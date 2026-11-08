@@ -36,6 +36,15 @@ Both NSIS installers ship the same ChemDraft version from the same commit:
 | `ChemDraft_<ver>_x64-setup.exe` | Personal installation, no admin required | `%LOCALAPPDATA%\ChemDraft` | `latest.json` |
 | `ChemDraft_<ver>_x64-allusers-setup.exe` | Managed or shared machines; available to every account | `C:\Program Files\ChemDraft` | `latest-allusers.json` |
 
+All-users offline installer (includes the WebView2 runtime, about 180 MB larger; for PCs without internet access)
+
+`ChemDraft_<ver>_x64-allusers-offline-setup.exe` uses the same all-users overlay, installation scope,
+file associations and `latest-allusers.json` endpoint. Once internet access is available, it updates
+by downloading the normal all-users installer. It has no separate feed or updater `.sig`; neither
+feed may mention offline installers. It receives the same Authenticode signing and verification as
+the other installers, and is included in the `windows-release` workflow artifact on dispatch dry
+runs and uploaded beside them when `upload_to_release` is supplied.
+
 The all-users installer creates an all-users Start Menu shortcut and requires administrator rights
 for installation, uninstallation, and **every update**, including updates accepted inside ChemDraft.
 On a normal unelevated launch it requests UAC elevation; a standard user sees an **admin-credentials
@@ -122,6 +131,12 @@ The workflow's variant list shares build/rename, identity checks, signing, verif
 Tauri initially names each installer `ChemDraft_<ver>_x64-setup.exe`; the workflow stages it with
 the variant suffix before the next build overwrites that output. Adding a future variant with no
 feed requires a variant entry and config; it still goes through signing and upload.
+
+The offline variant adds the generated `ci-offline.conf.json` after the all-users overlay. The
+generator, `scripts/windows-offline-installer.mjs`, sets `offlineInstaller` with `silent: true` for
+WebView2 and disables updater artifacts without changing file associations. This variant skips
+updater signing and feed generation while retaining Authenticode signing and upload. The workflow
+assertion rejects offline updater signatures and any mention of `offline` in either generated feed.
 
 To regenerate the all-users feed from its already signed CI artifact:
 

@@ -22,6 +22,13 @@ Authenticode changes the installer's bytes. Never Authenticode-sign, rebuild, or
 installer after creating its updater `.sig`; recreate and verify the `.sig` and manifest if it changes.
 The opt-out is explicit: without it, VM builds retain their existing automatic updater signing.
 
+In addition to those two update targets, the workflow builds
+`ChemDraft_<ver>_x64-allusers-offline-setup.exe` with the WebView2 runtime included. It follows the
+same shared build, Authenticode signing, certificate verification and upload path, but has no
+updater `.sig` or separate feed. It inherits the all-users overlay's `latest-allusers.json` endpoint,
+so it downloads the normal all-users installer for updates once internet access is available.
+The workflow rejects offline updater signatures and any mention of `offline` in either feed.
+
 ## Owner setup for SignPath Foundation
 
 The **repository owner must personally** complete these account and trust steps. No account, token,
@@ -54,6 +61,9 @@ certificate, or approval is supplied by the workflow.
    to the trusted GitHub build system, the repository and reviewed release refs. Require the
    Foundation's manual release approval. The workflow waits up to one hour for completion; failures
    fail the run rather than falling back to an unsigned installer.
+   Also include `ChemDraft_<ver>_x64-allusers-offline-setup.exe` at the ZIP root and select it for
+   Authenticode signing with `ChemDraft_*_x64-allusers-offline-setup.exe`. Update the SignPath
+   artifact configuration to cover all three installers before the first offline signing run.
 5. Create a restricted submitter API token for that project/policy. Under GitHub **Settings → Secrets
    and variables → Actions**, add:
 
@@ -86,6 +96,13 @@ Review action updates and trust policy changes as release infrastructure changes
 Use a reviewed commit that has landed on the public repository's `main` branch, with the workflow
 and signing tools present. Both platform artifacts must use the same commit and version. The release
 body must include `## macOS` and `## Windows`; this workflow supplies the Windows artifacts only.
+
+Include this line in the release-body template's Windows section:
+
+```text
+## Windows
+All-users offline installer (includes the WebView2 runtime, about 180 MB larger; for PCs without internet access)
+```
 
 1. Set the app version before tagging, and prepare tracked Windows release notes if needed. Create
    the release tag and an **existing draft** GitHub release, for example `vX.Y.Z`.

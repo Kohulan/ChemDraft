@@ -104,6 +104,11 @@ jobs:
       - name: Build host-native OPSIN runtime and smoke test benzene
         run: node scripts/build-opsin-runtime.mjs
 
+      - name: Generate all-users offline installer config
+        run: |
+          node scripts/windows-offline-installer.mjs config apps/desktop/src-tauri/ci-offline.conf.json
+          if ($LASTEXITCODE -ne 0) { throw 'Offline installer config generation failed.' }
+
       - name: Build, verify and stage stable NSIS installers without updater signing
         id: bundle
         env:
@@ -113,7 +118,8 @@ jobs:
           # Add future variants here; build/rename, signing and upload share this list.
           $variants = @(
             @{ Suffix = ''; Config = ''; Feed = 'latest.json' },
-            @{ Suffix = '-allusers'; Config = 'src-tauri/tauri.allusers.conf.json'; Feed = 'latest-allusers.json' }
+            @{ Suffix = '-allusers'; Config = 'src-tauri/tauri.allusers.conf.json'; Feed = 'latest-allusers.json' },
+            @{ Suffix = '-allusers-offline'; Config = @('src-tauri/tauri.allusers.conf.json', 'src-tauri/ci-offline.conf.json'); Feed = '' }
           )
           $bundleDir = 'apps/desktop/src-tauri/target/release/bundle/nsis'
           New-Item -ItemType Directory -Path release-assets | Out-Null
@@ -122,7 +128,9 @@ jobs:
             # Tauri gives each variant the same original filename. Stage it before the next build.
             if (Test-Path -LiteralPath $bundleDir) { Remove-Item -LiteralPath $bundleDir -Recurse -Force }
             $buildArgs = @('--filter', '@chemdraft/desktop', 'build', '--bundles', 'nsis')
-            if ($variant.Config) { $buildArgs += @('--config', $variant.Config) }
+            foreach ($variantConfig in @($variant.Config)) {
+              if ($variantConfig) { $buildArgs += @('--config', $variantConfig) }
+            }
             pnpm @buildArgs
             if ($LASTEXITCODE -ne 0) { throw "NSIS build failed for suffix '$($variant.Suffix)'." }
             $config = Get-Content apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
@@ -233,6 +241,7 @@ jobs:
         run: |
           $env:TAURI_SIGNING_PRIVATE_KEY = $env:TAURI_SIGNING_PRIVATE_KEY.Trim()
           foreach ($artifact in ($env:INSTALLERS | ConvertFrom-Json)) {
+            if (-not $artifact.Feed) { continue } # Offline media has no updater signature.
             $installer = Join-Path release-assets $artifact.Installer
             # Call Node directly so cmd.exe/pnpm.cmd cannot discard the empty password argument.
             node apps/desktop/node_modules/@tauri-apps/cli/tauri.js signer sign --password '' $installer
@@ -248,6 +257,7 @@ jobs:
           NOTES_FILE: ${{ inputs.notes_file }}
         run: |
           foreach ($artifact in ($env:INSTALLERS | ConvertFrom-Json)) {
+            if (-not $artifact.Feed) { continue } # Offline media has no updater feed.
             $installer = Join-Path release-assets $artifact.Installer
             pnpm exec tsx tools/release/verify-windows-updater.ts $installer
             if ($LASTEXITCODE -ne 0) { throw "Updater signature verification failed for $installer." }
@@ -260,6 +270,11 @@ jobs:
             }
           }
           'signed=true' >> $env:GITHUB_OUTPUT
+
+      - name: Check offline installer is excluded from updater artifacts
+        run: |
+          node scripts/windows-offline-installer.mjs check release-assets
+          if ($LASTEXITCODE -ne 0) { throw 'Offline updater artifact check failed.' }
 
       - name: Print SHA-256 and sizes and write checksums
         run: |
