@@ -1,3 +1,4 @@
+import { isDrawingToolCommand } from "./drawingTools";
 import { installPopoverEscapeRouting } from "./window-manager/popoverEscape";
 import type { AnalysisReport } from "@chemdraft/analysis-core";
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent } from "react";
@@ -784,6 +785,9 @@ export function PaletteWindow({
   }, [shortcutRegistry, platform]);
 
   const invokeCommand = (commandId: string) => {
+    // A tool can be activated by keyboard or a synthesized click without a
+    // pointerdown. Selecting it also ends any previous flyout interaction.
+    if (isDrawingToolCommand(commandId)) dismissPaletteFlyouts();
     void sendPaletteCommand(commandId).catch(() => undefined);
   };
   const previewCommand = (commandId: string) => {
@@ -833,6 +837,18 @@ export function PaletteWindow({
   const popoverRequestRef = useRef(0);
   const enqueuePopoverOperation = (operation: () => Promise<void>) => {
     popoverOperationsRef.current = popoverOperationsRef.current.then(operation).catch(() => undefined);
+  };
+
+  const dismissPaletteFlyouts = () => {
+    // A native open may still be queued when this click arrives. Invalidate it
+    // immediately and clear its mount replay; close only after that work settles.
+    ++popoverRequestRef.current;
+    const opening = lastPopoverPayloadRef.current?.content;
+    lastPopoverPayloadRef.current = undefined;
+    enqueuePopoverOperation(async () => {
+      await closeToolsetPopoverWindow(toolset.id, opening?.openedAt, opening?.generation);
+    });
+    void dismissToolsetPopovers(toolsetPopoverTimestamp()).catch(() => undefined);
   };
 
   const openPopover = async (anchor: ToolbarPopoverAnchor, kind: string, content: ToolsetPopoverContent, request: number) => {
@@ -971,15 +987,7 @@ export function PaletteWindow({
       if (target instanceof Element && target.closest(".toolbar-color-trigger, .distribute-mode-button")) {
         return;
       }
-      // A native open may still be queued when this click arrives. Invalidate it
-      // immediately and clear its mount replay; close only after that work settles.
-      ++popoverRequestRef.current;
-      const opening = lastPopoverPayloadRef.current?.content;
-      lastPopoverPayloadRef.current = undefined;
-      enqueuePopoverOperation(async () => {
-        await closeToolsetPopoverWindow(toolset.id, opening?.openedAt, opening?.generation);
-      });
-      void dismissToolsetPopovers(toolsetPopoverTimestamp()).catch(() => undefined);
+      dismissPaletteFlyouts();
     };
     window.addEventListener("pointerdown", handlePointerDown, true);
     return () => window.removeEventListener("pointerdown", handlePointerDown, true);

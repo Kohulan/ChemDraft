@@ -40,6 +40,22 @@ describe.each(["macos", "windows"] as const)("text editor placement (%s)", platf
     window.history.replaceState(null, "", "/"); delete window.__CHEMDRAFT_AGENT__;
   });
 
+  it("encloses an Orthonym caption whose stored auto box is smaller than the painted name", async () => {
+    const drawing = structuredClone(insertNativeTextObject(createPhase4Document("Caption"), { x: 200, y: 160 }, "toluene"));
+    const object = drawing.pages[0].objects[0] as TextObject;
+    Object.assign(object, { width: 49, height: 12, style: {}, spans: [] });
+    const original = structuredClone(object);
+    await act(async () => root.render(createElement(MainWindow, { initialDocument: drawing, initialPaletteMode: "hidden",
+      nativePalette: true, initialRulersVisible: false, initialCrosshairsVisible: false, shortcutPlatform: platform })));
+    const frame = container.querySelector<HTMLElement>(`[data-object-controls="${object.id}"]`)!;
+    const hit = container.querySelector<HTMLElement>(`.text-object[data-object-id="${object.id}"]`)!;
+    expect(frame.style.width).toBe(hit.style.width);
+    expect(frame.style.height).toBe(hit.style.height);
+    expect(parseFloat(frame.style.width) * drawing.pages[0].width / 100).toBeGreaterThan(59);
+    expect(parseFloat(frame.style.height) * drawing.pages[0].height / 100).toBeGreaterThan(21);
+    expect(object).toEqual(original);
+  });
+
   it.each([
     ...[1, 1.25, 1.5, 2].flatMap(dpr => [12, 13.333, 18.667, 14 * 96 / 72, 24].flatMap(fontSizePx => [1, 2].flatMap(zoom =>
       (["left", "center", "right"] as const).map(textAlign => ({ zoom, textAlign, fontSizePx, dpr, text: "HHHHHH", height: undefined }))))),

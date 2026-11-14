@@ -6386,6 +6386,16 @@ export function objectFrameBoundsForPageFit(object: DocumentObject): LayoutBound
  * and script metrics as sizing/rendering, rather than measuring host fonts or changing the text.
  */
 export function textVisualBoundsForPageFit(object: TextObject): LayoutBounds {
+  const frame = textContentFrame(object);
+  const left = frame.x, right = frame.x + frame.width, top = frame.y, bottom = frame.y + frame.height;
+  const corners = [{ x: left, y: top }, { x: right, y: top }, { x: left, y: bottom }, { x: right, y: bottom }]
+    .map(point => transformPointForObject(object, point));
+  const x = Math.min(...corners.map(point => point.x)), y = Math.min(...corners.map(point => point.y));
+  return { x, y, width: Math.max(...corners.map(point => point.x)) - x, height: Math.max(...corners.map(point => point.y)) - y };
+}
+
+/** Unrotated bounds of the stored caption and its visible lines, in page units. */
+export function textContentFrame(object: TextObject): LayoutBounds {
   const style = nativeTextStyleFromObjectStyle(object.style);
   const lines = textObjectSpanLines(object);
   const anchor = style.textAlign === "center" ? object.x + object.width / 2
@@ -6409,11 +6419,10 @@ export function textVisualBoundsForPageFit(object: TextObject): LayoutBounds {
       bottom = Math.max(bottom, baseline + size * nativeTextMetrics.descentEm);
     }
   });
-  const corners = [{ x: left, y: top }, { x: right, y: top }, { x: left, y: bottom }, { x: right, y: bottom }]
-    .map(point => transformPointForObject(object, point));
-  const x = Math.min(...corners.map(point => point.x)), y = Math.min(...corners.map(point => point.y));
-  return { x, y, width: Math.max(...corners.map(point => point.x)) - x, height: Math.max(...corners.map(point => point.y)) - y };
+  return { x: left, y: top, width: right - left, height: bottom - top };
 }
+
+
 
 /** Centre the visible ring system rather than a tall substituent or a long atom label.
  * Acyclic structures use their atom frame; clearance still measures every visible part. */

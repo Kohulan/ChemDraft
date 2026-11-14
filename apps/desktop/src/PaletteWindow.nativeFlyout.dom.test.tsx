@@ -135,6 +135,15 @@ describe.each(["macos", "windows"] as const)("standalone palette flyout keyboard
     expect(document.activeElement).toBe(button);
   });
 
+  it("dismisses the old menu when a different drawing tool receives a click without pointerdown", async () => {
+    await key("ArrowDown");
+    expect(native.visible).toBe(true);
+    const bond = host.querySelector<HTMLButtonElement>('[data-test-owner] [data-command-id="tool.bond"]')!;
+    await act(async () => bond.click());
+    expect(sendPaletteCommand).toHaveBeenCalledExactlyOnceWith("tool.bond");
+    expect(native.visible).toBe(false);
+  });
+
   it("dismisses an open flyout and invokes primary once when short-clicking another flyout button", async () => {
     expect((await key("ArrowDown")).defaultPrevented).toBe(true);
     expect(setToolsetPopoverContent).toHaveBeenCalledTimes(1);

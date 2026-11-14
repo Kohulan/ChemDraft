@@ -276,6 +276,7 @@ import {
   nativeTextScriptFontScale,
   measureNativeTextSpanLineWidth,
   planTextObjectPlacement,
+  textContentFrame,
   planTextObjectEditorPlacement,
   type NativeTextCssMetrics,
   textObjectSpanLines,
@@ -1773,7 +1774,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.14.11.40-codex";
+const CURRENT_BUILD_STAMP = "11.14.13.02-codex";
 const VibeCodeGuideForm = lazy(() => import("./dialogs/VibeCodeGuideForm").then(module => ({ default: module.VibeCodeGuideForm })));
 const StructureTemplatePicker = lazy(() => import("./dialogs/StructureTemplatePicker").then(module => ({ default: module.StructureTemplatePicker })));
 /** Starts in the background for the document webview under the existing probe gate. */
@@ -17195,6 +17196,7 @@ export function MainWindow({
   const resizeTextDocumentFromDrag = useCallback((drag: TextResizeState, point: ClientPoint): ChemDraftDocument => {
     const dx = point.x - drag.startPoint.x;
     const dy = point.y - drag.startPoint.y;
+    if (dx === 0 && dy === 0) return drag.startDocument;
     const frame = drag.edge === "right"
       ? {
           x: drag.startObjectX,
@@ -17373,6 +17375,7 @@ export function MainWindow({
 
     event.preventDefault();
     event.stopPropagation();
+    const startFrame = activeTextEditObjectId === objectId ? object : textSelectionFrame(object);
     textResizeRef.current = {
       pointerId: event.pointerId,
       objectId,
@@ -17380,10 +17383,10 @@ export function MainWindow({
       startDocument: documentRef.current,
       startPoint: point,
       latestPoint: point,
-      startObjectX: object.x,
-      startObjectY: object.y,
-      startObjectWidth: object.width,
-      startObjectHeight: object.height
+      startObjectX: startFrame.x,
+      startObjectY: startFrame.y,
+      startObjectWidth: startFrame.width,
+      startObjectHeight: startFrame.height
     };
     setActiveEditorObjectId(undefined);
     setActiveTextEditObjectId((current) => current === objectId ? current : undefined);
@@ -17393,7 +17396,7 @@ export function MainWindow({
     assignHoveredNativeDeleteTarget(undefined);
     setFreeformNativeBond(undefined);
     captureGesturePointer(pageRef.current, event.pointerId);
-  }, [assignHoveredNativeDeleteTarget, pagePointFromPointerEvent]);
+  }, [activeTextEditObjectId, assignHoveredNativeDeleteTarget, pagePointFromPointerEvent]);
 
   const groupProjectedPlaneTiltFromDrag = useCallback((
     drag: GroupTransformDragState,
@@ -29315,7 +29318,8 @@ function DocumentObjectViewContent({
   const artObjectProjection = documentObjectSupportsArtTransform(object, directElectronMarkEditing)
     ? documentObjectProjectedPlaneProjection(object)
     : undefined;
-  const frameBounds = interactionBounds ?? object;
+  const textFrame = object.type === "text" && !editingText ? textSelectionFrame(object) : undefined;
+  const frameBounds = interactionBounds ?? textFrame ?? object;
   const mechanismRotationOrigin = object.type === "mechanism-arrow"
     ? objectTransformPreview && objectTransformPreview.mode !== "move"
       ? { x: objectTransformPreview.origin.x - frameBounds.x, y: objectTransformPreview.origin.y - frameBounds.y }
@@ -29330,7 +29334,11 @@ function DocumentObjectViewContent({
     transform: documentObjectOuterCssTransform(object, artObjectProjection, objectTransformPreview),
     transformOrigin: mechanismRotationOrigin
       ? `${pageScaledCssPx(mechanismRotationOrigin.x)} ${pageScaledCssPx(mechanismRotationOrigin.y)}`
-      : documentObjectOuterCssTransformOrigin(object, objectTransformPreview)
+      : textFrame && textFrame !== object
+        ? objectTransformPreview && objectTransformPreview.mode !== "move"
+          ? objectTransformPreviewCssOrigin(frameBounds, objectTransformPreview)
+          : `${pageScaledCssPx(object.x + object.width / 2 - frameBounds.x)} ${pageScaledCssPx(object.y + object.height / 2 - frameBounds.y)}`
+        : documentObjectOuterCssTransformOrigin(object, objectTransformPreview)
   } as CSSProperties;
   // The positioned copy carries only edit/preview chrome. Its own z-index is bounded
   // inside the page's interaction layer, independent of the object's paint index.
@@ -32032,6 +32040,15 @@ interface DocumentObjectProjection {
 
 function documentObjectSupportsArtTransform(object: DocumentObject, directElectronMarkEditing = false): boolean {
   return object.type === "graphic" || object.type === "bracket" || object.type === "reaction-arrow" || (directElectronMarkEditing && object.type === "electron-mark");
+}
+
+function textSelectionFrame(object: TextObject) {
+  if (object.style.textBoxSizingMode === "fixed-width" || object.style.textBoxSizingMode === "fixed-size" ||
+      object.arrowAttachment?.kind === "conditions" || object.style.reactionPlus === true) return object;
+  const frame = textContentFrame(object);
+  if (frame.x === object.x && frame.y === object.y && frame.width === object.width && frame.height === object.height) return object;
+  // Round expanded edges outward to accommodate fractional font descent.
+  return { ...frame, width: Math.ceil(frame.width), height: Math.ceil(frame.height) };
 }
 
 function documentObjectOuterCssTransform(
