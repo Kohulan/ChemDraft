@@ -154,7 +154,7 @@ import {
 } from "./toolsets";
 import type { ArtInspectorEffectKind } from "./artInspectorModel";
 import { loadSystemFonts, type SystemFontFamily, type SystemFontFace } from "./systemFonts";
-import { listenForPaletteCommandCancels, type ToolsetArtPaintTarget, type ToolsetFlyoutSnapshot } from "./window-manager";
+import { isDesktopRuntime, listenForPaletteCommandCancels, type ToolsetArtPaintTarget, type ToolsetFlyoutSnapshot } from "./window-manager";
 import { registerInlinePopover } from "./window-manager/popoverEscape";
 
 export type ToolPaletteMode = "docked" | "floating";
@@ -731,7 +731,7 @@ function TextToolbarStyleControls() {
         <ColorPickerControl
           currentColor={currentColor}
           onOpenChange={onColorPickerOpenChange}
-          onRequestPopover={onRequestColorPopover}
+          onRequestPopover={isDesktopRuntime() ? onRequestColorPopover : undefined}
           onInvoke={onInvoke}
         />
       </div>
