@@ -3296,6 +3296,14 @@ function ColorPickerControl({
   const [open, setOpen] = useState(false);
   const [draftHex, setDraftHex] = useState(normalizedCurrentColor);
 
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    // A detached palette borrows the native keyboard only when an editing control has focus.
+    if (open && dialogRef.current?.closest(".palette-window-shell")) {
+      dialogRef.current.querySelector<HTMLInputElement>(".color-hex-field input")?.focus({ preventScroll: true });
+    }
+  }, [open]);
+
   useEffect(() => open ? registerInlinePopover(() => setOpen(false)) : undefined, [open]);
 
   useEffect(() => {
@@ -3349,7 +3357,20 @@ function ColorPickerControl({
         <span className="toolbar-color-trigger-label">Color</span>
       </button>
       {open ? (
-        <div className="toolbar-color-popover" role="dialog" aria-label={dialogLabel}>
+        <div
+          ref={dialogRef}
+          className="toolbar-color-popover"
+          role="dialog"
+          aria-label={dialogLabel}
+          onKeyDown={(event) => {
+            // Bubble after the field discards its draft and before the focus lease blurs it.
+            if (event.key !== "Escape" || event.nativeEvent.isComposing || event.defaultPrevented ||
+                event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+            event.preventDefault();
+            event.stopPropagation();
+            setOpen(false);
+          }}
+        >
           <ColorPickerPopoverBody
             activeColor={normalizedCurrentColor}
             value={draftHex}
