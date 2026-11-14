@@ -468,7 +468,7 @@ export interface ToolsetFlyoutSnapshot {
  * no per-kind windows to keep in sync, and no way for a stale kind to coexist.
  */
 export type ToolsetPopoverContent = ToolsetPopoverOpening & (
-  | { kind: "artColor" }
+  | { kind: "artColor" | "textColor" }
   | { kind: "flyout"; flyout: ToolsetFlyoutSnapshot }
 );
 

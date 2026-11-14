@@ -5617,7 +5617,7 @@ async fn prewarm_toolset_tooltip(app: tauri::AppHandle) -> Result<(), String> {
 fn toolset_popover_title(label: &str, kind: &str) -> &'static str {
     if label == toolset_popover_window_label("core.bondStereo") {
         "E/Z not specified"
-    } else if kind == "artColor" {
+    } else if matches!(kind, "artColor" | "textColor") {
         "ChemDraft color picker"
     } else {
         "ChemDraft tools"

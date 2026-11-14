@@ -7,6 +7,7 @@ import { createPhase4Document, insertNativeArtGraphicObject } from "./documentWo
 import { createArtInspectorModel, selectedGraphicObjectsForArtInspector } from "./artInspectorModel";
 import { PaletteWindow } from "./PaletteWindow";
 import { PalettePopoverWindow } from "./PalettePopoverWindow";
+import { textCustomColorCommandId } from "./commands";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 import {
   closeToolsetPopoverWindow, createToolsetTextStylePayload, dismissToolsetPopovers,
@@ -38,6 +39,7 @@ vi.mock("./window-manager", async importOriginal => {
   }
   return {
     ...actual,
+    isDesktopRuntime: () => true,
     listenForToolsetPopoverContent: (handler: (payload: ToolsetPopoverContentPayload) => void) => subscribe(native.content, handler),
     listenForToolsetFlyoutKeys: (handler: (payload: ToolsetFlyoutKey) => void) => subscribe(native.keys, handler),
     listenForToolsetFlyoutClosed: (handler: (payload: ToolsetFlyoutSession) => void) => subscribe(native.closed, handler),
@@ -219,6 +221,38 @@ describe.each(["macos", "windows"] as const)("standalone palette flyout keyboard
     });
     expect(sendPaletteCommand).not.toHaveBeenCalled();
     expect(native.hide).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens Text color in the native picker and accepts a targeted document dismissal", async () => {
+    await act(async () => root.render(<>
+      <div data-test-owner><PaletteWindow key="text" toolsetId="core.text" platform={platform} /></div>
+      <div data-test-popover><PalettePopoverWindow key="text-popover" toolsetId="core.text" kind="textColor" prewarm platform={platform} /></div>
+    </>));
+    const trigger = host.querySelector<HTMLButtonElement>('[aria-label="Open text color picker"]')!;
+    await act(async () => trigger.click());
+    const call = vi.mocked(setToolsetPopoverContent).mock.lastCall!;
+    expect(call[0]).toBe("core.text");
+    expect(call[1].kind).toBe("textColor");
+    expect(native.visible).toBe(true);
+    expect(host.querySelector('[data-test-owner] [role="dialog"]')).toBeNull();
+    const hex = host.querySelector<HTMLInputElement>('[data-test-popover] [aria-label="Text color picker"] .color-hex-field input')!;
+    const enterHex = async (value: string) => {
+      await act(async () => {
+        hex.focus();
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(hex, value);
+        hex.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+    };
+    await enterHex("#123456");
+    expect(sendPaletteCommand).toHaveBeenCalledWith(textCustomColorCommandId("#123456"), { preserveInputFocus: true });
+    vi.mocked(sendPaletteCommand).mockClear();
+    await enterHex("#ABC");
+    await act(async () => dismissToolsetPopovers(performance.timeOrigin + performance.now(), "escape", [{
+      toolsetId: "core.text", openedAt: call[1].openedAt, generation: call[1].generation
+    }]));
+    await act(async () => hex.blur());
+    expect(native.visible).toBe(false);
+    expect(sendPaletteCommand).not.toHaveBeenCalled();
   });
 
   it("preserves color swatch toggle behavior on pointer-down", async () => {

@@ -44,7 +44,7 @@ export interface ToolbarWidgetState {
   molecularInspectorStale?: boolean;
   onInvoke: (commandId: string) => void;
   onColorPickerOpenChange?: (open: boolean) => void;
-  onRequestColorPopover?: (anchor: ToolbarPopoverAnchor) => void;
+  onRequestColorPopover?: (anchor: ToolbarPopoverAnchor, kind?: "artColor" | "textColor") => void;
   onArtStylePreview?: (commandId: string) => void;
   onArtStyleCommit?: (commandId: string) => void;
   onArtStyleCancel?: () => void;

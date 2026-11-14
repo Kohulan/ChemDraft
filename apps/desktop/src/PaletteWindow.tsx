@@ -58,6 +58,7 @@ import {
   openToolsetPopoverWindow,
   prewarmToolsetPopoverWindow,
   prewarmToolsetTooltipWindow,
+  isDesktopRuntime,
   listenForPalettePointer,
   listenForCurrentWindowWorkAreaChanges,
   listenForPalettePointerLeave,
@@ -884,13 +885,13 @@ export function PaletteWindow({
 
   // Flyout opens and swatch toggles share the entire native operation, including visibility reads.
   // Snapshot the opening before awaiting: a late reply never authorizes closing its replacement.
-  const openArtColorPopover = (anchor: ToolbarPopoverAnchor) => {
+  const openColorPopover = (anchor: ToolbarPopoverAnchor, kind: "artColor" | "textColor" = "artColor") => {
     const request = popoverRequestRef.current;
     enqueuePopoverOperation(async () => {
       if (popoverRequestRef.current !== request) return;
       const opening = lastPopoverPayloadRef.current?.content;
       const isCurrent = () => popoverRequestRef.current === request && lastPopoverPayloadRef.current?.content === opening;
-      if (opening?.kind === "artColor") {
+      if (opening?.kind === kind) {
         const visible = await isToolsetPopoverWindowVisible(toolset.id);
         if (!isCurrent()) return;
         if (visible) {
@@ -905,8 +906,8 @@ export function PaletteWindow({
           return;
         }
       }
-      const content: ToolsetPopoverContent = { kind: "artColor", ...newToolsetPopoverOpening() };
-      if (await openPopover(anchor, "artColor", content, request)) {
+      const content: ToolsetPopoverContent = { kind, ...newToolsetPopoverOpening() };
+      if (await openPopover(anchor, kind, content, request)) {
         await requestToolsetTextStyle();
       }
     });
@@ -1133,7 +1134,7 @@ export function PaletteWindow({
           currentTextStyle,
           currentTextScript,
           onColorPickerOpenChange: setColorPickerOpen,
-          onRequestColorPopover: openArtColorPopover,
+          onRequestColorPopover: isDesktopRuntime() ? openColorPopover : undefined,
           onArtStylePreview: previewCommand,
           onArtStyleCommit: commitPreviewCommand,
           onArtStyleCancel: cancelPreviewCommand,

@@ -3,7 +3,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ColorPickerPopoverBody, symbolToolGlyph, toolbarCommandFlyoutGridStyle } from "./ToolPalette";
 import { Icon, type IconName } from "./icons";
 import { toolbarAsset, type ToolbarAssetName } from "./toolbarAssets";
-import { normalizeHexColor, objectCustomColorCommandId } from "./commands";
+import { normalizeHexColor, objectCustomColorCommandId, textCustomColorCommandId } from "./commands";
 import { installPaletteInputFocus } from "./plugins/pluginPanelInputFocus";
 import { detectDesktopShortcutPlatform } from "./keyboardShortcuts";
 import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
@@ -101,7 +101,7 @@ export function PalettePopoverWindow({
   const [content, setContent] = useState<ToolsetPopoverContent>(() =>
     kind === "flyout"
       ? { kind: "flyout", flyout: { flyoutId: "", title: "", commands: [] } }
-      : { kind: "artColor" }
+      : { kind: kind === "textColor" ? "textColor" : "artColor" }
   );
   const [artStyle, setArtStyle] = useState<ToolsetArtStylePayload | undefined>();
   const contentRef = useRef(content);
@@ -137,7 +137,7 @@ export function PalettePopoverWindow({
   const activeColor = effectiveTarget === "fill"
     ? artStyle?.values.fillColor.value
     : artStyle?.values.strokeColor.value;
-  const currentColor = normalizeHexColor(activeColor ?? fallbackColor) ?? "#111111";
+  const currentColor = normalizeHexColor(content.kind === "textColor" ? fallbackColor : activeColor ?? fallbackColor) ?? "#111111";
   const value = draft ?? currentColor;
 
   useEffect(() => {
@@ -213,7 +213,7 @@ export function PalettePopoverWindow({
         if (current.kind === "flyout" && current.flyout.id === payload.flyout.id) return;
       }
       if (perfShownRef.current) perfHook(() => perfProbe?.surfaceShown(perfShownRef.current, "no-op"));
-      perfShownRef.current = perfHook(() => perfProbe?.surfaceStarted("palette-popover", undefined, payload.kind === "flyout" ? payload.flyout.flyoutId : "artColor"));
+      perfShownRef.current = perfHook(() => perfProbe?.surfaceStarted("palette-popover", undefined, payload.kind === "flyout" ? payload.flyout.flyoutId : payload.kind));
       // A fresh push is a fresh open — it may follow a dismissal.
       contentPushedRef.current = true;
       if (compareToolsetPopoverOpenings(opening, contentRef.current) !== 0 || payload.kind !== "flyout" ||
@@ -226,6 +226,7 @@ export function PalettePopoverWindow({
       if (payload.anchor && typeof payload.anchor.x === "number" && typeof payload.anchor.y === "number") {
         anchorRef.current = payload.anchor;
       }
+      if (payload.kind === "textColor") setDraft(undefined);
       const next: ToolsetPopoverContent = { ...payload, ...opening };
       contentRef.current = next;
       setContent(next);
@@ -301,7 +302,7 @@ export function PalettePopoverWindow({
   // runs while hidden, so measuring synchronously after the React commit is safe; the ResizeObserver
   // effect above keeps the size pixel-perfect once painting resumes.
   useEffect(() => {
-    const ready = content.kind === "artColor" || (content.kind === "flyout" && content.flyout.commands.length > 0);
+    const ready = content.kind !== "flyout" || content.flyout.commands.length > 0;
     if (!ready && perfShownRef.current) {
       perfHook(() => perfProbe?.surfaceShown(perfShownRef.current, "no-op"));
       perfShownRef.current = undefined;
@@ -417,13 +418,13 @@ export function PalettePopoverWindow({
   // Escape dismisses (and cancels any in-flight colour preview).
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || dismissedRef.current) {
+      if (event.key !== "Escape" || dismissedRef.current || event.isComposing) {
         return;
       }
       event.preventDefault();
       dismissedRef.current = true;
       notifyBondStereoClose();
-      void sendPaletteCommandCancel("palette.preview.cancel").catch(() => undefined);
+      if (contentRef.current.kind !== "textColor") void sendPaletteCommandCancel("palette.preview.cancel").catch(() => undefined);
       hidePopoverWindow();
     };
     window.addEventListener("keydown", onKeyDown);
@@ -473,7 +474,7 @@ export function PalettePopoverWindow({
       const cancelPreview = payload?.reason === "escape" && contentPushedRef.current && !dismissedRef.current;
       dismissedRef.current = true;
       notifyBondStereoClose();
-      if (cancelPreview) {
+      if (cancelPreview && contentRef.current.kind !== "textColor") {
         void sendPaletteCommandCancel("palette.preview.cancel").catch(() => undefined);
       }
       hidePopoverWindow();
@@ -487,6 +488,13 @@ export function PalettePopoverWindow({
 
   // Both refuse once the popover is dismissed: hiding it blurs whichever field had focus, and a blur
   // that settles a half-typed value would otherwise apply a colour the user just walked away from.
+  const applyTextColor = (color: string) => {
+    const normalized = normalizeHexColor(color);
+    if (!normalized || dismissedRef.current) return;
+    setDraft(normalized);
+    void sendPaletteCommand(textCustomColorCommandId(normalized), { preserveInputFocus: true }).catch(() => undefined);
+  };
+
   const previewColor = (color: string) => {
     const normalized = normalizeHexColor(color);
     if (!normalized || dismissedRef.current) {
@@ -637,13 +645,14 @@ export function PalettePopoverWindow({
           ))}
         </div>
       ) : (
-        <div className="art-color-popover" role="dialog" aria-label="Art color picker">
+        <div className="art-color-popover" role="dialog" aria-label={content.kind === "textColor" ? "Text color picker" : "Art color picker"}>
           <ColorPickerPopoverBody
+            key={content.kind === "textColor" ? content.openedAt : undefined}
             contextKey={colorContextKey}
             activeColor={currentColor}
             value={value}
-            onPreviewColor={previewColor}
-            onCommitColor={commitColor}
+            onPreviewColor={content.kind === "textColor" ? applyTextColor : previewColor}
+            onCommitColor={content.kind === "textColor" ? applyTextColor : commitColor}
           />
         </div>
       )}

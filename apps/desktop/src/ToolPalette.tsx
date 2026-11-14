@@ -692,7 +692,7 @@ function toolbarItemGridStyle(layout: ToolbarPaletteItemModel["layout"]): CSSPro
 }
 
 function TextToolbarStyleControls() {
-  const { currentTextStyle, currentTextScript = "normal", onColorPickerOpenChange, onInvoke } = useToolbarWidgetState();
+  const { currentTextStyle, currentTextScript = "normal", onColorPickerOpenChange, onRequestColorPopover, onInvoke } = useToolbarWidgetState();
   const sizeCommandId = closestSizeCommandId(currentTextStyle?.fontSizePx);
   const textAlign = currentTextStyle?.textAlign ?? "left";
   const currentColor = normalizeHexColor(currentTextStyle?.color) ?? textColorCommands[0].color;
@@ -731,6 +731,7 @@ function TextToolbarStyleControls() {
         <ColorPickerControl
           currentColor={currentColor}
           onOpenChange={onColorPickerOpenChange}
+          onRequestPopover={onRequestColorPopover}
           onInvoke={onInvoke}
         />
       </div>
@@ -3281,6 +3282,7 @@ function ColorPickerControl({
   triggerLabel = "Open text color picker",
   dialogLabel = "Text color picker",
   onOpenChange,
+  onRequestPopover,
   onInvoke
 }: {
   compact?: boolean;
@@ -3290,19 +3292,12 @@ function ColorPickerControl({
   triggerLabel?: string;
   dialogLabel?: string;
   onOpenChange?: (open: boolean) => void;
+  onRequestPopover?: (anchor: ToolbarPopoverAnchor, kind: "textColor") => void;
   onInvoke: (commandId: string) => void;
 }) {
   const normalizedCurrentColor = normalizeHexColor(currentColor) ?? textColorCommands[0].color;
   const [open, setOpen] = useState(false);
   const [draftHex, setDraftHex] = useState(normalizedCurrentColor);
-
-  const dialogRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    // A detached palette borrows the native keyboard only when an editing control has focus.
-    if (open && dialogRef.current?.closest(".palette-window-shell")) {
-      dialogRef.current.querySelector<HTMLInputElement>(".color-hex-field input")?.focus({ preventScroll: true });
-    }
-  }, [open]);
 
   useEffect(() => open ? registerInlinePopover(() => setOpen(false)) : undefined, [open]);
 
@@ -3347,18 +3342,24 @@ function ColorPickerControl({
         type="button"
         className="toolbar-color-trigger"
         aria-label={triggerLabel}
-        aria-expanded={open}
+        aria-haspopup="dialog"
+        aria-expanded={onRequestPopover ? undefined : open}
         data-color-picker-trigger="true"
         data-palette-control="true"
         style={{ "--picker-color": normalizedCurrentColor } as CSSProperties}
-        onClick={() => setOpenState(!open)}
+        onClick={(event) => {
+          if (onRequestPopover) {
+            onRequestPopover(event.currentTarget.getBoundingClientRect(), "textColor");
+          } else {
+            setOpenState(!open);
+          }
+        }}
       >
         <span className="toolbar-color-trigger-swatch" aria-hidden="true" />
         <span className="toolbar-color-trigger-label">Color</span>
       </button>
       {open ? (
         <div
-          ref={dialogRef}
           className="toolbar-color-popover"
           role="dialog"
           aria-label={dialogLabel}

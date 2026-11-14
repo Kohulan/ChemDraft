@@ -866,23 +866,6 @@ describe.each(["macos", "windows"] as const)("palette input focus (%s)", (platfo
     expect(sendPaletteCommand).not.toHaveBeenCalled();
   });
 
-  it("gives an opened Text color picker the keyboard and closes it on the first Escape", async () => {
-    await mountSettings("core.text");
-    const trigger = container.querySelector<HTMLButtonElement>('[aria-label="Open text color picker"]')!;
-    await act(async () => trigger.click());
-    await flush();
-    const hex = container.querySelector<HTMLInputElement>(".color-hex-field input")!;
-    expect(document.activeElement).toBe(hex);
-    expect(leases().at(-1)?.[1].editing).toBe(true);
-    await type(hex, "#ABC");
-    const escape = await press(hex, "Escape");
-    await flush();
-    expect(escape.defaultPrevented).toBe(true);
-    expect(trigger.getAttribute("aria-expanded")).toBe("false");
-    expect(leases().at(-1)?.[1].editing).toBe(false);
-    expect(sendPaletteCommand).not.toHaveBeenCalled();
-  });
-
   it("keeps Text size type-ahead and arrows native, then releases on closed-select Escape", async () => {
     await mountSettings("core.text");
     const select = container.querySelector<HTMLSelectElement>('[aria-label="Text size"]')!;
