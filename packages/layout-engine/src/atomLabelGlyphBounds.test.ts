@@ -4,6 +4,10 @@
 // run.y + 0.35 em, start/middle/end anchored by the font's own advance.
 
 import { describe, expect, it } from "vitest";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Resvg } from "@resvg/resvg-js";
 import { DefaultNativeDrawingStyle, type MoleculeAtom, type NativeDrawingStyle } from "@chemdraft/chem-core";
 
 import { atomLabelGlyphBounds, atomLabelLayout, type AtomLabelPlan } from "./index";
@@ -199,7 +203,7 @@ describe("atomLabelGlyphBounds encloses the ink of the label font", () => {
 
   it("widens a monospace 'I' to its advance, where Helvetica's is under half as wide", () => {
     const courier = atomLabelGlyphBounds(planFor("I", { atomLabelFontFamily: "Courier New, Courier, monospace", atomLabelFontSizePx: 20 }));
-    const helvetica = atomLabelGlyphBounds(planFor("I", { atomLabelFontSizePx: 20 }));
+    const helvetica = atomLabelGlyphBounds(planFor("I", { atomLabelFontFamily: "Helvetica", atomLabelFontSizePx: 20 }));
     expect(courier.width).toBeGreaterThanOrEqual(0.6 * 20);
     expect(helvetica.width).toBeLessThan(0.3 * 20);
   });
@@ -233,16 +237,42 @@ describe("atomLabelGlyphBounds encloses the ink of the label font", () => {
     }
   });
 
-  it("keeps the sans-serif glyph box inside the padded renderer bounds for ordinary labels", () => {
+  it("keeps named Helvetica glyph boxes inside the padded renderer bounds for ordinary labels", () => {
     for (const label of ["OH", "NH2", "CO2H", "O-", "NH4+", "N2+", "13C", "H2N", "I", "Cl"]) {
       for (const anchor of ANCHORS) {
-        const plan = planFor(label, {}, anchor), box = atomLabelGlyphBounds(plan), bounds = plan.layout.bounds;
+        const plan = planFor(label, { atomLabelFontFamily: "Helvetica" }, anchor), box = atomLabelGlyphBounds(plan), bounds = plan.layout.bounds;
         expect(box.x, label).toBeGreaterThanOrEqual(bounds.x - 1e-9);
         expect(box.y, label).toBeGreaterThanOrEqual(bounds.y - 1e-9);
         expect(box.x + box.width, label).toBeLessThanOrEqual(bounds.x + bounds.width + 1e-9);
         expect(box.y + box.height, label).toBeLessThanOrEqual(bounds.y + bounds.height + 1e-9);
       }
     }
+  });
+
+  it("encloses Linux sans-serif fallback ink at the unchanged authored run positions", () => {
+    const directory = mkdtempSync(join(tmpdir(), "chemdraft-label-fallback-"));
+    try {
+      const source = readFileSync(new URL("../../export-engine/src/fonts/DejaVuSans.ts", import.meta.url), "utf8");
+      const base64 = source.match(/export default "([A-Za-z0-9+/=]+)"/)![1]!;
+      const path = join(directory, "DejaVuSans.ttf");
+      writeFileSync(path, Buffer.from(base64, "base64"));
+      for (const label of ["N+", "NH2", "H2N", "Cl", "I", "O-"]) {
+        const plan = planFor(label, { atomLabelFontSizePx: 20 });
+        const runs = plan.layout.runs.map(run => `<text x="${run.x}" y="${run.y}" dy="0.35em" text-anchor="${run.textAnchor}" font-size="${atomLabelRunSize(plan, run.script)}">${run.text}</text>`).join("");
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200"><g transform="translate(100 100)" font-family="${plan.fontFamily}">${runs}</g></svg>`;
+        const ink = new Resvg(svg, { font: { loadSystemFonts: false, fontFiles: [path],
+          sansSerifFamily: "DejaVu Sans", defaultFontFamily: "DejaVu Sans" } }).getBBox()!;
+        const box = atomLabelGlyphBounds(plan);
+        expect(ink.x - 100, label).toBeGreaterThanOrEqual(box.x - 0.5);
+        expect(ink.x + ink.width - 100, label).toBeLessThanOrEqual(box.x + box.width + 0.5);
+        expect(ink.y - 100, label).toBeGreaterThanOrEqual(box.y - 0.5);
+        expect(ink.y + ink.height - 100, label).toBeLessThanOrEqual(box.y + box.height + 0.5);
+        // A font database may also fall back to a monospace face. The same
+        // authored Cl and negative-charge runs must enclose Courier's independently
+        // tabulated ink, including its wider lowercase l and minus sign.
+        if (label === "Cl" || label === "O-") expectEncloses(plan, "courier");
+      }
+    } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
   it.each(FOREIGN_STACKS)("an unknown font stack (%j) gets the padded renderer bounds", (fontFamily) => {

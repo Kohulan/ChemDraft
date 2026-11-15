@@ -89,7 +89,7 @@ describe("2D layout quality", () => {
     const molecule: MoleculeObject = {
       id: "labels", type: "molecule", x: 0, y: 0, width: 200, height: 80, rotation: 0,
       structure: "", structureFormat: "smiles", superatoms: [], rGroups: [],
-      style: { bondLengthPx: 30, atomLabelFontSizePx: 15, atomLabelFontSizes: { a4: 23 } },
+      style: { bondLengthPx: 30, atomLabelFontFamily: "Helvetica", atomLabelFontSizePx: 15, atomLabelFontSizes: { a4: 23 } },
       atoms: ["C", "O", "C", "N", "OMe"].map((element, i) => ({
         id: `a${i}`, element, x: i * 30, y: 0, formalCharge: i === 3 ? 1 : 0,
         ...(i === 2 ? { isotope: 13 } : {}) })),
@@ -99,7 +99,7 @@ describe("2D layout quality", () => {
     const boxes = moleculeLayoutLabelBoxes(molecule);
     expect(boxes.map(box => box.atom)).toEqual([1, 2, 3, 4]);
     expect(plans.at(-1)!.fontSizePx).toBe(23);
-    // Quality checks use glyph extents, which remain inside the renderer's padded clipping bounds.
+    // Named Helvetica glyph extents remain inside the renderer's padded clipping bounds.
     expect(boxes).toEqual(plans.map(plan => {
       const bounds = atomLabelGlyphBounds(plan);
       return { atom: molecule.atoms.indexOf(plan.atom), x: plan.anchor.x + bounds.x, y: plan.anchor.y + bounds.y,

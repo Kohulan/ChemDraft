@@ -228,10 +228,26 @@ describe("native document agent commands", () => {
     expect(svg).toMatch(/<path[^>]*data-molecule-effect="sketch"[^>]*d="M/);
     expect(svg).toContain('data-object-id="ring-letter"');
     expect(svg).toContain(">A<");
-    const bold = svg.match(/<line[^>]*data-bond-style="bold"[^>]*stroke-width="([\d.]+)"/);
-    const ordinary = svg.match(/<line[^>]*data-bond-id="b1"[^>]*stroke-width="([\d.]+)"/);
-    expect(bold).not.toBeNull();
-    expect(Number(bold![1])).toBeGreaterThan(Number(ordinary![1]));
+    const dom = new JSDOM(svg, { contentType: "image/svg+xml" });
+    try {
+      // Bold ink is a filled, mitered band, including beneath the Sketch effect.
+      const bold = dom.window.document.querySelector('polygon[data-bond-id="b0"][data-bond-style="bold"]');
+      const ordinary = dom.window.document.querySelector('line[data-bond-id="b1"]');
+      expect(bold).not.toBeNull();
+      expect(ordinary).not.toBeNull();
+      expect(bold!.getAttribute("fill")).toMatch(/^#[\da-f]{6}$/i);
+      expect(bold!.getAttribute("stroke")).toBe("none");
+      const points = bold!.getAttribute("points")!.split(" ").map(point => point.split(",").map(Number));
+      expect(points).toHaveLength(4);
+      expect(points.flat().every(Number.isFinite)).toBe(true);
+      const bond = molecule.bonds[0]!;
+      const from = molecule.atoms.find(atom => atom.id === bond.fromAtomId)!;
+      const to = molecule.atoms.find(atom => atom.id === bond.toAtomId)!;
+      const length = Math.hypot(to.x - from.x, to.y - from.y);
+      const width = Math.abs((points[1]![0]! - points[0]![0]!) * (from.y - to.y) / length
+        + (points[1]![1]! - points[0]![1]!) * (to.x - from.x) / length);
+      expect(width).toBeGreaterThan(Number(ordinary!.getAttribute("stroke-width")));
+    } finally { dom.window.close(); }
     const png = await readFile(join(directory, "styled.png"));
     expect(png.readUInt32BE(16)).toBe(240);
     expect(result.result.molecules[0].canonicalSmiles).toBe(built.sourceCanonicalSmiles);

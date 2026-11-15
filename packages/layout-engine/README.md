@@ -185,6 +185,13 @@ this result. Stored document frames are never remeasured merely by loading, norm
 
 ### Font advance ceilings
 
+Atom-label collision boxes keep the authored Helvetica/Arial run positions and tight vertical
+extents. Stacks ending in generic `sans-serif` also enclose Courier-width fallback runs and
+DejaVu Sans's wider plus sign (1716/2048 em, rounded upward), because Linux font databases may
+have neither Arial nor Helvetica. These horizontal collision envelopes can extend beyond the
+existing padded clipping bounds; label placement, bond clipping, halos and SVG ink are unchanged.
+The fallback regression uses the bundled DejaVu Sans 2.35 face and independent Courier AFM ink.
+
 The shipped commands in `apps/desktop/src/commands.ts` offer Arial/Helvetica/sans-serif,
 Times New Roman/Times/serif, Courier New/Courier/monospace and Georgia/serif. The fallback menus in
 `systemFonts.ts` and `ToolPalette.tsx` offer the same aliases; the native menu additionally lists
