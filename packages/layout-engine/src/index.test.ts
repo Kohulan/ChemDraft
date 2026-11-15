@@ -1191,7 +1191,7 @@ function referencePageCrossings(page: DocumentPage): ResolvedBondCrossing[] {
         ? Math.max(4, front.style.bondStrokeWidthPx * 2.2, front.style.bondBoldWidthPx * 1.05, front.style.bondLengthPx * 0.24)
         : front.bond.display?.bondStyle === "bold"
           ? front.bond.order === "double"
-            ? 2 * (stroke(front) + Math.max(gap - front.style.bondStrokeWidthPx, 3.4 * front.style.bondStrokeWidthPx)) + front.style.bondStrokeWidthPx
+            ? 2 * Math.max(gap, stroke(front) + 1.5 * front.style.bondStrokeWidthPx - gap / 2) + front.style.bondStrokeWidthPx
             : front.bond.order === "triple"
               ? 2 * Math.max(gap, stroke(front) / 2 + front.style.bondStrokeWidthPx * 1.5) + front.style.bondStrokeWidthPx
               : Math.max(stroke(front), 2 * stroke(front) - front.style.bondStrokeWidthPx)

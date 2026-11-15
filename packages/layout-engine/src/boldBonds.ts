@@ -1,57 +1,73 @@
-import type { NativeDrawingStyle } from "@chemdraft/chem-core";
 import { formatNumber } from "./formatNumber";
 
-/** Display-only dimensions, relative to the document's ordinary line width. */
-export const BoldBondStyle = { widthRatio: 3.4, clearGapRatio: 3.4, miterLimit: 2 } as const;
+/** Display-only dimensions. The minimum wins when the ordinary line is already thick. */
+export const BoldBondStyle = {
+  widthRatio: 3.4, bondLengthRatio: 0.135, minimumWidthRatio: 1.8, clearGapRatio: 1, miterLimit: 2
+} as const;
 
-export function boldDoubleBondSeparation(style: NativeDrawingStyle, normalGap: number, depthScale: number): number {
-  const line = style.bondStrokeWidthPx * depthScale;
-  const band = style.bondBoldWidthPx * depthScale;
-  // A flush outside edge puts the inside edge at band - line/2, and the pi edge
-  // at separation - line/2. Their white gap is therefore separation - band.
-  return band + Math.max(normalGap - line, line * BoldBondStyle.clearGapRatio);
+export function boldBondWidth(lineWidth: number, bondLength: number): number {
+  return Math.max(lineWidth * BoldBondStyle.minimumWidthRatio,
+    Math.min(lineWidth * BoldBondStyle.widthRatio, bondLength * BoldBondStyle.bondLengthRatio));
 }
 
 type Point = { x: number; y: number };
-export type BoldBondNeighbor = { origin: Point; unit: Point; length: number; width: number };
+export type BoldBondNeighbor = { bondId: string; origin: Point; unit: Point; length: number; width: number };
+export type BoldBondJoin = { neighbor: BoldBondNeighbor; points: readonly Point[] };
 type Segment = { x1: number; y1: number; x2: number; y2: number };
 
-/** Filled band. Its end cuts meet the outside edges of the incident strokes: the
- * overlap stays inside those strokes, so there is no exposed cap or antialiasing slit.
- * Acute/near-collinear joints are bounded by a bevel; absent joints give square caps.
- * Side selects inward growth with the opposite edge fixed at the ordinary half-width.
+/** Filled, constant-width quadrilateral. Each end joins ONE neighbor: inner edge to
+ * inner edge, outer edge to outer edge. Ring callers supply only the same-ring neighbor;
+ * a substituent must never cut a notch into the band. Degenerate/overlong miters and
+ * absent neighbors use a square end. Side selects inward growth; if that would crowd
+ * a fixed pi line, grow partly outward instead. The pi line itself is never displaced.
  */
 export function boldBondPolygonPoints(segment: Segment, width: number, lineWidth: number,
-  side: "left" | "right" | undefined, from: readonly BoldBondNeighbor[], to: readonly BoldBondNeighbor[]): string {
+  side: "left" | "right" | undefined, from: readonly BoldBondNeighbor[], to: readonly BoldBondNeighbor[],
+  piSeparation?: number, onJoin?: (join: BoldBondJoin) => void): string {
   const length = Math.hypot(segment.x2 - segment.x1, segment.y2 - segment.y1);
   if (length < 1e-8) return "";
   const unit = { x: (segment.x2 - segment.x1) / length, y: (segment.y2 - segment.y1) / length };
   const normal = { x: -unit.y, y: unit.x };
-  const low = side === "left" ? -lineWidth / 2 : side === "right" ? lineWidth / 2 - width : -width / 2;
-  const high = low + width;
+  let low = side === "left" ? -lineWidth / 2 : side === "right" ? lineWidth / 2 - width : -width / 2;
+  let high = low + width;
+  if (piSeparation !== undefined && side) {
+    // SVG points round to 0.001 units; leave one such unit so that rounding an
+    // oblique edge cannot turn the promised minimum gap into slightly less ink clearance.
+    const innerLimit = piSeparation - lineWidth * (0.5 + BoldBondStyle.clearGapRatio) - 0.001;
+    const shift = Math.max(0, (side === "left" ? high : -low) - innerLimit);
+    low += side === "left" ? -shift : shift;
+    high += side === "left" ? -shift : shift;
+  }
   const dot = (a: Point, b: Point) => a.x * b.x + a.y * b.y;
   const end = (origin: Point, inward: Point, neighbors: readonly BoldBondNeighbor[], reverse: boolean) => {
-    const offsets = [low, high];
-    const jointOffset = neighbors[0] ? dot({ x: neighbors[0].origin.x - origin.x, y: neighbors[0].origin.y - origin.y }, normal) : 0;
-    // At a branch, each edge joins the ray on its own side; retain the corner
-    // between those cuts instead of drawing a diagonal across the atom.
-    if (low < jointOffset && high > jointOffset && neighbors.some(n => dot(n.unit, normal) > 1e-6)
-      && neighbors.some(n => dot(n.unit, normal) < -1e-6)) offsets.splice(1, 0, jointOffset);
-    const points = offsets.map(offset => {
-      const candidates = neighbors.filter(n => Math.abs(dot(n.unit, normal)) > 1e-6);
-      const onSide = candidates.filter(n => dot(n.unit, normal) * (offset - jointOffset) > 0);
-      const joins = (onSide.length ? onSide : candidates).map(neighbor => {
-        let edgeNormal = { x: -neighbor.unit.y, y: neighbor.unit.x };
-        if (dot(edgeNormal, inward) < 0) edgeNormal = { x: -edgeNormal.x, y: -edgeNormal.y };
-        const displacement = { x: origin.x - neighbor.origin.x, y: origin.y - neighbor.origin.y };
-        const t = (-neighbor.width / 2 - dot(displacement, edgeNormal) - offset * dot(normal, edgeNormal)) / dot(inward, edgeNormal);
-        const limit = Math.min(width * BoldBondStyle.miterLimit, length / 4, neighbor.length / 4);
-        return Math.max(-limit, Math.min(limit, t));
+    const candidates = neighbors.filter(n => Math.abs(dot(n.unit, normal)) > 1e-6);
+    const onSide = candidates.filter(n => dot(n.unit, normal) * (side === "right" ? -1 : 1) > 0);
+    const neighbor = (side && onSide.length ? onSide : candidates).slice().sort((a, b) =>
+      Math.abs(dot(b.unit, normal)) - Math.abs(dot(a.unit, normal)) || a.unit.x - b.unit.x || a.unit.y - b.unit.y)[0];
+    let distances = [0, 0];
+    let mitered = false;
+    if (neighbor) {
+      let edgeNormal = { x: -neighbor.unit.y, y: neighbor.unit.x };
+      if (dot(edgeNormal, inward) < 0) edgeNormal = { x: -edgeNormal.x, y: -edgeNormal.y };
+      const displacement = { x: origin.x - neighbor.origin.x, y: origin.y - neighbor.origin.y };
+      const innerIsHigh = dot(neighbor.unit, normal) > 0;
+      const intersections = [low, high].map((offset, i) => {
+        const edge = (i === 1) === innerIsHigh ? neighbor.width / 2 : -neighbor.width / 2;
+        return (edge - dot(displacement, edgeNormal) - offset * dot(normal, edgeNormal)) / dot(inward, edgeNormal);
       });
-      const t = joins.length ? Math.min(...joins) : 0;
+      const limit = Math.min(width * BoldBondStyle.miterLimit, length / 4, neighbor.length / 4);
+      // Fall back as a pair: clamping each corner independently creates a false miter.
+      if (intersections.every(t => Number.isFinite(t) && Math.abs(t) <= limit)) {
+        distances = intersections;
+        mitered = true;
+      }
+    }
+    const points = [low, high].map((offset, i) => {
+      const t = distances[i]!;
       return { x: origin.x + normal.x * offset + inward.x * t,
         y: origin.y + normal.y * offset + inward.y * t };
     });
+    if (neighbor && mitered) onJoin?.({ neighbor, points });
     return reverse ? points.reverse() : points;
   };
   return [...end({ x: segment.x1, y: segment.y1 }, unit, from, false),

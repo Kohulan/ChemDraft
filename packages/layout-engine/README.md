@@ -121,13 +121,18 @@ bond display styles and remains visible with query indicators off or sketch effe
 not resolve the order or change the stored chemistry.
 
 Bold bonds use filled bands from `src/boldBonds.ts`, shared by the canvas, SVG/PDF and clipboard
-images. `BoldBondStyle.widthRatio` defaults to 3.4 times the ordinary line width, scaled with the
-document preset. Ring bands keep the ordinary outer edge fixed and grow inward; chain bands are
-centered. Ends join neighboring stroke edges with bounded miters/bevels; terminal, label-trimmed
-and crossing-cut ends are square. A bold double's pi line retains the ordinary stroke width and
-inset, displaced to leave at least `BoldBondStyle.clearGapRatio` (3.4) ordinary widths of white
-space beside the band. Larger authored gaps remain larger. Effects and Sketch trace that same plan.
-Preset `bondBoldWidthPx` values still set wedge dimensions; bold ink substitutes the ratio for
+images. `BoldBondStyle` sizes a band as `max(1.8 * lineWidth, min(3.4 * lineWidth,
+0.135 * bondLength))`: 3.6/22 units (16.36% of bond length) for the default Synthetic preset,
+2.97/22 (13.5%) for ACS 1996-style. Ring bands grow inward. Each end is one straight miter cut
+between the inner/inner and outer/outer edge intersections with the same-ring neighbor; an
+exocyclic substituent never clips the band. Neighbor strokes reach the outer miter corner so
+their butt ends cannot leave a notch. Chain bands are centered and join one neighbor per end.
+Terminal, label-trimmed, crossing-cut and degenerate/overlong-miter ends are square.
+A bold double's pi line retains exactly the normal double's position, stroke width and inset.
+If inward growth would leave less than `BoldBondStyle.clearGapRatio` (1) normal line width
+of white space, the band grows partly outward, with both edges still mitered to its neighbors.
+Effects and Sketch trace that same plan.
+Preset `bondBoldWidthPx` values still set wedge dimensions; bold ink substitutes this sizing rule for
 those historical defaults (also after uniform scaling). Custom molecule widths and explicit
 `bondBoldWidths` overrides remain authoritative. No document or chemical fields are rewritten.
 

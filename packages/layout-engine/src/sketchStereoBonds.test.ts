@@ -115,7 +115,7 @@ describe("sketch effect on stereo bonds", () => {
     const strokes = sketchStrokes("bold");
     expect(strokes).toHaveLength(4);
     expect(strokes.filter(stroke => Math.abs(stroke.length - BOND_LENGTH) < 0.01)).toHaveLength(2);
-    expect(strokes.filter(stroke => Math.abs(stroke.length - 6.8) < 0.01)).toHaveLength(2);
+    expect(strokes.filter(stroke => Math.abs(stroke.length - 3.6) < 0.01)).toHaveLength(2);
     expect(strokes.some(stroke => stroke.start === "40 60")).toBe(false);
   });
 
