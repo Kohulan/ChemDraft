@@ -127,6 +127,8 @@ images. `BoldBondStyle` sizes a band as `max(1.8 * lineWidth, min(3.4 * lineWidt
 between the inner/inner and outer/outer edge intersections with the same-ring neighbor; an
 exocyclic substituent never clips the band. Neighbor strokes reach the outer miter corner so
 their butt ends cannot leave a notch. Chain bands are centered and join one neighbor per end.
+Adjacent bold ring bands share one cached cut from their actual rendered edges, including any
+outward shift needed to clear a double bond's pi line; reversed bonds reuse the same cut.
 Terminal, label-trimmed, crossing-cut and degenerate/overlong-miter ends are square.
 A bold double's pi line retains exactly the normal double's position, stroke width and inset.
 If inward growth would leave less than `BoldBondStyle.clearGapRatio` (1) normal line width

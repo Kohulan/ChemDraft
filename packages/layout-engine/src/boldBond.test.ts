@@ -30,7 +30,100 @@ function terminal() {
   return object;
 }
 
+type Point = { x: number; y: number };
+const minus = (a: Point, b: Point) => ({ x: a.x - b.x, y: a.y - b.y });
+const cross = (a: Point, b: Point) => a.x * b.y - a.y * b.x;
+const dot = (a: Point, b: Point) => a.x * b.x + a.y * b.y;
+const inside = (points: Point[], p: Point) => {
+  const turns = points.map((a, i) => cross(minus(points[(i + 1) % 4]!, a), minus(p, a)));
+  return turns.every(t => t >= -1e-8) || turns.every(t => t <= 1e-8);
+};
+
+function expectUniformConvexBand(object: MoleculeObject, id: string, points: Point[]) {
+  expect(points).toHaveLength(4);
+  const turns = points.map((p, i) => cross(minus(points[(i + 1) % 4]!, p),
+    minus(points[(i + 2) % 4]!, points[(i + 1) % 4]!)));
+  expect(turns.every(t => t > 0) || turns.every(t => t < 0)).toBe(true);
+  const bond = object.bonds.find(b => b.id === id)!;
+  const a = object.atoms.find(a => a.id === bond.fromAtomId)!;
+  const b = object.atoms.find(a => a.id === bond.toAtomId)!;
+  const length = Math.hypot(b.x - a.x, b.y - a.y);
+  const unit = { x: (b.x - a.x) / length, y: (b.y - a.y) / length };
+  const normal = { x: -unit.y, y: unit.x };
+  const local = points.map(p => ({ x: dot(minus(p, a), unit), y: dot(minus(p, a), normal) }));
+  for (const fraction of [0.3, 0.5, 0.7]) {
+    const x = length * fraction;
+    const hits = local.flatMap((p, i) => {
+      const q = local[(i + 1) % 4]!;
+      if ((x - p.x) * (x - q.x) > 0 || Math.abs(q.x - p.x) < 1e-8) return [];
+      return [p.y + (q.y - p.y) * (x - p.x) / (q.x - p.x)];
+    });
+    expect(hits).toHaveLength(2);
+    expect(Math.abs(Math.abs(hits[1]! - hits[0]!) - 6.48)).toBeLessThan(0.002);
+  }
+}
+
 describe("bold band geometry", () => {
+  for (const count of [2, 3, 6]) {
+    for (const reverseMask of count === 2 ? [0, 1, 2, 3] : [0, 1, 2, 5, (1 << count) - 1]) {
+      it.each([
+        { withDouble: false, angle: 0 }, { withDouble: true, angle: 0 },
+        { withDouble: false, angle: 0.37 }, { withDouble: true, angle: 0.37 }
+      ])(`shares cuts without gaps or overlaps for ${count} bold ring bonds (directions ${reverseMask}, double $withDouble, rotation $angle)`, ({ withDouble, angle }) => {
+        const { object } = boldBondFixture(withDouble ? "double" : "ring");
+        for (const atom of object.atoms) {
+          const { x, y } = atom;
+          atom.x = x * Math.cos(angle) - y * Math.sin(angle);
+          atom.y = x * Math.sin(angle) + y * Math.cos(angle);
+        }
+        for (let i = 0; i < count; i++) {
+          const bond = object.bonds[i]!;
+          bond.display = { ...bond.display, bondStyle: "bold" };
+        }
+        const originals = Array.from({ length: count }, (_, i) => polygon(object, `b${i}`)
+          .map(p => `${p.x},${p.y}`).sort());
+        for (let i = 0; i < count; i++) {
+          const bond = object.bonds[i]!;
+          if (reverseMask & (1 << i)) [bond.fromAtomId, bond.toAtomId] = [bond.toAtomId, bond.fromAtomId];
+        }
+        object.bonds.reverse(); // Also exercise which band computes the cached joint first.
+        const before = JSON.stringify(object);
+        const bands = Array.from({ length: count }, (_, i) => polygon(object, `b${i}`));
+        bands.forEach((band, i) => {
+          expectUniformConvexBand(object, `b${i}`, band);
+          expect(band.map(p => `${p.x},${p.y}`).sort()).toEqual(originals[i]);
+        });
+        for (let i = 0; i < (count === 6 ? count : count - 1); i++) {
+          const j = (i + 1) % count;
+          const bond = object.bonds.find(b => b.id === `b${i}`)!;
+          const next = object.bonds.find(b => b.id === `b${j}`)!;
+          const atomId = [bond.fromAtomId, bond.toAtomId].find(id => [next.fromAtomId, next.toAtomId].includes(id))!;
+          const cut = (points: Point[], from: boolean) => from ? points.slice(0, 2) : points.slice(2, 4);
+          const a = cut(bands[i]!, bond.fromAtomId === atomId);
+          const b = cut(bands[j]!, next.fromAtomId === atomId);
+          for (const p of a) expect(Math.min(...b.map(q => Math.hypot(p.x - q.x, p.y - q.y)))).toBeLessThan(1e-6);
+          // Convex bands occupy opposite half-planes of exactly the same cut:
+          // their interiors cannot overlap, and their union fills both sides.
+          const edge = minus(a[1]!, a[0]!);
+          const side = (p: Point) => cross(edge, minus(p, a[0]!));
+          const interiorA = bands[i]!.filter(p => !a.includes(p)).map(side);
+          const interiorB = bands[j]!.filter(p => !b.includes(p)).map(side);
+          expect(interiorA.every(s => s * interiorA[0]! > 0)).toBe(true);
+          expect(interiorB.every(s => s * interiorA[0]! < 0)).toBe(true);
+          const size = Math.hypot(edge.x, edge.y);
+          for (const t of [0.1, 0.3, 0.5, 0.7, 0.9]) {
+            for (const sign of [-1, 1]) {
+              const p = { x: a[0]!.x + edge.x * t - sign * edge.y / size * 0.01,
+                y: a[0]!.y + edge.y * t + sign * edge.x / size * 0.01 };
+              expect(Number(inside(bands[i]!, p)) + Number(inside(bands[j]!, p))).toBe(1);
+            }
+          }
+        }
+        expect(JSON.stringify(object)).toBe(before);
+      });
+    }
+  }
+
   it("reports the default and ACS-like width ratios", () => {
     expect(boldBondWidth(2, 22)).toBeCloseTo(3.6);
     expect(boldBondWidth(2, 22) / 22).toBeCloseTo(0.16363636);
