@@ -556,6 +556,9 @@ export interface ToolsetFlyoutSession {
 }
 export interface ToolsetFlyoutKey extends ToolsetFlyoutSession {
   key: string;
+  /** Document-owned E/Z navigation includes its exact session and reverse Tab. */
+  sessionId?: string;
+  shiftKey?: boolean;
 }
 const TOOLSET_FLYOUT_KEY_EVENT = "chemdraft://toolset-flyout-key";
 const TOOLSET_FLYOUT_CLOSED_EVENT = "chemdraft://toolset-flyout-closed";

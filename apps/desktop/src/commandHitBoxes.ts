@@ -1,3 +1,10 @@
+/** Shared by renderer defaults and native command hit regions, including custom palettes. */
+export function isPaletteCommandButton(element: Element): boolean {
+  const button = element.closest("button");
+  return !!button && !element.closest('input, textarea, select, [contenteditable="true"], [role="slider"]') &&
+    !button.closest(".customizing, .toolbar-color-popover, .art-color-popover");
+}
+
 export interface PhysicalClientRect {
   x: number;
   y: number;
@@ -20,9 +27,8 @@ export function physicalClientRect(
 }
 
 export function commandButtonHitBoxes(root: ParentNode, scale: number): PhysicalClientRect[] {
-  return [...root.querySelectorAll<HTMLButtonElement>(
-    'button[data-native-noactivate-command="true"]:not(:disabled)'
-  )].flatMap((button) => {
+  return [...root.querySelectorAll<HTMLButtonElement>("button")].flatMap((button) => {
+    if (!isPaletteCommandButton(button)) return [];
     const bounds = physicalClientRect(button.getBoundingClientRect(), scale);
     return bounds ? [bounds] : [];
   });

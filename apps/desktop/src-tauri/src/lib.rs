@@ -5698,7 +5698,7 @@ fn build_toolset_popover_window(
 }
 
 /// Reapply the requested focus policy on every reuse, including keyboard → mouse.
-/// Only E/Z keyboard opens use Focus; palette colour fields borrow the keyboard through
+/// Only macOS E/Z keyboard opens use Focus; palette colour fields borrow the keyboard through
 /// the guarded input lease instead (see `effective_toolset_popover_focus_mode`).
 fn configure_toolset_popover_window<R: Runtime>(
     window: &tauri::WebviewWindow<R>,
@@ -5722,10 +5722,7 @@ fn configure_toolset_popover_window<R: Runtime>(
                 SetWindowLongPtrW(
                     hwnd,
                     GWL_EXSTYLE,
-                    toolset_popover_extended_style(
-                        GetWindowLongPtrW(hwnd, GWL_EXSTYLE),
-                        focus_mode,
-                    ),
+                    toolset_popover_extended_style(GetWindowLongPtrW(hwnd, GWL_EXSTYLE)),
                 );
             }
         }
@@ -5734,16 +5731,11 @@ fn configure_toolset_popover_window<R: Runtime>(
 }
 
 #[cfg(windows)]
-fn toolset_popover_extended_style(style: isize, focus_mode: ToolsetPopoverFocusMode) -> isize {
+fn toolset_popover_extended_style(style: isize) -> isize {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     };
-    let style = (style | WS_EX_TOOLWINDOW as isize) & !(WS_EX_APPWINDOW as isize);
-    if focus_mode == ToolsetPopoverFocusMode::Preserve {
-        style | WS_EX_NOACTIVATE as isize
-    } else {
-        style & !(WS_EX_NOACTIVATE as isize)
-    }
+    (style | (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) as isize) & !(WS_EX_APPWINDOW as isize)
 }
 
 #[tauri::command]
@@ -5761,16 +5753,24 @@ fn toolset_popover_window_label(toolset_id: &str) -> String {
 
 /// Palette popovers (colour pickers and flyouts) never take key status when they open: their
 /// text fields borrow the keyboard through the guarded input lease (`install_toolset_input_focus`),
-/// like palette settings. Only the E/Z popover honours a keyboard open's request for real focus,
-/// because its choices are buttons, which never lease.
+/// like palette settings. macOS E/Z keyboard opens retain native focus; Windows
+/// routes navigation from the document and never grants this exception.
 fn effective_toolset_popover_focus_mode(
     label: &str,
     requested: ToolsetPopoverFocusMode,
 ) -> ToolsetPopoverFocusMode {
-    if label == toolset_popover_window_label("core.bondStereo") {
-        requested
-    } else {
+    #[cfg(windows)]
+    {
+        let _ = (label, requested);
         ToolsetPopoverFocusMode::Preserve
+    }
+    #[cfg(not(windows))]
+    {
+        if label == toolset_popover_window_label("core.bondStereo") {
+            requested
+        } else {
+            ToolsetPopoverFocusMode::Preserve
+        }
     }
 }
 
@@ -6126,8 +6126,11 @@ fn set_palette_command_hit_boxes(
     window: tauri::WebviewWindow,
     boxes: Vec<panel_window::PaletteCommandHitBox>,
 ) -> Result<(), String> {
-    if !window.label().starts_with("toolset-core-") {
-        return Err("Expected a core tool palette.".into());
+    if !["toolset-core-", "toolset-plugin-", "toolset-user-"]
+        .iter()
+        .any(|prefix| window.label().starts_with(prefix))
+    {
+        return Err("Expected a tool palette.".into());
     }
     #[cfg(windows)]
     {
@@ -11770,17 +11773,12 @@ mod tests {
             WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
         };
         assert_bond_stereo_mouse_creation();
-        let style = toolset_popover_extended_style(
-            WS_EX_APPWINDOW as isize,
-            ToolsetPopoverFocusMode::Preserve,
-        );
+        let style = toolset_popover_extended_style(WS_EX_APPWINDOW as isize);
         assert_ne!(style & WS_EX_NOACTIVATE as isize, 0);
         assert_ne!(style & WS_EX_TOOLWINDOW as isize, 0);
         assert_eq!(style & WS_EX_APPWINDOW as isize, 0);
-        // Reusing the same window for an explicit keyboard focus lease must work.
-        let focused = toolset_popover_extended_style(style, ToolsetPopoverFocusMode::Focus);
-        assert_eq!(focused & WS_EX_NOACTIVATE as isize, 0);
-        assert_ne!(focused & WS_EX_TOOLWINDOW as isize, 0);
+        // Reuse keeps the no-activation style, including keyboard E/Z opens.
+        assert_eq!(toolset_popover_extended_style(style), style);
     }
 
     #[cfg(not(windows))]
@@ -11848,7 +11846,11 @@ mod tests {
         let bond_stereo = toolset_popover_window_label("core.bondStereo");
         assert!(
             effective_toolset_popover_focus_mode(&bond_stereo, ToolsetPopoverFocusMode::Focus)
-                == ToolsetPopoverFocusMode::Focus
+                == if cfg!(windows) {
+                    ToolsetPopoverFocusMode::Preserve
+                } else {
+                    ToolsetPopoverFocusMode::Focus
+                }
         );
         assert!(
             effective_toolset_popover_focus_mode(&bond_stereo, ToolsetPopoverFocusMode::Preserve)

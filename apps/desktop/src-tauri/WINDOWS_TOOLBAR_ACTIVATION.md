@@ -1,5 +1,126 @@
 # Windows toolbar activation investigation
 
+## Renderer follow-up handoff — 2026-11-15
+
+Implementation is ready for integration review; verification remains partial. The
+historical native-only investigation below is retained as evidence, and its
+"remaining renderer work" is superseded by this section. Build stamp:
+`11.15.08.11-codex`. No commit, install, or app launch was performed.
+
+### Changes and ordering
+
+- `ToolPalette` and `PalettePopoverWindow` capture pointerdown and mousedown to
+  cancel Windows command-button focus defaults. Capture still reaches buttons
+  whose own handlers stop propagation. Pointerup, click, pointer capture, and the
+  200 ms hold timer are unchanged. `platform` defaults to the existing detector
+  and is supplied by `PaletteWindow`; macOS keeps its pointer defaults.
+- Inputs, selects, contenteditable controls, sliders, and colour-picker bodies
+  retain their pointer defaults. The same command predicate supplies native hit
+  rectangles, now including non-drawing commands, disabled command buttons, and
+  custom/plugin palettes. Editable bounds and customization slots stay excluded.
+  The native label guard and Windows capability grant admit these palette labels
+  only, not plugin report windows.
+- Windows E/Z creation/reveal uses Preserve. The document's `useBondStereoPopover`
+  routes Tab/Shift+Tab, arrows, Enter and Space through the existing flyout key
+  channel, including the exact E/Z session identity. The renderer highlights and
+  chooses enabled actions/Keep unspecified without native or DOM focus. Repeated
+  activation and its keyup default are consumed even after closure. macOS keeps
+  its window/webview focus and Tab loop. Rust no longer accepts the Windows
+  E/Z Focus exception and retains `WS_EX_NOACTIVATE` on reuse.
+- Dismissal previously invalidated the owner's request/replay immediately but
+  queued native close behind `popoverOperationsRef`. The broadcast was prompt,
+  but depended on the popover renderer servicing it; a slow open/content
+  acknowledgement could delay the owner's native hide. Dismissal now starts the
+  identity-checked native close immediately. An ordered close remains behind
+  pending work, before subsequent opens, to sweep up a cancelled cold open.
+  Existing request/generation checks, replay invalidation, and receiver dismissal
+  timestamps prevent delayed content or positioning from reviving the old menu.
+  This queue bottleneck was established by source tracing; the reported Windows
+  shadow/persistence was not reproduced on this host.
+- Added a regression for 350 ms Charge hold, short same-button press, immediate
+  hide before a blocked content acknowledgement, exactly one primary invocation,
+  no reopening after 650 ms or after the acknowledgement. Added a delayed-position
+  reveal/replay regression and platform-specific focus/navigation coverage.
+
+### Changed expectations and reasons
+
+1. `paletteInputFocusCapabilities.test.ts`: replaced the old `active_command_hit`
+   late return and `app_was_active` gate assertions with policy selection **before**
+   `DefSubclassProc`, synchronous command observation, and default delegation only
+   for non-command surfaces. The previous native commit intentionally changed
+   this ordering to prevent activation side effects, even when ChemDraft was not
+   foreground. The native colour-popup default and already-active input-lease
+   assertions remain. Its core-only hitbox assertion now expects core/plugin/user
+   labels and their matching capability grant because all these command surfaces
+   use the same focus policy.
+2. `commandHitBoxes.test.ts`: changed one marked drawing rectangle to four command
+   rectangles, including unmarked/custom and disabled buttons. Disabled commands
+   must still avoid activation; they remain unable to invoke. Customization is
+   now explicitly identified by `.customizing`, rather than inferred from missing
+   drawing-command metadata. Editable/colour-picker/slider exclusions remain.
+3. `PalettePopoverWindow.bondStereo.dom.test.tsx`: creation and reveal expect
+   Preserve for Windows keyboard opens, Focus only for macOS keyboard opens.
+   The former two-platform focused Tab/Enter test is retained for macOS; new
+   Windows tests assert document-owned key routing, visual highlighting, stale
+   session rejection, exactly-once choice, and zero native/DOM focus transfer.
+   Windows keyboard E/Z is also included in idle-activation handback coverage,
+   because it no longer has the old focused-reveal exemption.
+4. Rust `bond_stereo_mouse_popover_is_owned_and_nonactivating`: reuse now retains
+   `WS_EX_NOACTIVATE`, instead of asserting that Focus removes it. Rust
+   `palette_popovers_open_without_focus_and_lease_their_fields` now expects the
+   Windows E/Z Focus request to resolve to Preserve, while macOS still expects
+   Focus. Both changes follow document-owned Windows navigation.
+
+### Verification and remaining gate
+
+- macOS Apple silicon: native fmt and clippy with `-D warnings` passed. The local
+  Sparkle framework was copied into the ignored worktree build-support path after
+  the initial clippy attempt reported it missing; no download or install occurred.
+- Full native tests: 839 passed, 27 failed, 9 ignored. All 27 failures are
+  sandbox-denied loopback socket operations (`Operation not permitted`). The
+  unrelated fake sidecar test passed in this run. The focused `panel_window::`
+  native suite passed all 45 tests.
+- Targeted Vitest tests pass (10 palette input-focus, 7 core capability-grant,
+  and 2 command hit-region tests). Seven DOM suites cannot load this isolated
+  worktree's missing React and Tauri API dependency links. This includes the
+  newly added regressions; no DOM result is claimed. `pnpm install` was not run.
+- Windows compile/clippy/tests and Windows runtime are unverified. Neither macOS
+  runtime (Apple silicon or Intel) was launched, per the worker's scoped test-only
+  instructions. Re-run the named DOM suites with dependency links present and
+  the full native suite in an environment that permits loopback sockets.
+
+Named frontend files attempted with `pnpm vitest run --configLoader runner --no-cache`:
+`paletteInputFocusCapabilities.test.ts`, `coreCapabilityGrants.test.ts`,
+`commandHitBoxes.test.ts`, `ToolPalette.dom.test.ts`,
+`PalettePopoverWindow.bondStereo.dom.test.tsx`,
+`PaletteWindow.popoverCleanup.dom.test.tsx`, `PaletteWindow.nativeFlyout.dom.test.tsx`,
+`MainWindow.nativeFlyout.dom.test.tsx`, `ToolPalette.colorPicker.dom.test.tsx`, and
+`window-manager/popover-dismiss.dom.test.ts` (all under `apps/desktop/src/`).
+
+Windows hands-on checks still required, using real mouse/keyboard events:
+
+1. Fresh launch, then repeat after HEX typing, system colour chooser use, caption
+   editing, and shortcuts: Charge/bond/ring/menu choices never activate the
+   command window or darken its shadow. Capture active/foreground HWND and the
+   existing native activation logs alongside video.
+2. A 350 ms Charge hold opens at the unchanged 200 ms threshold without selecting
+   Charge. A short same-button press dismisses promptly and selects once. Repeat
+   with delayed cold opens/content delivery, rapid alternate holds, and mouse-up
+   outside the owner; no stale reveal or close may affect a newer menu.
+3. E/Z keyboard open retains the document HWND and DOM focus; Tab/Shift+Tab,
+   arrows, Enter/Space, held keys, Escape, disabled choices and Keep unspecified
+   work once. Mouse E/Z opens likewise remain nonactivating.
+4. Verify HEX/RGB inputs, caption fields, native colour/select choosers and slider
+   editing still acquire their normal focus; customization drag/drop, disabled
+   buttons, core/plugin/user palettes, mixed DPI, geometry, dragging, and app
+   switching still behave correctly. Repeat macOS pointer/hold and E/Z keyboard
+   checks on Apple silicon and Intel to confirm the retained behavior.
+
+Recommended next task: run those Windows real-event checks and the blocked DOM
+regressions before merging.
+
+## Historical native-only handoff
+
 Native-only handoff, 2026-11-15. Windows execution and the reported shadow blink
 have not been reproduced on this macOS host. This is a partial fix: WebView2's
 DOM focus defaults and explicit E/Z keyboard focus remain outside this change.

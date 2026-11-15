@@ -1,4 +1,7 @@
 import { paletteFocusDiagnostic } from "./paletteFocusDiagnostic";
+import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
+import { detectDesktopShortcutPlatform } from "./keyboardShortcuts";
+import { preventPaletteCommandPointerFocus } from "./paletteCommandPointerFocus";
 import { waveSettingRanges, type WaveSetting } from "@chemdraft/art-engine";
 import { isBlockedByModalDialog } from "@chemdraft/shortcut-engine";
 import {
@@ -241,7 +244,8 @@ export function ToolPalette({
   onRequestFlyout,
   onInvoke,
   widgetState,
-  customize
+  customize,
+  platform = detectDesktopShortcutPlatform()
 }: {
   groups?: CommandSpec[][];
   itemGroups?: ToolbarPaletteItemModel[][];
@@ -256,6 +260,7 @@ export function ToolPalette({
   /** Live state + callbacks for the widget sections (style controls, inspectors), provided via
    *  context to the widgets declared as manifest `control` items. */
   widgetState?: ToolbarWidgetState;
+  platform?: ShortcutPlatform;
   /** When set, render in-place customize mode: each grid item becomes a dnd-kit sortable slot (no
    *  invoke/flyout/tooltip handlers), grouped by these group ids (aligned with the item groups,
    *  BEFORE the widget filter). A DndContext must wrap this component (ToolbarCustomizeController). */
@@ -400,6 +405,8 @@ export function ToolPalette({
         aria-label={title}
         data-tool-palette-orientation={orientation}
         data-tooltip-delay-ms={TOOLTIP_DELAY_MS}
+        onPointerDownCapture={event => { if (!customize) preventPaletteCommandPointerFocus(event, platform); }}
+        onMouseDownCapture={event => { if (!customize) preventPaletteCommandPointerFocus(event, platform); }}
       >
         {mode === "floating" && !customize ? (
           // The palette shell handles this grip through the same drag command as the title.

@@ -8,13 +8,17 @@ import { PaletteWindow } from "./PaletteWindow";
 const native = vi.hoisted(() => ({
   visible: false,
   open: vi.fn(async () => {}),
+  contentAck: vi.fn(async () => {}),
   invoke: vi.fn(async (command: string, _args?: unknown) => {
     if (command === "window_logical_position") return { x: 100, y: 100 };
     if (command === "open_toolset_popover") await native.open();
     if (command === "close_toolset_popover") native.visible = false;
   }),
   emit: vi.fn(async (event: string, _payload?: unknown) => {
-    if (event === "chemdraft://toolset-popover-content") native.visible = true;
+    if (event === "chemdraft://toolset-popover-content") {
+      native.visible = true;
+      await native.contentAck();
+    }
   })
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: native.invoke, isTauri: () => true }));
@@ -56,6 +60,7 @@ describe.each(["macos", "windows"] as const)("palette cleanup during native open
     container.remove();
     delete host.__TAURI__;
     vi.restoreAllMocks();
+    vi.useRealTimers();
   });
 
   async function openFlyout() {
@@ -63,6 +68,43 @@ describe.each(["macos", "windows"] as const)("palette cleanup during native open
     expect(button).not.toBeNull();
     await act(async () => button.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true })));
   }
+
+  it("hides promptly after a 350 ms Charge hold then short same-button press, before a delayed content acknowledgement", async () => {
+    await act(async () => root!.render(createElement(PaletteWindow, { key: "main", toolsetId: "core.main", platform })));
+    // Unlike the equal-timestamp identity tests below, this models elapsed press time.
+    vi.mocked(performance.now).mockRestore();
+    vi.useFakeTimers();
+    const button = container.querySelector<HTMLButtonElement>('[data-command-id="tool.charge"]')!;
+    expect(button).not.toBeNull();
+    let acknowledge!: () => void;
+    native.contentAck.mockImplementationOnce(() => new Promise<void>(resolve => { acknowledge = resolve; }));
+    const pointer = async (type: string) => act(async () => {
+      button.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, button: 0 }));
+    });
+    const commands = () => native.invoke.mock.calls.filter(([command]) => command === "route_toolset_command");
+    await pointer("pointerdown");
+    await act(async () => vi.advanceTimersByTimeAsync(199));
+    expect(native.visible).toBe(false);
+    await act(async () => vi.advanceTimersByTimeAsync(151));
+    expect(native.visible).toBe(true);
+    expect(acknowledge).toBeTypeOf("function");
+    await pointer("pointerup"); await pointer("click");
+    expect(commands()).toHaveLength(0);
+
+    await pointer("pointerdown");
+    // The owner queue is still awaiting contentAck. Native close must bypass it.
+    expect(native.visible).toBe(false);
+    await act(async () => vi.advanceTimersByTimeAsync(30));
+    await pointer("pointerup"); await pointer("click");
+    expect(commands()).toHaveLength(1);
+    expect(commands()[0][1]).toMatchObject({ commandId: "tool.charge" });
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(native.visible).toBe(false);
+    await act(async () => acknowledge());
+    expect(native.visible).toBe(false);
+    expect(native.emit.mock.calls.filter(([event]) => event === "chemdraft://toolset-popover-content")).toHaveLength(1);
+    expect(commands()).toHaveLength(1);
+  });
 
   it.each(["later timestamp", "same timestamp", "first opening"] as const)(
     "closes the native popover when unmounted before a %s registers content", async opening => {

@@ -835,21 +835,30 @@ export function PaletteWindow({
     undefined
   );
   const popoverOperationsRef = useRef(Promise.resolve());
+  const pendingPopoverOperationsRef = useRef(0);
   // A flyout press invalidates older work immediately, even while its native open is queued.
   // Swatch presses themselves remain ordered toggles rather than cancelling one another.
   const popoverRequestRef = useRef(0);
   const enqueuePopoverOperation = (operation: () => Promise<void>) => {
-    popoverOperationsRef.current = popoverOperationsRef.current.then(operation).catch(() => undefined);
+    ++pendingPopoverOperationsRef.current;
+    popoverOperationsRef.current = popoverOperationsRef.current.then(operation).catch(() => undefined)
+      .finally(() => { --pendingPopoverOperationsRef.current; });
   };
 
   const dismissPaletteFlyouts = () => {
     // A native open may still be queued when this click arrives. Invalidate it
-    // immediately and clear its mount replay; close only after that work settles.
+    // immediately and clear its mount replay. Hide now, without waiting for a
+    // slow native open/content acknowledgement in popoverOperationsRef. Retain
+    // the ordered close as a barrier before the next open: pending old work may
+    // still finish, but cannot reveal or close a newer generation.
     ++popoverRequestRef.current;
     const opening = lastPopoverPayloadRef.current?.content;
     lastPopoverPayloadRef.current = undefined;
+    const pendingWork = pendingPopoverOperationsRef.current > 0;
+    const hidden = closeToolsetPopoverWindow(toolset.id, opening?.openedAt, opening?.generation).catch(() => undefined);
     enqueuePopoverOperation(async () => {
-      await closeToolsetPopoverWindow(toolset.id, opening?.openedAt, opening?.generation);
+      await hidden;
+      if (pendingWork) await closeToolsetPopoverWindow(toolset.id, opening?.openedAt, opening?.generation);
     });
     void dismissToolsetPopovers(toolsetPopoverTimestamp()).catch(() => undefined);
   };
@@ -1112,6 +1121,7 @@ export function PaletteWindow({
     const renderItemGroups = renderGroups.map((group) => group.items);
     return (
       <ToolPalette
+        platform={platform}
         groups={paletteCommandGroupsFromItemGroups(renderItemGroups)}
         itemGroups={renderItemGroups}
         gridLayout={toolset.gridLayout}
@@ -1163,7 +1173,7 @@ export function PaletteWindow({
     : !currentMoleculeInspector?.targets.moleculeObjectIds.length);
 
   useEffect(() => {
-    if (platform !== "windows" || !toolsetId.startsWith("core.")) return;
+    if (platform !== "windows") return;
     if (customizeThisPalette) {
       void setPaletteCommandHitBoxes([]).catch(() => undefined);
       return;
@@ -1183,7 +1193,7 @@ export function PaletteWindow({
     const resizeObserver = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(publish);
     resizeObserver?.observe(body);
     const mutationObserver = new MutationObserver(publish);
-    mutationObserver.observe(body, { subtree: true, childList: true, attributes: true, attributeFilter: ["disabled", "data-native-noactivate-command", "data-command-id", "style"] });
+    mutationObserver.observe(body, { subtree: true, childList: true, attributes: true, attributeFilter: ["disabled", "data-native-noactivate-command", "data-command-id", "style", "class"] });
     window.addEventListener("resize", publish);
     window.addEventListener("scroll", publish, true);
     let unlistenRefresh: (() => void) | undefined;

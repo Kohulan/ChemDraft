@@ -715,7 +715,9 @@ pub(crate) fn install_input_focus<R: tauri::Runtime>(
             );
         }),
         stable_nonclient_paint: window.label().starts_with("toolset-"),
-        command_hit_boxes: window.label().starts_with("toolset-core-"),
+        command_hit_boxes: ["toolset-core-", "toolset-plugin-", "toolset-user-"]
+            .iter()
+            .any(|prefix| window.label().starts_with(prefix)),
         activation: std::rc::Rc::new(move |active| activation(&target, active)),
         drag_finished: std::rc::Rc::new(move || {
             // The palette's title/background press ended its lease without returning focus.

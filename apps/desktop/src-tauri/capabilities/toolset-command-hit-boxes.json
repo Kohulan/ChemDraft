@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "toolset-command-hit-boxes",
-  "description": "Allow Windows drawing palettes to report the locations of their command buttons.",
+  "description": "Allow Windows tool palettes to report the locations of their non-editable command buttons.",
   "platforms": ["windows"],
-  "windows": ["toolset-core-*"],
+  "windows": ["toolset-core-*", "toolset-plugin-*", "toolset-user-*"],
   "permissions": ["allow-set-palette-command-hit-boxes"]
 }

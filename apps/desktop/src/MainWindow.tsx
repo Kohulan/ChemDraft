@@ -1774,7 +1774,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.14.19.34-codex";
+const CURRENT_BUILD_STAMP = "11.15.08.11-codex";
 const VibeCodeGuideForm = lazy(() => import("./dialogs/VibeCodeGuideForm").then(module => ({ default: module.VibeCodeGuideForm })));
 const StructureTemplatePicker = lazy(() => import("./dialogs/StructureTemplatePicker").then(module => ({ default: module.StructureTemplatePicker })));
 /** Starts in the background for the document webview under the existing probe gate. */
@@ -21939,7 +21939,7 @@ export function MainWindow({
       canvasRegionRef.current?.focus({ preventScroll: true });
       void focusCurrentWindowAndWebview({ onlyIfAppActive: true }).catch(() => undefined);
     }
-  });
+  }, shortcutPlatform);
 
   // Handlers every object view receives. Most of them close over the document, so their identities
   // change on every edit, which forced all of a page's object views to re-render: 5,000 molecules

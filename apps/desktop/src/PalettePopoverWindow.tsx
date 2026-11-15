@@ -6,6 +6,7 @@ import { toolbarAsset, type ToolbarAssetName } from "./toolbarAssets";
 import { normalizeHexColor, objectCustomColorCommandId, textCustomColorCommandId } from "./commands";
 import { installPaletteInputFocus } from "./plugins/pluginPanelInputFocus";
 import { detectDesktopShortcutPlatform } from "./keyboardShortcuts";
+import { preventPaletteCommandPointerFocus } from "./paletteCommandPointerFocus";
 import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import {
   listenForToolsetPopoverContent,
@@ -218,8 +219,10 @@ export function PalettePopoverWindow({
       contentPushedRef.current = true;
       if (compareToolsetPopoverOpenings(opening, contentRef.current) !== 0 || payload.kind !== "flyout" ||
           contentRef.current.kind !== "flyout" || contentRef.current.flyout.flyoutId !== payload.flyout.flyoutId) {
-        highlightedCommandRef.current = undefined;
-        setHighlightedCommandId(undefined);
+        highlightedCommandRef.current = platform === "windows" && payload.kind === "flyout" &&
+          payload.flyout.variant === "bondStereo" && payload.flyout.keyboardOpen
+          ? payload.flyout.commands.find(command => command.enabled)?.id ?? "keep" : undefined;
+        setHighlightedCommandId(highlightedCommandRef.current);
       }
       contentOpenedAt.current = openedAt;
       dismissedRef.current = false;
@@ -237,7 +240,7 @@ export function PalettePopoverWindow({
       })
       .catch(() => undefined);
     return () => unlisten?.();
-  }, [toolsetId]);
+  }, [toolsetId, platform]);
 
   // Follow the shared broadcast so the colour picker always opens on the current object's colour.
   useEffect(() => {
@@ -347,11 +350,10 @@ export function PalettePopoverWindow({
       }
       resetScroll();
       try {
-        // Rust maps other popovers to Preserve; their fields lease the keyboard.
-        // Only a deliberate E/Z keyboard reveal owns focus without a field lease.
+        // Windows E/Z keys stay in the document; macOS retains its native focus.
         const preserveFocus = content.kind === "flyout" &&
-          !(content.flyout.variant === "bondStereo" && content.flyout.keyboardOpen);
-        keepWindowFocusRef.current = toolsetId === "core.bondStereo" && content.kind === "flyout" &&
+          (platform === "windows" || !(content.flyout.variant === "bondStereo" && content.flyout.keyboardOpen));
+        keepWindowFocusRef.current = platform !== "windows" && toolsetId === "core.bondStereo" && content.kind === "flyout" &&
           content.flyout.variant === "bondStereo" && !!content.flyout.keyboardOpen;
         await showCurrentToolsetPopoverWindow(preserveFocus ? "preserve" : "focus", content.kind);
         resetScroll("reveal");
@@ -361,7 +363,7 @@ export function PalettePopoverWindow({
           if (contentRef.current === content) hidePopoverWindow();
           return;
         }
-        if (content.kind === "flyout" && content.flyout.variant === "bondStereo" && content.flyout.keyboardOpen && !cancelled && !dismissedRef.current) {
+        if (platform !== "windows" && content.kind === "flyout" && content.flyout.variant === "bondStereo" && content.flyout.keyboardOpen && !cancelled && !dismissedRef.current) {
           const [{ getCurrentWindow }, { getCurrentWebview }] = await Promise.all([
             import("@tauri-apps/api/window"), import("@tauri-apps/api/webview")
           ]);
@@ -395,7 +397,7 @@ export function PalettePopoverWindow({
       window.clearTimeout(scrubTimer);
       document.body.style.backgroundColor = "";
     };
-  }, [content, prewarm, toolsetId]);
+  }, [content, prewarm, toolsetId, platform]);
 
   // Safety net for a cold user-initiated open: if content never arrives (e.g. the owning palette went
   // away mid-open), show anyway so the window can't get stuck invisible. Prewarmed windows are the
@@ -520,7 +522,7 @@ export function PalettePopoverWindow({
     dismissedRef.current = true;
     const current = contentRef.current;
     if (current.kind === "flyout" && current.flyout.variant === "bondStereo" && current.flyout.id) {
-      const action = command.id === "molecule.bondStereo:flipped" ? "flipped" : "geometry";
+      const action = command.id === "keep" ? "keep" : command.id === "molecule.bondStereo:flipped" ? "flipped" : "geometry";
       void sendBondStereoPopoverAction({ sessionId: current.flyout.id, action }).catch(() => undefined);
     } else void sendPaletteCommand(command.id).catch(() => undefined);
     hidePopoverWindow();
@@ -531,15 +533,18 @@ export function PalettePopoverWindow({
     let unlisten: (() => void) | undefined;
     void listenForToolsetFlyoutKeys(payload => {
       const current = contentRef.current;
-      if (disposed || dismissedRef.current || current.kind !== "flyout" || current.flyout.variant === "bondStereo" ||
+      if (disposed || dismissedRef.current || current.kind !== "flyout" ||
           payload.toolsetId !== toolsetId || payload.flyoutId !== current.flyout.flyoutId ||
           payload.openedAt !== contentOpenedAt.current) return;
+      const bondStereo = current.flyout.variant === "bondStereo";
+      if (bondStereo && (platform !== "windows" || payload.sessionId !== current.flyout.id)) return;
       const commands = current.flyout.commands.filter(command => command.enabled);
+      if (bondStereo) commands.push({ id: "keep", title: "Keep unspecified", enabled: true, active: false });
       // Match the inline flyout: both axes navigate, including multi-column ring
       // grids. The owning palette's orientation does not determine its menu's axis.
-      const backward = payload.key === "ArrowLeft" || payload.key === "ArrowUp";
+      const backward = payload.key === "ArrowLeft" || payload.key === "ArrowUp" || (payload.key === "Tab" && payload.shiftKey);
       const index = commands.findIndex(command => command.id === highlightedCommandRef.current);
-      if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(payload.key)) {
+      if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(payload.key) || (bondStereo && payload.key === "Tab")) {
         const next = index < 0 ? (backward ? commands.length - 1 : 0)
           : (index + (backward ? commands.length - 1 : 1)) % commands.length;
         highlightedCommandRef.current = commands[next]?.id;
@@ -551,14 +556,16 @@ export function PalettePopoverWindow({
       }
     }).then(stop => { if (disposed) stop(); else unlisten = stop; }).catch(() => undefined);
     return () => { disposed = true; unlisten?.(); };
-  }, [toolsetId]);
+  }, [toolsetId, platform]);
 
 	return (
-	  <div ref={shellRef} className="palette-popover-shell" data-popover-kind={content.kind}>
+	  <div ref={shellRef} className="palette-popover-shell" data-popover-kind={content.kind}
+      onPointerDownCapture={event => preventPaletteCommandPointerFocus(event, platform)}
+      onMouseDownCapture={event => preventPaletteCommandPointerFocus(event, platform)}>
       {content.kind === "flyout" && content.flyout.variant === "bondStereo" ? (
         <div className="bond-stereo-popover" role="dialog" aria-label="E/Z not specified"
           onKeyDown={event => {
-            if (event.key !== "Tab") return;
+            if (event.key !== "Tab" || platform === "windows") return;
             const buttons = [...event.currentTarget.querySelectorAll<HTMLButtonElement>("button:not(:disabled)")];
             const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
             event.preventDefault(); event.stopPropagation();
@@ -567,8 +574,9 @@ export function PalettePopoverWindow({
           <strong>E/Z not specified</strong>
           <p>This double bond's geometry wasn't given, so ChemDraft shows it as either E or Z.</p>
           {content.flyout.commands.map(command => <button key={command.id} type="button" disabled={!command.enabled}
+            data-keyboard-highlighted={command.enabled && command.id === highlightedCommandId || undefined}
             title={command.disabledReason} data-command-id={command.id} onClick={() => chooseFlyoutCommand(command)}>{command.title}</button>)}
-          <button type="button" onClick={() => {
+          <button type="button" data-keyboard-highlighted={highlightedCommandId === "keep" || undefined} onClick={() => {
             if (dismissedRef.current) return;
             dismissedRef.current = true;
             if (content.flyout.id) void sendBondStereoPopoverAction({ sessionId: content.flyout.id, action: "keep" }).catch(() => undefined);
