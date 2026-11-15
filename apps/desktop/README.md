@@ -44,6 +44,11 @@ macOS and Ctrl+, on Windows.
 While editing an existing text box, only the live formatted preview is shown. The saved drawing
 returns with the updated content when editing ends; other labels remain visible throughout.
 
+Charges have a centered move target of at least 36 CSS pixels at every page zoom, with either
+Direct electron-mark editing setting. The visible sign and saved/exported size stay the same.
+With direct editing enabled, resize corners sit outside that move target; Shift-drag still
+stretches the mark independently in each direction.
+
 Plugin catalog and local engine downloads use reqwest 0.12 with both Mozilla and OS certificate
 roots, so macOS and Windows enterprise trust stores can participate without disabling certificate
 verification. Transport failures name the host and cause; diagnostics and logs remove URL credentials,

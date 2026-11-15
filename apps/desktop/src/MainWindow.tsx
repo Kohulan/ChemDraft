@@ -1774,7 +1774,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.14.18.16-codex";
+const CURRENT_BUILD_STAMP = "11.14.19.34-codex";
 const VibeCodeGuideForm = lazy(() => import("./dialogs/VibeCodeGuideForm").then(module => ({ default: module.VibeCodeGuideForm })));
 const StructureTemplatePicker = lazy(() => import("./dialogs/StructureTemplatePicker").then(module => ({ default: module.StructureTemplatePicker })));
 /** Starts in the background for the document webview under the existing probe gate. */
@@ -28683,7 +28683,8 @@ function PageSvgSurfaceContent({
                     </svg>
                   ) : (
                     <>
-                      {object.type === "table" || object.type === "bracket" || object.type === "reaction-arrow" || (directElectronMarkEditing && object.type === "electron-mark") ? (
+                      {object.type === "table" || object.type === "bracket" || object.type === "reaction-arrow" ||
+                        (object.type === "electron-mark" && (object.markKind === "charge" || directElectronMarkEditing)) ? (
                         <rect {...(object.type === "electron-mark" ? { ...electronMarkHitCatcherAttributes(object), ...electronMarkInteractionFrames(object, pageScale).move } : {
                           x: object.x, y: object.y,
                           width: tableLayout?.width ?? object.width,
