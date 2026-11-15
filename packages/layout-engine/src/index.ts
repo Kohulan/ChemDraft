@@ -6371,8 +6371,8 @@ function atomLabelCharacterExtent(character: string): { ascent: number; descent:
 /** Glyph extents at the renderer's run positions, without bond-clipping padding.
  * SVG/canvas text uses dy=0.35em, not a vertically centred em box. Keeping the
  * clipping envelope here used to report separated acid labels as overlapping.
- * Helvetica/Arial stacks ending in generic sans-serif also enclose common Linux
- * font fallbacks without changing the advances used by anchored label placement;
+ * The box must enclose the ink of whichever font draws the label. Helvetica/Arial
+ * (the advances anchored label placement uses) get glyph-tight horizontal extents;
  * a monospace family is widened to Courier's advance from the run's text anchor; any other
  * family, or a label with a character this module has no metrics for, gets the padded renderer
  * bounds, whose extents are unknown to this module. */
@@ -6384,19 +6384,12 @@ export function atomLabelGlyphBounds(plan: AtomLabelPlan): LayoutBounds {
     return { ...plan.layout.bounds };
   }
   const italic = plan.drawingStyle.atomLabelFontStyle === "italic";
-  const genericSansFallback = plan.fontFamily.split(",").some(family => family.trim().toLowerCase() === "sans-serif");
   const boxes = plan.layout.runs.map(run => {
     const size = atomLabelRunFontSize(run.script, plan.drawingStyle) ?? plan.fontSizePx;
     const characters = [...run.text];
-    const layoutAdvance = atomLabelRunAdvance(run, plan.drawingStyle);
-    // Arial/Helvetica may both be absent on Linux. Keep their authored run positions,
-    // but enclose a monospace fallback and DejaVu Sans's wider plus (1716/2048 em,
-    // rounded up). This is collision geometry only, never label placement or bond clipping.
-    const fallbackAdvance = Math.max(characters.length * monospaceAdvanceEm,
-      characters.reduce((sum, character) => sum + (character === "+" ? 0.838 : sansSerifAdvanceEm[character] ?? 0.62), 0)) * size;
     const width = fontClass === "monospace"
       ? characters.length * monospaceAdvanceEm * size
-      : genericSansFallback ? Math.max(layoutAdvance, fallbackAdvance) : layoutAdvance;
+      : atomLabelRunAdvance(run, plan.drawingStyle);
     const extents = characters.map(atomLabelCharacterExtent);
     const ascent = Math.max(...extents.map(extent => extent.ascent));
     const descent = Math.max(...extents.map(extent => extent.descent));

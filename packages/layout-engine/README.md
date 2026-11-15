@@ -185,12 +185,12 @@ this result. Stored document frames are never remeasured merely by loading, norm
 
 ### Font advance ceilings
 
-Atom-label collision boxes keep the authored Helvetica/Arial run positions and tight vertical
-extents. Stacks ending in generic `sans-serif` also enclose Courier-width fallback runs and
-DejaVu Sans's wider plus sign (1716/2048 em, rounded upward), because Linux font databases may
-have neither Arial nor Helvetica. These horizontal collision envelopes can extend beyond the
-existing padded clipping bounds; label placement, bond clipping, halos and SVG ink are unchanged.
-The fallback regression uses the bundled DejaVu Sans 2.35 face and independent Courier AFM ink.
+Atom-label collision boxes use the declared family's reference metrics: Helvetica for the
+Arial/Helvetica/sans-serif stack, Courier for named monospace stacks, and padded bounds for
+unrecognized families. They do not measure the host's resolved fallback font. Tests use independent
+Core14 AFM ink (`src/atomLabelInk.fixture.ts`) for enclosure assertions; Resvg's host-selected
+font still exercises real rendering and visible label distances. Do not widen these boxes to
+accommodate a CI font substitution: they also drive cleanup ranking and electron-mark placement.
 
 The shipped commands in `apps/desktop/src/commands.ts` offer Arial/Helvetica/sans-serif,
 Times New Roman/Times/serif, Courier New/Courier/monospace and Georgia/serif. The fallback menus in
