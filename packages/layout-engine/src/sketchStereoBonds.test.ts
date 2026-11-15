@@ -104,13 +104,19 @@ describe("sketch effect on stereo bonds", () => {
     }
   });
 
-  it("leaves plain and bold bonds as one centre-line stroke", () => {
-    for (const style of [undefined, "bold"] as const) {
-      const strokes = sketchStrokes(style);
-      expect(strokes).toHaveLength(1);
-      expect(strokes[0]!.start).toBe("40 60");
-      expect(strokes[0]!.length).toBeCloseTo(BOND_LENGTH, 1);
-    }
+  it("leaves a plain bond as one centre-line stroke", () => {
+    const strokes = sketchStrokes(undefined);
+    expect(strokes).toHaveLength(1);
+    expect(strokes[0]!.start).toBe("40 60");
+    expect(strokes[0]!.length).toBeCloseTo(BOND_LENGTH, 1);
+  });
+
+  it("traces the shared bold polygon instead of adding a centerline", () => {
+    const strokes = sketchStrokes("bold");
+    expect(strokes).toHaveLength(4);
+    expect(strokes.filter(stroke => Math.abs(stroke.length - BOND_LENGTH) < 0.01)).toHaveLength(2);
+    expect(strokes.filter(stroke => Math.abs(stroke.length - 6.8) < 0.01)).toHaveLength(2);
+    expect(strokes.some(stroke => stroke.start === "40 60")).toBe(false);
   });
 
   it("does not change the normal bond layer when the sketch effect is off", () => {

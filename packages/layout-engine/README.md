@@ -120,6 +120,17 @@ PDF), using only the bond's stroke colour. This mandatory display takes preceden
 bond display styles and remains visible with query indicators off or sketch effects on. It does
 not resolve the order or change the stored chemistry.
 
+Bold bonds use filled bands from `src/boldBonds.ts`, shared by the canvas, SVG/PDF and clipboard
+images. `BoldBondStyle.widthRatio` defaults to 3.4 times the ordinary line width, scaled with the
+document preset. Ring bands keep the ordinary outer edge fixed and grow inward; chain bands are
+centered. Ends join neighboring stroke edges with bounded miters/bevels; terminal, label-trimmed
+and crossing-cut ends are square. A bold double's pi line retains the ordinary stroke width and
+inset, displaced to leave at least `BoldBondStyle.clearGapRatio` (3.4) ordinary widths of white
+space beside the band. Larger authored gaps remain larger. Effects and Sketch trace that same plan.
+Preset `bondBoldWidthPx` values still set wedge dimensions; bold ink substitutes the ratio for
+those historical defaults (also after uniform scaling). Custom molecule widths and explicit
+`bondBoldWidths` overrides remain authoritative. No document or chemical fields are rewritten.
+
 `DocumentStylePreset` and `DocumentTextStyle` are native style data in `@chemdraft/chem-core`.
 `DocumentStyleScale` and point conversion stay here in `src/documentStyle.ts`. Native coordinates
 use 22 units per bond; the physical scale is 14.4/22 pt per unit. Canvas plans and exporters use those same dimensions,

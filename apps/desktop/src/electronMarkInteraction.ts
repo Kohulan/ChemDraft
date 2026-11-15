@@ -3,9 +3,9 @@ import type { ElectronMarkObject } from "@chemdraft/chem-core";
 /** Canvas-only targets in document units; never used for saved or exported geometry. */
 export function electronMarkInteractionFrames(mark: Pick<ElectronMarkObject, "x" | "y" | "width" | "height" | "markKind">, pageScale: number) {
   const scale = Number.isFinite(pageScale) && pageScale > 0 ? pageScale : 1;
-  // Charge glyphs are much smaller than their stored frames. Keep a generous grab
+  // Electron glyphs are much smaller than their stored frames. Keep a generous grab
   // area in screen pixels, even for a tiny mark or a zoomed-out page.
-  const minimumSize = mark.markKind === "charge" ? 36 : 24;
+  const minimumSize = 36;
   const width = Math.max(mark.width, minimumSize / scale);
   const height = Math.max(mark.height, minimumSize / scale);
   const x = mark.x + (mark.width - width) / 2;

@@ -25,6 +25,7 @@ import { clearCustomSwatchSlot, customSwatchCommandId, loadCustomSwatches, parse
 import { persistCustomSwatches, useCustomSwatches } from "./toolbars/customSwatchSettings";
 import { createCustomSwatchActions, textCustomColorCommandId } from "./commands";
 import { clipboardWriteNotices, pasteTableIntoDocument, readTableClipboardPaste, stripClipboardPictures, tableClipboardPasteDecision, tableClipboardResultOutranksPicture, tableSelectionClipboardItems, type TableClipboardPasteDecision } from "./tableClipboardWiring";
+import { selectionClipboardImageItems } from "./selectionClipboard";
 import type { ClipboardReadPayload, ClipboardTableResult } from "@chemdraft/clipboard-adapter";
 import type { InsertTableOptions } from "./dialogs/dialogProtocol";
 import { paletteFocusDiagnostic } from "./paletteFocusDiagnostic";
@@ -1777,7 +1778,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.15.09.10-codex";
+const CURRENT_BUILD_STAMP = "11.15.09.11-codex";
 const VibeCodeGuideForm = lazy(() => import("./dialogs/VibeCodeGuideForm").then(module => ({ default: module.VibeCodeGuideForm })));
 const StructureTemplatePicker = lazy(() => import("./dialogs/StructureTemplatePicker").then(module => ({ default: module.StructureTemplatePicker })));
 /** Starts in the background for the document webview under the existing probe gate. */
@@ -7598,9 +7599,10 @@ export function MainWindow({
   }, [assignHoveredNativeDeleteTarget, commitDocumentChange]);
 
   const copySelectionToClipboard = useCallback(async (mode: "copy" | "cut") => {
-    const wholeObjectIds = [...documentRef.current.selection.objectIds];
+    const source = documentRef.current;
+    const wholeObjectIds = [...source.selection.objectIds];
     const payload = createSelectionClipboardPayload(
-      documentRef.current,
+      source,
       nativeMoleculeFragmentSelections(selectedNativeMoleculePartsRef.current)
     );
     if (!payload) {
@@ -7608,19 +7610,30 @@ export function MainWindow({
       return;
     }
 
-    const tableCopy = tableSelectionClipboardItems(payload);
-    // A table's HTML, RTF and text are optional; keep the writer's result so a dropped one is shown.
-    const result = await writeClipboardItems(tableCopy?.items ?? selectionClipboardTextItems(payload));
+    let copy: { items: Parameters<typeof writeClipboardItems>[0]; warnings: string[] } | undefined
+      = tableSelectionClipboardItems(payload);
+    const hasDrawing = payload.objects.some(object => !["text", "annotation", "group"].includes(object.type));
+    if (!copy && hasDrawing && isDesktopRuntime()) {
+      try {
+        copy = await selectionClipboardImageItems(source, payload, shortcutPlatform);
+      } catch (error) {
+        setStatus(`${mode === "copy" ? "Copy failed" : "Cut canceled"}: ${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
+    }
+    // Required PNG prevents an ordinary drawing copy from silently succeeding with only JSON.
+    const result = await writeClipboardItems(copy?.items ?? selectionClipboardTextItems(payload));
     // As writeClipboardTextItems: a browser accepts a plain-text fallback when richer formats fail.
     const didWrite = result.ok || (!isDesktopRuntime() && result.written.includes("text/plain"));
     if (!didWrite) {
-      setStatus(mode === "copy" ? "Copy failed: clipboard unavailable" : "Cut canceled: clipboard unavailable");
+      setStatus([mode === "copy" ? "Copy failed: clipboard unavailable" : "Cut canceled: clipboard unavailable",
+        ...clipboardWriteNotices(result)].join("; "));
       return;
     }
 
     selectionClipboardPayloadRef.current = payload;
     selectionClipboardPasteStateRef.current = initialSelectionClipboardPasteState(payload, mode);
-    const notices = [...(payload.warnings ?? []), ...(tableCopy?.warnings ?? []), ...clipboardWriteNotices(result)];
+    const notices = [...(payload.warnings ?? []), ...(copy?.warnings ?? []), ...clipboardWriteNotices(result)];
 
     if (mode === "cut") {
       deleteSelectionAfterClipboardCut(payload, wholeObjectIds);
@@ -7629,7 +7642,7 @@ export function MainWindow({
     }
 
     setStatus(["Copied ChemDraft selection", ...notices].join("; "));
-  }, [deleteSelectionAfterClipboardCut]);
+  }, [deleteSelectionAfterClipboardCut, shortcutPlatform]);
 
   // Table text is private until edit completion. Copy As and flushes include its rich-text draft
   // without touching the working document or history. This table-only snapshot leaves chemistry
@@ -18965,20 +18978,26 @@ export function MainWindow({
     // browser happened to deliver the event to. A molecule's rectangular wrapper otherwise
     // swallows a press meant for a molecule beneath it (the rotaxane-overlap bug: hover
     // highlights the lower atom in red but the press selects nothing). This mirrors the hover
-    // hit path so click and hover can never disagree. We only re-target among molecules — a
-    // press the DOM delivered to a non-molecule object (text, charge mark) is never hijacked —
-    // and we move pointer capture to the resolved molecule's wrapper so every drag/up handler
-    // (all keyed by objectId) stays consistent with the re-targeted object.
+    // hit path. An electron mark's transparent grab area also yields to a nearer atom/bond.
+    // Move pointer capture to the resolved molecule's wrapper so every drag/up handler
+    // (all keyed by objectId) stays consistent with the re-targeted object. Painted mark
+    // ink and other non-molecule objects keep their own pointer routing.
     let captureElement: Element = event.currentTarget;
     const pressedObject = findDocumentObject(document, objectId);
-    if (point && pressedObject?.type === "molecule" && isNativeMoleculeGraph(pressedObject)) {
+    const electronGrabArea = pressedObject?.type === "electron-mark" && event.target instanceof Element &&
+      event.target.closest("[data-electron-mark-hit-target]")?.getAttribute("data-electron-mark-hit-target") === objectId;
+    if (point && (pressedObject?.type === "molecule" && isNativeMoleculeGraph(pressedObject) || electronGrabArea)) {
       const resolved = nativeMoleculeCanvasHoverTarget(
         document,
         point,
         event.target,
         hitToleranceForScale(viewportRef.current.scale)
       );
-      if (resolved && resolved.objectId !== objectId) {
+      const markDistance = pressedObject?.type === "electron-mark"
+        ? Math.hypot(point.x - (pressedObject.x + pressedObject.width / 2),
+          point.y - (pressedObject.y + pressedObject.height / 2))
+        : Infinity;
+      if (resolved && resolved.distanceToPointer < markDistance && resolved.objectId !== objectId) {
         objectId = resolved.objectId;
         const resolvedWrapper = pageRef.current?.querySelector(`[data-object-id="${CSS.escape(objectId)}"]`);
         if (resolvedWrapper) {
@@ -28695,8 +28714,7 @@ function PageSvgSurfaceContent({
                     </svg>
                   ) : (
                     <>
-                      {object.type === "table" || object.type === "bracket" || object.type === "reaction-arrow" ||
-                        (object.type === "electron-mark" && (object.markKind === "charge" || directElectronMarkEditing)) ? (
+                      {object.type === "table" || object.type === "bracket" || object.type === "reaction-arrow" || object.type === "electron-mark" ? (
                         <rect {...(object.type === "electron-mark" ? { ...electronMarkHitCatcherAttributes(object), ...electronMarkInteractionFrames(object, pageScale).move } : {
                           x: object.x, y: object.y,
                           width: tableLayout?.width ?? object.width,
@@ -29580,6 +29598,22 @@ function DocumentObjectViewContent({
                 cy={atom.y - object.y}
                 key={`selection-blob-atom-${atom.id}`}
                 r="8.8"
+              />
+          ))}
+          {/* Atom circles cannot cover labels extending away from the atom (H3N, group
+              labels, or a manually offset label). Use the renderer's shared label plan. */}
+          {[...atomLabelPlanByAtomId.values()]
+            .filter((plan) => selectedAtomIds.has(plan.atom.id))
+            .map((plan) => (
+              <rect
+                className="native-selection-blob-atom native-selection-blob-label"
+                data-selected-atom-label-id={plan.atom.id}
+                key={`selection-blob-label-${plan.atom.id}`}
+                x={plan.anchor.x + plan.layout.bounds.x - object.x}
+                y={plan.anchor.y + plan.layout.bounds.y - object.y}
+                width={plan.layout.bounds.width}
+                height={plan.layout.bounds.height}
+                rx="2"
               />
           ))}
         </g>

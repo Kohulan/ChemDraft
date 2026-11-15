@@ -1,7 +1,7 @@
 import { logToolsetPopoverGeometry, perfHook, perfProbe } from "./perf/runtime";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ColorPickerPopoverBody, symbolToolGlyph, toolbarCommandFlyoutGridStyle } from "./ToolPalette";
-import { Icon, type IconName } from "./icons";
+import { Icon, ToolbarAssetIcon, type IconName } from "./icons";
 import { toolbarAsset, type ToolbarAssetName } from "./toolbarAssets";
 import { normalizeHexColor, objectCustomColorCommandId, textCustomColorCommandId } from "./commands";
 import { installPaletteInputFocus } from "./plugins/pluginPanelInputFocus";
@@ -644,7 +644,7 @@ export function PalettePopoverWindow({
                   ? toolbarAsset(command.assetName as ToolbarAssetName)
                   : undefined;
                 if (assetSrc) {
-                  return <img className="tool-icon-image" src={assetSrc} alt="" aria-hidden="true" />;
+                  return <ToolbarAssetIcon assetName={command.assetName as ToolbarAssetName} src={assetSrc} />;
                 }
                 return command.icon ? <Icon name={command.icon as IconName} /> : null;
               })()}

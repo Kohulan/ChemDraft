@@ -8,14 +8,14 @@ const buttonSize = Number(css.match(/\.object-resize-handle\s*\{[^}]*width:\s*([
 const cornerOffset = Number(css.match(/\.object-resize-top-left\s*\{[^}]*left:\s*(-?[\d.]+)px/s)![1]);
 
 describe.each([0.25, 0.5, 1, 2, 4].flatMap(scale =>
-  (["charge", "radical-dot", "lone-pair"] as const).map(markKind => ({ scale, markKind }))))(
+  (["charge", "radical-dot", "lone-pair", "unknown"] as const).map(markKind => ({ scale, markKind }))))(
   "electron move targets ($markKind, zoom $scale)", ({ scale, markKind }) => {
   it.each([[2.16, 2.16], [18, 18], [72, 36]])("keeps a %s × %s mark movable without covering any resize button", (width, height) => {
     const mark = { x: 100, y: 200, width, height, markKind };
     const original = { ...mark };
     const { move, controls } = electronMarkInteractionFrames(mark, scale);
     expect(mark).toEqual(original);
-    const minimumSize = markKind === "charge" ? 36 : 24;
+    const minimumSize = 36;
     expect(move.width * scale).toBeGreaterThanOrEqual(minimumSize);
     expect(move.height * scale).toBeGreaterThanOrEqual(minimumSize);
     expect(move.x + move.width / 2).toBeCloseTo(mark.x + width / 2);

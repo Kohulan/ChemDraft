@@ -147,7 +147,7 @@ import {
   textScriptCommands,
   textSizeCommands
 } from "./commands";
-import { Icon } from "./icons";
+import { Icon, ToolbarAssetIcon } from "./icons";
 import { getDrawingToolDefinition, isDrawingToolCommand } from "./drawingTools";
 import { toolbarAsset } from "./toolbarAssets";
 import {
@@ -4447,7 +4447,7 @@ export function ToolbarItemIcon({
   // only render the image when it resolves, otherwise fall through to a real icon.
   const assetSrc = item.assetName ? toolbarAsset(item.assetName) : undefined;
   if (assetSrc) {
-    return <img className="tool-icon-image" src={assetSrc} alt="" aria-hidden="true" />;
+    return <ToolbarAssetIcon assetName={item.assetName} src={assetSrc} />;
   }
   if (command) {
     return <ToolbarCommandIcon command={command} />;
@@ -4467,7 +4467,7 @@ function ToolbarCommandIcon({ command }: { command: CommandSpec }) {
   }
   const assetSrc = command.assetName ? toolbarAsset(command.assetName) : undefined;
   if (assetSrc) {
-    return <img className="tool-icon-image" src={assetSrc} alt="" aria-hidden="true" />;
+    return <ToolbarAssetIcon assetName={command.assetName} src={assetSrc} />;
   }
   if (command.id.startsWith("tool.art.")) {
     return <ArtToolIcon commandId={command.id} />;
@@ -4636,7 +4636,7 @@ export function CommandIconButton({
         {...invokeHandlers}
       >
         {assetSrc ? (
-          <img className="tool-icon-image" src={assetSrc} alt="" aria-hidden="true" />
+          <ToolbarAssetIcon assetName={command.assetName} src={assetSrc} />
         ) : command.id.startsWith("tool.art.") ? (
           <ArtToolIcon commandId={command.id} />
         ) : (
