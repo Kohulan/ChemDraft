@@ -62,8 +62,14 @@ it("allows Windows palette colour popups to activate without a second WebView2 f
   const panel = readNative("src/panel_window.rs");
   const observer = panel.split('unsafe extern "system" fn focus_subclass(')[1]!.split("\n#[cfg(windows)]")[0]!;
   // Observing WM_MOUSEACTIVATE is needed to guard click-to-lease delivery.
-  // Only overriding its result with MA_NOACTIVATE breaks native colour popups.
-  expect(observer).not.toContain("return MA_NOACTIVATE");
+  // Native colour controls need the subclass result. Only a drawing-command hit
+  // in an already-active app may override it, after the other observers run.
+  const guardedReturn = /if active_command_hit \{\s*return MA_NOACTIVATE as isize;\s*\}/;
+  expect(observer).toMatch(guardedReturn);
+  expect(observer.replace(guardedReturn, "")).not.toContain("return MA_NOACTIVATE");
+  expect(observer).toContain("should_suppress_command_mouse_activation(primary_client_press, app_was_active, command_hit)");
+  expect(observer.indexOf("let result = DefSubclassProc")).toBeLessThan(observer.indexOf("if active_command_hit"));
+  expect(panel).toContain('command_hit_boxes: window.label().starts_with("toolset-core-")');
   expect(readNative("src/palette_key_guard.rs")).not.toContain("return MA_NOACTIVATE");
   expect(observer).toContain("DefSubclassProc(hwnd, message, wparam, lparam)");
   // The native default remains non-activating; pointer-intent leases grant input focus.
