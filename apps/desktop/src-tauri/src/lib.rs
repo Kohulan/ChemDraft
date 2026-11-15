@@ -1542,6 +1542,7 @@ pub fn run() {
             cancel_quit,
             close_toolset_popover,
             route_toolset_command,
+            set_palette_command_hit_boxes,
             sync_plugin_menu_items,
             read_clipboard_payload,
             write_clipboard_items,
@@ -6112,6 +6113,24 @@ fn build_toolset_tooltip_window(app: &tauri::AppHandle) -> Result<(), String> {
     window
         .set_ignore_cursor_events(true)
         .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn set_palette_command_hit_boxes(
+    window: tauri::WebviewWindow,
+    boxes: Vec<panel_window::PaletteCommandHitBox>,
+) -> Result<(), String> {
+    if !window.label().starts_with("toolset-core-") {
+        return Err("Expected a core tool palette.".into());
+    }
+    #[cfg(windows)]
+    {
+        let hwnd = window.hwnd().map_err(|error| error.to_string())?.0;
+        panel_window::set_palette_command_hit_boxes(hwnd as isize, boxes);
+    }
+    #[cfg(not(windows))]
+    let _ = boxes;
     Ok(())
 }
 
@@ -11547,8 +11566,8 @@ mod tests {
     #[test]
     fn registered_commands_have_permissions_and_capability_grants() {
         let lib_source = include_str!("lib.rs");
-        let capability = format!(
-            "{}{}{}{}{}{}{}{}{}",
+        let capability = concat!(
+            include_str!("../capabilities/toolset-command-hit-boxes.json"),
             include_str!("../capabilities/palette-focus-diagnostic.json"),
             include_str!("../capabilities/window-drag.json"),
             include_str!("../capabilities/default.json"),

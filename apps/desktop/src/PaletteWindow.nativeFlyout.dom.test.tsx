@@ -90,6 +90,16 @@ describe.each(["macos", "windows"] as const)("standalone palette flyout keyboard
     expect(native.content.size + native.keys.size + native.closed.size + native.dismiss.size + native.textStyle.size).toBe(0);
     vi.restoreAllMocks(); vi.unstubAllGlobals();
   });
+  it("marks actual Charge and ring buttons for native command hit testing and excludes editable controls", () => {
+    const toolbar = host.querySelector<HTMLElement>("[data-test-owner]")!;
+    const charge = toolbar.querySelector('button[data-command-id="tool.charge"]');
+    expect(charge?.getAttribute("data-native-noactivate-command")).toBe("true");
+    expect(button.getAttribute("data-native-noactivate-command")).toBe("true");
+    for (const control of toolbar.querySelectorAll("input, select, textarea, [contenteditable=true]")) {
+      expect(control.closest("[data-native-noactivate-command=true]")).toBeNull();
+    }
+  });
+
   async function key(value: string, init: KeyboardEventInit = {}, type = "keydown") {
     const event = new KeyboardEvent(type, { key: value, bubbles: true, cancelable: true, ...init });
     await act(async () => document.activeElement!.dispatchEvent(event));

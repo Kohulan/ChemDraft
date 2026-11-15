@@ -145,7 +145,7 @@ import {
   textSizeCommands
 } from "./commands";
 import { Icon } from "./icons";
-import { getDrawingToolDefinition } from "./drawingTools";
+import { getDrawingToolDefinition, isDrawingToolCommand } from "./drawingTools";
 import { toolbarAsset } from "./toolbarAssets";
 import {
   commandShortcutDisplay,
@@ -285,6 +285,7 @@ export function ToolPalette({
       onTooltipLeave={(options) => clearTooltip(tooltipId, options)}
       onRequestFlyout={onRequestFlyout}
       onInvoke={onInvoke}
+      allowNativeNoActivateCommands={!customize}
     />
   );
 
@@ -3910,7 +3911,8 @@ function ToolbarPaletteItem({
   onTooltipEnter,
   onTooltipLeave,
   onRequestFlyout,
-  onInvoke
+  onInvoke,
+  allowNativeNoActivateCommands
 }: {
   item: ToolbarPaletteItemModel;
   activeTool?: string;
@@ -3921,6 +3923,7 @@ function ToolbarPaletteItem({
   onTooltipLeave?: (options?: ClearTooltipOptions) => void;
   onRequestFlyout?: (request: ToolbarFlyoutRequest) => void;
   onInvoke: (commandId: string) => void;
+  allowNativeNoActivateCommands?: boolean;
 }) {
   const defaultPrimaryCommand = item.primary.type === "command" ? item.primary.command : undefined;
   const [selectedFlyoutCommandId, setSelectedFlyoutCommandId] = useState<string>();
@@ -4248,6 +4251,7 @@ function ToolbarPaletteItem({
         data-command-flyout-button={hasSubmenu ? submenu?.id : undefined}
         data-command-flyout-ids={hasSubmenu ? submenuCommands.map((command) => command.id).join(" ") : undefined}
         data-command-id={primaryCommand?.id}
+        data-native-noactivate-command={allowNativeNoActivateCommands && !primaryDisabled && primaryCommand && isDrawingToolCommand(primaryCommand.id) ? "true" : undefined}
         data-disabled={primaryDisabled ? "true" : undefined}
         data-distribute-mode={primaryCommand && isDistributeCommandId(primaryCommand.id) ? distributeMode : undefined}
         data-shortcut-label={item.tooltip.shortcutLabel ?? item.tooltip.shortcut ?? "No shortcut"}

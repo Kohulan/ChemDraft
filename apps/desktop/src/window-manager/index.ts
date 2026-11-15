@@ -144,6 +144,15 @@ export function isDesktopRuntime(): boolean {
   return Boolean(candidate.__TAURI_INTERNALS__ || candidate.__TAURI__);
 }
 
+/** Publish the currently rendered drawing-command button hit regions to this native palette. */
+export async function setPaletteCommandHitBoxes(
+  boxes: readonly { x: number; y: number; width: number; height: number }[]
+): Promise<void> {
+  if (!isDesktopRuntime()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("set_palette_command_hit_boxes", { boxes });
+}
+
 export function createPaletteCommandPayload(commandId: string): PaletteCommandPayload {
   return createToolsetCommandPayload(commandId);
 }

@@ -11,6 +11,98 @@ mod focus_return;
 mod installation;
 #[path = "palette_key_guard.rs"]
 mod key_guard;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+pub(crate) struct PaletteCommandHitBox {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl PaletteCommandHitBox {
+    #[cfg(any(windows, test))]
+    fn contains(self, x: i32, y: i32) -> bool {
+        x >= self.x
+            && y >= self.y
+            && x < self.x.saturating_add(self.width)
+            && y < self.y.saturating_add(self.height)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn should_suppress_command_mouse_activation(
+    primary_client_press: bool,
+    app_was_active: bool,
+    command_hit: bool,
+) -> bool {
+    primary_client_press && app_was_active && command_hit
+}
+
+#[cfg(windows)]
+static PALETTE_COMMAND_HIT_BOXES: std::sync::OnceLock<
+    Mutex<HashMap<isize, Vec<PaletteCommandHitBox>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(windows)]
+pub(crate) fn set_palette_command_hit_boxes(hwnd: isize, boxes: Vec<PaletteCommandHitBox>) {
+    let state = PALETTE_COMMAND_HIT_BOXES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut state) = state.lock() {
+        if boxes.is_empty() {
+            state.remove(&hwnd);
+        } else {
+            state.insert(hwnd, boxes);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn palette_command_hit(hwnd: isize, x: i32, y: i32) -> bool {
+    PALETTE_COMMAND_HIT_BOXES
+        .get()
+        .and_then(|state| state.lock().ok())
+        .is_some_and(|state| {
+            state
+                .get(&hwnd)
+                .is_some_and(|boxes| boxes.iter().any(|rect| rect.contains(x, y)))
+        })
+}
+
+#[cfg(test)]
+mod palette_command_hit_box_tests {
+    use super::{should_suppress_command_mouse_activation, PaletteCommandHitBox};
+
+    #[test]
+    fn physical_client_hit_boxes_select_only_command_bounds_at_dpi_scale() {
+        // Two command buttons remain eligible; the gap/input area between them is not.
+        let buttons = [
+            PaletteCommandHitBox {
+                x: 0,
+                y: 0,
+                width: 60,
+                height: 60,
+            },
+            PaletteCommandHitBox {
+                x: 75,
+                y: 0,
+                width: 60,
+                height: 60,
+            },
+        ];
+        assert!(buttons.iter().any(|button| button.contains(59, 59)));
+        assert!(!buttons.iter().any(|button| button.contains(65, 30)));
+        assert!(buttons.iter().any(|button| button.contains(75, 30)));
+        assert!(!buttons.iter().any(|button| button.contains(135, 30)));
+    }
+
+    #[test]
+    fn routing_requires_active_app_primary_client_hit_on_an_enabled_command_box() {
+        assert!(should_suppress_command_mouse_activation(true, true, true));
+        assert!(!should_suppress_command_mouse_activation(false, true, true));
+        assert!(!should_suppress_command_mouse_activation(true, false, true));
+        assert!(!should_suppress_command_mouse_activation(true, true, false));
+    }
+}
 pub(crate) use installation::finish_installation;
 pub(crate) use key_guard::{
     keeps_palette_focus, observe_document_pointer_release, End as PointerGuardEnd,
@@ -614,8 +706,10 @@ pub(crate) fn install_input_focus<R: tauri::Runtime>(
     let hwnd = window.hwnd().map_err(|error| error.to_string())?.0;
     let target = window.clone();
     let drag_target = window.clone();
+    let refresh_window = window.clone();
     let data = Box::into_raw(Box::new(FocusObserver {
         stable_nonclient_paint: window.label().starts_with("toolset-"),
+        command_hit_boxes: window.label().starts_with("toolset-core-"),
         activation: std::rc::Rc::new(move |active| activation(&target, active)),
         drag_finished: std::rc::Rc::new(move || {
             // The palette's title/background press ended its lease without returning focus.
@@ -625,6 +719,13 @@ pub(crate) fn install_input_focus<R: tauri::Runtime>(
                     eprintln!("Could not return palette keyboard focus after drag: {error}");
                 }
             }
+        }),
+        refresh_hit_boxes: std::rc::Rc::new(move || {
+            let _ = refresh_window.emit_to(
+                refresh_window.label(),
+                "chemdraft://palette-command-hit-boxes-refresh",
+                (),
+            );
         }),
     }));
     unsafe {
@@ -647,8 +748,10 @@ pub(crate) fn install_input_focus<R: tauri::Runtime>(
 #[cfg(windows)]
 struct FocusObserver {
     stable_nonclient_paint: bool,
+    command_hit_boxes: bool,
     activation: std::rc::Rc<dyn Fn(bool)>,
     drag_finished: std::rc::Rc<dyn Fn()>,
+    refresh_hit_boxes: std::rc::Rc<dyn Fn()>,
 }
 
 #[cfg(windows)]
@@ -660,13 +763,43 @@ unsafe extern "system" fn focus_subclass(
     id: usize,
     data: usize,
 ) -> isize {
+    use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
     use windows_sys::Win32::UI::{
         Shell::{DefSubclassProc, RemoveWindowSubclass},
         WindowsAndMessaging::{
-            IsIconic, WA_INACTIVE, WM_ACTIVATE, WM_ACTIVATEAPP, WM_EXITSIZEMOVE, WM_NCACTIVATE,
-            WM_NCDESTROY,
+            GetForegroundWindow, GetMessagePos, IsIconic, HTCLIENT, MA_NOACTIVATE, WA_INACTIVE,
+            WM_ACTIVATE, WM_ACTIVATEAPP, WM_EXITSIZEMOVE, WM_LBUTTONDOWN, WM_MOUSEACTIVATE,
+            WM_NCACTIVATE, WM_NCDESTROY, WM_SHOWWINDOW,
         },
     };
+    let primary_client_press = message == WM_MOUSEACTIVATE
+        && (*(data as *const FocusObserver)).command_hit_boxes
+        && (lparam & 0xffff) == HTCLIENT as isize
+        && ((lparam >> 16) & 0xffff) == WM_LBUTTONDOWN as isize;
+    let app_was_active = if primary_client_press {
+        let foreground = GetForegroundWindow();
+        let mut process_id = 0;
+        windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+            foreground,
+            &mut process_id,
+        );
+        !foreground.is_null() && process_id == std::process::id()
+    } else {
+        false
+    };
+    let command_hit = if primary_client_press && app_was_active {
+        let packed = GetMessagePos();
+        let mut point = windows_sys::Win32::Foundation::POINT {
+            x: (packed as u16 as i16) as i32,
+            y: ((packed >> 16) as u16 as i16) as i32,
+        };
+        ScreenToClient(hwnd, &mut point) != 0
+            && palette_command_hit(hwnd as isize, point.x, point.y)
+    } else {
+        false
+    };
+    let active_command_hit =
+        should_suppress_command_mouse_activation(primary_client_press, app_was_active, command_hit);
     // Toolsets draw their own frame. Keep native activation bookkeeping (including Tao's
     // active-state tracking) but suppress DefWindowProc's transient nonclient repaint.
     // WM_NCACTIVATE documents lParam=-1 for this purpose; do not fake wParam or skip the
@@ -690,6 +823,7 @@ unsafe extern "system" fn focus_subclass(
         notify(active);
     }
     if message == WM_NCDESTROY {
+        set_palette_command_hit_boxes(hwnd as isize, Vec::new());
         RemoveWindowSubclass(hwnd, Some(focus_subclass), id);
         let result = DefSubclassProc(hwnd, message, wparam, lparam);
         drop(Box::from_raw(data as *mut FocusObserver));
@@ -698,7 +832,16 @@ unsafe extern "system" fn focus_subclass(
     // Clone before invoking Tao: nested message handling can destroy the observer.
     let drag_finished = (message == WM_EXITSIZEMOVE)
         .then(|| (*(data as *const FocusObserver)).drag_finished.clone());
+    if message == WM_SHOWWINDOW && wparam == 0 {
+        set_palette_command_hit_boxes(hwnd as isize, Vec::new());
+    } else if message == WM_SHOWWINDOW && wparam != 0 {
+        let refresh = (*(data as *const FocusObserver)).refresh_hit_boxes.clone();
+        refresh();
+    }
     let result = DefSubclassProc(hwnd, message, wparam, lparam);
+    if active_command_hit {
+        return MA_NOACTIVATE as isize;
+    }
     if let Some(drag_finished) = drag_finished {
         drag_finished();
     }

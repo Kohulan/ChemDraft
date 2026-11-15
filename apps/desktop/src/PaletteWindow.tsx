@@ -1,7 +1,9 @@
 import { isDrawingToolCommand } from "./drawingTools";
 import { installPopoverEscapeRouting } from "./window-manager/popoverEscape";
+import { listenCurrentWindowEvent } from "./window-manager/tauriEvents";
 import type { AnalysisReport } from "@chemdraft/analysis-core";
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent } from "react";
+import { commandButtonHitBoxes } from "./commandHitBoxes";
 import { DefaultNativeTextStyle, type NativeTextStyle, type TextSpan } from "@chemdraft/chem-core";
 import {
   APPENDABLE_TOOLBAR_WIDGETS,
@@ -78,6 +80,7 @@ import {
   requestToolsetTextStyle,
   sendToolsetLayoutEdit,
   setToolsetPopoverContent,
+  setPaletteCommandHitBoxes,
   sendPaletteCommand,
   sendPaletteCommandCancel,
   sendPaletteInspectorAction,
@@ -1158,6 +1161,48 @@ export function PaletteWindow({
   const tableOnly = tableInspector && (currentSelection
     ? currentSelection.objectTypes.length === 1 && currentSelection.objectTypes[0] === "table"
     : !currentMoleculeInspector?.targets.moleculeObjectIds.length);
+
+  useEffect(() => {
+    if (platform !== "windows" || !toolsetId.startsWith("core.")) return;
+    if (customizeThisPalette) {
+      void setPaletteCommandHitBoxes([]).catch(() => undefined);
+      return;
+    }
+    const body = bodyRef.current;
+    if (!body) return;
+    let frame = 0;
+    let disposed = false;
+    const publish = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        if (disposed) return;
+        const boxes = commandButtonHitBoxes(body, window.devicePixelRatio || 1);
+        void setPaletteCommandHitBoxes(boxes).catch(() => undefined);
+      });
+    };
+    const resizeObserver = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(publish);
+    resizeObserver?.observe(body);
+    const mutationObserver = new MutationObserver(publish);
+    mutationObserver.observe(body, { subtree: true, childList: true, attributes: true, attributeFilter: ["disabled", "data-native-noactivate-command", "data-command-id", "style"] });
+    window.addEventListener("resize", publish);
+    window.addEventListener("scroll", publish, true);
+    let unlistenRefresh: (() => void) | undefined;
+    void listenCurrentWindowEvent("chemdraft://palette-command-hit-boxes-refresh", publish).then((unlisten) => {
+      if (disposed) unlisten();
+      else unlistenRefresh = unlisten;
+    }).catch(() => undefined);
+    publish();
+    return () => {
+      disposed = true;
+      cancelAnimationFrame(frame);
+      resizeObserver?.disconnect();
+      mutationObserver.disconnect();
+      window.removeEventListener("resize", publish);
+      window.removeEventListener("scroll", publish, true);
+      unlistenRefresh?.();
+      void setPaletteCommandHitBoxes([]).catch(() => undefined);
+    };
+  }, [platform, toolsetId, customizeThisPalette, itemGroups, commandSpecs, currentSelection]);
 
   return (
     <main
