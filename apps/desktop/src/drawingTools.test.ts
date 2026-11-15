@@ -11,7 +11,7 @@ import {
   isDrawingToolCommand,
   withStandaloneDrawingToolCommands
 } from "./drawingTools";
-import { getToolsetCommandSpecs } from "./toolsets";
+import { getToolsetCommandSpecs, getToolsetItemGroups } from "./toolsets";
 import type { CommandSpec } from "./commands";
 
 describe("Phase 7 drawing tool activation", () => {
@@ -32,8 +32,11 @@ describe("Phase 7 drawing tool activation", () => {
     expect(commandsForKind("art")).toContain("tool.art.arc90Dashed");
   });
 
-  it.each(["double", "triple"])("puts the %s bond tool on the default toolbar and registers it for Customize", (order) => {
+  it.each(["double", "triple"])("offers the %s bond tool through the default multiple-bond group and Customize", (order) => {
     const id = `tool.${order}Bond`;
+    const items = getToolsetItemGroups("core.main").flat();
+    expect(items.find(item => item.id === "tool.doubleBond")?.submenu?.items.map(command => command.id)).toContain(id);
+    expect(items.some(item => item.id === id)).toBe(order === "double");
     expect(getToolsetCommandSpecs().some(candidate => candidate.id === id)).toBe(true);
     const command = withStandaloneDrawingToolCommands(getToolsetCommandSpecs()).find(candidate => candidate.id === id)!;
     expect(command).toBeDefined();

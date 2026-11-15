@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { applyToolsetLayoutState, parseToolsetLayoutState, type ToolsetLayoutState } from "@chemdraft/toolset-registry";
-import { mergeVisibilityIntoLayoutState, withCurrentMainToolbarDefaults } from "./toolbarLayoutState";
+import { MAIN_TOOLBAR_DEFAULTS_REVISION, mergeVisibilityIntoLayoutState, withCurrentMainToolbarDefaults } from "./toolbarLayoutState";
 import { createDesktopToolsetRegistry, desktopToolsets, getToolsetItemGroups, migrateMainToolbarDefaultsLayoutState } from "../toolsets";
 import { addToolsetItemAddition, emptyLayoutState, removeToolsetItem, resetAllLayouts, resetToolsetLayout, setItemHidden } from "./CustomizeToolbars/layoutStateEdits";
 
@@ -13,7 +13,7 @@ describe("mergeVisibilityIntoLayoutState", () => {
     ]);
     // Round-trips through the loader's schema (what Rust reads back).
     expect(() => parseToolsetLayoutState(state)).not.toThrow();
-    expect(parseToolsetLayoutState(state).mainToolbarDefaultsRevision).toBe(1);
+    expect(parseToolsetLayoutState(state).mainToolbarDefaultsRevision).toBe(MAIN_TOOLBAR_DEFAULTS_REVISION);
   });
 
   it("updates visibility without clobbering other customization on the same override", () => {
@@ -86,7 +86,7 @@ describe("Main toolbar defaults migration", () => {
     for (const state of [emptyLayoutState(), setItemHidden(emptyLayoutState(), "core.art", "tool.art.pen", true)]) {
       const migrated = migrate(state);
       expect(ids(migrated)).toEqual(defaults);
-      expect(migrated.mainToolbarDefaultsRevision).toBe(1);
+      expect(migrated.mainToolbarDefaultsRevision).toBe(MAIN_TOOLBAR_DEFAULTS_REVISION);
       expect(migrated.toolsetOverrides).toEqual(state.toolsetOverrides);
     }
   });
@@ -183,7 +183,7 @@ describe("Main toolbar defaults migration", () => {
     expect(ids(migrate(fresh))).toEqual(defaults.filter(id => id !== "tool.eraser"));
     const visibility = mergeVisibilityIntoLayoutState(undefined, ["core.main"], new Set(["core.main"]));
     expect(ids(migrate(visibility))).toEqual(defaults);
-    expect(mergeVisibilityIntoLayoutState(fresh, ["core.main"], new Set()).mainToolbarDefaultsRevision).toBe(1);
+    expect(mergeVisibilityIntoLayoutState(fresh, ["core.main"], new Set()).mainToolbarDefaultsRevision).toBe(MAIN_TOOLBAR_DEFAULTS_REVISION);
   });
 
   it("reset-to-default yields the new defaults after relaunch and subsequent visibility saves", () => {
@@ -193,5 +193,43 @@ describe("Main toolbar defaults migration", () => {
       const saved = mergeVisibilityIntoLayoutState(reset, ["core.main"], new Set(["core.main"]));
       expect(ids(migrate(JSON.parse(JSON.stringify(saved))))).toEqual(defaults);
     }
+  });
+
+  it.each([false, true])("preserves a revision-1 standalone Triple button and custom order (hidden: %s)", hidden => {
+    const previousDefaults = defaults.filter(id => id !== "tool.doubleBond");
+    previousDefaults.splice(previousDefaults.indexOf("tool.bond") + 1, 0, "tool.doubleBond", "tool.tripleBond");
+    const previousOrder = ["tool.tripleBond", ...previousDefaults.filter(id => id !== "tool.tripleBond")];
+    const state = {
+      ...emptyLayoutState(), mainToolbarDefaultsRevision: 1,
+      toolsetOverrides: [{ toolsetId: "core.main", itemOrder: { "core.main.items": previousOrder },
+        hiddenCommandIds: hidden ? ["tool.tripleBond"] : [],
+        itemAdditions: [{ groupId: "core.main.items", index: 7,
+          item: { id: "user.space.1", kind: "spacer", primary: { type: "none" } } }] }]
+    };
+    const snapshot = structuredClone(state);
+    const migrated = migrate(state);
+    expect(ids(migrated)).toEqual([...previousOrder.filter(id => !hidden || id !== "tool.tripleBond"), "user.space.1"]);
+    const saved = mergeVisibilityIntoLayoutState(migrated, ["core.main"], new Set(["core.main"]));
+    expect(ids(migrate(JSON.parse(JSON.stringify(saved))))).toEqual(ids(migrated));
+    expect(ids(migrated).filter(id => id === "tool.tripleBond")).toHaveLength(hidden ? 0 : 1);
+    expect(state).toEqual(snapshot);
+    expect(migrateMainToolbarDefaultsLayoutState(migrated)).toBe(migrated);
+  });
+
+  it("preserves revision-1 addition indices without an explicit saved order", () => {
+    const previousDefaults = defaults.filter(id => id !== "tool.doubleBond");
+    previousDefaults.splice(previousDefaults.indexOf("tool.bond") + 1, 0, "tool.doubleBond", "tool.tripleBond");
+    previousDefaults.splice(7, 0, "user.space.1");
+    const state = { ...emptyLayoutState(), mainToolbarDefaultsRevision: 1, toolsetOverrides: [{ toolsetId: "core.main",
+      itemAdditions: [{ groupId: "core.main.items", index: 7, item: { id: "user.space.1", kind: "spacer", primary: { type: "none" } } }] }] };
+    expect(ids(migrate(state))).toEqual(previousDefaults);
+  });
+
+  it("uses the current defaults for revision-1 visibility-only saves and after resetting customization", () => {
+    const visibility = { ...emptyLayoutState(), mainToolbarDefaultsRevision: 1, toolsetOverrides: [{ toolsetId: "core.main", visible: true }] };
+    expect(ids(migrate(visibility))).toEqual(defaults);
+    const customized = migrate({ ...visibility, toolsetOverrides: [{ toolsetId: "core.main", hiddenCommandIds: ["tool.eraser"] }] });
+    expect(ids(customized)).toContain("tool.tripleBond");
+    expect(ids(migrate(resetToolsetLayout(customized, "core.main")))).toEqual(defaults);
   });
 });

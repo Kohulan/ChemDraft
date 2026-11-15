@@ -7,6 +7,7 @@ import type { CommandSpec } from "./commands";
 import { TOOLBAR_FLYOUT_HOLD_MS, ToolPalette } from "./ToolPalette";
 import type { ToolbarPaletteItemModel } from "./toolsets";
 import { getToolsetItemGroups } from "./toolsets";
+import { toolbarAsset } from "./toolbarAssets";
 
 const bondCommand: CommandSpec = {
   id: "tool.bond",
@@ -184,6 +185,61 @@ describe("ToolPalette schema-backed items", () => {
     } finally {
       await act(async () => root.unmount());
     }
+  });
+
+  it.each(["double", "triple"])("chooses %s Bond once and remembers its face and primary command", async order => {
+    const item = getToolsetItemGroups("core.main").flat().find(entry => entry.id === "tool.doubleBond")!;
+    const { host, button, root, onInvoke } = await renderSchemaPalette(item);
+    const id = `tool.${order}Bond`;
+    const render = (activeTool: string) => act(async () => root.render(createElement(ToolPalette, {
+      groups: [], itemGroups: [[item]], activeTool, onInvoke
+    })));
+    try {
+      expect(button.getAttribute("data-command-id")).toBe("tool.doubleBond");
+      await act(async () => button.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true })));
+      const menu = host.querySelector<HTMLElement>('[role="menu"]')!;
+      expect(button.getAttribute("aria-controls")).toBe(menu.id);
+      expect(menu.getAttribute("data-toolbar-submenu-owner-id")).toBe(item.id);
+      const choice = menu.querySelector<HTMLButtonElement>(`[data-command-id="${id}"]`)!;
+      expect(choice.getAttribute("role")).toBe("menuitem");
+      await act(async () => {
+        choice.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
+        choice.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+        choice.click();
+      });
+      expect(onInvoke).toHaveBeenCalledExactlyOnceWith(id);
+      expect(menu.hidden).toBe(true);
+      // Model the document's command activation/snapshot, also used after native flyout selection.
+      await render(id);
+      expect(button.getAttribute("data-command-id")).toBe(id);
+      const face = button.querySelector("img")?.getAttribute("src");
+      expect(face).toBe(toolbarAsset(order === "triple" ? "Custom_Bond_Triple" : "Custom_Bond_Double"));
+      await render("tool.select");
+      expect(button.getAttribute("data-command-id")).toBe(id);
+      expect(button.querySelector("img")?.getAttribute("src")).toBe(face);
+      onInvoke.mockClear();
+      await act(async () => button.click());
+      expect(onInvoke).toHaveBeenCalledExactlyOnceWith(id);
+    } finally { await act(async () => root.unmount()); }
+  });
+
+  it("sends the multiple-bond group through the native flyout request without dangling DOM ARIA", async () => {
+    const item = getToolsetItemGroups("core.main").flat().find(entry => entry.id === "tool.doubleBond")!;
+    const { host, button, root, onInvoke } = await renderSchemaPalette(item);
+    const onRequestFlyout = vi.fn();
+    try {
+      await act(async () => root.render(createElement(ToolPalette, { itemGroups: [[item]], onInvoke, onRequestFlyout })));
+      await act(async () => button.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true })));
+      expect(onRequestFlyout).toHaveBeenCalledTimes(1);
+      expect(onRequestFlyout.mock.calls[0][0].flyout).toMatchObject({
+        flyoutId: "multiple-bond-tools", columns: 3,
+        commands: [{ id: "tool.doubleBond", enabled: true }, { id: "tool.tripleBond", enabled: true }]
+      });
+      expect(button.getAttribute("aria-haspopup")).toBe("menu");
+      expect(button.getAttribute("aria-controls")).toBeNull();
+      expect(host.querySelector<HTMLElement>('[role="menu"]')?.hidden).toBe(true);
+      expect(onInvoke).not.toHaveBeenCalled();
+    } finally { await act(async () => root.unmount()); }
   });
 
   it("invokes the primary command exactly once before the flyout hold threshold", async () => {

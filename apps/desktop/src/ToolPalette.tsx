@@ -3935,7 +3935,8 @@ function ToolbarPaletteItem({
   const defaultPrimaryCommand = item.primary.type === "command" ? item.primary.command : undefined;
   const [selectedFlyoutCommandId, setSelectedFlyoutCommandId] = useState<string>();
   const followsSelectedTool = defaultPrimaryCommand?.id === "tool.symbol"
-    || defaultPrimaryCommand?.id === "tool.charge";
+    || defaultPrimaryCommand?.id === "tool.charge"
+    || defaultPrimaryCommand?.id === "tool.doubleBond";
   const activeFlyoutCommand = followsSelectedTool
     ? item.submenu?.items.find((command) => command.id === activeTool)
     : undefined;
@@ -4262,7 +4263,7 @@ function ToolbarPaletteItem({
         data-disabled={primaryDisabled ? "true" : undefined}
         data-distribute-mode={primaryCommand && isDistributeCommandId(primaryCommand.id) ? distributeMode : undefined}
         data-shortcut-label={item.tooltip.shortcutLabel ?? item.tooltip.shortcut ?? "No shortcut"}
-        data-toolbar-asset={item.assetName ?? primaryCommand?.assetName}
+        data-toolbar-asset={followsSelectedTool ? primaryCommand?.assetName : item.assetName ?? primaryCommand?.assetName}
         data-tooltip={tooltipText}
         onPointerDown={(event) => {
           event.stopPropagation();
@@ -4436,9 +4437,9 @@ export function ToolbarItemIcon({
   if (item.iconDataUri) {
     return <img className="tool-icon-image" src={item.iconDataUri} alt="" aria-hidden="true" />;
   }
-  // Only the Symbol/charge group previews its selected command instead of its shared asset.
+  // Groups that remember their selected tool preview that command instead of their shared asset.
   const primaryId = item.primary.type === "command" ? item.primary.command.id : undefined;
-  if (command && (primaryId === "tool.symbol" || primaryId === "tool.charge")) {
+  if (command && (primaryId === "tool.symbol" || primaryId === "tool.charge" || primaryId === "tool.doubleBond")) {
     return <ToolbarCommandIcon command={command} />;
   }
   // toolbarAsset() returns undefined for an unknown key (e.g. a plugin's unregistered assetName);

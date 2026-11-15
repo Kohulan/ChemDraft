@@ -103,23 +103,22 @@ describe("desktop toolset mapping", () => {
       itemOrder: { "core.main.items": [...defaults.filter(id => id !== "tool.roundBracket"), "tool.roundBracket"] } }] };
     expect(migrateBracketToolbarOrder(custom)).toBe(custom);
   });
-  it("puts Single, Double and Triple Bond together on default Main and leaves Chain in the gallery", () => {
+  it("puts the Double Bond group under benzene with Triple in its flyout instead of a standalone button", () => {
     const items = getToolsetItemGroups("core.main").flat();
     const ids = items.map(item => item.id);
-    expect(ids.slice(ids.indexOf("tool.bond"), ids.indexOf("tool.bond") + 3)).toEqual([
-      "tool.bond", "tool.doubleBond", "tool.tripleBond"
+    expect(ids.slice(ids.indexOf("tool.bond"), ids.indexOf("core.main.divider.2"))).toEqual([
+      "tool.bond", "tool.wedgeBond", "tool.hashedBond", "tool.boldBond", "tool.benzene", "tool.doubleBond"
     ]);
+    expect(ids).not.toContain("tool.tripleBond");
     expect(ids).not.toContain("tool.chain");
-    for (const [id, label, assetName] of [
-      ["tool.doubleBond", "Double Bond", "Custom_Bond_Double"],
-      ["tool.tripleBond", "Triple Bond", "Custom_Bond_Triple"]
-    ]) {
-      expect(items.find(item => item.id === id)).toMatchObject({
-        kind: "button", label, assetName, category: "structure",
-        primary: { type: "command", command: { id } }, submenu: null,
-        tooltip: { title: label }, layout: { colSpan: 1, rowSpan: 1 }
-      });
-    }
+    const double = items.find(item => item.id === "tool.doubleBond")!;
+    expect(double).toMatchObject({
+      kind: "button", label: "Double Bond", assetName: "Custom_Bond_Double", category: "structure",
+      primary: { type: "command", command: { id: "tool.doubleBond" } },
+      submenu: { id: "multiple-bond-tools", type: "command-grid" },
+      tooltip: { title: "Double Bond" }, layout: { colSpan: 1, rowSpan: 1 }
+    });
+    expect(double.submenu?.items.map(command => command.id)).toEqual(["tool.doubleBond", "tool.tripleBond"]);
   });
   it("maps legacy command items to schema-backed palette items", () => {
     const item = getToolsetItemGroups("core.legacy", registry([legacyToolset]))[0][0];
