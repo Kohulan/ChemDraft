@@ -222,6 +222,49 @@ describe("bold band geometry", () => {
     }
   });
 
+  it.each([0, 0.37, 1.8])("keeps ordinary junction ink beside an uncovered wide centered bold double at rotation %s", angle => {
+    const { object } = boldBondFixture("double");
+    object.bonds[0]!.display!.doubleBondSide = "center";
+    object.style.multipleBondGapPx = 20;
+    for (const atom of object.atoms) {
+      const { x, y } = atom;
+      atom.x = x * Math.cos(angle) - y * Math.sin(angle);
+      atom.y = x * Math.sin(angle) + y * Math.cos(angle);
+    }
+    const before = JSON.stringify(object);
+    const atom = object.atoms[0]!; // Two ordinary bonds and the centered bold double meet here.
+    const other = object.atoms[1]!;
+    const length = Math.hypot(other.x - atom.x, other.y - atom.y);
+    const offset = (point: { x: number; y: number }) =>
+      (-(other.y - atom.y) * (point.x - atom.x) + (other.x - atom.x) * (point.y - atom.y)) / length;
+    const offsets = polygon(object).map(offset);
+    // The new 6.48-unit band still sits entirely away from the carbon at a 20-unit gap.
+    expect(Math.min(...offsets.map(Math.abs))).toBeGreaterThan(1.16);
+    expect(offsets.every(value => value > 0) || offsets.every(value => value < 0)).toBe(true);
+    const pi = ink(object).find(f => f.tag === "line")!;
+    expect(Math.abs(offset({ x: Number(pi.attrs.x1), y: Number(pi.attrs.y1) })))
+      .toBeGreaterThan(1.16 + Number(pi.attrs["stroke-width"]) / 2);
+    const junction = fragments(object).find(f => f.attrs.class === "native-carbon-junction" && f.attrs["data-atom-id"] === atom.id);
+    expect(junction?.tag).toBe("circle");
+    expect(junction?.attrs).toMatchObject({ cx: atom.x, cy: atom.y, r: "1.16", fill: "#000000", stroke: "none" });
+    expect(JSON.stringify(object)).toBe(before);
+  });
+
+  it.each(["single", "double"])("omits extra junction ink where the %s band covers the carbon", kind => {
+    const { object } = boldBondFixture(kind === "single" ? "ring" : "double");
+    const atom = object.atoms[0]!;
+    const points = polygon(object);
+    // A point lies in this convex quadrilateral when every edge has the same
+    // signed orientation to it. Assert coverage separately from circle omission.
+    const sides = points.map((point, index) => {
+      const next = points[(index + 1) % points.length]!;
+      return (next.x - point.x) * (atom.y - point.y) - (next.y - point.y) * (atom.x - point.x);
+    });
+    expect(sides.every(side => side >= 0) || sides.every(side => side <= 0)).toBe(true);
+    expect(fragments(object).filter(f => f.attrs.class === "native-carbon-junction" && f.attrs["data-atom-id"] === atom.id))
+      .toHaveLength(0);
+  });
+
   it("leaves pi endpoints unchanged beside oblique labels and at centered chain joins", () => {
     for (const labeled of [false, true]) {
       const { object } = boldBondFixture("chain");

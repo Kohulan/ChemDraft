@@ -83,6 +83,31 @@ describe.each(["macos", "windows"] as const)("MainWindow selection copy on %s", 
     expect(container.querySelector('[role="status"]')?.textContent).toContain("Cut canceled");
     if (failure === "render") expect(writeClipboardItems).not.toHaveBeenCalled();
   });
+  it.each(["copy", "cut"] as const)("%s forwards all prepared mixed-selection flavors in one transaction", async mode => {
+    const drawing = insertNativeTextObject(source(), { x: 20, y: 20 }, "Reaction conditions");
+    const selected = { ...drawing, selection: { ...drawing.selection,
+      objectIds: drawing.pages[0].objects.map(object => object.id) } };
+    const payload = createSelectionClipboardPayload(selected)!;
+    expect(payload.objects.map(object => object.type)).toEqual(["molecule", "text"]);
+    const items = [
+      { type: CHEMDRAFT_SELECTION_CLIPBOARD_TYPE, text: serializeSelectionClipboardPayload(payload), required: true },
+      { type: "image/png", bytes: Uint8Array.from([137, 80]), required: true },
+      { type: "image/svg+xml", text: "<svg/>", required: false },
+      ...(platform === "macos" ? [
+        { type: "public.svg-image", text: "<svg/>", required: false },
+        { type: "application/pdf", bytes: Uint8Array.from([37, 80, 68, 70]), required: false }
+      ] : []),
+      { type: "text/plain", text: "Reaction conditions", required: false }
+    ];
+    vi.mocked(selectionClipboardImageItems).mockResolvedValue({ items, warnings: [] });
+    await mount(selected);
+    await command(`clipboard.${mode}`);
+    expect(selectionClipboardImageItems).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ pages: selected.pages }), payload, platform);
+    expect(writeClipboardItems).toHaveBeenCalledExactlyOnceWith(items);
+    const objects = window.__CHEMDRAFT_AGENT__!.snapshot().document.pages[0].objects;
+    expect(objects).toEqual(mode === "copy" ? selected.pages[0].objects : []);
+  });
   it("retains readable plain text for a text-only selection", async () => {
     await mount(insertNativeTextObject(createPhase4Document(), { x: 20, y: 20 }, "Reaction conditions"));
     await command("clipboard.copy");

@@ -4,7 +4,7 @@ import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import type { ClipboardWriteItem } from "./clipboard";
 import {
   CHEMDRAFT_SELECTION_CLIPBOARD_TYPE, copyAsScopedDocument, exportPhase4Pdf, exportPhase4Svg,
-  serializeSelectionClipboardPayload, type ChemDraftSelectionClipboardPayload
+  selectionClipboardPlainText, serializeSelectionClipboardPayload, type ChemDraftSelectionClipboardPayload
 } from "./documentWorkflow";
 import { detectDesktopShortcutPlatform } from "./keyboardShortcuts";
 import { rasterizeSvgNative } from "./nativeRasterExport";
@@ -43,6 +43,10 @@ export async function selectionClipboardImageItems(
       // Some text cannot be represented by PDF. PNG still carries the exact drawing and data.
       warnings.push(`PDF was not copied: ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+  const plainText = selectionClipboardPlainText(payload);
+  if (plainText.length > 0) {
+    items.push({ type: "text/plain", text: plainText, required: false });
   }
   return { items, warnings: [...new Set(warnings)] };
 }

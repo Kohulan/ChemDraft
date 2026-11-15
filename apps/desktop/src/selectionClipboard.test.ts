@@ -85,6 +85,31 @@ describe("selection picture copy", () => {
     expect(payload.objects[0]).toMatchObject({ atoms: [molecule.atoms[0]], bonds: [] });
   });
 
+  it.each(["macos", "windows"] as const)("keeps plain text alongside every image flavor for a mixed selection on %s", async platform => {
+    let source = insertNativeSingleBondMolecule(createPhase4Document(), { x: 300, y: 300 });
+    source = insertNativeTextObject(source, { x: 20, y: 20 }, "Reaction conditions");
+    source = { ...source, selection: { ...source.selection,
+      objectIds: source.pages[0].objects.map(object => object.id) } };
+    const before = structuredClone(source);
+    const payload = createSelectionClipboardPayload(source)!;
+    expect(payload.objects.map(object => object.type)).toEqual(["molecule", "text"]);
+    const prepared = await selectionClipboardImageItems(source, payload, platform);
+    expect(prepared.items).toContainEqual({ type: "text/plain", text: "Reaction conditions", required: false });
+    expect(prepared.items.map(item => item.type)).toEqual(expect.arrayContaining([
+      CHEMDRAFT_SELECTION_CLIPBOARD_TYPE, "text/plain", "image/png", "image/svg+xml",
+      ...(platform === "macos" ? ["public.svg-image", "application/pdf"] : [])
+    ]));
+    await writeClipboardItems(prepared.items);
+    expect(native.invoke).toHaveBeenCalledExactlyOnceWith("write_clipboard_items", {
+      items: expect.arrayContaining([
+        expect.objectContaining({ type: "text/plain", text: "Reaction conditions", required: false }),
+        expect.objectContaining({ type: "image/png", required: true }),
+        expect.objectContaining({ type: "image/svg+xml" })
+      ])
+    });
+    expect(source).toEqual(before);
+  });
+
   it("does not fall back to a JSON-only copy when rasterization fails", async () => {
     vi.mocked(rasterizeSvgNative).mockRejectedValue(new Error("Rasterizer unavailable"));
     const source = insertNativeSingleBondMolecule(createPhase4Document(), { x: 300, y: 300 });

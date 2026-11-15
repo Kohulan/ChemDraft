@@ -2008,7 +2008,10 @@ function planNativeMoleculeGraphSvg(
   const carbonJunctionPlans = nativeCarbonJunctionPlans(
     object,
     labeledAtomIds,
-    drawingStyle
+    drawingStyle,
+    bondSegmentGroups,
+    gapsByBondKey,
+    resolution
   );
   const sketchGeometry = visualEffectsForStyle(object.style).some((effect) => effect.kind === "sketch")
     ? moleculeEffectSketchBasePathD(object, bondSegmentGroups, gapsByBondKey, resolution)
@@ -3195,8 +3198,23 @@ function linePathD(segment: Pick<PageBondLineSegment, "x1" | "y1" | "x2" | "y2">
 function nativeCarbonJunctionPlans(
   object: MoleculeObject,
   labeledAtomIds: ReadonlySet<string>,
-  drawingStyle: NativeDrawingStyle
+  drawingStyle: NativeDrawingStyle,
+  bondSegmentGroups: readonly PageMoleculeBondSegmentGroup[],
+  gapsByBondKey: ReadonlyMap<string, readonly BondCrossingGap[]>,
+  resolution: NativeBondOrderResolution
 ): NativeCarbonJunctionPlan[] {
+  // Use the actual ink, including centered-double offsets and crossing cuts. A bold
+  // band can sit entirely to one side of the carbon when double spacing is wide.
+  const boldPolygonsByBondId = new Map(bondSegmentGroups.flatMap(group => {
+    if (group.bond.order === "unknown" || nativeBondDisplayStyle(group.bond) !== "bold") return [];
+    const primary = group.segments.find(segment => segment.segment === "primary");
+    const polygons = primary ? nativeBoldBondPolygons(object, primary, group.drawingStyle,
+      gapsByBondKey.get(bondRefKey({ objectId: object.id, bondId: group.bond.id })) ?? [], resolution) : [];
+    return [[group.bond.id, polygons.map(points => points.split(/\s+/).map(point => {
+      const [x, y] = point.split(",").map(Number);
+      return { x: x!, y: y! };
+    }))] as const];
+  }));
   return object.atoms.flatMap((atom) => {
     if (
       nativeElementFromAtomLabel(atom.element) !== "C" ||
@@ -3212,9 +3230,11 @@ function nativeCarbonJunctionPlans(
       const bondStyle = nativeBondDisplayStyle(bond);
       return bondStyle !== "dashed" && bondStyle !== "hashed";
     });
-    // Bold bands already meet the neighboring ink. A circle here would reinstate
-    // a round blob (even a normal-width one protrudes past the flush outer edge).
-    if (continuousBonds.some(bond => bond.order !== "unknown" && nativeBondDisplayStyle(bond) === "bold")) return [];
+    // Where a band covers the carbon, a circle would protrude past its clean miter.
+    // Else keep the ordinary-width ink joining the other incident strokes.
+    if (continuousBonds.some(bond => boldPolygonsByBondId.get(bond.id)?.some(polygon =>
+      pointInPolygon(atom, polygon) || polygon.some((point, index) =>
+        distanceToSegment(atom, point, polygon[(index + 1) % polygon.length]!) <= 0.001)))) return [];
     if (continuousBonds.length < 2) {
       return [];
     }
@@ -3224,7 +3244,9 @@ function nativeCarbonJunctionPlans(
       return {
         bond,
         drawingStyle: bondDrawingStyle,
-        strokeWidth: nativeBondStrokeWidth(bond, bondDrawingStyle)
+        strokeWidth: boldPolygonsByBondId.has(bond.id)
+          ? depthCuedBondStrokeWidth(bondDrawingStyle.bondStrokeWidthPx, bond.display?.depthWeight)
+          : nativeBondStrokeWidth(bond, bondDrawingStyle)
       };
     });
     const topmost = incidentStyles[incidentStyles.length - 1]!;
