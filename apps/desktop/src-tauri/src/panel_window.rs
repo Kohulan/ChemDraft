@@ -31,13 +31,8 @@ impl PaletteCommandHitBox {
 }
 
 #[cfg(any(windows, test))]
-fn should_suppress_command_mouse_activation(
-    primary_client_press: bool,
-    app_was_active: bool,
-    command_hit: bool,
-) -> bool {
-    primary_client_press && app_was_active && command_hit
-}
+#[path = "palette_activation.rs"]
+mod palette_activation;
 
 #[cfg(windows)]
 static PALETTE_COMMAND_HIT_BOXES: std::sync::OnceLock<
@@ -70,7 +65,7 @@ fn palette_command_hit(hwnd: isize, x: i32, y: i32) -> bool {
 
 #[cfg(test)]
 mod palette_command_hit_box_tests {
-    use super::{should_suppress_command_mouse_activation, PaletteCommandHitBox};
+    use super::PaletteCommandHitBox;
 
     #[test]
     fn physical_client_hit_boxes_select_only_command_bounds_at_dpi_scale() {
@@ -93,14 +88,6 @@ mod palette_command_hit_box_tests {
         assert!(!buttons.iter().any(|button| button.contains(65, 30)));
         assert!(buttons.iter().any(|button| button.contains(75, 30)));
         assert!(!buttons.iter().any(|button| button.contains(135, 30)));
-    }
-
-    #[test]
-    fn routing_requires_active_app_primary_client_hit_on_an_enabled_command_box() {
-        assert!(should_suppress_command_mouse_activation(true, true, true));
-        assert!(!should_suppress_command_mouse_activation(false, true, true));
-        assert!(!should_suppress_command_mouse_activation(true, false, true));
-        assert!(!should_suppress_command_mouse_activation(true, true, false));
     }
 }
 pub(crate) use installation::finish_installation;
@@ -574,6 +561,12 @@ pub(crate) fn focus_if_app_active(hwnd: windows_sys::Win32::Foundation::HWND) ->
         ) -> windows_sys::Win32::Foundation::HWND;
     }
     unsafe {
+        if focus_observer(hwnd).is_some_and(|observer| !observer.policy.get().permits_input_focus())
+        {
+            log::debug!(target: "chemdraft::windows_activation",
+                "input-focus refused hwnd={hwnd:?} reason=command-surface");
+            return false;
+        }
         // Preserve Tao's visible/non-minimized gate, including utility suspension for dialogs.
         if hwnd.is_null() || IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
             return false;
@@ -705,9 +698,22 @@ pub(crate) fn install_input_focus<R: tauri::Runtime>(
     key_guard::install(window)?;
     let hwnd = window.hwnd().map_err(|error| error.to_string())?.0;
     let target = window.clone();
+    let press_target = window.clone();
     let drag_target = window.clone();
     let refresh_window = window.clone();
     let data = Box::into_raw(Box::new(FocusObserver {
+        label: window.label().to_owned(),
+        policy: std::cell::Cell::new(palette_activation::Policy::default()),
+        command_pressed: std::rc::Rc::new(move |primary| {
+            // Cancel a queued editing acquisition synchronously, before WebView2 sees
+            // this command press. Preserve the pending-key observer that the early
+            // MA_NOACTIVATE return deliberately bypasses in the subclass chain.
+            activation_with_reason(&press_target, false, "command");
+            key_guard::pointer(
+                press_target.app_handle(),
+                primary.then_some(press_target.label()),
+            );
+        }),
         stable_nonclient_paint: window.label().starts_with("toolset-"),
         command_hit_boxes: window.label().starts_with("toolset-core-"),
         activation: std::rc::Rc::new(move |active| activation(&target, active)),
@@ -745,8 +751,58 @@ pub(crate) fn install_input_focus<R: tauri::Runtime>(
     Ok(())
 }
 
+/// Called at native open AND reveal, so colour -> flyout reuse cannot keep an
+/// editing acquisition alive. This is a no-op off Windows.
+pub(crate) fn set_popover_content<R: tauri::Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    kind: &str,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let target = window.clone();
+        let kind = kind.to_owned();
+        super::run_on_main_thread_blocking(window, move || {
+            let hwnd = target.hwnd().map_err(|error| error.to_string())?.0;
+            // SAFETY: installed observer, read and updated only on this HWND's UI thread.
+            if let Some(observer) = unsafe { focus_observer(hwnd) } {
+                let mut policy = observer.policy.get();
+                policy.set_content(&kind);
+                observer.policy.set(policy);
+                if !policy.permits_input_focus() {
+                    activation_with_reason(&target, false, "content");
+                    return_focus_after_interaction(&target, true)?;
+                }
+            }
+            Ok(())
+        })?
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (window, kind);
+        Ok(())
+    }
+}
+
+// The reference must not survive a callback/DefSubclassProc (WM_NCDESTROY owns it).
+#[cfg(windows)]
+unsafe fn focus_observer<'a>(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+) -> Option<&'a FocusObserver> {
+    let mut data = 0;
+    if windows_sys::Win32::UI::Shell::GetWindowSubclass(hwnd, Some(focus_subclass), 2, &mut data)
+        == 0
+    {
+        None
+    } else {
+        (data as *const FocusObserver).as_ref()
+    }
+}
+
 #[cfg(windows)]
 struct FocusObserver {
+    label: String,
+    policy: std::cell::Cell<palette_activation::Policy>,
+    command_pressed: std::rc::Rc<dyn Fn(bool)>,
     stable_nonclient_paint: bool,
     command_hit_boxes: bool,
     activation: std::rc::Rc<dyn Fn(bool)>,
@@ -767,39 +823,43 @@ unsafe extern "system" fn focus_subclass(
     use windows_sys::Win32::UI::{
         Shell::{DefSubclassProc, RemoveWindowSubclass},
         WindowsAndMessaging::{
-            GetForegroundWindow, GetMessagePos, IsIconic, HTCLIENT, MA_NOACTIVATE, WA_INACTIVE,
-            WM_ACTIVATE, WM_ACTIVATEAPP, WM_EXITSIZEMOVE, WM_LBUTTONDOWN, WM_MOUSEACTIVATE,
-            WM_NCACTIVATE, WM_NCDESTROY, WM_SHOWWINDOW,
+            GetMessagePos, IsIconic, HTCLIENT, WA_INACTIVE, WM_ACTIVATE, WM_ACTIVATEAPP,
+            WM_EXITSIZEMOVE, WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_NCACTIVATE, WM_NCDESTROY,
+            WM_SHOWWINDOW,
         },
     };
-    let primary_client_press = message == WM_MOUSEACTIVATE
-        && (*(data as *const FocusObserver)).command_hit_boxes
-        && (lparam & 0xffff) == HTCLIENT as isize
-        && ((lparam >> 16) & 0xffff) == WM_LBUTTONDOWN as isize;
-    let app_was_active = if primary_client_press {
-        let foreground = GetForegroundWindow();
-        let mut process_id = 0;
-        windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
-            foreground,
-            &mut process_id,
-        );
-        !foreground.is_null() && process_id == std::process::id()
-    } else {
-        false
-    };
-    let command_hit = if primary_client_press && app_was_active {
-        let packed = GetMessagePos();
-        let mut point = windows_sys::Win32::Foundation::POINT {
-            x: (packed as u16 as i16) as i32,
-            y: ((packed >> 16) as u16 as i16) as i32,
+    if message == WM_MOUSEACTIVATE {
+        let observer = &*(data as *const FocusObserver);
+        let primary = ((lparam >> 16) & 0xffff) == WM_LBUTTONDOWN as isize;
+        let command_hit = if observer.command_hit_boxes && (lparam & 0xffff) == HTCLIENT as isize {
+            let packed = GetMessagePos();
+            let mut point = windows_sys::Win32::Foundation::POINT {
+                x: (packed as u16 as i16) as i32,
+                y: ((packed >> 16) as u16 as i16) as i32,
+            };
+            ScreenToClient(hwnd, &mut point) != 0
+                && palette_command_hit(hwnd as isize, point.x, point.y)
+        } else {
+            false
         };
-        ScreenToClient(hwnd, &mut point) != 0
-            && palette_command_hit(hwnd as isize, point.x, point.y)
-    } else {
-        false
-    };
-    let active_command_hit =
-        should_suppress_command_mouse_activation(primary_client_press, app_was_active, command_hit);
+        let mut policy = observer.policy.get();
+        let decision = policy.mouse_activate(command_hit);
+        observer.policy.set(policy);
+        // Clone before invoking callbacks/default processing: nested messages may
+        // destroy the observer. Return before lower handlers can perform focus
+        // side effects; correcting activation later still lets DWM see its shadow.
+        let label = observer.label.clone();
+        let command_pressed = observer.command_pressed.clone();
+        let result = if let Some(result) = decision {
+            command_pressed(primary);
+            result
+        } else {
+            DefSubclassProc(hwnd, message, wparam, lparam)
+        };
+        log::debug!(target: "chemdraft::windows_activation",
+            "WM_MOUSEACTIVATE label={label} return={result} command_hit={command_hit} policy={policy:?}");
+        return result;
+    }
     // Toolsets draw their own frame. Keep native activation bookkeeping (including Tao's
     // active-state tracking) but suppress DefWindowProc's transient nonclient repaint.
     // WM_NCACTIVATE documents lParam=-1 for this purpose; do not fake wParam or skip the
@@ -811,14 +871,16 @@ unsafe extern "system" fn focus_subclass(
     {
         return DefSubclassProc(hwnd, message, wparam, -1);
     }
-    // Observe focus without overriding mouse activation. Palettes keep WS_EX_NOACTIVATE,
-    // but WebView2 must be allowed to activate them for a native colour picker. Forcing
-    // MA_NOACTIVATE here (newly installed on palettes) prevents that popup from opening.
-    // Ordinary command clicks still return focus through the guarded pointer hand-back.
+    // Editable controls retain native chooser activation; command surfaces were
+    // handled above without forwarding WM_MOUSEACTIVATE into the default chain.
     // Observe genuine top-level loss synchronously, including during acquisition.
     // WebView2 child focus transitions are not lease boundaries.
     if message == WM_ACTIVATE || (message == WM_ACTIVATEAPP && wparam == 0) {
         let active = message == WM_ACTIVATE && (wparam & 0xffff) != WA_INACTIVE as usize;
+        log::debug!(target: "chemdraft::windows_activation",
+            "activation label={} message={message:#x} active={active} policy={:?}",
+            (*(data as *const FocusObserver)).label,
+            (*(data as *const FocusObserver)).policy.get());
         let notify = (*(data as *const FocusObserver)).activation.clone();
         notify(active);
     }
@@ -839,9 +901,6 @@ unsafe extern "system" fn focus_subclass(
         refresh();
     }
     let result = DefSubclassProc(hwnd, message, wparam, lparam);
-    if active_command_hit {
-        return MA_NOACTIVATE as isize;
-    }
     if let Some(drag_finished) = drag_finished {
         drag_finished();
     }

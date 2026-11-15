@@ -38,6 +38,7 @@ mod webview_context_menus;
 #[cfg(test)]
 mod webview_context_menus_tests;
 mod window_drag;
+mod windows_activation_log;
 mod windows_clipboard;
 
 use clipboard_formats::{
@@ -1053,6 +1054,7 @@ const MAIN_WINDOW_TITLE_GRAB_PT: f64 = 22.0;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let perf_enabled = agent_bridge_status().enabled;
+    windows_activation_log::init(perf_enabled);
     let perf_log = perf_log::PerfLog::new(perf_enabled);
     let builder = tauri::Builder::default();
 
@@ -5568,6 +5570,7 @@ async fn open_toolset_popover(
         // can nudge an NSWindow's frame, and the first open after a prewarm used to land the
         // popover away from its anchor. An explicit LogicalPosition set is the final word in
         // both the warm and cold paths.
+        panel_window::set_popover_content(&window, &kind)?;
         configure_toolset_popover_window(&window, focus_mode)?;
         window
             .set_title(toolset_popover_title(&label, &kind))
@@ -5685,6 +5688,7 @@ fn build_toolset_popover_window(
     disable_default_context_menus(&window);
     configure_toolset_popover_window(&window, focus_mode)?;
     install_toolset_input_focus(&window)?;
+    panel_window::set_popover_content(&window, kind)?;
     // Re-assert the anchor as the FINAL step, mirroring the warm path: panel configuration
     // can nudge the frame, and builder-time positioning has proven less trustworthy than an
     // explicit post-build LogicalPosition set (first opens landed away from the anchor).
@@ -5914,6 +5918,7 @@ fn show_toolset_popover_window(
     // The page owns the live content, including a prewarmed/reused Art window switching
     // between its colour picker and command flyouts. Titles are fixed native strings.
     if let Some(kind) = kind {
+        panel_window::set_popover_content(&window, &kind)?;
         window
             .set_title(toolset_popover_title(window.label(), &kind))
             .map_err(|error| error.to_string())?;
