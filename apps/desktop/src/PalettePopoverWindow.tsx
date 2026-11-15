@@ -7,6 +7,8 @@ import { normalizeHexColor, objectCustomColorCommandId, textCustomColorCommandId
 import { installPaletteInputFocus } from "./plugins/pluginPanelInputFocus";
 import { detectDesktopShortcutPlatform } from "./keyboardShortcuts";
 import { preventPaletteCommandPointerFocus } from "./paletteCommandPointerFocus";
+import { observePaletteHitBoxes } from "./commandHitBoxes";
+import { listenCurrentWindowEvent } from "./window-manager/tauriEvents";
 import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import {
   listenForToolsetPopoverContent,
@@ -28,6 +30,7 @@ import {
   sendBondStereoPopoverAction,
   setCurrentWindowLogicalPosition,
   setCurrentWindowLogicalSize,
+  setPaletteCommandHitBoxes,
   showCurrentToolsetPopoverWindow,
   toolsetPopoverTimestamp,
   type ToolsetArtPaintTarget,
@@ -144,6 +147,17 @@ export function PalettePopoverWindow({
   useEffect(() => {
     const shell = shellRef.current;
     if (shell) return installPaletteInputFocus(shell, platform, undefined, () => keepWindowFocusRef.current);
+  }, [platform]);
+
+  useEffect(() => {
+    const shell = shellRef.current;
+    if (platform !== "windows" || !shell) return;
+    return observePaletteHitBoxes(shell, setPaletteCommandHitBoxes, refresh =>
+      listenCurrentWindowEvent("chemdraft://palette-command-hit-boxes-refresh", refresh));
+  }, [platform, toolsetId]);
+
+  useEffect(() => () => {
+    if (platform === "windows") void setPaletteCommandHitBoxes([], []).catch(() => undefined);
   }, [platform]);
 
   useEffect(() => {

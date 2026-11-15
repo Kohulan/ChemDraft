@@ -4070,7 +4070,7 @@ async fn set_plugin_panel_input_focus(
                             windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow()
                                 == hwnd
                         };
-                        if !panel_window::focus_if_app_active(hwnd) {
+                        if !panel_window::focus_if_app_active(hwnd, pointer_before.is_none()) {
                             return Ok(false);
                         }
                         // A native colour popup may have opened during the click default before
@@ -6126,16 +6126,26 @@ fn set_palette_command_hit_boxes(
     window: tauri::WebviewWindow,
     boxes: Vec<panel_window::PaletteCommandHitBox>,
 ) -> Result<(), String> {
-    if !["toolset-core-", "toolset-plugin-", "toolset-user-"]
-        .iter()
-        .any(|prefix| window.label().starts_with(prefix))
+    if ![
+        "toolset-core-",
+        "toolset-plugin-",
+        "toolset-user-",
+        "toolset-popover-",
+    ]
+    .iter()
+    .any(|prefix| window.label().starts_with(prefix))
     {
         return Err("Expected a tool palette.".into());
     }
     #[cfg(windows)]
     {
         let hwnd = window.hwnd().map_err(|error| error.to_string())?.0;
-        panel_window::set_palette_command_hit_boxes(hwnd as isize, boxes);
+        let (chooser_rects, boxes): (Vec<_>, Vec<_>) =
+            boxes.into_iter().partition(|rect| rect.native_chooser);
+        log::debug!(target: "chemdraft::windows_activation",
+            "set_palette_command_hit_boxes label={} count={} chooser_rects={}",
+            window.label(), boxes.len(), chooser_rects.len());
+        panel_window::set_palette_command_hit_boxes(hwnd as isize, boxes, chooser_rects);
     }
     #[cfg(not(windows))]
     let _ = boxes;

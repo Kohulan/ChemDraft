@@ -144,13 +144,16 @@ export function isDesktopRuntime(): boolean {
   return Boolean(candidate.__TAURI_INTERNALS__ || candidate.__TAURI__);
 }
 
-/** Publish the currently rendered drawing-command button hit regions to this native palette. */
+/** Atomically publish command and native-chooser bounds to this palette/popover. */
 export async function setPaletteCommandHitBoxes(
-  boxes: readonly { x: number; y: number; width: number; height: number }[]
+  boxes: readonly { x: number; y: number; width: number; height: number }[],
+  chooserRects: readonly { x: number; y: number; width: number; height: number }[] = []
 ): Promise<void> {
   if (!isDesktopRuntime()) return;
   const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("set_palette_command_hit_boxes", { boxes });
+  await invoke("set_palette_command_hit_boxes", {
+    boxes: [...boxes, ...chooserRects.map(rect => ({ ...rect, nativeChooser: true }))]
+  });
 }
 
 export function createPaletteCommandPayload(commandId: string): PaletteCommandPayload {

@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "toolset-command-hit-boxes",
-  "description": "Allow Windows tool palettes to report the locations of their non-editable command buttons.",
+  "description": "Allow Windows tool palettes and popovers to report command buttons and native chooser bounds.",
   "platforms": ["windows"],
-  "windows": ["toolset-core-*", "toolset-plugin-*", "toolset-user-*"],
+  "windows": ["toolset-core-*", "toolset-plugin-*", "toolset-user-*", "toolset-popover-*"],
   "permissions": ["allow-set-palette-command-hit-boxes"]
 }

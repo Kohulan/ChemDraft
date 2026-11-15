@@ -13,11 +13,15 @@ mod installation;
 mod key_guard;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct PaletteCommandHitBox {
     pub x: i32,
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    // Keep the existing IPC envelope: chooser bounds share the atomic snapshot.
+    #[serde(default)]
+    pub native_chooser: bool,
 }
 
 impl PaletteCommandHitBox {
@@ -35,37 +39,77 @@ impl PaletteCommandHitBox {
 mod palette_activation;
 
 #[cfg(windows)]
-static PALETTE_COMMAND_HIT_BOXES: std::sync::OnceLock<
-    Mutex<HashMap<isize, Vec<PaletteCommandHitBox>>>,
-> = std::sync::OnceLock::new();
+static PALETTE_COMMAND_HIT_BOXES: std::sync::OnceLock<Mutex<HashMap<isize, PaletteHitRegions>>> =
+    std::sync::OnceLock::new();
 
 #[cfg(windows)]
-pub(crate) fn set_palette_command_hit_boxes(hwnd: isize, boxes: Vec<PaletteCommandHitBox>) {
+#[derive(Default)]
+struct PaletteHitRegions {
+    boxes: Vec<PaletteCommandHitBox>,
+    chooser_rects: Vec<PaletteCommandHitBox>,
+}
+
+#[cfg(windows)]
+pub(crate) fn set_palette_command_hit_boxes(
+    hwnd: isize,
+    boxes: Vec<PaletteCommandHitBox>,
+    chooser_rects: Vec<PaletteCommandHitBox>,
+) {
     let state = PALETTE_COMMAND_HIT_BOXES.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut state) = state.lock() {
-        if boxes.is_empty() {
+        if boxes.is_empty() && chooser_rects.is_empty() {
             state.remove(&hwnd);
         } else {
-            state.insert(hwnd, boxes);
+            state.insert(
+                hwnd,
+                PaletteHitRegions {
+                    boxes,
+                    chooser_rects,
+                },
+            );
         }
     }
 }
 
 #[cfg(windows)]
-fn palette_command_hit(hwnd: isize, x: i32, y: i32) -> bool {
+fn palette_hits(hwnd: isize, point: Option<(i32, i32)>) -> (usize, usize, bool, bool) {
     PALETTE_COMMAND_HIT_BOXES
         .get()
         .and_then(|state| state.lock().ok())
-        .is_some_and(|state| {
-            state
-                .get(&hwnd)
-                .is_some_and(|boxes| boxes.iter().any(|rect| rect.contains(x, y)))
+        .and_then(|state| {
+            state.get(&hwnd).map(|regions| {
+                let hit = |rects: &[PaletteCommandHitBox]| {
+                    point.is_some_and(|(x, y)| rects.iter().any(|rect| rect.contains(x, y)))
+                };
+                (
+                    regions.boxes.len(),
+                    regions.chooser_rects.len(),
+                    hit(&regions.boxes),
+                    hit(&regions.chooser_rects),
+                )
+            })
         })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod palette_command_hit_box_tests {
     use super::PaletteCommandHitBox;
+
+    #[test]
+    fn tagged_chooser_rects_share_the_existing_command_snapshot() {
+        let old_command: PaletteCommandHitBox = serde_json::from_value(serde_json::json!({
+            "x": 0, "y": 0, "width": 20, "height": 20
+        }))
+        .unwrap();
+        assert!(!old_command.native_chooser);
+        let chooser: PaletteCommandHitBox = serde_json::from_value(serde_json::json!({
+            "x": 40, "y": 0, "width": 20, "height": 20, "nativeChooser": true
+        }))
+        .unwrap();
+        assert!(chooser.native_chooser);
+        assert!(chooser.contains(40, 0));
+    }
 
     #[test]
     fn physical_client_hit_boxes_select_only_command_bounds_at_dpi_scale() {
@@ -76,12 +120,14 @@ mod palette_command_hit_box_tests {
                 y: 0,
                 width: 60,
                 height: 60,
+                native_chooser: false,
             },
             PaletteCommandHitBox {
                 x: 75,
                 y: 0,
                 width: 60,
                 height: 60,
+                native_chooser: false,
             },
         ];
         assert!(buttons.iter().any(|button| button.contains(59, 59)));
@@ -546,7 +592,10 @@ const RESIZE_ZONE_LOGICAL_PX: f64 = 6.0;
 /// SetActiveWindow changes activation only within our UI thread; unlike tao's set_focus it
 /// never calls SetForegroundWindow or synthesizes Alt. A late IPC is dropped in the background.
 #[cfg(windows)]
-pub(crate) fn focus_if_app_active(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
+pub(crate) fn focus_if_app_active(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    non_pointer_lease: bool,
+) -> bool {
     use windows_sys::Win32::{
         System::Threading::GetCurrentProcessId,
         UI::WindowsAndMessaging::{
@@ -561,8 +610,18 @@ pub(crate) fn focus_if_app_active(hwnd: windows_sys::Win32::Foundation::HWND) ->
         ) -> windows_sys::Win32::Foundation::HWND;
     }
     unsafe {
-        if focus_observer(hwnd).is_some_and(|observer| !observer.policy.get().permits_input_focus())
-        {
+        if focus_observer(hwnd).is_some_and(|observer| {
+            let mut policy = observer.policy.get();
+            // WebView2 can deliver Tab/accessibility focus inside its child
+            // without sending WM_KEYDOWN to the host. Pointer acquisitions carry
+            // pointer_before; a non-pointer lease must not inherit their guard.
+            if non_pointer_lease {
+                policy.clear_command_press();
+            }
+            let allowed = policy.permits_input_focus(std::time::Instant::now());
+            observer.policy.set(policy);
+            !allowed
+        }) {
             log::debug!(target: "chemdraft::windows_activation",
                 "input-focus refused hwnd={hwnd:?} reason=command-surface");
             return false;
@@ -703,7 +762,7 @@ pub(crate) fn install_input_focus<R: tauri::Runtime>(
     let refresh_window = window.clone();
     let data = Box::into_raw(Box::new(FocusObserver {
         label: window.label().to_owned(),
-        policy: std::cell::Cell::new(palette_activation::Policy::default()),
+        policy: std::cell::Cell::new(palette_activation::Policy::new(window.label())),
         command_pressed: std::rc::Rc::new(move |primary| {
             // Cancel a queued editing acquisition synchronously, before WebView2 sees
             // this command press. Preserve the pending-key observer that the early
@@ -714,10 +773,8 @@ pub(crate) fn install_input_focus<R: tauri::Runtime>(
                 primary.then_some(press_target.label()),
             );
         }),
-        stable_nonclient_paint: window.label().starts_with("toolset-"),
-        command_hit_boxes: ["toolset-core-", "toolset-plugin-", "toolset-user-"]
-            .iter()
-            .any(|prefix| window.label().starts_with(prefix)),
+        stable_nonclient_paint: palette_activation::is_command_surface(window.label()),
+        pin_inactive: std::env::var("CHEMDRAFT_PALETTE_PIN_INACTIVE").as_deref() != Ok("0"),
         activation: std::rc::Rc::new(move |active| activation(&target, active)),
         drag_finished: std::rc::Rc::new(move || {
             // The palette's title/background press ended its lease without returning focus.
@@ -770,7 +827,7 @@ pub(crate) fn set_popover_content<R: tauri::Runtime>(
                 let mut policy = observer.policy.get();
                 policy.set_content(&kind);
                 observer.policy.set(policy);
-                if !policy.permits_input_focus() {
+                if !policy.permits_input_focus(std::time::Instant::now()) {
                     activation_with_reason(&target, false, "content");
                     return_focus_after_interaction(&target, true)?;
                 }
@@ -806,7 +863,7 @@ struct FocusObserver {
     policy: std::cell::Cell<palette_activation::Policy>,
     command_pressed: std::rc::Rc<dyn Fn(bool)>,
     stable_nonclient_paint: bool,
-    command_hit_boxes: bool,
+    pin_inactive: bool,
     activation: std::rc::Rc<dyn Fn(bool)>,
     drag_finished: std::rc::Rc<dyn Fn()>,
     refresh_hit_boxes: std::rc::Rc<dyn Fn()>,
@@ -823,33 +880,66 @@ unsafe extern "system" fn focus_subclass(
 ) -> isize {
     use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
     use windows_sys::Win32::UI::{
+        Input::Pointer::{GetPointerInfo, POINTER_INFO},
         Shell::{DefSubclassProc, RemoveWindowSubclass},
         WindowsAndMessaging::{
-            GetMessagePos, IsIconic, HTCLIENT, WA_INACTIVE, WM_ACTIVATE, WM_ACTIVATEAPP,
-            WM_EXITSIZEMOVE, WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_NCACTIVATE, WM_NCDESTROY,
-            WM_SHOWWINDOW,
+            DefWindowProcW, GetCursorPos, GetMessagePos, IsIconic, HTCLIENT, WA_INACTIVE,
+            WM_ACTIVATE, WM_ACTIVATEAPP, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_LBUTTONDOWN,
+            WM_MOUSEACTIVATE, WM_NCACTIVATE, WM_NCDESTROY, WM_POINTERACTIVATE, WM_SHOWWINDOW,
+            WM_SYSKEYDOWN,
         },
     };
-    if message == WM_MOUSEACTIVATE {
+    if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN) {
         let observer = &*(data as *const FocusObserver);
-        let primary = ((lparam >> 16) & 0xffff) == WM_LBUTTONDOWN as isize;
-        let command_hit = if observer.command_hit_boxes && (lparam & 0xffff) == HTCLIENT as isize {
-            let packed = GetMessagePos();
-            let mut point = windows_sys::Win32::Foundation::POINT {
-                x: (packed as u16 as i16) as i32,
-                y: ((packed >> 16) as u16 as i16) as i32,
-            };
-            ScreenToClient(hwnd, &mut point) != 0
-                && palette_command_hit(hwnd as isize, point.x, point.y)
-        } else {
-            false
-        };
         let mut policy = observer.policy.get();
-        let decision = policy.mouse_activate(command_hit);
+        policy.clear_command_press();
         observer.policy.set(policy);
-        // Clone before invoking callbacks/default processing: nested messages may
-        // destroy the observer. Return before lower handlers can perform focus
-        // side effects; correcting activation later still lets DWM see its shadow.
+    }
+    if matches!(message, WM_MOUSEACTIVATE | WM_POINTERACTIVATE) {
+        let observer = &*(data as *const FocusObserver);
+        let pointer = message == WM_POINTERACTIVATE;
+        let primary = pointer || ((lparam >> 16) & 0xffff) == WM_LBUTTONDOWN as isize;
+        let hit_test = if pointer {
+            (wparam >> 16) & 0xffff
+        } else {
+            (lparam & 0xffff) as usize
+        };
+        // GetMessagePos can be stale: WebView2 dequeues the click in its browser
+        // process and sends activation to our UI thread. Use the live cursor.
+        let packed = GetMessagePos();
+        let message_pos = (
+            (packed as u16 as i16) as i32,
+            ((packed >> 16) as u16 as i16) as i32,
+        );
+        let mut cursor = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+        let cursor_valid = GetCursorPos(&mut cursor) != 0;
+        let cursor_pos = cursor_valid.then_some((cursor.x, cursor.y));
+        // Touch/pen does not necessarily move the mouse cursor. Its pointer ID
+        // supplies the same physical screen coordinates for native chooser hits.
+        let mut info: POINTER_INFO = std::mem::zeroed();
+        let pointer_valid = pointer && GetPointerInfo((wparam & 0xffff) as u32, &mut info) != 0;
+        let mut point = if pointer_valid {
+            info.ptPixelLocation
+        } else {
+            cursor
+        };
+        let position_valid = if pointer { pointer_valid } else { cursor_valid };
+        let client = (position_valid
+            && hit_test == HTCLIENT as usize
+            && ScreenToClient(hwnd, &mut point) != 0)
+            .then_some((point.x, point.y));
+        let (box_count, chooser_count, command_hit, chooser_hit) =
+            palette_hits(hwnd as isize, client);
+        let mut policy = observer.policy.get();
+        let press = if pointer {
+            palette_activation::Press::Pointer
+        } else {
+            palette_activation::Press::Mouse
+        };
+        let decision = policy.activate(press, command_hit, chooser_hit, std::time::Instant::now());
+        observer.policy.set(policy);
+        // Clone before callbacks/default processing: nested messages may destroy
+        // the observer. No default chain may activate a command surface first.
         let label = observer.label.clone();
         let command_pressed = observer.command_pressed.clone();
         let result = if let Some(result) = decision {
@@ -858,20 +948,30 @@ unsafe extern "system" fn focus_subclass(
         } else {
             DefSubclassProc(hwnd, message, wparam, lparam)
         };
+        let message_name = if pointer {
+            "WM_POINTERACTIVATE"
+        } else {
+            "WM_MOUSEACTIVATE"
+        };
         log::debug!(target: "chemdraft::windows_activation",
-            "WM_MOUSEACTIVATE label={label} return={result} command_hit={command_hit} policy={policy:?}");
+            "{message_name} label={label} boxes={box_count} chooser_rects={chooser_count} GetMessagePos={message_pos:?} GetCursorPos={cursor_pos:?} client={client:?} command_hit={command_hit} chooser_hit={chooser_hit} return={result} policy={policy:?}");
         return result;
     }
-    // Toolsets draw their own frame. Keep native activation bookkeeping (including Tao's
-    // active-state tracking) but suppress DefWindowProc's transient nonclient repaint.
-    // WM_NCACTIVATE documents lParam=-1 for this purpose; do not fake wParam or skip the
-    // subclass chain, which would break focus/native choosers. Minimized windows retain
-    // the default path. Native Windows shadow behavior still requires the hand check.
-    if message == WM_NCACTIVATE
-        && (*(data as *const FocusObserver)).stable_nonclient_paint
-        && IsIconic(hwnd) == 0
-    {
-        return DefSubclassProc(hwnd, message, wparam, -1);
+    if message == WM_NCACTIVATE {
+        let observer = &*(data as *const FocusObserver);
+        let stable = observer.stable_nonclient_paint && IsIconic(hwnd) == 0;
+        let pinned = stable && observer.pin_inactive && wparam != 0;
+        let label = observer.label.clone();
+        // Tao must receive the REAL activation bit: its focus state drives lease
+        // bookkeeping and popover lifetime. Pin only DefWindowProc's frame state,
+        // AFTER the subclass chain, and return the chain's original result.
+        let result = DefSubclassProc(hwnd, message, wparam, if stable { -1 } else { lparam });
+        if pinned {
+            DefWindowProcW(hwnd, WM_NCACTIVATE, 0, -1);
+        }
+        log::debug!(target: "chemdraft::windows_activation",
+            "WM_NCACTIVATE label={label} wparam={wparam} pinned={pinned}");
+        return result;
     }
     // Editable controls retain native chooser activation; command surfaces were
     // handled above without forwarding WM_MOUSEACTIVATE into the default chain.
@@ -887,7 +987,7 @@ unsafe extern "system" fn focus_subclass(
         notify(active);
     }
     if message == WM_NCDESTROY {
-        set_palette_command_hit_boxes(hwnd as isize, Vec::new());
+        set_palette_command_hit_boxes(hwnd as isize, Vec::new(), Vec::new());
         RemoveWindowSubclass(hwnd, Some(focus_subclass), id);
         let result = DefSubclassProc(hwnd, message, wparam, lparam);
         drop(Box::from_raw(data as *mut FocusObserver));
@@ -897,7 +997,7 @@ unsafe extern "system" fn focus_subclass(
     let drag_finished = (message == WM_EXITSIZEMOVE)
         .then(|| (*(data as *const FocusObserver)).drag_finished.clone());
     if message == WM_SHOWWINDOW && wparam == 0 {
-        set_palette_command_hit_boxes(hwnd as isize, Vec::new());
+        set_palette_command_hit_boxes(hwnd as isize, Vec::new(), Vec::new());
     } else if message == WM_SHOWWINDOW && wparam != 0 {
         let refresh = (*(data as *const FocusObserver)).refresh_hit_boxes.clone();
         refresh();

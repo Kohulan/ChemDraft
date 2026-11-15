@@ -12,7 +12,11 @@ pub(crate) fn init(enabled: bool) {
 
         fn log(&self, record: &log::Record<'_>) {
             if self.enabled(record.metadata()) {
-                eprintln!("[windows-activation] {}", record.args());
+                eprintln!(
+                    "[windows-activation {}] {}",
+                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    record.args()
+                );
             }
         }
 

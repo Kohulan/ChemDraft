@@ -1,5 +1,124 @@
 # Windows toolbar activation investigation
 
+## Inactive-frame pin and default no-activate policy — 2026-11-15
+
+This section supersedes the activation policy described in the historical handoffs below.
+Build stamp: `11.15.10.15-codex`. Windows compilation and visual behavior still need
+the Windows checks below; this implementation does not establish the DWM hypothesis.
+
+- Core, plugin and user command palettes, and their popovers, answer
+  `MA_NOACTIVATE` / `PA_NOACTIVATE` over buttons, background, labels, title and grip.
+  Only renderer-registered enabled `input[type=color]` and `select` rectangles
+  delegate to default activation. Text fields use the existing input lease.
+  Neither result eats the press; title/grip dragging retains its handlers.
+  Document windows, tooltips and report-panel activation are unchanged.
+- Mouse hit testing uses `GetCursorPos` in physical client pixels. Touch/pen uses
+  `GetPointerInfo` for the pointer ID because it need not move the mouse cursor.
+  Failure to obtain a position leaves command surfaces nonactivating.
+- Command/chooser snapshots replace each other atomically. Selection and command
+  broadcasts no longer tear down registration or publish an empty list between
+  frames. DOM, resize and scroll observers republish; renderer cleanup clears only
+  on unmount or customization. Native hide/destruction still discards rectangles,
+  and reveal requests a fresh snapshot.
+- A command press blocks delayed pointer input acquisitions for at most 500 ms.
+  Mouse/pointer activation reclassifies the new press; native keydown clears the
+  old guard. Keyboard/accessibility leases without a pointer timestamp also clear
+  it, covering WebView2 child keys that never reach the host HWND. Command flyouts
+  still refuse text leases for their entire content session.
+- `WM_NCACTIVATE` first passes the **real wParam** through `DefSubclassProc`
+  with `lParam=-1`. For active command surfaces, a second, direct
+  `DefWindowProcW(hwnd, WM_NCACTIVATE, 0, -1)` pins only the frame inactive.
+  The first result is returned. Tao's activation bookkeeping is preserved;
+  legitimate field activation can still dim the document title bar.
+
+### Opt-in diagnostics and A/B switch
+
+Ordinary launches install no activation logger. Enable the existing bridge
+diagnostics with `CHEMDRAFT_AGENT_BRIDGE=1` (or `--chemdraft-agent-bridge`)
+and capture stderr. Every `[windows-activation ...]` line includes a UTC ISO
+timestamp with milliseconds. No field contents are logged.
+
+Mouse and pointer activation lines include window label, command box count,
+chooser rectangle count, both `GetMessagePos` and `GetCursorPos` screen positions,
+the tested client point, command/chooser hit results, and the returned value.
+Each `WM_NCACTIVATE` logs wParam and whether the inactive pin was applied.
+Each renderer `set_palette_command_hit_boxes` call logs label and both counts.
+`activation ... active=true` records real activation, even when the frame is pinned.
+
+The frame pin defaults **on**. Set `CHEMDRAFT_PALETTE_PIN_INACTIVE=0` before
+launch to disable just the pin; remove it or set it to `1` to enable it. Restart
+between runs: existing windows retain the value read when they were created.
+The no-activate/chooser policy and logging stay identical in both runs.
+
+PowerShell, launching the same built development executable for each run:
+
+```powershell
+$env:CHEMDRAFT_AGENT_BRIDGE = "1"
+$env:CHEMDRAFT_PALETTE_PIN_INACTIVE = "0"
+& .\target\debug\chemdraft.exe 2> activation-pin-off.log
+# Quit that dev instance before run 2.
+$env:CHEMDRAFT_PALETTE_PIN_INACTIVE = "1"
+& .\target\debug\chemdraft.exe 2> activation-pin-on.log
+```
+
+Run from `apps/desktop/src-tauri`, or substitute the exact development binary
+from the Windows build. For a Tauri dev build, keep its Vite server available.
+Record the worktree label and build stamp; use the existing synchronized
+capture of foreground/active HWNDs and video, with the same clock as the log.
+
+### Two-run Windows protocol
+
+**Run 1, pin off:** At fresh launch, make ten Charge presses: five after a
+one-second dwell and five move-and-press from the canvas. Select a caption,
+type a HEX value, and repeat. Add five presses within 150 ms of the previous
+command and one title drag. Correlate every dark frame with the activation log:
+
+| Log near a dark frame | Interpretation |
+| --- | --- |
+| `return=1 command_hit=false`, zero boxes or differing positions, then `active=true` | Review's original guard-input failure signature. With the inverted policy a non-chooser command surface must now return 3 even with zero boxes; investigate any other result. |
+| `return=3`, then `active=true` | Activation bypassed the mouse/pointer decision; frame pin is needed. |
+| No mouse/pointer activation line, then `active=true` | That activation did not reach the host press handler. |
+| No `active=true` | The activation-driven shadow hypothesis is not supported for this frame. |
+
+**Run 2, pin on:** Repeat the exact steps and additionally click the HEX field.
+Zero dark frames while `active=true` and `WM_NCACTIVATE ... pinned=true` are
+logged supports the inactive-frame fix. Continued dark frames mean DWM may
+follow true foreground; this pin is then insufficient. Report that outcome
+rather than claiming the blink fixed.
+
+In both runs also verify native colour/select opening and choice, HEX typing,
+command then immediate touch/pen field entry and Tab entry, a field acquisition
+after 500 ms without another mouse activation, title/grip drag, 350 ms holds,
+short presses and exactly-once dispatch. Include custom/plugin palettes,
+disabled buttons, E/Z keyboard navigation, mixed-DPI monitors and app switching.
+Verify report panels still activate normally. macOS Apple silicon and Intel
+need the existing palette field/chooser/drag checks to confirm unchanged behavior.
+
+Recommended next task: run this two-run protocol on Windows 11/WebView2 using
+the same reviewed build, after Windows compile/clippy/tests.
+
+### Verification of this change
+
+- macOS Apple silicon: `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check`,
+  `cargo clippy --all-targets --manifest-path apps/desktop/src-tauri/Cargo.toml -- -D warnings`,
+  and `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml panel_window::`
+  passed (48 Rust tests). The existing local Sparkle framework was copied into
+  this worktree's ignored build-support directory; no download/install was run.
+- Vitest: 817 tests across 27 suites passed, covering palette/popover DOM,
+  input leases, chooser/command publishing and IPC, capabilities, command
+  signatures, drawing tools and the agent bridge. This isolated checkout lacks
+  package dependency links, so runs used a temporary Vite alias configuration
+  pointing to the already-installed local dependencies and this worktree's
+  package sources. No `pnpm install` was run.
+- `git diff --check` passed. The command IPC signature remains unchanged:
+  native choosers are tagged `nativeChooser: true` in the existing boxes payload,
+  so one publication atomically replaces both sets of rectangles.
+- Windows compile/clippy/tests and real-event activation/DWM behavior are
+  unverified. The windows-sys 0.61 declarations and feature gates were inspected,
+  including `GetCursorPos`, `GetPointerInfo`, and `WM_POINTERACTIVATE`.
+  Neither macOS architecture received an app launch or hands-on pass; macOS
+  Intel compilation was not run. Unit tests do not establish the visual result.
+
 ## Renderer follow-up handoff — 2026-11-15
 
 Implementation is ready for integration review; verification remains partial. The
