@@ -42,8 +42,8 @@ beforeEach(() => {
 afterEach(async () => { await act(async () => root.unmount()); container.remove(); });
 
 describe.each(["macos", "windows"] as const)("native multiple-bond flyout on %s", platform => {
-  async function open(disabled = false) {
-    const item = getToolsetItemGroups("core.main").flat().find(entry => entry.id === "tool.doubleBond")!;
+  async function open(disabled = false, ownerId = "tool.doubleBond") {
+    const item = getToolsetItemGroups("core.main").flat().find(entry => entry.id === ownerId)!;
     if (disabled) item.submenu!.items = item.submenu!.items.map(command => ({ ...command, enabled: false, disabledReason: "Drawing is temporarily unavailable" }));
     const request = vi.fn();
     await act(async () => root.render(createElement(ToolPalette, { itemGroups: [[item]], onInvoke: vi.fn(), onRequestFlyout: request, platform })));
@@ -56,19 +56,19 @@ describe.each(["macos", "windows"] as const)("native multiple-bond flyout on %s"
     return container.querySelector<HTMLElement>('[role="menu"]')!;
   }
 
-  it.each(["double", "triple"])("dispatches %s Bond exactly once from the actual owner request", async order => {
-    const menu = await open();
-    expect(menu.querySelectorAll('[role="menuitem"]')).toHaveLength(2);
-    const button = menu.querySelector<HTMLButtonElement>(`[data-command-id="tool.${order}Bond"]`)!;
+  it.each(["tool.doubleBond", "tool.tripleBond", "tool.doubleBond:either", "tool.wavyBond"])("dispatches %s exactly once from the actual owner request", async id => {
+    const menu = await open(false, id === "tool.wavyBond" ? "tool.bond" : "tool.doubleBond");
+    expect(menu.querySelectorAll('[role="menuitem"]')).toHaveLength(id === "tool.wavyBond" ? 6 : 3);
+    const button = menu.querySelector<HTMLButtonElement>(`[data-command-id="${id}"]`)!;
     await act(async () => { button.click(); button.click(); });
-    expect(native.command).toHaveBeenCalledExactlyOnceWith(`tool.${order}Bond`);
+    expect(native.command).toHaveBeenCalledExactlyOnceWith(id);
     expect(native.hide).toHaveBeenCalledTimes(1);
   });
 
-  it("never dispatches disabled multiple-bond choices", async () => {
-    const menu = await open(true);
+  it.each(["tool.doubleBond", "tool.bond"])("never dispatches disabled choices for %s", async ownerId => {
+    const menu = await open(true, ownerId);
     const buttons = [...menu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
-    expect(buttons).toHaveLength(2);
+    expect(buttons).toHaveLength(ownerId === "tool.bond" ? 6 : 3);
     for (const button of buttons) {
       expect(button.disabled).toBe(true);
       await act(async () => button.click());

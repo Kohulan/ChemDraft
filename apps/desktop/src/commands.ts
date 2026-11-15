@@ -55,6 +55,7 @@ import { createBracketCommands } from "./bracketCommands";
 export { tableRuleWidthCommandId, parseTableRuleWidthCommandId } from "./tableCommands";
 import { templateDialogAction, templateInsertActions } from "./templateCommands";
 import { atomProblemCommands } from "./atomProblemCommands";
+export { bondDrawingToolCommandId } from "./bondToolCommands";
 export { templateInsertCommandId } from "./templateCommands";
 
 export interface CommandAvailability {

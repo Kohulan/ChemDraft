@@ -1,3 +1,4 @@
+import { bondDrawingToolCommandId } from "./bondToolCommands";
 import { nativeChargePlacementPointForAtom, nativeRadicalPlacementPointForAtom, nativeChargeMarkSizePx, nativeAtomHitRadiusPx } from "@chemdraft/layout-engine";
 export { nativeChargePlacementPointForAtom, nativeChargeMarkSizePx, nativeAtomHitRadiusPx } from "@chemdraft/layout-engine";
 import {
@@ -772,6 +773,7 @@ function artArcTool(
 
 export interface NativeBondToolOptions {
   bondOrder?: NativeBondOrderValue;
+  bondStereo?: "either";
   bondStyle?: NativeBondDisplayStyle;
   /** Told why the tool refused to place the bond, so the caller can say so instead of guessing. */
   onRefusal?: (reason: string) => void;
@@ -1025,6 +1027,7 @@ export function createNativeSingleBondMolecule(
     fromAtomId: leftAtom.id,
     toAtomId: rightAtom.id,
     order: options.bondOrder ?? "single",
+    ...(options.bondOrder === "double" && options.bondStereo === "either" ? { stereo: "either" as const } : {}),
     ...nativeBondDisplayObject(options.bondStyle),
     ...(options.bondOrder === "double" && loadDrawingSettings().defaultDoubleBond === "centred"
       ? { display: { ...nativeBondDisplayObject(options.bondStyle).display, doubleBondSide: "center" as const } }
@@ -1032,7 +1035,7 @@ export function createNativeSingleBondMolecule(
   }] satisfies MoleculeBond[];
   const geometry = moleculeGeometryFromAtoms(atoms);
 
-  return normalizeNativeMoleculeGeometry({
+  const molecule = normalizeNativeMoleculeGeometry({
     id: nextObjectId(document, "mol_bond"),
     type: "molecule",
     x: geometry.x,
@@ -1059,6 +1062,7 @@ export function createNativeSingleBondMolecule(
     superatoms: [],
     rGroups: []
   });
+  return options.bondStereo === "either" ? withStoredBondStereoMolfile(molecule) : molecule;
 }
 
 export function insertNativeSingleBondMolecule(
@@ -1453,10 +1457,15 @@ export function applyNativeChainTool(
 }
 
 export function nativeBondOrderForToolCommand(commandId: string): NativeBondOrderValue {
-  return commandId === "tool.doubleBond" ? "double" : commandId === "tool.tripleBond" ? "triple" : "single";
+  return commandId === "tool.doubleBond" || nativeBondStereoForToolCommand(commandId) === "either" ? "double" : commandId === "tool.tripleBond" ? "triple" : "single";
+}
+
+export function nativeBondStereoForToolCommand(commandId: string): "either" | undefined {
+  return commandId === bondDrawingToolCommandId("double", "either") ? "either" : undefined;
 }
 
 export function nativeBondStyleForToolCommand(commandId: string): NativeBondToolStyle | undefined {
+  if (nativeBondStereoForToolCommand(commandId)) return "solid";
   switch (commandId) {
     case "tool.bond":
     case "tool.doubleBond":
@@ -8948,8 +8957,10 @@ export function applyNativeMoleculeBondOrderTarget(
 export function applyNativeMoleculeBondOrderValueTarget(
   document: ChemDraftDocument,
   target: NativeBondOrderTarget,
-  order: NativeBondOrderValue
+  order: NativeBondOrderValue,
+  stereo?: "either"
 ): ChemDraftDocument {
+  if (stereo && order !== "double") return document;
   const page = firstPage(document);
   const molecule = page.objects.find((object): object is MoleculeObject =>
     object.id === target.objectId && object.type === "molecule"
@@ -8963,18 +8974,22 @@ export function applyNativeMoleculeBondOrderValueTarget(
     return document;
   }
 
-  if ((order === bond.order && bond.stereo !== "either") || !canSetNativeBondOrder(molecule, bond, order)) {
+  if ((order === bond.order && bond.stereo === stereo) || !canSetNativeBondOrder(molecule, bond, order)) {
     return document;
   }
 
   const bonds = molecule.bonds.map((candidate) =>
     candidate.id === bond.id
       // Clearing an existing double bond's "either" stereo is not double-bond creation.
-      ? nativeBondWithOrderAndDisplay(molecule, withoutDoubleBondStereo(candidate), order, bond.order !== "double")
+      ? { ...nativeBondWithOrderAndDisplay(molecule, withoutDoubleBondStereo(candidate), order, bond.order !== "double"),
+          ...(stereo ? { stereo } : {}) }
       : candidate
   );
-  const refreshed = refreshNativeSingleBondGraph(molecule, molecule.atoms, bonds);
-  const nextMolecule = bond.stereo === "either" ? withStoredBondStereoMolfile(refreshed) : refreshed;
+  const refreshed = stereo === "either"
+    ? refreshNativeBondToolGraph(molecule, molecule.atoms, bonds, { bondStereo: stereo })
+    : refreshNativeSingleBondGraph(molecule, molecule.atoms, bonds);
+  if (!refreshed) return document;
+  const nextMolecule = !stereo && bond.stereo === "either" ? withStoredBondStereoMolfile(refreshed) : refreshed;
 
   return applyPatch(
     document,
@@ -20362,7 +20377,21 @@ function extendNativeCarbonGraph(
   ];
 
   const orderedBonds = nativeBondsWithToolOrder({ ...molecule, atoms, bonds }, options);
-  return orderedBonds ? refreshNativeSingleBondGraph(molecule, atoms, orderedBonds) : undefined;
+  return orderedBonds ? refreshNativeBondToolGraph(molecule, atoms, orderedBonds, options) : undefined;
+}
+
+/** Reuse the selected-bond either writer, including its source-only chemistry guards. */
+function refreshNativeBondToolGraph(
+  molecule: MoleculeObject, atoms: readonly MoleculeAtom[], bonds: readonly MoleculeBond[], options: NativeBondToolOptions
+): MoleculeObject | undefined {
+  if (options.bondStereo !== "either") return refreshNativeSingleBondGraph(molecule, atoms, bonds);
+  try {
+    const refreshed = refreshNativeSingleBondGraph(molecule, atoms, bonds);
+    return withStoredBondStereoMolfile({ ...refreshed, structure: molecule.structure, structureFormat: molecule.structureFormat });
+  } catch (error) {
+    options.onRefusal?.(error instanceof Error ? error.message : "Cannot preserve E/Z stereo");
+    return undefined;
+  }
 }
 
 /**
@@ -20383,7 +20412,8 @@ function nativeBondsWithToolOrder(
     return undefined;
   }
   return molecule.bonds.map(bond =>
-    bond.id === addedBond.id ? nativeBondWithOrderAndDisplay(molecule, bond, order) : bond);
+    bond.id === addedBond.id ? { ...nativeBondWithOrderAndDisplay(molecule, bond, order),
+      ...(order === "double" && options.bondStereo === "either" ? { stereo: "either" as const } : {}) } : bond);
 }
 
 /**
@@ -20795,7 +20825,7 @@ function connectNativeCarbonAtoms(
   ];
 
   const orderedBonds = nativeBondsWithToolOrder({ ...molecule, bonds }, options);
-  return orderedBonds ? refreshNativeSingleBondGraph(molecule, molecule.atoms, orderedBonds) : undefined;
+  return orderedBonds ? refreshNativeBondToolGraph(molecule, molecule.atoms, orderedBonds, options) : undefined;
 }
 
 function atomLabelIsotopeRefusal(atom: MoleculeAtom, label: string, molecule: MoleculeObject, literal: boolean): string | undefined {

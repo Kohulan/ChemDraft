@@ -643,6 +643,7 @@ import {
   documentObjectProjectedPlaneTilt,
   nativeBondStyleForToolCommand,
   nativeBondOrderForToolCommand,
+  nativeBondStereoForToolCommand,
   nativeBondOrderTargetRefusal,
   nativeChargeMarkMaxMagnitude,
   nativeChargeStackRefusal,
@@ -1082,6 +1083,7 @@ type NativeBondDragState = {
   atomId: string;
   bondStyle?: NativeBondDisplayStyle;
   bondOrder?: NativeBondOrderValue;
+  bondStereo?: "either";
   startPoint: ClientPoint;
   latestPoint: ClientPoint;
   dragging: boolean;
@@ -1099,6 +1101,7 @@ type NativePlacementDragState = {
   latestPoint: ClientPoint;
   bondStyle?: NativeBondDisplayStyle;
   bondOrder?: NativeBondOrderValue;
+  bondStereo?: "either";
   templateId?: NativeMoleculeTemplateId;
   arrowKind?: ArrowObject["arrowKind"];
   bracketKind?: BracketObject["bracketKind"];
@@ -1774,7 +1777,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.15.08.32-codex";
+const CURRENT_BUILD_STAMP = "11.15.09.10-codex";
 const VibeCodeGuideForm = lazy(() => import("./dialogs/VibeCodeGuideForm").then(module => ({ default: module.VibeCodeGuideForm })));
 const StructureTemplatePicker = lazy(() => import("./dialogs/StructureTemplatePicker").then(module => ({ default: module.StructureTemplatePicker })));
 /** Starts in the background for the document webview under the existing probe gate. */
@@ -3262,6 +3265,7 @@ export function MainWindow({
   );
   const activeEditorMolecule =
     selectedMolecule && selectedMolecule.id === activeEditorObjectId ? selectedMolecule : undefined;
+  const activeNativeBondStereo = nativeBondStereoForToolCommand(activeToolState.activeCommandId);
   const activeNativeBondOrder = nativeBondOrderForToolCommand(activeToolState.activeCommandId);
   const activeNativeBondToolStyle = nativeBondStyleForToolCommand(activeToolState.activeCommandId);
   const activeNativeBondDisplayStyle = activeNativeBondToolStyle && activeNativeBondToolStyle !== "solid"
@@ -15392,12 +15396,14 @@ export function MainWindow({
     sourceDocument: ChemDraftDocument,
     point: ClientPoint,
     bondStyle?: NativeBondDisplayStyle,
-    bondOrder: NativeBondOrderValue = "single"
+    bondOrder: NativeBondOrderValue = "single",
+    bondStereo?: "either"
   ) => {
     let refusal: string | undefined;
     const { document: nextDocument, refusal: sproutRefusal } = nativeSingleBondToolAtPoint(sourceDocument, point, {
       bondStyle,
       bondOrder,
+      bondStereo,
       onRefusal: reason => { refusal = reason; }
     });
     if (sproutRefusal) {
@@ -15459,7 +15465,7 @@ export function MainWindow({
     event: ObjectPointerEvent,
     point: ClientPoint,
     placement:
-      | { kind: "single-bond"; bondStyle?: NativeBondDisplayStyle; bondOrder?: NativeBondOrderValue }
+      | { kind: "single-bond"; bondStyle?: NativeBondDisplayStyle; bondOrder?: NativeBondOrderValue; bondStereo?: "either" }
       | { kind: "template"; templateId: NativeMoleculeTemplateId }
       | { kind: "arrow"; arrowKind: ArrowObject["arrowKind"] }
       | { kind: "bracket"; bracketKind: BracketObject["bracketKind"] }
@@ -15480,7 +15486,7 @@ export function MainWindow({
             ? applyNativeArtLineToolDefaultAtPoint(startDocument, point, placement.commandId)
             : placement.kind === "orbital"
               ? insertNativeArtGraphicObject(startDocument, point, placement.commandId)
-              : applySingleBondToolAtPoint(startDocument, point, { bondStyle: placement.bondStyle, bondOrder: placement.bondOrder });
+              : applySingleBondToolAtPoint(startDocument, point, { bondStyle: placement.bondStyle, bondOrder: placement.bondOrder, bondStereo: placement.bondStereo });
     const objectId = placementDocument.selection.objectIds[0];
     // Anchored chains grow an existing molecule, so the placed object legitimately pre-exists.
     const growsExistingObject = placement.kind === "chain" && placement.anchor !== undefined;
@@ -15498,6 +15504,7 @@ export function MainWindow({
       latestPoint: point,
       bondStyle: placement.kind === "single-bond" ? placement.bondStyle : undefined,
       bondOrder: placement.kind === "single-bond" ? placement.bondOrder : undefined,
+      bondStereo: placement.kind === "single-bond" ? placement.bondStereo : undefined,
       templateId: placement.kind === "template" ? placement.templateId : undefined,
       arrowKind: placement.kind === "arrow" ? placement.arrowKind : undefined,
       bracketKind: placement.kind === "bracket" ? placement.bracketKind : undefined,
@@ -15630,7 +15637,8 @@ export function MainWindow({
     forceCustomLength: boolean,
     bondStyle?: NativeBondDisplayStyle,
     placementAltKey = false,
-    bondOrder: NativeBondOrderValue = "single"
+    bondOrder: NativeBondOrderValue = "single",
+    bondStereo?: "either"
   ) => {
     const previousMolecule = findDocumentObject(sourceDocument, objectId);
     let refusal: string | undefined;
@@ -15638,6 +15646,7 @@ export function MainWindow({
       forceCustomLength,
       bondStyle,
       bondOrder,
+      bondStereo,
       placementAltKey,
       onRefusal: reason => { refusal = reason; }
     });
@@ -15928,9 +15937,9 @@ export function MainWindow({
     const selectedDocument = selectDocumentObject(documentRef.current, drag.objectId);
     if (drag.dragging) {
       applyFreeformBondDocumentAtPoint(selectedDocument, drag.objectId, drag.atomId, drag.latestPoint,
-        drag.freeformUnlocked || drag.connectsForeignAtom, drag.bondStyle, drag.altKey, drag.bondOrder);
+        drag.freeformUnlocked || drag.connectsForeignAtom, drag.bondStyle, drag.altKey, drag.bondOrder, drag.bondStereo);
     } else {
-      applySingleBondDocumentAtPoint(selectedDocument, point, drag.bondStyle, drag.bondOrder);
+      applySingleBondDocumentAtPoint(selectedDocument, point, drag.bondStyle, drag.bondOrder, drag.bondStereo);
     }
     clearNativeBondDrag(event);
   }, [applyFreeformBondDocumentAtPoint, applySingleBondDocumentAtPoint, clearNativeBondDrag, pagePointFromPointerEvent]);
@@ -17871,8 +17880,8 @@ export function MainWindow({
     if (activeNativeBondToolStyle) {
       event.preventDefault();
       event.stopPropagation();
-      if (!startNativePlacementDrag(event, point, { kind: "single-bond", bondStyle: activeNativeBondDisplayStyle, bondOrder: activeNativeBondOrder })) {
-        applySingleBondDocumentAtPoint(document, point, activeNativeBondDisplayStyle, activeNativeBondOrder);
+      if (!startNativePlacementDrag(event, point, { kind: "single-bond", bondStyle: activeNativeBondDisplayStyle, bondOrder: activeNativeBondOrder, bondStereo: activeNativeBondStereo })) {
+        applySingleBondDocumentAtPoint(document, point, activeNativeBondDisplayStyle, activeNativeBondOrder, activeNativeBondStereo);
       }
     }
   }, [
@@ -17881,6 +17890,7 @@ export function MainWindow({
     startMechanismArrowDrag,
     activeNativeBondDisplayStyle,
     activeNativeBondOrder,
+    activeNativeBondStereo,
     activeNativeBondToolStyle,
     activeNativeTemplateId,
     activeNativeArtTool,
@@ -19747,7 +19757,7 @@ export function MainWindow({
       event.stopPropagation();
       const target = { objectId, ...nativeMoleculeHit };
       const selectedDocument = selectDocumentObject(document, objectId);
-      const nextDocument = applyNativeMoleculeBondOrderValueTarget(selectedDocument, target, activeNativeBondOrder);
+      const nextDocument = applyNativeMoleculeBondOrderValueTarget(selectedDocument, target, activeNativeBondOrder, activeNativeBondStereo);
       if (nextDocument === selectedDocument) {
         setStatus(nativeBondOrderTargetRefusal(selectedDocument, target, activeNativeBondOrder) ?? "Bond order not changed");
         return;
@@ -19759,7 +19769,7 @@ export function MainWindow({
       setHoveredNativeAtom(undefined);
       assignHoveredNativeDeleteTarget(undefined);
       setFreeformNativeBond(undefined);
-      setStatus(`Set bond to ${activeNativeBondOrder}`);
+      setStatus(activeNativeBondStereo ? "Set double bond to E/Z unspecified" : `Set bond to ${activeNativeBondOrder}`);
       return;
     }
 
@@ -19792,7 +19802,7 @@ export function MainWindow({
       // click: Alt/Option can still aim it toward open room. The release decides click vs drag.
       const dragAtomId = preview?.atomId ?? nativeBondDragSourceAtomId(object, point);
       if (!dragAtomId) {
-        applySingleBondDocumentAtPoint(selectDocumentObject(document, objectId), point, activeNativeBondDisplayStyle, activeNativeBondOrder);
+        applySingleBondDocumentAtPoint(selectDocumentObject(document, objectId), point, activeNativeBondDisplayStyle, activeNativeBondOrder, activeNativeBondStereo);
         return;
       }
 
@@ -19802,6 +19812,7 @@ export function MainWindow({
         atomId: dragAtomId,
         bondStyle: activeNativeBondDisplayStyle,
         bondOrder: activeNativeBondOrder,
+        bondStereo: activeNativeBondStereo,
         startPoint: point,
         latestPoint: point,
         dragging: false,
@@ -19867,6 +19878,7 @@ export function MainWindow({
     activeNativeArtTool,
     activeNativeBondDisplayStyle,
     activeNativeBondOrder,
+    activeNativeBondStereo,
     activeNativeBondToolStyle,
     activeNativeTemplateId,
     addChargeToHoveredNativeAtom,

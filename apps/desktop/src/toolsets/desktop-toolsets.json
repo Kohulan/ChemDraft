@@ -403,6 +403,11 @@
                     "label": "Triple Bond",
                     "icon": "tripleBond",
                     "assetName": "Custom_Bond_Triple"
+                  },
+                  {
+                    "commandId": "tool.doubleBond:either",
+                    "label": "E/Z-unspecified Double Bond",
+                    "icon": "eitherDoubleBond"
                   }
                 ]
               },

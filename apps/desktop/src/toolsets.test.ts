@@ -107,9 +107,11 @@ describe("desktop toolset mapping", () => {
     const items = getToolsetItemGroups("core.main").flat();
     const ids = items.map(item => item.id);
     expect(ids.slice(ids.indexOf("tool.bond"), ids.indexOf("core.main.divider.2"))).toEqual([
-      "tool.bond", "tool.wedgeBond", "tool.hashedBond", "tool.boldBond", "tool.benzene", "tool.doubleBond"
+      "tool.bond", "tool.wedgeBond", "tool.hashedBond", "tool.dashedBond", "tool.boldBond", "tool.benzene", "tool.doubleBond"
     ]);
     expect(ids).not.toContain("tool.tripleBond");
+    expect(ids).not.toContain("tool.wavyBond");
+    expect(items.find(item => item.id === "tool.bond")?.submenu?.items.filter(command => command.id === "tool.wavyBond")).toHaveLength(1);
     expect(ids).not.toContain("tool.chain");
     const double = items.find(item => item.id === "tool.doubleBond")!;
     expect(double).toMatchObject({
@@ -118,7 +120,7 @@ describe("desktop toolset mapping", () => {
       submenu: { id: "multiple-bond-tools", type: "command-grid" },
       tooltip: { title: "Double Bond" }, layout: { colSpan: 1, rowSpan: 1 }
     });
-    expect(double.submenu?.items.map(command => command.id)).toEqual(["tool.doubleBond", "tool.tripleBond"]);
+    expect(double.submenu?.items.map(command => command.id)).toEqual(["tool.doubleBond", "tool.tripleBond", "tool.doubleBond:either"]);
   });
   it("maps legacy command items to schema-backed palette items", () => {
     const item = getToolsetItemGroups("core.legacy", registry([legacyToolset]))[0][0];

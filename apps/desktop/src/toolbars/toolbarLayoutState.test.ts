@@ -76,6 +76,21 @@ describe("mergeVisibilityIntoLayoutState", () => {
 });
 
 describe("Main toolbar defaults migration", () => {
+  it.each([undefined, 1, 2])("preserves a saved standalone Wavy button without duplicates (revision %s)", revision => {
+    const state = { version: 1, mainToolbarDefaultsRevision: revision, userToolsets: [], toolsetOverrides: [{
+      toolsetId: "core.main",
+      itemOrder: { "core.main.items": ["tool.wavyBond", "tool.bond"] },
+      itemAdditions: [{ groupId: "core.main.items", index: 0, item: {
+        id: "tool.wavyBond", commandId: "tool.wavyBond", title: "Wavy bond", icon: "wavyBond"
+      } }]
+    }] };
+    const migrated = migrateMainToolbarDefaultsLayoutState(state);
+    const items = getToolsetItemGroups("core.main", createDesktopToolsetRegistry(migrated)).flat();
+    expect(items.filter(item => item.id === "tool.wavyBond")).toHaveLength(1);
+    expect(items[0].id).toBe("tool.wavyBond");
+    const loaded = migrateMainToolbarDefaultsLayoutState(JSON.parse(JSON.stringify(migrated)));
+    expect(getToolsetItemGroups("core.main", createDesktopToolsetRegistry(loaded)).flat()).toEqual(items);
+  });
   const migrate = (state: unknown): ToolsetLayoutState => parseToolsetLayoutState(migrateMainToolbarDefaultsLayoutState(state));
   const ids = (state: ToolsetLayoutState) => getToolsetItemGroups("core.main", createDesktopToolsetRegistry(state)).flat().map(item => item.id);
   const defaults = getToolsetItemGroups("core.main").flat().map(item => item.id);

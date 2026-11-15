@@ -187,15 +187,19 @@ describe("ToolPalette schema-backed items", () => {
     }
   });
 
-  it.each(["double", "triple"])("chooses %s Bond once and remembers its face and primary command", async order => {
-    const item = getToolsetItemGroups("core.main").flat().find(entry => entry.id === "tool.doubleBond")!;
+  it.each([
+    ["tool.doubleBond", "tool.doubleBond", "Custom_Bond_Double"],
+    ["tool.doubleBond", "tool.tripleBond", "Custom_Bond_Triple"],
+    ["tool.doubleBond", "tool.doubleBond:either", undefined],
+    ["tool.bond", "tool.wavyBond", undefined]
+  ] as const)("chooses %s → %s once and remembers its face and primary command", async (ownerId, id, asset) => {
+    const item = getToolsetItemGroups("core.main").flat().find(entry => entry.id === ownerId)!;
     const { host, button, root, onInvoke } = await renderSchemaPalette(item);
-    const id = `tool.${order}Bond`;
     const render = (activeTool: string) => act(async () => root.render(createElement(ToolPalette, {
       groups: [], itemGroups: [[item]], activeTool, onInvoke
     })));
     try {
-      expect(button.getAttribute("data-command-id")).toBe("tool.doubleBond");
+      expect(button.getAttribute("data-command-id")).toBe(ownerId);
       await act(async () => button.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true })));
       const menu = host.querySelector<HTMLElement>('[role="menu"]')!;
       expect(button.getAttribute("aria-controls")).toBe(menu.id);
@@ -213,12 +217,22 @@ describe("ToolPalette schema-backed items", () => {
       await render(id);
       expect(button.getAttribute("data-command-id")).toBe(id);
       const face = button.querySelector("img")?.getAttribute("src");
-      expect(face).toBe(toolbarAsset(order === "triple" ? "Custom_Bond_Triple" : "Custom_Bond_Double"));
+      if (asset) expect(face).toBe(toolbarAsset(asset));
+      else {
+        expect(face).toBeUndefined();
+        expect(button.querySelector("svg path")?.getAttribute("d")).toBe(id === "tool.wavyBond"
+          ? "M3 12C4 9 5 9 6 12S8 15 9 12S11 9 12 12S14 15 15 12S17 9 18 12S20 15 21 12"
+          : "M4 15 20 9M6 19 18 5");
+      }
       await render("tool.select");
       expect(button.getAttribute("data-command-id")).toBe(id);
       expect(button.querySelector("img")?.getAttribute("src")).toBe(face);
       onInvoke.mockClear();
-      await act(async () => button.click());
+      await act(async () => {
+        dispatchPointerButton(button, "pointerdown");
+        dispatchPointerButton(button, "pointerup");
+        button.click();
+      });
       expect(onInvoke).toHaveBeenCalledExactlyOnceWith(id);
     } finally { await act(async () => root.unmount()); }
   });
@@ -233,7 +247,7 @@ describe("ToolPalette schema-backed items", () => {
       expect(onRequestFlyout).toHaveBeenCalledTimes(1);
       expect(onRequestFlyout.mock.calls[0][0].flyout).toMatchObject({
         flyoutId: "multiple-bond-tools", columns: 3,
-        commands: [{ id: "tool.doubleBond", enabled: true }, { id: "tool.tripleBond", enabled: true }]
+        commands: [{ id: "tool.doubleBond", enabled: true }, { id: "tool.tripleBond", enabled: true }, { id: "tool.doubleBond:either", enabled: true }]
       });
       expect(button.getAttribute("aria-haspopup")).toBe("menu");
       expect(button.getAttribute("aria-controls")).toBeNull();
