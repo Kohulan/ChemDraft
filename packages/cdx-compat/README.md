@@ -54,8 +54,7 @@ Mixed solid/open end types and decorative markers retain the existing named expo
 Legacy Graphic Line + ArrowType input remains supported. No recognized semantic arrow kind needs
 a legacy Graphic export exception. An unknown reaction-arrow kind still writes an unheaded
 Graphic line with its existing warning rather than inventing chemistry. Curved arrows retain the
-existing curve export path. See [the fix report](arrow-object-fix-report.md) for regression coverage
-and the reasons for changed test expectations.
+existing curve export path.
 
 Native multi-atom labels are encoded as standard `GenericNickname` nodes with label text on the
 existing atom; its bond endpoints stay unchanged. Import also accepts unexpanded nickname, formula,
