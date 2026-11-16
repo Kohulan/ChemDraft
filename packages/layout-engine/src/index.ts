@@ -1,5 +1,8 @@
 export * from "./layoutQuality";
 export * from "./electronMarkPlacement";
+export { BoldBondStyle } from "./boldBonds";
+import { boldBondWidth, boldBondPolygonPoints, boldBondEdgeOffsets,
+  type BoldBondNeighbor, type BoldBondJoin, type BoldBondJointCache } from "./boldBonds";
 import { nativeChargeMarkSizePx, nativeAtomHitRadiusPx } from "./electronMarkPlacement";
 export { rotatedGraphicLocalBounds } from "./graphicBounds";
 import type { LayoutLabelBox } from "./layoutQuality";
@@ -25,6 +28,7 @@ export {
 import {
   ChemDraftSyntheticStylePreset,
   DefaultNativeDrawingStyle,
+  NativeStylePresets,
   DocumentStylePreset,
   Acs1996StylePreset,
   RscJournalStylePreset,
@@ -1304,6 +1308,7 @@ interface PageBondLineSegment {
   y2: number;
   segment: "primary" | "secondary" | "outer";
   doubleBondSide?: DoubleBondSide;
+  boldSide?: "left" | "right";
 }
 
 type PageMoleculeBondSegment = PageBondLineSegment & { bond: CoreMoleculeBond; key: string };
@@ -1532,7 +1537,7 @@ function nativeBondCandidates(object: MoleculeObject, objectLayerIndex: number):
       end,
       localStart,
       localEnd,
-      drawingStyle
+      drawingStyle: nativeMoleculeBondDrawingStyle(object, bond.id, drawingStyle)
     }];
   });
 }
@@ -1620,6 +1625,16 @@ function nativeBondFootprintPx(bond: CoreMoleculeBond, drawingStyle: NativeDrawi
     return nativeWavyBondAmplitude(drawingStyle, drawingStyle.bondLengthPx) * 2 + nativeBondStrokeWidth(bond, drawingStyle);
   }
   const gap = nativeMultipleBondGapPx(drawingStyle);
+  if (bondStyle === "bold" && bond.order !== "unknown") {
+    const depth = depthCuedBondStrokeWidth(1, bond.display?.depthWeight);
+    const line = drawingStyle.bondStrokeWidthPx * depth;
+    const band = drawingStyle.bondBoldWidthPx * depth;
+    // Crossing gaps are centered on the atom axis. Reserve both sides of the
+    // furthest possible edge, including outward growth away from a fixed pi line.
+    if (bond.order === "double") return 2 * Math.max(gap, band + line * 1.5 - gap / 2) + line;
+    if (bond.order === "triple") return 2 * Math.max(gap, band / 2 + line * 1.5) + line;
+    return Math.max(band, 2 * band - line);
+  }
   if (bond.order === "triple") {
     return gap * 2 + nativeBondStrokeWidth(bond, drawingStyle);
   }
@@ -1953,7 +1968,7 @@ function planNativeMoleculeGraphSvg(
   const atomLabels = planMoleculeAtomLabels(object, resolution);
   const labelPlanByAtomId = new Map(atomLabels.map((plan) => [plan.atom.id, plan]));
   // Ring double bonds default their inner line to the ring interior. Computed once per molecule.
-  const ringInteriorSides = ringInteriorDoubleBondSides(object);
+  const ringInteriorSides = ringInteriorBondSides(object);
   const bondSegmentGroups: PageMoleculeBondSegmentGroup[] = object.bonds.flatMap((bond) => {
     const fromAtom = atomById.get(bond.fromAtomId);
     const toAtom = atomById.get(bond.toAtomId);
@@ -1987,13 +2002,17 @@ function planNativeMoleculeGraphSvg(
   });
   const labeledAtomIds = new Set(labelPlanByAtomId.keys());
   joinCenteredDoubleBondSegments(bondSegmentGroups, labeledAtomIds);
+  joinBoldBondNeighbors(object, bondSegmentGroups, resolution);
   const primitive = moleculeDrawingPrimitive(object) === "single-bond"
     ? "single-bond"
     : "connected-carbon-chain";
   const carbonJunctionPlans = nativeCarbonJunctionPlans(
     object,
     labeledAtomIds,
-    drawingStyle
+    drawingStyle,
+    bondSegmentGroups,
+    gapsByBondKey,
+    resolution
   );
   const sketchGeometry = visualEffectsForStyle(object.style).some((effect) => effect.kind === "sketch")
     ? moleculeEffectSketchBasePathD(object, bondSegmentGroups, gapsByBondKey, resolution)
@@ -2552,6 +2571,12 @@ export function smallestRingAtomIdsByBondId(object: MoleculeObject): Map<string,
  * ring carrying amide/carbonyl groups).
  */
 export function ringInteriorDoubleBondSides(object: MoleculeObject): Map<string, DoubleBondSide> {
+  const doubles = new Set(object.bonds.filter(bond => bond.order === "double").map(bond => bond.id));
+  return new Map([...ringInteriorBondSides(object)].filter(([id]) => doubles.has(id)));
+}
+
+/** Ring singles need the same interior direction for their asymmetric bold band. */
+function ringInteriorBondSides(object: MoleculeObject): Map<string, DoubleBondSide> {
   const rings = smallestRingAtomIdsByBondId(object);
   const result = new Map<string, DoubleBondSide>();
   if (rings.size === 0) {
@@ -2559,9 +2584,6 @@ export function ringInteriorDoubleBondSides(object: MoleculeObject): Map<string,
   }
   const atomById = new Map(object.atoms.map((atom) => [atom.id, atom]));
   for (const bond of object.bonds) {
-    if (bond.order !== "double") {
-      continue;
-    }
     const ringAtomIds = rings.get(bond.id);
     if (!ringAtomIds) {
       continue;
@@ -2932,6 +2954,12 @@ function moleculeBondEffectSourceFragments(
   resolution: NativeBondOrderResolution
 ): PageSvgElementFragment[] {
   const bondStyle = nativeBondDisplayStyle(segment.bond);
+  if (segment.bond.order !== "unknown" && bondStyle === "bold" && segment.segment === "primary") {
+    return nativeBoldBondPolygons(object, segment, drawingStyle, crossingGaps, resolution).map((points, index) =>
+      elementFragment("polygon", `molecule-effect-source-bond-${object.id}-${segment.key}-${index}`, {
+        points, fill: "#000000", stroke: "none"
+      }));
+  }
   if (segment.bond.order !== "unknown" && bondStyle === "wavy") {
     return nativeWavyBondPaths(segment, drawingStyle, crossingGaps).map((d, index) =>
       elementFragment("path", `molecule-effect-source-bond-${object.id}-${segment.key}-${index}`, {
@@ -2985,7 +3013,7 @@ function moleculeBondEffectSourceFragments(
       x2: visibleSegment.x2,
       y2: visibleSegment.y2,
       stroke: "#000000",
-      "stroke-width": nativeBondStrokeWidth(segment.bond, drawingStyle),
+      "stroke-width": nativeBondSegmentStrokeWidth(segment, drawingStyle),
       ...nativeBondStrokePattern(segment.bond, drawingStyle)
     })
   );
@@ -3065,7 +3093,7 @@ function moleculeEffectSketchBasePathD(
 
 /**
  * Sketch path pieces for one bond segment, tracing what the normal renderer draws: each hash of a
- * hashed bond, each dash of a dashed bond, the outline of a wedge. Every other style is its centre
+ * hashed bond, each dash of a dashed bond, the outline of a wedge or bold band. Other styles use their centre
  * line. The geometry comes from the same helpers `nativeBondSegmentFragments` uses.
  */
 function moleculeBondSketchPathParts(
@@ -3078,6 +3106,10 @@ function moleculeBondSketchPathParts(
   // Keep the unknown-order dots explicit: a sketch centreline would hide their meaning.
   if (segment.bond.order === "unknown") return [];
   const bondStyle = nativeBondDisplayStyle(segment.bond);
+  if (bondStyle === "bold" && segment.segment === "primary") {
+    return nativeBoldBondPolygons(object, segment, drawingStyle, crossingGaps, resolution)
+      .map(points => ({ d: polygonPathD(points) }));
+  }
   if (bondStyle === "wavy") {
     return nativeWavyBondPaths(segment, drawingStyle, crossingGaps).map((d) => ({ d }));
   }
@@ -3167,8 +3199,23 @@ function linePathD(segment: Pick<PageBondLineSegment, "x1" | "y1" | "x2" | "y2">
 function nativeCarbonJunctionPlans(
   object: MoleculeObject,
   labeledAtomIds: ReadonlySet<string>,
-  drawingStyle: NativeDrawingStyle
+  drawingStyle: NativeDrawingStyle,
+  bondSegmentGroups: readonly PageMoleculeBondSegmentGroup[],
+  gapsByBondKey: ReadonlyMap<string, readonly BondCrossingGap[]>,
+  resolution: NativeBondOrderResolution
 ): NativeCarbonJunctionPlan[] {
+  // Use the actual ink, including centered-double offsets and crossing cuts. A bold
+  // band can sit entirely to one side of the carbon when double spacing is wide.
+  const boldPolygonsByBondId = new Map(bondSegmentGroups.flatMap(group => {
+    if (group.bond.order === "unknown" || nativeBondDisplayStyle(group.bond) !== "bold") return [];
+    const primary = group.segments.find(segment => segment.segment === "primary");
+    const polygons = primary ? nativeBoldBondPolygons(object, primary, group.drawingStyle,
+      gapsByBondKey.get(bondRefKey({ objectId: object.id, bondId: group.bond.id })) ?? [], resolution) : [];
+    return [[group.bond.id, polygons.map(points => points.split(/\s+/).map(point => {
+      const [x, y] = point.split(",").map(Number);
+      return { x: x!, y: y! };
+    }))] as const];
+  }));
   return object.atoms.flatMap((atom) => {
     if (
       nativeElementFromAtomLabel(atom.element) !== "C" ||
@@ -3184,6 +3231,11 @@ function nativeCarbonJunctionPlans(
       const bondStyle = nativeBondDisplayStyle(bond);
       return bondStyle !== "dashed" && bondStyle !== "hashed";
     });
+    // Where a band covers the carbon, a circle would protrude past its clean miter.
+    // Else keep the ordinary-width ink joining the other incident strokes.
+    if (continuousBonds.some(bond => boldPolygonsByBondId.get(bond.id)?.some(polygon =>
+      pointInPolygon(atom, polygon) || polygon.some((point, index) =>
+        distanceToSegment(atom, point, polygon[(index + 1) % polygon.length]!) <= 0.001)))) return [];
     if (continuousBonds.length < 2) {
       return [];
     }
@@ -3193,7 +3245,9 @@ function nativeCarbonJunctionPlans(
       return {
         bond,
         drawingStyle: bondDrawingStyle,
-        strokeWidth: nativeBondStrokeWidth(bond, bondDrawingStyle)
+        strokeWidth: boldPolygonsByBondId.has(bond.id)
+          ? depthCuedBondStrokeWidth(bondDrawingStyle.bondStrokeWidthPx, bond.display?.depthWeight)
+          : nativeBondStrokeWidth(bond, bondDrawingStyle)
       };
     });
     const topmost = incidentStyles[incidentStyles.length - 1]!;
@@ -3284,6 +3338,14 @@ function nativeBondSegmentFragments(
   };
   const stroke = nativeMoleculeBondColor(object, segment.bond, drawingStyle);
 
+  if (segment.bond.order !== "unknown" && bondStyle === "bold" && segment.segment === "primary") {
+    return nativeBoldBondPolygons(object, segment, drawingStyle, crossingGaps, resolution).map((points, index) =>
+      elementFragment("polygon", `bond-${object.id}-${segment.key}-${index}`, {
+        ...commonAttrs, points, fill: stroke, stroke: "none",
+        "fill-opacity": moleculeStrokeOpacity === 1 ? undefined : moleculeStrokeOpacity
+      }));
+  }
+
   if (segment.bond.order !== "unknown" && bondStyle === "wavy") {
     return nativeWavyBondPaths(segment, drawingStyle, crossingGaps).map((d, index) =>
       elementFragment("path", `bond-${object.id}-${segment.key}-${index}`, {
@@ -3353,7 +3415,7 @@ function nativeBondSegmentFragments(
       y2: visibleSegment.y2,
       stroke,
       "stroke-opacity": moleculeStrokeOpacity === 1 ? undefined : moleculeStrokeOpacity,
-      "stroke-width": nativeBondStrokeWidth(segment.bond, drawingStyle),
+      "stroke-width": nativeBondSegmentStrokeWidth(segment, drawingStyle),
       ...nativeBondStrokePattern(segment.bond, drawingStyle)
     })
   );
@@ -4148,16 +4210,23 @@ export function nativeChargePlacementPointForAtom(
     pageBounds: { x: 0, y: 0, width: pageWidth, height: pageHeight },
     objectBounds: { x: molecule.x, y: molecule.y, width: molecule.width, height: molecule.height }
   });
-  // Direct drops clear their whole frame from labels; new tool marks retain the original slot.
+  // A charge shares its original placement policy with existing charges (the tool updates
+  // their value), but a separate radical/lone pair must not be covered by the new charge.
+  // Exclude a mark being repositioned: its old frame must not obstruct its own drop.
+  const occupiedMarks = objects.filter((object): object is ElectronMarkObject =>
+    object.type === "electron-mark" && object.markKind !== "charge" && object.id !== mark?.id
+      && object.anchor.kind === "atom" && object.anchor.objectId === molecule.id && object.anchor.atomId === atomId);
+  // Direct drops also clear their whole frame from labels.
   const localPoint = electronMarkPlacementPointForAtom(molecule, atomId, objects, pageWidth, pageHeight, {
     growthPoint: growth && growth.sourceAtomId === atomId && !growth.targetAtomId ? growth.newAtomPoint : undefined,
     mark,
-    avoidLabelOverlap: mark !== undefined
+    avoidLabelOverlap: mark !== undefined,
+    occupiedMarks
   });
   return localPoint && transformPointForObject(molecule, localPoint);
 }
 
-/** A repeated radical keeps the open-angle preference, but must clear existing mark frames. */
+/** A radical keeps the open-angle preference, but must clear any existing mark on its atom. */
 export function nativeRadicalPlacementPointForAtom(
   molecule: MoleculeObject,
   atomId: string,
@@ -4165,7 +4234,7 @@ export function nativeRadicalPlacementPointForAtom(
   pageWidth: number,
   pageHeight: number
 ): LayoutPoint | undefined {
-  const occupied = objects.some(object => object.type === "electron-mark" && object.markKind === "radical-dot"
+  const occupied = objects.some(object => object.type === "electron-mark"
     && object.anchor.kind === "atom" && object.anchor.objectId === molecule.id && object.anchor.atomId === atomId);
   if (!occupied) return nativeChargePlacementPointForAtom(molecule, atomId, objects, pageWidth, pageHeight);
   // Retain the existing distance score as a preference among unoccupied candidates.
@@ -5860,6 +5929,21 @@ function bondLineSegments(
     fromLabelLayout,
     toLabelLayout
   );
+  const bold = nativeBondDisplayStyle(bond) === "bold" && bond.order !== "unknown";
+  if (bold && bond.order !== "double") {
+    // A square band end must clear the whole label, including at oblique angles.
+    // The old centre-ray clearance alone can leave a wide corner inside the glyph.
+    const labelPlane = (atom: MoleculeAtom, label: string | undefined, style: NativeDrawingStyle,
+      layout: AtomLabelLayout | undefined, direction: LayoutPoint) => {
+      if (!label) return 0;
+      const box = atomLabelBoundsRelativeToAtom(atom, label, style, layout);
+      return Math.max(...[box.x, box.x + box.width].flatMap(x =>
+        [box.y, box.y + box.height].map(y => x * direction.x + y * direction.y)));
+    };
+    clearance.from = Math.max(clearance.from, labelPlane(fromAtom, fromLabel, fromLabelStyle ?? drawingStyle, fromLabelLayout, unit));
+    clearance.to = Math.max(clearance.to, labelPlane(toAtom, toLabel, toLabelStyle ?? drawingStyle, toLabelLayout, { x: -unit.x, y: -unit.y }));
+    if (clearance.from + clearance.to >= length) return [];
+  }
   const x1 = fromAtom.x + unit.x * clearance.from;
   const y1 = fromAtom.y + unit.y * clearance.from;
   const x2 = toAtom.x - unit.x * clearance.to;
@@ -5888,7 +5972,8 @@ function bondLineSegments(
         x2: x2 + normal.x * offset,
         y2: y2 + normal.y * offset,
         segment: index === 0 ? "primary" : "secondary",
-        doubleBondSide: "center"
+        doubleBondSide: "center",
+        ...(bold ? { boldSide: "right" as const } : {})
       }));
     }
     const terminalHeteroatomSide = terminalHeteroatomDoubleBondInnerSide(
@@ -5916,7 +6001,8 @@ function bondLineSegments(
     const secondaryFromInset = flushEnds.from ? 0 : inset;
     const secondaryToInset = flushEnds.to ? 0 : inset;
     return [
-      { x1, y1, x2, y2, segment: "primary", doubleBondSide },
+      { x1, y1, x2, y2, segment: "primary", doubleBondSide,
+        ...(bold ? { boldSide: doubleBondSide === "left" ? "left" as const : "right" as const } : {}) },
       {
         x1: x1 + unit.x * secondaryFromInset + normal.x * offset,
         y1: y1 + unit.y * secondaryFromInset + normal.y * offset,
@@ -5929,7 +6015,9 @@ function bondLineSegments(
   }
 
   if (bond.order === "triple") {
-    return [-gap, 0, gap].map((offset, index) => ({
+    const tripleGap = bold ? Math.max(gap, depthCuedBondStrokeWidth(
+      drawingStyle.bondBoldWidthPx / 2 + drawingStyle.bondStrokeWidthPx * 1.5, bond.display?.depthWeight)) : gap;
+    return [-tripleGap, 0, tripleGap].map((offset, index) => ({
       x1: x1 + normal.x * offset,
       y1: y1 + normal.y * offset,
       x2: x2 + normal.x * offset,
@@ -5938,7 +6026,8 @@ function bondLineSegments(
     }));
   }
 
-  return [{ x1, y1, x2, y2, segment: "primary" }];
+  return [{ x1, y1, x2, y2, segment: "primary",
+    ...(bold && (ringInteriorSide === "left" || ringInteriorSide === "right") ? { boldSide: ringInteriorSide } : {}) }];
 }
 
 /**
@@ -6379,6 +6468,16 @@ export function objectFrameBoundsForPageFit(object: DocumentObject): LayoutBound
  * and script metrics as sizing/rendering, rather than measuring host fonts or changing the text.
  */
 export function textVisualBoundsForPageFit(object: TextObject): LayoutBounds {
+  const frame = textContentFrame(object);
+  const left = frame.x, right = frame.x + frame.width, top = frame.y, bottom = frame.y + frame.height;
+  const corners = [{ x: left, y: top }, { x: right, y: top }, { x: left, y: bottom }, { x: right, y: bottom }]
+    .map(point => transformPointForObject(object, point));
+  const x = Math.min(...corners.map(point => point.x)), y = Math.min(...corners.map(point => point.y));
+  return { x, y, width: Math.max(...corners.map(point => point.x)) - x, height: Math.max(...corners.map(point => point.y)) - y };
+}
+
+/** Unrotated bounds of the stored caption and its visible lines, in page units. */
+export function textContentFrame(object: TextObject): LayoutBounds {
   const style = nativeTextStyleFromObjectStyle(object.style);
   const lines = textObjectSpanLines(object);
   const anchor = style.textAlign === "center" ? object.x + object.width / 2
@@ -6402,11 +6501,10 @@ export function textVisualBoundsForPageFit(object: TextObject): LayoutBounds {
       bottom = Math.max(bottom, baseline + size * nativeTextMetrics.descentEm);
     }
   });
-  const corners = [{ x: left, y: top }, { x: right, y: top }, { x: left, y: bottom }, { x: right, y: bottom }]
-    .map(point => transformPointForObject(object, point));
-  const x = Math.min(...corners.map(point => point.x)), y = Math.min(...corners.map(point => point.y));
-  return { x, y, width: Math.max(...corners.map(point => point.x)) - x, height: Math.max(...corners.map(point => point.y)) - y };
+  return { x: left, y: top, width: right - left, height: bottom - top };
 }
+
+
 
 /** Centre the visible ring system rather than a tall substituent or a long atom label.
  * Acyclic structures use their atom frame; clearance still measures every visible part. */
@@ -6472,7 +6570,7 @@ export function moleculeOutlineForArrangement(object: MoleculeObject): LayoutPoi
     else if(fragment.tag==='path' && typeof a.d==='string') svgPathSamplePoints(a.d).forEach(p=>add(p,r));
     fragment.children.forEach(c=>{if(c.kind==='element') collect(c);});
   };
-  const sides=ringInteriorDoubleBondSides(object);
+  const sides=ringInteriorBondSides(object);
   for(const bond of object.bonds) {
     const from=atoms.get(bond.fromAtomId),to=atoms.get(bond.toAtomId);if(!from||!to)continue;
     const f=byLabel.get(from.id),t=byLabel.get(to.id),drawing=nativeMoleculeBondDrawingStyle(object,bond.id,style);
@@ -7339,6 +7437,152 @@ function nativeBondStrokeWidth(bond: CoreMoleculeBond, drawingStyle: NativeDrawi
     ? drawingStyle.bondBoldWidthPx
     : drawingStyle.bondStrokeWidthPx;
   return depthCuedBondStrokeWidth(base, bond.display?.depthWeight);
+}
+
+function nativeBondSegmentStrokeWidth(segment: PageMoleculeBondSegment, style: NativeDrawingStyle): number {
+  return segment.bond.order !== "unknown" && nativeBondDisplayStyle(segment.bond) === "bold" && segment.segment !== "primary"
+    ? depthCuedBondStrokeWidth(style.bondStrokeWidthPx, segment.bond.display?.depthWeight)
+    : nativeBondStrokeWidth(segment.bond, style);
+}
+
+const boldBondRingIndices = new WeakMap<MoleculeObject, Map<string, readonly string[]>>();
+const boldBondRenderEdges = new WeakMap<MoleculeObject, {
+  byBond: Map<string, ReadonlyMap<string, BoldBondNeighbor>>;
+  joints: BoldBondJointCache;
+}>();
+
+function boldBondPiSeparation(segment: PageMoleculeBondSegment, style: NativeDrawingStyle): number | undefined {
+  return segment.bond.order === "double" && segment.bond.stereo !== "either"
+    ? nativeMultipleBondGapPx(style) : undefined;
+}
+
+/** One polygon source for normal ink, effects and Sketch; cuts at crossings stay square. */
+function nativeBoldBondPolygons(object: MoleculeObject, segment: PageMoleculeBondSegment,
+  style: NativeDrawingStyle, crossingGaps: readonly BondCrossingGap[], resolution: NativeBondOrderResolution,
+  onJoin?: (join: BoldBondJoin) => void): string[] {
+  let rings = boldBondRingIndices.get(object);
+  if (!rings) {
+    rings = smallestRingAtomIdsByBondId(object);
+    boldBondRingIndices.set(object, rings);
+  }
+  const ring = rings.get(segment.bond.id);
+  const neighbors = (atomId: string, point: LayoutPoint): BoldBondNeighbor[] => {
+    const atom = resolution.atomById.get(atomId);
+    if (!atom) return [];
+    // Centered primary lines are offset sideways from the atom but still join there.
+    // Axial displacement means a label/crossing cut, which must keep its square cap.
+    if (distance(atom, point) > 0.001) {
+      const fromAtom = resolution.atomById.get(segment.bond.fromAtomId);
+      const toAtom = resolution.atomById.get(segment.bond.toAtomId);
+      if (segment.doubleBondSide !== "center" || segment.bond.stereo === "either" || !fromAtom || !toAtom) return [];
+      const length = distance(fromAtom, toAtom);
+      if (length < 0.001 || Math.abs(((point.x - atom.x) * (toAtom.x - fromAtom.x)
+        + (point.y - atom.y) * (toAtom.y - fromAtom.y)) / length) > 0.001) return [];
+    }
+    return (resolution.bondsByAtom.get(atomId) ?? []).flatMap(bond => {
+      if (bond.id === segment.bond.id || bond.order === "unknown") return [];
+      const otherId = bond.fromAtomId === atomId ? bond.toAtomId : bond.fromAtomId;
+      if (ring) {
+        const index = ring.indexOf(atomId);
+        if (otherId !== ring[(index + 1) % ring.length] && otherId !== ring[(index + ring.length - 1) % ring.length]) return [];
+      }
+      const bondStyle = nativeBondDisplayStyle(bond);
+      if (bondStyle === "dashed" || bondStyle === "hashed" || bondStyle === "wavy") return [];
+      const other = resolution.atomById.get(otherId);
+      if (!other) return [];
+      const length = distance(atom, other);
+      if (length < 0.001) return [];
+      const adjacentStyle = nativeMoleculeBondDrawingStyle(object, bond.id);
+      const rendered = boldBondRenderEdges.get(object)?.byBond.get(bond.id)?.get(atomId);
+      if (rendered && ring) return [rendered];
+      return [{ bondId: bond.id, origin: atom, unit: { x: (other.x - atom.x) / length, y: (other.y - atom.y) / length }, length,
+        width: nativeBondStrokeWidth(bond, adjacentStyle) }];
+    });
+  };
+  const width = nativeBondStrokeWidth(segment.bond, style);
+  const lineWidth = depthCuedBondStrokeWidth(style.bondStrokeWidthPx, segment.bond.display?.depthWeight);
+  const piSeparation = boldBondPiSeparation(segment, style);
+  // Square band caps must clear the whole label. Clip only the polygon: changing
+  // the shared double-bond endpoints would also shorten the unchanged pi line.
+  let bandSegment: PageBondLineSegment = segment;
+  const geometry = nativeSegmentVectorGeometry(segment);
+  if (geometry && segment.bond.order === "double") {
+    const project = (p: LayoutPoint) => p.x * geometry.unit.x + p.y * geometry.unit.y;
+    const start = project({ x: segment.x1, y: segment.y1 });
+    const end = project({ x: segment.x2, y: segment.y2 });
+    let from = start, to = end;
+    for (const label of planMoleculeAtomLabels(object, resolution)) {
+      if (![segment.bond.fromAtomId, segment.bond.toAtomId].includes(label.atom.id)) continue;
+      const box = label.layout.bounds;
+      const projections = [box.x, box.x + box.width].flatMap(x => [box.y, box.y + box.height]
+        .map(y => project({ x: label.atom.x + x, y: label.atom.y + y })));
+      if (label.atom.id === segment.bond.fromAtomId) from = Math.max(from, ...projections);
+      else to = Math.min(to, ...projections);
+    }
+    if (from >= to) return [];
+    bandSegment = { ...segment,
+      x1: segment.x1 + geometry.unit.x * (from - start), y1: segment.y1 + geometry.unit.y * (from - start),
+      x2: segment.x2 + geometry.unit.x * (to - end), y2: segment.y2 + geometry.unit.y * (to - end) };
+  }
+  return splitSegmentByCrossingGaps(bandSegment, crossingGaps).map(visible => boldBondPolygonPoints(
+    visible, width, lineWidth, segment.boldSide,
+    neighbors(segment.bond.fromAtomId, { x: visible.x1, y: visible.y1 }),
+    neighbors(segment.bond.toAtomId, { x: visible.x2, y: visible.y2 }), piSeparation, onJoin,
+    { bondId: segment.bond.id, cache: boldBondRenderEdges.get(object)?.joints ?? new Map() }
+  )).filter(Boolean);
+}
+
+/** The normal stroke must reach the outer miter corner behind its atom. Its short
+ * extension is covered by the band, filling the butt-end triangle without a cap,
+ * circle or extra polygon vertex. Only the neighbor's primary line is extended. */
+function joinBoldBondNeighbors(object: MoleculeObject, groups: readonly PageMoleculeBondSegmentGroup[],
+  resolution: NativeBondOrderResolution): void {
+  const boldGroups = groups.filter(group => nativeBondDisplayStyle(group.bond) === "bold" && group.bond.order !== "unknown");
+  if (boldGroups.length === 0) return;
+  // Snapshot the actual primary band axes BEFORE extending ordinary neighbor ink.
+  // Offset ranges include inward growth, centered doubles and pi-clearance shifts.
+  // Both consumers of a joint reuse the same cut, including on effects/export passes.
+  const byBond = new Map<string, ReadonlyMap<string, BoldBondNeighbor>>();
+  for (const group of boldGroups) {
+    const primary = group.segments.find(segment => segment.segment === "primary");
+    const geometry = primary && nativeSegmentVectorGeometry(primary);
+    if (!primary || !geometry) continue;
+    const width = nativeBondStrokeWidth(group.bond, group.drawingStyle);
+    const lineWidth = depthCuedBondStrokeWidth(group.drawingStyle.bondStrokeWidthPx, group.bond.display?.depthWeight);
+    const [low, high] = boldBondEdgeOffsets(width, lineWidth, primary.boldSide,
+      boldBondPiSeparation(primary, group.drawingStyle));
+    const base = { bondId: group.bond.id, length: geometry.length, width };
+    byBond.set(group.bond.id, new Map([
+      [group.bond.fromAtomId, { ...base, origin: { x: primary.x1, y: primary.y1 }, unit: geometry.unit,
+        offsets: [low, high] as const }],
+      [group.bond.toAtomId, { ...base, origin: { x: primary.x2, y: primary.y2 },
+        unit: { x: -geometry.unit.x, y: -geometry.unit.y }, offsets: [-high, -low] as const }]
+    ]));
+  }
+  boldBondRenderEdges.set(object, { byBond, joints: new Map() });
+  const byId = new Map(groups.map(group => [group.bond.id, group]));
+  const joins: BoldBondJoin[] = [];
+  for (const group of boldGroups) {
+    const primary = group.segments.find(segment => segment.segment === "primary");
+    if (primary) nativeBoldBondPolygons(object, primary, group.drawingStyle, [], resolution, join => joins.push(join));
+  }
+  for (const { neighbor, points } of joins) {
+    const group = byId.get(neighbor.bondId);
+    if (!group || nativeBondDisplayStyle(group.bond) === "bold") continue;
+    const primary = group.segments.find(segment => segment.segment === "primary");
+    if (!primary || primary.doubleBondSide === "center") continue;
+    const project = (point: LayoutPoint) => (point.x - neighbor.origin.x) * neighbor.unit.x
+      + (point.y - neighbor.origin.y) * neighbor.unit.y;
+    const from = { x: primary.x1, y: primary.y1 }, to = { x: primary.x2, y: primary.y2 };
+    const atFrom = distance(from, neighbor.origin) < distance(to, neighbor.origin);
+    const current = atFrom ? from : to;
+    const along = Math.min(...points.map(project));
+    if (along >= project(current)) continue;
+    const x = neighbor.origin.x + neighbor.unit.x * along;
+    const y = neighbor.origin.y + neighbor.unit.y * along;
+    if (atFrom) { primary.x1 = x; primary.y1 = y; }
+    else { primary.x2 = x; primary.y2 = y; }
+  }
 }
 
 /** Unknown chemical order always uses separated round dots, even with a retained display style.
@@ -8238,16 +8482,40 @@ function nativeMoleculeBondColor(
   return depthCuedBondColor(baseColor, bond.display?.depthWeight);
 }
 
+const drawingBondIndices = new WeakMap<readonly CoreMoleculeBond[], ReadonlyMap<string, CoreMoleculeBond>>();
+
 export function nativeMoleculeBondDrawingStyle(
   object: MoleculeObject,
   bondId: string,
   drawingStyle: NativeDrawingStyle = nativeDrawingStyleFromObjectStyle(object.style)
 ): NativeDrawingStyle {
+  const strokeWidth = styleNumberMapValue(object.style.bondStrokeWidths, bondId) ?? drawingStyle.bondStrokeWidthPx;
+  const bondLength = styleNumberMapValue(object.style.bondLengths, bondId) ?? drawingStyle.bondLengthPx;
+  let boldWidth = styleNumberMapValue(object.style.bondBoldWidths, bondId) ?? drawingStyle.bondBoldWidthPx;
+  // Documents replace edited bond arrays. Index once, rather than adding a graph
+  // scan for every style lookup in rendering, crossings and the inspector.
+  let byId = drawingBondIndices.get(object.bonds);
+  if (!byId) {
+    byId = new Map(object.bonds.map(bond => [bond.id, bond]));
+    drawingBondIndices.set(object.bonds, byId);
+  }
+  const bond = byId.get(bondId);
+  if (bond && bond.order !== "unknown" && nativeBondDisplayStyle(bond) === "bold"
+    && styleNumberMapValue(object.style.bondBoldWidths, bondId) === undefined) {
+    const preset = NativeStylePresets.find(preset => preset.id === drawingStyle.stylePresetId)?.drawing ?? DefaultNativeDrawingStyle;
+    // Presets store the historical bold/wedge width in one field. Keep wedge dimensions
+    // intact, but size bold ink against both line width and bond length.
+    // A custom molecule width or a per-bond width remains authoritative.
+    const presetWidth = preset.bondBoldWidthPx;
+    const scaledPresetWidth = presetWidth * drawingStyle.bondStrokeWidthPx / preset.bondStrokeWidthPx;
+    if (object.style.bondBoldWidthPx === undefined || Math.abs(boldWidth - presetWidth) < 1e-6
+      || Math.abs(boldWidth - scaledPresetWidth) < 1e-6) boldWidth = boldBondWidth(strokeWidth, bondLength);
+  }
   return {
     ...drawingStyle,
-    bondLengthPx: styleNumberMapValue(object.style.bondLengths, bondId) ?? drawingStyle.bondLengthPx,
-    bondStrokeWidthPx: styleNumberMapValue(object.style.bondStrokeWidths, bondId) ?? drawingStyle.bondStrokeWidthPx,
-    bondBoldWidthPx: styleNumberMapValue(object.style.bondBoldWidths, bondId) ?? drawingStyle.bondBoldWidthPx,
+    bondLengthPx: bondLength,
+    bondStrokeWidthPx: strokeWidth,
+    bondBoldWidthPx: boldWidth,
     bondColor: styleColorMapValue(object.style.bondColors, bondId) ?? drawingStyle.bondColor,
     bondLineCap: styleBondLineCapMapValue(object.style.bondLineCaps, bondId) ?? drawingStyle.bondLineCap,
     bondSpacingMode: styleBondSpacingModeMapValue(object.style.bondSpacingModes, bondId) ?? drawingStyle.bondSpacingMode,

@@ -2,7 +2,7 @@ import { isBlockedByModalDialog, shouldIgnoreShortcutTarget } from "@chemdraft/s
 import {
   dismissToolsetPopovers, listenForToolsetPopoverContent, listenForToolsetPopoverDismiss,
   listenForToolsetPopoverClosed, listenForToolsetPopoverNativeClose, toolsetPopoverTimestamp, isToolsetPopoverVisible,
-  compareToolsetPopoverOpenings, type ToolsetPopoverOpening
+  compareToolsetPopoverOpenings, type ToolsetPopoverOpening, type ToolsetPopoverContent
 } from "./index";
 
 // Inline menus live in this webview. Native announcements identify candidates only;
@@ -15,7 +15,7 @@ export function registerInlinePopover(dismiss: () => void): () => void {
 
 /** Install on document/palette windows only. Editors and dialogs retain ownership of Escape. */
 export function installPopoverEscapeRouting(editorOpen: () => boolean = () => false): () => void {
-  type Opening = ToolsetPopoverOpening & { toolsetId: string; revision: number; checking: boolean; ready: Promise<void>; stop?: () => void };
+  type Opening = ToolsetPopoverOpening & { toolsetId: string; kind: ToolsetPopoverContent["kind"]; revision: number; checking: boolean; ready: Promise<void>; stop?: () => void };
   const opens = new Map<string, Opening>();
   const closed = new Map<string, ToolsetPopoverOpening>();
   let dismissedAt = -Infinity;
@@ -45,7 +45,7 @@ export function installPopoverEscapeRouting(editorOpen: () => boolean = () => fa
     if (at === undefined || at <= dismissedAt || (tombstone && compareToolsetPopoverOpenings(payload, tombstone) <= 0)
       || (previous && compareToolsetPopoverOpenings(payload, previous) <= 0)) return;
     if (previous) retire(previous);
-    const opening: Opening = { toolsetId: payload.toolsetId, openedAt: at, generation: payload.generation,
+    const opening: Opening = { toolsetId: payload.toolsetId, kind: payload.kind, openedAt: at, generation: payload.generation,
       revision: 0, checking: false, ready: Promise.resolve() };
     opens.set(payload.toolsetId, opening);
     opening.ready = listenForToolsetPopoverNativeClose(payload.toolsetId, () => retire(opening)).then(stop => {
@@ -74,8 +74,12 @@ export function installPopoverEscapeRouting(editorOpen: () => boolean = () => fa
     for (const opening of opens.values()) if (opening.openedAt! <= at) retire(opening);
   }).then(retain).catch(() => undefined);
 
-  const ownedElsewhere = (event: KeyboardEvent, target: EventTarget | null = event.target) => event.isComposing || composing || editorOpen()
-    || isBlockedByModalDialog(target) || shouldIgnoreShortcutTarget(target, event.key);
+  const ownedElsewhere = (event: KeyboardEvent, target: EventTarget | null, caption?: HTMLTextAreaElement) => {
+    if (event.isComposing || composing || isBlockedByModalDialog(target)) return true;
+    // The caption and its open color picker share one editing operation. Other editors own Escape.
+    if (caption && target === caption && document.activeElement === caption && editorOpen()) return false;
+    return editorOpen() || shouldIgnoreShortcutTarget(target, event.key);
+  };
   const currentTarget = (event: KeyboardEvent): EventTarget => {
     // Focus may still be scheduled when an editor or modal opens. Resolve its DOM
     // owner explicitly instead of replaying to the canvas that owned the original key.
@@ -95,16 +99,20 @@ export function installPopoverEscapeRouting(editorOpen: () => boolean = () => fa
     currentTarget(event).dispatchEvent(next);
   };
   const onKeyDown = (event: KeyboardEvent) => {
-    if (event.key !== "Escape" || event.defaultPrevented || ownedElsewhere(event)) return;
-    if (forwarded.has(event)) return;
-    const pending = [...opens.values()].filter(opening => !opening.checking);
-    const hadInline = inlineDismissals.size > 0;
+    if (event.key !== "Escape" || event.defaultPrevented || forwarded.has(event)) return;
+    const caption = event.target instanceof HTMLTextAreaElement && event.target.matches(".text-object-editor") && editorOpen()
+      ? event.target : undefined;
+    if (ownedElsewhere(event, event.target, caption)) return;
+    const pending = [...opens.values()].filter(opening => !opening.checking && (!caption || opening.kind === "textColor"));
+    const hadInline = !caption && inlineDismissals.size > 0;
     if (!pending.length && !hadInline) return;
     event.preventDefault();
     event.stopImmediatePropagation();
     const requestedAt = toolsetPopoverTimestamp();
-    for (const dismiss of [...inlineDismissals]) { inlineDismissals.delete(dismiss); dismiss(); }
-    if (hadInline) return;
+    if (hadInline) {
+      for (const dismiss of [...inlineDismissals]) { inlineDismissals.delete(dismiss); dismiss(); }
+      return;
+    }
     // A second Escape can act on the canvas while the first read is pending. Keep
     // lifecycle subscriptions alive until it resolves, so close/blur can invalidate it.
     const checks = pending.map(async opening => {
@@ -121,7 +129,7 @@ export function installPopoverEscapeRouting(editorOpen: () => boolean = () => fa
         result.opening.revision === result.revision ? [result.opening] : []);
       pending.forEach(retire);
       // Re-evaluate every ownership guard after IPC, even when the flyout is visible.
-      if (ownedElsewhere(event, currentTarget(event))) {
+      if (ownedElsewhere(event, currentTarget(event), caption)) {
         resumeEscape(event);
       } else if (targets.length) {
         void dismissToolsetPopovers(requestedAt, "escape", targets.map(({ toolsetId, openedAt, generation }) =>

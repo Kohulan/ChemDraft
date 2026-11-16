@@ -1,6 +1,9 @@
+import { isDrawingToolCommand } from "./drawingTools";
 import { installPopoverEscapeRouting } from "./window-manager/popoverEscape";
+import { listenCurrentWindowEvent } from "./window-manager/tauriEvents";
 import type { AnalysisReport } from "@chemdraft/analysis-core";
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent } from "react";
+import { observePaletteHitBoxes } from "./commandHitBoxes";
 import { DefaultNativeTextStyle, type NativeTextStyle, type TextSpan } from "@chemdraft/chem-core";
 import {
   APPENDABLE_TOOLBAR_WIDGETS,
@@ -77,6 +80,7 @@ import {
   requestToolsetTextStyle,
   sendToolsetLayoutEdit,
   setToolsetPopoverContent,
+  setPaletteCommandHitBoxes,
   sendPaletteCommand,
   sendPaletteCommandCancel,
   sendPaletteInspectorAction,
@@ -784,6 +788,9 @@ export function PaletteWindow({
   }, [shortcutRegistry, platform]);
 
   const invokeCommand = (commandId: string) => {
+    // A tool can be activated by keyboard or a synthesized click without a
+    // pointerdown. Selecting it also ends any previous flyout interaction.
+    if (isDrawingToolCommand(commandId)) dismissPaletteFlyouts();
     void sendPaletteCommand(commandId).catch(() => undefined);
   };
   const previewCommand = (commandId: string) => {
@@ -828,11 +835,32 @@ export function PaletteWindow({
     undefined
   );
   const popoverOperationsRef = useRef(Promise.resolve());
+  const pendingPopoverOperationsRef = useRef(0);
   // A flyout press invalidates older work immediately, even while its native open is queued.
   // Swatch presses themselves remain ordered toggles rather than cancelling one another.
   const popoverRequestRef = useRef(0);
   const enqueuePopoverOperation = (operation: () => Promise<void>) => {
-    popoverOperationsRef.current = popoverOperationsRef.current.then(operation).catch(() => undefined);
+    ++pendingPopoverOperationsRef.current;
+    popoverOperationsRef.current = popoverOperationsRef.current.then(operation).catch(() => undefined)
+      .finally(() => { --pendingPopoverOperationsRef.current; });
+  };
+
+  const dismissPaletteFlyouts = () => {
+    // A native open may still be queued when this click arrives. Invalidate it
+    // immediately and clear its mount replay. Hide now, without waiting for a
+    // slow native open/content acknowledgement in popoverOperationsRef. Retain
+    // the ordered close as a barrier before the next open: pending old work may
+    // still finish, but cannot reveal or close a newer generation.
+    ++popoverRequestRef.current;
+    const opening = lastPopoverPayloadRef.current?.content;
+    lastPopoverPayloadRef.current = undefined;
+    const pendingWork = pendingPopoverOperationsRef.current > 0;
+    const hidden = closeToolsetPopoverWindow(toolset.id, opening?.openedAt, opening?.generation).catch(() => undefined);
+    enqueuePopoverOperation(async () => {
+      await hidden;
+      if (pendingWork) await closeToolsetPopoverWindow(toolset.id, opening?.openedAt, opening?.generation);
+    });
+    void dismissToolsetPopovers(toolsetPopoverTimestamp()).catch(() => undefined);
   };
 
   const openPopover = async (anchor: ToolbarPopoverAnchor, kind: string, content: ToolsetPopoverContent, request: number) => {
@@ -868,13 +896,13 @@ export function PaletteWindow({
 
   // Flyout opens and swatch toggles share the entire native operation, including visibility reads.
   // Snapshot the opening before awaiting: a late reply never authorizes closing its replacement.
-  const openArtColorPopover = (anchor: ToolbarPopoverAnchor) => {
+  const openColorPopover = (anchor: ToolbarPopoverAnchor, kind: "artColor" | "textColor" = "artColor") => {
     const request = popoverRequestRef.current;
     enqueuePopoverOperation(async () => {
       if (popoverRequestRef.current !== request) return;
       const opening = lastPopoverPayloadRef.current?.content;
       const isCurrent = () => popoverRequestRef.current === request && lastPopoverPayloadRef.current?.content === opening;
-      if (opening?.kind === "artColor") {
+      if (opening?.kind === kind) {
         const visible = await isToolsetPopoverWindowVisible(toolset.id);
         if (!isCurrent()) return;
         if (visible) {
@@ -889,8 +917,8 @@ export function PaletteWindow({
           return;
         }
       }
-      const content: ToolsetPopoverContent = { kind: "artColor", ...newToolsetPopoverOpening() };
-      if (await openPopover(anchor, "artColor", content, request)) {
+      const content: ToolsetPopoverContent = { kind, ...newToolsetPopoverOpening() };
+      if (await openPopover(anchor, kind, content, request)) {
         await requestToolsetTextStyle();
       }
     });
@@ -955,9 +983,12 @@ export function PaletteWindow({
     return () => unlisten?.();
   }, [toolset.id]);
 
-  // A pointer-down anywhere in this palette that isn't a popover trigger dismisses any open popover
-  // ("click elsewhere closes it"). The colour swatch and flyout buttons are excluded so re-clicking
-  // one toggles/swaps its popover rather than close-then-reopen. The popover lives in its own
+  // A pointer-down anywhere in this palette that isn't a direct popover toggle dismisses any open
+  // popover ("click elsewhere closes it"). The colour swatch and distribute mode buttons are excluded
+  // so clicking them toggles/swaps their popovers directly. Command flyout buttons are NOT excluded:
+  // a short click executes their primary command rather than toggling a popover, so clicking them
+  // must dismiss any open stale flyout. If a user long-holds, the new popover's later opening
+  // timestamp and fresh generation protect it from this dismissal. The popover lives in its own
   // window, so its own clicks never reach this listener.
   useEffect(() => {
     const handlePointerDown = (event: globalThis.PointerEvent) => {
@@ -965,10 +996,10 @@ export function PaletteWindow({
         return;
       }
       const target = event.target;
-      if (target instanceof Element && target.closest(".toolbar-color-trigger, .command-flyout-button, .distribute-mode-button")) {
+      if (target instanceof Element && target.closest(".toolbar-color-trigger, .distribute-mode-button")) {
         return;
       }
-      void dismissToolsetPopovers(toolsetPopoverTimestamp()).catch(() => undefined);
+      dismissPaletteFlyouts();
     };
     window.addEventListener("pointerdown", handlePointerDown, true);
     return () => window.removeEventListener("pointerdown", handlePointerDown, true);
@@ -1090,6 +1121,7 @@ export function PaletteWindow({
     const renderItemGroups = renderGroups.map((group) => group.items);
     return (
       <ToolPalette
+        platform={platform}
         groups={paletteCommandGroupsFromItemGroups(renderItemGroups)}
         itemGroups={renderItemGroups}
         gridLayout={toolset.gridLayout}
@@ -1114,7 +1146,7 @@ export function PaletteWindow({
           currentTextStyle,
           currentTextScript,
           onColorPickerOpenChange: setColorPickerOpen,
-          onRequestColorPopover: openArtColorPopover,
+          onRequestColorPopover: openColorPopover,
           onArtStylePreview: previewCommand,
           onArtStyleCommit: commitPreviewCommand,
           onArtStyleCancel: cancelPreviewCommand,
@@ -1139,6 +1171,24 @@ export function PaletteWindow({
   const tableOnly = tableInspector && (currentSelection
     ? currentSelection.objectTypes.length === 1 && currentSelection.objectTypes[0] === "table"
     : !currentMoleculeInspector?.targets.moleculeObjectIds.length);
+
+  useEffect(() => {
+    if (platform !== "windows") return;
+    if (customizeThisPalette) {
+      void setPaletteCommandHitBoxes([], []).catch(() => undefined);
+      return;
+    }
+    const body = bodyRef.current;
+    if (!body) return;
+    return observePaletteHitBoxes(body, setPaletteCommandHitBoxes, refresh =>
+      listenCurrentWindowEvent("chemdraft://palette-command-hit-boxes-refresh", refresh));
+  }, [platform, toolsetId, customizeThisPalette]);
+
+  // Selection/spec broadcasts replace state objects, not this native registration.
+  // Observer cleanup never clears a live window; only teardown/customize does.
+  useEffect(() => () => {
+    if (platform === "windows") void setPaletteCommandHitBoxes([], []).catch(() => undefined);
+  }, [platform]);
 
   return (
     <main

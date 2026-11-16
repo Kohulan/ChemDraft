@@ -2932,9 +2932,12 @@ describe("ChemDraft desktop shell", () => {
     ]);
     const disabledTools = paletteGroups.flat().filter((command) => !enabledToolIds.has(command.id));
 
-    for (const id of ["tool.bond", "tool.doubleBond", "tool.tripleBond"]) {
+    for (const id of ["tool.bond", "tool.doubleBond"]) {
       expect(paletteGroups.flat().find((command) => command.id === id)).toMatchObject({ enabled: true });
     }
+    // Triple remains enabled in the bond dropdown, without a standalone default cell.
+    expect(allPaletteCommands().find((command) => command.id === "tool.tripleBond")).toMatchObject({ enabled: true });
+    expect(paletteGroups.flat().find((command) => command.id === "tool.tripleBond")).toBeUndefined();
     expect(paletteGroups.flat().find((command) => command.id === "tool.text")).toMatchObject({ enabled: true });
     expect(paletteGroups.flat().find((command) => command.id === structureCleanupCommandId)).toMatchObject({ enabled: true });
     expect(paletteGroups.flat().find((command) => command.id === structureCleanup3dCommandId)).toMatchObject({

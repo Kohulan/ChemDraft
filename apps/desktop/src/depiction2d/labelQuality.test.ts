@@ -3,6 +3,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { createEmptyDocument, type MoleculeObject } from "@chemdraft/chem-core";
 import { pastedStructureDepictionFromMolfile, stereoPerceptionMolfile } from "@chemdraft/document-workflow-core";
 import { atomLabelGlyphBounds, atomLabelRunFontSize, moleculeLayoutLabelBoxes, planMoleculeAtomLabels } from "@chemdraft/layout-engine";
+import { atomLabelReferenceInk } from "@chemdraft/layout-engine/testing";
 import * as layoutEngine from "@chemdraft/layout-engine";
 import { ensureOclResources, perceiveStereoCentersFromMolfile, relayoutMolfile2D } from "@chemdraft/ocl-adapter";
 import * as rdkitDepiction from "@chemdraft/rdkit-adapter/depiction";
@@ -102,20 +103,29 @@ describe("renderer label collision regressions", () => {
     expect(contacts.collinearBondOverlaps).toEqual(quality.collinearBondOverlaps);
 
     const plans = planMoleculeAtomLabels(molecule), boxes = moleculeLayoutLabelBoxes(molecule);
-    // Render the canvas's exact text runs: same anchor, H side, scripts, font and dy.
-    // Resvg measures ink rather than the padded rectangle used to clip bonds.
+    // Render the canvas's exact text runs with the host's available fonts. Resvg's
+    // fallback can be unrelated to Helvetica (including a monospace face on Linux),
+    // so its ink measures visible distances, not the model's Helvetica enclosure.
     const glyphs = plans.map(plan => {
       const runs = plan.layout.runs.map(run => `<text x="${run.x}" y="${run.y}" dy="0.35em" text-anchor="${run.textAnchor}" font-size="${atomLabelRunFontSize(run.script, plan.drawingStyle) ?? plan.fontSizePx}">${run.text}</text>`).join("");
       const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="800" height="800"><g transform="translate(${plan.anchor.x} ${plan.anchor.y})" font-family="${plan.fontFamily}" font-weight="${plan.fontWeight}" font-style="${plan.fontStyle}">${runs}</g></svg>`;
       const glyph = new Resvg(svg).getBBox()!;
+      expect(glyph).not.toBeNull();
+      expect([glyph.x, glyph.y, glyph.width, glyph.height].every(Number.isFinite)).toBe(true);
+      expect(glyph.width).toBeGreaterThan(0);
+      expect(glyph.height).toBeGreaterThan(0);
       const box = boxes.find(box => molecule.atoms[box.atom].id === plan.atom.id)!;
-      expect(glyph.x).toBeGreaterThanOrEqual(box.x - 0.5);
-      expect(glyph.y).toBeGreaterThanOrEqual(box.y - 0.5);
-      expect(glyph.x + glyph.width).toBeLessThanOrEqual(box.x + box.width + 0.5);
-      expect(glyph.y + glyph.height).toBeLessThanOrEqual(box.y + box.height + 0.5);
+      // Independent AFM ink, shared with atomLabelGlyphBounds.test.ts, checks all
+      // four edges at the actual paste anchors without assuming an installed font.
+      // Keep the molecule's default stack: pinning its style changes the case tested.
+      const ink = atomLabelReferenceInk(plan, "helvetica");
+      expect(plan.anchor.x + ink.left).toBeGreaterThanOrEqual(box.x - 0.5);
+      expect(plan.anchor.y + ink.top).toBeGreaterThanOrEqual(box.y - 0.5);
+      expect(plan.anchor.x + ink.right).toBeLessThanOrEqual(box.x + box.width + 0.5);
+      expect(plan.anchor.y + ink.bottom).toBeLessThanOrEqual(box.y + box.height + 0.5);
       // Check that collision boxes use glyph bounds rather than padded layout bounds.
       // The fixed-label cases independently guard glyph-bound tightness without system
-      // fonts; the assertions above check that the actual ink is still enclosed.
+      // fonts; the assertions above check that the reference font's ink is enclosed.
       const expectedHeight = atomLabelGlyphBounds(plan).height;
       expect(Math.abs(box.height - expectedHeight)).toBeLessThanOrEqual(0.5);
       return glyph;

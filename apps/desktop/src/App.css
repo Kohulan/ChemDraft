@@ -1584,6 +1584,28 @@ textarea:focus-visible,
   grid-template-columns: 170px 70px auto;
 }
 
+/* The detached Text palette sizes its native window from the shell's content.
+   Keep its expanded picker in flow, opening left from the last font control. */
+.palette-window-shell .text-style-palette:has(.text-toolbar-style-controls .toolbar-color-popover) {
+  max-height: none;
+}
+.palette-window-shell .text-toolbar-style-controls:has(.toolbar-color-popover) {
+  grid-template-rows: auto repeat(2, 24px);
+}
+.palette-window-shell .text-toolbar-row-font:has(.toolbar-color-popover) {
+  align-items: start;
+}
+.palette-window-shell .text-toolbar-row-font .toolbar-color-picker:has(.toolbar-color-popover) {
+  flex-direction: column;
+  align-items: flex-end;
+  width: max-content;
+  max-width: 82px;
+  gap: var(--cd-space-2);
+}
+.palette-window-shell .text-toolbar-row-font .toolbar-color-popover {
+  position: static;
+}
+
 .text-toolbar-font-control,
 .text-toolbar-size-control {
   width: 100%;

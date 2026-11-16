@@ -34,6 +34,7 @@ import {
   findNearestBondHit,
   findNearestAtomHit,
   nativeMoleculeRings,
+  nativeMoleculeBondDrawingStyle,
   nativeMoleculeRingAtPoint,
   NativeAtomLabelStyleMapKeys,
   planBondExtension,
@@ -1142,7 +1143,7 @@ function referencePageCrossings(page: DocumentPage): ResolvedBondCrossing[] {
       return from && to ? [{
         ref: { objectId: object.id, bondId: bond.id }, objectLayerIndex, bondIndex,
         bond, start: transform(from), end: transform(to),
-        style: nativeDrawingStyleFromObjectStyle(object.style)
+        style: nativeMoleculeBondDrawingStyle(object, bond.id)
       }] : [];
     });
   });
@@ -1188,6 +1189,12 @@ function referencePageCrossings(page: DocumentPage): ResolvedBondCrossing[] {
         : front.style.multipleBondGapPx;
       const footprint = front.bond.display?.bondStyle === "wedge" || front.bond.display?.bondStyle === "hashed"
         ? Math.max(4, front.style.bondStrokeWidthPx * 2.2, front.style.bondBoldWidthPx * 1.05, front.style.bondLengthPx * 0.24)
+        : front.bond.display?.bondStyle === "bold"
+          ? front.bond.order === "double"
+            ? 2 * Math.max(gap, stroke(front) + 1.5 * front.style.bondStrokeWidthPx - gap / 2) + front.style.bondStrokeWidthPx
+            : front.bond.order === "triple"
+              ? 2 * Math.max(gap, stroke(front) / 2 + front.style.bondStrokeWidthPx * 1.5) + front.style.bondStrokeWidthPx
+              : Math.max(stroke(front), 2 * stroke(front) - front.style.bondStrokeWidthPx)
         : stroke(front) + (front.bond.order === "triple" ? gap * 2 : front.bond.order === "double" ? gap : 0);
       crossings.push({
         key, bonds, front: front.ref, back: back.ref, point,
@@ -3079,7 +3086,9 @@ describe("layout-engine page SVG planner", () => {
     );
 
     expect(Math.abs(Number(doubleLines[0]?.attrs.y1) - Number(doubleLines[1]?.attrs.y1))).toBeCloseTo(22, 6);
-    expect(boldLine?.attrs["stroke-width"]).toBe(7);
+    expect(boldLine?.tag).toBe("polygon");
+    const ys = String(boldLine?.attrs.points).split(" ").map(point => Number(point.split(",")[1]));
+    expect(Math.max(...ys) - Math.min(...ys)).toBe(7);
   });
 
   it("uses native hash spacing for hashed wedge density", () => {

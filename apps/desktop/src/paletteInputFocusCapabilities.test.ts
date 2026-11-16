@@ -62,15 +62,25 @@ it("allows Windows palette colour popups to activate without a second WebView2 f
   const panel = readNative("src/panel_window.rs");
   const observer = panel.split('unsafe extern "system" fn focus_subclass(')[1]!.split("\n#[cfg(windows)]")[0]!;
   // Observing WM_MOUSEACTIVATE is needed to guard click-to-lease delivery.
-  // Only overriding its result with MA_NOACTIVATE breaks native colour popups.
-  expect(observer).not.toContain("return MA_NOACTIVATE");
+  // All command-surface points stay inactive except registered native choosers.
+  // Text inputs acquire their lease separately; the default chain cannot run first.
+  expect(observer).toContain("let decision = policy.activate(");
+  expect(observer).toContain("WM_POINTERACTIVATE");
+  expect(observer).toContain("GetCursorPos(&mut cursor)");
+  expect(observer).toMatch(/if let Some\(result\) = decision \{\s*command_pressed\(primary\);\s*result\s*\} else \{\s*DefSubclassProc\(hwnd, message, wparam, lparam\)/);
+  expect(observer).not.toContain("app_was_active");
+  // Custom and plugin palettes use the same renderer/native command classification.
+  for (const prefix of ["toolset-core-", "toolset-plugin-", "toolset-user-", "toolset-popover-"])
+    expect(readNative("src/palette_activation.rs")).toContain(prefix);
+  expect(JSON.parse(readNative("capabilities/toolset-command-hit-boxes.json")).windows)
+    .toEqual(["toolset-core-*", "toolset-plugin-*", "toolset-user-*", "toolset-popover-*"]);
   expect(readNative("src/palette_key_guard.rs")).not.toContain("return MA_NOACTIVATE");
   expect(observer).toContain("DefSubclassProc(hwnd, message, wparam, lparam)");
   // The native default remains non-activating; pointer-intent leases grant input focus.
   expect(panel).toContain("(style | (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)");
   const command = readNative("src/lib.rs").split("async fn set_plugin_panel_input_focus(")[1]!.split("/// Sent to the main window")[0]!;
   const windows = command.split("#[cfg(windows)]")[1]!.split("#[cfg(not(any")[0]!;
-  expect(windows).toContain("panel_window::focus_if_app_active(hwnd)");
+  expect(windows).toContain("panel_window::focus_if_app_active(hwnd, pointer_before.is_none())");
   expect(windows).toMatch(/if already_active \{\s+return Ok\(true\);/);
 });
 
@@ -90,6 +100,21 @@ it("gates every palette-focus diagnostic on the existing native agent bridge swi
   for (const file of ["src/panel_window.rs", "src/palette_key_guard.rs"]) {
     expect(readNative(file)).not.toContain('eprintln!("[palette-focus]');
   }
+});
+
+it("pins only command frames after forwarding real activation and keeps the A/B and timestamp diagnostics", () => {
+  const panel = readNative("src/panel_window.rs");
+  expect(panel).toContain("stable_nonclient_paint: palette_activation::is_command_surface(window.label())");
+  expect(panel).toContain('std::env::var("CHEMDRAFT_PALETTE_PIN_INACTIVE").as_deref() != Ok("0")');
+  const frame = panel.split("if message == WM_NCACTIVATE {")[1]!.split("// Editable controls")[0]!;
+  expect(frame).toContain("stable && observer.pin_inactive && wparam != 0");
+  expect(frame).toContain("let result = DefSubclassProc(hwnd, message, wparam, if stable { -1 } else { lparam })");
+  expect(frame.indexOf("DefWindowProcW(hwnd, WM_NCACTIVATE, 0, -1)")).toBeGreaterThan(frame.indexOf("DefSubclassProc("));
+  expect(frame).toContain("return result;");
+  expect(frame).not.toContain("DefSubclassProc(hwnd, message, 0");
+  expect(readNative("src/windows_activation_log.rs")).toContain("chrono::SecondsFormat::Millis");
+  for (const field of ["GetMessagePos=", "GetCursorPos=", "boxes=", "chooser_rects=", "command_hit=", "chooser_hit=", "return="])
+    expect(panel).toContain(field);
 });
 
 it("retains only explicitly leased macOS selects across key loss and ends them on outside/app loss", () => {

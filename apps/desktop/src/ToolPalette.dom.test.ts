@@ -6,7 +6,7 @@ import { applyPatches, createEmptyDocument, type MoleculeObject } from "@chemdra
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { applyGraphicWaveSettingToSelection, createPhase4Document, applyChargeToolAtPoint, insertNativeArtGraphicObject, selectDocumentObjects } from "./documentWorkflow";
 import { createArtInspectorModel, selectedGraphicObjectsForArtInspector } from "./artInspectorModel";
-import { ToolPalette, titleMonogram } from "./ToolPalette";
+import { ToolPalette, titleMonogram, TOOLBAR_FLYOUT_HOLD_MS } from "./ToolPalette";
 import { toolbarAsset } from "./toolbarAssets";
 import { createMoleculeInspectorModel } from "./moleculeInspectorModel";
 import {
@@ -31,6 +31,50 @@ import { ToolbarCustomizeController } from "./toolbars/CustomizeMainToolbar/Tool
 function widgetOnlyItemGroups(toolsetId: string): ToolbarPaletteItemModel[][] {
   return [getToolsetItemGroups(toolsetId).flat().filter((item) => item.primary.type === "control")];
 }
+
+describe.each(["macos", "windows"] as const)("command pointer focus on %s", platform => {
+  it("retains the 200 ms hold and invokes a subsequent short Charge press exactly once", async () => {
+    vi.useFakeTimers();
+    const container = document.createElement("div"); document.body.append(container);
+    const root = createRoot(container);
+    const onInvoke = vi.fn(), onRequestFlyout = vi.fn();
+    const editor = document.createElement("input"); document.body.append(editor); editor.focus();
+    try {
+      await act(async () => root.render(createElement(ToolPalette, {
+        itemGroups: getToolsetItemGroups("core.main"), onInvoke, onRequestFlyout, platform
+      })));
+      const button = container.querySelector<HTMLButtonElement>('[data-command-id="tool.charge"]')!;
+      expect(button).not.toBeNull();
+      const press = async (type: string) => {
+        const event = new MouseEvent(type, { bubbles: true, cancelable: true, button: 0 });
+        await act(async () => button.dispatchEvent(event));
+        return event;
+      };
+      expect((await press("pointerdown")).defaultPrevented).toBe(platform === "windows");
+      const mouseDown = await press("mousedown");
+      expect(mouseDown.defaultPrevented).toBe(platform === "windows");
+      // jsdom has no native mouse-focus default. Model that default only when
+      // permitted; real WebView2 activation remains a Windows hands-on check.
+      if (!mouseDown.defaultPrevented) await act(async () => button.focus());
+      expect(document.activeElement).toBe(platform === "windows" ? editor : button);
+      await act(async () => vi.advanceTimersByTimeAsync(TOOLBAR_FLYOUT_HOLD_MS - 1));
+      expect(onRequestFlyout).not.toHaveBeenCalled();
+      await act(async () => vi.advanceTimersByTimeAsync(1));
+      expect(onRequestFlyout).toHaveBeenCalledTimes(1);
+      await act(async () => vi.advanceTimersByTimeAsync(150));
+      await press("pointerup"); await press("click");
+      expect(onInvoke).not.toHaveBeenCalled();
+      await press("pointerdown"); await press("mousedown");
+      await act(async () => vi.advanceTimersByTimeAsync(30));
+      await press("pointerup"); await press("click");
+      expect(onInvoke).toHaveBeenCalledExactlyOnceWith("tool.charge");
+      await act(async () => vi.advanceTimersByTimeAsync(650));
+      expect(onRequestFlyout).toHaveBeenCalledTimes(1);
+    } finally {
+      await act(async () => root.unmount()); container.remove(); editor.remove(); vi.useRealTimers();
+    }
+  });
+});
 
 function artInspectorModelFor(commandId: string) {
   const document = insertNativeArtGraphicObject(

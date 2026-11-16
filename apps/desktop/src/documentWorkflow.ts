@@ -1,3 +1,4 @@
+import { bondDrawingToolCommandId } from "./bondToolCommands";
 import { nativeChargePlacementPointForAtom, nativeRadicalPlacementPointForAtom, nativeChargeMarkSizePx, nativeAtomHitRadiusPx } from "@chemdraft/layout-engine";
 export { nativeChargePlacementPointForAtom, nativeChargeMarkSizePx, nativeAtomHitRadiusPx } from "@chemdraft/layout-engine";
 import {
@@ -772,6 +773,7 @@ function artArcTool(
 
 export interface NativeBondToolOptions {
   bondOrder?: NativeBondOrderValue;
+  bondStereo?: "either";
   bondStyle?: NativeBondDisplayStyle;
   /** Told why the tool refused to place the bond, so the caller can say so instead of guessing. */
   onRefusal?: (reason: string) => void;
@@ -1025,6 +1027,7 @@ export function createNativeSingleBondMolecule(
     fromAtomId: leftAtom.id,
     toAtomId: rightAtom.id,
     order: options.bondOrder ?? "single",
+    ...(options.bondOrder === "double" && options.bondStereo === "either" ? { stereo: "either" as const } : {}),
     ...nativeBondDisplayObject(options.bondStyle),
     ...(options.bondOrder === "double" && loadDrawingSettings().defaultDoubleBond === "centred"
       ? { display: { ...nativeBondDisplayObject(options.bondStyle).display, doubleBondSide: "center" as const } }
@@ -1032,7 +1035,7 @@ export function createNativeSingleBondMolecule(
   }] satisfies MoleculeBond[];
   const geometry = moleculeGeometryFromAtoms(atoms);
 
-  return normalizeNativeMoleculeGeometry({
+  const molecule = normalizeNativeMoleculeGeometry({
     id: nextObjectId(document, "mol_bond"),
     type: "molecule",
     x: geometry.x,
@@ -1059,6 +1062,7 @@ export function createNativeSingleBondMolecule(
     superatoms: [],
     rGroups: []
   });
+  return options.bondStereo === "either" ? withStoredBondStereoMolfile(molecule) : molecule;
 }
 
 export function insertNativeSingleBondMolecule(
@@ -1453,10 +1457,15 @@ export function applyNativeChainTool(
 }
 
 export function nativeBondOrderForToolCommand(commandId: string): NativeBondOrderValue {
-  return commandId === "tool.doubleBond" ? "double" : commandId === "tool.tripleBond" ? "triple" : "single";
+  return commandId === "tool.doubleBond" || nativeBondStereoForToolCommand(commandId) === "either" ? "double" : commandId === "tool.tripleBond" ? "triple" : "single";
+}
+
+export function nativeBondStereoForToolCommand(commandId: string): "either" | undefined {
+  return commandId === bondDrawingToolCommandId("double", "either") ? "either" : undefined;
 }
 
 export function nativeBondStyleForToolCommand(commandId: string): NativeBondToolStyle | undefined {
+  if (nativeBondStereoForToolCommand(commandId)) return "solid";
   switch (commandId) {
     case "tool.bond":
     case "tool.doubleBond":
@@ -8948,8 +8957,10 @@ export function applyNativeMoleculeBondOrderTarget(
 export function applyNativeMoleculeBondOrderValueTarget(
   document: ChemDraftDocument,
   target: NativeBondOrderTarget,
-  order: NativeBondOrderValue
+  order: NativeBondOrderValue,
+  stereo?: "either"
 ): ChemDraftDocument {
+  if (stereo && order !== "double") return document;
   const page = firstPage(document);
   const molecule = page.objects.find((object): object is MoleculeObject =>
     object.id === target.objectId && object.type === "molecule"
@@ -8963,18 +8974,22 @@ export function applyNativeMoleculeBondOrderValueTarget(
     return document;
   }
 
-  if ((order === bond.order && bond.stereo !== "either") || !canSetNativeBondOrder(molecule, bond, order)) {
+  if ((order === bond.order && bond.stereo === stereo) || !canSetNativeBondOrder(molecule, bond, order)) {
     return document;
   }
 
   const bonds = molecule.bonds.map((candidate) =>
     candidate.id === bond.id
       // Clearing an existing double bond's "either" stereo is not double-bond creation.
-      ? nativeBondWithOrderAndDisplay(molecule, withoutDoubleBondStereo(candidate), order, bond.order !== "double")
+      ? { ...nativeBondWithOrderAndDisplay(molecule, withoutDoubleBondStereo(candidate), order, bond.order !== "double"),
+          ...(stereo ? { stereo } : {}) }
       : candidate
   );
-  const refreshed = refreshNativeSingleBondGraph(molecule, molecule.atoms, bonds);
-  const nextMolecule = bond.stereo === "either" ? withStoredBondStereoMolfile(refreshed) : refreshed;
+  const refreshed = stereo === "either"
+    ? refreshNativeBondToolGraph(molecule, molecule.atoms, bonds, { bondStereo: stereo })
+    : refreshNativeSingleBondGraph(molecule, molecule.atoms, bonds);
+  if (!refreshed) return document;
+  const nextMolecule = !stereo && bond.stereo === "either" ? withStoredBondStereoMolfile(refreshed) : refreshed;
 
   return applyPatch(
     document,
@@ -14450,7 +14465,7 @@ export function duplicateSelectedDocumentObjects(
   const duplicateIdByOriginalId = new Map<string, string>();
   for (const object of selectedObjects) {
     const duplicate = structuredClone(object) as DocumentObject;
-    // Standalone marks use the normal policy; explicit pairs are remapped after all copies exist.
+    // Standalone marks use the normal policy; attached pairs are remapped after all copies exist.
     if (duplicate.type === "electron-mark") delete duplicate.atomAssociation;
     duplicate.id = allocateId(duplicateObjectIdPrefix(object));
     duplicates.push(duplicate);
@@ -14458,7 +14473,7 @@ export function duplicateSelectedDocumentObjects(
     duplicateIdByOriginalId.set(object.id, duplicate.id);
     patches.push({ op: "addObject", pageId: page.id, object: duplicate });
   }
-  remapCopiedExplicitElectronMarkAssociations(selectedObjects,
+  remapCopiedElectronMarkAssociations(selectedObjects,
     new Map(selectedObjects.map((object, index) => [object.id, duplicates[index]])), warningsOut);
 
   // Every group reachable inside a selected group, innermost first, so a nested group's copy exists
@@ -14888,7 +14903,7 @@ export function pasteSelectionClipboardPayload(
     pastedById.set(pasted.id, pasted);
     patches.push({ op: "addObject", pageId: page.id, object: pasted });
   }
-  remapCopiedExplicitElectronMarkAssociations(sourceChildren,
+  remapCopiedElectronMarkAssociations(sourceChildren,
     new Map(sourceChildren.map(object => [object.id, pastedById.get(idBySourceId.get(object.id)!)!])), warningsOut);
 
   // Object ids are reminted on paste; atom ids remain local to their cloned molecule.
@@ -14953,13 +14968,13 @@ export function pasteSelectionClipboardPayload(
 }
 
 /** Copies retain local atom ids: remap the molecule id and validate the copied atom identity. */
-function remapCopiedExplicitElectronMarkAssociations(
+function remapCopiedElectronMarkAssociations(
   sources: readonly DocumentObject[],
   copiesBySourceId: ReadonlyMap<string, DocumentObject>,
   warningsOut?: string[]
 ): void {
   for (const source of sources) {
-    if (source.type !== "electron-mark" || source.atomAssociation !== "explicit" ||
+    if (source.type !== "electron-mark" ||
       source.anchor.kind !== "atom" || source.anchor.objectId === undefined) continue;
     const molecule = copiesBySourceId.get(source.anchor.objectId);
     // Copying just a mark retains the existing standalone association policy.
@@ -14967,12 +14982,15 @@ function remapCopiedExplicitElectronMarkAssociations(
     const copy = copiesBySourceId.get(source.id);
     if (copy?.type !== "electron-mark") continue;
     if (molecule.type !== "molecule" || !molecule.atoms.some(atom => atom.id === source.anchor.atomId)) {
+      // Legacy geometric anchors may be stale; retain their existing fallback policy.
+      if (source.atomAssociation !== "explicit") continue;
       const warning = `Cannot preserve explicit electron mark "${source.id}" association: copied atom "${source.anchor.atomId}" in molecule "${source.anchor.objectId}" is missing.`;
       if (!warningsOut) throw new Error(warning);
       warningsOut.push(warning);
       continue;
     }
     copy.anchor = { ...source.anchor, objectId: molecule.id };
+    // Preserve the copied pair even when its offset places it nearer an original atom.
     copy.atomAssociation = "explicit";
   }
 }
@@ -15224,7 +15242,10 @@ function transformOtherObjectAroundPointPatches(
     rotation: normalizeDegrees(object.rotation + degrees)
   };
   if (object.type === "electron-mark") {
-    Object.assign(changes, electronMarkMoveAssociation(document, object, oldCenter, newCenter, { operation: "transform" }));
+    // Resizing about the mark's own centre changes appearance, not its atom.
+    const operation = degrees === 0 && (options.scaleX !== undefined || options.scaleY !== undefined) &&
+      oldCenter.x === newCenter.x && oldCenter.y === newCenter.y ? "frame" : "transform";
+    Object.assign(changes, electronMarkMoveAssociation(document, object, oldCenter, newCenter, { operation }));
   }
   if (object.type === "graphic") {
     changes.data = resizeGraphicObjectDataForFrame(object.data, oldCenter, newCenter, scaleX, scaleY);
@@ -20356,7 +20377,21 @@ function extendNativeCarbonGraph(
   ];
 
   const orderedBonds = nativeBondsWithToolOrder({ ...molecule, atoms, bonds }, options);
-  return orderedBonds ? refreshNativeSingleBondGraph(molecule, atoms, orderedBonds) : undefined;
+  return orderedBonds ? refreshNativeBondToolGraph(molecule, atoms, orderedBonds, options) : undefined;
+}
+
+/** Reuse the selected-bond either writer, including its source-only chemistry guards. */
+function refreshNativeBondToolGraph(
+  molecule: MoleculeObject, atoms: readonly MoleculeAtom[], bonds: readonly MoleculeBond[], options: NativeBondToolOptions
+): MoleculeObject | undefined {
+  if (options.bondStereo !== "either") return refreshNativeSingleBondGraph(molecule, atoms, bonds);
+  try {
+    const refreshed = refreshNativeSingleBondGraph(molecule, atoms, bonds);
+    return withStoredBondStereoMolfile({ ...refreshed, structure: molecule.structure, structureFormat: molecule.structureFormat });
+  } catch (error) {
+    options.onRefusal?.(error instanceof Error ? error.message : "Cannot preserve E/Z stereo");
+    return undefined;
+  }
 }
 
 /**
@@ -20377,7 +20412,8 @@ function nativeBondsWithToolOrder(
     return undefined;
   }
   return molecule.bonds.map(bond =>
-    bond.id === addedBond.id ? nativeBondWithOrderAndDisplay(molecule, bond, order) : bond);
+    bond.id === addedBond.id ? { ...nativeBondWithOrderAndDisplay(molecule, bond, order),
+      ...(order === "double" && options.bondStereo === "either" ? { stereo: "either" as const } : {}) } : bond);
 }
 
 /**
@@ -20789,7 +20825,7 @@ function connectNativeCarbonAtoms(
   ];
 
   const orderedBonds = nativeBondsWithToolOrder({ ...molecule, bonds }, options);
-  return orderedBonds ? refreshNativeSingleBondGraph(molecule, molecule.atoms, orderedBonds) : undefined;
+  return orderedBonds ? refreshNativeBondToolGraph(molecule, molecule.atoms, orderedBonds, options) : undefined;
 }
 
 function atomLabelIsotopeRefusal(atom: MoleculeAtom, label: string, molecule: MoleculeObject, literal: boolean): string | undefined {

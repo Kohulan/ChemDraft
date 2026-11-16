@@ -1,4 +1,5 @@
 import { MAX_IMAGE_OBJECT_BYTES, normalizeAtomIsotope, isSvgImageSource, readSvgInfo, validatePngImage, validateSvgImage, imagePixelLimitError } from "@chemdraft/chem-core";
+export { CHEMDRAFT_PNG_SELECTION_KEYWORD, pngWithChemDraftSelection } from "./pngSelection";
 
 export type ClipboardPayloadKind = "svg" | "png" | "text/plain" | "smiles" | "mol" | "rxn" | "cdxml" | "cdx";
 

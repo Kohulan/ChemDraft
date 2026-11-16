@@ -439,7 +439,7 @@ sprouts 4/5, carbonyl 2, gem-dimethyl 9, the 0-key cyclic bond closing a ring), 
 following the selected scheme — `e` over an atom applies the Et nickname in the ChemDraw scheme,
 while ChemDraft's `e` arms the eraser; charge stacking
 by hotkey and by the charge tool up to ±9 and back down to mark removal;
-with **Direct electron-mark editing** off (the default), check painted-ink-only picking over
+with **Direct electron-mark editing** off (the default), check radical/lone-pair painted-ink-only picking over
 atoms, bonds and filled rings, repeated radical/lone-pair tool placement on existing ink, and
 absence of mark resize/rotation handles. Enable the preference live, then drag circled/plain
 charges, radical ions, radical dots and lone pairs from blank corners of their rotated frames
@@ -1478,6 +1478,13 @@ whole-molecule cleanup with the existing behavior, and check save/reopen and exp
 - With Direct electron-mark editing off (the default), drag a charge mark onto an atom: it lands
   beside the atom label. Undo and Redo the drop. Enable Direct electron-mark editing in Preferences,
   then move, resize and rotate the mark; Undo and Redo restore each edit.
+- With either preference setting, grab positive/negative, plain/circled and radical-ion charges
+  outside their drawn sign and saved frame, within the centered 36 CSS-pixel move area. Repeat at
+  25%, 50%, 100%, 200% and 400% zoom, using Select and the matching charge tool: one mark moves,
+  without a duplicate. With direct editing enabled, grab each separate resize corner and use Shift
+  to stretch non-uniformly; clicking a corner without moving changes nothing. Undo/Redo each move
+  and resize. Check nearby overlapping objects still follow drawing order, and SVG/PDF contain
+  only the original drawing, with no enlarged invisible rectangle or changed charge size.
 
 ### Reaction conditions
 

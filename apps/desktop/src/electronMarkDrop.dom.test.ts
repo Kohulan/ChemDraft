@@ -2,7 +2,8 @@
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { applyPatch, type ChemDraftDocument } from "@chemdraft/chem-core";
+import { applyPatch, type ChemDraftDocument, type ElectronMarkObject } from "@chemdraft/chem-core";
+import { exportDocumentToSvg } from "@chemdraft/export-engine";
 import { atomDisplayLabel, moleculeLayoutLabelBoxes, transformPointForObject } from "@chemdraft/layout-engine";
 import { documentDrawingDefaults, nativeAtomBondOrderUsage, nativeImplicitHydrogenCount, phase4Timestamp } from "@chemdraft/document-workflow-core";
 import { MainWindow } from "./MainWindow";
@@ -85,6 +86,59 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
     const molecule = dropMolecule(snapshot());
     return molecule.atoms.map(atom => atomDisplayLabel(atom, molecule.bonds, undefined, molecule.atoms));
   }
+
+  it.each((["radical-dot", "lone-pair", "charge", "unknown"] as const).flatMap(markKind =>
+    (["atom", "bond"] as const).map(part => ({ markKind, part }))))(
+    "selects and drags a tiny $markKind beside a $part from blank grab space, yielding to the nearer part", async ({ markKind, part }) => {
+      const base = workflow.insertNativeSingleBondMolecule(workflow.createPhase4Document("Small mark target"), { x: 300, y: 300 });
+      const molecule = dropMolecule(base), [a, b] = molecule.atoms;
+      const partPoint = part === "atom" ? a : { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      const center = { x: partPoint.x, y: partPoint.y - 16 };
+      const mark: ElectronMarkObject = { id: "tiny-mark", type: "electron-mark", markKind,
+        x: center.x - 1, y: center.y - 1, width: 2, height: 2, rotation: 0, style: {},
+        ...(markKind === "charge" ? { charge: 1 } : {}),
+        anchor: { kind: "point", point: center }, atomAssociation: "explicit" };
+      const drawing = { ...base, pages: [{ ...base.pages[0], objects: [molecule, mark] }],
+        selection: { ...base.selection, objectIds: [] } };
+      await mount(drawing);
+      const beforeSvg = exportDocumentToSvg(snapshot()).contents;
+      const catcher = () => container.querySelector<SVGRectElement>(`[data-electron-mark-hit-target="${mark.id}"]`)!;
+      expect(catcher()).not.toBeNull();
+      expect(Number(catcher().getAttribute("width"))).toBe(36);
+      expect(Number(catcher().getAttribute("height"))).toBe(36);
+      // Beyond the previous 24px target and far from the painted dot, but nearer the mark.
+      const start = { x: center.x, y: center.y - 14 };
+      expect(start.y).toBeGreaterThan(Number(catcher().getAttribute("y")));
+      await act(async () => pointer(catcher(), "pointerdown", start));
+      await act(async () => pointer(catcher(), "pointerup", start));
+      expect(snapshot().selection.objectIds).toEqual([mark.id]);
+      expect(dropMark(snapshot())).toEqual(mark);
+      expect(exportDocumentToSvg(snapshot()).contents).toBe(beforeSvg);
+      const end = { x: start.x + 60, y: start.y - 40 };
+      await act(async () => pointer(catcher(), "pointerdown", start));
+      await move(catcher(), end);
+      await act(async () => pointer(catcher(), "pointerup", end));
+      expect(dropMark(snapshot())).toMatchObject({ x: mark.x + 60, y: mark.y - 40, width: 2, height: 2 });
+      expect(dropMolecule(snapshot())).toEqual(molecule);
+      await command("edit.undo");
+      expect(dropMark(snapshot())).toEqual(mark);
+      expect(exportDocumentToSvg(snapshot()).contents).toBe(beforeSvg);
+      // The enlarged catcher is above this part; send it the event as the browser would.
+      // Both a nearby point and the exact atom/bond must still select that molecule part.
+      let pressTime = Date.now();
+      const clock = vi.spyOn(Date, "now");
+      for (const point of [{ x: partPoint.x, y: partPoint.y - 4 }, partPoint]) {
+        clock.mockReturnValue(pressTime += 1000); // Independent clicks, not a double-click drill-in.
+        await act(async () => pointer(catcher(), "pointerdown", point));
+        await act(async () => pointer(moleculeTarget(), "pointerup", point));
+        expect(snapshot().selection.objectIds).not.toContain(mark.id);
+        expect(window.__CHEMDRAFT_AGENT__!.snapshot().selectedNativeMoleculePart).toMatchObject({
+          objectId: molecule.id, kind: part, ...(part === "atom" ? { atomId: a.id } : { bondId: molecule.bonds[0].id })
+        });
+        expect(dropMark(snapshot())).toEqual(mark);
+      }
+      function moleculeTarget() { return container.querySelector(`[data-object-id="${molecule.id}"]`)!; }
+    });
 
   it.each([
     ["tool.plus", "Add Charge"], ["tool.minus", "Add Charge"],

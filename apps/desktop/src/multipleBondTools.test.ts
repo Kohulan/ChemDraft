@@ -1,5 +1,12 @@
 import { nativeAtomValidationState } from "@chemdraft/document-workflow-core";
 import { describe, expect, it } from "vitest";
+import { Molecule } from "openchemlib";
+import { exportDocumentToCdxml, openChemDraftPayload } from "@chemdraft/cdx-compat";
+import { moleculeToMolfileV2000, type MoleculeObject } from "@chemdraft/chem-core";
+import { parseMolfileGraph } from "@chemdraft/clipboard-adapter";
+import { perceiveDoubleBondStereoFromMolfile } from "@chemdraft/ocl-adapter";
+import { bondDrawingToolCommandId } from "./commands";
+import { applyMoleculeBondStereo, nativeBondStereoForToolCommand } from "./documentWorkflow";
 import {
   applyFreeformSingleBondToolAtPoint, applyNativeMoleculeBondOrderTarget, applyNativeMoleculeBondOrderValueTarget, applySingleBondToolAtPoint,
   createPhase4Document, getSelectedMolecule, nativeBondOrderForToolCommand, nativeBondOrderTargetRefusal,
@@ -12,6 +19,69 @@ function bondTarget(
 ): NativeBondOrderTarget {
   return { objectId, kind: "bond", bondId: bond.id, fromAtomId: bond.fromAtomId, toAtomId: bond.toAtomId, distanceToPointer: 0 };
 }
+
+describe("either double-bond drawing", () => {
+  const id = bondDrawingToolCommandId("double", "either");
+  const options = { bondOrder: nativeBondOrderForToolCommand(id), bondStereo: nativeBondStereoForToolCommand(id) };
+  const canonical = (molecule: MoleculeObject) => Molecule.fromMolfile(moleculeToMolfileV2000(molecule, { fromDocFrame: true, kekuleBondOrders: new Map() }).contents).toIsomericSmiles();
+
+  it("inserts an explicit either double bond with no E/Z, and reopens it", () => {
+    expect(options).toEqual({ bondOrder: "double", bondStereo: "either" });
+    expect(nativeBondStyleForToolCommand(id)).toBe("solid");
+    const document = applySingleBondToolAtPoint(createPhase4Document(), { x: 300, y: 300 }, options);
+    const molecule = getSelectedMolecule(document)!;
+    expect(molecule.bonds).toHaveLength(1);
+    expect(molecule.bonds[0]).toMatchObject({ order: "double", stereo: "either" });
+    expect(molecule.structureFormat).toBe("molfile-v2000");
+    expect(parseMolfileGraph(molecule.structure).bonds[0]).toMatchObject({ order: "double", stereo: "either" });
+    expect(canonical(molecule)).toBe(Molecule.fromSmiles("C=C").toIsomericSmiles());
+    expect(openNativeDocument(createNativeSavePayload(document).contents).document).toEqual(document);
+  });
+
+  it.each(["click", "drag"])("grows an either bond by %s and exchanges substituted alkene without E/Z", mode => {
+    const seed = applySingleBondToolAtPoint(createPhase4Document(), { x: 300, y: 300 });
+    const original = getSelectedMolecule(seed)!;
+    const source = original.atoms[1];
+    const drawn = mode === "click" ? applySingleBondToolAtPoint(seed, source, options)
+      : applyFreeformSingleBondToolAtPoint(seed, original.id, source.id, { x: source.x + 40, y: source.y }, options);
+    const grown = getSelectedMolecule(drawn)!;
+    expect(grown.bonds[0]).toEqual(original.bonds[0]);
+    expect(grown.bonds[1]).toMatchObject({ order: "double", stereo: "either" });
+    const tail = grown.atoms.at(-1)!;
+    const document = applySingleBondToolAtPoint(drawn, tail);
+    const molecule = getSelectedMolecule(document)!;
+    expect(molecule.atoms).toHaveLength(4);
+    expect(molecule.bonds).toHaveLength(3);
+    expect(molecule.chemistry?.formula).toBe("C4H8");
+    expect(canonical(molecule)).toBe(Molecule.fromSmiles("CC=CC").toIsomericSmiles());
+    expect(canonical(molecule)).not.toMatch(/[\\/]/);
+    // Match the representation produced by #229's selected-bond command.
+    const geometry = applyNativeMoleculeBondOrderValueTarget(document, bondTarget(molecule.id, molecule.bonds[1]), "double");
+    const viaCommand = applyMoleculeBondStereo(geometry, [bondTarget(molecule.id, molecule.bonds[1])], "either", perceiveDoubleBondStereoFromMolfile);
+    expect(getSelectedMolecule(viaCommand)!.bonds).toEqual(molecule.bonds);
+    expect(openNativeDocument(createNativeSavePayload(document).contents).document).toEqual(document);
+    for (const embedNativePayload of [true, false]) {
+      const exported = exportDocumentToCdxml(document, { embedNativePayload });
+      expect(exported.contents).toContain('Display="Wavy"');
+      const reopened = openChemDraftPayload(exported.contents).document!;
+      const result = reopened.pages[0].objects.find((object): object is MoleculeObject => object.type === "molecule")!;
+      expect(result.atoms).toHaveLength(4);
+      expect(result.bonds).toHaveLength(3);
+      expect(result.bonds.filter(bond => bond.stereo === "either")).toHaveLength(1);
+      expect(canonical(result)).toBe(canonical(molecule));
+    }
+  });
+
+  it("applies either to an existing double bond and ordinary Double clears it", () => {
+    const seed = applySingleBondToolAtPoint(createPhase4Document(), { x: 300, y: 300 }, { bondOrder: "double" });
+    const molecule = getSelectedMolecule(seed)!;
+    const target = bondTarget(molecule.id, molecule.bonds[0]);
+    const either = applyNativeMoleculeBondOrderValueTarget(seed, target, "double", "either");
+    expect(getSelectedMolecule(either)!.bonds[0].stereo).toBe("either");
+    expect(applyNativeMoleculeBondOrderValueTarget(either, target, "double", "either")).toBe(either);
+    expect(getSelectedMolecule(applyNativeMoleculeBondOrderValueTarget(either, target, "double"))!.bonds[0]).not.toHaveProperty("stereo");
+  });
+});
 
 /** A bond whose second atom takes three more single substituents, so it ends with four bonds (full carbon). */
 function branchedSeed() {

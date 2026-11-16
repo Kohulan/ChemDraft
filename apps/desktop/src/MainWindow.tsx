@@ -1,3 +1,4 @@
+import { electronMarkInteractionFrames } from "./electronMarkInteraction";
 import { installPopoverEscapeRouting } from "./window-manager/popoverEscape";
 import { BracketLabelEditor, type BracketLabelEditorHandle } from "./BracketLabelEditor";
 import { createBracketCommands, selectedBracketPair, toggleBracketRepeatUnit, setBracketRepeatLabel, bracketRepeatUnitStatus } from "./bracketCommands";
@@ -24,6 +25,7 @@ import { clearCustomSwatchSlot, customSwatchCommandId, loadCustomSwatches, parse
 import { persistCustomSwatches, useCustomSwatches } from "./toolbars/customSwatchSettings";
 import { createCustomSwatchActions, textCustomColorCommandId } from "./commands";
 import { clipboardWriteNotices, pasteTableIntoDocument, readTableClipboardPaste, stripClipboardPictures, tableClipboardPasteDecision, tableClipboardResultOutranksPicture, tableSelectionClipboardItems, type TableClipboardPasteDecision } from "./tableClipboardWiring";
+import { selectionClipboardImageItems } from "./selectionClipboard";
 import type { ClipboardReadPayload, ClipboardTableResult } from "@chemdraft/clipboard-adapter";
 import type { InsertTableOptions } from "./dialogs/dialogProtocol";
 import { paletteFocusDiagnostic } from "./paletteFocusDiagnostic";
@@ -275,6 +277,7 @@ import {
   nativeTextScriptFontScale,
   measureNativeTextSpanLineWidth,
   planTextObjectPlacement,
+  textContentFrame,
   planTextObjectEditorPlacement,
   type NativeTextCssMetrics,
   textObjectSpanLines,
@@ -641,6 +644,7 @@ import {
   documentObjectProjectedPlaneTilt,
   nativeBondStyleForToolCommand,
   nativeBondOrderForToolCommand,
+  nativeBondStereoForToolCommand,
   nativeBondOrderTargetRefusal,
   nativeChargeMarkMaxMagnitude,
   nativeChargeStackRefusal,
@@ -1080,6 +1084,7 @@ type NativeBondDragState = {
   atomId: string;
   bondStyle?: NativeBondDisplayStyle;
   bondOrder?: NativeBondOrderValue;
+  bondStereo?: "either";
   startPoint: ClientPoint;
   latestPoint: ClientPoint;
   dragging: boolean;
@@ -1097,6 +1102,7 @@ type NativePlacementDragState = {
   latestPoint: ClientPoint;
   bondStyle?: NativeBondDisplayStyle;
   bondOrder?: NativeBondOrderValue;
+  bondStereo?: "either";
   templateId?: NativeMoleculeTemplateId;
   arrowKind?: ArrowObject["arrowKind"];
   bracketKind?: BracketObject["bracketKind"];
@@ -1772,7 +1778,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.13.15.00-codex";
+const CURRENT_BUILD_STAMP = "11.15.14.50-codex";
 const VibeCodeGuideForm = lazy(() => import("./dialogs/VibeCodeGuideForm").then(module => ({ default: module.VibeCodeGuideForm })));
 const StructureTemplatePicker = lazy(() => import("./dialogs/StructureTemplatePicker").then(module => ({ default: module.StructureTemplatePicker })));
 /** Starts in the background for the document webview under the existing probe gate. */
@@ -3260,6 +3266,7 @@ export function MainWindow({
   );
   const activeEditorMolecule =
     selectedMolecule && selectedMolecule.id === activeEditorObjectId ? selectedMolecule : undefined;
+  const activeNativeBondStereo = nativeBondStereoForToolCommand(activeToolState.activeCommandId);
   const activeNativeBondOrder = nativeBondOrderForToolCommand(activeToolState.activeCommandId);
   const activeNativeBondToolStyle = nativeBondStyleForToolCommand(activeToolState.activeCommandId);
   const activeNativeBondDisplayStyle = activeNativeBondToolStyle && activeNativeBondToolStyle !== "solid"
@@ -7592,9 +7599,10 @@ export function MainWindow({
   }, [assignHoveredNativeDeleteTarget, commitDocumentChange]);
 
   const copySelectionToClipboard = useCallback(async (mode: "copy" | "cut") => {
-    const wholeObjectIds = [...documentRef.current.selection.objectIds];
+    const source = documentRef.current;
+    const wholeObjectIds = [...source.selection.objectIds];
     const payload = createSelectionClipboardPayload(
-      documentRef.current,
+      source,
       nativeMoleculeFragmentSelections(selectedNativeMoleculePartsRef.current)
     );
     if (!payload) {
@@ -7602,19 +7610,30 @@ export function MainWindow({
       return;
     }
 
-    const tableCopy = tableSelectionClipboardItems(payload);
-    // A table's HTML, RTF and text are optional; keep the writer's result so a dropped one is shown.
-    const result = await writeClipboardItems(tableCopy?.items ?? selectionClipboardTextItems(payload));
+    let copy: { items: Parameters<typeof writeClipboardItems>[0]; warnings: string[] } | undefined
+      = tableSelectionClipboardItems(payload);
+    const hasDrawing = payload.objects.some(object => !["text", "annotation", "group"].includes(object.type));
+    if (!copy && hasDrawing && isDesktopRuntime()) {
+      try {
+        copy = await selectionClipboardImageItems(source, payload, shortcutPlatform);
+      } catch (error) {
+        setStatus(`${mode === "copy" ? "Copy failed" : "Cut canceled"}: ${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
+    }
+    // Required PNG prevents an ordinary drawing copy from silently succeeding with only JSON.
+    const result = await writeClipboardItems(copy?.items ?? selectionClipboardTextItems(payload));
     // As writeClipboardTextItems: a browser accepts a plain-text fallback when richer formats fail.
     const didWrite = result.ok || (!isDesktopRuntime() && result.written.includes("text/plain"));
     if (!didWrite) {
-      setStatus(mode === "copy" ? "Copy failed: clipboard unavailable" : "Cut canceled: clipboard unavailable");
+      setStatus([mode === "copy" ? "Copy failed: clipboard unavailable" : "Cut canceled: clipboard unavailable",
+        ...clipboardWriteNotices(result)].join("; "));
       return;
     }
 
     selectionClipboardPayloadRef.current = payload;
     selectionClipboardPasteStateRef.current = initialSelectionClipboardPasteState(payload, mode);
-    const notices = [...(payload.warnings ?? []), ...(tableCopy?.warnings ?? []), ...clipboardWriteNotices(result)];
+    const notices = [...(payload.warnings ?? []), ...(copy?.warnings ?? []), ...clipboardWriteNotices(result)];
 
     if (mode === "cut") {
       deleteSelectionAfterClipboardCut(payload, wholeObjectIds);
@@ -7623,7 +7642,7 @@ export function MainWindow({
     }
 
     setStatus(["Copied ChemDraft selection", ...notices].join("; "));
-  }, [deleteSelectionAfterClipboardCut]);
+  }, [deleteSelectionAfterClipboardCut, shortcutPlatform]);
 
   // Table text is private until edit completion. Copy As and flushes include its rich-text draft
   // without touching the working document or history. This table-only snapshot leaves chemistry
@@ -7654,6 +7673,10 @@ export function MainWindow({
   // document, and a relaunch never reopens changed chemistry. The edit itself stays open. Reads
   // refs only, including private table and repeat-label drafts.
   const documentForFlush = useCallback((): ChemDraftDocument => {
+    // Resizing replaces the live page for preview, but only pointerup commits it.
+    // A Save/autosave/export during the held gesture must match what Escape restores.
+    const resize = objectResizeDragRef.current;
+    if (resize) return resize.startDocument;
     let current = documentWithTableDraft();
     const bracket = bracketLabelEditRef.current;
     const label = bracketLabelEditorRef.current?.draft();
@@ -15386,12 +15409,14 @@ export function MainWindow({
     sourceDocument: ChemDraftDocument,
     point: ClientPoint,
     bondStyle?: NativeBondDisplayStyle,
-    bondOrder: NativeBondOrderValue = "single"
+    bondOrder: NativeBondOrderValue = "single",
+    bondStereo?: "either"
   ) => {
     let refusal: string | undefined;
     const { document: nextDocument, refusal: sproutRefusal } = nativeSingleBondToolAtPoint(sourceDocument, point, {
       bondStyle,
       bondOrder,
+      bondStereo,
       onRefusal: reason => { refusal = reason; }
     });
     if (sproutRefusal) {
@@ -15453,7 +15478,7 @@ export function MainWindow({
     event: ObjectPointerEvent,
     point: ClientPoint,
     placement:
-      | { kind: "single-bond"; bondStyle?: NativeBondDisplayStyle; bondOrder?: NativeBondOrderValue }
+      | { kind: "single-bond"; bondStyle?: NativeBondDisplayStyle; bondOrder?: NativeBondOrderValue; bondStereo?: "either" }
       | { kind: "template"; templateId: NativeMoleculeTemplateId }
       | { kind: "arrow"; arrowKind: ArrowObject["arrowKind"] }
       | { kind: "bracket"; bracketKind: BracketObject["bracketKind"] }
@@ -15474,7 +15499,7 @@ export function MainWindow({
             ? applyNativeArtLineToolDefaultAtPoint(startDocument, point, placement.commandId)
             : placement.kind === "orbital"
               ? insertNativeArtGraphicObject(startDocument, point, placement.commandId)
-              : applySingleBondToolAtPoint(startDocument, point, { bondStyle: placement.bondStyle, bondOrder: placement.bondOrder });
+              : applySingleBondToolAtPoint(startDocument, point, { bondStyle: placement.bondStyle, bondOrder: placement.bondOrder, bondStereo: placement.bondStereo });
     const objectId = placementDocument.selection.objectIds[0];
     // Anchored chains grow an existing molecule, so the placed object legitimately pre-exists.
     const growsExistingObject = placement.kind === "chain" && placement.anchor !== undefined;
@@ -15492,6 +15517,7 @@ export function MainWindow({
       latestPoint: point,
       bondStyle: placement.kind === "single-bond" ? placement.bondStyle : undefined,
       bondOrder: placement.kind === "single-bond" ? placement.bondOrder : undefined,
+      bondStereo: placement.kind === "single-bond" ? placement.bondStereo : undefined,
       templateId: placement.kind === "template" ? placement.templateId : undefined,
       arrowKind: placement.kind === "arrow" ? placement.arrowKind : undefined,
       bracketKind: placement.kind === "bracket" ? placement.bracketKind : undefined,
@@ -15624,7 +15650,8 @@ export function MainWindow({
     forceCustomLength: boolean,
     bondStyle?: NativeBondDisplayStyle,
     placementAltKey = false,
-    bondOrder: NativeBondOrderValue = "single"
+    bondOrder: NativeBondOrderValue = "single",
+    bondStereo?: "either"
   ) => {
     const previousMolecule = findDocumentObject(sourceDocument, objectId);
     let refusal: string | undefined;
@@ -15632,6 +15659,7 @@ export function MainWindow({
       forceCustomLength,
       bondStyle,
       bondOrder,
+      bondStereo,
       placementAltKey,
       onRefusal: reason => { refusal = reason; }
     });
@@ -15922,9 +15950,9 @@ export function MainWindow({
     const selectedDocument = selectDocumentObject(documentRef.current, drag.objectId);
     if (drag.dragging) {
       applyFreeformBondDocumentAtPoint(selectedDocument, drag.objectId, drag.atomId, drag.latestPoint,
-        drag.freeformUnlocked || drag.connectsForeignAtom, drag.bondStyle, drag.altKey, drag.bondOrder);
+        drag.freeformUnlocked || drag.connectsForeignAtom, drag.bondStyle, drag.altKey, drag.bondOrder, drag.bondStereo);
     } else {
-      applySingleBondDocumentAtPoint(selectedDocument, point, drag.bondStyle, drag.bondOrder);
+      applySingleBondDocumentAtPoint(selectedDocument, point, drag.bondStyle, drag.bondOrder, drag.bondStereo);
     }
     clearNativeBondDrag(event);
   }, [applyFreeformBondDocumentAtPoint, applySingleBondDocumentAtPoint, clearNativeBondDrag, pagePointFromPointerEvent]);
@@ -17190,6 +17218,7 @@ export function MainWindow({
   const resizeTextDocumentFromDrag = useCallback((drag: TextResizeState, point: ClientPoint): ChemDraftDocument => {
     const dx = point.x - drag.startPoint.x;
     const dy = point.y - drag.startPoint.y;
+    if (dx === 0 && dy === 0) return drag.startDocument;
     const frame = drag.edge === "right"
       ? {
           x: drag.startObjectX,
@@ -17368,6 +17397,7 @@ export function MainWindow({
 
     event.preventDefault();
     event.stopPropagation();
+    const startFrame = activeTextEditObjectId === objectId ? object : textSelectionFrame(object);
     textResizeRef.current = {
       pointerId: event.pointerId,
       objectId,
@@ -17375,10 +17405,10 @@ export function MainWindow({
       startDocument: documentRef.current,
       startPoint: point,
       latestPoint: point,
-      startObjectX: object.x,
-      startObjectY: object.y,
-      startObjectWidth: object.width,
-      startObjectHeight: object.height
+      startObjectX: startFrame.x,
+      startObjectY: startFrame.y,
+      startObjectWidth: startFrame.width,
+      startObjectHeight: startFrame.height
     };
     setActiveEditorObjectId(undefined);
     setActiveTextEditObjectId((current) => current === objectId ? current : undefined);
@@ -17388,7 +17418,7 @@ export function MainWindow({
     assignHoveredNativeDeleteTarget(undefined);
     setFreeformNativeBond(undefined);
     captureGesturePointer(pageRef.current, event.pointerId);
-  }, [assignHoveredNativeDeleteTarget, pagePointFromPointerEvent]);
+  }, [activeTextEditObjectId, assignHoveredNativeDeleteTarget, pagePointFromPointerEvent]);
 
   const groupProjectedPlaneTiltFromDrag = useCallback((
     drag: GroupTransformDragState,
@@ -17863,8 +17893,8 @@ export function MainWindow({
     if (activeNativeBondToolStyle) {
       event.preventDefault();
       event.stopPropagation();
-      if (!startNativePlacementDrag(event, point, { kind: "single-bond", bondStyle: activeNativeBondDisplayStyle, bondOrder: activeNativeBondOrder })) {
-        applySingleBondDocumentAtPoint(document, point, activeNativeBondDisplayStyle, activeNativeBondOrder);
+      if (!startNativePlacementDrag(event, point, { kind: "single-bond", bondStyle: activeNativeBondDisplayStyle, bondOrder: activeNativeBondOrder, bondStereo: activeNativeBondStereo })) {
+        applySingleBondDocumentAtPoint(document, point, activeNativeBondDisplayStyle, activeNativeBondOrder, activeNativeBondStereo);
       }
     }
   }, [
@@ -17873,6 +17903,7 @@ export function MainWindow({
     startMechanismArrowDrag,
     activeNativeBondDisplayStyle,
     activeNativeBondOrder,
+    activeNativeBondStereo,
     activeNativeBondToolStyle,
     activeNativeTemplateId,
     activeNativeArtTool,
@@ -18947,20 +18978,26 @@ export function MainWindow({
     // browser happened to deliver the event to. A molecule's rectangular wrapper otherwise
     // swallows a press meant for a molecule beneath it (the rotaxane-overlap bug: hover
     // highlights the lower atom in red but the press selects nothing). This mirrors the hover
-    // hit path so click and hover can never disagree. We only re-target among molecules — a
-    // press the DOM delivered to a non-molecule object (text, charge mark) is never hijacked —
-    // and we move pointer capture to the resolved molecule's wrapper so every drag/up handler
-    // (all keyed by objectId) stays consistent with the re-targeted object.
+    // hit path. An electron mark's transparent grab area also yields to a nearer atom/bond.
+    // Move pointer capture to the resolved molecule's wrapper so every drag/up handler
+    // (all keyed by objectId) stays consistent with the re-targeted object. Painted mark
+    // ink and other non-molecule objects keep their own pointer routing.
     let captureElement: Element = event.currentTarget;
     const pressedObject = findDocumentObject(document, objectId);
-    if (point && pressedObject?.type === "molecule" && isNativeMoleculeGraph(pressedObject)) {
+    const electronGrabArea = pressedObject?.type === "electron-mark" && event.target instanceof Element &&
+      event.target.closest("[data-electron-mark-hit-target]")?.getAttribute("data-electron-mark-hit-target") === objectId;
+    if (point && (pressedObject?.type === "molecule" && isNativeMoleculeGraph(pressedObject) || electronGrabArea)) {
       const resolved = nativeMoleculeCanvasHoverTarget(
         document,
         point,
         event.target,
         hitToleranceForScale(viewportRef.current.scale)
       );
-      if (resolved && resolved.objectId !== objectId) {
+      const markDistance = pressedObject?.type === "electron-mark"
+        ? Math.hypot(point.x - (pressedObject.x + pressedObject.width / 2),
+          point.y - (pressedObject.y + pressedObject.height / 2))
+        : Infinity;
+      if (resolved && resolved.distanceToPointer < markDistance && resolved.objectId !== objectId) {
         objectId = resolved.objectId;
         const resolvedWrapper = pageRef.current?.querySelector(`[data-object-id="${CSS.escape(objectId)}"]`);
         if (resolvedWrapper) {
@@ -19739,7 +19776,7 @@ export function MainWindow({
       event.stopPropagation();
       const target = { objectId, ...nativeMoleculeHit };
       const selectedDocument = selectDocumentObject(document, objectId);
-      const nextDocument = applyNativeMoleculeBondOrderValueTarget(selectedDocument, target, activeNativeBondOrder);
+      const nextDocument = applyNativeMoleculeBondOrderValueTarget(selectedDocument, target, activeNativeBondOrder, activeNativeBondStereo);
       if (nextDocument === selectedDocument) {
         setStatus(nativeBondOrderTargetRefusal(selectedDocument, target, activeNativeBondOrder) ?? "Bond order not changed");
         return;
@@ -19751,7 +19788,7 @@ export function MainWindow({
       setHoveredNativeAtom(undefined);
       assignHoveredNativeDeleteTarget(undefined);
       setFreeformNativeBond(undefined);
-      setStatus(`Set bond to ${activeNativeBondOrder}`);
+      setStatus(activeNativeBondStereo ? "Set double bond to E/Z unspecified" : `Set bond to ${activeNativeBondOrder}`);
       return;
     }
 
@@ -19784,7 +19821,7 @@ export function MainWindow({
       // click: Alt/Option can still aim it toward open room. The release decides click vs drag.
       const dragAtomId = preview?.atomId ?? nativeBondDragSourceAtomId(object, point);
       if (!dragAtomId) {
-        applySingleBondDocumentAtPoint(selectDocumentObject(document, objectId), point, activeNativeBondDisplayStyle, activeNativeBondOrder);
+        applySingleBondDocumentAtPoint(selectDocumentObject(document, objectId), point, activeNativeBondDisplayStyle, activeNativeBondOrder, activeNativeBondStereo);
         return;
       }
 
@@ -19794,6 +19831,7 @@ export function MainWindow({
         atomId: dragAtomId,
         bondStyle: activeNativeBondDisplayStyle,
         bondOrder: activeNativeBondOrder,
+        bondStereo: activeNativeBondStereo,
         startPoint: point,
         latestPoint: point,
         dragging: false,
@@ -19859,6 +19897,7 @@ export function MainWindow({
     activeNativeArtTool,
     activeNativeBondDisplayStyle,
     activeNativeBondOrder,
+    activeNativeBondStereo,
     activeNativeBondToolStyle,
     activeNativeTemplateId,
     addChargeToHoveredNativeAtom,
@@ -21931,7 +21970,7 @@ export function MainWindow({
       canvasRegionRef.current?.focus({ preventScroll: true });
       void focusCurrentWindowAndWebview({ onlyIfAppActive: true }).catch(() => undefined);
     }
-  });
+  }, shortcutPlatform);
 
   // Handlers every object view receives. Most of them close over the document, so their identities
   // change on every edit, which forced all of a page's object views to re-render: 5,000 molecules
@@ -22537,6 +22576,7 @@ export function MainWindow({
                 ) : null}
                 <div className="page-object-stack" data-page-object-stack="true">
                 <PageSvgSurface
+                  pageScale={viewport.scale}
                   directElectronMarkEditing={directElectronMarkEditing}
                   {...objectViewHandlers}
                   ariaLabel={document.title}
@@ -22760,9 +22800,9 @@ export function MainWindow({
                       interactionLayer={interactionLayer}
                       pageHeight={activePage.height}
                       pageWidth={activePage.width}
-                      // Text editor allowance and the selected corner-radius handle use
+                      // Text, electron-mark targets and the selected corner-radius handle use
                       // screen-sized margins. Other object views stay memoized on zoom.
-                      pageScale={(object.type === "text" && activeTextEditObjectId === object.id) ||
+                      pageScale={object.type === "electron-mark" || (object.type === "text" && activeTextEditObjectId === object.id) ||
                         (object.type === "graphic" && selected && !inGroupSelection &&
                           !nativeArtToolIsOrbital(activeToolState.activeCommandId) &&
                           object.graphicKind === "rect")
@@ -28562,6 +28602,7 @@ function PageInteractionPortal({ target, children }: { target: HTMLDivElement | 
 const PageSvgSurface = memo(PageSvgSurfaceContent);
 
 function PageSvgSurfaceContent({
+  pageScale,
   directElectronMarkEditing = false,
   ariaLabel,
   pageHeight,
@@ -28575,6 +28616,7 @@ function PageSvgSurfaceContent({
   editingTableCell,
   ...handlers
 }: {
+  pageScale: number;
   directElectronMarkEditing?: boolean;
   ariaLabel: string;
   pageHeight: number;
@@ -28672,8 +28714,8 @@ function PageSvgSurfaceContent({
                     </svg>
                   ) : (
                     <>
-                      {object.type === "table" || object.type === "bracket" || object.type === "reaction-arrow" || (directElectronMarkEditing && object.type === "electron-mark") ? (
-                        <rect {...(object.type === "electron-mark" ? electronMarkHitCatcherAttributes(object) : {
+                      {object.type === "table" || object.type === "bracket" || object.type === "reaction-arrow" || object.type === "electron-mark" ? (
+                        <rect {...(object.type === "electron-mark" ? { ...electronMarkHitCatcherAttributes(object), ...electronMarkInteractionFrames(object, pageScale).move } : {
                           x: object.x, y: object.y,
                           width: tableLayout?.width ?? object.width,
                           height: tableLayout?.height ?? object.height,
@@ -29307,7 +29349,8 @@ function DocumentObjectViewContent({
   const artObjectProjection = documentObjectSupportsArtTransform(object, directElectronMarkEditing)
     ? documentObjectProjectedPlaneProjection(object)
     : undefined;
-  const frameBounds = interactionBounds ?? object;
+  const textFrame = object.type === "text" && !editingText ? textSelectionFrame(object) : undefined;
+  const frameBounds = interactionBounds ?? textFrame ?? object;
   const mechanismRotationOrigin = object.type === "mechanism-arrow"
     ? objectTransformPreview && objectTransformPreview.mode !== "move"
       ? { x: objectTransformPreview.origin.x - frameBounds.x, y: objectTransformPreview.origin.y - frameBounds.y }
@@ -29322,7 +29365,11 @@ function DocumentObjectViewContent({
     transform: documentObjectOuterCssTransform(object, artObjectProjection, objectTransformPreview),
     transformOrigin: mechanismRotationOrigin
       ? `${pageScaledCssPx(mechanismRotationOrigin.x)} ${pageScaledCssPx(mechanismRotationOrigin.y)}`
-      : documentObjectOuterCssTransformOrigin(object, objectTransformPreview)
+      : textFrame && textFrame !== object
+        ? objectTransformPreview && objectTransformPreview.mode !== "move"
+          ? objectTransformPreviewCssOrigin(frameBounds, objectTransformPreview)
+          : `${pageScaledCssPx(object.x + object.width / 2 - frameBounds.x)} ${pageScaledCssPx(object.y + object.height / 2 - frameBounds.y)}`
+        : documentObjectOuterCssTransformOrigin(object, objectTransformPreview)
   } as CSSProperties;
   // The positioned copy carries only edit/preview chrome. Its own z-index is bounded
   // inside the page's interaction layer, independent of the object's paint index.
@@ -29348,7 +29395,7 @@ function DocumentObjectViewContent({
     </div>, interactionLayer
   ) : <>{children}</>;
   const artObjectTransformFrameStyle = documentObjectSupportsArtTransform(object, directElectronMarkEditing)
-    ? documentObjectArtTransformFrameStyle(object, artObjectProjection, objectTransformPreview)
+    ? documentObjectArtTransformFrameStyle(object, artObjectProjection, objectTransformPreview, pageScale)
     : undefined;
   const graphicPathEditPoints = object.type === "graphic" ? nativeGraphicPathEditPoints(object) : undefined;
   const graphicPathNodeEditPoints = object.type === "graphic" ? nativeGraphicPathNodeEditPoints(object) : undefined;
@@ -29551,6 +29598,22 @@ function DocumentObjectViewContent({
                 cy={atom.y - object.y}
                 key={`selection-blob-atom-${atom.id}`}
                 r="8.8"
+              />
+          ))}
+          {/* Atom circles cannot cover labels extending away from the atom (H3N, group
+              labels, or a manually offset label). Use the renderer's shared label plan. */}
+          {[...atomLabelPlanByAtomId.values()]
+            .filter((plan) => selectedAtomIds.has(plan.atom.id))
+            .map((plan) => (
+              <rect
+                className="native-selection-blob-atom native-selection-blob-label"
+                data-selected-atom-label-id={plan.atom.id}
+                key={`selection-blob-label-${plan.atom.id}`}
+                x={plan.anchor.x + plan.layout.bounds.x - object.x}
+                y={plan.anchor.y + plan.layout.bounds.y - object.y}
+                width={plan.layout.bounds.width}
+                height={plan.layout.bounds.height}
+                rx="2"
               />
           ))}
         </g>
@@ -32026,6 +32089,15 @@ function documentObjectSupportsArtTransform(object: DocumentObject, directElectr
   return object.type === "graphic" || object.type === "bracket" || object.type === "reaction-arrow" || (directElectronMarkEditing && object.type === "electron-mark");
 }
 
+function textSelectionFrame(object: TextObject) {
+  if (object.style.textBoxSizingMode === "fixed-width" || object.style.textBoxSizingMode === "fixed-size" ||
+      object.arrowAttachment?.kind === "conditions" || object.style.reactionPlus === true) return object;
+  const frame = textContentFrame(object);
+  if (frame.x === object.x && frame.y === object.y && frame.width === object.width && frame.height === object.height) return object;
+  // Round expanded edges outward to accommodate fractional font descent.
+  return { ...frame, width: Math.ceil(frame.width), height: Math.ceil(frame.height) };
+}
+
 function documentObjectOuterCssTransform(
   object: DocumentObject,
   projection: DocumentObjectProjection | undefined,
@@ -32156,8 +32228,14 @@ function documentObjectProjectedPlaneProjection(object: DocumentObject): Documen
 function documentObjectArtTransformFrameStyle(
   object: DocumentObject,
   projection: DocumentObjectProjection | undefined,
-  preview: ObjectTransformPreviewState | undefined
+  preview: ObjectTransformPreviewState | undefined,
+  pageScale = 1
 ): CSSProperties | undefined {
+  if (object.type === "electron-mark") {
+    const frame = electronMarkInteractionFrames(object, pageScale).controls;
+    return { left: pageScaledCssPx(frame.x), top: pageScaledCssPx(frame.y),
+      width: pageScaledCssPx(frame.width), height: pageScaledCssPx(frame.height) };
+  }
   if (object.type !== "graphic") {
     return projection?.frameStyle;
   }
