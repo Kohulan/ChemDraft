@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
-    sync::{LazyLock, Mutex},
+    sync::{Arc, Condvar, LazyLock, Mutex},
     time::{Duration, Instant},
 };
 use tauri::{ipc::Channel, Manager, Runtime, WebviewUrl, WebviewWindowBuilder, WindowEvent};
@@ -13,6 +13,8 @@ const MAX_PREVIEW_BYTES: usize = 5 * 1024 * 1024;
 // Tauri 2.11.2 queues JSON >= 8192 bytes app-wide, outside receiver authentication.
 // Measure the complete delivery after JSON escaping, well below that threshold.
 const MAX_CHANNEL_BYTES: usize = 4096;
+// Matches the 320px document min-width in App.css, in logical pixels.
+const DIALOG_CONTENT_MIN_WIDTH: f64 = 320.0;
 const OVERSIZED_ERROR: &str = "Dialog operation failed; error details exceeded the delivery limit.";
 
 struct DialogKindSpec {
@@ -45,7 +47,7 @@ fn kind_spec(kind: &str) -> Result<DialogKindSpec, String> {
             title: "Atom problem",
             size: (460.0, 360.0),
             min_size: (360.0, 260.0),
-            fit_content: false,
+            fit_content: true,
             preserve_user_frame: false,
         }),
         "vibeCodeGuide" => Ok(DialogKindSpec {
@@ -110,7 +112,7 @@ fn kind_spec(kind: &str) -> Result<DialogKindSpec, String> {
             title: "Reaction conditions",
             size: (560.0, 620.0),
             min_size: (380.0, 420.0),
-            fit_content: false,
+            fit_content: true,
             preserve_user_frame: false,
         }),
         "export" => Ok(DialogKindSpec {
@@ -326,9 +328,11 @@ impl MeasuredContent {
             .max(min_height)
     }
     fn logical_width(self) -> Option<f64> {
-        self.fit
-            .content_width
-            .map(|width| (width * self.fit.pixel_ratio / self.scale_at_ready).ceil())
+        self.fit.content_width.map(|width| {
+            (width * self.fit.pixel_ratio / self.scale_at_ready)
+                .ceil()
+                .max(DIALOG_CONTENT_MIN_WIDTH)
+        })
     }
 }
 #[derive(Deserialize)]
@@ -1540,10 +1544,23 @@ fn update_snapshot(session: &mut Session, message: &Message) {
 }
 fn releases_action_reservation(message: &Message) -> bool {
     (message.dialog_kind == "atomProblem" && message.data["status"] == "applied")
+        // Export keeps its window open for another explicit export after a successful write.
+        || (message.dialog_kind == "export" && message.data["status"] == "exported")
         || matches!(
             message.data["status"].as_str(),
             Some("error" | "picked" | "cancelled" | "inserted")
         )
+}
+
+fn complete_action(session: &mut Session, message: &Message) {
+    if releases_action_reservation(message)
+        && session.terminal_request.as_ref() == Some(&message.request_id)
+    {
+        session.terminal_request = None;
+    }
+    session
+        .receipts
+        .insert(message.request_id.clone(), message.clone());
 }
 
 fn register(
@@ -1902,14 +1919,7 @@ pub(crate) fn dialog_publish(
         if let Some(previous) = session.receipts.get(&message.request_id) {
             return send_host(session, previous);
         }
-        if releases_action_reservation(&message)
-            && session.terminal_request.as_ref() == Some(&message.request_id)
-        {
-            session.terminal_request = None;
-        }
-        session
-            .receipts
-            .insert(message.request_id.clone(), message.clone());
+        complete_action(session, &message);
     } else if message.message_type == "snapshot" {
         update_snapshot(session, &message);
     }
@@ -2154,6 +2164,7 @@ fn show_on_main<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), Stri
     })?;
     let preferences = window.label() == super::PREFERENCES_WINDOW_LABEL;
     if preferences {
+        super::clear_document_key_after_unhide_for_preferences();
         if let Some(state) = REGISTRY
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -2182,9 +2193,82 @@ fn show_on_main<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), Stri
         recover_preferences_frame(window)?;
     }
     configure_on_main(window)?;
+    if preferences {
+        activate_preferences_application_on_main()?;
+    }
     window.set_focus().map_err(|e| e.to_string())?;
-    bring_to_front_on_main(window, true)
+    bring_to_front_on_main(window, true)?;
+    if preferences {
+        defer_preferences_raise_on_main(window);
+    }
+    Ok(())
 }
+
+#[cfg(target_os = "macos")]
+fn activate_preferences_application_on_main() -> Result<(), String> {
+    // A menu action can reveal Preferences while Finder is active. Ordering a window
+    // alone does not activate its application; activate before requesting keyboard focus.
+    let marker =
+        objc2::MainThreadMarker::new().ok_or("Preferences must open on the main thread")?;
+    #[allow(deprecated)] // Supports activation on the older macOS versions we ship for.
+    objc2_app_kit::NSApplication::sharedApplication(marker).activateIgnoringOtherApps(true);
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn activate_preferences_application_on_main() -> Result<(), String> {
+    // Other platforms retain the existing show/set_focus path.
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn should_raise_preferences_after_activation(
+    quitting: bool,
+    preferences_visible: Option<bool>,
+    owner_visible: bool,
+    utilities_suspended: bool,
+) -> bool {
+    !quitting && preferences_visible == Some(true) && owner_visible && !utilities_suspended
+}
+
+#[cfg(target_os = "macos")]
+fn defer_preferences_raise_on_main<R: Runtime>(window: &tauri::WebviewWindow<R>) {
+    let app = window.app_handle().clone();
+    let raise = block2::RcBlock::new(move || {
+        // Resolve live windows at execution time; never retain a native pointer across turns.
+        let preferences = app.get_webview_window(super::PREFERENCES_WINDOW_LABEL);
+        let owner_visible = app
+            .get_webview_window(super::MAIN_WINDOW_LABEL)
+            .is_some_and(|owner| {
+                owner.is_visible().unwrap_or(false) && !owner.is_minimized().unwrap_or(true)
+            });
+        if !should_raise_preferences_after_activation(
+            super::quit_in_progress(),
+            preferences
+                .as_ref()
+                .map(|window| window.is_visible().unwrap_or(false)),
+            owner_visible,
+            super::utility_windows_suspended(),
+        ) {
+            return;
+        }
+        if let Some(window) = preferences {
+            if let Err(error) = bring_to_front_on_main(&window, true) {
+                eprintln!("ChemDraft: could not raise Preferences after activation: {error}");
+            }
+        }
+    });
+    // Unlike Tauri's main-thread runner, adding an operation never invokes this block inline.
+    // Foundation's main queue runs it after the current activation/show transaction returns.
+    // SAFETY: the block captures only a Send AppHandle; AppKit access stays on the main queue.
+    unsafe { objc2_foundation::NSOperationQueue::mainQueue().addOperationWithBlock(&raise) };
+}
+
+#[cfg(not(target_os = "macos"))]
+fn defer_preferences_raise_on_main<R: Runtime>(_window: &tauri::WebviewWindow<R>) {
+    // Windows keeps the immediate set_focus and owned-window z-order handling.
+}
+
 /// Called by reveal and by the existing relative-order utility restore (already on main).
 pub(crate) fn configure_on_main<R: Runtime>(
     window: &tauri::WebviewWindow<R>,
@@ -2231,7 +2315,14 @@ fn bring_to_front_on_main<R: Runtime>(
     {
         let ptr = window.ns_window().map_err(|e| e.to_string())? as *mut objc2_app_kit::NSWindow;
         let native = unsafe { ptr.as_ref() }.ok_or("Could not access native dialog window")?;
-        native.orderFront(None);
+        // Preferences is explicitly requested by Cmd+, even when already visible behind the
+        // document. Ordering alone does not make it key; finish the reopen on AppKit's main
+        // thread with both activation and ordering. Other utilities keep their existing order.
+        if window.label() == super::PREFERENCES_WINDOW_LABEL {
+            native.makeKeyAndOrderFront(None);
+        } else {
+            native.orderFront(None);
+        }
     }
     #[cfg(windows)]
     {
@@ -2682,12 +2773,12 @@ fn remembered_client_size(saved: Option<&SavedPosition>, resizable: bool) -> Opt
         .size
         .filter(|size| valid_client_size(*size))
 }
-fn custom_color_refit_size(
+fn content_refit_size(
     fit: MeasuredContent,
     current: (f64, f64),
     user_size: Option<(f64, f64)>,
 ) -> (f64, f64) {
-    // Mode/error changes can remove content as well as add it. Keep a user's larger size,
+    // Format/mode/error changes can remove content as well as add it. Keep a user's larger size,
     // but do not turn the previous programmatic content height into a permanent floor.
     (
         current.0.max(fit.logical_width().unwrap_or(1.0)),
@@ -2935,7 +3026,12 @@ fn place_content_window_from_frame<R: Runtime>(
         .or_else(|| positions.get(kind))
         .filter(|position| valid_saved_frame(position));
     let mut client_size = dialog_client_size(&spec, content_fit, saved, current_frame);
-    if current_frame && kind == "customColor" {
+    if current_frame
+        && matches!(
+            kind,
+            "customColor" | "export" | "insertTable" | "reactionConditions"
+        )
+    {
         if let Some(fit) = content_fit {
             // A resize can still be waiting for the persistence debounce when the form reports
             // its next measurement. Consult that pending user frame before the stored one.
@@ -2949,7 +3045,7 @@ fn place_content_window_from_frame<R: Runtime>(
                 .map(|(_, position)| position.clone());
             let user_size = remembered_client_size(pending.as_ref(), true)
                 .or_else(|| remembered_client_size(positions.get(kind), true));
-            client_size = custom_color_refit_size(fit, client_size, user_size);
+            client_size = content_refit_size(fit, client_size, user_size);
         }
     }
     // A user size remains useful after its display is removed; its position does not.
@@ -3774,6 +3870,7 @@ static POSITION_WORKER: LazyLock<std::sync::mpsc::SyncSender<std::path::PathBuf>
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
             debounce_positions(receiver, Duration::from_millis(200), |path| {
+                let _pending = POSITION_WRITES.register();
                 // Serialize final close flushes with worker writes. Take the snapshot under REGISTRY,
                 // then release REGISTRY before any file reads or writes.
                 let _io = POSITION_IO.lock().unwrap_or_else(|p| p.into_inner());
@@ -3855,24 +3952,126 @@ fn persist_positions(
         .collect();
     // v1.1.1 strictly parses every top-level value as a five-field position record:
     // no size field, wrapper, version or metadata key can be added to this file.
-    let position_bytes = serde_json::to_vec(&position_only).map_err(|e| e.to_string())?;
-    let size_bytes = serde_json::to_vec(&sizes).map_err(|e| e.to_string())?;
-    let write = |path: &std::path::Path, bytes: &[u8]| -> Result<(), String> {
-        use std::io::Write;
-        std::fs::File::create(path)
-            .and_then(|mut file| file.write_all(bytes).and_then(|()| file.sync_all()))
-            .map_err(|e| format!("{}: {e}", path.display()))
-    };
+    let position_contents = serde_json::to_string(&position_only).map_err(|e| e.to_string())?;
+    let size_contents = serde_json::to_string(&sizes).map_err(|e| e.to_string())?;
+    // The quit deadline can abandon a worker. Publish each file only as a complete replacement.
     // Save sizes first. If that fails, leave the inline migration source intact for retry.
-    write(&sizes_path(path), &size_bytes)?;
-    write(path, &position_bytes)
+    super::write_file_atomic(&sizes_path(path), &size_contents)?;
+    super::write_file_atomic(path, &position_contents)
 }
 fn flush_position<R: Runtime>(app: &tauri::AppHandle<R>, session: &mut Session) {
     if let Some((_, saved)) = session.pending_move.take() {
-        let _io = POSITION_IO.lock().unwrap_or_else(|p| p.into_inner());
-        if let Ok(path) = saved_path(app) {
-            write_positions(&path, vec![(session.snapshot.dialog_kind.clone(), saved)]);
+        let app = app.clone();
+        let kind = session.snapshot.dialog_kind.clone();
+        persist_close_with(defer_quit_close_persistence(), move || {
+            let _io = POSITION_IO.lock().unwrap_or_else(|p| p.into_inner());
+            if let Ok(path) = saved_path(&app) {
+                write_positions(&path, vec![(kind, saved)]);
+            }
+        });
+    }
+}
+
+/// Quit callbacks on either platform must leave POSITION_IO and filesystem work to a worker.
+fn defer_quit_close_persistence() -> bool {
+    super::quit_in_progress()
+}
+
+#[derive(Default)]
+struct PositionWriteTracker {
+    pending: Mutex<usize>,
+    finished: Condvar,
+}
+
+impl PositionWriteTracker {
+    fn register(self: &Arc<Self>) -> PositionWriteGuard {
+        *self.pending.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+        PositionWriteGuard(self.clone())
+    }
+
+    fn drain(&self) {
+        let pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        drop(
+            self.finished
+                .wait_while(pending, |pending| *pending != 0)
+                .unwrap_or_else(|p| p.into_inner()),
+        );
+    }
+}
+
+struct PositionWriteGuard(Arc<PositionWriteTracker>);
+
+impl Drop for PositionWriteGuard {
+    fn drop(&mut self) {
+        *self.0.pending.lock().unwrap_or_else(|p| p.into_inner()) -= 1;
+        self.0.finished.notify_all();
+    }
+}
+
+static POSITION_WRITES: LazyLock<Arc<PositionWriteTracker>> = LazyLock::new(Default::default);
+
+/// A serial writer for layout frames. Registration precedes enqueueing so confirmation also
+/// waits for queued work; only the worker takes filesystem locks or performs disk I/O.
+#[derive(Clone)]
+pub(super) struct PositionWriteWorker {
+    sender: std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>,
+    tracker: Arc<PositionWriteTracker>,
+}
+
+impl Default for PositionWriteWorker {
+    fn default() -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send>>();
+        std::thread::spawn(move || {
+            for write in receiver {
+                write();
+            }
+        });
+        Self {
+            sender,
+            tracker: Default::default(),
         }
+    }
+}
+
+impl PositionWriteWorker {
+    pub(super) fn dispatch(&self, write: impl FnOnce() + Send + 'static) -> Result<(), String> {
+        let pending = self.tracker.register();
+        self.sender
+            .send(Box::new(move || {
+                let _pending = pending;
+                write();
+            }))
+            .map_err(|_| "The window geometry writer stopped.".to_string())
+    }
+
+    pub(super) fn drain(&self) {
+        self.tracker.drain();
+    }
+}
+
+/// Only confirmation workers wait here. The quit deadline and exit watchdog never do.
+pub(crate) fn drain_pending_position_writes() {
+    POSITION_WRITES.drain();
+}
+
+fn persist_close_with(defer: bool, persist: impl FnOnce() + Send + 'static) {
+    persist_close_tracked_with(&POSITION_WRITES, defer, persist);
+}
+
+fn persist_close_tracked_with(
+    tracker: &Arc<PositionWriteTracker>,
+    defer: bool,
+    persist: impl FnOnce() + Send + 'static,
+) {
+    // Register before dispatch so a fast session confirmation includes unscheduled writes.
+    let pending = tracker.register();
+    if defer {
+        std::thread::spawn(move || {
+            let _pending = pending;
+            persist();
+        });
+    } else {
+        persist();
     }
 }
 
@@ -3921,12 +4120,19 @@ fn flush_preferences_to(
     }
 }
 pub(crate) fn flush_preferences<R: Runtime>(app: &tauri::AppHandle<R>, close: PreferencesClose) {
-    if let Ok(path) = saved_path(app) {
-        flush_preferences_to(&REGISTRY, &path, close, || {
-            app.get_webview_window(super::PREFERENCES_WINDOW_LABEL)
-                .and_then(|window| sample_preferences_position(&window))
-        });
-    }
+    // Native reads stay on the caller's main-thread capture; path resolution and I/O move together.
+    let current = if close == PreferencesClose::Destroyed {
+        None
+    } else {
+        app.get_webview_window(super::PREFERENCES_WINDOW_LABEL)
+            .and_then(|window| sample_preferences_position(&window))
+    };
+    let app = app.clone();
+    persist_close_with(defer_quit_close_persistence(), move || {
+        if let Ok(path) = saved_path(&app) {
+            flush_preferences_to(&REGISTRY, &path, close, || current);
+        }
+    });
 }
 /// Native close/destroy settles even if the renderer crashes or never executes cleanup.
 pub(crate) fn on_window_event<R: Runtime>(window: &tauri::Window<R>, event: &WindowEvent) {
@@ -4213,6 +4419,129 @@ mod tests {
     }
 
     #[test]
+    fn quit_close_never_takes_position_io_on_the_capture_thread_and_drain_tracks_both_writes() {
+        let tracker = Arc::new(PositionWriteTracker::default());
+        let held = POSITION_IO.lock().unwrap();
+        let capture_thread = std::thread::current().id();
+        let (started, starting) = std::sync::mpsc::channel();
+        let (finished, finishing) = std::sync::mpsc::channel();
+        for _kind in ["preferences", "export"] {
+            let started = started.clone();
+            let finished = finished.clone();
+            persist_close_tracked_with(&tracker, true, move || {
+                started.send(std::thread::current().id()).unwrap();
+                let _io = POSITION_IO.lock().unwrap();
+                finished.send(()).unwrap();
+            });
+        }
+        for _ in 0..2 {
+            assert_ne!(
+                starting.recv_timeout(Duration::from_secs(2)).unwrap(),
+                capture_thread
+            );
+        }
+        assert_eq!(*tracker.pending.lock().unwrap(), 2);
+        assert!(finishing.try_recv().is_err());
+        let draining = tracker.clone();
+        let (drained, drain_done) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            draining.drain();
+            drained.send(()).unwrap();
+        });
+        assert!(drain_done.try_recv().is_err());
+        drop(held);
+        drain_done.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        assert_eq!(finishing.try_iter().count(), 2);
+    }
+
+    #[test]
+    fn ordinary_close_remains_synchronous_and_quit_publication_keeps_the_old_file_whole() {
+        let tracker = Arc::new(PositionWriteTracker::default());
+        let synchronous = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saved = synchronous.clone();
+        persist_close_tracked_with(&tracker, false, move || {
+            saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(synchronous.load(std::sync::atomic::Ordering::SeqCst));
+        for platform in ["macos", "windows"] {
+            let path = preferences_test_path(platform);
+            let expected = preferences_native_frame(platform, 1.5, false).unwrap();
+            write_positions(&path, vec![("preferences".into(), expected.clone())]);
+            let original = std::fs::read(&path).unwrap();
+            let held = POSITION_IO.lock().unwrap();
+            let worker_path = path.clone();
+            let (started, starting) = std::sync::mpsc::channel();
+            persist_close_tracked_with(&tracker, true, move || {
+                started.send(()).unwrap();
+                let _io = POSITION_IO.lock().unwrap();
+                write_positions(&worker_path, vec![("export".into(), expected)]);
+            });
+            starting.recv_timeout(Duration::from_secs(2)).unwrap();
+            // A deadline can exit here without exposing a partially overwritten frame file.
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            drop(held);
+            tracker.drain();
+            let positions = read_positions_at(&path);
+            assert_eq!(positions.len(), 2);
+            assert_eq!(
+                std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+                2
+            );
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn atom_problem_fits_short_content_at_each_monitor_scale() {
+        for scale in [1.0, 1.5, 2.0] {
+            let spec = kind_spec("atomProblem").unwrap();
+            let content = MeasuredContent::new(
+                Some(ContentFit {
+                    content_height: 180.0,
+                    content_width: None,
+                    pixel_ratio: scale,
+                }),
+                Some(scale),
+            );
+            assert_eq!(
+                dialog_client_size(&spec, content, None, false).1,
+                180.0,
+                "{scale}x"
+            );
+        }
+    }
+    #[test]
+    fn deferred_preferences_raise_requires_live_visible_windows_and_no_quit_or_suspension() {
+        for (reason, quitting, preferences_visible, owner_visible, suspended, expected) in [
+            ("ready", false, Some(true), true, false, true),
+            ("quitting", true, Some(true), true, false, false),
+            ("Preferences gone", false, None, true, false, false),
+            ("Preferences hidden", false, Some(false), true, false, false),
+            (
+                "owner hidden or gone",
+                false,
+                Some(true),
+                false,
+                false,
+                false,
+            ),
+            ("utilities suspended", false, Some(true), true, true, false),
+        ] {
+            assert_eq!(
+                super::should_raise_preferences_after_activation(
+                    quitting,
+                    preferences_visible,
+                    owner_visible,
+                    suspended,
+                ),
+                expected,
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
     fn conditions_drafts_are_typed_bounded_and_have_an_owned_dialog_kind() {
         let draft = json!({"side":"above","spans":[{"text":"K","script":"normal"},{"text":"2","script":"subscript"},{"text":"CO₃, 80 °C","script":"normal"}]});
         assert!(
@@ -4232,7 +4561,7 @@ mod tests {
         let spec = super::kind_spec("reactionConditions").unwrap();
         assert_eq!(spec.title, "Reaction conditions");
         assert!(spec.resizable);
-        assert!(!spec.fit_content);
+        assert!(spec.fit_content);
         assert!(super::is_dialog_label("dialog-main-reactionConditions-1"));
         assert!(include_str!("../capabilities/dialog-host.json")
             .contains("dialog-main-reactionConditions-*"));
@@ -5372,8 +5701,17 @@ mod tests {
         assert!(!reserve_action(session, &action).unwrap());
         action.request_id = "second".into();
         assert!(reserve_action(session, &action).is_err());
-        session.terminal_request = None; // An error result releases the reservation.
+        let mut receipt = snapshot();
+        receipt.message_type = "result".into();
+        receipt.data = json!({"status":"error","error":"Try again"});
+        complete_action(session, &receipt);
         assert!(reserve_action(session, &action).unwrap());
+        // A successful Apply stays terminal; only an error permits a retry.
+        receipt.request_id = action.request_id.clone();
+        receipt.data = json!({"status":"applied"});
+        complete_action(session, &receipt);
+        action.request_id = "third".into();
+        assert!(reserve_action(session, &action).is_err());
     }
     #[test]
     fn template_placement_fits_oversized_frames_at_destination_dpi_and_negative_origins() {
@@ -7629,6 +7967,7 @@ mod tests {
                 {
                     for kind in [
                         "preferences",
+                        "atomProblem",
                         "vibeCodeGuide",
                         "insertTable",
                         "export",
@@ -7932,6 +8271,69 @@ mod tests {
         );
     }
     #[test]
+    fn reaction_conditions_content_fit_keeps_document_width_floor() {
+        use std::cell::RefCell;
+        let spec = kind_spec("reactionConditions").unwrap();
+        assert!(spec.fit_content);
+        for (macos, border, title_bar) in [(true, 0.0, 28.0), (false, 16.0, 40.0)] {
+            for scale in [1.0, 1.25, 1.5, 2.0] {
+                let work = WorkArea {
+                    id: "screen".into(),
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1600.0,
+                    height: 1000.0,
+                    scale,
+                };
+                let saved = SavedPosition {
+                    size: Some((250.0, 540.0)),
+                    monitor: work.id.clone(),
+                    x: 100.0,
+                    y: 100.0,
+                    offset_x: 0.0,
+                    offset_y: 0.0,
+                };
+                for (width, expected) in [(250.0, 320.0), (420.0, 420.0)] {
+                    // Measure at 2x, then place at the destination's scale on either platform.
+                    let content = MeasuredContent::new(
+                        ContentFit::from_ready(&json!({
+                            "contentWidth": width, "contentHeight": 540, "pixelRatio": 2
+                        })),
+                        Some(2.0),
+                    );
+                    let client_size = dialog_client_size(&spec, content, Some(&saved), false);
+                    assert_eq!(client_size, (expected, 540.0));
+                    let dialog = RefCell::new(SimulatedDialog {
+                        scale,
+                        client: tauri::LogicalSize::new(250.0, 540.0),
+                        minimum: tauri::LogicalSize::new(spec.min_size.0, spec.min_size.1),
+                        position: tauri::LogicalPosition::new(100.0, 100.0),
+                        decoration: tauri::LogicalSize::new(border, title_bar),
+                        queue: Vec::new(),
+                        calls: Vec::new(),
+                    });
+                    SimulatedDialog::place(
+                        &dialog,
+                        macos,
+                        DialogPlacement {
+                            position: (100.0 * scale, 100.0 * scale, scale),
+                            client_size,
+                            content,
+                            work: &work,
+                            spec: &spec,
+                            fit_content: true,
+                            template: None,
+                        },
+                    );
+                    let native = dialog.borrow();
+                    assert_eq!(native.frame().client.0, (expected * scale).ceil() as u32);
+                    assert_eq!(native.frame().client.1, (540.0 * scale).ceil() as u32);
+                    assert_eq!(native.minimum.width, expected);
+                }
+            }
+        }
+    }
+    #[test]
     fn custom_color_refits_shrink_removed_content_but_keep_user_sizes() {
         let spec = kind_spec("customColor").unwrap();
         assert_eq!(spec.size, (460.0, 320.0));
@@ -7951,7 +8353,7 @@ mod tests {
                         Some(scale),
                     )
                     .unwrap();
-                    current = custom_color_refit_size(fit, current, user_size);
+                    current = content_refit_size(fit, current, user_size);
                     assert_eq!(
                         current,
                         (
@@ -7959,6 +8361,76 @@ mod tests {
                             height.max(user_size.map_or(1.0, |size| size.1))
                         )
                     );
+                }
+            }
+        }
+    }
+    #[test]
+    fn changing_content_shrinks_native_client_and_lowers_minimum_on_both_platforms() {
+        use std::cell::RefCell;
+        for (macos, border, title_bar) in [(true, 0.0, 32.0), (false, 16.0, 40.0)] {
+            for scale in [1.0, 1.5, 2.0] {
+                for kind in ["export", "insertTable", "reactionConditions"] {
+                    let spec = kind_spec(kind).unwrap();
+                    assert!(spec.fit_content);
+                    let work = WorkArea {
+                        id: "screen".into(),
+                        x: 0.0,
+                        y: 0.0,
+                        width: 1600.0,
+                        height: 1200.0,
+                        scale,
+                    };
+                    for user_size in [None, Some((700.0_f64, 800.0_f64))] {
+                        let dialog = RefCell::new(SimulatedDialog {
+                            scale,
+                            client: tauri::LogicalSize::new(spec.size.0, spec.size.1),
+                            minimum: tauri::LogicalSize::new(spec.min_size.0, spec.min_size.1),
+                            position: tauri::LogicalPosition::new(100.0, 100.0),
+                            decoration: tauri::LogicalSize::new(border, title_bar),
+                            queue: Vec::new(),
+                            calls: Vec::new(),
+                        });
+                        // PDF/options, added error, CDXML/fewer options, PDF again. The final
+                        // minimum may be below the builder's original minimum (e.g. Export 360).
+                        for height in [620.0_f64, 660.0, 300.0, 620.0] {
+                            let fit = MeasuredContent::new(
+                                ContentFit::from_ready(&json!({
+                                    "contentHeight": height,
+                                    "contentWidth": spec.size.0,
+                                    "pixelRatio": scale
+                                })),
+                                Some(scale),
+                            )
+                            .unwrap();
+                            let current =
+                                (dialog.borrow().client.width, dialog.borrow().client.height);
+                            let client_size = content_refit_size(fit, current, user_size);
+                            dialog.borrow_mut().calls.clear();
+                            SimulatedDialog::place(
+                                &dialog,
+                                macos,
+                                DialogPlacement {
+                                    position: (100.0 * scale, 100.0 * scale, scale),
+                                    client_size,
+                                    content: Some(fit),
+                                    work: &work,
+                                    spec: &spec,
+                                    fit_content: true,
+                                    template: None,
+                                },
+                            );
+                            let native = dialog.borrow();
+                            assert_eq!(
+                                native.client.height,
+                                height.max(user_size.map_or(1.0, |s| s.1))
+                            );
+                            assert_eq!(native.minimum.height, height);
+                            // The previous PDF/error minimum must be cleared BEFORE resizing.
+                            assert_eq!(native.calls.first(), Some(&"minimum"));
+                            assert_eq!(native.calls.last(), Some(&"minimum"));
+                        }
+                    }
                 }
             }
         }
@@ -8293,6 +8765,7 @@ mod tests {
             "arrangementSpacing",
             "customColor",
             "insertTable",
+            "reactionConditions",
             "export",
             "engineInstall",
             "toolInstall",
@@ -8950,7 +9423,7 @@ mod tests {
         assert_eq!(bounded["message"]["data"]["error"], OVERSIZED_ERROR);
     }
     #[test]
-    fn completed_export_allows_only_cancel_and_replays_duplicates() {
+    fn completed_export_releases_reservation_and_replays_duplicates() {
         let mut registry = Registry::default();
         let mut m = export_snapshot();
         let (r, _) = register(&mut registry, m.clone(), false).unwrap();
@@ -8962,11 +9435,34 @@ mod tests {
         let mut receipt = m.clone();
         receipt.message_type = "result".into();
         receipt.data = json!({"status":"exported","notice":"Exported PDF"});
-        session.receipts.insert(m.request_id.clone(), receipt);
-        m.request_id = "second-press".into();
-        assert!(reserve_action(session, &m).is_err());
-        m.data = json!({"action":"cancel"});
-        assert!(reserve_action(session, &m).unwrap());
+        complete_action(session, &receipt);
+        assert!(session.terminal_request.is_none());
+        assert!(!reserve_action(session, &m).unwrap());
+        assert_eq!(session.receipts[&m.request_id].data, receipt.data);
+
+        // Each successful write permits an explicit same-format or changed-format export.
+        for (request_id, format, filename) in [
+            ("second-pdf", "pdf", "Drawing.pdf"),
+            ("third-svg", "svg", "Drawing.svg"),
+        ] {
+            let mut next = m.clone();
+            next.request_id = request_id.into();
+            next.data["options"]["format"] = json!(format);
+            next.data["options"]["filename"] = json!(filename);
+            assert!(next.validate().is_ok());
+            assert!(reserve_action(session, &next).unwrap());
+            assert!(!reserve_action(session, &m).unwrap());
+            // Replaying the previous success must not release the new pending write.
+            complete_action(session, &receipt);
+            assert_eq!(session.terminal_request.as_ref(), Some(&next.request_id));
+            let mut overlapping = next.clone();
+            overlapping.request_id = "overlapping".into();
+            assert!(reserve_action(session, &overlapping).is_err());
+            receipt.request_id = next.request_id.clone();
+            complete_action(session, &receipt);
+            assert!(session.terminal_request.is_none());
+            assert!(!reserve_action(session, &next).unwrap());
+        }
     }
     #[test]
     fn pending_export_allows_cancel_without_releasing_write_reservation() {
@@ -8982,6 +9478,11 @@ mod tests {
         cancel.data = json!({"action":"cancel"});
         assert!(reserve_action(session, &cancel).unwrap());
         assert!(!reserve_action(session, &cancel).unwrap());
+        let mut receipt = m.clone();
+        receipt.message_type = "result".into();
+        receipt.data = json!({"status":"exported"});
+        complete_action(session, &receipt);
+        assert_eq!(session.terminal_request.as_ref(), Some(&cancel.request_id));
         m.request_id = "second-export".into();
         assert!(reserve_action(session, &m).is_err());
     }

@@ -54,6 +54,9 @@ export function mainAssociationCases(w: MainWorkflow, spec: Workflow.NativeElect
   }
   const orphanPayload = { ...payload, objects: payload.objects.filter(o => o.type === "electron-mark") };
   const empty = w.createPhase4Document("Paste target");
+  // fa5c8c137 makes tool-created lone pairs explicit; a2537ded6 requires a warning
+  // instead of silently treating a missing copied atom as a geometric association.
+  const staleWarnings: string[] = [];
   const cases = [
     { name: "nearby move", before: document, patched: moveMark({ x: molecule.atoms[0].x + 4, y: molecule.atoms[0].y }) },
     { name: "onto neighbour", before: document, patched: moveMark(molecule.atoms[1]) },
@@ -71,7 +74,7 @@ export function mainAssociationCases(w: MainWorkflow, spec: Workflow.NativeElect
     { name: "paste", before: empty, patched: w.pasteSelectionClipboardPayload(empty, payload,
       { x: payload.bounds.centerX + 4, y: payload.bounds.centerY + 4 }) },
     { name: "stale paste missing atom", before: empty, patched: w.pasteSelectionClipboardPayload(empty, stalePayload,
-      { x: payload.bounds.centerX + 4, y: payload.bounds.centerY + 4 }) },
+      { x: payload.bounds.centerX + 4, y: payload.bounds.centerY + 4 }, staleWarnings), warnings: staleWarnings },
     { name: "stale paste missing molecule", before: empty, patched: w.pasteSelectionClipboardPayload(empty, orphanPayload,
       { x: payload.bounds.centerX + 4, y: payload.bounds.centerY + 4 }) }
   ];
@@ -105,7 +108,7 @@ export function mainAssociationCases(w: MainWorkflow, spec: Workflow.NativeElect
     { name: "crowded frame rotation", before: crowded.document,
       patched: w.rotateDocumentObject(crowded.document, crowded.mark.id, 73) }
   );
-  return cases;
+  return cases.map(c => ({ warnings: [] as string[], ...c }));
 }
 
 /** Compact fixed oracle: anchors before/after reconciliation, all atom fields, and H-bearing formula. */

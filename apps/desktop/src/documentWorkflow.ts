@@ -1,7 +1,8 @@
 import { bondDrawingToolCommandId } from "./bondToolCommands";
-import { nativeChargePlacementPointForAtom, nativeRadicalPlacementPointForAtom, nativeChargeMarkSizePx, nativeAtomHitRadiusPx } from "@chemdraft/layout-engine";
+import { lonePairPlacementPlanForAtom, nativeChargePlacementPointForAtom, nativeRadicalPlacementPointForAtom, nativeChargeMarkSizePx, nativeAtomHitRadiusPx } from "@chemdraft/layout-engine";
 export { nativeChargePlacementPointForAtom, nativeChargeMarkSizePx, nativeAtomHitRadiusPx } from "@chemdraft/layout-engine";
 import {
+  assertMolfileExportIdentity, type ComputeStructureIdentifiers, moleculeToInteropMolfile,
   atomProblem, readNativeDocumentContents, formulaSpansFromText,
   nativeElectronMarkAtomKey, nativeElectronMarkAssignments, isEditableNativeMoleculeGraph,
   nativeChargeValue, nativeChargeMarkCenter, nativeChargeAssociationRadiusPx, nativeChargeMarkMaxMagnitude,
@@ -5035,7 +5036,7 @@ export function createNativeMolfileMolecule(
 
   const page = firstPage(document);
   const { bondLengthPx, objectStyle } = documentDrawingDefaults(document);
-  const atoms = scaleParsedMolfileAtoms(graph, point, page, bondLengthPx).map((atom) => ({
+  const atoms = scaleParsedMolfileAtoms(graph, point, page, bondLengthPx, true, "median").map((atom) => ({
     id: atom.id,
     element: atom.element,
     ...(atom.isotope === undefined ? {} : { isotope: atom.isotope }),
@@ -7507,7 +7508,9 @@ function normalizeElectronMarkSpec(spec: NativeElectronMarkSpec | NativeChargeVa
 export function applyChargeToolAtNativeAtom(
   document: ChemDraftDocument,
   spec: NativeElectronMarkSpec | NativeChargeValue,
-  target: NativeMoleculeDeleteTarget
+  target: NativeMoleculeDeleteTarget,
+  /** Optional page-coordinate angle in radians for lone-pair placement. */
+  directionRadians?: number
 ): ChemDraftDocument {
   if (target.kind !== "atom") {
     return document;
@@ -7559,8 +7562,12 @@ export function applyChargeToolAtNativeAtom(
     );
   }
 
-  const placement = normalized.kind === "radical-dot" ? nativeRadicalPlacementPointForAtom : nativeChargePlacementPointForAtom;
-  const point = placement(molecule, target.atomId, page.objects, page.width, page.height);
+  const placement = normalized.kind === "lone-pair"
+    ? lonePairPlacementPlanForAtom(molecule, target.atomId, page.objects, page.width, page.height, directionRadians)
+    : undefined;
+  const point = normalized.kind === "lone-pair" ? placement?.center
+    : (normalized.kind === "radical-dot" ? nativeRadicalPlacementPointForAtom : nativeChargePlacementPointForAtom)(
+      molecule, target.atomId, page.objects, page.width, page.height);
   return point
     ? addChargeMarkAtPoint(document, page.id, normalized, point, {
         objectId: molecule.id,
@@ -7568,7 +7575,7 @@ export function applyChargeToolAtNativeAtom(
         // Page-space placement must retain the chosen atom through legacy local-distance
         // reconciliation. Leave unrotated tool marks byte-for-byte unchanged.
         explicit: molecule.rotation !== 0
-      })
+      }, placement?.rotation)
     : document;
 }
 
@@ -8212,7 +8219,8 @@ function addChargeMarkAtPoint(
   pageId: string,
   spec: NativeElectronMarkSpec,
   point: PagePoint,
-  anchorAtom?: { objectId: string; atomId: string; explicit?: boolean }
+  anchorAtom?: { objectId: string; atomId: string; explicit?: boolean },
+  rotation = 0
 ): ChemDraftDocument {
   const page = firstPage(document);
   const halfSize = nativeChargeMarkSizePx / 2;
@@ -8229,7 +8237,7 @@ function addChargeMarkAtPoint(
     y,
     width: nativeChargeMarkSizePx,
     height: nativeChargeMarkSizePx,
-    rotation: 0,
+    rotation,
     style: {
       source: "chemdraft-native-charge"
     },
@@ -8239,7 +8247,8 @@ function addChargeMarkAtPoint(
     anchor: anchorAtom
       ? { kind: "atom" as const, objectId: anchorAtom.objectId, atomId: anchorAtom.atomId }
       : { kind: "point" as const, point: center },
-    ...(anchorAtom?.explicit ? { atomAssociation: "explicit" as const } : {}),
+    // Label clearance and rotated placement must retain the clicked atom explicitly.
+    ...(anchorAtom && (spec.kind === "lone-pair" || anchorAtom.explicit) ? { atomAssociation: "explicit" as const } : {}),
     ...(spec.kind === "charge"
       ? {
           charge: spec.charge,
@@ -8948,7 +8957,7 @@ export function applyNativeMoleculeBondOrderTarget(
     return document;
   }
 
-  const nextOrder = nextNativeBondOrder(molecule, bond);
+  const nextOrder = nativeBondCanBeMadePlain(bond) ? "single" : nextNativeBondOrder(molecule, bond);
   return isNativeBondOrderValue(nextOrder)
     ? applyNativeMoleculeBondOrderValueTarget(document, target, nextOrder)
     : document;
@@ -8974,15 +8983,18 @@ export function applyNativeMoleculeBondOrderValueTarget(
     return document;
   }
 
-  if ((order === bond.order && bond.stereo === stereo) || !canSetNativeBondOrder(molecule, bond, order)) {
+  const makePlain = order === "single" && nativeBondCanBeMadePlain(bond);
+  // This display-only edit keeps the order, so order-change restrictions do not apply.
+  if (!makePlain && ((order === bond.order && bond.stereo === stereo) || !canSetNativeBondOrder(molecule, bond, order))) {
     return document;
   }
 
   const bonds = molecule.bonds.map((candidate) =>
     candidate.id === bond.id
       // Clearing an existing double bond's "either" stereo is not double-bond creation.
-      ? { ...nativeBondWithOrderAndDisplay(molecule, withoutDoubleBondStereo(candidate), order, bond.order !== "double"),
-          ...(stereo ? { stereo } : {}) }
+      ? makePlain ? nativeBondWithoutStereoDisplay(candidate)
+        : { ...nativeBondWithOrderAndDisplay(molecule, withoutDoubleBondStereo(candidate), order, bond.order !== "double"),
+            ...(stereo ? { stereo } : {}) }
       : candidate
   );
   const refreshed = stereo === "either"
@@ -8996,6 +9008,18 @@ export function applyNativeMoleculeBondOrderValueTarget(
     { op: "updateObject", objectId: molecule.id, changes: nextMolecule },
     { now: phase4Timestamp }
   );
+}
+
+/** Single-order edits clear only the explicitly authored single-bond stereo display. */
+export function nativeBondCanBeMadePlain(bond: MoleculeBond | undefined): boolean {
+  return bond?.order === "single" &&
+    (bond.display?.bondStyle === "wedge" || bond.display?.bondStyle === "hashed" || bond.display?.bondStyle === "wavy");
+}
+
+function nativeBondWithoutStereoDisplay(bond: MoleculeBond): MoleculeBond {
+  const { display: _display, ...rest } = bond;
+  const { bondStyle: _bondStyle, ...display } = bond.display ?? {};
+  return { ...rest, ...(Object.keys(display).length ? { display } : {}) };
 }
 
 /**
@@ -9015,6 +9039,7 @@ export function nativeBondOrderTargetRefusal(
   if (!isEditableNativeMoleculeGraph(molecule)) {
     return "Bond order not changed: this molecule cannot be edited as a native graph";
   }
+  if (order === "single" && nativeBondCanBeMadePlain(bond)) return undefined;
   if (order === bond.order && bond.stereo !== "either") return `Bond is already ${order}`;
   const reason = nativeBondOrderRefusalReason(molecule, bond, order);
   return reason ? `Bond order not changed: ${reason}` : undefined;
@@ -19984,11 +20009,14 @@ export async function copyAsSmiles(document: ChemDraftDocument, warningsOut?: st
  * lossy-emission notes (V2000 flattens dative bonds to single; any other label — a placeholder,
  * unrecognized text, a flagged group, a bonded "Ar" — writes as a dummy atom) — V3000 keeps dative
  * bonds as coordination type 9 and stays silent about them.
+ * Serialization only: clipboard commands use copyAsMolfileForExport to verify the final bytes.
+ * External copies default to Angstrom units; identifier computation requests raw coordinates.
  */
 export function copyAsMolfile(
   document: ChemDraftDocument,
   flavor: "v2000" | "v3000",
-  warningsOut?: string[]
+  warningsOut?: string[],
+  options: { coordinateUnits?: "angstrom" | "raw" } = {}
 ): string | undefined {
   if (refusePreservedChemistryCopy(document, "MOL", warningsOut)) return undefined;
   const molecules = copyAsScopeMolecules(document);
@@ -20016,7 +20044,7 @@ export function copyAsMolfile(
       .filter(warning => nonSruGroups.has(warning.objectId))
       .map(warning => warning.message.replace(`Molecule ${molecule.id} is`, "A molecule is")))];
   warningsOut?.push(...repeatMessages);
-  const options = {
+  const writerOptions = {
     fromDocFrame: true,
     warnings: writerWarnings,
     kekuleBondOrders: nativeBondOrderResolution(merged.atoms, merged.bonds).kekuleOrders,
@@ -20025,7 +20053,11 @@ export function copyAsMolfile(
     placeholderAtoms
   };
   try {
-    return flavor === "v2000" ? moleculeToMolfileV2000(merged, options).contents : moleculeToMolfileV3000(merged, options).contents;
+    // Identifier computation keeps the raw drawing coordinates and their established rounding.
+    if (options.coordinateUnits === "raw") {
+      return (flavor === "v2000" ? moleculeToMolfileV2000 : moleculeToMolfileV3000)(merged, writerOptions).contents;
+    }
+    return moleculeToInteropMolfile(merged, flavor, documentDrawingDefaults(document).bondLengthPx, writerOptions).contents;
   } finally {
     warningsOut?.push(...molecules.flatMap(molecule => {
       // Account only for labels the writer actually diagnosed, retaining drawn atom indices.
@@ -20035,6 +20067,21 @@ export function copyAsMolfile(
       return nativeMoleculeExportWarnings(molecule, { unrecognizedLabels }).map(warning => warning.message);
     }), ...writerWarnings.filter(message => !cachedBracketMessages.has(message) && !repeatMessages.some(warning => warning.includes(message))));
   }
+}
+
+/** Prepare and verify a complete merged Copy As CTAB before any clipboard write. */
+export async function copyAsMolfileForExport(
+  document: ChemDraftDocument,
+  flavor: "v2000" | "v3000",
+  warningsOut?: string[],
+  computeStructureIdentifiers?: ComputeStructureIdentifiers
+): Promise<string | undefined> {
+  const contents = copyAsMolfile(document, flavor, warningsOut);
+  if (contents === undefined) return undefined;
+  const source = copyAsMolfile(document, flavor, undefined, { coordinateUnits: "raw" })!;
+  const engine = computeStructureIdentifiers ?? await (await import("./moleculeSmiles")).loadStructureIdentifiers();
+  await assertMolfileExportIdentity(source, contents, engine, flavor === "v2000" ? "Copy as MOL V2000" : "Copy as MOL");
+  return contents;
 }
 
 const copyAsPagePaddingPx = 16;

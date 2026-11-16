@@ -82,7 +82,7 @@ describe("complete molecule carried with its distant explicit charge", () => {
       const movedMark = committed.pages[0].objects.find(object => object.id === mark.id)! as typeof mark;
       const dx = moved.x - molecule.x, dy = moved.y - molecule.y;
       expect(movedMark.anchor, name).toEqual(mark.anchor);
-      expect(movedMark.atomAssociation, name).toBeUndefined();
+      expect(movedMark.atomAssociation, name).toBe(spec.kind === "lone-pair" ? "explicit" : undefined);
       for (const id of [mark.id, captionId]) {
         const original = document.pages[0].objects.find(object => object.id === id)!;
         const next = committed.pages[0].objects.find(object => object.id === id)!;
