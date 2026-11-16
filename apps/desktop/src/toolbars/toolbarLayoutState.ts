@@ -1,6 +1,6 @@
 import type { ToolsetLayoutState } from "@chemdraft/toolset-registry";
 
-export const MAIN_TOOLBAR_DEFAULTS_REVISION = 1;
+export const MAIN_TOOLBAR_DEFAULTS_REVISION = 2;
 
 /** Stamp new customization before it is rendered, broadcast or saved as a historical layout. */
 export function withCurrentMainToolbarDefaults<T extends ToolsetLayoutState>(state: T): T {

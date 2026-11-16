@@ -201,54 +201,6 @@
               }
             },
             {
-              "commandId": "tool.doubleBond",
-              "title": "Double Bond",
-              "icon": "doubleBond",
-              "assetName": "Custom_Bond_Double",
-              "category": "structure",
-              "id": "tool.doubleBond",
-              "kind": "button",
-              "label": "Double Bond",
-              "primary": {
-                "type": "command",
-                "commandId": "tool.doubleBond"
-              },
-              "submenu": null,
-              "tooltip": {
-                "title": "Double Bond",
-                "shortcut": null,
-                "description": "Draw a double bond or click a bond to set its order."
-              },
-              "layout": {
-                "colSpan": 1,
-                "rowSpan": 1
-              }
-            },
-            {
-              "commandId": "tool.tripleBond",
-              "title": "Triple Bond",
-              "icon": "tripleBond",
-              "assetName": "Custom_Bond_Triple",
-              "category": "structure",
-              "id": "tool.tripleBond",
-              "kind": "button",
-              "label": "Triple Bond",
-              "primary": {
-                "type": "command",
-                "commandId": "tool.tripleBond"
-              },
-              "submenu": null,
-              "tooltip": {
-                "title": "Triple Bond",
-                "shortcut": null,
-                "description": "Draw a triple bond or click a bond to set its order."
-              },
-              "layout": {
-                "colSpan": 1,
-                "rowSpan": 1
-              }
-            },
-            {
               "commandId": "tool.wedgeBond",
               "title": "Solid Wedge Bond",
               "icon": "bond",
@@ -414,7 +366,55 @@
               "tooltip": {
                 "title": "Benzene Template",
                 "shortcut": null,
-                "description": "Draw benzene. Long-press or press Arrow Down for 3–8-membered rings and chair cyclohexanes."
+                "description": "Draw benzene. Long-press or press Arrow Down for 3\u20138-membered rings and chair cyclohexanes."
+              },
+              "layout": {
+                "colSpan": 1,
+                "rowSpan": 1
+              }
+            },
+            {
+              "commandId": "tool.doubleBond",
+              "title": "Double Bond",
+              "icon": "doubleBond",
+              "assetName": "Custom_Bond_Double",
+              "category": "structure",
+              "id": "tool.doubleBond",
+              "kind": "button",
+              "label": "Double Bond",
+              "primary": {
+                "type": "command",
+                "commandId": "tool.doubleBond"
+              },
+              "submenu": {
+                "type": "command-grid",
+                "id": "multiple-bond-tools",
+                "title": "Multiple bond tools",
+                "columns": 3,
+                "items": [
+                  {
+                    "commandId": "tool.doubleBond",
+                    "label": "Double Bond",
+                    "icon": "doubleBond",
+                    "assetName": "Custom_Bond_Double"
+                  },
+                  {
+                    "commandId": "tool.tripleBond",
+                    "label": "Triple Bond",
+                    "icon": "tripleBond",
+                    "assetName": "Custom_Bond_Triple"
+                  },
+                  {
+                    "commandId": "tool.doubleBond:either",
+                    "label": "E/Z-unspecified Double Bond",
+                    "icon": "eitherDoubleBond"
+                  }
+                ]
+              },
+              "tooltip": {
+                "title": "Double Bond",
+                "shortcut": null,
+                "description": "Draw a double bond or click a bond to set its order."
               },
               "layout": {
                 "colSpan": 1,
@@ -825,7 +825,7 @@
               "tooltip": {
                 "title": "Symbol Tool Group",
                 "shortcut": null,
-                "description": "Stamp a ° symbol. Long-press for other symbols."
+                "description": "Stamp a \u00b0 symbol. Long-press for other symbols."
               },
               "layout": {
                 "colSpan": 1,
@@ -1030,7 +1030,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid.left",
-                    "label": "Grid — Left",
+                    "label": "Grid \u2014 Left",
                     "icon": "arrangeGridLeft",
                     "tooltip": {
                       "title": "Arrange in a Grid (Left)",
@@ -1039,7 +1039,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid",
-                    "label": "Grid — Centered",
+                    "label": "Grid \u2014 Centered",
                     "icon": "arrangeGridCenter",
                     "tooltip": {
                       "title": "Arrange in a Grid (Centered)",
@@ -1048,7 +1048,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid.right",
-                    "label": "Grid — Right",
+                    "label": "Grid \u2014 Right",
                     "icon": "arrangeGridRight",
                     "tooltip": {
                       "title": "Arrange in a Grid (Right)",
@@ -1075,7 +1075,7 @@
                   },
                   {
                     "commandId": "layout.adjustArrangementSpacing",
-                    "label": "Adjust spacing…",
+                    "label": "Adjust spacing\u2026",
                     "icon": "align",
                     "tooltip": {
                       "title": "Adjust arrangement spacing",
@@ -2283,7 +2283,7 @@
               "tooltip": {
                 "title": "Benzene Template",
                 "shortcut": null,
-                "description": "Draw benzene. Long-press or press Arrow Down for 3–8-membered rings and chair cyclohexanes."
+                "description": "Draw benzene. Long-press or press Arrow Down for 3\u20138-membered rings and chair cyclohexanes."
               },
               "layout": {
                 "colSpan": 1,
@@ -2738,7 +2738,7 @@
               "tooltip": {
                 "title": "Symbol Tool Group",
                 "shortcut": null,
-                "description": "Stamp a ° symbol. Long-press for other symbols."
+                "description": "Stamp a \u00b0 symbol. Long-press for other symbols."
               },
               "layout": {
                 "colSpan": 1,
@@ -3372,7 +3372,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid.left",
-                    "label": "Grid — Left",
+                    "label": "Grid \u2014 Left",
                     "icon": "arrangeGridLeft",
                     "tooltip": {
                       "title": "Arrange in a Grid (Left)",
@@ -3381,7 +3381,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid",
-                    "label": "Grid — Centered",
+                    "label": "Grid \u2014 Centered",
                     "icon": "arrangeGridCenter",
                     "tooltip": {
                       "title": "Arrange in a Grid (Centered)",
@@ -3390,7 +3390,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid.right",
-                    "label": "Grid — Right",
+                    "label": "Grid \u2014 Right",
                     "icon": "arrangeGridRight",
                     "tooltip": {
                       "title": "Arrange in a Grid (Right)",
@@ -3417,7 +3417,7 @@
                   },
                   {
                     "commandId": "layout.adjustArrangementSpacing",
-                    "label": "Adjust spacing…",
+                    "label": "Adjust spacing\u2026",
                     "icon": "align",
                     "tooltip": {
                       "title": "Adjust arrangement spacing",
@@ -4317,7 +4317,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid.left",
-                    "label": "Grid — Left",
+                    "label": "Grid \u2014 Left",
                     "icon": "arrangeGridLeft",
                     "tooltip": {
                       "title": "Arrange in a Grid (Left)",
@@ -4326,7 +4326,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid",
-                    "label": "Grid — Centered",
+                    "label": "Grid \u2014 Centered",
                     "icon": "arrangeGridCenter",
                     "tooltip": {
                       "title": "Arrange in a Grid (Centered)",
@@ -4335,7 +4335,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid.right",
-                    "label": "Grid — Right",
+                    "label": "Grid \u2014 Right",
                     "icon": "arrangeGridRight",
                     "tooltip": {
                       "title": "Arrange in a Grid (Right)",
@@ -4362,7 +4362,7 @@
                   },
                   {
                     "commandId": "layout.adjustArrangementSpacing",
-                    "label": "Adjust spacing…",
+                    "label": "Adjust spacing\u2026",
                     "icon": "align",
                     "tooltip": {
                       "title": "Adjust arrangement spacing",

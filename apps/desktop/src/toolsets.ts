@@ -148,6 +148,22 @@ function previousMainToolbarGroups(): ToolsetGroupDefinition<IconName, ToolbarAs
   });
 }
 
+/** Revision 1 shipped separate Double/Triple buttons immediately after Single Bond. */
+function revisionOneMainToolbarGroups(): ToolsetGroupDefinition<IconName, ToolbarAssetName>[] {
+  const groups = desktopToolsets.find(toolset => toolset.id === "core.main")!.groups;
+  const double = groups[0].items.find(item => item.commandId === "tool.doubleBond")!;
+  const triple: ToolsetItemDefinition<IconName, ToolbarAssetName> = {
+    ...double, commandId: "tool.tripleBond", id: "tool.tripleBond", title: "Triple Bond", label: "Triple Bond",
+    icon: "tripleBond", assetName: "Custom_Bond_Triple", primary: { type: "command", commandId: "tool.tripleBond" },
+    submenu: null, tooltip: { title: "Triple Bond", shortcut: null, description: "Draw a triple bond or click a bond to set its order." }
+  };
+  return groups.map(group => {
+    const items = group.items.filter(item => !MULTIPLE_BOND_IDS.includes(item.commandId ?? ""));
+    items.splice(items.findIndex(item => item.commandId === "tool.bond") + 1, 0, { ...double, submenu: null }, triple);
+    return { ...group, items };
+  });
+}
+
 /** Preserve customized layouts against the old defaults once; other overrides use the new defaults.
  * Complete the old order before adding Chain back, since addition indices precede reorder/hide and
  * were measured against the old manifest. Keep a top-level marker even when no Main override exists.
@@ -161,9 +177,17 @@ export function migrateMainToolbarDefaultsLayoutState(state: unknown): unknown {
     // A genuine pre-#340 1.2 file carries its revision inline, so native honours it and never
     // sets this hint. A v1.1.1 file with no side file has no hint and gets the original migration
     // below. Consume the IPC-only hint before parsing/broadcasting/saving.
-    return withCurrentMainToolbarDefaults(parseToolsetLayoutState(
+    const parsed = parseToolsetLayoutState(
       migrateLegacyMainToolbarLayoutState(migrateRenamedCommandIdsInLayoutState(loaded))
-    ));
+    );
+    // An explicit order naming Triple without an addition proves it was a manifest button.
+    // Preserve that known layout even when its revision side file could not be recovered.
+    const hadStandaloneTriple = parsed.toolsetOverrides.some(override => override.toolsetId === "core.main"
+      && override.itemOrder?.[MAIN_ITEMS_GROUP_ID]?.includes("tool.tripleBond")
+      && !override.itemAdditions?.some(addition => toolsetItemCustomizationId(addition.item) === "tool.tripleBond"));
+    return hadStandaloneTriple
+      ? migrateMainToolbarDefaultsLayoutState({ ...parsed, mainToolbarDefaultsRevision: 1 })
+      : withCurrentMainToolbarDefaults(parsed);
   }
   const legacy = migrateLegacyMainToolbarLayoutState(migrateRenamedCommandIdsInLayoutState(state));
   if (typeof legacy !== "object" || legacy === null) return legacy;
@@ -172,6 +196,31 @@ export function migrateMainToolbarDefaultsLayoutState(state: unknown): unknown {
     return legacy;
   }
   const parsed = parseToolsetLayoutState(legacy);
+  if (revision === 1) {
+    const previousGroups = revisionOneMainToolbarGroups();
+    const tripleIndex = previousGroups[0].items.findIndex(item => item.commandId === "tool.tripleBond");
+    return withCurrentMainToolbarDefaults({
+      ...parsed,
+      toolsetOverrides: parsed.toolsetOverrides.map(override => {
+        if (override.toolsetId !== "core.main" || !(
+          override.groupOrder !== undefined || override.itemOrder !== undefined ||
+          override.hiddenCommandIds !== undefined || override.itemOverrides !== undefined ||
+          override.itemAdditions !== undefined
+        )) return override;
+        const groups = mergeToolsetItemAdditions(previousGroups, override.itemAdditions);
+        const ids = groups[0].items.map(item => toolsetItemCustomizationId(item)!);
+        return {
+          ...override,
+          itemOrder: { ...override.itemOrder, [MAIN_ITEMS_GROUP_ID]: reorderToolbarIds(ids, override.itemOrder?.[MAIN_ITEMS_GROUP_ID]) },
+          // Restore the removed manifest button before replaying additions at historical indices.
+          itemAdditions: [
+            { groupId: MAIN_ITEMS_GROUP_ID, index: tripleIndex, item: previousGroups[0].items[tripleIndex] },
+            ...(override.itemAdditions ?? [])
+          ]
+        };
+      })
+    });
+  }
   const previousGroups = previousMainToolbarGroups();
   const chainIndex = previousGroups[0].items.findIndex(item => item.commandId === "tool.chain");
   return withCurrentMainToolbarDefaults({

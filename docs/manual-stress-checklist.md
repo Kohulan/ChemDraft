@@ -453,7 +453,7 @@ sprouts 4/5, carbonyl 2, gem-dimethyl 9, the 0-key cyclic bond closing a ring), 
 following the selected scheme — `e` over an atom applies the Et nickname in the ChemDraw scheme,
 while ChemDraft's `e` arms the eraser; charge stacking
 by hotkey and by the charge tool up to ±9 and back down to mark removal;
-with **Direct electron-mark editing** off (the default), check painted-ink-only picking over
+with **Direct electron-mark editing** off (the default), check radical/lone-pair painted-ink-only picking over
 atoms, bonds and filled rings, repeated radical/lone-pair tool placement on existing ink, and
 absence of mark resize/rotation handles.
 With the Lone Pair tool, click an atom to auto-place in its largest free gap; repeat for a second pair.
@@ -471,6 +471,13 @@ with the preference off match the previous rendering, while custom/scaled lone-p
 radical-ion dot/sign geometry remain separated. Compare canvas, SVG and PDF; CDXML must warn by
 mark ID that annotation position, size, thickness and rotation remain in the native payload only.
 Check charge/radical counts, formula and canonical SMILES before and after appearance-only edits.
+With each direct-editing preference setting on macOS and Windows, drag a floating + to 20 px above
+Boc-glycine's carbonyl O: no target highlight, "Moved electron mark", O neutral and mark floating.
+Select All, click blank canvas, insert text, change mark appearance, and save/reopen the native file:
+the binding, atom charges, formula and SMILES must stay unchanged. Repeat at 8 px: highlight O,
+attach with a status naming its charge change, and retain that binding through the same operations.
+For O–C–C–N in frame (100,100,100,20), rotation 180°, drop + at (200,110): both highlight and
+commit target O, leaving N neutral. Repeat unrotated at (100,110), and check exact Undo/Redo.
 Move marks within the original atom's radius, onto nearby/far atoms and into empty space; charge
 moves retain the previous nearest-atom reassociation, while radical/lone-pair moves keep sticky
 anchors until out of range or unsupported. In a crowded placement, a general charge transform
@@ -1516,6 +1523,13 @@ whole-molecule cleanup with the existing behavior, and check save/reopen and exp
   then move, resize and rotate the mark; Undo and Redo restore each edit. With the mark selected,
   dragging from its center moves it; corner handles resize. Repeat at 50%, 100% and 200% zoom,
   including a rotated mark.
+- With either preference setting, grab positive/negative, plain/circled and radical-ion charges
+  outside their drawn sign and saved frame, within the centered 36 CSS-pixel move area. Repeat at
+  25%, 50%, 100%, 200% and 400% zoom, using Select and the matching charge tool: one mark moves,
+  without a duplicate. With direct editing enabled, grab each separate resize corner and use Shift
+  to stretch non-uniformly; clicking a corner without moving changes nothing. Undo/Redo each move
+  and resize. Check nearby overlapping objects still follow drawing order, and SVG/PDF contain
+  only the original drawing, with no enlarged invisible rectangle or changed charge size.
 
 ### Reaction conditions
 

@@ -12,6 +12,7 @@ import {
   nativeTextStyleFromObjectStyle,
   parseDocument,
   prepareNativeDocumentForSerializationWithWarnings,
+  resolveRepeatUnitAtomMembership,
   withBracketChemistryWarnings,
   type Anchor,
   type ArrowObject,
@@ -24,6 +25,7 @@ import {
   type DocumentObject,
   type GroupObject,
   type DocumentPage,
+  type ElectronMarkObject,
   type GraphicMarker,
   type GraphicObject,
   type GraphicPathNode,
@@ -54,6 +56,7 @@ import {
 } from "./cdxBinary";
 import { abbreviationExpansionIssue, cdxmlAtomChemistry, cdxmlAtomNativeState, elementFromCdxmlAtom, restoreCdxmlAbbreviations } from "./abbreviations";
 import { cdxmlToCssPx, cssPxToCdxml, formatNumber, formatPoint } from "./coordinates";
+import { nativeChargePlacementPointForAtom, nativeRadicalPlacementPointForAtom, nativeChargeMarkSizePx } from "@chemdraft/layout-engine";
 
 export interface CompatibilityConversionWarning {
   code: string;
@@ -156,6 +159,13 @@ export function exportDocumentToCdx(document: ChemDraftDocument, options: CdxExp
   checkRepeatCounts(root);
   const tags: [string, string][] = [];
   const strip = (x: CdxElement) => {
+    // Start/End have no binary tags. Standard 3D endpoints already carry these coordinates;
+    // dropping only equivalent aliases loses nothing and should not report an omission.
+    for (const [alias, endpoint] of [["Start", "Tail3D"], ["End", "Head3D"]]) {
+      const point = parseCdxmlXyPoint(x.attrs[alias]);
+      const standard = parseCdxmlXyPoint(x.attrs[endpoint]);
+      if (point && standard && point.x === standard.x && point.y === standard.y) delete x.attrs[alias];
+    }
     x.kids = x.kids.filter((child) => {
       if (child.name === "objecttag" && child.attrs.Name?.startsWith(ChemDraftObjectTagPrefix)) {
         tags.push([child.attrs.Name, child.attrs.Value]);
@@ -300,6 +310,7 @@ interface IdAllocator {
 type ExportColorTable = string[];
 
 interface VisibleExportContext {
+  page: DocumentPage;
   format: "CDXML" | "CDX";
   embedNativePayload: boolean;
   colors: ExportColorTable;
@@ -1263,6 +1274,55 @@ function exportReactionSchemes(
   });
 }
 
+/** Default atom-tool dots carry the Radical attribute written on the atom, not separate
+ * authored appearance. A moved or styled dot still needs the ordinary loss diagnostics. */
+function isStandardAtomRadicalMark(
+  mark: ElectronMarkObject,
+  page: DocumentPage,
+  objectsById: ReadonlyMap<string, DocumentObject>
+): boolean {
+  if (mark.markKind !== "radical-dot" || mark.anchor.kind !== "atom"
+      || mark.style.source !== "chemdraft-native-charge"
+      || Object.entries(mark.style).some(([key, value]) => key !== "source" && value !== undefined)
+      || mark.width !== nativeChargeMarkSizePx || mark.height !== nativeChargeMarkSizePx || mark.rotation !== 0) return false;
+  const { objectId, atomId } = mark.anchor;
+  const molecule = objectId && objectsById.get(objectId);
+  if (!molecule || molecule.type !== "molecule") return false;
+  const atom = molecule.atoms.find(atom => atom.id === atomId);
+  if (!atom) return false;
+  // Source handles follow direct edits to the atom's radical state, including its removal.
+  // Compare the current atom-relative frame: a stationary dot must not stay exempt when
+  // its atom moves away, while translating both together preserves the imported appearance.
+  const imported = mark.compatibility?.unknown.cdxmlRadicalMarkPlacement;
+  if (isRecord(imported)) {
+    if (imported.objectId !== objectId || imported.atomId !== atomId) return false;
+    if (typeof imported.offsetX === "number" && typeof imported.offsetY === "number") {
+      const atomPoint = transformPointForObject(molecule, atom);
+      return Math.abs(mark.x - atomPoint.x - imported.offsetX) < 1e-8
+        && Math.abs(mark.y - atomPoint.y - imported.offsetY) < 1e-8;
+    }
+    // Older native payloads lack relative coordinates: require the current default below.
+  }
+  if (!isRecord(imported) && atom.markRadicals !== 1 && atom.markRadicals !== 2) return false;
+  const carried = page.objects.filter(object => object.type === "electron-mark"
+    && object.anchor.kind === "atom" && object.anchor.objectId === molecule.id && object.anchor.atomId === atom.id
+    && (object.markKind === "radical-dot" || object.markKind === "charge" && object.radical)).length;
+  if (!isRecord(imported) && carried !== atom.markRadicals) return false;
+  // Legacy imports placed both triplet dots in the charge-tool slot. Keep those untouched
+  // payloads warning-free too, but only while that slot still matches the atom's position.
+  const point = isRecord(imported)
+    ? nativeChargePlacementPointForAtom(molecule, atom.id,
+      // Reconstruct the legacy slot before mixed-mark collision avoidance existed.
+      page.objects.filter(object => object.type !== "electron-mark" || object.markKind === "charge"), page.width, page.height)
+    : nativeRadicalPlacementPointForAtom(molecule, atom.id,
+      page.objects.slice(0, page.objects.indexOf(mark)), page.width, page.height);
+  if (!point) return false;
+  const size = nativeChargeMarkSizePx;
+  const x = Math.max(0, Math.min(point.x - size / 2, page.width - size));
+  const y = Math.max(0, Math.min(point.y - size / 2, page.height - size));
+  return Math.abs(mark.x - x) < 1e-8 && Math.abs(mark.y - y) < 1e-8;
+}
+
 function exportVisibleObject(
   object: DocumentObject,
   context: VisibleExportContext,
@@ -1296,7 +1356,7 @@ function exportVisibleObject(
     return exportTextObject({ ...object, type: "text", text: "+", spans: [] }, context, allocator, warnings);
   }
   if (object.type === "reaction-arrow") {
-    return exportReactionArrowObject(object, context.ids, allocator, objectsById, warnings, context.colors);
+    return exportReactionArrowObject(object, context.ids, allocator, objectsById, warnings, context.colors, unknownObjects.format);
   }
   if (object.type === "graphic") {
     return exportGraphicObject(object, context.ids, allocator, warnings, context.colors);
@@ -1321,6 +1381,7 @@ function exportVisibleObject(
     return "";
   }
   if (object.type === "electron-mark") {
+    if (isStandardAtomRadicalMark(object, context.page, objectsById)) return "";
     warnings.push({
       code: "cdxml.electron_mark_appearance_payload_only",
       message: `${unknownObjects.format.toUpperCase()} export: electron mark ${object.compatibility?.originalId ?? object.id}, including its position, size (${object.width} × ${object.height}), thickness (${object.style.strokeWidth ?? 1.5}) and rotation (${object.rotation}°), ${unknownObjects.embedNativePayload
@@ -1529,9 +1590,15 @@ function exportBracketPairs(page: DocumentPage, context: VisibleExportContext, a
     const unchanged = pair.every(object => object.compatibility?.unknown.cdxmlBracketState === bracketSourceState(object));
     const membershipUnchanged = pair.every(object => object.compatibility?.unknown.cdxmlBracketMembership === JSON.stringify(object.containedObjectIds));
     const requestedMembers = [...new Set(pair.flatMap(object => object.containedObjectIds))];
-    const members = requestedMembers.filter(id => objectsById.get(id)?.type === "molecule").map(id => idFor(context.ids, id, allocator));
-    if (members.length !== requestedMembers.length) warnings.push({ code: "cdxml.bracket_membership_payload_only", sourceObjectId: closing.id,
-      message: `Bracket membership for missing or non-molecule objects is preserved only in the ChemDraft payload; visible ${context.format} membership includes whole molecule objects only.` });
+    const membership = resolveRepeatUnitAtomMembership(pair, page.objects, { atomPosition: transformPointForObject });
+    const members = membership.members.flatMap(member => requestedMembers.includes(member.molecule.id)
+      ? [idFor(context.ids, member.molecule.id, allocator)]
+      : member.atomIds.flatMap(atomId => {
+        const id = context.atomIdsByObjectId.get(member.molecule.id)?.get(atomId);
+        return id ? [id] : [];
+      }));
+    if (requestedMembers.some(id => objectsById.get(id)?.type !== "molecule")) warnings.push({ code: "cdxml.bracket_membership_payload_only", sourceObjectId: closing.id,
+      message: `Bracket membership for missing or non-molecule objects is preserved only in the ChemDraft payload; visible ${context.format} membership includes only resolvable molecule and atom references.` });
     const memberRecords = closing.compatibility?.unknown.cdxmlBracketMembers;
     const preservedMembers = splitCdxmlIdList(attrs.BracketedObjectIDs).flatMap(sourceId => {
       const record = Array.isArray(memberRecords) ? memberRecords.find(record => isRecord(record) && record.sourceId === sourceId) : undefined;
@@ -1553,6 +1620,10 @@ function exportBracketPairs(page: DocumentPage, context: VisibleExportContext, a
       return [];
     });
     const exportedMembers = [...new Set([...preservedMembers, ...(membershipUnchanged && attrs.BracketedObjectIDs !== undefined ? [] : members)])];
+    if (bracketUsageAttribute(pair) && membership.unresolved) {
+      warnings.push({ code: "cdxml.bracket_membership_unresolved", sourceObjectId: closing.id,
+        message: `Repeat unit membership for bracket ${closing.id} cannot be resolved: ${membership.reason}; visible ${context.format} writes only known members and retained source references, without guessing enclosure.` });
+    }
     if (exportedMembers.length) attrs.BracketedObjectIDs = exportedMembers.join(" ");
     else delete attrs.BracketedObjectIDs;
     attrs.id = attrs.id ? allocator.sourceId(attrs.id) : allocator.next();
@@ -1650,6 +1721,7 @@ function createVisibleExportContext(page: DocumentPage, colors: ExportColorTable
   });
 
   return {
+    page,
     format,
     embedNativePayload,
     colors,
@@ -2054,7 +2126,8 @@ function exportReactionArrowObject(
   allocator: IdAllocator,
   objectsById: ReadonlyMap<string, DocumentObject>,
   warnings: CompatibilityConversionWarning[],
-  colors: ExportColorTable
+  colors: ExportColorTable,
+  format: "cdx" | "cdxml"
 ): string {
   const graphicId = idFor(ids, arrow.id, allocator);
   const start = resolveAnchorPoint(arrow.start, objectsById) ?? { x: arrow.x, y: arrow.y + arrow.height / 2 };
@@ -2073,7 +2146,10 @@ function exportReactionArrowObject(
     });
   }
   const arrowTypeAttribute = arrowType === undefined ? "" : ` ArrowType="${escapeXmlAttribute(arrowType)}"`;
-  return `<graphic id="${graphicId}" GraphicType="Line"${arrowTypeAttribute}${cdxmlColorAttribute(arrow.style.strokeColor ?? arrow.style.color, colors).map(attribute => ` ${attribute}`).join("")} BoundingBox="${formatLineBoundingBox(start, end)}" Start="${formatPoint(start)}" End="${formatPoint(end)}"/>`;
+  const endpoints = format === "cdx"
+    ? `Tail3D="${formatXyPoint(start)}" Head3D="${formatXyPoint(end)}"`
+    : `Start="${formatPoint(start)}" End="${formatPoint(end)}"`;
+  return `<graphic id="${graphicId}" GraphicType="Line"${arrowTypeAttribute}${cdxmlColorAttribute(arrow.style.strokeColor ?? arrow.style.color, colors).map(attribute => ` ${attribute}`).join("")} BoundingBox="${formatLineBoundingBox(start, end)}" ${endpoints}/>`;
 }
 
 function exportGraphicObject(
@@ -2550,8 +2626,12 @@ function exportGraphicAsCdxmlCurve(
 ): string {
   const attributes = preservedCurveAttributes(graphic.compatibility?.unknown.cdxmlCurveAttributes);
   const nativeCurve = graphic.compatibility?.unknown.cdxmlElementName !== "curve";
-  if (nativeCurve) {
+  const sourceFill = graphicStyleFromCdxmlCurve({ name: "curve", attributes, children: [] }, { colorByIndex: new Map(), warnings: [] });
+  if (nativeCurve || graphicHasVisibleFill(graphic) !== graphicHasVisibleFill({ ...graphic, style: sourceFill }) ||
+    graphic.style.fillMode !== sourceFill.fillMode) {
     attributes.FillType = graphicHasVisibleFill(graphic) ? "Solid" : "None";
+  }
+  if (nativeCurve) {
     if (approximateArc) {
       warnings.push({ code: "cdxml.arc_curve_approximation", sourceObjectId: graphic.id,
         message: "Circular arrow exported as cubic CDXML curve segments; the arc has a small geometric approximation." });
@@ -2599,7 +2679,7 @@ function exportGraphicAsCdxmlCurve(
     warnings.push({ code: "cdxml.curve_head_size_payload_only",
       message: "Edited native curve head dimensions remain only in the native payload; standard CDXML retains the source head sizing attributes.", sourceObjectId: graphic.id });
   }
-  const useFill = nativeCurve && graphic.data.pathClosed && graphicHasVisibleFill(graphic);
+  const useFill = graphic.data.pathClosed && graphicHasVisibleFill(graphic);
   const color = normalizeHexColor((useFill ? graphic.style.fillColor : graphic.style.strokeColor) ?? defaultCdxmlStrokeColor);
   if (useFill && graphic.style.strokeColor && normalizeHexColor(graphic.style.strokeColor) !== color) {
     warnings.push({ code: "cdxml.graphic_single_color", sourceObjectId: graphic.id,
@@ -3093,12 +3173,14 @@ function importVisibleCdxmlFromTree(tree: OrderedXmlTree, sourceFormat: "CDXML" 
         importPageObjects(pageElement, pageIndex, warnings, colorTable, fonts, curveLineDefaults, sourceFormat),
         importTransform
       );
-      return {
+      const page: DocumentPage = {
         ...pageTemplate,
         id: `page_${String(pageIndex + 1).padStart(3, "0")}`,
         objects: importedPage.objects,
         crossings: importedPage.crossings
       };
+      addImportedRadicalMarks(page);
+      return page;
     });
   } catch (error) {
     return {
@@ -3140,6 +3222,44 @@ function importVisibleCdxmlFromTree(tree: OrderedXmlTree, sourceFormat: "CDXML" 
     };
   }
   return { document: withBracketChemistryWarnings(parsed.data), warnings };
+}
+
+/** `markRadicals` is a mark contribution, never an intrinsic atom radical. Supply the same
+ * editable handle the atom tool creates, or the desktop commit normalizer must remove it.
+ * Run after source coordinate transforms so placement sees the final page and atom positions. */
+function addImportedRadicalMarks(page: DocumentPage): void {
+  const marks = page.objects.filter((object): object is ElectronMarkObject => object.type === "electron-mark");
+  const ids = new Set(page.objects.map(object => object.id));
+  for (const molecule of page.objects.filter((object): object is MoleculeObject => object.type === "molecule")) {
+    for (const atom of molecule.atoms) {
+      const carried = marks.filter(mark => mark.anchor.kind === "atom" && mark.anchor.objectId === molecule.id && mark.anchor.atomId === atom.id)
+        .reduce((sum, mark) => sum + (mark.markKind === "radical-dot" || mark.markKind === "charge" && mark.radical ? 1 : 0), 0);
+      const missing = (atom.markRadicals ?? 0) - carried;
+      for (let index = 0; index < missing; index++) {
+        const point = nativeRadicalPlacementPointForAtom(molecule, atom.id, page.objects, page.width, page.height)!;
+        const size = nativeChargeMarkSizePx;
+        const baseId = `${molecule.id}_${atom.id}_radical_${index + 1}`;
+        let id = baseId;
+        while (ids.has(id)) id += "_";
+        ids.add(id);
+        const mark: ElectronMarkObject = {
+          id, type: "electron-mark", markKind: "radical-dot",
+          x: Math.max(0, Math.min(point.x - size / 2, page.width - size)),
+          y: Math.max(0, Math.min(point.y - size / 2, page.height - size)),
+          width: size, height: size, rotation: 0, style: { source: "chemdraft-native-charge" },
+          anchor: { kind: "atom", objectId: molecule.id, atomId: atom.id },
+          atomAssociation: "explicit"
+        };
+        const atomPoint = transformPointForObject(molecule, atom);
+        mark.compatibility = { warnings: [], unknown: { cdxmlRadicalMarkPlacement: {
+          x: mark.x, y: mark.y, offsetX: mark.x - atomPoint.x, offsetY: mark.y - atomPoint.y,
+          objectId: molecule.id, atomId: atom.id
+        } } };
+        page.objects.push(mark);
+        marks.push(mark);
+      }
+    }
+  }
 }
 
 function importPageObjects(
@@ -4822,7 +4942,7 @@ function importCurveGraphic(
   return {
     id, type: "graphic", ...box, rotation: 0,
     graphicKind: "path",
-    style: graphicStyleFromCdxmlCurve(effectiveElement, context.colorTable),
+    style: graphicStyleFromCdxmlCurve(effectiveElement, context.colorTable, message => note("cdxml.curve_fill_type_approximation", message)),
     data: {
       artPathKind: "bezier", pathNodes: nodes,
       ...(cdxmlCurveIsClosed(element.attributes) ? { pathClosed: true } : {}),
@@ -5086,8 +5206,20 @@ function graphicStyleFromCdxmlShape(
   return style;
 }
 
-function graphicStyleFromCdxmlCurve(element: XmlElementView, colorTable: CdxmlColorTable): GraphicObject["style"] {
+function graphicStyleFromCdxmlCurve(element: XmlElementView, colorTable: CdxmlColorTable, warn?: (message: string) => void): GraphicObject["style"] {
   const style = graphicStyleFromCdxmlShape(element, colorTable);
+  const fillType = normalizedCdxmlToken(element.attributes.FillType);
+  if (["solid", "2", "shaded", "4"].includes(fillType)) {
+    style.fillColor = style.strokeColor;
+    style.fillMode = "solid";
+  } else if (["none", "1"].includes(fillType)) {
+    style.fillColor = "none";
+    delete style.fillMode;
+  }
+  if (fillType && !["unspecified", "0", "none", "1", "solid", "2"].includes(fillType)) {
+    warn?.(`Curve "${element.attributes.id ?? "(unknown)"}" has FillType="${element.attributes.FillType}" with no native equivalent; ` +
+      (["shaded", "4"].includes(fillType) ? "a solid fill is used" : "no fill is used") + "; the source FillType is retained for export.");
+  }
   const width = normalizedCdxmlToken(element.attributes.LineType) === "bold"
     ? parseNumber(element.attributes.BoldWidth) ?? parseNumber(element.attributes.LineWidth)
     : parseNumber(element.attributes.LineWidth);

@@ -13,6 +13,7 @@ import { exportDocumentToSvg } from "@chemdraft/export-engine";
 import { nativeMoleculeRings, planPageSvgRender } from "@chemdraft/layout-engine";
 import { MainWindow } from "./MainWindow";
 import { saveDirectElectronMarkEditing } from "./electronMarkEditingSettings";
+import { electronMarkInteractionFrames } from "./electronMarkInteraction";
 import { broadcastElectronMarkEditingSettings } from "./window-manager";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 import {
@@ -205,6 +206,7 @@ describe("canvas ring-fill layers", () => {
 
   beforeEach(() => {
     vi.stubGlobal("localStorage", new MemoryStorage());
+    vi.stubGlobal("CSS", { escape: (value: string) => value });
     window.history.replaceState(null, "", "/?agentBridge=1");
     vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => window.setTimeout(() => callback(performance.now()), 0));
     vi.stubGlobal("cancelAnimationFrame", (handle: number) => window.clearTimeout(handle));
@@ -497,9 +499,9 @@ describe("canvas ring-fill layers", () => {
     await act(async () => window.dispatchEvent(new CustomEvent(eventName, { detail: { commandId } })));
   }
 
-  async function pointer(target: Element, type: "pointerdown" | "pointermove" | "pointerup", point: { x: number; y: number }, buttons = type === "pointerup" ? 0 : 1) {
+  async function pointer(target: Element, type: "pointerdown" | "pointermove" | "pointerup", point: { x: number; y: number }, buttons = type === "pointerup" ? 0 : 1, shiftKey = false) {
     const event = new MouseEvent(type, { bubbles: true, cancelable: true, button: 0, buttons,
-      detail: 1, clientX: point.x, clientY: point.y });
+      detail: 1, clientX: point.x, clientY: point.y, shiftKey });
     Object.defineProperties(event, { isPrimary: { value: true }, pointerId: { value: 17 }, pointerType: { value: "mouse" } });
     await act(async () => target.dispatchEvent(event));
   }
@@ -681,7 +683,7 @@ describe("canvas ring-fill layers", () => {
     }
   );
 
-  it.each([
+  it.each(([
     { tool: "tool.plus", spec: { kind: "charge", charge: 1 } },
     { tool: "tool.minus", spec: { kind: "charge", charge: -1 } },
     { tool: "tool.plusPlain", spec: { kind: "charge", charge: 1, chargeStyle: "plain" } },
@@ -690,27 +692,32 @@ describe("canvas ring-fill layers", () => {
     { tool: "tool.radicalAnion", spec: { kind: "charge", charge: -1, radical: true } },
     { tool: "tool.radical", spec: { kind: "radical-dot" } },
     { tool: "tool.lonePair", spec: { kind: "lone-pair" } }
-  ] as const)("repositions $tool marks from their blank grab area without duplicating them", async ({ tool, spec }) => {
-    saveDirectElectronMarkEditing(true);
+  ] as const).flatMap(item => (item.spec.kind === "charge" ? [false, true] : [true])
+    .map(directEditing => ({ ...item, directEditing }))))(
+    "repositions $tool marks from their blank grab area without duplicating them (direct editing: $directEditing)", async ({ tool, spec, directEditing }) => {
+    saveDirectElectronMarkEditing(directEditing);
     const initial = applyChargeToolAtPoint(createPhase4Document("Move electron marks"), spec, { x: 300, y: 300 });
     const mark = initial.pages[0].objects[0] as ElectronMarkObject;
     await renderDocument(initial, tool);
     const snapshot = () => window.__CHEMDRAFT_AGENT__!.snapshot().document;
-    // This corner is outside the painted dot/sign/circle but inside the mark's frame.
-    const start = { x: mark.x + 1, y: mark.y + 1 };
+    // Grab outside even the saved frame, inside the larger canvas-only target.
+    // Every electron mark can be grabbed beyond the previous 24px target.
+    const padding = 7;
+    const start = { x: mark.x - padding, y: mark.y - padding };
     const end = { x: start.x + 45, y: start.y + 30 };
     const hit = objectVisual(mark.id)!.querySelector('rect[pointer-events="all"]')!;
     expect(hit).not.toBeNull();
     expect(hit.getAttribute("fill")).toBe("transparent");
-    expect(Number(hit.getAttribute("width"))).toBe(mark.width);
+    expect(Number(hit.getAttribute("width"))).toBe(36);
+    expect(Number(hit.getAttribute("x"))).toBeLessThan(start.x);
     await pointer(hit, "pointerdown", start);
     await pointer(hit, "pointermove", end);
     await pointer(hit, "pointerup", end);
     expect(snapshot().pages[0].objects).toHaveLength(1);
     expect(snapshot().pages[0].objects[0]).toMatchObject({
       id: mark.id, x: mark.x + 45, y: mark.y + 30,
-      // Main's floating radical/lone-pair point anchors retain their original coordinates.
-      anchor: spec.kind === "charge" ? { kind: "point", point: { x: 345, y: 330 } } : mark.anchor
+      // old -> new: radical/lone-pair anchors now record the dropped centre, like charges, with an explicit floating decision.
+      anchor: { kind: "point", point: { x: 345, y: 330 } }
     });
     await command("edit.undo");
     expect(container.querySelector("[data-status-message]")?.textContent).toBe("Undid Move electron mark");
@@ -724,6 +731,40 @@ describe("canvas ring-fill layers", () => {
     await pointer(selectHit, "pointerup", start);
     expect(snapshot().pages[0].objects[0]).toMatchObject({ x: mark.x, y: mark.y });
     expect(snapshot().pages[0].objects).toHaveLength(1);
+  });
+
+  it.each((["charge", "radical-dot", "lone-pair"] as const).flatMap(kind =>
+    [false, true].map(stretch => ({ kind, stretch }))))(
+    "keeps $kind corner resizing separate from its larger move target (stretch: $stretch)", async ({ kind, stretch }) => {
+    saveDirectElectronMarkEditing(true);
+    const initial = applyChargeToolAtPoint(createPhase4Document("Charge grab and stretch"),
+      kind === "charge" ? { kind, charge: 1 } : { kind }, { x: 300, y: 300 });
+    const mark = initial.pages[0].objects[0] as ElectronMarkObject;
+    const beforeSvg = exportDocumentToSvg(initial).contents;
+    await renderDocument(initial);
+    const snapshot = () => window.__CHEMDRAFT_AGENT__!.snapshot().document;
+    const frame = electronMarkInteractionFrames(mark, 1).controls;
+    const start = { x: mark.x + frame.x + frame.width, y: mark.y + frame.y + frame.height };
+    const end = { x: start.x + 24, y: start.y + 12 };
+    const handle = container.querySelector(`[data-object-controls="${mark.id}"] [data-object-resize-corner="bottom-right"]`)!;
+    const page = container.querySelector(".page")!;
+    expect(handle).not.toBeNull();
+    expect(exportDocumentToSvg(snapshot()).contents).toBe(beforeSvg);
+    await pointer(handle, "pointerdown", start, 1, stretch);
+    expect(snapshot().pages[0].objects[0]).toEqual(mark);
+    await pointer(page, "pointermove", end, 1, stretch);
+    await pointer(page, "pointerup", end, 0, stretch);
+    const resized = snapshot().pages[0].objects[0];
+    expect(resized.width).toBeGreaterThan(mark.width);
+    expect(resized.height).toBeGreaterThan(mark.height);
+    if (stretch) expect(resized.width).toBeGreaterThan(resized.height);
+    else expect(resized.width).toBeCloseTo(resized.height);
+    expect(snapshot().pages[0].objects).toHaveLength(1);
+    await command("edit.undo");
+    expect(snapshot().pages[0].objects[0]).toEqual(mark);
+    expect(exportDocumentToSvg(snapshot()).contents).toBe(beforeSvg);
+    await command("edit.redo");
+    expect(snapshot().pages[0].objects[0]).toEqual(resized);
   });
 
   it.each(["charge", "radical-dot", "lone-pair"] as const)(
@@ -767,7 +808,7 @@ describe("canvas ring-fill layers", () => {
     const initial = applyChargeToolAtPoint(createPhase4Document("Legacy electron tools"), { kind }, { x: 300, y: 300 });
     const mark = initial.pages[0].objects[0] as ElectronMarkObject;
     await renderDocument(initial, kind === "radical-dot" ? "tool.radical" : "tool.lonePair");
-    expect(objectVisual(mark.id)?.querySelector('[pointer-events="all"]')).toBeNull();
+    expect(objectVisual(mark.id)?.querySelector('[data-electron-mark-hit-target]')).not.toBeNull();
     expect(container.querySelector(`[data-object-controls="${mark.id}"] [data-object-resize-corner]`)).toBeNull();
     expect(container.querySelector(`[data-object-controls="${mark.id}"] [data-selection-rotate-handle]`)).toBeNull();
     const ink = objectVisual(mark.id)!.querySelector("circle")!;
@@ -781,11 +822,13 @@ describe("canvas ring-fill layers", () => {
     await pointer(selectedInk, "pointermove", { x: 345, y: 330 });
     await pointer(selectedInk, "pointerup", { x: 345, y: 330 });
     expect(window.__CHEMDRAFT_AGENT__!.snapshot().document.pages[0].objects[0]).toMatchObject({
-      x: mark.x + 45, y: mark.y + 30, anchor: mark.anchor
+      x: mark.x + 45, y: mark.y + 30,
+      // old -> new: the floating point anchor follows the dropped centre even with direct editing off.
+      anchor: { kind: "point", point: { x: 345, y: 330 } }
     });
   });
 
-  it.each(["atom", "bond", "ring"] as const)("keeps a blank mark corner above a %s click-through by default, and catches it only after opt-in", async targetKind => {
+  it.each(["atom", "bond", "ring"] as const)("resolves a blank mark corner above a %s with either editing preference", async targetKind => {
     const fixture = ringLetterDocument(fills[0].style);
     const molecule = fixture.molecule;
     const a = molecule.atoms[0], b = molecule.atoms[1];
@@ -797,7 +840,7 @@ describe("canvas ring-fill layers", () => {
     await renderDocument(initial, "tool.select", false);
     if (targetKind === "ring") await command("view.toggleRingInspector");
     const visual = objectVisual(mark.id)!;
-    expect(visual.querySelector('[pointer-events="all"]')).toBeNull();
+    expect(visual.querySelector('[data-electron-mark-hit-target]')).not.toBeNull();
     // Confirm this is an actual blank part of the shared render output, then route to the
     // underlying atom/bond/ring. jsdom cannot perform the browser's own SVG hit testing.
     expect(darkPixels(`<svg xmlns="http://www.w3.org/2000/svg" width="816" height="1056">${visual.innerHTML}</svg>`,
@@ -812,8 +855,10 @@ describe("canvas ring-fill layers", () => {
     const catcher = objectVisual(mark.id)!.querySelector('[data-electron-mark-hit-target]')!;
     expect(catcher).not.toBeNull();
     await pointer(catcher, "pointerdown", point);
-    await pointer(catcher, "pointerup", point);
-    expect(window.__CHEMDRAFT_AGENT__!.snapshot().document.selection.objectIds).toEqual([mark.id]);
+    // A nearer molecule receives pointer capture; jsdom does not route that release for us.
+    await pointer(targetKind === "ring" ? catcher : moleculeLayer(molecule.id), "pointerup", point);
+    if (targetKind === "ring") expect(window.__CHEMDRAFT_AGENT__!.snapshot().document.selection.objectIds).toEqual([mark.id]);
+    else expect(window.__CHEMDRAFT_AGENT__!.snapshot().document.selection.objectIds).not.toContain(mark.id);
   });
 
   it.each(["size", "thickness"] as const)("cancels %s previews and commits multiple previews as one labelled Undo entry", async property => {
@@ -833,11 +878,11 @@ describe("canvas ring-fill layers", () => {
   });
 
   it("applies the preference live without editing the document and keeps authored styling after opt-out", async () => {
-    const initial = applyChargeToolAtPoint(createPhase4Document("Preference toggle"), { kind: "charge", charge: 1, radical: true }, { x: 300, y: 300 });
+    const initial = applyChargeToolAtPoint(createPhase4Document("Preference toggle"), { kind: "lone-pair" }, { x: 300, y: 300 });
     const mark = initial.pages[0].objects[0] as ElectronMarkObject;
     await renderDocument(initial);
     const initialPaint = objectVisual(mark.id)!.innerHTML;
-    expect(objectVisual(mark.id)?.querySelector('[data-electron-mark-hit-target]')).toBeNull();
+    expect(objectVisual(mark.id)?.querySelector('[data-electron-mark-hit-target]')).not.toBeNull();
     await act(async () => { window.dispatchEvent(new KeyboardEvent("keydown", { key: "Shift", shiftKey: true })); });
     expect(container.querySelector(`[data-object-controls="${mark.id}"] [data-selection-rotate-handle]`)).toBeNull();
     await act(async () => {
@@ -848,7 +893,7 @@ describe("canvas ring-fill layers", () => {
     expect(container.querySelector(`[data-object-controls="${mark.id}"] [data-object-resize-corner]`)).not.toBeNull();
     expect(container.querySelector(`[data-object-controls="${mark.id}"] [data-selection-rotate-handle]`)).not.toBeNull();
     await act(async () => { window.dispatchEvent(new KeyboardEvent("keyup", { key: "Shift" })); });
-    expect(objectVisual(mark.id)!.innerHTML).not.toBe(initialPaint);
+    expect(objectVisual(mark.id)!.innerHTML).toBe(initialPaint);
     await act(async () => {
       saveDirectElectronMarkEditing(false);
       await broadcastElectronMarkEditingSettings(false);

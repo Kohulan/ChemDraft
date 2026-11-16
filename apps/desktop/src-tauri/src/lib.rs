@@ -41,6 +41,7 @@ mod webview_context_menus;
 #[cfg(test)]
 mod webview_context_menus_tests;
 mod window_drag;
+mod windows_activation_log;
 mod windows_clipboard;
 
 use clipboard_formats::{
@@ -1175,6 +1176,7 @@ const MAIN_WINDOW_TITLE_GRAB_PT: f64 = 22.0;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let perf_enabled = agent_bridge_status().enabled;
+    windows_activation_log::init(perf_enabled);
     let perf_log = perf_log::PerfLog::new(perf_enabled);
     let builder = tauri::Builder::default();
 
@@ -1673,6 +1675,7 @@ pub fn run() {
             cancel_quit,
             close_toolset_popover,
             route_toolset_command,
+            set_palette_command_hit_boxes,
             sync_plugin_menu_items,
             read_clipboard_payload,
             write_clipboard_items,
@@ -2557,8 +2560,8 @@ async fn suspend_toolset_windows(
                     ))
                 })
                 .collect::<Result<_, String>>()?;
-            // Only the first acquisition reads the native order. A nested prompt must keep the
-            // first snapshot, including while waiting for a minimized document to return.
+            // Only the first acquisition reads the native order. Nested prompts and re-acquisition
+            // during pending restoration keep the original order; newly visible windows join it.
             let top_to_bottom = if UTILITY_SUSPENSION
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4430,7 +4433,7 @@ async fn set_plugin_panel_input_focus(
                             windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow()
                                 == hwnd
                         };
-                        if !panel_window::focus_if_app_active(hwnd) {
+                        if !panel_window::focus_if_app_active(hwnd, pointer_before.is_none()) {
                             return Ok(false);
                         }
                         // A native colour popup may have opened during the click default before
@@ -5961,6 +5964,7 @@ async fn open_toolset_popover(
         // can nudge an NSWindow's frame, and the first open after a prewarm used to land the
         // popover away from its anchor. An explicit LogicalPosition set is the final word in
         // both the warm and cold paths.
+        panel_window::set_popover_content(&window, &kind)?;
         configure_toolset_popover_window(&window, focus_mode)?;
         window
             .set_title(toolset_popover_title(&label, &kind))
@@ -6011,7 +6015,7 @@ async fn prewarm_toolset_tooltip(app: tauri::AppHandle) -> Result<(), String> {
 fn toolset_popover_title(label: &str, kind: &str) -> &'static str {
     if label == toolset_popover_window_label("core.bondStereo") {
         "E/Z not specified"
-    } else if kind == "artColor" {
+    } else if matches!(kind, "artColor" | "textColor") {
         "ChemDraft color picker"
     } else {
         "ChemDraft tools"
@@ -6078,6 +6082,7 @@ fn build_toolset_popover_window(
     disable_default_context_menus(&window);
     configure_toolset_popover_window(&window, focus_mode)?;
     install_toolset_input_focus(&window)?;
+    panel_window::set_popover_content(&window, kind)?;
     // Re-assert the anchor as the FINAL step, mirroring the warm path: panel configuration
     // can nudge the frame, and builder-time positioning has proven less trustworthy than an
     // explicit post-build LogicalPosition set (first opens landed away from the anchor).
@@ -6087,7 +6092,7 @@ fn build_toolset_popover_window(
 }
 
 /// Reapply the requested focus policy on every reuse, including keyboard → mouse.
-/// Only E/Z keyboard opens use Focus; palette colour fields borrow the keyboard through
+/// Only macOS E/Z keyboard opens use Focus; palette colour fields borrow the keyboard through
 /// the guarded input lease instead (see `effective_toolset_popover_focus_mode`).
 fn configure_toolset_popover_window<R: Runtime>(
     window: &tauri::WebviewWindow<R>,
@@ -6111,10 +6116,7 @@ fn configure_toolset_popover_window<R: Runtime>(
                 SetWindowLongPtrW(
                     hwnd,
                     GWL_EXSTYLE,
-                    toolset_popover_extended_style(
-                        GetWindowLongPtrW(hwnd, GWL_EXSTYLE),
-                        focus_mode,
-                    ),
+                    toolset_popover_extended_style(GetWindowLongPtrW(hwnd, GWL_EXSTYLE)),
                 );
             }
         }
@@ -6123,16 +6125,11 @@ fn configure_toolset_popover_window<R: Runtime>(
 }
 
 #[cfg(windows)]
-fn toolset_popover_extended_style(style: isize, focus_mode: ToolsetPopoverFocusMode) -> isize {
+fn toolset_popover_extended_style(style: isize) -> isize {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     };
-    let style = (style | WS_EX_TOOLWINDOW as isize) & !(WS_EX_APPWINDOW as isize);
-    if focus_mode == ToolsetPopoverFocusMode::Preserve {
-        style | WS_EX_NOACTIVATE as isize
-    } else {
-        style & !(WS_EX_NOACTIVATE as isize)
-    }
+    (style | (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) as isize) & !(WS_EX_APPWINDOW as isize)
 }
 
 #[tauri::command]
@@ -6150,16 +6147,24 @@ fn toolset_popover_window_label(toolset_id: &str) -> String {
 
 /// Palette popovers (colour pickers and flyouts) never take key status when they open: their
 /// text fields borrow the keyboard through the guarded input lease (`install_toolset_input_focus`),
-/// like palette settings. Only the E/Z popover honours a keyboard open's request for real focus,
-/// because its choices are buttons, which never lease.
+/// like palette settings. macOS E/Z keyboard opens retain native focus; Windows
+/// routes navigation from the document and never grants this exception.
 fn effective_toolset_popover_focus_mode(
     label: &str,
     requested: ToolsetPopoverFocusMode,
 ) -> ToolsetPopoverFocusMode {
-    if label == toolset_popover_window_label("core.bondStereo") {
-        requested
-    } else {
+    #[cfg(windows)]
+    {
+        let _ = (label, requested);
         ToolsetPopoverFocusMode::Preserve
+    }
+    #[cfg(not(windows))]
+    {
+        if label == toolset_popover_window_label("core.bondStereo") {
+            requested
+        } else {
+            ToolsetPopoverFocusMode::Preserve
+        }
     }
 }
 
@@ -6307,6 +6312,7 @@ fn show_toolset_popover_window(
     // The page owns the live content, including a prewarmed/reused Art window switching
     // between its colour picker and command flyouts. Titles are fixed native strings.
     if let Some(kind) = kind {
+        panel_window::set_popover_content(&window, &kind)?;
         window
             .set_title(toolset_popover_title(window.label(), &kind))
             .map_err(|error| error.to_string())?;
@@ -6506,6 +6512,37 @@ fn build_toolset_tooltip_window(app: &tauri::AppHandle) -> Result<(), String> {
     window
         .set_ignore_cursor_events(true)
         .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn set_palette_command_hit_boxes(
+    window: tauri::WebviewWindow,
+    boxes: Vec<panel_window::PaletteCommandHitBox>,
+) -> Result<(), String> {
+    if ![
+        "toolset-core-",
+        "toolset-plugin-",
+        "toolset-user-",
+        "toolset-popover-",
+    ]
+    .iter()
+    .any(|prefix| window.label().starts_with(prefix))
+    {
+        return Err("Expected a tool palette.".into());
+    }
+    #[cfg(windows)]
+    {
+        let hwnd = window.hwnd().map_err(|error| error.to_string())?.0;
+        let (chooser_rects, boxes): (Vec<_>, Vec<_>) =
+            boxes.into_iter().partition(|rect| rect.native_chooser);
+        log::debug!(target: "chemdraft::windows_activation",
+            "set_palette_command_hit_boxes label={} count={} chooser_rects={}",
+            window.label(), boxes.len(), chooser_rects.len());
+        panel_window::set_palette_command_hit_boxes(hwnd as isize, boxes, chooser_rects);
+    }
+    #[cfg(not(windows))]
+    let _ = boxes;
     Ok(())
 }
 
@@ -12547,8 +12584,8 @@ mod tests {
     #[test]
     fn registered_commands_have_permissions_and_capability_grants() {
         let lib_source = include_str!("lib.rs");
-        let capability = format!(
-            "{}{}{}{}{}{}{}{}{}",
+        let capability = concat!(
+            include_str!("../capabilities/toolset-command-hit-boxes.json"),
             include_str!("../capabilities/palette-focus-diagnostic.json"),
             include_str!("../capabilities/window-drag.json"),
             include_str!("../capabilities/default.json"),
@@ -12746,17 +12783,12 @@ mod tests {
             WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
         };
         assert_bond_stereo_mouse_creation();
-        let style = toolset_popover_extended_style(
-            WS_EX_APPWINDOW as isize,
-            ToolsetPopoverFocusMode::Preserve,
-        );
+        let style = toolset_popover_extended_style(WS_EX_APPWINDOW as isize);
         assert_ne!(style & WS_EX_NOACTIVATE as isize, 0);
         assert_ne!(style & WS_EX_TOOLWINDOW as isize, 0);
         assert_eq!(style & WS_EX_APPWINDOW as isize, 0);
-        // Reusing the same window for an explicit keyboard focus lease must work.
-        let focused = toolset_popover_extended_style(style, ToolsetPopoverFocusMode::Focus);
-        assert_eq!(focused & WS_EX_NOACTIVATE as isize, 0);
-        assert_ne!(focused & WS_EX_TOOLWINDOW as isize, 0);
+        // Reuse keeps the no-activation style, including keyboard E/Z opens.
+        assert_eq!(toolset_popover_extended_style(style), style);
     }
 
     #[cfg(not(windows))]
@@ -12824,7 +12856,11 @@ mod tests {
         let bond_stereo = toolset_popover_window_label("core.bondStereo");
         assert!(
             effective_toolset_popover_focus_mode(&bond_stereo, ToolsetPopoverFocusMode::Focus)
-                == ToolsetPopoverFocusMode::Focus
+                == if cfg!(windows) {
+                    ToolsetPopoverFocusMode::Preserve
+                } else {
+                    ToolsetPopoverFocusMode::Focus
+                }
         );
         assert!(
             effective_toolset_popover_focus_mode(&bond_stereo, ToolsetPopoverFocusMode::Preserve)

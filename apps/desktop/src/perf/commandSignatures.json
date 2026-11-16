@@ -593,6 +593,14 @@
   },
   {
     "file": "lib.rs",
+    "name": "set_palette_command_hit_boxes",
+    "async": false,
+    "generics": "",
+    "parameters": "window: tauri::WebviewWindow, boxes: Vec<panel_window::PaletteCommandHitBox>,",
+    "returnType": "Result<(), String>"
+  },
+  {
+    "file": "lib.rs",
     "name": "route_toolset_command",
     "async": false,
     "generics": "",

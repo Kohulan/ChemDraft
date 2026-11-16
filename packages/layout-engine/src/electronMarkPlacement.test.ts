@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { ElectronMarkObject, MoleculeObject } from "@chemdraft/chem-core";
-import { electronMarkPlacementPointForAtom, lonePairDragDirection, lonePairPlacementPlanForAtom, moleculeLayoutLabelBoxes } from "./index";
+import type { DocumentObject, ElectronMarkObject, MoleculeObject } from "@chemdraft/chem-core";
+import { electronMarkPlacementPointForAtom, lonePairDragDirection, lonePairPlacementPlanForAtom, moleculeLayoutLabelBoxes, nativeChargePlacementPointForAtom, nativeRadicalPlacementPointForAtom, transformPointForObject } from "./index";
 
 describe("lone-pair drag direction", () => {
   const atom = { x: 210, y: 175 };
@@ -17,6 +17,98 @@ describe("lone-pair drag direction", () => {
     expect(lonePairDragDirection(atom, atom)).toBeUndefined();
     expect(lonePairDragDirection(atom, { x: NaN, y: 1 })).toBeUndefined();
     expect(lonePairDragDirection({ x: Infinity, y: 1 }, pointer(100))).toBeUndefined();
+  });
+});
+describe("repeated radical placement", () => {
+  it.each([
+    { name: "bonded repro", element: "C", neighbors: [[189, 181], [189, 219]] },
+    { name: "unbonded atom", element: "C", neighbors: [] },
+    { name: "terminal atom", element: "C", neighbors: [[178, 200]] },
+    { name: "three bonds", element: "C", neighbors: [[178, 200], [211, 181], [211, 219]] },
+    { name: "labeled heteroatom", element: "N", neighbors: [[189, 181], [189, 219]] }
+  ])("keeps two and three dots clear on a $name and preserves its first placement", ({ element, neighbors }) => {
+    const molecule: MoleculeObject = { id: "molecule", type: "molecule", x: 178, y: 181, width: 33, height: 38,
+      rotation: 0, style: {}, structureFormat: "smiles", structure: "", atoms: [
+        { id: "atom", element, formalCharge: 0, x: 200, y: 200 },
+        ...neighbors.map(([x, y], index) => ({ id: `neighbor_${index}`, element: "C", formalCharge: 0, x, y }))
+      ], bonds: neighbors.map((_, index) => ({ id: `bond_${index}`, fromAtomId: "atom", toAtomId: `neighbor_${index}`, order: "single" })),
+      superatoms: [], rGroups: [] };
+    const objects: DocumentObject[] = [molecule];
+    const first = nativeRadicalPlacementPointForAtom(molecule, "atom", objects, 792, 612)!;
+    expect(first).toEqual(nativeChargePlacementPointForAtom(molecule, "atom", objects, 792, 612));
+    // The charge-tool oracle in the desktop suite freezes HEAD's first-dot arithmetic.
+    const centers = [first];
+    for (let index = 0; index < 3; index++) {
+      const point = index === 0 ? first : nativeRadicalPlacementPointForAtom(molecule, "atom", objects, 792, 612)!;
+      if (index > 0) centers.push(point);
+      objects.push({ id: `dot_${index}`, type: "electron-mark", markKind: "radical-dot",
+        x: point.x - 9, y: point.y - 9, width: 18, height: 18, rotation: 0, style: {},
+        anchor: { kind: "atom", objectId: molecule.id, atomId: "atom" } });
+    }
+    for (let index = 1; index < centers.length; index++) for (const earlier of centers.slice(0, index)) {
+      const point = centers[index];
+      expect(Math.hypot(point.x - earlier.x, point.y - earlier.y), `dot ${index + 1} centre distance`).toBeGreaterThanOrEqual(4.2);
+      expect(Math.abs(point.x - earlier.x) >= 18 || Math.abs(point.y - earlier.y) >= 18,
+        `dot ${index + 1} frame must not overlap`).toBe(true);
+    }
+  });
+
+  it.each([0, 65])("searches an outer ring when every first-ring frame is occupied (rotation %s)", rotation => {
+    const molecule: MoleculeObject = { id: "molecule", type: "molecule", x: 200, y: 200, width: 0, height: 0,
+      rotation, style: {}, structureFormat: "smiles", structure: "", atoms: [
+        { id: "atom", element: "C", formalCharge: 0, x: 200, y: 200 }
+      ], bonds: [], superatoms: [], rGroups: [] };
+    const marks: ElectronMarkObject[] = Array.from({ length: 16 }, (_, index) => {
+      const angle = -Math.PI + index * Math.PI / 8;
+      const center = transformPointForObject(molecule, { x: 200 + 24.3 * Math.cos(angle), y: 200 + 24.3 * Math.sin(angle) });
+      return { id: `dot_${index}`, type: "electron-mark", markKind: "radical-dot", x: center.x - 9, y: center.y - 9,
+        width: 18, height: 18, rotation: 0, style: {}, anchor: { kind: "atom", objectId: molecule.id, atomId: "atom" } };
+    });
+    const point = nativeRadicalPlacementPointForAtom(molecule, "atom", [molecule, ...marks], 792, 612)!;
+    expect(point).toBeDefined();
+    expect(Math.hypot(point.x - 200, point.y - 200)).toBeGreaterThan(24.3 + 1e-8);
+    for (const mark of marks) {
+      expect(Math.abs(point.x - mark.x - 9) >= 20 || Math.abs(point.y - mark.y - 9) >= 20).toBe(true);
+    }
+  });
+
+  it.each([0, 65])("clears final clamped frames at a page corner (rotation %s)", rotation => {
+    const molecule: MoleculeObject = { id: "molecule", type: "molecule", x: 9, y: 9, width: 0, height: 0,
+      rotation, style: {}, structureFormat: "smiles", structure: "", atoms: [
+        { id: "atom", element: "N", formalCharge: 0, x: 9, y: 9 }
+      ], bonds: [], superatoms: [], rGroups: [] };
+    const objects: DocumentObject[] = [molecule];
+    for (let index = 0; index < 3; index++) {
+      const point = nativeRadicalPlacementPointForAtom(molecule, "atom", objects, 792, 612)!;
+      expect(point).toBeDefined();
+      const center = { x: Math.max(9, Math.min(point.x, 783)), y: Math.max(9, Math.min(point.y, 603)) };
+      for (const object of objects) if (object.type === "electron-mark") {
+        expect(Math.abs(center.x - object.x - 9) >= 20 || Math.abs(center.y - object.y - 9) >= 20).toBe(true);
+      }
+      objects.push({ id: `dot_${index}`, type: "electron-mark", markKind: "radical-dot",
+        x: center.x - 9, y: center.y - 9, width: 18, height: 18, rotation: 0, style: {},
+        anchor: { kind: "atom", objectId: molecule.id, atomId: "atom" } });
+    }
+  });
+
+  it.each([0, 65])("uses the charge tool's existing open-angle search at rotation %s", rotation => {
+    const molecule: MoleculeObject = { id: "molecule", type: "molecule", x: 200, y: 200, width: 0, height: 0,
+      rotation, style: {}, structureFormat: "smiles", structure: "", atoms: [
+        { id: "atom", element: "C", formalCharge: 0, x: 200, y: 200 }
+      ], bonds: [], superatoms: [], rGroups: [] };
+    const first = nativeRadicalPlacementPointForAtom(molecule, "atom", [molecule], 792, 612)!;
+    expect(first).toEqual(nativeChargePlacementPointForAtom(molecule, "atom", [molecule], 792, 612));
+    const mark: ElectronMarkObject = { id: "first", type: "electron-mark", markKind: "radical-dot",
+      x: first.x - 9, y: first.y - 9, width: 18, height: 18, rotation: 0, style: {},
+      anchor: { kind: "atom", objectId: molecule.id, atomId: "atom" } };
+    const second = nativeRadicalPlacementPointForAtom(molecule, "atom", [molecule, mark], 792, 612)!;
+    const localCenter = transformPointForObject({ ...molecule, rotation: -rotation }, first);
+    const existingSearch = electronMarkPlacementPointForAtom(molecule, "atom", [molecule, {
+      ...mark, markKind: "charge", x: localCenter.x - 9, y: localCenter.y - 9
+    }],
+      792, 612, { avoidLabelOverlap: false })!;
+    expect(second).toEqual(transformPointForObject(molecule, existingSearch));
+    expect(Math.abs(second.x - first.x) >= 18 || Math.abs(second.y - first.y) >= 18).toBe(true);
   });
 });
 
@@ -160,5 +252,39 @@ describe("lone-pair placement plans", () => {
     expect(lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule], 792, 612, Infinity)).toBeUndefined();
     molecule.atoms[0].x = 5;
     expect(lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule], 792, 612, Math.PI)).toBeUndefined();
+  });
+});
+
+
+describe("mixed charge and radical placement", () => {
+  it.each([0, 65])("clears the existing mark in both creation orders at rotation %s", rotation => {
+    for (const firstKind of ["charge", "radical-dot"] as const) {
+      for (const coordinate of [9, 200]) for (const size of [18, 48]) {
+        const molecule: MoleculeObject = { id: "molecule", type: "molecule",
+          x: coordinate, y: coordinate, width: 0, height: 0, rotation, style: {},
+          structureFormat: "smiles", structure: "", atoms: [
+            { id: "nitrogen", element: "N", formalCharge: 1, x: coordinate, y: coordinate }
+          ], bonds: [], superatoms: [], rGroups: [] };
+        const firstPoint = nativeChargePlacementPointForAtom(molecule, "nitrogen", [molecule], 792, 612)!;
+        const half = size / 2;
+        const first: ElectronMarkObject = { id: "existing", type: "electron-mark", markKind: firstKind,
+          ...(firstKind === "charge" ? { charge: 1 } : {}),
+          x: Math.max(half, Math.min(firstPoint.x, 792 - half)) - half,
+          y: Math.max(half, Math.min(firstPoint.y, 612 - half)) - half,
+          width: size, height: size, rotation: 37, style: {},
+          anchor: { kind: "atom", objectId: molecule.id, atomId: "nitrogen" } };
+        const objects = [molecule, first];
+        const before = JSON.stringify(objects);
+        const place = firstKind === "charge" ? nativeRadicalPlacementPointForAtom : nativeChargePlacementPointForAtom;
+        const next = place(molecule, "nitrogen", objects, 792, 612)!;
+        expect(next).toBeDefined();
+        const center = { x: Math.max(9, Math.min(next.x, 783)), y: Math.max(9, Math.min(next.y, 603)) };
+        const rotatedHalf = half * (Math.abs(Math.cos(37 * Math.PI / 180)) + Math.abs(Math.sin(37 * Math.PI / 180)));
+        expect(Math.abs(center.x - first.x - half) >= 9 + rotatedHalf + 2 - 1e-8 ||
+          Math.abs(center.y - first.y - half) >= 9 + rotatedHalf + 2 - 1e-8,
+          `${firstKind} first, size ${size}, coordinate ${coordinate}`).toBe(true);
+        expect(JSON.stringify(objects)).toBe(before);
+      }
+    }
   });
 });

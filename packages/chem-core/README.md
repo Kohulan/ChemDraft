@@ -52,9 +52,18 @@ ignorable headers are omitted for plain 1.1.1 documents. See
 [the native compatibility contract](../../docs/architecture/native-document-compatibility.md).
 
 Preservation follows unique IDs. Identity-free arrays restore only while their known content is
-unchanged. Edits drop their future data with logged `NATIVE_EXTENSION_DATA_DROPPED` warnings;
+unchanged. A mismatch permanently retires restoration even if matching content is later reinserted;
+the pending loss warning remains in the snapshot, and undo restores eligibility exactly.
+Edits drop their future data with logged `NATIVE_EXTENSION_DATA_DROPPED` warnings;
 `serializeDocumentWithWarnings` returns `{ contents, warnings }`, and the validated container API
 `prepareNativeDocumentForSerializationWithWarnings` returns `{ value, warnings }`.
+Object and nested atom/bond deletion retires the corresponding extension state in the patch result;
+undo and redo retain exact snapshots, including that state. `copyNativeObjectExtensions` transfers
+only copied objects' state to their new page/object IDs, retaining molecule-local atom/bond IDs and
+the source version/ignorable-field contract. Native clipboard serialization reconstructs source
+values and reads them through the normal native reader on paste; it never accepts a clipboard
+extension-state sidecar. Foreign chemistry copy refuses preserved values it cannot represent and
+returns a user-visible explanation.
 
 `DocumentPage` optionally carries `compatibility` using the same metadata schema as document objects.
 CDXML/CDX import uses it to retain source page and print settings, including page counts that have
@@ -97,8 +106,20 @@ optional safe positive integer (meaningful for a multiple group); `label` remain
 needed. Pair cleanup removes all multiplier and crossing metadata from an orphan, and patches
 prune references to deleted bonds or molecules. Copies carry references only to copied objects.
 
-`bracketChemistryWarnings` reads live document membership, preserved atom membership, crossing
-references, and geometric enclosure. Cached formula and mass metadata carry
+`resolveRepeatUnitAtomMembership` is the shared pure atom-membership resolver for bracket status,
+CDXML/CDX and MOL export, analysis guards and subject keys, and structure search. Explicit native
+object members include all their atoms; other native members come from individual atom coordinates
+inside the bracket pair's box or a crossing's recorded inner component. Imported source ids resolve
+only through scoped native member records, with identity snapshots checked before MOL SRU output;
+unresolved imports never acquire members from geometry. Crossings also report the atoms they touch,
+so an unresolved group can refuse search without assigning unrelated or empty brackets to a molecule.
+Callers pass layout-engine's atom-position transform for rotated molecules. Rotated bracket pairs
+resolve enclosure in their common planar frame, using the tiny pure `rotatePointAboutCenter`
+helper shared with the renderer. Unknown or projected frames never supply guessed atom members.
+Every invalid membership carries both `unresolved: true` and a specific `reason`, including
+inconsistent crossing-bond boundaries.
+
+`bracketChemistryWarnings` uses that resolver, including partial repeat units. Cached formula and mass metadata carry
 `chemistry.bracket_multiplier` warnings after loading or patching; values describe one drawn copy,
 never an expanded polymer or multiplier. `moleculeBracketWarningMessages` lets graph consumers keep
 that context when only a molecule is available. The MOL writers return those warnings too; callers

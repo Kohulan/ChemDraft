@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ChemDraftSyntheticStylePreset, type ChemDraftDocument, type DocumentObject, type ElectronMarkObject, type MoleculeAtom,
   type MoleculeObject } from "@chemdraft/chem-core";
-import { clamp, distance, lonePairPlacementPlanForAtom, type LayoutPoint } from "@chemdraft/layout-engine";
+import { clamp, distance, lonePairPlacementPlanForAtom, transformPointForObject, type LayoutPoint } from "@chemdraft/layout-engine";
 import { nativeSingleBondGraphMetadata, nativeSingleBondGraphSmiles, stereoPerceptionMolfile } from "@chemdraft/document-workflow-core";
 import { ensureRdkit, resetRdkitForTesting } from "../../../packages/rdkit-adapter/src/conformer";
 import { installRealRdkitModuleLoader } from "../../../packages/rdkit-adapter/src/testing";
@@ -140,6 +140,17 @@ describe("charge-tool placement equivalence with ee50d782", () => {
   it("returns no point for a missing atom", () => {
     const molecule = placementFixture("terminal", "N", { x: 300, y: 300 }, 0, 15);
     expect(nativeChargePlacementPointForAtom(molecule, "missing", [molecule], 792, 612)).toBeUndefined();
+  });
+
+  it("retains the tool's growth slot in page coordinates for rotated molecules with custom bond styles", () => {
+    for (const shape of ["isolated", "terminal", "ring", "blocked"] as const) {
+      const molecule = placementFixture(shape, "C", { x: 300, y: 300 }, 0, 15);
+      molecule.rotation = 65;
+      molecule.style = { ...molecule.style, bondLengthPx: 45, chainAngleDegrees: 105 };
+      const local = legacyPlacementPoint(molecule, "atom_0", [molecule], 792, 612)!;
+      expect(nativeChargePlacementPointForAtom(molecule, "atom_0", [molecule], 792, 612))
+        .toEqual(transformPointForObject(molecule, local));
+    }
   });
 });
 

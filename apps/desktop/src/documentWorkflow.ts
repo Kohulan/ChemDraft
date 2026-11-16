@@ -1,4 +1,6 @@
-import { electronMarkPlacementPointForAtom, lonePairPlacementPlanForAtom } from "@chemdraft/layout-engine";
+import { bondDrawingToolCommandId } from "./bondToolCommands";
+import { lonePairPlacementPlanForAtom, nativeChargePlacementPointForAtom, nativeRadicalPlacementPointForAtom, nativeChargeMarkSizePx, nativeAtomHitRadiusPx } from "@chemdraft/layout-engine";
+export { nativeChargePlacementPointForAtom, nativeChargeMarkSizePx, nativeAtomHitRadiusPx } from "@chemdraft/layout-engine";
 import {
   assertMolfileExportIdentity, type ComputeStructureIdentifiers, moleculeToInteropMolfile,
   atomProblem, readNativeDocumentContents, formulaSpansFromText,
@@ -15,6 +17,7 @@ import { bracketVisualBounds } from "@chemdraft/layout-engine";
 import { repeatUnits, repeatUnitExportWarnings, repeatUnitMolfileGroups } from "@chemdraft/export-engine";
 import { nativeMoleculeLayoutQuality } from "./depiction2d/layoutQuality";
 import { planObjectArrangement, moleculeAnchorForArrangement, moleculeVisualBoundsForArrangement, textVisualBoundsForArrangement, type ArrangementLayout, type ArrangementOptions, type ArrangementItem, type LayoutBounds } from "@chemdraft/layout-engine";
+import { combinedLayoutBounds, planObjectAlignment, planObjectDistribution, type ObjectAlignMode, type ObjectDistributeAxis, type ObjectDistributeMode } from "@chemdraft/layout-engine";
 import { nativeFormattedTextObjectSize, reconcileReactionArrowAttachments } from "@chemdraft/document-workflow-core";
 import { withArrowAttachmentIds } from "@chemdraft/layout-engine";
 import { snapRotationDegrees } from "./rotationSnap";
@@ -75,16 +78,20 @@ import {
 } from "@chemdraft/art-engine";
 import {
   adoptDerivedDocument,
+  copyNativeObjectExtensions,
+  preservedNativeChemistryValues,
+  readDocument,
+  serializeDocument,
   bracketChemistryWarnings,
   bracketPairs,
   withoutBracketPairMetadata,
   moleculeBracketWarningMessages,
+  resolveRepeatUnitAtomMembership,
   applyPatch,
   applyPatches,
   ChemDraftSyntheticStylePreset,
   createEmptyDocument,
   createImageGraphicObject,
-  DocumentObjectSchema,
   createPageLayout,
   createCustomPageLayout,
   cssPxToPageSize,
@@ -374,6 +381,12 @@ export interface ChemDraftSelectionClipboardPayload {
   selectionIds: string[];
   bounds: SelectionBounds;
   warnings?: string[];
+  /** In-memory source state. Serialized clipboard objects carry the reconstructed native values
+   * and version headers instead, and are validated by the native reader when received. */
+  nativeSource?: ChemDraftDocument;
+  formatVersion?: string;
+  minAppVersion?: string;
+  ignorableFields?: string[];
 }
 
 export interface NativeTextSelectionRange {
@@ -761,6 +774,7 @@ function artArcTool(
 
 export interface NativeBondToolOptions {
   bondOrder?: NativeBondOrderValue;
+  bondStereo?: "either";
   bondStyle?: NativeBondDisplayStyle;
   /** Told why the tool refused to place the bond, so the caller can say so instead of guessing. */
   onRefusal?: (reason: string) => void;
@@ -860,9 +874,6 @@ const projectedPlaneTiltMaxDegrees = 360;
 export const documentObjectProjectedPlaneTiltMaxDegrees = projectedPlaneTiltMaxDegrees;
 
 export const projectedPlaneTiltMaxRadians = projectedPlaneTiltMaxDegrees * Math.PI / 180;
-
-export const nativeAtomHitRadiusPx = 8;
-export const nativeChargeMarkSizePx = 18;
 
 const nativeBondLength = nativeBondLengthPx;
 const nativeCarbonSingleBondLengthAngstrom = 1.56;
@@ -1017,6 +1028,7 @@ export function createNativeSingleBondMolecule(
     fromAtomId: leftAtom.id,
     toAtomId: rightAtom.id,
     order: options.bondOrder ?? "single",
+    ...(options.bondOrder === "double" && options.bondStereo === "either" ? { stereo: "either" as const } : {}),
     ...nativeBondDisplayObject(options.bondStyle),
     ...(options.bondOrder === "double" && loadDrawingSettings().defaultDoubleBond === "centred"
       ? { display: { ...nativeBondDisplayObject(options.bondStyle).display, doubleBondSide: "center" as const } }
@@ -1024,7 +1036,7 @@ export function createNativeSingleBondMolecule(
   }] satisfies MoleculeBond[];
   const geometry = moleculeGeometryFromAtoms(atoms);
 
-  return normalizeNativeMoleculeGeometry({
+  const molecule = normalizeNativeMoleculeGeometry({
     id: nextObjectId(document, "mol_bond"),
     type: "molecule",
     x: geometry.x,
@@ -1051,6 +1063,7 @@ export function createNativeSingleBondMolecule(
     superatoms: [],
     rGroups: []
   });
+  return options.bondStereo === "either" ? withStoredBondStereoMolfile(molecule) : molecule;
 }
 
 export function insertNativeSingleBondMolecule(
@@ -1445,10 +1458,15 @@ export function applyNativeChainTool(
 }
 
 export function nativeBondOrderForToolCommand(commandId: string): NativeBondOrderValue {
-  return commandId === "tool.doubleBond" ? "double" : commandId === "tool.tripleBond" ? "triple" : "single";
+  return commandId === "tool.doubleBond" || nativeBondStereoForToolCommand(commandId) === "either" ? "double" : commandId === "tool.tripleBond" ? "triple" : "single";
+}
+
+export function nativeBondStereoForToolCommand(commandId: string): "either" | undefined {
+  return commandId === bondDrawingToolCommandId("double", "either") ? "either" : undefined;
 }
 
 export function nativeBondStyleForToolCommand(commandId: string): NativeBondToolStyle | undefined {
+  if (nativeBondStereoForToolCommand(commandId)) return "solid";
   switch (commandId) {
     case "tool.bond":
     case "tool.doubleBond":
@@ -7548,11 +7566,15 @@ export function applyChargeToolAtNativeAtom(
     ? lonePairPlacementPlanForAtom(molecule, target.atomId, page.objects, page.width, page.height, directionRadians)
     : undefined;
   const point = normalized.kind === "lone-pair" ? placement?.center
-    : nativeChargePlacementPointForAtom(molecule, target.atomId, page.objects, page.width, page.height);
+    : (normalized.kind === "radical-dot" ? nativeRadicalPlacementPointForAtom : nativeChargePlacementPointForAtom)(
+      molecule, target.atomId, page.objects, page.width, page.height);
   return point
     ? addChargeMarkAtPoint(document, page.id, normalized, point, {
         objectId: molecule.id,
-        atomId: target.atomId
+        atomId: target.atomId,
+        // Page-space placement must retain the chosen atom through legacy local-distance
+        // reconciliation. Leave unrotated tool marks byte-for-byte unchanged.
+        explicit: molecule.rotation !== 0
       }, placement?.rotation)
     : document;
 }
@@ -7655,26 +7677,6 @@ function nativeAssociatedChargeMarkForAtom(
     .map((mark) => ({ mark, distance: distance(nativeChargeMarkCenter(mark), atom) }))
     .filter((entry) => entry.distance <= radius)
     .sort((left, right) => left.distance - right.distance)[0]?.mark;
-}
-
-export function nativeChargePlacementPointForAtom(
-  molecule: MoleculeObject,
-  atomId: string,
-  objects: readonly DocumentObject[],
-  pageWidth: number,
-  pageHeight: number,
-  mark?: ElectronMarkObject
-): PagePoint | undefined {
-  const atom = molecule.atoms.find(candidate => candidate.id === atomId);
-  if (!atom) return undefined;
-  const growth = previewNativeMoleculeBondGrowth(molecule, atom, pageWidth, pageHeight);
-  // Direct drops supply their mark and have an explicit association. New tool marks must keep
-  // the legacy point: label clearance can push them outside distance-based association.
-  return electronMarkPlacementPointForAtom(molecule, atomId, objects, pageWidth, pageHeight, {
-    growthPoint: growth && growth.atomId === atomId && !growth.targetAtomId ? growth.newAtomPoint : undefined,
-    mark,
-    avoidLabelOverlap: mark !== undefined
-  });
 }
 
 /** The growth the on-canvas arrow is showing: where the new atom lands, or which existing atom
@@ -8217,7 +8219,7 @@ function addChargeMarkAtPoint(
   pageId: string,
   spec: NativeElectronMarkSpec,
   point: PagePoint,
-  anchorAtom?: { objectId: string; atomId: string },
+  anchorAtom?: { objectId: string; atomId: string; explicit?: boolean },
   rotation = 0
 ): ChemDraftDocument {
   const page = firstPage(document);
@@ -8245,8 +8247,8 @@ function addChargeMarkAtPoint(
     anchor: anchorAtom
       ? { kind: "atom" as const, objectId: anchorAtom.objectId, atomId: anchorAtom.atomId }
       : { kind: "point" as const, point: center },
-    // Label clearance can exceed the legacy capture radius; the clicked atom stays explicit.
-    ...(spec.kind === "lone-pair" && anchorAtom ? { atomAssociation: "explicit" as const } : {}),
+    // Label clearance and rotated placement must retain the clicked atom explicitly.
+    ...(anchorAtom && (spec.kind === "lone-pair" || anchorAtom.explicit) ? { atomAssociation: "explicit" as const } : {}),
     ...(spec.kind === "charge"
       ? {
           charge: spec.charge,
@@ -8275,8 +8277,9 @@ function addChargeMarkAtPoint(
  * that makes it self-contained: `atom.markCharge` records exactly the portion of
  * `atom.formalCharge` the marks contributed. Each pass strips that portion back out (recovering
  * the atom's intrinsic, drawn/imported charge), re-assigns every mark to its nearest
- * atom, and writes both fields fresh — so deleted marks, moved molecules, edited elements, and
- * copies pasted without their mark all settle correctly with no history diffing.
+ * atom unless its association is explicit, and writes both fields fresh — so deleted marks,
+ * moved molecules, edited elements, and copies pasted without their mark all settle correctly
+ * with no history diffing.
  */
 export type CommittedDocumentNormalizationOptions = NativeElectronMarkAssignmentOptions;
 
@@ -8546,6 +8549,11 @@ export function electronMarkMoveAssociation(
   options: ElectronMarkMoveAssociationOptions = {}
 ): ElectronMarkMoveAssociationResult {
   const operation = options.operation ?? "move";
+  // Layout/appearance edits cannot erase an intentional floating drop. A later direct atom
+  // drop can replace it; newly pasted copies retain their existing separate association policy.
+  if (mark.atomAssociation === "explicit" && mark.anchor.kind === "point" && operation !== "paste") {
+    return { anchor: from.x === to.x && from.y === to.y ? mark.anchor : { ...mark.anchor, point: to } };
+  }
   // Turning/resizing a dropped mark about its own centre changes only its appearance.
   if (mark.atomAssociation === "explicit" && operation !== "paste" && from.x === to.x && from.y === to.y) {
     return { anchor: mark.anchor };
@@ -8958,8 +8966,10 @@ export function applyNativeMoleculeBondOrderTarget(
 export function applyNativeMoleculeBondOrderValueTarget(
   document: ChemDraftDocument,
   target: NativeBondOrderTarget,
-  order: NativeBondOrderValue
+  order: NativeBondOrderValue,
+  stereo?: "either"
 ): ChemDraftDocument {
+  if (stereo && order !== "double") return document;
   const page = firstPage(document);
   const molecule = page.objects.find((object): object is MoleculeObject =>
     object.id === target.objectId && object.type === "molecule"
@@ -8975,7 +8985,7 @@ export function applyNativeMoleculeBondOrderValueTarget(
 
   const makePlain = order === "single" && nativeBondCanBeMadePlain(bond);
   // This display-only edit keeps the order, so order-change restrictions do not apply.
-  if (!makePlain && ((order === bond.order && bond.stereo !== "either") || !canSetNativeBondOrder(molecule, bond, order))) {
+  if (!makePlain && ((order === bond.order && bond.stereo === stereo) || !canSetNativeBondOrder(molecule, bond, order))) {
     return document;
   }
 
@@ -8983,11 +8993,15 @@ export function applyNativeMoleculeBondOrderValueTarget(
     candidate.id === bond.id
       // Clearing an existing double bond's "either" stereo is not double-bond creation.
       ? makePlain ? nativeBondWithoutStereoDisplay(candidate)
-        : nativeBondWithOrderAndDisplay(molecule, withoutDoubleBondStereo(candidate), order, bond.order !== "double")
+        : { ...nativeBondWithOrderAndDisplay(molecule, withoutDoubleBondStereo(candidate), order, bond.order !== "double"),
+            ...(stereo ? { stereo } : {}) }
       : candidate
   );
-  const refreshed = refreshNativeSingleBondGraph(molecule, molecule.atoms, bonds);
-  const nextMolecule = bond.stereo === "either" ? withStoredBondStereoMolfile(refreshed) : refreshed;
+  const refreshed = stereo === "either"
+    ? refreshNativeBondToolGraph(molecule, molecule.atoms, bonds, { bondStereo: stereo })
+    : refreshNativeSingleBondGraph(molecule, molecule.atoms, bonds);
+  if (!refreshed) return document;
+  const nextMolecule = !stereo && bond.stereo === "either" ? withStoredBondStereoMolfile(refreshed) : refreshed;
 
   return applyPatch(
     document,
@@ -13971,15 +13985,15 @@ export function documentObjectMoveDeltaResolver(
   objectId: string,
   groupObjectIds?: readonly string[]
 ): (dx: number, dy: number) => PagePoint {
+  const page = pageContainingObject(document, objectId);
+  if (!page) return () => ({ x: 0, y: 0 });
   if (groupObjectIds && groupObjectIds.length > 1) {
-    const page = firstPage(document);
     const ids = resolveGroupedDocumentObjectIds(page.objects, groupObjectIds);
     const bounds = selectionBounds(page.objects, [...expandWithAnchoredMarkIds(page.objects, ids)]);
     return bounds ? (dx, dy) => clampedSelectionMoveDelta(page, bounds, dx, dy) : () => ({ x: 0, y: 0 });
   }
-  const page = pageContainingObject(document, objectId);
   const object = objectOnPage(page, objectId);
-  if (!page || !object) return () => ({ x: 0, y: 0 });
+  if (!object) return () => ({ x: 0, y: 0 });
   return (dx, dy) => {
     const position = clampedObjectMovePosition(page, object, { x: object.x + dx, y: object.y + dy });
     return { x: position.x - object.x, y: position.y - object.y };
@@ -13993,7 +14007,8 @@ export function moveDocumentObjects(
   dx: number,
   dy: number
 ): ChemDraftDocument {
-  const page = firstPage(document);
+  const page = ids.length > 0 ? pageContainingObject(document, ids[0]) : undefined;
+  if (!page) return document;
   const objectIds = resolveGroupedDocumentObjectIds(page.objects, ids);
   const set = expandWithAnchoredMarkIds(page.objects, objectIds);
   const bounds = selectionBounds(page.objects, [...set]);
@@ -14009,10 +14024,13 @@ export function moveDocumentObjects(
   // One patch batch for the whole selection: each translation reads only its own object, and every
   // object is visited once, so computing all of them against `document` is the same as applying
   // them in turn — without a whole-document clone and validation per object.
+  const carriedMarkIds = cascadeCarriedAnchoredMarkIds(page.objects, set);
   const patches = page.objects.flatMap((object) =>
     set.has(object.id)
       ? translateDocumentObjectByPatches(document, object.id, cdx, cdy, {
-          translateAnchoredGeometry: groupMoveTranslatesArrowGeometry(object, set)
+          translateAnchoredGeometry: groupMoveTranslatesArrowGeometry(object, set),
+          preserveChargeAnchor: object.type === "electron-mark" && object.atomAssociation === "explicit" &&
+            carriedMarkIds.has(object.id)
         })
       : []
   );
@@ -14025,11 +14043,12 @@ export function moveCanvasSelection(
   fragments: readonly NativeMoleculeFragmentSelection[],
   delta: PagePoint
 ): ChemDraftDocument {
-  const page = firstPage(document);
+  const selectedId = document.selection.objectIds[0];
+  const page = selectedId ? pageContainingObject(document, selectedId) : undefined;
   // A molecule's part selection takes precedence over its object highlight, as in a part drag.
   const fragmentIds = new Set(fragments.map(fragment => fragment.objectId));
-  const ids = resolveGroupedDocumentObjectIds(page.objects, document.selection.objectIds)
-    .filter(id => !fragmentIds.has(id));
+  const ids = page ? resolveGroupedDocumentObjectIds(page.objects, document.selection.objectIds)
+    .filter(id => !fragmentIds.has(id)) : [];
   let moved = document;
   if (ids.length > 1) moved = moveDocumentObjects(moved, ids, delta.x, delta.y);
   else if (ids.length === 1) {
@@ -14072,9 +14091,9 @@ export function translateDocumentPage(
   return applyPatches(document, patches, { now: phase4Timestamp });
 }
 
-export type DocumentAlignMode = "left" | "center" | "right" | "top" | "middle" | "bottom";
-export type DocumentDistributeAxis = "horizontal" | "vertical";
-export type DocumentDistributeMode = "centers" | "spacing";
+export type DocumentAlignMode = ObjectAlignMode;
+export type DocumentDistributeAxis = ObjectDistributeAxis;
+export type DocumentDistributeMode = ObjectDistributeMode;
 
 // The top-level objects participating in the current selection — a selected group appears once as
 // its group object, not as its expanded children, so layout operations treat it as a single item.
@@ -14084,9 +14103,52 @@ function selectionLayoutObjects(document: ChemDraftDocument): DocumentObject[] {
   return page.objects.filter((object) => selectedIds.has(object.id));
 }
 
+/** Any selected atom-associated mark and its selected molecule share a target, even without a group.
+ * Merge intersecting group members too, so no member receives two layout translations. */
+function selectionLayoutUnits(document: ChemDraftDocument, selected = selectionLayoutObjects(document)): string[][] {
+  const page = selectionPage(document);
+  const objects = objectByIdIndex(page.objects);
+  const associations = nativeElectronMarkAssignments(page).anchorByMarkId;
+  const units: Set<string>[] = [];
+  const membersByItem = new Map<string, readonly string[]>();
+  for (const object of selected) {
+    const members = resolveGroupedDocumentObjectIds(page.objects, [object.id]);
+    if (members.length > 0) {
+      membersByItem.set(object.id, members);
+      units.push(new Set([object.id]));
+    }
+  }
+  const owner = new Map<string, Set<string>>();
+  const merge = (a: Set<string>, b: Set<string>) => {
+    if (a === b) return;
+    for (const id of b) {
+      a.add(id);
+      for (const memberId of membersByItem.get(id)!) owner.set(memberId, a);
+    }
+    b.clear();
+  };
+  for (const unit of units) {
+    for (const id of membersByItem.get([...unit][0])!) {
+      const existing = owner.get(id);
+      if (existing) merge(unit, existing);
+      else owner.set(id, unit);
+    }
+  }
+  for (const [id, unit] of owner) {
+    const mark = objects.get(id);
+    if (mark?.type !== "electron-mark") continue;
+    const moleculeId = associations.get(mark.id)?.objectId ??
+      (mark.atomAssociation === "explicit" && mark.anchor.kind === "atom" ? mark.anchor.objectId : undefined);
+    if (!moleculeId || objects.get(moleculeId)?.type !== "molecule") continue;
+    const moleculeUnit = owner.get(moleculeId);
+    if (moleculeUnit) merge(moleculeUnit, unit);
+  }
+  return units.filter(unit => unit.size > 0).map(unit => [...unit]);
+}
+
 // Move a top-level layout item by a delta. For a group this moves every descendant together (the
 // same primitive group dragging uses), so the group keeps its internal arrangement. Unlike
-// moveDocumentObjects it neither clamps to the page nor assumes the first page.
+// moveDocumentObjects it does not clamp to the page.
 interface LayoutItemMove {
   objectId: string;
   dx: number;
@@ -14098,7 +14160,7 @@ interface LayoutItemMove {
  *  marks anchored to them) by dx/dy. */
 function selectionLayoutItemMoves(
   pageObjects: readonly DocumentObject[],
-  itemId: string,
+  itemId: string | readonly string[],
   dx: number,
   dy: number
 ): LayoutItemMove[] {
@@ -14107,7 +14169,7 @@ function selectionLayoutItemMoves(
   }
   const memberIds = expandWithAnchoredMarkIds(
     pageObjects,
-    resolveGroupedDocumentObjectIds(pageObjects, [itemId])
+    resolveGroupedDocumentObjectIds(pageObjects, typeof itemId === "string" ? [itemId] : itemId)
   );
   const objectById = objectByIdIndex(pageObjects);
   return [...memberIds].map((memberId) => {
@@ -14128,7 +14190,9 @@ function selectionLayoutItemMoves(
  * so its deltas are summed here. Applying items one at a time cloned and validated the whole
  * document per object — quadratic for a large selection.
  */
-function applyLayoutItemMoves(document: ChemDraftDocument, moves: readonly LayoutItemMove[], preserveChargeAnchor = false): ChemDraftDocument {
+function applyLayoutItemMoves(
+  document: ChemDraftDocument, moves: readonly LayoutItemMove[], warningsOut?: string[]
+): ChemDraftDocument {
   const combined = new Map<string, LayoutItemMove>();
   for (const move of moves) {
     const existing = combined.get(move.objectId);
@@ -14141,21 +14205,64 @@ function applyLayoutItemMoves(document: ChemDraftDocument, moves: readonly Layou
     existing.translateAnchoredGeometry ||= move.translateAnchoredGeometry;
   }
   const objects = objectByIdIndex(selectionPage(document).objects);
+  // Commit reconciliation also visits stationary units. Report stale explicit anchors even
+  // when their unit is an outer distribution anchor or already sits on the alignment edge.
+  if (combined.size > 0) {
+    const page = selectionPage(document);
+    const selectedIds = expandWithAnchoredMarkIds(page.objects,
+      resolveGroupedDocumentObjectIds(page.objects, document.selection.objectIds));
+    for (const id of selectedIds) {
+      const mark = objects.get(id);
+      if (mark?.type !== "electron-mark" || mark.atomAssociation !== "explicit" || mark.anchor.kind !== "atom") continue;
+      const molecule = mark.anchor.objectId ? objects.get(mark.anchor.objectId) : undefined;
+      if (molecule?.type === "molecule" && molecule.atoms.some(atom => atom.id === mark.anchor.atomId)) continue;
+      const warning = `Cannot preserve explicit electron mark "${mark.id}" association: atom "${mark.anchor.atomId}" in molecule "${mark.anchor.objectId}" is missing.`;
+      if (!warningsOut) throw new Error(warning);
+      warningsOut.push(warning);
+    }
+  }
   const patches = [...combined.values()].flatMap((move) => {
     const object = objects.get(move.objectId);
     const anchorMove = object?.type === "electron-mark" && object.anchor.kind === "atom" && object.anchor.objectId
       ? combined.get(object.anchor.objectId) : undefined;
+    const carriedTogether = anchorMove !== undefined &&
+      Math.abs(anchorMove.dx - move.dx) < 1e-9 && Math.abs(anchorMove.dy - move.dy) < 1e-9;
+    // Carried pairs retain their atom identity under one translation, including unselected ordinary
+    // marks. Independent translations keep the existing association policy.
+    const explicitAtomMark = object?.type === "electron-mark" && object.atomAssociation === "explicit" && object.anchor.kind === "atom";
+    if (explicitAtomMark && !carriedTogether) {
+      const molecule = object.anchor.objectId ? objects.get(object.anchor.objectId) : undefined;
+      if (molecule?.type === "molecule" && molecule.atoms.some(atom => atom.id === object.anchor.atomId)) {
+        const warning = `Cannot preserve explicit electron mark "${object.id}" association: the mark is moving independently of molecule "${molecule.id}".`;
+        if (!warningsOut) throw new Error(warning);
+        warningsOut.push(warning);
+      }
+    }
     return translateDocumentObjectByPatches(document, move.objectId, move.dx, move.dy, {
       translateAnchoredGeometry: move.translateAnchoredGeometry,
-      preserveChargeAnchor: preserveChargeAnchor && anchorMove !== undefined &&
-        Math.abs(anchorMove.dx - move.dx) < 1e-9 && Math.abs(anchorMove.dy - move.dy) < 1e-9
+      preserveChargeAnchor: carriedTogether
     });
   });
-  return patches.length > 0 ? applyPatches(document, patches, { now: phase4Timestamp }) : document;
+  if (patches.length === 0) return document;
+  const next = applyPatches(document, patches, { now: phase4Timestamp });
+  // Ask the existing assignment resolver what this movement will do at commit. This is a
+  // warning only: do not reconcile or alter chemistry here. Explicit marks were reported above.
+  const beforeAssignments = nativeElectronMarkAssignments(selectionPage(document)).anchorByMarkId;
+  const afterAssignments = nativeElectronMarkAssignments(selectionPage(next)).anchorByMarkId;
+  for (const [markId, anchor] of beforeAssignments) {
+    const mark = objects.get(markId);
+    if (!anchor || mark?.type !== "electron-mark" || mark.atomAssociation === "explicit") continue;
+    const after = afterAssignments.get(markId);
+    if (after?.objectId === anchor.objectId && after.atomId === anchor.atomId) continue;
+    const warning = `Cannot preserve electron mark "${markId}" association: layout movement changes its association with atom "${anchor.atomId}" in molecule "${anchor.objectId}".`;
+    if (!warningsOut) throw new Error(warning);
+    warningsOut.push(warning);
+  }
+  return next;
 }
 
 /** Groups are single items; their selected descendants and attached marks must not move twice. */
-export function selectedArrangementObjectIds(document: ChemDraftDocument): string[] {
+function arrangementRootObjectIds(document: ChemDraftDocument): string[] {
   const page = selectionPage(document);
   const selected = selectionLayoutObjects(document);
   const objects = objectByIdIndex(page.objects);
@@ -14179,15 +14286,29 @@ export function selectedArrangementObjectIds(document: ChemDraftDocument): strin
   return roots.filter((object) => object.type !== "electron-mark" || !carried.has(object.id)).map((object) => object.id);
 }
 
+/** Reuse the same association units for arrangement, including marks inside separate groups. */
+function selectionArrangementUnits(document: ChemDraftDocument): string[][] {
+  const objects = objectByIdIndex(selectionPage(document).objects);
+  return selectionLayoutUnits(document, arrangementRootObjectIds(document).map(id => objects.get(id)!));
+}
+
+export function selectedArrangementObjectIds(document: ChemDraftDocument): string[] {
+  return selectionArrangementUnits(document).map(ids => ids[0]);
+}
+
 export function arrangeSelectedDocumentObjects(document: ChemDraftDocument, layout: ArrangementLayout,
   options: Pick<ArrangementOptions, "gap" | "columns" | "gridAlignment"> = {}): { document: ChemDraftDocument; status: string } {
   const page = selectionPage(document);
-  const items = selectedArrangementObjectIds(document).map(id => arrangementItem(page.objects, id)!);
+  const units = selectionArrangementUnits(document);
+  const items = units.map(ids => arrangementItem(page.objects, ids)!);
   const plan = planObjectArrangement(items, layout, { ...options, pageBounds: { x: 0, y: 0, width: page.width, height: page.height } });
   if (!plan.ok) return { document, status: plan.reason === "selection" ? "Select at least two objects or groups" :
     plan.reason === "page" ? "This arrangement does not fit on the page. Try a grid or a larger page." : "Cannot arrange this selection: invalid bounds or spacing." };
-  const next = applyLayoutItemMoves(document, plan.placements.flatMap(p => selectionLayoutItemMoves(page.objects, p.id, p.dx, p.dy)), true);
-  return { document: next, status: next === document ? "Selection is already arranged" : `Arranged ${items.length} objects in ${layout === "oval" ? "an" : "a"} ${layout}${layout === "grid" ? ` (${options.gridAlignment ?? "center"})` : ""}` };
+  const warnings: string[] = [];
+  const unitsById = new Map(units.map(ids => [ids[0], ids]));
+  const next = applyLayoutItemMoves(document, plan.placements.flatMap(p => selectionLayoutItemMoves(page.objects, unitsById.get(p.id)!, p.dx, p.dy)), warnings);
+  const status = next === document ? "Selection is already arranged" : `Arranged ${items.length} objects in ${layout === "oval" ? "an" : "a"} ${layout}${layout === "grid" ? ` (${options.gridAlignment ?? "center"})` : ""}`;
+  return { document: next, status: [status, ...warnings].join("; ") };
 }
 
 // Share a subpixel roundoff allowance between Save and the slider's page constraints. Without
@@ -14198,10 +14319,10 @@ const arrangementSpacingPageEpsilon = 1e-7;
 export function adjustArrangementSpacing(document:ChemDraftDocument,factor:number):{document:ChemDraftDocument;ok:boolean;status:string} {
   const fail=(status:string)=>({document,ok:false,status});
   if(!Number.isFinite(factor) || factor<=0) return fail("Choose a valid spacing");
-  const page=selectionPage(document),ids=selectedArrangementObjectIds(document);
-  if(ids.length<2) return fail("Select at least two compounds or groups");
+  const page=selectionPage(document),units=selectionArrangementUnits(document);
+  if(units.length<2) return fail("Select at least two compounds or groups");
   if(Math.abs(factor-1)<1e-9) return {document,ok:true,status:"Original spacing"};
-  const items=ids.map(id=>arrangementItem(page.objects,id)!);
+  const items=units.map(ids=>arrangementItem(page.objects,ids)!);
   const anchors=items.map(item=>item.anchor ?? {x:item.bounds.x+item.bounds.width/2,y:item.bounds.y+item.bounds.height/2});
   const center={x:anchors.reduce((sum,p)=>sum+p.x,0)/anchors.length,y:anchors.reduce((sum,p)=>sum+p.y,0)/anchors.length};
   const deltas=anchors.map(p=>({x:(p.x-center.x)*(factor-1),y:(p.y-center.y)*(factor-1)}));
@@ -14215,14 +14336,15 @@ export function adjustArrangementSpacing(document:ChemDraftDocument,factor:numbe
     if(a.x<b.x+b.width+12 && a.x+a.width>b.x-12 && a.y<b.y+b.height+12 && a.y+a.height>b.y-12)
       return fail("The compounds need more space between them");
   }
-  const moves=ids.flatMap((id,i)=>selectionLayoutItemMoves(page.objects,id,deltas[i].x,deltas[i].y));
-  const result=applyLayoutItemMoves(document,moves,true);
-  return {document:result,ok:true,status:`Spacing adjusted to ${Math.round(factor*100)}%`};
+  const moves=units.flatMap((ids,i)=>selectionLayoutItemMoves(page.objects,ids,deltas[i].x,deltas[i].y));
+  const warnings: string[] = [];
+  const result=applyLayoutItemMoves(document,moves,warnings);
+  return {document:result,ok:true,status:[`Spacing adjusted to ${Math.round(factor*100)}%`, ...warnings].join("; ")};
 }
 
 export function arrangementSpacingRange(document:ChemDraftDocument):{min:number;max:number} {
   const page = selectionPage(document);
-  const items = selectedArrangementObjectIds(document).map(id => arrangementItem(page.objects, id)!);
+  const items = selectionArrangementUnits(document).map(ids => arrangementItem(page.objects, ids)!);
   if (items.length < 2) return { min: 1, max: 1 };
   const anchors = items.map(item => item.anchor ?? { x: item.bounds.x + item.bounds.width / 2, y: item.bounds.y + item.bounds.height / 2 });
   const center = { x: anchors.reduce((sum, p) => sum + p.x, 0) / anchors.length,
@@ -14265,19 +14387,19 @@ export function arrangementSpacingRange(document:ChemDraftDocument):{min:number;
 }
 
 export function arrangementSpacingPreviewBounds(document:ChemDraftDocument):LayoutBounds|undefined {
-  const page=selectionPage(document),items=selectedArrangementObjectIds(document).flatMap(id=>arrangementItem(page.objects,id) ?? []);
+  const page=selectionPage(document),items=selectionArrangementUnits(document).flatMap(ids=>arrangementItem(page.objects,ids) ?? []);
   if(!items.length) return undefined;
   const x=Math.min(...items.map(i=>i.bounds.x)),y=Math.min(...items.map(i=>i.bounds.y));
   return {x,y,width:Math.max(...items.map(i=>i.bounds.x+i.bounds.width))-x,height:Math.max(...items.map(i=>i.bounds.y+i.bounds.height))-y};
 }
 
-function arrangementItem(pageObjects: readonly DocumentObject[], id: string): ArrangementItem | undefined {
+function arrangementItem(pageObjects: readonly DocumentObject[], ids: readonly string[]): ArrangementItem | undefined {
     const objects = objectByIdIndex(pageObjects);
-    if (!objects.has(id)) return undefined;
-    const members = [...expandWithAnchoredMarkIds(pageObjects, resolveGroupedDocumentObjectIds(pageObjects, [id]))]
+    if (!objects.has(ids[0])) return undefined;
+    const members = [...expandWithAnchoredMarkIds(pageObjects, resolveGroupedDocumentObjectIds(pageObjects, ids))]
       .map((memberId) => objects.get(memberId))
       .filter((object): object is DocumentObject => object !== undefined && object.type !== "group");
-    const visibleMembers = members.length > 0 ? members : [objects.get(id)!];
+    const visibleMembers = members.length > 0 ? members : [objects.get(ids[0])!];
     const boxes = visibleMembers.map((object) =>
       object.type === "molecule" ? moleculeVisualBoundsForArrangement(object) :
         object.type === "text" ? textVisualBoundsForArrangement(object) : documentObjectVisualBounds(object, pageObjects)
@@ -14287,7 +14409,7 @@ function arrangementItem(pageObjects: readonly DocumentObject[], id: string): Ar
     const anchors=moleculeMembers.map(moleculeAnchorForArrangement);
     const anchor=anchors.length ? {x:anchors.reduce((sum,p)=>sum+p.x,0)/anchors.length,
       y:anchors.reduce((sum,p)=>sum+p.y,0)/anchors.length} : undefined;
-    return { id, ...(anchor ? {anchor} : {}), bounds: {
+    return { id: ids[0], ...(anchor ? {anchor} : {}), bounds: {
       x, y,
       width: Math.max(...boxes.map((b) => b.x + b.width)) - x,
       height: Math.max(...boxes.map((b) => b.y + b.height)) - y
@@ -14296,39 +14418,18 @@ function arrangementItem(pageObjects: readonly DocumentObject[], id: string): Ar
 
 export function alignSelectedDocumentObjects(
   document: ChemDraftDocument,
-  mode: DocumentAlignMode
+  mode: DocumentAlignMode,
+  warningsOut?: string[]
 ): ChemDraftDocument {
   const page = selectionPage(document);
-  const layoutItems = selectionLayoutObjects(document)
-    .map((object) => ({ id: object.id, bounds: selectionBounds(page.objects, [object.id]) }))
-    .filter((item): item is { id: string; bounds: SelectionBounds } => item.bounds !== undefined);
-  if (layoutItems.length < 2) {
-    return document;
-  }
-  const bounds = selectionBounds(page.objects, layoutItems.map((item) => item.id));
-  if (!bounds) {
-    return document;
-  }
-
-  const moves: LayoutItemMove[] = [];
-  for (const { id, bounds: itemBounds } of layoutItems) {
-    const dx = mode === "left"
-      ? bounds.x - itemBounds.x
-      : mode === "center"
-        ? bounds.centerX - itemBounds.centerX
-        : mode === "right"
-          ? bounds.x + bounds.width - (itemBounds.x + itemBounds.width)
-          : 0;
-    const dy = mode === "top"
-      ? bounds.y - itemBounds.y
-      : mode === "middle"
-        ? bounds.centerY - itemBounds.centerY
-        : mode === "bottom"
-          ? bounds.y + bounds.height - (itemBounds.y + itemBounds.height)
-          : 0;
-    moves.push(...selectionLayoutItemMoves(page.objects, id, dx, dy));
-  }
-  return applyLayoutItemMoves(document, moves);
+  const units = selectionLayoutUnits(document);
+  const items = units.flatMap((ids, index) => {
+    const bounds = selectionBounds(page.objects, ids);
+    return bounds ? [{ id: String(index), bounds }] : [];
+  });
+  const moves = planObjectAlignment(items, mode).flatMap(({ id, dx, dy }) =>
+    selectionLayoutItemMoves(page.objects, units[Number(id)], dx, dy));
+  return applyLayoutItemMoves(document, moves, warningsOut);
 }
 
 // Visual bounds of a top-level layout item, treating a group as a single box (the union of its
@@ -14349,86 +14450,18 @@ function layoutItemVisualBounds(
 export function distributeSelectedDocumentObjects(
   document: ChemDraftDocument,
   axis: DocumentDistributeAxis,
-  mode: DocumentDistributeMode = "centers"
+  mode: DocumentDistributeMode = "centers",
+  warningsOut?: string[]
 ): ChemDraftDocument {
   const page = selectionPage(document);
-  const selectedObjects = selectionLayoutObjects(document);
-  if (selectedObjects.length < 3) {
-    return document;
-  }
-
-  if (mode === "spacing") {
-    return distributeSelectedDocumentObjectsBySpacing(document, page.objects, selectedObjects, axis);
-  }
-
-  const centerForAxis = (object: DocumentObject) => {
-    const bounds = layoutItemVisualBounds(page.objects, object);
-    return axis === "horizontal"
-      ? bounds.x + bounds.width / 2
-      : bounds.y + bounds.height / 2;
-  };
-  const sortedObjects = [...selectedObjects].sort((a, b) => centerForAxis(a) - centerForAxis(b));
-  const firstCenter = centerForAxis(sortedObjects[0]);
-  const lastCenter = centerForAxis(sortedObjects[sortedObjects.length - 1]);
-  const spacing = (lastCenter - firstCenter) / (sortedObjects.length - 1);
-  if (Math.abs(spacing) < 1e-6) {
-    return document;
-  }
-
-  const moves: LayoutItemMove[] = [];
-  sortedObjects.forEach((object, index) => {
-    const targetCenter = firstCenter + spacing * index;
-    const delta = targetCenter - centerForAxis(object);
-    moves.push(...(axis === "horizontal"
-      ? selectionLayoutItemMoves(page.objects, object.id, delta, 0)
-      : selectionLayoutItemMoves(page.objects, object.id, 0, delta)));
-  });
-  return applyLayoutItemMoves(document, moves);
-}
-
-function distributeSelectedDocumentObjectsBySpacing(
-  document: ChemDraftDocument,
-  pageObjects: readonly DocumentObject[],
-  selectedObjects: readonly DocumentObject[],
-  axis: DocumentDistributeAxis
-): ChemDraftDocument {
-  const visualBoundsById = new Map(selectedObjects.map((object) => [object.id, layoutItemVisualBounds(pageObjects, object)] as const));
-  const visualBoundsForObject = (object: DocumentObject): ObjectBounds => {
-    const bounds = visualBoundsById.get(object.id);
-    if (!bounds) {
-      throw new Error(`Expected visual bounds for selected object ${object.id}.`);
-    }
-    return bounds;
-  };
-  const startForAxis = (object: DocumentObject) => {
-    const bounds = visualBoundsForObject(object);
-    return axis === "horizontal" ? bounds.x : bounds.y;
-  };
-  const sizeForAxis = (object: DocumentObject) => {
-    const bounds = visualBoundsForObject(object);
-    return axis === "horizontal" ? bounds.width : bounds.height;
-  };
-  const sortedObjects = [...selectedObjects].sort((a, b) => startForAxis(a) - startForAxis(b));
-  const firstStart = startForAxis(sortedObjects[0]);
-  const lastObject = sortedObjects[sortedObjects.length - 1];
-  const lastEnd = startForAxis(lastObject) + sizeForAxis(lastObject);
-  const totalSize = sortedObjects.reduce((sum, object) => sum + sizeForAxis(object), 0);
-  const gap = (lastEnd - firstStart - totalSize) / (sortedObjects.length - 1);
-
-  const moves: LayoutItemMove[] = [];
-  let targetStart = firstStart;
-  sortedObjects.forEach((object, index) => {
-    if (index === 0 || index === sortedObjects.length - 1) {
-      targetStart += sizeForAxis(object) + gap;
-      return;
-    }
-    const delta = targetStart - startForAxis(object);
-    moves.push(...(axis === "horizontal"
-      ? selectionLayoutItemMoves(pageObjects, object.id, delta, 0)
-      : selectionLayoutItemMoves(pageObjects, object.id, 0, delta)));
-    targetStart += sizeForAxis(object) + gap;
-  });
-  return applyLayoutItemMoves(document, moves);
+  const units = selectionLayoutUnits(document);
+  const objects = objectByIdIndex(page.objects);
+  const items = units.map((ids, index) => ({ id: String(index), bounds: combinedLayoutBounds(
+    ids.map(id => layoutItemVisualBounds(page.objects, objects.get(id)!))
+  )! }));
+  const moves = planObjectDistribution(items, axis, mode).flatMap(({ id, dx, dy }) =>
+    selectionLayoutItemMoves(page.objects, units[Number(id)], dx, dy));
+  return applyLayoutItemMoves(document, moves, warningsOut);
 }
 
 export function duplicateSelectedDocumentObjects(
@@ -14457,7 +14490,7 @@ export function duplicateSelectedDocumentObjects(
   const duplicateIdByOriginalId = new Map<string, string>();
   for (const object of selectedObjects) {
     const duplicate = structuredClone(object) as DocumentObject;
-    // Copies use the normal association policy, including a zero-offset duplicate.
+    // Standalone marks use the normal policy; attached pairs are remapped after all copies exist.
     if (duplicate.type === "electron-mark") delete duplicate.atomAssociation;
     duplicate.id = allocateId(duplicateObjectIdPrefix(object));
     duplicates.push(duplicate);
@@ -14465,6 +14498,8 @@ export function duplicateSelectedDocumentObjects(
     duplicateIdByOriginalId.set(object.id, duplicate.id);
     patches.push({ op: "addObject", pageId: page.id, object: duplicate });
   }
+  remapCopiedElectronMarkAssociations(selectedObjects,
+    new Map(selectedObjects.map((object, index) => [object.id, duplicates[index]])), warningsOut);
 
   // Every group reachable inside a selected group, innermost first, so a nested group's copy exists
   // before the group containing it maps its children. Only the selected groups used to be copied —
@@ -14546,7 +14581,8 @@ export function duplicateSelectedDocumentObjects(
     duplicate.arrowAttachment = parentObjectId ? { ...duplicate.arrowAttachment, parentObjectId } : undefined;
   }
   const next = applyPatches(document, patches, { now: phase4Timestamp });
-  return reconcileReactionArrowAttachments(moveDocumentObjects(next, selectionIds, offset.x, offset.y));
+  return copyNativeObjectExtensions(document,
+    reconcileReactionArrowAttachments(moveDocumentObjects(next, selectionIds, offset.x, offset.y)), duplicateIdByOriginalId);
 }
 
 /**
@@ -14592,10 +14628,12 @@ export function createSelectionClipboardPayload(
   const clipboardObjects = structuredClone(copiedObjects) as DocumentObject[];
   const warnings: string[] = [];
   remapCopiedBracketPairs(clipboardObjects, new Map(clipboardObjects.map(object => [object.id, object.id])), warnings);
+  const nativeSource = selectionClipboardNativeSource(document, clipboardObjects);
   return {
     kind: "chemdraft-selection",
     version: 1,
     objects: clipboardObjects,
+    ...(nativeSource ? { nativeSource } : {}),
     ...(warnings.length ? { warnings } : {}),
     selectionIds: [
       ...document.selection.objectIds.filter((objectId) =>
@@ -14670,7 +14708,20 @@ function createNativeMoleculeFragmentClipboardPayload(
 export function serializeSelectionClipboardPayload(
   payload: ChemDraftSelectionClipboardPayload
 ): string {
-  return JSON.stringify(payload);
+  const { nativeSource, ...serialized } = payload;
+  if (!nativeSource) return JSON.stringify(serialized);
+  // Ship source values through the same reader/writer contract as native files, rather than
+  // trusting an arbitrary extension-state sidecar supplied by the clipboard.
+  const native = JSON.parse(serializeDocument(nativeSource)) as ChemDraftDocument;
+  return JSON.stringify({ ...serialized, objects: native.pages[0]!.objects,
+    formatVersion: native.formatVersion, minAppVersion: native.minAppVersion, ignorableFields: native.ignorableFields });
+}
+
+function selectionClipboardNativeSource(document: ChemDraftDocument, objects: DocumentObject[]): ChemDraftDocument | undefined {
+  const empty = createEmptyDocument({ pageId: firstPage(document).id });
+  const scoped = { ...empty, pages: [{ ...empty.pages[0]!, objects }] };
+  const copied = copyNativeObjectExtensions(document, scoped, new Map(objects.map(object => [object.id, object.id])));
+  return copied.compatibility.nativeExtensions?.length ? copied : undefined;
 }
 
 // Human-readable representation for the public `text/plain` clipboard flavor. External apps (Word,
@@ -14710,9 +14761,14 @@ export function parseSelectionClipboardPayload(
       return undefined;
     }
 
-    const objects = payload.objects
-      .map(parseClipboardDocumentObject)
-      .filter((object): object is DocumentObject => object !== undefined);
+    const empty = createEmptyDocument();
+    const read = readDocument({ ...empty,
+      ...(payload.formatVersion !== undefined ? { formatVersion: payload.formatVersion } : {}),
+      ...(payload.minAppVersion !== undefined ? { minAppVersion: payload.minAppVersion } : {}),
+      ...(payload.ignorableFields !== undefined ? { ignorableFields: payload.ignorableFields } : {}),
+      pages: [{ ...empty.pages[0]!, objects: payload.objects }]
+    });
+    const objects = read.document.pages[0]!.objects;
     if (objects.length === 0 || objects.length !== payload.objects.length) {
       return undefined;
     }
@@ -14721,6 +14777,7 @@ export function parseSelectionClipboardPayload(
       kind: "chemdraft-selection",
       version: 1,
       objects,
+      ...(read.document.compatibility.nativeExtensions?.length ? { nativeSource: read.document } : {}),
       ...(Array.isArray(payload.warnings) ? { warnings: payload.warnings.filter((message): message is string => typeof message === "string") } : {}),
       selectionIds: payload.selectionIds.filter((id): id is string => typeof id === "string"),
       bounds: {
@@ -14871,6 +14928,8 @@ export function pasteSelectionClipboardPayload(
     pastedById.set(pasted.id, pasted);
     patches.push({ op: "addObject", pageId: page.id, object: pasted });
   }
+  remapCopiedElectronMarkAssociations(sourceChildren,
+    new Map(sourceChildren.map(object => [object.id, pastedById.get(idBySourceId.get(object.id)!)!])), warningsOut);
 
   // Object ids are reminted on paste; atom ids remain local to their cloned molecule.
   for (const object of sourceChildren) {
@@ -14929,7 +14988,36 @@ export function pasteSelectionClipboardPayload(
   remapCopiedReactionReferences(document, patches, idBySourceId);
   patches.push({ op: "setSelection", pageId: page.id, objectIds: fallbackSelectionIds });
 
-  return applyPatches(document, patches, { now: phase4Timestamp });
+  const next = applyPatches(document, patches, { now: phase4Timestamp });
+  return payload.nativeSource ? copyNativeObjectExtensions(payload.nativeSource, next, idBySourceId) : next;
+}
+
+/** Copies retain local atom ids: remap the molecule id and validate the copied atom identity. */
+function remapCopiedElectronMarkAssociations(
+  sources: readonly DocumentObject[],
+  copiesBySourceId: ReadonlyMap<string, DocumentObject>,
+  warningsOut?: string[]
+): void {
+  for (const source of sources) {
+    if (source.type !== "electron-mark" ||
+      source.anchor.kind !== "atom" || source.anchor.objectId === undefined) continue;
+    const molecule = copiesBySourceId.get(source.anchor.objectId);
+    // Copying just a mark retains the existing standalone association policy.
+    if (!molecule) continue;
+    const copy = copiesBySourceId.get(source.id);
+    if (copy?.type !== "electron-mark") continue;
+    if (molecule.type !== "molecule" || !molecule.atoms.some(atom => atom.id === source.anchor.atomId)) {
+      // Legacy geometric anchors may be stale; retain their existing fallback policy.
+      if (source.atomAssociation !== "explicit") continue;
+      const warning = `Cannot preserve explicit electron mark "${source.id}" association: copied atom "${source.anchor.atomId}" in molecule "${source.anchor.objectId}" is missing.`;
+      if (!warningsOut) throw new Error(warning);
+      warningsOut.push(warning);
+      continue;
+    }
+    copy.anchor = { ...source.anchor, objectId: molecule.id };
+    // Preserve the copied pair even when its offset places it nearer an original atom.
+    copy.atomAssociation = "explicit";
+  }
 }
 
 /** A copied step refers to the copied drawables, including forward references and shared intermediates. */
@@ -15082,14 +15170,6 @@ function mapAnchorPoint(anchor: Anchor, map: (point: PagePoint) => PagePoint): A
     : anchor;
 }
 
-// Fully validate (and normalize) a clipboard object against the document schema. Shallow base-field
-// checks let objects with missing type-specific fields through, which then throw later at applyPatch
-// instead of being rejected so paste can fall back safely.
-function parseClipboardDocumentObject(value: unknown): DocumentObject | undefined {
-  const result = DocumentObjectSchema.safeParse(value);
-  return result.success ? result.data : undefined;
-}
-
 function duplicateObjectIdPrefix(object: DocumentObject): string {
   switch (object.type) {
     case "molecule":
@@ -15187,7 +15267,10 @@ function transformOtherObjectAroundPointPatches(
     rotation: normalizeDegrees(object.rotation + degrees)
   };
   if (object.type === "electron-mark") {
-    Object.assign(changes, electronMarkMoveAssociation(document, object, oldCenter, newCenter, { operation: "transform" }));
+    // Resizing about the mark's own centre changes appearance, not its atom.
+    const operation = degrees === 0 && (options.scaleX !== undefined || options.scaleY !== undefined) &&
+      oldCenter.x === newCenter.x && oldCenter.y === newCenter.y ? "frame" : "transform";
+    Object.assign(changes, electronMarkMoveAssociation(document, object, oldCenter, newCenter, { operation }));
   }
   if (object.type === "graphic") {
     changes.data = resizeGraphicObjectDataForFrame(object.data, oldCenter, newCenter, scaleX, scaleY);
@@ -19815,7 +19898,7 @@ export function copyAsMergedMolecule(
  * string, silently.
  */
 export function analysisFacingStructure(molecule: MoleculeObject, document?: ChemDraftDocument): { structureFormat: string; structure: string; refusalReason?: string } {
-  const bracketWarnings = moleculeBracketWarningMessages(molecule, document);
+  const bracketWarnings = moleculeBracketWarningMessages(molecule, document, { atomPosition: transformPointForObject });
   if (bracketWarnings.length) return { structureFormat: "molfile-v3000", structure: "",
     refusalReason: bracketWarnings.join(" ") };
   const unknownIds = molecule.bonds.filter((bond) => bond.order === "unknown").map((bond) => bond.id);
@@ -19878,11 +19961,19 @@ export function validationFacingStructure(
  * change to its chemistry (an element, a charge, a bond order, a label) does.
  */
 export function analysisSubjectKey(molecule: MoleculeObject, document?: ChemDraftDocument): string {
+  const membership = document?.pages.flatMap(page => [...bracketPairs(page.objects).values()].flatMap(pair => {
+    if (!pair.some(bracket => bracket.repeatUnit || bracket.bracketKind === "polymer" ||
+      bracket.bracketUsage && bracket.bracketUsage !== "generic")) return [];
+    const resolved = resolveRepeatUnitAtomMembership(pair, page.objects, { atomPosition: transformPointForObject });
+    if (!resolved.referencedObjectIds.has(molecule.id)) return [];
+    return [[pair[0].pairId, resolved.members.find(member => member.molecule.id === molecule.id)?.atomIds, resolved.reason]];
+  }));
   return JSON.stringify([
     molecule.id,
     molecule.atoms.map(({ x: _x, y: _y, z: _z, ...atom }) => atom),
     molecule.bonds,
-    moleculeBracketWarningMessages(molecule, document)
+    moleculeBracketWarningMessages(molecule, document, { atomPosition: transformPointForObject }),
+    membership
   ]);
 }
 
@@ -19891,6 +19982,7 @@ export function analysisSubjectKey(molecule: MoleculeObject, document?: ChemDraf
  * Keep this import on demand: copying a drawing must not load RDKit at application startup.
  */
 export async function copyAsSmiles(document: ChemDraftDocument, warningsOut?: string[]): Promise<string | undefined> {
+  if (refusePreservedChemistryCopy(document, "SMILES", warningsOut)) return undefined;
   const molecules = copyAsScopeMolecules(document);
   reportRepeatUnitExportWarnings(document, "SMILES", molecules, warningsOut);
   if (molecules.length === 0) {
@@ -19926,6 +20018,7 @@ export function copyAsMolfile(
   warningsOut?: string[],
   options: { coordinateUnits?: "angstrom" | "raw" } = {}
 ): string | undefined {
+  if (refusePreservedChemistryCopy(document, "MOL", warningsOut)) return undefined;
   const molecules = copyAsScopeMolecules(document);
   const scoped = copyAsMergedMolecule(molecules);
   if (!scoped) {
@@ -19937,19 +20030,18 @@ export function copyAsMolfile(
   const writerWarnings: string[] = [];
   const repeatWarnings: ExportWarning[] = [];
   const repeatUnitGroups = repeatUnitMolfileGroups(document, molecules, repeatWarnings, { merged: true, expansions });
-  // SRU encoding preserves the annotation; the graph and cached formula still describe one copy.
-  // Keep SRU context only for annotations actually written, but retain multiple/unknown context.
+  // A real SRU S-group preserves the polymer, so it needs no one-copy loss warning.
+  // Retain multiple/unknown context; declined SRUs already have a specific loss warning.
   // Read it before merging, which can rebuild cached chemistry under a new molecule id, and
   // describe molecules without native ids.
-  const writtenRepeatUnits = new Set(repeatUnitGroups.map(group => group.objectId));
   const nonSruGroups = new Set(repeatUnits(document, molecules).filter(unit => unit.usage !== "sru").map(unit => unit.objectId));
   // The graph-only writer re-emits cached bracket notes with native ids. Live context below
   // replaces those notes, including when an SRU is declined and its old note must be dropped.
   const cachedBracketMessages = new Set(moleculeBracketWarningMessages(merged));
   const repeatMessages = [...repeatWarnings.map(warning => molecules.reduce((message, molecule) =>
     message.replaceAll(`member "${molecule.id}"`, "member molecule"), warning.message)),
-    ...molecules.flatMap(molecule => bracketChemistryWarnings(document, molecule)
-      .filter(warning => writtenRepeatUnits.has(warning.objectId) || nonSruGroups.has(warning.objectId))
+    ...molecules.flatMap(molecule => bracketChemistryWarnings(document, molecule, { atomPosition: transformPointForObject })
+      .filter(warning => nonSruGroups.has(warning.objectId))
       .map(warning => warning.message.replace(`Molecule ${molecule.id} is`, "A molecule is")))];
   warningsOut?.push(...repeatMessages);
   const writerOptions = {
@@ -19993,6 +20085,21 @@ export async function copyAsMolfileForExport(
 }
 
 const copyAsPagePaddingPx = 16;
+
+function refusePreservedChemistryCopy(document: ChemDraftDocument, format: string, warningsOut?: string[]): boolean {
+  const scope = copyAsScopeObjects(document);
+  let values = preservedNativeChemistryValues(document, new Set(scope.map(object => object.id)));
+  // Inspect the full scope before the editable-graph filter can omit source-only chemistry.
+  // If that filter would fall back to the page, check its full scope too.
+  if (!values.length && !scope.some(object => object.type === "molecule" && isEditableNativeMoleculeGraph(object))) {
+    values = preservedNativeChemistryValues(document, new Set(firstPage(document).objects.map(object => object.id)));
+  }
+  if (!values.length) return false;
+  const message = `Copy as ${format} refused: preserved source chemistry (${values.map(value => JSON.stringify(value)).join(", ")}) cannot be represented. Use native ChemDraft copy to keep it.`;
+  if (!warningsOut) throw new Error(message);
+  warningsOut.push(message);
+  return true;
+}
 
 function reportRepeatUnitExportWarnings(document: ChemDraftDocument, format: string, molecules: readonly MoleculeObject[], warningsOut?: string[]) {
   const messages = repeatUnitExportWarnings(document, format, { molecules }).map(warning => warning.message);
@@ -20317,7 +20424,21 @@ function extendNativeCarbonGraph(
   ];
 
   const orderedBonds = nativeBondsWithToolOrder({ ...molecule, atoms, bonds }, options);
-  return orderedBonds ? refreshNativeSingleBondGraph(molecule, atoms, orderedBonds) : undefined;
+  return orderedBonds ? refreshNativeBondToolGraph(molecule, atoms, orderedBonds, options) : undefined;
+}
+
+/** Reuse the selected-bond either writer, including its source-only chemistry guards. */
+function refreshNativeBondToolGraph(
+  molecule: MoleculeObject, atoms: readonly MoleculeAtom[], bonds: readonly MoleculeBond[], options: NativeBondToolOptions
+): MoleculeObject | undefined {
+  if (options.bondStereo !== "either") return refreshNativeSingleBondGraph(molecule, atoms, bonds);
+  try {
+    const refreshed = refreshNativeSingleBondGraph(molecule, atoms, bonds);
+    return withStoredBondStereoMolfile({ ...refreshed, structure: molecule.structure, structureFormat: molecule.structureFormat });
+  } catch (error) {
+    options.onRefusal?.(error instanceof Error ? error.message : "Cannot preserve E/Z stereo");
+    return undefined;
+  }
 }
 
 /**
@@ -20338,7 +20459,8 @@ function nativeBondsWithToolOrder(
     return undefined;
   }
   return molecule.bonds.map(bond =>
-    bond.id === addedBond.id ? nativeBondWithOrderAndDisplay(molecule, bond, order) : bond);
+    bond.id === addedBond.id ? { ...nativeBondWithOrderAndDisplay(molecule, bond, order),
+      ...(order === "double" && options.bondStereo === "either" ? { stereo: "either" as const } : {}) } : bond);
 }
 
 /**
@@ -20750,7 +20872,7 @@ function connectNativeCarbonAtoms(
   ];
 
   const orderedBonds = nativeBondsWithToolOrder({ ...molecule, bonds }, options);
-  return orderedBonds ? refreshNativeSingleBondGraph(molecule, molecule.atoms, orderedBonds) : undefined;
+  return orderedBonds ? refreshNativeBondToolGraph(molecule, molecule.atoms, orderedBonds, options) : undefined;
 }
 
 function atomLabelIsotopeRefusal(atom: MoleculeAtom, label: string, molecule: MoleculeObject, literal: boolean): string | undefined {

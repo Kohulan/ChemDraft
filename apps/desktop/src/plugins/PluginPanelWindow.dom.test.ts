@@ -343,7 +343,7 @@ describe("PluginPanelWindow (unified renderer, ADR-0030)", () => {
     const source = readFileSync(join(nativePath, "lib.rs"), "utf8");
     const command = source.split("async fn set_plugin_panel_input_focus(")[1]!.split("fn set_plugin_panel_activation(")[0]!;
     const windows = command.split('#[cfg(windows)]')[1]?.split('#[cfg(not(any(')[0] ?? "";
-    expect(windows).toContain("if !panel_window::focus_if_app_active(hwnd)");
+    expect(windows).toContain("if !panel_window::focus_if_app_active(hwnd, pointer_before.is_none())");
     expect(windows).toContain("return Ok(false)");
     expect(windows).not.toContain("target.set_focus()");
     expect(command).toContain("WindowsAndMessaging::GetForegroundWindow()");

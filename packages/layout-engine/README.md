@@ -101,6 +101,10 @@ type-4 bond does not), and `porphyrinoid` / `fusedPyrroleLadder` builders.
 
 Layout must not change chemical identity.
 
+`planObjectAlignment` and `planObjectDistribution` plan translations from unit bounds.
+The caller supplies each molecule and its selected explicit electron marks as one unit;
+`combinedLayoutBounds` includes their annotation offsets without changing molecular geometry.
+
 Reaction builders may store explicit editable NaOH, MgBr and H2O atom labels.
 The ordinary abbreviation/spelled-label grammar expands them for chemistry; a drawn label is
 one selectable atom, with no invisible atoms or bonds behind it. Only NaOH with explicit
@@ -115,6 +119,24 @@ Unknown-order bonds render as separated round dots in the shared canvas/SVG plan
 PDF), using only the bond's stroke colour. This mandatory display takes precedence over retained
 bond display styles and remains visible with query indicators off or sketch effects on. It does
 not resolve the order or change the stored chemistry.
+
+Bold bonds use filled bands from `src/boldBonds.ts`, shared by the canvas, SVG/PDF and clipboard
+images. `BoldBondStyle` sizes a band as `max(1.8 * lineWidth, min(3.4 * lineWidth,
+0.135 * bondLength))`: 3.6/22 units (16.36% of bond length) for the default Synthetic preset,
+2.97/22 (13.5%) for ACS 1996-style. Ring bands grow inward. Each end is one straight miter cut
+between the inner/inner and outer/outer edge intersections with the same-ring neighbor; an
+exocyclic substituent never clips the band. Neighbor strokes reach the outer miter corner so
+their butt ends cannot leave a notch. Chain bands are centered and join one neighbor per end.
+Adjacent bold ring bands share one cached cut from their actual rendered edges, including any
+outward shift needed to clear a double bond's pi line; reversed bonds reuse the same cut.
+Terminal, label-trimmed, crossing-cut and degenerate/overlong-miter ends are square.
+A bold double's pi line retains exactly the normal double's position, stroke width and inset.
+If inward growth would leave less than `BoldBondStyle.clearGapRatio` (1) normal line width
+of white space, the band grows partly outward, with both edges still mitered to its neighbors.
+Effects and Sketch trace that same plan.
+Preset `bondBoldWidthPx` values still set wedge dimensions; bold ink substitutes this sizing rule for
+those historical defaults (also after uniform scaling). Custom molecule widths and explicit
+`bondBoldWidths` overrides remain authoritative. No document or chemical fields are rewritten.
 
 `DocumentStylePreset` and `DocumentTextStyle` are native style data in `@chemdraft/chem-core`.
 `DocumentStyleScale` and point conversion stay here in `src/documentStyle.ts`. Native coordinates
@@ -162,6 +184,13 @@ after **every character, including the last** (also across spans); the last char
 this result. Stored document frames are never remeasured merely by loading, normalizing or reopening.
 
 ### Font advance ceilings
+
+Atom-label collision boxes use the declared family's reference metrics: Helvetica for the
+Arial/Helvetica/sans-serif stack, Courier for named monospace stacks, and padded bounds for
+unrecognized families. They do not measure the host's resolved fallback font. Tests use independent
+Core14 AFM ink (`src/atomLabelInk.fixture.ts`) for enclosure assertions; Resvg's host-selected
+font still exercises real rendering and visible label distances. Do not widen these boxes to
+accommodate a CI font substitution: they also drive cleanup ranking and electron-mark placement.
 
 The shipped commands in `apps/desktop/src/commands.ts` offer Arial/Helvetica/sans-serif,
 Times New Roman/Times/serif, Courier New/Courier/monospace and Georgia/serif. The fallback menus in

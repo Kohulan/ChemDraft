@@ -499,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "chemdraft"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "base64 0.22.1",
  "block2",
@@ -513,6 +513,7 @@ dependencies = [
  "hyper-util",
  "image",
  "libc",
+ "log",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",

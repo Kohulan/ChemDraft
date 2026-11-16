@@ -36,7 +36,8 @@ it("restores the document without focus before creating or raising Preferences o
   expect(ensure).not.toContain("hide()");
   expect(showPreferences).toMatch(/if ready \{[\s\S]*?show_on_main\(window\)\?/);
   expect(showPreferences).not.toContain("hide()");
-  expect(show).toMatch(/window\.unminimize\(\)[\s\S]*?place_content_window\(window,[\s\S]*?window\.show\(\)[\s\S]*?window\.set_focus\(\)[\s\S]*?bring_to_front_on_main\(window\)/);
+  // Explicit reveal now passes true to the raise helper; the restore/place/show/focus/raise order is unchanged.
+  expect(show).toMatch(/window\.unminimize\(\)[\s\S]*?place_content_window\(window,[\s\S]*?window\.show\(\)[\s\S]*?window\.set_focus\(\)[\s\S]*?bring_to_front_on_main\(window, true\)/);
   expect(show).not.toContain("hide()");
 });
 

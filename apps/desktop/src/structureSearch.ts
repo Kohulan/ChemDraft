@@ -1,7 +1,8 @@
 // Portions adapted from Octet Draw (https://github.com/SamChemMan/Octet-Draw), Copyright 2026 Sam Ellis, licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0). Modified for ChemDraft: selected-fragment searches through shared commands, per-site consent and native browser opening.
 
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import type { ChemDraftDocument } from "@chemdraft/chem-core";
+import { bracketPairs, resolveRepeatUnitAtomMembership, type ChemDraftDocument } from "@chemdraft/chem-core";
+import { transformPointForObject } from "@chemdraft/layout-engine";
 import { repeatUnitExportWarnings, repeatUnits } from "@chemdraft/export-engine";
 import type { CommandSpec } from "./commands";
 import { copyAsScopeMolecules, copyAsSmiles, createSelectionClipboardPayload, type NativeMoleculeFragmentSelection } from "./documentWorkflow";
@@ -48,17 +49,21 @@ export function structureSearchDocument(
   } }, fragments);
   const molecules = payload?.objects.filter(object => object.type === "molecule");
   if (!molecules?.length) return undefined;
-  // Read membership from the original graph and brackets, before discarding either. Only
-  // selected member atoms carry the warning into the graph-only serializer's existing channel.
-  const units = repeatUnits(document, molecules);
+  // Read membership and crossing references before discarding the original graph and brackets.
+  // A crossing still carries bracket semantics when imported members cannot resolve.
+  const units = repeatUnits(document);
+  const membershipByBracketId = new Map(document.pages.flatMap(page => [...bracketPairs(page.objects).values()].map(pair =>
+    [pair.find(bracket => bracket.side === "close")!.id,
+      resolveRepeatUnitAtomMembership(pair, page.objects, { atomPosition: transformPointForObject })] as const)));
   const bracketUsages = new Set<string>();
-  const repeatWarnings = repeatUnitExportWarnings(document, "SMILES", { molecules });
+  const repeatWarnings = repeatUnitExportWarnings(document, "SMILES");
   const searchMolecules = molecules.map(molecule => {
     const atomIds = new Set(molecule.atoms.map(atom => atom.id));
-    const selectedUnits = units.filter(unit => unit.members.some(member =>
-      member.molecule.id === molecule.id &&
-      member.atomIds.some(id => atomIds.has(id))
-    ));
+    const selectedUnits = units.filter(unit => {
+      const membership = membershipByBracketId.get(unit.objectId);
+      return membership?.members.some(member => member.molecule.id === molecule.id && member.atomIds.some(id => atomIds.has(id))) ||
+        [...(membership?.crossingAtomIds.get(molecule.id) ?? [])].some(id => atomIds.has(id));
+    });
     selectedUnits.forEach(unit => bracketUsages.add(unit.usage));
     const bracketIds = new Set(selectedUnits.map(unit => unit.objectId));
     const warnings = repeatWarnings.filter(warning => warning.objectId !== undefined && bracketIds.has(warning.objectId))

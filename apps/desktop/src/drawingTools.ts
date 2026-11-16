@@ -1,3 +1,4 @@
+import { bondDrawingToolCommandId } from "./bondToolCommands";
 import type { CommandSpec } from "./commands";
 import { canonicalCommandId } from "./renamedCommands";
 import { detectShortcutPlatform, type ShortcutPlatform } from "@chemdraft/shortcut-engine";
@@ -87,7 +88,7 @@ export const coreDrawingToolDefinitions = [
     usageHint: usageHint("click canvas or atom", "click atom to extend", "Esc exits")
   },
   {
-    commandId: "tool.doubleBond",
+    commandId: bondDrawingToolCommandId("double"),
     title: "Double Bond",
     kind: "bond",
     category: "structure",
@@ -95,12 +96,20 @@ export const coreDrawingToolDefinitions = [
     usageHint: usageHint("click canvas or atom", "click bond to set its order", "Esc exits")
   },
   {
-    commandId: "tool.tripleBond",
+    commandId: bondDrawingToolCommandId("triple"),
     title: "Triple Bond",
     kind: "bond",
     category: "structure",
     icon: "tripleBond",
     usageHint: usageHint("click canvas or atom", "click bond to set its order", "Esc exits")
+  },
+  {
+    commandId: bondDrawingToolCommandId("double", "either"),
+    title: "E/Z-unspecified Double Bond",
+    kind: "bond",
+    category: "structure",
+    icon: "eitherDoubleBond",
+    usageHint: usageHint("click canvas or atom", "click bond to leave E/Z unspecified", "Esc exits")
   },
   {
     commandId: "tool.wedgeBond",

@@ -7,6 +7,7 @@ import { MainWindow } from "./MainWindow";
 import { applySingleBondToolAtPoint, createPhase4Document, getSelectedMolecule, insertNativeMolfileMolecule } from "./documentWorkflow";
 import { DOM_COMMAND_EVENT } from "./window-manager";
 import { MemoryStorage } from "./testSupport/memoryStorage";
+import { bondDrawingToolCommandId } from "./commands";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 class TestResizeObserver { observe() {} unobserve() {} disconnect() {} }
@@ -134,6 +135,29 @@ describe("MainWindow wavy bond undo", () => {
       await command("edit.undo");
       expect(molecule()).toEqual(wedge);
     }
+  });
+
+  it.each(["MacIntel", "Win32"])("draws an either double bond through the registry and undoes it (%s)", async platform => {
+    Object.defineProperty(navigator, "platform", { configurable: true, value: platform });
+    await act(async () => root.render(createElement(MainWindow, {
+      initialDocument: createPhase4Document("Either drawing"), initialActiveToolCommandId: "tool.select",
+      initialPaletteMode: "hidden", initialRulersVisible: false, initialCrosshairsVisible: false, nativePalette: false
+    })));
+    const rect = { x: 0, y: 0, left: 0, top: 0, right: 792, bottom: 612, width: 792, height: 612, toJSON: () => ({}) } as DOMRect;
+    for (const element of container.querySelectorAll<HTMLElement>(".page, .canvas-region")) element.getBoundingClientRect = () => rect;
+    const id = bondDrawingToolCommandId("double", "either");
+    await command(id);
+    await click(container.querySelector(".page")!, 260, 260);
+    const either = molecule()!;
+    expect(either.bonds[0]).toMatchObject({ order: "double", stereo: "either" });
+    expect(container.querySelectorAll('[data-bond-stereo="either"]')).toHaveLength(2);
+    await command("edit.undo"); expect(molecule()).toBeUndefined();
+    await command("edit.redo"); expect(molecule()).toEqual(either);
+    await command("tool.doubleBond"); await bondClick();
+    expect(molecule()!.bonds[0]).not.toHaveProperty("stereo");
+    await command(id); await bondClick();
+    expect(molecule()!.bonds[0]).toMatchObject({ order: "double", stereo: "either" });
+    await command("edit.undo"); expect(molecule()!.bonds[0]).not.toHaveProperty("stereo");
   });
 
   it("converts the CH3–CH bond of butan-2-ol with its narrow end on C2 after lazy perception, in one undo", async () => {

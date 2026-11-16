@@ -27,7 +27,7 @@ vi.mock("./tauriEvents", async original => ({
 }));
 vi.mock("@tauri-apps/api/window", () => ({
   Window: { getByLabel: async (label: string) => {
-    expect(label).toBe("toolset-popover-core-art");
+    expect(["toolset-popover-core-art", "toolset-popover-core-text"]).toContain(label);
     return native.exists ? { isVisible: native.queryVisibility,
       listen: async (name: string, receive: () => void) => {
         const key = `${label}:${name}`;
@@ -87,6 +87,42 @@ function nativeClose(event: "tauri://close-requested" | "tauri://destroyed") {
 }
 
 describe.each(["macos", "windows"])("native flyout lifecycle on %s", () => {
+  it("routes Escape from the document to the visible detached Text color picker", async () => {
+    await setToolsetPopoverContent("core.text", { kind: "textColor", openedAt: 100, generation: 1 });
+    await vi.waitFor(() => expect(native.windowListeners.get("toolset-popover-core-text:tauri://destroyed")?.size).toBe(1));
+    await escape();
+    expect(canvasEscape).not.toHaveBeenCalled();
+    expect(native.emit).toHaveBeenCalledWith("chemdraft://dismiss-toolset-popovers", {
+      requestedAt: expect.any(Number), reason: "escape", openings: [{ toolsetId: "core.text", openedAt: 100, generation: 1 }]
+    });
+    await escape();
+    expect(canvasEscape).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([true, false])("keeps the inline caption editor open only while Text color is visible (%s)", async visible => {
+    stop();
+    stop = installPopoverEscapeRouting(() => true);
+    const editor = document.createElement("textarea");
+    editor.className = "text-object-editor";
+    const finishEditing = vi.fn();
+    editor.addEventListener("keydown", finishEditing);
+    document.body.append(editor);
+    editor.focus();
+    try {
+      native.visible = visible;
+      await setToolsetPopoverContent("core.text", { kind: "textColor", openedAt: 101 });
+      await vi.waitFor(() => expect(native.windowListeners.get("toolset-popover-core-text:tauri://destroyed")?.size).toBe(1));
+      editor.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+      await vi.waitFor(() => expect(native.queryVisibility).toHaveBeenCalled());
+      if (visible) {
+        await vi.waitFor(() => expect(native.emit).toHaveBeenCalledWith("chemdraft://dismiss-toolset-popovers", expect.objectContaining({ reason: "escape" })));
+        expect(finishEditing).not.toHaveBeenCalled();
+        editor.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+      }
+      expect(finishEditing).toHaveBeenCalledTimes(1);
+    } finally { editor.remove(); }
+  });
+
   it("a shown notification still requires a live native visibility query", async () => {
     await open(100);
     await notifyToolsetPopoverVisibility({ toolsetId: "core.art", openedAt: 100, visible: true });

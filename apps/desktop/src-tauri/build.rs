@@ -86,6 +86,7 @@ fn main() {
             "request_quit_after_close",
             "close_toolset_popover",
             "route_toolset_command",
+            "set_palette_command_hit_boxes",
             "sync_plugin_menu_items",
             "read_clipboard_payload",
             "write_clipboard_items",

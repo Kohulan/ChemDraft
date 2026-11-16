@@ -72,7 +72,7 @@ describe("buildGalleryModel", () => {
 
 describe("buildGallerySections", () => {
   it("offers all direct bond and chain tools from the shipped catalog in Bonds & Chains", () => {
-    const ids = ["tool.doubleBond", "tool.tripleBond", "tool.chain", "tool.chainFlexible"];
+    const ids = ["tool.wavyBond", "tool.doubleBond:either", "tool.doubleBond", "tool.tripleBond", "tool.chain", "tool.chainFlexible"];
     const catalog = allPaletteCommands();
     const sections = buildGallerySections(catalog, [], new Set(), "");
     const bonds = sections.find(section => section.id === "bonds");

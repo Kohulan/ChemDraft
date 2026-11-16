@@ -144,6 +144,18 @@ export function isDesktopRuntime(): boolean {
   return Boolean(candidate.__TAURI_INTERNALS__ || candidate.__TAURI__);
 }
 
+/** Atomically publish command and native-chooser bounds to this palette/popover. */
+export async function setPaletteCommandHitBoxes(
+  boxes: readonly { x: number; y: number; width: number; height: number }[],
+  chooserRects: readonly { x: number; y: number; width: number; height: number }[] = []
+): Promise<void> {
+  if (!isDesktopRuntime()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("set_palette_command_hit_boxes", {
+    boxes: [...boxes, ...chooserRects.map(rect => ({ ...rect, nativeChooser: true }))]
+  });
+}
+
 export function createPaletteCommandPayload(commandId: string): PaletteCommandPayload {
   return createToolsetCommandPayload(commandId);
 }
@@ -468,7 +480,7 @@ export interface ToolsetFlyoutSnapshot {
  * no per-kind windows to keep in sync, and no way for a stale kind to coexist.
  */
 export type ToolsetPopoverContent = ToolsetPopoverOpening & (
-  | { kind: "artColor" }
+  | { kind: "artColor" | "textColor" }
   | { kind: "flyout"; flyout: ToolsetFlyoutSnapshot }
 );
 
@@ -547,6 +559,9 @@ export interface ToolsetFlyoutSession {
 }
 export interface ToolsetFlyoutKey extends ToolsetFlyoutSession {
   key: string;
+  /** Document-owned E/Z navigation includes its exact session and reverse Tab. */
+  sessionId?: string;
+  shiftKey?: boolean;
 }
 const TOOLSET_FLYOUT_KEY_EVENT = "chemdraft://toolset-flyout-key";
 const TOOLSET_FLYOUT_CLOSED_EVENT = "chemdraft://toolset-flyout-closed";
