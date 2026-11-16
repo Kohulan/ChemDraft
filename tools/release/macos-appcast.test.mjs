@@ -115,10 +115,16 @@ test("arm64 feed retains every published signed item byte-for-byte and lists onl
   assert.deepEqual(updated.slice(1), items);
 });
 
-test("committed Intel feed is valid empty RSS until the first Intel release", () => {
+test("committed Intel feed is valid and lists only x86_64 DMGs", () => {
   const xml = readFileSync(new URL("../../appcast-intel.xml", import.meta.url), "utf8");
-  assert.deepEqual(verifyAppcast(xml, "x86_64"), []);
-  assert.deepEqual(parseAppcast(xml), []);
+  const items = verifyAppcast(xml, "x86_64");
+  assert.ok(items.length > 0);
+  assert.equal(parseAppcast(xml).length, items.length);
+  for (const item of items) {
+    assert.match(item.url, /_x86_64\.dmg$/);
+    assert.doesNotMatch(item.url, /_(?:aarch64|arm64)\.dmg$/);
+    assert.match(item.raw, /<sparkle:minimumSystemVersion>11\.0<\/sparkle:minimumSystemVersion>/);
+  }
   for (const invalid of ["<rss><channel></rss>", "<rss/>", "<!DOCTYPE rss><rss/>"]) assert.throws(() => parseAppcast(invalid));
 });
 
