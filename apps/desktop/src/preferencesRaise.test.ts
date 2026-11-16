@@ -55,15 +55,17 @@ it("makes retained Preferences key as well as frontmost on macOS, keeping Window
   const windows = raise.split("#[cfg(windows)]")[1]!.split("#[cfg(not(any")[0]!;
   expect(windows).toContain("SetWindowPos(");
   // Windows activation remains in the shared path before its sibling z-order adjustment.
+  // 06ab47372 / 2e872572e added true for an explicit reveal during owner restoration.
   const show = dialogs.split("fn show_on_main<R: Runtime>")[1]!.split("pub(crate) fn configure_on_main")[0]!;
-  expect(show).toMatch(/window\.unminimize\(\)[\s\S]*?window\.show\(\)[\s\S]*?window\.set_focus\(\)[\s\S]*?bring_to_front_on_main\(window\)/);
+  expect(show).toMatch(/window\.unminimize\(\)[\s\S]*?window\.show\(\)[\s\S]*?window\.set_focus\(\)[\s\S]*?bring_to_front_on_main\(window, true\)/);
 });
 
 it("gives Preferences priority over pending unhide focus and defers its final macOS raise", () => {
   const source = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
   const dialogs = readFileSync(new URL("../src-tauri/src/dialog_windows.rs", import.meta.url), "utf8");
   const show = dialogs.split("fn show_on_main<R: Runtime>")[1]!.split("fn activate_preferences_application_on_main")[0]!;
-  expect(show).toMatch(/if preferences \{\s*super::clear_document_key_after_unhide_for_preferences\(\);[\s\S]*?window\.show\(\)[\s\S]*?activate_preferences_application_on_main\(\)\?;[\s\S]*?window\.set_focus\(\)[\s\S]*?bring_to_front_on_main\(window\)\?;\s*if preferences \{\s*defer_preferences_raise_on_main\(window\);/);
+  // Keep ff2c6b11f's deferred focus order with 06ab47372's explicit-reveal argument.
+  expect(show).toMatch(/if preferences \{\s*super::clear_document_key_after_unhide_for_preferences\(\);[\s\S]*?window\.show\(\)[\s\S]*?activate_preferences_application_on_main\(\)\?;[\s\S]*?window\.set_focus\(\)[\s\S]*?bring_to_front_on_main\(window, true\)\?;\s*if preferences \{\s*defer_preferences_raise_on_main\(window\);/);
   expect(source).toMatch(/fn preferences_raised\(&mut self\) \{\s*self\.document_was_key_at_hide = None;/);
   expect(source).toMatch(/fn clear_document_key_after_unhide_for_preferences\(\) \{[\s\S]*?DOCUMENT_KEY_AFTER_UNHIDE\.lock\(\)[\s\S]*?state\.preferences_raised\(\)/);
   expect(source).toMatch(/#\[cfg\(not\(target_os = "macos"\)\)\]\s*fn clear_document_key_after_unhide_for_preferences\(\)/);
@@ -73,7 +75,8 @@ it("gives Preferences priority over pending unhide focus and defers its final ma
   expect(deferred).toContain("block2::RcBlock::new(move ||");
   expect(deferred).toContain("NSOperationQueue::mainQueue().addOperationWithBlock(&raise)");
   expect(deferred).not.toContain("run_on_main_thread");
-  expect(deferred).toMatch(/get_webview_window\(super::PREFERENCES_WINDOW_LABEL\)[\s\S]*?get_webview_window\(super::MAIN_WINDOW_LABEL\)[\s\S]*?should_raise_preferences_after_activation\([\s\S]*?super::quit_in_progress\(\)[\s\S]*?window\.is_visible\(\)[\s\S]*?bring_to_front_on_main\(&window\)/);
+  // The deferred completion belongs to the same explicit Preferences request (06ab47372).
+  expect(deferred).toMatch(/get_webview_window\(super::PREFERENCES_WINDOW_LABEL\)[\s\S]*?get_webview_window\(super::MAIN_WINDOW_LABEL\)[\s\S]*?should_raise_preferences_after_activation\([\s\S]*?super::quit_in_progress\(\)[\s\S]*?window\.is_visible\(\)[\s\S]*?bring_to_front_on_main\(&window, true\)/);
   expect(dialogs).toMatch(/#\[cfg\(not\(target_os = "macos"\)\)\]\s*fn defer_preferences_raise_on_main<R: Runtime>/);
   const bringToFront = dialogs.split("fn bring_to_front_on_main<R: Runtime>")[1]!.split("struct SavedPosition")[0]!;
   expect(bringToFront).toMatch(/#\[cfg\(target_os = "macos"\)\][\s\S]*?if window\.label\(\) == super::PREFERENCES_WINDOW_LABEL \{\s*native\.makeKeyAndOrderFront\(None\);\s*\} else \{\s*native\.orderFront\(None\);/);
