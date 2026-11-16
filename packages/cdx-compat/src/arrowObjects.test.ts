@@ -144,7 +144,29 @@ describe.each([false, true])("directed Arrow objects (binary=%s)", binary => {
     const arrow = result.opened.document!.pages[0].objects[0] as GraphicObject;
     expect(arrow.data).toMatchObject({ artToolId: "fishhookArrow", markerEnd: { kind: "half-arrow" } });
     expect(arrow.data.markerStart).toBeUndefined();
+    expect(all(result.root, "arrow")[0].attrs.ArrowShaftSpacing).toBeUndefined();
+    expect(arrow.data.dualShaft).toBeUndefined();
     assertEndpoints(arrow, start, end);
+  });
+
+  it.each(["head", "tail", "both"] as const)("preserves equilibrium's dual shafts with %s removed", removed => {
+    const start = { x: 400, y: 200 }, end = { x: 200, y: 200 };
+    const document = createEmptyDocument();
+    const arrow = artArrow(start, end, "equilibrium");
+    if (removed !== "tail") delete arrow.data.markerEnd;
+    if (removed !== "head") delete arrow.data.markerStart;
+    document.pages[0].objects.push(arrow);
+    const result = visibleExport(document, binary);
+    const attributes = all(result.root, "arrow")[0].attrs;
+    expect(attributes.ArrowShaftSpacing).toBe("300");
+    expect(attributes.ArrowheadHead).toBe(removed === "tail" ? "HalfLeft" : undefined);
+    expect(attributes.ArrowheadTail).toBe(removed === "head" ? "HalfLeft" : undefined);
+    const reopened = result.opened.document!.pages[0].objects[0] as GraphicObject;
+    expect(reopened.data).toMatchObject({ artToolId: "equilibriumArrow", dualShaft: true });
+    expect(reopened.data.dualShaftParallel).toBeUndefined();
+    expect(reopened.data.markerStart?.kind).toBe(removed === "head" ? "half-arrow" : undefined);
+    expect(reopened.data.markerEnd?.kind).toBe(removed === "tail" ? "half-arrow" : undefined);
+    assertEndpoints(reopened, start, end);
   });
 
   it("writes the actual edited head side instead of the semantic tool's defaults", () => {
@@ -177,6 +199,26 @@ describe.each([false, true])("directed Arrow objects (binary=%s)", binary => {
     expect(all(visibleExport(result.opened.document!, binary).root, "arrow")[0].attrs.ArrowheadType).toBe("Solid");
   });
 
+  it("imports a leftward legacy Hollow arrow and re-exports its hollow head on the left", () => {
+    const xml = '<CDXML><page id="1"><graphic id="2" GraphicType="Line" ArrowType="Hollow" BoundingBox="150 150 300 150" Tail3D="300 150 0" Head3D="150 150 0"/></page></CDXML>';
+    const opened = binary ? importCdx(writeCdx(tree(xml))) : openChemDraftPayload(xml);
+    expect(opened.source).not.toBe("native-payload");
+    expect(opened.warnings).toContainEqual(expect.objectContaining({ code: "cdxml.arrow_hollow_head_approximation" }));
+    const arrow = opened.document!.pages[0].objects[0] as GraphicObject;
+    expect(arrow.data).toMatchObject({ artToolId: "reactionArrow", markerEnd: { kind: "open-arrow" } });
+    expect(arrow.data.markerStart).toBeUndefined();
+    assertEndpoints(arrow, { x: 400, y: 200 }, { x: 200, y: 200 });
+    const result = visibleExport(opened.document!, binary);
+    expect(all(result.root, "graphic")).toEqual([]);
+    expect(all(result.root, "arrow")).toHaveLength(1);
+    expect(all(result.root, "arrow")[0].attrs).toMatchObject({
+      Tail3D: "300 150 0", Head3D: "150 150 0", ArrowheadHead: "Full", ArrowheadType: "Hollow"
+    });
+    const reopened = result.opened.document!.pages[0].objects[0] as GraphicObject;
+    expect(reopened.data).toMatchObject({ artToolId: "reactionArrow", markerEnd: { kind: "open-arrow" } });
+    assertEndpoints(reopened, { x: 400, y: 200 }, { x: 200, y: 200 });
+  });
+
   it.each(["FullHead", "HalfHead", "Resonance", "Equilibrium", "RetroSynthetic"])("still imports legacy Graphic Line + ArrowType=%s", type => {
     const xml = `<CDXML><page id="1"><graphic id="2" GraphicType="Line" ArrowType="${type}" BoundingBox="150 150 300 150" Tail3D="300 150 0" Head3D="150 150 0"/></page></CDXML>`;
     const opened = binary ? importCdx(writeCdx(tree(xml))) : openChemDraftPayload(xml);
@@ -188,5 +230,21 @@ describe.each([false, true])("directed Arrow objects (binary=%s)", binary => {
     const result = visibleExport(opened.document!, binary);
     expect(all(result.root, "arrow")).toHaveLength(1);
     expect((result.opened.document!.pages[0].objects[0] as GraphicObject).data.artToolId).toBe(tool);
+  });
+});
+
+describe("legacy unknown arrow endpoints", () => {
+  it.each([
+    ["3D endpoints before 2D aliases", 'Tail3D="300 225 0" Head3D="150 150 0" Start="150 150" End="300 225"', { x: 400, y: 300 }, { x: 200, y: 200 }],
+    ["2D aliases before bounding box", 'Start="300 225" End="150 150"', { x: 400, y: 300 }, { x: 200, y: 200 }],
+    ["bounding box when endpoints are absent", "", { x: 200, y: 200 }, { x: 400, y: 300 }]
+  ] as const)("prefers %s", (_name, attributes, start, end) => {
+    const opened = openChemDraftPayload(`<CDXML><page id="1"><graphic id="2" GraphicType="Line" ArrowType="Unmapped" BoundingBox="150 150 300 225" ${attributes}/></page></CDXML>`);
+    expect(opened.source).not.toBe("native-payload");
+    const arrow = opened.document!.pages[0].objects[0] as ArrowObject;
+    expect(arrow.type).toBe("reaction-arrow");
+    expect(arrow.arrowKind).toBe("unknown");
+    expect(arrow.start).toEqual({ kind: "point", point: start });
+    expect(arrow.end).toEqual({ kind: "point", point: end });
   });
 });

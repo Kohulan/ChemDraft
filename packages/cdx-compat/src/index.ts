@@ -4709,8 +4709,8 @@ function importGraphic(
     if (arrowKind === "forward" || arrowKind === "resonance" || arrowKind === "equilibrium" || arrowKind === "retrosynthesis") {
       return importReactionArrowAsArtArrow(element, pageIndex, objectIndex, context, arrowKind);
     }
-    const start = parseCdxmlPoint(element.attributes.Start) ?? { x: box.x, y: box.y };
-    const end = parseCdxmlPoint(element.attributes.End) ?? { x: box.x + box.width, y: box.y + box.height };
+    const start = parseCdxmlXyPoint(element.attributes.Tail3D) ?? parseCdxmlXyPoint(element.attributes.Start) ?? { x: box.x, y: box.y };
+    const end = parseCdxmlXyPoint(element.attributes.Head3D) ?? parseCdxmlXyPoint(element.attributes.End) ?? { x: box.x + box.width, y: box.y + box.height };
     const color = colorForCdxmlIndex(element.attributes.color, context.colorTable);
     return {
       id: `cdxml_arrow_${pageIndex + 1}_${objectIndex}`,
@@ -4748,6 +4748,12 @@ function importReactionArrowAsArtArrow(
   context: ImportPageContext,
   arrowKind: "forward" | "resonance" | "equilibrium" | "retrosynthesis"
 ): GraphicObject {
+  if (normalizedCdxmlToken(element.attributes.ArrowType) === "hollow") {
+    // Legacy Hollow is a forward arrow; share the modern open-head approximation and preservation.
+    return importArrowGraphic({ ...element, attributes: {
+      ...element.attributes, ArrowheadHead: "Full", ArrowheadType: "Hollow"
+    } }, pageIndex, objectIndex, context);
+  }
   const graphic = importShapeGraphic(element, pageIndex, objectIndex, context, "graphic");
   // The two-shaft forms: equilibrium is opposed half-arrows, one head per shaft; retrosynthesis runs
   // both shafts the same way under a single open head.
@@ -4832,8 +4838,8 @@ function importHalfHeadArrowAsFishhook(
  *
  * The tool is read from the heads and shaft spacing: one head is a
  * reaction arrow, heads at both ends a resonance arrow, a single barb a fishhook. A headless
- * `<arrow>` is left untagged — it is a line, and should not claim to be a chemical arrow — but it
- * still becomes a path so a head can be added to it later.
+ * `<arrow>` without shaft spacing is left untagged — it is a line, and should not claim to be a
+ * chemical arrow — but it still becomes a path so a head can be added to it later.
  */
 function importArrowGraphic(
   element: XmlElementView,
@@ -4844,9 +4850,10 @@ function importArrowGraphic(
   const graphic = importShapeGraphic(element, pageIndex, objectIndex, context, "arrow");
   const markers = cdxmlArrowMarkers(element);
   const spaced = (parseNumber(element.attributes.ArrowShaftSpacing) ?? 0) > 0;
-  const equilibrium = spaced && Boolean(markers.markerStart && markers.markerEnd);
   const retro = spaced && !markers.markerStart && markers.markerEnd?.kind === "open-arrow" &&
     normalizedCdxmlToken(element.attributes.ArrowheadType) === "angle";
+  // Shaft spacing retains the two-shaft identity even when either or both heads were removed.
+  const equilibrium = spaced && !retro;
   const artToolId = equilibrium ? "equilibriumArrow" : retro ? "retroArrow" : artToolIdForImportedArrowMarkers(markers);
   const lineType = element.attributes.LineType;
   if (element.name === "arrow" && lineType !== undefined && !["solid", "dashed", "bold", "wavy"].includes(normalizedCdxmlToken(lineType))) {
@@ -6079,6 +6086,7 @@ const cdxmlArrowTypeByKind: Readonly<Record<Exclude<ArrowObject["arrowKind"], "u
 const arrowKindByCdxmlArrowType: ReadonlyMap<string, ArrowObject["arrowKind"]> = new Map([
   // Real CDXML spellings.
   ["fullhead", "forward"],
+  ["hollow", "forward"],
   // "halfhead" is absent on purpose: a half-headed arrow is one-electron chemistry and is
   // intercepted before this lookup (see importHalfHeadArrowAsFishhook). Mapping it to "forward"
   // here is what used to launder it into a two-electron reaction arrow.
