@@ -2,7 +2,19 @@
 
 Owns native clipboard formats and Office-friendly copy/paste behavior.
 
-Native clipboard integration is not implemented in the foundation milestone.
+The desktop native writer publishes all prepared flavors in one clipboard transaction. Drawing
+selection copy requires the private selection JSON and PNG, with SVG and (on macOS) PDF as optional
+vector renditions. Windows derives registered `PNG`, `image/png`, and `CF_DIBV5` from the PNG;
+macOS uses `public.png`, `public.svg-image`, and `com.adobe.pdf`. Rendering stays in export-engine.
+Text-only selections retain readable text; table-only selections retain editable HTML/RTF/TSV.
+
+`pngWithChemDraftSelection` adds the exact private selection JSON to the PNG in an uncompressed,
+UTF-8 `iTXt` chunk with keyword `application/x-chemdraft-selection+json`. It replaces that keyword's
+previous metadata, preserves image and density chunks, and enforces the 25 MB picture limit.
+The embedded payload uses the existing `chemdraft-selection` version 1 schema and native-version
+headers. This is a data carrier, not an Office activation or editing bridge. Office may choose a
+vector/bitmap rendition or strip PNG metadata; edit-in-place and preservation through Office
+save/reopen require separate integration and hands-on verification.
 
 `inspectClipboardPayload` accepts optional `imageItems` and `skippedImageItems` alongside existing
 text flavors. Chemistry retains priority; pictures precede prose, with PNG preferred over SVG.

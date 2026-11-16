@@ -1,3 +1,4 @@
+import { bondDrawingToolCommandId } from "./bondToolCommands";
 import type { CommandSpec } from "./commands";
 import { canonicalCommandId } from "./renamedCommands";
 import { detectShortcutPlatform, type ShortcutPlatform } from "@chemdraft/shortcut-engine";
@@ -87,7 +88,7 @@ export const coreDrawingToolDefinitions = [
     usageHint: usageHint("click canvas or atom", "click atom to extend", "Esc exits")
   },
   {
-    commandId: "tool.doubleBond",
+    commandId: bondDrawingToolCommandId("double"),
     title: "Double Bond",
     kind: "bond",
     category: "structure",
@@ -95,12 +96,20 @@ export const coreDrawingToolDefinitions = [
     usageHint: usageHint("click canvas or atom", "click bond to set its order", "Esc exits")
   },
   {
-    commandId: "tool.tripleBond",
+    commandId: bondDrawingToolCommandId("triple"),
     title: "Triple Bond",
     kind: "bond",
     category: "structure",
     icon: "tripleBond",
     usageHint: usageHint("click canvas or atom", "click bond to set its order", "Esc exits")
+  },
+  {
+    commandId: bondDrawingToolCommandId("double", "either"),
+    title: "E/Z-unspecified Double Bond",
+    kind: "bond",
+    category: "structure",
+    icon: "eitherDoubleBond",
+    usageHint: usageHint("click canvas or atom", "click bond to leave E/Z unspecified", "Esc exits")
   },
   {
     commandId: "tool.wedgeBond",
@@ -117,6 +126,14 @@ export const coreDrawingToolDefinitions = [
     category: "structure",
     icon: "bond",
     usageHint: usageHint("click canvas or atom", "click atom to extend", "Esc exits")
+  },
+  {
+    commandId: "tool.wavyBond",
+    title: "Wavy bond",
+    kind: "bond",
+    category: "structure",
+    icon: "wavyBond",
+    usageHint: usageHint("click canvas or atom", "click bond to apply, again to reverse", "Esc exits")
   },
   {
     commandId: "tool.dashedBond",
@@ -345,7 +362,15 @@ export const coreDrawingToolDefinitions = [
     kind: "bracket",
     category: "annotation",
     icon: "bracket",
-    usageHint: usageHint("click canvas to place", "resize with the transform handles", "Esc exits")
+    usageHint: usageHint("drag around a repeat unit", "click to place a default pair", "Esc exits")
+  },
+  {
+    commandId: "tool.roundBracket",
+    title: "Round Bracket Tool",
+    kind: "bracket",
+    category: "annotation",
+    icon: "roundBracket",
+    usageHint: usageHint("drag around a repeat unit", "click to place a default pair", "Esc exits")
   },
   {
     commandId: "tool.dagger",

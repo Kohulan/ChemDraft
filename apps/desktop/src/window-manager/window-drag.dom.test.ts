@@ -8,18 +8,17 @@ import { PluginPanelWindow } from "../plugins/PluginPanelWindow";
 import { pluginPanelWindowId } from "../plugins/panelBridge";
 
 const native = vi.hoisted(() => ({
-  invoke: vi.fn(async (_command: string, _args?: Record<string, unknown>) => undefined),
+  invoke: vi.fn(async (_command: string, _args?: Record<string, unknown>, _options?: unknown) => undefined),
   drag: vi.fn(),
   move: vi.fn()
 }));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: native.invoke }));
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({ startDragging: native.drag, setPosition: native.move })
 }));
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-describe("native title dragging", () => {
+describe.each(["macos", "windows"] as const)("native title dragging (%s)", platform => {
   let container: HTMLDivElement;
   let root: Root;
 
@@ -35,16 +34,17 @@ describe("native title dragging", () => {
   afterEach(() => {
     act(() => root.unmount());
     container.remove();
-    delete (window as typeof window & { __TAURI__?: unknown }).__TAURI__;
+    delete (window as typeof window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
     vi.restoreAllMocks();
   });
 
   async function mount(surface: "palette" | "panel"): Promise<void> {
-    // Mount with the real web event transport, then enable only the native drag invocation.
-    // No unrelated window sizing/focus IPC needs to be mocked for this call-path regression.
+    // Mount with the real web event transport, then stub the native IPC boundary.
+    // The pointerdown capture listener starts popover dismissal alongside dragging.
+    // Keep the real Tauri modules so concurrent imports share this same IPC stub.
     await act(async () => {
       root.render(surface === "palette"
-        ? createElement(PaletteWindow, { toolsetId: "core.main" })
+        ? createElement(PaletteWindow, { toolsetId: "core.main", platform })
         : createElement(PluginPanelWindow, { panelId: pluginPanelWindowId("org.test.demo", "panel.demo.result") }));
     });
     for (const owner of container.querySelectorAll<HTMLElement>(".palette-title, main")) {
@@ -53,7 +53,7 @@ describe("native title dragging", () => {
       owner.hasPointerCapture = () => false;
       owner.releasePointerCapture = vi.fn();
     }
-    (window as typeof window & { __TAURI__?: unknown }).__TAURI__ = {};
+    (window as typeof window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = { invoke: native.invoke };
   }
 
   function pointerEvent(type: string, pointerId: number, isPrimary = true): MouseEvent {
@@ -99,7 +99,7 @@ describe("native title dragging", () => {
 
   function expectOneCompensatedDrag(): void {
     expect(native.invoke.mock.calls.filter(([command]) => command === "start_window_drag"))
-      .toEqual([["start_window_drag", { grabX: 37, grabY: 11 }]]);
+      .toEqual([["start_window_drag", { grabX: 37, grabY: 11 }, undefined]]);
     expect(native.drag).not.toHaveBeenCalled();
     // Tauri's injected mousedown handler has nothing to match, including the content grip.
     expect(container.querySelector("[data-tauri-drag-region]")).toBeNull();

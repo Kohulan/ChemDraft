@@ -3,10 +3,13 @@ import type { ChemDraftDocument } from "@chemdraft/chem-core";
 import { createBondStereoActions, createFlippedBondStereoAction, moleculeBondStereoCommandId } from "./commands";
 import { nativeBondStereoAvailability, nativeBondStereoFlipDisabledReason } from "./documentWorkflow";
 import { listenCurrentWindowEvent } from "./window-manager/tauriEvents";
+import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
+import { detectDesktopShortcutPlatform } from "./keyboardShortcuts";
 import {
   closeToolsetPopoverWindow, currentWindowLogicalPosition, listenForBondStereoPopoverActions,
   listenForToolsetPopoverContentRequests, listenForToolsetPopoverDismiss, openToolsetPopoverWindow,
-  sendBondStereoPopoverAction, setToolsetPopoverContent, toolsetPopoverTimestamp, type ToolsetPopoverAnchor, type ToolsetPopoverContent
+  sendBondStereoPopoverAction, sendToolsetFlyoutKey, setToolsetPopoverContent, newToolsetPopoverOpening, compareToolsetPopoverOpenings,
+  type ToolsetPopoverAnchor, type ToolsetPopoverContent
 } from "./window-manager";
 
 export const BOND_STEREO_POPOVER_ID = "core.bondStereo";
@@ -19,7 +22,7 @@ type Session = { id: string; openedAt: number; document: ChemDraftDocument; targ
 export function useBondStereoPopover(options: {
   document: ChemDraftDocument; targets: readonly Target[]; reader: Reader;
   select(target: Target): void; invoke(commandId: string): void | Promise<void>; focusCanvas(): void;
-}) {
+}, platform: ShortcutPlatform = detectDesktopShortcutPlatform()) {
   const latest = useRef(options);
   latest.current = options;
   const session = useRef<Session | undefined>(undefined);
@@ -33,9 +36,11 @@ export function useBondStereoPopover(options: {
   const close = () => {
     if (!session.current) return;
     const id = session.current.id;
+    const openedAt = session.current.openedAt;
+    const generation = session.current.content.generation;
     session.current = undefined;
     void sendBondStereoPopoverAction({ sessionId: id, action: "close" }).catch(() => undefined);
-    enqueue(() => closeToolsetPopoverWindow(BOND_STEREO_POPOVER_ID));
+    enqueue(() => closeToolsetPopoverWindow(BOND_STEREO_POPOVER_ID, openedAt, generation));
     latest.current.focusCanvas();
   };
   const push = async (opened: Session) => {
@@ -51,6 +56,8 @@ export function useBondStereoPopover(options: {
       if (id === BOND_STEREO_POPOVER_ID && session.current) void push(session.current);
     }));
     subscribe(listenForToolsetPopoverDismiss(payload => {
+      if (payload?.openings && (!session.current || !payload.openings.some(opening => opening.toolsetId === BOND_STEREO_POPOVER_ID &&
+        compareToolsetPopoverOpenings(opening, session.current!.content) === 0))) return;
       // The opening press broadcasts before click, but its IPC may arrive after
       // this session opens. Only a press at or after this open may dismiss it.
       if (session.current && payload?.requestedAt !== undefined && payload.requestedAt < session.current.openedAt) return;
@@ -75,25 +82,57 @@ export function useBondStereoPopover(options: {
       } else if (payload.action === "keep" || payload.action === "close") close();
     }));
     const pointerAway = () => close();
-    const escape = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && session.current) { event.preventDefault(); event.stopPropagation(); close(); }
+    const activationKeys = new Set<string>();
+    const keyDown = (event: KeyboardEvent) => {
+      if (platform !== "windows") {
+        if (event.key === "Escape" && session.current) { event.preventDefault(); event.stopPropagation(); close(); }
+        return;
+      }
+      if (event.isComposing || event.keyCode === 229 || event.defaultPrevented) return;
+      if (event.repeat && activationKeys.has(event.key)) {
+        event.preventDefault(); event.stopImmediatePropagation(); return;
+      }
+      const opened = session.current;
+      if (!opened) return;
+      if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); close(); return; }
+      const navigation = ["Tab", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key);
+      const activate = event.key === "Enter" || event.key === " ";
+      if (!navigation && !activate) return;
+      // The document keeps the keyboard. Highlight and choose through the same
+      // flyout transport as ordinary tool menus, without focusing the WebView2.
+      event.preventDefault(); event.stopImmediatePropagation();
+      if (event.ctrlKey || event.metaKey || event.altKey || (event.shiftKey && event.key !== "Tab")) return;
+      if (activate) activationKeys.add(event.key);
+      void sendToolsetFlyoutKey({ toolsetId: BOND_STEREO_POPOVER_ID, flyoutId: BOND_STEREO_POPOVER_ID,
+        openedAt: opened.openedAt, sessionId: opened.id, key: event.key, shiftKey: event.shiftKey }).catch(() => undefined);
+    };
+    const keyUp = (event: KeyboardEvent) => {
+      // Suppress a repeated Enter/Space and its native keyup click even if the
+      // chosen action has already closed the session.
+      if (!activationKeys.delete(event.key)) return;
+      event.preventDefault(); event.stopImmediatePropagation();
     };
     window.addEventListener("pointerdown", pointerAway, true);
-    window.addEventListener("keydown", escape, true);
+    window.addEventListener("keydown", keyDown, true);
+    window.addEventListener("keyup", keyUp, true);
     window.addEventListener("scroll", close, true);
     window.addEventListener("resize", close);
     // Pan and zoom update the page stage's viewport CSS variables without necessarily scrolling.
     const stage = globalThis.document.querySelector(".page-stage");
     const observer = stage ? new MutationObserver(() => close()) : undefined;
     if (stage) observer?.observe(stage, { attributes: true, attributeFilter: ["style"] });
-    return () => { disposed = true; cleanups.forEach(cleanup => cleanup()); session.current = undefined;
+    return () => { disposed = true; cleanups.forEach(cleanup => cleanup());
+      const openedAt = session.current?.openedAt;
+      const generation = session.current?.content.generation;
+      session.current = undefined;
       observer?.disconnect();
       window.removeEventListener("scroll", close, true);
       window.removeEventListener("resize", close);
       window.removeEventListener("pointerdown", pointerAway, true);
-      window.removeEventListener("keydown", escape, true);
-      enqueue(() => closeToolsetPopoverWindow(BOND_STEREO_POPOVER_ID)); };
-  }, []);
+      window.removeEventListener("keydown", keyDown, true);
+      window.removeEventListener("keyup", keyUp, true);
+      enqueue(() => closeToolsetPopoverWindow(BOND_STEREO_POPOVER_ID, openedAt, generation)); };
+  }, [platform]);
 
   useEffect(() => {
     const opened = session.current;
@@ -102,7 +141,7 @@ export function useBondStereoPopover(options: {
   }, [options.document, options.targets]);
 
   return (request: BondStereoBadgeRequest) => {
-    const openedAt = toolsetPopoverTimestamp();
+    const { openedAt, generation } = newToolsetPopoverOpening();
     close();
     const { document, reader } = latest.current;
     const target = { objectId: request.objectId, bondId: request.bondId };
@@ -113,7 +152,7 @@ export function useBondStereoPopover(options: {
     const actions = [createBondStereoActions(state)[1], createFlippedBondStereoAction(state,
       nativeBondStereoFlipDisabledReason(document, [target], reader))];
     const id = `bond-stereo-${Date.now()}-${++serial.current}`;
-    const opened: Session = { id, openedAt, document, target, content: { kind: "flyout", openedAt, flyout: {
+    const opened: Session = { id, openedAt, document, target, content: { kind: "flyout", openedAt, generation, flyout: {
       id, flyoutId: BOND_STEREO_POPOVER_ID, title: "E/Z not specified", variant: "bondStereo", keyboardOpen: request.keyboard,
       commands: actions.map(action => ({ id: action.id, title: action.title, enabled: action.enabled !== false,
         active: false, disabledReason: action.disabledReason }))
@@ -126,7 +165,7 @@ export function useBondStereoPopover(options: {
       if (!position) { close(); return; }
       opened.anchor = { x: position.x + request.rect.left, y: position.y + request.rect.bottom + 4 };
       await openToolsetPopoverWindow(BOND_STEREO_POPOVER_ID, "flyout", opened.anchor.x, opened.anchor.y,
-        request.keyboard ? "focus" : "preserve");
+        request.keyboard && platform !== "windows" ? "focus" : "preserve");
       if (session.current !== opened) return;
       await push(opened);
     }, () => { if (session.current === opened) close(); });

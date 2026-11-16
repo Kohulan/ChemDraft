@@ -1,6 +1,7 @@
 import type { MoleculeAtom, MoleculeBond } from "@chemdraft/chem-core";
 
 export { kekuleSearchWorkForTesting } from "./valence";
+export { atomLabelReferenceInk } from "./atomLabelInk.fixture";
 
 import type { NativeDrawingStyle } from "@chemdraft/chem-core";
 

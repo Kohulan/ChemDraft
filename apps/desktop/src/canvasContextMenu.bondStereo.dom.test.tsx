@@ -16,7 +16,7 @@ import { applyMoleculeBondStereo, CHEMDRAFT_SELECTION_CLIPBOARD_TYPE, copyAsMerg
 import { moleculeToMolfileV3000 } from "@chemdraft/chem-core";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 import { DOM_COMMAND_EVENT, openToolsetPopoverWindow, setToolsetPopoverContent, closeToolsetPopoverWindow,
-  currentWindowLogicalPosition, dismissToolsetPopovers, type ToolsetPopoverDismissPayload, type BondStereoPopoverAction } from "./window-manager";
+  currentWindowLogicalPosition, dismissToolsetPopovers, sendToolsetFlyoutKey, type ToolsetPopoverDismissPayload, type BondStereoPopoverAction } from "./window-manager";
 const nativePopover = vi.hoisted(() => ({
   action: undefined as undefined | ((payload: BondStereoPopoverAction) => void),
   request: undefined as undefined | ((id: string) => void),
@@ -32,6 +32,7 @@ vi.mock("./window-manager", async importOriginal => ({
   openToolsetPopoverWindow: vi.fn(async () => {}),
   closeToolsetPopoverWindow: vi.fn(async () => {}),
   setToolsetPopoverContent: vi.fn(async () => {}),
+  sendToolsetFlyoutKey: vi.fn(async () => {}),
   focusCurrentWindowAndWebview: vi.fn(async () => {}),
   listenForBondStereoPopoverActions: vi.fn(async handler => { nativePopover.action = handler; return () => {}; }),
   listenForToolsetPopoverContentRequests: vi.fn(async handler => { nativePopover.request = handler; return () => {}; }),
@@ -328,7 +329,10 @@ describe.each<ShortcutPlatform>(["macos", "windows"])("native badge popover (%s)
       }
     });
     expect(currentWindowLogicalPosition).toHaveBeenCalledWith("inner");
-    expect(openToolsetPopoverWindow).toHaveBeenCalledWith("core.bondStereo", "flyout", 130, 254, keyboard ? "focus" : "preserve");
+    // Windows keeps keyboard navigation in the document to avoid activating the palette.
+    expect(openToolsetPopoverWindow).toHaveBeenCalledWith("core.bondStereo", "flyout", 130, 254,
+      keyboard && platform !== "windows" ? "focus" : "preserve");
+    if (keyboard && platform === "windows") expect(document.activeElement).toBe(badge);
     const content = vi.mocked(setToolsetPopoverContent).mock.calls.at(-1)![1];
     expect(setToolsetPopoverContent).toHaveBeenLastCalledWith("core.bondStereo", expect.anything(), { x: 130, y: 254 });
     if (content.kind !== "flyout") throw new Error("Expected flyout");
@@ -369,7 +373,7 @@ describe.each<ShortcutPlatform>(["macos", "windows"])("native badge popover (%s)
     // A later press in another palette reaches this window only via its broadcast.
     await dismissToolsetPopovers(performance.timeOrigin + performance.now());
     await act(async () => nativePopover.dismiss?.(nativePopover.pendingDismisses.shift()));
-    expect(closeToolsetPopoverWindow).toHaveBeenCalledWith("core.bondStereo");
+    expect(closeToolsetPopoverWindow).toHaveBeenCalledWith("core.bondStereo", originalContent.openedAt, originalContent.generation);
     await act(async () => nativePopover.request?.("core.bondStereo"));
     expect(setToolsetPopoverContent).toHaveBeenCalledTimes(2);
   });
@@ -393,20 +397,30 @@ describe.each<ShortcutPlatform>(["macos", "windows"])("native badge popover (%s)
     const { original, content } = await openBadge(action === "escape" ? "Enter" : undefined);
     await act(async () => {
       if (action === "keep") nativePopover.action?.({ sessionId: content.flyout.id!, action: "keep" });
-      if (action === "escape") canvas.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+      if (action === "escape") document.activeElement!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
       if (action === "click-away") canvas.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
       if (action === "palette-away") nativePopover.dismiss?.();
     });
-    expect(closeToolsetPopoverWindow).toHaveBeenCalledWith("core.bondStereo");
+    expect(closeToolsetPopoverWindow).toHaveBeenCalledWith("core.bondStereo", content.openedAt, content.generation);
     expect(document.activeElement).toBe(canvas); expect(molecule()).toEqual(original);
     await command("edit.undo"); expect(molecule()).toEqual(original);
   });
   it("opens with Space through the canvas Tab path and never exports the badge/popover", async () => {
-    await openBadge(" ");
+    const { content } = await openBadge(" ");
+    if (platform === "windows") {
+      const badge = document.activeElement;
+      for (const [value, shiftKey] of [["ArrowDown", false], ["Tab", true], ["Enter", false]] as const) {
+        await key(value, shiftKey);
+        expect(sendToolsetFlyoutKey).toHaveBeenLastCalledWith({ toolsetId: "core.bondStereo", flyoutId: "core.bondStereo",
+          openedAt: content.openedAt, sessionId: content.flyout.id, key: value, shiftKey });
+        expect(document.activeElement).toBe(badge);
+      }
+      expect(sendToolsetFlyoutKey).toHaveBeenCalledTimes(3);
+    }
     const doc = window.__CHEMDRAFT_AGENT__!.snapshot().document;
     vi.stubGlobal("getComputedStyle", window.getComputedStyle.bind(window));
     const pdf = await exportPhase4Pdf(doc, { compress: false });
-    for (const output of [exportPhase4Svg(doc).contents, exportPhase4Cdxml(doc).contents, new TextDecoder().decode(pdf.bytes)]) {
+    for (const output of [(await exportPhase4Svg(doc)).contents, exportPhase4Cdxml(doc).contents, new TextDecoder().decode(pdf.bytes)]) {
       expect(output).not.toContain("native-bond-stereo-marker"); expect(output).not.toContain("E/Z not specified");
       expect(output).not.toContain("This double bond"); expect(output).not.toMatch(/>!<|\(!\) Tj/);
     }
