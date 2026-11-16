@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { describe, expect, it, vi } from "vitest";
+import { NativeStylePresets } from "@chemdraft/chem-core";
 
 import {
   buildAppMenuModel,
@@ -15,6 +16,8 @@ import {
   type AppMenuContext
 } from "./appMenu";
 import { pluginItemsForNativeMenu } from "./plugins/nativePluginMenu";
+import { VIBE_CODE_STARTER_COMMAND_ID } from "./commands/vibeCodeStarter";
+import { nativeStylePresetCommandId } from "./commands";
 
 const EMPTY_CONTEXT: AppMenuContext = {
   rulersVisible: true,
@@ -58,6 +61,22 @@ function parseNativeMenuCommandIds(): string[] {
 }
 
 describe("app menu model", () => {
+  it.each(["macos", "windows"] as const)("keeps a separate plugin alias block after the drawing styles on %s", platform => {
+    const context = { ...EMPTY_CONTEXT, platform };
+    const base = buildAppMenuModel(context).find(section => section.id === "structure")!;
+    const aliases: AppMenuCommand[] = ["first", "second"].map(name => ({
+      kind: "command", id: `menu.test.${name}`, commandId: `plugin.test.${name}`,
+      label: name, enabled: true, pluginContributed: true
+    }));
+    const model = buildAppMenuModel({ ...context, pluginMenuItems: aliases.map(command => ({ location: "structure", command })) });
+    const structure = model.find(section => section.id === "structure")!;
+    expect(base.items.slice(-NativeStylePresets.length)).toEqual(NativeStylePresets.map(preset =>
+      expect.objectContaining({ kind: "command", commandId: nativeStylePresetCommandId(preset.id) })));
+    expect(structure.items.slice(0, base.items.length)).toEqual(base.items);
+    expect(structure.items.slice(base.items.length)).toEqual([expect.objectContaining({ kind: "separator" }), ...aliases]);
+    expect(nativeRoutedCommandIds(model)).toEqual(nativeRoutedCommandIds(buildAppMenuModel(context)));
+  });
+
   it.each(["MacIntel", "Win32"])("shows the counted plugin update notice only for available offers on %s", platform => {
     vi.stubGlobal("navigator", { platform });
     try {
@@ -239,6 +258,7 @@ describe("app menu model", () => {
       "Insert",
       "View",
       "Structure",
+      "Tools",
       "Analyze",
       "Plugins",
       "Help"
@@ -258,8 +278,8 @@ describe("app menu model", () => {
     expect(nativeRoutedCommandIds(model)).toContain("table.insertDialog");
   });
 
-  it("exposes the core plugin manager in its own native-routed section", () => {
-    const model = buildAppMenuModel(EMPTY_CONTEXT);
+  it.each(["macos", "windows"] as const)("exposes the plugin manager and starter in order on %s", platform => {
+    const model = buildAppMenuModel({ ...EMPTY_CONTEXT, platform });
     const plugins = model.find((section) => section.id === "plugins");
 
     expect(plugins?.label).toBe("Plugins");
@@ -269,9 +289,20 @@ describe("app menu model", () => {
         commandId: PLUGIN_MANAGER_COMMAND_ID,
         label: "Add or Remove Plugins…",
         enabled: true
+      }),
+      expect.objectContaining({ kind: "separator" }),
+      expect.objectContaining({
+        kind: "command",
+        commandId: VIBE_CODE_STARTER_COMMAND_ID,
+        label: "Vibe Code Your Own Plugin…",
+        enabled: true
       })
     ]);
     expect(nativeRoutedCommandIds(model)).toContain(PLUGIN_MANAGER_COMMAND_ID);
+    expect(nativeRoutedCommandIds(model)).toContain(VIBE_CODE_STARTER_COMMAND_ID);
+    const source = readFileSync("apps/desktop/src-tauri/src/lib.rs", "utf8");
+    const builder = source.split("let plugins_menu =")[1]!.split("let plugins_plugin_items")[0]!;
+    expect(builder).toMatch(/"plugins.manage",\s*"Add or Remove Plugins…"[\s\S]*PredefinedMenuItem::separator\(app\)[\s\S]*"plugins.vibeCodeStarter",\s*"Vibe Code Your Own Plugin…"/);
   });
 
   it("appends plugin menu items to their target section without disturbing the native routed set", () => {
@@ -297,6 +328,7 @@ describe("app menu model", () => {
       "Insert",
       "View",
       "Structure",
+      "Tools",
       "Analyze",
       "Plugins",
       "Help"
@@ -321,7 +353,7 @@ describe("app menu model", () => {
     expect(commands.some((command) => /nmr/i.test(command.commandId) || /nmr/i.test(command.label))).toBe(false);
   });
 
-  it("appends contributed items to the core Plugins section after one separator", () => {
+  it("appends contributed items after the core Plugins commands and a separator", () => {
     const model = buildAppMenuModel({
       ...EMPTY_CONTEXT,
       pluginMenuItems: [
@@ -342,6 +374,8 @@ describe("app menu model", () => {
     const plugins = model.find((section) => section.id === "plugins");
     expect(plugins?.items.map((item) => (item.kind === "command" ? item.commandId : item.kind))).toEqual([
       PLUGIN_MANAGER_COMMAND_ID,
+      "separator",
+      VIBE_CODE_STARTER_COMMAND_ID,
       "separator",
       "plugin.demo.open"
     ]);

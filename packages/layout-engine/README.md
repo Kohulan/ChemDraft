@@ -2,6 +2,11 @@
 
 Owns page and object layout operations such as align, distribute, group, rotate, flip, z-order, guides, and page sizing.
 
+`textVisualBoundsForPageFit` measures both a text object's stored frame and the explicit lines SVG
+paints beyond that frame, using the shared font/script metrics, alignment and original rotation
+pivot. The desktop uses it before a page-enlargement question. The existing arrangement helper
+continues to measure the stored frame; neither helper changes text or document geometry.
+
 It also owns pure molecule-growth geometry helpers used by drawing tools, such as planning the next bonded atom position from an existing native molecule graph. The desktop app may consume these plans, but document mutation remains in `chem-core` patches and app workflow code.
 
 `src/labelGrammar.ts` is the one atom-label grammar: what a label's text means (an element, one heavy
@@ -10,6 +15,12 @@ placeholder, a bare formula, or unrecognized text), which atom of a group its bo
 valence tables the reading needs. It is pure text in, reading out, so the drawn label can place a
 group by the same reading the chemistry uses. `@chemdraft/document-workflow-core` re-exports it and
 keeps what is built on it (valence verdicts, validation, expansion); it must not carry a copy.
+
+Hover typing uses `nativeHoverAtomLabelCompletion` and `nativeHoverAtomLabelCanContinue` against
+the same grammar and abbreviation table. Lowercase keys can finish known labels such as NO2,
+OMe and OBn. An implicit first capital never makes `n,o` the element No: that pending text is
+invalid until completed. The ordinary label grammar still accepts explicitly entered element
+symbols, and the hover helpers do not change imported labels.
 
 A group label is drawn the way round its bond reads, with the atom it bonds to on the atom
 (`nativeGroupLabelDisplay`, `atomDisplayLabelPlacement`): "OMe" with its O on the atom, drawn "MeO"
@@ -90,6 +101,43 @@ type-4 bond does not), and `porphyrinoid` / `fusedPyrroleLadder` builders.
 
 Layout must not change chemical identity.
 
+`planObjectAlignment` and `planObjectDistribution` plan translations from unit bounds.
+The caller supplies each molecule and its selected explicit electron marks as one unit;
+`combinedLayoutBounds` includes their annotation offsets without changing molecular geometry.
+
+Reaction builders may store explicit editable NaOH, MgBr and H2O atom labels.
+The ordinary abbreviation/spelled-label grammar expands them for chemistry; a drawn label is
+one selectable atom, with no invisible atoms or bonds behind it. Only NaOH with explicit
+`schemeAbbreviation: "NaOH"` metadata expands to [Na+].[OH-]; typed NaOH stays a formula placeholder.
+Ordinary expanded molecules keep their individual atom and bond rendering.
+
+Wavy single bonds use a tapered sinusoidal cubic path, with amplitude and wavelength tied to the
+stroke width and bond length. The shared SVG plan owns label trimming and crossing gaps, including
+effect/sketch paths; canvas, SVG, PDF and resvg PNG all consume that geometry.
+
+Unknown-order bonds render as separated round dots in the shared canvas/SVG plan (also used by
+PDF), using only the bond's stroke colour. This mandatory display takes precedence over retained
+bond display styles and remains visible with query indicators off or sketch effects on. It does
+not resolve the order or change the stored chemistry.
+
+Bold bonds use filled bands from `src/boldBonds.ts`, shared by the canvas, SVG/PDF and clipboard
+images. `BoldBondStyle` sizes a band as `max(1.8 * lineWidth, min(3.4 * lineWidth,
+0.135 * bondLength))`: 3.6/22 units (16.36% of bond length) for the default Synthetic preset,
+2.97/22 (13.5%) for ACS 1996-style. Ring bands grow inward. Each end is one straight miter cut
+between the inner/inner and outer/outer edge intersections with the same-ring neighbor; an
+exocyclic substituent never clips the band. Neighbor strokes reach the outer miter corner so
+their butt ends cannot leave a notch. Chain bands are centered and join one neighbor per end.
+Adjacent bold ring bands share one cached cut from their actual rendered edges, including any
+outward shift needed to clear a double bond's pi line; reversed bonds reuse the same cut.
+Terminal, label-trimmed, crossing-cut and degenerate/overlong-miter ends are square.
+A bold double's pi line retains exactly the normal double's position, stroke width and inset.
+If inward growth would leave less than `BoldBondStyle.clearGapRatio` (1) normal line width
+of white space, the band grows partly outward, with both edges still mitered to its neighbors.
+Effects and Sketch trace that same plan.
+Preset `bondBoldWidthPx` values still set wedge dimensions; bold ink substitutes this sizing rule for
+those historical defaults (also after uniform scaling). Custom molecule widths and explicit
+`bondBoldWidths` overrides remain authoritative. No document or chemical fields are rewritten.
+
 `DocumentStylePreset` and `DocumentTextStyle` are native style data in `@chemdraft/chem-core`.
 `DocumentStyleScale` and point conversion stay here in `src/documentStyle.ts`. Native coordinates
 use 22 units per bond; the physical scale is 14.4/22 pt per unit. Canvas plans and exporters use those same dimensions,
@@ -136,6 +184,13 @@ after **every character, including the last** (also across spans); the last char
 this result. Stored document frames are never remeasured merely by loading, normalizing or reopening.
 
 ### Font advance ceilings
+
+Atom-label collision boxes use the declared family's reference metrics: Helvetica for the
+Arial/Helvetica/sans-serif stack, Courier for named monospace stacks, and padded bounds for
+unrecognized families. They do not measure the host's resolved fallback font. Tests use independent
+Core14 AFM ink (`src/atomLabelInk.fixture.ts`) for enclosure assertions; Resvg's host-selected
+font still exercises real rendering and visible label distances. Do not widen these boxes to
+accommodate a CI font substitution: they also drive cleanup ranking and electron-mark placement.
 
 The shipped commands in `apps/desktop/src/commands.ts` offer Arial/Helvetica/sans-serif,
 Times New Roman/Times/serif, Courier New/Courier/monospace and Georgia/serif. The fallback menus in
@@ -206,3 +261,11 @@ Fixed-width/fixed-size boxes retain their authored editor width. Growing chrome 
 left/centre/right alignment anchor: move its left edge by 0/half/all of the growth and move the
 rotation origin inside the frame by the same amount. The original rotation pivot therefore stays
 fixed in page space, including on rotated old boxes. The document frame is untouched.
+
+Reaction conditions attach to ordinary arrow shafts through arrowAttachmentFrame and
+reactionConditionsFrame. Top follows the inside of curves and page top for straight arrows
+(left for vertical arrows). reactionConditionsPlacement searches for clear space using actual
+arrow ink and molecule outlines. resolveArrowAttachments keeps labels attached and retains manual
+offsets after drags. withArrowAttachmentIds includes a parent arrow's conditions in lifecycle
+operations. Canvas and exports share the resolved render plan; measured script baselines apply
+only to attached conditions text, preserving the ordinary-text and table rendering path.

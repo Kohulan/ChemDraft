@@ -8,13 +8,15 @@ import type { ChemDraftDocument, MoleculeBond, MoleculeObject } from "@chemdraft
 import { applyPatches } from "@chemdraft/chem-core";
 import { depictSmiles2D, ensureOclResources, perceiveDoubleBondStereoFromMolfile } from "@chemdraft/ocl-adapter";
 import { CommandRegistry } from "@chemdraft/plugin-host";
+import { Molecule } from "openchemlib";
 import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import { MainWindow, ObjectLayerContextMenu } from "./MainWindow";
 import { createBondStereoActions, moleculeBondStereoCommandId } from "./commands";
-import { applyMoleculeBondStereo, createPhase4Document, getSelectedMolecule, insertNativeMolfileMolecule, selectDocumentObjects, exportPhase4Svg, exportPhase4Pdf, exportPhase4Cdxml } from "./documentWorkflow";
+import { applyMoleculeBondStereo, CHEMDRAFT_SELECTION_CLIPBOARD_TYPE, copyAsMergedMolecule, createPhase4Document, parseSelectionClipboardPayload, getSelectedMolecule, insertNativeMolfileMolecule, insertSmilesMolecule, insertSmilesMoleculeGrid, pasteSelectionClipboardPayload, selectDocumentObjects, exportPhase4Svg, exportPhase4Pdf, exportPhase4Cdxml } from "./documentWorkflow";
+import { moleculeToMolfileV3000 } from "@chemdraft/chem-core";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 import { DOM_COMMAND_EVENT, openToolsetPopoverWindow, setToolsetPopoverContent, closeToolsetPopoverWindow,
-  currentWindowLogicalPosition, dismissToolsetPopovers, type ToolsetPopoverDismissPayload, type BondStereoPopoverAction } from "./window-manager";
+  currentWindowLogicalPosition, dismissToolsetPopovers, sendToolsetFlyoutKey, type ToolsetPopoverDismissPayload, type BondStereoPopoverAction } from "./window-manager";
 const nativePopover = vi.hoisted(() => ({
   action: undefined as undefined | ((payload: BondStereoPopoverAction) => void),
   request: undefined as undefined | ((id: string) => void),
@@ -30,6 +32,7 @@ vi.mock("./window-manager", async importOriginal => ({
   openToolsetPopoverWindow: vi.fn(async () => {}),
   closeToolsetPopoverWindow: vi.fn(async () => {}),
   setToolsetPopoverContent: vi.fn(async () => {}),
+  sendToolsetFlyoutKey: vi.fn(async () => {}),
   focusCurrentWindowAndWebview: vi.fn(async () => {}),
   listenForBondStereoPopoverActions: vi.fn(async handler => { nativePopover.action = handler; return () => {}; }),
   listenForToolsetPopoverContentRequests: vi.fn(async handler => { nativePopover.request = handler; return () => {}; }),
@@ -217,6 +220,92 @@ it("uses the command's plain geometry title while perception is loading", async 
 
 
 describe.each<ShortcutPlatform>(["macos", "windows"])("native badge popover (%s)", platform => {
+  it.each([
+    { count: 3, flippedIndex: 0 },
+    { count: 3, flippedIndex: 1 },
+    { count: 1, flippedIndex: 0 }
+  ])("copy matches visible selection after flip/undo/redo ($count molecules, flip index $flippedIndex)", async ({ count, flippedIndex }) => {
+    const smiles = "CC=CC", depiction = depictSmiles2D(smiles, { openUnspecifiedDoubleBonds: true });
+    const single = insertSmilesMolecule(createPhase4Document(), { x: 200, y: 200 }, depiction, smiles,
+      { openUnspecifiedDoubleBonds: true });
+    // The grid leaves only mol_002 and mol_003 selected, as in the reported repro.
+    const initial = count === 1 ? single : insertSmilesMoleculeGrid(single, { x: 300, y: 300 },
+      [{ smiles, depiction }, { smiles, depiction }]).document;
+    const originals = initial.pages[0].objects.filter((o): o is MoleculeObject => o.type === "molecule");
+    const target = originals[flippedIndex];
+    // Also exercise a target already inside an explicit three-molecule selection.
+    await mount(flippedIndex === 1
+      ? selectDocumentObjects(initial, initial.pages[0].id, originals.map(o => o.id))
+      : initial, platform);
+    const badge = container.querySelector<SVGGElement>(`[data-object-controls="${target.id}"] [data-unspecified-bond-id]`)!;
+    badge.getBoundingClientRect = () => ({ left: 30, bottom: 50 }) as DOMRect;
+    await act(async () => badge.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    const content = vi.mocked(setToolsetPopoverContent).mock.calls.at(-1)![1];
+    if (content.kind !== "flyout") throw new Error("Expected flyout");
+    await act(async () => nativePopover.action?.({ sessionId: content.flyout.id!, action: "flipped" }));
+    const canonical = (molecules: MoleculeObject[]) => Molecule.fromMolfile(
+      moleculeToMolfileV3000(copyAsMergedMolecule(molecules)!, { fromDocFrame: true, kekuleBondOrders: new Map() }).contents
+    ).toIsomericSmiles();
+    let flippedCanonical = "";
+    for (const stage of ["flip", "undo", "redo"] as const) {
+      if (stage !== "flip") await command(`edit.${stage}`);
+      const snapshot = window.__CHEMDRAFT_AGENT__!.snapshot();
+      const current = snapshot.document;
+      const molecules = current.pages[0].objects.filter((o): o is MoleculeObject => o.type === "molecule");
+      const expected = molecules.map(o => ({ id: o.id, atoms: o.atoms.map(a => a.id).sort(), bonds: o.bonds.map(b => b.id).sort() }));
+      // Read the painted selection, including atom/bond highlights, independently of app state.
+      const visible = [...container.querySelectorAll<HTMLElement>("[data-object-controls]")].map(node => ({
+        id: node.dataset.objectControls!,
+        atoms: [...node.querySelectorAll<SVGElement>("[data-selected-atom-id]")].map(a => a.dataset.selectedAtomId!).sort(),
+        bonds: [...node.querySelectorAll<SVGElement>("[data-selected-bond-id]")].map(b => b.dataset.selectedBondId!).sort()
+      })).filter(o => o.atoms.length || o.bonds.length);
+      const written = new Map<string, string>();
+      const event = new Event("copy", { bubbles: true, cancelable: true });
+      Object.defineProperty(event, "clipboardData", { value: { setData: (type: string, text: string) => written.set(type, text) } });
+      await act(async () => canvas.dispatchEvent(event));
+      expect(event.defaultPrevented).toBe(true);
+      const payload = parseSelectionClipboardPayload(written.get(CHEMDRAFT_SELECTION_CLIPBOARD_TYPE)!)!;
+      expect(payload).toBeDefined();
+      const copied = payload.objects.filter((o): o is MoleculeObject => o.type === "molecule");
+      const copiedParts = copied.map(o => ({ id: o.id, atoms: o.atoms.map(a => a.id).sort(), bonds: o.bonds.map(b => b.id).sort() }));
+      expect.soft(copiedParts, `${stage}: copy equals painted objects/atoms/bonds`).toEqual(visible);
+      expect.soft(visible, `${stage}: all molecules visibly selected in full`).toEqual(expected);
+      expect.soft(payload.objects.map(o => o.id).sort(), `${stage}: no invisible object`).toEqual(visible.map(o => o.id).sort());
+      expect.soft(payload.selectionIds.slice().sort(), `${stage}: clipboard selection`).toEqual(visible.map(o => o.id).sort());
+      expect.soft(current.selection.objectIds.slice().sort(), `${stage}: whole-object selection`).toEqual(originals.map(o => o.id).sort());
+      expect.soft(snapshot.selectedNativeMoleculePart, `${stage}: no leftover bond target`).toBeUndefined();
+      expect.soft(copied.flatMap(o => o.atoms).filter(a => a.element === "C"), `${stage}: carbon count`).toHaveLength(count * 4);
+      expect.soft(canonical(copied).split("."), `${stage}: component count`).toHaveLength(count);
+      expect.soft(canonical(copied), `${stage}: selected chemistry`).toBe(canonical(molecules));
+      if (stage === "undo") {
+        expect.soft(molecules).toEqual(originals);
+        expect.soft(canonical(copied), "undo: original canonical SMILES").toBe(canonical(originals));
+      } else {
+        expect.soft(perceiveDoubleBondStereoFromMolfile(molecules[flippedIndex].structure)[0].descriptor).toBe("Z");
+        expect.soft(molecules.filter(o => o.id !== target.id)).toEqual(originals.filter(o => o.id !== target.id));
+        if (stage === "flip") flippedCanonical = canonical(copied);
+        else expect.soft(canonical(copied), "redo: recorded flipped chemistry").toBe(flippedCanonical);
+      }
+      const pasted = pasteSelectionClipboardPayload(current, payload, { x: 400, y: 400 });
+      expect.soft(canonical(pasted.pages[0].objects.filter((o): o is MoleculeObject =>
+        o.type === "molecule" && pasted.selection.objectIds.includes(o.id))), `${stage}: paste preserves copied chemistry`).toBe(canonical(copied));
+    }
+  });
+
+  it("ordinary bond-order edit keeps its bond selected through undo and redo", async () => {
+    const { doc, mol } = drawing("CC");
+    const bond = mol.bonds[0];
+    await mount(doc, platform);
+    await selectBond(mol, bond);
+    await key("2");
+    for (const [stage, order] of [["edit", "double"], ["undo", "single"], ["redo", "double"]] as const) {
+      if (stage !== "edit") await command(`edit.${stage}`);
+      expect(molecule().bonds.find(b => b.id === bond.id)?.order).toBe(order);
+      expect.soft(window.__CHEMDRAFT_AGENT__!.snapshot().selectedNativeMoleculePart, stage).toMatchObject({ kind: "bond", objectId: mol.id, bondId: bond.id });
+      expect.soft(container.querySelector(`[data-object-id="${mol.id}"]`)?.getAttribute("data-selected-native-bond-id"), stage).toBe(bond.id);
+      expect.soft(container.querySelector(`[data-object-controls="${mol.id}"] [data-selected-bond-id="${bond.id}"]`), stage).not.toBeNull();
+    }
+  });
   async function openBadge(keyboard?: "Enter" | " ") {
     const { doc, mol } = drawing("CC=CC", true);
     const bond = mol.bonds.find(b => b.stereo === "either")!;
@@ -240,7 +329,10 @@ describe.each<ShortcutPlatform>(["macos", "windows"])("native badge popover (%s)
       }
     });
     expect(currentWindowLogicalPosition).toHaveBeenCalledWith("inner");
-    expect(openToolsetPopoverWindow).toHaveBeenCalledWith("core.bondStereo", "flyout", 130, 254, keyboard ? "focus" : "preserve");
+    // Windows keeps keyboard navigation in the document to avoid activating the palette.
+    expect(openToolsetPopoverWindow).toHaveBeenCalledWith("core.bondStereo", "flyout", 130, 254,
+      keyboard && platform !== "windows" ? "focus" : "preserve");
+    if (keyboard && platform === "windows") expect(document.activeElement).toBe(badge);
     const content = vi.mocked(setToolsetPopoverContent).mock.calls.at(-1)![1];
     expect(setToolsetPopoverContent).toHaveBeenLastCalledWith("core.bondStereo", expect.anything(), { x: 130, y: 254 });
     if (content.kind !== "flyout") throw new Error("Expected flyout");
@@ -281,7 +373,7 @@ describe.each<ShortcutPlatform>(["macos", "windows"])("native badge popover (%s)
     // A later press in another palette reaches this window only via its broadcast.
     await dismissToolsetPopovers(performance.timeOrigin + performance.now());
     await act(async () => nativePopover.dismiss?.(nativePopover.pendingDismisses.shift()));
-    expect(closeToolsetPopoverWindow).toHaveBeenCalledWith("core.bondStereo");
+    expect(closeToolsetPopoverWindow).toHaveBeenCalledWith("core.bondStereo", originalContent.openedAt, originalContent.generation);
     await act(async () => nativePopover.request?.("core.bondStereo"));
     expect(setToolsetPopoverContent).toHaveBeenCalledTimes(2);
   });
@@ -293,7 +385,7 @@ describe.each<ShortcutPlatform>(["macos", "windows"])("native badge popover (%s)
     expect(invoke.mock.calls.filter(([id]) => id === moleculeBondStereoCommandId(action))).toHaveLength(1);
     expect(molecule().bonds.find(b => b.id === bond.id)?.stereo).toBeUndefined();
     expect(perceiveDoubleBondStereoFromMolfile(molecule().structure)[0].descriptor).toBe(action === "geometry" ? "E" : "Z");
-    expect(window.__CHEMDRAFT_AGENT__!.snapshot().selectedNativeMoleculePart).toMatchObject({ kind: "bond", bondId: bond.id });
+    expect(window.__CHEMDRAFT_AGENT__!.snapshot().selectedNativeMoleculePart).toBeUndefined();
     expect(document.activeElement).toBe(canvas);
     await command("edit.undo"); expect(molecule()).toEqual(original);
     expect(container.querySelector('[role="status"]')?.textContent).toBe(action === "geometry" ? "Undid Use drawn geometry" : "Undid Use the other geometry");
@@ -305,20 +397,30 @@ describe.each<ShortcutPlatform>(["macos", "windows"])("native badge popover (%s)
     const { original, content } = await openBadge(action === "escape" ? "Enter" : undefined);
     await act(async () => {
       if (action === "keep") nativePopover.action?.({ sessionId: content.flyout.id!, action: "keep" });
-      if (action === "escape") canvas.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+      if (action === "escape") document.activeElement!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
       if (action === "click-away") canvas.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
       if (action === "palette-away") nativePopover.dismiss?.();
     });
-    expect(closeToolsetPopoverWindow).toHaveBeenCalledWith("core.bondStereo");
+    expect(closeToolsetPopoverWindow).toHaveBeenCalledWith("core.bondStereo", content.openedAt, content.generation);
     expect(document.activeElement).toBe(canvas); expect(molecule()).toEqual(original);
     await command("edit.undo"); expect(molecule()).toEqual(original);
   });
   it("opens with Space through the canvas Tab path and never exports the badge/popover", async () => {
-    await openBadge(" ");
+    const { content } = await openBadge(" ");
+    if (platform === "windows") {
+      const badge = document.activeElement;
+      for (const [value, shiftKey] of [["ArrowDown", false], ["Tab", true], ["Enter", false]] as const) {
+        await key(value, shiftKey);
+        expect(sendToolsetFlyoutKey).toHaveBeenLastCalledWith({ toolsetId: "core.bondStereo", flyoutId: "core.bondStereo",
+          openedAt: content.openedAt, sessionId: content.flyout.id, key: value, shiftKey });
+        expect(document.activeElement).toBe(badge);
+      }
+      expect(sendToolsetFlyoutKey).toHaveBeenCalledTimes(3);
+    }
     const doc = window.__CHEMDRAFT_AGENT__!.snapshot().document;
     vi.stubGlobal("getComputedStyle", window.getComputedStyle.bind(window));
     const pdf = await exportPhase4Pdf(doc, { compress: false });
-    for (const output of [exportPhase4Svg(doc).contents, exportPhase4Cdxml(doc).contents, new TextDecoder().decode(pdf.bytes)]) {
+    for (const output of [(await exportPhase4Svg(doc)).contents, exportPhase4Cdxml(doc).contents, new TextDecoder().decode(pdf.bytes)]) {
       expect(output).not.toContain("native-bond-stereo-marker"); expect(output).not.toContain("E/Z not specified");
       expect(output).not.toContain("This double bond"); expect(output).not.toMatch(/>!<|\(!\) Tj/);
     }

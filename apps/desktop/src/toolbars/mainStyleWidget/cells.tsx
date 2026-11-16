@@ -12,7 +12,7 @@ import {
   usePaletteButtonInvoke,
   type ColorCommand
 } from "../toolbarCells";
-import { useNativeFloatingTooltip } from "../toolbarTooltip";
+import { type ClearTooltipOptions, useNativeFloatingTooltip } from "../toolbarTooltip";
 
 /**
  * The Main Toolbar style widget's layout currency: every variant is two rows of cells on the
@@ -151,7 +151,7 @@ function spanStyle(cells: number): CSSProperties {
 export const WidgetTooltipContext = createContext<{
   visibleTooltipId: string | undefined;
   requestTooltip: (tooltipId: string) => void;
-  clearTooltip: (tooltipId?: string) => void;
+  clearTooltip: (tooltipId?: string, options?: ClearTooltipOptions) => void;
 }>({
   visibleTooltipId: undefined,
   requestTooltip: () => undefined,
@@ -187,7 +187,7 @@ function CellShell({
       onClickCapture={() => clearTooltip(tooltipId)}
       onPointerDownCapture={() => clearTooltip(tooltipId)}
       onPointerEnter={() => requestTooltip(tooltipId)}
-      onPointerLeave={() => clearTooltip(tooltipId)}
+      onPointerLeave={() => clearTooltip(tooltipId, { onlyMatchingPending: true })}
     >
       {children}
       <span className="tool-tooltip" role="tooltip" aria-hidden="true">
@@ -247,7 +247,7 @@ function StyleSelectCell({
     <label className={cell.labelClassName ?? "toolbar-control-label"} style={cell.labelClassName ? undefined : spanStyle(cell.cells)}>
       <span className="visually-hidden">{cell.ariaLabel}</span>
       <select
-        className={cell.selectClassName ?? "toolbar-select"}
+        className={`toolbar-select ${cell.selectClassName ?? ""}`}
         value={cell.value}
         aria-label={cell.ariaLabel}
         disabled={cell.disabled}

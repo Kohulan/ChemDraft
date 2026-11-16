@@ -16,40 +16,51 @@ ChemDraft is free, open source, and runs on macOS and Windows. This page shows w
 **Files and data**
 - Open and save CDX files (the older binary format), alongside CDXML.
 - Search PubChem or Reaxys for the selected structure.
-- Better name-to-structure with a larger name dictionary.
-- Plugins can ask for a structure's formula, mass and charge, and can add their own tools to the AI assistant.
+- Name to Structure can find more common names, trade names and CAS registry numbers offline.
+- Preserve supported unknown content from newer documents, with warnings where needed.
 
 **Drawing**
-- The familiar industry-standard keyboard shortcuts become the default, including W and Shift+W for wedge and hashed bonds.
-- More abbreviations: OTBDPS, TBDPS, TIPS, TES, PMB, MOM, SEM and others.
+- W and Shift+W draw wedge and hashed bonds; a wavy single bond marks unknown stereochemistry.
+- More abbreviations: OTBDPS, TBDPS, TIPS, TES, PMB, MOM and SEM.
 - Round brackets, bracket pairs and polymer repeat units with an editable "n".
 - Arrow keys move the selection.
-- Choose whether new double bonds are drawn offset or centred.
-- A warning, instead of a refusal, when a bond would exceed normal valence.
-- More drawing style presets alongside "Tot. Syn. blog", including a journal-style preset.
-- Formatted reaction conditions, movable electron-pushing marks and adjustable wavy lines (community contributions).
+- Choose whether new double bonds are drawn offset or centered.
+- An explanatory badge, instead of a refusal, when a bond would exceed normal valence.
+- ACS 1996-style and RSC journal-style drawing presets.
+- Formatted reaction conditions, adjustable electron marks and adjustable wavy lines (community contributions).
 - Asks before enlarging the page when a structure doesn't fit.
 
 **Windows and Mac**
-- Windows: an offline installer that needs no internet, and installing for all users.
-- Mac: a version for Intel Macs.
-- Preferences reopens where you left it; Esc closes pop-out menus.
-- Windows code signing, as soon as the signing service approves the project.
+- Mac: a version for Intel Macs, with Name from Structure.
+- Dialogs fit their contents; Preferences reopens where you left it; Esc closes toolbar flyouts.
 
-**Fixes**
-- Export suggests the document's own name and keeps the folder you chose; template search finds families; tables, pictures, text editing and the NMR panel get a round of fixes.
+**Plugins and assistant**
+- Plugins can use chemical properties and offer assistant tools, subject to their permissions.
+
+## 1.2.1
+- A Windows installer that installs for all users (Program Files, all-users Start Menu, silent install), deferred from 1.2.
+- MOL/SDF coordinates are written in standard units.
+- A native right-click menu.
+- The warnings window stays above floating palettes.
+- Structures inserted from pickers are placed outside open pickers.
+- Repeated pastes no longer stack on top of each other.
 
 ## 1.3
+- Several document windows at once.
 - The main toolbar in groups that fold into a single icon each when the window is narrow; plugins choose which group their buttons join.
 - Floating toolbars resize along their length, with an overflow button for buttons that don't fit.
 - Your own keyboard shortcuts for the keys you press over the drawing.
 - Short typed shortcuts for common groups (for example c1 methyl, ph phenyl, cn nitrile), shared with Avogadro.
 
+## 1.4
+- Linux is on the roadmap for the 1.x series, aimed at 1.4, which will most likely land early 2027. It needs its own builds, testing and update system first, because every release must work the same on every supported platform.
+
 ## Later in 1.x
 - A biology clip-art plugin (antibodies, proteins, membranes).
-- Linux.
 - Avogadro integration.
-- Several document windows at once.
+- Industry-standard keyboard shortcuts as the default.
+- A Windows offline installer.
+- Windows code signing, as soon as the signing service approves the project.
 
 ## 2.0 — early 2027
 - A design refresh across the whole app.

@@ -1,4 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  cloneElement, createContext, useCallback, useContext, useEffect, useId, useRef, useState,
+  type HTMLAttributes, type ReactElement, type RefAttributes
+} from "react";
 
 /**
  * The palette tooltip machinery, shared by the grid icons (ToolbarPaletteItem) and the style
@@ -8,13 +11,17 @@ import { useCallback, useEffect, useRef, useState } from "react";
  */
 
 export const TOOLTIP_DELAY_MS = 500;
+export const TOOLTIP_RESHOW_WINDOW_MS = 300;
+
+export type ClearTooltipOptions = { onlyMatchingPending?: boolean };
 
 export function usePaletteTooltipState() {
   const [visibleTooltipId, setVisibleTooltipId] = useState<string | undefined>();
   const visibleTooltipIdRef = useRef<string | undefined>(undefined);
   const pendingTooltipRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const pendingTooltipIdRef = useRef<string | undefined>(undefined);
-  visibleTooltipIdRef.current = visibleTooltipId;
+  const warmRef = useRef(false);
+  const coolTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   const clearPendingTooltip = useCallback(() => {
     if (pendingTooltipRef.current !== undefined) {
@@ -30,20 +37,45 @@ export function usePaletteTooltipState() {
     }
 
     clearPendingTooltip();
+    clearTimeout(coolTimerRef.current);
+    if (warmRef.current) {
+      visibleTooltipIdRef.current = tooltipId;
+      setVisibleTooltipId(tooltipId);
+      return;
+    }
+    visibleTooltipIdRef.current = undefined;
     setVisibleTooltipId(undefined);
     pendingTooltipIdRef.current = tooltipId;
     pendingTooltipRef.current = setTimeout(() => {
       pendingTooltipRef.current = undefined;
       pendingTooltipIdRef.current = undefined;
+      warmRef.current = true;
+      visibleTooltipIdRef.current = tooltipId;
       setVisibleTooltipId(tooltipId);
     }, TOOLTIP_DELAY_MS);
   }, [clearPendingTooltip]);
 
-  const clearTooltip = useCallback((tooltipId?: string) => {
-    clearPendingTooltip();
-    setVisibleTooltipId((current) => (
-      tooltipId && current !== tooltipId ? current : undefined
-    ));
+  const clearTooltip = useCallback((tooltipId?: string, options?: ClearTooltipOptions) => {
+    // Pointer transitions can arrive from a stale owner after another tooltip was queued.
+    // Explicit dismissals must cancel the timer regardless of its owner.
+    if (!options?.onlyMatchingPending || tooltipId === undefined || pendingTooltipIdRef.current === tooltipId) {
+      clearPendingTooltip();
+    }
+    if (!tooltipId || !options?.onlyMatchingPending) {
+      clearTimeout(coolTimerRef.current);
+      warmRef.current = false;
+    }
+    // Refs change synchronously so an old owner's leave cannot hide its neighbour before
+    // React commits the handoff, even when both events arrive in the same pointer-feed tick.
+    if (tooltipId && visibleTooltipIdRef.current !== tooltipId) return;
+    visibleTooltipIdRef.current = undefined;
+    setVisibleTooltipId(undefined);
+    clearTimeout(coolTimerRef.current);
+    if (tooltipId && options?.onlyMatchingPending) {
+      // A's leave hides immediately. Keep a short warm interval across the gaps between cells,
+      // so the neighbour can show promptly even when its enter is in the next pointer-feed tick.
+      coolTimerRef.current = setTimeout(() => { warmRef.current = false; }, TOOLTIP_RESHOW_WINDOW_MS);
+    }
   }, [clearPendingTooltip]);
 
   useEffect(() => {
@@ -61,42 +93,43 @@ export function usePaletteTooltipState() {
       const ownerElement = targetElement?.closest<HTMLElement>("[data-tooltip-owner-id]");
 
       if (ownerElement?.dataset.tooltipOwnerId !== visibleTooltipId) {
-        clearTooltip(visibleTooltipId);
+        clearTooltip(visibleTooltipId, { onlyMatchingPending: true });
       }
     };
 
     const clearVisibleTooltip = () => {
-      clearTooltip(visibleTooltipId);
+      clearTooltip(visibleTooltipId, { onlyMatchingPending: true });
     };
 
     document.addEventListener("mousemove", clearWhenPointerLeavesOwner, true);
     document.addEventListener("pointermove", clearWhenPointerLeavesOwner, true);
     document.addEventListener("mouseleave", clearVisibleTooltip, true);
-    document.addEventListener("pointerdown", clearWhenPointerLeavesOwner, true);
-    window.addEventListener("blur", clearVisibleTooltip);
 
     return () => {
       document.removeEventListener("mousemove", clearWhenPointerLeavesOwner, true);
       document.removeEventListener("pointermove", clearWhenPointerLeavesOwner, true);
       document.removeEventListener("mouseleave", clearVisibleTooltip, true);
-      document.removeEventListener("pointerdown", clearWhenPointerLeavesOwner, true);
-      window.removeEventListener("blur", clearVisibleTooltip);
     };
   }, [visibleTooltipId, clearTooltip]);
 
   useEffect(() => {
-    const clearPendingOnBlur = () => {
+    const dismissTooltip = () => {
       clearTooltip();
     };
 
-    window.addEventListener("blur", clearPendingOnBlur);
+    window.addEventListener("blur", dismissTooltip);
+    document.addEventListener("pointerdown", dismissTooltip, true);
+    document.addEventListener("scroll", dismissTooltip, true);
     return () => {
-      window.removeEventListener("blur", clearPendingOnBlur);
+      window.removeEventListener("blur", dismissTooltip);
+      document.removeEventListener("pointerdown", dismissTooltip, true);
+      document.removeEventListener("scroll", dismissTooltip, true);
     };
   }, [clearTooltip]);
 
   useEffect(() => () => {
     clearPendingTooltip();
+    clearTimeout(coolTimerRef.current);
   }, [clearPendingTooltip]);
 
   return {
@@ -104,6 +137,35 @@ export function usePaletteTooltipState() {
     requestTooltip,
     clearTooltip
   };
+}
+
+const inactiveTooltipState: ReturnType<typeof usePaletteTooltipState> = {
+  visibleTooltipId: undefined,
+  requestTooltip: () => undefined,
+  clearTooltip: () => undefined
+};
+export const PaletteControlTooltipContext = createContext<ReturnType<typeof usePaletteTooltipState> | undefined>(undefined);
+
+/** Add the same tooltip contract to an existing label/button without changing its layout. */
+export function PaletteControlTooltip({ tooltip, children }: {
+  tooltip: string;
+  children: ReactElement<HTMLAttributes<HTMLElement> & RefAttributes<HTMLElement>>;
+}) {
+  const id = useId();
+  const { visibleTooltipId, requestTooltip, clearTooltip } = useContext(PaletteControlTooltipContext) ?? inactiveTooltipState;
+  const shellRef = useRef<HTMLElement | null>(null);
+  const visible = visibleTooltipId === id;
+  useNativeFloatingTooltip(shellRef, visible, tooltip);
+  const props = children.props;
+  return cloneElement(children, {
+    ref: shellRef,
+    className: `${props.className ?? ""} toolbar-control-tooltip`,
+    ...{ "data-tooltip-owner-id": id, "data-tooltip-visible": visible ? "true" : undefined },
+    onPointerEnter: event => { props.onPointerEnter?.(event); requestTooltip(id); },
+    onPointerLeave: event => { props.onPointerLeave?.(event); clearTooltip(id, { onlyMatchingPending: true }); },
+    onPointerDownCapture: event => { props.onPointerDownCapture?.(event); clearTooltip(id); },
+    onClickCapture: event => { props.onClickCapture?.(event); clearTooltip(id); }
+  }, props.children, <span className="tool-tooltip" role="tooltip" aria-hidden="true"><span>{tooltip}</span></span>);
 }
 
 /** Tooltip visibility announcement from a shell to its hosting window. In the native palette
@@ -114,6 +176,7 @@ export const PALETTE_TOOLTIP_DOM_EVENT = "chemdraft:palette-tooltip";
 
 export interface PaletteTooltipDomDetail {
   visible: boolean;
+  ownerId?: string;
   title?: string;
   description?: string;
   shortcut?: string;
@@ -146,7 +209,8 @@ export function extractTooltipParts(tooltip: Element): { title: string; descript
  * the same reason popovers/flyouts live in their own windows. Browser and in-window palettes keep
  * the pure-CSS span; this hook is a no-op for them.
  */
-export function useNativeFloatingTooltip(shellRef: { current: HTMLElement | null }, visible: boolean) {
+export function useNativeFloatingTooltip(shellRef: { current: HTMLElement | null }, visible: boolean, contentKey?: string) {
+  const ownerId = useId();
   useEffect(() => {
     if (!document.body.classList.contains("palette-window-body")) {
       return;
@@ -168,6 +232,7 @@ export function useNativeFloatingTooltip(shellRef: { current: HTMLElement | null
       new CustomEvent<PaletteTooltipDomDetail>(PALETTE_TOOLTIP_DOM_EVENT, {
         detail: {
           visible: true,
+          ownerId,
           title,
           description,
           shortcut,
@@ -177,8 +242,8 @@ export function useNativeFloatingTooltip(shellRef: { current: HTMLElement | null
     );
     return () => {
       window.dispatchEvent(
-        new CustomEvent<PaletteTooltipDomDetail>(PALETTE_TOOLTIP_DOM_EVENT, { detail: { visible: false } })
+        new CustomEvent<PaletteTooltipDomDetail>(PALETTE_TOOLTIP_DOM_EVENT, { detail: { visible: false, ownerId } })
       );
     };
-  }, [shellRef, visible]);
+  }, [shellRef, visible, ownerId, contentKey]);
 }
