@@ -90,6 +90,34 @@ describe("synthetic binary rectangle fills", () => {
   });
 });
 
+describe("CDXML shaded rectangle and curve fill precedence", () => {
+  it.each(["Solid", "2", "Shaded", "4"])("keeps rectangle gloss and curve solid approximation with FillType=%s", fillType => {
+    const source = `<CDXML><colortable>
+      <color r="1" g="1" b="1"/><color r="0" g="0" b="0"/><color r="0.2" g="0.4" b="0.6"/>
+      </colortable><page id="1" BoundingBox="0 0 612 792">
+      <graphic id="2" GraphicType="Rectangle" BoundingBox="20 20 80 60" color="4"
+        RectangleType="Shaded" FillType="${fillType}"/>
+      <graphic id="3" GraphicType="Rectangle" BoundingBox="100 20 160 60" color="4"
+        RectangleType="RoundEdge Shadow Dashed Shaded" CornerRadius="400" FillType="${fillType}"/>
+      <curve id="4" CurvePoints="20 100 30 100 50 100 60 100" color="4"
+        Closed="yes" FillType="${fillType}"/>
+      </page></CDXML>`;
+    const opened = openChemDraftPayload(source);
+    const document = requireDocument(opened);
+    expect(document.pages[0].objects).toHaveLength(3);
+    const [plain, decorated, curve] = document.pages[0].objects as GraphicObject[];
+    expect(plain).toMatchObject({ type: "graphic", graphicKind: "rect",
+      style: { strokeColor: "#336699", fillColor: "#336699", fillMode: "gloss" } });
+    expect(decorated).toMatchObject({ type: "graphic", graphicKind: "rect",
+      style: { strokeColor: "#336699", fillColor: "#336699", fillMode: "gloss", effect: "shadow", strokeDasharray: "3 4" },
+      data: { cornerRadiusPx: 400 / 75 } });
+    expect(curve).toMatchObject({ type: "graphic", graphicKind: "path",
+      style: { fillColor: "#336699", fillMode: "solid" } });
+    const fillWarnings = opened.warnings.filter(warning => warning.code === "cdxml.curve_fill_type_approximation");
+    expect(fillWarnings).toHaveLength(["Shaded", "4"].includes(fillType) ? 1 : 0);
+  });
+});
+
 describe.each(routes)("CDXML rectangle combinations through %s", route => {
   it.each([
     "Filled", "RoundEdge Filled", "Shadow Filled", "RoundEdge Shadow Filled",

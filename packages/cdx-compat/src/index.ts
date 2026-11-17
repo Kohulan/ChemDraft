@@ -5211,7 +5211,8 @@ function graphicStyleFromCdxmlCurve(element: XmlElementView, colorTable: CdxmlCo
   const fillType = normalizedCdxmlToken(element.attributes.FillType);
   if (["solid", "2", "shaded", "4"].includes(fillType)) {
     style.fillColor = style.strokeColor;
-    style.fillMode = "solid";
+    // Shape subtypes already define gloss; only curves need the solid approximation.
+    style.fillMode ??= "solid";
   } else if (["none", "1"].includes(fillType)) {
     style.fillColor = "none";
     delete style.fillMode;
