@@ -2466,6 +2466,10 @@ export function MainWindow({
   );
   const [analysisBusy, setAnalysisBusy] = useState(false);
   const [analysisInterpretation, setAnalysisInterpretation] = useState<string | undefined>();
+  const analysisInterpretationRef = useRef(analysisInterpretation);
+  analysisInterpretationRef.current = analysisInterpretation;
+  const [molecularInspectorOpen, setMolecularInspectorOpen] = useState(false);
+  const inspectorSubjectRef = useRef<string | undefined>(undefined);
 
   // Every document entering the app is normalized so charge marks near atoms carry their
   // chemistry from the first paint — the commit funnels keep it normalized from then on.
@@ -3043,6 +3047,32 @@ export function MainWindow({
   toolsetRegistryRef.current = toolsetRegistry;
 
   const selectedMolecule = getSelectedMolecule(document);
+  // Exclude drawing-only fields while retaining stereochemical bond styles and bracket context.
+  const inspectorSubject = selectedMolecule ? analysisSubjectKey({
+    ...selectedMolecule,
+    atoms: selectedMolecule.atoms.map(({ labelVisible: _visible, labelOffset: _offset, warningSuppressed: _warning, ...atom }) => atom),
+    bonds: selectedMolecule.bonds.map(({ display, ...bond }) => ({ ...bond,
+      ...(display?.bondStyle && ["wedge", "hashed", "wavy"].includes(display.bondStyle)
+        ? { display: { bondStyle: display.bondStyle } } : {}) }))
+  }, document) + JSON.stringify([selectedMolecule.structureFormat, selectedMolecule.structure]) : undefined;
+  const inspectorVisible = molecularInspectorOpen || visibleToolsetIds.has(molecularInspectorToolsetId);
+  useEffect(() => {
+    if (!inspectorVisible) {
+      inspectorSubjectRef.current = undefined;
+      return;
+    }
+    if (inspectorSubjectRef.current === inspectorSubject) return;
+    inspectorSubjectRef.current = inspectorSubject;
+    // Cancel immediately so an old selection cannot publish while the debounce is pending.
+    analysisClient()?.cancel("selection");
+    setAnalysisBusy(false);
+    if (!inspectorSubject) return;
+    const timer = window.setTimeout(() => {
+      const molecule = getSelectedMolecule(documentRef.current);
+      if (molecule) void runMolecularProperties(molecule, analysisInterpretationRef.current);
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [inspectorVisible, inspectorSubject, runMolecularProperties]);
   /**
    * The report describes something other than what is selected now.
    *
@@ -4479,6 +4509,13 @@ export function MainWindow({
         ? await closeToolsetWindow(toolsetId)
         : await openToolsetWindow(toolsetId, toolsetWindowGeometry(toolsetId));
       setVisibleToolsetIds((current) => updateVisibleToolsets(current, toolsetId, nextState.open));
+      if (toolsetId === molecularInspectorToolsetId && nextState.open) {
+        const molecule = getSelectedMolecule(documentRef.current);
+        if (molecule) {
+          inspectorSubjectRef.current = inspectorSubject;
+          void runMolecularProperties(molecule, analysisInterpretation);
+        }
+      }
       if (nextState.open) void perfHook(() => nativeWindowShown(perfOpen));
       if (perfProbe && perfWindow) perfHook(() => perfProbe?.complete(perfWindow, nextState.open ? "window-shown" : "command-finished"));
       // Deliberately closing the Rings toolbar clears the ring selection. The pruning effect no
@@ -4492,13 +4529,20 @@ export function MainWindow({
     }
 
     const wasOpen = visibleToolsetIdsRef.current.has(toolsetId);
+    if (toolsetId === molecularInspectorToolsetId && !wasOpen) {
+      const molecule = getSelectedMolecule(documentRef.current);
+      if (molecule) {
+        inspectorSubjectRef.current = inspectorSubject;
+        void runMolecularProperties(molecule, analysisInterpretation);
+      }
+    }
     setVisibleToolsetIds((current) => updateVisibleToolsets(current, toolsetId, !current.has(toolsetId)));
     if (perfProbe && perfWindow) perfHook(() => perfProbe?.complete(perfWindow, wasOpen ? "command-finished" : "window-shown"));
     if (toolsetId === ringInspectorToolsetId && wasOpen) {
       clearNativeRingParts();
     }
     setStatus(`Toggled ${toolsetRegistry.require(toolsetId).title}`);
-  }, [clearNativeRingParts, effectiveNativePalette, toolsetRegistry, toolsetWindowGeometry]);
+  }, [analysisInterpretation, clearNativeRingParts, effectiveNativePalette, inspectorSubject, runMolecularProperties, toolsetRegistry, toolsetWindowGeometry]);
 
   // Enter/exit in-place customize mode for the Main toolbar. On enter, ensure the Main palette is
   // open (you can't customize a hidden toolbar); broadcast the flag so the palette renders customize
@@ -11797,6 +11841,7 @@ export function MainWindow({
           // Desktop analysis never occupies a toolbar or the drawing viewport. Open the shared
           // analysis-window host before starting the worker so progress/empty state is visible.
           if (isDesktopRuntime()) {
+            setMolecularInspectorOpen(true);
             publishAnalysisWindow(
               MOLECULAR_INSPECTOR_WINDOW_ID,
               "Molecular Inspector",
@@ -11810,12 +11855,14 @@ export function MainWindow({
             );
           } else if (!visibleToolsetIdsRef.current.has(molecularInspectorToolsetId)) {
             await toggleToolset(molecularInspectorToolsetId);
+            return;
           }
           const molecule = getSelectedMolecule(document);
           if (!molecule) {
             setStatus("Molecular Inspector opened — select a structure to analyze it");
             return;
           }
+          inspectorSubjectRef.current = inspectorSubject;
           await runMolecularProperties(molecule, analysisInterpretation);
           return;
         }
@@ -12455,6 +12502,7 @@ export function MainWindow({
     openExportDialog,
     openTemplatesDialog,
     insertTemplateToTab,
+    inspectorSubject,
     openInteractive3dWorkspace,
     openDocumentFromNativePicker,
     openCustomPageSizeDialog,
@@ -12863,6 +12911,7 @@ export function MainWindow({
     const runtime = pluginRuntime.runtime;
     return listenForNativePanelWindowCloses(({ pluginId, panelId }) => {
       if (pluginId === ANALYSIS_WINDOW_OWNER_ID) {
+        if (panelId === MOLECULAR_INSPECTOR_WINDOW_ID) setMolecularInspectorOpen(false);
         if (panelId === PLUGIN_DIAGNOSTICS_WINDOW_ID) setPluginDiagnosticsOpen(false);
         if (panelId === PATCH_REVIEW_WINDOW_ID) setProposalReview((current) => ({ ...current, windowOpen: false }));
         return;
@@ -13127,6 +13176,7 @@ export function MainWindow({
         }
         switch (action.kind) {
           case "close":
+            if (action.windowId === MOLECULAR_INSPECTOR_WINDOW_ID) setMolecularInspectorOpen(false);
             if (action.windowId === PLUGIN_DIAGNOSTICS_WINDOW_ID) {
               setPluginDiagnosticsOpen(false);
             }
