@@ -8,7 +8,7 @@ export function AtomProblemMarker({ target, x, y, explanation, invoke }: {
     onPointerDown={event => { event.preventDefault(); event.stopPropagation(); event.currentTarget.focus(); }}
     onPointerUp={event => event.stopPropagation()} onDoubleClick={event => event.stopPropagation()}
     onClick={event => { event.stopPropagation(); invoke(commandId); }}
-    onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter" || event.key === " ") { event.preventDefault(); if (!event.repeat) invoke(commandId); } }}>
+    onKeyDown={event => { if (["Escape", "Enter", " ", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) event.stopPropagation(); if (event.key === "Enter" || event.key === " ") { event.preventDefault(); if (!event.repeat) invoke(commandId); } }}>
     <title>{explanation}</title>
     <circle className="native-atom-invalid-ring" cx={x} cy={y} r="6" />
     <text className="native-atom-invalid-exclamation" x={x} y={y}>!</text>

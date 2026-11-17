@@ -19897,10 +19897,10 @@ export function copyAsMergedMolecule(
  * is room: it has no 999-atom ceiling, and a V2000 overflow falls back to that lossy `structure`
  * string, silently.
  */
-export function analysisFacingStructure(molecule: MoleculeObject, document?: ChemDraftDocument): { structureFormat: string; structure: string; refusalReason?: string } {
+export function analysisFacingStructure(molecule: MoleculeObject, document?: ChemDraftDocument): { structureFormat: string; structure: string; refusalReason?: string; refusalCode?: string } {
   const bracketWarnings = moleculeBracketWarningMessages(molecule, document, { atomPosition: transformPointForObject });
   if (bracketWarnings.length) return { structureFormat: "molfile-v3000", structure: "",
-    refusalReason: bracketWarnings.join(" ") };
+    refusalReason: bracketWarnings.join(" "), refusalCode: "structure.repeat_unit" };
   const unknownIds = molecule.bonds.filter((bond) => bond.order === "unknown").map((bond) => bond.id);
   if (unknownIds.length > 0) {
     // No query molfile reaches a descriptor engine. The client maps this to an unsupported run,
