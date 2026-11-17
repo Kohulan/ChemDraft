@@ -182,12 +182,12 @@ jobs:
 
       - run: cargo clippy --all-targets --manifest-path apps/desktop/src-tauri/Cargo.toml -- -D warnings
 
-      # external_tools, naming_engine and ocsr_engine report themselves unsupported on Linux
+      # external_tools and naming_engine report themselves unsupported on Linux
       # (local_engine::platform has no Linux implementation yet), so their tests cannot run here.
-      # Remove a --skip when its feature gains a Linux platform.
+      # Remove a --skip when its feature gains a Linux platform. (ocsr_engine passes since 1.2.)
       - run: >-
           cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --
-          --skip external_tools:: --skip naming_engine:: --skip ocsr_engine:: --skip engine3d_sidecar_
+          --skip external_tools:: --skip naming_engine:: --skip engine3d_sidecar_
 
       # The 3D sidecar tests write a fake executable and then spawn it. On Linux a fork from a
       # parallel test can still hold that file open for writing, and exec fails with ETXTBSY

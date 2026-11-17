@@ -125,6 +125,8 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
+          # tauri-build copies resource targets beside the release executable, as on Windows.
+          node tools/release/verify-bundle-licenses.mjs apps/desktop/src-tauri/target/release || { echo '::error::Required bundled licences are missing from the release resource staging directory.'; exit 1; }
           conf=apps/desktop/src-tauri/tauri.conf.json
           version=$(node -p "require('./$conf').version")
           identifier=$(node -p "require('./$conf').identifier")
@@ -138,11 +140,13 @@ jobs:
           appimage="$bundle/appimage/ChemDraft_${version}_${ARCH}.AppImage"
           [ -f "$deb" ] || { echo "::error::Missing $deb"; exit 1; }
           [ -f "$appimage" ] || { echo "::error::Missing $appimage"; exit 1; }
-          # The .deb must carry the 3D sidecar and the OPSIN runtime, as the other platforms do.
+          # The .deb must carry the 3D sidecar, the OPSIN runtime and the bundled licences, as the
+          # other platforms do.
           # (The Linux sidecar is still the placeholder from binaries/README.md; the app reports 3D
           # as unavailable until a real Linux build replaces it.)
           contents=$(dpkg-deb -c "$deb" | awk '{print $NF}' | sed 's|^\./||')
-          for path in usr/bin/chemdraft usr/bin/avogadro3d-sidecar usr/lib/ChemDraft/resources/opsin/jre/bin/java; do
+          licences=$(node --input-type=module -e "import { requiredLicenseFiles } from './tools/release/required-license-files.mjs'; for (const { target } of requiredLicenseFiles) console.log('usr/lib/ChemDraft/' + target);")
+          for path in usr/bin/chemdraft usr/bin/avogadro3d-sidecar usr/lib/ChemDraft/resources/opsin/jre/bin/java $licences; do
             grep -qxF "$path" <<<"$contents" || { echo "::error::$deb lacks $path"; exit 1; }
           done
           mkdir -p release-assets
