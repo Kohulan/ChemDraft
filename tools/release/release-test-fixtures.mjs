@@ -4,6 +4,7 @@ import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { artifactDigest, BUILD_TARGETS } from "./record-build.mjs";
+import { writeReleaseChecksums } from "./release-checksums.mjs";
 
 export const version = "1.2.3";
 export const commit = "a".repeat(40);
@@ -42,6 +43,7 @@ export function releaseFixture(t) {
   writeFileSync(join(assets, "latest.json"), JSON.stringify({
     version, platforms: { [windowsPlatformKey]: { url: installerUrl, signature } }
   }));
+  writeReleaseChecksums(assets);
   return { rootDir, assets, version };
 }
 

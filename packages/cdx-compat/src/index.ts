@@ -513,7 +513,17 @@ function exportCdxml(
 
   if (!embedNativePayload) {
     // Interchange has no recovery envelope. Never promise that omitted data was kept.
-    for (const item of warnings) if (/payload/i.test(item.message)) {
+    for (const item of warnings) if (item.code === "cdxml.molecule_metadata_payload_only") {
+      const radical = /radical count/i.test(item.message);
+      const stereo = /stereochemistry assignment/i.test(item.message);
+      const details = [
+        ...(radical ? ["The molecule's radical count is not fully represented by CDXML atom Radical attributes."] : []),
+        ...(stereo ? ["The molecule's stereochemistry assignment is not represented by CDXML atom assignments."] : [])
+      ];
+      item.message = `${details.join(" ")}${details.length ? " " : ""}Unsupported radical/stereo data${item.sourceObjectId ? ` on ${item.sourceObjectId}` : ""} is NOT written; no native payload is embedded.`;
+      continue;
+    }
+    for (const item of warnings) if (item.code !== "cdxml.molecule_metadata_payload_only" && /payload/i.test(item.message)) {
       const visibleDetail = item.message.split(/(?<=[.;])\s+/).filter(part => !/payload/i.test(part)).join(" ");
       const feature = item.code.replace(/^cdxml\./, "").replace(/_payload_only$/, "").replaceAll("_", " ");
       item.message = `${visibleDetail ? `${visibleDetail} ` : ""}Unsupported ${feature} data${item.sourceObjectId ? ` on ${item.sourceObjectId}` : ""} is NOT written; no native payload is embedded.`;
@@ -1874,11 +1884,15 @@ function exportMoleculeObject(
       const split = value.lastIndexOf(":");
       return visibleStereo.get(atomIds.get(value.slice(0, split)) ?? "") !== value.slice(split + 1);
     });
-    if (!molecule.chemistry?.radicalCount && !missingStereo) return;
+    const visibleRadicals = molecule.atoms.reduce((total, atom) => total + (atom.markRadicals ?? 0), 0);
+    const missingRadicals = (molecule.chemistry?.radicalCount ?? 0) > visibleRadicals;
+    if (!missingRadicals && !missingStereo) return;
     warnings.push({
       code: "cdxml.molecule_metadata_payload_only",
-      message: "Molecule radical and stereochemistry aggregates remain in the native payload; " +
-        "isotopes are preserved on CDXML atoms and supported bond stereo is written visibly.",
+      message: [
+        ...(missingRadicals ? ["The molecule's radical count is not fully represented by CDXML atom Radical attributes; this data is kept in ChemDraft's embedded data."] : []),
+        ...(missingStereo ? ["The molecule's stereochemistry assignment is not represented by CDXML atom assignments; this data is kept in ChemDraft's embedded data."] : [])
+      ].join(" "),
       sourceObjectId: molecule.id
     });
   };

@@ -191,6 +191,27 @@ describe("Name to Structure insertion placement", () => {
     expect(inserted.y + inserted.height / 2).toBeCloseTo(page.height / 2);
   });
 
+  it("places successive results inside the visible page beyond the ruler", async () => {
+    harness.opsin.mockResolvedValue({ smiles: "CCO" });
+    const drawing = createEmptyDocument();
+    const port = await mount(drawing, "ethanol");
+    // The history port returns page coordinates after clipping the canvas and ruler band.
+    const visible = { x: 50, y: 50, width: 220, height: 180 };
+    vi.spyOn(port as unknown as { getViewportRect: () => typeof visible }, "getViewportRect").mockReturnValue(visible);
+    await act(async () => { await harness.runtime!.invokeCommand(commandId); });
+    await act(async () => { await harness.runtime!.invokeCommand(commandId); });
+    const page = port.read("initial")!.pages[0]!;
+    expect(page.objects).toHaveLength(2);
+    for (const object of page.objects) {
+      const rect = objectRect(object);
+      expect(rect.x).toBeGreaterThanOrEqual(visible.x);
+      expect(rect.y).toBeGreaterThanOrEqual(visible.y);
+      expect(rect.x + rect.width).toBeLessThanOrEqual(Math.min(page.width, visible.x + visible.width));
+      expect(rect.y + rect.height).toBeLessThanOrEqual(Math.min(page.height, visible.y + visible.height));
+    }
+    expect(overlaps(objectRect(page.objects[0]!), objectRect(page.objects[1]!))).toBe(false);
+  });
+
   it.each(["filled molecule frame", "page border"])("keeps the original position without asking to enlarge a page occupied by %s", async kind => {
     harness.opsin.mockResolvedValue({ smiles: "CCO" });
     const drawing = createEmptyDocument();
