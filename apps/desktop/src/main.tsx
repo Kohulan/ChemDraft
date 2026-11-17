@@ -3,7 +3,11 @@ import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { perfProbeRequestedFromWindow } from "./perf/gate";
 import { perfHook } from "./perf/runtime";
+import { installContextMenuGuard } from "./contextMenuGuard";
 import "./App.css";
+
+// The document window owns its canvas context menu; all other app windows share this guard.
+if (new URLSearchParams(window.location.search).has("window")) installContextMenuGuard();
 
 function mount() {
   createRoot(document.getElementById("root") as HTMLElement).render(

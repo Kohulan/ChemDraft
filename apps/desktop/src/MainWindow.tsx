@@ -1786,7 +1786,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.16.18.30-codex";
+const CURRENT_BUILD_STAMP = "11.16.20.25-codex";
 const VibeCodeGuideForm = lazy(() => import("./dialogs/VibeCodeGuideForm").then(module => ({ default: module.VibeCodeGuideForm })));
 const StructureTemplatePicker = lazy(() => import("./dialogs/StructureTemplatePicker").then(module => ({ default: module.StructureTemplatePicker })));
 /** Starts in the background for the document webview under the existing probe gate. */
@@ -12617,7 +12617,17 @@ export function MainWindow({
           consent = new PageEnlargementConsent(shortcutPlatform);
           if (signal) pluginPageConsentsRef.current.set(signal, consent);
         }
-        const prepared = normalizeCommittedDocument(applied.document);
+        let placed = applied.document;
+        if (plugin.id === "org.chemdraft.opsin.nameToStructure") {
+          const page = placed.pages[0];
+          if (page) {
+            const insertedIds = page.objects.filter(object => !previousIds.has(object.id)).map(object => object.id);
+            placed = placeInsertedObjectsInFreeSpace(placed, page.id, insertedIds, {
+              viewport: assistantHistoryPort.getViewportRect?.(activeDocumentTabIdRef.current)
+            });
+          }
+        }
+        const prepared = normalizeCommittedDocument(placed);
         const pending = commitWithPageFit(before, prepared, (document, fitBaseline) => {
           // User-approved page fitting is a host edit. Replay its exact transform on the baseline
           // so it grants no scope for a plugin's own movement or normalization side effects.

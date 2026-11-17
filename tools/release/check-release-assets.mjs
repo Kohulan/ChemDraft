@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { expectedReleaseCommit, missingBuildFiles, releaseBuildFiles, verifyBuildAssets, verifyWindowsUpdateAssets } from "./release-assets.mjs";
 import { verifyDmgSourceCommit } from "./macos-dmg.mjs";
+import { verifyReleaseChecksums } from "./release-checksums.mjs";
 
 const ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
@@ -41,6 +42,7 @@ export function checkReleaseAssets({ tag, version = tag?.replace(/^v/, ""), comm
     });
     // Strict mode validates updater assets in verifyBuildAssets; preserve the partial-upload gate.
     if (allowIncomplete) verifyWindowsUpdateAssets({ assets: folder, version, allowIncomplete }, { updaterPublicKey });
+    verifyReleaseChecksums(folder);
     if (missing.length) return { complete: false, missing };
     return { complete: true, commit: expectedCommit, builds };
   } finally { if (temporary) cleanup(folder); }
