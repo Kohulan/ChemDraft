@@ -50,22 +50,26 @@ const current = () => window.__CHEMDRAFT_AGENT__!.snapshot();
 const molecule = () => current().document.pages[0]!.objects.find(o => o.id === target.objectId) as MoleculeObject;
 const badge = () => container.querySelector<SVGGElement>(`[data-invalid-atom-id="${target.atomId}"]`)!;
 describe.each(["macos", "windows"] as const)("problem marker keyboard propagation (%s)", platform => {
-  it("lets undo and redo reach the canvas while retaining its own navigation keys", async () => {
+  it("lets only platform undo and redo reach the canvas", async () => {
+    Object.defineProperty(navigator, "platform", { configurable: true, value: platform === "macos" ? "MacIntel" : "Win32" });
     const received: string[] = [];
     await act(async () => root.render(createElement("svg", { onKeyDown: event => received.push(event.key) },
       createElement(AtomProblemMarker, { target, x: 0, y: 0, invoke: () => {} }))));
     const marker = badge();
     for (const [key, modifiers] of [["z", platform === "macos" ? { metaKey: true } : { ctrlKey: true }],
-      [platform === "macos" ? "Z" : "y", platform === "macos" ? { metaKey: true, shiftKey: true } : { ctrlKey: true }],
+      ["Z", platform === "macos" ? { metaKey: true, shiftKey: true } : { ctrlKey: true, shiftKey: true }],
+      ...(platform === "windows" ? [["y", { ctrlKey: true }]] as const : []),
+      ["r", { ctrlKey: true }], ["r", { metaKey: true }], ["F5", {}],
       ["ArrowLeft", {}], ["Escape", {}]] as const) {
       marker.dispatchEvent(new KeyboardEvent("keydown", { key, ...modifiers, bubbles: true }));
     }
-    expect(received).toEqual(["z", platform === "macos" ? "Z" : "y"]);
+    expect(received).toEqual(["z", "Z", ...(platform === "windows" ? ["y"] : [])]);
   });
 });
 describe.each(["macos", "windows"] as const)("reload on a focused problem marker (%s)", platform => {
+  beforeEach(() => Object.defineProperty(navigator, "platform", { configurable: true, value: platform === "macos" ? "MacIntel" : "Win32" }));
   it.each([
-    ["F5", {}], ["r", { ctrlKey: true }],
+    ["F5", {}], ["r", { ctrlKey: true }], ["r", { metaKey: true }],
     ["R", { ctrlKey: true, shiftKey: true }], ["F5", { ctrlKey: true }]
   ] as const)("consumes %s %j without invoking a command", async (key, modifiers) => {
     await mount(problemDocument(), platform);
