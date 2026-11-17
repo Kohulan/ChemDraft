@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-monitor-logical-bounds-at"
+description = "Enables the monitor_logical_bounds_at command without any pre-configured scope."
+commands.allow = ["monitor_logical_bounds_at"]
+
+[[permission]]
+identifier = "deny-monitor-logical-bounds-at"
+description = "Denies the monitor_logical_bounds_at command without any pre-configured scope."
+commands.deny = ["monitor_logical_bounds_at"]

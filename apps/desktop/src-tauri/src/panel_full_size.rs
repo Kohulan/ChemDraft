@@ -189,8 +189,7 @@ pub(super) fn set<R: Runtime>(
     }
     let normal =
         super::current_plugin_panel_geometry(window).ok_or("Could not read the panel frame.")?;
-    let monitor = window
-        .current_monitor()
+    let monitor = crate::monitor_query::current_monitor(window)
         .map_err(|e| e.to_string())?
         .ok_or("The panel's monitor is unavailable.")?;
     let monitor = super::panel_window_frame::Monitor::from_native(&monitor);

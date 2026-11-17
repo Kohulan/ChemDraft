@@ -15,6 +15,7 @@ mod local_engine;
 #[cfg(target_os = "macos")]
 mod macos_quit;
 mod main_window_placement;
+mod monitor_query;
 mod naming_engine;
 mod network_error;
 #[cfg(test)]
@@ -1055,6 +1056,9 @@ const MAIN_WINDOW_TITLE_GRAB_PT: f64 = 22.0;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // First, before GTK opens the display: see monitor_query.rs.
+    #[cfg(target_os = "linux")]
+    monitor_query::init_xlib_threads();
     let perf_enabled = agent_bridge_status().enabled;
     windows_activation_log::init(perf_enabled);
     let perf_log = perf_log::PerfLog::new(perf_enabled);
@@ -1535,6 +1539,8 @@ pub fn run() {
             show_toolset_tooltip_window,
             hide_toolset_tooltip_window,
             set_current_window_global_position,
+            monitor_query::current_window_logical_work_area,
+            monitor_query::monitor_logical_bounds_at,
             start_window_drag,
             quit_after_flush,
             set_quit_prompt_enabled,
@@ -5061,8 +5067,9 @@ fn current_plugin_panel_geometry<R: Runtime>(
 ) -> Option<panel_window_frame::Frame> {
     let position = window.outer_position().ok()?;
     let size = window.inner_size().ok()?;
-    let monitor =
-        panel_window_frame::Monitor::from_native(&window.current_monitor().ok().flatten()?);
+    let monitor = panel_window_frame::Monitor::from_native(
+        &monitor_query::current_monitor(window).ok().flatten()?,
+    );
     panel_window_frame::Frame::from_physical(
         (position.x, position.y),
         (size.width, size.height),
@@ -5087,7 +5094,7 @@ fn plugin_panel_saved_placement<R: Runtime>(
     app: &tauri::AppHandle<R>,
     frame: &panel_window_frame::Frame,
 ) -> Option<panel_window_frame::Placement> {
-    let monitors = app.available_monitors().unwrap_or_default();
+    let monitors = monitor_query::available_monitors(app).unwrap_or_default();
     let monitors: Vec<_> = monitors
         .iter()
         .map(panel_window_frame::Monitor::from_native)
@@ -5099,7 +5106,7 @@ fn plugin_panel_restore_geometry<R: Runtime>(
     app: &tauri::AppHandle<R>,
     saved: &panel_window_frame::Frame,
 ) -> Option<(panel_window_frame::Placement, panel_window_frame::Frame)> {
-    let monitors = app.available_monitors().unwrap_or_default();
+    let monitors = monitor_query::available_monitors(app).unwrap_or_default();
     let monitors: Vec<_> = monitors
         .iter()
         .map(panel_window_frame::Monitor::from_native)
@@ -5113,7 +5120,9 @@ fn plugin_panel_restore_geometry<R: Runtime>(
     let (width, height) = panel_window_frame::default_size(None, None);
     let placement = plugin_panel_default_placement(app, width, height)?;
     let main = app.get_webview_window(MAIN_WINDOW_LABEL)?;
-    let monitor = panel_window_frame::Monitor::from_native(&main.current_monitor().ok().flatten()?);
+    let monitor = panel_window_frame::Monitor::from_native(
+        &monitor_query::current_monitor(&main).ok().flatten()?,
+    );
     let frame =
         panel_window_frame::Frame::from_physical(placement.position, placement.size, &monitor)?;
     Some((placement, frame))
@@ -5126,7 +5135,7 @@ fn plugin_panel_default_placement<R: Runtime>(
 ) -> Option<panel_window_frame::Placement> {
     let position = analysis_window_initial_position(app, width, height)?;
     let main = app.get_webview_window(MAIN_WINDOW_LABEL)?;
-    let monitor = main.current_monitor().ok().flatten()?;
+    let monitor = monitor_query::current_monitor(&main).ok().flatten()?;
     let scale = monitor.scale_factor();
     let position = position.to_physical::<i32>(scale);
     let size = tauri::LogicalSize::new(width, height).to_physical::<u32>(scale);
@@ -5148,7 +5157,8 @@ fn analysis_window_initial_position<R: Runtime>(
     let main_size = main.inner_size().ok()?.to_logical::<f64>(scale);
     // Clamp to the work area, not the full display: a window pushed under the menu bar or the Dock
     // has its title strip -- the only way to drag an undecorated window -- out of reach.
-    let work_area = monitor_logical_work_area(&main.current_monitor().ok().flatten()?);
+    let work_area =
+        monitor_logical_work_area(&monitor_query::current_monitor(&main).ok().flatten()?);
     // The floating palettes sit at a higher window level than this window, so wherever they are is
     // somewhere the new window would open underneath them, title bar and all.
     let palettes: Vec<ScreenRect> = app
@@ -6026,8 +6036,7 @@ fn set_window_global_logical_position<R: Runtime>(
     x: f64,
     y: f64,
 ) -> Result<(), String> {
-    let monitors = window
-        .available_monitors()
+    let monitors = monitor_query::available_monitors(window.app_handle())
         .unwrap_or_default()
         .iter()
         .map(|monitor| MonitorFrame {
@@ -9504,7 +9513,7 @@ fn clamp_toolset_position<R: Runtime>(
     width: f64,
     height: f64,
 ) -> ToolsetWindowPosition {
-    let monitors = match app.available_monitors() {
+    let monitors = match monitor_query::available_monitors(app) {
         Ok(monitors) if !monitors.is_empty() => monitors,
         // No monitor info (headless, or the platform refused): trust the saved position rather than
         // moving a window the user may have deliberately placed.
@@ -9515,8 +9524,7 @@ fn clamp_toolset_position<R: Runtime>(
         return position;
     }
 
-    let target = app
-        .primary_monitor()
+    let target = monitor_query::primary_monitor(app)
         .ok()
         .flatten()
         .unwrap_or_else(|| monitors[0].clone());
@@ -9849,7 +9857,7 @@ fn main_window_geometry_reachable<R: Runtime>(
     window: &tauri::WebviewWindow<R>,
     geometry: &MainWindowGeometry,
 ) -> bool {
-    let Ok(monitors) = window.available_monitors() else {
+    let Ok(monitors) = monitor_query::available_monitors(window.app_handle()) else {
         // Can't enumerate displays — trust the frame rather than discard the user's layout.
         return true;
     };

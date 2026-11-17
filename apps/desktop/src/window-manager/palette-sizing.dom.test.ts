@@ -1,17 +1,17 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { currentWindowLogicalWorkArea, fitCurrentPaletteWindow } from "./index";
+import { currentWindowLogicalWorkArea, fitCurrentPaletteWindow, monitorLogicalBoundsAt } from "./index";
 
 const native = vi.hoisted(() => ({
   invoke: vi.fn(),
-  currentMonitor: vi.fn(),
+  workArea: vi.fn(),
+  boundsAt: vi.fn(),
   setSize: vi.fn(),
   position: { x: 100, y: 100 }
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: native.invoke }));
 vi.mock("@tauri-apps/api/window", () => ({
-  currentMonitor: native.currentMonitor,
   getCurrentWindow: () => ({ setSize: native.setSize }),
   LogicalSize: class {
     constructor(public width: number, public height: number) {}
@@ -23,10 +23,13 @@ describe("palette work-area sizing", () => {
     vi.stubGlobal("__TAURI__", {});
     native.position = { x: 100, y: 100 };
     native.setSize.mockReset().mockResolvedValue(undefined);
-    native.currentMonitor.mockReset();
+    native.workArea.mockReset();
+    native.boundsAt.mockReset().mockResolvedValue(null);
     native.invoke.mockReset().mockImplementation(async (command, payload) => {
       if (command === "window_logical_position") return { ...native.position };
       if (command === "set_current_window_global_position") native.position = { ...payload };
+      if (command === "current_window_logical_work_area") return native.workArea();
+      if (command === "monitor_logical_bounds_at") return native.boundsAt(payload);
     });
   });
 
@@ -35,24 +38,31 @@ describe("palette work-area sizing", () => {
     vi.restoreAllMocks();
   });
 
-  it.each([1, 1.5, 2])("uses the monitor's own scale (%s) and excludes OS chrome", async (scaleFactor) => {
-    native.currentMonitor.mockResolvedValue({
-      scaleFactor,
-      position: { x: -1920 * scaleFactor, y: 0 },
-      size: { width: 1920 * scaleFactor, height: 1080 * scaleFactor },
-      workArea: {
-        position: { x: -1920 * scaleFactor, y: 24 * scaleFactor },
-        size: { width: 1920 * scaleFactor, height: 1016 * scaleFactor }
-      }
-    });
+  // The scale conversion itself is tested in Rust (monitor_query.rs).
+  it("uses the native work area, which excludes OS chrome", async () => {
+    native.workArea.mockResolvedValue({ left: -1920, top: 24, right: 0, bottom: 1040 });
     expect(await currentWindowLogicalWorkArea()).toEqual({ left: -1920, top: 24, right: 0, bottom: 1040 });
+    expect(native.invoke).toHaveBeenCalledWith("current_window_logical_work_area");
   });
 
-  it("uses available screen dimensions when the monitor query fails", async () => {
-    native.currentMonitor.mockRejectedValue(new Error("No monitor"));
+  it.each([
+    ["fails", () => native.workArea.mockRejectedValue(new Error("No monitor"))],
+    ["finds no monitor", () => native.workArea.mockResolvedValue(null)]
+  ])("uses available screen dimensions when the monitor query %s", async (_case, arrange) => {
+    arrange();
     vi.spyOn(window.screen, "availHeight", "get").mockReturnValue(720);
     vi.spyOn(window.screen, "availWidth", "get").mockReturnValue(1280);
     expect(await currentWindowLogicalWorkArea()).toEqual({ left: 0, top: 0, right: 1280, bottom: 720 });
+  });
+
+  it("asks the native side for the monitor under a point", async () => {
+    native.boundsAt.mockResolvedValue({ left: 1920, top: 0, right: 4480, bottom: 1440 });
+    expect(await monitorLogicalBoundsAt(2000, 100)).toEqual({ left: 1920, top: 0, right: 4480, bottom: 1440 });
+    expect(native.boundsAt).toHaveBeenCalledWith({ x: 2000, y: 100 });
+    native.boundsAt.mockResolvedValue(null);
+    expect(await monitorLogicalBoundsAt(9000, 0)).toBeUndefined();
+    native.boundsAt.mockRejectedValue(new Error("no runtime"));
+    expect(await monitorLogicalBoundsAt(0, 0)).toBeUndefined();
   });
 
   it("caps an oversized inspector and moves its entire frame into the work area", async () => {

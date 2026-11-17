@@ -696,6 +696,22 @@
     "returnType": "Result<(), String>"
   },
   {
+    "file": "monitor_query.rs",
+    "name": "current_window_logical_work_area",
+    "async": false,
+    "generics": "",
+    "parameters": "window: tauri::WebviewWindow,",
+    "returnType": "Option<LogicalBounds>"
+  },
+  {
+    "file": "monitor_query.rs",
+    "name": "monitor_logical_bounds_at",
+    "async": false,
+    "generics": "",
+    "parameters": "window: tauri::WebviewWindow, x: f64, y: f64,",
+    "returnType": "Option<LogicalBounds>"
+  },
+  {
     "file": "naming_engine/mod.rs",
     "name": "naming_engine_status",
     "async": false,

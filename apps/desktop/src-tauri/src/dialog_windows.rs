@@ -2563,7 +2563,8 @@ fn sample_normal_frame<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Option<N
     // Read state and geometry on both sides of the monitor lookup. A minimize, DPI change,
     // or torn sizing read must not become either placement input or pending persistence.
     let before = native_normal_geometry(window)?;
-    let work = WorkArea::from_monitor(&window.current_monitor().ok()??).inset(12.0);
+    let work =
+        WorkArea::from_monitor(&crate::monitor_query::current_monitor(window).ok()??).inset(12.0);
     let after = native_normal_geometry(window)?;
     stable_normal_frame(&work, Some(before), Some(after))
 }
@@ -2821,8 +2822,7 @@ fn recover_preferences_frame<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Re
         }
         retained = Some(normal);
     }
-    let monitors: Vec<_> = window
-        .available_monitors()
+    let monitors: Vec<_> = crate::monitor_query::available_monitors(window.app_handle())
         .map_err(|error| error.to_string())?
         .iter()
         .map(|monitor| WorkArea::from_monitor(monitor).inset(12.0))
@@ -2901,13 +2901,11 @@ fn place_content_window_from_frame<R: Runtime>(
     let owner = app
         .get_webview_window(super::MAIN_WINDOW_LABEL)
         .ok_or("Unknown dialog owner")?;
-    let monitor = owner
-        .current_monitor()
+    let monitor = crate::monitor_query::current_monitor(&owner)
         .map_err(|e| e.to_string())?
         .ok_or("Document monitor unavailable")?;
     let work = WorkArea::from_monitor(&monitor).inset(12.0);
-    let monitors: Vec<_> = owner
-        .available_monitors()
+    let monitors: Vec<_> = crate::monitor_query::available_monitors(owner.app_handle())
         .map_err(|e| e.to_string())?
         .iter()
         .map(|m| WorkArea::from_monitor(m).inset(12.0))
