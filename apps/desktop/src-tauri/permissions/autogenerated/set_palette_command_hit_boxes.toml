@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-palette-command-hit-boxes"
+description = "Enables the set_palette_command_hit_boxes command without any pre-configured scope."
+commands.allow = ["set_palette_command_hit_boxes"]
+
+[[permission]]
+identifier = "deny-set-palette-command-hit-boxes"
+description = "Denies the set_palette_command_hit_boxes command without any pre-configured scope."
+commands.deny = ["set_palette_command_hit_boxes"]

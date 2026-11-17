@@ -6,14 +6,16 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { expectedReleaseCommit, missingBuildFiles, releaseBuildFiles, verifyBuildAssets } from "./release-assets.mjs";
+import { expectedReleaseCommit, missingBuildFiles, releaseBuildFiles, verifyBuildAssets, verifyWindowsUpdateAssets } from "./release-assets.mjs";
 import { verifyDmgSourceCommit } from "./macos-dmg.mjs";
+import { verifyReleaseChecksums } from "./release-checksums.mjs";
 
 const ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
 export function checkReleaseAssets({ tag, version = tag?.replace(/^v/, ""), commit, assets, rootDir = ROOT, allowIncomplete = false, skipDmgProvenance = false }, {
   run = spawnSync, makeTemp = () => mkdtempSync(join(tmpdir(), "chemdraft-release-assets-")),
-  cleanup = (path) => rmSync(path, { recursive: true, force: true }), platform = process.platform, log = console.log
+  cleanup = (path) => rmSync(path, { recursive: true, force: true }), platform = process.platform, log = console.log,
+  updaterPublicKey
 } = {}) {
   releaseBuildFiles(version);
   if (tag !== undefined && tag !== `v${version}`) throw new Error("Release tag must match --version");
@@ -33,14 +35,15 @@ export function checkReleaseAssets({ tag, version = tag?.replace(/^v/, ""), comm
     }
     const missing = missingBuildFiles(folder, version);
     const builds = verifyBuildAssets({ assets: folder, version, expectedCommit, allowIncomplete }, {
+      updaterPublicKey,
       checkDmgCommit: platform === "darwin"
         ? (dmg, _target, expected, recordCommit) => verifyDmgSourceCommit(dmg, expected, { run, recordCommit })
         : undefined
     });
-    if (missing.length) {
-      if (!allowIncomplete) throw new Error(missing.map((name) => `${name}: missing release file`).join("\n"));
-      return { complete: false, missing };
-    }
+    // Strict mode validates updater assets in verifyBuildAssets; preserve the partial-upload gate.
+    if (allowIncomplete) verifyWindowsUpdateAssets({ assets: folder, version, allowIncomplete }, { updaterPublicKey });
+    verifyReleaseChecksums(folder);
+    if (missing.length) return { complete: false, missing };
     return { complete: true, commit: expectedCommit, builds };
   } finally { if (temporary) cleanup(folder); }
 }

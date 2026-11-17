@@ -256,8 +256,19 @@ describe("Structure controls on the user's two SMILES", () => {
     expect(roundCapLine?.attrs["stroke-linecap"]).toBe("round");
 
     const boldMolecule = withBondDisplay(styledMolecule(molecule, { bondBoldWidthPx: 9 }), normalBond.id, "bold");
-    const boldLine = bondLines(boldMolecule, normalBond.id)[0];
-    expect(boldLine?.attrs["stroke-width"]).toBe(9);
+    const boldBand = bondLines(boldMolecule, normalBond.id)[0]!;
+    expect(boldBand.tag).toBe("polygon");
+    expect(boldBand.attrs.fill).toBe("#000000");
+    expect(boldBand.attrs.stroke).toBe("none");
+    const from = molecule.atoms.find(atom => atom.id === normalBond.fromAtomId)!;
+    const to = molecule.atoms.find(atom => atom.id === normalBond.toAtomId)!;
+    const length = Math.hypot(to.x - from.x, to.y - from.y);
+    // Bold width is now ink geometry: measure perpendicular to the bond axis.
+    const offsets = String(boldBand.attrs.points).split(" ").map(point => {
+      const [x, y] = point.split(",").map(Number);
+      return (-(to.y - from.y) * x! + (to.x - from.x) * y!) / length;
+    });
+    expect(Math.max(...offsets) - Math.min(...offsets)).toBeCloseTo(9, 2);
 
     const doubleBond = firstCarbonDoubleBond(molecule);
     const percentLines = bondLines(styledMolecule(molecule, {

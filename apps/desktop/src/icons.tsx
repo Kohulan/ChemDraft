@@ -1,5 +1,6 @@
 import type { SVGProps } from "react";
 import { roundBracketIconPath } from "../../../packages/ui-kit/src";
+import type { ToolbarAssetName } from "./toolbarAssets";
 
 export type IconName =
   | "templates"
@@ -18,6 +19,7 @@ export type IconName =
   | "atom"
   | "bond"
   | "doubleBond"
+  | "eitherDoubleBond"
   | "tripleBond"
   | "wavyBond"
   | "bracket"
@@ -46,6 +48,7 @@ export type IconName =
   | "save"
   | "select"
   | "style"
+  | "sponge3d"
   | "text"
   | "undo"
   | "zoomIn"
@@ -53,6 +56,14 @@ export type IconName =
 
 interface IconProps extends SVGProps<SVGSVGElement> {
   name: IconName;
+}
+
+/** Keep legacy asset keys working across toolbar, gallery and native flyout snapshots. */
+export function ToolbarAssetIcon({ assetName, src }: { assetName?: ToolbarAssetName; src: string }) {
+  if (assetName === "Custom_Structure_Cleanup_3D") {
+    return <Icon name="sponge3d" />;
+  }
+  return <img className="tool-icon-image" src={src} alt="" aria-hidden="true" />;
 }
 
 export function Icon({ name, ...props }: IconProps) {
@@ -68,6 +79,16 @@ export function Icon({ name, ...props }: IconProps) {
   };
 
   switch (name) {
+    case "sponge3d":
+      return (
+        <svg {...common}>
+          {/* Original rectangular sponge: top, front and right faces with three simple pores. */}
+          <path d="m2 8 4-4 16 3v7l-4 4-16-3Zm0 0 16 3 4-4M18 11v7" />
+          <ellipse cx="11.5" cy="7.5" rx="1.8" ry="0.8" transform="rotate(10 11.5 7.5)" />
+          <circle cx="7" cy="11.8" r="1.3" />
+          <ellipse cx="13" cy="14" rx="1.5" ry="1.1" transform="rotate(15 13 14)" />
+        </svg>
+      );
     case "wavyBond":
       return <svg {...common}><path d="M3 12C4 9 5 9 6 12S8 15 9 12S11 9 12 12S14 15 15 12S17 9 18 12S20 15 21 12" /></svg>;
     case "templates":
@@ -134,6 +155,8 @@ export function Icon({ name, ...props }: IconProps) {
       );
     case "doubleBond":
       return <svg {...common}><path d="M4 15 18 5M6 19 20 9" /></svg>;
+    case "eitherDoubleBond":
+      return <svg {...common}><path d="M4 15 20 9M6 19 18 5" /></svg>;
     case "tripleBond":
       return <svg {...common}><path d="M3 14 17 4M5 17 19 7M7 20 21 10" /></svg>;
     case "bond":

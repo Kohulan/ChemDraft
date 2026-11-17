@@ -62,6 +62,20 @@ Canvas context menus (macOS and Windows): open the page and object menus with th
 use arrows, Home/End, Arrange and Copy As submenus, Enter, Space, Escape and Tab, then verify canvas
 focus and drawing shortcuts return after an action or dismissal.
 
+Native canvas context menus (macOS and Windows):
+
+- Move a floating palette over the canvas, right-click a page and then an object beside it so the
+  popup overlaps the palette: the native menu and its submenus stay above the palette. Open Arrange,
+  Copy As and table alignment submenus; check enabled items and disabled items with their reasons.
+  Click a disabled item: no command runs. Choose an enabled edit: exactly one edit/Undo entry occurs.
+- Open again and cancel with Escape, then reopen and click outside. Both close without an edit;
+  canvas focus and drawing shortcuts return. With a plugin canvas prompt visible, right-click and
+  choose an item, then repeat and cancel: the prompt reappears after tracking ends, and a subsequent
+  canvas drag hides/shows it normally. Repeat mouse opens and keyboard activation rapidly.
+- On Windows, run `pnpm smoke:windows-menu-churn`; churn the main menu, context submenus, palettes,
+  flyouts and warnings together, then quit and relaunch. No startup/quit crash or duplicate action;
+  utility windows never gain a document menu, taskbar button or separate Alt-Tab entry.
+
 Selection nudging (macOS and Windows): select a molecule, an atom/bond fragment, text, arrow,
 graphic, and a mixed selection in turn. Arrow keys move by 1 document unit (one CSS pixel);
 Shift+arrow moves by 10, and Down increases document y. Check at several zoom levels and page edges.
@@ -439,9 +453,14 @@ sprouts 4/5, carbonyl 2, gem-dimethyl 9, the 0-key cyclic bond closing a ring), 
 following the selected scheme — `e` over an atom applies the Et nickname in the ChemDraw scheme,
 while ChemDraft's `e` arms the eraser; charge stacking
 by hotkey and by the charge tool up to ±9 and back down to mark removal;
-with **Direct electron-mark editing** off (the default), check painted-ink-only picking over
+with **Direct electron-mark editing** off (the default), check radical/lone-pair painted-ink-only picking over
 atoms, bonds and filled rings, repeated radical/lone-pair tool placement on existing ink, and
-absence of mark resize/rotation handles. Enable the preference live, then drag circled/plain
+absence of mark resize/rotation handles.
+With the Lone Pair tool, click an atom to auto-place in its largest free gap; repeat for a second pair.
+Press an atom and drag: check the live tangent pair follows in 15° steps; hold Alt/Option for a free angle.
+Release once, then Undo/Redo once to remove/restore the exact pair; confirm molecular identity is unchanged.
+Escape, pointer cancellation or lost capture during placement must remove the preview without an Undo entry.
+Enable the preference live, then drag circled/plain
 charges, radical ions, radical dots and lone pairs from blank corners of their rotated frames
 with Select and electron tools; check overlap picking and no duplicates. Resize with corners,
 rotate with handles and typed entry, and check one labeled Undo/Redo per gesture. Adjust Art
@@ -452,6 +471,13 @@ with the preference off match the previous rendering, while custom/scaled lone-p
 radical-ion dot/sign geometry remain separated. Compare canvas, SVG and PDF; CDXML must warn by
 mark ID that annotation position, size, thickness and rotation remain in the native payload only.
 Check charge/radical counts, formula and canonical SMILES before and after appearance-only edits.
+With each direct-editing preference setting on macOS and Windows, drag a floating + to 20 px above
+Boc-glycine's carbonyl O: no target highlight, "Moved electron mark", O neutral and mark floating.
+Select All, click blank canvas, insert text, change mark appearance, and save/reopen the native file:
+the binding, atom charges, formula and SMILES must stay unchanged. Repeat at 8 px: highlight O,
+attach with a status naming its charge change, and retain that binding through the same operations.
+For O–C–C–N in frame (100,100,100,20), rotation 180°, drop + at (200,110): both highlight and
+commit target O, leaving N neutral. Repeat unrotated at (100,110), and check exact Undo/Redo.
 Move marks within the original atom's radius, onto nearby/far atoms and into empty space; charge
 moves retain the previous nearest-atom reassociation, while radical/lone-pair moves keep sticky
 anchors until out of range or unsupported. In a crowded placement, a general charge transform
@@ -737,6 +763,26 @@ molecule or atom with the Select tool; tool shortcuts work straight after any cl
 the list without cancelling a drag or leaving the eyedropper, and with the list closed does what it
 always did; File ▸ New or a cleanly opening file removes the count; and on Windows the list fits and
 scrolls in a small window at 125% and 150% display scale.
+
+Native file warnings (macOS and Windows):
+
+- Open either warning fixture above. Move a palette over the status button, click the warning count,
+  and verify the list appears above all palettes. Click Show on molecule and atom rows: the correct
+  target is selected and centered; missing/whole-file rows offer no invalid Show action. Scroll long
+  lists and repeat at mixed display scales. The warnings window cannot be dragged.
+- Close with ×; wait with it hidden, then reopen repeatedly. Repeat with keyboard focus on the
+  count and Enter/Space. Escape, outside clicks in the document or a palette, and switching apps
+  dismiss the list and clear the count button's expanded state. Reopen after each dismissal.
+- Open warnings and minimize the document (yellow button on macOS, taskbar/minimize on Windows):
+  no warning window remains visible. Restore the document: the transient stays dismissed, the count
+  button is collapsed, and clicking it opens the list again above palettes. Closing/hiding the
+  document also leaves no orphan warnings window.
+- Click inside warnings to give it keyboard focus; press Cmd+Z / Shift+Cmd+Z / Cmd+A on macOS or
+  Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y / Ctrl+A on Windows. Undo, Redo and Select All affect the drawing
+  exactly once, return focus to the document and leave no stuck canvas pointer state. Repeat through
+  the native Edit menu on macOS; F5 and Cmd/Ctrl+R never reload the warnings webview.
+- On Windows, verify warnings have no taskbar button or Alt-Tab entry; repeatedly open/dismiss them
+  while using context menus and palettes, including `pnpm smoke:windows-menu-churn`.
 
 Status row: at the 900×640 minimum window, open a file with warnings under a long name; the status text ends
 in an ellipsis, "N warnings" stays whole and clickable, and the build stamp at the right never overlaps either,
@@ -1189,6 +1235,7 @@ with a preview/flyout open: it closes, controls disappear and direct commands re
 - In an existing customized layout without Double Bond or Triple Bond, add both from Customize Main Toolbar, then activate each; verify distinct icons and active highlight.
 - Click and drag on empty page, extend from an atom, connect atoms and separate molecules, and click an existing bond to set its order. Confirm the requested order, normal snapping/Alt behavior, and one Undo/Redo step per gesture.
 - Allow growth or order changes that exceed available valence and show (!) on the affected atoms; retain existing atoms and coordinates, with only the requested graph changes. Still refuse unrepresentable multiple bonds to group labels or dashed dative bonds. Check save/reopen and SVG/MOL export, including valence warnings. Switch back to Single Bond and wedge/hash/dashed/bold tools.
+- Transition metals use a coordination ceiling (Pt: 6 in `packages/document-workflow-core/src/atoms.ts`); check (!) only above it, such as Pt with 7 attached atoms. The Ru example's (!) belongs on N.
 - Repeat in native Windows/WebView2 and macOS, including customized Main layouts, reset, and narrow palettes; verify browser fallback.
 
 ## Isotope insertion (macOS and Windows)
@@ -1329,6 +1376,7 @@ formatted.
 - Draw a Ru donor complex with neutral N bonded to Ru and two carbons. Set the solid Ru–N bond
   to double using hover `2`, order cycling, and the bond tool. Each edit must land with (!) on N;
   Undo/Redo restores the exact authored graph without adding charge. Dashed Ru–N stays single.
+- Transition metals show (!) only above their coordination ceiling (Pt: 6; test 7 attached atoms); the Ru example's (!) belongs on N.
 - Draw neopentane, relabel its center S and endpoints O, then raise two S–O bonds to double one
   at a time. The intermediate S(V) has (!); the final H2SO4 has no (!). Repeat with literal S/O
   labels and explicit OH for the acid oxygens. Keep every atom, coordinate and charge as drawn.
@@ -1359,14 +1407,15 @@ formatted.
 - Select waves together with a molecule, straight line and rectangle; adjust every slider and
   confirm only selected waves change. Check the molecule's bonds, stereo, charge and labels, and an
   unselected wave. Repeat Undo/Redo and cancel; mixed wave values should read Mixed until adjusted.
-- Open Customize Main Toolbar and search for Wave; value-specific smoothness, height and width
-  commands should be available and work when added to a toolbar.
+- Value-specific wave smoothness/height/width commands are hidden from the Customize gallery on purpose
+  (they remain registered; `galleryModel.ts` excludes `object.wave.*`). Search “wavy” finds Wavy bond
+  and Wavy Line; adjust waves with the Object Settings sliders.
 
 ## Newer native documents (macOS and Windows)
 
 Open a versioned future native JSON file and a `.chemdraft` envelope with a greater `minAppVersion`,
 an unknown visual field, a future bond style and a future drawing preset ID. Repeat through File
-Open, recent files, OS Open With and file drop. Each newly opened document must show exactly one
+Open, OS Open With and file drop. Each newly opened document must show exactly one
 native OK message with that file's full minimum version, owned by the document window. Verify that
 floating utilities hide and restore around the box, focus returns correctly, and Windows gains no
 taskbar entry. Activating an already-open file must not repeat the box. Legacy and same-version
@@ -1456,7 +1505,8 @@ whole-molecule cleanup with the existing behavior, and check save/reopen and exp
 - Choose Wavy bond from the bond flyout and draw a bond, then click a single bond to convert it.
   It displays a wave. Undo and Redo restore each edit; export MOL and check the unknown stereo survives.
 - Choose it from the Customize gallery too; click a wavy bond again to reverse its unknown stereo
-  end, then convert back to wedge/plain. Each edit is one Undo/Redo step. Check label clearance and
+  end, then convert back to wedge. To make wedge/hash/wavy plain, hover the bond and press 1, or click
+  it with the Single Bond tool; each is one Undo step labeled “Made bond plain”. Check label clearance and
   canvas/SVG/PDF/PNG parity, no R/S at the wave's `from` atom, SMILES without `@` there, MOL V2000
   stereo 4 and V3000 CFG=2.
 
@@ -1470,7 +1520,16 @@ whole-molecule cleanup with the existing behavior, and check save/reopen and exp
 
 - With Direct electron-mark editing off (the default), drag a charge mark onto an atom: it lands
   beside the atom label. Undo and Redo the drop. Enable Direct electron-mark editing in Preferences,
-  then move, resize and rotate the mark; Undo and Redo restore each edit.
+  then move, resize and rotate the mark; Undo and Redo restore each edit. With the mark selected,
+  dragging from its center moves it; corner handles resize. Repeat at 50%, 100% and 200% zoom,
+  including a rotated mark.
+- With either preference setting, grab positive/negative, plain/circled and radical-ion charges
+  outside their drawn sign and saved frame, within the centered 36 CSS-pixel move area. Repeat at
+  25%, 50%, 100%, 200% and 400% zoom, using Select and the matching charge tool: one mark moves,
+  without a duplicate. With direct editing enabled, grab each separate resize corner and use Shift
+  to stretch non-uniformly; clicking a corner without moving changes nothing. Undo/Redo each move
+  and resize. Check nearby overlapping objects still follow drawing order, and SVG/PDF contain
+  only the original drawing, with no enlarged invisible rectangle or changed charge size.
 
 ### Reaction conditions
 

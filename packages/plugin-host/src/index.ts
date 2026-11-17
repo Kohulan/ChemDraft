@@ -2,7 +2,7 @@
 // into this package's dist so no `@chemdraft/chem-core` dependency ships (ADR-0031). `ChemDraftDocument`,
 // however, is taken from `@chemdraft/plugin-api` so a consumer using both SDK packages sees ONE canonical
 // document type — not a second, structurally-identical copy inlined here.
-import type { ApplyPatchOptions, DocumentObject, DocumentPatch } from "@chemdraft/chem-core";
+import type { ApplyPatchOptions, DocumentObject, DocumentPatch, DocumentPage } from "@chemdraft/chem-core";
 import { applyPatch, pruneReactionObjectReferences } from "@chemdraft/chem-core";
 import { rebasePluginPatch } from "./rebasePluginPatch";
 export { rebasePluginPatch } from "./rebasePluginPatch";
@@ -38,6 +38,35 @@ function authoredObjectValue(object: DocumentObject): DocumentObject {
   return { ...object, chemistry: { ...object.chemistry,
     warnings: object.chemistry.warnings.filter(warning => warning.code !== "chemistry.bracket_multiplier")
   } };
+}
+
+/** Page fitting must already be replayed on `before`. Only objects and crossings have scoped
+ * write semantics; all other page fields (including future additions) are host-owned. */
+function assertPluginPageWriteScope(before: ChemDraftDocument, after: ChemDraftDocument, scope: ReadonlySet<string>): void {
+  for (let index = 0; index < Math.max(before.pages.length, after.pages.length); index++) {
+    const original = before.pages[index], next = after.pages[index];
+    if (!original || !next) {
+      throw new PluginHostError(`Plugin write refused: page "${(original ?? next)!.id}" was ${original ? "removed" : "added"} outside this command's object scope.`);
+    }
+    const { objects: _objects, crossings, ...shell } = original;
+    const { objects: _nextObjects, crossings: nextCrossings, ...nextShell } = next;
+    if (!sameDocumentValue(shell, nextShell)) {
+      const fields = Object.keys({ ...shell, ...nextShell }).filter(key =>
+        !sameDocumentValue(shell[key as keyof typeof shell], nextShell[key as keyof typeof nextShell]));
+      throw new PluginHostError(`Plugin write refused: page "${original.id}" was changed (${fields.join(", ")}) outside this command's object scope.`);
+    }
+    // Preserve the protected sequence, including duplicate pairs: rendering uses the FIRST
+    // matching override. In-scope records may change without shifting this protected sequence.
+    const protectedCrossings = (values: DocumentPage["crossings"]) =>
+      values.filter(crossing => crossing.bonds.some(ref => !scope.has(ref.objectId)));
+    const protectedBefore = protectedCrossings(crossings), protectedAfter = protectedCrossings(nextCrossings);
+    for (let i = 0; i < Math.max(protectedBefore.length, protectedAfter.length); i++) {
+      if (sameDocumentValue(protectedBefore[i], protectedAfter[i])) continue;
+      const crossing = (protectedBefore[i] ?? protectedAfter[i])!;
+      const outside = crossing.bonds.find(ref => !scope.has(ref.objectId))!;
+      throw new PluginHostError(`Plugin write refused: crossing on page "${original.id}" involving object "${outside.objectId}" (bond "${outside.bondId}") would change, but that object was not selected when the command started.`);
+    }
+  }
 }
 
 /** Host-only preflight. Embedders must rerun against the document they will actually commit after
@@ -118,18 +147,108 @@ export function assertPluginPatchWriteScope(
     }
     throw new PluginHostError(`Patch would change object "${object.id}", which is not selected`);
   }
+  assertPluginPageWriteScope(document, validated, scope);
+}
+
+/** Last check at the history boundary, AFTER all normalization and placement. Only rebased patch
+ * insertions whose ids did not exist in `before` extend scope; neither receipts nor derived additions
+ * grant access to existing objects. Unlike preflight, every final object field is compared. */
+export function assertPluginDocumentWriteScope(
+  before: ChemDraftDocument,
+  after: ChemDraftDocument,
+  proposed: NormalizedProposedDocumentPatch,
+  objectIds: readonly string[]
+): void {
+  const originals = before.pages.flatMap(page => page.objects.map(object => ({ pageId: page.id, object })));
+  const survivors = after.pages.flatMap(page => page.objects.map(object => ({ pageId: page.id, object })));
+  const existingIds = new Set(originals.map(entry => entry.object.id));
+  const inserted = new Set(writePatchOps(rebasePluginPatch(before, proposed).patch).flatMap(op =>
+    op.op === "addObject" ? [op.object.id] : op.op === "addAnnotation" ? [op.annotation.id] : []
+  ).filter(id => !existingIds.has(id)));
+  const scope = new Set(objectIds);
+  type Entry = typeof survivors[number];
+  // Reserve reference-identical occurrences before matching cloned occurrences by id, so a duplicate
+  // id cannot hide an edit or removal of its earlier occurrence (including on another page).
+  const byReference = new Map<DocumentObject, Entry[]>();
+  for (const entry of survivors) {
+    const entries = byReference.get(entry.object) ?? [];
+    entries.push(entry);
+    byReference.set(entry.object, entries);
+  }
+  const matches = new Map<typeof originals[number], Entry>();
+  const matched = new Set<Entry>();
+  for (const original of originals) {
+    const entries = byReference.get(original.object);
+    if (!entries?.length) continue;
+    const samePage = entries.findIndex(entry => entry.pageId === original.pageId);
+    const [entry] = entries.splice(samePage < 0 ? 0 : samePage, 1);
+    matches.set(original, entry!);
+    matched.add(entry!);
+  }
+  const byId = new Map<string, Entry[]>();
+  for (const entry of survivors) {
+    if (matched.has(entry)) continue;
+    const entries = byId.get(entry.object.id) ?? [];
+    entries.push(entry);
+    byId.set(entry.object.id, entries);
+  }
+  for (const original of originals) {
+    const survivor = matches.get(original) ?? byId.get(original.object.id)?.shift();
+    if (survivor) matched.add(survivor);
+    if (scope.has(original.object.id)) continue;
+    if (survivor?.pageId === original.pageId && sameDocumentValue(original.object, survivor.object)) continue;
+    const detail = !survivor ? "removed" : survivor.pageId !== original.pageId ? "moved to another page"
+      : pluginObjectChangeDescription(original.object, survivor.object);
+    throw new PluginHostError(`Plugin write refused: ${original.object.type} "${original.object.id}" was ${detail}, but was not selected when the command started.`);
+  }
+  for (const entry of survivors) {
+    if (!matched.has(entry) && !inserted.has(entry.object.id)) {
+      throw new PluginHostError(`Plugin write refused: ${entry.object.type} "${entry.object.id}" was added outside this command's insertions.`);
+    }
+  }
+  assertPluginPageWriteScope(before, after, new Set([...scope, ...inserted]));
+}
+
+function pluginObjectChangeDescription(before: DocumentObject, after: DocumentObject): string {
+  if (before.type === "molecule" && after.type === "molecule") {
+    for (const atom of before.atoms) {
+      const next = after.atoms.find(candidate => candidate.id === atom.id);
+      if (!next) return `changed by removing atom "${atom.id}"`;
+      if (sameDocumentValue(atom, next)) continue;
+      const fields = Object.keys({ ...atom, ...next }).filter(key =>
+        !sameDocumentValue(atom[key as keyof typeof atom], next[key as keyof typeof next]));
+      const names: Record<string, string> = { formalCharge: "formal charge", markCharge: "mark charge",
+        markRadicals: "mark radicals", labelBondSide: "label bond side" };
+      return `changed at atom "${atom.id}" (${fields.map(key => names[key] ?? key).join(", ")})`;
+    }
+  }
+  const fields = Object.keys({ ...before, ...after }).filter(key =>
+    !sameDocumentValue((before as Record<string, unknown>)[key], (after as Record<string, unknown>)[key]));
+  return `changed (${fields.join(", ")})`;
 }
 
 export function chemistryPropertiesInputError(
   request: unknown,
   error: Extract<ReturnType<typeof PluginChemistryPropertiesRequestSchema.safeParse>, { success: false }>['error']
 ): string {
-  const issue = error.issues.find(item => item.code === "too_big" && item.path[0] === "structure");
-  if (issue?.code === "too_big" && typeof request === "object" && request !== null &&
-    "structure" in request && typeof request.structure === "string") {
-    return `The structure is too long: ${request.structure.length} characters; the limit is ${issue.maximum}.`;
+  return chemistryInputError(request, error.issues[0]);
+}
+
+function chemistryInputError(request: unknown, issue: Extract<ReturnType<typeof PluginChemistryPropertiesRequestSchema.safeParse>, { success: false }>['error']['issues'][number]): string {
+  const field = [...issue.path].reverse().find(part => typeof part === "string");
+  const name = typeof field === "string" && /^[A-Za-z][A-Za-z0-9]*$/.test(field) ? field : "input";
+  let value: unknown = request;
+  for (const part of issue.path) {
+    if (value === null || typeof value !== "object") { value = undefined; break; }
+    value = (value as Record<string | number, unknown>)[part];
   }
-  return `Invalid chemistry properties input: ${error.issues.map(item => item.message).join("; ")}`;
+  if (issue.code === "too_big") {
+    if (issue.type === "string" && typeof value === "string") return `The ${name} is ${value.length} characters, over the ${issue.maximum} limit.`;
+    if (issue.type === "array" && Array.isArray(value)) return `The ${name} has ${value.length} entries, over the ${issue.maximum} limit.`;
+  }
+  if ((name === "structure" || name === "smiles") && typeof value === "string" && !value.trim() &&
+    (issue.code === "too_small" || issue.code === "custom")) return `The ${name} must not be empty.`;
+  return `The ${name} is invalid.`;
 }
 import type {
   AppliedPatchReceipt,
@@ -1019,18 +1138,24 @@ export class PluginHost {
             return PluginChemistryPropertiesResultSchema.parse(await this.computeProperties(parsed.data));
           },
           embed3d: request => this.runChemistry3d(pluginId, invocationToken, "embed3d", () => {
-            const parsed = PluginEmbed3DRequestSchema.parse(request);
+            const result = PluginEmbed3DRequestSchema.safeParse(request);
+            if (!result.success) throw new PluginHostError(chemistryInputError(request, result.error.issues[0]));
+            const parsed = result.data;
             if (!this.chemistry3d.embed3d) throw new PluginHostError("This host provides no 3D embedding engine.");
             return { timeoutMs: chemistry3dTimeoutMs("embed3d", parsed.components.length),
               run: signal => this.chemistry3d.embed3d!(parsed, signal) };
           }),
           minimize3d: request => this.runChemistry3d(pluginId, invocationToken, "minimize3d", () => {
-            const parsed = PluginMinimize3DRequestSchema.parse(request);
+            const result = PluginMinimize3DRequestSchema.safeParse(request);
+            if (!result.success) throw new PluginHostError(chemistryInputError(request, result.error.issues[0]));
+            const parsed = result.data;
             if (!this.chemistry3d.minimize3d) throw new PluginHostError("This host provides no 3D minimization engine.");
             return { timeoutMs: chemistry3dTimeoutMs("minimize3d"), run: signal => this.chemistry3d.minimize3d!(parsed, signal) };
           }),
           flatten3d: request => this.runChemistry3d(pluginId, invocationToken, "flatten3d", () => {
-            const parsed = PluginFlatten3DRequestSchema.parse(request);
+            const result = PluginFlatten3DRequestSchema.safeParse(request);
+            if (!result.success) throw new PluginHostError(chemistryInputError(request, result.error.issues[0]));
+            const parsed = result.data;
             if (!this.chemistry3d.flatten3d) throw new PluginHostError("This host provides no 3D flattening engine.");
             return { timeoutMs: chemistry3dTimeoutMs("flatten3d"), run: signal => this.chemistry3d.flatten3d!(parsed, signal) };
           }),

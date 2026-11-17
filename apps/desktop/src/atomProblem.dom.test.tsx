@@ -42,13 +42,29 @@ afterEach(() => {
   vi.restoreAllMocks(); vi.unstubAllGlobals(); delete window.__CHEMDRAFT_AGENT__;
   window.history.replaceState(null, "", "/");
 });
-async function mount(document: ChemDraftDocument) {
+async function mount(document: ChemDraftDocument, shortcutPlatform?: "macos" | "windows") {
   await act(async () => root.render(createElement(MainWindow, { initialDocument: document, initialActiveToolCommandId: "tool.select",
-    initialCrosshairsVisible: false, initialRulersVisible: false, initialPaletteMode: "hidden", nativePalette: true })));
+    initialCrosshairsVisible: false, initialRulersVisible: false, initialPaletteMode: "hidden", nativePalette: true, shortcutPlatform })));
 }
 const current = () => window.__CHEMDRAFT_AGENT__!.snapshot();
 const molecule = () => current().document.pages[0]!.objects.find(o => o.id === target.objectId) as MoleculeObject;
 const badge = () => container.querySelector<SVGGElement>(`[data-invalid-atom-id="${target.atomId}"]`)!;
+describe.each(["macos", "windows"] as const)("reload on a focused problem marker (%s)", platform => {
+  it.each([
+    ["F5", {}], ["r", { ctrlKey: true }],
+    ["R", { ctrlKey: true, shiftKey: true }], ["F5", { ctrlKey: true }]
+  ] as const)("consumes %s %j without invoking a command", async (key, modifiers) => {
+    await mount(problemDocument(), platform);
+    const before = current();
+    const event = new KeyboardEvent("keydown", { key, ...modifiers, bubbles: true, cancelable: true });
+    await act(async () => { badge().focus(); badge().dispatchEvent(event); });
+    expect(document.activeElement).toBe(badge());
+    expect(event.defaultPrevented).toBe(platform === "windows");
+    expect(current()).toEqual(before);
+    expect(container.querySelector(".document-rulers-overlay")).toBeNull();
+    expect(native.open).not.toHaveBeenCalled();
+  });
+});
 async function command(id: string) { await act(async () => { await window.__CHEMDRAFT_AGENT__!.command(id); }); }
 async function deliver(type: "ready" | "action", data: object) {
   await act(async () => { native.receive!({ senderWindowId: "dialog-main-atomProblem-1", windowLabel: "dialog-main-atomProblem-1",
@@ -134,6 +150,43 @@ it("Ignore hides only the badge; context-menu Restore works for a suppressed inv
   await command("edit.undo"); expect(badge()).not.toBeNull();
   expect(container.querySelector('[role="status"]')!.textContent).toContain("Undid Ignore warning");
   expect(container.querySelector("main")!.dataset.canUndo).toBe("false");
+});
+describe.each(["MacIntel", "Win32"])("problem completion (%s)", platform => {
+  it("updates the same window while the restored warning remains, then closes after its fix", async () => {
+    Object.defineProperty(navigator, "platform", { configurable: true, value: platform });
+    const source = problemMolecule("N", Array(4).fill("C"));
+    source.atoms[0]!.warningSuppressed = true;
+    await mount(problemDocument(source));
+    await command(atomProblemCommandId(target));
+    await deliver("ready", {});
+    if (snapshot.dialogKind !== "atomProblem") throw new Error("Expected problem window");
+    const version = snapshot.data.targetVersion;
+    await deliver("action", { action: "restore", targetVersion: version });
+    expect(native.close).not.toHaveBeenCalled();
+    expect(native.open).toHaveBeenCalledTimes(1);
+    expect(snapshot.data.targetVersion).toBeGreaterThan(version);
+    expect(snapshot.data.fixes.map(fix => fix.action)).toContain("charge");
+    expect(snapshot.data.fixes.map(fix => fix.action)).toContain("ignore");
+    expect(snapshot.data.fixes.map(fix => fix.action)).not.toContain("restore");
+    await deliver("action", { action: "charge", targetVersion: snapshot.data.targetVersion });
+    expect(native.close).toHaveBeenCalledExactlyOnceWith("opaque", "close");
+  });
+  it.each([
+    ["ignore", problemMolecule("N", Array(4).fill("C"))],
+    ["ignore", problemMolecule("OH2")],
+    ["charge", problemMolecule("N", Array(4).fill("C"))],
+    ["hydrogens", problemMolecule("OH2")]
+  ] as const)("closes after %s even when the warning offers a suggested fix", async (action, source) => {
+    Object.defineProperty(navigator, "platform", { configurable: true, value: platform });
+    await mount(problemDocument(source));
+    await command(atomProblemCommandId(target));
+    await deliver("ready", {});
+    if (snapshot.dialogKind !== "atomProblem") throw new Error("Expected problem window");
+    expect(snapshot.data.fixes.some(fix => fix.action === "charge" || fix.action === "hydrogens")).toBe(true);
+    await deliver("action", { action, targetVersion: snapshot.data.targetVersion });
+    expect(badge()).toBeNull();
+    expect(native.close).toHaveBeenCalledExactlyOnceWith("opaque", "close");
+  });
 });
 it("stops drawing gestures at the marker even with the bond tool active", async () => {
   await mount(problemDocument()); await command("tool.bond.single");

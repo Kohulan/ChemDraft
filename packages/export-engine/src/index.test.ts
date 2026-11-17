@@ -283,7 +283,7 @@ describe("exportDocumentToSvg", () => {
     expect(result.contents).toContain('data-bond-style="dashed"');
     expect(result.contents).toContain("stroke-dasharray");
     expect(result.contents).toContain('data-bond-style="bold"');
-    expect(result.contents).toContain('stroke-width="4.8"');
+    expect(result.contents).toContain('<polygon data-bond-id="bond_004" data-bond-order="single" data-bond-segment="primary" data-bond-style="bold" points="240,158.2 240,161.8 280,161.8 280,158.2" fill="#000000" stroke="none" />');
   });
 
   it("exports native charge marks without falling back to placeholder text", () => {

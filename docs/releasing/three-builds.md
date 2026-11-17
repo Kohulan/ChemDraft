@@ -36,6 +36,28 @@ The Windows workflow records source identity in the clean checkout and updates t
 **after Authenticode signing**, retaining the recorded source identity. Any later byte change requires
 a new record and new updater signatures/feeds.
 
+## Combined release checksums
+
+The Windows workflow creates and verifies an LF-only `SHA256SUMS.txt` for its staged artifact.
+It uploads the Windows files without that local sums file, then downloads every attached asset,
+regenerates the combined sums and uploads them with `gh release upload --clobber`. Recomputing from
+the attached bytes retains Mac entries on Windows reruns and works in either upload order.
+After all Mac and Windows uploads finish, regenerate and upload the final combined file:
+
+```text
+node tools/release/release-checksums.mjs --tag vX.Y.Z
+node tools/release/release-checksums.mjs --tag vX.Y.Z --verify
+```
+
+Tag write mode downloads the complete release into a temporary folder, hashes every regular file
+except `SHA256SUMS.txt` itself, and uploads the replacement sums before deleting the folder.
+Each line is `lowercase-hash␠␠filename` with LF endings. `--tag ... --verify` only downloads and
+checks the existing sums. `--assets path/to/release-assets` writes only a local file; if used instead,
+upload it explicitly with `gh release upload vX.Y.Z path/to/release-assets/SHA256SUMS.txt --clobber`.
+The final asset checker requires sums to cover exactly all downloaded release files. Keep uploads
+idle during checksum generation and verification; after any asset change, regenerate and recheck.
+Do not use Windows PowerShell text output to rewrite the combined file.
+
 ## Draft the body on macOS
 
 Prepare `release-notes/macos/ChemDraft_X.Y.Z_aarch64.md`,
@@ -71,35 +93,44 @@ record can substitute for an expected commit. Complete the production signature 
 1. Upload the final artifacts, their four records, updater signatures and generated feeds to the
    existing draft release. Run the platform acceptance checks in the platform guides.
 2. Set the reviewed release body. Immediately before un-drafting, **on a Mac**, from a checkout of
-   the release source with `gh` authenticated to read drafts and `APPLE_TEAM_ID` exported, download
-   the final assets to a new, empty folder. All three verification commands below are mandatory:
+   the release source with `gh` authenticated to read and upload draft assets and `APPLE_TEAM_ID`
+   exported, regenerate and upload the combined sums, then download the final assets to a new,
+   empty folder. The checksum upload and all three verification commands below are mandatory:
 
    ```text
+   node tools/release/release-checksums.mjs --tag vX.Y.Z
    gh release download vX.Y.Z --dir path/to/final-download
    node tools/release/verify-macos-app.mjs --target aarch64-apple-darwin --release --dmg path/to/final-download/ChemDraft_X.Y.Z_aarch64.dmg --commit <full-sha>
    node tools/release/verify-macos-app.mjs --target x86_64-apple-darwin --release --dmg path/to/final-download/ChemDraft_X.Y.Z_x86_64.dmg --commit <full-sha>
    node tools/release/check-release-assets.mjs --tag vX.Y.Z --commit <full-sha>
    ```
 
-   The two release verifiers mount the downloaded DMGs read-only, verify the apps inside, and check
-   each DMG's staple and Gatekeeper assessment. The process staples only the DMG, never requiring
+   The checksum command uploads `SHA256SUMS.txt` covering every attached asset before the final
+   checker downloads it. The two release verifiers mount the downloaded DMGs read-only, verify the
+   apps inside, and check each DMG's staple and Gatekeeper assessment. The process staples only the DMG, never requiring
    an app staple. The final asset command downloads all assets again to a temporary directory and cleans it up.
-   It requires exactly the four expected builds and their records, both Windows `.exe.sig` files,
-   `latest.json` and `latest-allusers.json`. It refuses extra builds or records, including unexpected
-   `.sig`, `.msi`, `.zip`, `.pkg` and `.tar.gz` files. It recomputes hashes and sizes, mounts
+   It requires exactly both DMGs, both installers and their records, refuses extra builds or records,
+   including unexpected `.sig`, `.msi`, `.zip`, `.pkg` and `.tar.gz` files (only the two expected Windows
+   `.exe.sig` files and `latest.json` and `latest-allusers.json` are allowed updater assets). It requires all four Windows updater files,
+   checks the manifest version, exact `windows-x86_64-nsis` platform key and release download URL,
+   and requires the manifest signature to match the `.exe.sig`. It verifies that signature against
+   the final installer bytes, including the Minisign key ID and authenticated comment, using
+   `plugins.updater.pubkey` from the checked-in `apps/desktop/src-tauri/tauri.windows.conf.json`.
+   These updater checks run offline on both platforms. It recomputes hashes and sizes, mounts
    every DMG to compare its embedded commit with its record and the expected commit, and checks common
    source identity against the freshly fetched origin tag. It needs macOS, `hdiutil` and `plutil`, but
    no npm dependencies. For an already-downloaded complete folder, add `--assets path/to/downloaded`; without
    a tag, folder checks require `--version X.Y.Z --commit <full-sha>` and cannot attest tag identity.
 3. **Un-draft only after both release verifiers succeed and the strict attached-asset command reports PASS.** Do not change assets
-   between that pass and publishing; rerun it after any replacement. Then land generated feeds
-   through the normal PR flow once their artifact URLs are publicly reachable.
+   between that pass and publishing; regenerate and upload sums and rerun verification after any
+   replacement. Then land generated feeds through the normal PR flow once their artifact URLs are publicly reachable.
 
 The Windows workflow runs this checker **inside the upload job after uploading**, with its existing
 `contents: write` token so draft assets are visible. Other jobs retain read access. Its
-`--allow-incomplete` mode permits wholly missing artifact/record pairs and missing Windows updater
-signatures or feeds, and lists the missing filenames,
-while fully checking every supplied build. Partial pairs, invalid records, hashes, sizes, extra builds
+`--allow-incomplete` mode permits wholly missing artifact/record pairs and lists the missing filenames,
+while fully checking every supplied build. A supplied Windows installer still requires its verified
+`.exe.sig` and matching updater feed; only a wholly absent Windows build and updater files may be deferred.
+Partial pairs, invalid records, hashes, sizes, extra builds
 and tag mismatches fail even in incomplete mode. INCOMPLETE is **not permission to un-draft**.
 
 On Linux and Windows, the checker prints that embedded DMG provenance was skipped and requires

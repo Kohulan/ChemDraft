@@ -1,15 +1,21 @@
 // @vitest-environment jsdom
 import { act, createElement } from "react";
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { resolve } from "node:path";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { applyPatch, type ChemDraftDocument } from "@chemdraft/chem-core";
-import { atomDisplayLabel, moleculeLayoutLabelBoxes } from "@chemdraft/layout-engine";
-import { nativeAtomBondOrderUsage, nativeImplicitHydrogenCount, phase4Timestamp } from "@chemdraft/document-workflow-core";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { applyPatch, type ChemDraftDocument, type ElectronMarkObject } from "@chemdraft/chem-core";
+import { exportDocumentToSvg } from "@chemdraft/export-engine";
+import { atomDisplayLabel, lonePairPlacementPlanForAtom, moleculeLayoutLabelBoxes, transformPointForObject } from "@chemdraft/layout-engine";
+import { documentDrawingDefaults, nativeAtomBondOrderUsage, nativeImplicitHydrogenCount, phase4Timestamp, stereoPerceptionMolfile } from "@chemdraft/document-workflow-core";
+import { ensureRdkit, resetRdkitForTesting, setRdkitModuleLoader } from "../../../packages/rdkit-adapter/src/conformer";
+import { inspectStructureInWorker } from "./depiction2d/identityInspect";
 import { MainWindow } from "./MainWindow";
 import * as workflow from "./documentWorkflow";
 import { DOM_COMMAND_EVENT } from "./window-manager";
 import { saveDirectElectronMarkEditing } from "./electronMarkEditingSettings";
-import { dropMark, dropMolecule, electronMarkDropFixture } from "./testSupport/electronMarkDropFixture";
+import { dropMark, dropMolecule, electronMarkDropFixture, rotatedElectronMarkDropFixture } from "./testSupport/electronMarkDropFixture";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -18,12 +24,18 @@ class TestResizeObserver { observe() {} unobserve() {} disconnect() {} }
 describe.each(["macos", "windows"] as const)("electron-mark drops on %s", platform => {
 describe.each([false, true])("electron-mark drop interaction with direct editing %s", enabled => {
   let container: HTMLDivElement, root: Root;
+  let handleStyles: HTMLStyleElement;
   let frames: Map<number, FrameRequestCallback>, frameId: number;
   const captureMethods = { set: Element.prototype.setPointerCapture,
     release: Element.prototype.releasePointerCapture, has: Element.prototype.hasPointerCapture };
   beforeEach(() => {
     vi.stubGlobal("localStorage", new MemoryStorage());
     saveDirectElectronMarkEditing(enabled);
+    // jsdom has no layout. Read the actual handle CSS for coordinate-based targeting below.
+    handleStyles = document.createElement("style");
+    handleStyles.textContent = [...readFileSync(resolve("apps/desktop/src/App.css"), "utf8")
+      .matchAll(/[^{}]*\.object-resize-[^{}]*\{[^{}]*\}/g)].map(match => match[0]).join("\n");
+    document.head.append(handleStyles);
     frames = new Map(); frameId = 0;
     vi.stubGlobal("ResizeObserver", TestResizeObserver);
     vi.stubGlobal("CSS", { escape: (value: string) => value });
@@ -38,7 +50,7 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
   });
   afterEach(async () => {
     await act(async () => root.unmount());
-    container.remove();
+    container.remove(); handleStyles.remove();
     window.history.replaceState(null, "", "/");
     delete window.__CHEMDRAFT_AGENT__;
     vi.restoreAllMocks(); vi.unstubAllGlobals();
@@ -57,9 +69,9 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
   const status = () => container.querySelector("[data-status-message]")?.textContent;
   const highlighted = () => container.querySelector("[data-delete-hover-atom-id]")?.getAttribute("data-delete-hover-atom-id");
   const page = () => container.querySelector(".page")!;
-  function pointer(target: EventTarget, type: string, point: { x: number; y: number }) {
+  function pointer(target: EventTarget, type: string, point: { x: number; y: number }, altKey = false) {
     const event = new MouseEvent(type, { bubbles: true, cancelable: true, button: 0,
-      buttons: type === "pointerup" ? 0 : 1, clientX: point.x, clientY: point.y });
+      buttons: type === "pointerup" ? 0 : 1, clientX: point.x, clientY: point.y, altKey });
     Object.defineProperties(event, { pointerId: { value: 1 }, isPrimary: { value: true }, pointerType: { value: "mouse" } });
     target.dispatchEvent(event);
   }
@@ -85,6 +97,345 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
     const molecule = dropMolecule(snapshot());
     return molecule.atoms.map(atom => atomDisplayLabel(atom, molecule.bonds, undefined, molecule.atoms));
   }
+
+  describe("lone-pair placement with real DOM pointer events", () => {
+    beforeAll(() => {
+      // jsdom rewrites import.meta.url to HTTP; load the real vendored WASM by filesystem path.
+      const glue = resolve("packages/rdkit-adapter/vendor/RDKit_minimal.js");
+      const factory = new Function("require", "__dirname", `${readFileSync(glue, "utf8")}\n;return initRDKitModule;`)(
+        createRequire(glue), resolve("packages/rdkit-adapter/vendor"));
+      setRdkitModuleLoader(() => factory({ wasmBinary: new Uint8Array(readFileSync(resolve("packages/rdkit-adapter/vendor/RDKit_minimal.wasm"))) }));
+    });
+    afterAll(() => resetRdkitForTesting());
+    const pairs = () => snapshot().pages[0].objects.filter((object): object is ElectronMarkObject =>
+      object.type === "electron-mark" && object.markKind === "lone-pair");
+    async function pressAtom(route: "object" | "page" = "object", offset = { x: 0, y: 0 }) {
+      const fixture = electronMarkDropFixture({ kind: "lone-pair" });
+      const withoutMark = applyPatch(fixture.document,
+        { op: "removeObject", objectId: dropMark(fixture.document).id }, { now: phase4Timestamp });
+      const initial = workflow.normalizeCommittedDocument({ ...withoutMark, pages: withoutMark.pages.map(page => ({
+        ...page, objects: page.objects.map(object => object.type === "molecule" ? { ...object,
+          x: object.x + offset.x, y: object.y + offset.y,
+          atoms: object.atoms.map(atom => ({ ...atom, x: atom.x + offset.x, y: atom.y + offset.y }))
+        } : object)
+      })) });
+      await mount(initial);
+      await command("tool.lonePair");
+      const atom = { ...fixture.carbonylOxygen, x: fixture.carbonylOxygen.x + offset.x,
+        y: fixture.carbonylOxygen.y + offset.y };
+      // The page route covers bare vertices whose hover resolves the atom before the press.
+      await act(async () => pointer(page(), "pointermove", atom));
+      const target = route === "page" ? page() : container.querySelector(`[data-hit-target="atom"][data-atom-id="${atom.id}"]`)!;
+      expect(target).not.toBeNull();
+      const before = snapshot();
+      await act(async () => pointer(target, "pointerdown", { x: atom.x + 1, y: atom.y }));
+      expect(snapshot()).toEqual(before);
+      expect(pairs()).toHaveLength(0);
+      const end = (degrees: number) => ({ x: atom.x + 55 * Math.cos(degrees * Math.PI / 180),
+        y: atom.y + 55 * Math.sin(degrees * Math.PI / 180) });
+      return { before, target, atom, end };
+    }
+    async function assertSingleUndo(before: ChemDraftDocument, after: ChemDraftDocument) {
+      await command("edit.undo");
+      expect(status()).toBe("Undid Add Lone Pair");
+      expect(snapshot()).toEqual(before);
+      await command("edit.undo");
+      expect(snapshot()).toEqual(before); // No preview or duplicate release created another entry.
+      await command("edit.redo");
+      expect(status()).toBe("Redid Add Lone Pair");
+      expect(snapshot()).toEqual(after);
+    }
+    it.each(["object", "page"] as const)("auto-places a click through the %s route, only on release", async route => {
+      const { before, target, atom } = await pressAtom(route);
+      await act(async () => pointer(target, "pointermove", { x: atom.x + 2, y: atom.y }));
+      expect(snapshot()).toEqual(before); // Sub-threshold movement remains a click.
+      await act(async () => pointer(target, "pointerup", atom));
+      expect(pairs()).toHaveLength(1);
+      const molecule = dropMolecule(before), pageBefore = before.pages[0];
+      const expected = lonePairPlacementPlanForAtom(molecule, atom.id, pageBefore.objects, pageBefore.width, pageBefore.height)!;
+      expect(workflow.nativeChargeMarkCenter(pairs()[0])).toEqual(expected.center);
+      expect(pairs()[0].rotation).toBe(expected.rotation);
+      await assertSingleUndo(before, snapshot());
+    });
+    it("explains when a click has no gap that fits inside the page", async () => {
+      const { before, target, atom } = await pressAtom("object", { x: 0, y: -226 });
+      await act(async () => pointer(target, "pointerup", atom));
+      expect(status()).toBe("Cannot place a lone pair on this atom: there is no room inside the page.");
+      expect(snapshot()).toEqual(before);
+      expect(pairs()).toHaveLength(0);
+      await command("edit.undo");
+      expect(snapshot()).toEqual(before);
+    });
+    it("refuses an off-page drag without substituting an automatic direction and explains how to fix it", async () => {
+      const fixture = electronMarkDropFixture({ kind: "lone-pair" });
+      const { before, target, end } = await pressAtom("object", {
+        x: fixture.document.pages[0].width - 12 - fixture.carbonylOxygen.x, y: 0
+      });
+      const molecule = dropMolecule(before), pageBefore = before.pages[0];
+      expect(lonePairPlacementPlanForAtom(molecule, molecule.atoms[10].id, pageBefore.objects,
+        pageBefore.width, pageBefore.height)).toBeDefined();
+      await act(async () => pointer(target, "pointermove", end(0)));
+      expect(pairs()).toHaveLength(0);
+      await act(async () => pointer(target, "pointerup", end(0)));
+      expect(status()).toBe("Cannot place the lone pair there: it would fall outside the page. Drag toward the page.");
+      expect(snapshot()).toEqual(before);
+      await command("edit.undo");
+      expect(snapshot()).toEqual(before);
+    });
+    it.each([false, true])("previews a 100° drag (Alt %s), commits once and preserves chemistry", async altKey => {
+      const { before, target, atom, end } = await pressAtom();
+      const moleculeBefore = dropMolecule(before);
+      const module = await ensureRdkit();
+      const identity = inspectStructureInWorker(module, stereoPerceptionMolfile(moleculeBefore));
+      expect(identity.valid).toBe(true);
+      if (!identity.valid) throw new Error(identity.reason);
+      expect(identity.canonicalSmiles).not.toBe("");
+      await act(async () => pointer(target, "pointermove", end(100), altKey));
+      expect(pairs()).toHaveLength(1);
+      const preview = pairs()[0];
+      expect(preview.rotation).toBeCloseTo((altKey ? 100 : 105) + 90, 8);
+      const previewCenter = workflow.nativeChargeMarkCenter(preview);
+      expect(Math.atan2(previewCenter.y - atom.y, previewCenter.x - atom.x) * 180 / Math.PI).toBeCloseTo(altKey ? 100 : 105, 8);
+      const rendered = container.querySelector(`[data-page-svg-object-visual="${preview.id}"]`);
+      expect(rendered).not.toBeNull();
+      expect(rendered!.querySelectorAll("circle")).toHaveLength(2);
+      await act(async () => pointer(target, "pointerup", end(100), altKey));
+      const after = snapshot();
+      expect(pairs()).toEqual([preview]);
+      expect(dropMolecule(after)).toEqual(moleculeBefore);
+      expect(dropMolecule(after).atoms).toHaveLength(moleculeBefore.atoms.length);
+      expect(dropMolecule(after).bonds).toHaveLength(moleculeBefore.bonds.length);
+      expect(inspectStructureInWorker(module, stereoPerceptionMolfile(dropMolecule(after)))).toEqual(identity);
+      await act(async () => pointer(target, "pointerup", end(100), altKey));
+      expect(snapshot()).toEqual(after);
+      await assertSingleUndo(before, after);
+    });
+    it("uses the release point and its Alt state after multiple preview frames", async () => {
+      const { before, target, end } = await pressAtom();
+      for (const degrees of [30, 65, 100]) {
+        await act(async () => pointer(target, "pointermove", end(degrees)));
+        expect(pairs()).toHaveLength(1);
+      }
+      await act(async () => pointer(page(), "pointerup", end(110), true));
+      expect(pairs()[0].rotation).toBeCloseTo(200, 8);
+      await assertSingleUndo(before, snapshot());
+    });
+    it.each(["Escape", "object cancel", "page cancel", "lost capture"])("cancels on %s with no document change or undo entry", async cancel => {
+      const { before, target, end } = await pressAtom();
+      await act(async () => pointer(target, "pointermove", end(100)));
+      const previewId = pairs()[0].id;
+      await act(async () => {
+        if (cancel === "Escape") window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+        else pointer(cancel === "page cancel" ? page() : target,
+          cancel === "lost capture" ? "lostpointercapture" : "pointercancel", end(100));
+      });
+      expect(snapshot()).toEqual(before);
+      expect(pairs()).toHaveLength(0);
+      expect(container.querySelector(`[data-page-svg-object-visual="${previewId}"]`)).toBeNull();
+      await act(async () => pointer(target, "pointerup", end(100)));
+      expect(snapshot()).toEqual(before);
+      await command("edit.undo");
+      expect(snapshot()).toEqual(before);
+      await command("edit.redo");
+      expect(snapshot()).toEqual(before);
+    });
+  });
+
+  async function selectedMark(zoom: number, rotation: number, size = 18) {
+    let initial = electronMarkDropFixture().document;
+    const mark = dropMark(initial);
+    initial = applyPatch(initial, { op: "updateObject", objectId: mark.id,
+      changes: { x: 450, y: 350, width: size, height: size, rotation, chargeStyle: "circled" } }, { now: phase4Timestamp });
+    initial = workflow.selectDocumentObjects(initial, initial.pages[0].id, [mark.id]);
+    await mount(initial);
+    if (zoom !== 1) await act(async () => {
+      container.querySelector(".canvas-region")!.dispatchEvent(new WheelEvent("wheel", {
+        bubbles: true, cancelable: true, ctrlKey: true, deltaY: -Math.log(zoom) / 0.002
+      }));
+    });
+    expect((window.__CHEMDRAFT_AGENT__!.snapshot().viewport as { scale: number }).scale).toBeCloseTo(zoom);
+    return snapshot();
+  }
+  function handleBoxes(zoom: number) {
+    const mark = dropMark(snapshot());
+    const frame = container.querySelector<HTMLElement>(`[data-object-controls="${mark.id}"] [data-art-transform-frame]`);
+    if (!frame) return [];
+    const value = (key: string, fallback: number) => {
+      const number = /calc\(([-\d.]+)px/.exec(frame.style.getPropertyValue(key));
+      return (number ? Number(number[1]) : fallback) * zoom;
+    };
+    const left = mark.x * zoom + value("left", 0), top = mark.y * zoom + value("top", 0);
+    const width = value("width", mark.width), height = value("height", mark.height);
+    return [...frame.querySelectorAll<HTMLButtonElement>("[data-object-resize-corner]")].map(handle => {
+      const css = getComputedStyle(handle), w = Number.parseFloat(css.width), h = Number.parseFloat(css.height);
+      const corner = handle.dataset.objectResizeCorner!;
+      const x = left + (corner.endsWith("left") ? Number.parseFloat(css.left) : width - Number.parseFloat(css.right) - w);
+      const y = top + (corner.startsWith("top") ? Number.parseFloat(css.top) : height - Number.parseFloat(css.bottom) - h);
+      expect([x, y, w, h].every(Number.isFinite)).toBe(true);
+      return { handle, x, y, width: w, height: h, frame: { x: left, y: top, width, height } };
+    });
+  }
+  function resizeHandleAt(point: { x: number; y: number }, zoom: number) {
+    // Resolve HTML corner hit boxes using production offsets. Dispatching straight to the
+    // SVG would bypass the bug: jsdom does not implement elementFromPoint/layout.
+    return handleBoxes(zoom).reverse().find(box => point.x >= box.x && point.x <= box.x + box.width &&
+      point.y >= box.y && point.y <= box.y + box.height)?.handle;
+  }
+  function targetAt(point: { x: number; y: number }, zoom: number) {
+    const mark = dropMark(snapshot());
+    // The canvas grab target stays available with either direct-editing setting.
+    return resizeHandleAt(point, zoom) ?? container.querySelector(`[data-electron-mark-hit-target="${mark.id}"]`) ??
+      container.querySelector(`[data-page-svg-object-visual="${mark.id}"] line:last-child`)!;
+  }
+  async function exactUndoRedo(before: ChemDraftDocument, after: ChemDraftDocument, label: string) {
+    await command("edit.undo"); expect(status()).toBe(`Undid ${label}`); expect(snapshot()).toEqual(before);
+    // A second Undo must have nothing else to undo: the gesture committed exactly once.
+    await command("edit.undo"); expect(snapshot()).toEqual(before);
+    await command("edit.redo"); expect(snapshot()).toEqual(after);
+  }
+
+  const markViews = [0.5, 1, 2].flatMap(zoom => [0, 37].map(rotation => ({ zoom, rotation })));
+  it.each(markViews)("moves a selected mark from its center at zoom $zoom, rotation $rotation in one undo step", async ({ zoom, rotation }) => {
+    const before = await selectedMark(zoom, rotation), mark = dropMark(before);
+    const center = { x: (mark.x + mark.width / 2) * zoom, y: (mark.y + mark.height / 2) * zoom };
+    const end = { x: center.x + 40 * zoom, y: center.y + 30 * zoom };
+    const target = targetAt(center, zoom);
+    expect(target).toBe(container.querySelector(`[data-electron-mark-hit-target="${mark.id}"]`));
+    expect(target.tagName).toBe("rect");
+    expect(Number(target.getAttribute("x")) + Number(target.getAttribute("width")) / 2).toBeCloseTo(center.x / zoom);
+    expect(Number(target.getAttribute("y")) + Number(target.getAttribute("height")) / 2).toBeCloseTo(center.y / zoom);
+    await act(async () => pointer(target, "pointerdown", center));
+    await move(page(), end);
+    await act(async () => pointer(page(), "pointerup", end));
+    const after = snapshot(), moved = dropMark(after);
+    expect(moved).toMatchObject({ x: mark.x + 40, y: mark.y + 30,
+      width: mark.width, height: mark.height, rotation: mark.rotation });
+    expect(status()).toBe("Moved electron mark");
+    expect(dropMolecule(after)).toEqual(dropMolecule(before));
+    expect(container.querySelectorAll(".object-resize-compact")).toHaveLength(enabled ? 1 : 0);
+    expect(container.querySelectorAll("[data-object-resize-corner]")).toHaveLength(enabled ? 4 : 0);
+    await exactUndoRedo(before, after, "Move electron mark");
+  });
+
+  const cornerViews = markViews.flatMap(view => ["top-left", "top-right", "bottom-left", "bottom-right"]
+    .map(corner => ({ ...view, corner })));
+  it.runIf(enabled).each(cornerViews)("resizes a selected mark from $corner at zoom $zoom, rotation $rotation in one undo step", async ({ zoom, rotation, corner }) => {
+    const before = await selectedMark(zoom, rotation), mark = dropMark(before);
+    const box = handleBoxes(zoom).find(box => box.handle.dataset.objectResizeCorner === corner)!;
+    // Review P2-a/P2-b: 18px at -15px -> 11px at -8px preserves the 3px
+    // overlap while restoring the ordinary reach beside atoms and page edges.
+    expect(box).toMatchObject({ width: 11, height: 11 });
+    const css = getComputedStyle(box.handle);
+    expect(corner.endsWith("left") ? css.left : css.right).toBe("-8px");
+    expect(corner.startsWith("top") ? css.top : css.bottom).toBe("-8px");
+    const point = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+    expect(targetAt(point, zoom)).toBe(box.handle);
+    const center = { x: (mark.x + mark.width / 2) * zoom, y: (mark.y + mark.height / 2) * zoom };
+    const end = { x: center.x + 1.5 * (point.x - center.x), y: center.y + 1.5 * (point.y - center.y) };
+    await act(async () => pointer(box.handle, "pointerdown", point));
+    await move(page(), end);
+    await act(async () => pointer(page(), "pointerup", end));
+    const after = snapshot();
+    expect(dropMark(after).width).toBeGreaterThan(mark.width);
+    expect(dropMark(after).height).toBeGreaterThan(mark.height);
+    expect(status()).toBe("Resized electron mark");
+    expect(dropMolecule(after)).toEqual(dropMolecule(before));
+    await exactUndoRedo(before, after, "Resize electron mark");
+  });
+
+  it.runIf(enabled).each(markViews)("leaves a press 12px outside the bottom-left corner clear of resize handles at zoom $zoom, rotation $rotation", async ({ zoom, rotation }) => {
+    const before = await selectedMark(zoom, rotation);
+    const boxes = handleBoxes(zoom);
+    expect(boxes).toHaveLength(4);
+    const { frame } = boxes[0];
+    const point = { x: frame.x - 12, y: frame.y + frame.height + 12 };
+    // An adjacent atom here was covered by the old -15px compact targets (P2-a).
+    expect(resizeHandleAt(point, zoom)).toBeUndefined();
+    await act(async () => pointer(page(), "pointerdown", point));
+    await act(async () => pointer(page(), "pointerup", point));
+    expect(dropMark(snapshot())).toEqual(dropMark(before));
+  });
+
+  it.runIf(enabled).each([
+    { size: 53, zoom: 1, rotation: 0, compact: true },
+    { size: 54, zoom: 1, rotation: 0, compact: false },
+    { size: 54, zoom: 0.5, rotation: 0, compact: true },
+    { size: 27, zoom: 2, rotation: 0, compact: false },
+    { size: 40, zoom: 1, rotation: 45, compact: false }
+  ])("uses screen frame size for compact handles: $size px, zoom $zoom, rotation $rotation", async ({ size, zoom, rotation, compact }) => {
+    await selectedMark(zoom, rotation, size);
+    expect(container.querySelectorAll(".object-resize-compact")).toHaveLength(compact ? 1 : 0);
+  });
+
+  it("keeps normal rectangle handle offsets unchanged", async () => {
+    const initial = workflow.createPhase4Document("Normal art handles");
+    initial.pages[0].objects = [{ id: "rectangle", type: "graphic", graphicKind: "rect", x: 100, y: 100,
+      width: 160, height: 120, rotation: 0, style: {}, data: {} }];
+    initial.selection.objectIds = ["rectangle"];
+    await mount(initial);
+    expect(container.querySelector(".object-resize-compact")).toBeNull();
+    const handles = [...container.querySelectorAll<HTMLElement>("[data-object-resize-corner]")];
+    expect(handles).toHaveLength(4);
+    for (const handle of handles) {
+      const css = getComputedStyle(handle), corner = handle.dataset.objectResizeCorner!;
+      expect(css.width).toBe("18px"); expect(css.height).toBe("18px");
+      expect(corner.endsWith("left") ? css.left : css.right).toBe("-8px");
+      expect(corner.startsWith("top") ? css.top : css.bottom).toBe("-8px");
+    }
+  });
+
+  it.each((["radical-dot", "lone-pair", "charge", "unknown"] as const).flatMap(markKind =>
+    (["atom", "bond"] as const).map(part => ({ markKind, part }))))(
+    "selects and drags a tiny $markKind beside a $part from blank grab space, yielding to the nearer part", async ({ markKind, part }) => {
+      const base = workflow.insertNativeSingleBondMolecule(workflow.createPhase4Document("Small mark target"), { x: 300, y: 300 });
+      const molecule = dropMolecule(base), [a, b] = molecule.atoms;
+      const partPoint = part === "atom" ? a : { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      const center = { x: partPoint.x, y: partPoint.y - 16 };
+      const mark: ElectronMarkObject = { id: "tiny-mark", type: "electron-mark", markKind,
+        x: center.x - 1, y: center.y - 1, width: 2, height: 2, rotation: 0, style: {},
+        ...(markKind === "charge" ? { charge: 1 } : {}),
+        anchor: { kind: "point", point: center }, atomAssociation: "explicit" };
+      const drawing = { ...base, pages: [{ ...base.pages[0], objects: [molecule, mark] }],
+        selection: { ...base.selection, objectIds: [] } };
+      await mount(drawing);
+      const beforeSvg = exportDocumentToSvg(snapshot()).contents;
+      const catcher = () => container.querySelector<SVGRectElement>(`[data-electron-mark-hit-target="${mark.id}"]`)!;
+      expect(catcher()).not.toBeNull();
+      expect(Number(catcher().getAttribute("width"))).toBe(36);
+      expect(Number(catcher().getAttribute("height"))).toBe(36);
+      // Beyond the previous 24px target and far from the painted dot, but nearer the mark.
+      const start = { x: center.x, y: center.y - 14 };
+      expect(start.y).toBeGreaterThan(Number(catcher().getAttribute("y")));
+      await act(async () => pointer(catcher(), "pointerdown", start));
+      await act(async () => pointer(catcher(), "pointerup", start));
+      expect(snapshot().selection.objectIds).toEqual([mark.id]);
+      expect(dropMark(snapshot())).toEqual(mark);
+      expect(exportDocumentToSvg(snapshot()).contents).toBe(beforeSvg);
+      const end = { x: start.x + 60, y: start.y - 40 };
+      await act(async () => pointer(catcher(), "pointerdown", start));
+      await move(catcher(), end);
+      await act(async () => pointer(catcher(), "pointerup", end));
+      expect(dropMark(snapshot())).toMatchObject({ x: mark.x + 60, y: mark.y - 40, width: 2, height: 2 });
+      expect(dropMolecule(snapshot())).toEqual(molecule);
+      await command("edit.undo");
+      expect(dropMark(snapshot())).toEqual(mark);
+      expect(exportDocumentToSvg(snapshot()).contents).toBe(beforeSvg);
+      // The enlarged catcher is above this part; send it the event as the browser would.
+      // Both a nearby point and the exact atom/bond must still select that molecule part.
+      let pressTime = Date.now();
+      const clock = vi.spyOn(Date, "now");
+      for (const point of [{ x: partPoint.x, y: partPoint.y - 4 }, partPoint]) {
+        clock.mockReturnValue(pressTime += 1000); // Independent clicks, not a double-click drill-in.
+        await act(async () => pointer(catcher(), "pointerdown", point));
+        await act(async () => pointer(moleculeTarget(), "pointerup", point));
+        expect(snapshot().selection.objectIds).not.toContain(mark.id);
+        expect(window.__CHEMDRAFT_AGENT__!.snapshot().selectedNativeMoleculePart).toMatchObject({
+          objectId: molecule.id, kind: part, ...(part === "atom" ? { atomId: a.id } : { bondId: molecule.bonds[0].id })
+        });
+        expect(dropMark(snapshot())).toEqual(mark);
+      }
+      function moleculeTarget() { return container.querySelector(`[data-object-id="${molecule.id}"]`)!; }
+    });
 
   it.each([
     ["tool.plus", "Add Charge"], ["tool.minus", "Add Charge"],
@@ -232,7 +583,7 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
     await act(async () => pointer(drag.target, "pointerup", end));
     expect(dropMark(snapshot()).anchor).toEqual(dropMark(before).anchor);
     expect(dropMolecule(snapshot())).toEqual(dropMolecule(before));
-    expect(status()).toBe("Charge repositioned on N; no atom within capture radius");
+    expect(status()).toBe("Charge repositioned on N (no other atom close enough to move it to)");
     await command("edit.undo"); expect(snapshot()).toEqual(before);
   });
 
@@ -261,13 +612,63 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
     await command("edit.redo"); expect(snapshot()).toEqual(after);
   });
 
+  it.each(["Select All", "selection click"])("keeps a deliberately floating drop neutral after %s", async action => {
+    const fixture = electronMarkDropFixture();
+    await mount(workflow.normalizeCommittedDocument(workflow.moveDocumentObject(fixture.document,
+      dropMark(fixture.document).id, { x: 591, y: 491 })));
+    const drag = await start();
+    const point = { x: fixture.carbonylOxygen.x, y: fixture.carbonylOxygen.y - 20 };
+    await move(drag.target, point);
+    expect(highlighted()).toBeUndefined();
+    await act(async () => pointer(drag.target, "pointerup", point));
+    expect(status()).toBe("Moved electron mark");
+    const after = snapshot(), mark = dropMark(after), molecule = dropMolecule(after);
+    expect(mark.anchor.kind).toBe("point");
+    expect(molecule.atoms[10].formalCharge).toBe(0);
+    if (action === "Select All") {
+      await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "a", bubbles: true, metaKey: platform === "macos", ctrlKey: platform === "windows"
+      })));
+      expect(status()).toBe("Selected 2 canvas objects");
+    } else {
+      await act(async () => pointer(page(), "pointerdown", { x: 650, y: 500 }));
+      await act(async () => pointer(page(), "pointerup", { x: 650, y: 500 }));
+    }
+    expect(snapshot().selection).not.toEqual(after.selection);
+    expect(dropMolecule(snapshot()).atoms[10].formalCharge).toBe(0);
+    expect(dropMolecule(snapshot())).toEqual(molecule);
+    expect(dropMark(snapshot())).toEqual(mark);
+  });
+
+  it.each([0, 180])("previews and commits the rendered O target in a molecule rotated %s degrees", async rotation => {
+    await mount(rotatedElectronMarkDropFixture(rotation));
+    const molecule = dropMolecule(snapshot()), oxygen = molecule.atoms[0], nitrogen = molecule.atoms[3];
+    const point = { x: rotation === 180 ? 200 : 100, y: 110 };
+    const drag = await start(), before = snapshot();
+    await move(drag.target, point);
+    expect(snapshot()).toBe(before);
+    expect(highlighted()).toBe(oxygen.id);
+    await act(async () => pointer(drag.target, "pointerup", point));
+    expect(dropMark(snapshot()).anchor.atomId).toBe(oxygen.id);
+    expect(dropMolecule(snapshot()).atoms.find(atom => atom.id === oxygen.id)?.formalCharge).toBe(1);
+    expect(dropMolecule(snapshot()).atoms.find(atom => atom.id === nitrogen.id)?.formalCharge).toBe(0);
+    const center = workflow.nativeChargeMarkCenter(dropMark(snapshot()));
+    const renderedOxygen = transformPointForObject(molecule, oxygen);
+    const renderedNitrogen = transformPointForObject(molecule, nitrogen);
+    const oxygenDistance = Math.hypot(center.x - renderedOxygen.x, center.y - renderedOxygen.y);
+    // Match the unit regression's bound, based on the unrotated placement distance.
+    expect(oxygenDistance).toBeLessThanOrEqual(documentDrawingDefaults(snapshot()).bondLengthPx * 1.5);
+    expect(Math.hypot(center.x - renderedNitrogen.x, center.y - renderedNitrogen.y)).toBeGreaterThan(oxygenDistance);
+    expect(status()).toBe("Charge attached to O (O now H2O)");
+  });
+
   it.each([1, -1] as const)("keeps the radical on its atom after dropping and neutralising a radical ion with charge %s", async charge => {
     const fixture = electronMarkDropFixture({ kind: "charge", charge, radical: true });
     await mount(fixture.document);
     const drag = await start(), end = { x: 600, y: 500 };
     await move(drag.target, end);
     await act(async () => pointer(drag.target, "pointerup", end));
-    expect(status()).toContain("no atom within capture radius");
+    expect(status()).toContain("no other atom close enough to move it to");
     const distant = snapshot(), original = dropMark(distant);
     await act(async () => pointer(page(), "pointermove", fixture.sourceAtom));
     await command(charge > 0 ? "tool.minus" : "tool.plus");

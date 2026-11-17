@@ -907,7 +907,7 @@ describe("CDXML-compatible ChemDraft envelope", () => {
       text: "H2O",
       spans: [
         { text: "H", script: "normal", style: {} },
-        { text: "2", script: "subscript", style: { fontWeight: 700 } },
+        { text: "2", script: "subscript", style: { fontWeight: 700, fontSizePx: 18 } },
         { text: "O", script: "normal", style: {} }
       ]
     }, {
@@ -919,8 +919,9 @@ describe("CDXML-compatible ChemDraft envelope", () => {
       spans: []
     }]);
     const result = exportDocumentToCdxml(document);
-    expect(result.warnings.filter(item => item.code === "cdxml.text_format_native_only")
-      .map(item => item.sourceObjectId)).toEqual(["styled_text", "bold_box"]);
+    const formattingWarnings = result.warnings.filter(item => item.code === "cdxml.text_format_native_only");
+    expect(formattingWarnings.map(item => item.sourceObjectId)).toEqual(["styled_text", "bold_box"]);
+    expect(formattingWarnings[1]!.message).toContain("but not formatting applied to the whole text box (font, size, bold, italic, alignment, spacing)");
   });
 
   it("exports text, plus signs, reaction arrows and native reaction steps", () => {
@@ -995,9 +996,9 @@ describe("CDXML-compatible ChemDraft envelope", () => {
     expect(result.contents).toContain("<t ");
     expect(result.contents).toContain(">A + B</t>");
     expect(result.contents).toContain(">+</t>");
-    expect(result.contents).toContain('<graphic id="');
-    expect(result.contents).toContain('GraphicType="Line"');
-    expect(result.contents).toContain('ArrowType="FullHead"');
+    expect(result.contents).toContain('<arrow id="');
+    expect(result.contents).toContain('<arrow ');
+    expect(result.contents).toContain('ArrowheadHead="Full"');
     expect(result.contents).toContain("<scheme ");
     expect(result.contents).toContain("<step ");
     expect(result.warnings.map((item) => item.code)).toEqual([
@@ -1036,11 +1037,12 @@ describe("CDXML-compatible ChemDraft envelope", () => {
 
     expect(result.contents).toContain('<graphic id="');
     expect(result.contents).toContain('GraphicType="Rectangle"');
-    expect(result.contents).toContain('RectangleType="RoundEdge Shadow"');
+    expect(result.contents).toContain('RectangleType="RoundEdge Shadow Dashed"');
     expect(result.contents).toContain('CornerRadius="525"');
     expect(result.warnings.map((item) => item.code)).toEqual([
       "cdxml.graphic_gloss_payload_only",
-      "cdxml.graphic_tilt_payload_only"
+      "cdxml.graphic_tilt_payload_only",
+      "cdxml.graphic_single_color"
     ]);
     expect(openChemDraftPayload(result.contents).document?.pages[0].objects[0]).toMatchObject({
       type: "graphic",
@@ -1375,7 +1377,7 @@ describe("CDXML-compatible ChemDraft envelope", () => {
     document.pages[0].objects.push(wavyArrow);
 
     const exported = exportDocumentToCdxml(document, { creationProgram: "Wavy Arrow Round Trip" });
-    expect(exported.contents).toContain('ArrowType="FullHead"');
+    expect(exported.contents).toContain('ArrowheadHead="Full"');
     expect(exported.contents).toContain('LineType="Wavy"');
 
     // Reopen as a foreign file, so the VISIBLE CDXML is what gets read. The embedded native payload
@@ -2137,10 +2139,10 @@ describe("CDXML-compatible ChemDraft envelope", () => {
 
     // And it must not be re-emitted as a full-headed reaction arrow.
     const exported = exportDocumentToCdxml(opened.document!);
-    expect(exported.contents).not.toContain('ArrowType="FullHead"');
+    expect(exported.contents).not.toContain('ArrowheadHead="Full"');
   });
 
-  it("round-trips a half-headed arrow back out as ArrowType=\"HalfHead\"", () => {
+  it("round-trips a half-headed arrow as an Arrow with HalfLeft head", () => {
     // Importing honestly is only half the job: exporting the fishhook as a plain line still loses
     // the arrow's chemical identity, so a ChemDraw file opened and re-saved came back as a
     // decorative stroke. HalfHead is a real CDXML spelling and the fishhook is exactly what it
@@ -2155,13 +2157,12 @@ describe("CDXML-compatible ChemDraft envelope", () => {
     const opened = openChemDraftPayload(source);
     const exported = exportDocumentToCdxml(opened.document!);
 
-    // The visible layer must say HalfHead — not FullHead (wrong chemistry) and not a bare line
-    // (no chemistry). Check the visible <graphic>, since the embedded payload is JSON.
+    // The visible Arrow's HalfLeft head preserves the fishhook's single-barb chemistry.
     const visibleGraphic = exported.contents
       .split("\n")
-      .find((line) => line.includes("<graphic ") && line.includes("GraphicType=\"Line\""));
+      .find((line) => line.includes("<arrow "));
     expect(visibleGraphic).toBeDefined();
-    expect(visibleGraphic).toContain('ArrowType="HalfHead"');
+    expect(visibleGraphic).toContain('ArrowheadHead="HalfLeft"');
 
     // Reopening the export must land on the same fishhook, not drift a second time.
     const reopened = openChemDraftPayload(exported.contents);
@@ -2392,7 +2393,7 @@ describe("CDXML-compatible ChemDraft envelope", () => {
       .not.toContain("cdxml.graphic_marker_payload_only");
   });
 
-  it("keeps colour, dash, and head-loss warnings on semantic arrow export", () => {
+  it("keeps colour, dash, and actual heads on semantic Arrow export", () => {
     const arrow = (style: GraphicObject["style"], data: GraphicObject["data"]): ChemDraftDocument =>
       documentWithObjects([
         {
@@ -2411,14 +2412,15 @@ describe("CDXML-compatible ChemDraft envelope", () => {
       { creationProgram: "T" }
     );
     expect(dashed.contents).toContain('LineType="Dashed"');
-    expect(dashed.contents).toMatch(/<graphic[^>]*ArrowType="FullHead"[^>]*color="/);
+    expect(dashed.contents).toMatch(/<arrow[^>]*color="[^>]*ArrowheadHead="Full"/);
 
-    // A removed head cannot be said in standard CDXML — that must warn rather than export a lie.
+    // A real Arrow can state a removed head without substituting the default full head.
     const headless = exportDocumentToCdxml(
       arrow({ strokeColor: "#000000", strokeWidth: 2 }, {}),
       { creationProgram: "T" }
     );
-    expect(headless.warnings.map((warning) => warning.code)).toContain("cdxml.arrow_head_payload_only");
+    expect(headless.warnings).toEqual([]);
+    expect(headless.contents).not.toContain("ArrowheadHead=");
 
     // The ordinary case still exports clean.
     const plain = exportDocumentToCdxml(
@@ -2428,7 +2430,7 @@ describe("CDXML-compatible ChemDraft envelope", () => {
     expect(plain.warnings.map((warning) => warning.code)).not.toContain("cdxml.arrow_head_payload_only");
   });
 
-  it("writes real CDXML ArrowType spellings and reads foreign and legacy ones", () => {
+  it("writes directed CDXML Arrow heads and reads foreign and legacy ArrowType spellings", () => {
     // The previous test asserted our own lowercase output against our own reader, so it passed
     // while real CDXML imported as "unknown". Assert the wire spellings directly.
     const arrowAt = (arrowKind: ArrowObject["arrowKind"]) => documentWithObjects([
@@ -2444,13 +2446,13 @@ describe("CDXML-compatible ChemDraft envelope", () => {
     ]);
 
     expect(exportDocumentToCdxml(arrowAt("forward"), { creationProgram: "T" }).contents)
-      .toContain('ArrowType="FullHead"');
+      .toContain('ArrowheadHead="Full"');
     expect(exportDocumentToCdxml(arrowAt("resonance"), { creationProgram: "T" }).contents)
-      .toContain('ArrowType="Resonance"');
+      .toContain('ArrowheadHead="Full" ArrowheadTail="Full"');
     expect(exportDocumentToCdxml(arrowAt("equilibrium"), { creationProgram: "T" }).contents)
-      .toContain('ArrowType="Equilibrium"');
+      .toContain('ArrowheadHead="HalfLeft" ArrowheadTail="HalfLeft" ArrowheadType="Solid" ArrowShaftSpacing="300"');
     expect(exportDocumentToCdxml(arrowAt("retrosynthesis"), { creationProgram: "T" }).contents)
-      .toContain('ArrowType="RetroSynthetic"');
+      .toContain('ArrowheadHead="Full" ArrowheadType="Angle" ArrowShaftSpacing="600"');
 
     // Foreign CDXML — the spellings another program writes. `bactvue-visible-subset` is a real
     // third-party fixture already carrying ArrowType="FullHead"; substituting into it keeps the
@@ -2522,20 +2524,19 @@ describe("CDXML-compatible ChemDraft envelope", () => {
       }
     });
 
-    // A reaction/resonance art arrow (rich editable object) emits the STANDARD reaction-arrow CDXML so
-    // other programs read it as a reaction arrow — not as a generic <graphic>/<arrow>.
+    // Reaction/resonance art arrows emit standard Arrow elements with per-end heads.
     const reactionCdxml = exportDocumentToCdxml(
       documentWithObjects([artArrow("reactionArrow", false)]),
       { creationProgram: "T" }
     ).contents;
-    expect(reactionCdxml).toContain('GraphicType="Line"');
-    expect(reactionCdxml).toContain('ArrowType="FullHead"');
+    expect(reactionCdxml).toContain('<arrow ');
+    expect(reactionCdxml).toContain('ArrowheadHead="Full"');
 
     const resonanceCdxml = exportDocumentToCdxml(
       documentWithObjects([artArrow("resonanceArrow", true)]),
       { creationProgram: "T" }
     ).contents;
-    expect(resonanceCdxml).toContain('ArrowType="Resonance"');
+    expect(resonanceCdxml).toContain('ArrowheadHead="Full" ArrowheadTail="Full"');
   });
 
   it("exports the preconfigured bold/dashed reaction arrow variants as forward reaction arrows", () => {
@@ -2563,12 +2564,11 @@ describe("CDXML-compatible ChemDraft envelope", () => {
         documentWithObjects([variantArrow(artToolId, artToolId === "reactionArrowBold" ? 24 : 16)]),
         { creationProgram: "T" }
       ).contents;
-      expect(cdxml).toContain('GraphicType="Line"');
-      expect(cdxml).toContain('ArrowType="FullHead"');
+      expect(cdxml).toContain('<arrow ');
+      expect(cdxml).toContain('ArrowheadHead="Full"');
     }
 
-    // A fishhook DOES have a standard spelling — HalfHead — and it is different chemistry from
-    // FullHead, so it must be named rather than flattened to a generic graphic.
+    // A fishhook uses the standard per-end HalfLeft head, retaining its one-electron meaning.
     const fishhookCdxml = exportDocumentToCdxml(
       documentWithObjects([{
         ...variantArrow("fishhookArrow", 16),
@@ -2579,8 +2579,8 @@ describe("CDXML-compatible ChemDraft envelope", () => {
       }]),
       { creationProgram: "T" }
     ).contents;
-    expect(fishhookCdxml).toContain('ArrowType="HalfHead"');
-    expect(fishhookCdxml).not.toContain('ArrowType="FullHead"');
+    expect(fishhookCdxml).toContain('ArrowheadHead="HalfLeft"');
+    expect(fishhookCdxml).not.toContain('ArrowheadHead="Full"');
 
     // A no-reaction arrow really has no CDXML equivalent — its crossed shaft is not in the
     // ArrowType enum at all — so it stays a generic graphic and round-trips via the payload.
@@ -2618,7 +2618,7 @@ describe("CDXML-compatible ChemDraft envelope", () => {
     ]);
     const exported = exportDocumentToCdxml(document, { creationProgram: "Resonance Arrow Test" });
 
-    expect(exported.contents).toContain('ArrowType="Resonance"');
+    expect(exported.contents).toContain('ArrowheadHead="Full" ArrowheadTail="Full"');
     const reopened = openChemDraftPayload(exported.contents);
     const arrow = reopened.document?.pages[0].objects.find(
       (object): object is ArrowObject => object.type === "reaction-arrow"
@@ -2710,7 +2710,7 @@ describe("visible CDXML colours", () => {
     expect(xml).toMatch(/<t\b[^>]*color="12"/);
     expect(xml).toContain('<s color="10">H</s>');
     expect(xml).toContain('<s color="4">2O</s>');
-    expect(xml).toMatch(/<graphic\b[^>]*color="11"/);
+    expect(xml).toMatch(/<arrow\b[^>]*color="11"/);
     expect(xml).toMatch(/<graphic\b[^>]*color="13"/);
     expect(visible(document)).toBe(xml);
   });

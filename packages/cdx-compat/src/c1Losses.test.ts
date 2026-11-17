@@ -333,8 +333,9 @@ describe.each(["CDXML", "CDX"] as const)("C1 remaining losses in %s", format => 
       if (cycle === 3) break;
       const exported = output(document);
       const step = all(exported, "step")[0];
-      const target = all(exported, "graphic").find(o => o.attrs.id === step.attrs.ReactionStepArrows)!;
-      expect(target?.attrs).toMatchObject({ GraphicType: "Line", ArrowType: "FullHead" });
+      // Step references now resolve to a real Arrow, rather than a legacy arrowed Graphic line.
+      const target = all(exported, "arrow").find(o => o.attrs.id === step.attrs.ReactionStepArrows)!;
+      expect(target?.attrs).toMatchObject({ ArrowheadHead: "Full", ArrowheadType: "Solid" });
       expect(target?.attrs.LineType).toBe(lineType);
       imported = roundTrip(document);
     }

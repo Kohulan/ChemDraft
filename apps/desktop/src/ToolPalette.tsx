@@ -1,4 +1,7 @@
 import { paletteFocusDiagnostic } from "./paletteFocusDiagnostic";
+import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
+import { detectDesktopShortcutPlatform } from "./keyboardShortcuts";
+import { preventPaletteCommandPointerFocus } from "./paletteCommandPointerFocus";
 import { waveSettingRanges, type WaveSetting } from "@chemdraft/art-engine";
 import { isBlockedByModalDialog } from "@chemdraft/shortcut-engine";
 import {
@@ -144,8 +147,8 @@ import {
   textScriptCommands,
   textSizeCommands
 } from "./commands";
-import { Icon } from "./icons";
-import { getDrawingToolDefinition } from "./drawingTools";
+import { Icon, ToolbarAssetIcon } from "./icons";
+import { getDrawingToolDefinition, isDrawingToolCommand } from "./drawingTools";
 import { toolbarAsset } from "./toolbarAssets";
 import {
   commandShortcutDisplay,
@@ -154,7 +157,7 @@ import {
 } from "./toolsets";
 import type { ArtInspectorEffectKind } from "./artInspectorModel";
 import { loadSystemFonts, type SystemFontFamily, type SystemFontFace } from "./systemFonts";
-import { listenForPaletteCommandCancels, type ToolsetArtPaintTarget, type ToolsetFlyoutSnapshot } from "./window-manager";
+import { isDesktopRuntime, listenForPaletteCommandCancels, type ToolsetArtPaintTarget, type ToolsetFlyoutSnapshot } from "./window-manager";
 import { registerInlinePopover } from "./window-manager/popoverEscape";
 
 export type ToolPaletteMode = "docked" | "floating";
@@ -182,7 +185,7 @@ export type ToolbarFlyoutRequest = {
 
 const GRADIENT_STOP_DIRECT_DRAG_GAP = 0.01;
 /** A deliberate hold opens a toolbar flyout; a normal click always selects its primary tool. */
-export const TOOLBAR_FLYOUT_HOLD_MS = 400;
+export const TOOLBAR_FLYOUT_HOLD_MS = 200;
 
 const ART_SHAPE_COMMAND_IDS = [
   "tool.art.rect",
@@ -241,7 +244,8 @@ export function ToolPalette({
   onRequestFlyout,
   onInvoke,
   widgetState,
-  customize
+  customize,
+  platform = detectDesktopShortcutPlatform()
 }: {
   groups?: CommandSpec[][];
   itemGroups?: ToolbarPaletteItemModel[][];
@@ -256,6 +260,7 @@ export function ToolPalette({
   /** Live state + callbacks for the widget sections (style controls, inspectors), provided via
    *  context to the widgets declared as manifest `control` items. */
   widgetState?: ToolbarWidgetState;
+  platform?: ShortcutPlatform;
   /** When set, render in-place customize mode: each grid item becomes a dnd-kit sortable slot (no
    *  invoke/flyout/tooltip handlers), grouped by these group ids (aligned with the item groups,
    *  BEFORE the widget filter). A DndContext must wrap this component (ToolbarCustomizeController). */
@@ -285,6 +290,7 @@ export function ToolPalette({
       onTooltipLeave={(options) => clearTooltip(tooltipId, options)}
       onRequestFlyout={onRequestFlyout}
       onInvoke={onInvoke}
+      allowNativeNoActivateCommands={!customize}
     />
   );
 
@@ -399,6 +405,8 @@ export function ToolPalette({
         aria-label={title}
         data-tool-palette-orientation={orientation}
         data-tooltip-delay-ms={TOOLTIP_DELAY_MS}
+        onPointerDownCapture={event => { if (!customize) preventPaletteCommandPointerFocus(event, platform); }}
+        onMouseDownCapture={event => { if (!customize) preventPaletteCommandPointerFocus(event, platform); }}
       >
         {mode === "floating" && !customize ? (
           // The palette shell handles this grip through the same drag command as the title.
@@ -438,7 +446,7 @@ export function ToolPalette({
 /**
  * A grid item rendered as a dnd-kit sortable in customize mode. Deliberately a SEPARATE component
  * from ToolbarPaletteItem: none of that component's interactive handlers (invoke-on-pointerdown,
- * setPointerCapture, 420ms hold-to-flyout timers, tooltips) are mounted here, which is what keeps a
+ * setPointerCapture, hold-to-flyout timers, tooltips) are mounted here, which is what keeps a
  * drag from firing the tool's command. Carries `data-palette-control` so PaletteWindow's shell-drag
  * and popover-dismiss `closest()` checks skip it (else pressing it would move the whole window).
  */
@@ -692,7 +700,7 @@ function toolbarItemGridStyle(layout: ToolbarPaletteItemModel["layout"]): CSSPro
 }
 
 function TextToolbarStyleControls() {
-  const { currentTextStyle, currentTextScript = "normal", onColorPickerOpenChange, onInvoke } = useToolbarWidgetState();
+  const { currentTextStyle, currentTextScript = "normal", onColorPickerOpenChange, onRequestColorPopover, onInvoke } = useToolbarWidgetState();
   const sizeCommandId = closestSizeCommandId(currentTextStyle?.fontSizePx);
   const textAlign = currentTextStyle?.textAlign ?? "left";
   const currentColor = normalizeHexColor(currentTextStyle?.color) ?? textColorCommands[0].color;
@@ -731,6 +739,7 @@ function TextToolbarStyleControls() {
         <ColorPickerControl
           currentColor={currentColor}
           onOpenChange={onColorPickerOpenChange}
+          onRequestPopover={isDesktopRuntime() ? onRequestColorPopover : undefined}
           onInvoke={onInvoke}
         />
       </div>
@@ -3281,6 +3290,7 @@ function ColorPickerControl({
   triggerLabel = "Open text color picker",
   dialogLabel = "Text color picker",
   onOpenChange,
+  onRequestPopover,
   onInvoke
 }: {
   compact?: boolean;
@@ -3290,6 +3300,7 @@ function ColorPickerControl({
   triggerLabel?: string;
   dialogLabel?: string;
   onOpenChange?: (open: boolean) => void;
+  onRequestPopover?: (anchor: ToolbarPopoverAnchor, kind: "textColor") => void;
   onInvoke: (commandId: string) => void;
 }) {
   const normalizedCurrentColor = normalizeHexColor(currentColor) ?? textColorCommands[0].color;
@@ -3339,17 +3350,36 @@ function ColorPickerControl({
         type="button"
         className="toolbar-color-trigger"
         aria-label={triggerLabel}
-        aria-expanded={open}
+        aria-haspopup="dialog"
+        aria-expanded={onRequestPopover ? undefined : open}
         data-color-picker-trigger="true"
         data-palette-control="true"
         style={{ "--picker-color": normalizedCurrentColor } as CSSProperties}
-        onClick={() => setOpenState(!open)}
+        onClick={(event) => {
+          if (onRequestPopover) {
+            onRequestPopover(event.currentTarget.getBoundingClientRect(), "textColor");
+          } else {
+            setOpenState(!open);
+          }
+        }}
       >
         <span className="toolbar-color-trigger-swatch" aria-hidden="true" />
         <span className="toolbar-color-trigger-label">Color</span>
       </button>
       {open ? (
-        <div className="toolbar-color-popover" role="dialog" aria-label={dialogLabel}>
+        <div
+          className="toolbar-color-popover"
+          role="dialog"
+          aria-label={dialogLabel}
+          onKeyDown={(event) => {
+            // Bubble after the field discards its draft and before the focus lease blurs it.
+            if (event.key !== "Escape" || event.nativeEvent.isComposing || event.defaultPrevented ||
+                event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+            event.preventDefault();
+            event.stopPropagation();
+            setOpen(false);
+          }}
+        >
           <ColorPickerPopoverBody
             activeColor={normalizedCurrentColor}
             value={draftHex}
@@ -3888,7 +3918,8 @@ function ToolbarPaletteItem({
   onTooltipEnter,
   onTooltipLeave,
   onRequestFlyout,
-  onInvoke
+  onInvoke,
+  allowNativeNoActivateCommands
 }: {
   item: ToolbarPaletteItemModel;
   activeTool?: string;
@@ -3899,11 +3930,14 @@ function ToolbarPaletteItem({
   onTooltipLeave?: (options?: ClearTooltipOptions) => void;
   onRequestFlyout?: (request: ToolbarFlyoutRequest) => void;
   onInvoke: (commandId: string) => void;
+  allowNativeNoActivateCommands?: boolean;
 }) {
   const defaultPrimaryCommand = item.primary.type === "command" ? item.primary.command : undefined;
   const [selectedFlyoutCommandId, setSelectedFlyoutCommandId] = useState<string>();
   const followsSelectedTool = defaultPrimaryCommand?.id === "tool.symbol"
-    || defaultPrimaryCommand?.id === "tool.charge";
+    || defaultPrimaryCommand?.id === "tool.charge"
+    || defaultPrimaryCommand?.id === "tool.doubleBond"
+    || defaultPrimaryCommand?.id === "tool.bond";
   const activeFlyoutCommand = followsSelectedTool
     ? item.submenu?.items.find((command) => command.id === activeTool)
     : undefined;
@@ -4226,10 +4260,11 @@ function ToolbarPaletteItem({
         data-command-flyout-button={hasSubmenu ? submenu?.id : undefined}
         data-command-flyout-ids={hasSubmenu ? submenuCommands.map((command) => command.id).join(" ") : undefined}
         data-command-id={primaryCommand?.id}
+        data-native-noactivate-command={allowNativeNoActivateCommands && !primaryDisabled && primaryCommand && isDrawingToolCommand(primaryCommand.id) ? "true" : undefined}
         data-disabled={primaryDisabled ? "true" : undefined}
         data-distribute-mode={primaryCommand && isDistributeCommandId(primaryCommand.id) ? distributeMode : undefined}
         data-shortcut-label={item.tooltip.shortcutLabel ?? item.tooltip.shortcut ?? "No shortcut"}
-        data-toolbar-asset={item.assetName ?? primaryCommand?.assetName}
+        data-toolbar-asset={followsSelectedTool ? primaryCommand?.assetName : item.assetName ?? primaryCommand?.assetName}
         data-tooltip={tooltipText}
         onPointerDown={(event) => {
           event.stopPropagation();
@@ -4403,16 +4438,16 @@ export function ToolbarItemIcon({
   if (item.iconDataUri) {
     return <img className="tool-icon-image" src={item.iconDataUri} alt="" aria-hidden="true" />;
   }
-  // Only the Symbol/charge group previews its selected command instead of its shared asset.
+  // Groups that remember their selected tool preview that command instead of their shared asset.
   const primaryId = item.primary.type === "command" ? item.primary.command.id : undefined;
-  if (command && (primaryId === "tool.symbol" || primaryId === "tool.charge")) {
+  if (command && (primaryId === "tool.symbol" || primaryId === "tool.charge" || primaryId === "tool.doubleBond" || primaryId === "tool.bond")) {
     return <ToolbarCommandIcon command={command} />;
   }
   // toolbarAsset() returns undefined for an unknown key (e.g. a plugin's unregistered assetName);
   // only render the image when it resolves, otherwise fall through to a real icon.
   const assetSrc = item.assetName ? toolbarAsset(item.assetName) : undefined;
   if (assetSrc) {
-    return <img className="tool-icon-image" src={assetSrc} alt="" aria-hidden="true" />;
+    return <ToolbarAssetIcon assetName={item.assetName} src={assetSrc} />;
   }
   if (command) {
     return <ToolbarCommandIcon command={command} />;
@@ -4432,7 +4467,7 @@ function ToolbarCommandIcon({ command }: { command: CommandSpec }) {
   }
   const assetSrc = command.assetName ? toolbarAsset(command.assetName) : undefined;
   if (assetSrc) {
-    return <img className="tool-icon-image" src={assetSrc} alt="" aria-hidden="true" />;
+    return <ToolbarAssetIcon assetName={command.assetName} src={assetSrc} />;
   }
   if (command.id.startsWith("tool.art.")) {
     return <ArtToolIcon commandId={command.id} />;
@@ -4601,7 +4636,7 @@ export function CommandIconButton({
         {...invokeHandlers}
       >
         {assetSrc ? (
-          <img className="tool-icon-image" src={assetSrc} alt="" aria-hidden="true" />
+          <ToolbarAssetIcon assetName={command.assetName} src={assetSrc} />
         ) : command.id.startsWith("tool.art.") ? (
           <ArtToolIcon commandId={command.id} />
         ) : (

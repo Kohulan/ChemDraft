@@ -3,10 +3,10 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PalettePopoverWindow } from "./PalettePopoverWindow";
-import { sendBondStereoPopoverAction, sendPaletteCommand, type ToolsetPopoverDismissPayload, type ToolsetPopoverContentPayload } from "./window-manager";
+import { sendBondStereoPopoverAction, sendPaletteCommand, sendToolsetFlyoutKey, type ToolsetFlyoutKey, type ToolsetPopoverDismissPayload, type ToolsetPopoverContentPayload } from "./window-manager";
 import { useBondStereoPopover } from "./useBondStereoPopover";
 import type { ChemDraftDocument } from "@chemdraft/chem-core";
-import { closeToolsetPopoverWindow, currentWindowLogicalPosition, openToolsetPopoverWindow, setToolsetPopoverContent } from "./window-manager";
+import { closeToolsetPopoverWindow, currentWindowLogicalPosition, openToolsetPopoverWindow, setCurrentWindowLogicalPosition, setToolsetPopoverContent } from "./window-manager";
 import type { NativePanelFocusEvent } from "./plugins/pluginPanelInputFocus";
 
 const native = vi.hoisted(() => ({
@@ -14,7 +14,8 @@ const native = vi.hoisted(() => ({
   action: undefined as undefined | ((payload: { sessionId: string; action: string }) => void),
   dismiss: undefined as undefined | ((payload?: ToolsetPopoverDismissPayload) => void),
   request: undefined as undefined | ((toolsetId: string) => void),
-  hide: vi.fn(async () => {}), focus: vi.fn(async () => {}), show: vi.fn(async () => {}),
+  key: undefined as undefined | ((payload: ToolsetFlyoutKey) => void),
+  hide: vi.fn(async () => {}), focus: vi.fn(async () => {}), webviewFocus: vi.fn(async () => {}), show: vi.fn(async () => {}),
   invoke: vi.fn(async (_command: string, _args?: Record<string, unknown>): Promise<unknown> => undefined),
   fallbackShow: vi.fn(async () => {}),
   platform: "macos" as "macos" | "windows",
@@ -42,12 +43,14 @@ vi.mock("./documentWorkflow", async importOriginal => ({
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: native.invoke }));
 vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ hide: native.hide, setFocus: native.focus, show: native.fallbackShow }) }));
-vi.mock("@tauri-apps/api/webview", () => ({ getCurrentWebview: () => ({ setFocus: vi.fn(async () => {}) }) }));
+vi.mock("@tauri-apps/api/webview", () => ({ getCurrentWebview: () => ({ setFocus: native.webviewFocus }) }));
 vi.mock("./window-manager", async importOriginal => ({
   ...await importOriginal<typeof import("./window-manager")>(),
   listenForToolsetPopoverContent: vi.fn(async handler => { native.content = handler; return () => {}; }),
   listenForToolsetPopoverDismiss: vi.fn(async handler => { native.dismiss = handler; return () => {}; }),
   listenForBondStereoPopoverActions: vi.fn(async handler => { native.action = handler; return () => {}; }),
+  listenForToolsetFlyoutKeys: vi.fn(async handler => { native.key = handler; return () => { native.key = undefined; }; }),
+  sendToolsetFlyoutKey: vi.fn(async payload => { native.key?.(payload); }),
   listenForToolsetTextStyle: vi.fn(async () => () => {}),
   requestToolsetPopoverContent: vi.fn(async () => {}), requestToolsetTextStyle: vi.fn(async () => {}),
   setCurrentWindowLogicalSize: vi.fn(async () => {}), setCurrentWindowLogicalPosition: vi.fn(async () => {}),
@@ -77,13 +80,40 @@ describe("document-owned bond stereo popover", () => {
       select: () => {}, invoke: () => {}, focusCanvas: () => {} });
     return <><div className="page-stage" /><button onClick={() => openPopover({ objectId: "m", bondId: "b", rect: { left: 30, bottom: 50 }, keyboard })}>Open</button></>;
   }
-  it.each([false, true])("sends the native creation and content focus mode for keyboard=%s", async keyboard => {
+  it.each([["macos", false], ["macos", true], ["windows", false], ["windows", true]] as const)("sends the native creation and content focus mode for %s keyboard=%s", async (platform, keyboard) => {
+    native.platform = platform;
     await act(async () => root.render(<Owner keyboard={keyboard} />));
     await act(async () => container.querySelector("button")!.click());
-    expect(openToolsetPopoverWindow).toHaveBeenCalledWith("core.bondStereo", "flyout", 130, 254, keyboard ? "focus" : "preserve");
+    expect(openToolsetPopoverWindow).toHaveBeenCalledWith("core.bondStereo", "flyout", 130, 254, keyboard && platform !== "windows" ? "focus" : "preserve");
     expect(setToolsetPopoverContent).toHaveBeenCalledWith("core.bondStereo", expect.objectContaining({
       kind: "flyout", flyout: expect.objectContaining({ variant: "bondStereo", keyboardOpen: keyboard })
     }), { x: 130, y: 254 });
+  });
+  it("keeps Windows E/Z Tab, arrows and activation in the document and consumes held-key repeats", async () => {
+    native.platform = "windows";
+    await act(async () => root.render(<Owner keyboard />));
+    const owner = container.querySelector("button")!;
+    await act(async () => { owner.focus(); owner.click(); });
+    const content = vi.mocked(setToolsetPopoverContent).mock.calls[0][1];
+    if (content.kind !== "flyout") throw new Error("Expected E/Z flyout");
+    const press = async (key: string, init: KeyboardEventInit = {}, type = "keydown") => {
+      const event = new KeyboardEvent(type, { key, bubbles: true, cancelable: true, ...init });
+      await act(async () => owner.dispatchEvent(event));
+      expect(event.defaultPrevented).toBe(true);
+    };
+    await press("Tab", { shiftKey: true });
+    expect(sendToolsetFlyoutKey).toHaveBeenLastCalledWith({ toolsetId: "core.bondStereo", flyoutId: "core.bondStereo",
+      openedAt: content.openedAt, sessionId: content.flyout.id, key: "Tab", shiftKey: true });
+    await press("ArrowRight");
+    expect(document.activeElement).toBe(owner);
+    await press("Enter");
+    const forwarded = vi.mocked(sendToolsetFlyoutKey).mock.calls.length;
+    await act(async () => native.action?.({ sessionId: content.flyout.id!, action: "keep" }));
+    await press("Enter", { repeat: true });
+    await press("Enter", {}, "keyup");
+    expect(sendToolsetFlyoutKey).toHaveBeenCalledTimes(forwarded);
+    expect(native.focus).not.toHaveBeenCalled();
+    expect(native.webviewFocus).not.toHaveBeenCalled();
   });
   it("carries the session's original open time through delayed positioning and startup replay", async () => {
     const now = vi.spyOn(performance, "now").mockReturnValue(100);
@@ -198,7 +228,7 @@ async function open(keyboardOpen = false) {
         { id: "molecule.bondStereo:flipped", title: "Use the other geometry (E)", enabled: true, active: false }
       ] } }));
   expect(native.show).toHaveBeenCalledTimes(1);
-  expect(native.show).toHaveBeenCalledWith(keyboardOpen ? "focus" : "preserve", "flyout");
+  expect(native.show).toHaveBeenCalledWith(keyboardOpen && native.platform !== "windows" ? "focus" : "preserve", "flyout");
   expect(container.querySelector('[role="dialog"]')?.getAttribute("aria-label")).toBe("E/Z not specified");
   expect(container.querySelector("p")?.textContent).toBe("This double bond's geometry wasn't given, so ChemDraft shows it as either E or Z.");
   return [...container.querySelectorAll("button")];
@@ -213,6 +243,23 @@ describe("open-bond native popover body", () => {
         commands: [{ id: "tool.rectangle", title: "Rectangle", enabled: true, active: false }] }
     };
   }
+  it.each(["macos", "windows"] as const)("dismisses during delayed positioning without a stale reveal and allows a fresh opening (%s)", async platform => {
+    let positioned!: () => void;
+    vi.mocked(setCurrentWindowLogicalPosition).mockImplementationOnce(() => new Promise<void>(resolve => { positioned = resolve; }));
+    const payload = { ...snapshot("menu", 100), generation: 1, anchor: { x: 20, y: 40 } };
+    await act(async () => root.render(<PalettePopoverWindow toolsetId="core.art" kind="flyout" prewarm platform={platform} />));
+    await act(async () => native.content?.(payload));
+    expect(positioned).toBeTypeOf("function");
+    expect(native.show).not.toHaveBeenCalled();
+    await act(async () => native.dismiss?.({ requestedAt: 200 }));
+    expect(native.hide).toHaveBeenCalledTimes(1);
+    await act(async () => positioned());
+    await act(async () => native.content?.(payload));
+    expect(native.show).not.toHaveBeenCalled();
+    await act(async () => native.content?.({ ...payload, openedAt: 300, generation: 2 }));
+    expect(native.show).toHaveBeenCalledExactlyOnceWith("preserve", "flyout");
+    expect(native.hide).toHaveBeenCalledTimes(1);
+  });
   it("a delayed Escape only dismisses its checked generation, even at an identical timestamp", async () => {
     const old = { ...snapshot("menu", 100), generation: 1 };
     const current = { ...snapshot("menu", 100), generation: 2 };
@@ -399,9 +446,9 @@ describe("open-bond native popover body", () => {
     expect(sendBondStereoPopoverAction).toHaveBeenCalledWith({ sessionId: "session-1", action: "close" });
     expect(native.hide).toHaveBeenCalledTimes(1);
   });
-  it.each(["macos", "windows"] as const)("keeps a keyboard E/Z reveal focused through native activation, Tab and Enter (%s)", async platform => {
+  it("keeps macOS keyboard E/Z focus through native activation, Tab and Enter", async () => {
     vi.useFakeTimers();
-    native.platform = platform;
+    native.platform = "macos";
     const host = window as typeof window & { __TAURI__?: unknown };
     host.__TAURI__ = {};
     let popoverOwnsKeyboard = false;
@@ -450,17 +497,62 @@ describe("open-bond native popover body", () => {
         native.notifyFocus!({ payload: { kind: "activated", generation: 0 } });
         await vi.advanceTimersByTimeAsync(40);
       });
-      expect(handBacks()).toHaveLength(platform === "windows" ? 1 : 0);
-      if (platform === "windows") expect(handBacks()[0][1]).toMatchObject({ returnFocus: true });
+      expect(handBacks()).toHaveLength(0);
     } finally { delete host.__TAURI__; }
   });
-  it.each(["mouse E/Z", "colour"])("still returns idle Windows activation for a %s popover", async kind => {
+  it.each(["geometry", "flipped", "keep"] as const)("navigates Windows E/Z without native or DOM focus and chooses %s once", async action => {
+    native.platform = "windows";
+    vi.spyOn(performance, "now").mockReturnValue(100);
+    const owner = document.createElement("input"); document.body.append(owner); owner.focus();
+    try {
+      const buttons = await open(true);
+      const key = (value: string, shiftKey = false, sessionId = "session-1") => act(async () => native.key?.({
+        toolsetId: "core.bondStereo", flyoutId: "core.bondStereo", openedAt: performance.timeOrigin + 100,
+        sessionId, key: value, shiftKey
+      }));
+      const highlighted = () => container.querySelector('[data-keyboard-highlighted="true"]');
+      expect(highlighted()).toBe(buttons[0]);
+      await key("Tab", true); expect(highlighted()).toBe(buttons[2]);
+      await key("Tab"); expect(highlighted()).toBe(buttons[0]);
+      await key("Enter", false, "stale-session");
+      expect(sendBondStereoPopoverAction).not.toHaveBeenCalled();
+      if (action === "flipped") await key("ArrowRight");
+      if (action === "keep") await key("Tab", true);
+      await key("Enter"); await key("Enter");
+      expect(sendBondStereoPopoverAction).toHaveBeenCalledExactlyOnceWith({ sessionId: "session-1", action });
+      expect(native.hide).toHaveBeenCalledTimes(1);
+      expect(native.focus).not.toHaveBeenCalled();
+      expect(native.webviewFocus).not.toHaveBeenCalled();
+      expect(document.activeElement).toBe(owner);
+    } finally { owner.remove(); }
+  });
+  it.each(["macos", "windows"] as const)("preserves editable pointer defaults but prevents command focus only on Windows (%s)", async platform => {
+    native.platform = platform;
+    const buttons = await open();
+    for (const type of ["pointerdown", "mousedown"]) {
+      const event = new MouseEvent(type, { bubbles: true, cancelable: true, button: 0 });
+      await act(async () => buttons[0].dispatchEvent(event));
+      expect(event.defaultPrevented).toBe(platform === "windows");
+    }
+    await act(async () => root.render(<PalettePopoverWindow key="color" toolsetId="core.art" kind="artColor" prewarm platform={platform} />));
+    await act(async () => native.content?.({ toolsetId: "core.art", kind: "artColor" }));
+    for (const selector of ['input[type="text"]', 'input[type="color"]', '[role="tab"]']) {
+      const control = container.querySelector(selector)!;
+      expect(control).not.toBeNull();
+      for (const type of ["pointerdown", "mousedown"]) {
+        const event = new MouseEvent(type, { bubbles: true, cancelable: true, button: 0 });
+        await act(async () => control.dispatchEvent(event));
+        expect(event.defaultPrevented).toBe(false);
+      }
+    }
+  });
+  it.each(["mouse E/Z", "keyboard E/Z", "colour"])("still returns idle Windows activation for a %s popover", async kind => {
     vi.useFakeTimers();
     native.platform = "windows";
     const host = window as typeof window & { __TAURI__?: unknown };
     host.__TAURI__ = {};
     try {
-      if (kind === "mouse E/Z") await open();
+      if (kind !== "colour") await open(kind === "keyboard E/Z");
       else {
         await act(async () => root.render(<PalettePopoverWindow toolsetId="core.art" prewarm />));
         await act(async () => native.content?.({ toolsetId: "core.art", kind: "artColor" }));

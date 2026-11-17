@@ -134,7 +134,9 @@ are none. This workflow supplies the Windows artifacts only.
    ```
 
 6. If `upload_to_release` was supplied, a separate job downloads the final artifact and uses
-   `gh release upload --clobber`. It refuses a missing or already published release, and requires
+   `gh release upload --clobber`. It verifies the staged Windows sums and excludes that local
+   `SHA256SUMS.txt` from the upload so a rerun cannot overwrite combined sums with Windows-only entries.
+   It refuses a missing or already published release, and requires
    `v<app version>` because the generated feed points to that URL. Before uploading it fetches
    and peels the destination tag and requires it to resolve to the built commit. It also requires both
    `authenticode_signed` and `updater_signed` build outputs to be true; these are set only after
@@ -143,7 +145,10 @@ are none. This workflow supplies the Windows artifacts only.
    use it only for draft dry runs. Only this job has
    `contents: write`; the build/signing job retains read access. Leave the release draft while testing.
    If uploading manually, upload the same final artifacts, without rebuilding or re-signing.
-7. After uploading, the same upload job uses its draft-visible token to download all attached release assets and run the
+7. After uploading, the same upload job runs `node tools/release/release-checksums.mjs --tag vX.Y.Z`
+   with its draft-visible token to download every attached asset and upload a freshly computed
+   combined `SHA256SUMS.txt`. This preserves coverage of Mac assets already attached to the draft.
+   It then downloads all attached release assets again and runs the
    [asset checker](three-builds.md#last-step-before-un-drafting). If both DMGs, both installers and their
    records are present, hashes, sizes and tag/commit identity must pass. Wholly missing build pairs
    are listed, while every supplied build is fully checked; partial pairs fail. The Windows-only
@@ -151,7 +156,8 @@ are none. This workflow supplies the Windows artifacts only.
    because it cannot mount DMGs; the final Mac gate must check their embedded commits.
 8. Collect both DMGs and both installers with all four `.build.json` files, then pass the
    [joint release body check](three-builds.md) with the tag and explicit gaps or `--no-gaps`.
-   After all four artifacts pass review, **as the last step before un-drafting on a Mac** run both
+   After all four artifacts pass review, **as the last step before un-drafting on a Mac** run
+   `node tools/release/release-checksums.mjs --tag vX.Y.Z` to upload the final combined sums, both
    `verify-macos-app.mjs --release --dmg` checks and
    `node tools/release/check-release-assets.mjs --tag vX.Y.Z --commit <full-sha>` against GitHub,
    as listed in [the final checklist](three-builds.md#last-step-before-un-drafting).

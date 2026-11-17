@@ -12,6 +12,7 @@ import {
   nativeTextStyleFromObjectStyle,
   parseDocument,
   prepareNativeDocumentForSerializationWithWarnings,
+  resolveRepeatUnitAtomMembership,
   withBracketChemistryWarnings,
   type Anchor,
   type ArrowObject,
@@ -24,6 +25,7 @@ import {
   type DocumentObject,
   type GroupObject,
   type DocumentPage,
+  type ElectronMarkObject,
   type GraphicMarker,
   type GraphicObject,
   type GraphicPathNode,
@@ -53,6 +55,8 @@ import {
   type CdxElement
 } from "./cdxBinary";
 import { abbreviationExpansionIssue, cdxmlAtomChemistry, cdxmlAtomNativeState, elementFromCdxmlAtom, restoreCdxmlAbbreviations } from "./abbreviations";
+import { cdxmlToCssPx, cssPxToCdxml, formatNumber, formatPoint } from "./coordinates";
+import { nativeChargePlacementPointForAtom, nativeRadicalPlacementPointForAtom, nativeChargeMarkSizePx } from "@chemdraft/layout-engine";
 
 export interface CompatibilityConversionWarning {
   code: string;
@@ -155,6 +159,13 @@ export function exportDocumentToCdx(document: ChemDraftDocument, options: CdxExp
   checkRepeatCounts(root);
   const tags: [string, string][] = [];
   const strip = (x: CdxElement) => {
+    // Start/End have no binary tags. Standard 3D endpoints already carry these coordinates;
+    // dropping only equivalent aliases loses nothing and should not report an omission.
+    for (const [alias, endpoint] of [["Start", "Tail3D"], ["End", "Head3D"]]) {
+      const point = parseCdxmlXyPoint(x.attrs[alias]);
+      const standard = parseCdxmlXyPoint(x.attrs[endpoint]);
+      if (point && standard && point.x === standard.x && point.y === standard.y) delete x.attrs[alias];
+    }
     x.kids = x.kids.filter((child) => {
       if (child.name === "objecttag" && child.attrs.Name?.startsWith(ChemDraftObjectTagPrefix)) {
         tags.push([child.attrs.Name, child.attrs.Value]);
@@ -259,9 +270,6 @@ const legacyVisibleXmlParser = new XMLParser({
 });
 
 const base64UrlAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-const cssPxPerInch = 96;
-const cdxmlPointsPerInch = 72;
-const cdxmlScale = cdxmlPointsPerInch / cssPxPerInch;
 const nativeImportTimestamp = "2026-05-29T00:00:00.000Z";
 const defaultCdxmlStrokeColor = "#000000";
 const defaultCdxmlFillColor = "none";
@@ -302,6 +310,7 @@ interface IdAllocator {
 type ExportColorTable = string[];
 
 interface VisibleExportContext {
+  page: DocumentPage;
   format: "CDXML" | "CDX";
   embedNativePayload: boolean;
   colors: ExportColorTable;
@@ -504,7 +513,17 @@ function exportCdxml(
 
   if (!embedNativePayload) {
     // Interchange has no recovery envelope. Never promise that omitted data was kept.
-    for (const item of warnings) if (/payload/i.test(item.message)) {
+    for (const item of warnings) if (item.code === "cdxml.molecule_metadata_payload_only") {
+      const radical = /radical count/i.test(item.message);
+      const stereo = /stereochemistry assignment/i.test(item.message);
+      const details = [
+        ...(radical ? ["The molecule's radical count is not fully represented by CDXML atom Radical attributes."] : []),
+        ...(stereo ? ["The molecule's stereochemistry assignment is not represented by CDXML atom assignments."] : [])
+      ];
+      item.message = `${details.join(" ")}${details.length ? " " : ""}Unsupported radical/stereo data${item.sourceObjectId ? ` on ${item.sourceObjectId}` : ""} is NOT written; no native payload is embedded.`;
+      continue;
+    }
+    for (const item of warnings) if (item.code !== "cdxml.molecule_metadata_payload_only" && /payload/i.test(item.message)) {
       const visibleDetail = item.message.split(/(?<=[.;])\s+/).filter(part => !/payload/i.test(part)).join(" ");
       const feature = item.code.replace(/^cdxml\./, "").replace(/_payload_only$/, "").replaceAll("_", " ");
       item.message = `${visibleDetail ? `${visibleDetail} ` : ""}Unsupported ${feature} data${item.sourceObjectId ? ` on ${item.sourceObjectId}` : ""} is NOT written; no native payload is embedded.`;
@@ -1265,6 +1284,55 @@ function exportReactionSchemes(
   });
 }
 
+/** Default atom-tool dots carry the Radical attribute written on the atom, not separate
+ * authored appearance. A moved or styled dot still needs the ordinary loss diagnostics. */
+function isStandardAtomRadicalMark(
+  mark: ElectronMarkObject,
+  page: DocumentPage,
+  objectsById: ReadonlyMap<string, DocumentObject>
+): boolean {
+  if (mark.markKind !== "radical-dot" || mark.anchor.kind !== "atom"
+      || mark.style.source !== "chemdraft-native-charge"
+      || Object.entries(mark.style).some(([key, value]) => key !== "source" && value !== undefined)
+      || mark.width !== nativeChargeMarkSizePx || mark.height !== nativeChargeMarkSizePx || mark.rotation !== 0) return false;
+  const { objectId, atomId } = mark.anchor;
+  const molecule = objectId && objectsById.get(objectId);
+  if (!molecule || molecule.type !== "molecule") return false;
+  const atom = molecule.atoms.find(atom => atom.id === atomId);
+  if (!atom) return false;
+  // Source handles follow direct edits to the atom's radical state, including its removal.
+  // Compare the current atom-relative frame: a stationary dot must not stay exempt when
+  // its atom moves away, while translating both together preserves the imported appearance.
+  const imported = mark.compatibility?.unknown.cdxmlRadicalMarkPlacement;
+  if (isRecord(imported)) {
+    if (imported.objectId !== objectId || imported.atomId !== atomId) return false;
+    if (typeof imported.offsetX === "number" && typeof imported.offsetY === "number") {
+      const atomPoint = transformPointForObject(molecule, atom);
+      return Math.abs(mark.x - atomPoint.x - imported.offsetX) < 1e-8
+        && Math.abs(mark.y - atomPoint.y - imported.offsetY) < 1e-8;
+    }
+    // Older native payloads lack relative coordinates: require the current default below.
+  }
+  if (!isRecord(imported) && atom.markRadicals !== 1 && atom.markRadicals !== 2) return false;
+  const carried = page.objects.filter(object => object.type === "electron-mark"
+    && object.anchor.kind === "atom" && object.anchor.objectId === molecule.id && object.anchor.atomId === atom.id
+    && (object.markKind === "radical-dot" || object.markKind === "charge" && object.radical)).length;
+  if (!isRecord(imported) && carried !== atom.markRadicals) return false;
+  // Legacy imports placed both triplet dots in the charge-tool slot. Keep those untouched
+  // payloads warning-free too, but only while that slot still matches the atom's position.
+  const point = isRecord(imported)
+    ? nativeChargePlacementPointForAtom(molecule, atom.id,
+      // Reconstruct the legacy slot before mixed-mark collision avoidance existed.
+      page.objects.filter(object => object.type !== "electron-mark" || object.markKind === "charge"), page.width, page.height)
+    : nativeRadicalPlacementPointForAtom(molecule, atom.id,
+      page.objects.slice(0, page.objects.indexOf(mark)), page.width, page.height);
+  if (!point) return false;
+  const size = nativeChargeMarkSizePx;
+  const x = Math.max(0, Math.min(point.x - size / 2, page.width - size));
+  const y = Math.max(0, Math.min(point.y - size / 2, page.height - size));
+  return Math.abs(mark.x - x) < 1e-8 && Math.abs(mark.y - y) < 1e-8;
+}
+
 function exportVisibleObject(
   object: DocumentObject,
   context: VisibleExportContext,
@@ -1298,7 +1366,7 @@ function exportVisibleObject(
     return exportTextObject({ ...object, type: "text", text: "+", spans: [] }, context, allocator, warnings);
   }
   if (object.type === "reaction-arrow") {
-    return exportReactionArrowObject(object, context.ids, allocator, objectsById, warnings, context.colors);
+    return exportReactionArrowObject(object, context.ids, allocator, objectsById, warnings, context.colors, unknownObjects.format);
   }
   if (object.type === "graphic") {
     return exportGraphicObject(object, context.ids, allocator, warnings, context.colors);
@@ -1323,6 +1391,7 @@ function exportVisibleObject(
     return "";
   }
   if (object.type === "electron-mark") {
+    if (isStandardAtomRadicalMark(object, context.page, objectsById)) return "";
     warnings.push({
       code: "cdxml.electron_mark_appearance_payload_only",
       message: `${unknownObjects.format.toUpperCase()} export: electron mark ${object.compatibility?.originalId ?? object.id}, including its position, size (${object.width} × ${object.height}), thickness (${object.style.strokeWidth ?? 1.5}) and rotation (${object.rotation}°), ${unknownObjects.embedNativePayload
@@ -1531,9 +1600,15 @@ function exportBracketPairs(page: DocumentPage, context: VisibleExportContext, a
     const unchanged = pair.every(object => object.compatibility?.unknown.cdxmlBracketState === bracketSourceState(object));
     const membershipUnchanged = pair.every(object => object.compatibility?.unknown.cdxmlBracketMembership === JSON.stringify(object.containedObjectIds));
     const requestedMembers = [...new Set(pair.flatMap(object => object.containedObjectIds))];
-    const members = requestedMembers.filter(id => objectsById.get(id)?.type === "molecule").map(id => idFor(context.ids, id, allocator));
-    if (members.length !== requestedMembers.length) warnings.push({ code: "cdxml.bracket_membership_payload_only", sourceObjectId: closing.id,
-      message: `Bracket membership for missing or non-molecule objects is preserved only in the ChemDraft payload; visible ${context.format} membership includes whole molecule objects only.` });
+    const membership = resolveRepeatUnitAtomMembership(pair, page.objects, { atomPosition: transformPointForObject });
+    const members = membership.members.flatMap(member => requestedMembers.includes(member.molecule.id)
+      ? [idFor(context.ids, member.molecule.id, allocator)]
+      : member.atomIds.flatMap(atomId => {
+        const id = context.atomIdsByObjectId.get(member.molecule.id)?.get(atomId);
+        return id ? [id] : [];
+      }));
+    if (requestedMembers.some(id => objectsById.get(id)?.type !== "molecule")) warnings.push({ code: "cdxml.bracket_membership_payload_only", sourceObjectId: closing.id,
+      message: `Bracket membership for missing or non-molecule objects is preserved only in the ChemDraft payload; visible ${context.format} membership includes only resolvable molecule and atom references.` });
     const memberRecords = closing.compatibility?.unknown.cdxmlBracketMembers;
     const preservedMembers = splitCdxmlIdList(attrs.BracketedObjectIDs).flatMap(sourceId => {
       const record = Array.isArray(memberRecords) ? memberRecords.find(record => isRecord(record) && record.sourceId === sourceId) : undefined;
@@ -1555,6 +1630,10 @@ function exportBracketPairs(page: DocumentPage, context: VisibleExportContext, a
       return [];
     });
     const exportedMembers = [...new Set([...preservedMembers, ...(membershipUnchanged && attrs.BracketedObjectIDs !== undefined ? [] : members)])];
+    if (bracketUsageAttribute(pair) && membership.unresolved) {
+      warnings.push({ code: "cdxml.bracket_membership_unresolved", sourceObjectId: closing.id,
+        message: `Repeat unit membership for bracket ${closing.id} cannot be resolved: ${membership.reason}; visible ${context.format} writes only known members and retained source references, without guessing enclosure.` });
+    }
     if (exportedMembers.length) attrs.BracketedObjectIDs = exportedMembers.join(" ");
     else delete attrs.BracketedObjectIDs;
     attrs.id = attrs.id ? allocator.sourceId(attrs.id) : allocator.next();
@@ -1652,6 +1731,7 @@ function createVisibleExportContext(page: DocumentPage, colors: ExportColorTable
   });
 
   return {
+    page,
     format,
     embedNativePayload,
     colors,
@@ -1804,11 +1884,15 @@ function exportMoleculeObject(
       const split = value.lastIndexOf(":");
       return visibleStereo.get(atomIds.get(value.slice(0, split)) ?? "") !== value.slice(split + 1);
     });
-    if (!molecule.chemistry?.radicalCount && !missingStereo) return;
+    const visibleRadicals = molecule.atoms.reduce((total, atom) => total + (atom.markRadicals ?? 0), 0);
+    const missingRadicals = (molecule.chemistry?.radicalCount ?? 0) > visibleRadicals;
+    if (!missingRadicals && !missingStereo) return;
     warnings.push({
       code: "cdxml.molecule_metadata_payload_only",
-      message: "Molecule radical and stereochemistry aggregates remain in the native payload; " +
-        "isotopes are preserved on CDXML atoms and supported bond stereo is written visibly.",
+      message: [
+        ...(missingRadicals ? ["The molecule's radical count is not fully represented by CDXML atom Radical attributes; this data is kept in ChemDraft's embedded data."] : []),
+        ...(missingStereo ? ["The molecule's stereochemistry assignment is not represented by CDXML atom assignments; this data is kept in ChemDraft's embedded data."] : [])
+      ].join(" "),
       sourceObjectId: molecule.id
     });
   };
@@ -2021,7 +2105,8 @@ function exportTextObject(text: TextObject, context: VisibleExportContext, alloc
       message: `Text ${text.id} (source ${text.compatibility?.originalId ?? "<unnamed>"}) was edited or its source text is unavailable; source formatting was not kept. The current native text is written.` });
   }
   const unsupportedTextStyle = (style: Record<string, unknown>) =>
-    Object.keys(style).some(key => key !== "color") ||
+    Object.entries(style).some(([key, value]) => key === "fontWeight" ? value !== 400 && value !== 700
+      : key === "fontStyle" ? value !== "normal" && value !== "italic" : key !== "color") ||
     typeof style.color === "string" && normalizeHexColor(style.color) === undefined;
   const styledSpan = text.spans.some(span => unsupportedTextStyle(span.style));
   const styledObject = [
@@ -2031,16 +2116,19 @@ function exportTextObject(text: TextObject, context: VisibleExportContext, alloc
   if (styledSpan || styledObject || typeof text.style.color === "string" && normalizeHexColor(text.style.color) === undefined) {
     warnings.push({
       code: "cdxml.text_format_native_only",
-      message: `Some text formatting is preserved only in the embedded ChemDraft payload; the visible ${format} retains colors and subscript/superscript but may look different in other apps.`,
+      message: `Some text formatting is preserved only in the embedded ChemDraft payload; the visible ${format} keeps per-character (run) colors, bold/italic and subscript/superscript, but not formatting applied to the whole text box (font, size, bold, italic, alignment, spacing), and may look different in other apps.`,
       sourceObjectId: text.id
     });
   }
   const color = cdxmlColorAttribute(text.style.color, colors);
   const content = text.spans.length === 0 ? escapeXmlText(text.text)
     : textObjectSpansForRendering(text).map((span) => {
-        const face = span.script === "subscript" ? ' face="32"' : span.script === "superscript" ? ' face="64"' : "";
-        // Explicit black must override a coloured parent, even though it is otherwise implicit.
-        const runColor = cdxmlColorAttribute(span.style.color, colors, normalizeHexColorValue(text.style.color));
+        const faceBits = (typeof span.style.fontWeight === "number" && span.style.fontWeight >= 600 ? 1 : 0)
+          | (span.style.fontStyle === "italic" ? 2 : 0)
+          | (span.script === "subscript" ? 32 : span.script === "superscript" ? 64 : 0);
+        const face = faceBits ? ` face="${faceBits}"` : "";
+        // Keep an explicit run colour when the parent has no explicit colour, including black.
+        const runColor = cdxmlColorAttribute(span.style.color, colors, normalizeHexColorValue(text.style.color) ?? "");
         return `<s${face}${runColor.length ? ` ${runColor.join(" ")}` : ""}>${escapeXmlText(span.text)}</s>`;
       }).join("");
   return `<t id="${textId}" p="${formatPoint({ x: text.x, y: text.y })}"${color.length ? ` ${color.join(" ")}` : ""}>${content}</t>`;
@@ -2052,12 +2140,32 @@ function exportReactionArrowObject(
   allocator: IdAllocator,
   objectsById: ReadonlyMap<string, DocumentObject>,
   warnings: CompatibilityConversionWarning[],
-  colors: ExportColorTable
+  colors: ExportColorTable,
+  format: "cdx" | "cdxml"
 ): string {
   const graphicId = idFor(ids, arrow.id, allocator);
   const start = resolveAnchorPoint(arrow.start, objectsById) ?? { x: arrow.x, y: arrow.y + arrow.height / 2 };
   const end = resolveAnchorPoint(arrow.end, objectsById) ?? { x: arrow.x + arrow.width, y: arrow.y + arrow.height / 2 };
   const arrowType = cdxmlArrowTypeForKind(arrow.arrowKind);
+  if (arrow.arrowKind !== "unknown") {
+    const equilibrium = arrow.arrowKind === "equilibrium";
+    const retro = arrow.arrowKind === "retrosynthesis";
+    const marker: GraphicMarker = equilibrium
+      ? { kind: "half-arrow", sizePx: defaultCdxmlHalfArrowheadSizePx }
+      : { kind: "filled-arrow", sizePx: defaultCdxmlArrowheadSizePx };
+    return exportGraphicAsCdxmlArrow({
+      ...arrow, type: "graphic", graphicKind: "path",
+      data: {
+        artPathKind: "line", lineStart: start, lineEnd: end,
+        ...(retro ? {} : { markerEnd: marker }),
+        ...(equilibrium || arrow.arrowKind === "resonance" ? { markerStart: marker } : {}),
+        ...(equilibrium || retro ? { dualShaft: true } : {}),
+        ...(retro ? { dualShaftParallel: true } : {}),
+        artToolId: equilibrium ? "equilibriumArrow" : retro ? "retroArrow"
+          : arrow.arrowKind === "resonance" ? "resonanceArrow" : "reactionArrow"
+      }
+    }, graphicId, warnings, colors);
+  }
   if (arrowType === undefined) {
     // "unknown" means the source document's arrow type was not one this build understands. Writing
     // a concrete spelling would launder that into a claim — a plain reaction arrow — that survives
@@ -2071,7 +2179,10 @@ function exportReactionArrowObject(
     });
   }
   const arrowTypeAttribute = arrowType === undefined ? "" : ` ArrowType="${escapeXmlAttribute(arrowType)}"`;
-  return `<graphic id="${graphicId}" GraphicType="Line"${arrowTypeAttribute}${cdxmlColorAttribute(arrow.style.strokeColor ?? arrow.style.color, colors).map(attribute => ` ${attribute}`).join("")} BoundingBox="${formatLineBoundingBox(start, end)}" Start="${formatPoint(start)}" End="${formatPoint(end)}"/>`;
+  const endpoints = format === "cdx"
+    ? `Tail3D="${formatXyPoint(start)}" Head3D="${formatXyPoint(end)}"`
+    : `Start="${formatPoint(start)}" End="${formatPoint(end)}"`;
+  return `<graphic id="${graphicId}" GraphicType="Line"${arrowTypeAttribute}${cdxmlColorAttribute(arrow.style.strokeColor ?? arrow.style.color, colors).map(attribute => ` ${attribute}`).join("")} BoundingBox="${formatLineBoundingBox(start, end)}" ${endpoints}/>`;
 }
 
 function exportGraphicObject(
@@ -2115,17 +2226,15 @@ function exportGraphicObject(
   if (graphic.compatibility?.unknown.cdxmlElementName === "curve") {
     return exportGraphicAsCdxmlCurve(graphic, graphicId, warnings, colors);
   }
-  // An object that came in as an <arrow> goes back out as one, even now that it is tagged as a
-  // native arrow. The element's ArrowheadHead/ArrowheadTail/ArrowheadType triple is RICHER than the
-  // closed ArrowType enum — it can say which ends are full/half with a shared solid/open type —
-  // so round-tripping the source form loses less than promoting it to a reaction arrow would.
+  // Both imported and newly authored arrows use directed Arrow objects. Legacy Graphic lines
+  // have readers that ignore Tail3D/Head3D and reverse leftward/upward arrows.
   if (graphic.compatibility?.unknown.cdxmlElementName === "arrow") {
     return exportGraphicAsCdxmlArrow(graphic, graphicId, warnings, colors);
   }
   if (curve) return exportGraphicAsCdxmlCurve(curve, graphicId, warnings, colors,
     graphic.data.artPathKind === "arc" && !graphic.data.pathControlPoint);
   if (isSemanticReactionArrowGraphic(graphic)) {
-    return exportSemanticReactionArrowGraphic(graphic, graphicId, warnings, colors);
+    return exportGraphicAsCdxmlArrow(graphic, graphicId, warnings, colors);
   }
   warnForGenericGraphicMarkerLoss(graphic, warnings);
   return exportGraphicAsCdxmlGraphic(graphic, graphicId, warnings, colors);
@@ -2332,74 +2441,14 @@ function isSemanticReactionArrowGraphic(graphic: GraphicObject): boolean {
   return semanticArrowExportKind(graphic) !== undefined;
 }
 
-/** Export a reaction/resonance-tagged art arrow as the standard CDXML reaction arrow
- *  (`<graphic GraphicType="Line" ArrowType=…>`) so other programs read it as a reaction arrow. The
- *  exact art geometry (arc, arrowhead size, style) still round-trips within ChemDraft via the
- *  embedded native payload; this is purely the interop representation. */
-function exportSemanticReactionArrowGraphic(
-  graphic: GraphicObject,
-  graphicId: string,
-  warnings: CompatibilityConversionWarning[],
-  colors: ExportColorTable
-): string {
-  const line = graphicLineEndpointsForCdxml(graphic);
-  const arrowKind = semanticArrowExportKind(graphic) ?? "forward";
-  const arrowType = cdxmlArrowTypeByExportKind[arrowKind];
-  // Appearance rides the same helpers every other graphic export uses; without them a dashed or
-  // coloured reaction arrow reopened elsewhere as a default solid black one, silently and with no
-  // warning. Colours share the same document-wide table as all other written objects.
-  const attributes = [
-    `id="${graphicId}"`,
-    `GraphicType="Line"`,
-    `ArrowType="${escapeXmlAttribute(arrowType)}"`,
-    ...cdxmlGraphicColorAttribute(graphic, warnings, colors),
-    ...cdxmlLineTypeAttributes(graphic),
-    `BoundingBox="${formatLineBoundingBox(line.start, line.end)}"`,
-    // Start/End are CDXML-only aliases. Binary CDX needs standard endpoints too; otherwise
-    // reopening falls back to an inset bounding-box diagonal and shortens a standalone arrow.
-    `Tail3D="${formatPoint(line.start)} 0"`,
-    `Head3D="${formatPoint(line.end)} 0"`,
-    `Start="${formatPoint(line.start)}"`,
-    `End="${formatPoint(line.end)}"`
-  ];
-  warnForSemanticArrowHeadLoss(graphic, arrowKind, warnings);
-  return `<graphic ${attributes.join(" ")}/>`;
-}
-
-/** Standard CDXML carries an arrow's heads in the closed `ArrowType` enum, so a head the user
- *  removed or swapped (a bare tail, a bar head) cannot be represented — it reopens elsewhere as the
- *  kind's default. Say so rather than exporting a silent lie. */
-function warnForSemanticArrowHeadLoss(
-  graphic: GraphicObject,
-  arrowKind: SemanticArrowExportKind,
-  warnings: CompatibilityConversionWarning[]
-): void {
-  const headKind = graphic.data.markerEnd?.kind;
-  const tailKind = graphic.data.markerStart?.kind;
-  const expectsTail = arrowKind === "resonance" || arrowKind === "equilibrium";
-  const headMissing = arrowKind !== "retrosynthesis" && (headKind === undefined || headKind === "none");
-  const tailMismatch = expectsTail
-    ? tailKind === undefined || tailKind === "none"
-    : tailKind !== undefined && tailKind !== "none";
-  if (!headMissing && !tailMismatch) {
-    return;
-  }
-
-  warnings.push({
-    code: "cdxml.arrow_head_payload_only",
-    message: `Arrowhead changes on this ${arrowKind} arrow are preserved exactly only in the embedded ChemDraft payload; standard CDXML reopens it with the default heads for ArrowType.`,
-    sourceObjectId: graphic.id
-  });
-}
-
 /**
  * The generic `<graphic>` export writes geometry and stroke only — no `ArrowType`, no arrowhead
  * attributes, no shaft mark. Standard CDXML simply cannot name a no-reaction cross or a head on a
  * decorative stroke, so the loss is unavoidable; going quiet about it is not. A no-reaction arrow
  * that reopens as a plain line has had its meaning inverted, not merely simplified.
  *
- * The two sibling arrow paths already warn for this class ({@link warnForSemanticArrowHeadLoss},
- * {@link warnForUnrepresentableArrowheads}); this covers the graphics that reach neither.
+ * The arrow path already warns for this class ({@link warnForUnrepresentableArrowheads});
+ * this covers the graphics that do not reach it.
  */
 function warnForGenericGraphicMarkerLoss(
   graphic: GraphicObject,
@@ -2527,14 +2576,35 @@ function exportGraphicAsCdxmlArrow(
     `BoundingBox="${escapeXmlAttribute(cdxmlBoundingBoxForGraphic(graphic, objectCornerPoints(graphic)))}"`,
     ...cdxmlGraphicColorAttribute(graphic, warnings, colors),
     ...cdxmlLineTypeAttributes(graphic),
+    ...cdxmlArrowLineWidthAttributes(graphic),
     'FillType="None"',
     ...cdxmlArrowheadAttributes(graphic, warnings),
+    ...cdxmlArrowShaftAttributes(graphic),
     ...(isArc ? [`AngularSize="${escapeXmlAttribute(cdxmlAngularSizeForGraphic(graphic))}"`] : []),
     `Head3D="${formatXyPoint(line.end)}"`,
     `Tail3D="${formatXyPoint(line.start)}"`,
     ...cdxmlLineAxisAttributes(line.start, line.end)
   ];
   return `<arrow ${attrs.join(" ")}/>`;
+}
+
+/** Use real Arrow objects in both CDXML and binary CDX (0x8021), with directed endpoints.
+ * The dual-shaft forms follow the Arrow conventions also used by Indigo's MoleculeCdxmlSaver::addArrow and
+ * addRetrosynteticArrow: https://github.com/epam/Indigo/blob/master/core/indigo-core/molecule/src/molecule_cdxml_saver.cpp
+ * Head sizing and the exact native shaft gap remain an appearance approximation. */
+function cdxmlArrowShaftAttributes(graphic: GraphicObject): string[] {
+  if (!graphic.data.dualShaft) return [];
+  return [`ArrowShaftSpacing="${graphic.data.dualShaftParallel ? 600 : 300}"`];
+}
+
+function cdxmlArrowLineWidthAttributes(graphic: GraphicObject): string[] {
+  const width = graphic.style.strokeWidth;
+  if (typeof width !== "number" || !(width > 0)) return [];
+  // Keep implicit defaults implicit: a decimal -> binary -> CSS conversion can otherwise put
+  // the bold default just below its classification threshold on the next export.
+  if (width === defaultCdxmlLineWidthPx || width === defaultCdxmlBoldWidthPx && cdxmlLineTypeForGraphic(graphic) === "Bold") return [];
+  const value = formatNumber(cssPxToCdxml(width));
+  return [`LineWidth="${value}"`, ...(cdxmlLineTypeForGraphic(graphic) === "Bold" ? [`BoldWidth="${value}"`] : [])];
 }
 
 /** Curves keep their source spelling where the corresponding native value is unchanged. Source
@@ -2548,8 +2618,12 @@ function exportGraphicAsCdxmlCurve(
 ): string {
   const attributes = preservedCurveAttributes(graphic.compatibility?.unknown.cdxmlCurveAttributes);
   const nativeCurve = graphic.compatibility?.unknown.cdxmlElementName !== "curve";
-  if (nativeCurve) {
+  const sourceFill = graphicStyleFromCdxmlCurve({ name: "curve", attributes, children: [] }, { colorByIndex: new Map(), warnings: [] });
+  if (nativeCurve || graphicHasVisibleFill(graphic) !== graphicHasVisibleFill({ ...graphic, style: sourceFill }) ||
+    graphic.style.fillMode !== sourceFill.fillMode) {
     attributes.FillType = graphicHasVisibleFill(graphic) ? "Solid" : "None";
+  }
+  if (nativeCurve) {
     if (approximateArc) {
       warnings.push({ code: "cdxml.arc_curve_approximation", sourceObjectId: graphic.id,
         message: "Circular arrow exported as cubic CDXML curve segments; the arc has a small geometric approximation." });
@@ -2597,7 +2671,7 @@ function exportGraphicAsCdxmlCurve(
     warnings.push({ code: "cdxml.curve_head_size_payload_only",
       message: "Edited native curve head dimensions remain only in the native payload; standard CDXML retains the source head sizing attributes.", sourceObjectId: graphic.id });
   }
-  const useFill = nativeCurve && graphic.data.pathClosed && graphicHasVisibleFill(graphic);
+  const useFill = graphic.data.pathClosed && graphicHasVisibleFill(graphic);
   const color = normalizeHexColor((useFill ? graphic.style.fillColor : graphic.style.strokeColor) ?? defaultCdxmlStrokeColor);
   if (useFill && graphic.style.strokeColor && normalizeHexColor(graphic.style.strokeColor) !== color) {
     warnings.push({ code: "cdxml.graphic_single_color", sourceObjectId: graphic.id,
@@ -2651,13 +2725,19 @@ function cdxmlArrowheadAttributes(
   graphic: GraphicObject,
   warnings: CompatibilityConversionWarning[]
 ): string[] {
+  // Retrosynthetic heads are part of the native parallel-shaft path, rather than markers.
+  if (graphic.data.dualShaft && graphic.data.dualShaftParallel) {
+    return ['ArrowheadHead="Full"', 'ArrowheadType="Angle"'];
+  }
   const head = cdxmlArrowheadForMarker(graphic.data.markerEnd);
   const tail = cdxmlArrowheadForMarker(graphic.data.markerStart);
   warnForUnrepresentableArrowheads(graphic, warnings);
+  const hollow = graphic.compatibility?.unknown.cdxmlHollowArrowMarkers ===
+    JSON.stringify([graphic.data.markerStart?.kind, graphic.data.markerEnd?.kind]);
   return [
     ...(head ? [`ArrowheadHead="${head.head}"`] : []),
     ...(tail ? [`ArrowheadTail="${tail.head}"`] : []),
-    `ArrowheadType="${head?.type ?? tail?.type ?? "Solid"}"`
+    `ArrowheadType="${hollow ? "Hollow" : head?.type ?? tail?.type ?? "Solid"}"`
   ];
 }
 
@@ -2767,22 +2847,23 @@ function cdxmlRectangleTypeForGraphic(graphic: GraphicObject): string | undefine
   const roundEdge = typeof graphic.data.cornerRadiusPx === "number" && graphic.data.cornerRadiusPx > 0;
   const dashed = Boolean(graphic.style.strokeDasharray);
   const shadow = graphic.style.effect === "shadow";
-  if (roundEdge && shadow) {
-    return "RoundEdge Shadow";
-  }
-  if (roundEdge && dashed) {
-    return "RoundEdge Dashed";
-  }
-  if (roundEdge) {
-    return "RoundEdge";
-  }
-  if (shadow) {
-    return "Shadow";
-  }
-  if (graphicHasVisibleFill(graphic)) {
-    return "Filled";
-  }
-  return dashed ? "Dashed" : undefined;
+  return [
+    roundEdge && "RoundEdge",
+    shadow && "Shadow",
+    dashed && "Dashed",
+    cdxmlRectangleHasRepresentableFill(graphic) && "Filled"
+  ].filter(Boolean).join(" ") || undefined;
+}
+
+function cdxmlRectangleHasRepresentableFill(graphic: GraphicObject): boolean {
+  if (!cdxmlRectanglePreservesOutline(graphic)) return graphicHasVisibleFill(graphic);
+  const stroke = normalizeHexColor(graphic.style.strokeColor ?? graphic.style.color ?? defaultCdxmlStrokeColor);
+  return graphicHasVisibleFill(graphic) && stroke !== undefined && stroke === normalizeHexColorValue(graphic.style.fillColor);
+}
+
+function cdxmlRectanglePreservesOutline(graphic: GraphicObject): boolean {
+  return (typeof graphic.data.cornerRadiusPx === "number" && graphic.data.cornerRadiusPx > 0) ||
+    graphic.style.effect === "shadow";
 }
 
 function cdxmlLineTypeAttributes(graphic: GraphicObject): string[] {
@@ -2820,25 +2901,28 @@ function cdxmlGraphicColorIndex(
   warnings: CompatibilityConversionWarning[],
   colors: ExportColorTable
 ): number | undefined {
-  // CDXML graphics carry a single color attribute. On import it becomes the stroke color, and only
-  // for "Filled"/"Shaded" subtypes does it also become the fill. So those shapes must export their
-  // fill color (not stroke) to round-trip the visible fill; every other subtype keeps the stroke.
+  // The single color becomes the stroke on import, plus the fill for Filled/Shaded subtypes.
+  // Rounded/shadowed rectangles keep the outline; plain rectangles retain the release-1.2 fill color.
   const subtype = cdxmlShapeSubtypeForColor(graphic);
   const fillDerivedFromColor = subtype.includes("filled") || subtype.includes("shaded");
   const strokeColor = graphic.style.strokeColor ?? graphic.style.color;
   const fillColor = graphic.style.fillColor;
-  const color = fillDerivedFromColor
+  const preserveRectangleOutline = graphic.graphicKind === "rect" && cdxmlRectanglePreservesOutline(graphic);
+  const droppedRectangleFill = preserveRectangleOutline && graphicHasVisibleFill(graphic) && !cdxmlRectangleHasRepresentableFill(graphic);
+  const color = preserveRectangleOutline ? strokeColor ?? defaultCdxmlStrokeColor : fillDerivedFromColor
     ? fillColor ?? graphic.style.color ?? strokeColor
     : strokeColor ?? fillColor;
   if (
-    fillDerivedFromColor &&
+    droppedRectangleFill || fillDerivedFromColor &&
     strokeColor &&
     fillColor &&
     normalizeHexColor(strokeColor) !== normalizeHexColor(fillColor)
   ) {
     warnings.push({
       code: "cdxml.graphic_single_color",
-      message: "CDXML graphics store a single color; the visible fill was preserved and the distinct stroke color was dropped.",
+      message: droppedRectangleFill
+        ? "CDXML graphics store a single color; the outline color was preserved and the distinct fill was not written."
+        : "CDXML graphics store a single color; the visible fill was preserved and the distinct stroke color was dropped.",
       sourceObjectId: graphic.id
     });
   }
@@ -3087,12 +3171,14 @@ function importVisibleCdxmlFromTree(tree: OrderedXmlTree, sourceFormat: "CDXML" 
         importPageObjects(pageElement, pageIndex, warnings, colorTable, fonts, curveLineDefaults, sourceFormat),
         importTransform
       );
-      return {
+      const page: DocumentPage = {
         ...pageTemplate,
         id: `page_${String(pageIndex + 1).padStart(3, "0")}`,
         objects: importedPage.objects,
         crossings: importedPage.crossings
       };
+      addImportedRadicalMarks(page);
+      return page;
     });
   } catch (error) {
     return {
@@ -3134,6 +3220,44 @@ function importVisibleCdxmlFromTree(tree: OrderedXmlTree, sourceFormat: "CDXML" 
     };
   }
   return { document: withBracketChemistryWarnings(parsed.data), warnings };
+}
+
+/** `markRadicals` is a mark contribution, never an intrinsic atom radical. Supply the same
+ * editable handle the atom tool creates, or the desktop commit normalizer must remove it.
+ * Run after source coordinate transforms so placement sees the final page and atom positions. */
+function addImportedRadicalMarks(page: DocumentPage): void {
+  const marks = page.objects.filter((object): object is ElectronMarkObject => object.type === "electron-mark");
+  const ids = new Set(page.objects.map(object => object.id));
+  for (const molecule of page.objects.filter((object): object is MoleculeObject => object.type === "molecule")) {
+    for (const atom of molecule.atoms) {
+      const carried = marks.filter(mark => mark.anchor.kind === "atom" && mark.anchor.objectId === molecule.id && mark.anchor.atomId === atom.id)
+        .reduce((sum, mark) => sum + (mark.markKind === "radical-dot" || mark.markKind === "charge" && mark.radical ? 1 : 0), 0);
+      const missing = (atom.markRadicals ?? 0) - carried;
+      for (let index = 0; index < missing; index++) {
+        const point = nativeRadicalPlacementPointForAtom(molecule, atom.id, page.objects, page.width, page.height)!;
+        const size = nativeChargeMarkSizePx;
+        const baseId = `${molecule.id}_${atom.id}_radical_${index + 1}`;
+        let id = baseId;
+        while (ids.has(id)) id += "_";
+        ids.add(id);
+        const mark: ElectronMarkObject = {
+          id, type: "electron-mark", markKind: "radical-dot",
+          x: Math.max(0, Math.min(point.x - size / 2, page.width - size)),
+          y: Math.max(0, Math.min(point.y - size / 2, page.height - size)),
+          width: size, height: size, rotation: 0, style: { source: "chemdraft-native-charge" },
+          anchor: { kind: "atom", objectId: molecule.id, atomId: atom.id },
+          atomAssociation: "explicit"
+        };
+        const atomPoint = transformPointForObject(molecule, atom);
+        mark.compatibility = { warnings: [], unknown: { cdxmlRadicalMarkPlacement: {
+          x: mark.x, y: mark.y, offsetX: mark.x - atomPoint.x, offsetY: mark.y - atomPoint.y,
+          objectId: molecule.id, atomId: atom.id
+        } } };
+        page.objects.push(mark);
+        marks.push(mark);
+      }
+    }
+  }
 }
 
 function importPageObjects(
@@ -4494,7 +4618,11 @@ function importText(textElement: XmlElementView, pageIndex: number, objectIndex:
       spans.push({
         text: textContent(run.children),
         script: face & 32 ? "subscript" : face & 64 ? "superscript" : "normal",
-        style: runColor ? { color: runColor } : {}
+        style: {
+          ...(runColor ? { color: runColor } : {}),
+          ...(face & 1 ? { fontWeight: 700 } : {}),
+          ...(face & 2 ? { fontStyle: "italic" } : {})
+        }
       });
     } else {
       const plain = textContent([node]);
@@ -4599,8 +4727,8 @@ function importGraphic(
     if (arrowKind === "forward" || arrowKind === "resonance" || arrowKind === "equilibrium" || arrowKind === "retrosynthesis") {
       return importReactionArrowAsArtArrow(element, pageIndex, objectIndex, context, arrowKind);
     }
-    const start = parseCdxmlPoint(element.attributes.Start) ?? { x: box.x, y: box.y };
-    const end = parseCdxmlPoint(element.attributes.End) ?? { x: box.x + box.width, y: box.y + box.height };
+    const start = parseCdxmlXyPoint(element.attributes.Tail3D) ?? parseCdxmlXyPoint(element.attributes.Start) ?? { x: box.x, y: box.y };
+    const end = parseCdxmlXyPoint(element.attributes.Head3D) ?? parseCdxmlXyPoint(element.attributes.End) ?? { x: box.x + box.width, y: box.y + box.height };
     const color = colorForCdxmlIndex(element.attributes.color, context.colorTable);
     return {
       id: `cdxml_arrow_${pageIndex + 1}_${objectIndex}`,
@@ -4628,7 +4756,7 @@ function importGraphic(
 }
 
 /** Import a CDXML reaction/resonance arrow as an editable art-arrow graphic (the reverse of
- *  {@link exportSemanticReactionArrowGraphic}). Reuses the line-graphic importer for correct
+ *  {@link exportGraphicAsCdxmlArrow}). Reuses the line-graphic importer for correct
  *  geometry/style, then tags it: single filled head for a reaction (forward) arrow, heads at both
  *  ends for a resonance arrow, plus the `artToolId` that round-trips its chemical identity. */
 function importReactionArrowAsArtArrow(
@@ -4638,6 +4766,12 @@ function importReactionArrowAsArtArrow(
   context: ImportPageContext,
   arrowKind: "forward" | "resonance" | "equilibrium" | "retrosynthesis"
 ): GraphicObject {
+  if (normalizedCdxmlToken(element.attributes.ArrowType) === "hollow") {
+    // Legacy Hollow is a forward arrow; share the modern open-head approximation and preservation.
+    return importArrowGraphic({ ...element, attributes: {
+      ...element.attributes, ArrowheadHead: "Full", ArrowheadType: "Hollow"
+    } }, pageIndex, objectIndex, context);
+  }
   const graphic = importShapeGraphic(element, pageIndex, objectIndex, context, "graphic");
   // The two-shaft forms: equilibrium is opposed half-arrows, one head per shaft; retrosynthesis runs
   // both shafts the same way under a single open head.
@@ -4673,7 +4807,7 @@ function importReactionArrowAsArtArrow(
     data: {
       ...graphic.data,
       // Only DEFAULT the path kind, as the `<arrow>` importer does. `graphicDataFromCdxmlShape` has
-      // already read `LineType="Wavy"` off this element, and `exportSemanticReactionArrowGraphic`
+      // already read `LineType="Wavy"` off this element, and `exportGraphicAsCdxmlArrow`
       // writes that same attribute back out — so overwriting it here straightened a wavy shaft on
       // the way in, including on files this codec had just written itself.
       artPathKind: dualShaft ? "line" : graphic.data.artPathKind ?? "line",
@@ -4700,7 +4834,7 @@ function importHalfHeadArrowAsFishhook(
   context.warnings.push(
     warning(
       "cdxml.half_head_arrow_import_approximation",
-      "A half-headed (fishhook) arrow was imported as ChemDraft's fishhook arrow, and exports again as ArrowType=\"HalfHead\". Its single-barb chemistry round-trips; the barb's left/right handedness does not, because native fishhook heads are one-sided but not handed."
+      "A half-headed (fishhook) arrow was imported as ChemDraft's fishhook arrow, and exports as an Arrow object with a HalfLeft head. Its single-barb chemistry round-trips; the barb's left/right handedness does not, because native fishhook heads are one-sided but not handed."
     )
   );
   return {
@@ -4720,17 +4854,10 @@ function importHalfHeadArrowAsFishhook(
  * Import a standalone `<arrow>` as a native art arrow, the same shape the
  * `<graphic GraphicType="Line" ArrowType=…>` path produces.
  *
- * ChemDraw writes reaction arrows as `<arrow>` elements; ChemDraft writes them as tagged
- * `<graphic>` lines. Only the second path produced a real arrow, so an imported ChemDraw arrow
- * arrived as an untagged `graphicKind: "line"` — a generic shape to everything downstream. The Main
- * toolbar offered it the shape layout (a fill colour, for a line), `graphicObjectSupportsMarkers`
- * requires `graphicKind === "path"` so its own head could not be edited, "Set as Default Arrow
- * Style" did not recognise it, and it re-exported as a decorative stroke.
- *
- * The tool is read from the heads, which is the only chemistry an `<arrow>` states: one head is a
+ * The tool is read from the heads and shaft spacing: one head is a
  * reaction arrow, heads at both ends a resonance arrow, a single barb a fishhook. A headless
- * `<arrow>` is left untagged — it is a line, and should not claim to be a chemical arrow — but it
- * still becomes a path so a head can be added to it later.
+ * `<arrow>` without shaft spacing is left untagged — it is a line, and should not claim to be a
+ * chemical arrow — but it still becomes a path so a head can be added to it later.
  */
 function importArrowGraphic(
   element: XmlElementView,
@@ -4740,7 +4867,26 @@ function importArrowGraphic(
 ): GraphicObject {
   const graphic = importShapeGraphic(element, pageIndex, objectIndex, context, "arrow");
   const markers = cdxmlArrowMarkers(element);
-  const artToolId = artToolIdForImportedArrowMarkers(markers);
+  const spaced = (parseNumber(element.attributes.ArrowShaftSpacing) ?? 0) > 0;
+  const retro = spaced && !markers.markerStart && markers.markerEnd?.kind === "open-arrow" &&
+    normalizedCdxmlToken(element.attributes.ArrowheadType) === "angle";
+  // Shaft spacing retains the two-shaft identity even when either or both heads were removed.
+  const equilibrium = spaced && !retro;
+  const artToolId = equilibrium ? "equilibriumArrow" : retro ? "retroArrow" : artToolIdForImportedArrowMarkers(markers);
+  const lineType = element.attributes.LineType;
+  if (element.name === "arrow" && lineType !== undefined && !["solid", "dashed", "bold", "wavy"].includes(normalizedCdxmlToken(lineType))) {
+    context.warnings.push({ code: "cdxml.arrow_line_type_approximation", sourceObjectId: element.attributes.id,
+      message: `${context.sourceFormat} arrow ${element.attributes.id ?? "(unknown)"} has unmapped LineType="${lineType}"; the arrowhead and reaction links are imported, while its line style is approximated and the source LineType is retained in compatibility data and visible export.` });
+  }
+  if (normalizedCdxmlToken(element.attributes.ArrowheadType) === "hollow" && (markers.markerStart || markers.markerEnd)) {
+    graphic.compatibility!.unknown.cdxmlHollowArrowMarkers = JSON.stringify([markers.markerStart?.kind, markers.markerEnd?.kind]);
+    context.warnings.push({ code: "cdxml.arrow_hollow_head_approximation", sourceObjectId: graphic.id,
+      message: `${context.sourceFormat} arrow "${element.attributes.id ?? graphic.id}" uses an open native arrowhead for the hollow head; its Hollow type is retained for unchanged export.` });
+  }
+  if ((equilibrium || retro) && graphic.data.artPathKind === "wavy") {
+    context.warnings.push(warning("cdxml.wavy_dual_shaft_arrow_straightened",
+      `A wavy ${equilibrium ? "equilibrium" : "retrosynthesis"} arrow was imported with a straight shaft: its two shafts are drawn geometry, which ChemDraft cannot currently draw as a wave. The arrow's chemistry is unchanged.`));
+  }
   return {
     ...graphic,
     graphicKind: "path",
@@ -4748,8 +4894,10 @@ function importArrowGraphic(
       ...graphic.data,
       // Only default the path kind — an <arrow> can carry real geometry of its own (a wavy shaft,
       // for one), and overwriting that would straighten it on import.
-      artPathKind: graphic.data.artPathKind ?? "line",
-      ...markers,
+      artPathKind: equilibrium || retro ? "line" : graphic.data.artPathKind ?? "line",
+      ...(retro ? {} : markers),
+      ...(equilibrium ? { dualShaft: true, dualShaftGapPx: 7 } : {}),
+      ...(retro ? { dualShaft: true, dualShaftParallel: true, dualShaftGapPx: 5 } : {}),
       ...(artToolId === undefined ? {} : { artToolId })
     }
   };
@@ -4812,7 +4960,7 @@ function importCurveGraphic(
   return {
     id, type: "graphic", ...box, rotation: 0,
     graphicKind: "path",
-    style: graphicStyleFromCdxmlCurve(effectiveElement, context.colorTable),
+    style: graphicStyleFromCdxmlCurve(effectiveElement, context.colorTable, message => note("cdxml.curve_fill_type_approximation", message)),
     data: {
       artPathKind: "bezier", pathNodes: nodes,
       ...(cdxmlCurveIsClosed(element.attributes) ? { pathClosed: true } : {}),
@@ -5061,21 +5209,36 @@ function graphicStyleFromCdxmlShape(
     style.fillColor = strokeColor;
     style.fillMode = "solid";
   }
-  if (ovalType.includes("shaded")) {
+  if (ovalType.includes("shaded") || rectangleType.includes("shaded")) {
     style.fillColor = strokeColor;
     style.fillMode = "gloss";
     style.strokeWidth = 1.5;
   }
   if (ovalType.includes("shadow") || rectangleType.includes("shadow")) {
     style.effect = "shadow";
-    style.fillColor = rectangleType.includes("shadow") ? "#ffffff" : defaultCdxmlFillColor;
+    if (!rectangleType.includes("filled") && !rectangleType.includes("shaded") && normalizedCdxmlToken(element.attributes.FillType) !== "none") {
+      style.fillColor = rectangleType.includes("shadow") ? "#ffffff" : defaultCdxmlFillColor;
+    }
   }
 
   return style;
 }
 
-function graphicStyleFromCdxmlCurve(element: XmlElementView, colorTable: CdxmlColorTable): GraphicObject["style"] {
+function graphicStyleFromCdxmlCurve(element: XmlElementView, colorTable: CdxmlColorTable, warn?: (message: string) => void): GraphicObject["style"] {
   const style = graphicStyleFromCdxmlShape(element, colorTable);
+  const fillType = normalizedCdxmlToken(element.attributes.FillType);
+  if (["solid", "2", "shaded", "4"].includes(fillType)) {
+    style.fillColor = style.strokeColor;
+    // Shape subtypes already define gloss; only curves need the solid approximation.
+    style.fillMode ??= "solid";
+  } else if (["none", "1"].includes(fillType)) {
+    style.fillColor = "none";
+    delete style.fillMode;
+  }
+  if (fillType && !["unspecified", "0", "none", "1", "solid", "2"].includes(fillType)) {
+    warn?.(`Curve "${element.attributes.id ?? "(unknown)"}" has FillType="${element.attributes.FillType}" with no native equivalent; ` +
+      (["shaded", "4"].includes(fillType) ? "a solid fill is used" : "no fill is used") + "; the source FillType is retained for export.");
+  }
   const width = normalizedCdxmlToken(element.attributes.LineType) === "bold"
     ? parseNumber(element.attributes.BoldWidth) ?? parseNumber(element.attributes.LineWidth)
     : parseNumber(element.attributes.LineWidth);
@@ -5803,13 +5966,6 @@ function formatColorComponent(value: number): string {
   return formatNumber(Math.max(0, Math.min(255, value)) / 255);
 }
 
-/** CDXML 2D positions are "x y" — see the CDXCoordinates note that the y-first order belongs to
- *  BINARY CDX, not CDXML. ChemDraft wrote y-first through codec v1; v2 writes spec order, and a v1
- *  file's visible layer is transposed on import (see {@link transposeImportedObject}). */
-function formatPoint(point: Point): string {
-  return `${formatNumber(cssPxToCdxml(point.x))} ${formatNumber(cssPxToCdxml(point.y))}`;
-}
-
 function formatXyPoint(point: Point): string {
   return `${formatNumber(cssPxToCdxml(point.x))} ${formatNumber(cssPxToCdxml(point.y))} 0`;
 }
@@ -5880,19 +6036,6 @@ function parseCdxmlXyBoundingBox(box: string | undefined): { x: number; y: numbe
   };
 }
 
-function cssPxToCdxml(value: number): number {
-  return value * cdxmlScale;
-}
-
-function cdxmlToCssPx(value: number): number {
-  return value / cdxmlScale;
-}
-
-function formatNumber(value: number): string {
-  const fixed = value.toFixed(4);
-  return fixed.replace(/\.?0+$/, "") || "0";
-}
-
 function boundsForAtoms(atoms: readonly MoleculeAtom[]): { x: number; y: number; width: number; height: number } {
   const xs = atoms.map((atom) => atom.x);
   const ys = atoms.map((atom) => atom.y);
@@ -5961,15 +6104,10 @@ const cdxmlArrowTypeByKind: Readonly<Record<Exclude<ArrowObject["arrowKind"], "u
   retrosynthesis: "RetroSynthetic"
 };
 
-/** The same spellings plus the one an art arrow can carry that no `reaction-arrow` object can. */
-const cdxmlArrowTypeByExportKind: Readonly<Record<SemanticArrowExportKind, string>> = {
-  ...cdxmlArrowTypeByKind,
-  fishhook: "HalfHead"
-};
-
 const arrowKindByCdxmlArrowType: ReadonlyMap<string, ArrowObject["arrowKind"]> = new Map([
   // Real CDXML spellings.
   ["fullhead", "forward"],
+  ["hollow", "forward"],
   // "halfhead" is absent on purpose: a half-headed arrow is one-electron chemistry and is
   // intercepted before this lookup (see importHalfHeadArrowAsFishhook). Mapping it to "forward"
   // here is what used to launder it into a two-electron reaction arrow.

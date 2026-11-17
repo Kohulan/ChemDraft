@@ -28,6 +28,34 @@ CDXML embeds native metadata by default; `{ embedNativePayload: false }` omits i
 root hash-version attribute `attrib4345`. Warnings about
 unsupported data say explicitly when that data is not written because no payload is embedded.
 
+Straight native reaction arrows and semantic art arrows export as real `<arrow>` elements in
+CDXML and Arrow objects (`0x8021`) in binary CDX. `Tail3D` is the native start; `Head3D` is the
+native end. Direction comes from these endpoints, independently of the normalized `BoundingBox`.
+All forms carry `FillType="None"`, stroke color, line style and representable line width.
+
+| Native form | `ArrowheadHead` | `ArrowheadTail` | `ArrowheadType` | `ArrowShaftSpacing` |
+| --- | --- | --- | --- | --- |
+| Forward, including bold/dashed variants | Full | omitted | Solid | omitted |
+| Resonance / double-headed | Full | Full | Solid | omitted |
+| Fishhook / half-head | HalfLeft | omitted | Solid | omitted |
+| Equilibrium | HalfLeft | HalfLeft | Solid | 300 |
+| Retrosynthesis | Full | omitted | Angle | 600 |
+| Open full head | Full | omitted | Angle | omitted |
+| Imported hollow full head | Full | omitted | Hollow | omitted |
+
+Art-arrow markers override the defaults in this table, preserving edited head sides and removed
+heads. Retrosynthesis uses its native parallel-shaft path head. The dual-shaft attribute conventions
+also appear in the independent [Indigo exporter](https://github.com/epam/Indigo/blob/master/core/indigo-core/molecule/src/molecule_cdxml_saver.cpp).
+Their exact head dimensions and shaft gaps remain appearance approximations. Half heads are not
+handed in the native model; export uses HalfLeft. Imported Hollow heads display with the native
+open marker and a named approximation warning; unchanged marker kinds retain Hollow on export.
+Mixed solid/open end types and decorative markers retain the existing named export warnings.
+
+Legacy Graphic Line + ArrowType input remains supported. No recognized semantic arrow kind needs
+a legacy Graphic export exception. An unknown reaction-arrow kind still writes an unheaded
+Graphic line with its existing warning rather than inventing chemistry. Curved arrows retain the
+existing curve export path.
+
 Native multi-atom labels are encoded as standard `GenericNickname` nodes with label text on the
 existing atom; its bond endpoints stay unchanged. Import also accepts unexpanded nickname, formula,
 fragment and monomer text nodes, including a `GenericNickname` property without a text object.
@@ -317,6 +345,14 @@ to cubic. Unheaded curves use the same native path without arrow markers. Source
 `<curve>`, while existing `<arrow>` objects keep their export form. Curves carry explicit line
 widths and custom colors through the visible CDXML, including when the native payload is removed.
 
+Curve `FillType="Solid"` imports as a native solid fill in the curve's color; `None` imports
+with no fill, and absent or `Unspecified` retains the unfilled default. Numeric CDXML spellings
+0/1/2 are accepted too. Shaded (4) uses a solid approximation with
+`cdxml.curve_fill_type_approximation`; other unsupported fill types warn and use no fill. Source
+fill types remain in compatibility data for unchanged export; native fill edits regenerate
+`FillType`. Filled closed native polylines therefore retain their fill through payload-free
+CDXML and binary CDX.
+
 `compatibility.unknown.cdxmlCurveAttributes` retains the source attributes, including the original
 `CurvePoints` text, head sizing, `LineType` and `Z`. Unchanged geometry and head attributes export
 verbatim; edited Bezier nodes export their current controls. Native head dimensions, half-head
@@ -342,6 +378,14 @@ pairs. `bracketedgroup` maps `SRU` to `bracketUsage: "sru"` plus `repeatUnit`, `
 `"multiple"`, absent usage to `"generic"`, and other usages to `"unknown"` with a named warning.
 Graphic-level usage fills in an absent group usage. `SRULabel`, safe positive integer `RepeatCount`,
 whole-fragment membership, and molecule-scoped crossing bonds round-trip through CDXML and CDX.
+Native partial repeat units write atom-level `BracketedObjectIDs` using chem-core's shared
+`resolveRepeatUnitAtomMembership`, so UI member counts and visible export describe the same atoms.
+Rotated pairs use the renderer's planar rotation convention for enclosure. If the pair's frame is
+unknown, export writes no geometry-based members; original native data and source references remain
+available through their existing preservation paths.
+`cdxml.bracket_membership_unresolved` names any repeat unit whose atom membership cannot be
+resolved, including an empty native repeat unit or inconsistent crossing bonds; source references
+are retained where possible.
 Atom-level or unresolved membership and unresolved crossing references remain compatibility data
 with warnings; they do not prevent native pair import. No multiplier expands the molecular graph.
 Invalid counts retain their original text and source group as compatibility data, with native usage

@@ -1,11 +1,13 @@
 import { lazy, Suspense, useEffect, type ReactElement } from "react";
 import {
   PREFERENCES_WINDOW_KIND,
+  isDesktopRuntime,
   routeToolsetCommand,
   TOOLSET_POPOVER_WINDOW_KIND,
   TOOLSET_TOOLTIP_WINDOW_KIND
 } from "./window-manager";
 import { installSecondaryWindowEditHistory } from "./editHistoryRouting";
+import { installBrowserReloadGuard } from "./browserReloadGuard";
 
 const MainWindow = lazy(() => import("./MainWindow").then(m => ({ default: m.MainWindow })));
 const PaletteWindow = lazy(() => import("./PaletteWindow").then(m => ({ default: m.PaletteWindow })));
@@ -15,8 +17,22 @@ const PluginPanelWindow = lazy(() => import("./plugins/PluginPanelWindow").then(
 const Spin3dDebuggerWindow = lazy(() => import("./Spin3dDebuggerWindow").then(m => ({ default: m.Spin3dDebuggerWindow })));
 const PreferencesWindow = lazy(() => import("./PreferencesWindow").then(m => ({ default: m.PreferencesWindow })));
 const DialogWindow = lazy(() => import("./dialogs/DialogWindow").then(m => ({ default: m.DialogWindow })));
+const FileWarningsWindow = lazy(() => import("./FileWarningsWindow").then(m => ({ default: m.FileWarningsWindow })));
 
 export function App() {
+  useEffect(() => {
+    if (!isDesktopRuntime()) return;
+    const kind = new URLSearchParams(window.location.search).get("window");
+    // Main handles its own outside press, excluding the toggle. Other native app
+    // windows have a dismissal-only capability; warning-row clicks stay inside.
+    if (!kind || kind === "fileWarnings") return;
+    const dismiss = () => { void import("@tauri-apps/api/core").then(({ invoke }) => invoke("file_warnings_dismiss")).catch(() => undefined); };
+    window.addEventListener("pointerdown", dismiss, true);
+    return () => window.removeEventListener("pointerdown", dismiss, true);
+  }, []);
+  if (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("window") === "fileWarnings") {
+    return <Suspense fallback={null}><FileWarningsWindow /></Suspense>;
+  }
   const dialog = dialogRoute();
   if (dialog !== undefined) {
     return <Suspense fallback={<p role="status">Opening dialog…</p>}>
@@ -42,6 +58,7 @@ export function App() {
  * focused text field, or hand the command to the main window's document history.
  */
 function SecondaryWindowEditHistory({ dialog = false }: { dialog?: boolean }): null {
+  useEffect(() => installBrowserReloadGuard(), []);
   useEffect(() => installSecondaryWindowEditHistory({ forwardToMain: dialog ? () => {} : routeToolsetCommand }), [dialog]);
   return null;
 }
