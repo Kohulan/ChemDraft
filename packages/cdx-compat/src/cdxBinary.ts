@@ -82,14 +82,14 @@ function prepareTextColors(root: CdxElement): void {
       if (explicitIndex === undefined) {
         // Without a table, CDXML's standard slot 3 is black. Reserved slot 0 keeps
         // explicit black distinct from the uncoloured foreground run.
-        if (!definition || ["r", "g", "b"].every(channel => Number(definition.attrs[channel] ?? 0) === 0)) explicitIndex = 0;
+        if (textForegroundIsBlack(root)) explicitIndex = 0;
         else {
           // Preserve the source palette for other objects; move explicit text using
           // slot 3 to an unambiguous palette entry before the table is serialized.
           const existing = palette.findIndex((color, index) => index + 2 !== TEXT_FOREGROUND
-            && ["r", "g", "b"].every(channel => Number(color.attrs[channel] ?? 0) === Number(definition.attrs[channel] ?? 0)));
+            && ["r", "g", "b"].every(channel => Number(color.attrs[channel] ?? 0) === Number(definition!.attrs[channel] ?? 0)));
           explicitIndex = existing >= 0 ? existing + 2 : palette.length + 2;
-          if (existing < 0) table!.kids.push({ ...definition, attrs: { ...definition.attrs }, kids: [] });
+          if (existing < 0) table!.kids.push({ ...definition!, attrs: { ...definition!.attrs }, kids: [] });
         }
       }
       element.attrs.color = String(explicitIndex);
@@ -663,6 +663,8 @@ const f64 = (v: number) => { const b = new Uint8Array(8); new DataView(b.buffer)
 const enc = new TextEncoder();
 const NUMBER = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d{1,3})?$/;
 const real = (s?: string) => { const t = s?.trim(); return t && NUMBER.test(t) && Math.abs(Number(t)) < 1e9 ? Number(t) : undefined; };
+export const isValidLongTagValue = (value: string): boolean => /^[-+]?\d+$/.test(value.trim())
+  && Number(value) >= -2147483648 && Number(value) <= 2147483647;
 const reals = (s: string) => s.trim().split(/\s+/).map(real);
 // Whole numbers in a list (ids reach 2^31).
 const ints = (s: string) => (s.trim() ? s.trim().split(/\s+/) : []).map((v) => (/^-?\d{1,10}$/.test(v) && Math.abs(Number(v)) < 2 ** 32 ? Number(v) : undefined));
@@ -770,7 +772,7 @@ export function writeCdx(root: CdxElement, warnings: CdxWarning[] = []): Uint8Ar
       }
       case "tagvalue": {
         const t = el.attrs.TagType;
-        return t === "Double" && r !== undefined ? f64(r) : t === "Long" && Number.isFinite(i) ? le(4, i) : t === "String" ? plainString(v, el) : undefined;
+        return t === "Double" && r !== undefined ? f64(r) : t === "Long" && isValidLongTagValue(v) ? le(4, Number(v)) : t === "String" ? plainString(v, el) : undefined;
       }
       case "sgvalue": return el.attrs.SGDataType === "4" ? enc.encode(v) : r === undefined ? undefined : f64(r);
       default: return undefined;
@@ -821,7 +823,7 @@ export function writeCdx(root: CdxElement, warnings: CdxWarning[] = []): Uint8Ar
       const p = plainName(x, byName.get(k));
       if (!p) { warn(x, "unknown attribute " + k); continue; }
       if (p.kind === "style") { style[k] = v; continue; }
-      if (p.kind === "raw" || p.kind === "glist" || ["tagvalue", "sgvalue"].includes(p.kind) && v.startsWith("|x|")) {
+      if (p.kind === "raw" || p.kind === "glist" || (p.kind === "sgvalue" || p.kind === "tagvalue" && x.attrs.TagType !== "Long") && v.startsWith("|x|")) {
         const b = rawValue(v);
         if (b) put(p.tag, b); else warn(x, `unencodable attribute ${k}`);
         continue;
@@ -830,6 +832,7 @@ export function writeCdx(root: CdxElement, warnings: CdxWarning[] = []): Uint8Ar
       const kind = x.name === "tlcspot" && (k === "Width" || k === "Height") ? { ...p, kind: "i32" } : p;
       const b = value(x, kind, v);
       if (b) put(p.tag, b);
+      else if (p.kind === "tagvalue" && x.attrs.TagType === "Long") warn(x, `invalid signed 32-bit Long value ${JSON.stringify(v)} for tag ${JSON.stringify(x.attrs.Name ?? x.attrs.id ?? "(unnamed)")}`);
       else if (!(p.kind === "flag" && /^(no|false)$/.test(v))) warn(x, "unencodable attribute " + k + "=" + JSON.stringify(v));
     }
     // Label and caption styles: CDXML's four attributes as one 8-byte record, the document's filling any part left out.

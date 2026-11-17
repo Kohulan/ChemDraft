@@ -50,6 +50,7 @@ import {
   cdxElementFromOrderedTree,
   cdxElementToCdxml,
   hex,
+  isValidLongTagValue,
   readCdx,
   writeCdx,
   type CdxElement
@@ -3149,6 +3150,15 @@ function buildMetadataObjectTags(values: {
 
 function importVisibleCdxmlFromTree(tree: OrderedXmlTree, sourceFormat: "CDXML" | "CDX"): { document?: ChemDraftDocument; warnings: CompatibilityConversionWarning[] } {
   const warnings: CompatibilityConversionWarning[] = [];
+  const invalidLongTags = findElements(tree, "objecttag").filter(tag => tag.attributes.TagType === "Long"
+    && tag.attributes.Value !== undefined && !isValidLongTagValue(tag.attributes.Value));
+  for (const tag of invalidLongTags) {
+    const { TagType, Value, Name, id } = tag.attributes;
+    if (TagType === "Long" && Value !== undefined && !isValidLongTagValue(Value)) {
+      warnings.push({ code: "cdxml.invalid_long_tag", sourceObjectId: id,
+        message: `${sourceFormat} object tag ${JSON.stringify(Name ?? id ?? "(unnamed)")} has invalid signed 32-bit Long value ${JSON.stringify(Value)}; its source text is not converted to a number.` });
+    }
+  }
   const pageElements = findElements(tree, "page");
   if (pageElements.length === 0) {
     return {
@@ -3171,6 +3181,14 @@ function importVisibleCdxmlFromTree(tree: OrderedXmlTree, sourceFormat: "CDXML" 
         importPageObjects(pageElement, pageIndex, warnings, colorTable, fonts, curveLineDefaults, sourceFormat),
         importTransform
       );
+      if (pageIndex === 0) {
+        // Keep root-level and nested tags even when their parent has no native compatibility slot.
+        invalidLongTags.forEach((tag, index) => {
+          const preserved = importUnknownCompatibilityObject(tag, pageIndex, index, sourceFormat);
+          preserved.id = `cdxml_invalid_long_tag_${index + 1}`;
+          importedPage.objects.push(preserved);
+        });
+      }
       const page: DocumentPage = {
         ...pageTemplate,
         id: `page_${String(pageIndex + 1).padStart(3, "0")}`,
