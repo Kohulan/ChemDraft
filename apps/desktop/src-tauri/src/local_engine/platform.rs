@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// Tests build every platform's pins; a Linux library build uses none of them.
+#[cfg(any(test, target_os = "macos", windows))]
 use super::pins;
 
 /// The Rust build target, also passed explicitly by tests for each supported platform.
@@ -274,7 +276,10 @@ pub fn free_disk_bytes(path: &Path) -> Result<u64, String> {
         }
         // SAFETY: statvfs returned success and initialized the structure.
         let stats = unsafe { stats.assume_init() };
-        Ok(u64::from(stats.f_bavail).saturating_mul(stats.f_frsize))
+        // f_bavail is u32 on macOS and u64 on Linux; the conversion is a no-op only on Linux.
+        #[allow(clippy::useless_conversion)]
+        let available = u64::from(stats.f_bavail);
+        Ok(available.saturating_mul(stats.f_frsize))
     }
     #[cfg(target_os = "windows")]
     {
