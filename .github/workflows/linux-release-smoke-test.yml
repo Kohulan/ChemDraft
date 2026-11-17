@@ -1,0 +1,492 @@
+name: Linux release (fork smoke test)
+
+# Builds the Linux packages for a release from the same tag as the macOS DMG and the Windows
+# installer: a .deb (Ubuntu, Linux Mint, Debian, Pop!_OS, elementary OS, …) and an AppImage (any
+# glibc-based distribution). Dispatch it with the same inputs as windows-release.yml:
+#
+#   gh workflow run linux-release.yml --ref v1.2.0 -f ref=v1.2.0 -f upload_to_release=v1.2.0
+#
+# Built on Ubuntu 22.04 on purpose: a binary links against the glibc and WebKitGTK of the host it is
+# built on, so the oldest supported base sets the floor. 22.04 covers Ubuntu 22.04+, Linux Mint 21+
+# and Debian 12+. See docs/releasing/linux.md.
+
+on:
+  push:
+    branches: [linux-x11-threads-smoke-test]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Public repository tag or full commit SHA to build
+        required: true
+        type: string
+      upload_to_release:
+        description: Optional existing DRAFT release tag (v<app version>)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# Do not race two uploads to the same draft.
+concurrency:
+  group: linux-release-${{ inputs.upload_to_release || inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # No fork runs, PR events, fork checkouts, or credentials persisted in the checkout.
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: amd64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      # apt must never stop at a prompt (needrestart, debconf) on a release runner.
+      DEBIAN_FRONTEND: noninteractive
+      NEEDRESTART_MODE: a
+    outputs:
+      version: ${{ steps.bundle.outputs.version }}
+      deb: ${{ steps.bundle.outputs.deb }}
+      appimage: ${{ steps.bundle.outputs.appimage }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release source
+        env:
+          BUILD_REF: ${{ inputs.ref || github.sha }}
+          RELEASE_TAG: ${{ inputs.upload_to_release }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          if ! [[ "$BUILD_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            tag=${BUILD_REF#refs/tags/}
+            git check-ref-format "refs/tags/$tag" || { echo '::error::ref must be a tag or full commit SHA.'; exit 1; }
+            tag_sha=$(git rev-parse --verify "refs/tags/${tag}^{commit}") || { echo '::error::ref must resolve to a repository tag.'; exit 1; }
+            [ "$tag_sha" = "$sha" ] || { echo '::error::ref must resolve to a repository tag.'; exit 1; }
+          fi
+          version=$(node -p "require('./apps/desktop/src-tauri/tauri.conf.json').version")
+          if [ -n "$RELEASE_TAG" ] && [ "$RELEASE_TAG" != "v$version" ]; then
+            echo "::error::upload_to_release must be v$version (the app version)."; exit 1
+          fi
+          echo "Release source: $sha (version $version)"
+
+      # The Tauri Linux build set: WebKitGTK 4.1 for the webview, librsvg for icons, patchelf and
+      # file for linuxdeploy (AppImage), xdg-utils so the bundled app can open links and mail.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo -E apt-get install -y --no-install-recommends \
+            build-essential pkg-config file patchelf xdg-utils \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev libsoup-3.0-dev libssl-dev libxdo-dev
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # rust-toolchain.toml is the single source of truth, as in the CI jobs.
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+          shared-key: linux-release-${{ matrix.arch }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21' # jlink --compress=zip-9 requires JDK 21+.
+      - name: Build host-native OPSIN runtime and smoke test benzene
+        run: node scripts/build-opsin-runtime.mjs
+
+      - name: Build stable .deb and AppImage
+        env:
+          CHEMDRAFT_STABLE_BUILD: '1'
+          # GitHub runners have no FUSE; linuxdeploy (itself an AppImage) must extract to run.
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+          # linuxdeploy's bundled strip predates the .relr.dyn sections newer toolchains emit.
+          NO_STRIP: 'true'
+          # The Vite build of the whole editor needs more than Node's default heap.
+          NODE_OPTIONS: --max-old-space-size=4096
+        # linuxdeploy resolves the dependencies of every ELF file in the AppDir, the bundled OPSIN
+        # JRE included. Its libraries need libjvm.so from the JRE's lib/server, which they find at
+        # run time through their own RUNPATH but linuxdeploy does not search: show it the folder.
+        run: |
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/apps/desktop/src-tauri/resources/opsin/jre/lib/server"
+          pnpm --filter @chemdraft/desktop build --bundles deb,appimage
+
+      - name: Verify stable bundle identity and stage packages
+        id: bundle
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          # tauri-build copies resource targets beside the release executable, as on Windows.
+          node tools/release/verify-bundle-licenses.mjs apps/desktop/src-tauri/target/release || { echo '::error::Required bundled licences are missing from the release resource staging directory.'; exit 1; }
+          conf=apps/desktop/src-tauri/tauri.conf.json
+          version=$(node -p "require('./$conf').version")
+          identifier=$(node -p "require('./$conf').identifier")
+          product=$(node -p "require('./$conf').productName")
+          [ "$identifier" = org.chemdraft.desktop ] && [ "$product" = ChemDraft ] || { echo '::error::Bundle has a development identity.'; exit 1; }
+          # build.rs re-emits the worktree label into the native title; a release must have none.
+          output=$(ls -t apps/desktop/src-tauri/target/release/build/chemdraft-*/output | head -n1)
+          grep -qx 'cargo:rustc-env=CHEMDRAFT_WORKTREE_LABEL=' "$output" || { echo '::error::Native build has a worktree label.'; exit 1; }
+          bundle=apps/desktop/src-tauri/target/release/bundle
+          deb="$bundle/deb/ChemDraft_${version}_${ARCH}.deb"
+          appimage="$bundle/appimage/ChemDraft_${version}_${ARCH}.AppImage"
+          [ -f "$deb" ] || { echo "::error::Missing $deb"; exit 1; }
+          [ -f "$appimage" ] || { echo "::error::Missing $appimage"; exit 1; }
+          # The .deb must carry the 3D sidecar, the OPSIN runtime and the bundled licences, as the
+          # other platforms do.
+          # (The Linux sidecar is still the placeholder from binaries/README.md; the app reports 3D
+          # as unavailable until a real Linux build replaces it.)
+          contents=$(dpkg-deb -c "$deb" | awk '{print $NF}' | sed 's|^\./||')
+          licences=$(node --input-type=module -e "import { requiredLicenseFiles } from './tools/release/required-license-files.mjs'; for (const { target } of requiredLicenseFiles) console.log('usr/lib/ChemDraft/' + target);")
+          for path in usr/bin/chemdraft usr/bin/avogadro3d-sidecar usr/lib/ChemDraft/resources/opsin/jre/bin/java $licences; do
+            grep -qxF "$path" <<<"$contents" || { echo "::error::$deb lacks $path"; exit 1; }
+          done
+          mkdir -p release-assets
+          cp "$deb" "$appimage" release-assets/
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "deb=$(basename "$deb")" >> "$GITHUB_OUTPUT"
+          echo "appimage=$(basename "$appimage")" >> "$GITHUB_OUTPUT"
+
+      - name: Print SHA-256 and sizes and write checksums
+        run: |
+          set -euo pipefail
+          cd release-assets
+          ls -l
+          sha256sum -- *.deb *.AppImage | tee SHA256SUMS-linux.txt
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-release-${{ matrix.arch }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  smoke:
+    needs: build
+    strategy:
+      # Both host stacks must report, even when one fails. The packages are built only on 22.04.
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      NEEDRESTART_MODE: a
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-release-amd64
+          path: release-assets
+
+      # Exercise both delivered packages, even if the first fails. The Linux-only harness lives
+      # here so a dispatched source tag need not contain a separate diagnostic script.
+      - name: Smoke test the installed .deb and AppImage
+        env:
+          DEB: release-assets/${{ needs.build.outputs.deb }}
+          # APPIMAGE itself is reserved for the AppImage runtime; setting it would also make
+          # Tauri misidentify the installed .deb process as running from an AppImage.
+          APPIMAGE_PACKAGE: release-assets/${{ needs.build.outputs.appimage }}
+        run: |
+          set -euo pipefail
+          (cd release-assets && sha256sum --check SHA256SUMS-linux.txt)
+          sudo apt-get update
+          sudo -E apt-get install -y --no-install-recommends xvfb xauth x11-utils xdotool openbox dbus dbus-bin gdb "./$DEB"
+          mkdir -p linux-smoke-logs
+          # Noble renames GTK to libgtk-3-0t64; match both hosts' installed package names.
+          dpkg-query -W 'libgtk-3-0*' libwebkit2gtk-4.1-0 'libsoup-3.0-0*' libc6 | tee linux-smoke-logs/libraries.log
+          harness="$RUNNER_TEMP/chemdraft-linux-smoke.sh"
+          cat > "$harness" <<'SMOKE'
+          set -euo pipefail
+          kind=$1
+          executable=$2
+          logs="$GITHUB_WORKSPACE/linux-smoke-logs/$kind"
+          mkdir -p "$logs"
+          export WEBKIT_DISABLE_DMABUF_RENDERER=1 RUST_BACKTRACE=1
+          # Currently Linux has no log backend; retain this filter for builds that install one.
+          export RUST_LOG=tauri=debug,tauri_runtime_wry=debug,wry=debug,tao=debug
+          export GDK_BACKEND=x11
+          profile() {
+            local root
+            root=$(mktemp -d "$RUNNER_TEMP/chemdraft-$kind.XXXXXX")
+            export XDG_CONFIG_HOME="$root/config" XDG_DATA_HOME="$root/data"
+            export XDG_CACHE_HOME="$root/cache" XDG_RUNTIME_DIR="$root/runtime"
+            mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR"
+            chmod 700 "$XDG_RUNTIME_DIR"
+            echo "Fresh app-data/profile: $root"
+          }
+          state() {
+            echo 'App-data and runtime entries (including any locks):'
+            find "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR" -maxdepth 4 -ls
+            echo 'Single-instance D-Bus name owner (Linux uses D-Bus, not a lock file):'
+            dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+              /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner \
+              string:org.chemdraft.desktop.SingleInstance
+            pgrep -a -x chemdraft || true
+          }
+          report_status() {
+            echo "$kind: wait exit status (\$?) = $1 ($2)"
+            if [ "$1" -gt 128 ]; then
+              local signal=$(( $1 - 128 ))
+              echo "$kind: signal $signal ($(kill -l "$signal" 2>/dev/null || echo unknown))"
+            else
+              echo "$kind: no terminating signal encoded in exit status"
+            fi
+          }
+          pid=
+          stop_and_wait() {
+            local status
+            if kill -0 "$pid" 2>/dev/null; then
+              echo "$kind: harness sending SIGTERM to $pid after observation"
+            fi
+            # setsid gives the launcher and its WebKit children a private process group. Clean
+            # up the whole group, including AppImage children, before testing the next format.
+            if kill -0 -- "-$pid" 2>/dev/null; then
+              echo "$kind: cleaning smoke process group $pid with SIGTERM"
+              kill -TERM -- "-$pid" 2>/dev/null || true
+              for _ in $(seq 1 10); do
+                kill -0 -- "-$pid" 2>/dev/null || break
+                sleep 1
+              done
+              if kill -0 -- "-$pid" 2>/dev/null; then
+                echo "$kind: process group $pid still exists after 10 s; sending SIGKILL"
+                kill -KILL -- "-$pid" 2>/dev/null || true
+              fi
+            fi
+            # Do not let errexit discard the child's status, including signal exits.
+            set +e
+            wait "$pid"
+            status=$?
+            set -e
+            report_status "$status" 'original smoke process; harness termination is labelled above'
+            pid=
+          }
+          finish() {
+            local result=$?
+            trap - EXIT
+            if [ -n "$pid" ]; then stop_and_wait; fi
+            if [ "$result" -ne 0 ]; then
+              for log in "$logs"/*.log; do
+                [ -f "$log" ] || continue
+                echo "Full diagnostic log: $log"
+                cat "$log"
+              done
+            fi
+            exit "$result"
+          }
+          trap finish EXIT
+          visible_window() {
+            local window owner
+            for window in $(xdotool search --onlyvisible --name '^ChemDraft' 2>/dev/null || true); do
+              owner=$(xdotool getwindowpid "$window" 2>/dev/null) || continue
+              # AppImage extract-and-run may fork AppRun rather than exec it. Accept its window
+              # only if its PID descends from our launcher; never accept an unrelated instance.
+              while [[ "$owner" =~ ^[0-9]+$ ]] && [ "$owner" -gt 1 ]; do
+                [ "$owner" = "$pid" ] && return 0
+                owner=$(ps -o ppid= -p "$owner" 2>/dev/null | tr -d ' ') || break
+              done
+            done
+            return 1
+          }
+          profile
+          state | tee "$logs/state-before.log"
+          # A private session bus and an empty XDG tree exclude a previous instance/profile.
+          dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+            /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner \
+            string:org.chemdraft.desktop.SingleInstance | grep -q 'boolean false'
+          command=("$executable")
+          debug_binary="$executable"
+          if [ "$kind" = appimage ]; then
+            chmod +x "$executable"
+            # Always use the FUSE-free path on runners. Smoke the actual delivered image.
+            command+=(--appimage-extract-and-run)
+            # A second extracted copy is for ldd/GDB only; the smoke still runs the image above.
+            extract=$(mktemp -d "$RUNNER_TEMP/chemdraft-appimage.XXXXXX")
+            (cd "$extract" && "$executable" --appimage-extract) >"$logs/extract.log" 2>&1
+            appdir="$extract/squashfs-root"
+            debug_binary="$appdir/usr/bin/chemdraft"
+            test -x "$debug_binary"
+          fi
+          echo "ldd for $debug_binary (host resolution):"
+          ldd "$debug_binary" | tee "$logs/ldd.log"
+          setsid "${command[@]}" >"$logs/app.log" 2>&1 &
+          pid=$!
+          echo "$kind: smoke PID $pid; command: ${command[*]}"
+          failure=
+          appeared=false
+          for _ in $(seq 1 60); do
+            if ! kill -0 "$pid" 2>/dev/null; then
+              failure='ChemDraft exited during start-up.'
+              break
+            fi
+            # Restrict to this application's windows so another package cannot satisfy the test.
+            if visible_window; then
+              appeared=true
+              break
+            fi
+            sleep 1
+          done
+          if [ -z "$failure" ] && [ "$appeared" = false ]; then
+            failure='No ChemDraft window appeared within 60 s.'
+          fi
+          if [ -z "$failure" ]; then
+            # Palettes and the tooltip are created after the document window.
+            sleep 20
+            kill -0 "$pid" 2>/dev/null || failure='ChemDraft crashed after start-up.'
+            if [ -z "$failure" ] && ! visible_window; then
+              failure='ChemDraft has no visible window after start-up.'
+            fi
+          fi
+          state >"$logs/state-after.log" 2>&1 || true
+          stop_and_wait
+          if grep -q 'panicked' "$logs/app.log"; then failure='ChemDraft panicked.'; fi
+          if [ -n "$failure" ]; then
+            echo "::error::$kind: $failure"
+            # Retry with both fresh data and a new bus, after reaping the first process. A passing
+            # retry never clears the original failure. Bound a retry that does not reproduce.
+            profile
+            # Synchronous X errors keep the issuing GTK/Tao call on the stack at SIGTRAP.
+            export GDK_SYNCHRONIZE=1
+            debug_script="$logs/debug.gdb"
+            cat > "$debug_script" <<'GDB'
+          set pagination off
+          set breakpoint pending on
+          set startup-with-shell off
+          # These packages are amd64: record window/atom IDs and the callers of each property
+          # read without calling Xlib from GDB (which could deadlock the stopped client).
+          break XGetWindowProperty
+          commands
+            silent
+            printf "XGetWindowProperty window=%#lx atom=%lu\n", $rsi, $rdx
+            bt 12
+            continue
+          end
+          # A pending gdk_x_error breakpoint resolves if the GTK build exposes that symbol.
+          break gdk_x_error
+          # Also catch clean/fatal library exits: the previous retry exited 01 with no stack.
+          break exit
+          break _exit
+          run
+          bt
+          thread apply all bt full
+          GDB
+            debug_command=(/usr/bin/gdb --nx --nh -batch -x "$debug_script" --args "$debug_binary")
+            if [ "$kind" = appimage ]; then
+              # Let AppRun configure its own bundled loader, schemas and WebKit helpers before
+              # entering GDB. Replace only the executable in the disposable diagnostic copy.
+              mv "$debug_binary" "$debug_binary.real"
+              cat > "$debug_binary" <<'DEBUG'
+          #!/bin/bash
+          set -euo pipefail
+          binary="$(dirname "$0")/chemdraft.real"
+          # AppRun itself sets PYTHONHOME/PYTHONPATH to its incomplete Python tree. Host GDB
+          # embeds Python, so clearing only the environment *before* AppRun is insufficient.
+          for variable in "${!PYTHON@}"; do unset "$variable"; done
+          echo 'ldd inside the AppRun environment:'
+          /usr/bin/ldd "$binary"
+          # GDB must load host libraries, while the inferior needs AppRun's library/helper PATH.
+          environment_script="$CHEMDRAFT_SMOKE_LOGS/apprun-environment.gdb"
+          printf 'set environment LD_LIBRARY_PATH = %s\n' "${LD_LIBRARY_PATH-}" > "$environment_script"
+          printf 'set environment LD_PRELOAD = %s\n' "${LD_PRELOAD-}" >> "$environment_script"
+          printf 'set environment PATH = %s\n' "$PATH" >> "$environment_script"
+          exec /usr/bin/env -u LD_LIBRARY_PATH -u LD_PRELOAD PATH=/usr/bin:/bin \
+            /usr/bin/gdb --nx --nh -batch -x "$environment_script" \
+            -x "$CHEMDRAFT_SMOKE_GDB_SCRIPT" --args "$binary" "$@"
+          DEBUG
+              chmod +x "$debug_binary"
+              debug_command=(env APPDIR="$appdir" APPIMAGE="$executable"
+                CHEMDRAFT_SMOKE_LOGS="$logs" CHEMDRAFT_SMOKE_GDB_SCRIPT="$debug_script" "$appdir/AppRun")
+            fi
+            set +e
+            timeout --signal=INT --kill-after=10s 90s dbus-run-session -- "${debug_command[@]}" >"$logs/gdb.log" 2>&1
+            debug_status=$?
+            set -e
+            # Match numeric property IDs in GDB to names without invoking Xlib in the inferior.
+            xlsatoms >"$logs/atoms.log" 2>&1 || true
+            report_status "$debug_status" 'debugger retry; 124 means the 90 s diagnostic timeout'
+            exit 1
+          fi
+          echo "Smoke test passed: $kind started and stayed up."
+          SMOKE
+          # xvfb-run chooses an unused display and waits until it is ready. Keep the same
+          # server/WM for both package formats; each app still gets its own profile and bus.
+          export CHEMDRAFT_SMOKE_HARNESS="$harness"
+          xvfb-run -a --error-file=linux-smoke-logs/xvfb.log \
+            --server-args='-screen 0 1920x1080x24 +extension RANDR +extension GLX -nolisten tcp' \
+            bash <<'DISPLAY_SESSION'
+          set -euo pipefail
+          xdpyinfo >linux-smoke-logs/display.log
+          openbox >linux-smoke-logs/openbox.log 2>&1 &
+          wm_pid=$!
+          trap 'kill "$wm_pid" 2>/dev/null || true' EXIT
+          # Do not race startup against Openbox advertising its EWMH support on the root window.
+          wm_ready=false
+          for _ in $(seq 1 50); do
+            kill -0 "$wm_pid"
+            if xprop -root _NET_SUPPORTING_WM_CHECK | grep -q 'window id'; then wm_ready=true; break; fi
+            sleep 0.1
+          done
+          [ "$wm_ready" = true ] || { echo '::error::Openbox did not become ready.'; exit 1; }
+          failed=0
+          for kind in deb appimage; do
+            if [ "$kind" = deb ]; then executable=$(command -v chemdraft); else executable="$GITHUB_WORKSPACE/$APPIMAGE_PACKAGE"; fi
+            # Each format gets its own bus, so the installed package cannot cause the AppImage
+            # to hand off to it and exit successfully without actually testing its startup.
+            # Allowlist the runner environment: no inherited PYTHON*, loader overrides, virtual
+            # environments, or AppImage variables. Execute the image directly, never via Python.
+            if env -i PATH=/usr/bin:/bin HOME="$HOME" USER="$USER" LANG=C.UTF-8 \
+              DISPLAY="$DISPLAY" XAUTHORITY="${XAUTHORITY:-}" \
+              GITHUB_WORKSPACE="$GITHUB_WORKSPACE" RUNNER_TEMP="$RUNNER_TEMP" \
+              dbus-run-session -- bash "$CHEMDRAFT_SMOKE_HARNESS" "$kind" "$executable" \
+              2>&1 | tee "linux-smoke-logs/$kind.log"; then
+              :
+            else
+              failed=1
+            fi
+          done
+          exit "$failed"
+          DISPLAY_SESSION
+
+      - name: Preserve Linux smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-smoke-amd64-${{ matrix.runner }}
+          path: linux-smoke-logs/
+          if-no-files-found: ignore
+
+  upload:
+    needs: [build, smoke]
+    if: github.repository == 'jgassens/ChemDraft' && !github.event.repository.fork && inputs.upload_to_release != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Only this job can upload release assets; no source code executes here.
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: linux-release-*
+          merge-multiple: true
+          path: release-assets
+      - name: Upload only to an existing draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.upload_to_release }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          [ "$RELEASE_TAG" = "v$VERSION" ] || { echo '::error::Release tag must match the package version.'; exit 1; }
+          draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft) || { echo '::error::Target release must already exist.'; exit 1; }
+          [ "$draft" = true ] || { echo '::error::Refusing to upload to a published release.'; exit 1; }
+          gh release upload "$RELEASE_TAG" release-assets/* --clobber
