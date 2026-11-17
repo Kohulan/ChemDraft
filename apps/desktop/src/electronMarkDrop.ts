@@ -165,7 +165,10 @@ function applyElectronMarkDrops(
   let after = normalizeCommittedDocument(applyPatches(moved, drops.map(({ mark, anchor }) => ({
     op: "updateObject", objectId: mark.id, changes: { anchor, atomAssociation: "explicit" }
   })), { now: phase4Timestamp }));
+  // Verify requested atom drops. For drops without a target, report the association
+  // reconciliation actually made, including changes outside the pointer capture radius.
   for (const drop of drops) {
+    if (!drop.destination) continue;
     const finalMark = findDocumentObject(after, drop.mark.id) as ElectronMarkObject;
     if (!sameAtom(drop.destination, associatedAtom(after, finalMark.anchor))) {
       return refusal(drop, "the atom cannot accept this mark's charge or unpaired electrons");

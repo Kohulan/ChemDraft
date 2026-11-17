@@ -22917,6 +22917,7 @@ export function MainWindow({
                   return (
                     <DocumentObjectView
                       directElectronMarkEditing={directElectronMarkEditing}
+                      shortcutPlatform={shortcutPlatform}
                       key={objectRenderKey}
                       {...objectViewHandlers}
                       object={moveArrowPreviewObjects?.get(object.id)?.object ?? object}
@@ -28618,6 +28619,7 @@ const DocumentObjectView = memo(DocumentObjectViewContent);
 
 function DocumentObjectViewContent({
   directElectronMarkEditing = false,
+  shortcutPlatform,
   object,
   layerIndex,
   interactionLayer,
@@ -28698,6 +28700,7 @@ function DocumentObjectViewContent({
   onAtomProblemInvoke
 }: {
   directElectronMarkEditing?: boolean;
+  shortcutPlatform?: ShortcutPlatform;
   onBondStereoBadgeOpen(request: BondStereoBadgeRequest): void;
   onAtomProblemInvoke(commandId: string): void;
   object: DocumentObject;
@@ -29370,6 +29373,7 @@ function DocumentObjectViewContent({
                   target={{ objectId: object.id, atomId: atom.id }}
                   key={`invalid-${atom.id}`}
                   explanation={invalidReasonByAtomId.get(atom.id)}
+                  platform={shortcutPlatform}
                   x={atom.x - object.x + 9} y={atom.y - object.y - 9}
                   invoke={onAtomProblemInvoke}
                 />
