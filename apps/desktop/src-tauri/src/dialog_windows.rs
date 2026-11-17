@@ -1853,7 +1853,7 @@ pub(crate) async fn dialog_send(
                 .map(|s| (s.snapshot.dialog_kind.clone(), s.content_fit))
                 .ok_or("Unknown dialog window")?;
             // No reveal/focus: a status update must not activate a hidden/suspended dialog.
-            place_content_window(&target, &kind, content_fit, true)
+            place_content_window(&target, &kind, content_fit, PlacementMode::Refit)
         })
         .and_then(|result| result)
         {
@@ -2030,7 +2030,7 @@ pub(crate) async fn preferences_ready(
     }
     let target = window.clone();
     super::run_on_main_thread_blocking(&window, move || {
-        place_content_window(&target, "preferences", measured, false)?;
+        place_content_window(&target, "preferences", measured, PlacementMode::Initial)?;
         show_on_main(&target)?;
         Ok(())
     })
@@ -2186,7 +2186,7 @@ fn show_on_main<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), Stri
             .find(|s| s.registration.window_label == window.label())
             .map(|s| (s.snapshot.dialog_kind.clone(), s.content_fit))
             .ok_or("Unknown dialog window")?;
-        place_content_window(window, &kind, content_fit, true)?;
+        place_content_window(window, &kind, content_fit, PlacementMode::Reveal)?;
     }
     window.show().map_err(|e| e.to_string())?;
     if preferences {
@@ -2474,12 +2474,9 @@ impl NormalFrame {
 
     fn reachable(&self, monitors: &[WorkArea]) -> bool {
         let width = f64::from(self.physical.outer.0) / self.physical.scale;
-        let height = f64::from(self.physical.outer.1) / self.physical.scale;
         monitors.iter().any(|work| {
-            self.saved.x >= work.x
-                && self.saved.y >= work.y
-                && self.saved.x + width <= work.x + work.width
-                && self.saved.y + height <= work.y + work.height
+            work.id == self.saved.monitor
+                && work.title_bar_reachable(self.saved.x, self.saved.y, width)
         })
     }
 
@@ -2678,6 +2675,7 @@ struct WorkArea {
     width: f64,
     height: f64,
     scale: f64,
+    margin: f64,
 }
 impl WorkArea {
     fn from_monitor(m: &tauri::Monitor) -> Self {
@@ -2693,6 +2691,7 @@ impl WorkArea {
             width: f64::from(area.size.width) / scale,
             height: f64::from(area.size.height) / scale,
             scale,
+            margin: 0.0,
         }
     }
     fn inset(&self, margin: f64) -> Self {
@@ -2704,8 +2703,18 @@ impl WorkArea {
             y: self.y + margin,
             width: self.width - margin * 2.0,
             height: self.height - margin * 2.0,
+            margin: self.margin + margin,
             ..self.clone()
         }
+    }
+    fn title_bar_reachable(&self, x: f64, y: f64, width: f64) -> bool {
+        // The inset is for fitting new or off-screen windows. A saved title bar can use
+        // the real work area, including the strip between the inset and the system UI.
+        let title_center_x = x + width / 2.0;
+        title_center_x >= self.x - self.margin
+            && title_center_x < self.x + self.width + self.margin
+            && y >= self.y - self.margin
+            && y + super::MAIN_WINDOW_TITLE_GRAB_PT <= self.y + self.height + self.margin
     }
     fn clamp(&self, x: f64, y: f64, width: f64, height: f64) -> (f64, f64) {
         // Keep the entire title bar reachable; also keep the whole dialog in the work area if it fits.
@@ -2798,7 +2807,11 @@ fn position_for(
             // Restore the saved outer origin, independent of the newly measured client size.
             // Reconstructing it from normalized offsets moves the window whenever content or
             // decorations change between the saved frame and the initial/re-fitted frame.
-            let (x, y) = m.clamp(saved.x, saved.y, size.0, size.1);
+            let (x, y) = if m.title_bar_reachable(saved.x, saved.y, size.0) {
+                (saved.x, saved.y)
+            } else {
+                m.clamp(saved.x, saved.y, size.0, size.1)
+            };
             return (x * m.scale, y * m.scale, m.scale);
         }
     }
@@ -2866,20 +2879,51 @@ fn place_window<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), Stri
         .find(|s| s.registration.window_label == window.label())
         .map(|s| (s.snapshot.dialog_kind.clone(), s.content_fit))
         .ok_or("Unknown dialog window")?;
-    place_content_window(window, &kind, content_fit, false)
+    place_content_window(window, &kind, content_fit, PlacementMode::Initial)
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlacementMode {
+    Initial,
+    Reveal,
+    Refit,
+}
+
+impl PlacementMode {
+    fn template<'a>(
+        self,
+        saved: Option<&'a SavedPosition>,
+        persisted: Option<&SavedPosition>,
+        scale: f64,
+        owner_rect: (f64, f64, f64, f64),
+    ) -> Option<TemplatePlacement<'a>> {
+        let saved = saved.filter(|live| {
+            self != Self::Refit
+                || persisted.is_some_and(|stored| {
+                    // The first content observer can refit as soon as the window is shown.
+                    // Keep the restored origin through that refit, allowing native rounding.
+                    live.monitor == stored.monitor
+                        && ((live.x - stored.x) * scale).abs() < 1.0
+                        && ((live.y - stored.y) * scale).abs() < 1.0
+                })
+        });
+        (self == Self::Initial || saved.is_some())
+            .then_some(TemplatePlacement { saved, owner_rect })
+    }
+}
+
 fn place_content_window<R: Runtime>(
     window: &tauri::WebviewWindow<R>,
     kind: &str,
     content_fit: Option<MeasuredContent>,
-    current_frame: bool,
+    mode: PlacementMode,
 ) -> Result<(), String> {
     // Defence in depth for any content-fit/reveal caller: Preferences never refits after
     // ready. Only the explicit, cached off-screen recovery path may place a retained frame.
-    if kind == "preferences" && current_frame {
+    if kind == "preferences" && mode != PlacementMode::Initial {
         return Ok(());
     }
-    place_content_window_from_frame(window, kind, content_fit, current_frame, None, None)
+    place_content_window_from_frame(window, kind, content_fit, mode, None, None)
 }
 
 fn recover_preferences_frame<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<bool, String> {
@@ -2938,7 +2982,7 @@ fn recover_preferences_frame<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Re
             window,
             "preferences",
             None,
-            true,
+            PlacementMode::Reveal,
             retained.as_ref(),
             Some(normal),
         );
@@ -2984,10 +3028,11 @@ fn place_content_window_from_frame<R: Runtime>(
     window: &tauri::WebviewWindow<R>,
     kind: &str,
     content_fit: Option<MeasuredContent>,
-    current_frame: bool,
+    mode: PlacementMode,
     retained: Option<&NormalFrame>,
     normal: Option<NormalFrame>,
 ) -> Result<(), String> {
+    let current_frame = mode != PlacementMode::Initial;
     let app = window.app_handle();
     let owner = app
         .get_webview_window(super::MAIN_WINDOW_LABEL)
@@ -3073,22 +3118,24 @@ fn place_content_window_from_frame<R: Runtime>(
         .and_then(|s| monitors.iter().find(|m| m.id == s.monitor))
         .unwrap_or(&work);
     // Content changes grow from the live origin, only moving to stay inside the work area.
-    if let Some(live) = live_frame.filter(|_| saved.is_some()) {
+    if let Some(live) = live_frame.filter(|_| mode == PlacementMode::Refit && saved.is_some()) {
         x = live.x * destination_scale;
         y = live.y * destination_scale;
     }
-    let template_placement = (!current_frame).then_some(TemplatePlacement {
+    let template_placement = mode.template(
         saved,
-        owner_rect: (
+        positions.get(kind),
+        destination_scale,
+        (
             f64::from(position.x) / destination.scale,
             f64::from(position.y) / destination.scale,
             f64::from(owner_size.width) / destination.scale,
             f64::from(owner_size.height) / destination.scale,
         ),
-    });
+    );
     // WM_DPICHANGED runs when moving between Windows monitors. Move first, set the desired
     // client size at the destination DPI, then clamp using the measured final outer frame.
-    mark_transient(window.label());
+    mark_placement_transient(window.label());
     let applied_client = std::cell::Cell::new(None);
     DialogPlacement {
         position: (x, y, destination_scale),
@@ -3203,7 +3250,7 @@ fn place_content_window_from_frame<R: Runtime>(
         },
         |size| window.set_min_size(Some(size)).map_err(|e| e.to_string()),
     )?;
-    mark_transient(window.label());
+    mark_placement_transient(window.label());
     // Persistence bookkeeping must not turn an otherwise placed dialog into an
     // error when the same native measurements that required fallback are still unavailable.
     match window.inner_size() {
@@ -3377,6 +3424,7 @@ impl DialogPlacement<'_> {
         mut set_minimum: impl FnMut(tauri::LogicalSize<f64>) -> Result<(), String>,
     ) -> Result<(), String> {
         let fits_work_area = self.template.is_some() || self.fit_content;
+        let saved = self.template.as_ref().and_then(|template| template.saved);
         if fits_work_area {
             // Small work areas may require less than the kind's usual minimum.
             set_minimum(tauri::LogicalSize::new(1.0, 1.0))?;
@@ -3411,12 +3459,20 @@ impl DialogPlacement<'_> {
             let client = fitted_template_client(template_client, template_frame.outer, self.work);
             resize(client.0, client.1)?;
             let outer = DialogFrame::from_client(client, decorations).outer;
-            let (x, y) = self.work.clamp(
-                self.work.x + (self.work.width - f64::from(outer.0) / self.work.scale) / 2.0,
-                self.work.y + (self.work.height - f64::from(outer.1) / self.work.scale) / 2.0,
-                f64::from(outer.0) / self.work.scale,
-                f64::from(outer.1) / self.work.scale,
-            );
+            let width = f64::from(outer.0) / self.work.scale;
+            let height = f64::from(outer.1) / self.work.scale;
+            let (x, y) = if let Some(saved) =
+                saved.filter(|s| self.work.title_bar_reachable(s.x, s.y, width))
+            {
+                (saved.x, saved.y)
+            } else {
+                self.work.clamp(
+                    self.work.x + (self.work.width - width) / 2.0,
+                    self.work.y + (self.work.height - height) / 2.0,
+                    width,
+                    height,
+                )
+            };
             move_to(x * self.work.scale, y * self.work.scale)?;
         }
         if fits_work_area {
@@ -3567,30 +3623,44 @@ fn mark_preferences_position(label: &str, position: (i32, i32)) {
     }
 }
 pub(crate) fn mark_transient(label: &str) {
-    if label == super::PREFERENCES_WINDOW_LABEL {
-        if let Some(state) = REGISTRY
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .preferences
-            .as_mut()
-        {
-            state.transient_until = Instant::now() + Duration::from_millis(500);
-            state.programmatic_client = None;
-            state.programmatic_position = None;
-        }
-        return;
-    }
+    // A picker only hid and showed the dialog. Keep the tags for its placed frame so
+    // close-time capture still recognizes a work-area-clamped size as programmatic.
+    mark_transient_in(&REGISTRY, label, false);
+}
 
-    if let Some(session) = REGISTRY
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .sessions
-        .values_mut()
-        .find(|s| s.registration.window_label == label)
-    {
-        session.transient_until = Instant::now() + Duration::from_millis(500);
-        session.programmatic_client = None;
-        session.programmatic_position = None;
+fn mark_placement_transient(label: &str) {
+    mark_transient_in(&REGISTRY, label, true);
+}
+
+fn mark_transient_in(registry: &Mutex<Registry>, label: &str, placing: bool) {
+    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    let markers = if label == super::PREFERENCES_WINDOW_LABEL {
+        registry.preferences.as_mut().map(|state| {
+            (
+                &mut state.transient_until,
+                &mut state.programmatic_client,
+                &mut state.programmatic_position,
+            )
+        })
+    } else {
+        registry
+            .sessions
+            .values_mut()
+            .find(|s| s.registration.window_label == label)
+            .map(|session| {
+                (
+                    &mut session.transient_until,
+                    &mut session.programmatic_client,
+                    &mut session.programmatic_position,
+                )
+            })
+    };
+    if let Some((until, client, position)) = markers {
+        *until = Instant::now() + Duration::from_millis(500);
+        if placing {
+            *client = None;
+            *position = None;
+        }
     }
 }
 fn remember_programmatic_client(label: &str, size: (u32, u32)) {
@@ -4599,6 +4669,7 @@ mod tests {
             width: 1600.0,
             height: 1000.0,
             scale,
+            margin: 0.0,
         };
         // Physical measurements from the destination monitor, including native decorations.
         let client = ((800.0 * scale) as u32, (600.0 * scale) as u32);
@@ -4670,6 +4741,7 @@ mod tests {
                     width: 1600.0,
                     height: 1000.0,
                     scale,
+                    margin: 0.0,
                 };
                 let decorations = if platform == "windows" {
                     (16.0, 40.0)
@@ -4798,6 +4870,7 @@ mod tests {
                     width: 1600.0,
                     height: 1000.0,
                     scale,
+                    margin: 0.0,
                 };
                 write_positions(&path, vec![("preferences".into(), original.clone())]);
                 let registry = Mutex::new(Registry {
@@ -4868,6 +4941,52 @@ mod tests {
                 std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn preferences_picker_restore_preserves_the_preclamp_size_on_close() {
+        let work = WorkArea {
+            id: "screen".into(),
+            x: 0.0,
+            y: 24.0,
+            width: 1200.0,
+            height: 600.0,
+            scale: 2.0,
+            margin: 0.0,
+        };
+        let frame = PhysicalNormalFrame {
+            position: (200, 250),
+            outer: (1400, 1100),
+            client: (1400, 1044),
+            scale: work.scale,
+        };
+        let registry = Mutex::new(Registry {
+            preferences: Some(PreferencesLayout {
+                programmatic_client: Some(frame.client),
+                programmatic_position: Some(frame.position),
+                ..PreferencesLayout::default()
+            }),
+            ..Registry::default()
+        });
+        mark_transient_in(&registry, super::super::PREFERENCES_WINDOW_LABEL, false);
+        let state = registry.into_inner().unwrap().preferences.unwrap();
+        let mut positions = HashMap::from([(
+            "preferences".into(),
+            saved_frame(&work, frame.position, frame.outer, Some((700.0, 850.0))),
+        )]);
+        // Move the dialog after the picker so close captures an origin and still preserves size.
+        let moved = PhysicalNormalFrame {
+            position: (240, 260),
+            ..frame
+        };
+        let captured = NormalFrame::validated(&work, moved)
+            .unwrap()
+            .close_frame(state.programmatic_client, state.programmatic_position)
+            .unwrap();
+        merge_positions(&mut positions, vec![("preferences".into(), captured)]);
+        let saved = &positions["preferences"];
+        assert_eq!((saved.x, saved.y), (120.0, 130.0));
+        assert_eq!(saved.size, Some((700.0, 850.0)));
     }
 
     #[test]
@@ -4942,6 +5061,7 @@ mod tests {
             width: 1200.0,
             height: 900.0,
             scale: 2.0,
+            margin: 0.0,
         };
         let other = WorkArea {
             id: "other".into(),
@@ -4950,6 +5070,7 @@ mod tests {
             width: 1200.0,
             height: 900.0,
             scale: 1.5,
+            margin: 0.0,
         };
         let monitors = vec![owner.clone(), other];
         let size = kind_spec("preferences").unwrap().size;
@@ -5010,6 +5131,7 @@ mod tests {
             width: 1200.0,
             height: 900.0,
             scale: 1.0,
+            margin: 0.0,
         };
         let monitors = vec![owner.clone()];
         for (kind, size) in [
@@ -5505,6 +5627,7 @@ mod tests {
             width: 1000.0,
             height: 800.0,
             scale: 2.0,
+            margin: 0.0,
         };
         let other = WorkArea {
             id: "other".into(),
@@ -5513,6 +5636,7 @@ mod tests {
             width: 1000.0,
             height: 800.0,
             scale: 1.5,
+            margin: 0.0,
         };
         let position = position_for(
             Some(&writes[0].1),
@@ -5742,6 +5866,7 @@ mod tests {
                 width: area.0,
                 height: area.1,
                 scale,
+                margin: 0.0,
             };
             let owner_rect = (work.x + 20.0, work.y + 20.0, 800.0, 700.0);
             let client = RefCell::new((0, 0));
@@ -5795,6 +5920,7 @@ mod tests {
             width: 800.0,
             height: 600.0,
             scale: 2.0,
+            margin: 0.0,
         };
         for (monitor, expected_position) in [
             ("secondary", (-1256.0, 0.0)),
@@ -5857,6 +5983,7 @@ mod tests {
             width: 800.0,
             height: 600.0,
             scale: 2.0,
+            margin: 0.0,
         };
         finish_placement(
             ((3000.0, 1000.0, 2.0), (420.0, 300.0)),
@@ -6358,6 +6485,7 @@ mod tests {
                     width: 2536.0,
                     height: 936.0,
                     scale,
+                    margin: 0.0,
                 };
                 for (kind, height) in [
                     ("preferences", 700.0),
@@ -6426,6 +6554,7 @@ mod tests {
                         width: 1600.0,
                         height: 1000.0,
                         scale,
+                        margin: 0.0,
                     };
                     let mut preferences = PreferencesLayout::default();
                     // Preferences fits on first open, then preserves a saved user viewport
@@ -6729,6 +6858,7 @@ mod tests {
                         width,
                         height,
                         scale,
+                        margin: 0.0,
                     };
                     let spec = kind_spec("pageSize").unwrap();
                     let client = Cell::new(None);
@@ -6835,6 +6965,7 @@ mod tests {
                 width: 1176.0,
                 height: 876.0,
                 scale,
+                margin: 0.0,
             };
             let physical = normal_test_frame(scale);
             let unstable = PhysicalNormalFrame {
@@ -7053,6 +7184,7 @@ mod tests {
                         width: 900.0,
                         height: 500.0,
                         scale,
+                        margin: 0.0,
                     };
                     let saved = SavedPosition {
                         size: Some((750.5, 900.0)),
@@ -7159,7 +7291,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_fallback_clamps_final_bounds_after_content_growth_and_work_area_shrink() {
+    fn windows_fallback_fits_size_and_preserves_reachable_saved_origins() {
         use std::cell::Cell;
         for scale in [1.0, 1.25, 1.5, 2.0] {
             for (old_height, content_height, work_height) in [
@@ -7181,6 +7313,7 @@ mod tests {
                             width: 1200.0,
                             height: work_height,
                             scale,
+                            margin: 0.0,
                         };
                         let spec = kind_spec("export").unwrap();
                         let saved = SavedPosition {
@@ -7268,7 +7401,11 @@ mod tests {
                             final_frame.client.1,
                             (content_height.min(work_height - 40.0) * scale).ceil() as u32,
                         );
-                        assert_placed_bounds_inside(position.get(), final_frame, &work);
+                        if restore_saved_origin {
+                            assert_eq!(position.get(), (saved.x * scale, saved.y * scale));
+                        } else {
+                            assert_placed_bounds_inside(position.get(), final_frame, &work);
+                        }
                     }
                 }
             }
@@ -7330,6 +7467,7 @@ mod tests {
                     width: 1176.0,
                     height: 876.0,
                     scale,
+                    margin: 0.0,
                 };
                 let spec = kind_spec("preferences").unwrap();
                 let content = MeasuredContent::new(
@@ -7453,6 +7591,7 @@ mod tests {
                 width: 1200.0,
                 height: 900.0,
                 scale,
+                margin: 0.0,
             };
             let valid = normal_test_frame(scale);
             let mut state = PreferencesLayout::default();
@@ -7539,6 +7678,7 @@ mod tests {
                     width: 1600.0,
                     height: 1000.0,
                     scale,
+                    margin: 0.0,
                 };
                 let before = normal_test_frame(source_scale);
                 let after = PhysicalNormalFrame {
@@ -7603,6 +7743,109 @@ mod tests {
     }
 
     #[test]
+    fn saved_dialog_title_bars_keep_their_origins_on_reveal_and_reopen() {
+        use std::cell::RefCell;
+        for (macos, border, title_bar) in [(false, 16.0, 40.0), (true, 0.0, 28.0)] {
+            for scale in [1.0, 1.5, 2.0] {
+                let work = WorkArea {
+                    id: "secondary".into(),
+                    x: -1200.0,
+                    y: 24.0,
+                    width: 1200.0,
+                    height: 900.0,
+                    scale,
+                    margin: 0.0,
+                }
+                .inset(12.0);
+                let owner_rect = (work.x, work.y, work.width, work.height);
+                for (kind, height, y, expected_y) in [
+                    ("export", 1200.0, 180.0, 180.0),
+                    ("export", 1200.0, 925.0, work.y),
+                    // Full-frame clamping would move Preferences up by seven points.
+                    (
+                        "preferences",
+                        600.0,
+                        919.0 - 600.0 - title_bar,
+                        919.0 - 600.0 - title_bar,
+                    ),
+                    // The real work area starts above the inset used for sizing and fallback.
+                    ("preferences", 600.0, 29.0, 29.0),
+                ] {
+                    let spec = kind_spec(kind).unwrap();
+                    let saved = SavedPosition {
+                        size: Some((700.0, height)),
+                        monitor: work.id.clone(),
+                        x: -1000.0,
+                        y,
+                        offset_x: 0.0,
+                        offset_y: 0.0,
+                    };
+                    let saved: SavedPosition =
+                        serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+                    let dialog = RefCell::new(SimulatedDialog {
+                        scale,
+                        client: tauri::LogicalSize::new(spec.size.0, spec.size.1),
+                        minimum: tauri::LogicalSize::new(spec.min_size.0, spec.min_size.1),
+                        position: tauri::LogicalPosition::new(0.0, 0.0),
+                        decoration: tauri::LogicalSize::new(border, title_bar),
+                        queue: Vec::new(),
+                        calls: Vec::new(),
+                    });
+                    for mode in [
+                        PlacementMode::Initial,
+                        PlacementMode::Reveal,
+                        PlacementMode::Refit,
+                    ] {
+                        let position = position_for(
+                            Some(&saved),
+                            std::slice::from_ref(&work),
+                            &work,
+                            owner_rect,
+                            (700.0 + border, height + title_bar),
+                        );
+                        SimulatedDialog::place(
+                            &dialog,
+                            macos,
+                            DialogPlacement {
+                                position,
+                                client_size: saved.size.unwrap(),
+                                content: None,
+                                work: &work,
+                                spec: &spec,
+                                fit_content: true,
+                                template: mode.template(
+                                    Some(&saved),
+                                    Some(&saved),
+                                    scale,
+                                    owner_rect,
+                                ),
+                            },
+                        );
+                        let native = dialog.borrow();
+                        // A half-pixel origin rounds on Windows, with at most one pixel of drift.
+                        assert_eq!(native.position.x, saved.x);
+                        assert!((native.position.y - expected_y).abs() < 1.0 / scale);
+                        assert!(native.client.height + title_bar <= work.height);
+                        let physical = native.position.to_physical::<i32>(scale);
+                        let frame = native.frame();
+                        let normal = NormalFrame::validated(
+                            &work,
+                            PhysicalNormalFrame {
+                                position: (physical.x, physical.y),
+                                outer: frame.outer,
+                                client: frame.client,
+                                scale,
+                            },
+                        )
+                        .unwrap();
+                        assert!(normal.reachable(std::slice::from_ref(&work)));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn preferences_saved_and_live_frames_survive_tall_content_and_reopen() {
         use std::cell::RefCell;
         for (macos, border, title_bar) in [(false, 16.0, 40.0), (true, 0.0, 28.0)] {
@@ -7614,6 +7857,7 @@ mod tests {
                     width: 1200.0,
                     height: 900.0,
                     scale,
+                    margin: 0.0,
                 }
                 .inset(12.0);
                 let spec = kind_spec("preferences").unwrap();
@@ -7744,6 +7988,7 @@ mod tests {
                     width: 1200.0,
                     height: 900.0,
                     scale,
+                    margin: 0.0,
                 }
                 .inset(12.0);
                 let spec = kind_spec(kind).unwrap();
@@ -7838,6 +8083,7 @@ mod tests {
                 width: 2000.0,
                 height: 1600.0,
                 scale,
+                margin: 0.0,
             }
             .inset(12.0);
             let spec = kind_spec("pageSize").unwrap();
@@ -7916,6 +8162,7 @@ mod tests {
                 width: 2000.0_f64,
                 height: 1600.0_f64,
                 scale,
+                margin: 0.0,
             };
             let expected = (61_i32, 115_i32);
             let outer = (823_u32, 561_u32);
@@ -7985,6 +8232,7 @@ mod tests {
                             width: if small { 450.0 } else { 1600.0 },
                             height: if small { 300.0 } else { 1000.0 },
                             scale,
+                            margin: 0.0,
                         };
                         let saved = remembered.then_some(SavedPosition {
                             size: Some((900.0, 1200.0)),
@@ -8195,6 +8443,7 @@ mod tests {
                 width: 1200.0,
                 height: 800.0,
                 scale,
+                margin: 0.0,
             }
             .inset(12.0);
             let saved = saved_frame(
@@ -8284,6 +8533,7 @@ mod tests {
                     width: 1600.0,
                     height: 1000.0,
                     scale,
+                    margin: 0.0,
                 };
                 let saved = SavedPosition {
                     size: Some((250.0, 540.0)),
@@ -8380,6 +8630,7 @@ mod tests {
                         width: 1600.0,
                         height: 1200.0,
                         scale,
+                        margin: 0.0,
                     };
                     for user_size in [None, Some((700.0_f64, 800.0_f64))] {
                         let dialog = RefCell::new(SimulatedDialog {
@@ -8458,6 +8709,7 @@ mod tests {
                             width: 700.0,
                             height: 900.0,
                             scale,
+                            margin: 0.0,
                         }
                         .inset(12.0);
                         let mut saved = SavedPosition {
@@ -8600,6 +8852,7 @@ mod tests {
             width: 1600.0,
             height: 1000.0,
             scale: 1.0,
+            margin: 0.0,
         };
         let original = saved_frame(&work, (100, 200), (616, 440), Some((600.0, 400.0)));
         for preferences in [false, true] {
@@ -8751,6 +9004,7 @@ mod tests {
             width: 10.0,
             height: 6.0,
             scale: 2.0,
+            margin: 0.0,
         }
         .inset(12.0);
         assert!(work.width >= 1.0 && work.height >= 1.0);
@@ -8895,6 +9149,7 @@ mod tests {
                 width: 1600.0,
                 height: 1000.0,
                 scale: reveal_scale,
+                margin: 0.0,
             };
             let client = RefCell::new((0u32, 0u32));
             finish_placement(
@@ -8955,6 +9210,7 @@ mod tests {
                 width: 1440.0,
                 height: 875.0,
                 scale,
+                margin: 0.0,
             };
             let resizes = RefCell::new(Vec::<(u32, u32)>::new());
             finish_placement(
@@ -9009,6 +9265,7 @@ mod tests {
                 width: 1600.0,
                 height: area_height,
                 scale,
+                margin: 0.0,
             };
             let client = RefCell::new((0u32, 0u32));
             let position = RefCell::new((0.0, 0.0));
@@ -9258,6 +9515,7 @@ mod tests {
             width: 1000.0,
             height: 700.0,
             scale: 2.0,
+            margin: 0.0,
         };
         let other = WorkArea {
             id: "other".into(),
@@ -9266,6 +9524,7 @@ mod tests {
             width: 800.0,
             height: 600.0,
             scale: 1.5,
+            margin: 0.0,
         };
         assert_eq!(
             position_for(
@@ -9497,6 +9756,7 @@ mod tests {
             width: 1920.0,
             height: 1080.0,
             scale: 1.5,
+            margin: 0.0,
         };
         finish_placement(
             ((0.0, 0.0, 1.5), kind_spec("export").unwrap().size),

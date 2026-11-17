@@ -1890,7 +1890,10 @@ fn ensure_main_window_visible<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<(
             let geometry = if keep_frame {
                 None
             } else {
-                load_toolset_layout_state(app).main_window
+                let latest = *LATEST_MAIN_WINDOW_GEOMETRY
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                latest.for_restore(|| load_toolset_layout_state(app).main_window)
             };
             match main_window_frame_action(keep_frame, geometry.is_some()) {
                 MainWindowFrameAction::Keep => false,
@@ -9981,7 +9984,7 @@ fn persist_toolset_position<R: Runtime>(
 }
 
 /// What a main-window resize or move should persist.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum MainWindowGeometryUpdate {
     /// Fullscreen or minimized: a transient OS state, not a user-chosen frame.
     Skip,
@@ -9991,6 +9994,44 @@ enum MainWindowGeometryUpdate {
     /// A normal frame: save it, clearing the maximized flag.
     SaveFrame,
 }
+
+#[derive(Clone, Copy, Default)]
+struct LatestMainWindowGeometry {
+    frame: Option<MainWindowGeometry>,
+    maximized_without_frame: bool,
+}
+
+impl LatestMainWindowGeometry {
+    fn record(
+        &mut self,
+        update: MainWindowGeometryUpdate,
+        normal_frame: Option<MainWindowGeometry>,
+    ) {
+        update_main_window_geometry(&mut self.frame, update, normal_frame);
+        if update != MainWindowGeometryUpdate::Skip {
+            self.maximized_without_frame =
+                self.frame.is_none() && update == MainWindowGeometryUpdate::MarkMaximized;
+        }
+    }
+
+    fn for_restore(
+        self,
+        read_disk: impl FnOnce() -> Option<MainWindowGeometry>,
+    ) -> Option<MainWindowGeometry> {
+        self.frame.or_else(|| {
+            read_disk().map(|mut frame| {
+                frame.maximized |= self.maximized_without_frame;
+                frame
+            })
+        })
+    }
+}
+
+static LATEST_MAIN_WINDOW_GEOMETRY: Mutex<LatestMainWindowGeometry> =
+    Mutex::new(LatestMainWindowGeometry {
+        frame: None,
+        maximized_without_frame: false,
+    });
 
 fn main_window_geometry_update(
     fullscreen: bool,
@@ -10047,15 +10088,18 @@ fn persist_main_window_geometry<R: Runtime>(window: &tauri::Window<R>) -> Result
     };
     // The final quit capture is valid even while a save prompt has suspended utility windows.
     // Native minimized/fullscreen checks above still reject transient frames.
-    if quit_in_progress() {
-        queue_toolset_layout_update(window.app_handle(), move |layout_state| {
-            update_main_window_geometry(&mut layout_state.main_window, update, normal_frame);
-        })
-    } else {
-        update_toolset_layout_state(window.app_handle(), move |layout_state| {
-            update_main_window_geometry(&mut layout_state.main_window, update, normal_frame);
-        })
+    if !quit_in_progress() && utility_windows_suspended() {
+        return Ok(());
     }
+    // Reopen can run before the writer commits this frame. Publish it on the event thread
+    // before dispatch, and release the lock before any layout I/O.
+    LATEST_MAIN_WINDOW_GEOMETRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .record(update, normal_frame);
+    queue_toolset_layout_update(window.app_handle(), move |layout_state| {
+        update_main_window_geometry(&mut layout_state.main_window, update, normal_frame);
+    })
 }
 
 fn persist_plugin_panel_geometry<R: Runtime>(window: &tauri::Window<R>) -> Result<(), String> {
@@ -11505,6 +11549,63 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn main_window_reopen_uses_latest_frame_while_disk_write_is_pending() {
+        let writer = dialog_windows::PositionWriteWorker::default();
+        let path = std::env::temp_dir().join(format!(
+            "chemdraft-reopen-frame-{}.json",
+            std::process::id()
+        ));
+        let old = MainWindowGeometry {
+            x: 100.0,
+            y: 100.0,
+            width: 900.0,
+            height: 640.0,
+            maximized: false,
+        };
+        let moved = MainWindowGeometry {
+            x: 200.0,
+            height: 700.0,
+            ..old
+        };
+        queue_test_layout_frame(&writer, path.clone(), old, || {});
+        writer.drain();
+
+        let read_disk = || {
+            toolset_layout_state_from_read(read_optional_file(&path))
+                .unwrap()
+                .main_window
+        };
+        let mut latest = LatestMainWindowGeometry::default();
+        assert_eq!(latest.for_restore(read_disk), Some(old));
+        latest.record(MainWindowGeometryUpdate::MarkMaximized, None);
+        assert_eq!(
+            latest.for_restore(read_disk),
+            Some(MainWindowGeometry {
+                maximized: true,
+                ..old
+            })
+        );
+
+        let (started, starting) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        latest.record(MainWindowGeometryUpdate::SaveFrame, Some(moved));
+        queue_test_layout_frame(&writer, path.clone(), moved, move || {
+            started.send(()).unwrap();
+            blocked.recv().unwrap();
+        });
+        starting.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(read_disk(), Some(old));
+        assert_eq!(
+            latest.for_restore(|| panic!("cached restore must skip disk")),
+            Some(moved)
+        );
+        release.send(()).unwrap();
+        writer.drain();
+        assert_eq!(read_disk(), Some(moved));
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
