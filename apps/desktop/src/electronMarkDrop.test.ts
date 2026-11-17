@@ -1,11 +1,12 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { applyPatch, deserializeDocument, serializeDocument, type ChemDraftDocument, type MoleculeAtom, type MoleculeBond } from "@chemdraft/chem-core";
+import { applyPatch, deserializeDocument, serializeDocument, type ChemDraftDocument } from "@chemdraft/chem-core";
 import { atomDisplayLabel, moleculeLayoutLabelBoxes, transformPointForObject } from "@chemdraft/layout-engine";
 import { documentDrawingDefaults, nativeAtomBondOrderUsage, nativeImplicitHydrogenCount, phase4Timestamp,
   stereoPerceptionMolfile, type PagePoint } from "@chemdraft/document-workflow-core";
 import * as workflow from "./documentWorkflow";
-import { dropElectronMark, electronMarkDropTarget, ELECTRON_MARK_DROP_CAPTURE_BOND_LENGTHS } from "./electronMarkDrop";
-import { ammoniumElectronMarkDropFixture, distantAttachedElectronMarkFixture, dropMark, dropMolecule, electronMarkDropFixture, rotatedElectronMarkDropFixture } from "./testSupport/electronMarkDropFixture";
+import { dropElectronMark, dropElectronMarksInSelection, electronMarkDropTarget, ELECTRON_MARK_DROP_CAPTURE_BOND_LENGTHS } from "./electronMarkDrop";
+import { ammoniumElectronMarkDropFixture, distantAttachedElectronMarkFixture, dropMark, dropMolecule,
+  electronMarkDropFixture, fourBondNitrogenElectronMarkDropFixture, rotatedElectronMarkDropFixture } from "./testSupport/electronMarkDropFixture";
 import { associationSpecs } from "./testSupport/electronMarkMainParity";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 import { saveDirectElectronMarkEditing } from "./electronMarkEditingSettings";
@@ -364,18 +365,32 @@ describe.each([false, true])("electron-mark drops with direct editing %s", enabl
   });
 
   it.each(["transfer", "detach"])("refuses to strip the charge from a four-bond nitrogen on %s", action => {
-    const fixture = electronMarkDropFixture();
-    const molecule = dropMolecule(fixture.document);
-    const hydrogens: MoleculeAtom[] = [-1, 1].map((side, index) => ({ id: `explicit_h${index}`, element: "H", formalCharge: 0,
-      x: fixture.nitrogen.x, y: fixture.nitrogen.y + side * 22 }));
-    const bonds: MoleculeBond[] = hydrogens.map(atom => ({ id: `bond_${atom.id}`, fromAtomId: fixture.nitrogen.id,
-      toAtomId: atom.id, order: "single" }));
-    const document = workflow.normalizeCommittedDocument(applyPatch(fixture.document, { op: "updateObject", objectId: molecule.id,
-      changes: { atoms: [...molecule.atoms, ...hydrogens], bonds: [...molecule.bonds, ...bonds] } }, { now: phase4Timestamp }));
-    const result = drop(document, action === "transfer" ? fixture.carbonylOxygen : { x: 600, y: 500 });
+    const { document, carbonylOxygen } = fourBondNitrogenElectronMarkDropFixture();
+    const result = drop(document, action === "transfer" ? carbonylOxygen : { x: 600, y: 500 });
     expect(result.refused).toBe(true);
     expect(result.document).toBe(document);
     expect(result.status).toBe(`Cannot move Charge from N${action === "transfer" ? " to O" : ""}: N cannot carry formal charge 0 with bond/radical valence 4`);
+  });
+
+  it("refuses two radical drops that together exceed the target atom's valence", () => {
+    const { document, nitrogen } = electronMarkDropFixture({ kind: "lone-pair" });
+    const start = { x: 555, y: 495 };
+    const first = workflow.applyChargeToolAtPoint(document, { kind: "radical-dot" }, start);
+    const before = workflow.normalizeCommittedDocument(workflow.applyChargeToolAtPoint(first,
+      { kind: "radical-dot" }, { x: start.x + 10, y: start.y }));
+    const [firstRadical, secondRadical] = before.pages[0].objects.filter(object =>
+      object.type === "electron-mark" && object.markKind === "radical-dot");
+    const point = { x: nitrogen.x - 5, y: nitrogen.y };
+    const delta = { x: point.x - start.x, y: point.y - start.y };
+    for (const radical of [firstRadical, secondRadical]) {
+      const position = { x: radical.x + delta.x, y: radical.y + delta.y };
+      expect(dropElectronMark(before, radical.id, position, { x: position.x + radical.width / 2,
+        y: position.y + radical.height / 2 }).refused).toBeUndefined();
+    }
+    const result = dropElectronMarksInSelection(before, [firstRadical.id, secondRadical.id], delta,
+      { grabbedObjectId: firstRadical.id, point });
+    expect(result.document).toBe(before);
+    expect(result.status).toBe("Cannot move Radical electron to N: N has unsupported valence after moving this mark");
   });
 
   it("re-associates unknown display marks too", () => {

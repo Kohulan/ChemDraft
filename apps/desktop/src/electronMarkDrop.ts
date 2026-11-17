@@ -1,11 +1,11 @@
-import { applyPatch, nativeDrawingStyleFromObjectStyle,
+import { applyPatch, applyPatches, nativeDrawingStyleFromObjectStyle,
   type ChemDraftDocument, type ElectronMarkObject, type MoleculeAtom, type MoleculeObject } from "@chemdraft/chem-core";
 import { atomDisplayLabel, transformPointForObject } from "@chemdraft/layout-engine";
-import { documentDrawingDefaults, nativeAtomChargeSupportsValence, nativeAtomExternalValence,
+import { documentDrawingDefaults, nativeAtomChargeSupportsValence, nativeAtomExternalValence, nativeElectronMarkAtomKey,
   nativeElementFromAtomLabel, phase4Timestamp, type PagePoint } from "@chemdraft/document-workflow-core";
 import { electronMarkAtomContribution, electronMarkChemistryChanges, findDocumentObject,
-  isEditableNativeMoleculeGraph, moveDocumentObject, nativeChargePlacementPointForAtom, normalizeCommittedDocument,
-  type NativeMoleculeDeleteTarget } from "./documentWorkflow";
+  isEditableNativeMoleculeGraph, moveDocumentObject, moveDocumentObjects, nativeChargeMarkCenter,
+  nativeChargePlacementPointForAtom, normalizeCommittedDocument, resolveGroupedDocumentObjectIds, type NativeMoleculeDeleteTarget } from "./documentWorkflow";
 
 /** Document-space radius, independent of zoom and of the direct-editing preference. */
 export const ELECTRON_MARK_DROP_CAPTURE_BOND_LENGTHS = 0.5;
@@ -31,18 +31,23 @@ export function electronMarkDropTarget(
   return nearest;
 }
 
-function associatedAtom(document: ChemDraftDocument, anchor: ElectronMarkObject["anchor"]) {
+interface AtomEndpoint {
+  molecule: MoleculeObject;
+  atom: MoleculeAtom;
+}
+
+function associatedAtom(document: ChemDraftDocument, anchor: ElectronMarkObject["anchor"]): AtomEndpoint | undefined {
   const molecule = anchor.kind === "atom" && anchor.objectId ? findDocumentObject(document, anchor.objectId) : undefined;
   const atom = molecule?.type === "molecule" ? molecule.atoms.find(atom => atom.id === anchor.atomId) : undefined;
   return molecule?.type === "molecule" && atom ? { molecule, atom } : undefined;
 }
 
-function label({ molecule, atom }: { molecule: MoleculeObject; atom: MoleculeAtom }): string {
+function label({ molecule, atom }: AtomEndpoint): string {
   return atomDisplayLabel(atom, molecule.bonds, nativeDrawingStyleFromObjectStyle(molecule.style), molecule.atoms) ?? atom.element;
 }
 
 /** Context from the existing graph and displayed label, before a same-element transfer. */
-function atomContextName(endpoint: { molecule: MoleculeObject; atom: MoleculeAtom }): string {
+function atomContextName(endpoint: AtomEndpoint): string {
   const { molecule, atom } = endpoint;
   const neighbours = molecule.bonds.flatMap(bond => {
     const neighbourId = bond.fromAtomId === atom.id ? bond.toAtomId : bond.toAtomId === atom.id ? bond.fromAtomId : undefined;
@@ -70,27 +75,73 @@ export interface ElectronMarkDropResult {
   refused?: boolean;
 }
 
-/** A single direct drop. Callers install the already-normalized snapshot once; previews never call this. */
+interface ElectronMarkDrop {
+  mark: ElectronMarkObject;
+  anchor: ElectronMarkObject["anchor"];
+  source: AtomEndpoint | undefined;
+  destination: AtomEndpoint | undefined;
+}
+
+function sameAtom(first: AtomEndpoint | undefined, second: AtomEndpoint | undefined): boolean {
+  return first?.molecule.id === second?.molecule.id && first?.atom.id === second?.atom.id;
+}
+
+function planElectronMarkDrop(
+  before: ChemDraftDocument, moved: ChemDraftDocument, mark: ElectronMarkObject, center: PagePoint, dropPoint: PagePoint
+): ElectronMarkDrop {
+  const pageId = before.pages.find(page => page.objects.some(object => object.id === mark.id))?.id;
+  const target = electronMarkDropTarget(moved, dropPoint, pageId);
+  const anchor: ElectronMarkObject["anchor"] = target?.kind === "atom"
+    ? { kind: "atom", objectId: target.objectId, atomId: target.atomId }
+    : { kind: "point", point: center };
+  return { mark, anchor, source: associatedAtom(before, mark.anchor), destination: associatedAtom(before, anchor) };
+}
+
+/** A direct drop uses the pointer for atom capture and the translated mark center for a free annotation. */
 export function dropElectronMark(
   document: ChemDraftDocument, markId: string, position: PagePoint, dropPoint: PagePoint
 ): ElectronMarkDropResult {
   const mark = findDocumentObject(document, markId);
   if (mark?.type !== "electron-mark") return { document, status: "Electron mark no longer exists", undoLabel: "Move electron mark" };
-  const name = markName(mark);
-  const source = associatedAtom(document, mark.anchor);
-  const pageId = document.pages.find(page => page.objects.some(object => object.id === markId))?.id;
-  const target = electronMarkDropTarget(document, dropPoint, pageId);
-  const anchor: ElectronMarkObject["anchor"] = target?.kind === "atom"
-    ? { kind: "atom", objectId: target.objectId, atomId: target.atomId }
-    : { kind: "point", point: { x: position.x + mark.width / 2, y: position.y + mark.height / 2 } };
-  const destination = associatedAtom(document, anchor);
-  const transferring = source?.molecule.id !== destination?.molecule.id || source?.atom.id !== destination?.atom.id;
-  const contribution = electronMarkAtomContribution(mark);
-  const undoLabel = source || destination ? `Move ${name}` : "Move electron mark";
-  const refusal = (reason: string): ElectronMarkDropResult => ({ document, undoLabel, refused: true,
-    status: `Cannot move ${name}${source ? ` from ${source.atom.element}` : ""}${destination ? ` to ${destination.atom.element}` : ""}: ${reason}` });
+  const center = { x: position.x + mark.width / 2, y: position.y + mark.height / 2 };
+  const drop = planElectronMarkDrop(document, document, mark, center, dropPoint);
+  const moved = moveDocumentObject(document, markId, position);
+  const result = applyElectronMarkDrops(document, moved, [drop]);
+  return { ...result, undoLabel: drop.source || drop.destination ? `Move ${markName(mark)}` : "Move electron mark" };
+}
 
-  if (transferring && (contribution.charge || contribution.radicals)) {
+/** Validate independent marks against the selection's final geometry and commit the move as a unit. */
+export function dropElectronMarksInSelection(
+  document: ChemDraftDocument, objectIds: readonly string[], delta: PagePoint,
+  release: { grabbedObjectId: string; point: PagePoint }
+): { document: ChemDraftDocument; status?: string } {
+  const moved = moveDocumentObjects(document, objectIds, delta.x, delta.y, { preserveCarriedMarkAnchors: true });
+  if (moved === document) return { document };
+
+  const page = document.pages.find(page => page.objects.some(object => object.id === release.grabbedObjectId));
+  const selectedIds = new Set(resolveGroupedDocumentObjectIds(page?.objects ?? [], objectIds));
+  const drops = (page?.objects ?? []).flatMap((mark) => {
+    if (mark.type !== "electron-mark" || !selectedIds.has(mark.id)) return [];
+    const source = associatedAtom(document, mark.anchor);
+    if (source && selectedIds.has(source.molecule.id)) return [];
+    const translated = findDocumentObject(moved, mark.id);
+    if (translated?.type !== "electron-mark") return [];
+    const center = nativeChargeMarkCenter(translated);
+    return [planElectronMarkDrop(document, moved, mark, center, mark.id === release.grabbedObjectId ? release.point : center)];
+  });
+  return drops.length ? applyElectronMarkDrops(document, moved, drops) : { document: moved };
+}
+
+function applyElectronMarkDrops(
+  document: ChemDraftDocument, moved: ChemDraftDocument, drops: readonly ElectronMarkDrop[]
+): { document: ChemDraftDocument; status: string; refused?: boolean } {
+  const refusal = ({ mark, source, destination }: ElectronMarkDrop, reason: string) => ({ document, refused: true,
+    status: `Cannot move ${markName(mark)}${source ? ` from ${source.atom.element}` : ""}${destination ? ` to ${destination.atom.element}` : ""}: ${reason}` });
+  const expected = new Map<string, { endpoint: AtomEndpoint; charge: number; radicals: number; drop: ElectronMarkDrop }>();
+  for (const drop of drops) {
+    const { mark, source, destination } = drop;
+    const contribution = electronMarkAtomContribution(mark);
+    if (sameAtom(source, destination) || (!contribution.charge && !contribution.radicals)) continue;
     // Use the same admission rule as typed charge stacking, including the radical bonding slots.
     // Check removal too: a four-bond N cannot lose its +1 without an explicit bond edit.
     for (const [endpoint, sign] of [[source, -1], [destination, 1]] as const) {
@@ -100,46 +151,59 @@ export function dropElectronMark(
       const charge = atom.formalCharge + sign * contribution.charge;
       const usage = nativeAtomExternalValence(molecule, atom) + sign * contribution.radicals;
       if (element && !nativeAtomChargeSupportsValence(element, usage, charge)) {
-        return refusal(`${atom.element} cannot carry formal charge ${charge > 0 ? "+" : ""}${charge} with bond/radical valence ${usage}`);
+        return refusal(drop, `${atom.element} cannot carry formal charge ${charge > 0 ? "+" : ""}${charge} with bond/radical valence ${usage}`);
       }
+      const key = nativeElectronMarkAtomKey(molecule.id, atom.id);
+      const previous = expected.get(key);
+      expected.set(key, { endpoint, drop,
+        charge: (previous?.charge ?? atom.formalCharge) + sign * contribution.charge,
+        radicals: (previous?.radicals ?? atom.markRadicals ?? 0) + sign * contribution.radicals });
     }
   }
 
-  let moved = moveDocumentObject(document, markId, position);
-  // Record the decision on the document, including an intentional floating drop. The existing
-  // explicit flag makes either anchor durable across normalization, native save and reopen.
-  moved = applyPatch(moved, { op: "updateObject", objectId: markId,
-    changes: { anchor, atomAssociation: "explicit" } }, { now: phase4Timestamp });
-  let after = normalizeCommittedDocument(moved);
-  const finalMark = findDocumentObject(after, markId) as ElectronMarkObject;
-  const finalDestination = associatedAtom(after, finalMark.anchor);
-  if (destination && (!finalDestination || finalDestination.molecule.id !== destination.molecule.id ||
-    finalDestination.atom.id !== destination.atom.id)) return refusal("the atom cannot accept this mark's charge or unpaired electrons");
-  if (transferring && (contribution.charge || contribution.radicals)) {
-    for (const [endpoint, sign] of [[source, -1], [destination, 1]] as const) {
-      if (!endpoint) continue;
-      const final = associatedAtom(after, { kind: "atom", objectId: endpoint.molecule.id, atomId: endpoint.atom.id });
-      if (!final || final.atom.formalCharge !== endpoint.atom.formalCharge + sign * contribution.charge ||
-        (final.atom.markRadicals ?? 0) !== (endpoint.atom.markRadicals ?? 0) + sign * contribution.radicals) {
-        return refusal("the atom associations could not preserve the existing charges or unpaired electrons");
-      }
-      const element = nativeElementFromAtomLabel(final.atom.element);
-      if (element && !nativeAtomChargeSupportsValence(element, nativeAtomExternalValence(final.molecule, final.atom), final.atom.formalCharge)) {
-        return refusal(`${final.atom.element} has unsupported valence after moving this mark`);
-      }
+  // Install all explicit drop decisions before reconciliation sees any of the translated marks.
+  let after = normalizeCommittedDocument(applyPatches(moved, drops.map(({ mark, anchor }) => ({
+    op: "updateObject", objectId: mark.id, changes: { anchor, atomAssociation: "explicit" }
+  })), { now: phase4Timestamp }));
+  for (const drop of drops) {
+    const finalMark = findDocumentObject(after, drop.mark.id) as ElectronMarkObject;
+    if (!sameAtom(drop.destination, associatedAtom(after, finalMark.anchor))) {
+      return refusal(drop, "the atom cannot accept this mark's charge or unpaired electrons");
+    }
+  }
+  // Two individually valid drops can exceed the same atom's capacity together.
+  for (const { endpoint, charge, radicals, drop } of expected.values()) {
+    const final = associatedAtom(after, { kind: "atom", objectId: endpoint.molecule.id, atomId: endpoint.atom.id });
+    if (!final || final.atom.formalCharge !== charge || (final.atom.markRadicals ?? 0) !== radicals) {
+      return refusal(drop, "the atom associations could not preserve the existing charges or unpaired electrons");
+    }
+    const element = nativeElementFromAtomLabel(final.atom.element);
+    if (element && !nativeAtomChargeSupportsValence(element, nativeAtomExternalValence(final.molecule, final.atom), final.atom.formalCharge)) {
+      return refusal(drop, `${final.atom.element} has unsupported valence after moving this mark`);
     }
   }
 
   // Only an actual atom drop snaps beside its label. Empty-space drops retain the user's
   // position as free annotations. Use reconciled chemistry so OH/NH2 includes the new H.
-  if (target && finalDestination) {
-    const page = after.pages.find(page => page.id === pageId)!;
+  for (const drop of drops) {
+    if (!drop.destination) continue;
+    const markId = drop.mark.id;
+    const finalMark = findDocumentObject(after, markId) as ElectronMarkObject;
+    const finalDestination = associatedAtom(after, finalMark.anchor)!;
+    const page = after.pages.find(page => page.objects.some(object => object.id === markId))!;
     const point = nativeChargePlacementPointForAtom(finalDestination.molecule, finalDestination.atom.id,
       page.objects.filter(object => object.id !== markId), page.width, page.height, finalMark);
     if (point) after = applyPatch(after, { op: "updateObject", objectId: markId,
       changes: { x: point.x - finalMark.width / 2, y: point.y - finalMark.height / 2 } }, { now: phase4Timestamp });
   }
+  return { document: after, status: drops.map(drop => describeElectronMarkDrop(document, after, drop)).join(". ") };
+}
 
+function describeElectronMarkDrop(document: ChemDraftDocument, after: ChemDraftDocument, { mark, source, destination }: ElectronMarkDrop): string {
+  const name = markName(mark);
+  const markId = mark.id;
+  const finalMark = findDocumentObject(after, markId) as ElectronMarkObject;
+  const finalDestination = associatedAtom(after, finalMark.anchor);
   const anchors = [mark.anchor, finalMark.anchor];
   const chemistryChanges = electronMarkChemistryChanges(document, after, { markIds: [markId], atoms: anchors.flatMap(anchor =>
     anchor.kind === "atom" && anchor.objectId && anchor.atomId ? [{ objectId: anchor.objectId, atomId: anchor.atomId }] : []) });
@@ -147,7 +211,7 @@ export function dropElectronMark(
   let sourceName = source?.atom.element;
   let destinationName = finalDestination?.atom.element;
   const contextNames = new Map<MoleculeAtom, string>();
-  if (source && destination && finalDestination && transferring && sourceName === destinationName) {
+  if (source && destination && finalDestination && !sameAtom(source, destination) && sourceName === destinationName) {
     const sourceContext = atomContextName(source), destinationContext = atomContextName(destination);
     if (sourceContext !== destinationContext) {
       sourceName = `${sourceName} (${sourceContext})`;
@@ -163,15 +227,15 @@ export function dropElectronMark(
     ? ` (${changedAtoms.map(endpoint => `${contextNames.get(endpoint.atom) ?? endpoint.atom.element} now ${label(endpoint)}`).join(", ")})` : "";
   // Status describes the committed associations and chemistry, including any change made by
   // normalization, rather than relying on the intended geometric transfer alone.
-  if (finalDestination && (!source || source.molecule.id !== finalDestination.molecule.id || source.atom.id !== finalDestination.atom.id)) {
-    return { document: after, undoLabel, status: source
+  if (finalDestination && !sameAtom(source, finalDestination)) {
+    return source
       ? `${name} moved from ${sourceName} to ${destinationName}${chemistry}`
-      : `${name} attached to ${finalDestination.atom.element}${chemistry}` };
+      : `${name} attached to ${finalDestination.atom.element}${chemistry}`;
   }
   if (source && !finalDestination) {
-    return { document: after, undoLabel, status: `${name} removed from ${source.atom.element}${chemistry}` };
+    return `${name} removed from ${source.atom.element}${chemistry}`;
   }
-  return { document: after, undoLabel, status: source
+  return source
     ? `${name} repositioned on ${source.atom.element}${chemistry}`
-    : `Moved electron mark${chemistry}` };
+    : `Moved electron mark${chemistry}`;
 }

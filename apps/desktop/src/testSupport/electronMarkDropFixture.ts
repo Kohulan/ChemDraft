@@ -1,4 +1,5 @@
-import { applyPatch, applyPatches, type ChemDraftDocument, type ElectronMarkObject, type MoleculeObject } from "@chemdraft/chem-core";
+import { applyPatch, applyPatches, type ChemDraftDocument, type ElectronMarkObject,
+  type MoleculeAtom, type MoleculeBond, type MoleculeObject } from "@chemdraft/chem-core";
 import { testMoleculeFromSmiles } from "@chemdraft/layout-engine/testing";
 import { nativeSingleBondGraphMetadata, nativeSingleBondGraphSmiles, phase4Timestamp } from "@chemdraft/document-workflow-core";
 import { applyChargeToolAtNativeAtom, createPhase4Document, moveDocumentObject, normalizeCommittedDocument, type NativeElectronMarkSpec } from "../documentWorkflow";
@@ -29,6 +30,24 @@ export function ammoniumElectronMarkDropFixture() {
   document = normalizeCommittedDocument(applyChargeToolAtNativeAtom(document, 1,
     { kind: "atom", objectId: molecule.id, atomId: atoms[0].id, distanceToPointer: 0 }));
   return { document, nitrogen: atoms[0] };
+}
+
+/** Four explicit bonds make the positive charge necessary. */
+export function fourBondNitrogenElectronMarkDropFixture() {
+  const fixture = electronMarkDropFixture();
+  const molecule = dropMolecule(fixture.document);
+  const hydrogens: MoleculeAtom[] = [-1, 1].map((side, index) => ({
+    id: `explicit_h${index}`, element: "H", formalCharge: 0,
+    x: fixture.nitrogen.x, y: fixture.nitrogen.y + side * 22
+  }));
+  const bonds: MoleculeBond[] = hydrogens.map(atom => ({
+    id: `bond_${atom.id}`, fromAtomId: fixture.nitrogen.id, toAtomId: atom.id, order: "single"
+  }));
+  const document = normalizeCommittedDocument(applyPatch(fixture.document, {
+    op: "updateObject", objectId: molecule.id,
+    changes: { atoms: [...molecule.atoms, ...hydrogens], bonds: [...molecule.bonds, ...bonds] }
+  }, { now: phase4Timestamp }));
+  return { ...fixture, document };
 }
 
 /** O–C–C–N in the reported rotation frame, with a distant floating +. */

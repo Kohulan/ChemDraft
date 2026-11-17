@@ -13,7 +13,7 @@ import { AtomProblemMarker } from "./AtomProblemMarker";
 import { atomProblemCommandId, atomProblemCommands, atomProblemSnapshot, type AtomProblemTarget } from "./atomProblemCommands";
 import { atomProblem, type AtomProblemAction } from "@chemdraft/document-workflow-core";
 import { applyNativeAtomProblemFix } from "./documentWorkflow";
-import { dropElectronMark, electronMarkDropTarget } from "./electronMarkDrop";
+import { dropElectronMark, dropElectronMarksInSelection, electronMarkDropTarget } from "./electronMarkDrop";
 import { electronMarkUndoLabel } from "./electronMarkUndoLabel";
 import { nativeFragmentSproutTarget, nativeDieneFuseTarget, nativeOxoHotkeyTarget, nativeBranchedHotkeyTarget, type FragmentSproutKind } from "./sproutHotkeys";
 import { applyTableCommand, applyTableFontCommand, applyTableObjectEdit, createTableCommands, createTableInsertAction, parseTableInsertCommandId, resolveActiveTableCell, selectedTable, tableInsertCommandId, tableInspectorSnapshot, type ActiveTableCell, type TableInsertDimensions } from "./tableCommands";
@@ -16746,7 +16746,12 @@ export function MainWindow({
       commitDocumentHistoryFrom(drag.startDocument, result.document, result.undoLabel);
       return true;
     }
-    const moved = objectDragDocument(drag, point);
+    const selectionDrop = drag.groupObjectIds && drag.groupObjectIds.length > 1
+      ? dropElectronMarksInSelection(drag.startDocument, drag.groupObjectIds,
+        { x: point.x - drag.startPoint.x, y: point.y - drag.startPoint.y }, { grabbedObjectId: drag.objectId, point })
+      : undefined;
+    drag.dropStatus = selectionDrop?.status;
+    const moved = selectionDrop?.document ?? objectDragDocument(drag, point);
     if (moved === drag.startDocument) {
       replacePresentDocument(drag.startDocument);
       return false;

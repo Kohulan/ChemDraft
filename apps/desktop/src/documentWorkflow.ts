@@ -8269,9 +8269,9 @@ function addChargeMarkAtPoint(
 }
 
 /**
- * Applies the chemistry of charge and radical marks. Direct drops explicitly retain a chosen
- * atom even when the symbol is repositioned farther away. Other operations use distance-based
- * association without valence-based reassignment. A minus on a drawn OH removes its implicit proton.
+ * Applies the chemistry of charge and radical marks. Direct drops record a chosen atom or an
+ * intentionally floating point. Reconciliation respects either explicit placement and uses
+ * distance-based association for legacy placements. A minus on a drawn OH removes its implicit proton.
  *
  * Runs on every document commit, so it must be a cheap, IDEMPOTENT normalization. The invariant
  * that makes it self-contained: `atom.markCharge` records exactly the portion of
@@ -14005,7 +14005,8 @@ export function moveDocumentObjects(
   document: ChemDraftDocument,
   ids: readonly string[],
   dx: number,
-  dy: number
+  dy: number,
+  { preserveCarriedMarkAnchors = false }: { preserveCarriedMarkAnchors?: boolean } = {}
 ): ChemDraftDocument {
   const page = ids.length > 0 ? pageContainingObject(document, ids[0]) : undefined;
   if (!page) return document;
@@ -14029,7 +14030,8 @@ export function moveDocumentObjects(
     set.has(object.id)
       ? translateDocumentObjectByPatches(document, object.id, cdx, cdy, {
           translateAnchoredGeometry: groupMoveTranslatesArrowGeometry(object, set),
-          preserveChargeAnchor: object.type === "electron-mark" && object.atomAssociation === "explicit" &&
+          preserveChargeAnchor: object.type === "electron-mark" &&
+            (preserveCarriedMarkAnchors || object.atomAssociation === "explicit") &&
             carriedMarkIds.has(object.id)
         })
       : []
