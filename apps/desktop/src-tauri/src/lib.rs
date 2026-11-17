@@ -15,6 +15,8 @@ mod installed_plugins;
 mod local_engine;
 #[cfg(target_os = "macos")]
 mod macos_quit;
+#[cfg(target_os = "macos")]
+mod macos_single_instance;
 mod main_window_placement;
 mod naming_engine;
 mod network_error;
@@ -1180,34 +1182,12 @@ pub fn run() {
     let perf_log = perf_log::PerfLog::new(perf_enabled);
     let builder = tauri::Builder::default();
 
-    // Registered first, as the plugin requires. A second launch forwards its argv here (a document
-    // double-clicked while ChemDraft runs) instead of starting a rival process on the same
-    // app_data_dir. macOS routes such opens to the running app itself (RunEvent::Opened).
+    // Both guards run before any webview or app setup can touch session/settings files. macOS
+    // needs an advisory lock too: LaunchServices' normal Opened routing does not cover `open -n`.
+    #[cfg(target_os = "macos")]
+    let builder = builder.plugin(macos_single_instance::init(handle_second_launch));
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
-        let setup_completed = app
-            .state::<PendingOpenDocument>()
-            .setup_completed
-            .load(Ordering::SeqCst);
-        let action = second_launch_action(quit_in_progress(), setup_completed);
-        if action == SecondLaunchAction::IgnoreWhileQuitting {
-            eprintln!("ChemDraft: a second launch arrived while quitting; ignored (this process is exiting)");
-            return;
-        }
-        let cwd = PathBuf::from(cwd);
-        if let Err(error) = handle_opened_document_args(app, argv.into_iter().skip(1), &cwd) {
-            eprintln!("Could not open ChemDraft document from a second launch: {error}");
-        }
-        if action == SecondLaunchAction::OpenOnly {
-            return;
-        }
-        if let Err(error) = ensure_main_window_visible(app) {
-            eprintln!("Could not show ChemDraft main window for a second launch: {error}");
-        }
-        if let Err(error) = focus_main_document_window_impl(app, MainWindowFocusMode::Force) {
-            eprintln!("Could not focus ChemDraft document window for a second launch: {error}");
-        }
-    }));
+    let builder = builder.plugin(tauri_plugin_single_instance::init(handle_second_launch));
 
     let builder = if perf_enabled {
         builder.plugin(
@@ -2935,10 +2915,7 @@ fn restore_utility_window<R: Runtime>(
 const QUITTING_WINDOW_REFUSAL: &str = "ChemDraft is quitting; no new windows";
 
 /// What a second launch, forwarded here by the single-instance lock, does to this process.
-#[cfg_attr(
-    any(target_os = "macos", target_os = "ios", target_os = "android"),
-    allow(dead_code)
-)]
+#[cfg_attr(any(target_os = "ios", target_os = "android"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SecondLaunchAction {
     /// Open its documents and bring the document window up.
@@ -2955,10 +2932,7 @@ enum SecondLaunchAction {
     IgnoreWhileQuitting,
 }
 
-#[cfg_attr(
-    any(target_os = "macos", target_os = "ios", target_os = "android"),
-    allow(dead_code)
-)]
+#[cfg_attr(any(target_os = "ios", target_os = "android"), allow(dead_code))]
 fn second_launch_action(quitting: bool, setup_completed: bool) -> SecondLaunchAction {
     if quitting {
         SecondLaunchAction::IgnoreWhileQuitting
@@ -2966,6 +2940,35 @@ fn second_launch_action(quitting: bool, setup_completed: bool) -> SecondLaunchAc
         SecondLaunchAction::OpenAndShow
     } else {
         SecondLaunchAction::OpenOnly
+    }
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+fn handle_second_launch<R: Runtime>(app: &tauri::AppHandle<R>, argv: Vec<String>, cwd: String) {
+    let setup_completed = app
+        .state::<PendingOpenDocument>()
+        .setup_completed
+        .load(Ordering::SeqCst);
+    let action = second_launch_action(quit_in_progress(), setup_completed);
+    if action == SecondLaunchAction::IgnoreWhileQuitting {
+        eprintln!(
+            "ChemDraft: a second launch arrived while quitting; ignored (this process is exiting)"
+        );
+        return;
+    }
+    if let Err(error) =
+        handle_opened_document_args(app, argv.into_iter().skip(1), &PathBuf::from(cwd))
+    {
+        eprintln!("Could not open ChemDraft document from a second launch: {error}");
+    }
+    if action == SecondLaunchAction::OpenOnly {
+        return;
+    }
+    if let Err(error) = ensure_main_window_visible(app) {
+        eprintln!("Could not show ChemDraft main window for a second launch: {error}");
+    }
+    if let Err(error) = focus_main_document_window_impl(app, MainWindowFocusMode::Force) {
+        eprintln!("Could not focus ChemDraft document window for a second launch: {error}");
     }
 }
 
@@ -8205,7 +8208,7 @@ fn handle_opened_document_urls<R: Runtime>(
 
 /// Document paths passed on the command line (Windows/Linux shell opens, and argv forwarded from a
 /// second launch). Skip flags and open every supported file in argument order.
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 fn handle_opened_document_args<R: Runtime>(
     app: &tauri::AppHandle<R>,
     args: impl IntoIterator<Item = String>,
@@ -8217,10 +8220,7 @@ fn handle_opened_document_args<R: Runtime>(
     deliver_opened_documents(payloads, |payload| deliver_opened_document(app, payload))
 }
 
-#[cfg(any(
-    test,
-    not(any(target_os = "macos", target_os = "ios", target_os = "android"))
-))]
+#[cfg(any(test, not(any(target_os = "ios", target_os = "android"))))]
 fn openable_document_paths_from_args(
     args: impl IntoIterator<Item = String>,
     cwd: &Path,
@@ -8232,10 +8232,7 @@ fn openable_document_paths_from_args(
         .collect()
 }
 
-#[cfg(any(
-    test,
-    not(any(target_os = "macos", target_os = "ios", target_os = "android"))
-))]
+#[cfg(any(test, not(any(target_os = "ios", target_os = "android"))))]
 fn is_openable_document_path(path: &Path) -> bool {
     let extension_ok = path
         .extension()
@@ -10978,7 +10975,7 @@ mod tests {
     }
 
     #[test]
-    fn opened_document_args_keep_all_openable_paths_in_argument_order() {
+    fn single_instance_opened_document_args_keep_all_openable_paths_in_argument_order() {
         let dir =
             std::env::temp_dir().join(format!("chemdraft-open-many-args-{}", std::process::id()));
         fs::create_dir_all(dir.join("nested")).expect("temp dir");
@@ -12297,7 +12294,7 @@ mod tests {
     }
 
     #[test]
-    fn a_second_launch_while_quitting_opens_and_shows_nothing() {
+    fn single_instance_a_second_launch_while_quitting_opens_and_shows_nothing() {
         assert_eq!(
             second_launch_action(true, true),
             SecondLaunchAction::IgnoreWhileQuitting
@@ -12341,7 +12338,7 @@ mod tests {
     }
 
     #[test]
-    fn openable_document_paths_are_existing_chemdraft_cdxml_or_cdx_files() {
+    fn single_instance_openable_document_paths_are_existing_chemdraft_cdxml_or_cdx_files() {
         let dir = std::env::temp_dir().join(format!("chemdraft-open-args-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("temp dir");
         for name in ["a.chemdraft", "b.CDXML", "c.txt", "d.Cdx"] {

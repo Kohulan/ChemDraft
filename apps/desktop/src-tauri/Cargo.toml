@@ -45,8 +45,8 @@ tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-http = "2.5.9"
 
-# Off macOS, a second launch (e.g. double-clicking a document while ChemDraft runs) must hand its
-# arguments to the running instance; macOS gets this from LaunchServices via RunEvent::Opened.
+# Keep the existing Windows/Linux handoff. macOS uses macos_single_instance's advisory lock:
+# the pinned plugin 2.4.5 binds asynchronously and fails open on listener errors/racing launches.
 [target.'cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))'.dependencies]
 tauri-plugin-single-instance = "2"
 
@@ -77,7 +77,7 @@ windows-sys = { version = "0.61", features = [
   "Win32_UI_Shell",
 ] }
 
-# The OCSR engine's process-group kill, waitid and statvfs; every use is behind cfg(unix).
+# The OCSR engine's process-group kill, waitid and statvfs, plus macOS's single-instance flock.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
