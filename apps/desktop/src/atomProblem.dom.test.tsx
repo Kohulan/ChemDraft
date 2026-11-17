@@ -59,6 +59,8 @@ describe.each(["macos", "windows"] as const)("problem marker keyboard propagatio
     for (const [key, modifiers] of [["z", platform === "macos" ? { metaKey: true } : { ctrlKey: true }],
       ["Z", platform === "macos" ? { metaKey: true, shiftKey: true } : { ctrlKey: true, shiftKey: true }],
       ...(platform === "windows" ? [["y", { ctrlKey: true }]] as const : []),
+      ["z", platform === "macos" ? { ctrlKey: true } : { metaKey: true }],
+      ["z", { ctrlKey: true, metaKey: true }], ["y", { metaKey: true }], ["Y", { ctrlKey: true, shiftKey: true }],
       ["r", { ctrlKey: true }], ["r", { metaKey: true }], ["F5", {}],
       ["ArrowLeft", {}], ["Escape", {}]] as const) {
       marker.dispatchEvent(new KeyboardEvent("keydown", { key, ...modifiers, bubbles: true }));
@@ -67,7 +69,8 @@ describe.each(["macos", "windows"] as const)("problem marker keyboard propagatio
   });
 });
 describe.each(["macos", "windows"] as const)("reload on a focused problem marker (%s)", platform => {
-  beforeEach(() => Object.defineProperty(navigator, "platform", { configurable: true, value: platform === "macos" ? "MacIntel" : "Win32" }));
+  // The badge must follow the window's platform override even when host detection disagrees.
+  beforeEach(() => Object.defineProperty(navigator, "platform", { configurable: true, value: platform === "macos" ? "Win32" : "MacIntel" }));
   it.each([
     ["F5", {}], ["r", { ctrlKey: true }], ["r", { metaKey: true }],
     ["R", { ctrlKey: true, shiftKey: true }], ["F5", { ctrlKey: true }]
