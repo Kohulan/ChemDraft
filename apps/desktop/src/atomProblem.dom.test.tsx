@@ -49,6 +49,20 @@ async function mount(document: ChemDraftDocument, shortcutPlatform?: "macos" | "
 const current = () => window.__CHEMDRAFT_AGENT__!.snapshot();
 const molecule = () => current().document.pages[0]!.objects.find(o => o.id === target.objectId) as MoleculeObject;
 const badge = () => container.querySelector<SVGGElement>(`[data-invalid-atom-id="${target.atomId}"]`)!;
+describe.each(["macos", "windows"] as const)("problem marker keyboard propagation (%s)", platform => {
+  it("lets undo and redo reach the canvas while retaining its own navigation keys", async () => {
+    const received: string[] = [];
+    await act(async () => root.render(createElement("svg", { onKeyDown: event => received.push(event.key) },
+      createElement(AtomProblemMarker, { target, x: 0, y: 0, invoke: () => {} }))));
+    const marker = badge();
+    for (const [key, modifiers] of [["z", platform === "macos" ? { metaKey: true } : { ctrlKey: true }],
+      [platform === "macos" ? "Z" : "y", platform === "macos" ? { metaKey: true, shiftKey: true } : { ctrlKey: true }],
+      ["ArrowLeft", {}], ["Escape", {}]] as const) {
+      marker.dispatchEvent(new KeyboardEvent("keydown", { key, ...modifiers, bubbles: true }));
+    }
+    expect(received).toEqual(["z", platform === "macos" ? "Z" : "y"]);
+  });
+});
 describe.each(["macos", "windows"] as const)("reload on a focused problem marker (%s)", platform => {
   it.each([
     ["F5", {}], ["r", { ctrlKey: true }],

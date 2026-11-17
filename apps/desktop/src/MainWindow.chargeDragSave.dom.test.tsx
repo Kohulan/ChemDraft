@@ -116,6 +116,7 @@ describe.each(["macos", "windows"] as const)("charge drag Save (%s)", platform =
       else await pointer(target, ending, { x: 600, y: 500 });
       if (finishWrite) await act(async () => finishWrite!());
       if (ending === "pointerup") {
+        if (gesture === "move") expect(container.querySelector('[role="status"]')?.textContent).toContain("Saved charge-drag.chemdraft");
         expect(dropMark(snapshot().document).anchor).toEqual(mark.anchor);
         expect(dropMark(snapshot().document).x).not.toBe(mark.x);
       } else expect(snapshot().document).toEqual(before);

@@ -2268,6 +2268,7 @@ export function MainWindow({
   const nativeBondEditDragRef = useRef<NativeBondEditDragState | null>(null);
   const nativePartDragRef = useRef<NativePartDragState | null>(null);
   const objectDragRef = useRef<ObjectDragState | null>(null);
+  const objectDragSaveStatusRef = useRef<{ drag: ObjectDragState; status: string } | undefined>(undefined);
   const graphicCornerRadiusDragRef = useRef<GraphicCornerRadiusDragState | null>(null);
   const graphicPathEditDragRef = useRef<GraphicPathEditDragState | null>(null);
   const graphicMarkerDragRef = useRef<GraphicMarkerDragState | null>(null);
@@ -2392,7 +2393,7 @@ export function MainWindow({
       // The live atom/bond graph, not the object's `structure` string: that string is empty for an
       // imported molecule ("The structure input is empty.") and a lossy SMILES for a drawn fused ring
       // system, which analysed a different molecule than the one on the page.
-      const { structureFormat: format, structure, refusalReason } = analysisFacingStructure(molecule, documentRef.current);
+      const { structureFormat: format, structure, refusalReason, refusalCode } = analysisFacingStructure(molecule, documentRef.current);
       const subjectKey = analysisSubjectKey(molecule, documentRef.current);
       const unspellableLabels = nativeMoleculeUnspellableLabels(molecule);
       const client = analysisClient();
@@ -2410,6 +2411,7 @@ export function MainWindow({
             format,
             value: structure,
             ...(refusalReason ? { refusalReason } : {}),
+            ...(refusalCode ? { refusalCode } : {}),
             ...(interpretationOverride ? { interpretationOverride } : {})
           },
           { immediate: true }
@@ -11003,7 +11005,9 @@ export function MainWindow({
         openWarningsRef.current = activeOpenWarnings(tabWarningsRef.current) ?? warningsReport;
         setSaveWarningsReport(warningsReport);
         setOpenWarningsListOpen(false);
-        setStatus(formatSaveStatus(displayName, payload.warnings));
+        const saveStatus = formatSaveStatus(displayName, payload.warnings);
+        if (objectDragRef.current) objectDragSaveStatusRef.current = { drag: objectDragRef.current, status: saveStatus };
+        setStatus(saveStatus);
       } else {
         const snapshot = documentTabSnapshotsRef.current.get(savingTabId);
         if (snapshot) documentTabSnapshotsRef.current.set(savingTabId, {
@@ -18692,7 +18696,9 @@ export function MainWindow({
       objectDragMachineRef.current = initialInteractionState();
       if (objectDrag.dragging) {
         const changed = commitObjectDrag(objectDrag, point);
-        setStatus(objectDrag.dropStatus ?? (changed ? "Moved selected object" : "Object did not move"));
+        const moveStatus = objectDrag.dropStatus ?? (changed ? "Moved selected object" : "Object did not move");
+        setStatus(objectDragSaveStatusRef.current?.drag === objectDrag ? `${objectDragSaveStatusRef.current.status}; ${moveStatus}` : moveStatus);
+        objectDragSaveStatusRef.current = undefined;
       } else if (objectDrag.bondTarget) {
         cycleNativeBondOrder(objectDrag.bondTarget);
       } else {
@@ -21631,7 +21637,9 @@ export function MainWindow({
       const point = pagePointFromPointerEvent(event) ?? objectDrag.latestPoint;
       if (objectDrag.dragging) {
         const changed = commitObjectDrag(objectDrag, point);
-        setStatus(objectDrag.dropStatus ?? (changed ? "Moved selected object" : "Object did not move"));
+        const moveStatus = objectDrag.dropStatus ?? (changed ? "Moved selected object" : "Object did not move");
+        setStatus(objectDragSaveStatusRef.current?.drag === objectDrag ? `${objectDragSaveStatusRef.current.status}; ${moveStatus}` : moveStatus);
+        objectDragSaveStatusRef.current = undefined;
       } else if (objectDrag.bondTarget) {
         cycleNativeBondOrder(objectDrag.bondTarget);
       } else {

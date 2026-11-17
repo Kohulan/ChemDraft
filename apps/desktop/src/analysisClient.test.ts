@@ -76,6 +76,13 @@ afterEach(() => {
 });
 
 describe("createAnalysisClient", () => {
+  it("reports repeat-unit refusals with their own diagnostic code", async () => {
+    const { client, workers } = createClient();
+    const run = await client.analyze("selection", { format: "molfile-v3000", value: "", refusalReason: "Repeat unit cannot be analyzed", refusalCode: "structure.repeat_unit" });
+    expect(run.warnings).toEqual([expect.objectContaining({ code: "structure.repeat_unit", message: "Repeat unit cannot be analyzed" })]);
+    expect(workers).toEqual([]);
+    client.dispose();
+  });
   it("declines unknown bond orders without creating a worker or computing numbers", async () => {
     const { client, workers } = createClient();
     const run = await client.analyze("selection", { format: "molfile-v3000", value: "", refusalReason: "Bonds b3, b7 have an unknown bond order." }, { immediate: true });
