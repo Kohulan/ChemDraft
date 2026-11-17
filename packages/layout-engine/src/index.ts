@@ -3061,7 +3061,7 @@ function moleculeEffectSketchBasePathD(
       // The first path contains the ordinary rough edges (two M/Bezier strokes per edge).
       // Tick overrides follow it, already coloured below. Keep uniform paths intact.
       const colors = bondPathParts.filter(part => !part.tick)
-        .flatMap(part => Array<string>(part.d.match(/[LZ]/g)?.length ?? 0).fill(part.color));
+        .flatMap(part => Array<string>(part.d.match(/[LCZ]/g)?.length ?? 0).fill(part.color));
       if (!colors.length || !paths.length) return paths;
       const [path, ...ticks] = paths;
       if (colors.every(color => color === colors[0])) return [{ ...path!, stroke: colors[0]! }, ...ticks];
@@ -3076,7 +3076,7 @@ function moleculeEffectSketchBasePathD(
       const overrides = new Map<number, NativeArtSketchPathPlan | null>();
       let lineIndex = 0;
       for (const part of bondPathParts) {
-        const edges = part.d.match(/[LZ]/g)?.length ?? 0;
+        const edges = part.d.match(/[LCZ]/g)?.length ?? 0;
         if (part.tick) {
           overrides.set(lineIndex, parameters.roughness === 0
             ? { d: part.d, stroke: part.color, strokeWidth: parameters.strokeWidth }
@@ -5727,8 +5727,12 @@ export function bracketVisualBounds(object: BracketObject): LayoutBounds {
   const label = bracketLabelPlan(object);
   const right = label ? Math.max(object.width, label.bounds.x + label.bounds.width) : object.width;
   const bottom = label ? Math.max(object.height, label.bounds.y + label.bounds.height) : object.height;
+  const projection = projectedPlaneMatrixForObject(object);
   const points = [{ x: 0, y: 0 }, { x: right, y: 0 }, { x: right, y: bottom }, { x: 0, y: bottom }]
-    .map(point => transformPointForObject(object, { x: object.x + point.x, y: object.y + point.y }));
+    .map(point => {
+      const page = { x: object.x + point.x, y: object.y + point.y };
+      return projection ? projectPointInObjectPlane(object, page, projection) : transformPointForObject(object, page);
+    });
   const x = Math.min(...points.map(point => point.x)), y = Math.min(...points.map(point => point.y));
   return { x, y, width: Math.max(...points.map(point => point.x)) - x, height: Math.max(...points.map(point => point.y)) - y };
 }
@@ -9139,14 +9143,14 @@ export function projectedPlaneMatrix(
   return { a: cy * cz, b: cx * sz + sx * sy * cz, c: -cy * sz, d: cx * cz - sx * sy * sz };
 }
 
-function projectedPlaneMatrixForObject(object: DocumentObject): ProjectedPlaneMatrix | undefined {
+export function projectedPlaneMatrixForObject(object: DocumentObject): ProjectedPlaneMatrix | undefined {
   const tiltX = metadataNumber(object.style.tiltXDegrees) ?? 0;
   const tiltY = metadataNumber(object.style.tiltYDegrees) ?? 0;
   if (Math.abs(tiltX) < 0.001 && Math.abs(tiltY) < 0.001) return undefined;
   return projectedPlaneMatrix(tiltX, tiltY, object.rotation);
 }
 
-function projectPointInObjectPlane(object: DocumentObject, point: LayoutPoint, matrix: ProjectedPlaneMatrix): LayoutPoint {
+export function projectPointInObjectPlane(object: DocumentObject, point: LayoutPoint, matrix: ProjectedPlaneMatrix): LayoutPoint {
   const cx = object.x + Math.max(object.width, 1) / 2;
   const cy = object.y + Math.max(object.height, 1) / 2;
   return {

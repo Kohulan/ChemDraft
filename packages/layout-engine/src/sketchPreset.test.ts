@@ -21,6 +21,16 @@ const render = (object: MoleculeObject) => planPageSvgRender({ ...createEmptyDoc
 const sketch = (object: MoleculeObject) => render(object).filter(fragment => fragment.attrs.class === "native-molecule-sketch");
 
 describe("Sketch preset bond geometry at roughness 1.25", () => {
+  it("keeps wavy and following hashed bond colours and ink distinct", () => {
+    const object = molecule("single");
+    object.bonds[0]!.display = { bondStyle: "wavy" };
+    object.atoms.push({ id: "c", element: "C", x: 100, y: 60, formalCharge: 0 });
+    object.bonds.push({ id: "bc", fromAtomId: "b", toAtomId: "c", order: "single", display: { bondStyle: "hashed" } });
+    object.style.bondColors = { ab: "#ab1234", bc: "#1234ab" };
+    const ink = sketch(object);
+    expect(ink.some(mark => mark.attrs.stroke === "#ab1234")).toBe(true);
+    expect(ink.some(mark => mark.attrs.fill === "#1234ab" || mark.attrs.stroke === "#1234ab")).toBe(true);
+  });
   it.each([
     { name: "explicit bond", bondColor: "#123456", effectColor: "#654321", override: "#ab1234", expected: "#ab1234" },
     { name: "explicit black bond", override: "#000000", expected: "#000000" },
