@@ -6,6 +6,31 @@ import { applyChargeToolAtNativeAtom, createPhase4Document, moveDocumentObject, 
 export const dropMark = (document: ChemDraftDocument) => document.pages[0].objects.find(object => object.type === "electron-mark") as ElectronMarkObject;
 export const dropMolecule = (document: ChemDraftDocument) => document.pages[0].objects.find(object => object.type === "molecule") as MoleculeObject;
 
+/** Legacy documents can contain distant explicit atom links; transforms must still carry them. */
+export function distantAttachedElectronMarkFixture(spec: NativeElectronMarkSpec = { kind: "charge", charge: 1 }) {
+  const fixture = electronMarkDropFixture(spec), mark = dropMark(fixture.document);
+  return { ...fixture, document: normalizeCommittedDocument(applyPatch(fixture.document,
+    { op: "updateObject", objectId: mark.id, changes: { x: 591, y: 491, atomAssociation: "explicit" } },
+    { now: phase4Timestamp })) };
+}
+
+/** Ammonium with implicit H, so detaching + must refresh NH4 to neutral NH3. */
+export function ammoniumElectronMarkDropFixture() {
+  const fixture = electronMarkDropFixture(), molecule = dropMolecule(fixture.document);
+  const graph = testMoleculeFromSmiles("N");
+  const atoms = graph.atoms.map(atom => ({ ...atom, x: 228, y: 250 }));
+  let document = applyPatches(fixture.document, [
+    { op: "removeObject", objectId: dropMark(fixture.document).id },
+    { op: "updateObject", objectId: molecule.id, changes: {
+      x: 228, y: 250, width: 0, height: 0, atoms, bonds: graph.bonds,
+      structure: nativeSingleBondGraphSmiles(atoms, graph.bonds), chemistry: nativeSingleBondGraphMetadata(atoms, graph.bonds)
+    } }
+  ], { now: phase4Timestamp });
+  document = normalizeCommittedDocument(applyChargeToolAtNativeAtom(document, 1,
+    { kind: "atom", objectId: molecule.id, atomId: atoms[0].id, distanceToPointer: 0 }));
+  return { document, nitrogen: atoms[0] };
+}
+
 /** O–C–C–N in the reported rotation frame, with a distant floating +. */
 export function rotatedElectronMarkDropFixture(rotation: number) {
   const fixture = electronMarkDropFixture();

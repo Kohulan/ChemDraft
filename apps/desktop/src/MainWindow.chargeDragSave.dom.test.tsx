@@ -116,12 +116,25 @@ describe.each(["macos", "windows"] as const)("charge drag Save (%s)", platform =
       else await pointer(target, ending, { x: 600, y: 500 });
       if (finishWrite) await act(async () => finishWrite!());
       if (ending === "pointerup") {
+<<<<<<< HEAD
         if (gesture === "move") expect(container.querySelector('[role="status"]')?.textContent).toContain("Saved charge-drag.chemdraft");
         expect(dropMark(snapshot().document).anchor).toEqual(mark.anchor);
+||||||| 907c5fb40
+        expect(dropMark(snapshot().document).anchor).toEqual(mark.anchor);
+=======
+        if (gesture === "move") {
+          expect(dropMark(snapshot().document).anchor.kind).toBe("point");
+          expect(dropMolecule(snapshot().document).atoms[7].formalCharge).toBe(0);
+          expect(container.querySelector("[data-status-message]")?.textContent).toBe("Charge removed from N (N now NH)");
+        } else expect(dropMark(snapshot().document).anchor).toEqual(mark.anchor);
+>>>>>>> agentctl/run-20261117-134100-c8d4f1/mark-dissociate
         expect(dropMark(snapshot().document).x).not.toBe(mark.x);
       } else expect(snapshot().document).toEqual(before);
       expect(snapshot().file.dirty, "only a committed move after Save is dirty").toBe(ending === "pointerup");
-      expect.soft(dropMolecule(saved), "clean restored canvas must match saved chemistry").toEqual(dropMolecule(snapshot().document));
+      if (gesture === "move" && ending === "pointerup") {
+        expect(dropMolecule(saved).atoms[7].formalCharge).toBe(1);
+        expect(dropMolecule(snapshot().document).atoms[7].formalCharge).toBe(0);
+      } else expect.soft(dropMolecule(saved), "clean restored canvas must match saved chemistry").toEqual(dropMolecule(snapshot().document));
       expect(container.querySelector("main")?.getAttribute("data-can-undo")).toBe(ending === "pointerup" ? "true" : "false");
     });
   });

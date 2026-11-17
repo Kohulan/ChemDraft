@@ -5,7 +5,7 @@ import { documentDrawingDefaults, nativeAtomBondOrderUsage, nativeImplicitHydrog
   stereoPerceptionMolfile, type PagePoint } from "@chemdraft/document-workflow-core";
 import * as workflow from "./documentWorkflow";
 import { dropElectronMark, electronMarkDropTarget, ELECTRON_MARK_DROP_CAPTURE_BOND_LENGTHS } from "./electronMarkDrop";
-import { dropMark, dropMolecule, electronMarkDropFixture, rotatedElectronMarkDropFixture } from "./testSupport/electronMarkDropFixture";
+import { ammoniumElectronMarkDropFixture, distantAttachedElectronMarkFixture, dropMark, dropMolecule, electronMarkDropFixture, rotatedElectronMarkDropFixture } from "./testSupport/electronMarkDropFixture";
 import { associationSpecs } from "./testSupport/electronMarkMainParity";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 import { saveDirectElectronMarkEditing } from "./electronMarkEditingSettings";
@@ -133,17 +133,37 @@ describe.each([false, true])("electron-mark drops with direct editing %s", enabl
     }
   });
 
-  it.each(associationSpecs)("keeps the source atom and chemistry in empty space for %j, including after save and normalize", spec => {
+  it.each(associationSpecs)("dissociates %j in empty space, recomputes chemistry, and reattaches on return", spec => {
     const { document, sourceAtom } = electronMarkDropFixture(spec);
     const originalMolecule = dropMolecule(document);
     const result = drop(document, { x: 600, y: 500 });
     expect(result.refused).toBeUndefined();
     expect(dropMark(result.document)).toMatchObject({ x: 591, y: 491,
-      anchor: { kind: "atom", objectId: originalMolecule.id, atomId: sourceAtom.id }, atomAssociation: "explicit" });
-    expect(dropMolecule(result.document)).toEqual(originalMolecule);
-    expect(result.status).toContain("no other atom close enough to move it to");
+      anchor: { kind: "point", point: { x: 600, y: 500 } }, atomAssociation: "explicit" });
+    expect(dropMark(result.document).anchor.objectId).toBeUndefined();
+    expect(dropMark(result.document).anchor.atomId).toBeUndefined();
+    expect(atomDropState(result.document, sourceAtom.id)).toMatchObject({ charge: 0, radicals: 0 });
+    expect(result.status).toContain(`removed from ${sourceAtom.element}`);
+    expect(result.undoLabel).toMatch(/^Move /);
     const reopened = workflow.normalizeCommittedDocument(deserializeDocument(serializeDocument(result.document)));
     expect(reopened.pages).toEqual(result.document.pages);
+    const returned = drop(reopened, sourceAtom);
+    expect(returned.refused).toBeUndefined();
+    expect(dropMark(returned.document).anchor).toEqual(dropMark(document).anchor);
+    expect(dropMolecule(returned.document)).toEqual(originalMolecule);
+  });
+
+  it("removes ammonium's positive charge and recomputes NH4 to NH3 through the shared valence code", () => {
+    const { document, nitrogen } = ammoniumElectronMarkDropFixture();
+    expect(atomDropState(document, nitrogen.id)).toMatchObject({ charge: 1, hydrogens: 4, label: "NH4" });
+    const result = drop(document, { x: 600, y: 500 });
+    expect(result.refused).toBeUndefined();
+    expect(atomDropState(result.document, nitrogen.id)).toMatchObject({ charge: 0, radicals: 0, hydrogens: 3, label: "NH3" });
+    expect(dropMolecule(result.document).atoms[0].markCharge).toBeUndefined();
+    expect(result.status).toBe("Charge removed from N (N now NH3)");
+    const returned = drop(result.document, nitrogen);
+    expect(returned.status).toBe("Charge attached to N (N now NH4)");
+    expect(dropMolecule(returned.document)).toEqual(dropMolecule(document));
   });
 
   it.each(["point", "stale"])("keeps a %s-anchored floating charge outside capture radius durably, without changing legacy files", anchorKind => {
@@ -294,7 +314,7 @@ describe.each([false, true])("electron-mark drops with direct editing %s", enabl
 
   it.each([1, -1] as const)("retains a distant radical ion's association when neutralising charge %s", async charge => {
     const fixture = electronMarkDropFixture({ kind: "charge", charge, radical: true });
-    const distant = drop(fixture.document, { x: 600, y: 500 }).document;
+    const distant = distantAttachedElectronMarkFixture({ kind: "charge", charge, radical: true }).document;
     const original = dropMark(distant), molecule = dropMolecule(distant);
     const neutral = workflow.normalizeCommittedDocument(workflow.applyChargeToolAtNativeAtom(distant, -charge as 1 | -1,
       { kind: "atom", objectId: molecule.id, atomId: fixture.sourceAtom.id, distanceToPointer: 0 }));
@@ -343,7 +363,7 @@ describe.each([false, true])("electron-mark drops with direct editing %s", enabl
     expect(result.status).toBe("Cannot move Charge from N to C: C cannot carry formal charge +1 with bond/radical valence 4");
   });
 
-  it("refuses to strip the charge from a four-bond nitrogen", () => {
+  it.each(["transfer", "detach"])("refuses to strip the charge from a four-bond nitrogen on %s", action => {
     const fixture = electronMarkDropFixture();
     const molecule = dropMolecule(fixture.document);
     const hydrogens: MoleculeAtom[] = [-1, 1].map((side, index) => ({ id: `explicit_h${index}`, element: "H", formalCharge: 0,
@@ -352,10 +372,10 @@ describe.each([false, true])("electron-mark drops with direct editing %s", enabl
       toAtomId: atom.id, order: "single" }));
     const document = workflow.normalizeCommittedDocument(applyPatch(fixture.document, { op: "updateObject", objectId: molecule.id,
       changes: { atoms: [...molecule.atoms, ...hydrogens], bonds: [...molecule.bonds, ...bonds] } }, { now: phase4Timestamp }));
-    const result = drop(document, fixture.carbonylOxygen);
+    const result = drop(document, action === "transfer" ? fixture.carbonylOxygen : { x: 600, y: 500 });
     expect(result.refused).toBe(true);
     expect(result.document).toBe(document);
-    expect(result.status).toBe("Cannot move Charge from N to O: N cannot carry formal charge 0 with bond/radical valence 4");
+    expect(result.status).toBe(`Cannot move Charge from N${action === "transfer" ? " to O" : ""}: N cannot carry formal charge 0 with bond/radical valence 4`);
   });
 
   it("re-associates unknown display marks too", () => {
@@ -423,8 +443,7 @@ it("chooses the nearest atom inside half the document bond length, including the
 });
 
 it.each(associationSpecs)("keeps a distant explicit attachment through appearance edits of %j", spec => {
-  const fixture = electronMarkDropFixture(spec);
-  let document = drop(fixture.document, { x: 600, y: 500 }).document;
+  let document = distantAttachedElectronMarkFixture(spec).document;
   const original = dropMolecule(document), anchor = dropMark(document).anchor;
   document = workflow.applyElectronMarkStyleToSelection(document, "size", 72);
   document = workflow.applyElectronMarkStyleToSelection(document, "thickness", 5);

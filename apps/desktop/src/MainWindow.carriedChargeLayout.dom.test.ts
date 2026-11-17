@@ -8,7 +8,6 @@ import { combinedLayoutBounds, planObjectArrangement } from "@chemdraft/layout-e
 import { nativeSingleBondGraphMetadata, nativeSingleBondGraphSmiles } from "@chemdraft/document-workflow-core";
 import { MainWindow } from "./MainWindow";
 import * as workflow from "./documentWorkflow";
-import { dropElectronMark } from "./electronMarkDrop";
 import { saveDirectElectronMarkEditing } from "./electronMarkEditingSettings";
 import { saveCompoundLayoutSettings } from "./compoundLayoutSettings";
 import { DOM_COMMAND_EVENT } from "./window-manager";
@@ -33,9 +32,9 @@ function twoGlycinesAndArrow(distant = true): ChemDraftDocument {
     if (!distant) continue;
     const mark = document.pages[0].objects.find(object => object.type === "electron-mark" && object.anchor.objectId === molecule.id)!;
     const center = { x: 450 + index * 100, y: 390 + index * 90 };
-    const dropped = dropElectronMark(document, mark.id, { x: center.x - mark.width / 2, y: center.y - mark.height / 2 }, center);
-    expect(dropped.refused).toBeUndefined();
-    document = dropped.document;
+    // Legacy explicit links remain valid even though a new direct drop here would dissociate.
+    document = workflow.normalizeCommittedDocument(applyPatch(document, { op: "updateObject", objectId: mark.id,
+      changes: { x: center.x - mark.width / 2, y: center.y - mark.height / 2, atomAssociation: "explicit" } }));
   }
   const arrow = workflow.createNativeArtLineGraphicObject(document, { x: 660, y: 540 }, { x: 750, y: 540 }, "tool.art.reactionArrow")!;
   return applyPatch(document, { op: "addObject", pageId: document.pages[0].id, object: arrow });
