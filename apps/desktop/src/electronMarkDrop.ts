@@ -81,9 +81,10 @@ export function dropElectronMark(
   const pageId = document.pages.find(page => page.objects.some(object => object.id === markId))?.id;
   const target = electronMarkDropTarget(document, dropPoint, pageId);
   const anchor: ElectronMarkObject["anchor"] = target?.kind === "atom"
-    ? { kind: "atom", objectId: target.objectId, atomId: target.atomId } : mark.anchor;
+    ? { kind: "atom", objectId: target.objectId, atomId: target.atomId }
+    : { kind: "point", point: { x: position.x + mark.width / 2, y: position.y + mark.height / 2 } };
   const destination = associatedAtom(document, anchor);
-  const transferring = destination && (!source || source.molecule.id !== destination.molecule.id || source.atom.id !== destination.atom.id);
+  const transferring = source?.molecule.id !== destination?.molecule.id || source?.atom.id !== destination?.atom.id;
   const contribution = electronMarkAtomContribution(mark);
   const undoLabel = source || destination ? `Move ${name}` : "Move electron mark";
   const refusal = (reason: string): ElectronMarkDropResult => ({ document, undoLabel, refused: true,
@@ -108,9 +109,7 @@ export function dropElectronMark(
   // Record the decision on the document, including an intentional floating drop. The existing
   // explicit flag makes either anchor durable across normalization, native save and reopen.
   moved = applyPatch(moved, { op: "updateObject", objectId: markId,
-    changes: { anchor: destination ? anchor : { kind: "point", point: {
-      x: position.x + mark.width / 2, y: position.y + mark.height / 2
-    } }, atomAssociation: "explicit" } }, { now: phase4Timestamp });
+    changes: { anchor, atomAssociation: "explicit" } }, { now: phase4Timestamp });
   let after = normalizeCommittedDocument(moved);
   const finalMark = findDocumentObject(after, markId) as ElectronMarkObject;
   const finalDestination = associatedAtom(after, finalMark.anchor);
@@ -132,7 +131,7 @@ export function dropElectronMark(
   }
 
   // Only an actual atom drop snaps beside its label. Empty-space drops retain the user's
-  // position and existing association. Use reconciled chemistry so OH/NH2 includes the new H.
+  // position as free annotations. Use reconciled chemistry so OH/NH2 includes the new H.
   if (target && finalDestination) {
     const page = after.pages.find(page => page.id === pageId)!;
     const point = nativeChargePlacementPointForAtom(finalDestination.molecule, finalDestination.atom.id,
@@ -169,10 +168,10 @@ export function dropElectronMark(
       ? `${name} moved from ${sourceName} to ${destinationName}${chemistry}`
       : `${name} attached to ${finalDestination.atom.element}${chemistry}` };
   }
-  if (source && !finalDestination && chemistryChanges.length) {
-    return { document: after, undoLabel, status: `${name} detached from ${source.atom.element}${chemistry}` };
+  if (source && !finalDestination) {
+    return { document: after, undoLabel, status: `${name} removed from ${source.atom.element}${chemistry}` };
   }
   return { document: after, undoLabel, status: source
-    ? `${name} repositioned on ${source.atom.element}${chemistry}${target ? "" : " (no other atom close enough to move it to)"}`
+    ? `${name} repositioned on ${source.atom.element}${chemistry}`
     : `Moved electron mark${chemistry}` };
 }

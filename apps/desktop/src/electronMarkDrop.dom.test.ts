@@ -15,7 +15,7 @@ import { MainWindow } from "./MainWindow";
 import * as workflow from "./documentWorkflow";
 import { DOM_COMMAND_EVENT } from "./window-manager";
 import { saveDirectElectronMarkEditing } from "./electronMarkEditingSettings";
-import { dropMark, dropMolecule, electronMarkDropFixture, rotatedElectronMarkDropFixture } from "./testSupport/electronMarkDropFixture";
+import { ammoniumElectronMarkDropFixture, distantAttachedElectronMarkFixture, dropMark, dropMolecule, electronMarkDropFixture, rotatedElectronMarkDropFixture } from "./testSupport/electronMarkDropFixture";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -575,16 +575,68 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
     }
   });
 
-  it("keeps the atom and chemistry when dropping into empty space", async () => {
-    const { document } = electronMarkDropFixture(); await mount(document);
+  it.each(["object", "page"])("dissociates ammonium on a far %s drop, reattaches on return, and undoes each drag exactly once", async route => {
+    const { document, nitrogen } = ammoniumElectronMarkDropFixture();
+    await mount(document);
     const before = snapshot(), drag = await start(), end = { x: 600, y: 500 };
+    expect(labels()[0]).toBe("NH4");
     await move(drag.target, end);
     expect(highlighted()).toBeUndefined();
-    await act(async () => pointer(drag.target, "pointerup", end));
-    expect(dropMark(snapshot()).anchor).toEqual(dropMark(before).anchor);
-    expect(dropMolecule(snapshot())).toEqual(dropMolecule(before));
-    expect(status()).toBe("Charge repositioned on N (no other atom close enough to move it to)");
+    expect(snapshot()).toBe(before);
+    await act(async () => pointer(route === "page" ? page() : drag.target, "pointerup", end));
+    const detached = snapshot();
+    expect(dropMark(detached).anchor).toEqual({ kind: "point", point: end });
+    expect(dropMolecule(detached).atoms[0]).toMatchObject({ formalCharge: 0 });
+    expect(dropMolecule(detached).atoms[0].markCharge).toBeUndefined();
+    expect(labels()[0]).toBe("NH3");
+    expect(status()).toBe("Charge removed from N (N now NH3)");
+    await command("edit.undo");
+    expect(status()).toBe("Undid Move Charge");
+    expect(snapshot()).toEqual(before);
     await command("edit.undo"); expect(snapshot()).toEqual(before);
+    await command("edit.redo"); expect(snapshot()).toEqual(detached);
+    await command("edit.redo"); expect(snapshot()).toEqual(detached);
+
+    const returning = await start();
+    await move(returning.target, nitrogen);
+    expect(highlighted()).toBe(nitrogen.id);
+    await act(async () => pointer(route === "page" ? page() : returning.target, "pointerup", nitrogen));
+    const attached = snapshot();
+    expect(dropMark(attached).anchor).toEqual(dropMark(before).anchor);
+    expect(dropMolecule(attached)).toEqual(dropMolecule(before));
+    expect(labels()[0]).toBe("NH4");
+    expect(status()).toBe("Charge attached to N (N now NH4)");
+    await command("edit.undo");
+    expect(status()).toBe("Undid Move Charge");
+    expect(snapshot()).toEqual(detached);
+    await command("edit.undo"); expect(snapshot()).toEqual(before);
+    await command("edit.redo"); expect(snapshot()).toEqual(detached);
+    await command("edit.redo"); expect(snapshot()).toEqual(attached);
+  });
+
+  it("carries an ammonium molecule together with its mark in one exactly reversible drag", async () => {
+    const { document } = ammoniumElectronMarkDropFixture();
+    const molecule = dropMolecule(document), mark = dropMark(document);
+    await mount(workflow.groupSelectedDocumentObjects(workflow.selectDocumentObjects(document,
+      document.pages[0].id, [molecule.id, mark.id])));
+    const target = container.querySelector(`[data-page-svg-object-visual="${mark.id}"] circle`)!;
+    expect(target).not.toBeNull();
+    const point = workflow.nativeChargeMarkCenter(mark);
+    await act(async () => pointer(target, "pointerdown", point));
+    const before = snapshot();
+    await move(target, { x: point.x + 100, y: point.y + 100 });
+    await act(async () => pointer(target, "pointerup", { x: point.x + 100, y: point.y + 100 }));
+    const after = snapshot(), movedMark = dropMark(after);
+    expect(movedMark.anchor).toEqual(mark.anchor);
+    expect(workflow.nativeChargeMarkCenter(movedMark)).toEqual({ x: point.x + 100, y: point.y + 100 });
+    expect(dropMolecule(after).atoms[0]).toMatchObject({ formalCharge: 1, markCharge: 1,
+      x: molecule.atoms[0].x + 100, y: molecule.atoms[0].y + 100 });
+    expect(labels()[0]).toBe("NH4");
+    await command("edit.undo");
+    expect(status()).toBe("Undid Move group");
+    expect(snapshot()).toEqual(before);
+    await command("edit.undo"); expect(snapshot()).toEqual(before);
+    await command("edit.redo"); expect(snapshot()).toEqual(after);
   });
 
   it.each([20, 8])("commits a floating charge released %s px from O with accurate status", async separation => {
@@ -662,13 +714,9 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
     expect(status()).toBe("Charge attached to O (O now H2O)");
   });
 
-  it.each([1, -1] as const)("keeps the radical on its atom after dropping and neutralising a radical ion with charge %s", async charge => {
-    const fixture = electronMarkDropFixture({ kind: "charge", charge, radical: true });
+  it.each([1, -1] as const)("keeps a legacy distant radical ion on its atom when neutralising charge %s", async charge => {
+    const fixture = distantAttachedElectronMarkFixture({ kind: "charge", charge, radical: true });
     await mount(fixture.document);
-    const drag = await start(), end = { x: 600, y: 500 };
-    await move(drag.target, end);
-    await act(async () => pointer(drag.target, "pointerup", end));
-    expect(status()).toContain("no other atom close enough to move it to");
     const distant = snapshot(), original = dropMark(distant);
     await act(async () => pointer(page(), "pointermove", fixture.sourceAtom));
     await command(charge > 0 ? "tool.minus" : "tool.plus");
