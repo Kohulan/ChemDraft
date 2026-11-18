@@ -185,7 +185,7 @@ import {
   type ViewportState
 } from "@chemdraft/viewport-engine";
 import ScenaRuler from "@scena/react-ruler";
-import { assertPluginDocumentWriteScope, assertPluginPatchWriteScope, CommandRegistry } from "@chemdraft/plugin-host";
+import { assertPluginDocumentWriteScope, assertPluginPatchWriteScope, CommandRegistry, finishScopedRepeatUnitCleanup, rebasePluginPatch } from "@chemdraft/plugin-host";
 import { PluginCommandInputSchema, type PluginCommandInput, type PluginPanelReport } from "@chemdraft/plugin-api";
 import { createCoreCommandRegistrar } from "./commands/coreCommandRegistrar";
 import { createFixturePluginOptions, fixturePluginManifest, FIXTURE_PLUGIN_ID } from "./plugins/fixturePlugin";
@@ -534,7 +534,8 @@ import {
   applyNativeMoleculeDeleteTarget,
   nativeAtomHasExplicitLabel,
   applyNativeMoleculePartDeleteTarget,
-  applyNativeMoleculePartsDelete,
+  nativeMoleculePartDeletePatch,
+  deleteClipboardSelection,
   applyEditorSaveResultWithLabelWarnings,
   editorSaveLabelWarningsStatus,
   applyAnalysisToSelectedMolecule,
@@ -2655,7 +2656,6 @@ export function MainWindow({
   const bracketLabelEditRef = useRef(bracketLabelEdit); bracketLabelEditRef.current = bracketLabelEdit;
   const bracketLabelEditorRef = useRef<BracketLabelEditorHandle>(null);
   useEffect(() => { setBracketLabelEdit(undefined); }, [activeDocumentTabId]);
-  const bracketActions = useMemo(() => createBracketCommands(document), [document]);
   const tableActions = useMemo(() => createTableCommands(document, activeTableCell),
     [document, activeTableCell?.tableId, activeTableCell?.rowId, activeTableCell?.columnId]);
   const insertTableFromDialogRef = useRef<(tabId: string, options: InsertTableOptions) => Promise<void>>(async () => {});
@@ -2767,6 +2767,7 @@ export function MainWindow({
   // across *different* molecules. `selectedNativeMoleculePart` (the primary) still drives every
   // single-molecule operation — drag, spin, delete, the inspector, dependency arrays — unchanged.
   const [selectedNativeMoleculeParts, setSelectedNativeMoleculeParts] = useState<NativeMoleculeSelectionPart[]>([]);
+  const bracketActions = useMemo(() => createBracketCommands(document, selectedNativeMoleculeParts), [document, selectedNativeMoleculeParts]);
   const arrowNudgeBurstRef = useRef<{ history: DocumentHistory; lastPress: number } | undefined>(undefined);
   useLayoutEffect(() => { arrowNudgeBurstRef.current = undefined; }, [selectedNativeMoleculeParts]);
   useEffect(() => {
@@ -2901,6 +2902,7 @@ export function MainWindow({
   const historyNavigationCountRef = useRef(0);
   const documentHistoryRef = useRef<DocumentHistory>(documentHistory);
   const documentUndoLabelsRef = useRef(new WeakMap<ChemDraftDocument, string>());
+  const repeatUnitHistorySelectionsRef = useRef(new WeakMap<ChemDraftDocument, NativeMoleculeSelectionPart[]>());
   const fileStateRef = useRef<NativeFileState>(fileState);
   // Successful explicit saves, per tab, including a save completed while its label editor is open.
   const documentSaveRevisionsRef = useRef(new Map<string, number>());
@@ -3719,9 +3721,9 @@ export function MainWindow({
   }, []);
   // Ordinary edits and assistant history pushes/amendments share commit preparation.
   const prepareDocumentCommit = useCallback((nextDocument: ChemDraftDocument, undoLabel?: string,
-    assertFinalDocument?: (document: ChemDraftDocument) => void) => {
-    const present = normalizeCommittedDocument(nextDocument);
-    assertFinalDocument?.(present);
+    assertFinalDocument?: (document: ChemDraftDocument) => ChemDraftDocument | void) => {
+    const normalized = normalizeCommittedDocument(nextDocument);
+    const present = assertFinalDocument?.(normalized) ?? normalized;
     const label = undoLabel ?? documentUndoLabelsRef.current.get(nextDocument);
     if (label) documentUndoLabelsRef.current.set(present, label);
     return present;
@@ -3732,7 +3734,7 @@ export function MainWindow({
     nextDocumentOrUpdate: ChemDraftDocument | ((current: ChemDraftDocument) => ChemDraftDocument),
     undoLabel?: string,
     textCheckpointed = false,
-    assertFinalDocument?: (document: ChemDraftDocument) => void
+    assertFinalDocument?: (document: ChemDraftDocument) => ChemDraftDocument | void
   ): boolean => {
     if (quitMutationFrozenRef.current) throw new Error("Quit is completing; the pending edit was not applied.");
     // Validate the actual final state before checkpointing typing or settling other history.
@@ -3785,7 +3787,7 @@ export function MainWindow({
   const commitDocumentChangeWithPageFit = useCallback((
     update: ChemDraftDocument | ((current: ChemDraftDocument) => ChemDraftDocument), label?: string,
     onCommit?: NonNullable<Parameters<typeof commitWithPageFit>[3]>["onCommit"],
-    assertFinalDocument?: (document: ChemDraftDocument) => void
+    assertFinalDocument?: (document: ChemDraftDocument) => ChemDraftDocument | void
   ): boolean => {
     if (pageFitPendingRef.current) { setStatus("Finish the page size question before editing."); return false; }
     const resumeTextEdit = checkpointTextEditBeforeCommitRef.current();
@@ -3884,7 +3886,7 @@ export function MainWindow({
         documentTabSnapshotsRef.current.set(tabId, { ...snapshot, history, parts: [], file: { ...snapshot.file, dirty: true } });
       }
     };
-    const labelled = (document: ChemDraftDocument, label: string, assertFinalDocument?: (document: ChemDraftDocument) => void) => {
+    const labelled = (document: ChemDraftDocument, label: string, assertFinalDocument?: (document: ChemDraftDocument) => ChemDraftDocument | void) => {
       const present = prepareDocumentCommit(document, label, assertFinalDocument);
       assistantRecordedAfterRef.current.set(present, present);
       return present;
@@ -7681,17 +7683,7 @@ export function MainWindow({
     const currentDocument = documentRef.current;
     // Use the selection that produced the successful clipboard write. It may include both
     // whole objects and fragments, and the user may have changed selection while it was writing.
-    const carriedMarkIds = payload.objects.filter((object) => object.type === "electron-mark").map((object) => object.id);
-    let nextDocument = deleteSelectedDocumentObjects(currentDocument, [...wholeObjectIds, ...carriedMarkIds]);
-    for (const object of payload.objects) {
-      if (object.type === "molecule") {
-        nextDocument = applyNativeMoleculePartsDelete(nextDocument, {
-          objectId: object.id,
-          atomIds: object.atoms.map((atom) => atom.id),
-          bondIds: object.bonds.map((bond) => bond.id)
-        });
-      }
-    }
+    const nextDocument = deleteClipboardSelection(currentDocument, payload, wholeObjectIds);
     if (nextDocument !== documentRef.current) {
       commitDocumentChange(nextDocument);
       setActiveEditorObjectId(undefined);
@@ -9660,6 +9652,9 @@ export function MainWindow({
       setStatus(direction === "undo" ? "Nothing to undo" : "Nothing to redo");
       return;
     }
+
+    const repeatUnitSelection = repeatUnitHistorySelectionsRef.current.get(nextHistory.present);
+    if (repeatUnitSelection) setSelectedNativeMoleculeParts(repeatUnitSelection);
 
     historyNavigationCountRef.current += 1;
     setFileState((current) => {
@@ -11698,10 +11693,20 @@ export function MainWindow({
 
     bracketActions.forEach(action => register(action, () => {
       if (action.id === "bracket.repeatUnit.toggle") {
-        const nextDocument = toggleBracketRepeatUnit(documentRef.current);
-        if (commitDocumentChange(nextDocument, action.title)) {
-          setStatus(bracketRepeatUnitStatus(nextDocument));
-        }
+        const parts = selectedNativeMoleculePartsRef.current;
+        const nextDocument = toggleBracketRepeatUnit(documentRef.current, parts);
+        const finish = (committed: ChemDraftDocument) => {
+          if (parts.length) {
+            const { past, present } = documentHistoryRef.current;
+            const before = past.at(-1);
+            if (before) repeatUnitHistorySelectionsRef.current.set(before, parts);
+            repeatUnitHistorySelectionsRef.current.set(present, []);
+          }
+          setSelectedNativeMoleculeParts([]);
+          setStatus(bracketRepeatUnitStatus(committed));
+        };
+        if (parts.length) commitDocumentChangeWithPageFit(nextDocument, action.title, finish);
+        else if (commitDocumentChange(nextDocument, action.title)) finish(nextDocument);
       } else {
         const closing = selectedBracketPair(documentRef.current).find(object => object.side === "close");
         if (closing) {
@@ -12667,6 +12672,7 @@ export function MainWindow({
     getActiveDocument: () => documentRef.current,
     getActiveDocumentKey: () => String(documentIdentityRef.current),
     getActiveDocumentTab: () => ({ id: activeDocumentTabIdRef.current }),
+    getDocumentForTab: (tabId) => assistantHistoryPort.read(tabId),
     getDialogCoordinator: () => dialogCoordinatorRef.current,
     getDocumentTabTitle: (tabId) => documentTabsRef.current.find((tab) => tab.id === tabId)?.title,
     // `warnings` is the collector of the command invocation that is reading (see the plugin command
@@ -12675,7 +12681,7 @@ export function MainWindow({
     commandRegistry: registry,
     createStorage: createPersistentPluginStorage,
     onProposedPatchesChanged: () => setPatchQueueVersion((version) => version + 1),
-    applyDocumentPatch: async ({ plugin, command, patch, undoLabel, signal, writeScopeObjectIds }) => {
+    applyDocumentPatch: async ({ plugin, command, patch, undoLabel, signal, writeScopeObjectIds, repeatUnitCleanup }) => {
       if (quitInteractionRef.current) throw new Error("Quit is waiting for a choice; nothing was inserted.");
       const gate = pluginWriteGateRef.current;
       if (!gate) throw new Error("The document window is closing; nothing was inserted.");
@@ -12719,19 +12725,27 @@ export function MainWindow({
           }
         }
         const prepared = normalizeCommittedDocument(placed);
+        let committed = prepared;
         const pending = commitWithPageFit(before, prepared, (document, fitBaseline) => {
           // User-approved page fitting is a host edit. Replay its exact transform on the baseline
           // so it grants no scope for a plugin's own movement or normalization side effects.
           const baseline = fitBaseline(before);
-          const assertFinalDocument = (document: ChemDraftDocument) =>
+          const authoredPatch = rebasePluginPatch(before, patch).patch;
+          let cleanup: ReturnType<typeof finishScopedRepeatUnitCleanup>;
+          const assertFinalDocument = (document: ChemDraftDocument) => {
             assertPluginDocumentWriteScope(baseline, document, patch, writeScopeObjectIds);
+            cleanup = finishScopedRepeatUnitCleanup(repeatUnitCleanup, before, document, authoredPatch);
+            committed = cleanup?.document ?? document;
+            return committed;
+          };
           // Both history paths normalize again; check their actual final state, after page fit too.
           if (assistantTxId) assistantTransactions.writeAssistantTransaction(assistantTxId, document, applied.receipt.objectIds, prepared, assertFinalDocument);
           else commitDocumentChange(document, undoLabel, false, assertFinalDocument);
+          cleanup?.record();
         }, { // Allocate request consent only if page fitting actually needs a question.
           get consent() { return assistantTxId ? assistantTransactions.pageEnlargementConsent(assistantTxId, shortcutPlatform) : consent; }, signal,
           isCurrent: () => mountedRef.current && !quitInteractionRef.current && documentIdentityRef.current === documentIdentity &&
-          assistantDocumentContentUnchanged(before, documentRef.current) });
+          assistantDocumentContentUnchanged(before, documentRef.current, { checkBracketIdentity: true }) });
         if (pending) {
           pageFitPendingRef.current += 1;
           try { await pending; } finally { pageFitPendingRef.current -= 1; }
@@ -12743,18 +12757,20 @@ export function MainWindow({
           : insertedObject?.type === "text"
             ? patch.reason === "Insert Name" ? "name" : "text"
             : undefined;
-        const templateMessages = applied.document.pages.flatMap(page => page.objects.flatMap(object =>
-          object.type === "molecule" && !previousIds.has(object.id) && applied.receipt.objectIds.includes(object.id)
+        const survivingIds = new Set(committed.pages.flatMap(page => page.objects.map(object => object.id)));
+        const receipt = { ...applied.receipt, objectIds: applied.receipt.objectIds.filter(id => survivingIds.has(id)) };
+        const templateMessages = committed.pages.flatMap(page => page.objects.flatMap(object =>
+          object.type === "molecule" && !previousIds.has(object.id) && receipt.objectIds.includes(object.id)
             ? [structureTemplateLayoutMessage(object)].filter((message): message is string => !!message) : []));
         const sourceStatus = plugin.id === "org.chemdraft.opsin.nameToStructure" && insertedDescription === "structure"
           ? nameResolutionStatusRef.current : undefined;
         if (sourceStatus) nameResolutionStatusRef.current = undefined;
         const insertionStatus = templateMessages.length ? templateMessages.join("; ") :
-          applied.receipt.objectIds.length > 0 && insertedDescription
+          receipt.objectIds.length > 0 && insertedDescription
             ? `${plugin.name}: inserted ${insertedDescription}`
             : `${plugin.name}: applied ${command.title}`;
         setStatus(sourceStatus ? `${insertionStatus} (${sourceStatus})` : insertionStatus);
-        return applied.receipt;
+        return receipt;
       });
     }
   });
@@ -13037,7 +13053,9 @@ export function MainWindow({
         }
         const before = documentRef.current;
         const documentIdentity = documentIdentityRef.current;
-        let prepared = applyAcceptedPluginProposal(before, proposal.proposal).document;
+        let prepared = host.previewProposedPatch(proposal.id, before, {
+          apply: (document, proposed, options) => applyAcceptedPluginProposal(document, proposed, options).document
+        });
         if (recognized) {
           const visible = assistantHistoryPort.getViewportRect?.(tab.id);
           const pageRect = pageRef.current?.getBoundingClientRect();
@@ -13056,7 +13074,7 @@ export function MainWindow({
           commitDocumentChange(updated, `${pluginName}: ${recognized ? "Insert Recognized Structure" : "Apply Proposal"}`);
         }, { consent: new PageEnlargementConsent(shortcutPlatform), isCurrent: () =>
           mountedRef.current && !quitInteractionRef.current && documentIdentityRef.current === documentIdentity &&
-          assistantDocumentContentUnchanged(before, documentRef.current)
+          assistantDocumentContentUnchanged(before, documentRef.current, { checkBracketIdentity: true })
         });
         if (pending) {
           pageFitPendingRef.current += 1;
@@ -23354,7 +23372,9 @@ export function MainWindow({
         }} /> : null}
       {objectContextMenu ? (
         <ObjectLayerContextMenu
-          bracketActions={findDocumentObject(document, objectContextMenu.objectId)?.type === "bracket" ? bracketActions : []}
+          bracketActions={findDocumentObject(document, objectContextMenu.objectId)?.type === "bracket" ? bracketActions
+            : selectedNativeMoleculeParts.some(part => part.objectId === objectContextMenu.objectId)
+              ? bracketActions.filter(action => action.id === "bracket.repeatUnit.toggle") : []}
           tableActions={selectedTable(document) ? tableActions : []}
           arrowActions={(() => {
             const object = activePage.objects.find(object => object.id === objectContextMenu.objectId);
@@ -26803,17 +26823,13 @@ function isBareSkeletonCarbon(atom: MoleculeAtom): boolean {
  * as the eraser always did.
  */
 export function applyEraserSweep(document: ChemDraftDocument, sweep: EraserSweep): ChemDraftDocument {
-  let next = sweep.objectIds.length > 0
-    ? applyPatches(document, sweep.objectIds.map((objectId) => ({ op: "removeObject" as const, objectId })))
-    : document;
+  const wholeObjects = new Set(sweep.objectIds);
+  const patches: DocumentPatch[] = [...wholeObjects].map(objectId => ({ op: "removeObject", objectId }));
   for (const part of sweep.moleculeParts) {
-    if (part.atomIds.length === 0 && part.bondIds.length === 0) {
-      continue;
-    }
-    const erased = applyNativeMoleculePartDeleteTarget(next, part);
-    next = erased !== next ? erased : applyPatches(next, [{ op: "removeObject", objectId: part.objectId }]);
+    if (wholeObjects.has(part.objectId) || (!part.atomIds.length && !part.bondIds.length)) continue;
+    patches.push(nativeMoleculePartDeletePatch(document, part) ?? { op: "removeObject", objectId: part.objectId });
   }
-  return next;
+  return applyPatches(document, patches);
 }
 
 export function eraserSweepStatus(sweep: EraserSweep): string {

@@ -679,7 +679,9 @@ export const BracketObjectSchema = BaseObjectSchema.extend({
     unknown: z.object({
       // Source ids bind these snapshots to cdxmlBracketMembers. Copying a pair remaps the
       // member's objectId but keeps molecule-local atom/bond ids, so this also survives copies.
-      cdxmlBracketAtomSnapshots: z.array(CdxmlBracketAtomSnapshotSchema).optional()
+      cdxmlBracketAtomSnapshots: z.array(CdxmlBracketAtomSnapshotSchema).optional(),
+      // Source member and local atom id pairs whose deletion was observed while identity was known.
+      cdxmlBracketDeletedAtoms: z.array(z.tuple([IdSchema, IdSchema])).optional()
     }).catchall(z.unknown()).default({})
   }).optional()
 }).strict();

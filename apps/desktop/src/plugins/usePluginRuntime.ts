@@ -19,7 +19,7 @@ import {
   createPluginUpdateChecker, hasOfficialInstalledPlugin, installedPluginCatalogKey,
   schedulePluginUpdateAutoCheck, type CachedPluginUpdateResults, type TimedPluginUpdateCheckResult
 } from "./pluginUpdateAutoCheck";
-import { createPluginRuntime, type DesktopPluginRuntime, type ProposalDocumentTab } from "./createPluginRuntime";
+import { createPluginRuntime, type DesktopPluginRuntime, type DesktopPluginRuntimeOptions, type ProposalDocumentTab } from "./createPluginRuntime";
 import {
   PluginInstallError,
   PluginInstallErrorCodes,
@@ -79,6 +79,7 @@ export interface PluginRuntimeProviders {
    *  File > New in one session are indistinguishable to the write-binding check. */
   getActiveDocumentKey?: () => string | undefined;
   getActiveDocumentTab?: () => Pick<ProposalDocumentTab, "id">;
+  getDocumentForTab?: DesktopPluginRuntimeOptions["getDocumentForTab"];
   /** MainWindow's native dialog authority, when this is a desktop document window. */
   getDialogCoordinator?: () => DialogCoordinator | undefined;
   getDocumentTabTitle?: (tabId: string) => string | undefined;
@@ -188,6 +189,7 @@ export function usePluginRuntime(providers: PluginRuntimeProviders): PluginRunti
         ? () => providersRef.current.getActiveDocumentTab!()
         : undefined,
       getDocumentTabTitle: (tabId) => providersRef.current.getDocumentTabTitle?.(tabId),
+      getDocumentForTab: (tabId) => providersRef.current.getDocumentForTab?.(tabId),
       getSelection: (warnings) => providersRef.current.getSelection(warnings),
       // Read once at creation: the registry (and the other integration options) must be stable —
       // MainWindow creates the registry in a one-time memo, matching the runtime's lifetime.

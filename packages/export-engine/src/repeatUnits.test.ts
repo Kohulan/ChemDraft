@@ -230,17 +230,16 @@ describe("repeat-unit export membership", () => {
     expect(reopened).toEqual(before);
   });
 
-  it.each([false, true])("warns after deleting the whole member molecule (other molecule remains: %s)", keepAcid => {
-    const { document, molecule, close } = imported("10", keepAcid ? sourceWithAcid : wholeMoleculeSource);
+  it.each([false, true])("deletes the imported brackets with their member molecule (other molecule remains: %s)", keepAcid => {
+    const { document, molecule } = imported("10", keepAcid ? sourceWithAcid : wholeMoleculeSource);
     const removed = deserializeDocument(serializeDocument(applyPatch(document, { op: "removeObject", objectId: molecule.id })));
-    expect(removed.pages[0].objects.filter(object => object.type === "bracket").map(bracket => bracket.containedObjectIds))
-      .toEqual([[], []]);
+    expect(removed.pages[0].objects.some(object => object.type === "bracket")).toBe(false);
     const remaining = removed.pages[0].objects.filter((object): object is MoleculeObject => object.type === "molecule");
     const warnings: ExportWarning[] = [];
     const groups = repeatUnitMolfileGroups(removed, remaining, warnings);
     expect(groups).toEqual([]);
-    expect(warnings).toEqual([expect.objectContaining({ code: "export.repeat_unit_not_represented", objectId: close.id,
-      message: expect.stringContaining("its edited native membership is empty") })]);
+    expect(warnings).toEqual([]);
+    expect(repeatUnitExportWarnings(removed, "SMILES")).toEqual([]);
     if (remaining.length) {
       expect(moleculeToMolfileV3000(remaining[0], { kekuleBondOrders: new Map(), repeatUnitGroups: groups }).contents).not.toMatch(/SRU/);
     }
@@ -344,21 +343,45 @@ describe("repeat-unit export membership", () => {
       message: expect.stringContaining("missing import-time membership snapshot") })]);
   });
 
-  it("declines imported atom membership after a member atom is deleted", () => {
-    const { document, molecule, close } = imported();
-    const deletedId = molecule.atoms[0].id;
+  it.each([false, true])("removes a staged imported SRU on last known member deletion (unknown source member: %s)", unknown => {
+    const cdxml = wholeMoleculeSource.replace("</fragment>", '<n id="14" Element="6" p="220 110"/><b id="15" B="12" E="14" Order="1"/></fragment>');
+    const { document, molecule, close } = imported(unknown ? "11 12 missing" : "11 12", cdxml);
+    const [first, second, retained] = molecule.atoms;
     const removed = applyPatch(document, { op: "updateObject", objectId: molecule.id, changes: {
-      atoms: molecule.atoms.filter(atom => atom.id !== deletedId),
-      bonds: molecule.bonds.filter(bond => bond.fromAtomId !== deletedId && bond.toAtomId !== deletedId)
+      atoms: [second, retained],
+      bonds: molecule.bonds.filter(bond => bond.fromAtomId !== first.id && bond.toAtomId !== first.id)
     } });
     const reopened = deserializeDocument(serializeDocument(removed));
     const current = reopened.pages[0].objects.find((object): object is MoleculeObject => object.type === "molecule")!;
     const warnings: ExportWarning[] = [];
     const groups = repeatUnitMolfileGroups(reopened, [current], warnings);
     expect(groups).toEqual([]);
+    const unresolved = unknown ? "missing" : "11";
     expect(warnings).toEqual([expect.objectContaining({ objectId: close.id,
-      message: expect.stringContaining('its imported BracketedObjectIDs member "11" does not resolve unambiguously') })]);
+      message: expect.stringContaining(`its imported BracketedObjectIDs member "${unresolved}" does not resolve unambiguously`) })]);
     expect(moleculeToMolfileV3000(current, { kekuleBondOrders: new Map(), repeatUnitGroups: groups }).contents).not.toMatch(/SRU/);
+    const last = applyPatch(reopened, { op: "updateObject", objectId: current.id, changes: { atoms: [retained], bonds: [] } });
+    if (unknown) {
+      expect(last.pages[0].objects.filter(object => object.type === "bracket")).toHaveLength(2);
+      expect(repeatUnitExportWarnings(last, "MOL")).toEqual([
+        expect.objectContaining({ objectId: close.id, message: expect.stringContaining('member "missing" does not resolve unambiguously') })
+      ]);
+    } else expect(last.pages[0].objects).toMatchObject([{ id: molecule.id, atoms: [retained] }]);
+  });
+
+  it("keeps the imported SRU and diagnostic after a recycled member atom id is deleted", () => {
+    const { document, molecule, close } = imported("11", wholeMoleculeSource);
+    const [member, other] = molecule.atoms;
+    const { cdxmlSourceId: _source, ...replacement } = member;
+    const redrawn = applyPatch(document, { op: "updateObject", objectId: molecule.id, changes: { atoms: [replacement, other] } });
+    expect(repeatUnitExportWarnings(redrawn, "MOL")).toEqual([
+      expect.objectContaining({ objectId: close.id, message: expect.stringContaining("is the imported original after an edit") })
+    ]);
+    const after = applyPatch(redrawn, { op: "updateObject", objectId: molecule.id, changes: { atoms: [other], bonds: [] } });
+    expect(after.pages[0].objects.filter(object => object.type === "bracket")).toHaveLength(2);
+    expect(repeatUnitExportWarnings(after, "MOL")).toEqual([
+      expect.objectContaining({ objectId: close.id, message: expect.stringContaining('member "11" does not resolve unambiguously') })
+    ]);
   });
 
   it("preserves unchanged atom-level membership with no imported crossing bonds", () => {
