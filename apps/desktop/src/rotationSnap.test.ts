@@ -1,5 +1,47 @@
 import { describe, expect, it } from "vitest";
+import { createRotationSweep } from "./interaction/rotationSweep";
 import { snapRotationDegrees } from "./rotationSnap";
+
+const center = { x: 200, y: 150 };
+function atAngle(degrees: number, radius = 20) {
+  const radians = degrees * Math.PI / 180;
+  return { x: center.x + radius * Math.cos(radians), y: center.y + radius * Math.sin(radians) };
+}
+
+describe("pointer rotation sweep", () => {
+  it.each([20, 200])("turns 45° along a %spx radius", (radius) => {
+    const turn = createRotationSweep(center, atAngle(0, radius));
+    turn.update(atAngle(45, radius));
+    expect(turn.degrees).toBe(45);
+  });
+
+  it.each([1, -1])("keeps accumulating in direction %s through 180° and past one full turn", (direction) => {
+    const turn = createRotationSweep(center, atAngle(0));
+    for (const angle of [90, 170, 180, 190, 270, 360, 405]) {
+      turn.update(atAngle(direction * angle));
+      expect(turn.degrees).toBe(direction * angle);
+    }
+  });
+
+  it("holds the previous turn at the center and resumes from the new bearing", () => {
+    const turn = createRotationSweep(center, atAngle(0));
+    turn.update(atAngle(45));
+    for (const point of [center, atAngle(135, 0.5), atAngle(225)]) {
+      turn.update(point);
+      expect(turn.degrees).toBe(45);
+    }
+    turn.update(atAngle(240));
+    expect(turn.degrees).toBe(60);
+  });
+
+  it("starts at zero if the drag begins at the center", () => {
+    const turn = createRotationSweep(center, center);
+    turn.update(atAngle(120));
+    expect(turn.degrees).toBe(0);
+    turn.update(atAngle(105));
+    expect(turn.degrees).toBe(-15);
+  });
+});
 
 describe("rotation drag snapping", () => {
   it.each([
@@ -51,6 +93,13 @@ describe("rotation drag snapping", () => {
     expect(snapDrag(0.5)).toBe(8);
     expect(snapDrag(0.5) - 0.5).toBe(7.5);
     expect(snapDrag(0.5) - snapDrag(0.4)).toBe(15);
+  });
+
+  it("snaps a 45° pointer arc from a 7° starting orientation to 45° with Shift", () => {
+    const turn = createRotationSweep(center, atAngle(0));
+    turn.update(atAngle(45));
+    const referenceDegrees = 7;
+    expect(referenceDegrees + snapRotationDegrees(turn.degrees, { referenceDegrees, shiftKey: true })).toBe(45);
   });
 
   it.each([

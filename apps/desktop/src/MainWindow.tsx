@@ -54,6 +54,7 @@ import { formatDocumentOpenBatchStatus, formatDocumentOpenFailure, listenAndDrai
 import { useInAppModalUtilitySuspension } from "./useInAppModalUtilitySuspension";
 import { Icon } from "./icons";
 import { snapRotationDegrees } from "./rotationSnap";
+import { createRotationSweep } from "./interaction/rotationSweep";
 import { planDisplayPage } from "./plannedDisplayPage";
 import { snapPlacementDegrees } from "./placementSnap";
 import { listenCurrentWindowEvent, listenTauriEvent } from "./window-manager/tauriEvents";
@@ -1275,9 +1276,9 @@ type ObjectRotateDragState = {
   target?: NativeMoleculeTransformableSelectionPart;
   startDocument: ChemDraftDocument;
   centerPoint: ClientPoint;
-  startPoint: ClientPoint;
+  rotationSweep: ReturnType<typeof createRotationSweep>;
+  isOrbital: boolean;
   startRotationDegrees: number;
-  latestPoint: ClientPoint;
   shiftKey: boolean;
   artPreviewProxies?: Record<string, ArtTransformDragPreviewProxy>;
   dragging: boolean;
@@ -1428,6 +1429,7 @@ type GroupTransformDragState = {
   center: ClientPoint;
   startPoint: ClientPoint;
   latestPoint: ClientPoint;
+  rotationSweep?: ReturnType<typeof createRotationSweep>;
   shiftKey: boolean;
   latestTiltXRad?: number;
   latestTiltYRad?: number;
@@ -1758,7 +1760,6 @@ const FREEFORM_BOND_DRAG_THRESHOLD = 6;
 const DOUBLE_BOND_SIDE_DRAG_THRESHOLD = 4;
 const VIEW_ZOOM_COMMAND_FACTOR = 1.25;
 const PROJECTED_PLANE_TILT_DRAG_PX = 360;
-const OBJECT_ROTATE_TANGENTIAL_DEGREES_PER_PIXEL = 360 / PROJECTED_PLANE_TILT_DRAG_PX;
 const OBJECT_DRAG_THRESHOLD = 4;
 const GRAPHIC_HANDLE_DRAG_THRESHOLD = 1;
 const PEN_CONTROL_DRAG_THRESHOLD_PX = 10;
@@ -1788,7 +1789,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.18.14.00-codex";
+const CURRENT_BUILD_STAMP = "11.18.14.40-codex";
 const VibeCodeGuideForm = lazy(() => import("./dialogs/VibeCodeGuideForm").then(module => ({ default: module.VibeCodeGuideForm })));
 const StructureTemplatePicker = lazy(() => import("./dialogs/StructureTemplatePicker").then(module => ({ default: module.StructureTemplatePicker })));
 /** Starts in the background for the document webview under the existing probe gate. */
@@ -16544,16 +16545,10 @@ export function MainWindow({
   }, [commitDocumentHistoryFrom, graphicGradientDocumentFromDrag, replacePresentDocument]);
 
   // One snap policy for live preview and release; fragments retain their bond-direction grid.
-  const objectRotateDragDegrees = useCallback((drag: ObjectRotateDragState, point: ClientPoint): number => {
-    const degrees = rotationDeltaDegrees(drag.centerPoint, drag.startPoint, point);
+  const objectRotateDragDegrees = useCallback((drag: ObjectRotateDragState): number => {
+    const degrees = drag.rotationSweep.degrees;
     if (!drag.target) {
-      const object = findDocumentObject(drag.startDocument, drag.objectId);
-      if (object && nativeOrbitalAnchorPoint(object)) {
-        const startAngle = Math.atan2(drag.startPoint.y - drag.centerPoint.y, drag.startPoint.x - drag.centerPoint.x);
-        const endAngle = Math.atan2(point.y - drag.centerPoint.y, point.x - drag.centerPoint.x);
-        const angle = ((endAngle - startAngle) * 180 / Math.PI + 540) % 360 - 180;
-        return drag.shiftKey ? snapRotationDegrees(angle, { shiftKey: true, referenceDegrees: drag.startRotationDegrees }) : angle;
-      }
+      if (drag.isOrbital && !drag.shiftKey) return degrees;
       return snapRotationDegrees(degrees, {
         shiftKey: drag.shiftKey,
         referenceDegrees: drag.startRotationDegrees
@@ -16565,13 +16560,12 @@ export function MainWindow({
       : snapRotationDegrees(degrees, { shiftKey: drag.shiftKey });
   }, []);
 
-  const objectRotateDocumentFromDrag = useCallback((drag: ObjectRotateDragState, point: ClientPoint): ChemDraftDocument => {
-    const degrees = objectRotateDragDegrees(drag, point);
+  const objectRotateDocumentFromDrag = useCallback((drag: ObjectRotateDragState, degrees: number): ChemDraftDocument => {
     const rotated = drag.target
       ? rotateNativeMoleculeParts(drag.startDocument, drag.target, degrees)
       : rotateDocumentObject(drag.startDocument, drag.objectId, degrees);
     return resolveElectronMarksInSelectionTransform(drag.startDocument, rotated).document;
-  }, [objectRotateDragDegrees]);
+  }, []);
 
   // Snapshot the molecule's persisted Spin 3D model for a whole-molecule rotate drag.
   // Returns undefined unless a valid (graph-matching) model is present and its conformer
@@ -16702,11 +16696,10 @@ export function MainWindow({
       );
   }, []);
 
-  const previewObjectRotateDrag = useCallback((drag: ObjectRotateDragState, point: ClientPoint) => {
+  const previewObjectRotateDrag = useCallback((drag: ObjectRotateDragState) => {
     markFrame("previewObjectRotateDrag", () => {
-      drag.latestPoint = point;
       // The readout shows the same (snapped) angle the drag will commit.
-      const degrees = objectRotateDragDegrees(drag, point);
+      const degrees = objectRotateDragDegrees(drag);
       if (objectRotateReadoutTimeoutRef.current !== undefined) {
         window.clearTimeout(objectRotateReadoutTimeoutRef.current);
       }
@@ -16718,7 +16711,8 @@ export function MainWindow({
         objectRotateReadoutTimeoutRef.current = undefined;
         setObjectRotateReadout(undefined);
       }, 1200);
-      if (!drag.target && findDocumentObject(drag.startDocument, drag.objectId)?.type === "graphic" &&
+      // Orbital lobes rotate around their tip, so preview with the same pivot-preserving geometry as release.
+      if (!drag.target && !drag.isOrbital && findDocumentObject(drag.startDocument, drag.objectId)?.type === "graphic" &&
           !drag.startDocument.pages.some(page => page.objects.some(object => object.type === "text" && object.arrowAttachment?.kind === "conditions"))) {
         scheduleObjectTransformPreview({
           pointerId: drag.pointerId,
@@ -16736,7 +16730,7 @@ export function MainWindow({
       }
 
       clearObjectTransformPreview(drag.pointerId);
-      replacePresentDocument(objectRotateDocumentFromDrag(drag, point));
+      replacePresentDocument(objectRotateDocumentFromDrag(drag, degrees));
     });
   }, [clearObjectTransformPreview, objectRotateDocumentFromDrag, objectRotateDragDegrees, replacePresentDocument, scheduleObjectTransformPreview]);
 
@@ -16866,8 +16860,9 @@ export function MainWindow({
     return true;
   }, [commitDocumentHistoryFrom, graphicPathEditDocumentFromDrag, replacePresentDocument]);
 
-  const commitObjectRotateDrag = useCallback((drag: ObjectRotateDragState, point: ClientPoint): boolean => {
-    const rotated = objectRotateDocumentFromDrag(drag, point);
+  const commitObjectRotateDrag = useCallback((drag: ObjectRotateDragState): boolean => {
+    const degrees = objectRotateDragDegrees(drag);
+    const rotated = objectRotateDocumentFromDrag(drag, degrees);
     clearObjectTransformPreview(drag.pointerId);
     if (rotated === drag.startDocument) {
       replacePresentDocument(drag.startDocument);
@@ -16881,7 +16876,6 @@ export function MainWindow({
     // re-projects from a consistent source instead of jumping.
     let committed = rotated;
     if (drag.spin3dModel && !drag.target) {
-      const degrees = objectRotateDragDegrees(drag, point);
       // NOTE the negated angle: flattenSpunMolecule flips Y on output (math y-up → document
       // y-down), so a +θ screen rotation (rotateDocumentObject, which is what the user sees)
       // corresponds to a −θ rotation about the math-frame +Z axis. Folding +θ here would store
@@ -17638,8 +17632,8 @@ export function MainWindow({
     point: ClientPoint,
     stretch = false
   ): ChemDraftDocument => {
-    if (drag.mode === "rotate") {
-      const degrees = snapRotationDegrees(rotationDeltaDegrees(drag.center, drag.startPoint, point), {
+    if (drag.rotationSweep) {
+      const degrees = snapRotationDegrees(drag.rotationSweep.degrees, {
         shiftKey: drag.shiftKey
       });
       return rotateDocumentObjectsAroundPoint(drag.startDocument, drag.objectIds, drag.center, degrees);
@@ -17684,14 +17678,16 @@ export function MainWindow({
     setFreeformNativeBond(undefined);
     setNativeDoubleBondSidePreview(undefined);
     assignHoveredNativeDeleteTarget(undefined);
+    const center = { x: bounds.centerX, y: bounds.centerY };
     groupTransformDragRef.current = {
       pointerId: event.pointerId,
       mode,
       objectIds: [...ids],
       startDocument: document,
-      center: { x: bounds.centerX, y: bounds.centerY },
+      center,
       startPoint: point,
       latestPoint: point,
+      rotationSweep: mode === "rotate" ? createRotationSweep(center, point) : undefined,
       shiftKey: event.shiftKey,
       dragging: false
     };
@@ -18149,6 +18145,7 @@ export function MainWindow({
       }
       groupTransform.latestPoint = point;
       groupTransform.shiftKey = event.shiftKey;
+      groupTransform.rotationSweep?.update(point);
       groupTransformMachineRef.current = interactionReducer(groupTransformMachineRef.current, { type: "pointerMove", pointerId: event.pointerId, world: point, target: { kind: "empty" } });
       const nowDragging = groupTransformMachineRef.current.phase === "dragging";
       if (!groupTransform.dragging && nowDragging) {
@@ -18256,7 +18253,7 @@ export function MainWindow({
         return;
       }
 
-      objectRotateDrag.latestPoint = point;
+      objectRotateDrag.rotationSweep.update(point);
       objectRotateDrag.shiftKey = event.shiftKey;
       objectRotateMachineRef.current = interactionReducer(objectRotateMachineRef.current, { type: "pointerMove", pointerId: event.pointerId, world: point, target: { kind: "empty" } });
       const nowDragging = objectRotateMachineRef.current.phase === "dragging";
@@ -18273,7 +18270,7 @@ export function MainWindow({
       }
 
       if (objectRotateDrag.dragging) {
-        previewObjectRotateDrag(objectRotateDrag, point);
+        previewObjectRotateDrag(objectRotateDrag);
       }
       return;
     }
@@ -18685,9 +18682,8 @@ export function MainWindow({
     if (objectRotateDrag?.pointerId === event.pointerId) {
       event.stopPropagation();
       // Commit the last visible angle even if Shift is released with the pointer.
-      const point = objectRotateDrag.latestPoint;
       if (objectRotateDrag.dragging) {
-        const changed = commitObjectRotateDrag(objectRotateDrag, point);
+        const changed = commitObjectRotateDrag(objectRotateDrag);
         const object = findDocumentObject(documentRef.current, objectRotateDrag.objectId);
         const label = objectRotateDrag.target ? "selected molecule fragment" : documentObjectTransformLabel(object, directElectronMarkEditing);
         setStatus(changed ? `Rotated ${label}` : `${capitalizeLabel(label)} rotation unchanged`);
@@ -20305,23 +20301,24 @@ export function MainWindow({
     setFreeformNativeBond(undefined);
     setNativeDoubleBondSidePreview(undefined);
     assignHoveredNativeDeleteTarget(undefined);
+    const orbitalAnchor = nativeOrbitalAnchorPoint(object);
+    // An attached fragment swings about its junction. Measure about the same pivot as the transform.
+    const centerPoint = (selectedFragmentBounds && selectedFragmentTarget && object.type === "molecule"
+      ? nativeMoleculePartRotationPivot(object, selectedFragmentTarget) ?? documentObjectCenter(selectedFragmentBounds)
+      : undefined)
+      ?? orbitalAnchor
+      ?? (object.type === "molecule" ? nativeMoleculeCenter(object) : documentObjectCenter(object));
     objectRotateDragRef.current = {
       pointerId: event.pointerId,
       objectId,
       target: selectedFragmentTarget,
       startDocument: selectedDocument,
-      // A fragment attached to the rest through one junction swings about that junction atom;
-      // the pointer's angle is measured about the same pivot the rotation applies around.
-      centerPoint: (selectedFragmentBounds && selectedFragmentTarget && object.type === "molecule"
-        ? nativeMoleculePartRotationPivot(object, selectedFragmentTarget) ?? documentObjectCenter(selectedFragmentBounds)
-        : undefined)
-        ?? nativeOrbitalAnchorPoint(object)
-        ?? (object.type === "molecule" ? nativeMoleculeCenter(object) : documentObjectCenter(object)),
-      startPoint: point,
+      centerPoint,
+      rotationSweep: createRotationSweep(centerPoint, point),
+      isOrbital: orbitalAnchor !== undefined,
       startRotationDegrees: object.type === "molecule"
         ? selectedFragmentTarget ? 0 : nativeMoleculeTransformState(object).rotationDegrees
         : object.rotation,
-      latestPoint: point,
       artPreviewProxies: createArtTransformDragPreviewProxies(selectedDocument, [objectId], viewportRef.current.scale),
       shiftKey: event.shiftKey,
       dragging: false,
@@ -21350,7 +21347,7 @@ export function MainWindow({
         return;
       }
 
-      objectRotateDrag.latestPoint = point;
+      objectRotateDrag.rotationSweep.update(point);
       objectRotateDrag.shiftKey = event.shiftKey;
       objectRotateMachineRef.current = interactionReducer(objectRotateMachineRef.current, { type: "pointerMove", pointerId: event.pointerId, world: point, target: { kind: "empty" } });
       const nowDragging = objectRotateMachineRef.current.phase === "dragging";
@@ -21360,12 +21357,14 @@ export function MainWindow({
         setActiveTextEditObjectId(undefined);
         setActiveAtomLabelEdit(undefined);
         setHoveredNativeAtom(undefined);
-        setSelectedNativeMoleculePart(undefined);
+        if (!objectRotateDrag.target) {
+          setSelectedNativeMoleculePart(undefined);
+        }
         assignHoveredNativeDeleteTarget(undefined);
       }
 
       if (objectRotateDrag.dragging) {
-        previewObjectRotateDrag(objectRotateDrag, point);
+        previewObjectRotateDrag(objectRotateDrag);
       }
       return;
     }
@@ -21630,9 +21629,8 @@ export function MainWindow({
     const objectRotateDrag = objectRotateDragRef.current;
     if (objectRotateDrag?.pointerId === event.pointerId && objectRotateDrag.objectId === objectId) {
       event.stopPropagation();
-      const point = objectRotateDrag.latestPoint;
       if (objectRotateDrag.dragging) {
-        const changed = commitObjectRotateDrag(objectRotateDrag, point);
+        const changed = commitObjectRotateDrag(objectRotateDrag);
         const object = findDocumentObject(documentRef.current, objectRotateDrag.objectId);
         const label = documentObjectTransformLabel(object, directElectronMarkEditing);
         setStatus(changed ? `Rotated ${label}` : `${capitalizeLabel(label)} rotation unchanged`);
@@ -24556,34 +24554,6 @@ function nativeMoleculeObjectIdsForGroupProjectedPlaneTilt(
   return molecules.every((object) => isNativeMoleculeGraph(object) && object.atoms.length > 0)
     ? molecules.map((object) => object.id)
     : [];
-}
-
-export function rotationDeltaDegrees(center: ClientPoint, start: ClientPoint, latest: ClientPoint): number {
-  const startAngle = Math.atan2(start.y - center.y, start.x - center.x);
-  const latestAngle = Math.atan2(latest.y - center.y, latest.x - center.x);
-  let angularDelta = (latestAngle - startAngle) * 180 / Math.PI;
-  if (angularDelta > 180) {
-    angularDelta -= 360;
-  }
-  if (angularDelta < -180) {
-    angularDelta += 360;
-  }
-
-  const radius = clientPointDistance(center, start);
-  if (radius <= 0.001) {
-    return Number(angularDelta.toFixed(3));
-  }
-
-  const tangent = {
-    x: -(start.y - center.y) / radius,
-    y: (start.x - center.x) / radius
-  };
-  const dragVector = {
-    x: latest.x - start.x,
-    y: latest.y - start.y
-  };
-  return Number(((dragVector.x * tangent.x + dragVector.y * tangent.y) *
-    OBJECT_ROTATE_TANGENTIAL_DEGREES_PER_PIXEL).toFixed(3));
 }
 
 export function parseRotationInputDegrees(value: string): number | undefined {

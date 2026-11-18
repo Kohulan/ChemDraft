@@ -3,7 +3,9 @@
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { ChemDraftDocument, MoleculeObject } from "@chemdraft/chem-core";
+import { moleculeToMolfileV2000, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
+import { nativeBondOrderResolution } from "@chemdraft/document-workflow-core";
+import { Molecule } from "openchemlib";
 import { MainWindow } from "./MainWindow";
 import {
   createPhase4Document,
@@ -31,6 +33,17 @@ class TestResizeObserver {
   observe() {}
   unobserve() {}
   disconnect() {}
+}
+
+function anglePoint(center: { x: number; y: number }, radius: number, degrees: number) {
+  const radians = degrees * Math.PI / 180;
+  return { x: center.x + radius * Math.cos(radians), y: center.y + radius * Math.sin(radians) };
+}
+
+function canonicalSmiles(molecule: MoleculeObject) {
+  return Molecule.fromMolfile(moleculeToMolfileV2000(molecule, {
+    fromDocFrame: true, kekuleBondOrders: nativeBondOrderResolution(molecule.atoms, molecule.bonds).kekuleOrders
+  }).contents).toIsomericSmiles();
 }
 
 describe("freehand art and rotation interactions", () => {
@@ -479,16 +492,15 @@ describe("freehand art and rotation interactions", () => {
     const handle = container.querySelector<HTMLButtonElement>(".object-rotate-handle");
     if (!handle) throw new Error("Expected molecule rotate handle.");
     const center = nativeMoleculeCenter(original);
-    const start = { x: center.x + 100, y: center.y };
-    const at = (degrees: number) => ({ x: start.x, y: start.y + degrees });
+    const at = (degrees: number) => anglePoint(center, 20, degrees);
     const molecule = () => {
       const object = window.__CHEMDRAFT_AGENT__?.snapshot().document.pages[0].objects.find((object) => object.id === original.id);
       if (object?.type !== "molecule") throw new Error("Expected molecule snapshot.");
       return object;
     };
     // Establish a freely drawn 7° orientation before testing a second drag's absolute grid.
-    const freeStart = { ...start, x: start.x + 30 };
-    const freeEnd = { ...freeStart, y: freeStart.y + 7 };
+    const freeStart = anglePoint(center, 100, 0);
+    const freeEnd = anglePoint(center, 100, 7);
     await act(async () => {
       dispatchPointer(handle, "pointerdown", freeStart, 89, 0.5);
       dispatchPointer(pageElement(), "pointermove", freeEnd, 89, 0.5);
@@ -497,21 +509,28 @@ describe("freehand art and rotation interactions", () => {
     const before = molecule();
     expect(nativeMoleculeTransformState(before).rotationDegrees).toBe(7);
     await act(async () => {
-      dispatchPointer(handle, "pointerdown", start, 90, 0.5);
-      dispatchPointer(pageElement(), "pointermove", at(6.9), 90, 0.5);
+      dispatchPointer(handle, "pointerdown", at(0), 90, 0.5);
+      dispatchPointer(pageElement(), "pointermove", at(19), 90, 0.5);
     });
+    // Cross the drag threshold before returning to the small magnetic-snap arc.
+    await act(async () => dispatchPointer(pageElement(), "pointermove", at(6.9), 90, 0.5));
     expect(nativeMoleculeTransformState(molecule()).rotationDegrees).toBe(15);
     await act(async () => dispatchPointer(pageElement(), "pointermove", at(19), 90, 0.5));
     expect(nativeMoleculeTransformState(molecule()).rotationDegrees).toBe(26);
     await act(async () => dispatchPointer(pageElement(), "pointermove", at(19), 90, 0.5, true));
+    expect(nativeMoleculeTransformState(molecule()).rotationDegrees).toBe(30);
+    await act(async () => dispatchPointer(pageElement(), "pointermove", at(45), 90, 0.5));
+    expect(nativeMoleculeTransformState(molecule()).rotationDegrees).toBe(52);
+    await act(async () => dispatchPointer(pageElement(), "pointermove", at(45), 90, 0.5, true));
     const preview = molecule();
-    expect(nativeMoleculeTransformState(preview).rotationDegrees).toBe(30);
+    expect(nativeMoleculeTransformState(preview).rotationDegrees).toBe(45);
     await act(async () => dispatchPointer(pageElement(), "pointerup", at(24), 90, 0.5));
     const after = molecule();
     expect(after).toEqual(preview);
     expect(after.bonds).toEqual(before.bonds);
     expect(after.structure).toBe(before.structure);
     expect(after.chemistry).toEqual(before.chemistry);
+    expect(canonicalSmiles(after)).toBe(canonicalSmiles(original));
     const identity = ({ x: _x, y: _y, ...atom }: MoleculeObject["atoms"][number]) => atom;
     expect(after.atoms.map(identity)).toEqual(before.atoms.map(identity));
     for (let i = 0; i < before.atoms.length; i++) {
@@ -535,13 +554,13 @@ describe("freehand art and rotation interactions", () => {
     if (!rotateHandle || !graphic) throw new Error("Expected rotation handle and graphic.");
 
     const original = debugArtObject(objectId).object;
-    const start = { x: original.x + original.width + 20, y: original.y + original.height / 2 };
-    // The handle measures tangential travel at one degree per page pixel.
-    const point = (degrees: number) => ({ x: start.x, y: start.y + degrees });
+    const center = { x: original.x + original.width / 2, y: original.y + original.height / 2 };
+    const radius = original.width / 2 + 20;
+    const point = (degrees: number) => anglePoint(center, radius, degrees);
     const previewRotation = () => graphic.querySelector<HTMLElement>(".graphic-visual-shell")?.style.transform;
 
-    const freeStart = { ...start, x: start.x + 30 };
-    const freeEnd = { ...freeStart, y: freeStart.y + 7 };
+    const freeStart = anglePoint(center, radius + 30, 0);
+    const freeEnd = anglePoint(center, radius + 30, 7);
     await act(async () => {
       dispatchPointer(rotateHandle, "pointerdown", freeStart, 88, 0.5);
       dispatchPointer(pageElement(), "pointermove", freeEnd, 88, 0.5);
@@ -551,7 +570,7 @@ describe("freehand art and rotation interactions", () => {
     const before = debugArtObject(objectId).object;
     expect(before.rotation).toBe(7);
     await act(async () => {
-      dispatchPointer(rotateHandle, "pointerdown", start, 92, 0.5);
+      dispatchPointer(rotateHandle, "pointerdown", point(0), 92, 0.5);
       dispatchPointer(pageElement(), "pointermove", point(6.9), 92, 0.5);
     });
     await waitForPreviewFrame();
@@ -591,10 +610,11 @@ describe("freehand art and rotation interactions", () => {
     const graphic = container.querySelector<HTMLElement>(`[data-object-id="${objectId}"]`);
     if (!handle || !graphic) throw new Error("Expected rotation handle and graphic.");
     const original = debugArtObject(objectId).object;
-    const start = { x: original.x + original.width + 20, y: original.y + original.height / 2 };
-    const at = (degrees: number) => ({ x: start.x, y: start.y + degrees });
-    const freeStart = { ...start, x: start.x + 30 };
-    const freeEnd = { ...freeStart, y: freeStart.y + 100 };
+    const center = { x: original.x + original.width / 2, y: original.y + original.height / 2 };
+    const radius = original.width / 2 + 20;
+    const at = (degrees: number) => anglePoint(center, radius, degrees);
+    const freeStart = anglePoint(center, radius + 30, 0);
+    const freeEnd = anglePoint(center, radius + 30, 100);
     await act(async () => {
       dispatchPointer(handle, "pointerdown", freeStart, 94, 0.5);
       dispatchPointer(pageElement(), "pointermove", freeEnd, 94, 0.5);
@@ -603,7 +623,7 @@ describe("freehand art and rotation interactions", () => {
     await act(async () => dispatchPointer(pageElement(), "pointerup", freeEnd, 94, 0.5));
     expect(debugArtObject(objectId).object.rotation).toBe(100);
     await act(async () => {
-      dispatchPointer(handle, "pointerdown", start, 95, 0.5, true);
+      dispatchPointer(handle, "pointerdown", at(0), 95, 0.5, true);
       dispatchPointer(pageElement(), "pointermove", at(delta), 95, 0.5, true);
     });
     await waitForPreviewFrame();
@@ -631,14 +651,15 @@ describe("freehand art and rotation interactions", () => {
     const handle = container.querySelector<HTMLButtonElement>("[data-group-rotate-handle='true']");
     if (!frame || !handle) throw new Error("Expected group rotation frame.");
     const coordinate = (value: string) => Number(value.match(/calc\(([-\d.]+)px/)?.[1]);
-    const start = {
-      x: coordinate(frame.style.left) + coordinate(frame.style.width) + 20,
+    const radius = coordinate(frame.style.width) / 2 + 20;
+    const center = {
+      x: coordinate(frame.style.left) + coordinate(frame.style.width) / 2,
       y: coordinate(frame.style.top) + coordinate(frame.style.height) / 2
     };
-    const at = (degrees: number) => ({ x: start.x, y: start.y + degrees });
+    const at = (degrees: number) => anglePoint(center, radius, degrees);
     const originals = [debugArtObject(first).object, debugArtObject(second).object];
     await act(async () => {
-      dispatchPointer(handle, "pointerdown", start, 103, 0.5);
+      dispatchPointer(handle, "pointerdown", at(0), 103, 0.5);
       dispatchPointer(pageElement(), "pointermove", at(14.9), 103, 0.5);
     });
     expect(debugArtObject(first).object.rotation).toBe(15);
