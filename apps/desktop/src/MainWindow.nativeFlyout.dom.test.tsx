@@ -12,12 +12,13 @@ import { MemoryStorage } from "./testSupport/memoryStorage";
 import {
   dismissToolsetPopovers, newToolsetPopoverOpening, sendPaletteCommand, sendToolsetFlyoutKey, setToolsetPopoverContent,
   type ToolsetPopoverContentPayload, type ToolsetPopoverDismissPayload, type ToolsetFlyoutKey,
-  type ToolsetFlyoutSession
+  type ToolsetFlyoutSession, type AcceptedToolsetPopoverOpening
 } from "./window-manager";
 
 // Keep the real request/snapshot renderers and commands; replace only cross-window IPC.
 const native = vi.hoisted(() => ({
   content: new Set<(payload: ToolsetPopoverContentPayload) => void>(),
+  accepted: new Set<(opening: AcceptedToolsetPopoverOpening) => void>(),
   keys: new Set<(payload: ToolsetFlyoutKey) => void>(),
   closed: new Set<(payload: ToolsetFlyoutSession) => void>(),
   dismiss: new Set<(payload?: ToolsetPopoverDismissPayload) => void>(),
@@ -36,6 +37,8 @@ vi.mock("./window-manager", async importOriginal => {
   return {
     ...actual,
     listenForToolsetPopoverContent: (handler: (payload: ToolsetPopoverContentPayload) => void) => subscribe(native.content, handler),
+    listenForAcceptedToolsetPopoverContent: (handler: (opening: AcceptedToolsetPopoverOpening) => void) => subscribe(native.accepted, handler),
+    notifyToolsetPopoverContentAccepted: async (opening: AcceptedToolsetPopoverOpening) => native.accepted.forEach(handler => handler(opening)),
     listenForToolsetFlyoutKeys: (handler: (payload: ToolsetFlyoutKey) => void) => subscribe(native.keys, handler),
     listenForToolsetFlyoutClosed: (handler: (payload: ToolsetFlyoutSession) => void) => subscribe(native.closed, handler),
     listenForToolsetPopoverDismiss: (handler: (payload?: ToolsetPopoverDismissPayload) => void) => subscribe(native.dismiss, handler),
@@ -79,7 +82,7 @@ describe.each(["macos", "windows"] as const)("native flyout keyboard routing (%s
   });
   afterEach(async () => {
     await act(async () => root.unmount()); host.remove();
-    expect(native.content.size + native.keys.size + native.closed.size + native.dismiss.size).toBe(0);
+    expect(native.content.size + native.accepted.size + native.keys.size + native.closed.size + native.dismiss.size).toBe(0);
     vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals();
   });
   async function key(value: string, init: KeyboardEventInit = {}, type = "keydown") {
@@ -139,7 +142,7 @@ describe.each(["macos", "windows"] as const)("native flyout keyboard routing (%s
     // A queued IPC activation and stale startup replay cannot invoke or reopen it.
     await act(async () => {
       await sendToolsetFlyoutKey({ toolsetId: content.toolsetId, flyoutId: content.flyout.flyoutId,
-        openedAt: content.openedAt!, key: activation });
+        openedAt: content.openedAt!, generation: content.generation, key: activation });
       await setToolsetPopoverContent(content.toolsetId, content, content.anchor);
     });
     expect(sendPaletteCommand).toHaveBeenCalledTimes(1);

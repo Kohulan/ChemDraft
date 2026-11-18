@@ -14,6 +14,13 @@ import { ELECTRON_MARK_EDITING_STORAGE_KEY, loadDirectElectronMarkEditing } from
 import { isKeybindingSettings, type KeybindingScheme, type KeybindingSettings } from "../keybindingSettings";
 import { migrateLegacyToolsetIds } from "../toolbars/legacyToolsetIds";
 import { listenCurrentWindowEvent, listenTauriEvent, safeTauriWindowListen } from "./tauriEvents";
+import {
+  compareToolsetPopoverOpenings, type AcceptedToolsetPopoverOpening, type ToolsetPopoverDismissPayload,
+  type ToolsetPopoverOpening, type ToolsetFlyoutClosedNotice
+} from "./flyoutOpeningRule";
+
+export { compareToolsetPopoverOpenings } from "./flyoutOpeningRule";
+export type { AcceptedToolsetPopoverOpening, ToolsetPopoverDismissPayload, ToolsetPopoverOpening } from "./flyoutOpeningRule";
 
 export const PALETTE_COMMAND_EVENT = "chemdraft://palette-command";
 export const PALETTE_COMMAND_PREVIEW_EVENT = "chemdraft://palette-command-preview";
@@ -394,12 +401,6 @@ export function toolsetPopoverTimestamp(): number {
   return performance.timeOrigin + performance.now();
 }
 
-export interface ToolsetPopoverOpening {
-  /** Captured before async work and retained on startup replays for click-away ordering. */
-  openedAt?: number;
-  /** Originating opener's sequence, so equal timestamps still identify distinct opens. */
-  generation?: number;
-}
 let popoverGeneration = 0;
 // Owner-local identities are recorded synchronously, before content delivery can yield to a close.
 // Replays of an older opening must not make its delayed close current again.
@@ -407,17 +408,6 @@ const latestToolsetPopoverOpenings = new Map<string, ToolsetPopoverOpening>();
 /** Allocate once at the originating press; startup replays retain this sequence. */
 export function newToolsetPopoverOpening(): Required<ToolsetPopoverOpening> {
   return { openedAt: toolsetPopoverTimestamp(), generation: ++popoverGeneration };
-}
-export function compareToolsetPopoverOpenings(a: ToolsetPopoverOpening, b: ToolsetPopoverOpening): number {
-  return (a.openedAt ?? 0) - (b.openedAt ?? 0) || (a.generation ?? 0) - (b.generation ?? 0);
-}
-
-export interface ToolsetPopoverDismissPayload {
-  /** Captured synchronously at the originating press, before any asynchronous IPC. */
-  requestedAt: number;
-  reason?: "escape";
-  /** A visibility reply only authorizes dismissal of the openings that were checked. */
-  openings?: (ToolsetPopoverOpening & { toolsetId: string })[];
 }
 
 /**
@@ -495,6 +485,7 @@ export interface ToolsetPopoverAnchor {
 }
 
 export type ToolsetPopoverContentPayload = { toolsetId: string; anchor?: ToolsetPopoverAnchor } & ToolsetPopoverContent;
+type ToolsetPopoverContentNotice = ToolsetPopoverContentPayload | (AcceptedToolsetPopoverOpening & { accepted: true });
 
 const TOOLSET_POPOVER_CONTENT_EVENT = "chemdraft://toolset-popover-content";
 const TOOLSET_POPOVER_CONTENT_REQUEST_EVENT = "chemdraft://toolset-popover-content-request";
@@ -526,7 +517,28 @@ export async function listenForToolsetPopoverContent(
   if (!isDesktopRuntime()) {
     return () => undefined;
   }
-  return listenTauriEvent<ToolsetPopoverContentPayload>(TOOLSET_POPOVER_CONTENT_EVENT, (event) => handler(event.payload));
+  return listenTauriEvent<ToolsetPopoverContentNotice>(TOOLSET_POPOVER_CONTENT_EVENT, ({ payload }) => {
+    if (!("accepted" in payload)) handler(payload);
+  });
+}
+
+/** Popover → keyboard router: publish the identity that the renderer actually accepted. */
+export async function notifyToolsetPopoverContentAccepted(opening: AcceptedToolsetPopoverOpening): Promise<void> {
+  if (!isDesktopRuntime()) return;
+  const { emit } = await import("@tauri-apps/api/event");
+  await emit<ToolsetPopoverContentNotice>(TOOLSET_POPOVER_CONTENT_EVENT, { ...opening, accepted: true });
+}
+
+export async function listenForAcceptedToolsetPopoverContent(
+  handler: (opening: AcceptedToolsetPopoverOpening) => void
+): Promise<Unlisten> {
+  if (!isDesktopRuntime()) return () => undefined;
+  return listenTauriEvent<ToolsetPopoverContentNotice>(TOOLSET_POPOVER_CONTENT_EVENT, ({ payload }) => {
+    if ("accepted" in payload) {
+      const { accepted, ...opening } = payload;
+      handler(opening);
+    }
+  });
 }
 
 /** Popover → palette: "I just mounted, resend my content" — closes the create-vs-emit startup race. */
@@ -552,11 +564,8 @@ export async function listenForToolsetPopoverContentRequests(
 
 /** Navigation stays in the focused document or palette; identify the open so delayed keys cannot
  * activate a different flyout in the reused popover window. */
-export interface ToolsetFlyoutSession {
-  toolsetId: string;
+export interface ToolsetFlyoutSession extends AcceptedToolsetPopoverOpening {
   flyoutId: string;
-  openedAt: number;
-  generation?: number;
 }
 export interface ToolsetFlyoutKey extends ToolsetFlyoutSession {
   key: string;
@@ -578,15 +587,15 @@ export async function listenForToolsetFlyoutKeys(handler: (payload: ToolsetFlyou
   return listenTauriEvent<ToolsetFlyoutKey>(TOOLSET_FLYOUT_KEY_EVENT, event => handler(event.payload));
 }
 
-export async function notifyToolsetFlyoutClosed(payload: ToolsetFlyoutSession): Promise<void> {
+export async function notifyToolsetFlyoutClosed(payload: ToolsetFlyoutClosedNotice): Promise<void> {
   if (!isDesktopRuntime()) return;
   const { emit } = await import("@tauri-apps/api/event");
   await emit(TOOLSET_FLYOUT_CLOSED_EVENT, payload);
 }
 
-export async function listenForToolsetFlyoutClosed(handler: (payload: ToolsetFlyoutSession) => void): Promise<Unlisten> {
+export async function listenForToolsetFlyoutClosed(handler: (payload: ToolsetFlyoutClosedNotice) => void): Promise<Unlisten> {
   if (!isDesktopRuntime()) return () => undefined;
-  return listenTauriEvent<ToolsetFlyoutSession>(TOOLSET_FLYOUT_CLOSED_EVENT, event => handler(event.payload));
+  return listenTauriEvent<ToolsetFlyoutClosedNotice>(TOOLSET_FLYOUT_CLOSED_EVENT, event => handler(event.payload));
 }
 
 export interface BondStereoPopoverAction {

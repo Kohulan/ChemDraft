@@ -3,7 +3,10 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PalettePopoverWindow } from "./PalettePopoverWindow";
-import { sendBondStereoPopoverAction, sendPaletteCommand, sendToolsetFlyoutKey, type ToolsetFlyoutKey, type ToolsetPopoverDismissPayload, type ToolsetPopoverContentPayload } from "./window-manager";
+import {
+  notifyToolsetPopoverContentAccepted, sendBondStereoPopoverAction, sendPaletteCommand, sendToolsetFlyoutKey,
+  type ToolsetFlyoutKey, type ToolsetPopoverDismissPayload, type ToolsetPopoverContentPayload
+} from "./window-manager";
 import { useBondStereoPopover } from "./useBondStereoPopover";
 import type { ChemDraftDocument } from "@chemdraft/chem-core";
 import { closeToolsetPopoverWindow, currentWindowLogicalPosition, openToolsetPopoverWindow, setCurrentWindowLogicalPosition, setToolsetPopoverContent } from "./window-manager";
@@ -47,6 +50,7 @@ vi.mock("@tauri-apps/api/webview", () => ({ getCurrentWebview: () => ({ setFocus
 vi.mock("./window-manager", async importOriginal => ({
   ...await importOriginal<typeof import("./window-manager")>(),
   listenForToolsetPopoverContent: vi.fn(async handler => { native.content = handler; return () => {}; }),
+  notifyToolsetPopoverContentAccepted: vi.fn(async () => {}),
   listenForToolsetPopoverDismiss: vi.fn(async handler => { native.dismiss = handler; return () => {}; }),
   listenForBondStereoPopoverActions: vi.fn(async handler => { native.action = handler; return () => {}; }),
   listenForToolsetFlyoutKeys: vi.fn(async handler => { native.key = handler; return () => { native.key = undefined; }; }),
@@ -103,7 +107,7 @@ describe("document-owned bond stereo popover", () => {
     };
     await press("Tab", { shiftKey: true });
     expect(sendToolsetFlyoutKey).toHaveBeenLastCalledWith({ toolsetId: "core.bondStereo", flyoutId: "core.bondStereo",
-      openedAt: content.openedAt, sessionId: content.flyout.id, key: "Tab", shiftKey: true });
+      openedAt: content.openedAt, generation: content.generation, sessionId: content.flyout.id, key: "Tab", shiftKey: true });
     await press("ArrowRight");
     expect(document.activeElement).toBe(owner);
     await press("Enter");
@@ -506,8 +510,9 @@ describe("open-bond native popover body", () => {
     const owner = document.createElement("input"); document.body.append(owner); owner.focus();
     try {
       const buttons = await open(true);
+      const [opening] = vi.mocked(notifyToolsetPopoverContentAccepted).mock.lastCall!;
       const key = (value: string, shiftKey = false, sessionId = "session-1") => act(async () => native.key?.({
-        toolsetId: "core.bondStereo", flyoutId: "core.bondStereo", openedAt: performance.timeOrigin + 100,
+        toolsetId: "core.bondStereo", flyoutId: "core.bondStereo", openedAt: performance.timeOrigin + 100, generation: opening.generation,
         sessionId, key: value, shiftKey
       }));
       const highlighted = () => container.querySelector('[data-keyboard-highlighted="true"]');

@@ -104,7 +104,8 @@ export function useBondStereoPopover(options: {
       if (event.ctrlKey || event.metaKey || event.altKey || (event.shiftKey && event.key !== "Tab")) return;
       if (activate) activationKeys.add(event.key);
       void sendToolsetFlyoutKey({ toolsetId: BOND_STEREO_POPOVER_ID, flyoutId: BOND_STEREO_POPOVER_ID,
-        openedAt: opened.openedAt, sessionId: opened.id, key: event.key, shiftKey: event.shiftKey }).catch(() => undefined);
+        openedAt: opened.openedAt, generation: opened.content.generation,
+        sessionId: opened.id, key: event.key, shiftKey: event.shiftKey }).catch(() => undefined);
     };
     const keyUp = (event: KeyboardEvent) => {
       // Suppress a repeated Enter/Space and its native keyup click even if the

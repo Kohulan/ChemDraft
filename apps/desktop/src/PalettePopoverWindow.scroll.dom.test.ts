@@ -5,10 +5,14 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { PalettePopoverWindow } from "./PalettePopoverWindow";
 import { installNativeFlyoutKeyboard } from "./nativeFlyoutKeyboard";
-import type { ToolsetFlyoutKey, ToolsetFlyoutSession, ToolsetPopoverContentPayload, ToolsetPopoverDismissPayload } from "./window-manager";
+import type {
+  AcceptedToolsetPopoverOpening, ToolsetFlyoutKey, ToolsetFlyoutSession, ToolsetPopoverContentPayload,
+  ToolsetPopoverDismissPayload
+} from "./window-manager";
 
 const native = vi.hoisted(() => ({
   content: undefined as undefined | ((payload: ToolsetPopoverContentPayload) => void),
+  accepted: undefined as undefined | ((payload: AcceptedToolsetPopoverOpening) => void),
   receiveClose: undefined as undefined | ((payload: ToolsetFlyoutSession) => void),
   dismiss: undefined as undefined | ((payload?: ToolsetPopoverDismissPayload) => void),
   key: undefined as undefined | ((payload: ToolsetFlyoutKey) => void),
@@ -28,6 +32,11 @@ vi.mock("./plugins/pluginPanelInputFocus", async importOriginal => ({
 vi.mock("./window-manager", async importOriginal => ({
   ...await importOriginal<typeof import("./window-manager")>(),
   listenForToolsetPopoverContent: vi.fn(async handler => { native.content = handler; return () => {}; }),
+  listenForAcceptedToolsetPopoverContent: vi.fn(async handler => {
+    native.accepted = handler;
+    return () => { native.accepted = undefined; };
+  }),
+  notifyToolsetPopoverContentAccepted: async (opening: AcceptedToolsetPopoverOpening) => native.accepted?.(opening),
   listenForToolsetPopoverRelease: vi.fn(async handler => { native.release = handler; return () => {}; }),
   listenForToolsetFlyoutKeys: vi.fn(async handler => { native.key = handler; return () => {}; }),
   listenForToolsetFlyoutClosed: vi.fn(async handler => { native.receiveClose = handler; return () => {}; }),
@@ -71,6 +80,10 @@ const rings: ToolsetPopoverContentPayload = { toolsetId: "core.main", kind: "fly
     id: `ring-${i}`, title: `Ring ${i}`, enabled: true, active: false
   })) } };
 const ringSession = { toolsetId: rings.toolsetId, flyoutId: rings.flyout.flyoutId, openedAt: 1 };
+function acceptContent(payload: ToolsetPopoverContentPayload) {
+  native.accepted?.({ toolsetId: payload.toolsetId, openedAt: payload.openedAt!, generation: payload.generation,
+    flyoutId: payload.kind === "flyout" ? payload.flyout.flyoutId : undefined });
+}
 function pressFlyoutArrow() {
   const event = new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true });
   window.dispatchEvent(event);
@@ -162,7 +175,7 @@ it("sends the live content kind on each reveal of a prewarmed Art popover", asyn
 it("closes both flyout channels and resets keyboard navigation for a newer opening at the same timestamp", async () => {
   await act(async () => root.render(createElement(PalettePopoverWindow, { toolsetId: "core.main", kind: "flyout", prewarm: true })));
   const first = { ...rings, generation: 1 };
-  const key = { toolsetId: "core.main", flyoutId: "rings", openedAt: 1, key: "ArrowDown" };
+  const key = { toolsetId: "core.main", flyoutId: "rings", openedAt: 1, generation: 1, key: "ArrowDown" };
   await act(async () => native.content?.(first));
   await act(async () => native.key?.(key));
   expect(container.querySelector('[data-keyboard-highlighted="true"]')?.getAttribute("data-command-id")).toBe("ring-0");
@@ -180,7 +193,7 @@ it("closes both flyout channels and resets keyboard navigation for a newer openi
   expect(native.show).toHaveBeenCalledTimes(reveals + 1);
   expect(native.show).toHaveBeenLastCalledWith("preserve", "flyout");
   expect(container.querySelector('[data-keyboard-highlighted="true"]')).toBeNull();
-  await act(async () => native.key?.(key));
+  await act(async () => native.key?.({ ...key, generation: 2 }));
   expect(container.querySelector('[data-keyboard-highlighted="true"]')?.getAttribute("data-command-id")).toBe("ring-0");
 });
 
@@ -194,15 +207,15 @@ it.each(["before", "after"])("routes keys to a newer same-time flyout when the o
   try {
     const current = { toolsetId: rings.toolsetId, flyoutId: rings.flyout.flyoutId, openedAt: 1, generation: 2 };
     const closeOld = () => native.receiveClose?.({ ...current, generation: 1 });
-    native.content?.({ ...rings, generation: 1 });
+    acceptContent({ ...rings, generation: 1 });
     if (order === "before") closeOld();
-    native.content?.({ ...rings, generation: 2 });
+    acceptContent({ ...rings, generation: 2 });
     if (order === "after") closeOld();
     expect(press()).toBe(true);
     expect(native.sendKey).toHaveBeenCalledOnce();
     native.receiveClose?.(current);
     expect(press()).toBe(false);
-    native.content?.({ ...rings, generation: 3 });
+    acceptContent({ ...rings, generation: 3 });
     expect(press()).toBe(true);
     // Old senders identify their close by timestamp.
     native.receiveClose?.({ toolsetId: current.toolsetId, flyoutId: current.flyoutId, openedAt: current.openedAt });
@@ -214,13 +227,13 @@ it.each(["rings", "other"])("retires a superseded flyout when the newer %s close
   const stop = installNativeFlyoutKeyboard();
   const replacement = { ...rings, flyout: { ...rings.flyout, flyoutId } };
   try {
-    native.content?.({ ...rings, generation: 1 });
+    acceptContent({ ...rings, generation: 1 });
     expect(pressFlyoutArrow()).toBe(true);
     native.receiveClose?.({ ...ringSession, flyoutId, generation: 2 });
     const routedBeforeContent = pressFlyoutArrow();
-    native.content?.({ ...replacement, generation: 2 });
+    acceptContent({ ...replacement, generation: 2 });
     expect([routedBeforeContent, pressFlyoutArrow()]).toEqual([false, false]);
-    native.content?.({ ...replacement, generation: 3 });
+    acceptContent({ ...replacement, generation: 3 });
     expect(pressFlyoutArrow()).toBe(true);
   } finally { stop(); }
 });
@@ -230,16 +243,16 @@ it("scopes same-time opening and close generations to each toolset", () => {
   const toolsetId = "core.art";
   const stop = installNativeFlyoutKeyboard();
   try {
-    native.content?.({ ...rings, generation: 9 });
+    acceptContent({ ...rings, generation: 9 });
     const next = { ...rings, toolsetId, generation: 1, flyout: { ...rings.flyout, flyoutId } };
-    native.content?.(next);
+    acceptContent(next);
     expect(pressFlyoutArrow()).toBe(true);
     expect(native.sendKey).toHaveBeenLastCalledWith(expect.objectContaining({ toolsetId, flyoutId }));
-    native.content?.({ ...rings, generation: 9 });
+    acceptContent({ ...rings, generation: 9 });
     expect(pressFlyoutArrow()).toBe(true);
     expect(native.sendKey).toHaveBeenLastCalledWith(expect.objectContaining({ toolsetId, flyoutId }));
     native.receiveClose?.({ ...ringSession, generation: 9 });
-    native.content?.(next);
+    acceptContent(next);
     expect(pressFlyoutArrow()).toBe(true);
     expect(native.sendKey).toHaveBeenLastCalledWith(expect.objectContaining({ toolsetId, flyoutId }));
   } finally { stop(); }
@@ -248,9 +261,9 @@ it("scopes same-time opening and close generations to each toolset", () => {
 it("keeps the newer menu when an older menu from the same toolset arrives late", () => {
   const stop = installNativeFlyoutKeyboard();
   try {
-    native.content?.({ ...rings, generation: 2 });
+    acceptContent({ ...rings, generation: 2 });
     const delayed = { ...rings, generation: 1, flyout: { ...rings.flyout, flyoutId: "other" } };
-    native.content?.(delayed);
+    acceptContent(delayed);
     expect(pressFlyoutArrow()).toBe(true);
     expect(native.sendKey).toHaveBeenCalledExactlyOnceWith({ ...ringSession, generation: 2, key: "ArrowDown" });
   } finally { stop(); }
@@ -258,21 +271,15 @@ it("keeps the newer menu when an older menu from the same toolset arrives late",
 
 it("retains the generation through a legacy replay so queued Enter cannot choose from a replacement", async () => {
   await act(async () => root.render(createElement(PalettePopoverWindow, { toolsetId: rings.toolsetId, kind: "flyout", prewarm: true })));
-  const showContent = native.content!;
   const stop = installNativeFlyoutKeyboard();
   try {
     await act(async () => {
-      for (const opening of [{ ...rings, generation: 2 }, rings]) {
-        showContent(opening);
-        native.content?.(opening);
-      }
+      for (const opening of [{ ...rings, generation: 2 }, rings]) native.content?.(opening);
     });
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
     const [queuedEnter] = native.sendKey.mock.lastCall!;
     await act(async () => {
-      const replacement = { ...rings, generation: 3 };
-      showContent(replacement);
-      native.content?.(replacement);
+      native.content?.({ ...rings, generation: 3 });
       native.key?.({ ...ringSession, generation: 3, key: "ArrowDown" });
     });
     expect(container.querySelector('[data-keyboard-highlighted="true"]')?.getAttribute("data-command-id")).toBe("ring-0");
@@ -285,7 +292,7 @@ it("retains the generation through a legacy replay so queued Enter cannot choose
 it("forwards keys with the generation of the active flyout", () => {
   const stop = installNativeFlyoutKeyboard();
   try {
-    native.content?.({ ...rings, generation: 2 });
+    acceptContent({ ...rings, generation: 2 });
     expect(pressFlyoutArrow()).toBe(true);
     expect(native.sendKey).toHaveBeenCalledExactlyOnceWith({ ...ringSession, generation: 2, key: "ArrowDown" });
   } finally { stop(); }
@@ -308,16 +315,16 @@ it.each([1, undefined])("retains a newer same-time flyout after targeted Escape 
   const stop = installNativeFlyoutKeyboard();
   const target = { toolsetId: rings.toolsetId, openedAt: 1 };
   try {
-    native.content?.({ ...rings, generation: 2 });
+    acceptContent({ ...rings, generation: 2 });
     native.dismiss?.({ requestedAt: 2, reason: "escape", openings: [{ ...target, generation }] });
     expect(pressFlyoutArrow()).toBe(true);
     native.dismiss?.({ requestedAt: 2, reason: "escape", openings: [{ ...target, toolsetId: "core.art", generation: 2 }] });
     expect(pressFlyoutArrow()).toBe(true);
     native.dismiss?.({ requestedAt: 2, reason: "escape", openings: [{ ...target, generation: 2 }] });
     expect(pressFlyoutArrow()).toBe(false);
-    native.content?.({ ...rings, generation: 2 });
+    acceptContent({ ...rings, generation: 2 });
     expect(pressFlyoutArrow()).toBe(false);
-    native.content?.({ ...rings, generation: 3 });
+    acceptContent({ ...rings, generation: 3 });
     expect(pressFlyoutArrow()).toBe(true);
     native.dismiss?.({ requestedAt: 1 });
     expect(pressFlyoutArrow()).toBe(false);
