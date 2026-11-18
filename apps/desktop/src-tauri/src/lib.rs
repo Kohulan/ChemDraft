@@ -1416,6 +1416,12 @@ pub fn run() {
                 return;
             }
 
+            if window.label().starts_with("toolset-popover-")
+                && matches!(event, WindowEvent::Destroyed)
+            {
+                toolset_popover_command_sources().remove(window.label());
+            }
+
             // Owned windows may finish unminimizing after their owner's Resized event.
             if dialog_windows::is_dialog_label(window.label()) {
                 dialog_windows::on_window_event(window, event);
@@ -6434,6 +6440,7 @@ fn close_toolset_popover(app: tauri::AppHandle, toolset_id: String) -> Result<()
     if let Some(window) = app.get_webview_window(&toolset_popover_window_label(&toolset_id)) {
         panel_window::end_for_hide(window.app_handle(), window.label());
         window.hide().map_err(|error| error.to_string())?;
+        toolset_popover_command_sources().remove(window.label());
     }
     Ok(())
 }
@@ -6592,6 +6599,38 @@ fn raise_among_owned_windows<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Re
     Ok(())
 }
 
+#[derive(Debug, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolsetFlyoutOpening {
+    toolset_id: String,
+    flyout_id: String,
+    opened_at: f64,
+    generation: Option<u64>,
+    bond_stereo_session_id: Option<String>,
+}
+
+enum ToolsetPopoverCommandSource {
+    TextColor,
+    Flyout(ToolsetFlyoutOpening),
+}
+
+fn toolset_popover_command_sources(
+) -> std::sync::MutexGuard<'static, HashMap<String, ToolsetPopoverCommandSource>> {
+    static SOURCES: std::sync::LazyLock<Mutex<HashMap<String, ToolsetPopoverCommandSource>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    SOURCES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn can_dispatch_flyout_command(
+    visible: bool,
+    current: &ToolsetFlyoutOpening,
+    requested: Option<&ToolsetFlyoutOpening>,
+) -> bool {
+    visible && requested == Some(current)
+}
+
 /// Reveal the calling palette popover once it has painted its content at the right size, and put it
 /// above the palette it belongs to. A mouse-opened E/Z popover must not become key/active.
 #[tauri::command]
@@ -6599,12 +6638,29 @@ fn show_toolset_popover_window(
     window: tauri::WebviewWindow,
     focus_mode: Option<ToolsetPopoverFocusMode>,
     kind: Option<String>,
+    flyout_opening: Option<ToolsetFlyoutOpening>,
 ) -> Result<bool, String> {
     if !window.label().starts_with("toolset-popover-") {
         return Err("Only toolset popovers may reveal popover content".into());
     }
     if utility_windows_suspended() {
         return Ok(false);
+    }
+    let source = match (kind.as_deref(), flyout_opening) {
+        (Some("flyout"), Some(opening))
+            if window.label() == toolset_popover_window_label(&opening.toolset_id) =>
+        {
+            Some(ToolsetPopoverCommandSource::Flyout(opening))
+        }
+        (_, Some(_)) => return Err("Flyout opening does not match its popover window".into()),
+        (Some("textColor"), None) => Some(ToolsetPopoverCommandSource::TextColor),
+        _ => None,
+    };
+    // The renderer has painted this content. Retire the previous opening even if reveal fails.
+    if let Some(source) = source {
+        toolset_popover_command_sources().insert(window.label().to_string(), source);
+    } else {
+        toolset_popover_command_sources().remove(window.label());
     }
     // The page owns the live content, including a prewarmed/reused Art window switching
     // between its colour picker and command flyouts. Titles are fixed native strings.
@@ -6985,6 +7041,7 @@ fn route_toolset_command(
     command_id: String,
     preserve_input_focus: Option<bool>,
     commit: Option<bool>,
+    flyout_opening: Option<ToolsetFlyoutOpening>,
 ) -> Result<(), String> {
     if utility_windows_suspended() && !commit.unwrap_or(false) {
         return Ok(());
@@ -6992,6 +7049,38 @@ fn route_toolset_command(
     let command_id = command_id.trim();
     if command_id.is_empty() {
         return Err("Toolset command id cannot be empty.".to_string());
+    }
+
+    if window.label().starts_with("toolset-popover-") {
+        if commit.unwrap_or(false) {
+            return Ok(());
+        }
+        let allowed = match toolset_popover_command_sources().get(window.label()) {
+            Some(ToolsetPopoverCommandSource::TextColor) => flyout_opening.is_none(),
+            Some(ToolsetPopoverCommandSource::Flyout(current)) => can_dispatch_flyout_command(
+                window.is_visible().unwrap_or(false),
+                current,
+                flyout_opening.as_ref(),
+            ),
+            None => false,
+        };
+        if !allowed {
+            return Ok(());
+        }
+    } else if flyout_opening.is_some() {
+        return Ok(());
+    }
+
+    if let Some(session_id) = flyout_opening.and_then(|opening| opening.bond_stereo_session_id) {
+        if matches!(command_id, "geometry" | "flipped" | "keep") {
+            app.emit_to(
+                MAIN_WINDOW_LABEL,
+                "chemdraft://bond-stereo-popover-action",
+                serde_json::json!({ "sessionId": session_id, "action": command_id }),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        return Ok(());
     }
 
     if commit.unwrap_or(false) {
@@ -13693,6 +13782,57 @@ mod tests {
             serde_json::from_str(include_str!("../capabilities/toolset-window-size.json")).unwrap();
         assert_eq!(capability["windows"], serde_json::json!(["toolset-*"]));
         assert_eq!(toolset_window_label("lab.quick"), "toolset-lab-quick");
+    }
+
+    #[test]
+    fn native_flyout_dispatch_requires_a_visible_matching_opening() {
+        let opening = || ToolsetFlyoutOpening {
+            toolset_id: "core.main".into(),
+            flyout_id: "rings".into(),
+            opened_at: 123.5,
+            generation: Some(2),
+            bond_stereo_session_id: None,
+        };
+        let current = opening();
+        assert!(can_dispatch_flyout_command(
+            true,
+            &current,
+            Some(&opening())
+        ));
+        assert!(!can_dispatch_flyout_command(
+            false,
+            &current,
+            Some(&opening())
+        ));
+        assert!(!can_dispatch_flyout_command(true, &current, None));
+        for stale in [
+            ToolsetFlyoutOpening {
+                toolset_id: "core.structure".into(),
+                ..opening()
+            },
+            ToolsetFlyoutOpening {
+                flyout_id: "bonds".into(),
+                ..opening()
+            },
+            ToolsetFlyoutOpening {
+                opened_at: 123.0,
+                ..opening()
+            },
+            ToolsetFlyoutOpening {
+                generation: Some(1),
+                ..opening()
+            },
+            ToolsetFlyoutOpening {
+                generation: None,
+                ..opening()
+            },
+            ToolsetFlyoutOpening {
+                bond_stereo_session_id: Some("session-1".into()),
+                ..opening()
+            },
+        ] {
+            assert!(!can_dispatch_flyout_command(true, &current, Some(&stale)));
+        }
     }
 
     #[test]

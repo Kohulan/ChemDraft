@@ -582,6 +582,9 @@ export async function listenForToolsetPopoverContentRequests(
 export interface ToolsetFlyoutSession extends AcceptedToolsetPopoverOpening {
   flyoutId: string;
 }
+export interface ToolsetFlyoutCommandOpening extends ToolsetFlyoutSession {
+  bondStereoSessionId?: string;
+}
 export interface ToolsetFlyoutKey extends ToolsetFlyoutSession {
   key: string;
   /** Document-owned E/Z navigation includes its exact session and reverse Tab. */
@@ -619,8 +622,14 @@ export interface BondStereoPopoverAction {
 }
 const BOND_STEREO_POPOVER_ACTION_EVENT = "chemdraft://bond-stereo-popover-action";
 
-export async function sendBondStereoPopoverAction(payload: BondStereoPopoverAction): Promise<void> {
+export async function sendBondStereoPopoverAction(payload: BondStereoPopoverAction, opening?: ToolsetFlyoutCommandOpening): Promise<void> {
   if (!isDesktopRuntime()) return;
+  if (payload.action !== "close") {
+    if (opening?.bondStereoSessionId === payload.sessionId) {
+      await routeToolsetCommand(payload.action, { flyoutOpening: opening });
+    }
+    return;
+  }
   const { emit } = await import("@tauri-apps/api/event");
   await emit(BOND_STEREO_POPOVER_ACTION_EVENT, payload);
 }
@@ -933,7 +942,12 @@ export async function setMenuChecked(commandId: string, checked: boolean): Promi
   await invoke("set_menu_checked", { commandId, checked }).catch(() => undefined);
 }
 
-export async function sendPaletteCommand(commandId: string, options?: { preserveInputFocus: boolean }): Promise<void> {
+interface PaletteCommandOptions {
+  preserveInputFocus?: boolean;
+  flyoutOpening?: ToolsetFlyoutCommandOpening;
+}
+
+export async function sendPaletteCommand(commandId: string, options?: PaletteCommandOptions): Promise<void> {
   return routeToolsetCommand(commandId, options);
 }
 
@@ -958,10 +972,11 @@ const pendingPaletteEvents = new Set<Promise<void>>();
 // resolves after Tauri enqueues the destination eval, before the subsequent invoke.
 export const PALETTE_EVENT_SETTLE_TIMEOUT_MS = 500;
 export function routeToolsetCommand(
-  commandId: string, options?: { preserveInputFocus?: boolean; commit?: boolean }
+  commandId: string, options?: PaletteCommandOptions & { commit?: boolean }
 ): Promise<void> {
   // Single delivery: the invoke routes through Rust `route_toolset_command`, which dispatches the
   // native-command DOM event into the main window (the one listener in `listenForToolsetCommands`).
+  // E/Z choices use the same guard and reach the document's bond-stereo session listener.
   // No client-side `emit` — that used to also fan out over the tauri event bus, so every command
   // arrived several times and needed `dedupeAdjacentCommands` to collapse it.
   const payload = createToolsetCommandPayload(commandId);
@@ -1164,19 +1179,23 @@ export async function fitCurrentPaletteWindow(size: ToolsetWindowSize, area: Mon
  * Reveal the calling palette popover above the palette it belongs to. Rust shows it and then raises
  * it among the document's owned windows: the JS window `show()` alone left it underneath its palette
  * on Windows whenever the two overlapped. Falls back to that plain `show()` if the command is
- * unavailable for focusable popovers. A preserve-focus open must never fall back to an activating show.
+ * unavailable for focusable pickers. Flyouts register their identity with the native show command.
  * Returns whether the native window became visible.
  */
-export async function showCurrentToolsetPopoverWindow(focusMode: ToolsetPopoverFocusMode = "focus", kind?: ToolsetPopoverContent["kind"]): Promise<boolean> {
+export async function showCurrentToolsetPopoverWindow(
+  focusMode: ToolsetPopoverFocusMode = "focus", kind?: ToolsetPopoverContent["kind"], flyoutOpening?: ToolsetFlyoutCommandOpening
+): Promise<boolean> {
   if (!isDesktopRuntime()) {
     return false;
   }
 
   const { invoke } = await import("@tauri-apps/api/core");
   try {
-    return await invoke<boolean>("show_toolset_popover_window", { focusMode, ...(kind ? { kind } : {}) });
+    return await invoke<boolean>("show_toolset_popover_window", {
+      focusMode, ...(kind ? { kind } : {}), ...(flyoutOpening ? { flyoutOpening } : {})
+    });
   } catch (error) {
-    if (focusMode === "preserve") throw error;
+    if (focusMode === "preserve" || flyoutOpening) throw error;
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
     const window = getCurrentWindow();
     await window.show();

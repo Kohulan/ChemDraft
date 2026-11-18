@@ -3,6 +3,7 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
+import { isDeepStrictEqual } from "node:util";
 import { PalettePopoverWindow } from "./PalettePopoverWindow";
 import { installNativeFlyoutKeyboard } from "./nativeFlyoutKeyboard";
 import type {
@@ -18,8 +19,11 @@ const native = vi.hoisted(() => ({
   key: undefined as undefined | ((payload: ToolsetFlyoutKey) => void),
   release: undefined as undefined | ((payload: { toolsetId: string; releasedAt: number }) => void),
   resized: undefined as undefined | (() => void),
-  show: vi.fn(async () => true), size: vi.fn(async () => {}), invoke: vi.fn(async (_command: string, _args?: Record<string, unknown>) => {}),
-  command: vi.fn(async () => {}), closed: vi.fn(async () => {}), flyoutClosed: vi.fn(async () => {}),
+  show: vi.fn<typeof import("./window-manager").showCurrentToolsetPopoverWindow>(async () => true), size: vi.fn(async () => {}),
+  invoke: vi.fn(async (_command: string, _args?: Record<string, unknown>): Promise<unknown> => undefined),
+  visible: vi.fn(async () => true),
+  command: vi.fn<typeof import("./window-manager").sendPaletteCommand>(async () => {}),
+  closed: vi.fn(async () => {}), flyoutClosed: vi.fn(async () => {}),
   sendKey: vi.fn(async (_payload: ToolsetFlyoutKey) => {})
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: native.invoke }));
@@ -31,7 +35,7 @@ vi.mock("./plugins/pluginPanelInputFocus", async importOriginal => ({
 }));
 vi.mock("./window-manager", async importOriginal => ({
   ...await importOriginal<typeof import("./window-manager")>(),
-  isToolsetPopoverVisible: async () => true,
+  isToolsetPopoverVisible: native.visible,
   listenForToolsetPopoverContent: vi.fn(async handler => {
     native.content.add(handler);
     return () => { native.content.delete(handler); };
@@ -174,7 +178,7 @@ it("sends the live content kind on each reveal of a prewarmed Art popover", asyn
   await act(async () => pushContent({ ...rings, toolsetId: "core.art" }));
   // Command navigation is routed from the document; even a failed native reveal
   // must not fall back to an activating show for this flyout.
-  expect(native.show).toHaveBeenLastCalledWith("preserve", "flyout");
+  expect(native.show).toHaveBeenLastCalledWith("preserve", "flyout", { ...ringSession, toolsetId: "core.art" });
   await act(async () => pushContent({ toolsetId: "core.art", kind: "artColor", openedAt: 2 }));
   expect(native.show).toHaveBeenLastCalledWith("focus", "artColor");
 });
@@ -190,7 +194,7 @@ it("closes both flyout channels and resets keyboard navigation for a newer openi
     native.key?.({ ...key, key: "Enter" });
     native.key?.({ ...key, key: "Enter" });
   });
-  expect(native.command).toHaveBeenCalledExactlyOnceWith("ring-0");
+  expect(native.command).toHaveBeenCalledExactlyOnceWith("ring-0", { flyoutOpening: { ...ringSession, generation: 1 } });
   expect(native.closed).toHaveBeenCalledExactlyOnceWith("core.main", 1, 1);
   expect(native.flyoutClosed).toHaveBeenCalledExactlyOnceWith({ toolsetId: "core.main", flyoutId: "rings", openedAt: 1, generation: 1 });
   const reveals = native.show.mock.calls.length;
@@ -198,7 +202,7 @@ it("closes both flyout channels and resets keyboard navigation for a newer openi
   expect(native.show).toHaveBeenCalledTimes(reveals);
   await act(async () => pushContent({ ...first, generation: 2 }));
   expect(native.show).toHaveBeenCalledTimes(reveals + 1);
-  expect(native.show).toHaveBeenLastCalledWith("preserve", "flyout");
+  expect(native.show).toHaveBeenLastCalledWith("preserve", "flyout", { ...ringSession, generation: 2 });
   expect(container.querySelector('[data-keyboard-highlighted="true"]')).toBeNull();
   await act(async () => native.key?.({ ...key, generation: 2 }));
   expect(container.querySelector('[data-keyboard-highlighted="true"]')?.getAttribute("data-command-id")).toBe("ring-0");
@@ -315,7 +319,48 @@ it("ignores queued arrow and activation keys from a stale flyout generation", as
   await act(async () => native.key?.({ ...ringSession, generation: 1, key: "Enter" }));
   expect(native.command).not.toHaveBeenCalled();
   await act(async () => native.key?.({ ...ringSession, generation: 2, key: "Enter" }));
-  expect(native.command).toHaveBeenCalledExactlyOnceWith("ring-0");
+  expect(native.command).toHaveBeenCalledExactlyOnceWith("ring-0", { flyoutOpening: { ...ringSession, generation: 2 } });
+});
+
+it.each(["macos", "windows"] as const)("refuses Enter at native dispatch when the flyout hides during a delayed visibility reply on %s", async platform => {
+  const manager = await vi.importActual<typeof import("./window-manager")>("./window-manager");
+  let visible = false;
+  let shownOpening: unknown;
+  const delivered = vi.fn();
+  native.invoke.mockImplementation(async (command, args) => {
+    if (command === "show_toolset_popover_window") {
+      shownOpening = args?.flyoutOpening;
+      return visible = true;
+    }
+    if (command === "route_toolset_command") {
+      const opening = args?.flyoutOpening;
+      // Model the native dispatch boundary. The ordinary palette route has no opening.
+      if (!opening || (visible && isDeepStrictEqual(opening, shownOpening))) delivered(args?.commandId);
+    }
+  });
+  native.show.mockImplementationOnce(manager.showCurrentToolsetPopoverWindow);
+  native.command.mockImplementationOnce(manager.sendPaletteCommand);
+  let reply!: () => void;
+  native.visible.mockImplementationOnce(() => new Promise(resolve => {
+    const sampledVisibility = visible;
+    reply = () => resolve(sampledVisibility);
+  }));
+  try {
+    await act(async () => root.render(createElement(PalettePopoverWindow, { toolsetId: rings.toolsetId, kind: "flyout", prewarm: true, platform })));
+    await act(async () => pushContent({ ...rings, generation: 2 }));
+    await act(async () => native.key?.({ ...ringSession, generation: 2, key: "ArrowDown" }));
+    expect(container.querySelector('[data-keyboard-highlighted="true"]')?.getAttribute("data-command-id")).toBe("ring-0");
+    await act(async () => native.key?.({ ...ringSession, generation: 2, key: "Enter" }));
+    expect(visible).toBe(true);
+    visible = false;
+    await act(async () => reply());
+    expect(delivered).not.toHaveBeenCalled();
+    const flyoutOpening = { ...ringSession, generation: 2 };
+    expect(shownOpening).toEqual(flyoutOpening);
+    expect(native.invoke).toHaveBeenCalledWith("route_toolset_command", { commandId: "ring-0", flyoutOpening });
+  } finally {
+    native.invoke.mockReset();
+  }
 });
 
 it.each([1, undefined])("retains a newer same-time flyout after targeted Escape generation %s and honors broadcasts", generation => {

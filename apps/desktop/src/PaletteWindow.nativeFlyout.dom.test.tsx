@@ -120,7 +120,9 @@ describe.each(["macos", "windows"] as const)("standalone palette flyout keyboard
     const [toolsetId, content] = vi.mocked(setToolsetPopoverContent).mock.calls[0]!;
     if (content.kind !== "flyout") throw new Error("Expected ring flyout snapshot");
     const choices = content.flyout.commands.filter(command => command.enabled);
-    expect(native.show).toHaveBeenLastCalledWith("preserve", "flyout");
+    const flyoutOpening = { toolsetId, flyoutId: content.flyout.flyoutId,
+      openedAt: content.openedAt, generation: content.generation };
+    expect(native.show).toHaveBeenLastCalledWith("preserve", "flyout", flyoutOpening);
     expect(document.activeElement).toBe(button);
     expect(highlighted()).toBeNull();
     // Activation with no highlight must also be consumed, never invoke the owner.
@@ -146,7 +148,7 @@ describe.each(["macos", "windows"] as const)("standalone palette flyout keyboard
     // WKWebView can synthesize a button click after keyboard activation. The
     // palette's existing hold-open click guard must still suppress its primary.
     await act(async () => button.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })));
-    expect(sendPaletteCommand).toHaveBeenCalledExactlyOnceWith(choices[1].id);
+    expect(sendPaletteCommand).toHaveBeenCalledExactlyOnceWith(choices[1].id, { flyoutOpening });
     expect(native.hide).toHaveBeenCalledTimes(1);
     expect(native.focus).not.toHaveBeenCalled();
     expect(document.activeElement).toBe(button);

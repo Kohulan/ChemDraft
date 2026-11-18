@@ -265,7 +265,9 @@ describe.each(["macos", "windows"] as const)("native flyout keyboard routing (%s
     const choices = content.flyout.commands.filter(command => command.enabled);
     const hidesBeforeActivation = native.hide.mock.calls.length;
     expect(highlighted()).toBeNull();
-    expect(native.show).toHaveBeenLastCalledWith("preserve", "flyout");
+    const flyoutOpening = { toolsetId: content.toolsetId, flyoutId: content.flyout.flyoutId,
+      openedAt: content.openedAt, generation: content.generation };
+    expect(native.show).toHaveBeenLastCalledWith("preserve", "flyout", flyoutOpening);
     expect(document.activeElement).toBe(canvas);
     expect((await key("ArrowDown")).defaultPrevented).toBe(true);
     expect(highlighted()?.dataset.commandId).toBe(choices[0].id);
@@ -284,7 +286,7 @@ describe.each(["macos", "windows"] as const)("native flyout keyboard routing (%s
     expect((await key(activation)).defaultPrevented).toBe(true);
     expect((await key(activation, { repeat: true })).defaultPrevented).toBe(true);
     expect((await key(activation, {}, "keyup")).defaultPrevented).toBe(true);
-    expect(sendPaletteCommand).toHaveBeenCalledExactlyOnceWith(choices[0].id);
+    expect(sendPaletteCommand).toHaveBeenCalledExactlyOnceWith(choices[0].id, { flyoutOpening });
     expect(native.hide).toHaveBeenCalledTimes(hidesBeforeActivation + 1);
     expect(current()).toBe(before);
     // A queued IPC activation and stale startup replay cannot invoke or reopen it.
@@ -308,7 +310,8 @@ describe.each(["macos", "windows"] as const)("native flyout keyboard routing (%s
       { id: "tool.cyclopentane", title: "Last", enabled: true, active: false }
     ] };
     // A changed snapshot is a fresh opening; an identical opening identity is a replay.
-    await act(async () => setToolsetPopoverContent(opened.toolsetId, { ...opened, ...newToolsetPopoverOpening(), flyout }));
+    const timing = newToolsetPopoverOpening();
+    await act(async () => setToolsetPopoverContent(opened.toolsetId, { ...opened, ...timing, flyout }));
     expect(host.querySelector<HTMLButtonElement>('[data-test-popover] [data-command-id="tool.cyclobutane"]')?.disabled).toBe(true);
     await key("ArrowLeft"); expect(highlighted()?.dataset.commandId).toBe("tool.cyclopentane");
     await key("ArrowRight"); expect(highlighted()?.dataset.commandId).toBe("tool.cyclopropane");
@@ -318,7 +321,9 @@ describe.each(["macos", "windows"] as const)("native flyout keyboard routing (%s
       openedAt: opened.openedAt! - 1, key: "Enter" }));
     expect(sendPaletteCommand).not.toHaveBeenCalled();
     await key(" ");
-    expect(sendPaletteCommand).toHaveBeenCalledExactlyOnceWith("tool.cyclopentane");
+    expect(sendPaletteCommand).toHaveBeenCalledExactlyOnceWith("tool.cyclopentane", {
+      flyoutOpening: { toolsetId: opened.toolsetId, flyoutId: flyout.flyoutId, ...timing }
+    });
     expect(document.activeElement).toBe(canvas);
     expect(native.focus).not.toHaveBeenCalled();
   });

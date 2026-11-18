@@ -62,7 +62,9 @@ describe.each(["macos", "windows"] as const)("native multiple-bond flyout on %s"
     expect(menu.querySelectorAll('[role="menuitem"]')).toHaveLength(id === "tool.wavyBond" ? 6 : 3);
     const button = menu.querySelector<HTMLButtonElement>(`[data-command-id="${id}"]`)!;
     await act(async () => { button.click(); button.click(); });
-    expect(native.command).toHaveBeenCalledExactlyOnceWith(id);
+    expect(native.command).toHaveBeenCalledExactlyOnceWith(id, {
+      flyoutOpening: expect.objectContaining({ toolsetId: "core.main", openedAt: expect.any(Number) })
+    });
     expect(native.hide).toHaveBeenCalledTimes(1);
   });
 
