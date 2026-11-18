@@ -47,6 +47,23 @@ describe("binary CDX headers and reference codec cases", () => {
     ]));
   });
 
+  it("keeps invalid Long tags on their source pages and root tags on the first page", () => {
+    // The value precedes its type, so the reader retains it as raw text before seeing Long.
+    const tag = (id: number) => object(0x8011, id, property(0x0d05, [1, 2, 3]), property(0x0d00, u16(2)));
+    const imported = importCdx(file(tag(10), object(0x8001, 1, tag(11)), object(0x8001, 2, object(0x8002, 3, tag(12)))));
+    expect(imported.document, JSON.stringify(imported.warnings)).toBeDefined();
+    const pages = imported.document!.pages;
+    expect(pages).toHaveLength(2);
+    const tagIds = (page: typeof pages[number]) => page.objects
+      .filter(object => object.type === "unknown-compatibility-object" && object.sourceObjectType === "objecttag")
+      .map(object => object.compatibility?.originalId);
+    expect(tagIds(pages[0])).toEqual(["10", "11"]);
+    expect(tagIds(pages[1])).toEqual(["12"]);
+    expect(imported.warnings.filter(warning => warning.code === "cdxml.invalid_long_tag")).toHaveLength(3);
+    const afterPageDeletion = { ...imported.document!, pages: pages.filter(page => page.id !== pages[1].id) };
+    expect(afterPageDeletion.pages.flatMap(tagIds)).toEqual(["10", "11"]);
+  });
+
   it.each([false, true])("preserves explicit foreground colour when slot 3 is %s", colored => {
     const palette = element("colortable", {}, [element("color", { r: "1", g: "1", b: "1" }), element("color", { r: colored ? "1" : "0", g: "0", b: "0" })]);
     const decoded = readCdx(writeCdx(element("CDXML", {}, [palette, element("t", { id: "2" }, [element("s", { color: "3" }, [], "text")])])));

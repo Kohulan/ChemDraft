@@ -3,6 +3,7 @@ import type { ChemDraftDocument } from "@chemdraft/chem-core";
 import { ensureSvgFontsLoaded, exportDocumentToSvg } from "@chemdraft/export-engine";
 import { adjustArrangementSpacing, arrangementSpacingRange, arrangementSpacingPreviewBounds } from "./documentWorkflow";
 import { ArrangementSpacingForm } from "./dialogs/ArrangementSpacingForm";
+import { resolveElectronMarksInSelectionTransform } from "./electronMarkDrop";
 
 export function frameArrangementSpacingPreviewSvg(svg: string, pageWidth: number, pageHeight: number): string {
   const padding = Math.max(pageWidth, pageHeight) * 0.025;
@@ -19,9 +20,15 @@ export function frameArrangementSpacingPreviewSvg(svg: string, pageWidth: number
     .replace("</svg>", `<rect data-arrangement-page-boundary="true" x="0" y="0" width="${pageWidth}" height="${pageHeight}" fill="none" stroke="#64748b" stroke-width="1" vector-effect="non-scaling-stroke" />\n</svg>`);
 }
 
+export function checkedArrangementSpacing(source: ChemDraftDocument, factor: number) {
+  const spacing = adjustArrangementSpacing(source, factor);
+  const edit = resolveElectronMarksInSelectionTransform(source, spacing.document);
+  return { document: edit.document, ok: spacing.ok && !edit.refused, status: edit.status ?? spacing.status };
+}
+
 /** Runs only in the document owner; native forms receive previews, never documents. */
 export async function arrangementSpacingPreviewSvg(source: ChemDraftDocument, percent: number): Promise<string> {
-  const result = adjustArrangementSpacing(source, percent / 100);
+  const result = checkedArrangementSpacing(source, percent / 100);
   if (!result.ok) throw new Error(result.status);
   if (!arrangementSpacingPreviewBounds(source)) throw new Error("Select at least two compounds or groups.");
   const pageIndex = source.pages.findIndex(page => page.id === source.selection.pageId);

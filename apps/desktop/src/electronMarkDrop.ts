@@ -1,8 +1,8 @@
 import { applyPatch, applyPatches, nativeDrawingStyleFromObjectStyle,
-  type ChemDraftDocument, type ElectronMarkObject, type MoleculeAtom, type MoleculeObject } from "@chemdraft/chem-core";
+  type ChemDraftDocument, type DocumentObject, type DocumentPatch, type ElectronMarkObject, type MoleculeAtom, type MoleculeObject } from "@chemdraft/chem-core";
 import { atomDisplayLabel, transformPointForObject } from "@chemdraft/layout-engine";
-import { documentDrawingDefaults, nativeAtomChargeSupportsValence, nativeAtomExternalValence, nativeElectronMarkAtomKey,
-  nativeElementFromAtomLabel, phase4Timestamp, type PagePoint } from "@chemdraft/document-workflow-core";
+import { documentDrawingDefaults, nativeAtomChargeSupportsValence, nativeAtomExternalValence, nativeChargeAssociationRadiusPx,
+  nativeElectronMarkAssignments, nativeElectronMarkAtomKey, nativeElementFromAtomLabel, phase4Timestamp, type PagePoint } from "@chemdraft/document-workflow-core";
 import { electronMarkAtomContribution, electronMarkChemistryChanges, findDocumentObject,
   isEditableNativeMoleculeGraph, moveDocumentObject, moveDocumentObjects, nativeChargeMarkCenter,
   nativeChargePlacementPointForAtom, normalizeCommittedDocument, resolveGroupedDocumentObjectIds, type NativeMoleculeDeleteTarget } from "./documentWorkflow";
@@ -38,8 +38,13 @@ interface AtomEndpoint {
 
 function associatedAtom(document: ChemDraftDocument, anchor: ElectronMarkObject["anchor"]): AtomEndpoint | undefined {
   const molecule = anchor.kind === "atom" && anchor.objectId ? findDocumentObject(document, anchor.objectId) : undefined;
-  const atom = molecule?.type === "molecule" ? molecule.atoms.find(atom => atom.id === anchor.atomId) : undefined;
-  return molecule?.type === "molecule" && atom ? { molecule, atom } : undefined;
+  return atomEndpoint(molecule, anchor.atomId);
+}
+
+function atomEndpoint(object: DocumentObject | undefined, atomId: string | undefined): AtomEndpoint | undefined {
+  if (object?.type !== "molecule") return undefined;
+  const atom = object.atoms.find(atom => atom.id === atomId);
+  return atom ? { molecule: object, atom } : undefined;
 }
 
 function label({ molecule, atom }: AtomEndpoint): string {
@@ -130,6 +135,71 @@ export function dropElectronMarksInSelection(
     return [planElectronMarkDrop(document, moved, mark, center, mark.id === release.grabbedObjectId ? release.point : center)];
   });
   return drops.length ? applyElectronMarkDrops(document, moved, drops) : { document: moved };
+}
+
+/** Preserve carried marks and admit independent detachments/transfers as one selection edit. */
+export function resolveElectronMarksInSelectionTransform(
+  document: ChemDraftDocument, transformed: ChemDraftDocument
+): { document: ChemDraftDocument; status?: string; refused?: boolean } {
+  if (transformed === document) return { document };
+  const drops: ElectronMarkDrop[] = [];
+  const preserve: DocumentPatch[] = [];
+  for (const page of document.pages) {
+    const nextPage = transformed.pages.find(candidate => candidate.id === page.id);
+    if (!nextPage || nextPage.objects === page.objects) continue;
+    const marks = page.objects.filter(object => object.type === "electron-mark");
+    if (!marks.length) continue;
+    const objects = new Map(page.objects.map(object => [object.id, object]));
+    const nextObjects = new Map(nextPage.objects.map(object => [object.id, object]));
+    const assignments = nativeElectronMarkAssignments(nextPage).anchorByMarkId;
+    for (const mark of marks) {
+      const next = nextObjects.get(mark.id);
+      if (next?.type !== "electron-mark") continue;
+      const anchor = mark.anchor;
+      const source = anchor.kind === "atom" && anchor.objectId ? atomEndpoint(objects.get(anchor.objectId), anchor.atomId) : undefined;
+      const nextSource = source && atomEndpoint(nextObjects.get(source.molecule.id), source.atom.id);
+      const sameAnchor = next.anchor.kind === anchor.kind && next.anchor.objectId === anchor.objectId && next.anchor.atomId === anchor.atomId;
+      const carried = source && nextSource && nextSource.molecule !== source.molecule && sameAnchor;
+      const center = nativeChargeMarkCenter(next);
+      const previousCenter = nativeChargeMarkCenter(mark);
+      const moved = Math.hypot(center.x - previousCenter.x, center.y - previousCenter.y) > 1e-6;
+      if (carried && next === mark) {
+        // Atom-part transforms can move the atom without emitting a patch for its mark.
+        const from = transformPointForObject(source.molecule, source.atom);
+        const to = transformPointForObject(nextSource.molecule, nextSource.atom);
+        const dx = to.x - from.x, dy = to.y - from.y;
+        if (Math.hypot(dx, dy) > 1e-6) {
+          preserve.push({ op: "updateObject", objectId: mark.id, changes: {
+            x: mark.x + dx, y: mark.y + dy, atomAssociation: "explicit"
+          } });
+          continue;
+        }
+      }
+      if (nextSource && moved && !carried) {
+        // A keyboard nudge or small transform can reposition a mark beside its original atom.
+        // Use the sticky association radius there, and the drag capture radius for a new target.
+        const atomPoint = transformPointForObject(nextSource.molecule, nextSource.atom);
+        const radius = Math.max(nativeChargeAssociationRadiusPx, nativeDrawingStyleFromObjectStyle(nextSource.molecule.style).bondLengthPx * 1.15);
+        if (Math.hypot(center.x - atomPoint.x, center.y - atomPoint.y) > radius) {
+          drops.push(planElectronMarkDrop(document, transformed, mark, center, center));
+          continue;
+        }
+      }
+
+      const assignment = assignments.get(mark.id);
+      const reassigned = assignment?.objectId !== source?.molecule.id || assignment?.atomId !== source?.atom.id;
+      if (reassigned || (source && !sameAnchor)) {
+        // A carried mark may be outside the legacy radius after scaling. A floating mark
+        // may end up beside an atom. Make the existing association explicit in either case.
+        preserve.push({ op: "updateObject", objectId: mark.id, changes: {
+          anchor: source ? anchor : { kind: "point", point: center },
+          atomAssociation: "explicit"
+        } });
+      }
+    }
+  }
+  const prepared = preserve.length ? applyPatches(transformed, preserve, { now: phase4Timestamp }) : transformed;
+  return drops.length ? applyElectronMarkDrops(document, prepared, drops) : { document: prepared };
 }
 
 function applyElectronMarkDrops(

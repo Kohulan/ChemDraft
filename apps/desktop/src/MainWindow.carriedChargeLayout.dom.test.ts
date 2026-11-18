@@ -73,6 +73,39 @@ describe.each(["macos", "windows"] as const)("toolbar charge layout (%s)", platf
     await act(async () => window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId } })));
   }
 
+  function expectDissociatedCharge(before: ChemDraftDocument, after: ChemDraftDocument, markId: string) {
+    const beforeObjects = before.pages[0].objects;
+    const afterObjects = after.pages[0].objects;
+    const originalMark = beforeObjects.find((object): object is ElectronMarkObject =>
+      object.type === "electron-mark" && object.id === markId)!;
+    const molecules = beforeObjects.filter(object => object.type === "molecule");
+    const [source, other] = molecules;
+    const [nitrogen, ...otherAtoms] = source.atoms;
+    expect(originalMark.anchor).toMatchObject({ kind: "atom", objectId: source.id, atomId: nitrogen.id });
+    expect(nitrogen).toMatchObject({ formalCharge: 1, markCharge: 1 });
+    expect(source.chemistry).toMatchObject({ totalCharge: 1, formula: "C2H6NO2" });
+
+    const neutral = afterObjects.find((object): object is MoleculeObject =>
+      object.type === "molecule" && object.id === source.id)!;
+    const { markCharge: _markCharge, ...originalNitrogen } = nitrogen;
+    expect(neutral.atoms).toEqual([{ ...originalNitrogen, formalCharge: 0 }, ...otherAtoms]);
+    expect(neutral.bonds).toEqual(source.bonds);
+    expect(neutral.chemistry).toMatchObject({ totalCharge: 0, formula: "C2H5NO2" });
+    expect(afterObjects.find(object => object.id === other.id)).toEqual(other);
+    const otherMark = beforeObjects.find(object => object.type === "electron-mark" && object.anchor.objectId === other.id)!;
+    expect(afterObjects.find(object => object.id === otherMark.id)).toEqual(otherMark);
+
+    const movedMark = afterObjects.find((object): object is ElectronMarkObject =>
+      object.type === "electron-mark" && object.id === markId)!;
+    expect(movedMark).toMatchObject({
+      markKind: "charge", charge: 1, atomAssociation: "explicit",
+      anchor: { kind: "point", point: workflow.nativeChargeMarkCenter(movedMark) }
+    });
+    expect(movedMark.x).not.toBe(originalMark.x);
+    expect(container.querySelector("[data-status-message]")?.textContent).toBe("Charge removed from N (N now H2N)");
+    return movedMark;
+  }
+
   async function changeSpacing() {
     await command("layout.adjustArrangementSpacing");
     const slider = container.querySelector<HTMLInputElement>('.arrangement-spacing-dialog input[type="range"]')!;
@@ -86,7 +119,7 @@ describe.each(["macos", "windows"] as const)("toolbar charge layout (%s)", platf
     await act(async () => container.querySelector<HTMLButtonElement>('.arrangement-spacing-dialog button[type="submit"]')!.click());
   }
 
-  it.each(["arrange", "spacing"])("warns and keeps independent explicit-mark movement through %s", async operation => {
+  it.each(["arrange", "spacing"])("dissociates an independently moved explicit charge through %s and reports it", async operation => {
     let initialDocument = twoGlycinesAndArrow();
     const objects = initialDocument.pages[0].objects;
     const mark = objects.find(object => object.type === "electron-mark")!;
@@ -98,12 +131,7 @@ describe.each(["macos", "windows"] as const)("toolbar charge layout (%s)", platf
     if (operation === "arrange") await command("layout.arrange.row");
     else await changeSpacing();
     const after = snapshot();
-    expect(container.querySelector("[data-status-message]")?.textContent).toContain("the mark is moving independently");
-    expect(after.pages[0].objects.filter(object => object.type === "molecule")
-      .map(molecule => molecule.atoms[0].formalCharge)).toEqual([0, 1]);
-    const movedMark = after.pages[0].objects.find(object => object.id === mark.id)!;
-    expect(movedMark).toMatchObject({ anchor: { kind: "point" } });
-    expect(movedMark.x).not.toBe(mark.x);
+    const movedMark = expectDissociatedCharge(before, after, mark.id);
     // Both operations retain their translation-only policy; the unselected molecules stay put.
     expect(after.pages[0].objects.filter(object => object.type === "molecule").map(({ x, y }) => ({ x, y })))
       .toEqual(before.pages[0].objects.filter(object => object.type === "molecule").map(({ x, y }) => ({ x, y })));
@@ -219,31 +247,25 @@ describe.each(["macos", "windows"] as const)("toolbar charge layout (%s)", platf
       expect(snapshot().pages).toEqual(after.pages);
     });
 
-  it("warns when an ordinary charge loses its association during independent alignment", async () => {
-    let initialDocument = twoGlycinesAndArrow(false);
+  it.each([
+    { association: "ordinary", distant: false },
+    { association: "explicit", distant: true }
+  ])("dissociates an independently aligned $association charge and reports it", async ({ distant }) => {
+    let initialDocument = twoGlycinesAndArrow(distant);
     const objects = initialDocument.pages[0].objects;
     const mark = objects.find(object => object.type === "electron-mark")!;
-    initialDocument = workflow.selectDocumentObjects(initialDocument, initialDocument.pages[0].id, [mark.id, objects[objects.length - 1].id]);
+    const arrow = objects[objects.length - 1];
+    initialDocument = workflow.selectDocumentObjects(initialDocument, initialDocument.pages[0].id, [mark.id, arrow.id]);
     await act(async () => root.render(createElement(MainWindow, { initialDocument, initialActiveToolCommandId: "tool.select",
       initialPaletteMode: "hidden", initialRulersVisible: false, initialCrosshairsVisible: false, nativePalette: false, shortcutPlatform: platform })));
+    const before = snapshot();
     await command("layout.alignRight");
-    expect(snapshot().pages[0].objects.filter(object => object.type === "molecule")
-      .map(molecule => molecule.atoms[0].formalCharge)).toEqual([0, 1]);
-    expect(container.querySelector("[data-status-message]")?.textContent).toContain("association");
-    expect(container.querySelector("[data-status-message]")?.textContent).toContain(mark.id);
-  });
-
-  it("warns when aligning a selected mark independently of its unselected molecule", async () => {
-    let initialDocument = twoGlycinesAndArrow();
-    const objects = initialDocument.pages[0].objects;
-    const mark = objects.find(object => object.type === "electron-mark")!;
-    initialDocument = workflow.selectDocumentObjects(initialDocument, initialDocument.pages[0].id, [mark.id, objects[objects.length - 1].id]);
-    await act(async () => root.render(createElement(MainWindow, { initialDocument, initialActiveToolCommandId: "tool.select",
-      initialPaletteMode: "hidden", initialRulersVisible: false, initialCrosshairsVisible: false, nativePalette: false, shortcutPlatform: platform })));
-    await command("layout.alignRight");
-    expect(container.querySelector("[data-status-message]")?.textContent).toContain("the mark is moving independently");
-    expect(snapshot().pages[0].objects.filter(object => object.type === "molecule")
-      .map(molecule => molecule.atoms[0].formalCharge)).toEqual([0, 1]);
+    const after = snapshot();
+    const movedMark = expectDissociatedCharge(before, after, mark.id);
+    const afterObjects = after.pages[0].objects;
+    const markBounds = workflow.selectionBounds(afterObjects, [movedMark.id])!;
+    const arrowBounds = workflow.selectionBounds(afterObjects, [arrow.id])!;
+    expect(markBounds.x + markBounds.width).toBeCloseTo(arrowBounds.x + arrowBounds.width);
   });
 
   it.each(operations)("keeps two explicit distant +1 marks through Select All / $commandId ($mode), undo and redo", async ({ commandId, mode }) => {

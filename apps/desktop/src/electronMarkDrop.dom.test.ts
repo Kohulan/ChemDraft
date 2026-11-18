@@ -616,13 +616,80 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
     await command("edit.redo"); expect(snapshot()).toEqual(attached);
   });
 
-  async function mountMarkAndTextSelection(drawing: ChemDraftDocument) {
+  async function mountMarkAndTextSelection(drawing: ChemDraftDocument, addThirdObject = false) {
     const mark = dropMark(drawing), pageId = drawing.pages[0].id;
     const text = createNativeTextObject(drawing, { x: 120, y: 125 }, "Caption");
-    const withText = applyPatch(drawing, { op: "addObject", pageId, object: text }, { now: phase4Timestamp });
-    await mount(workflow.selectDocumentObjects(withText, pageId, [mark.id, text.id]));
+    let withText = applyPatch(drawing, { op: "addObject", pageId, object: text }, { now: phase4Timestamp });
+    const selected = [mark.id, text.id];
+    if (addThirdObject) {
+      const other = createNativeTextObject(withText, { x: 620, y: 300 }, "Another caption");
+      withText = applyPatch(withText, { op: "addObject", pageId, object: other }, { now: phase4Timestamp });
+      selected.push(other.id);
+    }
+    await mount(workflow.selectDocumentObjects(withText, pageId, selected));
     return { mark, text, before: snapshot() };
   }
+
+  const selectionCommands = {
+    "rotate 90°": "layout.rotate90", flip: "layout.flipHorizontal", align: "layout.alignLeft", distribute: "layout.distributeHorizontal"
+  } as const;
+  const selectionTransforms = ["resize", "rotate handle", "rotate 90°", "flip", "align", "distribute", "nudge"] as const;
+  const nitrogenFixtures = [
+    { molecule: "four-bond N+", fixture: fourBondNitrogenElectronMarkDropFixture, refused: true },
+    { molecule: "NH4+", fixture: ammoniumElectronMarkDropFixture, refused: false }
+  ];
+  it.each(nitrogenFixtures.flatMap(example => selectionTransforms.map(transform => ({ ...example, transform }))))(
+    "checks a $transform of the $molecule charge and a text box as one edit", async ({ fixture, refused, transform }) => {
+      const { document, nitrogen } = fixture();
+      const original = dropMark(document);
+      const drawing = transform === "nudge" ? applyPatch(document, { op: "updateObject", objectId: original.id, changes: {
+        x: nitrogen.x + 22 - original.width / 2, y: nitrogen.y + 9 - original.height / 2
+      } }, { now: phase4Timestamp }) : document;
+      const { before, mark, text } = await mountMarkAndTextSelection(drawing, transform === "distribute");
+      expect(dropMark(before).anchor.atomId).toBe(nitrogen.id);
+      let undoLabel: string | undefined;
+      if (transform === "resize" || transform === "rotate handle") {
+        const frame = container.querySelector<HTMLElement>("[data-group-selection]")!;
+        const frameNumber = (key: "left" | "top" | "width" | "height") => Number(/calc\(([-\d.]+)px/.exec(frame.style[key])![1]);
+        const left = frameNumber("left"), top = frameNumber("top"), width = frameNumber("width"), height = frameNumber("height");
+        const center = { x: left + width / 2, y: top + height / 2 };
+        const resize = transform === "resize";
+        const handle = frame.querySelector(resize ? '[data-object-resize-corner="top-right"]' : "[data-group-rotate-handle]")!;
+        const start = resize ? { x: left + width, y: top } : { x: center.x, y: top - 20 };
+        const end = resize ? { x: center.x + width, y: center.y - height } : { x: center.x + height, y: center.y };
+        await act(async () => pointer(handle, "pointerdown", start));
+        await move(page(), end);
+        if (refused) expect(snapshot()).toEqual(before);
+        await act(async () => pointer(page(), "pointerup", end));
+        undoLabel = resize ? "Resize selection" : "Rotate selection";
+      } else if (transform === "nudge") {
+        await act(async () => page().dispatchEvent(new KeyboardEvent("keydown", {
+          key: "ArrowDown", shiftKey: true, bubbles: true, cancelable: true
+        })));
+        undoLabel = "Move";
+      } else {
+        await command(selectionCommands[transform]);
+      }
+
+      const after = snapshot();
+      if (refused) {
+        expect(status()).toBe("Cannot move Charge from N: N cannot carry formal charge 0 with bond/radical valence 4");
+        expect(after).toEqual(before);
+        expect(container.querySelector("main")?.getAttribute("data-can-undo")).toBe("false");
+      } else {
+        expect(dropMark(after)).toMatchObject({ id: mark.id, anchor: { kind: "point" }, atomAssociation: "explicit" });
+        expect(dropMolecule(after).atoms[0]).toMatchObject({ formalCharge: 0 });
+        expect(labels()[0]).toBe("NH3");
+        expect(status()).toBe("Charge removed from N (N now NH3)");
+        if (transform !== "align" && transform !== "distribute") expect(workflow.findDocumentObject(after, text.id)).not.toEqual(text);
+        if (undoLabel) await exactUndoRedo(before, after, undoLabel);
+        else {
+          await command("edit.undo"); expect(snapshot()).toEqual(before);
+          await command("edit.redo"); expect(snapshot()).toEqual(after);
+        }
+      }
+    }
+  );
 
   it("refuses a charge and text drag off a four-bond N as a unit", async () => {
     const { document } = fourBondNitrogenElectronMarkDropFixture();
