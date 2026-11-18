@@ -145,10 +145,11 @@ are none. This workflow supplies the Windows artifacts only.
    `ChemDraft_X.Y.Z_amd64.AppImage` with their five adjacent `.build.json` files. The
    [Linux workflow](linux.md#releasing) builds and records both packages and uploads them to the
    existing draft after smoke tests pass when `upload_to_release` is supplied. Otherwise download
-   `linux-release-amd64` and upload the packages and records. Then pass the
+   `linux-release-amd64` and upload the packages, records, and `SHA256SUMS-linux.txt`. Then pass the
    [joint release body check](three-builds.md) with the tag and explicit gaps or `--no-gaps`.
    Add `## Linux` notes and any Linux feature gaps manually to the generated body; the generator
-   currently creates only the macOS and Windows sections. After all five artifacts pass review,
+   currently creates only the macOS and Windows sections. When adding a Linux gap, adjust the generated
+   Platform differences note by hand to reflect it. After all five artifacts pass review,
    **as the last step before un-drafting on a Mac** run both
    `verify-macos-app.mjs --release --dmg` checks and
    `node tools/release/check-release-assets.mjs --tag vX.Y.Z --commit <full-sha>` against GitHub,

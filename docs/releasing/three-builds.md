@@ -28,7 +28,7 @@ the [local-only unsigned stable escape](macos-updates.md#local-unsigned-stable-r
 Those builds must never be published, even if subsequently signed or given matching build records.
 The [Linux workflow](linux.md#releasing) builds and records both Linux packages. After smoke tests
 pass, it uploads them to the existing draft when `upload_to_release` is set; otherwise download
-`linux-release-amd64` and upload the packages and records to the draft.
+`linux-release-amd64` and upload the packages, records, and `SHA256SUMS-linux.txt` to the draft.
 The Windows workflow records source identity in the clean checkout and updates the hash and size
 **after Authenticode signing**, retaining the recorded source identity. Any later byte change requires
 a new record and new updater signatures/feeds.
@@ -45,10 +45,13 @@ node tools/release/draft-release-body.mjs --version X.Y.Z --tag vX.Y.Z --assets 
 
 Use `--no-gaps` only after explicitly checking feature parity. Otherwise replace it with one or
 more `--gap "macos:feature and reason"`, `--gap "macos-intel:feature and reason"`, or
-`--gap "windows:feature and reason"`. Neither choice, or both choices together, is an error.
+`--gap "windows:feature and reason"`. The tool requires at least one valid `--gap` or
+`--no-gaps`; it rejects omitting both, using both together, and gaps with an unrecognized platform or empty,
+whitespace-only, or multiline text.
 The generator writes the macOS and Windows sections. Add a `## Linux` section manually to the
 generated body before setting it on the draft, including Linux notes and any feature gaps and reasons.
-The generator does not accept a Linux `--gap` or generate that section. Review the resulting body
+The generator does not accept a Linux `--gap` or generate that section. When adding a Linux gap,
+adjust the generated Platform differences note by hand to reflect it. Review the resulting body
 and its Platform differences note for all three platforms.
 Without `--assets`, the current directory is checked; without `--out`, the body goes to stdout.
 
