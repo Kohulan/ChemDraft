@@ -50,7 +50,8 @@ The workflow:
    combined checksums.
 
 The [release body generator](three-builds.md#draft-the-body-on-macos) adds `## Linux` when both
-packages and their records are present. To draft the section before uploading them, pass `--include-linux`.
+packages and their records are present and verified. Passing `--include-linux` requires that complete
+verified set in the assets directory.
 
 ## Ubuntu smoke diagnostics
 

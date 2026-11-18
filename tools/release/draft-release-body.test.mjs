@@ -46,10 +46,14 @@ test("five-build release includes a Linux beta section and accepts Linux gaps", 
     /^## Linux\n\nLinux support is in beta\.\n\nNot in this build: Feature A: reason\n\nPlatform differences: See/m);
 });
 
-test("Linux section can be requested explicitly without packages", (t) => {
+test("requesting a Linux section without packages fails", (t) => {
   const args = fixture(t, { withLinux: false });
   assert.doesNotMatch(draft(args), /^## Linux$/m);
-  assert.match(draft({ ...args, includeLinux: true }), /^## Linux\n\nLinux support is in beta\./m);
+  assert.throws(() => draft({ ...args, includeLinux: true }), /--include-linux requires both verified Linux packages/);
+});
+
+test("requesting a Linux section succeeds with the complete verified set", (t) => {
+  assert.match(draft({ ...fixture(t), includeLinux: true }), /^## Linux\n\nLinux support is in beta\./m);
 });
 
 test("requesting a Linux section still requires a complete set when packages are present", (t) => {
@@ -105,7 +109,7 @@ test("missing version and notes are named", (t) => {
 test("invalid gap is rejected", (t) => {
   const args = { ...fixture(t, { withLinux: false }), noGaps: false };
   assert.throws(() => draft({ ...args, gaps: ["linux:feature"] }), /Invalid gap/);
-  assert.throws(() => draft({ ...args, includeLinux: true, gaps: ["other:feature"] }), /Invalid gap/);
+  assert.throws(() => draft({ ...fixture(t), noGaps: false, includeLinux: true, gaps: ["other:feature"] }), /Invalid gap/);
 });
 
 for (const [field, value, message] of [

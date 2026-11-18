@@ -5,7 +5,8 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { spawnSync } from "node:child_process";
 import { dmgArchitecture, parseAppcast } from "./macos-appcast.mjs";
-import { expectedReleaseCommit, verifyBuildAssets } from "./release-assets.mjs";
+import { expectedReleaseCommit, releaseBuildFiles, verifyBuildAssets } from "./release-assets.mjs";
+import { LINUX_BUILD_TARGET } from "./record-build.mjs";
 import { verifyDmgCommit } from "./verify-macos-feed.mjs";
 
 const ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
@@ -29,6 +30,9 @@ export function draftReleaseBody({ version, commit, tag = `v${version}`, assets 
   let builds = [];
   try { builds = verifyBuildAssets({ assets, version, expectedCommit }, { checkDmgCommit, updaterPublicKey }); }
   catch (error) { errors.push(error.message); }
+  if (includeLinux && !errors.length && releaseBuildFiles(version).filter(({ target }) => target === LINUX_BUILD_TARGET).some(({ name }) => !builds.includes(name))) {
+    errors.push("--include-linux requires both verified Linux packages (.deb and AppImage) and their .build.json records");
+  }
   for (const name of [platforms[0].dmg, platforms[1].dmg, installer, `${installer}.sig`, "latest.json"]) {
     try { if (!statSync(join(assets, name)).isFile()) throw new Error(); }
     catch { errors.push(`Missing release file: ${name}`); }

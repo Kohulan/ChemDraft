@@ -63,8 +63,8 @@ more `--gap "macos:feature and reason"`, `--gap "macos-intel:feature and reason"
 `--gap "windows:feature and reason"`. Use `--gap "linux:feature and reason"` when the Linux section
 is included. The tool requires at least one valid `--gap` or `--no-gaps` and rejects using both
 together. A gap must name a platform and provide single-line text.
-The generator includes `## Linux` when both Linux packages and records are present or when you
-pass `--include-linux` to draft the section ahead of uploads. Add any release-specific Linux notes
+The generator includes `## Linux` when both Linux packages and records are present and verified.
+Passing `--include-linux` requires that complete verified set. Add any release-specific Linux notes
 to that section and review the Platform differences note before setting the body on the draft.
 Without `--assets`, the current directory is checked; without `--out`, the body goes to stdout.
 
