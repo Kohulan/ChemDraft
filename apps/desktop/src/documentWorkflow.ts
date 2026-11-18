@@ -12647,27 +12647,7 @@ export function rotateDocumentObject(
   }
 
   if (object.type === "molecule" && object.atoms.length > 0) {
-    const center = nativeMoleculeCenter(object);
-    const angleRadians = (object.rotation + angleDegrees) * Math.PI / 180;
-    const atoms = object.atoms.map((atom) => ({
-      ...atom,
-      ...rotatePointAround(atom, center, angleRadians)
-    }));
-    const transform = nativeMoleculeTransformState(object);
-    const nextMolecule = withNativeMoleculeTransform(refreshNativeCyclicDoubleBondSides(normalizeNativeMoleculeGeometry({
-      ...object,
-      rotation: 0,
-      atoms
-    })), {
-      ...transform,
-      rotationDegrees: transform.rotationDegrees + angleDegrees
-    });
-
-    return applyPatch(
-      document,
-      { op: "updateObject", objectId, changes: nextMolecule },
-      { now: phase4Timestamp }
-    );
+    return rotateNativeMoleculeObjectAroundPoint(document, objectId, nativeMoleculeCenter(object), angleDegrees);
   }
 
   if (isNativeOrbitalLobe(object)) {
@@ -12727,39 +12707,16 @@ export function rotateNativeMoleculeObjectAroundPoint(
   center: PagePoint,
   angleDegrees: number
 ): ChemDraftDocument {
-  const page = pageContainingObject(document, objectId);
-  const molecule = moleculeOnPage(page, objectId);
-  if (!page || !molecule || molecule.atoms.length === 0 || Math.abs(angleDegrees) < 0.05) {
-    return document;
-  }
-
-  const angleRadians = (molecule.rotation + angleDegrees) * Math.PI / 180;
-  const atoms = molecule.atoms.map((atom) => ({
-    ...atom,
-    ...rotatePointAround(atom, center, angleRadians)
-  }));
-  const transform = nativeMoleculeTransformState(molecule);
-  const nextMolecule = withNativeMoleculeTransform(refreshNativeCyclicDoubleBondSides(normalizeNativeMoleculeGeometry({
-    ...molecule,
-    rotation: 0,
-    atoms
-  })), {
-    ...transform,
-    rotationDegrees: transform.rotationDegrees + angleDegrees
-  });
-
-  return applyPatch(
-    document,
-    { op: "updateObject", objectId, changes: nextMolecule },
-    { now: phase4Timestamp }
-  );
+  const patches = rotateNativeMoleculeGeometryAroundPointPatches(document, objectId, center, angleDegrees, true);
+  return patches.length ? applyPatches(document, patches, { now: phase4Timestamp }) : document;
 }
 
 function rotateNativeMoleculeGeometryAroundPointPatches(
   document: ChemDraftDocument,
   objectId: string,
   center: PagePoint,
-  angleDegrees: number
+  angleDegrees: number,
+  persistTransform = false
 ): DocumentPatch[] {
   const page = pageContainingObject(document, objectId);
   const molecule = moleculeOnPage(page, objectId);
@@ -12768,7 +12725,7 @@ function rotateNativeMoleculeGeometryAroundPointPatches(
   }
 
   const angleRadians = (molecule.rotation + angleDegrees) * Math.PI / 180;
-  const nextMolecule = refreshNativeCyclicDoubleBondSides(normalizeNativeMoleculeGeometry({
+  let nextMolecule = refreshNativeCyclicDoubleBondSides(normalizeNativeMoleculeGeometry({
     ...molecule,
     rotation: 0,
     atoms: molecule.atoms.map((atom) => ({
@@ -12776,6 +12733,10 @@ function rotateNativeMoleculeGeometryAroundPointPatches(
       ...rotatePointAround(atom, center, angleRadians)
     }))
   }));
+  if (persistTransform) {
+    const transform = nativeMoleculeTransformState(molecule);
+    nextMolecule = withNativeMoleculeTransform(nextMolecule, { ...transform, rotationDegrees: transform.rotationDegrees + angleDegrees });
+  }
   // The atoms above bake in any residual frame rotation (`molecule.rotation + angleDegrees`),
   // but a mark's stored x/y is already absolute page geometry — it turns by the requested angle
   // only, or a legacy molecule with a nonzero frame rotation would fling its marks past the turn
@@ -13269,26 +13230,8 @@ export function resizeNativeMoleculeObject(
     return document;
   }
 
-  const center = objectCenter(molecule);
-  const transform = nativeMoleculeTransformState(molecule);
-  const resized = withMeasuredNativeMoleculeBondLength(withNativeMoleculeTransform(normalizeNativeMoleculeGeometry({
-    ...molecule,
-    atoms: molecule.atoms.map((atom) => ({
-      ...atom,
-      x: center.x + (atom.x - center.x) * scaleX,
-      y: center.y + (atom.y - center.y) * scaleY
-    }))
-  }), {
-    ...transform,
-    scaleX: transform.scaleX * scaleX,
-    scaleY: transform.scaleY * scaleY
-  }));
-
-  return applyPatch(
-    document,
-    { op: "updateObject", objectId, changes: resized },
-    { now: phase4Timestamp }
-  );
+  const patches = scaleNativeMoleculeObjectAroundPointPatches(document, objectId, objectCenter(molecule), scaleX, scaleY);
+  return applyPatches(document, patches, { now: phase4Timestamp });
 }
 
 // ---------------------------------------------------------------------------
@@ -14052,7 +13995,7 @@ export function moveCanvasSelection(
   const ids = page ? resolveGroupedDocumentObjectIds(page.objects, document.selection.objectIds)
     .filter(id => !fragmentIds.has(id)) : [];
   let moved = document;
-  if (ids.length > 1) moved = moveDocumentObjects(moved, ids, delta.x, delta.y);
+  if (ids.length > 1) moved = moveDocumentObjects(moved, ids, delta.x, delta.y, { preserveCarriedMarkAnchors: true });
   else if (ids.length === 1) {
     const object = objectOnPage(page, ids[0]);
     if (object) moved = moveDocumentObject(moved, object.id, { x: object.x + delta.x, y: object.y + delta.y });
@@ -14193,7 +14136,7 @@ function selectionLayoutItemMoves(
  * document per object — quadratic for a large selection.
  */
 function applyLayoutItemMoves(
-  document: ChemDraftDocument, moves: readonly LayoutItemMove[], warningsOut?: string[]
+  document: ChemDraftDocument, moves: readonly LayoutItemMove[], warningsOut?: string[] | null
 ): ChemDraftDocument {
   const combined = new Map<string, LayoutItemMove>();
   for (const move of moves) {
@@ -14209,7 +14152,7 @@ function applyLayoutItemMoves(
   const objects = objectByIdIndex(selectionPage(document).objects);
   // Commit reconciliation also visits stationary units. Report stale explicit anchors even
   // when their unit is an outer distribution anchor or already sits on the alignment edge.
-  if (combined.size > 0) {
+  if (warningsOut !== null && combined.size > 0) {
     const page = selectionPage(document);
     const selectedIds = expandWithAnchoredMarkIds(page.objects,
       resolveGroupedDocumentObjectIds(page.objects, document.selection.objectIds));
@@ -14232,7 +14175,7 @@ function applyLayoutItemMoves(
     // Carried pairs retain their atom identity under one translation, including unselected ordinary
     // marks. Independent translations keep the existing association policy.
     const explicitAtomMark = object?.type === "electron-mark" && object.atomAssociation === "explicit" && object.anchor.kind === "atom";
-    if (explicitAtomMark && !carriedTogether) {
+    if (warningsOut !== null && explicitAtomMark && !carriedTogether) {
       const molecule = object.anchor.objectId ? objects.get(object.anchor.objectId) : undefined;
       if (molecule?.type === "molecule" && molecule.atoms.some(atom => atom.id === object.anchor.atomId)) {
         const warning = `Cannot preserve explicit electron mark "${object.id}" association: the mark is moving independently of molecule "${molecule.id}".`;
@@ -14247,6 +14190,8 @@ function applyLayoutItemMoves(
   });
   if (patches.length === 0) return document;
   const next = applyPatches(document, patches, { now: phase4Timestamp });
+  // The canvas commands request geometry only and run the electron-mark drop checks themselves.
+  if (warningsOut === null) return next;
   // Ask the existing assignment resolver what this movement will do at commit. This is a
   // warning only: do not reconcile or alter chemistry here. Explicit marks were reported above.
   const beforeAssignments = nativeElectronMarkAssignments(selectionPage(document)).anchorByMarkId;
@@ -14421,7 +14366,7 @@ function arrangementItem(pageObjects: readonly DocumentObject[], ids: readonly s
 export function alignSelectedDocumentObjects(
   document: ChemDraftDocument,
   mode: DocumentAlignMode,
-  warningsOut?: string[]
+  warningsOut?: string[] | null
 ): ChemDraftDocument {
   const page = selectionPage(document);
   const units = selectionLayoutUnits(document);
@@ -14453,7 +14398,7 @@ export function distributeSelectedDocumentObjects(
   document: ChemDraftDocument,
   axis: DocumentDistributeAxis,
   mode: DocumentDistributeMode = "centers",
-  warningsOut?: string[]
+  warningsOut?: string[] | null
 ): ChemDraftDocument {
   const page = selectionPage(document);
   const units = selectionLayoutUnits(document);

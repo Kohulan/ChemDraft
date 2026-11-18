@@ -4,7 +4,8 @@ import { atomDisplayLabel, moleculeLayoutLabelBoxes, transformPointForObject } f
 import { documentDrawingDefaults, nativeAtomBondOrderUsage, nativeImplicitHydrogenCount, phase4Timestamp,
   stereoPerceptionMolfile, type PagePoint } from "@chemdraft/document-workflow-core";
 import * as workflow from "./documentWorkflow";
-import { dropElectronMark, dropElectronMarksInSelection, electronMarkDropTarget, ELECTRON_MARK_DROP_CAPTURE_BOND_LENGTHS } from "./electronMarkDrop";
+import { dropElectronMark, dropElectronMarksInSelection, electronMarkDropTarget, ELECTRON_MARK_DROP_CAPTURE_BOND_LENGTHS,
+  resolveElectronMarksInSelectionTransform } from "./electronMarkDrop";
 import { ammoniumElectronMarkDropFixture, distantAttachedElectronMarkFixture, dropMark, dropMolecule,
   electronMarkDropFixture, fourBondNitrogenElectronMarkDropFixture, rotatedElectronMarkDropFixture } from "./testSupport/electronMarkDropFixture";
 import { associationSpecs } from "./testSupport/electronMarkMainParity";
@@ -30,6 +31,49 @@ function atomDropState(document: ChemDraftDocument, atomId: string) {
     hydrogens: nativeImplicitHydrogenCount(element, nativeAtomBondOrderUsage(atom.id, molecule.bonds, molecule.atoms), atom.formalCharge, atom.markRadicals),
     label: atomDisplayLabel(atom, molecule.bonds, undefined, molecule.atoms) };
 }
+
+describe("selection transform admission", () => {
+  it.each([false, true])("checks a scale that lands on another atom (four bonds: %s)", fourBonds => {
+    const fixture = fourBonds ? fourBondNitrogenElectronMarkDropFixture() : electronMarkDropFixture();
+    const { document } = fixture;
+    const target = fourBonds ? fixture.saturatedCarbon : fixture.carbonylOxygen;
+    const mark = dropMark(document);
+    const center = workflow.nativeChargeMarkCenter(mark);
+    const pivot = { x: 2 * center.x - target.x, y: 2 * center.y - target.y };
+    const scaled = workflow.scaleDocumentObjectsAroundPoint(document, [mark.id], pivot, 2, 2);
+    const result = resolveElectronMarksInSelectionTransform(document, scaled);
+    expect(result.status).toBe(drop(document, target).status);
+    if (fourBonds) {
+      expect(result.refused).toBe(true);
+      expect(result.document).toBe(document);
+      expect(atomDropState(result.document, target.id).charge).toBe(0);
+    } else {
+      expect(result.refused).toBeUndefined();
+      expect(dropMark(result.document)).toMatchObject({ anchor: { kind: "atom", atomId: target.id }, width: 2 * mark.width });
+      expect(atomDropState(result.document, target.id).charge).toBe(1);
+      expect(atomDropState(result.document, fixture.nitrogen.id).charge).toBe(0);
+    }
+  });
+
+  it.each(["single", "group"])("carries an attached ammonium charge outside the old radius during %s resize", mode => {
+    const { document } = ammoniumElectronMarkDropFixture();
+    const molecule = dropMolecule(document), mark = dropMark(document);
+    const center = workflow.nativeChargeMarkCenter(mark);
+    const pivot = molecule.atoms[0];
+    const scaled = mode === "single" ? workflow.resizeNativeMoleculeObject(document, molecule.id, { x: 3, y: 3 })
+      : workflow.scaleDocumentObjectsAroundPoint(document, [molecule.id, mark.id], pivot, 3, 3);
+    const result = resolveElectronMarksInSelectionTransform(document, scaled);
+    const committed = workflow.normalizeCommittedDocument(result.document);
+    const newMark = dropMark(committed);
+    expect(result.status).toBeUndefined();
+    expect(newMark.anchor).toEqual(mark.anchor);
+    expect(newMark.width).toBe(3 * mark.width);
+    const nextAtom = dropMolecule(committed).atoms[0], nextCenter = workflow.nativeChargeMarkCenter(newMark);
+    expect(nextCenter.x - nextAtom.x).toBeCloseTo(3 * (center.x - pivot.x));
+    expect(nextCenter.y - nextAtom.y).toBeCloseTo(3 * (center.y - pivot.y));
+    expect(atomDropState(committed, pivot.id)).toMatchObject({ charge: 1, hydrogens: 4 });
+  });
+});
 
 describe.each([false, true])("electron-mark drops with direct editing %s", enabled => {
   beforeEach(() => {
