@@ -1,3 +1,4 @@
+# Bash by design: Linux-only by nature (CI runners and the AppImage's AppRun), like AGENTS.md section 1's macOS-only exception; the Node rule exists because Windows has no bash.
 # Sourced by the Ubuntu runner's package smoke and its disposable AppRun wrapper.
 
 diagnostic_timeout() {
