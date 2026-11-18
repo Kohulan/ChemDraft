@@ -34,12 +34,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: linux-container-smoke-${{ github.event.pull_request.number || github.run_id }}
+  group: linux-container-smoke-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
-    if: github.event_name == 'pull_request' || (inputs.artifact_run_id == '' && inputs.artifact_name == '')
+    if: inputs.artifact_run_id == '' && inputs.artifact_name == ''
     uses: ./.github/workflows/linux-release.yml
     permissions:
       # The reusable workflow declares an upload job with write permission. Its build job has
