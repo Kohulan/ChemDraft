@@ -16,7 +16,7 @@ const native = vi.hoisted(() => ({
   resized: undefined as undefined | (() => void),
   show: vi.fn(async () => {}), size: vi.fn(async () => {}), invoke: vi.fn(async (_command: string, _args?: Record<string, unknown>) => {}),
   command: vi.fn(async () => {}), closed: vi.fn(async () => {}), flyoutClosed: vi.fn(async () => {}),
-  sendKey: vi.fn(async () => {})
+  sendKey: vi.fn(async (_payload: ToolsetFlyoutKey) => {})
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: native.invoke }));
 vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ hide: async () => {}, setFocus: async () => {} }) }));
@@ -210,24 +210,24 @@ it.each(["before", "after"])("routes keys to a newer same-time flyout when the o
   } finally { stop(); }
 });
 
-it("retires a superseded flyout when the newer close arrives before its content", () => {
+it.each(["rings", "other"])("retires a superseded flyout when the newer %s close arrives before its content", flyoutId => {
   const stop = installNativeFlyoutKeyboard();
+  const replacement = { ...rings, flyout: { ...rings.flyout, flyoutId } };
   try {
     native.content?.({ ...rings, generation: 1 });
     expect(pressFlyoutArrow()).toBe(true);
-    native.receiveClose?.({ ...ringSession, generation: 2 });
+    native.receiveClose?.({ ...ringSession, flyoutId, generation: 2 });
     const routedBeforeContent = pressFlyoutArrow();
-    native.content?.({ ...rings, generation: 2 });
+    native.content?.({ ...replacement, generation: 2 });
     expect([routedBeforeContent, pressFlyoutArrow()]).toEqual([false, false]);
-    native.content?.({ ...rings, generation: 3 });
+    native.content?.({ ...replacement, generation: 3 });
     expect(pressFlyoutArrow()).toBe(true);
   } finally { stop(); }
 });
 
-it.each([
-  { toolsetId: "core.art", flyoutId: "rings" },
-  { toolsetId: "core.main", flyoutId: "other" }
-])("scopes same-time opening and close generations to $toolsetId/$flyoutId", ({ toolsetId, flyoutId }) => {
+it("scopes same-time opening and close generations to each toolset", () => {
+  const { flyoutId } = ringSession;
+  const toolsetId = "core.art";
   const stop = installNativeFlyoutKeyboard();
   try {
     native.content?.({ ...rings, generation: 9 });
@@ -242,6 +242,43 @@ it.each([
     native.content?.(next);
     expect(pressFlyoutArrow()).toBe(true);
     expect(native.sendKey).toHaveBeenLastCalledWith(expect.objectContaining({ toolsetId, flyoutId }));
+  } finally { stop(); }
+});
+
+it("keeps the newer menu when an older menu from the same toolset arrives late", () => {
+  const stop = installNativeFlyoutKeyboard();
+  try {
+    native.content?.({ ...rings, generation: 2 });
+    const delayed = { ...rings, generation: 1, flyout: { ...rings.flyout, flyoutId: "other" } };
+    native.content?.(delayed);
+    expect(pressFlyoutArrow()).toBe(true);
+    expect(native.sendKey).toHaveBeenCalledExactlyOnceWith({ ...ringSession, generation: 2, key: "ArrowDown" });
+  } finally { stop(); }
+});
+
+it("retains the generation through a legacy replay so queued Enter cannot choose from a replacement", async () => {
+  await act(async () => root.render(createElement(PalettePopoverWindow, { toolsetId: rings.toolsetId, kind: "flyout", prewarm: true })));
+  const showContent = native.content!;
+  const stop = installNativeFlyoutKeyboard();
+  try {
+    await act(async () => {
+      for (const opening of [{ ...rings, generation: 2 }, rings]) {
+        showContent(opening);
+        native.content?.(opening);
+      }
+    });
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    const [queuedEnter] = native.sendKey.mock.lastCall!;
+    await act(async () => {
+      const replacement = { ...rings, generation: 3 };
+      showContent(replacement);
+      native.content?.(replacement);
+      native.key?.({ ...ringSession, generation: 3, key: "ArrowDown" });
+    });
+    expect(container.querySelector('[data-keyboard-highlighted="true"]')?.getAttribute("data-command-id")).toBe("ring-0");
+    await act(async () => native.key?.(queuedEnter));
+    expect(native.command).not.toHaveBeenCalled();
+    expect(queuedEnter.generation).toBe(2);
   } finally { stop(); }
 });
 
@@ -267,12 +304,12 @@ it("ignores queued arrow and activation keys from a stale flyout generation", as
   expect(native.command).toHaveBeenCalledExactlyOnceWith("ring-0");
 });
 
-it("retains a newer same-time flyout after a targeted Escape and honors broadcasts", () => {
+it.each([1, undefined])("retains a newer same-time flyout after targeted Escape generation %s and honors broadcasts", generation => {
   const stop = installNativeFlyoutKeyboard();
   const target = { toolsetId: rings.toolsetId, openedAt: 1 };
   try {
     native.content?.({ ...rings, generation: 2 });
-    native.dismiss?.({ requestedAt: 2, reason: "escape", openings: [{ ...target, generation: 1 }] });
+    native.dismiss?.({ requestedAt: 2, reason: "escape", openings: [{ ...target, generation }] });
     expect(pressFlyoutArrow()).toBe(true);
     native.dismiss?.({ requestedAt: 2, reason: "escape", openings: [{ ...target, toolsetId: "core.art", generation: 2 }] });
     expect(pressFlyoutArrow()).toBe(true);

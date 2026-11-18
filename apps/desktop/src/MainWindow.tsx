@@ -19769,6 +19769,7 @@ export function MainWindow({
           : groupObjectIds ? selectDocumentObject(document, selectableObjectId) : document;
         if (selectedDocument !== document) {
           replacePresentDocument(selectedDocument);
+          setStatus(objectSelectionStatusLabel(selectedDocument));
         }
         objectDragRef.current = {
           pointerId: event.pointerId,

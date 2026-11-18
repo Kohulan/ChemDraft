@@ -133,7 +133,8 @@ describe.each(["macos", "windows"] as const)("standalone palette flyout keyboard
     }
     expect(setToolsetPopoverContent).toHaveBeenCalledTimes(1);
     expect(sendToolsetFlyoutKey).toHaveBeenLastCalledWith({
-      toolsetId, flyoutId: content.flyout.flyoutId, openedAt: content.openedAt, key: "ArrowDown"
+      toolsetId, flyoutId: content.flyout.flyoutId, openedAt: content.openedAt,
+      generation: content.generation, key: "ArrowDown"
     });
     expect((await key(activation)).defaultPrevented).toBe(true);
     expect((await key(activation, { repeat: true })).defaultPrevented).toBe(true);

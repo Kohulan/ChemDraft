@@ -6,7 +6,7 @@ import type { ChemDraftDocument } from "@chemdraft/chem-core";
 import { MainWindow } from "./MainWindow";
 import { toggleBracketRepeatUnit } from "./bracketCommands";
 import {
-  applyChargeToolAtNativeAtom, applyChargeToolAtPoint, createPhase4Document,
+  applyChargeToolAtNativeAtom, applyChargeToolAtPoint, createPhase4Document, groupSelectedDocumentObjects,
   insertNativeBracket, insertNativeSingleBondMolecule, selectDocumentObjects
 } from "./documentWorkflow";
 import { MemoryStorage } from "./testSupport/memoryStorage";
@@ -139,6 +139,27 @@ describe.each(["macos", "windows"] as const)("drawing fixes on %s", shortcutPlat
     await pointer(objectVisual(bracket.id), "pointerup", bracket.x, bracket.y + bracket.height / 2);
     expect(snapshot().selection.objectIds).toEqual(ids);
     expect(status()).toBe("Selected 2 objects");
+  });
+
+  it("updates the status when clicking a grouped atom replaces the bracket selection", async () => {
+    let drawing = insertNativeSingleBondMolecule(repeatUnit(), { x: 340, y: 250 });
+    drawing = insertNativeSingleBondMolecule(drawing, { x: 440, y: 250 });
+    const page = drawing.pages[0];
+    const bracket = page.objects.find(object => object.type === "bracket")!;
+    const molecules = page.objects.filter(object => object.type === "molecule");
+    drawing = groupSelectedDocumentObjects(selectDocumentObjects(drawing, page.id, molecules.map(object => object.id)));
+    const group = drawing.pages[0].objects.find(object => object.type === "group")!;
+    await mount(selectDocumentObjects(drawing, page.id, []));
+    await pointer(objectVisual(bracket.id), "pointerdown", bracket.x, bracket.y + bracket.height / 2);
+    await pointer(objectVisual(bracket.id), "pointerup", bracket.x, bracket.y + bracket.height / 2);
+    expect(status()).toBe("Selected bracket");
+
+    const atom = molecules[0].atoms[0];
+    const atomTarget = container.querySelector(`[data-hit-target="atom"][data-atom-id="${atom.id}"]`)!;
+    await pointer(atomTarget, "pointerdown", atom.x, atom.y);
+    await pointer(atomTarget, "pointerup", atom.x, atom.y);
+    expect(snapshot().selection.objectIds).toEqual([group.id]);
+    expect(status()).toBe("Selected group");
   });
 
   it.each([true, false])("names the undo for a drag of electron marks (with molecule: %s)", async withMolecule => {

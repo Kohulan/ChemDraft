@@ -669,7 +669,7 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
     expect(labels()[molecule.atoms.indexOf(atom)]).toBe(label);
     if (mark.markKind === "lone-pair") expect(molecule).toEqual(dropMolecule(before));
     expect(status()).toBe(message);
-    await exactUndoRedo(before, after, "Move electron mark");
+    await exactUndoRedo(before, after, "Move");
   });
 
   it("keeps a selected charge, radical and lone pair attached when their selected molecule moves", async () => {
@@ -693,7 +693,7 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
     expect(dropMolecule(after)).toEqual({ ...originalMolecule, x: originalMolecule.x + 100, y: originalMolecule.y + 100,
       atoms: originalMolecule.atoms.map(atom => ({ ...atom, x: atom.x + 100, y: atom.y + 100 })) });
     expect(status()).toBe("Moved selected object");
-    await exactUndoRedo(before, after, "Move electron mark");
+    await exactUndoRedo(before, after, "Move");
   });
 
   it("carries an ammonium molecule together with its mark in one exactly reversible drag", async () => {
