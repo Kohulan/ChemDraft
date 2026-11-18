@@ -208,6 +208,7 @@ jobs:
             exit 1
           fi
           graphics=$(find squashfs-root \( -name 'libEGL*' -o -name 'libGL.so*' -o -name 'libGLX*' \
+            -o -name 'libOpenGL.so*' -o -name 'libGLESv1_CM.so*' -o -name 'libGLESv2.so*' -o -name 'libGLU.so*' \
             -o -name 'libGLdispatch*' -o -name 'libgbm*' -o -name 'libdrm*' -o -name 'libglapi*' \
             -o \( -name dri \( -type d -o -type l \) \) -o -name '*_dri.so' -o -name 'libvulkan*' \) \
             -print | LC_ALL=C sort)

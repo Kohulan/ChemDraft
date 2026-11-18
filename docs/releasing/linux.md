@@ -40,7 +40,9 @@ The workflow:
 5. Repacks the AppImage after Tauri bundles it. It uses the host's Wayland and compiler runtime
    libraries and the host's `libgpg-error.so.0`; the job verifies that the finished image contains no `libwayland-*`,
    `libstdc++.so*`, or `libgcc_s.so*` files or symlinks. The job logs the bundled shared libraries
-   under `usr/lib` and rejects bundled EGL, GL, GBM, DRM, DRI, and Vulkan libraries or drivers.
+   under `usr/lib` and rejects bundled `libEGL*`, `libGL.so*`, `libGLX*`, `libOpenGL.so*`,
+   `libGLESv1_CM.so*`, `libGLESv2.so*`, `libGLU.so*`, `libGLdispatch*`, `libgbm*`, `libdrm*`,
+   `libglapi*`, `*_dri.so`, `libvulkan*`, and any `dri` directory or symlink.
 6. Records the source commit and final bytes of each package, then stages the packages, records,
    and checksums as the `linux-release-amd64` workflow artifact.
 7. Runs independent smoke jobs on **Ubuntu 22.04 and 24.04**. Each downloads and verifies the same
@@ -118,8 +120,9 @@ repository on GitHub Pages, or a Flathub listing.
 - Webview: WebKitGTK, origin `tauri://localhost` (as on macOS). Before startup on Linux,
   ChemDraft defaults `WEBKIT_DISABLE_DMABUF_RENDERER` to `1` to avoid Wayland graphics
   problems. An explicit value, including `0`, takes precedence.
-  For AppImage launches, ChemDraft defaults `EGL_PLATFORM` to `x11` when `GDK_BACKEND` starts
-  with `x11` or `WAYLAND_DISPLAY` is unset, and to `wayland` otherwise, preserving any explicit value.
+  For AppImage launches, an explicit `EGL_PLATFORM` takes precedence. Otherwise, a `GDK_BACKEND`
+  starting with `x11` or `wayland` selects that EGL platform. For other or unset backends, ChemDraft
+  selects `wayland` when `WAYLAND_DISPLAY` is set and `x11` otherwise.
 - Menus: on the document window, as on Windows (`install_app_menu`). Edit ▸ Cut / Copy / Paste
   invoke WebKitGTK's native editing commands in the focused window. The webview receives
   Ctrl+X / C / V directly and uses the same clipboard events for menu clicks and shortcuts.

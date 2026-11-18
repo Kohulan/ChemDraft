@@ -73,6 +73,11 @@ jobs:
             package: deb
             backend: wayland
             native_wayland: '1'
+          - distro: debian
+            image: debian:sid
+            package: appimage
+            backend: wayland
+            native_wayland: '1'
     container:
       image: ${{ matrix.image }}
       # strace needs ptrace and glycin's bubblewrap needs user namespaces.
@@ -143,7 +148,7 @@ jobs:
           install -d -m 1777 /tmp/.X11-unix
 
       # Xvfb catches missing libraries and baseline startup failures in both packages. Weston
-      # exercises the XWayland default and one native Wayland .deb launch with the opt-out.
+      # exercises the XWayland default and native Wayland launches of both packages with the opt-out.
       # Both virtual displays exercise WebKit startup on newer host libraries without a GPU.
       - name: Launch and watch the WebKit process
         uses: ./.github/workflows/linux-package-smoke

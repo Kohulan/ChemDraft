@@ -71,12 +71,15 @@ fn appimage_egl_platform(
         return None;
     }
 
-    let x11_backend =
-        gdk_backend.is_some_and(|backend| backend.as_encoded_bytes().starts_with(b"x11"));
-    Some(if x11_backend || !wayland_display_set {
+    let backend = gdk_backend
+        .map(std::ffi::OsStr::as_encoded_bytes)
+        .unwrap_or_default();
+    Some(if backend.starts_with(b"x11") {
         "x11"
-    } else {
+    } else if backend.starts_with(b"wayland") || wayland_display_set {
         "wayland"
+    } else {
+        "x11"
     })
 }
 
@@ -130,21 +133,32 @@ mod tests {
     #[test]
     fn egl_platform_default_respects_every_explicit_value() {
         for value in ["x11", "wayland", "surfaceless", ""] {
-            assert_eq!(
-                appimage_egl_platform(true, Some(OsStr::new(value)), None, false),
-                None
-            );
+            for backend in [None, Some("x11"), Some("wayland")] {
+                assert_eq!(
+                    appimage_egl_platform(
+                        true,
+                        Some(OsStr::new(value)),
+                        backend.map(OsStr::new),
+                        true,
+                    ),
+                    None
+                );
+            }
         }
     }
 
     #[test]
     fn egl_platform_default_matches_the_gdk_backend() {
         for (backend, wayland_display_set, expected) in [
+            (Some("x11"), false, "x11"),
             (Some("x11"), true, "x11"),
             (Some("x11,wayland"), true, "x11"),
-            (None, false, "x11"),
-            (Some("wayland"), false, "x11"),
+            (Some("wayland"), false, "wayland"),
             (Some("wayland"), true, "wayland"),
+            (Some("wayland,x11"), false, "wayland"),
+            (Some("other,wayland"), false, "x11"),
+            (Some("other,x11"), true, "wayland"),
+            (None, false, "x11"),
             (None, true, "wayland"),
         ] {
             assert_eq!(

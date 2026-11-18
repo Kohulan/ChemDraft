@@ -202,7 +202,7 @@ runs:
           command+=(--appimage-extract-and-run)
         fi
         report_egl_error() {
-          if grep -qE 'Could not create default EGL display|EGL_BAD_PARAMETER' "$logs/chemdraft.log"; then
+          if grep -qE 'Could not create default EGL display|EGL_BAD_PARAMETER.*Aborting|Aborting.*EGL_BAD_PARAMETER' "$logs/chemdraft.log"; then
             echo '::error::ChemDraft failed to initialize its EGL display. See chemdraft.log for details.'
             return 0
           fi
@@ -259,10 +259,22 @@ runs:
           sleep 1
         done
         [[ -n "$main_pid" ]] || fail 'ChemDraft did not launch'
+        if ! app_environment=$(tr '\0' '\n' < "/proc/$main_pid/environ"); then
+          echo "::error::Could not read ChemDraft process environment at /proc/$main_pid/environ"
+          exit 1
+        fi
         echo 'Display environment inherited by ChemDraft:'
-        tr '\0' '\n' < "/proc/$main_pid/environ" | grep -E '^(EGL_PLATFORM|GDK_BACKEND|WAYLAND_DISPLAY|DISPLAY|CHEMDRAFT_NATIVE_WAYLAND)=' || true
+        grep -E '^(EGL_PLATFORM|GDK_BACKEND|WAYLAND_DISPLAY|DISPLAY|CHEMDRAFT_NATIVE_WAYLAND)=' <<< "$app_environment" || true
         # /proc shows the environment at exec, so read the in-process defaults from the app log.
         grep -E 'ChemDraft (GTK backend|AppImage EGL) default:' "$logs/chemdraft.log" || true
+        if [[ "$backend" == wayland ]]; then
+          if grep -Fxq 'GDK_BACKEND=x11' <<< "$app_environment" ||
+            grep -Fxq 'ChemDraft GTK backend default: GDK_BACKEND=x11' "$logs/chemdraft.log"; then
+            [[ "$native_wayland" != 1 ]] || fail 'Expected native Wayland, but ChemDraft has GDK_BACKEND=x11'
+          else
+            [[ "$native_wayland" == 1 ]] || fail 'Expected GDK_BACKEND=x11 in the Wayland session'
+          fi
+        fi
         web_process_running || fail 'No WebKitWebProcess stayed alive during startup'
         window_ready || fail 'No ChemDraft window appeared within 60 seconds'
         for _ in {1..20}; do
