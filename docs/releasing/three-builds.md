@@ -29,16 +29,16 @@ Those builds must never be published, even if subsequently signed or given match
 The [Linux workflow](linux.md#releasing) builds and records both Linux packages. After smoke tests
 pass, it uploads them to the existing draft when `upload_to_release` is set; otherwise download
 `linux-release-amd64` and upload the packages, records, and `SHA256SUMS-linux.txt` to the draft.
-After all manual uploads, refresh the combined checksums from the assets attached to the draft,
-including the Linux packages and records even if Windows was uploaded first. From the repository root,
-with `gh` authenticated for the draft, run (replace the tag, commit, and output path):
+After all manual uploads and after every release upload workflow for the tag (`linux-release.yml` and
+`windows-release.yml` upload jobs) has finished, refresh the combined checksums from the assets attached
+to the draft. Do not change the draft's assets between this refresh and publication. From the repository
+root, with `gh` authenticated for the draft, run (replace the tag and commit and use a fresh output path):
 
 ```text
-node tools/release/check-release-assets.mjs --tag vX.Y.Z --commit <full-sha> --allow-incomplete --skip-dmg-provenance --write-checksums path/to/SHA256SUMS.txt
-gh release upload vX.Y.Z path/to/SHA256SUMS.txt --clobber
+node tools/release/check-release-assets.mjs --tag vX.Y.Z --commit <full-sha> --skip-dmg-provenance --write-checksums path/to/SHA256SUMS.txt && gh release upload vX.Y.Z path/to/SHA256SUMS.txt --clobber
 ```
 
-Only upload the checksums if the checker succeeds. This refresh does not replace the final Mac gate below.
+This refresh does not replace the final Mac gate below.
 The Windows workflow records source identity in the clean checkout and updates the hash and size
 **after Authenticode signing**, retaining the recorded source identity. Any later byte change requires
 a new record and new updater signatures/feeds.

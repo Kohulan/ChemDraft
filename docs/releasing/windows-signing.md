@@ -145,17 +145,18 @@ are none. This workflow supplies the Windows artifacts only.
    `ChemDraft_X.Y.Z_amd64.AppImage` with their five adjacent `.build.json` files. The
    [Linux workflow](linux.md#releasing) builds and records both packages and uploads them to the
    existing draft after smoke tests pass when `upload_to_release` is supplied. Otherwise download
-   `linux-release-amd64` and upload the packages, records, and `SHA256SUMS-linux.txt`. After all manual
-   uploads, refresh the combined checksums from every asset attached to the draft, including the Linux
-   packages and records even if Windows was uploaded first. From the repository root, with `gh`
-   authenticated for the draft, run (replace the tag, commit, and output path):
+   `linux-release-amd64` and upload the packages, records, and `SHA256SUMS-linux.txt`.
+
+   After all manual uploads and after every release upload workflow for the tag (`linux-release.yml` and
+   `windows-release.yml` upload jobs) has finished, refresh the combined checksums from the assets attached
+   to the draft. Do not change the draft's assets between this refresh and publication. From the repository
+   root, with `gh` authenticated for the draft, run (replace the tag and commit and use a fresh output path):
 
    ```text
-   node tools/release/check-release-assets.mjs --tag vX.Y.Z --commit <full-sha> --allow-incomplete --skip-dmg-provenance --write-checksums path/to/SHA256SUMS.txt
-   gh release upload vX.Y.Z path/to/SHA256SUMS.txt --clobber
+   node tools/release/check-release-assets.mjs --tag vX.Y.Z --commit <full-sha> --skip-dmg-provenance --write-checksums path/to/SHA256SUMS.txt && gh release upload vX.Y.Z path/to/SHA256SUMS.txt --clobber
    ```
 
-   Only upload the checksums if the checker succeeds. Then pass the
+   Then pass the
    [joint release body check](three-builds.md) with the tag and explicit gaps or `--no-gaps`.
    Add `## Linux` notes and any Linux feature gaps manually to the generated body; the generator
    currently creates only the macOS and Windows sections. When adding a Linux gap, adjust the generated
