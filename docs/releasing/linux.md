@@ -76,6 +76,8 @@ detail depends on the binary's available symbols.
 
 ## Container smoke test
 
+Pull requests changing Linux packaging paths also build and smoke-test packages from the PR head.
+
 Build and test both packages using the workflow from a branch or tag:
 
 ```sh

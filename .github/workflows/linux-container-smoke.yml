@@ -1,6 +1,17 @@
 name: Linux container smoke
 
 on:
+  pull_request:
+    paths:
+      - .github/workflows/linux-container-smoke.yml
+      - .github/workflows/linux-release.yml
+      - .github/workflows/linux-package-smoke/**
+      - apps/desktop/src-tauri/tauri.conf.json
+      - apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu
+      - scripts/build-opsin-runtime.mjs
+      - scripts/desktop-tauri.mjs
+      - tools/release/verify-bundle-licenses.mjs
+      - tools/release/record-build.mjs
   workflow_call:
     inputs:
       artifact_run_id:
@@ -22,16 +33,20 @@ permissions:
   actions: read
   contents: read
 
+concurrency:
+  group: linux-container-smoke-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
-    if: inputs.artifact_run_id == '' && inputs.artifact_name == ''
+    if: github.event_name == 'pull_request' || (inputs.artifact_run_id == '' && inputs.artifact_name == '')
     uses: ./.github/workflows/linux-release.yml
     permissions:
       # The reusable workflow declares an upload job with write permission. Its build job has
       # read access and workflow_call accepts only a source ref, so this call cannot publish.
       contents: write
     with:
-      ref: ${{ github.sha }}
+      ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
   smoke:
     needs: build
