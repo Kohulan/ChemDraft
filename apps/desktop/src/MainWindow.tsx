@@ -685,7 +685,8 @@ import {
   groupSelectedDocumentObjects,
   moveDocumentObject,
   moveDocumentObjects,
-  moveCanvasSelection,
+  moveCanvasSelectionWithPositions,
+  canvasSelectionMovePairs,
   translateInsertedDocumentObjects,
   documentObjectMoveDeltaResolver,
   promoteDocumentObjectIdsToSelectableGroups,
@@ -1786,7 +1787,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.17.13.45-codex";
+const CURRENT_BUILD_STAMP = "11.17.19.10-codex";
 const VibeCodeGuideForm = lazy(() => import("./dialogs/VibeCodeGuideForm").then(module => ({ default: module.VibeCodeGuideForm })));
 const StructureTemplatePicker = lazy(() => import("./dialogs/StructureTemplatePicker").then(module => ({ default: module.StructureTemplatePicker })));
 /** Starts in the background for the document webview under the existing probe gate. */
@@ -11551,7 +11552,7 @@ export function MainWindow({
       const burst = arrowNudgeBurstRef.current;
       const now = Date.now();
       const continuesBurst = burst?.history === documentHistoryRef.current && arrowNudgeContinuesBurst(burst.lastPress, now);
-      const moved = moveCanvasSelection(current, fragments, delta);
+      const { document: moved, positions } = moveCanvasSelectionWithPositions(current, fragments, delta);
       if (moved === current) {
         // Repeats against a page edge are still presses, so they renew an existing burst.
         arrowNudgeBurstRef.current = continuesBurst ? { history: documentHistoryRef.current, lastPress: now } : undefined;
@@ -11565,7 +11566,6 @@ export function MainWindow({
         replacePresentDocument(prepareDocumentCommit(moved, "Move"));
       } else commitDocumentChange(moved, "Move");
       arrowNudgeBurstRef.current = { history: documentHistoryRef.current, lastPress: now };
-      const nextObjects = new Map(moved.pages.flatMap(page => page.objects.map(object => [object.id, object] as const)));
       let dx = 0, dy = 0, finite = true;
       const measure = (before: { x: number; y: number }, after: { x: number; y: number }) => {
         const x = after.x - before.x, y = after.y - before.y;
@@ -11573,10 +11573,16 @@ export function MainWindow({
         if (Math.abs(x) > Math.abs(dx)) dx = x;
         if (Math.abs(y) > Math.abs(dy)) dy = y;
       };
-      current.pages.forEach(page => page.objects.forEach(object => {
-        const next = nextObjects.get(object.id);
-        if (!next) return;
+      const fragmentIds = new Set(fragments.map(fragment => fragment.objectId));
+      canvasSelectionMovePairs(current, moved, fragments).forEach(([object, next]) => {
         if (object.type === "molecule" && next.type === "molecule") {
+          if (fragmentIds.has(object.id)) {
+            for (const index of positions.get(object.id) ?? []) {
+              const atom = object.atoms[index], after = next.atoms[index];
+              if (atom && after?.id === atom.id) measure(atom, after);
+            }
+            return;
+          }
           const nextAtoms = new Map(next.atoms.map(atom => [atom.id, atom] as const));
           object.atoms.forEach(atom => {
             const after = nextAtoms.get(atom.id);
@@ -11585,7 +11591,7 @@ export function MainWindow({
         } else {
           measure(object, next);
         }
-      }));
+      });
       const distance = (value: number) => Number(Math.abs(value).toFixed(3));
       const horizontal = dx ? `${distance(dx)} px ${dx < 0 ? "left" : "right"}` : "";
       const vertical = dy ? `${distance(dy)} px ${dy < 0 ? "up" : "down"}` : "";

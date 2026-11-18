@@ -257,10 +257,54 @@ describe.each(["macos", "windows"] as const)("canvas arrow nudge (%s)", platform
     await pointer(target(), "pointerup", atom, true);
     const before = current();
     await key("ArrowRight", {}, canvas); await key("ArrowRight", { repeat: true }, canvas);
+    expect(container.querySelector('[role="status"]')?.textContent).toBe("Moved selection right by 1 px");
     expect(molecule().atoms).toEqual(molecule(before).atoms.map(candidate => candidate.id === atom.id
       ? { ...candidate, x: candidate.x + 2 } : candidate));
     expect(canonical()).toBe(canonical(before));
     await undo(); expect(current().pages).toEqual(before.pages);
+  });
+  it("reports movement of another object after Undo and an edge-clamped atom nudge", async () => {
+    const initial = structuredClone(insertNativeTextObject(
+      insertNativeSingleBondMolecule(createPhase4Document("Nudge after undo"), { x: 200, y: 200 }),
+      { x: 350, y: 250 }, "Conditions"));
+    const item = molecule(initial);
+    item.atoms[1].x = initial.pages[0].width;
+    const text = initial.pages[0].objects.find(object => object.type === "text")!;
+    await mountDocument(selectDocumentObjects(initial, initial.pages[0].id, [text.id]));
+    const selectAtom = async (index: number) => {
+      const target = container.querySelector(`[data-object-id="${item.id}"]`)!;
+      const atom = molecule().atoms[index];
+      await pointer(target, "pointerdown", atom, true);
+      await pointer(target, "pointerup", atom, true);
+    };
+    await selectAtom(0);
+    await key("ArrowRight", {}, canvas);
+    await undo();
+    await selectAtom(0);
+    await selectAtom(1);
+    const before = current();
+    await key("ArrowRight", {}, canvas);
+    expect(molecule().atoms[1].x).toBe(before.pages[0].width);
+    expect(current().pages[0].objects.find(object => object.id === text.id)!.x).toBe(text.x + 1);
+    expect(container.querySelector('[role="status"]')?.textContent).toBe("Moved selection right by 1 px");
+  });
+  it("breaks equal opposing nudge distances in page object order", async () => {
+    const initial = structuredClone(insertNativeTextObject(
+      insertNativeSingleBondMolecule(createPhase4Document("Nudge tie"), { x: 200, y: 200 }),
+      { x: 350, y: 250 }, "Conditions"));
+    const page = initial.pages[0];
+    const text = page.objects.find(object => object.type === "text")!;
+    text.x = page.width - text.width + 1;
+    await mountDocument(selectDocumentObjects(initial, page.id, [text.id]));
+    const atom = molecule().atoms[0];
+    const target = container.querySelector(`[data-object-id="${molecule().id}"]`)!;
+    await pointer(target, "pointerdown", atom, true);
+    await pointer(target, "pointerup", atom, true);
+    const before = current();
+    await key("ArrowRight", {}, canvas);
+    expect(molecule().atoms[0].x - molecule(before).atoms[0].x).toBe(1);
+    expect(current().pages[0].objects.find(object => object.id === text.id)!.x - text.x).toBe(-1);
+    expect(container.querySelector('[role="status"]')?.textContent).toBe("Moved selection right by 1 px");
   });
   it("leaves empty selections unchanged and adds no undo entry", async () => {
     await mount(false); const before = current();
