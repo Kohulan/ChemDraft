@@ -1,15 +1,17 @@
 # Linux release
 
-ChemDraft for Linux ships as two packages, built by `.github/workflows/linux-release.yml` on a
-GitHub-hosted Ubuntu 22.04 runner from the same tag as the macOS DMG and the Windows installer:
+Linux packages are optional while ChemDraft for Linux is in beta. When included, both packages
+and their `.build.json` records must be attached. The release checker validates their names,
+version, hashes, sizes and commit against the same release tag as the macOS DMGs and Windows
+installer. The GitHub-hosted Ubuntu 22.04 runner builds both packages in `linux-release.yml`.
 
 | Package | For | Install |
 | --- | --- | --- |
 | `ChemDraft_<version>_amd64.deb` | Ubuntu 22.04+, Linux Mint 21+, Debian 12+, Pop!_OS, elementary OS, Zorin | `sudo apt install ./ChemDraft_<version>_amd64.deb` |
 | `ChemDraft_<version>_amd64.AppImage` | x86-64 distributions with glibc 2.35 or later and compatible host graphics libraries | `chmod +x ChemDraft_<version>_amd64.AppImage && ./ChemDraft_<version>_amd64.AppImage` |
 
-`SHA256SUMS-linux.txt` lists both package checksums. The combined `SHA256SUMS.txt` covers the
-packages, their `.build.json` records, and the other attached release assets.
+`SHA256SUMS-linux.txt` lists both package checksums. The combined `SHA256SUMS.txt` covers all
+other attached release assets, including the Linux packages and records when supplied.
 
 ## Why Ubuntu 22.04
 
@@ -47,7 +49,8 @@ The workflow:
    commit. It uploads to the existing draft, validates the attached builds, and refreshes the
    combined checksums.
 
-Add a `## Linux` section when preparing the release body.
+The [release body generator](three-builds.md#draft-the-body-on-macos) adds `## Linux` when both
+packages and their records are present. To draft the section before uploading them, pass `--include-linux`.
 
 ## Ubuntu smoke diagnostics
 

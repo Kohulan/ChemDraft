@@ -10,8 +10,8 @@ import { appImage, arm, commit, deb, fakeReleaseRunner, installer, intel, releas
 
 const feed = (name) => `<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel><item><sparkle:version>${version}</sparkle:version><enclosure url="https://example.com/${name}"/></item></channel></rss>`;
 
-function fixture(t) {
-  const args = releaseFixture(t);
+function fixture(t, options) {
+  const args = releaseFixture(t, options);
   mkdirSync(join(args.rootDir, "release-notes", "macos"), { recursive: true });
   mkdirSync(join(args.rootDir, "release-notes", "macos-intel"), { recursive: true });
   writeFileSync(join(args.assets, "appcast.xml"), feed(arm));
@@ -24,8 +24,8 @@ function fixture(t) {
 
 const draft = (args, options = {}) => draftReleaseBody(args, { run: fakeReleaseRunner(), updaterPublicKey, ...options });
 
-test("complete release produces ordered sections with explicit gaps or explicit no-gaps", (t) => {
-  const args = fixture(t);
+test("three-build release produces ordered sections with explicit gaps or explicit no-gaps", (t) => {
+  const args = fixture(t, { withLinux: false });
   const body = draft({ ...args, noGaps: false, gaps: ["macos-intel:Feature A: reason", "windows:Feature B: reason", "macos-intel:Feature C: reason"] });
   const sections = body.split(/^## /m);
   assert.equal(sections.length, 4);
@@ -37,6 +37,26 @@ test("complete release produces ordered sections with explicit gaps or explicit 
   assert.match(sections[3], /^Windows\n\nWindows notes/);
   assert.match(sections[3], /Not in this build: Feature B: reason/);
   assert.match(draft(args), /Platform differences: None\./);
+});
+
+test("five-build release includes a Linux beta section and accepts Linux gaps", (t) => {
+  const args = fixture(t);
+  assert.match(draft(args), /^## Linux\n\nLinux support is in beta\./m);
+  assert.match(draft({ ...args, noGaps: false, gaps: ["linux:Feature A: reason"] }),
+    /^## Linux\n\nLinux support is in beta\.\n\nNot in this build: Feature A: reason\n\nPlatform differences: See/m);
+});
+
+test("Linux section can be requested explicitly without packages", (t) => {
+  const args = fixture(t, { withLinux: false });
+  assert.doesNotMatch(draft(args), /^## Linux$/m);
+  assert.match(draft({ ...args, includeLinux: true }), /^## Linux\n\nLinux support is in beta\./m);
+});
+
+test("requesting a Linux section still requires a complete set when packages are present", (t) => {
+  const args = fixture(t);
+  unlinkSync(join(args.assets, appImage));
+  unlinkSync(join(args.assets, `${appImage}.build.json`));
+  assert.throws(() => draft({ ...args, includeLinux: true }), /amd64\.AppImage: missing release file/);
 });
 
 test("neither gap choice is refused, including by the CLI", (t) => {
@@ -83,7 +103,9 @@ test("missing version and notes are named", (t) => {
 });
 
 test("invalid gap is rejected", (t) => {
-  assert.throws(() => draft({ ...fixture(t), noGaps: false, gaps: ["linux:feature"] }), /Invalid gap/);
+  const args = { ...fixture(t, { withLinux: false }), noGaps: false };
+  assert.throws(() => draft({ ...args, gaps: ["linux:feature"] }), /Invalid gap/);
+  assert.throws(() => draft({ ...args, includeLinux: true, gaps: ["other:feature"] }), /Invalid gap/);
 });
 
 for (const [field, value, message] of [

@@ -51,6 +51,17 @@ test("all five release artifacts record the checked-out full commit, version, ta
   }
 });
 
+test("Linux records require an exact package name for the checked-out version", (t) => {
+  const { rootDir } = fixture(t);
+  for (const name of ["ChemDraft_1.2.2_amd64.deb", "ChemDraft_1.2.3_arm64.deb", "ChemDraft_1.2.3_amd64.appimage"]) {
+    const artifact = join(rootDir, "assets", name);
+    writeFileSync(artifact, "fixture");
+    assert.throws(() => recordBuild({ artifact, target: "x86_64-unknown-linux-gnu", rootDir }),
+      { message: `Expected release artifact ${deb} or ${appImage}` });
+    assert.equal(existsSync(`${artifact}.build.json`), false);
+  }
+});
+
 for (const [target, name] of [["aarch64-apple-darwin", arm], ["x86_64-apple-darwin", intel]]) {
   test(`recording ${target} refuses an unsigned-stamped app even with the correct source commit`, (t) => {
     const { rootDir, commit } = fixture(t);

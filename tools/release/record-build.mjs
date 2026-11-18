@@ -11,11 +11,12 @@ import { COMMIT_PATTERN } from "./source-commit.mjs";
 export { COMMIT_PATTERN } from "./source-commit.mjs";
 
 const ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+export const LINUX_BUILD_TARGET = "x86_64-unknown-linux-gnu";
 export const BUILD_TARGETS = {
   "aarch64-apple-darwin": ["aarch64.dmg"],
   "x86_64-apple-darwin": ["x86_64.dmg"],
   "x86_64-pc-windows-msvc": ["x64-setup.exe"],
-  "x86_64-unknown-linux-gnu": ["amd64.deb", "amd64.AppImage"]
+  [LINUX_BUILD_TARGET]: ["amd64.deb", "amd64.AppImage"]
 };
 
 // Hash in bounded chunks: release installers and DMGs can be hundreds of MB.

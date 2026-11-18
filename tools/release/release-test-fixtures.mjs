@@ -3,7 +3,7 @@ import { createHash, generateKeyPairSync, randomBytes, sign } from "node:crypto"
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { artifactDigest } from "./record-build.mjs";
+import { artifactDigest, LINUX_BUILD_TARGET } from "./record-build.mjs";
 import { releaseBuildFiles } from "./release-assets.mjs";
 
 export const version = "1.2.3";
@@ -30,12 +30,13 @@ export function updaterSignature(bytes) {
   return Buffer.from(`untrusted comment: ephemeral test signature\n${packet.toString("base64")}\ntrusted comment: ${comment}\n${global.toString("base64")}\n`).toString("base64");
 }
 
-export function releaseFixture(t) {
+export function releaseFixture(t, { withLinux = true } = {}) {
   const rootDir = mkdtempSync(join(dirname(fileURLToPath(import.meta.url)), ".release-test-"));
   t.after(() => rmSync(rootDir, { recursive: true, force: true }));
   const assets = join(rootDir, "assets");
   mkdirSync(assets);
   for (const { target, name } of releaseBuildFiles(version)) {
+    if (!withLinux && target === LINUX_BUILD_TARGET) continue;
     const file = join(assets, name);
     writeFileSync(file, `synthetic ${name}`);
     writeFileSync(`${file}.build.json`, JSON.stringify({ commit, version, target, clean: true, ...artifactDigest(file) }));

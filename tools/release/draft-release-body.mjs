@@ -10,7 +10,7 @@ import { verifyDmgCommit } from "./verify-macos-feed.mjs";
 
 const ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
-export function draftReleaseBody({ version, commit, tag = `v${version}`, assets = process.cwd(), rootDir = ROOT, gaps = [], noGaps = false }, {
+export function draftReleaseBody({ version, commit, tag = `v${version}`, assets = process.cwd(), rootDir = ROOT, gaps = [], noGaps = false, includeLinux = false }, {
   run = spawnSync, checkDmgCommit = (dmg, target, expected) => verifyDmgCommit(dmg, target, expected, { run }),
   updaterPublicKey
 } = {}) {
@@ -25,14 +25,9 @@ export function draftReleaseBody({ version, commit, tag = `v${version}`, assets 
     { key: "windows", heading: "Windows", notes: join("release-notes", `windows-${version}.md`) }
   ];
   const errors = [];
-  const gapMap = new Map(platforms.map(({ key }) => [key, []]));
-  for (const gap of gaps) {
-    const match = /^(macos|macos-intel|windows):([^\r\n]+)$/.exec(gap);
-    if (!match || !match[2].trim()) throw new Error(`Invalid gap ${JSON.stringify(gap)}; expected macos, macos-intel, or windows followed by :text`);
-    gapMap.get(match[1]).push(match[2].trim());
-  }
   const installer = `ChemDraft_${version}_x64-setup.exe`;
-  try { verifyBuildAssets({ assets, version, expectedCommit }, { checkDmgCommit, updaterPublicKey }); }
+  let builds = [];
+  try { builds = verifyBuildAssets({ assets, version, expectedCommit }, { checkDmgCommit, updaterPublicKey }); }
   catch (error) { errors.push(error.message); }
   for (const name of [platforms[0].dmg, platforms[1].dmg, installer, `${installer}.sig`, "latest.json"]) {
     try { if (!statSync(join(assets, name)).isFile()) throw new Error(); }
@@ -56,6 +51,17 @@ export function draftReleaseBody({ version, commit, tag = `v${version}`, assets 
     } catch (error) { errors.push(`Release notes ${platform.notes}: ${error.message}`); }
   }
   if (errors.length) throw new Error(errors.join("\n"));
+  if (includeLinux || builds.some((name) => name.endsWith(".deb"))) {
+    platforms.push({ key: "linux", heading: "Linux", content: "Linux support is in beta." });
+  }
+  const gapMap = new Map(platforms.map(({ key }) => [key, []]));
+  for (const gap of gaps) {
+    const match = /^([^:]+):([^\r\n]+)$/.exec(gap);
+    if (!match || !gapMap.has(match[1]) || !match[2].trim()) {
+      throw new Error(`Invalid gap ${JSON.stringify(gap)}. Use a platform followed by :text. Available platforms are ${[...gapMap.keys()].join(", ")}.`);
+    }
+    gapMap.get(match[1]).push(match[2].trim());
+  }
   const sections = platforms.map((platform) => {
     const lines = gapMap.get(platform.key).map((gap) => `Not in this build: ${gap}`);
     return [`## ${platform.heading}`, platform.content, ...lines].join("\n\n");
@@ -65,8 +71,17 @@ export function draftReleaseBody({ version, commit, tag = `v${version}`, assets 
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    const { values } = parseArgs({ options: { version: { type: "string" }, commit: { type: "string" }, tag: { type: "string" }, assets: { type: "string" }, out: { type: "string" }, gap: { type: "string", multiple: true }, "no-gaps": { type: "boolean", default: false } } });
-    const body = draftReleaseBody({ ...values, gaps: values.gap, noGaps: values["no-gaps"] });
+    const { values } = parseArgs({ options: {
+      version: { type: "string" },
+      commit: { type: "string" },
+      tag: { type: "string" },
+      assets: { type: "string" },
+      out: { type: "string" },
+      gap: { type: "string", multiple: true },
+      "no-gaps": { type: "boolean", default: false },
+      "include-linux": { type: "boolean", default: false }
+    } });
+    const body = draftReleaseBody({ ...values, gaps: values.gap, noGaps: values["no-gaps"], includeLinux: values["include-linux"] });
     if (values.out) writeFileSync(values.out, body);
     else process.stdout.write(body);
   } catch (error) { console.error(`Release body: ${error.message}`); process.exitCode = 1; }

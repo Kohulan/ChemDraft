@@ -32,7 +32,6 @@ export function checkReleaseAssets({ tag, version = tag?.replace(/^v/, ""), comm
       const result = run("gh", ["release", "download", tag, "--dir", folder], { cwd: rootDir, encoding: "utf8" });
       if (result.status !== 0) throw new Error(`gh release download ${tag}: ${result.stderr || result.error?.message || "download failed"}`);
     }
-    const missing = missingBuildFiles(folder, version);
     const builds = verifyBuildAssets({ assets: folder, version, expectedCommit, allowIncomplete }, {
       updaterPublicKey,
       checkDmgCommit: platform === "darwin"
@@ -41,6 +40,7 @@ export function checkReleaseAssets({ tag, version = tag?.replace(/^v/, ""), comm
     });
     // Strict mode validates updater assets in verifyBuildAssets; preserve the partial-upload gate.
     if (allowIncomplete) verifyWindowsUpdateAssets({ assets: folder, version, allowIncomplete }, { updaterPublicKey });
+    const missing = missingBuildFiles(folder, version);
     if (checksumOutput) writeReleaseChecksums(folder, checksumOutput);
     if (missing.length) return { complete: false, missing };
     return { complete: true, commit: expectedCommit, builds };

@@ -1,17 +1,22 @@
-# Check and publish all five builds
+# Check and publish release builds
 
-Every release ships five builds across three platforms: an Apple-silicon DMG, an Intel DMG, a Windows
-x64 NSIS installer, a Linux `.deb`, and a Linux AppImage, all from the same commit and version. Keep the GitHub release **draft** throughout
+Every release ships an Apple-silicon DMG, an Intel DMG, and a Windows x64 NSIS installer.
+While Linux is in beta, its `.deb` and AppImage are optional. If either package or build record is
+attached, the release must include both Linux packages and both records. Every supplied build is
+validated against the same commit and version. Keep the GitHub release **draft** throughout
 verification. Both the release body check and the final attached-asset gate below must pass.
 
 ## Record the final bytes
 
-After signing, notarization and stapling have finished, collect the five packages and their records,
-the Windows `.exe.sig`, `latest.json`, and both generated appcasts in one staging directory:
+After signing, notarization and stapling have finished, collect the three required packages and their
+records, the Windows `.exe.sig`, `latest.json`, and both generated appcasts in one staging directory.
 
 - `ChemDraft_X.Y.Z_aarch64.dmg` and `ChemDraft_X.Y.Z_aarch64.dmg.build.json`
 - `ChemDraft_X.Y.Z_x86_64.dmg` and `ChemDraft_X.Y.Z_x86_64.dmg.build.json`
 - `ChemDraft_X.Y.Z_x64-setup.exe` and `ChemDraft_X.Y.Z_x64-setup.exe.build.json`
+
+For a release that includes Linux beta builds, add both pairs.
+
 - `ChemDraft_X.Y.Z_amd64.deb` and `ChemDraft_X.Y.Z_amd64.deb.build.json`
 - `ChemDraft_X.Y.Z_amd64.AppImage` and `ChemDraft_X.Y.Z_amd64.AppImage.build.json`
 
@@ -38,7 +43,7 @@ root, with `gh` authenticated for the draft, run (replace the tag and commit and
 node tools/release/check-release-assets.mjs --tag vX.Y.Z --commit <full-sha> --skip-dmg-provenance --write-checksums path/to/SHA256SUMS.txt && gh release upload vX.Y.Z path/to/SHA256SUMS.txt --clobber
 ```
 
-This refresh does not replace the final Mac gate below.
+The combined `SHA256SUMS.txt` covers all other attached assets. Run the final Mac gate below after refreshing it.
 The Windows workflow records source identity in the clean checkout and updates the hash and size
 **after Authenticode signing**, retaining the recorded source identity. Any later byte change requires
 a new record and new updater signatures/feeds.
@@ -55,22 +60,20 @@ node tools/release/draft-release-body.mjs --version X.Y.Z --tag vX.Y.Z --assets 
 
 Use `--no-gaps` only after explicitly checking feature parity. Otherwise replace it with one or
 more `--gap "macos:feature and reason"`, `--gap "macos-intel:feature and reason"`, or
-`--gap "windows:feature and reason"`. The tool requires at least one valid `--gap` or
-`--no-gaps`; it rejects omitting both, using both together, and gaps with an unrecognized platform or empty,
-whitespace-only, or multiline text.
-The generator writes the macOS and Windows sections. Add a `## Linux` section manually to the
-generated body before setting it on the draft, including Linux notes and any feature gaps and reasons.
-The generator does not accept a Linux `--gap` or generate that section. When adding a Linux gap,
-adjust the generated Platform differences note by hand to reflect it. Review the resulting body
-and its Platform differences note for all three platforms.
+`--gap "windows:feature and reason"`. Use `--gap "linux:feature and reason"` when the Linux section
+is included. The tool requires at least one valid `--gap` or `--no-gaps` and rejects using both
+together. A gap must name a platform and provide single-line text.
+The generator includes `## Linux` when both Linux packages and records are present or when you
+pass `--include-linux` to draft the section ahead of uploads. Add any release-specific Linux notes
+to that section and review the Platform differences note before setting the body on the draft.
 Without `--assets`, the current directory is checked; without `--out`, the body goes to stdout.
 
-The body command requires all five records to name the same commit, the requested version,
-`clean: true`, and the appropriate target (`aarch64-apple-darwin`, `x86_64-apple-darwin`, or
-`x86_64-pc-windows-msvc`, or `x86_64-unknown-linux-gnu` for both Linux packages). It recomputes SHA-256 and byte size for every artifact. It mounts each
-DMG read-only, reads each app's `Info.plist`, and requires `ChemDraftSourceCommit` to match the
-expected source commit. Release DMGs must embed this key before signing; only non-release app
-builds may omit it. This command therefore needs macOS, `hdiutil` and `plutil`.
+The body command checks every supplied record for the same commit, the requested version,
+`clean: true`, and the appropriate target (`aarch64-apple-darwin`, `x86_64-apple-darwin`,
+`x86_64-pc-windows-msvc`, or `x86_64-unknown-linux-gnu` for both Linux packages). It recomputes
+SHA-256 and byte size for every artifact. It mounts each DMG read-only, reads each app's `Info.plist`,
+and requires `ChemDraftSourceCommit` to match the expected source commit. Release DMGs must embed
+this key before signing. This command therefore needs macOS, `hdiutil` and `plutil`.
 
 The default tag is `vX.Y.Z`. The command always fetches the tag from `origin`, even if it exists
 locally, and peels the fetched `FETCH_HEAD` to its commit. A fetch or resolution failure (including a
@@ -81,7 +84,7 @@ record can substitute for an expected commit. Complete the production signature 
 
 ## Last step before un-drafting
 
-1. Upload the final artifacts, their five records, updater signatures and generated feeds to the
+1. Upload the final artifacts, their records, updater signatures and generated feeds to the
    existing draft release. Run the platform acceptance checks in the platform guides.
 2. Set the reviewed release body. Immediately before un-drafting, **on a Mac**, from a checkout of
    the release source with `gh` authenticated to read drafts and `APPLE_TEAM_ID` exported, download
@@ -97,8 +100,9 @@ record can substitute for an expected commit. Complete the production signature 
    The two release verifiers mount the downloaded DMGs read-only, verify the apps inside, and check
    each DMG's staple and Gatekeeper assessment. The process staples only the DMG, never requiring
    an app staple. The final asset command downloads all assets again to a temporary directory and cleans it up.
-   It requires exactly the five expected builds and their records, refuses extra builds or records,
-   including unexpected `.sig`, `.msi`, `.zip`, `.pkg` and `.tar.gz` files (only the expected Windows
+   It requires both DMGs, the Windows installer, and their records. It validates the optional Linux
+   packages when present and rejects partial Linux sets and extra builds or records, including
+   unexpected `.deb`, `.AppImage`, `.sig`, `.msi`, `.zip`, `.pkg` and `.tar.gz` files (only the expected Windows
    `.exe.sig` and `latest.json` are allowed updater assets). It requires both Windows updater files,
    checks the manifest version, exact `windows-x86_64-nsis` platform key and release download URL,
    and requires the manifest signature to match the `.exe.sig`. It verifies that signature against
@@ -115,9 +119,10 @@ record can substitute for an expected commit. Complete the production signature 
 
 The Windows workflow runs this checker **inside the upload job after uploading**, with its existing
 `contents: write` token so draft assets are visible. Other jobs retain read access. Its
-`--allow-incomplete` mode permits wholly missing artifact/record pairs and lists the missing filenames,
-while fully checking every supplied build. A supplied Windows installer still requires its verified
-`.exe.sig` and matching `latest.json`; only a wholly absent Windows build and updater files may be deferred.
+`--allow-incomplete` mode permits wholly missing macOS or Windows artifact/record pairs and lists
+their missing filenames, while fully checking every supplied build. A supplied Windows installer still
+requires its verified `.exe.sig` and matching `latest.json`. The checker can defer Windows when its
+installer, record and updater assets are all absent.
 Partial pairs, invalid records, hashes, sizes, extra builds
 and tag mismatches fail even in incomplete mode. INCOMPLETE is **not permission to un-draft**.
 

@@ -10,7 +10,18 @@ import { appImage, arm, commit, deb, fakeReleaseRunner, installer, installerUrl,
 
 const check = (args, options = {}) => checkReleaseAssets({ tag: `v${version}`, ...args }, { run: fakeReleaseRunner(), platform: "darwin", updaterPublicKey, ...options });
 
-const buildNames = [arm, intel, installer, deb, appImage];
+const requiredBuilds = [arm, intel, installer];
+const buildNames = [...requiredBuilds, deb, appImage];
+
+test("the three required builds pass without Linux and produce combined checksums", (t) => {
+  const args = releaseFixture(t, { withLinux: false });
+  const checksumOutput = join(args.rootDir, "SHA256SUMS.txt");
+  const expected = { complete: true, commit, builds: requiredBuilds };
+  assert.deepEqual(check({ ...args, checksumOutput }), expected);
+  assert.deepEqual(check({ ...args, allowIncomplete: true }), expected);
+  assert.deepEqual(readFileSync(checksumOutput, "utf8").trimEnd().split("\n"), readdirSync(args.assets).sort()
+    .map((name) => `${artifactDigest(join(args.assets, name)).sha256}  ${name}`));
+});
 
 test("folder gate accepts exactly five builds from the tag's commit", (t) => {
   const args = releaseFixture(t);
@@ -34,13 +45,14 @@ for (const name of [...buildNames, ...buildNames.map((name) => `${name}.build.js
   test(`asset checker names missing ${name}; incomplete workflow mode is not a pass`, (t) => {
     const args = releaseFixture(t);
     unlinkSync(join(args.assets, name));
-    assert.throws(() => check(args), (error) => error.message.includes(name));
-    // Incomplete mode cannot fully verify a half-present build.
-    assert.throws(() => check({ ...args, allowIncomplete: true }), (error) => error.message.includes(name));
+    const missing = name.endsWith(".build.json") ? "missing build record" : "missing release file";
+    for (const allowIncomplete of [false, true]) {
+      assert.throws(() => check({ ...args, allowIncomplete }), ({ message }) => message.includes(`${name}: ${missing}`));
+    }
   });
 }
 
-for (const extra of ["ChemDraft_1.2.2_aarch64.dmg", "ChemDraft_1.2.3_x64.dmg", "unexpected.exe", "other.dmg.build.json", "other.sig", "old.exe.sig", "other.msi", "other.zip", "other.pkg", "other.tar.gz", "OTHER.TAR.GZ", "other.deb", "OTHER.APPIMAGE"]) {
+for (const extra of ["ChemDraft_1.2.2_aarch64.dmg", "ChemDraft_1.2.3_x64.dmg", "unexpected.exe", "other.dmg.build.json", "other.sig", "old.exe.sig", "other.msi", "other.zip", "other.pkg", "other.tar.gz", "OTHER.TAR.GZ"]) {
   test(`extra build ${extra} is refused`, (t) => {
     const args = releaseFixture(t);
     writeFileSync(join(args.assets, extra), "stale build");
@@ -48,7 +60,27 @@ for (const extra of ["ChemDraft_1.2.2_aarch64.dmg", "ChemDraft_1.2.3_x64.dmg", "
   });
 }
 
+for (const extra of ["other.deb", "OTHER.APPIMAGE", "ChemDraft_1.2.2_amd64.deb", "ChemDraft_1.2.2_amd64.AppImage.build.json"]) {
+  test(`unexpected Linux file ${extra} is refused with or without the beta packages`, (t) => {
+    for (const withLinux of [false, true]) {
+      const args = releaseFixture(t, { withLinux });
+      writeFileSync(join(args.assets, extra), "stale build");
+      assert.throws(() => check(args), (error) => error.message.includes(`Unexpected release build: ${extra}`));
+    }
+  });
+}
+
 for (const name of [deb, appImage]) {
+  test(`asset checker requires ${name} and its record when the other Linux package is present`, (t) => {
+    const args = releaseFixture(t);
+    unlinkSync(join(args.assets, name));
+    unlinkSync(join(args.assets, `${name}.build.json`));
+    for (const allowIncomplete of [false, true]) {
+      assert.throws(() => check({ ...args, allowIncomplete }), ({ message }) =>
+        message.includes(`${name}.build.json: missing build record`) && message.includes(`${name}: missing release file`));
+    }
+  });
+
   test(`asset checker rejects tampered ${name} bytes`, (t) => {
     const args = releaseFixture(t);
     writeFileSync(join(args.assets, name), "tampered");
@@ -58,6 +90,20 @@ for (const name of [deb, appImage]) {
     }
   });
 }
+
+test("a lone Linux package or build record is rejected even in incomplete mode", (t) => {
+  const linuxFiles = [deb, `${deb}.build.json`, appImage, `${appImage}.build.json`];
+  for (const attached of linuxFiles) {
+    const args = releaseFixture(t);
+    for (const file of linuxFiles.filter((name) => name !== attached)) unlinkSync(join(args.assets, file));
+    const missing = attached.endsWith(".build.json")
+      ? `${attached.slice(0, -".build.json".length)}: missing release file`
+      : `${attached}.build.json: missing build record`;
+    for (const allowIncomplete of [false, true]) {
+      assert.throws(() => check({ ...args, allowIncomplete }), ({ message }) => message.includes(missing));
+    }
+  }
+});
 
 test("combined checksums refresh from the attached assets after a Linux rebuild", (t) => {
   const { assets, rootDir } = releaseFixture(t);
@@ -92,7 +138,7 @@ test("Windows updater gate defaults to the checked-in config key and refuses the
 });
 
 test("incomplete mode defers a wholly absent Windows build, but refuses orphaned updater metadata", (t) => {
-  const args = releaseFixture(t);
+  const args = releaseFixture(t, { withLinux: false });
   const signature = readFileSync(join(args.assets, `${installer}.sig`), "utf8");
   for (const name of [installer, `${installer}.build.json`, `${installer}.sig`, "latest.json"]) unlinkSync(join(args.assets, name));
   assert.deepEqual(check({ ...args, allowIncomplete: true }), { complete: false, missing: [installer, `${installer}.build.json`] });
