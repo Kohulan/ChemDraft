@@ -10,6 +10,9 @@ inputs:
   backend:
     description: x11 or wayland
     required: true
+  native-wayland:
+    description: Set to 1 to exercise the native Wayland opt-out under Weston
+    default: '0'
   logs:
     description: Directory for display, app, and process logs
     required: true
@@ -30,6 +33,7 @@ runs:
         BUNDLE: ${{ inputs.bundle }}
         PACKAGE: ${{ inputs.package }}
         BACKEND: ${{ inputs.backend }}
+        NATIVE_WAYLAND: ${{ inputs.native-wayland }}
         LOGS: ${{ inputs.logs }}
         CONTAINER_USER: ${{ inputs.container-user }}
         CHECK_WINDOW: ${{ inputs.check-window }}
@@ -46,7 +50,7 @@ runs:
           mkdir -p "$LOGS"
         fi
         "${session[@]}" -- bash -s -- "$bundle" "$PACKAGE" "$BACKEND" "$LOGS" "$CHECK_WINDOW" \
-          "$DIAGNOSTICS" "$GITHUB_ACTION_PATH" 2>&1 <<'SMOKE' | tee "$LOGS/harness.log"
+          "$DIAGNOSTICS" "$GITHUB_ACTION_PATH" "$NATIVE_WAYLAND" 2>&1 <<'SMOKE' | tee "$LOGS/harness.log"
         set -euo pipefail
         bundle=$1
         package=$2
@@ -55,6 +59,7 @@ runs:
         check_window=$5
         diagnostics=$6
         action_path=$7
+        native_wayland=$8
         work=$(mktemp -d)
         display_pid=
         launcher_pid=
@@ -63,7 +68,7 @@ runs:
         export XDG_RUNTIME_DIR
         XDG_RUNTIME_DIR="$work/runtime"
         mkdir -m 700 "$XDG_RUNTIME_DIR"
-        unset DISPLAY WAYLAND_DISPLAY WEBKIT_DISABLE_DMABUF_RENDERER
+        unset DISPLAY WAYLAND_DISPLAY GDK_BACKEND CHEMDRAFT_NATIVE_WAYLAND WEBKIT_DISABLE_DMABUF_RENDERER
 
         new_profile() {
           local profile
@@ -158,7 +163,12 @@ runs:
           exit 1
         fi
 
-        if [[ "$backend" == wayland ]]; then
+        if [[ "$backend" == x11 ]]; then
+          export GDK_BACKEND=x11
+        elif [[ "$native_wayland" == 1 ]]; then
+          export CHEMDRAFT_NATIVE_WAYLAND=1
+          echo 'Testing the native Wayland opt-out with only the Wayland display available.'
+        else
           for _ in {1..20}; do
             display=$(sed -n 's/.*xserver listening on display \(:[0-9][0-9]*\).*/\1/p' "$logs/display.log" | tail -n 1)
             [[ -n "$display" ]] && break
@@ -167,10 +177,11 @@ runs:
           done
           [[ -n "$display" ]] || { echo '::error::Weston Xwayland display did not start'; exit 1; }
           export DISPLAY="$display"
+          echo 'ChemDraft defaults to XWayland in this Wayland session.'
         fi
-        export GDK_BACKEND="$backend"
-        printf 'Launch environment: EGL_PLATFORM=%s GDK_BACKEND=%s WAYLAND_DISPLAY=%s DISPLAY=%s\n' \
-          "${EGL_PLATFORM-<unset>}" "$GDK_BACKEND" "${WAYLAND_DISPLAY-}" "${DISPLAY-}"
+        printf 'Launch environment: EGL_PLATFORM=%s GDK_BACKEND=%s WAYLAND_DISPLAY=%s DISPLAY=%s CHEMDRAFT_NATIVE_WAYLAND=%s\n' \
+          "${EGL_PLATFORM-<unset>}" "${GDK_BACKEND-<unset>}" "${WAYLAND_DISPLAY-}" "${DISPLAY-}" \
+          "${CHEMDRAFT_NATIVE_WAYLAND-<unset>}"
         if [[ "$check_window" == true ]]; then
           openbox > "$logs/openbox.log" 2>&1 &
           wm_pid=$!
@@ -249,9 +260,9 @@ runs:
         done
         [[ -n "$main_pid" ]] || fail 'ChemDraft did not launch'
         echo 'Display environment inherited by ChemDraft:'
-        tr '\0' '\n' < "/proc/$main_pid/environ" | grep -E '^(EGL_PLATFORM|GDK_BACKEND|WAYLAND_DISPLAY|DISPLAY)=' || true
-        # /proc shows the environment at exec, so read the in-process default from the app log.
-        grep -F 'ChemDraft AppImage EGL default:' "$logs/chemdraft.log" || true
+        tr '\0' '\n' < "/proc/$main_pid/environ" | grep -E '^(EGL_PLATFORM|GDK_BACKEND|WAYLAND_DISPLAY|DISPLAY|CHEMDRAFT_NATIVE_WAYLAND)=' || true
+        # /proc shows the environment at exec, so read the in-process defaults from the app log.
+        grep -E 'ChemDraft (GTK backend|AppImage EGL) default:' "$logs/chemdraft.log" || true
         web_process_running || fail 'No WebKitWebProcess stayed alive during startup'
         window_ready || fail 'No ChemDraft window appeared within 60 seconds'
         for _ in {1..20}; do

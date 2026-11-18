@@ -6,6 +6,7 @@ on:
       - .github/workflows/linux-container-smoke.yml
       - .github/workflows/linux-release.yml
       - .github/workflows/linux-package-smoke/**
+      - apps/desktop/src-tauri/src/main.rs
       - apps/desktop/src-tauri/tauri.conf.json
       - apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu
       - scripts/build-opsin-runtime.mjs
@@ -61,11 +62,17 @@ jobs:
         distro: [debian, fedora]
         package: [appimage, deb]
         backend: [x11, wayland]
+        native_wayland: ['0']
         include:
           - distro: debian
             image: debian:sid
           - distro: fedora
             image: fedora:latest
+          - distro: debian
+            image: debian:sid
+            package: deb
+            backend: wayland
+            native_wayland: '1'
     container:
       image: ${{ matrix.image }}
       # strace needs ptrace and glycin's bubblewrap needs user namespaces.
@@ -136,19 +143,20 @@ jobs:
           install -d -m 1777 /tmp/.X11-unix
 
       # Xvfb catches missing libraries and baseline startup failures in both packages. Weston
-      # exercises GTK on Wayland and the AppImage WebKit subprocess startup/abort path against
-      # newer host libraries. Neither display has a GPU or reproduces KDE Plasma rendering glitches.
+      # exercises the XWayland default and one native Wayland .deb launch with the opt-out.
+      # Both virtual displays exercise WebKit startup on newer host libraries without a GPU.
       - name: Launch and watch the WebKit process
         uses: ./.github/workflows/linux-package-smoke
         with:
           bundle: ${{ env.BUNDLE }}
           package: ${{ matrix.package }}
           backend: ${{ matrix.backend }}
+          native-wayland: ${{ matrix.native_wayland }}
           logs: ${{ github.workspace }}/smoke-logs
           container-user: smoke
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
-          name: linux-smoke-${{ matrix.distro }}-${{ matrix.package }}-${{ matrix.backend }}
+          name: linux-smoke-${{ matrix.distro }}-${{ matrix.package }}-${{ matrix.backend }}${{ matrix.native_wayland == '1' && '-native' || '' }}
           path: smoke-logs/
