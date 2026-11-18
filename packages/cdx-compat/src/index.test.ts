@@ -1037,7 +1037,7 @@ describe("CDXML-compatible ChemDraft envelope", () => {
 
     expect(result.contents).toContain('<graphic id="');
     expect(result.contents).toContain('GraphicType="Rectangle"');
-    expect(result.contents).toContain('RectangleType="RoundEdge Shadow Dashed"');
+    expect(result.contents).toContain('RectangleType="RoundEdge Shadow Dashed Filled"');
     expect(result.contents).toContain('CornerRadius="525"');
     expect(result.warnings.map((item) => item.code)).toEqual([
       "cdxml.graphic_gloss_payload_only",

@@ -152,39 +152,62 @@ describe.each(routes)("CDXML rectangle combinations through %s", route => {
 
 describe.each([false, true])("distinct rectangle stroke and fill (CDXML input=%s)", xmlInput => {
   describe.each(routes)("through %s", route => {
-    describe.each(["#ffffff", "#336699"])("fill %s", fillColor => {
+    const cases: {
+      name: string;
+      fill?: string;
+      background?: string;
+      pageBackground?: string;
+      writtenFill?: string;
+      implicitShadowFill?: string;
+    }[] = [
+      { name: "colored fill", fill: "#336699", writtenFill: "#336699" },
+      { name: "shorthand colored fill", fill: "#A4F", writtenFill: "#aa44ff" },
+      { name: "white fill on a colored background", fill: "#ffffff", background: "#abc", implicitShadowFill: "#ffffff" },
+      { name: "shorthand white fill", fill: "#FFF", implicitShadowFill: "#ffffff" },
+      { name: "RGB white fill", fill: "RGB(255, 255, 255)", implicitShadowFill: "#ffffff" },
+      { name: "fill matching the document background", fill: "#abc", background: "rgb(170, 187, 204)" },
+      { name: "fill matching the page background", fill: "rgb(170 187 204)", background: "#ddeeff", pageBackground: "#AABBCC" },
+      { name: "fill differing from the page background", fill: "#abc", background: "#aabbcc", pageBackground: "#def", writtenFill: "#aabbcc" },
+      { name: "explicit no fill", fill: "none" },
+      { name: "absent fill" }
+    ];
+    describe.each(cases)("$name", ({ fill, background, pageBackground, writtenFill, implicitShadowFill }) => {
       it.each([
         ...[0, 1, 2, 3, 16, 17, 18, 19].map(rectangleType => ({ rectangleType, cornerRadiusPx: undefined })),
         { rectangleType: 0, cornerRadiusPx: 0 }, { rectangleType: 16, cornerRadiusPx: 0 }
-      ])("uses fill for plain rectangles and outline for rounded/shadowed rectangles: %o", ({ rectangleType, cornerRadiusPx }) => {
+      ])("chooses the visible color and preserves the shape: %o", ({ rectangleType, cornerRadiusPx }) => {
         const bytes = syntheticRectangles(rectangle(13, rectangleType, undefined, 3));
         const document = requireDocument(xmlInput ? openChemDraftPayload(cdxElementToCdxml(readCdx(bytes))) : importCdx(bytes));
+        if (background !== undefined) document.styles.backgroundColor = background;
+        if (pageBackground !== undefined) document.pages[0].compatibility!.unknown.backgroundColor = pageBackground;
         const before = rectangles(document)[3];
-        // A native edit can express two colors that a visible CDXML/CDX rectangle cannot.
-        before.style.strokeColor = "#000000";
-        before.style.fillColor = fillColor;
+        const outline = "#123456";
+        before.style.strokeColor = "rgb(18, 52, 86)";
+        if (fill === undefined) delete before.style.fillColor;
+        else before.style.fillColor = fill;
         if (cornerRadiusPx !== undefined) before.data.cornerRadiusPx = cornerRadiusPx;
-        const preserveOutline = Boolean(rectangleType & 3);
 
         const exported = route === "CDX"
           ? exportDocumentToCdx(document, { embedNativePayload: false })
           : exportDocumentToCdxml(document, { embedNativePayload: false });
-        expect(exported.warnings).toContainEqual(expect.objectContaining({
-          code: "cdxml.graphic_single_color", sourceObjectId: before.id,
-          message: preserveOutline
-            ? "CDXML graphics store a single color; the outline color was preserved and the distinct fill was not written."
-            : "CDXML graphics store a single color; the visible fill was preserved and the distinct stroke color was dropped."
-        }));
+        const lossWarnings = exported.warnings.filter(warning =>
+          warning.code === "cdxml.graphic_single_color" && warning.sourceObjectId === before.id);
+        if (fill === undefined || fill === "none") {
+          expect(lossWarnings).toHaveLength(0);
+        } else {
+          expect(lossWarnings).toHaveLength(1);
+          expect(lossWarnings[0].message).toContain(writtenFill
+            ? `writes the fill ${writtenFill} and omits the outline ${outline}`
+            : `writes the outline ${outline} and omits the explicit fill ${fill}`);
+        }
         const visible = "bytes" in exported ? cdxElementToCdxml(readCdx(exported.bytes)) : exported.contents;
         const emitted = [...visible.matchAll(/<graphic\b[^>]*>/g)].at(-1)![0];
-        expect(emitted.includes("Filled")).toBe(!preserveOutline);
-        // Omit explicit None so shadow rectangles retain their implicit white fill.
-        expect(emitted).not.toContain('FillType="None"');
-        if (!preserveOutline) expect(emitted).not.toContain("FillType=");
-        const after = rectangles(roundTrip(document, route))[3];
-        expect(after.style.strokeColor).toBe(preserveOutline ? "#000000" : fillColor);
-        // Shadow without Filled defaults to white; rounded-only rectangles remain unfilled.
-        expect(after.style.fillColor).toBe(preserveOutline ? (rectangleType & 2 ? "#ffffff" : "none") : fillColor);
+        expect(emitted).toMatch(/\bcolor="\d+"/);
+        expect(emitted.includes("Filled")).toBe(writtenFill !== undefined);
+        const reopened = requireDocument("bytes" in exported ? importCdx(exported.bytes) : openChemDraftPayload(exported.contents));
+        const after = rectangles(route === "CDXML->CDX" ? roundTrip(reopened, "CDX") : reopened)[3];
+        expect(after.style.strokeColor).toBe(writtenFill ?? outline);
+        expect(after.style.fillColor).toBe(writtenFill ?? (rectangleType & 2 ? implicitShadowFill ?? "none" : "none"));
         expect(after.data.cornerRadiusPx).toBe(before.data.cornerRadiusPx);
         expect(after.style.effect).toBe(before.style.effect);
         expect(after.style.strokeDasharray).toBe(before.style.strokeDasharray);
@@ -224,5 +247,43 @@ describe.each(routes)("matching rectangle colors through %s", route => {
       expect(after.style.strokeColor).toBe(color);
       expect(after.style.fillColor).toBe(color);
     });
+  });
+});
+
+describe("rectangle export color warnings", () => {
+  it.each([0, 1, 2])("reports the implicit outline for rectangle type %s", rectangleType => {
+    const document = requireDocument(importCdx(syntheticRectangles(rectangle(13, rectangleType, undefined, 3))));
+    const graphic = rectangles(document)[3];
+    delete graphic.style.strokeColor;
+    delete graphic.style.color;
+    graphic.style.fillColor = "rgb(100%, 0%, 0%)";
+    const exported = exportDocumentToCdxml(document, { embedNativePayload: false });
+    expect(exported.warnings).toContainEqual(expect.objectContaining({
+      code: "cdxml.graphic_single_color", sourceObjectId: graphic.id,
+      message: expect.stringContaining("writes the fill #ff0000 and omits the outline #000000")
+    }));
+    expect(rectangles(requireDocument(openChemDraftPayload(exported.contents)))[3].style.fillColor).toBe("#ff0000");
+  });
+
+  it.each(["#336699", " None "])("handles outline %s without a loss warning", stroke => {
+    const document = requireDocument(importCdx(syntheticRectangles(rectangle(13))));
+    const graphic = rectangles(document)[3];
+    graphic.style.strokeColor = stroke;
+    graphic.style.fillColor = "#336699";
+    const exported = exportDocumentToCdxml(document, { embedNativePayload: false });
+    expect(exported.warnings.filter(warning => warning.sourceObjectId === graphic.id)).toHaveLength(0);
+    expect(rectangles(requireDocument(openChemDraftPayload(exported.contents)))[3].style.fillColor).toBe("#336699");
+  });
+
+  it("treats a padded none fill as absent", () => {
+    const document = requireDocument(importCdx(syntheticRectangles(rectangle(13))));
+    const graphic = rectangles(document)[3];
+    graphic.style.strokeColor = "#123456";
+    graphic.style.fillColor = " None ";
+    const exported = exportDocumentToCdxml(document, { embedNativePayload: false });
+    expect(exported.warnings.filter(warning => warning.sourceObjectId === graphic.id)).toHaveLength(0);
+    const reopened = rectangles(requireDocument(openChemDraftPayload(exported.contents)))[3];
+    expect(reopened.style.strokeColor).toBe("#123456");
+    expect(reopened.style.fillColor).toBe("none");
   });
 });
