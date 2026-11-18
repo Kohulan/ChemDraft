@@ -1,8 +1,8 @@
 name: Linux release
 
 # Builds the Linux packages for a release from the same tag as the macOS DMG and the Windows
-# installer: a .deb (Ubuntu, Linux Mint, Debian, Pop!_OS, elementary OS, …) and an AppImage (any
-# glibc-based distribution). Dispatch it with the same inputs as windows-release.yml:
+# installer: a .deb (Ubuntu, Linux Mint, Debian, Pop!_OS, elementary OS, …) and an AppImage.
+# Dispatch it with the same inputs as windows-release.yml:
 #
 #   gh workflow run linux-release.yml --ref v1.2.0 -f ref=v1.2.0 -f upload_to_release=v1.2.0
 #
@@ -53,17 +53,20 @@ jobs:
       DEBIAN_FRONTEND: noninteractive
       NEEDRESTART_MODE: a
     outputs:
+      commit: ${{ steps.source.outputs.commit }}
       version: ${{ steps.bundle.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Validate release source
+        id: source
         env:
           BUILD_REF: ${{ inputs.ref }}
+          WORKFLOW_SHA: ${{ github.sha }}
           RELEASE_TAG: ${{ inputs.upload_to_release }}
         run: |
           set -euo pipefail
@@ -75,9 +78,11 @@ jobs:
             [ "$tag_sha" = "$sha" ] || { echo '::error::ref must resolve to a repository tag.'; exit 1; }
           fi
           version=$(node -p "require('./apps/desktop/src-tauri/tauri.conf.json').version")
-          if [ -n "$RELEASE_TAG" ] && [ "$RELEASE_TAG" != "v$version" ]; then
-            echo "::error::upload_to_release must be v$version (the app version)."; exit 1
+          if [ -n "$RELEASE_TAG" ]; then
+            [ "$RELEASE_TAG" = "v$version" ] || { echo "::error::upload_to_release must be v$version (the app version)."; exit 1; }
+            [ "$sha" = "$WORKFLOW_SHA" ] || { echo '::error::Build ref must match the workflow commit. Dispatch with --ref <release-tag>.'; exit 1; }
           fi
+          echo "commit=$sha" >> "$GITHUB_OUTPUT"
           echo "Release source: $sha (version $version)"
 
       # The Tauri Linux build set: WebKitGTK 4.1 for the webview, librsvg for icons, patchelf and
@@ -125,7 +130,7 @@ jobs:
           export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/apps/desktop/src-tauri/resources/opsin/jre/lib/server"
           pnpm --filter @chemdraft/desktop build --bundles deb,appimage
 
-      - name: Verify stable bundle identity and stage packages
+      - name: Verify stable bundle identity
         id: bundle
         env:
           ARCH: ${{ matrix.arch }}
@@ -155,15 +160,13 @@ jobs:
           for path in usr/bin/chemdraft usr/bin/avogadro3d-sidecar usr/lib/ChemDraft/resources/opsin/jre/bin/java $licences; do
             grep -qxF "$path" <<<"$contents" || { echo "::error::$deb lacks $path"; exit 1; }
           done
-          mkdir -p release-assets
-          cp "$deb" "$appimage" release-assets/
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "deb=$(basename "$deb")" >> "$GITHUB_OUTPUT"
-          echo "appimage=$(basename "$appimage")" >> "$GITHUB_OUTPUT"
+          echo "deb=$deb" >> "$GITHUB_OUTPUT"
+          echo "appimage=$appimage" >> "$GITHUB_OUTPUT"
 
       - name: Repack AppImage with host Wayland and compiler runtimes
         env:
-          APPIMAGE: release-assets/${{ steps.bundle.outputs.appimage }}
+          APPIMAGE: ${{ steps.bundle.outputs.appimage }}
         run: |
           set -euo pipefail
           image="$GITHUB_WORKSPACE/$APPIMAGE"
@@ -199,32 +202,42 @@ jobs:
           fi
           mv ../repacked.AppImage "$image"
 
-      # Install the .deb like a user would and keep it running on a virtual display. This catches a
-      # missing library dependency and a crash during start-up (window creation, menus, palettes).
-      - name: Smoke test the installed .deb
+      - name: Install smoke test tools
+        run: sudo -E apt-get install -y --no-install-recommends dbus-daemon openbox strace xdotool xvfb
+
+      - name: Smoke test the repacked AppImage
+        uses: ./.github/workflows/linux-package-smoke
+        with:
+          bundle: ${{ steps.bundle.outputs.appimage }}
+          package: appimage
+          backend: x11
+          logs: ${{ runner.temp }}/smoke-appimage
+          check-window: 'true'
+
+      - name: Install the .deb
         env:
-          DEB: release-assets/${{ steps.bundle.outputs.deb }}
+          DEB: ${{ steps.bundle.outputs.deb }}
+        run: sudo -E apt-get install -y --no-install-recommends "./$DEB"
+
+      - name: Smoke test the installed .deb
+        uses: ./.github/workflows/linux-package-smoke
+        with:
+          bundle: /usr/bin/chemdraft
+          package: deb
+          backend: x11
+          logs: ${{ runner.temp }}/smoke-deb
+          check-window: 'true'
+
+      - name: Record and stage the final packages
+        env:
+          DEB: ${{ steps.bundle.outputs.deb }}
+          APPIMAGE: ${{ steps.bundle.outputs.appimage }}
         run: |
           set -euo pipefail
-          sudo -E apt-get install -y --no-install-recommends xvfb xdotool openbox "./$DEB"
-          export DISPLAY=:99
-          Xvfb "$DISPLAY" -screen 0 1600x1000x24 >/dev/null 2>&1 &
-          sleep 1
-          openbox >/dev/null 2>&1 &
-          env -u WEBKIT_DISABLE_DMABUF_RENDERER chemdraft > chemdraft-smoke.log 2>&1 &
-          pid=$!
-          for _ in $(seq 1 60); do
-            kill -0 "$pid" 2>/dev/null || { cat chemdraft-smoke.log; echo '::error::ChemDraft exited during start-up.'; exit 1; }
-            xdotool search --onlyvisible --name '^ChemDraft' >/dev/null 2>&1 && break
-            sleep 1
-          done
-          xdotool search --onlyvisible --name '^ChemDraft' >/dev/null || { cat chemdraft-smoke.log; echo '::error::No ChemDraft window appeared within 60 s.'; exit 1; }
-          # Stay up a while: palettes and the tooltip window are created after the document window.
-          sleep 20
-          kill -0 "$pid" 2>/dev/null || { cat chemdraft-smoke.log; echo '::error::ChemDraft crashed after start-up.'; exit 1; }
-          kill "$pid"
-          grep -n 'panicked' chemdraft-smoke.log && { echo '::error::ChemDraft panicked.'; exit 1; } || true
-          echo 'Smoke test passed: the installed .deb started and stayed up.'
+          node tools/release/record-build.mjs --artifact "$DEB" --target x86_64-unknown-linux-gnu
+          node tools/release/record-build.mjs --artifact "$APPIMAGE" --target x86_64-unknown-linux-gnu
+          mkdir -p release-assets
+          cp "$DEB" "$DEB.build.json" "$APPIMAGE" "$APPIMAGE.build.json" release-assets/
 
       - name: Print SHA-256 and sizes and write checksums
         run: |
@@ -234,7 +247,7 @@ jobs:
           sha256sum -- *.deb *.AppImage | tee SHA256SUMS-linux.txt
 
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-release-${{ matrix.arch }}
           path: release-assets/*
@@ -244,9 +257,17 @@ jobs:
     needs: build
     if: github.repository == 'jgassens/ChemDraft' && !github.event.repository.fork && inputs.upload_to_release != ''
     runs-on: ubuntu-latest
+    concurrency:
+      group: draft-release-upload-${{ inputs.upload_to_release }}
+      cancel-in-progress: false
     permissions:
-      contents: write # Only this job can upload release assets; no source code executes here.
+      contents: write # Upload and validate draft assets here; the build stays read-only.
     steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.build.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           pattern: linux-release-*
@@ -258,9 +279,26 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.upload_to_release }}
           VERSION: ${{ needs.build.outputs.version }}
+          BUILD_COMMIT: ${{ needs.build.outputs.commit }}
         run: |
           set -euo pipefail
           [ "$RELEASE_TAG" = "v$VERSION" ] || { echo '::error::Release tag must match the package version.'; exit 1; }
-          draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft) || { echo '::error::Target release must already exist.'; exit 1; }
-          [ "$draft" = true ] || { echo '::error::Refusing to upload to a published release.'; exit 1; }
+          draft_tag=$(gh release view "$RELEASE_TAG" --json isDraft,tagName --jq 'select(.isDraft).tagName') || { echo '::error::Target release must already exist.'; exit 1; }
+          [ "$draft_tag" = "$RELEASE_TAG" ] || { echo '::error::Refusing to upload outside the requested draft.'; exit 1; }
+          # Fetch immediately before upload and peel annotated tags.
+          git fetch --no-tags origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          destination_commit=$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")
+          [ "$destination_commit" = "$BUILD_COMMIT" ] || { echo '::error::Destination release tag does not match the built commit.'; exit 1; }
           gh release upload "$RELEASE_TAG" release-assets/* --clobber
+
+      - name: Check attached builds and refresh combined checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.upload_to_release }}
+          BUILD_COMMIT: ${{ needs.build.outputs.commit }}
+        run: |
+          set -euo pipefail
+          node tools/release/check-release-assets.mjs --tag "$RELEASE_TAG" --commit "$BUILD_COMMIT" \
+            --allow-incomplete --skip-dmg-provenance --write-checksums "$RUNNER_TEMP/SHA256SUMS.txt"
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/SHA256SUMS.txt" --clobber

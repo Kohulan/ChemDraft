@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { draftReleaseBody } from "./draft-release-body.mjs";
-import { BUILD_TARGETS } from "./record-build.mjs";
-import { arm, commit, fakeReleaseRunner, installer, intel, releaseFixture, updaterPublicKey, version } from "./release-test-fixtures.mjs";
+import { releaseBuildFiles } from "./release-assets.mjs";
+import { appImage, arm, commit, deb, fakeReleaseRunner, installer, intel, releaseFixture, updaterPublicKey, version } from "./release-test-fixtures.mjs";
 
 const feed = (name) => `<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel><item><sparkle:version>${version}</sparkle:version><enclosure url="https://example.com/${name}"/></item></channel></rss>`;
 
@@ -48,7 +48,8 @@ test("neither gap choice is refused, including by the CLI", (t) => {
   assert.match(result.stderr, /--gap.*--no-gaps/);
 });
 
-for (const name of [arm, intel, installer, `${installer}.sig`, "latest.json", "appcast.xml", "appcast-intel.xml", ...[arm, intel, installer].map((name) => `${name}.build.json`)]) {
+const buildNames = [arm, intel, installer, deb, appImage];
+for (const name of [...buildNames, `${installer}.sig`, "latest.json", "appcast.xml", "appcast-intel.xml", ...buildNames.map((name) => `${name}.build.json`)]) {
   test(`missing ${name} is named`, (t) => {
     const args = fixture(t);
     unlinkSync(join(args.assets, name));
@@ -101,10 +102,10 @@ for (const [field, value, message] of [
   });
 }
 
-for (const [target, suffix] of Object.entries(BUILD_TARGETS)) {
-  test(`differing ${target} commit and bytes are refused`, (t) => {
+for (const { name } of releaseBuildFiles(version)) {
+  test(`differing ${name} commit and bytes are refused`, (t) => {
     const args = fixture(t);
-    const file = join(args.assets, `ChemDraft_${version}_${suffix}`);
+    const file = join(args.assets, name);
     writeFileSync(file, "tampered bytes");
     assert.throws(() => draft(args), /SHA-256 mismatch/);
     const recordFile = `${file}.build.json`;

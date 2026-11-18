@@ -1,6 +1,6 @@
 // Shared, platform-neutral checks over the final artifact bytes and source identity.
 import { spawnSync } from "node:child_process";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { artifactDigest, BUILD_TARGETS, COMMIT_PATTERN } from "./record-build.mjs";
 import { loadUpdaterPublicKey, RELEASE_DOWNLOAD_BASE, verifyUpdaterSignature, WINDOWS_PLATFORM_KEY } from "./windows-updater.mjs";
@@ -55,13 +55,21 @@ export function expectedReleaseCommit({ commit, tag, rootDir }, { run = spawnSyn
 
 export function releaseBuildFiles(version) {
   if (!/^\d+\.\d+\.\d+$/.test(version ?? "")) throw new Error("Expected --version X.Y.Z");
-  return Object.entries(BUILD_TARGETS).map(([target, suffix]) => ({ target, name: `ChemDraft_${version}_${suffix}` }));
+  return Object.entries(BUILD_TARGETS).flatMap(([target, suffixes]) =>
+    suffixes.map((suffix) => ({ target, name: `ChemDraft_${version}_${suffix}` })));
 }
 
 export function missingBuildFiles(assets, version) {
   return releaseBuildFiles(version).flatMap(({ name }) => [name, `${name}.build.json`]).filter((name) => {
     try { return !statSync(join(assets, name)).isFile(); } catch { return true; }
   });
+}
+
+export function writeReleaseChecksums(assets, output) {
+  const checksums = readdirSync(assets).sort()
+    .filter((name) => name !== "SHA256SUMS.txt")
+    .map((name) => `${artifactDigest(join(assets, name)).sha256}  ${name}`);
+  writeFileSync(output, `${checksums.join("\n")}\n`);
 }
 
 export function verifyBuildAssets({ assets, version, expectedCommit, allowIncomplete = false }, { checkDmgCommit, updaterPublicKey } = {}) {
@@ -74,7 +82,7 @@ export function verifyBuildAssets({ assets, version, expectedCommit, allowIncomp
   // Feeds, checksums and notes are allowed; unexpected packages/signatures/records are not.
   const present = new Set(readdirSync(assets));
   for (const name of present) {
-    if (/\.(?:dmg|exe|build\.json|sig|msi|zip|pkg|tar\.gz)$/i.test(name) && !allowed.has(name)) errors.push(`Unexpected release build: ${name}`);
+    if (/\.(?:dmg|exe|deb|appimage|build\.json|sig|msi|zip|pkg|tar\.gz)$/i.test(name) && !allowed.has(name)) errors.push(`Unexpected release build: ${name}`);
   }
   let commonCommit;
   let commonBuild;

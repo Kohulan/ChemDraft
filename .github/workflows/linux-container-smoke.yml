@@ -61,6 +61,10 @@ jobs:
       BACKEND: ${{ matrix.backend }}
       DEBIAN_FRONTEND: noninteractive
     steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
       - uses: actions/download-artifact@v4
         with:
           name: ${{ inputs.artifact_name || 'linux-release-amd64' }}
@@ -117,95 +121,15 @@ jobs:
       # exercises GTK on Wayland and the AppImage WebKit subprocess startup/abort path against
       # newer host libraries. Neither display has a GPU or reproduces KDE Plasma rendering glitches.
       - name: Launch and watch the WebKit process
-        run: |
-          set -euo pipefail
-          logs="$GITHUB_WORKSPACE/smoke-logs"
-          install -d -o smoke "$logs"
-          runuser -u smoke -- dbus-run-session -- bash -s -- "$BUNDLE" "$PACKAGE" "$BACKEND" "$logs" <<'SMOKE'
-          set -euo pipefail
-          bundle=$1
-          package=$2
-          backend=$3
-          logs=$4
-          export XDG_RUNTIME_DIR
-          XDG_RUNTIME_DIR=$(mktemp -d)
-          unset DISPLAY WAYLAND_DISPLAY WEBKIT_DISABLE_DMABUF_RENDERER
-          if [[ "$backend" == wayland ]]; then
-            export WAYLAND_DISPLAY=chemdraft-smoke
-            weston --backend=headless --renderer=pixman --shell=kiosk-shell.so \
-              --socket="$WAYLAND_DISPLAY" --idle-time=0 > "$logs/display.log" 2>&1 &
-            ready="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
-          else
-            Xvfb -screen 0 1600x1000x24 -nolisten tcp -displayfd 3 \
-              3>"$logs/display-number" > "$logs/display.log" 2>&1 &
-            ready="$logs/display-number"
-          fi
-          display_pid=$!
-          launcher_pid=
-          main_pid=
-          trap 'kill ${main_pid:+"$main_pid"} ${launcher_pid:+"$launcher_pid"} "$display_pid" 2>/dev/null || true' EXIT
-          for _ in {1..20}; do
-            [[ -S "$ready" || -s "$ready" ]] && break
-            kill -0 "$display_pid"
-            sleep 1
-          done
-          if [[ "$backend" == x11 && -s "$ready" ]]; then
-            export DISPLAY=":$(<"$ready")"
-          elif [[ "$backend" != wayland || ! -S "$ready" ]]; then
-            echo "::error::$backend display did not start"
-            exit 1
-          fi
+        uses: ./.github/workflows/linux-package-smoke
+        with:
+          bundle: ${{ env.BUNDLE }}
+          package: ${{ matrix.package }}
+          backend: ${{ matrix.backend }}
+          logs: ${{ github.workspace }}/smoke-logs
+          container-user: smoke
 
-          # The disposable container already isolates the unprivileged app and can block
-          # WebKitGTK's nested bubblewrap namespaces. Production launches keep the sandbox.
-          export GDK_BACKEND="$backend" WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
-          command=("$bundle")
-          if [[ "$package" == appimage ]]; then
-            command+=(--appimage-extract-and-run)
-          fi
-          fail() {
-            cat "$logs/chemdraft.log"
-            echo "::error::$1"
-            exit 1
-          }
-          # Trace execs and process exits so a child SIGABRT fails even without a systemd journal.
-          smoke_uid=$(id -u)
-          web_process_running() {
-            pgrep -u "$smoke_uid" -f '(^|/)WebKitWebProcess([[:space:]:]|$)' >/dev/null
-          }
-          strace -f -e trace=execve -s 256 -o "$logs/process.log" "${command[@]}" \
-            > "$logs/chemdraft.log" 2>&1 &
-          launcher_pid=$!
-          for _ in {1..60}; do
-            kill -0 "$launcher_pid" 2>/dev/null || fail 'ChemDraft or its tracer exited during startup'
-            main_pid=$(pgrep -u "$smoke_uid" -x chemdraft || true)
-            if [[ -n "$main_pid" ]] && web_process_running; then
-              break
-            fi
-            sleep 1
-          done
-          [[ -n "$main_pid" ]] || fail 'ChemDraft did not launch'
-          web_process_running || fail 'No WebKitWebProcess stayed alive during startup'
-          for _ in {1..20}; do
-            sleep 1
-            kill -0 "$launcher_pid" "$main_pid" "$display_pid" 2>/dev/null \
-              || fail 'ChemDraft, its tracer, or the display exited during the 20-second smoke test'
-          done
-          if awk '
-            /execve\("[^"]*\/WebKitWebProcess"/ { webkit[$1] = 1 }
-            ($1 in webkit) && /\+\+\+ (killed by SIG(ABRT|BUS|FPE|ILL|KILL|SEGV|SYS|TRAP)|exited with [1-9])/ {
-              print
-              crashed = 1
-            }
-            END { exit !crashed }
-          ' "$logs/process.log" || grep -Ei 'web[ -]*process.*(crash|abort|segfault|terminated unexpectedly)|panicked at' "$logs/chemdraft.log"; then
-            fail 'A WebKit subprocess crashed or ChemDraft panicked'
-          fi
-          web_process_running || fail 'No WebKitWebProcess was alive at the end of the smoke test'
-          echo 'ChemDraft started WebKitWebProcess and stayed alive for 20 seconds.'
-          SMOKE
-
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: linux-smoke-${{ matrix.distro }}-${{ matrix.package }}-${{ matrix.backend }}

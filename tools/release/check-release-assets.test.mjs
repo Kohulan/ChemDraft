@@ -1,18 +1,20 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { checkReleaseAssets } from "./check-release-assets.mjs";
 import { artifactDigest } from "./record-build.mjs";
 import { expectedReleaseCommit } from "./release-assets.mjs";
 import { loadUpdaterPublicKey } from "./windows-updater.mjs";
-import { arm, commit, fakeReleaseRunner, installer, installerUrl, intel, releaseFixture, updaterPublicKey, updaterSignature, version, windowsPlatformKey } from "./release-test-fixtures.mjs";
+import { appImage, arm, commit, deb, fakeReleaseRunner, installer, installerUrl, intel, releaseFixture, updaterPublicKey, updaterSignature, version, windowsPlatformKey } from "./release-test-fixtures.mjs";
 
 const check = (args, options = {}) => checkReleaseAssets({ tag: `v${version}`, ...args }, { run: fakeReleaseRunner(), platform: "darwin", updaterPublicKey, ...options });
 
-test("folder gate accepts exactly three builds from the tag's commit", (t) => {
+const buildNames = [arm, intel, installer, deb, appImage];
+
+test("folder gate accepts exactly five builds from the tag's commit", (t) => {
   const args = releaseFixture(t);
-  assert.deepEqual(check(args), { complete: true, commit, builds: [arm, intel, installer] });
+  assert.deepEqual(check(args), { complete: true, commit, builds: buildNames });
 });
 
 for (const name of [arm, intel]) {
@@ -28,7 +30,7 @@ for (const name of [arm, intel]) {
   });
 }
 
-for (const name of [arm, intel, installer, ...[arm, intel, installer].map((name) => `${name}.build.json`)]) {
+for (const name of [...buildNames, ...buildNames.map((name) => `${name}.build.json`)]) {
   test(`asset checker names missing ${name}; incomplete workflow mode is not a pass`, (t) => {
     const args = releaseFixture(t);
     unlinkSync(join(args.assets, name));
@@ -38,13 +40,45 @@ for (const name of [arm, intel, installer, ...[arm, intel, installer].map((name)
   });
 }
 
-for (const extra of ["ChemDraft_1.2.2_aarch64.dmg", "ChemDraft_1.2.3_x64.dmg", "unexpected.exe", "other.dmg.build.json", "other.sig", "old.exe.sig", "other.msi", "other.zip", "other.pkg", "other.tar.gz", "OTHER.TAR.GZ"]) {
+for (const extra of ["ChemDraft_1.2.2_aarch64.dmg", "ChemDraft_1.2.3_x64.dmg", "unexpected.exe", "other.dmg.build.json", "other.sig", "old.exe.sig", "other.msi", "other.zip", "other.pkg", "other.tar.gz", "OTHER.TAR.GZ", "other.deb", "OTHER.APPIMAGE"]) {
   test(`extra build ${extra} is refused`, (t) => {
     const args = releaseFixture(t);
     writeFileSync(join(args.assets, extra), "stale build");
     assert.throws(() => check(args), (error) => error.message.includes(`Unexpected release build: ${extra}`));
   });
 }
+
+for (const name of [deb, appImage]) {
+  test(`asset checker rejects tampered ${name} bytes`, (t) => {
+    const args = releaseFixture(t);
+    writeFileSync(join(args.assets, name), "tampered");
+    for (const allowIncomplete of [false, true]) {
+      assert.throws(() => check({ ...args, allowIncomplete }), (error) =>
+        error.message.includes(`SHA-256 mismatch for ${name}`));
+    }
+  });
+}
+
+test("combined checksums refresh from the attached assets after a Linux rebuild", (t) => {
+  const { assets, rootDir } = releaseFixture(t);
+  const checksumOutput = join(rootDir, "SHA256SUMS.txt");
+  writeFileSync(join(assets, "SHA256SUMS.txt"), "stale combined checksums");
+  writeFileSync(join(assets, "SHA256SUMS-linux.txt"), "separate Linux manifest");
+  const refresh = () => {
+    check({ assets: undefined, checksumOutput }, { run: fakeReleaseRunner({ downloadFrom: assets }) });
+    return readFileSync(checksumOutput, "utf8");
+  };
+  const before = refresh();
+  const artifact = join(assets, appImage);
+  writeFileSync(artifact, "rebuilt AppImage");
+  const record = JSON.parse(readFileSync(`${artifact}.build.json`, "utf8"));
+  writeFileSync(`${artifact}.build.json`, JSON.stringify({ ...record, ...artifactDigest(artifact) }));
+  const after = refresh();
+  assert.notEqual(before, after);
+  assert.deepEqual(after.trimEnd().split("\n"), readdirSync(assets).sort()
+    .filter((name) => name !== "SHA256SUMS.txt")
+    .map((name) => `${artifactDigest(join(assets, name)).sha256}  ${name}`));
+});
 
 test("the expected Windows signature and latest.json verify against the installer", (t) => {
   const args = releaseFixture(t);
@@ -251,6 +285,30 @@ test("required CI jobs run the Node suites and release upload checks destination
   assert.match(workflow.split("\n  upload:")[0], /permissions:\n\s+contents: read/);
   assert.match(upload, /check-release-assets\.mjs --tag "\$env:RELEASE_TAG" --commit "\$env:BUILD_COMMIT" --allow-incomplete --skip-dmg-provenance/);
   assert.match(upload, /shell: pwsh[\s\S]*if \(\$LASTEXITCODE -ne 0\) \{ throw 'Release asset validation failed\.'/);
+});
+
+test("Linux records the smoke-tested packages before staging and checks the destination before upload", () => {
+  const workflow = readFileSync(new URL("../../.github/workflows/linux-release.yml", import.meta.url), "utf8");
+  const container = readFileSync(new URL("../../.github/workflows/linux-container-smoke.yml", import.meta.url), "utf8");
+  const windows = readFileSync(new URL("../../.github/workflows/windows-release.yml", import.meta.url), "utf8");
+  const [build, upload] = workflow.split("\n  upload:");
+  assert.match(build, /commit: \$\{\{ steps\.source\.outputs\.commit \}\}/);
+  assert.match(build, /\[ "\$sha" = "\$WORKFLOW_SHA" \]/);
+  assert.match(build, /Repack AppImage[\s\S]+Smoke test the repacked AppImage\n\s+uses: \.\/\.github\/workflows\/linux-package-smoke[\s\S]+package: appimage/);
+  assert.match(container, /uses: \.\/\.github\/workflows\/linux-package-smoke/);
+  for (const variable of ["DEB", "APPIMAGE"]) {
+    const record = build.indexOf(`record-build.mjs --artifact "$${variable}" --target x86_64-unknown-linux-gnu`);
+    assert.ok(record > build.indexOf("Smoke test the installed .deb"));
+    assert.ok(record < build.indexOf("mkdir -p release-assets"));
+    assert.ok(build.includes(`"$${variable}.build.json"`));
+  }
+  assert.match(upload, /BUILD_COMMIT: \$\{\{ needs\.build\.outputs\.commit \}\}/);
+  assert.match(upload, /git fetch --no-tags origin[^\n]+\n\s+destination_commit=\$\(git rev-parse --verify "refs\/tags\/\$\{RELEASE_TAG\}\^\{commit\}"\)/);
+  assert.match(upload, /\[ "\$destination_commit" = "\$BUILD_COMMIT" \].*exit 1; \}\n\s+gh release upload/);
+  assert.match(upload, /gh release upload[\s\S]+--write-checksums[\s\S]+gh release upload/);
+  const group = "group: draft-release-upload-${{ inputs.upload_to_release }}";
+  assert.ok(upload.includes(group));
+  assert.ok(windows.split("\n  upload:")[1].includes(group));
 });
 
 test("the final publishing checklist requires Mac verification of both DMGs without bypass flags", () => {

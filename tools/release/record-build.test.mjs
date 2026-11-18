@@ -4,9 +4,9 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { artifactDigest, BUILD_TARGETS, recordBuild } from "./record-build.mjs";
+import { artifactDigest, recordBuild } from "./record-build.mjs";
 import { macosReleasePlist } from "./macos-build-plist.mjs";
-import { fakeReleaseRunner } from "./release-test-fixtures.mjs";
+import { appImage, arm, deb, fakeReleaseRunner, installer, intel } from "./release-test-fixtures.mjs";
 
 const recordRunner = (options) => {
   const native = fakeReleaseRunner(options);
@@ -35,10 +35,14 @@ function fixture(t) {
   return { rootDir, tauriDir, commit: git("rev-parse", "HEAD") };
 }
 
-test("all three release artifacts record the checked-out full commit, version, target and cleanliness", (t) => {
+test("all five release artifacts record the checked-out full commit, version, target and cleanliness", (t) => {
   const { rootDir, commit } = fixture(t);
-  for (const [target, suffix] of Object.entries(BUILD_TARGETS)) {
-    const artifact = join(rootDir, "assets", `ChemDraft_1.2.3_${suffix}`);
+  for (const [target, name] of [
+    ["aarch64-apple-darwin", arm], ["x86_64-apple-darwin", intel],
+    ["x86_64-pc-windows-msvc", installer],
+    ["x86_64-unknown-linux-gnu", deb], ["x86_64-unknown-linux-gnu", appImage]
+  ]) {
+    const artifact = join(rootDir, "assets", name);
     writeFileSync(artifact, "fixture");
     const calls = [];
     recordBuild({ artifact, target, rootDir }, { run: recordRunner({ embeddedCommit: commit, calls }) });
@@ -47,10 +51,10 @@ test("all three release artifacts record the checked-out full commit, version, t
   }
 });
 
-for (const target of ["aarch64-apple-darwin", "x86_64-apple-darwin"]) {
+for (const [target, name] of [["aarch64-apple-darwin", arm], ["x86_64-apple-darwin", intel]]) {
   test(`recording ${target} refuses an unsigned-stamped app even with the correct source commit`, (t) => {
     const { rootDir, commit } = fixture(t);
-    const artifact = join(rootDir, "assets", `ChemDraft_1.2.3_${BUILD_TARGETS[target]}`);
+    const artifact = join(rootDir, "assets", name);
     writeFileSync(artifact, "synthetic unsigned DMG");
     const calls = [];
     assert.throws(() => recordBuild({ artifact, target, rootDir }, {
@@ -62,7 +66,7 @@ for (const target of ["aarch64-apple-darwin", "x86_64-apple-darwin"]) {
 
   test(`recording ${target} checks the DMG's embedded commit before writing a record`, (t) => {
     const { rootDir, commit } = fixture(t);
-    const artifact = join(rootDir, "assets", `ChemDraft_1.2.3_${BUILD_TARGETS[target]}`);
+    const artifact = join(rootDir, "assets", name);
     writeFileSync(artifact, "synthetic DMG");
     for (const embeddedCommit of [undefined, "short", "b".repeat(40)]) {
       const calls = [];

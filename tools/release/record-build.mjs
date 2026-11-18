@@ -12,9 +12,10 @@ export { COMMIT_PATTERN } from "./source-commit.mjs";
 
 const ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 export const BUILD_TARGETS = {
-  "aarch64-apple-darwin": "aarch64.dmg",
-  "x86_64-apple-darwin": "x86_64.dmg",
-  "x86_64-pc-windows-msvc": "x64-setup.exe"
+  "aarch64-apple-darwin": ["aarch64.dmg"],
+  "x86_64-apple-darwin": ["x86_64.dmg"],
+  "x86_64-pc-windows-msvc": ["x64-setup.exe"],
+  "x86_64-unknown-linux-gnu": ["amd64.deb", "amd64.AppImage"]
 };
 
 // Hash in bounded chunks: release installers and DMGs can be hundreds of MB.
@@ -54,8 +55,10 @@ export function buildSource(rootDir = ROOT, { run = spawnSync } = {}) {
 export function recordBuild({ artifact, target, rootDir = ROOT }, { run = spawnSync } = {}) {
   if (!Object.hasOwn(BUILD_TARGETS, target)) throw new Error(`Unsupported release target: ${target}`);
   const source = buildSource(rootDir, { run });
-  const expected = `ChemDraft_${source.version}_${BUILD_TARGETS[target]}`;
-  if (basename(artifact) !== expected || !statSync(artifact).isFile()) throw new Error(`Expected release artifact ${expected}`);
+  const expected = BUILD_TARGETS[target].map((suffix) => `ChemDraft_${source.version}_${suffix}`);
+  if (!expected.includes(basename(artifact)) || !statSync(artifact).isFile()) {
+    throw new Error(`Expected release artifact ${expected.join(" or ")}`);
+  }
   if (artifact.endsWith(".dmg")) verifyDmgSourceCommit(artifact, source.commit, { run });
   const record = { ...source, target, ...artifactDigest(artifact) };
   writeFileSync(`${artifact}.build.json`, `${JSON.stringify(record, null, 2)}\n`);

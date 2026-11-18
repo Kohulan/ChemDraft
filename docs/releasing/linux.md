@@ -6,9 +6,10 @@ GitHub-hosted Ubuntu 22.04 runner from the same tag as the macOS DMG and the Win
 | Package | For | Install |
 | --- | --- | --- |
 | `ChemDraft_<version>_amd64.deb` | Ubuntu 22.04+, Linux Mint 21+, Debian 12+, Pop!_OS, elementary OS, Zorin | `sudo apt install ./ChemDraft_<version>_amd64.deb` |
-| `ChemDraft_<version>_amd64.AppImage` | Other glibc-based distributions (Fedora, openSUSE, Arch, …) | `chmod +x ChemDraft_<version>_amd64.AppImage && ./ChemDraft_<version>_amd64.AppImage` |
+| `ChemDraft_<version>_amd64.AppImage` | x86-64 distributions with glibc 2.35 or later and compatible host graphics libraries | `chmod +x ChemDraft_<version>_amd64.AppImage && ./ChemDraft_<version>_amd64.AppImage` |
 
-`SHA256SUMS-linux.txt` lists both checksums.
+`SHA256SUMS-linux.txt` lists both package checksums. The combined `SHA256SUMS.txt` covers the
+packages, their `.build.json` records, and the other attached release assets.
 
 ## Why Ubuntu 22.04
 
@@ -28,6 +29,7 @@ gh workflow run linux-release.yml --ref v<version> -f ref=v<version> -f upload_t
 The workflow:
 
 1. Checks that `ref` is a tag (or full SHA) and that `upload_to_release` is `v<app version>`.
+   For uploads, the build ref must also match the workflow commit.
 2. Builds the OPSIN Java runtime on the runner and smoke-tests it (benzene).
 3. Builds a stable `.deb` and AppImage (`CHEMDRAFT_STABLE_BUILD=1`, no worktree label).
 4. Checks the bundle identity and that the `.deb` carries `chemdraft`, the 3D sidecar and the
@@ -35,11 +37,14 @@ The workflow:
 5. Repacks the AppImage after Tauri bundles it. It uses the host's Wayland and compiler runtime
    libraries, and the job verifies that the finished image contains no `libwayland-*`,
    `libstdc++.so*`, or `libgcc_s.so*` files or symlinks.
-6. Installs the `.deb` on the runner and starts it on a virtual display (Xvfb + openbox). It fails
-   if a library is missing, if ChemDraft exits or panics during start-up, or if no window appears.
-7. Uploads the packages and checksums to the draft release, never to a published one.
+6. Runs the repacked AppImage with `--appimage-extract-and-run` and installs and runs the `.deb`.
+   Both smoke tests use Xvfb and openbox and fail if the window fails to appear, ChemDraft exits or
+   panics during startup, or a WebKitWebProcess crashes.
+7. Records the source commit and final bytes of each package. Before uploading, it fetches the
+   draft's tag and checks that the tag resolves to the build commit. It then validates the attached
+   builds and refreshes the combined checksums.
 
-The release body gets a `## Linux` section beside `## macOS` and `## Windows`.
+Add a `## Linux` section when preparing the release body.
 
 ## Container smoke test
 
@@ -72,9 +77,8 @@ repository on GitHub Pages, or a Flathub listing.
   ChemDraft defaults `WEBKIT_DISABLE_DMABUF_RENDERER` to `1` to avoid Wayland graphics
   problems. An explicit value, including `0`, takes precedence.
 - Menus: on the document window, as on Windows (`install_app_menu`). Edit ▸ Cut / Copy / Paste
-  are routed commands (`clipboard_edit_menu_item`), not muda's predefined items: on Linux those
-  only fake a key press through libxdo, which does nothing on Wayland and was unreliable on X11.
-  They carry no accelerator, so Ctrl+X / C / V keep reaching the webview (and focused text fields).
+  invoke WebKitGTK's native editing commands in the focused window. The webview receives
+  Ctrl+X / C / V directly and uses the same clipboard events for menu clicks and shortcuts.
 - 3D: the `avogadro3d-sidecar` for Linux is still the placeholder (`binaries/README.md`), so 3D
   reports itself unavailable until a real Linux sidecar is built.
 - Clipboard: `linux_clipboard.rs`, GTK's clipboard (X11 and Wayland). Targets are MIME types, so
