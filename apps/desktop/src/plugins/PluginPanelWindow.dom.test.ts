@@ -464,7 +464,7 @@ describe("PluginPanelWindow (unified renderer, ADR-0030)", () => {
     // Closing (CloseRequested) and the panel's own hide command restore explicitly too.
     expect(source).toMatch(/if let WindowEvent::CloseRequested \{ api, \.\. \} = event \{\s*panel_full_size::will_hide\(window\);/);
     const controls = readFileSync(join(nativePath, "panel_window_controls.rs"), "utf8");
-    expect(controls).toMatch(/panel_full_size::set\(window, false, 0\.0, 0\.0\)\?;\s*window\.hide\(\)/);
+    expect(controls).toMatch(/panel_full_size::set\(window, false, 0\.0, 0\.0\)\?;\s*if let Err\(error\) = super::persist_plugin_panel_geometry\(window\)[\s\S]*?window\.hide\(\)/);
     // So does the document window's hide of a panel, on the main thread, through a caller-bound command.
     expect(controls).toMatch(/authorize_main_hide\(window\.label\(\), &label\)\?;/);
     expect(controls).toMatch(/\|\| super::panel_full_size::before_hide\(window\),\s*\|\| window\.hide\(\)/);
@@ -539,6 +539,52 @@ describe("PluginPanelWindow (unified renderer, ADR-0030)", () => {
     expect(mac).toContain("view.isDescendantOf(content)");
     expect(mac).toContain("view.isHidden()");
     expect(mac).toContain("panel.styleMask().bits()");
+  });
+
+  it("checks a hidden panel's current reachability before reopening or restoring it", () => {
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../src-tauri/src/lib.rs"), "utf8");
+    const reuse = source.split("fn build_or_show_plugin_panel<")[1]!.split("let saved =")[0]!;
+    expect(reuse).toMatch(/run_on_main_thread_blocking\(&window, move \|\| \{[^}]*recover_hidden_plugin_panel_frame\(&target, Some\(&request\)\)\?;\s*reveal_plugin_panel\(&target\)/);
+    const restore = source.split("fn restore_utility_in_document_group<")[1]!.split("fn restore_utility_window<")[0]!;
+    expect(restore).toMatch(/if is_plugin_panel_window_label\(window.label\(\)\) \{\s*recover_hidden_plugin_panel_frame\(window, None\)\?;\s*\}\s*restore_utility_window\(/);
+    const recovery = source.split("fn recover_hidden_plugin_panel_frame<")[1]!.split("fn current_plugin_panel_geometry<")[0]!;
+    expect(recovery).toMatch(/if target\.is_visible\(\)[^\n]*\.is_minimized\(\)[\s\S]*return Ok\(\(\)\);[\s\S]*current_plugin_panel_geometry/);
+    expect(recovery).toMatch(/Frame::hidden_reopen[\s\S]*if let Some\(placement\) = placement[\s\S]*panel_full_size::apply/);
+  });
+
+  it("keeps the initial frame off a panel once it can be dragged", () => {
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../src-tauri/src/lib.rs"), "utf8");
+    const build = source.split("fn build_or_show_plugin_panel<")[1]!.split("fn reveal_plugin_panel<")[0]!;
+    expect(build).toContain(".focused(false)\n    .visible(false)");
+    expect(build).toMatch(/if !cfg!\(target_os = "macos"\) && utility_window_has_document_parent\(&label\) \{[\s\S]*builder.parent\(&main\)/);
+    expect(build).toMatch(/placement\.filter\(\|_\| !target.is_visible\(\)\.unwrap_or\(true\)\)[\s\S]*panel_full_size::apply/);
+    const afterInstall = build.split("panel_window::finish_installation")[1]!;
+    expect(afterInstall).toMatch(/run_on_main_thread_blocking\(&window,[\s\S]*reveal_plugin_panel\(&target\)/);
+  });
+
+  it("shows Windows panels only while hidden and sets focusability after the show", () => {
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../src-tauri/src/lib.rs"), "utf8");
+    const reveal = source.split("fn reveal_plugin_panel<")[2]!.split("fn recover_hidden_plugin_panel_frame<")[0]!;
+    expect(reveal).toMatch(/if !window\.is_visible\(\)[^\n]*\{\s*window\.show\(\)[^\n]*\n\s*window\s*\.set_focusable\(false\)/);
+  });
+
+  it("reattaches visible macOS reports when their document returns", () => {
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../src-tauri/src/lib.rs"), "utf8");
+    expect(source).toMatch(/WindowEvent::Focused\(true\) => \{\s*#\[cfg\(target_os = "macos"\)\]\s*reattach_visible_plugin_panels\(window.app_handle\(\)\)/);
+    const attach = source.split("fn attach_to_main_window<")[1]!.split("/// Whether the document")[0]!;
+    expect(attach).toContain("!main.isVisible() || !child.isVisible()");
+    expect(attach).toMatch(/fn reattach_visible_plugin_panels<[\s\S]*if is_plugin_panel_window_label\(&label\) \{\s*attach_webview_window_to_main\(&panel\)/);
+  });
+
+  it("guards every panel frame save with current visibility and minimized state", () => {
+    const nativePath = join(dirname(fileURLToPath(import.meta.url)), "../../src-tauri/src");
+    const source = readFileSync(join(nativePath, "lib.rs"), "utf8");
+    const persist = source.split("fn save_plugin_panel_frame<")[1]!.split("fn update_main_window_geometry(")[0]!;
+    expect(persist).toMatch(/if !window\.is_visible\(\)\.unwrap_or\(false\)[\s\S]*return Ok\(\(\)\)/);
+    expect(persist).toMatch(/Frame::for_save\(\s*native.minimized \|\| window.is_minimized\(\)[\s\S]*layout.plugin_panels.insert/);
+    const fullSize = readFileSync(join(nativePath, "panel_full_size.rs"), "utf8");
+    const quit = fullSize.split("fn restore_all<")[1]!.split("fn forget<")[0]!;
+    expect(quit).toMatch(/&& window\.is_visible\(\)\.unwrap_or\(false\) \{[\s\S]*will_hide\(/);
   });
 
   it("keeps resizing a creation trait and skips redundant AppKit style-mask setters", () => {

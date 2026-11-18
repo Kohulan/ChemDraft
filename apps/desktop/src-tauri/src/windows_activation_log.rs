@@ -31,3 +31,19 @@ pub(crate) fn init(enabled: bool) {
 
 #[cfg(not(windows))]
 pub(crate) fn init(_enabled: bool) {}
+
+/// Frame writes use the same opt-in debug sink as focus and activation diagnostics.
+pub(super) fn frame_set<P: std::fmt::Debug, S: std::fmt::Debug>(
+    label: &str,
+    reason: &str,
+    units: &str,
+    frame: impl FnOnce() -> (P, S),
+) {
+    if cfg!(debug_assertions)
+        && log::log_enabled!(target: "chemdraft::windows_activation", log::Level::Debug)
+    {
+        let (position, size) = frame();
+        log::debug!(target: "chemdraft::windows_activation",
+            "set utility frame label={label} reason={reason} units={units} position={position:?} size={size:?}");
+    }
+}

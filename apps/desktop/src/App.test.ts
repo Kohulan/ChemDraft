@@ -374,9 +374,9 @@ describe("ChemDraft desktop shell", () => {
   });
 
   it("opens analysis windows without focus and lends focus only to their editable controls", () => {
-    expect(desktopNativeSource).toContain("focused_on_build: false,");
-    expect(desktopNativeSource).toContain(".focused(presentation.focused_on_build)");
-    expect(desktopNativeSource).toContain("configure_analysis_window(&window)");
+    const buildPanel = desktopNativeSource.split("fn build_or_show_plugin_panel<")[1]!.split("fn reveal_plugin_panel<")[0]!;
+    expect(buildPanel).toContain(".focused(false)");
+    expect(buildPanel).toContain("reveal_plugin_panel(&target)");
     expect(desktopNativeSource).not.toContain("focus_after_show");
     expect(desktopNativeSource).toContain("validate_plugin_panel_focus_caller(window.label())?");
     expect(desktopNativeSource).toMatch(/async fn set_plugin_panel_input_focus\(/);

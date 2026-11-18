@@ -4,6 +4,7 @@ use super::ScreenRect;
 
 pub(super) const MIN_WIDTH: f64 = 280.0;
 pub(super) const MIN_HEIGHT: f64 = 200.0;
+const TITLE_HEIGHT: f64 = 28.0;
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -149,8 +150,8 @@ impl Frame {
         let width = self.width.clamp(MIN_WIDTH, area.width);
         let height = self.height.clamp(MIN_HEIGHT, area.height);
         Self {
-            x: self.x.clamp(area.x, area.x + area.width - width),
-            y: self.y.clamp(area.y, area.y + area.height - height),
+            x: self.x.clamp(area.x, area.x + (area.width - width)),
+            y: self.y.clamp(area.y, area.y + (area.height - height)),
             width,
             height,
             ..self.clone()
@@ -159,7 +160,36 @@ impl Frame {
 
     pub fn restore(&self, monitors: &[Monitor]) -> Option<Placement> {
         let monitor = self.attached_monitor(monitors)?;
-        Some(self.clamped(monitor.work_area).placement(monitor))
+        Some(self.restored_placement(monitor))
+    }
+
+    pub fn hidden_reopen(
+        live: Option<&Self>,
+        monitors: &[Monitor],
+        fallback: impl FnOnce() -> Option<Placement>,
+    ) -> Option<Placement> {
+        let Some((frame, monitor)) = live.and_then(|frame| {
+            frame
+                .attached_monitor(monitors)
+                .map(|monitor| (frame, monitor))
+        }) else {
+            return fallback();
+        };
+        let restored = frame.restored_placement(monitor);
+        (restored != frame.placement(monitor)).then_some(restored)
+    }
+
+    fn restored_placement(&self, monitor: &Monitor) -> Placement {
+        let area = monitor.work_area;
+        // The title strip is reachable. Preserve the user's origin even if a normal-size
+        // panel extends past the right or bottom edge. Clamp if its dimensions need correction.
+        if (MIN_WIDTH..=area.width).contains(&self.width)
+            && (MIN_HEIGHT..=area.height).contains(&self.height)
+        {
+            self.placement(monitor)
+        } else {
+            self.clamped(area).placement(monitor)
+        }
     }
 
     pub fn restore_normal(&self, monitors: &[Monitor]) -> Option<Placement> {
@@ -176,14 +206,11 @@ impl Frame {
             .iter()
             .find(|m| m.identity == self.monitor && m.valid())?;
         let area = monitor.work_area;
-        if self.x + self.width / 2.0 < area.x
-            || self.x + self.width / 2.0 > area.x + area.width
-            || self.y < area.y - 1.0
-            || self.y + 22.0 > area.y + area.height
-        {
-            return None;
-        }
-        Some(monitor)
+        // The right edge can contain the Run again button, so keep the label reachable when
+        // the left edge is off-screen.
+        (self.x + self.width / 2.0 >= area.x
+            && area.contains_title_strip(self.x, self.y, self.width, TITLE_HEIGHT))
+        .then_some(monitor)
     }
 
     fn placement(&self, monitor: &Monitor) -> Placement {
@@ -242,12 +269,15 @@ impl Frame {
     }
 
     pub fn for_save(
-        self,
         minimized: bool,
         owner_minimized: bool,
         fullscreen: bool,
+        sample: impl FnOnce() -> Option<Self>,
     ) -> Option<Self> {
-        (!minimized && !owner_minimized && !fullscreen && self.valid()).then_some(self)
+        if minimized || owner_minimized || fullscreen {
+            return None;
+        }
+        sample().filter(Self::valid)
     }
 }
 
@@ -313,6 +343,102 @@ mod tests {
         assert_eq!(
             saved.restore(&[primary, secondary]).unwrap().position,
             (2200, 160)
+        );
+    }
+
+    #[test]
+    fn reopening_preserves_a_reachable_frame_with_edges_outside_the_work_area() {
+        for scale in [1.0, 1.5, 2.0] {
+            let mut destination = monitor((-1920, 0), scale);
+            destination.work_area = ScreenRect::new(0.0, 0.0, 950.0, 660.0);
+            let saved = Frame {
+                x: 286.0,
+                y: 90.0,
+                width: 940.0,
+                height: 660.0,
+                ..frame(&destination)
+            };
+            let expected = Placement {
+                position: (-1920 + (286.0 * scale) as i32, (90.0 * scale) as i32),
+                size: ((940.0 * scale) as u32, (660.0 * scale) as u32),
+                scale,
+            };
+            assert_eq!(
+                saved.restore(&[monitor((0, 0), 1.0), destination]),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_reopen_applies_a_work_area_correction_without_replaying_a_reachable_origin() {
+        let original = monitor((0, 0), 1.0);
+        let dragged = Frame {
+            x: 250.0,
+            y: 160.0,
+            width: 940.0,
+            height: 660.0,
+            ..frame(&original)
+        };
+        let no_fallback = || panic!("a reachable live title needs no default placement");
+        assert_eq!(
+            Frame::hidden_reopen(Some(&dragged), std::slice::from_ref(&original), no_fallback),
+            None
+        );
+        let mut reduced = original;
+        reduced.work_area = ScreenRect::new(0.0, 24.0, 950.0, 560.0);
+        assert_eq!(
+            Frame::hidden_reopen(Some(&dragged), &[reduced], no_fallback),
+            Some(Placement {
+                position: (10, 24),
+                size: (940, 560),
+                scale: 1.0,
+            })
+        );
+    }
+
+    #[test]
+    fn hidden_reopen_recovers_a_title_outside_the_work_area() {
+        let mut display = monitor((0, 0), 1.0);
+        display.work_area = ScreenRect::new(0.0, 24.0, 950.0, 636.0);
+        let fallback = Placement {
+            position: (0, 24),
+            size: (600, 500),
+            scale: 1.0,
+        };
+        for (x, y) in [
+            (-550.0, 100.0),
+            (100.0, -100.0),
+            (100.0, 0.0),
+            (903.0, 632.0),
+            (902.0, 633.0),
+        ] {
+            let live = Frame {
+                x,
+                y,
+                ..frame(&display)
+            };
+            assert_eq!(
+                Frame::hidden_reopen(Some(&live), std::slice::from_ref(&display), || Some(
+                    fallback
+                )),
+                Some(fallback),
+            );
+        }
+        let live = Frame {
+            x: 902.0,
+            y: 632.0,
+            ..frame(&display)
+        };
+        assert_eq!(
+            live.restore(std::slice::from_ref(&display))
+                .unwrap()
+                .position,
+            (902, 632)
+        );
+        assert_eq!(
+            Frame::hidden_reopen(Some(&live), &[display], || panic!("title is reachable")),
+            None,
         );
     }
 
@@ -385,7 +511,7 @@ mod tests {
     #[test]
     fn restore_keeps_title_strip_guard_and_clamps_size_position_and_minimum() {
         let m = monitor((1920, 0), 2.0);
-        for y in [0.0, 790.0] {
+        for y in [-100.0, 0.0, 24.0, 774.0, 790.0] {
             assert_eq!(
                 Frame { y, ..frame(&m) }.restore(std::slice::from_ref(&m)),
                 None
@@ -492,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn live_normal_restore_is_exact_even_when_the_window_extends_past_the_work_area() {
+    fn both_restores_keep_the_origin_of_a_reachable_normal_size_frame() {
         let m = monitor((1920, 0), 2.0);
         let normal = Frame {
             x: 500.0,
@@ -507,7 +633,7 @@ mod tests {
             normal.restore_normal(std::slice::from_ref(&m)),
             Some(expected)
         );
-        assert_ne!(normal.restore(&[m]), Some(expected));
+        assert_eq!(normal.restore(&[m]), Some(expected));
     }
 
     #[test]
@@ -515,7 +641,9 @@ mod tests {
         let m = monitor((1920, 0), 2.0);
         for flags in 1..8 {
             assert_eq!(
-                frame(&m).for_save(flags & 1 != 0, flags & 2 != 0, flags & 4 != 0),
+                Frame::for_save(flags & 1 != 0, flags & 2 != 0, flags & 4 != 0, || {
+                    panic!("a transient panel must not be sampled")
+                }),
                 None
             );
         }
@@ -524,7 +652,10 @@ mod tests {
                 width: bad,
                 ..frame(&m)
             };
-            assert_eq!(invalid.clone().for_save(false, false, false), None);
+            assert_eq!(
+                Frame::for_save(false, false, false, || Some(invalid.clone())),
+                None
+            );
             assert_eq!(invalid.restore(std::slice::from_ref(&m)), None);
             let mut invalid_monitor = m.clone();
             invalid_monitor.scale = bad;
