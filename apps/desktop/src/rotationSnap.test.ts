@@ -11,34 +11,83 @@ function atAngle(degrees: number, radius = 20) {
 describe("pointer rotation sweep", () => {
   it.each([20, 200])("turns 45° along a %spx radius", (radius) => {
     const turn = createRotationSweep(center, atAngle(0, radius));
-    turn.update(atAngle(45, radius));
+    turn.update(atAngle(45, radius), 1);
     expect(turn.degrees).toBe(45);
   });
 
   it.each([1, -1])("keeps accumulating in direction %s through 180° and past one full turn", (direction) => {
     const turn = createRotationSweep(center, atAngle(0));
     for (const angle of [90, 170, 180, 190, 270, 360, 405]) {
-      turn.update(atAngle(direction * angle));
+      turn.update(atAngle(direction * angle), 1);
       expect(turn.degrees).toBe(direction * angle);
     }
   });
 
   it("holds the previous turn at the center and resumes from the new bearing", () => {
     const turn = createRotationSweep(center, atAngle(0));
-    turn.update(atAngle(45));
+    turn.update(atAngle(45), 1);
     for (const point of [center, atAngle(135, 0.5), atAngle(225)]) {
-      turn.update(point);
+      turn.update(point, 1);
       expect(turn.degrees).toBe(45);
     }
-    turn.update(atAngle(240));
+    turn.update(atAngle(240), 1);
     expect(turn.degrees).toBe(60);
+  });
+
+  it("holds and rebases on a pivot crossing with or without a sample at the pivot", () => {
+    const scale = 2;
+    const beforePivot = { x: center.x - 5, y: center.y };
+    const afterPivot = { x: center.x + 5, y: center.y };
+    const fast = createRotationSweep(center, atAngle(135, 5));
+    const slow = createRotationSweep(center, atAngle(135, 5));
+    for (const turn of [fast, slow]) {
+      turn.update(beforePivot, scale);
+      expect(turn.degrees).toBe(45);
+    }
+
+    slow.update(center, scale);
+    expect(slow.degrees).toBe(45);
+    for (const turn of [fast, slow]) {
+      turn.update(afterPivot, scale);
+      expect(turn.degrees).toBe(45);
+      turn.update(atAngle(45, 5), scale);
+      expect(turn.degrees).toBe(90);
+    }
+  });
+
+  it("holds when the segment passes near the pivot with both samples outside the hold radius", () => {
+    const turn = createRotationSweep(center, { x: center.x - 10, y: center.y + 5 });
+    turn.update({ x: center.x + 10, y: center.y + 5 }, 1);
+    expect(turn.degrees).toBe(0);
+  });
+
+  describe.each([0.5, 8.5])("at view scale %s", (scale) => {
+    it("holds a one-CSS-pixel wobble near the pivot", () => {
+      const start = { x: center.x + 1 / scale, y: center.y };
+      const turn = createRotationSweep(center, start);
+      turn.update({ x: start.x, y: start.y + 1 / scale }, scale);
+      expect(turn.degrees).toBe(0);
+    });
+
+    it.each([[5.5, 0], [6.5, 15]])("turns %s CSS pixels from the pivot by %s°", (radius, expected) => {
+      const turn = createRotationSweep(center, atAngle(0, radius / scale));
+      turn.update(atAngle(15, radius / scale), scale);
+      expect(turn.degrees).toBe(expected);
+    });
+
+    it("turns 45° along a normal arc", () => {
+      const radius = 20 / scale;
+      const turn = createRotationSweep(center, atAngle(0, radius));
+      turn.update(atAngle(45, radius), scale);
+      expect(turn.degrees).toBe(45);
+    });
   });
 
   it("starts at zero if the drag begins at the center", () => {
     const turn = createRotationSweep(center, center);
-    turn.update(atAngle(120));
+    turn.update(atAngle(120), 1);
     expect(turn.degrees).toBe(0);
-    turn.update(atAngle(105));
+    turn.update(atAngle(105), 1);
     expect(turn.degrees).toBe(-15);
   });
 });
@@ -97,7 +146,7 @@ describe("rotation drag snapping", () => {
 
   it("snaps a 45° pointer arc from a 7° starting orientation to 45° with Shift", () => {
     const turn = createRotationSweep(center, atAngle(0));
-    turn.update(atAngle(45));
+    turn.update(atAngle(45), 1);
     const referenceDegrees = 7;
     expect(referenceDegrees + snapRotationDegrees(turn.degrees, { referenceDegrees, shiftKey: true })).toBe(45);
   });

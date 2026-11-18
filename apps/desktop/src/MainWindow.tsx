@@ -18145,7 +18145,7 @@ export function MainWindow({
       }
       groupTransform.latestPoint = point;
       groupTransform.shiftKey = event.shiftKey;
-      groupTransform.rotationSweep?.update(point);
+      groupTransform.rotationSweep?.update(point, viewportRef.current.scale);
       groupTransformMachineRef.current = interactionReducer(groupTransformMachineRef.current, { type: "pointerMove", pointerId: event.pointerId, world: point, target: { kind: "empty" } });
       const nowDragging = groupTransformMachineRef.current.phase === "dragging";
       if (!groupTransform.dragging && nowDragging) {
@@ -18253,7 +18253,7 @@ export function MainWindow({
         return;
       }
 
-      objectRotateDrag.rotationSweep.update(point);
+      objectRotateDrag.rotationSweep.update(point, viewportRef.current.scale);
       objectRotateDrag.shiftKey = event.shiftKey;
       objectRotateMachineRef.current = interactionReducer(objectRotateMachineRef.current, { type: "pointerMove", pointerId: event.pointerId, world: point, target: { kind: "empty" } });
       const nowDragging = objectRotateMachineRef.current.phase === "dragging";
@@ -21347,7 +21347,7 @@ export function MainWindow({
         return;
       }
 
-      objectRotateDrag.rotationSweep.update(point);
+      objectRotateDrag.rotationSweep.update(point, viewportRef.current.scale);
       objectRotateDrag.shiftKey = event.shiftKey;
       objectRotateMachineRef.current = interactionReducer(objectRotateMachineRef.current, { type: "pointerMove", pointerId: event.pointerId, world: point, target: { kind: "empty" } });
       const nowDragging = objectRotateMachineRef.current.phase === "dragging";
