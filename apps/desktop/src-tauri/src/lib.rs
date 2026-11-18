@@ -5519,11 +5519,29 @@ fn plugin_panel_initial_geometry<R: Runtime>(
     saved: Option<panel_window_frame::Frame>,
 ) -> (f64, f64, Option<panel_window_frame::Placement>) {
     let (width, height) = panel_window_frame::default_size(request.width, request.height);
-    let placement = saved
-        .as_ref()
-        .and_then(|frame| plugin_panel_saved_placement(app, frame))
-        .or_else(|| plugin_panel_default_placement(app, width, height));
+    let placement = match saved.as_ref() {
+        Some(frame) => plugin_panel_saved_placement(app, frame),
+        None => plugin_panel_first_placement(app, (width, height)),
+    }
+    .or_else(|| plugin_panel_default_placement(app, width, height));
     (width, height, placement)
+}
+
+fn plugin_panel_first_placement<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    size: (f64, f64),
+) -> Option<panel_window_frame::Placement> {
+    let owner = app.get_webview_window(MAIN_WINDOW_LABEL)?;
+    let monitor =
+        panel_window_frame::Monitor::from_native(&owner.current_monitor().ok().flatten()?);
+    let position = owner.inner_position().ok()?;
+    let owner_size = owner.inner_size().ok()?;
+    panel_window_frame::Frame::first_placement(
+        (position.x, position.y),
+        (owner_size.width, owner_size.height),
+        size,
+        &monitor,
+    )
 }
 
 fn plugin_panel_saved_placement<R: Runtime>(

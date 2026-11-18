@@ -120,6 +120,34 @@ pub(super) fn default_size(width: Option<f64>, height: Option<f64>) -> (f64, f64
 }
 
 impl Frame {
+    pub fn first_placement(
+        owner_position: (i32, i32),
+        owner_size: (u32, u32),
+        size: (f64, f64),
+        monitor: &Monitor,
+    ) -> Option<Placement> {
+        let owner = Self::from_physical(owner_position, owner_size, monitor)?;
+        let area = monitor.work_area;
+        let width = size.0.min(area.width);
+        let height = size.1.min(area.height);
+        let (x, y) = super::dialog_windows::centered_window_origin(
+            ScreenRect::new(owner.x, owner.y, owner.width, owner.height),
+            (width, height),
+        );
+        let panel = Self {
+            x,
+            y,
+            width,
+            height,
+            ..owner
+        };
+        Some(if panel.title_strip_reachable(area) {
+            panel.placement(monitor)
+        } else {
+            panel.clamped(area).placement(monitor)
+        })
+    }
+
     pub fn from_physical(
         position: (i32, i32),
         size: (u32, u32),
@@ -205,12 +233,15 @@ impl Frame {
         let monitor = monitors
             .iter()
             .find(|m| m.identity == self.monitor && m.valid())?;
-        let area = monitor.work_area;
+        self.title_strip_reachable(monitor.work_area)
+            .then_some(monitor)
+    }
+
+    fn title_strip_reachable(&self, area: ScreenRect) -> bool {
         // The right edge can contain the Run again button, so keep the label reachable when
         // the left edge is off-screen.
-        (self.x + self.width / 2.0 >= area.x
-            && area.contains_title_strip(self.x, self.y, self.width, TITLE_HEIGHT))
-        .then_some(monitor)
+        self.x + self.width / 2.0 >= area.x
+            && area.contains_title_strip(self.x, self.y, self.width, TITLE_HEIGHT)
     }
 
     fn placement(&self, monitor: &Monitor) -> Placement {
@@ -304,6 +335,43 @@ mod tests {
             width: 600.0,
             height: 500.0,
         }
+    }
+
+    #[test]
+    fn first_placement_centers_over_the_owner_and_recovers_an_unreachable_title() {
+        let size = default_size(None, None);
+        let display = monitor((0, 0), 1.0);
+        assert_eq!(
+            Frame::first_placement((200, 140), (1000, 800), size, &display),
+            Some(Placement {
+                position: (510, 280),
+                size: (380, 520),
+                scale: 1.0,
+            })
+        );
+        // A reachable title lets the centered panel extend past an edge.
+        assert_eq!(
+            Frame::first_placement((-100, 140), (380, 800), size, &display)
+                .unwrap()
+                .position,
+            (-100, 280)
+        );
+        assert_eq!(
+            Frame::first_placement((0, 25), (300, 300), size, &display)
+                .unwrap()
+                .position,
+            (0, 25)
+        );
+
+        let display = monitor((-1920, -100), 2.0);
+        assert_eq!(
+            Frame::first_placement((-1720, 100), (1400, 1200), size, &display),
+            Some(Placement {
+                position: (-1400, 180),
+                size: (760, 1040),
+                scale: 2.0,
+            })
+        );
     }
 
     #[test]
