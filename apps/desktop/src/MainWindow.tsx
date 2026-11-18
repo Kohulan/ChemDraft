@@ -80,6 +80,7 @@ import {
   restoreSessionWarningReports,
   TOGGLE_OPEN_WARNINGS_COMMAND_ID,
   warningCountLabel,
+  type OpenWarning,
   type OpenWarningSelection,
   type OpenWarningsReport
 } from "./openWarnings";
@@ -121,6 +122,7 @@ import {
 import {
   CSS_PX_PER_INCH,
   DefaultNativeTextStyle,
+  TABLE_LIMITS,
   admitParsedDocument,
   adoptDerivedDocument,
   applyPatches,
@@ -1788,7 +1790,14 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.18.14.10-codex";
+const CURRENT_BUILD_STAMP = "11.18.16.40-codex";
+const TABLE_DRAFT_RECOVERY_WARNING = "session.tableDraftDropped";
+
+function clearTableDraftRecoveryWarnings(report: OpenWarningsReport | undefined): OpenWarningsReport | undefined {
+  if (!report?.warnings.some(warning => warning.code === TABLE_DRAFT_RECOVERY_WARNING)) return report;
+  const warnings = report.warnings.filter(warning => warning.code !== TABLE_DRAFT_RECOVERY_WARNING);
+  return warnings.length ? { ...report, warnings } : undefined;
+}
 const VibeCodeGuideForm = lazy(() => import("./dialogs/VibeCodeGuideForm").then(module => ({ default: module.VibeCodeGuideForm })));
 const StructureTemplatePicker = lazy(() => import("./dialogs/StructureTemplatePicker").then(module => ({ default: module.StructureTemplatePicker })));
 /** Starts in the background for the document webview under the existing probe gate. */
@@ -2541,6 +2550,9 @@ export function MainWindow({
   const quitInteractionRef = useRef(false);
   const quitMutationFrozenRef = useRef(false);
   const quitCommittedRef = useRef(false);
+  const committedQuitDraftRef = useRef<{ tabId: string; document: ChemDraftDocument; dirty: boolean;
+    warning?: OpenWarning } | undefined>(undefined);
+  const [quitCommitted, setQuitCommitted] = useState(false);
   const pendingQuitAfterCloseRef = useRef(false);
   const [quitAfterCloseReady, setQuitAfterCloseReady] = useState(0);
   const [keptDrawingsPrompt, setKeptDrawingsPrompt] = useState<"notice">();
@@ -2848,6 +2860,7 @@ export function MainWindow({
     height: 0
   }));
   const [status, setStatus] = useState("Blank native document");
+  const tableDraftStatusRef = useRef<{ announced: string; original: string } | undefined>(undefined);
   // Keep import findings and the latest save findings independent for this tab.
   // Replacing the document drops both (resetDocumentHistory).
   const [openWarningsReport, setOpenWarningsReport] = useState<OpenWarningsReport | undefined>();
@@ -6818,6 +6831,12 @@ export function MainWindow({
       return false;
     }
 
+    // A clean restored file may not have been saved in this run. Keep its pre-typing baseline.
+    const tabId = activeDocumentTabIdRef.current;
+    if (!fileStateRef.current.dirty && !savedDocumentsRef.current.has(tabId)) {
+      savedDocumentsRef.current.set(tabId, currentDocument);
+    }
+
     // Moving straight from one label edit to another keeps the first edit's record: the selection
     // on screen now is that edit's own atom, not what the user had selected.
     const selectionBefore = activeAtomLabelEditRef.current?.selectionBefore ?? {
@@ -7773,16 +7792,28 @@ export function MainWindow({
   // (finishNativeAtomLabelEdit), so what reaches disk never depends on which path wrote the present
   // document, and a relaunch never reopens changed chemistry. The edit itself stays open. Reads
   // refs only, including private table and repeat-label drafts.
-  const documentForFlush = useCallback((): ChemDraftDocument => {
+  const documentForFlush = useCallback((onDroppedDraft?: (kind: string, error: unknown) => void): ChemDraftDocument => {
     // Resizing replaces the live page for preview, but only pointerup commits it.
     // A Save/autosave/export during the held gesture must match what Escape restores.
     const resize = objectResizeDragRef.current;
     if (resize) return resize.startDocument;
-    let current = documentWithTableDraft();
+    let current = documentRef.current;
+    const includeDraft = (kind: string, apply: () => ChemDraftDocument, rollback?: () => ChemDraftDocument) => {
+      if (!onDroppedDraft) return apply();
+      try {
+        return apply();
+      } catch (error) {
+        onDroppedDraft(kind, error);
+        return rollback?.() ?? current;
+      }
+    };
+    current = includeDraft("table", documentWithTableDraft);
     const bracket = bracketLabelEditRef.current;
-    const label = bracketLabelEditorRef.current?.draft();
-    if (bracket?.tabId === activeDocumentTabIdRef.current && label !== undefined) {
-      current = setBracketRepeatLabel(current, bracket.objectId, label);
+    if (bracket?.tabId === activeDocumentTabIdRef.current) {
+      current = includeDraft("repeat label", () => {
+        const label = bracketLabelEditorRef.current?.draft();
+        return label === undefined ? current : setBracketRepeatLabel(current, bracket.objectId, label);
+      });
     }
     const edit = activeAtomLabelEditRef.current;
     if (
@@ -7793,7 +7824,8 @@ export function MainWindow({
       return current;
     }
     if (!atomLabelEditKeepsStartingText(edit) && !documentHasAtomLabelDraft(current, edit)) return current;
-    return normalizeCommittedDocument(finishedAtomLabelDraft(current, edit).document);
+    return includeDraft("atom label", () => normalizeCommittedDocument(finishedAtomLabelDraft(current, edit).document),
+      () => restoreAtomLabelDraft(current, edit));
   }, [documentWithTableDraft]);
 
   const performCopyAs = useCallback(async (commandId: string) => {
@@ -9826,7 +9858,9 @@ export function MainWindow({
       assistantViewportRect: assistantHistoryPort.getViewportRect?.(activeDocumentTabIdRef.current),
       parts: selectedNativeMoleculePartsRef.current,
       warnings: tabWarningsRef.current, saveWarnings: tabSaveWarningsRef.current,
-      status: statusRef.current, pageFit: tabPageFitRef.current
+      status: statusRef.current === tableDraftStatusRef.current?.announced
+        ? tableDraftStatusRef.current.original : statusRef.current,
+      pageFit: tabPageFitRef.current
     });
     return true;
   }, [assistantHistoryPort]);
@@ -9850,10 +9884,22 @@ export function MainWindow({
     selectedNativeMoleculePartsRef.current = snapshot.parts;
     selectedNativeMoleculePartRef.current = snapshot.parts.at(-1);
     setSelectedNativeMoleculeParts(snapshot.parts);
-    tabWarningsRef.current = snapshot.warnings;
+    let warnings = snapshot.warnings;
+    const unannounced = warnings?.warnings.filter(warning =>
+      warning.code === TABLE_DRAFT_RECOVERY_WARNING && warning.recoveryAnnounced !== true);
+    tableDraftStatusRef.current = undefined;
+    if (warnings && unannounced?.length) {
+      warnings = { ...warnings, warnings: warnings.warnings.map(warning =>
+        unannounced.includes(warning) ? { ...warning, recoveryAnnounced: true } : warning) };
+      tableDraftStatusRef.current = {
+        original: snapshot.status,
+        announced: `${snapshot.status}. ${unannounced.map(warning => warning.message).join(" ")}`
+      };
+    }
+    tabWarningsRef.current = warnings;
     tabSaveWarningsRef.current = snapshot.saveWarnings;
-    openWarningsRef.current = fileWarningReports(snapshot.warnings, snapshot.saveWarnings)[0];
-    setOpenWarningsReport(snapshot.warnings);
+    openWarningsRef.current = fileWarningReports(warnings, snapshot.saveWarnings)[0];
+    setOpenWarningsReport(warnings);
     setSaveWarningsReport(snapshot.saveWarnings);
     setOpenWarningsListOpen(false);
     tabPageFitRef.current = snapshot.pageFit;
@@ -9864,7 +9910,7 @@ export function MainWindow({
     setAnalysisReport(undefined);
     setObjectContextMenu(undefined);
     setArrowEditTargetId(undefined);
-    setStatus(snapshot.status);
+    setStatus(tableDraftStatusRef.current?.announced ?? snapshot.status);
   }, [cancelDocumentTabSessions, clearDocumentInteractionState, installDocumentHistory]);
 
   const activateDocumentTab = useCallback((id: string) => {
@@ -10629,20 +10675,21 @@ export function MainWindow({
   // Write the working document + file association to the session file now. Reads refs only, so it
   // is stable and safe to call from the debounce below and from the quit flush. Gated on hydration
   // so the startup blank can't clobber the previous session before the restore above has read it.
-  // `strict` rethrows a failed write. The app updater needs it: its installer ends the process, so
-  // "the previous autosave stays" is not good enough there — a failed save must stop the update.
-  // That includes the gate: with autosave off (the last session could not be read) or the restore
-  // still running, nothing is written, and resolving would let the installer discard the drawing.
+  // Quit and the updater use strict mode so neither treats a failed write as a saved session.
+  // This includes the hydration gate when skipping the write would lose work.
   const writeDocumentSessionNow = useCallback(async (options?: { strict?: boolean }) => {
+    const committedDraft = committedQuitDraftRef.current;
     if (!documentSessionHydratedRef.current || !documentSessionSaveEnabledRef.current) {
       snapshotDocumentTab(false);
       const refusal = options?.strict
         ? documentTabsRef.current.map((tab) => {
             const snapshot = documentTabSnapshotsRef.current.get(tab.id)!;
+            const draft = tab.id === committedDraft?.tabId ? committedDraft : undefined;
             return strictSessionFlushRefusal({
               hydrated: documentSessionHydratedRef.current,
               saveEnabled: documentSessionSaveEnabledRef.current,
-              blank: documentIsBlank(snapshot.history.present), fileState: snapshot.file
+              blank: documentIsBlank(draft?.document ?? snapshot.history.present),
+              fileState: draft ? { ...snapshot.file, dirty: draft.dirty || draft.warning !== undefined } : snapshot.file
             });
           }).find((reason) => reason !== undefined)
         : undefined;
@@ -10653,29 +10700,38 @@ export function MainWindow({
     }
     try {
       snapshotDocumentTab(false);
-      const flushed = documentForFlush();
+      const flushed = committedDraft?.tabId === activeDocumentTabIdRef.current
+        ? committedDraft.document : documentForFlush();
       // View changes and quitting an untouched startup blank are not new document work.
       // The sticky pristine marker also recognizes edit-then-undo and explicit Save of a blank.
       if (skippedSessionRestoreRef.current
         && skippedRecoveryTabCountRef.current === unrestoredSessionTabsRef.current.length
         && documentTabsRef.current.length === 1
         && !nonPristineTabsRef.current.has(activeDocumentTabIdRef.current)
-        && !fileStateRef.current.path && !fileStateRef.current.dirty
+        && !fileStateRef.current.path && !(committedDraft?.dirty ?? fileStateRef.current.dirty)
         && documentIsBlank(flushed)) return;
       const tabs = documentTabsRef.current.map((tab) => {
         const snapshot = documentTabSnapshotsRef.current.get(tab.id)!;
-        const tabDocument = tab.id === activeDocumentTabIdRef.current ? flushed : snapshot.history.present;
+        const draft = tab.id === committedDraft?.tabId ? committedDraft : undefined;
+        const tabDocument = draft?.document ?? (tab.id === activeDocumentTabIdRef.current ? flushed : snapshot.history.present);
+        const file = draft ? { ...snapshot.file, dirty: draft.dirty } : snapshot.file;
+        const displayName = file.path ? nativePathBasename(file.path) : tab.title;
+        const warning = draft?.warning;
+        const openWarnings = warning ? {
+          displayName, sourceLabel: snapshot.warnings?.sourceLabel ?? "a recovered session",
+          warnings: [...(snapshot.warnings?.warnings ?? []).filter(existing =>
+            existing.code !== warning.code || existing.sourceObjectId !== warning.sourceObjectId), warning]
+        } : snapshot.warnings;
         let payload = sessionPayloadCacheRef.current.get(tabDocument);
         if (!payload) {
           payload = createNativeSavePayload(tabDocument);
           sessionPayloadCacheRef.current.set(tabDocument, payload);
         }
         return {
-          ...buildDocumentSessionEnvelope(payload, snapshot.file,
-            snapshot.file.path ? nativePathBasename(snapshot.file.path) : tab.title, documentIsBlank(tabDocument)),
+          ...buildDocumentSessionEnvelope(payload, file, displayName, documentIsBlank(tabDocument)),
           pristine: !nonPristineTabsRef.current.has(tab.id),
           view: { viewport: snapshot.viewport, scrollLeft: snapshot.scrollLeft, scrollTop: snapshot.scrollTop },
-          openWarnings: snapshot.warnings,
+          openWarnings,
           saveWarnings: snapshot.saveWarnings,
           nativeDocumentVersions: tabDocument.formatVersion || tabDocument.minAppVersion ? {
             formatVersion: tabDocument.formatVersion, minAppVersion: tabDocument.minAppVersion
@@ -10691,8 +10747,7 @@ export function MainWindow({
       if (options?.strict) {
         throw error;
       }
-      // Serialization or the write must never break editing (or block a quit); the previous
-      // autosave stays.
+      // Background autosave leaves the previous session in place if a write fails.
     }
   }, [documentForFlush, snapshotDocumentTab]);
 
@@ -10703,17 +10758,50 @@ export function MainWindow({
       return undefined;
     }
     const handle = window.setTimeout(() => {
-      void writeDocumentSessionNow();
+      if (!quitCommittedRef.current) void writeDocumentSessionNow();
     }, DOCUMENT_SESSION_SAVE_DEBOUNCE_MS);
     return () => window.clearTimeout(handle);
   }, [document, fileState, documentTabs, activeDocumentTabId, viewport, openWarningsReport, saveWarningsReport, sessionStartupCompleted, writeDocumentSessionNow]);
 
 
   const lockCommittedQuit = useCallback(() => {
+    if (quitCommittedRef.current) return;
+    // Capture private drafts before the UI lock or dialog disposal can change editor focus.
+    const tabId = activeDocumentTabIdRef.current;
+    const current = objectResizeDragRef.current?.startDocument ?? documentRef.current;
+    let warning: OpenWarning | undefined;
+    const document = documentForFlush((kind, error) => {
+      console.warn(`Could not include the ${kind} draft in the quit session`, error);
+      if (kind === "table") {
+        const validation = tableValidationMessage(error);
+        const reason = validation.includes("maxTableCharacters")
+          ? `The table exceeds the ${TABLE_LIMITS.maxTableCharacters}-character limit.` : validation;
+        warning = { code: TABLE_DRAFT_RECOVERY_WARNING, sourceObjectId: tableCellEditRef.current?.tableId,
+          message: `The last table edit was not saved. ${reason}` };
+      }
+    });
+    const baseline = savedDocumentsRef.current.get(tabId);
+    // A draft may restore the saved content even while the live file is marked dirty.
+    const dirty = baseline
+      ? baseline !== document && !assistantDocumentContentUnchanged(baseline, document)
+      : fileStateRef.current.dirty || (current !== document && !assistantDocumentContentUnchanged(current, document));
+    committedQuitDraftRef.current = { tabId, document, dirty, warning };
     quitCommittedRef.current = true;
     quitInteractionRef.current = true;
     quitMutationFrozenRef.current = true;
-  }, []);
+    clearScheduledTextEditorFocus();
+    // Install readOnly before disposal or session I/O yields to the next input event.
+    flushSync(() => setQuitCommitted(true));
+  }, [clearScheduledTextEditorFocus, documentForFlush]);
+
+  const writeQuitSession = useCallback(async (confirm: () => Promise<void>) => {
+    try {
+      await writeDocumentSessionNow({ strict: true });
+      await confirm();
+    } finally {
+      void dialogCoordinatorRef.current?.dispose("quit").catch(() => undefined);
+    }
+  }, [writeDocumentSessionNow]);
 
   // Menu Quit / Cmd+Q on macOS, or closing the document window / File ▸ Exit elsewhere: Rust asks
   // for the pending autosave first so an edit inside the debounce window survives relaunch.
@@ -10723,13 +10811,15 @@ export function MainWindow({
     }
     let unlisten: (() => void) | undefined;
     let disposed = false;
-    void listenForQuitFlushRequest(async (phase) => {
+    void listenForQuitFlushRequest(async (phase, requestId) => {
       // A system quit can commit while a Cancel reply is in flight. The commit locks editing
       // even if the reply already released the prompt's guards.
       if (phase === "committed") lockCommittedQuit();
-      await dialogCoordinatorRef.current?.dispose("quit");
-      await writeDocumentSessionNow();
-      await confirmQuitAfterFlush();
+      try {
+        await writeQuitSession(() => confirmQuitAfterFlush(requestId));
+      } catch (error) {
+        console.warn("Could not save the session before quitting", error);
+      }
     }).then((cleanup) => {
       if (disposed) {
         cleanup();
@@ -10741,7 +10831,7 @@ export function MainWindow({
       disposed = true;
       unlisten?.();
     };
-  }, [lockCommittedQuit, writeDocumentSessionNow]);
+  }, [lockCommittedQuit, writeQuitSession]);
 
   const cancelQuitRequest = useCallback(async (requestId: number) => {
     const reply = await cancelQuit(requestId);
@@ -10793,8 +10883,8 @@ export function MainWindow({
               quitMutationFrozenRef.current = true;
               if (await resumeQuitAfterPrompt(requestId) && quitRequestRef.current === requestId &&
                   !disposed && !quitCommittedRef.current) {
-                await writeDocumentSessionNow();
-                await confirmPromptedQuit(requestId);
+                lockCommittedQuit();
+                await writeQuitSession(() => confirmPromptedQuit(requestId));
                 return;
               }
             }
@@ -10812,7 +10902,7 @@ export function MainWindow({
       if (!disposed) await setQuitPromptEnabled(loadAskToSaveBeforeQuit());
     })().catch((error: unknown) => { setStatus("Quit preference unavailable: " + String(error)); });
     return () => { disposed = true; listeners.forEach((listener) => listener()); };
-  }, [snapshotDocumentTab, writeDocumentSessionNow, cancelQuitRequest]);
+  }, [snapshotDocumentTab, writeQuitSession, cancelQuitRequest, lockCommittedQuit]);
 
   useEffect(() => {
     if (closeTabPrompt || !pendingQuitAfterCloseRef.current) return;
@@ -11081,6 +11171,8 @@ export function MainWindow({
       if (savingTabId === activeDocumentTabIdRef.current) {
         fileStateRef.current = nextFileState;
         setFileState(nextFileState);
+        tabWarningsRef.current = clearTableDraftRecoveryWarnings(tabWarningsRef.current);
+        setOpenWarningsReport(tabWarningsRef.current);
         tabSaveWarningsRef.current = warningsReport;
         openWarningsRef.current = activeOpenWarnings(tabWarningsRef.current) ?? warningsReport;
         setSaveWarningsReport(warningsReport);
@@ -11091,7 +11183,8 @@ export function MainWindow({
       } else {
         const snapshot = documentTabSnapshotsRef.current.get(savingTabId);
         if (snapshot) documentTabSnapshotsRef.current.set(savingTabId, {
-          ...snapshot, file: nextFileState, saveWarnings: warningsReport,
+          ...snapshot, file: nextFileState, warnings: clearTableDraftRecoveryWarnings(snapshot.warnings),
+          saveWarnings: warningsReport,
           status: formatSaveStatus(displayName, payload.warnings)
         });
       }
@@ -11199,8 +11292,8 @@ export function MainWindow({
       if (!await resumeQuitAfterPrompt(requestId)) {
         return await cancelQuitPrompt(requestId);
       }
-      await writeDocumentSessionNow();
-      await confirmPromptedQuit(requestId);
+      lockCommittedQuit();
+      await writeQuitSession(() => confirmPromptedQuit(requestId));
     } catch (error) {
       setStatus("Quit failed: " + (error instanceof Error ? error.message : String(error)));
       return await cancelQuitPrompt(requestId);
@@ -11210,7 +11303,7 @@ export function MainWindow({
         setQuitSaveBusy(false);
       }
     }
-  }, [saveDocumentTabById, writeDocumentSessionNow, cancelQuitPrompt]);
+  }, [saveDocumentTabById, writeQuitSession, cancelQuitPrompt, lockCommittedQuit]);
 
   const quitPrompt = useNativePrompt({
     title: "Save changes before quitting?",
@@ -14397,7 +14490,7 @@ export function MainWindow({
       const edit = activeAtomLabelEditRef.current;
       const target = hoveredNativeDeleteTargetRef.current;
       const canvas = canvasRegionRef.current;
-      if (!edit?.startedFromHover || !canvas ||
+      if (quitCommittedRef.current || !edit?.startedFromHover || !canvas ||
           !(event.target instanceof HTMLInputElement) || !event.target.matches('[data-atom-label-editor="true"]') ||
           event.defaultPrevented || event.isComposing || event.keyCode === 229 ||
           event.metaKey || event.ctrlKey || event.altKey || !/^[a-z0-9]$/i.test(event.key) ||
@@ -22833,7 +22926,7 @@ export function MainWindow({
                       onPreview={setTableResizePreview} onCommit={commitTableObject} />
                     {editingCell ? <TableCellEditor key={`${activeDocumentTabId}:${JSON.stringify(editingCell)}`}
                       ref={tableCellEditorRef} document={document} table={table} cell={editingCell} scale={viewport.scale}
-                      platform={shortcutPlatform} renderText={object => <TextObjectContent object={object} noWrap />}
+                      platform={shortcutPlatform} readOnly={quitCommitted} renderText={object => <TextObjectContent object={object} noWrap />}
                       resolveShortcut={event => shortcutRegistry.resolve({ key: event.key, shiftKey: event.shiftKey,
                         metaKey: event.metaKey, ctrlKey: event.ctrlKey, altKey: event.altKey })}
                       onFinish={finishTableCellEdit} onDraftChange={markDocumentDirty}
@@ -22844,7 +22937,7 @@ export function MainWindow({
                   const object = findDocumentObject(document, bracketLabelEdit.objectId);
                   return object?.type === "bracket" && bracketLabelPlan(object) ? <BracketLabelEditor
                     key={`${activeDocumentTabId}:${object.id}`} object={object} ref={bracketLabelEditorRef}
-                    onDraftChange={markDocumentDirty} onFinish={finishBracketLabelEdit} /> : null;
+                    readOnly={quitCommitted} onDraftChange={markDocumentDirty} onFinish={finishBracketLabelEdit} /> : null;
                 })() : null}
                 {activeNativeTemplateId && templatePreview ? (
                   <NativeTemplateGhostOverlay
@@ -23066,6 +23159,8 @@ export function MainWindow({
                       selectedPart={selectedPart}
                       transformHandlesEnabled={selectionChromeActive}
                       editingText={activeTextEditObjectId === object.id}
+                      inlineEditorReadOnly={quitCommitted &&
+                        (activeTextEditObjectId === object.id || activeAtomLabelEdit?.objectId === object.id)}
                       editingAtomLabel={activeAtomLabelEdit?.objectId === object.id ? {
                         ...activeAtomLabelEdit,
                         previewAtomId: atomLabelPreview?.target.kind === "atom" ? atomLabelPreview.target.atomId : undefined
@@ -28755,6 +28850,7 @@ function DocumentObjectViewContent({
   selectedPart,
   transformHandlesEnabled,
   editingText,
+  inlineEditorReadOnly,
   editingAtomLabel,
   growthPreview,
   deleteTarget,
@@ -28814,6 +28910,7 @@ function DocumentObjectViewContent({
   onAtomProblemInvoke
 }: {
   directElectronMarkEditing?: boolean;
+  inlineEditorReadOnly: boolean;
   shortcutPlatform?: ShortcutPlatform;
   onBondStereoBadgeOpen(request: BondStereoBadgeRequest): void;
   onAtomProblemInvoke(commandId: string): void;
@@ -29016,6 +29113,7 @@ function DocumentObjectViewContent({
     onObjectResizeDoubleClick(object.id, corner, event);
   };
   const handleTextChange = (event: ChangeEvent<HTMLTextAreaElement>) => {
+    if (inlineEditorReadOnly) return;
     onTextPlaceholderClear(object.id);
     recordTextEditorSelection(event.currentTarget);
     onTextChange(object.id, event.currentTarget.value);
@@ -29045,6 +29143,7 @@ function DocumentObjectViewContent({
     });
   };
   const handleTextPaste = (event: ReactClipboardEvent<HTMLTextAreaElement>) => {
+    if (inlineEditorReadOnly) { event.preventDefault(); event.stopPropagation(); return; }
     const text = event.clipboardData.getData("text/plain");
     if (text.length === 0) {
       return;
@@ -29056,6 +29155,7 @@ function DocumentObjectViewContent({
   };
   const handleTextKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
     event.stopPropagation();
+    if (inlineEditorReadOnly) return;
     if (event.key === "Escape") {
       event.preventDefault();
       onTextEditFinish(object.id, "escape");
@@ -29089,6 +29189,7 @@ function DocumentObjectViewContent({
   };
   const handleAtomLabelKeyDown = (state: AtomLabelEditState, event: ReactKeyboardEvent<HTMLInputElement>) => {
     event.stopPropagation();
+    if (inlineEditorReadOnly) return;
     // Tab finishes like Enter. Left to the browser it would move focus to the next control,
     // ending the edit by blur and sending the rest of the word to the canvas hotkeys.
     if (event.key === "Enter" || event.key === "Tab") {
@@ -29654,6 +29755,7 @@ function DocumentObjectViewContent({
                   data-atom-label-draft-empty={editingAtomLabel.draft.length === 0 ? "true" : undefined}
                   data-atom-id={editingAtomLabel.atomId}
                   key={`atom-label-editor-${editingAtomLabel.atomId}`}
+                  readOnly={inlineEditorReadOnly}
                   spellCheck={false}
                   style={{
                     left: `calc(${atom.x + anchorOffset.x - object.x}px * var(--page-scale))`,
@@ -29670,12 +29772,14 @@ function DocumentObjectViewContent({
                     // deactivated (a native palette or popover became key), not the user leaving
                     // the editor. Keep the edit open: the browser hands focus back to this input
                     // when the window is reactivated, so the rest of the word still lands here.
-                    if (!inlineEditorBlurEndsEdit(event.currentTarget)) {
+                    if (inlineEditorReadOnly || !inlineEditorBlurEndsEdit(event.currentTarget)) {
                       return;
                     }
                     onAtomLabelFinish(editingAtomLabel, "blur");
                   }}
-                  onChange={(event) => onAtomLabelChange(editingAtomLabel, event.currentTarget.value)}
+                  onChange={(event) => {
+                    if (!inlineEditorReadOnly) onAtomLabelChange(editingAtomLabel, event.currentTarget.value);
+                  }}
                   onKeyDown={(event) => handleAtomLabelKeyDown(editingAtomLabel, event)}
                   onPointerDown={(event) => event.stopPropagation()}
                 />
@@ -29882,6 +29986,7 @@ function DocumentObjectViewContent({
               autoFocus
               className="text-object-editor rich-text-object-editor"
               ref={textEditorRef}
+              readOnly={inlineEditorReadOnly}
               spellCheck={false}
               data-text-script={objectTextScript}
               style={textEditorCss}
@@ -29897,7 +30002,7 @@ function DocumentObjectViewContent({
               // Click-away commits (exact element-symbol text becomes an atom). The
               // explicit id matters: canvas pointer handlers clear the edit state before blur.
               onBlur={(event) => {
-                if (inlineEditorBlurEndsEdit(event.currentTarget)) {
+                if (!inlineEditorReadOnly && inlineEditorBlurEndsEdit(event.currentTarget)) {
                   onTextEditFinish(object.id);
                 }
               }}
@@ -29905,7 +30010,7 @@ function DocumentObjectViewContent({
               onKeyUp={(event) => recordTextEditorSelection(event.currentTarget)}
               onSelect={(event) => recordTextEditorSelection(event.currentTarget)}
               onPointerDown={(event) => {
-                onTextPlaceholderClear(object.id);
+                if (!inlineEditorReadOnly) onTextPlaceholderClear(object.id);
                 event.stopPropagation();
               }}
               onPointerUp={(event) => {

@@ -21,7 +21,7 @@ import { saveAskToSaveBeforeQuit, loadAskToSaveBeforeQuit } from "./quitSettings
 import { MemoryStorage } from "./testSupport/memoryStorage";
 import { createViewportState } from "@chemdraft/viewport-engine";
 import { DOM_COMMAND_EVENT, setToolbarsMenu, type QuitFlushPhase, type ToolsetWindowState } from "./window-manager";
-import { buildDocumentSessionEnvelope, buildDocumentTabsSession, parseDocumentSessionEnvelope } from "./documentSession";
+import { buildDocumentSessionEnvelope, buildDocumentTabsSession, DOCUMENT_SESSION_SAVE_DEBOUNCE_MS, parseDocumentSessionEnvelope } from "./documentSession";
 import { createPluginRuntime, type DesktopPluginRuntime } from "./plugins/createPluginRuntime";
 import { applyPatches, type DocumentPatch, type MoleculeObject } from "@chemdraft/chem-core";
 import {
@@ -58,7 +58,7 @@ const native = vi.hoisted(() => ({
   session: undefined as unknown,
   load: vi.fn<() => Promise<unknown>>(),
   saveSession: vi.fn<(value: unknown) => Promise<void>>(),
-  quitFlush: undefined as undefined | ((phase?: QuitFlushPhase) => Promise<void>),
+  quitFlush: undefined as undefined | ((phase: QuitFlushPhase, requestId: number) => Promise<void>),
   quit: vi.fn(),
   promptQuit: undefined as undefined | ((id: number) => Promise<void>),
   quitId: 0,
@@ -575,7 +575,7 @@ describe("documents in one window", () => {
     expect(bridge().snapshot().page.objectCount).toBe(0);
     expect(container.querySelector('[role="dialog"]')).toBeNull();
     expect(pendingPrompt).toBeUndefined();
-    const saved = await flush();
+    const saved = await autosave();
     expect(saved.tabs).toHaveLength(1);
     expect(saved.tabs![0]).toMatchObject({ pristine: true, blank: true, dirty: false });
     await command("edit.undo");
@@ -595,7 +595,14 @@ describe("documents in one window", () => {
   async function flush() {
     await act(async () => {
       if (loadAskToSaveBeforeQuit()) await native.promptQuit!(++native.quitId);
-      else await native.quitFlush!();
+      else await native.quitFlush!("committed", ++native.quitId);
+    });
+    return parseDocumentSessionEnvelope(native.session)!;
+  }
+  async function autosave() {
+    await act(async () => {
+      if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(DOCUMENT_SESSION_SAVE_DEBOUNCE_MS);
+      else await new Promise(resolve => setTimeout(resolve, DOCUMENT_SESSION_SAVE_DEBOUNCE_MS));
     });
     return parseDocumentSessionEnvelope(native.session)!;
   }
@@ -1125,7 +1132,7 @@ describe("documents in one window", () => {
       expect(bridge().snapshot().document.title).toBe("Restored future");
       expect(prompts).toHaveLength(1);
       expect(prompts[0]!.message).toContain("(1.10.2)");
-      const saved = await flush();
+      const saved = await autosave();
       expect(openNativeDocument(saved.tabs![0]!.contents).nativeDocumentVersions?.minAppVersion).toBe("1.10.2");
     } finally { restore(); }
   });
@@ -1140,7 +1147,7 @@ describe("documents in one window", () => {
           contents, displayName: `${minimum}.chemdraft`, path: `/tmp/${minimum}.chemdraft`
         }));
       }
-      await flush(); await remount();
+      await autosave(); await remount();
       expect(prompts).toEqual([]);
     } finally { restore(); }
   });
@@ -1246,7 +1253,7 @@ describe("documents in one window", () => {
           if (expected.length) expect(expected[0]).toMatchObject({ title: "Newer ChemDraft file", owner: "document",
             message: "This file was made with a newer ChemDraft (1.3.0). Some features may not show. Update to keep them." });
           for (let relaunch = 0; relaunch < 2; relaunch++) {
-            const saved = await flush();
+            const saved = await autosave();
             if (name === "newer-format-only") {
               // File > Save intentionally omits unused version headers; the session must retain them.
               expect(openNativeDocument(saved.tabs![0]!.contents).document?.formatVersion).toBeUndefined();
@@ -1326,7 +1333,7 @@ describe("documents in one window", () => {
     expect(status).toContain("not JSON");
     expect(status).not.toContain("/drawings/");
     // Flush later work after the last successful open; its status must not replace the summary.
-    await flush();
+    await autosave();
     await act(async () => { await Promise.resolve(); });
     expect(container.querySelector('[role="status"]')?.textContent).toBe(status);
   });
@@ -1650,7 +1657,7 @@ describe("documents in one window", () => {
     expect(warningButton()).toBeNull();
     await activate(0);
     expect(warningButton()?.textContent).toContain("11 warnings");
-    const saved = await flush();
+    const saved = await autosave();
     expect(saved.tabs![0]!.openWarnings?.warnings).toHaveLength(11);
     await remount();
     expect(warningButton()?.textContent).toContain("11 warnings");
@@ -1758,7 +1765,7 @@ describe("documents in one window", () => {
     expect(active()).toBe(1);
     expect(bridge().snapshot().file.path).toBe("/tmp/conflicted.chemdraft");
     expect(drawnText()).toContain("Externally edited note");
-    const saved = await flush();
+    const saved = await autosave();
     expect(saved.tabs!.filter((tab) => tab.path === "/tmp/conflicted.chemdraft")).toHaveLength(1);
   });
 
@@ -2205,7 +2212,7 @@ describe("documents in one window", () => {
     let finishWrite!: () => void;
     native.saveSession.mockImplementationOnce(() => new Promise<void>(resolve => { finishWrite = resolve; }));
     let flushing!: Promise<void>;
-    await act(async () => { flushing = native.quitFlush!("committed"); });
+    await act(async () => { flushing = native.quitFlush!("committed", 7); });
     expect(native.quit).not.toHaveBeenCalled();
     if (order === "during") await act(async () => { reply("cancelled"); });
 
@@ -2657,17 +2664,19 @@ describe("documents in one window", () => {
       const previous = threeTabSession(); native.session = previous;
       saveStartWithFreshDocument(true); await remount();
       native.saveSession.mockClear();
-      await act(async () => { await new Promise(resolve => setTimeout(resolve, 900)); });
+      await autosave();
       await flush();
       expect(native.saveSession).not.toHaveBeenCalled();
+      expect(native.quit).toHaveBeenCalledExactlyOnceWith(1);
       expect(native.session).toEqual(previous);
+      await remount();
       await paste("New run work");
       await act(async () => { await new Promise(resolve => setTimeout(resolve, 900)); });
       expect(native.saveSession).toHaveBeenCalled();
       native.savePicker.mockResolvedValueOnce("D:\\new-run.chemdraft");
       await command("document.save");
       expect(native.writeFile).toHaveBeenCalled();
-      const saved = await flush();
+      const saved = await autosave();
       expect(saved.tabs).toHaveLength(1);
       saveStartWithFreshDocument(false); await remount();
       expect(drawnText()).toContain("New run work");
@@ -2725,7 +2734,7 @@ describe("documents in one window", () => {
       saveStartWithFreshDocument(enabled);
       const raw = { version: 99, contents: "recoverable bytes" }; native.session = raw;
       await remount(); native.saveSession.mockClear();
-      await paste("New work"); await flush();
+      await paste("New work"); await autosave();
       expect(native.saveSession).not.toHaveBeenCalled(); expect(native.session).toEqual(raw);
     });
 
@@ -2738,7 +2747,7 @@ describe("documents in one window", () => {
       expect(tabs()).toHaveLength(1);
       expect(pendingPrompt).toBeUndefined();
       await paste("Fresh work beside newly readable recovery");
-      expect((await flush()).unrestoredTabs).toEqual([kept]);
+      expect((await autosave()).unrestoredTabs).toEqual([kept]);
     });
 
     it("retains schema-valid envelopes with unreadable document contents in a fresh run", async () => {
@@ -2750,7 +2759,7 @@ describe("documents in one window", () => {
       expect(tabs()).toHaveLength(1);
       expect(pendingPrompt).toBeUndefined();
       await paste("Fresh work beside recovery");
-      expect((await flush()).unrestoredTabs).toEqual([corrupt]);
+      expect((await autosave()).unrestoredTabs).toEqual([corrupt]);
     });
 
     it("retains unrestored tabs while skipping readable tabs and never discards automatically", async () => {
@@ -2760,10 +2769,10 @@ describe("documents in one window", () => {
       expect(tabs()).toHaveLength(1);
       expect(bridge().snapshot().document.title).toBe("Untitled");
       expect(pendingPrompt).toBeUndefined();
-      native.saveSession.mockClear(); await flush();
+      native.saveSession.mockClear(); await autosave();
       expect(native.saveSession).not.toHaveBeenCalled();
       await paste("New run with recovery");
-      expect((await flush()).unrestoredTabs).toEqual(previous.unrestoredTabs);
+      expect((await autosave()).unrestoredTabs).toEqual(previous.unrestoredTabs);
     });
 
 
@@ -2778,7 +2787,7 @@ describe("documents in one window", () => {
         expect(pendingPrompt).toBeUndefined();
         expect(tabs()).toHaveLength(1);
         await paste("Fresh work beside recovery");
-        expect((await flush()).unrestoredTabs).toEqual(expect.arrayContaining([kept, corrupt]));
+        expect((await autosave()).unrestoredTabs).toEqual(expect.arrayContaining([kept, corrupt]));
       } else {
         expect(pendingPrompt?.prompt.title).toMatch(/didn't open/);
       }
@@ -3011,7 +3020,7 @@ describe("documents in one window", () => {
       expect(pendingPrompt?.prompt.title).toBe("3 drawings didn't open");
       for (const tab of raw.tabs) expect(pendingPrompt?.prompt.message).toContain(tab.displayName);
       expectSuspended();
-      expect((await flush()).unrestoredTabs).toEqual(raw.tabs);
+      expect((await autosave()).unrestoredTabs).toEqual(raw.tabs);
       await modalButton("Cancel");
       expectReleased();
       native.saveSession.mockClear();
@@ -3025,7 +3034,7 @@ describe("documents in one window", () => {
       await remount();
       expect(pendingPrompt?.prompt.title).toBe("3 drawings didn't open");
       expect(drawnText()).toContain("Fresh work after unreadable children");
-      expect((await flush()).unrestoredTabs).toEqual(raw.tabs);
+      expect((await autosave()).unrestoredTabs).toEqual(raw.tabs);
       await modalButton("Cancel");
       expectReleased();
     });
@@ -3045,7 +3054,7 @@ describe("documents in one window", () => {
         expect(native.writeFile).toHaveBeenNthCalledWith(index + 1, paths[index], tab.contents);
       });
       expectReleased();
-      expect((await flush()).unrestoredTabs).toBeUndefined();
+      expect((await autosave()).unrestoredTabs).toBeUndefined();
       expect(tabs()).toHaveLength(1);
       await remount();
       expect(pendingPrompt).toBeUndefined();
@@ -3062,7 +3071,7 @@ describe("documents in one window", () => {
       expect(tabs()).toHaveLength(1);
       expect(bridge().snapshot().document.title).toBe("Second");
       expect(pendingPrompt?.prompt.title).toBe("2 drawings didn't open");
-      expect((await flush()).unrestoredTabs).toEqual(unreadable);
+      expect((await autosave()).unrestoredTabs).toEqual(unreadable);
       await modalButton("Cancel");
       expectReleased();
     });
@@ -3079,7 +3088,7 @@ describe("documents in one window", () => {
       expect(pendingPrompt?.prompt.title).toBe(`${readableSibling ? 3 : 4} drawings didn't open`);
       expect(pendingPrompt?.prompt.message).toContain("Previously kept");
       const expectedKept = [alreadyKept, ...children.filter(tab => tab.version === 99)];
-      expect((await flush()).unrestoredTabs).toEqual(expectedKept);
+      expect((await autosave()).unrestoredTabs).toEqual(expectedKept);
       await modalButton("Cancel");
       expectReleased();
       await activate(readableSibling ? 1 : 0);
@@ -3093,7 +3102,7 @@ describe("documents in one window", () => {
       await remount();
       expect(tabs()).toHaveLength(1);
       expect(pendingPrompt?.prompt.title).toBe("3 drawings didn't open");
-      expect((await flush()).unrestoredTabs).toEqual(children);
+      expect((await autosave()).unrestoredTabs).toEqual(children);
       await modalButton("Cancel");
       expectReleased();
     });
@@ -3112,10 +3121,15 @@ describe("documents in one window", () => {
       expect(container.querySelector('[role="status"]')?.textContent).toContain("will not be autosaved");
       native.saveSession.mockClear();
       await paste("Drawing after unreadable outer session");
+      expect(bridge().snapshot().file.dirty).toBe(true);
       await act(async () => { await new Promise((resolve) => setTimeout(resolve, 900)); });
-      await flush();
       expect(native.saveSession).not.toHaveBeenCalled();
       expect(native.session).toEqual(raw);
+      const requestId = ++native.quitId;
+      await act(async () => { await native.quitFlush!("committed", requestId); });
+      expect(native.saveSession).not.toHaveBeenCalled();
+      expect(native.session).toEqual(raw);
+      expect(native.quit).not.toHaveBeenCalledWith(requestId);
     });
 
     it.each(["Cancel", "Escape"])("keeps raw drawings and retries next launch after %s", async (ending) => {
@@ -3147,7 +3161,7 @@ describe("documents in one window", () => {
         } else await modalButton("Cancel");
         expectReleased();
         await command("view.zoomIn");
-        expect((await flush()).unrestoredTabs).toEqual(session.unrestoredTabs);
+        expect((await autosave()).unrestoredTabs).toEqual(session.unrestoredTabs);
       }
     });
 
@@ -3163,7 +3177,7 @@ describe("documents in one window", () => {
       expect(pendingPrompt).toBeUndefined();
       await activate(3);
       expect(bridge().snapshot().document.title).toBe("Recovered");
-      expect((await flush()).unrestoredTabs).toBeUndefined();
+      expect((await autosave()).unrestoredTabs).toBeUndefined();
       await remount();
       expect(tabs()).toHaveLength(4);
     });
@@ -3179,7 +3193,7 @@ describe("documents in one window", () => {
       expect(pendingPrompt?.prompt.message).toContain("Future.chemdraft");
       expect(pendingPrompt?.prompt.message).toContain("saved by a newer ChemDraft");
       await modalButton("Cancel");
-      const saved = await flush();
+      const saved = await autosave();
       expect(saved.unrestoredTabs).toEqual([session.tabs![1]]);
       saved.unrestoredTabs = [{ ...session.tabs![1]!, contents: JSON.stringify(drawing) }];
       native.session = saved;
@@ -3188,7 +3202,7 @@ describe("documents in one window", () => {
       expect(pendingPrompt).toBeUndefined();
       await activate(2);
       expect(bridge().snapshot().document.title).toBe("Future drawing");
-      expect((await flush()).unrestoredTabs).toBeUndefined();
+      expect((await autosave()).unrestoredTabs).toBeUndefined();
     });
 
     it("saves an unsupported envelope's exact text to the chosen path unchanged", async () => {
@@ -3203,7 +3217,7 @@ describe("documents in one window", () => {
       expect(native.writeFile).toHaveBeenCalledExactlyOnceWith(
         platform === "Win32" ? "C:\\rescued\\chosen-name" : "/tmp/chosen-name", "future saved format");
       expectReleased();
-      expect((await flush()).unrestoredTabs).toBeUndefined();
+      expect((await autosave()).unrestoredTabs).toBeUndefined();
       await activate(2);
       expect(container.querySelector('[role="status"]')?.textContent).not.toContain("kept for later");
       await remount();
@@ -3229,14 +3243,14 @@ describe("documents in one window", () => {
       }));
       expect(native.writeFile).toHaveBeenNthCalledWith(1, "C:\\rescued\\First.chemdraft", "unreadable raw document 0");
       expect(native.writeFile).toHaveBeenNthCalledWith(2, "C:\\rescued\\Second.cdxml", "unreadable raw document 1");
-      expect((await flush()).unrestoredTabs).toEqual([session.unrestoredTabs![1]]);
+      expect((await autosave()).unrestoredTabs).toEqual([session.unrestoredTabs![1]]);
       expect(pendingPrompt?.prompt.message).toContain("Second.cdxml: disk full");
       expect(pendingPrompt?.prompt.title).toBe("1 drawing didn't open");
       expectSuspended();
       await modalButton("Cancel");
       expectReleased();
       await remount();
-      expect((await flush()).unrestoredTabs).toEqual([session.unrestoredTabs![1]]);
+      expect((await autosave()).unrestoredTabs).toEqual([session.unrestoredTabs![1]]);
       expect(pendingPrompt).toBeDefined();
     });
 
@@ -3252,14 +3266,14 @@ describe("documents in one window", () => {
       }
       await modalButton("Save Drawing…");
       if (saved) {
-        expect((await flush()).unrestoredTabs).toEqual(session.unrestoredTabs);
+        expect((await autosave()).unrestoredTabs).toEqual(session.unrestoredTabs);
         expectSuspended();
         await command("document.new");
         expect(tabs()).toHaveLength(3);
         await act(async () => finishWrite());
       }
       expect(native.writeFile).toHaveBeenCalledTimes(saved);
-      expect((await flush()).unrestoredTabs).toEqual(session.unrestoredTabs!.slice(saved));
+      expect((await autosave()).unrestoredTabs).toEqual(session.unrestoredTabs!.slice(saved));
       expect(pendingPrompt?.prompt.message).toContain(`Saved ${saved} ${saved === 1 ? "drawing" : "drawings"}; ${3 - saved} kept for later (save canceled)`);
       expectSuspended();
       await modalButton("Cancel");
@@ -3278,11 +3292,11 @@ describe("documents in one window", () => {
       expect(pendingPrompt?.prompt.message).toContain("This cannot be undone.");
       expect(pendingPrompt?.prompt.message).toContain("Alpha.chemdraft");
       expect(pendingPrompt?.prompt.message).toContain("Beta.chemdraft");
-      expect((await flush()).unrestoredTabs).toEqual(session.unrestoredTabs);
+      expect((await autosave()).unrestoredTabs).toEqual(session.unrestoredTabs);
       expectSuspended();
       await modalButton(ending === "Escape" ? "Cancel" : ending);
       const confirmed = ending === "Delete";
-      expect((await flush()).unrestoredTabs).toEqual(confirmed ? undefined : session.unrestoredTabs);
+      expect((await autosave()).unrestoredTabs).toEqual(confirmed ? undefined : session.unrestoredTabs);
       if (!confirmed) {
         expect(pendingPrompt?.prompt.title).toBe("2 drawings didn't open");
         expectSuspended();
@@ -3292,7 +3306,7 @@ describe("documents in one window", () => {
       await activate(2);
       expect(container.querySelector('[role="status"]')?.textContent.includes("kept for later")).toBe(!confirmed);
       await remount();
-      expect((await flush()).unrestoredTabs).toEqual(confirmed ? undefined : session.unrestoredTabs);
+      expect((await autosave()).unrestoredTabs).toEqual(confirmed ? undefined : session.unrestoredTabs);
       expect(pendingPrompt === undefined).toBe(confirmed);
     });
 
@@ -3303,7 +3317,7 @@ describe("documents in one window", () => {
       native.savePicker.mockRejectedValueOnce(new Error("panel failed"));
       await modalButton("Save Drawing…");
       expect(pendingPrompt?.prompt.message).toContain("Kept.chemdraft: panel failed");
-      expect((await flush()).unrestoredTabs).toEqual(session.unrestoredTabs);
+      expect((await autosave()).unrestoredTabs).toEqual(session.unrestoredTabs);
       expectSuspended();
       await modalButton("Cancel");
       expectReleased();
@@ -3317,7 +3331,7 @@ describe("documents in one window", () => {
         await remount();
         expectReleased();
         expect(container.querySelector('[role="dialog"]')).toBeNull();
-        expect((await flush()).unrestoredTabs).toEqual(session.unrestoredTabs);
+        expect((await autosave()).unrestoredTabs).toEqual(session.unrestoredTabs);
       } finally { restoreFailureProvider(); }
     });
 
@@ -3329,7 +3343,7 @@ describe("documents in one window", () => {
       native.saveSession.mockRejectedValueOnce(new Error("session write refused"));
       await modalButton("Delete");
       expect(pendingPrompt?.prompt.message).toContain("Delete failed; the drawings are kept for later: session write refused");
-      expect((await flush()).unrestoredTabs).toEqual(session.unrestoredTabs);
+      expect((await autosave()).unrestoredTabs).toEqual(session.unrestoredTabs);
       expectSuspended();
       await modalButton("Cancel");
       expectReleased();
@@ -3341,10 +3355,10 @@ describe("documents in one window", () => {
       await remount();
       expect(tabs()).toHaveLength(1);
       expect(pendingPrompt?.prompt.title).toBe("3 drawings didn't open");
-      expect((await flush()).unrestoredTabs).toEqual(raw.tabs);
+      expect((await autosave()).unrestoredTabs).toEqual(raw.tabs);
       await modalButton("Delete");
       await modalButton("Delete");
-      expect((await flush()).unrestoredTabs).toBeUndefined();
+      expect((await autosave()).unrestoredTabs).toBeUndefined();
       expectReleased();
     });
 
@@ -3394,13 +3408,13 @@ describe("documents in one window", () => {
     expect(tabs()).toHaveLength(2);
     expect(bridge().snapshot().document.title).toBe("First");
     expect(container.querySelector('[role="status"]')?.textContent).toContain("1 drawing is kept for later");
-    const saved = await flush();
+    const saved = await autosave();
     expect(saved.unrestoredTabs).toEqual([corrupt]);
     expect(saved.tabs!.map((tab) => tab.displayName)).toEqual(["First.chemdraft", "Third.chemdraft"]);
     await remount();
     expect(tabs()).toHaveLength(2);
     await command("view.zoomIn");
-    expect((await flush()).unrestoredTabs).toEqual([corrupt]);
+    expect((await autosave()).unrestoredTabs).toEqual([corrupt]);
   });
 
   it("never overwrites a wholly unreadable session envelope", async () => {
@@ -3410,13 +3424,13 @@ describe("documents in one window", () => {
     native.saveSession.mockClear();
     expect(container.querySelector('[role="status"]')?.textContent).toContain("will not be autosaved");
     await paste("Drawing after failed restore");
-    await flush();
+    await autosave();
     expect(native.saveSession).not.toHaveBeenCalled();
     expect(native.session).toEqual(raw);
   });
 
   it("neither restores nor announces a sole pristine blank Untitled tab", async () => {
-    const saved = await flush();
+    const saved = await autosave();
     expect(saved.tabs).toHaveLength(1);
     expect(saved.tabs![0]!.pristine).toBe(true);
     await remount();
@@ -3426,7 +3440,7 @@ describe("documents in one window", () => {
     // A clean no-restore read still permits later autosaves.
     native.saveSession.mockClear();
     await paste("Fresh drawing");
-    await flush();
+    await autosave();
     expect(native.saveSession).toHaveBeenCalledTimes(1);
   });
 
@@ -3457,7 +3471,7 @@ describe("documents in one window", () => {
   it("zoom autosave keeps views current without serializing unchanged foreground or background tabs", async () => {
     await open("Background");
     await open("Foreground");
-    await flush();
+    await autosave();
     vi.mocked(createNativeSavePayload).mockClear();
     await command("view.zoomIn");
     const view = bridge().snapshot().viewport;
@@ -3465,7 +3479,7 @@ describe("documents in one window", () => {
     expect(createNativeSavePayload).not.toHaveBeenCalled();
     expect(parseDocumentSessionEnvelope(native.session)!.tabs![1]!.view!.viewport).toEqual(view);
     await paste("Changed foreground");
-    await flush();
+    await autosave();
     expect(createNativeSavePayload).toHaveBeenCalledTimes(1);
   });
 
@@ -3579,7 +3593,7 @@ describe("documents in one window", () => {
     expect(active()).toBe(0);
     expect(bridge().snapshot().document.title).toBe("Session drawing");
     expect(bridge().snapshot().file.dirty).toBe(true);
-    expect((await flush()).tabs).toHaveLength(2);
+    expect((await autosave()).tabs).toHaveLength(2);
   });
 
   it("edits made during a slow session read remain active while the old tabs are restored", async () => {
@@ -3604,7 +3618,7 @@ describe("documents in one window", () => {
     native.saveSession.mockClear();
     await paste("Work after failed read");
     await command("document.new");
-    await flush();
+    await autosave();
     expect(native.saveSession).not.toHaveBeenCalled();
   });
 
