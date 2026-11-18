@@ -397,18 +397,34 @@ describe("native Window and full-screen menus", () => {
     expect(windowMenu).toMatch(/#\[cfg\(not\(target_os = "macos"\)\)\]\s*&PredefinedMenuItem::close_window\(app, None\)/);
   });
 
-  it("adds one predefined full-screen role to View on macOS", () => {
-    const viewMenu = source.split("fn create_view_menu<R: Runtime>")[1]!.split("/// One Toolbars-menu row")[0]!;
-    expect(viewMenu).toMatch(/let view_menu = Submenu::with_items\(\s*app,\s*"View",/);
-    expect(viewMenu).toMatch(/if cfg!\(target_os = "macos"\) \{[^}]*view_menu\.append_items\([^}]*PredefinedMenuItem::fullscreen\(app, None\)/);
+  it("builds one native full-screen item in View with the current document state on macOS", () => {
     expect(source.match(/PredefinedMenuItem::fullscreen\(/g)).toHaveLength(1);
+    const builder = source.split("fn create_app_menu_for_toolsets<R: Runtime>")[1]!.split("/// Close Window")[0]!;
+    expect(builder).toContain("let view_menu = create_view_menu(app, entries, view_state)?;");
+    expect(builder).toMatch(/#\[cfg\(target_os = "macos"\)\]\s*let fullscreen = \{/);
+    expect(builder).toMatch(/let is_fullscreen = main_ns_window\(app\)\s*\.is_some_and\(\|window\| window\.styleMask\(\)\.contains\(NSWindowStyleMask::FullScreen\)\)/);
+    expect(builder).toContain("PredefinedMenuItem::fullscreen(app, Some(fullscreen_menu_title(is_fullscreen)))");
+    expect(builder).toContain("view_menu.append_items(&[&PredefinedMenuItem::separator(app)?, &item])?;");
+    expect(builder).toContain("state.0.lock().unwrap().replace(fullscreen)");
+    const viewMenu = source.split("fn create_view_menu<R: Runtime>")[1]!.split("/// One Toolbars-menu row")[0]!;
+    expect(viewMenu).toMatch(/Submenu::with_items\(\s*app,\s*"View",/);
+  });
+
+  it("retitles the latest item when the document finishes entering or leaving full screen", () => {
+    const observer = source.split("fn observe_document_fullscreen<R: Runtime>")[1]!.split("/// One Toolbars-menu row")[0]!;
+    expect(observer).toContain("(NSWindowDidEnterFullScreenNotification, true)");
+    expect(observer).toContain("(NSWindowDidExitFullScreenNotification, false)");
+    expect(observer).toMatch(/addObserverForName_object_queue_usingBlock\(\s*Some\(notification\),\s*Some\(window\),/);
+    expect(observer).toContain("app.state::<FullscreenMenuItem<R>>();");
+    expect(observer).toContain("let item = state.0.lock().unwrap().clone();");
+    expect(observer).toContain("let title = fullscreen_menu_title(entered);");
+    expect(observer).toMatch(/if current != title \{\s*item\.set_text\(title\)\?;/);
   });
 
   it("excludes secondary windows from AppKit's list when they are created", () => {
     const setup = source.split("// Only macOS has an app-wide menu bar.")[1]!.split(".on_page_load(")[0]!;
     expect(setup).toMatch(/#\[cfg\(target_os = "macos"\)\]\s*let builder = builder\.menu\(create_app_menu\)\.plugin\(/);
-    expect(setup).toMatch(/\.on_window_ready\(\|window\| \{\s*\/\/[^\n]*\n\s*if window\.label\(\) == MAIN_WINDOW_LABEL \{\s*return;/);
-    expect(setup).toContain("native.setExcludedFromWindowsMenu(true)");
+    expect(setup).toMatch(/\.on_window_ready\(\|window\| \{[\s\S]*?if is_document_window\(window\.label\(\)\) \{\s*observe_document_fullscreen\(window\.app_handle\(\), native\);\s*\} else \{\s*native\.setExcludedFromWindowsMenu\(true\);/);
   });
 });
 

@@ -1244,22 +1244,24 @@ pub fn run() {
     // window, which subclasses each palette/popover with muda's menu proc; see `install_app_menu`
     // for why that crashed. There the menu is attached to the document window in `setup` instead.
     #[cfg(target_os = "macos")]
+    let builder = builder.manage(FullscreenMenuItem::<tauri::Wry>(Mutex::new(None)));
+    #[cfg(target_os = "macos")]
     let builder = builder.menu(create_app_menu).plugin(
         tauri::plugin::Builder::<tauri::Wry>::new("windows-menu")
             .on_window_ready(|window| {
-                // All document tabs live in the main window. AppKit's list should only show it.
-                if window.label() == MAIN_WINDOW_LABEL {
-                    return;
-                }
                 match window.ns_window() {
                     Ok(pointer) => {
                         // SAFETY: Tauri calls this hook on the main thread with a live window.
                         if let Some(native) = unsafe { pointer.cast::<NSWindow>().as_ref() } {
-                            native.setExcludedFromWindowsMenu(true);
+                            if is_document_window(window.label()) {
+                                observe_document_fullscreen(window.app_handle(), native);
+                            } else {
+                                native.setExcludedFromWindowsMenu(true);
+                            }
                         }
                     }
                     Err(error) => eprintln!(
-                        "Could not exclude ChemDraft window {} from the Window menu: {error}",
+                        "Could not configure the native menu for ChemDraft window {}: {error}",
                         window.label()
                     ),
                 }
@@ -8714,6 +8716,15 @@ fn create_app_menu_for_toolsets<R: Runtime>(
     let page_setup_menu = create_page_setup_menu(app)?;
     let insert_menu = build_insert_submenu(app)?;
     let view_menu = create_view_menu(app, entries, view_state)?;
+    #[cfg(target_os = "macos")]
+    let fullscreen = {
+        // The initial app menu is built before the document window exists.
+        let is_fullscreen = main_ns_window(app)
+            .is_some_and(|window| window.styleMask().contains(NSWindowStyleMask::FullScreen));
+        let item = PredefinedMenuItem::fullscreen(app, Some(fullscreen_menu_title(is_fullscreen)))?;
+        view_menu.append_items(&[&PredefinedMenuItem::separator(app)?, &item])?;
+        item
+    };
     let structure_menu = Submenu::with_items(
         app,
         "Structure",
@@ -8806,7 +8817,7 @@ fn create_app_menu_for_toolsets<R: Runtime>(
         }
     }
 
-    Menu::with_items(
+    let menu = Menu::with_items(
         app,
         &[
             #[cfg(target_os = "macos")]
@@ -9011,7 +9022,16 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                 ],
             )?,
         ],
-    )
+    )?;
+
+    #[cfg(target_os = "macos")]
+    {
+        // Keep only the new item's handle so transitions never retitle retired menus.
+        let state = app.state::<FullscreenMenuItem<R>>();
+        let previous = state.0.lock().unwrap().replace(fullscreen);
+        drop(previous);
+    }
+    Ok(menu)
 }
 
 /// Close Window (Cmd+W) on macOS. The predefined item sends `performClose:`, which AppKit refuses
@@ -9290,7 +9310,7 @@ fn create_view_menu<R: Runtime>(
         None::<&str>,
     )?;
 
-    let view_menu = Submenu::with_items(
+    Submenu::with_items(
         app,
         "View",
         true,
@@ -9304,15 +9324,71 @@ fn create_view_menu<R: Runtime>(
             &customize_toolbars,
             &customize_main_toolbar,
         ],
-    )?;
-    if cfg!(target_os = "macos") {
-        // AppKit validates toggleFullScreen: against the active window and updates the title.
-        view_menu.append_items(&[
-            &PredefinedMenuItem::separator(app)?,
-            &PredefinedMenuItem::fullscreen(app, None)?,
-        ])?;
+    )
+}
+
+#[cfg(target_os = "macos")]
+struct FullscreenMenuItem<R: Runtime>(Mutex<Option<PredefinedMenuItem<R>>>);
+
+#[cfg(any(target_os = "macos", test))]
+fn fullscreen_menu_title(fullscreen: bool) -> &'static str {
+    if fullscreen {
+        "Exit Full Screen"
+    } else {
+        "Enter Full Screen"
     }
-    Ok(view_menu)
+}
+
+#[cfg(target_os = "macos")]
+fn observe_document_fullscreen<R: Runtime>(app: &tauri::AppHandle<R>, window: &NSWindow) {
+    use objc2_app_kit::{
+        NSWindowDidEnterFullScreenNotification, NSWindowDidExitFullScreenNotification,
+    };
+    use objc2_foundation::{NSNotification, NSNotificationCenter};
+    use std::ptr::NonNull;
+
+    let center = NSNotificationCenter::defaultCenter();
+    // Muda disables AppKit menu validation. The window's completion notifications tell us when
+    // to retitle the native toggleFullScreen: item, including transitions from the green button.
+    for (notification, entered) in unsafe {
+        [
+            (NSWindowDidEnterFullScreenNotification, true),
+            (NSWindowDidExitFullScreenNotification, false),
+        ]
+    } {
+        let app = app.clone();
+        let callback = block2::RcBlock::new(move |_: NonNull<NSNotification>| {
+            let state = app.state::<FullscreenMenuItem<R>>();
+            let item = state.0.lock().unwrap().clone();
+            let Some(item) = item else { return };
+            let title = fullscreen_menu_title(entered);
+            let result = item.text().and_then(|current| {
+                if current != title {
+                    item.set_text(title)?;
+                }
+                Ok(())
+            });
+            if let Err(error) = result {
+                eprintln!("Could not update the ChemDraft full-screen menu title: {error}");
+            }
+        });
+        // The document window lives for the process, like the other document observers.
+        std::mem::forget(unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(notification),
+                Some(window),
+                None,
+                &callback,
+            )
+        });
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn fullscreen_menu_titles_match_window_state() {
+    assert_eq!(fullscreen_menu_title(false), "Enter Full Screen");
+    assert_eq!(fullscreen_menu_title(true), "Exit Full Screen");
 }
 
 /// One Toolbars-menu row. JS is the source of truth for the toolset set + titles now and pushes
