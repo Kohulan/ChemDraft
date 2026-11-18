@@ -35,7 +35,7 @@ The workflow:
 4. Checks the bundle identity and that the `.deb` carries `chemdraft`, the 3D sidecar and the
    OPSIN runtime.
 5. Repacks the AppImage after Tauri bundles it. It uses the host's Wayland and compiler runtime
-   libraries, bundles `libgpg-error.so.0` beside `libgcrypt.so.20`, and the job verifies that the finished image contains no `libwayland-*`,
+   libraries and the host's `libgpg-error.so.0`; the job verifies that the finished image contains no `libwayland-*`,
    `libstdc++.so*`, or `libgcc_s.so*` files or symlinks.
 6. Records the source commit and final bytes of each package, then stages the packages, records,
    and checksums as the `linux-release-amd64` workflow artifact.
@@ -90,7 +90,8 @@ To test existing packages, add `-f artifact_run_id=<linux-release-run-id>` and o
 `actions: read` for artifact downloads and must allow the `contents: write` permission declared
 by the release workflow's separate publishing job. The build itself runs with read access.
 
-The workflow checks Debian sid and Fedora under Xvfb and headless Weston. Debian installs the
+The workflow checks Debian sid and Fedora under Xvfb and headless Weston. The containers install
+libgpg-error as a desktop system would. Debian installs the
 .deb with apt and Fedora extracts its payload and runs it with Fedora's libraries. Each job
 uploads display, app, and process logs. These tests cover startup and subprocess crashes. GPU
 rendering still needs a desktop check. The privileged containers allow `strace` to trace the app

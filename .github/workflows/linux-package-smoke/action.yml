@@ -247,8 +247,10 @@ runs:
         window_ready || fail 'No ChemDraft window appeared within 60 seconds'
         for _ in {1..20}; do
           sleep 1
-          kill -0 "$launcher_pid" "$main_pid" "$display_pid" 2>/dev/null \
-            || fail 'ChemDraft, its tracer, or the display exited during the 20-second smoke test'
+          for pid in "$launcher_pid" "$main_pid" "$display_pid"; do
+            kill -0 "$pid" 2>/dev/null \
+              || fail 'ChemDraft, its tracer, or the display exited during the 20-second smoke test'
+          done
         done
         if awk '
           /execve\("[^"]*\/WebKitWebProcess"/ { webkit[$1] = 1 }

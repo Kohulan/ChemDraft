@@ -110,14 +110,14 @@ jobs:
             apt-get update
             apt-get install -y --no-install-recommends \
               dbus-daemon passwd procps strace util-linux weston xwayland xvfb libgtk-3-0t64 libxdo3 \
-              libegl1 libegl-mesa0 libgl1 libgl1-mesa-dri \
+              libegl1 libegl-mesa0 libgl1 libgl1-mesa-dri libgpg-error0 \
               libwayland-client0 libwayland-egl1 libwayland-cursor0 libwayland-server0
             if [[ "$PACKAGE" == deb ]]; then
               apt-get install -y --no-install-recommends "${bundles[0]}"
             fi
           else
             dnf install -y /usr/bin/dbus-run-session procps-ng shadow-utils strace util-linux weston xorg-x11-server-Xwayland xorg-x11-server-Xvfb \
-              gtk3 libxdo mesa-dri-drivers mesa-libEGL libglvnd-egl libglvnd-glx \
+              gtk3 libxdo mesa-dri-drivers mesa-libEGL libglvnd-egl libglvnd-glx libgpg-error \
               libwayland-client libwayland-egl libwayland-cursor libwayland-server
             if [[ "$PACKAGE" == deb ]]; then
               # Fedora exercises the payload against Fedora libraries. Debian tests apt install.
