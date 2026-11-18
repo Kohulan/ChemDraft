@@ -32,11 +32,33 @@ The workflow:
 3. Builds a stable `.deb` and AppImage (`CHEMDRAFT_STABLE_BUILD=1`, no worktree label).
 4. Checks the bundle identity and that the `.deb` carries `chemdraft`, the 3D sidecar and the
    OPSIN runtime.
-5. Installs the `.deb` on the runner and starts it on a virtual display (Xvfb + openbox). It fails
+5. Repacks the AppImage after Tauri bundles it. It uses the host's Wayland and compiler runtime
+   libraries, and the job verifies that the finished image contains no `libwayland-*`,
+   `libstdc++.so*`, or `libgcc_s.so*` files or symlinks.
+6. Installs the `.deb` on the runner and starts it on a virtual display (Xvfb + openbox). It fails
    if a library is missing, if ChemDraft exits or panics during start-up, or if no window appears.
-6. Uploads the packages and checksums to the draft release, never to a published one.
+7. Uploads the packages and checksums to the draft release, never to a published one.
 
 The release body gets a `## Linux` section beside `## macOS` and `## Windows`.
+
+## Container smoke test
+
+Build and test both packages using the workflow from a branch or tag:
+
+```sh
+gh workflow run linux-container-smoke.yml --ref <branch-or-tag>
+```
+
+To test existing packages, add `-f artifact_run_id=<linux-release-run-id>` and optionally
+`-f artifact_name=<name>` (defaults to `linux-release-amd64`). A reusable caller can also supply
+`artifact_name` for packages uploaded earlier in the same run. Reusable callers need
+`actions: read` for artifact downloads and must allow the `contents: write` permission declared
+by the release workflow's separate publishing job. The build itself runs with read access.
+
+The workflow checks Debian sid and Fedora under Xvfb and headless Weston. Debian installs the
+.deb with apt and Fedora extracts its payload and runs it with Fedora's libraries. Each job
+uploads display, app, and process logs. These tests cover startup and subprocess crashes. GPU
+rendering still needs a desktop check.
 
 ## Updates
 
@@ -46,7 +68,9 @@ repository on GitHub Pages, or a Flathub listing.
 
 ## Platform notes
 
-- Webview: WebKitGTK, origin `tauri://localhost` (as on macOS).
+- Webview: WebKitGTK, origin `tauri://localhost` (as on macOS). Before startup on Linux,
+  ChemDraft defaults `WEBKIT_DISABLE_DMABUF_RENDERER` to `1` to avoid Wayland graphics
+  problems. An explicit value, including `0`, takes precedence.
 - Menus: on the document window, as on Windows (`install_app_menu`). Edit ▸ Cut / Copy / Paste
   are routed commands (`clipboard_edit_menu_item`), not muda's predefined items: on Linux those
   only fake a key press through libxdo, which does nothing on Wayland and was unreliable on X11.

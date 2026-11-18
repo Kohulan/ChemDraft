@@ -1,0 +1,212 @@
+name: Linux container smoke
+
+on:
+  workflow_call:
+    inputs:
+      artifact_run_id:
+        description: Run ID for an artifact in this repository (omit for the same run)
+        type: string
+      artifact_name:
+        description: Package artifact name (defaults to linux-release-amd64 with a run ID)
+        type: string
+  workflow_dispatch:
+    inputs:
+      artifact_run_id:
+        description: Run ID of an existing Linux package artifact
+        type: string
+      artifact_name:
+        description: Artifact name (use with a run ID, defaults to linux-release-amd64)
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  build:
+    if: inputs.artifact_run_id == '' && inputs.artifact_name == ''
+    uses: ./.github/workflows/linux-release.yml
+    permissions:
+      # The reusable workflow declares an upload job with write permission. Its build job has
+      # read access and workflow_call accepts only a source ref, so this call cannot publish.
+      contents: write
+    with:
+      ref: ${{ github.sha }}
+
+  smoke:
+    needs: build
+    if: >-
+      always() && !cancelled() && (needs.build.result == 'success' ||
+      (needs.build.result == 'skipped' && (inputs.artifact_run_id != '' || inputs.artifact_name != '')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [debian, fedora]
+        package: [appimage, deb]
+        backend: [x11, wayland]
+        include:
+          - distro: debian
+            image: debian:sid
+          - distro: fedora
+            image: fedora:latest
+    container: ${{ matrix.image }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      DISTRO: ${{ matrix.distro }}
+      PACKAGE: ${{ matrix.package }}
+      BACKEND: ${{ matrix.backend }}
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name || 'linux-release-amd64' }}
+          path: packages
+          github-token: ${{ inputs.artifact_run_id != '' && github.token || '' }}
+          run-id: ${{ inputs.artifact_run_id || github.run_id }}
+
+      - name: Install host graphics libraries and smoke tools
+        run: |
+          set -euo pipefail
+          mkdir -p smoke-logs
+          exec > >(tee smoke-logs/setup.log) 2>&1
+          shopt -s nullglob
+          if [[ "$PACKAGE" == deb ]]; then
+            bundles=("$GITHUB_WORKSPACE"/packages/*.deb)
+          else
+            bundles=("$GITHUB_WORKSPACE"/packages/*.AppImage)
+          fi
+          if [[ ${#bundles[@]} != 1 ]]; then
+            echo "::error::Expected exactly one $PACKAGE in the artifact"
+            exit 1
+          fi
+
+          if [[ "$DISTRO" == debian ]]; then
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              dbus-daemon passwd procps strace util-linux weston xvfb libgtk-3-0t64 libxdo3 \
+              libegl1 libegl-mesa0 libgl1 libgl1-mesa-dri \
+              libwayland-client0 libwayland-egl1 libwayland-cursor0 libwayland-server0
+            if [[ "$PACKAGE" == deb ]]; then
+              apt-get install -y --no-install-recommends "${bundles[0]}"
+            fi
+          else
+            dnf install -y /usr/bin/dbus-run-session procps-ng shadow-utils strace util-linux weston xorg-x11-server-Xvfb \
+              gtk3 libxdo mesa-dri-drivers mesa-libEGL libglvnd-egl libglvnd-glx \
+              libwayland-client libwayland-egl libwayland-cursor libwayland-server
+            if [[ "$PACKAGE" == deb ]]; then
+              # Fedora exercises the payload against Fedora libraries. Debian tests apt install.
+              dnf install -y /usr/bin/dpkg-deb webkit2gtk4.1
+              dpkg-deb -x "${bundles[0]}" /
+            fi
+          fi
+
+          if [[ "$PACKAGE" == appimage ]]; then
+            chmod a+x "${bundles[0]}"
+            echo "BUNDLE=${bundles[0]}" >> "$GITHUB_ENV"
+          else
+            echo 'BUNDLE=/usr/bin/chemdraft' >> "$GITHUB_ENV"
+          fi
+          useradd --create-home smoke
+          install -d -m 1777 /tmp/.X11-unix
+
+      # Xvfb catches missing libraries and baseline startup failures in both packages. Weston
+      # exercises GTK on Wayland and the AppImage WebKit subprocess startup/abort path against
+      # newer host libraries. Neither display has a GPU or reproduces KDE Plasma rendering glitches.
+      - name: Launch and watch the WebKit process
+        run: |
+          set -euo pipefail
+          logs="$GITHUB_WORKSPACE/smoke-logs"
+          install -d -o smoke "$logs"
+          runuser -u smoke -- dbus-run-session -- bash -s -- "$BUNDLE" "$PACKAGE" "$BACKEND" "$logs" <<'SMOKE'
+          set -euo pipefail
+          bundle=$1
+          package=$2
+          backend=$3
+          logs=$4
+          export XDG_RUNTIME_DIR
+          XDG_RUNTIME_DIR=$(mktemp -d)
+          unset DISPLAY WAYLAND_DISPLAY WEBKIT_DISABLE_DMABUF_RENDERER
+          if [[ "$backend" == wayland ]]; then
+            export WAYLAND_DISPLAY=chemdraft-smoke
+            weston --backend=headless --renderer=pixman --shell=kiosk-shell.so \
+              --socket="$WAYLAND_DISPLAY" --idle-time=0 > "$logs/display.log" 2>&1 &
+            ready="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+          else
+            Xvfb -screen 0 1600x1000x24 -nolisten tcp -displayfd 3 \
+              3>"$logs/display-number" > "$logs/display.log" 2>&1 &
+            ready="$logs/display-number"
+          fi
+          display_pid=$!
+          launcher_pid=
+          main_pid=
+          trap 'kill ${main_pid:+"$main_pid"} ${launcher_pid:+"$launcher_pid"} "$display_pid" 2>/dev/null || true' EXIT
+          for _ in {1..20}; do
+            [[ -S "$ready" || -s "$ready" ]] && break
+            kill -0 "$display_pid"
+            sleep 1
+          done
+          if [[ "$backend" == x11 && -s "$ready" ]]; then
+            export DISPLAY=":$(<"$ready")"
+          elif [[ "$backend" != wayland || ! -S "$ready" ]]; then
+            echo "::error::$backend display did not start"
+            exit 1
+          fi
+
+          # The disposable container already isolates the unprivileged app and can block
+          # WebKitGTK's nested bubblewrap namespaces. Production launches keep the sandbox.
+          export GDK_BACKEND="$backend" WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
+          command=("$bundle")
+          if [[ "$package" == appimage ]]; then
+            command+=(--appimage-extract-and-run)
+          fi
+          fail() {
+            cat "$logs/chemdraft.log"
+            echo "::error::$1"
+            exit 1
+          }
+          # Trace execs and process exits so a child SIGABRT fails even without a systemd journal.
+          smoke_uid=$(id -u)
+          web_process_running() {
+            pgrep -u "$smoke_uid" -f '(^|/)WebKitWebProcess([[:space:]:]|$)' >/dev/null
+          }
+          strace -f -e trace=execve -s 256 -o "$logs/process.log" "${command[@]}" \
+            > "$logs/chemdraft.log" 2>&1 &
+          launcher_pid=$!
+          for _ in {1..60}; do
+            kill -0 "$launcher_pid" 2>/dev/null || fail 'ChemDraft or its tracer exited during startup'
+            main_pid=$(pgrep -u "$smoke_uid" -x chemdraft || true)
+            if [[ -n "$main_pid" ]] && web_process_running; then
+              break
+            fi
+            sleep 1
+          done
+          [[ -n "$main_pid" ]] || fail 'ChemDraft did not launch'
+          web_process_running || fail 'No WebKitWebProcess stayed alive during startup'
+          for _ in {1..20}; do
+            sleep 1
+            kill -0 "$launcher_pid" "$main_pid" "$display_pid" 2>/dev/null \
+              || fail 'ChemDraft, its tracer, or the display exited during the 20-second smoke test'
+          done
+          if awk '
+            /execve\("[^"]*\/WebKitWebProcess"/ { webkit[$1] = 1 }
+            ($1 in webkit) && /\+\+\+ (killed by SIG(ABRT|BUS|FPE|ILL|KILL|SEGV|SYS|TRAP)|exited with [1-9])/ {
+              print
+              crashed = 1
+            }
+            END { exit !crashed }
+          ' "$logs/process.log" || grep -Ei 'web[ -]*process.*(crash|abort|segfault|terminated unexpectedly)|panicked at' "$logs/chemdraft.log"; then
+            fail 'A WebKit subprocess crashed or ChemDraft panicked'
+          fi
+          web_process_running || fail 'No WebKitWebProcess was alive at the end of the smoke test'
+          echo 'ChemDraft started WebKitWebProcess and stayed alive for 20 seconds.'
+          SMOKE
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-smoke-${{ matrix.distro }}-${{ matrix.package }}-${{ matrix.backend }}
+          path: smoke-logs/

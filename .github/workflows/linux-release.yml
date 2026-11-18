@@ -11,6 +11,12 @@ name: Linux release
 # and Debian 12+. See docs/releasing/linux.md.
 
 on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Public repository tag or full commit SHA to build without publishing
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       ref:
@@ -80,7 +86,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo -E apt-get install -y --no-install-recommends \
-            build-essential pkg-config file patchelf xdg-utils \
+            build-essential pkg-config file patchelf squashfs-tools xdg-utils \
             libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
             libayatana-appindicator3-dev libsoup-3.0-dev libssl-dev libxdo-dev
 
@@ -153,6 +159,45 @@ jobs:
           cp "$deb" "$appimage" release-assets/
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "deb=$(basename "$deb")" >> "$GITHUB_OUTPUT"
+          echo "appimage=$(basename "$appimage")" >> "$GITHUB_OUTPUT"
+
+      - name: Repack AppImage with host Wayland and compiler runtimes
+        env:
+          APPIMAGE: release-assets/${{ steps.bundle.outputs.appimage }}
+        run: |
+          set -euo pipefail
+          image="$GITHUB_WORKSPACE/$APPIMAGE"
+          work=$(mktemp -d)
+          trap 'rm -rf -- "$work"' EXIT
+          cd "$work"
+
+          # A type 2 AppImage is its ELF runtime followed by SquashFS. Keep the runtime Tauri
+          # supplied and replace the filesystem after linuxdeploy completes, without FUSE.
+          offset=$("$image" --appimage-offset)
+          [[ "$offset" =~ ^[1-9][0-9]*$ ]]
+          "$image" --appimage-extract > original-extraction.log
+          test -x squashfs-root/AppRun
+          echo 'Graphics and compiler libraries in the original AppImage:'
+          find squashfs-root \( -name 'libwayland-*' -o -name 'libEGL*.so*' -o -name 'libgbm.so*' \
+            -o -name 'libstdc++.so*' -o -name 'libgcc_s.so*' \) -print
+          find squashfs-root \( -name 'libwayland-*' -o -name 'libstdc++.so*' \
+            -o -name 'libgcc_s.so*' \) -delete
+          mksquashfs squashfs-root app.squashfs -noappend -all-root -comp xz -no-progress
+          head -c "$offset" "$image" > repacked.AppImage
+          cat app.squashfs >> repacked.AppImage
+          chmod +x repacked.AppImage
+
+          mkdir verify
+          cd verify
+          ../repacked.AppImage --appimage-extract > repacked-extraction.log
+          test -x squashfs-root/AppRun
+          leftovers=$(find squashfs-root \( -name 'libwayland-*' -o -name 'libstdc++.so*' \
+            -o -name 'libgcc_s.so*' \) -print)
+          if [[ -n "$leftovers" ]]; then
+            printf '::error::AppImage still contains host libraries\n%s\n' "$leftovers"
+            exit 1
+          fi
+          mv ../repacked.AppImage "$image"
 
       # Install the .deb like a user would and keep it running on a virtual display. This catches a
       # missing library dependency and a crash during start-up (window creation, menus, palettes).
@@ -166,7 +211,7 @@ jobs:
           Xvfb "$DISPLAY" -screen 0 1600x1000x24 >/dev/null 2>&1 &
           sleep 1
           openbox >/dev/null 2>&1 &
-          WEBKIT_DISABLE_DMABUF_RENDERER=1 chemdraft > chemdraft-smoke.log 2>&1 &
+          env -u WEBKIT_DISABLE_DMABUF_RENDERER chemdraft > chemdraft-smoke.log 2>&1 &
           pid=$!
           for _ in $(seq 1 60); do
             kill -0 "$pid" 2>/dev/null || { cat chemdraft-smoke.log; echo '::error::ChemDraft exited during start-up.'; exit 1; }
