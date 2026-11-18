@@ -127,11 +127,14 @@ export function installPopoverEscapeRouting(editorOpen: () => boolean = () => fa
       if (disposed) return;
       const targets = visible.flatMap(result => result && opens.get(result.opening.toolsetId) === result.opening &&
         result.opening.revision === result.revision ? [result.opening] : []);
-      pending.forEach(retire);
       // Re-evaluate every ownership guard after IPC, even when the flyout is visible.
       if (ownedElsewhere(event, currentTarget(event), caption)) {
+        pending.forEach(opening => { opening.checking = false; });
         resumeEscape(event);
-      } else if (targets.length) {
+        return;
+      }
+      pending.forEach(retire);
+      if (targets.length) {
         void dismissToolsetPopovers(requestedAt, "escape", targets.map(({ toolsetId, openedAt, generation }) =>
           ({ toolsetId, openedAt, generation }))).catch(() => undefined);
       } else {

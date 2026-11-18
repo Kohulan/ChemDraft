@@ -77,7 +77,7 @@ export interface ArtInspectorModel {
     height: ArtInspectorMixedValue<number>;
     width: ArtInspectorMixedValue<number>;
   };
-  electronMarks?: { count: number; sizePx: number; thicknessPx: number };
+  electronMarks?: { count: number; sizePx: ArtInspectorMixedValue<number>; thicknessPx: ArtInspectorMixedValue<number> };
   selectedCount: number;
   selectedObjectIds: string[];
   selectedGraphicIds: string[];
@@ -178,6 +178,7 @@ export function createArtInspectorModel({
     .map((object) => object.id);
   const marks = document.pages.flatMap(page => page.objects.filter(object =>
     object.type === "electron-mark" && document.selection.objectIds.includes(object.id)));
+  const supportsMarkStyle = marks.map(() => true);
   const selectedCount = styleObjects.length + marks.length;
   const planned = styleObjects.map((object): ArtInspectorPlannedEntry => {
     if (object.type === "graphic") {
@@ -253,8 +254,8 @@ export function createArtInspectorModel({
     selectedCount,
     ...(marks.length ? { electronMarks: {
       count: marks.length,
-      sizePx: Math.max(marks[0].width, marks[0].height),
-      thicknessPx: typeof marks[0].style.strokeWidth === "number" ? marks[0].style.strokeWidth : 1.5
+      sizePx: uniformSupportedValue(marks, supportsMarkStyle, mark => Math.max(mark.width, mark.height)),
+      thicknessPx: uniformSupportedValue(marks, supportsMarkStyle, mark => metadataNumberValue(mark.style.strokeWidth, 1.5))
     } } : {}),
     selectedObjectIds: [...styleObjects, ...marks].map((object) => object.id),
     selectedGraphicIds: graphics.map((object) => object.id),

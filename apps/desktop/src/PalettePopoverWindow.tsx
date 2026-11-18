@@ -93,7 +93,7 @@ export function PalettePopoverWindow({
     if (current.kind === "flyout" && current.flyout.variant !== "bondStereo") {
       // closedOpening rejects replays while allowing a newer generation at the same timestamp.
       void notifyToolsetFlyoutClosed({ toolsetId, flyoutId: current.flyout.flyoutId,
-        openedAt: contentOpenedAt.current }).catch(() => undefined);
+        openedAt: contentOpenedAt.current, generation: current.generation }).catch(() => undefined);
     }
     hideNativePopoverWindow();
   };

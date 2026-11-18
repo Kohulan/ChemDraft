@@ -2536,14 +2536,16 @@ function ArtToolbarStyleControls() {
   };
 
   const marks = currentArtStyle?.electronMarks;
+  const markSize = marks?.sizePx.value ?? 8;
+  const markThickness = marks?.thicknessPx.value ?? 0.5;
   const markSliders = marks ? (
     <div className="art-inspector-row" data-electron-mark-controls="true">
-      {opacitySlider("Electron mark size", "Size", (marks.sizePx - 8) / 100,
+      {opacitySlider("Electron mark size", "Size", (markSize - 8) / 100,
         value => electronMarkStyleCommandId("size", value * 100), marks.count, undefined,
-        `${Math.round(marks.sizePx * 10) / 10}px`)}
-      {opacitySlider("Electron mark thickness", "Thickness", (marks.thicknessPx - 0.5) / 5,
+        marks.sizePx.mixed ? "Mixed" : `${Math.round(markSize * 10) / 10}px`)}
+      {opacitySlider("Electron mark thickness", "Thickness", (markThickness - 0.5) / 5,
         value => electronMarkStyleCommandId("thickness", value * 100), marks.count, undefined,
-        `${Math.round(marks.thicknessPx * 100) / 100}px`)}
+        marks.thicknessPx.mixed ? "Mixed" : `${Math.round(markThickness * 100) / 100}px`)}
     </div>
   ) : null;
   if (marks && marks.count === selectedCount) {

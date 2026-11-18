@@ -556,6 +556,7 @@ export interface ToolsetFlyoutSession {
   toolsetId: string;
   flyoutId: string;
   openedAt: number;
+  generation?: number;
 }
 export interface ToolsetFlyoutKey extends ToolsetFlyoutSession {
   key: string;

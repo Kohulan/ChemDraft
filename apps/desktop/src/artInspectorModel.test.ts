@@ -5,6 +5,7 @@ import {
   stylePresetToObjectStyle,
   type ChemDraftDocument,
   type DocumentObject,
+  type ElectronMarkObject,
   type GraphicObject,
   type MoleculeObject
 } from "@chemdraft/chem-core";
@@ -30,6 +31,25 @@ const baseGraphic = {
 } satisfies Omit<GraphicObject, "id" | "graphicKind" | "width" | "height">;
 
 describe("ArtInspectorModel", () => {
+  it.each([
+    { width: 14, height: 24, strokeWidth: 1.5, mixedSize: false, mixedThickness: false },
+    { width: 24, height: 30, strokeWidth: 1.5, mixedSize: true, mixedThickness: false },
+    { width: 24, height: 14, strokeWidth: 2.5, mixedSize: false, mixedThickness: true }
+  ])("reports electron-mark size and thickness independently ($mixedSize, $mixedThickness)", ({
+    width, height, strokeWidth, mixedSize, mixedThickness
+  }) => {
+    const mark: ElectronMarkObject = { id: "mark_1", type: "electron-mark", markKind: "charge",
+      charge: 1, anchor: { kind: "point", point: { x: 100, y: 100 } }, x: 100, y: 100,
+      width: 24, height: 18, rotation: 0, style: {} };
+    const other = { ...mark, id: "mark_2", width, height, style: { strokeWidth } };
+    const model = createArtInspectorModel({ document: documentWithSelectedObjects([mark, other]), selectedGraphicObjects: [] });
+    expect(model.electronMarks).toEqual({
+      count: 2,
+      sizePx: { value: mixedSize ? null : 24, mixed: mixedSize },
+      thicknessPx: { value: mixedThickness ? null : 1.5, mixed: mixedThickness }
+    });
+  });
+
   it("derives a serializable stroke-only model for line, arc, wavy, and quadratic path graphics", () => {
     for (const artPathKind of ["line", "arc", "wavy", "quadratic"] as const) {
       const graphic = pathGraphic(`graphic_${artPathKind}`, artPathKind);

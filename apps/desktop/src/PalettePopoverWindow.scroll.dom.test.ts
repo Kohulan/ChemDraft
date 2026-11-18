@@ -4,15 +4,18 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { PalettePopoverWindow } from "./PalettePopoverWindow";
-import type { ToolsetFlyoutKey, ToolsetPopoverContentPayload } from "./window-manager";
+import { installNativeFlyoutKeyboard } from "./nativeFlyoutKeyboard";
+import type { ToolsetFlyoutKey, ToolsetFlyoutSession, ToolsetPopoverContentPayload } from "./window-manager";
 
 const native = vi.hoisted(() => ({
   content: undefined as undefined | ((payload: ToolsetPopoverContentPayload) => void),
+  receiveClose: undefined as undefined | ((payload: ToolsetFlyoutSession) => void),
   key: undefined as undefined | ((payload: ToolsetFlyoutKey) => void),
   release: undefined as undefined | ((payload: { toolsetId: string; releasedAt: number }) => void),
   resized: undefined as undefined | (() => void),
   show: vi.fn(async () => {}), size: vi.fn(async () => {}), invoke: vi.fn(async (_command: string, _args?: Record<string, unknown>) => {}),
-  command: vi.fn(async () => {}), closed: vi.fn(async () => {}), flyoutClosed: vi.fn(async () => {})
+  command: vi.fn(async () => {}), closed: vi.fn(async () => {}), flyoutClosed: vi.fn(async () => {}),
+  sendKey: vi.fn(async () => {})
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: native.invoke }));
 vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ hide: async () => {}, setFocus: async () => {} }) }));
@@ -26,6 +29,8 @@ vi.mock("./window-manager", async importOriginal => ({
   listenForToolsetPopoverContent: vi.fn(async handler => { native.content = handler; return () => {}; }),
   listenForToolsetPopoverRelease: vi.fn(async handler => { native.release = handler; return () => {}; }),
   listenForToolsetFlyoutKeys: vi.fn(async handler => { native.key = handler; return () => {}; }),
+  listenForToolsetFlyoutClosed: vi.fn(async handler => { native.receiveClose = handler; return () => {}; }),
+  sendToolsetFlyoutKey: native.sendKey,
   notifyToolsetPopoverClosed: native.closed, notifyToolsetFlyoutClosed: native.flyoutClosed,
   sendPaletteCommand: native.command,
   listenForToolsetPopoverDismiss: vi.fn(async () => () => {}),
@@ -160,7 +165,7 @@ it("closes both flyout channels and resets keyboard navigation for a newer openi
   });
   expect(native.command).toHaveBeenCalledExactlyOnceWith("ring-0");
   expect(native.closed).toHaveBeenCalledExactlyOnceWith("core.main", 1, 1);
-  expect(native.flyoutClosed).toHaveBeenCalledExactlyOnceWith({ toolsetId: "core.main", flyoutId: "rings", openedAt: 1 });
+  expect(native.flyoutClosed).toHaveBeenCalledExactlyOnceWith({ toolsetId: "core.main", flyoutId: "rings", openedAt: 1, generation: 1 });
   const reveals = native.show.mock.calls.length;
   await act(async () => native.content?.(first));
   expect(native.show).toHaveBeenCalledTimes(reveals);
@@ -170,6 +175,32 @@ it("closes both flyout channels and resets keyboard navigation for a newer openi
   expect(container.querySelector('[data-keyboard-highlighted="true"]')).toBeNull();
   await act(async () => native.key?.(key));
   expect(container.querySelector('[data-keyboard-highlighted="true"]')?.getAttribute("data-command-id")).toBe("ring-0");
+});
+
+it.each(["before", "after"])("routes keys to a newer same-time flyout when the old close arrives %s its opening", order => {
+  const stop = installNativeFlyoutKeyboard();
+  const press = () => {
+    const event = new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true });
+    window.dispatchEvent(event);
+    return event.defaultPrevented;
+  };
+  try {
+    const current = { toolsetId: rings.toolsetId, flyoutId: rings.flyout.flyoutId, openedAt: 1, generation: 2 };
+    const closeOld = () => native.receiveClose?.({ ...current, generation: 1 });
+    native.content?.({ ...rings, generation: 1 });
+    if (order === "before") closeOld();
+    native.content?.({ ...rings, generation: 2 });
+    if (order === "after") closeOld();
+    expect(press()).toBe(true);
+    expect(native.sendKey).toHaveBeenCalledOnce();
+    native.receiveClose?.(current);
+    expect(press()).toBe(false);
+    native.content?.({ ...rings, generation: 3 });
+    expect(press()).toBe(true);
+    // Old senders identify their close by timestamp.
+    native.receiveClose?.({ toolsetId: current.toolsetId, flyoutId: current.flyoutId, openedAt: current.openedAt });
+    expect(press()).toBe(false);
+  } finally { stop(); }
 });
 
 it("focuses keyboard flyout choices and traverses Tab without scrolling", async () => {

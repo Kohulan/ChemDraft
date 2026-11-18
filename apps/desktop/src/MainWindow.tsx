@@ -1786,7 +1786,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.17.13.45-codex";
+const CURRENT_BUILD_STAMP = "11.17.20.00-codex";
 const VibeCodeGuideForm = lazy(() => import("./dialogs/VibeCodeGuideForm").then(module => ({ default: module.VibeCodeGuideForm })));
 const StructureTemplatePicker = lazy(() => import("./dialogs/StructureTemplatePicker").then(module => ({ default: module.StructureTemplatePicker })));
 /** Starts in the background for the document webview under the existing probe gate. */
@@ -16807,11 +16807,13 @@ export function MainWindow({
       return false;
     }
 
-    const movesMark = (drag.groupObjectIds ?? [drag.objectId]).some(id =>
-      findDocumentObject(drag.startDocument, id)?.type === "electron-mark");
+    const movedIds = drag.groupObjectIds ?? [drag.objectId];
+    const movedMarkCount = movedIds.filter(id =>
+      findDocumentObject(drag.startDocument, id)?.type === "electron-mark").length;
     const movesGroup = (drag.groupObjectIds?.length ?? 0) > 1 &&
       (object?.type === "group" || parentGroupForDocumentObject(drag.startDocument.pages[0]?.objects ?? [], drag.objectId) !== undefined);
-    commitDocumentHistoryFrom(drag.startDocument, moved, movesGroup ? "Move group" : movesMark ? "Move electron mark"
+    commitDocumentHistoryFrom(drag.startDocument, moved, movesGroup ? "Move group"
+      : movedMarkCount === movedIds.length ? "Move electron mark" : movedMarkCount > 0 ? "Move"
       : object?.type === "text" && object.arrowAttachment?.kind === "conditions" ? "Move Reaction Conditions" : undefined);
     return true;
   }, [assignHoveredNativeDeleteTarget, clearObjectTransformPreview, commitDocumentHistoryFrom, objectDragDelta, objectDragDocument, replacePresentDocument]);
@@ -19866,7 +19868,9 @@ export function MainWindow({
       setFreeformNativeBond(undefined);
       setNativeDoubleBondSidePreview(undefined);
       assignHoveredNativeDeleteTarget(undefined);
-      setStatus(selectionStatusLabel({ objectIds: nextDocument.selection.objectIds }));
+      const selectedIds = nextDocument.selection.objectIds;
+      setStatus(object.type === "bracket" && selectedIds.length === 1 && selectedIds[0] === objectId
+        ? "Selected bracket" : selectionStatusLabel({ objectIds: selectedIds }));
       return;
     }
 
@@ -19924,6 +19928,9 @@ export function MainWindow({
       setSelectedNativeMoleculePart(undefined);
       assignHoveredNativeDeleteTarget(undefined);
 
+      if (object?.type === "bracket") {
+        setStatus(selectedDocument.selection.objectIds.includes(objectId) ? "Selected bracket" : "Selected group");
+      }
       if (object && point) {
         objectDragRef.current = {
           pointerId: event.pointerId,
@@ -22646,6 +22653,15 @@ export function MainWindow({
               clearScheduledTextEditorFocus();
               finishActiveNativeTextEdit(textEditId);
               canvas.focus({ preventScroll: true });
+              return;
+            }
+            const bracketEditor = bracketLabelEditorRef.current;
+            if (bracketEditor && event.button === 0 && event.isPrimary !== false
+              && !isEditableTarget(event.target) && isCanvasDrawingPress(canvas, event)) {
+              // Canvas tools cancel default focus, so finish the edit before they claim the press.
+              event.preventDefault();
+              event.stopPropagation();
+              bracketEditor.commit();
               return;
             }
             const overlay = globalThis.document.activeElement?.closest<HTMLElement>(".plugin-canvas-overlay");
