@@ -86,9 +86,9 @@ Review action updates and trust policy changes as release infrastructure changes
 ## Run a release
 
 Use a reviewed commit that has landed on the public repository's `main` branch, with the workflow
-and signing tools present. The Apple-silicon DMG, Intel DMG and Windows installer must use the same
-commit and version. The release body must include `## macOS (Apple silicon)`, `## macOS (Intel)` and
-`## Windows`, plus a Platform differences note naming each feature gap and its reason, or saying there
+and signing tools present. The Apple-silicon DMG, Intel DMG, Windows installer, Linux `.deb` and Linux
+AppImage must use the same commit and version. The release body must include `## macOS (Apple silicon)`,
+`## macOS (Intel)`, `## Windows`, and `## Linux`, plus a Platform differences note naming each feature gap and its reason, or saying there
 are none. This workflow supplies the Windows artifacts only.
 
 1. Set the app version before tagging, and prepare tracked Windows release notes if needed. Create
@@ -136,14 +136,20 @@ are none. This workflow supplies the Windows artifacts only.
    `contents: write`; the build/signing job retains read access. Leave the release draft while testing.
    If uploading manually, upload the same final artifacts, without rebuilding or re-signing.
 7. After uploading, the same upload job uses its draft-visible token to download all attached release assets and run the
-   [asset checker](three-builds.md#last-step-before-un-drafting). If all three builds and their
+   [asset checker](three-builds.md#last-step-before-un-drafting). If all five builds and their
    records are present, hashes, sizes and tag/commit identity must pass. Wholly missing build pairs
    are listed, while every supplied build is fully checked; partial pairs fail. The Windows-only
    result is INCOMPLETE, not a publishing pass. Windows passes `--skip-dmg-provenance` explicitly
    because it cannot mount DMGs; the final Mac gate must check their embedded commits.
-8. Collect both DMGs and the installer with all three `.build.json` files, then pass the
+8. Collect both DMGs, the installer, `ChemDraft_X.Y.Z_amd64.deb`, and
+   `ChemDraft_X.Y.Z_amd64.AppImage` with their five adjacent `.build.json` files. The
+   [Linux workflow](linux.md#releasing) builds and records both packages and uploads them to the
+   existing draft after smoke tests pass when `upload_to_release` is supplied. Otherwise download
+   `linux-release-amd64` and upload the packages and records. Then pass the
    [joint release body check](three-builds.md) with the tag and explicit gaps or `--no-gaps`.
-   After all three artifacts pass review, **as the last step before un-drafting on a Mac** run both
+   Add `## Linux` notes and any Linux feature gaps manually to the generated body; the generator
+   currently creates only the macOS and Windows sections. After all five artifacts pass review,
+   **as the last step before un-drafting on a Mac** run both
    `verify-macos-app.mjs --release --dmg` checks and
    `node tools/release/check-release-assets.mjs --tag vX.Y.Z --commit <full-sha>` against GitHub,
    as listed in [the final checklist](three-builds.md#last-step-before-un-drafting).

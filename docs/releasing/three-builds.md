@@ -1,17 +1,19 @@
-# Check and publish a joint release
+# Check and publish all five builds
 
-Every release ships exactly one Apple-silicon DMG, one Intel DMG and one Windows x64 NSIS
-installer, built from the same commit and version. Keep the GitHub release **draft** throughout
+Every release ships five builds across three platforms: an Apple-silicon DMG, an Intel DMG, a Windows
+x64 NSIS installer, a Linux `.deb`, and a Linux AppImage, all from the same commit and version. Keep the GitHub release **draft** throughout
 verification. Both the release body check and the final attached-asset gate below must pass.
 
 ## Record the final bytes
 
-After signing, notarization and stapling have finished, collect the two DMGs, Windows installer,
-its `.exe.sig`, `latest.json`, and both generated appcasts in one staging directory. Include:
+After signing, notarization and stapling have finished, collect the five packages and their records,
+the Windows `.exe.sig`, `latest.json`, and both generated appcasts in one staging directory:
 
-- `ChemDraft_X.Y.Z_aarch64.dmg.build.json`
-- `ChemDraft_X.Y.Z_x86_64.dmg.build.json`
-- `ChemDraft_X.Y.Z_x64-setup.exe.build.json`
+- `ChemDraft_X.Y.Z_aarch64.dmg` and `ChemDraft_X.Y.Z_aarch64.dmg.build.json`
+- `ChemDraft_X.Y.Z_x86_64.dmg` and `ChemDraft_X.Y.Z_x86_64.dmg.build.json`
+- `ChemDraft_X.Y.Z_x64-setup.exe` and `ChemDraft_X.Y.Z_x64-setup.exe.build.json`
+- `ChemDraft_X.Y.Z_amd64.deb` and `ChemDraft_X.Y.Z_amd64.deb.build.json`
+- `ChemDraft_X.Y.Z_amd64.AppImage` and `ChemDraft_X.Y.Z_amd64.AppImage.build.json`
 
 Every record contains `commit` (full 40-character SHA), `version`, `target` (target triple),
 `clean: true`, `sha256` (lowercase hexadecimal SHA-256 of the artifact), and `size` (byte count).
@@ -24,6 +26,9 @@ Recording, feed verification, appcast generation, release body drafting and the 
 gates also refuse an unsigned stamp (`ChemDraftUnsignedBuild` present with a value other than `false`), from
 the [local-only unsigned stable escape](macos-updates.md#local-unsigned-stable-rebuilds-never-publish).
 Those builds must never be published, even if subsequently signed or given matching build records.
+The [Linux workflow](linux.md#releasing) builds and records both Linux packages. After smoke tests
+pass, it uploads them to the existing draft when `upload_to_release` is set; otherwise download
+`linux-release-amd64` and upload the packages and records to the draft.
 The Windows workflow records source identity in the clean checkout and updates the hash and size
 **after Authenticode signing**, retaining the recorded source identity. Any later byte change requires
 a new record and new updater signatures/feeds.
@@ -41,12 +46,15 @@ node tools/release/draft-release-body.mjs --version X.Y.Z --tag vX.Y.Z --assets 
 Use `--no-gaps` only after explicitly checking feature parity. Otherwise replace it with one or
 more `--gap "macos:feature and reason"`, `--gap "macos-intel:feature and reason"`, or
 `--gap "windows:feature and reason"`. Neither choice, or both choices together, is an error.
-Review the resulting body; each platform has its own notes and any declared gaps.
+The generator writes the macOS and Windows sections. Add a `## Linux` section manually to the
+generated body before setting it on the draft, including Linux notes and any feature gaps and reasons.
+The generator does not accept a Linux `--gap` or generate that section. Review the resulting body
+and its Platform differences note for all three platforms.
 Without `--assets`, the current directory is checked; without `--out`, the body goes to stdout.
 
-The body command requires all three records to name the same commit, the requested version,
+The body command requires all five records to name the same commit, the requested version,
 `clean: true`, and the appropriate target (`aarch64-apple-darwin`, `x86_64-apple-darwin`, or
-`x86_64-pc-windows-msvc`). It recomputes SHA-256 and byte size for every artifact. It mounts each
+`x86_64-pc-windows-msvc`, or `x86_64-unknown-linux-gnu` for both Linux packages). It recomputes SHA-256 and byte size for every artifact. It mounts each
 DMG read-only, reads each app's `Info.plist`, and requires `ChemDraftSourceCommit` to match the
 expected source commit. Release DMGs must embed this key before signing; only non-release app
 builds may omit it. This command therefore needs macOS, `hdiutil` and `plutil`.
@@ -60,7 +68,7 @@ record can substitute for an expected commit. Complete the production signature 
 
 ## Last step before un-drafting
 
-1. Upload the final artifacts, their three records, updater signatures and generated feeds to the
+1. Upload the final artifacts, their five records, updater signatures and generated feeds to the
    existing draft release. Run the platform acceptance checks in the platform guides.
 2. Set the reviewed release body. Immediately before un-drafting, **on a Mac**, from a checkout of
    the release source with `gh` authenticated to read drafts and `APPLE_TEAM_ID` exported, download
@@ -76,7 +84,7 @@ record can substitute for an expected commit. Complete the production signature 
    The two release verifiers mount the downloaded DMGs read-only, verify the apps inside, and check
    each DMG's staple and Gatekeeper assessment. The process staples only the DMG, never requiring
    an app staple. The final asset command downloads all assets again to a temporary directory and cleans it up.
-   It requires exactly the three expected builds and their records, refuses extra builds or records,
+   It requires exactly the five expected builds and their records, refuses extra builds or records,
    including unexpected `.sig`, `.msi`, `.zip`, `.pkg` and `.tar.gz` files (only the expected Windows
    `.exe.sig` and `latest.json` are allowed updater assets). It requires both Windows updater files,
    checks the manifest version, exact `windows-x86_64-nsis` platform key and release download URL,
