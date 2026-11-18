@@ -1,38 +1,48 @@
 # Sourced by the Ubuntu runner's package smoke and its disposable AppRun wrapper.
 
+diagnostic_timeout() {
+  local limit=$1 status=0
+  shift
+  timeout --kill-after=5s "$limit" "$@" || status=$?
+  if (( status == 124 || status == 137 )); then
+    printf 'Diagnostic command timed out after %s: %s\n' "$limit" "$*" >&2
+  fi
+  return "$status"
+}
+
 print_dependencies() {
   local executable=$1 helper
   shift
   for helper in "$executable" "$@"; do
     printf '\nldd %s\n' "$helper"
-    /usr/bin/ldd "$helper" || true
+    diagnostic_timeout 30s /usr/bin/ldd "$helper" || true
   done
 }
 
 record_profile() {
-  find "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR" -maxdepth 3 -ls
-  dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+  diagnostic_timeout 30s find "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR" -maxdepth 3 -ls || true
+  diagnostic_timeout 30s dbus-send --session --print-reply --dest=org.freedesktop.DBus \
     /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner \
-    string:org.chemdraft.desktop.SingleInstance
+    string:org.chemdraft.desktop.SingleInstance || true
 }
 
 prepare_diagnostics() {
   # Run against host libraries except where AppRun explicitly supplies its own environment.
   unset APPDIR APPIMAGE APPIMAGE_EXTRACT_AND_RUN LD_LIBRARY_PATH LD_PRELOAD
-  dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package} ${Version}\n' \
+  diagnostic_timeout 30s dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package} ${Version}\n' \
     'libgtk-3-0*' 'libwebkit2gtk-4.1-0*' 'libsoup-3.0-0*' libc6 2>/dev/null \
-    | awk '$1 == "ii" { print $2, $3 }' > "$logs/libraries.log" || true
+    | diagnostic_timeout 30s awk '$1 == "ii" { print $2, $3 }' > "$logs/libraries.log" || true
 
   if [[ "$package" == deb ]]; then
     local -a helpers
-    mapfile -t helpers < <(dpkg-query -L libwebkit2gtk-4.1-0 | grep -E '/WebKit(Web|Network|GPU)Process$')
+    mapfile -t helpers < <(diagnostic_timeout 30s dpkg-query -L libwebkit2gtk-4.1-0 | diagnostic_timeout 30s grep -E '/WebKit(Web|Network|GPU)Process$')
     print_dependencies "$bundle" "${helpers[@]}" > "$logs/ldd.log" 2>&1
     return
   fi
 
   # Only the disposable copy gets a wrapper. The smoke still launches the delivered AppImage.
   appdir="$work/squashfs-root"
-  if ! (cd "$work" && "$bundle" --appimage-extract) > "$logs/extract.log" 2>&1; then
+  if ! (cd "$work" && diagnostic_timeout 60s "$bundle" --appimage-extract) > "$logs/extract.log" 2>&1; then
     echo '::warning::Could not extract a diagnostic copy of the AppImage'
     return
   fi
@@ -57,7 +67,7 @@ appimage_diagnostics() {
   local binary="$APPDIR/usr/bin/chemdraft.real" variable environment_script
   if [[ -z "${CHEMDRAFT_SMOKE_GDB_SCRIPT:-}" ]]; then
     local -a helpers
-    mapfile -d '' -t helpers < <(find "$APPDIR" \
+    mapfile -d '' -t helpers < <(diagnostic_timeout 30s find "$APPDIR" \
       \( -name WebKitWebProcess -o -name WebKitNetworkProcess -o -name WebKitGPUProcess \) -print0)
     echo 'ldd inside the AppRun environment:'
     print_dependencies "$binary" "${helpers[@]}"
