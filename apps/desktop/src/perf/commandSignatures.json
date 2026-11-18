@@ -372,8 +372,8 @@
     "name": "list_toolset_window_states",
     "async": false,
     "generics": "",
-    "parameters": "app: tauri::AppHandle",
-    "returnType": "Result<Vec<ToolsetWindowState>, String>"
+    "parameters": "app: tauri::AppHandle, foreground_only: Option<bool>,",
+    "returnType": "Result<ToolsetWindowQueryResult, String>"
   },
   {
     "file": "lib.rs",

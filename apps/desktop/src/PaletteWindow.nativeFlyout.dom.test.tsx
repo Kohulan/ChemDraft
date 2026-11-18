@@ -52,6 +52,7 @@ vi.mock("./window-manager", async importOriginal => {
     setToolsetPopoverContent: vi.fn(async (toolsetId, content, anchor) => {
       native.content.forEach(handler => handler({ toolsetId, ...content, anchor }));
     }),
+    isToolsetPopoverVisible: async () => true,
     sendToolsetFlyoutKey: vi.fn(async payload => { native.keys.forEach(handler => handler(payload)); }),
     notifyToolsetFlyoutClosed: vi.fn(async payload => { native.closed.forEach(handler => handler(payload)); }),
     sendPaletteCommand: vi.fn(async () => {}),

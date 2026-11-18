@@ -31,6 +31,7 @@ vi.mock("./plugins/pluginPanelInputFocus", async importOriginal => ({
 }));
 vi.mock("./window-manager", async importOriginal => ({
   ...await importOriginal<typeof import("./window-manager")>(),
+  isToolsetPopoverVisible: async () => true,
   listenForToolsetPopoverContent: vi.fn(async handler => {
     native.content.add(handler);
     return () => { native.content.delete(handler); };
@@ -203,7 +204,7 @@ it("closes both flyout channels and resets keyboard navigation for a newer openi
   expect(container.querySelector('[data-keyboard-highlighted="true"]')?.getAttribute("data-command-id")).toBe("ring-0");
 });
 
-it.each(["before", "after"])("routes keys to a newer same-time flyout when the old close arrives %s its opening", order => {
+it.each(["before", "after"])("routes keys to a newer same-time flyout when the old close arrives %s its opening", async order => {
   const stop = installNativeFlyoutKeyboard();
   const press = () => {
     const event = new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true });
@@ -217,7 +218,7 @@ it.each(["before", "after"])("routes keys to a newer same-time flyout when the o
     if (order === "before") closeOld();
     acceptContent({ ...rings, generation: 2 });
     if (order === "after") closeOld();
-    expect(press()).toBe(true);
+    await act(async () => expect(press()).toBe(true));
     expect(native.sendKey).toHaveBeenCalledOnce();
     native.receiveClose?.(current);
     expect(press()).toBe(false);
@@ -246,7 +247,7 @@ it.each(["rings", "other"])("retires a superseded flyout when the newer %s close
   } finally { stop(); }
 });
 
-it("scopes same-time opening and close generations to each toolset", () => {
+it("scopes same-time opening and close generations to each toolset", async () => {
   const { flyoutId } = ringSession;
   const toolsetId = "core.art";
   const stop = installNativeFlyoutKeyboard();
@@ -254,25 +255,25 @@ it("scopes same-time opening and close generations to each toolset", () => {
     acceptContent({ ...rings, generation: 9 });
     const next = { ...rings, toolsetId, generation: 1, flyout: { ...rings.flyout, flyoutId } };
     acceptContent(next);
-    expect(pressFlyoutArrow()).toBe(true);
+    await act(async () => expect(pressFlyoutArrow()).toBe(true));
     expect(native.sendKey).toHaveBeenLastCalledWith(expect.objectContaining({ toolsetId, flyoutId }));
     acceptContent({ ...rings, generation: 9 });
-    expect(pressFlyoutArrow()).toBe(true);
+    await act(async () => expect(pressFlyoutArrow()).toBe(true));
     expect(native.sendKey).toHaveBeenLastCalledWith(expect.objectContaining({ toolsetId, flyoutId }));
     native.receiveClose?.({ ...ringSession, generation: 9 });
     acceptContent(next);
-    expect(pressFlyoutArrow()).toBe(true);
+    await act(async () => expect(pressFlyoutArrow()).toBe(true));
     expect(native.sendKey).toHaveBeenLastCalledWith(expect.objectContaining({ toolsetId, flyoutId }));
   } finally { stop(); }
 });
 
-it("keeps the newer menu when an older menu from the same toolset arrives late", () => {
+it("keeps the newer menu when an older menu from the same toolset arrives late", async () => {
   const stop = installNativeFlyoutKeyboard();
   try {
     acceptContent({ ...rings, generation: 2 });
     const delayed = { ...rings, generation: 1, flyout: { ...rings.flyout, flyoutId: "other" } };
     acceptContent(delayed);
-    expect(pressFlyoutArrow()).toBe(true);
+    await act(async () => expect(pressFlyoutArrow()).toBe(true));
     expect(native.sendKey).toHaveBeenCalledExactlyOnceWith({ ...ringSession, generation: 2, key: "ArrowDown" });
   } finally { stop(); }
 });
@@ -284,7 +285,7 @@ it("retains the generation through a legacy replay so queued Enter cannot choose
     await act(async () => {
       for (const opening of [{ ...rings, generation: 2 }, rings]) pushContent(opening);
     });
-    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })));
     const [queuedEnter] = native.sendKey.mock.lastCall!;
     await act(async () => pushContent({ ...rings, generation: 3 }));
     await act(async () => native.key?.({ ...ringSession, generation: 3, key: "ArrowDown" }));
@@ -295,11 +296,11 @@ it("retains the generation through a legacy replay so queued Enter cannot choose
   } finally { stop(); }
 });
 
-it("forwards keys with the generation of the active flyout", () => {
+it("forwards keys with the generation of the active flyout", async () => {
   const stop = installNativeFlyoutKeyboard();
   try {
     acceptContent({ ...rings, generation: 2 });
-    expect(pressFlyoutArrow()).toBe(true);
+    await act(async () => expect(pressFlyoutArrow()).toBe(true));
     expect(native.sendKey).toHaveBeenCalledExactlyOnceWith({ ...ringSession, generation: 2, key: "ArrowDown" });
   } finally { stop(); }
 });

@@ -3249,8 +3249,24 @@ fn close_toolset_window(
     Ok(state)
 }
 
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum ToolsetWindowQueryResult {
+    States(Vec<ToolsetWindowState>),
+    Foreground(Option<String>),
+}
+
 #[tauri::command]
-fn list_toolset_window_states(app: tauri::AppHandle) -> Result<Vec<ToolsetWindowState>, String> {
+fn list_toolset_window_states(
+    app: tauri::AppHandle,
+    foreground_only: Option<bool>,
+) -> Result<ToolsetWindowQueryResult, String> {
+    if foreground_only == Some(true) {
+        let target = app.clone();
+        return run_on_main_thread_blocking(&app, move || foreground_app_window_label(&target))
+            .map(ToolsetWindowQueryResult::Foreground);
+    }
+
     // Report the state of every palette window we've opened this session (from the directory),
     // rather than scanning the manifest. The JS reconciler only cares about which are open.
     let toolset_ids: Vec<String> = {
@@ -3261,7 +3277,53 @@ fn list_toolset_window_states(app: tauri::AppHandle) -> Result<Vec<ToolsetWindow
     toolset_ids
         .iter()
         .map(|toolset_id| toolset_state(&app, toolset_id))
-        .collect()
+        .collect::<Result<_, _>>()
+        .map(ToolsetWindowQueryResult::States)
+}
+
+#[cfg(target_os = "macos")]
+fn foreground_app_window_label(app: &tauri::AppHandle) -> Option<String> {
+    let marker = MainThreadMarker::new()?;
+    let application = objc2_app_kit::NSApplication::sharedApplication(marker);
+    if !application.isActive() {
+        return None;
+    }
+    let key_window = application.keyWindow()?;
+    let key_ptr = objc2::rc::Retained::as_ptr(&key_window).cast::<std::ffi::c_void>();
+    app.webview_windows()
+        .into_iter()
+        .find_map(|(label, window)| {
+            window
+                .ns_window()
+                .is_ok_and(|pointer| pointer.cast_const() == key_ptr)
+                .then_some(label)
+        })
+}
+
+#[cfg(windows)]
+fn foreground_app_window_label(app: &tauri::AppHandle) -> Option<String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetAncestor, GetForegroundWindow, GA_ROOT};
+
+    // Foreground is sampled once. The parent chain maps a WebView2 child back to its host
+    // without following the owner of a separate foreground window.
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.is_null() {
+        return None;
+    }
+    let root = unsafe { GetAncestor(foreground, GA_ROOT) };
+    app.webview_windows()
+        .into_iter()
+        .find_map(|(label, window)| {
+            window
+                .hwnd()
+                .is_ok_and(|hwnd| hwnd.0 == foreground || hwnd.0 == root)
+                .then_some(label)
+        })
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn foreground_app_window_label(_app: &tauri::AppHandle) -> Option<String> {
+    None
 }
 
 /// Read a file, distinguishing "not there yet" (`Ok(None)`) from a genuine read failure (`Err`).

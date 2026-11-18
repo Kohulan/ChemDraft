@@ -15,6 +15,7 @@ import {
 } from "./window-manager/flyoutOpeningRule";
 import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import {
+  isToolsetPopoverVisible,
   listenForToolsetPopoverContent,
   listenForToolsetPopoverClosed,
   notifyToolsetPopoverContentAccepted,
@@ -62,6 +63,10 @@ function hideNativePopoverWindow(isCurrent: () => boolean) {
     })
     .catch(() => undefined);
 }
+
+const keepBondStereoCommand: ToolsetFlyoutCommandSnapshot = {
+  id: "keep", title: "Keep unspecified", enabled: true, active: false
+};
 
 export function PalettePopoverWindow({
   toolsetId = "core.art",
@@ -114,6 +119,7 @@ export function PalettePopoverWindow({
   const [artStyle, setArtStyle] = useState<ToolsetArtStylePayload | undefined>();
   const contentRef = useRef(content);
   const shownContentRef = useRef<ToolsetPopoverContent | undefined>(undefined);
+  const pendingChoiceRef = useRef<ToolsetPopoverContent | undefined>(undefined);
   const [highlightedCommandId, setHighlightedCommandId] = useState<string>();
   const highlightedCommandRef = useRef<string | undefined>(undefined);
   const resetScroll = (phase: "reveal" | "release" | "guard" = "guard") => {
@@ -439,6 +445,7 @@ export function PalettePopoverWindow({
     })();
     return () => {
       cancelled = true;
+      if (shownContentRef.current === content) shownContentRef.current = undefined;
       keepWindowFocusRef.current = false;
       perfHook(() => perfProbe?.surfaceShown(perfShown, "no-op"));
       window.clearTimeout(scrubTimer);
@@ -551,15 +558,21 @@ export function PalettePopoverWindow({
     void sendPaletteCommandCommit(objectCustomColorCommandId(normalized)).catch(() => undefined);
   };
 
-  const chooseFlyoutCommand = (command: ToolsetFlyoutCommandSnapshot) => {
-    if (!command.enabled || dismissedRef.current || shownContentRef.current !== contentRef.current) {
-      return;
-    }
-    dismissedRef.current = true;
+  const chooseFlyoutCommand = async (command: ToolsetFlyoutCommandSnapshot) => {
     const current = contentRef.current;
-    if (current.kind === "flyout" && current.flyout.variant === "bondStereo" && current.flyout.id) {
+    const canChoose = () => !dismissedRef.current && contentRef.current === current && shownContentRef.current === current;
+    if (!command.enabled || current.kind !== "flyout" || pendingChoiceRef.current === current || !canChoose()) return;
+
+    // The OS can hide this window after the owner forwards a key, without a close event.
+    pendingChoiceRef.current = current;
+    const visible = await isToolsetPopoverVisible(toolsetId).catch(() => false);
+    if (pendingChoiceRef.current === current) pendingChoiceRef.current = undefined;
+    if (!visible || !canChoose()) return;
+
+    dismissedRef.current = true;
+    if (current.flyout.variant === "bondStereo") {
       const action = command.id === "keep" ? "keep" : command.id === "molecule.bondStereo:flipped" ? "flipped" : "geometry";
-      void sendBondStereoPopoverAction({ sessionId: current.flyout.id, action }).catch(() => undefined);
+      if (current.flyout.id) void sendBondStereoPopoverAction({ sessionId: current.flyout.id, action }).catch(() => undefined);
     } else void sendPaletteCommand(command.id).catch(() => undefined);
     hidePopoverWindow();
   };
@@ -575,7 +588,7 @@ export function PalettePopoverWindow({
       const bondStereo = current.flyout.variant === "bondStereo";
       if (bondStereo && (platform !== "windows" || payload.sessionId !== current.flyout.id)) return;
       const commands = current.flyout.commands.filter(command => command.enabled);
-      if (bondStereo) commands.push({ id: "keep", title: "Keep unspecified", enabled: true, active: false });
+      if (bondStereo) commands.push(keepBondStereoCommand);
       // Match the inline flyout: both axes navigate, including multi-column ring
       // grids. The owning palette's orientation does not determine its menu's axis.
       const backward = payload.key === "ArrowLeft" || payload.key === "ArrowUp" || (payload.key === "Tab" && payload.shiftKey);
@@ -586,9 +599,7 @@ export function PalettePopoverWindow({
         highlightedCommandRef.current = commands[next]?.id;
         setHighlightedCommandId(highlightedCommandRef.current);
       } else if ((payload.key === "Enter" || payload.key === " ") && index >= 0) {
-        // Use the same disabled/dismissed guard and command channel as a mouse pick.
-        // Dismissal is synchronous, so queued repeats cannot invoke a second time.
-        chooseFlyoutCommand(commands[index]!);
+        void chooseFlyoutCommand(commands[index]!);
       }
     }).then(stop => { if (disposed) stop(); else unlisten = stop; }).catch(() => undefined);
     return () => { disposed = true; unlisten?.(); };
@@ -611,13 +622,9 @@ export function PalettePopoverWindow({
           <p>This double bond's geometry wasn't given, so ChemDraft shows it as either E or Z.</p>
           {content.flyout.commands.map(command => <button key={command.id} type="button" disabled={!command.enabled}
             data-keyboard-highlighted={command.enabled && command.id === highlightedCommandId || undefined}
-            title={command.disabledReason} data-command-id={command.id} onClick={() => chooseFlyoutCommand(command)}>{command.title}</button>)}
-          <button type="button" data-keyboard-highlighted={highlightedCommandId === "keep" || undefined} onClick={() => {
-            if (dismissedRef.current || shownContentRef.current !== contentRef.current) return;
-            dismissedRef.current = true;
-            if (content.flyout.id) void sendBondStereoPopoverAction({ sessionId: content.flyout.id, action: "keep" }).catch(() => undefined);
-            hidePopoverWindow();
-          }}>Keep unspecified</button>
+            title={command.disabledReason} data-command-id={command.id} onClick={() => void chooseFlyoutCommand(command)}>{command.title}</button>)}
+          <button type="button" data-keyboard-highlighted={highlightedCommandId === "keep" || undefined}
+            onClick={() => void chooseFlyoutCommand(keepBondStereoCommand)}>{keepBondStereoCommand.title}</button>
         </div>
       ) : content.kind === "flyout" && content.flyout.variant === "distribute" ? (
         // Plain-text radio choice (Centers / Equal gaps) — icon-less, so it must NOT use the
@@ -638,7 +645,7 @@ export function PalettePopoverWindow({
               aria-checked={command.active}
               data-keyboard-highlighted={command.enabled && command.id === highlightedCommandId || undefined}
               data-command-id={command.id}
-              onClick={() => chooseFlyoutCommand(command)}
+              onClick={() => void chooseFlyoutCommand(command)}
             >
               {command.title}
             </button>
@@ -666,7 +673,7 @@ export function PalettePopoverWindow({
               className={command.active ? "active" : undefined}
               aria-pressed={command.active || undefined}
               title={command.enabled ? command.title : `${command.title}: ${command.disabledReason ?? "unavailable"}`}
-              onClick={() => chooseFlyoutCommand(command)}
+              onClick={() => void chooseFlyoutCommand(command)}
             >
               {(() => {
                 const symbolGlyph = symbolToolGlyph(command.id);

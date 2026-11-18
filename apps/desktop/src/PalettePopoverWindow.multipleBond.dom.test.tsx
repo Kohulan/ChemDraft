@@ -20,6 +20,7 @@ vi.mock("./plugins/pluginPanelInputFocus", async importOriginal => ({
 }));
 vi.mock("./window-manager", async importOriginal => ({
   ...await importOriginal<typeof import("./window-manager")>(),
+  isToolsetPopoverVisible: async () => true,
   listenForToolsetPopoverContent: vi.fn(async handler => { native.content = handler; return () => {}; }),
   listenForToolsetPopoverDismiss: vi.fn(async () => () => {}),
   listenForToolsetPopoverRelease: vi.fn(async () => () => {}),

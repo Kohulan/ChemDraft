@@ -1788,7 +1788,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.18.15.40-codex";
+const CURRENT_BUILD_STAMP = "11.18.17.40-codex";
 const VibeCodeGuideForm = lazy(() => import("./dialogs/VibeCodeGuideForm").then(module => ({ default: module.VibeCodeGuideForm })));
 const StructureTemplatePicker = lazy(() => import("./dialogs/StructureTemplatePicker").then(module => ({ default: module.StructureTemplatePicker })));
 /** Starts in the background for the document webview under the existing probe gate. */
@@ -2087,7 +2087,7 @@ export function MainWindow({
   nativePalette = shouldDefaultToNativePalettes()
 }: MainWindowProps) {
   useEffect(() => installBrowserReloadGuard(shortcutPlatform), [shortcutPlatform]);
-  useEffect(() => installNativeFlyoutKeyboard(), []);
+  useEffect(() => installNativeFlyoutKeyboard(shortcutPlatform), [shortcutPlatform]);
   useEffect(() => installMainWindowPalettePendingKeys(), []);
   useInAppModalUtilitySuspension();
   // Plugin commands may settle after the document window has unmounted.

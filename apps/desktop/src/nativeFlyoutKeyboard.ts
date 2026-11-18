@@ -1,7 +1,9 @@
+import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
+import { detectDesktopShortcutPlatform } from "./keyboardShortcuts";
 import {
-  listenForAcceptedToolsetPopoverContent, listenForToolsetPopoverContent, listenForToolsetPopoverClosed,
-  listenForToolsetPopoverDismiss, listenForToolsetFlyoutClosed, sendToolsetFlyoutKey, toolsetPopoverTimestamp,
-  type ToolsetFlyoutSession
+  isToolsetPopoverFocusTransfer, isToolsetPopoverVisible, listenForAcceptedToolsetPopoverContent, listenForToolsetPopoverContent,
+  listenForToolsetPopoverClosed, listenForToolsetPopoverDismiss, listenForToolsetFlyoutClosed,
+  sendToolsetFlyoutKey, toolsetPopoverTimestamp, type ToolsetFlyoutSession
 } from "./window-manager";
 import {
   acceptFlyoutOpening, closeFlyoutMenu, closeFlyoutOpening, currentFlyoutOpening, dismissFlyoutOpenings,
@@ -11,9 +13,11 @@ import {
 /** Install in the document and standalone palette windows: nonactivating flyouts
  * preserve either window's focus. Route keys before toolbar buttons, canvas
  * shortcuts and browser defaults, without transferring window or DOM focus. */
-export function installNativeFlyoutKeyboard(): () => void {
+export function installNativeFlyoutKeyboard(platform: ShortcutPlatform = detectDesktopShortcutPlatform()): () => void {
   let openings = newFlyoutOpeningState();
-  const pending = new Map<string, { session: ToolsetFlyoutSession; keys: string[]; flushing: boolean }>();
+  type KeyQueue = { session: ToolsetFlyoutSession; keys: string[]; accepted: boolean; flushing: boolean };
+  const queues = new Map<string, KeyQueue>();
+  const focusChecks = new Set<{ requestedAt: number }>();
   const activationKeys = new Set<string>();
   let disposed = false;
   const cleanups: (() => void)[] = [];
@@ -22,27 +26,41 @@ export function installNativeFlyoutKeyboard(): () => void {
   };
   const updateOpenings = (next: typeof openings) => {
     openings = next;
-    for (const [toolsetId, queue] of pending) {
-      if (currentFlyoutOpening(openings, toolsetId) !== queue.session) pending.delete(toolsetId);
+    for (const [toolsetId, queue] of queues) {
+      if (currentFlyoutOpening(openings, toolsetId) !== queue.session) queues.delete(toolsetId);
     }
   };
-  const sendKey = (session: ToolsetFlyoutSession, key: string) =>
-    sendToolsetFlyoutKey({ ...session, key }).catch(() => undefined);
+  const checkingFocus = (session: ToolsetFlyoutSession) => {
+    for (const check of focusChecks) if (session.openedAt <= check.requestedAt) return true;
+    return false;
+  };
+  const flush = async (queue: KeyQueue) => {
+    if (!queue.accepted || queue.flushing || checkingFocus(queue.session)) return;
+    const { toolsetId } = queue.session;
+    queue.flushing = true;
+    while (queues.get(toolsetId) === queue && queue.keys.length && !checkingFocus(queue.session)) {
+      // Even an accepted reveal can be hidden by the OS before its close notice arrives.
+      const visible = await isToolsetPopoverVisible(toolsetId).catch(() => false);
+      if (queues.get(toolsetId) !== queue || checkingFocus(queue.session)) break;
+      if (!visible) {
+        updateOpenings(closeFlyoutOpening(openings, queue.session));
+        break;
+      }
+      await sendToolsetFlyoutKey({ ...queue.session, key: queue.keys.shift()! }).catch(() => undefined);
+    }
+    queue.flushing = false;
+  };
   subscribe(listenForAcceptedToolsetPopoverContent(opening => {
     if (disposed) return;
     updateOpenings(acceptFlyoutOpening(openings, opening));
-    const queue = pending.get(opening.toolsetId);
-    if (!queue || queue.flushing || opening.flyoutId !== queue.session.flyoutId ||
-        !matchesToolsetPopoverOpening(opening, queue.session)) return;
-    queue.flushing = true;
-    void (async () => {
-      // Keep newly pressed keys behind the buffered keys while their IPC is in flight.
-      for (const key of queue.keys) {
-        if (pending.get(opening.toolsetId) !== queue) return;
-        await sendKey(queue.session, key);
-      }
-      if (pending.get(opening.toolsetId) === queue) pending.delete(opening.toolsetId);
-    })();
+    const session = currentFlyoutOpening(openings, opening.toolsetId);
+    if (session?.flyoutId === undefined || opening.flyoutId !== session.flyoutId ||
+        !matchesToolsetPopoverOpening(opening, session)) return;
+    const queue = queues.get(session.toolsetId) ??
+      { session: session as ToolsetFlyoutSession, keys: [], accepted: true, flushing: false };
+    queues.set(session.toolsetId, queue);
+    queue.accepted = true;
+    void flush(queue);
   }));
   subscribe(listenForToolsetPopoverContent(payload => {
     // Only the renderer assigns identities to legacy content without an opening timestamp.
@@ -53,7 +71,7 @@ export function installNativeFlyoutKeyboard(): () => void {
     const next = acceptFlyoutOpening(openings, session ?? opening);
     if (next === openings) return;
     updateOpenings(next);
-    if (session) pending.set(session.toolsetId, { session, keys: [], flushing: false });
+    if (session) queues.set(session.toolsetId, { session, keys: [], accepted: false, flushing: false });
   }));
   subscribe(listenForToolsetPopoverDismiss(payload => {
     // Only the renderer knows what it had accepted when an unstamped broadcast arrived.
@@ -83,9 +101,11 @@ export function installNativeFlyoutKeyboard(): () => void {
     event.stopImmediatePropagation();
     if (!arrow) activationKeys.add(event.key);
     if (plain) {
-      const queue = pending.get(session.toolsetId);
-      if (queue) queue.keys.push(event.key);
-      else void sendKey({ ...session, flyoutId: session.flyoutId }, event.key);
+      const queue = queues.get(session.toolsetId);
+      if (queue) {
+        queue.keys.push(event.key);
+        void flush(queue);
+      }
     }
   };
   const keyUp = (event: KeyboardEvent) => {
@@ -96,15 +116,35 @@ export function installNativeFlyoutKeyboard(): () => void {
   };
   const blur = () => {
     activationKeys.clear();
-    // Native utility windows hide on app deactivation without a renderer close notice.
-    updateOpenings(dismissFlyoutOpenings(openings, { requestedAt: toolsetPopoverTimestamp() }));
+    const requestedAt = toolsetPopoverTimestamp();
+    const dismiss = () => {
+      // App deactivation can hide a native utility without a renderer close notice.
+      if (!disposed) updateOpenings(dismissFlyoutOpenings(openings, { requestedAt }));
+    };
+    const opening = latestLiveFlyoutOpening(openings);
+    if (opening?.flyoutId === undefined) {
+      dismiss();
+      return;
+    }
+    const check = { requestedAt };
+    focusChecks.add(check);
+    // WebView2 can blur during the reveal/release while the owner retains native
+    // focus. The flyout itself can also briefly receive focus during the handoff.
+    const finish = (keptFocus: boolean) => {
+      if (disposed) return;
+      focusChecks.delete(check);
+      if (!keptFocus) dismiss();
+      for (const queue of queues.values()) void flush(queue);
+    };
+    void isToolsetPopoverFocusTransfer(opening.toolsetId, platform === "windows").then(finish, () => finish(false));
   };
   window.addEventListener("keydown", keyDown, true);
   window.addEventListener("keyup", keyUp, true);
   window.addEventListener("blur", blur);
   return () => {
     disposed = true;
-    pending.clear();
+    queues.clear();
+    focusChecks.clear();
     cleanups.forEach(stop => stop());
     window.removeEventListener("keydown", keyDown, true);
     window.removeEventListener("keyup", keyUp, true);

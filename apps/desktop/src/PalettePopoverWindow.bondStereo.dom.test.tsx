@@ -49,6 +49,7 @@ vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ hide: nati
 vi.mock("@tauri-apps/api/webview", () => ({ getCurrentWebview: () => ({ setFocus: native.webviewFocus }) }));
 vi.mock("./window-manager", async importOriginal => ({
   ...await importOriginal<typeof import("./window-manager")>(),
+  isToolsetPopoverVisible: async () => true,
   listenForToolsetPopoverContent: vi.fn(async handler => { native.content = handler; return () => {}; }),
   notifyToolsetPopoverContentAccepted: vi.fn(async () => {}),
   listenForToolsetPopoverDismiss: vi.fn(async handler => { native.dismiss = handler; return () => {}; }),

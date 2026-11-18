@@ -341,11 +341,26 @@ export async function closeToolsetPopoverWindow(toolsetId: string, openedAt: num
   if (!hasNewerOpening()) latestToolsetPopoverOpenings.delete(toolsetId);
 }
 
+function toolsetPopoverWindowLabel(toolsetId: string): string {
+  return `toolset-popover-${toolsetId.replaceAll(".", "-")}`;
+}
+
+/** A DOM blur has no related target when focus crosses native webviews. */
+export async function isToolsetPopoverFocusTransfer(toolsetId: string, includeOwner: boolean): Promise<boolean> {
+  if (!isDesktopRuntime()) return false;
+  const [{ invoke }, { getCurrentWindow }] = await Promise.all([
+    import("@tauri-apps/api/core"), import("@tauri-apps/api/window")
+  ]);
+  const focused = await invoke<string | null>("list_toolset_window_states", { foregroundOnly: true });
+  return focused !== null &&
+    (focused === toolsetPopoverWindowLabel(toolsetId) || (includeOwner && focused === getCurrentWindow().label));
+}
+
 /** OS deactivation and native hides need not pass through the renderer's close notification. */
 export async function isToolsetPopoverVisible(toolsetId: string): Promise<boolean> {
   if (!isDesktopRuntime()) return false;
   const { Window } = await import("@tauri-apps/api/window");
-  const popover = await Window.getByLabel(`toolset-popover-${toolsetId.replaceAll(".", "-")}`);
+  const popover = await Window.getByLabel(toolsetPopoverWindowLabel(toolsetId));
   return popover ? popover.isVisible().catch(() => false) : false;
 }
 
@@ -354,7 +369,7 @@ export async function isToolsetPopoverVisible(toolsetId: string): Promise<boolea
 export async function listenForToolsetPopoverNativeClose(toolsetId: string, closed: () => void): Promise<Unlisten> {
   if (!isDesktopRuntime()) return () => undefined;
   const { Window } = await import("@tauri-apps/api/window");
-  const popover = await Window.getByLabel(`toolset-popover-${toolsetId.replaceAll(".", "-")}`);
+  const popover = await Window.getByLabel(toolsetPopoverWindowLabel(toolsetId));
   if (!popover) { closed(); return () => undefined; }
   const listeners = ["tauri://close-requested", "tauri://destroyed"].map(name =>
     safeTauriWindowListen(popover, name, closed));
@@ -386,7 +401,7 @@ export async function listenForToolsetPopoverClosed(handler: (payload: ToolsetPo
 export async function isToolsetPopoverWindowVisible(toolsetId: string): Promise<boolean> {
   if (!isDesktopRuntime()) return false;
   const { Window } = await import("@tauri-apps/api/window");
-  const popover = await Window.getByLabel(`toolset-popover-${toolsetId.replaceAll(".", "-")}`);
+  const popover = await Window.getByLabel(toolsetPopoverWindowLabel(toolsetId));
   return popover ? popover.isVisible() : false;
 }
 
