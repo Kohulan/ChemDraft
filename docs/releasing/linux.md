@@ -1,6 +1,7 @@
 # Linux release
 
-Linux packages are optional while ChemDraft for Linux is in beta. When included, both packages
+Linux is an optional, community-tested beta indefinitely. macOS and Windows releases never wait
+on Linux. When Linux packages are available and included, both packages
 and their `.build.json` records must be attached. The release checker validates their names,
 version, hashes, sizes and commit against the same release tag as the macOS DMGs and Windows
 installer. The GitHub-hosted Ubuntu 22.04 runner builds both packages in `linux-release.yml`.

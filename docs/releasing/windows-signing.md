@@ -87,7 +87,8 @@ Review action updates and trust policy changes as release infrastructure changes
 
 Use a reviewed commit that has landed on the public repository's `main` branch, with the workflow
 and signing tools present. Every release requires the Apple-silicon DMG, Intel DMG, and Windows
-installer. While Linux is in beta, its `.deb` and AppImage are optional. When included, both packages
+installer. Linux is an optional, community-tested beta indefinitely; macOS and Windows releases never
+wait on Linux. Its `.deb` and AppImage may be attached when available. When included, both packages
 and their records must pass the same checks for the commit, version and artifact bytes as the required
 builds. The release body includes `## macOS (Apple silicon)`, `## macOS (Intel)`, and `## Windows`,
 plus `## Linux` when the Linux packages are included. The Platform differences note names each feature
@@ -149,9 +150,8 @@ gap and its reason or says there are none. This workflow supplies the Windows ar
    them to the existing draft after smoke tests pass when `upload_to_release` is supplied. For a manual
    Linux upload, download `linux-release-amd64` and upload the packages, records, and `SHA256SUMS-linux.txt`.
 
-   After all manual uploads and after every release upload workflow for the tag (`linux-release.yml` and
-   `windows-release.yml` upload jobs) has finished, refresh the combined checksums from the assets attached
-   to the draft. Do not change the draft's assets between this refresh and publication. From the repository
+   After all planned manual uploads and release upload workflows for the tag have finished, refresh the
+   combined checksums from the assets attached to the draft. Do not change the draft's assets between this refresh and publication. From the repository
    root, with `gh` authenticated for the draft, run (replace the tag and commit and use a fresh output path):
 
    ```text

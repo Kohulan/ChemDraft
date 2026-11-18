@@ -1,7 +1,8 @@
-# Check and publish release builds
+# Check and publish three required builds and optional Linux beta packages
 
 Every release ships an Apple-silicon DMG, an Intel DMG, and a Windows x64 NSIS installer.
-While Linux is in beta, its `.deb` and AppImage are optional. If either package or build record is
+Linux is an optional, community-tested beta indefinitely; macOS and Windows releases never wait on
+Linux. Its `.deb` and AppImage may be attached when available. If either package or build record is
 attached, the release must include both Linux packages and both records. Every supplied build is
 validated against the same commit and version. Keep the GitHub release **draft** throughout
 verification. Both the release body check and the final attached-asset gate below must pass.
@@ -31,12 +32,11 @@ Recording, feed verification, appcast generation, release body drafting and the 
 gates also refuse an unsigned stamp (`ChemDraftUnsignedBuild` present with a value other than `false`), from
 the [local-only unsigned stable escape](macos-updates.md#local-unsigned-stable-rebuilds-never-publish).
 Those builds must never be published, even if subsequently signed or given matching build records.
-The [Linux workflow](linux.md#releasing) builds and records both Linux packages. After smoke tests
+When including Linux, the [Linux workflow](linux.md#releasing) builds and records both packages. After smoke tests
 pass, it uploads them to the existing draft when `upload_to_release` is set; otherwise download
 `linux-release-amd64` and upload the packages, records, and `SHA256SUMS-linux.txt` to the draft.
-After all manual uploads and after every release upload workflow for the tag (`linux-release.yml` and
-`windows-release.yml` upload jobs) has finished, refresh the combined checksums from the assets attached
-to the draft. Do not change the draft's assets between this refresh and publication. From the repository
+After all planned manual uploads and release upload workflows for the tag have finished, refresh the
+combined checksums from the assets attached to the draft. Do not change the draft's assets between this refresh and publication. From the repository
 root, with `gh` authenticated for the draft, run (replace the tag and commit and use a fresh output path):
 
 ```text
