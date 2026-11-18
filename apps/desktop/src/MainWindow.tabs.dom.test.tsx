@@ -20,7 +20,7 @@ import { saveKeybindingSettings } from "./keybindingSettings";
 import { saveAskToSaveBeforeQuit, loadAskToSaveBeforeQuit } from "./quitSettings";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 import { createViewportState } from "@chemdraft/viewport-engine";
-import { DOM_COMMAND_EVENT, setToolbarsMenu, type ToolsetWindowState } from "./window-manager";
+import { DOM_COMMAND_EVENT, setToolbarsMenu, type QuitFlushPhase, type ToolsetWindowState } from "./window-manager";
 import { buildDocumentSessionEnvelope, buildDocumentTabsSession, parseDocumentSessionEnvelope } from "./documentSession";
 import { createPluginRuntime, type DesktopPluginRuntime } from "./plugins/createPluginRuntime";
 import { applyPatches, type DocumentPatch, type MoleculeObject } from "@chemdraft/chem-core";
@@ -58,7 +58,7 @@ const native = vi.hoisted(() => ({
   session: undefined as unknown,
   load: vi.fn<() => Promise<unknown>>(),
   saveSession: vi.fn<(value: unknown) => Promise<void>>(),
-  quitFlush: undefined as undefined | (() => Promise<void>),
+  quitFlush: undefined as undefined | ((phase?: QuitFlushPhase) => Promise<void>),
   quit: vi.fn(),
   promptQuit: undefined as undefined | ((id: number) => Promise<void>),
   quitId: 0,
@@ -105,7 +105,7 @@ vi.mock("./window-manager", async (original) => ({
     return { toolsetId, open: false, focused: false };
   },
   setToolbarsMenu: vi.fn().mockResolvedValue(undefined),
-  listenForQuitFlushRequest: async (handler: () => Promise<void>) => {
+  listenForQuitFlushRequest: async (handler: NonNullable<typeof native.quitFlush>) => {
     native.quitFlush = handler;
     return () => { if (native.quitFlush === handler) native.quitFlush = undefined; };
   },
@@ -215,7 +215,7 @@ describe("documents in one window", () => {
         document.querySelector('[role="dialog"][aria-modal="true"][aria-labelledby="quit-prompt-title"]') !== null).toBe(true);
       return true;
     });
-    native.cancelQuit.mockResolvedValue(true);
+    native.cancelQuit.mockResolvedValue("cancelled");
     native.prepareQuit.mockResolvedValue(true);
     native.resumeQuit.mockResolvedValue(true);
     native.quitId = 0;
@@ -2178,14 +2178,45 @@ describe("documents in one window", () => {
     await paste("Dirty drawing");
     saveAskToSaveBeforeQuit(true);
     await flush();
-    let reply: (value: boolean) => void = () => {};
-    native.cancelQuit.mockImplementationOnce(() => new Promise<boolean>((resolve) => { reply = resolve; }));
+    let reply: (value: "cancelled") => void = () => {};
+    native.cancelQuit.mockImplementationOnce(() => new Promise<"cancelled">((resolve) => { reply = resolve; }));
     await quitButton("Cancel");
     await flush();
-    await act(async () => { reply(true); });
+    await act(async () => { reply("cancelled"); });
     expect(pendingPrompt?.prompt.title).toBe("Save changes before quitting?");
     expect(native.promptShowing).toHaveBeenLastCalledWith(2);
     expect(native.quit).not.toHaveBeenCalled();
+  });
+
+  it.each(["during", "before"])("keeps editing locked when Cancel resolves %s a committed quit flush", async (order) => {
+    await paste("Dirty drawing");
+    saveAskToSaveBeforeQuit(true);
+    await flush();
+    let reply!: (outcome: "cancelled") => void;
+    native.cancelQuit.mockImplementationOnce(() => new Promise<"cancelled">(resolve => { reply = resolve; }));
+    await quitButton("Cancel");
+    expect(native.cancelQuit).toHaveBeenCalledWith(1);
+    if (order === "before") {
+      await act(async () => { reply("cancelled"); });
+      await paste("Edit after Cancel");
+      expect(drawnText()).toContain("Edit after Cancel");
+    }
+
+    let finishWrite!: () => void;
+    native.saveSession.mockImplementationOnce(() => new Promise<void>(resolve => { finishWrite = resolve; }));
+    let flushing!: Promise<void>;
+    await act(async () => { flushing = native.quitFlush!("committed"); });
+    expect(native.quit).not.toHaveBeenCalled();
+    if (order === "during") await act(async () => { reply("cancelled"); });
+
+    const before = bridge().snapshot().document;
+    await command("document.new");
+    await command("edit.undo");
+    await paste("Late edit");
+    expect(tabs()).toHaveLength(1);
+    expect(bridge().snapshot().document).toEqual(before);
+    await act(async () => { finishWrite(); await flushing; });
+    expect(native.quit).toHaveBeenCalledOnce();
   });
 
   it.each(["Save", "Discard"])("re-arms native grace before a stalled %s session write", async (choice) => {
@@ -2201,6 +2232,64 @@ describe("documents in one window", () => {
     expect(native.quit).not.toHaveBeenCalled();
     await act(async () => { finish(); });
     expect(native.quit).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["refused", "rejected"])("accepts menu and palette commands after quit preparation is %s", async failure => {
+    await paste("Dirty drawing");
+    if (failure === "refused") native.prepareQuit.mockResolvedValueOnce(false);
+    else native.prepareQuit.mockRejectedValueOnce(new Error("Window unavailable"));
+    await act(async () => native.promptQuit!(++native.quitId));
+    expect(native.prepareQuit).toHaveBeenCalledWith(1);
+    expect(pendingPrompt).toBeUndefined();
+    // The native File menu and floating palette both deliver DOM_COMMAND_EVENT.
+    await command("document.new");
+    expect(tabs()).toHaveLength(2);
+    await command("tool.text");
+    expect(bridge().snapshot().activeToolCommandId).toBe("tool.text");
+  });
+
+  it("keeps a newer quit prompt guarded when an older preparation returns false", async () => {
+    await paste("Dirty drawing");
+    let finish!: (prepared: boolean) => void;
+    native.prepareQuit.mockImplementationOnce(() => new Promise<boolean>(resolve => { finish = resolve; }));
+    let older!: Promise<void>;
+    await act(async () => { older = native.promptQuit!(++native.quitId); });
+    await act(async () => native.promptQuit!(++native.quitId));
+    await act(async () => { finish(false); await older; });
+    await command("document.new");
+    expect(tabs()).toHaveLength(1);
+    await quitButton("Cancel");
+    await command("document.new");
+    expect(tabs()).toHaveLength(2);
+  });
+
+  it.each([true, false])("releases a cancelled quit after resume is refused when the document is dirty=%s", async dirty => {
+    if (dirty) await paste("Dirty drawing");
+    native.resumeQuit.mockResolvedValueOnce(false);
+    await act(async () => native.promptQuit!(++native.quitId));
+    if (dirty) await quitButton("Discard");
+    await command("document.new");
+    expect(tabs()).toHaveLength(2);
+  });
+
+  it.each([true, false])("keeps editing frozen after confirmation rejects when the document is dirty=%s", async dirty => {
+    if (dirty) await paste("Dirty drawing");
+    saveAskToSaveBeforeQuit(true);
+    native.quit.mockRejectedValueOnce(new Error("Confirmation reply lost"));
+    native.cancelQuit.mockResolvedValueOnce("committed");
+
+    await flush();
+    if (dirty) await quitButton("Discard");
+
+    expect(native.resumeQuit).toHaveBeenCalledWith(1);
+    expect(native.quit).toHaveBeenCalledWith(1);
+    expect(native.cancelQuit).toHaveBeenCalledWith(1);
+    const saved = bridge().snapshot().document;
+    await command("document.new");
+    await command("edit.undo");
+    await paste("Late edit");
+    expect(tabs()).toHaveLength(1);
+    expect(bridge().snapshot().document).toEqual(saved);
   });
 
   it("native quit modal suspension hides palettes and releases on Cancel", async () => {
@@ -2238,13 +2327,13 @@ describe("documents in one window", () => {
     await paste("Dirty drawing");
     saveAskToSaveBeforeQuit(true);
     await flush();
-    let reply: (value: boolean) => void = () => {};
-    native.cancelQuit.mockImplementationOnce(() => new Promise<boolean>((resolve) => { reply = resolve; }));
+    let reply: (value: "cancelled") => void = () => {};
+    native.cancelQuit.mockImplementationOnce(() => new Promise<"cancelled">((resolve) => { reply = resolve; }));
     await quitButton("Cancel");
     expect(pendingPrompt).toBeUndefined();
     expect(container.querySelector('[aria-labelledby="quit-prompt-title"]')).toBeNull();
     expect(native.writeFile.mock.calls.filter(([path]) => path.endsWith(".chemdraft"))).toHaveLength(0);
-    await act(async () => { reply(true); });
+    await act(async () => { reply("cancelled"); });
   });
 
   it("failed native suspension never acknowledges the prompt and cancels its request", async () => {

@@ -1,13 +1,15 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { QuitFlushPhase } from "./index";
 
 const native = vi.hoisted(() => {
-  const listeners = new Map<string, (event: { event: string; id: number; payload: undefined }) => void>();
+  type FlushEvent = { event: string; id: number; payload: QuitFlushPhase | null };
+  const listeners = new Map<string, (event: FlushEvent) => void>();
   return {
     listeners,
     invoke: vi.fn<(...args: unknown[]) => Promise<void>>(),
-    listen: vi.fn(async (eventName: string, handler: (event: { event: string; id: number; payload: undefined }) => void) => {
+    listen: vi.fn(async (eventName: string, handler: (event: FlushEvent) => void) => {
       listeners.set(eventName, handler);
       return () => { listeners.delete(eventName); };
     })
@@ -21,8 +23,8 @@ vi.mock("@tauri-apps/api/webviewWindow", () => ({
 
 import { confirmQuitAfterFlush, listenForQuitFlushRequest, QUIT_FLUSH_REQUEST_EVENT, saveDocumentSession } from "./index";
 
-function requestFlush() {
-  native.listeners.get(QUIT_FLUSH_REQUEST_EVENT)?.({ event: QUIT_FLUSH_REQUEST_EVENT, id: 1, payload: undefined });
+function requestFlush(phase: QuitFlushPhase | null = null) {
+  native.listeners.get(QUIT_FLUSH_REQUEST_EVENT)?.({ event: QUIT_FLUSH_REQUEST_EVENT, id: 1, payload: phase });
 }
 
 beforeEach(() => {
@@ -49,13 +51,15 @@ describe.each(["MacIntel", "Win32"])("quit flush on %s", (platform) => {
       if (command === "save_document_session") await pendingWrite;
     });
     const session = { lastEdit: "inside the autosave debounce" };
-    const stop = await listenForQuitFlushRequest(async () => {
+    const handler = vi.fn(async (_phase?: QuitFlushPhase) => {
       // The document window uses this same write-then-confirm handshake on either platform.
       await saveDocumentSession(session);
       await confirmQuitAfterFlush();
     });
+    const stop = await listenForQuitFlushRequest(handler);
     expect(native.listen).toHaveBeenCalledWith(QUIT_FLUSH_REQUEST_EVENT, expect.any(Function));
-    requestFlush();
+    requestFlush("committed");
+    expect(handler).toHaveBeenCalledWith("committed");
     await vi.waitFor(() => expect(native.invoke).toHaveBeenCalledWith("save_document_session", { state: session }));
     expect(native.invoke).toHaveBeenCalledTimes(1);
     finishWrite();
@@ -70,7 +74,7 @@ describe.each(["MacIntel", "Win32"])("quit flush on %s", (platform) => {
     const handler = vi.fn().mockRejectedValue(new Error("webview flush failed"));
     const stop = await listenForQuitFlushRequest(handler);
     requestFlush();
-    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledExactlyOnceWith(undefined));
     expect(native.invoke).not.toHaveBeenCalled();
     stop();
   });

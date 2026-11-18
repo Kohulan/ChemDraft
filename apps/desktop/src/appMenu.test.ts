@@ -400,7 +400,7 @@ describe("native Window and full-screen menus", () => {
   it("builds one native full-screen item in View with the current document state on macOS", () => {
     expect(source.match(/PredefinedMenuItem::fullscreen\(/g)).toHaveLength(1);
     const builder = source.split("fn create_app_menu_for_toolsets<R: Runtime>")[1]!.split("/// Close Window")[0]!;
-    expect(builder).toContain("let view_menu = create_view_menu(app, entries, view_state)?;");
+    expect(builder).toContain("let view_menu = create_view_menu(app, entries, view_state, scheme)?;");
     expect(builder).toMatch(/#\[cfg\(target_os = "macos"\)\]\s*let fullscreen = \{/);
     expect(builder).toMatch(/let is_fullscreen = main_ns_window\(app\)\s*\.is_some_and\(\|window\| window\.styleMask\(\)\.contains\(NSWindowStyleMask::FullScreen\)\)/);
     expect(builder).toContain("PredefinedMenuItem::fullscreen(app, Some(fullscreen_menu_title(is_fullscreen)))");
@@ -422,9 +422,16 @@ describe("native Window and full-screen menus", () => {
   });
 
   it("excludes secondary windows from AppKit's list when they are created", () => {
-    const setup = source.split("// Only macOS has an app-wide menu bar.")[1]!.split(".on_page_load(")[0]!;
-    expect(setup).toMatch(/#\[cfg\(target_os = "macos"\)\]\s*let builder = builder\.menu\(create_app_menu\)\.plugin\(/);
-    expect(setup).toMatch(/\.on_window_ready\(\|window\| \{[\s\S]*?if is_document_window\(window\.label\(\)\) \{\s*observe_document_fullscreen\(window\.app_handle\(\), native\);\s*\} else \{\s*native\.setExcludedFromWindowsMenu\(true\);/);
+    const run = source.split("pub fn run() {")[1]!.split("fn start_macos_primary(")[0]!;
+    const primaryArm = run.split("let builder = if let Some(guard) = primary_lock {")[1]!.split("} else {")[0]!;
+    expect(primaryArm).toMatch(/\bbuilder\b[\s\S]*?\.menu\(create_app_menu\)/);
+    expect(run).toMatch(/#\[cfg\(target_os = "macos"\)\]\s*let builder = builder\.manage\(FullscreenMenuItem::<tauri::Wry>\(Mutex::new\(None\)\)\);/);
+    expect(run).toMatch(/#\[cfg\(target_os = "macos"\)\]\s*let builder = builder\.plugin\(\s*tauri::plugin::Builder::<tauri::Wry>::new\("windows-menu"\)\s*\.on_window_ready\(\|window\| \{[\s\S]*?if is_document_window\(window\.label\(\)\) \{\s*observe_document_fullscreen\(window\.app_handle\(\), native\);\s*\} else \{\s*native\.setExcludedFromWindowsMenu\(true\);[\s\S]*?\.build\(\),\s*\);/);
+    expect(run).toMatch(/let builder = builder\.manage\(FullscreenMenuItem::<tauri::Wry>\(Mutex::new\(None\)\)\);[\s\S]*?let builder = builder\.plugin\([\s\S]*?new\("windows-menu"\)[\s\S]*?let app = builder\b[\s\S]*?\.build\(context\)[\s\S]*?app\.run\(/);
+    const takeover = source.split("fn start_macos_primary(")[1]!.split("fn setup_primary_app(")[0]!;
+    expect(takeover).toContain("install_app_menu(app, create_app_menu(app)?)?;");
+    expect(takeover).toContain("create_main_window(app)?;");
+    expect(takeover.indexOf("install_app_menu(app, create_app_menu(app)?)?;")).toBeLessThan(takeover.indexOf("create_main_window(app)?;"));
   });
 });
 

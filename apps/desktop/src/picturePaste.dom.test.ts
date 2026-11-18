@@ -662,7 +662,7 @@ describe("picture paste and canvas", { timeout: 30_000 }, () => {
     });
     vi.spyOn(windowManager, "prepareQuitPrompt").mockResolvedValue(true);
     vi.spyOn(windowManager, "reportQuitPromptShowing").mockResolvedValue(true);
-    const cancelQuit = vi.spyOn(windowManager, "cancelQuit").mockResolvedValue(true);
+    const cancelQuit = vi.spyOn(windowManager, "cancelQuit").mockResolvedValue("cancelled");
     await render();
     await command("tool.bond");
     await act(async () => {

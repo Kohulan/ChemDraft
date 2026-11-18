@@ -176,8 +176,8 @@ static APP_QUITTING: AtomicBool = AtomicBool::new(false);
 
 /// Application-menu Quit on macOS, File ▸ Exit elsewhere.
 const APP_QUIT_COMMAND_ID: &str = "app.quit";
-/// Sent to the document window when the app is about to quit; it flushes its pending session
-/// autosave and answers with `quit_after_flush`. Mirrors `QUIT_FLUSH_REQUEST_EVENT` in
+/// Sent with the `committed` phase once native quit can no longer be cancelled. The document
+/// window flushes its session and answers with `quit_after_flush`. Mirrors `QUIT_FLUSH_REQUEST_EVENT` in
 /// apps/desktop/src/window-manager/index.ts.
 const QUIT_FLUSH_REQUEST_EVENT: &str = "chemdraft://flush-before-quit";
 /// How long a quit waits for the document window's flush before quitting anyway.
@@ -406,7 +406,7 @@ impl<R: Runtime> QuitHost for tauri::AppHandle<R> {
                     || {
                         if capture.get_webview_window(MAIN_WINDOW_LABEL).is_none()
                             || capture
-                                .emit_to(MAIN_WINDOW_LABEL, QUIT_FLUSH_REQUEST_EVENT, ())
+                                .emit_to(MAIN_WINDOW_LABEL, QUIT_FLUSH_REQUEST_EVENT, "committed")
                                 .is_err()
                         {
                             complete_quit_flush_with(&QUIT, &capture, QuitReason::NoDocument);
@@ -735,20 +735,24 @@ fn acknowledge_quit_prompt(flow: &QuitFlow, request_id: u64, visible: bool) -> b
     true
 }
 
-fn cancel_quit_with(flow: &QuitFlow, request_id: u64) -> bool {
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+enum QuitCancelOutcome {
+    Cancelled,
+    Superseded,
+    Committed,
+}
+
+fn cancel_quit_with(flow: &QuitFlow, request_id: u64) -> QuitCancelOutcome {
     let mut prompt = flow.prompt.lock().unwrap();
-    if request_id == 0
-        || prompt.0 != request_id
-        || !matches!(
-            prompt.1,
-            QuitPromptPhase::Idle | QuitPromptPhase::AwaitingWindow | QuitPromptPhase::Showing
-        )
-        || flow.quitting.load(Ordering::SeqCst)
-    {
-        return false;
+    if prompt.1 == QuitPromptPhase::Flushing || flow.in_progress() {
+        return QuitCancelOutcome::Committed;
+    }
+    if request_id == 0 || prompt.0 != request_id {
+        return QuitCancelOutcome::Superseded;
     }
     prompt.1 = QuitPromptPhase::Idle;
-    true
+    QuitCancelOutcome::Cancelled
 }
 
 #[tauri::command]
@@ -800,7 +804,10 @@ async fn quit_prompt_showing(
 }
 
 #[tauri::command]
-async fn cancel_quit(window: tauri::WebviewWindow, request_id: u64) -> Result<bool, String> {
+async fn cancel_quit(
+    window: tauri::WebviewWindow,
+    request_id: u64,
+) -> Result<QuitCancelOutcome, String> {
     authorize_quit_window(window.label())?;
     Ok(cancel_quit_with(&QUIT, request_id))
 }
@@ -950,6 +957,10 @@ struct PluginNativeMenuItems(std::sync::Mutex<Vec<PluginMenuItemInput>>);
 /// without waiting for the next toolbar push — the menu's source of truth stays the TS toolbar registry.
 #[derive(Default)]
 struct ToolbarsMenuModel(std::sync::Mutex<(Vec<ToolbarMenuEntry>, ViewMenuState)>);
+
+/// Set after a failed native update. Only a complete rebuild can trust the cached models again.
+#[derive(Default)]
+struct NativeMenuNeedsRebuild(AtomicBool);
 
 /// Which keyboard-shortcut scheme the app runs under (mirrors the webview's persisted setting; JS
 /// pushes it on startup and on change via `set_keybinding_scheme`). Read at menu-build time so the
@@ -1234,6 +1245,7 @@ pub fn run() {
         .manage(ToolsetWindowDirectory::default())
         .manage(PluginNativeMenuItems::default())
         .manage(ToolbarsMenuModel::default())
+        .manage(NativeMenuNeedsRebuild::default())
         .manage(KeybindingSchemeState::default())
         // Take over the app's OWN `tauri://` origin so one handler serves both the document and any
         // staged plugin package (ADR-0029 §6 as amended; M36). This *replaces* Tauri's built-in
@@ -1315,6 +1327,7 @@ pub fn run() {
             }
         })
         .on_menu_event(|app, event| {
+            windows_activation_log::menu(Some(event.id().as_ref()));
             if canvas_context_menu::menu_event(app, event.id().as_ref()) {
                 return;
             }
@@ -3949,10 +3962,7 @@ async fn save_document_session(
     write_file_atomic(&path, &contents)
 }
 
-/// JS pushes the Toolbars menu model (which toolsets exist, their titles, current visibility) and
-/// Rust rebuilds the app menu with that Toolbars submenu — so the menu's source of truth is the TS
-/// toolbar registry, not Rust's manifest copy. Runs on the main thread; per-toggle checkmark flips
-/// still go through set_menu_checked (in place, no rebuild).
+/// Apply the webview's toolbar rows and View state to the document menu on the UI thread.
 #[tauri::command]
 fn set_toolbars_menu(
     app: tauri::AppHandle,
@@ -3968,48 +3978,70 @@ fn set_toolbars_menu(
         crosshairs_visible,
         has_multiple_document_tabs: has_multiple_document_tabs.unwrap_or(false),
     };
-    // Remember the pushed model so plugin-menu syncs can rebuild the full menu from it later
-    // (reinstall_app_menu) without waiting for the next toolbar push. JS pushes on every toolbar
-    // visibility or rulers/crosshairs toggle; most pushes only move checkmarks, and a full rebuild
-    // swaps the whole menu bar (on Windows: two SetMenu calls, a resize of the document's client
-    // area and two layout-file writes), so only a structural change rebuilds.
-    let update = {
-        let state = app.state::<ToolbarsMenuModel>();
-        let mut guard = state.0.lock().map_err(|error| error.to_string())?;
-        let update = classify_toolbars_menu_update(&guard, &entries, view_state);
-        *guard = (entries.clone(), view_state);
-        update
-    };
-    if update == ToolbarsMenuUpdate::Unchanged {
-        return Ok(());
-    }
-    app.clone()
-        .run_on_main_thread(move || {
-            let result = if update == ToolbarsMenuUpdate::ChecksOnly {
-                entries
-                    .iter()
-                    .map(|entry| (toolset_toggle_command_id(&entry.toolset_id), entry.visible))
-                    .chain([
-                        ("view.toggleRulers".to_string(), view_state.rulers_visible),
-                        (
-                            "view.toggleCrosshairs".to_string(),
-                            view_state.crosshairs_visible,
-                        ),
-                    ])
-                    .try_for_each(|(command_id, checked)| {
-                        set_check_menu_item_checked_now(&app, &command_id, checked)
-                    })
-            } else {
-                let plugin_items = current_plugin_menu_items(&app);
-                create_app_menu_for_toolsets(&app, &entries, view_state, &plugin_items)
-                    .and_then(|menu| install_app_menu(&app, menu))
-                    .map_err(|error| error.to_string())
-            };
-            if let Err(error) = result {
-                eprintln!("Could not update ChemDraft toolbar menu: {error}");
-            }
-        })
-        .map_err(|error| error.to_string())
+    run_on_main_thread_blocking(&app.clone(), move || {
+        let previous = current_toolbars_menu_model(&app);
+        apply_menu_update(
+            &app.state::<NativeMenuNeedsRebuild>().0,
+            classify_toolbars_menu_update(&previous, &entries, view_state),
+            || {
+                let menu = installed_app_menu(&app)?;
+                for (old, new) in previous.0.iter().zip(&entries) {
+                    if old == new {
+                        continue;
+                    }
+                    let id = toolset_toggle_command_id(&new.toolset_id);
+                    let MenuItemKind::Check(item) = required_menu_item(&menu, &id)? else {
+                        return Err(format!("Expected a checkable toolbar menu item for {id}"));
+                    };
+                    if new.title != old.title {
+                        item.set_text(&new.title).map_err(|e| e.to_string())?;
+                    }
+                    item.set_checked(new.visible).map_err(|e| e.to_string())?;
+                }
+                for (id, old, new) in [
+                    (
+                        "view.toggleRulers",
+                        previous.1.rulers_visible,
+                        view_state.rulers_visible,
+                    ),
+                    (
+                        "view.toggleCrosshairs",
+                        previous.1.crosshairs_visible,
+                        view_state.crosshairs_visible,
+                    ),
+                ] {
+                    if old != new {
+                        let MenuItemKind::Check(item) = required_menu_item(&menu, id)? else {
+                            return Err(format!("Expected a checkable View menu item for {id}"));
+                        };
+                        item.set_checked(new).map_err(|e| e.to_string())?;
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                if previous.1.has_multiple_document_tabs != view_state.has_multiple_document_tabs {
+                    for id in [CLOSE_WINDOW_FILE_MENU_ID, CLOSE_WINDOW_WINDOW_MENU_ID] {
+                        let MenuItemKind::MenuItem(item) = required_menu_item(&menu, id)? else {
+                            return Err(format!("Expected a close menu item for {id}"));
+                        };
+                        item.set_text(close_menu_title(view_state.has_multiple_document_tabs))
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+                Ok(())
+            },
+            || {
+                reinstall_app_menu(
+                    &app,
+                    &entries,
+                    view_state,
+                    &current_plugin_menu_items(&app),
+                    current_keybinding_scheme(&app),
+                )
+            },
+        )?;
+        *app.state::<ToolbarsMenuModel>().0.lock().unwrap() = (entries, view_state);
+        Ok(())
+    })?
 }
 
 #[tauri::command]
@@ -8778,11 +8810,7 @@ fn emit_toolset_window_state_to_main<R: Runtime>(
         .map_err(|error| error.to_string())
 }
 
-/// The checkable View-menu toggle states that must survive a full menu rebuild. `set_toolbars_menu`
-/// rebuilds the whole bar via `set_menu`, which recreates the Show Rulers / Show Crosshairs items;
-/// carrying their real state here keeps them from snapping back to a hardcoded default (the checkmark
-/// would otherwise desync and then invert on the next click). JS is the source of truth and passes
-/// the current values; the startup menu uses the defaults, which match the app's initial state.
+/// Webview-owned View checkmarks and Close Tab / Close Window label.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ViewMenuState {
     rulers_visible: bool,
@@ -8800,68 +8828,250 @@ impl Default for ViewMenuState {
     }
 }
 
-/// Sync the webview's plugin menu items into the native menu (ADR-0016): store them, then
-/// rebuild + reinstall the app menu so they appear natively. Clicks route back by the `plugin.`
-/// prefix or an explicit `core_routed` flag through the existing native→webview command bridge.
+/// Compare and store the requested model on the UI thread, alongside the native menu mutations.
 #[tauri::command]
 fn sync_plugin_menu_items(
     app: tauri::AppHandle,
     items: Vec<PluginMenuItemInput>,
 ) -> Result<(), String> {
-    {
-        let state = app.state::<PluginNativeMenuItems>();
-        let mut guard = state.0.lock().map_err(|error| error.to_string())?;
-        // The webview re-sends the list on every plugin host/panel change (each report push, panel
-        // open/close), almost always unchanged. A rebuild swaps the whole menu bar — on Windows two
-        // SetMenu calls that resize the document's client area — so identical syncs are dropped.
-        if *guard == items {
-            return Ok(());
-        }
-        *guard = items;
-    }
-    reinstall_app_menu(&app)
+    run_on_main_thread_blocking(&app.clone(), move || {
+        app.state::<PluginNativeMenuItems>().apply_update(
+            &app.state::<NativeMenuNeedsRebuild>().0,
+            items,
+            |previous, next| update_installed_plugin_menu(&app, previous, next),
+            |next| {
+                let (entries, view) = current_toolbars_menu_model(&app);
+                reinstall_app_menu(&app, &entries, view, next, current_keybinding_scheme(&app))
+            },
+        )
+    })?
 }
 
-/// How a Toolbars-menu push differs from the menu already installed.
+impl PluginNativeMenuItems {
+    fn apply_update(
+        &self,
+        needs_rebuild: &AtomicBool,
+        items: Vec<PluginMenuItemInput>,
+        update_properties: impl FnOnce(
+            &[PluginMenuItemInput],
+            &[PluginMenuItemInput],
+        ) -> Result<(), String>,
+        rebuild: impl FnOnce(&[PluginMenuItemInput]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let previous = self.0.lock().unwrap().clone();
+        let result = apply_menu_update(
+            needs_rebuild,
+            classify_plugin_menu_update(&previous, &items),
+            || update_properties(&previous, &items),
+            || rebuild(&items),
+        );
+        // A rebuild from another menu update still needs the latest request after a setter fails.
+        *self.0.lock().unwrap() = items;
+        result
+    }
+}
+
 #[derive(Debug, PartialEq)]
-enum ToolbarsMenuUpdate {
-    /// Same rows, same checkmarks: nothing to do.
+enum MenuUpdate {
     Unchanged,
-    /// Same rows (ids and titles, in order); only checkmarks changed — flip them in place.
-    ChecksOnly,
-    /// Rows were added, removed, reordered or renamed: rebuild the menu.
+    Properties,
     Rebuild,
+}
+
+fn apply_menu_update(
+    needs_rebuild: &AtomicBool,
+    update: MenuUpdate,
+    update_properties: impl FnOnce() -> Result<(), String>,
+    rebuild: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let result = match (needs_rebuild.load(Ordering::Relaxed), update) {
+        (true, _) | (_, MenuUpdate::Rebuild) => rebuild(),
+        (false, MenuUpdate::Properties) => update_properties(),
+        (false, MenuUpdate::Unchanged) => return Ok(()),
+    };
+    needs_rebuild.store(result.is_err(), Ordering::Relaxed);
+    result
+}
+
+const DYNAMIC_MENU_SECTIONS: [&str; 4] = ["structure", "tools", "analyze", "plugins"];
+
+fn classify_plugin_menu_update(
+    old: &[PluginMenuItemInput],
+    new: &[PluginMenuItemInput],
+) -> MenuUpdate {
+    if old == new {
+        return MenuUpdate::Unchanged;
+    }
+    for section in DYNAMIC_MENU_SECTIONS {
+        let old = plugin_menu_items_in(old, section);
+        let new = plugin_menu_items_in(new, section);
+        if old.len() != new.len()
+            || old.into_iter().zip(new).any(|(a, b)| {
+                a.id != b.id || (section == "structure" && a.separator_before != b.separator_before)
+            })
+        {
+            return MenuUpdate::Rebuild;
+        }
+    }
+    MenuUpdate::Properties
+}
+
+fn update_installed_plugin_menu<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    previous: &[PluginMenuItemInput],
+    next: &[PluginMenuItemInput],
+) -> Result<(), String> {
+    let menu = installed_app_menu(app)?;
+    let sections = menu.items().map_err(|e| e.to_string())?;
+    update_plugin_menu_properties(
+        previous,
+        next,
+        |section| {
+            let (section_position, submenu) = sections
+                .iter()
+                .enumerate()
+                .find(|(_, item)| item.id().as_ref() == section)
+                .and_then(|(position, item)| item.as_submenu().map(|submenu| (position, submenu)))
+                .ok_or_else(|| format!("Missing native menu section {section}"))?;
+            let items = submenu.items().map_err(|e| e.to_string())?;
+            let row_count = items.len();
+            Ok(items
+                .into_iter()
+                .enumerate()
+                .filter_map(|(position, kind)| {
+                    let MenuItemKind::MenuItem(item) = kind else {
+                        return None;
+                    };
+                    let id = item.id().as_ref().to_string();
+                    Some((id, (item, (submenu, section_position, position, row_count))))
+                })
+                .collect())
+        },
+        |(item, position), enabled| {
+            item.set_enabled(enabled).map_err(|e| e.to_string())?;
+            #[cfg(windows)]
+            if !enabled {
+                gray_disabled_menu_item(app, *position)?;
+            }
+            #[cfg(not(windows))]
+            let _ = position;
+            Ok(())
+        },
+        |(item, _), label| item.set_text(label).map_err(|e| e.to_string()),
+    )
+}
+
+#[cfg(windows)]
+fn gray_disabled_menu_item<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    position: (&Submenu<R>, usize, usize, usize),
+) -> Result<(), String> {
+    use tauri::menu::ContextMenu;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnableMenuItem, GetMenu, GetMenuItemCount, GetSubMenu, HMENU, MF_BYPOSITION, MF_GRAYED,
+    };
+
+    let (submenu, section_position, row_position, row_count) = position;
+    let window = app
+        .get_webview_window(MAIN_WINDOW_LABEL)
+        .ok_or("The native document window is unavailable.")?;
+    let hwnd = window.hwnd().map_err(|e| e.to_string())?;
+    let popup = submenu.hpopupmenu().map_err(|e| e.to_string())? as HMENU;
+    // Stock muda uses MF_DISABLED when mutating rows and MF_GRAYED when building them.
+    // The installed bar and Tauri's popup copy both preserve the submenu's item order.
+    // Positions distinguish duplicate command aliases and include separator rows.
+    // SAFETY: This runs on the UI thread with the document window and menu handles live.
+    unsafe {
+        let installed = GetSubMenu(GetMenu(hwnd.0 as _), section_position as i32);
+        for handle in [installed, popup] {
+            if GetMenuItemCount(handle) != row_count as i32
+                || EnableMenuItem(handle, row_position as u32, MF_BYPOSITION | MF_GRAYED) == -1
+            {
+                return Err(format!(
+                    "Could not gray native menu item in {}",
+                    submenu.id().as_ref()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn update_plugin_menu_properties<Row>(
+    previous: &[PluginMenuItemInput],
+    next: &[PluginMenuItemInput],
+    mut section_rows: impl FnMut(&str) -> Result<Vec<(String, Row)>, String>,
+    mut set_enabled: impl FnMut(&Row, bool) -> Result<(), String>,
+    mut set_text: impl FnMut(&Row, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    for section in DYNAMIC_MENU_SECTIONS {
+        let old = plugin_menu_items_in(previous, section);
+        let new = plugin_menu_items_in(next, section);
+        if old == new {
+            continue;
+        }
+        // Dynamic rows are appended in payload order. Match from the end so multiple
+        // aliases of one command can each keep their own title and enabled state.
+        let mut commands = section_rows(section)?.into_iter().rev();
+        for (old, new) in old.into_iter().zip(new).rev() {
+            let (_, item) = commands
+                .next()
+                .filter(|(id, _)| id == &new.id)
+                .ok_or_else(|| format!("Missing native menu item {} in {section}", new.id))?;
+            if old.enabled != new.enabled {
+                set_enabled(&item, new.enabled)?;
+            }
+            if old.label != new.label {
+                set_text(&item, &new.label)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn classify_toolbars_menu_update(
     previous: &(Vec<ToolbarMenuEntry>, ViewMenuState),
     next_entries: &[ToolbarMenuEntry],
     next_view: ViewMenuState,
-) -> ToolbarsMenuUpdate {
+) -> MenuUpdate {
     let (previous_entries, previous_view) = previous;
-    let same_rows = previous_entries.len() == next_entries.len()
-        && previous_entries
-            .iter()
-            .zip(next_entries)
-            .all(|(old, new)| old.toolset_id == new.toolset_id && old.title == new.title);
-    let tab_close_changed = cfg!(target_os = "macos")
-        && previous_view.has_multiple_document_tabs != next_view.has_multiple_document_tabs;
-    if !same_rows || tab_close_changed {
-        ToolbarsMenuUpdate::Rebuild
-    } else if previous_entries.as_slice() == next_entries && *previous_view == next_view {
-        ToolbarsMenuUpdate::Unchanged
+    if previous_entries.as_slice() == next_entries && *previous_view == next_view {
+        MenuUpdate::Unchanged
+    } else if previous_entries
+        .iter()
+        .map(|row| &row.toolset_id)
+        .eq(next_entries.iter().map(|row| &row.toolset_id))
+    {
+        MenuUpdate::Properties
     } else {
-        ToolbarsMenuUpdate::ChecksOnly
+        MenuUpdate::Rebuild
     }
 }
 
-/// Rebuild and install the app menu on the main thread from the last JS-pushed toolbar model plus the
-/// current plugin menu items. Toolbar rows and View-toggle state come from `ToolbarsMenuModel` (what
-/// `set_toolbars_menu` last stored), so a plugin sync never resets the Toolbars submenu or the View
-/// checkmarks while JS remains the source of truth for both.
-/// Store the webview-owned keybinding scheme and rebuild the native menu so its accelerators match.
-/// JS pushes this on startup and whenever the Preferences toggle changes; the scheme itself is
-/// persisted by the webview (localStorage), so Rust only mirrors it.
+impl KeybindingScheme {
+    fn export(self) -> &'static str {
+        match self {
+            Self::ChemDraft => "CmdOrCtrl+Shift+E",
+            Self::ChemDraw if cfg!(target_os = "macos") => "Ctrl+Command+E",
+            Self::ChemDraw => "CmdOrCtrl+E",
+        }
+    }
+
+    fn rulers(self) -> &'static str {
+        match self {
+            Self::ChemDraft => "CmdOrCtrl+R",
+            Self::ChemDraw => "CmdOrCtrl+;",
+        }
+    }
+
+    fn crosshairs(self) -> &'static str {
+        match self {
+            Self::ChemDraft => "CmdOrCtrl+Shift+R",
+            Self::ChemDraw => "Alt+CmdOrCtrl+X",
+        }
+    }
+}
+
 #[tauri::command]
 fn set_keybinding_scheme(app: tauri::AppHandle, scheme: String) -> Result<(), String> {
     let parsed = match scheme.as_str() {
@@ -8869,21 +9079,50 @@ fn set_keybinding_scheme(app: tauri::AppHandle, scheme: String) -> Result<(), St
         "chemdraw" => KeybindingScheme::ChemDraw,
         other => return Err(format!("unknown keybinding scheme: {other}")),
     };
-    let state = app.state::<KeybindingSchemeState>();
-    let changed = {
-        let mut guard = state.0.lock().map_err(|error| error.to_string())?;
-        let changed = *guard != parsed;
-        *guard = parsed;
-        changed
-    };
-    if changed {
-        reinstall_app_menu(&app)?;
-    }
-    Ok(())
+    run_on_main_thread_blocking(&app.clone(), move || {
+        let update = if current_keybinding_scheme(&app) == parsed {
+            MenuUpdate::Unchanged
+        } else if cfg!(windows) {
+            MenuUpdate::Rebuild
+        } else {
+            MenuUpdate::Properties
+        };
+        apply_menu_update(
+            &app.state::<NativeMenuNeedsRebuild>().0,
+            update,
+            || {
+                let menu = installed_app_menu(&app)?;
+                for (id, accelerator) in [
+                    ("export.open", parsed.export()),
+                    ("view.toggleRulers", parsed.rulers()),
+                    ("view.toggleCrosshairs", parsed.crosshairs()),
+                ] {
+                    match required_menu_item(&menu, id)? {
+                        MenuItemKind::MenuItem(item) => item.set_accelerator(Some(accelerator)),
+                        MenuItemKind::Check(item) => item.set_accelerator(Some(accelerator)),
+                        _ => return Err(format!("Expected an accelerator menu item for {id}")),
+                    }
+                    .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            },
+            || {
+                let (entries, view) = current_toolbars_menu_model(&app);
+                reinstall_app_menu(
+                    &app,
+                    &entries,
+                    view,
+                    &current_plugin_menu_items(&app),
+                    parsed,
+                )
+            },
+        )?;
+        *app.state::<KeybindingSchemeState>().0.lock().unwrap() = parsed;
+        Ok(())
+    })?
 }
 
-/// Install a (re)built app menu. Must run on the main thread (every caller does: `setup`, and the
-/// `run_on_main_thread` closures of `set_toolbars_menu` / `reinstall_app_menu`).
+/// Install the document menu during setup or a structural update on the UI thread.
 ///
 /// macOS has one app-wide menu bar. Elsewhere the menu belongs to the document window alone and is
 /// set on that window, never app-wide. An app-wide Tauri menu is attached to EVERY window, and
@@ -8908,22 +9147,20 @@ fn install_app_menu<R: Runtime>(app: &tauri::AppHandle<R>, menu: Menu<R>) -> tau
         };
         window.set_menu(menu)?;
     }
+    windows_activation_log::menu(None);
     Ok(())
 }
 
-fn reinstall_app_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
-    let app = app.clone();
-    app.clone()
-        .run_on_main_thread(move || {
-            let (entries, view_state) = current_toolbars_menu_model(&app);
-            let plugin_items = current_plugin_menu_items(&app);
-            let result = create_app_menu_for_toolsets(&app, &entries, view_state, &plugin_items)
-                .and_then(|menu| install_app_menu(&app, menu));
-            if let Err(error) = result {
-                eprintln!("Could not update ChemDraft plugin menu: {error}");
-            }
-        })
-        .map_err(|error| error.to_string())
+fn reinstall_app_menu<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    entries: &[ToolbarMenuEntry],
+    view: ViewMenuState,
+    plugin_items: &[PluginMenuItemInput],
+    scheme: KeybindingScheme,
+) -> Result<(), String> {
+    create_app_menu_for_toolsets(app, entries, view, plugin_items, scheme)
+        .and_then(|menu| install_app_menu(app, menu))
+        .map_err(|e| e.to_string())
 }
 
 /// Shared Insert menu for the macOS application menu and Windows document-window menu.
@@ -8993,14 +9230,20 @@ fn build_analyze_submenu<R: Runtime>(
             items.push(item);
         }
     }
-    Submenu::with_items(app, "Analyze", true, &items)
+    Submenu::with_id_and_items(app, "analyze", "Analyze", true, &items)
 }
 
 fn create_app_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<Menu<R>> {
     // Empty Toolbars submenu; JS pushes the real rows via set_toolbars_menu once it loads. Plugin
     // items are read from state so menu rebuilds after a plugin sync keep them (ADR-0016).
     let plugin_items = current_plugin_menu_items(app);
-    create_app_menu_for_toolsets(app, &[], ViewMenuState::default(), &plugin_items)
+    create_app_menu_for_toolsets(
+        app,
+        &[],
+        ViewMenuState::default(),
+        &plugin_items,
+        current_keybinding_scheme(app),
+    )
 }
 
 /// The plugin menu items last synced from the webview (empty until the first sync). Read on every menu
@@ -9025,12 +9268,13 @@ fn create_app_menu_for_toolsets<R: Runtime>(
     entries: &[ToolbarMenuEntry],
     view_state: ViewMenuState,
     plugin_items: &[PluginMenuItemInput],
+    scheme: KeybindingScheme,
 ) -> tauri::Result<Menu<R>> {
     #[cfg(target_os = "macos")]
     let native_app_menu = create_native_app_menu(app)?;
     let page_setup_menu = create_page_setup_menu(app)?;
     let insert_menu = build_insert_submenu(app)?;
-    let view_menu = create_view_menu(app, entries, view_state)?;
+    let view_menu = create_view_menu(app, entries, view_state, scheme)?;
     #[cfg(target_os = "macos")]
     let fullscreen = {
         // The initial app menu is built before the document window exists.
@@ -9040,8 +9284,9 @@ fn create_app_menu_for_toolsets<R: Runtime>(
         view_menu.append_items(&[&PredefinedMenuItem::separator(app)?, &item])?;
         item
     };
-    let structure_menu = Submenu::with_items(
+    let structure_menu = Submenu::with_id_and_items(
         app,
+        "structure",
         "Structure",
         true,
         &[
@@ -9085,7 +9330,7 @@ fn create_app_menu_for_toolsets<R: Runtime>(
             )?)?;
         }
     }
-    let tools_menu = Submenu::with_items(app, "Tools", true, &[])?;
+    let tools_menu = Submenu::with_id_and_items(app, "tools", "Tools", true, &[])?;
     for item in plugin_menu_items_in(plugin_items, "tools") {
         tools_menu.append(&MenuItem::with_id(
             app,
@@ -9096,8 +9341,9 @@ fn create_app_menu_for_toolsets<R: Runtime>(
         )?)?;
     }
     let analyze_menu = build_analyze_submenu(app, plugin_items)?;
-    let plugins_menu = Submenu::with_items(
+    let plugins_menu = Submenu::with_id_and_items(
         app,
+        "plugins",
         "Plugins",
         true,
         &[
@@ -9132,6 +9378,8 @@ fn create_app_menu_for_toolsets<R: Runtime>(
         }
     }
 
+    // On Windows, the document webview handles the shortcuts. Attaching accelerated rows after
+    // their submenu joins the root would allocate a table stock muda leaves behind on drop.
     let menu = Menu::with_items(
         app,
         &[
@@ -9160,15 +9408,7 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                         "export.open",
                         "Export...",
                         true,
-                        Some(match current_keybinding_scheme(app) {
-                            KeybindingScheme::ChemDraft => "CmdOrCtrl+Shift+E",
-                            #[cfg(target_os = "macos")]
-                            KeybindingScheme::ChemDraw => "Ctrl+Command+E",
-                            // "Command" is the Windows/Super key off macOS. The shortcut engine
-                            // folds Cmd into Ctrl there, so the ChemDraw scheme's chord is Ctrl+E.
-                            #[cfg(not(target_os = "macos"))]
-                            KeybindingScheme::ChemDraw => "CmdOrCtrl+E",
-                        }),
+                        Some(scheme.export()),
                     )?,
                     &PredefinedMenuItem::separator(app)?,
                     #[cfg(not(target_os = "macos"))]
@@ -9362,14 +9602,19 @@ fn close_window_menu_item<R: Runtime>(
     MenuItem::with_id(
         app,
         id,
-        if has_multiple_document_tabs {
-            "Close Tab"
-        } else {
-            "Close Window"
-        },
+        close_menu_title(has_multiple_document_tabs),
         true,
         Some("CmdOrCtrl+W"),
     )
+}
+
+#[cfg(target_os = "macos")]
+fn close_menu_title(has_multiple_document_tabs: bool) -> &'static str {
+    if has_multiple_document_tabs {
+        "Close Tab"
+    } else {
+        "Close Window"
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -9574,20 +9819,17 @@ fn create_view_menu<R: Runtime>(
     app: &tauri::AppHandle<R>,
     entries: &[ToolbarMenuEntry],
     view_state: ViewMenuState,
+    scheme: KeybindingScheme,
 ) -> tauri::Result<Submenu<R>> {
     // Real checked state (from JS), not a hardcoded true — otherwise a full-menu rebuild would
     // re-check these while the feature is off, desyncing the menu from the document.
-    let scheme = current_keybinding_scheme(app);
     let show_rulers = CheckMenuItem::with_id(
         app,
         "view.toggleRulers",
         "Show Rulers",
         true,
         view_state.rulers_visible,
-        Some(match scheme {
-            KeybindingScheme::ChemDraft => "CmdOrCtrl+R",
-            KeybindingScheme::ChemDraw => "CmdOrCtrl+;",
-        }),
+        Some(scheme.rulers()),
     )?;
     let show_crosshairs = CheckMenuItem::with_id(
         app,
@@ -9595,10 +9837,7 @@ fn create_view_menu<R: Runtime>(
         "Show Crosshairs",
         true,
         view_state.crosshairs_visible,
-        Some(match scheme {
-            KeybindingScheme::ChemDraft => "CmdOrCtrl+Shift+R",
-            KeybindingScheme::ChemDraw => "Alt+CmdOrCtrl+X",
-        }),
+        Some(scheme.crosshairs()),
     )?;
     let separator = PredefinedMenuItem::separator(app)?;
     let debugger_separator = PredefinedMenuItem::separator(app)?;
@@ -10875,16 +11114,7 @@ fn set_check_menu_item_checked_now<R: Runtime>(
     command_id: &str,
     checked: bool,
 ) -> Result<(), String> {
-    // Off macOS the menu lives on the document window, not the app (see `install_app_menu`).
-    #[cfg(target_os = "macos")]
-    let menu = app.menu();
-    #[cfg(not(target_os = "macos"))]
-    let menu = app
-        .get_webview_window(MAIN_WINDOW_LABEL)
-        .and_then(|window| window.menu());
-    let Some(menu) = menu else {
-        return Ok(());
-    };
+    let menu = installed_app_menu(app)?;
     let Some(item) = find_menu_item_by_id(menu.items().unwrap_or_default(), command_id) else {
         return Ok(());
     };
@@ -10895,6 +11125,22 @@ fn set_check_menu_item_checked_now<R: Runtime>(
     check_item
         .set_checked(checked)
         .map_err(|error| error.to_string())
+}
+
+fn installed_app_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<Menu<R>, String> {
+    // Off macOS the menu lives on the document window, not the app (see `install_app_menu`).
+    #[cfg(target_os = "macos")]
+    let menu = app.menu();
+    #[cfg(not(target_os = "macos"))]
+    let menu = app
+        .get_webview_window(MAIN_WINDOW_LABEL)
+        .and_then(|window| window.menu());
+    menu.ok_or_else(|| "The native document menu is unavailable.".to_string())
+}
+
+fn required_menu_item<R: Runtime>(menu: &Menu<R>, id: &str) -> Result<MenuItemKind<R>, String> {
+    find_menu_item_by_id(menu.items().map_err(|e| e.to_string())?, id)
+        .ok_or_else(|| format!("Missing native menu item {id}"))
 }
 
 fn find_menu_item_by_id<R: Runtime>(
@@ -11787,6 +12033,135 @@ mod tests {
     }
 
     #[test]
+    fn selecting_a_structure_updates_existing_native_search_items() {
+        let row = PluginMenuItemInput {
+            id: "search.pubchem".into(),
+            location: "tools".into(),
+            label: "Search PubChem".into(),
+            core_routed: true,
+            enabled: false,
+            separator_before: false,
+        };
+        let mut selected = row.clone();
+        selected.enabled = true;
+        let old = [row];
+        let mut new = [selected];
+        assert_eq!(
+            classify_plugin_menu_update(&old, &new),
+            MenuUpdate::Properties
+        );
+        new[0].label.push('…');
+        assert_eq!(
+            classify_plugin_menu_update(&old, &new),
+            MenuUpdate::Properties
+        );
+        new[0].location = "structure".into();
+        assert_eq!(classify_plugin_menu_update(&old, &new), MenuUpdate::Rebuild);
+        assert_eq!(classify_plugin_menu_update(&old, &[]), MenuUpdate::Rebuild);
+    }
+
+    #[test]
+    fn native_menu_updates_call_the_enabled_setter_for_each_changed_row() {
+        let row = |enabled| PluginMenuItemInput {
+            id: "search.pubchem".into(),
+            location: "tools".into(),
+            label: "Search PubChem".into(),
+            core_routed: true,
+            enabled,
+            separator_before: false,
+        };
+        let old = [row(false), row(true), row(true)];
+        let new = [row(true), row(false), row(true)];
+        let mut calls = Vec::new();
+        update_plugin_menu_properties(
+            &old,
+            &new,
+            |section| {
+                assert_eq!(section, "tools");
+                Ok(old
+                    .iter()
+                    .enumerate()
+                    .map(|(i, row)| (row.id.clone(), i))
+                    .collect())
+            },
+            |position, enabled| {
+                calls.push((*position, enabled));
+                Ok(())
+            },
+            |_, _| panic!("Enabled changes do not rename items"),
+        )
+        .unwrap();
+        assert_eq!(calls, [(1, false), (0, true)]);
+    }
+
+    #[test]
+    fn partial_plugin_menu_failure_rebuilds_with_the_requested_items_on_a_toolbar_update() {
+        let row = |id: &str, enabled| PluginMenuItemInput {
+            id: id.into(),
+            location: "tools".into(),
+            label: id.into(),
+            core_routed: true,
+            enabled,
+            separator_before: false,
+        };
+        let plugin_model = PluginNativeMenuItems(Mutex::new(vec![
+            row("search.pubchem", true),
+            row("search.reaxys", true),
+        ]));
+        let new = vec![row("search.pubchem", false), row("search.reaxys", false)];
+        let needs_rebuild = AtomicBool::new(false);
+        let mut native_enabled = [true, true];
+
+        let result = plugin_model.apply_update(
+            &needs_rebuild,
+            new,
+            |previous, next| {
+                update_plugin_menu_properties(
+                    previous,
+                    next,
+                    |_| {
+                        Ok(previous
+                            .iter()
+                            .enumerate()
+                            .map(|(i, row)| (row.id.clone(), i))
+                            .collect())
+                    },
+                    |&position, enabled| {
+                        if position == 0 {
+                            return Err("setter failed".into());
+                        }
+                        native_enabled[position] = enabled;
+                        Ok(())
+                    },
+                    |_, _| panic!("Enabled changes do not rename items"),
+                )
+            },
+            |_| panic!("First update should use the in-place setters"),
+        );
+        assert_eq!(result, Err("setter failed".into()));
+        assert_eq!(native_enabled, [true, false]);
+
+        let toolbars = (Vec::new(), ViewMenuState::default());
+        let view = ViewMenuState {
+            rulers_visible: false,
+            ..toolbars.1
+        };
+        apply_menu_update(
+            &needs_rebuild,
+            classify_toolbars_menu_update(&toolbars, &toolbars.0, view),
+            || panic!("An in-place update cannot repair the stale native state"),
+            || {
+                let items = plugin_model.0.lock().unwrap();
+                native_enabled = [items[0].enabled, items[1].enabled];
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(native_enabled, [false, false]);
+        assert!(!needs_rebuild.load(Ordering::Relaxed));
+    }
+
+    #[test]
     fn toolbars_menu_pushes_rebuild_only_on_structural_change() {
         let entry = |id: &str, visible: bool| ToolbarMenuEntry {
             toolset_id: id.to_string(),
@@ -11800,7 +12175,7 @@ mod tests {
         );
         assert_eq!(
             classify_toolbars_menu_update(&previous, &previous.0, view),
-            ToolbarsMenuUpdate::Unchanged
+            MenuUpdate::Unchanged
         );
         assert_eq!(
             classify_toolbars_menu_update(
@@ -11808,7 +12183,7 @@ mod tests {
                 &[entry("core.main", true), entry("core.art", true)],
                 view
             ),
-            ToolbarsMenuUpdate::ChecksOnly
+            MenuUpdate::Properties
         );
         assert_eq!(
             classify_toolbars_menu_update(
@@ -11819,11 +12194,11 @@ mod tests {
                     ..view
                 }
             ),
-            ToolbarsMenuUpdate::ChecksOnly
+            MenuUpdate::Properties
         );
         assert_eq!(
             classify_toolbars_menu_update(&previous, &[entry("core.main", true)], view),
-            ToolbarsMenuUpdate::Rebuild
+            MenuUpdate::Rebuild
         );
         assert_eq!(
             classify_toolbars_menu_update(
@@ -11834,17 +12209,13 @@ mod tests {
                     ..view
                 }
             ),
-            if cfg!(target_os = "macos") {
-                ToolbarsMenuUpdate::Rebuild
-            } else {
-                ToolbarsMenuUpdate::ChecksOnly
-            }
+            MenuUpdate::Properties
         );
         let mut renamed = previous.0.clone();
         renamed[1].title = "Art (renamed)".to_string();
         assert_eq!(
             classify_toolbars_menu_update(&previous, &renamed, view),
-            ToolbarsMenuUpdate::Rebuild
+            MenuUpdate::Properties
         );
     }
 
@@ -12370,11 +12741,11 @@ mod tests {
         host.fire_timer();
         assert_eq!(host.app.calls(), ["prompt", "timer armed"]);
         assert!(!flow.quitting.load(Ordering::SeqCst));
-        assert!(cancel_quit_with(flow, id));
+        assert_eq!(cancel_quit_with(flow, id), QuitCancelOutcome::Cancelled);
         let id = request_prompted_quit_with(flow, &host).unwrap();
         assert!(acknowledge_quit_prompt(flow, id, true));
         assert!(request_appkit_quit_with(flow, &host));
-        assert!(!cancel_quit_with(flow, id));
+        assert_eq!(cancel_quit_with(flow, id), QuitCancelOutcome::Committed);
         assert!(!resume_prompted_quit_with(flow, &host, id));
         host.fire_timer(); // The superseded prompt's timer cannot decide the quit.
         assert!(!flow.quitting.load(Ordering::SeqCst));
@@ -12400,7 +12771,7 @@ mod tests {
         thread::sleep(Duration::from_millis(600));
         assert_eq!(host.calls(), ["ask to flush"]);
         assert!(!flow.quitting.load(Ordering::SeqCst));
-        assert!(cancel_quit_with(flow, id));
+        assert_eq!(cancel_quit_with(flow, id), QuitCancelOutcome::Cancelled);
         assert!(!prompt_waits_for_user(flow));
         assert!(lock_window_creation_with(flow).is_ok());
     }
@@ -12411,11 +12782,11 @@ mod tests {
         let host = StuckAppHost::new(true);
         let first = request_prompted_quit_with(flow, &host).unwrap();
         assert!(acknowledge_quit_prompt(flow, first, true));
-        assert!(cancel_quit_with(flow, first));
+        assert_eq!(cancel_quit_with(flow, first), QuitCancelOutcome::Cancelled);
         // A lost cancellation reply may be retried, but must never affect a newer request.
-        assert!(cancel_quit_with(flow, first));
+        assert_eq!(cancel_quit_with(flow, first), QuitCancelOutcome::Cancelled);
         let next = request_prompted_quit_with(flow, &host).unwrap();
-        assert!(!cancel_quit_with(flow, first));
+        assert_eq!(cancel_quit_with(flow, first), QuitCancelOutcome::Superseded);
         assert!(!acknowledge_quit_prompt(flow, first, true));
         assert!(acknowledge_quit_prompt(flow, next, true));
         thread::sleep(Duration::from_millis(600));
@@ -12430,6 +12801,7 @@ mod tests {
             let id = request_prompted_quit_with(flow, &host).unwrap();
             assert!(acknowledge_quit_prompt(flow, id, true));
             assert!(resume_prompted_quit_with(flow, &host, id));
+            assert_eq!(cancel_quit_with(flow, id), QuitCancelOutcome::Committed);
             assert!(!resume_prompted_quit_with(flow, &host, id));
             assert!(lock_window_creation_with(flow).is_err());
             assert_eq!(
