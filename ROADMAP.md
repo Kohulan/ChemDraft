@@ -1,41 +1,6 @@
 # ChemDraft roadmap
 
-ChemDraft is free, open source, and runs on macOS and Windows. This page shows what is coming next. Dates are targets, not promises. Ideas and votes are welcome in [GitHub Issues](https://github.com/jgassens/ChemDraft/issues).
-
-## 1.1.1 — November 2026 (fixes)
-- Typing in a text box after saving is no longer lost when you close the document.
-- Save shortcuts work while you are typing in a text box or table cell.
-- Copying right after undoing an E/Z change copies the whole molecule.
-- Pressing 2 over sulfur or phosphorus adds =O correctly.
-- Toolbar tooltips show for every button when you slide across them.
-- Bold and italic letters stay bold and italic when a whole text box is made subscript or superscript.
-- Spin 3D starts on macOS 11–15; the Windows installer quotes its file-open command.
-- **New:** Plugins ▸ Vibe Code Your Own Plugin… — a step-by-step guide and a starter file you hand to a coding assistant to build your own plugin.
-
-## 1.2 — late November 2026
-**Files and data**
-- Open and save CDX files (the older binary format), alongside CDXML.
-- Search PubChem or Reaxys for the selected structure.
-- Name to Structure can find more common names, trade names and CAS registry numbers offline.
-- Preserve supported unknown content from newer documents, with warnings where needed.
-
-**Drawing**
-- W and Shift+W draw wedge and hashed bonds; a wavy single bond marks unknown stereochemistry.
-- More abbreviations: OTBDPS, TBDPS, TIPS, TES, PMB, MOM and SEM.
-- Round brackets, bracket pairs and polymer repeat units with an editable "n".
-- Arrow keys move the selection.
-- Choose whether new double bonds are drawn offset or centered.
-- An explanatory badge, instead of a refusal, when a bond would exceed normal valence.
-- ACS 1996-style and RSC journal-style drawing presets.
-- Formatted reaction conditions, adjustable electron marks and adjustable wavy lines (community contributions).
-- Asks before enlarging the page when a structure doesn't fit.
-
-**Windows and Mac**
-- Mac: a version for Intel Macs, with Name from Structure.
-- Dialogs fit their contents; Preferences reopens where you left it; Esc closes toolbar flyouts.
-
-**Plugins and assistant**
-- Plugins can use chemical properties and offer assistant tools, subject to their permissions.
+ChemDraft is free, open source, and runs on macOS and Windows. A [Linux beta](https://github.com/jgassens/ChemDraft/releases/tag/v1.2.0-linux-beta.2) is available. This page shows what is coming next. Dates are targets, not promises. Ideas and votes are welcome in [GitHub Issues](https://github.com/jgassens/ChemDraft/issues).
 
 ## 1.2.1
 - A Windows installer that installs for all users (Program Files, all-users Start Menu, silent install), deferred from 1.2.
@@ -52,8 +17,8 @@ ChemDraft is free, open source, and runs on macOS and Windows. This page shows w
 - Your own keyboard shortcuts for the keys you press over the drawing.
 - Short typed shortcuts for common groups (for example c1 methyl, ph phenyl, cn nitrile), shared with Avogadro.
 
-## 1.4
-- Linux is on the roadmap for the 1.x series, aimed at 1.4, which will most likely land early 2027. It needs its own builds, testing and update system first, because every release must work the same on every supported platform.
+## Linux
+Linux is in beta now (.deb and AppImage). It leaves beta once it passes testing on real desktops (GNOME, KDE and Cinnamon, on X11 and Wayland) and has its own update system.
 
 ## Later in 1.x
 - A biology clip-art plugin (antibodies, proteins, membranes).
@@ -67,3 +32,6 @@ ChemDraft is free, open source, and runs on macOS and Windows. This page shows w
 - Docked toolbars in a ribbon at the top of the window, as an option to floating toolbars.
 - Edit ChemDraft structures directly inside Word and PowerPoint.
 - Launches together with the full in-app AI assistant plugin, and works with it from day one.
+
+## Released
+- 1.2.0 (November 16, 2026) and 1.1.1 (November 8, 2026): see the [release notes](https://github.com/jgassens/ChemDraft/releases).
