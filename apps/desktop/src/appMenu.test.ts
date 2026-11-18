@@ -384,6 +384,34 @@ describe("app menu model", () => {
   });
 });
 
+describe("native Window and full-screen menus", () => {
+  const source = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+
+  it("uses Tauri's reserved Window menu ID in the shared native builder", () => {
+    const builder = source.split("fn create_app_menu_for_toolsets<R: Runtime>")[1]!.split("/// Close Window")[0]!;
+    const windowMenu = builder.split('"Window",')[1]!.split('"Help",')[0]!;
+    expect(builder).toMatch(/Submenu::with_id_and_items\(\s*app,\s*tauri::menu::WINDOW_SUBMENU_ID,\s*"Window",/);
+    expect(windowMenu).toContain("PredefinedMenuItem::minimize(app, None)");
+    expect(windowMenu).toContain("PredefinedMenuItem::maximize(app, None)");
+    expect(windowMenu).toContain("CLOSE_WINDOW_WINDOW_MENU_ID");
+    expect(windowMenu).toMatch(/#\[cfg\(not\(target_os = "macos"\)\)\]\s*&PredefinedMenuItem::close_window\(app, None\)/);
+  });
+
+  it("adds one predefined full-screen role to View on macOS", () => {
+    const viewMenu = source.split("fn create_view_menu<R: Runtime>")[1]!.split("/// One Toolbars-menu row")[0]!;
+    expect(viewMenu).toMatch(/let view_menu = Submenu::with_items\(\s*app,\s*"View",/);
+    expect(viewMenu).toMatch(/if cfg!\(target_os = "macos"\) \{[^}]*view_menu\.append_items\([^}]*PredefinedMenuItem::fullscreen\(app, None\)/);
+    expect(source.match(/PredefinedMenuItem::fullscreen\(/g)).toHaveLength(1);
+  });
+
+  it("excludes secondary windows from AppKit's list when they are created", () => {
+    const setup = source.split("// Only macOS has an app-wide menu bar.")[1]!.split(".on_page_load(")[0]!;
+    expect(setup).toMatch(/#\[cfg\(target_os = "macos"\)\]\s*let builder = builder\.menu\(create_app_menu\)\.plugin\(/);
+    expect(setup).toMatch(/\.on_window_ready\(\|window\| \{\s*\/\/[^\n]*\n\s*if window\.label\(\) == MAIN_WINDOW_LABEL \{\s*return;/);
+    expect(setup).toContain("native.setExcludedFromWindowsMenu(true)");
+  });
+});
+
 
 describe("Preferences placement", () => {
   it("keeps native Preferences in the macOS application menu and Windows File menu", () => {

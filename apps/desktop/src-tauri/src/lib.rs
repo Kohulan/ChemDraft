@@ -1244,7 +1244,28 @@ pub fn run() {
     // window, which subclasses each palette/popover with muda's menu proc; see `install_app_menu`
     // for why that crashed. There the menu is attached to the document window in `setup` instead.
     #[cfg(target_os = "macos")]
-    let builder = builder.menu(create_app_menu);
+    let builder = builder.menu(create_app_menu).plugin(
+        tauri::plugin::Builder::<tauri::Wry>::new("windows-menu")
+            .on_window_ready(|window| {
+                // All document tabs live in the main window. AppKit's list should only show it.
+                if window.label() == MAIN_WINDOW_LABEL {
+                    return;
+                }
+                match window.ns_window() {
+                    Ok(pointer) => {
+                        // SAFETY: Tauri calls this hook on the main thread with a live window.
+                        if let Some(native) = unsafe { pointer.cast::<NSWindow>().as_ref() } {
+                            native.setExcludedFromWindowsMenu(true);
+                        }
+                    }
+                    Err(error) => eprintln!(
+                        "Could not exclude ChemDraft window {} from the Window menu: {error}",
+                        window.label()
+                    ),
+                }
+            })
+            .build(),
+    );
 
     builder
         .on_page_load(|webview, payload| {
@@ -8956,8 +8977,10 @@ fn create_app_menu_for_toolsets<R: Runtime>(
             &tools_menu,
             &analyze_menu,
             &plugins_menu,
-            &Submenu::with_items(
+            // Tauri registers this reserved ID with NSApp whenever it installs the app menu.
+            &Submenu::with_id_and_items(
                 app,
+                tauri::menu::WINDOW_SUBMENU_ID,
                 "Window",
                 true,
                 &[
@@ -9267,7 +9290,7 @@ fn create_view_menu<R: Runtime>(
         None::<&str>,
     )?;
 
-    Submenu::with_items(
+    let view_menu = Submenu::with_items(
         app,
         "View",
         true,
@@ -9281,7 +9304,15 @@ fn create_view_menu<R: Runtime>(
             &customize_toolbars,
             &customize_main_toolbar,
         ],
-    )
+    )?;
+    if cfg!(target_os = "macos") {
+        // AppKit validates toggleFullScreen: against the active window and updates the title.
+        view_menu.append_items(&[
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::fullscreen(app, None)?,
+        ])?;
+    }
+    Ok(view_menu)
 }
 
 /// One Toolbars-menu row. JS is the source of truth for the toolset set + titles now and pushes
