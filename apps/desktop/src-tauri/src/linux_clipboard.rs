@@ -9,12 +9,37 @@
 //! Both commands run on the main thread (they are sync Tauri commands off Windows), which GTK
 //! requires. `wait_for_*` spins a nested main loop there, as every GTK application's paste does.
 
+use std::ffi::{c_char, c_void, CStr};
+
 use gtk::gdk;
+use gtk::glib::prelude::ObjectType;
 
 use crate::clipboard_formats::{ClipboardWriteResult, ValidatedClipboardItem};
 use crate::clipboard_images::{self, ClipboardImageItem, SkippedClipboardImageItem};
 use crate::clipboard_limits;
 use crate::{ClipboardReadPayload, ClipboardTextItem};
+
+#[link(name = "webkit2gtk-4.1")]
+unsafe extern "C" {
+    fn webkit_web_view_execute_editing_command(webview: *mut c_void, command: *const c_char);
+}
+
+/// Execute a menu click as a privileged WebKit editing action on the view's current focus.
+pub(crate) fn execute_editing_command<R: tauri::Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    command: &'static CStr,
+) -> Result<(), String> {
+    window
+        .with_webview(move |webview| {
+            let webview = webview.inner();
+            // SAFETY: Tauri's Linux inner view is a live WebKitWebView and this closure runs on
+            // its owning thread. The command is a static, nul-terminated WebKit command name.
+            unsafe {
+                webkit_web_view_execute_editing_command(webview.as_ptr().cast(), command.as_ptr())
+            };
+        })
+        .map_err(|error| error.to_string())
+}
 
 /// Extra targets other Linux applications ask for when they want plain text.
 const PLAIN_TEXT_ALIASES: [&str; 5] = [

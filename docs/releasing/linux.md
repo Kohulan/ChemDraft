@@ -1,14 +1,18 @@
 # Linux release
 
-ChemDraft for Linux ships as two packages, built by `.github/workflows/linux-release.yml` on a
-GitHub-hosted Ubuntu 22.04 runner from the same tag as the macOS DMG and the Windows installer:
+Linux is an optional, community-tested beta indefinitely. macOS and Windows releases never wait
+on Linux. When Linux packages are available and included, both packages
+and their `.build.json` records must be attached. The release checker validates their names,
+version, hashes, sizes and commit against the same release tag as the macOS DMGs and Windows
+installer. The GitHub-hosted Ubuntu 22.04 runner builds both packages in `linux-release.yml`.
 
 | Package | For | Install |
 | --- | --- | --- |
 | `ChemDraft_<version>_amd64.deb` | Ubuntu 22.04+, Linux Mint 21+, Debian 12+, Pop!_OS, elementary OS, Zorin | `sudo apt install ./ChemDraft_<version>_amd64.deb` |
-| `ChemDraft_<version>_amd64.AppImage` | Other glibc-based distributions (Fedora, openSUSE, Arch, …) | `chmod +x ChemDraft_<version>_amd64.AppImage && ./ChemDraft_<version>_amd64.AppImage` |
+| `ChemDraft_<version>_amd64.AppImage` | x86-64 distributions with glibc 2.35 or later and compatible host graphics libraries | `chmod +x ChemDraft_<version>_amd64.AppImage && ./ChemDraft_<version>_amd64.AppImage` |
 
-`SHA256SUMS-linux.txt` lists both checksums.
+`SHA256SUMS-linux.txt` lists both package checksums. The combined `SHA256SUMS.txt` covers all
+other attached release assets, including the Linux packages and records when supplied.
 
 ## Why Ubuntu 22.04
 
@@ -28,15 +32,79 @@ gh workflow run linux-release.yml --ref v<version> -f ref=v<version> -f upload_t
 The workflow:
 
 1. Checks that `ref` is a tag (or full SHA) and that `upload_to_release` is `v<app version>`.
+   For uploads, the build ref must also match the workflow commit.
 2. Builds the OPSIN Java runtime on the runner and smoke-tests it (benzene).
 3. Builds a stable `.deb` and AppImage (`CHEMDRAFT_STABLE_BUILD=1`, no worktree label).
 4. Checks the bundle identity and that the `.deb` carries `chemdraft`, the 3D sidecar and the
    OPSIN runtime.
-5. Installs the `.deb` on the runner and starts it on a virtual display (Xvfb + openbox). It fails
-   if a library is missing, if ChemDraft exits or panics during start-up, or if no window appears.
-6. Uploads the packages and checksums to the draft release, never to a published one.
+5. Repacks the AppImage after Tauri bundles it. It uses the host's Wayland and compiler runtime
+   libraries and the host's `libgpg-error.so.0`; the job verifies that the finished image contains no `libwayland-*`,
+   `libstdc++.so*`, or `libgcc_s.so*` files or symlinks. The job logs the bundled shared libraries
+   under `usr/lib` and rejects bundled `libEGL*`, `libGL.so*`, `libGLX*`, `libOpenGL.so*`,
+   `libGLESv1_CM.so*`, `libGLESv2.so*`, `libGLU.so*`, `libGLdispatch*`, `libgbm*`, `libdrm*`,
+   `libglapi*`, `*_dri.so`, `libvulkan*`, and any `dri` directory or symlink.
+6. Records the source commit and final bytes of each package, then stages the packages, records,
+   and checksums as the `linux-release-amd64` workflow artifact.
+7. Runs independent smoke jobs on **Ubuntu 22.04 and 24.04**. Each downloads and verifies the same
+   22.04-built packages against `SHA256SUMS-linux.txt`. The jobs run both package checks, even
+   when the AppImage or the other runner fails.
+8. After both smoke jobs pass, fetches the draft's tag and checks that it resolves to the build
+   commit. It uploads to the existing draft, validates the attached builds, and refreshes the
+   combined checksums.
 
-The release body gets a `## Linux` section beside `## macOS` and `## Windows`.
+The [release body generator](three-builds.md#draft-the-body-on-macos) adds `## Linux` when both
+packages and their records are present and verified. Passing `--include-linux` requires that complete
+verified set in the assets directory.
+
+## Ubuntu smoke diagnostics
+
+Both runners use the package smoke composite action shared with the container workflow. Each
+runner restores the AppImage's executable bit and launches it with `--appimage-extract-and-run`
+before apt installs the `.deb` and its dependencies. Each launch uses Xvfb, Openbox, a private
+D-Bus session, and fresh XDG directories. Xvfb selects a free display with RANDR and GLX enabled,
+and the action waits for Openbox readiness. The action checks that the app and a WebKit web process
+start and a ChemDraft window appears within 60 seconds. The app must stay up for another 20 seconds,
+with a visible window and live web process at the end. A WebKit web process crash or app panic fails
+the check. The harness matches processes and windows to the active launch by process ancestry.
+The smoke test also reports EGL display initialization failures and logs the display backend settings.
+
+The `linux-smoke-amd64-ubuntu-22.04` and `linux-smoke-amd64-ubuntu-24.04` artifacts preserve
+package setup, library versions, display, app, and process logs even when smoke fails. The harness
+records the traced launch's exit status and any encoded signal, and labels signals it sends during
+cleanup. It also records profile contents and the single-instance D-Bus name owner. The `ldd` logs
+cover the app and WebKit helpers, using installed paths for the `.deb` and AppRun's library paths
+for the AppImage. Compare the reported package versions across runners since `4.1` names the
+WebKitGTK ABI.
+
+A failed launch gets a GDB retry with a fresh profile and D-Bus session and synchronous GTK X11
+errors. The retry times out after 90 seconds, with a further ten seconds before SIGKILL. It records
+thread stacks if GDB catches a fatal signal or reaches an exit breakpoint. For the AppImage, the
+action uses a disposable extraction so the app under GDB has AppRun's environment and GDB can use
+host libraries and Python. A successful retry leaves the original failure in place. GDB frame
+detail depends on the binary's available symbols.
+
+## Container smoke test
+
+Pull requests changing Linux packaging paths also build and smoke-test packages from the PR head.
+
+Build and test both packages using the workflow from a branch or tag:
+
+```sh
+gh workflow run linux-container-smoke.yml --ref <branch-or-tag>
+```
+
+To test existing packages, add `-f artifact_run_id=<linux-release-run-id>` and optionally
+`-f artifact_name=<name>` (defaults to `linux-release-amd64`). A reusable caller can also supply
+`artifact_name` for packages uploaded earlier in the same run. Reusable callers need
+`actions: read` for artifact downloads and must allow the `contents: write` permission declared
+by the release workflow's separate publishing job. The build itself runs with read access.
+
+The workflow checks Debian sid and Fedora under Xvfb and headless Weston. The containers install
+libgpg-error as a desktop system would. Debian installs the
+.deb with apt and Fedora extracts its payload and runs it with Fedora's libraries. Each job
+uploads display, app, and process logs. These tests cover startup and subprocess crashes. GPU
+rendering still needs a desktop check. The privileged containers allow `strace` to trace the app
+and glycin's bubblewrap to create user namespaces; Weston enables Xwayland for Wayland smoke tests.
 
 ## Updates
 
@@ -46,11 +114,20 @@ repository on GitHub Pages, or a Flathub listing.
 
 ## Platform notes
 
-- Webview: WebKitGTK, origin `tauri://localhost` (as on macOS).
+- On Wayland, the `.deb` defaults to XWayland so ChemDraft can position floating toolbars and
+  dialogs, matching the AppImage launcher. Set `CHEMDRAFT_NATIVE_WAYLAND=1` to skip the app's
+  XWayland default for the `.deb`, and use `GDK_BACKEND` to supply an explicit backend. The AppImage
+  always uses XWayland because linuxdeploy-plugin-gtk's AppRun hook exports `GDK_BACKEND=x11` before
+  ChemDraft starts.
+- Webview: WebKitGTK, origin `tauri://localhost` (as on macOS). Before startup on Linux,
+  ChemDraft defaults `WEBKIT_DISABLE_DMABUF_RENDERER` to `1` to avoid Wayland graphics
+  problems. An explicit value, including `0`, takes precedence.
+  For AppImage launches, an explicit `EGL_PLATFORM` takes precedence. Otherwise, a `GDK_BACKEND`
+  starting with `x11` or `wayland` selects that EGL platform. For other or unset backends, ChemDraft
+  selects `wayland` when `WAYLAND_DISPLAY` is set and `x11` otherwise.
 - Menus: on the document window, as on Windows (`install_app_menu`). Edit ▸ Cut / Copy / Paste
-  are routed commands (`clipboard_edit_menu_item`), not muda's predefined items: on Linux those
-  only fake a key press through libxdo, which does nothing on Wayland and was unreliable on X11.
-  They carry no accelerator, so Ctrl+X / C / V keep reaching the webview (and focused text fields).
+  invoke WebKitGTK's native editing commands in the focused window. The webview receives
+  Ctrl+X / C / V directly and uses the same clipboard events for menu clicks and shortcuts.
 - 3D: the `avogadro3d-sidecar` for Linux is still the placeholder (`binaries/README.md`), so 3D
   reports itself unavailable until a real Linux sidecar is built.
 - Clipboard: `linux_clipboard.rs`, GTK's clipboard (X11 and Wayland). Targets are MIME types, so

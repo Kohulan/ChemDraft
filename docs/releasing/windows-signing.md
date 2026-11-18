@@ -86,10 +86,13 @@ Review action updates and trust policy changes as release infrastructure changes
 ## Run a release
 
 Use a reviewed commit that has landed on the public repository's `main` branch, with the workflow
-and signing tools present. The Apple-silicon DMG, Intel DMG and Windows installer must use the same
-commit and version. The release body must include `## macOS (Apple silicon)`, `## macOS (Intel)` and
-`## Windows`, plus a Platform differences note naming each feature gap and its reason, or saying there
-are none. This workflow supplies the Windows artifacts only.
+and signing tools present. Every release requires the Apple-silicon DMG, Intel DMG, and Windows
+installer. Linux is an optional, community-tested beta indefinitely; macOS and Windows releases never
+wait on Linux. Its `.deb` and AppImage may be attached when available. When included, both packages
+and their records must pass the same checks for the commit, version and artifact bytes as the required
+builds. The release body includes `## macOS (Apple silicon)`, `## macOS (Intel)`, and `## Windows`,
+plus `## Linux` when the Linux packages are included. The Platform differences note names each feature
+gap and its reason or says there are none. This workflow supplies the Windows artifacts only.
 
 1. Set the app version before tagging, and prepare tracked Windows release notes if needed. Create
    the release tag and an **existing draft** GitHub release, for example `vX.Y.Z`.
@@ -136,14 +139,30 @@ are none. This workflow supplies the Windows artifacts only.
    `contents: write`; the build/signing job retains read access. Leave the release draft while testing.
    If uploading manually, upload the same final artifacts, without rebuilding or re-signing.
 7. After uploading, the same upload job uses its draft-visible token to download all attached release assets and run the
-   [asset checker](three-builds.md#last-step-before-un-drafting). If all three builds and their
-   records are present, hashes, sizes and tag/commit identity must pass. Wholly missing build pairs
-   are listed, while every supplied build is fully checked; partial pairs fail. The Windows-only
+   [asset checker](three-builds.md#last-step-before-un-drafting). Every supplied build must pass
+   the hash, size and tag/commit checks. The checker lists wholly missing macOS or Windows build
+   pairs and rejects partial pairs or an incomplete Linux set. The Windows-only
    result is INCOMPLETE, not a publishing pass. Windows passes `--skip-dmg-provenance` explicitly
    because it cannot mount DMGs; the final Mac gate must check their embedded commits.
-8. Collect both DMGs and the installer with all three `.build.json` files, then pass the
+8. Collect both DMGs and the installer with their adjacent `.build.json` files. If you are including
+   Linux, also collect `ChemDraft_X.Y.Z_amd64.deb`, `ChemDraft_X.Y.Z_amd64.AppImage`, and their
+   records. The [Linux workflow](linux.md#releasing) builds and records both packages and uploads
+   them to the existing draft after smoke tests pass when `upload_to_release` is supplied. For a manual
+   Linux upload, download `linux-release-amd64` and upload the packages, records, and `SHA256SUMS-linux.txt`.
+
+   After all planned manual uploads and release upload workflows for the tag have finished, refresh the
+   combined checksums from the assets attached to the draft. Do not change the draft's assets between this refresh and publication. From the repository
+   root, with `gh` authenticated for the draft, run (replace the tag and commit and use a fresh output path):
+
+   ```text
+   node tools/release/check-release-assets.mjs --tag vX.Y.Z --commit <full-sha> --skip-dmg-provenance --write-checksums path/to/SHA256SUMS.txt && gh release upload vX.Y.Z path/to/SHA256SUMS.txt --clobber
+   ```
+
+   Then pass the
    [joint release body check](three-builds.md) with the tag and explicit gaps or `--no-gaps`.
-   After all three artifacts pass review, **as the last step before un-drafting on a Mac** run both
+   The generator adds a Linux section when those packages and records are present. Use
+   `--gap "linux:feature and reason"` for any Linux feature gaps. After the attached artifacts pass review,
+   **as the last step before un-drafting on a Mac** run both
    `verify-macos-app.mjs --release --dmg` checks and
    `node tools/release/check-release-assets.mjs --tag vX.Y.Z --commit <full-sha>` against GitHub,
    as listed in [the final checklist](three-builds.md#last-step-before-un-drafting).

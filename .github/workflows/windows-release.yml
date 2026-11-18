@@ -279,6 +279,9 @@ jobs:
     needs: build
     if: github.repository == 'jgassens/ChemDraft' && !github.event.repository.fork && inputs.upload_to_release != ''
     runs-on: windows-latest
+    concurrency:
+      group: draft-release-upload-${{ inputs.upload_to_release }}
+      cancel-in-progress: false
     permissions:
       contents: write # Upload and validate draft assets here; all other jobs stay read-only.
       actions: read
@@ -324,7 +327,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Target release must already exist.' }
           $release = $releaseJson | ConvertFrom-Json
           if ($release.isDraft -ne $true -or $release.tagName -cne $env:RELEASE_TAG) { throw 'Refusing to upload to a published release.' }
-          $assets = @(Get-ChildItem release-assets -File | ForEach-Object { $_.FullName })
+          $assets = @(Get-ChildItem release-assets -File | Where-Object Name -CNE 'SHA256SUMS.txt' | ForEach-Object { $_.FullName })
           gh release upload $env:RELEASE_TAG @assets --clobber
           if ($LASTEXITCODE -ne 0) { throw 'Release asset upload failed.' }
 
@@ -332,7 +335,7 @@ jobs:
         with:
           node-version: 24
           token: ''
-      - name: Check all attached release builds when complete
+      - name: Check attached builds and refresh combined checksums
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -341,5 +344,8 @@ jobs:
           BUILD_COMMIT: ${{ needs.build.outputs.commit }}
         # Draft assets need this upload job's token. A Windows-only result is not a publishing pass.
         run: |
-          node tools/release/check-release-assets.mjs --tag "$env:RELEASE_TAG" --commit "$env:BUILD_COMMIT" --allow-incomplete --skip-dmg-provenance
+          $checksums = Join-Path $env:RUNNER_TEMP SHA256SUMS.txt
+          node tools/release/check-release-assets.mjs --tag "$env:RELEASE_TAG" --commit "$env:BUILD_COMMIT" --allow-incomplete --skip-dmg-provenance --write-checksums $checksums
           if ($LASTEXITCODE -ne 0) { throw 'Release asset validation failed.' }
+          gh release upload $env:RELEASE_TAG $checksums --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Combined checksum upload failed.' }

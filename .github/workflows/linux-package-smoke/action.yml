@@ -1,0 +1,304 @@
+name: Linux package smoke
+description: Launch a Linux package on a virtual display and watch its WebKit subprocess
+inputs:
+  bundle:
+    description: Package path for an AppImage, or executable path for an installed .deb
+    required: true
+  package:
+    description: appimage or deb
+    required: true
+  backend:
+    description: x11 or wayland
+    required: true
+  native-wayland:
+    description: Set to 1 to exercise the native Wayland opt-out under Weston
+    default: '0'
+  logs:
+    description: Directory for display, app, and process logs
+    required: true
+  container-user:
+    description: Unprivileged smoke user in an already isolated container
+    required: false
+  check-window:
+    description: Require a visible ChemDraft window under Xvfb with openbox and xdotool
+    default: 'false'
+  diagnostics:
+    description: Record Ubuntu library resolution and retry startup failures under GDB
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        BUNDLE: ${{ inputs.bundle }}
+        PACKAGE: ${{ inputs.package }}
+        BACKEND: ${{ inputs.backend }}
+        NATIVE_WAYLAND: ${{ inputs.native-wayland }}
+        LOGS: ${{ inputs.logs }}
+        CONTAINER_USER: ${{ inputs.container-user }}
+        CHECK_WINDOW: ${{ inputs.check-window }}
+        DIAGNOSTICS: ${{ inputs.diagnostics }}
+      run: |
+        set -euo pipefail
+        bundle=$(realpath "$BUNDLE")
+        session=(dbus-run-session)
+        if [[ -n "$CONTAINER_USER" ]]; then
+          install -d -o "$CONTAINER_USER" "$LOGS"
+          # The container already isolates the app and can block WebKitGTK's nested namespaces.
+          session=(runuser -u "$CONTAINER_USER" -- env WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 "${session[@]}")
+        else
+          mkdir -p "$LOGS"
+        fi
+        "${session[@]}" -- bash -s -- "$bundle" "$PACKAGE" "$BACKEND" "$LOGS" "$CHECK_WINDOW" \
+          "$DIAGNOSTICS" "$GITHUB_ACTION_PATH" "$NATIVE_WAYLAND" 2>&1 <<'SMOKE' | tee "$LOGS/harness.log"
+        set -euo pipefail
+        bundle=$1
+        package=$2
+        backend=$3
+        logs=$4
+        check_window=$5
+        diagnostics=$6
+        action_path=$7
+        native_wayland=$8
+        work=$(mktemp -d)
+        display_pid=
+        launcher_pid=
+        wm_pid=
+        export RUST_BACKTRACE=1
+        export XDG_RUNTIME_DIR
+        XDG_RUNTIME_DIR="$work/runtime"
+        mkdir -m 700 "$XDG_RUNTIME_DIR"
+        unset DISPLAY WAYLAND_DISPLAY GDK_BACKEND CHEMDRAFT_NATIVE_WAYLAND WEBKIT_DISABLE_DMABUF_RENDERER
+
+        new_profile() {
+          local profile
+          profile=$(mktemp -d "$work/profile.XXXXXX")
+          export XDG_CONFIG_HOME="$profile/config" XDG_DATA_HOME="$profile/data" XDG_CACHE_HOME="$profile/cache"
+          mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME"
+          if [[ "$backend" == x11 ]]; then
+            XDG_RUNTIME_DIR="$profile/runtime"
+            mkdir -m 700 "$XDG_RUNTIME_DIR"
+          fi
+        }
+        report_status() {
+          local status=$1 signal
+          printf '%s exit status: %s\n' "$2" "$status"
+          if (( status > 128 )); then
+            signal=$((status - 128))
+            printf 'Signal encoded in status: %s (%s)\n' "$signal" "$(kill -l "$signal" 2>/dev/null || echo unknown)"
+          fi
+        }
+        reap_launcher() {
+          local status=0
+          if kill -0 -- "-$launcher_pid" 2>/dev/null; then
+            echo "Harness sending SIGTERM to smoke process group $launcher_pid."
+            kill -TERM -- "-$launcher_pid" 2>/dev/null || true
+            for _ in {1..25}; do
+              kill -0 -- "-$launcher_pid" 2>/dev/null || break
+              sleep 0.2
+            done
+            if kill -0 -- "-$launcher_pid" 2>/dev/null; then
+              echo "Harness sending SIGKILL to smoke process group $launcher_pid."
+              kill -KILL -- "-$launcher_pid" 2>/dev/null || true
+            fi
+          fi
+          wait "$launcher_pid" || status=$?
+          report_status "$status" 'Traced launch'
+        }
+        cleanup() {
+          local result=$?
+          if [[ -n "$launcher_pid" ]]; then
+            if [[ "$diagnostics" == true ]]; then
+              record_profile > "$logs/profile-after.log" 2>&1 || true
+            fi
+            reap_launcher
+            if (( result != 0 )) && [[ "$diagnostics" == true ]]; then
+              retry_under_gdb || true
+            fi
+          fi
+          kill ${wm_pid:+"$wm_pid"} ${display_pid:+"$display_pid"} 2>/dev/null || true
+          rm -rf -- "$work"
+          exit "$result"
+        }
+        trap cleanup EXIT
+        new_profile
+        if command -v bwrap >/dev/null 2>&1; then
+          bwrap_status=0
+          bwrap --unshare-all --ro-bind / / /usr/bin/true || bwrap_status=$?
+          printf 'bubblewrap namespace preflight exit status: %s\n' "$bwrap_status"
+        fi
+        if [[ "$diagnostics" == true ]]; then
+          source "$action_path/diagnostics.sh"
+          prepare_diagnostics
+          record_profile > "$logs/profile-before.log" 2>&1
+          if grep -q 'boolean true' "$logs/profile-before.log"; then
+            echo '::error::ChemDraft already owns the private D-Bus session name'
+            exit 1
+          elif ! grep -q 'boolean false' "$logs/profile-before.log"; then
+            echo 'D-Bus name ownership probe was inconclusive; continuing with smoke test.' \
+              | tee -a "$logs/profile-before.log"
+          fi
+        fi
+
+        if [[ "$backend" == wayland ]]; then
+          export WAYLAND_DISPLAY=chemdraft-smoke
+          weston --backend=headless --renderer=pixman --shell=kiosk-shell.so --xwayland \
+            --socket="$WAYLAND_DISPLAY" --idle-time=0 > "$logs/display.log" 2>&1 &
+          ready="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+        else
+          Xvfb -screen 0 1920x1080x24 +extension RANDR +extension GLX -nolisten tcp -displayfd 3 \
+            3>"$logs/display-number" > "$logs/display.log" 2>&1 &
+          ready="$logs/display-number"
+        fi
+        display_pid=$!
+        for _ in {1..20}; do
+          [[ -S "$ready" || -s "$ready" ]] && break
+          kill -0 "$display_pid"
+          sleep 1
+        done
+        if [[ "$backend" == x11 && -s "$ready" ]]; then
+          export DISPLAY=":$(<"$ready")"
+        elif [[ "$backend" != wayland || ! -S "$ready" ]]; then
+          echo "::error::$backend display did not start"
+          exit 1
+        fi
+
+        if [[ "$backend" == x11 ]]; then
+          export GDK_BACKEND=x11
+        elif [[ "$native_wayland" == 1 ]]; then
+          export CHEMDRAFT_NATIVE_WAYLAND=1
+          echo 'Testing the native Wayland opt-out with only the Wayland display available.'
+        else
+          for _ in {1..20}; do
+            display=$(sed -n 's/.*xserver listening on display \(:[0-9][0-9]*\).*/\1/p' "$logs/display.log" | tail -n 1)
+            [[ -n "$display" ]] && break
+            kill -0 "$display_pid"
+            sleep 1
+          done
+          [[ -n "$display" ]] || { echo '::error::Weston Xwayland display did not start'; exit 1; }
+          export DISPLAY="$display"
+          echo 'ChemDraft defaults to XWayland in this Wayland session.'
+        fi
+        printf 'Launch environment: EGL_PLATFORM=%s GDK_BACKEND=%s WAYLAND_DISPLAY=%s DISPLAY=%s CHEMDRAFT_NATIVE_WAYLAND=%s\n' \
+          "${EGL_PLATFORM-<unset>}" "${GDK_BACKEND-<unset>}" "${WAYLAND_DISPLAY-}" "${DISPLAY-}" \
+          "${CHEMDRAFT_NATIVE_WAYLAND-<unset>}"
+        if [[ "$check_window" == true ]]; then
+          openbox > "$logs/openbox.log" 2>&1 &
+          wm_pid=$!
+          xdpyinfo > "$logs/xdpyinfo.log"
+          for _ in {1..50}; do
+            kill -0 "$wm_pid"
+            wm_property=$(xprop -root _NET_SUPPORTING_WM_CHECK)
+            [[ "$wm_property" == *'window id'* ]] && break
+            sleep 0.1
+          done
+          if [[ "$wm_property" != *'window id'* ]]; then
+            echo '::error::Openbox did not become ready'
+            exit 1
+          fi
+        fi
+        command=("$bundle")
+        if [[ "$package" == appimage ]]; then
+          command+=(--appimage-extract-and-run)
+        fi
+        report_egl_error() {
+          if grep -qE 'Could not create default EGL display|EGL_BAD_PARAMETER.*Aborting|Aborting.*EGL_BAD_PARAMETER' "$logs/chemdraft.log"; then
+            echo '::error::ChemDraft failed to initialize its EGL display. See chemdraft.log for details.'
+            return 0
+          fi
+          return 1
+        }
+        fail() {
+          cat "$logs/chemdraft.log"
+          report_egl_error || echo "::error::$1"
+          exit 1
+        }
+        # Trace execs and process exits so a child SIGABRT fails even without a systemd journal.
+        smoke_uid=$(id -u)
+        # AppImage may fork AppRun, and WebKit may start helpers in another process group.
+        belongs_to_launch() {
+          local owner=$1
+          while [[ "$owner" =~ ^[0-9]+$ ]] && (( owner > 1 )); do
+            [[ "$owner" == "$launcher_pid" ]] && return 0
+            owner=$(ps -o ppid= -p "$owner" 2>/dev/null) || break
+            owner=${owner//[[:space:]]/}
+          done
+          return 1
+        }
+        launched_pid() {
+          local candidate
+          for candidate in $(pgrep -u "$smoke_uid" "$@" || true); do
+            if belongs_to_launch "$candidate"; then
+              printf '%s\n' "$candidate"
+              return 0
+            fi
+          done
+          return 1
+        }
+        window_ready() {
+          [[ "$check_window" != true ]] && return 0
+          local window owner
+          for window in $(xdotool search --onlyvisible --name '^ChemDraft' 2>/dev/null || true); do
+            owner=$(xdotool getwindowpid "$window" 2>/dev/null) || continue
+            belongs_to_launch "$owner" && return 0
+          done
+          return 1
+        }
+        web_process_running() {
+          launched_pid -f '(^|/)WebKitWebProcess([[:space:]:]|$)' >/dev/null
+        }
+        setsid strace -f -e trace=execve -s 256 -o "$logs/process.log" "${command[@]}" \
+          > "$logs/chemdraft.log" 2>&1 &
+        launcher_pid=$!
+        for _ in {1..60}; do
+          kill -0 "$launcher_pid" 2>/dev/null || fail 'ChemDraft or its tracer exited during startup'
+          main_pid=$(launched_pid -x chemdraft || true)
+          if [[ -n "$main_pid" ]] && web_process_running && window_ready; then
+            break
+          fi
+          sleep 1
+        done
+        [[ -n "$main_pid" ]] || fail 'ChemDraft did not launch'
+        if ! app_environment=$(tr '\0' '\n' < "/proc/$main_pid/environ"); then
+          echo "::error::Could not read ChemDraft process environment at /proc/$main_pid/environ"
+          exit 1
+        fi
+        echo 'Display environment inherited by ChemDraft:'
+        grep -E '^(EGL_PLATFORM|GDK_BACKEND|WAYLAND_DISPLAY|DISPLAY|CHEMDRAFT_NATIVE_WAYLAND)=' <<< "$app_environment" || true
+        # /proc shows the environment at exec, so read the in-process defaults from the app log.
+        grep -E 'ChemDraft (GTK backend|AppImage EGL) default:' "$logs/chemdraft.log" || true
+        if [[ "$backend" == wayland ]]; then
+          if grep -Fxq 'GDK_BACKEND=x11' <<< "$app_environment" ||
+            grep -Fxq 'ChemDraft GTK backend default: GDK_BACKEND=x11' "$logs/chemdraft.log"; then
+            [[ "$native_wayland" != 1 ]] || fail 'Expected native Wayland, but ChemDraft has GDK_BACKEND=x11'
+          else
+            [[ "$native_wayland" == 1 ]] || fail 'Expected GDK_BACKEND=x11 in the Wayland session'
+          fi
+        fi
+        web_process_running || fail 'No WebKitWebProcess stayed alive during startup'
+        window_ready || fail 'No ChemDraft window appeared within 60 seconds'
+        for _ in {1..20}; do
+          sleep 1
+          for pid in "$launcher_pid" "$main_pid" "$display_pid"; do
+            kill -0 "$pid" 2>/dev/null \
+              || fail 'ChemDraft, its tracer, or the display exited during the 20-second smoke test'
+          done
+        done
+        if report_egl_error; then
+          cat "$logs/chemdraft.log"
+          exit 1
+        fi
+        if awk '
+          /execve\("[^"]*\/WebKitWebProcess"/ { webkit[$1] = 1 }
+          ($1 in webkit) && /\+\+\+ (killed by SIG(ABRT|BUS|FPE|ILL|KILL|SEGV|SYS|TRAP)|exited with [1-9])/ {
+            print
+            crashed = 1
+          }
+          END { exit !crashed }
+        ' "$logs/process.log" || grep -Ei 'web[ -]*process.*(crash|abort|segfault|terminated unexpectedly)|panicked at' "$logs/chemdraft.log"; then
+          fail 'A WebKit subprocess crashed or ChemDraft panicked'
+        fi
+        web_process_running || fail 'No WebKitWebProcess was alive at the end of the smoke test'
+        window_ready || fail 'No ChemDraft window was visible at the end of the smoke test'
+        echo 'ChemDraft started WebKitWebProcess and stayed alive for 20 seconds.'
+        SMOKE

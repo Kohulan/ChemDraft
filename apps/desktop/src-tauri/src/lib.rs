@@ -7761,6 +7761,7 @@ const EDIT_HISTORY_MENU_ITEMS: [EditHistoryMenuItem; 2] = [
 ];
 
 /// Edit ▸ Cut / Copy / Paste, in menu order, as (command id, label).
+#[cfg(target_os = "linux")]
 const CLIPBOARD_EDIT_MENU_ITEMS: [(&str, &str); 3] = [
     ("clipboard.cut", "Cut"),
     ("clipboard.copy", "Copy"),
@@ -7783,9 +7784,8 @@ fn clipboard_edit_menu_item<R: Runtime>(
 
 /// muda's Linux predefined Cut/Copy/Paste only fake a Ctrl+X/C/V key press through libxdo: nothing
 /// on Wayland, and on X11 the press can land before the menu releases its grab, so the click did
-/// nothing. Route them to the editor's own commands instead. No accelerator: a GTK menu
-/// accelerator wins over the focused widget, so Ctrl+C in a text field would copy the drawing.
-/// The keys keep reaching the webview, which handles them as on the other platforms.
+/// nothing. Invoke WebKit's editing commands directly. With no GTK accelerator, the keys still
+/// reach the webview and raise the same DOM clipboard events as the menu commands.
 #[cfg(target_os = "linux")]
 fn clipboard_edit_menu_item<R: Runtime>(
     app: &tauri::AppHandle<R>,
@@ -7824,14 +7824,32 @@ fn is_edit_history_command(command_id: &str) -> bool {
         .any(|item| item.command_id == command_id)
 }
 
+#[cfg(target_os = "linux")]
+fn native_clipboard_edit_command(command_id: &str) -> Option<&'static std::ffi::CStr> {
+    match command_id {
+        "clipboard.cut" => Some(c"Cut"),
+        "clipboard.copy" => Some(c"Copy"),
+        "clipboard.paste" => Some(c"Paste"),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn native_clipboard_edit_command(_command_id: &str) -> Option<&'static std::ffi::CStr> {
+    None
+}
+
 /// Which window a routed menu command is delivered to. Everything goes to the main document window,
-/// except Select All and Undo / Redo, which follow the key window. As with AppKit's
-/// predefined items, ⌘Z in a palette's text field undoes that text. The secondary window forwards
+/// except text editing actions, which follow the key window. The secondary window forwards
 /// history commands to the main window itself
 /// when it has no text field focused (`installSecondaryWindowEditHistory` in the webview).
 fn menu_command_target_label<'a>(command_id: &str, focused_label: Option<&'a str>) -> &'a str {
     match focused_label {
-        Some(label) if is_edit_history_command(command_id) || command_id == "edit.selectAll" => {
+        Some(label)
+            if is_edit_history_command(command_id)
+                || command_id == "edit.selectAll"
+                || native_clipboard_edit_command(command_id).is_some() =>
+        {
             label
         }
         _ => MAIN_WINDOW_LABEL,
@@ -7848,10 +7866,17 @@ fn emit_menu_command<R: Runtime>(
         .find(|(_, window)| window.is_focused().unwrap_or(false))
         .map(|(label, _)| label);
     let target_label = menu_command_target_label(command_id, focused_label.as_deref());
+    if target_label == MAIN_WINDOW_LABEL && panel_window::palette_blocks_menu(true, command_id) {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(command) = native_clipboard_edit_command(command_id) {
+        let target = app
+            .get_webview_window(target_label)
+            .ok_or_else(|| format!("Window {target_label} is not available."))?;
+        return linux_clipboard::execute_editing_command(&target, command);
+    }
     if target_label == MAIN_WINDOW_LABEL {
-        if panel_window::palette_blocks_menu(true, command_id) {
-            return Ok(());
-        }
         return emit_command_to_main(app, command_id);
     }
     let target = app
@@ -9452,10 +9477,7 @@ fn toolset_toggle_command_id(toolset_id: &str) -> String {
 
 fn is_routed_menu_command(command_id: &str) -> bool {
     MENU_COMMAND_IDS.contains(&command_id)
-        || (cfg!(target_os = "linux")
-            && CLIPBOARD_EDIT_MENU_ITEMS
-                .iter()
-                .any(|(id, _)| *id == command_id))
+        || native_clipboard_edit_command(command_id).is_some()
         || command_id.starts_with(TOOLSET_TOGGLE_PREFIX)
         || command_id.starts_with(PLUGIN_COMMAND_PREFIX)
 }
@@ -12247,9 +12269,18 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn clipboard_edit_menu_commands_are_routed_on_linux() {
-        for command in ["clipboard.cut", "clipboard.copy", "clipboard.paste"] {
+        for (command, expected) in [
+            ("clipboard.cut", c"Cut"),
+            ("clipboard.copy", c"Copy"),
+            ("clipboard.paste", c"Paste"),
+        ] {
             assert!(is_routed_menu_command(command), "{command}");
+            assert_eq!(native_clipboard_edit_command(command), Some(expected));
             assert_eq!(menu_command_target_label(command, None), MAIN_WINDOW_LABEL);
+            assert_eq!(
+                menu_command_target_label(command, Some("dialog-main-pageSize-12")),
+                "dialog-main-pageSize-12"
+            );
         }
     }
 

@@ -9,7 +9,7 @@ import {
   CHEMDRAFT_SELECTION_CLIPBOARD_TYPE, createPhase4Document, createSelectionClipboardPayload,
   insertNativeSingleBondMolecule, insertNativeTextObject, serializeSelectionClipboardPayload
 } from "./documentWorkflow";
-import { writeClipboardItems } from "./clipboard";
+import { readClipboardPayload, writeClipboardItems } from "./clipboard";
 import { selectionClipboardImageItems } from "./selectionClipboard";
 import { DOM_COMMAND_EVENT } from "./window-manager";
 import { MemoryStorage } from "./testSupport/memoryStorage";
@@ -19,14 +19,14 @@ vi.mock("./window-manager", async original => ({
   ...await original<typeof import("./window-manager")>(), isDesktopRuntime: () => runtime.desktop
 }));
 vi.mock("./clipboard", async original => ({
-  ...await original<typeof import("./clipboard")>(), writeClipboardItems: vi.fn()
+  ...await original<typeof import("./clipboard")>(), readClipboardPayload: vi.fn(), writeClipboardItems: vi.fn()
 }));
 vi.mock("./selectionClipboard", () => ({ selectionClipboardImageItems: vi.fn() }));
 vi.mock("./rdkitWasmLoader", () => ({ registerRdkitWasmLoader: vi.fn() }));
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-describe.each(["macos", "windows"] as const)("MainWindow selection copy on %s", platform => {
+describe.each(["macos", "windows", "linux"] as const)("MainWindow selection copy on %s", platform => {
   let container: HTMLDivElement;
   let root: Root;
   const source = () => insertNativeSingleBondMolecule(createPhase4Document(), { x: 300, y: 300 });
@@ -35,6 +35,7 @@ describe.each(["macos", "windows"] as const)("MainWindow selection copy on %s", 
     window.history.replaceState(null, "", "/?agentBridge=1");
     vi.stubGlobal("localStorage", new MemoryStorage());
     vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
+    vi.mocked(readClipboardPayload).mockReset().mockResolvedValue({ types: [], textItems: [] });
     vi.mocked(selectionClipboardImageItems).mockReset().mockImplementation(async (_source, payload) => ({
       items: [{ type: CHEMDRAFT_SELECTION_CLIPBOARD_TYPE, text: serializeSelectionClipboardPayload(payload), required: true },
         { type: "image/png", bytes: Uint8Array.from([137, 80]), required: true }], warnings: []
@@ -58,6 +59,41 @@ describe.each(["macos", "windows"] as const)("MainWindow selection copy on %s", 
   async function command(commandId: string) {
     await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId } })); });
   }
+  it.each(["input", "textarea", "contenteditable"])("leaves native cut, copy, and paste to a focused %s", async kind => {
+    const drawing = await mount();
+    const field = document.createElement(kind === "contenteditable" ? "div" : kind);
+    if (kind === "contenteditable") field.setAttribute("contenteditable", "true");
+    container.append(field);
+    field.focus();
+    expect(document.activeElement).toBe(field);
+    await act(async () => {
+      // Desktop menu actions go through the WebView's clipboard event path.
+      for (const operation of ["cut", "copy", "paste"]) {
+        for (const type of [`before${operation}`, operation]) {
+          expect(field.dispatchEvent(new Event(type, { bubbles: true, cancelable: true }))).toBe(true);
+        }
+      }
+    });
+    expect(readClipboardPayload).not.toHaveBeenCalled();
+    expect(writeClipboardItems).not.toHaveBeenCalled();
+    expect(window.__CHEMDRAFT_AGENT__!.snapshot().document.pages[0].objects).toEqual(drawing.pages[0].objects);
+  });
+
+  it("preserves canvas clipboard handling for native menu actions", async () => {
+    await mount();
+    for (const operation of ["paste", "copy", "cut"]) {
+      await act(async () => {
+        const before = new Event(`before${operation}`, { bubbles: true, cancelable: true });
+        expect(document.body.dispatchEvent(before)).toBe(platform !== "linux");
+        const event = new Event(operation, { bubbles: true, cancelable: true });
+        expect(document.body.dispatchEvent(event)).toBe(false);
+      });
+    }
+    expect(readClipboardPayload).toHaveBeenCalledOnce();
+    expect(writeClipboardItems).toHaveBeenCalledTimes(2);
+    expect(window.__CHEMDRAFT_AGENT__!.snapshot().document.pages[0].objects).toEqual([]);
+  });
+
   it.each(["event", "command"])("%s copy sends the prepared image and JSON in one transaction", async path => {
     const drawing = await mount();
     if (path === "event") {

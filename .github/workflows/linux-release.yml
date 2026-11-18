@@ -1,8 +1,8 @@
 name: Linux release
 
 # Builds the Linux packages for a release from the same tag as the macOS DMG and the Windows
-# installer: a .deb (Ubuntu, Linux Mint, Debian, Pop!_OS, elementary OS, …) and an AppImage (any
-# glibc-based distribution). Dispatch it with the same inputs as windows-release.yml:
+# installer: a .deb (Ubuntu, Linux Mint, Debian, Pop!_OS, elementary OS, …) and an AppImage.
+# Dispatch it with the same inputs as windows-release.yml:
 #
 #   gh workflow run linux-release.yml --ref v1.2.0 -f ref=v1.2.0 -f upload_to_release=v1.2.0
 #
@@ -11,6 +11,12 @@ name: Linux release
 # and Debian 12+. See docs/releasing/linux.md.
 
 on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Public repository tag or full commit SHA to build without publishing
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       ref:
@@ -47,17 +53,22 @@ jobs:
       DEBIAN_FRONTEND: noninteractive
       NEEDRESTART_MODE: a
     outputs:
+      commit: ${{ steps.source.outputs.commit }}
       version: ${{ steps.bundle.outputs.version }}
+      deb: ${{ steps.bundle.outputs.deb-name }}
+      appimage: ${{ steps.bundle.outputs.appimage-name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Validate release source
+        id: source
         env:
           BUILD_REF: ${{ inputs.ref }}
+          WORKFLOW_SHA: ${{ github.sha }}
           RELEASE_TAG: ${{ inputs.upload_to_release }}
         run: |
           set -euo pipefail
@@ -69,9 +80,11 @@ jobs:
             [ "$tag_sha" = "$sha" ] || { echo '::error::ref must resolve to a repository tag.'; exit 1; }
           fi
           version=$(node -p "require('./apps/desktop/src-tauri/tauri.conf.json').version")
-          if [ -n "$RELEASE_TAG" ] && [ "$RELEASE_TAG" != "v$version" ]; then
-            echo "::error::upload_to_release must be v$version (the app version)."; exit 1
+          if [ -n "$RELEASE_TAG" ]; then
+            [ "$RELEASE_TAG" = "v$version" ] || { echo "::error::upload_to_release must be v$version (the app version)."; exit 1; }
+            [ "$sha" = "$WORKFLOW_SHA" ] || { echo '::error::Build ref must match the workflow commit. Dispatch with --ref <release-tag>.'; exit 1; }
           fi
+          echo "commit=$sha" >> "$GITHUB_OUTPUT"
           echo "Release source: $sha (version $version)"
 
       # The Tauri Linux build set: WebKitGTK 4.1 for the webview, librsvg for icons, patchelf and
@@ -80,23 +93,23 @@ jobs:
         run: |
           sudo apt-get update
           sudo -E apt-get install -y --no-install-recommends \
-            build-essential pkg-config file patchelf xdg-utils \
+            build-essential pkg-config file patchelf squashfs-tools xdg-utils \
             libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
             libayatana-appindicator3-dev libsoup-3.0-dev libssl-dev libxdo-dev
 
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       # rust-toolchain.toml is the single source of truth, as in the CI jobs.
       - run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: apps/desktop/src-tauri
           shared-key: linux-release-${{ matrix.arch }}
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
         with:
           distribution: temurin
           java-version: '21' # jlink --compress=zip-9 requires JDK 21+.
@@ -119,7 +132,7 @@ jobs:
           export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/apps/desktop/src-tauri/resources/opsin/jre/lib/server"
           pnpm --filter @chemdraft/desktop build --bundles deb,appimage
 
-      - name: Verify stable bundle identity and stage packages
+      - name: Verify stable bundle identity
         id: bundle
         env:
           ARCH: ${{ matrix.arch }}
@@ -149,37 +162,72 @@ jobs:
           for path in usr/bin/chemdraft usr/bin/avogadro3d-sidecar usr/lib/ChemDraft/resources/opsin/jre/bin/java $licences; do
             grep -qxF "$path" <<<"$contents" || { echo "::error::$deb lacks $path"; exit 1; }
           done
-          mkdir -p release-assets
-          cp "$deb" "$appimage" release-assets/
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "deb=$(basename "$deb")" >> "$GITHUB_OUTPUT"
+          echo "deb=$deb" >> "$GITHUB_OUTPUT"
+          echo "appimage=$appimage" >> "$GITHUB_OUTPUT"
+          echo "deb-name=$(basename "$deb")" >> "$GITHUB_OUTPUT"
+          echo "appimage-name=$(basename "$appimage")" >> "$GITHUB_OUTPUT"
 
-      # Install the .deb like a user would and keep it running on a virtual display. This catches a
-      # missing library dependency and a crash during start-up (window creation, menus, palettes).
-      - name: Smoke test the installed .deb
+      - name: Repack AppImage with host Wayland and compiler runtimes
         env:
-          DEB: release-assets/${{ steps.bundle.outputs.deb }}
+          APPIMAGE: ${{ steps.bundle.outputs.appimage }}
         run: |
           set -euo pipefail
-          sudo -E apt-get install -y --no-install-recommends xvfb xdotool openbox "./$DEB"
-          export DISPLAY=:99
-          Xvfb "$DISPLAY" -screen 0 1600x1000x24 >/dev/null 2>&1 &
-          sleep 1
-          openbox >/dev/null 2>&1 &
-          WEBKIT_DISABLE_DMABUF_RENDERER=1 chemdraft > chemdraft-smoke.log 2>&1 &
-          pid=$!
-          for _ in $(seq 1 60); do
-            kill -0 "$pid" 2>/dev/null || { cat chemdraft-smoke.log; echo '::error::ChemDraft exited during start-up.'; exit 1; }
-            xdotool search --onlyvisible --name '^ChemDraft' >/dev/null 2>&1 && break
-            sleep 1
-          done
-          xdotool search --onlyvisible --name '^ChemDraft' >/dev/null || { cat chemdraft-smoke.log; echo '::error::No ChemDraft window appeared within 60 s.'; exit 1; }
-          # Stay up a while: palettes and the tooltip window are created after the document window.
-          sleep 20
-          kill -0 "$pid" 2>/dev/null || { cat chemdraft-smoke.log; echo '::error::ChemDraft crashed after start-up.'; exit 1; }
-          kill "$pid"
-          grep -n 'panicked' chemdraft-smoke.log && { echo '::error::ChemDraft panicked.'; exit 1; } || true
-          echo 'Smoke test passed: the installed .deb started and stayed up.'
+          image="$GITHUB_WORKSPACE/$APPIMAGE"
+          work=$(mktemp -d)
+          trap 'rm -rf -- "$work"' EXIT
+          cd "$work"
+
+          # A type 2 AppImage is its ELF runtime followed by SquashFS. Keep the runtime Tauri
+          # supplied and replace the filesystem after linuxdeploy completes, without FUSE.
+          offset=$("$image" --appimage-offset)
+          [[ "$offset" =~ ^[1-9][0-9]*$ ]]
+          "$image" --appimage-extract > original-extraction.log
+          test -x squashfs-root/AppRun
+          echo 'Graphics and compiler libraries in the original AppImage:'
+          find squashfs-root \( -name 'libwayland-*' -o -name 'libEGL*.so*' -o -name 'libgbm.so*' \
+            -o -name 'libstdc++.so*' -o -name 'libgcc_s.so*' \) -print
+          find squashfs-root \( -name 'libwayland-*' -o -name 'libstdc++.so*' \
+            -o -name 'libgcc_s.so*' \) -delete
+          # The AppImage runtime reads only zlib or zstd.
+          mksquashfs squashfs-root app.squashfs -noappend -all-root -comp zstd -no-progress
+          head -c "$offset" "$image" > repacked.AppImage
+          cat app.squashfs >> repacked.AppImage
+          chmod +x repacked.AppImage
+
+          mkdir verify
+          cd verify
+          ../repacked.AppImage --appimage-extract > repacked-extraction.log
+          test -x squashfs-root/AppRun
+          echo 'Shared libraries under usr/lib in the repacked AppImage:'
+          find squashfs-root/usr/lib \( -type f -o -type l \) \( -name '*.so' -o -name '*.so.*' \) -print | LC_ALL=C sort
+          leftovers=$(find squashfs-root \( -name 'libwayland-*' -o -name 'libstdc++.so*' \
+            -o -name 'libgcc_s.so*' \) -print)
+          if [[ -n "$leftovers" ]]; then
+            printf '::error::AppImage still contains host libraries\n%s\n' "$leftovers"
+            exit 1
+          fi
+          graphics=$(find squashfs-root \( -name 'libEGL*' -o -name 'libGL.so*' -o -name 'libGLX*' \
+            -o -name 'libOpenGL.so*' -o -name 'libGLESv1_CM.so*' -o -name 'libGLESv2.so*' -o -name 'libGLU.so*' \
+            -o -name 'libGLdispatch*' -o -name 'libgbm*' -o -name 'libdrm*' -o -name 'libglapi*' \
+            -o \( -name dri \( -type d -o -type l \) \) -o -name '*_dri.so' -o -name 'libvulkan*' \) \
+            -print | LC_ALL=C sort)
+          if [[ -n "$graphics" ]]; then
+            printf '::error::AppImage bundles graphics libraries or drivers that must come from the host\n%s\n' "$graphics"
+            exit 1
+          fi
+          mv ../repacked.AppImage "$image"
+
+      - name: Record and stage the final packages
+        env:
+          DEB: ${{ steps.bundle.outputs.deb }}
+          APPIMAGE: ${{ steps.bundle.outputs.appimage }}
+        run: |
+          set -euo pipefail
+          node tools/release/record-build.mjs --artifact "$DEB" --target x86_64-unknown-linux-gnu
+          node tools/release/record-build.mjs --artifact "$APPIMAGE" --target x86_64-unknown-linux-gnu
+          mkdir -p release-assets
+          cp "$DEB" "$DEB.build.json" "$APPIMAGE" "$APPIMAGE.build.json" release-assets/
 
       - name: Print SHA-256 and sizes and write checksums
         run: |
@@ -189,20 +237,106 @@ jobs:
           sha256sum -- *.deb *.AppImage | tee SHA256SUMS-linux.txt
 
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-release-${{ matrix.arch }}
           path: release-assets/*
           if-no-files-found: error
 
-  upload:
+  smoke:
     needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      NEEDRESTART_MODE: a
+    steps:
+      # Use the action that belongs to the workflow, even when building an older source ref.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: linux-release-amd64
+          path: release-assets
+
+      - name: Verify the packages and install smoke test tools
+        id: prepare
+        env:
+          APPIMAGE_PACKAGE: release-assets/${{ needs.build.outputs.appimage }}
+        run: |
+          set -euo pipefail
+          mkdir -p smoke-logs
+          exec > >(tee smoke-logs/setup.log) 2>&1
+          (cd release-assets && sha256sum --check SHA256SUMS-linux.txt)
+          sudo apt-get update
+          sudo -E apt-get install -y --no-install-recommends \
+            dbus-bin dbus-daemon gdb openbox strace x11-utils xdotool xvfb \
+            libgtk-3-bin libxdo3 libegl1 libegl-mesa0 libgl1 libgl1-mesa-dri \
+            libwayland-client0 libwayland-egl1 libwayland-cursor0 libwayland-server0
+          chmod +x "$APPIMAGE_PACKAGE"
+
+      - name: Smoke test the repacked AppImage
+        uses: ./.github/workflows/linux-package-smoke
+        with:
+          bundle: release-assets/${{ needs.build.outputs.appimage }}
+          package: appimage
+          backend: x11
+          logs: ${{ github.workspace }}/smoke-logs/appimage
+          check-window: 'true'
+          diagnostics: 'true'
+
+      - name: Install the .deb
+        id: install-deb
+        # Still test the .deb if the AppImage fails. Test the AppImage before apt adds .deb dependencies.
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        env:
+          DEB: release-assets/${{ needs.build.outputs.deb }}
+        run: |
+          set -euo pipefail
+          sudo -E apt-get install -y --no-install-recommends "./$DEB" 2>&1 | tee smoke-logs/install-deb.log
+
+      - name: Smoke test the installed .deb
+        if: ${{ !cancelled() && steps.install-deb.outcome == 'success' }}
+        uses: ./.github/workflows/linux-package-smoke
+        with:
+          bundle: /usr/bin/chemdraft
+          package: deb
+          backend: x11
+          logs: ${{ github.workspace }}/smoke-logs/deb
+          check-window: 'true'
+          diagnostics: 'true'
+
+      - name: Preserve Linux smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-smoke-amd64-${{ matrix.runner }}
+          path: smoke-logs/
+          if-no-files-found: ignore
+
+  upload:
+    needs: [build, smoke]
     if: github.repository == 'jgassens/ChemDraft' && !github.event.repository.fork && inputs.upload_to_release != ''
     runs-on: ubuntu-latest
+    concurrency:
+      group: draft-release-upload-${{ inputs.upload_to_release }}
+      cancel-in-progress: false
     permissions:
-      contents: write # Only this job can upload release assets; no source code executes here.
+      contents: write # Upload and validate draft assets here; the build stays read-only.
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.build.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: linux-release-*
           merge-multiple: true
@@ -213,9 +347,26 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.upload_to_release }}
           VERSION: ${{ needs.build.outputs.version }}
+          BUILD_COMMIT: ${{ needs.build.outputs.commit }}
         run: |
           set -euo pipefail
           [ "$RELEASE_TAG" = "v$VERSION" ] || { echo '::error::Release tag must match the package version.'; exit 1; }
-          draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft) || { echo '::error::Target release must already exist.'; exit 1; }
-          [ "$draft" = true ] || { echo '::error::Refusing to upload to a published release.'; exit 1; }
+          draft_tag=$(gh release view "$RELEASE_TAG" --json isDraft,tagName --jq 'select(.isDraft).tagName') || { echo '::error::Target release must already exist.'; exit 1; }
+          [ "$draft_tag" = "$RELEASE_TAG" ] || { echo '::error::Refusing to upload outside the requested draft.'; exit 1; }
+          # Fetch immediately before upload and peel annotated tags.
+          git fetch --no-tags origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          destination_commit=$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")
+          [ "$destination_commit" = "$BUILD_COMMIT" ] || { echo '::error::Destination release tag does not match the built commit.'; exit 1; }
           gh release upload "$RELEASE_TAG" release-assets/* --clobber
+
+      - name: Check attached builds and refresh combined checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.upload_to_release }}
+          BUILD_COMMIT: ${{ needs.build.outputs.commit }}
+        run: |
+          set -euo pipefail
+          node tools/release/check-release-assets.mjs --tag "$RELEASE_TAG" --commit "$BUILD_COMMIT" \
+            --allow-incomplete --skip-dmg-provenance --write-checksums "$RUNNER_TEMP/SHA256SUMS.txt"
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/SHA256SUMS.txt" --clobber

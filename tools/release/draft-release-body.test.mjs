@@ -5,13 +5,13 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { draftReleaseBody } from "./draft-release-body.mjs";
-import { BUILD_TARGETS } from "./record-build.mjs";
-import { arm, commit, fakeReleaseRunner, installer, intel, releaseFixture, updaterPublicKey, version } from "./release-test-fixtures.mjs";
+import { releaseBuildFiles } from "./release-assets.mjs";
+import { appImage, arm, commit, deb, fakeReleaseRunner, installer, intel, releaseFixture, updaterPublicKey, version } from "./release-test-fixtures.mjs";
 
 const feed = (name) => `<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel><item><sparkle:version>${version}</sparkle:version><enclosure url="https://example.com/${name}"/></item></channel></rss>`;
 
-function fixture(t) {
-  const args = releaseFixture(t);
+function fixture(t, options) {
+  const args = releaseFixture(t, options);
   mkdirSync(join(args.rootDir, "release-notes", "macos"), { recursive: true });
   mkdirSync(join(args.rootDir, "release-notes", "macos-intel"), { recursive: true });
   writeFileSync(join(args.assets, "appcast.xml"), feed(arm));
@@ -24,8 +24,8 @@ function fixture(t) {
 
 const draft = (args, options = {}) => draftReleaseBody(args, { run: fakeReleaseRunner(), updaterPublicKey, ...options });
 
-test("complete release produces ordered sections with explicit gaps or explicit no-gaps", (t) => {
-  const args = fixture(t);
+test("three-build release produces ordered sections with explicit gaps or explicit no-gaps", (t) => {
+  const args = fixture(t, { withLinux: false });
   const body = draft({ ...args, noGaps: false, gaps: ["macos-intel:Feature A: reason", "windows:Feature B: reason", "macos-intel:Feature C: reason"] });
   const sections = body.split(/^## /m);
   assert.equal(sections.length, 4);
@@ -39,6 +39,30 @@ test("complete release produces ordered sections with explicit gaps or explicit 
   assert.match(draft(args), /Platform differences: None\./);
 });
 
+test("five-build release includes a Linux beta section and accepts Linux gaps", (t) => {
+  const args = fixture(t);
+  assert.match(draft(args), /^## Linux\n\nLinux support is in beta\./m);
+  assert.match(draft({ ...args, noGaps: false, gaps: ["linux:Feature A: reason"] }),
+    /^## Linux\n\nLinux support is in beta\.\n\nNot in this build: Feature A: reason\n\nPlatform differences: See/m);
+});
+
+test("requesting a Linux section without packages fails", (t) => {
+  const args = fixture(t, { withLinux: false });
+  assert.doesNotMatch(draft(args), /^## Linux$/m);
+  assert.throws(() => draft({ ...args, includeLinux: true }), /--include-linux requires both verified Linux packages/);
+});
+
+test("requesting a Linux section succeeds with the complete verified set", (t) => {
+  assert.match(draft({ ...fixture(t), includeLinux: true }), /^## Linux\n\nLinux support is in beta\./m);
+});
+
+test("requesting a Linux section still requires a complete set when packages are present", (t) => {
+  const args = fixture(t);
+  unlinkSync(join(args.assets, appImage));
+  unlinkSync(join(args.assets, `${appImage}.build.json`));
+  assert.throws(() => draft({ ...args, includeLinux: true }), /amd64\.AppImage: missing release file/);
+});
+
 test("neither gap choice is refused, including by the CLI", (t) => {
   const args = fixture(t);
   assert.throws(() => draft({ ...args, noGaps: false }), /--gap.*--no-gaps/);
@@ -48,7 +72,8 @@ test("neither gap choice is refused, including by the CLI", (t) => {
   assert.match(result.stderr, /--gap.*--no-gaps/);
 });
 
-for (const name of [arm, intel, installer, `${installer}.sig`, "latest.json", "appcast.xml", "appcast-intel.xml", ...[arm, intel, installer].map((name) => `${name}.build.json`)]) {
+const buildNames = [arm, intel, installer, deb, appImage];
+for (const name of [...buildNames, `${installer}.sig`, "latest.json", "appcast.xml", "appcast-intel.xml", ...buildNames.map((name) => `${name}.build.json`)]) {
   test(`missing ${name} is named`, (t) => {
     const args = fixture(t);
     unlinkSync(join(args.assets, name));
@@ -82,7 +107,9 @@ test("missing version and notes are named", (t) => {
 });
 
 test("invalid gap is rejected", (t) => {
-  assert.throws(() => draft({ ...fixture(t), noGaps: false, gaps: ["linux:feature"] }), /Invalid gap/);
+  const args = { ...fixture(t, { withLinux: false }), noGaps: false };
+  assert.throws(() => draft({ ...args, gaps: ["linux:feature"] }), /Invalid gap/);
+  assert.throws(() => draft({ ...fixture(t), noGaps: false, includeLinux: true, gaps: ["other:feature"] }), /Invalid gap/);
 });
 
 for (const [field, value, message] of [
@@ -101,10 +128,10 @@ for (const [field, value, message] of [
   });
 }
 
-for (const [target, suffix] of Object.entries(BUILD_TARGETS)) {
-  test(`differing ${target} commit and bytes are refused`, (t) => {
+for (const { name } of releaseBuildFiles(version)) {
+  test(`differing ${name} commit and bytes are refused`, (t) => {
     const args = fixture(t);
-    const file = join(args.assets, `ChemDraft_${version}_${suffix}`);
+    const file = join(args.assets, name);
     writeFileSync(file, "tampered bytes");
     assert.throws(() => draft(args), /SHA-256 mismatch/);
     const recordFile = `${file}.build.json`;
