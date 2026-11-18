@@ -100,10 +100,9 @@ export function closeFlyoutOpening(state: OpeningState, target: ToolsetPopoverOp
 
 export function closeFlyoutMenu(state: OpeningState, notice: ToolsetFlyoutClosedNotice): OpeningState {
   const current = currentFlyoutOpening(state, notice.toolsetId);
-  // Old menu-specific notices without an exact identity can close the matching live menu.
-  const target = !notice.exactOpening && notice.generation === undefined &&
-    current?.openedAt === notice.openedAt && current.flyoutId === notice.flyoutId ? current : notice;
-  return closeFlyoutOpening(state, target);
+  // A legacy notice cannot identify a generation, even when the timestamp and menu match.
+  if (!notice.exactOpening && notice.generation === undefined && current?.generation !== undefined) return state;
+  return closeFlyoutOpening(state, notice);
 }
 
 export function dismissFlyoutOpenings(state: OpeningState, payload?: ToolsetPopoverDismissPayload): OpeningState {

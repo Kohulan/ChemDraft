@@ -69,9 +69,10 @@ export function installPopoverEscapeRouting(editorOpen: () => boolean = () => fa
       }
       return;
     }
-    const at = payload?.requestedAt ?? toolsetPopoverTimestamp();
-    dismissedAt = Math.max(dismissedAt, at);
-    for (const opening of opens.values()) if (opening.openedAt! <= at) retire(opening);
+    // A dismissal without a press timestamp only applies to openings already known here.
+    const at = payload?.requestedAt;
+    if (at !== undefined) dismissedAt = Math.max(dismissedAt, at);
+    for (const opening of opens.values()) if (at === undefined || opening.openedAt! <= at) retire(opening);
   }).then(retain).catch(() => undefined);
 
   const ownedElsewhere = (event: KeyboardEvent, target: EventTarget | null, caption?: HTMLTextAreaElement) => {
