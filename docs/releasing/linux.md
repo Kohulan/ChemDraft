@@ -116,7 +116,9 @@ repository on GitHub Pages, or a Flathub listing.
 
 - On Wayland, the `.deb` defaults to XWayland so ChemDraft can position floating toolbars and
   dialogs, matching the AppImage launcher. Set `CHEMDRAFT_NATIVE_WAYLAND=1` to skip the app's
-  XWayland default, and use `GDK_BACKEND` to supply an explicit backend.
+  XWayland default for the `.deb`, and use `GDK_BACKEND` to supply an explicit backend. The AppImage
+  always uses XWayland because linuxdeploy-plugin-gtk's AppRun hook exports `GDK_BACKEND=x11` before
+  ChemDraft starts.
 - Webview: WebKitGTK, origin `tauri://localhost` (as on macOS). Before startup on Linux,
   ChemDraft defaults `WEBKIT_DISABLE_DMABUF_RENDERER` to `1` to avoid Wayland graphics
   problems. An explicit value, including `0`, takes precedence.

@@ -73,11 +73,9 @@ jobs:
             package: deb
             backend: wayland
             native_wayland: '1'
-          - distro: debian
-            image: debian:sid
-            package: appimage
-            backend: wayland
-            native_wayland: '1'
+          # The AppImage cannot run natively on Wayland: linuxdeploy-plugin-gtk's AppRun hook
+          # always exports GDK_BACKEND=x11 before ChemDraft starts, so it always uses XWayland.
+          # Native Wayland is covered by the .deb job.
     container:
       image: ${{ matrix.image }}
       # strace needs ptrace and glycin's bubblewrap needs user namespaces.
