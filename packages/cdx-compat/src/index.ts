@@ -3150,9 +3150,22 @@ function buildMetadataObjectTags(values: {
 
 function importVisibleCdxmlFromTree(tree: OrderedXmlTree, sourceFormat: "CDXML" | "CDX"): { document?: ChemDraftDocument; warnings: CompatibilityConversionWarning[] } {
   const warnings: CompatibilityConversionWarning[] = [];
-  const invalidLongTags = findElements(tree, "objecttag").filter(tag => tag.attributes.TagType === "Long"
-    && tag.attributes.Value !== undefined && !isValidLongTagValue(tag.attributes.Value));
-  for (const tag of invalidLongTags) {
+  const invalidLongTags: { tag: XmlElementView; pageIndex: number | undefined }[] = [];
+  let nextPageIndex = 0;
+  const collectInvalidLongTags = (nodes: OrderedXmlTree, ownerPageIndex?: number): void => {
+    for (const node of nodes) {
+      const element = elementView(node);
+      if (!element) continue;
+      const pageIndex = element.name === "page" ? nextPageIndex++ : ownerPageIndex;
+      if (element.name === "objecttag" && element.attributes.TagType === "Long"
+        && element.attributes.Value !== undefined && !isValidLongTagValue(element.attributes.Value)) {
+        invalidLongTags.push({ tag: element, pageIndex });
+      }
+      collectInvalidLongTags(element.children, pageIndex);
+    }
+  };
+  collectInvalidLongTags(tree);
+  for (const { tag } of invalidLongTags) {
     const { TagType, Value, Name, id } = tag.attributes;
     if (TagType === "Long" && Value !== undefined && !isValidLongTagValue(Value)) {
       warnings.push({ code: "cdxml.invalid_long_tag", sourceObjectId: id,
@@ -3181,14 +3194,14 @@ function importVisibleCdxmlFromTree(tree: OrderedXmlTree, sourceFormat: "CDXML" 
         importPageObjects(pageElement, pageIndex, warnings, colorTable, fonts, curveLineDefaults, sourceFormat),
         importTransform
       );
-      if (pageIndex === 0) {
-        // Keep root-level and nested tags even when their parent has no native compatibility slot.
-        invalidLongTags.forEach((tag, index) => {
+      // Preserve page-local tags on their owning page; document-level tags use the first page.
+      invalidLongTags.forEach(({ tag, pageIndex: ownerPageIndex }, index) => {
+        if ((ownerPageIndex ?? 0) === pageIndex) {
           const preserved = importUnknownCompatibilityObject(tag, pageIndex, index, sourceFormat);
           preserved.id = `cdxml_invalid_long_tag_${index + 1}`;
           importedPage.objects.push(preserved);
-        });
-      }
+        }
+      });
       const page: DocumentPage = {
         ...pageTemplate,
         id: `page_${String(pageIndex + 1).padStart(3, "0")}`,
