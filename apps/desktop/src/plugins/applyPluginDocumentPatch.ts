@@ -38,7 +38,7 @@ export function applyPluginDocumentPatch(
 ): AppliedPluginDocumentPatch {
   const now = options.now ?? new Date();
   proposed = rebasePluginPatch(document, proposed, false);
-  let patched = applyPatch(document, proposed.patch, { ...options, now });
+  let patched = applyPatch(document, proposed.patch, { preserveRepeatUnitBrackets: true, deferGroupCleanup: true, ...options, now });
   const inserted = new Set(writePatchOps(proposed.patch).flatMap(op => op.op === "addObject" ? [op.object.id] :
     op.op === "addAnnotation" ? [op.annotation.id] : []));
   const existingIds = new Set(document.pages.flatMap(page => page.objects.map(object => object.id)));
@@ -239,7 +239,9 @@ export function applyAcceptedPluginProposal(
   proposed: NormalizedProposedDocumentPatch,
   options: ApplyPatchOptions = {}
 ): AppliedPluginDocumentPatch {
-  return applyPluginDocumentPatch(document, rebaseProposedInsertion(document, proposed), options);
+  return applyPluginDocumentPatch(document, rebaseProposedInsertion(document, proposed), {
+    preserveRepeatUnitBrackets: false, deferGroupCleanup: false, ...options
+  });
 }
 
 /** The proposal with its insertion re-targeted at `document` (see `applyAcceptedPluginProposal`). */

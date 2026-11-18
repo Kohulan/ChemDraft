@@ -118,6 +118,7 @@ import {
   type ChemDraftDocument,
   type ChemicalMetadata,
   type CompatibilityWarning,
+  remapImportedRepeatUnitAfterMoleculeMerge,
   type DocumentPatch,
   type DocumentObject,
   type DocumentPage,
@@ -4856,6 +4857,21 @@ export function insertNativeBracket(
   end?: PagePoint
 ): ChemDraftDocument {
   const page = firstPage(document);
+  const pair = nativeBracketPairForDrag(document, page, point, bracketKind, end);
+  return applyPatches(document, [
+    ...pair.map(object => ({ op: "addObject" as const, pageId: page.id, object })),
+    { op: "setSelection", pageId: page.id, objectIds: pair.map(object => object.id) }
+  ], { now: phase4Timestamp });
+}
+
+/** Shared placement and enclosure for drawn pairs and pairs created around atom selections. */
+export function nativeBracketPairForDrag(
+  document: ChemDraftDocument,
+  page: DocumentPage,
+  point: PagePoint,
+  bracketKind: BracketObject["bracketKind"],
+  end?: PagePoint
+): [BracketObject, BracketObject] {
   // Keep the requested placement and dimensions. The shared page-fit commit asks before
   // enlarging the page; Keep Page Size must not squeeze or move the bracket pair.
   const left = end ? Math.min(point.x, end.x) : point.x - 40;
@@ -4867,6 +4883,8 @@ export function insertNativeBracket(
     object.x >= left && object.y >= top && object.x + object.width <= left + boxWidth &&
     object.y + object.height <= top + height).map(object => object.id);
   const allocateId = pendingObjectIdAllocator(document);
+  const pairId = nextIndexedId("bracket_pair", page.objects.flatMap(object =>
+    object.type === "bracket" && object.pairId ? [object.pairId] : []));
   const object: BracketObject = {
     id: allocateId("bracket"),
     type: "bracket",
@@ -4878,6 +4896,7 @@ export function insertNativeBracket(
     style: {},
     bracketKind,
     side: "open",
+    pairId,
     containedObjectIds,
     compatibility: {
       sourceFormat: "chemdraft-native",
@@ -4886,18 +4905,9 @@ export function insertNativeBracket(
     }
   };
   const closing: BracketObject = { ...object, id: allocateId("bracket"),
-    x: left + boxWidth - width, side: "close", pairId: object.id };
-  object.pairId = object.id;
+    x: left + boxWidth - width, side: "close" };
 
-  return applyPatches(
-    document,
-    [
-      { op: "addObject", pageId: page.id, object },
-      { op: "addObject", pageId: page.id, object: closing },
-      { op: "setSelection", pageId: page.id, objectIds: [object.id, closing.id] }
-    ],
-    { now: phase4Timestamp }
-  );
+  return [object, closing];
 }
 
 const reactionArrowKindByToolCommandId: ReadonlyMap<string, ArrowObject["arrowKind"]> = new Map([
@@ -7185,6 +7195,13 @@ export function deleteSelectedDocumentObjects(
   document: ChemDraftDocument,
   selectedObjectIds: readonly string[] = document.selection.objectIds
 ): ChemDraftDocument {
+  return applyPatches(document, selectedObjectRemovalPatches(document, selectedObjectIds), { now: phase4Timestamp });
+}
+
+function selectedObjectRemovalPatches(
+  document: ChemDraftDocument,
+  selectedObjectIds: readonly string[]
+): Extract<DocumentPatch, { op: "removeObject" }>[] {
   const page = selectionPage(document);
   const selectedIds = new Set(selectedObjectIds);
   const selectedChildIds = new Set(withArrowAttachmentIds(page.objects, resolveGroupedDocumentObjectIds(page.objects, selectedObjectIds)));
@@ -7194,29 +7211,28 @@ export function deleteSelectedDocumentObjects(
       (selectedIds.has(object.id) || object.childObjectIds.some((childId) => selectedChildIds.has(childId)))
     )
     .map((object) => object.id);
-  const objectIds = [...new Set([...selectedChildIds, ...affectedGroupIds])];
-  if (objectIds.length === 0) {
-    return document;
-  }
-  const removedIds = new Set(objectIds);
-  const removedPairIds = new Set(page.objects.flatMap(object =>
-    object.type === "bracket" && object.pairId && removedIds.has(object.id) ? [object.pairId] : []));
+  return [...new Set([...selectedChildIds, ...affectedGroupIds])].map(objectId => ({ op: "removeObject", objectId }));
+}
 
-  return applyPatches(
-    document,
-    [
-      ...objectIds.map((objectId): DocumentPatch => ({ op: "removeObject", objectId })),
-      ...page.objects.flatMap((object): DocumentPatch[] => {
-        if (object.type !== "bracket" || !object.pairId || removedIds.has(object.id) || !removedPairIds.has(object.pairId)) return [];
-        return [{ op: "updateObject", objectId: object.id, changes: {
-          pairId: undefined, repeatUnit: undefined, label: undefined, containedObjectIds: [],
-          bracketUsage: undefined, repeatCount: undefined, crossingBondIds: undefined,
-          bracketKind: object.bracketKind === "polymer" ? "square" : object.bracketKind
-        } }];
-      })
-    ],
-    { now: phase4Timestamp }
-  );
+/** Cut whole objects and copied fragments together so a partly selected pair still has its
+ * original membership when the patch engine checks for orphaned glyphs. */
+export function deleteClipboardSelection(
+  document: ChemDraftDocument,
+  payload: ChemDraftSelectionClipboardPayload,
+  wholeObjectIds: readonly string[]
+): ChemDraftDocument {
+  const carriedMarkIds = payload.objects.filter(object => object.type === "electron-mark").map(object => object.id);
+  const wholeRemovals = selectedObjectRemovalPatches(document, [...wholeObjectIds, ...carriedMarkIds]);
+  const removedIds = new Set(wholeRemovals.map(patch => patch.objectId));
+  const patches: DocumentPatch[] = [...wholeRemovals];
+  for (const object of payload.objects) {
+    if (object.type !== "molecule" || removedIds.has(object.id)) continue;
+    const patch = nativeMoleculePartDeletePatch(document, {
+      kind: "parts", objectId: object.id, atomIds: object.atoms.map(atom => atom.id), bondIds: object.bonds.map(bond => bond.id)
+    });
+    if (patch) patches.push(patch);
+  }
+  return applyPatches(document, patches, { now: phase4Timestamp });
 }
 
 export function applySingleBondToolAtPoint(
@@ -7329,7 +7345,8 @@ export function nativeFreeformSingleBondToolAtPoint(
         { op: "removeObject", objectId: foreign.molecule.id },
         { op: "setSelection", pageId: page.id, objectIds: [molecule.id] }
       ],
-      { now: phase4Timestamp }
+      // Absorption is a graph transfer even when the source membership cannot be resolved.
+      { now: phase4Timestamp, preserveRepeatUnitBrackets: true }
     ) };
   }
 
@@ -8864,80 +8881,30 @@ export function applyNativeMoleculePartsDelete(
   document: ChemDraftDocument,
   selection: { objectId: string; atomIds: readonly string[]; bondIds: readonly string[] }
 ): ChemDraftDocument {
-  const page = firstPage(document);
-  const molecule = page.objects.find((object): object is MoleculeObject =>
-    object.id === selection.objectId && object.type === "molecule"
-  );
-  if (!molecule || !isEditableNativeMoleculeGraph(molecule)) {
-    return document;
-  }
-
-  const removeAtomIds = new Set(selection.atomIds);
-  const removeBondIds = new Set(selection.bondIds);
-  if (removeAtomIds.size === 0 && removeBondIds.size === 0) {
-    return document;
-  }
-
-  const atoms = molecule.atoms.filter((atom) => !removeAtomIds.has(atom.id));
-  const bonds = molecule.bonds.filter((bond) =>
-    !removeBondIds.has(bond.id) &&
-    !removeAtomIds.has(bond.fromAtomId) &&
-    !removeAtomIds.has(bond.toAtomId)
-  );
-  if (atoms.length === molecule.atoms.length && bonds.length === molecule.bonds.length) {
-    return document; // selection referenced nothing that still exists
-  }
-
-  if (atoms.length === 0) {
-    return applyPatch(
-      document,
-      { op: "removeObject", objectId: molecule.id },
-      { now: phase4Timestamp }
-    );
-  }
-
-  return applyPatch(
-    document,
-    {
-      op: "updateObject",
-      objectId: molecule.id,
-      changes: moleculeWithPrunedRingStyles(refreshNativeSingleBondGraph(molecule, atoms, bonds))
-    },
-    { now: phase4Timestamp }
-  );
+  return applyNativeMoleculePartDeleteTarget(document, { ...selection, kind: "parts" });
 }
 
 export function applyNativeMoleculePartDeleteTarget(
   document: ChemDraftDocument,
   target: NativeMoleculePartReorderTarget
 ): ChemDraftDocument {
-  const page = firstPage(document);
-  const molecule = page.objects.find((object): object is MoleculeObject =>
+  const patch = nativeMoleculePartDeletePatch(document, target);
+  return patch ? applyPatch(document, patch, { now: phase4Timestamp }) : document;
+}
+
+export function nativeMoleculePartDeletePatch(
+  document: ChemDraftDocument,
+  target: NativeMoleculePartReorderTarget
+): DocumentPatch | undefined {
+  const molecule = firstPage(document).objects.find((object): object is MoleculeObject =>
     object.id === target.objectId && object.type === "molecule"
   );
-  if (!molecule || !isEditableNativeMoleculeGraph(molecule)) {
-    return document;
-  }
-
+  if (!molecule || !isEditableNativeMoleculeGraph(molecule)) return undefined;
   const nextMolecule = nativeMoleculeAfterPartDelete(molecule, target);
-  if (!nextMolecule) {
-    return document;
-  }
-  const prunedNextMolecule = moleculeWithPrunedRingStyles(nextMolecule);
-
-  if (prunedNextMolecule.atoms.length === 0) {
-    return applyPatch(
-      document,
-      { op: "removeObject", objectId: molecule.id },
-      { now: phase4Timestamp }
-    );
-  }
-
-  return applyPatch(
-    document,
-    { op: "updateObject", objectId: molecule.id, changes: prunedNextMolecule },
-    { now: phase4Timestamp }
-  );
+  if (!nextMolecule) return undefined;
+  return nextMolecule.atoms.length === 0
+    ? { op: "removeObject", objectId: molecule.id }
+    : { op: "updateObject", objectId: molecule.id, changes: moleculeWithPrunedRingStyles(nextMolecule) };
 }
 
 export function applyNativeMoleculeBondOrderTarget(
@@ -14887,6 +14854,7 @@ function remapCopiedBracketPairs(objects: DocumentObject[], idMap: ReadonlyMap<s
           if (Array.isArray(membership)) unknown.cdxmlBracketMembership = JSON.stringify(membership.flatMap(id => typeof id === "string" && idMap.has(id) ? [idMap.get(id)] : []));
         }
       } else {
+        delete unknown.cdxmlBracketDeletedAtoms;
         const dropped = ["bracketedGroup", "cdxmlBracketAttachment", "cdxmlBracketCrossings", "cdxmlBracketMembership",
           "cdxmlBracketMemberObjectIds", "cdxmlBracketMembers", "cdxmlBracketState", "cdxmlBracketInvalidRepeatCount"].filter(key => key in unknown);
         for (const key of dropped) delete unknown[key];
@@ -20718,13 +20686,34 @@ function mergeNativeMoleculeObjects(
 
   return {
     molecule: refreshNativeSingleBondGraph(
-      { ...host, style: mergeIdKeyedMoleculeStyle(host.style, absorbed.style, atomIdMap, bondIdMap) },
+      { ...host, style: mergeIdKeyedMoleculeStyle(host.style, absorbed.style, atomIdMap, bondIdMap),
+        compatibility: mergeMoleculeSourceIds(host, absorbed, atomIdMap, bondIdMap) },
       atoms,
       bonds
     ),
     atomIdMap,
     bondIdMap
   };
+}
+
+function mergeMoleculeSourceIds(host: MoleculeObject, absorbed: MoleculeObject,
+  atomIds: ReadonlyMap<string, string>, bondIds: ReadonlyMap<string, string>): MoleculeObject["compatibility"] {
+  const unknown = { ...host.compatibility?.unknown };
+  let changed = false;
+  for (const [key, ids] of [["cdxmlAtomIdsByAtomId", atomIds], ["cdxmlBondIdsByBondId", bondIds]] as const) {
+    const oldIds = absorbed.compatibility?.unknown[key];
+    if (!oldIds || typeof oldIds !== "object" || Array.isArray(oldIds)) continue;
+    const mapped = [...ids].flatMap(([from, to]) => {
+      const sourceId = (oldIds as Record<string, unknown>)[from];
+      return typeof sourceId === "string" ? [[to, sourceId]] : [];
+    });
+    if (!mapped.length) continue;
+    const existing = unknown[key];
+    unknown[key] = { ...(existing && typeof existing === "object" && !Array.isArray(existing) ? existing : {}),
+      ...Object.fromEntries(mapped) };
+    changed = true;
+  }
+  return changed ? { warnings: [], ...host.compatibility, unknown } : host.compatibility;
 }
 
 /**
@@ -20833,9 +20822,13 @@ function remapAnchorsAfterMoleculeMerge(
       const childObjectIds = [...new Set(object.childObjectIds.map((id) => id === absorbedObjectId ? hostObjectId : id))];
       return [{ op: "updateObject", objectId: object.id, changes: { childObjectIds } }];
     }
-    if (object.type === "bracket" && (object.containedObjectIds.includes(absorbedObjectId) || object.crossingBondIds?.some(ref => ref.objectId === absorbedObjectId))) {
+    if (object.type === "bracket") {
+      const compatibility = remapImportedRepeatUnitAfterMoleculeMerge(object, absorbedObjectId, hostObjectId, atomIdMap, bondIdMap);
+      const nativeRefsChanged = object.containedObjectIds.includes(absorbedObjectId) ||
+        object.crossingBondIds?.some(ref => ref.objectId === absorbedObjectId);
+      if (!nativeRefsChanged && compatibility === object.compatibility) return [];
       const containedObjectIds = [...new Set(object.containedObjectIds.map((id) => id === absorbedObjectId ? hostObjectId : id))];
-      return [{ op: "updateObject", objectId: object.id, changes: { containedObjectIds,
+      return [{ op: "updateObject", objectId: object.id, changes: { containedObjectIds, compatibility,
         crossingBondIds: object.crossingBondIds?.flatMap(ref => ref.objectId !== absorbedObjectId ? [ref] :
           bondIdMap.has(ref.bondId) ? [{ objectId: hostObjectId, bondId: bondIdMap.get(ref.bondId)! }] : []) } }];
     }

@@ -105,6 +105,8 @@ export interface DesktopPluginRuntimeOptions {
   getActiveDocumentKey?: () => string | undefined;
   /** Desktop tab ownership, captured when a command starts even if its proposal arrives later. */
   getActiveDocumentTab?: () => Pick<ProposalDocumentTab, "id">;
+  /** Reads a background tab when a command creates a proposal after a tab switch. */
+  getDocumentForTab?: (tabId: string) => ChemDraftDocument | undefined;
   /** Reads the latest title of an open tab at display time. */
   getDocumentTabTitle?: (tabId: string) => string | undefined;
   /**
@@ -523,6 +525,8 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
       }
     },
     getActiveDocument: options.getActiveDocument,
+    getProposalDocument: () => proposingTabId && proposingTabId !== options.getActiveDocumentTab?.().id
+      ? options.getDocumentForTab?.(proposingTabId) : options.getActiveDocument(),
     getActiveDocumentKey:
       options.getActiveDocumentKey ?? (() => documentIdentityKey(options.getActiveDocument())),
     getSelection: readSelection ? () => readSelection(readingSelectionWarnings) : undefined,
