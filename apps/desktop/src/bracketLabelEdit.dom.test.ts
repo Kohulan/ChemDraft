@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MainWindow } from "./MainWindow";
 import { applySingleBondToolAtPoint, createPhase4Document, insertNativeBracket, selectDocumentObjects } from "./documentWorkflow";
 import { toggleBracketRepeatUnit } from "./bracketCommands";
-import { DOM_COMMAND_EVENT } from "./window-manager";
+import { DOM_COMMAND_EVENT, type QuitFlushPhase } from "./window-manager";
 import { bracketLabelPlan } from "@chemdraft/layout-engine";
 import { applyPatch, type ChemDraftDocument } from "@chemdraft/chem-core";
 import { openChemDraftPayload } from "@chemdraft/cdx-compat";
@@ -17,7 +17,7 @@ import { saveAskToSaveBeforeQuit } from "./quitSettings";
 const native = vi.hoisted(() => ({
   writeFile: vi.fn<(path: string, contents: string) => Promise<void>>(),
   saveSession: vi.fn<(value: DocumentSessionEnvelope) => Promise<void>>(),
-  quitFlush: undefined as undefined | (() => Promise<void>),
+  quitFlush: undefined as undefined | ((phase: QuitFlushPhase, requestId: number) => Promise<void>),
   promptQuit: undefined as undefined | ((id: number) => Promise<void>),
   quit: vi.fn()
 }));
@@ -31,7 +31,7 @@ vi.mock("./window-manager", async original => ({
   loadToolsetLayoutState: async () => undefined,
   listToolsetWindowStates: async () => [],
   setToolbarsMenu: async () => {},
-  listenForQuitFlushRequest: async (handler: () => Promise<void>) => {
+  listenForQuitFlushRequest: async (handler: NonNullable<typeof native.quitFlush>) => {
     native.quitFlush = handler; return () => { native.quitFlush = undefined; };
   },
   listenForQuitPromptRequest: async (handler: (id: number) => Promise<void>) => {
@@ -281,13 +281,46 @@ describe.each(["macos", "windows"] as const)("repeat label editing (%s)", platfo
     const field = editor();
     if (route === "session autosave") {
       await act(async () => { await vi.advanceTimersByTimeAsync(DOCUMENT_SESSION_SAVE_DEBOUNCE_MS + 100); });
-    } else await act(async () => { await native.quitFlush!(); });
+    } else {
+      await act(async () => { await native.quitFlush!("committed", 42); });
+      expect(native.quit).toHaveBeenCalledExactlyOnceWith(42);
+    }
     const session = native.saveSession.mock.calls.at(-1)![0];
     expect(savedLabel(session.contents)).toMatchObject({ label: "m" });
     expect(session.dirty).toBe(true);
     expect(snapshot().file.dirty).toBe(true);
     expect(editor()).toBe(field);
     expect(native.writeFile).not.toHaveBeenCalled();
+  });
+  it("freezes the open repeat label during a committed quit write", async () => {
+    await openSavedLabel();
+    await type("m");
+    let finishWrite!: () => void;
+    native.saveSession.mockImplementationOnce(() => new Promise<void>(resolve => { finishWrite = resolve; }));
+    let flushing!: Promise<void>;
+    await act(async () => { flushing = native.quitFlush!("committed", 42); });
+    const field = editor()!;
+    expect.soft(field.readOnly).toBe(true);
+    await type("Late typing");
+    expect.soft(field.value).toBe("m");
+    expect(savedLabel(native.saveSession.mock.calls.at(-1)![0].contents)).toMatchObject({ label: "m" });
+    expect(native.quit).not.toHaveBeenCalled();
+    await act(async () => { finishWrite(); await flushing; });
+    expect(native.quit).toHaveBeenCalledExactlyOnceWith(42);
+  });
+  it("flushes a repeat label as clean after typing back to the saved value", async () => {
+    await openSavedLabel();
+    await type("m");
+    await command("document.save");
+    await type("p");
+    expect(snapshot().file.dirty).toBe(true);
+    await type("m");
+    expect(editor()?.value).toBe("m");
+    await act(async () => { await native.quitFlush!("committed", 42); });
+    const session = native.saveSession.mock.lastCall![0];
+    expect(savedLabel(session.contents)).toMatchObject({ label: "m" });
+    expect(session.dirty).toBe(false);
+    expect(native.quit).toHaveBeenCalledExactlyOnceWith(42);
   });
   it.each(["close", "quit"])("prompts for an uncommitted draft on %s and Save writes it", async boundary => {
     await mount(true);

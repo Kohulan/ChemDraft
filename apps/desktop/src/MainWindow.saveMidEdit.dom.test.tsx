@@ -15,7 +15,7 @@ import { deserializeDocument, type TableObject } from "@chemdraft/chem-core";
 import { openChemDraftPayload } from "@chemdraft/cdx-compat";
 import { planTableLayout } from "@chemdraft/layout-engine";
 import { MainWindow } from "./MainWindow";
-import { DOM_COMMAND_EVENT } from "./window-manager";
+import { DOM_COMMAND_EVENT, type QuitFlushPhase } from "./window-manager";
 import { DOCUMENT_SESSION_SAVE_DEBOUNCE_MS, type DocumentSessionEnvelope } from "./documentSession";
 import { createPhase4Document, insertNativeTextObject } from "./documentWorkflow";
 import { setNativePromptProvider, type NativePromptOptions } from "./nativePrompt";
@@ -25,7 +25,7 @@ import { MemoryStorage } from "./testSupport/memoryStorage";
 const native = vi.hoisted(() => ({
   saveSession: vi.fn<(value: DocumentSessionEnvelope) => Promise<void>>(),
   writeFile: vi.fn<(path: string, contents: string) => Promise<void>>(),
-  quitFlush: undefined as undefined | (() => Promise<void>),
+  quitFlush: undefined as undefined | ((phase: QuitFlushPhase, requestId: number) => Promise<void>),
   promptQuit: undefined as undefined | ((id: number) => Promise<void>),
   quit: vi.fn()
 }));
@@ -39,7 +39,7 @@ vi.mock("./window-manager", async original => ({
   loadToolsetLayoutState: async () => undefined,
   listToolsetWindowStates: async () => [],
   setToolbarsMenu: async () => {},
-  listenForQuitFlushRequest: async (handler: () => Promise<void>) => {
+  listenForQuitFlushRequest: async (handler: NonNullable<typeof native.quitFlush>) => {
     native.quitFlush = handler; return () => { native.quitFlush = undefined; };
   },
   listenForQuitPromptRequest: async (handler: (id: number) => Promise<void>) => {
@@ -156,7 +156,11 @@ describe.each(["macos", "windows"] as const)("save mid-edit (%s)", platform => {
     else if (route === "File > Save As") await command("document.saveAs");
     else if (route === "session autosave") {
       await act(async () => { await vi.advanceTimersByTimeAsync(DOCUMENT_SESSION_SAVE_DEBOUNCE_MS + 100); });
-    } else await act(async () => { await native.quitFlush!(); });
+    } else {
+      await act(async () => { await native.quitFlush!("committed", 42); });
+      expect(native.quit).toHaveBeenCalledExactlyOnceWith(42);
+      expect(textarea.readOnly).toBe(true);
+    }
     expect(editor(), "save/flush keeps the same editor").toBe(textarea);
     expect(document.activeElement, "save/flush retains editor focus").toBe(textarea);
     if (route === "File > Save" || route === "File > Save As" || route === "editor keyboard shortcut") {
@@ -169,7 +173,6 @@ describe.each(["macos", "windows"] as const)("save mid-edit (%s)", platform => {
       expect(contentsText(session.contents, kind), "recovery session contains open Hello draft").toBe("Hello");
       expect(session.dirty, "session flush preserves dirty flag").toBe(true);
       expect(snapshot().file.dirty, "session flush does not establish a clean baseline").toBe(true);
-      native.quit.mockClear(); // quit-flush acknowledgement is separate from a prompted quit request.
     }
   }
   async function endEdit(ending: "Escape" | "click-away" | "tool switch") {
@@ -270,8 +273,11 @@ describe.each(["macos", "windows"] as const)("save mid-edit (%s)", platform => {
   });
 
   describe.each(["text box", "table cell"] as const)("%s", kind => {
-    const routes: Route[] = ["File > Save", "session autosave", "quit session flush"];
-    routes.push("editor keyboard shortcut");
+    const routes: Route[] = ["File > Save", "session autosave", "editor keyboard shortcut"];
+    it("persists the dirty draft and locks editing on committed quit", async () => {
+      await mount(kind);
+      await saveWhileEditing("quit session flush", kind);
+    });
     describe.each(routes)("%s", route => {
       for (const ending of ["Escape", "click-away"] as const) {
         it.each(["close", "quit"] as const)(`retained extra typing stays dirty after ${ending} and prompts on %s`, async boundary => {
@@ -285,7 +291,7 @@ describe.each(["macos", "windows"] as const)("save mid-edit (%s)", platform => {
           // Table Escape intentionally cancels to pre-edit content. That still differs
           // from the explicitly saved Hello and must therefore prompt after an explicit save.
           const canceledUnsavedTable = kind === "table cell" && ending === "Escape"
-            && (route === "session autosave" || route === "quit session flush");
+            && route === "session autosave";
           expect(currentText(kind)).toBe(kind === "table cell" && ending === "Escape" ? original : "Hellox");
           expect.soft(snapshot().file.dirty, "ending edit must preserve unsaved changes").toBe(!canceledUnsavedTable);
           if (canceledUnsavedTable) {

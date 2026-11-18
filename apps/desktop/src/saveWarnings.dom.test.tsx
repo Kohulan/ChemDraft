@@ -11,6 +11,7 @@ import { saveKeybindingSettings } from "./keybindingSettings";
 import { tableInsertCommandId } from "./tableCommands";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 import { buildDocumentSessionEnvelope } from "./documentSession";
+import type { QuitFlushPhase } from "./window-manager";
 import { invalidCarbonDocument, invalidCarbonWarning } from "../../../packages/document-workflow-core/test/invalidStructureFixtures";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -18,7 +19,8 @@ import { invalidCarbonDocument, invalidCarbonWarning } from "../../../packages/d
 const native = vi.hoisted(() => ({
   desktop: false,
   session: undefined as unknown,
-  flush: undefined as (() => Promise<void>) | undefined,
+  flush: undefined as ((phase: QuitFlushPhase, requestId: number) => Promise<void>) | undefined,
+  quit: vi.fn(),
   loadSession: vi.fn<() => Promise<unknown>>(),
   saveSession: vi.fn<(value: unknown) => Promise<void>>(),
   save: vi.fn<() => Promise<string | null>>(),
@@ -29,11 +31,11 @@ vi.mock("./window-manager", async (original) => ({
   isDesktopRuntime: () => native.desktop,
   loadDocumentSession: native.loadSession,
   saveDocumentSession: native.saveSession,
-  listenForQuitFlushRequest: async (handler: () => Promise<void>) => {
+  listenForQuitFlushRequest: async (handler: NonNullable<typeof native.flush>) => {
     native.flush = handler;
     return () => { if (native.flush === handler) native.flush = undefined; };
   },
-  confirmQuitAfterFlush: vi.fn()
+  confirmQuitAfterFlush: native.quit
 }));
 vi.mock("./nativeFileDialog", () => ({ save: native.save, prewarmNativeFileDialogs: vi.fn() }));
 vi.mock("@tauri-apps/plugin-fs", async (original) => ({
@@ -96,6 +98,7 @@ describe("save warnings in the existing file warnings list", () => {
     native.desktop = false;
     native.session = undefined;
     native.flush = undefined;
+    native.quit.mockClear();
     native.loadSession.mockReset().mockImplementation(async () => native.session);
     native.saveSession.mockReset().mockImplementation(async (value) => {
       native.session = JSON.parse(JSON.stringify(value));
@@ -364,7 +367,8 @@ describe("save warnings in the existing file warnings list", () => {
     expect(headings).toHaveLength(2);
 
     await command("document.new");
-    await act(async () => { await native.flush!(); });
+    await act(async () => { await native.flush!("committed", 42); });
+    expect(native.quit).toHaveBeenCalledExactlyOnceWith(42);
     const saved = native.session as { tabs: { openWarnings: unknown; saveWarnings: unknown }[] };
     expect(saved.tabs[0]!.openWarnings).toMatchObject({ displayName: "import.cdxml" });
     expect(saved.tabs[0]!.saveWarnings).toMatchObject({ operation: "save", displayName: "table.chemdraft" });
@@ -382,7 +386,8 @@ describe("save warnings in the existing file warnings list", () => {
     await command("document.save");
     const tooltip = status().title;
     const count = button()!.textContent;
-    await act(async () => { await native.flush!(); });
+    await act(async () => { await native.flush!("committed", 42); });
+    expect(native.quit).toHaveBeenCalledExactlyOnceWith(42);
     const saved = native.session as { tabs: { openWarnings?: unknown; saveWarnings?: unknown }[] };
     expect(saved.tabs[0]!.openWarnings).toBeUndefined();
     expect(saved.tabs[0]!.saveWarnings).toMatchObject({ operation: "save" });
@@ -394,7 +399,8 @@ describe("save warnings in the existing file warnings list", () => {
     await click(button()!);
     expect(list()?.getAttribute("aria-label")).toMatch(/^Saved table.chemdraft/);
     expect(list()?.textContent).not.toContain("Opened ");
-    await act(async () => { await native.flush!(); });
+    await act(async () => { await native.flush!("committed", 43); });
+    expect(native.quit).toHaveBeenLastCalledWith(43);
     expect((native.session as typeof saved).tabs[0]!.openWarnings).toBeUndefined();
     expect((native.session as typeof saved).tabs[0]!.saveWarnings).toEqual(saved.tabs[0]!.saveWarnings);
   });

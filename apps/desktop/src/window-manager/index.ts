@@ -786,22 +786,25 @@ export async function saveDocumentSession(state: unknown, options?: { strict?: b
  *  autosave and then calls `confirmQuitAfterFlush`; Rust quits anyway after a short grace period. */
 export const QUIT_FLUSH_REQUEST_EVENT = "chemdraft://flush-before-quit";
 export type QuitFlushPhase = "committed";
+type QuitFlushRequest = { phase: QuitFlushPhase; requestId: number };
 
-export async function listenForQuitFlushRequest(handler: (phase?: QuitFlushPhase) => Promise<void>): Promise<Unlisten> {
+export async function listenForQuitFlushRequest(handler: (phase: QuitFlushPhase, requestId: number) => Promise<void>): Promise<Unlisten> {
   if (!isDesktopRuntime()) {
     return () => undefined;
   }
-  return listenCurrentWindowEvent<QuitFlushPhase | null>(QUIT_FLUSH_REQUEST_EVENT, (event) => {
-    void handler(event.payload ?? undefined).catch(() => undefined);
+  return listenCurrentWindowEvent<QuitFlushRequest | null>(QUIT_FLUSH_REQUEST_EVENT, ({ payload }) => {
+    if (payload?.phase === "committed" && Number.isSafeInteger(payload.requestId) && payload.requestId > 0) {
+      void handler(payload.phase, payload.requestId).catch(() => undefined);
+    }
   });
 }
 
-export async function confirmQuitAfterFlush(): Promise<void> {
+export async function confirmQuitAfterFlush(requestId: number): Promise<void> {
   if (!isDesktopRuntime()) {
     return;
   }
   const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("quit_after_flush").catch(() => undefined);
+  await invoke("quit_after_flush", { requestId }).catch(() => undefined);
 }
 
 export const QUIT_PROMPT_REQUEST_EVENT = "chemdraft://prompt-before-quit";

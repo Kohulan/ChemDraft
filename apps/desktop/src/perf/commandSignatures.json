@@ -284,8 +284,8 @@
     "name": "quit_after_flush",
     "async": true,
     "generics": "",
-    "parameters": "app: tauri::AppHandle",
-    "returnType": "()"
+    "parameters": "app: tauri::AppHandle, window: tauri::WebviewWindow, request_id: u64,",
+    "returnType": "Result<(), String>"
   },
   {
     "file": "lib.rs",
