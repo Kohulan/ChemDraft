@@ -1088,14 +1088,12 @@ export async function setCurrentWindowLogicalSize(size: ToolsetWindowSize): Prom
  * Never use this webview's height: content-fit windows would shrink their own cap on every resize. */
 export async function currentWindowLogicalWorkArea(): Promise<MonitorLogicalBounds> {
   if (isDesktopRuntime()) {
-    const { currentMonitor } = await import("@tauri-apps/api/window");
-    const monitor = await currentMonitor().catch(() => null);
-    if (monitor) {
-      const scale = monitor.scaleFactor > 0 ? monitor.scaleFactor : 1;
-      const area = monitor.workArea;
-      const left = area.position.x / scale;
-      const top = area.position.y / scale;
-      return { left, top, right: left + area.size.width / scale, bottom: top + area.size.height / scale };
+    // Native command, not `currentMonitor()`: the plugin builds monitors off the main thread, which
+    // crashes GTK/X11 builds (see monitor_query.rs).
+    const { invoke } = await import("@tauri-apps/api/core");
+    const area = await invoke<MonitorLogicalBounds | null>("current_window_logical_work_area").catch(() => null);
+    if (area) {
+      return area;
     }
   }
   const screen = window.screen as Screen & { availLeft?: number; availTop?: number };
@@ -1627,19 +1625,10 @@ export async function monitorLogicalBoundsAt(
   if (!isDesktopRuntime()) {
     return undefined;
   }
-  const { availableMonitors } = await import("@tauri-apps/api/window");
-  const monitors = await availableMonitors().catch(() => []);
-  for (const monitor of monitors) {
-    const scale = monitor.scaleFactor > 0 ? monitor.scaleFactor : 1;
-    const left = monitor.position.x / scale;
-    const top = monitor.position.y / scale;
-    const right = left + monitor.size.width / scale;
-    const bottom = top + monitor.size.height / scale;
-    if (x >= left && x < right && y >= top && y < bottom) {
-      return { left, top, right, bottom };
-    }
-  }
-  return undefined;
+  // Native command, not `availableMonitors()`: see currentWindowLogicalWorkArea.
+  const { invoke } = await import("@tauri-apps/api/core");
+  const bounds = await invoke<MonitorLogicalBounds | null>("monitor_logical_bounds_at", { x, y }).catch(() => null);
+  return bounds ?? undefined;
 }
 
 export async function hidePaletteFloatingTooltip(): Promise<void> {

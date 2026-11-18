@@ -41,6 +41,8 @@
     "allow-show-toolset-tooltip-window",
     "allow-hide-toolset-tooltip-window",
     "allow-set-current-window-global-position",
+    "allow-current-window-logical-work-area",
+    "allow-monitor-logical-bounds-at",
     "allow-quit-after-flush",
     "allow-close-toolset-popover",
     "core:window:allow-show",
