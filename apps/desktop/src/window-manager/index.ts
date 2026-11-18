@@ -704,7 +704,7 @@ export async function listenForKeybindingSettings(
   };
 }
 
-/** Tell the Rust side to rebuild the native menu with accelerators for the given scheme. */
+/** Keep native menu accelerators in step with the shortcut scheme. */
 export async function pushKeybindingSchemeToNativeMenu(scheme: KeybindingScheme): Promise<void> {
   if (!isDesktopRuntime()) {
     return;
@@ -782,17 +782,17 @@ export async function saveDocumentSession(state: unknown, options?: { strict?: b
   await (options?.strict ? write : write.catch(() => undefined));
 }
 
-/** Emitted by Rust before application-menu Quit / Cmd+Q on macOS, or closing the document
- *  window / File ▸ Exit elsewhere. The listener flushes the pending session autosave and then
- *  calls `confirmQuitAfterFlush`; Rust quits anyway after a short grace period. */
+/** Rust sends the committed phase once quit is irreversible. The listener flushes the session
+ *  autosave and then calls `confirmQuitAfterFlush`; Rust quits anyway after a short grace period. */
 export const QUIT_FLUSH_REQUEST_EVENT = "chemdraft://flush-before-quit";
+export type QuitFlushPhase = "committed";
 
-export async function listenForQuitFlushRequest(handler: () => Promise<void>): Promise<Unlisten> {
+export async function listenForQuitFlushRequest(handler: (phase?: QuitFlushPhase) => Promise<void>): Promise<Unlisten> {
   if (!isDesktopRuntime()) {
     return () => undefined;
   }
-  return listenCurrentWindowEvent(QUIT_FLUSH_REQUEST_EVENT, () => {
-    void handler().catch(() => undefined);
+  return listenCurrentWindowEvent<QuitFlushPhase | null>(QUIT_FLUSH_REQUEST_EVENT, (event) => {
+    void handler(event.payload ?? undefined).catch(() => undefined);
   });
 }
 
@@ -867,7 +867,8 @@ export async function setQuitPromptEnabled(enabled: boolean): Promise<void> {
 }
 export const prepareQuitPrompt = (id: number): Promise<boolean> => quitPromptCommand("prepare_quit_prompt", id);
 export const reportQuitPromptShowing = (id: number): Promise<boolean> => quitPromptCommand("quit_prompt_showing", id);
-export const cancelQuit = (id: number): Promise<boolean> => quitPromptCommand("cancel_quit", id);
+export type QuitCancelOutcome = "cancelled" | "superseded" | "committed";
+export const cancelQuit = (id: number): Promise<QuitCancelOutcome> => quitPromptCommand("cancel_quit", id);
 export const resumeQuitAfterPrompt = (id: number): Promise<boolean> => quitPromptCommand("resume_quit_after_prompt", id);
 export const confirmPromptedQuit = (id: number): Promise<void> => quitPromptCommand("confirm_prompted_quit", id);
 export async function requestQuitAfterClose(): Promise<void> {

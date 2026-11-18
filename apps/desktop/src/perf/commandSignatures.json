@@ -316,8 +316,8 @@
     "name": "cancel_quit",
     "async": true,
     "generics": "",
-    "parameters": "window: tauri::WebviewWindow, request_id: u64",
-    "returnType": "Result<bool, String>"
+    "parameters": "window: tauri::WebviewWindow, request_id: u64,",
+    "returnType": "Result<QuitCancelOutcome, String>"
   },
   {
     "file": "lib.rs",

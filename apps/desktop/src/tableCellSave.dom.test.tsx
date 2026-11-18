@@ -49,7 +49,7 @@ vi.mock("./window-manager", async original => ({
   prepareQuitPrompt: async () => true,
   resumeQuitAfterPrompt: async () => true,
   reportQuitPromptShowing: async () => true,
-  cancelQuit: async () => true,
+  cancelQuit: async () => "cancelled",
   confirmQuitAfterFlush: native.quit,
   confirmPromptedQuit: native.quit
 }));

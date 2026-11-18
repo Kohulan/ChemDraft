@@ -400,7 +400,7 @@ describe("native Window and full-screen menus", () => {
   it("builds one native full-screen item in View with the current document state on macOS", () => {
     expect(source.match(/PredefinedMenuItem::fullscreen\(/g)).toHaveLength(1);
     const builder = source.split("fn create_app_menu_for_toolsets<R: Runtime>")[1]!.split("/// Close Window")[0]!;
-    expect(builder).toContain("let view_menu = create_view_menu(app, entries, view_state)?;");
+    expect(builder).toContain("let view_menu = create_view_menu(app, entries, view_state, scheme)?;");
     expect(builder).toMatch(/#\[cfg\(target_os = "macos"\)\]\s*let fullscreen = \{/);
     expect(builder).toMatch(/let is_fullscreen = main_ns_window\(app\)\s*\.is_some_and\(\|window\| window\.styleMask\(\)\.contains\(NSWindowStyleMask::FullScreen\)\)/);
     expect(builder).toContain("PredefinedMenuItem::fullscreen(app, Some(fullscreen_menu_title(is_fullscreen)))");

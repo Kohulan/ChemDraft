@@ -2540,6 +2540,7 @@ export function MainWindow({
   const [closeTabPrompt, setCloseTabPrompt] = useState<string>();
   const quitInteractionRef = useRef(false);
   const quitMutationFrozenRef = useRef(false);
+  const quitCommittedRef = useRef(false);
   const pendingQuitAfterCloseRef = useRef(false);
   const [quitAfterCloseReady, setQuitAfterCloseReady] = useState(0);
   const [keptDrawingsPrompt, setKeptDrawingsPrompt] = useState<"notice">();
@@ -10717,6 +10718,12 @@ export function MainWindow({
   }, [document, fileState, documentTabs, activeDocumentTabId, viewport, openWarningsReport, saveWarningsReport, sessionStartupCompleted, writeDocumentSessionNow]);
 
 
+  const lockCommittedQuit = useCallback(() => {
+    quitCommittedRef.current = true;
+    quitInteractionRef.current = true;
+    quitMutationFrozenRef.current = true;
+  }, []);
+
   // Menu Quit / Cmd+Q on macOS, or closing the document window / File ▸ Exit elsewhere: Rust asks
   // for the pending autosave first so an edit inside the debounce window survives relaunch.
   useEffect(() => {
@@ -10725,7 +10732,10 @@ export function MainWindow({
     }
     let unlisten: (() => void) | undefined;
     let disposed = false;
-    void listenForQuitFlushRequest(async () => {
+    void listenForQuitFlushRequest(async (phase) => {
+      // A system quit can commit while a Cancel reply is in flight. The commit locks editing
+      // even if the reply already released the prompt's guards.
+      if (phase === "committed") lockCommittedQuit();
       await dialogCoordinatorRef.current?.dispose("quit");
       await writeDocumentSessionNow();
       await confirmQuitAfterFlush();
@@ -10740,7 +10750,20 @@ export function MainWindow({
       disposed = true;
       unlisten?.();
     };
-  }, [writeDocumentSessionNow]);
+  }, [lockCommittedQuit, writeDocumentSessionNow]);
+
+  const cancelQuitRequest = useCallback(async (requestId: number) => {
+    const reply = await cancelQuit(requestId);
+    if (reply === "committed") lockCommittedQuit();
+    const outcome = quitCommittedRef.current ? "committed" : reply;
+    if (quitRequestRef.current !== requestId || outcome === "superseded") return outcome;
+    if (outcome === "cancelled") {
+      quitInteractionRef.current = false;
+      quitMutationFrozenRef.current = false;
+    }
+    setQuitPromptOpen(current => current === requestId ? undefined : current);
+    return outcome;
+  }, [lockCommittedQuit]);
 
   useEffect(() => {
     if (!isDesktopRuntime()) return;
@@ -10749,51 +10772,62 @@ export function MainWindow({
     const keep = (listener: () => void) => { if (disposed) listener(); else listeners.push(listener); };
     void (async () => {
       keep(await listenForQuitPromptRequest(async (requestId) => {
-        if (disposed || (quitRequestRef.current !== undefined && requestId <= quitRequestRef.current)) return;
+        if (disposed || quitCommittedRef.current ||
+            (quitRequestRef.current !== undefined && requestId <= quitRequestRef.current)) return;
         quitRequestRef.current = requestId;
+        setQuitPromptOpen(undefined);
         quitMutationFrozenRef.current = false;
         quitPromptBusyRef.current = false;
         setQuitSaveBusy(false);
         quitInteractionRef.current = true;
-        if (closeTabPromptRef.current) {
-          // React cleanup cannot dismiss an OS alert. Retire this native quit deadline and
-          // finish the existing close choice first, then request a fresh, visible quit prompt.
-          if (await cancelQuit(requestId) && quitRequestRef.current === requestId) {
-            pendingQuitAfterCloseRef.current = true;
-            setQuitAfterCloseReady((value) => value + 1);
+        try {
+          if (closeTabPromptRef.current) {
+            // Finish the existing native alert first, then request a fresh quit prompt.
+            if (await cancelQuitRequest(requestId) === "cancelled" && quitRequestRef.current === requestId && !disposed) {
+              pendingQuitAfterCloseRef.current = true;
+              setQuitAfterCloseReady((value) => value + 1);
+            }
+            return;
           }
-          return;
-        }
-        if (!snapshotDocumentTab()) {
-          await cancelQuit(requestId);
-          quitInteractionRef.current = false;
-          return;
-        }
-        const dirty = documentTabsRef.current.some((tab) => tab.id === activeDocumentTabIdRef.current
-          ? fileStateRef.current.dirty : documentTabSnapshotsRef.current.get(tab.id)?.file.dirty);
-        if (!dirty) {
-          quitMutationFrozenRef.current = true;
-          if (await resumeQuitAfterPrompt(requestId)) {
-            await writeDocumentSessionNow();
-            await confirmPromptedQuit(requestId);
+          if (snapshotDocumentTab()) {
+            const dirty = documentTabsRef.current.some((tab) => tab.id === activeDocumentTabIdRef.current
+              ? fileStateRef.current.dirty : documentTabSnapshotsRef.current.get(tab.id)?.file.dirty);
+            if (dirty) {
+              if (await prepareQuitPrompt(requestId) && quitRequestRef.current === requestId &&
+                  !disposed && !quitCommittedRef.current) {
+                setQuitPromptOpen(requestId);
+                return;
+              }
+            } else {
+              quitMutationFrozenRef.current = true;
+              if (await resumeQuitAfterPrompt(requestId) && quitRequestRef.current === requestId &&
+                  !disposed && !quitCommittedRef.current) {
+                await writeDocumentSessionNow();
+                await confirmPromptedQuit(requestId);
+                return;
+              }
+            }
           }
-          return;
+        } catch (error) {
+          if (!disposed && quitRequestRef.current === requestId) setStatus("Quit failed: " + String(error));
         }
-        if (await prepareQuitPrompt(requestId) && quitRequestRef.current === requestId && !disposed) {
-          setQuitPromptOpen(requestId);
+        if (!disposed && quitRequestRef.current === requestId) {
+          await cancelQuitRequest(requestId).catch((error: unknown) => {
+            setStatus("Could not cancel quit: " + String(error));
+          });
         }
       }));
       keep(await listenForQuitSettings((enabled) => { void setQuitPromptEnabled(enabled); }));
       if (!disposed) await setQuitPromptEnabled(loadAskToSaveBeforeQuit());
     })().catch((error: unknown) => { setStatus("Quit preference unavailable: " + String(error)); });
     return () => { disposed = true; listeners.forEach((listener) => listener()); };
-  }, [snapshotDocumentTab, writeDocumentSessionNow]);
+  }, [snapshotDocumentTab, writeDocumentSessionNow, cancelQuitRequest]);
 
   useEffect(() => {
     if (closeTabPrompt || !pendingQuitAfterCloseRef.current) return;
     pendingQuitAfterCloseRef.current = false;
+    if (quitCommittedRef.current) return;
     void requestQuitAfterClose().catch((error: unknown) => {
-      quitInteractionRef.current = false;
       setStatus("Could not resume quit after closing the tab prompt: " + String(error));
     });
   }, [closeTabPrompt, quitAfterCloseReady]);
@@ -11114,31 +11148,21 @@ export function MainWindow({
     const requestId = quitPromptOpen;
     let disposed = false;
     const suspension = acquireNativeUtilitySuspension();
-    const retirePrompt = () => {
-      void cancelQuit(requestId).then((cancelled) => {
-        if (!cancelled) return;
-        if (quitRequestRef.current === requestId) {
-          quitInteractionRef.current = false;
-          quitMutationFrozenRef.current = false;
-        }
-        setQuitPromptOpen((current) => current === requestId ? undefined : current);
-      }).catch((error: unknown) => {
-        // Keep the dialog available for retry; never hide an acknowledged prompt on failed IPC.
-        setStatus("Could not cancel quit: " + String(error));
-      });
-    };
     void suspension.then(async () => {
       if (disposed) return;
       setQuitPromptReady(requestId);
     }).catch((error: unknown) => {
+      if (disposed) return;
       setStatus("Quit prompt unavailable: " + String(error));
-      retirePrompt();
+      void cancelQuitRequest(requestId).catch((error: unknown) => {
+        setStatus("Could not cancel quit: " + String(error));
+      });
     });
     return () => {
       disposed = true;
       void suspension.then((release) => release(), () => {});
     };
-  }, [quitPromptOpen]);
+  }, [quitPromptOpen, cancelQuitRequest]);
 
   const cancelQuitPrompt = useCallback(async (requestId = quitRequestRef.current) => {
     if (requestId === undefined) return;
@@ -11147,22 +11171,17 @@ export function MainWindow({
       setQuitSaveBusy(true);
     }
     try {
-      if (await cancelQuit(requestId)) {
-        if (quitRequestRef.current === requestId) {
-          quitInteractionRef.current = false;
-          quitMutationFrozenRef.current = false;
-        }
-        setQuitPromptOpen((current) => current === requestId ? undefined : current);
-      }
+      await cancelQuitRequest(requestId);
     } catch (error) {
       setStatus("Could not cancel quit: " + String(error));
+      return false;
     } finally {
       if (quitRequestRef.current === requestId) {
         quitPromptBusyRef.current = false;
         setQuitSaveBusy(false);
       }
     }
-  }, []);
+  }, [cancelQuitRequest]);
 
   const finishPromptedQuit = useCallback(async (save: boolean) => {
     const requestId = quitRequestRef.current;
@@ -11176,24 +11195,24 @@ export function MainWindow({
           const file = tab.id === activeDocumentTabIdRef.current ? fileStateRef.current :
             documentTabSnapshotsRef.current.get(tab.id)?.file;
           if (file?.dirty && !await saveDocumentTabById(tab.id, false)) {
-            await cancelQuitPrompt(requestId);
-            return;
+            return await cancelQuitPrompt(requestId);
           }
         }
         if (documentTabsRef.current.some((tab) => tab.id === activeDocumentTabIdRef.current
           ? fileStateRef.current.dirty : documentTabSnapshotsRef.current.get(tab.id)?.file.dirty)) {
           setStatus("A document changed while saving. Quit canceled; save again before quitting.");
-          await cancelQuitPrompt(requestId);
-          return;
+          return await cancelQuitPrompt(requestId);
         }
       }
       // Re-arm grace before session IPC so a stalled flush still arms #99's exit watchdog.
-      if (!await resumeQuitAfterPrompt(requestId)) return;
+      if (!await resumeQuitAfterPrompt(requestId)) {
+        return await cancelQuitPrompt(requestId);
+      }
       await writeDocumentSessionNow();
       await confirmPromptedQuit(requestId);
     } catch (error) {
       setStatus("Quit failed: " + (error instanceof Error ? error.message : String(error)));
-      await cancelQuitPrompt(requestId);
+      return await cancelQuitPrompt(requestId);
     } finally {
       if (quitRequestRef.current === requestId) {
         quitPromptBusyRef.current = false;
@@ -11214,16 +11233,8 @@ export function MainWindow({
   }, async (choice) => {
     const requestId = quitPromptOpen;
     if (requestId === undefined || quitRequestRef.current !== requestId) return;
-    if (choice === "cancel") {
-      await cancelQuitPrompt(requestId);
-      return quitRequestRef.current === requestId && quitInteractionRef.current ? false : undefined;
-    }
-    await finishPromptedQuit(choice === "save");
-    // A failed cancellation must leave a question available for retry.
-    const dirty = documentTabsRef.current.some((tab) => tab.id === activeDocumentTabIdRef.current
-      ? fileStateRef.current.dirty : documentTabSnapshotsRef.current.get(tab.id)?.file.dirty);
-    return quitRequestRef.current === requestId && quitInteractionRef.current &&
-      (!quitMutationFrozenRef.current || (choice === "save" && dirty)) ? false : undefined;
+    const result = choice === "cancel" ? await cancelQuitPrompt(requestId) : await finishPromptedQuit(choice === "save");
+    return quitRequestRef.current === requestId ? result : undefined;
   }, quitPromptReady === quitPromptOpen ? quitPromptOpen : undefined, false, undefined, async () => {
     const requestId = quitPromptOpen;
     if (requestId === undefined || quitRequestRef.current !== requestId) return;
