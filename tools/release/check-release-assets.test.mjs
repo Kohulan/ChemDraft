@@ -298,9 +298,21 @@ test("Linux records the smoke-tested packages before staging and checks the dest
   assert.match(container, /uses: \.\/\.github\/workflows\/linux-package-smoke/);
   for (const variable of ["DEB", "APPIMAGE"]) {
     const record = build.indexOf(`record-build.mjs --artifact "$${variable}" --target x86_64-unknown-linux-gnu`);
-    assert.ok(record > build.indexOf("Smoke test the installed .deb"));
+    assert.ok(record > build.indexOf("Repack AppImage"));
     assert.ok(record < build.indexOf("mkdir -p release-assets"));
     assert.ok(build.includes(`"$${variable}.build.json"`));
+  }
+  const jobs = [...workflow.matchAll(/^  ([\w-]+):\n([\s\S]*?)(?=^  [\w-]+:\n|$(?![\s\S]))/gm)];
+  assert.match(build, /uses: actions\/upload-artifact@[^\n]+\n\s+with:\n\s+name: linux-release-\$\{\{ matrix\.arch \}\}\n\s+path: release-assets\/\*/);
+  assert.match(build, /arch: amd64/);
+  const smokeJobs = jobs.filter(([, , body]) => body.includes("uses: ./.github/workflows/linux-package-smoke"));
+  assert.ok(smokeJobs.length > 0);
+  for (const [, name, body] of smokeJobs) {
+    assert.match(body, /needs:\s*(?:build|\[[^\]]*\bbuild\b[^\]]*\])/);
+    assert.match(body, /uses: actions\/download-artifact@[^\n]+\n\s+with:\n\s+name: linux-release-amd64\n\s+path: release-assets/);
+    assert.match(body, /release-assets\/\$\{\{ needs\.build\.outputs\.appimage \}\}/);
+    assert.match(body, /release-assets\/\$\{\{ needs\.build\.outputs\.deb \}\}/);
+    assert.ok(upload.match(/needs:\s*\[([^\]]+)\]/)?.[1].split(",").map((need) => need.trim()).includes(name), `upload must need ${name}`);
   }
   assert.match(upload, /BUILD_COMMIT: \$\{\{ needs\.build\.outputs\.commit \}\}/);
   assert.match(upload, /git fetch --no-tags origin[^\n]+\n\s+destination_commit=\$\(git rev-parse --verify "refs\/tags\/\$\{RELEASE_TAG\}\^\{commit\}"\)/);

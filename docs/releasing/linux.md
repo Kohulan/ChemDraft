@@ -37,14 +37,42 @@ The workflow:
 5. Repacks the AppImage after Tauri bundles it. It uses the host's Wayland and compiler runtime
    libraries, and the job verifies that the finished image contains no `libwayland-*`,
    `libstdc++.so*`, or `libgcc_s.so*` files or symlinks.
-6. Runs the repacked AppImage with `--appimage-extract-and-run` and installs and runs the `.deb`.
-   Both smoke tests use Xvfb and openbox and fail if the window fails to appear, ChemDraft exits or
-   panics during startup, or a WebKitWebProcess crashes.
-7. Records the source commit and final bytes of each package. Before uploading, it fetches the
-   draft's tag and checks that the tag resolves to the build commit. It then validates the attached
-   builds and refreshes the combined checksums.
+6. Records the source commit and final bytes of each package, then stages the packages, records,
+   and checksums as the `linux-release-amd64` workflow artifact.
+7. Runs independent smoke jobs on **Ubuntu 22.04 and 24.04**. Each downloads and verifies the same
+   22.04-built packages against `SHA256SUMS-linux.txt`. The jobs run both package checks, even
+   when the AppImage or the other runner fails.
+8. After both smoke jobs pass, fetches the draft's tag and checks that it resolves to the build
+   commit. It uploads to the existing draft, validates the attached builds, and refreshes the
+   combined checksums.
 
 Add a `## Linux` section when preparing the release body.
+
+## Ubuntu smoke diagnostics
+
+Both runners use the package smoke composite action shared with the container workflow. Each
+runner restores the AppImage's executable bit and launches it with `--appimage-extract-and-run`
+before apt installs the `.deb` and its dependencies. Each launch uses Xvfb, Openbox, a private
+D-Bus session, and fresh XDG directories. Xvfb selects a free display with RANDR and GLX enabled,
+and the action waits for Openbox readiness. The action checks that the app and a WebKit web process
+start and a ChemDraft window appears within 60 seconds. The app must stay up for another 20 seconds,
+with a visible window and live web process at the end. A WebKit web process crash or app panic fails
+the check. The harness matches processes and windows to the active launch by process ancestry.
+
+The `linux-smoke-amd64-ubuntu-22.04` and `linux-smoke-amd64-ubuntu-24.04` artifacts preserve
+package setup, library versions, display, app, and process logs even when smoke fails. The harness
+records the traced launch's exit status and any encoded signal, and labels signals it sends during
+cleanup. It also records profile contents and the single-instance D-Bus name owner. The `ldd` logs
+cover the app and WebKit helpers, using installed paths for the `.deb` and AppRun's library paths
+for the AppImage. Compare the reported package versions across runners since `4.1` names the
+WebKitGTK ABI.
+
+A failed launch gets a GDB retry with a fresh profile and D-Bus session and synchronous GTK X11
+errors. The retry times out after 90 seconds, with a further ten seconds before SIGKILL. It records
+thread stacks if GDB catches a fatal signal or reaches an exit breakpoint. For the AppImage, the
+action uses a disposable extraction so the app under GDB has AppRun's environment and GDB can use
+host libraries and Python. A successful retry leaves the original failure in place. GDB frame
+detail depends on the binary's available symbols.
 
 ## Container smoke test
 

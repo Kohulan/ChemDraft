@@ -55,6 +55,8 @@ jobs:
     outputs:
       commit: ${{ steps.source.outputs.commit }}
       version: ${{ steps.bundle.outputs.version }}
+      deb: ${{ steps.bundle.outputs.deb-name }}
+      appimage: ${{ steps.bundle.outputs.appimage-name }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -163,6 +165,8 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "deb=$deb" >> "$GITHUB_OUTPUT"
           echo "appimage=$appimage" >> "$GITHUB_OUTPUT"
+          echo "deb-name=$(basename "$deb")" >> "$GITHUB_OUTPUT"
+          echo "appimage-name=$(basename "$appimage")" >> "$GITHUB_OUTPUT"
 
       - name: Repack AppImage with host Wayland and compiler runtimes
         env:
@@ -202,32 +206,6 @@ jobs:
           fi
           mv ../repacked.AppImage "$image"
 
-      - name: Install smoke test tools
-        run: sudo -E apt-get install -y --no-install-recommends dbus-daemon openbox strace xdotool xvfb
-
-      - name: Smoke test the repacked AppImage
-        uses: ./.github/workflows/linux-package-smoke
-        with:
-          bundle: ${{ steps.bundle.outputs.appimage }}
-          package: appimage
-          backend: x11
-          logs: ${{ runner.temp }}/smoke-appimage
-          check-window: 'true'
-
-      - name: Install the .deb
-        env:
-          DEB: ${{ steps.bundle.outputs.deb }}
-        run: sudo -E apt-get install -y --no-install-recommends "./$DEB"
-
-      - name: Smoke test the installed .deb
-        uses: ./.github/workflows/linux-package-smoke
-        with:
-          bundle: /usr/bin/chemdraft
-          package: deb
-          backend: x11
-          logs: ${{ runner.temp }}/smoke-deb
-          check-window: 'true'
-
       - name: Record and stage the final packages
         env:
           DEB: ${{ steps.bundle.outputs.deb }}
@@ -253,8 +231,86 @@ jobs:
           path: release-assets/*
           if-no-files-found: error
 
-  upload:
+  smoke:
     needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      NEEDRESTART_MODE: a
+    steps:
+      # Use the action that belongs to the workflow, even when building an older source ref.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-release-amd64
+          path: release-assets
+
+      - name: Verify the packages and install smoke test tools
+        id: prepare
+        env:
+          APPIMAGE_PACKAGE: release-assets/${{ needs.build.outputs.appimage }}
+        run: |
+          set -euo pipefail
+          mkdir -p smoke-logs
+          exec > >(tee smoke-logs/setup.log) 2>&1
+          (cd release-assets && sha256sum --check SHA256SUMS-linux.txt)
+          sudo apt-get update
+          sudo -E apt-get install -y --no-install-recommends \
+            dbus-bin dbus-daemon gdb openbox strace x11-utils xdotool xvfb \
+            libgtk-3-bin libxdo3 libegl1 libegl-mesa0 libgl1 libgl1-mesa-dri \
+            libwayland-client0 libwayland-egl1 libwayland-cursor0 libwayland-server0
+          chmod +x "$APPIMAGE_PACKAGE"
+
+      - name: Smoke test the repacked AppImage
+        uses: ./.github/workflows/linux-package-smoke
+        with:
+          bundle: release-assets/${{ needs.build.outputs.appimage }}
+          package: appimage
+          backend: x11
+          logs: ${{ github.workspace }}/smoke-logs/appimage
+          check-window: 'true'
+          diagnostics: 'true'
+
+      - name: Install the .deb
+        id: install-deb
+        # Still test the .deb if the AppImage fails. Test the AppImage before apt adds .deb dependencies.
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        env:
+          DEB: release-assets/${{ needs.build.outputs.deb }}
+        run: |
+          set -euo pipefail
+          sudo -E apt-get install -y --no-install-recommends "./$DEB" 2>&1 | tee smoke-logs/install-deb.log
+
+      - name: Smoke test the installed .deb
+        if: ${{ !cancelled() && steps.install-deb.outcome == 'success' }}
+        uses: ./.github/workflows/linux-package-smoke
+        with:
+          bundle: /usr/bin/chemdraft
+          package: deb
+          backend: x11
+          logs: ${{ github.workspace }}/smoke-logs/deb
+          check-window: 'true'
+          diagnostics: 'true'
+
+      - name: Preserve Linux smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-smoke-amd64-${{ matrix.runner }}
+          path: smoke-logs/
+          if-no-files-found: ignore
+
+  upload:
+    needs: [build, smoke]
     if: github.repository == 'jgassens/ChemDraft' && !github.event.repository.fork && inputs.upload_to_release != ''
     runs-on: ubuntu-latest
     concurrency:
