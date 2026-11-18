@@ -126,6 +126,7 @@ import {
   applyPatches,
   toEngineDocument,
   createDocumentHistory,
+  isDativeBond,
   moleculeToMolfileV2000,
   UnknownBondOrderError,
   nativeDrawingStyleFromObjectStyle,
@@ -3047,12 +3048,12 @@ export function MainWindow({
   toolsetRegistryRef.current = toolsetRegistry;
 
   const selectedMolecule = getSelectedMolecule(document);
-  // Exclude drawing-only fields while retaining stereochemical bond styles and bracket context.
+  // Exclude drawing-only fields while retaining chemistry-bearing bond styles and bracket context.
   const inspectorSubject = selectedMolecule ? analysisSubjectKey({
     ...selectedMolecule,
     atoms: selectedMolecule.atoms.map(({ labelVisible: _visible, labelOffset: _offset, warningSuppressed: _warning, ...atom }) => atom),
     bonds: selectedMolecule.bonds.map(({ display, ...bond }) => ({ ...bond,
-      ...(display?.bondStyle && ["wedge", "hashed", "wavy"].includes(display.bondStyle)
+      ...(display?.bondStyle && (isDativeBond({ ...bond, display }) || ["wedge", "hashed", "wavy"].includes(display.bondStyle))
         ? { display: { bondStyle: display.bondStyle } } : {}) }))
   }, document) + JSON.stringify([selectedMolecule.structureFormat, selectedMolecule.structure]) : undefined;
   const inspectorVisible = molecularInspectorOpen || visibleToolsetIds.has(molecularInspectorToolsetId);
