@@ -199,10 +199,20 @@ jobs:
           cd verify
           ../repacked.AppImage --appimage-extract > repacked-extraction.log
           test -x squashfs-root/AppRun
+          echo 'Shared libraries under usr/lib in the repacked AppImage:'
+          find squashfs-root/usr/lib \( -type f -o -type l \) \( -name '*.so' -o -name '*.so.*' \) -print | LC_ALL=C sort
           leftovers=$(find squashfs-root \( -name 'libwayland-*' -o -name 'libstdc++.so*' \
             -o -name 'libgcc_s.so*' \) -print)
           if [[ -n "$leftovers" ]]; then
             printf '::error::AppImage still contains host libraries\n%s\n' "$leftovers"
+            exit 1
+          fi
+          graphics=$(find squashfs-root \( -name 'libEGL*' -o -name 'libGL.so*' -o -name 'libGLX*' \
+            -o -name 'libGLdispatch*' -o -name 'libgbm*' -o -name 'libdrm*' -o -name 'libglapi*' \
+            -o \( -name dri \( -type d -o -type l \) \) -o -name '*_dri.so' -o -name 'libvulkan*' \) \
+            -print | LC_ALL=C sort)
+          if [[ -n "$graphics" ]]; then
+            printf '::error::AppImage bundles graphics libraries or drivers that must come from the host\n%s\n' "$graphics"
             exit 1
           fi
           mv ../repacked.AppImage "$image"

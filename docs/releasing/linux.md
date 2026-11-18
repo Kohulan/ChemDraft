@@ -36,7 +36,8 @@ The workflow:
    OPSIN runtime.
 5. Repacks the AppImage after Tauri bundles it. It uses the host's Wayland and compiler runtime
    libraries and the host's `libgpg-error.so.0`; the job verifies that the finished image contains no `libwayland-*`,
-   `libstdc++.so*`, or `libgcc_s.so*` files or symlinks.
+   `libstdc++.so*`, or `libgcc_s.so*` files or symlinks. The job logs the bundled shared libraries
+   under `usr/lib` and rejects bundled EGL, GL, GBM, DRM, DRI, and Vulkan libraries or drivers.
 6. Records the source commit and final bytes of each package, then stages the packages, records,
    and checksums as the `linux-release-amd64` workflow artifact.
 7. Runs independent smoke jobs on **Ubuntu 22.04 and 24.04**. Each downloads and verifies the same
@@ -58,6 +59,7 @@ and the action waits for Openbox readiness. The action checks that the app and a
 start and a ChemDraft window appears within 60 seconds. The app must stay up for another 20 seconds,
 with a visible window and live web process at the end. A WebKit web process crash or app panic fails
 the check. The harness matches processes and windows to the active launch by process ancestry.
+The smoke test also reports EGL display initialization failures and logs the display backend settings.
 
 The `linux-smoke-amd64-ubuntu-22.04` and `linux-smoke-amd64-ubuntu-24.04` artifacts preserve
 package setup, library versions, display, app, and process logs even when smoke fails. The harness
@@ -108,6 +110,8 @@ repository on GitHub Pages, or a Flathub listing.
 - Webview: WebKitGTK, origin `tauri://localhost` (as on macOS). Before startup on Linux,
   ChemDraft defaults `WEBKIT_DISABLE_DMABUF_RENDERER` to `1` to avoid Wayland graphics
   problems. An explicit value, including `0`, takes precedence.
+  For AppImage launches, ChemDraft defaults `EGL_PLATFORM` to `x11` when `GDK_BACKEND` starts
+  with `x11` or `WAYLAND_DISPLAY` is unset, and to `wayland` otherwise, preserving any explicit value.
 - Menus: on the document window, as on Windows (`install_app_menu`). Edit ▸ Cut / Copy / Paste
   invoke WebKitGTK's native editing commands in the focused window. The webview receives
   Ctrl+X / C / V directly and uses the same clipboard events for menu clicks and shortcuts.

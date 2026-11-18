@@ -169,8 +169,8 @@ runs:
           export DISPLAY="$display"
         fi
         export GDK_BACKEND="$backend"
-        printf 'App environment: GDK_BACKEND=%s WAYLAND_DISPLAY=%s DISPLAY=%s\n' \
-          "$GDK_BACKEND" "${WAYLAND_DISPLAY-}" "${DISPLAY-}"
+        printf 'Launch environment: EGL_PLATFORM=%s GDK_BACKEND=%s WAYLAND_DISPLAY=%s DISPLAY=%s\n' \
+          "${EGL_PLATFORM-<unset>}" "$GDK_BACKEND" "${WAYLAND_DISPLAY-}" "${DISPLAY-}"
         if [[ "$check_window" == true ]]; then
           openbox > "$logs/openbox.log" 2>&1 &
           wm_pid=$!
@@ -190,9 +190,16 @@ runs:
         if [[ "$package" == appimage ]]; then
           command+=(--appimage-extract-and-run)
         fi
+        report_egl_error() {
+          if grep -qE 'Could not create default EGL display|EGL_BAD_PARAMETER' "$logs/chemdraft.log"; then
+            echo '::error::ChemDraft failed to initialize its EGL display. See chemdraft.log for details.'
+            return 0
+          fi
+          return 1
+        }
         fail() {
           cat "$logs/chemdraft.log"
-          echo "::error::$1"
+          report_egl_error || echo "::error::$1"
           exit 1
         }
         # Trace execs and process exits so a child SIGABRT fails even without a systemd journal.
@@ -241,8 +248,10 @@ runs:
           sleep 1
         done
         [[ -n "$main_pid" ]] || fail 'ChemDraft did not launch'
-        echo 'Display environment seen by ChemDraft:'
-        tr '\0' '\n' < "/proc/$main_pid/environ" | grep -E '^(GDK_BACKEND|WAYLAND_DISPLAY|DISPLAY)=' || true
+        echo 'Display environment inherited by ChemDraft:'
+        tr '\0' '\n' < "/proc/$main_pid/environ" | grep -E '^(EGL_PLATFORM|GDK_BACKEND|WAYLAND_DISPLAY|DISPLAY)=' || true
+        # /proc shows the environment at exec, so read the in-process default from the app log.
+        grep -F 'ChemDraft AppImage EGL default:' "$logs/chemdraft.log" || true
         web_process_running || fail 'No WebKitWebProcess stayed alive during startup'
         window_ready || fail 'No ChemDraft window appeared within 60 seconds'
         for _ in {1..20}; do
@@ -252,6 +261,10 @@ runs:
               || fail 'ChemDraft, its tracer, or the display exited during the 20-second smoke test'
           done
         done
+        if report_egl_error; then
+          cat "$logs/chemdraft.log"
+          exit 1
+        fi
         if awk '
           /execve\("[^"]*\/WebKitWebProcess"/ { webkit[$1] = 1 }
           ($1 in webkit) && /\+\+\+ (killed by SIG(ABRT|BUS|FPE|ILL|KILL|SEGV|SYS|TRAP)|exited with [1-9])/ {
