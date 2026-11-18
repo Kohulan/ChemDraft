@@ -36,6 +36,7 @@ vi.mock("../window-manager", async original => ({
   listenForToolsetPopoverDismiss: async (handler: typeof native.dismiss) => { native.dismiss = handler; return () => {}; },
   listenForToolsetTextStyle: async () => () => {}, requestToolsetPopoverContent: async () => {}, requestToolsetTextStyle: async () => {},
   setCurrentWindowLogicalPosition: async () => {}, setCurrentWindowLogicalSize: async () => {},
+  isToolsetPopoverVisible: async () => true,
   showCurrentToolsetPopoverWindow: native.showPopover,
   sendPaletteCommand: async (commandId: string) => {
     window.dispatchEvent(new CustomEvent("chemdraft:native-command", { detail: { commandId } }));
