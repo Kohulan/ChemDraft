@@ -274,6 +274,7 @@ const base64UrlAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0
 const nativeImportTimestamp = "2026-05-29T00:00:00.000Z";
 const defaultCdxmlStrokeColor = "#000000";
 const defaultCdxmlFillColor = "none";
+const defaultCdxmlBackgroundColor = "#ffffff";
 const defaultCdxmlLineWidthPx = 0.8;
 const defaultCdxmlBoldWidthPx = 2.68;
 const defaultCdxmlCornerRadiusFactor = 100;
@@ -312,6 +313,7 @@ type ExportColorTable = string[];
 
 interface VisibleExportContext {
   page: DocumentPage;
+  pageBackgroundColor: string;
   format: "CDXML" | "CDX";
   embedNativePayload: boolean;
   colors: ExportColorTable;
@@ -454,10 +456,14 @@ function exportCdxml(
   const reactionAllocator = createIdAllocator(0, reactionIds);
   for (const page of parsedDocument.pages) reactionAllocator.sourceId(page.id);
   const unknownObjects: UnknownObjectExportDiagnostics = { embedNativePayload, format, droppedOriginalIds: [], hasDroppedNativeObjects: false };
+  const documentBackgroundColor = normalizeRectangleColor(parsedDocument.styles.backgroundColor) ?? defaultCdxmlBackgroundColor;
   let sharedPrintMargins = pagePrintMargins(parsedDocument.pages[0]);
   const fittedPages = parsedDocument.pages.map((page, pageIndex) => {
+    // The page layout schema contains dimensions and margins. Explicit page colors can
+    // travel in page compatibility metadata and override the document's style metadata.
+    const pageBackgroundColor = normalizeRectangleColor(page.compatibility?.unknown.backgroundColor) ?? documentBackgroundColor;
     const fitted = fitVisiblePage(page,
-      buildVisiblePageChildren(page, warnings, fonts, colors,
+      buildVisiblePageChildren(page, pageBackgroundColor, warnings, fonts, colors,
         preserveReferenceIds ? reactionAllocator : createIdAllocator(pageIndex), unknownObjects), warnings,
       parsedDocument.pages.length === 1, sharedPrintMargins);
     // Retain an equivalent source root spelling, and use its exact numbers for later grids.
@@ -977,8 +983,8 @@ function restorePageOffset(page: XmlElementView, warnings: CompatibilityConversi
   }
 }
 
-function buildVisiblePageChildren(page: DocumentPage, warnings: CompatibilityConversionWarning[], fonts: readonly CdxmlFont[], colors: ExportColorTable, allocator: IdAllocator, unknownObjects: UnknownObjectExportDiagnostics): string {
-  const context = createVisibleExportContext(page, colors, unknownObjects.format === "cdx" ? "CDX" : "CDXML", unknownObjects.embedNativePayload);
+function buildVisiblePageChildren(page: DocumentPage, pageBackgroundColor: string, warnings: CompatibilityConversionWarning[], fonts: readonly CdxmlFont[], colors: ExportColorTable, allocator: IdAllocator, unknownObjects: UnknownObjectExportDiagnostics): string {
+  const context = createVisibleExportContext(page, pageBackgroundColor, colors, unknownObjects.format === "cdx" ? "CDX" : "CDXML", unknownObjects.embedNativePayload);
   const objectsById = new Map(page.objects.map((object) => [object.id, object]));
   const preserveSourceIds = page.objects.some(needsSourceGraphicIds);
   for (const object of page.objects) {
@@ -1370,7 +1376,7 @@ function exportVisibleObject(
     return exportReactionArrowObject(object, context.ids, allocator, objectsById, warnings, context.colors, unknownObjects.format);
   }
   if (object.type === "graphic") {
-    return exportGraphicObject(object, context.ids, allocator, warnings, context.colors);
+    return exportGraphicObject(object, context, allocator, warnings);
   }
   if (object.type === "bracket") {
     if (!canExportBracketGlyph(object)) warnings.push({
@@ -1717,7 +1723,7 @@ function exportBracketPairs(page: DocumentPage, context: VisibleExportContext, a
   return groups;
 }
 
-function createVisibleExportContext(page: DocumentPage, colors: ExportColorTable, format: VisibleExportContext["format"], embedNativePayload: boolean): VisibleExportContext {
+function createVisibleExportContext(page: DocumentPage, pageBackgroundColor: string, colors: ExportColorTable, format: VisibleExportContext["format"], embedNativePayload: boolean): VisibleExportContext {
   const crossingPartnerKeysByRefKey = new Map<string, Set<string>>();
   const crossingFrontKeysByRefKey = new Map<string, { front: number; back: number }>();
 
@@ -1733,6 +1739,7 @@ function createVisibleExportContext(page: DocumentPage, colors: ExportColorTable
 
   return {
     page,
+    pageBackgroundColor,
     format,
     embedNativePayload,
     colors,
@@ -2188,10 +2195,9 @@ function exportReactionArrowObject(
 
 function exportGraphicObject(
   graphic: GraphicObject,
-  ids: Map<string, string>,
+  { ids, colors, pageBackgroundColor, format }: VisibleExportContext,
   allocator: IdAllocator,
-  warnings: CompatibilityConversionWarning[],
-  colors: ExportColorTable
+  warnings: CompatibilityConversionWarning[]
 ): string {
   if (graphic.graphicKind === "image") {
     warnings.push({ code: "cdxml.picture_not_saved", message: `CDXML export: picture ${graphic.id} is not saved in CDXML`, sourceObjectId: graphic.id });
@@ -2238,7 +2244,7 @@ function exportGraphicObject(
     return exportGraphicAsCdxmlArrow(graphic, graphicId, warnings, colors);
   }
   warnForGenericGraphicMarkerLoss(graphic, warnings);
-  return exportGraphicAsCdxmlGraphic(graphic, graphicId, warnings, colors);
+  return exportGraphicAsCdxmlGraphic(graphic, graphicId, warnings, colors, pageBackgroundColor, format);
 }
 
 function needsSourceGraphicIds(object: DocumentObject): boolean {
@@ -2480,7 +2486,8 @@ function warnForGraphicCdxmlLimitations(
 ): void {
   const color = graphic.style.strokeColor ?? graphic.style.color ?? graphic.style.fillColor;
   // Curves encode custom colors and path controls themselves; these warnings apply only to graphics.
-  if (!exportsCurve && typeof color === "string" && color.length > 0 && color.toLowerCase() !== "none" && normalizeHexColor(color) === undefined) {
+  const normalizeColor = graphic.graphicKind === "rect" ? normalizeRectangleColor : normalizeHexColor;
+  if (!exportsCurve && typeof color === "string" && color.length > 0 && color.trim().toLowerCase() !== "none" && normalizeColor(color) === undefined) {
     warnings.push({
       code: "cdxml.graphic_color_approximation",
       message: `Native graphic color "${color}" cannot be represented as an RGB color and is preserved exactly only in the embedded ChemDraft payload.`,
@@ -2535,7 +2542,9 @@ function exportGraphicAsCdxmlGraphic(
   graphic: GraphicObject,
   graphicId: string,
   warnings: CompatibilityConversionWarning[],
-  colors: ExportColorTable
+  colors: ExportColorTable,
+  pageBackgroundColor = defaultCdxmlBackgroundColor,
+  format: VisibleExportContext["format"] = "CDXML"
 ): string {
   const type = cdxmlGraphicTypeForNativeGraphic(graphic);
   if (!type) {
@@ -2543,12 +2552,14 @@ function exportGraphicAsCdxmlGraphic(
       message: `Native ${graphic.data.artPathKind ?? graphic.graphicKind} graphic ${graphic.id} has no faithful CDXML representation and is NOT written in the visible layer.` });
     return "";
   }
+  const rectangle = type === "Rectangle" ? cdxmlRectangleStyle(graphic, pageBackgroundColor, warnings, format) : undefined;
   const attrs = [
     `id="${graphicId}"`,
-    ...cdxmlGraphicColorAttribute(graphic, warnings, colors),
+    ...(rectangle ? cdxmlColorAttribute(rectangle.color, colors) : cdxmlGraphicColorAttribute(graphic, warnings, colors)),
     `GraphicType="${type}"`,
     `BoundingBox="${escapeXmlAttribute(cdxmlBoundingBoxForGraphic(graphic, objectCornerPoints(graphic)))}"`,
     ...(type === "Line" || type === "Arc" ? cdxmlLineTypeAttributes(graphic) : []),
+    ...(rectangle?.attributes ?? []),
     ...cdxmlShapeSubtypeAttributes(graphic)
   ];
   if (type === "Oval" || type === "Rectangle") {
@@ -2814,15 +2825,6 @@ function cdxmlShapeSubtypeAttributes(graphic: GraphicObject): string[] {
       attrs.push(`OvalType="${ovalType}"`);
     }
   }
-  if (graphic.graphicKind === "rect") {
-    const rectangleType = cdxmlRectangleTypeForGraphic(graphic);
-    if (rectangleType) {
-      attrs.push(`RectangleType="${rectangleType}"`);
-    }
-    if (graphic.data.cornerRadiusPx !== undefined) {
-      attrs.push(`CornerRadius="${formatNumber(cssPxToCdxml(graphic.data.cornerRadiusPx) * defaultCdxmlCornerRadiusFactor)}"`);
-    }
-  }
   if (graphic.style.effect === "shadow") {
     attrs.push('ShadowSize="400"');
   }
@@ -2844,27 +2846,46 @@ function cdxmlOvalTypeForGraphic(graphic: GraphicObject): string | undefined {
   return undefined;
 }
 
-function cdxmlRectangleTypeForGraphic(graphic: GraphicObject): string | undefined {
-  const roundEdge = typeof graphic.data.cornerRadiusPx === "number" && graphic.data.cornerRadiusPx > 0;
-  const dashed = Boolean(graphic.style.strokeDasharray);
+/** Both visible writers encode one rectangle color, including for decorated rectangles. */
+function cdxmlRectangleStyle(
+  graphic: GraphicObject,
+  pageBackgroundColor: string,
+  warnings: CompatibilityConversionWarning[],
+  format: VisibleExportContext["format"]
+): { color: string; attributes: string[] } {
+  const fill = normalizeRectangleColor(graphic.style.fillColor);
+  const authoredStroke = graphic.style.strokeColor ?? graphic.style.color;
+  const normalizedStroke = normalizeRectangleColor(authoredStroke);
+  const stroke = normalizedStroke ?? defaultCdxmlStrokeColor;
+  const useFill = fill !== undefined && fill !== defaultCdxmlBackgroundColor && fill !== pageBackgroundColor;
+  const color = useFill ? fill : stroke;
+  const filled = fill === color;
   const shadow = graphic.style.effect === "shadow";
-  return [
-    roundEdge && "RoundEdge",
+  const dropsOutline = useFill && authoredStroke?.trim().toLowerCase() !== "none" &&
+    graphic.style.strokeWidth !== 0 && fill !== stroke;
+  if (dropsOutline || (!filled && graphicHasVisibleFill(graphic))) {
+    const kept = useFill ? `fill ${fill}` : `outline ${stroke}`;
+    const omitted = useFill ? `outline ${normalizedStroke ?? authoredStroke ?? stroke}` : `explicit fill ${graphic.style.fillColor}`;
+    warnings.push({
+      code: "cdxml.graphic_single_color",
+      sourceObjectId: graphic.id,
+      message: `${format} rectangles store a single color. Rectangle ${graphic.id} writes the ${kept} and omits the ${omitted}.`
+    });
+  }
+  const radius = graphic.data.cornerRadiusPx;
+  const subtype = [
+    radius !== undefined && radius > 0 && "RoundEdge",
     shadow && "Shadow",
-    dashed && "Dashed",
-    cdxmlRectangleHasRepresentableFill(graphic) && "Filled"
-  ].filter(Boolean).join(" ") || undefined;
-}
-
-function cdxmlRectangleHasRepresentableFill(graphic: GraphicObject): boolean {
-  if (!cdxmlRectanglePreservesOutline(graphic)) return graphicHasVisibleFill(graphic);
-  const stroke = normalizeHexColor(graphic.style.strokeColor ?? graphic.style.color ?? defaultCdxmlStrokeColor);
-  return graphicHasVisibleFill(graphic) && stroke !== undefined && stroke === normalizeHexColorValue(graphic.style.fillColor);
-}
-
-function cdxmlRectanglePreservesOutline(graphic: GraphicObject): boolean {
-  return (typeof graphic.data.cornerRadiusPx === "number" && graphic.data.cornerRadiusPx > 0) ||
-    graphic.style.effect === "shadow";
+    graphic.style.strokeDasharray && "Dashed",
+    filled && "Filled"
+  ].filter(Boolean).join(" ");
+  const attributes = [
+    ...(subtype ? [`RectangleType="${subtype}"`] : []),
+    ...(radius !== undefined ? [`CornerRadius="${formatNumber(cssPxToCdxml(radius) * defaultCdxmlCornerRadiusFactor)}"`] : []),
+    // Shadow implies a white interior unless FillType explicitly turns it off.
+    ...(shadow && !filled && fill !== defaultCdxmlBackgroundColor ? ['FillType="None"'] : [])
+  ];
+  return { color, attributes };
 }
 
 function cdxmlLineTypeAttributes(graphic: GraphicObject): string[] {
@@ -2902,41 +2923,26 @@ function cdxmlGraphicColorIndex(
   warnings: CompatibilityConversionWarning[],
   colors: ExportColorTable
 ): number | undefined {
-  // The single color becomes the stroke on import, plus the fill for Filled/Shaded subtypes.
-  // Rounded/shadowed rectangles keep the outline; plain rectangles retain the release-1.2 fill color.
-  const subtype = cdxmlShapeSubtypeForColor(graphic);
+  const subtype = graphic.graphicKind === "ellipse" ? cdxmlOvalTypeForGraphic(graphic)?.toLowerCase() ?? "" : "";
   const fillDerivedFromColor = subtype.includes("filled") || subtype.includes("shaded");
   const strokeColor = graphic.style.strokeColor ?? graphic.style.color;
   const fillColor = graphic.style.fillColor;
-  const preserveRectangleOutline = graphic.graphicKind === "rect" && cdxmlRectanglePreservesOutline(graphic);
-  const droppedRectangleFill = preserveRectangleOutline && graphicHasVisibleFill(graphic) && !cdxmlRectangleHasRepresentableFill(graphic);
-  const color = preserveRectangleOutline ? strokeColor ?? defaultCdxmlStrokeColor : fillDerivedFromColor
+  const color = fillDerivedFromColor
     ? fillColor ?? graphic.style.color ?? strokeColor
     : strokeColor ?? fillColor;
   if (
-    droppedRectangleFill || fillDerivedFromColor &&
+    fillDerivedFromColor &&
     strokeColor &&
     fillColor &&
     normalizeHexColor(strokeColor) !== normalizeHexColor(fillColor)
   ) {
     warnings.push({
       code: "cdxml.graphic_single_color",
-      message: droppedRectangleFill
-        ? "CDXML graphics store a single color; the outline color was preserved and the distinct fill was not written."
-        : "CDXML graphics store a single color; the visible fill was preserved and the distinct stroke color was dropped.",
+      message: "CDXML graphics store a single color; the visible fill was preserved and the distinct stroke color was dropped.",
       sourceObjectId: graphic.id
     });
   }
   return color && color.toLowerCase() !== "none" ? cdxmlColorIndexForHex(color, colors) : undefined;
-}
-
-function cdxmlShapeSubtypeForColor(graphic: GraphicObject): string {
-  const subtype = graphic.graphicKind === "ellipse"
-    ? cdxmlOvalTypeForGraphic(graphic)
-    : graphic.graphicKind === "rect"
-      ? cdxmlRectangleTypeForGraphic(graphic)
-      : undefined;
-  return (subtype ?? "").toLowerCase();
 }
 
 function cdxmlBoundingBoxForGraphic(graphic: GraphicObject, fallbackPoints: readonly Point[]): string {
@@ -2997,9 +3003,29 @@ function normalizeHexColor(color: string): string | undefined {
   return rgb ? rgbToHexColor(rgb.r, rgb.g, rgb.b) : undefined;
 }
 
+function normalizeRectangleColor(color: unknown): string | undefined {
+  if (typeof color !== "string") return undefined;
+  const hex = normalizeHexColor(color);
+  if (hex) return hex;
+  const text = color.trim().toLowerCase();
+  if (text === "white") return defaultCdxmlBackgroundColor;
+  const shorthand = /^#([0-9a-f]{3})$/.exec(text);
+  if (shorthand) return `#${[...shorthand[1]].map(digit => digit.repeat(2)).join("")}`;
+
+  const cssRgb = /^rgb\(([^)]+)\)$/.exec(text);
+  if (!cssRgb) return undefined;
+  const components = cssRgb[1].trim().split(cssRgb[1].includes(",") ? /\s*,\s*/ : /\s+/);
+  if (components.length !== 3 || components.some(component => !/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)%?$/.test(component))) return undefined;
+  const [r, g, b] = components.map(component => {
+    const value = component.endsWith("%") ? Number(component.slice(0, -1)) / 100 * 255 : Number(component);
+    return Math.round(Math.max(0, Math.min(255, value)));
+  });
+  return rgbToHexColor(r, g, b);
+}
+
 function graphicHasVisibleFill(graphic: GraphicObject): boolean {
   const fill = graphic.style.fillColor;
-  return typeof fill === "string" && fill.length > 0 && fill.toLowerCase() !== "none";
+  return typeof fill === "string" && fill.length > 0 && fill.trim().toLowerCase() !== "none";
 }
 
 function cdxmlAxisAttributes(graphic: GraphicObject): string[] {
