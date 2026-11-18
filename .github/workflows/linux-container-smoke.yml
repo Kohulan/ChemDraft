@@ -51,7 +51,10 @@ jobs:
             image: debian:sid
           - distro: fedora
             image: fedora:latest
-    container: ${{ matrix.image }}
+    container:
+      image: ${{ matrix.image }}
+      # strace needs ptrace inside the container.
+      options: --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
     defaults:
       run:
         shell: bash

@@ -91,7 +91,8 @@ by the release workflow's separate publishing job. The build itself runs with re
 The workflow checks Debian sid and Fedora under Xvfb and headless Weston. Debian installs the
 .deb with apt and Fedora extracts its payload and runs it with Fedora's libraries. Each job
 uploads display, app, and process logs. These tests cover startup and subprocess crashes. GPU
-rendering still needs a desktop check.
+rendering still needs a desktop check. The containers grant `SYS_PTRACE` and use unconfined seccomp
+so `strace` can trace the app.
 
 ## Updates
 
