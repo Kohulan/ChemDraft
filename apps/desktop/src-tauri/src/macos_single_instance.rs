@@ -10,14 +10,16 @@ use std::{
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::Path,
+    sync::{mpsc, Arc},
     thread,
     time::{Duration, Instant},
 };
-use tauri::{plugin::TauriPlugin, AppHandle, Manager, Runtime};
+use tauri::{plugin::TauriPlugin, AppHandle, Context, Manager, RunEvent, Url, Wry};
 
 const LOCK_FILE: &str = "single-instance.lock";
 const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(2);
+const LAUNCH_OPEN_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Deserialize, Serialize)]
 struct Endpoint {
@@ -28,8 +30,16 @@ struct Endpoint {
 #[derive(Debug, Deserialize, Serialize)]
 struct Launch {
     token: [u8; 32],
-    argv: Vec<String>,
-    cwd: String,
+    #[serde(flatten)]
+    request: LaunchRequest,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct LaunchRequest {
+    pub argv: Vec<String>,
+    pub cwd: String,
+    #[serde(default)]
+    pub urls: Vec<Url>,
 }
 
 // Never unlink this file: replacing its inode would let a second process lock a different file.
@@ -83,27 +93,27 @@ impl InstanceLock {
     }
 }
 
-pub fn init<R, F>(callback: F) -> TauriPlugin<R>
-where
-    R: Runtime,
-    F: Fn(&AppHandle<R>, Vec<String>, String) + Send + Sync + 'static,
-{
-    tauri::plugin::Builder::new("single-instance")
+pub fn init(
+    context: Context<Wry>,
+    callback: impl Fn(&AppHandle<Wry>, LaunchRequest) + Send + Sync + 'static,
+) -> tauri::Result<(Context<Wry>, TauriPlugin<Wry>)> {
+    // Match PathResolver::app_data_dir before building either app. The configured identifier keeps
+    // stable and dev separate even for unpackaged development executables.
+    let directory = dirs::data_dir()
+        .ok_or(tauri::Error::UnknownPath)?
+        .join(&context.config().identifier);
+    let Some(mut guard) = InstanceLock::acquire(&directory)? else {
+        forward_secondary(context, &directory)?;
+        std::process::exit(0);
+    };
+    let plugin = tauri::plugin::Builder::new("single-instance")
         .setup(move |app, _| {
-            // Tauri derives this directory from the configured identifier, so stable and all dev
-            // worktrees have separate locks, including bare `run-app --dev` executables.
-            let directory = app.path().app_data_dir()?;
-            let Some(mut guard) = InstanceLock::acquire(&directory)? else {
-                forward_launch(&directory, std::env::args().collect(), current_directory()?)?;
-                // No webview, session read, settings read, or application setup in this process.
-                std::process::exit(0);
-            };
             let (listener, endpoint) = guard.publish()?;
             let app_handle = app.clone();
             thread::Builder::new()
                 .name("single-instance".into())
                 .spawn(move || {
-                    let callback = std::sync::Arc::new(callback);
+                    let callback = Arc::new(callback);
                     for connection in listener.incoming() {
                         let result = connection.and_then(|mut stream| {
                             stream.set_read_timeout(Some(HANDOFF_TIMEOUT))?;
@@ -113,7 +123,7 @@ where
                                 let callback = callback.clone();
                                 app_handle
                                     .run_on_main_thread(move || {
-                                        callback(&app, launch.argv, launch.cwd);
+                                        callback(&app, launch);
                                     })
                                     .map_err(io::Error::other)
                             })
@@ -128,11 +138,45 @@ where
             app.manage(guard);
             Ok(())
         })
-        .build()
+        .build();
+    Ok((context, plugin))
 }
 
-fn current_directory() -> io::Result<String> {
-    Ok(std::env::current_dir()?.to_string_lossy().into_owned())
+fn forward_secondary(mut context: Context<Wry>, directory: &Path) -> tauri::Result<()> {
+    // LaunchServices sends `open -n ... file` as application:openURLs:, independently of argv.
+    // Use a windowless AppKit loop so Tao can receive it without running ChemDraft's app setup.
+    context.config_mut().app.windows.clear();
+    let mut app = tauri::Builder::default()
+        .enable_macos_default_menu(false)
+        .build(context)?;
+    app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+    let (send_urls, received_urls) = mpsc::channel();
+    let exit_code = app.run_return(move |app, event| match event {
+        RunEvent::Opened { urls } => {
+            let _ = send_urls.send(urls);
+        }
+        // Tao emits Ready from applicationDidFinishLaunching. Keep pumping events for the whole
+        // window because LaunchServices can deliver several Opened events for a single launch.
+        RunEvent::Ready => {
+            let app = app.clone();
+            thread::spawn(move || {
+                thread::sleep(LAUNCH_OPEN_WINDOW);
+                app.exit(0);
+            });
+        }
+        _ => {}
+    });
+    if exit_code != 0 {
+        return Err(
+            io::Error::other(format!("launch event loop exited with status {exit_code}")).into(),
+        );
+    }
+    let launch = LaunchRequest {
+        argv: std::env::args().collect(),
+        cwd: std::env::current_dir()?.to_string_lossy().into_owned(),
+        urls: received_urls.try_iter().flatten().collect(),
+    };
+    Ok(forward_launch(directory, launch)?)
 }
 
 fn read_endpoint(directory: &Path) -> io::Result<Endpoint> {
@@ -140,8 +184,8 @@ fn read_endpoint(directory: &Path) -> io::Result<Endpoint> {
     Ok(serde_json::from_reader(file.take(1024))?)
 }
 
-fn forward_launch(directory: &Path, argv: Vec<String>, cwd: String) -> io::Result<()> {
-    forward_launch_with(directory, argv, cwd, |endpoint| {
+fn forward_launch(directory: &Path, launch: LaunchRequest) -> io::Result<()> {
+    forward_launch_with(directory, launch, |endpoint| {
         let address = SocketAddr::from((Ipv4Addr::LOCALHOST, endpoint.port));
         let stream = TcpStream::connect_timeout(&address, HANDOFF_TIMEOUT)?;
         stream.set_read_timeout(Some(HANDOFF_TIMEOUT))?;
@@ -152,12 +196,11 @@ fn forward_launch(directory: &Path, argv: Vec<String>, cwd: String) -> io::Resul
 
 fn forward_launch_with<S: Read + Write>(
     directory: &Path,
-    argv: Vec<String>,
-    cwd: String,
+    launch: LaunchRequest,
     mut connect: impl FnMut(&Endpoint) -> io::Result<S>,
 ) -> io::Result<()> {
     // The owner may have just taken flock and not published its endpoint yet. Never start a rival
-    // on a timeout or I/O failure; propagate the error out of plugin setup instead.
+    // on a timeout or I/O failure; report the error to the forwarding process.
     let deadline = Instant::now() + HANDOFF_TIMEOUT;
     let (endpoint, mut stream) = loop {
         let connection = read_endpoint(directory)
@@ -170,12 +213,11 @@ fn forward_launch_with<S: Read + Write>(
     };
     let request = serde_json::to_vec(&Launch {
         token: endpoint.token,
-        argv,
-        cwd,
+        request: launch,
     })?;
     if request.len() > MAX_MESSAGE_BYTES {
         return Err(io::Error::other(
-            "second-launch arguments exceed the handoff limit",
+            "second-launch request exceeds the handoff limit",
         ));
     }
     stream.write_all(&(request.len() as u32).to_le_bytes())?;
@@ -193,7 +235,7 @@ fn forward_launch_with<S: Read + Write>(
 fn receive_launch(
     stream: &mut (impl Read + Write),
     token: &[u8; 32],
-    deliver: impl FnOnce(Launch) -> io::Result<()>,
+    deliver: impl FnOnce(LaunchRequest) -> io::Result<()>,
 ) -> io::Result<()> {
     let mut size = [0; 4];
     stream.read_exact(&mut size)?;
@@ -212,9 +254,8 @@ fn receive_launch(
             "invalid handoff token",
         ));
     }
-    deliver(launch)?;
-    // Acknowledge only after the request is queued on the owner's main thread. An AppleEvent
-    // supplied to `open -n` may not yet exist as argv here; the empty request still shows the owner.
+    deliver(launch.request)?;
+    // Acknowledge only after the request is queued on the owner's main thread.
     stream.write_all(&[1])
 }
 
@@ -371,7 +412,7 @@ mod single_instance_tests {
         let (client, mut server) = streams();
         let client = thread::spawn(move || {
             let mut client = Some(client);
-            forward_launch_with(&path, vec!["ChemDraft".into()], String::new(), |_| {
+            forward_launch_with(&path, LaunchRequest::default(), |_| {
                 Ok(client.take().unwrap())
             })
         });
@@ -387,42 +428,105 @@ mod single_instance_tests {
     }
 
     #[test]
-    fn single_instance_forwards_files_in_order_and_empty_launch_for_activation() {
-        for argv in [
-            vec!["ChemDraft", "relative file.chemdraft", "β.cdxml"],
-            vec!["ChemDraft"],
-        ] {
-            let directory = Directory::new();
-            let mut guard = InstanceLock::acquire(&directory.0).unwrap().unwrap();
-            let endpoint = Endpoint {
-                port: 1,
-                token: [4; 32],
-            };
-            guard.write_endpoint(&endpoint).unwrap();
-            let (client, mut stream) = streams();
-            let server = thread::spawn(move || {
-                let mut delivered = None;
-                receive_launch(&mut stream, &endpoint.token, |launch| {
-                    delivered = Some(launch);
-                    Ok(())
-                })
-                .unwrap();
-                delivered.unwrap()
-            });
-            let expected: Vec<String> = argv.into_iter().map(String::from).collect();
-            let mut client = Some(client);
-            forward_launch_with(
-                &directory.0,
-                expected.clone(),
-                "/drawings with spaces".into(),
-                |_| Ok(client.take().unwrap()),
-            )
-            .unwrap();
-            let launch = server.join().unwrap();
-            assert_eq!(launch.argv, expected);
-            assert_eq!(launch.cwd, "/drawings with spaces");
-            assert!(InstanceLock::acquire(&directory.0).unwrap().is_none());
+    fn single_instance_forwards_open_events_and_reports_missing_files() {
+        let directory = Directory::new();
+        let names = ["first file.chemdraft", "missing file.chemdraft", "β.cdx"];
+        fs::write(directory.0.join(names[0]), "<CDXML/>").unwrap();
+        fs::write(directory.0.join(names[2]), "VjCD0100").unwrap();
+        let urls: Vec<_> = names
+            .iter()
+            .map(|name| Url::from_file_path(directory.0.join(name)).unwrap())
+            .collect();
+        // LaunchServices normally supplies only the executable in argv.
+        let launch = round_trip(
+            &directory.0,
+            LaunchRequest {
+                argv: vec!["ChemDraft".into()],
+                urls: urls.clone(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(launch.urls, urls);
+        let mut opened = Vec::new();
+        let error = crate::deliver_opened_documents(
+            crate::forwarded_document_payloads(launch),
+            |payloads| {
+                assert_eq!(payloads.len(), 2);
+                opened = payloads;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            crate::open_document_payload_from_path(&directory.0.join(names[1]))
+                .err()
+                .expect("missing file must fail")
+        );
+        assert_eq!(opened[0].path, directory.0.join(names[0]).to_str().unwrap());
+        assert_eq!(opened[0].contents, "<CDXML/>");
+        assert_eq!(opened[1].path, directory.0.join(names[2]).to_str().unwrap());
+        assert_eq!(opened[1].bytes.as_deref(), Some(b"VjCD0100".as_slice()));
+    }
+
+    #[test]
+    fn single_instance_keeps_distinct_argv_files_and_accepts_activation_only() {
+        let directory = Directory::new();
+        let first = "first file.chemdraft";
+        let second = "β.cdxml";
+        for name in [first, second] {
+            fs::write(directory.0.join(name), "<CDXML/>").unwrap();
         }
+        let argv = vec!["ChemDraft".into(), first.into(), second.into()];
+        let cwd = directory.0.to_str().unwrap().to_string();
+        let launch = round_trip(
+            &directory.0,
+            LaunchRequest {
+                argv: argv.clone(),
+                cwd: cwd.clone(),
+                urls: vec![Url::from_file_path(directory.0.join(first)).unwrap()],
+            },
+        );
+        assert_eq!(launch.argv, argv);
+        assert_eq!(launch.cwd, cwd);
+        let opened: Vec<_> = crate::forwarded_document_payloads(launch)
+            .map(|payload| payload.unwrap().display_name)
+            .collect();
+        assert_eq!(opened, [first, second]);
+
+        let activation = round_trip(
+            &directory.0,
+            LaunchRequest {
+                argv: vec!["ChemDraft".into()],
+                ..Default::default()
+            },
+        );
+        assert!(crate::forwarded_document_payloads(activation)
+            .next()
+            .is_none());
+    }
+
+    fn round_trip(directory: &Path, launch: LaunchRequest) -> LaunchRequest {
+        let mut guard = InstanceLock::acquire(directory).unwrap().unwrap();
+        let endpoint = Endpoint {
+            port: 1,
+            token: [4; 32],
+        };
+        guard.write_endpoint(&endpoint).unwrap();
+        let (client, mut stream) = streams();
+        let server = thread::spawn(move || {
+            let mut delivered = None;
+            receive_launch(&mut stream, &endpoint.token, |launch| {
+                delivered = Some(launch);
+                Ok(())
+            })
+            .unwrap();
+            delivered.unwrap()
+        });
+        let mut client = Some(client);
+        forward_launch_with(directory, launch, |_| Ok(client.take().unwrap())).unwrap();
+        assert!(InstanceLock::acquire(directory).unwrap().is_none());
+        server.join().unwrap()
     }
 
     #[test]
@@ -442,8 +546,7 @@ mod single_instance_tests {
             } else {
                 let request = serde_json::to_vec(&Launch {
                     token: [2; 32],
-                    argv: vec![],
-                    cwd: String::new(),
+                    request: LaunchRequest::default(),
                 })
                 .unwrap();
                 stream

@@ -1182,10 +1182,14 @@ pub fn run() {
     let perf_log = perf_log::PerfLog::new(perf_enabled);
     let builder = tauri::Builder::default();
 
-    // Both guards run before any webview or app setup can touch session/settings files. macOS
-    // needs an advisory lock too: LaunchServices' normal Opened routing does not cover `open -n`.
+    // Both guards run before any webview or app setup can touch session/settings files.
+    let context = tauri::generate_context!();
     #[cfg(target_os = "macos")]
-    let builder = builder.plugin(macos_single_instance::init(handle_second_launch));
+    let (context, single_instance_plugin) =
+        macos_single_instance::init(context, handle_macos_second_launch)
+            .expect("could not initialize ChemDraft single-instance handoff");
+    #[cfg(target_os = "macos")]
+    let builder = builder.plugin(single_instance_plugin);
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(handle_second_launch));
 
@@ -1703,7 +1707,7 @@ pub fn run() {
             export::rasterize_svg,
             fonts::list_system_fonts
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building ChemDraft")
         .run(|app, event| match event {
             RunEvent::MainEventsCleared => canvas_context_menu::events_cleared(app),
@@ -2946,8 +2950,50 @@ fn second_launch_action(quitting: bool, setup_completed: bool) -> SecondLaunchAc
     }
 }
 
-#[cfg(not(any(target_os = "ios", target_os = "android")))]
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
 fn handle_second_launch<R: Runtime>(app: &tauri::AppHandle<R>, argv: Vec<String>, cwd: String) {
+    handle_second_launch_with(app, || {
+        handle_opened_document_args(app, argv.into_iter().skip(1), Path::new(&cwd))
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn handle_macos_second_launch<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    launch: macos_single_instance::LaunchRequest,
+) {
+    handle_second_launch_with(app, || {
+        deliver_opened_documents(forwarded_document_payloads(launch), |payloads| {
+            deliver_opened_document(app, payloads)
+        })
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn forwarded_document_payloads(
+    launch: macos_single_instance::LaunchRequest,
+) -> impl Iterator<Item = Result<NativeOpenDocumentPayload, String>> {
+    let event_paths: std::collections::HashSet<_> = launch
+        .urls
+        .iter()
+        .filter_map(|url| url.to_file_path().ok())
+        .collect();
+    let arg_paths =
+        openable_document_paths_from_args(launch.argv.into_iter().skip(1), Path::new(&launch.cwd));
+    // Preserve the native event batch. Some callers can also supply the same file in argv.
+    opened_document_payloads_from_urls(launch.urls).chain(
+        arg_paths
+            .into_iter()
+            .filter(move |path| !event_paths.contains(path))
+            .map(|path| open_document_payload_from_path(&path)),
+    )
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+fn handle_second_launch_with<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    open: impl FnOnce() -> Result<(), String>,
+) {
     let setup_completed = app
         .state::<PendingOpenDocument>()
         .setup_completed
@@ -2959,9 +3005,7 @@ fn handle_second_launch<R: Runtime>(app: &tauri::AppHandle<R>, argv: Vec<String>
         );
         return;
     }
-    if let Err(error) =
-        handle_opened_document_args(app, argv.into_iter().skip(1), &PathBuf::from(cwd))
-    {
+    if let Err(error) = open() {
         eprintln!("Could not open ChemDraft document from a second launch: {error}");
     }
     if action == SecondLaunchAction::OpenOnly {
@@ -8211,7 +8255,7 @@ fn handle_opened_document_urls<R: Runtime>(
 
 /// Document paths passed on the command line (Windows/Linux shell opens, and argv forwarded from a
 /// second launch). Skip flags and open every supported file in argument order.
-#[cfg(not(any(target_os = "ios", target_os = "android")))]
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
 fn handle_opened_document_args<R: Runtime>(
     app: &tauri::AppHandle<R>,
     args: impl IntoIterator<Item = String>,
