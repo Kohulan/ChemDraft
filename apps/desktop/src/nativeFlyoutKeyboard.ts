@@ -4,14 +4,31 @@ import {
   type ToolsetPopoverOpening
 } from "./window-manager";
 
+function compareOpenings(a: ToolsetPopoverOpening, b: ToolsetPopoverOpening): number {
+  return a.generation === undefined || b.generation === undefined
+    ? (a.openedAt ?? 0) - (b.openedAt ?? 0)
+    : compareToolsetPopoverOpenings(a, b);
+}
+
+const openingKey = (toolsetId: string, flyoutId?: string) => JSON.stringify([toolsetId, flyoutId]);
+
+function rememberDismissal(dismissals: Map<string, ToolsetPopoverOpening>, key: string, opening: ToolsetPopoverOpening) {
+  const previous = dismissals.get(key);
+  const order = previous ? compareOpenings(opening, previous) : 1;
+  // A timestamp-only dismissal covers every generation at that time.
+  if (order > 0 || (order === 0 && opening.generation === undefined)) dismissals.set(key, opening);
+}
+
 /** Install in the document and standalone palette windows: nonactivating flyouts
  * preserve either window's focus. Route keys before toolbar buttons, canvas
  * shortcuts and browser defaults, without transferring window or DOM focus. */
 export function installNativeFlyoutKeyboard(): () => void {
   let session: ToolsetFlyoutSession | undefined;
   let closedThrough = -Infinity;
-  let latestOpen: ToolsetPopoverOpening | undefined;
-  let latestClose: ToolsetPopoverOpening | undefined;
+  let latestOpenedAt = -Infinity;
+  const latestOpens = new Map<string, ToolsetPopoverOpening>();
+  const latestCloses = new Map<string, ToolsetPopoverOpening>();
+  const targetedDismissals = new Map<string, ToolsetPopoverOpening>();
   const activationKeys = new Set<string>();
   let disposed = false;
   const cleanups: (() => void)[] = [];
@@ -22,10 +39,17 @@ export function installNativeFlyoutKeyboard(): () => void {
     if (disposed) return;
     const openedAt = payload.openedAt ?? toolsetPopoverTimestamp();
     const opening = { openedAt, generation: payload.generation };
-    if (openedAt <= closedThrough ||
-        (latestOpen && compareToolsetPopoverOpenings(opening, latestOpen) < 0) ||
-        (latestClose && compareToolsetPopoverOpenings(opening, latestClose) <= 0)) return;
-    latestOpen = opening;
+    const key = openingKey(payload.toolsetId, payload.kind === "flyout" ? payload.flyout.flyoutId : undefined);
+    const latestOpen = latestOpens.get(key);
+    const latestClose = latestCloses.get(key);
+    const targetedDismissal = targetedDismissals.get(payload.toolsetId);
+    const order = latestOpen ? compareOpenings(opening, latestOpen) : 1;
+    if (openedAt <= closedThrough || openedAt < latestOpenedAt || order < 0 ||
+        (order === 0 && opening.generation !== undefined && latestOpen?.generation !== undefined) ||
+        (latestClose && compareOpenings(opening, latestClose) <= 0) ||
+        (targetedDismissal && compareOpenings(opening, targetedDismissal) <= 0)) return;
+    latestOpenedAt = openedAt;
+    if (order > 0 || opening.generation !== undefined) latestOpens.set(key, opening);
     session = payload.kind === "flyout" && payload.flyout.variant !== "bondStereo"
       ? { toolsetId: payload.toolsetId, flyoutId: payload.flyout.flyoutId, ...opening }
       : undefined;
@@ -34,18 +58,20 @@ export function installNativeFlyoutKeyboard(): () => void {
     closedThrough = Math.max(closedThrough, requestedAt);
     if (session && session.openedAt <= requestedAt) session = undefined;
   };
-  subscribe(listenForToolsetPopoverDismiss(payload => dismiss(payload?.requestedAt)));
+  subscribe(listenForToolsetPopoverDismiss(payload => {
+    if (!payload?.openings) {
+      dismiss(payload?.requestedAt);
+      return;
+    }
+    for (const target of payload.openings) {
+      rememberDismissal(targetedDismissals, target.toolsetId, target);
+      if (session?.toolsetId === target.toolsetId && compareOpenings(session, target) <= 0) session = undefined;
+    }
+  }));
   subscribe(listenForToolsetFlyoutClosed(payload => {
+    rememberDismissal(latestCloses, openingKey(payload.toolsetId, payload.flyoutId), payload);
     if (session?.toolsetId === payload.toolsetId && session.flyoutId === payload.flyoutId &&
-        session.openedAt === payload.openedAt) {
-      if (payload.generation !== undefined && payload.generation !== session.generation) return;
-      session = undefined;
-    }
-    if (payload.generation === undefined) {
-      closedThrough = Math.max(closedThrough, payload.openedAt);
-    } else if (!latestClose || compareToolsetPopoverOpenings(payload, latestClose) > 0) {
-      latestClose = payload;
-    }
+        compareOpenings(session, payload) <= 0) session = undefined;
   }));
   const keyDown = (event: KeyboardEvent) => {
     if (event.repeat && activationKeys.has(event.key)) {
@@ -63,8 +89,7 @@ export function installNativeFlyoutKeyboard(): () => void {
     event.stopImmediatePropagation();
     if (!arrow) activationKeys.add(event.key);
     if (plain) {
-      const { toolsetId, flyoutId, openedAt } = session;
-      void sendToolsetFlyoutKey({ toolsetId, flyoutId, openedAt, key: event.key }).catch(() => undefined);
+      void sendToolsetFlyoutKey({ ...session, key: event.key }).catch(() => undefined);
     }
   };
   const keyUp = (event: KeyboardEvent) => {

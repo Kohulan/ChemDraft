@@ -549,7 +549,8 @@ export function PalettePopoverWindow({
       const current = contentRef.current;
       if (disposed || dismissedRef.current || current.kind !== "flyout" ||
           payload.toolsetId !== toolsetId || payload.flyoutId !== current.flyout.flyoutId ||
-          payload.openedAt !== contentOpenedAt.current) return;
+          payload.openedAt !== contentOpenedAt.current ||
+          (payload.generation !== undefined && payload.generation !== current.generation)) return;
       const bondStereo = current.flyout.variant === "bondStereo";
       if (bondStereo && (platform !== "windows" || payload.sessionId !== current.flyout.id)) return;
       const commands = current.flyout.commands.filter(command => command.enabled);

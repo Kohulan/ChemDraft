@@ -734,6 +734,31 @@ describe("ToolPalette art color popover", () => {
     }
   });
 
+  it("announces the displayed electron mark slider values for mixed and uniform selections", () => {
+    let doc = applyChargeToolAtPoint(createPhase4Document("Mark slider values"), 1, { x: 200, y: 200 });
+    doc = applyChargeToolAtPoint(doc, -1, { x: 300, y: 300 });
+    const page = doc.pages[0];
+    const [first, second] = page.objects;
+    const objects = [{ ...first, width: 18, height: 16, style: { strokeWidth: 1.5 } },
+      { ...second, width: 25, height: 20, style: { strokeWidth: 2 } }];
+    const draw = (selectedIds: string[]) => {
+      const document = selectDocumentObjects({ ...doc, pages: [{ ...page, objects }] }, page.id, selectedIds);
+      renderPalette({ currentArtStyle: createArtInspectorModel({ document, selectedGraphicObjects: [] }) });
+    };
+    for (const [property, uniform] of [["size", "18px"], ["thickness", "1.5px"]]) {
+      draw([first.id, second.id]);
+      const slider = container.querySelector<HTMLInputElement>(`[aria-label="Electron mark ${property}"]`)!;
+      const visibleValue = () => slider.closest("label")!.querySelector(".art-inspector-slider-value")?.textContent;
+      act(() => slider.focus());
+      expect(document.activeElement).toBe(slider);
+      expect(visibleValue()).toBe("Mixed");
+      expect(slider.getAttribute("aria-valuetext")).toBe("Mixed");
+      draw([first.id]);
+      expect(visibleValue()).toBe(uniform);
+      expect(slider.getAttribute("aria-valuetext")).toBe(uniform);
+    }
+  });
+
   it("invokes native effect commands from buttons and visible effect controls", () => {
     const { onInvoke } = renderPalette();
     const glowButton = container.querySelector<HTMLButtonElement>('[data-art-effect-button="glow"]');

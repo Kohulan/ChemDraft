@@ -254,7 +254,7 @@ export function createArtInspectorModel({
     selectedCount,
     ...(marks.length ? { electronMarks: {
       count: marks.length,
-      sizePx: uniformSupportedValue(marks, supportsMarkStyle, mark => Math.max(mark.width, mark.height)),
+      sizePx: uniformSupportedValue(marks, supportsMarkStyle, mark => Math.round(Math.max(mark.width, mark.height) * 10) / 10),
       thicknessPx: uniformSupportedValue(marks, supportsMarkStyle, mark => metadataNumberValue(mark.style.strokeWidth, 1.5))
     } } : {}),
     selectedObjectIds: [...styleObjects, ...marks].map((object) => object.id),

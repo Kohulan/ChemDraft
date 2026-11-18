@@ -16807,13 +16807,17 @@ export function MainWindow({
       return false;
     }
 
-    const movedIds = drag.groupObjectIds ?? [drag.objectId];
-    const movedMarkCount = movedIds.filter(id =>
-      findDocumentObject(drag.startDocument, id)?.type === "electron-mark").length;
+    const movedIds = new Set(drag.groupObjectIds);
+    let movedMarkCount = 0;
+    if (movedIds.size > 0) {
+      for (const candidate of drag.startDocument.pages[0].objects) {
+        if (candidate.type === "electron-mark" && movedIds.has(candidate.id)) movedMarkCount++;
+      }
+    }
     const movesGroup = (drag.groupObjectIds?.length ?? 0) > 1 &&
       (object?.type === "group" || parentGroupForDocumentObject(drag.startDocument.pages[0]?.objects ?? [], drag.objectId) !== undefined);
     commitDocumentHistoryFrom(drag.startDocument, moved, movesGroup ? "Move group"
-      : movedMarkCount === movedIds.length ? "Move electron mark" : movedMarkCount > 0 ? "Move"
+      : movedMarkCount > 0 ? (movedMarkCount === movedIds.size ? "Move electron mark" : "Move")
       : object?.type === "text" && object.arrowAttachment?.kind === "conditions" ? "Move Reaction Conditions" : undefined);
     return true;
   }, [assignHoveredNativeDeleteTarget, clearObjectTransformPreview, commitDocumentHistoryFrom, objectDragDelta, objectDragDocument, replacePresentDocument]);
@@ -19868,9 +19872,7 @@ export function MainWindow({
       setFreeformNativeBond(undefined);
       setNativeDoubleBondSidePreview(undefined);
       assignHoveredNativeDeleteTarget(undefined);
-      const selectedIds = nextDocument.selection.objectIds;
-      setStatus(object.type === "bracket" && selectedIds.length === 1 && selectedIds[0] === objectId
-        ? "Selected bracket" : selectionStatusLabel({ objectIds: selectedIds }));
+      setStatus(objectSelectionStatusLabel(nextDocument));
       return;
     }
 
@@ -19928,9 +19930,7 @@ export function MainWindow({
       setSelectedNativeMoleculePart(undefined);
       assignHoveredNativeDeleteTarget(undefined);
 
-      if (object?.type === "bracket") {
-        setStatus(selectedDocument.selection.objectIds.includes(objectId) ? "Selected bracket" : "Selected group");
-      }
+      setStatus(objectSelectionStatusLabel(selectedDocument));
       if (object && point) {
         objectDragRef.current = {
           pointerId: event.pointerId,
@@ -28216,6 +28216,16 @@ function isWholeNativeMoleculeSelected(
     document.selection.objectIds
   );
   return selectedObjectIds.includes(objectId) && selectedPart?.objectId !== objectId;
+}
+
+function objectSelectionStatusLabel(document: ChemDraftDocument): string {
+  const { objectIds } = document.selection;
+  if (objectIds.length === 1) {
+    const object = findDocumentObject(document, objectIds[0]);
+    if (object?.type === "bracket") return "Selected bracket";
+    if (object?.type === "group") return "Selected group";
+  }
+  return selectionStatusLabel({ objectIds });
 }
 
 function selectionStatusLabel(selection: {

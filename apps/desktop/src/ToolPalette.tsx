@@ -2475,6 +2475,7 @@ function ArtToolbarStyleControls() {
             value={percent}
             disabled={!selected || supportedCount === 0}
             aria-label={label}
+            aria-valuetext={valueLabel}
             data-palette-control="true"
             onPointerDown={(event) => {
               event.stopPropagation();
@@ -2542,7 +2543,7 @@ function ArtToolbarStyleControls() {
     <div className="art-inspector-row" data-electron-mark-controls="true">
       {opacitySlider("Electron mark size", "Size", (markSize - 8) / 100,
         value => electronMarkStyleCommandId("size", value * 100), marks.count, undefined,
-        marks.sizePx.mixed ? "Mixed" : `${Math.round(markSize * 10) / 10}px`)}
+        marks.sizePx.mixed ? "Mixed" : `${markSize}px`)}
       {opacitySlider("Electron mark thickness", "Thickness", (markThickness - 0.5) / 5,
         value => electronMarkStyleCommandId("thickness", value * 100), marks.count, undefined,
         marks.thicknessPx.mixed ? "Mixed" : `${Math.round(markThickness * 100) / 100}px`)}

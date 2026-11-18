@@ -112,6 +112,35 @@ describe.each(["macos", "windows"] as const)("drawing fixes on %s", shortcutPlat
     expect(status()).toBe("Selected bracket");
   });
 
+  it("updates the status when a charge mark replaces the bracket selection", async () => {
+    const drawing = applyChargeToolAtPoint(repeatUnit(), 1, { x: 340, y: 250 });
+    const page = drawing.pages[0];
+    const bracket = page.objects.find(object => object.type === "bracket")!;
+    const mark = page.objects.find(object => object.type === "electron-mark")!;
+    await mount(selectDocumentObjects(drawing, page.id, []));
+    await pointer(objectVisual(bracket.id), "pointerdown", bracket.x, bracket.y + bracket.height / 2);
+    await pointer(objectVisual(bracket.id), "pointerup", bracket.x, bracket.y + bracket.height / 2);
+    expect(status()).toBe("Selected bracket");
+    const x = mark.x + mark.width / 2;
+    const y = mark.y + mark.height / 2;
+    await pointer(objectVisual(mark.id), "pointerdown", x, y);
+    await pointer(objectVisual(mark.id), "pointerup", x, y);
+    expect(snapshot().selection.objectIds).toEqual([mark.id]);
+    expect(status()).toBe("Selected object");
+  });
+
+  it("reports the whole selection when clicking one of several selected brackets", async () => {
+    const drawing = repeatUnit();
+    const page = drawing.pages[0];
+    const bracket = page.objects[0];
+    const ids = page.objects.map(object => object.id);
+    await mount(selectDocumentObjects(drawing, page.id, ids));
+    await pointer(objectVisual(bracket.id), "pointerdown", bracket.x, bracket.y + bracket.height / 2);
+    await pointer(objectVisual(bracket.id), "pointerup", bracket.x, bracket.y + bracket.height / 2);
+    expect(snapshot().selection.objectIds).toEqual(ids);
+    expect(status()).toBe("Selected 2 objects");
+  });
+
   it.each([true, false])("names the undo for a drag of electron marks (with molecule: %s)", async withMolecule => {
     let drawing = createPhase4Document("Move undo");
     if (withMolecule) {
@@ -139,5 +168,33 @@ describe.each(["macos", "windows"] as const)("drawing fixes on %s", shortcutPlat
     await command("edit.undo");
     expect(snapshot().pages[0].objects).toEqual(before);
     expect(status()).toBe(withMolecule ? "Undid Move" : "Undid Move electron mark");
+  });
+
+  it("avoids per-object page searches when labeling a large mixed drag", async () => {
+    const drawing = applyChargeToolAtPoint(createPhase4Document("Large mixed move"), 1, { x: 150, y: 150 });
+    const mark = drawing.pages[0].objects[0];
+    const bracket = repeatUnit().pages[0].objects[0];
+    const page = { ...drawing.pages[0], objects: [mark, ...Array.from({ length: 64 }, (_, index) =>
+      ({ ...bracket, id: `bracket_${index}`, x: 200 + (index % 8) * 40, y: 150 + Math.floor(index / 8) * 20 }))] };
+    await mount(selectDocumentObjects({ ...drawing, pages: [page] }, page.id, page.objects.map(object => object.id)));
+    const x = mark.x + mark.width / 2;
+    const y = mark.y + mark.height / 2;
+    await pointer(objectVisual(mark.id), "pointerdown", x, y);
+    await pointer(objectVisual(mark.id), "pointermove", x + 40, y + 25);
+    const find = Array.prototype.find;
+    let pageSearches = 0;
+    const search = vi.spyOn(Array.prototype, "find").mockImplementation(function (this: unknown[], ...args) {
+      if (this.length === page.objects.length && this[0] && (this[0] as { id?: string }).id === mark.id) pageSearches++;
+      return Reflect.apply(find, this, args);
+    });
+    try {
+      await pointer(objectVisual(mark.id), "pointerup", x + 40, y + 25);
+    } finally {
+      search.mockRestore();
+    }
+    expect(snapshot().pages[0].objects[0].x).toBeCloseTo(mark.x + 40);
+    await command("edit.undo");
+    expect(status()).toBe("Undid Move");
+    expect(pageSearches).toBeLessThan(page.objects.length);
   });
 });

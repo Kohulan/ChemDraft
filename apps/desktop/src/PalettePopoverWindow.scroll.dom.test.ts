@@ -5,11 +5,12 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { PalettePopoverWindow } from "./PalettePopoverWindow";
 import { installNativeFlyoutKeyboard } from "./nativeFlyoutKeyboard";
-import type { ToolsetFlyoutKey, ToolsetFlyoutSession, ToolsetPopoverContentPayload } from "./window-manager";
+import type { ToolsetFlyoutKey, ToolsetFlyoutSession, ToolsetPopoverContentPayload, ToolsetPopoverDismissPayload } from "./window-manager";
 
 const native = vi.hoisted(() => ({
   content: undefined as undefined | ((payload: ToolsetPopoverContentPayload) => void),
   receiveClose: undefined as undefined | ((payload: ToolsetFlyoutSession) => void),
+  dismiss: undefined as undefined | ((payload?: ToolsetPopoverDismissPayload) => void),
   key: undefined as undefined | ((payload: ToolsetFlyoutKey) => void),
   release: undefined as undefined | ((payload: { toolsetId: string; releasedAt: number }) => void),
   resized: undefined as undefined | (() => void),
@@ -33,7 +34,7 @@ vi.mock("./window-manager", async importOriginal => ({
   sendToolsetFlyoutKey: native.sendKey,
   notifyToolsetPopoverClosed: native.closed, notifyToolsetFlyoutClosed: native.flyoutClosed,
   sendPaletteCommand: native.command,
-  listenForToolsetPopoverDismiss: vi.fn(async () => () => {}),
+  listenForToolsetPopoverDismiss: vi.fn(async handler => { native.dismiss = handler; return () => {}; }),
   listenForBondStereoPopoverActions: vi.fn(async () => () => {}),
   listenForToolsetTextStyle: vi.fn(async () => () => {}),
   requestToolsetPopoverContent: vi.fn(async () => {}), requestToolsetTextStyle: vi.fn(async () => {}),
@@ -69,6 +70,12 @@ const rings: ToolsetPopoverContentPayload = { toolsetId: "core.main", kind: "fly
   flyout: { flyoutId: "rings", title: "Rings", columns: 3, commands: Array.from({ length: 9 }, (_, i) => ({
     id: `ring-${i}`, title: `Ring ${i}`, enabled: true, active: false
   })) } };
+const ringSession = { toolsetId: rings.toolsetId, flyoutId: rings.flyout.flyoutId, openedAt: 1 };
+function pressFlyoutArrow() {
+  const event = new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true });
+  window.dispatchEvent(event);
+  return event.defaultPrevented;
+}
 function elements() {
   return [document.documentElement, document.body, container,
     container.querySelector<HTMLElement>(".palette-popover-shell")!,
@@ -200,6 +207,83 @@ it.each(["before", "after"])("routes keys to a newer same-time flyout when the o
     // Old senders identify their close by timestamp.
     native.receiveClose?.({ toolsetId: current.toolsetId, flyoutId: current.flyoutId, openedAt: current.openedAt });
     expect(press()).toBe(false);
+  } finally { stop(); }
+});
+
+it("retires a superseded flyout when the newer close arrives before its content", () => {
+  const stop = installNativeFlyoutKeyboard();
+  try {
+    native.content?.({ ...rings, generation: 1 });
+    expect(pressFlyoutArrow()).toBe(true);
+    native.receiveClose?.({ ...ringSession, generation: 2 });
+    const routedBeforeContent = pressFlyoutArrow();
+    native.content?.({ ...rings, generation: 2 });
+    expect([routedBeforeContent, pressFlyoutArrow()]).toEqual([false, false]);
+    native.content?.({ ...rings, generation: 3 });
+    expect(pressFlyoutArrow()).toBe(true);
+  } finally { stop(); }
+});
+
+it.each([
+  { toolsetId: "core.art", flyoutId: "rings" },
+  { toolsetId: "core.main", flyoutId: "other" }
+])("scopes same-time opening and close generations to $toolsetId/$flyoutId", ({ toolsetId, flyoutId }) => {
+  const stop = installNativeFlyoutKeyboard();
+  try {
+    native.content?.({ ...rings, generation: 9 });
+    const next = { ...rings, toolsetId, generation: 1, flyout: { ...rings.flyout, flyoutId } };
+    native.content?.(next);
+    expect(pressFlyoutArrow()).toBe(true);
+    expect(native.sendKey).toHaveBeenLastCalledWith(expect.objectContaining({ toolsetId, flyoutId }));
+    native.content?.({ ...rings, generation: 9 });
+    expect(pressFlyoutArrow()).toBe(true);
+    expect(native.sendKey).toHaveBeenLastCalledWith(expect.objectContaining({ toolsetId, flyoutId }));
+    native.receiveClose?.({ ...ringSession, generation: 9 });
+    native.content?.(next);
+    expect(pressFlyoutArrow()).toBe(true);
+    expect(native.sendKey).toHaveBeenLastCalledWith(expect.objectContaining({ toolsetId, flyoutId }));
+  } finally { stop(); }
+});
+
+it("forwards keys with the generation of the active flyout", () => {
+  const stop = installNativeFlyoutKeyboard();
+  try {
+    native.content?.({ ...rings, generation: 2 });
+    expect(pressFlyoutArrow()).toBe(true);
+    expect(native.sendKey).toHaveBeenCalledExactlyOnceWith({ ...ringSession, generation: 2, key: "ArrowDown" });
+  } finally { stop(); }
+});
+
+it("ignores queued arrow and activation keys from a stale flyout generation", async () => {
+  await act(async () => root.render(createElement(PalettePopoverWindow, { toolsetId: rings.toolsetId, kind: "flyout", prewarm: true })));
+  await act(async () => native.content?.({ ...rings, generation: 2 }));
+  await act(async () => native.key?.({ ...ringSession, generation: 1, key: "ArrowDown" }));
+  expect(container.querySelector('[data-keyboard-highlighted="true"]')).toBeNull();
+  await act(async () => native.key?.({ ...ringSession, generation: 2, key: "ArrowDown" }));
+  expect(container.querySelector('[data-keyboard-highlighted="true"]')?.getAttribute("data-command-id")).toBe("ring-0");
+  await act(async () => native.key?.({ ...ringSession, generation: 1, key: "Enter" }));
+  expect(native.command).not.toHaveBeenCalled();
+  await act(async () => native.key?.({ ...ringSession, generation: 2, key: "Enter" }));
+  expect(native.command).toHaveBeenCalledExactlyOnceWith("ring-0");
+});
+
+it("retains a newer same-time flyout after a targeted Escape and honors broadcasts", () => {
+  const stop = installNativeFlyoutKeyboard();
+  const target = { toolsetId: rings.toolsetId, openedAt: 1 };
+  try {
+    native.content?.({ ...rings, generation: 2 });
+    native.dismiss?.({ requestedAt: 2, reason: "escape", openings: [{ ...target, generation: 1 }] });
+    expect(pressFlyoutArrow()).toBe(true);
+    native.dismiss?.({ requestedAt: 2, reason: "escape", openings: [{ ...target, toolsetId: "core.art", generation: 2 }] });
+    expect(pressFlyoutArrow()).toBe(true);
+    native.dismiss?.({ requestedAt: 2, reason: "escape", openings: [{ ...target, generation: 2 }] });
+    expect(pressFlyoutArrow()).toBe(false);
+    native.content?.({ ...rings, generation: 2 });
+    expect(pressFlyoutArrow()).toBe(false);
+    native.content?.({ ...rings, generation: 3 });
+    expect(pressFlyoutArrow()).toBe(true);
+    native.dismiss?.({ requestedAt: 1 });
+    expect(pressFlyoutArrow()).toBe(false);
   } finally { stop(); }
 });
 
