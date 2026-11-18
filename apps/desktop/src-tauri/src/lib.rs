@@ -1185,11 +1185,23 @@ pub fn run() {
     // Both guards run before any webview or app setup can touch session/settings files.
     let context = tauri::generate_context!();
     #[cfg(target_os = "macos")]
-    let (context, single_instance_plugin) =
-        macos_single_instance::init(context, handle_macos_second_launch)
-            .expect("could not initialize ChemDraft single-instance handoff");
+    let (context, primary_lock, secondary) = {
+        let mut context = context;
+        let (primary_lock, secondary) = macos_single_instance::init(&mut context);
+        (context, primary_lock, secondary)
+    };
     #[cfg(target_os = "macos")]
-    let builder = builder.plugin(single_instance_plugin);
+    let builder = if let Some(guard) = primary_lock {
+        builder
+            .plugin(macos_single_instance::plugin(
+                guard,
+                handle_macos_second_launch,
+            ))
+            .plugin(tauri_plugin_sparkle_updater::init())
+            .menu(create_app_menu)
+    } else {
+        builder.enable_macos_default_menu(false)
+    };
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(handle_second_launch));
 
@@ -1235,9 +1247,6 @@ pub fn run() {
         // workers remain under connect-src 'self' and never receive this capability.
         .plugin(tauri_plugin_http::init());
 
-    #[cfg(target_os = "macos")]
-    let builder = builder.plugin(tauri_plugin_sparkle_updater::init());
-
     // Windows app updates: a signed manifest on main (`plugins.updater` in tauri.windows.conf.json)
     // and a signed NSIS installer. The webview drives the flow, and only a stable build ever checks;
     // see docs/releasing/windows-updates.md.
@@ -1250,7 +1259,7 @@ pub fn run() {
     #[cfg(target_os = "macos")]
     let builder = builder.manage(FullscreenMenuItem::<tauri::Wry>(Mutex::new(None)));
     #[cfg(target_os = "macos")]
-    let builder = builder.menu(create_app_menu).plugin(
+    let builder = builder.plugin(
         tauri::plugin::Builder::<tauri::Wry>::new("windows-menu")
             .on_window_ready(|window| {
                 match window.ns_window() {
@@ -1273,7 +1282,9 @@ pub fn run() {
             .build(),
     );
 
-    builder
+    #[cfg(target_os = "macos")]
+    let collecting_launch = secondary.is_some();
+    let app = builder
         .on_page_load(|webview, payload| {
             if matches!(payload.event(), PageLoadEvent::Finished) {
                 if let Some(window) = webview.app_handle().get_webview_window(webview.label()) {
@@ -1528,79 +1539,12 @@ pub fn run() {
                 _ => {}
             }
         })
-        .setup(|app| {
-            let app = app.handle();
-            panel_window::observe_document_pointer_release(app);
-            file_warnings_window::observe_document(app)?;
-            // Programmatic panel removal hides a reusable window, so it produces neither
-            // CloseRequested nor Destroyed. Cancel its native restore work via the same bridge
-            // messages that clear the report and notify the host of a panel's close control.
-            for event in [PLUGIN_PANEL_REPORT_CLEARED_EVENT, PLUGIN_PANEL_CLOSED_EVENT] {
-                app.listen(event, |event| {
-                    cancel_plugin_panel_restore(&UTILITY_SUSPENSION, event.payload());
-                });
-            }
-            problem_reports::install_panic_hook(app);
+        .setup(move |app| {
             #[cfg(target_os = "macos")]
-            if let Err(error) = macos_quit::install(app) {
-                eprintln!("Could not install ChemDraft AppKit quit handler: {error}");
+            if collecting_launch {
+                return Ok(());
             }
-            let ocsr = app.state::<ocsr_engine::OcsrEngineState>();
-            ocsr.start_idle_reaper();
-            ocsr.remove_stale_staging(app);
-            external_tools::setup(app);
-            let naming = app.state::<naming_engine::NamingEngineState>();
-            naming.start_idle_reaper();
-            naming.remove_stale_staging(app);
-            // The Toolbars menu starts empty and is filled by JS (set_toolbars_menu) once the main
-            // window loads; Rust no longer parses the manifest or applies customization for it.
-            // Activation policy is a macOS Dock concept; other platforms have no equivalent.
-            #[cfg(target_os = "macos")]
-            if let Err(error) = app.set_activation_policy(tauri::ActivationPolicy::Regular) {
-                eprintln!("Could not set ChemDraft activation policy: {error}");
-            }
-
-            #[cfg(not(target_os = "macos"))]
-            if let Err(error) = create_app_menu(app).and_then(|menu| install_app_menu(app, menu)) {
-                eprintln!("Could not install the ChemDraft menu: {error}");
-            }
-
-            if let Err(error) = ensure_main_window_visible(app) {
-                eprintln!("Could not show ChemDraft main window: {error}");
-            }
-
-            if let Err(error) = focus_main_document_window_impl(app, MainWindowFocusMode::Force) {
-                eprintln!("Could not focus ChemDraft document window: {error}");
-            }
-
-            // Palettes never become key, so hover must be fed to their webviews (see
-            // start_palette_pointer_feed's doc for why the OS won't deliver it).
-            start_palette_pointer_feed(app.clone());
-
-            #[cfg(target_os = "macos")]
-            observe_hide_for_document_key_restore(app.clone());
-
-            // The tooltip window is NOT built here: a palette prewarms it once it has painted
-            // (prewarm_toolset_tooltip). Building it in setup put a hidden webview ahead of every
-            // palette in the queue for window creation.
-
-            app.state::<PendingOpenDocument>()
-                .setup_completed
-                .store(true, Ordering::SeqCst);
-
-            // Off macOS a document opened from the shell arrives as a launch argument. Keep the
-            // existing queue-and-emit behavior, now that setup and the config window are ready.
-            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
-            if let Ok(cwd) = std::env::current_dir() {
-                let args = std::env::args_os()
-                    .skip(1)
-                    .map(|arg| arg.to_string_lossy().into_owned());
-                if let Err(error) = handle_opened_document_args(app, args, &cwd) {
-                    eprintln!("Could not open ChemDraft document from launch arguments: {error}");
-                }
-            }
-
-            Ok(())
+            setup_primary_app(app.handle())
         })
         .invoke_handler(tauri::generate_handler![
             canvas_context_menu::popup_canvas_context_menu,
@@ -1731,8 +1675,24 @@ pub fn run() {
             fonts::list_system_fonts
         ])
         .build(context)
-        .expect("error while building ChemDraft")
-        .run(|app, event| match event {
+        .expect("error while building ChemDraft");
+    #[cfg(target_os = "macos")]
+    let app = {
+        let mut app = app;
+        if collecting_launch {
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+        }
+        app
+    };
+    app.run(move |app, event| {
+        #[cfg(target_os = "macos")]
+        if secondary
+            .as_ref()
+            .is_some_and(|launch| launch.handle_event(app, &event, start_macos_primary))
+        {
+            return;
+        }
+        match event {
             RunEvent::MainEventsCleared => canvas_context_menu::events_cleared(app),
             RunEvent::ExitRequested { code, api, .. } => {
                 if should_flush_exit_request(
@@ -1781,7 +1741,102 @@ pub fn run() {
                 }
             }
             _ => {}
+        }
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn start_macos_primary(
+    app: &tauri::AppHandle,
+    guard: macos_single_instance::InstanceLock,
+    launch: &macos_single_instance::LaunchRequest,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    app.plugin(macos_single_instance::plugin(
+        guard,
+        handle_macos_second_launch,
+    ))?;
+    app.plugin(tauri_plugin_sparkle_updater::init())?;
+    install_app_menu(app, create_app_menu(app)?)?;
+
+    // A takeover opens its files through the cold-start queue before the document window mounts.
+    let open_error = open_macos_launch(app, launch).err();
+    create_main_window(app)?;
+    setup_primary_app(app)?;
+    Ok(open_error)
+}
+
+fn setup_primary_app(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    panel_window::observe_document_pointer_release(app);
+    file_warnings_window::observe_document(app)?;
+    // Programmatic panel removal hides a reusable window, so it produces neither
+    // CloseRequested nor Destroyed. Cancel its native restore work via the same bridge
+    // messages that clear the report and notify the host of a panel's close control.
+    for event in [PLUGIN_PANEL_REPORT_CLEARED_EVENT, PLUGIN_PANEL_CLOSED_EVENT] {
+        app.listen(event, |event| {
+            cancel_plugin_panel_restore(&UTILITY_SUSPENSION, event.payload());
         });
+    }
+    problem_reports::install_panic_hook(app);
+    #[cfg(target_os = "macos")]
+    if let Err(error) = macos_quit::install(app) {
+        eprintln!("Could not install ChemDraft AppKit quit handler: {error}");
+    }
+    let ocsr = app.state::<ocsr_engine::OcsrEngineState>();
+    ocsr.start_idle_reaper();
+    ocsr.remove_stale_staging(app);
+    external_tools::setup(app);
+    let naming = app.state::<naming_engine::NamingEngineState>();
+    naming.start_idle_reaper();
+    naming.remove_stale_staging(app);
+    // The Toolbars menu starts empty and is filled by JS (set_toolbars_menu) once the main
+    // window loads; Rust no longer parses the manifest or applies customization for it.
+    // Activation policy is a macOS Dock concept; other platforms have no equivalent.
+    #[cfg(target_os = "macos")]
+    if let Err(error) = app.set_activation_policy(tauri::ActivationPolicy::Regular) {
+        eprintln!("Could not set ChemDraft activation policy: {error}");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    if let Err(error) = create_app_menu(app).and_then(|menu| install_app_menu(app, menu)) {
+        eprintln!("Could not install the ChemDraft menu: {error}");
+    }
+
+    if let Err(error) = ensure_main_window_visible(app) {
+        eprintln!("Could not show ChemDraft main window: {error}");
+    }
+
+    if let Err(error) = focus_main_document_window_impl(app, MainWindowFocusMode::Force) {
+        eprintln!("Could not focus ChemDraft document window: {error}");
+    }
+
+    // Palettes never become key, so hover must be fed to their webviews (see
+    // start_palette_pointer_feed's doc for why the OS won't deliver it).
+    start_palette_pointer_feed(app.clone());
+
+    #[cfg(target_os = "macos")]
+    observe_hide_for_document_key_restore(app.clone());
+
+    // The tooltip window is NOT built here: a palette prewarms it once it has painted
+    // (prewarm_toolset_tooltip). Building it in setup put a hidden webview ahead of every
+    // palette in the queue for window creation.
+
+    app.state::<PendingOpenDocument>()
+        .setup_completed
+        .store(true, Ordering::SeqCst);
+
+    // Off macOS a document opened from the shell arrives as a launch argument. Keep the
+    // existing queue-and-emit behavior, now that setup and the config window are ready.
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+    if let Ok(cwd) = std::env::current_dir() {
+        let args = std::env::args_os()
+            .skip(1)
+            .map(|arg| arg.to_string_lossy().into_owned());
+        if let Err(error) = handle_opened_document_args(app, args, &cwd) {
+            eprintln!("Could not open ChemDraft document from launch arguments: {error}");
+        }
+    }
+
+    Ok(())
 }
 
 // Must match appUpdateChannelNotice in apps/desktop/src/appUpdates.ts.
@@ -2954,11 +3009,8 @@ enum SecondLaunchAction {
     OpenOnly,
     /// This process is quitting. Opening a document into it, or showing (even rebuilding) the
     /// document window, would be lost with the process and would hold the main thread the quit is
-    /// waiting on. The exit is at most the flush plus `EXIT_WATCHDOG` away, and a launch after it
-    /// starts a fresh process; one made inside that window is lost, as the log line says. While a
-    /// window build holds the main thread this callback cannot run at all: the plugin's handoff
-    /// (a blocking WM_COPYDATA) waits until this process ends, then the second process exits, so
-    /// that launch is lost too, without the log line (measured on Windows).
+    /// waiting on. macOS refuses the handoff so the second process can wait for the lock.
+    /// Windows keeps the single-instance plugin's WM_COPYDATA behavior.
     IgnoreWhileQuitting,
 }
 
@@ -2975,7 +3027,7 @@ fn second_launch_action(quitting: bool, setup_completed: bool) -> SecondLaunchAc
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
 fn handle_second_launch<R: Runtime>(app: &tauri::AppHandle<R>, argv: Vec<String>, cwd: String) {
-    handle_second_launch_with(app, || {
+    let _ = handle_second_launch_with(app, || {
         handle_opened_document_args(app, argv.into_iter().skip(1), Path::new(&cwd))
     });
 }
@@ -2984,27 +3036,61 @@ fn handle_second_launch<R: Runtime>(app: &tauri::AppHandle<R>, argv: Vec<String>
 fn handle_macos_second_launch<R: Runtime>(
     app: &tauri::AppHandle<R>,
     launch: macos_single_instance::LaunchRequest,
-) {
-    handle_second_launch_with(app, || {
-        deliver_opened_documents(forwarded_document_payloads(launch), |payloads| {
-            deliver_opened_document(app, payloads)
-        })
-    });
+) -> macos_single_instance::Acknowledgement {
+    use macos_single_instance::Acknowledgement;
+    // During takeover the listener can start before the document window. A setup failure
+    // must never leave it acknowledging requests while the startup error is on screen.
+    if !app
+        .state::<PendingOpenDocument>()
+        .setup_completed
+        .load(Ordering::SeqCst)
+    {
+        return Acknowledgement::Refused;
+    }
+    let result = handle_second_launch_with(app, || open_macos_launch(app, &launch));
+    if quit_in_progress() {
+        return Acknowledgement::Refused;
+    }
+    match result {
+        None => Acknowledgement::Refused,
+        Some(Ok(())) => Acknowledgement::Accepted,
+        Some(Err(_)) => Acknowledgement::Failed,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_macos_launch<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    launch: &macos_single_instance::LaunchRequest,
+) -> Result<(), String> {
+    deliver_opened_documents(forwarded_document_payloads(launch), |payloads| {
+        if quit_in_progress() {
+            return Err("ChemDraft is quitting".into());
+        }
+        deliver_opened_document(app, payloads)
+    })
 }
 
 #[cfg(target_os = "macos")]
 fn forwarded_document_payloads(
-    launch: macos_single_instance::LaunchRequest,
+    launch: &macos_single_instance::LaunchRequest,
 ) -> impl Iterator<Item = Result<NativeOpenDocumentPayload, String>> {
     let event_paths: std::collections::HashSet<_> = launch
         .urls
         .iter()
         .filter_map(|url| url.to_file_path().ok())
         .collect();
-    let arg_paths =
-        openable_document_paths_from_args(launch.argv.into_iter().skip(1), Path::new(&launch.cwd));
+    let cwd = Path::new(&launch.cwd);
+    let arg_paths: Vec<_> = launch
+        .argv
+        .iter()
+        .skip(1)
+        .filter(|arg| !arg.starts_with('-'))
+        .map(|arg| cwd.join(arg))
+        .filter(|path| has_document_extension(path) || is_openable_document_path(path))
+        .collect();
     // Preserve the native event batch. Some callers can also supply the same file in argv.
-    opened_document_payloads_from_urls(launch.urls).chain(
+    opened_document_payloads_from_urls(launch.urls.clone()).chain(
         arg_paths
             .into_iter()
             .filter(move |path| !event_paths.contains(path))
@@ -3016,7 +3102,7 @@ fn forwarded_document_payloads(
 fn handle_second_launch_with<R: Runtime>(
     app: &tauri::AppHandle<R>,
     open: impl FnOnce() -> Result<(), String>,
-) {
+) -> Option<Result<(), String>> {
     let setup_completed = app
         .state::<PendingOpenDocument>()
         .setup_completed
@@ -3026,13 +3112,14 @@ fn handle_second_launch_with<R: Runtime>(
         eprintln!(
             "ChemDraft: a second launch arrived while quitting; ignored (this process is exiting)"
         );
-        return;
+        return None;
     }
-    if let Err(error) = open() {
+    let result = open();
+    if let Err(error) = &result {
         eprintln!("Could not open ChemDraft document from a second launch: {error}");
     }
     if action == SecondLaunchAction::OpenOnly {
-        return;
+        return Some(result);
     }
     if let Err(error) = ensure_main_window_visible(app) {
         eprintln!("Could not show ChemDraft main window for a second launch: {error}");
@@ -3040,6 +3127,7 @@ fn handle_second_launch_with<R: Runtime>(
     if let Err(error) = focus_main_document_window_impl(app, MainWindowFocusMode::Force) {
         eprintln!("Could not focus ChemDraft document window for a second launch: {error}");
     }
+    Some(result)
 }
 
 /// Whether a quit has begun: off macOS a document-window close requests one, and the exit itself
@@ -8291,7 +8379,10 @@ fn handle_opened_document_args<R: Runtime>(
     deliver_opened_documents(payloads, |payload| deliver_opened_document(app, payload))
 }
 
-#[cfg(any(test, not(any(target_os = "ios", target_os = "android"))))]
+#[cfg(any(
+    test,
+    not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+))]
 fn openable_document_paths_from_args(
     args: impl IntoIterator<Item = String>,
     cwd: &Path,
@@ -8305,18 +8396,10 @@ fn openable_document_paths_from_args(
 
 #[cfg(any(test, not(any(target_os = "ios", target_os = "android"))))]
 fn is_openable_document_path(path: &Path) -> bool {
-    let extension_ok = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("chemdraft")
-                || extension.eq_ignore_ascii_case("cdxml")
-                || extension.eq_ignore_ascii_case("cdx")
-        });
     if !path.is_file() {
         return false;
     }
-    if extension_ok {
+    if has_document_extension(path) {
         return true;
     }
     // A renamed binary CDX still opens; inspect only its header here.
@@ -8326,6 +8409,17 @@ fn is_openable_document_path(path: &Path) -> bool {
         .and_then(|mut file| file.read_exact(&mut header))
         .is_ok()
         && header == *b"VjCD0100"
+}
+
+#[cfg(any(test, not(any(target_os = "ios", target_os = "android"))))]
+fn has_document_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("chemdraft")
+                || extension.eq_ignore_ascii_case("cdxml")
+                || extension.eq_ignore_ascii_case("cdx")
+        })
 }
 
 /// Queue an opened document for the window to drain on mount (cold start). Only after setup,
