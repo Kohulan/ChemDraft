@@ -15,7 +15,11 @@ print_dependencies() {
   shift
   for helper in "$executable" "$@"; do
     printf '\nldd %s\n' "$helper"
-    diagnostic_timeout 30s /usr/bin/ldd "$helper" || true
+    local status=0
+    diagnostic_timeout 30s /usr/bin/ldd "$helper" || status=$?
+    if (( status == 124 || status == 137 )); then
+      printf 'ldd timed out for %s (status %s)\n' "$helper" "$status" >&2
+    fi
   done
 }
 
@@ -30,7 +34,7 @@ prepare_diagnostics() {
   # Run against host libraries except where AppRun explicitly supplies its own environment.
   unset APPDIR APPIMAGE APPIMAGE_EXTRACT_AND_RUN LD_LIBRARY_PATH LD_PRELOAD
   diagnostic_timeout 30s dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package} ${Version}\n' \
-    'libgtk-3-0*' 'libwebkit2gtk-4.1-0*' 'libsoup-3.0-0*' libc6 2>/dev/null \
+    'libgtk-3-0*' 'libwebkit2gtk-4.1-0*' 'libsoup-3.0-0*' libc6 2> "$logs/libraries.err" \
     | diagnostic_timeout 30s awk '$1 == "ii" { print $2, $3 }' > "$logs/libraries.log" || true
 
   if [[ "$package" == deb ]]; then

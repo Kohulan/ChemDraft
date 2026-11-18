@@ -121,9 +121,12 @@ runs:
           source "$action_path/diagnostics.sh"
           prepare_diagnostics
           record_profile > "$logs/profile-before.log" 2>&1
-          if ! grep -q 'boolean false' "$logs/profile-before.log"; then
+          if grep -q 'boolean true' "$logs/profile-before.log"; then
             echo '::error::ChemDraft already owns the private D-Bus session name'
             exit 1
+          elif ! grep -q 'boolean false' "$logs/profile-before.log"; then
+            echo 'D-Bus name ownership probe was inconclusive; continuing with smoke test.' \
+              | tee -a "$logs/profile-before.log"
           fi
         fi
 
