@@ -6554,6 +6554,35 @@ export function textVisualBoundsForArrangement(object: TextObject): LayoutBounds
   return objectFrameBoundsForPageFit(object);
 }
 
+/** Frame size allowed by the page while keeping the rotated alignment anchor fixed. */
+export function textAutoSizePageLimits(
+  object: TextObject, page: { width: number; height: number }, minimumHeight: number
+): { maxWidth: number; maxHeight: (width: number) => number } {
+  const { x, alignment } = planTextObjectPlacement(object);
+  // The aligned point on the top edge stays fixed with the baseline. The frame extends
+  // to either side of it along the rotated writing direction and down along the rotated normal.
+  const top = transformPointForObject(object, { x, y: object.y });
+  const radians = degreesToRadians(object.rotation);
+  const cos = Math.cos(radians), sin = Math.sin(radians);
+  const edges = [
+    { room: top.x, along: -cos, down: sin },
+    { room: page.width - top.x, along: cos, down: -sin },
+    { room: top.y, along: -sin, down: -cos },
+    { room: page.height - top.y, along: sin, down: cos }
+  ].map(({ room, along, down }) => ({
+    room,
+    width: Math.max(-along * alignment, along * (1 - alignment)),
+    height: Math.max(0, down)
+  }));
+  const limit = (room: number, direction: number) => direction > 1e-12 ? room / direction : Infinity;
+  // Round inward to the stored frame's hundredth-of-a-pixel precision.
+  const inward = (size: number) => Math.floor((size + 1e-9) * 100) / 100;
+  return {
+    maxWidth: inward(Math.min(...edges.map(edge => limit(edge.room - minimumHeight * edge.height, edge.width)))),
+    maxHeight: width => inward(Math.min(...edges.map(edge => limit(edge.room - width * edge.width, edge.height))))
+  };
+}
+
 /** Exact rotated frame, without a circumscribed-circle overestimate near page edges. */
 export function objectFrameBoundsForPageFit(object: DocumentObject): LayoutBounds {
   const corners = [

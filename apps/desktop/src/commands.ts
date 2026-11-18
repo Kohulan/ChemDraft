@@ -338,7 +338,7 @@ export const editActions: CommandSpec[] = [
     icon: "ring",
     source: "core",
     category: "edit",
-    description: "Attach a benzene ring sharing the hovered atom"
+    description: "Attach a benzene ring at the hovered atom, using a phenyl bond if sharing a carbon vertex would exceed its valence"
   },
   {
     id: "atom.attachRingToHoveredAtom.cyclohexane",
@@ -394,7 +394,7 @@ export const editActions: CommandSpec[] = [
     icon: "bond",
     source: "core",
     category: "edit",
-    description: "Grow a bond that keeps turning — repeated presses trace and close a ring"
+    description: "Grow a bond that keeps turning to close a ring, or continue a terminal alkyne in a straight line"
   },
   {
     id: "bond.fuseRingAtHoveredBond.benzene",
@@ -2368,13 +2368,13 @@ export function createLayerActions(document: ChemDraftDocument, layoutsEnabled =
     },
     {
       id: "layout.rotate90",
-      title: "Rotate 90 Degrees",
+      title: "Rotate 90° Clockwise",
       icon: "align",
       assetName: "Custom_Rotation",
       source: "core",
       category: "layout",
       enabled: hasSelection,
-      description: "Rotate the selected document objects 90 degrees around the selection center"
+      description: "Rotate the selected document objects 90 degrees clockwise around the selection center"
     },
     {
       id: "layout.duplicate",

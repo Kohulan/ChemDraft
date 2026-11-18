@@ -3,12 +3,12 @@
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { MoleculeObject } from "@chemdraft/chem-core";
+import { applyPatches, type MoleculeObject } from "@chemdraft/chem-core";
 import { Molecule } from "openchemlib";
 import { depictSmiles2D } from "@chemdraft/ocl-adapter";
-import { insertSmilesMolecule } from "@chemdraft/document-workflow-core";
+import { insertSmilesMolecule, nativeAtomValidationState } from "@chemdraft/document-workflow-core";
 import { MainWindow } from "./MainWindow";
-import { applyNativeAtomElementTarget, createPhase4Document, insertNativeSingleBondMolecule, nativeAtomSproutHotkeyTarget, nativeSingleBondHotkeyAtAtomTarget, selectDocumentObjects } from "./documentWorkflow";
+import { applyNativeAtomElementTarget, createPhase4Document, insertNativeSingleBondMolecule, nativeAtomSproutHotkeyTarget, nativeBondLengthPx, nativeSingleBondHotkeyAtAtomTarget, selectDocumentObjects } from "./documentWorkflow";
 import { saveKeybindingSettings } from "./keybindingSettings";
 
 // Real DOM event harness promoted from the chemist's hover reproduction tests.
@@ -123,6 +123,143 @@ describe.each([
     await act(async () => { (document.activeElement ?? document.body).dispatchEvent(event); });
     return event;
   }
+
+  async function expectOneUndo(before: MoleculeObject) {
+    await press("z", { metaKey: platform === "macos", ctrlKey: platform === "windows" });
+    expect(molecule()).toEqual(before);
+    expect(container.querySelector("main")?.getAttribute("data-can-undo")).toBe("false");
+  }
+
+  it.each([
+    ["CCC", 2, "CC(C)c1ccccc1", "C9H12", 9, 9],
+    ["CC", 1, "Cc1ccccc1", "C7H8", 7, 7]
+  ] as const)("key 3 on %s at a carbon with %i bonds produces the expected benzene derivative", async (smiles, degree, product, formula, atoms, bonds) => {
+    const initial = insertSmilesMolecule(createPhase4Document("Benzene hotkey"), { x: 300, y: 300 }, depictSmiles2D(smiles), smiles);
+    await renderEthane(initial);
+    const before = molecule();
+    const incidentBonds = (m: MoleculeObject, atomId: string) => m.bonds.filter(bond =>
+      bond.fromAtomId === atomId || bond.toAtomId === atomId);
+    const source = await hoverAtom(before.atoms.findIndex(atom => incidentBonds(before, atom.id).length === degree));
+    expect((await press("3")).defaultPrevented).toBe(true);
+    const after = molecule();
+    expect(after.atoms).toHaveLength(atoms);
+    expect(after.bonds).toHaveLength(bonds);
+    expect(after.bonds.slice(0, before.bonds.length)).toEqual(before.bonds);
+    const center = after.atoms.find(atom => atom.id === source.id)!;
+    expect(incidentBonds(after, center.id)).toHaveLength(3);
+    expect(nativeAtomValidationState(center, after.bonds, center.formalCharge, after.atoms).valid).toBe(true);
+    expect(Molecule.fromSmiles(after.structure).toSmiles()).toBe(Molecule.fromSmiles(product).toSmiles());
+    expect(after.chemistry?.formula).toBe(formula);
+    await expectOneUndo(before);
+  });
+
+  it("key 3 adds phenyl to a cyclohexadiene methylene without changing the original ring", async () => {
+    const smiles = "C1=CCC=CC1";
+    const initial = insertSmilesMolecule(createPhase4Document("Diene hotkey"), { x: 300, y: 300 }, depictSmiles2D(smiles), smiles);
+    await renderEthane(initial);
+    const before = molecule();
+    await hoverAtom(before.atoms.findIndex(atom => before.bonds.filter(bond =>
+      bond.fromAtomId === atom.id || bond.toAtomId === atom.id).every(bond => bond.order === "single")));
+    await press("3");
+    const after = molecule();
+    expect(after.chemistry?.formula).toBe("C12H12");
+    expect(after.bonds.slice(0, before.bonds.length)).toEqual(before.bonds);
+    expect(after.bonds.slice(before.bonds.length).filter(bond => bond.order === "double")).toHaveLength(3);
+    await expectOneUndo(before);
+  });
+
+  it("key 3 refuses to overfill a propane carbon labeled CH2", async () => {
+    const smiles = "CCC";
+    const initial = insertSmilesMolecule(createPhase4Document("Labeled carbon hotkey"), { x: 300, y: 300 }, depictSmiles2D(smiles), smiles);
+    const graph = initial.pages[0].objects[0] as MoleculeObject;
+    const index = graph.atoms.findIndex(atom => graph.bonds.every(bond => bond.fromAtomId === atom.id || bond.toAtomId === atom.id));
+    const atoms = graph.atoms.map((atom, i) => i === index ? { ...atom, element: "CH2", labelLiteral: true } : atom);
+    await renderEthane(applyPatches(initial, [{ op: "updateObject", objectId: graph.id, changes: { atoms } }]));
+    const before = molecule();
+    await hoverAtom(index);
+    await press("3");
+    expect(molecule()).toEqual(before);
+    expect(container.querySelector("[data-status-message]")?.textContent).toContain("that atom has no free valence");
+    expect(container.querySelector("main")?.getAttribute("data-can-undo")).toBe("false");
+  });
+
+  it("key 3 refuses a fully bonded carbon without adding an undo entry", async () => {
+    const smiles = "CC(C)(C)C";
+    const initial = insertSmilesMolecule(createPhase4Document("Benzene hotkey"), { x: 300, y: 300 }, depictSmiles2D(smiles), smiles);
+    await renderEthane(initial);
+    const before = molecule();
+    await hoverAtom(before.atoms.findIndex(atom => before.bonds.filter(bond =>
+      bond.fromAtomId === atom.id || bond.toAtomId === atom.id).length === 4));
+    await press("3");
+    expect(molecule()).toEqual(before);
+    expect(container.querySelector("[data-status-message]")?.textContent).toContain("that atom has no free valence");
+    expect(container.querySelector("main")?.getAttribute("data-can-undo")).toBe("false");
+  });
+
+  it.each(["horizontal", "rotated", "page edge"] as const)("key 0 uses the same growth as 1 at a %s alkyne", async placement => {
+    const smiles = "CC#C";
+    const initial = insertSmilesMolecule(createPhase4Document("Propyne hotkey"), { x: 300, y: 300 }, depictSmiles2D(smiles), smiles);
+    const graph = initial.pages[0].objects[0] as MoleculeObject;
+    const triple = graph.bonds.find(bond => bond.order === "triple")!;
+    const methyl = graph.atoms.find(atom => atom.id !== triple.fromAtomId && atom.id !== triple.toAtomId)!;
+    const single = graph.bonds.find(bond => bond.order === "single")!;
+    const neighborId = single.fromAtomId === methyl.id ? single.toAtomId : single.fromAtomId;
+    const terminalId = triple.fromAtomId === neighborId ? triple.toAtomId : triple.fromAtomId;
+    const angle = placement === "rotated" ? Math.PI / 5 : 0;
+    const tip = { x: placement === "page edge" ? initial.pages[0].width - 2 : 300, y: 300 };
+    const atoms = graph.atoms.map(atom => {
+      const distance = atom.id === terminalId ? 0 : atom.id === neighborId ? nativeBondLengthPx : 2 * nativeBondLengthPx;
+      return { ...atom, x: tip.x - distance * Math.cos(angle), y: tip.y - distance * Math.sin(angle) };
+    });
+    await renderEthane(applyPatches(initial, [{ op: "updateObject", objectId: graph.id, changes: { atoms } }]));
+    const before = molecule();
+    const terminalIndex = before.atoms.findIndex(atom => atom.id === terminalId);
+    await hoverAtom(terminalIndex);
+    await press("1");
+    const singleGrowth = molecule();
+    await expectOneUndo(before);
+    const terminal = await hoverAtom(terminalIndex);
+    await press("0");
+    const after = molecule();
+    expect(after.atoms).toHaveLength(4);
+    expect(after.bonds).toHaveLength(3);
+    expect(after.bonds.slice(0, 2)).toEqual(before.bonds);
+    const added = after.atoms.at(-1)!;
+    expect(after.bonds.at(-1)).toMatchObject({ fromAtomId: terminalId, toAtomId: added.id, order: "single" });
+    if (placement !== "page edge") {
+      const neighbor = before.atoms.find(atom => atom.id === neighborId)!;
+      const ab = { x: neighbor.x - terminal.x, y: neighbor.y - terminal.y };
+      const ac = { x: added.x - terminal.x, y: added.y - terminal.y };
+      const cosine = (ab.x * ac.x + ab.y * ac.y) / (Math.hypot(ab.x, ab.y) * Math.hypot(ac.x, ac.y));
+      expect(cosine).toBeCloseTo(-1, 8);
+    }
+    expect(after.atoms).toEqual(singleGrowth.atoms);
+    expect(after.bonds).toEqual(singleGrowth.bonds);
+    expect(Molecule.fromSmiles(after.structure).toSmiles()).toBe(Molecule.fromSmiles("CC#CC").toSmiles());
+    expect(after.chemistry?.formula).toBe("C4H6");
+    await expectOneUndo(before);
+  });
+
+  it("repeated 0 presses still grow and close a saturated six-membered ring", async () => {
+    await renderEthane();
+    for (let index = 1; index < 5; index += 1) {
+      await hoverAtom(index);
+      await press("0");
+      expect(molecule().atoms).toHaveLength(index + 2);
+    }
+    const open = molecule();
+    expect(open.bonds).toHaveLength(5);
+    await hoverAtom(5);
+    await press("0");
+    const ring = molecule();
+    expect(ring.atoms).toEqual(open.atoms);
+    expect(ring.bonds).toHaveLength(6);
+    expect(ring.bonds.at(-1)).toMatchObject({ fromAtomId: open.atoms[5].id, toAtomId: open.atoms[0].id, order: "single" });
+    expect(Molecule.fromSmiles(ring.structure).toSmiles()).toBe(Molecule.fromSmiles("C1CCCCC1").toSmiles());
+    expect(ring.chemistry?.formula).toBe("C6H12");
+    await press("z", { metaKey: platform === "macos", ctrlKey: platform === "windows" });
+    expect(molecule()).toEqual(open);
+  });
 
   function numericSeed(element: "C" | "S" | "P") {
     let drawing = insertNativeSingleBondMolecule(createPhase4Document("Numeric keys"), { x: 300, y: 300 });

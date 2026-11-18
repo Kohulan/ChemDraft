@@ -25,7 +25,7 @@ import { snapPlacementDegrees } from "./placementSnap";
 import { nativeTemplateForToolCommand as sharedTemplateForToolCommand } from "./ringTemplates";
 import { projectedDoubleBondSides } from "./interaction/projectedDoubleBondSides";
 import { buildTableObject, pageConstrainedShift } from "@chemdraft/document-workflow-core";
-import { planTableLayout, tableVisualBoundsForArrangement, transformPointForObject, rotatedGraphicLocalBounds } from "@chemdraft/layout-engine";
+import { planTableLayout, planTextObjectPlacement, tableVisualBoundsForArrangement, textAutoSizePageLimits, transformPointForObject, rotatedGraphicLocalBounds } from "@chemdraft/layout-engine";
 import { validTableDimensions, type TableInsertDimensions } from "./dialogs/insertTableOptions";
 import { doubleBondStereoState, perceivedSpecifiedDoubleBondIds } from "./interaction/doubleBondStereo";
 import { loadDrawingSettings } from "./drawingSettings";
@@ -172,6 +172,7 @@ import {
   type TextExportResult
 } from "@chemdraft/export-engine";
 import {
+  atomPairOverlaps,
   compareLayoutQuality,
   layoutAtomAndLabelDefects,
   repairBridgedLayoutContacts,
@@ -3803,12 +3804,12 @@ function attachNativeTemplateRingToAtom(
     } satisfies MoleculeBond;
   });
 
-  const attached = refreshNativeSingleBondGraph(
+  // This ring shares only a vertex. Its template already assigns the alternating bonds.
+  return refreshNativeSingleBondGraph(
     molecule,
     [...molecule.atoms, ...newAtoms],
     [...molecule.bonds, ...newBonds]
   );
-  return templateId === "benzene" ? normalizeNativeAromaticTemplateBonds(attached) : attached;
 }
 
 function isNativeChairTemplate(templateId: NativeMoleculeTemplateId): boolean {
@@ -4639,7 +4640,8 @@ export interface TextToAtomLabelResult {
 function nativeTextObjectToAtomLabelTarget(
   document: ChemDraftDocument,
   objectId: string,
-  hitRadius: number
+  hitRadius: number,
+  placementPoint?: PagePoint
 ): { text: TextObject; target?: NativeMoleculeDeleteTarget; molecule?: MoleculeObject } | undefined {
   const page = firstPage(document);
   const text = page.objects.find((object): object is TextObject => object.id === objectId && object.type === "text");
@@ -4648,7 +4650,7 @@ function nativeTextObjectToAtomLabelTarget(
   }
   const nearest = page.objects.flatMap((object, layerIndex) => {
     if (object.type !== "molecule") return [];
-    const hit = findNearestAtomAtPoint({ atoms: object.atoms, point: text, hitRadius });
+    const hit = findNearestAtomAtPoint({ atoms: object.atoms, point: placementPoint ?? text, hitRadius });
     return hit ? [{ object, hit, layerIndex }] : [];
   }).sort((left, right) => left.hit.distance - right.hit.distance || right.layerIndex - left.layerIndex)[0];
   return {
@@ -4705,9 +4707,10 @@ export function selectedTextToAtomLabelDisabledReason(document: ChemDraftDocumen
 export function convertNativeTextObjectToAtomLabel(
   document: ChemDraftDocument,
   objectId: string,
-  hitRadius = nativeAtomHitRadiusPx
+  hitRadius = nativeAtomHitRadiusPx,
+  placementPoint?: PagePoint
 ): TextToAtomLabelResult {
-  const candidate = nativeTextObjectToAtomLabelTarget(document, objectId, hitRadius);
+  const candidate = nativeTextObjectToAtomLabelTarget(document, objectId, hitRadius, placementPoint);
   if (!candidate) {
     return { document, disabledReason: "Select one text box" };
   }
@@ -4756,19 +4759,19 @@ export function canAutoConvertNativeTextObjectToAtom(document: ChemDraftDocument
 
 /**
  * Text anchored on an atom uses the literal label editor's path. In open space, keep the
- * existing exact-element conversion: a one-atom molecule at the text box's center. Other text
+ * existing exact-element conversion: a one-atom molecule centered on the edited text frame. Other text
  * stays text. A bare covalent-table element is valence-flagged until it gains enough bonds.
  */
 export function convertNativeTextObjectToAtom(
   document: ChemDraftDocument,
   objectId: string,
-  options: { skipAtomLabel?: boolean } = {}
+  options: { skipAtomLabel?: boolean; placementPoint?: PagePoint } = {}
 ): ChemDraftDocument {
   if (!canAutoConvertNativeTextObjectToAtom(document, objectId)) {
     return document;
   }
   if (!options.skipAtomLabel) {
-    const labelResult = convertNativeTextObjectToAtomLabel(document, objectId);
+    const labelResult = convertNativeTextObjectToAtomLabel(document, objectId, undefined, options.placementPoint);
     if (labelResult.target) {
       return labelResult.document;
     }
@@ -5383,7 +5386,8 @@ export function getSelectedTextObject(document: ChemDraftDocument): TextObject |
 export function updateNativeTextObjectText(
   document: ChemDraftDocument,
   objectId: string,
-  text: string
+  text: string,
+  originalFrame?: Pick<TextObject, "x" | "y" | "width" | "height">
 ): ChemDraftDocument {
   const location = findTextObjectLocation(document, objectId);
   if (!location) {
@@ -5393,13 +5397,33 @@ export function updateNativeTextObjectText(
   const spans = textObjectSpansForTextChange(object, text);
   const fixedWidth = object.style.textBoxSizingMode === "fixed-width" || object.style.textBoxSizingMode === "fixed-size";
   const fixedSize = object.style.textBoxSizingMode === "fixed-size";
+  const frame = { ...object, x: 0, y: 0 };
+  const placement = planTextObjectPlacement(frame);
+  const minimumHeight = nativeTextObjectMinimumDimensions.height;
+  const limits = fixedWidth ? undefined : textAutoSizePageLimits(object, page, minimumHeight);
   const size = nativeTextObjectSizeForText(text, object.style, {
     spans,
     width: fixedWidth ? object.width : undefined,
     height: fixedSize ? object.height : undefined,
-    maxWidth: Math.max(nativeTextObjectMinimumDimensions.width, page.width - object.x),
-    maxHeight: Math.max(nativeTextObjectMinimumDimensions.height, page.height - object.y)
+    maxWidth: limits?.maxWidth ?? page.width - object.x,
+    maxHeight: fixedWidth ? Math.max(minimumHeight, page.height - object.y) : undefined
   });
+  if (limits) size.height = Math.min(size.height, Math.max(minimumHeight, limits.maxHeight(size.width)));
+
+  let { x, y } = object;
+  if (!fixedWidth) {
+    // The SVG baseline rotates around the frame center, which moves when either dimension changes.
+    const resizedFrame = { ...frame, ...size };
+    const anchor = transformPointForObject(frame, placement);
+    const resizedAnchor = transformPointForObject(resizedFrame, planTextObjectPlacement(resizedFrame));
+    x += anchor.x - resizedAnchor.x;
+    y += anchor.y - resizedAnchor.y;
+    // Returning to the original frame should not create an undo entry for floating-point roundoff.
+    if (originalFrame && size.width === originalFrame.width && size.height === originalFrame.height &&
+        Math.abs(x - originalFrame.x) < 1e-9 && Math.abs(y - originalFrame.y) < 1e-9) {
+      ({ x, y } = originalFrame);
+    }
+  }
 
   return applyPatch(
     document,
@@ -5408,6 +5432,8 @@ export function updateNativeTextObjectText(
       objectId,
       changes: {
         text,
+        x,
+        y,
         width: size.width,
         height: size.height,
         spans
@@ -7880,6 +7906,10 @@ export function nativeAtomSproutHotkeyTarget(
     return { document, refusal: "target-unavailable" };
   }
 
+  if (kind === "cyclic" && linearBondGrowthAimDegrees(sourceAtom.id, molecule.atoms, molecule.bonds) !== undefined) {
+    return nativeSingleBondHotkeyAtAtomTarget(document, target, plan);
+  }
+
   const growthPlan = (plan && !plan.targetAtomId ? plan : undefined)
     ?? nativeBondGrowthPlanForAtom(molecule, target.atomId, page.width, page.height);
 
@@ -8026,6 +8056,7 @@ function nativeCyclicClosurePatched(
 
 /** Refusal diagnostics only: these helpers never decide whether a sprout is placed. */
 export type NativeAtomSproutRefusal = NativeRingHotkeyRefusal
+  | "atom-no-free-valence"
   | "branched-carbon-full"
   | "sprout-no-free-direction"
   | "closure-bond-exists";
@@ -9645,7 +9676,7 @@ export function commitNativeAtomLabelTarget(
   document: ChemDraftDocument,
   target: NativeMoleculeDeleteTarget,
   label: string,
-  options: { literal?: boolean; beforeAtom?: MoleculeAtom; beforeMolecule?: MoleculeObject } = {}
+  options: { literal?: boolean; beforeAtom?: MoleculeAtom; beforeMolecule?: MoleculeObject; replaceElement?: boolean } = {}
 ): { document: ChemDraftDocument; target: NativeMoleculeDeleteTarget; message?: string; refusal?: string } {
   const page = firstPage(document);
   const molecule = page.objects.find((object): object is MoleculeObject => object.id === target.objectId && object.type === "molecule");
@@ -9654,7 +9685,7 @@ export function commitNativeAtomLabelTarget(
   const beforeAtom = options.beforeAtom ?? atom;
   const beforeMolecule = options.beforeMolecule ?? molecule;
   const normalized = normalizeNativeAtomElementLabel(label);
-  const decision = labelOnBondedAtom(normalized, beforeAtom, beforeMolecule);
+  const decision = labelOnBondedAtom(normalized, beforeAtom, beforeMolecule, options.replaceElement);
   const relabel = (reason?: string) => {
     const refusal = atomLabelIsotopeRefusal(beforeAtom, normalized, beforeMolecule, options.literal === true);
     if (refusal) return { document, target, message: refusal, refusal };
@@ -9675,7 +9706,7 @@ export function commitNativeAtomLabelTarget(
     pageBounds: { x: 0, y: 0, width: page.width, height: page.height }
   });
   const pageMolecules = page.objects.filter((o): o is MoleculeObject => o.type === "molecule");
-  if (!placement || pageMolecules.some(m => m.atoms.some(a => Math.hypot(a.x - placement.newAtomPoint.x, a.y - placement.newAtomPoint.y) < style.bondLengthPx * 0.5))) {
+  if (!placement || pageMolecules.some(m => m.atoms.some(a => atomPairOverlaps(distance(a, placement.newAtomPoint), style.bondLengthPx)))) {
     return relabel("no clear substituent position on the page");
   }
   // The substituent keeps the reading the user typed — the label as written, bond on its left — on

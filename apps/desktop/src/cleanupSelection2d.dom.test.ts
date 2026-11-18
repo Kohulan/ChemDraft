@@ -2,9 +2,9 @@
 import { act, createElement, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createEmptyDocument, type ChemDraftDocument, type ElectronMarkObject, type MoleculeObject } from "@chemdraft/chem-core";
+import { createEmptyDocument, nativeDrawingStyleFromObjectStyle, type ChemDraftDocument, type ElectronMarkObject, type MoleculeBond, type MoleculeObject } from "@chemdraft/chem-core";
 import { createSmilesMolecule } from "@chemdraft/document-workflow-core";
-import { depictSmiles2D } from "@chemdraft/ocl-adapter";
+import * as ocl from "@chemdraft/ocl-adapter";
 import { transformPointForObject } from "@chemdraft/layout-engine";
 import { MainWindow } from "./MainWindow";
 import { cleanUpNativeMolecules2d } from "./documentWorkflow";
@@ -54,7 +54,7 @@ describe("Clean Up Selection command", () => {
   function fixture(count = 1, smiles = "c1ccccc1CCCC") {
     const document = createEmptyDocument();
     for (let n = 0; n < count; n++) {
-      const molecule = createSmilesMolecule(document, { x: 250 + n * 260, y: 250 }, depictSmiles2D(smiles), smiles);
+      const molecule = createSmilesMolecule(document, { x: 250 + n * 260, y: 250 }, ocl.depictSmiles2D(smiles), smiles);
       molecule.atoms = molecule.atoms.map((atom, i) => i < 8 ? atom
         : { ...atom, x: atom.x + (i - 7) * 15, y: atom.y + (i - 7) * 12 });
       document.pages[0]!.objects.push(molecule);
@@ -64,6 +64,11 @@ describe("Clean Up Selection command", () => {
   async function selectLastBond(molecule: MoleculeObject, pointerId: number) {
     const bond = molecule.bonds.find(bond => [bond.fromAtomId, bond.toAtomId].every(id =>
       [molecule.atoms[8]!.id, molecule.atoms[9]!.id].includes(id)))!;
+    const selection = await selectBond(molecule, bond, pointerId);
+    expect(selection.wrapper().dataset.selectedNativeBondId).toBe(bond.id);
+    return selection;
+  }
+  async function selectBond(molecule: MoleculeObject, bond: MoleculeBond, pointerId: number) {
     const a = molecule.atoms.find(atom => atom.id === bond.fromAtomId)!;
     const b = molecule.atoms.find(atom => atom.id === bond.toAtomId)!;
     const wrapper = () => container.querySelector<HTMLElement>(`[data-object-id="${molecule.id}"]`)!;
@@ -75,7 +80,6 @@ describe("Clean Up Selection command", () => {
         wrapper().dispatchEvent(event);
       }
     });
-    expect(wrapper().dataset.selectedNativeBondId).toBe(bond.id);
     return { bond, wrapper };
   }
 
@@ -107,6 +111,93 @@ describe("Clean Up Selection command", () => {
     await vi.waitFor(() => expect(status()).toMatch(/^Cleaned up selected structure/));
     await command("structure.cleanup2d");
     await vi.waitFor(() => expect(status()).toBe("Selected structure already clean"));
+  }, 20_000);
+
+  it("undoes and redoes reflected ring coordinates and double-bond sides together", async () => {
+    const smiles = "CC1=CC=CC=C1";
+    await render(fixture(1, smiles));
+    const molecule = objects()[0]!;
+    const doubles = molecule.bonds.filter(bond => bond.order === "double");
+    for (const [i, bond] of doubles.entries()) await selectBond(molecule, bond, 730 + i);
+    const before = structuredClone(current());
+    const depiction = ocl.depictSmiles2D(smiles);
+    vi.spyOn(ocl, "relayoutMolfile2D").mockReturnValue({ ...depiction,
+      atoms: depiction.atoms.map(atom => ({ ...atom, y: -atom.y })) });
+
+    await command("structure.cleanup2d");
+    await vi.waitFor(() => expect(status()).toMatch(/^Cleaned up selected structure/));
+    expect(objects()[0]!.atoms[0]).toEqual(molecule.atoms[0]);
+    for (const bond of doubles) {
+      const updated = objects()[0]!.bonds.find(candidate => candidate.id === bond.id)!;
+      expect(updated.display?.doubleBondSide).toBe(bond.display?.doubleBondSide === "left" ? "right" : "left");
+    }
+    const after = structuredClone(current());
+    await command("edit.undo");
+    expect(status()).toBe("Undid Clean Up Selection");
+    expect(current()).toEqual(before);
+    await command("edit.redo");
+    expect(current()).toEqual(after);
+  }, 20_000);
+
+  it.each([
+    { fixedX: 311, outcome: "refuses a new atom overlap", refused: true },
+    { fixedX: 333, outcome: "separates an existing atom overlap", refused: false }
+  ])("$outcome and keeps the expected undo history", async ({ fixedX, refused }) => {
+    const document = fixture(1, "CC.[He]");
+    const molecule = document.pages[0]!.objects[0] as MoleculeObject;
+    molecule.atoms = molecule.atoms.map((atom, i) => ({ ...atom, x: [267, 333, fixedX][i]!, y: 250 }));
+    await render(document);
+    await selectBond(objects()[0]!, molecule.bonds[0]!, 720);
+    const before = structuredClone(current());
+
+    await command("structure.cleanup2d");
+    if (refused) {
+      await vi.waitFor(() => expect(status()).toMatch(/Clean Up Selection: .*would create overlapping atoms/));
+      expect(current()).toEqual(before);
+      expect(container.querySelector("main")?.getAttribute("data-can-undo")).toBe("false");
+    } else {
+      await vi.waitFor(() => expect(status()).toMatch(/^Cleaned up selected structure/));
+      expect(objects()[0]!.atoms[1]!.x).toBeCloseTo(311, 8);
+    }
+    const after = structuredClone(current());
+    await command("edit.undo");
+    expect(status()).toBe(refused ? "Nothing to undo" : "Undid Clean Up Selection");
+    expect(current()).toEqual(before);
+    await command("edit.redo");
+    expect(current()).toEqual(after);
+  }, 20_000);
+
+  it("refuses a collision between a selected fragment and a wholly selected naphthalene after both layouts", async () => {
+    const document = fixture(1, "CC.[He]");
+    const page = document.pages[0]!;
+    const fragment = page.objects[0] as MoleculeObject;
+    const center = { x: 400, y: 250 };
+    const smiles = "c1ccc2ccccc2c1";
+    const ring = createSmilesMolecule(document, center, ocl.depictSmiles2D(smiles), smiles);
+    ring.atoms = ring.atoms.map(atom => ({ ...atom,
+      x: center.x + (atom.x - center.x) * 0.4, y: center.y + (atom.y - center.y) * 0.4 }));
+    page.objects.push(ring);
+    const { bondLengthPx } = nativeDrawingStyleFromObjectStyle(ring.style);
+    const laidOut = workflow.applyNativeMoleculeEngineRelayout(document, ring.id, ocl.relayoutMolfile2D, {
+      targetBondLengthPx: bondLengthPx, perceiveStereo: ocl.perceiveStereoCentersFromMolfile
+    }).pages[0]!.objects[1] as MoleculeObject;
+    const leftmost = laidOut.atoms.reduce((left, atom) => atom.x < left.x ? atom : left);
+    expect(Math.min(...ring.atoms.map(atom => atom.x)) - leftmost.x).toBeGreaterThan(bondLengthPx / 2);
+    // Cleanup fits the selected bond around its midpoint, putting its right atom on the ring's new leftmost atom.
+    fragment.atoms = fragment.atoms.map((atom, i) => ({ ...atom,
+      x: leftmost.x + [-2 * bondLengthPx, bondLengthPx, -4 * bondLengthPx][i]!, y: leftmost.y }));
+    document.selection = { pageId: page.id, objectIds: [ring.id] };
+
+    await render(document);
+    const part = await selectBond(objects()[0]!, fragment.bonds[0]!, 721);
+    expect(part.wrapper().dataset.selectedNativeBondId).toBe(part.bond.id);
+    expect(current().selection.objectIds).toContain(ring.id);
+    const before = structuredClone(current());
+    await command("structure.cleanup2d");
+    await vi.waitFor(() => expect(status()).toBe("Clean Up Selection: the fitted layout would create overlapping atoms."));
+    expect(current()).toEqual(before);
+    await command("edit.undo");
+    expect(status()).toBe("Nothing to undo");
   }, 20_000);
 
   it.each([1, 2])("cleans partial selections across %i molecule(s) in one labelled undo entry and keeps the selection", async count => {

@@ -15,7 +15,7 @@ import { atomProblem, type AtomProblemAction } from "@chemdraft/document-workflo
 import { applyNativeAtomProblemFix } from "./documentWorkflow";
 import { dropElectronMark, dropElectronMarksInSelection, electronMarkDropTarget, resolveElectronMarksInSelectionTransform } from "./electronMarkDrop";
 import { electronMarkUndoLabel } from "./electronMarkUndoLabel";
-import { nativeFragmentSproutTarget, nativeDieneFuseTarget, nativeOxoHotkeyTarget, nativeBranchedHotkeyTarget, type FragmentSproutKind } from "./sproutHotkeys";
+import { nativeBenzeneHotkeyAtAtomTarget, nativeFragmentSproutTarget, nativeDieneFuseTarget, nativeOxoHotkeyTarget, nativeBranchedHotkeyTarget, type FragmentSproutKind } from "./sproutHotkeys";
 import { applyTableCommand, applyTableFontCommand, applyTableObjectEdit, createTableCommands, createTableInsertAction, parseTableInsertCommandId, resolveActiveTableCell, selectedTable, tableInsertCommandId, tableInspectorSnapshot, type ActiveTableCell, type TableInsertDimensions } from "./tableCommands";
 import { TableCellEditor, TableColumnResizers, type TableCellEditorHandle } from "./tableCellEditor";
 import { tableCellAtPoint, tableEditingContent, tableTextAtPoint, type TableEditingAction } from "./tableInteraction";
@@ -33,7 +33,7 @@ import type { InsertTableOptions } from "./dialogs/dialogProtocol";
 import { paletteFocusDiagnostic } from "./paletteFocusDiagnostic";
 import { installMainWindowPalettePendingKeys } from "./palettePendingKeys";
 import { installNativeFlyoutKeyboard } from "./nativeFlyoutKeyboard";
-import { cleanUpMoleculeSelections2d, cleanupSelectionAtomIds, nextObjectId, structureTemplateLayoutMessage } from "@chemdraft/document-workflow-core";
+import { assertNoNewCleanupMoleculeOverlaps, cleanUpMoleculeSelections2d, cleanupSelectionAtomIds, nextObjectId, structureTemplateLayoutMessage, type PagePoint } from "@chemdraft/document-workflow-core";
 import { insertStructureTemplate } from "./structureTemplateInsertion";
 import { pageOcclusionRects, readCanvasOcclusion } from "./window-manager/canvasOcclusion";
 import { commitWithPageFit, PageEnlargementConsent, planDocumentPageFit } from "./pageEnlargement";
@@ -1580,7 +1580,7 @@ function finishedAtomLabelDraft(current: ChemDraftDocument, state: AtomLabelEdit
   // Ordinary labels still go through the typed relabel decision (C/N can become literal).
   const unchanged = !state.draft.trim();
   return { baseline, ...(unchanged ? { document: baseline, target } : commitNativeAtomLabelTarget(baseline, target, state.draft, {
-    literal: true, beforeAtom: state.beforeAtom, beforeMolecule: state.beforeMolecule
+    literal: true, beforeAtom: state.beforeAtom, beforeMolecule: state.beforeMolecule, replaceElement: !state.startedFromHover
   })) };
 }
 
@@ -1788,7 +1788,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.18.14.00-codex";
+const CURRENT_BUILD_STAMP = "11.18.15.40-codex";
 const VibeCodeGuideForm = lazy(() => import("./dialogs/VibeCodeGuideForm").then(module => ({ default: module.VibeCodeGuideForm })));
 const StructureTemplatePicker = lazy(() => import("./dialogs/StructureTemplatePicker").then(module => ({ default: module.StructureTemplatePicker })));
 /** Starts in the background for the document webview under the existing probe gate. */
@@ -2565,9 +2565,9 @@ export function MainWindow({
   const textAutoConversionInProgressRef = useRef(false);
   // Only the first committed edit of each box placed by the Text tool may become an atom label.
   // Existing captions always remain text when reopened; the explicit command remains available.
-  // A second placement can end an earlier edit before React observes it, so pending ids cannot be
-  // kept in one overwriteable slot.
-  const textObjectIdsAwaitingAutoConversionRef = useRef<Set<string>>(new Set());
+  // Keep the first placement point for each id. A second placement can end an earlier edit
+  // before React observes it.
+  const textPlacementsAwaitingAutoConversionRef = useRef(new Map<string, PagePoint>());
   // Only fresh insertions own a placeholder. Synchronous clearing also protects focus retries.
   const pendingTextPlaceholderObjectIdRef = useRef<string | undefined>(undefined);
   const isTextPlaceholderPending = useCallback((objectId: string) =>
@@ -3329,7 +3329,8 @@ export function MainWindow({
     return commitNativeAtomLabelTarget(document, {
       objectId: activeAtomLabelEdit.objectId, atomId: activeAtomLabelEdit.atomId, kind: "atom", distanceToPointer: 0
     }, activeAtomLabelEdit.draft, {
-      literal: true, beforeAtom: activeAtomLabelEdit.beforeAtom, beforeMolecule: activeAtomLabelEdit.beforeMolecule
+      literal: true, beforeAtom: activeAtomLabelEdit.beforeAtom, beforeMolecule: activeAtomLabelEdit.beforeMolecule,
+      replaceElement: !activeAtomLabelEdit.startedFromHover
     });
   }, [document, activeAtomLabelEdit]);
   const labelDisplayPage = useMemo(() => {
@@ -4975,9 +4976,12 @@ export function MainWindow({
   }, [applyHoveredNativeTargetEdit]);
 
   const attachRingAtHoveredNativeAtom = useCallback((templateId: NativeMoleculeTemplateId, statusNoun: string) => {
-    applyHoveredNativeTargetEdit("atom", statusNoun, (document, target) =>
-      nativeRingHotkeyAttachAtAtomTarget(document, target, templateId, hoveredGrowthArrowPlan(target))
-    );
+    applyHoveredNativeTargetEdit("atom", statusNoun, (document, target) => {
+      const plan = hoveredGrowthArrowPlan(target);
+      return templateId === "benzene"
+        ? nativeBenzeneHotkeyAtAtomTarget(document, target, plan)
+        : nativeRingHotkeyAttachAtAtomTarget(document, target, templateId, plan);
+    });
   }, [applyHoveredNativeTargetEdit, hoveredGrowthArrowPlan]);
 
   const fuseRingAtHoveredNativeBond = useCallback((templateId: NativeMoleculeTemplateId, statusNoun: string) => {
@@ -5184,7 +5188,7 @@ export function MainWindow({
         let prepared = cleanUpNativeMolecules2d(currentDocument, nativeTargetIds);
         prepared = cleanUpMoleculeSelections2d(prepared, partialSelections, {
           relayout: relayoutMolfile2D, assertIdentity: assertConstrainedLayoutIdentity
-        });
+        }, { deferPageOverlapCheck: true });
         for (const objectId of engineTargetIds) {
           // 2D Cleanup idealises to the style's bond length like the polygon+tree pass does, so
           // repeated cleanups converge instead of freezing whatever scale the drawing drifted to.
@@ -5206,6 +5210,7 @@ export function MainWindow({
           setStatus("Clean up canceled because the document changed");
           return;
         }
+        if (partialSelections.length) assertNoNewCleanupMoleculeOverlaps(currentDocument, prepared);
         const changed = commitDocumentChangeWithPageFit(() => prepared, partialSelections.length ? "Clean Up Selection" : undefined, undefined,
           partialSelections.length ? (finalDocument) => {
             // Normalization can reassociate electron marks, including to a structure outside
@@ -7191,7 +7196,7 @@ export function MainWindow({
     void broadcastToolsetActiveTool(selectToolState.activeCommandId).catch(() => undefined);
   }, []);
 
-  const applyTextDocumentAtPoint = useCallback((point: ClientPoint) => {
+  const applyTextDocumentAtPoint = useCallback((point: PagePoint) => {
     // Finish the label and its history entry before the text placement takes its baseline.
     const edit = activeAtomLabelEditRef.current;
     if (edit) {
@@ -7205,7 +7210,7 @@ export function MainWindow({
     const inserted = getSelectedTextObject(nextDocument);
     commitDocumentChange(nextDocument);
     if (inserted) {
-      textObjectIdsAwaitingAutoConversionRef.current.add(inserted.id);
+      textPlacementsAwaitingAutoConversionRef.current.set(inserted.id, point);
     }
     restoreToolAfterTextPlacement();
     setActiveEditorObjectId(undefined);
@@ -7968,22 +7973,26 @@ export function MainWindow({
   }, [applyDetectedClipboardPayload, applySelectionClipboardPayload, applyTableClipboardResult, captureClipboardPasteAnchor]);
 
   const updateTextObjectContent = useCallback((objectId: string, text: string) => {
-    if (replacePresentDocument((current) => updateNativeTextObjectText(current, objectId, text))) {
+    const edit = textEditHistorySnapshotRef.current;
+    const original = edit?.objectId === objectId && edit.documentIdentity === documentIdentityRef.current
+      ? findDocumentObject(edit.document, objectId) : undefined;
+    const originalFrame = original?.type === "text" && original.text === text ? original : undefined;
+    if (replacePresentDocument((current) => updateNativeTextObjectText(current, objectId, text, originalFrame))) {
       reconcileSavedDocumentDirtyState();
     }
   }, [reconcileSavedDocumentDirtyState, replacePresentDocument]);
 
   const convertCommittedText = useCallback((objectId: string) => {
-    if (!textObjectIdsAwaitingAutoConversionRef.current.delete(objectId)) {
-      return;
-    }
+    const placement = textPlacementsAwaitingAutoConversionRef.current.get(objectId);
+    if (!placement) return;
+    textPlacementsAwaitingAutoConversionRef.current.delete(objectId);
     // A previous box may convert after a second placement. Its untouched first edit still
     // belongs to that placement, rather than becoming an existing-text edit at conversion.
     textAutoConversionInProgressRef.current = true;
     try {
       const currentDocument = documentRef.current;
       if (!canAutoConvertNativeTextObjectToAtom(currentDocument, objectId)) return;
-      const labelResult = convertNativeTextObjectToAtomLabel(currentDocument, objectId);
+      const labelResult = convertNativeTextObjectToAtomLabel(currentDocument, objectId, undefined, placement);
       if (labelResult.target) {
         if (labelResult.document !== currentDocument) {
           commitDocumentChange(
@@ -8032,7 +8041,7 @@ export function MainWindow({
     if (!objectId) return;
     // Escape keeps the literal text. Disarm conversion before closing so late blur/effects
     // can safely run the same finish path without converting this box.
-    if (reason === "escape") textObjectIdsAwaitingAutoConversionRef.current.delete(objectId);
+    if (reason === "escape") textPlacementsAwaitingAutoConversionRef.current.delete(objectId);
     settlePalettePreviewRef.current("finish text edit");
     if (activeTextEditObjectIdRef.current === objectId) activeTextEditObjectIdRef.current = undefined;
     setActiveTextEditObjectId((current) => (current === objectId ? undefined : current));
@@ -8142,7 +8151,7 @@ export function MainWindow({
 
     // Own the session before arming its snapshot: a checkpoint never sees a snapshot without its owner.
     activeTextEditObjectIdRef.current = objectId;
-    if (!textObjectIdsAwaitingAutoConversionRef.current.has(objectId) &&
+    if (!textPlacementsAwaitingAutoConversionRef.current.has(objectId) &&
       textEditHistorySnapshotRef.current?.objectId !== objectId) {
       textEditHistorySnapshotRef.current = {
         objectId, document: atomLabelHistorySnapshot(currentDocument), documentIdentity: documentIdentityRef.current
@@ -9630,7 +9639,7 @@ export function MainWindow({
     // navigation (including a forced palette command) records and closes the live session first.
     // First typing belongs to placement: navigating history must not insert a conversion entry.
     const textEditId = activeTextEditObjectIdRef.current ?? textEditHistorySnapshotRef.current?.objectId;
-    if (textEditId) textObjectIdsAwaitingAutoConversionRef.current.delete(textEditId);
+    if (textEditId) textPlacementsAwaitingAutoConversionRef.current.delete(textEditId);
     finishActiveNativeTextEdit();
     let nextHistory: DocumentHistory | undefined;
     let undoLabel: string | undefined;
@@ -24961,7 +24970,7 @@ function nativeTemplateStatusLabel(templateId: NativeMoleculeTemplateId): string
 }
 
 /** Why a ring or sprout could not change the target molecule, worded for the status line. */
-export function nativeTemplateFallbackReasonText(reason: NativeAtomSproutRefusal | "atom-no-free-valence"): string {
+export function nativeTemplateFallbackReasonText(reason: NativeAtomSproutRefusal): string {
   switch (reason) {
     case "atom-no-free-valence":
       return "that atom has no free valence";
