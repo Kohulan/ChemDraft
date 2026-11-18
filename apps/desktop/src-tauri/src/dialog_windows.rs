@@ -2795,6 +2795,12 @@ fn content_refit_size(
             .max(user_size.map_or(1.0, |size| size.1)),
     )
 }
+pub(super) fn centered_window_origin(owner: super::ScreenRect, size: (f64, f64)) -> (f64, f64) {
+    (
+        owner.x + (owner.width - size.0) / 2.0,
+        owner.y + (owner.height - size.1) / 2.0,
+    )
+}
 fn position_for(
     saved: Option<&SavedPosition>,
     monitors: &[WorkArea],
@@ -2816,12 +2822,8 @@ fn position_for(
         }
     }
     let (x, y, width, height) = owner_rect;
-    let (x, y) = owner.clamp(
-        x + (width - size.0) / 2.0,
-        y + (height - size.1) / 2.0,
-        size.0,
-        size.1,
-    );
+    let (x, y) = centered_window_origin(super::ScreenRect::new(x, y, width, height), size);
+    let (x, y) = owner.clamp(x, y, size.0, size.1);
     (x * owner.scale, y * owner.scale, owner.scale)
 }
 fn saved_path<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<std::path::PathBuf, String> {

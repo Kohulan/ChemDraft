@@ -101,6 +101,7 @@ pub(super) fn frame_for_save<R: Runtime>(window: &tauri::Window<R>) -> Option<Fr
 pub(super) fn apply<R: Runtime>(
     window: &tauri::Window<R>,
     placement: Placement,
+    reason: &str,
 ) -> Result<(), String> {
     use objc2_app_kit::{NSScreen, NSWindow};
     use objc2_foundation::{NSPoint, NSRect, NSSize};
@@ -128,6 +129,9 @@ pub(super) fn apply<R: Runtime>(
             outer.size.height - content.size.height,
         ),
     );
+    super::windows_activation_log::frame_set(window.label(), reason, "pixels", || {
+        (placement.position, placement.size)
+    });
     native.setFrame_display(
         NSRect::new(
             NSPoint::new(frame.x, frame.y),
@@ -142,7 +146,11 @@ pub(super) fn apply<R: Runtime>(
 pub(super) fn apply<R: Runtime>(
     window: &tauri::Window<R>,
     placement: Placement,
+    reason: &str,
 ) -> Result<(), String> {
+    super::windows_activation_log::frame_set(window.label(), reason, "pixels", || {
+        (placement.position, placement.size)
+    });
     // On the UI thread Tauri dispatches inline; Win32 completes each SetWindowPos before returning.
     placement.apply(
         |(x, y)| {
@@ -211,8 +219,8 @@ pub(super) fn set<R: Runtime>(
         .or_default()
         .enable(normal.clone());
     // Write before resizing as well: a crash while enlarged must retain the latest normal frame.
-    if let Err(error) =
-        super::save_plugin_panel_frame(window, normal).and_then(|()| apply(window, placement))
+    if let Err(error) = super::save_plugin_panel_frame(window, || Some(normal))
+        .and_then(|()| apply(window, placement, "enter panel full size"))
     {
         let _ = restore(window);
         return Err(error);
@@ -226,9 +234,9 @@ fn restore<R: Runtime>(window: &tauri::Window<R>) -> Result<Status, String> {
         let (placement, restored) =
             super::plugin_panel_restore_geometry(window.app_handle(), &normal)
                 .ok_or("Could not place the restored panel on an attached monitor.")?;
-        apply(window, placement)?;
-        // Save the target rather than reading back a minimized owner's parking coordinates.
-        super::save_plugin_panel_frame(window, restored)
+        apply(window, placement, "restore panel normal size")?;
+        // Native frame notifications can lag the synchronous restore. Save its target while visible.
+        super::save_plugin_panel_frame(window, || Some(restored))
     })?;
     Ok(if restored {
         notify(window, false)
@@ -239,15 +247,12 @@ fn restore<R: Runtime>(window: &tauri::Window<R>) -> Result<Status, String> {
 
 pub(super) fn will_hide<R: Runtime>(window: &tauri::Window<R>) {
     if let Err(error) = set(window, false, 0.0, 0.0) {
-        // Preserve the normal frame even if the OS refuses a move during teardown.
-        if let Some(normal) = frame_for_save(window) {
-            let _ = super::save_plugin_panel_frame(window, normal);
-        }
         eprintln!(
             "Could not restore panel {} before hiding: {error}",
             window.label()
         );
     }
+    // If restoring an enlargement failed, persistence still reads its last normal frame.
     if let Err(error) = super::persist_plugin_panel_geometry(window) {
         eprintln!(
             "Could not persist panel {} before hiding: {error}",
@@ -284,7 +289,7 @@ pub(super) fn before_hide<R: Runtime>(_window: &tauri::WebviewWindow<R>) {}
 
 pub(super) fn restore_all<R: Runtime>(app: &tauri::AppHandle<R>) {
     for (label, window) in app.webview_windows() {
-        if super::is_plugin_panel_window_label(&label) {
+        if super::is_plugin_panel_window_label(&label) && window.is_visible().unwrap_or(false) {
             let webview: &tauri::Webview<R> = window.as_ref();
             will_hide(&webview.window());
         }

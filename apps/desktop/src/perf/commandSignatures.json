@@ -593,6 +593,14 @@
   },
   {
     "file": "lib.rs",
+    "name": "resize_toolset_window",
+    "async": false,
+    "generics": "",
+    "parameters": "window: tauri::WebviewWindow, width: f64, height: f64,",
+    "returnType": "Result<bool, String>"
+  },
+  {
+    "file": "lib.rs",
     "name": "set_palette_command_hit_boxes",
     "async": false,
     "generics": "",

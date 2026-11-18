@@ -1394,6 +1394,8 @@ pub fn run() {
                             .shutdown();
                     }
                     WindowEvent::Focused(true) => {
+                        #[cfg(target_os = "macos")]
+                        reattach_visible_plugin_panels(window.app_handle());
                         schedule_suspended_utility_restore(window.app_handle());
                     }
                     _ => {}
@@ -1496,12 +1498,11 @@ pub fn run() {
             }
 
             match event {
-                // Minimizing the document minimizes its owned palettes too, and Windows parks a
-                // minimized window far off-screen and reports that as a Moved. Persisting it saved
-                // the palettes at (-16000, -16000), so the next launch clamped them to the screen
-                // corner. Like persist_main_window_geometry, minimized frames are not user frames.
-                WindowEvent::Moved(_) if toolset_frame_is_transient(app, window) => {}
-                WindowEvent::Moved(position) => {
+                WindowEvent::Moved(_) => {
+                    // A queued Moved can arrive after a hide or report an older position.
+                    let Some(position) = visible_toolset_physical_position(window) else {
+                        return;
+                    };
                     if !UTILITY_SUSPENSION
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1615,6 +1616,7 @@ pub fn run() {
             show_toolset_tooltip_window,
             hide_toolset_tooltip_window,
             set_current_window_global_position,
+            resize_toolset_window,
             start_window_drag,
             quit_after_flush,
             set_quit_prompt_enabled,
@@ -2284,6 +2286,7 @@ fn restore_main_document_window_without_focus<R: Runtime>(
             native.deminiaturize(None);
         }
         native.orderFront(None);
+        reattach_visible_plugin_panels(window.app_handle());
     }
     #[cfg(windows)]
     {
@@ -2884,6 +2887,9 @@ fn restore_utility_in_document_group<R: Runtime>(
     };
     let anchor =
         anchor.ok_or_else(|| "ChemDraft utility restore anchor disappeared.".to_string())?;
+    if is_plugin_panel_window_label(window.label()) {
+        recover_hidden_plugin_panel_frame(window, None)?;
+    }
     restore_utility_window(window, &main, &anchor, below)
 }
 
@@ -2914,14 +2920,14 @@ fn restore_utility_window<R: Runtime>(
             anchor.ns_window().map_err(|error| error.to_string())? as *mut NSWindow;
         let anchor = unsafe { anchor_pointer.as_ref() }
             .ok_or_else(|| "Could not access native ChemDraft restore anchor.".to_string())?;
-        // Ordering out can detach children. Preserve recorded relationships for original windows;
-        // newly deferred windows use the normal creation policy (panels parented, toolbars and
-        // dialogs unparented). Dialogs must never inherit the document's normal window level.
+        // Ordering out can detach children. Reports belong to the now-visible document, even
+        // when they first opened while it was hidden. Preserve other recorded relationships.
         // Both children and unparented utilities use the retained relative stacking position below.
-        let restore_as_document_child = UTILITY_SUSPENSION
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .restore_as_document_child(window.label());
+        let restore_as_document_child = is_plugin_panel_window_label(window.label())
+            || UTILITY_SUSPENSION
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .restore_as_document_child(window.label());
         if restore_as_document_child
             && native
                 .parentWindow()
@@ -3202,7 +3208,10 @@ fn close_toolset_window(
     }
     let window = app.get_webview_window(&toolset_window_label(&toolset_id));
     if let Some(window) = window.as_ref() {
-        if let Some(position) = current_toolset_window_position(window) {
+        let webview: &tauri::Webview = window.as_ref();
+        if let Some(position) = visible_toolset_physical_position(&webview.window()) {
+            let position =
+                logical_toolset_position(window, f64::from(position.x), f64::from(position.y));
             // Best-effort, exactly like the `Moved` handler. Remembering where the palette was is
             // housekeeping; it must never be able to veto the close the user asked for. Once
             // `update_toolset_layout_state` began propagating read errors instead of swallowing
@@ -4275,21 +4284,6 @@ struct OpenPluginPanelRequest {
     _focus: bool,
 }
 
-struct PanelWindowPresentation {
-    focused_on_build: bool,
-    visible_on_build: bool,
-}
-
-impl OpenPluginPanelRequest {
-    fn presentation(&self, deferred: bool) -> PanelWindowPresentation {
-        PanelWindowPresentation {
-            // Tao's Windows show mode is a lifetime creation trait, not the current focus state.
-            focused_on_build: false,
-            visible_on_build: !deferred,
-        }
-    }
-}
-
 /// The native window label for a panel id. Must be injective: `panel.a-b.c` and `panel.a.b-c` are
 /// different panels and must never share (and so replace or reveal) one window. Tauri labels allow
 /// `:` but not `.`, and panel ids never contain `:` (`is_valid_plugin_storage_id`), so swapping `.`
@@ -5096,23 +5090,6 @@ mod plugin_panel_label_tests {
     }
 
     #[test]
-    fn explicit_panel_focus_never_changes_the_non_activating_restore_trait() {
-        for focus in [false, true] {
-            let request: OpenPluginPanelRequest = serde_json::from_value(serde_json::json!({
-                "panelId": "v1x61x62", "title": "Analyze", "focus": focus
-            }))
-            .unwrap();
-            for deferred in [false, true] {
-                let presentation = request.presentation(deferred);
-                // On Windows this selects SW_SHOWNOACTIVATE for ALL subsequent shows, including
-                // restoration of an Analyze panel that was explicitly focused after its build.
-                assert!(!presentation.focused_on_build);
-                assert_eq!(presentation.visible_on_build, !deferred);
-            }
-        }
-    }
-
-    #[test]
     fn native_close_interception_covers_every_panel_window_and_nothing_else() {
         assert!(is_plugin_panel_window_label(&plugin_panel_window_label(
             "v1x6f7267x70616e656c"
@@ -5475,7 +5452,6 @@ fn build_or_show_plugin_panel<R: Runtime>(
         return Err(QUITTING_WINDOW_REFUSAL.to_string());
     }
     let label = plugin_panel_window_label(&request.panel_id);
-    let presentation = request.presentation(restoring);
     if let Some(window) = app.get_webview_window(&label) {
         if restoring {
             let target = window.clone();
@@ -5483,28 +5459,13 @@ fn build_or_show_plugin_panel<R: Runtime>(
                 restore_utility_in_document_group(&target)
             })?;
         }
-        if !window.is_visible().unwrap_or(true) {
-            // Reopening a reusable window also checks for a monitor disconnected since close.
-            // Prompt restoration above deliberately leaves its live frame and ordering alone.
-            let webview: &tauri::Webview<R> = window.as_ref();
-            let live = current_plugin_panel_geometry(&webview.window());
-            let (_, _, placement) = plugin_panel_initial_geometry(app, &request, live);
-            if let Some(placement) = placement {
-                let target = window.clone();
-                run_on_main_thread_blocking(&window, move || {
-                    let webview: &tauri::Webview<R> = target.as_ref();
-                    panel_full_size::apply(&webview.window(), placement)
-                })??;
-            }
-        }
-        // `show()` makes the window key on macOS (tao's `set_visible` is makeKeyAndOrderFront), so
-        // an automatic re-show leaves visibility to `configure_analysis_window`, which only orders
-        // the window front.
-        if !cfg!(target_os = "macos") {
-            window.show().map_err(|error| error.to_string())?;
-        }
-        configure_analysis_window(&window)?;
-        return Ok(());
+        let target = window.clone();
+        return run_on_main_thread_blocking(&window, move || {
+            // Read and recover the frame just before revealing the panel. A separate placement
+            // task could apply old coordinates after another reveal or move.
+            recover_hidden_plugin_panel_frame(&target, Some(&request))?;
+            reveal_plugin_panel(&target)
+        })?;
     }
 
     let saved = load_toolset_layout_state(app)
@@ -5528,21 +5489,24 @@ fn build_or_show_plugin_panel<R: Runtime>(
     .accept_first_mouse(true)
     .focusable(false)
     // Windows uses this creation trait for EVERY later show, not just the initial reveal.
-    .focused(presentation.focused_on_build)
-    .visible(presentation.visible_on_build && placement.is_none())
+    .focused(false)
+    .visible(false)
     .resizable(true)
     .decorations(false)
     // Overlapping panels need a visible edge, matching the palette popover's native shadow.
     .shadow(true)
     .skip_taskbar(true);
-    // AppKit parent attachment orders even a hidden child in. A deferred build stays unparented
-    // until the main-thread restore checks activation and attaches it relative to the document.
-    if utility_window_has_document_parent(&label) && !(restoring && cfg!(target_os = "macos")) {
+    // AppKit parent attachment can order a hidden child in before the queued placement runs.
+    // Attach at reveal on macOS so a user cannot drag the panel before its initial frame is set.
+    if !cfg!(target_os = "macos") && utility_window_has_document_parent(&label) {
         if let Some(main) = app.get_webview_window(MAIN_WINDOW_LABEL) {
             builder = builder.parent(&main).map_err(|error| error.to_string())?;
         }
     }
     let window = builder.build().map_err(|error| error.to_string())?;
+    windows_activation_log::frame_set(&label, "panel creation", "pixels", || {
+        (window.outer_position().ok(), window.inner_size().ok())
+    });
     disable_default_context_menus(&window);
     let target = window.clone();
     let installed = run_on_main_thread_blocking(&window, move || {
@@ -5554,9 +5518,9 @@ fn build_or_show_plugin_panel<R: Runtime>(
             let native = unsafe { &*(pointer as *const NSWindow) };
             configure_analysis_window_traits(&target, native)?;
         }
-        if let Some(placement) = placement {
+        if let Some(placement) = placement.filter(|_| !target.is_visible().unwrap_or(true)) {
             let webview: &tauri::Webview<R> = target.as_ref();
-            panel_full_size::apply(&webview.window(), placement)?;
+            panel_full_size::apply(&webview.window(), placement, "initial panel placement")?;
         }
         panel_window::install_resize_hit_test(&target)
     })
@@ -5565,16 +5529,61 @@ fn build_or_show_plugin_panel<R: Runtime>(
         window.destroy().map_err(|error| error.to_string())
     })?;
 
-    if restoring {
-        let target = window.clone();
-        return run_on_main_thread_blocking(&window, move || {
+    let target = window.clone();
+    run_on_main_thread_blocking(&window, move || {
+        if restoring {
             restore_utility_in_document_group(&target)
-        })?;
-    }
-    if !cfg!(target_os = "macos") {
+        } else {
+            reveal_plugin_panel(&target)
+        }
+    })?
+}
+
+#[cfg(target_os = "macos")]
+fn reveal_plugin_panel<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), String> {
+    configure_analysis_window_on_main_thread(window)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn reveal_plugin_panel<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), String> {
+    if !window.is_visible().map_err(|error| error.to_string())? {
         window.show().map_err(|error| error.to_string())?;
+        window
+            .set_focusable(false)
+            .map_err(|error| error.to_string())?;
     }
-    configure_analysis_window(&window)?;
+    Ok(())
+}
+
+/// Main-thread-only. Recover a hidden panel immediately before either reveal path.
+fn recover_hidden_plugin_panel_frame<R: Runtime>(
+    target: &tauri::WebviewWindow<R>,
+    request: Option<&OpenPluginPanelRequest>,
+) -> Result<(), String> {
+    if target.is_visible().unwrap_or(true) || target.is_minimized().unwrap_or(true) {
+        return Ok(());
+    }
+    let app = target.app_handle();
+    let webview: &tauri::Webview<R> = target.as_ref();
+    let window = webview.window();
+    let live = current_plugin_panel_geometry(&window);
+    let placement = panel_window_frame::Frame::hidden_reopen(
+        live.as_ref(),
+        &plugin_panel_monitors(app),
+        || {
+            let (width, height) = match request {
+                Some(request) => panel_window_frame::default_size(request.width, request.height),
+                None => live.as_ref().map_or_else(
+                    || panel_window_frame::default_size(None, None),
+                    |frame| (frame.width, frame.height),
+                ),
+            };
+            plugin_panel_default_placement(app, width, height)
+        },
+    );
+    if let Some(placement) = placement {
+        panel_full_size::apply(&window, placement, "recover hidden panel")?;
+    }
     Ok(())
 }
 
@@ -5598,34 +5607,53 @@ fn plugin_panel_initial_geometry<R: Runtime>(
     saved: Option<panel_window_frame::Frame>,
 ) -> (f64, f64, Option<panel_window_frame::Placement>) {
     let (width, height) = panel_window_frame::default_size(request.width, request.height);
-    let placement = saved
-        .as_ref()
-        .and_then(|frame| plugin_panel_saved_placement(app, frame))
-        .or_else(|| plugin_panel_default_placement(app, width, height));
+    let placement = match saved.as_ref() {
+        Some(frame) => plugin_panel_saved_placement(app, frame),
+        None => plugin_panel_first_placement(app, (width, height)),
+    }
+    .or_else(|| plugin_panel_default_placement(app, width, height));
     (width, height, placement)
+}
+
+fn plugin_panel_first_placement<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    size: (f64, f64),
+) -> Option<panel_window_frame::Placement> {
+    let owner = app.get_webview_window(MAIN_WINDOW_LABEL)?;
+    let monitor =
+        panel_window_frame::Monitor::from_native(&owner.current_monitor().ok().flatten()?);
+    let position = owner.inner_position().ok()?;
+    let owner_size = owner.inner_size().ok()?;
+    panel_window_frame::Frame::first_placement(
+        (position.x, position.y),
+        (owner_size.width, owner_size.height),
+        size,
+        &monitor,
+    )
 }
 
 fn plugin_panel_saved_placement<R: Runtime>(
     app: &tauri::AppHandle<R>,
     frame: &panel_window_frame::Frame,
 ) -> Option<panel_window_frame::Placement> {
-    let monitors = app.available_monitors().unwrap_or_default();
-    let monitors: Vec<_> = monitors
+    frame.restore(&plugin_panel_monitors(app))
+}
+
+fn plugin_panel_monitors<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Vec<panel_window_frame::Monitor> {
+    app.available_monitors()
+        .unwrap_or_default()
         .iter()
         .map(panel_window_frame::Monitor::from_native)
-        .collect();
-    frame.restore(&monitors)
+        .collect()
 }
 
 fn plugin_panel_restore_geometry<R: Runtime>(
     app: &tauri::AppHandle<R>,
     saved: &panel_window_frame::Frame,
 ) -> Option<(panel_window_frame::Placement, panel_window_frame::Frame)> {
-    let monitors = app.available_monitors().unwrap_or_default();
-    let monitors: Vec<_> = monitors
-        .iter()
-        .map(panel_window_frame::Monitor::from_native)
-        .collect();
+    let monitors = plugin_panel_monitors(app);
     if let Some(placement) = saved.restore_normal(&monitors) {
         let monitor = monitors.iter().find(|m| m.identity == saved.monitor)?;
         let frame =
@@ -5646,9 +5674,12 @@ fn plugin_panel_default_placement<R: Runtime>(
     width: f64,
     height: f64,
 ) -> Option<panel_window_frame::Placement> {
-    let position = analysis_window_initial_position(app, width, height)?;
     let main = app.get_webview_window(MAIN_WINDOW_LABEL)?;
     let monitor = main.current_monitor().ok().flatten()?;
+    let work_area = monitor_logical_work_area(&monitor);
+    let width = width.min(work_area.width);
+    let height = height.min(work_area.height);
+    let position = analysis_window_initial_position(app, width, height, work_area)?;
     let scale = monitor.scale_factor();
     let position = position.to_physical::<i32>(scale);
     let size = tauri::LogicalSize::new(width, height).to_physical::<u32>(scale);
@@ -5663,6 +5694,7 @@ fn analysis_window_initial_position<R: Runtime>(
     app: &tauri::AppHandle<R>,
     width: f64,
     height: f64,
+    work_area: ScreenRect,
 ) -> Option<tauri::LogicalPosition<f64>> {
     let main = app.get_webview_window(MAIN_WINDOW_LABEL)?;
     let scale = main.scale_factor().ok()?;
@@ -5670,7 +5702,6 @@ fn analysis_window_initial_position<R: Runtime>(
     let main_size = main.inner_size().ok()?.to_logical::<f64>(scale);
     // Clamp to the work area, not the full display: a window pushed under the menu bar or the Dock
     // has its title strip -- the only way to drag an undecorated window -- out of reach.
-    let work_area = monitor_logical_work_area(&main.current_monitor().ok().flatten()?);
     // The floating palettes sit at a higher window level than this window, so wherever they are is
     // somewhere the new window would open underneath them, title bar and all.
     let palettes: Vec<ScreenRect> = app
@@ -5709,7 +5740,7 @@ fn analysis_window_initial_position<R: Runtime>(
     Some(tauri::LogicalPosition::new(x, y))
 }
 
-/// A window frame in logical screen coordinates.
+/// A rectangle in screen coordinates. Comparisons use the same units for both rectangles.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ScreenRect {
     x: f64,
@@ -5736,6 +5767,26 @@ impl ScreenRect {
         } else {
             width * height
         }
+    }
+
+    fn contains_title_strip(&self, x: f64, y: f64, width: f64, title_height: f64) -> bool {
+        self.contains_title_strip_at_scale(x, y, width, title_height, 1.0)
+    }
+
+    fn contains_title_strip_at_scale(
+        &self,
+        x: f64,
+        y: f64,
+        width: f64,
+        title_height: f64,
+        scale: f64,
+    ) -> bool {
+        // Leave enough horizontal room to grab the title, and keep its full height clear of
+        // the menu bar, taskbar or Dock.
+        let overlap = (x + width).min(self.x + self.width) - x.max(self.x);
+        overlap >= width.min(48.0 * scale)
+            && y >= self.y
+            && y + title_height <= self.y + self.height
     }
 }
 
@@ -5802,18 +5853,7 @@ fn choose_analysis_window_position(
     best
 }
 
-/// Non-activating by default. Only the caller-validated input focus command makes a panel key.
-///
-/// Marshalled: `open_plugin_panel_window` is async (a worker thread, required for WebView2 on
-/// Windows), and every call below is raw AppKit, which is main-thread-only.
-#[cfg(target_os = "macos")]
-fn configure_analysis_window<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), String> {
-    let target = window.clone();
-    run_on_main_thread_blocking(window, move || {
-        configure_analysis_window_on_main_thread(&target)
-    })?
-}
-
+/// Order the panel front without making it key. Called on the UI thread.
 #[cfg(target_os = "macos")]
 fn configure_analysis_window_on_main_thread<R: Runtime>(
     window: &tauri::WebviewWindow<R>,
@@ -5863,11 +5903,10 @@ fn configure_analysis_window_traits<R: Runtime>(
 
 /// Makes `child` a child window of the main document window again, if it is not one already.
 ///
-/// The builder's `.parent(&main)` attaches a report window only once, at creation, and AppKit drops
-/// the relationship whenever the child is ordered out — which is what `hide()` does. Without this a
-/// re-shown report window is an ordinary window that falls behind the document on the next canvas
-/// click. Call it only once `child` is on screen: `addChildWindow:` orders a hidden child in. A
-/// hidden main window is left alone, because attaching to it would tie the child to its visibility.
+/// AppKit drops the relationship whenever the child is ordered out. Attach on each reveal so the
+/// panel stays above the document on the next canvas click. Call it only once `child` is on screen:
+/// `addChildWindow:` orders a hidden child in. Leave a hidden main window alone so the child can
+/// stay visible independently until the document returns.
 #[cfg(target_os = "macos")]
 fn attach_to_main_window<R: Runtime>(app: &tauri::AppHandle<R>, label: &str, child: &NSWindow) {
     if !should_attach_as_document_child(label) {
@@ -5905,12 +5944,14 @@ pub(crate) fn attach_webview_window_to_main<R: Runtime>(window: &tauri::WebviewW
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn configure_analysis_window<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), String> {
-    window
-        .set_focusable(false)
-        .map_err(|error| error.to_string())?;
-    Ok(())
+/// Main-thread-only. Panels already on screen can be attached without changing the key window.
+#[cfg(target_os = "macos")]
+fn reattach_visible_plugin_panels<R: Runtime>(app: &tauri::AppHandle<R>) {
+    for (label, panel) in app.webview_windows() {
+        if is_plugin_panel_window_label(&label) {
+            attach_webview_window_to_main(&panel);
+        }
+    }
 }
 
 /// Whether the document should get keyboard focus back once a hidden app is active again.
@@ -6055,6 +6096,7 @@ fn observe_hide_for_document_key_restore<R: Runtime>(app: tauri::AppHandle<R>) {
             let Some(main) = main_ns_window(&restore_app) else {
                 return;
             };
+            reattach_visible_plugin_panels(&restore_app);
             let restore = DOCUMENT_KEY_AFTER_UNHIDE
                 .lock()
                 .map(|mut state| state.take_restore(main.isVisible(), main.isKeyWindow()))
@@ -6594,11 +6636,18 @@ fn set_window_global_logical_position<R: Runtime>(
         .collect::<Vec<_>>();
     let current_scale = window.scale_factor().unwrap_or(1.0);
     let (physical_x, physical_y) = global_logical_to_physical(&monitors, x, y, current_scale);
+    let position =
+        tauri::PhysicalPosition::new(physical_x.round() as i32, physical_y.round() as i32);
+    if is_plugin_panel_window_label(window.label()) || window.label().starts_with("toolset-") {
+        windows_activation_log::frame_set(
+            window.label(),
+            "global position request",
+            "pixels",
+            || (position, window.inner_size().ok()),
+        );
+    }
     window
-        .set_position(tauri::PhysicalPosition::new(
-            physical_x.round() as i32,
-            physical_y.round() as i32,
-        ))
+        .set_position(position)
         .map_err(|error| error.to_string())
 }
 
@@ -6612,6 +6661,133 @@ fn set_current_window_global_position(
     y: f64,
 ) -> Result<(), String> {
     set_window_global_logical_position(&window, x, y)
+}
+
+/// Resize to measured content, keeping the native top-left that is current when the resize runs.
+#[tauri::command]
+fn resize_toolset_window(
+    window: tauri::WebviewWindow,
+    width: f64,
+    height: f64,
+) -> Result<bool, String> {
+    let app = window.app_handle();
+    if toolset_id_for_window_label(app, window.label()).is_none() {
+        return Err("Only a ChemDraft tool palette may resize to fit its content.".into());
+    }
+    if ![width, height]
+        .into_iter()
+        .all(|n| n.is_finite() && n > 0.0)
+    {
+        return Err("Tool palette dimensions must be positive and finite.".into());
+    }
+    // This synchronous command runs on the UI thread. On macOS, applying the frame directly
+    // also avoids Tao queuing independent resize and top-left updates on the AppKit queue.
+    let webview: &tauri::Webview = window.as_ref();
+    let window = webview.window();
+    if toolset_frame_is_transient(app, &window) {
+        return Ok(false);
+    }
+    let monitor = window
+        .current_monitor()
+        .map_err(|error| error.to_string())?
+        .or_else(|| app.primary_monitor().ok().flatten())
+        .ok_or("The tool palette's monitor is unavailable.")?;
+    let scale = monitor.scale_factor();
+    #[cfg(not(target_os = "macos"))]
+    let window_scale = window.scale_factor().unwrap_or(scale);
+    let position = window.outer_position().map_err(|error| error.to_string())?;
+    let origin = (position.x, position.y);
+    let mut placement = toolset_content_placement(
+        origin,
+        (width, height),
+        scale,
+        monitor_logical_work_area(&monitor),
+    );
+    // The monitor under most of the palette can differ from the one under its title.
+    if placement.position != origin
+        && app
+            .available_monitors()
+            .unwrap_or_default()
+            .iter()
+            .any(|monitor| {
+                // AppKit reports the outer position in the window's backing scale.
+                #[cfg(target_os = "macos")]
+                {
+                    monitor_logical_work_area(monitor).contains_title_strip(
+                        f64::from(position.x) / scale,
+                        f64::from(position.y) / scale,
+                        width,
+                        TOOLSET_TITLE_HEIGHT,
+                    )
+                }
+                // Windows uses one virtual desktop in physical pixels. Size the title with
+                // the window's DPI before comparing it to another monitor's physical work area.
+                #[cfg(not(target_os = "macos"))]
+                {
+                    toolset_title_in_physical_work_area(
+                        origin,
+                        width,
+                        window_scale,
+                        monitor.work_area(),
+                    )
+                }
+            })
+    {
+        placement.position = origin;
+    }
+    #[cfg(not(target_os = "macos"))]
+    if placement.position == origin {
+        windows_activation_log::frame_set(window.label(), "toolbar content fit", "pixels", || {
+            (placement.position, placement.size)
+        });
+        window
+            .set_size(tauri::PhysicalSize::new(placement.size.0, placement.size.1))
+            .map_err(|error| error.to_string())?;
+        return Ok(true);
+    }
+    panel_full_size::apply(&window, placement, "toolbar content fit")?;
+    Ok(true)
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn toolset_title_in_physical_work_area(
+    position: (i32, i32),
+    width: f64,
+    window_scale: f64,
+    area: &tauri::PhysicalRect<i32, u32>,
+) -> bool {
+    ScreenRect::new(
+        f64::from(area.position.x),
+        f64::from(area.position.y),
+        f64::from(area.size.width),
+        f64::from(area.size.height),
+    )
+    .contains_title_strip_at_scale(
+        f64::from(position.0),
+        f64::from(position.1),
+        width * window_scale,
+        TOOLSET_TITLE_HEIGHT * window_scale,
+        window_scale,
+    )
+}
+
+fn toolset_content_placement(
+    position: (i32, i32),
+    size: (f64, f64),
+    scale: f64,
+    area: ScreenRect,
+) -> panel_window_frame::Placement {
+    let position =
+        logical_toolset_position_from_physical(f64::from(position.0), f64::from(position.1), scale);
+    let (width, height) = (size.0, size.1.min(area.height));
+    let position = toolset_position_in_work_area(position, width, height, area);
+    let position = tauri::LogicalPosition::new(position.x, position.y).to_physical::<i32>(scale);
+    let size = tauri::LogicalSize::new(width, height).to_physical::<u32>(scale);
+    panel_window_frame::Placement {
+        position: (position.x, position.y),
+        size: (size.width, size.height),
+        scale,
+    }
 }
 
 /// Pre-build the single shared floating tooltip window, hidden. Palettes can't paint a tooltip
@@ -9615,6 +9791,9 @@ fn ensure_toolset_window<R: Runtime>(
         labels.insert(label.clone(), toolset_id.to_string());
     }
 
+    windows_activation_log::frame_set(&label, "toolbar creation", "logical", || {
+        ((position.x, position.y), (width, height))
+    });
     let window = match utility_window_builder(
         WebviewWindowBuilder::new(
             app,
@@ -10026,10 +10205,9 @@ fn is_routed_menu_command(command_id: &str) -> bool {
         || command_id.starts_with(PLUGIN_COMMAND_PREFIX)
 }
 
-/// How much of a palette must land on a monitor for the user to be able to grab and move it.
-const TOOLSET_WINDOW_MIN_VISIBLE_PX: f64 = 48.0;
+const TOOLSET_TITLE_HEIGHT: f64 = 22.0;
 
-/// A monitor's bounds in the same logical points palette positions are persisted in.
+/// A monitor's full bounds in global logical points.
 fn monitor_logical_bounds(monitor: &tauri::Monitor) -> (f64, f64, f64, f64) {
     let scale = monitor.scale_factor();
     let origin = monitor.position().to_logical::<f64>(scale);
@@ -10051,19 +10229,20 @@ fn monitor_logical_work_area(monitor: &tauri::Monitor) -> ScreenRect {
     ScreenRect::new(origin.x, origin.y, size.width, size.height)
 }
 
-/// True when the rect overlaps some attached monitor enough to be seen and dragged.
-fn toolset_position_is_reachable(
-    monitors: &[tauri::Monitor],
-    position: &ToolsetWindowPosition,
+fn toolset_position_in_work_area(
+    position: ToolsetWindowPosition,
     width: f64,
     height: f64,
-) -> bool {
-    monitors.iter().any(|monitor| {
-        let (left, top, right, bottom) = monitor_logical_bounds(monitor);
-        let overlap_w = (position.x + width).min(right) - position.x.max(left);
-        let overlap_h = (position.y + height).min(bottom) - position.y.max(top);
-        overlap_w >= TOOLSET_WINDOW_MIN_VISIBLE_PX && overlap_h >= TOOLSET_WINDOW_MIN_VISIBLE_PX
-    })
+    area: ScreenRect,
+) -> ToolsetWindowPosition {
+    if area.contains_title_strip(position.x, position.y, width, TOOLSET_TITLE_HEIGHT) {
+        return position;
+    }
+    // Pin oversized palettes to the top-left of the work area.
+    ToolsetWindowPosition {
+        x: position.x.min(area.x + area.width - width).max(area.x),
+        y: position.y.min(area.y + area.height - height).max(area.y),
+    }
 }
 
 /// Pull a palette position back onto an attached monitor.
@@ -10086,7 +10265,14 @@ fn clamp_toolset_position<R: Runtime>(
         _ => return position,
     };
 
-    if toolset_position_is_reachable(&monitors, &position, width, height) {
+    if monitors.iter().any(|monitor| {
+        monitor_logical_work_area(monitor).contains_title_strip(
+            position.x,
+            position.y,
+            width,
+            TOOLSET_TITLE_HEIGHT,
+        )
+    }) {
         return position;
     }
 
@@ -10095,13 +10281,7 @@ fn clamp_toolset_position<R: Runtime>(
         .ok()
         .flatten()
         .unwrap_or_else(|| monitors[0].clone());
-    let (left, top, right, bottom) = monitor_logical_bounds(&target);
-    // max() before min() so a palette taller/wider than the monitor still pins to the top-left
-    // corner instead of inverting to a negative offset.
-    ToolsetWindowPosition {
-        x: position.x.min(right - width).max(left),
-        y: position.y.min(bottom - height).max(top),
-    }
+    toolset_position_in_work_area(position, width, height, monitor_logical_work_area(&target))
 }
 
 /// Move an already-built palette back onscreen if its current spot is unreachable. Best-effort: a
@@ -10135,6 +10315,12 @@ fn recover_offscreen_toolset_window<R: Runtime>(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .recovery_move(window.label(), (physical.x, physical.y));
     }
+    windows_activation_log::frame_set(
+        window.label(),
+        "recover offscreen toolbar",
+        "pixels",
+        || (physical, window.inner_size().ok()),
+    );
     let _ = window.set_position(physical);
 }
 
@@ -10157,10 +10343,10 @@ fn toolset_frame_is_transient<R: Runtime>(
     app: &tauri::AppHandle<R>,
     window: &tauri::Window<R>,
 ) -> bool {
-    let palette_minimized = window.is_minimized().unwrap_or(false);
+    let palette_minimized = window.is_minimized().unwrap_or(true);
     let document_minimized = app
         .get_webview_window(MAIN_WINDOW_LABEL)
-        .is_some_and(|main| main.is_minimized().unwrap_or(false));
+        .is_some_and(|main| main.is_minimized().unwrap_or(true));
     toolset_frame_state_is_transient(palette_minimized, document_minimized)
 }
 
@@ -10172,10 +10358,22 @@ fn toolset_frame_state_is_transient(palette_minimized: bool, document_minimized:
     palette_minimized || (cfg!(windows) && document_minimized)
 }
 
+fn visible_toolset_physical_position<R: Runtime>(
+    window: &tauri::Window<R>,
+) -> Option<tauri::PhysicalPosition<i32>> {
+    if !window.is_visible().unwrap_or(false)
+        || toolset_frame_is_transient(window.app_handle(), window)
+    {
+        return None;
+    }
+    window.outer_position().ok()
+}
+
 fn current_toolset_window_position<R: Runtime>(
     window: &tauri::WebviewWindow<R>,
 ) -> Option<ToolsetWindowPosition> {
-    if window.is_minimized().unwrap_or(false) {
+    let webview: &tauri::Webview<R> = window.as_ref();
+    if toolset_frame_is_transient(window.app_handle(), &webview.window()) {
         return None;
     }
     let position = window.outer_position().ok()?;
@@ -10349,7 +10547,14 @@ fn persist_main_window_geometry<R: Runtime>(window: &tauri::Window<R>) -> Result
 }
 
 fn persist_plugin_panel_geometry<R: Runtime>(window: &tauri::Window<R>) -> Result<(), String> {
-    if utility_windows_suspended() {
+    save_plugin_panel_frame(window, || panel_full_size::frame_for_save(window))
+}
+
+fn save_plugin_panel_frame<R: Runtime>(
+    window: &tauri::Window<R>,
+    frame: impl FnOnce() -> Option<panel_window_frame::Frame>,
+) -> Result<(), String> {
+    if !window.is_visible().unwrap_or(false) || utility_windows_suspended() {
         return Ok(());
     }
     // Native state is authoritative before Tao's cached minimized flag catches up. Windows may
@@ -10359,23 +10564,14 @@ fn persist_plugin_panel_geometry<R: Runtime>(window: &tauri::Window<R>) -> Resul
         .app_handle()
         .get_webview_window(MAIN_WINDOW_LABEL)
         .is_some_and(|owner| owner.is_minimized().unwrap_or(true));
-    let Some(frame) = panel_full_size::frame_for_save(window) else {
-        return Ok(());
-    };
-    let Some(frame) = frame.for_save(
+    let Some(frame) = panel_window_frame::Frame::for_save(
         native.minimized || window.is_minimized().unwrap_or(true),
         owner_minimized,
         native.fullscreen || window.is_fullscreen().unwrap_or(true),
+        frame,
     ) else {
         return Ok(());
     };
-    save_plugin_panel_frame(window, frame)
-}
-
-fn save_plugin_panel_frame<R: Runtime>(
-    window: &tauri::Window<R>,
-    frame: panel_window_frame::Frame,
-) -> Result<(), String> {
     // Reject off-screen/parked positions rather than replacing the last usable frame.
     if plugin_panel_saved_placement(window.app_handle(), &frame).is_none() {
         return Ok(());
@@ -11349,6 +11545,65 @@ mod tests {
         // Windows minimizes owned palettes with the document and parks them off-screen; macOS
         // leaves them visible and draggable, so a move then is a real user move.
         assert_eq!(toolset_frame_state_is_transient(false, true), cfg!(windows));
+    }
+
+    #[test]
+    fn palette_content_fit_recovers_the_title_strip_and_keeps_a_reachable_dragged_origin() {
+        let area = ScreenRect::new(0.0, 24.0, 950.0, 636.0);
+        for scale in [1.0, 1.5, 2.0] {
+            let physical = |(x, y): (f64, f64)| ((x * scale) as i32, (y * scale) as i32);
+            // In each case the body may be visible but the title does not have a usable strip.
+            for origin in [
+                (286.0, -100.0),
+                (286.0, 0.0),
+                (904.0, 110.0),
+                (310.0, 640.0),
+            ] {
+                let fit = toolset_content_placement(physical(origin), (940.0, 200.0), scale, area);
+                assert_ne!(fit.position, physical(origin));
+                assert!(area.contains_title_strip(
+                    f64::from(fit.position.0) / scale,
+                    f64::from(fit.position.1) / scale,
+                    940.0,
+                    TOOLSET_TITLE_HEIGHT,
+                ));
+            }
+            for origin in [(310.0, 110.0), (902.0, 638.0)] {
+                let dragged = physical(origin);
+                let fit = toolset_content_placement(dragged, (940.0, 660.0), scale, area);
+                assert_eq!(fit.position, dragged);
+                assert_eq!(fit.size, ((940.0 * scale) as u32, (636.0 * scale) as u32));
+            }
+        }
+    }
+
+    #[test]
+    fn palette_title_does_not_overlap_a_high_dpi_monitor_across_a_physical_gap() {
+        // The 200% display starts at x = 1920. The 160 px palette on the 100% display starts
+        // 200 physical pixels before that edge, leaving a 40 px gap.
+        let high_dpi_work_area = tauri::PhysicalRect {
+            position: tauri::PhysicalPosition::new(1920, 0),
+            size: tauri::PhysicalSize::new(3840, 2080),
+        };
+        assert!(!toolset_title_in_physical_work_area(
+            (1720, 100),
+            160.0,
+            1.0,
+            &high_dpi_work_area,
+        ));
+        assert!(toolset_title_in_physical_work_area(
+            (1808, 100),
+            160.0,
+            1.0,
+            &high_dpi_work_area,
+        ));
+        // At 200%, a 22-point title needs 44 physical pixels below the top edge.
+        assert!(!toolset_title_in_physical_work_area(
+            (1920, 2040),
+            160.0,
+            2.0,
+            &high_dpi_work_area,
+        ));
     }
 
     #[test]
@@ -12932,6 +13187,7 @@ mod tests {
             include_str!("../capabilities/toolset-command-hit-boxes.json"),
             include_str!("../capabilities/palette-focus-diagnostic.json"),
             include_str!("../capabilities/window-drag.json"),
+            include_str!("../capabilities/toolset-window-size.json"),
             include_str!("../capabilities/default.json"),
             include_str!("../capabilities/document-dialogs.json"),
             include_str!("../capabilities/plugin-panel.json"),
@@ -12995,6 +13251,14 @@ mod tests {
             "toolset-plugin-fixture",
             &toolset_window_label("plugin.fixture"),
         );
+    }
+
+    #[test]
+    fn toolset_window_size_capability_covers_custom_palette_labels() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/toolset-window-size.json")).unwrap();
+        assert_eq!(capability["windows"], serde_json::json!(["toolset-*"]));
+        assert_eq!(toolset_window_label("lab.quick"), "toolset-lab-quick");
     }
 
     #[test]

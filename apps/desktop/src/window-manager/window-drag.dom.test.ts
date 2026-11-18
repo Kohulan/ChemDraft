@@ -2,18 +2,26 @@
 
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { clearMocks, mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PaletteWindow } from "../PaletteWindow";
 import { PluginPanelWindow } from "../plugins/PluginPanelWindow";
 import { pluginPanelWindowId } from "../plugins/panelBridge";
+import { fitCurrentPaletteWindow } from "./index";
 
 const native = vi.hoisted(() => ({
-  invoke: vi.fn(async (_command: string, _args?: Record<string, unknown>, _options?: unknown) => undefined),
+  invoke: vi.fn(async (_command: string, _args?: Record<string, unknown>, _options?: unknown): Promise<unknown> => undefined),
   drag: vi.fn(),
-  move: vi.fn()
+  move: vi.fn(),
+  resize: vi.fn(),
+  currentMonitor: vi.fn(async () => null)
 }));
 vi.mock("@tauri-apps/api/window", () => ({
-  getCurrentWindow: () => ({ startDragging: native.drag, setPosition: native.move })
+  currentMonitor: native.currentMonitor,
+  getCurrentWindow: () => ({ startDragging: native.drag, setPosition: native.move, setSize: native.resize }),
+  LogicalSize: class {
+    constructor(public width: number, public height: number) {}
+  }
 }));
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -23,9 +31,11 @@ describe.each(["macos", "windows"] as const)("native title dragging (%s)", platf
   let root: Root;
 
   beforeEach(() => {
-    native.invoke.mockClear();
+    native.invoke.mockReset();
     native.drag.mockClear();
     native.move.mockClear();
+    native.resize.mockReset();
+    native.currentMonitor.mockClear();
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -34,14 +44,33 @@ describe.each(["macos", "windows"] as const)("native title dragging (%s)", platf
   afterEach(() => {
     act(() => root.unmount());
     container.remove();
+    clearMocks();
     delete (window as typeof window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
     vi.restoreAllMocks();
   });
 
-  async function mount(surface: "palette" | "panel"): Promise<void> {
+  it("requests content sizing without capturing a position to replay over a drag", async () => {
+    useNativeIpc();
+    await fitCurrentPaletteWindow({ width: 940, height: 660 }, { left: 0, top: 0, right: 950, bottom: 660 });
+    expect(native.invoke.mock.calls).toEqual([
+      ["resize_toolset_window", { width: 940, height: 660 }, undefined]
+    ]);
+    expect(native.move).not.toHaveBeenCalled();
+    expect(native.resize).not.toHaveBeenCalled();
+  });
+
+  function useNativeIpc(): void {
+    (window as typeof window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = { invoke: native.invoke };
+  }
+
+  async function mount(surface: "palette" | "panel", nativeBeforeMount = false): Promise<void> {
     // Mount with the real web event transport, then stub the native IPC boundary.
     // The pointerdown capture listener starts popover dismissal alongside dragging.
     // Keep the real Tauri modules so concurrent imports share this same IPC stub.
+    if (nativeBeforeMount) {
+      mockWindows("toolset-core-main");
+      mockIPC((command, args) => native.invoke(command, args as Record<string, unknown> | undefined), { shouldMockEvents: true });
+    }
     await act(async () => {
       root.render(surface === "palette"
         ? createElement(PaletteWindow, { toolsetId: "core.main", platform })
@@ -53,8 +82,23 @@ describe.each(["macos", "windows"] as const)("native title dragging (%s)", platf
       owner.hasPointerCapture = () => false;
       owner.releasePointerCapture = vi.fn();
     }
-    (window as typeof window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = { invoke: native.invoke };
+    if (!nativeBeforeMount) useNativeIpc();
   }
+
+  it("retries the same content measurement after a skipped resize", async () => {
+    const outcomes = [false, true];
+    native.invoke.mockImplementation(async (command) => command === "resize_toolset_window" ? outcomes.shift() : undefined);
+    const requests = () => native.invoke.mock.calls.filter(([command]) => command === "resize_toolset_window");
+    await mount("palette", true);
+    await vi.waitFor(() => expect(requests()).toHaveLength(1));
+    window.dispatchEvent(new Event("resize"));
+    await vi.waitFor(() => expect(requests()).toHaveLength(2));
+    expect(requests()[1]).toEqual(requests()[0]);
+    const monitorReads = native.currentMonitor.mock.calls.length;
+    await dispatch(window, new Event("resize"));
+    await vi.waitFor(() => expect(native.currentMonitor.mock.calls.length).toBeGreaterThan(monitorReads));
+    expect(requests()).toHaveLength(2);
+  });
 
   function pointerEvent(type: string, pointerId: number, isPrimary = true): MouseEvent {
     // jsdom has no PointerEvent; supply the pointer fields alongside real mouse coordinates.
@@ -69,7 +113,7 @@ describe.each(["macos", "windows"] as const)("native title dragging (%s)", platf
     return event;
   }
 
-  async function dispatch(target: HTMLElement, ...events: Event[]): Promise<void> {
+  async function dispatch(target: EventTarget, ...events: Event[]): Promise<void> {
     await act(async () => {
       events.forEach((event) => target.dispatchEvent(event));
       // startPaletteWindowDrag awaits a dynamic import before invoking the native command.

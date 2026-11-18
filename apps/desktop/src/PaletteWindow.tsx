@@ -491,9 +491,8 @@ export function PaletteWindow({
           }
         }
         const sizeKey = `${width}x${height}`;
-        if (sizeKey !== lastSize) {
+        if (sizeKey !== lastSize && await fitCurrentPaletteWindow({ width, height }, area)) {
           lastSize = sizeKey;
-          await fitCurrentPaletteWindow({ width, height }, area);
         }
       } finally {
         sizing = false;

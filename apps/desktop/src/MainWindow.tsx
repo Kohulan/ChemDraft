@@ -1788,7 +1788,13 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
+<<<<<<< HEAD
 const CURRENT_BUILD_STAMP = "11.17.21.30-codex";
+||||||| b214ee6bd
+const CURRENT_BUILD_STAMP = "11.17.21.00-codex";
+=======
+const CURRENT_BUILD_STAMP = "11.18.13.50-codex";
+>>>>>>> 6a71a5d33b0988e2811b311c64ac6dac9a947de0
 const VibeCodeGuideForm = lazy(() => import("./dialogs/VibeCodeGuideForm").then(module => ({ default: module.VibeCodeGuideForm })));
 const StructureTemplatePicker = lazy(() => import("./dialogs/StructureTemplatePicker").then(module => ({ default: module.StructureTemplatePicker })));
 /** Starts in the background for the document webview under the existing probe gate. */

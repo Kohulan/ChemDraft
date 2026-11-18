@@ -1135,20 +1135,13 @@ export async function listenForCurrentWindowWorkAreaChanges(handler: () => void)
   };
 }
 
-/** Preserve the top-left across macOS content resizes, then keep the whole palette on its monitor. */
-export async function fitCurrentPaletteWindow(size: ToolsetWindowSize, area: MonitorLogicalBounds): Promise<void> {
-  const position = await currentWindowLogicalPosition();
-  const height = Math.min(size.height, area.bottom - area.top);
-  await setCurrentWindowLogicalSize({ width: size.width, height });
-  if (!position) return;
-  const target = {
-    x: Math.max(area.left, Math.min(position.x, area.right - size.width)),
-    y: Math.max(area.top, Math.min(position.y, area.bottom - height))
-  };
-  const resizedPosition = await currentWindowLogicalPosition();
-  if (resizedPosition?.x !== target.x || resizedPosition?.y !== target.y) {
-    await setCurrentWindowLogicalPosition(target);
+/** Fit to content and return whether the native resize was applied. */
+export async function fitCurrentPaletteWindow(size: ToolsetWindowSize, area: MonitorLogicalBounds): Promise<boolean> {
+  if (isDesktopRuntime()) {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return invoke<boolean>("resize_toolset_window", { width: size.width, height: Math.min(size.height, area.bottom - area.top) });
   }
+  return true;
 }
 
 /**
