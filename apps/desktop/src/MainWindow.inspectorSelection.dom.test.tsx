@@ -79,6 +79,43 @@ describe.each(["MacIntel", "Win32"])("inspector selection (%s)", platform => {
     expect(host.analyze).toHaveBeenCalledTimes(1);
   });
 
+  it("refreshes for a dative bond edit but not a color edit", async () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue(platform);
+    const initialDocument = insertNativeSingleBondMolecule(createPhase4Document("Selected"), { x: 300, y: 300 });
+    await act(async () => root.render(createElement(MainWindow, { initialDocument, initialActiveToolCommandId: "tool.select",
+      initialPaletteMode: "hidden", initialRulersVisible: false, initialCrosshairsVisible: false, nativePalette: true })));
+    await command("analyze.molecularProperties");
+    expect(host.analyze).toHaveBeenCalledTimes(1);
+    const rect = { x: 0, y: 0, left: 0, top: 0, right: 792, bottom: 612, width: 792, height: 612, toJSON: () => ({}) } as DOMRect;
+    for (const element of container.querySelectorAll<HTMLElement>(".page, .canvas-region")) element.getBoundingClientRect = () => rect;
+    const molecule = window.__CHEMDRAFT_AGENT__!.snapshot().document.pages[0]!.objects.find(object => object.type === "molecule")!;
+    if (molecule.type !== "molecule") throw new Error("Expected molecule");
+    const bond = molecule.bonds[0]!;
+    const from = molecule.atoms.find(atom => atom.id === bond.fromAtomId)!;
+    const to = molecule.atoms.find(atom => atom.id === bond.toAtomId)!;
+    await act(async () => {
+      const event = new MouseEvent("pointermove", { bubbles: true, clientX: (from.x + to.x) / 2, clientY: (from.y + to.y) / 2 });
+      Object.defineProperties(event, { pointerId: { value: 77 }, pointerType: { value: "mouse" }, isPrimary: { value: true } });
+      container.querySelector(".page")!.dispatchEvent(event);
+    });
+    expect(window.__CHEMDRAFT_AGENT__!.snapshot().hoveredNativeTarget).toMatchObject({ kind: "bond", bondId: bond.id });
+    await command("bond.setHoveredBondDisplay.dashed");
+    const edited = window.__CHEMDRAFT_AGENT__!.snapshot().document.pages[0]!.objects.find(object => object.type === "molecule");
+    expect(edited?.type === "molecule" && edited.bonds[0]?.display?.bondStyle).toBe("dashed");
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 300)); });
+    expect(host.analyze).toHaveBeenCalledTimes(2);
+    await act(async () => window.dispatchEvent(new CustomEvent(PALETTE_COMMAND_COMMIT_EVENT,
+      { detail: { commandId: moleculeStructureBondColorCommandId("#00ff00") } })));
+    const recolored = window.__CHEMDRAFT_AGENT__!.snapshot().document.pages[0]!.objects.find(object => object.type === "molecule");
+    expect(recolored?.style.bondColor).toBe("#00ff00");
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 300)); });
+    expect(host.analyze).toHaveBeenCalledTimes(2);
+    await command("edit.undo");
+    await command("edit.undo");
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 300)); });
+    expect(host.analyze).toHaveBeenCalledTimes(3);
+  });
+
   it("publishes and replays the current analysis when opened immediately after insertion", async () => {
     vi.spyOn(navigator, "platform", "get").mockReturnValue(platform);
     const initialDocument = insertNativeSingleBondMolecule(createPhase4Document("Selected insertion"), { x: 300, y: 300 });
