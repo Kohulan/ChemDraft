@@ -11553,14 +11553,9 @@ export function MainWindow({
       const burst = arrowNudgeBurstRef.current;
       const now = Date.now();
       const continuesBurst = burst?.history === documentHistoryRef.current && arrowNudgeContinuesBurst(burst.lastPress, now);
-<<<<<<< HEAD
-      const result = resolveElectronMarksInSelectionTransform(current, moveCanvasSelection(current, fragments, delta));
+      const { document: transformed, positions } = moveCanvasSelectionWithPositions(current, fragments, delta);
+      const result = resolveElectronMarksInSelectionTransform(current, transformed);
       const moved = result.document;
-||||||| ffa99f6d0
-      const moved = moveCanvasSelection(current, fragments, delta);
-=======
-      const { document: moved, positions } = moveCanvasSelectionWithPositions(current, fragments, delta);
->>>>>>> origin/fix/1.2.1-small
       if (moved === current) {
         // Repeats against a page edge are still presses, so they renew an existing burst.
         arrowNudgeBurstRef.current = continuesBurst ? { history: documentHistoryRef.current, lastPress: now } : undefined;
@@ -11574,16 +11569,10 @@ export function MainWindow({
         replacePresentDocument(prepareDocumentCommit(moved, "Move"));
       } else commitDocumentChange(moved, "Move");
       arrowNudgeBurstRef.current = { history: documentHistoryRef.current, lastPress: now };
-<<<<<<< HEAD
       if (result.status) {
         setStatus(result.status);
         return;
       }
-      const nextObjects = new Map(moved.pages.flatMap(page => page.objects.map(object => [object.id, object] as const)));
-||||||| ffa99f6d0
-      const nextObjects = new Map(moved.pages.flatMap(page => page.objects.map(object => [object.id, object] as const)));
-=======
->>>>>>> origin/fix/1.2.1-small
       let dx = 0, dy = 0, finite = true;
       const measure = (before: { x: number; y: number }, after: { x: number; y: number }) => {
         const x = after.x - before.x, y = after.y - before.y;
