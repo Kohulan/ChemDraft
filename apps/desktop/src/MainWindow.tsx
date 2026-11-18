@@ -13,7 +13,7 @@ import { AtomProblemMarker } from "./AtomProblemMarker";
 import { atomProblemCommandId, atomProblemCommands, atomProblemSnapshot, type AtomProblemTarget } from "./atomProblemCommands";
 import { atomProblem, type AtomProblemAction } from "@chemdraft/document-workflow-core";
 import { applyNativeAtomProblemFix } from "./documentWorkflow";
-import { dropElectronMark, dropElectronMarksInSelection, electronMarkDropTarget } from "./electronMarkDrop";
+import { dropElectronMark, dropElectronMarksInSelection, electronMarkDropTarget, resolveElectronMarksInSelectionTransform } from "./electronMarkDrop";
 import { electronMarkUndoLabel } from "./electronMarkUndoLabel";
 import { nativeFragmentSproutTarget, nativeDieneFuseTarget, nativeOxoHotkeyTarget, nativeBranchedHotkeyTarget, type FragmentSproutKind } from "./sproutHotkeys";
 import { applyTableCommand, applyTableFontCommand, applyTableObjectEdit, createTableCommands, createTableInsertAction, parseTableInsertCommandId, resolveActiveTableCell, selectedTable, tableInsertCommandId, tableInspectorSnapshot, type ActiveTableCell, type TableInsertDimensions } from "./tableCommands";
@@ -952,8 +952,8 @@ import { useStructureSearchEnabled } from "./structureSearchSettings";
 import { createStructureSearchController, structureSearchCommands, structureSearchDocument, structureSearchErrorStatus, structureSearchSite } from "./structureSearch";
 import { useCompoundLayoutSettings } from "./useCompoundLayoutTools";
 import { useDirectElectronMarkEditing } from "./useDirectElectronMarkEditing";
-import { ArrangementSpacingDialog, arrangementSpacingPreviewSvg } from "./ArrangementSpacingDialog";
-import { arrangeSelectedDocumentObjects, adjustArrangementSpacing, arrangementSpacingRange, selectedArrangementObjectIds } from "./documentWorkflow";
+import { ArrangementSpacingDialog, arrangementSpacingPreviewSvg, checkedArrangementSpacing } from "./ArrangementSpacingDialog";
+import { arrangeSelectedDocumentObjects, arrangementSpacingRange, selectedArrangementObjectIds } from "./documentWorkflow";
 import { arrangementLayoutForCommand, arrangementGridAlignmentForCommand } from "./commands";
 import { loadKeybindingSettings, type KeybindingScheme } from "./keybindingSettings";
 import { saveDrawingSettings } from "./drawingSettings";
@@ -10255,7 +10255,7 @@ export function MainWindow({
   applySpacingRef.current = (tabId, percent) => {
     const source = spacingSourceForTab(tabId);
     if (tabId === activeDocumentTabIdRef.current && isSnapshotSessionActive()) throw new Error("Finish the current drawing gesture, then save the spacing again.");
-    const result = adjustArrangementSpacing(source, percent / 100);
+    const result = checkedArrangementSpacing(source, percent / 100);
     if (!result.ok) throw new Error(result.status);
     if (tabId === activeDocumentTabIdRef.current) {
       commitDocumentChange(result.document, "Adjust arrangement spacing"); setStatus(result.status); return;
@@ -11551,11 +11551,12 @@ export function MainWindow({
       const burst = arrowNudgeBurstRef.current;
       const now = Date.now();
       const continuesBurst = burst?.history === documentHistoryRef.current && arrowNudgeContinuesBurst(burst.lastPress, now);
-      const moved = moveCanvasSelection(current, fragments, delta);
+      const result = resolveElectronMarksInSelectionTransform(current, moveCanvasSelection(current, fragments, delta));
+      const moved = result.document;
       if (moved === current) {
         // Repeats against a page edge are still presses, so they renew an existing burst.
         arrowNudgeBurstRef.current = continuesBurst ? { history: documentHistoryRef.current, lastPress: now } : undefined;
-        setStatus("Selection is already at the page edge");
+        setStatus(result.status ?? "Selection is already at the page edge");
         return;
       }
       // Like assistant-history amendments, retain the first before-snapshot and replace only
@@ -11565,6 +11566,10 @@ export function MainWindow({
         replacePresentDocument(prepareDocumentCommit(moved, "Move"));
       } else commitDocumentChange(moved, "Move");
       arrowNudgeBurstRef.current = { history: documentHistoryRef.current, lastPress: now };
+      if (result.status) {
+        setStatus(result.status);
+        return;
+      }
       const nextObjects = new Map(moved.pages.flatMap(page => page.objects.map(object => [object.id, object] as const)));
       let dx = 0, dy = 0, finite = true;
       const measure = (before: { x: number; y: number }, after: { x: number; y: number }) => {
@@ -12038,7 +12043,9 @@ export function MainWindow({
           let operationStatus = "";
           commitDocumentChange(current => {
             const result = arrangeSelectedDocumentObjects(current, layout, { gridAlignment: arrangementGridAlignmentForCommand(action.id) });
-            operationStatus = result.status; return result.document;
+            const edit = resolveElectronMarksInSelectionTransform(current, result.document);
+            operationStatus = edit.status ?? result.status;
+            return edit.document;
           }, action.title);
           setStatus(operationStatus); return;
         }
@@ -12063,34 +12070,38 @@ export function MainWindow({
           return;
         }
 
+        const commitSelectionTransform = (transform: (current: ChemDraftDocument) => ChemDraftDocument, emptyStatus: string) => {
+          let markStatus: string | undefined;
+          const changed = commitDocumentChange(current => {
+            const result = resolveElectronMarksInSelectionTransform(current, transform(current));
+            markStatus = result.status;
+            return result.document;
+          }, action.title);
+          setStatus(markStatus ?? (changed ? action.title : emptyStatus));
+        };
+
         if (action.id === "layout.flipHorizontal" || action.id === "layout.flipVertical") {
           const axis = action.id === "layout.flipHorizontal" ? "horizontal" : "vertical";
-          const changed = commitDocumentChange((current) => flipSelectedDocumentObjects(current, axis));
-          setStatus(changed ? action.title : "No selected object");
+          commitSelectionTransform(current => flipSelectedDocumentObjects(current, axis), "No selected object");
           return;
         }
 
         const alignMode = alignModeForCommandId(action.id);
         if (alignMode) {
-          const warnings: string[] = [];
-          const changed = commitDocumentChange((current) => alignSelectedDocumentObjects(current, alignMode, warnings));
-          setStatus([changed ? action.title : "Select at least two objects", ...warnings].join("; "));
+          commitSelectionTransform(current => alignSelectedDocumentObjects(current, alignMode, null), "Select at least two objects");
           return;
         }
 
         const distributeAxis = distributeAxisForCommandId(action.id);
         if (distributeAxis) {
-          const warnings: string[] = [];
-          const changed = commitDocumentChange((current) =>
-            distributeSelectedDocumentObjects(current, distributeAxis, distributeMode, warnings)
+          commitSelectionTransform(current => distributeSelectedDocumentObjects(current, distributeAxis, distributeMode, null),
+            "Select at least three objects"
           );
-          setStatus([changed ? action.title : "Select at least three objects", ...warnings].join("; "));
           return;
         }
 
         if (action.id === "layout.rotate90") {
-          const changed = commitDocumentChange((current) => rotateSelectedDocumentObjects90(current));
-          setStatus(changed ? action.title : "No selected object");
+          commitSelectionTransform(rotateSelectedDocumentObjects90, "No selected object");
           return;
         }
 
@@ -16548,9 +16559,10 @@ export function MainWindow({
 
   const objectRotateDocumentFromDrag = useCallback((drag: ObjectRotateDragState, point: ClientPoint): ChemDraftDocument => {
     const degrees = objectRotateDragDegrees(drag, point);
-    return drag.target
+    const rotated = drag.target
       ? rotateNativeMoleculeParts(drag.startDocument, drag.target, degrees)
       : rotateDocumentObject(drag.startDocument, drag.objectId, degrees);
+    return resolveElectronMarksInSelectionTransform(drag.startDocument, rotated).document;
   }, [objectRotateDragDegrees]);
 
   // Snapshot the molecule's persisted Spin 3D model for a whole-molecule rotate drag.
@@ -17117,7 +17129,7 @@ export function MainWindow({
       return;
     }
 
-    replacePresentDocument(result.document);
+    replacePresentDocument(resolveElectronMarksInSelectionTransform(nextInput.startDocument, result.document).document);
     if (result.kind === "xy") {
       showProjectedPlaneTiltReadout(nextInput.objectId, result.tiltXRad, result.tiltYRad, result.clamped, false);
     } else {
@@ -17240,7 +17252,7 @@ export function MainWindow({
       return;
     }
 
-    replacePresentDocument(result.document);
+    replacePresentDocument(resolveElectronMarksInSelectionTransform(nextInput.startDocument, result.document).document);
     showObjectResizeReadout(nextInput.objectId, result.targetScale, false);
   }, [objectResizeInputDocumentFromDraft, replacePresentDocument, showObjectResizeReadout, updateObjectResizeInput]);
 
@@ -17315,13 +17327,11 @@ export function MainWindow({
   ): ChemDraftDocument => {
     const scale = objectResizeScaleFromDrag(drag.centerPoint, drag.startPoint, point, stretching);
     const object = findDocumentObject(drag.startDocument, drag.objectId);
-    if (!drag.target && object?.type !== "molecule") {
-      return scaleDocumentObjectsAroundPoint(drag.startDocument, [drag.objectId], drag.centerPoint, scale.x, scale.y);
-    }
-
-    return drag.target
+    const resized = drag.target
       ? resizeNativeMoleculeParts(drag.startDocument, drag.target, scale)
-      : resizeNativeMoleculeObject(drag.startDocument, drag.objectId, scale);
+      : object?.type === "molecule" ? resizeNativeMoleculeObject(drag.startDocument, drag.objectId, scale)
+        : scaleDocumentObjectsAroundPoint(drag.startDocument, [drag.objectId], drag.centerPoint, scale.x, scale.y);
+    return resolveElectronMarksInSelectionTransform(drag.startDocument, resized).document;
   }, []);
 
   const previewObjectResize = useCallback((drag: ObjectResizeDragState, point: ClientPoint, stretching: boolean) => {
@@ -18136,10 +18146,12 @@ export function MainWindow({
           groupTransform.latestTiltXRad = result.tiltXRad;
           groupTransform.latestTiltYRad = result.tiltYRad;
           groupTransform.clamped = result.clamped;
-          replacePresentDocument(result.document);
+          replacePresentDocument(resolveElectronMarksInSelectionTransform(groupTransform.startDocument, result.document).document);
           setStatus(`3D rotate: ${projectedPlaneTiltReadoutLabel(result.tiltXRad, result.tiltYRad)}`);
         } else {
-          replacePresentDocument(groupTransformDocument(groupTransform, point, event.shiftKey));
+          const before = groupTransform.startDocument;
+          const preview = resolveElectronMarksInSelectionTransform(before, groupTransformDocument(groupTransform, point, event.shiftKey));
+          replacePresentDocument(preview.document);
         }
       }
       return;
@@ -18555,18 +18567,24 @@ export function MainWindow({
         const result = groupTransform.mode === "projected-plane-tilt"
           ? groupProjectedPlaneTiltFromDrag(groupTransform, point)
           : undefined;
-        const next = result?.document ?? groupTransformDocument(groupTransform, point, event.shiftKey);
-        if (next !== groupTransform.startDocument) {
-          commitDocumentHistoryFrom(groupTransform.startDocument, next);
+        const before = groupTransform.startDocument;
+        const transformed = result?.document ?? groupTransformDocument(groupTransform, point, event.shiftKey);
+        const edit = resolveElectronMarksInSelectionTransform(before, transformed);
+        if (edit.document !== before) {
+          const undoLabel = groupTransform.mode === "rotate" ? "Rotate selection"
+            : groupTransform.mode === "resize" ? "Resize selection" : undefined;
+          commitDocumentHistoryFrom(before, edit.document, undoLabel);
+        } else {
+          replacePresentDocument(before);
         }
         setStatus(
-          groupTransform.mode === "rotate"
+          edit.status ?? (groupTransform.mode === "rotate"
             ? "Rotated selection"
             : groupTransform.mode === "projected-plane-tilt"
               ? "3D rotate applied"
               : groupTransform.objectIds.some(id =>
                 findDocumentObject(groupTransform.startDocument, id)?.type === "table")
-                ? "Tables keep their size when scaled" : "Resized selection"
+                ? "Tables keep their size when scaled" : "Resized selection")
         );
       }
       groupTransformDragRef.current = null;
@@ -23285,7 +23303,7 @@ export function MainWindow({
             setSpacingSource(undefined); setStatus("Drawing changed. Reopen Adjust spacing to preview the current selection."); return;
           }
           let ok = false, operationStatus = "";
-          commitDocumentChange(current => { const result = adjustArrangementSpacing(current, factor);
+          commitDocumentChange(current => { const result = checkedArrangementSpacing(current, factor);
             ok = result.ok; operationStatus = result.status; return result.document; }, "Adjust arrangement spacing");
           if (ok) setSpacingSource(undefined); setStatus(operationStatus);
         }} /> : null}
