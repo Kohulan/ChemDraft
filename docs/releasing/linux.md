@@ -35,7 +35,7 @@ The workflow:
 4. Checks the bundle identity and that the `.deb` carries `chemdraft`, the 3D sidecar and the
    OPSIN runtime.
 5. Repacks the AppImage after Tauri bundles it. It uses the host's Wayland and compiler runtime
-   libraries, and the job verifies that the finished image contains no `libwayland-*`,
+   libraries, bundles `libgpg-error.so.0` beside `libgcrypt.so.20`, and the job verifies that the finished image contains no `libwayland-*`,
    `libstdc++.so*`, or `libgcc_s.so*` files or symlinks.
 6. Records the source commit and final bytes of each package, then stages the packages, records,
    and checksums as the `linux-release-amd64` workflow artifact.
@@ -93,8 +93,8 @@ by the release workflow's separate publishing job. The build itself runs with re
 The workflow checks Debian sid and Fedora under Xvfb and headless Weston. Debian installs the
 .deb with apt and Fedora extracts its payload and runs it with Fedora's libraries. Each job
 uploads display, app, and process logs. These tests cover startup and subprocess crashes. GPU
-rendering still needs a desktop check. The containers grant `SYS_PTRACE` and use unconfined seccomp
-so `strace` can trace the app.
+rendering still needs a desktop check. The privileged containers allow `strace` to trace the app
+and glycin's bubblewrap to create user namespaces; Weston enables Xwayland for Wayland smoke tests.
 
 ## Updates
 

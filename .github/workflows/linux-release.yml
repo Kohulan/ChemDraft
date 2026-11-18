@@ -189,6 +189,11 @@ jobs:
             -o -name 'libstdc++.so*' -o -name 'libgcc_s.so*' \) -print
           find squashfs-root \( -name 'libwayland-*' -o -name 'libstdc++.so*' \
             -o -name 'libgcc_s.so*' \) -delete
+          # linuxdeploy excludes this dependency of the bundled libgcrypt on minimal hosts.
+          gcrypt=$(find squashfs-root/usr/lib -name libgcrypt.so.20 -print -quit)
+          test -n "$gcrypt"
+          gcrypt_dir=$(dirname "${gcrypt#squashfs-root/}")
+          cp -L /usr/lib/x86_64-linux-gnu/libgpg-error.so.0 "squashfs-root/$gcrypt_dir/libgpg-error.so.0"
           # The AppImage runtime reads only zlib or zstd.
           mksquashfs squashfs-root app.squashfs -noappend -all-root -comp zstd -no-progress
           head -c "$offset" "$image" > repacked.AppImage
@@ -199,6 +204,7 @@ jobs:
           cd verify
           ../repacked.AppImage --appimage-extract > repacked-extraction.log
           test -x squashfs-root/AppRun
+          test -f "squashfs-root/$gcrypt_dir/libgpg-error.so.0"
           leftovers=$(find squashfs-root \( -name 'libwayland-*' -o -name 'libstdc++.so*' \
             -o -name 'libgcc_s.so*' \) -print)
           if [[ -n "$leftovers" ]]; then

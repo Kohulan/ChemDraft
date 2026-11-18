@@ -68,8 +68,8 @@ jobs:
             image: fedora:latest
     container:
       image: ${{ matrix.image }}
-      # strace needs ptrace inside the container.
-      options: --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+      # strace needs ptrace and glycin's bubblewrap needs user namespaces.
+      options: --privileged
     defaults:
       run:
         shell: bash
@@ -109,14 +109,14 @@ jobs:
           if [[ "$DISTRO" == debian ]]; then
             apt-get update
             apt-get install -y --no-install-recommends \
-              dbus-daemon passwd procps strace util-linux weston xvfb libgtk-3-0t64 libxdo3 \
+              dbus-daemon passwd procps strace util-linux weston xwayland xvfb libgtk-3-0t64 libxdo3 \
               libegl1 libegl-mesa0 libgl1 libgl1-mesa-dri \
               libwayland-client0 libwayland-egl1 libwayland-cursor0 libwayland-server0
             if [[ "$PACKAGE" == deb ]]; then
               apt-get install -y --no-install-recommends "${bundles[0]}"
             fi
           else
-            dnf install -y /usr/bin/dbus-run-session procps-ng shadow-utils strace util-linux weston xorg-x11-server-Xvfb \
+            dnf install -y /usr/bin/dbus-run-session procps-ng shadow-utils strace util-linux weston xorg-x11-server-Xwayland xorg-x11-server-Xvfb \
               gtk3 libxdo mesa-dri-drivers mesa-libEGL libglvnd-egl libglvnd-glx \
               libwayland-client libwayland-egl libwayland-cursor libwayland-server
             if [[ "$PACKAGE" == deb ]]; then

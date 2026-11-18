@@ -117,6 +117,11 @@ runs:
         }
         trap cleanup EXIT
         new_profile
+        if command -v bwrap >/dev/null 2>&1; then
+          bwrap_status=0
+          bwrap --unshare-all --ro-bind / / /usr/bin/true || bwrap_status=$?
+          printf 'bubblewrap namespace preflight exit status: %s\n' "$bwrap_status"
+        fi
         if [[ "$diagnostics" == true ]]; then
           source "$action_path/diagnostics.sh"
           prepare_diagnostics
@@ -132,7 +137,7 @@ runs:
 
         if [[ "$backend" == wayland ]]; then
           export WAYLAND_DISPLAY=chemdraft-smoke
-          weston --backend=headless --renderer=pixman --shell=kiosk-shell.so \
+          weston --backend=headless --renderer=pixman --shell=kiosk-shell.so --xwayland \
             --socket="$WAYLAND_DISPLAY" --idle-time=0 > "$logs/display.log" 2>&1 &
           ready="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
         else
@@ -153,7 +158,19 @@ runs:
           exit 1
         fi
 
+        if [[ "$backend" == wayland ]]; then
+          for _ in {1..20}; do
+            display=$(sed -n 's/.*xserver listening on display \(:[0-9][0-9]*\).*/\1/p' "$logs/display.log" | tail -n 1)
+            [[ -n "$display" ]] && break
+            kill -0 "$display_pid"
+            sleep 1
+          done
+          [[ -n "$display" ]] || { echo '::error::Weston Xwayland display did not start'; exit 1; }
+          export DISPLAY="$display"
+        fi
         export GDK_BACKEND="$backend"
+        printf 'App environment: GDK_BACKEND=%s WAYLAND_DISPLAY=%s DISPLAY=%s\n' \
+          "$GDK_BACKEND" "${WAYLAND_DISPLAY-}" "${DISPLAY-}"
         if [[ "$check_window" == true ]]; then
           openbox > "$logs/openbox.log" 2>&1 &
           wm_pid=$!
@@ -224,6 +241,8 @@ runs:
           sleep 1
         done
         [[ -n "$main_pid" ]] || fail 'ChemDraft did not launch'
+        echo 'Display environment seen by ChemDraft:'
+        tr '\0' '\n' < "/proc/$main_pid/environ" | grep -E '^(GDK_BACKEND|WAYLAND_DISPLAY|DISPLAY)=' || true
         web_process_running || fail 'No WebKitWebProcess stayed alive during startup'
         window_ready || fail 'No ChemDraft window appeared within 60 seconds'
         for _ in {1..20}; do
