@@ -123,7 +123,7 @@ async function mount(options: { web?: boolean; inline?: boolean; document?: Retu
   native.close.mockImplementation(async (toolsetId: string) => {
     native.windows.delete(toolsetId === "core.drawnStructureSettings" ? "settings" : toolsetId); return { toolsetId, open: false, focused: false };
   });
-  native.showPopover.mockResolvedValue(undefined); native.hidePopover.mockResolvedValue(undefined);
+  native.showPopover.mockResolvedValue(true); native.hidePopover.mockResolvedValue(undefined);
   native.publish.mockResolvedValue(undefined); native.writeText.mockResolvedValue(undefined); native.writeFile.mockResolvedValue(undefined);
   window.history.replaceState(null, "", "/?agentBridge=1");
   runtime = await import("./runtime");
@@ -377,7 +377,7 @@ it.each([
     }
     if (surface === "popover-click" || surface === "popover-replace" || surface === "popover-dismiss") {
       // Keep the first reveal outstanding for the replacement/dismissal paths.
-      if (surface !== "popover-click") native.showPopover.mockImplementationOnce(() => new Promise<void>(() => {}));
+      if (surface !== "popover-click") native.showPopover.mockImplementationOnce(() => new Promise<boolean>(() => {}));
       await act(async () => native.content!(popoverContent));
     }
     let reject!: (error: Error) => void;

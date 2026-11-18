@@ -1156,19 +1156,22 @@ export async function fitCurrentPaletteWindow(size: ToolsetWindowSize, area: Mon
  * it among the document's owned windows: the JS window `show()` alone left it underneath its palette
  * on Windows whenever the two overlapped. Falls back to that plain `show()` if the command is
  * unavailable for focusable popovers. A preserve-focus open must never fall back to an activating show.
+ * Returns whether the native window became visible.
  */
-export async function showCurrentToolsetPopoverWindow(focusMode: ToolsetPopoverFocusMode = "focus", kind?: ToolsetPopoverContent["kind"]): Promise<void> {
+export async function showCurrentToolsetPopoverWindow(focusMode: ToolsetPopoverFocusMode = "focus", kind?: ToolsetPopoverContent["kind"]): Promise<boolean> {
   if (!isDesktopRuntime()) {
-    return;
+    return false;
   }
 
   const { invoke } = await import("@tauri-apps/api/core");
   try {
-    await invoke("show_toolset_popover_window", { focusMode, ...(kind ? { kind } : {}) });
+    return await invoke<boolean>("show_toolset_popover_window", { focusMode, ...(kind ? { kind } : {}) });
   } catch (error) {
     if (focusMode === "preserve") throw error;
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
-    await getCurrentWindow().show();
+    const window = getCurrentWindow();
+    await window.show();
+    return window.isVisible();
   }
 }
 

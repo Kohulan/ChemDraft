@@ -9,7 +9,7 @@ import type { ToolsetPopoverContentPayload } from "./window-manager";
 
 const native = vi.hoisted(() => ({
   content: undefined as undefined | ((payload: ToolsetPopoverContentPayload) => void),
-  command: vi.fn(async () => {}), hide: vi.fn(async () => {}), show: vi.fn(async () => {})
+  command: vi.fn(async () => {}), hide: vi.fn(async () => {}), show: vi.fn(async () => true)
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => {}) }));
 vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ hide: native.hide, setFocus: vi.fn(async () => {}) }) }));

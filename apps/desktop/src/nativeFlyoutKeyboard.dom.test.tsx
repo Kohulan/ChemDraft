@@ -25,7 +25,7 @@ const native = {
     }
   }),
   position: vi.fn(async () => {}),
-  show: vi.fn(async (_kind?: string) => {}),
+  show: vi.fn(async (_kind?: string) => true),
   hide: vi.fn(async () => {}),
   routeCommand: vi.fn()
 };
@@ -45,8 +45,9 @@ function installMockTauri() {
       if (command === "plugin:event|emit") await native.emit(args.event, args.payload);
       if (command === "set_current_window_global_position") await native.position();
       if (command === "show_toolset_popover_window" || command === "plugin:window|show") {
-        await native.show(args.kind);
-        native.visible = true;
+        const shown = await native.show(args.kind);
+        if (shown) native.visible = true;
+        return shown;
       }
       if (command === "plugin:window|hide") {
         await native.hide();
@@ -119,9 +120,9 @@ describe.each(["macos", "windows"] as const)("keyboard routing with reordered po
   it("defers acceptance and keyboard activation until the native show succeeds", async () => {
     const opening = { openedAt: 1, generation: 1 };
     let finishPosition!: () => void;
-    let finishShow!: () => void;
+    let finishShow!: (shown: boolean) => void;
     native.position.mockImplementationOnce(() => new Promise<void>(resolve => { finishPosition = resolve; }));
-    native.show.mockImplementationOnce(() => new Promise<void>(resolve => { finishShow = resolve; }));
+    native.show.mockImplementationOnce(() => new Promise<boolean>(resolve => { finishShow = resolve; }));
     await pushMenu(main, "rings", opening);
     expect(native.position).toHaveBeenCalledOnce();
     expect(await press("ArrowDown")).toBe(true);
@@ -142,7 +143,7 @@ describe.each(["macos", "windows"] as const)("keyboard routing with reordered po
     });
     expect(highlighted()).toBeUndefined();
     expect(native.routeCommand).not.toHaveBeenCalled();
-    await act(async () => finishShow());
+    await act(async () => finishShow(true));
     expect(native.routeCommand).toHaveBeenCalledOnce();
   });
 
@@ -173,7 +174,7 @@ describe.each(["macos", "windows"] as const)("keyboard routing with reordered po
   it("discards queued keys when the opening fails to show", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     let failShow!: (error: Error) => void;
-    native.show.mockImplementationOnce(() => new Promise<void>((_, reject) => { failShow = reject; }));
+    native.show.mockImplementationOnce(() => new Promise<boolean>((_, reject) => { failShow = reject; }));
     await pushMenu(main, "rings", { openedAt: 1, generation: 1 });
     expect(await press("ArrowDown")).toBe(true);
     expect(await press("Enter")).toBe(true);
@@ -184,6 +185,24 @@ describe.each(["macos", "windows"] as const)("keyboard routing with reordered po
     await pushMenu(main, "rings", { openedAt: 1, generation: 2 });
     expect(highlighted()).toBeUndefined();
     expect(native.routeCommand).not.toHaveBeenCalled();
+  });
+
+  it("releases routing without accepting or replaying keys when native show is suspended", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    let finishShow!: (shown: boolean) => void;
+    native.show.mockImplementationOnce(() => new Promise<boolean>(resolve => { finishShow = resolve; }));
+    await pushMenu(main, "rings", { openedAt: 1, generation: 1 });
+    expect(await press("ArrowDown")).toBe(true);
+    expect(await press("Enter")).toBe(true);
+
+    // The native command resolves successfully but leaves the window hidden.
+    await act(async () => finishShow(false));
+    expect(native.visible).toBe(false);
+    expect(native.routeCommand).not.toHaveBeenCalled();
+    expect(native.emit.mock.calls.some(([event, payload]) => accepted(event, payload))).toBe(false);
+    expect(sendKeys()).toEqual([]);
+    expect(await press("ArrowDown")).toBe(false);
+    expect(native.show).toHaveBeenCalledOnce();
   });
 
   it("discards pending keys on close even if acceptance was already sent", async () => {

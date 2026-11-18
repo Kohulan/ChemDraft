@@ -26,7 +26,7 @@ const native = vi.hoisted(() => ({
   dismiss: new Set<(payload?: ToolsetPopoverDismissPayload) => void>(),
   textStyle: new Set<(payload: ToolsetTextStylePayload) => void>(),
   visible: false,
-  show: vi.fn(async () => { native.visible = true; }),
+  show: vi.fn(async () => { native.visible = true; return true; }),
   hide: vi.fn(async () => { native.visible = false; }),
   focus: vi.fn(async () => {})
 }));

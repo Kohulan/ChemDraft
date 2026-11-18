@@ -6375,12 +6375,12 @@ fn show_toolset_popover_window(
     window: tauri::WebviewWindow,
     focus_mode: Option<ToolsetPopoverFocusMode>,
     kind: Option<String>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if !window.label().starts_with("toolset-popover-") {
         return Err("Only toolset popovers may reveal popover content".into());
     }
     if utility_windows_suspended() {
-        return Ok(());
+        return Ok(false);
     }
     // The page owns the live content, including a prewarmed/reused Art window switching
     // between its colour picker and command flyouts. Titles are fixed native strings.
@@ -6412,7 +6412,8 @@ fn show_toolset_popover_window(
     // `focus: false` at creation makes Tao use SW_SHOWNOACTIVATE on Windows.
     // Keep its visibility state in sync (a raw ShowWindow alone breaks later hide()).
     window.show().map_err(|error| error.to_string())?;
-    raise_among_owned_windows(&window)
+    raise_among_owned_windows(&window)?;
+    Ok(window.is_visible().unwrap_or(false))
 }
 
 /// Hide the tooltip window. Deliberately a sync command like `show_toolset_tooltip_window`: both

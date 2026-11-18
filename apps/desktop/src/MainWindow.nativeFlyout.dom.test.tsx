@@ -22,7 +22,7 @@ const native = vi.hoisted(() => ({
   keys: new Set<(payload: ToolsetFlyoutKey) => void>(),
   closed: new Set<(payload: ToolsetFlyoutSession) => void>(),
   dismiss: new Set<(payload?: ToolsetPopoverDismissPayload) => void>(),
-  show: vi.fn(async () => {}), hide: vi.fn(async () => {}), focus: vi.fn(async () => {})
+  show: vi.fn(async () => true), hide: vi.fn(async () => {}), focus: vi.fn(async () => {})
 }));
 vi.mock("./rdkitWasmLoader", () => ({ registerRdkitWasmLoader: vi.fn() }));
 vi.mock("@scena/react-ruler", () => ({ default: () => <canvas /> }));

@@ -18,7 +18,7 @@ const native = vi.hoisted(() => ({
   dismiss: undefined as undefined | ((payload?: ToolsetPopoverDismissPayload) => void),
   request: undefined as undefined | ((toolsetId: string) => void),
   key: undefined as undefined | ((payload: ToolsetFlyoutKey) => void),
-  hide: vi.fn(async () => {}), focus: vi.fn(async () => {}), webviewFocus: vi.fn(async () => {}), show: vi.fn(async () => {}),
+  hide: vi.fn(async () => {}), focus: vi.fn(async () => {}), webviewFocus: vi.fn(async () => {}), show: vi.fn(async () => true),
   invoke: vi.fn(async (_command: string, _args?: Record<string, unknown>): Promise<unknown> => undefined),
   fallbackShow: vi.fn(async () => {}),
   platform: "macos" as "macos" | "windows",
@@ -73,7 +73,8 @@ beforeEach(() => {
   native.platform = "macos";
   native.notifyFocus = undefined;
   native.invoke.mockReset().mockImplementation(async (command: string, args?: Record<string, unknown>) =>
-    command === "register_plugin_panel_input_focus" ? "popover-page" : args?.editing);
+    command === "register_plugin_panel_input_focus" ? "popover-page" :
+      command === "show_toolset_popover_window" ? true : args?.editing);
   container = document.createElement("div"); document.body.append(container); root = createRoot(container);
 });
 
@@ -199,14 +200,14 @@ describe("native popover focus transport", () => {
         expect(native.invoke).toHaveBeenLastCalledWith("open_toolset_popover", {
           toolsetId: "core.bondStereo", kind: "flyout", x: 130, y: 254, focusMode
         });
-        await manager.showCurrentToolsetPopoverWindow(focusMode);
+        await expect(manager.showCurrentToolsetPopoverWindow(focusMode)).resolves.toBe(true);
         expect(native.invoke).toHaveBeenLastCalledWith("show_toolset_popover_window", { focusMode });
       }
       await manager.openToolsetPopoverWindow("core.art", "artColor", 0, 0);
       expect(native.invoke).toHaveBeenLastCalledWith("open_toolset_popover", {
         toolsetId: "core.art", kind: "artColor", x: 0, y: 0, focusMode: "focus"
       });
-      await manager.showCurrentToolsetPopoverWindow();
+      await expect(manager.showCurrentToolsetPopoverWindow()).resolves.toBe(true);
       expect(native.invoke).toHaveBeenLastCalledWith("show_toolset_popover_window", { focusMode: "focus" });
     } finally { delete host.__TAURI__; }
   });
@@ -470,6 +471,7 @@ describe("open-bond native popover body", () => {
       expect(native.notifyFocus).toBeTypeOf("function");
       // Activation can arrive during reveal, before setFocus() resolves.
       native.notifyFocus!({ payload: { kind: "activated", generation: 0 } });
+      return true;
     });
     const handBacks = () => native.invoke.mock.calls.filter(([command, args]) =>
       command === "set_plugin_panel_input_focus" && args?.editing === false);
@@ -571,8 +573,8 @@ describe("open-bond native popover body", () => {
     } finally { delete host.__TAURI__; }
   });
   it("does not let an older reveal hide a newly opened session", async () => {
-    let finishReveal!: () => void;
-    native.show.mockImplementationOnce(() => new Promise<void>(resolve => { finishReveal = resolve; }));
+    let finishReveal!: (shown: boolean) => void;
+    native.show.mockImplementationOnce(() => new Promise<boolean>(resolve => { finishReveal = resolve; }));
     await open();
     const next: ToolsetPopoverContentPayload = { toolsetId: "core.bondStereo", kind: "flyout", flyout: {
       id: "session-2", flyoutId: "core.bondStereo", title: "E/Z not specified", variant: "bondStereo",
@@ -580,7 +582,7 @@ describe("open-bond native popover body", () => {
     } };
     await act(async () => { native.content?.(next); native.content?.(next); });
     expect(native.show).toHaveBeenCalledTimes(2);
-    await act(async () => finishReveal());
+    await act(async () => finishReveal(true));
     expect(native.hide).not.toHaveBeenCalled();
     await act(async () => container.querySelector("button")!.click());
     expect(sendBondStereoPopoverAction).toHaveBeenCalledWith({ sessionId: "session-2", action: "geometry" });
@@ -588,7 +590,7 @@ describe("open-bond native popover body", () => {
   it("does not let an older failed reveal close a newly opened session", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     let failReveal!: (error: Error) => void;
-    native.show.mockImplementationOnce(() => new Promise<void>((_resolve, reject) => { failReveal = reject; }));
+    native.show.mockImplementationOnce(() => new Promise<boolean>((_resolve, reject) => { failReveal = reject; }));
     await open();
     await act(async () => native.content?.({ toolsetId: "core.bondStereo", kind: "flyout", flyout: {
       id: "session-2", flyoutId: "core.bondStereo", title: "E/Z not specified", variant: "bondStereo",

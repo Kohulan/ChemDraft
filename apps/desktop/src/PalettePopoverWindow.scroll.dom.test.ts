@@ -18,7 +18,7 @@ const native = vi.hoisted(() => ({
   key: undefined as undefined | ((payload: ToolsetFlyoutKey) => void),
   release: undefined as undefined | ((payload: { toolsetId: string; releasedAt: number }) => void),
   resized: undefined as undefined | (() => void),
-  show: vi.fn(async () => {}), size: vi.fn(async () => {}), invoke: vi.fn(async (_command: string, _args?: Record<string, unknown>) => {}),
+  show: vi.fn(async () => true), size: vi.fn(async () => {}), invoke: vi.fn(async (_command: string, _args?: Record<string, unknown>) => {}),
   command: vi.fn(async () => {}), closed: vi.fn(async () => {}), flyoutClosed: vi.fn(async () => {}),
   sendKey: vi.fn(async (_payload: ToolsetFlyoutKey) => {})
 }));
@@ -110,13 +110,13 @@ function records() {
 it("clears retained document/root/shell scrolling on content update, fit and reveal", async () => {
   await act(async () => root.render(createElement(PalettePopoverWindow, { toolsetId: "core.main", kind: "flyout", prewarm: true })));
   offset();
-  let finishReveal!: () => void;
-  native.show.mockImplementationOnce(() => new Promise<void>(resolve => { finishReveal = resolve; }));
+  let finishReveal!: (shown: boolean) => void;
+  native.show.mockImplementationOnce(() => new Promise<boolean>(resolve => { finishReveal = resolve; }));
   await act(async () => pushContent(rings));
   expectReset();
   expect(container.querySelectorAll('[role="menuitem"]')).toHaveLength(9);
   offset();
-  await act(async () => finishReveal());
+  await act(async () => finishReveal(true));
   expectReset();
   expect(records().filter(record => record.geometry.phase === "reveal")).toEqual([
     expect.objectContaining({ event: "toolset-popover-geometry", geometry: {

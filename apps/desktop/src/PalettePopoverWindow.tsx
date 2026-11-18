@@ -396,7 +396,8 @@ export function PalettePopoverWindow({
           (platform === "windows" || !(content.flyout.variant === "bondStereo" && content.flyout.keyboardOpen));
         keepWindowFocusRef.current = platform !== "windows" && toolsetId === "core.bondStereo" && content.kind === "flyout" &&
           content.flyout.variant === "bondStereo" && !!content.flyout.keyboardOpen;
-        await showCurrentToolsetPopoverWindow(preserveFocus ? "preserve" : "focus", content.kind);
+        const shown = await showCurrentToolsetPopoverWindow(preserveFocus ? "preserve" : "focus", content.kind);
+        if (!shown) throw new Error("Native toolset popover remained hidden");
         resetScroll("reveal");
         if (cancelled || dismissedRef.current || contentRef.current !== content) {
           // An older reveal may complete after a fresh open. Only hide the content
@@ -458,7 +459,7 @@ export function PalettePopoverWindow({
       }
       resetScroll();
       void showCurrentToolsetPopoverWindow(contentRef.current.kind === "flyout" ? "preserve" : "focus",
-        contentRef.current.kind).then(() => resetScroll("reveal")).catch(() => undefined);
+        contentRef.current.kind).then(shown => { if (shown) resetScroll("reveal"); }).catch(() => undefined);
     }, 600);
     return () => window.clearTimeout(fallback);
   }, [prewarm, toolsetId]);
