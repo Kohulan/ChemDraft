@@ -9,14 +9,12 @@ use objc2_app_kit::{NSAlert, NSAlertStyle, NSApplication};
 use objc2_foundation::{NSString, NSTimer};
 use serde::{Deserialize, Serialize};
 use std::{
-    cell::{Cell, RefCell},
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::{Path, PathBuf},
-    rc::Rc,
-    sync::{mpsc, Arc},
+    sync::{mpsc, Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -102,7 +100,7 @@ impl InstanceLock {
     }
 }
 
-pub fn init(context: &mut Context<Wry>) -> (Option<InstanceLock>, Option<Rc<SecondaryLaunch>>) {
+pub fn init(context: &mut Context<Wry>) -> (Option<InstanceLock>, Option<Arc<SecondaryLaunch>>) {
     // Match PathResolver::app_data_dir. The identifier separates stable and dev builds.
     let directory = dirs::data_dir()
         .ok_or_else(|| io::Error::other("ChemDraft's application data directory is unavailable"))
@@ -111,15 +109,14 @@ pub fn init(context: &mut Context<Wry>) -> (Option<InstanceLock>, Option<Rc<Seco
         .as_ref()
         .ok()
         .and_then(|path| InstanceLock::acquire(path).ok().flatten());
-    // The shared macOS startup hook creates the document window once we hold the lock.
+    if let Some(guard) = guard {
+        return (Some(guard), None);
+    }
+    // Keep the config for a possible takeover while starting the secondary without windows.
     for window in &mut context.config_mut().app.windows {
         window.create = false;
     }
-    if let Some(guard) = guard {
-        (Some(guard), None)
-    } else {
-        (None, Some(Rc::new(SecondaryLaunch::new(directory))))
-    }
+    (None, Some(Arc::new(SecondaryLaunch::new(directory))))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,6 +144,9 @@ pub fn plugin(
                             stream.set_read_timeout(Some(HANDOFF_TIMEOUT))?;
                             stream.set_write_timeout(Some(HANDOFF_TIMEOUT))?;
                             receive_launch(&mut stream, &endpoint.token, |launch| {
+                                if crate::quit_in_progress() {
+                                    return Ok(Acknowledgement::Refused);
+                                }
                                 let app = app_handle.clone();
                                 let callback = callback.clone();
                                 let (send_reply, reply) = mpsc::channel();
@@ -160,7 +160,9 @@ pub fn plugin(
                                     })
                                     .map_err(io::Error::other)?;
                                 reply
-                                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                                    .recv_timeout(
+                                        deadline.saturating_duration_since(Instant::now()),
+                                    )
                                     .map_err(io::Error::other)
                             })
                         });
@@ -177,144 +179,264 @@ pub fn plugin(
         .build()
 }
 
+#[derive(Default)]
 struct OpenCollection {
     launch: LaunchRequest,
-    ready: Option<Instant>,
+    started: Option<Instant>,
     last_open: Option<Instant>,
 }
 
 impl OpenCollection {
     fn append(&mut self, urls: &[Url], now: Instant) {
         if !urls.is_empty() {
+            self.started.get_or_insert(now);
             self.launch.urls.extend_from_slice(urls);
             self.last_open = Some(now);
         }
     }
 
-    fn deadline(&self) -> Instant {
-        let ready = self.ready.expect("collection timer starts after Ready");
-        let last_open = self.last_open.unwrap_or(ready).max(ready);
-        (last_open + OPEN_QUIET_PERIOD).min(ready + OPEN_COLLECTION_CAP)
+    fn deadline(&self) -> Option<Instant> {
+        let started = self.started?;
+        let last_open = self.last_open.unwrap_or(started).max(started);
+        Some((last_open + OPEN_QUIET_PERIOD).min(started + OPEN_COLLECTION_CAP))
     }
 }
 
 type StartPrimary = fn(
     &AppHandle<Wry>,
     InstanceLock,
-    Option<&LaunchRequest>,
-) -> Result<(), Box<dyn std::error::Error>>;
+    &LaunchRequest,
+) -> Result<Option<String>, Box<dyn std::error::Error>>;
+
+struct Handoff {
+    launch: LaunchRequest,
+    result: mpsc::Receiver<io::Result<Resolution>>,
+}
+
+struct SecondaryState {
+    collection: OpenCollection,
+    handoff: Option<Handoff>,
+    promoted: bool,
+    exiting: bool,
+    exit_code: i32,
+}
 
 pub struct SecondaryLaunch {
     directory: io::Result<PathBuf>,
-    collection: RefCell<Option<OpenCollection>>,
-    promoted: Cell<bool>,
+    state: Mutex<SecondaryState>,
 }
 
 impl SecondaryLaunch {
     fn new(directory: io::Result<PathBuf>) -> Self {
         Self {
             directory,
-            collection: RefCell::new(Some(OpenCollection {
-                launch: LaunchRequest {
-                    argv: std::env::args_os()
-                        .map(|arg| arg.to_string_lossy().into_owned())
-                        .collect(),
-                    cwd: std::env::current_dir()
-                        .map(|cwd| cwd.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                    urls: Vec::new(),
+            state: Mutex::new(SecondaryState {
+                collection: OpenCollection {
+                    launch: LaunchRequest {
+                        argv: std::env::args_os()
+                            .map(|arg| arg.to_string_lossy().into_owned())
+                            .collect(),
+                        cwd: std::env::current_dir()
+                            .map(|cwd| cwd.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        urls: Vec::new(),
+                    },
+                    ..Default::default()
                 },
-                ready: None,
-                last_open: None,
-            })),
-            promoted: Cell::new(false),
+                handoff: None,
+                promoted: false,
+                exiting: false,
+                exit_code: 0,
+            }),
         }
     }
 
     // Keep one Tauri event loop. When we take over, run normal startup in this windowless app.
     pub fn handle_event(
-        self: &Rc<Self>,
+        self: &Arc<Self>,
         app: &AppHandle<Wry>,
         event: &RunEvent,
         start_primary: StartPrimary,
     ) -> bool {
-        if self.promoted.get() {
+        let mut state = self.state.lock().unwrap();
+        if state.promoted {
             return false;
         }
-        match event {
+        let deadline = match event {
             RunEvent::Opened { urls } => {
-                if let Some(collection) = self.collection.borrow_mut().as_mut() {
-                    collection.append(urls, Instant::now());
-                }
+                state.collection.append(urls, Instant::now());
+                None
             }
             RunEvent::Ready => {
-                if let Some(collection) = self.collection.borrow_mut().as_mut() {
-                    collection.ready = Some(Instant::now());
-                }
-                self.schedule(app.clone(), start_primary);
+                state.collection.started = Some(Instant::now());
+                state.collection.deadline()
             }
-            _ => {}
+            RunEvent::ExitRequested { code, api, .. } => {
+                // AppHandle::exit posts an event. Keep collecting if an Opened event arrived
+                // between posting it and receiving it.
+                if state.exiting && *code == Some(state.exit_code) {
+                    let deadline = state.collection.deadline();
+                    if deadline.is_some() {
+                        api.prevent_exit();
+                        state.exiting = false;
+                    }
+                    deadline
+                } else {
+                    api.prevent_exit();
+                    None
+                }
+            }
+            _ => None,
+        };
+        drop(state);
+        if let Some(deadline) = deadline {
+            self.schedule(app, start_primary, deadline);
         }
         true
     }
 
-    fn schedule(self: &Rc<Self>, app: AppHandle<Wry>, start_primary: StartPrimary) {
-        let Some(deadline) = self.collection.borrow().as_ref().map(OpenCollection::deadline) else {
-            return;
-        };
+    fn schedule(
+        self: &Arc<Self>,
+        app: &AppHandle<Wry>,
+        start_primary: StartPrimary,
+        deadline: Instant,
+    ) {
         let delay = deadline.saturating_duration_since(Instant::now());
         let secondary = self.clone();
-        let tick = RcBlock::new(move |_| {
-            let mut collection = secondary.collection.borrow_mut();
-            if collection
-                .as_ref()
-                .is_some_and(|pending| Instant::now() < pending.deadline())
-            {
-                drop(collection);
-                secondary.schedule(app.clone(), start_primary);
-            } else if let Some(pending) = collection.take() {
-                drop(collection);
-                secondary.finish(&app, pending.launch, start_primary);
-            }
-        });
-        // SAFETY: Ready and NSTimer callbacks run on the AppKit main thread. The run loop retains
-        // this one-shot timer and its copied block until it fires.
+        let app = app.clone();
+        let tick = RcBlock::new(move |_| secondary.tick(&app, start_primary));
+        // SAFETY: The block captures sendable values and is scheduled on AppKit's main run loop.
         unsafe {
             NSTimer::scheduledTimerWithTimeInterval_repeats_block(delay.as_secs_f64(), false, &tick)
         };
     }
 
-    fn finish(&self, app: &AppHandle<Wry>, launch: LaunchRequest, start_primary: StartPrimary) {
-        let result = match &self.directory {
-            Ok(directory) => resolve_launch_with(directory, &launch, TAKEOVER_TIMEOUT, connect)
-                .map_err(|error| error.to_string()),
-            Err(error) => Err(error.to_string()),
+    fn tick(self: &Arc<Self>, app: &AppHandle<Wry>, start_primary: StartPrimary) {
+        let mut state = self.state.lock().unwrap();
+        let now = Instant::now();
+        if let Some(handoff) = state.handoff.take() {
+            let result = match handoff.result.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Disconnected) => Err(io::Error::other(
+                    "the single-instance handoff worker stopped",
+                )),
+                Err(mpsc::TryRecvError::Empty) => {
+                    state.handoff = Some(handoff);
+                    drop(state);
+                    self.schedule(app, start_primary, now + LOCK_RETRY);
+                    return;
+                }
+            };
+            drop(state);
+            self.complete(app, start_primary, handoff.launch, result);
+            return;
+        }
+
+        let Some(deadline) = state.collection.deadline() else {
+            return;
         };
+        if now < deadline {
+            drop(state);
+            self.schedule(app, start_primary, deadline);
+            return;
+        }
+        let launch = std::mem::take(&mut state.collection).launch;
+        drop(state);
+
+        // The lock wait and socket I/O must leave AppKit free to receive subsequent file opens.
+        let secondary = self.clone();
+        let request = launch.clone();
+        let (send, result) = mpsc::channel();
+        match thread::Builder::new()
+            .name("forward-launch".into())
+            .spawn(move || {
+                let result = match &secondary.directory {
+                    Ok(directory) => {
+                        resolve_launch_with(directory, &request, TAKEOVER_TIMEOUT, connect)
+                    }
+                    Err(error) => Err(io::Error::other(error.to_string())),
+                };
+                let _ = send.send(result);
+            }) {
+            Ok(_) => {
+                self.state.lock().unwrap().handoff = Some(Handoff { launch, result });
+                self.schedule(app, start_primary, now + LOCK_RETRY);
+            }
+            Err(error) => self.complete(app, start_primary, launch, Err(error)),
+        };
+    }
+
+    fn complete(
+        self: &Arc<Self>,
+        app: &AppHandle<Wry>,
+        start_primary: StartPrimary,
+        mut launch: LaunchRequest,
+        result: io::Result<Resolution>,
+    ) {
         let error = match result {
-            Ok(Resolution::Forwarded) => return app.exit(0),
-            Ok(Resolution::Primary(guard)) => match start_primary(app, guard, Some(&launch)) {
-                Ok(()) => return self.promoted.set(true),
-                Err(error) => error.to_string(),
-            },
-            Err(error) => error,
+            Ok(Resolution::Primary(guard)) => {
+                // Include files arriving during the lock wait in the cold-start open.
+                launch.urls.extend(self.take_late_launch().urls);
+                match start_primary(app, guard, &launch) {
+                    Ok(open_error) => {
+                        self.state.lock().unwrap().promoted = true;
+                        let late = self.take_late_launch();
+                        if let Err(error) = crate::open_macos_launch(app, &late) {
+                            show_launch_error(&late, &error);
+                        }
+                        if let Some(error) = open_error {
+                            show_launch_error(&launch, &error);
+                        }
+                        return;
+                    }
+                    Err(error) => {
+                        launch.urls.extend(self.take_late_launch().urls);
+                        Some(error.to_string())
+                    }
+                }
+            }
+            Ok(Resolution::Forwarded) => None,
+            Err(error) => Some(error.to_string()),
         };
-        show_launch_error(&launch, &error);
-        app.exit(1);
+
+        if let Some(error) = error {
+            self.state.lock().unwrap().exit_code = 1;
+            show_launch_error(&launch, &error);
+        }
+
+        let mut state = self.state.lock().unwrap();
+        if let Some(deadline) = state.collection.deadline() {
+            drop(state);
+            self.schedule(app, start_primary, deadline);
+        } else {
+            state.exiting = true;
+            let code = state.exit_code;
+            drop(state);
+            app.exit(code);
+        }
+    }
+
+    fn take_late_launch(&self) -> LaunchRequest {
+        std::mem::take(&mut self.state.lock().unwrap().collection).launch
     }
 }
 
 fn launch_error_message(launch: &LaunchRequest, error: &str) -> String {
     let mut files = Vec::new();
     for url in launch.urls.iter().filter(|url| url.scheme() == "file") {
-        let path = url.to_file_path().map_or_else(
-            |_| url.to_string(),
-            |path| path.display().to_string(),
-        );
+        let path = url
+            .to_file_path()
+            .map_or_else(|_| url.to_string(), |path| path.display().to_string());
         if !files.contains(&path) {
             files.push(path);
         }
     }
-    for arg in launch.argv.iter().skip(1).filter(|arg| !arg.starts_with('-')) {
+    for arg in launch
+        .argv
+        .iter()
+        .skip(1)
+        .filter(|arg| !arg.starts_with('-'))
+    {
         let path = Path::new(&launch.cwd).join(arg).display().to_string();
         if !files.contains(&path) {
             files.push(path);
@@ -336,7 +458,9 @@ pub fn show_launch_error(launch: &LaunchRequest, error: &str) {
     app.activateIgnoringOtherApps(true);
     let alert = NSAlert::new(mtm);
     alert.setAlertStyle(NSAlertStyle::Critical);
-    alert.setMessageText(&NSString::from_str("ChemDraft could not complete the document open"));
+    alert.setMessageText(&NSString::from_str(
+        "ChemDraft could not complete the document open",
+    ));
     alert.setInformativeText(&NSString::from_str(&message));
     alert.runModal();
 }
@@ -388,7 +512,7 @@ fn resolve_launch_with<S: Read + Write>(
                             Ok(Acknowledgement::Accepted) => return Ok(Resolution::Forwarded),
                             Ok(Acknowledgement::Refused) => {
                                 last_error = io::Error::other(
-                                    "the running copy is quitting and still holds the launch lock",
+                                    "the running copy refused the request and still holds the launch lock",
                                 );
                             }
                             Ok(Acknowledgement::Failed) => {
@@ -619,9 +743,12 @@ mod single_instance_tests {
         let (client, mut server) = streams();
         let client = thread::spawn(move || {
             let mut client = Some(client);
-            forward_launch_with(&path, LaunchRequest::default(), |_| {
-                Ok(client.take().unwrap())
-            })
+            resolve_launch_with(
+                &path,
+                &LaunchRequest::default(),
+                TAKEOVER_TIMEOUT,
+                |_, _| Ok(client.take().unwrap()),
+            )
         });
         // The first launch can be descheduled between locking and publishing its endpoint.
         thread::sleep(Duration::from_millis(60));
@@ -630,8 +757,244 @@ mod single_instance_tests {
             token: [3; 32],
         };
         guard.write_endpoint(&endpoint).unwrap();
-        receive_launch(&mut server, &endpoint.token, |_| Ok(())).unwrap();
-        client.join().unwrap().unwrap();
+        receive_launch(&mut server, &endpoint.token, |_| {
+            Ok(Acknowledgement::Accepted)
+        })
+        .unwrap();
+        assert!(matches!(
+            client.join().unwrap().unwrap(),
+            Resolution::Forwarded
+        ));
+    }
+
+    #[test]
+    fn single_instance_reclaims_lock_if_primary_exits_during_collection() {
+        let directory = Directory::new();
+        let mut primary = InstanceLock::acquire(&directory.0).unwrap().unwrap();
+        primary
+            .write_endpoint(&Endpoint {
+                port: 1,
+                token: [5; 32],
+            })
+            .unwrap();
+        assert!(InstanceLock::acquire(&directory.0).unwrap().is_none());
+        drop(primary);
+
+        let path = directory.0.join("takeover.chemdraft");
+        fs::write(&path, "<CDXML/>").unwrap();
+        let launch = LaunchRequest {
+            urls: vec![Url::from_file_path(&path).unwrap()],
+            ..Default::default()
+        };
+        let resolution =
+            resolve_launch_with::<UnixStream>(&directory.0, &launch, TAKEOVER_TIMEOUT, |_, _| {
+                panic!("must acquire the free lock before connecting to the stale endpoint")
+            })
+            .unwrap();
+        assert!(matches!(resolution, Resolution::Primary(_)));
+        assert!(InstanceLock::acquire(&directory.0).unwrap().is_none());
+
+        let pending = crate::PendingOpenDocument::default();
+        crate::deliver_opened_documents(crate::forwarded_document_payloads(&launch), |batch| {
+            assert_eq!(
+                pending.record(batch, false)?,
+                crate::OpenDocumentDelivery::PendingOnly
+            );
+            Ok(())
+        })
+        .unwrap();
+        let opened = pending.drain().unwrap();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].path, path.to_str().unwrap());
+    }
+
+    #[test]
+    fn single_instance_waits_for_quitting_primary_after_refusal() {
+        let directory = Directory::new();
+        let mut primary = InstanceLock::acquire(&directory.0).unwrap().unwrap();
+        let endpoint = Endpoint {
+            port: 1,
+            token: [6; 32],
+        };
+        primary.write_endpoint(&endpoint).unwrap();
+        let (client, mut server) = streams();
+        let path = directory.0.clone();
+        let url = Url::from_file_path(path.join("requested.chemdraft")).unwrap();
+        let launch = LaunchRequest {
+            urls: vec![url.clone()],
+            ..Default::default()
+        };
+        let secondary = thread::spawn(move || {
+            let mut client = Some(client);
+            resolve_launch_with(&path, &launch, TAKEOVER_TIMEOUT, |_, _| {
+                Ok(client
+                    .take()
+                    .expect("must not resend to the quitting primary"))
+            })
+        });
+        receive_launch(&mut server, &endpoint.token, |request| {
+            assert_eq!(request.urls, [url]);
+            Ok(Acknowledgement::Refused)
+        })
+        .unwrap();
+        assert!(InstanceLock::acquire(&directory.0).unwrap().is_none());
+        drop(primary);
+        assert!(matches!(
+            secondary.join().unwrap().unwrap(),
+            Resolution::Primary(_)
+        ));
+    }
+
+    #[test]
+    fn single_instance_reclaims_lock_if_primary_disconnects_before_acknowledging() {
+        let directory = Directory::new();
+        let mut primary = InstanceLock::acquire(&directory.0).unwrap().unwrap();
+        let endpoint = Endpoint {
+            port: 1,
+            token: [6; 32],
+        };
+        primary.write_endpoint(&endpoint).unwrap();
+        let (client, mut server) = streams();
+        let owner = thread::spawn(move || {
+            let error = receive_launch(&mut server, &endpoint.token, |_| {
+                drop(primary);
+                Err(io::ErrorKind::ConnectionAborted.into())
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        });
+
+        let mut client = Some(client);
+        let resolution = resolve_launch_with(
+            &directory.0,
+            &LaunchRequest::default(),
+            TAKEOVER_TIMEOUT,
+            |_, _| Ok(client.take().unwrap()),
+        )
+        .unwrap();
+        assert!(matches!(resolution, Resolution::Primary(_)));
+        owner.join().unwrap();
+    }
+
+    #[test]
+    fn single_instance_sends_refused_acknowledgement() {
+        let endpoint = Endpoint {
+            port: 1,
+            token: [7; 32],
+        };
+        let (mut client, mut server) = streams();
+        let server = thread::spawn(move || {
+            receive_launch(&mut server, &endpoint.token, |_| {
+                Ok(Acknowledgement::Refused)
+            })
+            .unwrap();
+        });
+        assert_eq!(
+            send_launch(&mut client, &endpoint, &LaunchRequest::default()).unwrap(),
+            Acknowledgement::Refused
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn single_instance_collects_two_open_batches_until_quiet() {
+        let directory = Directory::new();
+        let ready = Instant::now();
+        let first_batch = ready + Duration::from_millis(200);
+        let second_batch = ready + Duration::from_millis(450);
+        let first = Url::from_file_path(directory.0.join("first.chemdraft")).unwrap();
+        let second = Url::from_file_path(directory.0.join("second.cdxml")).unwrap();
+        let third = Url::from_file_path(directory.0.join("third.cdx")).unwrap();
+        let mut collection = OpenCollection {
+            started: Some(ready),
+            ..Default::default()
+        };
+        collection.append(std::slice::from_ref(&first), first_batch);
+        assert_eq!(collection.deadline(), Some(first_batch + OPEN_QUIET_PERIOD));
+        assert!(second_batch < collection.deadline().unwrap());
+        collection.append(&[second.clone(), third.clone()], second_batch);
+        assert_eq!(
+            collection.deadline(),
+            Some(second_batch + OPEN_QUIET_PERIOD)
+        );
+        let launch = round_trip(&directory.0, collection.launch);
+        assert_eq!(launch.urls, [first, second, third]);
+    }
+
+    #[test]
+    fn single_instance_caps_continuous_open_collection() {
+        let ready = Instant::now();
+        let mut collection = OpenCollection {
+            started: Some(ready),
+            ..Default::default()
+        };
+        let url = Url::parse("file:///drawing.chemdraft").unwrap();
+        for tick in 1..20 {
+            let now = ready + Duration::from_millis(250 * tick);
+            assert!(now < collection.deadline().unwrap());
+            collection.append(std::slice::from_ref(&url), now);
+        }
+        assert_eq!(collection.deadline(), Some(ready + OPEN_COLLECTION_CAP));
+        assert_eq!(collection.launch.urls.len(), 19);
+    }
+
+    #[test]
+    fn single_instance_reports_files_when_neither_forwarding_nor_takeover_works() {
+        let directory = Directory::new();
+        let mut primary = InstanceLock::acquire(&directory.0).unwrap().unwrap();
+        primary
+            .write_endpoint(&Endpoint {
+                port: 1,
+                token: [8; 32],
+            })
+            .unwrap();
+        let launch = LaunchRequest {
+            argv: vec!["ChemDraft".into(), "other drawing.cdxml".into()],
+            cwd: directory.0.display().to_string(),
+            urls: vec![
+                Url::from_file_path(directory.0.join("requested drawing.chemdraft")).unwrap(),
+            ],
+        };
+        let result = resolve_launch_with::<UnixStream>(
+            &directory.0,
+            &launch,
+            Duration::from_millis(100),
+            |_, _| {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "connection refused",
+                ))
+            },
+        );
+        let Err(error) = result else {
+            panic!("must report the failure if the unreachable owner keeps the lock");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        let message = launch_error_message(&launch, &error.to_string());
+        for expected in [
+            "connection refused",
+            "requested drawing.chemdraft",
+            "other drawing.cdxml",
+        ] {
+            assert!(message.contains(expected), "{message}");
+        }
+        assert!(InstanceLock::acquire(&directory.0).unwrap().is_none());
+    }
+
+    #[test]
+    fn single_instance_treats_a_missing_document_argument_as_a_failed_open() {
+        let directory = Directory::new();
+        let request = LaunchRequest {
+            argv: vec!["ChemDraft".into(), "missing.chemdraft".into()],
+            cwd: directory.0.display().to_string(),
+            ..Default::default()
+        };
+        let mut files = crate::forwarded_document_payloads(&request);
+        assert!(matches!(
+            files.next(),
+            Some(Err(error)) if error.contains("missing.chemdraft")
+        ));
+        assert!(files.next().is_none());
     }
 
     #[test]
@@ -656,7 +1019,7 @@ mod single_instance_tests {
         assert_eq!(launch.urls, urls);
         let mut opened = Vec::new();
         let error = crate::deliver_opened_documents(
-            crate::forwarded_document_payloads(launch),
+            crate::forwarded_document_payloads(&launch),
             |payloads| {
                 assert_eq!(payloads.len(), 2);
                 opened = payloads;
@@ -696,7 +1059,7 @@ mod single_instance_tests {
         );
         assert_eq!(launch.argv, argv);
         assert_eq!(launch.cwd, cwd);
-        let opened: Vec<_> = crate::forwarded_document_payloads(launch)
+        let opened: Vec<_> = crate::forwarded_document_payloads(&launch)
             .map(|payload| payload.unwrap().display_name)
             .collect();
         assert_eq!(opened, [first, second]);
@@ -708,7 +1071,7 @@ mod single_instance_tests {
                 ..Default::default()
             },
         );
-        assert!(crate::forwarded_document_payloads(activation)
+        assert!(crate::forwarded_document_payloads(&activation)
             .next()
             .is_none());
     }
@@ -725,13 +1088,19 @@ mod single_instance_tests {
             let mut delivered = None;
             receive_launch(&mut stream, &endpoint.token, |launch| {
                 delivered = Some(launch);
-                Ok(())
+                Ok(Acknowledgement::Accepted)
             })
             .unwrap();
             delivered.unwrap()
         });
         let mut client = Some(client);
-        forward_launch_with(directory, launch, |_| Ok(client.take().unwrap())).unwrap();
+        assert!(matches!(
+            resolve_launch_with(directory, &launch, TAKEOVER_TIMEOUT, |_, _| Ok(client
+                .take()
+                .unwrap()))
+            .unwrap(),
+            Resolution::Forwarded
+        ));
         assert!(InstanceLock::acquire(directory).unwrap().is_none());
         server.join().unwrap()
     }

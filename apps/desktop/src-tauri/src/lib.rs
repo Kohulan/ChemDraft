@@ -1190,6 +1190,18 @@ pub fn run() {
         let (primary_lock, secondary) = macos_single_instance::init(&mut context);
         (context, primary_lock, secondary)
     };
+    #[cfg(target_os = "macos")]
+    let builder = if let Some(guard) = primary_lock {
+        builder
+            .plugin(macos_single_instance::plugin(
+                guard,
+                handle_macos_second_launch,
+            ))
+            .plugin(tauri_plugin_sparkle_updater::init())
+            .menu(create_app_menu)
+    } else {
+        builder.enable_macos_default_menu(false)
+    };
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(handle_second_launch));
 
@@ -1247,7 +1259,7 @@ pub fn run() {
     #[cfg(target_os = "macos")]
     let builder = builder.manage(FullscreenMenuItem::<tauri::Wry>(Mutex::new(None)));
     #[cfg(target_os = "macos")]
-    let builder = builder.enable_macos_default_menu(false).plugin(
+    let builder = builder.plugin(
         tauri::plugin::Builder::<tauri::Wry>::new("windows-menu")
             .on_window_ready(|window| {
                 match window.ns_window() {
@@ -1270,6 +1282,8 @@ pub fn run() {
             .build(),
     );
 
+    #[cfg(target_os = "macos")]
+    let collecting_launch = secondary.is_some();
     let app = builder
         .on_page_load(|webview, payload| {
             if matches!(payload.event(), PageLoadEvent::Finished) {
@@ -1527,13 +1541,9 @@ pub fn run() {
         })
         .setup(move |app| {
             #[cfg(target_os = "macos")]
-            {
-                if let Some(guard) = primary_lock {
-                    start_macos_primary(app.handle(), guard, None)?;
-                }
-                Ok(())
+            if collecting_launch {
+                return Ok(());
             }
-            #[cfg(not(target_os = "macos"))]
             setup_primary_app(app.handle())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1669,7 +1679,7 @@ pub fn run() {
     #[cfg(target_os = "macos")]
     let app = {
         let mut app = app;
-        if secondary.is_some() {
+        if collecting_launch {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
         }
         app
@@ -1739,21 +1749,20 @@ pub fn run() {
 fn start_macos_primary(
     app: &tauri::AppHandle,
     guard: macos_single_instance::InstanceLock,
-    launch: Option<&macos_single_instance::LaunchRequest>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    app.plugin(macos_single_instance::plugin(guard, handle_macos_second_launch))?;
+    launch: &macos_single_instance::LaunchRequest,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    app.plugin(macos_single_instance::plugin(
+        guard,
+        handle_macos_second_launch,
+    ))?;
     app.plugin(tauri_plugin_sparkle_updater::init())?;
     install_app_menu(app, create_app_menu(app)?)?;
 
     // A takeover opens its files through the cold-start queue before the document window mounts.
-    let open_error = launch
-        .and_then(|launch| open_macos_launch(app, launch.clone()).err());
+    let open_error = open_macos_launch(app, launch).err();
     create_main_window(app)?;
     setup_primary_app(app)?;
-    if let (Some(launch), Some(error)) = (launch, open_error) {
-        macos_single_instance::show_launch_error(launch, &error);
-    }
-    Ok(())
+    Ok(open_error)
 }
 
 fn setup_primary_app(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
@@ -3029,7 +3038,20 @@ fn handle_macos_second_launch<R: Runtime>(
     launch: macos_single_instance::LaunchRequest,
 ) -> macos_single_instance::Acknowledgement {
     use macos_single_instance::Acknowledgement;
-    match handle_second_launch_with(app, || open_macos_launch(app, launch)) {
+    // During takeover the listener can start before the document window. A setup failure
+    // must never leave it acknowledging requests while the startup error is on screen.
+    if !app
+        .state::<PendingOpenDocument>()
+        .setup_completed
+        .load(Ordering::SeqCst)
+    {
+        return Acknowledgement::Refused;
+    }
+    let result = handle_second_launch_with(app, || open_macos_launch(app, &launch));
+    if quit_in_progress() {
+        return Acknowledgement::Refused;
+    }
+    match result {
         None => Acknowledgement::Refused,
         Some(Ok(())) => Acknowledgement::Accepted,
         Some(Err(_)) => Acknowledgement::Failed,
@@ -3039,26 +3061,36 @@ fn handle_macos_second_launch<R: Runtime>(
 #[cfg(target_os = "macos")]
 fn open_macos_launch<R: Runtime>(
     app: &tauri::AppHandle<R>,
-    launch: macos_single_instance::LaunchRequest,
+    launch: &macos_single_instance::LaunchRequest,
 ) -> Result<(), String> {
     deliver_opened_documents(forwarded_document_payloads(launch), |payloads| {
+        if quit_in_progress() {
+            return Err("ChemDraft is quitting".into());
+        }
         deliver_opened_document(app, payloads)
     })
 }
 
 #[cfg(target_os = "macos")]
 fn forwarded_document_payloads(
-    launch: macos_single_instance::LaunchRequest,
+    launch: &macos_single_instance::LaunchRequest,
 ) -> impl Iterator<Item = Result<NativeOpenDocumentPayload, String>> {
     let event_paths: std::collections::HashSet<_> = launch
         .urls
         .iter()
         .filter_map(|url| url.to_file_path().ok())
         .collect();
-    let arg_paths =
-        openable_document_paths_from_args(launch.argv.into_iter().skip(1), Path::new(&launch.cwd));
+    let cwd = Path::new(&launch.cwd);
+    let arg_paths: Vec<_> = launch
+        .argv
+        .iter()
+        .skip(1)
+        .filter(|arg| !arg.starts_with('-'))
+        .map(|arg| cwd.join(arg))
+        .filter(|path| has_document_extension(path) || is_openable_document_path(path))
+        .collect();
     // Preserve the native event batch. Some callers can also supply the same file in argv.
-    opened_document_payloads_from_urls(launch.urls).chain(
+    opened_document_payloads_from_urls(launch.urls.clone()).chain(
         arg_paths
             .into_iter()
             .filter(move |path| !event_paths.contains(path))
@@ -8346,7 +8378,10 @@ fn handle_opened_document_args<R: Runtime>(
     deliver_opened_documents(payloads, |payload| deliver_opened_document(app, payload))
 }
 
-#[cfg(any(test, not(any(target_os = "ios", target_os = "android"))))]
+#[cfg(any(
+    test,
+    not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+))]
 fn openable_document_paths_from_args(
     args: impl IntoIterator<Item = String>,
     cwd: &Path,
@@ -8360,18 +8395,10 @@ fn openable_document_paths_from_args(
 
 #[cfg(any(test, not(any(target_os = "ios", target_os = "android"))))]
 fn is_openable_document_path(path: &Path) -> bool {
-    let extension_ok = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("chemdraft")
-                || extension.eq_ignore_ascii_case("cdxml")
-                || extension.eq_ignore_ascii_case("cdx")
-        });
     if !path.is_file() {
         return false;
     }
-    if extension_ok {
+    if has_document_extension(path) {
         return true;
     }
     // A renamed binary CDX still opens; inspect only its header here.
@@ -8381,6 +8408,17 @@ fn is_openable_document_path(path: &Path) -> bool {
         .and_then(|mut file| file.read_exact(&mut header))
         .is_ok()
         && header == *b"VjCD0100"
+}
+
+#[cfg(any(test, not(any(target_os = "ios", target_os = "android"))))]
+fn has_document_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("chemdraft")
+                || extension.eq_ignore_ascii_case("cdxml")
+                || extension.eq_ignore_ascii_case("cdx")
+        })
 }
 
 /// Queue an opened document for the window to drain on mount (cold start). Only after setup,
