@@ -126,6 +126,7 @@ function condenseSchemeLabels(molecule: MoleculeObject): MoleculeObject {
     return { ...condensed, structureFormat: "molfile-v2000", structure: contents,
       chemistry: nativeSingleBondGraphMetadata(atoms, bonds),
       ...(warnings.length ? { compatibility: { ...molecule.compatibility,
+        unknown: molecule.compatibility?.unknown ?? {},
         warnings: [...(molecule.compatibility?.warnings ?? []),
           ...warnings.map(message => ({ code: "molfile.stored_structure_lossy", message }))] } } : {}) };
   };
