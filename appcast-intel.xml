@@ -5,5 +5,16 @@
         <link>https://github.com/jgassens/ChemDraft</link>
         <description>Signed ChemDraft updates for macOS Intel.</description>
         <language>en</language>
-    </channel>
+    <item>
+            <title>1.2.0</title>
+            <pubDate>Mon, 16 Nov 2026 17:00:00 -0600</pubDate>
+            <link>https://github.com/jgassens/ChemDraft</link>
+            <sparkle:version>1.2.0</sparkle:version>
+            <sparkle:shortVersionString>1.2.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>11.0</sparkle:minimumSystemVersion>
+            <sparkle:releaseNotesLink>https://raw.githubusercontent.com/jgassens/ChemDraft/main/release-notes/macos-intel/ChemDraft_1.2.0_x86_64.md</sparkle:releaseNotesLink>
+            <enclosure url="https://github.com/jgassens/ChemDraft/releases/download/v1.2.0/ChemDraft_1.2.0_x86_64.dmg" length="87223172" type="application/octet-stream" sparkle:edSignature="/kiqfSYuWjbugdjKhM1a0DnxN5bmESHRAUHxboJXL7gXkWhIs72VDv1Mi0bNaZGBK+9ks2LUNUwHFsePrz90Cw=="/>
+            <sparkle:hardwareRequirements>x86_64</sparkle:hardwareRequirements>
+        </item>
+        </channel>
 </rss>

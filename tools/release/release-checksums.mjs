@@ -15,9 +15,9 @@ export function releaseChecksums(directory) {
     .map(({ name }) => `${digest(join(directory, name))}  ${name}`).sort((a, b) => a.slice(66).localeCompare(b.slice(66)));
 }
 
-export function writeReleaseChecksums(directory) {
+export function writeReleaseChecksums(directory, output = join(directory, SUMS_FILE)) {
   const content = `${releaseChecksums(directory).join("\n")}\n`;
-  writeFileSync(join(directory, SUMS_FILE), content, { encoding: "utf8" });
+  writeFileSync(output, content, { encoding: "utf8" });
   return content;
 }
 

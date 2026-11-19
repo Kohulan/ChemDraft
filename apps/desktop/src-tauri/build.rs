@@ -77,6 +77,8 @@ fn main() {
             "set_current_window_global_position",
             "clamp_current_inspector_frame",
             "resize_toolset_window",
+            "current_window_logical_work_area",
+            "monitor_logical_bounds_at",
             "start_window_drag",
             "quit_after_flush",
             "quit_prompt_showing",

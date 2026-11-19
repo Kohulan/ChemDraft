@@ -6,21 +6,15 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { act, createElement } from "react";
 import { createRoot } from "react-dom/client";
-import { currentWindowLogicalWorkArea, fitCurrentPaletteWindow } from "./index";
+import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
+import { currentWindowLogicalWorkArea, fitCurrentPaletteWindow, monitorLogicalBoundsAt } from "./index";
 import { PaletteWindow } from "../PaletteWindow";
 
 const native = vi.hoisted(() => ({
   invoke: vi.fn(),
-  currentMonitor: vi.fn(),
+  workArea: vi.fn(),
+  boundsAt: vi.fn(),
   workAreaEvents: new Map<string, () => void>()
-}));
-vi.mock("@tauri-apps/api/core", async original => ({
-  ...await original<typeof import("@tauri-apps/api/core")>(),
-  invoke: native.invoke
-}));
-vi.mock("@tauri-apps/api/window", async original => ({
-  ...await original<typeof import("@tauri-apps/api/window")>(),
-  currentMonitor: native.currentMonitor
 }));
 vi.mock("./tauriEvents", async original => ({
   ...await original<typeof import("./tauriEvents")>(),
@@ -33,34 +27,47 @@ vi.mock("./tauriEvents", async original => ({
 
 describe("palette work-area sizing", () => {
   beforeEach(() => {
-    vi.stubGlobal("__TAURI__", {});
-    native.currentMonitor.mockReset();
-    native.invoke.mockReset().mockResolvedValue(true);
+    native.workArea.mockReset().mockResolvedValue(null);
+    native.boundsAt.mockReset().mockResolvedValue(null);
+    native.invoke.mockReset().mockImplementation(async (command, payload) => {
+      if (command === "current_window_logical_work_area") return native.workArea();
+      if (command === "monitor_logical_bounds_at") return native.boundsAt(payload);
+      if (command === "resize_toolset_window") return true;
+    });
+    mockIPC(native.invoke);
   });
 
   afterEach(() => {
+    clearMocks();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
-  it.each([1, 1.5, 2])("uses the monitor's own scale (%s) and excludes OS chrome", async (scaleFactor) => {
-    native.currentMonitor.mockResolvedValue({
-      scaleFactor,
-      position: { x: -1920 * scaleFactor, y: 0 },
-      size: { width: 1920 * scaleFactor, height: 1080 * scaleFactor },
-      workArea: {
-        position: { x: -1920 * scaleFactor, y: 24 * scaleFactor },
-        size: { width: 1920 * scaleFactor, height: 1016 * scaleFactor }
-      }
-    });
+  // The scale conversion itself is tested in Rust (monitor_query.rs).
+  it("uses the native work area, which excludes OS chrome", async () => {
+    native.workArea.mockResolvedValue({ left: -1920, top: 24, right: 0, bottom: 1040 });
     expect(await currentWindowLogicalWorkArea()).toEqual({ left: -1920, top: 24, right: 0, bottom: 1040 });
+    expect(native.invoke).toHaveBeenCalledWith("current_window_logical_work_area", {});
   });
 
-  it("uses available screen dimensions when the monitor query fails", async () => {
-    native.currentMonitor.mockRejectedValue(new Error("No monitor"));
+  it.each([
+    ["fails", () => native.workArea.mockRejectedValue(new Error("No monitor"))],
+    ["finds no monitor", () => native.workArea.mockResolvedValue(null)]
+  ])("uses available screen dimensions when the monitor query %s", async (_case, arrange) => {
+    arrange();
     vi.spyOn(window.screen, "availHeight", "get").mockReturnValue(720);
     vi.spyOn(window.screen, "availWidth", "get").mockReturnValue(1280);
     expect(await currentWindowLogicalWorkArea()).toEqual({ left: 0, top: 0, right: 1280, bottom: 720 });
+  });
+
+  it("asks the native side for the monitor under a point", async () => {
+    native.boundsAt.mockResolvedValue({ left: 1920, top: 0, right: 4480, bottom: 1440 });
+    expect(await monitorLogicalBoundsAt(2000, 100)).toEqual({ left: 1920, top: 0, right: 4480, bottom: 1440 });
+    expect(native.boundsAt).toHaveBeenCalledWith({ x: 2000, y: 100 });
+    native.boundsAt.mockResolvedValue(null);
+    expect(await monitorLogicalBoundsAt(9000, 0)).toBeUndefined();
+    native.boundsAt.mockRejectedValue(new Error("no runtime"));
+    expect(await monitorLogicalBoundsAt(0, 0)).toBeUndefined();
   });
 
   it("caps an oversized inspector without supplying a replacement origin", async () => {
@@ -71,15 +78,13 @@ describe("palette work-area sizing", () => {
   it("re-clamps the resizable inspector after native moves, scale changes, and work-area resizes", async () => {
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
     vi.spyOn(document, "hidden", "get").mockReturnValue(false);
-    native.currentMonitor.mockResolvedValue({ scaleFactor: 1, workArea: {
-      position: { x: 0, y: 0 }, size: { width: 1920, height: 1000 }
-    } });
+    native.workArea.mockResolvedValue({ left: 0, top: 0, right: 1920, bottom: 1000 });
     vi.useFakeTimers();
     const root = createRoot(document.createElement("div"));
     const clampCalls = () => native.invoke.mock.calls.filter(([name]) => name === "clamp_current_inspector_frame");
     try {
       await act(async () => root.render(createElement(PaletteWindow, { toolsetId: "core.molecularInspector", resizable: true })));
-      expect(native.currentMonitor).toHaveBeenCalled();
+      expect(native.invoke).toHaveBeenCalledWith("current_window_logical_work_area", {});
       for (const notify of [
         () => native.workAreaEvents.get("tauri://move")?.(),
         () => native.workAreaEvents.get("tauri://scale-change")?.(),
@@ -92,9 +97,7 @@ describe("palette work-area sizing", () => {
         await act(async () => vi.advanceTimersByTimeAsync(200));
         expect(clampCalls()).toHaveLength(previousCalls + 1);
       }
-      native.currentMonitor.mockResolvedValue({ scaleFactor: 2, workArea: {
-        position: { x: 0, y: 0 }, size: { width: 1800, height: 1200 }
-      } });
+      native.workArea.mockResolvedValue({ left: 0, top: 0, right: 900, bottom: 600 });
       const previousCalls = clampCalls().length;
       await act(async () => vi.advanceTimersByTimeAsync(1200));
       expect(clampCalls()).toHaveLength(previousCalls + 1);

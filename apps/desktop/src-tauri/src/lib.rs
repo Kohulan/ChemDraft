@@ -12,12 +12,15 @@ mod external_tools;
 mod file_warnings_window;
 mod fonts;
 mod installed_plugins;
+#[cfg(target_os = "linux")]
+mod linux_clipboard;
 mod local_engine;
 #[cfg(target_os = "macos")]
 mod macos_quit;
 #[cfg(target_os = "macos")]
 mod macos_single_instance;
 mod main_window_placement;
+mod monitor_query;
 mod naming_engine;
 mod network_error;
 #[cfg(test)]
@@ -1292,6 +1295,9 @@ const MAIN_WINDOW_TITLE_GRAB_PT: f64 = 22.0;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // First, before GTK opens the display: see monitor_query.rs.
+    #[cfg(target_os = "linux")]
+    monitor_query::init_xlib_threads();
     let perf_enabled = agent_bridge_status().enabled;
     windows_activation_log::init(perf_enabled);
     let perf_log = perf_log::PerfLog::new(perf_enabled);
@@ -1750,6 +1756,8 @@ pub fn run() {
             set_current_window_global_position,
             clamp_current_inspector_frame,
             resize_toolset_window,
+            monitor_query::current_window_logical_work_area,
+            monitor_query::monitor_logical_bounds_at,
             start_window_drag,
             quit_after_flush,
             set_quit_prompt_enabled,
@@ -5828,8 +5836,9 @@ fn current_plugin_panel_geometry<R: Runtime>(
 ) -> Option<panel_window_frame::Frame> {
     let position = window.outer_position().ok()?;
     let size = window.inner_size().ok()?;
-    let monitor =
-        panel_window_frame::Monitor::from_native(&window.current_monitor().ok().flatten()?);
+    let monitor = panel_window_frame::Monitor::from_native(
+        &monitor_query::current_monitor(window).ok().flatten()?,
+    );
     panel_window_frame::Frame::from_physical(
         (position.x, position.y),
         (size.width, size.height),
@@ -5856,8 +5865,9 @@ fn plugin_panel_first_placement<R: Runtime>(
     size: (f64, f64),
 ) -> Option<panel_window_frame::Placement> {
     let owner = app.get_webview_window(MAIN_WINDOW_LABEL)?;
-    let monitor =
-        panel_window_frame::Monitor::from_native(&owner.current_monitor().ok().flatten()?);
+    let monitor = panel_window_frame::Monitor::from_native(
+        &monitor_query::current_monitor(&owner).ok().flatten()?,
+    );
     let position = owner.inner_position().ok()?;
     let owner_size = owner.inner_size().ok()?;
     panel_window_frame::Frame::first_placement(
@@ -5878,7 +5888,7 @@ fn plugin_panel_saved_placement<R: Runtime>(
 fn plugin_panel_monitors<R: Runtime>(
     app: &tauri::AppHandle<R>,
 ) -> Vec<panel_window_frame::Monitor> {
-    app.available_monitors()
+    monitor_query::available_monitors(app)
         .unwrap_or_default()
         .iter()
         .map(panel_window_frame::Monitor::from_native)
@@ -5899,7 +5909,9 @@ fn plugin_panel_restore_geometry<R: Runtime>(
     let (width, height) = panel_window_frame::default_size(None, None);
     let placement = plugin_panel_default_placement(app, width, height)?;
     let main = app.get_webview_window(MAIN_WINDOW_LABEL)?;
-    let monitor = panel_window_frame::Monitor::from_native(&main.current_monitor().ok().flatten()?);
+    let monitor = panel_window_frame::Monitor::from_native(
+        &monitor_query::current_monitor(&main).ok().flatten()?,
+    );
     let frame =
         panel_window_frame::Frame::from_physical(placement.position, placement.size, &monitor)?;
     Some((placement, frame))
@@ -5911,7 +5923,7 @@ fn plugin_panel_default_placement<R: Runtime>(
     height: f64,
 ) -> Option<panel_window_frame::Placement> {
     let main = app.get_webview_window(MAIN_WINDOW_LABEL)?;
-    let monitor = main.current_monitor().ok().flatten()?;
+    let monitor = monitor_query::current_monitor(&main).ok().flatten()?;
     let work_area = monitor_logical_work_area(&monitor);
     let width = width.min(work_area.width);
     let height = height.min(work_area.height);
@@ -6922,8 +6934,7 @@ fn set_window_global_logical_position<R: Runtime>(
     x: f64,
     y: f64,
 ) -> Result<(), String> {
-    let monitors = window
-        .available_monitors()
+    let monitors = monitor_query::available_monitors(window.app_handle())
         .unwrap_or_default()
         .iter()
         .map(|monitor| MonitorFrame {
@@ -7000,10 +7011,9 @@ fn resize_toolset_window(
     if toolset_frame_is_transient(app, &window) {
         return Ok(false);
     }
-    let monitor = window
-        .current_monitor()
+    let monitor = monitor_query::current_monitor(&window)
         .map_err(|error| error.to_string())?
-        .or_else(|| app.primary_monitor().ok().flatten())
+        .or_else(|| monitor_query::primary_monitor(app).ok().flatten())
         .ok_or("The tool palette's monitor is unavailable.")?;
     let scale = monitor.scale_factor();
     #[cfg(not(target_os = "macos"))]
@@ -7018,8 +7028,7 @@ fn resize_toolset_window(
     );
     // The monitor under most of the palette can differ from the one under its title.
     if placement.position != origin
-        && app
-            .available_monitors()
+        && monitor_query::available_monitors(app)
             .unwrap_or_default()
             .iter()
             .any(|monitor| {
@@ -7159,10 +7168,26 @@ fn build_toolset_tooltip_window(app: &tauri::AppHandle) -> Result<(), String> {
             }
         })?;
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     window
         .set_ignore_cursor_events(true)
         .map_err(|error| error.to_string())?;
+    // tao's set_ignore_cursor_events unwraps the GdkWindow, which a never-shown window does not
+    // have yet: the panic aborted the app (it fires inside a GLib callback, which cannot unwind).
+    // GTK keeps an input shape set on an unrealized widget and applies it when the window is
+    // realized, so set the same 1×1 shape tao would, directly on the GtkWindow.
+    #[cfg(target_os = "linux")]
+    {
+        let target = window.clone();
+        run_on_main_thread_blocking(&window, move || {
+            use gtk::prelude::WidgetExt;
+            let gtk_window = target.gtk_window().map_err(|error| error.to_string())?;
+            let region =
+                gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(0, 0, 1, 1));
+            gtk_window.input_shape_combine_region(Some(&region));
+            Ok::<(), String>(())
+        })??;
+    }
     Ok(())
 }
 
@@ -7628,7 +7653,10 @@ fn write_native_clipboard_text_items(items: Vec<ClipboardWriteTextItem>) -> Resu
 /// that any WebKit view — Safari included — leaves behind on copy; "decoding" it produced the
 /// CJK-mojibake text objects users saw when pasting between two ChemDraft instances.
 // Platform-neutral decoding, shared by the macOS pasteboard reader and the Windows clipboard reader.
-#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", windows, target_os = "linux")),
+    allow(dead_code)
+)]
 const OPAQUE_CLIPBOARD_TYPES: [&str; 4] = [
     "com.apple.WebKit.custom-pasteboard-data",
     "org.webkit.custom-pasteboard-data",
@@ -7638,7 +7666,10 @@ const OPAQUE_CLIPBOARD_TYPES: [&str; 4] = [
     "Chromium internal source RFH token",
 ];
 
-#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", windows, target_os = "linux")),
+    allow(dead_code)
+)]
 fn is_opaque_clipboard_type(pasteboard_type: &str) -> bool {
     OPAQUE_CLIPBOARD_TYPES.contains(&pasteboard_type)
 }
@@ -7750,7 +7781,10 @@ fn clipboard_text_for_type(
     Some(text)
 }
 
-#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", windows, target_os = "linux")),
+    allow(dead_code)
+)]
 fn decode_clipboard_text_bytes(bytes: &[u8]) -> Option<String> {
     if bytes.is_empty() {
         return None;
@@ -7774,7 +7808,10 @@ fn decode_clipboard_text_bytes(bytes: &[u8]) -> Option<String> {
     decode_utf16_bytes(bytes)
 }
 
-#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", windows, target_os = "linux")),
+    allow(dead_code)
+)]
 fn looks_like_utf16_bytes(bytes: &[u8]) -> bool {
     if bytes.starts_with(&[0xfe, 0xff]) || bytes.starts_with(&[0xff, 0xfe]) {
         return true;
@@ -7788,7 +7825,10 @@ fn looks_like_utf16_bytes(bytes: &[u8]) -> bool {
     null_count * 4 >= bytes.len()
 }
 
-#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", windows, target_os = "linux")),
+    allow(dead_code)
+)]
 fn decode_utf16_bytes(bytes: &[u8]) -> Option<String> {
     if let Some(content) = bytes.strip_prefix(&[0xfe, 0xff]) {
         return decode_utf16_units(content, true);
@@ -7847,7 +7887,10 @@ fn decode_utf16_bytes(bytes: &[u8]) -> Option<String> {
 /// contains private-use or noncharacter code points, while binary bytes and byte-swapped UTF-16
 /// frequently decode into exactly those ranges. (BOM'd and null-parity-detected payloads skip
 /// this — their encoding evidence is strong enough that PUA glyphs, e.g. icon fonts, pass.)
-#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", windows, target_os = "linux")),
+    allow(dead_code)
+)]
 fn utf16_sparse_text_is_convincing(text: &str) -> bool {
     text.chars().all(|character| {
         let code_point = character as u32;
@@ -7860,7 +7903,10 @@ fn utf16_sparse_text_is_convincing(text: &str) -> bool {
     })
 }
 
-#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", windows, target_os = "linux")),
+    allow(dead_code)
+)]
 fn decode_utf16_units(content: &[u8], big_endian: bool) -> Option<String> {
     if content.len() < 2 || !content.len().is_multiple_of(2) {
         return None;
@@ -7882,7 +7928,10 @@ fn decode_utf16_units(content: &[u8], big_endian: bool) -> Option<String> {
 /// Rejects strings that only a mis-decode produces: control characters (beyond whitespace)
 /// and replacement characters never occur in text a user meant to paste, while every
 /// legitimate UTF-16 clipboard payload (molfiles, CDXML, SMILES, prose) is clean of them.
-#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", windows, target_os = "linux")),
+    allow(dead_code)
+)]
 fn text_is_plausible_clipboard_text(text: &str) -> bool {
     text.chars().all(|character| {
         character == '\t'
@@ -7906,7 +7955,20 @@ fn write_clipboard_items_impl(
     windows_clipboard::native::write_items(clipboard_owner_window(app), items)
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(target_os = "linux")]
+fn read_clipboard_payload_impl() -> Result<ClipboardReadPayload, String> {
+    linux_clipboard::read_payload()
+}
+
+#[cfg(target_os = "linux")]
+fn write_clipboard_items_impl(
+    _app: &tauri::AppHandle,
+    items: &[ValidatedClipboardItem],
+) -> Result<ClipboardWriteResult, String> {
+    Ok(linux_clipboard::write_items(items))
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 fn read_clipboard_payload_impl() -> Result<ClipboardReadPayload, String> {
     Ok(ClipboardReadPayload {
         types: Vec::new(),
@@ -7917,12 +7979,12 @@ fn read_clipboard_payload_impl() -> Result<ClipboardReadPayload, String> {
     })
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 fn write_clipboard_items_impl(
     _app: &tauri::AppHandle,
     _items: &[ValidatedClipboardItem],
 ) -> Result<ClipboardWriteResult, String> {
-    Err("Native clipboard writes are only implemented for macOS and Windows.".to_string())
+    Err("Native clipboard writes are only implemented for macOS, Windows and Linux.".to_string())
 }
 
 #[tauri::command]
@@ -8804,6 +8866,51 @@ const EDIT_HISTORY_MENU_ITEMS: [EditHistoryMenuItem; 2] = [
     },
 ];
 
+/// Edit ▸ Cut / Copy / Paste, in menu order, as (command id, label).
+#[cfg(target_os = "linux")]
+const CLIPBOARD_EDIT_MENU_ITEMS: [(&str, &str); 3] = [
+    ("clipboard.cut", "Cut"),
+    ("clipboard.copy", "Copy"),
+    ("clipboard.paste", "Paste"),
+];
+
+/// On macOS and Windows the predefined items make the system send cut/copy/paste to the focused
+/// webview, which raises the DOM clipboard events the editor (and any focused text field) handles.
+#[cfg(not(target_os = "linux"))]
+fn clipboard_edit_menu_item<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    command_id: &str,
+) -> tauri::Result<Box<dyn tauri::menu::IsMenuItem<R>>> {
+    Ok(match command_id {
+        "clipboard.cut" => Box::new(PredefinedMenuItem::cut(app, None)?),
+        "clipboard.copy" => Box::new(PredefinedMenuItem::copy(app, None)?),
+        _ => Box::new(PredefinedMenuItem::paste(app, None)?),
+    })
+}
+
+/// muda's Linux predefined Cut/Copy/Paste only fake a Ctrl+X/C/V key press through libxdo: nothing
+/// on Wayland, and on X11 the press can land before the menu releases its grab, so the click did
+/// nothing. Invoke WebKit's editing commands directly. With no GTK accelerator, the keys still
+/// reach the webview and raise the same DOM clipboard events as the menu commands.
+#[cfg(target_os = "linux")]
+fn clipboard_edit_menu_item<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    command_id: &str,
+) -> tauri::Result<Box<dyn tauri::menu::IsMenuItem<R>>> {
+    let (id, label) = CLIPBOARD_EDIT_MENU_ITEMS
+        .iter()
+        .find(|(id, _)| *id == command_id)
+        .copied()
+        .unwrap_or(CLIPBOARD_EDIT_MENU_ITEMS[2]);
+    Ok(Box::new(MenuItem::with_id(
+        app,
+        id,
+        label,
+        true,
+        None::<&str>,
+    )?))
+}
+
 fn edit_history_menu_item<R: Runtime>(
     app: &tauri::AppHandle<R>,
     item: &EditHistoryMenuItem,
@@ -8823,14 +8930,32 @@ fn is_edit_history_command(command_id: &str) -> bool {
         .any(|item| item.command_id == command_id)
 }
 
+#[cfg(target_os = "linux")]
+fn native_clipboard_edit_command(command_id: &str) -> Option<&'static std::ffi::CStr> {
+    match command_id {
+        "clipboard.cut" => Some(c"Cut"),
+        "clipboard.copy" => Some(c"Copy"),
+        "clipboard.paste" => Some(c"Paste"),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn native_clipboard_edit_command(_command_id: &str) -> Option<&'static std::ffi::CStr> {
+    None
+}
+
 /// Which window a routed menu command is delivered to. Everything goes to the main document window,
-/// except Select All and Undo / Redo, which follow the key window. As with AppKit's
-/// predefined items, ⌘Z in a palette's text field undoes that text. The secondary window forwards
+/// except text editing actions, which follow the key window. The secondary window forwards
 /// history commands to the main window itself
 /// when it has no text field focused (`installSecondaryWindowEditHistory` in the webview).
 fn menu_command_target_label<'a>(command_id: &str, focused_label: Option<&'a str>) -> &'a str {
     match focused_label {
-        Some(label) if is_edit_history_command(command_id) || command_id == "edit.selectAll" => {
+        Some(label)
+            if is_edit_history_command(command_id)
+                || command_id == "edit.selectAll"
+                || native_clipboard_edit_command(command_id).is_some() =>
+        {
             label
         }
         _ => MAIN_WINDOW_LABEL,
@@ -8847,10 +8972,17 @@ fn emit_menu_command<R: Runtime>(
         .find(|(_, window)| window.is_focused().unwrap_or(false))
         .map(|(label, _)| label);
     let target_label = menu_command_target_label(command_id, focused_label.as_deref());
+    if target_label == MAIN_WINDOW_LABEL && panel_window::palette_blocks_menu(true, command_id) {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(command) = native_clipboard_edit_command(command_id) {
+        let target = app
+            .get_webview_window(target_label)
+            .ok_or_else(|| format!("Window {target_label} is not available."))?;
+        return linux_clipboard::execute_editing_command(&target, command);
+    }
     if target_label == MAIN_WINDOW_LABEL {
-        if panel_window::palette_blocks_menu(true, command_id) {
-            return Ok(());
-        }
         return emit_command_to_main(app, command_id);
     }
     let target = app
@@ -9800,8 +9932,8 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                     &edit_history_menu_item(app, &EDIT_HISTORY_MENU_ITEMS[0])?,
                     &edit_history_menu_item(app, &EDIT_HISTORY_MENU_ITEMS[1])?,
                     &PredefinedMenuItem::separator(app)?,
-                    &PredefinedMenuItem::cut(app, None)?,
-                    &PredefinedMenuItem::copy(app, None)?,
+                    &*clipboard_edit_menu_item(app, "clipboard.cut")?,
+                    &*clipboard_edit_menu_item(app, "clipboard.copy")?,
                     &Submenu::with_items(
                         app,
                         "Copy As",
@@ -9865,7 +9997,7 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                             )?,
                         ],
                     )?,
-                    &PredefinedMenuItem::paste(app, None)?,
+                    &*clipboard_edit_menu_item(app, "clipboard.paste")?,
                     &MenuItem::with_id(
                         app,
                         "edit.selectAll",
@@ -10836,6 +10968,7 @@ fn toolset_toggle_command_id(toolset_id: &str) -> String {
 
 fn is_routed_menu_command(command_id: &str) -> bool {
     MENU_COMMAND_IDS.contains(&command_id)
+        || native_clipboard_edit_command(command_id).is_some()
         || command_id.starts_with(TOOLSET_TOGGLE_PREFIX)
         || command_id.starts_with(PLUGIN_COMMAND_PREFIX)
 }
@@ -10911,7 +11044,7 @@ fn clamp_toolset_frame<R: Runtime>(
     resizable: bool,
 ) -> (ToolsetWindowPosition, f64, f64) {
     let (width, height) = size;
-    let monitors = match app.available_monitors() {
+    let monitors = match monitor_query::available_monitors(app) {
         Ok(monitors) if !monitors.is_empty() => monitors,
         // No monitor info (headless, or the platform refused): trust the saved position rather than
         // moving a window the user may have deliberately placed.
@@ -10929,7 +11062,7 @@ fn clamp_toolset_frame<R: Runtime>(
         })
         .collect::<Vec<_>>();
     let area = toolset_work_area_for_origin(position, width, &areas).unwrap_or_else(|| {
-        let primary = app.primary_monitor().ok().flatten();
+        let primary = monitor_query::primary_monitor(app).ok().flatten();
         monitor_logical_work_area(primary.as_ref().unwrap_or(&monitors[0]))
     });
     toolset_frame_in_work_area(position, size, resizable, area)
@@ -11089,14 +11222,12 @@ fn clamp_windows_toolset_frame<R: Runtime>(
     size: (f64, f64),
     resizable: bool,
 ) -> Option<panel_window_frame::Placement> {
-    let monitors: Vec<_> = app
-        .available_monitors()
+    let monitors: Vec<_> = monitor_query::available_monitors(app)
         .ok()?
         .iter()
         .map(ToolsetMonitor::from_native)
         .collect();
-    let primary = app
-        .primary_monitor()
+    let primary = monitor_query::primary_monitor(app)
         .ok()
         .flatten()
         .as_ref()
@@ -11563,7 +11694,7 @@ fn main_window_geometry_reachable<R: Runtime>(
     window: &tauri::WebviewWindow<R>,
     geometry: &MainWindowGeometry,
 ) -> bool {
-    let Ok(monitors) = window.available_monitors() else {
+    let Ok(monitors) = monitor_query::available_monitors(window.app_handle()) else {
         // Can't enumerate displays — trust the frame rather than discard the user's layout.
         return true;
     };
@@ -15063,10 +15194,29 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "linux"))]
     fn clipboard_edit_menu_commands_are_system_owned() {
         expect_false(is_routed_menu_command("clipboard.cut"));
         expect_false(is_routed_menu_command("clipboard.copy"));
         expect_false(is_routed_menu_command("clipboard.paste"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn clipboard_edit_menu_commands_are_routed_on_linux() {
+        for (command, expected) in [
+            ("clipboard.cut", c"Cut"),
+            ("clipboard.copy", c"Copy"),
+            ("clipboard.paste", c"Paste"),
+        ] {
+            assert!(is_routed_menu_command(command), "{command}");
+            assert_eq!(native_clipboard_edit_command(command), Some(expected));
+            assert_eq!(menu_command_target_label(command, None), MAIN_WINDOW_LABEL);
+            assert_eq!(
+                menu_command_target_label(command, Some("dialog-main-pageSize-12")),
+                "dialog-main-pageSize-12"
+            );
+        }
     }
 
     #[test]

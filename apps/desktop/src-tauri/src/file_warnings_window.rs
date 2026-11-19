@@ -273,7 +273,8 @@ fn place<R: Runtime>(
     _document: &tauri::WebviewWindow<R>,
     anchor: Anchor,
 ) -> Result<(), String> {
-    let monitors = window.available_monitors().map_err(|e| e.to_string())?;
+    let monitors =
+        super::monitor_query::available_monitors(window.app_handle()).map_err(|e| e.to_string())?;
     let monitor = monitors
         .iter()
         .find(|monitor| {
@@ -340,14 +341,13 @@ fn place<R: Runtime>(
     anchor: Anchor,
 ) -> Result<(), String> {
     let document_scale = document.scale_factor().map_err(|e| e.to_string())?;
-    let monitors: Vec<_> = window
-        .available_monitors()
+    let app = window.app_handle();
+    let monitors: Vec<_> = super::monitor_query::available_monitors(app)
         .map_err(|e| e.to_string())?
         .iter()
         .map(Monitor::from_native)
         .collect();
-    let primary = window
-        .primary_monitor()
+    let primary = super::monitor_query::primary_monitor(app)
         .ok()
         .flatten()
         .as_ref()

@@ -1,0 +1,165 @@
+name: Linux container smoke
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/linux-container-smoke.yml
+      - .github/workflows/linux-release.yml
+      - .github/workflows/linux-package-smoke/**
+      - apps/desktop/src-tauri/src/main.rs
+      - apps/desktop/src-tauri/tauri.conf.json
+      - apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu
+      - scripts/build-opsin-runtime.mjs
+      - scripts/desktop-tauri.mjs
+      - tools/release/verify-bundle-licenses.mjs
+      - tools/release/record-build.mjs
+  workflow_call:
+    inputs:
+      artifact_run_id:
+        description: Run ID for an artifact in this repository (omit for the same run)
+        type: string
+      artifact_name:
+        description: Package artifact name (defaults to linux-release-amd64 with a run ID)
+        type: string
+  workflow_dispatch:
+    inputs:
+      artifact_run_id:
+        description: Run ID of an existing Linux package artifact
+        type: string
+      artifact_name:
+        description: Artifact name (use with a run ID, defaults to linux-release-amd64)
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: linux-container-smoke-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    if: inputs.artifact_run_id == '' && inputs.artifact_name == ''
+    uses: ./.github/workflows/linux-release.yml
+    permissions:
+      # The reusable workflow declares an upload job with write permission. Its build job has
+      # read access and workflow_call accepts only a source ref, so this call cannot publish.
+      contents: write
+    with:
+      ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+  smoke:
+    needs: build
+    if: >-
+      always() && !cancelled() && (needs.build.result == 'success' ||
+      (needs.build.result == 'skipped' && (inputs.artifact_run_id != '' || inputs.artifact_name != '')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 40 # Distro mirror package installation took up to 19 minutes on 2026-11-18.
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [debian, fedora]
+        package: [appimage, deb]
+        backend: [x11, wayland]
+        native_wayland: ['0']
+        include:
+          - distro: debian
+            image: debian:sid
+          - distro: fedora
+            image: fedora:latest
+          - distro: debian
+            image: debian:sid
+            package: deb
+            backend: wayland
+            native_wayland: '1'
+          # The AppImage cannot run natively on Wayland: linuxdeploy-plugin-gtk's AppRun hook
+          # always exports GDK_BACKEND=x11 before ChemDraft starts, so it always uses XWayland.
+          # Native Wayland is covered by the .deb job.
+    container:
+      image: ${{ matrix.image }}
+      # strace needs ptrace and glycin's bubblewrap needs user namespaces.
+      options: --privileged
+    defaults:
+      run:
+        shell: bash
+    env:
+      DISTRO: ${{ matrix.distro }}
+      PACKAGE: ${{ matrix.package }}
+      BACKEND: ${{ matrix.backend }}
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.artifact_name || 'linux-release-amd64' }}
+          path: packages
+          github-token: ${{ inputs.artifact_run_id != '' && github.token || '' }}
+          run-id: ${{ inputs.artifact_run_id || github.run_id }}
+
+      - name: Install host graphics libraries and smoke tools
+        run: |
+          set -euo pipefail
+          mkdir -p smoke-logs
+          exec > >(tee smoke-logs/setup.log) 2>&1
+          shopt -s nullglob
+          if [[ "$PACKAGE" == deb ]]; then
+            bundles=("$GITHUB_WORKSPACE"/packages/*.deb)
+          else
+            bundles=("$GITHUB_WORKSPACE"/packages/*.AppImage)
+          fi
+          if [[ ${#bundles[@]} != 1 ]]; then
+            echo "::error::Expected exactly one $PACKAGE in the artifact"
+            exit 1
+          fi
+
+          if [[ "$DISTRO" == debian ]]; then
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              dbus-daemon passwd procps strace util-linux weston xwayland xvfb libgtk-3-0t64 libxdo3 \
+              libegl1 libegl-mesa0 libgl1 libgl1-mesa-dri libgpg-error0 \
+              libwayland-client0 libwayland-egl1 libwayland-cursor0 libwayland-server0
+            if [[ "$PACKAGE" == deb ]]; then
+              apt-get install -y --no-install-recommends "${bundles[0]}"
+            fi
+          else
+            dnf install -y /usr/bin/dbus-run-session procps-ng shadow-utils strace util-linux weston xorg-x11-server-Xwayland xorg-x11-server-Xvfb \
+              gtk3 libxdo mesa-dri-drivers mesa-libEGL libglvnd-egl libglvnd-glx libgpg-error \
+              libwayland-client libwayland-egl libwayland-cursor libwayland-server
+            if [[ "$PACKAGE" == deb ]]; then
+              # Fedora exercises the payload against Fedora libraries. Debian tests apt install.
+              dnf install -y /usr/bin/dpkg-deb webkit2gtk4.1
+              dpkg-deb -x "${bundles[0]}" /
+            fi
+          fi
+
+          if [[ "$PACKAGE" == appimage ]]; then
+            chmod a+x "${bundles[0]}"
+            echo "BUNDLE=${bundles[0]}" >> "$GITHUB_ENV"
+          else
+            echo 'BUNDLE=/usr/bin/chemdraft' >> "$GITHUB_ENV"
+          fi
+          useradd --create-home smoke
+          install -d -m 1777 /tmp/.X11-unix
+
+      # Xvfb catches missing libraries and baseline startup failures in both packages. Weston
+      # exercises the XWayland default and native Wayland launches of both packages with the opt-out.
+      # Both virtual displays exercise WebKit startup on newer host libraries without a GPU.
+      - name: Launch and watch the WebKit process
+        uses: ./.github/workflows/linux-package-smoke
+        with:
+          bundle: ${{ env.BUNDLE }}
+          package: ${{ matrix.package }}
+          backend: ${{ matrix.backend }}
+          native-wayland: ${{ matrix.native_wayland }}
+          logs: ${{ github.workspace }}/smoke-logs
+          container-user: smoke
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: linux-smoke-${{ matrix.distro }}-${{ matrix.package }}-${{ matrix.backend }}${{ matrix.native_wayland == '1' && '-native' || '' }}
+          path: smoke-logs/

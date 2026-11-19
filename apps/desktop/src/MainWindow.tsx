@@ -14208,17 +14208,29 @@ export function MainWindow({
   }, []);
 
   useEffect(() => {
+    const targetsCanvasClipboard = (event: Event, key: string) =>
+      !event.defaultPrevented &&
+      !isBlockedByModalDialog(event.target) &&
+      !shouldIgnoreShortcutTarget(event.target, key);
+
+    // WebKitGTK asks whether the page can handle native clipboard editing commands on a
+    // non-editable selection. Opt the canvas in so an Edit menu click raises the same clipboard
+    // events as the keyboard, even when the drawing selection is not a DOM text selection.
+    const beforeClipboard = (event: Event) => {
+      const key = event.type === "beforecopy" ? "c" : event.type === "beforecut" ? "x" : "v";
+      if (isDesktopRuntime() && targetsCanvasClipboard(event, key)) event.preventDefault();
+    };
+    const beforeClipboardEvents = (shortcutPlatform ?? detectDesktopShortcutPlatform()) === "linux"
+      ? ["beforecopy", "beforecut", "beforepaste"]
+      : [];
+
     const writeSelectionClipboardEvent = (
       event: ClipboardEvent,
       mode: "copy" | "cut"
     ): boolean => {
       // Behind an open modal the document is out of reach: native Edit > Cut/Copy (and the keys) then
       // belong to the dialog — selected dialog text copies natively — never to the canvas selection.
-      if (
-        event.defaultPrevented ||
-        isBlockedByModalDialog(event.target) ||
-        shouldIgnoreShortcutTarget(event.target, mode === "copy" ? "c" : "x")
-      ) {
+      if (!targetsCanvasClipboard(event, mode === "copy" ? "c" : "x")) {
         return false;
       }
 
@@ -14283,11 +14295,7 @@ export function MainWindow({
     const handlePaste = (event: ClipboardEvent) => {
       // A paste with a modal open is the dialog's (a text field in it pastes natively), never an
       // insertion into the document behind it.
-      if (
-        event.defaultPrevented ||
-        isBlockedByModalDialog(event.target) ||
-        shouldIgnoreShortcutTarget(event.target, "v")
-      ) {
+      if (!targetsCanvasClipboard(event, "v")) {
         return;
       }
 
@@ -14338,15 +14346,17 @@ export function MainWindow({
       });
     };
 
+    for (const type of beforeClipboardEvents) window.addEventListener(type, beforeClipboard);
     window.addEventListener("copy", handleCopy);
     window.addEventListener("cut", handleCut);
     window.addEventListener("paste", handlePaste);
     return () => {
+      for (const type of beforeClipboardEvents) window.removeEventListener(type, beforeClipboard);
       window.removeEventListener("copy", handleCopy);
       window.removeEventListener("cut", handleCut);
       window.removeEventListener("paste", handlePaste);
     };
-  }, [applyDetectedClipboardPayload, applySelectionClipboardPayload, applyTableClipboardResult, captureClipboardPasteAnchor, copySelectionToClipboard, deleteSelectionAfterClipboardCut, pasteClipboard]);
+  }, [applyDetectedClipboardPayload, applySelectionClipboardPayload, applyTableClipboardResult, captureClipboardPasteAnchor, copySelectionToClipboard, deleteSelectionAfterClipboardCut, pasteClipboard, shortcutPlatform]);
 
   const clearFreehandArtPreview = useCallback(() => {
     if (freehandArtPreviewFrameRef.current !== undefined) {

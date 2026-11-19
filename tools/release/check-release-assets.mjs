@@ -6,13 +6,13 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { expectedReleaseCommit, missingBuildFiles, releaseBuildFiles, verifyBuildAssets, verifyWindowsUpdateAssets } from "./release-assets.mjs";
+import { expectedReleaseCommit, missingBuildFiles, releaseBuildFiles, verifyBuildAssets, verifyWindowsUpdateAssets, writeReleaseChecksums } from "./release-assets.mjs";
 import { verifyDmgSourceCommit } from "./macos-dmg.mjs";
 import { verifyReleaseChecksums } from "./release-checksums.mjs";
 
 const ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
-export function checkReleaseAssets({ tag, version = tag?.replace(/^v/, ""), commit, assets, rootDir = ROOT, allowIncomplete = false, skipDmgProvenance = false }, {
+export function checkReleaseAssets({ tag, version = tag?.replace(/^v/, ""), commit, assets, rootDir = ROOT, allowIncomplete = false, skipDmgProvenance = false, checksumOutput }, {
   run = spawnSync, makeTemp = () => mkdtempSync(join(tmpdir(), "chemdraft-release-assets-")),
   cleanup = (path) => rmSync(path, { recursive: true, force: true }), platform = process.platform, log = console.log,
   updaterPublicKey
@@ -33,7 +33,6 @@ export function checkReleaseAssets({ tag, version = tag?.replace(/^v/, ""), comm
       const result = run("gh", ["release", "download", tag, "--dir", folder], { cwd: rootDir, encoding: "utf8" });
       if (result.status !== 0) throw new Error(`gh release download ${tag}: ${result.stderr || result.error?.message || "download failed"}`);
     }
-    const missing = missingBuildFiles(folder, version);
     const builds = verifyBuildAssets({ assets: folder, version, expectedCommit, allowIncomplete }, {
       updaterPublicKey,
       checkDmgCommit: platform === "darwin"
@@ -42,7 +41,9 @@ export function checkReleaseAssets({ tag, version = tag?.replace(/^v/, ""), comm
     });
     // Strict mode validates updater assets in verifyBuildAssets; preserve the partial-upload gate.
     if (allowIncomplete) verifyWindowsUpdateAssets({ assets: folder, version, allowIncomplete }, { updaterPublicKey });
-    verifyReleaseChecksums(folder);
+    const missing = missingBuildFiles(folder, version);
+    if (checksumOutput) writeReleaseChecksums(folder, checksumOutput);
+    else verifyReleaseChecksums(folder);
     if (missing.length) return { complete: false, missing };
     return { complete: true, commit: expectedCommit, builds };
   } finally { if (temporary) cleanup(folder); }
@@ -50,8 +51,8 @@ export function checkReleaseAssets({ tag, version = tag?.replace(/^v/, ""), comm
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    const { values } = parseArgs({ options: { tag: { type: "string" }, version: { type: "string" }, commit: { type: "string" }, assets: { type: "string" }, "allow-incomplete": { type: "boolean", default: false }, "skip-dmg-provenance": { type: "boolean", default: false } } });
-    const result = checkReleaseAssets({ ...values, allowIncomplete: values["allow-incomplete"], skipDmgProvenance: values["skip-dmg-provenance"] });
+    const { values } = parseArgs({ options: { tag: { type: "string" }, version: { type: "string" }, commit: { type: "string" }, assets: { type: "string" }, "allow-incomplete": { type: "boolean", default: false }, "skip-dmg-provenance": { type: "boolean", default: false }, "write-checksums": { type: "string" } } });
+    const result = checkReleaseAssets({ ...values, allowIncomplete: values["allow-incomplete"], skipDmgProvenance: values["skip-dmg-provenance"], checksumOutput: values["write-checksums"] });
     if (result.complete) console.log(`Release assets PASS: ${result.builds.join(", ")} at ${result.commit}`);
     else console.log(`Release assets INCOMPLETE (not a publishing pass): missing ${result.missing.join(", ")}`);
   } catch (error) { console.error(`Release assets: ${error.message}`); process.exitCode = 1; }
