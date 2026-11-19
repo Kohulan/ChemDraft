@@ -424,13 +424,19 @@ describe("native Window and full-screen menus", () => {
   it("excludes secondary windows from AppKit's list when they are created", () => {
     const run = source.split("pub fn run() {")[1]!.split("fn start_macos_primary(")[0]!;
     const primaryArm = run.split("let builder = if let Some(guard) = primary_lock {")[1]!.split("} else {")[0]!;
+    expect(run).toMatch(/#\[cfg\(target_os = "macos"\)\]\s*let builder = if let Some\(guard\) = primary_lock/);
+    const collectorArm = run.split(primaryArm)[1]!.split("};")[0]!;
+    expect(collectorArm).toContain("builder.enable_macos_default_menu(false)");
+    expect(collectorArm).not.toContain(".menu(");
     expect(primaryArm).toMatch(/\bbuilder\b[\s\S]*?\.menu\(create_app_menu\)/);
     expect(run).toMatch(/#\[cfg\(target_os = "macos"\)\]\s*let builder = builder\.manage\(FullscreenMenuItem::<tauri::Wry>\(Mutex::new\(None\)\)\);/);
     expect(run).toMatch(/#\[cfg\(target_os = "macos"\)\]\s*let builder = builder\.plugin\(\s*tauri::plugin::Builder::<tauri::Wry>::new\("windows-menu"\)\s*\.on_window_ready\(\|window\| \{[\s\S]*?if is_document_window\(window\.label\(\)\) \{\s*observe_document_fullscreen\(window\.app_handle\(\), native\);\s*\} else \{\s*native\.setExcludedFromWindowsMenu\(true\);[\s\S]*?\.build\(\),\s*\);/);
     expect(run).toMatch(/let builder = builder\.manage\(FullscreenMenuItem::<tauri::Wry>\(Mutex::new\(None\)\)\);[\s\S]*?let builder = builder\.plugin\([\s\S]*?new\("windows-menu"\)[\s\S]*?let app = builder\b[\s\S]*?\.build\(context\)[\s\S]*?app\.run\(/);
     const takeover = source.split("fn start_macos_primary(")[1]!.split("fn setup_primary_app(")[0]!;
     expect(takeover).toContain("install_app_menu(app, create_app_menu(app)?)?;");
-    expect(takeover).toContain("create_main_window(app)?;");
+    expect(takeover).toMatch(/create_main_window\(app\)\?;\s*setup_primary_app\(app\)/);
+    const sharedSetup = source.split("fn setup_primary_app(")[1]!.split("const DEVELOPMENT_UPDATES_MESSAGE")[0]!;
+    expect(sharedSetup).toMatch(/#\[cfg\(not\(target_os = "macos"\)\)\]\s*if let Err\(error\) = create_app_menu\(app\)\.and_then\(\|menu\| install_app_menu\(app, menu\)\)/);
     expect(takeover.indexOf("install_app_menu(app, create_app_menu(app)?)?;")).toBeLessThan(takeover.indexOf("create_main_window(app)?;"));
   });
 });
