@@ -53,7 +53,7 @@ function installMockTauri() {
         await native.hide();
         native.visible = false;
       }
-      if (command === "plugin:window|get_all_windows") return ["toolset-popover-core-main"];
+      if (command === "plugin:window|get_all_windows") return ["toolset-popover-core-main", "toolset-popover-core-art"];
       if (command === "plugin:window|is_visible") return native.visible;
       if (command === "route_toolset_command") native.routeCommand(args);
     }
@@ -98,7 +98,7 @@ describe.each(["macos", "windows"] as const)("keyboard routing with reordered po
       <PalettePopoverWindow toolsetId={art} kind="flyout" prewarm platform={platform} />
     </>));
     await vi.waitFor(() => expect(native.listeners.get(contentEvent)?.size).toBe(2));
-    await act(async () => { stop = installNativeFlyoutKeyboard(); });
+    await act(async () => { stop = installNativeFlyoutKeyboard(platform); });
     await vi.waitFor(() => expect(native.listeners.get(contentEvent)?.size).toBeGreaterThan(2));
     await vi.waitFor(() => expect(native.listeners.get(flyoutKeyEvent)?.size).toBe(2));
   });
@@ -143,8 +143,10 @@ describe.each(["macos", "windows"] as const)("keyboard routing with reordered po
     });
     expect(highlighted()).toBeUndefined();
     expect(native.routeCommand).not.toHaveBeenCalled();
-    await act(async () => finishShow(true));
-    expect(native.routeCommand).toHaveBeenCalledOnce();
+    await act(async () => {
+      finishShow(true);
+      await vi.waitFor(() => expect(native.routeCommand).toHaveBeenCalledOnce());
+    });
   });
 
   it("consumes navigation and replays keys in order when acceptance is delayed", async () => {
@@ -164,7 +166,7 @@ describe.each(["macos", "windows"] as const)("keyboard routing with reordered po
     stop = undefined;
     await pushMenu(main, "rings", { openedAt: 1, generation: 1 });
     expect(native.show).toHaveBeenCalledOnce();
-    await act(async () => { stop = installNativeFlyoutKeyboard(); });
+    await act(async () => { stop = installNativeFlyoutKeyboard(platform); });
     await pushMenu(main, "rings", { openedAt: 1, generation: 1 });
     expect(native.show).toHaveBeenCalledOnce();
     expect(await press("ArrowDown")).toBe(true);

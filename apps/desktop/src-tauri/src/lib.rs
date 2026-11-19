@@ -45,6 +45,7 @@ mod webview_context_menus_tests;
 mod window_drag;
 mod windows_activation_log;
 mod windows_clipboard;
+mod windows_session_end;
 
 use clipboard_formats::{
     validate_clipboard_items, ClipboardWriteItem, ClipboardWriteResult, ValidatedClipboardItem,
@@ -297,11 +298,19 @@ struct QuitFlow {
     position_drain_started: AtomicBool,
     /// Generation and visible-prompt flag, serialized with timeout/cancel decisions.
     prompt: Mutex<(u64, QuitPromptPhase)>,
+    next_request_id: AtomicU64,
+    flush: Mutex<Option<QuitFlush>>,
     /// Claiming a reply and delivering it on the main thread are separate transitions.
     #[cfg(any(target_os = "macos", test))]
     appkit_reply: Mutex<AppkitReplyState>,
     flush_grace: Duration,
     exit_watchdog: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct QuitFlush {
+    id: u64,
+    confirmed: bool,
 }
 
 impl QuitFlow {
@@ -317,6 +326,8 @@ impl QuitFlow {
         Self {
             requested: AtomicBool::new(false),
             prompt: Mutex::new((0, QuitPromptPhase::Idle)),
+            next_request_id: AtomicU64::new(1),
+            flush: Mutex::new(None),
             #[cfg(any(target_os = "macos", test))]
             appkit_reply: Mutex::new(AppkitReplyState::Idle),
             quitting,
@@ -326,6 +337,71 @@ impl QuitFlow {
             exit_watchdog,
         }
     }
+
+    /// Menu, window-close, and OS termination all share one committed flush.
+    fn begin_flush(&self, prompt_id: Option<u64>) -> (u64, bool) {
+        let mut flush = self.flush.lock().unwrap();
+        if let Some(existing) = *flush {
+            return (existing.id, false);
+        }
+        let id = prompt_id.unwrap_or_else(|| self.next_request_id.fetch_add(1, Ordering::SeqCst));
+        *flush = Some(QuitFlush {
+            id,
+            confirmed: false,
+        });
+        (id, true)
+    }
+
+    fn request_flush<E>(&self, emit: impl FnOnce(u64) -> Result<(), E>) -> Result<u64, E> {
+        let (request_id, started) = self.begin_flush(None);
+        if !started {
+            return Ok(request_id);
+        }
+        if let Err(error) = emit(request_id) {
+            let mut flush = self.flush.lock().unwrap();
+            if flush.is_some_and(|current| current.id == request_id) {
+                *flush = None;
+            }
+            return Err(error);
+        }
+        Ok(request_id)
+    }
+
+    fn confirm_flush(&self, request_id: u64) -> bool {
+        let mut flush = self.flush.lock().unwrap();
+        let Some(current) = flush.as_mut() else {
+            return false;
+        };
+        if current.id != request_id || current.confirmed {
+            return false;
+        }
+        current.confirmed = true;
+        true
+    }
+
+    #[cfg(any(windows, test))]
+    fn flush_confirmed(&self, request_id: u64) -> bool {
+        self.flush
+            .lock()
+            .unwrap()
+            .is_some_and(|flush| flush.id == request_id && flush.confirmed)
+    }
+}
+
+fn request_document_quit_flush<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> tauri::Result<Option<u64>> {
+    if app.get_webview_window(MAIN_WINDOW_LABEL).is_none() {
+        return Ok(None);
+    }
+    QUIT.request_flush(|request_id| {
+        app.emit_to(
+            MAIN_WINDOW_LABEL,
+            QUIT_FLUSH_REQUEST_EVENT,
+            serde_json::json!({ "phase": "committed", "requestId": request_id }),
+        )
+    })
+    .map(Some)
 }
 
 /// How a quit was decided. The forced-exit line names it, since only a confirmed flush means the
@@ -397,24 +473,15 @@ trait QuitHost: Clone + Send + 'static {
 impl<R: Runtime> QuitHost for tauri::AppHandle<R> {
     fn ask_document_to_flush(&self) -> bool {
         let app = self.clone();
-        // Queue native capture after applicationShouldTerminate returns TerminateLater.
+        // Queue the request after applicationShouldTerminate returns TerminateLater.
         self.dispatch_worker(move || {
-            let capture = app.clone();
+            let request = app.clone();
             if let Err(error) = app.run_on_main_thread(move || {
-                dismiss_then_flush_with(
-                    || capture_quit_window_frames(&capture),
-                    || {
-                        if capture.get_webview_window(MAIN_WINDOW_LABEL).is_none()
-                            || capture
-                                .emit_to(MAIN_WINDOW_LABEL, QUIT_FLUSH_REQUEST_EVENT, "committed")
-                                .is_err()
-                        {
-                            complete_quit_flush_with(&QUIT, &capture, QuitReason::NoDocument);
-                        }
-                    },
-                );
+                if !matches!(request_document_quit_flush(&request), Ok(Some(_))) {
+                    complete_quit_flush_with(&QUIT, &request, QuitReason::NoDocument);
+                }
             }) {
-                eprintln!("Could not dispatch final dialog capture: {error}");
+                eprintln!("Could not dispatch session flush: {error}");
                 // The independent grace still completes the quit.
             }
         });
@@ -422,6 +489,13 @@ impl<R: Runtime> QuitHost for tauri::AppHandle<R> {
     }
 
     fn drain_pending_position_writes(&self) {
+        // Capture and close native dialogs only after the renderer has written the session.
+        let app = self.clone();
+        if let Err(error) =
+            run_on_main_thread_blocking(self, move || capture_quit_window_frames(&app))
+        {
+            eprintln!("Could not dispatch final dialog capture: {error}");
+        }
         LAYOUT_POSITION_WRITER.drain();
         dialog_windows::drain_pending_position_writes();
     }
@@ -488,6 +562,9 @@ impl<R: Runtime> QuitHost for tauri::AppHandle<R> {
 /// the last moment. Ask the document window to flush first; it confirms through `quit_after_flush`,
 /// and a grace timer quits regardless if the webview can't answer.
 fn request_quit<R: Runtime>(app: &tauri::AppHandle<R>) {
+    if windows_session_end::in_progress() {
+        return;
+    }
     if ASK_TO_SAVE_ON_QUIT.load(Ordering::SeqCst) {
         // A repeated menu/Dock quit also reveals a prompt that was subsequently minimized.
         if prompt_waits_for_user(&QUIT) {
@@ -534,14 +611,7 @@ fn arm_quit_flush_grace<H: QuitHost>(flow: &'static QuitFlow, host: &H) {
     });
 }
 
-/// Native dismissal and renderer disposal both precede session serialization. Frame I/O does not.
-fn dismiss_then_flush_with(dismiss: impl FnOnce(), flush: impl FnOnce()) {
-    dismiss();
-    flush();
-}
-
-/// Read native frames on the main thread before renderer/session disposal. Every write is
-/// registered with the bounded drain before the renderer can confirm its session flush.
+/// Read native frames on the main thread and queue their writes for the bounded drain.
 fn capture_quit_window_frames<R: Runtime>(app: &tauri::AppHandle<R>) {
     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         let webview: &tauri::Webview<R> = window.as_ref();
@@ -554,7 +624,9 @@ fn capture_quit_window_frames<R: Runtime>(app: &tauri::AppHandle<R>) {
 
 /// Session confirmation has priority; only then join geometry workers. The deadline never joins.
 fn complete_quit_flush_with<H: QuitHost>(flow: &'static QuitFlow, host: &H, reason: QuitReason) {
-    if flow.position_drain_started.swap(true, Ordering::SeqCst) {
+    if windows_session_end::in_progress()
+        || flow.position_drain_started.swap(true, Ordering::SeqCst)
+    {
         return;
     }
     let drain_host = host.clone();
@@ -596,7 +668,7 @@ fn request_prompted_quit_with<H: QuitHost>(flow: &'static QuitFlow, host: &H) ->
     {
         return None;
     }
-    prompt.0 += 1;
+    prompt.0 = flow.next_request_id.fetch_add(1, Ordering::SeqCst);
     prompt.1 = QuitPromptPhase::AwaitingWindow;
     let request_id = prompt.0;
     drop(prompt);
@@ -644,6 +716,7 @@ fn resume_prompted_quit_with<H: QuitHost>(
             QuitPromptPhase::AwaitingWindow | QuitPromptPhase::Showing
         )
         || flow.quitting.load(Ordering::SeqCst)
+        || !flow.begin_flush(Some(request_id)).1
     {
         return false;
     }
@@ -657,6 +730,10 @@ fn resume_prompted_quit_with<H: QuitHost>(
 /// The session is written, or its grace has run out. Reply to a deferred AppKit termination;
 /// otherwise arm the exit watchdog here and nowhere else, then request event-loop exit.
 fn quit_now_with<H: QuitHost>(flow: &'static QuitFlow, host: &H, reason: QuitReason) {
+    if windows_session_end::in_progress() {
+        // WM_ENDSESSION is waiting for the document. Let Windows own teardown.
+        return;
+    }
     #[cfg(any(target_os = "macos", test))]
     {
         let mut reply = flow.appkit_reply.lock().unwrap();
@@ -707,15 +784,23 @@ fn quit_now_with<H: QuitHost>(flow: &'static QuitFlow, host: &H, reason: QuitRea
 /// held that thread the answer waited too, so the quit (and the exit watchdog) started only when the
 /// 3 s grace ran out. Deciding here posts the exit request or AppKit reply to the main thread.
 #[tauri::command]
-async fn quit_after_flush(app: tauri::AppHandle) {
-    complete_quit_flush_with(&QUIT, &app, QuitReason::FlushConfirmed);
+async fn quit_after_flush(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    request_id: u64,
+) -> Result<(), String> {
+    authorize_quit_window(window.label())?;
+    if QUIT.confirm_flush(request_id) {
+        complete_quit_flush_with(&QUIT, &app, QuitReason::FlushConfirmed);
+    }
+    Ok(())
 }
 
 fn authorize_quit_window(label: &str) -> Result<(), String> {
     if label == MAIN_WINDOW_LABEL {
         Ok(())
     } else {
-        Err("Only the document window can control quit prompts.".into())
+        Err("Only the document window can control quitting.".into())
     }
 }
 
@@ -829,12 +914,7 @@ async fn resume_quit_after_prompt(
     request_id: u64,
 ) -> Result<bool, String> {
     authorize_quit_window(window.label())?;
-    if !resume_prompted_quit_with(&QUIT, &app, request_id) {
-        return Ok(false);
-    }
-    // Accepted prompts use the same capture-before-session ordering as non-prompting quits.
-    run_on_main_thread_blocking(&window, move || capture_quit_window_frames(&app))?;
-    Ok(true)
+    Ok(resume_prompted_quit_with(&QUIT, &app, request_id))
 }
 
 #[tauri::command]
@@ -843,15 +923,7 @@ async fn confirm_prompted_quit(
     window: tauri::WebviewWindow,
     request_id: u64,
 ) -> Result<(), String> {
-    authorize_quit_window(window.label())?;
-    let prompt = QUIT.prompt.lock().unwrap();
-    let confirmed =
-        *prompt == (request_id, QuitPromptPhase::Flushing) && !QUIT.quitting.load(Ordering::SeqCst);
-    drop(prompt);
-    if confirmed {
-        complete_quit_flush_with(&QUIT, &app, QuitReason::FlushConfirmed);
-    }
-    Ok(())
+    quit_after_flush(app, window, request_id).await
 }
 
 const TOOLSET_LAYOUT_STATE_FILENAME: &str = "toolbar-state.json";
@@ -1438,6 +1510,12 @@ pub fn run() {
                 return;
             }
 
+            if window.label().starts_with("toolset-popover-")
+                && matches!(event, WindowEvent::Destroyed)
+            {
+                toolset_popover_command_sources().remove(window.label());
+            }
+
             // Owned windows may finish unminimizing after their owner's Resized event.
             if dialog_windows::is_dialog_label(window.label()) {
                 dialog_windows::on_window_event(window, event);
@@ -1732,7 +1810,10 @@ pub fn run() {
         match event {
             RunEvent::MainEventsCleared => canvas_context_menu::events_cleared(app),
             RunEvent::ExitRequested { code, api, .. } => {
-                if should_flush_exit_request(
+                if windows_session_end::in_progress() {
+                    // A queued app quit can arrive while WM_ENDSESSION is pumping WebView2.
+                    api.prevent_exit();
+                } else if should_flush_exit_request(
                     cfg!(target_os = "macos"),
                     code,
                     APP_QUITTING.load(Ordering::SeqCst),
@@ -1803,6 +1884,9 @@ fn start_macos_primary(
 }
 
 fn setup_primary_app(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    if let Err(error) = windows_session_end::install(app) {
+        eprintln!("Could not install ChemDraft session-end handler: {error}");
+    }
     panel_window::observe_document_pointer_release(app);
     file_warnings_window::observe_document(app)?;
     // Programmatic panel removal hides a reusable window, so it produces neither
@@ -3273,8 +3357,24 @@ fn close_toolset_window(
     Ok(state)
 }
 
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum ToolsetWindowQueryResult {
+    States(Vec<ToolsetWindowState>),
+    Foreground(Option<String>),
+}
+
 #[tauri::command]
-fn list_toolset_window_states(app: tauri::AppHandle) -> Result<Vec<ToolsetWindowState>, String> {
+fn list_toolset_window_states(
+    app: tauri::AppHandle,
+    foreground_only: Option<bool>,
+) -> Result<ToolsetWindowQueryResult, String> {
+    if foreground_only == Some(true) {
+        let target = app.clone();
+        return run_on_main_thread_blocking(&app, move || foreground_app_window_label(&target))
+            .map(ToolsetWindowQueryResult::Foreground);
+    }
+
     // Report the state of every palette window we've opened this session (from the directory),
     // rather than scanning the manifest. The JS reconciler only cares about which are open.
     let toolset_ids: Vec<String> = {
@@ -3285,7 +3385,53 @@ fn list_toolset_window_states(app: tauri::AppHandle) -> Result<Vec<ToolsetWindow
     toolset_ids
         .iter()
         .map(|toolset_id| toolset_state(&app, toolset_id))
-        .collect()
+        .collect::<Result<_, _>>()
+        .map(ToolsetWindowQueryResult::States)
+}
+
+#[cfg(target_os = "macos")]
+fn foreground_app_window_label(app: &tauri::AppHandle) -> Option<String> {
+    let marker = MainThreadMarker::new()?;
+    let application = objc2_app_kit::NSApplication::sharedApplication(marker);
+    if !application.isActive() {
+        return None;
+    }
+    let key_window = application.keyWindow()?;
+    let key_ptr = objc2::rc::Retained::as_ptr(&key_window).cast::<std::ffi::c_void>();
+    app.webview_windows()
+        .into_iter()
+        .find_map(|(label, window)| {
+            window
+                .ns_window()
+                .is_ok_and(|pointer| pointer.cast_const() == key_ptr)
+                .then_some(label)
+        })
+}
+
+#[cfg(windows)]
+fn foreground_app_window_label(app: &tauri::AppHandle) -> Option<String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetAncestor, GetForegroundWindow, GA_ROOT};
+
+    // Foreground is sampled once. The parent chain maps a WebView2 child back to its host
+    // without following the owner of a separate foreground window.
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.is_null() {
+        return None;
+    }
+    let root = unsafe { GetAncestor(foreground, GA_ROOT) };
+    app.webview_windows()
+        .into_iter()
+        .find_map(|(label, window)| {
+            window
+                .hwnd()
+                .is_ok_and(|hwnd| hwnd.0 == foreground || hwnd.0 == root)
+                .then_some(label)
+        })
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn foreground_app_window_label(_app: &tauri::AppHandle) -> Option<String> {
+    None
 }
 
 /// Read a file, distinguishing "not there yet" (`Ok(None)`) from a genuine read failure (`Err`).
@@ -6396,6 +6542,7 @@ fn close_toolset_popover(app: tauri::AppHandle, toolset_id: String) -> Result<()
     if let Some(window) = app.get_webview_window(&toolset_popover_window_label(&toolset_id)) {
         panel_window::end_for_hide(window.app_handle(), window.label());
         window.hide().map_err(|error| error.to_string())?;
+        toolset_popover_command_sources().remove(window.label());
     }
     Ok(())
 }
@@ -6554,6 +6701,38 @@ fn raise_among_owned_windows<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Re
     Ok(())
 }
 
+#[derive(Debug, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolsetFlyoutOpening {
+    toolset_id: String,
+    flyout_id: String,
+    opened_at: f64,
+    generation: Option<u64>,
+    bond_stereo_session_id: Option<String>,
+}
+
+enum ToolsetPopoverCommandSource {
+    TextColor,
+    Flyout(ToolsetFlyoutOpening),
+}
+
+fn toolset_popover_command_sources(
+) -> std::sync::MutexGuard<'static, HashMap<String, ToolsetPopoverCommandSource>> {
+    static SOURCES: std::sync::LazyLock<Mutex<HashMap<String, ToolsetPopoverCommandSource>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    SOURCES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn can_dispatch_flyout_command(
+    visible: bool,
+    current: &ToolsetFlyoutOpening,
+    requested: Option<&ToolsetFlyoutOpening>,
+) -> bool {
+    visible && requested == Some(current)
+}
+
 /// Reveal the calling palette popover once it has painted its content at the right size, and put it
 /// above the palette it belongs to. A mouse-opened E/Z popover must not become key/active.
 #[tauri::command]
@@ -6561,12 +6740,29 @@ fn show_toolset_popover_window(
     window: tauri::WebviewWindow,
     focus_mode: Option<ToolsetPopoverFocusMode>,
     kind: Option<String>,
+    flyout_opening: Option<ToolsetFlyoutOpening>,
 ) -> Result<bool, String> {
     if !window.label().starts_with("toolset-popover-") {
         return Err("Only toolset popovers may reveal popover content".into());
     }
     if utility_windows_suspended() {
         return Ok(false);
+    }
+    let source = match (kind.as_deref(), flyout_opening) {
+        (Some("flyout"), Some(opening))
+            if window.label() == toolset_popover_window_label(&opening.toolset_id) =>
+        {
+            Some(ToolsetPopoverCommandSource::Flyout(opening))
+        }
+        (_, Some(_)) => return Err("Flyout opening does not match its popover window".into()),
+        (Some("textColor"), None) => Some(ToolsetPopoverCommandSource::TextColor),
+        _ => None,
+    };
+    // The renderer has painted this content. Retire the previous opening even if reveal fails.
+    if let Some(source) = source {
+        toolset_popover_command_sources().insert(window.label().to_string(), source);
+    } else {
+        toolset_popover_command_sources().remove(window.label());
     }
     // The page owns the live content, including a prewarmed/reused Art window switching
     // between its colour picker and command flyouts. Titles are fixed native strings.
@@ -6948,6 +7144,7 @@ fn route_toolset_command(
     command_id: String,
     preserve_input_focus: Option<bool>,
     commit: Option<bool>,
+    flyout_opening: Option<ToolsetFlyoutOpening>,
 ) -> Result<(), String> {
     if utility_windows_suspended() && !commit.unwrap_or(false) {
         return Ok(());
@@ -6955,6 +7152,38 @@ fn route_toolset_command(
     let command_id = command_id.trim();
     if command_id.is_empty() {
         return Err("Toolset command id cannot be empty.".to_string());
+    }
+
+    if window.label().starts_with("toolset-popover-") {
+        if commit.unwrap_or(false) {
+            return Ok(());
+        }
+        let allowed = match toolset_popover_command_sources().get(window.label()) {
+            Some(ToolsetPopoverCommandSource::TextColor) => flyout_opening.is_none(),
+            Some(ToolsetPopoverCommandSource::Flyout(current)) => can_dispatch_flyout_command(
+                window.is_visible().unwrap_or(false),
+                current,
+                flyout_opening.as_ref(),
+            ),
+            None => false,
+        };
+        if !allowed {
+            return Ok(());
+        }
+    } else if flyout_opening.is_some() {
+        return Ok(());
+    }
+
+    if let Some(session_id) = flyout_opening.and_then(|opening| opening.bond_stereo_session_id) {
+        if matches!(command_id, "geometry" | "flipped" | "keep") {
+            app.emit_to(
+                MAIN_WINDOW_LABEL,
+                "chemdraft://bond-stereo-popover-action",
+                serde_json::json!({ "sessionId": session_id, "action": command_id }),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        return Ok(());
     }
 
     if commit.unwrap_or(false) {
@@ -12734,7 +12963,7 @@ mod tests {
             self.workers.lock().unwrap().remove(0)
         }
 
-        fn capture_dialogs(&self) {
+        fn emit_flush_request(&self) {
             self.take_worker()();
             let task = self.main.lock().unwrap().remove(0);
             task();
@@ -12747,15 +12976,7 @@ mod tests {
             self.dispatch_worker(move || {
                 let capture = host.clone();
                 host.main.lock().unwrap().push(Box::new(move || {
-                    dismiss_then_flush_with(
-                        || {
-                            (capture.capture_frames)();
-                            capture.app.calls.lock().unwrap().push("dialogs settled");
-                        },
-                        || {
-                            capture.app.ask_document_to_flush();
-                        },
-                    );
+                    capture.app.ask_document_to_flush();
                 }));
             });
             true
@@ -12776,6 +12997,8 @@ mod tests {
         }
 
         fn drain_pending_position_writes(&self) {
+            (self.capture_frames)();
+            self.app.calls.lock().unwrap().push("dialogs settled");
             self.app.calls.lock().unwrap().push("drain positions");
             (self.drain)();
         }
@@ -12933,8 +13156,9 @@ mod tests {
                 } else {
                     request_quit_with(flow, &host, false);
                 }
-                host.capture_dialogs(); // Includes the final frame, queued behind the stalled write.
+                host.emit_flush_request();
                 complete_quit_flush_with(flow, &host, QuitReason::FlushConfirmed);
+                // Final frame capture queues behind the stalled write before the drain joins it.
                 let drain = thread::spawn(host.take_worker());
                 drain_started.recv_timeout(Duration::from_secs(2)).unwrap();
                 assert!(flow.requested.load(Ordering::SeqCst));
@@ -13009,17 +13233,14 @@ mod tests {
     }
 
     #[test]
-    fn quit_deadline_precedes_capture_and_dialogs_settle_before_the_session_flush() {
+    fn quit_deadline_precedes_the_flush_and_dialogs_settle_after_confirmation() {
         let flow = test_quit_flow(QUIT_FLUSH_GRACE, EXIT_WATCHDOG);
         let host = ControlledQuitHost::new();
         assert!(request_appkit_quit_with(flow, &host)); // TerminateLater
         assert_eq!(host.app.calls(), ["timer armed"]);
         assert_eq!(host.timers.lock().unwrap()[0].0, QUIT_FLUSH_GRACE);
-        host.capture_dialogs();
-        assert_eq!(
-            host.app.calls(),
-            ["timer armed", "dialogs settled", "ask to flush"]
-        );
+        host.emit_flush_request();
+        assert_eq!(host.app.calls(), ["timer armed", "ask to flush"]);
         complete_quit_flush_with(flow, &host, QuitReason::FlushConfirmed);
         assert!(!flow.quitting.load(Ordering::SeqCst));
         host.take_worker()();
@@ -13027,8 +13248,8 @@ mod tests {
             host.app.calls(),
             [
                 "timer armed",
-                "dialogs settled",
                 "ask to flush",
+                "dialogs settled",
                 "drain positions",
                 "reply YES"
             ]
@@ -13063,7 +13284,7 @@ mod tests {
                 request_quit_with(flow, &host, false); // Windows document close
             }
             assert_eq!(host.app.calls(), ["timer armed"]);
-            host.capture_dialogs();
+            host.emit_flush_request();
             complete_quit_flush_with(flow, &host, QuitReason::FlushConfirmed);
             let drain = thread::spawn(host.take_worker());
             entering.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -13106,15 +13327,15 @@ mod tests {
             let flow = test_quit_flow(QUIT_FLUSH_GRACE, EXIT_WATCHDOG);
             let host = ControlledQuitHost::new();
             assert!(request_appkit_quit_with(flow, &host));
-            host.capture_dialogs();
+            host.emit_flush_request();
             complete_quit_flush_with(flow, &host, QuitReason::FlushConfirmed);
             host.take_worker()();
             assert_eq!(
                 host.app.calls(),
                 [
                     "timer armed",
-                    "dialogs settled",
                     "ask to flush",
+                    "dialogs settled",
                     "drain positions",
                     "reply YES"
                 ]
@@ -13145,7 +13366,7 @@ mod tests {
         assert!(!resume_prompted_quit_with(flow, &host, id));
         host.fire_timer(); // The superseded prompt's timer cannot decide the quit.
         assert!(!flow.quitting.load(Ordering::SeqCst));
-        host.capture_dialogs();
+        host.emit_flush_request();
         complete_quit_flush_with(flow, &host, QuitReason::FlushConfirmed);
         host.take_worker()();
         assert_eq!(host.app.calls().last(), Some(&"reply YES"));
@@ -13244,6 +13465,70 @@ mod tests {
         ] {
             assert!(!default.contains(permission));
         }
+    }
+
+    #[test]
+    fn session_end_joins_an_existing_flush_and_ignores_unmatched_acknowledgements() {
+        for prompted in [false, true] {
+            let flow = test_quit_flow(NEVER, NEVER);
+            let host = ControlledQuitHost::new();
+            let request_id = if prompted {
+                let id = request_prompted_quit_with(flow, &host).unwrap();
+                assert!(resume_prompted_quit_with(flow, &host, id));
+                id
+            } else {
+                let (id, started) = flow.begin_flush(None);
+                assert!(started);
+                id
+            };
+            assert_eq!(flow.begin_flush(None), (request_id, false));
+            assert!(!flow.confirm_flush(request_id + 1));
+            assert!(!flow.flush_confirmed(request_id));
+            assert!(flow.confirm_flush(request_id));
+            assert!(!flow.confirm_flush(request_id));
+            assert!(flow.flush_confirmed(request_id));
+            assert_eq!(flow.begin_flush(None), (request_id, false));
+        }
+    }
+
+    #[test]
+    fn session_end_requests_a_fresh_flush_after_an_emit_failure() {
+        let flow = test_quit_flow(NEVER, NEVER);
+        let mut failed_id = 0;
+        assert_eq!(
+            flow.request_flush(|id| {
+                failed_id = id;
+                Err("emit failed")
+            }),
+            Err("emit failed")
+        );
+        let mut emitted_id = 0;
+        let id = flow
+            .request_flush(|id| {
+                emitted_id = id;
+                Ok::<(), &str>(())
+            })
+            .unwrap();
+        assert_eq!(emitted_id, id);
+        assert_ne!(id, failed_id);
+        assert!(!flow.confirm_flush(failed_id));
+        assert!(flow.confirm_flush(id));
+    }
+
+    #[test]
+    fn session_end_watchdog_forces_exit_only_if_the_flush_stalls() {
+        let host = StuckAppHost::new(true);
+        let (disarm, watchdog) = mpsc::channel();
+        windows_session_end::watch_flush(watchdog, Duration::ZERO, &host);
+        assert_eq!(host.calls(), ["force exit"]);
+        assert_eq!(host.forced_reason(), Some(QuitReason::GraceExpired));
+        drop(disarm);
+
+        let host = StuckAppHost::new(true);
+        let (disarm, watchdog) = mpsc::channel();
+        drop(disarm);
+        windows_session_end::watch_flush(watchdog, Duration::ZERO, &host);
+        assert!(host.calls().is_empty());
     }
 
     #[test]
@@ -13653,10 +13938,9 @@ mod tests {
         // measured). Tauri runs an async command on a worker. Lines are compared trimmed, so a CRLF
         // checkout matches and this test's own quoted text never does.
         let lines: Vec<&str> = include_str!("lib.rs").lines().map(str::trim).collect();
-        let declared_async = lines.windows(2).any(|pair| {
-            pair[0] == "#[tauri::command]"
-                && pair[1] == "async fn quit_after_flush(app: tauri::AppHandle) {"
-        });
+        let declared_async = lines
+            .windows(2)
+            .any(|pair| pair[0] == "#[tauri::command]" && pair[1] == "async fn quit_after_flush(");
         assert!(declared_async);
         assert!(lines.windows(2).any(|pair| {
             pair[0] == "#[tauri::command]" && pair[1] == "async fn save_document_session("
@@ -14081,6 +14365,57 @@ mod tests {
             serde_json::from_str(include_str!("../capabilities/toolset-window-size.json")).unwrap();
         assert_eq!(capability["windows"], serde_json::json!(["toolset-*"]));
         assert_eq!(toolset_window_label("lab.quick"), "toolset-lab-quick");
+    }
+
+    #[test]
+    fn native_flyout_dispatch_requires_a_visible_matching_opening() {
+        let opening = || ToolsetFlyoutOpening {
+            toolset_id: "core.main".into(),
+            flyout_id: "rings".into(),
+            opened_at: 123.5,
+            generation: Some(2),
+            bond_stereo_session_id: None,
+        };
+        let current = opening();
+        assert!(can_dispatch_flyout_command(
+            true,
+            &current,
+            Some(&opening())
+        ));
+        assert!(!can_dispatch_flyout_command(
+            false,
+            &current,
+            Some(&opening())
+        ));
+        assert!(!can_dispatch_flyout_command(true, &current, None));
+        for stale in [
+            ToolsetFlyoutOpening {
+                toolset_id: "core.structure".into(),
+                ..opening()
+            },
+            ToolsetFlyoutOpening {
+                flyout_id: "bonds".into(),
+                ..opening()
+            },
+            ToolsetFlyoutOpening {
+                opened_at: 123.0,
+                ..opening()
+            },
+            ToolsetFlyoutOpening {
+                generation: Some(1),
+                ..opening()
+            },
+            ToolsetFlyoutOpening {
+                generation: None,
+                ..opening()
+            },
+            ToolsetFlyoutOpening {
+                bond_stereo_session_id: Some("session-1".into()),
+                ..opening()
+            },
+        ] {
+            assert!(!can_dispatch_flyout_command(true, &current, Some(&stale)));
+        }
     }
 
     #[test]

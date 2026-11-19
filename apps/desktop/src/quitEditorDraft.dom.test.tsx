@@ -8,12 +8,15 @@ import { DOM_COMMAND_EVENT } from "./window-manager";
 import { setNativePromptProvider, type NativePromptOptions } from "./nativePrompt";
 import { loadAskToSaveBeforeQuit, saveAskToSaveBeforeQuit } from "./quitSettings";
 import { MemoryStorage } from "./testSupport/memoryStorage";
+import type { DocumentSessionEnvelope } from "./documentSession";
+import { openChemDraftPayload } from "@chemdraft/cdx-compat";
+import { DialogCoordinator } from "./dialogs/DialogCoordinator";
 
 const native = vi.hoisted(() => ({
   promptQuit: undefined as undefined | ((id: number) => Promise<void>),
-  quitFlush: undefined as undefined | (() => Promise<void>),
+  quitFlush: undefined as undefined | ((phase: "committed", requestId: number) => Promise<void>),
   quit: vi.fn(),
-  saveSession: vi.fn()
+  saveSession: vi.fn<(session: DocumentSessionEnvelope) => Promise<void>>()
 }));
 vi.mock("./rdkitWasmLoader", () => ({ registerRdkitWasmLoader: vi.fn() }));
 vi.mock("@scena/react-ruler", () => ({ default: () => <canvas /> }));
@@ -93,7 +96,7 @@ describe.each(["macos", "windows"] as const)("quit with an open editor (%s)", pl
     // Preserve focus in the editor: a prior blur would hide the dirty-ref ordering bug.
     await act(async () => {
       if (loadAskToSaveBeforeQuit()) await native.promptQuit!(1);
-      else await native.quitFlush!();
+      else await native.quitFlush!("committed", 7);
     });
   }
 
@@ -155,6 +158,40 @@ describe.each(["macos", "windows"] as const)("quit with an open editor (%s)", pl
       expect(native.quit).toHaveBeenCalledOnce();
       expect(native.saveSession).toHaveBeenCalled();
     });
+    it("freezes the open editor during a committed quit write", async () => {
+      const value = kind === "label" ? "N" : "Updated conditions";
+      await openEditor(kind, value);
+      if (kind === "label") expect(snapshot().file.dirty).toBe(false);
+      const editor = (kind === "label" ? labelEditor() : textEditor())!;
+      const dispose = vi.spyOn(DialogCoordinator.prototype, "dispose")
+        .mockImplementationOnce(() => new Promise<void>(() => {}));
+      let finishWrite!: () => void;
+      native.saveSession.mockImplementationOnce(() => new Promise<void>(resolve => { finishWrite = resolve; }));
+      let flushing!: Promise<void>;
+      await act(async () => { flushing = native.quitFlush!("committed", 42); });
+      expect(native.saveSession).toHaveBeenCalledOnce();
+      expect(dispose).not.toHaveBeenCalled();
+      expect.soft(editor.readOnly).toBe(true);
+      await act(async () => {
+        const prototype = kind === "label" ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+        Object.getOwnPropertyDescriptor(prototype, "value")!.set!.call(editor, "O");
+        editor.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "O" }));
+      });
+      expect.soft(editor.value).toBe(value);
+      const session = native.saveSession.mock.lastCall![0];
+      expect(session.dirty).toBe(true);
+      expect(session.tabs?.[0]?.dirty).toBe(true);
+      const { document: saved } = openChemDraftPayload(session.contents);
+      if (kind === "label") {
+        expect(saved?.pages[0].objects.find(object => object.type === "molecule")?.atoms[0].element).toBe(value);
+      } else {
+        expect(saved?.pages[0].objects.find(object => object.type === "text")?.text).toBe(value);
+      }
+      expect(native.quit).not.toHaveBeenCalled();
+      await act(async () => { finishWrite(); await flushing; });
+      expect(native.quit).toHaveBeenCalledExactlyOnceWith(42);
+      expect(dispose).toHaveBeenCalledExactlyOnceWith("quit");
+    });
   });
   it("quits without a prompt for an empty atom-label draft", async () => {
     await openEditor("label", "N");
@@ -188,5 +225,24 @@ describe.each(["macos", "windows"] as const)("quit with an open editor (%s)", pl
     expect(pendingPrompt).toBeUndefined();
     expect(native.quit).toHaveBeenCalledOnce();
     expect(snapshot().file.dirty).toBe(false);
+  });
+  it("keeps the committed snapshot clean after saving the same atom label", async () => {
+    await openEditor("label", "N");
+    await command("document.save");
+    expect(labelEditor()).not.toBeNull();
+    await act(async () => { await native.quitFlush!("committed", 7); });
+    expect(native.saveSession.mock.lastCall![0].tabs?.[0]?.dirty).toBe(false);
+  });
+
+  it("leaves a rejected final session write unacknowledged", async () => {
+    saveAskToSaveBeforeQuit(false);
+    await openEditor("text", "Unsaved conditions");
+    const failure = new Error("Session disk write refused");
+    native.saveSession.mockRejectedValueOnce(failure);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await requestQuit();
+    expect(native.saveSession).toHaveBeenCalledExactlyOnceWith(expect.anything(), { strict: true });
+    expect(native.quit).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith("Could not save the session before quitting", failure);
   });
 });

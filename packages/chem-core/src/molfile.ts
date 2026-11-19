@@ -46,6 +46,7 @@ import { bridgeBondIndices } from "./bondGraph";
 import { elementSymbols, isMetalSymbol } from "./elements";
 import type { ChemDraftDocument, MoleculeAtom, MoleculeBond, MoleculeObject } from "./schemas";
 import { moleculeBracketWarningMessages } from "./brackets";
+import { isRepeatUnitBoundaryBond } from "./repeatUnitMembership";
 import { rGroupNumberFromLabel } from "./rGroups";
 
 export interface MolfileWriteOptions {
@@ -816,7 +817,7 @@ function molfileSgroups(
     groups.push({ type: "SRU", label: group.label, connectivity: group.connectivity ?? "eu",
       atomNumbers: [...members].map(id => atomNumbers.get(id)!).sort((a, b) => a - b),
       bondNumbers: writableBonds.flatMap((bond, index) =>
-        members.has(bond.fromAtomId) !== members.has(bond.toAtomId) ? [index + 1] : []) });
+        isRepeatUnitBoundaryBond(bond, members) ? [index + 1] : []) });
   }
   return groups;
 }

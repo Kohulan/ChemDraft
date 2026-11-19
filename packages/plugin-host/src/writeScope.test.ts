@@ -72,7 +72,7 @@ describe("direct-write invocation scope", () => {
     const document = createEmptyDocument({ now });
     const applyDocumentPatch = vi.fn();
     const getActiveDocument = vi.fn(async () => {
-      key = "switched";
+      if (getActiveDocument.mock.calls.length === 2) key = "switched";
       return document;
     });
     const host = new PluginHost({ getActiveDocument, getActiveDocumentKey: () => key, applyDocumentPatch });
@@ -86,7 +86,7 @@ describe("direct-write invocation scope", () => {
     } } });
     await expect(host.invokeCommand("plugin.switch.run", { writeSelection: snapshot(["missing-in-new-document"]) }))
       .rejects.toThrow("The document changed while the plugin was running; nothing was inserted.");
-    expect(getActiveDocument).toHaveBeenCalledTimes(timing === "before read" ? 0 : 1);
+    expect(getActiveDocument).toHaveBeenCalledTimes(timing === "before read" ? 1 : 2);
     expect(applyDocumentPatch).not.toHaveBeenCalled();
   });
 
@@ -146,6 +146,33 @@ describe("direct-write invocation scope", () => {
       'Patch would change object "b7", which is not selected');
     expect(f.applyDocumentPatch).not.toHaveBeenCalled();
     expect(f.document()).toBe(before);
+  });
+
+  it("refuses removing an explicitly referenced molecule from a surviving unselected SRU", async () => {
+    const other = { ...cachedMolecule(), id: "mol_other" };
+    const open = { ...bracket("open", "pair", "open"), containedObjectIds: ["mol_3", other.id] };
+    const f = fixture(["mol_3"], ctx => ctx.documents.applyPatch!({ reason: "Remove one of two members",
+      patch: { op: "removeObject", objectId: "mol_3" }
+    }), undefined, [cachedMolecule(), other, open, { ...open, id: "close", side: "close", x: 160, label: "n" }]);
+    const before = f.document();
+    await expect(f.host.invokeCommand("plugin.scope.run"))
+      .rejects.toThrow('Removing "mol_3" would change bracket "open", which is not selected');
+    expect(f.document()).toBe(before);
+  });
+
+  it("leaves an unrelated empty SRU alone when a plugin inserts and removes a temporary member", async () => {
+    const open = bracket("open", "pair", "open");
+    const close = { ...bracket("close", "pair", "close"), x: 160 };
+    const temporary = cachedMolecule();
+    const f = fixture([], ctx => ctx.documents.applyPatch!({ reason: "Insert then discard a draft", patch: {
+      op: "batch", patches: [
+        { op: "addObject", pageId: f.pageId, object: temporary },
+        { op: "removeObject", objectId: temporary.id }
+      ]
+    } }), undefined, [open, close]);
+    const objects = f.document().pages[0].objects;
+    await expect(f.host.invokeCommand("plugin.scope.run")).resolves.toMatchObject({ applied: true, objectIds: [] });
+    expect(f.document().pages[0].objects).toEqual(objects);
   });
 
   it.each(["selected", "inserted", "colliding insertion"] as const)("refuses pairId hijacking by a %s bracket atomically", async mode => {
@@ -297,11 +324,11 @@ describe("direct-write invocation scope", () => {
           }
         } }
       });
-      // Explicit Send scope avoids the separate invocation-start selection read.
+      // Send supplies the scope IDs. The invocation still reads its membership baseline.
       const before = f.document();
       await expect(host.invokeCommand("plugin.scope.run", { writeSelection: snapshot(["mol_1", "mol_7"]) }))
         .rejects.toThrow("no active document is available to check write scope");
-      expect(getActiveDocument).toHaveBeenCalledTimes(provider === "unavailable" ? 1 : 0);
+      expect(getActiveDocument).toHaveBeenCalledTimes(provider === "unavailable" ? 2 : 0);
       expect(f.applyDocumentPatch).not.toHaveBeenCalled();
       expect(f.document()).toBe(before);
     });
@@ -324,7 +351,7 @@ describe("direct-write invocation scope", () => {
       const before = f.document();
       await expect(host.invokeCommand("plugin.scope.run", { writeSelection: snapshot(["mol_1"]) }))
         .rejects.toThrow(`Plugin patch refused: no ${requestScope ? "request" : "active"} document is available to check reaction removal scope.`);
-      expect(getActiveDocument).toHaveBeenCalledTimes(!requestScope && provider === "unavailable" ? 1 : 0);
+      expect(getActiveDocument).toHaveBeenCalledTimes(provider === "unavailable" ? requestScope ? 1 : 2 : 0);
       expect(f.applyDocumentPatch).not.toHaveBeenCalled();
       expect(f.document()).toBe(before);
     });
@@ -357,7 +384,7 @@ describe("direct-write invocation scope", () => {
         expect(f.document()).toBe(before);
       }
       expect(getDocument).toHaveBeenCalledOnce();
-      expect(getActiveDocument).not.toHaveBeenCalled();
+      expect(getActiveDocument).toHaveBeenCalledOnce();
       expect(foreground.pages[0]!.objects).toEqual([]);
     });
 
@@ -375,7 +402,7 @@ describe("direct-write invocation scope", () => {
       await expect(host.invokeCommand("plugin.scope.run", { writeSelection: snapshot([]) }))
         .rejects.toThrow("no request document is available to check reaction removal scope");
       expect(getDocument).toHaveBeenCalledOnce();
-      expect(getActiveDocument).not.toHaveBeenCalled();
+      expect(getActiveDocument).toHaveBeenCalledOnce();
       expect(f.applyDocumentPatch).not.toHaveBeenCalled();
     });
   });

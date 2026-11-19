@@ -3,7 +3,8 @@ import {
   PluginAssistantToolResultSchema, PluginAssistantToolSessionRequestSchema, AssistantCapabilityPermissions,
   type PluginAssistantToolDescriptor, type PluginAssistantAPI, type PluginAssistantToolResult, type PluginManifest
 } from "@chemdraft/plugin-api";
-import { writePatchOps, type PluginHost, type PluginHostAssistant } from "@chemdraft/plugin-host";
+import { beginScopedRepeatUnitCleanup, finishScopedRepeatUnitCleanup, writePatchOps,
+  type PluginHost, type PluginHostAssistant, type ScopedRepeatUnitCleanup } from "@chemdraft/plugin-host";
 import { PluginWriteGateTimeoutError, type PluginWriteGate } from "../plugins/applyPluginDocumentPatch";
 import { runThumbnail } from "./runThumbnail";
 import type { AssistantToolContext, AssistantPageGrowth } from "./AssistantToolContext";
@@ -23,6 +24,7 @@ interface Request {
   pluginId: string;
   tabId: string;
   selection: string[];
+  repeatUnitCleanup: ScopedRepeatUnitCleanup | undefined;
   inserted: Set<string>;
   touched: Set<string>;
   transactions: AssistantTransactions;
@@ -79,10 +81,11 @@ export class AssistantToolsController implements PluginHostAssistant {
     const selection = [...this.options.getSelectionIds()];
     const transactions = this.options.transactions?.() ?? getAssistantTransactions();
     const getDocument = () => this.options.readDocument ? this.options.readDocument(tabId) : getAssistantHistoryPort().read(tabId);
+    const repeatUnitCleanup = beginScopedRepeatUnitCleanup(getDocument());
     const services = this.options.createContext({ plugin: manifest, tabId, getDocument });
     const requestId = transactions.beginAssistantTransaction({ pluginId: plugin.id, runId: crypto.randomUUID(), tabId,
       label: input.label ?? input.prompt, sendSelection: { objectIds: selection } });
-    const request: Request = { pluginId: plugin.id, tabId, selection, inserted: new Set(), touched: new Set(), transactions,
+    const request: Request = { pluginId: plugin.id, tabId, selection, repeatUnitCleanup, inserted: new Set(), touched: new Set(), transactions,
       ended: false, cancellations: new Map(), opening: 0,
       context: { ...services, plugin: manifest, tabId, getDocument, getSelectionAtSend: () => selection,
         chemistry: { ...services.chemistry, reactionProductAligner: async () => {
@@ -157,7 +160,9 @@ export class AssistantToolsController implements PluginHostAssistant {
           const growth = approvedGrowth?.growth;
           // Verify the plugin's scoped patch before the host-owned page translation. Consent
           // never widens the assistant's write scope to unrelated page content.
-          const patchDocument = (document: ChemDraftDocument) => applyPatch(document, patch);
+          const patchDocument = (document: ChemDraftDocument) => applyPatch(document, patch, {
+            preserveRepeatUnitBrackets: true, deferGroupCleanup: true
+          });
           const fitDocument = (document: ChemDraftDocument, patched: ChemDraftDocument) => {
             if (!growth) return patched;
             const plan = planDocumentPageFit(document, patched);
@@ -209,8 +214,14 @@ export class AssistantToolsController implements PluginHostAssistant {
                     op.op === "addAnnotation" ? [op.annotation.id] : "objectId" in op ? [op.objectId] : op.op === "setObjectOrder" ? op.objectIds : []);
                   // Recompute after a gesture or concurrent tool call, including every nearby
                   // mark. No await separates this scope/chemistry recheck and the history commit.
-                  const after = recheckNormalizedAssistantWrite(before, patchDocument(before), scope, verified, plannedDocument);
-                  request.transactions.writeAssistantTransaction(requestId, fitDocument(before, after), touched, after);
+                  const authored = recheckNormalizedAssistantWrite(before, patchDocument(before), scope, verified, plannedDocument);
+                  const fitted = fitDocument(before, authored);
+                  let cleanup: ReturnType<typeof finishScopedRepeatUnitCleanup>;
+                  request.transactions.writeAssistantTransaction(requestId, fitted, touched, authored, document => {
+                    cleanup = finishScopedRepeatUnitCleanup(request.repeatUnitCleanup, before, document, patch);
+                    return cleanup?.document;
+                  });
+                  cleanup?.record();
                   const existing = new Set(before.pages.flatMap(page => page.objects.map(object => object.id)));
                   for (const id of touched) { request.touched.add(id); if (!existing.has(id)) request.inserted.add(id); }
                   return { applied: true as const, objectIds: touched };
@@ -334,7 +345,7 @@ export class AssistantToolsController implements PluginHostAssistant {
             request.touched.add(id);
             if (!request.selection.includes(id)) request.inserted.add(id);
           }
-        });
+        }, request.repeatUnitCleanup);
       // A timeout responds immediately, but an abort-ignoring handler still occupies its slot.
       void work.then(() => { this.activeCalls--; }, () => { this.activeCalls--; });
       const result = structuredClone(await Promise.race([work, cancelled]));

@@ -26,6 +26,7 @@ export const TableCellEditor = forwardRef<TableCellEditorHandle, {
   cell: ActiveTableText;
   scale: number;
   platform?: ShortcutPlatform;
+  readOnly?: boolean;
   renderText(object: TextObject): ReactNode;
   resolveShortcut(event: KeyboardEvent): string | undefined;
   onFinish(value: TableRichText, action: TableEditingAction): void;
@@ -33,7 +34,7 @@ export const TableCellEditor = forwardRef<TableCellEditorHandle, {
   onHistoryCommand(direction: "undo" | "redo"): void;
   onError(message: string): void;
 }>(function TableCellEditor({ document: nativeDocument, table, cell, scale, platform = detectDesktopShortcutPlatform(),
-  renderText, resolveShortcut, onFinish, onDraftChange, onHistoryCommand, onError }, ref) {
+  readOnly = false, renderText, resolveShortcut, onFinish, onDraftChange, onHistoryCommand, onError }, ref) {
   const isNote = "kind" in cell;
   const row = isNote ? -1 : table.rows.findIndex(item => item.id === cell.rowId);
   const column = isNote ? -1 : table.columns.findIndex(item => item.id === cell.columnId);
@@ -70,7 +71,7 @@ export const TableCellEditor = forwardRef<TableCellEditorHandle, {
   };
 
   const finish = (action: TableEditingAction) => {
-    if (closed.current) return true;
+    if (readOnly || closed.current) return true;
     try {
       const value = isUnchanged() ? initialValue.current : draftRef.current;
       finishRef.current({ text: value.text, spans: value.spans }, action);
@@ -128,6 +129,7 @@ export const TableCellEditor = forwardRef<TableCellEditorHandle, {
     queueMicrotask(() => { editor.focus({ preventScroll: true }); editor.setSelectionRange(offset, offset); });
   };
   const applyCommand = (commandId: string) => {
+    if (readOnly) return false;
     if (window.document.activeElement === editorRef.current) recordSelection();
     if ((commandId === "edit.undo" || commandId === "edit.redo") && isUnchanged()) {
       // A freshly reached cell has no typing to undo. Undo the previous commit (formula first),
@@ -168,6 +170,7 @@ export const TableCellEditor = forwardRef<TableCellEditorHandle, {
     const value = beforeComposition.current ?? (isUnchanged() ? initialValue.current : draftRef.current);
     return { text: value.text, spans: value.spans };
   }, commit: (options?: { finishComposition?: boolean }) => {
+    if (readOnly) return true;
     if (composing.current) {
       if (!options?.finishComposition) return "composing";
       // A tab switch unmounts the textarea, so retain the last accepted input rather than
@@ -185,7 +188,8 @@ export const TableCellEditor = forwardRef<TableCellEditorHandle, {
   }, []);
   useEffect(() => {
     const outside = (event: globalThis.PointerEvent) => {
-      if (editorRef.current?.parentElement?.contains(event.target as Node)) return;
+      const editor = editorRef.current;
+      if (!editor || editor.readOnly || editor.parentElement?.contains(event.target as Node)) return;
       if (composing.current) {
         deferredOutside.current = true; event.preventDefault(); event.stopImmediatePropagation(); return;
       }
@@ -243,12 +247,13 @@ export const TableCellEditor = forwardRef<TableCellEditorHandle, {
       <div ref={previewRef} data-table-cell-preview>{renderText(draft)}</div>
     </div>
     <textarea ref={editorRef} aria-label={editorLabel} spellCheck={false} wrap="off"
-      maxLength={TABLE_LIMITS.maxCellCharacters} value={draft.text}
+      maxLength={TABLE_LIMITS.maxCellCharacters} value={draft.text} readOnly={readOnly}
       style={{ ...textCss, position: "absolute", inset: 0, width: "100%", height: "100%", boxSizing: "border-box",
         border: 0, outline: "1px solid var(--cd-accent, #1d7f68)", borderRadius: 0, resize: "none",
         padding: `${padding.y * scale}px ${padding.x * scale}px`, margin: 0,
         background: "transparent", color: "transparent", caretColor: textStyle.color, overflow: "auto" }}
       onChange={event => {
+        if (readOnly) return;
         recordSelection();
         changeText(event.currentTarget.value);
       }}
@@ -258,10 +263,12 @@ export const TableCellEditor = forwardRef<TableCellEditorHandle, {
           `translate(${-event.currentTarget.scrollLeft}px, ${-event.currentTarget.scrollTop}px)`;
       }}
       onCompositionStart={() => {
+        if (readOnly) return;
         beforeComposition.current = isUnchanged() ? initialValue.current : draftRef.current;
         composing.current = true;
       }}
       onCompositionEnd={() => {
+        if (readOnly) return;
         composing.current = false;
         const before = beforeComposition.current;
         beforeComposition.current = undefined;
@@ -274,7 +281,9 @@ export const TableCellEditor = forwardRef<TableCellEditorHandle, {
         }
       }}
       onPaste={event => {
-        event.preventDefault(); event.stopPropagation(); recordSelection();
+        event.preventDefault(); event.stopPropagation();
+        if (readOnly) return;
+        recordSelection();
         insert(event.clipboardData.getData("text/plain"));
       }}
       onBlur={() => {
@@ -284,6 +293,7 @@ export const TableCellEditor = forwardRef<TableCellEditorHandle, {
       onKeyDown={event => {
         event.stopPropagation();
         if (isBrowserReloadChord(event, platform) || event.key === "F5") { event.preventDefault(); return; }
+        if (readOnly) return;
         if (composing.current || event.nativeEvent.isComposing || event.keyCode === 229) return;
         recordSelection();
         const command = resolveShortcut(event.nativeEvent);

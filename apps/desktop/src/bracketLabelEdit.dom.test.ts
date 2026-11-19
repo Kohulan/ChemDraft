@@ -5,8 +5,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MainWindow } from "./MainWindow";
 import { applySingleBondToolAtPoint, createPhase4Document, insertNativeBracket, selectDocumentObjects } from "./documentWorkflow";
 import { toggleBracketRepeatUnit } from "./bracketCommands";
-import { DOM_COMMAND_EVENT } from "./window-manager";
+import { DOM_COMMAND_EVENT, type QuitFlushPhase } from "./window-manager";
 import { bracketLabelPlan } from "@chemdraft/layout-engine";
+import { applyPatch, type ChemDraftDocument } from "@chemdraft/chem-core";
 import { openChemDraftPayload } from "@chemdraft/cdx-compat";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 import { DOCUMENT_SESSION_SAVE_DEBOUNCE_MS, type DocumentSessionEnvelope } from "./documentSession";
@@ -16,7 +17,7 @@ import { saveAskToSaveBeforeQuit } from "./quitSettings";
 const native = vi.hoisted(() => ({
   writeFile: vi.fn<(path: string, contents: string) => Promise<void>>(),
   saveSession: vi.fn<(value: DocumentSessionEnvelope) => Promise<void>>(),
-  quitFlush: undefined as undefined | (() => Promise<void>),
+  quitFlush: undefined as undefined | ((phase: QuitFlushPhase, requestId: number) => Promise<void>),
   promptQuit: undefined as undefined | ((id: number) => Promise<void>),
   quit: vi.fn()
 }));
@@ -30,7 +31,7 @@ vi.mock("./window-manager", async original => ({
   loadToolsetLayoutState: async () => undefined,
   listToolsetWindowStates: async () => [],
   setToolbarsMenu: async () => {},
-  listenForQuitFlushRequest: async (handler: () => Promise<void>) => {
+  listenForQuitFlushRequest: async (handler: NonNullable<typeof native.quitFlush>) => {
     native.quitFlush = handler; return () => { native.quitFlush = undefined; };
   },
   listenForQuitPromptRequest: async (handler: (id: number) => Promise<void>) => {
@@ -101,6 +102,9 @@ describe.each(["macos", "windows"] as const)("repeat label editing (%s)", platfo
       { x: 100, y: 100 }, "round", { x: 260, y: 200 }));
     closingId = doc.pages[0].objects.find(object => object.type === "bracket" && object.side === "close")?.id ?? "";
     if (!selected) doc = selectDocumentObjects(doc, doc.pages[0].id, []);
+    await mountDocument(doc, tool);
+  }
+  async function mountDocument(doc: ChemDraftDocument, tool = "tool.select") {
     await act(async () => root.render(createElement(MainWindow, {
       initialDocument: doc, initialActiveToolCommandId: tool, initialCrosshairsVisible: false,
       initialRulersVisible: false, initialPaletteMode: "hidden", nativePalette: true, shortcutPlatform: platform
@@ -108,9 +112,9 @@ describe.each(["macos", "windows"] as const)("repeat label editing (%s)", platfo
     const rect = { left: 0, top: 0, x: 0, y: 0, width: 792, height: 612, right: 792, bottom: 612, toJSON: () => ({}) } as DOMRect;
     container.querySelectorAll(".page, .canvas-region").forEach(element => { element.getBoundingClientRect = () => rect; });
   }
-  async function mouse(target: Element, type: string, detail = 0, point = { x: 264, y: 199 }) {
+  async function mouse(target: Element, type: string, detail = 0, point = { x: 264, y: 199 }, modifiers: MouseEventInit = {}) {
     const event = new MouseEvent(type, { bubbles: true, cancelable: true, button: 0,
-      buttons: type.endsWith("down") ? 1 : 0, detail, clientX: point.x, clientY: point.y });
+      buttons: type.endsWith("down") ? 1 : 0, detail, clientX: point.x, clientY: point.y, ...modifiers });
     Object.defineProperties(event, { pointerId: { value: 8 }, pointerType: { value: "mouse" }, isPrimary: { value: true } });
     await act(async () => { target.dispatchEvent(event); });
     return event.defaultPrevented;
@@ -277,13 +281,46 @@ describe.each(["macos", "windows"] as const)("repeat label editing (%s)", platfo
     const field = editor();
     if (route === "session autosave") {
       await act(async () => { await vi.advanceTimersByTimeAsync(DOCUMENT_SESSION_SAVE_DEBOUNCE_MS + 100); });
-    } else await act(async () => { await native.quitFlush!(); });
+    } else {
+      await act(async () => { await native.quitFlush!("committed", 42); });
+      expect(native.quit).toHaveBeenCalledExactlyOnceWith(42);
+    }
     const session = native.saveSession.mock.calls.at(-1)![0];
     expect(savedLabel(session.contents)).toMatchObject({ label: "m" });
     expect(session.dirty).toBe(true);
     expect(snapshot().file.dirty).toBe(true);
     expect(editor()).toBe(field);
     expect(native.writeFile).not.toHaveBeenCalled();
+  });
+  it("freezes the open repeat label during a committed quit write", async () => {
+    await openSavedLabel();
+    await type("m");
+    let finishWrite!: () => void;
+    native.saveSession.mockImplementationOnce(() => new Promise<void>(resolve => { finishWrite = resolve; }));
+    let flushing!: Promise<void>;
+    await act(async () => { flushing = native.quitFlush!("committed", 42); });
+    const field = editor()!;
+    expect.soft(field.readOnly).toBe(true);
+    await type("Late typing");
+    expect.soft(field.value).toBe("m");
+    expect(savedLabel(native.saveSession.mock.calls.at(-1)![0].contents)).toMatchObject({ label: "m" });
+    expect(native.quit).not.toHaveBeenCalled();
+    await act(async () => { finishWrite(); await flushing; });
+    expect(native.quit).toHaveBeenCalledExactlyOnceWith(42);
+  });
+  it("flushes a repeat label as clean after typing back to the saved value", async () => {
+    await openSavedLabel();
+    await type("m");
+    await command("document.save");
+    await type("p");
+    expect(snapshot().file.dirty).toBe(true);
+    await type("m");
+    expect(editor()?.value).toBe("m");
+    await act(async () => { await native.quitFlush!("committed", 42); });
+    const session = native.saveSession.mock.lastCall![0];
+    expect(savedLabel(session.contents)).toMatchObject({ label: "m" });
+    expect(session.dirty).toBe(false);
+    expect(native.quit).toHaveBeenCalledExactlyOnceWith(42);
   });
   it.each(["close", "quit"])("prompts for an uncommitted draft on %s and Save writes it", async boundary => {
     await mount(true);
@@ -477,5 +514,97 @@ describe.each(["macos", "windows"] as const)("repeat label editing (%s)", platfo
     expect(container.querySelector("[data-status-message]")?.textContent).toBe('Marked 2 atoms as repeat unit "n"');
     await command("bracket.repeatUnit.toggle");
     expect(container.querySelector("[data-status-message]")?.textContent).toBe('Removed repeat unit "n"');
+  });
+
+  it("marks a canvas atom selection through the registered command and restores it with one undo", async () => {
+    const doc = applySingleBondToolAtPoint(createPhase4Document("Atom selection"), { x: 140, y: 140 });
+    const molecule = doc.pages[0].objects.find(object => object.type === "molecule")!;
+    await mountDocument(selectDocumentObjects(doc, doc.pages[0].id, []));
+    const selectAtom = async (index: number) => {
+      const target = container.querySelector(`.document-object[data-object-id="${molecule.id}"]`)!;
+      const atom = molecule.atoms[index];
+      const point = window.__CHEMDRAFT_AGENT__!.resolvePoint({ page: atom }).client;
+      for (const type of ["pointerdown", "pointerup"]) {
+        await mouse(target, type, 0, point, { shiftKey: true });
+      }
+    };
+    await selectAtom(0);
+    const before = snapshot();
+    expect(before.selectedNativeMoleculePart).toMatchObject({ kind: "atom", atomId: molecule.atoms[0].id });
+    await command("bracket.repeatUnit.toggle");
+    const marked = snapshot();
+    expect(marked.document.pages[0].objects.filter(object => object.type === "bracket")).toHaveLength(2);
+    expect(marked.selection.objectIds).toHaveLength(2);
+    expect(marked.selectedNativeMoleculePart).toBeUndefined();
+    expect(container.querySelector("[data-status-message]")?.textContent).toBe('Marked 1 atom as repeat unit "n"');
+    await command("edit.undo");
+    expect(snapshot().document).toEqual(before.document);
+    expect(snapshot().selectedNativeMoleculePart).toEqual(before.selectedNativeMoleculePart);
+    expect(container.querySelector("[data-status-message]")?.textContent).toBe("Undid Mark as Repeat Unit");
+    await command("edit.redo");
+    expect(snapshot().document).toEqual(marked.document);
+    expect(snapshot().selectedNativeMoleculePart).toBeUndefined();
+    await command("edit.undo");
+    await selectAtom(1);
+    const allAtoms = snapshot();
+    expect(allAtoms.selectedNativeMoleculePart).toMatchObject({ kind: "parts", atomIds: molecule.atoms.map(atom => atom.id) });
+    await command("bracket.repeatUnit.toggle");
+    expect(container.querySelector("[data-status-message]")?.textContent).toContain("no crossing bonds");
+    expect(snapshot().document).toEqual(allAtoms.document);
+    expect(snapshot().selectedNativeMoleculePart).toEqual(allAtoms.selectedNativeMoleculePart);
+  });
+
+  it.each(["keep", "enlarge"] as const)("asks before marking atoms at the page edge (%s) and undoes it together", async answer => {
+    const doc = applySingleBondToolAtPoint(createPhase4Document("Repeat at edge"), { x: 140, y: 140 });
+    const molecule = doc.pages[0].objects.find(object => object.type === "molecule")!;
+    const leftmost = molecule.atoms.reduce((left, atom) => atom.x < left.x ? atom : left);
+    const dx = 4 - leftmost.x;
+    const atEdge = applyPatch(doc, { op: "updateObject", objectId: molecule.id, changes: {
+      x: Math.max(0, molecule.x + dx), atoms: molecule.atoms.map(atom => ({ ...atom, x: atom.x + dx }))
+    } });
+    await mountDocument(selectDocumentObjects(atEdge, doc.pages[0].id, []));
+    const target = container.querySelector(`.document-object[data-object-id="${molecule.id}"]`)!;
+    const point = window.__CHEMDRAFT_AGENT__!.resolvePoint({ page: { x: 4, y: leftmost.y } }).client;
+    await mouse(target, "pointerdown", 0, point, { shiftKey: true });
+    await mouse(target, "pointerup", 0, point, { shiftKey: true });
+    const before = snapshot();
+    expect(before.selectedNativeMoleculePart).toMatchObject({ kind: "atom", atomId: leftmost.id });
+    await command("bracket.repeatUnit.toggle");
+    expect(pendingPrompt?.prompt.choices).toMatchObject([{ id: "enlarge" }, { id: "keep" }]);
+    expect(snapshot().document).toEqual(before.document);
+    await act(async () => pendingPrompt!.resolve(answer));
+    const after = snapshot();
+    const page = after.document.pages[0];
+    const bracket = page.objects.find(object => object.type === "bracket" && object.side === "open")!;
+    expect(after.selection.objectIds).toHaveLength(2);
+    expect(after.selectedNativeMoleculePart).toBeUndefined();
+    if (answer === "keep") {
+      expect(bracket.x).toBeLessThan(0);
+      expect(page.width).toBe(before.document.pages[0].width);
+    } else {
+      expect(bracket.x).toBeGreaterThanOrEqual(0);
+      expect(page.width).toBeGreaterThan(before.document.pages[0].width);
+    }
+    await command("edit.undo");
+    expect(snapshot().document).toEqual(before.document);
+    expect(snapshot().selectedNativeMoleculePart).toEqual(before.selectedNativeMoleculePart);
+    await command("edit.redo");
+    expect(snapshot().document).toEqual(after.document);
+  });
+
+  it("removes the bracket and label with the selected molecule on keyboard delete and undoes both", async () => {
+    const doc = applySingleBondToolAtPoint(createPhase4Document("Delete repeat"), { x: 140, y: 140 });
+    const molecule = doc.pages[0].objects.find(object => object.type === "molecule")!;
+    const marked = toggleBracketRepeatUnit(insertNativeBracket(doc, { x: 100, y: 100 }, "square", { x: 260, y: 200 }));
+    await mountDocument(selectDocumentObjects(marked, doc.pages[0].id, [molecule.id]));
+    const before = snapshot().document;
+    const canvas = container.querySelector<HTMLElement>(".canvas-region")!;
+    await act(async () => canvas.focus());
+    await key(platform === "macos" ? "Backspace" : "Delete");
+    expect(snapshot().document.pages[0].objects).toEqual([]);
+    expect(container.querySelector(".bracket-repeat-label")).toBeNull();
+    await command("edit.undo");
+    expect(snapshot().document).toEqual(before);
+    expect(container.querySelector(".bracket-repeat-label")?.textContent).toBe("n");
   });
 });

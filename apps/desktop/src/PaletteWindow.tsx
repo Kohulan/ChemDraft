@@ -142,7 +142,7 @@ export function PaletteWindow({
   initialRegistry?: DesktopToolsetRegistry;
   platform?: ShortcutPlatform;
 }) {
-  useEffect(() => installNativeFlyoutKeyboard(), []);
+  useEffect(() => installNativeFlyoutKeyboard(platform), [platform]);
   const dragRef = useRef<PaletteWindowDrag | null>(null);
   const shellRef = useRef<HTMLElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
