@@ -1541,17 +1541,33 @@ function bracketSourceState(object: BracketObject): string {
   return JSON.stringify([object.bracketUsage, object.repeatUnit, object.repeatCount, object.label]);
 }
 
-function bracketUsageAttribute(pair: BracketObject[]): string | undefined {
+function compareBracketGeometry(a: BracketObject, b: BracketObject): number {
+  return (a.x + a.width / 2) - (b.x + b.width / 2) || (a.y + a.height / 2) - (b.y + b.height / 2) ||
+    a.x - b.x || a.y - b.y || a.width - b.width || a.height - b.height;
+}
+
+function retainedBracketUsage(raw: unknown): string | undefined {
+  return isRecord(raw) ? preservedCurveAttributes(raw.attributes).BracketUsage : undefined;
+}
+
+function resolveSourceBracketUsage(
+  pair: readonly BracketObject[], groupUsage: string | undefined
+): { name?: string; conflictingGlyphUsages?: string[] } {
+  if (groupUsage !== undefined) return { name: groupUsage };
+  const names = [...pair].sort(compareBracketGeometry).flatMap(bracket => {
+    const name = retainedBracketUsage(bracket.compatibility?.unknown.cdxmlBracket);
+    return name ? [name] : [];
+  });
+  const [name, other] = names;
+  if (name && other && name.toLowerCase() !== other.toLowerCase()) return { conflictingGlyphUsages: names };
+  return { name };
+}
+
+function bracketUsageAttribute(pair: BracketObject[], sourceUsage: string | undefined): string | undefined {
   const usage = pair.find(object => object.bracketUsage && object.bracketUsage !== "generic")?.bracketUsage;
   if (usage === "multiple") return "MultipleGroup";
   if (usage === "sru" || pair.some(object => object.repeatUnit)) return "SRU";
-  if (usage === "unknown") {
-    const raw = pair[0].compatibility?.unknown.bracketedGroup;
-    const attrs = isRecord(raw) ? preservedCurveAttributes(raw.attributes) : {};
-    const graphic = pair.map(object => object.compatibility?.unknown.cdxmlBracket)
-      .find(raw => isRecord(raw) && isRecord(raw.attributes) && raw.attributes.BracketUsage);
-    return attrs.BracketUsage ?? (isRecord(graphic) ? preservedCurveAttributes(graphic.attributes).BracketUsage : undefined) ?? "Unspecified";
-  }
+  if (usage === "unknown") return sourceUsage ?? "Unspecified";
   return undefined;
 }
 
@@ -1588,7 +1604,8 @@ function exportBracketGlyph(object: BracketObject, context: VisibleExportContext
     if (index !== undefined) attrs.color = String(index);
   }
   if (object.compatibility?.unknown.cdxmlBracketState !== bracketSourceState(object)) {
-    const usage = bracketUsageAttribute([object]);
+    const sourceUsage = retainedBracketUsage(object.compatibility?.unknown.bracketedGroup) ?? (attrs.BracketUsage || undefined);
+    const usage = bracketUsageAttribute([object], sourceUsage);
     if (usage) attrs.BracketUsage = usage; else delete attrs.BracketUsage;
   }
   const children = isRecord(raw) ? preservedBracketChildren(raw.children) : "";
@@ -1609,6 +1626,13 @@ function exportBracketPairs(page: DocumentPage, context: VisibleExportContext, a
     const raw = closing.compatibility?.unknown.bracketedGroup;
     const attrs = isRecord(raw) ? preservedCurveAttributes(raw.attributes) : {};
     const unchanged = pair.every(object => object.compatibility?.unknown.cdxmlBracketState === bracketSourceState(object));
+    const sourceUsage = resolveSourceBracketUsage(pair, attrs.BracketUsage);
+    // Older imports may have assigned a known usage before recording otherwise unchanged glyphs.
+    const usageConflict = unchanged || pair.every(object => object.bracketUsage === "unknown")
+      ? sourceUsage.conflictingGlyphUsages : undefined;
+    const usage = usageConflict ? undefined : bracketUsageAttribute(pair, sourceUsage.name);
+    if (usageConflict) warnings.push({ code: "cdxml.bracket_usage_conflict", sourceObjectId: closing.id,
+      message: `Bracket ${closing.id} has conflicting glyph BracketUsage values ${usageConflict.map(name => `"${name}"`).join(" and ")}. Visible export leaves group usage unspecified.` });
     const membershipUnchanged = pair.every(object => object.compatibility?.unknown.cdxmlBracketMembership === JSON.stringify(object.containedObjectIds));
     const requestedMembers = [...new Set(pair.flatMap(object => object.containedObjectIds))];
     const membership = resolveRepeatUnitAtomMembership(pair, page.objects, { atomPosition: transformPointForObject });
@@ -1641,14 +1665,13 @@ function exportBracketPairs(page: DocumentPage, context: VisibleExportContext, a
       return [];
     });
     const exportedMembers = [...new Set([...preservedMembers, ...(membershipUnchanged && attrs.BracketedObjectIDs !== undefined ? [] : members)])];
-    if (bracketUsageAttribute(pair) && membership.unresolved) {
+    if ((usage || usageConflict) && membership.unresolved) {
       warnings.push({ code: "cdxml.bracket_membership_unresolved", sourceObjectId: closing.id,
         message: `Repeat unit membership for bracket ${closing.id} cannot be resolved: ${membership.reason}; visible ${context.format} writes only known members and retained source references, without guessing enclosure.` });
     }
     if (exportedMembers.length) attrs.BracketedObjectIDs = exportedMembers.join(" ");
     else delete attrs.BracketedObjectIDs;
     attrs.id = attrs.id ? allocator.sourceId(attrs.id) : allocator.next();
-    const usage = bracketUsageAttribute(pair);
     if (usage) attrs.BracketUsage = usage; else delete attrs.BracketUsage;
     const invalidRepeatCount = closing.compatibility?.unknown.cdxmlBracketInvalidRepeatCount;
     const hasInvalidRepeatCount = invalidRepeatCount !== undefined;
@@ -3562,16 +3585,13 @@ function importPageObjects(
       continue;
     }
     const brackets = pair as BracketObject[];
-    const compareGeometry = (a: BracketObject, b: BracketObject) =>
-      (a.x + a.width / 2) - (b.x + b.width / 2) || (a.y + a.height / 2) - (b.y + b.height / 2) ||
-      a.x - b.x || a.y - b.y || a.width - b.width || a.height - b.height;
-    if (compareGeometry(brackets[0], brackets[1]) === 0) {
+    if (compareBracketGeometry(brackets[0], brackets[1]) === 0) {
       warnings.push({ code: "cdxml.bracket_sides_ambiguous",
         message: `Bracket group ${group.attributes.id ?? "(unknown)"} has indistinguishable glyph geometry; imported sides are retained and the group, including its label, remains compatibility data.` });
       objects.push(importUnknownCompatibilityObject(group, pageIndex, objectIndex++, sourceFormat));
       continue;
     }
-    brackets.sort(compareGeometry);
+    brackets.sort(compareBracketGeometry);
     // Only a point-like (or missing/malformed) source box needs the pair-position heuristic.
     brackets.forEach((bracket, index) => {
       if (!importedBracketFacing(bracket)) bracket.side = index === 0 ? "open" : "close";
@@ -3583,10 +3603,12 @@ function importPageObjects(
       brackets[0].side = "open";
       brackets[1].side = "close";
     }
-    const usageName = group.attributes.BracketUsage ?? brackets.map(bracket => bracket.compatibility?.unknown.cdxmlBracket)
-      .flatMap(raw => isRecord(raw) ? [preservedCurveAttributes(raw.attributes).BracketUsage] : []).find(Boolean);
-    let bracketUsage: BracketObject["bracketUsage"] = usageName === "SRU" ? "sru" : usageName === "MultipleGroup" ? "multiple" : usageName === undefined ? "generic" : "unknown";
-    if (bracketUsage === "unknown") warnings.push({ code: "cdxml.bracket_usage_unknown",
+    const { name: usageName, conflictingGlyphUsages } = resolveSourceBracketUsage(brackets, group.attributes.BracketUsage);
+    let bracketUsage: BracketObject["bracketUsage"] = conflictingGlyphUsages ? "unknown" :
+      usageName === "SRU" ? "sru" : usageName === "MultipleGroup" ? "multiple" : usageName === undefined ? "generic" : "unknown";
+    if (conflictingGlyphUsages) warnings.push({ code: "cdxml.bracket_usage_conflict", sourceObjectId: group.attributes.id,
+      message: `${sourceFormat} bracket group ${group.attributes.id ?? "(unknown)"} has conflicting glyph BracketUsage values ${conflictingGlyphUsages.map(name => `"${name}"`).join(" and ")}. Group usage is unknown.` });
+    else if (bracketUsage === "unknown") warnings.push({ code: "cdxml.bracket_usage_unknown",
       message: `${sourceFormat} bracket group ${group.attributes.id ?? "(unknown)"} has unknown BracketUsage "${usageName}"; no multiplier is interpreted.` });
     const additional = Object.keys(group.attributes).filter(key => !["id", "BracketUsage", "BracketedObjectIDs", "SRULabel", "RepeatCount"].includes(key));
     if (additional.length || group.children.some(child => { const element = elementView(child); return element && element.name !== "bracketattachment"; })) {
