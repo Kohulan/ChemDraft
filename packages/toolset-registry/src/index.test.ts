@@ -9,6 +9,7 @@ import {
   createToolbarsMenuModel,
   createToolsetToggleCommandDefinitions,
   createToolsetToggleCommandId,
+  isToolsetLayoutSessionFallback,
   isValidToolsetCommandId,
   normalizeToolsetItem,
   parseToolsetLayoutState,
@@ -88,10 +89,9 @@ describe("toolset registry", () => {
       onWarning: warning => warnings.push(warning)
     });
     expect(toolbar.groups[0].items.map(item => item.commandId)).toEqual(["edit.undo", "edit.redo", "tool.select", "tool.bond"]);
-    expect(toolbar.groups[0].items[0].submenu).toBeNull();
+    expect(normalizeToolsetItem(toolbar.groups[0].items[0]).submenu).toBeNull();
     expect(toolbar.groups[0].items[1].submenu?.items).toEqual([{ commandId: "edit.undo", label: "Undo" }]);
-    expect(warnings).toHaveLength(5);
-    expect(warnings.every(warning => warning.includes("invalid command ID"))).toBe(true);
+    expect(warnings.filter(warning => /invalid command ID|Command IDs must/.test(warning))).toHaveLength(5);
   });
 
   it("drops only a malformed optional commandId when an addition still has a valid primary and submenu", () => {
@@ -113,6 +113,132 @@ describe("toolset registry", () => {
       "Toolbar customization dropped an invalid command ID field at toolsetOverrides.0.itemAdditions.0.item.commandId.",
       "Toolbar customization dropped an invalid command ID field at toolsetOverrides.0.itemAdditions.1.item.commandId."
     ]);
+  });
+
+  it("treats itemAdditions as a group ID when the issue is in itemOrder", () => {
+    const sibling = { toolsetId: pluginToolset.id, visible: true };
+    const addition = { groupId: "itemAdditions", item: { commandId: "edit.redo" } };
+    const state = { version: 1, toolsetOverrides: [{
+      toolsetId: fixtureToolset.id,
+      itemOrder: { itemAdditions: [null, "edit.undo"] },
+      itemAdditions: [addition]
+    }, sibling] };
+    const warnings: string[] = [];
+    const recovered = parseToolsetLayoutState(state, warning => warnings.push(warning));
+
+    expect(ToolsetLayoutStateSchema.parse(recovered).toolsetOverrides).toEqual([{
+      toolsetId: fixtureToolset.id, itemOrder: { itemAdditions: ["edit.undo"] }, itemAdditions: [addition]
+    }, sibling]);
+    expect(warnings).toEqual([expect.stringContaining("toolsetOverrides.0.itemOrder.itemAdditions.0")]);
+  });
+
+  it("keeps an explicitly identified spacer after removing both malformed action fields", () => {
+    const spacer = {
+      groupId: "fixture.tools", index: 1,
+      item: { kind: "spacer", id: "custom.space", placement: { row: 1, column: 2 } }
+    };
+    const sibling = { groupId: spacer.groupId, index: 3, item: { commandId: "edit.undo" } };
+    const override = {
+      toolsetId: fixtureToolset.id,
+      itemOrder: { [spacer.groupId]: ["custom.space", "edit.undo"] }
+    };
+    const state = { version: 1, toolsetOverrides: [{
+      ...override,
+      itemAdditions: [{ ...spacer, item: {
+        ...spacer.item, commandId: "bad id", primary: { type: "command", commandId: "bad primary id" }
+      } }, sibling]
+    }] };
+    const warnings: string[] = [];
+    const recovered = parseToolsetLayoutState(state, warning => warnings.push(warning));
+
+    expect(ToolsetLayoutStateSchema.parse(recovered).toolsetOverrides).toEqual([{
+      ...override, itemAdditions: [spacer, sibling]
+    }]);
+    expect(warnings).toEqual([
+      expect.stringContaining("toolsetOverrides.0.itemAdditions.0.item.commandId"),
+      expect.stringContaining("toolsetOverrides.0.itemAdditions.0.item.primary")
+    ]);
+  });
+
+  it("drops only the override that throws during validation", () => {
+    const sibling = { toolsetId: pluginToolset.id, visible: true };
+    const broken = {
+      toolsetId: fixtureToolset.id,
+      get itemAdditions() { throw new Error("Unreadable override"); }
+    };
+    const warnings: string[] = [];
+    const recovered = parseToolsetLayoutState({
+      version: 1, toolsetOverrides: [broken, sibling], toolsetOrder: [sibling.toolsetId]
+    }, warning => {
+      warnings.push(warning);
+      throw new Error("Warning listener failed");
+    });
+
+    expect(ToolsetLayoutStateSchema.parse(recovered)).toEqual({
+      version: 1, toolsetOverrides: [sibling], toolsetOrder: [sibling.toolsetId], userToolsets: []
+    });
+    expect(warnings).toEqual([expect.stringContaining("toolset override at toolsetOverrides.0")]);
+    expect(isToolsetLayoutSessionFallback(recovered)).toBe(false);
+  });
+
+  type TestLayoutPath = (string | number)[];
+  const firstOverride: TestLayoutPath = ["toolsetOverrides", 0];
+  const firstAddition: TestLayoutPath = [...firstOverride, "itemAdditions", 0];
+  const addedItem: TestLayoutPath = [...firstAddition, "item"];
+  const submenuEntry: TestLayoutPath = [...addedItem, "submenu", "items", 0];
+  const firstItemOverride: TestLayoutPath = [...firstOverride, "itemOverrides", 0];
+  const orderEntry: TestLayoutPath = [...firstOverride, "itemOrder", "itemAdditions", 0];
+  const corruptions: [string, TestLayoutPath, unknown, TestLayoutPath][] = [
+    ["override title", [...firstOverride, "title"], 10, [...firstOverride, "title"]],
+    ["item order entry", orderEntry, false, orderEntry],
+    ["addition index", [...firstAddition, "index"], -1, [...firstAddition, "index"]],
+    ["addition group", [...firstAddition, "groupId"], {}, firstAddition],
+    ["item layout field", [...addedItem, "layout", "rowSpan"], 0, [...addedItem, "layout", "rowSpan"]],
+    ["item command", [...addedItem, "commandId"], "bad id", [...addedItem, "commandId"]],
+    ["primary action command", [...addedItem, "primary", "commandId"], null, [...addedItem, "primary"]],
+    ["submenu command", [...submenuEntry, "commandId"], [], submenuEntry],
+    ["item override command", [...firstItemOverride, "commandId"], "", firstItemOverride],
+    ["required override ID", [...firstOverride, "toolsetId"], null, firstOverride],
+    ["top-level order entry", ["toolsetOrder", 0], {}, ["toolsetOrder", 0]]
+  ];
+
+  it.each(corruptions)("validates after a single corrupted %s and preserves all siblings", (_, path, badValue, removedPath) => {
+    const layout = ToolsetLayoutStateSchema.parse({
+      version: 1,
+      toolsetOrder: [fixtureToolset.id, pluginToolset.id, "user.custom"],
+      userToolsets: [{ ...fixtureToolset, id: "user.custom", source: "user" }],
+      toolsetOverrides: [{
+        toolsetId: fixtureToolset.id,
+        title: "My toolbar",
+        visible: false,
+        itemOrder: { itemAdditions: ["edit.undo", "tool.select"], primary: ["tool.bond"] },
+        itemAdditions: [
+          { groupId: "fixture.tools", index: 1, item: {
+            commandId: "edit.undo", primary: { type: "command", commandId: "edit.undo" },
+            layout: { rowSpan: 2, colSpan: 1 },
+            submenu: { type: "command-grid", items: [{ commandId: "edit.undo" }, { commandId: "edit.redo" }] }
+          } },
+          { groupId: "fixture.tools", index: 2, item: { id: "custom.space", kind: "spacer" } }
+        ],
+        itemOverrides: [{ commandId: "tool.text", hidden: true }, { commandId: "tool.bond", layout: { rowSpan: 2 } }]
+      }, { toolsetId: pluginToolset.id, visible: true }]
+    });
+    const parentAt = (state: unknown, path: TestLayoutPath) =>
+      path.slice(0, -1).reduce((parent, key) => (parent as Record<PropertyKey, unknown>)[key], state) as Record<PropertyKey, unknown>;
+    const corrupted = structuredClone(layout);
+    parentAt(corrupted, path)[path.at(-1)!] = badValue;
+    const expected = structuredClone(layout);
+    const parent = parentAt(expected, removedPath);
+    const key = removedPath.at(-1)!;
+    if (Array.isArray(parent)) parent.splice(Number(key), 1);
+    else delete parent[key];
+    const warnings: string[] = [];
+    const recovered = parseToolsetLayoutState(corrupted, warning => warnings.push(warning));
+
+    expect(ToolsetLayoutStateSchema.safeParse(corrupted).success).toBe(false);
+    expect(ToolsetLayoutStateSchema.parse(recovered)).toEqual(expected);
+    expect(parentAt(corrupted, path)[path.at(-1)!]).toEqual(badValue);
+    expect(warnings).toEqual([expect.stringContaining(removedPath.join("."))]);
   });
 
   it("validates typed toolset definitions", () => {

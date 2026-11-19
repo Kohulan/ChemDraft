@@ -1,4 +1,10 @@
-import { ToolsetRegistry, applyToolsetLayoutState, isValidToolsetCommandId } from "@chemdraft/toolset-registry";
+import {
+  TOOLSET_LAYOUT_SESSION_FALLBACK_WARNING,
+  ToolsetRegistry,
+  applyToolsetLayoutState,
+  isToolsetLayoutSessionFallback,
+  isValidToolsetCommandId
+} from "@chemdraft/toolset-registry";
 import type { CommandDefinition } from "@chemdraft/plugin-host";
 import { allPaletteCommands, type CommandSpec } from "../commands";
 import { desktopToolsets, desktopToolsetRegistry, migrateBracketToolbarOrder, type DesktopToolsetDefinition, type DesktopToolsetRegistry } from "../toolsets";
@@ -33,6 +39,7 @@ export function createToolbarCatalog(): ToolbarCatalog {
   let baseCommands = allPaletteCommands(desktopToolsetRegistry);
   let additionalCommandIds = SHELL_COMMAND_IDS;
   let layoutState: unknown;
+  let savedLayoutUnavailable = false;
   let warningList: readonly string[] = [];
   const listeners = new Set<() => void>();
 
@@ -90,6 +97,10 @@ export function createToolbarCatalog(): ToolbarCatalog {
       rebuild();
     },
     setLayoutState(state) {
+      // MainWindow only enables saving after the catalog accepts the loaded layout. Keep that
+      // gate closed for session defaults and refuse later edits that would replace the saved file.
+      savedLayoutUnavailable ||= isToolsetLayoutSessionFallback(state);
+      if (savedLayoutUnavailable) throw new Error(TOOLSET_LAYOUT_SESSION_FALLBACK_WARNING);
       layoutState = state;
       rebuild();
     },
