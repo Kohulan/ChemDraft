@@ -281,11 +281,12 @@ pub fn renderer_consumed(app: &AppHandle, receipt: RendererReceipt, opened: bool
 pub fn renderer_exiting(app: &AppHandle) {
     let batches = std::mem::take(&mut app.state::<Mutex<RendererOpens>>().lock().unwrap().batches);
     for batch in batches.into_values() {
-        // Disconnect remote waiters so they can take over. Only local requests need an alert here.
+        // Disconnect remote waiters so they can take over. Log unconfirmed local requests.
         if let Reply::Takeover(launch) = batch.reply {
-            show_launch_error(
+            report_launch_error(
                 &launch,
                 "ChemDraft quit before its document window confirmed the open.",
+                LaunchErrorPresentation::LogOnly,
             );
         }
     }
@@ -436,6 +437,20 @@ impl SecondaryLaunch {
     // AppKit termination can bypass ExitRequested. Warn synchronously before allowing it,
     // including a request in flight and opens collected while waiting for its reply.
     pub fn interrupt_for_exit(&self) -> bool {
+        self.interrupt_for_exit_with(show_launch_error)
+    }
+
+    fn handle_exit(
+        &self,
+        report: impl FnOnce(&LaunchRequest, &str, LaunchErrorPresentation),
+    ) -> bool {
+        // Tao holds its event callback mutex during Exit. A modal can reenter it via openURLs.
+        self.interrupt_for_exit_with(|launch, error| {
+            report(launch, error, LaunchErrorPresentation::LogOnly);
+        })
+    }
+
+    fn interrupt_for_exit_with(&self, report: impl FnOnce(&LaunchRequest, &str)) -> bool {
         let mut state = self.state.lock().unwrap();
         if state.promoted {
             return false;
@@ -446,7 +461,7 @@ impl SecondaryLaunch {
         if launch.urls.iter().any(|url| url.scheme() == "file")
             || launch.argv.iter().skip(1).any(|arg| !arg.starts_with('-'))
         {
-            show_launch_error(
+            report(
                 &launch,
                 "ChemDraft quit before it could confirm the document open.",
             );
@@ -462,7 +477,7 @@ impl SecondaryLaunch {
         start_primary: StartPrimary,
     ) -> bool {
         if matches!(event, RunEvent::Exit) {
-            return self.interrupt_for_exit();
+            return self.handle_exit(report_launch_error);
         }
         let mut state = self.state.lock().unwrap();
         if state.promoted {
@@ -657,8 +672,20 @@ fn launch_error_message(launch: &LaunchRequest, error: &str) -> String {
 }
 
 pub fn show_launch_error(launch: &LaunchRequest, error: &str) {
+    report_launch_error(launch, error, LaunchErrorPresentation::Alert);
+}
+
+enum LaunchErrorPresentation {
+    LogOnly,
+    Alert,
+}
+
+fn report_launch_error(launch: &LaunchRequest, error: &str, presentation: LaunchErrorPresentation) {
     let message = launch_error_message(launch, error);
     eprintln!("ChemDraft could not complete the document open: {message}");
+    if matches!(presentation, LaunchErrorPresentation::LogOnly) {
+        return;
+    }
     let mtm = MainThreadMarker::new().expect("launch error is shown on the main thread");
     let app = NSApplication::sharedApplication(mtm);
     #[allow(deprecated)]
@@ -1264,6 +1291,26 @@ mod single_instance_tests {
         }
         state.promoting = Some(launch);
         assert_eq!(state.take_interrupted_launch().urls, [early]);
+    }
+
+    #[test]
+    fn single_instance_exit_logs_unconfirmed_files_without_a_modal() {
+        let secondary = SecondaryLaunch::new(Ok(PathBuf::new()));
+        secondary.state.lock().unwrap().collection.launch = LaunchRequest {
+            urls: vec![Url::parse("file:///unconfirmed.cdx").unwrap()],
+            ..Default::default()
+        };
+        let mut logged = None;
+        assert!(secondary.handle_exit(|launch, error, presentation| {
+            assert!(matches!(presentation, LaunchErrorPresentation::LogOnly));
+            logged = Some(launch_error_message(launch, error));
+            report_launch_error(launch, error, presentation);
+        }));
+        assert_eq!(
+            logged.as_deref(),
+            Some("ChemDraft quit before it could confirm the document open.\n\nRequested files:\n/unconfirmed.cdx")
+        );
+        assert!(secondary.state.lock().unwrap().terminating);
     }
 
     #[test]
