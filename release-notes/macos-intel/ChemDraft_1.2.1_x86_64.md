@@ -20,8 +20,7 @@ ChemDraft 1.2.1 improves drawing, file exchange and dialogs, and fixes problems 
 - **Reaction arrows.** Reaction arrows keep their direction in CDX and CDXML. One-headed equilibrium arrows and older hollow arrows open unchanged.
 - **MOL and SDF.** Export uses standard MDL coordinate units. If scaling would change the structure, ChemDraft refuses the export and explains why.
 - **Opening files.** Choosing several files opens each one, and a file that fails to open is named in the message.
-<!-- PENDING: Confirm the charged-atom file-opening fix has landed before publishing. -->
-- **Charged atoms.** Opening a file never changes a charged atom.
+- **Charged atoms.** Opening a file or restoring a session no longer removes a charge whose + mark sits away from its atom.
 - **File warnings.** File warnings appear in their own window above floating toolbars. Out-of-range numeric CDX data is kept as text with a warning, and page-specific data stays on its page.
 
 ### Windows and dialogs
