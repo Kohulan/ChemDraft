@@ -1,3 +1,4 @@
+import { KEYBOARD_PREFERENCES_COMMAND_ID } from "../commands";
 import type { ReactionConditionsDraft } from "@chemdraft/document-workflow-core";
 export type ConditionsSnapshot = { title: string; arrowId: string; draft: ReactionConditionsDraft };
 /** Internal host contract. Advance independently of the public plugin API. No document/path URLs. */
@@ -180,7 +181,7 @@ export function parseDialogMessage(value: unknown): DialogMessage | undefined {
         case "action": valid = d.action === "cancel" || d.action === "finish" ? keys(d, ["action"])
           : d.action === "chooseShortcuts" ? keys(d, ["action", "scheme"]) && isKeybindingScheme(d.scheme)
           : d.action === "tryTourCommand" && keys(d, ["action", "command"]) &&
-            [TOUR_SAMPLE_COMMAND, TOUR_NAME_COMMAND, TOUR_INSPECTOR_COMMAND].some(command => d.command === command); break;
+            [TOUR_SAMPLE_COMMAND, TOUR_NAME_COMMAND, TOUR_INSPECTOR_COMMAND, KEYBOARD_PREFERENCES_COMMAND_ID].some(command => d.command === command); break;
         case "request": case "ready": valid = keys(d, []); break;
         case "closed": valid = keys(d, ["reason"]) && reasons.has(d.reason as DialogCloseReason); break;
         case "result": valid = keys(d, ["status"], ["error"]) && ["accepted", "cancelled", "error"].includes(String(d.status)) &&

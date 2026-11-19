@@ -1,3 +1,4 @@
+import type { ShortcutOverrides } from "@chemdraft/shortcut-engine";
 import { detectShortcutPlatform, type ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import { REPORT_BUG_COMMAND_ID } from "./problemReports";
 import { structureSearchCommands } from "./structureSearch";
@@ -129,6 +130,7 @@ export interface AppMenuContext {
   pluginMenuItems?: readonly PluginAppMenuItem[];
   /** Active keybinding scheme; the ChemDraw scheme relabels the accelerators that differ. */
   keybindingScheme?: "chemdraft" | "chemdraw";
+  keybindingOverrides?: ShortcutOverrides;
 }
 
 /** Prefix of the dynamic toolset-toggle command ids (see toolset-registry `createToolsetToggleCommandId`). */
@@ -159,18 +161,7 @@ export function formatMenuShortcut(
   accelerator: string | undefined,
   platform: ShortcutPlatform = "macos"
 ): string | undefined {
-  if (!accelerator) {
-    return undefined;
-  }
-  if (platform !== "macos") {
-    return formatShortcutLabel(accelerator, platform);
-  }
-  return accelerator
-    .replace(/Cmd|Command|Mod|Meta/gi, "⌘")
-    .replace(/Shift/gi, "⇧")
-    .replace(/Alt|Option/gi, "⌥")
-    .replace(/Ctrl|Control/gi, "⌃")
-    .replace(/\s*\+\s*/g, "");
+  return formatShortcutLabel(accelerator, platform);
 }
 
 function command(
@@ -388,6 +379,8 @@ export function buildAppMenuModel(context: AppMenuContext): AppMenuSection[] {
     ] });
   }
   for (const item of flattenAppMenuCommands(sections)) {
+    const keys = context.keybindingOverrides?.commands?.[item.commandId];
+    if (keys) item.accelerator = keys[0];
     item.shortcut = formatMenuShortcut(item.accelerator, platform);
   }
   // Presets are core styles; keep the contributed block separated from them.

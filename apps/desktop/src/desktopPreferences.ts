@@ -1,8 +1,9 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import type { KeybindingScheme } from "./keybindingSettings";
+import type { KeybindingSettings } from "./keybindingSettings";
 
 export interface DesktopPreferences {
-  shortcutScheme?: KeybindingScheme;
+  shortcutScheme?: KeybindingSettings["scheme"];
+  shortcutOverrides?: KeybindingSettings["overrides"];
   guidedTourSeen?: true;
 }
 

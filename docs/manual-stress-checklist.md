@@ -1610,3 +1610,21 @@ whole-molecule cleanup with the existing behavior, and check save/reopen and exp
 - Use File > Open to open a binary `.cdx` with known structures. Check bonds, labels and any import
   warnings against the source. Open a truncated CDX: it reports an import failure. On Windows use
   the file chooser or Open With; the installer does not register `.cdx` as an association.
+
+## Preferences > Keyboard
+
+- On macOS and Windows, use **Try it** on step 2 of the guided tour. Preferences should open or
+  raise with the Keyboard search field focused. Filter for Save and assign a new shortcut.
+  Check the File menu label and trigger Save from the document window with the new shortcut.
+- Assign Save's shortcut to another action. Cancel first, then repeat and choose Replace.
+  Check that only the replacement action runs. Clear and reset a menu, tool, and hover action,
+  then use **Reset all to scheme defaults**. Switch schemes and relaunch to verify each scheme
+  retains its own changes. Repeat with the Preferences window already open.
+- While the recorder is active try F5, Ctrl+R, and Cmd/Ctrl+Q and W. Verify the reserved-key
+  explanation for keys delivered to the recorder and that the document never reloads or closes.
+  Try Escape to cancel and verify normal menu accelerators work again afterward.
+- In the Classic desktop-compatible scheme record and use B and Shift+B with Caps Lock both
+  off and on. Only Shift changes the hover key. Lowercase b sets Br and uppercase B sets boron.
+- Try the normal Cut, Copy and Paste menu items with focus on a text field and with canvas
+  selection, before and after changing their shortcuts. Check that Windows utility windows
+  stay menu-free and the macOS app menu restores its shortcuts if Preferences loses focus mid-recording.

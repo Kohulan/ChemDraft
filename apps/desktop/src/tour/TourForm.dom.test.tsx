@@ -60,6 +60,10 @@ describe.each(["macos", "windows"] as const)("guided tour on %s", platform => {
     expect(choices.map(choice => choice.examples[0].key)).toEqual(["M", "X"]);
     expect(choices.map(choice => choice.examples.at(-1)?.key)).toEqual(platform === "macos" ? ["⌘S", "⌘S"] : ["Ctrl+S", "Ctrl+S"]);
 
+    expect(container.textContent).toContain("Preferences > Keyboard");
+    click("Try it");
+    expect(onAction).toHaveBeenLastCalledWith({ action: "tryTourCommand", command: "view.openKeyboardPreferences" });
+
     for (const command of ["help.tour.openSample", "plugin.opsinNameToStructure.convert", "analyze.molecularProperties"]) {
       click("Next");
       click("Try it");

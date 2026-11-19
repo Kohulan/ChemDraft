@@ -747,13 +747,13 @@ export async function listenForKeybindingSettings(
 }
 
 /** Keep native menu accelerators in step with the shortcut scheme. */
-export async function pushKeybindingSchemeToNativeMenu(scheme: KeybindingScheme): Promise<void> {
+export async function pushKeybindingSchemeToNativeMenu(scheme: KeybindingScheme, accelerators: Record<string, string | null> = {}): Promise<void> {
   if (!isDesktopRuntime()) {
     return;
   }
 
   const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("set_keybinding_scheme", { scheme }).catch(() => undefined);
+  await invoke("set_keybinding_scheme", { scheme, accelerators }).catch(error => console.error("Could not update menu shortcuts", error));
 }
 
 export async function listToolsetWindowStates(): Promise<ToolsetWindowState[]> {

@@ -25,6 +25,7 @@ import { broadcastDrawingSettings, listenForDrawingSettings } from "./window-man
 import { loadDirectElectronMarkEditing, saveDirectElectronMarkEditing } from "./electronMarkEditingSettings";
 import { broadcastElectronMarkEditingSettings } from "./window-manager";
 import { broadcastCompoundLayoutSettings, broadcastSpin3dSettings, broadcastQuitSettings, broadcastExportPreviewSettings } from "./window-manager";
+import { KeyboardPreferences } from "./KeyboardPreferences";
 
 interface RadioOption<T extends string> {
   value: T;
@@ -137,7 +138,8 @@ export function PreferencesWindow() {
   const [automaticPluginUpdates, setAutomaticPluginUpdates] = useState(loadAutomaticPluginUpdates);
   const [askToSave, setAskToSave] = useState(loadAskToSaveBeforeQuit);
   const [settings, setSettings] = useState<Spin3dSettings>(() => loadSpin3dSettings());
-  const keybindingScheme = useShortcutPreference();
+  const shortcutSettings = useShortcutPreference();
+  const keybindingScheme = shortcutSettings.scheme;
 
   useEffect(() => {
     let disposed = false;
@@ -178,6 +180,7 @@ export function PreferencesWindow() {
       <div className="cd-dialog-fit-body">
       <header className="preferences-header">
         <h1>Preferences</h1>
+        <a href="#keyboard">Keyboard</a>
       </header>
 
       <section className="preferences-section">
@@ -296,14 +299,20 @@ export function PreferencesWindow() {
         }}
       />
 
-      <PreferenceRadioGroup
-        legend="Keyboard shortcuts"
-        hint="Which keyboard scheme the drawing tools and hover hotkeys use. Takes effect immediately."
-        name="keybinding-scheme"
-        options={KEYBINDING_SCHEMES}
-        value={keybindingScheme}
-        onSelect={updateKeybindings}
-      />
+      <section id="keyboard" className="preferences-section" aria-labelledby="preferences-keyboard">
+        <h2 id="preferences-keyboard">Keyboard</h2>
+        <PreferenceRadioGroup
+          legend="Shortcut scheme"
+          hint="Each scheme keeps its own shortcuts."
+          name="keybinding-scheme"
+          options={KEYBINDING_SCHEMES}
+          value={keybindingScheme}
+          onSelect={updateKeybindings}
+        />
+        <KeyboardPreferences key={keybindingScheme} scheme={keybindingScheme}
+          overrides={shortcutSettings.overrides?.[keybindingScheme]}
+          onUpdate={overrides => updateShortcutPreference(keybindingScheme, overrides)} />
+      </section>
 
       <PreferenceRadioGroup
         legend="3D refinement"

@@ -455,7 +455,7 @@ describe("Preferences placement", () => {
     expect(appMenu.indexOf("&preferences_menu_item(app)?")).toBeLessThan(appMenu.indexOf("PredefinedMenuItem::services"));
     const item = source.split("fn preferences_menu_item<R: Runtime>")[1]!.split("fn create_view_menu")[0]!;
     expect(item).toContain("PREFERENCES_TOGGLE_COMMAND_ID");
-    expect(item).toContain('Some("CmdOrCtrl+,")');
+    expect(item).toContain('native_menu_shortcut(app, PREFERENCES_TOGGLE_COMMAND_ID, "CmdOrCtrl+,")');
     const viewMenu = source.split("fn create_view_menu<R: Runtime>")[1]!.split("fn create_toolbars_menu")[0]!;
     expect(viewMenu).not.toContain("preferences");
     expect(source).toContain('const PREFERENCES_TOGGLE_COMMAND_ID: &str = "view.togglePreferences";');

@@ -1,3 +1,4 @@
+import { KEYBOARD_PREFERENCES_COMMAND_ID } from "../commands";
 import { lazy, Suspense, useRef, useState } from "react";
 import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import type { DialogCoordinator } from "../dialogs/DialogCoordinator";
@@ -62,7 +63,9 @@ export function useGuidedTour(options: {
           throw new Error("Add Name to Structure from Plugins > Add or Remove Plugins, then try again.");
         }
         // Put commands with an insertion or analysis target in the practice drawing first.
-        if (action.command !== TOUR_SAMPLE_COMMAND) await commands.invoke(TOUR_SAMPLE_COMMAND);
+        if (action.command !== TOUR_SAMPLE_COMMAND && action.command !== KEYBOARD_PREFERENCES_COMMAND_ID) {
+          await commands.invoke(TOUR_SAMPLE_COMMAND);
+        }
         await commands.invoke(action.command);
         break;
     }

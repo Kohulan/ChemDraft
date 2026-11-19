@@ -1,6 +1,6 @@
 import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import { createEmptyDocument } from "@chemdraft/chem-core";
-import { createQuickActions, numericAtomDrawingHotkeys, PREFERENCES_COMMAND_ID, viewActions } from "../commands";
+import { createQuickActions, numericAtomDrawingHotkeys, KEYBOARD_PREFERENCES_COMMAND_ID, PREFERENCES_COMMAND_ID, viewActions } from "../commands";
 import { chemDrawHoveredTargetHotkeyCommand } from "../keybindingScheme";
 import { KEYBINDING_SCHEME_LABELS, type KeybindingScheme } from "../keybindingSettings";
 import { createMainWindowShortcutCommands, detectDesktopShortcutPlatform } from "../keyboardShortcuts";
@@ -57,8 +57,9 @@ export function tourSteps(
     },
     {
       title: "Choose your shortcuts",
-      text: "If you’ve used other drawing programs, try Classic desktop-compatible shortcuts. ChemDraft opens CDX and CDXML files.",
-      shortcuts: true
+      text: "If you’ve used other drawing programs, try Classic desktop-compatible shortcuts. ChemDraft opens CDX and CDXML files. You can change any assignable shortcut in Preferences > Keyboard.",
+      shortcuts: true,
+      tryCommand: KEYBOARD_PREFERENCES_COMMAND_ID
     },
     {
       title: "Draw a structure",

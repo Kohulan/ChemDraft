@@ -4,6 +4,7 @@ import * as smilesListPaste from "./smilesListPaste";
 import * as smilesPasteIdentity from "./smilesPasteIdentity";
 import { IdentityVerificationTimeoutError } from "./depiction2d/identityWorkerClient";
 import { inspectStructureOffThread } from "./depiction2d/identityClient";
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { act, createElement, StrictMode } from "react";
 import { setNativePromptProvider, type NativePromptOptions } from "./nativePrompt";
 import { withNativeUtilitySuspension } from "./nativeUtilitySuspension";
@@ -544,6 +545,10 @@ describe("documents in one window", () => {
       expect(native.dialogPublish).toHaveBeenCalledWith("opaque", expect.objectContaining({
         type: "snapshot", data: { title: "Take the Tour", scheme: "chemdraw", automatic: false }
       }));
+      await pageSizeMessage("action", { action: "tryTourCommand", command: "view.openKeyboardPreferences" });
+      expect(tauriInvoke).toHaveBeenCalledWith("toggle_preferences_window", { keyboard: true });
+      expect(tabs()).toHaveLength(1);
+      expect(bridge().snapshot().document).toEqual(before);
       const trySample = { action: "tryTourCommand", command: "help.tour.openSample" };
       await pageSizeMessage("action", trySample);
       expect(tabs()).toHaveLength(2);

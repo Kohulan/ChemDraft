@@ -268,7 +268,7 @@ import { canvasOverlayPrompt, OVERLAY_BUSY_MESSAGE, pluginCanvasOverlayOpenComma
 import type { PluginPanelActionRequest, PluginPanelActionResult } from "./plugins/pluginPanelActionTypes";
 import { handleSpectrumWindowAction, saveBinaryFileHere, saveTextFileHere, spectrumToPdf } from "./plugins/spectrumExport";
 import type { QueuedProposedPatch } from "@chemdraft/plugin-host";
-import { isBlockedByModalDialog, shouldIgnoreShortcutTarget, subscribeToModalDialogChanges, type ShortcutPlatform } from "@chemdraft/shortcut-engine";
+import { hoverKeyFromEvent, isBlockedByModalDialog, shouldIgnoreShortcutTarget, subscribeToModalDialogChanges, type ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import {
   atomLabelAnchorOffset,
   nativeHoverAtomLabelCompletion,
@@ -341,13 +341,9 @@ import {
   isSelectionNudgeCommand,
   atomElementActions,
   atomNicknameLabelActions,
-  atomElementCommandId,
   nicknameLabelByCommandId,
-  fragmentAtomDrawingHotkeys,
-  fragmentBondDrawingHotkeys,
   fragmentSproutKindForCommand,
   fragmentSproutCommands,
-  numericAtomDrawingHotkeys,
   numericBondDrawingHotkeys,
   artBooleanOperationCommandIds,
   createLayerActions,
@@ -458,6 +454,7 @@ import {
   pageCustomSizeAction,
   PAGE_CUSTOM_SIZE_COMMAND_ID,
   PREFERENCES_COMMAND_ID,
+  KEYBOARD_PREFERENCES_COMMAND_ID,
   toggleDrawnStructureSettingsCommandId,
   moleculeStructureNumberRanges,
   allShellCommands,
@@ -910,6 +907,7 @@ import {
   isArrowNudgeEditorTarget,
   createDesktopShortcutRegistry,
   createMainWindowShortcutCommands,
+  defaultClipboardShortcut,
   detectDesktopShortcutPlatform,
   enableWindowsLastDocumentCloseAction
 } from "./keyboardShortcuts";
@@ -955,7 +953,7 @@ import {
   tauriUpdateFlowDeps,
   writeLastAutoCheck
 } from "./appUpdates";
-import { applyKeybindingSchemeToCommands, chemDrawHoveredTargetHotkeyCommand } from "./keybindingScheme";
+import { applyKeybindingSchemeToCommands, createHoverShortcutTables, defaultHoverShortcuts, type HoverShortcutTables } from "./keybindingScheme";
 import { isCompoundLayoutCommandHidden, compoundLayoutCommandDisabledReason, isCompoundLayoutCommand } from "./compoundLayoutSettings";
 import { useStructureSearchEnabled } from "./structureSearchSettings";
 import { createStructureSearchController, structureSearchCommands, structureSearchDocument, structureSearchErrorStatus, structureSearchSite } from "./structureSearch";
@@ -965,6 +963,7 @@ import { ArrangementSpacingDialog, arrangementSpacingPreviewSvg, checkedArrangem
 import { arrangeSelectedDocumentObjects, arrangementSpacingRange, selectedArrangementObjectIds } from "./documentWorkflow";
 import { arrangementLayoutForCommand, arrangementGridAlignmentForCommand } from "./commands";
 import type { KeybindingScheme } from "./keybindingSettings";
+import { nativeMenuShortcutOverrides } from "./customKeyboardShortcuts";
 import { useShortcutPreference } from "./useShortcutPreference";
 import { SHOW_TOUR_COMMAND, TOUR_NAME_COMMAND, TOUR_SAMPLE_COMMAND, TOUR_TITLE, type TourAction } from "./tour/tourCommands";
 import type { TourMode } from "./tour/tourState";
@@ -1838,7 +1837,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.19.17.10-codex";
+const CURRENT_BUILD_STAMP = "11.19.17.28-codex";
 const TABLE_DRAFT_RECOVERY_WARNING = "session.tableDraftDropped";
 
 function clearTableDraftRecoveryWarnings(report: OpenWarningsReport | undefined): OpenWarningsReport | undefined {
@@ -3515,7 +3514,12 @@ export function MainWindow({
       setTapeMeasure(undefined);
     }
   }, [activeTool]);
-  const keybindingScheme = useShortcutPreference();
+  const shortcutSettings = useShortcutPreference();
+  const keybindingScheme = shortcutSettings.scheme;
+  const shortcutOverrides = shortcutSettings.overrides?.[keybindingScheme];
+  const hoverShortcuts = useMemo(() => createHoverShortcutTables(keybindingScheme, shortcutOverrides), [keybindingScheme, shortcutOverrides]);
+  const hoverShortcutsRef = useRef(hoverShortcuts);
+  hoverShortcutsRef.current = hoverShortcuts;
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
@@ -3527,17 +3531,17 @@ export function MainWindow({
     return () => { disposed = true; unlisten?.(); };
   }, []);
   const keybindingSchemeRef = useRef(keybindingScheme);
+  keybindingSchemeRef.current = keybindingScheme;
   useEffect(() => {
-    keybindingSchemeRef.current = keybindingScheme;
-    // The native macOS menu carries its own accelerators; keep them in step with the scheme.
-    void pushKeybindingSchemeToNativeMenu(keybindingScheme);
-  }, [keybindingScheme]);
+    // The native menu carries its own accelerators. Keep them in step with the canvas.
+    void pushKeybindingSchemeToNativeMenu(keybindingScheme, nativeMenuShortcutOverrides(shortcutOverrides, shortcutPlatform));
+  }, [keybindingScheme, shortcutOverrides, shortcutPlatform]);
   const toolCommandSpecs = useMemo(
     () => applyKeybindingSchemeToCommands(
       withStandaloneDrawingToolCommands(getToolsetCommandSpecs(toolsetRegistry)),
-      keybindingScheme
+      keybindingScheme, shortcutOverrides, shortcutPlatform
     ),
-    [keybindingScheme, toolsetRegistry]
+    [keybindingScheme, shortcutOverrides, shortcutPlatform, toolsetRegistry]
   );
   const hasSearchableStructure = useMemo(() => structureSearchDocument(
     document, nativeMoleculeFragmentSelections(selectedNativeMoleculeParts)
@@ -3562,9 +3566,9 @@ export function MainWindow({
         structureSearchEnabled,
         hasSearchableStructure
       }).map(command => customSwatchActions.find(action => action.id === command.id) ?? command).filter(command => command.id !== "arrow.conditions" || isDesktopRuntime()),
-      keybindingScheme
+      keybindingScheme, shortcutOverrides, shortcutPlatform
     ),
-    [baseToolbarCommands, customSwatches, customSwatchActions, activeTableCell?.tableId, activeTableCell?.rowId, activeTableCell?.columnId, canRedo, canUndo, document, documentTabs.length, keybindingScheme, openWarnings, selectedMolecule, selectedNativeMoleculeParts, toolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, structureSearchEnabled, hasSearchableStructure]
+    [shortcutOverrides, shortcutPlatform, baseToolbarCommands, customSwatches, customSwatchActions, activeTableCell?.tableId, activeTableCell?.rowId, activeTableCell?.columnId, canRedo, canUndo, document, documentTabs.length, keybindingScheme, openWarnings, selectedMolecule, selectedNativeMoleculeParts, toolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, structureSearchEnabled, hasSearchableStructure]
   );
   const shellCommandsById = useMemo(
     () => createShellCommandMap(shellCommandSpecs),
@@ -3580,12 +3584,12 @@ export function MainWindow({
     void broadcastToolsetCommandSpecs(shellCommandSpecsRef.current).catch(() => undefined);
   }, [shellCommandSpecsSignature]);
   const shortcutCommands = useMemo(
-    () => createMainWindowShortcutCommands({ quickActions, layerActions, toolCommandSpecs }, keybindingScheme),
-    [keybindingScheme, layerActions, quickActions, toolCommandSpecs]
+    () => createMainWindowShortcutCommands({ quickActions, layerActions, toolCommandSpecs }, keybindingScheme, shortcutOverrides, shortcutPlatform),
+    [keybindingScheme, shortcutOverrides, shortcutPlatform, layerActions, quickActions, toolCommandSpecs]
   );
   const shortcutRegistry = useMemo(
-    () => createDesktopShortcutRegistry(shortcutCommands, shortcutPlatform),
-    [shortcutCommands, shortcutPlatform]
+    () => createDesktopShortcutRegistry(shortcutCommands, { platform: shortcutPlatform, overrides: shortcutOverrides }),
+    [shortcutCommands, shortcutPlatform, shortcutOverrides]
   );
   useEffect(() => {
     const stop = perfHook(() => onPerfStarted(() => { perfHook(() => perfProbe?.setShortcutRegistry(shortcutRegistry)); }));
@@ -12817,12 +12821,16 @@ export function MainWindow({
       });
     });
 
-    viewActions.forEach((action) => {
+    const keyboardPreferences: CommandSpec = {
+      id: KEYBOARD_PREFERENCES_COMMAND_ID, title: "Keyboard Preferences", icon: "inspector", source: "core"
+    };
+    [...viewActions, keyboardPreferences].forEach((action) => {
       register(action, () => {
-        if (action.id === PREFERENCES_COMMAND_ID) {
+        if (action.id === PREFERENCES_COMMAND_ID || action.id === KEYBOARD_PREFERENCES_COMMAND_ID) {
+          const keyboard = action.id === KEYBOARD_PREFERENCES_COMMAND_ID;
           if (!isDesktopRuntime()) {
             const perfWindow = perfHook(() => perfProbe?.expectSignal("command-finished", action.id));
-            setStatus(openBrowserUtilityWindow(PREFERENCES_WINDOW_KIND)
+            setStatus(openBrowserUtilityWindow(PREFERENCES_WINDOW_KIND, keyboard ? "keyboard" : "")
               ? "Preferences opened in browser"
               : "Preferences pop-up blocked");
             if (perfWindow) perfHook(() => perfProbe?.complete(perfWindow, "command-finished"));
@@ -12833,7 +12841,7 @@ export function MainWindow({
             // Diagnostics have their own transport; the app command keeps its original contract.
             const open = perfHook(() => nativeWindowOpening("preferences", action.id));
             const { invoke } = await import("@tauri-apps/api/core");
-            await invoke("toggle_preferences_window");
+            await invoke("toggle_preferences_window", keyboard ? { keyboard } : undefined);
             perfHook(() => perfToggleResolved("preferences", open, input));
           })().catch((error: unknown) => {
             if (input) perfHook(() => perfProbe?.complete(input, "failed"));
@@ -13820,6 +13828,37 @@ export function MainWindow({
       commandId = stripForcedDocumentHistorySuffix(commandId);
     }
     if (commandId === "edit.selectAll" && !forcedDocumentHistory && performFocusedFieldSelectAll(globalThis.document)) return;
+    const focusedField = globalThis.document.activeElement;
+    if (shouldLetSystemClipboardHandleCommand(commandId) && isEditableTarget(focusedField)) {
+      if (commandId === "clipboard.paste") {
+        try {
+          const { textItems } = await readClipboardPayload();
+          const text = textItems?.find(item => item.type === "text/plain")?.text;
+          if (text && focusedField === globalThis.document.activeElement) {
+            globalThis.document.execCommand("insertText", false, text);
+          }
+        } catch (error) {
+          setStatus("Could not paste into the focused field. " + String(error));
+        }
+      } else {
+        const operation = commandId === "clipboard.cut" ? "cut" : "copy";
+        if (!globalThis.document.execCommand(operation)) {
+          const selection = () => focusedField instanceof HTMLInputElement || focusedField instanceof HTMLTextAreaElement
+            ? focusedField.value.slice(focusedField.selectionStart ?? 0, focusedField.selectionEnd ?? 0)
+            : globalThis.document.getSelection()?.toString();
+          const text = selection();
+          try {
+            if (text && await writeClipboardText(text) && operation === "cut" &&
+                focusedField === globalThis.document.activeElement && selection() === text) {
+              globalThis.document.execCommand("delete");
+            }
+          } catch (error) {
+            setStatus("Could not write to the clipboard. " + String(error));
+          }
+        }
+      }
+      return;
+    }
     const historyDirection = editHistoryDirection(commandId);
     if (historyDirection) {
       const history = documentHistoryRef.current;
@@ -14906,7 +14945,7 @@ export function MainWindow({
           isBlockedByModalDialog(event.target) || !(event.target instanceof Element) ||
           !event.target.matches(".text-object-editor, [data-table-cell-editor] textarea, [data-atom-label-editor], [data-bracket-label-editor]")) return;
       const commandId = shortcutRegistry.resolve({
-        key: event.key, ctrlKey: event.ctrlKey, metaKey: event.metaKey,
+        key: event.key, code: event.code, ctrlKey: event.ctrlKey, metaKey: event.metaKey,
         altKey: event.altKey, shiftKey: event.shiftKey
       });
       // The text textarea stops bubbling keys, just like the table editor. Route its
@@ -14987,10 +15026,10 @@ export function MainWindow({
       // Tab navigation ends an inline edit, so it also works while that editor owns focus.
       // Resolve through the same shortcut engine, omitting only its text-field target filter.
       const tabCommand = shortcutRegistry.resolve({
-        key: event.key, ctrlKey: event.ctrlKey, metaKey: event.metaKey,
+        key: event.key, code: event.code, ctrlKey: event.ctrlKey, metaKey: event.metaKey,
         altKey: event.altKey, shiftKey: event.shiftKey
       });
-      if (!event.defaultPrevented && tabCommand &&
+      if (!event.defaultPrevented && (event.metaKey || event.ctrlKey || event.altKey) && tabCommand &&
           ["document.closeTab", "document.nextTab", "document.previousTab"].includes(tabCommand)) {
         event.preventDefault();
         hoverLabelAssignmentRef.current = undefined;
@@ -15149,6 +15188,8 @@ export function MainWindow({
       }
 
       if (!event.metaKey && !event.ctrlKey && !event.altKey) {
+        const key = hoverKeyFromEvent(event);
+        const tables = hoverShortcutsRef.current;
         const assignment = hoverLabelAssignmentRef.current;
         let labelContinues = false;
         // Over a different atom, element keys (either case) and digits act on that atom; other
@@ -15161,9 +15202,9 @@ export function MainWindow({
           const current = hoveredNativeDeleteTargetRef.current;
           const continuingOnAtom = assignment !== undefined && current?.kind === "atom" &&
             current.objectId === assignment.objectId && current.atomId === assignment.atomId &&
-            /^[a-z0-9]$/i.test(event.key) && !Object.prototype.hasOwnProperty.call(numericBondDrawingHotkeys, event.key);
+            /^[a-z0-9]$/i.test(key) && !Object.prototype.hasOwnProperty.call(numericBondDrawingHotkeys, key);
           if (retarget && !activeAtomLabelEditRef.current &&
-            (!continuingOnAtom || hasBondHoverShortcut(retarget.pointerTarget, event.key))) {
+            (!continuingOnAtom || hasBondHoverShortcut(retarget.pointerTarget, key, tables))) {
             labelHoverRetargetRef.current = undefined;
             rederiveNativeCanvasHoverRef.current?.(documentRef.current);
           }
@@ -15171,14 +15212,17 @@ export function MainWindow({
           // case) and digits act on a different atom; non-element letters continue the label there.
           // Preserve that decision when the hover moves to the atom being labelled.
           const pointerTarget = hoveredNativeDeleteTargetRef.current;
-          labelContinues = assignment !== undefined &&
-            hoverLabelContinuesForKey(documentRef.current, pointerTarget, assignment, event.key);
+          const followsSchemeDefault = hoveredNativeTargetShortcutCommand(pointerTarget, key, keybindingSchemeRef.current, tables) ===
+            hoveredNativeTargetShortcutCommand(pointerTarget, key, keybindingSchemeRef.current);
+          labelContinues = assignment !== undefined && followsSchemeDefault &&
+            hoverLabelContinuesForKey(documentRef.current, pointerTarget, assignment, key);
           const labelAtom = hoverLabelAtomTargetForKey(
             documentRef.current,
             pointerTarget,
             hoverPagePointRef.current,
-            assignment,
-            event.key
+            labelContinues ? assignment : undefined,
+            key,
+            tables
           );
           if (labelAtom) {
             assignHoveredNativeDeleteTarget(labelAtom);
@@ -15186,7 +15230,7 @@ export function MainWindow({
           }
         }
         const hoveredTarget = hoveredNativeDeleteTargetRef.current;
-        if (event.key !== "Shift") {
+        if (key !== "Shift") {
           hoverLabelAssignmentRef.current = undefined;
         }
         if (
@@ -15196,7 +15240,7 @@ export function MainWindow({
         ) {
           const object = findDocumentObject(documentRef.current, assignment.objectId);
           const atom = object?.type === "molecule" ? object.atoms.find((candidate) => candidate.id === assignment.atomId) : undefined;
-          const draft = `${assignment.label}${event.key}`;
+          const draft = `${assignment.label}${key}`;
           if (atom?.element === assignment.label && startAtomLabelEdit(hoveredTarget, {
             draft, beforeAtom: assignment.beforeAtom, beforeMolecule: assignment.beforeMolecule,
             startedFromHover: true,
@@ -15215,8 +15259,9 @@ export function MainWindow({
           documentRef.current,
           selectedNativeMoleculePart,
           hoveredNativeDeleteTargetRef.current,
-          event.key,
-          keybindingSchemeRef.current
+          key,
+          keybindingSchemeRef.current,
+          tables
         );
         if (hoveredTargetCommandId) {
           event.preventDefault();
@@ -15230,10 +15275,10 @@ export function MainWindow({
           invokeCanvasKeyCommand(hoveredTargetCommandId, !labelHoverRetargetRef.current);
           // Only a label assignment made by a hover key starts continuation. Other keys and
           // selected-atom assignments retain their existing shortcut behavior.
-          const assignedElement = nativeElementFromKeyboardKey(event.key);
+          const assignedElement = nativeElementFromKeyboardKey(key);
           if (
             keybindingSchemeRef.current === "chemdraft" && hoveredTarget?.kind === "atom" &&
-            assignedElement
+            assignedElement && hoveredTargetCommandId === "atom.setHoveredElement." + assignedElement
           ) {
             const object = findDocumentObject(documentRef.current, hoveredTarget.objectId);
             const atom = object?.type === "molecule" ? object.atoms.find((candidate) => candidate.id === hoveredTarget.atomId) : undefined;
@@ -15249,13 +15294,15 @@ export function MainWindow({
         }
       }
 
+      const clipboard = defaultClipboardShortcut(event, shortcutPlatform);
       const commandId = shortcutRegistry.resolve(wasBrowserReloadPrevented(event) ? {
-        key: event.key, ctrlKey: event.ctrlKey, metaKey: event.metaKey,
+        key: event.key, code: event.code, ctrlKey: event.ctrlKey, metaKey: event.metaKey,
         altKey: event.altKey, shiftKey: event.shiftKey, target: event.target
       } : event);
-      if (!commandId) {
-        return;
+      if (clipboard && shortcutOverrides?.commands?.[clipboard] && commandId !== clipboard) {
+        event.preventDefault();
       }
+      if (!commandId) return;
       if (isSelectionNudgeCommand(commandId) &&
         ((!documentRef.current.selection.objectIds.length && !selectedNativeMoleculePartsRef.current.length) ||
           isArrowNudgeEditorTarget(event.target) || isArrowNudgeEditorTarget(globalThis.document.activeElement) ||
@@ -15266,7 +15313,7 @@ export function MainWindow({
       // Copy/cut/paste fall through to the native clipboard events (handleCopy/handleCut/handlePaste),
       // which read and write event.clipboardData synchronously. On desktop, handlePaste additionally
       // falls back to the native Tauri clipboard read when the WebView paste event has no data.
-      if (shouldLetSystemClipboardHandleCommand(commandId)) {
+      if (clipboard === commandId && shouldLetSystemClipboardHandleCommand(commandId)) {
         return;
       }
 
@@ -15301,6 +15348,8 @@ export function MainWindow({
     selectedNativeMoleculePart,
     assignHoveredNativeDeleteTarget,
     shortcutRegistry,
+    shortcutOverrides,
+    shortcutPlatform,
     isSnapshotSessionActive,
     activeTableCellState,
     startTableCellEdit,
@@ -22557,7 +22606,9 @@ export function MainWindow({
         toolbars: getToolbarsMenuModel(visibleToolsetIds, toolsetRegistry),
         pluginMenuItems: [...bracketMenuItems, ...pluginRuntime.pluginMenuItems],
         availablePluginUpdateCount,
-        keybindingScheme
+        keybindingScheme,
+        keybindingOverrides: shortcutOverrides,
+        platform: shortcutPlatform
       }),
     [
       rulersVisible,
@@ -22567,6 +22618,8 @@ export function MainWindow({
       document.selection.objectIds.length,
       quickActions,
       keybindingScheme,
+      shortcutOverrides,
+      shortcutPlatform,
       selectedMolecule,
       visibleToolsetIds,
       toolsetRegistry,
@@ -25533,50 +25586,17 @@ export function shouldOpenMoleculeEditorFromObjectClick(
 export function hoveredNativeTargetShortcutCommand(
   target: NativeMoleculeDeleteTarget | undefined,
   key: string,
-  scheme: KeybindingScheme = "chemdraft"
+  scheme: KeybindingScheme = "chemdraft",
+  tables?: HoverShortcutTables
 ): string | undefined {
-  const fragments = target?.kind === "atom" ? fragmentAtomDrawingHotkeys : target?.kind === "bond" ? fragmentBondDrawingHotkeys : undefined;
-  if (fragments && Object.prototype.hasOwnProperty.call(fragments, key)) return fragments[key];
-  if (scheme === "chemdraw") {
-    return target?.kind === "atom" || target?.kind === "bond"
-      ? chemDrawHoveredTargetHotkeyCommand(target.kind, key)
-      : undefined;
-  }
-
-  if (target?.kind === "bond") {
-    if (key === "w") return "bond.setHoveredBondDisplay.wedge";
-    if (key === "W") return "bond.setHoveredBondDisplay.hashed";
-    return Object.prototype.hasOwnProperty.call(numericBondDrawingHotkeys, key)
-      ? numericBondDrawingHotkeys[key]
-      : undefined;
-  }
-
-  if (target?.kind !== "atom") {
-    return undefined;
-  }
-
-  if (Object.prototype.hasOwnProperty.call(numericAtomDrawingHotkeys, key)) {
-    return numericAtomDrawingHotkeys[key];
-  }
-  if (key.toLowerCase() === "k") {
-    return "atom.addCarbonylToHoveredAtom";
-  }
-  if (key === "+") {
-    return "atom.addPositiveChargeToHoveredAtom";
-  }
-  if (key === "-") {
-    return "atom.addNegativeChargeToHoveredAtom";
-  }
-  if (key === ".") {
-    return "atom.addRadicalToHoveredAtom";
-  }
-
-  const element = nativeElementFromKeyboardKey(key);
-  return element ? atomElementCommandId(element) : undefined;
+  if (target?.kind !== "atom" && target?.kind !== "bond") return undefined;
+  if (tables) return tables[target.kind].get(key);
+  const defaults = defaultHoverShortcuts(scheme, target.kind);
+  return Object.hasOwn(defaults, key) ? defaults[key] : undefined;
 }
 
-function hasBondHoverShortcut(target: NativeMoleculeDeleteTarget | undefined, key: string): boolean {
-  return target?.kind === "bond" && hoveredNativeTargetShortcutCommand(target, key) !== undefined;
+function hasBondHoverShortcut(target: NativeMoleculeDeleteTarget | undefined, key: string, tables?: HoverShortcutTables): boolean {
+  return target?.kind === "bond" && hoveredNativeTargetShortcutCommand(target, key, "chemdraft", tables) !== undefined;
 }
 
 /**
@@ -25685,7 +25705,8 @@ export function hoverLabelAtomTargetForKey(
   target: NativeMoleculeDeleteTarget | undefined,
   pointer: ClientPoint | undefined,
   assignment: HoverLabelAssignment | undefined,
-  key: string
+  key: string,
+  tables?: HoverShortcutTables
 ): NativeMoleculeDeleteTarget | undefined {
   if (assignment && hoverLabelContinuesForKey(document, target, assignment, key)) {
     const onLabelledAtom = target?.kind === "atom" && target.objectId === assignment.objectId && target.atomId === assignment.atomId;
@@ -25694,7 +25715,8 @@ export function hoverLabelAtomTargetForKey(
   if (target?.kind !== "bond") {
     return undefined;
   }
-  if (hasBondHoverShortcut(target, key) || !nativeElementFromKeyboardKey(key)) {
+  if (hasBondHoverShortcut(target, key, tables) ||
+      !(tables ? tables.atom.get(key)?.startsWith("atom.setHoveredElement.") : nativeElementFromKeyboardKey(key))) {
     return undefined;
   }
   const molecule = findDocumentObject(document, target.objectId);
@@ -25716,13 +25738,15 @@ export function activeNativeTargetShortcutCommand(
   selectedPart: NativeMoleculeSelectionPart | undefined,
   hoveredTarget: NativeMoleculeDeleteTarget | undefined,
   key: string,
-  scheme: KeybindingScheme = "chemdraft"
+  scheme: KeybindingScheme = "chemdraft",
+  tables?: HoverShortcutTables
 ): string | undefined {
   if (key === "." && hoveredTarget?.kind !== "atom") return undefined;
   return hoveredNativeTargetShortcutCommand(
     hoveredTarget ?? nativeDeleteTargetFromSelectionPart(document, selectedPart),
     key,
-    scheme
+    scheme,
+    tables
   );
 }
 
@@ -33778,14 +33802,14 @@ function shouldEnableArtStyleQaLayer(): boolean {
   }
 }
 
-function openBrowserUtilityWindow(windowKind: string): boolean {
+function openBrowserUtilityWindow(windowKind: string, section = ""): boolean {
   if (typeof window === "undefined") {
     return false;
   }
 
   const url = new URL(window.location.href);
   url.searchParams.set("window", windowKind);
-  url.hash = "";
+  url.hash = section;
   const opened = window.open(
     url.toString(),
     `chemdraft-${windowKind}`,

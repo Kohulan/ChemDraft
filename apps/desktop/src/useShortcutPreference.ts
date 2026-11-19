@@ -1,34 +1,55 @@
 import { useEffect, useState } from "react";
+import type { ShortcutOverrides } from "@chemdraft/shortcut-engine";
 import { desktopPreferences } from "./desktopPreferences";
-import { isKeybindingScheme, loadKeybindingSettings, saveKeybindingSettings, type KeybindingScheme } from "./keybindingSettings";
+import {
+  isKeybindingScheme, isSchemeOverrides, KEYBINDING_STORAGE_KEY, loadKeybindingSettings,
+  saveKeybindingSettings, type KeybindingScheme, type KeybindingSettings
+} from "./keybindingSettings";
 import { broadcastKeybindingSettings, listenForKeybindingSettings } from "./window-manager";
 
-export function useShortcutPreference(): KeybindingScheme {
-  const [scheme, setScheme] = useState(() => loadKeybindingSettings().scheme);
+export function useShortcutPreference(): KeybindingSettings {
+  const [settings, setSettings] = useState(loadKeybindingSettings);
   useEffect(() => {
     let disposed = false;
     let changed = false;
     let unlisten: (() => void) | undefined;
-    void listenForKeybindingSettings(next => {
+    const receive = (next: KeybindingSettings) => {
       changed = true;
-      setScheme(next.scheme);
-    }).then(async stop => {
+      saveKeybindingSettings(next);
+      setSettings(next);
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === KEYBINDING_STORAGE_KEY) {
+        changed = true;
+        setSettings(loadKeybindingSettings());
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    void listenForKeybindingSettings(receive).then(async stop => {
       if (disposed) { stop(); return; }
       unlisten = stop;
-      const saved = (await desktopPreferences())?.shortcutScheme;
-      if (!disposed && !changed && isKeybindingScheme(saved)) {
-        saveKeybindingSettings({ scheme: saved });
-        setScheme(saved);
+      const saved = await desktopPreferences();
+      if (!disposed && !changed && saved && (isKeybindingScheme(saved.shortcutScheme) || isSchemeOverrides(saved.shortcutOverrides))) {
+        const cache = loadKeybindingSettings();
+        receive({
+          scheme: saved.shortcutScheme ?? cache.scheme,
+          overrides: isSchemeOverrides(saved.shortcutOverrides) ? saved.shortcutOverrides : cache.overrides
+        });
       }
     }).catch(error => console.error("Could not load keyboard shortcuts", error));
-    return () => { disposed = true; unlisten?.(); };
+    return () => { disposed = true; unlisten?.(); window.removeEventListener("storage", onStorage); };
   }, []);
-  return scheme;
+  return settings;
 }
 
-export async function updateShortcutPreference(scheme: KeybindingScheme): Promise<void> {
-  await desktopPreferences({ shortcutScheme: scheme });
-  const settings = { scheme };
+export async function updateShortcutPreference(scheme: KeybindingScheme, overrides?: ShortcutOverrides): Promise<void> {
+  const cache = loadKeybindingSettings();
+  const shortcutOverrides = overrides === undefined ? undefined : { [scheme]: overrides };
+  const saved = await desktopPreferences(overrides === undefined ? { shortcutScheme: scheme } : { shortcutOverrides });
+  const settings = {
+    scheme: saved?.shortcutScheme ?? (overrides === undefined ? scheme : cache.scheme),
+    overrides: saved?.shortcutOverrides ?? (shortcutOverrides ? { ...cache.overrides, ...shortcutOverrides } : cache.overrides)
+  };
   saveKeybindingSettings(settings);
   await broadcastKeybindingSettings(settings);
 }
