@@ -28,7 +28,6 @@ ChemDraft 1.2.1 improves drawing, file exchange and dialogs, and fixes problems 
 
 - **Right-click menus.** Canvas right-click menus use system menus. Floating toolbars, dialogs and panels no longer offer a Reload command that could discard the document.
 - **Dialogs and panels.** Insert Table, Reaction Conditions and Export fit their contents, and invalid fields are marked. Dialogs, palettes and panels reopen where they were left, with their title bars reachable.
-<!-- PENDING: Confirm toolbar customization and sizing have landed before publishing. -->
 - **Toolbars.** Add command… is available on every toolbar, and toolbars are sized to their contents.
 - **Inserts.** Structures from a picker, Name to Structure or image recognition are placed outside dialogs covering the page.
 
