@@ -144,7 +144,8 @@ describe("unknown-order bonds at app boundaries", () => {
     conformer.prefetch.mockClear();
     analysisWorkerFactory.mockClear();
     try {
-      await act(async () => root.render(createElement(MainWindow, { initialDocument: selectedDocument(unknownMolecule()), initialPaletteMode: "hidden", initialRulersVisible: false, nativePalette: true })));
+      // jsdom has no native palette window; use the web palette so opening the Inspector succeeds.
+      await act(async () => root.render(createElement(MainWindow, { initialDocument: selectedDocument(unknownMolecule()), initialPaletteMode: "hidden", initialRulersVisible: false, nativePalette: false })));
       const bridge = window[AGENT_BRIDGE_GLOBAL_NAME];
       expect(bridge).toBeDefined();
       await act(async () => { await bridge!.command(command); });
