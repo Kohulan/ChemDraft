@@ -98,8 +98,14 @@ describe.each(["macos", "windows"] as const)("orbital placement and rotation on 
     await act(async () => { await window.__CHEMDRAFT_AGENT__!.command("tool.select"); });
     const handle = container.querySelector<HTMLElement>('[data-selection-rotate-handle="true"]'); expect(handle).not.toBeNull();
     await pointer("pointerdown", atAngle(node, 0), handle!);
-    await pointer("pointermove", atAngle(node, 13.25)); await pointer("pointerup", atAngle(node, 13.25));
-    closeTo(nativeOrbitalAnchorPoint(graphics()[0]), node); expect(graphics()[0].rotation).toBeCloseTo(13.25, 6);
+    await pointer("pointermove", atAngle(node, 13.25));
+    const preview = graphics()[0];
+    closeTo(nativeOrbitalAnchorPoint(preview), node);
+    expect(preview.rotation).toBeCloseTo(13.25, 6);
+    await pointer("pointermove", node);
+    expect(graphics()[0]).toEqual(preview);
+    await pointer("pointerup", node);
+    expect(graphics()[0]).toEqual(preview);
   });
 
   it("drags a second orbital from the first orbital's node and retains Direct Edit", async () => {

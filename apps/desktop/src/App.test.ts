@@ -154,7 +154,6 @@ import {
   proposalWindowLifecycle,
   settleAnalysisWindowOpen,
   projectedPlaneTiltVectorFromDrag,
-  rotationDeltaDegrees,
   rotationInputHomeDraftDegrees,
   rotationInputDraftDegrees,
   rotationReadoutDegrees,
@@ -3024,24 +3023,13 @@ describe("ChemDraft desktop shell", () => {
     expect(toolPaletteSource).toContain("distributeModeCommandIds.spacing");
   });
 
-  it("matches rotate-handle tangential drag speed to projected-plane tilt speed", () => {
-    const center = { x: 0, y: 0 };
+  it("wraps projected-plane tilt after 360 pixels of drag", () => {
     const start = { x: 0, y: -20 };
 
-    expect(rotationDeltaDegrees(center, start, { x: 360, y: -20 })).toBe(360);
-    expect(rotationDeltaDegrees(center, start, { x: -360, y: -20 })).toBe(-360);
     expect(projectedPlaneTiltReadoutDegrees(projectedPlaneTiltRadiansFromDrag(start, { x: 0, y: -380 }))).toBe(0);
     expect(projectedPlaneTiltReadoutDegrees(projectedPlaneTiltRadiansFromDrag(start, { x: 0, y: -390 }))).toBe(10);
     expect(projectedPlaneTiltReadoutDegrees(projectedPlaneTiltRadiansFromDrag(start, { x: 0, y: 340 }))).toBe(0);
     expect(projectedPlaneTiltReadoutDegrees(projectedPlaneTiltRadiansFromDrag(start, { x: 0, y: 350 }))).toBe(10);
-  });
-
-  it("keeps short rotate-handle drags smooth instead of jumpy", () => {
-    const center = { x: 0, y: 0 };
-    const start = { x: 0, y: -20 };
-
-    expect(rotationDeltaDegrees(center, start, { x: 4, y: -20 })).toBe(4);
-    expect(rotationDeltaDegrees(center, start, { x: 8, y: -20 })).toBe(8);
   });
 
   it("uses the placement click point as the rotation origin for fresh bonds and templates", () => {
@@ -3267,7 +3255,7 @@ describe("ChemDraft desktop shell", () => {
     expect(mainWindowSource).toContain('data-group-tilt3d-handle="true"');
     expect(mainWindowSource).toContain("handleGroupProjectedPlaneTiltPointerDown");
     expect(mainWindowSource).toContain('"group-projected-plane-tilt"');
-    expect(mainWindowSource).toContain("center: { x: bounds.centerX, y: bounds.centerY }");
+    expect(mainWindowSource).toContain("const center = { x: bounds.centerX, y: bounds.centerY }");
     expect(mainWindowSource).toContain("tiltNativeMoleculeObjectsProjectedPlane");
   });
 
