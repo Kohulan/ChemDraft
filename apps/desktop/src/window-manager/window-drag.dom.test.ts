@@ -15,11 +15,9 @@ const native = vi.hoisted(() => ({
   invoke: vi.fn(async (_command: string, _args?: Record<string, unknown>, _options?: unknown): Promise<unknown> => undefined),
   drag: vi.fn(),
   move: vi.fn(),
-  resize: vi.fn(),
-  currentMonitor: vi.fn(async () => null)
+  resize: vi.fn()
 }));
 vi.mock("@tauri-apps/api/window", () => ({
-  currentMonitor: native.currentMonitor,
   getCurrentWindow: () => ({ startDragging: native.drag, setPosition: native.move, setSize: native.resize }),
   LogicalSize: class {
     constructor(public width: number, public height: number) {}
@@ -37,7 +35,6 @@ describe.each(["macos", "windows"] as const)("native title dragging (%s)", platf
     native.drag.mockClear();
     native.move.mockClear();
     native.resize.mockReset();
-    native.currentMonitor.mockClear();
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -89,16 +86,20 @@ describe.each(["macos", "windows"] as const)("native title dragging (%s)", platf
 
   it("retries the same content measurement after a skipped resize", async () => {
     const outcomes = [false, true];
-    native.invoke.mockImplementation(async (command) => command === "resize_toolset_window" ? outcomes.shift() : undefined);
+    native.invoke.mockImplementation(async (command) => {
+      if (command === "current_window_logical_work_area") return { left: 0, top: 24, right: 1920, bottom: 1040 };
+      if (command === "resize_toolset_window") return outcomes.shift();
+    });
     const requests = () => native.invoke.mock.calls.filter(([command]) => command === "resize_toolset_window");
+    const workAreaReads = () => native.invoke.mock.calls.filter(([command]) => command === "current_window_logical_work_area").length;
     await mount("palette", true);
     await vi.waitFor(() => expect(requests()).toHaveLength(1));
     window.dispatchEvent(new Event("resize"));
     await vi.waitFor(() => expect(requests()).toHaveLength(2));
     expect(requests()[1]).toEqual(requests()[0]);
-    const monitorReads = native.currentMonitor.mock.calls.length;
+    const previousReads = workAreaReads();
     await dispatch(window, new Event("resize"));
-    await vi.waitFor(() => expect(native.currentMonitor.mock.calls.length).toBeGreaterThan(monitorReads));
+    await vi.waitFor(() => expect(workAreaReads()).toBeGreaterThan(previousReads));
     expect(requests()).toHaveLength(2);
   });
 
