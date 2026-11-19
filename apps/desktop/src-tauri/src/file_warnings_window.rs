@@ -3,8 +3,13 @@ use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use tauri::{ipc::Channel, Manager, Runtime, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
+#[cfg(any(windows, test))]
+use super::panel_window_frame::{Monitor, Placement};
+
 const LABEL: &str = "file-warnings";
 const MAX_BYTES: usize = 4 * 1024 * 1024;
+const WIDTH: f64 = 520.0;
+const HEIGHT: f64 = 360.0;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -201,8 +206,8 @@ fn window_config(windows: bool) -> tauri::utils::config::WindowConfig {
         // `parent` is a document HWND owner on Windows. Never an AppKit child:
         // addChildWindow would reset the separately configured floating + 1 level.
         parent: windows.then(|| super::MAIN_WINDOW_LABEL.into()),
-        width: 520.0,
-        height: 360.0,
+        width: WIDTH,
+        height: HEIGHT,
         focus: false,
         focusable: true,
         skip_taskbar: true,
@@ -262,7 +267,12 @@ fn configure<R: Runtime>(window: &tauri::WebviewWindow<R>, reveal: bool) -> Resu
     Ok(())
 }
 
-fn place<R: Runtime>(window: &tauri::WebviewWindow<R>, anchor: Anchor) -> Result<(), String> {
+#[cfg(not(windows))]
+fn place<R: Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    _document: &tauri::WebviewWindow<R>,
+    anchor: Anchor,
+) -> Result<(), String> {
     let monitors = window.available_monitors().map_err(|e| e.to_string())?;
     let monitor = monitors
         .iter()
@@ -273,10 +283,8 @@ fn place<R: Runtime>(window: &tauri::WebviewWindow<R>, anchor: Anchor) -> Result
         .or(monitors.first())
         .ok_or("No monitor is available for file warnings")?;
     let area = super::monitor_logical_work_area(monitor);
-    let width = 520.0_f64.min(area.width);
-    let height = 360.0_f64.min(area.height);
-    // Size with the DESTINATION scale before moving; the hidden window may still
-    // report the previous monitor's scale on a mixed-DPI Windows desktop.
+    let width = WIDTH.min(area.width);
+    let height = HEIGHT.min(area.height);
     window
         .set_size(tauri::PhysicalSize::new(
             (width * monitor.scale_factor()).round() as u32,
@@ -290,6 +298,70 @@ fn place<R: Runtime>(window: &tauri::WebviewWindow<R>, anchor: Anchor) -> Result
             .min(area.y + area.height - height)
             .max(area.y),
     )
+}
+
+#[cfg(any(windows, test))]
+fn windows_placement(
+    anchor: Anchor,
+    document_scale: f64,
+    monitors: &[Monitor],
+    primary: &Monitor,
+) -> Placement {
+    // The webview sends its document's logical content origin plus the button offset.
+    let physical_anchor = (anchor.x * document_scale, anchor.y * document_scale);
+    let monitor =
+        super::monitor_containing_physical_point(monitors, physical_anchor).unwrap_or(primary);
+    let (left, top) = monitor.identity.position;
+    let (left, top) = (f64::from(left), f64::from(top));
+    let scale = monitor.scale;
+    let area = monitor.work_area;
+    let width = WIDTH.min(area.width);
+    let height = HEIGHT.min(area.height);
+    let x = ((physical_anchor.0 - left) / scale).clamp(area.x, area.x + (area.width - width));
+    let y =
+        ((physical_anchor.1 - top) / scale - height).clamp(area.y, area.y + (area.height - height));
+    Placement {
+        position: (
+            (left + x * scale).round() as i32,
+            (top + y * scale).round() as i32,
+        ),
+        size: (
+            (width * scale).round() as u32,
+            (height * scale).round() as u32,
+        ),
+        scale,
+    }
+}
+
+#[cfg(windows)]
+fn place<R: Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    document: &tauri::WebviewWindow<R>,
+    anchor: Anchor,
+) -> Result<(), String> {
+    let document_scale = document.scale_factor().map_err(|e| e.to_string())?;
+    let monitors: Vec<_> = window
+        .available_monitors()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .map(Monitor::from_native)
+        .collect();
+    let primary = window
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .as_ref()
+        .map(Monitor::from_native);
+    let primary = primary
+        .as_ref()
+        .or_else(|| monitors.first())
+        .ok_or("No monitor is available for file warnings")?;
+    let placement = windows_placement(anchor, document_scale, &monitors, primary);
+    let target = window.clone();
+    super::run_on_main_thread_blocking(window, move || {
+        let webview: &tauri::Webview<R> = target.as_ref();
+        super::panel_full_size::apply(&webview.window(), placement, "file warnings placement")
+    })?
 }
 
 #[tauri::command]
@@ -320,7 +392,7 @@ pub(crate) async fn file_warnings_open(
         }
     };
     target.hide().map_err(|e| e.to_string())?;
-    place(&target, anchor)?;
+    place(&target, &window, anchor)?;
     let mut state = STATE.lock().map_err(|e| e.to_string())?;
     state.session = Some(Session {
         snapshot,
@@ -657,6 +729,62 @@ mod tests {
         }
         assert_eq!(window_level(3), 4);
     }
+
+    #[test]
+    fn windows_warnings_use_the_physical_anchor_and_destination_scale() {
+        use super::super::{panel_window_frame::MonitorIdentity, ScreenRect};
+
+        let monitors = [
+            Monitor {
+                identity: MonitorIdentity {
+                    name: None,
+                    position: (0, 0),
+                    size: (1920, 1080),
+                },
+                scale: 1.0,
+                work_area: ScreenRect::new(0.0, 0.0, 1920.0, 1040.0),
+            },
+            Monitor {
+                identity: MonitorIdentity {
+                    name: None,
+                    position: (1920, 0),
+                    size: (2560, 1600),
+                },
+                scale: 2.0,
+                work_area: ScreenRect::new(0.0, 20.0, 1280.0, 740.0),
+            },
+        ];
+        let place =
+            |x, y, scale| windows_placement(Anchor { x, y }, scale, &monitors, &monitors[0]);
+
+        // The logical point overlaps the primary display, but its pixels are on the secondary.
+        assert_eq!(
+            place(1200.0, 650.0, 2.0),
+            Placement {
+                position: (2400, 580),
+                size: (1040, 720),
+                scale: 2.0,
+            },
+        );
+        // A document at 100% can extend onto the 200% display. Use the button's monitor.
+        assert_eq!(
+            place(1920.0, 400.0, 1.0),
+            Placement {
+                position: (1920, 40),
+                size: (1040, 720),
+                scale: 2.0,
+            },
+        );
+        assert_eq!(
+            place(-50.0, -10.0, 2.0),
+            Placement {
+                position: (0, 0),
+                size: (520, 360),
+                scale: 1.0,
+            },
+        );
+    }
+
     #[test]
     fn actions_require_live_session_revision_and_available_row() {
         let mut snapshot = snapshot();

@@ -10976,6 +10976,16 @@ fn toolset_monitor_contains(monitor: &ToolsetMonitor, point: (f64, f64)) -> bool
     (x..x + f64::from(width)).contains(&point.0) && (y..y + f64::from(height)).contains(&point.1)
 }
 
+#[cfg(any(windows, test))]
+fn monitor_containing_physical_point(
+    monitors: &[ToolsetMonitor],
+    point: (f64, f64),
+) -> Option<&ToolsetMonitor> {
+    monitors
+        .iter()
+        .find(|monitor| toolset_monitor_contains(monitor, point))
+}
+
 /// Select a Windows monitor in virtual-desktop pixels. Only after selecting it do we use its
 /// scale to clamp the frame in monitor-local points and convert it back to pixels.
 #[cfg(any(windows, test))]
@@ -11012,14 +11022,8 @@ fn clamp_toolset_frame_in_physical_space(
         physical.0 + size.0 * source_scale / 2.0,
         physical.1 + size.1 * source_scale / 2.0,
     );
-    let monitor = monitors
-        .iter()
-        .find(|monitor| toolset_monitor_contains(monitor, physical))
-        .or_else(|| {
-            monitors
-                .iter()
-                .find(|monitor| toolset_monitor_contains(monitor, center))
-        })
+    let monitor = monitor_containing_physical_point(monitors, physical)
+        .or_else(|| monitor_containing_physical_point(monitors, center))
         .or_else(|| {
             if resizable {
                 return None;
