@@ -169,6 +169,41 @@ describe.each([false, true])("directed Arrow objects (binary=%s)", binary => {
     assertEndpoints(reopened, start, end);
   });
 
+  it.each([
+    ["edited equilibrium", "equilibrium"],
+    ["unedited equilibrium", "equilibrium"],
+    ["retrosynthesis", "retrosynthesis"]
+  ] as const)("round-trips %s with native payload disabled", (variant, kind) => {
+    const start = { x: 400, y: 200 }, end = { x: 200, y: 200 };
+    const document = createEmptyDocument();
+    const arrow = artArrow(start, end, kind);
+    if (variant === "edited equilibrium") {
+      delete arrow.data.markerStart;
+      arrow.data.markerEnd = { kind: "open-arrow", sizePx: 16 };
+    }
+    document.pages[0].objects.push(arrow);
+
+    const options = { embedNativePayload: false };
+    const opened = binary
+      ? importCdx(exportDocumentToCdx(document, options).bytes)
+      : openChemDraftPayload(exportDocumentToCdxml(document, options).contents);
+    expect(opened.source).toBe("external-cdxml");
+    const reopened = opened.document!.pages[0].objects[0] as GraphicObject;
+    expect(reopened.data.artToolId).toBe(arrow.data.artToolId);
+    expect(reopened.data.dualShaft).toBe(true);
+    expect(reopened.data.dualShaftParallel).toBe(arrow.data.dualShaftParallel);
+    expect(reopened.data.markerStart?.kind).toBe(arrow.data.markerStart?.kind);
+    expect(reopened.data.markerEnd?.kind).toBe(arrow.data.markerEnd?.kind);
+    assertEndpoints(reopened, start, end);
+  });
+
+  it("still infers retrosynthesis from an angle head with other positive shaft spacing", () => {
+    const xml = '<CDXML><page id="1"><arrow id="2" Tail3D="300 150 0" Head3D="150 150 0" ArrowheadHead="Full" ArrowheadType="Angle" ArrowShaftSpacing="301"/></page></CDXML>';
+    const opened = binary ? importCdx(writeCdx(tree(xml))) : openChemDraftPayload(xml);
+    const arrow = opened.document!.pages[0].objects[0] as GraphicObject;
+    expect(arrow.data).toMatchObject({ artToolId: "retroArrow", dualShaft: true, dualShaftParallel: true });
+  });
+
   it("writes the actual edited head side instead of the semantic tool's defaults", () => {
     const start = { x: 400, y: 200 }, end = { x: 200, y: 200 };
     const document = createEmptyDocument();

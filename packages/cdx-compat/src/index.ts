@@ -283,6 +283,8 @@ const defaultCdxmlCornerRadiusFactor = 100;
 // defaults) and is indistinguishable from a drawn one.
 const defaultCdxmlArrowheadSizePx = 16;
 const defaultCdxmlHalfArrowheadSizePx = 14;
+const cdxmlEquilibriumShaftSpacing = 300;
+const cdxmlRetrosynthesisShaftSpacing = 600;
 const standardCdxmlColorTable = [
   "#ffffff",
   "#000000",
@@ -2606,7 +2608,8 @@ function exportGraphicAsCdxmlArrow(
  * Head sizing and the exact native shaft gap remain an appearance approximation. */
 function cdxmlArrowShaftAttributes(graphic: GraphicObject): string[] {
   if (!graphic.data.dualShaft) return [];
-  return [`ArrowShaftSpacing="${graphic.data.dualShaftParallel ? 600 : 300}"`];
+  const spacing = graphic.data.dualShaftParallel ? cdxmlRetrosynthesisShaftSpacing : cdxmlEquilibriumShaftSpacing;
+  return [`ArrowShaftSpacing="${spacing}"`];
 }
 
 function cdxmlArrowLineWidthAttributes(graphic: GraphicObject): string[] {
@@ -4924,8 +4927,12 @@ function importArrowGraphic(
 ): GraphicObject {
   const graphic = importShapeGraphic(element, pageIndex, objectIndex, context, "arrow");
   const markers = cdxmlArrowMarkers(element);
-  const spaced = (parseNumber(element.attributes.ArrowShaftSpacing) ?? 0) > 0;
-  const retro = spaced && !markers.markerStart && markers.markerEnd?.kind === "open-arrow" &&
+  const spacing = parseNumber(element.attributes.ArrowShaftSpacing) ?? 0;
+  const spaced = spacing > 0;
+  // The writer's exact equilibrium spacing identifies edited equilibrium arrows with a single
+  // open head. At other positive spacings retain the head-based inference for external files.
+  const retro = spaced && spacing !== cdxmlEquilibriumShaftSpacing &&
+    !markers.markerStart && markers.markerEnd?.kind === "open-arrow" &&
     normalizedCdxmlToken(element.attributes.ArrowheadType) === "angle";
   // Shaft spacing retains the two-shaft identity even when either or both heads were removed.
   const equilibrium = spaced && !retro;
