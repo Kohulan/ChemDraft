@@ -55,6 +55,7 @@ import { createBracketCommands } from "./bracketCommands";
 export { tableRuleWidthCommandId, parseTableRuleWidthCommandId } from "./tableCommands";
 import { templateDialogAction, templateInsertActions } from "./templateCommands";
 import { atomProblemCommands } from "./atomProblemCommands";
+import { vibeCodeStarterCommand } from "./commands/vibeCodeStarter";
 export { bondDrawingToolCommandId } from "./bondToolCommands";
 export { templateInsertCommandId } from "./templateCommands";
 
@@ -81,6 +82,8 @@ export interface ShellCommandOptions {
   compoundLayoutSettings?: CompoundLayoutSettings;
   availability?: CommandAvailability;
   registry?: DesktopToolsetRegistry;
+  /** The uncustomized command catalog. The live registry still supplies toolbar launchers. */
+  paletteCommands?: readonly CommandSpec[];
 }
 
 export interface CommandSpec extends CommandDefinition {
@@ -2477,7 +2480,7 @@ export function allShellCommands(
       options.structureSearchEnabled ?? loadStructureSearchEnabled(),
       options.hasSearchableStructure ?? structureSearchDocument(document) !== undefined
     ),
-    ...allPaletteCommands(registry),
+    ...(options.paletteCommands ?? allPaletteCommands()),
     ...copyAsActions,
     ...editActions,
     ...atomElementActions,
@@ -2491,7 +2494,8 @@ export function allShellCommands(
     ...textToolbarActions,
     ...objectStyleActions,
     ...nativeStylePresetActions,
-    ...toolbarCustomizationActions
+    ...toolbarCustomizationActions,
+    vibeCodeStarterCommand
   ]);
 }
 

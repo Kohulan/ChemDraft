@@ -61,9 +61,7 @@ describe("CustomizeToolbarsDialog", () => {
 
   const circle = { id: "tool.art.circle", title: "Circle", icon: "bracket", assetName: "Art_Circle" } as const;
   const availableCommands = filterToolbarCustomizationCommands([
-    { id: "tool.a", title: "A" },
-    { id: "tool.b", title: "B" },
-    { id: "plugin.fixture.ping", title: "Ping" },
+    { id: "plugin.fixture.ping", title: "Ping", source: "plugin" },
     circle,
     { id: "tool.testStub", title: "Unimplemented Test Tool" },
     { id: "tool.art.rectShadow", title: "Shadow Rectangle" },
@@ -270,6 +268,20 @@ describe("CustomizeToolbarsDialog", () => {
     expect(container.querySelector('[data-command-id="tool.testStub"]')).toBeNull();
     expect(container.querySelector('[data-command-id="tool.art.rectShadow"]')).toBeNull();
     expect(container.querySelector('[data-command-id="edit.undo"]')?.textContent).toBe("+ Undo");
+  });
+
+  it("re-shows a manifest command with a legacy hidden override while preserving its placement", () => {
+    const layout = { colSpan: 2 };
+    render({
+      ...emptyState,
+      toolsetOverrides: [{ toolsetId: "plugin.fixture", itemOverrides: [{ commandId: "plugin.fixture.ping", hidden: true, layout }] }]
+    });
+    click('[data-toolset-id="plugin.fixture"] .customize-toolset-title');
+    expect(container.querySelector<HTMLInputElement>('[data-item-id="plugin.fixture.ping"] .customize-item-visible')?.checked).toBe(false);
+    openPicker();
+    click('[data-command-id="plugin.fixture.ping"]');
+    expect(container.querySelectorAll('[data-item-id="plugin.fixture.ping"]')).toHaveLength(1);
+    expect(applied().toolsetOverrides).toEqual([{ toolsetId: "plugin.fixture", itemOverrides: [{ commandId: "plugin.fixture.ping", layout }] }]);
   });
 
   it("surfaces an in-place addition (spacer) as a row so it can be hidden there too", () => {

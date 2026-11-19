@@ -1,5 +1,7 @@
-import { ToolsetRegistry, applyToolsetLayoutState } from "@chemdraft/toolset-registry";
-import { desktopToolsets, migrateBracketToolbarOrder, type DesktopToolsetDefinition, type DesktopToolsetRegistry } from "../toolsets";
+import { ToolsetRegistry, applyToolsetLayoutState, isValidToolsetCommandId } from "@chemdraft/toolset-registry";
+import type { CommandDefinition } from "@chemdraft/plugin-host";
+import { allPaletteCommands, type CommandSpec } from "../commands";
+import { desktopToolsets, desktopToolsetRegistry, migrateBracketToolbarOrder, type DesktopToolsetDefinition, type DesktopToolsetRegistry } from "../toolsets";
 import { SHELL_COMMAND_IDS } from "../shellCommandIds";
 import type { IconName } from "../icons";
 import type { ToolbarAssetName } from "../toolbarAssets";
@@ -19,7 +21,8 @@ export interface ToolbarCatalog {
   /** Core ∪ plugin toolsets BEFORE the user's layout state — what the Customize editor re-applies its
    *  draft on top of. */
   baseToolsets(): readonly DesktopToolsetDefinition[];
-  setPluginToolsets(toolsets: readonly DesktopToolsetDefinition[]): void;
+  baseCommands(): readonly CommandSpec[];
+  setPluginToolsets(toolsets: readonly DesktopToolsetDefinition[], registeredCommands?: readonly CommandDefinition[]): void;
   setLayoutState(state: unknown): void;
   warnings(): readonly string[];
   onDidChange(listener: () => void): () => void;
@@ -27,6 +30,8 @@ export interface ToolbarCatalog {
 
 export function createToolbarCatalog(): ToolbarCatalog {
   let pluginToolsets: readonly DesktopToolsetDefinition[] = [];
+  let baseCommands = allPaletteCommands(desktopToolsetRegistry);
+  let additionalCommandIds = SHELL_COMMAND_IDS;
   let layoutState: unknown;
   let warningList: readonly string[] = [];
   const listeners = new Set<() => void>();
@@ -42,7 +47,7 @@ export function createToolbarCatalog(): ToolbarCatalog {
     const applied = applyToolsetLayoutState<IconName, ToolbarAssetName>(combined, migrateBracketToolbarOrder(layoutState), {
       // In-place customize can add any shell command, not just manifest ones — treat the whole
       // catalog as valid so those additions aren't pruned as "unknown" on render.
-      additionalCommandIds: SHELL_COMMAND_IDS,
+      additionalCommandIds,
       onUnknownCommand: "prune",
       onWarning: (warning) => warnings.push(warning)
     });
@@ -60,8 +65,24 @@ export function createToolbarCatalog(): ToolbarCatalog {
   return {
     registry: () => snapshot,
     baseToolsets: () => [...desktopToolsets, ...pluginToolsets],
-    setPluginToolsets(toolsets) {
+    baseCommands: () => baseCommands,
+    setPluginToolsets(toolsets, registeredCommands = []) {
       pluginToolsets = [...toolsets];
+      const paletteCommands = allPaletteCommands(new ToolsetRegistry([...desktopToolsets, ...pluginToolsets]));
+      const commandsById = new Map(paletteCommands.map(command => [command.id, command]));
+      const pluginCommands = registeredCommands.filter(command => command.source === "plugin" && isValidToolsetCommandId(command.id));
+      for (const command of pluginCommands) {
+        const presentation = commandsById.get(command.id);
+        commandsById.set(command.id, {
+          ...command,
+          ...presentation,
+          icon: presentation?.icon ?? "plugin",
+          enabled: command.enabled,
+          disabledReason: command.enabled === false ? presentation?.disabledReason ?? "Plugin command unavailable" : undefined
+        });
+      }
+      baseCommands = [...commandsById.values()];
+      additionalCommandIds = new Set([...SHELL_COMMAND_IDS, ...pluginCommands.map(command => command.id)]);
       rebuild();
     },
     setLayoutState(state) {

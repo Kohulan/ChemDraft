@@ -1,4 +1,4 @@
-import type { ToolsetItemDefinition, ToolsetLayoutState } from "@chemdraft/toolset-registry";
+import { hiddenToolsetItemIds, type ToolsetItemDefinition, type ToolsetLayoutState } from "@chemdraft/toolset-registry";
 import type { ToolsetLayoutEditPayload } from "../../window-manager";
 import {
   addToolsetItemAddition,
@@ -19,7 +19,7 @@ function isHiddenByOverride<I extends string, A extends string>(
   id: string
 ): boolean {
   const override = state.toolsetOverrides.find((entry) => entry.toolsetId === toolsetId);
-  return (override?.hiddenCommandIds ?? []).includes(id);
+  return hiddenToolsetItemIds(override).has(id);
 }
 
 /** Persist the drop position as a complete order over the authoritative, currently rendered group.

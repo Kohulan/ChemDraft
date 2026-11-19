@@ -152,6 +152,14 @@ export function setItemHidden<I extends string, A extends string>(
       current.delete(itemId);
     }
     draft.hiddenCommandIds = current.size > 0 ? [...current] : undefined;
+    if (draft.itemOverrides?.some(override => override.commandId === itemId && override.hidden !== undefined)) {
+      const overrides = draft.itemOverrides.flatMap(override => {
+        if (override.commandId !== itemId) return [override];
+        const { hidden: _, ...placementOverride } = override;
+        return placementOverride.placement || placementOverride.layout ? [placementOverride] : [];
+      });
+      draft.itemOverrides = overrides.length > 0 ? overrides : undefined;
+    }
   });
 }
 

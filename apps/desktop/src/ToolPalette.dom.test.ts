@@ -22,8 +22,38 @@ import {
 } from "./commands";
 import { getToolsetCommandGroups, getToolsetItemGroups, type ToolbarPaletteGroupModel, type ToolbarPaletteItemModel } from "./toolsets";
 import { ToolbarCustomizeController } from "./toolbars/CustomizeMainToolbar/ToolbarCustomizeController";
+import { createToolbarCatalog } from "./toolbars/toolbarCatalog";
+import { createCommandToolbarItem } from "./toolbars/CustomizeToolbars/layoutStateEdits";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+it.each(["core.art", "core.ringInspector", "core.drawnStructureSettings", "core.molecularInspector"])(
+  "renders and invokes added commands in %s alongside its widget",
+  toolsetId => {
+    const catalog = createToolbarCatalog();
+    const groupId = catalog.registry().require(toolsetId).groups[0].id!;
+    const command: CommandSpec = { id: "edit.undo", title: "Undo", icon: "undo", enabled: true };
+    catalog.setLayoutState({ version: 1, userToolsets: [], toolsetOverrides: [{
+      toolsetId, itemAdditions: [{ groupId, item: createCommandToolbarItem(command) }]
+    }] });
+    const itemGroups = getToolsetItemGroups(toolsetId, catalog.registry(), new Map([[command.id, command]]));
+    expect(itemGroups.flat().some(item => item.id === command.id)).toBe(true);
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const onInvoke = vi.fn();
+    try {
+      act(() => root.render(createElement(ToolPalette, { itemGroups, orientation: "horizontal", mode: "floating", onInvoke })));
+      const buttons = container.querySelectorAll<HTMLButtonElement>('[data-command-id="edit.undo"]');
+      expect(buttons).toHaveLength(1);
+      act(() => buttons[0]!.click());
+      expect(onInvoke).toHaveBeenCalledExactlyOnceWith(command.id);
+    } finally {
+      act(() => root.unmount());
+      container.remove();
+    }
+  }
+);
 
 // Phase 5: widgets are declared as manifest `control` items and read their state from context. This
 // isolates just a toolset's widget item (no grid commands), the way the old `groups: []` +

@@ -3927,7 +3927,7 @@ describe("ChemDraft desktop shell", () => {
     expect(toggles.every((command) => command.category === "view")).toBe(true);
   });
 
-  it("builds the shell catalog from the effective registry and current history availability", () => {
+  it("uses live toolbar titles and current history availability in the shell catalog", () => {
     const pluginCommands = allShellCommands(createPhase4Document(), undefined, {
       registry: buildRegistryWithFixture()
     });
@@ -4107,14 +4107,6 @@ describe("ChemDraft desktop shell", () => {
     expect(genericAt).toBeGreaterThan(cancelAt);
     // And it must restore the pre-drag document rather than keep the preview.
     expect(mainWindowSource).toContain("replacePresentDocument(drag.startDocument);");
-  });
-
-  it("uses shared command eligibility for the dialog and both in-place gallery sources", () => {
-    expect(mainWindowSource).toContain("filterToolbarCustomizationCommands(shellCommandSpecs, compoundLayoutSettings)");
-    expect(mainWindowSource).toContain("return galleryCommands.filter(");
-    expect(mainWindowSource).toContain("availableCommands={customizeCommandOptions}");
-    expect(paletteWindowSource).toContain("filterToolbarCustomizationCommands(allCommands, compoundLayoutSettings)");
-    expect(paletteWindowSource).toContain("commands={galleryCommands}");
   });
 
   it("treats art style presets as compat-only but keeps other unshipped art tools offered", () => {

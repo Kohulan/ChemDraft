@@ -18,6 +18,7 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import {
   applyToolsetLayoutState,
+  hiddenToolsetItemIds,
   mergeToolsetItemAdditions,
   toolsetItemCustomizationId,
   type ToolsetGroupDefinition,
@@ -108,7 +109,11 @@ export interface CustomizeToolbarsDialogProps {
 /** Apply the draft to the base toolsets so the list reflects order, visibility, and renames live.
  *  `error` is true when the draft can't be applied (e.g. a corrupt loaded state) — the preview falls
  *  back to the base set, and the dialog blocks Apply so a broken draft is never committed. */
-function useEffectiveToolsets(baseToolsets: readonly DesktopToolsetDefinition[], draft: LayoutState) {
+function useEffectiveToolsets(
+  baseToolsets: readonly DesktopToolsetDefinition[],
+  draft: LayoutState,
+  availableCommands: readonly CommandOption[]
+) {
   return useMemo(() => {
     try {
       // Let the generics infer from baseToolsets (DesktopToolsetDefinition) so the result stays
@@ -116,7 +121,7 @@ function useEffectiveToolsets(baseToolsets: readonly DesktopToolsetDefinition[],
       // not assignable to IconName) and only compiled by TS eliding a deep comparison.
       return {
         toolsets: applyToolsetLayoutState([...baseToolsets], draft, {
-          additionalCommandIds: SHELL_COMMAND_IDS,
+          additionalCommandIds: new Set([...SHELL_COMMAND_IDS, ...availableCommands.map(command => command.id)]),
           onUnknownCommand: "prune"
         }),
         error: false
@@ -124,7 +129,7 @@ function useEffectiveToolsets(baseToolsets: readonly DesktopToolsetDefinition[],
     } catch {
       return { toolsets: [...baseToolsets], error: true };
     }
-  }, [baseToolsets, draft]);
+  }, [baseToolsets, draft, availableCommands]);
 }
 
 function SortableToolsetRow({
@@ -248,7 +253,7 @@ export function CustomizeToolbarsDialog({
     }
     onLiveApplyRef.current?.(draft);
   }, [draft]);
-  const { toolsets: effective, error: draftError } = useEffectiveToolsets(baseToolsets, draft);
+  const { toolsets: effective, error: draftError } = useEffectiveToolsets(baseToolsets, draft, availableCommands);
   const [selectedToolsetId, setSelectedToolsetId] = useState<string | undefined>(effective[0]?.id);
   const [newToolbarName, setNewToolbarName] = useState("");
 
@@ -307,13 +312,13 @@ export function CustomizeToolbarsDialog({
     effective.find((toolset) => toolset.id === selectedToolsetId)?.title ?? selectedBase?.title ?? "";
 
   const selectedOverride = draft.toolsetOverrides.find((entry) => entry.toolsetId === selectedToolsetId);
+  const hiddenItemIds = useMemo(() => hiddenToolsetItemIds(selectedOverride), [selectedOverride]);
   const groupsWithAdditions = useMemo(
     () => mergeToolsetItemAdditions<string, string>(selectedBase?.groups ?? [], selectedOverride?.itemAdditions),
     [selectedBase, selectedOverride?.itemAdditions]
   );
 
   const detailGroups: CustomizeGroupModel[] = useMemo(() => {
-    const hidden = new Set(selectedOverride?.hiddenCommandIds ?? []);
     const baseItemIds = toolbarItemIds(selectedBase?.groups ?? []);
     return groupsWithAdditions.map((group) => {
       const groupId = group.id ?? "";
@@ -327,7 +332,7 @@ export function CustomizeToolbarsDialog({
             return {
               id,
               label: item.label ?? id,
-              hidden: hidden.has(id),
+              hidden: hiddenItemIds.has(id),
               isWidget: isWidgetItem(item),
               canRemove: selectedIsUser || !baseItemIds.has(id)
             };
@@ -335,7 +340,7 @@ export function CustomizeToolbarsDialog({
           .filter((item) => item.id.length > 0)
       };
     });
-  }, [groupsWithAdditions, selectedBase, selectedOverride, selectedIsUser]);
+  }, [groupsWithAdditions, hiddenItemIds, selectedBase, selectedOverride, selectedIsUser]);
 
   const displayedGroups = useMemo(() => isCommandHidden
     ? detailGroups.map((group) => ({ ...group, items: group.items.filter((item) => !isCommandHidden(item.id)) }))
@@ -343,8 +348,9 @@ export function CustomizeToolbarsDialog({
 
   const availableForToolset: CommandOption[] = useMemo(() => {
     const present = toolbarItemIds(groupsWithAdditions);
+    hiddenItemIds.forEach((id) => present.delete(id));
     return availableCommands.filter((command) => !isCommandHidden?.(command.id) && !present.has(command.id));
-  }, [availableCommands, groupsWithAdditions, isCommandHidden]);
+  }, [availableCommands, groupsWithAdditions, hiddenItemIds, isCommandHidden]);
 
   const addCommand = (command: CommandOption) => {
     if (!selectedBase) {
@@ -360,8 +366,9 @@ export function CustomizeToolbarsDialog({
       const override = current.toolsetOverrides.find((entry) => entry.toolsetId === toolsetId);
       const groups = mergeToolsetItemAdditions<string, string>(toolset.groups, override?.itemAdditions);
       const presentItemIds = toolbarItemIds(groups);
+      const wasHidden = hiddenToolsetItemIds(override).has(command.id);
       if (presentItemIds.has(command.id)) {
-        return current;
+        return wasHidden ? setItemHidden(current, toolsetId, command.id, false) : current;
       }
       const item = createCommandToolbarItem(command);
       const targetGroup = toolset.groups.find((group) => group.id) ?? toolset.groups[0];
@@ -374,7 +381,7 @@ export function CustomizeToolbarsDialog({
       } else if (targetGroup?.id) {
         next = addToolsetItemAddition(current, toolsetId, { groupId: targetGroup.id, item }, { presentItemIds });
       }
-      return next !== current && override?.hiddenCommandIds?.includes(command.id)
+      return next !== current && wasHidden
         ? setItemHidden(next, toolsetId, command.id, false)
         : next;
     });

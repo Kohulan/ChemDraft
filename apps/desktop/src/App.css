@@ -1432,6 +1432,19 @@ textarea:focus-visible,
   grid-column: 2;
 }
 
+.tool-palette-added-commands {
+  display: flex;
+  flex-wrap: wrap;
+  flex: none;
+  grid-column: -2 / -1;
+  gap: var(--cd-space-2);
+  padding: var(--cd-space-2);
+}
+
+.tool-palette.horizontal.molecular-inspector-palette {
+  flex-direction: column;
+}
+
 .art-toolbar-command-grid {
   display: grid;
   grid-template-columns: repeat(4, max-content);
@@ -2529,6 +2542,8 @@ textarea:focus-visible,
 .palette-window-shell[data-resizable] .molecular-inspector-pane {
   flex: 1;
   min-width: 0;
+  min-height: 0;
+  width: 100%;
   height: 100%;
 }
 

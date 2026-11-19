@@ -36,8 +36,8 @@ import {
   createDesktopToolsetRegistry,
   desktopToolsetRegistry,
   compoundLayoutRegistry,
-  computePaletteGridSize,
   getToolsetPaletteGroups,
+  initialToolsetWindowSize,
   paletteCommandGroupsFromItemGroups,
   type DesktopToolsetDefinition,
   type DesktopToolsetRegistry,
@@ -108,7 +108,7 @@ export function createPaletteRegistryFromLayoutState(
 ): DesktopToolsetRegistry {
   return createDesktopToolsetRegistry(
     layoutState,
-    new Set([...SHELL_COMMAND_IDS, ...commandSpecs.map((command) => command.id)]),
+    new Set([...SHELL_COMMAND_IDS, ...commandSpecs.filter(command => command.source === "plugin").map(command => command.id)]),
     pluginToolsets
   );
 }
@@ -219,7 +219,9 @@ export function PaletteWindow({
     [knownToolset, commandOverrides, toolset.id, toolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings]
   );
   const itemGroups = useMemo(() => paletteGroups.map((group) => group.items), [paletteGroups]);
-  const gridWindowSize = useMemo(() => computePaletteGridSize(toolset.gridLayout, itemGroups), [itemGroups, toolset.gridLayout]);
+  const { width: fallbackWidth, height: fallbackHeight } = useMemo(
+    () => initialToolsetWindowSize(toolset, itemGroups), [itemGroups, toolset]
+  );
   // The main window owns live command metadata/availability and publishes snapshots to detached
   // palettes. The state initializer above is only a first-paint fallback before that handshake.
   // Snapshots arrive already remapped for the active keybinding scheme; re-applying here covers the
@@ -466,10 +468,9 @@ export function PaletteWindow({
         const rect = shell?.getBoundingClientRect();
         const contentWidth = rect ? Math.ceil(rect.width) : 0;
         const contentHeight = rect ? Math.ceil(rect.height) : 0;
-        const preferredSize = gridWindowSize ?? toolset.preferredWindowSize;
-        const width = contentWidth || preferredSize?.width || 0;
+        const width = contentWidth || fallbackWidth;
         const height = Math.min(availableHeight,
-          Math.max(colorPickerOpen ? 292 : 0, contentHeight || preferredSize?.height || 0));
+          Math.max(colorPickerOpen ? 292 : 0, contentHeight || fallbackHeight));
         if (width <= 0 || height <= 0) return;
         // Dev-only size probe: open the palette window's devtools console to read exact
         // content-vs-window numbers for any palette that still looks wrong.
@@ -521,7 +522,7 @@ export function PaletteWindow({
         sizeAnimationFrameRef.current = undefined;
       }
     };
-  }, [colorPickerOpen, gridWindowSize, knownToolset, resizable, toolset.id, toolset.preferredWindowSize]);
+  }, [colorPickerOpen, fallbackHeight, fallbackWidth, knownToolset, resizable, toolset.id]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;

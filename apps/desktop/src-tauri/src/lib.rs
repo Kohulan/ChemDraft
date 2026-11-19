@@ -2840,9 +2840,9 @@ fn restore_utility_labels<R: Runtime>(
         if window.is_minimized().unwrap_or(true) {
             continue;
         }
-        if toolset_id_for_window_label(app, &label).is_some() {
+        if let Some(toolset_id) = toolset_id_for_window_label(app, &label) {
             buffer_utility_recovery_position(&window);
-            recover_offscreen_toolset_window(app, &window);
+            recover_offscreen_toolset_window(app, &window, toolset_is_resizable(&toolset_id));
         }
         if dialog_windows::is_dialog_label(&label) {
             dialog_windows::mark_transient(&label);
@@ -10015,12 +10015,13 @@ fn ensure_toolset_window<R: Runtime>(
     geometry: Option<&ToolsetWindowGeometry>,
 ) -> Result<(), String> {
     let label = toolset_window_label(toolset_id);
+    let resizable = toolset_is_resizable(toolset_id);
 
     if let Some(window) = app.get_webview_window(&label) {
         // Already built — but it may have been created (or dragged) offscreen earlier, or the
         // display it lived on may have been unplugged while it was hidden. Re-clamp on the way in,
         // so re-opening from View ▸ Toolbars is always enough to recover a lost palette.
-        recover_offscreen_toolset_window(app, &window);
+        recover_offscreen_toolset_window(app, &window, resizable);
         window.show().map_err(|error| error.to_string())?;
         configure_toolset_utility_window(&window, true)?;
         return Ok(());
@@ -10046,7 +10047,6 @@ fn ensure_toolset_window<R: Runtime>(
             ToolsetWindowPosition { x: 88.0, y: 154.0 },
         ),
     };
-    let resizable = toolset_is_resizable(toolset_id);
     let layout = load_toolset_layout_state(app);
     let saved = layout.toolsets.get(toolset_id);
     let (width, height) = saved
@@ -10055,13 +10055,13 @@ fn ensure_toolset_window<R: Runtime>(
     // A persisted position wins (the user moved it before); otherwise the JS-supplied default.
     // Either way it's clamped onto an attached monitor — a position saved on a display that's since
     // been unplugged would otherwise open the palette offscreen with no way to get it back.
-    let position = clamp_toolset_position(
+    let (position, width, height) = clamp_toolset_frame(
         app,
         saved
             .and_then(PersistedToolsetState::position)
             .unwrap_or(default_position),
-        width,
-        height,
+        (width, height),
+        resizable,
     );
 
     // Record label -> id so the Moved/Destroyed handlers and enumeration can resolve the toolset
@@ -10530,43 +10530,64 @@ fn toolset_position_in_work_area(
     }
 }
 
-/// Pull a palette position back onto an attached monitor.
+fn inspector_frame_in_work_area(
+    position: ToolsetWindowPosition,
+    size: (f64, f64),
+    area: ScreenRect,
+) -> (ToolsetWindowPosition, f64, f64) {
+    let width = size.0.min(area.width);
+    let height = size.1.min(area.height);
+    let position = ToolsetWindowPosition {
+        x: position.x.clamp(area.x, area.x + (area.width - width)),
+        y: position.y.clamp(area.y, area.y + (area.height - height)),
+    };
+    (position, width, height)
+}
+
+/// Pull a palette back onto an attached monitor. Scrolling inspectors need the full viewport
+/// inside the work area, while a toolbar only needs a reachable title before it fits its content.
 ///
 /// Positions are persisted in logical points, so a toolbar last parked on an external display comes
 /// back at coordinates that no longer exist once that display is unplugged. The window is then
 /// created successfully and painted into nowhere — which reads to the user as "the toolbar won't
 /// open" even though View ▸ Toolbars shows it checked, with no UI path to recover it. Clamp onto the
 /// primary monitor (the one that's certainly present) whenever the saved spot is unreachable.
-fn clamp_toolset_position<R: Runtime>(
+fn clamp_toolset_frame<R: Runtime>(
     app: &tauri::AppHandle<R>,
     position: ToolsetWindowPosition,
-    width: f64,
-    height: f64,
-) -> ToolsetWindowPosition {
+    size: (f64, f64),
+    resizable: bool,
+) -> (ToolsetWindowPosition, f64, f64) {
+    let (width, height) = size;
     let monitors = match app.available_monitors() {
         Ok(monitors) if !monitors.is_empty() => monitors,
         // No monitor info (headless, or the platform refused): trust the saved position rather than
         // moving a window the user may have deliberately placed.
-        _ => return position,
+        _ => return (position, width, height),
     };
 
-    if monitors.iter().any(|monitor| {
-        monitor_logical_work_area(monitor).contains_title_strip(
-            position.x,
-            position.y,
-            width,
-            TOOLSET_TITLE_HEIGHT,
-        )
-    }) {
-        return position;
-    }
-
-    let target = app
-        .primary_monitor()
-        .ok()
+    let title_monitor = |title_width: f64| {
+        monitors.iter().map(monitor_logical_work_area).find(|area| {
+            area.contains_title_strip(position.x, position.y, title_width, TOOLSET_TITLE_HEIGHT)
+        })
+    };
+    // Prefer the monitor containing the inspector's origin when its title spans displays.
+    let area = resizable
+        .then(|| title_monitor(1.0))
         .flatten()
-        .unwrap_or_else(|| monitors[0].clone());
-    toolset_position_in_work_area(position, width, height, monitor_logical_work_area(&target))
+        .or_else(|| title_monitor(width))
+        .unwrap_or_else(|| {
+            let primary = app.primary_monitor().ok().flatten();
+            monitor_logical_work_area(primary.as_ref().unwrap_or(&monitors[0]))
+        });
+    if resizable {
+        return inspector_frame_in_work_area(position, size, area);
+    }
+    (
+        toolset_position_in_work_area(position, width, height, area),
+        width,
+        height,
+    )
 }
 
 /// Move an already-built palette back onscreen if its current spot is unreachable. Best-effort: a
@@ -10574,6 +10595,7 @@ fn clamp_toolset_position<R: Runtime>(
 fn recover_offscreen_toolset_window<R: Runtime>(
     app: &tauri::AppHandle<R>,
     window: &tauri::WebviewWindow<R>,
+    resizable: bool,
 ) {
     let Some(position) = current_toolset_window_position(window) else {
         return;
@@ -10585,9 +10607,11 @@ fn recover_offscreen_toolset_window<R: Runtime>(
         return;
     };
     let size = size.to_logical::<f64>(scale);
-    // `position` is Copy on this branch (the clamping helpers wanted it), so main's `.clone()` here is
-    // a lint neither side trips alone -- main's struct is Clone-only. A merge artifact, not a bug.
-    let clamped = clamp_toolset_position(app, position, size.width, size.height);
+    let (clamped, width, height) =
+        clamp_toolset_frame(app, position, (size.width, size.height), resizable);
+    if (width - size.width).abs() >= 0.5 || (height - size.height).abs() >= 0.5 {
+        let _ = window.set_size(tauri::LogicalSize::new(width, height));
+    }
     if (clamped.x - position.x).abs() < 0.5 && (clamped.y - position.y).abs() < 0.5 {
         return;
     }
@@ -11890,6 +11914,36 @@ mod tests {
                 assert_eq!(fit.size, ((940.0 * scale) as u32, (636.0 * scale) as u32));
             }
         }
+    }
+
+    #[test]
+    fn restored_inspector_frame_fits_a_smaller_monitor_work_area() {
+        let area = ScreenRect::new(1200.0, 24.0, 800.0, 600.0);
+        let (position, width, height) = inspector_frame_in_work_area(
+            ToolsetWindowPosition {
+                x: 1400.0,
+                y: 140.0,
+            },
+            (900.0, 900.0),
+            area,
+        );
+        assert_eq!(
+            (position.x, position.y, width, height),
+            (1200.0, 24.0, 800.0, 600.0)
+        );
+
+        let (position, width, height) = inspector_frame_in_work_area(
+            ToolsetWindowPosition {
+                x: 1400.0,
+                y: 400.0,
+            },
+            (500.0, 300.0),
+            area,
+        );
+        assert_eq!(
+            (position.x, position.y, width, height),
+            (1400.0, 324.0, 500.0, 300.0)
+        );
     }
 
     #[test]

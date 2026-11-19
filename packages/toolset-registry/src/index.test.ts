@@ -56,6 +56,44 @@ describe("toolset registry", () => {
     expect(isValidToolsetCommandId("atom.setHoveredLabel.?")).toBe(false);
   });
 
+  it("prunes malformed saved command ids and keeps valid additions and menu entries", () => {
+    const invalidId = "atom.problem.open.mol%2E1.a0";
+    const groupId = "fixture.tools";
+    const state = {
+      version: 1,
+      toolsetOverrides: [{
+        toolsetId: fixtureToolset.id,
+        hiddenCommandIds: [invalidId, "tool.text"],
+        itemOrder: { [groupId]: [invalidId, "edit.undo", "edit.redo"] },
+        itemAdditions: [
+          { groupId, item: { id: invalidId, primary: { type: "command", commandId: invalidId } } },
+          { groupId, item: {
+            commandId: "edit.undo",
+            submenu: { type: "command-grid", items: [{ commandId: invalidId, label: "Atom problem" }] }
+          } },
+          { groupId, item: {
+            commandId: "edit.redo",
+            submenu: { type: "command-grid", items: [
+              { commandId: invalidId, label: "Atom problem" }, { commandId: "edit.undo", label: "Undo" }
+            ] }
+          } }
+        ]
+      }]
+    };
+    expect(() => parseToolsetLayoutState(state)).toThrow();
+    const warnings: string[] = [];
+    const [toolbar] = applyToolsetLayoutState([fixtureToolset], state, {
+      additionalCommandIds: ["edit.undo", "edit.redo"],
+      onUnknownCommand: "prune",
+      onWarning: warning => warnings.push(warning)
+    });
+    expect(toolbar.groups[0].items.map(item => item.commandId)).toEqual(["edit.undo", "edit.redo", "tool.select", "tool.bond"]);
+    expect(toolbar.groups[0].items[0].submenu).toBeNull();
+    expect(toolbar.groups[0].items[1].submenu?.items).toEqual([{ commandId: "edit.undo", label: "Undo" }]);
+    expect(warnings).toHaveLength(5);
+    expect(warnings.every(warning => warning.includes("invalid command ID"))).toBe(true);
+  });
+
   it("validates typed toolset definitions", () => {
     expect(ToolsetDefinitionSchema.parse(fixtureToolset).id).toBe("core.fixture");
   });

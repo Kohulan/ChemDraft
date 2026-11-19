@@ -31,6 +31,8 @@ export type DesktopToolsetRegistry = ToolsetRegistry<IconName, ToolbarAssetName>
 
 export interface ToolbarPaletteItemModel {
   id: string;
+  /** An item added to a shipped toolset by toolbar customization. */
+  customAddition?: boolean;
   kind: "button" | "toggle" | "control" | "separator" | "spacer";
   label: string;
   icon?: IconName;
@@ -108,7 +110,7 @@ export function createDesktopToolsetRegistry(
     // shell commands (e.g. edit.undo) count as valid targets so they aren't pruned as "unknown".
     : applyToolsetLayoutState<IconName, ToolbarAssetName>(
         base,
-        migrateMainToolbarDefaultsLayoutState(layoutState),
+        migrateMainToolbarDefaultsLayoutState(layoutState, warning => console.warn(warning)),
         {
           additionalCommandIds,
           onUnknownCommand: "prune"
@@ -168,7 +170,7 @@ function revisionOneMainToolbarGroups(): ToolsetGroupDefinition<IconName, Toolba
  * Complete the old order before adding Chain back, since addition indices precede reorder/hide and
  * were measured against the old manifest. Keep a top-level marker even when no Main override exists.
  */
-export function migrateMainToolbarDefaultsLayoutState(state: unknown): unknown {
+export function migrateMainToolbarDefaultsLayoutState(state: unknown, onInvalidCommand?: (warning: string) => void): unknown {
   if (typeof state === "object" && state !== null &&
       (state as { mainToolbarDefaultsMetadataUnavailable?: unknown }).mainToolbarDefaultsMetadataUnavailable === true) {
     const { mainToolbarDefaultsMetadataUnavailable: _, ...loaded } = state as Record<string, unknown>;
@@ -178,7 +180,8 @@ export function migrateMainToolbarDefaultsLayoutState(state: unknown): unknown {
     // sets this hint. A v1.1.1 file with no side file has no hint and gets the original migration
     // below. Consume the IPC-only hint before parsing/broadcasting/saving.
     const parsed = parseToolsetLayoutState(
-      migrateLegacyMainToolbarLayoutState(migrateRenamedCommandIdsInLayoutState(loaded))
+      migrateLegacyMainToolbarLayoutState(migrateRenamedCommandIdsInLayoutState(loaded)),
+      onInvalidCommand
     );
     // An explicit order naming Triple without an addition proves it was a manifest button.
     // Preserve that known layout even when its revision side file could not be recovered.
@@ -195,7 +198,7 @@ export function migrateMainToolbarDefaultsLayoutState(state: unknown): unknown {
   if (typeof revision === "number" && revision >= MAIN_TOOLBAR_DEFAULTS_REVISION) {
     return legacy;
   }
-  const parsed = parseToolsetLayoutState(legacy);
+  const parsed = parseToolsetLayoutState(legacy, onInvalidCommand);
   if (revision === 1) {
     const previousGroups = revisionOneMainToolbarGroups();
     const tripleIndex = previousGroups[0].items.findIndex(item => item.commandId === "tool.tripleBond");
@@ -559,6 +562,7 @@ export function getToolsetPaletteGroups(
         commandOverrides,
         isGeneratedLauncher || isCustomCoreAddition
       );
+      if (isCustomCoreAddition) model.customAddition = true;
       if (model.submenu) model.submenu.items = model.submenu.items.filter(command => !isCompoundLayoutCommandHidden(command.id, { ...settings, enabled: layoutsEnabled }));
       return model;
     })
@@ -584,6 +588,29 @@ export const PALETTE_GRID_METRIC_DEFAULTS = {
   gap: 2,
   padding: 4
 } as const;
+
+/** Default floating palettes use the padded two-column grid defined by the palette CSS. */
+const VERTICAL_PALETTE_GRID_LAYOUT = { columns: 2, cellWidth: 24, cellHeight: 24, gap: 4, padding: 4 };
+
+export function toolsetUsesResizableWindow(id: string): boolean {
+  return id === "core.molecularInspector" || id === "core.drawnStructureSettings" || id === "core.ringInspector";
+}
+
+export function initialToolsetWindowSize(
+  toolset: DesktopToolsetDefinition,
+  itemGroups: readonly (readonly ToolbarPaletteItemModel[])[]
+): { width: number; height: number } {
+  if (toolsetUsesResizableWindow(toolset.id)) {
+    return toolset.preferredWindowSize ?? { width: 96, height: 420 };
+  }
+  // Use the vertical grid's content width for recovery onto a smaller or newly attached display.
+  // Horizontal palettes with widgets use their shipped defaults until the DOM measures content.
+  const gridLayout = toolset.gridLayout ?? VERTICAL_PALETTE_GRID_LAYOUT;
+  const gridSize = toolset.gridLayout?.orientation === "horizontal" ? undefined : computePaletteGridSize(gridLayout, itemGroups);
+  return gridSize
+    ?? desktopToolsetRegistry.get(toolset.id)?.preferredWindowSize
+    ?? { width: 96, height: 420 };
+}
 
 export function computePaletteGridSize(
   gridLayout: DesktopToolsetDefinition["gridLayout"] | undefined,
