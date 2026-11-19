@@ -12,12 +12,14 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { Molecule } from "openchemlib";
 import { MainWindow, documentTabPathKey } from "./MainWindow";
 import { exportPhase4Svg, applyNativeChainTool, createNativeSingleBondMolecule, arrangeSelectedDocumentObjects, createNativeSavePayload, createPhase4Document, openNativeDocument, selectDocumentObjects } from "./documentWorkflow";
 import { openChemDraftPayload } from "@chemdraft/cdx-compat";
 import { saveCompoundLayoutSettings } from "./compoundLayoutSettings";
 import { saveKeybindingSettings } from "./keybindingSettings";
 import { saveAskToSaveBeforeQuit, loadAskToSaveBeforeQuit } from "./quitSettings";
+import { dropMark, dropMolecule, electronMarkDropFixture } from "./testSupport/electronMarkDropFixture";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 import { createViewportState } from "@chemdraft/viewport-engine";
 import { DOM_COMMAND_EVENT, setToolbarsMenu, type QuitFlushPhase, type ToolsetWindowState } from "./window-manager";
@@ -1143,6 +1145,40 @@ describe("documents in one window", () => {
       await flush(); await remount();
       expect(prompts).toEqual([]);
     } finally { restore(); }
+  });
+
+  it.each([
+    { name: "distant charge in a native envelope", kind: "charge", distant: true, legacy: false },
+    { name: "distant charge in legacy JSON", kind: "charge", distant: true, legacy: true },
+    { name: "distant radical dot", kind: "radical-dot", distant: true, legacy: false },
+    { name: "in-range charge", kind: "charge", distant: false, legacy: false }
+  ] as const)("preserves a $name on open and session restore", async ({ kind, distant, legacy }) => {
+    const { document, nitrogen } = electronMarkDropFixture(kind === "charge" ? { kind, charge: 1 } : { kind });
+    const molecule = dropMolecule(document);
+    const bond = molecule.bonds.find(bond => bond.fromAtomId === nitrogen.id || bond.toAtomId === nitrogen.id)!;
+    const before = distant ? applyPatches(document, [{ op: "updateObject", objectId: dropMark(document).id, changes: {
+      x: 591, y: 491, atomAssociation: undefined,
+      anchor: { kind: "bond", objectId: molecule.id, bondId: bond.id }
+    } }]) : document;
+    const source = dropMolecule(before);
+    expect(source.atoms.find(atom => atom.id === nitrogen.id)).toMatchObject(kind === "charge"
+      ? { formalCharge: 1, markCharge: 1 } : { formalCharge: 0, markRadicals: 1 });
+    const smiles = Molecule.fromSmiles(source.structure).toIsomericSmiles();
+    const payload = createNativeSavePayload(before);
+    const contents = legacy ? JSON.stringify(before) : payload.contents;
+    const path = "/tmp/electron-mark.chemdraft";
+    const expectPreserved = () => {
+      const opened = bridge().snapshot().document;
+      expect(opened.pages[0].objects).toEqual(before.pages[0].objects);
+      expect(Molecule.fromSmiles(dropMolecule(opened).structure).toIsomericSmiles()).toBe(smiles);
+    };
+
+    await act(async () => native.events.get("chemdraft://open-document")!({ contents, path, displayName: payload.filename }));
+    expectPreserved();
+
+    native.session = buildDocumentSessionEnvelope({ ...payload, contents }, { path, dirty: false }, payload.filename, false);
+    await remount();
+    expectPreserved();
   });
 
   describe.each(["macos", "windows"] as const)("restored native compatibility on %s", platform => {
