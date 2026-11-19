@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { applyPatch, applyPatches, resolveRepeatUnitAtomMembership, undo, redo,
+import { applyPatch, applyPatches, resolveRepeatUnitAtomMembership, toEngineDocument, undo, redo, withoutBracketPairMetadata,
   type BracketObject, type ChemDraftDocument, type GroupObject, type MoleculeObject } from "@chemdraft/chem-core";
 import { exportDocumentToCdxml, openChemDraftPayload } from "@chemdraft/cdx-compat";
 import { repeatUnitExportWarnings } from "@chemdraft/export-engine";
-import { bracketRepeatUnitStatus, createBracketCommands, selectedBracketPair, setBracketRepeatLabel, toggleBracketRepeatUnit } from "./bracketCommands";
+import { bracketRepeatUnitStatus, createBracketCommands, prepareCleanupRepeatUnits, selectedBracketPair, setBracketRepeatLabel, toggleBracketRepeatUnit } from "./bracketCommands";
 import { bracketLabelContainsPoint, bracketLabelPlan, transformPointForObject } from "@chemdraft/layout-engine";
 import { applyEraserSweep } from "./MainWindow";
 import { applyNativeMoleculePartsDelete, nativeFreeformSingleBondToolAtPoint, applySingleBondToolAtPoint, copyAsMolfile, copyAsSmiles, createPhase4Document,
@@ -42,6 +42,23 @@ const repeatAction = (document: ChemDraftDocument, parts: NativeMoleculePartSele
   createBracketCommands(document, parts).find(action => action.id === "bracket.repeatUnit.toggle")!;
 const chainParts = (atomIds: string[], bondIds: string[] = []): NativeMoleculePartSelection =>
   ({ objectId: "chain", kind: "parts", atomIds, bondIds });
+
+it("refits the paired glyph while leaving a later bracket with the same id alone", () => {
+  const { document, molecule } = repeatChain();
+  const marked = toggleBracketRepeatUnit(document, [chainParts(["a2", "a3", "a4"])]);
+  const page = marked.pages[0]!;
+  const opening = bracketObjects(marked).find(bracket => bracket.side === "open")!;
+  const spectator = withoutBracketPairMetadata({ ...opening, x: 400, y: 300 });
+  const before = toEngineDocument({ ...marked, pages: [{ ...page, objects: [...page.objects, spectator] }] });
+  const candidate = applyPatch(before, { op: "updateObject", objectId: molecule.id, changes: {
+    x: molecule.x + 200, atoms: molecule.atoms.map(atom => ({ ...atom, x: atom.x + 200 }))
+  } }, { preserveRepeatUnitBrackets: true });
+
+  const { document: cleaned } = prepareCleanupRepeatUnits(before, candidate, [molecule.id]);
+
+  expect(bracketObjects(cleaned)[0]!.x).toBe(opening.x + 200);
+  expect(cleaned.pages[0]!.objects.at(-1)).toBe(candidate.pages[0]!.objects.at(-1));
+});
 
 describe("marking an atom selection as a repeat unit", () => {
   it("creates the same selected bracket objects and MOL crossing bonds as drawing the pair first", () => {
