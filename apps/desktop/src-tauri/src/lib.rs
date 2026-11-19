@@ -14298,6 +14298,7 @@ mod tests {
             include_str!("../capabilities/palette-focus-diagnostic.json"),
             include_str!("../capabilities/window-drag.json"),
             include_str!("../capabilities/toolset-window-size.json"),
+            include_str!("../capabilities/inspector-window-clamp.json"),
             include_str!("../capabilities/default.json"),
             include_str!("../capabilities/document-dialogs.json"),
             include_str!("../capabilities/plugin-panel.json"),
