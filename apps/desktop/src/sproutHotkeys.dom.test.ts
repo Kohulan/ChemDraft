@@ -10,6 +10,7 @@ import { insertSmilesMolecule, nativeAtomValidationState } from "@chemdraft/docu
 import { MainWindow } from "./MainWindow";
 import { applyNativeAtomElementTarget, createPhase4Document, insertNativeSingleBondMolecule, nativeAtomSproutHotkeyTarget, nativeBondLengthPx, nativeSingleBondHotkeyAtAtomTarget, selectDocumentObjects } from "./documentWorkflow";
 import { saveKeybindingSettings } from "./keybindingSettings";
+import { MemoryStorage } from "./testSupport/memoryStorage";
 
 // Real DOM event harness promoted from the chemist's hover reproduction tests.
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -30,6 +31,7 @@ describe.each([
 
   beforeEach(() => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    vi.stubGlobal("localStorage", new MemoryStorage());
     saveKeybindingSettings({ scheme });
     originalPlatform = Object.getOwnPropertyDescriptor(navigator, "platform");
     Object.defineProperty(navigator, "platform", { value: platform === "windows" ? "Win32" : "MacIntel", configurable: true });
@@ -48,6 +50,7 @@ describe.each([
     await act(async () => { root.unmount(); });
     container.remove();
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
     vi.useRealTimers();
     window.history.replaceState(null, "", "/");
     delete window.__CHEMDRAFT_AGENT__;
@@ -432,11 +435,12 @@ describe.each([
     await expectOneUndo(before);
   });
 
-  it.skipIf(scheme !== "chemdraw")("V over empty canvas does not edit chemistry", async () => {
+  it.skipIf(scheme !== "chemdraw")("V over empty canvas leaves the tool and chemistry unchanged", async () => {
     await renderEthane();
     const before = snapshot().document;
     await hoverPoint({ x: 50, y: 50 });
-    await press("v");
+    expect((await press("v")).defaultPrevented).toBe(false);
+    expect(snapshot().activeToolCommandId).toBe("tool.bond");
     expect(snapshot().document).toEqual(before);
     expect(container.querySelector("main")?.getAttribute("data-can-undo")).toBe("false");
   });
@@ -477,17 +481,17 @@ describe.each([
     if (added) await expectOneUndo(before);
   });
 
-  it("adds one radical to the hovered atom without changing formula or charge and undoes exactly", async () => {
+  it("adds one radical to the hovered carbon, replacing one implicit hydrogen and preserving charge in one undo step", async () => {
     await renderEthane();
     const before = molecule();
     const beforeObjects = snapshot().document.pages[0].objects;
-    const formula = Molecule.fromSmiles(before.structure).getMolecularFormula().formula;
+    expect(Molecule.fromSmiles(before.structure).getMolecularFormula().formula).toBe("C2H6");
     await hoverAtom(0);
     await press(".");
     expect(molecule().atoms[0]).toEqual({ ...before.atoms[0], markRadicals: 1 });
     expect(molecule().atoms[1]).toEqual(before.atoms[1]);
     expect(molecule().bonds).toEqual(before.bonds);
-    expect(Molecule.fromSmiles(molecule().structure).getMolecularFormula().formula).toBe(formula);
+    expect(Molecule.fromSmiles(molecule().structure).getMolecularFormula().formula).toBe("C2H5");
     expect(molecule().atoms.map(atom => atom.formalCharge)).toEqual(before.atoms.map(atom => atom.formalCharge));
     expect((molecule().atoms[0].markRadicals ?? 0) - (before.atoms[0].markRadicals ?? 0)).toBe(1);
     const doc = snapshot().document;
