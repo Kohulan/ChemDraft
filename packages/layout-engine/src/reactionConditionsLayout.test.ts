@@ -1,7 +1,8 @@
 import { expect, it } from "vitest";
 import { createEmptyDocument, type ArrowObject, type MoleculeObject, type ReactionObject, type TextObject } from "@chemdraft/chem-core";
 import { reactionConditionsPlacement } from "./reactionConditionsLayout";
-import { arrowAttachmentPoint } from "./arrowAttachmentFrames";
+import { arrowAttachmentPoint, arrowShaftSamplePoints, reactionConditionsFrame } from "./arrowAttachmentFrames";
+import { projectedPlaneMatrix, projectPointInObjectPlane } from "./index";
 
 it("places horizontal conditions above and below a shaft without importing the public entry point", () => {
   const page = createEmptyDocument().pages[0];
@@ -30,6 +31,19 @@ function reactionFixture() {
   page.objects = [arrow, reaction];
   return { page, arrow, label, reaction };
 }
+
+it("uses the rendered tilted shaft for the conditions frame", () => {
+  const { page, arrow } = reactionFixture();
+  arrow.rotation = 30;
+  arrow.style = { tiltXDegrees: 45, tiltYDegrees: 35 };
+  const matrix = projectedPlaneMatrix(45, 35, 30);
+  const expected = [arrow.start, arrow.end].map(anchor => projectPointInObjectPlane(arrow,
+    (anchor as { kind: "point"; point: { x: number; y: number } }).point, matrix));
+  expect(arrowShaftSamplePoints(page, arrow)).toEqual(expected);
+  const frame = reactionConditionsFrame(page, arrow)!;
+  expect(frame.tangent.x).toBeCloseTo((expected[1]!.x - expected[0]!.x) / Math.hypot(expected[1]!.x - expected[0]!.x, expected[1]!.y - expected[0]!.y));
+  expect(frame.tangent.y).toBeCloseTo((expected[1]!.y - expected[0]!.y) / Math.hypot(expected[1]!.x - expected[0]!.x, expected[1]!.y - expected[0]!.y));
+});
 
 it("keeps conditions at the clear midpoint inside their own reaction container", () => {
   const { page, arrow, label } = reactionFixture();

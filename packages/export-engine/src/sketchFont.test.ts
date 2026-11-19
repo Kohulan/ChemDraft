@@ -165,6 +165,24 @@ describe("locally bundled Sketch handwriting", () => {
       expect(sfntTable(embedded[0]!, "glyf").length).toBeLessThan(sfntTable(font, "glyf").length);
     } finally { dom.window.close(); }
   });
+  it("warns once for each unavailable styled Patrick Hand face", async () => {
+    const dom = new JSDOM("<!doctype html><html><body></body></html>", { pretendToBeVisual: true });
+    for (const key of ["window", "document", "Node", "Element", "SVGElement", "HTMLElement", "XMLSerializer", "navigator"] as const) {
+      vi.stubGlobal(key, key === "window" ? dom.window : dom.window[key]);
+    }
+    vi.stubGlobal("getComputedStyle", dom.window.getComputedStyle.bind(dom.window));
+    Object.defineProperty(dom.window.SVGElement.prototype, "getBBox", { configurable: true, value: () => ({ x: 0, y: 0, width: 80, height: 16 }) });
+    Object.defineProperty(dom.window.HTMLCanvasElement.prototype, "getContext", { configurable: true, value: () => null });
+    try {
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg"><text font-family="Patrick Hand">regular<tspan font-weight="bold">bold</tspan><tspan font-style="italic">italic</tspan><tspan font-weight="700" font-style="italic">both</tspan></text></svg>`;
+      const result = await exportSvgToPdf(svg, { outputWidth: 200, outputHeight: 200, domParser: new dom.window.DOMParser() });
+      expect(result.warnings.map(warning => warning.message)).toEqual([
+        "Patrick Hand bold is unavailable; PDF uses the regular face.",
+        "Patrick Hand italic is unavailable; PDF uses the regular face.",
+        "Patrick Hand bold italic is unavailable; PDF uses the regular face."
+      ]);
+    } finally { dom.window.close(); }
+  });
 });
 
 function cmapCovers(character: string) { return unicodeCmap(font).has(character.codePointAt(0)!); }

@@ -69,9 +69,10 @@ export function installPopoverEscapeRouting(editorOpen: () => boolean = () => fa
       }
       return;
     }
-    const at = payload?.requestedAt ?? toolsetPopoverTimestamp();
-    dismissedAt = Math.max(dismissedAt, at);
-    for (const opening of opens.values()) if (opening.openedAt! <= at) retire(opening);
+    // A dismissal without a press timestamp only applies to openings already known here.
+    const at = payload?.requestedAt;
+    if (at !== undefined) dismissedAt = Math.max(dismissedAt, at);
+    for (const opening of opens.values()) if (at === undefined || opening.openedAt! <= at) retire(opening);
   }).then(retain).catch(() => undefined);
 
   const ownedElsewhere = (event: KeyboardEvent, target: EventTarget | null, caption?: HTMLTextAreaElement) => {
@@ -127,11 +128,14 @@ export function installPopoverEscapeRouting(editorOpen: () => boolean = () => fa
       if (disposed) return;
       const targets = visible.flatMap(result => result && opens.get(result.opening.toolsetId) === result.opening &&
         result.opening.revision === result.revision ? [result.opening] : []);
-      pending.forEach(retire);
       // Re-evaluate every ownership guard after IPC, even when the flyout is visible.
       if (ownedElsewhere(event, currentTarget(event), caption)) {
+        pending.forEach(opening => { opening.checking = false; });
         resumeEscape(event);
-      } else if (targets.length) {
+        return;
+      }
+      pending.forEach(retire);
+      if (targets.length) {
         void dismissToolsetPopovers(requestedAt, "escape", targets.map(({ toolsetId, openedAt, generation }) =>
           ({ toolsetId, openedAt, generation }))).catch(() => undefined);
       } else {

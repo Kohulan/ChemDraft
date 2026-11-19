@@ -13,13 +13,16 @@ import {
 import { resolveStructureTemplateName, setReactionArrowConditions, structureTemplateMolecule } from "@chemdraft/document-workflow-core";
 import { repeatUnitMolfileGroups } from "@chemdraft/export-engine";
 import { ProposedDocumentPatchSchema, type NormalizedProposedDocumentPatch } from "@chemdraft/plugin-api";
-import { assertPluginPatchWriteScope, PluginHost } from "@chemdraft/plugin-host";
+import { assertPluginDocumentWriteScope, assertPluginPatchWriteScope, finishScopedRepeatUnitCleanup, PluginHost } from "@chemdraft/plugin-host";
 import { describe, expect, it, vi } from "vitest";
 import { objectRect, overlaps } from "../assistant/placement";
+import { placeInsertedObjectsInFreeSpace } from "./applyPluginDocumentPatch";
 import {
+  createNativeSavePayload,
   createNativeArtLineGraphicObject,
   moveDocumentObjects,
   normalizeCommittedDocument,
+  openNativeDocument,
   translateDocumentPage,
   translateInsertedDocumentObjects
 } from "../documentWorkflow";
@@ -65,6 +68,117 @@ function repeatUnitObjects(): [MoleculeObject, BracketObject, BracketObject] {
 }
 
 describe("desktop direct plugin patch application", () => {
+  it("saves and reopens a group after a scoped plugin deletes one child without an SRU", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0].id;
+    const removed = DocumentObjectSchema.parse({ id: "removed", type: "plus", x: 40, y: 50, width: 20, height: 20 });
+    const kept = { ...removed, id: "kept", x: 70 };
+    const group = DocumentObjectSchema.parse({ id: "group", type: "group", x: 40, y: 50, width: 50, height: 20,
+      childObjectIds: [removed.id, kept.id] });
+    let document = applyPatch(blank, { op: "batch", patches: [
+      ...[removed, kept, group].map(object => ({ op: "addObject" as const, pageId, object })),
+      { op: "setSelection", pageId, objectIds: [removed.id] }
+    ] });
+    const host = new PluginHost({ getActiveDocument: () => document, applyDocumentPatch: request => {
+      const before = document;
+      const authored = applyPluginDocumentPatch(before, request.patch);
+      assertPluginDocumentWriteScope(before, authored.document, request.patch, request.writeScopeObjectIds);
+      const cleanup = finishScopedRepeatUnitCleanup(request.repeatUnitCleanup, before, authored.document, request.patch.patch);
+      document = cleanup?.document ?? authored.document;
+      cleanup?.record();
+      return authored.receipt;
+    } });
+    host.registerPlugin({ id: "org.test.group", name: "Delete", version: "0.0.1", apiVersion: "^0.1.25", entry: "test.js",
+      permissions: ["document.write"], contributes: { commands: [{ id: "plugin.group.delete", title: "Delete" }] }
+    }, { commandHandlers: { "plugin.group.delete": context => context.documents.applyPatch!({
+      reason: "Delete grouped child", patch: { op: "removeObject", objectId: removed.id }
+    }) } });
+    await expect(host.invokeCommand("plugin.group.delete")).resolves.toMatchObject({ applied: true });
+    const expected = [kept, { ...group, childObjectIds: [kept.id] }];
+    expect(document.pages[0].objects).toEqual(expected);
+    expect(openNativeDocument(createNativeSavePayload(document).contents))
+      .toMatchObject({ source: "native-payload", document: { pages: [{ objects: expected }] } });
+  });
+
+  it("prunes only deleted ids during scoped SRU cleanup and preserves unrelated references", async () => {
+    const empty = createEmptyDocument();
+    const pageId = empty.pages[0].id;
+    const [molecule, open, close] = repeatUnitObjects();
+    const plain = { ...open, id: "plain", pairId: undefined, repeatUnit: undefined, bracketUsage: undefined, containedObjectIds: [] };
+    const group = DocumentObjectSchema.parse({ id: "group", type: "group", x: 70, y: 96,
+      width: 200, height: 120, childObjectIds: [open.id, close.id, molecule.id, "preexisting-missing"] });
+    const parent = DocumentObjectSchema.parse({ id: "parent", type: "group", x: 70, y: 96,
+      width: 200, height: 120, childObjectIds: [group.id] });
+    const reaction = DocumentObjectSchema.parse({ id: "step", type: "reaction", x: 70, y: 96,
+      width: 200, height: 120, mappingState: "absent", components: [], conditionsTextObjectIds: [close.id, plain.id] });
+    const before = applyPatch(empty, { op: "batch", patches: [molecule,
+      { ...open, containedObjectIds: [] }, { ...close, containedObjectIds: [] }, plain, group, parent, reaction].map(object => ({
+      op: "addObject" as const, pageId, object
+    })) });
+    const selected = applyPatch(before, { op: "setSelection", pageId, objectIds: [molecule.id] });
+    let history = createDocumentHistory(selected);
+    const host = new PluginHost({ getActiveDocument: () => history.present, applyDocumentPatch: request => {
+      const baseline = history.present;
+      assertPluginPatchWriteScope(baseline, request.patch, request.writeScopeObjectIds);
+      const { document, receipt } = applyPluginDocumentPatch(baseline, request.patch);
+      expect(document.pages[0].objects.map(object => object.id)).toEqual([open.id, close.id, plain.id, group.id, parent.id, reaction.id]);
+      assertPluginDocumentWriteScope(baseline, document, request.patch, request.writeScopeObjectIds);
+      const forged = applyPatch(document, { op: "removeObject", objectId: plain.id });
+      expect(() => assertPluginDocumentWriteScope(baseline, forged, request.patch, request.writeScopeObjectIds))
+        .toThrow('bracket "plain" was removed');
+      const cleanup = finishScopedRepeatUnitCleanup(request.repeatUnitCleanup, baseline, document, request.patch.patch)!;
+      history = { past: [baseline], present: cleanup.document, future: [] };
+      cleanup.record();
+      return receipt;
+    } });
+    host.registerPlugin({ id: "org.test.delete", name: "Delete", version: "0.0.1", apiVersion: "^0.1.25", entry: "plugin.js",
+      permissions: ["document.write"], contributes: { commands: [{ id: "plugin.delete.run", title: "Delete" }] }
+    }, { commandHandlers: { "plugin.delete.run": ctx => ctx.documents.applyPatch!({ reason: "Remove selected molecule",
+      patch: { op: "removeObject", objectId: molecule.id }
+    }) } });
+    await expect(host.invokeCommand("plugin.delete.run")).resolves.toMatchObject({ applied: true });
+    expect(history.present.pages[0].objects).toEqual([plain, { ...group, childObjectIds: ["preexisting-missing"] },
+      parent, { ...reaction, conditionsTextObjectIds: [plain.id] }]);
+    expect(undo(history).present).toBe(selected);
+  });
+
+  it("places an inserted template beside all covering dialogs within the visible area, by translation only", () => {
+    const document = createEmptyDocument();
+    const page = document.pages[0];
+    const molecule = structureTemplateMolecule(resolveStructureTemplateName("18-crown-6")!, {
+      document, centre: { x: 396, y: 306 }
+    });
+    page.objects = [molecule];
+    document.selection = { pageId: page.id, objectIds: [molecule.id] };
+    const viewport = { x: 50, y: 70, width: 650, height: 450 };
+    const covered = [{ x: 290, y: 150, width: 210, height: 300 }, { x: 80, y: 100, width: 80, height: 100 }];
+    const placed = placeInsertedObjectsInFreeSpace(document, page.id, [molecule.id], { viewport, covered });
+    const inserted = placed.pages[0].objects[0] as MoleculeObject;
+    const bounds = objectRect(inserted);
+    expect(covered.every(rect => !overlaps(bounds, rect))).toBe(true);
+    expect(bounds.x).toBeGreaterThanOrEqual(viewport.x);
+    expect(bounds.y).toBeGreaterThanOrEqual(viewport.y);
+    expect(bounds.x + bounds.width).toBeLessThanOrEqual(viewport.x + viewport.width);
+    expect(bounds.y + bounds.height).toBeLessThanOrEqual(viewport.y + viewport.height);
+    const dx = inserted.x - molecule.x, dy = inserted.y - molecule.y;
+    expect(Math.hypot(dx, dy)).toBeGreaterThan(0);
+    expect(placed).toEqual(translateInsertedDocumentObjects(document, [molecule.id], dx, dy));
+    expect(placed.selection).toEqual(document.selection);
+    expect([placed.pages[0].width, placed.pages[0].height]).toEqual([page.width, page.height]);
+  });
+
+  it.each(["all covered", "uncovered sliver too small"])("keeps the original insertion when %s, even with free space off screen", mode => {
+    const document = createEmptyDocument();
+    const page = document.pages[0];
+    const molecule = structureTemplateMolecule(resolveStructureTemplateName("18-crown-6")!, {
+      document, centre: { x: 396, y: 306 }
+    });
+    page.objects = [molecule];
+    const viewport = { x: 250, y: 150, width: 300, height: 300 };
+    const covered = [{ ...viewport, width: viewport.width - (mode === "all covered" ? 0 : 5) }];
+    expect(placeInsertedObjectsInFreeSpace(document, page.id, [molecule.id], { viewport, covered })).toBe(document);
+  });
+
   it.each(["insert", "page"] as const)("translates every stored absolute coordinate in a template group (%s)", mode => {
     const document = createEmptyDocument();
     const page = document.pages[0];
@@ -942,7 +1056,8 @@ describe("plugin writes during a canvas gesture", () => {
     expect(gate.pending()).toBe(1);
     expect(commit).not.toHaveBeenCalled();
     if (attachBracket) {
-      document = applyPatch(document, { op: "batch", patches: [open, close].map(object => ({ op: "addObject", pageId, object })) });
+      document = applyPatch(document, { op: "batch", patches: [open, close].map(object => ({ op: "addObject", pageId,
+        object: { ...object, repeatUnit: undefined, bracketUsage: "generic", label: undefined } })) });
       // A later selection must not broaden the original command's grant.
       document = applyPatch(document, { op: "setSelection", objectIds: [molecule.id, open.id, close.id] });
     }

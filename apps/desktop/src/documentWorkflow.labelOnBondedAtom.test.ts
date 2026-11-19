@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { Molecule } from "openchemlib";
 import { applyPatches, nativeDrawingStyleFromObjectStyle, type MoleculeAtom, type MoleculeBond, type MoleculeObject } from "@chemdraft/chem-core";
-import { nativeAtomLabelReading, nativeAtomValidationState, nativeBondOrderResolution, nativeLabelBondSide } from "@chemdraft/document-workflow-core";
+import { insertSmilesMolecule, nativeAtomExternalValence, nativeAtomLabelReading, nativeAtomValidationState, nativeBondOrderResolution, nativeLabelBondSide } from "@chemdraft/document-workflow-core";
 import { atomDisplayLabelPlacement } from "@chemdraft/layout-engine";
+import { depictSmiles2D } from "@chemdraft/ocl-adapter";
 import {
   applyNativeAtomElementTarget, applyNativeAtomLabelDraft, commitNativeAtomLabelTarget,
   convertNativeTextObjectToAtomLabel, createPhase4Document, insertNativeSingleBondMolecule,
@@ -199,6 +200,39 @@ function canonicalLabelGraph(m: MoleculeObject) {
 }
 
 describe("commitNativeAtomLabelTarget", () => {
+  it("attaches typed chlorine to the middle carbon of propane", () => {
+    const { document, target } = bondedLabelFixture("C", ["C", "C"]);
+    const before = molecule(document);
+    const result = commitNativeAtomLabelTarget(document, target, "Cl", { literal: true, replaceElement: true });
+    const after = molecule(result.document);
+    expect(after.atoms.find(atom => atom.id === target.atomId)?.element).toBe("C");
+    expect(after.bonds.slice(0, before.bonds.length)).toEqual(before.bonds);
+    expect(after.chemistry?.formula).toBe("C3H7Cl");
+    expect(Molecule.fromSmiles(after.structure).toSmiles()).toBe(Molecule.fromSmiles("CC(Cl)C").toSmiles());
+  });
+
+  it.each(["C", "CH2"])("replaces phthalide's methylene (%s) with typed iodine and keeps both ring bonds", element => {
+    const smiles = "O=C1OCc2ccccc21";
+    const seed = insertSmilesMolecule(createPhase4Document(), { x: 300, y: 300 }, depictSmiles2D(smiles), smiles);
+    const graph = molecule(seed);
+    const source = graph.atoms.find(atom => atom.element === "C" && nativeAtomExternalValence(graph, atom) === 2)!;
+    const document = element === "C" ? seed : applyPatches(seed, [{
+      op: "updateObject", objectId: graph.id,
+      changes: { atoms: graph.atoms.map(atom => atom === source ? { ...atom, element, labelLiteral: true } : atom) }
+    }]);
+    const before = molecule(document);
+    const target = { objectId: before.id, kind: "atom" as const, atomId: source.id, distanceToPointer: 0 };
+    const result = commitNativeAtomLabelTarget(document, target, "I", { literal: true, replaceElement: true });
+    const after = molecule(result.document);
+    expect(result.target).toEqual(target);
+    expect(after.atoms.map(atom => atom.id)).toEqual(before.atoms.map(atom => atom.id));
+    expect(after.atoms.find(atom => atom.id === source.id)).toMatchObject({ element: "I", labelLiteral: true });
+    expect(before.bonds.filter(bond => [bond.fromAtomId, bond.toAtomId].includes(source.id))).toHaveLength(2);
+    expect(after.bonds).toEqual(before.bonds);
+    expect(after.chemistry?.formula).toBe("C7H4IO2");
+    expect(Molecule.fromSmiles(after.structure).toSmiles()).toBe(Molecule.fromSmiles("O=C1O[I]c2ccccc21").toSmiles());
+  });
+
   it.each([
     ["NH2", "NC1CCCCC1"], ["NO2", "[O-][N+](=O)C1CCCCC1"],
     ["CF3", "FC(F)(F)C1CCCCC1"], ["COOH", "O=C(O)C1CCCCC1"],

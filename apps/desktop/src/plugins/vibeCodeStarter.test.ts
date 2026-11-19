@@ -2,6 +2,9 @@ import { readFileSync } from "node:fs";
 import { CommandRegistry } from "@chemdraft/plugin-host";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createCoreCommandRegistrar, type CoreCommandBinding } from "../commands/coreCommandRegistrar";
+import { allShellCommands } from "../commands";
+import { createPhase4Document } from "../documentWorkflow";
+import { filterToolbarCustomizationCommands } from "../toolbars/toolbarCustomizationCommands";
 import { registerVibeCodeStarter, VIBE_CODE_STARTER_COMMAND_ID, VIBE_CODE_SAVE_COMMAND_ID, vibeCodeStarterCommand } from "../commands/vibeCodeStarter";
 import { save } from "../nativeFileDialog";
 import { gatherThisComputer, PLUGIN_STARTER_FILENAME, type VibeCodeStarterSaveOptions } from "./vibeCodeStarter";
@@ -13,7 +16,9 @@ vi.mock("../nativeFileDialog", () => ({ save: native.save }));
 vi.mock("@tauri-apps/plugin-fs", () => ({ writeTextFile: native.write }));
 vi.mock("@tauri-apps/api/path", () => ({ documentDir: native.documents, appDataDir: native.appData, join: native.join }));
 vi.mock("@tauri-apps/api/app", () => ({ getVersion: native.version }));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: native.invoke }));
+vi.mock("@tauri-apps/api/core", async importOriginal => ({
+  ...await importOriginal<typeof import("@tauri-apps/api/core")>(), invoke: native.invoke
+}));
 
 function setup(isDesktop = true) {
   const registry = new CommandRegistry();
@@ -113,13 +118,13 @@ describe("plugin starter command", () => {
     expect(download).not.toHaveBeenCalled();
   });
 
-  it("uses the tested binding and existing save helpers in MainWindow and exposes Customize", () => {
+  it("uses the tested binding and existing save helpers in MainWindow and offers Customize the registered starter", () => {
     const main = readFileSync(new URL("../MainWindow.tsx", import.meta.url), "utf8");
     expect(main).toContain("registerVibeCodeStarter(register, {");
     expect(main).toContain("pickSavePath: pickNativeExportPath");
     expect(main).toContain("writeText: writeNativeTextFile");
     expect(main).toContain("download: downloadText");
-    expect(main).toContain("}).map(command => customSwatchActions.find(action => action.id === command.id) ?? command), vibeCodeStarterCommand]");
-    expect(main).toContain("for (const command of shellCommandSpecs)");
+    const commands = filterToolbarCustomizationCommands(allShellCommands(createPhase4Document()), { enabled: false });
+    expect(commands).toContainEqual(vibeCodeStarterCommand);
   });
 });

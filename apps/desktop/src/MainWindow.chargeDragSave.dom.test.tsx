@@ -110,17 +110,26 @@ describe.each(["macos", "windows"] as const)("charge drag Save (%s)", platform =
       await key("s");
       expect(savedWrites()).toHaveLength(1);
       const saved = openChemDraftPayload(savedWrites()[0][1]).document!;
-      expect.soft(dropMolecule(saved).atoms[7].formalCharge, "Save while dragging must preserve +1").toBe(1);
+      expect.soft(dropMolecule(saved), "Save must write the full pre-drag molecule").toEqual(dropMolecule(before));
       expect.soft(dropMark(saved), "Save must write the pre-drag mark").toEqual(mark);
       if (ending.startsWith("Escape")) await key("Escape");
       else await pointer(target, ending, { x: 600, y: 500 });
       if (finishWrite) await act(async () => finishWrite!());
       if (ending === "pointerup") {
-        expect(dropMark(snapshot().document).anchor).toEqual(mark.anchor);
+        if (gesture === "move") {
+          expect(dropMark(snapshot().document).anchor.kind).toBe("point");
+          expect(dropMolecule(snapshot().document).atoms[7].formalCharge).toBe(0);
+          const status = container.querySelector("[data-status-message]");
+          expect(status?.getAttribute("role")).toBe("status");
+          expect(status?.textContent).toContain("Saved charge-drag.chemdraft");
+          expect(status?.textContent).toContain("Charge removed from N (N now NH)");
+        } else expect(dropMark(snapshot().document).anchor).toEqual(mark.anchor);
         expect(dropMark(snapshot().document).x).not.toBe(mark.x);
       } else expect(snapshot().document).toEqual(before);
       expect(snapshot().file.dirty, "only a committed move after Save is dirty").toBe(ending === "pointerup");
-      expect.soft(dropMolecule(saved), "clean restored canvas must match saved chemistry").toEqual(dropMolecule(snapshot().document));
+      if (gesture !== "move" || ending !== "pointerup") {
+        expect.soft(dropMolecule(saved), "restored canvas must match saved chemistry").toEqual(dropMolecule(snapshot().document));
+      }
       expect(container.querySelector("main")?.getAttribute("data-can-undo")).toBe(ending === "pointerup" ? "true" : "false");
     });
   });

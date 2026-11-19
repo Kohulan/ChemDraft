@@ -154,7 +154,6 @@ import {
   proposalWindowLifecycle,
   settleAnalysisWindowOpen,
   projectedPlaneTiltVectorFromDrag,
-  rotationDeltaDegrees,
   rotationInputHomeDraftDegrees,
   rotationInputDraftDegrees,
   rotationReadoutDegrees,
@@ -374,9 +373,9 @@ describe("ChemDraft desktop shell", () => {
   });
 
   it("opens analysis windows without focus and lends focus only to their editable controls", () => {
-    expect(desktopNativeSource).toContain("focused_on_build: false,");
-    expect(desktopNativeSource).toContain(".focused(presentation.focused_on_build)");
-    expect(desktopNativeSource).toContain("configure_analysis_window(&window)");
+    const buildPanel = desktopNativeSource.split("fn build_or_show_plugin_panel<")[1]!.split("fn reveal_plugin_panel<")[0]!;
+    expect(buildPanel).toContain(".focused(false)");
+    expect(buildPanel).toContain("reveal_plugin_panel(&target)");
     expect(desktopNativeSource).not.toContain("focus_after_show");
     expect(desktopNativeSource).toContain("validate_plugin_panel_focus_caller(window.label())?");
     expect(desktopNativeSource).toMatch(/async fn set_plugin_panel_input_focus\(/);
@@ -2598,7 +2597,20 @@ describe("ChemDraft desktop shell", () => {
     // share preparation, and plugin/proposal preflight also normalizes before checking fit.
     // The conditions editor also commits to its original tab while it is inactive.
     expect(mainWindowSource.match(/normalizeCommittedDocument\(/g)).toHaveLength(14);
-    expect(mainWindowSource).toMatch(/const prepareDocumentCommit = useCallback\([\s\S]*?const present = normalizeCommittedDocument\(nextDocument\);/);
+    const prepareDocumentCommitSource = mainWindowSource.slice(
+      mainWindowSource.indexOf("const prepareDocumentCommit = useCallback("),
+      mainWindowSource.indexOf("const pageFitPendingRef =")
+    );
+    expect(prepareDocumentCommitSource).toMatch(
+      /const normalized = normalizeCommittedDocument\(nextDocument\);\s*const present = assertFinalDocument\?\.\(normalized\) \?\? normalized;/
+    );
+    expect(prepareDocumentCommitSource).toContain("return present;");
+    const commitDocumentHistorySource = mainWindowSource.slice(
+      mainWindowSource.indexOf("const commitDocumentHistoryFrom ="),
+      mainWindowSource.indexOf("const commitInsertionHistoryWithPageFit =")
+    );
+    expect(commitDocumentHistorySource).toContain("const verified = assertFinalDocument ? prepareDocumentCommit(nextDocument, undoLabel, assertFinalDocument) : undefined;");
+    expect(commitDocumentHistorySource).toContain("const present = verified ?? prepareDocumentCommit(nextDocument, undoLabel);");
     const commitDocumentChangeSource = mainWindowSource.slice(
       mainWindowSource.indexOf("const commitDocumentChange ="),
       mainWindowSource.indexOf("const commitDocumentChangeWithPageFit =")
@@ -2624,7 +2636,21 @@ describe("ChemDraft desktop shell", () => {
     expect(mainWindowSource).toContain("finishNativeAtomLabelEdit(baseline,");
     expect(mainWindowSource).toContain("const clean = stripped === current ? current : normalizeCommittedDocument(stripped);");
     expect(mainWindowSource).toContain("normalizeCommittedDocument(finishedAtomLabelDraft(current, edit).document)");
-    expect(mainWindowSource).toContain("const flushed = documentForFlush();");
+    const sessionFlushSource = mainWindowSource.slice(
+      mainWindowSource.indexOf("const writeDocumentSessionNow ="),
+      mainWindowSource.indexOf("const lockCommittedQuit =")
+    );
+    expect(sessionFlushSource).toMatch(
+      /const flushed = committedDraft\?\.tabId === activeDocumentTabIdRef\.current\s*\? committedDraft\.document : documentForFlush\(\);/
+    );
+    expect(sessionFlushSource).toContain("const tabDocument = draft?.document ?? (tab.id === activeDocumentTabIdRef.current ? flushed : snapshot.history.present);");
+    expect(sessionFlushSource).toContain("createNativeSavePayload(tabDocument)");
+    const quitDraftSource = mainWindowSource.slice(
+      mainWindowSource.indexOf("const lockCommittedQuit ="),
+      mainWindowSource.indexOf("const writeQuitSession =")
+    );
+    expect(quitDraftSource).toContain("const document = documentForFlush(");
+    expect(quitDraftSource).toContain("committedQuitDraftRef.current = { tabId, document, dirty, warning };");
     expect(mainWindowSource).toContain("const savedDocument = active ? documentForFlush() : savingDocument;");
     expect(mainWindowSource).toContain("createDocumentFileSave(savedDocument, finalPath)");
     expect(mainWindowSource).toContain("tabId === activeDocumentTabIdRef.current ? documentForFlush() : documentTabSnapshotsRef.current.get(tabId)?.history.present");
@@ -3024,24 +3050,13 @@ describe("ChemDraft desktop shell", () => {
     expect(toolPaletteSource).toContain("distributeModeCommandIds.spacing");
   });
 
-  it("matches rotate-handle tangential drag speed to projected-plane tilt speed", () => {
-    const center = { x: 0, y: 0 };
+  it("wraps projected-plane tilt after 360 pixels of drag", () => {
     const start = { x: 0, y: -20 };
 
-    expect(rotationDeltaDegrees(center, start, { x: 360, y: -20 })).toBe(360);
-    expect(rotationDeltaDegrees(center, start, { x: -360, y: -20 })).toBe(-360);
     expect(projectedPlaneTiltReadoutDegrees(projectedPlaneTiltRadiansFromDrag(start, { x: 0, y: -380 }))).toBe(0);
     expect(projectedPlaneTiltReadoutDegrees(projectedPlaneTiltRadiansFromDrag(start, { x: 0, y: -390 }))).toBe(10);
     expect(projectedPlaneTiltReadoutDegrees(projectedPlaneTiltRadiansFromDrag(start, { x: 0, y: 340 }))).toBe(0);
     expect(projectedPlaneTiltReadoutDegrees(projectedPlaneTiltRadiansFromDrag(start, { x: 0, y: 350 }))).toBe(10);
-  });
-
-  it("keeps short rotate-handle drags smooth instead of jumpy", () => {
-    const center = { x: 0, y: 0 };
-    const start = { x: 0, y: -20 };
-
-    expect(rotationDeltaDegrees(center, start, { x: 4, y: -20 })).toBe(4);
-    expect(rotationDeltaDegrees(center, start, { x: 8, y: -20 })).toBe(8);
   });
 
   it("uses the placement click point as the rotation origin for fresh bonds and templates", () => {
@@ -3147,14 +3162,21 @@ describe("ChemDraft desktop shell", () => {
   });
 
   it("threads Spin 3D placement through modeled typed rotation while preserving legacy X/Y tilt", () => {
-    // The numeric-rotation flatten must run the stereo read-back guard (spin3dFlattenStereoOptions),
-    // not commit geometry-only, so a typed rotation can't silently persist a different stereoisomer.
-    expect(mainWindowSource).toMatch(/flattenSpunMolecule\(\s*input\.startDocument,\s*input\.objectId,\s*coords3d,\s*quatToViewMatrix\(nextQuat\),\s*{\s*placement,\s*\.\.\.spin3dFlattenStereoOptions\(input\.startDocument,\s*input\.objectId,\s*warnings\)\s*}\s*\)/s);
+    const typedRotationSource = mainWindowSource.slice(
+      mainWindowSource.indexOf("const rotationInputDocumentFromDraft ="),
+      mainWindowSource.indexOf("const handleRotationInputChange =")
+    );
+    // The typed flatten uses the shared placement computed from the starting orientation and
+    // runs the stereo read-back guard before persisting a new projection.
+    expect(typedRotationSource).toContain("const { placement } = spinPlacementFor(object, coords3d, model.orientation);");
+    expect(typedRotationSource).toMatch(
+      /const options = spin3dFlattenStereoOptions\(input\.startDocument,\s*input\.objectId,\s*warnings\);\s*const outcome = flattenSpunMolecule\(\s*input\.startDocument,\s*input\.objectId,\s*coords3d,\s*quatToViewMatrix\(nextQuat\),\s*{\s*placement,\s*\.\.\.options\s*}\s*\)/
+    );
     expect(mainWindowSource).toContain("modeledRotationEntry ? 0");
-    expect(mainWindowSource).toMatch(/quatFromAxisAngle\(SPIN_AXIS_Z,\s*-deltaDegrees \* Math\.PI \/ 180\)/);
-    expect(mainWindowSource).toMatch(/attachSpin3dModelFromConformer\(nextDocument,\s*input\.objectId/s);
-    expect(mainWindowSource).toMatch(/tiltNativeMoleculeProjectedPlane\(\s*input\.startDocument,\s*input\.objectId/s);
-    expect(mainWindowSource).toMatch(/applyDocumentObjectProjectedPlaneTilt\(\s*input\.startDocument,\s*input\.objectId/s);
+    expect(typedRotationSource).toMatch(/quatFromAxisAngle\(SPIN_AXIS_Z,\s*-deltaDegrees \* Math\.PI \/ 180\)/);
+    expect(typedRotationSource).toMatch(/attachSpin3dModelFromConformer\(nextDocument,\s*input\.objectId/);
+    expect(typedRotationSource).toMatch(/tiltNativeMoleculeProjectedPlane\(\s*input\.startDocument,\s*input\.objectId/);
+    expect(typedRotationSource).toMatch(/applyDocumentObjectProjectedPlaneTilt\(\s*input\.startDocument,\s*input\.objectId/);
   });
 
   it("keeps a flatten's own writer warnings but drops the expected per-commit perspective-cleanup note", () => {
@@ -3267,7 +3289,7 @@ describe("ChemDraft desktop shell", () => {
     expect(mainWindowSource).toContain('data-group-tilt3d-handle="true"');
     expect(mainWindowSource).toContain("handleGroupProjectedPlaneTiltPointerDown");
     expect(mainWindowSource).toContain('"group-projected-plane-tilt"');
-    expect(mainWindowSource).toContain("center: { x: bounds.centerX, y: bounds.centerY }");
+    expect(mainWindowSource).toContain("const center = { x: bounds.centerX, y: bounds.centerY }");
     expect(mainWindowSource).toContain("tiltNativeMoleculeObjectsProjectedPlane");
   });
 
@@ -3927,7 +3949,7 @@ describe("ChemDraft desktop shell", () => {
     expect(toggles.every((command) => command.category === "view")).toBe(true);
   });
 
-  it("builds the shell catalog from the effective registry and current history availability", () => {
+  it("uses live toolbar titles and current history availability in the shell catalog", () => {
     const pluginCommands = allShellCommands(createPhase4Document(), undefined, {
       registry: buildRegistryWithFixture()
     });
@@ -4107,22 +4129,6 @@ describe("ChemDraft desktop shell", () => {
     expect(genericAt).toBeGreaterThan(cancelAt);
     // And it must restore the pre-drag document rather than keep the preview.
     expect(mainWindowSource).toContain("replacePresentDocument(drag.startDocument);");
-  });
-
-  it("filters transitional stubs and compat-only art variants out of both gallery sources", () => {
-    for (const source of [mainWindowSource, paletteWindowSource]) {
-      expect(source).toContain("!TRANSITIONAL_STUB_COMMAND_IDS.has(command.id)");
-      expect(source).toContain("!isCompatOnlyArtVariantCommandId(command.id, shipped)");
-      // From the SHIPPED manifest, never the user's customized registry. Keyed off the latter the
-      // gallery ate its own tail: remove a tool from a toolbar and it disappeared from the list you
-      // would put it back with, with no way to recover it short of resetting every layout.
-      // (Scoped to this block on purpose — elsewhere, following the customized registry is right.)
-      const filterAt = source.indexOf("!isCompatOnlyArtVariantCommandId(command.id, shipped)");
-      const galleryBlock = source.slice(Math.max(0, filterAt - 600), filterAt);
-      expect(galleryBlock).toContain("getToolsetCommandSpecs(desktopToolsetRegistry)");
-      expect(galleryBlock).not.toContain("getToolsetCommandSpecs(toolsetRegistry)");
-    }
-    expect(paletteWindowSource).toContain("commands={galleryCommands}");
   });
 
   it("treats art style presets as compat-only but keeps other unshipped art tools offered", () => {

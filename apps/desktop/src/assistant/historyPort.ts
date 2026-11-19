@@ -1,8 +1,9 @@
 import type { AssistantRect } from "./AssistantToolContext";
-import type { ChemDraftDocument } from "@chemdraft/chem-core";
+import { sameBracketIdentity, type ChemDraftDocument } from "@chemdraft/chem-core";
 
 /** Selection patches rebuild page arrays too; array identity alone is not a document edit. */
-export function assistantDocumentContentUnchanged(before: ChemDraftDocument, after: ChemDraftDocument): boolean {
+export function assistantDocumentContentUnchanged(before: ChemDraftDocument, after: ChemDraftDocument,
+  { checkBracketIdentity = false }: { checkBracketIdentity?: boolean } = {}): boolean {
   const { selection: _beforeSelection, updatedAt: _beforeTime, pages: beforePages, ...beforeShell } = before;
   const { selection: _afterSelection, updatedAt: _afterTime, pages: afterPages, ...afterShell } = after;
   if (JSON.stringify(beforeShell) !== JSON.stringify(afterShell) || beforePages.length !== afterPages.length) return false;
@@ -10,8 +11,12 @@ export function assistantDocumentContentUnchanged(before: ChemDraftDocument, aft
     const { objects, ...shell } = page;
     const { objects: nextObjects, ...nextShell } = afterPages[index]!;
     return JSON.stringify(shell) === JSON.stringify(nextShell) && objects.length === nextObjects.length &&
-      objects.every((object, objectIndex) => object === nextObjects[objectIndex] ||
-        JSON.stringify(object) === JSON.stringify(nextObjects[objectIndex]));
+      objects.every((object, objectIndex) => {
+        const next = nextObjects[objectIndex]!;
+        if (object === next) return true;
+        if (checkBracketIdentity && object.type === "bracket" && next.type === "bracket" && !sameBracketIdentity(object, next)) return false;
+        return JSON.stringify(object) === JSON.stringify(next);
+      });
   });
 }
 
@@ -23,9 +28,9 @@ export interface AssistantHistoryPort {
   read(tabId: string): ChemDraftDocument | undefined;
   /** Run the optional guard on the final normalized state, before recording any history. */
   push(tabId: string, before: ChemDraftDocument, after: ChemDraftDocument, label: string,
-    assertFinalDocument?: (document: ChemDraftDocument) => void): void;
+    assertFinalDocument?: (document: ChemDraftDocument) => ChemDraftDocument | void): void;
   amend(tabId: string, after: ChemDraftDocument, label: string,
-    assertFinalDocument?: (document: ChemDraftDocument) => void): void;
+    assertFinalDocument?: (document: ChemDraftDocument) => ChemDraftDocument | void): void;
   select(tabId: string, objectIds: readonly string[], label: string): void;
   onUserEdit(listener: (tabId: string) => void): () => void;
   undo(tabId: string, expected: ChemDraftDocument): boolean;

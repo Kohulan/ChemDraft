@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Windows-only crash smoke for the menu-subclass use-after-free (see `install_app_menu` in
 // apps/desktop/src-tauri/src/lib.rs). It launches the INSTALLED app with a WebView2 DevTools port,
-// races whole-menu rebuilds (set_keybinding_scheme) against palette/Preferences/3D-debugger window
+// races whole-menu rebuilds (adding/removing a Tools row) against palette/Preferences/3D-debugger window
 // creation, show and hide, closes each run through the close button's WM_CLOSE path, and fails if
 // Windows logged a ChemDraft crash. Before the fix this crashed on every cycle; after it, none.
 //
@@ -153,17 +153,21 @@ async function stress(cdp) {
   if (toolsets.length === 0) {
     throw new Error("every churn toolset is already open; nothing to create");
   }
+  // Only this process's native menu mirror is changed. The webview restores its normal
+  // contributions on the next launch. Accelerator changes now update the existing items.
+  const addRow = invoke("sync_plugin_menu_items", { items: [
+    { id: "plugins.manage", label: "Add or Remove Plugins…", location: "tools", enabled: true }
+  ] });
+  const removeRow = invoke("sync_plugin_menu_items", { items: [] });
   for (let index = 0; index < rounds; index++) {
-    const scheme = index % 2 === 0 ? "chemdraw" : "chemdraft";
-    const other = scheme === "chemdraw" ? "chemdraft" : "chemdraw";
     const toolset = toolsets[index % toolsets.length];
     // Fired together so rebuild closures interleave with window creation on the main thread.
     await round(cdp, `round ${index + 1} open`, [
-      invoke("set_keybinding_scheme", { scheme }),
+      addRow,
       invoke("open_toolset_window", { toolsetId: toolset }),
-      invoke("set_keybinding_scheme", { scheme: other }),
+      removeRow,
       invoke("toggle_preferences_window"),
-      invoke("set_keybinding_scheme", { scheme }),
+      addRow,
       invoke("toggle_spin3d_debugger_window"),
       invoke("show_toolset_tooltip_window")
     ]);
@@ -171,7 +175,7 @@ async function stress(cdp) {
     await round(cdp, `round ${index + 1} close`, [
       invoke("close_toolset_window", { toolsetId: toolset }),
       invoke("hide_toolset_tooltip_window"),
-      invoke("set_keybinding_scheme", { scheme: "chemdraft" }),
+      removeRow,
       invoke("toggle_preferences_window"),
       invoke("toggle_spin3d_debugger_window")
     ]);

@@ -46,7 +46,7 @@ vi.mock("./window-manager", async original => ({
   },
   requestToolsetPopoverContent: async () => {}, requestToolsetTextStyle: async () => {},
   setCurrentWindowLogicalSize: async () => {}, setCurrentWindowLogicalPosition: async () => {},
-  showCurrentToolsetPopoverWindow: async () => {}, sendPaletteCommandCancel: bus.cancel,
+  showCurrentToolsetPopoverWindow: async () => true, sendPaletteCommandCancel: bus.cancel,
   isToolsetPopoverVisible: bus.queryVisibility
 }));
 

@@ -159,6 +159,31 @@ describe.each(["macos", "windows"])("native flyout lifecycle on %s", () => {
     }
   });
 
+  it("keeps a visible flyout eligible after Escape is handed back to an input", async () => {
+    await open(100, 1);
+    let resolveVisibility!: (visible: boolean) => void;
+    native.queryVisibility.mockImplementationOnce(() => new Promise(resolve => { resolveVisibility = resolve; }));
+    canvas.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    await vi.waitFor(() => expect(native.queryVisibility).toHaveBeenCalledTimes(1));
+    const input = document.createElement("input");
+    const received = vi.fn();
+    input.addEventListener("keydown", received);
+    document.body.append(input);
+    input.focus();
+    try {
+      resolveVisibility(true);
+      await vi.waitFor(() => expect(received).toHaveBeenCalledTimes(1));
+      expect(native.emit).not.toHaveBeenCalledWith("chemdraft://dismiss-toolset-popovers", expect.anything());
+      input.blur();
+      await escape();
+      expect(native.queryVisibility).toHaveBeenCalledTimes(2);
+      expect(native.emit).toHaveBeenCalledWith("chemdraft://dismiss-toolset-popovers", {
+        requestedAt: expect.any(Number), reason: "escape", openings: [{ toolsetId: "core.art", openedAt: 100, generation: 1 }]
+      });
+      expect(canvasEscape).not.toHaveBeenCalled();
+    } finally { input.remove(); }
+  });
+
   it.each(["hide", "blur"])("OS %s without a close notification lets Escape reach the canvas", async event => {
     await open(100);
     await notifyToolsetPopoverVisibility({ toolsetId: "core.art", openedAt: 100, visible: true });

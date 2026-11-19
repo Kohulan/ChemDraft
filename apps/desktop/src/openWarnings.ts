@@ -13,6 +13,8 @@ export const OPEN_WARNINGS_LIST_ID = "open-warnings-list";
 export interface OpenWarning {
   code: string;
   message: string;
+  /** A recovered table draft warning stays in the report after its automatic announcement. */
+  recoveryAnnounced?: boolean;
   /** The native object the warning is about; absent for a warning about the whole file. */
   sourceObjectId?: string;
   atomIds?: readonly string[];

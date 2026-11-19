@@ -106,6 +106,10 @@ export function PluginPromptTextDialog({ prompt, onSubmit, onCancel }: PluginPro
             value={value}
             placeholder={prompt.request.placeholder}
             maxLength={prompt.request.maxLength}
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
             onChange={(event) => setValue(event.currentTarget.value)}
           />
         </div>

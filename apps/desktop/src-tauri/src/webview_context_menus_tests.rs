@@ -493,15 +493,14 @@ fn contains_call(tokens: &[Token], name: &str, argument: &[&str]) -> bool {
     })
 }
 
-fn setup_configures_main(tokens: &[Token]) -> bool {
-    tokens.iter().enumerate().any(|(index, token)| {
-        (is(&tokens[index..], &[".", "setup", "("])
+fn setup_calls_primary(run: &[Token]) -> bool {
+    run.windows(3).any(|part| {
+        is(part, &[".", "setup", "("])
             && contains_call(
-                &tokens[index + 2].children,
-                "ensure_main_window_visible",
-                &["app"],
-            ))
-            || setup_configures_main(&token.children)
+                &part[2].children,
+                "setup_primary_app",
+                &["app", ".", "handle", "("],
+            )
     })
 }
 
@@ -533,7 +532,15 @@ fn main_is_configured(source: &str) -> bool {
         contains_call(body, "get_webview_window", &["MAIN_WINDOW_LABEL"])
             && contains_call(body, "configure_document_webview", &["&", "window"])
     });
-    let setup = setup_configures_main(&tokens);
+    // The macOS handoff can call setup_primary_app separately after creating a window. The
+    // automatic main window still needs the call from Tauri setup, which Windows always runs.
+    let setup = function_body(&tokens, "run").is_some_and(setup_calls_primary)
+        && function_body(&tokens, "setup_primary_app")
+            .is_some_and(|body| contains_call(body, "ensure_main_window_visible", &["app"]));
+    let takeover = function_body(&tokens, "start_macos_primary").is_some_and(|body| {
+        contains_call(body, "create_main_window", &["app"])
+            && contains_call(body, "setup_primary_app", &["app"])
+    });
     let label = tokens.windows(7).any(|part| {
         is(
             part,
@@ -548,7 +555,7 @@ fn main_is_configured(source: &str) -> bool {
             ],
         )
     });
-    configure && reveal && setup && label
+    configure && reveal && setup && takeover && label
 }
 
 #[test]
@@ -713,6 +720,9 @@ fn main_exemption_requires_the_setup_configuration_chain() {
     let source = include_str!("lib.rs");
     assert!(main_is_configured(source));
     for removed in [
+        "setup_primary_app(app.handle())",
+        "setup_primary_app(app)",
+        "create_main_window(app)?;",
         "ensure_main_window_visible(app)",
         "configure_document_webview(&window)",
         "disable_default_context_menus(window)",

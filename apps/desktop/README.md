@@ -9,6 +9,8 @@ the bounded native grace period; it pauses only once the save dialog is actually
 Save and Discard re-arm that grace before flushing the session. Prompt controls are restricted
 to the document window. On macOS, Dock Quit also checks the preference and reveals hidden
 documents for the prompt; system logout, restart, and shutdown remain non-blocking.
+If macOS cancels logout after ChemDraft receives the committed quit notification and the app
+stays open, editing remains locked and autosave stays off until you relaunch ChemDraft.
 
 Tauri v2, Vite, React, and TypeScript desktop shell for ChemDraft.
 

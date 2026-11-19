@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { act, createElement } from "react";
 import { createRoot } from "react-dom/client";
 import type { Generate3DConformerResult } from "@chemdraft/chemistry-adapter";
@@ -9,6 +9,7 @@ import { parseMolfileGraph } from "@chemdraft/clipboard-adapter";
 import { depictSmiles2D, perceiveStereoCentersFromMolfile, relayoutMolfile2D } from "@chemdraft/ocl-adapter";
 import * as oclAdapter from "@chemdraft/ocl-adapter";
 import { testMoleculeFromSmiles } from "@chemdraft/layout-engine/testing";
+import { ensureRdkit, resetRdkitForTesting, setRdkitModuleLoader } from "@chemdraft/rdkit-adapter";
 import { createSmilesMolecule, stereoPerceptionMolfile } from "@chemdraft/document-workflow-core";
 import { analysisFacingStructure, copyAsMolfile, applyNativeMoleculeEngineRelayout, flattenSpunMolecule, buildSpin3dModel, SPIN3D_MODEL_KEY } from "./documentWorkflow";
 import { MainWindow, spin3dPrefetchMolfile } from "./MainWindow";
@@ -16,6 +17,7 @@ import { AGENT_BRIDGE_GLOBAL_NAME, type ChemDraftAgentBridge } from "./agentBrid
 import * as flattenStereoPolicy from "./spin3dFlattenStereoPolicy";
 import { createEngine3dSessionInputFromMolecule } from "./engine3dSidecar";
 import { pluginFacingStructure } from "./plugins/selectionSnapshot";
+import { installDomRdkitLoader } from "./testSupport/rdkitIdentity";
 
 const conformer = vi.hoisted(() => ({ generate: vi.fn(), prefetch: vi.fn(), warmup: vi.fn() }));
 const analysisWorkerFactory = vi.hoisted(() => vi.fn(() => { throw new Error("Refused analysis attempted to create a worker."); }));
@@ -26,6 +28,7 @@ vi.mock("./analysisClient", async (importOriginal) => {
   return { ...original, analysisClient: () => client };
 });
 vi.mock("@scena/react-ruler", () => ({ default: () => null }));
+vi.mock("./rdkitWasmLoader", () => ({ registerRdkitWasmLoader: vi.fn() }));
 
 function unknownMolecule(): MoleculeObject {
   return { id: "unknown-molecule", type: "molecule", x: 100, y: 100, width: 100, height: 100,
@@ -141,7 +144,8 @@ describe("unknown-order bonds at app boundaries", () => {
     conformer.prefetch.mockClear();
     analysisWorkerFactory.mockClear();
     try {
-      await act(async () => root.render(createElement(MainWindow, { initialDocument: selectedDocument(unknownMolecule()), initialPaletteMode: "hidden", initialRulersVisible: false, nativePalette: true })));
+      // jsdom has no native palette window; use the web palette so opening the Inspector succeeds.
+      await act(async () => root.render(createElement(MainWindow, { initialDocument: selectedDocument(unknownMolecule()), initialPaletteMode: "hidden", initialRulersVisible: false, nativePalette: false })));
       const bridge = window[AGENT_BRIDGE_GLOBAL_NAME];
       expect(bridge).toBeDefined();
       await act(async () => { await bridge!.command(command); });
@@ -158,6 +162,12 @@ describe("unknown-order bonds at app boundaries", () => {
 });
 
 describe("persisted Spin models at rotation boundaries", () => {
+  beforeAll(async () => {
+    installDomRdkitLoader(setRdkitModuleLoader);
+    await ensureRdkit();
+  });
+  afterAll(() => resetRdkitForTesting());
+
   function withModel(molecule: MoleculeObject): MoleculeObject {
     return {
       ...molecule,
