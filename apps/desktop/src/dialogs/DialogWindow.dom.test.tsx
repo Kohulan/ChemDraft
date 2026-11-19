@@ -356,6 +356,24 @@ it.each(["macos", "windows"] as const)("closes a clean export through the dialog
   expect(actions.map(message => message.data.action)).toEqual(["export", "cancel"]);
 });
 
+it("keeps a clean export completed when automatic close fails", async () => {
+  act(() => root.unmount()); root = createRoot(container);
+  await act(async () => root.render(createElement(DialogWindow, { hostId: "export-host" })));
+  const exportSnapshot: Extract<DialogMessage, { type: "snapshot" }> = { ...snapshot, dialogKind: "export", sessionId: "export-close-failure", data: { title: "Origin", options: exportFixture() } };
+  await act(async () => { host.receive!(exportSnapshot); await import("./ExportForm"); });
+  const button = (text: string) => [...container.querySelectorAll<HTMLButtonElement>("button")].find(b => b.textContent === text)!;
+  await act(async () => button("Export").click());
+  const action = host.send.mock.calls.at(-1)![1] as DialogMessage;
+  host.send.mockRejectedValueOnce(new Error("Close failed"));
+  await act(async () => host.receive!({ ...exportSnapshot, type: "result", requestId: action.requestId, data: { status: "exported" } }));
+  expect(container.querySelector('[role="alert"]')?.textContent).toContain("Close failed");
+  expect(button("Exported").disabled).toBe(true);
+  await act(async () => button("Exported").click());
+  expect(host.send.mock.calls.filter(([, m]) => m.type === "action" && m.data.action === "export")).toHaveLength(1);
+  await act(async () => button("Close").click());
+  expect(host.send).toHaveBeenLastCalledWith("export-host", expect.objectContaining({ data: { action: "cancel" } }));
+});
+
 it("keeps Export open when the save panel is canceled", async () => {
   act(() => root.unmount()); root = createRoot(container);
   await act(async () => root.render(createElement(DialogWindow, { hostId: "export-host" })));

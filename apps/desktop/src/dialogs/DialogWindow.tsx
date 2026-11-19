@@ -144,6 +144,7 @@ function DialogWindowContent({ hostId }: { hostId: string }) {
           return;
         }
         clearTimeout(actionTimer.current);
+        if (message.data.status === "exported") setExported(true);
         if (latest.dialogKind === "export" && message.data.status === "exported" && !message.data.notice) {
           // The owner sends a notice for every warning-bearing export. Close clean exports
           // through the same host action as the form's Cancel and Close controls.
@@ -154,7 +155,6 @@ function DialogWindowContent({ hostId }: { hostId: string }) {
         }
         // A successful terminal receipt precedes native destruction. Never reopen Apply here.
         if (message.data.status !== "applied" || latest.dialogKind === "atomProblem") { actionPending.current = false; setBusy(false); }
-        if (message.data.status === "exported") setExported(true);
         if (message.data.status === "picked" && message.data.destinationPath && message.data.filename) {
           const { destinationPath, filename } = message.data;
           setExportDraft(current => current ? { ...current, destinationPath, filename } : current);
