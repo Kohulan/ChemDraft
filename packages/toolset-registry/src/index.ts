@@ -464,6 +464,7 @@ export function normalizeToolsetItem<TIcon extends string = string, TAssetName e
     : { type: "none" });
   const id = item.id
     ?? item.commandId
+    ?? (primary.type === "command" ? primary.commandId : undefined)
     ?? (primary.type === "control" ? primary.controlId : undefined)
     // A separator has no command/control id, so synthesize a stable one from its position. Never
     // require context.groupId here — a schema-valid separator in an id-less group must not crash.
@@ -554,32 +555,63 @@ export function parseToolsetLayoutState<TIcon extends string = string, TAssetNam
   const result = ToolsetLayoutStateSchema.safeParse(state);
   if (result.success) return result.data as ToolsetLayoutState<TIcon, TAssetName>;
 
-  // For a malformed command ID, remove its containing item or override entry and revalidate.
-  // Only recover command-ID errors. Unrelated malformed layout data still fails validation.
-  const removals = new Map<string, { path: (string | number)[]; index: number }>();
+  // Recover command-ID errors and revalidate the rest of the saved layout.
+  const property = (value: unknown, key: string | number): unknown =>
+    (value as Record<string | number, unknown>)[key];
+  const removals = new Map<string, (string | number)[]>();
   for (const issue of result.error.issues) {
     if (issue.message !== INVALID_COMMAND_ID_MESSAGE) continue;
+    // A toolbar item's legacy commandId and explicit primary are two ways to supply its
+    // action. A valid action in either field can keep the item, including its submenu.
+    const isPrimaryId = issue.path.at(-2) === "primary";
+    const itemPath = issue.path.slice(0, isPrimaryId ? -2 : -1);
+    const isAdditionItem = itemPath.at(-1) === "item";
+    const isToolbarItem = isAdditionItem
+      || (typeof itemPath.at(-1) === "number" && itemPath.at(-2) === "items" && itemPath.at(-3) !== "submenu");
+    if (issue.path.at(-1) === "commandId" && isToolbarItem) {
+      const item = itemPath.reduce<unknown>(property, state) as Record<string, unknown>;
+      const hasStructuralId = !isAdditionItem || NonEmptyStringSchema.safeParse(item.id).success;
+      const isStructural = hasStructuralId && (item.kind === "separator" || item.kind === "spacer");
+      const primary = ToolsetPrimaryActionSchema.safeParse(item.primary);
+      const hasOtherAction = isPrimaryId
+        ? CommandIdSchema.safeParse(item.commandId).success || (item.commandId === undefined && isStructural)
+        : primary.success
+          ? primary.data.type !== "none" || hasStructuralId
+          : item.primary === undefined && isStructural;
+      if (hasOtherAction) {
+        const fieldPath = [...itemPath, isPrimaryId ? "primary" : "commandId"];
+        removals.set(JSON.stringify(fieldPath), fieldPath);
+        continue;
+      }
+    }
+
     let indexPosition = issue.path.length - 1;
     while (indexPosition >= 0 && typeof issue.path[indexPosition] !== "number") indexPosition--;
     if (indexPosition < 0) continue;
-    const path = issue.path.slice(0, indexPosition);
-    const index = issue.path[indexPosition] as number;
-    removals.set(JSON.stringify([path, index]), { path, index });
-    onInvalidCommand(`Toolbar customization dropped an invalid command ID at ${issue.path.join(".")}.`);
+    const entryPath = issue.path.slice(0, indexPosition + 1);
+    removals.set(JSON.stringify(entryPath), entryPath);
   }
   if (removals.size === 0) throw result.error;
 
   const recovered = structuredClone(state);
-  const property = (value: unknown, key: string | number): unknown =>
-    (value as Record<string | number, unknown>)[key];
   // Remove nested entries before their parents, and remove from right to left within an array.
-  for (const { path, index } of [...removals.values()].sort((a, b) => b.path.length - a.path.length || b.index - a.index)) {
-    const entries = path.reduce<unknown>(property, recovered);
-    if (!Array.isArray(entries)) continue;
-    entries.splice(index, 1);
-    if (entries.length === 0 && path.at(-2) === "submenu" && path.at(-1) === "items") {
-      const item = path.slice(0, -2).reduce<unknown>(property, recovered) as Record<string, unknown>;
-      item.submenu = null;
+  const arrayIndex = (key: string | number | undefined) => typeof key === "number" ? key : -1;
+  for (const path of [...removals.values()].sort((a, b) => b.length - a.length || arrayIndex(b.at(-1)) - arrayIndex(a.at(-1)))) {
+    const key = path.at(-1)!;
+    const parentPath = path.slice(0, -1);
+    const parent = parentPath.reduce<unknown>(property, recovered);
+    if (typeof key === "string") {
+      delete (parent as Record<string, unknown>)[key];
+      onInvalidCommand(`Toolbar customization dropped an invalid command ID field at ${path.join(".")}.`);
+      continue;
+    }
+
+    const entries = parent as unknown[];
+    entries.splice(key, 1);
+    onInvalidCommand(`Toolbar customization dropped the entry at ${path.join(".")} because it contained an invalid command ID.`);
+    if (entries.length === 0 && parentPath.at(-2) === "submenu" && parentPath.at(-1) === "items") {
+      const owner = parentPath.slice(0, -2).reduce<unknown>(property, recovered) as Record<string, unknown>;
+      owner.submenu = null;
     }
   }
   return ToolsetLayoutStateSchema.parse(recovered) as ToolsetLayoutState<TIcon, TAssetName>;

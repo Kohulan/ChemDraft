@@ -12797,7 +12797,7 @@ export function MainWindow({
     const syncPluginToolsets = () => {
       const pluginToolsets = runtime.listPluginToolsets();
       pluginToolsetsRef.current = pluginToolsets;
-      toolbarCatalog.setPluginToolsets(pluginToolsets, registry.list());
+      toolbarCatalog.setPluginToolsets(pluginToolsets, runtime.listPluginCommandsWithHandlers());
       void broadcastToolsetDefinitions(pluginToolsets).catch(() => undefined);
     };
     const unsubscribe = runtime.onDidChange(syncPluginToolsets);
@@ -12819,7 +12819,7 @@ export function MainWindow({
         }
       }
     };
-  }, [pluginRuntime.runtime, registry, toolbarCatalog]);
+  }, [pluginRuntime.runtime, toolbarCatalog]);
 
   // Purge replay state synchronously with the controller, including when unregister + reinstall
   // are batched into one React render. Reports belong to a live panel, never just a plugin id.

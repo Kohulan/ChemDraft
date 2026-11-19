@@ -1142,6 +1142,9 @@ struct PersistedToolsetState {
     x: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     y: Option<f64>,
+    // The backing scale makes x/y unambiguous in the Windows virtual desktop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position_scale: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     width: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1542,16 +1545,11 @@ pub fn run() {
                     {
                         return;
                     }
-                    let logical_position = logical_toolset_position_from_physical(
-                        position.x as f64,
-                        position.y as f64,
-                        window.scale_factor().unwrap_or(1.0),
-                    );
                     if let Err(error) = persist_toolset_position(
                         app,
                         &toolset_id,
-                        logical_position.x,
-                        logical_position.y,
+                        position,
+                        window.scale_factor().unwrap_or(1.0),
                     ) {
                         eprintln!(
                             "Could not persist ChemDraft toolset position {toolset_id}: {error}"
@@ -3247,15 +3245,17 @@ fn close_toolset_window(
     if let Some(window) = window.as_ref() {
         let webview: &tauri::Webview = window.as_ref();
         if let Some(position) = visible_toolset_physical_position(&webview.window()) {
-            let position =
-                logical_toolset_position(window, f64::from(position.x), f64::from(position.y));
             // Best-effort, exactly like the `Moved` handler. Remembering where the palette was is
             // housekeeping; it must never be able to veto the close the user asked for. Once
             // `update_toolset_layout_state` began propagating read errors instead of swallowing
             // them as defaults, a `?` here meant an unreadable toolbar-state.json left the palette
             // on screen with its menu item still checked and no state event emitted.
-            if let Err(error) = persist_toolset_position(&app, &toolset_id, position.x, position.y)
-            {
+            if let Err(error) = persist_toolset_position(
+                &app,
+                &toolset_id,
+                position,
+                window.scale_factor().unwrap_or(1.0),
+            ) {
                 eprintln!(
                     "chemdraft: could not save the position of toolset {toolset_id}: {error}"
                 );
@@ -10055,11 +10055,15 @@ fn ensure_toolset_window<R: Runtime>(
     // A persisted position wins (the user moved it before); otherwise the JS-supplied default.
     // Either way it's clamped onto an attached monitor — a position saved on a display that's since
     // been unplugged would otherwise open the palette offscreen with no way to get it back.
-    let (position, width, height) = clamp_toolset_frame(
+    let position = saved
+        .and_then(PersistedToolsetState::position)
+        .unwrap_or(default_position);
+    #[cfg(not(windows))]
+    let (position, width, height) = clamp_toolset_frame(app, position, (width, height), resizable);
+    #[cfg(windows)]
+    let placement = clamp_windows_toolset_frame(
         app,
-        saved
-            .and_then(PersistedToolsetState::position)
-            .unwrap_or(default_position),
+        ToolsetFrameOrigin::Logical(position, saved.and_then(|state| state.position_scale)),
         (width, height),
         resizable,
     );
@@ -10094,8 +10098,17 @@ fn ensure_toolset_window<R: Runtime>(
     .decorations(false)
     // Overlapping palettes need a visible edge, matching the popover's native shadow.
     .shadow(true)
-    .skip_taskbar(true)
-    .position(position.x, position.y);
+    .skip_taskbar(true);
+    #[cfg(not(windows))]
+    let builder = builder.position(position.x, position.y);
+    #[cfg(windows)]
+    let builder = if placement.is_some() {
+        // Tao's builder accepts logical positions only. Set the physical frame before showing
+        // the window so it does not flash at an ambiguous logical position on another display.
+        builder.visible(false)
+    } else {
+        builder.visible(false).position(position.x, position.y)
+    };
     // Only scrolling inspectors need a floor for manual resize. A toolbar's frame is fixed
     // at the DOM's measured size until the next fit. A floor here would leave narrow grids padded.
     let builder = if resizable {
@@ -10119,6 +10132,21 @@ fn ensure_toolset_window<R: Runtime>(
     disable_default_context_menus(&window);
     configure_toolset_utility_window(&window, true)?;
     install_toolset_input_focus(&window)?;
+    #[cfg(windows)]
+    {
+        let target = window.clone();
+        let placed = run_on_main_thread_blocking(&window, move || {
+            if let Some(placement) = placement {
+                let webview: &tauri::Webview<R> = target.as_ref();
+                panel_full_size::apply(&webview.window(), placement, "initial toolbar placement")?;
+            }
+            target.show().map_err(|error| error.to_string())
+        })
+        .and_then(|result| result);
+        panel_window::finish_installation(placed, || {
+            window.destroy().map_err(|error| error.to_string())
+        })?;
+    }
     Ok(())
 }
 
@@ -10552,6 +10580,7 @@ fn inspector_frame_in_work_area(
 /// created successfully and painted into nowhere — which reads to the user as "the toolbar won't
 /// open" even though View ▸ Toolbars shows it checked, with no UI path to recover it. Clamp onto the
 /// primary monitor (the one that's certainly present) whenever the saved spot is unreachable.
+#[cfg(not(windows))]
 fn clamp_toolset_frame<R: Runtime>(
     app: &tauri::AppHandle<R>,
     position: ToolsetWindowPosition,
@@ -10580,9 +10609,19 @@ fn clamp_toolset_frame<R: Runtime>(
             let primary = app.primary_monitor().ok().flatten();
             monitor_logical_work_area(primary.as_ref().unwrap_or(&monitors[0]))
         });
+    toolset_frame_in_work_area(position, size, resizable, area)
+}
+
+fn toolset_frame_in_work_area(
+    position: ToolsetWindowPosition,
+    size: (f64, f64),
+    resizable: bool,
+    area: ScreenRect,
+) -> (ToolsetWindowPosition, f64, f64) {
     if resizable {
         return inspector_frame_in_work_area(position, size, area);
     }
+    let (width, height) = size;
     (
         toolset_position_in_work_area(position, width, height, area),
         width,
@@ -10590,8 +10629,139 @@ fn clamp_toolset_frame<R: Runtime>(
     )
 }
 
+#[cfg(any(windows, test))]
+type ToolsetMonitor = panel_window_frame::Monitor;
+
+#[cfg(any(windows, test))]
+enum ToolsetFrameOrigin {
+    Physical((i32, i32), f64),
+    Logical(ToolsetWindowPosition, Option<f64>),
+}
+
+#[cfg(any(windows, test))]
+fn toolset_monitor_contains(monitor: &ToolsetMonitor, point: (f64, f64)) -> bool {
+    let (x, y) = monitor.identity.position;
+    let (width, height) = monitor.identity.size;
+    let (x, y) = (f64::from(x), f64::from(y));
+    (x..x + f64::from(width)).contains(&point.0) && (y..y + f64::from(height)).contains(&point.1)
+}
+
+/// Select a Windows monitor in virtual-desktop pixels. Only after selecting it do we use its
+/// scale to clamp the frame in monitor-local points and convert it back to pixels.
+#[cfg(any(windows, test))]
+fn clamp_toolset_frame_in_physical_space(
+    origin: ToolsetFrameOrigin,
+    size: (f64, f64),
+    resizable: bool,
+    monitors: &[ToolsetMonitor],
+    primary: &ToolsetMonitor,
+) -> panel_window_frame::Placement {
+    let (physical, source_scale) = match origin {
+        ToolsetFrameOrigin::Physical((x, y), scale) => ((f64::from(x), f64::from(y)), scale),
+        ToolsetFrameOrigin::Logical(position, saved_scale) => {
+            let scale = saved_scale
+                .filter(|scale| scale.is_finite() && *scale > 0.0)
+                .unwrap_or_else(|| {
+                    // Legacy saves have no scale. Use a monitor that can explain the saved
+                    // position, preferring the primary if the old coordinates are ambiguous.
+                    std::iter::once(primary)
+                        .chain(monitors)
+                        .find(|monitor| {
+                            toolset_monitor_contains(
+                                monitor,
+                                (position.x * monitor.scale, position.y * monitor.scale),
+                            )
+                        })
+                        .unwrap_or(primary)
+                        .scale
+                });
+            ((position.x * scale, position.y * scale), scale)
+        }
+    };
+    let center = (
+        physical.0 + size.0 * source_scale / 2.0,
+        physical.1 + size.1 * source_scale / 2.0,
+    );
+    let monitor = monitors
+        .iter()
+        .find(|monitor| toolset_monitor_contains(monitor, physical))
+        .or_else(|| {
+            monitors
+                .iter()
+                .find(|monitor| toolset_monitor_contains(monitor, center))
+        })
+        .or_else(|| {
+            if resizable {
+                return None;
+            }
+            // A partially offscreen toolbar can still have a reachable title.
+            monitors.iter().find(|monitor| {
+                let (x, y) = monitor.identity.position;
+                let area = monitor.work_area;
+                let scale = monitor.scale;
+                ScreenRect::new(
+                    f64::from(x) + area.x * scale,
+                    f64::from(y) + area.y * scale,
+                    area.width * scale,
+                    area.height * scale,
+                )
+                .contains_title_strip_at_scale(
+                    physical.0,
+                    physical.1,
+                    size.0 * source_scale,
+                    TOOLSET_TITLE_HEIGHT * source_scale,
+                    source_scale,
+                )
+            })
+        })
+        .unwrap_or(primary);
+    let (x, y) = monitor.identity.position;
+    let scale = monitor.scale;
+    let position = ToolsetWindowPosition {
+        x: (physical.0 - f64::from(x)) / scale,
+        y: (physical.1 - f64::from(y)) / scale,
+    };
+    let (position, width, height) =
+        toolset_frame_in_work_area(position, size, resizable, monitor.work_area);
+    let size = tauri::LogicalSize::new(width, height).to_physical::<u32>(scale);
+    panel_window_frame::Placement {
+        position: (
+            (f64::from(x) + position.x * scale).round() as i32,
+            (f64::from(y) + position.y * scale).round() as i32,
+        ),
+        size: (size.width, size.height),
+        scale,
+    }
+}
+
+#[cfg(windows)]
+fn clamp_windows_toolset_frame<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    origin: ToolsetFrameOrigin,
+    size: (f64, f64),
+    resizable: bool,
+) -> Option<panel_window_frame::Placement> {
+    let monitors: Vec<_> = app
+        .available_monitors()
+        .ok()?
+        .iter()
+        .map(ToolsetMonitor::from_native)
+        .collect();
+    let primary = app
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .as_ref()
+        .map(ToolsetMonitor::from_native);
+    let primary = primary.as_ref().or_else(|| monitors.first())?;
+    Some(clamp_toolset_frame_in_physical_space(
+        origin, size, resizable, &monitors, primary,
+    ))
+}
+
 /// Move an already-built palette back onscreen if its current spot is unreachable. Best-effort: a
 /// window we can't measure or move is left exactly as it is rather than teleported on a guess.
+#[cfg(not(windows))]
 fn recover_offscreen_toolset_window<R: Runtime>(
     app: &tauri::AppHandle<R>,
     window: &tauri::WebviewWindow<R>,
@@ -10616,21 +10786,63 @@ fn recover_offscreen_toolset_window<R: Runtime>(
         return;
     }
 
-    let physical = tauri::LogicalPosition::new(clamped.x, clamped.y).to_physical::<i32>(scale);
-    if utility_windows_suspended() {
-        // Register before SetWindowPos: Windows may buffer Moved until after finish_restore.
-        UTILITY_SUSPENSION
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .recovery_move(window.label(), (physical.x, physical.y));
-    }
     windows_activation_log::frame_set(
         window.label(),
         "recover offscreen toolbar",
-        "pixels",
-        || (physical, window.inner_size().ok()),
+        "logical",
+        || ((clamped.x, clamped.y), (width, height)),
     );
-    let _ = window.set_position(physical);
+    let _ = window.set_position(tauri::LogicalPosition::new(clamped.x, clamped.y));
+}
+
+/// Recover a Windows palette in virtual-desktop pixels.
+#[cfg(windows)]
+fn recover_offscreen_toolset_window<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    window: &tauri::WebviewWindow<R>,
+    resizable: bool,
+) {
+    let target = window.clone();
+    let app = app.clone();
+    let _ = run_on_main_thread_blocking(window, move || {
+        let webview: &tauri::Webview<R> = target.as_ref();
+        let window = webview.window();
+        if toolset_frame_is_transient(&app, &window) {
+            return;
+        }
+        let (Ok(position), Ok(size), Ok(scale)) = (
+            window.outer_position(),
+            window.inner_size(),
+            window.scale_factor(),
+        ) else {
+            return;
+        };
+        let physical = (position.x, position.y);
+        let logical_size = size.to_logical::<f64>(scale);
+        let Some(placement) = clamp_windows_toolset_frame(
+            &app,
+            ToolsetFrameOrigin::Physical(physical, scale),
+            (logical_size.width, logical_size.height),
+            resizable,
+        ) else {
+            return;
+        };
+        if placement.position == physical {
+            if placement.size != (size.width, size.height) {
+                let _ =
+                    window.set_size(tauri::PhysicalSize::new(placement.size.0, placement.size.1));
+            }
+            return;
+        }
+        if utility_windows_suspended() {
+            // Register before SetWindowPos: Windows may buffer Moved until after finish_restore.
+            UTILITY_SUSPENSION
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recovery_move(window.label(), placement.position);
+        }
+        let _ = panel_full_size::apply(&window, placement, "recover offscreen toolbar");
+    });
 }
 
 fn persisted_toolset_position<R: Runtime>(
@@ -10722,14 +10934,17 @@ fn logical_toolset_position_from_physical(
 fn persist_toolset_position<R: Runtime>(
     app: &tauri::AppHandle<R>,
     toolset_id: &str,
-    x: f64,
-    y: f64,
+    physical: tauri::PhysicalPosition<i32>,
+    scale: f64,
 ) -> Result<(), String> {
     let toolset_id = toolset_id.to_string();
+    let position =
+        logical_toolset_position_from_physical(f64::from(physical.x), f64::from(physical.y), scale);
     update_toolset_layout_state(app, move |layout_state| {
         let state = layout_state.toolsets.entry(toolset_id).or_default();
-        state.x = Some(x);
-        state.y = Some(y);
+        state.x = Some(position.x);
+        state.y = Some(position.y);
+        state.position_scale = (cfg!(windows) && scale.is_finite() && scale > 0.0).then_some(scale);
     })
 }
 
@@ -11944,6 +12159,64 @@ mod tests {
             (position.x, position.y, width, height),
             (1400.0, 324.0, 500.0, 300.0)
         );
+
+        let monitors = [
+            ToolsetMonitor {
+                identity: panel_window_frame::MonitorIdentity {
+                    name: None,
+                    position: (0, 0),
+                    size: (1920, 1080),
+                },
+                scale: 1.0,
+                work_area: ScreenRect::new(0.0, 0.0, 1920.0, 1080.0),
+            },
+            ToolsetMonitor {
+                identity: panel_window_frame::MonitorIdentity {
+                    name: None,
+                    position: (1920, 0),
+                    size: (2560, 1500),
+                },
+                scale: 2.0,
+                work_area: ScreenRect::new(0.0, 0.0, 1280.0, 720.0),
+            },
+        ];
+        let expected = panel_window_frame::Placement {
+            position: (2400, 0),
+            size: (1000, 1440),
+            scale: 2.0,
+        };
+        for origin in [
+            ToolsetFrameOrigin::Physical((2400, 200), 2.0),
+            // A window moving to the secondary can still report its previous backing scale.
+            ToolsetFrameOrigin::Physical((2400, 200), 1.0),
+            ToolsetFrameOrigin::Logical(
+                ToolsetWindowPosition {
+                    x: 1200.0,
+                    y: 100.0,
+                },
+                Some(2.0),
+            ),
+        ] {
+            assert_eq!(
+                clamp_toolset_frame_in_physical_space(
+                    origin,
+                    (500.0, 900.0),
+                    true,
+                    &monitors,
+                    &monitors[0]
+                ),
+                expected
+            );
+        }
+        let centered = clamp_toolset_frame_in_physical_space(
+            ToolsetFrameOrigin::Physical((1880, -20), 1.0),
+            (500.0, 900.0),
+            true,
+            &monitors,
+            &monitors[0],
+        );
+        assert_eq!(centered.position, (1920, 0));
+        assert_eq!(centered.size, expected.size);
     }
 
     #[test]

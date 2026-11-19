@@ -31,7 +31,7 @@ export type DesktopToolsetRegistry = ToolsetRegistry<IconName, ToolbarAssetName>
 
 export interface ToolbarPaletteItemModel {
   id: string;
-  /** An item added to a shipped toolset by toolbar customization. */
+  /** An item added to a shipped toolset or one of its copies by toolbar customization. */
   customAddition?: boolean;
   kind: "button" | "toggle" | "control" | "separator" | "spacer";
   label: string;
@@ -541,17 +541,25 @@ export function getToolsetPaletteGroups(
   layoutsEnabled = loadCompoundLayoutSettings().enabled,
   settings: CompoundLayoutSettings = loadCompoundLayoutSettings()
 ): ToolbarPaletteGroupModel[] {
-  // Items absent from this core toolset's shipped definition are persisted custom additions. Their
+  // Items absent from the original core toolset's shipped definition are custom additions. Their
   // stored item shell is placement only; visual/interactive command semantics must follow the live
   // CommandSpec (for example a renamed user-toolbar launcher or changing Undo availability).
-  const shippedToolset = desktopToolsetRegistry.get(toolsetId);
+  const toolset = registry.require(toolsetId);
+  let shippedToolset = desktopToolsetRegistry.get(toolsetId);
+  let sourceId = toolset.clonedFromToolsetId;
+  const visited = new Set([toolsetId]);
+  while (!shippedToolset && sourceId && !visited.has(sourceId)) {
+    visited.add(sourceId);
+    shippedToolset = desktopToolsetRegistry.get(sourceId);
+    sourceId = registry.get(sourceId)?.clonedFromToolsetId;
+  }
   const shippedItemIds = new Set(
     shippedToolset
       ? normalizeToolsetDefinition(shippedToolset).groups
           .flatMap((group) => group.items.map((item) => item.id))
       : []
   );
-  return normalizeToolsetDefinition(registry.require(toolsetId)).groups.map((group) => ({
+  return normalizeToolsetDefinition(toolset).groups.map((group) => ({
     id: group.id,
     items: group.items.filter(item => item.primary.type !== "command" || !isCompoundLayoutCommandHidden(item.primary.commandId, { ...settings, enabled: layoutsEnabled })).map((item) => {
       const commandId = item.primary.type === "command" ? item.primary.commandId : undefined;
@@ -603,12 +611,16 @@ export function initialToolsetWindowSize(
   if (toolsetUsesResizableWindow(toolset.id)) {
     return toolset.preferredWindowSize ?? { width: 96, height: 420 };
   }
-  // Use the vertical grid's content width for recovery onto a smaller or newly attached display.
-  // Horizontal palettes with widgets use their shipped defaults until the DOM measures content.
-  const gridLayout = toolset.gridLayout ?? VERTICAL_PALETTE_GRID_LAYOUT;
-  const gridSize = toolset.gridLayout?.orientation === "horizontal" ? undefined : computePaletteGridSize(gridLayout, itemGroups);
-  return gridSize
-    ?? desktopToolsetRegistry.get(toolset.id)?.preferredWindowSize
+  // A horizontal toolbar's preferred size includes fixed controls the grid does not measure.
+  const horizontal = toolset.gridLayout?.orientation === "horizontal";
+  if (horizontal && toolset.preferredWindowSize) {
+    return toolset.preferredWindowSize;
+  }
+  const gridLayout = horizontal && !toolset.gridLayout?.columns
+    ? { rows: 2, ...toolset.gridLayout }
+    : toolset.gridLayout ?? VERTICAL_PALETTE_GRID_LAYOUT;
+  return computePaletteGridSize(gridLayout, itemGroups)
+    ?? toolset.preferredWindowSize
     ?? { width: 96, height: 420 };
 }
 

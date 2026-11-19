@@ -378,7 +378,8 @@ export function cloneToolset<I extends string, A extends string>(
     preferredWindowSize: source.preferredWindowSize,
     gridLayout: source.gridLayout,
     category: source.category,
-    clonedFromToolsetId: source.id,
+    // Keep the original definition available for rendering copies of a customized copy.
+    clonedFromToolsetId: source.clonedFromToolsetId ?? source.id,
     groups
   };
   return { state: { ...state, userToolsets: [...state.userToolsets, toolset] }, toolsetId: id };

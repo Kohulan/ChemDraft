@@ -45,6 +45,36 @@ describe("desktop plugin runtime + toolbar catalog", () => {
     expect(catalog.registry().get("core.main")).toBeDefined();
   });
 
+  it("offers only plugin commands with handlers, including disabled commands with handlers", () => {
+    const registry = new CommandRegistry();
+    const runtime = createPluginRuntime({ commandRegistry: registry, getActiveDocument: () => undefined });
+    const enabledId = "plugin.gallery.run";
+    const disabledId = "plugin.gallery.disabled";
+    const unhandledId = "plugin.gallery.unhandled";
+    runtime.registerPlugin({
+      id: "org.chemdraft.gallery",
+      name: "Gallery Test",
+      version: "0.0.0",
+      apiVersion: "^0.1.0",
+      entry: "dev",
+      permissions: [],
+      contributes: { commands: [
+        { id: enabledId, title: "Run" },
+        { id: disabledId, title: "Disabled", enabled: false },
+        { id: unhandledId, title: "Unhandled" }
+      ] }
+    }, { commandHandlers: { [enabledId]: () => undefined, [disabledId]: () => undefined } });
+
+    const catalog = createToolbarCatalog();
+    catalog.setPluginToolsets(runtime.listPluginToolsets(), runtime.listPluginCommandsWithHandlers());
+    expect(registry.get(unhandledId)?.enabled).toBe(false);
+    expect(catalog.baseCommands().filter(command => command.id.startsWith("plugin.gallery."))
+      .map(({ id, enabled }) => ({ id, enabled }))).toEqual([
+      { id: enabledId, enabled: true },
+      { id: disabledId, enabled: false }
+    ]);
+  });
+
   it("enforces ui.toolbar and rolls the plugin back when a toolset is contributed without it", () => {
     const runtime = makeRuntime();
     const withoutPermission = { ...fixturePluginManifest, id: "org.chemdraft.fixture.bad", permissions: [] };

@@ -59,8 +59,15 @@ describe("palette work-area sizing", () => {
     expect(resize).toContain("toolset_position_in_work_area(position, width, height, area)");
     const recover = nativeSource.split("fn toolset_position_in_work_area(")[1]!.split("/// Pull a palette")[0]!;
     expect(recover).toContain("area.contains_title_strip(position.x, position.y, width, TOOLSET_TITLE_HEIGHT)");
-    const reopen = nativeSource.split("fn clamp_toolset_frame<")[1]!.split("/// Move an already-built palette")[0]!;
+    const reopen = nativeSource.split("fn clamp_toolset_frame<")[1]!.split("fn toolset_frame_in_work_area")[0]!;
     expect(reopen).toMatch(/map\(monitor_logical_work_area\)[\s\S]*area\.contains_title_strip\(/);
+  });
+
+  it("recovers the Windows inspector from its native physical origin and applies the destination frame", () => {
+    const nativeSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../src-tauri/src/lib.rs"), "utf8");
+    const recover = nativeSource.split("#[cfg(windows)]\nfn recover_offscreen_toolset_window<")[1]
+      ?.split("fn persisted_toolset_position<")[0] ?? "";
+    expect(recover).toMatch(/window\.outer_position\(\)[\s\S]*ToolsetFrameOrigin::Physical\([\s\S]*panel_full_size::apply\(&window, placement,/);
   });
 
   it("samples the visible native palette instead of persisting queued move coordinates", () => {
@@ -73,9 +80,10 @@ describe("palette work-area sizing", () => {
 
   it("fits a restored inspector frame to the work area before creating or showing the window", () => {
     const nativeSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../src-tauri/src/lib.rs"), "utf8");
-    const open = nativeSource.split("fn ensure_toolset_window<")[1]!.split("let window = match builder.build()")[0]!;
+    const open = nativeSource.split("fn ensure_toolset_window<")[1]!.split("fn install_toolset_input_focus<")[0]!;
     expect(open).toMatch(/recover_offscreen_toolset_window\(app, &window, resizable\);\s*window\.show\(/);
     expect(open).toMatch(/let \(position, width, height\) = clamp_toolset_frame\([\s\S]*?\.inner_size\(width, height\)/);
+    expect(open).toMatch(/clamp_windows_toolset_frame\([\s\S]*?\.visible\(false\)[\s\S]*?panel_full_size::apply\([\s\S]*?target\.show\(/);
   });
 
   it("sends the requested size unchanged when it fits within the work area", async () => {

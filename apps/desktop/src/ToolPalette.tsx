@@ -408,6 +408,7 @@ export function ToolPalette({
           ...widgetClassNames
         ].filter(Boolean).join(" ")}
         aria-label={title}
+        data-has-added-commands={addedCommands.length > 0 ? "" : undefined}
         data-tool-palette-orientation={orientation}
         data-tooltip-delay-ms={TOOLTIP_DELAY_MS}
         onPointerDownCapture={event => { if (!customize) preventPaletteCommandPointerFocus(event, platform); }}

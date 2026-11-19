@@ -94,6 +94,27 @@ describe("toolset registry", () => {
     expect(warnings.every(warning => warning.includes("invalid command ID"))).toBe(true);
   });
 
+  it("drops only a malformed optional commandId when an addition still has a valid primary and submenu", () => {
+    const primary = { type: "command", commandId: "edit.undo" };
+    const submenu = { type: "command-grid", items: [{ commandId: "edit.redo", label: "Redo" }] };
+    const addition = { groupId: "fixture.tools", item: { commandId: "bad id", primary, submenu } };
+    const spacer = { groupId: "fixture.tools", item: { commandId: "bad spacer id", id: "history-space", kind: "spacer" } };
+    const state = { version: 1, toolsetOverrides: [{ toolsetId: fixtureToolset.id, itemAdditions: [addition, spacer] }] };
+    const warnings: string[] = [];
+
+    const recovered = parseToolsetLayoutState(state, warning => warnings.push(warning));
+    expect(recovered.toolsetOverrides[0]?.itemAdditions).toEqual([
+      { groupId: "fixture.tools", item: { primary, submenu } },
+      { groupId: "fixture.tools", item: { id: "history-space", kind: "spacer" } }
+    ]);
+    expect(normalizeToolsetItem(recovered.toolsetOverrides[0]!.itemAdditions![0]!.item).id).toBe("edit.undo");
+    expect(addition.item.commandId).toBe("bad id");
+    expect(warnings).toEqual([
+      "Toolbar customization dropped an invalid command ID field at toolsetOverrides.0.itemAdditions.0.item.commandId.",
+      "Toolbar customization dropped an invalid command ID field at toolsetOverrides.0.itemAdditions.1.item.commandId."
+    ]);
+  });
+
   it("validates typed toolset definitions", () => {
     expect(ToolsetDefinitionSchema.parse(fixtureToolset).id).toBe("core.fixture");
   });

@@ -22,7 +22,7 @@ export interface ToolbarCatalog {
    *  draft on top of. */
   baseToolsets(): readonly DesktopToolsetDefinition[];
   baseCommands(): readonly CommandSpec[];
-  setPluginToolsets(toolsets: readonly DesktopToolsetDefinition[], registeredCommands?: readonly CommandDefinition[]): void;
+  setPluginToolsets(toolsets: readonly DesktopToolsetDefinition[], commandsWithHandlers?: readonly CommandDefinition[]): void;
   setLayoutState(state: unknown): void;
   warnings(): readonly string[];
   onDidChange(listener: () => void): () => void;
@@ -66,11 +66,15 @@ export function createToolbarCatalog(): ToolbarCatalog {
     registry: () => snapshot,
     baseToolsets: () => [...desktopToolsets, ...pluginToolsets],
     baseCommands: () => baseCommands,
-    setPluginToolsets(toolsets, registeredCommands = []) {
+    setPluginToolsets(toolsets, commandsWithHandlers = []) {
       pluginToolsets = [...toolsets];
       const paletteCommands = allPaletteCommands(new ToolsetRegistry([...desktopToolsets, ...pluginToolsets]));
       const commandsById = new Map(paletteCommands.map(command => [command.id, command]));
-      const pluginCommands = registeredCommands.filter(command => command.source === "plugin" && isValidToolsetCommandId(command.id));
+      const pluginCommands = commandsWithHandlers.filter(command => command.source === "plugin" && isValidToolsetCommandId(command.id));
+      const pluginCommandIds = new Set(pluginCommands.map(command => command.id));
+      for (const command of paletteCommands) {
+        if (command.source === "plugin" && !pluginCommandIds.has(command.id)) commandsById.delete(command.id);
+      }
       for (const command of pluginCommands) {
         const presentation = commandsById.get(command.id);
         commandsById.set(command.id, {
@@ -82,7 +86,7 @@ export function createToolbarCatalog(): ToolbarCatalog {
         });
       }
       baseCommands = [...commandsById.values()];
-      additionalCommandIds = new Set([...SHELL_COMMAND_IDS, ...pluginCommands.map(command => command.id)]);
+      additionalCommandIds = new Set([...SHELL_COMMAND_IDS, ...pluginCommandIds]);
       rebuild();
     },
     setLayoutState(state) {

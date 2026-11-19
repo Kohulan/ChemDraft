@@ -2,6 +2,9 @@
 
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { ToolsetRegistry } from "@chemdraft/toolset-registry";
 import { applyPatches, createEmptyDocument, type MoleculeObject } from "@chemdraft/chem-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { applyGraphicWaveSettingToSelection, createPhase4Document, applyChargeToolAtPoint, insertNativeArtGraphicObject, selectDocumentObjects } from "./documentWorkflow";
@@ -20,10 +23,10 @@ import {
   moleculeStructureBondLengthCommandId,
   type CommandSpec
 } from "./commands";
-import { getToolsetCommandGroups, getToolsetItemGroups, type ToolbarPaletteGroupModel, type ToolbarPaletteItemModel } from "./toolsets";
+import { getToolsetCommandGroups, getToolsetItemGroups, initialToolsetWindowSize, type DesktopToolsetDefinition, type ToolbarPaletteGroupModel, type ToolbarPaletteItemModel } from "./toolsets";
 import { ToolbarCustomizeController } from "./toolbars/CustomizeMainToolbar/ToolbarCustomizeController";
 import { createToolbarCatalog } from "./toolbars/toolbarCatalog";
-import { createCommandToolbarItem } from "./toolbars/CustomizeToolbars/layoutStateEdits";
+import { cloneToolset, createCommandToolbarItem } from "./toolbars/CustomizeToolbars/layoutStateEdits";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -54,6 +57,88 @@ it.each(["core.art", "core.ringInspector", "core.drawnStructureSettings", "core.
     }
   }
 );
+
+it("renders and invokes the added Undo button in a cloned Art toolbar", () => {
+  const catalog = createToolbarCatalog();
+  const toolsetId = "core.art";
+  const groupId = catalog.registry().require(toolsetId).groups[0]!.id!;
+  const command: CommandSpec = { id: "edit.undo", title: "Undo", icon: "undo", enabled: true };
+  const state = { version: 1 as const, userToolsets: [], toolsetOverrides: [{
+    toolsetId, itemAdditions: [{ groupId, item: createCommandToolbarItem(command) }]
+  }] };
+  catalog.setLayoutState(state);
+  const clone = cloneToolset(state, catalog.registry().require(toolsetId));
+  catalog.setLayoutState(clone.state);
+  const itemGroups = getToolsetItemGroups(clone.toolsetId, catalog.registry(), new Map([[command.id, command]]));
+  const container = document.createElement("div");
+  const root = createRoot(container);
+  const onInvoke = vi.fn();
+  try {
+    act(() => root.render(createElement(ToolPalette, { itemGroups, orientation: "horizontal", mode: "floating", onInvoke })));
+    const buttons = container.querySelectorAll<HTMLButtonElement>('[aria-label="Added commands"] [data-command-id="edit.undo"]');
+    expect(buttons).toHaveLength(1);
+    expect(container.querySelector("[data-art-command-grid] [data-command-id]")).not.toBeNull();
+    act(() => buttons[0]!.click());
+    expect(onInvoke).toHaveBeenCalledExactlyOnceWith(command.id);
+  } finally {
+    act(() => root.unmount());
+  }
+});
+
+it("keeps the Molecular Inspector grip beside its pane and reserves pane height with added commands", () => {
+  const catalog = createToolbarCatalog();
+  const toolsetId = "core.molecularInspector";
+  const groupId = catalog.registry().require(toolsetId).groups[0]!.id!;
+  const stylesheet = document.createElement("style");
+  stylesheet.textContent = readFileSync(fileURLToPath(import.meta.url).replace(/ToolPalette\.dom\.test\.ts$/, "App.css"), "utf8");
+  document.head.append(stylesheet);
+  const shell = document.createElement("div");
+  shell.className = "palette-window-shell";
+  shell.dataset.resizable = "";
+  document.body.append(shell);
+  const root = createRoot(shell);
+  const renderInspector = () => {
+    const itemGroups = getToolsetItemGroups(toolsetId, catalog.registry());
+    act(() => root.render(createElement(ToolPalette, { itemGroups, orientation: "horizontal", mode: "floating", onInvoke: vi.fn() })));
+    return shell.querySelector<HTMLElement>(".molecular-inspector-palette")!;
+  };
+  try {
+    const inspector = renderInspector();
+    expect(getComputedStyle(inspector).display).toBe("flex");
+    expect(getComputedStyle(inspector).flexDirection).not.toBe("column");
+
+    catalog.setLayoutState({ version: 1, toolsetOverrides: [{
+      toolsetId, itemAdditions: [{ groupId, item: { commandId: "edit.undo" } }]
+    }] });
+    renderInspector();
+    expect(getComputedStyle(inspector).display).toBe("grid");
+    expect(getComputedStyle(inspector).gridTemplateRows).toBe("minmax(34px, 1fr) auto");
+    expect(getComputedStyle(inspector.querySelector(".palette-content-drag-grip")!).gridColumn).toBe("1");
+    expect(getComputedStyle(inspector.querySelector(".molecular-inspector-pane")!).minHeight).toBe("34px");
+  } finally {
+    act(() => root.unmount());
+    shell.remove();
+    stylesheet.remove();
+  }
+});
+
+it("sizes horizontal toolbar windows from the Art clone's preferred size or the plugin grid", () => {
+  const catalog = createToolbarCatalog();
+  const art = catalog.registry().require("core.art");
+  const clone = cloneToolset({ version: 1, toolsetOverrides: [], userToolsets: [] }, art);
+  catalog.setLayoutState(clone.state);
+  const artCopy = catalog.registry().require(clone.toolsetId);
+  expect(initialToolsetWindowSize(artCopy, getToolsetItemGroups(artCopy.id, catalog.registry())))
+    .toMatchObject({ width: 420, height: art.preferredWindowSize!.height });
+
+  const plugin: DesktopToolsetDefinition = {
+    id: "plugin.sizing", title: "Sizing", source: "plugin", defaultVisible: true, defaultMode: "floating",
+    gridLayout: { orientation: "horizontal", columns: 6, rows: 1, cellWidth: 24, cellHeight: 24, gap: 4, padding: 4 },
+    groups: [{ items: [{ commandId: "plugin.sizing.run" }] }]
+  };
+  const registry = new ToolsetRegistry([plugin]);
+  expect(initialToolsetWindowSize(plugin, getToolsetItemGroups(plugin.id, registry))).toEqual({ width: 172, height: 32 });
+});
 
 // Phase 5: widgets are declared as manifest `control` items and read their state from context. This
 // isolates just a toolset's widget item (no grid commands), the way the old `groups: []` +

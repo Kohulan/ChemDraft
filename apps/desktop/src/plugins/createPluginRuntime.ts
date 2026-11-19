@@ -32,6 +32,7 @@ import type {
 import {
   PluginHost,
   validateTrustedPluginManifest,
+  type CommandDefinition,
   type CommandRegistry,
   type PluginPatchApplicationRequest,
   type RegisterPluginOptions
@@ -242,6 +243,7 @@ export interface DesktopPluginRuntime {
   getCanvasOverlayOpenRequests(): ReadonlyMap<string, { readonly focus: boolean }>;
   subscribeCanvasOverlayOpen(listener: () => void): () => void;
   listPluginToolsets(): DesktopToolsetDefinition[];
+  listPluginCommandsWithHandlers(): CommandDefinition[];
   pluginIdForToolset(toolsetId: string): string | undefined;
   /** Notified when plugin contributions change. Returns unsubscribe. */
   onDidChange(listener: () => void): () => void;
@@ -713,6 +715,11 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
       };
     },
     listPluginToolsets: () => [...toolsetsByPluginId.values()].flat(),
+    listPluginCommandsWithHandlers: () => host.commands.list().filter(command => {
+      const registration = command.pluginId && registrations.get(command.pluginId);
+      return command.source === "plugin" && !!registration
+        && typeof registration.options.commandHandlers?.[command.id] === "function";
+    }),
     pluginIdForToolset: (toolsetId) => pluginIdByToolsetId.get(toolsetId),
     onDidChange(listener) {
       listeners.add(listener);
