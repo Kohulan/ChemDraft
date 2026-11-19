@@ -13,6 +13,7 @@ export {
   electronMarkAtomContribution
 } from "@chemdraft/document-workflow-core";
 import { loadDirectElectronMarkEditing } from "./electronMarkEditingSettings";
+import { identifiersWithMolfileStereo, sourceCoordinateWarnings } from "./documentWorkflow.molfileStereo";
 import { bracketVisualBounds } from "@chemdraft/layout-engine";
 import { repeatUnits, repeatUnitExportWarnings, repeatUnitMolfileGroups } from "@chemdraft/export-engine";
 import { nativeMoleculeLayoutQuality } from "./depiction2d/layoutQuality";
@@ -20364,9 +20365,14 @@ export async function copyAsMolfileForExport(
   const contents = copyAsMolfile(document, flavor, warningsOut);
   if (contents === undefined) return undefined;
   const source = copyAsMolfile(document, flavor, undefined, { coordinateUnits: "raw" })!;
-  const engine = computeStructureIdentifiers ?? await (await import("./moleculeSmiles")).loadStructureIdentifiers();
+  const identifiers = computeStructureIdentifiers ?? await (await import("./moleculeSmiles")).loadStructureIdentifiers();
+  let verifiedContents = contents;
+  const engine = identifiersWithMolfileStereo(identifiers, (sourceMolfile, reason) => {
+    verifiedContents = sourceMolfile;
+    warningsOut?.push(sourceCoordinateWarnings[reason].message);
+  });
   await assertMolfileExportIdentity(source, contents, engine, flavor === "v2000" ? "Copy as MOL V2000" : "Copy as MOL");
-  return contents;
+  return verifiedContents;
 }
 
 const copyAsPagePaddingPx = 16;

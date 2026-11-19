@@ -1,14 +1,24 @@
-import { findV2000CountsLineIndex, parseMolfileGraph } from "@chemdraft/clipboard-adapter";
+import { findV2000CountsLineIndex, parseMolfileGraph, type ParsedMolfileGraph } from "@chemdraft/clipboard-adapter";
 import type { ComputeStructureIdentifiers } from "./moleculeSmiles";
 
+export type MolfileStereo = ReadonlyMap<string, string>;
+export type MolfileStereoFallback = "unreadable" | "added";
+
+export type MolfileExportIdentifiers = ComputeStructureIdentifiers & {
+  molfileStereo?: {
+    read: (molfile: string) => Promise<MolfileStereo | undefined>;
+    keepSourceCoordinates: (sourceMolfile: string, reason: MolfileStereoFallback) => void;
+  };
+};
+
 /** Compare the raw source with the exact final CTAB, using the caller's identifier engine.
- * When both canonical identities are unavailable, compare the coordinate-free CTAB graph.
- * Never mask stereo, rewrite coordinates, or substitute native SMILES at this boundary.
+ * When canonical identities are unavailable, compare the CTAB graph and the reader's
+ * assignments on the original and rounded coordinates.
  */
 export async function assertMolfileExportIdentity(
   sourceMolfile: string,
   exportedMolfile: string,
-  computeStructureIdentifiers: ComputeStructureIdentifiers | undefined,
+  computeStructureIdentifiers: MolfileExportIdentifiers | undefined,
   label: string
 ): Promise<void> {
   const canonicalSmiles = async (molfile: string): Promise<string | undefined> => {
@@ -31,20 +41,43 @@ export async function assertMolfileExportIdentity(
   }
   const structure = (molfile: string, side: "source" | "exported") => {
     try {
-      return coordinateFreeStructure(molfile);
+      const graph = parseMolfileGraph(molfile);
+      return { graph, identity: coordinateFreeStructure(molfile, graph) };
     } catch (error) {
       const reason = (error instanceof Error ? error.message : String(error))
         .replace(/^Clipboard text/, "MOL data").replace(/\.+$/, "");
       throw new Error(`${label} refused: the ${side} MOL could not be read back (${reason}).`);
     }
   };
-  if (structure(sourceMolfile, "source") !== structure(exportedMolfile, "exported")) {
+  const sourceStructure = structure(sourceMolfile, "source");
+  const exportedStructure = structure(exportedMolfile, "exported");
+  if (sourceMolfile === exportedMolfile) return;
+  if (sourceStructure.identity !== exportedStructure.identity) {
     throw new Error(`${label} refused: the exported structure differs from the drawing (coordinate-free MOL atom or bond data differ).`);
+  }
+  if (!couldEncodeStereo(sourceStructure.graph)) return;
+  const stereo = computeStructureIdentifiers?.molfileStereo;
+  if (!stereo) {
+    throw new Error(`${label} refused: the exported stereochemistry could not be verified (no molfile stereo reader is available).`);
+  }
+
+  const sourceStereo = await stereo.read(sourceMolfile);
+  const exportedStereo = sourceStereo && await stereo.read(exportedMolfile);
+  if (!sourceStereo || !exportedStereo) {
+    stereo.keepSourceCoordinates(sourceMolfile, "unreadable");
+    return;
+  }
+  for (const [site, configuration] of sourceStereo) {
+    if (exportedStereo.get(site) !== configuration) {
+      throw new Error(`${label} refused: exported coordinates would lose or change ${site}.`);
+    }
+  }
+  if (exportedStereo.size > sourceStereo.size) {
+    stereo.keepSourceCoordinates(sourceMolfile, "added");
   }
 }
 
-function coordinateFreeStructure(molfile: string): string {
-  const graph = parseMolfileGraph(molfile);
+function coordinateFreeStructure(molfile: string, graph: ParsedMolfileGraph): string {
   const lines = molfile.replace(/\r\n?/g, "\n").split("\n");
   const radicals = graph.atoms.map(() => 0);
   const bondEncoding: { type: number; stereo: number }[] = [];
@@ -97,4 +130,19 @@ function coordinateFreeStructure(molfile: string): string {
       return [from, to, bond.order, bond.bondStyle ?? null, bond.stereo ?? null, bondEncoding[index]];
     }).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
   });
+}
+
+function couldEncodeStereo(graph: ParsedMolfileGraph): boolean {
+  // Skip reader work if there is no relevant V2000/V3000 encoding in the generated 2D CTAB.
+  const degree = new Map<string, number>();
+  for (const { fromAtomId, toAtomId } of graph.bonds) {
+    degree.set(fromAtomId, (degree.get(fromAtomId) ?? 0) + 1);
+    degree.set(toAtomId, (degree.get(toAtomId) ?? 0) + 1);
+  }
+  return graph.bonds.some(({ fromAtomId, toAtomId, order, bondStyle, stereo }) =>
+    (degree.get(fromAtomId) ?? 0) > 1 && (
+      bondStyle === "wedge" || bondStyle === "hashed" ||
+      (order === "double" && stereo !== "either" && (degree.get(toAtomId) ?? 0) > 1)
+    )
+  );
 }

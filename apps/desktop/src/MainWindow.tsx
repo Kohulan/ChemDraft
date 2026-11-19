@@ -516,7 +516,6 @@ import {
   applyChargeToolAtNativeAtom,
   applyMechanismArrowControlPoint,
   copyAsMolfile as serializeCopyAsMolfile,
-  copyAsMolfileForExport as copyAsMolfile,
   copyAsScopedDocument,
   copyAsSmiles,
   createMechanismArrowBetween,
@@ -804,7 +803,7 @@ import {
   type DocumentDistributeMode,
   type ImportedPageFitRecommendation
 } from "./documentWorkflow";
-import { exportStructureListSdf, exportStructureListSmi } from "./structureListExport";
+import { copyAsMolfileForExport as copyAsMolfile, exportStructureListSdf, exportStructureListSmi } from "./structureListExport";
 import { KetcherEditorHost } from "./KetcherEditorHost";
 import { DRAG_THRESHOLDS, initialInteractionState, interactionReducer, type InteractionState } from "./interaction/machine";
 import { APPENDABLE_TOOLBAR_WIDGETS, TOOLBAR_WIDGET_TITLES, ToolPalette } from "./ToolPalette";
@@ -1834,7 +1833,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.18.21.11-codex";
+const CURRENT_BUILD_STAMP = "11.18.23.50-codex";
 const TABLE_DRAFT_RECOVERY_WARNING = "session.tableDraftDropped";
 
 function clearTableDraftRecoveryWarnings(report: OpenWarningsReport | undefined): OpenWarningsReport | undefined {
