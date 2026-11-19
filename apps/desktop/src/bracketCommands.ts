@@ -1,7 +1,6 @@
-import { adoptDerivedDocument, applyPatches, bracketPairs, bracketPairUsage, isRepeatUnitBoundaryBond, resolveRepeatUnitAtomMembership,
+import { adoptDerivedDocument, applyPatches, bracketPairs, bracketPairUsage, retainBracketIdentity, isRepeatUnitBoundaryBond, resolveRepeatUnitAtomMembership,
   type BracketObject, type ChemDraftDocument, type DocumentPage, type RepeatUnitAtomMembership } from "@chemdraft/chem-core";
 import { transformPointForObject } from "@chemdraft/layout-engine";
-import { retainBracketIdentity } from "../../../packages/chem-core/src/brackets";
 import type { CommandSpec } from "./commands";
 import { nativeBracketPairForDrag } from "./documentWorkflow";
 import { toSelectionItemsMulti, type NativeMoleculePartSelection } from "./selection/selectionPolicy";
