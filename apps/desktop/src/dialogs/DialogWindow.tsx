@@ -124,7 +124,8 @@ function DialogWindowContent({ hostId }: { hostId: string }) {
       } else if (latest && sameDialog(message, latest) && message.type === "result" && message.data.status === "frame" && message.data.frame) {
         // Keep the newest frame even while Choose is pending. A frame may arrive before
         // the picker receipt releases actionPending; dropping it loses that revision forever.
-        clearPreview();
+        // The form aborts its pending render when the frame changes. A repeat frame
+        // leaves its preview key unchanged and must leave that request in flight.
         setFrame(message.data.frame);
       } else if (latest && sameDialog(message, latest) && message.type === "result" && message.requestId === previewPending.current?.id) {
         const pending = previewPending.current!;
@@ -143,9 +144,17 @@ function DialogWindowContent({ hostId }: { hostId: string }) {
           return;
         }
         clearTimeout(actionTimer.current);
+        if (message.data.status === "exported") setExported(true);
+        if (latest.dialogKind === "export" && message.data.status === "exported" && !message.data.notice) {
+          // The owner sends a notice for every warning-bearing export. Close clean exports
+          // through the same host action as the form's Cancel and Close controls.
+          cancellationRequested.current = true;
+          pendingRequestId.current = undefined;
+          void sendDialogMessage(hostId, { ...dialogEnvelope(latest), requestId: crypto.randomUUID(), type: "action", data: { action: "cancel" } }).catch(e => { cancellationRequested.current = false; actionPending.current = false; setBusy(false); setError(String(e)); });
+          return;
+        }
         // A successful terminal receipt precedes native destruction. Never reopen Apply here.
         if (message.data.status !== "applied" || latest.dialogKind === "atomProblem") { actionPending.current = false; setBusy(false); }
-        if (message.data.status === "exported") setExported(true);
         if (message.data.status === "picked" && message.data.destinationPath && message.data.filename) {
           const { destinationPath, filename } = message.data;
           setExportDraft(current => current ? { ...current, destinationPath, filename } : current);

@@ -11671,7 +11671,8 @@ export function MainWindow({
       const notice = formatExportStatus(descriptor.menuLabel, result.format, result.warnings);
       if (live()) setExportTabStatus(tabId, notice);
       const details = [notice, ...result.warnings.map(warning => warning.message)].join("\n");
-      return { status: "exported", notice: boundExportNotice(details) };
+      // Successful receipts carry a notice only when there are warnings to review.
+      return { status: "exported", ...(result.warnings.length ? { notice: boundExportNotice(details) } : {}) };
     } catch (error) {
       if (live()) setExportTabStatus(tabId, `Export failed: ${String(error)}`);
       throw error;
@@ -11702,10 +11703,16 @@ export function MainWindow({
     try {
       const result = await exportToTabRef.current(tabId, exportOptions(exportDialog), live);
       if (!live()) return;
+      if (result.status === "exported" && !result.notice) {
+        browserExportTabRef.current = undefined;
+        browserExportSessionRef.current = undefined;
+        setExportDialog(undefined);
+        return;
+      }
       setExportNotice(result.notice);
       setExportCompleted(result.status === "exported");
       // Keep the receipt visible in the shared form; completion disables further writes.
-      if (result.status !== "exported") setExportDialog(current => current ? { ...current, busy: false } : current);
+      setExportDialog(current => current ? { ...current, busy: false } : current);
     } catch (error) {
       if (!live()) return;
       const message = `Export failed: ${error instanceof Error ? error.message : String(error)}`;
