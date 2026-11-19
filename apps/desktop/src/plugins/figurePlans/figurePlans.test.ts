@@ -1,4 +1,4 @@
-import { applyPatch, createEmptyDocument, type MoleculeObject } from "@chemdraft/chem-core";
+import { applyPatch, createEmptyDocument, type BracketObject, type MoleculeObject } from "@chemdraft/chem-core";
 import { createSmilesMolecule, layoutReactionScheme, documentDrawingDefaults, representativeNativeMoleculeBondLength } from "@chemdraft/document-workflow-core";
 import { PluginPlanLayoutResultSchema, pluginRequestPermissions, type PluginRequestArguments,
   type PluginRequestPatch } from "@chemdraft/plugin-api";
@@ -23,6 +23,38 @@ describe("desktop figure plan providers", () => {
       createFigurePlanProviders(build).planLayout({ requestId: "request", pageId: page.id, spec }, binding);
     return { document, page, molecule, product, reaction, plan };
   }
+
+  const bracket: BracketObject = { id: "open-bracket", type: "bracket", bracketKind: "square", side: "open",
+    x: 80, y: 80, width: 10, height: 40, rotation: 0, style: {}, containedObjectIds: [] };
+
+  it.each(["row", "grid"] as const)("moves both halves of a bracket pair in a %s when only one is requested", async kind => {
+    const { page, plan } = fixture();
+    const open: BracketObject = { ...bracket, pairId: "pair" };
+    const close: BracketObject = { ...open, id: "close-bracket", side: "close", x: 140 };
+    page.objects = [open, close];
+    const requested = kind === "row" ? open : close;
+    const result = await plan({ kind, anchor: { x: 400, y: 200 }, objectIds: [requested.id] });
+    if (!result.ok) throw new Error(result.error.message);
+    const { transforms } = result.value;
+    expect(transforms).toHaveLength(2);
+    const { dx, dy } = transforms[0]!;
+    expect([dx, dy]).not.toEqual([0, 0]);
+    for (const glyph of [open, close]) {
+      expect(transforms.find(move => move.objectId === glyph.id)).toEqual({
+        objectId: glyph.id, dx, dy, changes: { x: glyph.x + dx, y: glyph.y + dy }
+      });
+    }
+  });
+
+  it.each(["row", "grid"] as const)("moves an unpaired bracket on its own in a %s", async kind => {
+    const { page, plan } = fixture();
+    page.objects.push(bracket);
+    const result = await plan({ kind, anchor: { x: 400, y: 200 }, objectIds: [bracket.id] });
+    if (!result.ok) throw new Error(result.error.message);
+    expect(result.value.transforms).toEqual([{
+      objectId: bracket.id, dx: expect.any(Number), dy: expect.any(Number), changes: { x: expect.any(Number), y: expect.any(Number) }
+    }]);
+  });
 
   it.each(["row", "grid"] as const)("refuses a %s that would attach a floating legacy charge", async kind => {
     const { page, molecule, plan } = fixture();

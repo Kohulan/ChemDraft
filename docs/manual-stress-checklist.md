@@ -323,8 +323,9 @@ and Windows x64 (WebView2). Record the build, platform, probe results and any er
 - Install [Request Tools Probe](../examples/plugins/request-tools-probe/README.md) through
   **Plugins > Add or Remove Plugins… > Add plugin from package…**. Check that the nine **Probe**
   commands appear in **Plugins**. The API 0.1.26 worker opts in to request capabilities, tool
-  calls and document-change delivery. In a separate compatibility test, verify that a worker
-  claiming these features with an older SDK is refused before its commands register.
+  calls and document-change delivery. In a separate compatibility test, verify that the bridge
+  ignores these feature flags from an older SDK. The handshake succeeds and legacy commands work.
+  Request-tool calls and document-change notifications return `unsupported`.
 - In tab A, click **Plugins > Probe: Read pinned document**. When the report says **Switch tab now**,
   click distinct tab B. Verify that the report shows A's document and captured selection.
 - In tab A, click **Plugins > Probe: Insert text and molecule**, then switch to B when prompted.

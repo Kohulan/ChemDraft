@@ -1,4 +1,4 @@
-import { DocumentObjectSchema, type ChemDraftDocument, type DocumentObject, type DocumentPage,
+import { bracketPairs, DocumentObjectSchema, type ChemDraftDocument, type DocumentObject, type DocumentPage,
   type MoleculeObject } from "@chemdraft/chem-core";
 import {
   changedElectronMarkAssignments, documentDrawingDefaults, isEditableNativeMoleculeGraph, listFigureStylePresets,
@@ -100,7 +100,10 @@ function anchoredObjectIds(object: DocumentObject) {
 }
 
 function relationships(page: DocumentPage, assignments = nativeElectronMarkAssignments(page)) {
-  return page.objects.flatMap(object => {
+  // Join bracket halves before checking the rest of each half's dependencies.
+  const pairRelationships = [...bracketPairs(page.objects).values()].map(([object, partner]) =>
+    ({ object: object!, id: partner!.id, includePartner: true }));
+  const references = page.objects.flatMap(object => {
     const refs = [
       ...anchoredObjectIds(object),
       ...(object.type === "electron-mark" ? [assignments.anchorByMarkId.get(object.id)?.objectId] : []),
@@ -109,8 +112,9 @@ function relationships(page: DocumentPage, assignments = nativeElectronMarkAssig
       ...(object.type === "reaction" ? [...object.components.map(component => component.objectId),
         ...(object.arrowObjectIds ?? []), ...(object.plusObjectIds ?? []), ...object.conditionsTextObjectIds] : [])
     ];
-    return [...new Set(refs)].flatMap(id => id && id !== object.id ? [{ object, id }] : []);
+    return [...new Set(refs)].flatMap(id => id && id !== object.id ? [{ object, id, includePartner: false }] : []);
   });
+  return [...pairRelationships, ...references];
 }
 
 function arrangementItems(page: DocumentPage, ids: readonly string[]) {
@@ -121,14 +125,21 @@ function arrangementItems(page: DocumentPage, ids: readonly string[]) {
     if (!object) invalid(`Object "${id}" does not exist on page "${page.id}".`);
     owner.set(id, new Set([object]));
   }
-  for (const { object, id } of relationships(page)) {
+  for (const { object, id, includePartner } of relationships(page)) {
     const a = owner.get(object.id), b = owner.get(id);
     // A selected drawable may be used in several reaction records. Their logical references
     // do not imply that the entire scheme must move with that drawable.
     if (!a && object.type === "reaction") continue;
     if (!a && !b || a === b) continue;
-    if (!a || !b) throw new RequestWriteError("scope",
-      `Arrange "${a ? object.id : id}" together with "${a ? id : object.id}".`);
+    if (!a || !b) {
+      if (!includePartner) throw new RequestWriteError("scope",
+        `Arrange "${a ? object.id : id}" together with "${a ? id : object.id}".`);
+      const item = (a ?? b)!;
+      const partner = a ? byId.get(id)! : object;
+      item.add(partner);
+      owner.set(partner.id, item);
+      continue;
+    }
     for (const member of b) {
       a.add(member);
       owner.set(member.id, a);
