@@ -18,9 +18,10 @@ import { openChemDraftPayload } from "@chemdraft/cdx-compat";
 import { saveCompoundLayoutSettings } from "./compoundLayoutSettings";
 import { saveKeybindingSettings } from "./keybindingSettings";
 import { saveAskToSaveBeforeQuit, loadAskToSaveBeforeQuit } from "./quitSettings";
+import { saveExportPreviewEnabled } from "./exportPreviewSettings";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 import { createViewportState } from "@chemdraft/viewport-engine";
-import { DOM_COMMAND_EVENT, setToolbarsMenu, type QuitFlushPhase, type ToolsetWindowState } from "./window-manager";
+import { DOM_COMMAND_EVENT, broadcastExportPreviewSettings, setToolbarsMenu, type QuitFlushPhase, type ToolsetWindowState } from "./window-manager";
 import { buildDocumentSessionEnvelope, buildDocumentTabsSession, DOCUMENT_SESSION_SAVE_DEBOUNCE_MS, parseDocumentSessionEnvelope } from "./documentSession";
 import { createPluginRuntime, type DesktopPluginRuntime } from "./plugins/createPluginRuntime";
 import { applyPatches, type DocumentPatch, type MoleculeObject } from "@chemdraft/chem-core";
@@ -33,6 +34,7 @@ import { createDesktopShortcutRegistry } from "./keyboardShortcuts";
 import { createDocumentTabActions } from "./commands";
 import type { ChemDraftAgentBridge } from "./agentBridge";
 import * as atomLabelDraft from "./atomLabelDraft";
+import * as workflow from "./documentWorkflow";
 import * as nativePaletteReconciliation from "./toolbars/reconcileNativePalettes";
 import type { DialogMessage } from "./dialogs/dialogProtocol";
 import { nativeDialogTransport, type DialogDelivery } from "./dialogs/dialogTransport";
@@ -542,7 +544,7 @@ describe("documents in one window", () => {
     expect(bridge().snapshot().document.pages[0]!.layout.presetId).toBe("custom");
     expect(container.querySelector(".cd-page-size-form")).toBeNull();
   });
-  it("the browser keeps the shared Export form and shows its download receipt", async () => {
+  it("closes a clean browser export after one download and preserves the drawing", async () => {
     native.desktop = false;
     vi.stubGlobal("URL", class extends URL { static createObjectURL = vi.fn(() => "blob:export"); static revokeObjectURL = vi.fn(); });
     const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
@@ -552,13 +554,44 @@ describe("documents in one window", () => {
     expect(dialog).not.toBeNull();
     const select = dialog.querySelector<HTMLSelectElement>("#chemdraft-export-format")!;
     await act(async () => { select.value = "svg"; select.dispatchEvent(new Event("change", { bubbles: true })); });
-    await act(async () => Array.from(dialog.querySelectorAll<HTMLButtonElement>("button")).find(b => b.textContent === "Export")!.click());
+    const drawing = bridge().snapshot().document;
+    const submit = [...dialog.querySelectorAll<HTMLButtonElement>("button")].find(b => b.textContent === "Export")!;
+    await act(async () => { submit.click(); submit.click(); });
     expect(click).toHaveBeenCalledTimes(1);
-    expect(dialog.textContent).toContain("Exported SVG");
-    expect(Array.from(dialog.querySelectorAll<HTMLButtonElement>("button")).find(b => b.textContent === "Exported")!.disabled).toBe(true);
+    expect(container.querySelector("[data-status-message]")?.textContent).toBe("Exported SVG");
+    expect(bridge().snapshot().document).toEqual(drawing);
     expect(native.savePicker).not.toHaveBeenCalled();
-    await act(async () => Array.from(dialog.querySelectorAll<HTMLButtonElement>("button")).find(b => b.textContent === "Close")!.click());
     expect(container.querySelector('[role="dialog"][aria-label="Export"]')).toBeNull();
+  });
+  it("renders the browser preview after a warning-bearing export and keeps the warning visible", async () => {
+    native.desktop = false;
+    vi.useFakeTimers();
+    vi.stubGlobal("URL", class extends URL { static createObjectURL = vi.fn(() => "blob:export"); static revokeObjectURL = vi.fn(); });
+    const download = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    const pdf = vi.spyOn(workflow, "exportPhase4Pdf");
+    let finishExport!: () => void;
+    pdf.mockImplementationOnce(() => new Promise(resolve => {
+      finishExport = () => resolve({
+        format: "pdf", kind: "binary", bytes: new Uint8Array([1]), mimeType: "application/pdf", extension: "pdf",
+        warnings: [{ code: "test-warning", message: "Some artwork was approximated." }]
+      });
+    }));
+    await act(async () => { saveExportPreviewEnabled(true); await broadcastExportPreviewSettings(true); });
+    await command("export.open");
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"][aria-label="Export"]')!;
+    const preview = () => dialog.querySelector<HTMLImageElement>('img[alt="Preview of the PDF page layout"]');
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(preview()?.src).toEqual(expect.stringMatching(/^data:image\/svg\+xml;base64,/));
+    const submit = [...dialog.querySelectorAll<HTMLButtonElement>("button")].find(b => b.textContent === "Export")!;
+    await act(async () => submit.click());
+    expect(dialog.getAttribute("aria-busy")).toBe("true");
+    await act(async () => finishExport());
+    expect(dialog.textContent).toContain("Some artwork was approximated.");
+    expect(submit.disabled).toBe(true);
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(preview()?.src).toEqual(expect.stringMatching(/^data:image\/svg\+xml;base64,/));
+    expect(download).toHaveBeenCalledTimes(1);
+    expect(pdf).toHaveBeenCalledTimes(1);
   });
   async function activate(index: number) {
     await act(async () => tabs()[index]!.click());
