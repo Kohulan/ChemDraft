@@ -8339,15 +8339,15 @@ export type CommittedDocumentNormalizationOptions = NativeElectronMarkAssignment
  * nothing else, and undo/redo only reinstate documents that passed it. So it is the one place every
  * in-app change — a paste of any format, a template, a plugin's patch, an agent command, a merge —
  * goes through, and where each side-dependent label ("SCN") gets its bond side recorded
- * (`withNativeDocumentLabelBondSides`) before a later rotation could change what it means. Charge
- * marks are reconciled first. Both passes are idempotent and keep what is already right, so a layout
- * commit changes nothing.
+ * (`withNativeDocumentLabelBondSides`) before a later rotation could change what it means. File
+ * open and session restore preserve the stored electron marks and their atom contributions.
  */
 export function normalizeCommittedDocument(
-  document: ChemDraftDocument, options: CommittedDocumentNormalizationOptions = {}
+  document: ChemDraftDocument,
+  options: CommittedDocumentNormalizationOptions & { preserveElectronMarks?: boolean } = {}
 ): ChemDraftDocument {
   document = reconcileReactionArrowAttachments(document);
-  const reconciled = reconcileNativeChargeMarks(document, options);
+  const reconciled = options.preserveElectronMarks ? document : reconcileNativeChargeMarks(document, options);
   const recorded = withNativeDocumentLabelBondSides(reconciled);
   // Re-admitted to the patch engine's sharing, as `reconcileNativeChargeMarks` does.
   return recorded === reconciled ? reconciled : adoptDerivedDocument(reconciled, recorded);
