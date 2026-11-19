@@ -798,7 +798,7 @@ import {
 } from "./documentWorkflow";
 import { exportStructureListSdf, exportStructureListSmi } from "./structureListExport";
 import { KetcherEditorHost } from "./KetcherEditorHost";
-import { initialInteractionState, interactionReducer, type InteractionState } from "./interaction/machine";
+import { DRAG_THRESHOLDS, initialInteractionState, interactionReducer, type InteractionState } from "./interaction/machine";
 import { APPENDABLE_TOOLBAR_WIDGETS, TOOLBAR_WIDGET_TITLES, ToolPalette } from "./ToolPalette";
 import { TOOLBAR_WIDGET_GRID_SPANS } from "./toolbars/toolbarWidgets";
 import {
@@ -1304,10 +1304,8 @@ type ProjectedPlaneTiltDragState = {
   clamped: boolean;
   dragging: boolean;
   spin3dModel?: Spin3dRotateSnapshot;
-  /** Last flatten that committed (depth-cued 2D + the orientation that produced it).
-   *  On a stereo-refused frame the preview holds this instead of snapping back. */
+  /** Last accepted drawing held on a refused preview frame. */
   lastValidPreviewDocument?: ChemDraftDocument;
-  lastValidOrientation?: Quaternion;
   /** A mandatory model refusal must survive the pointer-up status message. */
   rotationRefusal?: string;
 };
@@ -1322,6 +1320,7 @@ type RotationInputBase = {
   targetLabel: string;
   startDocument: ChemDraftDocument;
   warnings?: readonly string[];
+  rotationRefusal?: string;
 };
 
 type RotationInputState =
@@ -1350,6 +1349,7 @@ type RotationInputDraftDocumentResult =
       tiltXRad: number;
       tiltYRad: number;
       clamped: boolean;
+      rotationRefusal?: string;
     };
 type ObjectResizeInputState = {
   objectId: string;
@@ -1788,7 +1788,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.18.15.40-codex";
+const CURRENT_BUILD_STAMP = "11.18.18.36-codex";
 const VibeCodeGuideForm = lazy(() => import("./dialogs/VibeCodeGuideForm").then(module => ({ default: module.VibeCodeGuideForm })));
 const StructureTemplatePicker = lazy(() => import("./dialogs/StructureTemplatePicker").then(module => ({ default: module.StructureTemplatePicker })));
 /** Starts in the background for the document webview under the existing probe gate. */
@@ -16653,13 +16653,7 @@ export function MainWindow({
     if (drag.spin3dModel && !drag.target) {
       const model = drag.spin3dModel;
       const delta = projectedPlaneTiltVectorFromDrag(drag.startPoint, point);
-      // Delta is always measured from drag start and composed onto the start orientation,
-      // so repeated moves never accumulate drift. Vertical drag → X axis, horizontal → Y.
-      const deltaQuat = quatMultiply(
-        quatFromAxisAngle(SPIN_AXIS_Y, delta.yRad),
-        quatFromAxisAngle(SPIN_AXIS_X, delta.xRad)
-      );
-      const nextQuat = quatNormalize(quatMultiply(deltaQuat, model.startOrientation));
+      const nextQuat = rotateSpin3dXY(model.startOrientation, delta.xRad, delta.yRad);
       let document = drag.lastValidPreviewDocument ?? drag.startDocument;
       let changed = document !== drag.startDocument;
       try {
@@ -16669,7 +16663,6 @@ export function MainWindow({
         });
         if (outcome.status === "committed" && outcome.document !== drag.startDocument) {
           drag.lastValidPreviewDocument = outcome.document;
-          drag.lastValidOrientation = nextQuat;
           document = outcome.document;
           changed = true;
         }
@@ -16922,69 +16915,47 @@ export function MainWindow({
   }, [clearObjectTransformPreview, commitDocumentHistoryFrom, objectRotateDocumentFromDrag, objectRotateDragDegrees, replacePresentDocument]);
 
   const commitProjectedPlaneTilt = useCallback((drag: ProjectedPlaneTiltDragState, point: ClientPoint): boolean => {
-    const result = projectedPlaneTiltFromDrag(drag, point);
-    drag.latestTiltXRad = result.tiltXRad;
-    drag.latestTiltYRad = result.tiltYRad;
-    drag.clamped = result.clamped;
-    showProjectedPlaneTiltReadout(
-      drag.objectId,
-      result.tiltXRad,
-      result.tiltYRad,
-      result.clamped,
-      true
-    );
-
-    // 3D-backed commit: attach the updated 3D model AND keep its orientation in lock-step
-    // with the depth-cued geometry actually committed. If the final frame was refused, we
-    // commit the last valid preview and attach lastValidOrientation (NOT the refused quat),
-    // so the stored model never drifts away from the displayed depth/wedge/crossing state.
-    if (drag.spin3dModel) {
-      const finalOrientation = drag.lastValidOrientation;
-      if (
-        !result.changed ||
-        !finalOrientation ||
-        !drag.lastValidPreviewDocument ||
-        drag.lastValidPreviewDocument === drag.startDocument
-      ) {
-        replacePresentDocument(drag.startDocument);
-        return false;
-      }
-      // Preview frames flatten geometry-only for speed; the PERSISTED commit must re-flatten the
-      // final orientation through the stereo read-back guard so a rotation can't silently commit a
-      // different stereoisomer (the same protection the Spin 3D overlay commit applies).
+    const model = drag.spin3dModel;
+    if (model) {
+      const { xRad, yRad } = projectedPlaneTiltVectorFromDrag(drag.startPoint, point);
+      const finalOrientation = rotateSpin3dXY(model.startOrientation, xRad, yRad);
+      showProjectedPlaneTiltReadout(drag.objectId, xRad, yRad, false, true);
+      // Preview can hold an earlier drawing. Validate the release orientation with the
+      // same stereo read-back guard as Spin 3D before storing it.
       const warnings: string[] = [];
       let guarded: ReturnType<typeof flattenSpunMolecule>;
       try {
         guarded = flattenSpunMolecule(
           drag.startDocument,
           drag.objectId,
-          drag.spin3dModel.coords3d,
+          model.coords3d,
           quatToViewMatrix(finalOrientation),
-          { placement: drag.spin3dModel.placement, ...spin3dFlattenStereoOptions(drag.startDocument, drag.objectId, warnings) }
+          { placement: model.placement, ...spin3dFlattenStereoOptions(drag.startDocument, drag.objectId, warnings) }
         );
       } catch (error) {
         if (!(error instanceof UnknownBondOrderError)) throw error;
         replacePresentDocument(drag.startDocument);
         drag.rotationRefusal = `3D rotation not applied: ${error.message}`;
-        setStatus(drag.rotationRefusal);
         return false;
       }
       if (guarded.status !== "committed") {
         replacePresentDocument(drag.startDocument);
-        setStatus(`3D rotation not applied: ${guarded.refusalReasons[0] ?? "stereochemistry would change"}`);
+        drag.rotationRefusal = `3D rotation not applied: ${guarded.refusalReasons[0] ?? "stereochemistry would change"}`;
         return false;
       }
       warnings.push(...flattenWarningMessages(guarded.warnings));
       const modeled = attachSpin3dModelFromConformer(guarded.document, drag.objectId, {
-        coords3d: drag.spin3dModel.coords3d,
+        coords3d: model.coords3d,
         orientation: finalOrientation,
-        engine: drag.spin3dModel.engine
+        engine: model.engine
       });
       commitDocumentHistoryFrom(drag.startDocument, modeled);
       setStatus(["3D rotation applied", ...new Set(warnings)].join(" "));
       return true;
     }
 
+    const result = projectedPlaneTiltFromDrag(drag, point);
+    showProjectedPlaneTiltReadout(drag.objectId, result.tiltXRad, result.tiltYRad, result.clamped, true);
     if (!result.changed || result.document === drag.startDocument) {
       replacePresentDocument(drag.startDocument);
       return false;
@@ -17072,12 +17043,9 @@ export function MainWindow({
         const xRad = degreesToRadians(xDegrees);
         const yRad = degreesToRadians(yDegrees);
         const { placement } = spinPlacementFor(object, coords3d, model.orientation);
-        const deltaQuat = quatMultiply(
-          quatFromAxisAngle(SPIN_AXIS_Y, yRad),
-          quatFromAxisAngle(SPIN_AXIS_X, xRad)
-        );
-        const nextQuat = quatNormalize(quatMultiply(deltaQuat, model.orientation));
+        const nextQuat = rotateSpin3dXY(model.orientation, xRad, yRad);
         let document = input.startDocument;
+        let rotationRefusal: string | undefined;
         try {
           // Numeric X/Y rotation persists a flattened projection, so it runs the same stereo
           // read-back guard as the overlay/handle commits; a refused view leaves the document
@@ -17093,10 +17061,12 @@ export function MainWindow({
               orientation: nextQuat,
               engine: model.engine
             });
+          } else {
+            rotationRefusal = `3D rotation not applied: ${outcome.refusalReasons[0] ?? "stereochemistry would change"}`;
           }
         } catch (error) {
           if (error instanceof UnknownBondOrderError) {
-            warnings.push(`3D rotation not applied: ${error.message}`);
+            rotationRefusal = `3D rotation not applied: ${error.message}`;
           }
           document = input.startDocument;
         }
@@ -17105,7 +17075,8 @@ export function MainWindow({
           document,
           tiltXRad: xRad,
           tiltYRad: yRad,
-          clamped: false
+          clamped: false,
+          rotationRefusal
         };
       }
     }
@@ -17157,7 +17128,8 @@ export function MainWindow({
     if (nextInput.startDocument !== rotationInputRef.current?.startDocument) return;
     const warnings: string[] = [];
     const result = rotationInputDocumentFromDraft(nextInput, warnings);
-    updateRotationInput({ ...nextInput, warnings });
+    const rotationRefusal = result?.kind === "xy" ? result.rotationRefusal : undefined;
+    updateRotationInput({ ...nextInput, warnings, rotationRefusal });
     if (!result) {
       setStatus(nextInput.kind === "z" ? "Enter a valid Z rotation" : "Enter valid X and Y rotations");
       return;
@@ -17169,16 +17141,19 @@ export function MainWindow({
     } else {
       setObjectRotateReadout({ objectId: nextInput.objectId, degrees: result.zDegrees });
     }
-    if (warnings.length > 0) setStatus([...new Set(warnings)].join(" "));
-    return warnings;
+    if (rotationRefusal) setStatus(rotationRefusal);
+    else if (warnings.length > 0) setStatus([...new Set(warnings)].join(" "));
+    else if (nextInput.rotationRefusal) setStatus("");
+    return { warnings, rotationRefusal };
   }, [replacePresentDocument, rotationInputDocumentFromDraft, showProjectedPlaneTiltReadout, updateRotationInput]);
 
   const handleRotationInputHome = useCallback((input: RotationInputState) => {
     const nextInput: RotationInputState = input.kind === "z"
       ? { ...input, ...rotationInputHomeDraftDegrees("z") }
       : { ...input, ...rotationInputHomeDraftDegrees("xy") };
-    const warnings = handleRotationInputChange(nextInput) ?? [];
-    setStatus([nextInput.kind === "z" ? "Z rotation set to 0" : "X/Y rotation set to 0", ...new Set(warnings)].join(" "));
+    const result = handleRotationInputChange(nextInput);
+    setStatus(result?.rotationRefusal ??
+      [nextInput.kind === "z" ? "Z rotation set to 0" : "X/Y rotation set to 0", ...new Set(result?.warnings ?? [])].join(" "));
   }, [handleRotationInputChange]);
 
   const handleRotationInputCancel = useCallback((input?: RotationInputState) => {
@@ -17200,14 +17175,16 @@ export function MainWindow({
       return false;
     }
 
-    const changed = commitLiveInputPreview(session.startDocument, findDocumentObject(session.startDocument, session.objectId)?.type === "electron-mark" ? "Rotate electron mark" : undefined);
+    const changed = !session.rotationRefusal &&
+      commitLiveInputPreview(session.startDocument, findDocumentObject(session.startDocument, session.objectId)?.type === "electron-mark" ? "Rotate electron mark" : undefined);
     if (changed && findDocumentObject(session.startDocument, session.objectId)?.type !== "molecule") {
       documentUndoLabelsRef.current.set(documentHistoryRef.current.present, findDocumentObject(session.startDocument, session.objectId)?.type === "electron-mark" ? "Rotate electron mark" : "Rotate art object");
     }
     updateRotationInput(undefined);
     setObjectRotateReadout(undefined);
     setProjectedPlaneTiltReadout(undefined);
-    setStatus([changed ? "Rotation applied" : "Rotation unchanged", ...new Set(session.warnings ?? [])].join(" "));
+    setStatus(session.rotationRefusal ??
+      [changed ? "Rotation applied" : "Rotation unchanged", ...new Set(session.warnings ?? [])].join(" "));
     return changed;
   }, [commitLiveInputPreview, updateRotationInput]);
 
@@ -18686,7 +18663,9 @@ export function MainWindow({
       event.stopPropagation();
       const point = pagePointFromPointerEvent(event) ?? projectedPlaneTiltDrag.latestPoint;
       projectedPlaneTiltMachineRef.current = initialInteractionState();
-      if (projectedPlaneTiltDrag.dragging) {
+      const movedOnRelease = projectedPlaneTiltDrag.spin3dModel !== undefined &&
+        clientPointDistance(projectedPlaneTiltDrag.startPoint, point) >= DRAG_THRESHOLDS["projected-plane-tilt"];
+      if (projectedPlaneTiltDrag.dragging || movedOnRelease) {
         const changed = commitProjectedPlaneTilt(projectedPlaneTiltDrag, point);
         setStatus(changed
           ? "3D rotate applied"
@@ -20547,9 +20526,7 @@ export function MainWindow({
       latestTiltYRad: startTiltYRad,
       clamped: false,
       dragging: false,
-      spin3dModel,
-      lastValidPreviewDocument: selectedDocument,
-      lastValidOrientation: spin3dModel?.startOrientation
+      spin3dModel
     };
     projectedPlaneTiltMachineRef.current = interactionReducer(initialInteractionState(), {
       type: "pointerDown",
@@ -24690,6 +24667,11 @@ export function projectedPlaneTiltVectorFromDrag(start: ClientPoint, latest: Cli
     xRad: Number(wrapped.tiltXRad.toFixed(6)),
     yRad: Number(wrapped.tiltYRad.toFixed(6))
   };
+}
+
+function rotateSpin3dXY(startOrientation: Quaternion, xRad: number, yRad: number): Quaternion {
+  const delta = quatMultiply(quatFromAxisAngle(SPIN_AXIS_Y, yRad), quatFromAxisAngle(SPIN_AXIS_X, xRad));
+  return quatNormalize(quatMultiply(delta, startOrientation));
 }
 
 export function documentObjectProjectedPlaneTiltVectorFromDrag(
