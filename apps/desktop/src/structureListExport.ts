@@ -4,11 +4,17 @@ import {
   type MoleculeObject,
   type MolfileWriteOptions
 } from "@chemdraft/chem-core";
-import { assertMolfileExportIdentity, documentDrawingDefaults, moleculeToInteropMolfile, expandNativeMoleculeLabelGroups, nativeSingleHeavyElementLabelValence } from "@chemdraft/document-workflow-core";
+import {
+  assertMolfileExportIdentity, documentDrawingDefaults, moleculeToInteropMolfile, expandNativeMoleculeLabelGroups,
+  nativeSingleHeavyElementLabelValence
+} from "@chemdraft/document-workflow-core";
 import { getExportFormatDescriptor, repeatUnitExportWarnings, repeatUnitMolfileGroups, type ExportWarning, type TextExportResult } from "@chemdraft/export-engine";
 import { nativeBondOrderResolution } from "@chemdraft/layout-engine";
 import { copyAsScopeMolecules } from "./documentWorkflow";
+import { identifiersWithMolfileStereo, sourceCoordinateWarnings } from "./documentWorkflow.molfileStereo";
 import { loadStructureIdentifiers, moleculeSmiles } from "./moleculeSmiles";
+
+export { copyAsMolfileForExport } from "./documentWorkflow";
 
 /**
  * Read rows top to bottom, then their members left to right. Anchor each band at its
@@ -101,9 +107,14 @@ export async function exportStructureListSdf(
       typeof molecule.style.bondLengthPx === "number" ? molecule.style.bondLengthPx : documentDrawingDefaults(document).bondLengthPx,
       writerOptions).contents;
     const title = name ?? `ChemDraft molecule ${index + 1}`;
-    const molfile = `${title}${scaled.slice(scaled.indexOf("\n"))}`;
+    const withTitle = (ctab: string) => `${title}${ctab.slice(ctab.indexOf("\n"))}`;
+    let ctab = scaled;
     const source = moleculeToMolfileV2000(expanded, { ...writerOptions, warnings: undefined }).contents;
-    await assertMolfileExportIdentity(source, molfile, computeStructureIdentifiers,
+    const identifiers = identifiersWithMolfileStereo(computeStructureIdentifiers, (sourceMolfile, reason) => {
+      ctab = sourceMolfile;
+      warnings.push({ ...sourceCoordinateWarnings[reason], severity: "warning", objectId: molecule.id });
+    });
+    await assertMolfileExportIdentity(source, withTitle(scaled), identifiers,
       `SDF record ${index + 1} (${title})`);
     warnings.push(...writerWarnings.filter(message => !warnings.some(warning => warning.message.includes(message))).map((message): ExportWarning => ({
       code: "export.sdf_v2000_loss",
@@ -113,12 +124,12 @@ export async function exportStructureListSdf(
     })));
     let smiles: string | undefined;
     try {
-      smiles = await moleculeSmiles(molecule, index, warnings, computeStructureIdentifiers, scaled);
+      smiles = await moleculeSmiles(molecule, index, warnings, computeStructureIdentifiers, ctab);
       warnings.push(...repeatUnitExportWarnings(document, "SMILES", { molecules: [molecule] }));
     } catch (error) {
       warnings.push(smilesWriteFailure(molecule, error));
     }
-    records.push(molfile
+    records.push(withTitle(ctab)
       + (smiles === undefined ? "" : `> <SMILES>\n${smiles}\n\n`)
       + `> <Index>\n${index + 1}\n\n`
       + (name ? `> <Name>\n${name}\n\n` : "")

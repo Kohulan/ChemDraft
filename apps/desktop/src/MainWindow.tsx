@@ -516,7 +516,6 @@ import {
   applyChargeToolAtNativeAtom,
   applyMechanismArrowControlPoint,
   copyAsMolfile as serializeCopyAsMolfile,
-  copyAsMolfileForExport as copyAsMolfile,
   copyAsScopedDocument,
   copyAsSmiles,
   createMechanismArrowBetween,
@@ -804,7 +803,7 @@ import {
   type DocumentDistributeMode,
   type ImportedPageFitRecommendation
 } from "./documentWorkflow";
-import { exportStructureListSdf, exportStructureListSmi } from "./structureListExport";
+import { copyAsMolfileForExport as copyAsMolfile, exportStructureListSdf, exportStructureListSmi } from "./structureListExport";
 import { KetcherEditorHost } from "./KetcherEditorHost";
 import { DRAG_THRESHOLDS, initialInteractionState, interactionReducer, type InteractionState } from "./interaction/machine";
 import { APPENDABLE_TOOLBAR_WIDGETS, TOOLBAR_WIDGET_TITLES, ToolPalette } from "./ToolPalette";
