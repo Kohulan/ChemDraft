@@ -47,15 +47,16 @@ ChemDraft 1.2.1 improves drawing, file exchange and dialogs, and fixes problems 
 - The status line describes mixed selections and counts only objects that moved. Undo and Redo work while an atom-problem badge has focus, and Ignore closes its window.
 - Export closes after a clean export and retains its preview and format choices. Reaction-condition frames follow tilted arrows in exports, tilted repeat-unit labels are not clipped, and PDF export warns when bold or italic cannot be retained.
 - Name to Structure places results on the visible page and shows failures in the status line.
-- Spin 3D refuses to flatten a structure when doing so would change stereochemistry, a coordination bond or a polymer repeat unit.
+- Spin 3D refuses to flatten a structure when doing so would change stereochemistry, a coordination bond or a polymer repeat unit. For axial stereochemistry (allenes and atropisomers), flattening commits with a warning: this stereo is kept only in the 3D model and is lost on export or a later structural edit.
 
 ## Known limitations
 
 - Embedded objects in CDX and CDXML files, such as pictures, and spectra are not imported. ChemDraft shows a warning when you open such a file.
-- Documents imported from CDX/CDXML and saved in 1.2 or later need ChemDraft 1.2 or later to reopen.
+- Documents imported from CDX/CDXML and saved in 1.2 or later need ChemDraft 1.2 or later to reopen. If you delete a member atom from an imported repeat unit, the saved document requires ChemDraft 1.2.1 or later to reopen.
 - In a document with a non-black foreground color, uncolored text reopens as black rather than the default text color from a CDX saved without embedded ChemDraft data. Saving with the embedded data keeps it exactly.
 - CDX and CDXML keep one color per rectangle. When fill and outline differ, ChemDraft keeps the fill unless it is white or the page color, in which case it keeps the outline. A warning appears when a color cannot be saved.
 - A canceled macOS logout can leave editing locked until ChemDraft is relaunched.
+- If you open a file while ChemDraft is asking whether to save before quitting and then choose Don't Save, that file may not open. Open it again after relaunching.
 
 ## macOS
 
