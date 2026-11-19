@@ -2,7 +2,7 @@
 import { act, createElement, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { applyPatch, createEmptyDocument, nativeDrawingStyleFromObjectStyle, type ChemDraftDocument, type ElectronMarkObject, type MoleculeBond, type MoleculeObject } from "@chemdraft/chem-core";
+import { applyPatch, createEmptyDocument, nativeDrawingStyleFromObjectStyle, sameBracketIdentity, type ChemDraftDocument, type ElectronMarkObject, type MoleculeBond, type MoleculeObject } from "@chemdraft/chem-core";
 import { createSmilesMolecule } from "@chemdraft/document-workflow-core";
 import * as ocl from "@chemdraft/ocl-adapter";
 import { transformPointForObject } from "@chemdraft/layout-engine";
@@ -437,8 +437,29 @@ describe("Clean Up Selection command", () => {
     expect(brackets(after, second.id).map(bracket => bracket.id)).toEqual(secondBrackets.map(bracket => bracket.id));
     for (const [index, bracket] of brackets(after, second.id).entries()) {
       expect(bracket.x).not.toBe(secondBrackets[index]!.x);
+      expect(sameBracketIdentity(secondBrackets[index]!, bracket)).toBe(true);
     }
     expect(copyAsMolfile(after, "v3000")).toContain(terminalSru);
+  });
+
+  it("cleans up when validation prunes a stale bracket reference on the untouched second page", async () => {
+    const { document, molecule } = straightChain();
+    const [first] = document.pages;
+    const withBracket = insertNativeBracket(document, { x: 100, y: 100 }, "square");
+    const brackets = withBracket.pages[0]!.objects.filter(object => object.type === "bracket");
+    const second = { ...first, id: "page-two", objects: brackets.map(bracket =>
+      bracket.side === "close" ? { ...bracket, containedObjectIds: ["missing-object"] } : bracket) };
+    document.pages.push(second);
+    document.selection = { pageId: first.id, objectIds: [molecule.id] };
+    await render(document);
+    const before = current();
+    expect(before.pages[1]!.objects).toEqual(second.objects);
+
+    await command("structure.cleanup2d");
+
+    expect(status()).toBe("Cleaned up selected structure");
+    expect(current().pages[0]!.objects[0]).not.toEqual(before.pages[0]!.objects[0]);
+    expect(current().pages[1]!.objects).toEqual(brackets);
   });
 
   it("refuses a final bracket change on another page even when it preserves membership", async () => {

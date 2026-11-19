@@ -1,6 +1,7 @@
 import { adoptDerivedDocument, applyPatches, bracketPairs, bracketPairUsage, isRepeatUnitBoundaryBond, resolveRepeatUnitAtomMembership,
   type BracketObject, type ChemDraftDocument, type DocumentPage, type RepeatUnitAtomMembership } from "@chemdraft/chem-core";
 import { transformPointForObject } from "@chemdraft/layout-engine";
+import { retainBracketIdentity } from "../../../packages/chem-core/src/brackets";
 import type { CommandSpec } from "./commands";
 import { nativeBracketPairForDrag } from "./documentWorkflow";
 import { toSelectionItemsMulti, type NativeMoleculePartSelection } from "./selection/selectionPolicy";
@@ -96,6 +97,11 @@ function repeatUnitMembershipKey(membership: RepeatUnitAtomMembership): string {
   ]);
 }
 
+function bracketLayoutKey(brackets: readonly BracketObject[]): string {
+  return JSON.stringify(brackets.map(({ id, side, bracketKind, x, y, width, height, rotation }) =>
+    [id, side, bracketKind, x, y, width, height, rotation]));
+}
+
 /** Preserve pre-cleanup SRU membership by refitting native brackets or refusing the layout. */
 export function prepareCleanupRepeatUnits(before: ChemDraftDocument, after: ChemDraftDocument,
   targetIds: readonly string[]): {
@@ -115,16 +121,17 @@ export function prepareCleanupRepeatUnits(before: ChemDraftDocument, after: Chem
     const canRefit = candidate && candidateObjects && page.objects.some(object =>
       object.type === "molecule" && targets.has(object.id) && object !== candidateObjects.get(object.id));
     if (!canRefit) {
-      const expected = JSON.stringify(brackets);
+      // Patch validation can prune stale references even on pages that were not laid out.
+      const expected = bracketLayoutKey(brackets);
       checks.push(finalPages => {
         const finalBrackets = finalPages.get(page.id)?.objects.filter(object => object.type === "bracket");
-        if (JSON.stringify(finalBrackets) !== expected) {
+        if (!finalBrackets || bracketLayoutKey(finalBrackets) !== expected) {
           throw new Error(`Clean Up refused: brackets changed on page "${page.id}" outside the cleaned layout.`);
         }
       });
     }
     const candidatePairs = canRefit ? bracketPairs(candidate.objects) : undefined;
-    const replacements = new Map<string, BracketObject>();
+    const replacements = new Map<BracketObject, BracketObject>();
     for (const [pairId, pair] of bracketPairs(brackets)) {
       if (bracketPairUsage(pair) !== "sru") continue;
       const membership = resolveRepeatUnitAtomMembership(pair, page.objects, membershipOptions);
@@ -147,12 +154,14 @@ export function prepareCleanupRepeatUnits(before: ChemDraftDocument, after: Chem
       if (!refit || !candidatePair) throw refusal();
       for (const bracket of candidatePair) {
         const { x, y, width, height, rotation } = refit[bracket.side === "open" ? 0 : 1];
-        replacements.set(bracket.id, { ...bracket, x, y, width, height, rotation });
+        const replacement = { ...bracket, x, y, width, height, rotation };
+        retainBracketIdentity(bracket, replacement);
+        replacements.set(bracket, replacement);
       }
     }
     if (candidate && replacements.size) {
-      // Bracket ids are page-local. A document-wide update can hit a different page's glyph.
-      refittedPages.set(page.id, { ...candidate, objects: candidate.objects.map(object => replacements.get(object.id) ?? object) });
+      refittedPages.set(page.id, { ...candidate, objects: candidate.objects.map(object =>
+        object.type === "bracket" ? replacements.get(object) ?? object : object) });
     }
   }
   if (!checks.length) return { document: after };
