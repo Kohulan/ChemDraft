@@ -7,7 +7,7 @@ import { repeatUnitMolfileGroups, repeatUnits } from "@chemdraft/export-engine";
 import { exportDocumentToCdxml, openChemDraftPayload } from "@chemdraft/cdx-compat";
 import { parseMolfileGraph } from "@chemdraft/clipboard-adapter";
 import { applyPatch, BracketObjectSchema, createEmptyDocument, moleculeToMolfileV2000, resolveRepeatUnitAtomMembership,
-  toEngineDocument, type ChemDraftDocument, type DocumentObject, type MoleculeObject } from "@chemdraft/chem-core";
+  toEngineDocument, type ChemDraftDocument, type DocumentObject, type MoleculeObject, type ReactionObject } from "@chemdraft/chem-core";
 import { PluginApiVersion, type PluginCommandContext, type PluginPermission, type PluginToolHandler } from "@chemdraft/plugin-api";
 import { PluginHost, type RequestDocument, type PluginPatchApplicationRequest } from "@chemdraft/plugin-host";
 import { describe, expect, it, vi } from "vitest";
@@ -1237,6 +1237,130 @@ describe("verified request writes", () => {
       expect(await f.context.documents.applyRequestPatch!({ requestId, patch: { op: "addObject", pageId: f.pageId,
         object: { ...frame("new-group"), type: "group", childObjectIds: ["anchor"] } } }))
         .toMatchObject({ ok: false, error: { code: "scope" } });
+      expect(f.history).toHaveLength(0);
+    } finally { await f.finish(); }
+  });
+
+  const reaction: ReactionObject = { ...frame("step"), type: "reaction", mappingState: "unknown",
+    components: [{ role: "reactant", objectId: ethane.id }], conditionsTextObjectIds: [] };
+
+  it("refuses a new reaction naming an unselected molecule and records no history", async () => {
+    const f = setup();
+    try {
+      const before = f.pinned();
+      expect(await f.context.documents.applyRequestPatch!({ requestId: await f.begin(), patch: {
+        op: "addObject", pageId: f.pageId, object: reaction
+      } })).toMatchObject({ ok: false, error: { code: "scope", message: /ethane.*step/ } });
+      expect(f.pinned()).toBe(before);
+      expect(f.history).toHaveLength(0);
+    } finally { await f.finish(); }
+  });
+
+  it.each(["this batch", "a prior write"])("allows a reaction over a selected molecule and one inserted in %s", async when => {
+    const f = setup([ethane.id]);
+    try {
+      const requestId = await f.begin();
+      const apply = f.context.documents.applyRequestPatch!;
+      const product = { ...ethane, id: "product", x: 300, atoms: ethane.atoms.map(atom => ({ ...atom, x: atom.x + 100 })) };
+      const insertProduct = { op: "addObject" as const, pageId: f.pageId, object: product };
+      const step: ReactionObject = { ...reaction, components: [...reaction.components, { role: "product", objectId: product.id }] };
+      const insertStep = { op: "addObject" as const, pageId: f.pageId, object: step };
+      const expectedStructures = [{ kind: "insertion" as const, opIndex: 0, sourceSmiles: "CC" }];
+      if (when === "a prior write") {
+        const inserted = await apply({ requestId, patch: insertProduct, expectedStructures });
+        if (!inserted.ok) throw new Error(inserted.error.message);
+      }
+      const result = await apply(when === "a prior write" ? { requestId, patch: insertStep } : {
+        requestId, patch: { op: "batch", patches: [insertProduct, insertStep] }, expectedStructures
+      });
+      if (!result.ok) throw new Error(result.error.message);
+      expect(f.pinned().pages[0]!.objects.find(object => object.id === step.id)).toMatchObject(step);
+      expect(f.history).toHaveLength(1);
+    } finally { await f.finish(); }
+  });
+
+  it("refuses an in-scope reaction update adding an unselected component and records no history", async () => {
+    const product = { ...ethane, id: "product" };
+    const f = setup([reaction.id, ethane.id], undefined, { objects: [product, reaction] });
+    try {
+      const before = f.pinned();
+      expect(await f.context.documents.applyRequestPatch!({ requestId: await f.begin(), patch: {
+        op: "updateObject", objectId: reaction.id,
+        changes: { components: [...reaction.components, { role: "product", objectId: product.id }] }
+      } })).toMatchObject({ ok: false, error: { code: "scope", message: /product.*step/ } });
+      expect(f.pinned()).toBe(before);
+      expect(f.history).toHaveLength(0);
+    } finally { await f.finish(); }
+  });
+
+  it("checks a changed reaction role and allows unrelated edits to an existing reference", async () => {
+    const f = setup([reaction.id], undefined, { objects: [reaction] });
+    try {
+      const requestId = await f.begin();
+      const apply = f.context.documents.applyRequestPatch!;
+      expect(await apply({ requestId, patch: { op: "updateObject", objectId: reaction.id,
+        changes: { components: [{ role: "agent", objectId: ethane.id }] }
+      } })).toMatchObject({ ok: false, error: { code: "scope" } });
+      expect(f.history).toHaveLength(0);
+      expect(await apply({ requestId, patch: { op: "updateObject", objectId: reaction.id,
+        changes: { x: reaction.x + 10, components: reaction.components }
+      } })).toMatchObject({ ok: true });
+      expect(f.history).toHaveLength(1);
+    } finally { await f.finish(); }
+  });
+
+  it("refuses an electron-mark association with an unselected molecule and records no history", async () => {
+    const mark = { ...frame("electrons"), type: "electron-mark" as const, markKind: "lone-pair" as const,
+      anchor: { kind: "point" as const, point: { x: 120, y: 130 } } };
+    const f = setup([mark.id], undefined, { objects: [mark] });
+    try {
+      const before = f.pinned();
+      expect(await f.context.documents.applyRequestPatch!({ requestId: await f.begin(), patch: {
+        op: "updateObject", objectId: mark.id, changes: { atomAssociation: "explicit",
+          anchor: { kind: "atom", objectId: ethane.id, atomId: "a1" } }
+      } })).toMatchObject({ ok: false, error: { code: "scope", message: /ethane.*electrons/ } });
+      expect(f.pinned()).toBe(before);
+      expect(f.history).toHaveLength(0);
+    } finally { await f.finish(); }
+  });
+
+  it("refuses a bracket crossing reference before draft cleanup can drop it", async () => {
+    const f = setup();
+    try {
+      const before = f.pinned();
+      const bracket = BracketObjectSchema.parse({ ...frame("bracket"), type: "bracket", bracketKind: "square",
+        crossingBondIds: [{ objectId: ethane.id, bondId: "missing" }] });
+      expect(await f.context.documents.applyRequestPatch!({ requestId: await f.begin(), patch: {
+        op: "addObject", pageId: f.pageId, object: bracket
+      } })).toMatchObject({ ok: false, error: { code: "scope", message: /ethane.*bracket/ } });
+      expect(f.pinned()).toBe(before);
+      expect(f.history).toHaveLength(0);
+    } finally { await f.finish(); }
+  });
+
+  it("refuses an out-of-scope link in preserved reaction metadata", async () => {
+    const f = setup([reaction.id], undefined, { objects: [reaction] });
+    try {
+      const before = f.pinned();
+      expect(await f.context.documents.applyRequestPatch!({ requestId: await f.begin(), patch: {
+        op: "updateObject", objectId: reaction.id, changes: { compatibility: { warnings: [], unknown: {
+          cdxmlStepReferences: { ReactionStepObjectsAboveArrow: ["anchor"] }
+        } } }
+      } })).toMatchObject({ ok: false, error: { code: "scope", message: /anchor.*step/ } });
+      expect(f.pinned()).toBe(before);
+      expect(f.history).toHaveLength(0);
+    } finally { await f.finish(); }
+  });
+
+  it("refuses a reference to an object selected on another page", async () => {
+    const f = setup([ethane.id]);
+    try {
+      f.edit(doc => ({ ...doc, pages: [...doc.pages, { ...doc.pages[0]!, id: "other", objects: [] }] }));
+      const before = f.pinned();
+      expect(await f.context.documents.applyRequestPatch!({ requestId: await f.begin(), patch: {
+        op: "addObject", pageId: "other", object: reaction
+      } })).toMatchObject({ ok: false, error: { code: "scope", message: /ethane.*other/ } });
+      expect(f.pinned()).toBe(before);
       expect(f.history).toHaveLength(0);
     } finally { await f.finish(); }
   });

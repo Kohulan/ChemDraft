@@ -17,6 +17,7 @@ export {
   ArrowObjectSchema,
   BracketObjectSchema,
   CdxmlBracketAtomSnapshotSchema,
+  checkChangedObjectReferences,
   ChemDraftDocumentSchema,
   ChemicalMetadataSchema,
   CompatibilityMetadataSchema,

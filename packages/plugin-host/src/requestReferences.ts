@@ -1,4 +1,5 @@
-import type { Anchor, ChemDraftDocument, DocumentObject, DocumentPatch } from "@chemdraft/chem-core";
+import { checkChangedObjectReferences } from "@chemdraft/chem-core";
+import type { Anchor, ApplyPatchOptions, ChemDraftDocument, DocumentObject, DocumentPatch } from "@chemdraft/chem-core";
 import { RequestWriteError } from "./requestWrites";
 
 /** All AnchorSchema fields in chem-core, including molecule attachment metadata. */
@@ -118,10 +119,22 @@ function anchorGeometry(object: DocumentObject | undefined): unknown {
     : [x, y, width, height, rotation];
 }
 
+type CheckReferenceScope = NonNullable<ApplyPatchOptions["beforeObjectWrite"]>;
+
+export function requestReferenceScope(grantedPages: ReadonlyMap<string, string>): CheckReferenceScope {
+  return (pageId, previous, next) => {
+    checkChangedObjectReferences(previous, next, id => {
+      if (grantedPages.get(id) !== pageId) {
+        throw new RequestWriteError("scope", `Reference to "${id}" in "${next.id}" is outside the request scope on page "${pageId}".`);
+      }
+    });
+  };
+}
+
 /** Permit existing import defects, but refuse newly dangling native links and movement of an
  * anchored object unless the dependent annotation is also explicitly edited in the batch. */
 export function assertRequestReferences(before: ChemDraftDocument, after: ChemDraftDocument,
-  targets: ReadonlySet<string>, inserted: readonly string[], granted: ReadonlySet<string>): void {
+  targets: ReadonlySet<string>, inserted: readonly string[], checkScope: CheckReferenceScope): void {
   const edited = new Set([...targets, ...inserted]);
   for (const page of after.pages) {
     const original = new Map(before.pages.find(old => old.id === page.id)?.objects.map(object => [object.id, object]));
@@ -130,14 +143,7 @@ export function assertRequestReferences(before: ChemDraftDocument, after: ChemDr
       JSON.stringify(anchorGeometry(original.get(id))) !== JSON.stringify(anchorGeometry(current.get(id)))));
     for (const object of page.objects) {
       const old = original.get(object.id);
-      if (object.type === "group" && edited.has(object.id)) {
-        const priorChildren = new Set(old?.type === "group" ? old.childObjectIds : []);
-        for (const child of object.childObjectIds) {
-          if (!priorChildren.has(child) && !granted.has(child)) {
-            throw new RequestWriteError("scope", `Group child "${child}" is outside the request selection.`);
-          }
-        }
-      }
+      if (object !== old) checkScope(page.id, old, object);
       const missing = missingReferences(object, current);
       const previousMissing = new Set(old && missing.length ? missingReferences(old, original) : []);
       const problem = missing.find(id => edited.has(object.id) || !previousMissing.has(id));

@@ -9,7 +9,7 @@ import {
 } from "./index";
 import { sameDocumentValue } from "./documentValue";
 import { rebasePluginPatch } from "./rebasePluginPatch";
-import { assertAuthoredBracketReferences, assertRequestReferences } from "./requestReferences";
+import { assertAuthoredBracketReferences, assertRequestReferences, requestReferenceScope } from "./requestReferences";
 
 export class RequestWriteError extends Error {
   constructor(readonly code: PluginRequestError["code"], message: string) { super(message); }
@@ -235,6 +235,12 @@ export async function preflightRequestPatch(before: ChemDraftDocument, proposal:
       }
     }
 
+    // Native objects can refer to each other within an atomic batch. Use their rebased IDs and
+    // grant neither a colliding existing ID nor a reference on a different page.
+    const grantedPages = new Map(scope.map(id => [id, byId.get(id)!.pageId]));
+    for (const { objectId, pageId } of insertionRefs) grantedPages.set(objectId, pageId);
+    const checkReferenceScope = requestReferenceScope(grantedPages);
+
     const expected = new Map<string, string>();
     for (const item of options.expected ?? []) {
       const entry = item.kind === "insertion"
@@ -250,8 +256,9 @@ export async function preflightRequestPatch(before: ChemDraftDocument, proposal:
     // This preflight applies the whole draft atomically and detects implicit bracket, reaction
     // and crossing changes. Its original proposal is kept so commit-time rebasing uses live IDs.
     let draft: ChemDraftDocument;
-    try { draft = assertPluginPatchWriteScope(before, proposal, scope, rebased); }
+    try { draft = assertPluginPatchWriteScope(before, proposal, scope, rebased, checkReferenceScope); }
     catch (error) {
+      if (error instanceof RequestWriteError) throw error;
       throw new RequestWriteError(error instanceof DocumentPatchError ? "invalid" : "scope", (error as Error).message);
     }
     const nextEntries = entries(draft);
@@ -271,7 +278,7 @@ export async function preflightRequestPatch(before: ChemDraftDocument, proposal:
       }
     }
     assertAuthoredBracketReferences(leaves, after);
-    assertRequestReferences(before, draft, targets, insertionRefs.map(ref => ref.objectId), granted);
+    assertRequestReferences(before, draft, targets, insertionRefs.map(ref => ref.objectId), checkReferenceScope);
     const touched = new Map<string, RequestObjectRef>();
     for (const op of leaves) {
       const ids = op.op === "addObject" ? [op.object.id] : op.op === "addAnnotation" ? [op.annotation.id] : objectTarget(op);
@@ -282,7 +289,7 @@ export async function preflightRequestPatch(before: ChemDraftDocument, proposal:
     }
     const changed = [...touched.values()];
     if (changed.length > PluginRequestLimits.objects) throw new RequestWriteError("limit", "Too many objects in the write receipt.");
-    return { draft, scope, expected, insertionRefs, changed, granted, byId };
+    return { draft, scope, expected, insertionRefs, changed, granted, byId, checkReferenceScope };
   }
 
   const planned = prepare(before);
@@ -427,7 +434,7 @@ export async function commitRequestPatch(binding: BoundRequestWrite, proposal: N
         }
       }
       assertRequestReferences(baseline, final, new Set(plan.changed.map(ref => ref.objectId)),
-        plan.insertionRefs.map(ref => ref.objectId), plan.granted);
+        plan.insertionRefs.map(ref => ref.objectId), plan.checkReferenceScope);
       return finalObjects;
     };
     const commit: RequestWriteCommit = { touched: plan.changed, insertions: [] };

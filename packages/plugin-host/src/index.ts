@@ -87,7 +87,8 @@ export function assertPluginPatchWriteScope(
   document: ChemDraftDocument,
   proposed: NormalizedProposedDocumentPatch,
   objectIds: readonly string[],
-  preflight = rebasePluginPatch(document, proposed)
+  preflight = rebasePluginPatch(document, proposed),
+  beforeObjectWrite?: ApplyPatchOptions["beforeObjectWrite"]
 ): ChemDraftDocument {
   const scope = new Set(objectIds);
   for (const op of writePatchOps(preflight.patch)) {
@@ -101,7 +102,7 @@ export function assertPluginPatchWriteScope(
     }
   }
   // Inspect one atomic draft, without normalizing partial pairs or forward references between ops.
-  const validated = applyPatch(document, preflight.patch, { beforeRemoveObjects: (draft, objectIds) => {
+  const validated = applyPatch(document, preflight.patch, { beforeObjectWrite, beforeRemoveObjects: (draft, objectIds) => {
     const removed = new Set(objectIds);
     for (const page of draft.pages) {
       for (const object of page.objects) {

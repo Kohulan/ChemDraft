@@ -54,6 +54,8 @@ export interface ApplyPatchOptions {
   /** Trusted host preflight, before a removal run in the atomic draft. Throw to refuse the batch.
    * The draft is borrowed for inspection only; do not mutate or retain it. */
   beforeRemoveObjects?: (document: ChemDraftDocument, objectIds: readonly string[]) => void;
+  /** Trusted host preflight for a parsed add or update, before draft normalization can prune links. */
+  beforeObjectWrite?: (pageId: string, previous: DocumentObject | undefined, next: DocumentObject) => void;
 }
 
 export class DocumentPatchError extends Error {
@@ -123,7 +125,7 @@ export function applyPatches(
       }
     }
     try {
-      applyPatchInPlace(draft, patch);
+      applyPatchInPlace(draft, patch, options.beforeObjectWrite);
     } catch (error) {
       if (error instanceof z.ZodError) throw new DocumentPatchError(error.message);
       throw error;
@@ -310,18 +312,18 @@ function deepFreezeNew(value: unknown): void {
   }
 }
 
-function applyPatchInPlace(next: ChemDraftDocument, patch: DocumentPatch): void {
+function applyPatchInPlace(next: ChemDraftDocument, patch: DocumentPatch, beforeObjectWrite: ApplyPatchOptions["beforeObjectWrite"]): void {
   switch (patch.op) {
     case "batch":
       throw new DocumentPatchError("Nested batch patches are not allowed.");
     case "addObject":
-      addObject(next, patch.pageId, patch.object);
+      addObject(next, patch.pageId, patch.object, beforeObjectWrite);
       break;
     case "removeObject":
       removeObject(next, patch.objectId);
       break;
     case "updateObject":
-      updateObject(next, patch.objectId, patch.changes);
+      updateObject(next, patch.objectId, patch.changes, beforeObjectWrite);
       break;
     case "updatePageLayout":
       updatePageLayout(next, patch.pageId, patch.layout);
@@ -352,7 +354,7 @@ function applyPatchInPlace(next: ChemDraftDocument, patch: DocumentPatch): void 
       };
       break;
     case "addAnnotation":
-      addObject(next, patch.pageId, patch.annotation);
+      addObject(next, patch.pageId, patch.annotation, beforeObjectWrite);
       break;
     case "removeAnnotation":
       removeAnnotation(next, patch.annotationId);
@@ -362,7 +364,8 @@ function applyPatchInPlace(next: ChemDraftDocument, patch: DocumentPatch): void 
   }
 }
 
-function addObject(document: ChemDraftDocument, pageId: string, object: DocumentObject): void {
+function addObject(document: ChemDraftDocument, pageId: string, object: DocumentObject,
+  beforeObjectWrite: ApplyPatchOptions["beforeObjectWrite"]): void {
   const pageIndex = document.pages.findIndex((candidate) => candidate.id === pageId);
   const page = document.pages[pageIndex];
   if (!page) {
@@ -374,6 +377,7 @@ function addObject(document: ChemDraftDocument, pageId: string, object: Document
   }
 
   const parsed = DocumentObjectSchema.parse(object);
+  beforeObjectWrite?.(pageId, undefined, parsed);
   // Every new molecule — pasted, split off, merged, imported — enters here, so this is where a
   // stated H count that no longer sits in an aromatic ring is dropped (see dropOrphanedHydrogenHints).
   if (parsed.type === "molecule") {
@@ -615,7 +619,8 @@ function updatePageLayout(document: ChemDraftDocument, pageId: string, layout: P
 function updateObject(
   document: ChemDraftDocument,
   objectId: string,
-  changes: Partial<DocumentObject>
+  changes: Partial<DocumentObject>,
+  beforeObjectWrite?: ApplyPatchOptions["beforeObjectWrite"]
 ): void {
   const location = findObject(document, objectId);
   if (!location) {
@@ -631,6 +636,7 @@ function updateObject(
   }
 
   const updated = mergeObjectChanges(location.object, changes, objectId);
+  beforeObjectWrite?.(location.page.id, location.object, updated);
   if (location.object.type === "molecule" && updated.type === "molecule") {
     updated.atoms = clearChangedAtomHydrogenHints(location.object, updated.atoms, updated.bonds);
   }
