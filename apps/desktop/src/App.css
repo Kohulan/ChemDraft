@@ -1432,6 +1432,34 @@ textarea:focus-visible,
   grid-column: 2;
 }
 
+.tool-palette-added-commands {
+  display: flex;
+  flex-wrap: wrap;
+  flex: none;
+  grid-column: -2 / -1;
+  gap: var(--cd-space-2);
+  padding: var(--cd-space-2);
+}
+
+.tool-palette.horizontal.molecular-inspector-palette[data-has-added-commands] {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(34px, 1fr) auto;
+}
+
+.tool-palette.floating.horizontal.molecular-inspector-palette[data-has-added-commands] {
+  grid-template-columns: 7px minmax(0, 1fr);
+}
+
+.tool-palette.floating.horizontal.molecular-inspector-palette[data-has-added-commands] .palette-content-drag-grip {
+  grid-column: 1;
+  grid-row: 1 / 3;
+}
+
+.palette-window-shell[data-resizable] .molecular-inspector-palette[data-has-added-commands] .molecular-inspector-pane {
+  min-height: 34px;
+}
+
 .art-toolbar-command-grid {
   display: grid;
   grid-template-columns: repeat(4, max-content);
@@ -2509,6 +2537,31 @@ textarea:focus-visible,
   overflow-y: auto;
 }
 
+.palette-window-shell[data-resizable] {
+  width: 100%;
+  height: 100vh;
+  grid-template-rows: 22px minmax(0, 1fr);
+}
+
+.palette-window-shell[data-resizable] > .palette-window-content {
+  min-width: 0;
+  max-height: none;
+  overflow: auto;
+}
+
+.palette-window-shell[data-resizable] .tool-palette.floating.molecular-inspector-palette {
+  width: 100%;
+  height: 100%;
+}
+
+.palette-window-shell[data-resizable] .molecular-inspector-pane {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+}
+
 .palette-title {
   position: relative;
   box-sizing: border-box;
@@ -2524,6 +2577,11 @@ textarea:focus-visible,
   text-align: center;
   user-select: none;
   cursor: grab;
+}
+
+.palette-window-shell > .palette-title {
+  /* The tools determine the shell width. Ellipsize a long title within that width. */
+  contain: inline-size;
 }
 
 .palette-title[data-palette-title-drag-surface="true"] {

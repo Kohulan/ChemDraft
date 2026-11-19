@@ -193,6 +193,7 @@ import { PluginCommandInputSchema, type PluginCommandInput, type PluginPanelRepo
 import { createCoreCommandRegistrar } from "./commands/coreCommandRegistrar";
 import { createFixturePluginOptions, fixturePluginManifest, FIXTURE_PLUGIN_ID } from "./plugins/fixturePlugin";
 import { createToolbarCatalog } from "./toolbars/toolbarCatalog";
+import { filterToolbarCustomizationCommands } from "./toolbars/toolbarCustomizationCommands";
 import { classifyToolbarSelection } from "./toolbars/toolbarSelectionKind";
 import { CustomizeToolbarsDialog } from "./toolbars/CustomizeToolbars/CustomizeToolbarsDialog";
 import { emptyLayoutState } from "./toolbars/CustomizeToolbars/layoutStateEdits";
@@ -483,9 +484,7 @@ import {
   activateDrawingToolCommand,
   createActiveToolState,
   drawingToolStatusLabel,
-  isCompatOnlyArtVariantCommandId,
   isDrawingToolCommand,
-  TRANSITIONAL_STUB_COMMAND_IDS,
   withStandaloneDrawingToolCommands,
   type ActiveToolState
 } from "./drawingTools";
@@ -875,6 +874,7 @@ import {
   getToolsetItemGroups,
   getToolsetPaletteGroups,
   getToolsetToggleActions,
+  initialToolsetWindowSize,
   isDisabledPlaceholderCommand,
   migrateMainToolbarDefaultsLayoutState,
   type DesktopToolsetDefinition,
@@ -883,7 +883,7 @@ import {
 } from "./toolsets";
 import { MenuBar } from "./MenuBar";
 import { buildAppMenuModel, structureSearchMenuItems, PLUGIN_MANAGER_COMMAND_ID, PLUGIN_UPDATES_COMMAND_ID } from "./appMenu";
-import { registerVibeCodeStarter, vibeCodeStarterCommand, VIBE_CODE_SAVE_COMMAND_ID } from "./commands/vibeCodeStarter";
+import { registerVibeCodeStarter, VIBE_CODE_SAVE_COMMAND_ID } from "./commands/vibeCodeStarter";
 import {
   editHistoryDirection,
   forceDocumentHistoryCommandId,
@@ -3549,21 +3549,23 @@ export function MainWindow({
     [customSwatches, document.selection.objectIds, selectedNativeMoleculeParts, activeTextEditObjectId]);
   const customColorSaveRef = useRef<(swatch: CustomSwatchNumber, slot: CustomSwatchSlot, hex: string) => void>(() => {});
   const customColorClearRef = useRef<(swatch: CustomSwatchNumber, slot: CustomSwatchSlot) => Promise<void>>(async () => {});
+  const baseToolbarCommands = toolbarCatalog.baseCommands();
   const shellCommandSpecs = useMemo(
     () => applyKeybindingSchemeToCommands(
-      [...allShellCommands(document, selectedMolecule, {
+      allShellCommands(document, selectedMolecule, {
         customSwatches,
         activeTableCell,
         availability: { canUndo, canRedo, hasMultipleTabs: documentTabs.length > 1, hasOpenWarnings: openWarnings !== undefined,
           hasMoleculeFragmentSelection: selectedNativeMoleculeParts.length > 0 },
         registry: toolsetRegistry,
+        paletteCommands: baseToolbarCommands,
         compoundLayoutsEnabled, compoundLayoutSettings,
         structureSearchEnabled,
         hasSearchableStructure
-      }).map(command => customSwatchActions.find(action => action.id === command.id) ?? command), vibeCodeStarterCommand].filter(command => command.id !== "arrow.conditions" || isDesktopRuntime()),
+      }).map(command => customSwatchActions.find(action => action.id === command.id) ?? command).filter(command => command.id !== "arrow.conditions" || isDesktopRuntime()),
       keybindingScheme
     ),
-    [customSwatches, customSwatchActions, activeTableCell?.tableId, activeTableCell?.rowId, activeTableCell?.columnId, canRedo, canUndo, document, documentTabs.length, keybindingScheme, openWarnings, selectedMolecule, selectedNativeMoleculeParts, toolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, structureSearchEnabled, hasSearchableStructure]
+    [baseToolbarCommands, customSwatches, customSwatchActions, activeTableCell?.tableId, activeTableCell?.rowId, activeTableCell?.columnId, canRedo, canUndo, document, documentTabs.length, keybindingScheme, openWarnings, selectedMolecule, selectedNativeMoleculeParts, toolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, structureSearchEnabled, hasSearchableStructure]
   );
   const shellCommandsById = useMemo(
     () => createShellCommandMap(shellCommandSpecs),
@@ -4174,23 +4176,18 @@ export function MainWindow({
         if (layoutState !== undefined) {
           // Preserve historical Main defaults and fold pre-flatten layouts before anything consumes
           // them; the visibility save below persists the migrated state and its defaults revision.
-          const migrated = migrateMainToolbarDefaultsLayoutState(layoutState);
-          toolbarCatalog.setLayoutState(migrated);
+          const parsed = parseToolsetLayoutState(migrateMainToolbarDefaultsLayoutState(layoutState));
+          toolbarCatalog.setLayoutState(parsed);
           const nextRegistry = toolbarCatalog.registry();
           setWebPalettePositions(createDefaultToolsetPositions(nextRegistry));
           // The registry's default-visible set already reflects the saved toolsetOverrides[].visible,
           // so this restores exactly the palettes the user last had open.
           setVisibleToolsetIds(createDefaultVisibleToolsetIds(nextRegistry));
-          try {
-            layoutStateRef.current = parseToolsetLayoutState(migrated);
-          } catch {
-            layoutStateRef.current = undefined;
-          }
+          layoutStateRef.current = parsed;
         }
 
-        // Initial load finished and the file read cleanly. Record which toolsets we've resolved
-        // visibility for, and allow saves to persist — a save now merges onto the file we just read
-        // rather than replacing it.
+        // Record which toolsets we've resolved visibility for. A startup save may merge onto a
+        // validated layout or create a file when there was none.
         resolvedToolsetIdsRef.current = new Set(toolbarCatalog.registry().listToolsets().map((toolset) => toolset.id));
         layoutSaveEnabledRef.current = true;
         layoutHydratedRef.current = true;
@@ -4545,18 +4542,20 @@ export function MainWindow({
     if (!toolset) {
       return undefined;
     }
-    const size = toolset.preferredWindowSize;
+    const itemGroups = getToolsetPaletteGroups(toolsetId, toolsetRegistry, new Map(), compoundLayoutsEnabled, compoundLayoutSettings)
+      .map(group => group.items);
+    const size = initialToolsetWindowSize(toolset, itemGroups);
     // Stagger a first-ever placement by the toolset's position in the registry (Rust used to derive
     // this from the manifest order); a persisted position overrides it in Rust.
     const offset = toolsetStaggerIndex(toolsetId, toolsetRegistry) * TOOLSET_STAGGER_STEP_PX;
     return {
       title: toolset.title,
-      width: size?.width ?? 96,
-      height: size?.height ?? 420,
+      width: size.width,
+      height: size.height,
       x: 88 + offset,
       y: 154 + offset
     };
-  }, [toolsetRegistry]);
+  }, [compoundLayoutSettings, compoundLayoutsEnabled, toolsetRegistry]);
 
   const toggleToolset = useCallback(async (toolsetId: string) => {
     if (!toolsetRegistry.get(toolsetId)) {
@@ -13130,7 +13129,7 @@ export function MainWindow({
     const syncPluginToolsets = () => {
       const pluginToolsets = runtime.listPluginToolsets();
       pluginToolsetsRef.current = pluginToolsets;
-      toolbarCatalog.setPluginToolsets(pluginToolsets);
+      toolbarCatalog.setPluginToolsets(pluginToolsets, runtime.listPluginCommandsWithHandlers());
       void broadcastToolsetDefinitions(pluginToolsets).catch(() => undefined);
     };
     const unsubscribe = runtime.onDidChange(syncPluginToolsets);
@@ -13947,7 +13946,9 @@ export function MainWindow({
     try {
       layoutStateRef.current = parseToolsetLayoutState(next);
     } catch {
-      layoutStateRef.current = undefined;
+      // A displayed layout can omit an invalid addition. Only a valid edit can be saved.
+      layoutSaveEnabledRef.current = false;
+      return;
     }
     resolvedToolsetIdsRef.current = new Set(nextRegistry.listToolsets().map((toolset) => toolset.id));
     layoutSaveEnabledRef.current = true;
@@ -13978,42 +13979,16 @@ export function MainWindow({
     [commitToolbarLayout]
   );
 
-  // Command catalog (id + title, deduped) offered by the Customize dialog's "add command" palette.
-  // It follows the effective registry so user/plugin/renamed toolbar launchers appear immediately.
-  const customizeCommandOptions = useMemo(() => {
-    const byId = new Map<string, string>();
-    for (const command of shellCommandSpecs) {
-      if (parseCustomSwatchCommandId(command.id)) continue;
-      if (isCompoundLayoutCommandHidden(command.id, compoundLayoutSettings)) continue;
-      if (!byId.has(command.id)) {
-        byId.set(command.id, command.title ?? command.id);
-      }
-    }
-    return [...byId].map(([id, title]) => ({ id, title }));
-  }, [shellCommandSpecs, compoundLayoutSettings]);
-
-  // Full live specs (including current enabled state) for the in-place customize gallery — minus
-  // transitional stubs, which must never be draggable onto a real toolbar. The declared stub set is
-  // used rather than live enabled state, so transiently disabled commands (Undo, align, boolean
-  // ops) stay offered.
-  const galleryCommands = useMemo(() => {
-    // Deliberately the *shipped* manifest, not `toolsetRegistry`. The latter is the user's own
-    // customized layout, so keying off it made the gallery eat its own tail: remove a tool from a
-    // toolbar and it vanishes from the list you would put it back with, permanently. What the build
-    // ships is a fixed fact; what the user has arranged is not.
-    const shipped = new Set(getToolsetCommandSpecs(desktopToolsetRegistry).map((command) => command.id));
-    return shellCommandSpecs.filter((command) =>
-      !isCompoundLayoutCommandHidden(command.id, compoundLayoutSettings) &&
-      !TRANSITIONAL_STUB_COMMAND_IDS.has(command.id) &&
-      !isCompatOnlyArtVariantCommandId(command.id, shipped)
-    );
-  }, [shellCommandSpecs, compoundLayoutSettings]);
+  const galleryCommands = useMemo(
+    () => filterToolbarCustomizationCommands(shellCommandSpecs, compoundLayoutSettings),
+    [shellCommandSpecs, compoundLayoutSettings]
+  );
 
   // Command id → title, for the customize-edit applier (an addCommand for a title-less/unknown id is
   // a no-op).
   const commandTitleById = useMemo(
-    () => new Map(customizeCommandOptions.map((option) => [option.id, option.title])),
-    [customizeCommandOptions]
+    () => new Map(galleryCommands.map((option) => [option.id, option.title])),
+    [galleryCommands]
   );
 
   // Command id → spec, so an added command's synthesized item carries the command's real icon/asset.
@@ -22843,7 +22818,7 @@ export function MainWindow({
                   {
                     "--palette-x": `${position.x}px`,
                     "--palette-y": `${position.y}px`,
-                    "--palette-width": `${toolset.preferredWindowSize?.width ?? 96}px`
+                    "--palette-width": `${initialToolsetWindowSize(toolset, paletteGroups.map(group => group.items)).width}px`
                   } as CSSProperties
                 }
                 onPointerDown={(event) => startWebPaletteDrag(toolset.id, event)}
@@ -23597,7 +23572,7 @@ export function MainWindow({
           <CustomizeToolbarsDialog
             baseToolsets={toolbarCatalog.baseToolsets()}
             layoutState={layoutStateRef.current ?? emptyLayoutState()}
-            availableCommands={customizeCommandOptions}
+            availableCommands={galleryCommands}
             isCommandHidden={id => isCompoundLayoutCommandHidden(id, compoundLayoutSettings)}
             onApply={applyCustomizeToolbars}
             onLiveApply={liveApplyCustomizeToolbars}

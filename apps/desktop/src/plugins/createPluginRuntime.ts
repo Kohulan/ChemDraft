@@ -32,6 +32,7 @@ import type {
 import {
   PluginHost,
   validateTrustedPluginManifest,
+  type CommandDefinition,
   type CommandRegistry,
   type PluginPatchApplicationRequest,
   type RegisterPluginOptions
@@ -40,7 +41,7 @@ import {
 import type { RegisteredCanvasOverlay } from "./types";
 import type { CanvasOverlayContentSection, CanvasOverlayDraftRestore } from "./pluginCanvasOverlayControls";
 
-import type { DesktopToolsetDefinition } from "../toolsets";
+import { PLUGIN_COMMAND_WITHOUT_HANDLER, type DesktopToolsetDefinition } from "../toolsets";
 import { PluginPanelController } from "./PluginPanelController";
 import { PluginPromptTextController } from "./PluginPromptTextController";
 import { createDefaultImageSourceRegistry, type ImageSourceRegistry } from "./ImageSourceProvider";
@@ -244,6 +245,7 @@ export interface DesktopPluginRuntime {
   getCanvasOverlayOpenRequests(): ReadonlyMap<string, { readonly focus: boolean }>;
   subscribeCanvasOverlayOpen(listener: () => void): () => void;
   listPluginToolsets(): DesktopToolsetDefinition[];
+  listPluginCommandsWithHandlers(): CommandDefinition[];
   pluginIdForToolset(toolsetId: string): string | undefined;
   /** Notified when plugin contributions change. Returns unsubscribe. */
   onDidChange(listener: () => void): () => void;
@@ -608,7 +610,7 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
               throw new Error(`Plugin toolset "${toolset.id}" is already contributed by another plugin.`);
             }
           }
-          const mapped = contributed.map(pluginToolsetToDefinition);
+          const mapped = contributed.map(toolset => pluginToolsetToDefinition(toolset, registerOptions.commandHandlers));
           toolsetsByPluginId.set(manifest.id, mapped);
           mapped.forEach((toolset) => pluginIdByToolsetId.set(toolset.id, manifest.id));
         }
@@ -717,6 +719,11 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
       };
     },
     listPluginToolsets: () => [...toolsetsByPluginId.values()].flat(),
+    listPluginCommandsWithHandlers: () => host.commands.list().filter(command => {
+      const registration = command.pluginId && registrations.get(command.pluginId);
+      return command.source === "plugin" && !!registration
+        && typeof registration.options.commandHandlers?.[command.id] === "function";
+    }),
     pluginIdForToolset: (toolsetId) => pluginIdByToolsetId.get(toolsetId),
     onDidChange(listener) {
       listeners.add(listener);
@@ -738,26 +745,46 @@ export function documentIdentityKey(document: ChemDraftDocument | undefined): st
   return document === undefined ? undefined : `${document.id}\u0000${document.createdAt}`;
 }
 
-function pluginToolsetToDefinition(contribution: PluginToolsetContribution): DesktopToolsetDefinition {
+function pluginToolsetToDefinition(
+  contribution: PluginToolsetContribution,
+  commandHandlers: RegisterPluginOptions["commandHandlers"]
+): DesktopToolsetDefinition {
+  const groupIds = new Set(contribution.groups.flatMap(group => group.id === undefined ? [] : [group.id]));
   return {
     id: contribution.id,
     title: contribution.title,
     source: "plugin",
     defaultVisible: contribution.defaultVisible,
     defaultMode: "floating",
-    groups: contribution.groups.map((group) => ({
-      id: group.id,
-      title: group.title,
-      items: group.items.map((item) => ({
-        commandId: item.commandId,
-        title: item.title,
-        // Named fallback keeps the type honest; the real icon rides on iconDataUri.
-        icon: "palette",
-        iconDataUri: item.iconDataUri,
-        shortcutDisplay: item.shortcutDisplay,
-        category: "plugin"
-      }))
-    })),
+    groups: contribution.groups.map((group) => {
+      let id = group.id;
+      if (id === undefined) {
+        const content = JSON.stringify([group.title, group.items.map(item => item.commandId).sort()]);
+        let hash = 2166136261;
+        for (let offset = 0; offset < content.length; offset++) {
+          hash = Math.imul(hash ^ content.charCodeAt(offset), 16777619);
+        }
+        id = `${contribution.id}.group-content.${(hash >>> 0).toString(16)}`;
+        while (groupIds.has(id)) id += "-";
+        groupIds.add(id);
+      }
+      return {
+        id,
+        title: group.title,
+        items: group.items.map((item) => ({
+          commandId: item.commandId,
+          title: item.title,
+          // Named fallback keeps the type honest; the real icon rides on iconDataUri.
+          icon: "palette",
+          iconDataUri: item.iconDataUri,
+          shortcutDisplay: item.shortcutDisplay,
+          // The gallery omits handlerless commands. Detached palettes still receive their buttons.
+          disabledReason: typeof commandHandlers?.[item.commandId] === "function"
+            ? undefined : PLUGIN_COMMAND_WITHOUT_HANDLER,
+          category: "plugin"
+        }))
+      };
+    }),
     preferredWindowSize: contribution.preferredWindowSize
   };
 }

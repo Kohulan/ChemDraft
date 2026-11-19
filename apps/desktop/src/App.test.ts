@@ -3949,7 +3949,7 @@ describe("ChemDraft desktop shell", () => {
     expect(toggles.every((command) => command.category === "view")).toBe(true);
   });
 
-  it("builds the shell catalog from the effective registry and current history availability", () => {
+  it("uses live toolbar titles and current history availability in the shell catalog", () => {
     const pluginCommands = allShellCommands(createPhase4Document(), undefined, {
       registry: buildRegistryWithFixture()
     });
@@ -4129,22 +4129,6 @@ describe("ChemDraft desktop shell", () => {
     expect(genericAt).toBeGreaterThan(cancelAt);
     // And it must restore the pre-drag document rather than keep the preview.
     expect(mainWindowSource).toContain("replacePresentDocument(drag.startDocument);");
-  });
-
-  it("filters transitional stubs and compat-only art variants out of both gallery sources", () => {
-    for (const source of [mainWindowSource, paletteWindowSource]) {
-      expect(source).toContain("!TRANSITIONAL_STUB_COMMAND_IDS.has(command.id)");
-      expect(source).toContain("!isCompatOnlyArtVariantCommandId(command.id, shipped)");
-      // From the SHIPPED manifest, never the user's customized registry. Keyed off the latter the
-      // gallery ate its own tail: remove a tool from a toolbar and it disappeared from the list you
-      // would put it back with, with no way to recover it short of resetting every layout.
-      // (Scoped to this block on purpose — elsewhere, following the customized registry is right.)
-      const filterAt = source.indexOf("!isCompatOnlyArtVariantCommandId(command.id, shipped)");
-      const galleryBlock = source.slice(Math.max(0, filterAt - 600), filterAt);
-      expect(galleryBlock).toContain("getToolsetCommandSpecs(desktopToolsetRegistry)");
-      expect(galleryBlock).not.toContain("getToolsetCommandSpecs(toolsetRegistry)");
-    }
-    expect(paletteWindowSource).toContain("commands={galleryCommands}");
   });
 
   it("treats art style presets as compat-only but keeps other unshipped art tools offered", () => {

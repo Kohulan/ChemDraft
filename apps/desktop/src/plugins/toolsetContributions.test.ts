@@ -45,6 +45,36 @@ describe("desktop plugin runtime + toolbar catalog", () => {
     expect(catalog.registry().get("core.main")).toBeDefined();
   });
 
+  it("offers only plugin commands with handlers, including disabled commands with handlers", () => {
+    const registry = new CommandRegistry();
+    const runtime = createPluginRuntime({ commandRegistry: registry, getActiveDocument: () => undefined });
+    const enabledId = "plugin.gallery.run";
+    const disabledId = "plugin.gallery.disabled";
+    const unhandledId = "plugin.gallery.unhandled";
+    runtime.registerPlugin({
+      id: "org.chemdraft.gallery",
+      name: "Gallery Test",
+      version: "0.0.0",
+      apiVersion: "^0.1.0",
+      entry: "dev",
+      permissions: [],
+      contributes: { commands: [
+        { id: enabledId, title: "Run" },
+        { id: disabledId, title: "Disabled", enabled: false },
+        { id: unhandledId, title: "Unhandled" }
+      ] }
+    }, { commandHandlers: { [enabledId]: () => undefined, [disabledId]: () => undefined } });
+
+    const catalog = createToolbarCatalog();
+    catalog.setPluginToolsets(runtime.listPluginToolsets(), runtime.listPluginCommandsWithHandlers());
+    expect(registry.get(unhandledId)?.enabled).toBe(false);
+    expect(catalog.baseCommands().filter(command => command.id.startsWith("plugin.gallery."))
+      .map(({ id, enabled }) => ({ id, enabled }))).toEqual([
+      { id: enabledId, enabled: true },
+      { id: disabledId, enabled: false }
+    ]);
+  });
+
   it("enforces ui.toolbar and rolls the plugin back when a toolset is contributed without it", () => {
     const runtime = makeRuntime();
     const withoutPermission = { ...fixturePluginManifest, id: "org.chemdraft.fixture.bad", permissions: [] };
@@ -64,6 +94,118 @@ describe("desktop plugin runtime + toolbar catalog", () => {
 
     // Startup survives; core.main is still there.
     expect(catalog.registry().get("core.main")).toBeDefined();
+  });
+
+  it("replays saved additions when a plugin and its commands return", () => {
+    const runtime = makeRuntime();
+    const catalog = createToolbarCatalog();
+    const register = () => {
+      runtime.registerPlugin(fixturePluginManifest, createFixturePluginOptions());
+      catalog.setPluginToolsets(runtime.listPluginToolsets());
+    };
+    register();
+    const pluginGroupId = catalog.registry().require(FIXTURE_PLUGIN_TOOLSET_ID).groups[0]!.id;
+    expect(pluginGroupId).toBeTruthy();
+    const mainGroupId = catalog.registry().require("core.main").groups[0]!.id;
+    catalog.setLayoutState({
+      version: 1,
+      userToolsets: [],
+      toolsetOverrides: [
+        {
+          toolsetId: FIXTURE_PLUGIN_TOOLSET_ID,
+          itemAdditions: [{ groupId: pluginGroupId, item: { commandId: "edit.undo" } }]
+        },
+        {
+          toolsetId: "core.main",
+          itemAdditions: [{ groupId: mainGroupId, item: { commandId: FIXTURE_PLUGIN_PING_COMMAND_ID } }]
+        }
+      ]
+    });
+    const commandIds = (toolsetId: string) => catalog.registry().require(toolsetId).groups
+      .flatMap((group) => group.items.map((item) => item.commandId));
+    expect(commandIds(FIXTURE_PLUGIN_TOOLSET_ID)).toContain("edit.undo");
+    expect(commandIds("core.main")).toContain(FIXTURE_PLUGIN_PING_COMMAND_ID);
+
+    runtime.unregisterPlugin(FIXTURE_PLUGIN_ID);
+    catalog.setPluginToolsets(runtime.listPluginToolsets());
+    expect(catalog.registry().get(FIXTURE_PLUGIN_TOOLSET_ID)).toBeUndefined();
+    expect(commandIds("core.main")).not.toContain(FIXTURE_PLUGIN_PING_COMMAND_ID);
+
+    register();
+    expect(catalog.registry().require(FIXTURE_PLUGIN_TOOLSET_ID).groups[0]!.id).toBe(pluginGroupId);
+    expect(commandIds(FIXTURE_PLUGIN_TOOLSET_ID)).toContain("edit.undo");
+    expect(commandIds("core.main")).toContain(FIXTURE_PLUGIN_PING_COMMAND_ID);
+  });
+
+  it("keeps additions addressed by stable group IDs across plugin group changes", () => {
+    const runtime = makeRuntime();
+    const catalog = createToolbarCatalog();
+    const toolset = fixturePluginManifest.contributes.toolsets[0];
+    const original = { ...toolset.groups[0], id: undefined };
+    const named = { ...original, id: "plugin.fixture.named" };
+    const unnamed = { ...original, title: "Another group" };
+    const manifestWithGroups = (groups: (typeof original | typeof named)[]) => ({
+      ...fixturePluginManifest,
+      contributes: { ...fixturePluginManifest.contributes, toolsets: [{ ...toolset, groups }] }
+    });
+    const options = createFixturePluginOptions();
+    runtime.registerPlugin(manifestWithGroups([original]), options);
+    catalog.setPluginToolsets(runtime.listPluginToolsets(), runtime.listPluginCommandsWithHandlers());
+    const toolsetId = FIXTURE_PLUGIN_TOOLSET_ID;
+    const groupId = catalog.registry().require(toolsetId).groups[0].id!;
+    const saved = { version: 1, toolsetOverrides: [{
+      toolsetId, groupOrder: [groupId],
+      itemOrder: { [groupId]: ["edit.undo", FIXTURE_PLUGIN_PING_COMMAND_ID] },
+      itemAdditions: [{ groupId, item: { commandId: "edit.undo" } }]
+    }] };
+    const assertCustomizedGroup = () => {
+      const groups = catalog.registry().require(toolsetId).groups;
+      expect(groups[0].id).toBe(groupId);
+      expect(groups[0].items.map(item => item.commandId)).toEqual(["edit.undo", ...original.items.map(item => item.commandId)]);
+    };
+    catalog.setLayoutState(saved);
+    assertCustomizedGroup();
+    for (const groups of [[named, original, unnamed], [unnamed, named, original], [unnamed, original]]) {
+      runtime.replacePlugin(FIXTURE_PLUGIN_ID, manifestWithGroups(groups), options);
+      catalog.setPluginToolsets(runtime.listPluginToolsets(), runtime.listPluginCommandsWithHandlers());
+      assertCustomizedGroup();
+    }
+  });
+
+  it("keeps a saved addition on its unnamed group after restart and ignores stale index IDs", () => {
+    const toolset = fixturePluginManifest.contributes.toolsets[0];
+    const groupA = { ...toolset.groups[0], title: "Group A" };
+    const groupB = { ...toolset.groups[0], title: "Group B" };
+    const startRuntime = (groups: (typeof groupA)[]) => {
+      const runtime = makeRuntime();
+      runtime.registerPlugin({
+        ...fixturePluginManifest,
+        contributes: { ...fixturePluginManifest.contributes, toolsets: [{ ...toolset, groups }] }
+      }, createFixturePluginOptions());
+      return runtime;
+    };
+    const firstRun = startRuntime([groupA, groupB]);
+    const groupId = firstRun.listPluginToolsets()[0].groups[0].id!;
+    const saved = JSON.stringify({
+      version: 1,
+      toolsetOverrides: [{
+        toolsetId: toolset.id,
+        itemAdditions: [
+          { groupId, item: { commandId: "edit.undo" } },
+          { groupId: `${toolset.id}.group.0`, item: { commandId: "edit.redo" } }
+        ]
+      }]
+    });
+
+    const restarted = startRuntime([groupB, groupA]);
+    const catalog = createToolbarCatalog();
+    catalog.setLayoutState(JSON.parse(saved));
+    catalog.setPluginToolsets(restarted.listPluginToolsets(), restarted.listPluginCommandsWithHandlers());
+    const groups = catalog.registry().require(toolset.id).groups;
+    expect(groups.map(group => group.title)).toEqual(["Group B", "Group A"]);
+    expect(groups.find(group => group.items.some(item => item.commandId === "edit.undo"))?.id).toBe(groupId);
+    expect(groups[1].id).toBe(groupId);
+    expect(groups.flatMap(group => group.items.map(item => item.commandId))).not.toContain("edit.redo");
   });
 
   it("forwards selection and panel wiring to plugin command handlers", async () => {

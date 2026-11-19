@@ -24,10 +24,10 @@ import { installNativeFlyoutKeyboard } from "./nativeFlyoutKeyboard";
 import { disabledControlAtPointer, installPaletteInputFocus, isPaletteInputFocusPending, paletteInputFocusControl, PALETTE_INPUT_FOCUS_COMMIT_EVENT } from "./plugins/pluginPanelInputFocus";
 import { editHistoryDirection, forceDocumentHistoryCommandId, isCleanPaletteNumberInput, isTextEditingElement } from "./editHistoryRouting";
 import { applyKeybindingSchemeToCommands } from "./keybindingScheme";
-import { isCompoundLayoutCommandHidden } from "./compoundLayoutSettings";
 import { useCompoundLayoutSettings } from "./useCompoundLayoutTools";
 import { loadKeybindingSettings, type KeybindingScheme } from "./keybindingSettings";
 import { TOOLBAR_SELECTION_KINDS, type ToolbarSelectionModel } from "./toolbars/toolbarSelectionKind";
+import { filterToolbarCustomizationCommands } from "./toolbars/toolbarCustomizationCommands";
 import { ToolbarCustomizeController } from "./toolbars/CustomizeMainToolbar/ToolbarCustomizeController";
 import { CustomizeBar } from "./toolbars/CustomizeMainToolbar/CustomizeBar";
 import { GalleryTray } from "./toolbars/CustomizeMainToolbar/GalleryTray";
@@ -36,15 +36,13 @@ import {
   createDesktopToolsetRegistry,
   desktopToolsetRegistry,
   compoundLayoutRegistry,
-  computePaletteGridSize,
-  getToolsetCommandSpecs,
   getToolsetPaletteGroups,
+  initialToolsetWindowSize,
   paletteCommandGroupsFromItemGroups,
   type DesktopToolsetDefinition,
   type DesktopToolsetRegistry,
   type ToolbarPaletteGroupModel
 } from "./toolsets";
-import { isCompatOnlyArtVariantCommandId, TRANSITIONAL_STUB_COMMAND_IDS } from "./drawingTools";
 import {
   DEFAULT_TOOLSET_ID,
   closeToolsetWindow,
@@ -53,6 +51,8 @@ import {
   newToolsetPopoverOpening,
   currentWindowLogicalPosition,
   currentWindowLogicalWorkArea,
+  clampCurrentInspectorFrame,
+  isDesktopRuntime,
   fitCurrentPaletteWindow,
   dismissToolsetPopovers,
   toolsetPopoverTimestamp,
@@ -110,7 +110,7 @@ export function createPaletteRegistryFromLayoutState(
 ): DesktopToolsetRegistry {
   return createDesktopToolsetRegistry(
     layoutState,
-    new Set([...SHELL_COMMAND_IDS, ...commandSpecs.map((command) => command.id)]),
+    new Set([...SHELL_COMMAND_IDS, ...commandSpecs.filter(command => command.source === "plugin").map(command => command.id)]),
     pluginToolsets
   );
 }
@@ -133,12 +133,14 @@ function pendingPlaceholderToolset(toolsetId: string): DesktopToolsetDefinition 
 
 export function PaletteWindow({
   toolsetId = "core.main",
+  resizable = false,
   // Interim seam so tests (and, until Phase 4's definition-push, callers) can supply a
   // registry that already includes plugin toolsets. Defaults to the core registry.
   initialRegistry,
   platform = detectDesktopShortcutPlatform()
 }: {
   toolsetId?: string;
+  resizable?: boolean;
   initialRegistry?: DesktopToolsetRegistry;
   platform?: ShortcutPlatform;
 }) {
@@ -219,7 +221,9 @@ export function PaletteWindow({
     [knownToolset, commandOverrides, toolset.id, toolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings]
   );
   const itemGroups = useMemo(() => paletteGroups.map((group) => group.items), [paletteGroups]);
-  const gridWindowSize = useMemo(() => computePaletteGridSize(toolset.gridLayout, itemGroups), [itemGroups, toolset.gridLayout]);
+  const { width: fallbackWidth, height: fallbackHeight } = useMemo(
+    () => initialToolsetWindowSize(toolset, itemGroups), [itemGroups, toolset]
+  );
   // The main window owns live command metadata/availability and publishes snapshots to detached
   // palettes. The state initializer above is only a first-paint fallback before that handshake.
   // Snapshots arrive already remapped for the active keybinding scheme; re-applying here covers the
@@ -228,19 +232,10 @@ export function PaletteWindow({
     () => applyKeybindingSchemeToCommands(commandSpecs, keybindingScheme),
     [commandSpecs, keybindingScheme]
   );
-  // Same rule as the main window's in-place gallery: transitional stubs are not draggable onto
-  // toolbars. The declared stub set is used rather than the snapshot's enabled state.
-  const galleryCommands = useMemo(() => {
-    // The shipped manifest, not `toolsetRegistry` — see the matching note in MainWindow. Keyed off
-    // the user's customized layout, removing a tool would delete it from the list they would add it
-    // back with.
-    const shipped = new Set(getToolsetCommandSpecs(desktopToolsetRegistry).map((command) => command.id));
-    return allCommands.filter((command) =>
-      !isCompoundLayoutCommandHidden(command.id, compoundLayoutSettings) &&
-      !TRANSITIONAL_STUB_COMMAND_IDS.has(command.id) &&
-      !isCompatOnlyArtVariantCommandId(command.id, shipped)
-    );
-  }, [allCommands, compoundLayoutSettings]);
+  const galleryCommands = useMemo(
+    () => filterToolbarCustomizationCommands(allCommands, compoundLayoutSettings),
+    [allCommands, compoundLayoutSettings]
+  );
   const shortcutRegistry = useMemo(
     () => createDesktopShortcutRegistry(allCommands, { includeDisabled: true, platform }),
     [allCommands, platform]
@@ -447,10 +442,51 @@ export function PaletteWindow({
   }, [platform]);
 
   useEffect(() => {
-    const preferredSize = toolset.preferredWindowSize ?? gridWindowSize;
-    if (!preferredSize) {
-      return;
-    }
+    if (!resizable || !knownToolset || !isDesktopRuntime()) return;
+
+    let disposed = false;
+    let timer: number | undefined;
+    let unlisten: (() => void) | undefined;
+    // Let a native drag cross the screen edge before bringing the full frame back into view.
+    const scheduleClamp = () => {
+      if (disposed) return;
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        void clampCurrentInspectorFrame().catch(() => undefined);
+      }, 150);
+    };
+    // Taskbar or Dock changes can shrink the work area without a move or a webview resize.
+    let lastArea: string | undefined;
+    let checking = false;
+    const checkWorkArea = async () => {
+      if (checking || document.hidden) return;
+      checking = true;
+      try {
+        const { left, top, right, bottom } = await currentWindowLogicalWorkArea();
+        const area = `${left}:${top}:${right}:${bottom}`;
+        if (lastArea !== undefined && lastArea !== area) scheduleClamp();
+        lastArea = area;
+      } finally {
+        checking = false;
+      }
+    };
+    const check = () => { void checkWorkArea().catch(() => undefined); };
+    check();
+    const areaTimer = window.setInterval(check, 1000);
+    void listenForCurrentWindowWorkAreaChanges(scheduleClamp).then(cleanup => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    });
+    return () => {
+      disposed = true;
+      window.clearTimeout(timer);
+      window.clearInterval(areaTimer);
+      unlisten?.();
+    };
+  }, [knownToolset, resizable]);
+
+  useEffect(() => {
+    if (resizable || !knownToolset) return;
 
     const shell = shellRef.current;
     let disposed = false;
@@ -478,9 +514,10 @@ export function PaletteWindow({
         const rect = shell?.getBoundingClientRect();
         const contentWidth = rect ? Math.ceil(rect.width) : 0;
         const contentHeight = rect ? Math.ceil(rect.height) : 0;
-        const width = contentWidth > 0 ? contentWidth : preferredSize.width;
+        const width = contentWidth || fallbackWidth;
         const height = Math.min(availableHeight,
-          Math.max(colorPickerOpen ? 292 : 0, contentHeight > 0 ? contentHeight : preferredSize.height));
+          Math.max(colorPickerOpen ? 292 : 0, contentHeight || fallbackHeight));
+        if (width <= 0 || height <= 0) return;
         // Dev-only size probe: open the palette window's devtools console to read exact
         // content-vs-window numbers for any palette that still looks wrong.
         if (import.meta.env.DEV) {
@@ -531,7 +568,7 @@ export function PaletteWindow({
         sizeAnimationFrameRef.current = undefined;
       }
     };
-  }, [colorPickerOpen, gridWindowSize, toolset.preferredWindowSize]);
+  }, [colorPickerOpen, fallbackHeight, fallbackWidth, knownToolset, resizable, toolset.id]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -1195,6 +1232,7 @@ export function PaletteWindow({
       className="palette-window-shell"
       aria-label={`ChemDraft floating ${toolset.title}`}
       data-toolset-id={toolset.id}
+      data-resizable={resizable || undefined}
       data-palette-drag-surface={customizeThisPalette ? undefined : "true"}
       onPointerDown={startDragFromPaletteSurface}
       onPointerUp={stopPaletteWindowDrag}

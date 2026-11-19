@@ -593,6 +593,14 @@
   },
   {
     "file": "lib.rs",
+    "name": "clamp_current_inspector_frame",
+    "async": false,
+    "generics": "",
+    "parameters": "window: tauri::WebviewWindow",
+    "returnType": "()"
+  },
+  {
+    "file": "lib.rs",
     "name": "resize_toolset_window",
     "async": false,
     "generics": "",
