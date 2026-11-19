@@ -18,7 +18,8 @@ const native = vi.hoisted(() => ({ desktop: true, runtime: undefined as import("
   snapshot: undefined as import("../dialogs/dialogProtocol").DialogMessage | undefined,
   receive: undefined as ((delivery: import("../dialogs/dialogTransport").DialogDelivery) => void) | undefined,
   publish: vi.fn(), writeText: vi.fn(), writeFile: vi.fn(), stat: vi.fn(), fileOpen: vi.fn(), fileRead: vi.fn(), fileClose: vi.fn(), pickOpen: vi.fn(), pickSave: vi.fn(),
-  loadToolbarLayout: vi.fn(async (): Promise<unknown> => undefined)
+  loadToolbarLayout: vi.fn(async (): Promise<unknown> => undefined),
+  saveToolbarLayout: vi.fn(async () => {})
 }));
 vi.mock("../dialogs/dialogTransport", () => ({ nativeDialogTransport: {
   subscribe: async (receive: typeof native.receive) => { native.receive = receive; return () => {}; },
@@ -42,7 +43,8 @@ vi.mock("../window-manager", async original => ({
     window.dispatchEvent(new CustomEvent("chemdraft:native-command", { detail: { commandId } }));
   },
   loadDocumentSession: async () => undefined, saveDocumentSession: async () => {},
-  loadToolsetLayoutState: native.loadToolbarLayout, listToolsetWindowStates: async () => [],
+  loadToolsetLayoutState: native.loadToolbarLayout, saveToolsetLayoutState: native.saveToolbarLayout,
+  listToolsetWindowStates: async () => [],
   setToolbarsMenu: async () => {}, setQuitPromptEnabled: async () => {},
   listenForQuitFlushRequest: async () => () => {}, listenForQuitPromptRequest: async () => () => {}, listenForQuitSettings: async () => () => {}
 }));
@@ -255,6 +257,47 @@ it("opens Layout with the two-column width despite a legacy preferred window siz
   } });
   await command("view.toolset.toggle.core.layout");
   expect(native.open).toHaveBeenCalledWith("core.layout", expect.objectContaining({ width: 60 }));
+});
+
+it("can toggle and cancel Customize Toolbars after loading a newer saved layout", async () => {
+  await mount({ toolbarLayout: {
+    version: 2,
+    toolsetOverrides: [{ toolsetId: "core.layout", visible: true }],
+    userToolsets: []
+  } });
+  expect(container.querySelector('.web-floating-palette[data-toolset-id="core.main"]')).not.toBeNull();
+  expect(native.saveToolbarLayout).not.toHaveBeenCalled();
+  await command("view.customizeToolbars");
+
+  const dialog = ".customize-toolbars-dialog";
+  const palette = '.web-floating-palette[data-toolset-id="core.layout"]';
+  const visibility = container.querySelector<HTMLInputElement>(`${dialog} [data-toolset-id="core.layout"] .customize-toolset-visible`)!;
+  expect(visibility.checked).toBe(false);
+  await act(async () => visibility.click());
+  expect(visibility.checked).toBe(true);
+  expect(container.querySelector(palette)).not.toBeNull();
+
+  await clickToolbarButton(".customize-toolbars-cancel");
+  expect(container.querySelector(dialog)).toBeNull();
+  expect(container.querySelector(palette)).toBeNull();
+});
+
+it("opens a toolbar with a malformed saved addition without rewriting the layout at startup", async () => {
+  const malformedId = "atom.problem.open.mol%2E1.a0";
+  await mount({ toolbarLayout: {
+    version: 1,
+    toolsetOverrides: [{
+      toolsetId: "core.layout", visible: true,
+      itemAdditions: [
+        { groupId: "core.layout.tools", item: { commandId: malformedId } },
+        { groupId: "core.layout.tools", item: { commandId: "edit.undo" } }
+      ]
+    }],
+    userToolsets: []
+  } });
+  expect(console.warn).toHaveBeenCalledWith(expect.stringContaining(malformedId));
+  expect(native.open).toHaveBeenCalledWith("core.layout", expect.anything());
+  expect(native.saveToolbarLayout).not.toHaveBeenCalled();
 });
 
 it.each([

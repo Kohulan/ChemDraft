@@ -4112,22 +4112,28 @@ export function MainWindow({
         if (layoutState !== undefined) {
           // Preserve historical Main defaults and fold pre-flatten layouts before anything consumes
           // them; the visibility save below persists the migrated state and its defaults revision.
-          const warn = (warning: string) => console.warn(warning);
-          const migrated = parseToolsetLayoutState(migrateMainToolbarDefaultsLayoutState(layoutState, warn), warn);
+          let migrated: unknown = layoutState;
+          let parsed: ToolsetLayoutState | undefined;
+          try {
+            migrated = migrateMainToolbarDefaultsLayoutState(layoutState);
+            parsed = parseToolsetLayoutState(migrated);
+          } catch {
+            // The catalog can still render valid siblings of a malformed addition. Only the
+            // strictly parsed layout can seed the startup visibility save.
+          }
           toolbarCatalog.setLayoutState(migrated);
           const nextRegistry = toolbarCatalog.registry();
           setWebPalettePositions(createDefaultToolsetPositions(nextRegistry));
           // The registry's default-visible set already reflects the saved toolsetOverrides[].visible,
           // so this restores exactly the palettes the user last had open.
           setVisibleToolsetIds(createDefaultVisibleToolsetIds(nextRegistry));
-          layoutStateRef.current = migrated;
+          layoutStateRef.current = parsed;
         }
 
-        // Initial load finished and the file read cleanly. Record which toolsets we've resolved
-        // visibility for, and allow saves to persist — a save now merges onto the file we just read
-        // rather than replacing it.
+        // Record which toolsets we've resolved visibility for. A startup save may merge onto a
+        // validated layout or create a file when there was none.
         resolvedToolsetIdsRef.current = new Set(toolbarCatalog.registry().listToolsets().map((toolset) => toolset.id));
-        layoutSaveEnabledRef.current = true;
+        layoutSaveEnabledRef.current = layoutState === undefined || layoutStateRef.current !== undefined;
         layoutHydratedRef.current = true;
         setNativeToolsetLayoutReady(true);
       })
@@ -13593,7 +13599,7 @@ export function MainWindow({
   // persist. `closeDialog` distinguishes the Customize dialog's live edits (each visibility toggle
   // applies immediately — no draft that can drift out of sync) from a final close.
   const commitToolbarLayout = useCallback((next: ToolsetLayoutState, closeDialog: boolean) => {
-    next = parseToolsetLayoutState(withCurrentMainToolbarDefaults(next), warning => console.warn(warning));
+    next = withCurrentMainToolbarDefaults(next);
     toolbarCatalog.setLayoutState(next);
     const nextRegistry = toolbarCatalog.registry();
     const nextVisible = createDefaultVisibleToolsetIds(nextRegistry);
@@ -13609,7 +13615,13 @@ export function MainWindow({
       }
     }
     setVisibleToolsetIds(nextVisible);
-    layoutStateRef.current = next;
+    try {
+      layoutStateRef.current = parseToolsetLayoutState(next);
+    } catch {
+      // A displayed layout can omit an invalid addition. Only a valid edit can be saved.
+      layoutSaveEnabledRef.current = false;
+      return;
+    }
     resolvedToolsetIdsRef.current = new Set(nextRegistry.listToolsets().map((toolset) => toolset.id));
     layoutSaveEnabledRef.current = true;
     // Push the new state into the open palette webviews NOW (they built their toolbar once, at

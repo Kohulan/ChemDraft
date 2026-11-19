@@ -1,15 +1,9 @@
 import { describe, expect, it } from "vitest";
-import {
-  TOOLSET_LAYOUT_SESSION_FALLBACK_WARNING,
-  ToolsetLayoutStateSchema,
-  isToolsetLayoutSessionFallback,
-  parseToolsetLayoutState
-} from "@chemdraft/toolset-registry";
+import { parseToolsetLayoutState } from "@chemdraft/toolset-registry";
 import { ToolsetLayoutStateSchema as ReleasedLayoutSchema } from "../__fixtures__/toolbarLayoutSchema-v1.1.1";
 import fixture from "../__fixtures__/toolbarLayoutDowngrade.json";
 import { createDesktopToolsetRegistry, getToolsetItemGroups, migrateMainToolbarDefaultsLayoutState } from "../toolsets";
 import { MAIN_TOOLBAR_DEFAULTS_REVISION, mergeVisibilityIntoLayoutState, withCurrentMainToolbarDefaults } from "./toolbarLayoutState";
-import { createToolbarCatalog } from "./toolbarCatalog";
 
 // Rust's toolbar_customization_persistence_tests compare the actual files written by the native
 // command helpers with this SAME fixture. Validate those bytes against the frozen released schema,
@@ -96,25 +90,5 @@ describe("v1.1.1 toolbar layout downgrade contract", () => {
     expect(ids).toContain("tool.doubleBond");
     expect(ids).toContain("tool.tripleBond");
     expect(ids).not.toContain("tool.chain");
-  });
-
-  it("keeps the startup save gate closed for session defaults", () => {
-    const saved = { ...fixture.legacyState, version: 2 };
-    const warnings: string[] = [];
-    const warn = (warning: string) => warnings.push(warning);
-    const catalog = createToolbarCatalog();
-    const defaults = catalog.registry();
-    const recovered = parseToolsetLayoutState(migrateMainToolbarDefaultsLayoutState(saved, warn), warn);
-
-    expect(ToolsetLayoutStateSchema.parse(recovered)).toEqual({
-      version: 1, toolsetOverrides: [], userToolsets: []
-    });
-    expect(isToolsetLayoutSessionFallback(recovered)).toBe(true);
-    expect(warnings).toEqual([TOOLSET_LAYOUT_SESSION_FALLBACK_WARNING]);
-    // Startup and explicit customization both call this before enabling any disk writes.
-    expect(() => catalog.setLayoutState(recovered)).toThrow(TOOLSET_LAYOUT_SESSION_FALLBACK_WARNING);
-    expect(() => catalog.setLayoutState(current)).toThrow(TOOLSET_LAYOUT_SESSION_FALLBACK_WARNING);
-    expect(catalog.registry()).toBe(defaults);
-    expect(saved).toEqual({ ...fixture.legacyState, version: 2 });
   });
 });

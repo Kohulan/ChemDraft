@@ -1,11 +1,10 @@
 import { z } from "zod";
 
 const NonEmptyStringSchema = z.string().trim().min(1);
-const INVALID_COMMAND_ID_MESSAGE = "Command IDs must be non-empty identifiers without whitespace.";
-const CommandIdSchema = z.string({
-  required_error: INVALID_COMMAND_ID_MESSAGE,
-  invalid_type_error: INVALID_COMMAND_ID_MESSAGE
-}).trim().regex(/^[A-Za-z0-9]+(?:[._:-][A-Za-z0-9]+)*$/, INVALID_COMMAND_ID_MESSAGE);
+const CommandIdSchema = NonEmptyStringSchema.regex(
+  /^[A-Za-z0-9]+(?:[._:-][A-Za-z0-9]+)*$/,
+  "Command IDs must be non-empty identifiers without whitespace."
+);
 
 export function isValidToolsetCommandId(id: string): boolean {
   return CommandIdSchema.safeParse(id).success;
@@ -546,196 +545,9 @@ export function normalizeToolsetDefinitions<TIcon extends string = string, TAsse
 }
 
 export function parseToolsetLayoutState<TIcon extends string = string, TAssetName extends string = string>(
-  state: unknown,
-  onWarning?: (warning: string) => void
+  state: unknown
 ): ToolsetLayoutState<TIcon, TAssetName> {
-  if (!onWarning) {
-    return ToolsetLayoutStateSchema.parse(state) as ToolsetLayoutState<TIcon, TAssetName>;
-  }
-
-  const warn = (warning: string) => {
-    try {
-      onWarning(warning);
-    } catch {
-      // A warning listener must not interrupt loading the layout.
-    }
-  };
-  const defaults: ToolsetLayoutState<TIcon, TAssetName> & { [sessionFallback]: true } = {
-    version: 1, toolsetOverrides: [], userToolsets: [], [sessionFallback]: true
-  };
-  try {
-    if (isToolsetLayoutSessionFallback(state)) return defaults;
-
-    const envelope = repairLayoutPart(LayoutEnvelopeSchema, state, []);
-    if (envelope) {
-      const warnings = envelope.warnings;
-      const toolsetOverrides = repairLayoutEntries(UserToolsetOverrideSchema, envelope.data.toolsetOverrides, "toolsetOverrides", warnings);
-      const userToolsets = repairLayoutEntries(UserToolsetDefinitionSchema, envelope.data.userToolsets, "userToolsets", warnings);
-      const repaired = ToolsetLayoutStateSchema.parse({ ...envelope.data, toolsetOverrides, userToolsets });
-      warnings.forEach(warn);
-      return repaired as ToolsetLayoutState<TIcon, TAssetName>;
-    }
-  } catch {
-    // An unreadable envelope cannot be repaired safely.
-  }
-  warn(TOOLSET_LAYOUT_SESSION_FALLBACK_WARNING);
-  return defaults;
-}
-
-export const TOOLSET_LAYOUT_SESSION_FALLBACK_WARNING =
-  "Could not recover the saved toolbar layout. Using defaults for this session and keeping the saved file untouched.";
-
-// The marker survives desktop migration spreads and stays outside the saved schema.
-const sessionFallback = Symbol("toolsetLayoutSessionFallback");
-
-export function isToolsetLayoutSessionFallback(state: unknown): boolean {
-  return layoutProperty(state, sessionFallback) === true;
-}
-
-// Validate the envelope without opening individual toolsets. A validator or read error in one
-// entry can then be caught at that entry while every other toolset is recovered independently.
-const LayoutEnvelopeSchema = ToolsetLayoutStateSchema.extend({
-  toolsetOverrides: z.custom<unknown[]>(Array.isArray).default([]),
-  userToolsets: z.custom<unknown[]>(Array.isArray).default([])
-});
-const MAX_LAYOUT_REPAIR_PASSES = 12;
-
-type LayoutPath = (string | number)[];
-type LayoutRemoval = { path: LayoutPath; schema?: z.ZodTypeAny };
-
-function repairLayoutEntries<T>(
-  schema: z.ZodType<T, z.ZodTypeDef, unknown>,
-  entries: unknown[],
-  collection: "toolsetOverrides" | "userToolsets",
-  warnings: string[]
-): T[] {
-  const recovered: T[] = [];
-  for (let index = 0; index < entries.length; index++) {
-    const path = [collection, index];
-    let reason = "it could not be validated";
-    try {
-      const result = repairLayoutPart(schema, entries[index], path);
-      if (result) {
-        recovered.push(result.data);
-        warnings.push(...result.warnings);
-        continue;
-      }
-    } catch {
-      reason = "an unexpected error interrupted repair";
-    }
-    const description = collection === "toolsetOverrides" ? "toolset override" : "user toolset";
-    warnings.push(`Toolbar customization dropped the ${description} at ${formatLayoutPath(path)} because ${reason}.`);
-  }
-  return recovered;
-}
-
-function repairLayoutPart<T>(
-  schema: z.ZodType<T, z.ZodTypeDef, unknown>,
-  value: unknown,
-  scope: LayoutPath
-): { data: T; warnings: string[] } | undefined {
-  const warnings: string[] = [];
-  for (let pass = 0; pass <= MAX_LAYOUT_REPAIR_PASSES; pass++) {
-    const result = schema.safeParse(value);
-    if (result.success) return { data: result.data, warnings };
-    if (pass === MAX_LAYOUT_REPAIR_PASSES) break;
-
-    const removals = new Map<string, LayoutRemoval & { reason: string }>();
-    const ancestors = new Set<string>();
-    for (const issue of result.error.issues) {
-      // An unknown key on the envelope may belong to a newer layout format.
-      if (scope.length === 0 && issue.path.length === 0 && issue.code === "unrecognized_keys") return undefined;
-      const paths = issue.code === "unrecognized_keys" ? issue.keys.map(key => [...issue.path, key]) : [issue.path];
-      for (const path of paths) {
-        const removal = smallestLayoutRemoval(schema, value, path);
-        if (!removal) continue;
-        const key = JSON.stringify(removal.path);
-        if (!removals.has(key)) removals.set(key, { ...removal, reason: issue.message });
-        for (let length = 1; length < removal.path.length; length++) {
-          ancestors.add(JSON.stringify(removal.path.slice(0, length)));
-        }
-      }
-    }
-    if (removals.size === 0) return undefined;
-
-    // Retry enclosing refinement errors after repairing their children. Remove array entries
-    // from right to left so each issue still refers to the value the validator identified.
-    const arrayIndex = (path: LayoutPath) => typeof path.at(-1) === "number" ? Number(path.at(-1)) : -1;
-    const edits = [...removals.values()].sort((a, b) => b.path.length - a.path.length || arrayIndex(b.path) - arrayIndex(a.path));
-    for (const removal of edits) {
-      if (ancestors.has(JSON.stringify(removal.path))) continue;
-      const removed = removal.path.reduce<unknown>(layoutProperty, value);
-      const path = formatLayoutPath([...scope, ...removal.path]);
-      const isEntry = typeof removal.path.at(-1) === "number";
-      if (!isEntry && removal.reason === INVALID_COMMAND_ID_MESSAGE) {
-        warnings.push(`Toolbar customization dropped an invalid command ID field at ${path}.`);
-      } else {
-        const item = removal.schema === ToolsetItemAdditionSchema ? layoutProperty(removed, "item") : undefined;
-        const id = layoutProperty(item, "id") ?? layoutProperty(item, "commandId");
-        const description = typeof id === "string" ? `addition "${id}"` : isEntry ? "entry" : "field";
-        warnings.push(`Toolbar customization dropped the ${description} at ${path} (${removal.reason})`);
-      }
-      value = removeLayoutValue(value, removal.path);
-    }
-  }
-  return undefined;
-}
-
-function layoutProperty(value: unknown, key: PropertyKey): unknown {
-  return typeof value === "object" && value !== null && Object.hasOwn(value, key)
-    ? (value as Record<PropertyKey, unknown>)[key]
-    : undefined;
-}
-
-function formatLayoutPath(path: LayoutPath): string {
-  return path.map(key => typeof key === "number" || /^[\w$-]+$/.test(key) ? key : JSON.stringify(key)).join(".");
-}
-
-/** Follow the schema at the issue path. An array entry, record key, or optional object field
- *  can be removed. Required fields delegate removal to the nearest enclosing candidate. */
-function smallestLayoutRemoval(schema: z.ZodTypeAny, value: unknown, path: LayoutPath): LayoutRemoval | undefined {
-  const [key, ...rest] = path;
-  if (key === undefined) return undefined;
-  if (schema instanceof z.ZodEffects) return smallestLayoutRemoval(schema.innerType(), value, path);
-  if (schema instanceof z.ZodOptional || schema instanceof z.ZodNullable) {
-    return smallestLayoutRemoval(schema.unwrap(), value, path);
-  }
-  if (schema instanceof z.ZodDefault) return smallestLayoutRemoval(schema.removeDefault(), value, path);
-  if (schema instanceof z.ZodDiscriminatedUnion) {
-    const discriminator = layoutProperty(value, schema.discriminator) as Parameters<typeof schema.optionsMap.get>[0];
-    const variant = schema.optionsMap.get(discriminator);
-    return variant && smallestLayoutRemoval(variant, value, path);
-  }
-
-  let child: z.ZodTypeAny | undefined;
-  let removable = true;
-  if (schema instanceof z.ZodArray && typeof key === "number") {
-    child = schema.element;
-  } else if (schema instanceof z.ZodRecord && typeof key === "string") {
-    child = schema.valueSchema;
-  } else if (schema instanceof z.ZodObject && typeof key === "string") {
-    child = layoutProperty(schema.shape, key) as z.ZodTypeAny | undefined;
-    removable = !child || child.isOptional();
-  } else {
-    return undefined;
-  }
-  const nested = child && smallestLayoutRemoval(child, layoutProperty(value, key), rest);
-  if (nested) return { ...nested, path: [key, ...nested.path] };
-  return removable ? { path: [key], schema: child } : undefined;
-}
-
-function removeLayoutValue(value: unknown, path: LayoutPath): unknown {
-  const [key, ...rest] = path;
-  if (Array.isArray(value) && typeof key === "number") {
-    const copy: unknown[] = value.slice();
-    if (rest.length === 0) copy.splice(key, 1);
-    else copy[key] = removeLayoutValue(copy[key], rest);
-    return copy;
-  }
-  const copy = { ...(value as Record<string, unknown>) };
-  if (rest.length === 0) delete copy[key];
-  else copy[key] = removeLayoutValue(layoutProperty(value, key), rest);
-  return copy;
+  return ToolsetLayoutStateSchema.parse(state) as ToolsetLayoutState<TIcon, TAssetName>;
 }
 
 export function applyToolsetLayoutState<TIcon extends string = string, TAssetName extends string = string>(
@@ -743,9 +555,7 @@ export function applyToolsetLayoutState<TIcon extends string = string, TAssetNam
   state: unknown,
   options: ApplyToolsetLayoutStateOptions = {}
 ): ToolsetDefinition<TIcon, TAssetName>[] {
-  const onUnknownCommand = options.onUnknownCommand ?? "throw";
-  const warn = options.onWarning ?? (() => undefined);
-  const parsed = parseToolsetLayoutState<TIcon, TAssetName>(state, onUnknownCommand === "prune" ? warn : undefined);
+  const parsed = parseToolsetLayoutState<TIcon, TAssetName>(state);
   const commandIds = new Set(commandIdSetFromOptions(toolsets, options));
   // Toolbar-launcher commands are generated by the registry itself rather than declared by a
   // manifest item or the app's static shell catalog. They are nevertheless valid toolbar targets
@@ -753,6 +563,8 @@ export function applyToolsetLayoutState<TIcon extends string = string, TAssetNam
   for (const toolset of [...toolsets, ...parsed.userToolsets]) {
     commandIds.add(createToolsetToggleCommandId(toolset.id));
   }
+  const onUnknownCommand = options.onUnknownCommand ?? "throw";
+  const warn = options.onWarning ?? (() => undefined);
   const baseToolsets = toolsets.map(cloneToolset);
   const userToolsets = parsed.userToolsets
     .map(cloneToolset)

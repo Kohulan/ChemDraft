@@ -1,16 +1,11 @@
 import {
-  TOOLSET_LAYOUT_SESSION_FALLBACK_WARNING,
   ToolsetRegistry,
-  applyToolsetLayoutState,
-  isToolsetLayoutSessionFallback,
   isValidToolsetCommandId
 } from "@chemdraft/toolset-registry";
 import type { CommandDefinition } from "@chemdraft/plugin-host";
 import { allPaletteCommands, type CommandSpec } from "../commands";
-import { desktopToolsets, desktopToolsetRegistry, migrateBracketToolbarOrder, type DesktopToolsetDefinition, type DesktopToolsetRegistry } from "../toolsets";
+import { createDesktopToolsetRegistry, desktopToolsets, desktopToolsetRegistry, type DesktopToolsetDefinition, type DesktopToolsetRegistry } from "../toolsets";
 import { SHELL_COMMAND_IDS } from "../shellCommandIds";
-import type { IconName } from "../icons";
-import type { ToolbarAssetName } from "../toolbarAssets";
 
 /**
  * The data brain for toolbars: it composes the effective toolset set from three inputs —
@@ -39,33 +34,24 @@ export function createToolbarCatalog(): ToolbarCatalog {
   let baseCommands = allPaletteCommands(desktopToolsetRegistry);
   let additionalCommandIds = SHELL_COMMAND_IDS;
   let layoutState: unknown;
-  let savedLayoutUnavailable = false;
   let warningList: readonly string[] = [];
   const listeners = new Set<() => void>();
 
-  const build = (): DesktopToolsetRegistry => {
-    const combined = [...desktopToolsets, ...pluginToolsets];
-    if (layoutState === undefined || layoutState === null) {
-      warningList = [];
-      return new ToolsetRegistry<IconName, ToolbarAssetName>(combined);
-    }
-
+  const build = (state: unknown): DesktopToolsetRegistry => {
     const warnings: string[] = [];
-    const applied = applyToolsetLayoutState<IconName, ToolbarAssetName>(combined, migrateBracketToolbarOrder(layoutState), {
-      // In-place customize can add any shell command, not just manifest ones — treat the whole
-      // catalog as valid so those additions aren't pruned as "unknown" on render.
-      additionalCommandIds,
-      onUnknownCommand: "prune",
-      onWarning: (warning) => warnings.push(warning)
+    const registry = createDesktopToolsetRegistry(state, additionalCommandIds, pluginToolsets, warning => {
+      warnings.push(warning);
+      console.warn(warning);
     });
     warningList = warnings;
-    return new ToolsetRegistry<IconName, ToolbarAssetName>(applied);
+    return registry;
   };
 
-  let snapshot = build();
+  let snapshot = build(layoutState);
 
-  const rebuild = () => {
-    snapshot = build();
+  const rebuild = (state: unknown) => {
+    snapshot = build(state);
+    layoutState = state;
     listeners.forEach((listener) => listener());
   };
 
@@ -94,15 +80,10 @@ export function createToolbarCatalog(): ToolbarCatalog {
       }
       baseCommands = [...commandsById.values()];
       additionalCommandIds = new Set([...SHELL_COMMAND_IDS, ...pluginCommandIds]);
-      rebuild();
+      rebuild(layoutState);
     },
     setLayoutState(state) {
-      // MainWindow only enables saving after the catalog accepts the loaded layout. Keep that
-      // gate closed for session defaults and refuse later edits that would replace the saved file.
-      savedLayoutUnavailable ||= isToolsetLayoutSessionFallback(state);
-      if (savedLayoutUnavailable) throw new Error(TOOLSET_LAYOUT_SESSION_FALLBACK_WARNING);
-      layoutState = state;
-      rebuild();
+      rebuild(state);
     },
     warnings: () => warningList,
     onDidChange(listener) {

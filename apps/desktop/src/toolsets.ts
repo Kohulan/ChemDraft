@@ -3,6 +3,7 @@ import {
   applyToolsetLayoutState,
   createToolbarsMenuModel,
   createToolsetToggleCommandDefinitions,
+  isValidToolsetCommandId,
   mergeToolsetItemAdditions,
   normalizeToolsetDefinition,
   parseToolsetLayoutState,
@@ -14,7 +15,8 @@ import {
   type ToolsetDefinition,
   type ToolsetGroupDefinition,
   type ToolsetItemAddition,
-  type ToolsetItemDefinition
+  type ToolsetItemDefinition,
+  type UserToolsetOverride
 } from "@chemdraft/toolset-registry";
 import { detectShortcutPlatform, parseShortcutDisplay, type ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import { isCompoundLayoutCommand, isCompoundLayoutCommandHidden, type CompoundLayoutSettings, loadCompoundLayoutSettings } from "./compoundLayoutSettings";
@@ -100,7 +102,8 @@ export function createDesktopToolsetRegistry(
   // palette webview learns about them over the definitions IPC channel and passes them here so its
   // registry can resolve a plugin toolset window (instead of falling back to the Main toolbar). Empty
   // for the core-only case and every existing caller.
-  pluginToolsets: readonly DesktopToolsetDefinition[] = []
+  pluginToolsets: readonly DesktopToolsetDefinition[] = [],
+  onWarning: (warning: string) => void = warning => console.warn(warning)
 ): DesktopToolsetRegistry {
   const base = pluginToolsets.length > 0 ? [...desktopToolsets, ...pluginToolsets] : desktopToolsets;
   const toolsets = layoutState === undefined || layoutState === null
@@ -110,14 +113,62 @@ export function createDesktopToolsetRegistry(
     // shell commands (e.g. edit.undo) count as valid targets so they aren't pruned as "unknown".
     : applyToolsetLayoutState<IconName, ToolbarAssetName>(
         base,
-        migrateMainToolbarDefaultsLayoutState(layoutState, warning => console.warn(warning)),
+        migrateMainToolbarDefaultsLayoutState(skipMalformedToolbarAdditions(layoutState, onWarning)),
         {
           additionalCommandIds,
-          onUnknownCommand: "prune"
+          onUnknownCommand: "prune",
+          onWarning
         }
       );
 
   return new ToolsetRegistry<IconName, ToolbarAssetName>(toolsets);
+}
+
+/** Omit malformed additions and their invalid references from this rebuild's input only. */
+function skipMalformedToolbarAdditions(state: unknown, warn: (warning: string) => void): unknown {
+  if (typeof state !== "object" || state === null) return state;
+  const layout = state as { toolsetOverrides?: unknown };
+  if (!Array.isArray(layout.toolsetOverrides)) return state;
+
+  let changed = false;
+  const toolsetOverrides = layout.toolsetOverrides.map((entry: unknown) => {
+    if (typeof entry !== "object" || entry === null) return entry;
+    const override = entry as UserToolsetOverride;
+    if (!Array.isArray(override.itemAdditions)) return entry;
+
+    const malformedIds = new Set<string>();
+    const itemAdditions = override.itemAdditions.filter(addition => {
+      const item = addition?.item;
+      const commandIds = [item?.commandId, item?.primary?.type === "command" ? item.primary.commandId : undefined];
+      if (Array.isArray(item?.submenu?.items)) {
+        commandIds.push(...item.submenu.items.map(command => command?.commandId));
+      }
+      const invalidIds = new Set(commandIds.filter(
+        (id): id is string => typeof id === "string" && !isValidToolsetCommandId(id)
+      ));
+      for (const id of invalidIds) {
+        malformedIds.add(id);
+        warn(`Toolbar customization for "${override.toolsetId}" skipped addition with malformed command "${id}".`);
+      }
+      return invalidIds.size === 0;
+    });
+    if (malformedIds.size === 0) return entry;
+
+    changed = true;
+    const keep = (id: string) => !malformedIds.has(id);
+    return {
+      ...override,
+      itemAdditions,
+      hiddenCommandIds: Array.isArray(override.hiddenCommandIds) ? override.hiddenCommandIds.filter(keep) : override.hiddenCommandIds,
+      itemOverrides: Array.isArray(override.itemOverrides)
+        ? override.itemOverrides.filter(item => !item || keep(item.commandId))
+        : override.itemOverrides,
+      itemOrder: override.itemOrder && typeof override.itemOrder === "object" && !Array.isArray(override.itemOrder)
+        ? Object.fromEntries(Object.entries(override.itemOrder).map(([group, ids]) => [group, Array.isArray(ids) ? ids.filter(keep) : ids]))
+        : override.itemOrder
+    };
+  });
+  return changed ? { ...state, toolsetOverrides } : state;
 }
 
 /** The Main toolbar's original manifest groups, in display order — kept only so persisted state from
@@ -170,7 +221,7 @@ function revisionOneMainToolbarGroups(): ToolsetGroupDefinition<IconName, Toolba
  * Complete the old order before adding Chain back, since addition indices precede reorder/hide and
  * were measured against the old manifest. Keep a top-level marker even when no Main override exists.
  */
-export function migrateMainToolbarDefaultsLayoutState(state: unknown, onInvalidCommand?: (warning: string) => void): unknown {
+export function migrateMainToolbarDefaultsLayoutState(state: unknown): unknown {
   if (typeof state === "object" && state !== null &&
       (state as { mainToolbarDefaultsMetadataUnavailable?: unknown }).mainToolbarDefaultsMetadataUnavailable === true) {
     const { mainToolbarDefaultsMetadataUnavailable: _, ...loaded } = state as Record<string, unknown>;
@@ -180,8 +231,7 @@ export function migrateMainToolbarDefaultsLayoutState(state: unknown, onInvalidC
     // sets this hint. A v1.1.1 file with no side file has no hint and gets the original migration
     // below. Consume the IPC-only hint before parsing/broadcasting/saving.
     const parsed = parseToolsetLayoutState(
-      migrateLegacyMainToolbarLayoutState(migrateRenamedCommandIdsInLayoutState(loaded)),
-      onInvalidCommand
+      migrateLegacyMainToolbarLayoutState(migrateRenamedCommandIdsInLayoutState(loaded))
     );
     // An explicit order naming Triple without an addition proves it was a manifest button.
     // Preserve that known layout even when its revision side file could not be recovered.
@@ -198,7 +248,7 @@ export function migrateMainToolbarDefaultsLayoutState(state: unknown, onInvalidC
   if (typeof revision === "number" && revision >= MAIN_TOOLBAR_DEFAULTS_REVISION) {
     return legacy;
   }
-  const parsed = parseToolsetLayoutState(legacy, onInvalidCommand);
+  const parsed = parseToolsetLayoutState(legacy);
   if (revision === 1) {
     const previousGroups = revisionOneMainToolbarGroups();
     const tripleIndex = previousGroups[0].items.findIndex(item => item.commandId === "tool.tripleBond");

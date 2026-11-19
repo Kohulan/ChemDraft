@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { applyToolsetLayoutState, parseToolsetLayoutState, type ToolsetLayoutState } from "@chemdraft/toolset-registry";
 import { MAIN_TOOLBAR_DEFAULTS_REVISION, mergeVisibilityIntoLayoutState, withCurrentMainToolbarDefaults } from "./toolbarLayoutState";
 import { createToolbarCatalog } from "./toolbarCatalog";
@@ -76,35 +76,46 @@ describe("mergeVisibilityIntoLayoutState", () => {
   });
 });
 
-describe("Main toolbar defaults migration", () => {
-  it("restores a valid saved sibling addition at startup after dropping a malformed submenu button", () => {
+describe("live toolbar layout rebuild", () => {
+  it.each([undefined, MAIN_TOOLBAR_DEFAULTS_REVISION])("skips invalid saved additions only in the registry (revision %s)", revision => {
     const catalog = createToolbarCatalog();
     const toolsetId = "core.main";
     const groupId = catalog.registry().require(toolsetId).groups[0].id!;
-    const malformedId = "custom.history-menu";
-    const sibling = { groupId, item: { commandId: "edit.undo" } };
+    const malformedId = "atom.problem.open.mol%2E1.a0";
+    const unknownId = "plugin.uninstalled.run";
     const saved = {
-      version: 1, mainToolbarDefaultsRevision: MAIN_TOOLBAR_DEFAULTS_REVISION, toolsetOverrides: [{
-        toolsetId, itemAdditions: [
-          { groupId, item: {
-            id: malformedId, kind: "button", commandId: "bad id", primary: { type: "none" },
-            submenu: { type: "command-grid", items: [{ commandId: "edit.redo" }] }
-          } },
-          sibling
+      version: 1, mainToolbarDefaultsRevision: revision, toolsetOverrides: [{
+        toolsetId,
+        itemOrder: { [groupId]: ["edit.undo", malformedId, "edit.redo"] },
+        itemAdditions: [
+          { groupId, item: { commandId: "edit.undo" } },
+          { groupId, item: { id: malformedId, primary: { type: "command", commandId: malformedId } } },
+          { groupId, item: { commandId: "edit.redo" } },
+          { groupId, item: { commandId: unknownId } }
         ]
       }]
     };
-    const warnings: string[] = [];
-    const warn = (warning: string) => warnings.push(warning);
-    const recovered = parseToolsetLayoutState(migrateMainToolbarDefaultsLayoutState(saved, warn), warn);
-
-    expect(parseToolsetLayoutState(recovered).toolsetOverrides[0].itemAdditions).toEqual([sibling]);
-    expect(warnings).toContainEqual(expect.stringContaining(malformedId));
-    expect(getToolsetItemGroups(toolsetId, catalog.registry()).flat().map(item => item.id)).not.toContain("edit.undo");
-    catalog.setLayoutState(recovered);
-    expect(getToolsetItemGroups(toolsetId, catalog.registry()).flat().map(item => item.id)).toContain("edit.undo");
+    const before = structuredClone(saved);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(() => parseToolsetLayoutState(saved)).toThrow();
+      expect(() => catalog.setLayoutState(saved)).not.toThrow();
+      expect(() => catalog.setPluginToolsets([])).not.toThrow();
+      const ids = getToolsetItemGroups(toolsetId, catalog.registry()).flat().map(item => item.id);
+      expect(ids.slice(0, 2)).toEqual(["edit.undo", "edit.redo"]);
+      expect(ids).toContain("tool.bond");
+      expect(ids).not.toContain(malformedId);
+      expect(ids).not.toContain(unknownId);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(malformedId));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(unknownId));
+      expect(saved).toEqual(before);
+    } finally {
+      warn.mockRestore();
+    }
   });
+});
 
+describe("Main toolbar defaults migration", () => {
   it.each([undefined, 1, 2])("preserves a saved standalone Wavy button without duplicates (revision %s)", revision => {
     const state = { version: 1, mainToolbarDefaultsRevision: revision, userToolsets: [], toolsetOverrides: [{
       toolsetId: "core.main",
