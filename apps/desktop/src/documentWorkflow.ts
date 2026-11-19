@@ -28,6 +28,8 @@ import { buildTableObject, pageConstrainedShift } from "@chemdraft/document-work
 import { planTableLayout, planTextObjectPlacement, tableVisualBoundsForArrangement, textAutoSizePageLimits, transformPointForObject, rotatedGraphicLocalBounds } from "@chemdraft/layout-engine";
 import { validTableDimensions, type TableInsertDimensions } from "./dialogs/insertTableOptions";
 import { doubleBondStereoState, perceivedSpecifiedDoubleBondIds } from "./interaction/doubleBondStereo";
+import { separateProjectedStereoLigands, serializeSpin3dMolfile, type Spin3dStereoIssue, type Spin3dStereoReference } from "./interaction/spin3dStereo";
+import { projectPoint } from "./interaction/rotation3d";
 import { loadDrawingSettings } from "./drawingSettings";
 import type { storedCoordinatesMatchStereo } from "@chemdraft/ocl-adapter";
 import type { DoubleBondStereoReader } from "./interaction/doubleBondStereo";
@@ -17770,6 +17772,8 @@ export interface FlattenSpunOutcome {
   warnings: FlattenWarning[];
   refusalReasons: string[];
   stereoCenters: StereoCenterReport[];
+  /** Present when a same-side depiction correction made a near-collinear E/Z assignment readable. */
+  depictionCoords3d?: Float64Array;
 }
 
 // ---------------------------------------------------------------------------
@@ -18522,7 +18526,8 @@ export function flattenSpunMolecule(
   coords3d: ArrayLike<number>,
   viewMatrix: ViewMatrix,
   options: { placement?: ScreenPlacement; stereoCenterAtomIds?: ReadonlySet<string>; perceiveStereo?: StereoPerceiver;
-    perceiveDoubleBondStereo?: DoubleBondStereoReader; specifiedDoubleBondIds?: ReadonlySet<string> } = {}
+    perceiveDoubleBondStereo?: DoubleBondStereoReader; specifiedDoubleBondIds?: ReadonlySet<string>;
+    stereoReference?: Spin3dStereoReference } = {}
 ): FlattenSpunOutcome {
   let pageId: string | undefined;
   let molecule: MoleculeObject | undefined;
@@ -18544,7 +18549,80 @@ export function flattenSpunMolecule(
     };
   }
   const page = document.pages.find(candidate => candidate.id === pageId);
-  const result = flattenNativeMolecule3d(molecule, coords3d, viewMatrix, { ...options, bounds: page });
+  const stereo = options.stereoReference;
+  const geometryIssue = stereo?.checkGeometry(coords3d, true) ?? stereo?.checkProjectedDoubleBonds(coords3d, viewMatrix);
+  if (geometryIssue) return {
+    document, status: "refused", warnings: [], stereoCenters: [],
+    refusalReasons: [`${geometryIssue} from this view. Rotate slightly and try again.`]
+  };
+  const flatten = (coords: ArrayLike<number>) => {
+    const settings = { ...options, bounds: page,
+      specifiedDoubleBondIds: stereo?.specifiedDoubleBondIds ?? options.specifiedDoubleBondIds };
+    const attempt = flattenNativeMolecule3d(molecule, coords, viewMatrix, settings);
+    if (!stereo || attempt.status === "committed" || !attempt.stereoCenters.length) return attempt;
+    // RDKit has verified the 3D frame. If the usual encoder refuses its markers,
+    // use the same projection and require RDKit to verify a replacement below.
+    return flattenNativeMolecule3d(molecule, coords, viewMatrix, {
+      ...settings, stereoCenterAtomIds: new Set(), perceiveStereo: undefined
+    });
+  };
+  let result = flatten(coords3d);
+  let depictionCoords3d: Float64Array | undefined;
+  if (stereo && result.molecule) {
+    const readBack = (candidate: FlattenNative3DOutcome & { molecule: MoleculeObject }, coords: ArrayLike<number>) => {
+      let issues = stereo.compare(candidate.molecule);
+      const open = new Set(issues.flatMap(issue => issue.kind === "gained" && issue.bond ? [issue.bond.id] : []));
+      if (open.size > 0) {
+        // Make the source's open intent explicit if projection alone would specify E/Z.
+        const next = {
+          ...candidate.molecule,
+          bonds: candidate.molecule.bonds.map(bond => open.has(bond.id) ? { ...bond, stereo: "either" as const } : bond)
+        };
+        next.structure = serializeSpin3dMolfile(next);
+        candidate.molecule = next;
+        issues = stereo.compare(next);
+      }
+      const repeated = repeatedStereoMarkers(candidate.molecule.bonds);
+      if (!repeated.length && !issues.some(issue => issue.centerIndex !== undefined)) return issues;
+      const adjusted = repairSpin3dStereoMarkers(candidate.molecule, issues, repeated, stereo, coords, viewMatrix);
+      if (!adjusted) {
+        return issues.length ? issues : [{
+          kind: "lost" as const, message: "flatten would draw two identical wedge/hash marks at one atom"
+        }];
+      }
+      candidate.molecule = adjusted;
+      candidate.stereoCenters = candidate.stereoCenters.map(center => {
+        const marker = adjusted.bonds.find(bond => bond.fromAtomId === center.atomId && isSpin3dStereoMarker(bond));
+        return marker ? { ...center, wedgeBondId: marker.id, style: marker.display!.bondStyle as "wedge" | "hashed" } : center;
+      });
+      return stereo.compare(adjusted);
+    };
+    const staged = { ...result, molecule: result.molecule };
+    const issues = readBack(staged, coords3d);
+    // Apply only the smallest same-side correction that round trips. Each retry reruns
+    // the projection so any moved bond gets fresh wedge decisions and crossing depths.
+    let verified = issues.length === 0;
+    if (verified) {
+      result = staged;
+    } else {
+      for (const degrees of [1, 2, 4]) {
+        const separated = separateProjectedStereoLigands(coords3d, viewMatrix, issues, degrees);
+        if (!separated || stereo.checkGeometry(separated, true)) continue;
+        const candidate = flatten(separated);
+        if (!candidate.molecule) continue;
+        const staged = { ...candidate, molecule: candidate.molecule };
+        if (readBack(staged, separated).length !== 0) continue;
+        result = staged;
+        depictionCoords3d = separated;
+        verified = true;
+        break;
+      }
+    }
+    if (!verified) return {
+      document, status: "refused", warnings: result.warnings, stereoCenters: result.stereoCenters,
+      refusalReasons: [`${issues[0].message} from this view. Rotate slightly and try again.`]
+    };
+  }
   const { molecule: flattened, crossings, ...outcome } = result;
   if (!flattened || result.status !== "committed") return { document, ...outcome };
   const patches: DocumentPatch[] = [{
@@ -18554,13 +18632,173 @@ export function flattenSpunMolecule(
       structureFormat: flattened.structureFormat
     }
   }];
+  // Carry the mark's existing offset with its atom. Make legacy atom
+  // associations explicit so a crowded projection cannot reassign them.
+  const oldAtoms = new Map(molecule.atoms.map(atom => [atom.id, atom]));
+  const newAtoms = new Map(flattened.atoms.map(atom => [atom.id, atom]));
+  const assignments = page && nativeElectronMarkAssignments(page).anchorByMarkId;
+  for (const mark of page?.objects ?? []) {
+    if (mark.type !== "electron-mark") continue;
+    const owner = assignments && spin3dElectronMarkOwner(mark, assignments);
+    if (owner?.objectId !== objectId) continue;
+    const before = oldAtoms.get(owner.atomId);
+    const after = newAtoms.get(owner.atomId);
+    if (!before || !after) continue;
+    patches.push({ op: "updateObject", objectId: mark.id, changes: {
+      x: mark.x + after.x - before.x, y: mark.y + after.y - before.y, atomAssociation: "explicit",
+      anchor: { kind: "atom", objectId, atomId: owner.atomId }
+    } });
+  }
   for (const crossing of page?.crossings ?? []) {
     if (crossing.bonds.every(ref => ref.objectId === objectId)) {
       patches.push({ op: "clearCrossingOverride", pageId, bonds: crossing.bonds });
     }
   }
   for (const crossing of crossings ?? []) patches.push({ op: "setCrossingOverride", pageId, crossing });
-  return { document: applyPatches(document, patches, { now: phase4Timestamp }), ...outcome };
+  return { document: applyPatches(document, patches, { now: phase4Timestamp }), ...outcome,
+    ...(depictionCoords3d ? { depictionCoords3d } : {}) };
+}
+
+function isSpin3dStereoMarker(bond: MoleculeBond): boolean {
+  return bond.display?.bondStyle === "wedge" || bond.display?.bondStyle === "hashed";
+}
+
+function spin3dElectronMarkOwner(
+  mark: ElectronMarkObject,
+  assignments: ReturnType<typeof nativeElectronMarkAssignments>["anchorByMarkId"]
+) {
+  const anchor = mark.anchor;
+  return anchor.kind === "atom" && anchor.objectId && anchor.atomId
+    ? { objectId: anchor.objectId, atomId: anchor.atomId } : assignments.get(mark.id);
+}
+
+function repairSpin3dStereoMarkers(
+  projected: MoleculeObject, issues: readonly Spin3dStereoIssue[], repeated: readonly RepeatedStereoMarker[], stereo: Spin3dStereoReference,
+  coords: ArrayLike<number>, view: ViewMatrix
+): MoleculeObject | undefined {
+  const affected = new Map<string, "specified" | "open">();
+  for (const issue of issues) {
+    const atom = issue.centerIndex === undefined ? undefined : projected.atoms[issue.centerIndex];
+    if (atom && affected.get(atom.id) !== "specified") {
+      affected.set(atom.id, issue.kind === "gained" ? "open" : "specified");
+    }
+  }
+  const repeatedIds = new Set(repeated.flatMap(entry => entry.bondIds));
+  for (const bond of projected.bonds) {
+    if (repeatedIds.has(bond.id) && !affected.has(bond.fromAtomId)) affected.set(bond.fromAtomId, "specified");
+  }
+  if (!affected.size) return undefined;
+
+  const indices = new Map(projected.atoms.map((atom, index) => [atom.id, index]));
+  const depths = projected.atoms.map((_, index) => {
+    const i = index * 3;
+    return projectPoint(view, [coords[i], coords[i + 1], coords[i + 2]])[2];
+  });
+  const lengths = projected.bonds.map(bond => {
+    const from = projected.atoms[indices.get(bond.fromAtomId)!];
+    const to = projected.atoms[indices.get(bond.toAtomId)!];
+    return Math.hypot(to.x - from.x, to.y - from.y);
+  });
+  const minLength = Math.max(1e-6, DEFAULT_MIN_PROJECTED_BOND_LENGTH_FRACTION * medianOf(lengths.filter(length => length > 0)));
+  const bonds: MoleculeBond[] = projected.bonds.map(bond => {
+    if (!isSpin3dStereoMarker(bond) || !affected.has(bond.fromAtomId)) return bond;
+    const { bondStyle: _removed, ...display } = bond.display!;
+    return { ...bond, display };
+  });
+  const centers = [...affected].filter(([, status]) => status === "specified").map(([id]) => id);
+  const choices = centers.map(centerId => {
+    const center = indices.get(centerId)!;
+    return bonds.flatMap((bond, index) => {
+      if (bond.order !== "single" || bond.display?.bondStyle === "wavy" || isSpin3dStereoMarker(bond)) return [];
+      const neighborId = bond.fromAtomId === centerId ? bond.toAtomId : bond.toAtomId === centerId ? bond.fromAtomId : undefined;
+      if (!neighborId) return [];
+      const neighbor = indices.get(neighborId)!;
+      const depth = depths[neighbor] - depths[center];
+      const length = lengths[index];
+      if (length < minLength) return [];
+      return (["wedge", "hashed"] as const).flatMap(style => {
+        const alignment = style === "wedge" ? depth : -depth;
+        if (alignment < -1e-6) return [];
+        const marker = { ...bond, fromAtomId: centerId, toAtomId: neighborId, display: { ...bond.display, bondStyle: style } };
+        return [{ index, marker, alignment, length }];
+      });
+    }).sort((a, b) => b.alignment - a.alignment || b.length - a.length);
+  });
+
+  // Test complete assignments. A symmetric ring can need both markers
+  // before RDKit can distinguish either stereocenter.
+  let remaining = 256;
+  const search = (i: number): MoleculeObject | undefined => {
+    if (i === choices.length) {
+      const trial = { ...projected, bonds: bonds.slice() };
+      trial.structure = serializeSpin3dMolfile(trial);
+      return !stereo.compare(trial).some(issue => issue.centerIndex !== undefined) ? trial : undefined;
+    }
+    for (const choice of choices[i]) {
+      const original = bonds[choice.index];
+      if (isSpin3dStereoMarker(original)) continue;
+      if (--remaining < 0) return undefined;
+      bonds[choice.index] = choice.marker;
+      if (!repeatedStereoMarkers(bonds).length) {
+        const resolved = search(i + 1);
+        if (resolved) return resolved;
+      }
+      bonds[choice.index] = original;
+    }
+    return undefined;
+  };
+  return search(0);
+}
+
+/** Check the normalized document that will be installed, including stationary marks
+ * that may otherwise acquire a new atom association as the molecule moves. */
+export function assertSpin3dDocumentIdentity(
+  before: ChemDraftDocument, after: ChemDraftDocument, stereo: Spin3dStereoReference
+): void {
+  const nextMolecules = new Map(after.pages.flatMap(page => page.objects.flatMap(object =>
+    object.type === "molecule" ? [[object.id, object] as const] : [])));
+  for (const page of before.pages) {
+    for (const molecule of page.objects) {
+      if (molecule.type !== "molecule") continue;
+      const next = nextMolecules.get(molecule.id);
+      if (next === molecule) continue;
+      if (!next || next.atoms.length !== molecule.atoms.length) throw new Error("the atom count would change");
+      for (const [index, atom] of molecule.atoms.entries()) {
+        const other = next.atoms[index];
+        if (other.id !== atom.id || other.element !== atom.element) throw new Error(`atom ${atom.id} would change identity`);
+        if (other.formalCharge !== atom.formalCharge) throw new Error(`the formal charge on atom ${atom.id} would change`);
+        if (other.isotope !== atom.isotope) throw new Error(`the isotope on atom ${atom.id} would change`);
+        if ((other.markRadicals ?? 0) !== (atom.markRadicals ?? 0)) throw new Error(`the radicals on atom ${atom.id} would change`);
+      }
+    }
+    const nextPage = after.pages.find(candidate => candidate.id === page.id);
+    if (!nextPage) throw new Error("the rotated page is missing");
+    const originalAssignments = nativeElectronMarkAssignments(page).anchorByMarkId;
+    const nextAssignments = nativeElectronMarkAssignments(nextPage).anchorByMarkId;
+    const nextObjects = new Map(nextPage.objects.map(object => [object.id, object]));
+    for (const mark of page.objects) {
+      if (mark.type !== "electron-mark") continue;
+      const next = nextObjects.get(mark.id);
+      const owner = spin3dElectronMarkOwner(mark, originalAssignments);
+      const nextOwner = next?.type === "electron-mark" ? spin3dElectronMarkOwner(next, nextAssignments) : undefined;
+      if (next?.type !== "electron-mark" || owner?.objectId !== nextOwner?.objectId || owner?.atomId !== nextOwner?.atomId ||
+          (owner && (next.anchor.kind !== "atom" || next.anchor.objectId !== owner.objectId || next.anchor.atomId !== owner.atomId))) {
+        throw new Error(`the atom association of the ${mark.markKind} mark ${mark.id} would change`);
+      }
+      if (owner?.objectId !== stereo.source.id) continue;
+      const atom = stereo.source.atoms.find(candidate => candidate.id === owner.atomId);
+      const moved = nextMolecules.get(owner.objectId)?.atoms.find(candidate => candidate.id === owner.atomId);
+      const from = nativeChargeMarkCenter(mark);
+      const to = nativeChargeMarkCenter(next);
+      if (!atom || !moved || Math.hypot(to.x - moved.x - (from.x - atom.x), to.y - moved.y - (from.y - atom.y)) > 1e-6) {
+        throw new Error(`the ${mark.markKind} mark ${mark.id} would move away from its atom`);
+      }
+    }
+  }
+  const target = nextMolecules.get(stereo.source.id);
+  if (!target) throw new Error("the rotated molecule is missing");
+  const issue = stereo.checkIdentity(target);
+  if (issue) throw new Error(issue);
 }
 
 /** Pure molecule-level Spin 3D flatten. Shared by document commits and plugin 3D chemistry:
@@ -18849,11 +19087,7 @@ export function flattenNativeMolecule3d(
   // orders so a literal atom keeps its valence, and anything the writer could not keep is reported
   // with the flatten rather than stored silently.
   const useV3000 = stagedMolecule.atoms.length > 999 || stagedMolecule.bonds.length > 999;
-  const structure = (useV3000 ? moleculeToMolfileV3000 : moleculeToMolfileV2000)(stagedMolecule, {
-    fromDocFrame: true,
-    warnings: structureWarnings,
-    kekuleBondOrders: nativeBondOrderResolution(stagedMolecule.atoms, stagedMolecule.bonds).kekuleOrders
-  }).contents;
+  const structure = serializeSpin3dMolfile(stagedMolecule, structureWarnings);
   mark("flatten.serialize");
 
   return {
