@@ -1,4 +1,5 @@
 import type { BracketObject, ChemDraftDocument, DocumentObject, MoleculeObject } from "./schemas";
+import { bracketPairSemantics } from "./bracketSemantics";
 import { resolveRepeatUnitAtomMembership, type RepeatUnitMembershipOptions } from "./repeatUnitMembership";
 
 /** Pair identities are page-local and require exactly one opening and one closing glyph. */
@@ -52,16 +53,12 @@ export function bracketChemistryWarnings(document: ChemDraftDocument, molecule: 
 function chemistryWarningsForPairs(pairs: ReadonlyMap<string, BracketObject[]>, molecule: MoleculeObject,
   objects: readonly DocumentObject[], options: RepeatUnitMembershipOptions = {}) {
   return [...pairs].flatMap(([pairId, pair]) => {
-    const usage = pair.find(object => object.bracketUsage && object.bracketUsage !== "generic")?.bracketUsage ??
-      (pair.some(object => object.repeatUnit || object.bracketKind === "polymer") ? "sru" : "generic");
+    const { usage, closing, label, count } = bracketPairSemantics(pair);
     if (usage === "generic") return [];
     const membership = resolveRepeatUnitAtomMembership(pair, objects, options);
     if (!membership.referencedObjectIds.has(molecule.id)) return [];
-    const closing = pair.find(object => object.side === "close")!;
-    const count = pair.find(object => object.repeatCount !== undefined)?.repeatCount;
-    const label = closing.label === undefined ? "n" : closing.label || "(unassociated label)";
     const description = usage === "multiple" ? `a multiple group x${count ?? "?"}` : usage === "sru" ?
-      `a repeat unit ${label}; polymer formula not computed` : "a bracket group with unknown usage";
+      `a repeat unit ${label || "(unassociated label)"}; polymer formula not computed` : "a bracket group with unknown usage";
     return [{ pairId, objectId: closing.id, message: membership.reason
       ? `Repeat unit membership for bracket ${closing.id} cannot be resolved: ${membership.reason}. Molecule ${molecule.id} cannot be analyzed as a finite graph.`
       : `Molecule ${molecule.id} is inside ${description}; values and molecular graph exports are for one drawn copy only.` }];

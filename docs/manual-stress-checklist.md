@@ -317,6 +317,16 @@ must still be blocked by CSP without host permission. On macOS, confirm the entr
 worker still load directly from `tauri://localhost` with working prediction. In a Windows web
 preview, confirm construction remains native; classic and cross-origin calls must remain unchanged.
 
+Request tools (packaged macOS and Windows builds): load an installed API 0.1.26 worker in
+WKWebView (macOS) and WebView2 (Windows). In each build, start a request
+from tab A, switch to tab B, then finish a write to A. Verify B stays unchanged and the worker
+gets distinct active-document keys. Repeat with a write that needs more page space. Verify
+**Keep Page Size** preserves the page dimensions and **Enlarge** fits the content with one
+labelled Undo entry. Close the request tab or cancel the request while the question is open.
+An affirmative answer after cancellation must leave the drawing unchanged. Replace a pristine
+tab by opening a file, then disable the plugin and switch tabs. Verify the old request and its
+session have ended and the disabled worker receives no later notifications.
+
 Plugin panel focus (both macOS and Windows): open/re-show a panel from Analyze or a plugin command;
 click a panel button, heading, chart, empty area and title/drag area, hover its controls and scroll.
 Buttons must run exactly once and hover feedback must work; after each ordinary click the drawing
@@ -845,7 +855,7 @@ and Art toolbars open, including at 125%/150% display scale:
   Before insertion, expect exactly one native box: "This doesn't fit on the page. Enlarge the page
   to fit? Content on the page may shift to make room." with Enlarge / Keep Page Size. Enlarge and all content undo together; Keep Page Size keeps
   the exact proposed positions without resizing. Fitting content asks nothing. Repeat with an
-  assistant request containing several tool calls and direct patches: only one question per request,
+  legacy assistant request containing several tool calls and direct patches: only one question per request,
   one Undo, and Redo never reopens the question. Check template/table dialogs targeting an inactive
   tab, changes or tab closure while a question is pending, and Stop during an assistant question.
   Duplicate, structure-editor Save, Spin Flatten/Release and native ring/bracket/symbol/art stamps

@@ -1,5 +1,6 @@
 export { normalizeAtomIsotope } from "./isotopes";
 export { rGroupNumberFromLabel } from "./rGroups";
+export { bracketPairSemantics, bracketUsageSemantics, importedBracketUsage } from "./bracketSemantics";
 export { bracketPairs, withoutBracketPairMetadata, bracketChemistryWarnings, withBracketChemistryWarnings, moleculeBracketWarningMessages } from "./brackets";
 export { resolveRepeatUnitAtomMembership, type RepeatUnitAtomMembership, type RepeatUnitMembershipOptions } from "./repeatUnitMembership";
 export { rotatePointAboutCenter } from "./pointRotation";

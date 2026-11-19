@@ -1,4 +1,5 @@
 import { CdxmlBracketAtomSnapshotSchema, type BracketObject, type DocumentObject, type MoleculeObject, type MoleculeAtom, type Point } from "./schemas";
+import { bracketUsageSemantics } from "./bracketSemantics";
 import { rotatePointAboutCenter } from "./pointRotation";
 
 export type RepeatUnitMembershipOptions = {
@@ -97,7 +98,7 @@ export function resolveRepeatUnitAtomMembership(
   }
   reason ??= !members.length ? "its atom membership is empty" :
     crossingReason(pair, members, objects.filter((object): object is MoleculeObject => object.type === "molecule"),
-      !imported && pair.some(object => object.bracketUsage === "multiple") ? explicit : new Set<string>());
+      !imported && bracketUsageSemantics(pair).usage === "multiple" ? explicit : new Set<string>());
   return { members, crossingAtomIds, referencedObjectIds, imported: imported !== undefined,
     unresolved: reason !== undefined, connectivity: imported?.connectivity, reason };
 }

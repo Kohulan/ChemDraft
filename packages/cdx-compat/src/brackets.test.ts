@@ -45,6 +45,27 @@ function rotatedPartialUnit(rotation: number) {
 }
 
 describe("native bracket group interchange", () => {
+  it("round-trips legacy polymer usage, subscript and atom membership through visible CDXML and CDX", () => {
+    const { document, brackets } = rotatedPartialUnit(0);
+    for (const bracket of brackets) {
+      bracket.bracketKind = "polymer";
+      delete bracket.repeatUnit;
+    }
+    const expected = { usage: "sru", label: "n" };
+    const [original] = repeatUnits(document);
+    expect(original).toMatchObject(expected);
+    expect(original.members[0].atomIds).toEqual(["a1", "a2", "a3"]);
+    const options = { embedNativePayload: false };
+    for (const reopened of [openChemDraftPayload(exportDocumentToCdxml(document, options).contents),
+      importCdx(exportDocumentToCdx(document, options).bytes)]) {
+      const [unit] = repeatUnits(reopened.document!);
+      expect(unit).toMatchObject(expected);
+      const [member] = unit.members;
+      expect(member.molecule.atoms.filter(atom => member.atomIds.includes(atom.id)).map(atom => atom.x))
+        .toEqual([20, 40, 60].map(x => expect.closeTo(x, 3)));
+    }
+  });
+
   it.each([90, 37])("exports and reimports the enclosed subset in the renderer's %s degree frame", rotation => {
     const { document, molecule, brackets } = rotatedPartialUnit(rotation);
     expect(resolveRepeatUnitAtomMembership(brackets, document.pages[0].objects)).toMatchObject({

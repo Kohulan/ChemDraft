@@ -3,6 +3,10 @@ import {
   ChemDraftDocumentSchema,
   DocumentSchemaVersion,
   atomicNumberForElementSymbol,
+  bracketPairs,
+  bracketPairSemantics,
+  bracketUsageSemantics,
+  importedBracketUsage,
   createEmptyDocument,
   readSerializedDocument,
   drawnLabelBondSide,
@@ -18,6 +22,7 @@ import {
   type ArrowObject,
   type BondRef,
   type BracketObject,
+  type RepeatUnitAtomMembership,
   type CdxmlBracketAtomSnapshot,
   type ChemDraftDocument,
   type CompatibilityWarning,
@@ -1520,20 +1525,6 @@ function bracketSourceState(object: BracketObject): string {
   return JSON.stringify([object.bracketUsage, object.repeatUnit, object.repeatCount, object.label]);
 }
 
-function bracketUsageAttribute(pair: BracketObject[]): string | undefined {
-  const usage = pair.find(object => object.bracketUsage && object.bracketUsage !== "generic")?.bracketUsage;
-  if (usage === "multiple") return "MultipleGroup";
-  if (usage === "sru" || pair.some(object => object.repeatUnit)) return "SRU";
-  if (usage === "unknown") {
-    const raw = pair[0].compatibility?.unknown.bracketedGroup;
-    const attrs = isRecord(raw) ? preservedCurveAttributes(raw.attributes) : {};
-    const graphic = pair.map(object => object.compatibility?.unknown.cdxmlBracket)
-      .find(raw => isRecord(raw) && isRecord(raw.attributes) && raw.attributes.BracketUsage);
-    return attrs.BracketUsage ?? (isRecord(graphic) ? preservedCurveAttributes(graphic.attributes).BracketUsage : undefined) ?? "Unspecified";
-  }
-  return undefined;
-}
-
 function bracketGeometryKey(object: BracketObject): string {
   return JSON.stringify([object.x, object.y, object.width, object.height, object.rotation, object.bracketKind, object.side]);
 }
@@ -1567,80 +1558,102 @@ function exportBracketGlyph(object: BracketObject, context: VisibleExportContext
     if (index !== undefined) attrs.color = String(index);
   }
   if (object.compatibility?.unknown.cdxmlBracketState !== bracketSourceState(object)) {
-    const usage = bracketUsageAttribute([object]);
+    const { cdxmlUsage: usage } = bracketUsageSemantics([object]);
     if (usage) attrs.BracketUsage = usage; else delete attrs.BracketUsage;
   }
   const children = isRecord(raw) ? preservedBracketChildren(raw.children) : "";
   return children ? `<graphic ${xmlAttributes(attrs)}>${children}</graphic>` : `<graphic ${xmlAttributes(attrs)}/>`;
 }
 
+type NativeBracketMember = { objectId: string; atomId?: string };
+type BracketMember = NativeBracketMember | { sourceId: string };
+
+/** The visible CDXML and binary CDX group before allocating file-local IDs.
+ * Keep source-only subscripts and references in the identity checked by request writes. */
+export function visibleBracketGroup(pair: readonly BracketObject[], semantics: ReturnType<typeof bracketPairSemantics>,
+  membership: RepeatUnitAtomMembership, objectsById: ReadonlyMap<string, DocumentObject>,
+  hasExportId: (member: NativeBracketMember) => boolean = () => true) {
+  const { closing, cdxmlUsage, label, count } = semantics;
+  const source = closing.compatibility?.unknown;
+  const raw = source?.bracketedGroup;
+  const attrs = isRecord(raw) ? preservedCurveAttributes(raw.attributes) : {};
+  const unchanged = pair.every(object => object.compatibility?.unknown.cdxmlBracketState === bracketSourceState(object));
+  const invalidCount = source?.cdxmlBracketInvalidRepeatCount !== undefined;
+  const retainSource = unchanged || invalidCount;
+  const sruLabel = !invalidCount && cdxmlUsage === "SRU" && (closing.label !== "" || attrs.SRULabel !== undefined || !unchanged)
+    ? label : retainSource ? attrs.SRULabel : undefined;
+  const repeatCount = count !== undefined ? String(count) : retainSource ? attrs.RepeatCount : undefined;
+  const membershipUnchanged = pair.every(object => object.compatibility?.unknown.cdxmlBracketMembership === JSON.stringify(object.containedObjectIds));
+  const requested = new Set(pair.flatMap(object => object.containedObjectIds));
+  const records = source?.cdxmlBracketMembers;
+  const members: BracketMember[] = [];
+  const dropped: string[] = [];
+  for (const sourceId of splitCdxmlIdList(attrs.BracketedObjectIDs)) {
+    const record = Array.isArray(records) ? records.find(entry => isRecord(entry) && entry.sourceId === sourceId) : undefined;
+    if (isRecord(record) && typeof record.objectId === "string") {
+      const object = objectsById.get(record.objectId);
+      if (object && (typeof record.atomId === "string"
+        ? object.type === "molecule" && object.atoms.some(atom => atom.id === record.atomId)
+        : object.type !== "molecule" || membershipUnchanged || requested.has(object.id))) {
+        const member = typeof record.atomId === "string" ? { objectId: object.id, atomId: record.atomId } : { objectId: object.id };
+        if (hasExportId(member)) {
+          members.push(member);
+          continue;
+        }
+      }
+    } else if (membershipUnchanged) {
+      members.push({ sourceId });
+      continue;
+    }
+    dropped.push(sourceId);
+  }
+  if (!membershipUnchanged || attrs.BracketedObjectIDs === undefined) {
+    for (const { molecule, atomIds } of membership.members) {
+      if (requested.has(molecule.id)) members.push({ objectId: molecule.id });
+      else for (const atomId of atomIds) members.push({ objectId: molecule.id, atomId });
+    }
+  }
+  return { usage: cdxmlUsage, sruLabel, repeatCount, members, dropped,
+    hasNonMolecularMember: [...requested].some(id => objectsById.get(id)?.type !== "molecule") };
+}
+
 function exportBracketPairs(page: DocumentPage, context: VisibleExportContext, allocator: IdAllocator,
   warnings: CompatibilityConversionWarning[]): string[] {
-  const pairs = new Map<string, BracketObject[]>();
-  for (const object of page.objects) if (object.type === "bracket" && object.pairId) {
-    const pair = pairs.get(object.pairId) ?? []; pair.push(object); pairs.set(object.pairId, pair);
-  }
   const groups: string[] = [];
   const objectsById = new Map(page.objects.map(object => [object.id, object]));
-  for (const pair of pairs.values()) {
-    if (!exportableBracketPair(pair[0], objectsById)) continue;
-    const closing = pair.find(object => object.side === "close")!;
+  for (const pair of bracketPairs(page.objects).values()) {
+    const semantics = bracketPairSemantics(pair);
+    const { closing, count } = semantics;
     const raw = closing.compatibility?.unknown.bracketedGroup;
     const attrs = isRecord(raw) ? preservedCurveAttributes(raw.attributes) : {};
-    const unchanged = pair.every(object => object.compatibility?.unknown.cdxmlBracketState === bracketSourceState(object));
-    const membershipUnchanged = pair.every(object => object.compatibility?.unknown.cdxmlBracketMembership === JSON.stringify(object.containedObjectIds));
-    const requestedMembers = [...new Set(pair.flatMap(object => object.containedObjectIds))];
     const membership = resolveRepeatUnitAtomMembership(pair, page.objects, { atomPosition: transformPointForObject });
-    const members = membership.members.flatMap(member => requestedMembers.includes(member.molecule.id)
-      ? [idFor(context.ids, member.molecule.id, allocator)]
-      : member.atomIds.flatMap(atomId => {
-        const id = context.atomIdsByObjectId.get(member.molecule.id)?.get(atomId);
-        return id ? [id] : [];
-      }));
-    if (requestedMembers.some(id => objectsById.get(id)?.type !== "molecule")) warnings.push({ code: "cdxml.bracket_membership_payload_only", sourceObjectId: closing.id,
+    const memberId = ({ objectId, atomId }: NativeBracketMember) => atomId === undefined
+      ? context.ids.get(objectId) : context.atomIdsByObjectId.get(objectId)?.get(atomId);
+    const group = visibleBracketGroup(pair, semantics, membership, objectsById, member => memberId(member) !== undefined);
+    if (group.hasNonMolecularMember) warnings.push({ code: "cdxml.bracket_membership_payload_only", sourceObjectId: closing.id,
       message: `Bracket membership for missing or non-molecule objects is preserved only in the ChemDraft payload; visible ${context.format} membership includes only resolvable molecule and atom references.` });
-    const memberRecords = closing.compatibility?.unknown.cdxmlBracketMembers;
-    const preservedMembers = splitCdxmlIdList(attrs.BracketedObjectIDs).flatMap(sourceId => {
-      const record = Array.isArray(memberRecords) ? memberRecords.find(record => isRecord(record) && record.sourceId === sourceId) : undefined;
-      if (isRecord(record) && typeof record.objectId === "string") {
-        const member = objectsById.get(record.objectId);
-        // Native edits replace whole-molecule membership; atom membership stays atom-scoped.
-        if (member && (typeof record.atomId === "string"
-          ? member.type === "molecule" && member.atoms.some(atom => atom.id === record.atomId)
-          : member.type !== "molecule" || membershipUnchanged || requestedMembers.includes(member.id))) {
-          const id = typeof record.atomId === "string" ? context.atomIdsByObjectId.get(member.id)?.get(record.atomId) : context.ids.get(member.id);
-          if (id) return [id];
-        }
-      } else if (membershipUnchanged) {
-        // Truly unresolved source references stay opaque until membership changes.
-        return [sourceId];
-      }
-      warnings.push({ code: "cdxml.bracket_member_dropped", sourceObjectId: closing.id,
-        message: `Bracket member "${sourceId}" no longer resolves to an exported member and is NOT written.` });
-      return [];
-    });
-    const exportedMembers = [...new Set([...preservedMembers, ...(membershipUnchanged && attrs.BracketedObjectIDs !== undefined ? [] : members)])];
-    if (bracketUsageAttribute(pair) && membership.unresolved) {
+    for (const sourceId of group.dropped) warnings.push({ code: "cdxml.bracket_member_dropped", sourceObjectId: closing.id,
+      message: `Bracket member "${sourceId}" no longer resolves to an exported member and is NOT written.` });
+    const exportedMembers = [...new Set(group.members.flatMap(member => {
+      if ("sourceId" in member) return [member.sourceId];
+      const id = member.atomId === undefined ? idFor(context.ids, member.objectId, allocator) : memberId(member);
+      return id ? [id] : [];
+    }))];
+    if (group.usage && membership.unresolved) {
       warnings.push({ code: "cdxml.bracket_membership_unresolved", sourceObjectId: closing.id,
         message: `Repeat unit membership for bracket ${closing.id} cannot be resolved: ${membership.reason}; visible ${context.format} writes only known members and retained source references, without guessing enclosure.` });
     }
     if (exportedMembers.length) attrs.BracketedObjectIDs = exportedMembers.join(" ");
     else delete attrs.BracketedObjectIDs;
     attrs.id = attrs.id ? allocator.sourceId(attrs.id) : allocator.next();
-    const usage = bracketUsageAttribute(pair);
-    if (usage) attrs.BracketUsage = usage; else delete attrs.BracketUsage;
+    if (group.usage) attrs.BracketUsage = group.usage; else delete attrs.BracketUsage;
     const invalidRepeatCount = closing.compatibility?.unknown.cdxmlBracketInvalidRepeatCount;
-    const hasInvalidRepeatCount = invalidRepeatCount !== undefined;
-    if (!hasInvalidRepeatCount) {
-      if (usage === "SRU" && (closing.label !== "" || attrs.SRULabel !== undefined || !unchanged)) attrs.SRULabel = closing.label ?? "n";
-      else if (!unchanged) delete attrs.SRULabel;
-    }
-    const count = pair.find(object => object.repeatCount !== undefined)?.repeatCount;
-    if (count !== undefined) {
-      if (hasInvalidRepeatCount) warnings.push({ code: "cdxml.bracket_repeat_count_dropped", sourceObjectId: closing.id,
+    if (group.sruLabel !== undefined) attrs.SRULabel = group.sruLabel; else delete attrs.SRULabel;
+    if (group.repeatCount !== undefined) attrs.RepeatCount = group.repeatCount; else delete attrs.RepeatCount;
+    if (count !== undefined && invalidRepeatCount !== undefined) {
+      warnings.push({ code: "cdxml.bracket_repeat_count_dropped", sourceObjectId: closing.id,
         message: `Bracket RepeatCount "${invalidRepeatCount}" is NOT written because a native repeat count of ${count} replaces it.` });
-      attrs.RepeatCount = String(count);
-    } else if (!unchanged && !hasInvalidRepeatCount) delete attrs.RepeatCount;
+    }
     const attachments = pair.map(object => {
       const source = object.compatibility?.unknown.cdxmlBracketAttachment;
       const attachmentAttrs = isRecord(source) ? preservedCurveAttributes(source.attributes) : {};
@@ -3516,11 +3529,10 @@ function importPageObjects(
       brackets[0].side = "open";
       brackets[1].side = "close";
     }
-    const usageName = group.attributes.BracketUsage ?? brackets.map(bracket => bracket.compatibility?.unknown.cdxmlBracket)
-      .flatMap(raw => isRecord(raw) ? [preservedCurveAttributes(raw.attributes).BracketUsage] : []).find(Boolean);
-    let bracketUsage: BracketObject["bracketUsage"] = usageName === "SRU" ? "sru" : usageName === "MultipleGroup" ? "multiple" : usageName === undefined ? "generic" : "unknown";
+    const importedUsage = importedBracketUsage(brackets, group);
+    let bracketUsage = importedUsage.usage;
     if (bracketUsage === "unknown") warnings.push({ code: "cdxml.bracket_usage_unknown",
-      message: `${sourceFormat} bracket group ${group.attributes.id ?? "(unknown)"} has unknown BracketUsage "${usageName}"; no multiplier is interpreted.` });
+      message: `${sourceFormat} bracket group ${group.attributes.id ?? "(unknown)"} has unknown BracketUsage "${importedUsage.cdxmlUsage}"; no multiplier is interpreted.` });
     const additional = Object.keys(group.attributes).filter(key => !["id", "BracketUsage", "BracketedObjectIDs", "SRULabel", "RepeatCount"].includes(key));
     if (additional.length || group.children.some(child => { const element = elementView(child); return element && element.name !== "bracketattachment"; })) {
       warnings.push({ code: "cdxml.bracket_data_preserved",
