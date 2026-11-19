@@ -18312,7 +18312,7 @@ function relocateRepeatedStereoMarkers(
 
       for (const candidate of source) {
         if (candidate.order !== "single") continue;
-        if (candidate.display?.bondStyle === "wavy") continue;
+        if (candidate.display?.bondStyle === "wavy" || isDativeBond(candidate)) continue;
         const neighborId = candidate.fromAtomId === centerId
           ? candidate.toAtomId
           : candidate.toAtomId === centerId
@@ -18470,7 +18470,7 @@ function relocateRepeatedStereoMarkers(
 
     for (const candidate of depthAligned) {
       if (candidate.order !== "single") continue;
-      if (candidate.display?.bondStyle === "wavy") continue;
+      if (candidate.display?.bondStyle === "wavy" || isDativeBond(candidate)) continue;
       const neighborId = candidate.fromAtomId === centerId
         ? candidate.toAtomId
         : candidate.toAtomId === centerId
@@ -18509,6 +18509,28 @@ function relocateRepeatedStereoMarkers(
   return depthAligned;
 }
 
+/** The native dashed style encodes dative identity, with the donor at fromAtomId. */
+function changedCoordinationBond(before: MoleculeObject, after: MoleculeObject): MoleculeBond | undefined {
+  const pending = new Map(before.bonds.filter(bond => bond.display?.bondStyle === "dashed").map(bond => [bond.id, bond]));
+  for (const bond of after.bonds) {
+    const original = pending.get(bond.id);
+    if (!original) {
+      if (bond.display?.bondStyle === "dashed") return bond;
+      continue;
+    }
+    if (bond.display?.bondStyle !== original.display?.bondStyle || bond.order !== original.order ||
+      bond.fromAtomId !== original.fromAtomId || bond.toAtomId !== original.toAtomId) return original;
+    pending.delete(bond.id);
+  }
+  return pending.values().next().value;
+}
+
+function repeatUnitMembershipKey(pair: readonly BracketObject[], objects: readonly DocumentObject[]) {
+  const { members, unresolved } = resolveRepeatUnitAtomMembership(pair, objects, { atomPosition: transformPointForObject });
+  // The resolver returns members in page-object and molecule-atom order, which flatten preserves.
+  return { unresolved, members: JSON.stringify(members.map(({ molecule, atomIds }) => [molecule.id, atomIds])) };
+}
+
 /**
  * Commit a spun 3D conformer as a flattened 2D perspective depiction (Phase 5).
  *
@@ -18529,17 +18551,15 @@ export function flattenSpunMolecule(
     perceiveDoubleBondStereo?: DoubleBondStereoReader; specifiedDoubleBondIds?: ReadonlySet<string>;
     stereoReference?: Spin3dStereoReference } = {}
 ): FlattenSpunOutcome {
-  let pageId: string | undefined;
-  let molecule: MoleculeObject | undefined;
-  for (const page of document.pages) {
-    const found = page.objects.find((object) => object.id === objectId);
+  let located: { page: DocumentPage; molecule: MoleculeObject } | undefined;
+  for (const candidate of document.pages) {
+    const found = candidate.objects.find((object) => object.id === objectId);
     if (found && found.type === "molecule") {
-      molecule = found;
-      pageId = page.id;
+      located = { page: candidate, molecule: found };
       break;
     }
   }
-  if (!molecule || !pageId || !isEditableNativeMoleculeGraph(molecule)) {
+  if (!located || !isEditableNativeMoleculeGraph(located.molecule)) {
     return {
       document,
       status: "refused",
@@ -18548,7 +18568,7 @@ export function flattenSpunMolecule(
       stereoCenters: []
     };
   }
-  const page = document.pages.find(candidate => candidate.id === pageId);
+  const { page, molecule } = located;
   const stereo = options.stereoReference;
   const geometryIssue = stereo?.checkGeometry(coords3d, true) ?? stereo?.checkProjectedDoubleBonds(coords3d, viewMatrix);
   if (geometryIssue) return {
@@ -18636,10 +18656,10 @@ export function flattenSpunMolecule(
   // associations explicit so a crowded projection cannot reassign them.
   const oldAtoms = new Map(molecule.atoms.map(atom => [atom.id, atom]));
   const newAtoms = new Map(flattened.atoms.map(atom => [atom.id, atom]));
-  const assignments = page && nativeElectronMarkAssignments(page).anchorByMarkId;
-  for (const mark of page?.objects ?? []) {
+  const assignments = nativeElectronMarkAssignments(page).anchorByMarkId;
+  for (const mark of page.objects) {
     if (mark.type !== "electron-mark") continue;
-    const owner = assignments && spin3dElectronMarkOwner(mark, assignments);
+    const owner = spin3dElectronMarkOwner(mark, assignments);
     if (owner?.objectId !== objectId) continue;
     const before = oldAtoms.get(owner.atomId);
     const after = newAtoms.get(owner.atomId);
@@ -18649,14 +18669,51 @@ export function flattenSpunMolecule(
       anchor: { kind: "atom", objectId, atomId: owner.atomId }
     } });
   }
-  for (const crossing of page?.crossings ?? []) {
+  const pageId = page.id;
+  for (const crossing of page.crossings) {
     if (crossing.bonds.every(ref => ref.objectId === objectId)) {
       patches.push({ op: "clearCrossingOverride", pageId, bonds: crossing.bonds });
     }
   }
   for (const crossing of crossings ?? []) patches.push({ op: "setCrossingOverride", pageId, crossing });
-  return { document: applyPatches(document, patches, { now: phase4Timestamp }), ...outcome,
-    ...(depictionCoords3d ? { depictionCoords3d } : {}) };
+  const proposed = applyPatches(document, patches, { now: phase4Timestamp });
+  const repeatPairs = [...bracketPairs(page.objects)].filter(([, pair]) => pair.some(bracket =>
+    bracket.repeatUnit || bracket.bracketKind === "polymer" || bracket.bracketUsage && bracket.bracketUsage !== "generic"));
+  const hasCoordination = [molecule, flattened].some(object => object.bonds.some(bond => bond.display?.bondStyle === "dashed"));
+  const accepted = { ...outcome, ...(depictionCoords3d ? { depictionCoords3d } : {}) };
+  if (!hasCoordination && repeatPairs.length === 0) return { document: proposed, ...accepted };
+
+  // Check the same normalized graph and page geometry that will be committed and copied as MOL.
+  const normalized = normalizeCommittedDocument(proposed);
+  const nextPage = normalized.pages.find(candidate => candidate.id === pageId)!;
+  if (hasCoordination) {
+    const nextMolecule = nextPage.objects.find((object): object is MoleculeObject =>
+      object.id === objectId && object.type === "molecule")!;
+    const bond = changedCoordinationBond(molecule, nextMolecule);
+    if (bond) {
+      const donor = molecule.atoms.find(atom => atom.id === bond.fromAtomId);
+      const acceptor = molecule.atoms.find(atom => atom.id === bond.toAtomId);
+      const label = donor && acceptor ? `${donor.element}→${acceptor.element} coordination bond` : "coordination bond";
+      return { ...outcome, document, status: "refused",
+        refusalReasons: [`the ${label} would change. Rotate slightly and try again.`] };
+    }
+  }
+  if (repeatPairs.length > 0) {
+    const nextPairs = bracketPairs(nextPage.objects);
+    const refusal = repeatPairs.map(([id, pair]) => {
+      const nextPair = nextPairs.get(id);
+      if (!nextPair) return "the polymer bracket would enclose different atoms.";
+      const before = repeatUnitMembershipKey(pair, page.objects);
+      const after = repeatUnitMembershipKey(nextPair, nextPage.objects);
+      if (before.members !== after.members) return "the polymer bracket would enclose different atoms.";
+      if (before.unresolved !== after.unresolved) return after.unresolved
+        ? "the polymer bracket's crossing bonds could no longer be matched from this view. Rotate slightly and try again."
+        : "the polymer bracket's crossing bond resolution would change. Rotate slightly and try again.";
+      return undefined;
+    }).find(reason => reason !== undefined);
+    if (refusal) return { ...outcome, document, status: "refused", refusalReasons: [refusal] };
+  }
+  return { document: normalized, ...accepted };
 }
 
 function isSpin3dStereoMarker(bond: MoleculeBond): boolean {
@@ -18709,7 +18766,7 @@ function repairSpin3dStereoMarkers(
   const choices = centers.map(centerId => {
     const center = indices.get(centerId)!;
     return bonds.flatMap((bond, index) => {
-      if (bond.order !== "single" || bond.display?.bondStyle === "wavy" || isSpin3dStereoMarker(bond)) return [];
+      if (bond.order !== "single" || bond.display?.bondStyle === "wavy" || isDativeBond(bond) || isSpin3dStereoMarker(bond)) return [];
       const neighborId = bond.fromAtomId === centerId ? bond.toAtomId : bond.toAtomId === centerId ? bond.fromAtomId : undefined;
       if (!neighborId) return [];
       const neighbor = indices.get(neighborId)!;
