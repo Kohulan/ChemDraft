@@ -2,13 +2,14 @@
 import { act, createElement, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createEmptyDocument, nativeDrawingStyleFromObjectStyle, type ChemDraftDocument, type ElectronMarkObject, type MoleculeBond, type MoleculeObject } from "@chemdraft/chem-core";
+import { applyPatch, createEmptyDocument, nativeDrawingStyleFromObjectStyle, type ChemDraftDocument, type ElectronMarkObject, type MoleculeBond, type MoleculeObject } from "@chemdraft/chem-core";
 import { createSmilesMolecule } from "@chemdraft/document-workflow-core";
 import * as ocl from "@chemdraft/ocl-adapter";
 import { transformPointForObject } from "@chemdraft/layout-engine";
 import { MainWindow } from "./MainWindow";
-import { cleanUpNativeMolecules2d } from "./documentWorkflow";
+import { cleanUpNativeMolecules2d, copyAsMolfile, insertNativeBracket } from "./documentWorkflow";
 import * as workflow from "./documentWorkflow";
+import { toggleBracketRepeatUnit } from "./bracketCommands";
 import { getAssistantHistoryPort } from "./assistant/historyPort";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 import { DOM_COMMAND_EVENT } from "./window-manager";
@@ -61,6 +62,16 @@ describe("Clean Up Selection command", () => {
     }
     return document;
   }
+  function straightChain() {
+    const document = createEmptyDocument();
+    const molecule: MoleculeObject = { id: "chain", type: "molecule", x: 110, y: 140, width: 120, height: 1, rotation: 0,
+      style: {}, structure: "CCCCC", structureFormat: "smiles", superatoms: [], rGroups: [],
+      atoms: [110, 140, 170, 200, 230].map((x, i) => ({ id: `a${i + 1}`, element: "C", x, y: 140, formalCharge: 0 })),
+      bonds: [1, 2, 3, 4].map(i => ({ id: `b${i}`, fromAtomId: `a${i}`, toAtomId: `a${i + 1}`, order: "single" })) };
+    document.pages[0]!.objects.push(molecule);
+    return { document, molecule };
+  }
+  const chainSru = "SRU 0 ATOMS=(3 2 3 4) XBONDS=(2 1 4) LABEL=n CONNECT=EU";
   async function selectLastBond(molecule: MoleculeObject, pointerId: number) {
     const bond = molecule.bonds.find(bond => [bond.fromAtomId, bond.toAtomId].every(id =>
       [molecule.atoms[8]!.id, molecule.atoms[9]!.id].includes(id)))!;
@@ -352,5 +363,76 @@ describe("Clean Up Selection command", () => {
     await command("structure.cleanup2d");
     expect(objects()).toEqual(expected.pages[0]!.objects);
     expect(current().selection).toEqual(before.selection);
+  });
+
+  it.each(["atom selection", "drawn brackets (v1.2.0 path)"])("preserves the SRU during whole-molecule cleanup after marking %s", async (source) => {
+    const { document, molecule } = straightChain();
+    const marked = source === "atom selection"
+      ? toggleBracketRepeatUnit(document, [{ objectId: molecule.id, kind: "parts", atomIds: ["a2", "a3", "a4"], bondIds: [] }])
+      : toggleBracketRepeatUnit(insertNativeBracket(document, { x: 132, y: 132 }, "square", { x: 208, y: 148 }));
+    await render(applyPatch(marked, { op: "setSelection", objectIds: [molecule.id] }));
+    const before = current();
+    expect(copyAsMolfile(before, "v3000")).toContain(chainSru);
+
+    await command("structure.cleanup2d");
+    const after = current();
+    expect(objects()[0]!.atoms).not.toEqual(molecule.atoms);
+    expect(copyAsMolfile(after, "v3000")).toContain(chainSru);
+    expect(after.selection).toEqual(before.selection);
+    await command("edit.undo");
+    expect(current()).toEqual(before);
+    await command("edit.undo");
+    expect(status()).toBe("Nothing to undo");
+    await command("edit.redo");
+    expect(current()).toEqual(after);
+  });
+
+  it.each(["partial", "mixed"] as const)("preserves a terminal SRU during %s cleanup", async scope => {
+    const { document, molecule } = straightChain();
+    molecule.atoms[4]!.x += 90;
+    molecule.width += 90;
+    const whole = scope === "mixed" ? fixture(2).pages[0]!.objects[1] as MoleculeObject : undefined;
+    if (whole) document.pages[0]!.objects.push(whole);
+    const marked = toggleBracketRepeatUnit(document, [{ objectId: molecule.id, kind: "parts", atomIds: ["a5"], bondIds: [] }]);
+    await render(applyPatch(marked, { op: "setSelection", objectIds: whole ? [whole.id] : [] }));
+    const part = await selectBond(objects()[0]!, molecule.bonds[3]!, 722);
+    expect(part.wrapper().dataset.selectedNativeBondId).toBe(part.bond.id);
+    if (whole) expect(current().selection.objectIds).toContain(whole.id);
+    const before = current();
+    const molfile = (snapshot: ChemDraftDocument) =>
+      copyAsMolfile(applyPatch(snapshot, { op: "setSelection", objectIds: [molecule.id] }), "v3000");
+    const terminalSru = "SRU 0 ATOMS=(1 5) XBONDS=(1 4) LABEL=n CONNECT=EU";
+    expect(molfile(before)).toContain(terminalSru);
+
+    await command("structure.cleanup2d");
+    await vi.waitFor(() => expect(status()).toMatch(/^Cleaned up selected structure/));
+    const after = current();
+    expect(objects()[0]!.atoms[4]).not.toEqual(molecule.atoms[4]);
+    if (whole) expect(objects().find(object => object.id === whole.id)?.atoms).not.toEqual(whole.atoms);
+    expect(molfile(after)).toContain(terminalSru);
+    await command("edit.undo");
+    expect(current()).toEqual(before);
+    await command("edit.redo");
+    expect(current()).toEqual(after);
+  });
+
+  it("refuses whole-molecule cleanup when refitting would enclose another molecule", async () => {
+    const { document, molecule } = straightChain();
+    const cleaned = cleanUpNativeMolecules2d(document, [molecule.id]).pages[0]!.objects[0] as MoleculeObject;
+    const second = cleaned.atoms[1]!, fourth = cleaned.atoms[3]!;
+    const x = (second.x + fourth.x) / 2, y = fourth.y;
+    document.pages[0]!.objects.push({ ...molecule, id: "spectator", x, y, width: 1, height: 1,
+      structure: "C", atoms: [{ ...molecule.atoms[0]!, x, y }], bonds: [] });
+    const marked = toggleBracketRepeatUnit(insertNativeBracket(document, { x: 132, y: 132 }, "square", { x: 208, y: 148 }));
+    const close = marked.pages[0]!.objects.find(object => object.type === "bracket" && object.side === "close")!;
+    await render(applyPatch(marked, { op: "setSelection", objectIds: [molecule.id] }));
+    const before = current();
+    expect(copyAsMolfile(before, "v3000")).toContain(chainSru);
+
+    await command("structure.cleanup2d");
+    expect(status()).toBe(`Clean Up refused: the layout cannot preserve atom membership and crossing bonds for repeat unit "n" (bracket ${close.id}).`);
+    expect(current()).toBe(before);
+    await command("edit.undo");
+    expect(status()).toBe("Nothing to undo");
   });
 });

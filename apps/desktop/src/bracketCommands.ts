@@ -1,5 +1,5 @@
 import { applyPatches, bracketPairs, bracketPairUsage, isRepeatUnitBoundaryBond, resolveRepeatUnitAtomMembership,
-  type BracketObject, type ChemDraftDocument } from "@chemdraft/chem-core";
+  type BracketObject, type ChemDraftDocument, type DocumentPage, type DocumentPatch, type RepeatUnitAtomMembership } from "@chemdraft/chem-core";
 import { transformPointForObject } from "@chemdraft/layout-engine";
 import type { CommandSpec } from "./commands";
 import { nativeBracketPairForDrag } from "./documentWorkflow";
@@ -42,29 +42,9 @@ function prepareAtomRepeatUnit(document: ChemDraftDocument, parts: readonly Nati
     return { reason: "The selected atoms have no crossing bonds to unselected atoms." };
   }
 
-  let left = Infinity, right = -Infinity, top = Infinity, bottom = -Infinity;
-  for (const atom of atoms) {
-    const { x, y } = transformPointForObject(molecule, atom);
-    left = Math.min(left, x);
-    right = Math.max(right, x);
-    top = Math.min(top, y);
-    bottom = Math.max(bottom, y);
-  }
-  // Allow clearance for the glyphs, reducing it when an unselected atom sits just outside the box.
-  let padding = 8;
-  for (const object of page.objects) {
-    if (object.type !== "molecule") continue;
-    for (const atom of object.atoms) {
-      if (object === molecule && atomIds.has(atom.id)) continue;
-      const { x, y } = transformPointForObject(object, atom);
-      const gap = Math.max(left - x, x - right, top - y, y - bottom);
-      padding = Math.min(padding, gap / 2);
-    }
-  }
   const enclosureReason = "A rectangular bracket pair around the selected atoms would also enclose unselected atoms.";
-  if (padding <= 0) return { reason: enclosureReason };
-  const pair = nativeBracketPairForDrag(document, page,
-    { x: left - padding, y: top - padding }, "square", { x: right + padding, y: bottom + padding });
+  const pair = bracketPairAroundAtoms(document, page, new Map([[molecule.id, atomIds]]), "square");
+  if (!pair) return { reason: enclosureReason };
   const membership = resolveRepeatUnitAtomMembership(pair, page.objects, membershipOptions);
   if (membership.members.length !== 1 || membership.members[0].molecule !== molecule ||
     membership.members[0].atomIds.length !== atomIds.size || membership.members[0].atomIds.some(id => !atomIds.has(id))) {
@@ -72,6 +52,97 @@ function prepareAtomRepeatUnit(document: ChemDraftDocument, parts: readonly Nati
   }
   if (membership.reason) return { reason: `The proposed bracket pair cannot be marked because ${membership.reason}.` };
   return { pageId: page.id, pair };
+}
+
+function bracketPairAroundAtoms(document: ChemDraftDocument, page: DocumentPage,
+  memberAtoms: ReadonlyMap<string, ReadonlySet<string>>, bracketKind: BracketObject["bracketKind"]) {
+  let left = Infinity, right = -Infinity, top = Infinity, bottom = -Infinity;
+  const nonMembers = [];
+  for (const molecule of page.objects) {
+    if (molecule.type !== "molecule") continue;
+    for (const atom of molecule.atoms) {
+      const point = transformPointForObject(molecule, atom);
+      if (!memberAtoms.get(molecule.id)?.has(atom.id)) {
+        nonMembers.push(point);
+        continue;
+      }
+      left = Math.min(left, point.x);
+      right = Math.max(right, point.x);
+      top = Math.min(top, point.y);
+      bottom = Math.max(bottom, point.y);
+    }
+  }
+  if (!Number.isFinite(left)) return undefined;
+  // Allow clearance for the glyphs, reducing it when a nonmember atom sits just outside the box.
+  let padding = 8;
+  for (const { x, y } of nonMembers) {
+    const gap = Math.max(left - x, x - right, top - y, y - bottom);
+    padding = Math.min(padding, gap / 2);
+  }
+  if (padding <= 0) return undefined;
+  return nativeBracketPairForDrag(document, page,
+    { x: left - padding, y: top - padding }, bracketKind, { x: right + padding, y: bottom + padding });
+}
+
+function repeatUnitMembershipKey(membership: RepeatUnitAtomMembership): string {
+  return JSON.stringify([
+    membership.reason, membership.connectivity, membership.unresolvedMemberReferences,
+    membership.structureOnlyMembers.map(molecule => molecule.id).sort(),
+    membership.members.map(({ molecule, atomIds }) => {
+      const atoms = new Set(atomIds);
+      return [molecule.id, [...atomIds].sort(),
+        molecule.bonds.filter(bond => isRepeatUnitBoundaryBond(bond, atoms)).map(bond => bond.id).sort()] as const;
+    }).sort(([a], [b]) => a.localeCompare(b))
+  ]);
+}
+
+/** Preserve pre-cleanup SRU membership by refitting native brackets or refusing the layout. */
+export function prepareCleanupRepeatUnits(before: ChemDraftDocument, after: ChemDraftDocument,
+  targetIds: readonly string[]): {
+    document: ChemDraftDocument;
+    assertMembership?: (final: ChemDraftDocument) => void;
+  } {
+  if (after === before || !targetIds.length) return { document: after };
+  const targets = new Set(targetIds);
+  const patches: DocumentPatch[] = [];
+  const checks: ((final: ChemDraftDocument) => void)[] = [];
+  for (const page of before.pages) {
+    const candidate = after.pages.find(next => next.id === page.id);
+    if (!candidate || candidate.objects === page.objects) continue;
+    const pairs = [...bracketPairs(page.objects)].filter(([, pair]) => bracketPairUsage(pair) === "sru");
+    if (!pairs.length) continue;
+    const candidateObjects = new Map(candidate.objects.map(object => [object.id, object]));
+    if (!page.objects.some(object => object.type === "molecule" && targets.has(object.id) &&
+      object !== candidateObjects.get(object.id))) continue;
+    const candidatePairs = bracketPairs(candidate.objects);
+    for (const [pairId, pair] of pairs) {
+      const membership = resolveRepeatUnitAtomMembership(pair, page.objects, membershipOptions);
+      const expected = repeatUnitMembershipKey(membership);
+      const close = pair.find(bracket => bracket.side === "close")!;
+      const refusal = () => new Error(
+        `Clean Up refused: the layout cannot preserve atom membership and crossing bonds for repeat unit "${close.label ?? "n"}" (bracket ${close.id}).`);
+      checks.push(final => {
+        const finalPage = final.pages.find(next => next.id === page.id);
+        const finalPair = finalPage && bracketPairs(finalPage.objects).get(pairId);
+        if (!finalPage || !finalPair || bracketPairUsage(finalPair) !== "sru" ||
+          repeatUnitMembershipKey(resolveRepeatUnitAtomMembership(finalPair, finalPage.objects, membershipOptions)) !== expected) throw refusal();
+      });
+      const candidatePair = candidatePairs.get(pairId);
+      if (candidatePair && repeatUnitMembershipKey(resolveRepeatUnitAtomMembership(candidatePair, candidate.objects, membershipOptions)) === expected) continue;
+      const refit = !membership.imported && !membership.unresolved && bracketPairAroundAtoms(after, candidate,
+        new Map(membership.members.map(({ molecule, atomIds }) => [molecule.id, new Set(atomIds)])), close.bracketKind);
+      if (!refit || !candidatePair) throw refusal();
+      for (const bracket of candidatePair) {
+        const { x, y, width, height, rotation } = refit[bracket.side === "open" ? 0 : 1];
+        patches.push({ op: "updateObject", objectId: bracket.id, changes: { x, y, width, height, rotation } });
+      }
+    }
+  }
+  if (!checks.length) return { document: after };
+  const assertMembership = (final: ChemDraftDocument) => checks.forEach(check => check(final));
+  const document = applyPatches(after, patches, { now: after.updatedAt });
+  assertMembership(document);
+  return { document, assertMembership };
 }
 
 export function createBracketCommands(document: ChemDraftDocument, parts: readonly NativeMoleculePartSelection[] = []): CommandSpec[] {

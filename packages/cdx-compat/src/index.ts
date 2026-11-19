@@ -283,6 +283,9 @@ const defaultCdxmlCornerRadiusFactor = 100;
 // defaults) and is indistinguishable from a drawn one.
 const defaultCdxmlArrowheadSizePx = 16;
 const defaultCdxmlHalfArrowheadSizePx = 14;
+const chemDraftCreationProgram = "ChemDraft";
+const cdxmlEquilibriumShaftSpacing = 300;
+const cdxmlRetrosynthesisShaftSpacing = 600;
 const standardCdxmlColorTable = [
   "#ffffff",
   "#000000",
@@ -346,6 +349,7 @@ interface CdxmlCrossingImportHint {
 
 interface ImportPageContext {
   sourceFormat: "CDXML" | "CDX";
+  isChemDraftSource: boolean;
   /** Import warnings for this page, so object importers can report an approximation in place. */
   warnings: CompatibilityConversionWarning[];
   bondRefsByCdxmlId: Map<string, BondRef>;
@@ -380,7 +384,7 @@ function exportCdxml(
   // full schema pass over every object on each save, and autosave runs after every pause in editing.
   const parsedDocument = isEngineDocument(document) ? document : parseDocument(document);
   const warnings: CompatibilityConversionWarning[] = [];
-  const creationProgram = options.creationProgram ?? "ChemDraft";
+  const creationProgram = options.creationProgram ?? chemDraftCreationProgram;
   // Keep the payload compact and reuse core's version/preservation writer on the validated
   // document. Directly stringifying the active model would save degraded enum values and its
   // internal preservation sidecar, losing the original future fields on the next open.
@@ -2606,7 +2610,8 @@ function exportGraphicAsCdxmlArrow(
  * Head sizing and the exact native shaft gap remain an appearance approximation. */
 function cdxmlArrowShaftAttributes(graphic: GraphicObject): string[] {
   if (!graphic.data.dualShaft) return [];
-  return [`ArrowShaftSpacing="${graphic.data.dualShaftParallel ? 600 : 300}"`];
+  const spacing = graphic.data.dualShaftParallel ? cdxmlRetrosynthesisShaftSpacing : cdxmlEquilibriumShaftSpacing;
+  return [`ArrowShaftSpacing="${spacing}"`];
 }
 
 function cdxmlArrowLineWidthAttributes(graphic: GraphicObject): string[] {
@@ -3209,6 +3214,7 @@ function importVisibleCdxmlFromTree(tree: OrderedXmlTree, sourceFormat: "CDXML" 
   const colorTable = importCdxmlColorTable(tree, warnings);
   const fonts = findElements(tree, "fonttable").flatMap(table => childElements(table, "font").map(font => font.attributes));
   const root = tree.map(elementView).find(element => element?.name.toLowerCase() === "cdxml");
+  const isChemDraftSource = root?.attributes.CreationProgram === chemDraftCreationProgram;
   const curveLineDefaults = cdxmlCurveLineDefaults(root?.attributes ?? {});
   const base = createEmptyDocument({ title: `Imported ${sourceFormat}.chemdraft`, now: nativeImportTimestamp });
   let importedPages: DocumentPage[];
@@ -3217,7 +3223,7 @@ function importVisibleCdxmlFromTree(tree: OrderedXmlTree, sourceFormat: "CDXML" 
       const pageTemplate = importPageSetup(base.pages[0], pageElement.attributes, root?.attributes ?? {});
       restorePageOffset(pageElement, warnings, sourceFormat);
       const importedPage = applyImportTransformToPageObjects(
-        importPageObjects(pageElement, pageIndex, warnings, colorTable, fonts, curveLineDefaults, sourceFormat),
+        importPageObjects(pageElement, pageIndex, warnings, colorTable, fonts, curveLineDefaults, sourceFormat, isChemDraftSource),
         importTransform
       );
       // Preserve page-local tags on their owning page; document-level tags use the first page.
@@ -3324,12 +3330,14 @@ function importPageObjects(
   colorTable: CdxmlColorTable,
   fonts: readonly CdxmlFont[],
   curveLineDefaults: Record<string, string>,
-  sourceFormat: "CDXML" | "CDX"
+  sourceFormat: "CDXML" | "CDX",
+  isChemDraftSource: boolean
 ): { objects: DocumentObject[]; crossings: CrossingOverride[] } {
   const objects: DocumentObject[] = [];
   const bracketGroups: XmlElementView[] = [];
   const context: ImportPageContext = {
     sourceFormat,
+    isChemDraftSource,
     warnings,
     bondRefsByCdxmlId: new Map(),
     zByRefKey: new Map(),
@@ -4924,8 +4932,12 @@ function importArrowGraphic(
 ): GraphicObject {
   const graphic = importShapeGraphic(element, pageIndex, objectIndex, context, "arrow");
   const markers = cdxmlArrowMarkers(element);
-  const spaced = (parseNumber(element.attributes.ArrowShaftSpacing) ?? 0) > 0;
-  const retro = spaced && !markers.markerStart && markers.markerEnd?.kind === "open-arrow" &&
+  const spacing = parseNumber(element.attributes.ArrowShaftSpacing) ?? 0;
+  const spaced = spacing > 0;
+  // ChemDraft's spacing identifies its edited equilibrium arrows with a single open head.
+  const chemDraftEquilibrium = context.isChemDraftSource && spacing === cdxmlEquilibriumShaftSpacing;
+  const retro = spaced && !chemDraftEquilibrium &&
+    !markers.markerStart && markers.markerEnd?.kind === "open-arrow" &&
     normalizedCdxmlToken(element.attributes.ArrowheadType) === "angle";
   // Shaft spacing retains the two-shaft identity even when either or both heads were removed.
   const equilibrium = spaced && !retro;
