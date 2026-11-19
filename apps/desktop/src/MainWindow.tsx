@@ -190,6 +190,7 @@ import { PluginCommandInputSchema, type PluginCommandInput, type PluginPanelRepo
 import { createCoreCommandRegistrar } from "./commands/coreCommandRegistrar";
 import { createFixturePluginOptions, fixturePluginManifest, FIXTURE_PLUGIN_ID } from "./plugins/fixturePlugin";
 import { createToolbarCatalog } from "./toolbars/toolbarCatalog";
+import { filterToolbarCustomizationCommands } from "./toolbars/toolbarCustomizationCommands";
 import { classifyToolbarSelection } from "./toolbars/toolbarSelectionKind";
 import { CustomizeToolbarsDialog } from "./toolbars/CustomizeToolbars/CustomizeToolbarsDialog";
 import { emptyLayoutState } from "./toolbars/CustomizeToolbars/layoutStateEdits";
@@ -477,9 +478,7 @@ import {
   activateDrawingToolCommand,
   createActiveToolState,
   drawingToolStatusLabel,
-  isCompatOnlyArtVariantCommandId,
   isDrawingToolCommand,
-  TRANSITIONAL_STUB_COMMAND_IDS,
   withStandaloneDrawingToolCommands,
   type ActiveToolState
 } from "./drawingTools";
@@ -1788,7 +1787,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.18.15.40-codex";
+const CURRENT_BUILD_STAMP = "11.18.18.30-codex";
 const VibeCodeGuideForm = lazy(() => import("./dialogs/VibeCodeGuideForm").then(module => ({ default: module.VibeCodeGuideForm })));
 const StructureTemplatePicker = lazy(() => import("./dialogs/StructureTemplatePicker").then(module => ({ default: module.StructureTemplatePicker })));
 /** Starts in the background for the document webview under the existing probe gate. */
@@ -13642,36 +13641,16 @@ export function MainWindow({
     [commitToolbarLayout]
   );
 
-  // Command catalog (id + title, deduped) offered by the Customize dialog's "add command" palette.
-  // It follows the effective registry so user/plugin/renamed toolbar launchers appear immediately.
-  const customizeCommandOptions = useMemo(() => {
-    const byId = new Map<string, string>();
-    for (const command of shellCommandSpecs) {
-      if (parseCustomSwatchCommandId(command.id)) continue;
-      if (isCompoundLayoutCommandHidden(command.id, compoundLayoutSettings)) continue;
-      if (!byId.has(command.id)) {
-        byId.set(command.id, command.title ?? command.id);
-      }
-    }
-    return [...byId].map(([id, title]) => ({ id, title }));
-  }, [shellCommandSpecs, compoundLayoutSettings]);
+  const galleryCommands = useMemo(
+    () => filterToolbarCustomizationCommands(shellCommandSpecs, compoundLayoutSettings),
+    [shellCommandSpecs, compoundLayoutSettings]
+  );
 
-  // Full live specs (including current enabled state) for the in-place customize gallery — minus
-  // transitional stubs, which must never be draggable onto a real toolbar. The declared stub set is
-  // used rather than live enabled state, so transiently disabled commands (Undo, align, boolean
-  // ops) stay offered.
-  const galleryCommands = useMemo(() => {
-    // Deliberately the *shipped* manifest, not `toolsetRegistry`. The latter is the user's own
-    // customized layout, so keying off it made the gallery eat its own tail: remove a tool from a
-    // toolbar and it vanishes from the list you would put it back with, permanently. What the build
-    // ships is a fixed fact; what the user has arranged is not.
-    const shipped = new Set(getToolsetCommandSpecs(desktopToolsetRegistry).map((command) => command.id));
-    return shellCommandSpecs.filter((command) =>
-      !isCompoundLayoutCommandHidden(command.id, compoundLayoutSettings) &&
-      !TRANSITIONAL_STUB_COMMAND_IDS.has(command.id) &&
-      !isCompatOnlyArtVariantCommandId(command.id, shipped)
-    );
-  }, [shellCommandSpecs, compoundLayoutSettings]);
+  // Both pickers use the same eligible commands. The custom color widgets manage their own
+  // internal swatch commands in the in-place gallery.
+  const customizeCommandOptions = useMemo(() => {
+    return galleryCommands.filter((command) => !parseCustomSwatchCommandId(command.id));
+  }, [galleryCommands]);
 
   // Command id → title, for the customize-edit applier (an addCommand for a title-less/unknown id is
   // a no-op).

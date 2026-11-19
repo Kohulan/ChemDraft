@@ -2,6 +2,7 @@ import type { ToolsetItemDefinition, ToolsetLayoutState } from "@chemdraft/tools
 import type { ToolsetLayoutEditPayload } from "../../window-manager";
 import {
   addToolsetItemAddition,
+  createCommandToolbarItem,
   nextSeparatorItemId,
   nextSpacerItemId,
   removeToolsetItem,
@@ -97,15 +98,12 @@ export function applyToolsetLayoutEdit<I extends string = string, A extends stri
           context.orderedItemIdsByGroup
         );
       }
-      const item = {
+      const item = createCommandToolbarItem<I, A>({
         id: edit.commandId,
-        kind: "button",
-        label: title,
-        icon: context.commandIcon?.(edit.commandId),
-        assetName: context.commandAssetName?.(edit.commandId),
-        primary: { type: "command", commandId: edit.commandId },
-        submenu: null
-      } as ToolsetItemDefinition<I, A>;
+        title,
+        icon: context.commandIcon?.(edit.commandId) as I | undefined,
+        assetName: context.commandAssetName?.(edit.commandId) as A | undefined
+      });
       const added = addToolsetItemAddition(
         state,
         toolsetId,

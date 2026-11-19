@@ -24,10 +24,10 @@ import { installNativeFlyoutKeyboard } from "./nativeFlyoutKeyboard";
 import { disabledControlAtPointer, installPaletteInputFocus, isPaletteInputFocusPending, paletteInputFocusControl, PALETTE_INPUT_FOCUS_COMMIT_EVENT } from "./plugins/pluginPanelInputFocus";
 import { editHistoryDirection, forceDocumentHistoryCommandId, isCleanPaletteNumberInput, isTextEditingElement } from "./editHistoryRouting";
 import { applyKeybindingSchemeToCommands } from "./keybindingScheme";
-import { isCompoundLayoutCommandHidden } from "./compoundLayoutSettings";
 import { useCompoundLayoutSettings } from "./useCompoundLayoutTools";
 import { loadKeybindingSettings, type KeybindingScheme } from "./keybindingSettings";
 import { TOOLBAR_SELECTION_KINDS, type ToolbarSelectionModel } from "./toolbars/toolbarSelectionKind";
+import { filterToolbarCustomizationCommands } from "./toolbars/toolbarCustomizationCommands";
 import { ToolbarCustomizeController } from "./toolbars/CustomizeMainToolbar/ToolbarCustomizeController";
 import { CustomizeBar } from "./toolbars/CustomizeMainToolbar/CustomizeBar";
 import { GalleryTray } from "./toolbars/CustomizeMainToolbar/GalleryTray";
@@ -37,14 +37,12 @@ import {
   desktopToolsetRegistry,
   compoundLayoutRegistry,
   computePaletteGridSize,
-  getToolsetCommandSpecs,
   getToolsetPaletteGroups,
   paletteCommandGroupsFromItemGroups,
   type DesktopToolsetDefinition,
   type DesktopToolsetRegistry,
   type ToolbarPaletteGroupModel
 } from "./toolsets";
-import { isCompatOnlyArtVariantCommandId, TRANSITIONAL_STUB_COMMAND_IDS } from "./drawingTools";
 import {
   DEFAULT_TOOLSET_ID,
   closeToolsetWindow,
@@ -228,19 +226,10 @@ export function PaletteWindow({
     () => applyKeybindingSchemeToCommands(commandSpecs, keybindingScheme),
     [commandSpecs, keybindingScheme]
   );
-  // Same rule as the main window's in-place gallery: transitional stubs are not draggable onto
-  // toolbars. The declared stub set is used rather than the snapshot's enabled state.
-  const galleryCommands = useMemo(() => {
-    // The shipped manifest, not `toolsetRegistry` — see the matching note in MainWindow. Keyed off
-    // the user's customized layout, removing a tool would delete it from the list they would add it
-    // back with.
-    const shipped = new Set(getToolsetCommandSpecs(desktopToolsetRegistry).map((command) => command.id));
-    return allCommands.filter((command) =>
-      !isCompoundLayoutCommandHidden(command.id, compoundLayoutSettings) &&
-      !TRANSITIONAL_STUB_COMMAND_IDS.has(command.id) &&
-      !isCompatOnlyArtVariantCommandId(command.id, shipped)
-    );
-  }, [allCommands, compoundLayoutSettings]);
+  const galleryCommands = useMemo(
+    () => filterToolbarCustomizationCommands(allCommands, compoundLayoutSettings),
+    [allCommands, compoundLayoutSettings]
+  );
   const shortcutRegistry = useMemo(
     () => createDesktopShortcutRegistry(allCommands, { includeDisabled: true, platform }),
     [allCommands, platform]

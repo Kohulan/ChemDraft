@@ -4109,19 +4109,11 @@ describe("ChemDraft desktop shell", () => {
     expect(mainWindowSource).toContain("replacePresentDocument(drag.startDocument);");
   });
 
-  it("filters transitional stubs and compat-only art variants out of both gallery sources", () => {
-    for (const source of [mainWindowSource, paletteWindowSource]) {
-      expect(source).toContain("!TRANSITIONAL_STUB_COMMAND_IDS.has(command.id)");
-      expect(source).toContain("!isCompatOnlyArtVariantCommandId(command.id, shipped)");
-      // From the SHIPPED manifest, never the user's customized registry. Keyed off the latter the
-      // gallery ate its own tail: remove a tool from a toolbar and it disappeared from the list you
-      // would put it back with, with no way to recover it short of resetting every layout.
-      // (Scoped to this block on purpose — elsewhere, following the customized registry is right.)
-      const filterAt = source.indexOf("!isCompatOnlyArtVariantCommandId(command.id, shipped)");
-      const galleryBlock = source.slice(Math.max(0, filterAt - 600), filterAt);
-      expect(galleryBlock).toContain("getToolsetCommandSpecs(desktopToolsetRegistry)");
-      expect(galleryBlock).not.toContain("getToolsetCommandSpecs(toolsetRegistry)");
-    }
+  it("uses shared command eligibility for the dialog and both in-place gallery sources", () => {
+    expect(mainWindowSource).toContain("filterToolbarCustomizationCommands(shellCommandSpecs, compoundLayoutSettings)");
+    expect(mainWindowSource).toContain("return galleryCommands.filter(");
+    expect(mainWindowSource).toContain("availableCommands={customizeCommandOptions}");
+    expect(paletteWindowSource).toContain("filterToolbarCustomizationCommands(allCommands, compoundLayoutSettings)");
     expect(paletteWindowSource).toContain("commands={galleryCommands}");
   });
 

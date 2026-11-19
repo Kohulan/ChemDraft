@@ -66,6 +66,47 @@ describe("desktop plugin runtime + toolbar catalog", () => {
     expect(catalog.registry().get("core.main")).toBeDefined();
   });
 
+  it("replays saved additions when a plugin and its commands return", () => {
+    const runtime = makeRuntime();
+    const catalog = createToolbarCatalog();
+    const register = () => {
+      runtime.registerPlugin(fixturePluginManifest, createFixturePluginOptions());
+      catalog.setPluginToolsets(runtime.listPluginToolsets());
+    };
+    register();
+    const pluginGroupId = catalog.registry().require(FIXTURE_PLUGIN_TOOLSET_ID).groups[0]!.id;
+    expect(pluginGroupId).toBeTruthy();
+    const mainGroupId = catalog.registry().require("core.main").groups[0]!.id;
+    catalog.setLayoutState({
+      version: 1,
+      userToolsets: [],
+      toolsetOverrides: [
+        {
+          toolsetId: FIXTURE_PLUGIN_TOOLSET_ID,
+          itemAdditions: [{ groupId: pluginGroupId, item: { commandId: "edit.undo" } }]
+        },
+        {
+          toolsetId: "core.main",
+          itemAdditions: [{ groupId: mainGroupId, item: { commandId: FIXTURE_PLUGIN_PING_COMMAND_ID } }]
+        }
+      ]
+    });
+    const commandIds = (toolsetId: string) => catalog.registry().require(toolsetId).groups
+      .flatMap((group) => group.items.map((item) => item.commandId));
+    expect(commandIds(FIXTURE_PLUGIN_TOOLSET_ID)).toContain("edit.undo");
+    expect(commandIds("core.main")).toContain(FIXTURE_PLUGIN_PING_COMMAND_ID);
+
+    runtime.unregisterPlugin(FIXTURE_PLUGIN_ID);
+    catalog.setPluginToolsets(runtime.listPluginToolsets());
+    expect(catalog.registry().get(FIXTURE_PLUGIN_TOOLSET_ID)).toBeUndefined();
+    expect(commandIds("core.main")).not.toContain(FIXTURE_PLUGIN_PING_COMMAND_ID);
+
+    register();
+    expect(catalog.registry().require(FIXTURE_PLUGIN_TOOLSET_ID).groups[0]!.id).toBe(pluginGroupId);
+    expect(commandIds(FIXTURE_PLUGIN_TOOLSET_ID)).toContain("edit.undo");
+    expect(commandIds("core.main")).toContain(FIXTURE_PLUGIN_PING_COMMAND_ID);
+  });
+
   it("forwards selection and panel wiring to plugin command handlers", async () => {
     const runtime = createPluginRuntime({
       commandRegistry: new CommandRegistry(),

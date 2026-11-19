@@ -735,25 +735,35 @@ export function documentIdentityKey(document: ChemDraftDocument | undefined): st
 }
 
 function pluginToolsetToDefinition(contribution: PluginToolsetContribution): DesktopToolsetDefinition {
+  const groupIds = new Set(contribution.groups.map((group) => group.id));
   return {
     id: contribution.id,
     title: contribution.title,
     source: "plugin",
     defaultVisible: contribution.defaultVisible,
     defaultMode: "floating",
-    groups: contribution.groups.map((group) => ({
-      id: group.id,
-      title: group.title,
-      items: group.items.map((item) => ({
-        commandId: item.commandId,
-        title: item.title,
-        // Named fallback keeps the type honest; the real icon rides on iconDataUri.
-        icon: "palette",
-        iconDataUri: item.iconDataUri,
-        shortcutDisplay: item.shortcutDisplay,
-        category: "plugin"
-      }))
-    })),
+    groups: contribution.groups.map((group, index) => {
+      // Overrides need a persisted group ID even when the plugin omits one.
+      let id = group.id;
+      if (id === undefined) {
+        id = `${contribution.id}.group.${index}`;
+        while (groupIds.has(id)) id += "-";
+        groupIds.add(id);
+      }
+      return {
+        id,
+        title: group.title,
+        items: group.items.map((item) => ({
+          commandId: item.commandId,
+          title: item.title,
+          // Named fallback keeps the type honest; the real icon rides on iconDataUri.
+          icon: "palette",
+          iconDataUri: item.iconDataUri,
+          shortcutDisplay: item.shortcutDisplay,
+          category: "plugin"
+        }))
+      };
+    }),
     preferredWindowSize: contribution.preferredWindowSize
   };
 }

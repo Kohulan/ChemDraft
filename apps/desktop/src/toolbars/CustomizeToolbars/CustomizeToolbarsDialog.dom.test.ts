@@ -3,9 +3,16 @@
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ToolsetLayoutState } from "@chemdraft/toolset-registry";
+import { applyToolsetLayoutState, type ToolsetLayoutState } from "@chemdraft/toolset-registry";
+import { SHELL_COMMAND_IDS } from "../../shellCommandIds";
 import type { DesktopToolsetDefinition } from "../../toolsets";
+import { filterToolbarCustomizationCommands } from "../toolbarCustomizationCommands";
 import { CustomizeToolbarsDialog } from "./CustomizeToolbarsDialog";
+
+vi.mock("../../drawingTools", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../drawingTools")>(),
+  TRANSITIONAL_STUB_COMMAND_IDS: new Set(["tool.testStub"])
+}));
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -33,6 +40,14 @@ const baseToolsets: DesktopToolsetDefinition[] = [
     defaultVisible: false,
     defaultMode: "floating",
     groups: [{ id: "core.art.g", items: [{ id: "tool.b", kind: "button", label: "B", primary: { type: "command", commandId: "tool.b" }, submenu: null }] }]
+  },
+  {
+    id: "plugin.fixture",
+    title: "Fixture Toolbar",
+    source: "plugin",
+    defaultVisible: false,
+    defaultMode: "floating",
+    groups: [{ id: "plugin.fixture.g", items: [{ commandId: "plugin.fixture.ping", label: "Ping" }] }]
   }
 ];
 
@@ -44,11 +59,16 @@ describe("CustomizeToolbarsDialog", () => {
   let onApply: ReturnType<typeof vi.fn>;
   let onClose: ReturnType<typeof vi.fn>;
 
-  const availableCommands = [
+  const circle = { id: "tool.art.circle", title: "Circle", icon: "bracket", assetName: "Art_Circle" } as const;
+  const availableCommands = filterToolbarCustomizationCommands([
     { id: "tool.a", title: "A" },
     { id: "tool.b", title: "B" },
-    { id: "tool.circle", title: "Circle" }
-  ];
+    { id: "plugin.fixture.ping", title: "Ping" },
+    circle,
+    { id: "tool.testStub", title: "Unimplemented Test Tool" },
+    { id: "tool.art.rectShadow", title: "Shadow Rectangle" },
+    { id: "edit.undo", title: "Undo", enabled: false, disabledReason: "Nothing to undo" }
+  ], { enabled: false });
 
   function render(state: ToolsetLayoutState = emptyState) {
     onApply = vi.fn();
@@ -60,7 +80,21 @@ describe("CustomizeToolbarsDialog", () => {
 
   function clickButton(predicate: (button: HTMLButtonElement) => boolean) {
     const button = [...container.querySelectorAll("button")].find(predicate);
-    act(() => button?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(button).toBeDefined();
+    act(() => button!.click());
+  }
+
+  function click(selector: string) {
+    const element = container.querySelector<HTMLElement>(selector);
+    expect(element, selector).not.toBeNull();
+    act(() => element!.click());
+  }
+
+  function openPicker() {
+    clickButton((button) => button.textContent === "Add command…");
+    const search = container.querySelector<HTMLInputElement>('[aria-label="Search commands to add"]');
+    expect(search).not.toBeNull();
+    return search!;
   }
 
   function applied(): ToolsetLayoutState {
@@ -83,7 +117,7 @@ describe("CustomizeToolbarsDialog", () => {
   it("renders a row per toolset with current visibility", () => {
     render();
     const rows = container.querySelectorAll("[data-toolset-id]");
-    expect([...rows].map((row) => row.getAttribute("data-toolset-id"))).toEqual(["core.main", "core.art"]);
+    expect([...rows].map((row) => row.getAttribute("data-toolset-id"))).toEqual(["core.main", "core.art", "plugin.fixture"]);
     const mainVisible = container.querySelector<HTMLInputElement>('[data-toolset-id="core.main"] .customize-toolset-visible');
     expect(mainVisible?.checked).toBe(true);
     const artVisible = container.querySelector<HTMLInputElement>('[data-toolset-id="core.art"] .customize-toolset-visible');
@@ -173,15 +207,69 @@ describe("CustomizeToolbarsDialog", () => {
     const nameInput = container.querySelector<HTMLInputElement>('[aria-label="New toolbar name"]');
     act(() => setInputValue(nameInput!, "Mine"));
     clickButton((button) => button.textContent === "Create Toolbar");
-    // The command palette appears for the (selected) user toolset; search + add.
-    const search = container.querySelector<HTMLInputElement>('[aria-label="Search commands to add"]');
-    expect(search).not.toBeNull();
-    act(() => setInputValue(search!, "Circle"));
-    const addButton = container.querySelector<HTMLButtonElement>('[data-command-id="tool.circle"]');
-    expect(addButton).not.toBeNull();
-    act(() => addButton!.dispatchEvent(new MouseEvent("click", { bubbles: true })));
-    const userToolset = applied().userToolsets.find((toolset) => toolset.id === "user.mine");
-    expect(userToolset?.groups.some((group) => group.items.some((item) => item.id === "tool.circle"))).toBe(true);
+    const search = openPicker();
+    act(() => setInputValue(search, "Circle"));
+    click(`[data-command-id="${circle.id}"]`);
+    const state = applied();
+    expect(state.toolsetOverrides).toEqual([]);
+    expect(state.userToolsets.find((toolset) => toolset.id === "user.mine")?.groups[0]?.items).toMatchObject([
+      { id: circle.id, icon: circle.icon, assetName: circle.assetName }
+    ]);
+  });
+
+  it.each([
+    ["core.main", "core.main.g", "tool.a"],
+    ["plugin.fixture", "plugin.fixture.g", "plugin.fixture.ping"]
+  ])("adds and removes a command via the override for %s", (toolsetId, groupId, manifestItemId) => {
+    render();
+    click(`[data-toolset-id="${toolsetId}"] .customize-toolset-title`);
+    const manifestItem = container.querySelector(`[data-item-id="${manifestItemId}"]`)!;
+    expect(manifestItem.querySelector(".customize-item-remove")).toBeNull();
+    const search = openPicker();
+    expect(container.querySelector(`[data-command-id="${manifestItemId}"]`)).toBeNull();
+    act(() => setInputValue(search, circle.id));
+    click(`[data-command-id="${circle.id}"]`);
+    expect(container.querySelector(`[data-command-id="${circle.id}"]`)).toBeNull();
+    expect(applied()).toEqual({
+      ...emptyState,
+      toolsetOverrides: [{
+        toolsetId,
+        itemAdditions: [{
+          groupId,
+          item: {
+            id: circle.id, kind: "button", label: circle.title, icon: circle.icon, assetName: circle.assetName,
+            primary: { type: "command", commandId: circle.id }, submenu: null
+          }
+        }]
+      }]
+    });
+    click(`[data-item-id="${circle.id}"] .customize-item-visible`);
+    click(`[data-item-id="${circle.id}"] .customize-item-remove`);
+    expect(container.querySelector(`[data-item-id="${circle.id}"]`)).toBeNull();
+    expect(container.querySelector(`[data-command-id="${circle.id}"]`)).not.toBeNull();
+    expect(applied()).toEqual(emptyState);
+  });
+
+  it("resets a built-in toolbar to its manifest layout", () => {
+    render();
+    openPicker();
+    click('[data-command-id="edit.undo"]');
+    click('[data-item-id="tool.a"] .customize-item-visible');
+    const edited = applyToolsetLayoutState(baseToolsets, applied(), { additionalCommandIds: SHELL_COMMAND_IDS });
+    expect(edited.find((toolset) => toolset.id === "core.main")?.groups[0]?.items.map((item) => item.id))
+      .toEqual(["edit.undo"]);
+    click('[title="Reset Main Toolbar"]');
+    expect(container.querySelector('[data-item-id="edit.undo"]')).toBeNull();
+    expect(container.querySelector<HTMLInputElement>('[data-item-id="tool.a"] .customize-item-visible')?.checked).toBe(true);
+    expect(applied()).toEqual(emptyState);
+  });
+
+  it("offers transiently disabled commands and excludes transitional stubs and compatibility-only variants", () => {
+    render();
+    openPicker();
+    expect(container.querySelector('[data-command-id="tool.testStub"]')).toBeNull();
+    expect(container.querySelector('[data-command-id="tool.art.rectShadow"]')).toBeNull();
+    expect(container.querySelector('[data-command-id="edit.undo"]')?.textContent).toBe("+ Undo");
   });
 
   it("surfaces an in-place addition (spacer) as a row so it can be hidden there too", () => {

@@ -158,6 +158,23 @@ export function setItemHidden<I extends string, A extends string>(
 const SPACER_ID_PREFIX = "user.spacer.";
 const SEPARATOR_ID_PREFIX = "user.separator.";
 
+export function createCommandToolbarItem<I extends string, A extends string>({
+  id,
+  title,
+  icon,
+  assetName
+}: { id: string; title: string; icon?: I; assetName?: A }): ToolsetItemDefinition<I, A> {
+  return {
+    id,
+    kind: "button",
+    label: title,
+    icon,
+    assetName,
+    primary: { type: "command", commandId: id },
+    submenu: null
+  };
+}
+
 /** Add a new item (a gallery command, or a spacer) to ANY toolset — the one add-only structural
  *  edit permitted on core/plugin toolsets, persisted as `toolsetOverrides[].itemAdditions`. No-op
  *  when the item yields no customization id, the id is already present in the toolset

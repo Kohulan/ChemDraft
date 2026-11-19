@@ -680,7 +680,9 @@ function pruneUnknownOverrideCommands(
 ): UserToolsetOverride {
   // Prune additions first, by their OWN primary command id(s): a spacer has none so it always
   // survives (same mechanism that keeps user-toolset separators), while a command addition whose
-  // command came from a removed plugin is dropped.
+  // command came from a removed plugin is omitted from the effective toolbar. The saved override
+  // stays intact, so the addition reappears when its command ID is available again and its group
+  // still exists.
   const itemAdditions = override.itemAdditions?.filter((addition) => {
     const unknownPrimaryIds = toolsetItemPrimaryCommandIds(addition.item as ToolsetItemDefinition).filter(
       (commandId) => !registeredCommandIds.has(commandId)
