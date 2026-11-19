@@ -5216,10 +5216,6 @@ export function MainWindow({
       !changed && onlyDisconnectedAtoms
         ? "Nothing to clean up: the selected atoms aren't connected to each other. Select a bond or neighboring atoms."
         : cleanUpStructureStatus(documentRef.current, targetObjectIds, changed, warnings);
-    const reportCleanupFailure = (error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      setStatus(/^Clean Up (Selection:|refused:)/.test(message) ? message : `Clean up failed: ${message}`);
-    };
     const partialSelections = fragments.filter(fragment => {
       // The legacy store may include a part's host in objectIds. The part defines its scope;
       // a true whole-molecule pick clears that molecule's part in the selection policy.
@@ -5229,6 +5225,11 @@ export function MainWindow({
       return selected.size > 0 && selected.size < target.atoms.length;
     });
     const partialIds = new Set(partialSelections.map(selection => selection.objectId));
+    const cleanupLabel = partialSelections.length ? "Clean Up Selection" : "Clean Up";
+    const reportCleanupFailure = (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(/^(Clean Up:|Clean Up Selection:|Clean Up refused:)/.test(message) ? message : `Clean up failed: ${message}`);
+    };
 
     // The polygon+tree pass idealises single-ring components in place. Anything with more than
     // one ring per component (fused, bridged, spiro, several rings joined through chains or a
@@ -5249,6 +5250,7 @@ export function MainWindow({
       try {
         const changed = commitDocumentChangeWithPageFit((current) => {
           const result = prepareCleanupRepeatUnits(current, cleanUpNativeMolecules2d(current, nativeTargetIds), nativeTargetIds);
+          assertNoNewCleanupMoleculeOverlaps(current, result.document, cleanupLabel);
           assertMembership = result.assertMembership;
           return result.document;
         }, undefined, undefined, final => assertMembership?.(final));
@@ -5298,8 +5300,8 @@ export function MainWindow({
           setStatus("Clean up canceled because the document changed");
           return;
         }
-        if (partialSelections.length) assertNoNewCleanupMoleculeOverlaps(currentDocument, prepared);
         const { document, assertMembership } = prepareCleanupRepeatUnits(currentDocument, prepared, targetObjectIds);
+        assertNoNewCleanupMoleculeOverlaps(currentDocument, document, cleanupLabel);
         const changed = commitDocumentChangeWithPageFit(document, partialSelections.length ? "Clean Up Selection" : undefined, undefined,
           partialSelections.length ? (finalDocument) => {
             assertMembership?.(finalDocument);
@@ -10352,18 +10354,18 @@ export function MainWindow({
     const results = requests.map(({ contents, displayName, path, receipt }) => {
       // Confirm at tab installation, before optional page-fit and compatibility dialogs.
       // A rejected parse or an early return (e.g. unfinished table edit) fails the receipt.
-      let reported = false;
-      const report = (opened: boolean) => {
-        if (!receipt || reported) return;
-        reported = true;
-        void confirmNativeOpen(receipt, opened).catch(error =>
+      let opened = false;
+      const confirm = (installed: boolean) => {
+        if (!receipt) return;
+        void confirmNativeOpen(receipt, installed).catch(error =>
           setStatus(`Could not confirm opening ${displayName}: ${String(error)}`));
       };
-      const options = receipt ? { onOpened: () => report(true) } : undefined;
+      const options = { onOpened: () => { opened = true; confirm(true); } };
       return openDocumentContents(contents, displayName, path, options).then(
-        (): DocumentOpenResult => ({ displayName }),
+        (): DocumentOpenResult => opened ? { displayName }
+          : { displayName, error: "Finish or cancel the current edit and try again." },
         (error: unknown): DocumentOpenResult => ({ displayName, error })
-      ).finally(() => report(false));
+      ).finally(() => { if (!opened) confirm(false); });
     });
     // Reserve the summary's place before any later batch. Each open includes its page-fit and
     // compatibility prompts, so keeping an imported page finishes successfully before we count it.

@@ -261,7 +261,9 @@ export function cleanUpMoleculeSelections2d(
 }
 
 /** Compare rendered atom positions once all molecules in the cleanup have been laid out. */
-export function assertNoNewCleanupMoleculeOverlaps(original: ChemDraftDocument, candidate: ChemDraftDocument): void {
+export function assertNoNewCleanupMoleculeOverlaps(
+  original: ChemDraftDocument, candidate: ChemDraftDocument, commandLabel = "Clean Up Selection"
+): void {
   for (const page of original.pages) {
     const finalPage = candidate.pages.find(other => other.id === page.id);
     if (!finalPage || finalPage === page) continue;
@@ -269,11 +271,13 @@ export function assertNoNewCleanupMoleculeOverlaps(original: ChemDraftDocument, 
     if (molecules.length < 2) continue;
     const cleaned = new Map(finalPage.objects.filter((object): object is MoleculeObject => object.type === "molecule")
       .map(molecule => [molecule.id, molecule]));
-    checkOverlapsBetweenMolecules(molecules, cleaned);
+    checkOverlapsBetweenMolecules(molecules, cleaned, commandLabel);
   }
 }
 
-function checkOverlapsBetweenMolecules(molecules: MoleculeObject[], cleaned: ReadonlyMap<string, MoleculeObject>): void {
+function checkOverlapsBetweenMolecules(
+  molecules: MoleculeObject[], cleaned: ReadonlyMap<string, MoleculeObject>, commandLabel: string
+): void {
   const pageAtoms = molecules.map(molecule => {
     const candidate = cleaned.get(molecule.id);
     const before = molecule.atoms.map(atom => transformPointForObject(molecule, atom));
@@ -293,7 +297,7 @@ function checkOverlapsBetweenMolecules(molecules: MoleculeObject[], cleaned: Rea
           return atomPairOverlaps(distance(after, otherAfter), bondLengthPx) &&
             !atomPairOverlaps(distance(before, otherBefore), bondLengthPx);
         });
-        if (introducedOverlap) throw new Error("Clean Up Selection: the fitted layout would create overlapping atoms.");
+        if (introducedOverlap) throw new Error(`${commandLabel}: the fitted layout would create overlapping atoms.`);
       }
     }
   }

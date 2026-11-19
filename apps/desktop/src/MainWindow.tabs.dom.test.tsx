@@ -27,6 +27,8 @@ import { DOM_COMMAND_EVENT, broadcastExportPreviewSettings, setToolbarsMenu, typ
 import { buildDocumentSessionEnvelope, buildDocumentTabsSession, DOCUMENT_SESSION_SAVE_DEBOUNCE_MS, parseDocumentSessionEnvelope } from "./documentSession";
 import { createPluginRuntime, type DesktopPluginRuntime } from "./plugins/createPluginRuntime";
 import { applyPatches, type DocumentPatch, type MoleculeObject } from "@chemdraft/chem-core";
+import { buildTableObject } from "@chemdraft/document-workflow-core";
+import { planTableLayout } from "@chemdraft/layout-engine";
 import {
   ANALYSIS_WINDOW_ACTION_EVENT, ANALYSIS_WINDOW_OWNER_ID, PATCH_REVIEW_WINDOW_ID,
   type AnalysisWindowSnapshotPayload, broadcastAnalysisWindowSnapshot,
@@ -1379,6 +1381,44 @@ describe("documents in one window", () => {
       expect(bridge().snapshot().file.path).toBe(path);
       expect(bridge().snapshot().document.title).toBe(index.toString());
     }
+  });
+
+  it("counts zero opens when an invalid table draft refuses all three tab snapshots", async () => {
+    const source = createPhase4Document("Editing");
+    const table = buildTableObject({
+      columns: [{ widthPx: 100, formula: "off" }, { widthPx: 100, formula: "off" }],
+      rows: Array.from({ length: 100 }, () => ["x".repeat(1000), "y".repeat(1000)])
+    }, { id: "table-test", x: 80, y: 90, newId: prefix => `${prefix}-${crypto.randomUUID()}` }).object;
+    source.pages[0].objects.push(table);
+    await act(async () => root!.unmount());
+    await mount(source);
+    const box = planTableLayout(table).cells[0]!.box;
+    const page = container.querySelector<HTMLElement>(".page")!;
+    const target = container.querySelector("[data-table-hit-target]")!;
+    const scale = (bridge().snapshot().viewport as { scale: number }).scale;
+    const { left, top } = page.getBoundingClientRect();
+    await act(async () => target.dispatchEvent(new MouseEvent("dblclick", {
+      bubbles: true, cancelable: true, detail: 2,
+      clientX: left + (box.x + box.width / 2) * scale, clientY: top + (box.y + box.height / 2) * scale
+    })));
+    const editor = container.querySelector<HTMLTextAreaElement>("[data-table-cell-editor] textarea")!;
+    expect(editor).not.toBeNull();
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(editor, "x".repeat(1001));
+      editor.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const before = bridge().snapshot().document;
+    const paths = ["/drawings/first.chemdraft", "/drawings/second.chemdraft", "/drawings/third.chemdraft"];
+    native.picker.mockResolvedValueOnce(paths);
+    for (const path of paths) native.readFile.mockResolvedValueOnce(new TextEncoder().encode(fileContents(path)));
+
+    await command("document.open");
+
+    expect(native.readFile.mock.calls.map(([path]) => path)).toEqual(paths);
+    expect(tabs()).toHaveLength(1);
+    expect(bridge().snapshot().document).toEqual(before);
+    expect(editor.isConnected).toBe(true);
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("Opened 0 of 3 files.");
   });
 
   it.each(["picker", "pending drain"])("keeps the middle-file failure after a three-file %s finishes", async source => {
