@@ -57,6 +57,7 @@ ChemDraft 1.2.1 improves drawing, file exchange and dialogs, and fixes problems 
 - CDX and CDXML keep one color per rectangle. When fill and outline differ, ChemDraft keeps the fill unless it is white or the page color, in which case it keeps the outline. A warning appears when a color cannot be saved.
 - A canceled macOS logout can leave editing locked until ChemDraft is relaunched.
 - If you open a file while ChemDraft is asking whether to save before quitting and then choose Don't Save, that file may not open. Open it again after relaunching.
+- On macOS, opening several files at once from the Finder while ChemDraft asks how to fit a page can show a message that a file was not confirmed, even though every file opens.
 
 ## macOS
 
