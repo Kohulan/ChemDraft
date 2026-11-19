@@ -2597,7 +2597,20 @@ describe("ChemDraft desktop shell", () => {
     // share preparation, and plugin/proposal preflight also normalizes before checking fit.
     // The conditions editor also commits to its original tab while it is inactive.
     expect(mainWindowSource.match(/normalizeCommittedDocument\(/g)).toHaveLength(14);
-    expect(mainWindowSource).toMatch(/const prepareDocumentCommit = useCallback\([\s\S]*?const present = normalizeCommittedDocument\(nextDocument\);/);
+    const prepareDocumentCommitSource = mainWindowSource.slice(
+      mainWindowSource.indexOf("const prepareDocumentCommit = useCallback("),
+      mainWindowSource.indexOf("const pageFitPendingRef =")
+    );
+    expect(prepareDocumentCommitSource).toMatch(
+      /const normalized = normalizeCommittedDocument\(nextDocument\);\s*const present = assertFinalDocument\?\.\(normalized\) \?\? normalized;/
+    );
+    expect(prepareDocumentCommitSource).toContain("return present;");
+    const commitDocumentHistorySource = mainWindowSource.slice(
+      mainWindowSource.indexOf("const commitDocumentHistoryFrom ="),
+      mainWindowSource.indexOf("const commitInsertionHistoryWithPageFit =")
+    );
+    expect(commitDocumentHistorySource).toContain("const verified = assertFinalDocument ? prepareDocumentCommit(nextDocument, undoLabel, assertFinalDocument) : undefined;");
+    expect(commitDocumentHistorySource).toContain("const present = verified ?? prepareDocumentCommit(nextDocument, undoLabel);");
     const commitDocumentChangeSource = mainWindowSource.slice(
       mainWindowSource.indexOf("const commitDocumentChange ="),
       mainWindowSource.indexOf("const commitDocumentChangeWithPageFit =")
@@ -2623,7 +2636,21 @@ describe("ChemDraft desktop shell", () => {
     expect(mainWindowSource).toContain("finishNativeAtomLabelEdit(baseline,");
     expect(mainWindowSource).toContain("const clean = stripped === current ? current : normalizeCommittedDocument(stripped);");
     expect(mainWindowSource).toContain("normalizeCommittedDocument(finishedAtomLabelDraft(current, edit).document)");
-    expect(mainWindowSource).toContain("const flushed = documentForFlush();");
+    const sessionFlushSource = mainWindowSource.slice(
+      mainWindowSource.indexOf("const writeDocumentSessionNow ="),
+      mainWindowSource.indexOf("const lockCommittedQuit =")
+    );
+    expect(sessionFlushSource).toMatch(
+      /const flushed = committedDraft\?\.tabId === activeDocumentTabIdRef\.current\s*\? committedDraft\.document : documentForFlush\(\);/
+    );
+    expect(sessionFlushSource).toContain("const tabDocument = draft?.document ?? (tab.id === activeDocumentTabIdRef.current ? flushed : snapshot.history.present);");
+    expect(sessionFlushSource).toContain("createNativeSavePayload(tabDocument)");
+    const quitDraftSource = mainWindowSource.slice(
+      mainWindowSource.indexOf("const lockCommittedQuit ="),
+      mainWindowSource.indexOf("const writeQuitSession =")
+    );
+    expect(quitDraftSource).toContain("const document = documentForFlush(");
+    expect(quitDraftSource).toContain("committedQuitDraftRef.current = { tabId, document, dirty, warning };");
     expect(mainWindowSource).toContain("const savedDocument = active ? documentForFlush() : savingDocument;");
     expect(mainWindowSource).toContain("createDocumentFileSave(savedDocument, finalPath)");
     expect(mainWindowSource).toContain("tabId === activeDocumentTabIdRef.current ? documentForFlush() : documentTabSnapshotsRef.current.get(tabId)?.history.present");
@@ -3135,14 +3162,21 @@ describe("ChemDraft desktop shell", () => {
   });
 
   it("threads Spin 3D placement through modeled typed rotation while preserving legacy X/Y tilt", () => {
-    // The numeric-rotation flatten must run the stereo read-back guard (spin3dFlattenStereoOptions),
-    // not commit geometry-only, so a typed rotation can't silently persist a different stereoisomer.
-    expect(mainWindowSource).toMatch(/flattenSpunMolecule\(\s*input\.startDocument,\s*input\.objectId,\s*coords3d,\s*quatToViewMatrix\(nextQuat\),\s*{\s*placement,\s*\.\.\.spin3dFlattenStereoOptions\(input\.startDocument,\s*input\.objectId,\s*warnings\)\s*}\s*\)/s);
+    const typedRotationSource = mainWindowSource.slice(
+      mainWindowSource.indexOf("const rotationInputDocumentFromDraft ="),
+      mainWindowSource.indexOf("const handleRotationInputChange =")
+    );
+    // The typed flatten uses the shared placement computed from the starting orientation and
+    // runs the stereo read-back guard before persisting a new projection.
+    expect(typedRotationSource).toContain("const { placement } = spinPlacementFor(object, coords3d, model.orientation);");
+    expect(typedRotationSource).toMatch(
+      /const options = spin3dFlattenStereoOptions\(input\.startDocument,\s*input\.objectId,\s*warnings\);\s*const outcome = flattenSpunMolecule\(\s*input\.startDocument,\s*input\.objectId,\s*coords3d,\s*quatToViewMatrix\(nextQuat\),\s*{\s*placement,\s*\.\.\.options\s*}\s*\)/
+    );
     expect(mainWindowSource).toContain("modeledRotationEntry ? 0");
-    expect(mainWindowSource).toMatch(/quatFromAxisAngle\(SPIN_AXIS_Z,\s*-deltaDegrees \* Math\.PI \/ 180\)/);
-    expect(mainWindowSource).toMatch(/attachSpin3dModelFromConformer\(nextDocument,\s*input\.objectId/s);
-    expect(mainWindowSource).toMatch(/tiltNativeMoleculeProjectedPlane\(\s*input\.startDocument,\s*input\.objectId/s);
-    expect(mainWindowSource).toMatch(/applyDocumentObjectProjectedPlaneTilt\(\s*input\.startDocument,\s*input\.objectId/s);
+    expect(typedRotationSource).toMatch(/quatFromAxisAngle\(SPIN_AXIS_Z,\s*-deltaDegrees \* Math\.PI \/ 180\)/);
+    expect(typedRotationSource).toMatch(/attachSpin3dModelFromConformer\(nextDocument,\s*input\.objectId/);
+    expect(typedRotationSource).toMatch(/tiltNativeMoleculeProjectedPlane\(\s*input\.startDocument,\s*input\.objectId/);
+    expect(typedRotationSource).toMatch(/applyDocumentObjectProjectedPlaneTilt\(\s*input\.startDocument,\s*input\.objectId/);
   });
 
   it("keeps a flatten's own writer warnings but drops the expected per-commit perspective-cleanup note", () => {
