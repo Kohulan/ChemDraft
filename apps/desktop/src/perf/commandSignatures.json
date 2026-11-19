@@ -4,7 +4,7 @@
     "name": "assistant_mcp_session_open",
     "async": true,
     "generics": "",
-    "parameters": "plugin_id: String, plugin_name: String, on_request: Channel<McpBridgeRequest>,",
+    "parameters": "plugin_id: String, plugin_name: String, catalog: protocol::SessionCatalog, on_request: Channel<McpBridgeRequest>,",
     "returnType": "Result<SessionOpened, String>"
   },
   {
