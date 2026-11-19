@@ -1834,7 +1834,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.18.21.10-codex";
+const CURRENT_BUILD_STAMP = "11.18.21.11-codex";
 const TABLE_DRAFT_RECOVERY_WARNING = "session.tableDraftDropped";
 
 function clearTableDraftRecoveryWarnings(report: OpenWarningsReport | undefined): OpenWarningsReport | undefined {
@@ -3741,7 +3741,9 @@ export function MainWindow({
     // The document is being REPLACED, not edited — bump before installing the new history so a plugin
     // write already in flight against the old document key is refused rather than landing here.
     documentIdentityRef.current += 1;
-    installDocumentHistory(createDocumentHistory(normalizeCommittedDocument(admitParsedDocument(nextDocument))));
+    installDocumentHistory(createDocumentHistory(normalizeCommittedDocument(
+      admitParsedDocument(nextDocument), { preserveElectronMarks: true }
+    )));
     fileStateRef.current = nextFileState;
     setFileState(nextFileState);
     tabWarningsRef.current = undefined;
@@ -10813,7 +10815,9 @@ export function MainWindow({
               if (session.nativeDocumentVersions && resolved.source !== "external-cdxml") {
                 resolved.document = { ...resolved.document, ...session.nativeDocumentVersions };
               }
-              const history = createDocumentHistory(normalizeCommittedDocument(admitParsedDocument(resolved.document)));
+              const history = createDocumentHistory(normalizeCommittedDocument(
+                admitParsedDocument(resolved.document), { preserveElectronMarks: true }
+              ));
               const reports = restoreSessionWarningReports(session);
               restored.push({ session, opened, resolved, history, reports, candidateIndex, id: crypto.randomUUID() });
             } catch {
