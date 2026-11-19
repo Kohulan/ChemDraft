@@ -267,21 +267,24 @@ export function assertNoNewCleanupMoleculeOverlaps(
   for (const page of original.pages) {
     const finalPage = candidate.pages.find(other => other.id === page.id);
     if (!finalPage || finalPage === page) continue;
-    const molecules = page.objects.filter((object): object is MoleculeObject => object.type === "molecule");
+    // Cleanup updates objects in place, so the page position identifies each occurrence.
+    const molecules = page.objects.flatMap((molecule, index) => {
+      if (molecule.type !== "molecule") return [];
+      const next = finalPage.objects[index];
+      const cleaned = next?.type === "molecule" && next.id === molecule.id ? next : molecule;
+      return [{ molecule, cleaned }];
+    });
     if (molecules.length < 2) continue;
-    const cleaned = new Map(finalPage.objects.filter((object): object is MoleculeObject => object.type === "molecule")
-      .map(molecule => [molecule.id, molecule]));
-    checkOverlapsBetweenMolecules(molecules, cleaned, commandLabel);
+    checkOverlapsBetweenMolecules(molecules, commandLabel);
   }
 }
 
 function checkOverlapsBetweenMolecules(
-  molecules: MoleculeObject[], cleaned: ReadonlyMap<string, MoleculeObject>, commandLabel: string
+  molecules: { molecule: MoleculeObject; cleaned: MoleculeObject }[], commandLabel: string
 ): void {
-  const pageAtoms = molecules.map(molecule => {
-    const candidate = cleaned.get(molecule.id);
+  const pageAtoms = molecules.map(({ molecule, cleaned }) => {
     const before = molecule.atoms.map(atom => transformPointForObject(molecule, atom));
-    const after = candidate && candidate !== molecule ? candidate.atoms.map(atom => transformPointForObject(candidate, atom)) : before;
+    const after = cleaned !== molecule ? cleaned.atoms.map(atom => transformPointForObject(cleaned, atom)) : before;
     return { molecule, before, after };
   });
   for (const entry of pageAtoms) {

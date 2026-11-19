@@ -18815,17 +18815,23 @@ export function assertSpin3dDocumentIdentity(
   // A reference captured before attaching a model still identifies the first match used by flatten.
   const sourcePage = before.pages.find(page => page.objects.includes(stereo.source)) ??
     before.pages.find(page => page.objects.some(object => object.type === "molecule" && object.id === stereo.source.id));
+  const sourceIndex = sourcePage?.objects.indexOf(stereo.source) ?? -1;
+  const targetIndex = sourceIndex >= 0 ? sourceIndex : sourcePage?.objects.findIndex(object =>
+    object.type === "molecule" && object.id === stereo.source.id);
   const nextPages = new Map(after.pages.map(page => [page.id, page]));
-  const target = sourcePage && nextPages.get(sourcePage.id)?.objects.find(object => object.id === stereo.source.id);
+  let target: MoleculeObject | undefined;
   for (const page of before.pages) {
     const nextPage = nextPages.get(page.id);
     if (!nextPage) throw new Error("the rotated page is missing");
-    const nextObjects = new Map(nextPage.objects.map(object => [object.id, object]));
-    for (const molecule of page.objects) {
+    // Flatten and normalization preserve page object order, including duplicate ids.
+    for (const [index, molecule] of page.objects.entries()) {
       if (molecule.type !== "molecule") continue;
-      const next = nextObjects.get(molecule.id);
+      const next = nextPage.objects[index];
+      if (next?.type !== "molecule" || next.id !== molecule.id || next.atoms.length !== molecule.atoms.length) {
+        throw new Error("the atom count would change");
+      }
+      if (page === sourcePage && index === targetIndex) target = next;
       if (next === molecule) continue;
-      if (next?.type !== "molecule" || next.atoms.length !== molecule.atoms.length) throw new Error("the atom count would change");
       for (const [index, atom] of molecule.atoms.entries()) {
         const other = next.atoms[index];
         if (other.id !== atom.id || other.element !== atom.element) throw new Error(`atom ${atom.id} would change identity`);
@@ -18836,6 +18842,7 @@ export function assertSpin3dDocumentIdentity(
     }
     const originalAssignments = nativeElectronMarkAssignments(page).anchorByMarkId;
     const nextAssignments = nativeElectronMarkAssignments(nextPage).anchorByMarkId;
+    const nextObjects = new Map(nextPage.objects.map(object => [object.id, object]));
     for (const mark of page.objects) {
       if (mark.type !== "electron-mark") continue;
       const next = nextObjects.get(mark.id);
@@ -18847,7 +18854,7 @@ export function assertSpin3dDocumentIdentity(
       }
       if (page !== sourcePage || owner?.objectId !== stereo.source.id) continue;
       const atom = stereo.source.atoms.find(candidate => candidate.id === owner.atomId);
-      const moved = target?.type === "molecule" ? target.atoms.find(candidate => candidate.id === owner.atomId) : undefined;
+      const moved = target?.atoms.find(candidate => candidate.id === owner.atomId);
       const from = nativeChargeMarkCenter(mark);
       const to = nativeChargeMarkCenter(next);
       if (!atom || !moved || Math.hypot(to.x - moved.x - (from.x - atom.x), to.y - moved.y - (from.y - atom.y)) > 1e-6) {
@@ -18855,7 +18862,7 @@ export function assertSpin3dDocumentIdentity(
       }
     }
   }
-  if (target?.type !== "molecule") throw new Error("the rotated molecule is missing");
+  if (!target) throw new Error("the rotated molecule is missing");
   const issue = stereo.checkIdentity(target);
   if (issue) throw new Error(issue);
 }

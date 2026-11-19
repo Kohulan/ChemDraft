@@ -367,6 +367,25 @@ describe("Clean Up Selection command", () => {
     expect(current().selection).toEqual(before.selection);
   });
 
+  it("cleans a chain beside two stationary molecules with the same object id", async () => {
+    const { document, molecule } = straightChain();
+    const page = document.pages[0]!;
+    const helium = ocl.depictSmiles2D("[He]");
+    for (const x of [400, 500]) {
+      const spectator = createSmilesMolecule(document, { x, y: 300 }, helium, "[He]");
+      page.objects.push({ ...spectator, id: "shared-helium" });
+    }
+    document.selection = { pageId: page.id, objectIds: [molecule.id] };
+    await render(document);
+    const before = objects();
+
+    await command("structure.cleanup2d");
+
+    expect(status()).toBe("Cleaned up selected structure");
+    expect(objects()[0]!.atoms).not.toEqual(before[0]!.atoms);
+    expect(objects().slice(1)).toEqual(before.slice(1));
+  });
+
   it.each(["atom selection", "drawn brackets (v1.2.0 path)"])("preserves the SRU during whole-molecule cleanup after marking %s", async (source) => {
     const { document, molecule } = straightChain();
     const marked = source === "atom selection"

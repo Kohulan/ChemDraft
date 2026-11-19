@@ -12,9 +12,11 @@ import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import { tableValidationMessage, type ActiveTableText } from "./tableCommands";
 import { tableEditingContent, tableEditingKeyAction, type TableEditingAction } from "./tableInteraction";
 
+type TableCellCommitOptions = { finishComposition?: boolean; onError?: (message: string) => void };
+
 export interface TableCellEditorHandle {
   applyCommand(commandId: string): boolean;
-  commit(options?: { finishComposition?: boolean }): true | false | "composing";
+  commit(options?: TableCellCommitOptions): true | false | "composing";
   /** A flush reads the last accepted text while IME composition is in progress. */
   draft(): TableRichText;
 }
@@ -70,7 +72,7 @@ export const TableCellEditor = forwardRef<TableCellEditorHandle, {
     return JSON.stringify(normalizedSpans(draftRef.current)) === JSON.stringify(normalizedSpans(initialValue.current));
   };
 
-  const finish = (action: TableEditingAction) => {
+  const finish = (action: TableEditingAction, reportError = onError) => {
     if (readOnly || closed.current) return true;
     try {
       const value = isUnchanged() ? initialValue.current : draftRef.current;
@@ -78,7 +80,7 @@ export const TableCellEditor = forwardRef<TableCellEditorHandle, {
       closed.current = true;
       return true;
     } catch (error) {
-      onError(tableValidationMessage(error));
+      reportError(tableValidationMessage(error));
       editorRef.current?.focus({ preventScroll: true });
       return false;
     }
@@ -169,7 +171,7 @@ export const TableCellEditor = forwardRef<TableCellEditorHandle, {
   useImperativeHandle(ref, () => ({ applyCommand, draft: () => {
     const value = beforeComposition.current ?? (isUnchanged() ? initialValue.current : draftRef.current);
     return { text: value.text, spans: value.spans };
-  }, commit: (options?: { finishComposition?: boolean }) => {
+  }, commit: (options?: TableCellCommitOptions) => {
     if (readOnly) return true;
     if (composing.current) {
       if (!options?.finishComposition) return "composing";
@@ -179,7 +181,7 @@ export const TableCellEditor = forwardRef<TableCellEditorHandle, {
       beforeComposition.current = undefined;
       composing.current = false;
     }
-    return finish({ kind: "commit" });
+    return finish({ kind: "commit" }, options?.onError);
   } }));
   useLayoutEffect(() => {
     const editor = editorRef.current!;

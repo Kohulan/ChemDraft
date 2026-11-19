@@ -1418,7 +1418,9 @@ describe("documents in one window", () => {
     expect(tabs()).toHaveLength(1);
     expect(bridge().snapshot().document).toEqual(before);
     expect(editor.isConnected).toBe(true);
-    expect(container.querySelector('[role="status"]')?.textContent).toContain("Opened 0 of 3 files.");
+    const status = container.querySelector('[role="status"]')?.textContent;
+    expect(status).toContain("Opened 0 of 3 files.");
+    expect(status).toContain("maxTableCharacters is 200000; actual value is 200001");
   });
 
   it.each(["picker", "pending drain"])("keeps the middle-file failure after a three-file %s finishes", async source => {
