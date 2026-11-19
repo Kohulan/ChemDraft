@@ -576,7 +576,7 @@ export function parseToolsetLayoutState<TIcon extends string = string, TAssetNam
       const hasOtherAction = isPrimaryId
         ? CommandIdSchema.safeParse(item.commandId).success || (item.commandId === undefined && isStructural)
         : primary.success
-          ? primary.data.type !== "none" || hasStructuralId
+          ? primary.data.type !== "none" || !isAdditionItem || isStructural
           : item.primary === undefined && isStructural;
       if (hasOtherAction) {
         const fieldPath = [...itemPath, isPrimaryId ? "primary" : "commandId"];
@@ -593,6 +593,17 @@ export function parseToolsetLayoutState<TIcon extends string = string, TAssetNam
   }
   if (removals.size === 0) throw result.error;
 
+  // Revalidate repaired additions after all their nested edits and before sibling indices shift.
+  const additionsToValidate = new Set<string>();
+  for (const path of [...removals.values()]) {
+    if (path[2] !== "itemAdditions" || path.length <= 4) continue;
+    const additionPath = path.slice(0, 4);
+    const key = JSON.stringify(additionPath);
+    if (removals.has(key)) continue;
+    removals.set(key, additionPath);
+    additionsToValidate.add(key);
+  }
+
   const recovered = structuredClone(state);
   // Remove nested entries before their parents, and remove from right to left within an array.
   const arrayIndex = (key: string | number | undefined) => typeof key === "number" ? key : -1;
@@ -607,8 +618,15 @@ export function parseToolsetLayoutState<TIcon extends string = string, TAssetNam
     }
 
     const entries = parent as unknown[];
+    const entry = entries[key];
+    if (additionsToValidate.has(JSON.stringify(path)) && ToolsetItemAdditionSchema.safeParse(entry).success) continue;
     entries.splice(key, 1);
-    onInvalidCommand(`Toolbar customization dropped the entry at ${path.join(".")} because it contained an invalid command ID.`);
+    const item = parentPath.at(-1) === "itemAdditions"
+      ? (entry as { item?: { id?: unknown; commandId?: unknown } }).item
+      : undefined;
+    const itemId = item?.id ?? item?.commandId;
+    const description = typeof itemId === "string" ? `the addition "${itemId}"` : "the entry";
+    onInvalidCommand(`Toolbar customization dropped ${description} at ${path.join(".")} because it contained an invalid command ID.`);
     if (entries.length === 0 && parentPath.at(-2) === "submenu" && parentPath.at(-1) === "items") {
       const owner = parentPath.slice(0, -2).reduce<unknown>(property, recovered) as Record<string, unknown>;
       owner.submenu = null;

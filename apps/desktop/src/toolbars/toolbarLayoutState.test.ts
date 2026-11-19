@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { applyToolsetLayoutState, parseToolsetLayoutState, type ToolsetLayoutState } from "@chemdraft/toolset-registry";
 import { MAIN_TOOLBAR_DEFAULTS_REVISION, mergeVisibilityIntoLayoutState, withCurrentMainToolbarDefaults } from "./toolbarLayoutState";
+import { createToolbarCatalog } from "./toolbarCatalog";
 import { createDesktopToolsetRegistry, desktopToolsets, getToolsetItemGroups, migrateMainToolbarDefaultsLayoutState } from "../toolsets";
 import { addToolsetItemAddition, emptyLayoutState, removeToolsetItem, resetAllLayouts, resetToolsetLayout, setItemHidden } from "./CustomizeToolbars/layoutStateEdits";
 
@@ -76,6 +77,34 @@ describe("mergeVisibilityIntoLayoutState", () => {
 });
 
 describe("Main toolbar defaults migration", () => {
+  it("restores a valid saved sibling addition at startup after dropping a malformed submenu button", () => {
+    const catalog = createToolbarCatalog();
+    const toolsetId = "core.main";
+    const groupId = catalog.registry().require(toolsetId).groups[0].id!;
+    const malformedId = "custom.history-menu";
+    const sibling = { groupId, item: { commandId: "edit.undo" } };
+    const saved = {
+      version: 1, mainToolbarDefaultsRevision: MAIN_TOOLBAR_DEFAULTS_REVISION, toolsetOverrides: [{
+        toolsetId, itemAdditions: [
+          { groupId, item: {
+            id: malformedId, kind: "button", commandId: "bad id", primary: { type: "none" },
+            submenu: { type: "command-grid", items: [{ commandId: "edit.redo" }] }
+          } },
+          sibling
+        ]
+      }]
+    };
+    const warnings: string[] = [];
+    const warn = (warning: string) => warnings.push(warning);
+    const recovered = parseToolsetLayoutState(migrateMainToolbarDefaultsLayoutState(saved, warn), warn);
+
+    expect(parseToolsetLayoutState(recovered).toolsetOverrides[0].itemAdditions).toEqual([sibling]);
+    expect(warnings).toContainEqual(expect.stringContaining(malformedId));
+    expect(getToolsetItemGroups(toolsetId, catalog.registry()).flat().map(item => item.id)).not.toContain("edit.undo");
+    catalog.setLayoutState(recovered);
+    expect(getToolsetItemGroups(toolsetId, catalog.registry()).flat().map(item => item.id)).toContain("edit.undo");
+  });
+
   it.each([undefined, 1, 2])("preserves a saved standalone Wavy button without duplicates (revision %s)", revision => {
     const state = { version: 1, mainToolbarDefaultsRevision: revision, userToolsets: [], toolsetOverrides: [{
       toolsetId: "core.main",

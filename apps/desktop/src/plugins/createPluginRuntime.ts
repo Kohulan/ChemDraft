@@ -606,7 +606,7 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
               throw new Error(`Plugin toolset "${toolset.id}" is already contributed by another plugin.`);
             }
           }
-          const mapped = contributed.map(pluginToolsetToDefinition);
+          const mapped = contributed.map(toolset => pluginToolsetToDefinition(toolset, registerOptions.commandHandlers));
           toolsetsByPluginId.set(manifest.id, mapped);
           mapped.forEach((toolset) => pluginIdByToolsetId.set(toolset.id, manifest.id));
         }
@@ -741,7 +741,10 @@ export function documentIdentityKey(document: ChemDraftDocument | undefined): st
   return document === undefined ? undefined : `${document.id}\u0000${document.createdAt}`;
 }
 
-function pluginToolsetToDefinition(contribution: PluginToolsetContribution): DesktopToolsetDefinition {
+function pluginToolsetToDefinition(
+  contribution: PluginToolsetContribution,
+  commandHandlers: RegisterPluginOptions["commandHandlers"]
+): DesktopToolsetDefinition {
   const groupIds = new Set(contribution.groups.map((group) => group.id));
   return {
     id: contribution.id,
@@ -767,6 +770,9 @@ function pluginToolsetToDefinition(contribution: PluginToolsetContribution): Des
           icon: "palette",
           iconDataUri: item.iconDataUri,
           shortcutDisplay: item.shortcutDisplay,
+          // The gallery omits handlerless commands. Detached palettes still receive their buttons.
+          disabledReason: typeof commandHandlers?.[item.commandId] === "function"
+            ? undefined : "Plugin command has no registered handler",
           category: "plugin"
         }))
       };

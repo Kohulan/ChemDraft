@@ -599,6 +599,8 @@ export const PALETTE_GRID_METRIC_DEFAULTS = {
 
 /** Default floating palettes use the padded two-column grid defined by the palette CSS. */
 const VERTICAL_PALETTE_GRID_LAYOUT = { columns: 2, cellWidth: 24, cellHeight: 24, gap: 4, padding: 4 };
+// Horizontal .tool-palette uses --cd-space-3 between its group grids.
+const HORIZONTAL_PALETTE_GROUP_GAP = 6;
 
 export function toolsetUsesResizableWindow(id: string): boolean {
   return id === "core.molecularInspector" || id === "core.drawnStructureSettings" || id === "core.ringInspector";
@@ -632,18 +634,31 @@ export function computePaletteGridSize(
     return undefined;
   }
 
+  // Span-less section widgets render outside the grid. Inline controls and widgets with spans
+  // occupy grid slots, just as in ToolPalette.
+  const gridGroups = itemGroups
+    .map(group => group.filter(item => !isToolbarWidgetItem(item) || isGridWidgetItem(item)))
+    .filter(group => group.length > 0);
+  if (gridLayout.orientation === "horizontal" && gridGroups.length > 1) {
+    const sizes = gridGroups.map(group => computePaletteGroupSize(gridLayout, group))
+      .filter(size => size !== undefined);
+    if (sizes.length === 0) return undefined;
+    return {
+      width: sizes.reduce((total, size) => total + size.width, 0) + (sizes.length - 1) * HORIZONTAL_PALETTE_GROUP_GAP,
+      height: Math.max(...sizes.map(size => size.height))
+    };
+  }
+  return computePaletteGroupSize(gridLayout, gridGroups.flat());
+}
+
+function computePaletteGroupSize(
+  gridLayout: NonNullable<DesktopToolsetDefinition["gridLayout"]>,
+  placedItems: readonly ToolbarPaletteItemModel[]
+): { width: number; height: number } | undefined {
   const cellWidth = gridLayout.cellWidth ?? PALETTE_GRID_METRIC_DEFAULTS.cellWidth;
   const cellHeight = gridLayout.cellHeight ?? PALETTE_GRID_METRIC_DEFAULTS.cellHeight;
   const gap = gridLayout.gap ?? PALETTE_GRID_METRIC_DEFAULTS.gap;
   const padding = gridLayout.padding ?? PALETTE_GRID_METRIC_DEFAULTS.padding;
-  // Section-widget items (`widget.`-prefixed `control` items) render as their own sections, not grid
-  // slots, so they must not inflate the grid's column/row count (see ToolPalette's gridItemGroups
-  // filter). Inline controls (other `control` items) DO occupy a slot and are sized normally.
-  const placedItems = itemGroups
-    .flat()
-    // Span-less widgets render as appended sections (excluded from the grid math); a widget with
-    // declared grid spans is a grid citizen and its cells count like any other item's.
-    .filter((item) => !isToolbarWidgetItem(item) || isGridWidgetItem(item));
   const placedColumnCount = Math.max(
     0,
     ...placedItems

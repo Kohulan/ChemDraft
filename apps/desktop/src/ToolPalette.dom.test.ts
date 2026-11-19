@@ -27,6 +27,9 @@ import { getToolsetCommandGroups, getToolsetItemGroups, initialToolsetWindowSize
 import { ToolbarCustomizeController } from "./toolbars/CustomizeMainToolbar/ToolbarCustomizeController";
 import { createToolbarCatalog } from "./toolbars/toolbarCatalog";
 import { cloneToolset, createCommandToolbarItem } from "./toolbars/CustomizeToolbars/layoutStateEdits";
+import { CommandRegistry } from "@chemdraft/plugin-host";
+import { createPluginRuntime } from "./plugins/createPluginRuntime";
+import { FIXTURE_PLUGIN_PING_COMMAND_ID, FIXTURE_PLUGIN_TOOLSET_ID, fixturePluginManifest } from "./plugins/fixturePlugin";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -138,6 +141,42 @@ it("sizes horizontal toolbar windows from the Art clone's preferred size or the 
   };
   const registry = new ToolsetRegistry([plugin]);
   expect(initialToolsetWindowSize(plugin, getToolsetItemGroups(plugin.id, registry))).toEqual({ width: 172, height: 32 });
+});
+
+it.each(["user", "plugin"] as const)("sizes a horizontal %s toolbar for two side-by-side six-column groups", source => {
+  const toolset: DesktopToolsetDefinition = {
+    id: `${source}.sizing`, title: "Sizing", source, defaultVisible: true, defaultMode: "floating",
+    gridLayout: { orientation: "horizontal", columns: 6, rows: 1, cellWidth: 24, cellHeight: 24, gap: 4, padding: 4 },
+    groups: [
+      { items: [{ commandId: "edit.undo" }] },
+      { items: [{ commandId: "edit.redo" }] }
+    ]
+  };
+  const itemGroups = getToolsetItemGroups(toolset.id, new ToolsetRegistry([toolset]));
+  expect(initialToolsetWindowSize(toolset, itemGroups)).toEqual({ width: 350, height: 32 });
+});
+
+it("renders a contributed plugin button with no command handler as disabled", () => {
+  const runtime = createPluginRuntime({ commandRegistry: new CommandRegistry(), getActiveDocument: () => undefined });
+  runtime.registerPlugin(fixturePluginManifest, { commandHandlers: {} });
+  const catalog = createToolbarCatalog();
+  catalog.setPluginToolsets(runtime.listPluginToolsets(), runtime.listPluginCommandsWithHandlers());
+  const commandOverrides = new Map(catalog.baseCommands().map(command => [command.id, command]));
+  const itemGroups = getToolsetItemGroups(FIXTURE_PLUGIN_TOOLSET_ID, catalog.registry(), commandOverrides);
+  const container = document.createElement("div");
+  const root = createRoot(container);
+  const onInvoke = vi.fn();
+  try {
+    act(() => root.render(createElement(ToolPalette, { itemGroups, mode: "floating", onInvoke })));
+    const button = container.querySelector<HTMLButtonElement>(`[data-command-id="${FIXTURE_PLUGIN_PING_COMMAND_ID}"]`)!;
+    expect(button.disabled).toBe(true);
+    expect(button.getAttribute("aria-label")).toContain("Plugin command has no registered handler");
+    act(() => button.click());
+    expect(onInvoke).not.toHaveBeenCalled();
+    expect(commandOverrides.has(FIXTURE_PLUGIN_PING_COMMAND_ID)).toBe(false);
+  } finally {
+    act(() => root.unmount());
+  }
 });
 
 // Phase 5: widgets are declared as manifest `control` items and read their state from context. This
