@@ -152,7 +152,7 @@ test("Windows records before staging and carries the record through installer up
   assert.match(workflow, /Get-ChildItem release-assets -File[\s\S]+gh release upload \$env:RELEASE_TAG @assets/);
   const finalRecord = workflow.indexOf("name: Bind build record to final signed installer bytes");
   assert.ok(finalRecord > workflow.indexOf("name: Verify Authenticode and replace unsigned installer"));
-  assert.ok(finalRecord < workflow.indexOf("name: Print SHA-256 and sizes and write checksums"));
+  assert.ok(finalRecord < workflow.indexOf("node tools/release/release-checksums.mjs --assets release-assets"));
   assert.match(workflow, /\$record\.sha256 = \(Get-FileHash -LiteralPath \$installer -Algorithm SHA256\)/);
   assert.match(workflow, /\$record\.size = \(Get-Item -LiteralPath \$installer\)\.Length/);
 });

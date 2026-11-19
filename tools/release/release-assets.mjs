@@ -1,9 +1,11 @@
 // Shared, platform-neutral checks over the final artifact bytes and source identity.
 import { spawnSync } from "node:child_process";
-import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { artifactDigest, BUILD_TARGETS, COMMIT_PATTERN, LINUX_BUILD_TARGET } from "./record-build.mjs";
 import { loadUpdaterPublicKey, RELEASE_DOWNLOAD_BASE, verifyUpdaterSignature, WINDOWS_PLATFORM_KEY } from "./windows-updater.mjs";
+
+export { writeReleaseChecksums } from "./release-checksums.mjs";
 
 export function verifyWindowsUpdateAssets({ assets, version, allowIncomplete = false }, { updaterPublicKey } = {}) {
   const installer = `ChemDraft_${version}_x64-setup.exe`;
@@ -67,13 +69,6 @@ export function missingBuildFiles(assets, version) {
     .filter((name) => {
       try { return !statSync(join(assets, name)).isFile(); } catch { return true; }
     });
-}
-
-export function writeReleaseChecksums(assets, output) {
-  const checksums = readdirSync(assets).sort()
-    .filter((name) => name !== "SHA256SUMS.txt")
-    .map((name) => `${artifactDigest(join(assets, name)).sha256}  ${name}`);
-  writeFileSync(output, `${checksums.join("\n")}\n`);
 }
 
 export function verifyBuildAssets({ assets, version, expectedCommit, allowIncomplete = false }, { checkDmgCommit, updaterPublicKey } = {}) {

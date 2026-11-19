@@ -5,6 +5,13 @@ export interface LayoutLabelBox { atom: number; x: number; y: number; width: num
 
 /** Extra clearance beyond renderer padding, in bond lengths. */
 export const LABEL_CLEARANCE_PADDING = 0.04;
+export const ATOM_OVERLAP_DISTANCE_IN_BOND_LENGTHS = 0.5;
+
+/** The atom-pair distance and reference bond length use the same units. */
+export function atomPairOverlaps(pairDistance: number, referenceBondLength: number): boolean {
+  return pairDistance < ATOM_OVERLAP_DISTANCE_IN_BOND_LENGTHS * referenceBondLength;
+}
+
 export interface LayoutRingQuality {
   atoms: number[];
   /** Degrees, including reflex interior angles. Only five- and six-rings have this metric. */
@@ -275,7 +282,7 @@ function layoutGeometry(
         nearestAtomPairDistance = Math.min(nearestAtomPairDistance, d);
         if (!bondedPairs!.has(pairKey(i, j))) nearestNonBondedAtomPairDistance = Math.min(nearestNonBondedAtomPairDistance, d);
       }
-      if (d < 0.5) overlappingAtoms.push([i, j]);
+      if (atomPairOverlaps(d, 1)) overlappingAtoms.push([i, j]);
     }
   });
   const crossings: [number, number][] = [];

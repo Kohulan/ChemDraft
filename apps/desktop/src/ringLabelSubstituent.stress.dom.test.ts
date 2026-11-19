@@ -14,6 +14,7 @@ import { ANALYSIS_WINDOW_ACTION_EVENT } from "./plugins/panelBridge";
 import { openChemDraftPayload } from "@chemdraft/cdx-compat";
 
 const externalWrite = vi.hoisted(() => ({ object: undefined as MoleculeObject | undefined, pageId: "", proposalId: "" }));
+const externalMoleculeMove = { x: 120, y: 60 };
 // Use the same runtime registration path as the plugin DOM fixtures, with real permission-gated writes.
 vi.mock("./plugins/registerBundledPlugins", async importOriginal => {
   const actual = await importOriginal<typeof import("./plugins/registerBundledPlugins")>();
@@ -62,7 +63,7 @@ vi.mock("./plugins/registerBundledPlugins", async importOriginal => {
             const document = (await context.documents.getActiveDocument())!;
             const molecule = document.pages[0].objects.find((object): object is MoleculeObject => object.type === "molecule")!;
             const { moveDocumentObjects } = await import("./documentWorkflow");
-            const moved = moveDocumentObjects(document, [molecule.id], 120, 60);
+            const moved = moveDocumentObjects(document, [molecule.id], externalMoleculeMove.x, externalMoleculeMove.y);
             const next = moved.pages[0].objects.find((object): object is MoleculeObject => object.id === molecule.id && object.type === "molecule")!;
             const receipt = await context.documents.proposePatch({ reason: "Move whole molecule",
               patch: { op: "updateObject", objectId: molecule.id, changes: {
@@ -160,6 +161,12 @@ describe.each(["macos", "windows"] as const)("ring label commits (%s)", platform
     expect(moved).toMatchObject({ id: before.id, x: before.x + 120, y: before.y + 60 });
     expect(editor()).not.toBeNull();
     return moved;
+  }
+  async function moveWholeMolecule() {
+    await act(async () => { await window.__CHEMDRAFT_AGENT__!.command("plugin.labelHistory.moveMolecule"); });
+    await act(async () => { window.dispatchEvent(new CustomEvent(ANALYSIS_WINDOW_ACTION_EVENT, {
+      detail: { kind: "acceptPluginProposal", proposalId: externalWrite.proposalId }
+    })); });
   }
   function expectFreshDerivedFields(object: MoleculeObject) {
     const smiles = tryNativeSingleBondGraphSmiles(object.atoms, object.bonds);
@@ -462,14 +469,13 @@ describe.each(["macos", "windows"] as const)("ring label commits (%s)", platform
     await mount(); const before = molecule();
     await pointer("pointerdown", before.atoms[0]!, container.querySelector(`[data-object-id="${before.id}"]`)!);
     for (const char of "OMe") await key(char);
-    await act(async () => { await window.__CHEMDRAFT_AGENT__!.command("plugin.labelHistory.moveMolecule"); });
-    await act(async () => { window.dispatchEvent(new CustomEvent(ANALYSIS_WINDOW_ACTION_EVENT, {
-      detail: { kind: "acceptPluginProposal", proposalId: externalWrite.proposalId }
-    })); });
+    await moveWholeMolecule();
     expect(editor()).not.toBeNull();
     const moved = molecule();
     for (const [i, atom] of before.atoms.entries()) {
-      expect(moved.atoms[i]).toMatchObject({ id: atom.id, x: atom.x + 120, y: atom.y + 60 });
+      expect(moved.atoms[i]).toMatchObject({
+        id: atom.id, x: atom.x + externalMoleculeMove.x, y: atom.y + externalMoleculeMove.y
+      });
     }
     await key(finish);
     expect(editor()).toBeNull();
@@ -737,32 +743,45 @@ describe.each(["macos", "windows"] as const)("ring label commits (%s)", platform
     await history(); expect(current().pages[0].objects).toEqual(before); expect(status()).toBe("Undid Add OMe substituent");
     await history(true); expect(current().pages[0].objects).toEqual(after); expect(status()).toBe("Redid Add OMe substituent");
   });
-  it.each(["blur", "click", "tool", "Escape"])("fresh Text-tool text within reach finishes on %s; only Escape prevents conversion", async finish => {
+  it.each(["blur", "click", "tool", "Escape"].flatMap(finish => [
+    { finish, scenario: "a ring moves onto the click", moveRing: true },
+    { finish, scenario: "the text box clamps onto a ring", moveRing: false }
+  ]))("finishes fresh Text-tool OMe on $finish when $scenario", async ({ finish, moveRing }) => {
     const d = ring(), m = d.pages[0].objects.find((o): o is MoleculeObject => o.type === "molecule")!;
-    const point = { x: d.pages[0].width - 1, y: m.atoms[0]!.y };
-    const anchor = createNativeTextObject(d, point);
-    // Near the page edge the fresh text box clamps left of the click. Put a ring atom at
-    // that anchor: the pointer places text in open space, then finishing can convert on the atom.
-    const dx = anchor.x - m.atoms[0]!.x;
-    const shifted = normalizeNativeMoleculeGeometry({ ...m, atoms: m.atoms.map(a => ({ ...a, x: a.x + dx })) });
-    await mount(applyPatches(d, [{ op: "updateObject", objectId: m.id, changes: shifted }]), "tool.text");
-    const before = molecule();
+    const atom = m.atoms[0]!;
+    const point = moveRing
+      ? { x: atom.x + externalMoleculeMove.x, y: atom.y + externalMoleculeMove.y }
+      : { x: d.pages[0].width - 1, y: atom.y };
+    if (moveRing) {
+      await mount(d, "tool.text");
+    } else {
+      // The box clamps onto a ring atom near the page edge even though the click is in open space.
+      const anchor = createNativeTextObject(d, point);
+      const dx = anchor.x - atom.x;
+      const shifted = normalizeNativeMoleculeGeometry({ ...m, atoms: m.atoms.map(a => ({ ...a, x: a.x + dx })) });
+      await mount(applyPatches(d, [{ op: "updateObject", objectId: m.id, changes: shifted }]), "tool.text");
+    }
     await pointer("pointerdown", point);
     const textEditor = container.querySelector<HTMLTextAreaElement>(".text-object-editor")!;
-    expect(textEditor).not.toBeNull(); await input(textEditor, "OMe");
+    expect(textEditor).not.toBeNull();
+    await input(textEditor, "OMe");
+    if (moveRing) {
+      // A live document edit can bring the atom into reach after the Text tool has opened.
+      await moveWholeMolecule();
+      expect(molecule().atoms[0]).toMatchObject(point);
+      expect(container.querySelector(".text-object-editor")).toBe(textEditor);
+    } else {
+      const anchoredAtom = molecule().atoms[0]!;
+      expect(current().pages[0].objects.find(o => o.type === "text")).toMatchObject({ x: anchoredAtom.x, y: anchoredAtom.y });
+    }
+    const before = molecule();
+    const draft = current().pages[0].objects;
     if (finish === "Escape") {
       await key("Escape");
-      expect(container.querySelector(".text-object-editor")).toBeNull();
-      expect(molecule()).toEqual(before);
-      expect(current().pages[0].objects.find(o => o.type === "text")).toMatchObject({ text: "OMe" });
       // Subsequent finishing paths must not re-arm the box Escape already closed.
       await command("tool.select");
       await pointer("pointerdown", { x: 50, y: 50 });
-      expect(molecule()).toEqual(before);
-      expect(current().pages[0].objects).toHaveLength(2);
-      return;
-    }
-    if (finish === "tool") await command("tool.select");
+    } else if (finish === "tool") await command("tool.select");
     else if (finish === "click") {
       // Canvas capture consumes this press to finish editing, without placing a second box.
       await pointer("pointerdown", { x: 50, y: 50 });
@@ -776,14 +795,31 @@ describe.each(["macos", "windows"] as const)("ring label commits (%s)", platform
       await act(async () => textEditor.blur()); focused.mockRestore();
     }
     expect(container.querySelector(".text-object-editor")).toBeNull();
-    check(7, 7); expect(current().pages[0].objects).toHaveLength(1);
-    expect(status()).toContain("Attached OMe");
-    // A late blur cannot attach the same text a second time.
+    const after = current().pages[0].objects;
+    const attaches = moveRing && finish !== "Escape";
+    if (attaches) {
+      check(7, 7);
+      expect(after).toHaveLength(1);
+      expect(molecule().atoms.slice(0, 6)).toEqual(before.atoms);
+      expect(molecule().bonds.slice(0, 6)).toEqual(before.bonds);
+      const substituent = molecule().atoms[6]!;
+      expect(substituent).toMatchObject({ element: "OMe", labelLiteral: true });
+      expect(molecule().bonds[6]).toMatchObject({ fromAtomId: atom.id, toAtomId: substituent.id, order: "single" });
+      expect(status()).toContain("Attached OMe");
+    } else {
+      expect(molecule()).toEqual(before);
+      expect(after).toHaveLength(2);
+      expect(after.find(o => o.type === "text")).toMatchObject({ text: "OMe" });
+    }
+    // A late blur cannot convert the same text twice.
     await act(async () => textEditor.dispatchEvent(new FocusEvent("focusout", { bubbles: true })));
-    check(7, 7); expect(current().pages[0].objects).toHaveLength(1);
-    const after = molecule(); await history();
-    expect(molecule()).toEqual(before); expect(current().pages[0].objects.some(o => o.type === "text")).toBe(true);
-    await history(true); expect(molecule()).toEqual(after);
+    expect(current().pages[0].objects).toEqual(after);
+    if (attaches) {
+      await history();
+      expect(current().pages[0].objects).toEqual(draft);
+      await history(true);
+      expect(current().pages[0].objects).toEqual(after);
+    }
   });
 
   it("Save writes an open OMe draft as a substituent and keeps the edit open", async () => {

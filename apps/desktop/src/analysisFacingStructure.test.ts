@@ -75,7 +75,7 @@ describe("the structure the property analysis reads", () => {
   it("refuses analysis of pentane when an SRU encloses only three atoms", () => {
     const { pentane, document } = partialPentane();
     expect(bracketChemistryWarnings(document, pentane)).toContainEqual(expect.objectContaining({ message: expect.stringContaining("polymer formula not computed") }));
-    expect(analysisFacingStructure(pentane, document)).toMatchObject({ structure: "", refusalReason: expect.stringContaining("repeat unit n") });
+    expect(analysisFacingStructure(pentane, document)).toMatchObject({ structure: "", refusalReason: expect.stringContaining("repeat unit n"), refusalCode: "structure.repeat_unit" });
   });
 
   it("invalidates the analysis subject when a partial repeat mark is toggled", () => {

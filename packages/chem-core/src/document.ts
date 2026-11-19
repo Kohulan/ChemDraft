@@ -8,7 +8,7 @@ import {
   type DocumentObject
 } from "./schemas";
 import { engineDocuments } from "./engineDocuments";
-import { normalizeBracketPairs } from "./brackets";
+import { normalizeBracketPairs, retainBracketIdentity } from "./brackets";
 import { DefaultPageLayout, createPageLayout, pageMarginFromLayout } from "./page-layout";
 import { ignorableFieldsForNativeFeatures, minimumAppVersionForDocument, NativeDocumentBaselineAppVersion, NativeDocumentFormatVersion } from "./documentFeatures";
 import { compareNativeVersions, restoreNativeExtensions, type NativeDocumentWriteWarning } from "./nativeCompatibilityState";
@@ -185,7 +185,11 @@ export function migrateLegacyTableObjects(candidate: unknown): unknown {
 }
 
 export function cloneDocument(document: ChemDraftDocument): ChemDraftDocument {
-  return parseDocument(JSON.parse(JSON.stringify(document)) as unknown);
+  const clone = parseDocument(JSON.parse(JSON.stringify(document)) as unknown);
+  document.pages.forEach((page, pageIndex) => page.objects.forEach((object, objectIndex) => {
+    if (object.type === "bracket") retainBracketIdentity(object, clone.pages[pageIndex]!.objects[objectIndex]!);
+  }));
+  return clone;
 }
 
 export function toIsoTimestamp(value: Date | string): string {

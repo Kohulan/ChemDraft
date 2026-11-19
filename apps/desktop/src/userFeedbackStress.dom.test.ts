@@ -12,7 +12,7 @@ import { exportDocumentToCdxml, openChemDraftPayload } from "@chemdraft/cdx-comp
 import {
   nativeAtomBondOrderUsage, nativeAtomChargeSupportsValence, nativeBondLengthPx, nativeBondOrderResolution, nativeElementFromAtomLabel
 } from "@chemdraft/document-workflow-core";
-import { MainWindow, nativeTemplateStatusForApplication, rotationDeltaDegrees, visualSelectionBounds } from "./MainWindow";
+import { MainWindow, nativeTemplateStatusForApplication, visualSelectionBounds } from "./MainWindow";
 import {
   applyNativeAtomElementTarget, applyNativeAtomSproutTarget, applyNativeTemplatePlacementPlan, createPhase4Document, createSelectionClipboardPayload,
   flattenSpunMolecule, nativeMoleculeInvalidAtomStates, insertNativeArtGraphicObject, insertNativeSingleBondMolecule,
@@ -211,20 +211,22 @@ describe("user feedback app stress", () => {
       expect(handle).not.toBeNull();
       const center = { x: bounds.centerX, y: bounds.centerY }, start = { x: center.x, y: bounds.y - 30 };
       await pointer("pointerdown", start, handle, random() > 0.5);
-      let degrees = 0, shift = false, latest = start;
+      let degrees = 0, shift = false;
       for (let step = 0; step < 3; step++) {
         shift = random() > 0.5;
+        let nextDegrees: number;
         do {
-          degrees = random() * 320 - 160;
-          const radius = center.y - start.y, radians = degrees * Math.PI / 180;
-          latest = { x: center.x + radius * Math.sin(radians), y: center.y - radius * Math.cos(radians) };
+          nextDegrees = degrees + random() * 320 - 160;
           // A snapped zero is intentionally not a history entry. Require a real final rotation.
-        } while (step === 2 && Math.abs(snapRotationDegrees(rotationDeltaDegrees(center, start, latest), { shiftKey: shift })) < 1);
+        } while (step === 2 && Math.abs(snapRotationDegrees(nextDegrees, { shiftKey: shift })) < 1);
+        degrees = nextDegrees;
+        const radius = center.y - start.y, radians = degrees * Math.PI / 180;
+        const latest = { x: center.x + radius * Math.sin(radians), y: center.y - radius * Math.cos(radians) };
         await pointer("pointermove", latest, page(), shift, 7, 1);
       }
       const preview = current();
       // Group/multi-selection frames are axis-aligned and have no persistent orientation.
-      const expected = rotateDocumentObjectsAroundPoint(before, ids, center, snapRotationDegrees(rotationDeltaDegrees(center, start, latest), { shiftKey: shift, referenceDegrees: 0 }));
+      const expected = rotateDocumentObjectsAroundPoint(before, ids, center, snapRotationDegrees(Number(degrees.toFixed(3)), { shiftKey: shift }));
       expect(preview.pages[0].objects).toEqual(expected.pages[0].objects);
       // A release at another point/with another modifier must retain the last shown preview.
       await pointer("pointerup", { x: start.x + 3, y: start.y + 4 }, page(), !shift);
@@ -259,17 +261,21 @@ describe("user feedback app stress", () => {
           const center = object.type === "molecule" ? nativeMoleculeCenter(object)
             : { x: object.x + object.width / 2, y: object.y + object.height / 2 };
           // Distinct grab locations avoid interpreting consecutive drags as a double click.
-          const start = { x: center.x + 100 + i * 60 + (shift ? 30 : 0), y: center.y };
-          const end = { x: start.x, y: start.y + delta };
+          const radius = 100 + i * 60 + (shift ? 30 : 0);
+          const at = (degrees: number) => {
+            const radians = degrees * Math.PI / 180;
+            return { x: center.x + radius * Math.cos(radians), y: center.y + radius * Math.sin(radians) };
+          };
+          const end = at(delta);
           const absolute = reference + delta;
           const nearest = Math.round(absolute / 15) * 15;
           const snapped = shift || Math.abs(nearest - absolute) <= 3 ? nearest : absolute;
           const expected = rotateDocumentObject(before, id, snapped - reference);
           const handle = container.querySelector<HTMLElement>(".object-rotate-handle")!;
           expect(handle).not.toBeNull();
-          await pointer("pointerdown", start, handle, shift);
+          await pointer("pointerdown", at(0), handle, shift);
           // Cross the drag threshold before inspecting small final movements.
-          await pointer("pointermove", { x: start.x, y: start.y + 20 }, page(), shift, 7, 1);
+          await pointer("pointermove", at(20), page(), shift, 7, 1);
           await pointer("pointermove", end, page(), shift, 7, 1);
           await act(async () => { await vi.advanceTimersByTimeAsync(20); });
           if (object.type === "molecule") {

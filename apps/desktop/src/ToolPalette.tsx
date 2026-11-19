@@ -327,6 +327,11 @@ export function ToolPalette({
     .map((widget) => ({ ...widget, ...TOOLBAR_WIDGET_REGISTRY[widget.widgetId] }));
   const hidesGrid = presentWidgets.some((widget) => widget.gridMode === "hide-grid");
   const replacesGrid = presentWidgets.some((widget) => widget.gridMode === "replace-grid");
+  // Inspectors suppress their manifest launch buttons, and Art arranges its shipped buttons
+  // in fixed columns. Keep saved additions accessible beside those specialized controls.
+  const addedCommands = hidesGrid || replacesGrid
+    ? gridItemGroups.flat().filter(item => item.customAddition && item.primary.type === "command")
+    : [];
   // Palette-level class hooks (main-style-palette height cap, tooltip direction) follow ALL present
   // widgets — including grid citizens, which presentWidgets deliberately excludes from rendering.
   const widgetClassNames = [
@@ -365,7 +370,7 @@ export function ToolPalette({
   });
 
   const artCommandColumnElements = replacesGrid
-    ? artToolbarCommandColumns(gridItemGroups).map((column, columnIndex) => {
+    ? artToolbarCommandColumns(gridItemGroups.map(group => group.filter(item => !item.customAddition))).map((column, columnIndex) => {
         const elements = column.items.map((item, itemIndex) => {
           const tooltipId = `art-column-${columnIndex}-${itemIndex}-${item.id}`;
           return renderPaletteItem(item, tooltipId, item.id);
@@ -403,6 +408,7 @@ export function ToolPalette({
           ...widgetClassNames
         ].filter(Boolean).join(" ")}
         aria-label={title}
+        data-has-added-commands={addedCommands.length > 0 ? "" : undefined}
         data-tool-palette-orientation={orientation}
         data-tooltip-delay-ms={TOOLTIP_DELAY_MS}
         onPointerDownCapture={event => { if (!customize) preventPaletteCommandPointerFocus(event, platform); }}
@@ -438,6 +444,11 @@ export function ToolPalette({
             <Fragment key={widget.widgetId}>{widget.render()}</Fragment>
           )
         )}
+        {addedCommands.length > 0 ? (
+          <div className="tool-palette-added-commands" role="group" aria-label="Added commands">
+            {addedCommands.map(item => renderPaletteItem(item, `added-${item.id}`, item.id))}
+          </div>
+        ) : null}
       </aside>
     </ToolbarWidgetStateContext.Provider></PaletteControlTooltipContext.Provider>
   );
@@ -2475,6 +2486,7 @@ function ArtToolbarStyleControls() {
             value={percent}
             disabled={!selected || supportedCount === 0}
             aria-label={label}
+            aria-valuetext={valueLabel}
             data-palette-control="true"
             onPointerDown={(event) => {
               event.stopPropagation();
@@ -2536,14 +2548,16 @@ function ArtToolbarStyleControls() {
   };
 
   const marks = currentArtStyle?.electronMarks;
+  const markSize = marks?.sizePx.value ?? 8;
+  const markThickness = marks?.thicknessPx.value ?? 0.5;
   const markSliders = marks ? (
     <div className="art-inspector-row" data-electron-mark-controls="true">
-      {opacitySlider("Electron mark size", "Size", (marks.sizePx - 8) / 100,
+      {opacitySlider("Electron mark size", "Size", (markSize - 8) / 100,
         value => electronMarkStyleCommandId("size", value * 100), marks.count, undefined,
-        `${Math.round(marks.sizePx * 10) / 10}px`)}
-      {opacitySlider("Electron mark thickness", "Thickness", (marks.thicknessPx - 0.5) / 5,
+        marks.sizePx.mixed ? "Mixed" : `${markSize}px`)}
+      {opacitySlider("Electron mark thickness", "Thickness", (markThickness - 0.5) / 5,
         value => electronMarkStyleCommandId("thickness", value * 100), marks.count, undefined,
-        `${Math.round(marks.thicknessPx * 100) / 100}px`)}
+        marks.thicknessPx.mixed ? "Mixed" : `${Math.round(markThickness * 100) / 100}px`)}
     </div>
   ) : null;
   if (marks && marks.count === selectedCount) {

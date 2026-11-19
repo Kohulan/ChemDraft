@@ -103,6 +103,19 @@ describe("Name to Structure insertion placement", () => {
     await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: id } })); });
   }
 
+  it("replaces a successful status with the reason for a failed name, then with a later success", async () => {
+    harness.opsin.mockResolvedValueOnce({ smiles: "CCO" })
+      .mockResolvedValueOnce({ smiles: null, failureReason: "Unknown chemical name" })
+      .mockResolvedValueOnce({ smiles: "CCO" });
+    await mount(createEmptyDocument(), "unrecognized example name");
+    await act(async () => { await harness.runtime!.invokeCommand(commandId); });
+    expect(container.querySelector("[role=status]")?.textContent).toContain("OPSIN");
+    await act(async () => { await expect(harness.runtime!.invokeCommand(commandId)).rejects.toThrow(); });
+    expect(container.querySelector("[role=status]")?.textContent).toContain("Unknown chemical name");
+    await act(async () => { await harness.runtime!.invokeCommand(commandId); });
+    expect(container.querySelector("[role=status]")?.textContent).toContain("OPSIN");
+  });
+
   it("applies a reviewed edit without moving overlapping existing objects", async () => {
     const drawing = createEmptyDocument();
     const page = drawing.pages[0]!;
@@ -176,6 +189,27 @@ describe("Name to Structure insertion placement", () => {
     expect(page.objects).toEqual([harness.built]);
     expect(inserted.x + inserted.width / 2).toBeCloseTo(page.width / 2);
     expect(inserted.y + inserted.height / 2).toBeCloseTo(page.height / 2);
+  });
+
+  it("places successive results inside the visible page beyond the ruler", async () => {
+    harness.opsin.mockResolvedValue({ smiles: "CCO" });
+    const drawing = createEmptyDocument();
+    const port = await mount(drawing, "ethanol");
+    // The history port returns page coordinates after clipping the canvas and ruler band.
+    const visible = { x: 50, y: 50, width: 220, height: 180 };
+    vi.spyOn(port as unknown as { getViewportRect: () => typeof visible }, "getViewportRect").mockReturnValue(visible);
+    await act(async () => { await harness.runtime!.invokeCommand(commandId); });
+    await act(async () => { await harness.runtime!.invokeCommand(commandId); });
+    const page = port.read("initial")!.pages[0]!;
+    expect(page.objects).toHaveLength(2);
+    for (const object of page.objects) {
+      const rect = objectRect(object);
+      expect(rect.x).toBeGreaterThanOrEqual(visible.x);
+      expect(rect.y).toBeGreaterThanOrEqual(visible.y);
+      expect(rect.x + rect.width).toBeLessThanOrEqual(Math.min(page.width, visible.x + visible.width));
+      expect(rect.y + rect.height).toBeLessThanOrEqual(Math.min(page.height, visible.y + visible.height));
+    }
+    expect(overlaps(objectRect(page.objects[0]!), objectRect(page.objects[1]!))).toBe(false);
   });
 
   it.each(["filled molecule frame", "page border"])("keeps the original position without asking to enlarge a page occupied by %s", async kind => {

@@ -1,7 +1,7 @@
 import type { CommandDefinition, CommandRegistry } from "@chemdraft/plugin-host";
 
 export interface CoreCommandBinding {
-  spec: CommandDefinition;
+  spec: CommandDefinition & { disabledReason?: string };
   run: () => void | Promise<void>;
 }
 
@@ -44,7 +44,7 @@ export function createCoreCommandRegistrar(
           return { ok: false, commandId };
         }
         if (current.spec.enabled === false) {
-          throw new Error(`Command "${commandId}" is disabled.`);
+          throw new Error(current.spec.disabledReason ?? `Command "${commandId}" is disabled.`);
         }
         await current.run();
         return { ok: true, commandId };

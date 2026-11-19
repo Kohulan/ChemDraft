@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { applyToolsetLayoutState, parseToolsetLayoutState, type ToolsetLayoutState } from "@chemdraft/toolset-registry";
 import { MAIN_TOOLBAR_DEFAULTS_REVISION, mergeVisibilityIntoLayoutState, withCurrentMainToolbarDefaults } from "./toolbarLayoutState";
+import { createToolbarCatalog } from "./toolbarCatalog";
 import { createDesktopToolsetRegistry, desktopToolsets, getToolsetItemGroups, migrateMainToolbarDefaultsLayoutState } from "../toolsets";
 import { addToolsetItemAddition, emptyLayoutState, removeToolsetItem, resetAllLayouts, resetToolsetLayout, setItemHidden } from "./CustomizeToolbars/layoutStateEdits";
 
@@ -72,6 +73,95 @@ describe("mergeVisibilityIntoLayoutState", () => {
     const merged = mergeVisibilityIntoLayoutState(existing, ["core.main"], new Set());
     expect(merged.toolsetOverrides).toContainEqual({ toolsetId: "plugin.absent", visible: true });
     expect(merged.toolsetOverrides).toContainEqual({ toolsetId: "core.main", visible: false });
+  });
+});
+
+describe("live toolbar layout rebuild", () => {
+  it.each([42, null, { id: "edit.undo" }])("skips a non-string saved command ID (%j) and keeps valid siblings", commandId => {
+    const catalog = createToolbarCatalog();
+    const groupId = "core.layout.tools";
+    const saved = {
+      version: 1, mainToolbarDefaultsRevision: MAIN_TOOLBAR_DEFAULTS_REVISION, toolsetOverrides: [
+        { toolsetId: "core.main", title: "My Main Toolbar" },
+        { toolsetId: "core.layout", itemAdditions: [
+          { groupId, item: { commandId } },
+          { groupId, item: { commandId: "edit.undo" } }
+        ] }
+      ]
+    };
+    const before = structuredClone(saved);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      catalog.setLayoutState(saved);
+      catalog.setPluginToolsets([]);
+      expect(catalog.registry().require("core.main").title).toBe("My Main Toolbar");
+      expect(getToolsetItemGroups("core.layout", catalog.registry()).flat().map(item => item.id)).toContain("edit.undo");
+      expect(catalog.warnings()).toEqual([expect.stringContaining("malformed command")]);
+      expect(saved).toEqual(before);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("skips an added button naming a control or an unregistered flyout command", () => {
+    const catalog = createToolbarCatalog();
+    const groupId = "core.layout.tools";
+    const controlId = "widget.core.mainStyleControls";
+    const missingId = "plugin.uninstalled.extra";
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      catalog.setLayoutState({ version: 1, toolsetOverrides: [{
+        toolsetId: "core.layout", itemAdditions: [
+          { groupId, item: { commandId: controlId } },
+          { groupId, item: { commandId: "edit.undo", submenu: { type: "command-grid", items: [{ commandId: missingId }] } } },
+          { groupId, item: { commandId: "edit.redo" } }
+        ]
+      }] });
+      const ids = getToolsetItemGroups("core.layout", catalog.registry()).flat().map(item => item.id);
+      expect(ids).toContain("edit.redo");
+      expect(ids).not.toContain(controlId);
+      expect(ids).not.toContain("edit.undo");
+      expect(catalog.warnings()).toEqual([expect.stringContaining(controlId), expect.stringContaining(missingId)]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it.each([undefined, MAIN_TOOLBAR_DEFAULTS_REVISION])("skips invalid saved additions only in the registry (revision %s)", revision => {
+    const catalog = createToolbarCatalog();
+    const toolsetId = "core.main";
+    const groupId = catalog.registry().require(toolsetId).groups[0].id!;
+    const malformedId = "atom.problem.open.mol%2E1.a0";
+    const unknownId = "plugin.uninstalled.run";
+    const saved = {
+      version: 1, mainToolbarDefaultsRevision: revision, toolsetOverrides: [{
+        toolsetId,
+        itemOrder: { [groupId]: ["edit.undo", malformedId, "edit.redo"] },
+        itemAdditions: [
+          { groupId, item: { commandId: "edit.undo" } },
+          { groupId, item: { id: malformedId, primary: { type: "command", commandId: malformedId } } },
+          { groupId, item: { commandId: "edit.redo" } },
+          { groupId, item: { commandId: unknownId } }
+        ]
+      }]
+    };
+    const before = structuredClone(saved);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(() => parseToolsetLayoutState(saved)).toThrow();
+      expect(() => catalog.setLayoutState(saved)).not.toThrow();
+      expect(() => catalog.setPluginToolsets([])).not.toThrow();
+      const ids = getToolsetItemGroups(toolsetId, catalog.registry()).flat().map(item => item.id);
+      expect(ids.slice(0, 2)).toEqual(["edit.undo", "edit.redo"]);
+      expect(ids).toContain("tool.bond");
+      expect(ids).not.toContain(malformedId);
+      expect(ids).not.toContain(unknownId);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(malformedId));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(unknownId));
+      expect(saved).toEqual(before);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 

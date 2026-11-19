@@ -38,11 +38,16 @@ describe.each([false, true])("main's mark association policy with direct editing
   // the atom the user clicked." Valence warnings must never reassign duplicated radical ions.
   // The fixture captures raw anchors separately and checks every atom's charge/radical fields.
   it.each(specs)("matches main's stored anchors and resulting chemistry for %j", spec => {
-    for (const { name, before, patched } of mainAssociationCases(workflow, spec)) {
+    for (const { name, before, patched, warnings } of mainAssociationCases(workflow, spec)) {
       const beforeJson = JSON.stringify(before), patchedJson = JSON.stringify(patched);
       const result = normalizeDocumentEdit(before, patched);
       const expected = (mainOracle.cases as Record<string, unknown>)[`${JSON.stringify(spec)}: ${name}`];
       expect(expected, name).toBeDefined();
+      // fa5c8c137 makes new lone pairs explicit. a2537ded6 requires stale explicit
+      // copies to warn or fail, whereas main's legacy geometric fixture needed neither.
+      expect(warnings, name).toEqual(spec.kind === "lone-pair" && name === "stale paste missing atom"
+        ? ['Cannot preserve explicit electron mark "charge_003" association: copied atom "atom_001" in molecule "mol_bond_001" is missing.']
+        : []);
       if (["alignment", "crowded alignment", "crowded multi molecule group alignment"].includes(name)) {
         // Ordinary marks keep their anchors whenever carried with the molecule, selected or not.
         const state = associationState(patched, result.document);
@@ -133,10 +138,18 @@ describe.each([false, true])("main's mark association policy with direct editing
     }
   });
 
-  it.each(specs)("keeps main's stale point anchors for floating moves of %j", spec => {
+  it.each(specs)("keeps legacy stale point anchors and moves explicit floating anchors for %j", spec => {
     const { document, mark } = fixture(spec);
     const floating = { ...mark, anchor: { kind: "point" as const, point: { x: 600, y: 600 } }, x: 591, y: 591 };
     expect(electronMarkMoveAssociation(document, floating, { x: 600, y: 600 }, { x: 620, y: 620 })).toEqual({
+      // fa5c8c137 makes lone pairs explicit; 2942e07d0 moves explicit floating anchors
+      // with the mark so later normalization cannot silently attach them to an atom.
+      anchor: spec.kind === "charge" || spec.kind === "lone-pair"
+        ? { kind: "point", point: { x: 620, y: 620 } } : floating.anchor
+    });
+    // 2942e07d0 intentionally leaves files without the explicit flag on their legacy policy.
+    expect(electronMarkMoveAssociation(document, { ...floating, atomAssociation: undefined },
+      { x: 600, y: 600 }, { x: 620, y: 620 })).toEqual({
       anchor: spec.kind === "charge" ? { kind: "point", point: { x: 620, y: 620 } } : floating.anchor
     });
   });

@@ -13,19 +13,20 @@ import {
   closeToolsetPopoverWindow, createToolsetTextStylePayload, dismissToolsetPopovers,
   sendPaletteCommand, sendToolsetFlyoutKey, setToolsetPopoverContent,
   type ToolsetPopoverContentPayload, type ToolsetPopoverDismissPayload,
-  type ToolsetFlyoutKey, type ToolsetFlyoutSession, type ToolsetTextStylePayload
+  type ToolsetFlyoutKey, type ToolsetFlyoutSession, type ToolsetTextStylePayload, type AcceptedToolsetPopoverOpening
 } from "./window-manager";
 
 // Mount no document window: its router must not mask missing routing in the
 // standalone palette. Only the cross-window transport and native reveal are mocked.
 const native = vi.hoisted(() => ({
   content: new Set<(payload: ToolsetPopoverContentPayload) => void>(),
+  accepted: new Set<(opening: AcceptedToolsetPopoverOpening) => void>(),
   keys: new Set<(payload: ToolsetFlyoutKey) => void>(),
   closed: new Set<(payload: ToolsetFlyoutSession) => void>(),
   dismiss: new Set<(payload?: ToolsetPopoverDismissPayload) => void>(),
   textStyle: new Set<(payload: ToolsetTextStylePayload) => void>(),
   visible: false,
-  show: vi.fn(async () => { native.visible = true; }),
+  show: vi.fn(async () => { native.visible = true; return true; }),
   hide: vi.fn(async () => { native.visible = false; }),
   focus: vi.fn(async () => {})
 }));
@@ -41,6 +42,8 @@ vi.mock("./window-manager", async importOriginal => {
     ...actual,
     isDesktopRuntime: () => true,
     listenForToolsetPopoverContent: (handler: (payload: ToolsetPopoverContentPayload) => void) => subscribe(native.content, handler),
+    listenForAcceptedToolsetPopoverContent: (handler: (opening: AcceptedToolsetPopoverOpening) => void) => subscribe(native.accepted, handler),
+    notifyToolsetPopoverContentAccepted: async (opening: AcceptedToolsetPopoverOpening) => native.accepted.forEach(handler => handler(opening)),
     listenForToolsetFlyoutKeys: (handler: (payload: ToolsetFlyoutKey) => void) => subscribe(native.keys, handler),
     listenForToolsetFlyoutClosed: (handler: (payload: ToolsetFlyoutSession) => void) => subscribe(native.closed, handler),
     listenForToolsetPopoverDismiss: (handler: (payload?: ToolsetPopoverDismissPayload) => void) => subscribe(native.dismiss, handler),
@@ -49,6 +52,7 @@ vi.mock("./window-manager", async importOriginal => {
     setToolsetPopoverContent: vi.fn(async (toolsetId, content, anchor) => {
       native.content.forEach(handler => handler({ toolsetId, ...content, anchor }));
     }),
+    isToolsetPopoverVisible: async () => true,
     sendToolsetFlyoutKey: vi.fn(async payload => { native.keys.forEach(handler => handler(payload)); }),
     notifyToolsetFlyoutClosed: vi.fn(async payload => { native.closed.forEach(handler => handler(payload)); }),
     sendPaletteCommand: vi.fn(async () => {}),
@@ -87,7 +91,7 @@ describe.each(["macos", "windows"] as const)("standalone palette flyout keyboard
   });
   afterEach(async () => {
     await act(async () => root.unmount()); host.remove();
-    expect(native.content.size + native.keys.size + native.closed.size + native.dismiss.size + native.textStyle.size).toBe(0);
+    expect(native.content.size + native.accepted.size + native.keys.size + native.closed.size + native.dismiss.size + native.textStyle.size).toBe(0);
     vi.restoreAllMocks(); vi.unstubAllGlobals();
   });
   it("marks actual Charge and ring buttons for native command hit testing and excludes editable controls", () => {
@@ -116,7 +120,9 @@ describe.each(["macos", "windows"] as const)("standalone palette flyout keyboard
     const [toolsetId, content] = vi.mocked(setToolsetPopoverContent).mock.calls[0]!;
     if (content.kind !== "flyout") throw new Error("Expected ring flyout snapshot");
     const choices = content.flyout.commands.filter(command => command.enabled);
-    expect(native.show).toHaveBeenLastCalledWith("preserve", "flyout");
+    const flyoutOpening = { toolsetId, flyoutId: content.flyout.flyoutId,
+      openedAt: content.openedAt, generation: content.generation };
+    expect(native.show).toHaveBeenLastCalledWith("preserve", "flyout", flyoutOpening);
     expect(document.activeElement).toBe(button);
     expect(highlighted()).toBeNull();
     // Activation with no highlight must also be consumed, never invoke the owner.
@@ -133,7 +139,8 @@ describe.each(["macos", "windows"] as const)("standalone palette flyout keyboard
     }
     expect(setToolsetPopoverContent).toHaveBeenCalledTimes(1);
     expect(sendToolsetFlyoutKey).toHaveBeenLastCalledWith({
-      toolsetId, flyoutId: content.flyout.flyoutId, openedAt: content.openedAt, key: "ArrowDown"
+      toolsetId, flyoutId: content.flyout.flyoutId, openedAt: content.openedAt,
+      generation: content.generation, key: "ArrowDown"
     });
     expect((await key(activation)).defaultPrevented).toBe(true);
     expect((await key(activation, { repeat: true })).defaultPrevented).toBe(true);
@@ -141,7 +148,7 @@ describe.each(["macos", "windows"] as const)("standalone palette flyout keyboard
     // WKWebView can synthesize a button click after keyboard activation. The
     // palette's existing hold-open click guard must still suppress its primary.
     await act(async () => button.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })));
-    expect(sendPaletteCommand).toHaveBeenCalledExactlyOnceWith(choices[1].id);
+    expect(sendPaletteCommand).toHaveBeenCalledExactlyOnceWith(choices[1].id, { flyoutOpening });
     expect(native.hide).toHaveBeenCalledTimes(1);
     expect(native.focus).not.toHaveBeenCalled();
     expect(document.activeElement).toBe(button);

@@ -912,8 +912,10 @@ describe("chemical and drawing round trips", () => {
     expect(embedded.source).toBe("native-payload");
     expect(embedded.document).toEqual(savedDocument(document));
     const cdxml = exportDocumentToCdxml(document, { embedNativePayload: false }).contents;
-    expect(cdxml).toContain(`Start="${tail.x * 0.75} ${tail.y * 0.75}" End="${head.x * 0.75} ${head.y * 0.75}"`);
-    expect(cdxml).not.toMatch(/(?:Head|Tail)3D=/);
+    // Real Arrow objects carry directed standard endpoints in both formats, replacing Start/End aliases.
+    expect(cdxml).toContain(`Head3D="${head.x * 0.75} ${head.y * 0.75} 0"`);
+    expect(cdxml).toContain(`Tail3D="${tail.x * 0.75} ${tail.y * 0.75} 0"`);
+    expect(cdxml).toContain('<arrow ');
   });
 
   // Cover both tool presses: a triplet must share the tool's second-dot placement as well.

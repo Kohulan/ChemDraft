@@ -59,6 +59,74 @@ describe.each(["macos", "windows"] as const)("same-head label input (%s)", platf
     });
   }
 
+  it("retypes the RuMACHO PH arm as PPh2 and commits when focus returns to the canvas", async () => {
+    const seed = insertNativeSingleBondMolecule(createPhase4Document("RuMACHO"), { x: 300, y: 300 });
+    const original = seed.pages[0].objects[0] as MoleculeObject;
+    const source = { id: "p1", element: "PH", labelLiteral: true, x: 278, y: 316 };
+    const atoms = [source,
+      { id: "c1", element: "C", x: 258, y: 308 }, { id: "c2", element: "C", x: 258, y: 284 },
+      { id: "n", element: "NH", labelLiteral: true, x: 278, y: 274 },
+      { id: "c3", element: "C", x: 294, y: 256 }, { id: "c4", element: "C", x: 317, y: 260 },
+      { id: "p2", element: "PH", labelLiteral: true, x: 330, y: 281 },
+      { id: "ru", element: "Ru", x: 300, y: 302 }, { id: "h", element: "H", x: 300, y: 326 },
+      { id: "c5", element: "C", x: 326, y: 316, formalCharge: -1 }, { id: "o", element: "O", x: 348, y: 328, formalCharge: 1 }
+    ].map(atom => ({ formalCharge: 0, ...atom }));
+    const bonds = [
+      ["p1", "c1"], ["c1", "c2"], ["c2", "n"], ["n", "c3"], ["c3", "c4"], ["c4", "p2"],
+      ["ru", "h"], ["ru", "c5", "dashed"], ["c5", "o", "triple"],
+      ["p1", "ru", "dashed"], ["n", "ru", "dashed"], ["p2", "ru", "dashed"]
+    ].map(([fromAtomId, toAtomId, style], index) => ({
+      id: `bond${index + 1}`, fromAtomId, toAtomId, order: style === "triple" ? "triple" as const : "single" as const,
+      ...(style === "dashed" ? { display: { bondStyle: "dashed" as const } } : {})
+    }));
+    const initial = applyPatches(seed, [{ op: "updateObject", objectId: original.id, changes: { atoms, bonds } }]);
+    await act(async () => root.render(createElement(MainWindow, {
+      initialActiveToolCommandId: "tool.atom", initialCrosshairsVisible: false,
+      initialDocument: selectDocumentObjects(initial, initial.pages[0].id, []),
+      initialPaletteMode: "hidden", initialRulersVisible: false, nativePalette: true, shortcutPlatform: platform
+    })));
+    const rect = { x: 0, y: 0, left: 0, top: 0, right: 792, bottom: 612, width: 792, height: 612, toJSON: () => ({}) };
+    for (const element of container.querySelectorAll<HTMLElement>(".page, .canvas-region")) element.getBoundingClientRect = () => rect;
+    const canvas = container.querySelector<HTMLElement>(".canvas-region")!;
+    await act(async () => canvas.focus());
+    const before = molecule();
+    await act(async () => {
+      const event = new MouseEvent("pointerdown", {
+        bubbles: true, cancelable: true, button: 0, buttons: 1, clientX: source.x, clientY: source.y, detail: 1
+      });
+      Object.defineProperties(event, { pointerId: { value: 7 }, pointerType: { value: "mouse" }, isPrimary: { value: true } });
+      container.querySelector(".native-molecule-object")!.dispatchEvent(event);
+    });
+    const input = container.querySelector<HTMLInputElement>('[data-atom-label-editor="true"]')!;
+    expect(input.dataset.atomId).toBe(source.id);
+    expect(document.activeElement).toBe(input);
+    for (const draft of ["P", "PP", "PPh", "PPh2"]) {
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, draft);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      expect(input.value).toBe(draft);
+    }
+    // Focus stays in the document during the transfer, even though jsdom clears activeElement during blur.
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    await act(async () => canvas.focus());
+    expect(document.activeElement).toBe(canvas);
+    expect(container.querySelector('[data-atom-label-editor="true"]')).toBeNull();
+    const after = molecule();
+    expect(after.atoms.map(atom => atom.id)).toEqual(before.atoms.map(atom => atom.id));
+    expect(after.atoms.find(atom => atom.id === source.id)).toMatchObject({ element: "PPh2", formalCharge: 0 });
+    expect(after.bonds).toEqual(before.bonds);
+    expect(after.chemistry?.formula).toBe("C17H21NOP2Ru");
+    const expected = "[Ru]12([H])([C-]#[O+])P(CC[NH]1CC[PH]2)(c1ccccc1)c1ccccc1";
+    expect(Molecule.fromSmiles(after.structure).getIDCode()).toBe(Molecule.fromSmiles(expected).getIDCode());
+    const modifiers = { metaKey: platform === "macos", ctrlKey: platform === "windows" };
+    await press("z", modifiers);
+    expect(molecule()).toEqual(before);
+    expect(container.querySelector("main")?.getAttribute("data-can-undo")).toBe("false");
+    await press("z", { ...modifiers, shiftKey: true });
+    expect(molecule()).toEqual(after);
+  });
+
   it.each(["hover", "editor", "text"] as const)("shows the isotope refusal through %s and preserves the chemistry", async entry => {
     const seed = insertNativeSingleBondMolecule(createPhase4Document(), { x: 300, y: 300 });
     const original = seed.pages[0].objects[0] as MoleculeObject;

@@ -1,10 +1,11 @@
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { applyPatches, type ChemDraftDocument, type MoleculeObject, type ViewMatrix } from "@chemdraft/chem-core";
-import { planPageSvgRender } from "@chemdraft/layout-engine";
+import { openChemDraftPayload } from "@chemdraft/cdx-compat";
+import { applyPatch, applyPatches, resolveRepeatUnitAtomMembership, type ChemDraftDocument, type MoleculeObject, type ViewMatrix } from "@chemdraft/chem-core";
+import { planPageSvgRender, transformPointForObject } from "@chemdraft/layout-engine";
 import { depictSmiles2D, ensureOclResources, oclConformerGenerator, type Depiction2D } from "@chemdraft/ocl-adapter";
 
-import { createPhase4Document, flattenNativeMolecule3d, flattenSpunMolecule } from "./documentWorkflow";
+import { copyAsMolfile, createPhase4Document, flattenNativeMolecule3d, flattenSpunMolecule, normalizeCommittedDocument } from "./documentWorkflow";
 import { quatFromAxisAngle, quatToViewMatrix } from "./interaction/rotation3d";
 import { bondDepthWeights, projectSpin, spinJoinedBondFragments, type ScreenPlacement } from "./interaction/spinOverlay";
 import { projectedDoubleBondSides } from "./interaction/projectedDoubleBondSides";
@@ -136,6 +137,58 @@ describe("flattenSpunMolecule — commit mechanics", () => {
     const outcome = flattenSpunMolecule(document, "mol_bad", [0, 0, 0], IDENTITY); // wrong length
     expect(outcome.status).toBe("refused");
     expect(outcome.document).toBe(document); // identical reference — untouched
+  });
+
+  it("refuses to flatten when reversing an imported SRU crossing makes its membership unresolved", () => {
+    const document = openChemDraftPayload(`<CDXML>
+      <page id="1" BoundingBox="0 0 612 792">
+        <fragment id="10">
+          <n id="11" Element="9" p="330 300"/>
+          <n id="12" Element="6" p="300 300"/>
+          <n id="13" Element="17" p="285 274"/>
+          <n id="14" Element="35" p="285 326"/>
+          <b id="15" B="11" E="12" Order="1"/>
+          <b id="16" B="12" E="13" Order="1" Display="WedgeBegin"/>
+          <b id="17" B="12" E="14" Order="1"/>
+        </fragment>
+        <graphic id="20" GraphicType="Bracket" BracketType="Square" BoundingBox="273 310 280 260"/>
+        <graphic id="21" GraphicType="Bracket" BracketType="Square" BoundingBox="310 260 317 310"/>
+        <bracketedgroup id="30" BracketedObjectIDs="12 13" BracketUsage="SRU" SRULabel="n">
+          <bracketattachment id="31" GraphicID="20"><crossingbond id="32" BondID="17" InnerAtomID="12"/></bracketattachment>
+          <bracketattachment id="33" GraphicID="21"><crossingbond id="34" BondID="15" InnerAtomID="12"/></bracketattachment>
+        </bracketedgroup>
+      </page>
+    </CDXML>`).document!;
+    const page = document.pages[0];
+    const original = page.objects.find(object => object.type === "molecule")!;
+    const membershipIn = (doc: ChemDraftDocument) => {
+      const { objects } = doc.pages[0];
+      const pair = objects.filter(object => object.type === "bracket");
+      return resolveRepeatUnitAtomMembership(pair, objects, { atomPosition: transformPointForObject });
+    };
+    const before = membershipIn(document);
+    expect(before).toMatchObject({ imported: true, unresolved: false });
+    const salRecord = "M  SAL   1  2   2   3";
+    expect(copyAsMolfile(document, "v2000", [])).toContain(salRecord);
+
+    // F projects out of plane, moving the wedge onto the F–C crossing and reversing it.
+    const coords3d = [1, 0, 1, 0, 0, 0, -0.5, 0.87, 0, -0.5, -0.87, 0];
+    const projected = flattenNativeMolecule3d(original, coords3d, IDENTITY, { bounds: page });
+    expect(projected.status, projected.refusalReasons.join(" ")).toBe("committed");
+    const { atoms, bonds, structure, structureFormat } = projected.molecule!;
+    const candidate = normalizeCommittedDocument(applyPatch(document, {
+      op: "updateObject", objectId: original.id, changes: { atoms, bonds, structure, structureFormat }
+    }));
+    const after = membershipIn(candidate);
+    expect(after.members.map(member => member.atomIds)).toEqual(before.members.map(member => member.atomIds));
+    expect(after).toMatchObject({ unresolved: true, reason: expect.stringContaining("no longer has its original endpoints") });
+    expect(copyAsMolfile(candidate, "v2000", [])).not.toContain("M  SAL");
+
+    const outcome = flattenSpunMolecule(document, original.id, coords3d, IDENTITY);
+    expect(outcome.status).toBe("refused");
+    expect(outcome.refusalReasons).toEqual(["the polymer bracket's crossing bonds could no longer be matched from this view. Rotate slightly and try again."]);
+    expect(outcome.document).toBe(document);
+    expect(copyAsMolfile(outcome.document, "v2000", [])).toContain(salRecord);
   });
 });
 

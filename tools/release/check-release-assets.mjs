@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { expectedReleaseCommit, missingBuildFiles, releaseBuildFiles, verifyBuildAssets, verifyWindowsUpdateAssets, writeReleaseChecksums } from "./release-assets.mjs";
 import { verifyDmgSourceCommit } from "./macos-dmg.mjs";
+import { verifyReleaseChecksums } from "./release-checksums.mjs";
 
 const ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
@@ -42,6 +43,7 @@ export function checkReleaseAssets({ tag, version = tag?.replace(/^v/, ""), comm
     if (allowIncomplete) verifyWindowsUpdateAssets({ assets: folder, version, allowIncomplete }, { updaterPublicKey });
     const missing = missingBuildFiles(folder, version);
     if (checksumOutput) writeReleaseChecksums(folder, checksumOutput);
+    else verifyReleaseChecksums(folder);
     if (missing.length) return { complete: false, missing };
     return { complete: true, commit: expectedCommit, builds };
   } finally { if (temporary) cleanup(folder); }

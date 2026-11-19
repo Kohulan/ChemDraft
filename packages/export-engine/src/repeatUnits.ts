@@ -1,4 +1,4 @@
-import { bracketChemistryWarnings, bracketPairs, resolveRepeatUnitAtomMembership, type DocumentObject, type ChemDraftDocument, type MoleculeObject, type MolfileWriteOptions } from "@chemdraft/chem-core";
+import { bracketChemistryWarnings, bracketPairs, bracketPairUsage, resolveRepeatUnitAtomMembership, type DocumentObject, type ChemDraftDocument, type MoleculeObject, type MolfileWriteOptions } from "@chemdraft/chem-core";
 import { transformPointForObject } from "@chemdraft/layout-engine";
 import type { ExportWarning } from "./results";
 
@@ -17,8 +17,7 @@ type RepeatUnit = {
 export function repeatUnits(document: ChemDraftDocument, molecules?: readonly MoleculeObject[]): RepeatUnit[] {
   const exported = molecules && new Set(molecules.map(molecule => molecule.id));
   return document.pages.flatMap(page => [...bracketPairs(page.objects).values()].flatMap(pair => {
-    const usage = pair.find(object => object.bracketUsage && object.bracketUsage !== "generic")?.bracketUsage ??
-      (pair.some(object => object.repeatUnit || object.bracketKind === "polymer") ? "sru" : "generic");
+    const usage = bracketPairUsage(pair);
     if (usage === "generic") return [];
     const close = pair.find(object => object.side === "close")!;
     const explicit = new Set(pair.flatMap(object => object.containedObjectIds));

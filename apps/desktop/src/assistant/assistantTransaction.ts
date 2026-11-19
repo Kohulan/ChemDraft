@@ -83,7 +83,7 @@ export class AssistantTransactions {
 
   /** Call only after the host has validated the patch and fixed write scope. No tool is retained. */
   writeAssistantTransaction(txId: string, after: ChemDraftDocument, touchedIds: readonly string[] = [],
-    selectionDocument: ChemDraftDocument = after, assertFinalDocument?: (document: ChemDraftDocument) => void): void {
+    selectionDocument: ChemDraftDocument = after, assertFinalDocument?: (document: ChemDraftDocument) => ChemDraftDocument | void): void {
     const tx = this.running(txId);
     const current = this.document(tx.tabId);
     if (after === current) return;

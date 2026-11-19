@@ -1,13 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
-import { applyPatch, undo, redo, type BracketObject, type ChemDraftDocument } from "@chemdraft/chem-core";
+import { applyPatch, applyPatches, resolveRepeatUnitAtomMembership, toEngineDocument, undo, redo, withoutBracketPairMetadata,
+  type BracketObject, type ChemDraftDocument, type GroupObject, type MoleculeObject } from "@chemdraft/chem-core";
 import { exportDocumentToCdxml, openChemDraftPayload } from "@chemdraft/cdx-compat";
 import { repeatUnitExportWarnings } from "@chemdraft/export-engine";
-import { bracketRepeatUnitStatus, createBracketCommands, selectedBracketPair, setBracketRepeatLabel, toggleBracketRepeatUnit } from "./bracketCommands";
+import { bracketRepeatUnitStatus, createBracketCommands, prepareCleanupRepeatUnits, selectedBracketPair, setBracketRepeatLabel, toggleBracketRepeatUnit } from "./bracketCommands";
 import { bracketLabelContainsPoint, bracketLabelPlan, transformPointForObject } from "@chemdraft/layout-engine";
-import { applySingleBondToolAtPoint, copyAsMolfile, copyAsSmiles, createPhase4Document,
+import { applyEraserSweep } from "./MainWindow";
+import { applyNativeMoleculePartsDelete, nativeFreeformSingleBondToolAtPoint, applySingleBondToolAtPoint, copyAsMolfile, copyAsSmiles, createPhase4Document,
   analysisFacingStructure, createSelectionClipboardPayload, deleteSelectedDocumentObjects, duplicateSelectedDocumentObjects, insertNativeBracket, pasteSelectionClipboardPayload } from "./documentWorkflow";
 import { exportStructureListSdf, exportStructureListSmi } from "./structureListExport";
 import { allShellCommands } from "./commands";
+import type { NativeMoleculePartSelection } from "./selection/selectionPolicy";
 
 vi.mock("@chemdraft/rdkit-adapter/identifiers", () => ({ computeStructureIdentifiers: vi.fn(async () => undefined) }));
 vi.mock("./rdkitWasmLoader", () => ({ registerRdkitWasmLoader: vi.fn() }));
@@ -25,6 +28,301 @@ function expectPlainBracket(object: BracketObject) {
   expect(object.repeatCount).toBeUndefined();
   expect(object.crossingBondIds).toBeUndefined();
 }
+
+function repeatChain() {
+  const document = createPhase4Document("Repeat chain");
+  const molecule: MoleculeObject = { id: "chain", type: "molecule", x: 110, y: 140, width: 120, height: 1, rotation: 0,
+    style: {}, structure: "CCCCC", structureFormat: "smiles", superatoms: [], rGroups: [],
+    atoms: [110, 140, 170, 200, 230].map((x, index) => ({ id: `a${index + 1}`, element: "C", x, y: 140, formalCharge: 0 })),
+    bonds: [1, 2, 3, 4].map(index => ({ id: `b${index}`, fromAtomId: `a${index}`, toAtomId: `a${index + 1}`, order: "single" })) };
+  return { molecule, document: applyPatch(document, { op: "addObject", pageId: document.pages[0].id, object: molecule }) };
+}
+
+const repeatAction = (document: ChemDraftDocument, parts: NativeMoleculePartSelection[]) =>
+  createBracketCommands(document, parts).find(action => action.id === "bracket.repeatUnit.toggle")!;
+const chainParts = (atomIds: string[], bondIds: string[] = []): NativeMoleculePartSelection =>
+  ({ objectId: "chain", kind: "parts", atomIds, bondIds });
+
+it("refits the paired glyph while leaving a later bracket with the same id alone", () => {
+  const { document, molecule } = repeatChain();
+  const marked = toggleBracketRepeatUnit(document, [chainParts(["a2", "a3", "a4"])]);
+  const page = marked.pages[0]!;
+  const opening = bracketObjects(marked).find(bracket => bracket.side === "open")!;
+  const spectator = withoutBracketPairMetadata({ ...opening, x: 400, y: 300 });
+  const before = toEngineDocument({ ...marked, pages: [{ ...page, objects: [...page.objects, spectator] }] });
+  const candidate = applyPatch(before, { op: "updateObject", objectId: molecule.id, changes: {
+    x: molecule.x + 200, atoms: molecule.atoms.map(atom => ({ ...atom, x: atom.x + 200 }))
+  } }, { preserveRepeatUnitBrackets: true });
+
+  const { document: cleaned } = prepareCleanupRepeatUnits(before, candidate, [molecule.id]);
+
+  expect(bracketObjects(cleaned)[0]!.x).toBe(opening.x + 200);
+  expect(cleaned.pages[0]!.objects.at(-1)).toBe(candidate.pages[0]!.objects.at(-1));
+});
+
+describe("marking an atom selection as a repeat unit", () => {
+  it("creates the same selected bracket objects and MOL crossing bonds as drawing the pair first", () => {
+    const { document, molecule } = repeatChain();
+    const before = applyPatch(document, { op: "setSelection", objectIds: [molecule.id] });
+    const parts = [chainParts(["a2", "a3", "a4"], ["b2", "b3"])];
+    expect(repeatAction(before, parts)).toMatchObject({ title: "Mark as Repeat Unit", enabled: true });
+    expect(repeatAction(before, parts).disabledReason).toBeUndefined();
+    const marked = toggleBracketRepeatUnit(before, parts);
+    const drawn = toggleBracketRepeatUnit(insertNativeBracket(before, { x: 132, y: 132 }, "square", { x: 208, y: 148 }));
+    expect(bracketObjects(marked)).toEqual(bracketObjects(drawn));
+    expect(marked.selection).toEqual(drawn.selection);
+    expect(bracketRepeatUnitStatus(marked)).toBe('Marked 3 atoms as repeat unit "n"');
+    expect(copyAsMolfile(marked, "v3000")).toEqual(copyAsMolfile(drawn, "v3000"));
+    expect(copyAsMolfile(marked, "v3000")).toContain("SRU 0 ATOMS=(3 2 3 4) XBONDS=(2 1 4) LABEL=n CONNECT=EU");
+    const retained = marked.pages[0].objects.find(object => object.id === molecule.id) as MoleculeObject;
+    expect(retained.atoms).toEqual(molecule.atoms);
+    expect(retained.bonds).toEqual(molecule.bonds);
+  });
+
+  it("allocates a pair id independently of object ids and keeps an unrelated existing pair", () => {
+    const { document } = repeatChain();
+    const existing = toggleBracketRepeatUnit(insertNativeBracket(document,
+      { x: 400, y: 250 }, "square", { x: 480, y: 300 }));
+    const pair = bracketObjects(existing);
+    const oldPairId = "bracket_004"; // The object allocator's next opening glyph id.
+    const before = applyPatches(existing, [
+      ...pair.map(bracket => ({
+        op: "updateObject" as const, objectId: bracket.id, changes: { pairId: oldPairId }
+      })),
+      { op: "setSelection", objectIds: [] }
+    ]);
+    const marked = toggleBracketRepeatUnit(before, [chainParts(["a2"])]);
+    const [oldOpen, oldClose, newOpen, newClose] = bracketObjects(marked);
+    expect(oldOpen.pairId).toBe(oldPairId);
+    expect(oldClose).toMatchObject({ pairId: oldPairId, label: "n" });
+    expect(newOpen.id).toBe(oldPairId);
+    expect(newOpen.pairId).toBeTruthy();
+    expect(newOpen.pairId).not.toBe(oldPairId);
+    expect(newClose).toMatchObject({ pairId: newOpen.pairId, label: "n" });
+  });
+
+  it("accepts three crossing bonds under the existing MOL boundary rules", () => {
+    const { document, molecule } = repeatChain();
+    const branched = applyPatch(document, { op: "updateObject", objectId: molecule.id, changes: {
+      atoms: [...molecule.atoms, { id: "branch", element: "C", x: 170, y: 110, formalCharge: 0 }],
+      bonds: [...molecule.bonds, { id: "b5", fromAtomId: "a3", toAtomId: "branch", order: "single" }]
+    } });
+    const parts = [chainParts(["a3"])];
+    expect(repeatAction(branched, parts).enabled).toBe(true);
+    expect(copyAsMolfile(toggleBracketRepeatUnit(branched, parts), "v3000")).toContain("XBONDS=(3 2 3 5)");
+  });
+
+  it.each([
+    ["all atoms", "no crossing bonds"], ["isolated atom", "no crossing bonds"],
+    ["multiple molecules", "from a single molecule"], ["mixed objects", "Deselect whole objects"],
+    ["a bond without atoms", "Select a bracket pair or atoms"], ["already bracketed", "already inside a repeat unit"],
+    ["nonmembers inside the box", "would also enclose unselected atoms"]
+  ] as const)("refuses %s with a specific reason and no edit", (reasonCase, expected) => {
+    const chain = repeatChain();
+    let { document } = chain;
+    let parts = [chainParts(["a2"])];
+    if (reasonCase === "all atoms") parts = [chainParts(chain.molecule.atoms.map(atom => atom.id))];
+    if (reasonCase === "isolated atom") document = applyPatch(document, {
+      op: "updateObject", objectId: chain.molecule.id, changes: { bonds: chain.molecule.bonds.slice(2) }
+    });
+    if (reasonCase === "multiple molecules") {
+      const other = { ...chain.molecule, id: "other" };
+      document = applyPatch(document, { op: "addObject", pageId: document.pages[0].id, object: other });
+      parts.push({ objectId: other.id, kind: "atom", atomId: "a2" });
+    }
+    if (reasonCase === "mixed objects") document = insertNativeBracket(document, { x: 400, y: 400 }, "square");
+    if (reasonCase === "a bond without atoms") parts = [chainParts([], ["b2"])];
+    if (reasonCase === "already bracketed") document = applyPatch(toggleBracketRepeatUnit(document, parts), { op: "setSelection", objectIds: [] });
+    if (reasonCase === "nonmembers inside the box") parts = [chainParts(["a2", "a4"])];
+    const action = repeatAction(document, parts);
+    expect(action.enabled).toBe(false);
+    expect(action.disabledReason).toContain(expected);
+    expect(toggleBracketRepeatUnit(document, parts)).toBe(document);
+  });
+});
+
+describe("deleting repeat-unit members", () => {
+  it.each([false, true])("deletes bracket geometry and label with the molecule (explicitly select one glyph: %s)", includeGlyph => {
+    const { document, molecule } = repeatChain();
+    const marked = toggleBracketRepeatUnit(document, [chainParts(["a2", "a3", "a4"])]);
+    const repeat = setBracketRepeatLabel(marked, bracketObjects(marked).find(bracket => bracket.side === "close")!.id, "m");
+    const [open, close] = bracketObjects(repeat);
+    expect(close.label).toBe("m");
+    const selection = includeGlyph ? [molecule.id, open.id] : [molecule.id];
+    const before = applyPatch(repeat, { op: "setSelection", objectIds: selection });
+    const deleted = deleteSelectedDocumentObjects(before);
+    expect(deleted.pages[0].objects).toEqual([]);
+    expect(repeatUnitExportWarnings(deleted, "MOL")).toEqual([]);
+    expect(exportDocumentToCdxml(deleted, { embedNativePayload: false }).contents).not.toContain("bracketedgroup");
+    expect(undo({ past: [before], present: deleted, future: [] }).present).toBe(before);
+  });
+
+  it.each([false, true])("counts explicitly contained structure-only members until the last deletion (mixed: %s)", mixed => {
+    const chain = repeatChain();
+    const pageId = chain.document.pages[0].id;
+    const stored: MoleculeObject = { ...chain.molecule, id: "stored", x: 150, y: 160, structure: "CO", atoms: [], bonds: [] };
+    let document = applyPatch(chain.document, { op: "addObject", pageId, object: stored });
+    if (!mixed) document = applyPatch(document, { op: "removeObject", objectId: chain.molecule.id });
+    const repeat = toggleBracketRepeatUnit(insertNativeBracket(document, { x: 90, y: 100 }, "square", { x: 270, y: 210 }));
+    expect(bracketObjects(repeat).every(bracket => bracket.containedObjectIds.includes(stored.id))).toBe(true);
+    const remaining = mixed ? deleteSelectedDocumentObjects(repeat, [chain.molecule.id]) : repeat;
+    expect(bracketObjects(remaining)).toEqual(bracketObjects(repeat).map(bracket => ({ ...bracket, containedObjectIds: [stored.id] })));
+    expect(deleteSelectedDocumentObjects(remaining, [stored.id]).pages[0].objects).toEqual([]);
+  });
+
+  it("prunes the explicitly erased molecule and both orphaned glyphs from nested groups", () => {
+    const repeat = repeatAroundMolecule();
+    const page = repeat.pages[0];
+    const molecule = page.objects.find(object => object.type === "molecule")!;
+    const [open, close] = bracketObjects(repeat);
+    const group: GroupObject = { id: "survivingGroup", type: "group", childObjectIds: [open.id, "retained"],
+      x: 75, y: 75, width: 120, height: 120, rotation: 0, style: {} };
+    const before = applyPatches(repeat, [
+      { op: "addObject", pageId: page.id, object: { id: "retained", type: "plus", x: 75, y: 75, width: 12, height: 12, rotation: 0, style: {} } },
+      { op: "addObject", pageId: page.id, object: group },
+      { op: "addObject", pageId: page.id, object: { ...group, id: "emptyGroup", childObjectIds: [molecule.id, open.id, close.id] } },
+      { op: "addObject", pageId: page.id, object: { ...group, id: "parent", childObjectIds: ["emptyGroup"] } }
+    ]);
+    const after = applyEraserSweep(before, { objectIds: [molecule.id], moleculeParts: [] });
+    expect(after.pages[0].objects.map(object => object.id)).toEqual(["retained", group.id]);
+    expect(after.pages[0].objects.at(-1)).toEqual({ ...group, childObjectIds: ["retained"] });
+  });
+
+  it("prunes only the ids removed by separate erasures of two repeat-unit members", () => {
+    let drawing = applySingleBondToolAtPoint(createPhase4Document("Two members"), { x: 140, y: 140 });
+    drawing = applySingleBondToolAtPoint(drawing, { x: 220, y: 140 });
+    const repeat = toggleBracketRepeatUnit(insertNativeBracket(drawing, { x: 100, y: 100 }, "square", { x: 300, y: 200 }));
+    const page = repeat.pages[0];
+    const [first, second] = page.objects.filter(object => object.type === "molecule");
+    const glyphIds = bracketObjects(repeat).map(bracket => bracket.id);
+    const group: GroupObject = { id: "group", type: "group", childObjectIds: [first.id, ...glyphIds, "previously-missing"],
+      x: 75, y: 75, width: 220, height: 120, rotation: 0, style: {} };
+    const before = applyPatch(repeat, { op: "addObject", pageId: page.id, object: group });
+    const partial = applyEraserSweep(before, { objectIds: [first.id], moleculeParts: [] });
+    expect(partial.pages[0].objects.find(object => object.id === group.id))
+      .toEqual({ ...group, childObjectIds: [...glyphIds, "previously-missing"] });
+    const after = applyEraserSweep(partial, { objectIds: [second.id], moleculeParts: [] });
+    expect(after.pages[0].objects).toEqual([{ ...group, childObjectIds: ["previously-missing"] }]);
+  });
+
+  it("removes the opposite glyph when one eraser sweep hits a glyph and every member atom", () => {
+    const { document, molecule } = repeatChain();
+    const repeat = toggleBracketRepeatUnit(document, [chainParts(["a2", "a3", "a4"])]);
+    const [open] = bracketObjects(repeat);
+    const after = applyEraserSweep(repeat, { objectIds: [open.id], moleculeParts: [
+      { objectId: molecule.id, kind: "parts", atomIds: ["a2", "a3", "a4"], bondIds: [] }
+    ] });
+    expect(bracketObjects(after)).toEqual([]);
+    expect(after.pages[0].objects[0]).toMatchObject({ id: molecule.id, atoms: [{ id: "a1" }, { id: "a5" }] });
+  });
+
+  it.each([false, true])("retains an imported atom SRU through a merge and resolves only proven membership (unresolved: %s)", unresolved => {
+    const imported = openChemDraftPayload(`<CDXML><page id="1">
+      <fragment id="10"><n id="11" Element="6" p="100 140"/><n id="12" Element="6" p="130 140"/>
+        <b id="13" B="11" E="12" Order="1"/></fragment>
+      <graphic id="20" GraphicType="Bracket" BracketType="Round" BoundingBox="85 120 90 160"/>
+      <graphic id="21" GraphicType="Bracket" BracketType="Round" BoundingBox="110 120 115 160"/>
+      <bracketedgroup id="30" BracketedObjectIDs="${unresolved ? "11 999" : "11"}" BracketUsage="SRU" SRULabel="n">
+        <bracketattachment id="31" GraphicID="20"><crossingbond id="32" BondID="13" InnerAtomID="11"/></bracketattachment>
+        <bracketattachment id="33" GraphicID="21"/>
+      </bracketedgroup></page></CDXML>`).document!;
+    const page = imported.pages[0];
+    const absorbed = page.objects.find(object => object.type === "molecule")!;
+    const [member, outside] = absorbed.atoms;
+    const { molecule } = repeatChain();
+    const host = { ...molecule, atoms: molecule.atoms.map((atom, index) => ({ ...atom,
+      x: outside.x + 40 + index * 30, y: outside.y
+    })) };
+    const before = applyPatch(imported, { op: "addObject", pageId: page.id, object: host });
+    const after = nativeFreeformSingleBondToolAtPoint(before, host.id, host.atoms[0].id, outside).document;
+    expect(after.pages[0].objects.some(object => object.id === absorbed.id)).toBe(false);
+    const kept = bracketObjects(after);
+    expect(kept).toHaveLength(2);
+    expect(kept[1]).toMatchObject({ label: "n", pairId: bracketObjects(before)[1].pairId });
+    const membership = resolveRepeatUnitAtomMembership(kept, after.pages[0].objects);
+    const merged = after.pages[0].objects.find(object => object.id === host.id && object.type === "molecule") as MoleculeObject;
+    const moved = merged.atoms.find(atom => atom.cdxmlSourceId === "11")!;
+    expect(moved.id).not.toBe(member.id);
+    expect(membership.members.map(({ molecule, atomIds }) => [molecule.id, atomIds])).toEqual([[host.id, [moved.id]]]);
+    if (unresolved) {
+      expect(membership.reason).toContain('member "999" does not resolve');
+      expect(bracketObjects(deleteSelectedDocumentObjects(before, [absorbed.id]))).toHaveLength(2);
+    } else {
+      expect(membership.reason).toBeUndefined();
+      expect(copyAsMolfile(after, "v3000")).toContain("SRU 0 ATOMS=(1");
+    }
+  });
+
+  it("carries staged atom-deletion proof through a merge after an incident bond was erased", () => {
+    const imported = openChemDraftPayload(`<CDXML><page id="1">
+      <fragment id="10"><n id="11" Element="6" p="100 140"/><n id="12" Element="6" p="130 140"/>
+        <n id="14" Element="6" p="160 140"/><b id="13" B="11" E="12" Order="1"/>
+        <b id="15" B="12" E="14" Order="1"/></fragment>
+      <graphic id="20" GraphicType="Bracket" BracketType="Round" BoundingBox="85 120 90 160"/>
+      <graphic id="21" GraphicType="Bracket" BracketType="Round" BoundingBox="145 120 150 160"/>
+      <bracketedgroup id="30" BracketedObjectIDs="11 12" BracketUsage="SRU" SRULabel="n">
+        <bracketattachment id="31" GraphicID="20"/><bracketattachment id="33" GraphicID="21"/>
+      </bracketedgroup></page></CDXML>`).document!;
+    const absorbed = imported.pages[0].objects.find(object => object.type === "molecule")!;
+    const [first, second, outside] = absorbed.atoms;
+    const staged = applyNativeMoleculePartsDelete(imported, { objectId: absorbed.id, atomIds: [first.id], bondIds: [] });
+    const { molecule } = repeatChain();
+    const host = { ...molecule, atoms: molecule.atoms.map((atom, i) => ({ ...atom, x: outside.x + 40 + 30 * i, y: outside.y })) };
+    const before = applyPatch(staged, { op: "addObject", pageId: staged.pages[0].id, object: host });
+    const after = nativeFreeformSingleBondToolAtPoint(before, host.id, host.atoms[0].id, outside).document;
+    const merged = after.pages[0].objects.find(object => object.id === host.id && object.type === "molecule") as MoleculeObject;
+    const remapped = merged.atoms.find(atom => atom.cdxmlSourceId === "12")!;
+    expect(remapped.id).not.toBe(second.id);
+    expect(bracketObjects(after)).toHaveLength(2);
+    for (const glyph of bracketObjects(after)) {
+      const metadata = glyph.compatibility?.unknown;
+      expect(metadata?.cdxmlBracketDeletedAtoms).toEqual([["11", first.id]]);
+      expect(metadata?.cdxmlBracketAtomSnapshots?.find(snapshot => snapshot.sourceId === "12")?.atomId).toBe(remapped.id);
+    }
+    expect(deleteSelectedDocumentObjects(after, [merged.id]).pages[0].objects).toEqual([]);
+  });
+
+  it("keeps a partial unit and prunes only crossing references to deleted bonds", () => {
+    const { document, molecule } = repeatChain();
+    const repeat = toggleBracketRepeatUnit(document, [chainParts(["a2", "a3", "a4"])]);
+    const [open, close] = bracketObjects(repeat);
+    const before = applyPatch(repeat, { op: "updateObject", objectId: open.id, changes: {
+      crossingBondIds: ["b1", "b4"].map(bondId => ({ objectId: molecule.id, bondId }))
+    } });
+    const partial = applyNativeMoleculePartsDelete(before, { objectId: molecule.id, atomIds: ["a2"], bondIds: [] });
+    expect(bracketObjects(partial)).toEqual([{ ...open, crossingBondIds: [{ objectId: molecule.id, bondId: "b4" }] }, close]);
+    expect(copyAsMolfile(partial, "v3000")).toContain("SRU 0 ATOMS=(2 2 3) XBONDS=(1 2) LABEL=n CONNECT=EU");
+    const orphaned = applyNativeMoleculePartsDelete(partial, { objectId: molecule.id, atomIds: ["a3", "a4"], bondIds: [] });
+    expect(bracketObjects(orphaned)).toEqual([]);
+    expect(repeatUnitExportWarnings(orphaned, "SMILES")).toEqual([]);
+  });
+
+  it("cleans up a unit drawn around page-space atoms of a rotated molecule", () => {
+    const { document, molecule } = repeatChain();
+    const rotated = applyPatch(document, { op: "updateObject", objectId: molecule.id, changes: { rotation: 90 } });
+    const marked = toggleBracketRepeatUnit(rotated, [chainParts(["a2", "a3", "a4"])]);
+    expect(bracketRepeatUnitStatus(marked)).toBe('Marked 3 atoms as repeat unit "n"');
+    const removed = applyPatch(marked, { op: "removeObject", objectId: molecule.id });
+    expect(removed.pages[0].objects).toEqual([]);
+  });
+
+  it("waits until the last member of a multi-molecule drawn unit is deleted, including in a batch", () => {
+    let plain = applySingleBondToolAtPoint(createPhase4Document("Two members"), { x: 140, y: 140 });
+    plain = applySingleBondToolAtPoint(plain, { x: 220, y: 140 });
+    const repeat = toggleBracketRepeatUnit(insertNativeBracket(plain, { x: 100, y: 100 }, "square", { x: 300, y: 200 }));
+    const [first, second] = repeat.pages[0].objects.filter(object => object.type === "molecule");
+    const [open, close] = bracketObjects(repeat);
+    const firstRemoval = { op: "removeObject" as const, objectId: first.id };
+    const secondRemoval = { op: "removeObject" as const, objectId: second.id };
+    expect(bracketObjects(applyPatch(repeat, firstRemoval))).toEqual([open, close].map(bracket =>
+      ({ ...bracket, containedObjectIds: [second.id] })));
+    const removed = applyPatches(repeat, [firstRemoval,
+      { op: "updateObject", objectId: open.id, changes: { height: open.height + 2 } },
+      { op: "updateObject", objectId: close.id, changes: { height: close.height + 2, label: "m" } },
+      secondRemoval]);
+    expect(removed.pages[0].objects).toEqual([]);
+  });
+});
 
 describe("bracket pair annotations", () => {
   it.each([false, true])("preserves imported pair compatibility only with all referenced objects copied (%s)", includeMolecule => {

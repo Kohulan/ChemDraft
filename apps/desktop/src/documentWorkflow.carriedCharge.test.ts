@@ -1,21 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { applyPatches, serializeDocument, type ChemDraftDocument, type GraphicObject } from "@chemdraft/chem-core";
 import * as workflow from "./documentWorkflow";
-import { dropElectronMark } from "./electronMarkDrop";
-import { dropMark, dropMolecule, electronMarkDropFixture } from "./testSupport/electronMarkDropFixture";
+import { distantAttachedElectronMarkFixture, dropMark, dropMolecule } from "./testSupport/electronMarkDropFixture";
 import { associationFixture, associationSpecs } from "./testSupport/electronMarkMainParity";
 
 function distantAttachedCharge() {
-  const fixture = electronMarkDropFixture();
-  const mark = dropMark(fixture.document);
-  const dropped = dropElectronMark(fixture.document, mark.id,
-    { x: 600 - mark.width / 2, y: 500 - mark.height / 2 }, { x: 600, y: 500 });
-  expect(dropped.refused).toBeUndefined();
-  expect(dropMark(dropped.document)).toMatchObject({ atomAssociation: "explicit",
-    anchor: { kind: "atom", objectId: dropMolecule(dropped.document).id, atomId: fixture.nitrogen.id } });
-  expect(dropMolecule(dropped.document).atoms.find(atom => atom.id === fixture.nitrogen.id)?.formalCharge).toBe(1);
-  return workflow.selectDocumentObjects(dropped.document, dropped.document.pages[0].id,
-    [dropMolecule(dropped.document).id, mark.id]);
+  const { document } = distantAttachedElectronMarkFixture();
+  return workflow.selectDocumentObjects(document, document.pages[0].id,
+    [dropMolecule(document).id, dropMark(document).id]);
 }
 
 function expectCarriedCharges(document: ChemDraftDocument, expected: number[]) {
@@ -82,7 +74,7 @@ describe("complete molecule carried with its distant explicit charge", () => {
       const movedMark = committed.pages[0].objects.find(object => object.id === mark.id)! as typeof mark;
       const dx = moved.x - molecule.x, dy = moved.y - molecule.y;
       expect(movedMark.anchor, name).toEqual(mark.anchor);
-      expect(movedMark.atomAssociation, name).toBeUndefined();
+      expect(movedMark.atomAssociation, name).toBe(spec.kind === "lone-pair" ? "explicit" : undefined);
       for (const id of [mark.id, captionId]) {
         const original = document.pages[0].objects.find(object => object.id === id)!;
         const next = committed.pages[0].objects.find(object => object.id === id)!;
@@ -171,9 +163,7 @@ describe("complete molecule carried with its distant explicit charge", () => {
   });
 
   it.each(associationSpecs)("carries selected explicit marks with unchanged chemistry: %j", spec => {
-    const fixture = electronMarkDropFixture(spec), mark = dropMark(fixture.document);
-    let document = dropElectronMark(fixture.document, mark.id, { x: 600 - mark.width / 2, y: 500 - mark.height / 2 },
-      { x: 600, y: 500 }).document;
+    let document = distantAttachedElectronMarkFixture(spec).document;
     document = workflow.insertNativeTextObject(document, { x: 10, y: 10 }, "first");
     document = workflow.insertNativeTextObject(document, { x: 700, y: 560 }, "last");
     document = workflow.selectAllDocumentObjects(document, document.pages[0].id);

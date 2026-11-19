@@ -114,7 +114,10 @@ export async function exportSvgToPdf(
     compress: options.compress ?? true
   });
 
-  const releaseFonts = await preparePdfFonts(svgElement, pdf);
+  const releaseFonts = await preparePdfFonts(svgElement, pdf, face => warnings.push({
+    code: "export.pdf.patrick_hand_face_unavailable", severity: "warning",
+    message: `Patrick Hand ${face === "bolditalic" ? "bold italic" : face} is unavailable; PDF uses the regular face.`
+  }));
   let releaseHaloPaint = () => {};
   try {
     releaseHaloPaint = await preparePdfHaloPaint(svgElement, pdf, svg2pdf, widthPt, heightPt);

@@ -21,7 +21,11 @@ describe("document window launch placement", () => {
   });
 
   it("shows during setup before readiness, argv delivery, or frontend recovery", () => {
-    const setup = between(".setup(|app|", ".invoke_handler(");
+    const initial = between(".setup(move |app|", ".invoke_handler(");
+    expect(initial).toContain("setup_primary_app(app.handle())");
+    const takeover = between("fn start_macos_primary(", "fn setup_primary_app(");
+    expect(takeover).toMatch(/create_main_window\(app\)\?;\s*setup_primary_app\(app\)/);
+    const setup = between("fn setup_primary_app(", "const DEVELOPMENT_UPDATES_MESSAGE");
     const show = setup.indexOf("ensure_main_window_visible(app)");
     expect(show).toBeGreaterThan(0);
     expect(show).toBeLessThan(setup.indexOf(".setup_completed"));
@@ -33,11 +37,18 @@ describe("document window launch placement", () => {
     expect(delivery).toMatch(/if delivery == OpenDocumentDelivery::PendingOnly[\s\S]*?return Ok\(\(\)\);/);
     expect(delivery.indexOf("return Ok(());")).toBeLessThan(delivery.indexOf("ensure_main_window_visible(app)"));
     expect(delivery.indexOf("ensure_main_window_visible(app)")).toBeLessThan(delivery.indexOf("emit_open_document_to_main(app"));
-    const events = between(".run(|app, event|", "fn check_for_updates<");
+    const events = between("app.run(move |app, event|", "fn start_macos_primary(");
     expect(events).toMatch(/RunEvent::Reopen[\s\S]*?ensure_main_window_visible\(app\)/);
     expect(events).toMatch(/RunEvent::Opened[\s\S]*?handle_opened_document_urls\(app, urls\)/);
-    const secondLaunch = between("tauri_plugin_single_instance::init(", "let builder = builder\n");
-    expect(secondLaunch).toContain("ensure_main_window_visible(app)");
+    const startup = between("pub fn run() {", "fn start_macos_primary(");
+    expect(startup).toContain("tauri_plugin_single_instance::init(handle_second_launch)");
+    expect(startup).toMatch(/macos_single_instance::plugin\(\s*guard,\s*handle_macos_second_launch,/);
+    const secondLaunch = between("fn handle_second_launch<", "fn handle_macos_second_launch(");
+    expect(secondLaunch).toContain("handle_second_launch_with(app,");
+    const reveal = between("fn handle_second_launch_with<", "fn quit_in_progress(");
+    expect(reveal).toContain("ensure_main_window_visible(app)");
+    const mac = between("fn handle_macos_second_launch(", "fn open_macos_launch(");
+    expect(mac).toContain("ensure_main_window_visible(app)");
   });
 
   it("places hidden windows before show, preserving visible and fullscreen frames", () => {

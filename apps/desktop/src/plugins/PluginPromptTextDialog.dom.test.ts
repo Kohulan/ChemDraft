@@ -87,6 +87,10 @@ describe("PluginPromptTextDialog", () => {
     );
     expect(document.activeElement).toBe(input);
     expect(submit.disabled).toBe(true);
+    expect(input.getAttribute("autocomplete")).toBe("off");
+    expect(input.getAttribute("autocorrect")).toBe("off");
+    expect(input.getAttribute("autocapitalize")).toBe("off");
+    expect(input.getAttribute("spellcheck")).toBe("false");
 
     act(() => setInputValue(input, "  benzene  "));
     expect(submit.disabled).toBe(false);
