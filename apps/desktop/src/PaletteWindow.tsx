@@ -131,12 +131,14 @@ function pendingPlaceholderToolset(toolsetId: string): DesktopToolsetDefinition 
 
 export function PaletteWindow({
   toolsetId = "core.main",
+  resizable = false,
   // Interim seam so tests (and, until Phase 4's definition-push, callers) can supply a
   // registry that already includes plugin toolsets. Defaults to the core registry.
   initialRegistry,
   platform = detectDesktopShortcutPlatform()
 }: {
   toolsetId?: string;
+  resizable?: boolean;
   initialRegistry?: DesktopToolsetRegistry;
   platform?: ShortcutPlatform;
 }) {
@@ -436,10 +438,7 @@ export function PaletteWindow({
   }, [platform]);
 
   useEffect(() => {
-    const preferredSize = toolset.preferredWindowSize ?? gridWindowSize;
-    if (!preferredSize) {
-      return;
-    }
+    if (resizable || !knownToolset) return;
 
     const shell = shellRef.current;
     let disposed = false;
@@ -467,9 +466,11 @@ export function PaletteWindow({
         const rect = shell?.getBoundingClientRect();
         const contentWidth = rect ? Math.ceil(rect.width) : 0;
         const contentHeight = rect ? Math.ceil(rect.height) : 0;
-        const width = contentWidth > 0 ? contentWidth : preferredSize.width;
+        const preferredSize = gridWindowSize ?? toolset.preferredWindowSize;
+        const width = contentWidth || preferredSize?.width || 0;
         const height = Math.min(availableHeight,
-          Math.max(colorPickerOpen ? 292 : 0, contentHeight > 0 ? contentHeight : preferredSize.height));
+          Math.max(colorPickerOpen ? 292 : 0, contentHeight || preferredSize?.height || 0));
+        if (width <= 0 || height <= 0) return;
         // Dev-only size probe: open the palette window's devtools console to read exact
         // content-vs-window numbers for any palette that still looks wrong.
         if (import.meta.env.DEV) {
@@ -520,7 +521,7 @@ export function PaletteWindow({
         sizeAnimationFrameRef.current = undefined;
       }
     };
-  }, [colorPickerOpen, gridWindowSize, toolset.preferredWindowSize]);
+  }, [colorPickerOpen, gridWindowSize, knownToolset, resizable, toolset.id, toolset.preferredWindowSize]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -1184,6 +1185,7 @@ export function PaletteWindow({
       className="palette-window-shell"
       aria-label={`ChemDraft floating ${toolset.title}`}
       data-toolset-id={toolset.id}
+      data-resizable={resizable || undefined}
       data-palette-drag-surface={customizeThisPalette ? undefined : "true"}
       onPointerDown={startDragFromPaletteSurface}
       onPointerUp={stopPaletteWindowDrag}

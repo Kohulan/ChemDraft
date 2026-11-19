@@ -2509,6 +2509,29 @@ textarea:focus-visible,
   overflow-y: auto;
 }
 
+.palette-window-shell[data-resizable] {
+  width: 100%;
+  height: 100vh;
+  grid-template-rows: 22px minmax(0, 1fr);
+}
+
+.palette-window-shell[data-resizable] > .palette-window-content {
+  min-width: 0;
+  max-height: none;
+  overflow: auto;
+}
+
+.palette-window-shell[data-resizable] .tool-palette.floating.molecular-inspector-palette {
+  width: 100%;
+  height: 100%;
+}
+
+.palette-window-shell[data-resizable] .molecular-inspector-pane {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+}
+
 .palette-title {
   position: relative;
   box-sizing: border-box;
@@ -2524,6 +2547,11 @@ textarea:focus-visible,
   text-align: center;
   user-select: none;
   cursor: grab;
+}
+
+.palette-window-shell > .palette-title {
+  /* The tools determine the shell width. Ellipsize a long title within that width. */
+  contain: inline-size;
 }
 
 .palette-title[data-palette-title-drag-surface="true"] {

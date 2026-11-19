@@ -1142,6 +1142,25 @@ struct PersistedToolsetState {
     x: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     y: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    width: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height: Option<f64>,
+}
+
+impl PersistedToolsetState {
+    fn position(&self) -> Option<ToolsetWindowPosition> {
+        Some(ToolsetWindowPosition {
+            x: self.x?,
+            y: self.y?,
+        })
+    }
+
+    fn window_size(&self, resizable: bool) -> Option<(f64, f64)> {
+        let (width, height) = (self.width?, self.height?);
+        (resizable && width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
+            .then_some((width, height))
+    }
 }
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
@@ -1537,6 +1556,11 @@ pub fn run() {
                         eprintln!(
                             "Could not persist ChemDraft toolset position {toolset_id}: {error}"
                         );
+                    }
+                }
+                WindowEvent::Resized(_) if toolset_is_resizable(&toolset_id) => {
+                    if let Err(error) = persist_toolset_size(window, &toolset_id) {
+                        eprintln!("Could not persist ChemDraft toolset size {toolset_id}: {error}");
                     }
                 }
                 WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed => {
@@ -6703,7 +6727,8 @@ fn resize_toolset_window(
     height: f64,
 ) -> Result<bool, String> {
     let app = window.app_handle();
-    if toolset_id_for_window_label(app, window.label()).is_none() {
+    let toolset_id = toolset_id_for_window_label(app, window.label());
+    if toolset_id.is_none_or(|id| toolset_is_resizable(&id)) {
         return Err("Only a ChemDraft tool palette may resize to fit its content.".into());
     }
     if ![width, height]
@@ -9977,6 +10002,13 @@ fn create_toolbars_menu<R: Runtime>(
     Ok(menu)
 }
 
+fn toolset_is_resizable(toolset_id: &str) -> bool {
+    matches!(
+        toolset_id,
+        "core.molecularInspector" | "core.drawnStructureSettings" | "core.ringInspector"
+    )
+}
+
 fn ensure_toolset_window<R: Runtime>(
     app: &tauri::AppHandle<R>,
     toolset_id: &str,
@@ -10014,12 +10046,20 @@ fn ensure_toolset_window<R: Runtime>(
             ToolsetWindowPosition { x: 88.0, y: 154.0 },
         ),
     };
+    let resizable = toolset_is_resizable(toolset_id);
+    let layout = load_toolset_layout_state(app);
+    let saved = layout.toolsets.get(toolset_id);
+    let (width, height) = saved
+        .and_then(|state| state.window_size(resizable))
+        .unwrap_or((width, height));
     // A persisted position wins (the user moved it before); otherwise the JS-supplied default.
     // Either way it's clamped onto an attached monitor — a position saved on a display that's since
     // been unplugged would otherwise open the palette offscreen with no way to get it back.
     let position = clamp_toolset_position(
         app,
-        persisted_toolset_position(app, toolset_id).unwrap_or(default_position),
+        saved
+            .and_then(PersistedToolsetState::position)
+            .unwrap_or(default_position),
         width,
         height,
     );
@@ -10033,31 +10073,37 @@ fn ensure_toolset_window<R: Runtime>(
     windows_activation_log::frame_set(&label, "toolbar creation", "logical", || {
         ((position.x, position.y), (width, height))
     });
-    let window = match utility_window_builder(
+    let builder = utility_window_builder(
         WebviewWindowBuilder::new(
             app,
             label.clone(),
-            WebviewUrl::App(format!("/?window=toolset&toolsetId={toolset_id}").into()),
+            WebviewUrl::App(
+                format!("/?window=toolset&toolsetId={toolset_id}&resizable={resizable}").into(),
+            ),
         ),
         app,
     )
     .title(title)
     .inner_size(width, height)
-    // The window is sized to its actual palette content by the JS side (PaletteWindow
-    // applySize). The manifest's min sizes were tuned for the old docked/web layout and are far too
-    // large for a content-fit floating window (e.g. Art's 760), which left a big blank area beside
-    // the tools — so keep only a tiny hard floor here.
-    .min_inner_size(96.0, 56.0)
     .accept_first_mouse(true)
     .focusable(toolset_window_focusable())
-    .resizable(true)
+    // Tao's resizable flag controls AppKit's style mask and Win32 resize hit testing.
+    // Programmatic setFrame/set_size still fit the content in either direction.
+    .resizable(resizable)
+    .maximizable(resizable)
     .decorations(false)
     // Overlapping palettes need a visible edge, matching the popover's native shadow.
     .shadow(true)
     .skip_taskbar(true)
-    .position(position.x, position.y)
-    .build()
-    {
+    .position(position.x, position.y);
+    // Only scrolling inspectors need a floor for manual resize. A toolbar's frame is fixed
+    // at the DOM's measured size until the next fit. A floor here would leave narrow grids padded.
+    let builder = if resizable {
+        builder.min_inner_size(96.0, 56.0)
+    } else {
+        builder
+    };
+    let window = match builder.build() {
         Ok(window) => window,
         Err(error) => {
             // Roll back the directory entry we optimistically inserted above, so a failed build
@@ -10567,13 +10613,10 @@ fn persisted_toolset_position<R: Runtime>(
     app: &tauri::AppHandle<R>,
     toolset_id: &str,
 ) -> Option<ToolsetWindowPosition> {
-    let layout_state = load_toolset_layout_state(app);
-    layout_state.toolsets.get(toolset_id).and_then(|state| {
-        Some(ToolsetWindowPosition {
-            x: state.x?,
-            y: state.y?,
-        })
-    })
+    load_toolset_layout_state(app)
+        .toolsets
+        .get(toolset_id)
+        .and_then(PersistedToolsetState::position)
 }
 
 /// Whether a palette's current frame is a transient OS state (it or the document window it belongs
@@ -10663,6 +10706,32 @@ fn persist_toolset_position<R: Runtime>(
         let state = layout_state.toolsets.entry(toolset_id).or_default();
         state.x = Some(x);
         state.y = Some(y);
+    })
+}
+
+fn persist_toolset_size<R: Runtime>(
+    window: &tauri::Window<R>,
+    toolset_id: &str,
+) -> Result<(), String> {
+    if visible_toolset_physical_position(window).is_none()
+        || window.is_maximized().unwrap_or(true)
+        || window.is_fullscreen().unwrap_or(true)
+    {
+        return Ok(());
+    }
+    let scale = window.scale_factor().map_err(|error| error.to_string())?;
+    let size = window
+        .inner_size()
+        .map_err(|error| error.to_string())?
+        .to_logical::<f64>(scale);
+    if size.width <= 0.0 || size.height <= 0.0 {
+        return Ok(());
+    }
+    let toolset_id = toolset_id.to_string();
+    update_toolset_layout_state(window.app_handle(), move |layout_state| {
+        let state = layout_state.toolsets.entry(toolset_id).or_default();
+        state.width = Some(size.width);
+        state.height = Some(size.height);
     })
 }
 
@@ -13623,6 +13692,60 @@ mod tests {
             "toolset-plugin-fixture",
             &toolset_window_label("plugin.fixture"),
         );
+    }
+
+    #[test]
+    fn only_scrolling_toolsets_allow_user_resize() {
+        for id in [
+            "core.molecularInspector",
+            "core.drawnStructureSettings",
+            "core.ringInspector",
+        ] {
+            assert!(toolset_is_resizable(id), "{id}");
+        }
+        for id in [
+            "core.main",
+            "core.structure",
+            "core.arrows",
+            "core.annotations",
+            "core.art",
+            "core.orbitals",
+            "core.layout",
+            "core.style",
+            "core.text",
+            "plugin.fixture",
+            "user.fixture",
+        ] {
+            assert!(!toolset_is_resizable(id), "{id}");
+        }
+    }
+
+    #[test]
+    fn legacy_toolset_sizes_only_restore_for_scrolling_inspectors() {
+        let state: PersistedToolsetState =
+            serde_json::from_str(r#"{"x":-125.0,"y":275.0,"width":413.0,"height":317.0}"#).unwrap();
+        for (id, expected) in [
+            ("core.layout", None),
+            ("core.molecularInspector", Some((413.0, 317.0))),
+        ] {
+            let position = state.position().unwrap();
+            assert_eq!((position.x, position.y), (-125.0, 275.0));
+            assert_eq!(state.window_size(toolset_is_resizable(id)), expected);
+        }
+        let position_only: PersistedToolsetState =
+            serde_json::from_str(r#"{"x":-125.0,"y":275.0}"#).unwrap();
+        assert_eq!(position_only.window_size(true), None);
+    }
+
+    #[test]
+    fn two_column_palette_fit_accepts_the_measured_size_below_the_old_floor() {
+        let area = ScreenRect::new(0.0, 24.0, 950.0, 636.0);
+        for scale in [1.0, 1.5, 2.0] {
+            let origin = ((160.0 * scale) as i32, (104.0 * scale) as i32);
+            let fit = toolset_content_placement(origin, (60.0, 54.0), scale, area);
+            assert_eq!(fit.position, origin);
+            assert_eq!(fit.size, ((60.0 * scale) as u32, (54.0 * scale) as u32));
+        }
     }
 
     #[test]
