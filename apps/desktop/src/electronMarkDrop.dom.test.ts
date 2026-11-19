@@ -111,20 +111,21 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
     afterAll(() => resetRdkitForTesting());
     const pairs = () => snapshot().pages[0].objects.filter((object): object is ElectronMarkObject =>
       object.type === "electron-mark" && object.markKind === "lone-pair");
-    async function pressAtom(route: "object" | "page" = "object", offset = { x: 0, y: 0 }) {
+    async function pressAtom(route: "object" | "page" = "object", offset = { x: 0, y: 0 }, rotation = 0) {
       const fixture = electronMarkDropFixture({ kind: "lone-pair" });
       const withoutMark = applyPatch(fixture.document,
         { op: "removeObject", objectId: dropMark(fixture.document).id }, { now: phase4Timestamp });
       const initial = workflow.normalizeCommittedDocument({ ...withoutMark, pages: withoutMark.pages.map(page => ({
         ...page, objects: page.objects.map(object => object.type === "molecule" ? { ...object,
-          x: object.x + offset.x, y: object.y + offset.y,
+          x: object.x + offset.x, y: object.y + offset.y, rotation,
           atoms: object.atoms.map(atom => ({ ...atom, x: atom.x + offset.x, y: atom.y + offset.y }))
         } : object)
       })) });
       await mount(initial);
       await command("tool.lonePair");
-      const atom = { ...fixture.carbonylOxygen, x: fixture.carbonylOxygen.x + offset.x,
-        y: fixture.carbonylOxygen.y + offset.y };
+      const molecule = dropMolecule(initial);
+      const localAtom = molecule.atoms.find(atom => atom.id === fixture.carbonylOxygen.id)!;
+      const atom = { ...localAtom, ...transformPointForObject(molecule, localAtom) };
       // The page route covers bare vertices whose hover resolves the atom before the press.
       await act(async () => pointer(page(), "pointermove", atom));
       const target = route === "page" ? page() : container.querySelector(`[data-hit-target="atom"][data-atom-id="${atom.id}"]`)!;
@@ -211,6 +212,22 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
       await act(async () => pointer(target, "pointerup", end(100), altKey));
       expect(snapshot()).toEqual(after);
       await assertSingleUndo(before, after);
+    });
+    it.each(["object", "page"] as const)("places a rightward drag from a rotated atom through the %s route", async route => {
+      const { before, target, atom, end } = await pressAtom(route, { x: 0, y: 0 }, 90);
+      await act(async () => pointer(target, "pointermove", end(0)));
+      const [pair] = pairs();
+      expect(pair).toBeDefined();
+      const center = workflow.nativeChargeMarkCenter(pair);
+      const molecule = dropMolecule(before);
+      expect(center.x - atom.x).toBeGreaterThanOrEqual(24.3 - 1e-8);
+      expect(center.y).toBeCloseTo(atom.y, 10);
+      expect(pair.rotation).toBeCloseTo(90, 10);
+      expect(pair.anchor).toEqual({ kind: "atom", objectId: molecule.id, atomId: atom.id });
+      await act(async () => pointer(target, "pointerup", end(0)));
+      expect(pairs()).toEqual([pair]);
+      expect(dropMolecule(snapshot())).toEqual(molecule);
+      await assertSingleUndo(before, snapshot());
     });
     it("uses the release point and its Alt state after multiple preview frames", async () => {
       const { before, target, end } = await pressAtom();

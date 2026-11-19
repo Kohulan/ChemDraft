@@ -4,7 +4,7 @@ import { electronMarkInteractionFrames } from "./electronMarkInteraction";
 import { installPopoverEscapeRouting } from "./window-manager/popoverEscape";
 import { BracketLabelEditor, type BracketLabelEditorHandle } from "./BracketLabelEditor";
 import { createBracketCommands, selectedBracketPair, toggleBracketRepeatUnit, setBracketRepeatLabel, bracketRepeatUnitStatus, prepareCleanupRepeatUnits } from "./bracketCommands";
-import { bracketLabelPlan, bracketLabelContainsPoint, lonePairDragDirection } from "@chemdraft/layout-engine";
+import { bracketLabelPlan, bracketLabelContainsPoint, lonePairDragDirection, transformPointForObject } from "@chemdraft/layout-engine";
 import { useCanvasHandwritingFont } from "./canvasHandwritingFont";
 import { nativeTemplateForToolCommand } from "./ringTemplates";
 import { documentDrawingDefaults } from "@chemdraft/document-workflow-core";
@@ -1837,7 +1837,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.19.17.28-codex";
+const CURRENT_BUILD_STAMP = "11.19.17.52-codex";
 const TABLE_DRAFT_RECOVERY_WARNING = "session.tableDraftDropped";
 
 function clearTableDraftRecoveryWarnings(report: OpenWarningsReport | undefined): OpenWarningsReport | undefined {
@@ -16658,9 +16658,10 @@ export function MainWindow({
     if (drag.kind === "lone-pair" && drag.lonePairTarget?.kind === "atom") {
       const target = drag.lonePairTarget;
       const molecule = findDocumentObject(drag.startDocument, target.objectId);
-      const atom = molecule?.type === "molecule" ? molecule.atoms.find(atom => atom.id === target.atomId) : undefined;
+      if (molecule?.type !== "molecule") return drag.startDocument;
+      const atom = molecule.atoms.find(atom => atom.id === target.atomId);
       return atom ? applyChargeToolAtNativeAtom(drag.startDocument, { kind: "lone-pair" }, target,
-        lonePairDragDirection(atom, point, drag.altKey)) : drag.startDocument;
+        lonePairDragDirection(transformPointForObject(molecule, atom), point, drag.altKey)) : drag.startDocument;
     }
     if (drag.kind === "bracket" && drag.bracketKind) {
       return insertNativeBracket(drag.startDocument, drag.startPoint, drag.bracketKind, point);
