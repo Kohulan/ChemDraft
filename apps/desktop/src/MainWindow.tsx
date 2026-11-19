@@ -1476,6 +1476,7 @@ type ResolvedOpenDocument = {
   statusSourceLabel?: string;
 };
 type OpenDocumentContentsOptions = {
+  onOpened?: () => void;
   /** Restore-session path: the contents hold edits never written to `path`. */
   dirty?: boolean;
   /** Replaces the "Opened …" status line (e.g. "Restored last session — …"). */
@@ -2044,7 +2045,13 @@ const nativeOpenDocumentEvent = "chemdraft://open-document";
 // while still allowing a deliberate later re-open.
 const NATIVE_OPEN_DEDUPE_WINDOW_MS = 1500;
 
+interface NativeOpenReceipt {
+  batch: number;
+  file: number;
+}
+
 interface NativeOpenDocumentPayload {
+  receipt?: NativeOpenReceipt;
   path: string;
   displayName: string;
   contents: string;
@@ -2052,6 +2059,7 @@ interface NativeOpenDocumentPayload {
 }
 
 interface DocumentOpenRequest {
+  receipt?: NativeOpenReceipt;
   contents: DocumentContents | (() => Promise<DocumentContents>);
   displayName: string;
   path?: string;
@@ -10233,6 +10241,7 @@ export function MainWindow({
         browserFileKeysRef.current.get(tab.id) === browserKey);
     if (existing) {
       activateDocumentTab(existing.id);
+      if (activeDocumentTabIdRef.current === existing.id) options?.onOpened?.();
       perfHook(() => reportOutcome?.("already-open"));
       return;
     }
@@ -10276,6 +10285,7 @@ export function MainWindow({
     setStatus(fitRecommendation
       ? `${openStatus}; imported content exceeds ${pageFitPromptLayoutLabel(fitRecommendation.currentPageTitle, fitRecommendation.currentOrientation)}`
       : openStatus);
+    options?.onOpened?.();
     perfHook(() => reportOutcome?.("installed"));
     await pageFitSettled;
     await notifyInstalledDocumentCompatibility(opened, resolvedOpen.document);
@@ -10315,11 +10325,22 @@ export function MainWindow({
   }, []);
 
   const openDocumentBatch = useCallback((requests: readonly DocumentOpenRequest[]): Promise<void> => {
-    const results = requests.map(({ contents, displayName, path }) =>
-      openDocumentContents(contents, displayName, path).then(
+    const results = requests.map(({ contents, displayName, path, receipt }) => {
+      // Confirm at tab installation, before optional page-fit and compatibility dialogs.
+      // A rejected parse or an early return (e.g. unfinished table edit) fails the receipt.
+      let reported = false;
+      const report = (opened: boolean) => {
+        if (!receipt || reported) return;
+        reported = true;
+        void confirmNativeOpen(receipt, opened).catch(error =>
+          setStatus(`Could not confirm opening ${displayName}: ${String(error)}`));
+      };
+      const options = receipt ? { onOpened: () => report(true) } : undefined;
+      return openDocumentContents(contents, displayName, path, options).then(
         (): DocumentOpenResult => ({ displayName }),
         (error: unknown): DocumentOpenResult => ({ displayName, error })
-      ));
+      ).finally(() => report(false));
+    });
     // Reserve the summary's place before any later batch. Each open includes its page-fit and
     // compatibility prompts, so keeping an imported page finishes successfully before we count it.
     const finished = documentOpenQueueRef.current.then(async () => {
@@ -10713,12 +10734,12 @@ export function MainWindow({
           const now = Date.now();
           const last = lastNativeOpenPayloadKeyRef.current;
           // Coalesce repeated OS requests while reserving every other file's queue slot at once.
-          if (last && last.key === payloadKey && now - last.at < NATIVE_OPEN_DEDUPE_WINDOW_MS) return [];
+          if (!payload.receipt && last && last.key === payloadKey && now - last.at < NATIVE_OPEN_DEDUPE_WINDOW_MS) return [];
           lastNativeOpenPayloadKeyRef.current = { key: payloadKey, at: now };
-          return [{ contents, displayName: payload.displayName, path: payload.path }];
+          return [{ contents, displayName: payload.displayName, path: payload.path, receipt: payload.receipt }];
         } catch (error) {
           // Decode failures also occupy their original batch position and name their source file.
-          return [{ contents: async () => { throw error; }, displayName: payload.displayName, path: payload.path }];
+          return [{ contents: async () => { throw error; }, displayName: payload.displayName, path: payload.path, receipt: payload.receipt }];
         }
       });
       void openDocumentBatch(requests);
@@ -34085,6 +34106,11 @@ function prewarmNativeDialogModule(): void {
 async function readNativeBinaryFile(path: string): Promise<Uint8Array> {
   const { readFile } = await import("@tauri-apps/plugin-fs");
   return readFile(path);
+}
+
+async function confirmNativeOpen(receipt: NativeOpenReceipt, opened: boolean): Promise<void> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("take_pending_open_document", { confirmation: { receipt, opened } });
 }
 
 async function takePendingNativeOpenDocuments(): Promise<NativeOpenDocumentPayload[]> {

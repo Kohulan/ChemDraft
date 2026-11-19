@@ -9,6 +9,7 @@ use objc2_app_kit::{NSAlert, NSAlertStyle, NSApplication};
 use objc2_foundation::{NSString, NSTimer};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
@@ -53,6 +54,16 @@ pub struct LaunchRequest {
 // Closing the descriptor (including a crash/SIGKILL) releases flock without stale-lock recovery.
 pub struct InstanceLock {
     file: File,
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        // A concurrently spawned child can briefly share the open file description before
+        // exec closes its CLOEXEC descriptor. Relinquish ownership when *this* owner drops
+        // the guard. The kernel still releases the lock on a crash.
+        // SAFETY: the descriptor remains live through this call and closes immediately after.
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 impl InstanceLock {
@@ -127,9 +138,162 @@ pub enum Acknowledgement {
     Failed = 3,
 }
 
+// The legacy primary writes just 1 when scheduling its callback. A confirmed primary writes
+// both bytes in one reply, keeping older secondaries compatible after the actual open.
+const CONFIRMED_OPEN_VERSION: u8 = 2;
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+pub struct RendererReceipt {
+    batch: u32,
+    file: usize,
+}
+
+#[derive(Deserialize)]
+pub struct OpenConfirmation {
+    pub receipt: RendererReceipt,
+    pub opened: bool,
+}
+
+pub enum Reply {
+    Secondary(mpsc::Sender<Acknowledgement>),
+    Takeover(LaunchRequest),
+}
+
+impl Reply {
+    pub fn finish(self, result: Acknowledgement, error: &str) {
+        match self {
+            Self::Secondary(sender) => {
+                let _ = sender.send(result);
+            }
+            Self::Takeover(launch) if result != Acknowledgement::Accepted => {
+                show_launch_error(&launch, error);
+            }
+            Self::Takeover(_) => {}
+        }
+    }
+}
+
+struct PendingBatch {
+    outstanding: HashSet<usize>,
+    reply: Reply,
+}
+
+#[derive(Default)]
+pub struct RendererOpens {
+    next: u32,
+    batches: HashMap<u32, PendingBatch>,
+}
+
+impl RendererOpens {
+    fn track(&mut self, payloads: &mut [crate::NativeOpenDocumentPayload], reply: Reply) -> u32 {
+        let id = self.next;
+        self.next = self.next.checked_add(1).expect("exhausted handoff IDs");
+        for (file, payload) in payloads.iter_mut().enumerate() {
+            payload.receipt = Some(RendererReceipt { batch: id, file });
+        }
+        self.batches.insert(
+            id,
+            PendingBatch {
+                outstanding: (0..payloads.len()).collect(),
+                reply,
+            },
+        );
+        id
+    }
+
+    fn consume(
+        &mut self,
+        receipt: RendererReceipt,
+        opened: bool,
+    ) -> Option<(Reply, Acknowledgement)> {
+        let batch = self.batches.get_mut(&receipt.batch)?;
+        if !batch.outstanding.remove(&receipt.file) || (opened && !batch.outstanding.is_empty()) {
+            return None;
+        }
+        let result = if opened {
+            Acknowledgement::Accepted
+        } else {
+            Acknowledgement::Failed
+        };
+        Some((self.remove(receipt.batch)?, result))
+    }
+
+    fn remove(&mut self, id: u32) -> Option<Reply> {
+        self.batches.remove(&id).map(|batch| batch.reply)
+    }
+}
+
+pub fn track_renderer_open(
+    app: &AppHandle,
+    payloads: &mut [crate::NativeOpenDocumentPayload],
+    reply: Reply,
+) -> u32 {
+    let id = app
+        .state::<Mutex<RendererOpens>>()
+        .lock()
+        .unwrap()
+        .track(payloads, reply);
+    let app = app.clone();
+    let tick = RcBlock::new(move |_| {
+        fail_renderer_open(
+            &app,
+            id,
+            "The document window did not confirm every file open in time.",
+        );
+    });
+    // Main run loop, including during cold-start takeover. Bound both the receipt lifetime and
+    // the time before a promoted secondary with an unresponsive renderer shows its own alert.
+    unsafe {
+        NSTimer::scheduledTimerWithTimeInterval_repeats_block(
+            TAKEOVER_TIMEOUT.as_secs_f64(),
+            false,
+            &tick,
+        )
+    };
+    id
+}
+
+pub fn fail_renderer_open(app: &AppHandle, id: u32, error: &str) {
+    let reply = app
+        .state::<Mutex<RendererOpens>>()
+        .lock()
+        .unwrap()
+        .remove(id);
+    if let Some(reply) = reply {
+        reply.finish(Acknowledgement::Failed, error);
+    }
+}
+
+pub fn renderer_consumed(app: &AppHandle, receipt: RendererReceipt, opened: bool) {
+    let reply = app
+        .state::<Mutex<RendererOpens>>()
+        .lock()
+        .unwrap()
+        .consume(receipt, opened);
+    if let Some((reply, result)) = reply {
+        reply.finish(
+            result,
+            "The document window could not open every requested file.",
+        );
+    }
+}
+
+pub fn renderer_exiting(app: &AppHandle) {
+    let batches = std::mem::take(&mut app.state::<Mutex<RendererOpens>>().lock().unwrap().batches);
+    for batch in batches.into_values() {
+        // Disconnect remote waiters so they can take over. Only local requests need an alert here.
+        if let Reply::Takeover(launch) = batch.reply {
+            show_launch_error(
+                &launch,
+                "ChemDraft quit before its document window confirmed the open.",
+            );
+        }
+    }
+}
+
 pub fn plugin(
     mut guard: InstanceLock,
-    callback: impl Fn(&AppHandle<Wry>, LaunchRequest) -> Acknowledgement + Send + Sync + 'static,
+    callback: impl Fn(&AppHandle<Wry>, LaunchRequest, Reply) + Send + Sync + 'static,
 ) -> TauriPlugin<Wry> {
     tauri::plugin::Builder::new("single-instance")
         .setup(move |app, _| {
@@ -144,18 +308,18 @@ pub fn plugin(
                             stream.set_read_timeout(Some(HANDOFF_TIMEOUT))?;
                             stream.set_write_timeout(Some(HANDOFF_TIMEOUT))?;
                             receive_launch(&mut stream, &endpoint.token, |launch| {
-                                if crate::quit_in_progress() {
+                                if crate::QUIT.refuses_macos_launch() {
                                     return Ok(Acknowledgement::Refused);
                                 }
                                 let app = app_handle.clone();
                                 let callback = callback.clone();
                                 let (send_reply, reply) = mpsc::channel();
-                                let deadline = Instant::now() + HANDOFF_TIMEOUT;
+                                let deadline = Instant::now() + TAKEOVER_TIMEOUT;
                                 app_handle
                                     .run_on_main_thread(move || {
                                         // Skip work still queued after the IPC worker timed out.
                                         if Instant::now() < deadline {
-                                            let _ = send_reply.send(callback(&app, launch));
+                                            callback(&app, launch, Reply::Secondary(send_reply));
                                         }
                                     })
                                     .map_err(io::Error::other)?;
@@ -202,11 +366,7 @@ impl OpenCollection {
     }
 }
 
-type StartPrimary = fn(
-    &AppHandle<Wry>,
-    InstanceLock,
-    &LaunchRequest,
-) -> Result<Option<String>, Box<dyn std::error::Error>>;
+type StartPrimary = fn(&AppHandle<Wry>, InstanceLock) -> Result<(), Box<dyn std::error::Error>>;
 
 struct Handoff {
     launch: LaunchRequest,
@@ -216,9 +376,29 @@ struct Handoff {
 struct SecondaryState {
     collection: OpenCollection,
     handoff: Option<Handoff>,
+    promoting: Option<LaunchRequest>,
     promoted: bool,
+    terminating: bool,
     exiting: bool,
     exit_code: i32,
+}
+
+impl SecondaryState {
+    fn take_interrupted_launch(&mut self) -> LaunchRequest {
+        let late = std::mem::take(&mut self.collection).launch;
+        let unconfirmed = self.promoting.take().or_else(|| {
+            let handoff = self.handoff.take()?;
+            // The IPC worker may already have a confirmed reply that the timer has yet to poll.
+            (!matches!(handoff.result.try_recv(), Ok(Ok(Resolution::Forwarded))))
+                .then_some(handoff.launch)
+        });
+        if let Some(mut launch) = unconfirmed {
+            launch.urls.extend(late.urls);
+            launch
+        } else {
+            late
+        }
+    }
 }
 
 pub struct SecondaryLaunch {
@@ -244,11 +424,34 @@ impl SecondaryLaunch {
                     ..Default::default()
                 },
                 handoff: None,
+                promoting: None,
                 promoted: false,
+                terminating: false,
                 exiting: false,
                 exit_code: 0,
             }),
         }
+    }
+
+    // AppKit termination can bypass ExitRequested. Warn synchronously before allowing it,
+    // including a request in flight and opens collected while waiting for its reply.
+    pub fn interrupt_for_exit(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.promoted {
+            return false;
+        }
+        state.terminating = true;
+        let launch = state.take_interrupted_launch();
+        drop(state);
+        if launch.urls.iter().any(|url| url.scheme() == "file")
+            || launch.argv.iter().skip(1).any(|arg| !arg.starts_with('-'))
+        {
+            show_launch_error(
+                &launch,
+                "ChemDraft quit before it could confirm the document open.",
+            );
+        }
+        true
     }
 
     // Keep one Tauri event loop. When we take over, run normal startup in this windowless app.
@@ -258,6 +461,9 @@ impl SecondaryLaunch {
         event: &RunEvent,
         start_primary: StartPrimary,
     ) -> bool {
+        if matches!(event, RunEvent::Exit) {
+            return self.interrupt_for_exit();
+        }
         let mut state = self.state.lock().unwrap();
         if state.promoted {
             return false;
@@ -313,6 +519,9 @@ impl SecondaryLaunch {
 
     fn tick(self: &Arc<Self>, app: &AppHandle<Wry>, start_primary: StartPrimary) {
         let mut state = self.state.lock().unwrap();
+        if state.terminating || state.promoting.is_some() || state.promoted {
+            return;
+        }
         let now = Instant::now();
         if let Some(handoff) = state.handoff.take() {
             let result = match handoff.result.try_recv() {
@@ -375,24 +584,26 @@ impl SecondaryLaunch {
     ) {
         let error = match result {
             Ok(Resolution::Primary(guard)) => {
-                // Include files arriving during the lock wait in the cold-start open.
-                launch.urls.extend(self.take_late_launch().urls);
-                match start_primary(app, guard, &launch) {
-                    Ok(open_error) => {
-                        self.state.lock().unwrap().promoted = true;
-                        let late = self.take_late_launch();
-                        if let Err(error) = crate::open_macos_launch(app, &late) {
-                            show_launch_error(&late, &error);
-                        }
-                        if let Some(error) = open_error {
-                            show_launch_error(&launch, &error);
-                        }
+                // Retain ownership through window creation and setup. AppKit can deliver more
+                // Opened events, or terminate us, while either operation runs a nested loop.
+                self.state.lock().unwrap().promoting = Some(launch.clone());
+                let startup = start_primary(app, guard);
+                let mut state = self.state.lock().unwrap();
+                if state.terminating {
+                    return; // The termination alert already accounted for this batch.
+                }
+                state.promoting = None;
+                launch
+                    .urls
+                    .extend(std::mem::take(&mut state.collection).launch.urls);
+                match startup {
+                    Ok(()) => {
+                        state.promoted = true;
+                        drop(state);
+                        crate::open_macos_launch(app, &launch, Reply::Takeover(launch.clone()));
                         return;
                     }
-                    Err(error) => {
-                        launch.urls.extend(self.take_late_launch().urls);
-                        Some(error.to_string())
-                    }
+                    Err(error) => Some(error.to_string()),
                 }
             }
             Ok(Resolution::Forwarded) => None,
@@ -414,10 +625,6 @@ impl SecondaryLaunch {
             drop(state);
             app.exit(code);
         }
-    }
-
-    fn take_late_launch(&self) -> LaunchRequest {
-        std::mem::take(&mut self.state.lock().unwrap().collection).launch
     }
 }
 
@@ -477,7 +684,7 @@ enum Resolution {
 
 fn connect(endpoint: &Endpoint, timeout: Duration) -> io::Result<TcpStream> {
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, endpoint.port));
-    let stream = TcpStream::connect_timeout(&address, timeout)?;
+    let stream = TcpStream::connect_timeout(&address, timeout.min(HANDOFF_TIMEOUT))?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     Ok(stream)
@@ -503,7 +710,7 @@ fn resolve_launch_with<S: Read + Write>(
         }
         match read_endpoint(directory) {
             Ok(endpoint) if attempted_owner != Some(endpoint.token) => {
-                match connect(&endpoint, HANDOFF_TIMEOUT.min(remaining)) {
+                match connect(&endpoint, remaining) {
                     Ok(mut stream) => {
                         // A lost reply can leave delivery ambiguous. Try a new owner if one takes
                         // over, but don't send the same request twice to this owner.
@@ -511,6 +718,9 @@ fn resolve_launch_with<S: Read + Write>(
                         match send_launch(&mut stream, &endpoint, launch) {
                             Ok(Acknowledgement::Accepted) => return Ok(Resolution::Forwarded),
                             Ok(Acknowledgement::Refused) => {
+                                // Refusal guarantees no work was queued. The same owner can
+                                // finish setup or cancel a quit prompt before the deadline.
+                                attempted_owner = None;
                                 last_error = io::Error::other(
                                     "the running copy refused the request and still holds the launch lock",
                                 );
@@ -557,7 +767,16 @@ fn send_launch(
     let mut acknowledgement = [0];
     stream.read_exact(&mut acknowledgement)?;
     match acknowledgement[0] {
-        1 => Ok(Acknowledgement::Accepted),
+        1 => {
+            let mut version = [0];
+            if stream.read_exact(&mut version).is_ok() && version == [CONFIRMED_OPEN_VERSION] {
+                Ok(Acknowledgement::Accepted)
+            } else {
+                Err(io::Error::other(
+                    "the running copy did not confirm that its document window opened the files",
+                ))
+            }
+        }
         2 => Ok(Acknowledgement::Refused),
         3 => Ok(Acknowledgement::Failed),
         _ => Err(io::Error::other("invalid second-launch acknowledgement")),
@@ -587,7 +806,11 @@ fn receive_launch(
         ));
     }
     let acknowledgement = deliver(launch.request)?;
-    stream.write_all(&[acknowledgement as u8])
+    if acknowledgement == Acknowledgement::Accepted {
+        stream.write_all(&[acknowledgement as u8, CONFIRMED_OPEN_VERSION])
+    } else {
+        stream.write_all(&[acknowledgement as u8])
+    }
 }
 
 #[cfg(test)]
@@ -827,9 +1050,7 @@ mod single_instance_tests {
         let secondary = thread::spawn(move || {
             let mut client = Some(client);
             resolve_launch_with(&path, &launch, TAKEOVER_TIMEOUT, |_, _| {
-                Ok(client
-                    .take()
-                    .expect("must not resend to the quitting primary"))
+                client.take().ok_or(io::ErrorKind::ConnectionRefused.into())
             })
         });
         receive_launch(&mut server, &endpoint.token, |request| {
@@ -894,6 +1115,155 @@ mod single_instance_tests {
             Acknowledgement::Refused
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn single_instance_retries_explicit_refusal_against_the_same_owner() {
+        let directory = Directory::new();
+        let mut guard = InstanceLock::acquire(&directory.0).unwrap().unwrap();
+        let endpoint = Endpoint {
+            port: 1,
+            token: [9; 32],
+        };
+        guard.write_endpoint(&endpoint).unwrap();
+        let url = Url::from_file_path(directory.0.join("opening.chemdraft")).unwrap();
+        let launch = LaunchRequest {
+            urls: vec![url.clone()],
+            ..Default::default()
+        };
+        let (first, mut starting) = streams();
+        let (second, mut ready) = streams();
+        let server = thread::spawn(move || {
+            for (stream, reply) in [
+                (&mut starting, Acknowledgement::Refused),
+                (&mut ready, Acknowledgement::Accepted),
+            ] {
+                receive_launch(stream, &endpoint.token, |request| {
+                    assert_eq!(request.urls, std::slice::from_ref(&url));
+                    Ok(reply)
+                })
+                .unwrap();
+            }
+        });
+        let mut connections = [first, second].into_iter();
+        let result = resolve_launch_with(&directory.0, &launch, HANDOFF_TIMEOUT, |_, _| {
+            Ok(connections.next().unwrap())
+        })
+        .unwrap();
+        assert!(matches!(result, Resolution::Forwarded));
+        assert!(connections.next().is_none());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn single_instance_legacy_ack_cannot_confirm_or_replay_a_file_open() {
+        let directory = Directory::new();
+        let mut owner = InstanceLock::acquire(&directory.0).unwrap().unwrap();
+        owner
+            .write_endpoint(&Endpoint {
+                port: 1,
+                token: [9; 32],
+            })
+            .unwrap();
+        let launch = LaunchRequest {
+            urls: vec![Url::from_file_path(directory.0.join("legacy.cdx")).unwrap()],
+            ..Default::default()
+        };
+        let (client, mut legacy) = streams();
+        let server = thread::spawn(move || {
+            let mut length = [0; 4];
+            legacy.read_exact(&mut length).unwrap();
+            legacy
+                .read_exact(&mut vec![0; u32::from_le_bytes(length) as usize])
+                .unwrap();
+            legacy.write_all(&[1]).unwrap();
+        });
+        let mut client = Some(client);
+        let Err(error) =
+            resolve_launch_with(&directory.0, &launch, Duration::from_millis(150), |_, _| {
+                Ok(client
+                    .take()
+                    .expect("a legacy reply is ambiguous; never replay to that owner"))
+            })
+        else {
+            panic!("legacy scheduling ack must not be treated as an open");
+        };
+        assert!(error.to_string().contains("did not confirm"));
+        assert!(launch_error_message(&launch, &error.to_string()).contains("legacy.cdx"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn single_instance_waits_for_each_renderer_confirmation_after_the_destructive_drain() {
+        let directory = Directory::new();
+        let path = directory.0.join("draw.chemdraft");
+        fs::write(&path, "<CDXML/>").unwrap();
+        let payload = crate::open_document_payload_from_path(&path).unwrap();
+        for last_opened in [true, false] {
+            let mut opens = RendererOpens::default();
+            let mut files = vec![payload.clone(); 2];
+            let (sender, ack) = mpsc::channel();
+            opens.track(&mut files, Reply::Secondary(sender));
+            let queue = crate::PendingOpenDocument::default();
+            queue.record(files, true).unwrap();
+            let drained = queue.drain().unwrap();
+            let first = drained[0].receipt.unwrap();
+            let second = drained[1].receipt.unwrap();
+            assert!(opens.consume(first, true).is_none());
+            assert!(
+                opens.consume(first, true).is_none(),
+                "duplicate confirmation"
+            );
+            assert_eq!(ack.try_recv(), Err(mpsc::TryRecvError::Empty));
+            let (reply, result) = opens.consume(second, last_opened).unwrap();
+            let expected = if last_opened {
+                Acknowledgement::Accepted
+            } else {
+                Acknowledgement::Failed
+            };
+            reply.finish(result, "renderer outcome");
+            assert_eq!(ack.try_recv(), Ok(expected));
+            assert!(opens.consume(second, true).is_none(), "late confirmation");
+        }
+    }
+
+    #[test]
+    fn single_instance_exit_accounts_for_collected_in_flight_and_late_files() {
+        let secondary = SecondaryLaunch::new(Ok(PathBuf::new()));
+        let mut state = secondary.state.lock().unwrap();
+        let early = Url::parse("file:///early.cdx").unwrap();
+        let late = Url::parse("file:///late.cdxml").unwrap();
+        let launch = LaunchRequest {
+            urls: vec![early.clone()],
+            ..Default::default()
+        };
+        state.collection.launch = launch.clone();
+        assert_eq!(
+            state.take_interrupted_launch().urls,
+            std::slice::from_ref(&early)
+        );
+        for confirmed in [false, true] {
+            let (sender, result) = mpsc::channel();
+            state.handoff = Some(Handoff {
+                launch: launch.clone(),
+                result,
+            });
+            state
+                .collection
+                .append(std::slice::from_ref(&late), Instant::now());
+            if confirmed {
+                sender.send(Ok(Resolution::Forwarded)).unwrap();
+            }
+            let expected = if confirmed {
+                vec![late.clone()]
+            } else {
+                vec![early.clone(), late.clone()]
+            };
+            assert_eq!(state.take_interrupted_launch().urls, expected);
+            assert!(state.take_interrupted_launch().urls.is_empty());
+        }
+        state.promoting = Some(launch);
+        assert_eq!(state.take_interrupted_launch().urls, [early]);
     }
 
     #[test]

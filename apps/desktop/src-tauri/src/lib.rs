@@ -318,6 +318,13 @@ impl QuitFlow {
         self.requested.load(Ordering::SeqCst) || self.quitting.load(Ordering::SeqCst)
     }
 
+    // The user can still use save dialogs while the prompt is up, but a second launch
+    // must wait for cancellation or take over after a confirmed quit.
+    #[cfg(target_os = "macos")]
+    fn refuses_macos_launch(&self) -> bool {
+        self.prompt.lock().unwrap().1 != QuitPromptPhase::Idle || self.in_progress()
+    }
+
     const fn new(
         quitting: &'static AtomicBool,
         flush_grace: Duration,
@@ -1078,6 +1085,9 @@ struct ToolsetCommandPayload {
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NativeOpenDocumentPayload {
+    #[cfg(target_os = "macos")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt: Option<macos_single_instance::RendererReceipt>,
     path: String,
     display_name: String,
     contents: String,
@@ -1367,7 +1377,11 @@ pub fn run() {
     );
 
     #[cfg(target_os = "macos")]
+    let builder = builder.manage(Mutex::new(macos_single_instance::RendererOpens::default()));
+    #[cfg(target_os = "macos")]
     let collecting_launch = secondary.is_some();
+    #[cfg(target_os = "macos")]
+    let setup_secondary = secondary.clone();
     let app = builder
         .on_page_load(|webview, payload| {
             if matches!(payload.event(), PageLoadEvent::Finished) {
@@ -1633,8 +1647,13 @@ pub fn run() {
         })
         .setup(move |app| {
             #[cfg(target_os = "macos")]
-            if collecting_launch {
-                return Ok(());
+            {
+                if let Err(error) = macos_quit::install(app.handle(), setup_secondary) {
+                    eprintln!("Could not install ChemDraft AppKit quit handler: {error}");
+                }
+                if collecting_launch {
+                    return Ok(());
+                }
             }
             setup_primary_app(app.handle())
         })
@@ -1812,6 +1831,8 @@ pub fn run() {
             RunEvent::Exit => {
                 // AppKit quit decisions are handled before this final cleanup.
                 APP_QUITTING.store(true, Ordering::SeqCst);
+                #[cfg(target_os = "macos")]
+                macos_single_instance::renderer_exiting(app);
                 panel_full_size::restore_all(app);
                 app.state::<ocsr_engine::OcsrEngineState>().shutdown();
                 external_tools::shutdown(app);
@@ -1845,8 +1866,7 @@ pub fn run() {
 fn start_macos_primary(
     app: &tauri::AppHandle,
     guard: macos_single_instance::InstanceLock,
-    launch: &macos_single_instance::LaunchRequest,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>> {
     app.plugin(macos_single_instance::plugin(
         guard,
         handle_macos_second_launch,
@@ -1854,11 +1874,8 @@ fn start_macos_primary(
     app.plugin(tauri_plugin_sparkle_updater::init())?;
     install_app_menu(app, create_app_menu(app)?)?;
 
-    // A takeover opens its files through the cold-start queue before the document window mounts.
-    let open_error = open_macos_launch(app, launch).err();
     create_main_window(app)?;
-    setup_primary_app(app)?;
-    Ok(open_error)
+    setup_primary_app(app)
 }
 
 fn setup_primary_app(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
@@ -1876,10 +1893,6 @@ fn setup_primary_app(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::E
         });
     }
     problem_reports::install_panic_hook(app);
-    #[cfg(target_os = "macos")]
-    if let Err(error) = macos_quit::install(app) {
-        eprintln!("Could not install ChemDraft AppKit quit handler: {error}");
-    }
     let ocsr = app.state::<ocsr_engine::OcsrEngineState>();
     ocsr.start_idle_reaper();
     ocsr.remove_stale_staging(app);
@@ -3136,42 +3149,62 @@ fn handle_second_launch<R: Runtime>(app: &tauri::AppHandle<R>, argv: Vec<String>
 }
 
 #[cfg(target_os = "macos")]
-fn handle_macos_second_launch<R: Runtime>(
-    app: &tauri::AppHandle<R>,
+fn handle_macos_second_launch(
+    app: &tauri::AppHandle,
     launch: macos_single_instance::LaunchRequest,
-) -> macos_single_instance::Acknowledgement {
+    reply: macos_single_instance::Reply,
+) {
     use macos_single_instance::Acknowledgement;
-    // During takeover the listener can start before the document window. A setup failure
-    // must never leave it acknowledging requests while the startup error is on screen.
-    if !app
+    let ready = app
         .state::<PendingOpenDocument>()
         .setup_completed
-        .load(Ordering::SeqCst)
-    {
-        return Acknowledgement::Refused;
+        .load(Ordering::SeqCst);
+    if second_launch_action(QUIT.refuses_macos_launch(), ready) != SecondLaunchAction::OpenAndShow {
+        reply.finish(
+            Acknowledgement::Refused,
+            "ChemDraft is starting or quitting.",
+        );
+        return;
     }
-    let result = handle_second_launch_with(app, || open_macos_launch(app, &launch));
-    if quit_in_progress() {
-        return Acknowledgement::Refused;
+    // Refusal is only valid before queuing anything. After this point a failure is
+    // definitive or ambiguous, and the secondary must not resend to the same owner.
+    if let Err(error) = ensure_main_window_visible(app) {
+        reply.finish(Acknowledgement::Failed, &error);
+        return;
     }
-    match result {
-        None => Acknowledgement::Refused,
-        Some(Ok(())) => Acknowledgement::Accepted,
-        Some(Err(_)) => Acknowledgement::Failed,
+    if let Err(error) = focus_main_document_window_impl(app, MainWindowFocusMode::Force) {
+        eprintln!("Could not focus ChemDraft document window for a second launch: {error}");
     }
+    open_macos_launch(app, &launch, reply);
 }
 
 #[cfg(target_os = "macos")]
-fn open_macos_launch<R: Runtime>(
-    app: &tauri::AppHandle<R>,
+fn open_macos_launch(
+    app: &tauri::AppHandle,
     launch: &macos_single_instance::LaunchRequest,
-) -> Result<(), String> {
-    deliver_opened_documents(forwarded_document_payloads(launch), |payloads| {
-        if quit_in_progress() {
-            return Err("ChemDraft is quitting".into());
+    reply: macos_single_instance::Reply,
+) {
+    use macos_single_instance::Acknowledgement;
+    if QUIT.refuses_macos_launch() {
+        reply.finish(Acknowledgement::Refused, "ChemDraft is quitting.");
+        return;
+    }
+    let (mut opened, mut errors) = read_opened_documents(forwarded_document_payloads(launch));
+    if !errors.is_empty() {
+        if !opened.is_empty() {
+            if let Err(error) = deliver_opened_document(app, opened) {
+                errors.push(error);
+            }
         }
-        deliver_opened_document(app, payloads)
-    })
+        reply.finish(Acknowledgement::Failed, &errors.join("\n"));
+    } else if opened.is_empty() {
+        reply.finish(Acknowledgement::Accepted, "");
+    } else {
+        let id = macos_single_instance::track_renderer_open(app, &mut opened, reply);
+        if let Err(error) = deliver_opened_document(app, opened) {
+            macos_single_instance::fail_renderer_open(app, id, &error);
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -3201,7 +3234,7 @@ fn forwarded_document_payloads(
     )
 }
 
-#[cfg(not(any(target_os = "ios", target_os = "android")))]
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
 fn handle_second_launch_with<R: Runtime>(
     app: &tauri::AppHandle<R>,
     open: impl FnOnce() -> Result<(), String>,
@@ -8640,6 +8673,30 @@ fn engine3d_target_triple() -> &'static str {
     }
 }
 
+// Receipts travel on the same document-window IPC as the destructive drain. A receipt call
+// never drains the next batch, which may still be waiting for its queue-change notification.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+fn take_pending_open_document(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, PendingOpenDocument>,
+    confirmation: Option<macos_single_instance::OpenConfirmation>,
+) -> Result<Vec<NativeOpenDocumentPayload>, String> {
+    if !is_document_window(window.label()) {
+        return Err("Only the document window can take or confirm file opens.".into());
+    }
+    if let Some(confirmation) = confirmation {
+        macos_single_instance::renderer_consumed(
+            window.app_handle(),
+            confirmation.receipt,
+            confirmation.opened,
+        );
+        return Ok(Vec::new());
+    }
+    state.drain()
+}
+
+#[cfg(not(target_os = "macos"))]
 #[tauri::command]
 fn take_pending_open_document(
     state: tauri::State<'_, PendingOpenDocument>,
@@ -8898,14 +8955,7 @@ fn deliver_opened_documents(
     payloads: impl IntoIterator<Item = Result<NativeOpenDocumentPayload, String>>,
     mut deliver: impl FnMut(Vec<NativeOpenDocumentPayload>) -> Result<(), String>,
 ) -> Result<(), String> {
-    let mut opened = Vec::new();
-    let mut errors = Vec::new();
-    for payload in payloads {
-        match payload {
-            Ok(payload) => opened.push(payload),
-            Err(error) => errors.push(error),
-        }
-    }
+    let (opened, mut errors) = read_opened_documents(payloads);
     if !opened.is_empty() {
         if let Err(error) = deliver(opened) {
             errors.push(error);
@@ -8916,6 +8966,20 @@ fn deliver_opened_documents(
     } else {
         Err(errors.join("\n"))
     }
+}
+
+fn read_opened_documents(
+    payloads: impl IntoIterator<Item = Result<NativeOpenDocumentPayload, String>>,
+) -> (Vec<NativeOpenDocumentPayload>, Vec<String>) {
+    let mut opened = Vec::new();
+    let mut errors = Vec::new();
+    for payload in payloads {
+        match payload {
+            Ok(payload) => opened.push(payload),
+            Err(error) => errors.push(error),
+        }
+    }
+    (opened, errors)
 }
 
 #[cfg(any(test, target_os = "macos", target_os = "ios", target_os = "android"))]
@@ -8993,6 +9057,8 @@ fn open_document_payload_from_path(path: &Path) -> Result<NativeOpenDocumentPayl
         (decode_document_text(&data), None)
     };
     Ok(NativeOpenDocumentPayload {
+        #[cfg(target_os = "macos")]
+        receipt: None,
         path: path.to_string_lossy().to_string(),
         display_name,
         contents,
@@ -11803,6 +11869,8 @@ mod tests {
 
     fn opened_document_test_payload() -> NativeOpenDocumentPayload {
         NativeOpenDocumentPayload {
+            #[cfg(target_os = "macos")]
+            receipt: None,
             path: "cold-open.chemdraft".into(),
             display_name: "cold-open.chemdraft".into(),
             contents: "<CDXML/>".into(),
@@ -13549,6 +13617,34 @@ mod tests {
         assert!(lines.windows(2).any(|pair| {
             pair[0] == "#[tauri::command]" && pair[1] == "async fn save_document_session("
         }));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn single_instance_refuses_a_prompt_from_request_until_cancel_or_quit() {
+        let flow = test_quit_flow(QUIT_FLUSH_GRACE, EXIT_WATCHDOG);
+        let host = ControlledQuitHost::new();
+        for cancel in [true, false] {
+            assert!(!flow.refuses_macos_launch());
+            let id = request_prompted_quit_with(flow, &host).unwrap();
+            assert!(flow.refuses_macos_launch());
+            assert!(acknowledge_quit_prompt(flow, id, true));
+            assert!(flow.refuses_macos_launch());
+            assert_eq!(cancel_quit_with(flow, 0), QuitCancelOutcome::Superseded);
+            assert!(flow.refuses_macos_launch());
+            assert!(
+                !flow.in_progress(),
+                "Save As must still be usable during the prompt"
+            );
+            if cancel {
+                assert_eq!(cancel_quit_with(flow, id), QuitCancelOutcome::Cancelled);
+                assert!(!flow.refuses_macos_launch());
+            } else {
+                assert!(resume_prompted_quit_with(flow, &host, id));
+                assert_eq!(cancel_quit_with(flow, id), QuitCancelOutcome::Committed);
+                assert!(flow.refuses_macos_launch());
+            }
+        }
     }
 
     #[test]
