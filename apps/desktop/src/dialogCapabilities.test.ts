@@ -28,10 +28,15 @@ describe("dialog capabilities", () => {
     expect(granted[0]!.capability.webviews).toBeUndefined();
     expect(granted[0]!.capability.permissions).toEqual(["allow-preferences-ready"]);
   });
+  it("shares native preferences only with the document and Preferences windows", () => {
+    const granted = capabilities.filter(({ capability }) => permissionIdentifiers(capability).includes("allow-desktop-preferences"));
+    expect(granted.map(({ name }) => name)).toEqual(["desktop-preferences.json"]);
+    expect(granted[0]!.capability.windows).toEqual(["main", "preferences"]);
+  });
   it("gives draft windows only validated channel transport with no generic event permissions", () => {
     const host = capabilities.find(({ name }) => name === "dialog-host.json")!.capability;
     // Each native dialog kind gets only the same validated request/send transport.
-    expect(host.windows).toEqual(["dialog-main-reactionConditions-*", "dialog-main-pageSize-*", "dialog-main-arrangementSpacing-*", "dialog-main-insertTable-*", "dialog-main-customColor-*", "dialog-main-export-*", "dialog-main-engineInstall-*", "dialog-main-toolInstall-*", "dialog-main-structureTemplates-*", "dialog-main-atomProblem-*", "dialog-main-vibeCodeGuide-*"]);
+    expect(host.windows).toEqual(["dialog-main-reactionConditions-*", "dialog-main-pageSize-*", "dialog-main-arrangementSpacing-*", "dialog-main-insertTable-*", "dialog-main-customColor-*", "dialog-main-export-*", "dialog-main-engineInstall-*", "dialog-main-toolInstall-*", "dialog-main-structureTemplates-*", "dialog-main-atomProblem-*", "dialog-main-vibeCodeGuide-*", "dialog-main-guidedTour-*"]);
     expect(host.permissions.slice().sort()).toEqual([
       "allow-dialog-request", "allow-dialog-send"
     ]);

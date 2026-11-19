@@ -50,6 +50,15 @@ fn kind_spec(kind: &str) -> Result<DialogKindSpec, String> {
             fit_content: true,
             preserve_user_frame: false,
         }),
+        "guidedTour" => Ok(DialogKindSpec {
+            maximizable: false,
+            resizable: true,
+            title: "Take the Tour",
+            size: (520.0, 375.0),
+            min_size: (360.0, 260.0),
+            fit_content: false,
+            preserve_user_frame: false,
+        }),
         "vibeCodeGuide" => Ok(DialogKindSpec {
             maximizable: false,
             resizable: true,
@@ -146,7 +155,10 @@ fn kind_spec(kind: &str) -> Result<DialogKindSpec, String> {
     }
 }
 fn native_window_title(kind: &str, spec_title: &str, snapshot_title: &str) -> String {
-    if matches!(kind, "engineInstall" | "toolInstall" | "vibeCodeGuide") {
+    if matches!(
+        kind,
+        "engineInstall" | "toolInstall" | "vibeCodeGuide" | "guidedTour"
+    ) {
         snapshot_title.to_string()
     } else {
         format!("{spec_title} — {snapshot_title}")
@@ -164,6 +176,47 @@ pub(crate) fn macos_dialog_title_bar_style() -> tauri::TitleBarStyle {
     // all exclude decorations. configure_on_main restores the opaque appearance before
     // reveal without changing the style mask or the size units.
     tauri::TitleBarStyle::Transparent
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GuidedTourSnapshot {
+    title: String,
+    #[serde(rename = "scheme")]
+    _scheme: super::KeybindingScheme,
+    #[serde(rename = "automatic")]
+    _automatic: bool,
+}
+
+impl GuidedTourSnapshot {
+    fn valid(self) -> bool {
+        valid_title(&self.title) && !self.title.contains('\0')
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "camelCase", deny_unknown_fields)]
+enum GuidedTourAction {
+    Cancel {},
+    Finish {},
+    ChooseShortcuts {
+        #[serde(rename = "scheme")]
+        _scheme: super::KeybindingScheme,
+    },
+    TryTourCommand {
+        #[serde(rename = "command")]
+        _command: GuidedTourCommand,
+    },
+}
+
+#[derive(Deserialize)]
+enum GuidedTourCommand {
+    #[serde(rename = "help.tour.openSample")]
+    OpenSample,
+    #[serde(rename = "plugin.opsinNameToStructure.convert")]
+    ConvertName,
+    #[serde(rename = "analyze.molecularProperties")]
+    InspectMolecule,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -928,6 +981,7 @@ fn valid_reason(reason: &str) -> bool {
             | "ownerClose"
             | "quit"
             | "error"
+            | "deferred"
     )
 }
 impl Message {
@@ -1013,6 +1067,13 @@ impl Message {
                 CustomColorAction::Apply { hex } => valid_custom_color(&hex),
                 CustomColorAction::Clear {} | CustomColorAction::Cancel {} => true,
             }),
+            "snapshot" if self.dialog_kind == "guidedTour" => {
+                serde_json::from_value::<GuidedTourSnapshot>(self.data.clone())
+                    .is_ok_and(|snapshot| snapshot.valid())
+            }
+            "action" if self.dialog_kind == "guidedTour" => {
+                serde_json::from_value::<GuidedTourAction>(self.data.clone()).is_ok()
+            }
             "snapshot" if self.dialog_kind == "vibeCodeGuide" => {
                 serde_json::from_value::<VibeGuideSnapshot>(self.data.clone())
                     .is_ok_and(|s| valid_title(&s.title) && !s.title.contains('\0'))
@@ -1617,6 +1678,34 @@ fn register(
     Ok((registration, true))
 }
 
+const TOUR_WAITING_FOR_IDLE: &str = "Guided tour is waiting for the document window to be idle";
+
+fn automatic_tour_idle<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    owner: &tauri::WebviewWindow<R>,
+    tour_host: Option<&str>,
+) -> bool {
+    if super::quit_in_progress()
+        || super::utility_windows_suspended()
+        || !owner.is_focused().unwrap_or(false)
+        || !owner.is_visible().unwrap_or(false)
+        || owner.is_minimized().unwrap_or(true)
+        || !app
+            .state::<super::PendingOpenDocument>()
+            .payloads
+            .lock()
+            .is_ok_and(|payloads| payloads.is_empty())
+    {
+        return false;
+    }
+    let registry = REGISTRY.lock().unwrap_or_else(|p| p.into_inner());
+    registry.preferences.is_none()
+        && !registry
+            .sessions
+            .keys()
+            .any(|host| Some(host.as_str()) != tour_host)
+}
+
 /// Async, serialized, worker construction. Never take WINDOW_CREATION on the event thread.
 #[tauri::command]
 pub(crate) async fn dialog_open(
@@ -1631,6 +1720,17 @@ pub(crate) async fn dialog_open(
         return Err("Unknown dialog owner".into());
     }
     let _creation = super::lock_window_creation()?;
+    let new_automatic_tour = message.dialog_kind == "guidedTour"
+        && message.data["automatic"] == true
+        && !REGISTRY
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .sessions
+            .values()
+            .any(|session| session.snapshot.same_session(&message));
+    if new_automatic_tour && !automatic_tour_idle(&app, &window, None) {
+        return Err(TOUR_WAITING_FOR_IDLE.into());
+    }
     let owner_decision = dialog_owner_reveal_decision(&window);
     if owner_decision == OwnerRevealDecision::RejectHidden {
         return Err("The document window is hidden; no dialog can open".into());
@@ -1794,7 +1894,7 @@ pub(crate) async fn dialog_send(
     } else {
         None
     };
-    let (reveal, refit) = {
+    let (reveal, refit, automatic_tour) = {
         let mut registry = REGISTRY.lock().unwrap_or_else(|p| p.into_inner());
         let session = registry
             .sessions
@@ -1828,15 +1928,35 @@ pub(crate) async fn dialog_send(
         if !refit {
             send_owner(session, window.label(), &message)?;
         }
-        (reveal, refit)
+        let automatic_tour = session.snapshot.dialog_kind == "guidedTour"
+            && session.snapshot.data["automatic"] == true;
+        (reveal, refit, automatic_tour)
     };
     // Deliver ready before showing so the owner's listener is authoritative even on a fast click.
     if reveal {
         let target = window.clone();
-        if let Err(error) =
-            super::run_on_main_thread_blocking(&window, move || reveal_on_main(&target))
-                .and_then(|result| result)
+        let app_for_reveal = app.clone();
+        let host_for_reveal = host_id.clone();
+        if let Err(error) = super::run_on_main_thread_blocking(&window, move || {
+            if automatic_tour
+                && ((cfg!(any(target_os = "macos", windows))
+                    && !super::foreground_belongs_to_app())
+                    || app_for_reveal
+                        .get_webview_window(super::MAIN_WINDOW_LABEL)
+                        .is_none_or(|owner| {
+                            !automatic_tour_idle(&app_for_reveal, &owner, Some(&host_for_reveal))
+                        }))
+            {
+                return Err(TOUR_WAITING_FOR_IDLE.into());
+            }
+            reveal_on_main(&target)
+        })
+        .and_then(|result| result)
         {
+            if automatic_tour && error == TOUR_WAITING_FOR_IDLE {
+                close_session(&app, &host_id, "deferred");
+                return Ok(());
+            }
             eprintln!("Could not reveal native dialog: {error}");
             close_session(&app, &host_id, "error");
             return Err(error);
@@ -4241,6 +4361,19 @@ pub(crate) fn on_window_event<R: Runtime>(window: &tauri::Window<R>, event: &Win
             let session = key.and_then(|k| registry.sessions.remove(&k));
             drop(registry);
             if let Some(mut session) = session {
+                if session.snapshot.dialog_kind == "guidedTour"
+                    && matches!(event, WindowEvent::CloseRequested { .. })
+                {
+                    if let Err(error) = super::update_desktop_preferences(
+                        window.app_handle(),
+                        Some(super::DesktopPreferences {
+                            guided_tour_seen: Some(true),
+                            ..Default::default()
+                        }),
+                    ) {
+                        eprintln!("Could not save guided tour preference: {error}");
+                    }
+                }
                 flush_position(window.app_handle(), &mut session);
                 notify_closed(
                     &session,
@@ -5273,6 +5406,37 @@ mod tests {
             assert!(frame.applied_position.is_none());
         }
     }
+    #[test]
+    fn guided_tour_is_a_resizable_modeless_kind_with_typed_actions() {
+        let spec = kind_spec("guidedTour").unwrap();
+        assert!(spec.resizable && !spec.maximizable);
+        assert_eq!(
+            native_window_title("guidedTour", spec.title, spec.title),
+            "Take the Tour"
+        );
+        assert!(is_dialog_label("dialog-main-guidedTour-1"));
+        let mut message = snapshot();
+        message.dialog_kind = "guidedTour".into();
+        message.data = json!({"title":"Take the Tour", "scheme":"chemdraft", "automatic":true});
+        assert!(message.validate().is_ok());
+        message.data["automatic"] = json!("true");
+        assert!(message.validate().is_err());
+        message.message_type = "action".into();
+        for data in [
+            json!({"action":"cancel"}),
+            json!({"action":"finish"}),
+            json!({"action":"chooseShortcuts","scheme":"chemdraw"}),
+            json!({"action":"tryTourCommand","command":"help.tour.openSample"}),
+            json!({"action":"tryTourCommand","command":"plugin.opsinNameToStructure.convert"}),
+            json!({"action":"tryTourCommand","command":"analyze.molecularProperties"}),
+        ] {
+            message.data = data;
+            assert!(message.validate().is_ok());
+        }
+        message.data["command"] = json!("document.save");
+        assert!(message.validate().is_err());
+    }
+
     #[test]
     fn vibe_code_guide_kind_and_messages_are_bounded() {
         let spec = kind_spec("vibeCodeGuide").unwrap();

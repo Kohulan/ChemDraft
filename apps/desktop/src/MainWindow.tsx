@@ -857,7 +857,6 @@ import {
   setToolbarsMenu,
   toolsetCommandSpecsSignature,
   PREFERENCES_WINDOW_KIND,
-  listenForKeybindingSettings,
   listenForSpin3dSettings,
   pushKeybindingSchemeToNativeMenu,
   closeToolsetWindow,
@@ -965,7 +964,12 @@ import { useDirectElectronMarkEditing } from "./useDirectElectronMarkEditing";
 import { ArrangementSpacingDialog, arrangementSpacingPreviewSvg, checkedArrangementSpacing } from "./ArrangementSpacingDialog";
 import { arrangeSelectedDocumentObjects, arrangementSpacingRange, selectedArrangementObjectIds } from "./documentWorkflow";
 import { arrangementLayoutForCommand, arrangementGridAlignmentForCommand } from "./commands";
-import { loadKeybindingSettings, type KeybindingScheme } from "./keybindingSettings";
+import type { KeybindingScheme } from "./keybindingSettings";
+import { useShortcutPreference } from "./useShortcutPreference";
+import { SHOW_TOUR_COMMAND, TOUR_NAME_COMMAND, TOUR_SAMPLE_COMMAND, TOUR_TITLE, type TourAction } from "./tour/tourCommands";
+import type { TourMode } from "./tour/tourState";
+import { buildTourSample } from "./tour/tourSample";
+import { useGuidedTour } from "./tour/useGuidedTour";
 import { saveDrawingSettings } from "./drawingSettings";
 import { listenForDrawingSettings } from "./window-manager";
 import { rasterizeSvgNative } from "./nativeRasterExport";
@@ -1834,7 +1838,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.19.05.50-codex";
+const CURRENT_BUILD_STAMP = "11.19.17.10-codex";
 const TABLE_DRAFT_RECOVERY_WARNING = "session.tableDraftDropped";
 
 function clearTableDraftRecoveryWarnings(report: OpenWarningsReport | undefined): OpenWarningsReport | undefined {
@@ -2088,6 +2092,7 @@ export interface MainWindowProps {
   initialDocument?: ChemDraftDocument;
   initialActiveToolCommandId?: string;
   shortcutPlatform?: ShortcutPlatform;
+  tourMode?: TourMode;
   /**
    * Floating native palette windows instead of in-window palettes. Defaults to on only in the desktop
    * runtime (`shouldDefaultToNativePalettes`), and nothing in the app turns it on elsewhere. Forcing it
@@ -2137,6 +2142,16 @@ function inspectPastePayload(payload: ClipboardReadPayload): ClipboardDetectedPa
   });
 }
 
+function molecularInspectorSubject(molecule: MoleculeObject, document: ChemDraftDocument): string {
+  return analysisSubjectKey({
+    ...molecule,
+    atoms: molecule.atoms.map(({ labelVisible: _visible, labelOffset: _offset, warningSuppressed: _warning, ...atom }) => atom),
+    bonds: molecule.bonds.map(({ display, ...bond }) => ({ ...bond,
+      ...(display?.bondStyle && (isDativeBond({ ...bond, display }) || ["wedge", "hashed", "wavy"].includes(display.bondStyle))
+        ? { display: { bondStyle: display.bondStyle } } : {}) }))
+  }, document) + JSON.stringify([molecule.structureFormat, molecule.structure]);
+}
+
 export function MainWindow({
   initialPaletteMode = "floating",
   initialRulersVisible = true,
@@ -2144,6 +2159,7 @@ export function MainWindow({
   initialDocument,
   initialActiveToolCommandId,
   shortcutPlatform,
+  tourMode,
   nativePalette = shouldDefaultToNativePalettes()
 }: MainWindowProps) {
   useEffect(() => installBrowserReloadGuard(shortcutPlatform), [shortcutPlatform]);
@@ -2556,6 +2572,9 @@ export function MainWindow({
   documentTabsRef.current = documentTabs;
   const pluginRuntimeRef = useRef<DesktopPluginRuntime | undefined>(undefined);
   const dialogCoordinatorRef = useRef<DialogCoordinator | undefined>(undefined);
+  const tourActionRef = useRef<(action: TourAction) => Promise<void>>(async () => {});
+  const deferTourRef = useRef<() => void>(() => {});
+  const tourSampleRef = useRef<{ tabId: string; moleculeId: string } | undefined>(undefined);
   const atomProblemTargetRef = useRef<{ tabId: string; target: AtomProblemTarget; source: ChemDraftDocument; version: number } | undefined>(undefined);
   const atomProblemVersionRef = useRef(0);
   const fixAtomProblemRef = useRef<(tabId: string, action: AtomProblemAction, version: number) => void>(() => {});
@@ -3116,13 +3135,7 @@ export function MainWindow({
 
   const selectedMolecule = getSelectedMolecule(document);
   // Exclude drawing-only fields while retaining chemistry-bearing bond styles and bracket context.
-  const inspectorSubject = selectedMolecule ? analysisSubjectKey({
-    ...selectedMolecule,
-    atoms: selectedMolecule.atoms.map(({ labelVisible: _visible, labelOffset: _offset, warningSuppressed: _warning, ...atom }) => atom),
-    bonds: selectedMolecule.bonds.map(({ display, ...bond }) => ({ ...bond,
-      ...(display?.bondStyle && (isDativeBond({ ...bond, display }) || ["wedge", "hashed", "wavy"].includes(display.bondStyle))
-        ? { display: { bondStyle: display.bondStyle } } : {}) }))
-  }, document) + JSON.stringify([selectedMolecule.structureFormat, selectedMolecule.structure]) : undefined;
+  const inspectorSubject = selectedMolecule ? molecularInspectorSubject(selectedMolecule, document) : undefined;
   const inspectorVisible = molecularInspectorOpen || visibleToolsetIds.has(molecularInspectorToolsetId);
   useEffect(() => {
     if (!inspectorVisible) {
@@ -3502,7 +3515,7 @@ export function MainWindow({
       setTapeMeasure(undefined);
     }
   }, [activeTool]);
-  const [keybindingScheme, setKeybindingScheme] = useState<KeybindingScheme>(() => loadKeybindingSettings().scheme);
+  const keybindingScheme = useShortcutPreference();
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
@@ -3519,21 +3532,6 @@ export function MainWindow({
     // The native macOS menu carries its own accelerators; keep them in step with the scheme.
     void pushKeybindingSchemeToNativeMenu(keybindingScheme);
   }, [keybindingScheme]);
-  useEffect(() => {
-    let disposed = false;
-    let unlisten: (() => void) | undefined;
-    void listenForKeybindingSettings((next) => setKeybindingScheme(next.scheme)).then((listener) => {
-      if (disposed) {
-        listener();
-        return;
-      }
-      unlisten = listener;
-    });
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, []);
   const toolCommandSpecs = useMemo(
     () => applyKeybindingSchemeToCommands(
       withStandaloneDrawingToolCommands(getToolsetCommandSpecs(toolsetRegistry)),
@@ -9920,8 +9918,12 @@ export function MainWindow({
     if (repeatUnitSelection) setSelectedNativeMoleculeParts(repeatUnitSelection);
 
     historyNavigationCountRef.current += 1;
+    // Redoing the supplied practice structure returns to the clean starting drawing.
+    const tourBaseline = tourSampleRef.current?.tabId === activeDocumentTabIdRef.current
+      ? savedDocumentsRef.current.get(activeDocumentTabIdRef.current) : undefined;
+    const dirty = !tourBaseline || !assistantDocumentContentUnchanged(tourBaseline, nextHistory.present);
     setFileState((current) => {
-      const nextFileState = { ...current, dirty: true };
+      const nextFileState = { ...current, dirty };
       fileStateRef.current = nextFileState;
       return nextFileState;
     });
@@ -10182,6 +10184,40 @@ export function MainWindow({
     setStatus("Blank native document");
   }, [addDocumentTab, clearDocumentInteractionState, resetDocumentHistory]);
 
+  const openTourSample = () => {
+    if (closeTabPromptRef.current || quitInteractionRef.current || keptDrawingsPromptRef.current
+      || isSnapshotSessionActive() || activeAtomLabelEditRef.current || activeTextEditObjectIdRef.current
+      || tableCellEditorRef.current || bracketLabelEditorRef.current) {
+      throw new Error("Finish the current drawing edit before opening the tour sample.");
+    }
+    const practice = tourSampleRef.current;
+    if (practice) {
+      const source = practice.tabId === activeDocumentTabIdRef.current
+        ? documentRef.current : documentTabSnapshotsRef.current.get(practice.tabId)?.history.present;
+      if (source && findDocumentObject(source, practice.moleculeId)?.type === "molecule") {
+        activateDocumentTab(practice.tabId);
+        if (activeDocumentTabIdRef.current !== practice.tabId) throw new Error("Could not switch to the tour drawing.");
+        if (documentRef.current.selection.objectIds[0] !== practice.moleculeId || documentRef.current.selection.objectIds.length !== 1) {
+          replacePresentDocument(current => ({ ...current, selection: { ...current.selection, objectIds: [practice.moleculeId] } }));
+        }
+        return;
+      }
+    }
+    const blank = createPhase4Document("Tour");
+    const sample = buildTourSample(blank);
+    if (!addDocumentTab("Tour")) throw new Error("Could not open the tour drawing.");
+    resetDocumentHistory(blank);
+    clearDocumentInteractionState({ clearSpin3dModelCache: true });
+    tabPageFitRef.current = undefined;
+    setPageFitPrompt(undefined);
+    const present = prepareDocumentCommit(sample.document, sample.label);
+    installDocumentHistory({ past: [documentRef.current], present, future: [] });
+    const tabId = activeDocumentTabIdRef.current;
+    savedDocumentsRef.current.set(tabId, present);
+    tourSampleRef.current = { tabId, moleculeId: present.selection.objectIds[0] };
+    setStatus("Tour drawing opened");
+  };
+
   const removeDocumentTab = useCallback((id: string) => {
     if (id === activeDocumentTabIdRef.current) smilesListPasteAbortRef.current?.abort();
     let tabs = documentTabsRef.current;
@@ -10323,6 +10359,8 @@ export function MainWindow({
   const openDocumentContentsNowRef = useRef(openDocumentContentsNow);
   openDocumentContentsNowRef.current = openDocumentContentsNow;
   const documentOpenQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+  const queuedDocumentOpensRef = useRef(0);
+  const nativeOpenDrainBusyRef = useRef(true);
 
   // Opens run one at a time. A CDXML conflict choice awaits the user, so a second open of the same
   // file must wait and then find the tab the first one made, not add a second tab for one path.
@@ -10335,6 +10373,7 @@ export function MainWindow({
     let timing = perfHook(() => perfProbe?.documentOpenStarted());
     // A deferred read reserves its place immediately, so every file in a drop can be enqueued
     // before reading the first file or waiting for its page-size prompt.
+    queuedDocumentOpensRef.current += 1;
     const run = documentOpenQueueRef.current.then(async () =>
       openDocumentContentsNowRef.current(typeof contents === "function" ? await contents() : contents, displayName, path, options, outcome => {
         perfHook(() => {
@@ -10346,7 +10385,7 @@ export function MainWindow({
           if (outcome === "installed") return perfProbe?.documentOpenCommitted(timing);
           return perfProbe?.documentOpenSkipped(timing, outcome);
         });
-      }));
+      })).finally(() => { queuedDocumentOpensRef.current -= 1; });
     perfHook(() => {
       if (timing) return run.catch(() => perfHook(() => perfProbe?.documentOpenFailed(timing)));
     });
@@ -10674,6 +10713,7 @@ export function MainWindow({
     if (!isDesktopRuntime()) return;
     const coordinator = new DialogCoordinator(nativeDialogTransport, {
       fixAtomProblem: (tabId, action, version) => fixAtomProblemRef.current(tabId, action, version),
+      guidedTourAction: action => tourActionRef.current(action),
       vibeCodeGuideAction: action => vibeGuideActionRef.current(action),
       insertTemplate: (tabId, id) => dispatchTemplateRef.current(tabId, id),
       applyPageSize: (tabId, size) => applyPageSizeToTabRef.current(tabId, size),
@@ -10689,6 +10729,7 @@ export function MainWindow({
       previewExport: (tabId, options, live) => previewExportRef.current(tabId, options, live),
       chooseExportDestination: (tabId, options, live) => chooseExportDestinationRef.current(tabId, options, live),
       onSettled: (tabId, _reason, kind) => {
+        if (kind === "guidedTour" && _reason === "deferred") deferTourRef.current();
         if (kind === "export") exportGrantsRef.current.delete(tabId);
         if (kind === "atomProblem" && atomProblemTargetRef.current?.tabId === tabId) atomProblemTargetRef.current = undefined;
       }
@@ -10783,6 +10824,7 @@ export function MainWindow({
       subscribe: listenForNativeOpenDocuments,
       drain: takePendingNativeOpenDocuments,
       consumeBatch: openNativePayloads,
+      onDrainActivity: busy => { nativeOpenDrainBusyRef.current = busy; },
       onError: error => setStatus(`Could not check pending open files: ${error instanceof Error ? error.message : String(error)}`)
     });
   }, [openDocumentBatch]);
@@ -11893,10 +11935,25 @@ export function MainWindow({
     []
   );
 
-  // Core command handlers are rebuilt every render (they close over live state), but they
-  // now populate a plain Map instead of a fresh CommandRegistry. The registry instance
-  // itself is created once (below) and its handlers delegate to this ref, so plugin
-  // commands registered into the same registry survive re-renders (Phase 2 depends on this).
+  const tour = useGuidedTour({
+    coordinator: () => dialogCoordinatorRef.current,
+    readyAndIdle: () => documentSessionHydratedRef.current
+      && (!isDesktopRuntime() || (!nativeOpenDrainBusyRef.current && (!effectiveNativePalette || nativeToolsetStartupReady)))
+      && queuedDocumentOpensRef.current === 0 && !keptDrawingsPromptRef.current
+      && !nativeDocumentNoticeOpenRef.current && !closeTabPromptRef.current
+      && !quitInteractionRef.current && !isSnapshotSessionActive()
+      && !activeAtomLabelEditRef.current && !activeTextEditObjectIdRef.current
+      && !tableCellEditorRef.current && !bracketLabelEditorRef.current,
+    scheme: keybindingScheme,
+    platform: shortcutPlatform,
+    mode: tourMode,
+    setStatus
+  });
+  deferTourRef.current = tour.deferred;
+  const tourCommandsRef = useRef({ open: tour.open, openSample: openTourSample });
+  tourCommandsRef.current = { open: tour.open, openSample: openTourSample };
+
+  // Core handlers close over the latest state, while plugins keep the same registry instance.
   const coreCommandBindings = useMemo(() => {
     const bindings = new Map<string, { spec: CommandSpec; run: () => Promise<void> }>();
     const register = (definition: CommandSpec, handler?: () => void | Promise<void>) => {
@@ -12126,6 +12183,10 @@ export function MainWindow({
       }
     );
 
+    register({ id: SHOW_TOUR_COMMAND, title: TOUR_TITLE, icon: "open", source: "core", category: "app" },
+      () => tourCommandsRef.current.open());
+    register({ id: TOUR_SAMPLE_COMMAND, title: "Open Tour Drawing", icon: "new", source: "core", category: "app" },
+      () => tourCommandsRef.current.openSample());
     register(
       {
         id: REPORT_BUG_COMMAND_ID,
@@ -12249,12 +12310,13 @@ export function MainWindow({
             await toggleToolset(molecularInspectorToolsetId);
             return;
           }
-          const molecule = getSelectedMolecule(document);
+          const current = documentRef.current;
+          const molecule = getSelectedMolecule(current);
           if (!molecule) {
             setStatus("Molecular Inspector opened — select a structure to analyze it");
             return;
           }
-          inspectorSubjectRef.current = inspectorSubject;
+          inspectorSubjectRef.current = molecularInspectorSubject(molecule, current);
           await runMolecularProperties(molecule, analysisInterpretation);
           return;
         }
@@ -13134,6 +13196,16 @@ export function MainWindow({
     }
   });
   const { isPluginCommand: pluginCommandExists, invokePluginCommand } = pluginRuntime;
+  tourActionRef.current = action => tour.completeOrRun(action, {
+    has: id => registry.get(id)?.enabled === true,
+    invoke: async id => {
+      if (id !== TOUR_NAME_COMMAND) return registry.invoke(id);
+      const result = await invokePluginCommand(id);
+      const error = pluginCommandFailure(result);
+      if (error) throw new Error(error);
+      return result;
+    }
+  });
   canvasOverlaysPresentRef.current = pluginRuntime.canvasOverlays.length > 0;
   pluginRuntimeRef.current = pluginRuntime.runtime;
 
@@ -23684,6 +23756,7 @@ export function MainWindow({
           />
         ) : null}
       </section>
+      {tour.renderBrowser(action => tourActionRef.current(action))}
       {!isDesktopRuntime() && browserVibeGuide ? <Suspense fallback={<p>Opening guide…</p>}><VibeCodeGuideForm onAction={action => { if (action === "cancel") setBrowserVibeGuide(false); else void vibeGuideActionRef.current(action); }} /></Suspense> : null}
       {!isDesktopRuntime() && browserTemplates ? <div className="cd-template-browser"><Suspense fallback={<p role="status">Opening Templates…</p>}>
         <StructureTemplatePicker {...browserTemplates} onClose={() => setBrowserTemplates(undefined)}

@@ -717,7 +717,7 @@ function isSpin3dSettingsPayload(payload: unknown): payload is Spin3dSettings {
 export const KEYBINDING_SETTINGS_EVENT = "chemdraft://keybinding-settings";
 
 /** Broadcast a keybinding-scheme change so every open window rebuilds its shortcut registry live.
- *  localStorage is the source of truth across reloads; this event is the live-sync channel. */
+ *  The native preference and local cache handle persistence; this event handles live updates. */
 export async function broadcastKeybindingSettings(settings: KeybindingSettings): Promise<void> {
   dispatchDomToolsetEvent(KEYBINDING_SETTINGS_EVENT, settings);
   if (!isDesktopRuntime()) {

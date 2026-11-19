@@ -26,6 +26,8 @@ import { VIBE_CODE_STARTER_COMMAND_ID, vibeCodeStarterCommand } from "./commands
  * Bug… is routed like any other command.
  */
 
+import { SHOW_TOUR_COMMAND, TOUR_TITLE } from "./tour/tourCommands";
+
 /** A leaf item that invokes a registry command when clicked. */
 export interface AppMenuCommand {
   kind: "command";
@@ -376,7 +378,7 @@ export function buildAppMenuModel(context: AppMenuContext): AppMenuSection[] {
     {
       id: "help",
       label: "Help",
-      items: [command(REPORT_BUG_COMMAND_ID, "Report a Bug…")]
+      items: [command(SHOW_TOUR_COMMAND, TOUR_TITLE), command(REPORT_BUG_COMMAND_ID, "Report a Bug…")]
     }
   ];
 

@@ -985,6 +985,7 @@ const MENU_COMMAND_IDS: &[&str] = &[
     "structure.openInteractive3d",
     "plugins.manage",
     "plugins.vibeCodeStarter",
+    "help.showTour",
     "help.reportBug",
 ];
 
@@ -1047,7 +1048,8 @@ struct NativeMenuNeedsRebuild(AtomicBool);
 /// Which keyboard-shortcut scheme the app runs under (mirrors the webview's persisted setting; JS
 /// pushes it on startup and on change via `set_keybinding_scheme`). Read at menu-build time so the
 /// few native accelerators that differ between the schemes stay in step with the webview registry.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 enum KeybindingScheme {
     #[default]
     ChemDraft,
@@ -1736,6 +1738,7 @@ pub fn run() {
             focus_main_document_window_if_app_active,
             set_menu_checked,
             set_keybinding_scheme,
+            desktop_preferences,
             plugin_storage_read,
             plugin_storage_write,
             plugin_storage_delete,
@@ -9551,6 +9554,61 @@ impl KeybindingScheme {
     }
 }
 
+#[derive(Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DesktopPreferences {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shortcut_scheme: Option<KeybindingScheme>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guided_tour_seen: Option<bool>,
+}
+
+fn update_desktop_preferences<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    patch: Option<DesktopPreferences>,
+) -> Result<DesktopPreferences, String> {
+    static SETTINGS_WRITE: Mutex<()> = Mutex::new(());
+    let path = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?
+        .join("preferences.json");
+    let _guard = SETTINGS_WRITE.lock().map_err(|error| error.to_string())?;
+    let mut settings = match fs::read_to_string(&path) {
+        Ok(contents) => serde_json::from_str::<DesktopPreferences>(&contents)
+            .map_err(|error| error.to_string())?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DesktopPreferences::default(),
+        Err(error) => return Err(error.to_string()),
+    };
+    if let Some(patch) = patch {
+        settings.shortcut_scheme = patch.shortcut_scheme.or(settings.shortcut_scheme);
+        if patch.guided_tour_seen == Some(true) {
+            settings.guided_tour_seen = Some(true);
+        }
+        write_file_atomic(
+            &path,
+            &serde_json::to_string(&settings).map_err(|error| error.to_string())?,
+        )?;
+    }
+    Ok(settings)
+}
+
+#[tauri::command]
+async fn desktop_preferences(
+    window: tauri::WebviewWindow,
+    patch: Option<DesktopPreferences>,
+) -> Result<DesktopPreferences, String> {
+    if !matches!(window.label(), MAIN_WINDOW_LABEL | PREFERENCES_WINDOW_LABEL)
+        || (window.label() != MAIN_WINDOW_LABEL
+            && patch
+                .as_ref()
+                .is_some_and(|patch| patch.guided_tour_seen.is_some()))
+    {
+        return Err("This window cannot access the requested preferences".into());
+    }
+    update_desktop_preferences(window.app_handle(), patch)
+}
+
 #[tauri::command]
 fn set_keybinding_scheme(app: tauri::AppHandle, scheme: String) -> Result<(), String> {
     let parsed = match scheme.as_str() {
@@ -10048,6 +10106,7 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                 "Help",
                 true,
                 &[
+                    &MenuItem::with_id(app, "help.showTour", "Take the Tour", true, None::<&str>)?,
                     &MenuItem::with_id(app, "help.reportBug", "Report a Bug…", true, None::<&str>)?,
                     #[cfg(not(target_os = "macos"))]
                     &PredefinedMenuItem::separator(app)?,

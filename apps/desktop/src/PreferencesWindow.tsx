@@ -1,6 +1,7 @@
 import { measureDialogContentWhenFontsReady, observeDialogContent } from "./dialogs/dialogContentFit";
 import { isDesktopRuntime } from "./window-manager";
 import { useEffect, useRef, useState } from "react";
+import { updateShortcutPreference, useShortcutPreference } from "./useShortcutPreference";
 import { loadStructureSearchEnabled, saveStructureSearchEnabled } from "./structureSearchSettings";
 import { loadStartWithFreshDocument, saveStartWithFreshDocument } from "./startupSettings";
 import { loadExportPreviewEnabled, saveExportPreviewEnabled } from "./exportPreviewSettings";
@@ -15,17 +16,15 @@ import {
   type Spin3dSettings
 } from "./spin3dSettings";
 import {
-  loadKeybindingSettings,
-  saveKeybindingSettings,
-  type KeybindingScheme,
-  type KeybindingSettings
+  KEYBINDING_SCHEME_LABELS,
+  type KeybindingScheme
 } from "./keybindingSettings";
 import { compoundLayoutFeatures, loadCompoundLayoutSettings, saveCompoundLayoutSettings } from "./compoundLayoutSettings";
 import { loadDrawingSettings, saveDrawingSettings, type DefaultDoubleBond } from "./drawingSettings";
 import { broadcastDrawingSettings, listenForDrawingSettings } from "./window-manager";
 import { loadDirectElectronMarkEditing, saveDirectElectronMarkEditing } from "./electronMarkEditingSettings";
 import { broadcastElectronMarkEditingSettings } from "./window-manager";
-import { broadcastCompoundLayoutSettings, broadcastKeybindingSettings, broadcastSpin3dSettings, broadcastQuitSettings, broadcastExportPreviewSettings } from "./window-manager";
+import { broadcastCompoundLayoutSettings, broadcastSpin3dSettings, broadcastQuitSettings, broadcastExportPreviewSettings } from "./window-manager";
 
 interface RadioOption<T extends string> {
   value: T;
@@ -53,12 +52,12 @@ const ENGINES: RadioOption<Spin3dEnginePreference>[] = [
 const KEYBINDING_SCHEMES: RadioOption<KeybindingScheme>[] = [
   {
     value: "chemdraft",
-    title: "ChemDraft",
+    title: KEYBINDING_SCHEME_LABELS.chemdraft,
     description: "The native ChemDraft shortcuts. Recommended for new users."
   },
   {
     value: "chemdraw",
-    title: "Classic desktop-compatible",
+    title: KEYBINDING_SCHEME_LABELS.chemdraw,
     description:
       "Classic desktop shortcuts and hover hotkeys (Space for select, X for the bond tool, hover an atom and press 2 for a carbonyl, \"l\" for Cl, \"b\" for Br…). Case matters for element keys: B = boron, b = Br."
   }
@@ -138,7 +137,7 @@ export function PreferencesWindow() {
   const [automaticPluginUpdates, setAutomaticPluginUpdates] = useState(loadAutomaticPluginUpdates);
   const [askToSave, setAskToSave] = useState(loadAskToSaveBeforeQuit);
   const [settings, setSettings] = useState<Spin3dSettings>(() => loadSpin3dSettings());
-  const [keybindings, setKeybindings] = useState<KeybindingSettings>(() => loadKeybindingSettings());
+  const keybindingScheme = useShortcutPreference();
 
   useEffect(() => {
     let disposed = false;
@@ -170,15 +169,8 @@ export function PreferencesWindow() {
     void broadcastSpin3dSettings(next);
   };
 
-  // Same discrete-event shape as `update` above — persist + broadcast stay out of the setState
-  // updater so StrictMode double-invocation can't double-write or double-emit.
   const updateKeybindings = (scheme: KeybindingScheme): void => {
-    const next: KeybindingSettings = { ...keybindings, scheme };
-    setKeybindings(next);
-    saveKeybindingSettings(next);
-    // Every open window rebuilds its shortcut registry live; the main window also
-    // pushes the scheme to the native menu (localStorage persists it).
-    void broadcastKeybindingSettings(next);
+    void updateShortcutPreference(scheme).catch(error => console.error("Could not save keyboard shortcuts", error));
   };
 
   return (
@@ -309,7 +301,7 @@ export function PreferencesWindow() {
         hint="Which keyboard scheme the drawing tools and hover hotkeys use. Takes effect immediately."
         name="keybinding-scheme"
         options={KEYBINDING_SCHEMES}
-        value={keybindings.scheme}
+        value={keybindingScheme}
         onSelect={updateKeybindings}
       />
 

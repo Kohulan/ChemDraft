@@ -18,7 +18,10 @@ import { MainWindow, documentTabPathKey } from "./MainWindow";
 import { exportPhase4Svg, applyNativeChainTool, createNativeSingleBondMolecule, arrangeSelectedDocumentObjects, createNativeSavePayload, createPhase4Document, openNativeDocument, selectDocumentObjects } from "./documentWorkflow";
 import { openChemDraftPayload } from "@chemdraft/cdx-compat";
 import { saveCompoundLayoutSettings } from "./compoundLayoutSettings";
-import { saveKeybindingSettings } from "./keybindingSettings";
+import { loadKeybindingSettings, saveKeybindingSettings } from "./keybindingSettings";
+import type { DesktopPreferences } from "./desktopPreferences";
+import type { TourMode } from "./tour/tourState";
+import { TOUR_WAITING_FOR_IDLE } from "./tour/tourState";
 import { saveAskToSaveBeforeQuit, loadAskToSaveBeforeQuit } from "./quitSettings";
 import { saveExportPreviewEnabled } from "./exportPreviewSettings";
 import { MemoryStorage } from "./testSupport/memoryStorage";
@@ -53,6 +56,8 @@ vi.mock("./perf/runtime", async original => ({
 
 const native = vi.hoisted(() => ({
   desktop: true,
+  preferences: {} as DesktopPreferences,
+  savePreferences: vi.fn(),
   suspendUtilities: false,
   suspensionDepth: 0,
   visibilityChanges: [] as string[],
@@ -87,6 +92,15 @@ const native = vi.hoisted(() => ({
   dialogListener: undefined as ((delivery: DialogDelivery) => void) | undefined,
   dialogClose: vi.fn(),
   dialogPublish: vi.fn()
+}));
+vi.mock("./desktopPreferences", () => ({
+  desktopPreferences: async (patch?: DesktopPreferences) => {
+    if (patch) {
+      native.savePreferences(patch);
+      native.preferences = { ...native.preferences, ...patch };
+    }
+    return { ...native.preferences };
+  }
 }));
 vi.mock("./dialogs/dialogTransport", () => ({ nativeDialogTransport: {
   subscribe: async (handler: (delivery: DialogDelivery) => void) => { native.dialogListener = handler; return () => { native.dialogListener = undefined; }; },
@@ -233,6 +247,7 @@ describe("documents in one window", () => {
     vi.mocked(broadcastAnalysisWindowSnapshot).mockResolvedValue(undefined);
     vi.mocked(respondToProposalDecision).mockResolvedValue(undefined);
     native.desktop = true;
+    native.preferences = {};
     native.dialogSnapshot = undefined;
     native.dialogListener = undefined;
     native.dialogClose.mockReset().mockResolvedValue(undefined);
@@ -278,11 +293,11 @@ describe("documents in one window", () => {
     vi.useRealTimers();
   });
 
-  async function mount(initialDocument = createPhase4Document("Untitled"), strict = false, shortcutPlatform?: ShortcutPlatform) {
+  async function mount(initialDocument = createPhase4Document("Untitled"), strict = false, shortcutPlatform?: ShortcutPlatform, tourMode?: TourMode) {
     root = createRoot(container);
     await act(async () => {
       const main = createElement(MainWindow, {
-        initialDocument, initialActiveToolCommandId: "tool.select", shortcutPlatform,
+        initialDocument, initialActiveToolCommandId: "tool.select", shortcutPlatform, tourMode,
         initialPaletteMode: "hidden", initialCrosshairsVisible: false, initialRulersVisible: false, nativePalette: true
       });
       root!.render(strict ? createElement(StrictMode, null, main) : main);
@@ -440,6 +455,140 @@ describe("documents in one window", () => {
     await act(async () => { native.dialogListener!({ senderWindowId: `dialog-main-${native.dialogSnapshot!.dialogKind}-1`, windowLabel: `dialog-main-${native.dialogSnapshot!.dialogKind}-1`,
       message: { ...native.dialogSnapshot!, type, data, requestId: crypto.randomUUID() } }); });
   }
+  describe.each(["macos", "windows"] as const)("native tour on %s", platform => {
+    const restart = async (mode: TourMode, drawing = createPhase4Document("My drawing")) => {
+      act(() => root!.unmount());
+      native.dialogSnapshot = undefined;
+      await mount(drawing, false, platform, mode);
+    };
+    const idle = async () => { await act(async () => vi.advanceTimersByTimeAsync(1000)); };
+
+    it.each([["new install", "chemdraft", "cancel"], ["upgrade", "chemdraw", "finish"]] as const)(
+      "shows for a %s, persists the exit, and reopens from the Help command", async (profile, scheme, action) => {
+        vi.useFakeTimers();
+        if (profile === "upgrade") saveKeybindingSettings({ scheme });
+        await restart("automatic");
+        expect(native.dialogSnapshot).toBeUndefined();
+        await idle();
+        expect(native.dialogSnapshot).toMatchObject({ dialogKind: "guidedTour", data: { automatic: true, title: "Take the Tour", scheme } });
+        await pageSizeMessage("ready", {});
+        await pageSizeMessage("action", { action });
+        expect(native.savePreferences).toHaveBeenCalledExactlyOnceWith({ guidedTourSeen: true });
+        expect(native.dialogClose).toHaveBeenCalledWith("opaque", action === "finish" ? "apply" : "cancel");
+
+        await restart("automatic");
+        await idle();
+        expect(native.dialogSnapshot).toBeUndefined();
+        await command("help.showTour");
+        expect(native.dialogSnapshot).toMatchObject({ dialogKind: "guidedTour", data: { automatic: false } });
+      }
+    );
+
+    it("waits for the startup file and another native dialog before opening", async () => {
+      vi.useFakeTimers();
+      let releaseDrain!: (payloads: unknown[]) => void;
+      native.drainOpenDocuments.mockImplementationOnce(() => new Promise(resolve => { releaseDrain = resolve; }));
+      const drawing = applyNativeChainTool(createPhase4Document("User drawing"), { x: 100, y: 100 }, { x: 180, y: 140 });
+      await restart("automatic", drawing);
+      await idle();
+      expect(native.dialogSnapshot).toBeUndefined();
+      await command("page.setSizeCustom");
+      expect(native.dialogSnapshot?.dialogKind).toBe("pageSize");
+      await pageSizeMessage("ready", {});
+      await act(async () => releaseDrain([{
+        path: "/drawings/Started.chemdraft", displayName: "Started.chemdraft",
+        contents: createNativeSavePayload(createPhase4Document("Started")).contents
+      }]));
+      await idle();
+      expect(native.dialogSnapshot?.dialogKind).toBe("pageSize");
+      await pageSizeMessage("action", { action: "cancel" });
+      await idle();
+      expect(native.dialogSnapshot?.dialogKind).toBe("guidedTour");
+      expect(bridge().snapshot().document.title).toBe("Started");
+    });
+
+    it("waits for the launch recovery prompt to close", async () => {
+      vi.useFakeTimers();
+      const session = threeTabSession();
+      native.session = { ...session, tabs: session.tabs!.map(tab => ({ ...tab, version: 99 })) };
+      await restart("automatic");
+      await idle();
+      expect(pendingPrompt?.prompt.title).toContain("didn't open");
+      expect(native.dialogSnapshot).toBeUndefined();
+      await modalButton("Cancel");
+      await idle();
+      expect(native.dialogSnapshot?.dialogKind).toBe("guidedTour");
+    });
+
+    it("retries a native idle refusal and supports forcing a seen tour", async () => {
+      vi.useFakeTimers();
+      native.preferences = { guidedTourSeen: true };
+      const open = vi.spyOn(nativeDialogTransport, "open").mockRejectedValueOnce(TOUR_WAITING_FOR_IDLE);
+      await restart("force");
+      await idle();
+      expect(native.dialogSnapshot).toBeUndefined();
+      await act(async () => vi.advanceTimersByTimeAsync(1200));
+      expect(open).toHaveBeenCalledTimes(2);
+      expect(native.dialogSnapshot?.dialogKind).toBe("guidedTour");
+    });
+
+    it("uses the shortcut preference store and creates a clean practice tab with its own undo", async () => {
+      const drawing = applyNativeChainTool(createPhase4Document("User drawing"), { x: 100, y: 100 }, { x: 180, y: 140 });
+      await restart("suppress", drawing);
+      const before = structuredClone(bridge().snapshot().document);
+      await command("help.showTour");
+      await pageSizeMessage("ready", {});
+      await pageSizeMessage("action", { action: "chooseShortcuts", scheme: "chemdraw" });
+      expect(native.preferences.shortcutScheme).toBe("chemdraw");
+      expect(loadKeybindingSettings().scheme).toBe("chemdraw");
+      expect(native.dialogPublish).toHaveBeenCalledWith("opaque", expect.objectContaining({
+        type: "snapshot", data: { title: "Take the Tour", scheme: "chemdraw", automatic: false }
+      }));
+      const trySample = { action: "tryTourCommand", command: "help.tour.openSample" };
+      await pageSizeMessage("action", trySample);
+      expect(tabs()).toHaveLength(2);
+      expect(tabs()[1].textContent).toContain("Tour");
+      const sample = bridge().snapshot();
+      expect(sample.file.dirty).toBe(false);
+      expect(sample.document.pages[0].objects).toMatchObject([{ type: "molecule" }]);
+      await command("edit.undo");
+      expect(container.querySelector('[role="status"]')?.textContent).toContain("Undid Insert 12-Crown-4");
+      expect(bridge().snapshot().document.pages[0].objects).toEqual([]);
+      await command("edit.redo");
+      expect(bridge().snapshot().document).toEqual(sample.document);
+      expect(bridge().snapshot().file.dirty).toBe(false);
+      await closeTab();
+      expect(tabs()).toHaveLength(1);
+      expect(bridge().snapshot().document).toEqual(before);
+      expect(native.dialogClose).not.toHaveBeenCalled();
+    });
+
+    it("runs the installed naming command and Inspector against the practice drawing", async () => {
+      const drawing = applyNativeChainTool(createPhase4Document("User drawing"), { x: 100, y: 100 }, { x: 180, y: 140 });
+      vi.mocked(createPluginRuntime).mockClear();
+      await restart("suppress", drawing);
+      const commandId = "plugin.opsinNameToStructure.convert";
+      const convert = vi.fn(() => {
+        expect(bridge().snapshot().document.title).toBe("Tour");
+        return { ok: true };
+      });
+      await act(async () => runtime().registerPlugin({
+        id: "org.test.tour-naming", name: "Tour naming", version: "0.0.1", apiVersion: "^0.1.25",
+        entry: "dist/plugin.js", permissions: [], contributes: { commands: [{ id: commandId, title: "Convert Name to Structure" }] }
+      }, { commandHandlers: { [commandId]: convert } }));
+      await command("help.showTour");
+      await pageSizeMessage("ready", {});
+      await pageSizeMessage("action", { action: "tryTourCommand", command: commandId });
+      expect(convert).toHaveBeenCalledOnce();
+      expect(tabs()).toHaveLength(2);
+      await pageSizeMessage("action", { action: "tryTourCommand", command: "analyze.molecularProperties" });
+      expect(broadcastAnalysisWindowSnapshot).toHaveBeenCalledWith(expect.objectContaining({
+        content: expect.objectContaining({ kind: "molecularInspector" })
+      }));
+      expect(tabs()).toHaveLength(2);
+    });
+  });
+
   async function spacingDrawing() {
     saveCompoundLayoutSettings({ enabled: true });
     let source = createPhase4Document("Spacing source");

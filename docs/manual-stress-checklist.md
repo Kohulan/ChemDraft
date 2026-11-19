@@ -1043,6 +1043,27 @@ with a preview/flyout open: it closes, controls disappear and direct commands re
   confirm the engine folder is gone and Name from Structure offers the install dialog again.
 - Intel Mac: Name from Structure reports the engine unsupported rather than offering an install.
 
+## Guided tour (macOS and Windows)
+
+- With a new profile, launch ChemDraft and verify the tour opens shortly after the document is
+  ready. Repeat by upgrading an earlier profile with existing drawings and shortcuts. Hold a
+  restore prompt or open a drawing from the command line and verify the tour waits until both
+  the prompt and file open are complete. Open Preferences while the tour is pending and verify
+  it waits for Preferences to close.
+- Confirm the tour centers on the document the first time, floats above the drawing, and leaves
+  toolbars usable. Move it to a second display, close it, and reopen from Help > Take the Tour.
+  Verify the window remembers its position. On Windows, check that it has no taskbar entry.
+- Check that Skip tour is visible on all seven steps. In separate fresh profiles, dismiss it
+  with Skip tour, Escape, the title-bar close button, and Finish. Relaunch after each and verify
+  it only opens again through Help.
+- Change the shortcut radio choice and check Preferences and the active drawing keys. On macOS,
+  verify the shortcut examples use Mac glyphs and the last step points to the ChemDraft menu.
+  On Windows, verify Ctrl labels and the File menu.
+- Open an existing drawing and run each Try it button. Verify drawing practice opens a clean
+  Tour tab with a real molecule and one Undo entry. Close it without editing and confirm no
+  save prompt. Verify Name to Structure with the plugin installed and the Molecular Inspector
+  both use the practice tab. Check the original drawing is unchanged.
+
 ## Native Custom Page Size (macOS and Windows)
 
 - Preferences frame regression: open Preferences with no saved position; it must center over the

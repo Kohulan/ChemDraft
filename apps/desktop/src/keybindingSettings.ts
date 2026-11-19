@@ -9,6 +9,11 @@
 
 export type KeybindingScheme = "chemdraft" | "chemdraw";
 
+export const KEYBINDING_SCHEME_LABELS: Record<KeybindingScheme, string> = {
+  chemdraft: "ChemDraft",
+  chemdraw: "Classic desktop-compatible"
+};
+
 export interface KeybindingSettings {
   scheme: KeybindingScheme;
 }
