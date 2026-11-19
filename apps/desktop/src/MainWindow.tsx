@@ -1478,6 +1478,7 @@ type ResolvedOpenDocument = {
 };
 type OpenDocumentContentsOptions = {
   onOpened?: () => void;
+  onRefused?: (message: string) => void;
   /** Restore-session path: the contents hold edits never written to `path`. */
   dirty?: boolean;
   /** Replaces the "Opened …" status line (e.g. "Restored last session — …"). */
@@ -1834,7 +1835,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.18.23.55-codex";
+const CURRENT_BUILD_STAMP = "11.19.00.55-codex";
 const TABLE_DRAFT_RECOVERY_WARNING = "session.tableDraftDropped";
 
 function clearTableDraftRecoveryWarnings(report: OpenWarningsReport | undefined): OpenWarningsReport | undefined {
@@ -5216,10 +5217,6 @@ export function MainWindow({
       !changed && onlyDisconnectedAtoms
         ? "Nothing to clean up: the selected atoms aren't connected to each other. Select a bond or neighboring atoms."
         : cleanUpStructureStatus(documentRef.current, targetObjectIds, changed, warnings);
-    const reportCleanupFailure = (error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      setStatus(/^Clean Up (Selection:|refused:)/.test(message) ? message : `Clean up failed: ${message}`);
-    };
     const partialSelections = fragments.filter(fragment => {
       // The legacy store may include a part's host in objectIds. The part defines its scope;
       // a true whole-molecule pick clears that molecule's part in the selection policy.
@@ -5229,6 +5226,11 @@ export function MainWindow({
       return selected.size > 0 && selected.size < target.atoms.length;
     });
     const partialIds = new Set(partialSelections.map(selection => selection.objectId));
+    const cleanupLabel = partialSelections.length ? "Clean Up Selection" : "Clean Up";
+    const reportCleanupFailure = (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(/^(Clean Up:|Clean Up Selection:|Clean Up refused:)/.test(message) ? message : `Clean up failed: ${message}`);
+    };
 
     // The polygon+tree pass idealises single-ring components in place. Anything with more than
     // one ring per component (fused, bridged, spiro, several rings joined through chains or a
@@ -5249,6 +5251,7 @@ export function MainWindow({
       try {
         const changed = commitDocumentChangeWithPageFit((current) => {
           const result = prepareCleanupRepeatUnits(current, cleanUpNativeMolecules2d(current, nativeTargetIds), nativeTargetIds);
+          assertNoNewCleanupMoleculeOverlaps(current, result.document, cleanupLabel);
           assertMembership = result.assertMembership;
           return result.document;
         }, undefined, undefined, final => assertMembership?.(final));
@@ -5298,8 +5301,8 @@ export function MainWindow({
           setStatus("Clean up canceled because the document changed");
           return;
         }
-        if (partialSelections.length) assertNoNewCleanupMoleculeOverlaps(currentDocument, prepared);
         const { document, assertMembership } = prepareCleanupRepeatUnits(currentDocument, prepared, targetObjectIds);
+        assertNoNewCleanupMoleculeOverlaps(currentDocument, document, cleanupLabel);
         const changed = commitDocumentChangeWithPageFit(document, partialSelections.length ? "Clean Up Selection" : undefined, undefined,
           partialSelections.length ? (finalDocument) => {
             assertMembership?.(finalDocument);
@@ -10057,12 +10060,16 @@ export function MainWindow({
   tabEditFinishersRef.current = { finalizeAtomLabelDraft, finishActiveNativeTextEdit };
   const tabSessionCancellerRef = useRef(cancelDocumentTabSessions);
   tabSessionCancellerRef.current = cancelDocumentTabSessions;
-  const snapshotDocumentTab = useCallback((finishDrafts = true) => {
+  const snapshotDocumentTab = useCallback((finishDrafts = true, onRefused?: (message: string) => void) => {
     // A switch is an edit-ending gesture. Finish drafts while their document is still active.
     if (finishDrafts) {
-      const commit = tableCellEditorRef.current?.commit({ finishComposition: true });
+      const reportError = (message: string) => {
+        setStatus(message);
+        onRefused?.(message);
+      };
+      const commit = tableCellEditorRef.current?.commit({ finishComposition: true, onError: reportError });
       if (commit === "composing") {
-        setStatus("Finish typing in the table first.");
+        reportError("Finish typing in the table first.");
         return false;
       }
       if (commit === false) return false;
@@ -10146,14 +10153,14 @@ export function MainWindow({
     setStatus(tableDraftStatusRef.current?.announced ?? snapshot.status);
   }, [cancelDocumentTabSessions, clearDocumentInteractionState, installDocumentHistory]);
 
-  const activateDocumentTab = useCallback((id: string) => {
+  const activateDocumentTab = useCallback((id: string, onRefused?: (message: string) => void) => {
     if (id === activeDocumentTabIdRef.current || closeTabPrompt) return;
-    if (!snapshotDocumentTab()) return;
+    if (!snapshotDocumentTab(true, onRefused)) return;
     installDocumentTab(id);
   }, [closeTabPrompt, installDocumentTab, snapshotDocumentTab]);
 
-  const addDocumentTab = useCallback((title: string) => {
-    if (!snapshotDocumentTab()) return false;
+  const addDocumentTab = useCallback((title: string, onRefused?: (message: string) => void) => {
+    if (!snapshotDocumentTab(true, onRefused)) return false;
     const id = crypto.randomUUID();
     const tabs = [...documentTabsRef.current, { id, title }];
     documentTabsRef.current = tabs;
@@ -10264,7 +10271,7 @@ export function MainWindow({
           documentTabSnapshotsRef.current.get(tab.id)?.file.path)!) === documentTabPathKey(path) :
         browserFileKeysRef.current.get(tab.id) === browserKey);
     if (existing) {
-      activateDocumentTab(existing.id);
+      activateDocumentTab(existing.id, options?.onRefused);
       if (activeDocumentTabIdRef.current === existing.id) options?.onOpened?.();
       perfHook(() => reportOutcome?.("already-open"));
       return;
@@ -10279,8 +10286,8 @@ export function MainWindow({
       ? recommendImportedPageFit(resolvedOpen.document)
       : undefined;
     const dirty = options?.dirty ?? false;
-    if (!snapshotDocumentTab()) return;
-    if (nonPristineTabsRef.current.has(activeDocumentTabIdRef.current) && !addDocumentTab(displayName)) return;
+    if (!snapshotDocumentTab(true, options?.onRefused)) return;
+    if (nonPristineTabsRef.current.has(activeDocumentTabIdRef.current) && !addDocumentTab(displayName, options?.onRefused)) return;
     const id = activeDocumentTabIdRef.current;
     // A pristine tab keeps its tab ID but now represents a different document. Settle its drafts
     // synchronously before replacing the history; late actions must never target the opened file.
@@ -10352,18 +10359,22 @@ export function MainWindow({
     const results = requests.map(({ contents, displayName, path, receipt }) => {
       // Confirm at tab installation, before optional page-fit and compatibility dialogs.
       // A rejected parse or an early return (e.g. unfinished table edit) fails the receipt.
-      let reported = false;
-      const report = (opened: boolean) => {
-        if (!receipt || reported) return;
-        reported = true;
-        void confirmNativeOpen(receipt, opened).catch(error =>
+      let opened = false;
+      let refusal: string | undefined;
+      const confirm = (installed: boolean) => {
+        if (!receipt) return;
+        void confirmNativeOpen(receipt, installed).catch(error =>
           setStatus(`Could not confirm opening ${displayName}: ${String(error)}`));
       };
-      const options = receipt ? { onOpened: () => report(true) } : undefined;
+      const options: OpenDocumentContentsOptions = {
+        onOpened: () => { opened = true; confirm(true); },
+        onRefused: message => { refusal = message; }
+      };
       return openDocumentContents(contents, displayName, path, options).then(
-        (): DocumentOpenResult => ({ displayName }),
+        (): DocumentOpenResult => opened ? { displayName }
+          : { displayName, error: refusal ?? "Finish or cancel the current edit and try again." },
         (error: unknown): DocumentOpenResult => ({ displayName, error })
-      ).finally(() => report(false));
+      ).finally(() => { if (!opened) confirm(false); });
     });
     // Reserve the summary's place before any later batch. Each open includes its page-fit and
     // compatibility prompts, so keeping an imported page finishes successfully before we count it.

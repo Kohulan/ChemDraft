@@ -361,8 +361,29 @@ describe("Clean Up Selection command", () => {
     const before = current();
     const expected = cleanUpNativeMolecules2d(before, before.selection.objectIds);
     await command("structure.cleanup2d");
+    expect(status()).toBe("Cleaned up selected structure");
     expect(objects()).toEqual(expected.pages[0]!.objects);
+    expect(objects()).not.toEqual(before.pages[0]!.objects);
     expect(current().selection).toEqual(before.selection);
+  });
+
+  it("cleans a chain beside two stationary molecules with the same object id", async () => {
+    const { document, molecule } = straightChain();
+    const page = document.pages[0]!;
+    const helium = ocl.depictSmiles2D("[He]");
+    for (const x of [400, 500]) {
+      const spectator = createSmilesMolecule(document, { x, y: 300 }, helium, "[He]");
+      page.objects.push({ ...spectator, id: "shared-helium" });
+    }
+    document.selection = { pageId: page.id, objectIds: [molecule.id] };
+    await render(document);
+    const before = objects();
+
+    await command("structure.cleanup2d");
+
+    expect(status()).toBe("Cleaned up selected structure");
+    expect(objects()[0]!.atoms).not.toEqual(before[0]!.atoms);
+    expect(objects().slice(1)).toEqual(before.slice(1));
   });
 
   it.each(["atom selection", "drawn brackets (v1.2.0 path)"])("preserves the SRU during whole-molecule cleanup after marking %s", async (source) => {
@@ -434,5 +455,57 @@ describe("Clean Up Selection command", () => {
     expect(current()).toBe(before);
     await command("edit.undo");
     expect(status()).toBe("Nothing to undo");
+  });
+
+  it.each([
+    { layout: "polygon/tree", smiles: "CC" },
+    { layout: "engine", smiles: "c1ccc2ccccc2c1" }
+  ])("refuses whole-molecule Clean Up ($layout) that would overlap a neighbor without creating an undo entry", async ({ layout, smiles }) => {
+    const document = fixture(1, smiles);
+    const page = document.pages[0]!;
+    const molecule = page.objects[0] as MoleculeObject;
+    molecule.atoms = molecule.atoms.map((atom, i) => layout === "polygon/tree"
+      ? { ...atom, x: 200 + i * 100, y: 250 }
+      : { ...atom, x: 250 + (atom.x - 250) * 0.3, y: 250 + (atom.y - 250) * 0.3 });
+    document.selection = { pageId: page.id, objectIds: [molecule.id] };
+    const { bondLengthPx } = nativeDrawingStyleFromObjectStyle(molecule.style);
+    const cleaned = (layout === "polygon/tree" ? cleanUpNativeMolecules2d(document, [molecule.id])
+      : workflow.applyNativeMoleculeEngineRelayout(document, molecule.id, ocl.relayoutMolfile2D, {
+        targetBondLengthPx: bondLengthPx, perceiveStereo: ocl.perceiveStereoCentersFromMolfile
+      })).pages[0]!.objects[0] as MoleculeObject;
+    const movedAtom = cleaned.atoms.find(atom => molecule.atoms.every(before =>
+      Math.hypot(atom.x - before.x, atom.y - before.y) > bondLengthPx / 2))!;
+    expect(movedAtom).toBeDefined();
+    const neighbor = createSmilesMolecule(document, movedAtom, ocl.depictSmiles2D("[He]"), "[He]");
+    page.objects.push(neighbor);
+    await render(document);
+    const before = structuredClone(current());
+
+    await command("structure.cleanup2d");
+
+    await vi.waitFor(() => expect(status()).toBe("Clean Up: the fitted layout would create overlapping atoms."));
+    expect(current()).toEqual(before);
+    await command("edit.undo");
+    expect(status()).toBe("Nothing to undo");
+    expect(current()).toEqual(before);
+  });
+
+  it("refuses whole-molecule cleanup with a repeat unit when the cleaned structure would overlap a neighbor", async () => {
+    const { document, molecule } = straightChain();
+    const marked = toggleBracketRepeatUnit(document, [{ objectId: molecule.id, kind: "parts", atomIds: ["a2", "a3", "a4"], bondIds: [] }]);
+    const cleaned = cleanUpNativeMolecules2d(marked, [molecule.id]).pages[0]!.objects[0] as MoleculeObject;
+    const neighbor = createSmilesMolecule(marked, cleaned.atoms[0]!, ocl.depictSmiles2D("[He]"), "[He]");
+    const withNeighbor = applyPatch(marked, { op: "addObject", pageId: marked.pages[0]!.id, object: neighbor });
+    await render(applyPatch(withNeighbor, { op: "setSelection", objectIds: [molecule.id] }));
+    const before = structuredClone(current());
+    expect(copyAsMolfile(before, "v3000")).toContain(chainSru);
+
+    await command("structure.cleanup2d");
+
+    expect(status()).toBe("Clean Up: the fitted layout would create overlapping atoms.");
+    expect(current()).toEqual(before);
+    await command("edit.undo");
+    expect(status()).toBe("Nothing to undo");
+    expect(current()).toEqual(before);
   });
 });

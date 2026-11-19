@@ -11,7 +11,7 @@ import { ensureRdkit, resetRdkitForTesting, setRdkitModuleLoader } from "@chemdr
 import { MainWindow } from "./MainWindow";
 import { writeClipboardText } from "./clipboard";
 import {
-  attachSpin3dModelFromConformer, createPhase4Document, getSelectedMolecule, insertNativeMolfileMolecule
+  attachSpin3dModelFromConformer, createNativeTextObject, createPhase4Document, getSelectedMolecule, insertNativeMolfileMolecule
 } from "./documentWorkflow";
 import { quatFromAxisAngle, type Vec3 } from "./interaction/rotation3d";
 import { DOM_COMMAND_EVENT } from "./window-manager";
@@ -172,6 +172,57 @@ describe("Spin 3D flatten chemistry refusals", () => {
       const degrees = index * 15;
       return { view: `${name}${degrees}`, axis, degrees, refused: refused.includes(degrees) };
     }));
+
+  it("flattens when two other molecules on different pages share an object id", async () => {
+    const source = insertNativeMolfileMolecule(createPhase4Document(), { x: 300, y: 300 },
+      depictSmiles2D("CCC").molfile, "molfile-v2000");
+    const target = getSelectedMolecule(source)!;
+    const page = source.pages[0];
+    function spectator(smiles: string) {
+      const drawing = insertNativeMolfileMolecule(createPhase4Document(), { x: 100, y: 100 },
+        depictSmiles2D(smiles).molfile, "molfile-v2000");
+      return { ...getSelectedMolecule(drawing)!, id: "shared-molecule" };
+    }
+    const multipage = { ...source, pages: [
+      { ...page, objects: [...page.objects, spectator("CC")] },
+      { ...page, id: "second-page", objects: [spectator("O")] }
+    ] };
+    const coords3d = Float64Array.from(target.atoms.flatMap(atom => [(atom.x - 300) / 20, (300 - atom.y) / 20, 0]));
+    await mount(multipage, coords3d, [0, 0, 1], 90);
+    const before = snapshot();
+
+    await spinAndFlatten();
+
+    expect(status()).toMatch(/^Flattened /);
+    expect(overlay()).toBeNull();
+    const after = snapshot();
+    expect(getSelectedMolecule(after)!.atoms).not.toEqual(getSelectedMolecule(before)!.atoms);
+    expect(after.pages[0].objects[1]).toEqual(before.pages[0].objects[1]);
+    expect(after.pages[1]).toEqual(before.pages[1]);
+  });
+
+  it("flattens when a spectator molecule and the following text share an object id", async () => {
+    const source = insertNativeMolfileMolecule(createPhase4Document(), { x: 300, y: 300 },
+      depictSmiles2D("CCC").molfile, "molfile-v2000");
+    const target = getSelectedMolecule(source)!;
+    const drawing = insertNativeMolfileMolecule(createPhase4Document(), { x: 100, y: 100 },
+      depictSmiles2D("CC").molfile, "molfile-v2000");
+    const spectator = { ...getSelectedMolecule(drawing)!, id: "spectator" };
+    const text = { ...createNativeTextObject(source, { x: 150, y: 100 }, "Label"), id: spectator.id };
+    const page = source.pages[0];
+    const document = { ...source, pages: [{ ...page, objects: [...page.objects, spectator, text] }] };
+    const coords3d = Float64Array.from(target.atoms.flatMap(atom => [(atom.x - 300) / 20, (300 - atom.y) / 20, 0]));
+    await mount(document, coords3d, [0, 0, 1], 90);
+    const before = snapshot();
+
+    await spinAndFlatten();
+
+    expect(status()).toMatch(/^Flattened /);
+    expect(overlay()).toBeNull();
+    const after = snapshot();
+    expect(getSelectedMolecule(after)!.atoms).not.toEqual(getSelectedMolecule(before)!.atoms);
+    expect(after.pages[0].objects.slice(1)).toEqual(before.pages[0].objects.slice(1));
+  });
 
   it.each(views)("guards the directed P→B bond in view $view", async ({ axis, degrees, refused }) => {
     const source = insertNativeMolfileMolecule(createPhase4Document(), { x: 300, y: 300 }, phosphineBoraneMolfile, "molfile-v3000");

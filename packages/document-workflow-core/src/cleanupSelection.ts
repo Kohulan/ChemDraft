@@ -261,23 +261,30 @@ export function cleanUpMoleculeSelections2d(
 }
 
 /** Compare rendered atom positions once all molecules in the cleanup have been laid out. */
-export function assertNoNewCleanupMoleculeOverlaps(original: ChemDraftDocument, candidate: ChemDraftDocument): void {
+export function assertNoNewCleanupMoleculeOverlaps(
+  original: ChemDraftDocument, candidate: ChemDraftDocument, commandLabel = "Clean Up Selection"
+): void {
   for (const page of original.pages) {
     const finalPage = candidate.pages.find(other => other.id === page.id);
     if (!finalPage || finalPage === page) continue;
-    const molecules = page.objects.filter((object): object is MoleculeObject => object.type === "molecule");
+    // Cleanup updates objects in place, so the page position identifies each occurrence.
+    const molecules = page.objects.flatMap((molecule, index) => {
+      if (molecule.type !== "molecule") return [];
+      const next = finalPage.objects[index];
+      const cleaned = next?.type === "molecule" && next.id === molecule.id ? next : molecule;
+      return [{ molecule, cleaned }];
+    });
     if (molecules.length < 2) continue;
-    const cleaned = new Map(finalPage.objects.filter((object): object is MoleculeObject => object.type === "molecule")
-      .map(molecule => [molecule.id, molecule]));
-    checkOverlapsBetweenMolecules(molecules, cleaned);
+    checkOverlapsBetweenMolecules(molecules, commandLabel);
   }
 }
 
-function checkOverlapsBetweenMolecules(molecules: MoleculeObject[], cleaned: ReadonlyMap<string, MoleculeObject>): void {
-  const pageAtoms = molecules.map(molecule => {
-    const candidate = cleaned.get(molecule.id);
+function checkOverlapsBetweenMolecules(
+  molecules: { molecule: MoleculeObject; cleaned: MoleculeObject }[], commandLabel: string
+): void {
+  const pageAtoms = molecules.map(({ molecule, cleaned }) => {
     const before = molecule.atoms.map(atom => transformPointForObject(molecule, atom));
-    const after = candidate && candidate !== molecule ? candidate.atoms.map(atom => transformPointForObject(candidate, atom)) : before;
+    const after = cleaned !== molecule ? cleaned.atoms.map(atom => transformPointForObject(cleaned, atom)) : before;
     return { molecule, before, after };
   });
   for (const entry of pageAtoms) {
@@ -293,7 +300,7 @@ function checkOverlapsBetweenMolecules(molecules: MoleculeObject[], cleaned: Rea
           return atomPairOverlaps(distance(after, otherAfter), bondLengthPx) &&
             !atomPairOverlaps(distance(before, otherBefore), bondLengthPx);
         });
-        if (introducedOverlap) throw new Error("Clean Up Selection: the fitted layout would create overlapping atoms.");
+        if (introducedOverlap) throw new Error(`${commandLabel}: the fitted layout would create overlapping atoms.`);
       }
     }
   }
