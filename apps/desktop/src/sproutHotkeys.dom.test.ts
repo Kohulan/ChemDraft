@@ -416,6 +416,31 @@ describe.each([
     expect(molecule()).toEqual(before);
   });
 
+  it.skipIf(scheme !== "chemdraw")("V adds cyclopropyl over an atom and fuses cyclopropane over a bond", async () => {
+    await renderEthane();
+    const before = molecule();
+    await hoverAtom(0);
+    expect((await press("v")).defaultPrevented).toBe(true);
+    expect(molecule().atoms).toHaveLength(before.atoms.length + 3);
+    expect(molecule().bonds).toHaveLength(before.bonds.length + 4);
+    expect(container.querySelector("[data-status-message]")?.textContent).toContain("Added cyclopropyl");
+    await expectOneUndo(before);
+    await hoverBond();
+    expect((await press("v")).defaultPrevented).toBe(true);
+    expect(molecule().atoms).toHaveLength(before.atoms.length + 1);
+    expect(molecule().bonds).toHaveLength(before.bonds.length + 2);
+    await expectOneUndo(before);
+  });
+
+  it.skipIf(scheme !== "chemdraw")("V over empty canvas does not edit chemistry", async () => {
+    await renderEthane();
+    const before = snapshot().document;
+    await hoverPoint({ x: 50, y: 50 });
+    await press("v");
+    expect(snapshot().document).toEqual(before);
+    expect(container.querySelector("main")?.getAttribute("data-can-undo")).toBe("false");
+  });
+
   it.each([
     ["g", 3, 4], ["u", 4, 5],
     ["z", 2, 2], ["G", 5, 6], ["J", 6, 7]
@@ -443,11 +468,58 @@ describe.each([
     const before = molecule();
     await hoverBond();
     await press(key);
-    const added = key === "g" ? 1 : key === "z" ? 3 : 0;
+    const added = key === "g" ? 1 : key === "u" ? 2 : key === "z" ? 3 : 0;
     expect(molecule().atoms).toHaveLength(2 + added);
     expect(molecule().bonds).toHaveLength(1 + (added ? added + 1 : 0));
     expect(molecule().atoms.slice(0, 2)).toEqual(before.atoms);
     expect(molecule().bonds[0]).toEqual(before.bonds[0]);
     if (key === "z") expect(molecule().bonds.filter(bond => bond.order === "double")).toHaveLength(2);
+    if (added) await expectOneUndo(before);
+  });
+
+  it("adds one radical to the hovered atom without changing formula or charge and undoes exactly", async () => {
+    await renderEthane();
+    const before = molecule();
+    const beforeObjects = snapshot().document.pages[0].objects;
+    const formula = Molecule.fromSmiles(before.structure).getMolecularFormula().formula;
+    await hoverAtom(0);
+    await press(".");
+    expect(molecule().atoms[0]).toEqual({ ...before.atoms[0], markRadicals: 1 });
+    expect(molecule().atoms[1]).toEqual(before.atoms[1]);
+    expect(molecule().bonds).toEqual(before.bonds);
+    expect(Molecule.fromSmiles(molecule().structure).getMolecularFormula().formula).toBe(formula);
+    expect(molecule().atoms.map(atom => atom.formalCharge)).toEqual(before.atoms.map(atom => atom.formalCharge));
+    expect((molecule().atoms[0].markRadicals ?? 0) - (before.atoms[0].markRadicals ?? 0)).toBe(1);
+    const doc = snapshot().document;
+    const mark = doc.pages[0].objects.find(object => object.type === "electron-mark");
+    expect(mark).toMatchObject({ type: "electron-mark", markKind: "radical-dot" });
+    expect(doc.selection.objectIds).toContain(mark!.id);
+    await expectOneUndo(before);
+    expect(snapshot().document.pages[0].objects).toEqual(beforeObjects);
+  });
+
+  it("does not place a radical over a bond or empty canvas", async () => {
+    await renderEthane();
+    const before = snapshot().document;
+    await hoverBond();
+    await press(".");
+    await hoverPoint({ x: 50, y: 50 });
+    await press(".");
+    expect(snapshot().document).toEqual(before);
+  });
+
+  it("does not invoke the hover keys while a label editor is open", async () => {
+    await renderEthane();
+    await act(async () => { await window.__CHEMDRAFT_AGENT__!.command("tool.atom"); });
+    const atom = molecule().atoms[0]!;
+    await act(async () => {
+      const event = new MouseEvent("pointerdown", { bubbles: true, button: 0, buttons: 1, clientX: atom.x, clientY: atom.y });
+      Object.defineProperties(event, { pointerId: { value: 7 }, pointerType: { value: "mouse" }, isPrimary: { value: true } });
+      container.querySelector(`[data-object-id="${molecule().id}"]`)!.dispatchEvent(event);
+    });
+    expect(container.querySelector('[data-atom-label-editor="true"]')).not.toBeNull();
+    const before = snapshot().document;
+    for (const key of ["v", "u", "."]) await press(key);
+    expect(snapshot().document).toEqual(before);
   });
 });

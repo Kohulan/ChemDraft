@@ -93,10 +93,12 @@ function atomElementCommand(element: string): string {
 const CHEMDRAW_ATOM_HOTKEYS: Readonly<Record<string, string>> = {
   ...numericAtomDrawingHotkeys,
   ...fragmentAtomDrawingHotkeys,
+  v: fragmentAtomDrawingHotkeys.g,
   // "3/a" on the cheat sheet: both attach a benzene ring at the atom.
   a: numericAtomDrawingHotkeys["3"],
   "+": "atom.addPositiveChargeToHoveredAtom",
   "-": "atom.addNegativeChargeToHoveredAtom",
+  ".": "atom.addRadicalToHoveredAtom",
   h: atomElementCommand("H"),
   c: atomElementCommand("C"),
   n: atomElementCommand("N"),
@@ -144,6 +146,7 @@ const CHEMDRAW_ATOM_HOTKEYS: Readonly<Record<string, string>> = {
 const CHEMDRAW_BOND_HOTKEYS: Readonly<Record<string, string>> = {
   ...numericBondDrawingHotkeys,
   ...fragmentBondDrawingHotkeys,
+  v: "bond.fuseRingAtHoveredBond.cyclopropane",
   // ChemDraw fuses benzene onto a bond with "a".
   a: "bond.fuseRingAtHoveredBond.benzene",
   w: "bond.setHoveredBondDisplay.wedge",

@@ -1833,7 +1833,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.18.18.50-codex";
+const CURRENT_BUILD_STAMP = "11.18.21.10-codex";
 const TABLE_DRAFT_RECOVERY_WARNING = "session.tableDraftDropped";
 
 function clearTableDraftRecoveryWarnings(report: OpenWarningsReport | undefined): OpenWarningsReport | undefined {
@@ -12367,6 +12367,11 @@ export function MainWindow({
 
         if (action.id === "atom.addNegativeChargeToHoveredAtom") {
           addChargeToHoveredNativeAtom(-1);
+          return;
+        }
+
+        if (action.id === "atom.addRadicalToHoveredAtom") {
+          addChargeToHoveredNativeAtom({ kind: "radical-dot" });
           return;
         }
 
@@ -25465,6 +25470,9 @@ export function hoveredNativeTargetShortcutCommand(
   if (key === "-") {
     return "atom.addNegativeChargeToHoveredAtom";
   }
+  if (key === ".") {
+    return "atom.addRadicalToHoveredAtom";
+  }
 
   const element = nativeElementFromKeyboardKey(key);
   return element ? atomElementCommandId(element) : undefined;
@@ -25609,6 +25617,7 @@ export function activeNativeTargetShortcutCommand(
   key: string,
   scheme: KeybindingScheme = "chemdraft"
 ): string | undefined {
+  if (key === "." && hoveredTarget?.kind !== "atom") return undefined;
   return hoveredNativeTargetShortcutCommand(
     hoveredTarget ?? nativeDeleteTargetFromSelectionPart(document, selectedPart),
     key,

@@ -272,6 +272,7 @@ export function fragmentSproutKindForCommand(commandId: string): FragmentSproutK
   return fragmentSproutCommands.find(([kind]) => fragmentSproutCommandId(kind) === commandId)?.[0];
 }
 
+// Hover actions take precedence over tool shortcuts while a target is under the pointer.
 // Case-sensitive keys must stay free of tool/command shortcuts in BOTH presets.
 // In particular, v selects in the default preset and j selects benzene in the alternate preset.
 export const fragmentAtomDrawingHotkeys: Readonly<Record<string, string>> = {
@@ -284,6 +285,7 @@ export const fragmentAtomDrawingHotkeys: Readonly<Record<string, string>> = {
 
 export const fragmentBondDrawingHotkeys: Readonly<Record<string, string>> = {
   g: "bond.fuseRingAtHoveredBond.cyclopropane",
+  u: "bond.fuseRingAtHoveredBond.cyclobutane",
   z: "bond.fuseDieneAtHoveredBond"
 };
 
@@ -516,6 +518,14 @@ export const editActions: CommandSpec[] = [
     source: "core",
     category: "edit",
     description: "Place a negative charge near the hovered atom"
+  },
+  {
+    id: "atom.addRadicalToHoveredAtom",
+    title: "Add Radical to Hovered Atom",
+    icon: "charge",
+    source: "core",
+    category: "edit",
+    description: "Place a radical dot near the hovered atom"
   },
   {
     id: "edit.deleteHoveredNativeTarget",

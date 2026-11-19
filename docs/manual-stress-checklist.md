@@ -449,7 +449,10 @@ Keybinding and molecule-editing surfaces added since: the Chain tools flyout (Ch
 Chain) opened cold and warm, with a flexible-chain drag that turns corners both free and
 atom-anchored while a straight drag still reproduces the straight planner exactly; the numeric
 hover hotkeys in both keybinding schemes (rings 3–0 attach/fuse over atoms and bonds, wedge/hash
-sprouts 4/5, carbonyl 2, gem-dimethyl 9, the 0-key cyclic bond closing a ring), with tool keys
+sprouts 4/5, carbonyl 2, gem-dimethyl 9, the 0-key cyclic bond closing a ring), `g` over an atom or bond
+for cyclopropyl or fused cyclopropane, `u` over a bond for fused cyclobutane, and `.` over an atom
+for a radical; each edit undoes in one step. In the compatibility scheme, `v` mirrors `g`; in the
+default scheme, `v` selects the Select tool even over an atom. Check these on both platforms, with tool keys
 following the selected scheme — `e` over an atom applies the Et nickname in the ChemDraw scheme,
 while ChemDraft's `e` arms the eraser; charge stacking
 by hotkey and by the charge tool up to ±9 and back down to mark removal;
