@@ -76,8 +76,11 @@ export function unspecifiedStereoDoubleBondPairs(rdkit: RdkitMinimalModule, smil
 }
 
 /** Normalize parity against sorted neighbours, independent of bond traversal order. */
-function parity(graph: StereoGraph, center: number): number {
-  const neighbors = graph.bonds.flatMap(b => b.atoms[0] === center ? [b.atoms[1]] : b.atoms[1] === center ? [b.atoms[0]] : []);
+export function stereoNeighbors(graph: StereoGraph, center: number): number[] {
+  return graph.bonds.flatMap(b => b.atoms[0] === center ? [b.atoms[1]] : b.atoms[1] === center ? [b.atoms[0]] : []);
+}
+
+export function parity(graph: StereoGraph, center: number, neighbors = stereoNeighbors(graph, center)): number {
   let sign = graph.atoms[center]?.stereo === "cw" ? 1 : graph.atoms[center]?.stereo === "ccw" ? -1 : 0;
   for (let i = 0; i < neighbors.length; i++) for (let j = i + 1; j < neighbors.length; j++) if (neighbors[i] > neighbors[j]) sign = -sign;
   return sign;
