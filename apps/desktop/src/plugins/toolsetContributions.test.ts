@@ -137,7 +137,7 @@ describe("desktop plugin runtime + toolbar catalog", () => {
     expect(commandIds("core.main")).toContain(FIXTURE_PLUGIN_PING_COMMAND_ID);
   });
 
-  it.each(["stable", "legacy"] as const)("keeps additions addressed by %s group IDs across plugin group changes", idKind => {
+  it("keeps additions addressed by stable group IDs across plugin group changes", () => {
     const runtime = makeRuntime();
     const catalog = createToolbarCatalog();
     const toolset = fixturePluginManifest.contributes.toolsets[0];
@@ -152,8 +152,7 @@ describe("desktop plugin runtime + toolbar catalog", () => {
     runtime.registerPlugin(manifestWithGroups([original]), options);
     catalog.setPluginToolsets(runtime.listPluginToolsets(), runtime.listPluginCommandsWithHandlers());
     const toolsetId = FIXTURE_PLUGIN_TOOLSET_ID;
-    const stableId = catalog.registry().require(toolsetId).groups[0].id!;
-    const groupId = idKind === "stable" ? stableId : `${toolsetId}.group.0`;
+    const groupId = catalog.registry().require(toolsetId).groups[0].id!;
     const saved = { version: 1, toolsetOverrides: [{
       toolsetId, groupOrder: [groupId],
       itemOrder: { [groupId]: ["edit.undo", FIXTURE_PLUGIN_PING_COMMAND_ID] },
@@ -161,7 +160,7 @@ describe("desktop plugin runtime + toolbar catalog", () => {
     }] };
     const assertCustomizedGroup = () => {
       const groups = catalog.registry().require(toolsetId).groups;
-      expect(groups[0].id).toBe(stableId);
+      expect(groups[0].id).toBe(groupId);
       expect(groups[0].items.map(item => item.commandId)).toEqual(["edit.undo", ...original.items.map(item => item.commandId)]);
     };
     catalog.setLayoutState(saved);
@@ -171,7 +170,42 @@ describe("desktop plugin runtime + toolbar catalog", () => {
       catalog.setPluginToolsets(runtime.listPluginToolsets(), runtime.listPluginCommandsWithHandlers());
       assertCustomizedGroup();
     }
-    expect(saved.toolsetOverrides[0].itemAdditions[0].groupId).toBe(groupId);
+  });
+
+  it("keeps a saved addition on its unnamed group after restart and ignores stale index IDs", () => {
+    const toolset = fixturePluginManifest.contributes.toolsets[0];
+    const groupA = { ...toolset.groups[0], title: "Group A" };
+    const groupB = { ...toolset.groups[0], title: "Group B" };
+    const startRuntime = (groups: (typeof groupA)[]) => {
+      const runtime = makeRuntime();
+      runtime.registerPlugin({
+        ...fixturePluginManifest,
+        contributes: { ...fixturePluginManifest.contributes, toolsets: [{ ...toolset, groups }] }
+      }, createFixturePluginOptions());
+      return runtime;
+    };
+    const firstRun = startRuntime([groupA, groupB]);
+    const groupId = firstRun.listPluginToolsets()[0].groups[0].id!;
+    const saved = JSON.stringify({
+      version: 1,
+      toolsetOverrides: [{
+        toolsetId: toolset.id,
+        itemAdditions: [
+          { groupId, item: { commandId: "edit.undo" } },
+          { groupId: `${toolset.id}.group.0`, item: { commandId: "edit.redo" } }
+        ]
+      }]
+    });
+
+    const restarted = startRuntime([groupB, groupA]);
+    const catalog = createToolbarCatalog();
+    catalog.setLayoutState(JSON.parse(saved));
+    catalog.setPluginToolsets(restarted.listPluginToolsets(), restarted.listPluginCommandsWithHandlers());
+    const groups = catalog.registry().require(toolset.id).groups;
+    expect(groups.map(group => group.title)).toEqual(["Group B", "Group A"]);
+    expect(groups.find(group => group.items.some(item => item.commandId === "edit.undo"))?.id).toBe(groupId);
+    expect(groups[1].id).toBe(groupId);
+    expect(groups.flatMap(group => group.items.map(item => item.commandId))).not.toContain("edit.redo");
   });
 
   it("forwards selection and panel wiring to plugin command handlers", async () => {

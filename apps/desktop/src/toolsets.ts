@@ -22,7 +22,7 @@ import {
 import { detectShortcutPlatform, parseShortcutDisplay, type ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import { isCompoundLayoutCommand, isCompoundLayoutCommandHidden, type CompoundLayoutSettings, loadCompoundLayoutSettings } from "./compoundLayoutSettings";
 import manifest from "./toolsets/desktop-toolsets.json";
-import { isGridWidgetItem, isToolbarWidgetItem } from "./toolbars/toolbarWidgets";
+import { isGridWidgetItem, isToolbarWidgetItem, TOOLBAR_WIDGET_IDS } from "./toolbars/toolbarWidgets";
 import { MAIN_TOOLBAR_DEFAULTS_REVISION, withCurrentMainToolbarDefaults } from "./toolbars/toolbarLayoutState";
 import type { CommandSpec } from "./commands";
 import { renamedCommandId } from "./renamedCommands";
@@ -658,6 +658,13 @@ export const PALETTE_GRID_METRIC_DEFAULTS = {
 const VERTICAL_PALETTE_GRID_LAYOUT = { columns: 2, cellWidth: 24, cellHeight: 24, gap: 4, padding: 4 };
 // Horizontal .tool-palette uses --cd-space-3 between its group grids.
 const HORIZONTAL_PALETTE_GROUP_GAP = 6;
+// The Text style section sits beside the tool grid. Its spacing row is the widest:
+// nine 34px buttons with eight 4px gaps. The three 24px rows have two 4px gaps.
+const TEXT_STYLE_SECTION_SIZE = { width: 9 * 34 + 8 * 4, height: 3 * 24 + 2 * 4 };
+// Floating palette chrome in App.css: grip, horizontal padding, and web frame border;
+// title strip and vertical padding.
+const HORIZONTAL_PALETTE_FRAME_WIDTH = 7 + 2 * 6 + 2;
+const HORIZONTAL_PALETTE_FRAME_HEIGHT = 22 + 3 + 4;
 
 export function toolsetUsesResizableWindow(id: string): boolean {
   return id === "core.molecularInspector" || id === "core.drawnStructureSettings" || id === "core.ringInspector";
@@ -677,9 +684,20 @@ export function initialToolsetWindowSize(
   const gridLayout = horizontal && !toolset.gridLayout?.columns
     ? { rows: 2, ...toolset.gridLayout }
     : toolset.gridLayout ?? VERTICAL_PALETTE_GRID_LAYOUT;
-  return computePaletteGridSize(gridLayout, itemGroups)
-    ?? fallbackSize
-    ?? { width: 96, height: 420 };
+  const gridSize = computePaletteGridSize(gridLayout, itemGroups);
+  const hasTextStyleSection = horizontal && itemGroups.some(group => group.some(item =>
+    item.primary.type === "control" && item.primary.controlId === TOOLBAR_WIDGET_IDS.textStyleControls
+      && !isGridWidgetItem(item)
+  ));
+  if (hasTextStyleSection) {
+    // The command grid contributes its divider and the gap before the style section.
+    const gridWidth = gridSize ? gridSize.width + 1 + HORIZONTAL_PALETTE_GROUP_GAP : 0;
+    return {
+      width: gridWidth + TEXT_STYLE_SECTION_SIZE.width + HORIZONTAL_PALETTE_FRAME_WIDTH + HORIZONTAL_PALETTE_GROUP_GAP,
+      height: Math.max(gridSize?.height ?? 0, TEXT_STYLE_SECTION_SIZE.height) + HORIZONTAL_PALETTE_FRAME_HEIGHT
+    };
+  }
+  return gridSize ?? fallbackSize ?? { width: 96, height: 420 };
 }
 
 export function computePaletteGridSize(

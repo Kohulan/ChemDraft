@@ -144,6 +144,17 @@ it("sizes horizontal toolbar windows from the Art clone's grid or the plugin gri
   expect(initialToolsetWindowSize(plugin, getToolsetItemGroups(plugin.id, registry))).toEqual({ width: 172, height: 32 });
 });
 
+it("fits the stock Text toolbar's style controls in its initial window width", () => {
+  const registry = createToolbarCatalog().registry();
+  const toolset = registry.require("core.text");
+  const itemGroups = getToolsetItemGroups(toolset.id, registry);
+  const gridWidth = computePaletteGridSize(toolset.gridLayout, itemGroups)!.width;
+  const { width } = initialToolsetWindowSize(toolset, itemGroups);
+
+  // The Text Tool grid sits beside the font, size and color controls, with two 4px gaps.
+  expect(width).toBeGreaterThanOrEqual(gridWidth + 170 + 70 + 82 + 2 * 4);
+});
+
 it.each(["user", "plugin"] as const)("sizes a horizontal %s toolbar for two side-by-side six-column groups", source => {
   const toolset: DesktopToolsetDefinition = {
     id: `${source}.sizing`, title: "Sizing", source, defaultVisible: true, defaultMode: "floating",

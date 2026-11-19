@@ -4,8 +4,14 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { applyToolsetLayoutState, type ToolsetLayoutState } from "@chemdraft/toolset-registry";
+import { createPluginRuntime } from "../../plugins/createPluginRuntime";
+import {
+  createFixturePluginOptions, FIXTURE_PLUGIN_CHAT_COMMAND_ID, FIXTURE_PLUGIN_PING_COMMAND_ID,
+  FIXTURE_PLUGIN_TOOLSET_ID, fixturePluginManifest
+} from "../../plugins/fixturePlugin";
 import { SHELL_COMMAND_IDS } from "../../shellCommandIds";
-import type { DesktopToolsetDefinition } from "../../toolsets";
+import { getToolsetItemGroups, type DesktopToolsetDefinition } from "../../toolsets";
+import { createToolbarCatalog } from "../toolbarCatalog";
 import { filterToolbarCustomizationCommands } from "../toolbarCustomizationCommands";
 import { CustomizeToolbarsDialog } from "./CustomizeToolbarsDialog";
 
@@ -68,11 +74,11 @@ describe("CustomizeToolbarsDialog", () => {
     { id: "edit.undo", title: "Undo", enabled: false, disabledReason: "Nothing to undo" }
   ], { enabled: false });
 
-  function render(state: ToolsetLayoutState = emptyState) {
+  function render(state: ToolsetLayoutState = emptyState, toolsets: DesktopToolsetDefinition[] = baseToolsets) {
     onApply = vi.fn();
     onClose = vi.fn();
     act(() => {
-      root.render(createElement(CustomizeToolbarsDialog, { baseToolsets, layoutState: state, availableCommands, onApply, onClose }));
+      root.render(createElement(CustomizeToolbarsDialog, { baseToolsets: toolsets, layoutState: state, availableCommands, onApply, onClose }));
     });
   }
 
@@ -198,6 +204,35 @@ describe("CustomizeToolbarsDialog", () => {
     expect(visible?.checked).toBe(true);
     act(() => visible!.dispatchEvent(new MouseEvent("click", { bubbles: true })));
     expect(applied().toolsetOverrides).toContainEqual({ toolsetId: "core.main", hiddenCommandIds: ["tool.a"] });
+  });
+
+  it.each(["stable", "index"] as const)("shows the same plugin item order as the palette with a saved %s group ID", idKind => {
+    const runtime = createPluginRuntime({ getActiveDocument: () => undefined });
+    runtime.registerPlugin(fixturePluginManifest, createFixturePluginOptions());
+    const toolsets = runtime.listPluginToolsets();
+    const toolsetId = FIXTURE_PLUGIN_TOOLSET_ID;
+    const groupId = toolsets[0].groups[0].id!;
+    const orderGroupId = idKind === "stable" ? groupId : `${toolsetId}.group.0`;
+    const undo = "edit.undo";
+    const originalOrder = [FIXTURE_PLUGIN_PING_COMMAND_ID, FIXTURE_PLUGIN_CHAT_COMMAND_ID, undo];
+    const savedOrder = [undo, FIXTURE_PLUGIN_PING_COMMAND_ID, FIXTURE_PLUGIN_CHAT_COMMAND_ID];
+    const state: ToolsetLayoutState = {
+      ...emptyState,
+      toolsetOverrides: [{
+        toolsetId,
+        itemAdditions: [{ groupId, index: 2, item: { commandId: undo } }],
+        itemOrder: { [orderGroupId]: savedOrder }
+      }]
+    };
+    const catalog = createToolbarCatalog();
+    catalog.setPluginToolsets(toolsets, runtime.listPluginCommandsWithHandlers());
+    catalog.setLayoutState(state);
+    render(state, toolsets);
+
+    const paletteOrder = getToolsetItemGroups(toolsetId, catalog.registry()).flat().map(item => item.id);
+    const dialogOrder = [...container.querySelectorAll<HTMLElement>("[data-item-id]")].map(item => item.dataset.itemId);
+    expect(paletteOrder).toEqual(dialogOrder);
+    expect(dialogOrder).toEqual(idKind === "stable" ? savedOrder : originalOrder);
   });
 
   it("adds a command to a user toolset via the palette", () => {

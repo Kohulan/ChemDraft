@@ -75,6 +75,7 @@ fn main() {
             "show_toolset_tooltip_window",
             "hide_toolset_tooltip_window",
             "set_current_window_global_position",
+            "clamp_current_inspector_frame",
             "resize_toolset_window",
             "start_window_drag",
             "quit_after_flush",

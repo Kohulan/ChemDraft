@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "toolset-window-size",
-  "description": "Allow native tool palettes to fit the calling window to their content.",
+  "description": "Allow native tool palettes to fit the calling window to their content and inspectors to fit the work area.",
   "windows": ["toolset-*"],
-  "permissions": ["allow-resize-toolset-window"]
+  "permissions": ["allow-resize-toolset-window", "allow-clamp-current-inspector-frame"]
 }

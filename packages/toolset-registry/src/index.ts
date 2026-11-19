@@ -227,7 +227,7 @@ export const UserToolsetDefinitionSchema = ToolsetDefinitionSchema.extend({
 // those empties. The STRICT non-empty invariant for authored manifests stays in ToolsetManifestSchema
 // (parseToolsetManifest), so registering a derived layout can never crash the way register() did.
 export const RegisteredToolsetSchema = ToolsetDefinitionSchema.extend({
-  groups: z.array(UserToolsetGroupSchema.extend({ legacyGroupId: NonEmptyStringSchema.optional() }))
+  groups: z.array(UserToolsetGroupSchema)
 }).strict();
 
 export const ToolsetLayoutStateSchema = z
@@ -291,8 +291,6 @@ export type ToolsetItemDefinition<TIcon extends string = string, TAssetName exte
 
 export type ToolsetGroupDefinition<TIcon extends string = string, TAssetName extends string = string> =
   Omit<z.infer<typeof ToolsetGroupSchema>, "items"> & {
-    /** Transitional alias for an index-based ID from an older plugin toolbar. */
-    legacyGroupId?: string;
     items: ToolsetItemDefinition<TIcon, TAssetName>[];
   };
 
@@ -804,8 +802,7 @@ export function mergeToolsetItemAdditions<TIcon extends string = string, TAssetN
     // First wins toolset-wide, matching the prior registry contract even when the winning entry
     // targets a group that no longer exists.
     takenIds.add(id);
-    const group = merged.find((candidate) => candidate.id === addition.groupId)
-      ?? merged.find((candidate) => candidate.legacyGroupId === addition.groupId);
+    const group = merged.find((candidate) => candidate.id === addition.groupId);
     if (!group) {
       continue;
     }
@@ -843,14 +840,8 @@ function applyUserToolsetOverride<TIcon extends string, TAssetName extends strin
     toolset.groups,
     override.itemAdditions as readonly ToolsetItemAddition<TIcon, TAssetName>[] | undefined
   );
-  const groupOrder = override.groupOrder?.map(id =>
-    groupsWithAdditions.find(group => group.id === id)?.id
-    ?? groupsWithAdditions.find(group => group.legacyGroupId === id)?.id
-    ?? id
-  ) ?? [];
-  const groups = reorderById(groupsWithAdditions, groupOrder, (group) => group.id).map((group) => {
-    const order = (group.id ? override.itemOrder?.[group.id] : undefined)
-      ?? (group.legacyGroupId ? override.itemOrder?.[group.legacyGroupId] : undefined);
+  const groups = reorderById(groupsWithAdditions, override.groupOrder ?? [], (group) => group.id).map((group) => {
+    const order = group.id ? override.itemOrder?.[group.id] : undefined;
     const orderedItems = reorderById(group.items, order ?? [], toolsetItemCustomizationId)
       .filter((item) => {
         const commandId = toolsetItemCustomizationId(item);
