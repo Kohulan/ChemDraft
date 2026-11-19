@@ -3,7 +3,7 @@ import { buildObjectCanvasMenu, pageCanvasMenu, SET_DEFAULT_ARROW_STYLE_COMMAND_
 import { electronMarkInteractionFrames } from "./electronMarkInteraction";
 import { installPopoverEscapeRouting } from "./window-manager/popoverEscape";
 import { BracketLabelEditor, type BracketLabelEditorHandle } from "./BracketLabelEditor";
-import { createBracketCommands, selectedBracketPair, toggleBracketRepeatUnit, setBracketRepeatLabel, bracketRepeatUnitStatus } from "./bracketCommands";
+import { createBracketCommands, selectedBracketPair, toggleBracketRepeatUnit, setBracketRepeatLabel, bracketRepeatUnitStatus, prepareCleanupRepeatUnits } from "./bracketCommands";
 import { bracketLabelPlan, bracketLabelContainsPoint, lonePairDragDirection } from "@chemdraft/layout-engine";
 import { useCanvasHandwritingFont } from "./canvasHandwritingFont";
 import { nativeTemplateForToolCommand } from "./ringTemplates";
@@ -1834,7 +1834,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.18.21.11-codex";
+const CURRENT_BUILD_STAMP = "11.18.23.55-codex";
 const TABLE_DRAFT_RECOVERY_WARNING = "session.tableDraftDropped";
 
 function clearTableDraftRecoveryWarnings(report: OpenWarningsReport | undefined): OpenWarningsReport | undefined {
@@ -5216,6 +5216,10 @@ export function MainWindow({
       !changed && onlyDisconnectedAtoms
         ? "Nothing to clean up: the selected atoms aren't connected to each other. Select a bond or neighboring atoms."
         : cleanUpStructureStatus(documentRef.current, targetObjectIds, changed, warnings);
+    const reportCleanupFailure = (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(/^Clean Up (Selection:|refused:)/.test(message) ? message : `Clean up failed: ${message}`);
+    };
     const partialSelections = fragments.filter(fragment => {
       // The legacy store may include a part's host in objectIds. The part defines its scope;
       // a true whole-molecule pick clears that molecule's part in the selection policy.
@@ -5241,9 +5245,18 @@ export function MainWindow({
     });
     const nativeTargetIds = targetObjectIds.filter((targetId) => !engineTargetIds.includes(targetId) && !partialIds.has(targetId));
     if (engineTargetIds.length === 0 && partialSelections.length === 0) {
-      const changed = commitDocumentChangeWithPageFit((current) => cleanUpNativeMolecules2d(current, nativeTargetIds));
-      resetCleanupChrome();
-      setStatus(cleanedStatus(changed));
+      let assertMembership: ReturnType<typeof prepareCleanupRepeatUnits>["assertMembership"];
+      try {
+        const changed = commitDocumentChangeWithPageFit((current) => {
+          const result = prepareCleanupRepeatUnits(current, cleanUpNativeMolecules2d(current, nativeTargetIds), nativeTargetIds);
+          assertMembership = result.assertMembership;
+          return result.document;
+        }, undefined, undefined, final => assertMembership?.(final));
+        resetCleanupChrome();
+        setStatus(cleanedStatus(changed));
+      } catch (error) {
+        reportCleanupFailure(error);
+      }
       return;
     }
 
@@ -5286,8 +5299,10 @@ export function MainWindow({
           return;
         }
         if (partialSelections.length) assertNoNewCleanupMoleculeOverlaps(currentDocument, prepared);
-        const changed = commitDocumentChangeWithPageFit(() => prepared, partialSelections.length ? "Clean Up Selection" : undefined, undefined,
+        const { document, assertMembership } = prepareCleanupRepeatUnits(currentDocument, prepared, [...nativeTargetIds, ...engineTargetIds], partialIds);
+        const changed = commitDocumentChangeWithPageFit(document, partialSelections.length ? "Clean Up Selection" : undefined, undefined,
           partialSelections.length ? (finalDocument) => {
+            assertMembership?.(finalDocument);
             // Normalization can reassociate electron marks, including to a structure outside
             // the selection. Validate every native molecule in the exact document that will
             // enter history, after all normalization and before any document/history write.
@@ -5308,11 +5323,10 @@ export function MainWindow({
                 throw new Error(`Clean Up Selection refused: final commit normalization would change chemistry in structure ${before.id}. The drawing was kept unchanged.`);
               }
             }
-          } : undefined);
+          } : assertMembership);
         setStatus(cleanedStatus(changed, warnings));
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        setStatus(message.startsWith("Clean Up Selection:") ? message : `Clean up failed: ${message}`);
+        reportCleanupFailure(error);
       }
     })();
   }, [assignHoveredNativeDeleteTarget, commitDocumentChangeWithPageFit]);
