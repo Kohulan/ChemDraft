@@ -197,8 +197,11 @@ describe.each([false, true])("directed Arrow objects (binary=%s)", binary => {
     assertEndpoints(reopened, start, end);
   });
 
-  it("still infers retrosynthesis from an angle head with other positive shaft spacing", () => {
-    const xml = '<CDXML><page id="1"><arrow id="2" Tail3D="300 150 0" Head3D="150 150 0" ArrowheadHead="Full" ArrowheadType="Angle" ArrowShaftSpacing="301"/></page></CDXML>';
+  it.each([
+    [300, "Other Editor"], [300, undefined], [301, undefined]
+  ] as const)("infers retrosynthesis at shaft spacing %i with CreationProgram %s", (spacing, producer) => {
+    const creationProgram = producer ? ` CreationProgram="${producer}"` : "";
+    const xml = `<CDXML${creationProgram}><page id="1"><arrow id="2" Tail3D="300 150 0" Head3D="150 150 0" ArrowheadHead="Full" ArrowheadType="Angle" ArrowShaftSpacing="${spacing}"/></page></CDXML>`;
     const opened = binary ? importCdx(writeCdx(tree(xml))) : openChemDraftPayload(xml);
     const arrow = opened.document!.pages[0].objects[0] as GraphicObject;
     expect(arrow.data).toMatchObject({ artToolId: "retroArrow", dualShaft: true, dualShaftParallel: true });

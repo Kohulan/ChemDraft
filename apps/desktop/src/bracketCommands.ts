@@ -96,14 +96,14 @@ function repeatUnitMembershipKey(membership: RepeatUnitAtomMembership): string {
   ]);
 }
 
-/** Refit native SRUs only where a whole-molecule layout would change their chemical meaning. */
+/** Preserve pre-cleanup SRU membership by refitting native brackets or refusing the layout. */
 export function prepareCleanupRepeatUnits(before: ChemDraftDocument, after: ChemDraftDocument,
-  wholeIds: readonly string[], partialIds?: ReadonlySet<string>): {
+  targetIds: readonly string[]): {
     document: ChemDraftDocument;
     assertMembership?: (final: ChemDraftDocument) => void;
   } {
-  if (after === before || !wholeIds.length) return { document: after };
-  const whole = new Set(wholeIds);
+  if (after === before || !targetIds.length) return { document: after };
+  const targets = new Set(targetIds);
   const patches: DocumentPatch[] = [];
   const checks: ((final: ChemDraftDocument) => void)[] = [];
   for (const page of before.pages) {
@@ -112,14 +112,11 @@ export function prepareCleanupRepeatUnits(before: ChemDraftDocument, after: Chem
     const pairs = [...bracketPairs(page.objects)].filter(([, pair]) => bracketPairUsage(pair) === "sru");
     if (!pairs.length) continue;
     const candidateObjects = new Map(candidate.objects.map(object => [object.id, object]));
-    if (!page.objects.some(object => object.type === "molecule" && whole.has(object.id) &&
+    if (!page.objects.some(object => object.type === "molecule" && targets.has(object.id) &&
       object !== candidateObjects.get(object.id))) continue;
-    // In a mixed selection, compare against the same partial layouts on both sides.
-    const baseline = partialIds?.size ? page.objects.map(object =>
-      partialIds.has(object.id) ? candidateObjects.get(object.id) ?? object : object) : page.objects;
     const candidatePairs = bracketPairs(candidate.objects);
     for (const [pairId, pair] of pairs) {
-      const membership = resolveRepeatUnitAtomMembership(pair, baseline, membershipOptions);
+      const membership = resolveRepeatUnitAtomMembership(pair, page.objects, membershipOptions);
       const expected = repeatUnitMembershipKey(membership);
       const close = pair.find(bracket => bracket.side === "close")!;
       const refusal = () => new Error(

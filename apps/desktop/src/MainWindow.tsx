@@ -5299,7 +5299,7 @@ export function MainWindow({
           return;
         }
         if (partialSelections.length) assertNoNewCleanupMoleculeOverlaps(currentDocument, prepared);
-        const { document, assertMembership } = prepareCleanupRepeatUnits(currentDocument, prepared, [...nativeTargetIds, ...engineTargetIds], partialIds);
+        const { document, assertMembership } = prepareCleanupRepeatUnits(currentDocument, prepared, targetObjectIds);
         const changed = commitDocumentChangeWithPageFit(document, partialSelections.length ? "Clean Up Selection" : undefined, undefined,
           partialSelections.length ? (finalDocument) => {
             assertMembership?.(finalDocument);

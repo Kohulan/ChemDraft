@@ -387,6 +387,35 @@ describe("Clean Up Selection command", () => {
     expect(current()).toEqual(after);
   });
 
+  it.each(["partial", "mixed"] as const)("preserves a terminal SRU during %s cleanup", async scope => {
+    const { document, molecule } = straightChain();
+    molecule.atoms[4]!.x += 90;
+    molecule.width += 90;
+    const whole = scope === "mixed" ? fixture(2).pages[0]!.objects[1] as MoleculeObject : undefined;
+    if (whole) document.pages[0]!.objects.push(whole);
+    const marked = toggleBracketRepeatUnit(document, [{ objectId: molecule.id, kind: "parts", atomIds: ["a5"], bondIds: [] }]);
+    await render(applyPatch(marked, { op: "setSelection", objectIds: whole ? [whole.id] : [] }));
+    const part = await selectBond(objects()[0]!, molecule.bonds[3]!, 722);
+    expect(part.wrapper().dataset.selectedNativeBondId).toBe(part.bond.id);
+    if (whole) expect(current().selection.objectIds).toContain(whole.id);
+    const before = current();
+    const molfile = (snapshot: ChemDraftDocument) =>
+      copyAsMolfile(applyPatch(snapshot, { op: "setSelection", objectIds: [molecule.id] }), "v3000");
+    const terminalSru = "SRU 0 ATOMS=(1 5) XBONDS=(1 4) LABEL=n CONNECT=EU";
+    expect(molfile(before)).toContain(terminalSru);
+
+    await command("structure.cleanup2d");
+    await vi.waitFor(() => expect(status()).toMatch(/^Cleaned up selected structure/));
+    const after = current();
+    expect(objects()[0]!.atoms[4]).not.toEqual(molecule.atoms[4]);
+    if (whole) expect(objects().find(object => object.id === whole.id)?.atoms).not.toEqual(whole.atoms);
+    expect(molfile(after)).toContain(terminalSru);
+    await command("edit.undo");
+    expect(current()).toEqual(before);
+    await command("edit.redo");
+    expect(current()).toEqual(after);
+  });
+
   it("refuses whole-molecule cleanup when refitting would enclose another molecule", async () => {
     const { document, molecule } = straightChain();
     const cleaned = cleanUpNativeMolecules2d(document, [molecule.id]).pages[0]!.objects[0] as MoleculeObject;
