@@ -18,7 +18,7 @@ ChemDraft 1.2.1 improves drawing, file exchange and dialogs, and fixes problems 
 
 - **Rectangles.** Filled rectangles with rounded corners or a shadow keep their fill in CDX and CDXML; shaded rectangles keep their gloss fill. See the color limitation below.
 - **Reaction arrows.** Reaction arrows keep their direction in CDX and CDXML. One-headed equilibrium arrows and older hollow arrows open unchanged.
-- **MOL and SDF.** Export uses standard MDL coordinate units. If scaling would change the structure, ChemDraft refuses the export and explains why.
+- **MOL and SDF.** Export uses standard MDL coordinate units. If scaling would change the structure, ChemDraft refuses the export and explains why; if it cannot check stereochemistry after scaling, it keeps your drawing's coordinates and shows a warning.
 - **Opening files.** Choosing several files opens each one, and a file that fails to open is named in the message.
 - **Charged atoms.** Opening a file or restoring a session no longer removes a charge whose + mark sits away from its atom.
 - **File warnings.** File warnings appear in their own window above floating toolbars. Out-of-range numeric CDX data is kept as text with a warning, and page-specific data stays on its page.
@@ -41,7 +41,7 @@ ChemDraft 1.2.1 improves drawing, file exchange and dialogs, and fixes problems 
 - Charges, radicals and lone pairs follow their atoms through Arrange, Spacing and Align; a mark moved on its own stays put.
 - The Molecular Inspector reanalyzes after an edit that changes chemistry, such as making a bond dashed; color-only edits do not trigger a new analysis.
 - Condensing a reaction label keeps the structure's stored chemistry up to date for later edits and exports.
-- Clean Up explains when a selection has only unconnected atoms, keeps ring double-bond strokes inside the ring, and refuses overlapping results.
+- Clean Up explains when a selection has only unconnected atoms and keeps ring double-bond strokes inside the ring.
 - Typing a monovalent label on a ring carbon replaces that vertex. The phenyl shortcut preserves existing bond orders, and the terminal alkyne shortcut grows straight.
 - Center- and right-aligned text boxes keep their anchor while typing. The bold shortcut works in the text editor.
 - The status line describes mixed selections and counts only objects that moved. Undo and Redo work while an atom-problem badge has focus, and Ignore closes its window.
@@ -57,6 +57,7 @@ ChemDraft 1.2.1 improves drawing, file exchange and dialogs, and fixes problems 
 - CDX and CDXML keep one color per rectangle. When fill and outline differ, ChemDraft keeps the fill unless it is white or the page color, in which case it keeps the outline. A warning appears when a color cannot be saved.
 - A canceled macOS logout can leave editing locked until ChemDraft is relaunched.
 - If you open a file while ChemDraft is asking whether to save before quitting and then choose Don't Save, that file may not open. Open it again after relaunching.
+- An equilibrium arrow you edited to a single open head can reopen as a retrosynthesis arrow from a CDX or CDXML file saved without embedded ChemDraft data if you changed the Creation program field in the Export dialog.
 - On macOS, opening several files at once from the Finder while ChemDraft asks how to fit a page can show a message that a file was not confirmed, even though every file opens.
 
 ## macOS
