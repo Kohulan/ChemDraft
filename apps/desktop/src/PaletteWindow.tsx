@@ -51,6 +51,8 @@ import {
   newToolsetPopoverOpening,
   currentWindowLogicalPosition,
   currentWindowLogicalWorkArea,
+  clampCurrentInspectorFrame,
+  isDesktopRuntime,
   fitCurrentPaletteWindow,
   dismissToolsetPopovers,
   toolsetPopoverTimestamp,
@@ -438,6 +440,50 @@ export function PaletteWindow({
     if (shell) return installPaletteInputFocus(shell, platform,
       (event) => !!paletteMenuShortcut(event, shortcutRegistryRef.current));
   }, [platform]);
+
+  useEffect(() => {
+    if (!resizable || !knownToolset || !isDesktopRuntime()) return;
+
+    let disposed = false;
+    let timer: number | undefined;
+    let unlisten: (() => void) | undefined;
+    // Let a native drag cross the screen edge before bringing the full frame back into view.
+    const scheduleClamp = () => {
+      if (disposed) return;
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        void clampCurrentInspectorFrame().catch(() => undefined);
+      }, 150);
+    };
+    // Taskbar or Dock changes can shrink the work area without a move or a webview resize.
+    let lastArea: string | undefined;
+    let checking = false;
+    const checkWorkArea = async () => {
+      if (checking || document.hidden) return;
+      checking = true;
+      try {
+        const { left, top, right, bottom } = await currentWindowLogicalWorkArea();
+        const area = `${left}:${top}:${right}:${bottom}`;
+        if (lastArea !== undefined && lastArea !== area) scheduleClamp();
+        lastArea = area;
+      } finally {
+        checking = false;
+      }
+    };
+    const check = () => { void checkWorkArea().catch(() => undefined); };
+    check();
+    const areaTimer = window.setInterval(check, 1000);
+    void listenForCurrentWindowWorkAreaChanges(scheduleClamp).then(cleanup => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    });
+    return () => {
+      disposed = true;
+      window.clearTimeout(timer);
+      window.clearInterval(areaTimer);
+      unlisten?.();
+    };
+  }, [knownToolset, resizable]);
 
   useEffect(() => {
     if (resizable || !knownToolset) return;

@@ -23,13 +23,14 @@ import {
   moleculeStructureBondLengthCommandId,
   type CommandSpec
 } from "./commands";
-import { getToolsetCommandGroups, getToolsetItemGroups, initialToolsetWindowSize, type DesktopToolsetDefinition, type ToolbarPaletteGroupModel, type ToolbarPaletteItemModel } from "./toolsets";
+import { computePaletteGridSize, getToolsetCommandGroups, getToolsetItemGroups, initialToolsetWindowSize, type DesktopToolsetDefinition, type ToolbarPaletteGroupModel, type ToolbarPaletteItemModel } from "./toolsets";
 import { ToolbarCustomizeController } from "./toolbars/CustomizeMainToolbar/ToolbarCustomizeController";
 import { createToolbarCatalog } from "./toolbars/toolbarCatalog";
+import { filterToolbarCustomizationCommands } from "./toolbars/toolbarCustomizationCommands";
 import { cloneToolset, createCommandToolbarItem } from "./toolbars/CustomizeToolbars/layoutStateEdits";
 import { CommandRegistry } from "@chemdraft/plugin-host";
 import { createPluginRuntime } from "./plugins/createPluginRuntime";
-import { FIXTURE_PLUGIN_PING_COMMAND_ID, FIXTURE_PLUGIN_TOOLSET_ID, fixturePluginManifest } from "./plugins/fixturePlugin";
+import { FIXTURE_PLUGIN_ID, FIXTURE_PLUGIN_PING_COMMAND_ID, FIXTURE_PLUGIN_TOOLSET_ID, createFixturePluginOptions, fixturePluginManifest } from "./plugins/fixturePlugin";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -125,14 +126,14 @@ it("keeps the Molecular Inspector grip beside its pane and reserves pane height 
   }
 });
 
-it("sizes horizontal toolbar windows from the Art clone's preferred size or the plugin grid", () => {
+it("sizes horizontal toolbar windows from the Art clone's grid or the plugin grid", () => {
   const catalog = createToolbarCatalog();
   const art = catalog.registry().require("core.art");
   const clone = cloneToolset({ version: 1, toolsetOverrides: [], userToolsets: [] }, art);
   catalog.setLayoutState(clone.state);
   const artCopy = catalog.registry().require(clone.toolsetId);
-  expect(initialToolsetWindowSize(artCopy, getToolsetItemGroups(artCopy.id, catalog.registry())))
-    .toMatchObject({ width: 420, height: art.preferredWindowSize!.height });
+  const artGroups = getToolsetItemGroups(artCopy.id, catalog.registry());
+  expect(initialToolsetWindowSize(artCopy, artGroups)).toEqual(computePaletteGridSize(artCopy.gridLayout, artGroups));
 
   const plugin: DesktopToolsetDefinition = {
     id: "plugin.sizing", title: "Sizing", source: "plugin", defaultVisible: true, defaultMode: "floating",
@@ -156,24 +157,39 @@ it.each(["user", "plugin"] as const)("sizes a horizontal %s toolbar for two side
   expect(initialToolsetWindowSize(toolset, itemGroups)).toEqual({ width: 350, height: 32 });
 });
 
-it("renders a contributed plugin button with no command handler as disabled", () => {
+it.each(["macos", "windows"] as const)("disables the original and copied plugin buttons after their handler is removed on %s", platform => {
   const runtime = createPluginRuntime({ commandRegistry: new CommandRegistry(), getActiveDocument: () => undefined });
-  runtime.registerPlugin(fixturePluginManifest, { commandHandlers: {} });
+  runtime.registerPlugin(fixturePluginManifest, createFixturePluginOptions());
   const catalog = createToolbarCatalog();
   catalog.setPluginToolsets(runtime.listPluginToolsets(), runtime.listPluginCommandsWithHandlers());
-  const commandOverrides = new Map(catalog.baseCommands().map(command => [command.id, command]));
-  const itemGroups = getToolsetItemGroups(FIXTURE_PLUGIN_TOOLSET_ID, catalog.registry(), commandOverrides);
+  const layoutId = "core.layout";
+  const commandId = FIXTURE_PLUGIN_PING_COMMAND_ID;
+  catalog.setLayoutState({ version: 1, toolsetOverrides: [{
+    toolsetId: layoutId, itemAdditions: [{ groupId: "core.layout.tools", item: { commandId } }]
+  }] });
   const container = document.createElement("div");
   const root = createRoot(container);
   const onInvoke = vi.fn();
+  const renderButtons = () => {
+    const commandOverrides = new Map(catalog.baseCommands().map(command => [command.id, command]));
+    act(() => root.render([FIXTURE_PLUGIN_TOOLSET_ID, layoutId].map(toolsetId => createElement(ToolPalette, {
+      key: toolsetId, itemGroups: getToolsetItemGroups(toolsetId, catalog.registry(), commandOverrides),
+      mode: "floating", platform, onInvoke
+    }))));
+    return Array.from(container.querySelectorAll<HTMLButtonElement>(`[data-command-id="${commandId}"]`));
+  };
   try {
-    act(() => root.render(createElement(ToolPalette, { itemGroups, mode: "floating", onInvoke })));
-    const button = container.querySelector<HTMLButtonElement>(`[data-command-id="${FIXTURE_PLUGIN_PING_COMMAND_ID}"]`)!;
-    expect(button.disabled).toBe(true);
-    expect(button.getAttribute("aria-label")).toContain("Plugin command has no registered handler");
-    act(() => button.click());
+    expect(renderButtons().map(button => button.disabled)).toEqual([false, false]);
+    runtime.replacePlugin(FIXTURE_PLUGIN_ID, fixturePluginManifest, { commandHandlers: {} });
+    catalog.setPluginToolsets(runtime.listPluginToolsets(), runtime.listPluginCommandsWithHandlers());
+    const buttons = renderButtons();
+    expect(buttons.map(button => button.disabled)).toEqual([true, true]);
+    for (const button of buttons) {
+      expect(button.getAttribute("aria-label")).toContain("Plugin command has no registered handler");
+      act(() => button.click());
+    }
     expect(onInvoke).not.toHaveBeenCalled();
-    expect(commandOverrides.has(FIXTURE_PLUGIN_PING_COMMAND_ID)).toBe(false);
+    expect(filterToolbarCustomizationCommands(catalog.baseCommands(), { enabled: false }).map(command => command.id)).not.toContain(commandId);
   } finally {
     act(() => root.unmount());
   }

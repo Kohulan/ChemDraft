@@ -77,6 +77,56 @@ describe("mergeVisibilityIntoLayoutState", () => {
 });
 
 describe("live toolbar layout rebuild", () => {
+  it.each([42, null, { id: "edit.undo" }])("skips a non-string saved command ID (%j) and keeps valid siblings", commandId => {
+    const catalog = createToolbarCatalog();
+    const groupId = "core.layout.tools";
+    const saved = {
+      version: 1, mainToolbarDefaultsRevision: MAIN_TOOLBAR_DEFAULTS_REVISION, toolsetOverrides: [
+        { toolsetId: "core.main", title: "My Main Toolbar" },
+        { toolsetId: "core.layout", itemAdditions: [
+          { groupId, item: { commandId } },
+          { groupId, item: { commandId: "edit.undo" } }
+        ] }
+      ]
+    };
+    const before = structuredClone(saved);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      catalog.setLayoutState(saved);
+      catalog.setPluginToolsets([]);
+      expect(catalog.registry().require("core.main").title).toBe("My Main Toolbar");
+      expect(getToolsetItemGroups("core.layout", catalog.registry()).flat().map(item => item.id)).toContain("edit.undo");
+      expect(catalog.warnings()).toEqual([expect.stringContaining("malformed command")]);
+      expect(saved).toEqual(before);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("skips an added button naming a control or an unregistered flyout command", () => {
+    const catalog = createToolbarCatalog();
+    const groupId = "core.layout.tools";
+    const controlId = "widget.core.mainStyleControls";
+    const missingId = "plugin.uninstalled.extra";
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      catalog.setLayoutState({ version: 1, toolsetOverrides: [{
+        toolsetId: "core.layout", itemAdditions: [
+          { groupId, item: { commandId: controlId } },
+          { groupId, item: { commandId: "edit.undo", submenu: { type: "command-grid", items: [{ commandId: missingId }] } } },
+          { groupId, item: { commandId: "edit.redo" } }
+        ]
+      }] });
+      const ids = getToolsetItemGroups("core.layout", catalog.registry()).flat().map(item => item.id);
+      expect(ids).toContain("edit.redo");
+      expect(ids).not.toContain(controlId);
+      expect(ids).not.toContain("edit.undo");
+      expect(catalog.warnings()).toEqual([expect.stringContaining(controlId), expect.stringContaining(missingId)]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it.each([undefined, MAIN_TOOLBAR_DEFAULTS_REVISION])("skips invalid saved additions only in the registry (revision %s)", revision => {
     const catalog = createToolbarCatalog();
     const toolsetId = "core.main";

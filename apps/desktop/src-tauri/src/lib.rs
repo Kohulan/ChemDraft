@@ -1729,6 +1729,7 @@ pub fn run() {
             show_toolset_tooltip_window,
             hide_toolset_tooltip_window,
             set_current_window_global_position,
+            clamp_current_inspector_frame,
             resize_toolset_window,
             start_window_drag,
             quit_after_flush,
@@ -6915,6 +6916,18 @@ fn set_current_window_global_position(
     set_window_global_logical_position(&window, x, y)
 }
 
+/// Constrain the live frame after the inspector webview observes a move or work-area change.
+#[tauri::command]
+fn clamp_current_inspector_frame(window: tauri::WebviewWindow) {
+    let app = window.app_handle();
+    if toolset_id_for_window_label(app, window.label()).is_some_and(|id| toolset_is_resizable(&id))
+        && window.is_visible().unwrap_or(false)
+        && !utility_windows_suspended()
+    {
+        recover_offscreen_toolset_window(app, &window, true);
+    }
+}
+
 /// Resize to measured content, keeping the native top-left that is current when the resize runs.
 #[tauri::command]
 fn resize_toolset_window(
@@ -10750,6 +10763,7 @@ fn is_routed_menu_command(command_id: &str) -> bool {
 const TOOLSET_TITLE_HEIGHT: f64 = 22.0;
 
 /// A monitor's full bounds in global logical points.
+#[cfg(not(windows))]
 fn monitor_logical_bounds(monitor: &tauri::Monitor) -> (f64, f64, f64, f64) {
     let scale = monitor.scale_factor();
     let origin = monitor.position().to_logical::<f64>(scale);
@@ -10824,21 +10838,42 @@ fn clamp_toolset_frame<R: Runtime>(
         _ => return (position, width, height),
     };
 
-    let title_monitor = |title_width: f64| {
-        monitors.iter().map(monitor_logical_work_area).find(|area| {
-            area.contains_title_strip(position.x, position.y, title_width, TOOLSET_TITLE_HEIGHT)
+    let areas = monitors
+        .iter()
+        .map(|monitor| {
+            let (left, top, right, bottom) = monitor_logical_bounds(monitor);
+            (
+                ScreenRect::new(left, top, right - left, bottom - top),
+                monitor_logical_work_area(monitor),
+            )
         })
-    };
-    // Prefer the monitor containing the inspector's origin when its title spans displays.
-    let area = resizable
-        .then(|| title_monitor(1.0))
-        .flatten()
-        .or_else(|| title_monitor(width))
-        .unwrap_or_else(|| {
-            let primary = app.primary_monitor().ok().flatten();
-            monitor_logical_work_area(primary.as_ref().unwrap_or(&monitors[0]))
-        });
+        .collect::<Vec<_>>();
+    let area = toolset_work_area_for_origin(position, width, &areas).unwrap_or_else(|| {
+        let primary = app.primary_monitor().ok().flatten();
+        monitor_logical_work_area(primary.as_ref().unwrap_or(&monitors[0]))
+    });
     toolset_frame_in_work_area(position, size, resizable, area)
+}
+
+#[cfg(any(not(windows), test))]
+fn toolset_work_area_for_origin(
+    position: ToolsetWindowPosition,
+    width: f64,
+    monitors: &[(ScreenRect, ScreenRect)],
+) -> Option<ScreenRect> {
+    monitors
+        .iter()
+        // The saved origin can still identify the monitor when it falls in the Dock or menu bar.
+        .find(|(bounds, _)| {
+            (bounds.x..bounds.x + bounds.width).contains(&position.x)
+                && (bounds.y..bounds.y + bounds.height).contains(&position.y)
+        })
+        .or_else(|| {
+            monitors.iter().find(|(_, area)| {
+                area.contains_title_strip(position.x, position.y, width, TOOLSET_TITLE_HEIGHT)
+            })
+        })
+        .map(|(_, area)| *area)
 }
 
 fn toolset_frame_in_work_area(
@@ -12358,6 +12393,29 @@ mod tests {
                 assert_eq!(fit.size, ((940.0 * scale) as u32, (636.0 * scale) as u32));
             }
         }
+    }
+
+    #[test]
+    fn restored_inspector_keeps_its_display_when_the_dock_overlaps_its_saved_title() {
+        let primary = ScreenRect::new(0.0, 0.0, 1200.0, 900.0);
+        let secondary = ScreenRect::new(1200.0, 0.0, 800.0, 660.0);
+        let secondary_work_area = ScreenRect::new(1200.0, 24.0, 800.0, 600.0);
+        let origin = ToolsetWindowPosition {
+            x: 1400.0,
+            y: 615.0,
+        };
+        let area = toolset_work_area_for_origin(
+            origin,
+            500.0,
+            &[(primary, primary), (secondary, secondary_work_area)],
+        )
+        .unwrap();
+        assert_eq!(area, secondary_work_area);
+        let (position, width, height) = inspector_frame_in_work_area(origin, (500.0, 900.0), area);
+        assert_eq!(
+            (position.x, position.y, width, height),
+            (1400.0, 24.0, 500.0, 600.0)
+        );
     }
 
     #[test]

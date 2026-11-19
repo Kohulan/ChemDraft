@@ -4165,16 +4165,8 @@ export function MainWindow({
         if (layoutState !== undefined) {
           // Preserve historical Main defaults and fold pre-flatten layouts before anything consumes
           // them; the visibility save below persists the migrated state and its defaults revision.
-          let migrated: unknown = layoutState;
-          let parsed: ToolsetLayoutState | undefined;
-          try {
-            migrated = migrateMainToolbarDefaultsLayoutState(layoutState);
-            parsed = parseToolsetLayoutState(migrated);
-          } catch {
-            // The catalog can still render valid siblings of a malformed addition. Only the
-            // strictly parsed layout can seed the startup visibility save.
-          }
-          toolbarCatalog.setLayoutState(migrated);
+          const parsed = parseToolsetLayoutState(migrateMainToolbarDefaultsLayoutState(layoutState));
+          toolbarCatalog.setLayoutState(parsed);
           const nextRegistry = toolbarCatalog.registry();
           setWebPalettePositions(createDefaultToolsetPositions(nextRegistry));
           // The registry's default-visible set already reflects the saved toolsetOverrides[].visible,
@@ -4186,7 +4178,7 @@ export function MainWindow({
         // Record which toolsets we've resolved visibility for. A startup save may merge onto a
         // validated layout or create a file when there was none.
         resolvedToolsetIdsRef.current = new Set(toolbarCatalog.registry().listToolsets().map((toolset) => toolset.id));
-        layoutSaveEnabledRef.current = layoutState === undefined || layoutStateRef.current !== undefined;
+        layoutSaveEnabledRef.current = true;
         layoutHydratedRef.current = true;
         setNativeToolsetLayoutReady(true);
       })

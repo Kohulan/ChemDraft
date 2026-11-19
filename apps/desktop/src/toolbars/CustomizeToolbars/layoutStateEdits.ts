@@ -362,8 +362,8 @@ export function cloneToolset<I extends string, A extends string>(
   const takenIds = new Set([...state.userToolsets.map((toolset) => toolset.id)]);
   const id = userToolsetId(title, takenIds);
   const clonedGroups: ToolsetGroupDefinition<I, A>[] = source.groups.map((group, index) => ({
-    ...group,
     id: group.id ?? `${id}.group.${index}`,
+    title: group.title,
     items: group.items.map((item) => ({ ...item }))
   }));
   // A user toolset must have >=1 group (UserToolsetDefinitionSchema). Cloning a fully-emptied toolset

@@ -1169,6 +1169,13 @@ export async function listenForCurrentWindowWorkAreaChanges(handler: () => void)
   };
 }
 
+/** Ask native placement to constrain the inspector's current frame on its destination monitor. */
+export async function clampCurrentInspectorFrame(): Promise<void> {
+  if (!isDesktopRuntime()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("clamp_current_inspector_frame");
+}
+
 /** Fit to content and return whether the native resize was applied. */
 export async function fitCurrentPaletteWindow(size: ToolsetWindowSize, area: MonitorLogicalBounds): Promise<boolean> {
   if (isDesktopRuntime()) {

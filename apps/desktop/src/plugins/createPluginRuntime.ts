@@ -41,7 +41,7 @@ import {
 import type { RegisteredCanvasOverlay } from "./types";
 import type { CanvasOverlayContentSection, CanvasOverlayDraftRestore } from "./pluginCanvasOverlayControls";
 
-import type { DesktopToolsetDefinition } from "../toolsets";
+import { PLUGIN_COMMAND_WITHOUT_HANDLER, type DesktopToolsetDefinition } from "../toolsets";
 import { PluginPanelController } from "./PluginPanelController";
 import { PluginPromptTextController } from "./PluginPromptTextController";
 import { createDefaultImageSourceRegistry, type ImageSourceRegistry } from "./ImageSourceProvider";
@@ -572,6 +572,8 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
 
   const toolsetsByPluginId = new Map<string, DesktopToolsetDefinition[]>();
   const pluginIdByToolsetId = new Map<string, string>();
+  // Keep the old indices assigned at first registration for this release's compatibility path.
+  const legacyGroupIdsByPlugin = new Map<string, Map<string, Map<string, string>>>();
   const registrations = new Map<string, { manifest: PluginManifest; options: RegisterPluginOptions }>();
 
   const runtime: DesktopPluginRuntime = {
@@ -610,7 +612,13 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
               throw new Error(`Plugin toolset "${toolset.id}" is already contributed by another plugin.`);
             }
           }
-          const mapped = contributed.map(toolset => pluginToolsetToDefinition(toolset, registerOptions.commandHandlers));
+          const legacyGroupIdsByToolset = legacyGroupIdsByPlugin.get(manifest.id) ?? new Map();
+          const mapped = contributed.map(toolset => {
+            const legacyGroupIds = legacyGroupIdsByToolset.get(toolset.id) ?? new Map<string, string>();
+            legacyGroupIdsByToolset.set(toolset.id, legacyGroupIds);
+            return pluginToolsetToDefinition(toolset, registerOptions.commandHandlers, legacyGroupIds);
+          });
+          legacyGroupIdsByPlugin.set(manifest.id, legacyGroupIdsByToolset);
           toolsetsByPluginId.set(manifest.id, mapped);
           mapped.forEach((toolset) => pluginIdByToolsetId.set(toolset.id, manifest.id));
         }
@@ -747,9 +755,12 @@ export function documentIdentityKey(document: ChemDraftDocument | undefined): st
 
 function pluginToolsetToDefinition(
   contribution: PluginToolsetContribution,
-  commandHandlers: RegisterPluginOptions["commandHandlers"]
+  commandHandlers: RegisterPluginOptions["commandHandlers"],
+  legacyGroupIds: Map<string, string>
 ): DesktopToolsetDefinition {
-  const groupIds = new Set(contribution.groups.map((group) => group.id));
+  const explicitIds = new Set(contribution.groups.flatMap(group => group.id === undefined ? [] : [group.id]));
+  const groupIds = new Set(explicitIds);
+  const claimedLegacyIds = new Set(legacyGroupIds.values());
   return {
     id: contribution.id,
     title: contribution.title,
@@ -757,15 +768,33 @@ function pluginToolsetToDefinition(
     defaultVisible: contribution.defaultVisible,
     defaultMode: "floating",
     groups: contribution.groups.map((group, index) => {
-      // Overrides need a persisted group ID even when the plugin omits one.
       let id = group.id;
+      let legacyGroupId: string | undefined;
       if (id === undefined) {
-        id = `${contribution.id}.group.${index}`;
+        const content = JSON.stringify([group.title, group.items.map(item => item.commandId).sort()]);
+        let hash = 2166136261;
+        for (let offset = 0; offset < content.length; offset++) {
+          hash = Math.imul(hash ^ content.charCodeAt(offset), 16777619);
+        }
+        id = `${contribution.id}.group-content.${(hash >>> 0).toString(16)}`;
         while (groupIds.has(id)) id += "-";
         groupIds.add(id);
+
+        legacyGroupId = legacyGroupIds.get(id);
+        if (legacyGroupId === undefined) {
+          const oldId = `${contribution.id}.group.${index}`;
+          let availableId = oldId;
+          while (explicitIds.has(availableId)) availableId += "-";
+          if (!claimedLegacyIds.has(availableId)) {
+            legacyGroupId = availableId;
+            legacyGroupIds.set(id, availableId);
+            claimedLegacyIds.add(availableId);
+          }
+        }
       }
       return {
         id,
+        legacyGroupId: legacyGroupId && !explicitIds.has(legacyGroupId) ? legacyGroupId : undefined,
         title: group.title,
         items: group.items.map((item) => ({
           commandId: item.commandId,
@@ -776,7 +805,7 @@ function pluginToolsetToDefinition(
           shortcutDisplay: item.shortcutDisplay,
           // The gallery omits handlerless commands. Detached palettes still receive their buttons.
           disabledReason: typeof commandHandlers?.[item.commandId] === "function"
-            ? undefined : "Plugin command has no registered handler",
+            ? undefined : PLUGIN_COMMAND_WITHOUT_HANDLER,
           category: "plugin"
         }))
       };

@@ -108,7 +108,7 @@ async function command(action: string, forwarded = false) {
     window.dispatchEvent(new CustomEvent("chemdraft:native-command", { detail: { commandId: action } }));
   });
 }
-async function mount(options: { web?: boolean; inline?: boolean; document?: ReturnType<typeof createPhase4Document>; toolbarLayout?: unknown } = {}) {
+async function mount(options: { web?: boolean; inline?: boolean; failNativeToolbars?: boolean; document?: ReturnType<typeof createPhase4Document>; toolbarLayout?: unknown } = {}) {
   vi.resetModules(); vi.clearAllMocks(); native.windows.clear(); native.desktop = !options.web;
   native.loadToolbarLayout.mockResolvedValue(options.toolbarLayout);
   vi.stubGlobal("localStorage", new MemoryStorage()); vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -124,6 +124,7 @@ async function mount(options: { web?: boolean; inline?: boolean; document?: Retu
   });
   native.panelOpen.mockResolvedValue(undefined); native.analysisPublish.mockResolvedValue(undefined); native.reportPublish.mockResolvedValue(undefined);
   native.open.mockImplementation(async (toolsetId: string) => {
+    if (options.failNativeToolbars) throw new Error("Unable to open native toolbars");
     native.windows.add(toolsetId === "core.drawnStructureSettings" ? "settings" : toolsetId); return { toolsetId, open: true, focused: true };
   });
   native.close.mockImplementation(async (toolsetId: string) => {
@@ -260,6 +261,22 @@ it("opens Layout with the two-column width despite a legacy preferred window siz
   expect(native.open).toHaveBeenCalledWith("core.layout", expect.objectContaining({ width: 60 }));
 });
 
+it.each(["native", "inline"] as const)("sizes the Main toolbar from content in the %s path despite a legacy width", async surface => {
+  await mount({ failNativeToolbars: surface === "inline", toolbarLayout: {
+    version: 1, userToolsets: [],
+    toolsetOverrides: [{ toolsetId: "core.main", preferredWindowSize: { width: 5000, height: 317 } }]
+  } });
+  const palette = '.web-floating-palette[data-toolset-id="core.main"]';
+  if (surface === "inline") {
+    await vi.waitFor(() => expect(container.querySelector(palette)).not.toBeNull(), { timeout: 1500 });
+  }
+  const width = surface === "native"
+    ? native.open.mock.calls.find(([id]) => id === "core.main")?.[1].width
+    : Number.parseInt(container.querySelector<HTMLElement>(palette)!.style.getPropertyValue("--palette-width"), 10);
+  expect(width).toBeGreaterThan(0);
+  expect(width).toBeLessThan(5000);
+});
+
 it("can toggle and cancel Customize Toolbars after loading a newer saved layout", async () => {
   await mount({ toolbarLayout: {
     version: 2,
@@ -283,10 +300,11 @@ it("can toggle and cancel Customize Toolbars after loading a newer saved layout"
   expect(container.querySelector(palette)).toBeNull();
 });
 
-it("opens a toolbar with a malformed saved addition without rewriting the layout at startup", async () => {
+it.each([undefined, 3])("uses in-window fallback after a malformed saved addition (revision %s)", async revision => {
   const malformedId = "atom.problem.open.mol%2E1.a0";
   await mount({ toolbarLayout: {
     version: 1,
+    mainToolbarDefaultsRevision: revision,
     toolsetOverrides: [{
       toolsetId: "core.layout", visible: true,
       itemAdditions: [
@@ -296,8 +314,8 @@ it("opens a toolbar with a malformed saved addition without rewriting the layout
     }],
     userToolsets: []
   } });
-  expect(console.warn).toHaveBeenCalledWith(expect.stringContaining(malformedId));
-  expect(native.open).toHaveBeenCalledWith("core.layout", expect.anything());
+  expect(container.querySelector('.web-floating-palette[data-toolset-id="core.main"]')).not.toBeNull();
+  expect(native.open).not.toHaveBeenCalled();
   expect(native.saveToolbarLayout).not.toHaveBeenCalled();
 });
 

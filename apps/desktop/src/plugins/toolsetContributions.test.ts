@@ -137,6 +137,43 @@ describe("desktop plugin runtime + toolbar catalog", () => {
     expect(commandIds("core.main")).toContain(FIXTURE_PLUGIN_PING_COMMAND_ID);
   });
 
+  it.each(["stable", "legacy"] as const)("keeps additions addressed by %s group IDs across plugin group changes", idKind => {
+    const runtime = makeRuntime();
+    const catalog = createToolbarCatalog();
+    const toolset = fixturePluginManifest.contributes.toolsets[0];
+    const original = { ...toolset.groups[0], id: undefined };
+    const named = { ...original, id: "plugin.fixture.named" };
+    const unnamed = { ...original, title: "Another group" };
+    const manifestWithGroups = (groups: (typeof original | typeof named)[]) => ({
+      ...fixturePluginManifest,
+      contributes: { ...fixturePluginManifest.contributes, toolsets: [{ ...toolset, groups }] }
+    });
+    const options = createFixturePluginOptions();
+    runtime.registerPlugin(manifestWithGroups([original]), options);
+    catalog.setPluginToolsets(runtime.listPluginToolsets(), runtime.listPluginCommandsWithHandlers());
+    const toolsetId = FIXTURE_PLUGIN_TOOLSET_ID;
+    const stableId = catalog.registry().require(toolsetId).groups[0].id!;
+    const groupId = idKind === "stable" ? stableId : `${toolsetId}.group.0`;
+    const saved = { version: 1, toolsetOverrides: [{
+      toolsetId, groupOrder: [groupId],
+      itemOrder: { [groupId]: ["edit.undo", FIXTURE_PLUGIN_PING_COMMAND_ID] },
+      itemAdditions: [{ groupId, item: { commandId: "edit.undo" } }]
+    }] };
+    const assertCustomizedGroup = () => {
+      const groups = catalog.registry().require(toolsetId).groups;
+      expect(groups[0].id).toBe(stableId);
+      expect(groups[0].items.map(item => item.commandId)).toEqual(["edit.undo", ...original.items.map(item => item.commandId)]);
+    };
+    catalog.setLayoutState(saved);
+    assertCustomizedGroup();
+    for (const groups of [[named, original, unnamed], [unnamed, named, original], [unnamed, original]]) {
+      runtime.replacePlugin(FIXTURE_PLUGIN_ID, manifestWithGroups(groups), options);
+      catalog.setPluginToolsets(runtime.listPluginToolsets(), runtime.listPluginCommandsWithHandlers());
+      assertCustomizedGroup();
+    }
+    expect(saved.toolsetOverrides[0].itemAdditions[0].groupId).toBe(groupId);
+  });
+
   it("forwards selection and panel wiring to plugin command handlers", async () => {
     const runtime = createPluginRuntime({
       commandRegistry: new CommandRegistry(),

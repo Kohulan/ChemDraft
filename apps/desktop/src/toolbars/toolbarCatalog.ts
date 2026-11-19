@@ -4,7 +4,7 @@ import {
 } from "@chemdraft/toolset-registry";
 import type { CommandDefinition } from "@chemdraft/plugin-host";
 import { allPaletteCommands, type CommandSpec } from "../commands";
-import { createDesktopToolsetRegistry, desktopToolsets, desktopToolsetRegistry, type DesktopToolsetDefinition, type DesktopToolsetRegistry } from "../toolsets";
+import { createDesktopToolsetRegistry, desktopToolsets, desktopToolsetRegistry, PLUGIN_COMMAND_WITHOUT_HANDLER, type DesktopToolsetDefinition, type DesktopToolsetRegistry } from "../toolsets";
 import { SHELL_COMMAND_IDS } from "../shellCommandIds";
 
 /**
@@ -66,7 +66,9 @@ export function createToolbarCatalog(): ToolbarCatalog {
       const pluginCommands = commandsWithHandlers.filter(command => command.source === "plugin" && isValidToolsetCommandId(command.id));
       const pluginCommandIds = new Set(pluginCommands.map(command => command.id));
       for (const command of paletteCommands) {
-        if (command.source === "plugin" && !pluginCommandIds.has(command.id)) commandsById.delete(command.id);
+        if (command.source === "plugin" && !pluginCommandIds.has(command.id)) {
+          commandsById.set(command.id, { ...command, enabled: false, disabledReason: PLUGIN_COMMAND_WITHOUT_HANDLER });
+        }
       }
       for (const command of pluginCommands) {
         const presentation = commandsById.get(command.id);

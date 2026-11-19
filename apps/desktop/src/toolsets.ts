@@ -1,5 +1,6 @@
 import {
   ToolsetRegistry,
+  ToolsetItemAdditionSchema,
   applyToolsetLayoutState,
   createToolbarsMenuModel,
   createToolsetToggleCommandDefinitions,
@@ -72,6 +73,7 @@ export interface ToolbarPaletteItemModel {
 export const desktopToolsets = parseToolsetManifest<IconName, ToolbarAssetName>(manifest);
 export const desktopToolsetRegistry = createDesktopToolsetRegistry();
 export const defaultVisibleToolsetIds = createDefaultVisibleToolsetIds(desktopToolsetRegistry);
+export const PLUGIN_COMMAND_WITHOUT_HANDLER = "Plugin command has no registered handler";
 
 /** Filter only the displayed catalog; saved customization keeps disabled feature entries intact. */
 export function compoundLayoutRegistry(registry: DesktopToolsetRegistry, enabled: boolean, settings: CompoundLayoutSettings = loadCompoundLayoutSettings(), desktop = true): DesktopToolsetRegistry {
@@ -136,23 +138,28 @@ function skipMalformedToolbarAdditions(state: unknown, warn: (warning: string) =
     const override = entry as UserToolsetOverride;
     if (!Array.isArray(override.itemAdditions)) return entry;
 
-    const malformedIds = new Set<string>();
+    const malformedIds = new Set<unknown>();
     const itemAdditions = override.itemAdditions.filter(addition => {
+      if (ToolsetItemAdditionSchema.safeParse(addition).success) return true;
       const item = addition?.item;
-      const commandIds = [item?.commandId, item?.primary?.type === "command" ? item.primary.commandId : undefined];
+      const commandIds: unknown[] = [];
+      if (item?.commandId !== undefined) commandIds.push(item.commandId);
+      if (item?.primary?.type === "command") commandIds.push(item.primary.commandId);
       if (Array.isArray(item?.submenu?.items)) {
         commandIds.push(...item.submenu.items.map(command => command?.commandId));
       }
       const invalidIds = new Set(commandIds.filter(
-        (id): id is string => typeof id === "string" && !isValidToolsetCommandId(id)
+        id => typeof id !== "string" || !isValidToolsetCommandId(id)
       ));
       for (const id of invalidIds) {
         malformedIds.add(id);
-        warn(`Toolbar customization for "${override.toolsetId}" skipped addition with malformed command "${id}".`);
+        const description = typeof id === "string" || typeof id === "number" ? `"${id}"` : id === null ? "null" : `of type ${typeof id}`;
+        warn(`Toolbar customization for "${override.toolsetId}" skipped addition with malformed command ${description}.`);
       }
-      return invalidIds.size === 0;
+      if (invalidIds.size === 0) warn(`Toolbar customization for "${override.toolsetId}" skipped an invalid toolbar addition.`);
+      return false;
     });
-    if (malformedIds.size === 0) return entry;
+    if (itemAdditions.length === override.itemAdditions.length) return entry;
 
     changed = true;
     const keep = (id: string) => !malformedIds.has(id);
@@ -663,16 +670,15 @@ export function initialToolsetWindowSize(
   if (toolsetUsesResizableWindow(toolset.id)) {
     return toolset.preferredWindowSize ?? { width: 96, height: 420 };
   }
-  // A horizontal toolbar's preferred size includes fixed controls the grid does not measure.
   const horizontal = toolset.gridLayout?.orientation === "horizontal";
-  if (horizontal && toolset.preferredWindowSize) {
-    return toolset.preferredWindowSize;
-  }
+  const fallbackSize = horizontal
+    ? desktopToolsetRegistry.get(toolset.clonedFromToolsetId ?? toolset.id)?.preferredWindowSize
+    : toolset.preferredWindowSize;
   const gridLayout = horizontal && !toolset.gridLayout?.columns
     ? { rows: 2, ...toolset.gridLayout }
     : toolset.gridLayout ?? VERTICAL_PALETTE_GRID_LAYOUT;
   return computePaletteGridSize(gridLayout, itemGroups)
-    ?? toolset.preferredWindowSize
+    ?? fallbackSize
     ?? { width: 96, height: 420 };
 }
 
