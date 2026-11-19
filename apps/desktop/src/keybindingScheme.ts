@@ -146,7 +146,7 @@ const CHEMDRAW_ATOM_HOTKEYS: Readonly<Record<string, string>> = {
 const CHEMDRAW_BOND_HOTKEYS: Readonly<Record<string, string>> = {
   ...numericBondDrawingHotkeys,
   ...fragmentBondDrawingHotkeys,
-  v: "bond.fuseRingAtHoveredBond.cyclopropane",
+  v: fragmentBondDrawingHotkeys.g,
   // ChemDraw fuses benzene onto a bond with "a".
   a: "bond.fuseRingAtHoveredBond.benzene",
   w: "bond.setHoveredBondDisplay.wedge",
