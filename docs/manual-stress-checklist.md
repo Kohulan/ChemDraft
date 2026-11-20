@@ -1043,6 +1043,19 @@ with a preview/flyout open: it closes, controls disappear and direct commands re
   confirm the engine folder is gone and Name from Structure offers the install dialog again.
 - Intel Mac: Name from Structure reports the engine unsupported rather than offering an install.
 
+## About ChemDraft (macOS and Windows)
+
+- On macOS, open the ChemDraft menu and verify About ChemDraft is first. On Windows, open Help
+  and choose About ChemDraft. Check the packaged version and build stamp, and paste the result
+  of Copy Version into a text editor on each platform.
+- Confirm the window centers over the document on first open. Use the canvas and floating tools
+  while About stays open. Move it to another display, invoke the menu again, then close and reopen
+  it. Verify the window raises in place and restores its position. On Windows, check that it has
+  no separate taskbar entry and closes with the document window.
+- Navigate to Contributors and Open-source components and provenance with the keyboard.
+  Follow the website, repository, and a component link in the system browser, and open an
+  included full license inside About. Check that the component list scrolls at the minimum size.
+
 ## Guided tour (macOS and Windows)
 
 - With a new profile, launch ChemDraft and verify the tour opens shortly after the document is

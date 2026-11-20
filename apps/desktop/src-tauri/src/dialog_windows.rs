@@ -50,6 +50,15 @@ fn kind_spec(kind: &str) -> Result<DialogKindSpec, String> {
             fit_content: true,
             preserve_user_frame: false,
         }),
+        "about" => Ok(DialogKindSpec {
+            maximizable: false,
+            resizable: true,
+            title: "About ChemDraft",
+            size: (660.0, 620.0),
+            min_size: (380.0, 300.0),
+            fit_content: false,
+            preserve_user_frame: false,
+        }),
         "guidedTour" => Ok(DialogKindSpec {
             maximizable: false,
             resizable: true,
@@ -950,6 +959,21 @@ fn optional_string_fields(data: &Value, names: &[&str]) -> bool {
         .all(|name| data.get(name).is_none_or(Value::is_string))
 }
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AboutSnapshot {
+    title: String,
+    version: String,
+    build_stamp: String,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "camelCase", deny_unknown_fields)]
+enum AboutAction {
+    Cancel {},
+    CopyVersion {},
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Closed {
     reason: String,
@@ -1067,6 +1091,19 @@ impl Message {
                 CustomColorAction::Apply { hex } => valid_custom_color(&hex),
                 CustomColorAction::Clear {} | CustomColorAction::Cancel {} => true,
             }),
+            "snapshot" if self.dialog_kind == "about" => {
+                serde_json::from_value::<AboutSnapshot>(self.data.clone()).is_ok_and(|s| {
+                    s.title == "About ChemDraft"
+                        && [&s.version, &s.build_stamp].into_iter().all(|text| {
+                            !text.is_empty()
+                                && text.encode_utf16().count() <= 128
+                                && !text.contains(['\0', '\r', '\n'])
+                        })
+                })
+            }
+            "action" if self.dialog_kind == "about" => {
+                serde_json::from_value::<AboutAction>(self.data.clone()).is_ok()
+            }
             "snapshot" if self.dialog_kind == "guidedTour" => {
                 serde_json::from_value::<GuidedTourSnapshot>(self.data.clone())
                     .is_ok_and(|snapshot| snapshot.valid())
@@ -1273,6 +1310,10 @@ impl Message {
                             })
                     })
             }
+            "ready" if self.dialog_kind == "about" => {
+                self.data.as_object().is_some_and(|d| d.is_empty())
+            }
+            "result" if self.dialog_kind == "about" => false,
             "request" => self.data.as_object().is_some_and(|d| d.is_empty()),
             "ready" => {
                 self.data.as_object().is_some_and(|d| d.is_empty())
@@ -1800,6 +1841,23 @@ pub(crate) async fn dialog_open(
     .maximizable(spec.maximizable)
     .resizable(spec.resizable)
     .minimizable(false);
+    let builder = if message.dialog_kind == "about" {
+        builder.on_new_window(|url, _| {
+            // About's attribution links open in the system browser. Never create a
+            // remote webview or run a custom protocol from this dialog.
+            if url.scheme() == "https"
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+            {
+                super::problem_reports::open_external_address(url.as_str())
+                    .unwrap_or_else(|error| eprintln!("Could not open About link: {error}"));
+            }
+            tauri::webview::NewWindowResponse::Deny
+        })
+    } else {
+        builder
+    };
     // Let the activation click reach dialog controls on macOS. Other platforms retain
     // their existing click behavior; first-mouse acceptance is an AppKit policy.
     #[cfg(target_os = "macos")]
@@ -1887,7 +1945,7 @@ pub(crate) async fn dialog_send(
     if !matches!(message.message_type.as_str(), "ready" | "action") {
         return Err("Dialog can send only ready or a typed action".into());
     }
-    let _creation = super::lock_window_creation()?;
+    let creation = super::lock_window_creation()?;
     // The form measured at this window's current scale; read it before taking the registry lock.
     let scale_at_ready = if message.message_type == "ready" {
         window.scale_factor().ok()
@@ -1905,6 +1963,30 @@ pub(crate) async fn dialog_send(
         if message.message_type == "action" {
             if !session.ready {
                 return Err("Dialog is not ready".into());
+            }
+            if message.dialog_kind == "about" && message.data["action"] == "copyVersion" {
+                // Copy only these fields from the trusted owner snapshot. No host-supplied text
+                // reaches the system clipboard, and copying does not reserve a terminal action.
+                let text = format!(
+                    "ChemDraft {} (build {})",
+                    session.snapshot.data["version"]
+                        .as_str()
+                        .unwrap_or_default(),
+                    session.snapshot.data["buildStamp"]
+                        .as_str()
+                        .unwrap_or_default()
+                );
+                drop(registry);
+                drop(creation);
+                return super::clipboard_write_succeeded(super::write_clipboard_items_checked(
+                    &app,
+                    vec![super::ClipboardWriteItem {
+                        r#type: "text/plain".into(),
+                        text: Some(text),
+                        bytes_base64: None,
+                        required: true,
+                    }],
+                )?);
             }
             if let Some(receipt) = session.receipts.get(&message.request_id) {
                 return send_host(session, receipt);
@@ -5406,6 +5488,26 @@ mod tests {
             assert!(frame.applied_position.is_none());
         }
     }
+    #[test]
+    fn about_only_accepts_display_metadata_and_typed_actions() {
+        let mut message = snapshot();
+        message.dialog_kind = "about".into();
+        message.data = json!({"title": "About ChemDraft", "version": "1.2.2", "buildStamp": "11.19.18.03-codex"});
+        assert!(message.validate().is_ok());
+        assert!(is_dialog_label("dialog-main-about-1"));
+        assert!(!kind_spec("about").unwrap().fit_content);
+        message.data["buildStamp"] = json!("any\ntext");
+        assert!(message.validate().is_err());
+
+        message.message_type = "action".into();
+        message.data = json!({"action": "copyVersion"});
+        assert!(message.validate().is_ok());
+        message.data["text"] = json!("arbitrary clipboard content");
+        assert!(message.validate().is_err());
+        message.data = json!({"action": "cancel"});
+        assert!(message.validate().is_ok());
+    }
+
     #[test]
     fn guided_tour_is_a_resizable_modeless_kind_with_typed_actions() {
         let spec = kind_spec("guidedTour").unwrap();

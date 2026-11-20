@@ -21,12 +21,12 @@ import { VIBE_CODE_STARTER_COMMAND_ID, vibeCodeStarterCommand } from "./commands
  * be reflected in the other.
  *
  * Deliberately omitted from the web bar (they are OS-level, not in-document actions):
- * About/Services/Hide/Quit, the Window menu (minimize/maximize), and File ▸
+ * Services/Hide/Quit, the Window menu (minimize/maximize), and File ▸
  * Close Window / Quit. File ▸ Check for Updates is also native-only because Sparkle owns its UI and
- * lifecycle rather than the frontend command registry. Help ▸ About is OS-level too; Help ▸ Report a
- * Bug… is routed like any other command.
+ * lifecycle rather than the frontend command registry.
  */
 
+import { aboutCommand } from "./about/aboutCommand";
 import { SHOW_TOUR_COMMAND, TOUR_TITLE } from "./tour/tourCommands";
 
 /** A leaf item that invokes a registry command when clicked. */
@@ -369,12 +369,17 @@ export function buildAppMenuModel(context: AppMenuContext): AppMenuSection[] {
     {
       id: "help",
       label: "Help",
-      items: [command(SHOW_TOUR_COMMAND, TOUR_TITLE), command(REPORT_BUG_COMMAND_ID, "Report a Bug…")]
+      items: [
+        command(SHOW_TOUR_COMMAND, TOUR_TITLE), command(REPORT_BUG_COMMAND_ID, "Report a Bug…"),
+        ...(platform === "macos" ? [] : [separator(), command(aboutCommand.id, aboutCommand.title)])
+      ]
     }
   ];
 
   if (platform === "macos") {
     sections.unshift({ id: "app", label: "ChemDraft", items: [
+      command(aboutCommand.id, aboutCommand.title),
+      separator(),
       command("view.togglePreferences", "Preferences…", { accelerator: "Cmd+," })
     ] });
   }

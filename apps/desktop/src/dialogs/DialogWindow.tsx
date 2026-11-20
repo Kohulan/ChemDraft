@@ -16,6 +16,7 @@ import { ToolInstallForm } from "./ToolInstallForm";
 import { InsertTableForm } from "./InsertTableForm";
 import { AtomProblemForm } from "./AtomProblemForm";
 import { measureDialogContentWhenFontsReady, observeDialogContent, type DialogContentFit } from "./dialogContentFit";
+const AboutWindow = lazy(() => import("../about/AboutWindow").then(module => ({ default: module.AboutWindow })));
 const TourForm = lazy(() => import("../tour/TourForm").then(module => ({ default: module.TourForm })));
 const VibeCodeGuideForm = lazy(() => import("./VibeCodeGuideForm").then(module => ({ default: module.VibeCodeGuideForm })));
 const ExportForm = lazy(() => import("./ExportForm").then(module => ({ default: module.ExportForm })));
@@ -252,6 +253,10 @@ function DialogWindowContent({ hostId }: { hostId: string }) {
   if (!snapshot) return <p role="status">{error ?? "Opening dialog…"}</p>;
   if (snapshot.dialogKind === "atomProblem") return <AtomProblemForm data={snapshot.data} busy={busy} error={error} onReady={reportReady}
     onAction={action => sendAction({ action, targetVersion: snapshot.data.targetVersion })} onClose={() => sendAction({ action: "cancel" })} />;
+  if (snapshot.dialogKind === "about") return <Suspense fallback={<p role="status">Opening About ChemDraft…</p>}>
+    <AboutWindow {...snapshot.data} onReady={reportReady} error={error} onClose={() => sendAction({ action: "cancel" })}
+      onCopy={() => sendDialogMessage(hostId, { ...dialogEnvelope(snapshot), requestId: crypto.randomUUID(), type: "action", data: { action: "copyVersion" } })} />
+  </Suspense>;
   if (snapshot.dialogKind === "guidedTour") return <Suspense fallback={<p>Opening tour…</p>}>
     <TourForm scheme={snapshot.data.scheme} onReady={reportReady} busy={busy} error={error} onAction={sendAction} />
   </Suspense>;

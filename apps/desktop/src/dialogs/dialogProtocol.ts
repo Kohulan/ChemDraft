@@ -17,7 +17,7 @@ export const DIALOG_PROTOCOL_VERSION = 1;
 export const DIALOG_MAX_BYTES = 16 * 1024;
 export const DIALOG_PREVIEW_MAX_BYTES = 5 * 1024 * 1024;
 
-export type DialogKind = "pageSize" | "arrangementSpacing" | "reactionConditions" | "export" | "engineInstall" | "toolInstall" | "customColor" | "insertTable" | "structureTemplates" | "atomProblem" | "vibeCodeGuide" | "guidedTour";
+export type DialogKind = "pageSize" | "arrangementSpacing" | "reactionConditions" | "export" | "engineInstall" | "toolInstall" | "customColor" | "insertTable" | "structureTemplates" | "atomProblem" | "vibeCodeGuide" | "guidedTour" | "about";
 export type { AtomProblemAction } from "@chemdraft/document-workflow-core";
 import type { AtomProblemAction } from "@chemdraft/document-workflow-core";
 export interface AtomProblemSnapshot {
@@ -118,12 +118,14 @@ export type DialogSnapshot = DialogEnvelope & (
   | { dialogKind: "toolInstall"; type: "snapshot"; data: ToolInstallSnapshot }
   | { dialogKind: "structureTemplates"; type: "snapshot"; data: StructureTemplatesSnapshot }
   | { dialogKind: "vibeCodeGuide"; type: "snapshot"; data: { title: string } }
+  | { dialogKind: "about"; type: "snapshot"; data: AboutSnapshot }
   | { dialogKind: "guidedTour"; type: "snapshot"; data: { title: string; scheme: KeybindingScheme; automatic: boolean } }
 );
+export interface AboutSnapshot { title: string; version: string; buildStamp: string }
 export type DialogMessage = DialogSnapshot | (DialogEnvelope & (
   | { type: "request"; data: Record<string, never> }
   | { type: "ready"; data: Record<string, never> | DialogContentFit }
-  | { type: "action"; data: ({ action: "apply" } & (PageSize | InsertTableOptions)) | { action: "apply"; hex: string } | { action: "clear" } | { action: "apply"; draft: ReactionConditionsDraft } | { action: AtomProblemAction; targetVersion: number } | { action: "apply" | "preview"; percent: number } | { action: "insert"; templateId: string } | { action: "cancel" | "saveStarter" | "openPluginManager" } | { action: EngineInstallAction | ToolInstallAction } | { action: "export" | "chooseDestination" | "preview"; options: ExportOptions } | TourAction }
+  | { type: "action"; data: ({ action: "apply" } & (PageSize | InsertTableOptions)) | { action: "apply"; hex: string } | { action: "clear" } | { action: "apply"; draft: ReactionConditionsDraft } | { action: AtomProblemAction; targetVersion: number } | { action: "apply" | "preview"; percent: number } | { action: "insert"; templateId: string } | { action: "cancel" | "saveStarter" | "openPluginManager" | "copyVersion" } | { action: EngineInstallAction | ToolInstallAction } | { action: "export" | "chooseDestination" | "preview"; options: ExportOptions } | TourAction }
   | { type: "preview"; data: SpacingPreview }
   | { type: "result"; data: { status: "accepted" | "applied" | "inserted" | "progress" | ExportDialogResult["status"] | "preview" | "frame"; preview?: ExportPreviewResult; frame?: ExportFrame; error?: string; destinationPath?: string; filename?: string; notice?: string } }
   | { type: "closed"; data: { reason: DialogCloseReason } }
@@ -151,7 +153,7 @@ export function parseDialogMessage(value: unknown): DialogMessage | undefined {
   try {
     if (new TextEncoder().encode(JSON.stringify(value)).length > (record(value) && value.dialogKind === "export" && value.type === "result" && record(value.data) && value.data.status === "preview" ? DIALOG_PREVIEW_MAX_BYTES : DIALOG_MAX_BYTES)) return undefined;
     if (!record(value) || !keys(value, ["protocolVersion", "ownerWindowId", "documentTabId", "dialogKind", "sessionId", "requestId", "snapshotRevision", "type", "data"])) return undefined;
-    if (value.protocolVersion !== 1 || value.ownerWindowId !== "main" || typeof value.dialogKind !== "string" || !["pageSize", "arrangementSpacing", "reactionConditions", "export", "engineInstall", "toolInstall", "insertTable", "customColor", "structureTemplates", "atomProblem", "vibeCodeGuide", "guidedTour"].includes(value.dialogKind) ||
+    if (value.protocolVersion !== 1 || value.ownerWindowId !== "main" || typeof value.dialogKind !== "string" || !["pageSize", "arrangementSpacing", "reactionConditions", "export", "engineInstall", "toolInstall", "insertTable", "customColor", "structureTemplates", "atomProblem", "vibeCodeGuide", "guidedTour", "about"].includes(value.dialogKind) ||
         !token(value.documentTabId) || !token(value.sessionId) || !token(value.requestId) ||
         !Number.isSafeInteger(value.snapshotRevision) || Number(value.snapshotRevision) < 1 || !record(value.data)) return undefined;
     const d = value.data;
@@ -170,6 +172,17 @@ export function parseDialogMessage(value: unknown): DialogMessage | undefined {
         case "ready": valid = keys(d, []) || validDialogContentFit(d); break;
         case "closed": valid = keys(d, ["reason"]) && reasons.has(d.reason as DialogCloseReason); break;
         case "result": valid = keys(d, ["status"], ["error"]) && ["accepted", "applied", "cancelled", "error"].includes(String(d.status)) && (d.error === undefined || typeof d.error === "string" && d.error.length <= 2048); break;
+      }
+      return valid ? value as unknown as DialogMessage : undefined;
+    }
+    if (value.dialogKind === "about") {
+      const text = (v: unknown, max: number) => typeof v === "string" && v.length > 0 && v.length <= max && !/[\r\n\0]/.test(v);
+      switch (value.type) {
+        case "snapshot": valid = keys(d, ["title", "version", "buildStamp"]) && d.title === "About ChemDraft" &&
+          text(d.version, 128) && text(d.buildStamp, 128); break;
+        case "action": valid = keys(d, ["action"]) && (d.action === "copyVersion" || d.action === "cancel"); break;
+        case "request": case "ready": valid = keys(d, []); break;
+        case "closed": valid = keys(d, ["reason"]) && reasons.has(d.reason as DialogCloseReason); break;
       }
       return valid ? value as unknown as DialogMessage : undefined;
     }

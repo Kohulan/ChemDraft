@@ -74,9 +74,7 @@ use std::{
 use download_diagnosis::diagnose_download_host;
 use plugin_starter::plugin_starter_computer;
 use tauri::{
-    menu::{
-        AboutMetadata, CheckMenuItem, Menu, MenuItem, MenuItemKind, PredefinedMenuItem, Submenu,
-    },
+    menu::{CheckMenuItem, Menu, MenuItem, MenuItemKind, PredefinedMenuItem, Submenu},
     webview::PageLoadEvent,
     Emitter, Listener, Manager, RunEvent, Runtime, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
@@ -941,6 +939,7 @@ const TOOLSET_LAYOUT_STATE_FILENAME: &str = "toolbar-state.json";
 const TOOLSET_CUSTOMIZATION_STATE_FILENAME: &str = "toolbar-layout-state.json";
 const TOOLSET_CUSTOMIZATION_EXTENSIONS_FILENAME: &str = "toolbar-layout-state.v2.json";
 const DOCUMENT_SESSION_FILENAME: &str = "document-session.json";
+const ABOUT_COMMAND_ID: &str = "help.about";
 const MENU_COMMAND_IDS: &[&str] = &[
     "table.insertDialog",
     "template.insertDialog",
@@ -986,6 +985,7 @@ const MENU_COMMAND_IDS: &[&str] = &[
     "structure.openInteractive3d",
     "plugins.manage",
     "plugins.vibeCodeStarter",
+    ABOUT_COMMAND_ID,
     "help.showTour",
     "help.reportBug",
 ];
@@ -10261,7 +10261,7 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                     #[cfg(not(target_os = "macos"))]
                     &PredefinedMenuItem::separator(app)?,
                     #[cfg(not(target_os = "macos"))]
-                    &PredefinedMenuItem::about(app, None, Some(about_metadata(app)))?,
+                    &about_menu_item(app)?,
                 ],
             )?,
         ],
@@ -10398,32 +10398,20 @@ fn close_key_window<R: Runtime>(app: &tauri::AppHandle<R>) {
     }
 }
 
-fn about_metadata<R: Runtime>(app: &tauri::AppHandle<R>) -> AboutMetadata<'static> {
-    let config = app.config();
-    AboutMetadata {
-        name: Some("ChemDraft".to_string()),
-        version: Some(app.package_info().version.to_string()),
-        copyright: config.bundle.copyright.clone(),
-        authors: config
-            .bundle
-            .publisher
-            .clone()
-            .map(|publisher| vec![publisher]),
-        ..Default::default()
-    }
+fn about_menu_item<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<MenuItem<R>> {
+    MenuItem::with_id(app, ABOUT_COMMAND_ID, "About ChemDraft", true, None::<&str>)
 }
 
 #[cfg(target_os = "macos")]
 fn create_native_app_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<Submenu<R>> {
     let package_info = app.package_info();
-    let about_metadata = about_metadata(app);
 
     Submenu::with_items(
         app,
         package_info.name.clone(),
         true,
         &[
-            &PredefinedMenuItem::about(app, None, Some(about_metadata))?,
+            &about_menu_item(app)?,
             &PredefinedMenuItem::separator(app)?,
             &preferences_menu_item(app)?,
             &PredefinedMenuItem::separator(app)?,

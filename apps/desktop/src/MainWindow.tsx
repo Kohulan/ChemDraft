@@ -965,6 +965,7 @@ import { arrangementLayoutForCommand, arrangementGridAlignmentForCommand } from 
 import type { KeybindingScheme } from "./keybindingSettings";
 import { nativeMenuShortcutOverrides } from "./customKeyboardShortcuts";
 import { useShortcutPreference } from "./useShortcutPreference";
+import { aboutCommand, openAbout } from "./about/aboutCommand";
 import { SHOW_TOUR_COMMAND, TOUR_NAME_COMMAND, TOUR_SAMPLE_COMMAND, TOUR_TITLE, type TourAction } from "./tour/tourCommands";
 import type { TourMode } from "./tour/tourState";
 import { buildTourSample } from "./tour/tourSample";
@@ -1837,7 +1838,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.19.17.52-codex";
+const CURRENT_BUILD_STAMP = "11.19.18.03-codex";
 const TABLE_DRAFT_RECOVERY_WARNING = "session.tableDraftDropped";
 
 function clearTableDraftRecoveryWarnings(report: OpenWarningsReport | undefined): OpenWarningsReport | undefined {
@@ -12187,6 +12188,9 @@ export function MainWindow({
       }
     );
 
+    register(aboutCommand, () => openAbout(dialogCoordinatorRef.current, CURRENT_BUILD_STAMP, isDesktopRuntime()).catch(error => {
+      setStatus(`Could not open About ChemDraft: ${describeError(error).brief}`);
+    }));
     register({ id: SHOW_TOUR_COMMAND, title: TOUR_TITLE, icon: "open", source: "core", category: "app" },
       () => tourCommandsRef.current.open());
     register({ id: TOUR_SAMPLE_COMMAND, title: "Open Tour Drawing", icon: "new", source: "core", category: "app" },

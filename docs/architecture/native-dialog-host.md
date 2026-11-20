@@ -51,6 +51,14 @@ and missing-monitor fallback. They require
 native execution on both platforms; follow the Preferences checks in the standing manual stress
 checklist for real-window verification.
 
+## About ChemDraft
+
+The app-wide About session opens through the registered `help.about` command. Its shared
+modeless frame is owned by the document and persists under the `about` key. The owner snapshot
+contains the title, app version, and build stamp. Provenance is built from the repository records
+and loaded by the About renderer. The host handles Copy Version using the authenticated snapshot.
+Its HTTPS links open in the system browser.
+
 ## Guided tour
 
 The app-wide `guidedTour` session uses the document-owned dialog host and remembers its frame
