@@ -46,6 +46,8 @@ mod utility_window;
 mod webview_context_menus;
 #[cfg(test)]
 mod webview_context_menus_tests;
+#[cfg(any(target_os = "linux", test))]
+mod webview_recovery;
 mod window_drag;
 mod windows_activation_log;
 mod windows_clipboard;
@@ -1369,6 +1371,9 @@ pub fn run() {
         // Host-owned network transport for the allowlisted plugin-update catalog. Installed plugin
         // workers remain under connect-src 'self' and never receive this capability.
         .plugin(tauri_plugin_http::init());
+
+    #[cfg(target_os = "linux")]
+    let builder = builder.plugin(webview_recovery::plugin());
 
     // Windows app updates: a signed manifest on main (`plugins.updater` in tauri.windows.conf.json)
     // and a signed NSIS installer. The webview drives the flow, and only a stable build ever checks;
