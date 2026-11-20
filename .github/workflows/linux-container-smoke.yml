@@ -6,7 +6,11 @@ on:
       - .github/workflows/linux-container-smoke.yml
       - .github/workflows/linux-release.yml
       - .github/workflows/linux-package-smoke/**
-      - apps/desktop/src-tauri/src/main.rs
+      - apps/desktop/src-tauri/src/**
+      - apps/desktop/src/**
+      - apps/desktop/src-tauri/Cargo.toml
+      - apps/desktop/src-tauri/Cargo.lock
+      - .github/workflows/linux-build.yml
       - apps/desktop/src-tauri/tauri.conf.json
       - apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu
       - scripts/build-opsin-runtime.mjs
@@ -41,11 +45,9 @@ concurrency:
 jobs:
   build:
     if: inputs.artifact_run_id == '' && inputs.artifact_name == ''
-    uses: ./.github/workflows/linux-release.yml
+    uses: ./.github/workflows/linux-build.yml
     permissions:
-      # The reusable workflow declares an upload job with write permission. Its build job has
-      # read access and workflow_call accepts only a source ref, so this call cannot publish.
-      contents: write
+      contents: read
     with:
       ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
@@ -68,6 +70,11 @@ jobs:
             image: debian:sid
           - distro: fedora
             image: fedora:latest
+          - distro: arch
+            image: archlinux:latest
+            package: appimage
+            backend: x11
+            native_wayland: 0
           - distro: debian
             image: debian:sid
             package: deb
@@ -125,7 +132,7 @@ jobs:
             if [[ "$PACKAGE" == deb ]]; then
               apt-get install -y --no-install-recommends "${bundles[0]}"
             fi
-          else
+          elif [[ "$DISTRO" == fedora ]]; then
             dnf install -y /usr/bin/dbus-run-session procps-ng shadow-utils strace util-linux weston xorg-x11-server-Xwayland xorg-x11-server-Xvfb \
               gtk3 libxdo mesa-dri-drivers mesa-libEGL libglvnd-egl libglvnd-glx libgpg-error \
               libwayland-client libwayland-egl libwayland-cursor libwayland-server
@@ -134,6 +141,9 @@ jobs:
               dnf install -y /usr/bin/dpkg-deb webkit2gtk4.1
               dpkg-deb -x "${bundles[0]}" /
             fi
+          else
+            pacman -Syu --noconfirm --needed bash dbus procps-ng shadow strace util-linux \
+              xorg-server-xvfb gtk3 xdotool mesa libglvnd libdrm libgpg-error wayland
           fi
 
           if [[ "$PACKAGE" == appimage ]]; then
@@ -144,6 +154,10 @@ jobs:
           fi
           useradd --create-home smoke
           install -d -m 1777 /tmp/.X11-unix
+
+      - name: Check AppImage library resolution against host Mesa
+        if: matrix.package == appimage
+        run: bash .github/workflows/linux-package-smoke/host-mesa.sh "$BUNDLE"
 
       # Xvfb catches missing libraries and baseline startup failures in both packages. Weston
       # exercises the XWayland default and native Wayland launches of both packages with the opt-out.

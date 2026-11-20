@@ -277,6 +277,23 @@ runs:
         fi
         web_process_running || fail 'No WebKitWebProcess stayed alive during startup'
         window_ready || fail 'No ChemDraft window appeared within 60 seconds'
+        if [[ "$check_window" == true ]]; then
+          # Exclude the native menu bar: a blank WebKit surface has few colors. A rendered
+          # document includes antialiased rulers, page edges and canvas controls.
+          ready=0
+          for _ in {1..30}; do
+            document=$(xdotool search --onlyvisible --name '^ChemDraft$' 2>/dev/null | head -n 1 || true)
+            toolbar=$(xdotool search --onlyvisible --name '^ChemDraft Main Toolbar$' 2>/dev/null | head -n 1 || true)
+            if [[ -n "$document" && -n "$toolbar" ]] && \
+              import -window "$document" "$logs/document.png" 2>/dev/null; then
+              colors=$(convert "$logs/document.png" -gravity north -chop 0x50 -format '%k' info:)
+              echo "Document content colors: $colors"
+              if (( colors > 16 )); then ready=1; break; fi
+            fi
+            sleep 1
+          done
+          (( ready == 1 )) || fail 'Document remained blank or Main Toolbar window was missing'
+        fi
         for _ in {1..20}; do
           sleep 1
           for pid in "$launcher_pid" "$main_pid" "$display_pid"; do
