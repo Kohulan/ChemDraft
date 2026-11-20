@@ -337,9 +337,13 @@ and Windows x64 (WebView2). Record the build, platform, probe results and any er
 - Install [Request Tools Probe](../examples/plugins/request-tools-probe/README.md) through
   **Plugins > Add or Remove Plugins… > Add plugin from package…**. Check that the nine **Probe**
   commands appear in **Plugins**. The API 0.1.26 worker opts in to request capabilities, tool
-  calls and document-change delivery. In a separate compatibility test, verify that the bridge
-  ignores these feature flags from an older SDK. The handshake succeeds and legacy commands work.
-  Request-tool calls and document-change notifications return `unsupported`.
+  calls and document-change delivery.
+- Package the [Request Tools Legacy Fixture](../examples/plugins/request-tools-legacy-fixture/README.md)
+  with `pnpm plugin:package -- examples/plugins/request-tools-legacy-fixture` and install its ZIP
+  with the adjacent `.sha256` file. Verify that **Legacy Fixture: Read active document** and
+  **Legacy Fixture: Read selection** report the current document and selection.
+  **Legacy Fixture: Attempt to start request** should report `unsupported`. Switch tabs and run
+  **Legacy Fixture: Show document-change events**. The report should show zero received events.
 - In tab A, click **Plugins > Probe: Read pinned document**. When the report says **Switch tab now**,
   click distinct tab B. Verify that the report shows A's document and captured selection.
 - In tab A, click **Plugins > Probe: Insert text and molecule**, then switch to B when prompted.
