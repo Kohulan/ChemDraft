@@ -63,7 +63,7 @@ fn install<R: tauri::Runtime>(webview: tauri::Webview<R>) {
     use std::cell::RefCell;
     use tauri::Manager;
     use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
-    use webkit2gtk::{prelude::*, WebProcessTerminationReason};
+    use webkit2gtk::{BackForwardListExt, WebProcessTerminationReason, WebViewExt};
 
     let document = webview.clone();
     if let Err(error) = webview.with_webview(move |platform| {
