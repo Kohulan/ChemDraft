@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { createRoot, type Root } from "react-dom/client";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { applyPatch, type ChemDraftDocument, type ElectronMarkObject } from "@chemdraft/chem-core";
+import { applyPatch, applyPatches, type ChemDraftDocument, type ElectronMarkObject } from "@chemdraft/chem-core";
 import { exportDocumentToSvg } from "@chemdraft/export-engine";
 import { atomDisplayLabel, lonePairPlacementPlanForAtom, moleculeLayoutLabelBoxes, transformPointForObject } from "@chemdraft/layout-engine";
 import { createNativeTextObject, documentDrawingDefaults, nativeAtomBondOrderUsage, nativeImplicitHydrogenCount,
@@ -633,6 +633,120 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
     await command("edit.redo"); expect(snapshot()).toEqual(attached);
   });
 
+  async function dragAtom(objectId: string, from: { x: number; y: number }, to: { x: number; y: number }) {
+    const target = container.querySelector(`.native-molecule-object[data-object-id="${objectId}"]`)!;
+    expect(target).not.toBeNull();
+    await act(async () => pointer(target, "pointerdown", from));
+    const before = snapshot();
+    await move(page(), to);
+    const preview = snapshot();
+    await act(async () => pointer(page(), "pointerup", to));
+    return { before, preview };
+  }
+
+  it("labels Undo when nitrogen moves away from its stationary charge", async () => {
+    const { document, nitrogen } = ammoniumElectronMarkDropFixture();
+    const molecule = dropMolecule(document);
+    await mount(document);
+    const end = { x: nitrogen.x + 100, y: nitrogen.y + 100 };
+    const { before } = await dragAtom(molecule.id, nitrogen, end);
+    const after = snapshot();
+    expect(dropMolecule(after).atoms[0]).toMatchObject({ ...end, formalCharge: 0 });
+    expect(dropMark(after)).toMatchObject({ x: dropMark(before).x, y: dropMark(before).y, anchor: { kind: "point" } });
+    expect(labels()[0]).toBe("NH3");
+    expect.soft(status()).toBe("Charge removed from N (N now NH3)");
+    await exactUndoRedo(before, after, "Move and Remove Charge");
+  });
+
+  it("refuses an atom drag that would leave a neutral four-bond nitrogen", async () => {
+    const { document, nitrogen } = fourBondNitrogenElectronMarkDropFixture();
+    await mount(document);
+    const { before, preview } = await dragAtom(dropMolecule(document).id, nitrogen, { x: nitrogen.x + 100, y: nitrogen.y + 100 });
+    expect(status()).toMatch(/^Cannot move Charge from N.*bond\/radical valence 4/);
+    expect(preview).toEqual(before);
+    expect(snapshot()).toEqual(before);
+    expect(container.querySelector("main")?.getAttribute("data-can-undo")).toBe("false");
+  });
+
+  it("names a charge transfer to oxygen when nitrogen moves away from a stationary mark", async () => {
+    const { document, nitrogen } = electronMarkDropFixture();
+    const molecule = dropMolecule(document);
+    const mark = dropMark(document);
+    await mount(applyPatch(document, { op: "updateObject", objectId: mark.id, changes: {
+      x: nitrogen.x - 19 - mark.width / 2, y: nitrogen.y - 14 - mark.height / 2
+    } }, { now: phase4Timestamp }));
+    const { before } = await dragAtom(molecule.id, nitrogen, { x: nitrogen.x + 100, y: nitrogen.y + 100 });
+    expect(dropMark(before).anchor.atomId).toBe(nitrogen.id);
+    const after = snapshot();
+    expect(dropMark(after)).toMatchObject({
+      x: dropMark(before).x, y: dropMark(before).y, anchor: { kind: "atom", atomId: molecule.atoms[6].id }
+    });
+    expect(status()).toBe("Charge moved from N to O (O now OH, N now NH)");
+    await exactUndoRedo(before, after, "Move and Transfer Charge");
+  });
+
+  function rotatedMoleculeWithCharge(drawing: ChemDraftDocument, center: { x: number; y: number },
+    anchor: ElectronMarkObject["anchor"] = { kind: "point", point: center }) {
+    const mark = dropMark(drawing);
+    return applyPatches(drawing, [
+      { op: "updateObject", objectId: dropMolecule(drawing).id, changes: { rotation: 90 } },
+      { op: "updateObject", objectId: mark.id, changes: { atomAssociation: undefined,
+        anchor, x: center.x - mark.width / 2, y: center.y - mark.height / 2 } }
+    ], { now: phase4Timestamp });
+  }
+
+  it.each(["point", "bond", "object"] as const)("preserves the %s anchor when only a rotated carbon's raw coordinates reach the mark", async kind => {
+    const { document, saturatedCarbon } = electronMarkDropFixture();
+    const molecule = dropMolecule(document);
+    // Start on the rotation pivot so the raw and drawn positions agree at the press.
+    const start = { x: molecule.x + molecule.width / 2, y: saturatedCarbon.y };
+    const center = { x: start.x - 100, y: start.y + 100 };
+    const drawing = applyPatch(document, { op: "updateObject", objectId: molecule.id, changes: {
+      atoms: molecule.atoms.map(atom => atom.id === saturatedCarbon.id ? { ...atom, ...start } : atom)
+    } });
+    const anchor: ElectronMarkObject["anchor"] = kind === "point"
+      ? { kind, point: center }
+      : { kind, objectId: molecule.id, ...(kind === "bond" ? { bondId: molecule.bonds[0].id } : {}) };
+    await mount(rotatedMoleculeWithCharge(drawing, center, anchor));
+    const { before } = await dragAtom(molecule.id, start, center);
+    expect(dropMark(before).anchor).toEqual(anchor);
+    const after = snapshot();
+    const moved = dropMolecule(after);
+    const carbon = moved.atoms.find(atom => atom.id === saturatedCarbon.id)!;
+    expect(Math.hypot(carbon.x - center.x, carbon.y - center.y)).toBeLessThan(1);
+    const drawn = transformPointForObject(moved, carbon);
+    expect(Math.hypot(drawn.x - center.x, drawn.y - center.y)).toBeGreaterThan(26);
+    expect(dropMark(after).anchor).toEqual(anchor);
+    expect(carbon.formalCharge).toBe(0);
+    await command("edit.undo");
+    expect(snapshot()).toEqual(before);
+    await command("edit.redo");
+    expect(snapshot()).toEqual(after);
+    const saved = workflow.createNativeSavePayload(snapshot());
+    const reopened = workflow.openNativeDocument(saved.contents).document!;
+    expect(dropMark(reopened).anchor).toEqual(anchor);
+    expect(dropMark(workflow.normalizeCommittedDocument(reopened)).anchor).toEqual(anchor);
+  });
+
+  it("leaves a legacy floating plus by a stationary rotated oxygen when another molecule's atom moves", async () => {
+    const { document, carbonylOxygen } = electronMarkDropFixture();
+    const molecule = dropMolecule(document);
+    const center = transformPointForObject({ ...molecule, rotation: 90 }, carbonylOxygen);
+    const drawing = workflow.insertNativeSingleBondMolecule(rotatedMoleculeWithCharge(document, center), { x: 440, y: 420 });
+    await mount(workflow.selectDocumentObjects(drawing, drawing.pages[0].id, []));
+    const other = snapshot().pages[0].objects.find(object => object.type === "molecule" && object.id !== molecule.id);
+    if (other?.type !== "molecule") throw new Error("Expected a second molecule");
+    const start = other.atoms[0];
+    const { before } = await dragAtom(other.id, start, { x: start.x, y: start.y + 10 });
+    const after = snapshot();
+    const moved = workflow.findDocumentObject(after, other.id);
+    expect(moved).not.toEqual(other);
+    expect(dropMark(before).anchor.kind).toBe("point");
+    expect(dropMark(after)).toEqual(dropMark(before));
+    expect(dropMolecule(after)).toEqual(dropMolecule(before));
+    expect(status()).toBe("Moved selected molecule part");
+  });
+
   async function mountMarkAndTextSelection(drawing: ChemDraftDocument, addThirdObject = false) {
     const mark = dropMark(drawing), pageId = drawing.pages[0].id;
     const text = createNativeTextObject(drawing, { x: 120, y: 125 }, "Caption");
@@ -683,9 +797,11 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
         await act(async () => page().dispatchEvent(new KeyboardEvent("keydown", {
           key: "ArrowDown", shiftKey: true, bubbles: true, cancelable: true
         })));
-        undoLabel = "Move";
+        undoLabel = "Move and Remove Charge";
       } else {
         await command(selectionCommands[transform]);
+        if (transform === "align") undoLabel = "Align Left and Remove Charge";
+        if (transform === "distribute") undoLabel = "Distribute Horizontally and Remove Charge";
       }
 
       const after = snapshot();

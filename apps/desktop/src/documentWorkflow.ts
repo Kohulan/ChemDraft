@@ -8388,7 +8388,15 @@ function reconcileNativeChargeMarksOnPage(page: DocumentPage, options: Committed
     return page;
   }
 
-  const { anchorByMarkId, assignedChargeByAtomKey, assignedRadicalsByAtomKey } = nativeElectronMarkAssignments(page, options);
+  // Object and bond anchors already identify their targets. Exclude them from atom proximity matching.
+  let floatingElectronMarkIds: Set<string> | undefined;
+  for (const mark of electronMarks) {
+    if (mark.anchor.kind === "atom" || mark.anchor.kind === "point") continue;
+    floatingElectronMarkIds ??= new Set(options.floatingElectronMarkIds);
+    floatingElectronMarkIds.add(mark.id);
+  }
+  const { anchorByMarkId, assignedChargeByAtomKey, assignedRadicalsByAtomKey } = nativeElectronMarkAssignments(page,
+    floatingElectronMarkIds ? { ...options, floatingElectronMarkIds } : options);
   const nextObjectById = new Map<string, DocumentObject>();
 
   molecules.forEach((molecule) => {

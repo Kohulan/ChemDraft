@@ -13,8 +13,9 @@ import { AtomProblemMarker } from "./AtomProblemMarker";
 import { atomProblemCommandId, atomProblemCommands, atomProblemSnapshot, type AtomProblemTarget } from "./atomProblemCommands";
 import { atomProblem, nativeImplicitHydrogenCount, type AtomProblemAction } from "@chemdraft/document-workflow-core";
 import { applyNativeAtomProblemFix } from "./documentWorkflow";
-import { dropElectronMark, dropElectronMarksInSelection, electronMarkDropTarget, resolveElectronMarksInSelectionTransform } from "./electronMarkDrop";
-import { electronMarkUndoLabel } from "./electronMarkUndoLabel";
+import { dropElectronMark, dropElectronMarksInSelection, electronMarkDropTarget, electronMarkName,
+  resolveElectronMarksAfterMoleculePartMove, resolveElectronMarksInSelectionTransform } from "./electronMarkDrop";
+import { chargeAssociationUndoLabel, electronMarkUndoLabel } from "./electronMarkUndoLabel";
 import { nativeBenzeneHotkeyAtAtomTarget, nativeFragmentSproutTarget, nativeDieneFuseTarget, nativeOxoHotkeyTarget, nativeBranchedHotkeyTarget, type FragmentSproutKind } from "./sproutHotkeys";
 import { applyTableCommand, applyTableFontCommand, applyTableObjectEdit, createTableCommands, createTableInsertAction, parseTableInsertCommandId, resolveActiveTableCell, selectedTable, tableInsertCommandId, tableInspectorSnapshot, type ActiveTableCell, type TableInsertDimensions } from "./tableCommands";
 import { TableCellEditor, TableColumnResizers, type TableCellEditorHandle } from "./tableCellEditor";
@@ -1838,7 +1839,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.19.23.25-codex";
+const CURRENT_BUILD_STAMP = "11.20.16.00-codex";
 const TABLE_DRAFT_RECOVERY_WARNING = "session.tableDraftDropped";
 
 function clearTableDraftRecoveryWarnings(report: OpenWarningsReport | undefined): OpenWarningsReport | undefined {
@@ -3758,7 +3759,8 @@ export function MainWindow({
   }, [installDocumentHistory]);
   const replacePresentDocument = useCallback((
     nextDocumentOrUpdate: ChemDraftDocument | ((current: ChemDraftDocument) => ChemDraftDocument),
-    palettePreview = false
+    palettePreview = false,
+    labelReplacement?: (present: ChemDraftDocument) => string
   ): boolean => {
     if (quitMutationFrozenRef.current) throw new Error("Quit is completing; the pending edit was not applied.");
     let changed = false;
@@ -3769,7 +3771,7 @@ export function MainWindow({
       if (nextDocument === currentHistory.present) return currentHistory;
 
       const present = normalizeCommittedDocument(nextDocument);
-      const undoLabel = documentUndoLabelsRef.current.get(currentHistory.present);
+      const undoLabel = labelReplacement?.(present) ?? documentUndoLabelsRef.current.get(currentHistory.present);
       if (undoLabel) documentUndoLabelsRef.current.set(present, undoLabel);
       changed = true;
       return { ...currentHistory, present };
@@ -3802,11 +3804,17 @@ export function MainWindow({
   const pluginPageConsentsRef = useRef(new WeakMap<AbortSignal, PageEnlargementConsent>());
   const commitDocumentChange = useCallback((
     nextDocumentOrUpdate: ChemDraftDocument | ((current: ChemDraftDocument) => ChemDraftDocument),
-    undoLabel?: string,
+    undoLabel?: string | ((before: ChemDraftDocument, after: ChemDraftDocument) => string),
     textCheckpointed = false,
     assertFinalDocument?: (document: ChemDraftDocument) => ChemDraftDocument | void
   ): boolean => {
     if (quitMutationFrozenRef.current) throw new Error("Quit is completing; the pending edit was not applied.");
+    const prepare = (before: ChemDraftDocument, next: ChemDraftDocument) => {
+      if (typeof undoLabel !== "function") return prepareDocumentCommit(next, undoLabel, assertFinalDocument);
+      const present = prepareDocumentCommit(next, undefined, assertFinalDocument);
+      documentUndoLabelsRef.current.set(present, undoLabel(before, present));
+      return present;
+    };
     // Validate the actual final state before checkpointing typing or settling other history.
     // Reuse this prepared document only while its baseline is still current.
     let guardedCurrent: ChemDraftDocument | undefined;
@@ -3815,7 +3823,7 @@ export function MainWindow({
       const current = documentRef.current;
       const next = typeof nextDocumentOrUpdate === "function" ? nextDocumentOrUpdate(current) : nextDocumentOrUpdate;
       if (next === current) return false;
-      guardedPresent = prepareDocumentCommit(next, undoLabel, assertFinalDocument);
+      guardedPresent = prepare(current, next);
       guardedCurrent = current;
     }
     // Record typing before the command, retaining main's editor lifetime in its callers.
@@ -3833,7 +3841,7 @@ export function MainWindow({
           : nextDocumentOrUpdate);
         if (nextDocument === currentHistory.present) return history;
 
-        const present = reusablePresent ?? prepareDocumentCommit(nextDocument, undoLabel, assertFinalDocument);
+        const present = reusablePresent ?? prepare(currentHistory.present, nextDocument);
         checkpoint?.complete();
         resumeTextEdit = checkpoint?.resume ?? resumeTextEdit;
         changed = true;
@@ -8024,10 +8032,10 @@ export function MainWindow({
   // document, and a relaunch never reopens changed chemistry. The edit itself stays open. Reads
   // refs only, including private table and repeat-label drafts.
   const documentForFlush = useCallback((onDroppedDraft?: (kind: string, error: unknown) => void): ChemDraftDocument => {
-    // Resizing replaces the live page for preview, but only pointerup commits it.
+    // Resizing and part drags replace the live page during the preview.
     // A Save/autosave/export during the held gesture must match what Escape restores.
-    const resize = objectResizeDragRef.current;
-    if (resize) return resize.startDocument;
+    const gesture = objectResizeDragRef.current ?? nativePartDragRef.current;
+    if (gesture) return gesture.startDocument;
     let current = documentRef.current;
     const includeDraft = (kind: string, apply: () => ChemDraftDocument, rollback?: () => ChemDraftDocument) => {
       if (!onDroppedDraft) return apply();
@@ -10607,12 +10615,14 @@ export function MainWindow({
     const result = checkedArrangementSpacing(source, percent / 100);
     if (!result.ok) throw new Error(result.status);
     if (tabId === activeDocumentTabIdRef.current) {
-      commitDocumentChange(result.document, "Adjust arrangement spacing"); setStatus(result.status); return;
+      commitDocumentChange(result.document, (before, after) => chargeAssociationUndoLabel(before, after, "Adjust arrangement spacing"));
+      setStatus(result.status);
+      return;
     }
     const snapshot = documentTabSnapshotsRef.current.get(tabId)!;
     if (result.document === source) return;
     const present = normalizeCommittedDocument(result.document);
-    documentUndoLabelsRef.current.set(present, "Adjust arrangement spacing");
+    documentUndoLabelsRef.current.set(present, chargeAssociationUndoLabel(source, present, "Adjust arrangement spacing"));
     for (const listener of assistantUserEditListenersRef.current) listener(tabId);
     documentTabSnapshotsRef.current.set(tabId, { ...snapshot,
       history: { past: boundedHistoryPast([...snapshot.history.past, source], present), present, future: [] },
@@ -11997,8 +12007,9 @@ export function MainWindow({
       // the current snapshot. History identity also ends a burst after any intervening edit,
       // selection change, tab switch or Undo/Redo, even when it arrived outside keyboard routing.
       if (continuesBurst) {
-        replacePresentDocument(prepareDocumentCommit(moved, "Move"));
-      } else commitDocumentChange(moved, "Move");
+        const before = documentHistoryRef.current.past.at(-1) ?? current;
+        replacePresentDocument(moved, false, present => chargeAssociationUndoLabel(before, present, "Move"));
+      } else commitDocumentChange(moved, (before, after) => chargeAssociationUndoLabel(before, after, "Move"));
       arrowNudgeBurstRef.current = { history: documentHistoryRef.current, lastPress: now };
       if (result.status) {
         setStatus(result.status);
@@ -12487,6 +12498,8 @@ export function MainWindow({
 
     layerActions.forEach((action) => {
       register(action, () => {
+        const layoutUndoLabel = (before: ChemDraftDocument, after: ChemDraftDocument) =>
+          chargeAssociationUndoLabel(before, after, action.title);
         if (action.id === "arrow.conditions") {
           const reason = compoundLayoutCommandDisabledReason(action.id, compoundLayoutSettingsRef.current);
           if (reason) { setStatus(reason); return; }
@@ -12508,7 +12521,7 @@ export function MainWindow({
             const edit = resolveElectronMarksInSelectionTransform(current, result.document);
             operationStatus = edit.status ?? result.status;
             return edit.document;
-          }, action.title);
+          }, layoutUndoLabel);
           setStatus(operationStatus); return;
         }
         if (action.id === distributeModeCommandIds.centers || action.id === distributeModeCommandIds.spacing) {
@@ -12538,7 +12551,7 @@ export function MainWindow({
             const result = resolveElectronMarksInSelectionTransform(current, transform(current));
             markStatus = result.status;
             return result.document;
-          }, action.title);
+          }, layoutUndoLabel);
           setStatus(markStatus ?? (changed ? action.title : emptyStatus));
         };
 
@@ -12936,7 +12949,7 @@ export function MainWindow({
 
     return bindings;
   }, [
-    isSnapshotSessionActive, replacePresentDocument, prepareDocumentCommit, selectedNativeMoleculeParts,
+    isSnapshotSessionActive, replacePresentDocument, selectedNativeMoleculeParts,
     customSwatchActions, tableActions, activeTableCell, bracketActions, clearScheduledTextEditorFocus,
     activateDocumentTab,
     newDocumentTab,
@@ -16910,7 +16923,9 @@ export function MainWindow({
     markFrame("previewObjectDrag", () => {
       const object = findDocumentObject(drag.startDocument, drag.objectId);
       if (object?.type === "electron-mark" && !(drag.groupObjectIds && drag.groupObjectIds.length > 1)) {
-        assignHoveredNativeDeleteTarget(electronMarkDropTarget(drag.startDocument, point));
+        const delta = objectDragDelta(drag, point);
+        const center = { x: drag.startObjectX + delta.x + object.width / 2, y: drag.startObjectY + delta.y + object.height / 2 };
+        assignHoveredNativeDeleteTarget(electronMarkDropTarget(drag.startDocument, point, undefined, { mark: object, center }));
       }
       if (drag.startDocument.pages.some(page => page.objects.some(object => object.type === "text" && object.arrowAttachment?.kind === "conditions"))) {
         clearObjectTransformPreview(drag.pointerId);
@@ -17881,18 +17896,21 @@ export function MainWindow({
 
   const previewNativePartDrag = useCallback((drag: NativePartDragState, point: ClientPoint) => {
     drag.latestPoint = point;
-    replacePresentDocument(nativePartDocumentFromDrag(drag, point));
+    const preview = resolveElectronMarksAfterMoleculePartMove(drag.startDocument, nativePartDocumentFromDrag(drag, point));
+    replacePresentDocument(preview.document);
   }, [nativePartDocumentFromDrag, replacePresentDocument]);
 
-  const commitNativePartDrag = useCallback((drag: NativePartDragState, point: ClientPoint): boolean => {
-    const moved = nativePartDocumentFromDrag(drag, point);
-    if (moved === drag.startDocument) {
+  const commitNativePartDrag = useCallback((drag: NativePartDragState, point: ClientPoint) => {
+    const result = resolveElectronMarksAfterMoleculePartMove(drag.startDocument, nativePartDocumentFromDrag(drag, point));
+    if (result.document === drag.startDocument) {
       replacePresentDocument(drag.startDocument);
-      return false;
+      setStatus(result.status ?? "Molecule part did not move");
+      return;
     }
 
-    commitDocumentHistoryFrom(drag.startDocument, moved);
-    return true;
+    const committed = normalizeCommittedDocument(result.document);
+    commitDocumentHistoryFrom(drag.startDocument, committed, chargeAssociationUndoLabel(drag.startDocument, committed, "Move"));
+    setStatus(result.status ?? "Moved selected molecule part");
   }, [commitDocumentHistoryFrom, nativePartDocumentFromDrag, replacePresentDocument]);
 
   const resizeTextDocumentFromDrag = useCallback((drag: TextResizeState, point: ClientPoint): ChemDraftDocument => {
@@ -19297,8 +19315,7 @@ export function MainWindow({
       event.stopPropagation();
       const point = pagePointFromPointerEvent(event) ?? nativePartDrag.latestPoint;
       if (nativePartDrag.dragging) {
-        const changed = commitNativePartDrag(nativePartDrag, point);
-        setStatus(changed ? "Moved selected molecule part" : "Molecule part did not move");
+        commitNativePartDrag(nativePartDrag, point);
       }
       clearNativePartDrag(event);
       return;
@@ -22116,8 +22133,7 @@ export function MainWindow({
       event.stopPropagation();
       const point = pagePointFromPointerEvent(event) ?? nativePartDrag.latestPoint;
       if (nativePartDrag.dragging) {
-        const changed = commitNativePartDrag(nativePartDrag, point);
-        setStatus(changed ? "Moved selected molecule part" : "Molecule part did not move");
+        commitNativePartDrag(nativePartDrag, point);
       }
       clearNativePartDrag(event);
       return;
@@ -23831,7 +23847,8 @@ export function MainWindow({
           }
           let ok = false, operationStatus = "";
           commitDocumentChange(current => { const result = checkedArrangementSpacing(current, factor);
-            ok = result.ok; operationStatus = result.status; return result.document; }, "Adjust arrangement spacing");
+            ok = result.ok; operationStatus = result.status; return result.document;
+          }, (before, after) => chargeAssociationUndoLabel(before, after, "Adjust arrangement spacing"));
           if (ok) setSpacingSource(undefined); setStatus(operationStatus);
         }} /> : null}
       {objectContextMenu ? (
@@ -28711,6 +28728,7 @@ function objectSelectionStatusLabel(document: ChemDraftDocument): string {
     const object = findDocumentObject(document, objectIds[0]);
     if (object?.type === "bracket") return "Selected bracket";
     if (object?.type === "group") return "Selected group";
+    if (object?.type === "electron-mark") return `Selected ${electronMarkName(object).toLowerCase()}`;
   }
   return selectionStatusLabel({ objectIds });
 }

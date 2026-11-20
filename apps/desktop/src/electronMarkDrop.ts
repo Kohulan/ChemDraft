@@ -12,16 +12,42 @@ export const ELECTRON_MARK_DROP_CAPTURE_BOND_LENGTHS = 0.5;
 
 /** Geometric target shared by the drag highlight and the committed drop, including refused targets. */
 export function electronMarkDropTarget(
-  document: ChemDraftDocument, point: PagePoint, pageId = document.pages[0]?.id
+  document: ChemDraftDocument, point: PagePoint, pageId = document.pages[0]?.id,
+  reposition?: { mark: ElectronMarkObject; center: PagePoint }
 ): NativeMoleculeDeleteTarget | undefined {
   const radius = documentDrawingDefaults(document).bondLengthPx * ELECTRON_MARK_DROP_CAPTURE_BOND_LENGTHS;
+  const source = reposition && associatedAtom(document, reposition.mark.anchor);
+  const keepSource = source && reposition && withinAssociationRadius(source, reposition.center);
+  const target = nearestElectronMarkAtom(document, pageId, point, () => radius,
+    (molecule, atom) => keepSource === true || molecule.id !== source?.molecule.id || atom.id !== source.atom.id);
+  if (target || !source || !keepSource) return target;
+  const atomPoint = transformPointForObject(source.molecule, source.atom);
+  return { kind: "atom", objectId: source.molecule.id, atomId: source.atom.id,
+    distanceToPointer: Math.hypot(point.x - atomPoint.x, point.y - atomPoint.y) };
+}
+
+function associationRadius(molecule: MoleculeObject): number {
+  return Math.max(nativeChargeAssociationRadiusPx, nativeDrawingStyleFromObjectStyle(molecule.style).bondLengthPx * 1.15);
+}
+
+function withinAssociationRadius({ molecule, atom }: AtomEndpoint, center: PagePoint): boolean {
+  const point = transformPointForObject(molecule, atom);
+  return Math.hypot(center.x - point.x, center.y - point.y) <= associationRadius(molecule);
+}
+
+function nearestElectronMarkAtom(
+  document: ChemDraftDocument, pageId: string | undefined, point: PagePoint,
+  radiusFor: (molecule: MoleculeObject) => number, eligible: (molecule: MoleculeObject, atom: MoleculeAtom) => boolean
+): NativeMoleculeDeleteTarget | undefined {
   let nearest: NativeMoleculeDeleteTarget | undefined;
   for (const object of document.pages.find(page => page.id === pageId)?.objects ?? []) {
     if (object.type !== "molecule" || !isEditableNativeMoleculeGraph(object)) continue;
     // Atom coordinates precede the molecule's SVG rotation. Invert that same frame transform
     // for both preview and commit, so the target is the atom drawn under the pointer.
     const localPoint = transformPointForObject({ ...object, rotation: -object.rotation }, point);
+    const radius = radiusFor(object);
     for (const atom of object.atoms) {
+      if (!eligible(object, atom)) continue;
       const distanceToPointer = Math.hypot(localPoint.x - atom.x, localPoint.y - atom.y);
       if (distanceToPointer <= radius && (!nearest || distanceToPointer < nearest.distanceToPointer)) {
         nearest = { kind: "atom", objectId: object.id, atomId: atom.id, distanceToPointer };
@@ -67,7 +93,7 @@ function atomContextName(endpoint: AtomEndpoint): string {
   return heavy ? `${heavy.atom.element}–${atom.element}` : atom.element;
 }
 
-function markName(mark: ElectronMarkObject): string {
+export function electronMarkName(mark: ElectronMarkObject): string {
   return mark.markKind === "charge" ? (mark.radical ? "Radical ion" : "Charge")
     : mark.markKind === "radical-dot" ? "Radical electron"
     : mark.markKind === "lone-pair" ? "Lone pair" : "Electron mark";
@@ -85,6 +111,7 @@ interface ElectronMarkDrop {
   anchor: ElectronMarkObject["anchor"];
   source: AtomEndpoint | undefined;
   destination: AtomEndpoint | undefined;
+  stationary?: boolean;
 }
 
 function sameAtom(first: AtomEndpoint | undefined, second: AtomEndpoint | undefined): boolean {
@@ -95,11 +122,18 @@ function planElectronMarkDrop(
   before: ChemDraftDocument, moved: ChemDraftDocument, mark: ElectronMarkObject, center: PagePoint, dropPoint: PagePoint
 ): ElectronMarkDrop {
   const pageId = before.pages.find(page => page.objects.some(object => object.id === mark.id))?.id;
-  const target = electronMarkDropTarget(moved, dropPoint, pageId);
+  const target = electronMarkDropTarget(moved, dropPoint, pageId, { mark, center });
+  return planElectronMarkAssignment(before, mark, center, target);
+}
+
+function planElectronMarkAssignment(
+  before: ChemDraftDocument, mark: ElectronMarkObject, center: PagePoint,
+  target: NativeMoleculeDeleteTarget | undefined, stationary = false
+): ElectronMarkDrop {
   const anchor: ElectronMarkObject["anchor"] = target?.kind === "atom"
     ? { kind: "atom", objectId: target.objectId, atomId: target.atomId }
     : { kind: "point", point: center };
-  return { mark, anchor, source: associatedAtom(before, mark.anchor), destination: associatedAtom(before, anchor) };
+  return { mark, anchor, source: associatedAtom(before, mark.anchor), destination: associatedAtom(before, anchor), stationary };
 }
 
 /** A direct drop uses the pointer for atom capture and the translated mark center for a free annotation. */
@@ -112,7 +146,7 @@ export function dropElectronMark(
   const drop = planElectronMarkDrop(document, document, mark, center, dropPoint);
   const moved = moveDocumentObject(document, markId, position);
   const result = applyElectronMarkDrops(document, moved, [drop]);
-  return { ...result, undoLabel: drop.source || drop.destination ? `Move ${markName(mark)}` : "Move electron mark" };
+  return { ...result, undoLabel: drop.source || drop.destination ? `Move ${electronMarkName(mark)}` : "Move electron mark" };
 }
 
 /** Validate independent marks against the selection's final geometry and commit the move as a unit. */
@@ -137,6 +171,63 @@ export function dropElectronMarksInSelection(
   return drops.length ? applyElectronMarkDrops(document, moved, drops) : { document: moved };
 }
 
+/** Part drags move atoms under stationary marks. Keep the geometric decisions through normalization. */
+export function resolveElectronMarksAfterMoleculePartMove(
+  document: ChemDraftDocument, moved: ChemDraftDocument
+): { document: ChemDraftDocument; status?: string } {
+  if (moved === document) return { document };
+  const drops: ElectronMarkDrop[] = [];
+  const preserve: DocumentPatch[] = [];
+  for (const page of document.pages) {
+    const nextPage = moved.pages.find(candidate => candidate.id === page.id);
+    if (!nextPage || nextPage.objects === page.objects) continue;
+    const marks = page.objects.filter(object => object.type === "electron-mark");
+    if (!marks.length) continue;
+    const nextObjects = new Map(nextPage.objects.map(object => [object.id, object]));
+    const movedAtoms = new Set<MoleculeAtom>();
+    for (const object of page.objects) {
+      const next = nextObjects.get(object.id);
+      if (object.type !== "molecule" || next?.type !== "molecule" || next === object) continue;
+      const beforeAtoms = new Map(object.atoms.map(atom => [atom.id, atom]));
+      for (const atom of next.atoms) {
+        const before = beforeAtoms.get(atom.id);
+        if (!before) continue;
+        const from = transformPointForObject(object, before);
+        const to = transformPointForObject(next, atom);
+        if (Math.hypot(to.x - from.x, to.y - from.y) > 1e-6) movedAtoms.add(atom);
+      }
+    }
+    if (!movedAtoms.size) continue;
+    const assignments = nativeElectronMarkAssignments(nextPage).anchorByMarkId;
+    for (const mark of marks) {
+      const { anchor } = mark;
+      if (anchor.kind !== "atom" && anchor.kind !== "point") continue;
+      if (anchor.kind === "point" && mark.atomAssociation === "explicit") continue;
+      const source = anchor.kind === "atom" && anchor.objectId
+        ? atomEndpoint(nextObjects.get(anchor.objectId), anchor.atomId) : undefined;
+      const center = nativeChargeMarkCenter(mark);
+      if (!source || (movedAtoms.has(source.atom) && !withinAssociationRadius(source, center))) {
+        // A loose mark can only attach to an atom moved by this gesture. An attached mark
+        // can also transfer to an atom in the molecule whose movement dislodged it.
+        const target = nearestElectronMarkAtom(moved, page.id, center, associationRadius,
+          (molecule, atom) => movedAtoms.has(atom) || molecule.id === source?.molecule.id);
+        if (source || target) {
+          drops.push(planElectronMarkAssignment(document, mark, center, target, true));
+          continue;
+        }
+      }
+      // Legacy proximity matching uses unrotated coordinates, so persist the existing
+      // anchor when normalization would otherwise overwrite the gesture's decision.
+      const assignment = assignments.get(mark.id);
+      if (anchor.kind === "point" ? assignment : assignment?.objectId !== anchor.objectId || assignment?.atomId !== anchor.atomId) {
+        preserve.push({ op: "updateObject", objectId: mark.id, changes: { atomAssociation: "explicit" } });
+      }
+    }
+  }
+  const prepared = preserve.length ? applyPatches(moved, preserve, { now: phase4Timestamp }) : moved;
+  return drops.length ? applyElectronMarkDrops(document, prepared, drops) : { document: prepared };
+}
+
 /** Preserve carried marks and admit independent detachments/transfers as one selection edit. */
 export function resolveElectronMarksInSelectionTransform(
   document: ChemDraftDocument, transformed: ChemDraftDocument
@@ -156,6 +247,7 @@ export function resolveElectronMarksInSelectionTransform(
       const next = nextObjects.get(mark.id);
       if (next?.type !== "electron-mark") continue;
       const anchor = mark.anchor;
+      if (anchor.kind !== "atom" && anchor.kind !== "point") continue;
       const source = anchor.kind === "atom" && anchor.objectId ? atomEndpoint(objects.get(anchor.objectId), anchor.atomId) : undefined;
       const nextSource = source && atomEndpoint(nextObjects.get(source.molecule.id), source.atom.id);
       const sameAnchor = next.anchor.kind === anchor.kind && next.anchor.objectId === anchor.objectId && next.anchor.atomId === anchor.atomId;
@@ -178,9 +270,7 @@ export function resolveElectronMarksInSelectionTransform(
       if (nextSource && moved && !carried) {
         // A keyboard nudge or small transform can reposition a mark beside its original atom.
         // Use the sticky association radius there, and the drag capture radius for a new target.
-        const atomPoint = transformPointForObject(nextSource.molecule, nextSource.atom);
-        const radius = Math.max(nativeChargeAssociationRadiusPx, nativeDrawingStyleFromObjectStyle(nextSource.molecule.style).bondLengthPx * 1.15);
-        if (Math.hypot(center.x - atomPoint.x, center.y - atomPoint.y) > radius) {
+        if (!withinAssociationRadius(nextSource, center)) {
           drops.push(planElectronMarkDrop(document, transformed, mark, center, center));
           continue;
         }
@@ -206,10 +296,19 @@ function applyElectronMarkDrops(
   document: ChemDraftDocument, moved: ChemDraftDocument, drops: readonly ElectronMarkDrop[]
 ): { document: ChemDraftDocument; status: string; refused?: boolean } {
   const refusal = ({ mark, source, destination }: ElectronMarkDrop, reason: string) => ({ document, refused: true,
-    status: `Cannot move ${markName(mark)}${source ? ` from ${source.atom.element}` : ""}${destination ? ` to ${destination.atom.element}` : ""}: ${reason}` });
+    status: `Cannot move ${electronMarkName(mark)}${source ? ` from ${source.atom.element}` : ""}${destination ? ` to ${destination.atom.element}` : ""}: ${reason}` });
+  // Validate the actual associations, including any destination that normalization resolved.
+  let after = normalizeCommittedDocument(applyPatches(moved, drops.map(({ mark, anchor }) => ({
+    op: "updateObject", objectId: mark.id, changes: { anchor, atomAssociation: "explicit" }
+  })), { now: phase4Timestamp }));
   const expected = new Map<string, { endpoint: AtomEndpoint; charge: number; radicals: number; drop: ElectronMarkDrop }>();
   for (const drop of drops) {
-    const { mark, source, destination } = drop;
+    const { mark, source } = drop;
+    const finalMark = findDocumentObject(after, mark.id) as ElectronMarkObject;
+    const destination = associatedAtom(document, finalMark.anchor);
+    if (drop.destination && !sameAtom(drop.destination, destination)) {
+      return refusal(drop, "the atom cannot accept this mark's charge or unpaired electrons");
+    }
     const contribution = electronMarkAtomContribution(mark);
     if (sameAtom(source, destination) || (!contribution.charge && !contribution.radicals)) continue;
     // Use the same admission rule as typed charge stacking, including the radical bonding slots.
@@ -221,7 +320,7 @@ function applyElectronMarkDrops(
       const charge = atom.formalCharge + sign * contribution.charge;
       const usage = nativeAtomExternalValence(molecule, atom) + sign * contribution.radicals;
       if (element && !nativeAtomChargeSupportsValence(element, usage, charge)) {
-        return refusal(drop, `${atom.element} cannot carry formal charge ${charge > 0 ? "+" : ""}${charge} with bond/radical valence ${usage}`);
+        return refusal({ ...drop, destination }, `${atom.element} cannot carry formal charge ${charge > 0 ? "+" : ""}${charge} with bond/radical valence ${usage}`);
       }
       const key = nativeElectronMarkAtomKey(molecule.id, atom.id);
       const previous = expected.get(key);
@@ -231,19 +330,6 @@ function applyElectronMarkDrops(
     }
   }
 
-  // Install all explicit drop decisions before reconciliation sees any of the translated marks.
-  let after = normalizeCommittedDocument(applyPatches(moved, drops.map(({ mark, anchor }) => ({
-    op: "updateObject", objectId: mark.id, changes: { anchor, atomAssociation: "explicit" }
-  })), { now: phase4Timestamp }));
-  // Verify requested atom drops. For drops without a target, report the association
-  // reconciliation actually made, including changes outside the pointer capture radius.
-  for (const drop of drops) {
-    if (!drop.destination) continue;
-    const finalMark = findDocumentObject(after, drop.mark.id) as ElectronMarkObject;
-    if (!sameAtom(drop.destination, associatedAtom(after, finalMark.anchor))) {
-      return refusal(drop, "the atom cannot accept this mark's charge or unpaired electrons");
-    }
-  }
   // Two individually valid drops can exceed the same atom's capacity together.
   for (const { endpoint, charge, radicals, drop } of expected.values()) {
     const final = associatedAtom(after, { kind: "atom", objectId: endpoint.molecule.id, atomId: endpoint.atom.id });
@@ -256,10 +342,10 @@ function applyElectronMarkDrops(
     }
   }
 
-  // Only an actual atom drop snaps beside its label. Empty-space drops retain the user's
-  // position as free annotations. Use reconciled chemistry so OH/NH2 includes the new H.
+  // Snap direct transfers beside the reconciled label. Same-atom and stationary marks keep
+  // their offsets, and empty-space drops keep the free position.
   for (const drop of drops) {
-    if (!drop.destination) continue;
+    if (drop.stationary || !drop.destination || sameAtom(drop.source, drop.destination)) continue;
     const markId = drop.mark.id;
     const finalMark = findDocumentObject(after, markId) as ElectronMarkObject;
     const finalDestination = associatedAtom(after, finalMark.anchor)!;
@@ -273,7 +359,7 @@ function applyElectronMarkDrops(
 }
 
 function describeElectronMarkDrop(document: ChemDraftDocument, after: ChemDraftDocument, { mark, source, destination }: ElectronMarkDrop): string {
-  const name = markName(mark);
+  const name = electronMarkName(mark);
   const markId = mark.id;
   const finalMark = findDocumentObject(after, markId) as ElectronMarkObject;
   const finalDestination = associatedAtom(after, finalMark.anchor);
