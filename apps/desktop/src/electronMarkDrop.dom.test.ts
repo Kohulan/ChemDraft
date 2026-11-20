@@ -695,6 +695,90 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
     ], { now: phase4Timestamp });
   }
 
+  const legacyAnchorCases = (["bond", "object"] as const).flatMap(anchorKind => [
+    { anchorKind, name: "four-bond N+", fixture: fourBondNitrogenElectronMarkDropFixture,
+      chemistry: { formalCharge: 1, markCharge: 1 } },
+    { anchorKind, name: "N radical", fixture: () => electronMarkDropFixture({ kind: "radical-dot" }),
+      chemistry: { formalCharge: 0, markRadicals: 1 } }
+  ]);
+
+  function legacyNitrogenMark(anchorKind: "bond" | "object", fixture: typeof electronMarkDropFixture) {
+    const { document, nitrogen, saturatedCarbon } = fixture();
+    const molecule = dropMolecule(document), mark = dropMark(document);
+    const bond = molecule.bonds.find(bond => bond.fromAtomId === nitrogen.id || bond.toAtomId === nitrogen.id)!;
+    const anchor: ElectronMarkObject["anchor"] = anchorKind === "bond"
+      ? { kind: "bond", objectId: molecule.id, bondId: bond.id }
+      : { kind: "object", objectId: molecule.id };
+    const drawing = applyPatch(document, { op: "updateObject", objectId: mark.id, changes: {
+      anchor, atomAssociation: undefined, x: nitrogen.x - mark.width / 2, y: nitrogen.y - mark.height / 2
+    } }, { now: phase4Timestamp });
+    return { drawing, anchor, molecule, mark, nitrogen, saturatedCarbon };
+  }
+
+  it.each(legacyAnchorCases)("keeps the $anchorKind anchor and $name through a text insertion and native save/reopen",
+    ({ anchorKind, fixture, chemistry }) => {
+      const { drawing, anchor, molecule, mark, nitrogen } = legacyNitrogenMark(anchorKind, fixture);
+      const edited = workflow.normalizeCommittedDocument(workflow.insertNativeTextObject(drawing, { x: 400, y: 400 }, "Caption"));
+      expect(edited.pages[0].objects).toHaveLength(drawing.pages[0].objects.length + 1);
+      const saved = workflow.createNativeSavePayload(edited);
+      const reopened = workflow.openNativeDocument(saved.contents).document!;
+      for (const document of [edited, reopened, workflow.normalizeCommittedDocument(reopened)]) {
+        expect(dropMark(document).id).toBe(mark.id);
+        expect(dropMark(document).anchor).toEqual(anchor);
+        expect(dropMolecule(document).atoms.find(atom => atom.id === nitrogen.id)).toMatchObject(chemistry);
+        expect(dropMolecule(document).structure).toBe(molecule.structure);
+      }
+    });
+
+  it.each(legacyAnchorCases)("preserves the $anchorKind anchor and $name when dragging a part of its rotated molecule",
+    async ({ anchorKind, fixture, chemistry }) => {
+      const { drawing, anchor, molecule, mark, nitrogen, saturatedCarbon } = legacyNitrogenMark(anchorKind, fixture);
+      const rotated = applyPatch(drawing, { op: "updateObject", objectId: molecule.id, changes: { rotation: 90 } });
+      await mount(rotated);
+      const start = transformPointForObject(dropMolecule(rotated), saturatedCarbon);
+      const end = { x: start.x - 100, y: start.y + 100 };
+      const { before, preview } = await dragAtom(molecule.id, start, end);
+      const after = snapshot();
+      expect(dropMolecule(after).atoms.find(atom => atom.id === saturatedCarbon.id)).not.toEqual(saturatedCarbon);
+      for (const document of [before, preview, after]) {
+        expect(dropMark(document).id).toBe(mark.id);
+        expect(dropMark(document).anchor).toEqual(anchor);
+        expect(dropMolecule(document).atoms.find(atom => atom.id === nitrogen.id)).toMatchObject(chemistry);
+      }
+      await exactUndoRedo(before, after, "Move");
+    });
+
+  it.each(["bond", "object"] as const)("refuses to drag four-bond N away from its legacy %s-anchored charge",
+    async anchorKind => {
+      const { drawing, anchor, molecule, nitrogen } = legacyNitrogenMark(anchorKind, fourBondNitrogenElectronMarkDropFixture);
+      const rotated = applyPatch(drawing, { op: "updateObject", objectId: molecule.id, changes: { rotation: 90 } });
+      await mount(rotated);
+      const start = transformPointForObject(dropMolecule(rotated), nitrogen);
+      const { before, preview } = await dragAtom(molecule.id, start, { x: start.x + 100, y: start.y + 100 });
+      expect(dropMark(before).anchor).toEqual(anchor);
+      expect(dropMolecule(before).atoms.find(atom => atom.id === nitrogen.id)).toMatchObject({ formalCharge: 1, markCharge: 1 });
+      expect(status()).toMatch(/^Cannot move Charge from N(?: to \w+)?: N cannot carry formal charge 0 with bond\/radical valence 4$/);
+      expect(preview).toEqual(before);
+      expect(snapshot()).toEqual(before);
+      expect(container.querySelector("main")?.getAttribute("data-can-undo")).toBe("false");
+    });
+
+  it("names a valid charge removal without changing its legacy object anchor", async () => {
+    const { document, nitrogen } = ammoniumElectronMarkDropFixture();
+    const molecule = dropMolecule(document), mark = dropMark(document);
+    const anchor = { kind: "object", objectId: molecule.id } as const;
+    const drawing = applyPatch(document, { op: "updateObject", objectId: mark.id, changes: {
+      anchor, atomAssociation: undefined, x: nitrogen.x - mark.width / 2, y: nitrogen.y - mark.height / 2
+    } }, { now: phase4Timestamp });
+    await mount(drawing);
+    const { before } = await dragAtom(molecule.id, nitrogen, { x: nitrogen.x + 100, y: nitrogen.y + 100 });
+    const after = snapshot();
+    expect(dropMark(after)).toEqual(dropMark(before));
+    expect(dropMolecule(after).atoms[0].formalCharge).toBe(0);
+    expect(status()).toBe("Charge removed from N (N now NH3)");
+    await exactUndoRedo(before, after, "Move and Remove Charge");
+  });
+
   it.each(["point", "bond", "object"] as const)("preserves the %s anchor when only a rotated carbon's raw coordinates reach the mark", async kind => {
     const { document, saturatedCarbon } = electronMarkDropFixture();
     const molecule = dropMolecule(document);
@@ -792,7 +876,7 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
         await move(page(), end);
         if (refused) expect(snapshot()).toEqual(before);
         await act(async () => pointer(page(), "pointerup", end));
-        undoLabel = resize ? "Resize selection" : "Rotate selection";
+        undoLabel = resize ? "Resize selection and Remove Charge" : "Rotate selection and Remove Charge";
       } else if (transform === "nudge") {
         await act(async () => page().dispatchEvent(new KeyboardEvent("keydown", {
           key: "ArrowDown", shiftKey: true, bubbles: true, cancelable: true
@@ -869,7 +953,7 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
     expect(labels()[molecule.atoms.indexOf(atom)]).toBe(label);
     if (mark.markKind === "lone-pair") expect(molecule).toEqual(dropMolecule(before));
     expect(status()).toBe(message);
-    await exactUndoRedo(before, after, "Move");
+    await exactUndoRedo(before, after, mark.markKind === "charge" ? "Move and Remove Charge" : "Move");
   });
 
   it("keeps a selected charge, radical and lone pair attached when their selected molecule moves", async () => {

@@ -4,7 +4,7 @@ export { nativeChargePlacementPointForAtom, nativeChargeMarkSizePx, nativeAtomHi
 import {
   assertMolfileExportIdentity, type ComputeStructureIdentifiers, moleculeToInteropMolfile,
   atomProblem, readNativeDocumentContents, formulaSpansFromText,
-  nativeElectronMarkAtomKey, nativeElectronMarkAssignments, isEditableNativeMoleculeGraph,
+  nativeElectronMarkAtomKey, nativeElectronMarkAssignments, electronMarkAtomContribution, isEditableNativeMoleculeGraph,
   nativeChargeValue, nativeChargeMarkCenter, nativeChargeAssociationRadiusPx, nativeChargeMarkMaxMagnitude,
   type NativeElectronMarkAssignmentOptions
 } from "@chemdraft/document-workflow-core";
@@ -8372,6 +8372,36 @@ export function reconcileNativeChargeMarks(
   return changed ? adoptDerivedDocument(document, { ...document, pages }) : document;
 }
 
+export function committedElectronMarkAssignments(page: DocumentPage, options: NativeElectronMarkAssignmentOptions = {}) {
+  const assignments = nativeElectronMarkAssignments(page, options);
+  const legacyMarks = page.objects.filter((object): object is ElectronMarkObject =>
+    object.type === "electron-mark" && (object.anchor.kind === "bond" || object.anchor.kind === "object"));
+  if (!legacyMarks.length) return assignments;
+
+  const objects = objectByIdIndex(page.objects);
+  for (const mark of legacyMarks) {
+    const owner = assignments.anchorByMarkId.get(mark.id);
+    const molecule = owner && objects.get(owner.objectId);
+    if (!owner || molecule?.type !== "molecule" || !molecule.rotation) continue;
+    const atom = molecule.atoms.find(candidate => candidate.id === owner.atomId);
+    if (!atom) continue;
+    const { charge, radicals } = electronMarkAtomContribution(mark);
+    // Honor stored contributions attributed by the legacy raw-coordinate matcher. A new
+    // association also has to reach the drawn atom, including after a rotated part drag.
+    if ((charge !== 0 && Math.sign(atom.markCharge ?? 0) === Math.sign(charge)) ||
+        (radicals !== 0 && (atom.markRadicals ?? 0) >= radicals)) continue;
+    const radius = Math.max(nativeChargeAssociationRadiusPx,
+      nativeDrawingStyleFromObjectStyle(molecule.style).bondLengthPx * 1.15);
+    if (distance(nativeChargeMarkCenter(mark), transformPointForObject(molecule, atom)) <= radius) continue;
+
+    assignments.anchorByMarkId.set(mark.id, undefined);
+    const key = nativeElectronMarkAtomKey(owner.objectId, owner.atomId);
+    assignments.assignedChargeByAtomKey.set(key, (assignments.assignedChargeByAtomKey.get(key) ?? 0) - charge);
+    assignments.assignedRadicalsByAtomKey.set(key, (assignments.assignedRadicalsByAtomKey.get(key) ?? 0) - radicals);
+  }
+  return assignments;
+}
+
 function reconcileNativeChargeMarksOnPage(page: DocumentPage, options: CommittedDocumentNormalizationOptions): DocumentPage {
   const electronMarks = page.objects.filter((object): object is ElectronMarkObject =>
     object.type === "electron-mark" &&
@@ -8389,15 +8419,7 @@ function reconcileNativeChargeMarksOnPage(page: DocumentPage, options: Committed
     return page;
   }
 
-  // Object and bond anchors already identify their targets. Exclude them from atom proximity matching.
-  let floatingElectronMarkIds: Set<string> | undefined;
-  for (const mark of electronMarks) {
-    if (mark.anchor.kind === "atom" || mark.anchor.kind === "point") continue;
-    floatingElectronMarkIds ??= new Set(options.floatingElectronMarkIds);
-    floatingElectronMarkIds.add(mark.id);
-  }
-  const { anchorByMarkId, assignedChargeByAtomKey, assignedRadicalsByAtomKey } = nativeElectronMarkAssignments(page,
-    floatingElectronMarkIds ? { ...options, floatingElectronMarkIds } : options);
+  const { anchorByMarkId, assignedChargeByAtomKey, assignedRadicalsByAtomKey } = committedElectronMarkAssignments(page, options);
   const nextObjectById = new Map<string, DocumentObject>();
 
   molecules.forEach((molecule) => {
@@ -8430,6 +8452,8 @@ function reconcileNativeChargeMarksOnPage(page: DocumentPage, options: Committed
   });
 
   electronMarks.forEach((mark) => {
+    // The stored target and the atom receiving its chemistry are separate for legacy anchors.
+    if (mark.anchor.kind === "bond" || mark.anchor.kind === "object") return;
     const anchor = anchorByMarkId.get(mark.id);
     const currentAnchor = mark.anchor.kind === "atom"
       ? { objectId: mark.anchor.objectId, atomId: mark.anchor.atomId }
@@ -8662,23 +8686,36 @@ export function electronMarkChemistryChanges(
   const atomKeys = scope && new Set(scope.atoms.map(atom => atomKey(atom.objectId, atom.atomId)));
   const snapshot = (document: ChemDraftDocument) => {
     const marks = new Map<string, ElectronMarkObject>();
+    const associations = new Map<string, { objectId: string; atomId: string }>();
     const atoms = new Map<string, { formalCharge: number; markCharge: number; markRadicals: number }>();
-    for (const page of document.pages) for (const object of page.objects) {
-      if (object.type === "electron-mark" && (!markIds || markIds.has(object.id))) marks.set(object.id, object);
-      if (object.type === "molecule") for (const atom of object.atoms) {
-        if (atomKeys && !atomKeys.has(atomKey(object.id, atom.id))) continue;
-        atoms.set(atomKey(object.id, atom.id), {
-          formalCharge: atom.formalCharge, markCharge: atom.markCharge ?? 0, markRadicals: atom.markRadicals ?? 0
-        });
+    for (const page of document.pages) {
+      let assignments: ReturnType<typeof committedElectronMarkAssignments>["anchorByMarkId"] | undefined;
+      for (const object of page.objects) {
+        if (object.type === "electron-mark" && (!markIds || markIds.has(object.id))) {
+          marks.set(object.id, object);
+          const { anchor } = object;
+          if (anchor.kind === "atom" && anchor.objectId && anchor.atomId) {
+            associations.set(object.id, { objectId: anchor.objectId, atomId: anchor.atomId });
+          } else if (anchor.kind === "bond" || anchor.kind === "object") {
+            assignments ??= committedElectronMarkAssignments(page).anchorByMarkId;
+            const owner = assignments.get(object.id);
+            if (owner) associations.set(object.id, owner);
+          }
+        }
+        if (object.type === "molecule") for (const atom of object.atoms) {
+          if (atomKeys && !atomKeys.has(atomKey(object.id, atom.id))) continue;
+          atoms.set(atomKey(object.id, atom.id), {
+            formalCharge: atom.formalCharge, markCharge: atom.markCharge ?? 0, markRadicals: atom.markRadicals ?? 0
+          });
+        }
       }
     }
-    return { marks, atoms };
+    return { marks, associations, atoms };
   };
   const a = snapshot(before), b = snapshot(after);
-  const association = (mark: ElectronMarkObject | undefined, atoms: typeof a.atoms) => {
-    const anchor = mark?.anchor;
-    return anchor?.kind === "atom" && anchor.objectId && anchor.atomId &&
-      atoms.has(atomKey(anchor.objectId, anchor.atomId)) ? anchor : undefined;
+  const association = (markId: string, snapshot: typeof a) => {
+    const owner = snapshot.associations.get(markId);
+    return owner && snapshot.atoms.has(atomKey(owner.objectId, owner.atomId)) ? owner : undefined;
   };
   const changes: ElectronMarkChemistryChange[] = [];
   const zero = { formalCharge: 0, markCharge: 0, markRadicals: 0 };
@@ -8686,7 +8723,7 @@ export function electronMarkChemistryChanges(
     const oldMark = a.marks.get(markId), newMark = b.marks.get(markId);
     if (![oldMark, newMark].some(mark => mark && (mark.markKind === "radical-dot" ||
       (mark.markKind === "charge" && nativeChargeValue(mark.charge) !== undefined)))) continue;
-    const oldAnchor = association(oldMark, a.atoms), newAnchor = association(newMark, b.atoms);
+    const oldAnchor = association(markId, a), newAnchor = association(markId, b);
     const keys = new Set([oldAnchor, newAnchor].flatMap(anchor => anchor
       ? [atomKey(anchor.objectId!, anchor.atomId!)] : []));
     let changed = false, chargeDelta = 0, radicalDelta = 0;

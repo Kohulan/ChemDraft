@@ -1841,7 +1841,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.20.16.00-codex";
+const CURRENT_BUILD_STAMP = "11.20.17.00-codex";
 const TABLE_DRAFT_RECOVERY_WARNING = "session.tableDraftDropped";
 
 function clearTableDraftRecoveryWarnings(report: OpenWarningsReport | undefined): OpenWarningsReport | undefined {
@@ -17432,9 +17432,11 @@ export function MainWindow({
     }
     const movesGroup = (drag.groupObjectIds?.length ?? 0) > 1 &&
       (object?.type === "group" || parentGroupForDocumentObject(drag.startDocument.pages[0]?.objects ?? [], drag.objectId) !== undefined);
-    commitDocumentHistoryFrom(drag.startDocument, moved, movesGroup ? "Move group"
+    const label = movesGroup ? "Move group"
       : movedMarkCount > 0 ? (movedMarkCount === movedIds.size ? "Move electron mark" : "Move")
-      : object?.type === "text" && object.arrowAttachment?.kind === "conditions" ? "Move Reaction Conditions" : undefined);
+      : object?.type === "text" && object.arrowAttachment?.kind === "conditions" ? "Move Reaction Conditions" : undefined;
+    commitDocumentHistoryFrom(drag.startDocument, moved,
+      selectionDrop?.status ? chargeAssociationUndoLabel(drag.startDocument, moved, label ?? "Move") : label);
     return true;
   }, [assignHoveredNativeDeleteTarget, clearObjectTransformPreview, commitDocumentHistoryFrom, objectDragDelta, objectDragDocument, replacePresentDocument]);
 
@@ -19169,9 +19171,9 @@ export function MainWindow({
         const transformed = result?.document ?? groupTransformDocument(groupTransform, point, event.shiftKey);
         const edit = resolveElectronMarksInSelectionTransform(before, transformed);
         if (edit.document !== before) {
-          const undoLabel = groupTransform.mode === "rotate" ? "Rotate selection"
-            : groupTransform.mode === "resize" ? "Resize selection" : undefined;
-          commitDocumentHistoryFrom(before, edit.document, undoLabel);
+          const label = groupTransform.mode === "rotate" ? "Rotate selection"
+            : groupTransform.mode === "resize" ? "Resize selection" : "3D rotate";
+          commitDocumentHistoryFrom(before, edit.document, chargeAssociationUndoLabel(before, edit.document, label));
         } else {
           replacePresentDocument(before);
         }

@@ -1,5 +1,5 @@
 import type { ChemDraftDocument, DocumentObject, ElectronMarkObject } from "@chemdraft/chem-core";
-import type { NativeElectronMarkSpec } from "./documentWorkflow";
+import { committedElectronMarkAssignments, type NativeElectronMarkSpec } from "./documentWorkflow";
 
 /** Name the actual edit: an opposite-sign press reduces a charge, even on a radical ion. */
 export function electronMarkUndoLabel(before: ChemDraftDocument, after: ChemDraftDocument, spec: NativeElectronMarkSpec): string {
@@ -20,11 +20,18 @@ export function chargeAssociationUndoLabel(before: ChemDraftDocument, after: Che
     const charges = page.objects.filter(isChargeMark);
     if (!charges.length) continue;
     const nextCharges = new Map(nextPage.objects.filter(isChargeMark).map(mark => [mark.id, mark]));
+    let beforeAssignments: ReturnType<typeof committedElectronMarkAssignments>["anchorByMarkId"] | undefined;
+    let afterAssignments: typeof beforeAssignments;
     for (const mark of charges) {
       const next = nextCharges.get(mark.id);
-      if (!next || next === mark) continue;
-      const from = mark.anchor.kind === "atom" ? mark.anchor : undefined;
-      const to = next.anchor.kind === "atom" ? next.anchor : undefined;
+      if (!next) continue;
+      const fromLegacy = mark.anchor.kind === "bond" || mark.anchor.kind === "object";
+      const toLegacy = next.anchor.kind === "bond" || next.anchor.kind === "object";
+      if (next === mark && !fromLegacy) continue;
+      if (fromLegacy) beforeAssignments ??= committedElectronMarkAssignments(page).anchorByMarkId;
+      if (toLegacy) afterAssignments ??= committedElectronMarkAssignments(nextPage).anchorByMarkId;
+      const from = mark.anchor.kind === "atom" ? mark.anchor : fromLegacy ? beforeAssignments?.get(mark.id) : undefined;
+      const to = next.anchor.kind === "atom" ? next.anchor : toLegacy ? afterAssignments?.get(mark.id) : undefined;
       if (from?.objectId === to?.objectId && from?.atomId === to?.atomId) continue;
       actions.add(from && to ? "Transfer Charge" : from ? "Remove Charge" : "Attach Charge");
     }
