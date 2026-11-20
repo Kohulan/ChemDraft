@@ -14991,9 +14991,9 @@ mod tests {
             );
             assert!(!config.focus);
             assert!(!config.visible);
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             assert_eq!(config.parent.as_deref(), Some(MAIN_WINDOW_LABEL));
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "linux")))]
             assert_eq!(config.parent, None);
         }
     }
