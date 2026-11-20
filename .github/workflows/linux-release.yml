@@ -78,7 +78,8 @@ jobs:
           (cd release-assets && sha256sum --check SHA256SUMS-linux.txt)
           sudo apt-get update
           sudo -E apt-get install -y --no-install-recommends \
-            dbus-bin dbus-daemon gdb imagemagick openbox strace x11-utils xdotool xvfb \
+            at-spi2-core gir1.2-atspi-2.0 python3-gi fonts-dejavu-core \
+            dbus-bin dbus-daemon gdb imagemagick openbox strace x11-utils xclip xdotool xvfb \
             libgtk-3-bin libxdo3 libegl1 libegl-mesa0 libgl1 libgl1-mesa-dri \
             libwayland-client0 libwayland-egl1 libwayland-cursor0 libwayland-server0
           chmod +x "$APPIMAGE_PACKAGE"

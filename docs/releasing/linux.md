@@ -106,10 +106,14 @@ libgpg-error as a desktop system would. Debian installs the
 .deb with apt and Fedora extracts its payload and runs it with Fedora's libraries. Each job
 uploads display, app, and process logs. These tests cover startup and subprocess crashes. GPU
 rendering still needs a desktop check. The privileged containers allow `strace` to trace the app
-and glycin's bubblewrap to create user namespaces; Weston enables Xwayland for Wayland smoke tests.
-On Ubuntu the X11 readiness check requires the Main Toolbar window and more than 16 distinct colors
-in a screenshot of the document below the native menu bar, to catch a blank webview. This is a
-rendering heuristic and does not verify menu contents, keyboard focus or clipboard interoperability.
+and glycin's bubblewrap to create user namespaces. Weston enables Xwayland for Wayland startup tests.
+
+On Ubuntu and in the Xvfb container jobs, readiness requires the Main Toolbar window and more
+than 16 distinct colors in the document screenshot below the native menu bar. The check reads
+the Main Toolbar and Drawn Structure Settings entries from the GTK **View > Toolbars** accessibility
+tree. It uses `xclip` and real keyboard shortcuts to round-trip plain SMILES text and the native
+ChemDraft selection format through the X11 clipboard. Inspector digit entry and preservation of the
+drawing during that entry are skipped because the package harness has no document snapshot reader.
 
 ## Updates
 
