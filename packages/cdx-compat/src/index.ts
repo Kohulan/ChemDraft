@@ -1713,9 +1713,11 @@ function exportBracketPairs(page: DocumentPage, context: VisibleExportContext, a
   const objectsById = new Map(page.objects.map(object => [object.id, object]));
   for (const pair of context.bracketPairs.values()) {
     const semantics = bracketPairSemantics(pair);
-    const { closing, count } = semantics;
+    const { closing, count, cdxmlRepeatPattern } = semantics;
     const raw = closing.compatibility?.unknown.bracketedGroup;
     const attrs = isRecord(raw) ? preservedCurveAttributes(raw.attributes) : {};
+    if (cdxmlRepeatPattern !== undefined) attrs.PolymerRepeatPattern = cdxmlRepeatPattern;
+    else delete attrs.PolymerRepeatPattern;
     const membership = resolveRepeatUnitAtomMembership(pair, page.objects, { atomPosition: transformPointForObject });
     const memberId = ({ objectId, atomId }: NativeBracketMember) => atomId === undefined
       ? context.ids.get(objectId) : context.atomIdsByObjectId.get(objectId)?.get(atomId);

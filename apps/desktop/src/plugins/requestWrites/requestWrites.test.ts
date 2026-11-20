@@ -612,6 +612,103 @@ describe("verified request writes", () => {
     } finally { await f.finish(); }
   });
 
+  it("refuses a closing glyph edit that changes visible CDXML repeat connectivity", async () => {
+    const xml = `<CDXML><page><fragment id="10"><n id="11" p="300 200"/></fragment>
+      <graphic id="20" GraphicType="Bracket" BracketType="Square" BoundingBox="280 220 285 180"/>
+      <graphic id="21" GraphicType="Bracket" BracketType="Square" BoundingBox="325 180 320 220"/>
+      <bracketedgroup id="30" BracketUsage="SRU" BracketedObjectIDs="10" PolymerRepeatPattern="HeadToTail">
+        <bracketattachment id="31" GraphicID="20"/><bracketattachment id="32" GraphicID="21"/>
+      </bracketedgroup></page></CDXML>`;
+    const objects = openChemDraftPayload(xml).document!.pages[0]!.objects;
+    const brackets = objects.filter(object => object.type === "bracket");
+    expect(brackets.map(bracket => bracket.side)).toEqual(["open", "close"]);
+    const close = brackets[1]!;
+    const f = setup([close.id], undefined, { objects });
+    try {
+      const before = f.pinned();
+      const compatibility = close.compatibility!;
+      const group = compatibility.unknown.bracketedGroup as { attributes: Record<string, string> };
+      const patch = { op: "updateObject" as const, objectId: close.id, changes: {
+        compatibility: { ...compatibility, unknown: { ...compatibility.unknown, bracketedGroup: {
+          ...group, attributes: { ...group.attributes, PolymerRepeatPattern: "HeadToHead" }
+        } } }
+      } };
+      const visible = (doc: ChemDraftDocument) => exportDocumentToCdxml(doc, { embedNativePayload: false }).contents;
+      expect(visible(before)).toContain('PolymerRepeatPattern="HeadToTail"');
+      expect(visible(applyPatch(before, patch))).toContain('PolymerRepeatPattern="HeadToHead"');
+      expect(await f.context.documents.applyRequestPatch!({ requestId: await f.begin(), patch }))
+        .toMatchObject({ ok: false, error: { code: "chemistry", message: expect.stringContaining(`bracket "${close.id}"`) } });
+      expect(f.pinned()).toBe(before);
+      expect(f.history).toHaveLength(0);
+    } finally { await f.finish(); }
+  });
+
+  function structureOnlyUnit() {
+    const carbon: MoleculeObject = { ...ethane, id: "stored-carbon", x: 325, structure: "C", atoms: [], bonds: [] };
+    const nitrogen = { ...carbon, id: "stored-nitrogen", x: 410, structure: "N" };
+    const open = BracketObjectSchema.parse({ ...frame("open"), type: "bracket", bracketKind: "square", side: "open",
+      pairId: "stored-polymer", repeatUnit: true, containedObjectIds: [carbon.id], x: 312, y: 190, width: 2, height: 25 });
+    const close = { ...open, id: "close", side: "close" as const, x: 353, label: "n" };
+    const pair = [open, close];
+    expect(resolveRepeatUnitAtomMembership(pair, [carbon, nitrogen, ...pair])).toMatchObject({
+      members: [], structureOnlyMembers: [{ id: carbon.id, structure: "C" }], reason: "its atom membership is empty"
+    });
+    return { carbon, nitrogen, pair };
+  }
+
+  it.each(["replace", "delete"] as const)("refuses a request to %s the only stored repeat-unit member", async action => {
+    const { carbon, nitrogen, pair } = structureOnlyUnit();
+    const f = setup([carbon.id, nitrogen.id, ...pair.map(bracket => bracket.id)], undefined,
+      { objects: [carbon, nitrogen, ...pair] });
+    try {
+      const before = f.pinned();
+      const patch = action === "replace" ? { op: "batch" as const, patches: pair.map(bracket => ({
+        op: "updateObject" as const, objectId: bracket.id, changes: { containedObjectIds: [nitrogen.id] }
+      })) } : { op: "removeObject" as const, objectId: carbon.id };
+      const draft = applyPatch(before, patch, { preserveRepeatUnitBrackets: true }).pages[0]!.objects;
+      const brackets = draft.filter(object => object.type === "bracket");
+      expect(brackets).toHaveLength(2);
+      expect(resolveRepeatUnitAtomMembership(brackets, draft)).toMatchObject({
+        members: [], structureOnlyMembers: action === "replace" ? [{ id: nitrogen.id, structure: "N" }] : [],
+        reason: "its atom membership is empty"
+      });
+      expect(await f.context.documents.applyRequestPatch!({ requestId: await f.begin(), patch }))
+        .toMatchObject({ ok: false, error: { code: "chemistry", message: expect.stringContaining('bracket "close"') } });
+      expect(f.pinned()).toBe(before);
+      expect(f.history).toHaveLength(0);
+    } finally { await f.finish(); }
+  });
+
+  it("refuses a chemistry change to a stored repeat-unit member that keeps its object ID", async () => {
+    const { carbon, pair } = structureOnlyUnit();
+    const f = setup([carbon.id], undefined, { objects: [carbon, ...pair] });
+    try {
+      const before = f.pinned();
+      expect(await f.context.documents.applyRequestPatch!({ requestId: await f.begin(), patch: {
+        op: "updateObject", objectId: carbon.id, changes: { structure: "N" }
+      } })).toMatchObject({ ok: false, error: { code: "chemistry", message: expect.stringContaining('bracket "close"') } });
+      expect(f.pinned()).toBe(before);
+      expect(f.history).toHaveLength(0);
+    } finally { await f.finish(); }
+  });
+
+  it("commits a geometry-only move of a repeat unit with a stored member", async () => {
+    const { carbon, pair } = structureOnlyUnit();
+    const f = setup(pair.map(bracket => bracket.id), undefined, { objects: [carbon, ...pair] });
+    try {
+      const before = f.pinned();
+      const moves = pair.map(bracket => ({ op: "moveObject" as const, objectId: bracket.id, x: bracket.x + 8, y: bracket.y }));
+      expect(await f.context.documents.applyRequestPatch!({ requestId: await f.begin(), patch: { op: "batch", patches: moves } }))
+        .toMatchObject({ ok: true });
+      expect(f.history).toEqual([{ before, after: f.pinned(), label: "Draw requested objects" }]);
+      const objects = f.pinned().pages[0]!.objects;
+      const brackets = objects.filter(object => object.type === "bracket");
+      expect(brackets.map(bracket => bracket.x)).toEqual(moves.map(move => move.x));
+      expect(resolveRepeatUnitAtomMembership(brackets, objects).structureOnlyMembers)
+        .toMatchObject([{ id: carbon.id, structure: "C" }]);
+    } finally { await f.finish(); }
+  });
+
   it("preserves conflicting imported glyph usages when a request reorders the brackets", async () => {
     const xml = `<CDXML><page><fragment id="10"><n id="11" p="300 200"/></fragment>
       <graphic id="20" GraphicType="Bracket" BracketType="Square" BoundingBox="280 220 285 180" BracketUsage="AnyPolymer"/>
