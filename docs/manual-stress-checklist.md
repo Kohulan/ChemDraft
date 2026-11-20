@@ -344,6 +344,55 @@ must still be blocked by CSP without host permission. On macOS, confirm the entr
 worker still load directly from `tauri://localhost` with working prediction. In a Windows web
 preview, confirm construction remains native; classic and cross-origin calls must remain unchanged.
 
+Request tools: perform each check in packaged builds on macOS Apple silicon and Intel (WKWebView)
+and Windows x64 (WebView2). Record the build, platform, probe results and any errors.
+
+- Install [Request Tools Probe](../examples/plugins/request-tools-probe/README.md) through
+  **Plugins > Add or Remove Plugins… > Add plugin from package…**. Check that the nine **Probe**
+  commands appear in **Plugins**. The API 0.1.26 worker opts in to request capabilities, tool
+  calls and document-change delivery.
+- Package the [Request Tools Legacy Fixture](../examples/plugins/request-tools-legacy-fixture/README.md)
+  with `pnpm plugin:package -- examples/plugins/request-tools-legacy-fixture` and install its ZIP
+  with the adjacent `.sha256` file. Verify that **Legacy Fixture: Read active document** and
+  **Legacy Fixture: Read selection** report the current document and selection.
+  **Legacy Fixture: Attempt to start request** should report `unsupported`. Switch tabs and run
+  **Legacy Fixture: Show document-change events**. The report should show zero received events.
+- In tab A, click **Plugins > Probe: Read pinned document**. When the report says **Switch tab now**,
+  click distinct tab B. Verify that the report shows A's document and captured selection.
+- In tab A, click **Plugins > Probe: Insert text and molecule**, then switch to B when prompted.
+  Verify B is unchanged, then switch back to A and check that both insertions appear and are selected there. **Edit > Undo** restores the
+  exact original state in one step. **Edit > Redo** restores the result without another prompt.
+- Select one object and leave a text object unselected. Click **Plugins > Probe: Attempt out-of-scope edit**.
+  Expect a `scope` refusal, unchanged documents and no new history entry.
+- Click **Plugins > Probe: Request page space**, then **Ask for page space** in the panel. Use a fresh
+  request for each answer. **Keep Page Size** preserves the page
+  dimensions and requested positions; **Enlarge** fits the content and includes any page translation
+  in the single undo entry. Undo and redo restore the exact page and object states. Dismiss the prompt: it acts as **Keep Page Size** and inserts at the requested position. Undo it.
+  In a fresh request, leave the prompt unanswered for five minutes: expect `unanswered` and no write
+  or history entry.
+- Repeat **Probe: Request page space** and click **Ask and end after 10 seconds**. Leave the prompt
+  open past the timer, then answer it if it remains visible. Verify the report says `PASSED`, no write or history entry appears, and
+  the request and its session ended.
+- Use **Plugins > Probe: Print active-document events** before and after a tab switch, opening a
+  file into a pristine tab, and closing a tab. Verify that
+  keys identify the current document instance (or null when none is active), sequences increase, and
+  an edit within one instance does not generate a change. Closing or replacing the pinned document
+  ends its request and session.
+- Click **Plugins > Probe: Open tool session**. Verify that the panel lists `get_document` and
+  `get_selection`. Inspect listeners with `lsof -iTCP -sTCP:LISTEN` on macOS or `netstat -ano` on
+  Windows and verify that the server listens on 127.0.0.1 only. Click **Plugins > Probe: End request**
+  and verify the listener disappears when the probe owns the only session. With a host-authorized
+  client, check separately that the tools return the pinned context after switching tabs and fail
+  after the request ends.
+- Select a text object or molecule and click **Plugins > Probe: Measure selection**. Inspect the
+  reported ink bounds and document units.
+- Click **Plugins > Probe: Render selection PNG** with the same selection. Verify that the panel
+  displays the 400 × 300 PNG of the measured region.
+- Run **Probe: Open tool session** and disable the probe in **Plugins > Add or Remove Plugins…**.
+  Verify that its commands and listener disappear. Switch tabs and re-enable the probe. Verify
+  that **Probe: Print active-document events** shows a fresh worker log. With a host-authorized
+  client, verify separately that subsequent calls to the original session fail.
+
 Plugin panel focus (both macOS and Windows): open/re-show a panel from Analyze or a plugin command;
 click a panel button, heading, chart, empty area and title/drag area, hover its controls and scroll.
 Buttons must run exactly once and hover feedback must work; after each ordinary click the drawing
@@ -900,7 +949,7 @@ and Art toolbars open, including at 125%/150% display scale:
   Before insertion, expect exactly one native box: "This doesn't fit on the page. Enlarge the page
   to fit? Content on the page may shift to make room." with Enlarge / Keep Page Size. Enlarge and all content undo together; Keep Page Size keeps
   the exact proposed positions without resizing. Fitting content asks nothing. Repeat with an
-  assistant request containing several tool calls and direct patches: only one question per request,
+  legacy assistant request containing several tool calls and direct patches: only one question per request,
   one Undo, and Redo never reopens the question. Check template/table dialogs targeting an inactive
   tab, changes or tab closure while a question is pending, and Stop during an assistant question.
   Duplicate, structure-editor Save, Spin Flatten/Release and native ring/bracket/symbol/art stamps
