@@ -715,6 +715,113 @@ describe("verified request writes", () => {
     } finally { await f.finish(); }
   });
 
+  it.each(["moveObject", "updateObject"] as const)("commits an XY move of a stored repeat-unit member via %s", async op => {
+    const { carbon, pair } = structureOnlyBracketPair();
+    const stored: MoleculeObject = { ...carbon,
+      chemistry: { formula: "CH4", isotopeLabels: [], stereochemistry: [], warnings: [] },
+      compatibility: { sourceFormat: "smiles", unknown: { smiles: "C" }, warnings: [] } };
+    const f = setup([stored.id], undefined, { objects: [stored, ...pair] });
+    try {
+      const before = f.pinned();
+      const original = before.pages[0]!.objects.find(object => object.id === stored.id)!;
+      const position = { x: stored.x + 5, y: stored.y + 2 };
+      const patch = op === "moveObject" ? { op, objectId: stored.id, ...position }
+        : { op, objectId: stored.id, changes: position };
+      const requestId = await f.begin();
+      expect(await f.context.documents.applyRequestPatch!({ requestId, patch })).toMatchObject({ ok: true });
+      const after = f.pinned();
+      expect(f.history).toEqual([{ before, after, label: "Draw requested objects" }]);
+      expect(after.pages[0]!.objects.find(object => object.id === stored.id)).toEqual({ ...original, ...position });
+      expect(await f.context.documents.applyRequestPatch!({ requestId, patch: {
+        op: "updateObject", objectId: stored.id, changes: { structure: "N" }
+      } })).toMatchObject({ ok: false, error: { code: "chemistry", message: expect.stringContaining('bracket "close"') } });
+      expect(f.pinned()).toBe(after);
+      expect(f.history).toHaveLength(1);
+    } finally { await f.finish(); }
+  });
+
+  describe("stored-only SMILES", () => {
+    const chemistry: NonNullable<MoleculeObject["chemistry"]> = {
+      formula: "C2H6O", totalCharge: 0, isotopeLabels: [], stereochemistry: [], warnings: []
+    };
+    const stored: MoleculeObject = { ...ethane, id: "stored-smiles", structure: "CCO", atoms: [], bonds: [],
+      chemistry, compatibility: { sourceFormat: "smiles", unknown: { smiles: "CCO" }, warnings: [] } };
+    const position = { x: stored.x + 6, y: stored.y + 3 };
+
+    it("commits a geometry-only first write with one history entry", async () => {
+      const f = setup([stored.id], undefined, { objects: [stored] });
+      try {
+        const requestId = await f.begin();
+        const before = f.pinned();
+        const original = before.pages[0]!.objects.find(object => object.id === stored.id)!;
+        expect(f.history).toHaveLength(0);
+        expect(await f.context.documents.applyRequestPatch!({ requestId, patch: {
+          op: "moveObject", objectId: stored.id, ...position
+        } })).toMatchObject({ ok: true });
+        const after = f.pinned();
+        const moved = after.pages[0]!.objects.find(object => object.id === stored.id);
+        expect(moved).toStrictEqual({ ...original, ...position });
+        expect(JSON.stringify(moved)).toBe(JSON.stringify({ ...original, ...position }));
+        expect(f.history).toEqual([{ before, after, label: "Draw requested objects" }]);
+      } finally { await f.finish(); }
+    });
+
+    describe.each([
+      { mode: "without a move", geometry: {} },
+      { mode: "with a move", geometry: position }
+    ])("$mode", ({ geometry }) => {
+      it.each([
+        { name: "stored SMILES", structure: "CCO", changes: { structure: "CCN" } },
+        { name: "charge in SMILES", structure: "C[NH3+]", changes: { structure: "CN" } },
+        { name: "isotope in SMILES", structure: "CCO", changes: { structure: "[13CH3]CO" } },
+        { name: "stereo in SMILES", structure: "C[C@H](N)O", changes: { structure: "C[C@@H](N)O" } },
+        { name: "stored total formal charge", structure: "CCO", changes: { chemistry: { ...chemistry, totalCharge: 1 } } },
+        { name: "stored isotope labels", structure: "CCO", changes: { chemistry: { ...chemistry, isotopeLabels: ["13C"] } } },
+        { name: "stored stereochemistry", structure: "CCO", changes: { chemistry: { ...chemistry, stereochemistry: ["R"] } } }
+      ])("refuses changing $name on the first write without recording history", async ({ structure, changes }) => {
+        const molecule: MoleculeObject = {
+          ...stored, structure,
+          ...(structure === stored.structure ? {} : { chemistry: undefined, compatibility: undefined })
+        };
+        const f = setup([molecule.id], undefined, { objects: [molecule] });
+        try {
+          const requestId = await f.begin();
+          const before = f.pinned();
+          const beforeBytes = JSON.stringify(before);
+          expect(f.history).toHaveLength(0);
+          expect(await f.context.documents.applyRequestPatch!({ requestId, patch: {
+            op: "updateObject", objectId: molecule.id, changes: { ...changes, ...geometry }
+          } })).toMatchObject({ ok: false, error: { code: "chemistry" } });
+          expect(f.pinned()).toBe(before);
+          expect(JSON.stringify(f.pinned())).toBe(beforeBytes);
+          expect(f.history).toHaveLength(0);
+        } finally { await f.finish(); }
+      });
+    });
+  });
+
+  it("preserves a stored-only molfile on a move and refuses replacing it", async () => {
+    const structure = chemicalIdentitySource(ethane, [], "v2000").molfile;
+    const stored: MoleculeObject = { ...ethane, id: "stored-molfile", structureFormat: "molfile-v2000",
+      structure, atoms: [], bonds: [] };
+    const f = setup([stored.id], undefined, { objects: [stored] });
+    try {
+      const before = f.pinned();
+      const position = { x: stored.x + 6, y: stored.y + 3 };
+      const requestId = await f.begin();
+      expect(await f.context.documents.applyRequestPatch!({ requestId, patch: {
+        op: "moveObject", objectId: stored.id, ...position
+      } })).toMatchObject({ ok: true });
+      const after = f.pinned();
+      expect(after.pages[0]!.objects.find(object => object.id === stored.id)).toEqual({ ...stored, ...position });
+      expect(await f.context.documents.applyRequestPatch!({ requestId, patch: {
+        op: "updateObject", objectId: stored.id, changes: { structure: `${structure}\n` }
+      } })).toMatchObject({ ok: false, error: { code: "chemistry" } });
+      expect(f.pinned()).toBe(after);
+      expect(f.history).toEqual([{ before, after, label: "Draw requested objects" }]);
+    } finally { await f.finish(); }
+  });
+
   it("commits a geometry-only move of a repeat unit with a stored member", async () => {
     const { carbon, pair } = structureOnlyBracketPair();
     const f = setup(pair.map(bracket => bracket.id), undefined, { objects: [carbon, ...pair] });

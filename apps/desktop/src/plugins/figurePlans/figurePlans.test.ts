@@ -1,5 +1,6 @@
 import { applyPatch, createEmptyDocument, type BracketObject, type MoleculeObject } from "@chemdraft/chem-core";
-import { createSmilesMolecule, layoutReactionScheme, documentDrawingDefaults, representativeNativeMoleculeBondLength } from "@chemdraft/document-workflow-core";
+import { createSmilesMolecule, layoutReactionScheme, documentDrawingDefaults, moleculeGeometryFromAtoms,
+  representativeNativeMoleculeBondLength } from "@chemdraft/document-workflow-core";
 import { PluginPlanLayoutResultSchema, pluginRequestPermissions, type PluginRequestArguments,
   type PluginRequestPatch } from "@chemdraft/plugin-api";
 import { describe, expect, it, vi } from "vitest";
@@ -94,7 +95,7 @@ describe("desktop figure plan providers", () => {
     const { document, page, product, reaction, plan } = fixture();
     const smiles = "[Na+].[OH-]";
     const salt = createSmilesMolecule(document, { x: 100, y: 100 }, {
-      atoms: [{ element: "Na", x: 0, y: 0, charge: 1 }, { element: "O", x: 2, y: 0, charge: -1 }], bonds: []
+      atoms: [{ element: "Na", x: 0, y: 0, charge: 1 }, { element: "O", x: 4, y: 0, charge: -1 }], bonds: []
     }, smiles);
     const defaults = documentDrawingDefaults(document);
     const native = layoutReactionScheme({ ...reaction, reactants: [{ molecule: salt }], products: [{ molecule: product }],
@@ -107,6 +108,8 @@ describe("desktop figure plan providers", () => {
       .toMatchObject({ start: native.arrow.start, end: native.arrow.end });
     expect(proposed.value.objects.find(object => object.type === "molecule"))
       .toMatchObject({ atoms: native.molecules[0]!.atoms });
+    const plannedSalt = proposed.value.objects.find(object => object.type === "molecule")!;
+    expect(plannedSalt).toMatchObject({ ...moleculeGeometryFromAtoms(plannedSalt.atoms), bonds: [] });
     expect(native.molecules[0]!.atoms).toMatchObject([{ element: "NaOH" }]);
     page.objects = [salt, product];
     const pinned = await plan({ ...reaction, reactants: [salt.id] });

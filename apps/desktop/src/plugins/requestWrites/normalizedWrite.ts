@@ -111,6 +111,17 @@ export async function verifyNormalizedWrite(context: StructureInspectionContext,
     const styleOnlyMeaning = ({ style: _style, ...object }: MoleculeObject) => stableRecord(object);
     if (expected === undefined && original?.type === "molecule" &&
         styleOnlyMeaning(source) === styleOnlyMeaning(molecule) && styleOnlyMeaning(source) === styleOnlyMeaning(authored)) continue;
+    // A stored-only molecule has no editable graph to inspect. Its position can change if
+    // the entire remaining record matches both the authored and normalized versions.
+    if (original?.type === "molecule" && original.structureFormat !== "unknown" && original.structure.trim() &&
+        !original.atoms.length && !original.bonds.length) {
+      const storedMeaning = ({ x: _x, y: _y, ...object }: MoleculeObject) => stableRecord(object);
+      const identity = storedMeaning(original);
+      if (expected !== undefined || identity !== storedMeaning(authored) || identity !== storedMeaning(molecule)) {
+        throw new Error(`Cannot verify a chemical edit to stored-only molecule "${id}".`);
+      }
+      continue;
+    }
     const graph = await inspectMolecule(context, molecule);
     if (!graph.identitySmiles || !graph.orderedIdentity) throw new Error(`Cannot verify the normalized molecule "${id}".`);
     if (expected !== undefined) {

@@ -2,7 +2,7 @@ import { bracketPairs, DocumentObjectSchema, type ChemDraftDocument, type Docume
   type MoleculeObject } from "@chemdraft/chem-core";
 import {
   changedElectronMarkAssignments, documentDrawingDefaults, isEditableNativeMoleculeGraph, listFigureStylePresets,
-  moleculeTargetBondLengthChanges, nativeElectronMarkAssignments, planFigureArrangement,
+  moleculeTargetBondLengthChanges, nativeElectronMarkAssignments, normalizeNativeMoleculeGeometry, planFigureArrangement,
   planFigureReaction, planFigureStyle, planPageStyleUpdates, type FigureReactionStep
 } from "@chemdraft/document-workflow-core";
 import { resolveArrowAttachments } from "@chemdraft/layout-engine";
@@ -270,7 +270,7 @@ async function reaction(
       const original = built.get(ref)!;
       const placed = plan.placements.get(objectId)!;
       const translated = expectedPageTranslation(original, placed.x - original.x, placed.y - original.y) as MoleculeObject;
-      return { ...translated, atoms: placed.atoms, bonds: placed.bonds };
+      return normalizeNativeMoleculeGeometry({ ...translated, atoms: placed.atoms, bonds: placed.bonds });
     }),
     ...plan.objects
   ];

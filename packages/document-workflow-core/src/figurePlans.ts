@@ -113,7 +113,7 @@ export function planFigureReaction(steps: readonly FigureReactionStep[], options
     const shared = new Set(visual.filter(component => placements.has(component.id)).map(component => component.id));
     const continued = shared.size === 1 && shared.has(visual[0]!.id) && visual[0]!.id === lastComponent;
     let newRow = rows && (rows.breakBefore?.includes(index) || shared.size > 0 && !continued);
-    let stepAnchor = { x: index === 0 ? anchor.x : rowRight + rows!.gap, y: line };
+    let stepAnchor = { x: index === 0 ? anchor.x : rowRight + (rows?.gap ?? options.bondLength), y: line };
     const render = (omit: ReadonlySet<string>, at: PagePoint) => {
       const components = (items: readonly MoleculeObject[]) => items.filter(item => !omit.has(item.id))
         .map(molecule => ({ molecule, preserveLabels: !options.newMoleculeIds?.has(molecule.id) }));
