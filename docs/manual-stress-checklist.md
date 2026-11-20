@@ -93,6 +93,13 @@ text field. Check that showing each leaves the document focused. Click Target bo
 and reopening each window. Repeat with a digit immediately after the click. No ring should appear.
 Click the drawing and verify its shortcuts work again.
 
+On Linux (XWayland and native Wayland with `GDK_BACKEND=wayland`), maximize the document, open
+several floating toolbars, and click the canvas. Verify the toolbars stay above the document and
+have no standalone taskbar or pager entries. Switch to another app and check that its window can
+cover the toolbars. Hover for a tooltip, open and reopen a palette popover, and open a file warning.
+Check that each opens after prewarming or reuse and that mouse-opened utilities leave the document
+focused. On native Wayland, the compositor places these windows.
+
 Palette field input (macOS and Windows): in Drawn Structure Settings, click Target bond length,
 type 30 and press Return; the value changes, the canvas does not, and no hotkey fires. Switch to
 another app and back, then click the field again; Customize gallery search still types.
