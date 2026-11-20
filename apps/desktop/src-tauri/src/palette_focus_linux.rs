@@ -1,7 +1,7 @@
 //! GTK input arrives before the web process classifies a click. Preserve its GDK
 //! timestamp and let the compositor confirm (or refuse) the subsequent presentation.
 
-use super::{end, now, publish_click, state, wall_time, End, GUARD};
+use super::{end, now, publish, publish_click, state, wall_time, End, GUARD};
 use crate::{
     is_input_focus_window_label, panel_window, run_on_main_thread_blocking, MAIN_WINDOW_LABEL,
 };
@@ -25,6 +25,12 @@ pub(crate) fn install<R: Runtime>(window: &WebviewWindow<R>) -> Result<(), Strin
     let owner = native.downgrade();
     if is_input_focus_window_label(&label) {
         native.set_focus_on_map(false);
+        let source = label.clone();
+        // A compositor can deliver keys to a refused presentation. Stop them
+        // before GtkWindow dispatches a menu accelerator or WebKit forwards a shortcut.
+        native.connect_key_press_event(move |_, _| {
+            (!GUARD.lock().unwrap().allows_window_keys(&source)).into()
+        });
     }
     press.connect_pressed(move |gesture, _, _, _| {
         let primary = gesture.current_button() == 1;
@@ -32,7 +38,7 @@ pub(crate) fn install<R: Runtime>(window: &WebviewWindow<R>) -> Result<(), Strin
             && (primary || crate::is_plugin_panel_window_label(&label))
         {
             let focused = owner.upgrade().is_some_and(|w| w.has_toplevel_focus());
-            if GUARD.lock().unwrap().has_confirmed_focus(&label, focused) {
+            if focused && GUARD.lock().unwrap().has_confirmed_focus(&label) {
                 // A second click in a key field needs no new acquisition or key guard.
                 end(&app, "", End::Outside, None, 0);
                 return;
@@ -89,21 +95,35 @@ pub(crate) fn install<R: Runtime>(window: &WebviewWindow<R>) -> Result<(), Strin
     Ok(())
 }
 
+pub(crate) fn set_keyboard_popover(label: &str, keyboard: bool) {
+    GUARD.lock().unwrap().set_keyboard_popover(label, keyboard);
+}
+
+pub(crate) fn has_confirmed_focus(label: &str) -> bool {
+    GUARD.lock().unwrap().has_confirmed_focus(label)
+}
+
+// A reopened window can reuse both the Tauri label and the page's JS generations.
+// Resolve the actual GTK widget before acting on a queued event or IPC completion.
+fn current_window<R: Runtime>(
+    window: &tauri::Window<R>,
+) -> Option<(WebviewWindow<R>, gtk::ApplicationWindow)> {
+    let target = window.app_handle().get_webview_window(window.label())?;
+    let native = target.gtk_window().ok()?;
+    (window.gtk_window().ok()? == native).then_some((target, native))
+}
+
 pub(crate) fn focus_changed<R: Runtime>(window: &tauri::Window<R>, active: bool) {
-    if let Some(target) = window.app_handle().get_webview_window(window.label()) {
-        // Ignore stale events in either direction if a newer transition has already occurred.
-        if active
-            != target
-                .gtk_window()
-                .is_ok_and(|w| w.has_toplevel_focus() && w.is_visible())
-        {
-            return;
-        }
-        panel_window::activation(&target, active);
-        GUARD
-            .lock()
-            .unwrap()
-            .focus_changed(window.label(), active, now());
+    let Some((target, native)) = current_window(window) else {
+        return;
+    };
+    if active != (native.has_toplevel_focus() && native.is_visible()) {
+        return;
+    }
+    if active {
+        GUARD.lock().unwrap().focus_in(window.label(), now());
+    } else {
+        panel_window::activation(&target, false);
     }
 }
 
@@ -114,20 +134,11 @@ pub(crate) async fn acquire(
     click_sequence: Option<u64>,
     before: u64,
 ) -> Result<bool, String> {
-    let Some(epoch) = panel_window::request(&window, generation, page_token, true, false) else {
-        return Ok(false);
-    };
+    let page_token = page_token.to_owned();
     let target = window.clone();
     let request = run_on_main_thread_blocking(&window, move || {
-        let native = target.gtk_window().map_err(|error| error.to_string())?;
-        if !panel_window::is_current(&target, generation, epoch)
-            || !panel_window::holds_input_focus(&target)
-            || !native.is_visible()
-            || target.is_minimized().unwrap_or(true)
-            || !crate::foreground_belongs_to_app()
-        {
-            return Ok(state::FocusRequest::Denied);
-        }
+        let (_, native) = current_window(&target.as_ref().window())?;
+        let epoch = panel_window::request(&target, generation, &page_token, true, false)?;
         let request = GUARD.lock().unwrap().request_focus(
             target.label(),
             click_sequence,
@@ -135,25 +146,44 @@ pub(crate) async fn acquire(
             now(),
             native.has_toplevel_focus(),
         );
+        let sequence = request.sequence();
+        if !native.is_visible()
+            || target.is_minimized().unwrap_or(true)
+            || !crate::foreground_belongs_to_app()
+        {
+            return Some((epoch, sequence, state::FocusRequest::Denied));
+        }
         if !matches!(request, state::FocusRequest::Denied) {
             native.set_accept_focus(true);
         }
         if let state::FocusRequest::Present { timestamp, .. } = &request {
             native.present_with_time(*timestamp);
         }
-        Ok(request)
+        Some((epoch, sequence, request))
     })?;
-    // Wait on the IPC task, leaving the GTK thread free to deliver Focused.
-    let confirmed = match request {
-        Ok(request) => Ok(request.confirmed().await),
-        Err(error) => Err(error),
+    let Some((epoch, sequence, request)) = request else {
+        return Ok(false);
     };
+    // Wait on the IPC task, leaving the GTK thread free to deliver Focused.
+    let confirmed = request.confirmed().await;
     let target = window.clone();
     run_on_main_thread_blocking(&window, move || {
-        let result = confirmed.and_then(|confirmed| {
+        let Some((_, native)) = current_window(&target.as_ref().window()) else {
+            return Ok(false);
+        };
+        if !panel_window::is_current(&target, generation, epoch) {
+            return Ok(false);
+        }
+        let result = (|| {
             if !confirmed
-                || !panel_window::is_current(&target, generation, epoch)
+                || !sequence.is_some_and(|seq| {
+                    GUARD
+                        .lock()
+                        .unwrap()
+                        .ticket_is_current(target.label(), seq, now())
+                })
                 || !panel_window::holds_input_focus(&target)
+                || !native.has_toplevel_focus()
                 || !panel_window::is_active(&target)?
             {
                 return Ok(false);
@@ -161,18 +191,23 @@ pub(crate) async fn acquire(
             let webview: &tauri::Webview = target.as_ref();
             webview.set_focus().map_err(|error| error.to_string())?;
             Ok(true)
-        });
-        let held = panel_window::acquired(&target, generation, epoch, matches!(result, Ok(true)));
-        if !held && panel_window::is_current(&target, generation, epoch) {
-            let _ = target.set_focusable(false);
+        })();
+        let (held, event) =
+            GUARD
+                .lock()
+                .unwrap()
+                .finish_focus(target.label(), sequence, now(), |eligible| {
+                    panel_window::acquired(
+                        &target,
+                        generation,
+                        epoch,
+                        eligible && matches!(result, Ok(true)),
+                    )
+                });
+        publish(target.app_handle(), event);
+        if !held {
+            native.set_accept_focus(false);
         }
-        end(
-            target.app_handle(),
-            target.label(),
-            if held { End::Acquired } else { End::Refused },
-            click_sequence,
-            before,
-        );
         result.map(|_| held)
     })?
 }

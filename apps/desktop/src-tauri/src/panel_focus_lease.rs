@@ -193,6 +193,19 @@ impl PanelActivation {
         true
     }
 
+    // GTK reports untagged focus-in events. Only the current acquisition can
+    // promote physical focus to panel activation after validating its click.
+    #[cfg(any(target_os = "linux", test))]
+    pub fn acquired_presentation(&mut self, generation: u64, epoch: u64, focused: bool) -> bool {
+        if !self.is_current(generation, epoch) || !self.held {
+            return false;
+        }
+        self.active = focused;
+        self.held = focused;
+        focused
+    }
+
+    #[cfg(any(not(target_os = "linux"), test))]
     pub fn acquired(&mut self, generation: u64, epoch: u64, focused: bool) -> bool {
         if !self.is_current(generation, epoch) || !self.held {
             return false;
@@ -216,6 +229,25 @@ impl PanelActivation {
 #[cfg(test)]
 mod panel_activation_tests {
     use super::*;
+
+    #[test]
+    fn gtk_presentation_cannot_activate_a_refused_superseded_or_closed_panel() {
+        let mut panel = PanelActivation::default();
+        let epoch = panel.epoch;
+        assert!(panel.record_request(1, epoch, true));
+        assert!(!panel.acquired_presentation(1, epoch, false));
+        assert!(!panel.acquired_presentation(1, epoch, true));
+        assert!(!panel.active);
+        assert!(panel.record_request(2, epoch, true));
+        assert!(!panel.acquired_presentation(1, epoch, true));
+        assert!(!panel.active);
+        panel.reset();
+        assert!(panel.record_request(2, panel.epoch, true));
+        assert!(!panel.acquired_presentation(2, epoch, true));
+        assert!(!panel.active);
+        assert!(panel.acquired_presentation(2, panel.epoch, true));
+        assert!(panel.active);
+    }
 
     #[test]
     fn pending_panel_input_requires_native_activation_and_survives_only_its_generation() {

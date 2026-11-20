@@ -4711,6 +4711,7 @@ fn plugin_panel_event_forward(
         return run_on_main_thread_blocking(&window, move || {
             if !utility_windows_suspended()
                 && !panel_window::palette_blocks_forwarded_shortcut(
+                    target.label(),
                     &shortcut.key,
                     shortcut.meta_key,
                     shortcut.ctrl_key,
@@ -6594,6 +6595,11 @@ fn configure_toolset_popover_window<R: Runtime>(
         target
             .set_focusable(focus_mode == ToolsetPopoverFocusMode::Focus)
             .map_err(|error| error.to_string())?;
+        // Keyboard-opened popovers own their navigation keys without a field lease.
+        panel_window::set_keyboard_popover(
+            target.label(),
+            focus_mode == ToolsetPopoverFocusMode::Focus,
+        );
         #[cfg(windows)]
         {
             use windows_sys::Win32::UI::WindowsAndMessaging::{
