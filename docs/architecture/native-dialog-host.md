@@ -12,7 +12,9 @@ failure reports an error in the document status; it never creates an in-page des
 ## Drawing view recovery on Linux
 
 If the document's WebKitGTK web process stops, ChemDraft logs the reason and shows a native message
-box with two launch settings to try, `WEBKIT_DISABLE_DMABUF_RENDERER=1` and `GDK_BACKEND=x11`.
+box with terminal commands for the installed app and the AppImage. The commands try Mesa software
+rendering (`LIBGL_ALWAYS_SOFTWARE=1`) or disable WebKitGTK accelerated compositing
+(`WEBKIT_DISABLE_COMPOSITING_MODE=1`).
 Closing the first message reloads the drawing view once per document window during the app session.
 A later termination in that window shows a message asking the user to restart ChemDraft.
 Reload uses the normal session restore path. Pending edits can be lost because the autosave and

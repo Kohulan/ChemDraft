@@ -36,12 +36,21 @@ impl RecoveryPolicy {
         } else {
             "Quit and restart ChemDraft to reopen it."
         };
+        let appimage = concat!("./ChemDraft_", env!("CARGO_PKG_VERSION"), "_amd64.AppImage");
         Recovery {
             reload,
             message: format!(
                 "{stopped} {next} Changes since the last autosave may be lost.\n\n\
-                 If this keeps happening, try starting ChemDraft from a terminal with \
-                 WEBKIT_DISABLE_DMABUF_RENDERER=1 or GDK_BACKEND=x11 set."
+                 If this keeps happening, quit ChemDraft and try one of these terminal commands \
+                 for the installed app.\n\n\
+                 Mesa software rendering\n\
+                 LIBGL_ALWAYS_SOFTWARE=1 chemdraft\n\n\
+                 Disable WebKitGTK accelerated compositing\n\
+                 WEBKIT_DISABLE_COMPOSITING_MODE=1 chemdraft\n\n\
+                 For an AppImage, run one of these from the folder containing the file. \
+                 Use your AppImage's filename if it differs.\n\
+                 LIBGL_ALWAYS_SOFTWARE=1 {appimage}\n\
+                 WEBKIT_DISABLE_COMPOSITING_MODE=1 {appimage}"
             ),
         }
     }
@@ -136,9 +145,6 @@ mod tests {
             assert!(!recovery.reload);
             assert!(recovery.message.contains("Quit and restart ChemDraft"));
             assert!(!recovery.message.contains("will reload"));
-            assert!(recovery
-                .message
-                .contains("WEBKIT_DISABLE_DMABUF_RENDERER=1 or GDK_BACKEND=x11"));
         }
 
         assert!(second_window.on_termination(StopReason::Crashed).reload);
@@ -159,9 +165,28 @@ mod tests {
             assert!(recovery
                 .message
                 .contains("Changes since the last autosave may be lost"));
-            assert!(recovery
-                .message
-                .contains("WEBKIT_DISABLE_DMABUF_RENDERER=1 or GDK_BACKEND=x11"));
+        }
+    }
+
+    #[test]
+    fn gives_terminal_commands_for_installed_and_appimage_launches() {
+        let mut policy = RecoveryPolicy::default();
+        for _ in 0..2 {
+            let recovery = policy.on_termination(StopReason::Crashed);
+            for setting in [
+                "LIBGL_ALWAYS_SOFTWARE=1",
+                "WEBKIT_DISABLE_COMPOSITING_MODE=1",
+            ] {
+                let installed = format!("{setting} chemdraft");
+                let appimage = format!(
+                    "{setting} ./ChemDraft_{}_amd64.AppImage",
+                    env!("CARGO_PKG_VERSION")
+                );
+                assert!(recovery.message.lines().any(|line| line == installed));
+                assert!(recovery.message.lines().any(|line| line == appimage));
+            }
+            assert!(!recovery.message.contains("WEBKIT_DISABLE_DMABUF_RENDERER"));
+            assert!(!recovery.message.contains("GDK_BACKEND"));
         }
     }
 }
