@@ -3,7 +3,10 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PalettePopoverWindow } from "./PalettePopoverWindow";
-import { sendBondStereoPopoverAction, sendPaletteCommand, sendToolsetFlyoutKey, type ToolsetFlyoutKey, type ToolsetPopoverDismissPayload, type ToolsetPopoverContentPayload } from "./window-manager";
+import {
+  notifyToolsetPopoverContentAccepted, sendBondStereoPopoverAction, sendPaletteCommand, sendToolsetFlyoutKey,
+  type ToolsetFlyoutKey, type ToolsetPopoverDismissPayload, type ToolsetPopoverContentPayload
+} from "./window-manager";
 import { useBondStereoPopover } from "./useBondStereoPopover";
 import type { ChemDraftDocument } from "@chemdraft/chem-core";
 import { closeToolsetPopoverWindow, currentWindowLogicalPosition, openToolsetPopoverWindow, setCurrentWindowLogicalPosition, setToolsetPopoverContent } from "./window-manager";
@@ -15,7 +18,7 @@ const native = vi.hoisted(() => ({
   dismiss: undefined as undefined | ((payload?: ToolsetPopoverDismissPayload) => void),
   request: undefined as undefined | ((toolsetId: string) => void),
   key: undefined as undefined | ((payload: ToolsetFlyoutKey) => void),
-  hide: vi.fn(async () => {}), focus: vi.fn(async () => {}), webviewFocus: vi.fn(async () => {}), show: vi.fn(async () => {}),
+  hide: vi.fn(async () => {}), focus: vi.fn(async () => {}), webviewFocus: vi.fn(async () => {}), show: vi.fn(async () => true),
   invoke: vi.fn(async (_command: string, _args?: Record<string, unknown>): Promise<unknown> => undefined),
   fallbackShow: vi.fn(async () => {}),
   platform: "macos" as "macos" | "windows",
@@ -46,7 +49,9 @@ vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ hide: nati
 vi.mock("@tauri-apps/api/webview", () => ({ getCurrentWebview: () => ({ setFocus: native.webviewFocus }) }));
 vi.mock("./window-manager", async importOriginal => ({
   ...await importOriginal<typeof import("./window-manager")>(),
+  isToolsetPopoverVisible: async () => true,
   listenForToolsetPopoverContent: vi.fn(async handler => { native.content = handler; return () => {}; }),
+  notifyToolsetPopoverContentAccepted: vi.fn(async () => {}),
   listenForToolsetPopoverDismiss: vi.fn(async handler => { native.dismiss = handler; return () => {}; }),
   listenForBondStereoPopoverActions: vi.fn(async handler => { native.action = handler; return () => {}; }),
   listenForToolsetFlyoutKeys: vi.fn(async handler => { native.key = handler; return () => { native.key = undefined; }; }),
@@ -69,7 +74,8 @@ beforeEach(() => {
   native.platform = "macos";
   native.notifyFocus = undefined;
   native.invoke.mockReset().mockImplementation(async (command: string, args?: Record<string, unknown>) =>
-    command === "register_plugin_panel_input_focus" ? "popover-page" : args?.editing);
+    command === "register_plugin_panel_input_focus" ? "popover-page" :
+      command === "show_toolset_popover_window" ? true : args?.editing);
   container = document.createElement("div"); document.body.append(container); root = createRoot(container);
 });
 
@@ -103,7 +109,7 @@ describe("document-owned bond stereo popover", () => {
     };
     await press("Tab", { shiftKey: true });
     expect(sendToolsetFlyoutKey).toHaveBeenLastCalledWith({ toolsetId: "core.bondStereo", flyoutId: "core.bondStereo",
-      openedAt: content.openedAt, sessionId: content.flyout.id, key: "Tab", shiftKey: true });
+      openedAt: content.openedAt, generation: content.generation, sessionId: content.flyout.id, key: "Tab", shiftKey: true });
     await press("ArrowRight");
     expect(document.activeElement).toBe(owner);
     await press("Enter");
@@ -195,14 +201,14 @@ describe("native popover focus transport", () => {
         expect(native.invoke).toHaveBeenLastCalledWith("open_toolset_popover", {
           toolsetId: "core.bondStereo", kind: "flyout", x: 130, y: 254, focusMode
         });
-        await manager.showCurrentToolsetPopoverWindow(focusMode);
+        await expect(manager.showCurrentToolsetPopoverWindow(focusMode)).resolves.toBe(true);
         expect(native.invoke).toHaveBeenLastCalledWith("show_toolset_popover_window", { focusMode });
       }
       await manager.openToolsetPopoverWindow("core.art", "artColor", 0, 0);
       expect(native.invoke).toHaveBeenLastCalledWith("open_toolset_popover", {
         toolsetId: "core.art", kind: "artColor", x: 0, y: 0, focusMode: "focus"
       });
-      await manager.showCurrentToolsetPopoverWindow();
+      await expect(manager.showCurrentToolsetPopoverWindow()).resolves.toBe(true);
       expect(native.invoke).toHaveBeenLastCalledWith("show_toolset_popover_window", { focusMode: "focus" });
     } finally { delete host.__TAURI__; }
   });
@@ -218,6 +224,9 @@ describe("native popover focus transport", () => {
   });
 });
 afterEach(async () => { await act(async () => root.unmount()); container.remove(); vi.restoreAllMocks(); vi.useRealTimers(); });
+const bondStereoOpening = (bondStereoSessionId: string) => expect.objectContaining({
+  toolsetId: "core.bondStereo", flyoutId: "core.bondStereo", openedAt: expect.any(Number), bondStereoSessionId
+});
 async function open(keyboardOpen = false) {
   await act(async () => root.render(<PalettePopoverWindow toolsetId="core.bondStereo" kind="flyout" prewarm />));
   expect(native.show).not.toHaveBeenCalled();
@@ -228,7 +237,8 @@ async function open(keyboardOpen = false) {
         { id: "molecule.bondStereo:flipped", title: "Use the other geometry (E)", enabled: true, active: false }
       ] } }));
   expect(native.show).toHaveBeenCalledTimes(1);
-  expect(native.show).toHaveBeenCalledWith(keyboardOpen && native.platform !== "windows" ? "focus" : "preserve", "flyout");
+  expect(native.show).toHaveBeenCalledWith(keyboardOpen && native.platform !== "windows" ? "focus" : "preserve", "flyout",
+    bondStereoOpening("session-1"));
   expect(container.querySelector('[role="dialog"]')?.getAttribute("aria-label")).toBe("E/Z not specified");
   expect(container.querySelector("p")?.textContent).toBe("This double bond's geometry wasn't given, so ChemDraft shows it as either E or Z.");
   return [...container.querySelectorAll("button")];
@@ -257,7 +267,9 @@ describe("open-bond native popover body", () => {
     await act(async () => native.content?.(payload));
     expect(native.show).not.toHaveBeenCalled();
     await act(async () => native.content?.({ ...payload, openedAt: 300, generation: 2 }));
-    expect(native.show).toHaveBeenCalledExactlyOnceWith("preserve", "flyout");
+    expect(native.show).toHaveBeenCalledExactlyOnceWith("preserve", "flyout", {
+      toolsetId: "core.art", flyoutId: expect.any(String), openedAt: 300, generation: 2
+    });
     expect(native.hide).toHaveBeenCalledTimes(1);
   });
   it("a delayed Escape only dismisses its checked generation, even at an identical timestamp", async () => {
@@ -420,7 +432,7 @@ describe("open-bond native popover body", () => {
     const button = buttons[action === "geometry" ? 0 : action === "flipped" ? 1 : 2];
     await act(async () => { button.click(); button.click(); });
     expect(sendBondStereoPopoverAction).toHaveBeenCalledTimes(1);
-    expect(sendBondStereoPopoverAction).toHaveBeenCalledWith({ sessionId: "session-1", action });
+    expect(sendBondStereoPopoverAction).toHaveBeenCalledWith({ sessionId: "session-1", action }, bondStereoOpening("session-1"));
     expect(sendPaletteCommand).not.toHaveBeenCalled();
     expect(native.hide).toHaveBeenCalledTimes(1);
   });
@@ -466,6 +478,7 @@ describe("open-bond native popover body", () => {
       expect(native.notifyFocus).toBeTypeOf("function");
       // Activation can arrive during reveal, before setFocus() resolves.
       native.notifyFocus!({ payload: { kind: "activated", generation: 0 } });
+      return true;
     });
     const handBacks = () => native.invoke.mock.calls.filter(([command, args]) =>
       command === "set_plugin_panel_input_focus" && args?.editing === false);
@@ -489,7 +502,7 @@ describe("open-bond native popover body", () => {
       await press("Tab");
       expect(document.activeElement).toBe(buttons[0]);
       await press("Enter");
-      expect(sendBondStereoPopoverAction).toHaveBeenCalledExactlyOnceWith({ sessionId: "session-1", action: "geometry" });
+      expect(sendBondStereoPopoverAction).toHaveBeenCalledExactlyOnceWith({ sessionId: "session-1", action: "geometry" }, bondStereoOpening("session-1"));
       expect(native.hide).toHaveBeenCalledTimes(1);
       expect(handBacks()).toHaveLength(0);
       // A late activation after hide must no longer carry the focused-reveal exemption.
@@ -506,8 +519,9 @@ describe("open-bond native popover body", () => {
     const owner = document.createElement("input"); document.body.append(owner); owner.focus();
     try {
       const buttons = await open(true);
+      const [opening] = vi.mocked(notifyToolsetPopoverContentAccepted).mock.lastCall!;
       const key = (value: string, shiftKey = false, sessionId = "session-1") => act(async () => native.key?.({
-        toolsetId: "core.bondStereo", flyoutId: "core.bondStereo", openedAt: performance.timeOrigin + 100,
+        toolsetId: "core.bondStereo", flyoutId: "core.bondStereo", openedAt: performance.timeOrigin + 100, generation: opening.generation,
         sessionId, key: value, shiftKey
       }));
       const highlighted = () => container.querySelector('[data-keyboard-highlighted="true"]');
@@ -519,7 +533,7 @@ describe("open-bond native popover body", () => {
       if (action === "flipped") await key("ArrowRight");
       if (action === "keep") await key("Tab", true);
       await key("Enter"); await key("Enter");
-      expect(sendBondStereoPopoverAction).toHaveBeenCalledExactlyOnceWith({ sessionId: "session-1", action });
+      expect(sendBondStereoPopoverAction).toHaveBeenCalledExactlyOnceWith({ sessionId: "session-1", action }, bondStereoOpening("session-1"));
       expect(native.hide).toHaveBeenCalledTimes(1);
       expect(native.focus).not.toHaveBeenCalled();
       expect(native.webviewFocus).not.toHaveBeenCalled();
@@ -566,8 +580,8 @@ describe("open-bond native popover body", () => {
     } finally { delete host.__TAURI__; }
   });
   it("does not let an older reveal hide a newly opened session", async () => {
-    let finishReveal!: () => void;
-    native.show.mockImplementationOnce(() => new Promise<void>(resolve => { finishReveal = resolve; }));
+    let finishReveal!: (shown: boolean) => void;
+    native.show.mockImplementationOnce(() => new Promise<boolean>(resolve => { finishReveal = resolve; }));
     await open();
     const next: ToolsetPopoverContentPayload = { toolsetId: "core.bondStereo", kind: "flyout", flyout: {
       id: "session-2", flyoutId: "core.bondStereo", title: "E/Z not specified", variant: "bondStereo",
@@ -575,15 +589,15 @@ describe("open-bond native popover body", () => {
     } };
     await act(async () => { native.content?.(next); native.content?.(next); });
     expect(native.show).toHaveBeenCalledTimes(2);
-    await act(async () => finishReveal());
+    await act(async () => finishReveal(true));
     expect(native.hide).not.toHaveBeenCalled();
     await act(async () => container.querySelector("button")!.click());
-    expect(sendBondStereoPopoverAction).toHaveBeenCalledWith({ sessionId: "session-2", action: "geometry" });
+    expect(sendBondStereoPopoverAction).toHaveBeenCalledWith({ sessionId: "session-2", action: "geometry" }, bondStereoOpening("session-2"));
   });
   it("does not let an older failed reveal close a newly opened session", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     let failReveal!: (error: Error) => void;
-    native.show.mockImplementationOnce(() => new Promise<void>((_resolve, reject) => { failReveal = reject; }));
+    native.show.mockImplementationOnce(() => new Promise<boolean>((_resolve, reject) => { failReveal = reject; }));
     await open();
     await act(async () => native.content?.({ toolsetId: "core.bondStereo", kind: "flyout", flyout: {
       id: "session-2", flyoutId: "core.bondStereo", title: "E/Z not specified", variant: "bondStereo",
@@ -595,7 +609,7 @@ describe("open-bond native popover body", () => {
     expect(native.hide).not.toHaveBeenCalled();
     expect(sendBondStereoPopoverAction).not.toHaveBeenCalled();
     await act(async () => container.querySelector("button")!.click());
-    expect(sendBondStereoPopoverAction).toHaveBeenCalledWith({ sessionId: "session-2", action: "geometry" });
+    expect(sendBondStereoPopoverAction).toHaveBeenCalledWith({ sessionId: "session-2", action: "geometry" }, bondStereoOpening("session-2"));
   });
   it("keeps unavailable geometry choices disabled with their reason", async () => {
     await open();

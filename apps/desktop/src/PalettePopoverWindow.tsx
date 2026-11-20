@@ -9,12 +9,17 @@ import { detectDesktopShortcutPlatform } from "./keyboardShortcuts";
 import { preventPaletteCommandPointerFocus } from "./paletteCommandPointerFocus";
 import { observePaletteHitBoxes } from "./commandHitBoxes";
 import { listenCurrentWindowEvent } from "./window-manager/tauriEvents";
+import {
+  acceptFlyoutOpening, closeFlyoutOpening, currentFlyoutOpening, dismissFlyoutOpenings,
+  matchesToolsetPopoverOpening, newFlyoutOpeningState, resolveFlyoutOpening, wasFlyoutOpeningDismissed
+} from "./window-manager/flyoutOpeningRule";
 import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import {
+  isToolsetPopoverVisible,
   listenForToolsetPopoverContent,
+  listenForToolsetPopoverClosed,
+  notifyToolsetPopoverContentAccepted,
   notifyToolsetPopoverClosed,
-  compareToolsetPopoverOpenings,
-  newToolsetPopoverOpening,
   listenForToolsetPopoverDismiss,
   listenForToolsetPopoverRelease,
   listenForToolsetFlyoutKeys,
@@ -35,10 +40,10 @@ import {
   toolsetPopoverTimestamp,
   type ToolsetArtPaintTarget,
   type ToolsetArtStylePayload,
+  type ToolsetFlyoutCommandOpening,
   type ToolsetFlyoutCommandSnapshot,
   type ToolsetPopoverAnchor,
-  type ToolsetPopoverContent,
-  type ToolsetPopoverOpening
+  type ToolsetPopoverContent
 } from "./window-manager";
 
 /**
@@ -52,10 +57,22 @@ import {
  * deactivating (hidesOnDeactivate). The colour picker deliberately does NOT close on every commit
  * (it commits per RGB/hex keystroke); a flyout closes the moment you pick a command.
  */
-function hideNativePopoverWindow() {
+function hideNativePopoverWindow(isCurrent: () => boolean) {
   void import("@tauri-apps/api/window")
-    .then(({ getCurrentWindow }) => getCurrentWindow().hide())
+    .then(({ getCurrentWindow }) => {
+      if (isCurrent()) return getCurrentWindow().hide();
+    })
     .catch(() => undefined);
+}
+
+const keepBondStereoCommand: ToolsetFlyoutCommandSnapshot = {
+  id: "keep", title: "Keep unspecified", enabled: true, active: false
+};
+
+function flyoutCommandOpening(toolsetId: string, content: ToolsetPopoverContent): ToolsetFlyoutCommandOpening | undefined {
+  if (content.kind !== "flyout" || content.openedAt === undefined) return;
+  return { toolsetId, flyoutId: content.flyout.flyoutId, openedAt: content.openedAt, generation: content.generation,
+    ...(content.flyout.variant === "bondStereo" ? { bondStereoSessionId: content.flyout.id } : {}) };
 }
 
 export function PalettePopoverWindow({
@@ -75,27 +92,26 @@ export function PalettePopoverWindow({
   // Whether the owning palette has pushed content at least once. A prewarmed window must not reveal
   // (or answer its own mount content-request) before then — its initial state is a placeholder.
   const contentPushedRef = useRef(false);
-  const contentOpenedAt = useRef(0);
-  const closedOpening = useRef<ToolsetPopoverOpening | undefined>(undefined);
-  const latestDismissAt = useRef(-Infinity);
+  const openingsRef = useRef(newFlyoutOpeningState());
   const perfShownRef = useRef<ReturnType<NonNullable<typeof perfProbe>["surfaceStarted"]>>(undefined);
   // Set the moment this popover is dismissed (Escape, click-away, a chosen flyout command) so an
   // in-flight reveal chain cannot show it again after the user has closed it.
   const dismissedRef = useRef(false);
   const keepWindowFocusRef = useRef(false);
-  const hidePopoverWindow = () => {
+  const hidePopoverWindow = (notify = true) => {
     keepWindowFocusRef.current = false;
     const current = contentRef.current;
-    if (!closedOpening.current || compareToolsetPopoverOpenings(current, closedOpening.current) > 0) {
-      closedOpening.current = current;
+    const { openedAt, generation } = current;
+    if (notify && openedAt !== undefined) {
+      openingsRef.current = closeFlyoutOpening(openingsRef.current, { toolsetId, openedAt, generation });
+      void notifyToolsetPopoverClosed(toolsetId, openedAt, generation).catch(() => undefined);
+      if (current.kind === "flyout" && current.flyout.variant !== "bondStereo") {
+        void notifyToolsetFlyoutClosed({ toolsetId, flyoutId: current.flyout.flyoutId, openedAt, generation,
+          ...(generation === undefined ? { exactOpening: true } : {})
+        }).catch(() => undefined);
+      }
     }
-    void notifyToolsetPopoverClosed(toolsetId, contentOpenedAt.current, current.generation).catch(() => undefined);
-    if (current.kind === "flyout" && current.flyout.variant !== "bondStereo") {
-      // closedOpening rejects replays while allowing a newer generation at the same timestamp.
-      void notifyToolsetFlyoutClosed({ toolsetId, flyoutId: current.flyout.flyoutId,
-        openedAt: contentOpenedAt.current }).catch(() => undefined);
-    }
-    hideNativePopoverWindow();
+    hideNativePopoverWindow(() => contentRef.current === current);
   };
   const closedBondStereoSessions = useRef(new Set<string>());
   // Where this open's top-left belongs (global logical). Re-asserted after every content-fit
@@ -109,7 +125,8 @@ export function PalettePopoverWindow({
   );
   const [artStyle, setArtStyle] = useState<ToolsetArtStylePayload | undefined>();
   const contentRef = useRef(content);
-  contentRef.current = content;
+  const shownContentRef = useRef<ToolsetPopoverContent | undefined>(undefined);
+  const pendingChoiceRef = useRef<ToolsetPopoverContent | undefined>(undefined);
   const [highlightedCommandId, setHighlightedCommandId] = useState<string>();
   const highlightedCommandRef = useRef<string | undefined>(undefined);
   const resetScroll = (phase: "reveal" | "release" | "guard" = "guard") => {
@@ -182,7 +199,7 @@ export function PalettePopoverWindow({
     let unlisten: (() => void) | undefined;
     // The opening press is captured by the OWNER window, not this separate webview.
     const afterRelease = (payload?: { toolsetId: string; releasedAt: number }) => {
-      if (payload && (payload.toolsetId !== toolsetId || payload.releasedAt < contentOpenedAt.current)) return;
+      if (payload && (payload.toolsetId !== toolsetId || payload.releasedAt < (contentRef.current.openedAt ?? 0))) return;
       window.setTimeout(() => {
         if (disposed || dismissedRef.current) return;
         resetScroll("release");
@@ -206,18 +223,24 @@ export function PalettePopoverWindow({
       if (payload.toolsetId !== toolsetId) {
         return;
       }
-      // Unstamped pushes have no replay identity: each is a fresh opening, even when the
-      // clock has not advanced. Stamped owner replays retain their original identity.
-      const opening = payload.openedAt === undefined && payload.generation === undefined
-        ? newToolsetPopoverOpening()
-        : { openedAt: payload.openedAt ?? toolsetPopoverTimestamp(), generation: payload.generation };
-      const { openedAt } = opening;
-      if (closedOpening.current && compareToolsetPopoverOpenings(opening, closedOpening.current) <= 0) return;
-      if (contentPushedRef.current && compareToolsetPopoverOpenings(opening, contentRef.current) <= 0) return;
-      // Dismiss IPC and content IPC can arrive in either order. A genuine press
-      // after this open began wins even if the window had no content at the time.
-      if (latestDismissAt.current >= openedAt) {
-        notifyBondStereoClose(payload);
+      const previous = openingsRef.current;
+      const opening = resolveFlyoutOpening(previous, payload, toolsetPopoverTimestamp());
+      const accepted = { ...opening, toolsetId,
+        flyoutId: payload.kind === "flyout" && payload.flyout.variant !== "bondStereo" ? payload.flyout.flyoutId : undefined
+      };
+      const nextOpenings = acceptFlyoutOpening(previous, accepted);
+      if (nextOpenings === previous) {
+        if (wasFlyoutOpeningDismissed(previous, opening.openedAt)) notifyBondStereoClose(payload);
+        const current = currentFlyoutOpening(previous, toolsetId);
+        if (current && matchesToolsetPopoverOpening(current, opening)) {
+          // A router that missed the first acceptance can catch up on a replay.
+          if (!dismissedRef.current && shownContentRef.current === contentRef.current) {
+            void notifyToolsetPopoverContentAccepted(current).catch(() => undefined);
+          }
+        } else if (payload.openedAt !== undefined) {
+          // A router that missed the close or replacement may still be waiting.
+          void notifyToolsetPopoverClosed(toolsetId, opening.openedAt, opening.generation).catch(() => undefined);
+        }
         return;
       }
       if (payload.kind === "flyout" && payload.flyout.variant === "bondStereo" && payload.flyout.id) {
@@ -227,18 +250,15 @@ export function PalettePopoverWindow({
         // must not restore focus or resurrect a popover after an action/dismissal.
         if (current.kind === "flyout" && current.flyout.id === payload.flyout.id) return;
       }
+      openingsRef.current = nextOpenings;
       if (perfShownRef.current) perfHook(() => perfProbe?.surfaceShown(perfShownRef.current, "no-op"));
       perfShownRef.current = perfHook(() => perfProbe?.surfaceStarted("palette-popover", undefined, payload.kind === "flyout" ? payload.flyout.flyoutId : payload.kind));
       // A fresh push is a fresh open — it may follow a dismissal.
       contentPushedRef.current = true;
-      if (compareToolsetPopoverOpenings(opening, contentRef.current) !== 0 || payload.kind !== "flyout" ||
-          contentRef.current.kind !== "flyout" || contentRef.current.flyout.flyoutId !== payload.flyout.flyoutId) {
-        highlightedCommandRef.current = platform === "windows" && payload.kind === "flyout" &&
-          payload.flyout.variant === "bondStereo" && payload.flyout.keyboardOpen
-          ? payload.flyout.commands.find(command => command.enabled)?.id ?? "keep" : undefined;
-        setHighlightedCommandId(highlightedCommandRef.current);
-      }
-      contentOpenedAt.current = openedAt;
+      highlightedCommandRef.current = platform === "windows" && payload.kind === "flyout" &&
+        payload.flyout.variant === "bondStereo" && payload.flyout.keyboardOpen
+        ? payload.flyout.commands.find(command => command.enabled)?.id ?? "keep" : undefined;
+      setHighlightedCommandId(highlightedCommandRef.current);
       dismissedRef.current = false;
       if (payload.anchor && typeof payload.anchor.x === "number" && typeof payload.anchor.y === "number") {
         anchorRef.current = payload.anchor;
@@ -255,6 +275,22 @@ export function PalettePopoverWindow({
       .catch(() => undefined);
     return () => unlisten?.();
   }, [toolsetId, platform]);
+
+  // The owner can close an opening while its content is still in transit.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listenForToolsetPopoverClosed(payload => {
+      if (disposed || payload.toolsetId !== toolsetId) return;
+      const wasOpen = currentFlyoutOpening(openingsRef.current, toolsetId);
+      openingsRef.current = closeFlyoutOpening(openingsRef.current, payload);
+      if (wasOpen && !currentFlyoutOpening(openingsRef.current, toolsetId)) {
+        dismissedRef.current = true;
+        hidePopoverWindow(false);
+      }
+    }).then(stop => { if (disposed) stop(); else unlisten = stop; }).catch(() => undefined);
+    return () => { disposed = true; unlisten?.(); };
+  }, [toolsetId]);
 
   // Follow the shared broadcast so the colour picker always opens on the current object's colour.
   useEffect(() => {
@@ -324,6 +360,10 @@ export function PalettePopoverWindow({
       perfHook(() => perfProbe?.surfaceShown(perfShownRef.current, "no-op"));
       perfShownRef.current = undefined;
     }
+    if (!ready && content.openedAt !== undefined && contentRef.current === content && !dismissedRef.current) {
+      dismissedRef.current = true;
+      hidePopoverWindow();
+    }
     if (!ready || (prewarm && !contentPushedRef.current)) {
       return;
     }
@@ -358,7 +398,7 @@ export function PalettePopoverWindow({
       if (anchor) {
         await setCurrentWindowLogicalPosition(anchor).catch(() => undefined);
       }
-      if (cancelled || dismissedRef.current) {
+      if (cancelled || dismissedRef.current || contentRef.current !== content) {
         perfHook(() => perfProbe?.surfaceShown(perfShown, "no-op"));
         return;
       }
@@ -369,13 +409,22 @@ export function PalettePopoverWindow({
           (platform === "windows" || !(content.flyout.variant === "bondStereo" && content.flyout.keyboardOpen));
         keepWindowFocusRef.current = platform !== "windows" && toolsetId === "core.bondStereo" && content.kind === "flyout" &&
           content.flyout.variant === "bondStereo" && !!content.flyout.keyboardOpen;
-        await showCurrentToolsetPopoverWindow(preserveFocus ? "preserve" : "focus", content.kind);
+        const focusMode = preserveFocus ? "preserve" : "focus";
+        const flyoutOpening = flyoutCommandOpening(toolsetId, content);
+        const shown = await (flyoutOpening ? showCurrentToolsetPopoverWindow(focusMode, content.kind, flyoutOpening)
+          : showCurrentToolsetPopoverWindow(focusMode, content.kind));
+        if (!shown) throw new Error("Native toolset popover remained hidden");
         resetScroll("reveal");
-        if (cancelled || dismissedRef.current) {
+        if (cancelled || dismissedRef.current || contentRef.current !== content) {
           // An older reveal may complete after a fresh open. Only hide the content
           // this chain belongs to; the new session owns the reused window now.
           if (contentRef.current === content) hidePopoverWindow();
           return;
+        }
+        shownContentRef.current = content;
+        const opening = currentFlyoutOpening(openingsRef.current, toolsetId);
+        if (opening && matchesToolsetPopoverOpening(opening, content)) {
+          void notifyToolsetPopoverContentAccepted(opening).catch(() => undefined);
         }
         if (platform !== "windows" && content.kind === "flyout" && content.flyout.variant === "bondStereo" && content.flyout.keyboardOpen && !cancelled && !dismissedRef.current) {
           const [{ getCurrentWindow }, { getCurrentWebview }] = await Promise.all([
@@ -406,6 +455,7 @@ export function PalettePopoverWindow({
     })();
     return () => {
       cancelled = true;
+      if (shownContentRef.current === content) shownContentRef.current = undefined;
       keepWindowFocusRef.current = false;
       perfHook(() => perfProbe?.surfaceShown(perfShown, "no-op"));
       window.clearTimeout(scrubTimer);
@@ -426,7 +476,7 @@ export function PalettePopoverWindow({
       }
       resetScroll();
       void showCurrentToolsetPopoverWindow(contentRef.current.kind === "flyout" ? "preserve" : "focus",
-        contentRef.current.kind).then(() => resetScroll("reveal")).catch(() => undefined);
+        contentRef.current.kind).then(shown => { if (shown) resetScroll("reveal"); }).catch(() => undefined);
     }, 600);
     return () => window.clearTimeout(fallback);
   }, [prewarm, toolsetId]);
@@ -472,21 +522,10 @@ export function PalettePopoverWindow({
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     void listenForToolsetPopoverDismiss(payload => {
-      if (payload?.openings) {
-        const target = payload.openings.find(opening => opening.toolsetId === toolsetId);
-        if (!target) return;
-        if (!closedOpening.current || compareToolsetPopoverOpenings(target, closedOpening.current) > 0) {
-          closedOpening.current = target;
-        }
-        if (compareToolsetPopoverOpenings(target, contentRef.current) < 0) return;
-      }
-      // Remember even an out-of-order broadcast for content still in transit.
-      // Only presses before the originating open are stale, not presses before
-      // the content arrived in this webview.
-      if (payload?.requestedAt !== undefined && !payload.openings) {
-        latestDismissAt.current = Math.max(latestDismissAt.current, payload.requestedAt);
-        if (payload.requestedAt < contentOpenedAt.current) return;
-      }
+      if (payload?.openings && !payload.openings.some(opening => opening.toolsetId === toolsetId)) return;
+      const wasOpen = currentFlyoutOpening(openingsRef.current, toolsetId);
+      openingsRef.current = dismissFlyoutOpenings(openingsRef.current, payload);
+      if (currentFlyoutOpening(openingsRef.current, toolsetId) || (!wasOpen && contentPushedRef.current)) return;
       const cancelPreview = payload?.reason === "escape" && contentPushedRef.current && !dismissedRef.current;
       dismissedRef.current = true;
       notifyBondStereoClose();
@@ -500,7 +539,7 @@ export function PalettePopoverWindow({
       })
       .catch(() => undefined);
     return () => unlisten?.();
-  }, []);
+  }, [toolsetId]);
 
   // Both refuse once the popover is dismissed: hiding it blurs whichever field had focus, and a blur
   // that settles a half-typed value would otherwise apply a colour the user just walked away from.
@@ -529,17 +568,31 @@ export function PalettePopoverWindow({
     void sendPaletteCommandCommit(objectCustomColorCommandId(normalized)).catch(() => undefined);
   };
 
-  const chooseFlyoutCommand = (command: ToolsetFlyoutCommandSnapshot) => {
-    if (!command.enabled || dismissedRef.current) {
-      return;
-    }
-    dismissedRef.current = true;
+  const chooseFlyoutCommand = async (command: ToolsetFlyoutCommandSnapshot) => {
     const current = contentRef.current;
-    if (current.kind === "flyout" && current.flyout.variant === "bondStereo" && current.flyout.id) {
-      const action = command.id === "keep" ? "keep" : command.id === "molecule.bondStereo:flipped" ? "flipped" : "geometry";
-      void sendBondStereoPopoverAction({ sessionId: current.flyout.id, action }).catch(() => undefined);
-    } else void sendPaletteCommand(command.id).catch(() => undefined);
-    hidePopoverWindow();
+    const canChoose = () => !dismissedRef.current && contentRef.current === current && shownContentRef.current === current;
+    if (!command.enabled || current.kind !== "flyout" || pendingChoiceRef.current === current || !canChoose()) return;
+    const opening = flyoutCommandOpening(toolsetId, current);
+    if (!opening) return;
+
+    // The OS can hide this window after the owner forwards a key, without a close event.
+    pendingChoiceRef.current = current;
+    const visible = await isToolsetPopoverVisible(toolsetId).catch(() => false);
+    if (pendingChoiceRef.current === current) pendingChoiceRef.current = undefined;
+    if (!visible || !canChoose()) return;
+
+    dismissedRef.current = true;
+    // Native dispatch must check the sending window before this choice hides it.
+    try {
+      if (current.flyout.variant === "bondStereo") {
+        const action = command.id === "keep" ? "keep" : command.id === "molecule.bondStereo:flipped" ? "flipped" : "geometry";
+        if (current.flyout.id) await sendBondStereoPopoverAction({ sessionId: current.flyout.id, action }, opening);
+      } else await sendPaletteCommand(command.id, { flyoutOpening: opening });
+    } catch {
+      // A failed dispatch still dismisses the chosen opening.
+    } finally {
+      if (contentRef.current === current) hidePopoverWindow();
+    }
   };
 
   useEffect(() => {
@@ -547,13 +600,13 @@ export function PalettePopoverWindow({
     let unlisten: (() => void) | undefined;
     void listenForToolsetFlyoutKeys(payload => {
       const current = contentRef.current;
-      if (disposed || dismissedRef.current || current.kind !== "flyout" ||
+      if (disposed || dismissedRef.current || shownContentRef.current !== current || current.kind !== "flyout" ||
           payload.toolsetId !== toolsetId || payload.flyoutId !== current.flyout.flyoutId ||
-          payload.openedAt !== contentOpenedAt.current) return;
+          !matchesToolsetPopoverOpening(payload, current)) return;
       const bondStereo = current.flyout.variant === "bondStereo";
       if (bondStereo && (platform !== "windows" || payload.sessionId !== current.flyout.id)) return;
       const commands = current.flyout.commands.filter(command => command.enabled);
-      if (bondStereo) commands.push({ id: "keep", title: "Keep unspecified", enabled: true, active: false });
+      if (bondStereo) commands.push(keepBondStereoCommand);
       // Match the inline flyout: both axes navigate, including multi-column ring
       // grids. The owning palette's orientation does not determine its menu's axis.
       const backward = payload.key === "ArrowLeft" || payload.key === "ArrowUp" || (payload.key === "Tab" && payload.shiftKey);
@@ -564,9 +617,7 @@ export function PalettePopoverWindow({
         highlightedCommandRef.current = commands[next]?.id;
         setHighlightedCommandId(highlightedCommandRef.current);
       } else if ((payload.key === "Enter" || payload.key === " ") && index >= 0) {
-        // Use the same disabled/dismissed guard and command channel as a mouse pick.
-        // Dismissal is synchronous, so queued repeats cannot invoke a second time.
-        chooseFlyoutCommand(commands[index]!);
+        void chooseFlyoutCommand(commands[index]!);
       }
     }).then(stop => { if (disposed) stop(); else unlisten = stop; }).catch(() => undefined);
     return () => { disposed = true; unlisten?.(); };
@@ -589,13 +640,9 @@ export function PalettePopoverWindow({
           <p>This double bond's geometry wasn't given, so ChemDraft shows it as either E or Z.</p>
           {content.flyout.commands.map(command => <button key={command.id} type="button" disabled={!command.enabled}
             data-keyboard-highlighted={command.enabled && command.id === highlightedCommandId || undefined}
-            title={command.disabledReason} data-command-id={command.id} onClick={() => chooseFlyoutCommand(command)}>{command.title}</button>)}
-          <button type="button" data-keyboard-highlighted={highlightedCommandId === "keep" || undefined} onClick={() => {
-            if (dismissedRef.current) return;
-            dismissedRef.current = true;
-            if (content.flyout.id) void sendBondStereoPopoverAction({ sessionId: content.flyout.id, action: "keep" }).catch(() => undefined);
-            hidePopoverWindow();
-          }}>Keep unspecified</button>
+            title={command.disabledReason} data-command-id={command.id} onClick={() => void chooseFlyoutCommand(command)}>{command.title}</button>)}
+          <button type="button" data-keyboard-highlighted={highlightedCommandId === "keep" || undefined}
+            onClick={() => void chooseFlyoutCommand(keepBondStereoCommand)}>{keepBondStereoCommand.title}</button>
         </div>
       ) : content.kind === "flyout" && content.flyout.variant === "distribute" ? (
         // Plain-text radio choice (Centers / Equal gaps) — icon-less, so it must NOT use the
@@ -616,7 +663,7 @@ export function PalettePopoverWindow({
               aria-checked={command.active}
               data-keyboard-highlighted={command.enabled && command.id === highlightedCommandId || undefined}
               data-command-id={command.id}
-              onClick={() => chooseFlyoutCommand(command)}
+              onClick={() => void chooseFlyoutCommand(command)}
             >
               {command.title}
             </button>
@@ -644,7 +691,7 @@ export function PalettePopoverWindow({
               className={command.active ? "active" : undefined}
               aria-pressed={command.active || undefined}
               title={command.enabled ? command.title : `${command.title}: ${command.disabledReason ?? "unavailable"}`}
-              onClick={() => chooseFlyoutCommand(command)}
+              onClick={() => void chooseFlyoutCommand(command)}
             >
               {(() => {
                 const symbolGlyph = symbolToolGlyph(command.id);

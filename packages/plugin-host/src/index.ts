@@ -3,8 +3,8 @@ import { sameDocumentValue } from "./documentValue";
 // into this package's dist so no `@chemdraft/chem-core` dependency ships (ADR-0031). `ChemDraftDocument`,
 // however, is taken from `@chemdraft/plugin-api` so a consumer using both SDK packages sees ONE canonical
 // document type — not a second, structurally-identical copy inlined here.
-import type { ApplyPatchOptions, DocumentObject, DocumentPatch, DocumentPage } from "@chemdraft/chem-core";
-import { applyPatch, pruneReactionObjectReferences } from "@chemdraft/chem-core";
+import type { ApplyPatchOptions, DocumentObject, DocumentPatch, DocumentPage, OrphanedRepeatUnit } from "@chemdraft/chem-core";
+import { applyPatch, planOrphanedRepeatUnitCleanup, pruneReactionObjectReferences, removeOrphanedRepeatUnitBrackets, sameBracketIdentity } from "@chemdraft/chem-core";
 import {
   commitRequestPatch, containsBounds, pageContainsBounds, RequestWriteError, type BoundRequestWrite, type RequestDocument, type RequestHistory,
   type RequestWriteCommit, type RequestObjectRef, type RequestViewport, type RequestPageSpaceProvider
@@ -102,7 +102,7 @@ export function assertPluginPatchWriteScope(
     }
   }
   // Inspect one atomic draft, without normalizing partial pairs or forward references between ops.
-  const validated = applyPatch(document, preflight.patch, { beforeObjectWrite, beforeRemoveObjects: (draft, objectIds) => {
+  const validated = applyPatch(document, preflight.patch, { beforeObjectWrite, preserveRepeatUnitBrackets: true, deferGroupCleanup: true, beforeRemoveObjects: (draft, objectIds) => {
     const removed = new Set(objectIds);
     for (const page of draft.pages) {
       for (const object of page.objects) {
@@ -162,6 +162,50 @@ export function assertPluginPatchWriteScope(
   }
   assertPluginPageWriteScope(document, validated, scope);
   return validated;
+}
+
+export interface ScopedRepeatUnitCleanup {
+  readonly commandStartDocument: ChemDraftDocument;
+  authoredRemovals: ReadonlyMap<string, ReadonlySet<string>>;
+}
+
+export function beginScopedRepeatUnitCleanup(document: ChemDraftDocument | undefined): ScopedRepeatUnitCleanup | undefined {
+  return document && { commandStartDocument: document, authoredRemovals: new Map() };
+}
+
+/** Prepare only after scope accepts the authored document. Record deletions once history commits,
+ * so a later write can orphan a populated unit by deleting its last temporary member. */
+export function finishScopedRepeatUnitCleanup(cleanup: ScopedRepeatUnitCleanup | undefined,
+  before: ChemDraftDocument, authored: ChemDraftDocument, patch: DocumentPatch) {
+  const removed = new Set(writePatchOps(patch).flatMap(op => op.op === "removeObject" ? [op.objectId] : []));
+  if (!removed.size) return undefined;
+  const authoredRemovals = new Map(cleanup?.authoredRemovals);
+  const currentRemovals = new Map<string, Set<string>>();
+  for (const page of before.pages) {
+    const next = authored.pages.find(candidate => candidate.id === page.id);
+    if (!next) continue;
+    const surviving = new Set(next.objects.map(object => object.id));
+    const ids = page.objects.flatMap(object => removed.has(object.id) && !surviving.has(object.id) ? [object.id] : []);
+    if (!ids.length) continue;
+    currentRemovals.set(page.id, new Set(ids));
+    authoredRemovals.set(page.id, new Set([...(authoredRemovals.get(page.id) ?? []), ...ids]));
+  }
+  if (!currentRemovals.size) return undefined;
+  const deletedMember = (unit: OrphanedRepeatUnit, deletions: ReadonlyMap<string, ReadonlySet<string>>) =>
+    [...unit.deletedMoleculeIds].some(id => deletions.get(unit.pageId)?.has(id));
+  const options = { wholeMoleculesOnly: true };
+  let liveOrphans: OrphanedRepeatUnit[] | undefined;
+  const orphaned = cleanup ? planOrphanedRepeatUnitCleanup(cleanup.commandStartDocument, authored, options).filter(unit => {
+    if (deletedMember(unit, currentRemovals)) return true;
+    if (!deletedMember(unit, cleanup.authoredRemovals)) return false;
+    liveOrphans ??= planOrphanedRepeatUnitCleanup(before, authored, options).filter(candidate => deletedMember(candidate, currentRemovals));
+    return liveOrphans.some(candidate => candidate.pageId === unit.pageId &&
+      unit.bracketIds.every(id => candidate.bracketIds.includes(id)));
+  }) : [];
+  return {
+    document: removeOrphanedRepeatUnitBrackets(authored, orphaned, currentRemovals),
+    record: () => { if (cleanup) cleanup.authoredRemovals = authoredRemovals; }
+  };
 }
 
 /** Last check at the history boundary, AFTER all normalization and placement. Only rebased patch
@@ -245,12 +289,24 @@ export function chemistryPropertiesInputError(
   request: unknown,
   error: Extract<ReturnType<typeof PluginChemistryPropertiesRequestSchema.safeParse>, { success: false }>['error']
 ): string {
-  const issue = error.issues.find(item => item.code === "too_big" && item.path[0] === "structure");
-  if (issue?.code === "too_big" && typeof request === "object" && request !== null &&
-    "structure" in request && typeof request.structure === "string") {
-    return `The structure is too long: ${request.structure.length} characters; the limit is ${issue.maximum}.`;
+  return chemistryInputError(request, error.issues[0]);
+}
+
+function chemistryInputError(request: unknown, issue: Extract<ReturnType<typeof PluginChemistryPropertiesRequestSchema.safeParse>, { success: false }>['error']['issues'][number]): string {
+  const field = [...issue.path].reverse().find(part => typeof part === "string");
+  const name = typeof field === "string" && /^[A-Za-z][A-Za-z0-9]*$/.test(field) ? field : "input";
+  let value: unknown = request;
+  for (const part of issue.path) {
+    if (value === null || typeof value !== "object") { value = undefined; break; }
+    value = (value as Record<string | number, unknown>)[part];
   }
-  return `Invalid chemistry properties input: ${error.issues.map(item => item.message).join("; ")}`;
+  if (issue.code === "too_big") {
+    if (issue.type === "string" && typeof value === "string") return `The ${name} is ${value.length} characters, over the ${issue.maximum} limit.`;
+    if (issue.type === "array" && Array.isArray(value)) return `The ${name} has ${value.length} entries, over the ${issue.maximum} limit.`;
+  }
+  if ((name === "structure" || name === "smiles") && typeof value === "string" && !value.trim() &&
+    (issue.code === "too_small" || issue.code === "custom")) return `The ${name} must not be empty.`;
+  return `The ${name} is invalid.`;
 }
 import type {
   AppliedPatchReceipt,
@@ -513,6 +569,8 @@ export interface PluginPatchApplicationRequest {
   undoLabel: string;
   /** Host-only scope before this patch's insertions. Recheck after any wait with assertPluginPatchWriteScope. */
   writeScopeObjectIds: readonly string[];
+  /** Host-only membership snapshot and accepted removals for post-authorization cleanup. */
+  repeatUnitCleanup?: ScopedRepeatUnitCleanup;
   /** Host-only command lifetime. Stable across writes; aborted on end, unregister, or tool cancellation.
    * The embedding host must recheck before committing a deferred write. */
   signal?: AbortSignal;
@@ -659,6 +717,8 @@ export interface PluginHostOptions {
   assistant?: PluginHostAssistant;
   commandRegistry?: CommandRegistry;
   getActiveDocument?: () => ChemDraftDocument | undefined | Promise<ChemDraftDocument | undefined>;
+  /** The proposal's target document at enqueue time, including when its tab is now in the background. */
+  getProposalDocument?: () => ChemDraftDocument | undefined;
   /**
    * Identifies the document the user is working in — stable across edits and undo, different after
    * File > New/Open or switching to another document. Read once when a plugin command starts and again
@@ -781,6 +841,7 @@ export class PluginHost {
   private readonly requestPageSpace?: RequestPageSpaceProvider;
   private readonly getRequestSelection?: PluginHostOptions["getRequestSelection"];
   private readonly getActiveDocument?: PluginHostOptions["getActiveDocument"];
+  private readonly getProposalDocument?: PluginHostOptions["getProposalDocument"];
   private readonly getActiveDocumentKey?: PluginHostOptions["getActiveDocumentKey"];
   private readonly getSelectionSnapshot?: PluginHostOptions["getSelection"];
   private readonly createStorage?: PluginHostOptions["createStorage"];
@@ -826,10 +887,13 @@ export class PluginHost {
    *  reads it here before accepting (AGENTS.md §8: the source stays available). Image files the user
    *  chose are not kept: they are still on disk. Never exposed to plugins. */
   private readonly recognitionSources = new Map<string, PluginProvidedImage>();
+  /** Keep actual bracket objects off cloned proposal snapshots and out of plugin receipts. */
+  private readonly proposalOrphans = new Map<string, readonly OrphanedRepeatUnit[]>();
 
   constructor(options: PluginHostOptions = {}) {
     this.commands = options.commandRegistry ?? new CommandRegistry();
     this.getActiveDocument = options.getActiveDocument;
+    this.getProposalDocument = options.getProposalDocument;
     this.getActiveDocumentKey = options.getActiveDocumentKey;
     this.getSelectionSnapshot = options.getSelection;
     this.toolSessions = options.toolSessions;
@@ -1054,7 +1118,8 @@ export class PluginHost {
   /** Trusted session-controller entry: the caller validates session ownership and tool definitions.
    * Reuse command permissions/scope; report validated direct-write receipts to the owning request. */
   async invokeAssistantTool(pluginId: string, call: PluginAssistantToolCall, signal: AbortSignal,
-    writeSelection: readonly string[], onAppliedPatch?: (receipt: AppliedPatchReceipt) => void): Promise<PluginAssistantToolResult> {
+    writeSelection: readonly string[], onAppliedPatch?: (receipt: AppliedPatchReceipt) => void,
+    repeatUnitCleanup?: ScopedRepeatUnitCleanup): Promise<PluginAssistantToolResult> {
     for (const permission of AssistantCapabilityPermissions) this.requirePermission(pluginId, permission);
     signal.throwIfAborted();
     const handler = this.toolAndDocumentHandlers.get(pluginId)?.onAssistantToolCall;
@@ -1063,7 +1128,7 @@ export class PluginHost {
     this.activeCommandInvocations.set(token, {
       pluginId, commandId: call.name, commandTitle: call.name, documentKey: this.getActiveDocumentKey?.(),
       writeScope: new Set(writeSelection), recognized: false, recognizedImages: [],
-      writeStop: new AbortController(), onAppliedPatch, tool: true
+      writeStop: new AbortController(), onAppliedPatch, repeatUnitCleanup, tool: true
     });
     const cancel = () => this.finishCommandInvocation(token);
     signal.addEventListener("abort", cancel, { once: true });
@@ -1589,18 +1654,24 @@ export class PluginHost {
             return PluginChemistryPropertiesResultSchema.parse(await this.computeProperties(parsed.data));
           },
           embed3d: request => this.runChemistry3d(pluginId, invocationToken, "embed3d", () => {
-            const parsed = PluginEmbed3DRequestSchema.parse(request);
+            const result = PluginEmbed3DRequestSchema.safeParse(request);
+            if (!result.success) throw new PluginHostError(chemistryInputError(request, result.error.issues[0]));
+            const parsed = result.data;
             if (!this.chemistry3d.embed3d) throw new PluginHostError("This host provides no 3D embedding engine.");
             return { timeoutMs: chemistry3dTimeoutMs("embed3d", parsed.components.length),
               run: signal => this.chemistry3d.embed3d!(parsed, signal) };
           }),
           minimize3d: request => this.runChemistry3d(pluginId, invocationToken, "minimize3d", () => {
-            const parsed = PluginMinimize3DRequestSchema.parse(request);
+            const result = PluginMinimize3DRequestSchema.safeParse(request);
+            if (!result.success) throw new PluginHostError(chemistryInputError(request, result.error.issues[0]));
+            const parsed = result.data;
             if (!this.chemistry3d.minimize3d) throw new PluginHostError("This host provides no 3D minimization engine.");
             return { timeoutMs: chemistry3dTimeoutMs("minimize3d"), run: signal => this.chemistry3d.minimize3d!(parsed, signal) };
           }),
           flatten3d: request => this.runChemistry3d(pluginId, invocationToken, "flatten3d", () => {
-            const parsed = PluginFlatten3DRequestSchema.parse(request);
+            const result = PluginFlatten3DRequestSchema.safeParse(request);
+            if (!result.success) throw new PluginHostError(chemistryInputError(request, result.error.issues[0]));
+            const parsed = result.data;
             if (!this.chemistry3d.flatten3d) throw new PluginHostError("This host provides no 3D flattening engine.");
             return { timeoutMs: chemistry3dTimeoutMs("flatten3d"), run: signal => this.chemistry3d.flatten3d!(parsed, signal) };
           }),
@@ -1803,11 +1874,37 @@ export class PluginHost {
     // Snapshot BEFORE enqueueing: if a proposal cannot be cloned/frozen at all, it must never reach
     // the queue, or the tray's next render throws on an entry the user has no way to dismiss.
     const snapshot = snapshotProposal(queued);
+    const orphaned = this.captureProposalOrphans(parsedProposal);
+    if (orphaned) this.proposalOrphans.set(queued.id, orphaned);
     const screenSource = this.screenCaptureSourceFor(invocationToken, pluginProposal, heldRef);
     if (screenSource) this.recognitionSources.set(queued.id, screenSource);
     this.proposedPatches.set(queued.id, queued);
     this.onProposedPatchesChanged?.();
     return { snapshot, hostHeld };
+  }
+
+  private captureProposalOrphans(proposal: NormalizedProposedDocumentPatch): OrphanedRepeatUnit[] | undefined {
+    try {
+      if (!writePatchOps(proposal.patch).some(op => op.op === "removeObject" || op.op === "removeAnnotation" ||
+        (op.op === "updateObject" && "atoms" in op.changes))) return undefined;
+      const document = this.getProposalDocument ? this.getProposalDocument() : this.getActiveDocument?.();
+      if (!document) return [];
+      if ("then" in document) {
+        // Enqueue is synchronous. A host with an async active document can provide getProposalDocument.
+        void document.catch(() => undefined);
+        return [];
+      }
+      const orphaned: OrphanedRepeatUnit[] = [];
+      const { patch } = rebasePluginPatch(document, proposal, true);
+      applyPatch(document, patch, { allowOrphanedRepeatUnitRemoval: unit => {
+        orphaned.push(unit);
+        return false;
+      } });
+      return orphaned;
+    } catch {
+      // Acceptance still reports patch failures and can be retried after the user edits the drawing.
+      return [];
+    }
   }
 
   /** Host-only entry point; plugins receive a closure bound to their own invocation. */
@@ -2036,6 +2133,7 @@ export class PluginHost {
       command: { id: invocation.commandId, title: invocation.commandTitle },
       patch: parsedPatch,
       writeScopeObjectIds: [...(requestScope?.objectIds ?? invocation.writeScope)],
+      repeatUnitCleanup: requestScope ? undefined : invocation.repeatUnitCleanup,
       undoLabel: undoLabel ?? `${plugin.name}: ${invocation.commandTitle}`,
       signal
     });
@@ -2066,6 +2164,22 @@ export class PluginHost {
       .map(snapshotProposal);
   }
 
+  /** Prepare acceptance while the proposal stays pending, for example while asking about page fit. */
+  previewProposedPatch(
+    proposalId: string,
+    document: ChemDraftDocument,
+    options: AcceptProposedPatchOptions = {}
+  ): ChemDraftDocument {
+    const queued = this.requirePendingProposal(proposalId);
+    const { apply, ...applyOptions } = options;
+    const baseline = this.proposalOrphans.get(proposalId);
+    if (baseline) {
+      applyOptions.allowOrphanedRepeatUnitRemoval = unit => baseline.some(original => original.pageId === unit.pageId &&
+        unit.brackets.every(bracket => original.brackets.some(candidate => sameBracketIdentity(candidate, bracket))));
+    }
+    return apply ? apply(document, queued.proposal, applyOptions) : applyPatch(document, queued.proposal.patch, applyOptions);
+  }
+
   /**
    * The USER accepted a queued proposal. This is the review step a recognition proposal exists for, so
    * none of `documents.applyPatch`'s refusals apply here: not the recognition rule (the review is what
@@ -2080,10 +2194,7 @@ export class PluginHost {
     options: AcceptProposedPatchOptions = {}
   ): ChemDraftDocument {
     const queued = this.requirePendingProposal(proposalId);
-    const { apply, ...applyOptions } = options;
-    const updated = apply
-      ? apply(document, queued.proposal, applyOptions)
-      : applyPatch(document, queued.proposal.patch, applyOptions);
+    const updated = this.previewProposedPatch(proposalId, document, options);
 
     queued.status = "accepted";
     queued.resolvedAt = this.timestamp();
@@ -2091,6 +2202,7 @@ export class PluginHost {
     // data URI (up to ~35 MB), and nothing reads a resolved entry back.
     this.proposedPatches.delete(proposalId);
     this.recognitionSources.delete(proposalId);
+    this.proposalOrphans.delete(proposalId);
     this.onProposedPatchesChanged?.();
     return updated;
   }
@@ -2102,6 +2214,7 @@ export class PluginHost {
     const snapshot = snapshotProposal(queued);
     this.proposedPatches.delete(proposalId);
     this.recognitionSources.delete(proposalId);
+    this.proposalOrphans.delete(proposalId);
     this.onProposedPatchesChanged?.();
     return snapshot;
   }
@@ -2164,14 +2277,12 @@ export class PluginHost {
             const requestDocument = supportsPluginRequestTools(manifest.apiVersion) ? this.captureRequestDocument?.() : undefined;
             const sendDocument = requestDocument?.read();
             const sendSelection = captureRequestSelection(sendDocument, invocationContext.writeSelection?.objectIds);
-            // Snapshot ids only: the plugin-visible selection provider may build molfiles and
-            // collect warnings, so it must run only when the plugin explicitly reads selection.
-            const document = invocationContext.writeSelection ? undefined : sendDocument ?? this.getActiveDocument?.();
-            const selectedIds = invocationContext.writeSelection
-              ? [...invocationContext.writeSelection.objectIds]
-              : document && "then" in document
-                ? [...((await document)?.selection.objectIds ?? [])]
-                : [...(document?.selection.objectIds ?? [])];
+            // Read selection ids and the cleanup baseline from the same snapshot. The plugin-visible
+            // selection provider may build molfiles, so only use it when the plugin reads selection.
+            const overrideIds = invocationContext.writeSelection?.objectIds.slice();
+            const readDocument = sendDocument ?? this.getActiveDocument?.();
+            const document = readDocument && "then" in readDocument ? await readDocument : readDocument;
+            const selectedIds = overrideIds ?? document?.selection.objectIds ?? [];
             const ordinaryStop = new AbortController();
             this.activeCommandInvocations.set(invocationToken, {
               pluginId: manifest.id,
@@ -2182,6 +2293,7 @@ export class PluginHost {
               sendSelection,
               ordinaryStop,
               writeScope: new Set(selectedIds),
+              repeatUnitCleanup: beginScopedRepeatUnitCleanup(document),
               recognized: false,
               writeStop: new AbortController(),
               recognizedImages: []
@@ -2692,6 +2804,7 @@ interface ActiveCommandInvocation {
   ordinaryStop?: AbortController;
   onAppliedPatch?: (receipt: AppliedPatchReceipt) => void;
   writeScope: Set<string>;
+  repeatUnitCleanup?: ScopedRepeatUnitCleanup;
   pluginId: string;
   commandId: string;
   commandTitle: string;

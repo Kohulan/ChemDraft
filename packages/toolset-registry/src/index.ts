@@ -463,6 +463,7 @@ export function normalizeToolsetItem<TIcon extends string = string, TAssetName e
     : { type: "none" });
   const id = item.id
     ?? item.commandId
+    ?? (primary.type === "command" ? primary.commandId : undefined)
     ?? (primary.type === "control" ? primary.controlId : undefined)
     // A separator has no command/control id, so synthesize a stable one from its position. Never
     // require context.groupId here — a schema-valid separator in an id-less group must not crash.
@@ -678,15 +679,14 @@ function pruneUnknownOverrideCommands(
   warn: (warning: string) => void,
   toolsetItemIds: ReadonlySet<string> = new Set()
 ): UserToolsetOverride {
-  // Prune additions first, by their OWN primary command id(s): a spacer has none so it always
-  // survives (same mechanism that keeps user-toolset separators), while a command addition whose
-  // command came from a removed plugin is dropped.
+  // Prune additions with unregistered command IDs, including flyout commands. Commandless items
+  // survive, and an unavailable addition can reappear when its commands and group return.
   const itemAdditions = override.itemAdditions?.filter((addition) => {
-    const unknownPrimaryIds = toolsetItemPrimaryCommandIds(addition.item as ToolsetItemDefinition).filter(
+    const unknownIds = toolsetItemCommandIds(addition.item as ToolsetItemDefinition).filter(
       (commandId) => !registeredCommandIds.has(commandId)
     );
-    if (unknownPrimaryIds.length > 0) {
-      unknownPrimaryIds.forEach((commandId) => {
+    if (unknownIds.length > 0) {
+      unknownIds.forEach((commandId) => {
         warn(`Toolbar customization for "${override.toolsetId}" dropped addition with unknown command "${commandId}".`);
       });
       return false;
@@ -813,12 +813,9 @@ export function mergeToolsetItemAdditions<TIcon extends string = string, TAssetN
   return merged;
 }
 
-function applyUserToolsetOverride<TIcon extends string, TAssetName extends string>(
-  toolset: ToolsetDefinition<TIcon, TAssetName>,
-  override: UserToolsetOverride
-): ToolsetDefinition<TIcon, TAssetName> {
-  const hiddenCommandIds = new Set(override.hiddenCommandIds ?? []);
-  const itemOverrides = new Map((override.itemOverrides ?? []).map((itemOverride) => [itemOverride.commandId, itemOverride]));
+export function hiddenToolsetItemIds(override: UserToolsetOverride | undefined): Set<string> {
+  const hiddenCommandIds = new Set(override?.hiddenCommandIds ?? []);
+  const itemOverrides = new Map((override?.itemOverrides ?? []).map((itemOverride) => [itemOverride.commandId, itemOverride]));
   itemOverrides.forEach((itemOverride, commandId) => {
     if (itemOverride.hidden === true) {
       hiddenCommandIds.add(commandId);
@@ -827,6 +824,15 @@ function applyUserToolsetOverride<TIcon extends string, TAssetName extends strin
       hiddenCommandIds.delete(commandId);
     }
   });
+  return hiddenCommandIds;
+}
+
+function applyUserToolsetOverride<TIcon extends string, TAssetName extends string>(
+  toolset: ToolsetDefinition<TIcon, TAssetName>,
+  override: UserToolsetOverride
+): ToolsetDefinition<TIcon, TAssetName> {
+  const hiddenCommandIds = hiddenToolsetItemIds(override);
+  const itemOverrides = new Map((override.itemOverrides ?? []).map((itemOverride) => [itemOverride.commandId, itemOverride]));
 
   // Insert add-only item additions BEFORE reorder/hide runs, so itemOrder can address an added id and
   // a group that is otherwise all-hidden but holds an addition survives the empty-group filter below.
@@ -835,7 +841,8 @@ function applyUserToolsetOverride<TIcon extends string, TAssetName extends strin
     override.itemAdditions as readonly ToolsetItemAddition<TIcon, TAssetName>[] | undefined
   );
   const groups = reorderById(groupsWithAdditions, override.groupOrder ?? [], (group) => group.id).map((group) => {
-    const orderedItems = reorderById(group.items, group.id ? (override.itemOrder?.[group.id] ?? []) : [], toolsetItemCustomizationId)
+    const order = group.id ? override.itemOrder?.[group.id] : undefined;
+    const orderedItems = reorderById(group.items, order ?? [], toolsetItemCustomizationId)
       .filter((item) => {
         const commandId = toolsetItemCustomizationId(item);
         return commandId === undefined || !hiddenCommandIds.has(commandId);
@@ -927,34 +934,13 @@ function commandIdSetFromOptions<TIcon extends string, TAssetName extends string
 ): ReadonlySet<string> {
   const base = options.registeredCommandIds
     ? new Set(options.registeredCommandIds)
-    : new Set(toolsets.flatMap(toolsetOverrideTargetIds));
+    : new Set(toolsets.flatMap(toolsetCommandIds));
   if (options.additionalCommandIds) {
     for (const id of options.additionalCommandIds) {
       base.add(id);
     }
   }
   return base;
-}
-
-/** Ids an override may legitimately target: command ids PLUS `control` (widget) ids, since widgets
- *  are customizable (hide/reorder) by their controlId. Kept separate from {@link toolsetCommandIds}
- *  so the public `commandIds()` surface stays commands-only. */
-function toolsetOverrideTargetIds<TIcon extends string, TAssetName extends string>(
-  toolset: ToolsetDefinition<TIcon, TAssetName>
-): string[] {
-  return toolset.groups.flatMap((group) =>
-    group.items.flatMap((item) => {
-      const ids = toolsetItemCommandIds(item);
-      // Only expose the control id when it IS the item's customization key — i.e. no commandId wins
-      // over it (toolsetItemCustomizationId returns commandId first). Otherwise an override could
-      // "validate" against a control id that applyUserToolsetOverride can never match, silently
-      // dropping the edit.
-      if (item.primary?.type === "control" && item.commandId === undefined) {
-        ids.push(item.primary.controlId);
-      }
-      return ids;
-    })
-  );
 }
 
 function assertUniqueUserToolsets<TIcon extends string, TAssetName extends string>(
@@ -991,7 +977,7 @@ function assertOverrideCommandsRegistered(
   // lists below, alongside the registered commands.
   const allowed = new Set([...registeredCommandIds, ...toolsetItemIds]);
   override.itemAdditions?.forEach((addition) => {
-    toolsetItemPrimaryCommandIds(addition.item as ToolsetItemDefinition).forEach((commandId) =>
+    toolsetItemCommandIds(addition.item as ToolsetItemDefinition).forEach((commandId) =>
       assertCommandRegistered(commandId, registeredCommandIds)
     );
     const id = toolsetItemCustomizationId(addition.item as ToolsetItemDefinition);

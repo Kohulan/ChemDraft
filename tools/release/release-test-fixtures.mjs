@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { artifactDigest, LINUX_BUILD_TARGET } from "./record-build.mjs";
 import { releaseBuildFiles } from "./release-assets.mjs";
+import { writeReleaseChecksums } from "./release-checksums.mjs";
 
 export const version = "1.2.3";
 export const commit = "a".repeat(40);
@@ -46,6 +47,7 @@ export function releaseFixture(t, { withLinux = true } = {}) {
   writeFileSync(join(assets, "latest.json"), JSON.stringify({
     version, platforms: { [windowsPlatformKey]: { url: installerUrl, signature } }
   }));
+  writeReleaseChecksums(assets);
   return { rootDir, assets, version };
 }
 

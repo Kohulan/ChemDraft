@@ -2,11 +2,12 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AssistantCapabilityPermissions } from "@chemdraft/plugin-api";
-import { applyPatch, createEmptyDocument, DocumentObjectSchema } from "@chemdraft/chem-core";
+import { applyPatch, applyPatches, createEmptyDocument, DocumentObjectSchema } from "@chemdraft/chem-core";
 import { createSmilesMolecule, normalizeNativeMoleculeGeometry, resolveStructureTemplateName } from "@chemdraft/document-workflow-core";
 import { depictSmiles2D } from "@chemdraft/ocl-adapter";
+import { AssistantCapabilityPermissions } from "@chemdraft/plugin-api";
 import { MainWindow } from "./MainWindow";
+import { toggleBracketRepeatUnit } from "./bracketCommands";
 import { getAssistantHistoryPort } from "./assistant/historyPort";
 import { getAssistantTransactions } from "./assistant/assistantTransaction";
 import { createSelectionClipboardPayload, insertNativeTemplateMolecule, serializeSelectionClipboardPayload, setDocumentCustomPageSize, insertNativeTextObject, insertTableIntoDocument } from "./documentWorkflow";
@@ -38,11 +39,24 @@ beforeEach(() => {
 afterEach(async () => {
   await act(async () => root.unmount()); container.remove(); restorePrompt?.(); restorePrompt = undefined;
   captured.runtime = undefined; vi.restoreAllMocks(); vi.unstubAllGlobals();
+  window.history.replaceState(null, "", "/");
 });
 async function command(commandId: string) {
   await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId } })); });
 }
 const current = () => getAssistantHistoryPort().read("initial")!;
+function selectRepeatUnitMolecule(explicit: boolean) {
+  const drawing = workflow.applySingleBondToolAtPoint(initial(400), { x: 140, y: 140 });
+  const molecule = drawing.pages[0].objects.find(object => object.type === "molecule")!;
+  const repeat = toggleBracketRepeatUnit(workflow.insertNativeBracket(drawing,
+    { x: 100, y: 100 }, "square", { x: 220, y: 180 }));
+  const brackets = repeat.pages[0].objects.filter(object => object.type === "bracket");
+  return { molecule, selected: applyPatches(repeat, [
+    ...brackets.map(object => ({ op: "updateObject" as const, objectId: object.id,
+      changes: { containedObjectIds: explicit ? [molecule.id] : [], crossingBondIds: [] } })),
+    { op: "setSelection", objectIds: [molecule.id] }
+  ]) };
+}
 function initial(size: number) {
   return setDocumentCustomPageSize(createEmptyDocument(), { width: size, height: size, unit: "css-px" });
 }
@@ -157,6 +171,358 @@ describe.each(["macos", "windows"] as const)("mounted page commits on %s", platf
 
     await command("edit.undo"); expect(current()).toBe(before);
     await command("edit.redo"); expect(current()).toBe(before);
+  });
+
+  it.each([false, true])("keeps direct bracket edits out of scope and records host cleanup with the molecule deletion (assistant: %s)", async assistant => {
+    const { molecule, selected } = selectRepeatUnitMolecule(false);
+    await act(async () => root.render(<MainWindow initialDocument={selected} shortcutPlatform={platform}
+      initialPaletteMode="hidden" initialRulersVisible={false} nativePalette={false} />));
+    const before = current(), runtime = captured.runtime!, pluginId = "org.chemdraft.repeatDelete";
+    const close = before.pages[0].objects.find(object => object.type === "bracket" && object.side === "close")!;
+    const transactions = getAssistantTransactions(getAssistantHistoryPort());
+    const txId = assistant ? transactions.beginAssistantTransaction({ pluginId, runId: "repeat-delete",
+      label: "Delete repeat unit", tabId: "initial", sendSelection: { objectIds: [molecule.id] } }) : undefined;
+    await act(async () => {
+      const remove = { op: "removeObject", objectId: molecule.id } as const;
+      runtime.registerPlugin({ id: pluginId, name: "Repeat delete", version: "0.1.0", apiVersion: "^0.1.25",
+        entry: "test.js", permissions: ["document.write"],
+        contributes: { commands: [{ id: "plugin.repeatDelete.edit", title: "Edit" }, { id: "plugin.repeatDelete.remove", title: "Delete" }] }
+      }, { commandHandlers: {
+        "plugin.repeatDelete.edit": context => context.documents.applyPatch!({ reason: "Edit unselected bracket", patch: {
+          op: "batch", patches: [remove, { op: "updateObject", objectId: close.id, changes: { label: "m" } }]
+        } }),
+        "plugin.repeatDelete.remove": context => context.documents.applyPatch!({ reason: "Delete selected molecule", patch: remove })
+      } });
+      await expect(runtime.invokeCommand("plugin.repeatDelete.edit")).rejects.toThrow(`${close.id} was not selected`);
+    });
+    expect(current()).toBe(before);
+    const normalize = vi.spyOn(workflow, "normalizeCommittedDocument");
+    await act(async () => {
+      await expect(runtime.invokeCommand("plugin.repeatDelete.remove")).resolves.toMatchObject({ applied: true, objectIds: [] });
+      if (txId) transactions.endAssistantTransaction(txId, { touchedIds: [] });
+    });
+    expect(normalize.mock.calls.some(([draft]) =>
+      draft.pages[0].objects.filter(object => object.type === "bracket").length === 2)).toBe(true);
+    const after = current();
+    expect(after.pages[0].objects).toEqual([]);
+    await command("edit.undo");
+    expect(current()).toEqual(before);
+    expect(container.querySelector("[data-status-message]")?.textContent)
+      .toBe(assistant ? "Undid ChemDraft Assistant: Delete repeat unit" : "Undid Repeat delete: Delete");
+    await command("edit.redo");
+    expect(current()).toEqual(after);
+  });
+
+  it.each([false, true])("runs assistant delete_objects cleanup only after the authored write passes scope (explicit members: %s)", async explicit => {
+    const { molecule, selected } = selectRepeatUnitMolecule(explicit);
+    await act(async () => root.render(<MainWindow initialDocument={selected} shortcutPlatform={platform}
+      initialActiveToolCommandId="tool.select" initialPaletteMode="hidden" initialRulersVisible={false} nativePalette={false} />));
+    const before = current(), runtime = captured.runtime!;
+    await act(async () => {
+      runtime.registerPlugin({ id: "org.chemdraft.repeatTool", name: "Repeat tool", version: "0.1.0", apiVersion: "^0.1.25",
+        entry: "test.js", permissions: [...AssistantCapabilityPermissions],
+        contributes: { commands: [{ id: "plugin.repeatTool.run", title: "Delete" }] }
+      }, { commandHandlers: { "plugin.repeatTool.run": async context => {
+        const assistant = context.assistant!;
+        const { requestId } = await assistant.beginRequest({ prompt: "Delete repeat member" });
+        const result = await assistant.callTool({ name: "delete_objects", input: { objectIds: [molecule.id] } });
+        await assistant.endRequest({ requestId });
+        return result;
+      } } });
+      const result = await runtime.invokeCommand("plugin.repeatTool.run");
+      if (explicit) expect(result).toMatchObject({ isError: true,
+        content: [{ type: "text", text: expect.stringContaining("unselected bracket") }] });
+      else expect(result).toMatchObject({ structuredContent: { objectIds: [molecule.id] } });
+    });
+    const after = current();
+    if (explicit) expect(after).toBe(before);
+    else expect(after.pages[0].objects).toEqual([]);
+    await command("edit.undo");
+    expect(current()).toEqual(before);
+    await command("edit.redo");
+    expect(current()).toEqual(after);
+  });
+
+  it.each(["plugin bond edit", "plugin deletion", "assistant delete_objects"])(
+    "matches 1.2.0 mixed-repeat-unit authorization for %s", async operation => {
+    const blank = initial(400);
+    const pageId = blank.pages[0].id;
+    const chain = createSmilesMolecule(blank, { x: 150, y: 130 }, depictSmiles2D("CCC"), "CCC");
+    const [a, b, c] = chain.atoms.map((atom, i) => ({ ...atom, x: [130, 150, 275][i], y: 130 }));
+    const edited = { ...chain, id: "edited", atoms: [a, b, c], bonds: [
+      { ...chain.bonds[0], fromAtomId: a.id, toAtomId: b.id },
+      { ...chain.bonds[1], fromAtomId: b.id, toAtomId: c.id }
+    ] };
+    const protectedMolecule = { ...createSmilesMolecule(blank, { x: 145, y: 164 }, depictSmiles2D("CC"), "CC"), id: "protected" };
+    const stored = { ...protectedMolecule, id: "stored", x: 177, atoms: [], bonds: [], chemistry: undefined };
+    const drawing = applyPatches(blank, [edited, protectedMolecule, stored].map(object => ({ op: "addObject", pageId, object })));
+    const repeat = toggleBracketRepeatUnit(workflow.insertNativeBracket(drawing,
+      { x: 100, y: 100 }, "square", { x: 220, y: 200 }));
+    const glyphs = repeat.pages[0].objects.filter(object => object.type === "bracket");
+    const edit = operation === "plugin bond edit";
+    const selected = applyPatches(repeat, [
+      ...glyphs.map(object => ({ op: "updateObject" as const, objectId: object.id, changes: {
+        containedObjectIds: [stored.id], crossingBondIds: [{ objectId: edited.id, bondId: edited.bonds[1].id }]
+      } })),
+      { op: "setSelection", objectIds: edit ? [edited.id] : [stored.id, ...glyphs.map(object => object.id)] }
+    ]);
+    await act(async () => root.render(<MainWindow initialDocument={selected} shortcutPlatform={platform}
+      initialPaletteMode="hidden" initialRulersVisible={false} nativePalette={false} />));
+    const before = current(), runtime = captured.runtime!;
+    const protectedBefore = before.pages[0].objects.find(object => object.id === protectedMolecule.id);
+    const assistant = operation === "assistant delete_objects";
+    await act(async () => {
+      runtime.registerPlugin({ id: "org.chemdraft.mixedUnit", name: "Mixed unit", version: "0.1.0", apiVersion: "^0.1.25", entry: "test.js",
+        permissions: assistant ? [...AssistantCapabilityPermissions] : ["document.write"],
+        contributes: { commands: [{ id: "plugin.mixedUnit.run", title: "Edit mixed repeat unit" }] }
+      }, { commandHandlers: { "plugin.mixedUnit.run": async context => {
+        if (assistant) {
+          const { requestId } = await context.assistant!.beginRequest({ prompt: "Delete the stored molecule" });
+          try { return await context.assistant!.callTool({ name: "delete_objects", input: { objectIds: [stored.id] } }); }
+          finally { await context.assistant!.endRequest({ requestId }); }
+        }
+        return context.documents!.applyPatch!({ reason: "Edit mixed repeat unit", patch: edit
+          ? { op: "updateObject", objectId: edited.id, changes: { bonds: [{ ...edited.bonds[0], toAtomId: c.id }, edited.bonds[1]] } }
+          : { op: "removeObject", objectId: stored.id }
+        });
+      } } });
+      const result = runtime.invokeCommand("plugin.mixedUnit.run");
+      if (edit) await expect(result).rejects.toThrow(/molecule "protected" was changed.*chemistry.*not selected/);
+      else await expect(result).resolves.toMatchObject(assistant
+        ? { structuredContent: { objectIds: [stored.id] } }
+        : { applied: true });
+    });
+    if (edit) expect(current()).toBe(before);
+    else {
+      expect(current().pages[0].objects.some(object => object.id === stored.id)).toBe(false);
+      expect(current().pages[0].objects.filter(object => object.type === "bracket")).toHaveLength(2);
+      expect(current().pages[0].objects.find(object => object.id === protectedMolecule.id)).toEqual(protectedBefore);
+    }
+  });
+
+  it.each([false, true])("keeps a replacement SRU with reused ids while a plugin command is pending (page fit: %s)", async pageFit => {
+    const { molecule, selected } = selectRepeatUnitMolecule(false);
+    let answer!: (value: string) => void;
+    const prompt = vi.fn(() => new Promise<string>(resolve => { answer = resolve; }));
+    if (pageFit) restorePrompt = setNativePromptProvider(prompt);
+    await act(async () => root.render(<MainWindow initialDocument={selected} shortcutPlatform={platform}
+      initialPaletteMode="hidden" initialRulersVisible={false} nativePalette={false} />));
+    const before = current(), runtime = captured.runtime!;
+    const originals = before.pages[0].objects.filter(object => object.type === "bracket");
+    let finish!: () => void;
+    const pending = new Promise<void>(resolve => { finish = resolve; });
+    let completion!: ReturnType<DesktopPluginRuntime["invokeCommand"]>;
+    await act(async () => {
+      runtime.registerPlugin({ id: "org.chemdraft.pendingDelete", name: "Pending delete", version: "0.1.0", apiVersion: "^0.1.25",
+        entry: "test.js", permissions: ["document.write"],
+        contributes: { commands: [{ id: "plugin.pendingDelete.run", title: "Delete" }] }
+      }, { commandHandlers: { "plugin.pendingDelete.run": async context => {
+        const remove = { op: "removeObject", objectId: molecule.id } as const;
+        if (!pageFit) {
+          await pending;
+          return context.documents!.applyPatch!({ reason: "Delete original member", patch: remove });
+        }
+        const oversized = DocumentObjectSchema.parse({ id: "oversized", type: "plus", x: 100, y: 100, width: 480, height: 480 });
+        return context.documents!.applyPatch!({ reason: "Replace original member", patch: { op: "batch", patches: [
+          remove, { op: "addObject", pageId: before.pages[0].id, object: oversized }
+        ] } });
+      } } });
+      completion = runtime.invokeCommand("plugin.pendingDelete.run");
+    });
+    if (pageFit) expect(prompt).toHaveBeenCalledOnce();
+    const removed = workflow.deleteSelectedDocumentObjects(before, originals.map(object => object.id));
+    let replaced = toggleBracketRepeatUnit(workflow.insertNativeBracket(removed,
+      pageFit ? { x: 100, y: 100 } : { x: 275, y: 250 }, "square",
+      pageFit ? { x: 220, y: 180 } : { x: 360, y: 320 }));
+    if (pageFit) {
+      // The user redraws the same values while the confirmation holds a prepared commit.
+      replaced = applyPatches(replaced, originals.map(glyph => ({ op: "updateObject", objectId: glyph.id,
+        changes: { containedObjectIds: glyph.containedObjectIds, crossingBondIds: glyph.crossingBondIds } })));
+      expect(replaced.pages[0].objects).toEqual(before.pages[0].objects);
+    }
+    const replacement = replaced.pages[0].objects.filter(object => object.type === "bracket");
+    expect(replacement.map(({ id, pairId, side }) => ({ id, pairId, side })))
+      .toEqual(originals.map(({ id, pairId, side }) => ({ id, pairId, side })));
+    await act(async () => { getAssistantHistoryPort().push("initial", before, replaced, "Replace brackets"); });
+    await act(async () => {
+      if (pageFit) {
+        answer("keep");
+        await expect(completion).rejects.toThrow("The drawing changed while the page question was open");
+      } else {
+        finish();
+        await expect(completion).resolves.toMatchObject({ applied: true });
+      }
+    });
+    if (!pageFit) {
+      expect(current().pages[0].objects).toEqual(replacement);
+      await command("edit.undo");
+    }
+    expect(current()).toEqual(replaced);
+  });
+
+  it.each(["no intervening edit", "redraw before acceptance", "redraw during page fit"] as const)(
+    "accepts a deletion proposal with exact undo and redo after %s", async scenario => {
+      const { molecule, selected } = selectRepeatUnitMolecule(false);
+      const needsFit = scenario === "redraw during page fit";
+      let answer!: (decision: string) => void;
+      const prompt = vi.fn(() => new Promise<string>(resolve => { answer = resolve; }));
+      restorePrompt = setNativePromptProvider(prompt);
+      await act(async () => root.render(<MainWindow initialDocument={selected} shortcutPlatform={platform}
+        initialPaletteMode="hidden" initialRulersVisible={false} nativePalette={false} />));
+      const before = current(), runtime = captured.runtime!;
+      const pageId = before.pages[0].id;
+      const originals = before.pages[0].objects.filter(object => object.type === "bracket");
+      const oversized = DocumentObjectSchema.parse({ id: "oversized", type: "plus", x: 100, y: 100, width: 480, height: 480 });
+      const removal = { op: "removeObject", objectId: molecule.id } as const;
+      const patch = needsFit ? { op: "batch" as const, patches: [
+        removal, { op: "addObject" as const, pageId, object: oversized }
+      ] } : removal;
+      await act(async () => {
+        runtime.registerPlugin({ id: "org.chemdraft.reviewDelete", name: "Review delete", version: "0.1.0", apiVersion: "^0.1.25",
+          entry: "test.js", permissions: ["document.proposePatch"],
+          contributes: { commands: [{ id: "plugin.reviewDelete.run", title: "Propose deletion" }] }
+        }, { commandHandlers: { "plugin.reviewDelete.run": context => context.documents.proposePatch({
+          reason: "Delete original member", patch
+        }) } });
+        await runtime.invokeCommand("plugin.reviewDelete.run");
+      });
+      await act(async () => container.querySelector<HTMLButtonElement>(".patch-review-badge")!.click());
+      const accept = () => act(async () => container.querySelector<HTMLButtonElement>(".patch-review-actions button")!.click());
+      if (needsFit) {
+        await accept();
+        expect(prompt).toHaveBeenCalledOnce();
+      }
+      if (scenario !== "no intervening edit") {
+        const removed = workflow.deleteSelectedDocumentObjects(before, originals.map(object => object.id));
+        const redrawn = toggleBracketRepeatUnit(workflow.insertNativeBracket(removed,
+          { x: 100, y: 100 }, "square", { x: 220, y: 180 }));
+        const replacement = applyPatches(redrawn, originals.map(glyph => ({ op: "updateObject", objectId: glyph.id,
+          changes: { containedObjectIds: glyph.containedObjectIds, crossingBondIds: glyph.crossingBondIds } })));
+        expect(replacement.pages[0].objects).toEqual(before.pages[0].objects);
+        await act(async () => getAssistantHistoryPort().push("initial", before, replacement, "Redraw repeat unit"));
+      }
+      const beforeAccept = current();
+      if (needsFit) {
+        await act(async () => answer("keep"));
+        expect(runtime.host.listProposedPatches("pending")).toHaveLength(1);
+        expect(current()).toBe(beforeAccept);
+      }
+      await accept();
+      if (needsFit) {
+        expect(prompt).toHaveBeenCalledTimes(2);
+        await act(async () => answer("keep"));
+      }
+      expect(runtime.host.listProposedPatches("pending")).toHaveLength(0);
+      const accepted = current();
+      expect(accepted.pages[0].objects.some(object => object.id === molecule.id)).toBe(false);
+      expect(accepted.pages[0].objects.filter(object => object.type === "bracket"))
+        .toEqual(scenario === "no intervening edit" ? [] : originals);
+      await command("edit.undo");
+      expect(current()).toBe(beforeAccept);
+      await command("edit.redo");
+      expect(current()).toBe(accepted);
+    }
+  );
+
+  it("cleans up a populated SRU after an accepted write removes its last temporary member", async () => {
+    const { molecule, selected } = selectRepeatUnitMolecule(false);
+    const temporary = { ...molecule, id: "temporary" };
+    await act(async () => root.render(<MainWindow initialDocument={selected} shortcutPlatform={platform}
+      initialPaletteMode="hidden" initialRulersVisible={false} nativePalette={false} />));
+    const before = current(), runtime = captured.runtime!;
+    await act(async () => {
+      runtime.registerPlugin({ id: "org.chemdraft.swapMember", name: "Swap member", version: "0.1.0", apiVersion: "^0.1.25",
+        entry: "test.js", permissions: ["document.write"],
+        contributes: { commands: [{ id: "plugin.swapMember.run", title: "Swap repeat member" }] }
+      }, { commandHandlers: { "plugin.swapMember.run": async context => {
+        const apply = context.documents!.applyPatch!;
+        await apply({ reason: "Add a temporary member", patch: { op: "addObject", pageId: before.pages[0].id, object: temporary } });
+        await apply({ reason: "Remove the original member", patch: { op: "removeObject", objectId: molecule.id } });
+        expect(current().pages[0].objects.filter(object => object.type === "bracket")).toHaveLength(2);
+        return apply({ reason: "Remove the temporary member", patch: { op: "removeObject", objectId: temporary.id } });
+      } } });
+      await expect(runtime.invokeCommand("plugin.swapMember.run")).resolves.toMatchObject({ applied: true });
+    });
+    expect(current().pages[0].objects).toEqual([]);
+    await command("edit.undo");
+    expect(current().pages[0].objects.map(object => object.id)).toEqual([
+      ...before.pages[0].objects.filter(object => object.type === "bracket").map(object => object.id), temporary.id
+    ]);
+  });
+
+  it("keeps an empty SRU and its containing group when separate plugin writes add and delete a temporary member", async () => {
+    const blank = initial(400);
+    const emptyUnit = toggleBracketRepeatUnit(workflow.insertNativeBracket(blank,
+      { x: 100, y: 100 }, "square", { x: 220, y: 180 }));
+    const page = emptyUnit.pages[0];
+    const group = DocumentObjectSchema.parse({ id: "group", type: "group", x: 100, y: 100,
+      width: 120, height: 80, childObjectIds: page.objects.map(object => object.id) });
+    const reaction = DocumentObjectSchema.parse({ id: "reaction", type: "reaction", x: 100, y: 100, width: 120, height: 80,
+      mappingState: "absent", components: [], conditionsTextObjectIds: [group.id] });
+    const drawing = applyPatches(emptyUnit, [group, reaction].map(object => ({ op: "addObject", pageId: page.id, object })));
+    const temporary = createSmilesMolecule(blank, { x: 150, y: 140 }, depictSmiles2D("CC"), "CC");
+    await act(async () => root.render(<MainWindow initialDocument={applyPatch(drawing, { op: "setSelection", objectIds: [] })}
+      shortcutPlatform={platform} initialActiveToolCommandId="tool.select" initialPaletteMode="hidden"
+      initialRulersVisible={false} nativePalette={false} />));
+    const before = current(), runtime = captured.runtime!;
+    await act(async () => {
+      runtime.registerPlugin({ id: "org.chemdraft.tempMember", name: "Temporary member", version: "0.1.0", apiVersion: "^0.1.25",
+        entry: "test.js", permissions: ["document.write"],
+        contributes: { commands: [{ id: "plugin.tempMember.run", title: "Discard a draft" }] }
+      }, { commandHandlers: { "plugin.tempMember.run": async context => {
+        await expect(context.documents.applyPatch!({ reason: "Add a draft",
+          patch: { op: "addObject", pageId: page.id, object: temporary }
+        })).resolves.toMatchObject({ objectIds: [temporary.id] });
+        return context.documents.applyPatch!({ reason: "Discard the draft", patch: { op: "removeObject", objectId: temporary.id } });
+      } } });
+      await expect(runtime.invokeCommand("plugin.tempMember.run")).resolves.toMatchObject({ applied: true, objectIds: [] });
+    });
+    expect(current().pages[0].objects).toEqual(before.pages[0].objects);
+  });
+
+  it("cuts the selected glyph and all the selected member atoms in one undo entry", async () => {
+    const size = 400;
+    const blank = initial(size);
+    const molecule = createSmilesMolecule(blank, { x: 140, y: 140 }, depictSmiles2D("CCC"), "CCC");
+    const drawing = applyPatch(blank, { op: "addObject", pageId: blank.pages[0].id, object: molecule });
+    const member = molecule.atoms.find(atom => molecule.bonds.filter(bond => bond.fromAtomId === atom.id || bond.toAtomId === atom.id).length === 1)!;
+    const adjacent = molecule.bonds.find(bond => bond.fromAtomId === member.id || bond.toAtomId === member.id)!;
+    const retained = molecule.atoms.find(atom => atom.id !== adjacent.fromAtomId && atom.id !== adjacent.toAtomId)!;
+    const repeat = toggleBracketRepeatUnit(drawing, [{ kind: "atom", objectId: molecule.id, atomId: member.id }]);
+    const open = repeat.pages[0].objects.find(object => object.type === "bracket" && object.side === "open")!;
+    const selected = applyPatch(repeat, { op: "setSelection", objectIds: [open.id] });
+    const write = vi.spyOn(clipboard, "writeClipboardItems").mockResolvedValue({ ok: true, written: [], failed: [], warnings: [] });
+    window.history.replaceState(null, "", "/?agentBridge=1");
+    await act(async () => root.render(<MainWindow initialDocument={selected} shortcutPlatform={platform}
+      initialActiveToolCommandId="tool.select" initialPaletteMode="hidden" initialRulersVisible={false} nativePalette={false} />));
+    container.querySelectorAll(".page, .canvas-region").forEach(element => {
+      element.getBoundingClientRect = () => ({ left: 0, top: 0, x: 0, y: 0, width: size, height: size,
+        right: size, bottom: size, toJSON: () => ({}) });
+    });
+    const target = container.querySelector<HTMLElement>(".page")!;
+    target.setPointerCapture = () => {};
+    target.hasPointerCapture = () => false;
+    const bridge = window.__CHEMDRAFT_AGENT__!;
+    const start = bridge.resolvePoint({ page: { x: member.x - 5, y: member.y - 14 } }).client;
+    const end = bridge.resolvePoint({ page: { x: member.x + 5, y: member.y + 5 } }).client;
+    for (const type of ["pointerdown", "pointermove", "pointerup"]) {
+      const point = type === "pointerdown" ? start : end;
+      const event = new MouseEvent(type, { bubbles: true, cancelable: true, button: 0, shiftKey: true,
+        buttons: type === "pointerup" ? 0 : 1, clientX: point.x, clientY: point.y });
+      Object.defineProperties(event, { pointerId: { value: 7 }, pointerType: { value: "mouse" }, isPrimary: { value: true } });
+      await act(async () => target.dispatchEvent(event));
+    }
+    expect(bridge.snapshot().selectedNativeMoleculePart).toMatchObject({ kind: "parts", atomIds: [member.id], bondIds: [adjacent.id] });
+    const before = current();
+    expect(before.selection.objectIds).toEqual([open.id]);
+    await command("clipboard.cut");
+    expect(write).toHaveBeenCalledOnce();
+    const after = current();
+    expect(after.pages[0].objects).toMatchObject([{ id: molecule.id, atoms: [{ id: retained.id }] }]);
+    await command("edit.undo");
+    expect(current()).toEqual(before);
+    await command("edit.redo");
+    expect(current()).toEqual(after);
   });
 
   it.each([false, true])("refuses late normalization outside request scope (approved fit=%s)", async approved => {

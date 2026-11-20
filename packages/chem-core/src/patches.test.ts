@@ -30,6 +30,35 @@ function documentWith(count: number): ChemDraftDocument {
 }
 
 describe("patch engine structural sharing", () => {
+  it.each(["single", "batch", "annotation", "graph transfer"] as const)(
+    "prunes only deleted group members on %s removal", mode => {
+      const empty = createEmptyDocument({ now });
+      const pageId = empty.pages[0].id;
+      const removed: DocumentObject = mode === "annotation"
+        ? { id: "child", type: "annotation", message: "Note", targetObjectIds: [],
+          x: 0, y: 0, width: 10, height: 10, rotation: 0, style: {} }
+        : textObject("child", 0);
+      const sibling = textObject("sibling", 20);
+      const group: DocumentObject = { id: "group", type: "group", childObjectIds: [removed.id, sibling.id, "already-missing"],
+        x: 0, y: 0, width: 30, height: 10, rotation: 0, style: {} };
+      const emptyGroup: DocumentObject = { ...group, id: "newly-empty", childObjectIds: [removed.id] };
+      const unrelatedGroup: DocumentObject = { ...group, id: "unrelated", childObjectIds: ["preexisting-dangling"] };
+      const before = applyPatches(empty, [removed, sibling, group, emptyGroup, unrelatedGroup].map(object => ({
+        op: "addObject", pageId, object
+      })), { now });
+      const remove = { op: "removeObject", objectId: removed.id } as const;
+      const next = mode === "batch" ? applyPatches(before, [remove, { op: "removeObject", objectId: sibling.id }], { now })
+        : applyPatch(before, mode === "annotation" ? { op: "removeAnnotation", annotationId: removed.id } : remove,
+          { now, preserveRepeatUnitBrackets: mode === "graph transfer" });
+      expect(next.pages[0].objects).toEqual([
+        ...(mode === "batch" ? [] : [sibling]),
+        { ...group, childObjectIds: mode === "batch" ? ["already-missing"] : [sibling.id, "already-missing"] },
+        unrelatedGroup
+      ]);
+      expect(next.pages[0].objects.at(-1)).toBe(before.pages[0].objects.at(-1));
+    }
+  );
+
   it.each(["single", "batch"])("prunes shared reaction references on %s removal and restores exact snapshots on undo", mode => {
     const empty = createEmptyDocument({ now });
     const pageId = empty.pages[0].id;

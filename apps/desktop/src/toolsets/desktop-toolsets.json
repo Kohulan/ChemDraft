@@ -1395,7 +1395,7 @@
                   },
                   {
                     "commandId": "layout.rotate90",
-                    "label": "Rotate 90 Degrees",
+                    "label": "Rotate 90° Clockwise",
                     "icon": "align",
                     "assetName": "Custom_Rotation"
                   },
@@ -1443,20 +1443,20 @@
             },
             {
               "commandId": "layout.rotate90",
-              "title": "Rotate 90 Degrees",
+              "title": "Rotate 90° Clockwise",
               "icon": "align",
               "assetName": "Custom_Rotation",
               "category": "layout",
               "id": "layout.rotate90",
               "kind": "button",
-              "label": "Rotate 90 Degrees",
+              "label": "Rotate 90° Clockwise",
               "primary": {
                 "type": "command",
                 "commandId": "layout.rotate90"
               },
               "submenu": null,
               "tooltip": {
-                "title": "Rotate 90 Degrees",
+                "title": "Rotate 90° Clockwise",
                 "shortcut": null
               },
               "layout": {
@@ -3873,7 +3873,7 @@
                   },
                   {
                     "commandId": "layout.rotate90",
-                    "label": "Rotate 90 Degrees",
+                    "label": "Rotate 90° Clockwise",
                     "icon": "align",
                     "assetName": "Custom_Rotation"
                   },
@@ -3921,20 +3921,20 @@
             },
             {
               "commandId": "layout.rotate90",
-              "title": "Rotate 90 Degrees",
+              "title": "Rotate 90° Clockwise",
               "icon": "align",
               "assetName": "Custom_Rotation",
               "category": "layout",
               "id": "layout.rotate90",
               "kind": "button",
-              "label": "Rotate 90 Degrees",
+              "label": "Rotate 90° Clockwise",
               "primary": {
                 "type": "command",
                 "commandId": "layout.rotate90"
               },
               "submenu": null,
               "tooltip": {
-                "title": "Rotate 90 Degrees",
+                "title": "Rotate 90° Clockwise",
                 "shortcut": null
               },
               "layout": {
@@ -4682,7 +4682,7 @@
                   },
                   {
                     "commandId": "layout.rotate90",
-                    "label": "Rotate 90 Degrees",
+                    "label": "Rotate 90° Clockwise",
                     "icon": "align",
                     "assetName": "Custom_Rotation"
                   },
@@ -4730,20 +4730,20 @@
             },
             {
               "commandId": "layout.rotate90",
-              "title": "Rotate 90 Degrees",
+              "title": "Rotate 90° Clockwise",
               "icon": "align",
               "assetName": "Custom_Rotation",
               "category": "layout",
               "id": "layout.rotate90",
               "kind": "button",
-              "label": "Rotate 90 Degrees",
+              "label": "Rotate 90° Clockwise",
               "primary": {
                 "type": "command",
                 "commandId": "layout.rotate90"
               },
               "submenu": null,
               "tooltip": {
-                "title": "Rotate 90 Degrees",
+                "title": "Rotate 90° Clockwise",
                 "shortcut": null
               },
               "layout": {

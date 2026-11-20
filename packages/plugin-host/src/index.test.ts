@@ -869,8 +869,10 @@ describe("PluginHost", () => {
   });
 
   it("validates and applies a direct patch during the owning command", async () => {
+    const commandStartDocument = createEmptyDocument({ now: timestamp });
+    let activeDocument = commandStartDocument;
     const applyDocumentPatch = vi.fn(async () => ({ applied: true as const, objectIds: ["mol_001"] }));
-    const host = new PluginHost({ applyDocumentPatch, getActiveDocument: () => createEmptyDocument({ now: timestamp }) });
+    const host = new PluginHost({ applyDocumentPatch, getActiveDocument: () => activeDocument });
     host.registerPlugin(
       {
         id: "org.test.direct-write",
@@ -891,11 +893,13 @@ describe("PluginHost", () => {
       },
       {
         commandHandlers: {
-          "plugin.directWrite.insert": (context) =>
-            context.documents.applyPatch!({
+          "plugin.directWrite.insert": (context) => {
+            activeDocument = createEmptyDocument({ now: timestamp, title: "Updated drawing" });
+            return context.documents.applyPatch!({
               reason: "user supplied chemical name",
               patch: { op: "addObject", pageId: "page_001", object: moleculeObject() }
-            })
+            });
+          }
         }
       }
     );
@@ -907,6 +911,7 @@ describe("PluginHost", () => {
     expect(applyDocumentPatch).toHaveBeenCalledWith({
       signal: expect.any(AbortSignal),
       writeScopeObjectIds: [],
+      repeatUnitCleanup: { commandStartDocument, authoredRemovals: new Map() },
       plugin: { id: "org.test.direct-write", name: "Direct Writer", version: "0.0.1" },
       command: { id: "plugin.directWrite.insert", title: "Insert Structure" },
       patch: {

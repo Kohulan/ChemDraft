@@ -54,13 +54,18 @@ fn compensate_before_drag(
     );
     if dx != 0 || dy != 0 {
         let outer = window.outer_position().map_err(|error| error.to_string())?;
+        let position =
+            tauri::PhysicalPosition::new(outer.x.saturating_add(dx), outer.y.saturating_add(dy));
+        super::windows_activation_log::frame_set(
+            window.label(),
+            "compensate native drag start",
+            "pixels",
+            || (position, window.inner_size().ok()),
+        );
         // Preserve the inner/outer frame offset. tao's set_position uses SWP_NOACTIVATE |
         // SWP_NOSIZE | SWP_NOZORDER: this neither focuses nor raises nor resizes the window.
         window
-            .set_position(tauri::PhysicalPosition::new(
-                outer.x.saturating_add(dx),
-                outer.y.saturating_add(dy),
-            ))
+            .set_position(position)
             .map_err(|error| error.to_string())?;
     }
     Ok(())

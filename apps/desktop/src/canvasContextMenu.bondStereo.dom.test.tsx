@@ -412,7 +412,7 @@ describe.each<ShortcutPlatform>(["macos", "windows"])("native badge popover (%s)
       for (const [value, shiftKey] of [["ArrowDown", false], ["Tab", true], ["Enter", false]] as const) {
         await key(value, shiftKey);
         expect(sendToolsetFlyoutKey).toHaveBeenLastCalledWith({ toolsetId: "core.bondStereo", flyoutId: "core.bondStereo",
-          openedAt: content.openedAt, sessionId: content.flyout.id, key: value, shiftKey });
+          openedAt: content.openedAt, generation: content.generation, sessionId: content.flyout.id, key: value, shiftKey });
         expect(document.activeElement).toBe(badge);
       }
       expect(sendToolsetFlyoutKey).toHaveBeenCalledTimes(3);

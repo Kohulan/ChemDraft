@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { compareLayoutQuality, evaluateLayoutQuality, prepareLayoutLabelEvaluator, labelBoxBondDistance,
   LABEL_CLEARANCE_PADDING, MAX_BRIDGE_STRETCH, layoutAtomAndLabelDefects, type LayoutPoint, type LayoutLabelBox } from "./layoutQuality";
 import { testMoleculeFromSmiles } from "./testing";
-import { atomLabelGlyphBounds, moleculeLayoutLabelBoxes, planMoleculeAtomLabels } from "./index";
+import { atomLabelGlyphBounds, atomPairOverlaps, moleculeLayoutLabelBoxes, planMoleculeAtomLabels } from "./index";
 import type { MoleculeObject } from "@chemdraft/chem-core";
 
 const polygon = (n: number): LayoutPoint[] => Array.from({ length: n }, (_, i) => ({
@@ -270,6 +270,14 @@ describe("2D layout quality", () => {
     expect(quality.passesRelaxed).toBe(false);
     const distorted = evaluateLayoutQuality(polygon(6).map(p => ({ x: p.x, y: p.y * 0.3 })), cycle(6));
     expect(compareLayoutQuality(distorted, quality)).toBeLessThan(0);
+  });
+
+  it("uses a strict half-bond overlap threshold for normalized and page distances", () => {
+    for (const bondLength of [1, 22, 30]) {
+      expect(atomPairOverlaps(0.49 * bondLength, bondLength)).toBe(true);
+      expect(atomPairOverlaps(0.5 * bondLength, bondLength)).toBe(false);
+      expect(atomPairOverlaps(0.51 * bondLength, bondLength)).toBe(false);
+    }
   });
 
   it("uses reflex interior angles instead of their small supplements", () => {

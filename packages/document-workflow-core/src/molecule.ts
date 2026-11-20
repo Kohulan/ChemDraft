@@ -15,7 +15,7 @@ import {
   type MoleculeTransformState
 } from "@chemdraft/chem-core";
 import { type ParsedMolfileGraph, parseMolfileGraph } from "@chemdraft/clipboard-adapter";
-import { isDefaultCenteredDoubleBond, nativeBondOrderResolution, objectRotationCenter,
+import { molfileCoordinateScale, isDefaultCenteredDoubleBond, nativeBondOrderResolution, objectRotationCenter,
   ringInteriorDoubleBondSides } from "@chemdraft/layout-engine";
 import { nativeElementFromAtomLabel, nativeSingleBondGraphMetadata } from "./atoms";
 import {
@@ -506,10 +506,15 @@ export function scaleParsedMolfileAtoms(
   point: PagePoint,
   page: ChemDraftDocument["pages"][number],
   targetBondLengthPx: number = nativeBondLengthPx,
-  constrainToPage = true
+  constrainToPage = true,
+  bondStatistic: "mean" | "median" = "mean"
 ): ParsedMolfileGraph["atoms"] {
-  const averageBondLength = averageParsedMolfileBondLength(graph);
-  const scale = averageBondLength > 0 ? targetBondLengthPx / averageBondLength : targetBondLengthPx / 1.5;
+  // Generated depictions and authored templates retain their established mean sizing.
+  // External MOL/RXN and recognition input explicitly opt into the shared median scaler.
+  const averageBondLength = bondStatistic === "mean" ? averageParsedMolfileBondLength(graph) : 0;
+  const scale = bondStatistic === "median"
+    ? molfileCoordinateScale(graph.atoms, graph.bonds, targetBondLengthPx, 1.5).scale
+    : targetBondLengthPx / (averageBondLength > 0 ? averageBondLength : 1.5);
   const scaledAtoms = graph.atoms.map((atom) => ({
     ...atom,
     x: atom.x * scale,

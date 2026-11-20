@@ -612,7 +612,7 @@ describe("verified request writes", () => {
     } finally { await f.finish(); }
   });
 
-  it("refuses a reorder that changes visible CDXML usage on imported unknown brackets", async () => {
+  it("preserves conflicting imported glyph usages when a request reorders the brackets", async () => {
     const xml = `<CDXML><page><fragment id="10"><n id="11" p="300 200"/></fragment>
       <graphic id="20" GraphicType="Bracket" BracketType="Square" BoundingBox="280 220 285 180" BracketUsage="AnyPolymer"/>
       <graphic id="21" GraphicType="Bracket" BracketType="Square" BoundingBox="325 180 320 220" BracketUsage="MultipleGroup"/>
@@ -628,15 +628,18 @@ describe("verified request writes", () => {
       const before = f.pinned();
       const visible = (doc: ChemDraftDocument) => exportDocumentToCdxml(doc, { embedNativePayload: false }).contents;
       const group = (doc: ChemDraftDocument) => visible(doc).match(/<bracketedgroup\b[^>]*>/)![0];
-      expect(group(before)).toContain('BracketUsage="AnyPolymer"');
+      expect(group(before)).not.toContain("BracketUsage=");
+      expect(visible(before)).toContain('BracketUsage="AnyPolymer"');
+      expect(visible(before)).toContain('BracketUsage="MultipleGroup"');
       const [first, second] = brackets;
       const patch = { op: "setObjectOrder" as const, pageId: f.pageId, objectIds: ids.map(id =>
         id === first!.id ? second!.id : id === second!.id ? first!.id : id) };
-      expect(group(applyPatch(before, patch))).toContain('BracketUsage="MultipleGroup"');
       expect(await f.context.documents.applyRequestPatch!({ requestId: await f.begin(), patch }))
-        .toMatchObject({ ok: false, error: { code: "chemistry", message: /bracket|repeat unit/i } });
-      expect(f.history).toHaveLength(0);
-      expect(f.pinned()).toBe(before);
+        .toMatchObject({ ok: true });
+      expect(f.history).toHaveLength(1);
+      expect(group(f.pinned())).toEqual(group(before));
+      expect(visible(f.pinned())).toContain('BracketUsage="AnyPolymer"');
+      expect(visible(f.pinned())).toContain('BracketUsage="MultipleGroup"');
     } finally { await f.finish(); }
   });
 

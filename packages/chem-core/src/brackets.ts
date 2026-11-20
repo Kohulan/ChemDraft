@@ -2,6 +2,24 @@ import type { BracketObject, ChemDraftDocument, DocumentObject, MoleculeObject }
 import { bracketPairSemantics } from "./bracketSemantics";
 import { resolveRepeatUnitAtomMembership, type RepeatUnitMembershipOptions } from "./repeatUnitMembership";
 
+// Bracket ids can be reused after deletion. Keep creation identity in memory across edits and undo,
+// without adding metadata to the document or granting an identity to a newly inserted glyph.
+const bracketOrigins = new WeakMap<BracketObject, symbol>();
+
+export function retainBracketIdentity(before: DocumentObject, after: DocumentObject): void {
+  if (before.type === "bracket" && after.type === "bracket" && before.id === after.id &&
+    before.pairId === after.pairId && before.side === after.side) {
+    const origin = bracketOrigins.get(before) ?? Symbol();
+    bracketOrigins.set(before, origin);
+    bracketOrigins.set(after, origin);
+  }
+}
+
+export function sameBracketIdentity(a: BracketObject, b: BracketObject): boolean {
+  const origin = bracketOrigins.get(a);
+  return a === b || (origin !== undefined && origin === bracketOrigins.get(b));
+}
+
 /** Pair identities are page-local and require exactly one opening and one closing glyph. */
 export function bracketPairs(objects: readonly DocumentObject[]): Map<string, BracketObject[]> {
   const pairs = new Map<string, BracketObject[]>();
@@ -76,7 +94,8 @@ export function withBracketChemistryWarnings(document: ChemDraftDocument): ChemD
       const previous = object.chemistry.warnings;
       if (!pairs.size && !previous.some(warning => warning.code === "chemistry.bracket_multiplier")) return object;
       const warnings = [...previous.filter(warning => warning.code !== "chemistry.bracket_multiplier"),
-        ...chemistryWarningsForPairs(pairs, object, page.objects).map(warning => ({ code: "chemistry.bracket_multiplier", objectId: object.id, message: warning.message }))];
+        ...chemistryWarningsForPairs(pairs, object, page.objects, { useLegacyDiagnostics: true })
+          .map(warning => ({ code: "chemistry.bracket_multiplier", objectId: object.id, message: warning.message }))];
       if (JSON.stringify(previous) === JSON.stringify(warnings)) return object;
       changed = pageChanged = true;
       return { ...object, chemistry: { ...object.chemistry, warnings } };

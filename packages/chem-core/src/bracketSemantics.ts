@@ -2,28 +2,21 @@ import type { BracketObject } from "./schemas";
 
 const cdxmlNames = { sru: "SRU", multiple: "MultipleGroup" } as const;
 
-function usageAttribute(record: unknown) {
-  if (!record || typeof record !== "object" || !("attributes" in record)) return;
-  const attrs = record.attributes;
-  if (attrs && typeof attrs === "object" && "BracketUsage" in attrs && typeof attrs.BracketUsage === "string") return attrs.BracketUsage;
-}
-
-/** CDXML/CDX declare usage on the group, or on an attached glyph in older records. */
-export function importedBracketUsage(glyphs: readonly BracketObject[], group?: unknown) {
-  const cdxmlUsage = usageAttribute(group) ??
-    glyphs.map(glyph => usageAttribute(glyph.compatibility?.unknown.bracketedGroup)).find(value => value !== undefined) ??
-    glyphs.map(glyph => usageAttribute(glyph.compatibility?.unknown.cdxmlBracket)).find(Boolean);
-  const usage = cdxmlUsage === undefined ? "generic" : cdxmlUsage === cdxmlNames.sru ? "sru" :
+/** Classify the source name after interchange resolves the group and glyph declarations. */
+export function importedBracketUsage(cdxmlUsage: string | undefined) {
+  return cdxmlUsage === undefined ? "generic" : cdxmlUsage === cdxmlNames.sru ? "sru" :
     cdxmlUsage === cdxmlNames.multiple ? "multiple" : "unknown";
-  return { usage, cdxmlUsage } as const;
 }
 
-/** A legacy pair can have conflicting values. Resolve it in page order, including
- * the original name when native chemistry cannot interpret an imported usage. */
-export function bracketUsageSemantics(pair: readonly BracketObject[]) {
-  const usage = pair.find(object => object.bracketUsage && object.bracketUsage !== "generic")?.bracketUsage ??
+/** Resolve legacy native usage values in page order. */
+export function bracketPairUsage(pair: readonly BracketObject[]): NonNullable<BracketObject["bracketUsage"]> {
+  return pair.find(object => object.bracketUsage && object.bracketUsage !== "generic")?.bracketUsage ??
     (pair.some(object => object.repeatUnit || object.bracketKind === "polymer") ? "sru" : "generic");
-  const cdxmlUsage = usage === "unknown" ? importedBracketUsage(pair).cdxmlUsage ?? "Unspecified" :
+}
+
+export function bracketUsageSemantics(pair: readonly BracketObject[], sourceUsage?: string) {
+  const usage = bracketPairUsage(pair);
+  const cdxmlUsage = usage === "unknown" ? sourceUsage ?? "Unspecified" :
     usage === "generic" ? undefined : cdxmlNames[usage];
   return { usage, cdxmlUsage };
 }

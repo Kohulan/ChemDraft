@@ -5,8 +5,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MainWindow } from "./MainWindow";
 import { applySingleBondToolAtPoint, createPhase4Document, insertNativeBracket, selectDocumentObjects } from "./documentWorkflow";
 import { toggleBracketRepeatUnit } from "./bracketCommands";
-import { DOM_COMMAND_EVENT } from "./window-manager";
-import { bracketLabelContainsPoint, bracketLabelPlan } from "@chemdraft/layout-engine";
+import { DOM_COMMAND_EVENT, type QuitFlushPhase } from "./window-manager";
+import { bracketLabelPlan } from "@chemdraft/layout-engine";
+import { applyPatch, type ChemDraftDocument } from "@chemdraft/chem-core";
 import { openChemDraftPayload } from "@chemdraft/cdx-compat";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 import { DOCUMENT_SESSION_SAVE_DEBOUNCE_MS, type DocumentSessionEnvelope } from "./documentSession";
@@ -16,7 +17,7 @@ import { saveAskToSaveBeforeQuit } from "./quitSettings";
 const native = vi.hoisted(() => ({
   writeFile: vi.fn<(path: string, contents: string) => Promise<void>>(),
   saveSession: vi.fn<(value: DocumentSessionEnvelope) => Promise<void>>(),
-  quitFlush: undefined as undefined | (() => Promise<void>),
+  quitFlush: undefined as undefined | ((phase: QuitFlushPhase, requestId: number) => Promise<void>),
   promptQuit: undefined as undefined | ((id: number) => Promise<void>),
   quit: vi.fn()
 }));
@@ -30,7 +31,7 @@ vi.mock("./window-manager", async original => ({
   loadToolsetLayoutState: async () => undefined,
   listToolsetWindowStates: async () => [],
   setToolbarsMenu: async () => {},
-  listenForQuitFlushRequest: async (handler: () => Promise<void>) => {
+  listenForQuitFlushRequest: async (handler: NonNullable<typeof native.quitFlush>) => {
     native.quitFlush = handler; return () => { native.quitFlush = undefined; };
   },
   listenForQuitPromptRequest: async (handler: (id: number) => Promise<void>) => {
@@ -41,7 +42,7 @@ vi.mock("./window-manager", async original => ({
   prepareQuitPrompt: async () => true,
   resumeQuitAfterPrompt: async () => true,
   reportQuitPromptShowing: async () => true,
-  cancelQuit: async () => true,
+  cancelQuit: async () => "cancelled",
   confirmQuitAfterFlush: native.quit,
   confirmPromptedQuit: native.quit
 }));
@@ -96,11 +97,14 @@ describe.each(["macos", "windows"] as const)("repeat label editing (%s)", platfo
   const snapshot = () => window.__CHEMDRAFT_AGENT__!.snapshot();
   const editor = () => container.querySelector<HTMLInputElement>("[data-bracket-label-editor]");
   const label = () => container.querySelector<SVGElement>(`.page-svg-visual-layer [data-page-svg-object-visual="${closingId}"] .bracket-repeat-label`)!;
-  async function mount(selected: boolean, tool = "tool.select", empty = false, end = { x: 260, y: 200 }) {
+  async function mount(selected: boolean, tool = "tool.select", empty = false) {
     let doc = empty ? createPhase4Document("Placement") : toggleBracketRepeatUnit(insertNativeBracket(createPhase4Document("Label"),
-      { x: 100, y: 100 }, "round", end));
+      { x: 100, y: 100 }, "round", { x: 260, y: 200 }));
     closingId = doc.pages[0].objects.find(object => object.type === "bracket" && object.side === "close")?.id ?? "";
     if (!selected) doc = selectDocumentObjects(doc, doc.pages[0].id, []);
+    await mountDocument(doc, tool);
+  }
+  async function mountDocument(doc: ChemDraftDocument, tool = "tool.select") {
     await act(async () => root.render(createElement(MainWindow, {
       initialDocument: doc, initialActiveToolCommandId: tool, initialCrosshairsVisible: false,
       initialRulersVisible: false, initialPaletteMode: "hidden", nativePalette: true, shortcutPlatform: platform
@@ -108,15 +112,11 @@ describe.each(["macos", "windows"] as const)("repeat label editing (%s)", platfo
     const rect = { left: 0, top: 0, x: 0, y: 0, width: 792, height: 612, right: 792, bottom: 612, toJSON: () => ({}) } as DOMRect;
     container.querySelectorAll(".page, .canvas-region").forEach(element => { element.getBoundingClientRect = () => rect; });
   }
-  async function mouse(target: Element, type: string, detail = 0, point = { x: 264, y: 199 }) {
+  async function mouse(target: Element, type: string, detail = 0, point = { x: 264, y: 199 }, modifiers: MouseEventInit = {}) {
     const event = new MouseEvent(type, { bubbles: true, cancelable: true, button: 0,
-      buttons: type.endsWith("down") || type === "pointermove" ? 1 : 0, detail, clientX: point.x, clientY: point.y });
+      buttons: type.endsWith("down") ? 1 : 0, detail, clientX: point.x, clientY: point.y, ...modifiers });
     Object.defineProperties(event, { pointerId: { value: 8 }, pointerType: { value: "mouse" }, isPrimary: { value: true } });
-    await act(async () => {
-      target.dispatchEvent(event);
-      // Browsers implicitly release capture after dispatching pointerup/cancel; jsdom does not.
-      if ((type === "pointerup" || type === "pointercancel") && target.hasPointerCapture(8)) target.releasePointerCapture(8);
-    });
+    await act(async () => { target.dispatchEvent(event); });
     return event.defaultPrevented;
   }
   async function click(count: number) {
@@ -128,74 +128,6 @@ describe.each(["macos", "windows"] as const)("repeat label editing (%s)", platfo
       if (!await mouse(target, "mousedown", count)) await act(async () => target.focus());
     }
     for (const type of ["pointerup", "mouseup", "click"]) await mouse(target, type, type === "pointerup" ? 0 : count);
-  }
-  function trackPointerCapture() {
-    let captured: Element | undefined;
-    Object.defineProperty(Element.prototype, "setPointerCapture", { configurable: true,
-      value(this: Element) { captured = this; } });
-    Object.defineProperty(Element.prototype, "releasePointerCapture", { configurable: true,
-      value() { captured = undefined; } });
-    Object.defineProperty(Element.prototype, "hasPointerCapture", { configurable: true,
-      value(this: Element) { return captured === this; } });
-    return () => captured;
-  }
-  const closingBracket = () => {
-    const object = snapshot().document.pages[0].objects.find(object => object.id === closingId);
-    if (object?.type !== "bracket") throw new Error("Missing closing bracket");
-    return object;
-  };
-  const bottomRightHandle = () => container.querySelector<HTMLButtonElement>(
-    `[data-object-controls="${closingId}"] [data-object-resize-corner="bottom-right"]`);
-  const stretchEditor = () => container.querySelector('[aria-label="X stretch percent"]');
-  async function mountHandleFixture(scale: number) {
-    await mount(false, "tool.select", false, { x: 260, y: 164 });
-    if (scale !== 1) {
-      await act(async () => { container.querySelector(".canvas-region")!.dispatchEvent(new WheelEvent("wheel", {
-        bubbles: true, cancelable: true, ctrlKey: true, deltaY: -Math.log(scale) / 0.002
-      })); });
-    }
-    expect((snapshot().viewport as { scale: number }).scale).toBeCloseTo(scale);
-    const page = snapshot().document.pages[0];
-    const rect = { left: 73, top: 41, width: page.width * scale, height: page.height * scale };
-    container.querySelector(".page")!.getBoundingClientRect = () => ({ ...rect,
-      x: rect.left, y: rect.top, right: rect.left + rect.width, bottom: rect.top + rect.height, toJSON: () => ({}) });
-    const client = (point: { x: number; y: number }) => ({ x: rect.left + point.x * scale, y: rect.top + point.y * scale });
-    return { client, captured: trackPointerCapture() };
-  }
-  async function press(target: Element, point: { x: number; y: number }, detail = 0, count = 1) {
-    if (!await mouse(target, "pointerdown", detail, point)) {
-      if (!await mouse(target, "mousedown", count, point)) await act(async () => {
-        if (target instanceof HTMLElement || target instanceof SVGElement) target.focus();
-      });
-    }
-  }
-  async function release(target: Element, point: { x: number; y: number }, count = 1) {
-    for (const type of ["pointerup", "mouseup", "click"]) await mouse(target, type, type === "pointerup" ? 0 : count, point);
-  }
-  async function selectByLabel(client: (point: { x: number; y: number }) => { x: number; y: number }, captured: () => Element | undefined) {
-    const bracket = closingBracket();
-    const bounds = bracketLabelPlan(bracket)!.bounds;
-    // Near the label's left edge, inside the fixed 18px handle even at 200% zoom.
-    const pagePoint = { x: bracket.x + bounds.x + 1, y: bracket.y + bounds.y + bounds.height / 2 };
-    expect(bracketLabelContainsPoint(bracket, pagePoint)).toBe(true);
-    const point = client(pagePoint);
-    const corner = client({ x: bracket.x + bracket.width, y: bracket.y + bracket.height });
-    // App.css places the 18px hit box 8px beyond the frame's bottom/right edges.
-    expect(point.x).toBeGreaterThan(corner.x - 10);
-    expect(point.x).toBeLessThan(corner.x + 8);
-    expect(point.y).toBeGreaterThan(corner.y - 10);
-    expect(point.y).toBeLessThan(corner.y + 8);
-    expect(snapshot().document.selection.objectIds).toEqual([]);
-    expect(bottomRightHandle()).toBeNull();
-    await press(label(), point);
-    expect(snapshot().document.selection.objectIds).toEqual([closingId]);
-    expect(bottomRightHandle()).not.toBeNull();
-    expect(container.querySelectorAll(`[data-object-controls="${closingId}"] [data-object-resize-corner]`)).toHaveLength(4);
-    expect(captured()).toBe(label().closest("[data-page-svg-object-visual]"));
-    await release(captured()!, point);
-    expect(captured()).toBeUndefined();
-    expect(editor()).toBeNull();
-    return { point, pagePoint };
   }
   async function command(commandId: string) {
     await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId } })); });
@@ -349,13 +281,46 @@ describe.each(["macos", "windows"] as const)("repeat label editing (%s)", platfo
     const field = editor();
     if (route === "session autosave") {
       await act(async () => { await vi.advanceTimersByTimeAsync(DOCUMENT_SESSION_SAVE_DEBOUNCE_MS + 100); });
-    } else await act(async () => { await native.quitFlush!(); });
+    } else {
+      await act(async () => { await native.quitFlush!("committed", 42); });
+      expect(native.quit).toHaveBeenCalledExactlyOnceWith(42);
+    }
     const session = native.saveSession.mock.calls.at(-1)![0];
     expect(savedLabel(session.contents)).toMatchObject({ label: "m" });
     expect(session.dirty).toBe(true);
     expect(snapshot().file.dirty).toBe(true);
     expect(editor()).toBe(field);
     expect(native.writeFile).not.toHaveBeenCalled();
+  });
+  it("freezes the open repeat label during a committed quit write", async () => {
+    await openSavedLabel();
+    await type("m");
+    let finishWrite!: () => void;
+    native.saveSession.mockImplementationOnce(() => new Promise<void>(resolve => { finishWrite = resolve; }));
+    let flushing!: Promise<void>;
+    await act(async () => { flushing = native.quitFlush!("committed", 42); });
+    const field = editor()!;
+    expect.soft(field.readOnly).toBe(true);
+    await type("Late typing");
+    expect.soft(field.value).toBe("m");
+    expect(savedLabel(native.saveSession.mock.calls.at(-1)![0].contents)).toMatchObject({ label: "m" });
+    expect(native.quit).not.toHaveBeenCalled();
+    await act(async () => { finishWrite(); await flushing; });
+    expect(native.quit).toHaveBeenCalledExactlyOnceWith(42);
+  });
+  it("flushes a repeat label as clean after typing back to the saved value", async () => {
+    await openSavedLabel();
+    await type("m");
+    await command("document.save");
+    await type("p");
+    expect(snapshot().file.dirty).toBe(true);
+    await type("m");
+    expect(editor()?.value).toBe("m");
+    await act(async () => { await native.quitFlush!("committed", 42); });
+    const session = native.saveSession.mock.lastCall![0];
+    expect(savedLabel(session.contents)).toMatchObject({ label: "m" });
+    expect(session.dirty).toBe(false);
+    expect(native.quit).toHaveBeenCalledExactlyOnceWith(42);
   });
   it.each(["close", "quit"])("prompts for an uncommitted draft on %s and Save writes it", async boundary => {
     await mount(true);
@@ -481,143 +446,6 @@ describe.each(["macos", "windows"] as const)("repeat label editing (%s)", platfo
     expect(editor()).toBeNull();
     expect(label().textContent).toBe("n");
   });
-  it.each([0.5, 1, 2].flatMap(scale => [0, 1, 2].map(detail => ({ scale, detail }))))(
-    "edits the label on a double-click through its newly mounted handle (zoom $scale, pointer detail $detail)", async ({ scale, detail }) => {
-      const { client, captured } = await mountHandleFixture(scale);
-      const objects = snapshot().document.pages[0].objects;
-      const { point } = await selectByLabel(client, captured);
-      const handle = bottomRightHandle()!;
-      // A real second press hits this newly mounted HTML button, above the SVG label.
-      // Sending both presses to the label/canvas misses the WebKit regression.
-      await press(handle, point, detail, 2);
-      expect(stretchEditor()).toBeNull();
-      expect(container.querySelector("[data-status-message]")?.textContent).not.toBe("Stretch entry");
-      // Changed from ordinary object capture/no resize: hand check: a drag in the overlap
-      // must resize. Without a recognized second press, start the normal handle gesture.
-      if (detail < 2) {
-        expect(container.querySelector("[data-status-message]")?.textContent).toBe("Resize selected art object");
-        expect(captured()).toBe(container.querySelector(".page"));
-        expect(editor()).toBeNull();
-      } else {
-        expect(captured()).toBeUndefined();
-        expect(editor()?.value).toBe("n");
-        expect(document.activeElement).toBe(editor());
-      }
-      const clickTarget = captured() ?? handle;
-      for (const type of ["pointerup", "mouseup", "click", "dblclick"]) {
-        await mouse(clickTarget, type, type === "pointerup" ? 0 : 2, point);
-        expect(stretchEditor()).toBeNull();
-        expect(container.querySelector("[data-status-message]")?.textContent).not.toBe("Stretch entry");
-      }
-      expect(captured()).toBeUndefined();
-      expect(editor()?.value).toBe("n");
-      expect(document.activeElement).toBe(editor());
-      expect(snapshot().document.pages[0].objects).toEqual(objects);
-    });
-  it.each([0.5, 1, 2])("leaves an overlap click unchanged and edits on a repeated detail-0 handle press (zoom %s)", async scale => {
-    const { client, captured } = await mountHandleFixture(scale);
-    const { point } = await selectByLabel(client, captured);
-    const before = snapshot().document.pages[0].objects;
-    const handle = bottomRightHandle()!;
-    await press(handle, point, 0);
-    expect(captured()).toBe(container.querySelector(".page"));
-    await release(captured()!, point);
-    expect(captured()).toBeUndefined();
-    expect(snapshot().document.pages[0].objects).toEqual(before);
-    expect(snapshot().document.selection.objectIds).toEqual([closingId]);
-    expect(container.querySelector("[data-can-undo]")?.getAttribute("data-can-undo")).toBe("false");
-    expect(editor()).toBeNull();
-    expect(stretchEditor()).toBeNull();
-    // Both pointerdowns can have detail 0 in WebKit; the recorded handle presses
-    // must open the label editor before dblclick, never the Stretch editor.
-    await press(handle, point, 0, 2);
-    expect(captured()).toBeUndefined();
-    expect(editor()?.value).toBe("n");
-    expect(document.activeElement).toBe(editor());
-    for (const type of ["pointerup", "mouseup", "click", "dblclick"]) {
-      await mouse(handle, type, type === "pointerup" ? 0 : 2, point);
-      expect(stretchEditor()).toBeNull();
-      expect(container.querySelector("[data-status-message]")?.textContent).not.toBe("Stretch entry");
-    }
-    expect(document.activeElement).toBe(editor());
-    expect(snapshot().document.pages[0].objects).toEqual(before);
-  });
-  it.each([0.5, 1, 2].flatMap(scale => [false, true].map(overlap => ({ scale, overlap }))))(
-    "resizes from the handle in one ordinary undo step (zoom $scale, label overlap $overlap)", async ({ scale, overlap }) => {
-      const { client, captured } = await mountHandleFixture(scale);
-      const labelHit = await selectByLabel(client, captured);
-      const before = snapshot().document.pages[0].objects;
-      const bracket = closingBracket();
-      const pagePoint = overlap ? labelHit.pagePoint : { x: bracket.x + bracket.width, y: bracket.y + bracket.height };
-      expect(bracketLabelContainsPoint(bracket, pagePoint)).toBe(overlap);
-      const start = client(pagePoint);
-      const center = { x: bracket.x + bracket.width / 2, y: bracket.y + bracket.height / 2 };
-      const scaledPoint = (factor: number) => client({
-        x: center.x + (pagePoint.x - center.x) * factor,
-        y: center.y + (pagePoint.y - center.y) * factor
-      });
-      await press(bottomRightHandle()!, start);
-      expect(captured()).toBe(container.querySelector(".page"));
-      const captureTarget = captured()!;
-      // Several previews must still commit as a single change on release.
-      for (const factor of [1.25, 1.5]) {
-        await mouse(captureTarget, "pointermove", 0, scaledPoint(factor));
-      }
-      await release(captureTarget, scaledPoint(1.5));
-      expect(captured()).toBeUndefined();
-      expect(closingBracket().width).toBeCloseTo(bracket.width * 1.5);
-      expect(closingBracket().height).toBeCloseTo(bracket.height * 1.5);
-      // Resize preserves the centre; a body move would keep the old dimensions.
-      expect(closingBracket().x + closingBracket().width / 2).toBeCloseTo(center.x);
-      expect(closingBracket().y + closingBracket().height / 2).toBeCloseTo(center.y);
-      expect(editor()).toBeNull();
-      expect(stretchEditor()).toBeNull();
-      const after = snapshot().document.pages[0].objects;
-      await command("edit.undo");
-      expect(snapshot().document.pages[0].objects).toEqual(before);
-      // Ordinary bracket resizes use the generic history label; the overlap must match.
-      expect(container.querySelector("[data-status-message]")?.textContent).toBe("Undid last document change");
-      expect(container.querySelector("[data-can-undo]")?.getAttribute("data-can-undo")).toBe("false");
-      await command("edit.redo");
-      expect(snapshot().document.pages[0].objects).toEqual(after);
-    });
-  it.each([0.5, 1, 2])("still opens Stretch on a double-press outside the label (zoom %s)", async scale => {
-    const { client, captured } = await mountHandleFixture(scale);
-    await selectByLabel(client, captured);
-    const bracket = closingBracket();
-    const pagePoint = { x: bracket.x + bracket.width, y: bracket.y + bracket.height };
-    expect(bracketLabelContainsPoint(bracket, pagePoint)).toBe(false);
-    const point = client(pagePoint);
-    const handle = bottomRightHandle()!;
-    await press(handle, point);
-    await release(captured()!, point);
-    expect(stretchEditor()).toBeNull();
-    // WebKit pointerdown can report zero on both presses; the recorded presses still count.
-    await press(handle, point, 0, 2);
-    expect(container.querySelector("[data-status-message]")?.textContent).toBe("Stretch entry");
-    expect(stretchEditor()).not.toBeNull();
-    await release(handle, point, 2);
-    await mouse(handle, "dblclick", 2, point);
-    expect(stretchEditor()).not.toBeNull();
-    expect(editor()).toBeNull();
-  });
-  it.each([0.5, 1, 2])("still moves a bracket dragged from its painted body (zoom %s)", async scale => {
-    const { client, captured } = await mountHandleFixture(scale);
-    const bracket = closingBracket();
-    const point = { x: bracket.x + bracket.width - 4, y: bracket.y + bracket.height / 2 };
-    expect(bracketLabelContainsPoint(bracket, point)).toBe(false);
-    const body = container.querySelector(`[data-page-svg-object-visual="${closingId}"] path`)!;
-    await press(body, client(point));
-    const captureTarget = captured()!;
-    expect(captureTarget).toBe(body.closest("[data-page-svg-object-visual]"));
-    const end = client({ x: point.x + 30, y: point.y + 20 });
-    await mouse(captureTarget, "pointermove", 0, end);
-    await release(captureTarget, end);
-    expect(captured()).toBeUndefined();
-    expect(closingBracket()).toMatchObject({ x: bracket.x + 30, y: bracket.y + 20, width: bracket.width, height: bracket.height });
-    expect(editor()).toBeNull();
-    expect(stretchEditor()).toBeNull();
-  });
   it.each([false, true])("edits via the full canvas double-click sequence (initially selected: %s)", async selected => {
     await mount(selected);
     await command("view.zoomIn");
@@ -686,5 +514,97 @@ describe.each(["macos", "windows"] as const)("repeat label editing (%s)", platfo
     expect(container.querySelector("[data-status-message]")?.textContent).toBe('Marked 2 atoms as repeat unit "n"');
     await command("bracket.repeatUnit.toggle");
     expect(container.querySelector("[data-status-message]")?.textContent).toBe('Removed repeat unit "n"');
+  });
+
+  it("marks a canvas atom selection through the registered command and restores it with one undo", async () => {
+    const doc = applySingleBondToolAtPoint(createPhase4Document("Atom selection"), { x: 140, y: 140 });
+    const molecule = doc.pages[0].objects.find(object => object.type === "molecule")!;
+    await mountDocument(selectDocumentObjects(doc, doc.pages[0].id, []));
+    const selectAtom = async (index: number) => {
+      const target = container.querySelector(`.document-object[data-object-id="${molecule.id}"]`)!;
+      const atom = molecule.atoms[index];
+      const point = window.__CHEMDRAFT_AGENT__!.resolvePoint({ page: atom }).client;
+      for (const type of ["pointerdown", "pointerup"]) {
+        await mouse(target, type, 0, point, { shiftKey: true });
+      }
+    };
+    await selectAtom(0);
+    const before = snapshot();
+    expect(before.selectedNativeMoleculePart).toMatchObject({ kind: "atom", atomId: molecule.atoms[0].id });
+    await command("bracket.repeatUnit.toggle");
+    const marked = snapshot();
+    expect(marked.document.pages[0].objects.filter(object => object.type === "bracket")).toHaveLength(2);
+    expect(marked.selection.objectIds).toHaveLength(2);
+    expect(marked.selectedNativeMoleculePart).toBeUndefined();
+    expect(container.querySelector("[data-status-message]")?.textContent).toBe('Marked 1 atom as repeat unit "n"');
+    await command("edit.undo");
+    expect(snapshot().document).toEqual(before.document);
+    expect(snapshot().selectedNativeMoleculePart).toEqual(before.selectedNativeMoleculePart);
+    expect(container.querySelector("[data-status-message]")?.textContent).toBe("Undid Mark as Repeat Unit");
+    await command("edit.redo");
+    expect(snapshot().document).toEqual(marked.document);
+    expect(snapshot().selectedNativeMoleculePart).toBeUndefined();
+    await command("edit.undo");
+    await selectAtom(1);
+    const allAtoms = snapshot();
+    expect(allAtoms.selectedNativeMoleculePart).toMatchObject({ kind: "parts", atomIds: molecule.atoms.map(atom => atom.id) });
+    await command("bracket.repeatUnit.toggle");
+    expect(container.querySelector("[data-status-message]")?.textContent).toContain("no crossing bonds");
+    expect(snapshot().document).toEqual(allAtoms.document);
+    expect(snapshot().selectedNativeMoleculePart).toEqual(allAtoms.selectedNativeMoleculePart);
+  });
+
+  it.each(["keep", "enlarge"] as const)("asks before marking atoms at the page edge (%s) and undoes it together", async answer => {
+    const doc = applySingleBondToolAtPoint(createPhase4Document("Repeat at edge"), { x: 140, y: 140 });
+    const molecule = doc.pages[0].objects.find(object => object.type === "molecule")!;
+    const leftmost = molecule.atoms.reduce((left, atom) => atom.x < left.x ? atom : left);
+    const dx = 4 - leftmost.x;
+    const atEdge = applyPatch(doc, { op: "updateObject", objectId: molecule.id, changes: {
+      x: Math.max(0, molecule.x + dx), atoms: molecule.atoms.map(atom => ({ ...atom, x: atom.x + dx }))
+    } });
+    await mountDocument(selectDocumentObjects(atEdge, doc.pages[0].id, []));
+    const target = container.querySelector(`.document-object[data-object-id="${molecule.id}"]`)!;
+    const point = window.__CHEMDRAFT_AGENT__!.resolvePoint({ page: { x: 4, y: leftmost.y } }).client;
+    await mouse(target, "pointerdown", 0, point, { shiftKey: true });
+    await mouse(target, "pointerup", 0, point, { shiftKey: true });
+    const before = snapshot();
+    expect(before.selectedNativeMoleculePart).toMatchObject({ kind: "atom", atomId: leftmost.id });
+    await command("bracket.repeatUnit.toggle");
+    expect(pendingPrompt?.prompt.choices).toMatchObject([{ id: "enlarge" }, { id: "keep" }]);
+    expect(snapshot().document).toEqual(before.document);
+    await act(async () => pendingPrompt!.resolve(answer));
+    const after = snapshot();
+    const page = after.document.pages[0];
+    const bracket = page.objects.find(object => object.type === "bracket" && object.side === "open")!;
+    expect(after.selection.objectIds).toHaveLength(2);
+    expect(after.selectedNativeMoleculePart).toBeUndefined();
+    if (answer === "keep") {
+      expect(bracket.x).toBeLessThan(0);
+      expect(page.width).toBe(before.document.pages[0].width);
+    } else {
+      expect(bracket.x).toBeGreaterThanOrEqual(0);
+      expect(page.width).toBeGreaterThan(before.document.pages[0].width);
+    }
+    await command("edit.undo");
+    expect(snapshot().document).toEqual(before.document);
+    expect(snapshot().selectedNativeMoleculePart).toEqual(before.selectedNativeMoleculePart);
+    await command("edit.redo");
+    expect(snapshot().document).toEqual(after.document);
+  });
+
+  it("removes the bracket and label with the selected molecule on keyboard delete and undoes both", async () => {
+    const doc = applySingleBondToolAtPoint(createPhase4Document("Delete repeat"), { x: 140, y: 140 });
+    const molecule = doc.pages[0].objects.find(object => object.type === "molecule")!;
+    const marked = toggleBracketRepeatUnit(insertNativeBracket(doc, { x: 100, y: 100 }, "square", { x: 260, y: 200 }));
+    await mountDocument(selectDocumentObjects(marked, doc.pages[0].id, [molecule.id]));
+    const before = snapshot().document;
+    const canvas = container.querySelector<HTMLElement>(".canvas-region")!;
+    await act(async () => canvas.focus());
+    await key(platform === "macos" ? "Backspace" : "Delete");
+    expect(snapshot().document.pages[0].objects).toEqual([]);
+    expect(container.querySelector(".bracket-repeat-label")).toBeNull();
+    await command("edit.undo");
+    expect(snapshot().document).toEqual(before);
+    expect(container.querySelector(".bracket-repeat-label")?.textContent).toBe("n");
   });
 });

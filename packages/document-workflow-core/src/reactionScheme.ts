@@ -3,6 +3,7 @@
 import {
   createEmptyDocument,
   DocumentTextStyle,
+  moleculeToMolfileV2000,
   type ArrowObject,
   type ChemDraftDocument,
   type MoleculeObject,
@@ -11,7 +12,7 @@ import {
   type TextObject,
   textStyleToObjectStyle
 } from "@chemdraft/chem-core";
-import { moleculeInkBounds, reactionArrowInkBounds, reactionSchemeDrawingMetrics, representativeMoleculeBondLength,
+import { moleculeInkBounds, nativeBondOrderResolution, reactionArrowInkBounds, reactionSchemeDrawingMetrics, representativeMoleculeBondLength,
   type FigureStyle } from "@chemdraft/layout-engine";
 import type { ReactionAlignmentBudget, ReactionProductAligner } from "@chemdraft/rdkit-adapter/depiction";
 import { createNativeReactionArrow } from "./reactionArrows";
@@ -20,6 +21,7 @@ import { defaultDoubleBondSide, normalizeNativeMoleculeGeometry, pastedStructure
 import { layoutReactionLabels, planReactionLabels } from "./reactionLabels";
 import { phase4Timestamp } from "./shared";
 import { nativeTextObjectSizeForText } from "./textObjects";
+import { nativeSingleBondGraphMetadata } from "./atoms";
 
 export interface LayoutBounds {
   minX: number;
@@ -122,13 +124,25 @@ export async function layoutReactionSchemeAsync(options: ReactionSchemeLayoutOpt
 /** Persist real label atoms, just like authored abbreviations: nothing invisible remains
  * selectable behind them. Chemistry consumers expand these through the shared label grammar. */
 function condenseSchemeLabels(molecule: MoleculeObject): MoleculeObject {
+  const rebuild = (atoms: MoleculeObject["atoms"], bonds: MoleculeObject["bonds"]): MoleculeObject => {
+    const condensed = { ...molecule, atoms, bonds };
+    const { contents, warnings } = moleculeToMolfileV2000(condensed, {
+      fromDocFrame: true, kekuleBondOrders: nativeBondOrderResolution(atoms, bonds).kekuleOrders
+    });
+    return { ...condensed, structureFormat: "molfile-v2000", structure: contents,
+      chemistry: nativeSingleBondGraphMetadata(atoms, bonds),
+      ...(warnings.length ? { compatibility: { ...molecule.compatibility,
+        unknown: molecule.compatibility?.unknown ?? {},
+        warnings: [...(molecule.compatibility?.warnings ?? []),
+          ...warnings.map(message => ({ code: "molfile.stored_structure_lossy", message }))] } } : {}) };
+  };
   const eligible = (atom: MoleculeObject["atoms"][number]) => atom.isotope === undefined &&
     !atom.labelLiteral && !atom.markRadicals && !atom.markCharge && atom.labelVisible !== false;
   if (molecule.atoms.length === 2 && !molecule.bonds.length && molecule.atoms.every(eligible)) {
     const sodium = molecule.atoms.find(a => a.element === "Na" && a.formalCharge === 1 && !a.hydrogenCount);
     const hydroxide = molecule.atoms.find(a => a.element === "O" && a.formalCharge === -1 &&
       (a.hydrogenCount === undefined || a.hydrogenCount === 1));
-    if (sodium && hydroxide) return { ...molecule, atoms: [{ ...sodium, element: "NaOH", schemeAbbreviation: "NaOH", formalCharge: 0, labelVisible: true }] };
+    if (sodium && hydroxide) return rebuild([{ ...sodium, element: "NaOH", schemeAbbreviation: "NaOH", formalCharge: 0, labelVisible: true }], []);
   }
   let atoms = molecule.atoms, bonds = molecule.bonds;
   for (const metal of molecule.atoms.filter(a => a.element === "Mg" && a.formalCharge === 0 && !a.hydrogenCount && eligible(a))) {
@@ -153,7 +167,7 @@ function condenseSchemeLabels(molecule: MoleculeObject): MoleculeObject {
       (atoms[0]!.hydrogenCount === undefined || atoms[0]!.hydrogenCount === 2) && eligible(atoms[0]!)) {
     atoms = [{ ...atoms[0]!, element: "H2O", labelVisible: true }];
   }
-  return atoms === molecule.atoms ? molecule : { ...molecule, atoms, bonds };
+  return atoms === molecule.atoms ? molecule : rebuild(atoms, bonds);
 }
 
 /** Read the native roles of every step in page order, including shared intermediates. */

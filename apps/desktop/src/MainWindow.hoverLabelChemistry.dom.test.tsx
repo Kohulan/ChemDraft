@@ -3,6 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { applyPatches, type MoleculeObject } from "@chemdraft/chem-core";
+import { Molecule } from "openchemlib";
 import { MainWindow } from "./MainWindow";
 import { createPhase4Document, insertNativeSingleBondMolecule, insertNativeTemplateMolecule, selectDocumentObjects } from "./documentWorkflow";
 import { saveKeybindingSettings } from "./keybindingSettings";
@@ -41,10 +42,10 @@ describe.each(["macos", "windows"] as const)("hover label chemistry and history 
     vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals();
   });
 
-  async function mount(initial = insertNativeTemplateMolecule(createPhase4Document("Hover chemistry"), { x: 300, y: 300 }, "benzene")) {
+  async function mount(initial = insertNativeTemplateMolecule(createPhase4Document("Hover chemistry"), { x: 300, y: 300 }, "benzene"), tool = "tool.bond") {
     await act(async () => root.render(<MainWindow
       initialDocument={selectDocumentObjects(initial, initial.pages[0].id, [])}
-      initialActiveToolCommandId="tool.bond" initialPaletteMode="hidden" initialRulersVisible={false}
+      initialActiveToolCommandId={tool} initialPaletteMode="hidden" initialRulersVisible={false}
       initialCrosshairsVisible={false} nativePalette={true} shortcutPlatform={platform}
     />));
     const rect = { x: 0, y: 0, left: 0, top: 0, right: 792, bottom: 612, width: 792, height: 612, toJSON: () => ({}) };
@@ -169,12 +170,42 @@ describe.each(["macos", "windows"] as const)("hover label chemistry and history 
       const hydrogenCount = template === "benzene" ? 5 : 11;
       const formula = label === "OMe" ? `C7H${hydrogenCount + 3}O` : label === "CF3" ? `C7H${hydrogenCount}F3` : `C6H${hydrogenCount}${label}`;
       expect(after.chemistry?.formula, label).toBe(formula);
+      if (label === "Cl") {
+        const expected = template === "benzene" ? "Clc1ccccc1" : "ClC1CCCCC1";
+        expect(Molecule.fromSmiles(after.structure).toSmiles()).toBe(Molecule.fromSmiles(expected).toSmiles());
+      }
       expect(container.querySelector("[data-invalid-atom-id]"), label).toBeNull();
       await key("z", historyModifiers);
       expect(molecule()).toEqual(before);
+      expect(container.querySelector("main")?.getAttribute("data-can-undo")).toBe("false");
       await key("z", { ...historyModifiers, shiftKey: true });
       expect(molecule()).toEqual(after);
     }
+  });
+
+  it("replaces the ring vertex when I is typed into the atom-label editor", async () => {
+    await mount(insertNativeTemplateMolecule(createPhase4Document("Edit ring label"), { x: 300, y: 300 }, "cyclohexane"), "tool.atom");
+    const before = molecule();
+    const source = before.atoms[0]!;
+    const event = new MouseEvent("pointerdown", {
+      bubbles: true, cancelable: true, button: 0, buttons: 1, clientX: source.x, clientY: source.y, detail: 1
+    });
+    Object.defineProperties(event, { pointerId: { value: 7 }, pointerType: { value: "mouse" }, isPrimary: { value: true } });
+    await act(async () => wrapper().dispatchEvent(event));
+    expect(editor()?.dataset.atomId).toBe(source.id);
+    expect(document.activeElement).toBe(editor());
+    await type("I");
+    const after = molecule();
+    expect(after.atoms).toEqual([{ ...source, element: "I", labelLiteral: true }, ...before.atoms.slice(1)]);
+    expect(after.bonds).toEqual(before.bonds);
+    expect(after.bonds.filter(bond => [bond.fromAtomId, bond.toAtomId].includes(source.id))).toHaveLength(2);
+    expect(after.chemistry?.formula).toBe("C5H10I");
+    expect(Molecule.fromSmiles(after.structure).toSmiles()).toBe(Molecule.fromSmiles("[I]1CCCCC1").toSmiles());
+    await navigateHistory("undo", "shortcut");
+    expect(molecule()).toEqual(before);
+    expect(container.querySelector("main")?.getAttribute("data-can-undo")).toBe("false");
+    await navigateHistory("redo", "shortcut");
+    expect(molecule()).toEqual(after);
   });
 
   it("retyping Cl on an existing Cl ring atom is a plain relabel with no new atom", async () => {

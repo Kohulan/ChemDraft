@@ -18,7 +18,7 @@ function repeatUnits(page: DocumentPage) {
     const visible = visibleBracketGroup(pair, semantics, resolved, objects);
     const visibleMembers = [...new Set(visible.members.map(member => JSON.stringify(member)))].sort();
     units.set(id, { identity: JSON.stringify([usage, label, count, members, resolved.connectivity, brackets,
-      visible.usage, visible.sruLabel, visible.repeatCount, visibleMembers]),
+      visible.usage, visible.usageConflict, visible.caseOnlyGlyphUsages, visible.sruLabel, visible.repeatCount, visibleMembers]),
       generic: usage === "generic", unresolved: resolved.reason });
   }
   return units;

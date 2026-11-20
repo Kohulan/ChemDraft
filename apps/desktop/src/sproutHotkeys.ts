@@ -1,6 +1,6 @@
 import { applyPatches, clearChangedAtomHydrogenHints, type ChemDraftDocument, type MoleculeAtom, type MoleculeBond, type MoleculeObject } from "@chemdraft/chem-core";
 import {
-  atomBondOrderUsageMap, nativeAtomLabelReading, nativeAtomValidationState, nativeImplicitHydrogenCount,
+  atomBondOrderUsageMap, nativeAtomChargeSupportsValence, nativeAtomExternalValence, nativeAtomLabelReading, nativeAtomValidationState, nativeImplicitHydrogenCount,
   nativeSingleBondGraphMetadata, normalizeNativeMoleculeGeometry, phase4Timestamp,
   tryNativeSingleBondGraphSmiles, withNativeLabelBondSides
 } from "@chemdraft/document-workflow-core";
@@ -13,19 +13,12 @@ import type { FragmentSproutKind } from "./commands";
 import { loadDrawingSettings } from "./drawingSettings";
 export type { FragmentSproutKind } from "./commands";
 
-type NativeOxoHotkeyResult = {
-  document: ChemDraftDocument;
-  refusal?: NativeAtomSproutHotkeyResult["refusal"] | "atom-no-free-valence";
-};
-
 function moleculeAt(document: ChemDraftDocument, target: NativeMoleculeDeleteTarget): MoleculeObject | undefined {
   return document.pages[0].objects.find((object): object is MoleculeObject => object.id === target.objectId && object.type === "molecule");
 }
 
 /** Finish a graph edit through the same chemistry and geometry derivations as native drawing. */
-function commitGraph(document: ChemDraftDocument, before: MoleculeObject, atoms: MoleculeAtom[], bonds: MoleculeBond[]): NativeAtomSproutHotkeyResult;
-function commitGraph(document: ChemDraftDocument, before: MoleculeObject, atoms: MoleculeAtom[], bonds: MoleculeBond[], validateOxo: true): NativeOxoHotkeyResult;
-function commitGraph(document: ChemDraftDocument, before: MoleculeObject, atoms: MoleculeAtom[], bonds: MoleculeBond[], validateOxo = false): NativeOxoHotkeyResult {
+function commitGraph(document: ChemDraftDocument, before: MoleculeObject, atoms: MoleculeAtom[], bonds: MoleculeBond[], validateOxo = false): NativeAtomSproutHotkeyResult {
   atoms = withNativeLabelBondSides({ atoms: clearChangedAtomHydrogenHints(before, atoms, bonds), bonds }).atoms;
   // Oxo hotkeys retain their oxidation gate; other drawing edits diagnose valence after the edit.
   if (validateOxo) for (const atom of atoms) {
@@ -92,6 +85,22 @@ export function nativeFragmentSproutTarget(document: ChemDraftDocument, target: 
   }
   const graph = moleculeAt(result.document, target)!;
   return commitGraph(document, before, graph.atoms, graph.bonds);
+}
+
+/** The benzene shortcut shares a carbon vertex when it can take a single and a double bond. */
+export function nativeBenzeneHotkeyAtAtomTarget(document: ChemDraftDocument, target: NativeMoleculeDeleteTarget, plan?: NativeBondGrowthPlan): NativeAtomSproutHotkeyResult {
+  const molecule = moleculeAt(document, target);
+  const source = target.kind === "atom" ? molecule?.atoms.find(atom => atom.id === target.atomId) : undefined;
+  const reading = source && nativeAtomLabelReading(source.element);
+  if (molecule && source && (reading?.kind === "element" || reading?.kind === "spelled") && reading.element === "C") {
+    const usage = nativeAtomExternalValence(molecule, source) + (reading.kind === "spelled" ? reading.hydrogens : 0);
+    if (!nativeAtomChargeSupportsValence("C", usage + 3, source.formalCharge)) {
+      return nativeAtomChargeSupportsValence("C", usage + 1, source.formalCharge)
+        ? nativeFragmentSproutTarget(document, target, "phenyl", plan)
+        : { document, refusal: "atom-no-free-valence" };
+    }
+  }
+  return nativeRingHotkeyAttachAtAtomTarget(document, target, "benzene", plan);
 }
 
 function addDiene(document: ChemDraftDocument, before: MoleculeObject, graph: MoleculeObject, saturatedAtomId?: string, sharedBond?: MoleculeBond): NativeAtomSproutHotkeyResult {
@@ -163,7 +172,7 @@ function oxygenGraph(graph: MoleculeObject, atomId: string, document: ChemDraftD
 }
 
 /** Key 2 adds oxygen directly to S/P, preserving their explicit labels, charge and isotope. */
-export function nativeOxoHotkeyTarget(document: ChemDraftDocument, target: NativeMoleculeDeleteTarget, plan?: NativeBondGrowthPlan): NativeOxoHotkeyResult {
+export function nativeOxoHotkeyTarget(document: ChemDraftDocument, target: NativeMoleculeDeleteTarget, plan?: NativeBondGrowthPlan): NativeAtomSproutHotkeyResult {
   const graph = moleculeAt(document, target);
   const atom = target.kind === "atom" ? graph?.atoms.find(candidate => candidate.id === target.atomId) : undefined;
   const reading = atom ? nativeAtomLabelReading(atom.element) : undefined;

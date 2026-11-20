@@ -18,6 +18,7 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import {
   applyToolsetLayoutState,
+  hiddenToolsetItemIds,
   mergeToolsetItemAdditions,
   toolsetItemCustomizationId,
   type ToolsetGroupDefinition,
@@ -29,10 +30,13 @@ import { SHELL_COMMAND_IDS } from "../../shellCommandIds";
 import { WIDGET_CONTROL_ID_PREFIX } from "../toolbarWidgets";
 import {
   USER_TOOLSET_ID_PREFIX,
+  addToolsetItemAddition,
   cloneToolset,
+  createCommandToolbarItem,
   createUserToolset,
   deleteUserToolset,
   renameToolset,
+  removeToolsetItem,
   reorderItems,
   reorderToolsets,
   resetToolsetLayout,
@@ -52,6 +56,10 @@ function itemCustomizationId(item: ToolsetItemDefinition<string, string>): strin
 
 function isWidgetItem(item: ToolsetItemDefinition<string, string>): boolean {
   return item.primary?.type === "control" && item.primary.controlId.startsWith(WIDGET_CONTROL_ID_PREFIX);
+}
+
+function toolbarItemIds(groups: readonly ToolsetGroupDefinition<string, string>[]): Set<string> {
+  return new Set(groups.flatMap((group) => group.items.map(itemCustomizationId)));
 }
 
 /** Order items by a preferred id list (matching applyUserToolsetOverride), unlisted items kept last. */
@@ -87,7 +95,7 @@ export interface CustomizeToolbarsDialogProps {
   baseToolsets: readonly DesktopToolsetDefinition[];
   /** The layout state to edit (the dialog keeps its own draft and only reports it back on Apply). */
   layoutState: LayoutState;
-  /** All commands available to add to a user toolset (from the command registry). */
+  /** Commands available to add from the command registry. */
   availableCommands?: readonly CommandOption[];
   /** Hide commands from the dialog only; their saved layout and ordering remain intact. */
   isCommandHidden?: (commandId: string) => boolean;
@@ -101,7 +109,11 @@ export interface CustomizeToolbarsDialogProps {
 /** Apply the draft to the base toolsets so the list reflects order, visibility, and renames live.
  *  `error` is true when the draft can't be applied (e.g. a corrupt loaded state) — the preview falls
  *  back to the base set, and the dialog blocks Apply so a broken draft is never committed. */
-function useEffectiveToolsets(baseToolsets: readonly DesktopToolsetDefinition[], draft: LayoutState) {
+function useEffectiveToolsets(
+  baseToolsets: readonly DesktopToolsetDefinition[],
+  draft: LayoutState,
+  availableCommands: readonly CommandOption[]
+) {
   return useMemo(() => {
     try {
       // Let the generics infer from baseToolsets (DesktopToolsetDefinition) so the result stays
@@ -109,7 +121,7 @@ function useEffectiveToolsets(baseToolsets: readonly DesktopToolsetDefinition[],
       // not assignable to IconName) and only compiled by TS eliding a deep comparison.
       return {
         toolsets: applyToolsetLayoutState([...baseToolsets], draft, {
-          additionalCommandIds: SHELL_COMMAND_IDS,
+          additionalCommandIds: new Set([...SHELL_COMMAND_IDS, ...availableCommands.map(command => command.id)]),
           onUnknownCommand: "prune"
         }),
         error: false
@@ -117,7 +129,7 @@ function useEffectiveToolsets(baseToolsets: readonly DesktopToolsetDefinition[],
     } catch {
       return { toolsets: [...baseToolsets], error: true };
     }
-  }, [baseToolsets, draft]);
+  }, [baseToolsets, draft, availableCommands]);
 }
 
 function SortableToolsetRow({
@@ -241,7 +253,7 @@ export function CustomizeToolbarsDialog({
     }
     onLiveApplyRef.current?.(draft);
   }, [draft]);
-  const { toolsets: effective, error: draftError } = useEffectiveToolsets(baseToolsets, draft);
+  const { toolsets: effective, error: draftError } = useEffectiveToolsets(baseToolsets, draft, availableCommands);
   const [selectedToolsetId, setSelectedToolsetId] = useState<string | undefined>(effective[0]?.id);
   const [newToolbarName, setNewToolbarName] = useState("");
 
@@ -295,68 +307,96 @@ export function CustomizeToolbarsDialog({
     () => draft.userToolsets.find((toolset) => toolset.id === selectedToolsetId) ?? baseById.get(selectedToolsetId ?? ""),
     [draft.userToolsets, baseById, selectedToolsetId]
   );
-  const selectedIsUser = (selectedToolsetId ?? "").startsWith(USER_TOOLSET_ID_PREFIX);
+  const selectedIsUser = selectedBase?.source === "user";
   const selectedTitle =
     effective.find((toolset) => toolset.id === selectedToolsetId)?.title ?? selectedBase?.title ?? "";
 
+  const selectedOverride = draft.toolsetOverrides.find((entry) => entry.toolsetId === selectedToolsetId);
+  const hiddenItemIds = useMemo(() => hiddenToolsetItemIds(selectedOverride), [selectedOverride]);
+  const groupsWithAdditions = useMemo(
+    () => mergeToolsetItemAdditions<string, string>(selectedBase?.groups ?? [], selectedOverride?.itemAdditions),
+    [selectedBase, selectedOverride?.itemAdditions]
+  );
+
   const detailGroups: CustomizeGroupModel[] = useMemo(() => {
-    if (!selectedBase) {
-      return [];
-    }
-    const override = draft.toolsetOverrides.find((entry) => entry.toolsetId === selectedToolsetId);
-    const hidden = new Set(override?.hiddenCommandIds ?? []);
-    const additions = override?.itemAdditions ?? [];
-    const groupsWithAdditions = mergeToolsetItemAdditions<string, string>(selectedBase.groups, additions);
+    const baseItemIds = toolbarItemIds(selectedBase?.groups ?? []);
     return groupsWithAdditions.map((group) => {
       const groupId = group.id ?? "";
-      const ordered = orderItemsByIds(group.items, groupId ? override?.itemOrder?.[groupId] : undefined);
+      const ordered = orderItemsByIds(group.items, groupId ? selectedOverride?.itemOrder?.[groupId] : undefined);
       return {
         id: groupId,
         title: group.title,
         items: ordered
           .map((item) => {
             const id = itemCustomizationId(item);
-            return { id, label: item.label ?? id, hidden: hidden.has(id), isWidget: isWidgetItem(item) };
+            return {
+              id,
+              label: item.label ?? id,
+              hidden: hiddenItemIds.has(id),
+              isWidget: isWidgetItem(item),
+              canRemove: selectedIsUser || !baseItemIds.has(id)
+            };
           })
           .filter((item) => item.id.length > 0)
       };
     });
-  }, [selectedBase, draft.toolsetOverrides, selectedToolsetId]);
+  }, [groupsWithAdditions, hiddenItemIds, selectedBase, selectedOverride, selectedIsUser]);
 
   const displayedGroups = useMemo(() => isCommandHidden
     ? detailGroups.map((group) => ({ ...group, items: group.items.filter((item) => !isCommandHidden(item.id)) }))
     : detailGroups, [detailGroups, isCommandHidden]);
 
   const availableForToolset: CommandOption[] = useMemo(() => {
-    const present = new Set(detailGroups.flatMap((group) => group.items.map((item) => item.id)));
+    const present = toolbarItemIds(groupsWithAdditions);
+    hiddenItemIds.forEach((id) => present.delete(id));
     return availableCommands.filter((command) => !isCommandHidden?.(command.id) && !present.has(command.id));
-  }, [availableCommands, detailGroups, isCommandHidden]);
+  }, [availableCommands, groupsWithAdditions, hiddenItemIds, isCommandHidden]);
 
-  const addCommandToUserToolset = (groupId: string, command: CommandOption) => {
+  const addCommand = (command: CommandOption) => {
+    if (!selectedBase) {
+      return;
+    }
+    const toolsetId = selectedBase.id;
     setDraft((current) => {
-      const toolset = current.userToolsets.find((entry) => entry.id === selectedToolsetId);
+      const userToolset = current.userToolsets.find((entry) => entry.id === toolsetId);
+      const toolset = userToolset ?? baseById.get(toolsetId);
       if (!toolset) {
         return current;
       }
-      const newItem: ToolsetItemDefinition<string, string> = {
-        id: command.id,
-        kind: "button",
-        label: command.title,
-        primary: { type: "command", commandId: command.id },
-        submenu: null
-      };
-      const groups: ToolsetGroupDefinition<string, string>[] = toolset.groups.map((group) =>
-        (group.id ?? "") === groupId ? { ...group, items: [...group.items, newItem] } : group
-      );
-      return setUserToolsetGroups(current, toolset.id, groups);
+      const override = current.toolsetOverrides.find((entry) => entry.toolsetId === toolsetId);
+      const groups = mergeToolsetItemAdditions<string, string>(toolset.groups, override?.itemAdditions);
+      const presentItemIds = toolbarItemIds(groups);
+      const wasHidden = hiddenToolsetItemIds(override).has(command.id);
+      if (presentItemIds.has(command.id)) {
+        return wasHidden ? setItemHidden(current, toolsetId, command.id, false) : current;
+      }
+      const item = createCommandToolbarItem(command);
+      const targetGroup = toolset.groups.find((group) => group.id) ?? toolset.groups[0];
+      let next = current;
+      if (userToolset && targetGroup) {
+        const userGroups = userToolset.groups.map((group) =>
+          group === targetGroup ? { ...group, items: [...group.items, item] } : group
+        );
+        next = setUserToolsetGroups(current, toolsetId, userGroups);
+      } else if (targetGroup?.id) {
+        next = addToolsetItemAddition(current, toolsetId, { groupId: targetGroup.id, item }, { presentItemIds });
+      }
+      return next !== current && wasHidden
+        ? setItemHidden(next, toolsetId, command.id, false)
+        : next;
     });
   };
 
-  const removeItemFromUserToolset = (groupId: string, itemId: string) => {
+  const removeItem = (groupId: string, itemId: string) => {
+    if (!selectedToolsetId) {
+      return;
+    }
     setDraft((current) => {
       const toolset = current.userToolsets.find((entry) => entry.id === selectedToolsetId);
-      if (!toolset) {
-        return current;
+      if (!toolset?.groups.some((group) =>
+        (group.id ?? "") === groupId && group.items.some((item) => itemCustomizationId(item) === itemId)
+      )) {
+        return removeToolsetItem(current, selectedToolsetId, itemId);
       }
       const groups: ToolsetGroupDefinition<string, string>[] = toolset.groups.map((group) =>
         (group.id ?? "") === groupId
@@ -441,8 +481,8 @@ export function CustomizeToolbarsDialog({
           <div className="customize-detail-pane">
             {selectedBase ? (
               <CustomizeToolsetDetail
+                key={selectedBase.id}
                 toolsetTitle={selectedTitle}
-                isUser={selectedIsUser}
                 groups={displayedGroups}
                 availableCommands={availableForToolset}
                 onReorderItems={(groupId, orderedItemIds) => {
@@ -461,8 +501,8 @@ export function CustomizeToolbarsDialog({
                     setDraft((current) => setItemHidden(current, selectedToolsetId, itemId, hidden));
                   }
                 }}
-                onRemoveItem={removeItemFromUserToolset}
-                onAddCommand={addCommandToUserToolset}
+                onRemoveItem={removeItem}
+                onAddCommand={addCommand}
               />
             ) : (
               <p className="customize-detail-empty">Select a toolbar to edit its contents.</p>
