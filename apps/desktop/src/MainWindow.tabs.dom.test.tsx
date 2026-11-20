@@ -1803,6 +1803,93 @@ describe("documents in one window", () => {
     expect(drawnText()).toContain("First note for history");
   });
 
+  describe("overflowing document tab strip", () => {
+    async function openOverflowingTabs(browserClampsScroll = false) {
+      for (const name of ["First drawing", "Second drawing", "Third drawing", "Fourth drawing"]) {
+        await open(name);
+      }
+      expect(tabs()).toHaveLength(4);
+      expect(active()).toBe(3);
+
+      const strip = container.querySelector<HTMLDivElement>(".document-tab-list")!;
+      const tabWidth = 150;
+      const clientWidth = 230;
+      const stripLeft = 24;
+      const scrollWidth = () => strip.childElementCount * tabWidth;
+      const maxScrollLeft = () => scrollWidth() - clientWidth;
+      let scrollLeft = maxScrollLeft();
+      const writeScrollLeft = vi.fn((left: number) => { scrollLeft = left; });
+      Object.defineProperties(strip, {
+        clientWidth: { value: clientWidth },
+        scrollWidth: { get: scrollWidth },
+        scrollLeft: {
+          get: () => browserClampsScroll ? Math.min(scrollLeft, maxScrollLeft()) : scrollLeft,
+          set: writeScrollLeft
+        }
+      });
+      vi.spyOn(strip, "getBoundingClientRect").mockImplementation(() => new DOMRect(stripLeft, 0, clientWidth, 24));
+      for (const tab of strip.children) {
+        vi.spyOn(tab, "getBoundingClientRect").mockImplementation(() => {
+          const index = Array.from(strip.children).indexOf(tab);
+          return new DOMRect(stripLeft + index * tabWidth - strip.scrollLeft, 0, tabWidth, 24);
+        });
+      }
+      return { strip, writeScrollLeft };
+    }
+
+    it.each([false, true])("commits the clamped offset after closing the last active tab (browser already clamped: %s)", async (browserClampsScroll) => {
+      const { strip, writeScrollLeft } = await openOverflowingTabs(browserClampsScroll);
+      await closeTab();
+
+      expect(tabs()).toHaveLength(3);
+      expect(active()).toBe(2);
+      expect(writeScrollLeft).toHaveBeenCalledWith(220);
+      expect(strip.scrollLeft).toBe(220);
+      const activeTabRect = strip.querySelector('[data-active="true"]')!.getBoundingClientRect();
+      const stripRect = strip.getBoundingClientRect();
+      expect(activeTabRect.left).toBeGreaterThanOrEqual(stripRect.left);
+      expect(activeTabRect.right).toBeLessThanOrEqual(stripRect.right);
+    });
+
+    it("reveals the active tab when closing an inactive tab shrinks the strip", async () => {
+      const { strip, writeScrollLeft } = await openOverflowingTabs();
+      await activate(0);
+      strip.scrollLeft = 370;
+      writeScrollLeft.mockClear();
+
+      await closeTab(3);
+
+      expect(active()).toBe(0);
+      expect(writeScrollLeft).toHaveBeenCalledWith(220);
+      expect(strip.scrollLeft).toBe(0);
+    });
+
+    it("re-asserts the offset on window focus even if it is already clamped", async () => {
+      const { strip, writeScrollLeft } = await openOverflowingTabs(true);
+      await closeTab();
+      expect(strip.scrollLeft).toBe(220);
+      writeScrollLeft.mockClear();
+
+      await act(async () => window.dispatchEvent(new FocusEvent("focus")));
+
+      expect(writeScrollLeft).toHaveBeenCalledExactlyOnceWith(220);
+    });
+
+    it("activates the clicked tab by id after closing the last active tab", async () => {
+      await openOverflowingTabs();
+      const clickedTab = tabs()[1]!;
+      const commandId = runtime().host.commands.list().find(command => command.title === "Activate Second drawing.chemdraft")!.id;
+      await closeTab();
+      const invoke = vi.spyOn(runtime().host, "invokeCommand");
+
+      await act(async () => clickedTab.click());
+
+      expect(invoke).toHaveBeenCalledExactlyOnceWith(commandId);
+      expect(clickedTab.getAttribute("aria-selected")).toBe("true");
+      expect(bridge().snapshot().document.title).toBe("Second drawing");
+    });
+  });
+
   it("dirty tab x uses the registered close command; Cancel retains it and Discard selects its neighbour", async () => {
     await paste("Keep the first drawing");
     await command("document.new");

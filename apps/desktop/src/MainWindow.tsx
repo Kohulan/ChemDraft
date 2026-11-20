@@ -1836,7 +1836,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.19.22.57-codex";
+const CURRENT_BUILD_STAMP = "11.20.17.30-codex";
 const TABLE_DRAFT_RECOVERY_WARNING = "session.tableDraftDropped";
 
 function clearTableDraftRecoveryWarnings(report: OpenWarningsReport | undefined): OpenWarningsReport | undefined {
@@ -2554,6 +2554,7 @@ export function MainWindow({
   const [fileState, setFileState] = useState<NativeFileState>({ dirty: false });
   const [documentTabs, setDocumentTabs] = useState([{ id: "initial", title: initialDocument?.title ?? "Untitled" }]);
   const [activeDocumentTabId, setActiveDocumentTabId] = useState("initial");
+  const documentTabListRef = useRef<HTMLDivElement>(null);
   const documentTabsRef = useRef(documentTabs);
   documentTabsRef.current = documentTabs;
   const pluginRuntimeRef = useRef<DesktopPluginRuntime | undefined>(undefined);
@@ -10263,6 +10264,34 @@ export function MainWindow({
     const index = tabs.findIndex((tab) => tab.id === activeDocumentTabIdRef.current);
     activateDocumentTab(tabs[(index + direction + tabs.length) % tabs.length]!.id);
   }, [activateDocumentTab]);
+
+  const documentTabOrder = documentTabs.map((tab) => tab.id).join(",");
+  useLayoutEffect(() => {
+    const strip = documentTabListRef.current;
+    if (!strip) return;
+
+    const commitScrollLeft = () => {
+      const maxScrollLeft = Math.max(0, strip.scrollWidth - strip.clientWidth);
+      // WebKit can report the clamped position while a non-key window still draws the old one.
+      // Re-assert the offset even if the DOM already reports it.
+      strip.scrollLeft = clamp(strip.scrollLeft, 0, maxScrollLeft);
+      return maxScrollLeft;
+    };
+
+    const maxScrollLeft = commitScrollLeft();
+    const activeTab = strip.querySelector<HTMLElement>('.document-tab[data-active="true"]');
+    if (maxScrollLeft > 0 && activeTab) {
+      const tabRect = activeTab.getBoundingClientRect();
+      const stripLeft = strip.getBoundingClientRect().left + strip.clientLeft;
+      const stripRight = stripLeft + strip.clientWidth;
+      // Use the nearest edge, or align the start of a tab wider than the strip.
+      const delta = Math.min(tabRect.left - stripLeft, Math.max(0, tabRect.right - stripRight));
+      if (delta !== 0) strip.scrollLeft = clamp(strip.scrollLeft + delta, 0, maxScrollLeft);
+    }
+
+    window.addEventListener("focus", commitScrollLeft);
+    return () => window.removeEventListener("focus", commitScrollLeft);
+  }, [activeDocumentTabId, documentTabOrder]);
 
   useLayoutEffect(() => {
     const scroll = pendingTabScrollRef.current;
@@ -23050,7 +23079,7 @@ export function MainWindow({
       ) : null}
       <section className="workspace workspace-with-tabs">
         <div className="document-tab-strip">
-          <div className="document-tab-list" role="tablist" aria-label="Open documents">
+          <div ref={documentTabListRef} className="document-tab-list" role="tablist" aria-label="Open documents">
             {documentTabs.map((tab) => {
               const active = tab.id === activeDocumentTabId;
               const file = active ? fileState : documentTabSnapshotsRef.current.get(tab.id)?.file;
