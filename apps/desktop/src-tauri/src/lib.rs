@@ -1560,8 +1560,12 @@ pub fn run() {
                     .closed(window.label());
             }
 
-            // Focused is queued by Tao and may describe an older activation by delivery.
-            // Lease ownership is observed synchronously at the OS boundary instead.
+            #[cfg(target_os = "linux")]
+            if is_input_focus_window_label(window.label()) {
+                if let WindowEvent::Focused(active) = event {
+                    panel_window::linux::focus_changed(window, *active);
+                }
+            }
             if is_input_focus_window_label(window.label())
                 && matches!(event, WindowEvent::Destroyed)
             {
@@ -2203,7 +2207,18 @@ fn foreground_belongs_to_app() -> bool {
         .is_some_and(|mtm| objc2_app_kit::NSApplication::sharedApplication(mtm).isActive())
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(target_os = "linux")]
+fn foreground_belongs_to_app() -> bool {
+    use gtk::prelude::*;
+    gtk::is_initialized_main_thread()
+        && gtk::Window::list_toplevels().iter().any(|widget| {
+            widget
+                .downcast_ref::<gtk::Window>()
+                .is_some_and(|window| window.has_toplevel_focus())
+        })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn foreground_belongs_to_app() -> bool {
     false
 }
@@ -4745,6 +4760,17 @@ async fn set_plugin_panel_input_focus(
     select_interaction: Option<bool>,
 ) -> Result<bool, String> {
     validate_plugin_panel_focus_caller(window.label())?;
+    #[cfg(target_os = "linux")]
+    if editing {
+        return panel_window::linux::acquire(
+            window,
+            &page_token,
+            generation,
+            click_sequence,
+            pointer_before.unwrap_or(0),
+        )
+        .await;
+    }
     if is_plugin_panel_window_label(window.label()) {
         return set_plugin_panel_activation(window, page_token, editing, generation);
     }
@@ -4795,6 +4821,7 @@ async fn set_plugin_panel_input_focus(
                 );
                 return Ok(false);
             }
+            #[cfg(not(target_os = "linux"))]
             if editing {
                 let result = (|| -> Result<bool, String> {
                     // An acquisition dispatched before a hide can arrive afterwards.
@@ -4841,7 +4868,7 @@ async fn set_plugin_panel_input_focus(
                             return Ok(true);
                         }
                     }
-                    #[cfg(not(any(target_os = "macos", windows)))]
+                    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
                     {
                         target
                             .set_focusable(false)
@@ -4860,7 +4887,7 @@ async fn set_plugin_panel_input_focus(
                         &*(target.ns_window().map_err(|error| error.to_string())? as *mut NSWindow)
                     }
                     .isKeyWindow());
-                    #[cfg(not(any(target_os = "macos", windows)))]
+                    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
                     target.is_focused().map_err(|error| error.to_string())
                 })();
                 let held = panel_window::acquired(
@@ -4883,33 +4910,31 @@ async fn set_plugin_panel_input_focus(
                 if !held && panel_window::is_current(&target, generation, epoch) {
                     let _ = target.set_focusable(false);
                 }
-                result.map(|_| held)
-            } else {
-                panel_window::end_pointer_guard(
-                    target.app_handle(),
-                    target.label(),
-                    panel_window::PointerGuardEnd::Released,
-                    click_sequence,
-                    before,
-                );
-                // Hand back before disabling key eligibility: AppKit can resign a panel as
-                // that flag changes. The helper checks the actual key/foreground window,
-                // current lease and app activation; native loss/cleanup never request it.
-                if let Err(error) = panel_window::return_focus_after_interaction(
-                    &target,
-                    return_focus.unwrap_or(false),
-                ) {
-                    palette_focus_log(format_args!(
-                        "hand-back label={} result=skipped reason=error error={error}",
-                        target.label()
-                    ));
-                    eprintln!("Could not return panel keyboard focus after release: {error}");
-                }
-                target
-                    .set_focusable(false)
-                    .map_err(|error| error.to_string())?;
-                Ok(false)
+                return result.map(|_| held);
             }
+            panel_window::end_pointer_guard(
+                target.app_handle(),
+                target.label(),
+                panel_window::PointerGuardEnd::Released,
+                click_sequence,
+                before,
+            );
+            // Hand back before disabling key eligibility: AppKit can resign a panel as
+            // that flag changes. The helper checks the actual key/foreground window,
+            // current lease and app activation; native loss/cleanup never request it.
+            if let Err(error) =
+                panel_window::return_focus_after_interaction(&target, return_focus.unwrap_or(false))
+            {
+                palette_focus_log(format_args!(
+                    "hand-back label={} result=skipped reason=error error={error}",
+                    target.label()
+                ));
+                eprintln!("Could not return panel keyboard focus after release: {error}");
+            }
+            target
+                .set_focusable(false)
+                .map_err(|error| error.to_string())?;
+            Ok(false)
         })?
     })();
     palette_focus_log(format_args!(
@@ -4921,7 +4946,8 @@ async fn set_plugin_panel_input_focus(
     ));
     result
 }
-// Plugin panels never enter the palette lease/acquisition/hand-back path above.
+// Panel releases only clear input bookkeeping. macOS and Windows already observe
+// pointer activation before their panel acquisition runs.
 fn set_plugin_panel_activation(
     window: tauri::WebviewWindow,
     page_token: String,

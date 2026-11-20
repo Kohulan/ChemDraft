@@ -87,6 +87,12 @@ While atom labels, text, table cells, form controls or editable plugin text hold
 real arrow caret/navigation behavior and no canvas movement. Cmd/Ctrl/Alt+arrows retain their
 usual behavior.
 Brackets (macOS and Windows): drag square/round pairs in both directions, including over a molecule; verify matching sides, both visibly selected after returning to Select, one labeled Undo/Redo, and Escape cancellation. Right-click either side, mark a repeat unit, then double-click the painted n and type m without switching tools (Enter/blur commits once; Escape cancels). A single Select click only selects, matching text objects. Duplicate, copy/paste, save/reopen and compare canvas/SVG/PDF placement. Select only the molecule: Copy As SMILES and SMILES file export must name the omitted repeat label and atom count. Both MOL text formats must contain an SRU SGroup (including membership/crossing bonds, repeat label and EU connectivity), or warn naming the bracket if it cannot be represented. Recheck CDXML label/connectivity limitations. Open Main with a saved pre-Round-Bracket order: Round Bracket belongs immediately after Square Bracket; explicit custom placement remains where saved.
+On Linux (XWayland and native Wayland), open Drawn Structure Settings and a plugin panel with a
+text field. Check that showing each leaves the document focused. Click Target bond length and type
+`30`, then repeat in the panel field. Verify both fields receive the digits, including after hiding
+and reopening each window. Repeat with a digit immediately after the click. No ring should appear.
+Click the drawing and verify its shortcuts work again.
+
 Palette field input (macOS and Windows): in Drawn Structure Settings, click Target bond length,
 type 30 and press Return; the value changes, the canvas does not, and no hotkey fires. Switch to
 another app and back, then click the field again; Customize gallery search still types.

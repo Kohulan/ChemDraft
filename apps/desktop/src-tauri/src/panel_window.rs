@@ -137,6 +137,8 @@ mod palette_command_hit_box_tests {
     }
 }
 pub(crate) use installation::finish_installation;
+#[cfg(target_os = "linux")]
+pub(crate) use key_guard::linux;
 pub(crate) use key_guard::{
     keeps_palette_focus, observe_document_pointer_release, End as PointerGuardEnd,
 };
@@ -427,6 +429,8 @@ pub(crate) fn request<R: tauri::Runtime>(
         .or_insert_with(|| InputFocusState::new(window.label()));
     let epoch = page_token.parse().ok()?;
     let accepted = match lease {
+        #[cfg(target_os = "linux")]
+        InputFocusState::Panel(panel) if editing => panel.record_request(generation, epoch, true),
         InputFocusState::Panel(panel) => panel.request(generation, epoch, editing),
         InputFocusState::Palette(lease) => {
             let accepted = lease.request(generation, epoch, editing);
@@ -473,10 +477,8 @@ pub(crate) fn is_current<R: tauri::Runtime>(
         .is_some_and(|lease| lease.is_current(generation, epoch))
 }
 
-// Called synchronously from WM_ACTIVATE/WM_ACTIVATEAPP or AppKit key notifications,
-// never from WebView2 child focus messages or delayed Tauri Focused events.
-// Linux has no native activation hook (WM_ACTIVATE / AppKit key notifications) to call this.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+// Windows and macOS report activation at their native hooks. On GTK the source
+// is Tao's top-level focus-in/out event.
 pub(crate) fn activation<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>, active: bool) {
     activation_with_reason(window, active, "window");
 }

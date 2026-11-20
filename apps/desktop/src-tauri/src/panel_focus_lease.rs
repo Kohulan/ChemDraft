@@ -176,7 +176,16 @@ impl PanelActivation {
     }
 
     pub fn request(&mut self, generation: u64, epoch: u64, editing: bool) -> bool {
-        if epoch != self.epoch || generation <= self.generation || (editing && !self.active) {
+        if editing && !self.active {
+            return false;
+        }
+        self.record_request(generation, epoch, editing)
+    }
+
+    // GTK can receive the field IPC before its focus-in event. Reserve the generation
+    // now so a hide, release or reload invalidates it while acquisition is pending.
+    pub fn record_request(&mut self, generation: u64, epoch: u64, editing: bool) -> bool {
+        if epoch != self.epoch || generation <= self.generation {
             return false;
         }
         self.generation = generation;
@@ -185,11 +194,11 @@ impl PanelActivation {
     }
 
     pub fn acquired(&mut self, generation: u64, epoch: u64, focused: bool) -> bool {
-        if !self.is_current(generation, epoch) || !self.held || !self.active {
+        if !self.is_current(generation, epoch) || !self.held {
             return false;
         }
-        self.held = focused;
-        focused
+        self.held = self.active && focused;
+        self.held
     }
 
     pub fn deactivate(&mut self) -> Option<u64> {
@@ -207,6 +216,20 @@ impl PanelActivation {
 #[cfg(test)]
 mod panel_activation_tests {
     use super::*;
+
+    #[test]
+    fn pending_panel_input_requires_native_activation_and_survives_only_its_generation() {
+        let mut panel = PanelActivation::default();
+        assert!(panel.record_request(1, 0, true));
+        assert!(!panel.acquired(1, 0, true));
+        assert!(!panel.is_held());
+        assert!(panel.record_request(2, 0, true));
+        panel.deactivate();
+        panel.activate();
+        assert!(!panel.acquired(2, 0, true));
+        assert!(panel.record_request(3, 0, true));
+        assert!(panel.acquired(3, 0, true));
+    }
 
     #[test]
     fn native_click_activation_keeps_focus_until_genuine_deactivation() {
