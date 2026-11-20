@@ -10719,6 +10719,19 @@ fn ensure_toolset_window<R: Runtime>(
         resizable,
     );
 
+    // A non-resizable GtkWindow publishes fixed size hints. On native Wayland these
+    // can conflict with the compositor's configure, such as Weston's kiosk fullscreen.
+    // Keep GTK resizable there while the toolbar still uses content-fit sizing.
+    #[cfg(target_os = "linux")]
+    let native_resizable = resizable
+        || run_on_main_thread_blocking(app, || {
+            use gtk::gdk::prelude::DisplayExtManual;
+
+            gtk::gdk::Display::default().is_some_and(|display| display.backend().is_wayland())
+        })?;
+    #[cfg(not(target_os = "linux"))]
+    let native_resizable = resizable;
+
     // Record label -> id so the Moved/Destroyed handlers and enumeration can resolve the toolset
     // without the manifest (the label itself is lossy).
     if let Ok(mut labels) = app.state::<ToolsetWindowDirectory>().labels.lock() {
@@ -10742,9 +10755,7 @@ fn ensure_toolset_window<R: Runtime>(
     .inner_size(width, height)
     .accept_first_mouse(true)
     .focusable(toolset_window_focusable())
-    // Tao's resizable flag controls AppKit's style mask and Win32 resize hit testing.
-    // Programmatic setFrame/set_size still fit the content in either direction.
-    .resizable(resizable)
+    .resizable(native_resizable)
     .maximizable(resizable)
     .decorations(false)
     // Overlapping palettes need a visible edge, matching the popover's native shadow.
