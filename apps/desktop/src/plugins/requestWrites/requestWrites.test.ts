@@ -643,12 +643,12 @@ describe("verified request writes", () => {
     } finally { await f.finish(); }
   });
 
-  function structureOnlyUnit() {
+  function structureOnlyBracketPair(repeatUnit = true) {
     const carbon: MoleculeObject = { ...ethane, id: "stored-carbon", x: 325, structure: "C", atoms: [], bonds: [] };
     const nitrogen = { ...carbon, id: "stored-nitrogen", x: 410, structure: "N" };
     const open = BracketObjectSchema.parse({ ...frame("open"), type: "bracket", bracketKind: "square", side: "open",
-      pairId: "stored-polymer", repeatUnit: true, containedObjectIds: [carbon.id], x: 312, y: 190, width: 2, height: 25 });
-    const close = { ...open, id: "close", side: "close" as const, x: 353, label: "n" };
+      pairId: "stored-pair", repeatUnit, containedObjectIds: [carbon.id], x: 312, y: 190, width: 2, height: 25 });
+    const close = { ...open, id: "close", side: "close" as const, x: 353, label: repeatUnit ? "n" : undefined };
     const pair = [open, close];
     expect(resolveRepeatUnitAtomMembership(pair, [carbon, nitrogen, ...pair])).toMatchObject({
       members: [], structureOnlyMembers: [{ id: carbon.id, structure: "C" }], reason: "its atom membership is empty"
@@ -656,8 +656,31 @@ describe("verified request writes", () => {
     return { carbon, nitrogen, pair };
   }
 
+  it.each(["clear membership", "delete member"] as const)("commits a plain bracket edit to %s", async action => {
+    const { carbon, pair } = structureOnlyBracketPair(false);
+    const f = setup([carbon.id, ...pair.map(bracket => bracket.id)], undefined, { objects: [carbon, ...pair] });
+    try {
+      const before = f.pinned();
+      const patch = action === "clear membership" ? { op: "batch" as const, patches: pair.map(bracket => ({
+        op: "updateObject" as const, objectId: bracket.id, changes: { containedObjectIds: [] }
+      })) } : { op: "removeObject" as const, objectId: carbon.id };
+      expect(await f.context.documents.applyRequestPatch!({ requestId: await f.begin(), patch }))
+        .toMatchObject({ ok: true });
+      const after = f.pinned();
+      expect(f.history).toEqual([{ before, after, label: "Draw requested objects" }]);
+      const objects = after.pages[0]!.objects;
+      expect(objects.filter(object => object.type === "bracket")).toMatchObject(
+        pair.map(({ id, pairId }) => ({ id, pairId, containedObjectIds: [] })));
+      if (action === "clear membership") {
+        expect(objects.find(object => object.id === carbon.id)).toEqual(carbon);
+      } else {
+        expect(objects.find(object => object.id === carbon.id)).toBeUndefined();
+      }
+    } finally { await f.finish(); }
+  });
+
   it.each(["replace", "delete"] as const)("refuses a request to %s the only stored repeat-unit member", async action => {
-    const { carbon, nitrogen, pair } = structureOnlyUnit();
+    const { carbon, nitrogen, pair } = structureOnlyBracketPair();
     const f = setup([carbon.id, nitrogen.id, ...pair.map(bracket => bracket.id)], undefined,
       { objects: [carbon, nitrogen, ...pair] });
     try {
@@ -680,7 +703,7 @@ describe("verified request writes", () => {
   });
 
   it("refuses a chemistry change to a stored repeat-unit member that keeps its object ID", async () => {
-    const { carbon, pair } = structureOnlyUnit();
+    const { carbon, pair } = structureOnlyBracketPair();
     const f = setup([carbon.id], undefined, { objects: [carbon, ...pair] });
     try {
       const before = f.pinned();
@@ -693,7 +716,7 @@ describe("verified request writes", () => {
   });
 
   it("commits a geometry-only move of a repeat unit with a stored member", async () => {
-    const { carbon, pair } = structureOnlyUnit();
+    const { carbon, pair } = structureOnlyBracketPair();
     const f = setup(pair.map(bracket => bracket.id), undefined, { objects: [carbon, ...pair] });
     try {
       const before = f.pinned();

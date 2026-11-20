@@ -10,10 +10,12 @@ function repeatUnits(page: DocumentPage) {
   for (const [id, pair] of bracketPairs(page.objects)) {
     const semantics = bracketPairSemantics(pair);
     const { usage, label, count, closing, cdxmlRepeatPattern } = semantics;
+    const generic = usage === "generic";
     const resolved = resolveRepeatUnitAtomMembership(pair, page.objects, { atomPosition: transformPointForObject });
     const members = resolved.members.map(({ molecule, atomIds }) => [molecule.id, [...atomIds].sort()] as const)
       .sort(([a], [b]) => a.localeCompare(b));
-    const storedMembers = resolved.structureOnlyMembers.map(molecule => [molecule.id, stableRecord(withoutGeometry(molecule))] as const)
+    const storedMembers = generic ? [] : resolved.structureOnlyMembers
+      .map(molecule => [molecule.id, stableRecord(withoutGeometry(molecule))] as const)
       .sort(([a], [b]) => a.localeCompare(b));
     const brackets = [...pair].sort((a, b) => Number(a.side === "close") - Number(b.side === "close"))
       .map(({ side, bracketKind, bracketUsage, repeatUnit, repeatCount, label, crossingBondIds }) =>
@@ -27,7 +29,7 @@ function repeatUnits(page: DocumentPage) {
         resolved.connectivity, cdxmlRepeatPattern,
         visible.usage, visible.usageConflict, visible.caseOnlyGlyphUsages, visible.sruLabel, visible.repeatCount, visibleMembers
       ]),
-      bracketId: closing.id, generic: usage === "generic", unresolved: resolved.reason
+      bracketId: closing.id, generic, unresolved: resolved.reason
     });
   }
   return units;
@@ -59,7 +61,7 @@ export function assertRepeatUnitIdentity(before: DocumentPage, after: DocumentPa
       const bracketId = a?.bracketId ?? b?.bracketId;
       throw new RequestWriteError("chemistry", `The write would change the chemistry or membership of repeat unit "${id}" (bracket "${bracketId}").`);
     }
-    // An empty atom set is known, and any stored members were compared above.
+    // An empty atom set is known, and stored repeat-unit members were compared above.
     const reason = a?.unresolved ?? b?.unresolved;
     if (a?.unresolved !== b?.unresolved || reason && reason !== "its atom membership is empty") {
       throw new RequestWriteError("chemistry", `Cannot verify repeat unit "${id}" because ${reason}.`);
