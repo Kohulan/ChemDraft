@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -8,6 +10,8 @@ import { parseDialogMessage } from "../dialogs/dialogProtocol";
 
 let container: HTMLDivElement;
 let root: Root;
+const platforms = ["macos", "windows"] as const;
+const schemes = ["chemdraft", "chemdraw"] as const;
 
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -21,7 +25,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe.each(["macos", "windows"] as const)("guided tour on %s", platform => {
+describe.each(platforms)("guided tour on %s", platform => {
   const button = (text: string) => [...container.querySelectorAll("button")].find(button => button.textContent === text)!;
   const click = (text: string) => act(() => button(text).click());
 
@@ -77,7 +81,7 @@ describe.each(["macos", "windows"] as const)("guided tour on %s", platform => {
 
   it("keeps public copy free of other drawing product names", () => {
     const banned = /chemdraw|marvin(?:sketch)?|isischem|isis\/draw|acd\/chemsketch|chemsketch|ketcher|chemwindow|bkchem/i;
-    for (const scheme of ["chemdraft", "chemdraw"] as const) {
+    for (const scheme of schemes) {
       for (const step of tourSteps(scheme, platform)) {
         expect(step.title + step.text).not.toMatch(banned);
       }
@@ -85,11 +89,26 @@ describe.each(["macos", "windows"] as const)("guided tour on %s", platform => {
   });
 });
 
-it("validates the native tour action allowlist", () => {
-  const envelope = {
-    protocolVersion: 1, ownerWindowId: "main", documentTabId: "guidedTour", dialogKind: "guidedTour",
-    sessionId: "session", requestId: "request", snapshotRevision: 1
-  };
+const envelope = {
+  protocolVersion: 1, ownerWindowId: "main", documentTabId: "guidedTour", dialogKind: "guidedTour",
+  sessionId: "session", requestId: "request", snapshotRevision: 1
+};
+
+it("keeps TypeScript tour commands in sync with the native allowlist", () => {
+  const source = readFileSync(resolve("apps", "desktop", "src-tauri", "src", "dialog_windows.rs"), "utf8");
+  const nativeEnum = source.match(/enum GuidedTourCommand\s*\{([^}]*)\}/)?.[1] ?? "";
+  const nativeCommands = new Set([...nativeEnum.matchAll(/#\[serde\(rename = "([^"]+)"\)\]/g)].map(match => match[1]!));
+  const tourCommands = new Set(platforms
+    .flatMap(platform => schemes.flatMap(scheme => tourSteps(scheme, platform)))
+    .map(step => step.tryCommand)
+    .filter(command => command !== undefined));
+  expect(nativeCommands).toEqual(tourCommands);
+  for (const command of tourCommands) {
+    expect(parseDialogMessage({ ...envelope, type: "action", data: { action: "tryTourCommand", command } })).toBeDefined();
+  }
+});
+
+it("rejects invalid tour actions in the TypeScript dialog protocol", () => {
   expect(parseDialogMessage({ ...envelope, type: "snapshot", data: { title: "Take the Tour", scheme: "chemdraft", automatic: true } })).toBeDefined();
   for (const data of [
     { action: "tryTourCommand", command: "document.save" },

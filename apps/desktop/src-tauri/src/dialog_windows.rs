@@ -166,7 +166,7 @@ fn kind_spec(kind: &str) -> Result<DialogKindSpec, String> {
 fn native_window_title(kind: &str, spec_title: &str, snapshot_title: &str) -> String {
     if matches!(
         kind,
-        "engineInstall" | "toolInstall" | "vibeCodeGuide" | "guidedTour"
+        "engineInstall" | "toolInstall" | "vibeCodeGuide" | "guidedTour" | "about"
     ) {
         snapshot_title.to_string()
     } else {
@@ -220,6 +220,8 @@ enum GuidedTourAction {
 
 #[derive(Deserialize)]
 enum GuidedTourCommand {
+    #[serde(rename = "view.openKeyboardPreferences")]
+    OpenKeyboardPreferences,
     #[serde(rename = "help.tour.openSample")]
     OpenSample,
     #[serde(rename = "plugin.opsinNameToStructure.convert")]
@@ -5238,9 +5240,17 @@ mod tests {
             .split("fn ensure_preferences_window")
             .next()
             .unwrap();
-        assert!(menu_open.contains("ensure_preferences_window(&app).map(|_| ())"));
-        let existing_window = lib
+        assert!(menu_open.contains("ensure_preferences_window(&app, keyboard.unwrap_or(false))"));
+        let ensure_window = lib
             .split("fn ensure_preferences_window")
+            .nth(1)
+            .unwrap()
+            .split("fn with_preferences_owner_restored")
+            .next()
+            .unwrap();
+        assert!(ensure_window.contains("create_or_raise_preferences_window(app, keyboard)"));
+        let existing_window = lib
+            .split("fn create_or_raise_preferences_window")
             .nth(1)
             .unwrap()
             .split("let owner = app")
@@ -5249,7 +5259,7 @@ mod tests {
         assert!(existing_window.contains("app.get_webview_window(PREFERENCES_WINDOW_LABEL)"));
         assert!(existing_window.contains("dialog_windows::show_preferences(&target)"));
         assert!(existing_window.contains("return Ok(window);"));
-        for path in [menu_open, existing_window] {
+        for path in [menu_open, ensure_window, existing_window] {
             assert!(!path.contains("window.hide()"));
             assert!(!path.contains("window.close()"));
             assert!(!path.contains("window.destroy()"));
@@ -5260,7 +5270,7 @@ mod tests {
             .split("fn close_key_window")
             .nth(1)
             .unwrap()
-            .split("fn about_metadata")
+            .split("fn about_menu_item")
             .next()
             .unwrap();
         assert!(menu_close.contains("(CloseWindowRoute::TauriClose, Some(window)) => {\n            if let Err(error) = window.close()"));
@@ -5495,7 +5505,13 @@ mod tests {
         message.data = json!({"title": "About ChemDraft", "version": "1.2.2", "buildStamp": "11.19.18.03-codex"});
         assert!(message.validate().is_ok());
         assert!(is_dialog_label("dialog-main-about-1"));
-        assert!(!kind_spec("about").unwrap().fit_content);
+        let spec = kind_spec("about").unwrap();
+        assert!(!spec.fit_content);
+        let snapshot_title = message.data["title"].as_str().unwrap();
+        assert_eq!(
+            native_window_title("about", spec.title, snapshot_title),
+            "About ChemDraft"
+        );
         message.data["buildStamp"] = json!("any\ntext");
         assert!(message.validate().is_err());
 
@@ -5527,15 +5543,29 @@ mod tests {
         for data in [
             json!({"action":"cancel"}),
             json!({"action":"finish"}),
+            json!({"action":"chooseShortcuts","scheme":"chemdraft"}),
             json!({"action":"chooseShortcuts","scheme":"chemdraw"}),
-            json!({"action":"tryTourCommand","command":"help.tour.openSample"}),
-            json!({"action":"tryTourCommand","command":"plugin.opsinNameToStructure.convert"}),
-            json!({"action":"tryTourCommand","command":"analyze.molecularProperties"}),
         ] {
             message.data = data;
             assert!(message.validate().is_ok());
         }
-        message.data["command"] = json!("document.save");
+    }
+
+    #[test]
+    fn guided_tour_accepts_all_try_it_commands() {
+        let mut message = snapshot();
+        message.dialog_kind = "guidedTour".into();
+        message.message_type = "action".into();
+        for command in [
+            "view.openKeyboardPreferences",
+            "help.tour.openSample",
+            "plugin.opsinNameToStructure.convert",
+            "analyze.molecularProperties",
+        ] {
+            message.data = json!({"action":"tryTourCommand","command":command});
+            assert_eq!(message.validate(), Ok(()), "{command}");
+        }
+        message.data = json!({"action":"tryTourCommand","command":"document.save"});
         assert!(message.validate().is_err());
     }
 

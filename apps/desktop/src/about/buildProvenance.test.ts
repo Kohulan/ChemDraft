@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildAboutProvenance, readAboutSource, readNoticeRows } from "./buildProvenance";
+import { buildAboutProvenance, readAboutSource } from "./buildProvenance";
 
 describe("About provenance", () => {
   const provenance = buildAboutProvenance();
@@ -12,8 +12,24 @@ describe("About provenance", () => {
     expect([...provenance.inventoryCoverage.keys()]).toEqual(names);
 
     const notice = readAboutSource("NOTICE");
-    const headings = readNoticeRows(notice).map(row => row.heading);
-    expect([...provenance.noticeCoverage.keys()]).toEqual(headings);
+    // Component paragraphs start with a heading, then indent the details.
+    const paragraphs = notice.split(/\n{2,}/);
+    const headings = paragraphs.flatMap(paragraph => {
+      if (!/^\S/.test(paragraph) || /^(?:APPENDIX A\.|A\.\d )/.test(paragraph)) return [];
+      const lines = paragraph.split("\n");
+      const detailStart = lines.findIndex(line => line.startsWith("  "));
+      return detailStart > 0 ? [lines.slice(0, detailStart).join(" ")] : [];
+    });
+    // The network list, shaded JAR table, and datasets have their own heading formats.
+    const beforeAppendix = notice.split("\nAPPENDIX A.")[0]!;
+    const network = paragraphs.find(paragraph => paragraph.startsWith("Network transport and diagnostics"))!;
+    const networkHeadings = [...network.matchAll(/^ {2}(\S+ \d[^\s:]*)/gm)].map(match => match[1]!);
+    const jarHeadings = [...beforeAppendix.matchAll(/^ {4}(\S[^\n]*?) {2,}\S/gm)].map(match => match[1]!);
+    const dataSection = beforeAppendix.split("\nData under separate terms\n")[1]!;
+    const dataHeadings = [...dataSection.matchAll(/\n\n {2}(\S[^\n]*)/g)].map(match => match[1]!);
+    expect([...provenance.noticeCoverage.keys()]).toEqual([
+      ...headings, ...networkHeadings, ...jarHeadings, ...dataHeadings
+    ]);
     for (const disposition of provenance.inventoryCoverage.values()) {
       expect(displayed.has(disposition) ||
         ["Development or build tooling", "Distributed separately", "Linkage remains unconfirmed"].includes(disposition)).toBe(true);
