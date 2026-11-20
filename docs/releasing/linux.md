@@ -48,7 +48,8 @@ The workflow:
 7. Runs independent smoke jobs on **Ubuntu 22.04 and 24.04**. Each downloads and verifies the same
    22.04-built packages against `SHA256SUMS-linux.txt`. The jobs run both package checks, even
    when the AppImage or the other runner fails.
-8. After both smoke jobs pass, fetches the draft's tag and checks that it resolves to the build
+8. The Debian sid, Fedora and Arch container checks also have to pass before upload. After the
+   smoke jobs pass, the workflow fetches the draft's tag and checks that it resolves to the build
    commit. It uploads to the existing draft, validates the attached builds, and refreshes the
    combined checksums.
 
@@ -96,15 +97,19 @@ gh workflow run linux-container-smoke.yml --ref <branch-or-tag>
 To test existing packages, add `-f artifact_run_id=<linux-release-run-id>` and optionally
 `-f artifact_name=<name>` (defaults to `linux-release-amd64`). A reusable caller can also supply
 `artifact_name` for packages uploaded earlier in the same run. Reusable callers need
-`actions: read` for artifact downloads and must allow the `contents: write` permission declared
-by the release workflow's separate publishing job. The build itself runs with read access.
+`actions: read` for artifact downloads. The shared build runs with read access.
 
-The workflow checks Debian sid and Fedora under Xvfb and headless Weston. The containers install
+The workflow checks Debian sid and Fedora under Xvfb and headless Weston, and Arch under Xvfb.
+AppImage jobs extract the image and use its library search path to check host Mesa, DRI, GBM and
+DRM dependencies with `ldd`; missing or AppImage-shadowed dependencies fail the job. The containers install
 libgpg-error as a desktop system would. Debian installs the
 .deb with apt and Fedora extracts its payload and runs it with Fedora's libraries. Each job
 uploads display, app, and process logs. These tests cover startup and subprocess crashes. GPU
 rendering still needs a desktop check. The privileged containers allow `strace` to trace the app
 and glycin's bubblewrap to create user namespaces; Weston enables Xwayland for Wayland smoke tests.
+On Ubuntu the X11 readiness check requires the Main Toolbar window and more than 16 distinct colors
+in a screenshot of the document below the native menu bar, to catch a blank webview. This is a
+rendering heuristic and does not verify menu contents, keyboard focus or clipboard interoperability.
 
 ## Updates
 
