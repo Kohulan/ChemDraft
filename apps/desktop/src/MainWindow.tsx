@@ -1838,7 +1838,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.19.22.53-codex";
+const CURRENT_BUILD_STAMP = "11.19.23.25-codex";
 const TABLE_DRAFT_RECOVERY_WARNING = "session.tableDraftDropped";
 
 function clearTableDraftRecoveryWarnings(report: OpenWarningsReport | undefined): OpenWarningsReport | undefined {
@@ -12845,7 +12845,11 @@ export function MainWindow({
             // Diagnostics have their own transport; the app command keeps its original contract.
             const open = perfHook(() => nativeWindowOpening("preferences", action.id));
             const { invoke } = await import("@tauri-apps/api/core");
-            await invoke("toggle_preferences_window", keyboard ? { keyboard } : undefined);
+            if (keyboard) {
+              await invoke("toggle_preferences_window", { keyboard: true });
+            } else {
+              await invoke("toggle_preferences_window");
+            }
             perfHook(() => perfToggleResolved("preferences", open, input));
           })().catch((error: unknown) => {
             if (input) perfHook(() => perfProbe?.complete(input, "failed"));

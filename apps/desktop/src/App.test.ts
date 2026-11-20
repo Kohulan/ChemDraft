@@ -1920,10 +1920,9 @@ describe("ChemDraft desktop shell", () => {
     expect(registry.resolve({ key: "b" })).toBeUndefined();
     expect(registry.resolve({ key: "t" })).toBe("tool.text");
     expect(registry.resolve({ key: "e" })).toBe("tool.eraser");
-    expect(registry.resolve({ key: "1" })).toBe("atom.addSingleBondToHoveredAtom");
-    expect(registry.resolve({ key: "2" })).toBe("bond.setHoveredBondOrder.double");
-    expect(registry.resolve({ key: "3" })).toBe("bond.setHoveredBondOrder.triple");
-    expect(registry.resolve({ key: "k" })).toBe("atom.addCarbonylToHoveredAtom");
+    for (const key of ["1", "2", "3", "k"]) {
+      expect(registry.resolve({ key }), key).toBeUndefined();
+    }
     expect(registry.resolve({ key: "k", metaKey: true, shiftKey: true })).toBe(structureCleanupCommandId);
     expect(registry.resolve({ key: "+" })).toBe("tool.plus");
     expect(registry.resolve({ key: "-" })).toBe("tool.minus");
