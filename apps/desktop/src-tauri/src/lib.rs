@@ -1,3 +1,7 @@
+#[cfg(target_os = "linux")]
+mod appimage_dialogs;
+#[cfg(target_os = "linux")]
+mod appimage_single_instance;
 mod assistant_mcp;
 mod canvas_context_menu;
 mod canvas_occlusion;
@@ -14,6 +18,9 @@ mod fonts;
 mod installed_plugins;
 #[cfg(target_os = "linux")]
 mod linux_clipboard;
+mod linux_session_end;
+#[cfg(any(target_os = "linux", test))]
+mod linux_startup;
 mod local_engine;
 #[cfg(target_os = "macos")]
 mod macos_quit;
@@ -138,6 +145,21 @@ impl WithoutConsoleWindow for Command {
         self
     }
 }
+
+/// AppRun's working folder is for WebKitGTK. App-owned children start in the user's home
+/// unless the caller sets a resource or workspace directory of its own.
+fn child_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let command = Command::new(program);
+    #[cfg(target_os = "linux")]
+    {
+        let mut command = command;
+        linux_startup::set_child_directory(&mut command);
+        command
+    }
+    #[cfg(not(target_os = "linux"))]
+    command
+}
+
 const SPIN3D_DEBUGGER_WINDOW_LABEL: &str = "spin3d-debugger";
 const SPIN3D_DEBUGGER_WINDOW_ROUTE: &str = "/?window=spin3d-debugger";
 const SPIN3D_DEBUGGER_TOGGLE_COMMAND_ID: &str = "view.toggle3dDebugger";
@@ -392,7 +414,7 @@ impl QuitFlow {
         true
     }
 
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, target_os = "linux", test))]
     fn flush_confirmed(&self, request_id: u64) -> bool {
         self.flush
             .lock()
@@ -575,7 +597,7 @@ impl<R: Runtime> QuitHost for tauri::AppHandle<R> {
 /// the last moment. Ask the document window to flush first; it confirms through `quit_after_flush`,
 /// and a grace timer quits regardless if the webview can't answer.
 fn request_quit<R: Runtime>(app: &tauri::AppHandle<R>) {
-    if windows_session_end::in_progress() {
+    if windows_session_end::in_progress() || linux_session_end::in_progress() {
         return;
     }
     if ASK_TO_SAVE_ON_QUIT.load(Ordering::SeqCst) {
@@ -638,6 +660,7 @@ fn capture_quit_window_frames<R: Runtime>(app: &tauri::AppHandle<R>) {
 /// Session confirmation has priority; only then join geometry workers. The deadline never joins.
 fn complete_quit_flush_with<H: QuitHost>(flow: &'static QuitFlow, host: &H, reason: QuitReason) {
     if windows_session_end::in_progress()
+        || linux_session_end::in_progress()
         || flow.position_drain_started.swap(true, Ordering::SeqCst)
     {
         return;
@@ -743,8 +766,8 @@ fn resume_prompted_quit_with<H: QuitHost>(
 /// The session is written, or its grace has run out. Reply to a deferred AppKit termination;
 /// otherwise arm the exit watchdog here and nowhere else, then request event-loop exit.
 fn quit_now_with<H: QuitHost>(flow: &'static QuitFlow, host: &H, reason: QuitReason) {
-    if windows_session_end::in_progress() {
-        // WM_ENDSESSION is waiting for the document. Let Windows own teardown.
+    if windows_session_end::in_progress() || linux_session_end::in_progress() {
+        // The committed system shutdown owns the flush and the exit deadline.
         return;
     }
     #[cfg(any(target_os = "macos", test))]
@@ -804,6 +827,8 @@ async fn quit_after_flush(
 ) -> Result<(), String> {
     authorize_quit_window(window.label())?;
     if QUIT.confirm_flush(request_id) {
+        #[cfg(target_os = "linux")]
+        linux_session_end::acknowledge_flush();
         complete_quit_flush_with(&QUIT, &app, QuitReason::FlushConfirmed);
     }
     Ok(())
@@ -1298,6 +1323,8 @@ const MAIN_WINDOW_TITLE_GRAB_PT: f64 = 22.0;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    let startup = linux_startup::configure();
     // First, before GTK opens the display: see monitor_query.rs.
     #[cfg(target_os = "linux")]
     monitor_query::init_xlib_threads();
@@ -1305,6 +1332,10 @@ pub fn run() {
     windows_activation_log::init(perf_enabled);
     let perf_log = perf_log::PerfLog::new(perf_enabled);
     let builder = tauri::Builder::default();
+    #[cfg(target_os = "linux")]
+    let is_appimage = startup.appimage.is_some();
+    #[cfg(target_os = "linux")]
+    let builder = builder.manage(startup);
 
     // Both guards run before any webview or app setup can touch session/settings files.
     let context = tauri::generate_context!();
@@ -1326,8 +1357,19 @@ pub fn run() {
     } else {
         builder.enable_macos_default_menu(false)
     };
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(handle_second_launch));
+    #[cfg(target_os = "linux")]
+    let builder = builder.plugin(if is_appimage {
+        appimage_single_instance::init()
+    } else {
+        tauri_plugin_single_instance::init(handle_second_launch)
+    });
 
     let builder = if perf_enabled {
         builder.plugin(
@@ -1365,8 +1407,17 @@ pub fn run() {
         // handler rather than adding a scheme — a new scheme would be a new origin, and M35 measured
         // that a plugin package only loads same-origin. The origin is unchanged, so no origin-keyed
         // state (localStorage, IndexedDB) is disturbed. See `installed_plugins` for the full rationale.
-        .register_uri_scheme_protocol("tauri", installed_plugins::handle_tauri_request)
-        .plugin(tauri_plugin_dialog::init())
+        .register_uri_scheme_protocol("tauri", installed_plugins::handle_tauri_request);
+    let dialogs = tauri_plugin_dialog::init();
+    #[cfg(target_os = "linux")]
+    let builder = if is_appimage {
+        builder.plugin(appimage_dialogs::AppImageDialogs(dialogs))
+    } else {
+        builder.plugin(dialogs)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let builder = builder.plugin(dialogs);
+    let builder = builder
         .plugin(tauri_plugin_fs::init())
         // Host-owned network transport for the allowlisted plugin-update catalog. Installed plugin
         // workers remain under connect-src 'self' and never receive this capability.
@@ -1439,11 +1490,9 @@ pub fn run() {
             if webview.label() == MAIN_WINDOW_LABEL
                 && matches!(payload.event(), PageLoadEvent::Finished)
             {
-                // WKWebView applies index.html's initial `<title>ChemDraft</title>` after setup,
-                // overwriting the label set by ensure_main_window_visible. Reassert the baked
-                // worktree title at the page-load boundary so the actual macOS title bar, not only
-                // the web document/build stamp, identifies this checkout.
-                let _ = webview.window().set_title(&main_window_title());
+                // WKWebView can apply index.html's title after setup. Restore the worktree label
+                // if the React document has yet to publish its title.
+                let _ = set_startup_title(&webview.window());
             }
         })
         .on_menu_event(|app, event| {
@@ -1684,6 +1733,9 @@ pub fn run() {
             }
         })
         .setup(move |app| {
+            app.add_capability(
+                r#"{"identifier":"document-window-title","webviews":["main"],"permissions":["core:window:allow-set-title"]}"#,
+            )?;
             #[cfg(target_os = "macos")]
             {
                 if let Err(error) = macos_quit::install(app.handle(), setup_secondary) {
@@ -1848,8 +1900,8 @@ pub fn run() {
         match event {
             RunEvent::MainEventsCleared => canvas_context_menu::events_cleared(app),
             RunEvent::ExitRequested { code, api, .. } => {
-                if windows_session_end::in_progress() {
-                    // A queued app quit can arrive while WM_ENDSESSION is pumping WebView2.
+                if windows_session_end::in_progress() || linux_session_end::blocks_exit() {
+                    // A queued app quit must give the committed OS flush time to finish.
                     api.prevent_exit();
                 } else if should_flush_exit_request(
                     cfg!(target_os = "macos"),
@@ -1923,6 +1975,10 @@ fn setup_primary_app(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::E
     if let Err(error) = windows_session_end::install(app) {
         eprintln!("Could not install ChemDraft session-end handler: {error}");
     }
+    #[cfg(target_os = "linux")]
+    if let Err(error) = linux_session_end::install(app) {
+        eprintln!("Could not install ChemDraft Linux termination handlers: {error}");
+    }
     panel_window::observe_document_pointer_release(app);
     file_warnings_window::observe_document(app)?;
     // Programmatic panel removal hides a reusable window, so it produces neither
@@ -1979,7 +2035,12 @@ fn setup_primary_app(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::E
 
     // Off macOS a document opened from the shell arrives as a launch argument. Keep the
     // existing queue-and-emit behavior, now that setup and the config window are ready.
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
     if let Ok(cwd) = std::env::current_dir() {
         let args = std::env::args_os()
             .skip(1)
@@ -1987,6 +2048,18 @@ fn setup_primary_app(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::E
         if let Err(error) = handle_opened_document_args(app, args, &cwd) {
             eprintln!("Could not open ChemDraft document from launch arguments: {error}");
         }
+    }
+    #[cfg(target_os = "linux")]
+    if let Err(error) = handle_opened_document_paths(
+        app,
+        app.state::<linux_startup::Startup>()
+            .documents
+            .iter()
+            .filter(|path| is_openable_document_path(path))
+            .cloned(),
+    ) {
+        eprintln!("Could not open ChemDraft document from launch arguments: {error}");
+        show_open_document_error(app, &error);
     }
 
     Ok(())
@@ -2106,10 +2179,9 @@ fn ensure_main_window_visible<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<(
     let already_on_screen = window.is_visible().unwrap_or(false);
     main_window_placement::reveal_after_preparation(
         |errors| {
-            // Tauri auto-creates the config "main" window at startup (title "ChemDraft" from tauri.conf.json),
-            // so create_main_window's set_title never runs on that path — apply the worktree-labeled title
-            // here on the window we actually resolved, so every worktree's window is distinguishable.
-            errors.record("set title", window.set_title(&main_window_title()));
+            // The auto-created window starts with the config title. On subsequent reveals the
+            // active document's title is already set.
+            errors.record("set title", set_startup_title(&window.as_ref().window()));
             errors.record("set decorations", window.set_decorations(true));
             errors.record("configure webview", configure_document_webview(&window));
             errors.record("set focusable", window.set_focusable(true));
@@ -2498,6 +2570,17 @@ fn main_window_title() -> String {
     window_title_for(option_env!("CHEMDRAFT_WORKTREE_LABEL"))
 }
 
+fn set_startup_title<R: Runtime>(window: &tauri::Window<R>) -> tauri::Result<()> {
+    if needs_initial_main_window_title(&window.title()?) {
+        window.set_title(&main_window_title())?;
+    }
+    Ok(())
+}
+
+fn needs_initial_main_window_title(current_title: &str) -> bool {
+    matches!(current_title, "" | "ChemDraft")
+}
+
 fn window_title_for(label: Option<&str>) -> String {
     match label {
         Some(label) if !label.trim().is_empty() => format!("ChemDraft — {}", label.trim()),
@@ -2507,7 +2590,7 @@ fn window_title_for(label: Option<&str>) -> String {
 
 #[cfg(test)]
 mod window_title_tests {
-    use super::window_title_for;
+    use super::{needs_initial_main_window_title, window_title_for};
 
     #[test]
     fn unlabeled_builds_get_the_plain_title() {
@@ -2523,6 +2606,18 @@ mod window_title_tests {
             "ChemDraft — chemdraw [x]"
         );
         assert_eq!(window_title_for(Some(" a [b] ")), "ChemDraft — a [b]");
+    }
+
+    #[test]
+    fn revealing_the_window_preserves_the_document_title() {
+        assert!(needs_initial_main_window_title(""));
+        assert!(needs_initial_main_window_title("ChemDraft"));
+        assert!(!needs_initial_main_window_title(
+            "Probe A.chemdraft — ChemDraft"
+        ));
+        assert!(!needs_initial_main_window_title(
+            "Probe A.chemdraft • — ChemDraft — worktree [branch]"
+        ));
     }
 }
 
@@ -3195,9 +3290,15 @@ fn second_launch_action(quitting: bool, setup_completed: bool) -> SecondLaunchAc
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
 fn handle_second_launch<R: Runtime>(app: &tauri::AppHandle<R>, argv: Vec<String>, cwd: String) {
-    let _ = handle_second_launch_with(app, || {
+    let result = handle_second_launch_with(app, || {
         handle_opened_document_args(app, argv.into_iter().skip(1), Path::new(&cwd))
     });
+    #[cfg(target_os = "linux")]
+    if let Some(Err(error)) = &result {
+        show_open_document_error(app, error);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = result;
 }
 
 #[cfg(target_os = "macos")]
@@ -8492,6 +8593,8 @@ fn resolve_engine3d_sidecar_path(env_override: Option<String>) -> Option<PathBuf
     // Development / explicit override: an absolute path to a locally built sidecar wins.
     if let Some(path) = env_override {
         let candidate = PathBuf::from(path.trim());
+        #[cfg(target_os = "linux")]
+        let candidate = linux_startup::user_path(&candidate).into_owned();
         if is_runnable_sidecar(&candidate) {
             return Some(candidate);
         }
@@ -8577,7 +8680,7 @@ fn start_engine3d_sidecar_session_from_path(
         std::process::id(),
         ENGINE3D_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
-    let mut child = Command::new(path)
+    let mut child = child_command(path)
         .arg("--stdio")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -9121,7 +9224,15 @@ fn handle_opened_document_args<R: Runtime>(
     args: impl IntoIterator<Item = String>,
     cwd: &Path,
 ) -> Result<(), String> {
-    let payloads = openable_document_paths_from_args(args, cwd)
+    handle_opened_document_paths(app, openable_document_paths_from_args(args, cwd))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+fn handle_opened_document_paths<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> Result<(), String> {
+    let payloads = paths
         .into_iter()
         .map(|path| open_document_payload_from_path(&path));
     deliver_opened_documents(payloads, |payload| deliver_opened_document(app, payload))
@@ -9283,8 +9394,44 @@ fn decode_document_text(bytes: &[u8]) -> String {
 
 const MAX_OPEN_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The renderer keeps an opened document's path as a JavaScript string and saves back through it.
+/// A path with no UTF-8 form cannot survive that trip, so on Linux (where file names are raw bytes)
+/// it is refused by name rather than replaced with a lossy look-alike that a save would miss.
+/// Other hosts keep their earlier conversion: macOS paths are always UTF-8, and `exact` stays off
+/// on Windows so its behavior does not change.
+fn open_document_path_text(path: &Path, exact: bool) -> Result<String, String> {
+    match path.to_str() {
+        Some(text) => Ok(text.to_owned()),
+        None if exact => Err(unsavable_document_path_message(path)),
+        None => Ok(path.to_string_lossy().into_owned()),
+    }
+}
+
+fn unsavable_document_path_message(path: &Path) -> String {
+    format!(
+        "Could not open \"{}\": its file name is not valid UTF-8, so ChemDraft could not save \
+         changes back to it. Rename the file and open it again.",
+        path.display()
+    )
+}
+
+/// Off macOS a failed shell open is otherwise reported only on stderr.
+#[cfg(target_os = "linux")]
+fn show_open_document_error<R: Runtime>(app: &tauri::AppHandle<R>, error: &str) {
+    let mut message = app
+        .dialog()
+        .message(error)
+        .title("ChemDraft Could Not Open a Document")
+        .kind(tauri_plugin_dialog::MessageDialogKind::Error);
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        message = message.parent(&window);
+    }
+    message.show(|_| {});
+}
+
 fn open_document_payload_from_path(path: &Path) -> Result<NativeOpenDocumentPayload, String> {
     use std::io::Read;
+    let path_text = open_document_path_text(path, cfg!(target_os = "linux"))?;
     let display_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -9313,7 +9460,7 @@ fn open_document_payload_from_path(path: &Path) -> Result<NativeOpenDocumentPayl
     Ok(NativeOpenDocumentPayload {
         #[cfg(target_os = "macos")]
         receipt: None,
-        path: path.to_string_lossy().to_string(),
+        path: path_text,
         display_name,
         contents,
         bytes,
@@ -12459,6 +12606,44 @@ mod tests {
                 assert!(!should_focus_main_window(mode));
             }
         }
+    }
+
+    #[test]
+    fn opened_document_paths_are_exact_or_refused_by_name() {
+        let utf8 = std::env::temp_dir().join("caf\u{e9} drawing.chemdraft");
+        for exact in [true, false] {
+            assert_eq!(
+                open_document_path_text(&utf8, exact).as_deref(),
+                Ok(utf8.to_str().unwrap())
+            );
+        }
+
+        #[cfg(unix)]
+        let invalid = {
+            use std::os::unix::ffi::OsStrExt;
+            PathBuf::from(std::ffi::OsStr::from_bytes(b"/home/caf\xe9.chemdraft"))
+        };
+        #[cfg(windows)]
+        let invalid = {
+            use std::os::windows::ffi::OsStringExt;
+            let mut wide: Vec<u16> = "C:\\caf".encode_utf16().collect();
+            wide.push(0xD800);
+            wide.extend(".chemdraft".encode_utf16());
+            PathBuf::from(std::ffi::OsString::from_wide(&wide))
+        };
+        // Linux: never hand the renderer a look-alike path that a save would write elsewhere.
+        let error = open_document_path_text(&invalid, true).unwrap_err();
+        assert!(error.contains("not valid UTF-8"), "{error}");
+        assert!(error.contains("Rename the file"), "{error}");
+        // Other hosts keep their earlier conversion.
+        assert_eq!(
+            open_document_path_text(&invalid, false),
+            Ok(invalid.to_string_lossy().into_owned())
+        );
+        #[cfg(target_os = "linux")]
+        assert!(open_document_payload_from_path(&invalid)
+            .err()
+            .is_some_and(|error| error.contains("not valid UTF-8")));
     }
 
     fn opened_document_test_payload() -> NativeOpenDocumentPayload {

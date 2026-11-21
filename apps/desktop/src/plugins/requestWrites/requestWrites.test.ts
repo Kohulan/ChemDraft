@@ -37,7 +37,7 @@ const plugin = "org.test.requests";
 
 function setup(initialIds: string[] = [], onToolCall?: PluginToolHandler,
   options: { writeSelection?: string[]; duplicate?: boolean; deferOrdinary?: boolean; objects?: DocumentObject[];
-    confirm?: () => Promise<"enlarge" | "keep"> } = {}) {
+    confirm?: (signal: AbortSignal, documentKey: string) => Promise<"enlarge" | "keep"> } = {}) {
   const first = toEngineDocument(createEmptyDocument());
   const pageId = first.pages[0]!.id;
   let pinned: ChemDraftDocument | undefined = normalizeCommittedDocument(applyPatch(first, { op: "batch", patches: [
@@ -177,6 +177,8 @@ describe("request page fit", () => {
         object: { ...frame("plus"), type: "plus", ...requiredBounds } } })).toMatchObject({ ok: true });
       expect(f.history).toHaveLength(1);
       expect(confirm).toHaveBeenCalledOnce();
+      // The host names the request's own document, not the one that happens to be active.
+      expect(confirm).toHaveBeenCalledWith(expect.any(AbortSignal), "instance-first");
     } finally { await f.finish(); }
   });
 
