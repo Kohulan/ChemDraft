@@ -421,6 +421,186 @@ describe("plugin direct writes through mounted desktop normalization", () => {
     expect(inspect).not.toHaveBeenCalled();
   });
 
+  it("skips inspection when a whole alkene is rotated and moved as one unit", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const molecule = graphEditFixture(blank, pluginGraphEdits.find(edit => edit.name === "coordinate-only E/Z")!);
+    await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const cx = molecule.atoms.reduce((sum, atom) => sum + atom.x, 0) / molecule.atoms.length;
+    const cy = molecule.atoms.reduce((sum, atom) => sum + atom.y, 0) / molecule.atoms.length;
+    const cos = Math.cos(Math.PI / 3), sin = Math.sin(Math.PI / 3);
+    // A rotation keeps both double-bond sides, so the E isomer cannot change.
+    const atoms = molecule.atoms.map(atom => ({ ...atom,
+      x: cx + 15 + (atom.x - cx) * cos - (atom.y - cy) * sin, y: cy + 10 + (atom.x - cx) * sin + (atom.y - cy) * cos }));
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Rotate molecule", patch: {
+      op: "updateObject", objectId: molecule.id, changes: { atoms }
+    } }));
+    await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true }); });
+    expect(inspect).not.toHaveBeenCalled();
+  });
+
+  /** The E-but-2-ene fixture with explicit coordinates for the alkene ends and their substituents. */
+  function alkeneAt(blank: ChemDraftDocument, place: (role: "start" | "end" | "startSubstituent" | "endSubstituent") => { x: number; y: number }) {
+    const molecule = graphEditFixture(blank, pluginGraphEdits.find(edit => edit.name === "coordinate-only E/Z")!);
+    const alkene = molecule.bonds.find(bond => bond.order === "double")!;
+    const role = (id: string) => id === alkene.fromAtomId ? "start" : id === alkene.toAtomId ? "end" :
+      molecule.bonds.some(bond => bond !== alkene && [bond.fromAtomId, bond.toAtomId].includes(id) &&
+        [bond.fromAtomId, bond.toAtomId].includes(alkene.fromAtomId)) ? "startSubstituent" : "endSubstituent";
+    molecule.atoms = molecule.atoms.map(atom => ({ ...atom, ...place(role(atom.id)) }));
+    return { molecule, role };
+  }
+
+  it("verifies a large-coordinate edit that moves one alkene substituent across the axis", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    // Extent 1e9 lets the similarity fit absorb a 2-unit move; the substituent still changes sides.
+    const { molecule, role } = alkeneAt(blank, which => ({ start: { x: 300, y: 250 }, end: { x: 300 + 1e9, y: 250 },
+      startSubstituent: { x: 299, y: 251 }, endSubstituent: { x: 301 + 1e9, y: 249 } })[which]);
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const before = port.read("initial")!;
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const atoms = molecule.atoms.map(atom => role(atom.id) === "startSubstituent" ? { ...atom, y: 249 } : atom);
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Move substituent", patch: {
+      op: "updateObject", objectId: molecule.id, changes: { atoms }
+    } }));
+    await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true, objectIds: [molecule.id] }); });
+    expect(inspect).toHaveBeenCalled();
+    expect(port.read("initial")).not.toBe(before);
+    await expectStoredGraph(port.read("initial")!.pages[0]!.objects[0]! as MoleculeObject,
+      pluginGraphEdits.find(edit => edit.name === "coordinate-only E/Z")!);
+  }, 20_000);
+
+  it("verifies a near-collinear substituent that crosses the double-bond axis", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const { molecule, role } = alkeneAt(blank, which => ({ start: { x: 300, y: 250 }, end: { x: 320, y: 250 },
+      startSubstituent: { x: 280, y: 250 + 1e-5 }, endSubstituent: { x: 330, y: 250 - 17.32 } })[which]);
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const before = port.read("initial")!;
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const atoms = molecule.atoms.map(atom => role(atom.id) === "startSubstituent" ? { ...atom, y: 250 - 1e-5 } : atom);
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Move substituent", patch: {
+      op: "updateObject", objectId: molecule.id, changes: { atoms }
+    } }));
+    // Neither drawing gives the alkene a side, so its stored E isomer cannot be confirmed.
+    await act(async () => { await expect(invoke()).rejects.toThrow(
+      new RegExp(`cannot refresh stored chemistry for molecule "${molecule.id}".*stored smiles.*editable graph cannot verify`, "i")); });
+    expect(inspect).toHaveBeenCalled();
+    expect(port.read("initial")).toBe(before);
+  }, 20_000);
+
+  /** (R)-1-aminoethanol drawn with its nitrogen wedged up from the stereocentre, at explicit
+   * coordinates for the stereocentre's three neighbours. */
+  function stereocentreAt(blank: ChemDraftDocument, place: (element: "centre" | "C" | "N" | "O") => { x: number; y: number }) {
+    const molecule = graphEditFixture(blank, { name: "element", source: "C[C@H](N)O" });
+    const centre = molecule.bonds.find(bond => bond.display?.bondStyle === "wedge")!.fromAtomId;
+    expect(molecule.atoms.find(atom => atom.id === centre)?.element).toBe("C");
+    const role = (id: string) => id === centre ? "centre" : molecule.atoms.find(atom => atom.id === id)!.element as "C" | "N" | "O";
+    molecule.atoms = molecule.atoms.map(atom => ({ ...atom, ...place(role(atom.id)) }));
+    return { molecule, role };
+  }
+  async function storedConfiguration(molecule: MoleculeObject) {
+    const result = await identityClient.inspectStructureOffThread(molecule.structureFormat === "smiles" ? "smiles" : "molfile",
+      molecule.structure, undefined, undefined, "writeIdentity");
+    if (!result.valid) throw new Error(result.reason);
+    return result.identitySmiles;
+  }
+  async function moveStereocentreAtoms(molecule: MoleculeObject, atoms: MoleculeObject["atoms"]) {
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Move atoms", patch: {
+      op: "updateObject", objectId: molecule.id, changes: { atoms }
+    } }));
+    let result: unknown;
+    await act(async () => { result = await invoke(); });
+    return result;
+  }
+
+  it("verifies a large-coordinate edit that moves one wedge neighbour across another", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    // Extent 1e9 lets the similarity fit absorb a 2-unit move; the oxygen still crosses the methyl's ray.
+    const { molecule, role } = stereocentreAt(blank, which => ({ centre: { x: 300, y: 255.5 }, C: { x: 300 + 1e9, y: 255.5 },
+      N: { x: 300, y: 233.5 }, O: { x: 305, y: 256.5 } })[which]);
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const before = port.read("initial")!;
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const atoms = molecule.atoms.map(atom => role(atom.id) === "O" ? { ...atom, y: 254.5 } : atom);
+    await expect(moveStereocentreAtoms(molecule, atoms)).resolves.toMatchObject({ applied: true, objectIds: [molecule.id] });
+    expect(inspect).toHaveBeenCalled();
+    const after = port.read("initial")!.pages[0]!.objects[0]! as MoleculeObject;
+    expect(after).not.toBe(before.pages[0]!.objects[0]);
+    // The drawn configuration inverted, so the stored R must become S and never stay R.
+    expect(await storedConfiguration(after)).toBe(await storedConfiguration({ ...after, structure: "C[C@@H](N)O", structureFormat: "smiles" }));
+    expect(after.compatibility?.unknown.smiles).toBe("C[C@@H](N)O");
+    expect(after.chemistry?.stereochemistry.join(" ")).toMatch(/\(S\)/);
+    expect(after.chemistry?.stereochemistry.join(" ")).not.toMatch(/\(R\)/);
+  }, 20_000);
+
+  it("skips inspection when a wedged stereocentre is rotated and moved as one unit", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const molecule = graphEditFixture(blank, { name: "element", source: "C[C@H](N)O" });
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const stored = port.read("initial")!.pages[0]!.objects[0]! as MoleculeObject;
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const cx = molecule.atoms.reduce((sum, atom) => sum + atom.x, 0) / molecule.atoms.length;
+    const cy = molecule.atoms.reduce((sum, atom) => sum + atom.y, 0) / molecule.atoms.length;
+    const cos = Math.cos(Math.PI / 3), sin = Math.sin(Math.PI / 3);
+    // A rotation keeps the turn between every pair of the stereocentre's neighbours, so R cannot change.
+    const atoms = molecule.atoms.map(atom => ({ ...atom,
+      x: cx + 15 + (atom.x - cx) * cos - (atom.y - cy) * sin, y: cy + 10 + (atom.x - cx) * sin + (atom.y - cy) * cos }));
+    await expect(moveStereocentreAtoms(molecule, atoms)).resolves.toMatchObject({ applied: true });
+    expect(inspect).not.toHaveBeenCalled();
+    const after = port.read("initial")!.pages[0]!.objects[0]! as MoleculeObject;
+    expect(after.atoms.map(atom => [atom.x, atom.y])).toEqual(atoms.map(atom => [atom.x, atom.y]));
+    expect(after.structure).toBe("C[C@H](N)O");
+    expect(after.compatibility?.unknown.smiles).toBe(stored.compatibility?.unknown.smiles);
+    expect(after.chemistry?.stereochemistry).toEqual(stored.chemistry?.stereochemistry);
+  });
+
+  it("verifies a near-collinear wedge neighbour that crosses another neighbour's ray", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    // The oxygen sits within the side epsilon of the methyl's ray (|sin| about 5e-9), so neither
+    // drawing clearly keeps its turn, although the move is far inside the similarity tolerance.
+    const { molecule, role } = stereocentreAt(blank, which => ({ centre: { x: 300, y: 255.5 }, C: { x: 320, y: 255.5 },
+      N: { x: 300, y: 233.5 }, O: { x: 280, y: 255.5 + 1e-7 } })[which]);
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const before = port.read("initial")!;
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const atoms = molecule.atoms.map(atom => role(atom.id) === "O" ? { ...atom, y: 255.5 - 1e-7 } : atom);
+    // A collinear drawing gives the stereocentre no configuration, so its stored R cannot be confirmed.
+    await expect(moveStereocentreAtoms(molecule, atoms)).rejects.toThrow(
+      new RegExp(`cannot refresh stored chemistry for molecule "${molecule.id}".*stored smiles.*editable graph cannot verify`, "i"));
+    expect(inspect).toHaveBeenCalled();
+    expect(port.read("initial")).toBe(before);
+  }, 20_000);
+
+  it("inserts a molecule whose stored records are the canvas's own derivation without inspection", async () => {
+    const blank = createEmptyDocument();
+    const molecule = graphEditFixture(blank, { name: "element", source: "CO" });
+    const port = await mount(blank);
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Insert methanol", patch: {
+      op: "addObject", pageId: blank.pages[0]!.id, object: molecule
+    } }));
+    await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true, objectIds: [molecule.id] }); });
+    expect(inspect).not.toHaveBeenCalled();
+    expect(port.read("initial")!.pages[0]!.objects).toMatchObject([{ id: molecule.id, structure: "CO" }]);
+  });
+
   it("preserves a canvas edit made while a plugin graph patch awaits inspection", async () => {
     const blank = createEmptyDocument();
     const pageId = blank.pages[0]!.id;
