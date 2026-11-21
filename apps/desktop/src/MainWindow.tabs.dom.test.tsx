@@ -2105,6 +2105,31 @@ describe("documents in one window", () => {
       touch(third, "pointerup", 62, 4 + TOUCH_PAN_SLOP + 1, { pointerId: 22 });
     });
 
+    it("never default-prevents touch moves of an abandoned vertical gesture or outside the strip", async () => {
+      const { track } = await openOverflowingTabs();
+      track.setPointerCapture = vi.fn();
+      const touchMove = (target: Element) => {
+        const event = new Event("touchmove", { bubbles: true, cancelable: true });
+        target.dispatchEvent(event);
+        return event.defaultPrevented;
+      };
+      const third = tabs()[2]!;
+      touch(third, "pointerdown", 60, 4, { pointerId: 23 });
+      touch(third, "pointermove", 66, 44, { pointerId: 23 });
+      // Vertical page scroll and pinch-zoom keep working during and after the abandoned gesture.
+      expect(touchMove(third)).toBe(false);
+      expect(touchMove(track)).toBe(false);
+      expect(touchMove(document.body)).toBe(false);
+      // Turning sideways afterwards does not make it a pan.
+      touch(third, "pointermove", 160, 44, { pointerId: 23 });
+      expect(touchMove(third)).toBe(false);
+      expect(touchMove(track)).toBe(false);
+      touch(third, "pointerup", 160, 44, { pointerId: 23 });
+      expect(touchMove(third)).toBe(false);
+      expect(touchMove(track)).toBe(false);
+      expect(touchMove(document.body)).toBe(false);
+    });
+
     it("does not pan on a vertical-dominant touch move", async () => {
       const { track } = await openOverflowingTabs();
       const capture = track.setPointerCapture = vi.fn();
