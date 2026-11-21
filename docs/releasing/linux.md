@@ -38,7 +38,14 @@ The workflow:
 4. Checks the bundle identity and that the `.deb` carries `chemdraft`, the 3D sidecar and the
    OPSIN runtime.
 5. Repacks the AppImage after Tauri bundles it. It uses the host's Wayland and compiler runtime
-   libraries and the host's `libgpg-error.so.0`; the job verifies that the finished image contains no `libwayland-*`,
+   libraries and the host's `libgpg-error.so.0`. It also removes the bundled copies of libraries
+   that host Mesa (`libEGL_mesa`, `libgallium`, `libgbm`, the DRI drivers) depends on, so the
+   Ubuntu 22.04 copies never shadow the host's newer ones: `libzstd.so*`, `libelf.so*` and
+   `libelf-*.so`, `libffi.so*`, `libXau.so*`, `libXdmcp.so*`, `libxcb-randr.so*`,
+   `libxcb-shm.so*`, `libbsd.so*`, and `libmd.so*`. Each is a standard base package on every
+   supported host (on Debian and Ubuntu: `libzstd1`, `libelf1`, `libffi8`, `libxau6`,
+   `libxdmcp6`, `libxcb-randr0`, `libxcb-shm0`, `libbsd0`, `libmd0`); `libxcb.so.1` stays
+   bundled. The job verifies that the finished image contains none of these and no `libwayland-*`,
    `libstdc++.so*`, or `libgcc_s.so*` files or symlinks. The job logs the bundled shared libraries
    under `usr/lib` and rejects bundled `libEGL*`, `libGL.so*`, `libGLX*`, `libOpenGL.so*`,
    `libGLESv1_CM.so*`, `libGLESv2.so*`, `libGLU.so*`, `libGLdispatch*`, `libgbm*`, `libdrm*`,

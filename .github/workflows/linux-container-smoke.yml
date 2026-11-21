@@ -173,7 +173,7 @@ jobs:
           install -d -m 1777 /tmp/.X11-unix
 
       - name: Check AppImage library resolution against host Mesa
-        if: matrix.package == appimage
+        if: matrix.package == 'appimage'
         run: bash .github/workflows/linux-package-smoke/host-mesa.sh "$BUNDLE"
 
       # Xvfb also runs the document, menu and clipboard checks. Weston exercises the XWayland
