@@ -1638,3 +1638,18 @@ whole-molecule cleanup with the existing behavior, and check save/reopen and exp
 - Use File > Open to open a binary `.cdx` with known structures. Check bonds, labels and any import
   warnings against the source. Open a truncated CDX: it reports an import failure. On Windows use
   the file chooser or Open With; the installer does not register `.cdx` as an association.
+
+## Linux startup and session end
+
+- Disable “Start with a fresh document”, make an unsaved edit, and log out before the autosave
+  debounce expires. Log back in and verify that the last edit is recovered. Repeat with
+  `kill -TERM`, `kill -HUP`, and `kill -INT` against ChemDraft, including with the Save on Quit
+  prompt open. Stall the renderer and verify that shutdown is bounded and reports an
+  unconfirmed flush.
+- In a directory containing `drawing.cdxml`, launch `/path/to/ChemDraft.AppImage drawing.cdxml`.
+  Verify that the drawing opens, then repeat with ChemDraft already running. Check that WebKit
+  starts and that an untitled document's Save dialog starts outside the image mount. Check the
+  process's working folder with and without `OWD`.
+- Start a native Wayland session with XWayland disabled. With `DISPLAY` and `GDK_BACKEND` unset,
+  launch both packages and verify that the document window and drawing canvas appear. Repeat
+  on Wayland with XWayland enabled and check the default and an explicit Wayland override.

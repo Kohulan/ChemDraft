@@ -114,17 +114,26 @@ repository on GitHub Pages, or a Flathub listing.
 
 ## Platform notes
 
-- On Wayland, the `.deb` defaults to XWayland so ChemDraft can position floating toolbars and
-  dialogs, matching the AppImage launcher. Set `CHEMDRAFT_NATIVE_WAYLAND=1` to skip the app's
-  XWayland default for the `.deb`, and use `GDK_BACKEND` to supply an explicit backend. The AppImage
-  always uses XWayland because linuxdeploy-plugin-gtk's AppRun hook exports `GDK_BACKEND=x11` before
-  ChemDraft starts.
+- On Wayland with a non-empty `DISPLAY`, ChemDraft defaults to XWayland so it can position
+  floating toolbars and dialogs. With no X11 display, GTK chooses native Wayland.
+  `CHEMDRAFT_NATIVE_WAYLAND=1` skips this default and an explicit `GDK_BACKEND` takes precedence.
+  The generated AppImage GTK hook still sets `GDK_BACKEND=x11` before ChemDraft starts, so that
+  launcher requires X11 or XWayland.
 - Webview: WebKitGTK, origin `tauri://localhost` (as on macOS). Before startup on Linux,
   ChemDraft defaults `WEBKIT_DISABLE_DMABUF_RENDERER` to `1` to avoid Wayland graphics
   problems. An explicit value, including `0`, takes precedence.
   For AppImage launches, an explicit `EGL_PLATFORM` takes precedence. Otherwise, a `GDK_BACKEND`
   starting with `x11` or `wayland` selects that EGL platform. For other or unset backends, ChemDraft
-  selects `wayland` when `WAYLAND_DISPLAY` is set and `x11` otherwise.
+  selects `wayland` when `WAYLAND_DISPLAY` is non-empty and `x11` otherwise.
+- An AppImage resolves document arguments from `OWD` or the user's home folder and
+  resolves relative WebKit path overrides from `APPDIR`. The bundled WebKit in the generated
+  AppImage uses helper paths relative to the mount, so a primary instance restores that
+  working folder before WebKit starts. It forwards the caller's folder when handing off
+  documents to a running instance.
+- Linux session end uses the same recovery write as File ▸ Exit. The app requests it on SIGTERM,
+  SIGINT, SIGHUP, a GNOME session-end notification, or a logind shutdown notification. When
+  available, a logind delay inhibitor gives the renderer up to two seconds to confirm the
+  write. A separate three-second deadline covers a stalled event loop or teardown.
 - Menus: on the document window, as on Windows (`install_app_menu`). Edit ▸ Cut / Copy / Paste
   invoke WebKitGTK's native editing commands in the focused window. The webview receives
   Ctrl+X / C / V directly and uses the same clipboard events for menu clicks and shortcuts.

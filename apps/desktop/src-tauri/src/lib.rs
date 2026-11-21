@@ -14,6 +14,9 @@ mod fonts;
 mod installed_plugins;
 #[cfg(target_os = "linux")]
 mod linux_clipboard;
+mod linux_session_end;
+#[cfg(any(target_os = "linux", test))]
+mod linux_startup;
 mod local_engine;
 #[cfg(target_os = "macos")]
 mod macos_quit;
@@ -389,7 +392,7 @@ impl QuitFlow {
         true
     }
 
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, target_os = "linux", test))]
     fn flush_confirmed(&self, request_id: u64) -> bool {
         self.flush
             .lock()
@@ -572,7 +575,7 @@ impl<R: Runtime> QuitHost for tauri::AppHandle<R> {
 /// the last moment. Ask the document window to flush first; it confirms through `quit_after_flush`,
 /// and a grace timer quits regardless if the webview can't answer.
 fn request_quit<R: Runtime>(app: &tauri::AppHandle<R>) {
-    if windows_session_end::in_progress() {
+    if windows_session_end::in_progress() || linux_session_end::in_progress() {
         return;
     }
     if ASK_TO_SAVE_ON_QUIT.load(Ordering::SeqCst) {
@@ -635,6 +638,7 @@ fn capture_quit_window_frames<R: Runtime>(app: &tauri::AppHandle<R>) {
 /// Session confirmation has priority; only then join geometry workers. The deadline never joins.
 fn complete_quit_flush_with<H: QuitHost>(flow: &'static QuitFlow, host: &H, reason: QuitReason) {
     if windows_session_end::in_progress()
+        || linux_session_end::in_progress()
         || flow.position_drain_started.swap(true, Ordering::SeqCst)
     {
         return;
@@ -740,8 +744,8 @@ fn resume_prompted_quit_with<H: QuitHost>(
 /// The session is written, or its grace has run out. Reply to a deferred AppKit termination;
 /// otherwise arm the exit watchdog here and nowhere else, then request event-loop exit.
 fn quit_now_with<H: QuitHost>(flow: &'static QuitFlow, host: &H, reason: QuitReason) {
-    if windows_session_end::in_progress() {
-        // WM_ENDSESSION is waiting for the document. Let Windows own teardown.
+    if windows_session_end::in_progress() || linux_session_end::in_progress() {
+        // The committed system shutdown owns the flush and the exit deadline.
         return;
     }
     #[cfg(any(target_os = "macos", test))]
@@ -801,6 +805,8 @@ async fn quit_after_flush(
 ) -> Result<(), String> {
     authorize_quit_window(window.label())?;
     if QUIT.confirm_flush(request_id) {
+        #[cfg(target_os = "linux")]
+        linux_session_end::acknowledge_flush();
         complete_quit_flush_with(&QUIT, &app, QuitReason::FlushConfirmed);
     }
     Ok(())
@@ -1295,6 +1301,8 @@ const MAIN_WINDOW_TITLE_GRAB_PT: f64 = 22.0;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    let startup = linux_startup::configure();
     // First, before GTK opens the display: see monitor_query.rs.
     #[cfg(target_os = "linux")]
     monitor_query::init_xlib_threads();
@@ -1302,6 +1310,8 @@ pub fn run() {
     windows_activation_log::init(perf_enabled);
     let perf_log = perf_log::PerfLog::new(perf_enabled);
     let builder = tauri::Builder::default();
+    #[cfg(target_os = "linux")]
+    let builder = builder.manage(startup);
 
     // Both guards run before any webview or app setup can touch session/settings files.
     let context = tauri::generate_context!();
@@ -1819,6 +1829,12 @@ pub fn run() {
         ])
         .build(context)
         .expect("error while building ChemDraft");
+    #[cfg(target_os = "linux")]
+    linux_startup::restore_legacy_webkit_cwd(
+        app.state::<linux_startup::Startup>()
+            .legacy_webkit_cwd
+            .as_deref(),
+    );
     #[cfg(target_os = "macos")]
     let app = {
         let mut app = app;
@@ -1838,8 +1854,8 @@ pub fn run() {
         match event {
             RunEvent::MainEventsCleared => canvas_context_menu::events_cleared(app),
             RunEvent::ExitRequested { code, api, .. } => {
-                if windows_session_end::in_progress() {
-                    // A queued app quit can arrive while WM_ENDSESSION is pumping WebView2.
+                if windows_session_end::in_progress() || linux_session_end::blocks_exit() {
+                    // A queued app quit must give the committed OS flush time to finish.
                     api.prevent_exit();
                 } else if should_flush_exit_request(
                     cfg!(target_os = "macos"),
@@ -1913,6 +1929,10 @@ fn setup_primary_app(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::E
     if let Err(error) = windows_session_end::install(app) {
         eprintln!("Could not install ChemDraft session-end handler: {error}");
     }
+    #[cfg(target_os = "linux")]
+    if let Err(error) = linux_session_end::install(app) {
+        eprintln!("Could not install ChemDraft Linux termination handlers: {error}");
+    }
     panel_window::observe_document_pointer_release(app);
     file_warnings_window::observe_document(app)?;
     // Programmatic panel removal hides a reusable window, so it produces neither
@@ -1969,7 +1989,12 @@ fn setup_primary_app(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::E
 
     // Off macOS a document opened from the shell arrives as a launch argument. Keep the
     // existing queue-and-emit behavior, now that setup and the config window are ready.
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
     if let Ok(cwd) = std::env::current_dir() {
         let args = std::env::args_os()
             .skip(1)
@@ -1977,6 +2002,17 @@ fn setup_primary_app(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::E
         if let Err(error) = handle_opened_document_args(app, args, &cwd) {
             eprintln!("Could not open ChemDraft document from launch arguments: {error}");
         }
+    }
+    #[cfg(target_os = "linux")]
+    if let Err(error) = handle_opened_document_paths(
+        app,
+        app.state::<linux_startup::Startup>()
+            .documents
+            .iter()
+            .filter(|path| is_openable_document_path(path))
+            .cloned(),
+    ) {
+        eprintln!("Could not open ChemDraft document from launch arguments: {error}");
     }
 
     Ok(())
@@ -9051,7 +9087,15 @@ fn handle_opened_document_args<R: Runtime>(
     args: impl IntoIterator<Item = String>,
     cwd: &Path,
 ) -> Result<(), String> {
-    let payloads = openable_document_paths_from_args(args, cwd)
+    handle_opened_document_paths(app, openable_document_paths_from_args(args, cwd))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+fn handle_opened_document_paths<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> Result<(), String> {
+    let payloads = paths
         .into_iter()
         .map(|path| open_document_payload_from_path(&path));
     deliver_opened_documents(payloads, |payload| deliver_opened_document(app, payload))
