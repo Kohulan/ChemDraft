@@ -2021,6 +2021,109 @@ describe("documents in one window", () => {
       });
     });
 
+    describe("a tab that grows after it was revealed", () => {
+      const gap = 2;
+      const stripLeft = 24;
+      const stripWidth = 230;
+      const closeWidth = 30;
+
+      // Tabs have a width of their own, so one can grow after the strip has already revealed it. The width comes
+      // from the title unless a test overrides it, and only the tests fire the resize callbacks.
+      async function mountWithVariableWidths() {
+        const resize = new Map<Element, () => void>();
+        vi.stubGlobal("ResizeObserver", class {
+          constructor(private readonly onResize: () => void) {}
+          observe(element: Element) { resize.set(element, this.onResize); }
+          unobserve(element: Element) { resize.delete(element); }
+          disconnect() {}
+        });
+        await remount();
+        const strip = container.querySelector<HTMLDivElement>(".document-tab-list")!;
+        const track = strip.querySelector<HTMLDivElement>(".document-tab-track")!;
+        const widths = new Map<Element, number>();
+        const widthOf = (tab: Element) => {
+          const title = tab.querySelector('[role="tab"] span')?.textContent ?? "";
+          return widths.get(tab) ?? (title === "Untitled" ? 90 : title.startsWith("Quarterly") ? 220 : 150);
+        };
+        const trackWidth = () => {
+          const tabs = Array.from(track.children);
+          return Math.max(0, tabs.reduce((sum, tab) => sum + widthOf(tab), 0) + Math.max(0, tabs.length - 1) * gap);
+        };
+        track.style.columnGap = `${gap}px`;
+        vi.spyOn(strip, "clientWidth", "get").mockReturnValue(stripWidth);
+        vi.spyOn(strip, "getBoundingClientRect").mockImplementation(() => new DOMRect(stripLeft, 0, stripWidth, 24));
+        vi.spyOn(track, "scrollWidth", "get").mockImplementation(trackWidth);
+        vi.spyOn(track, "getBoundingClientRect").mockImplementation(() =>
+          new DOMRect(stripLeft + translationX(track), 0, trackWidth(), 24));
+        const bounds = HTMLDivElement.prototype.getBoundingClientRect;
+        vi.spyOn(HTMLDivElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLDivElement) {
+          if (this.parentElement !== track) return bounds.call(this);
+          let left = 0;
+          for (const tab of Array.from(track.children)) {
+            if (tab === this) break;
+            left += widthOf(tab) + gap;
+          }
+          return new DOMRect(stripLeft + left + translationX(track), 0, widthOf(this), 24);
+        });
+        for (const name of ["First drawing", "Second drawing", "Third drawing", "Fourth drawing"]) await open(name);
+        expect(tabs()).toHaveLength(4);
+        expect(active()).toBe(3);
+        // Four tabs of 150 px and three gaps make a 606 px track in a 230 px strip: the last tab is revealed.
+        expect(track.style.transform).toBe("translateX(-376px)");
+        return { strip, track, widths, resize, lastTab: () => track.lastElementChild as HTMLElement };
+      }
+
+      // The tab and its close button, at the tab's right end, both sit inside the strip.
+      function expectTabAndCloseInStrip(tab: HTMLElement) {
+        const box = tab.getBoundingClientRect();
+        expect(box.left).toBeGreaterThanOrEqual(stripLeft);
+        expect(box.right).toBeLessThanOrEqual(stripLeft + stripWidth);
+        expect(box.right - closeWidth).toBeGreaterThanOrEqual(stripLeft);
+      }
+
+      it("keeps the active last tab fully visible when its width grows after the reveal", async () => {
+        const { track, widths, resize, lastTab } = await mountWithVariableWidths();
+        expectTabAndCloseInStrip(lastTab());
+
+        // Only the tab's own width changes: the strip keeps its size, so just the track's observer fires.
+        widths.set(lastTab(), 200);
+        resize.get(track)!();
+
+        expect(track.style.transform).toBe("translateX(-426px)");
+        expect(426 + stripWidth).toBe(3 * 150 + 200 + 3 * gap);
+        expectTabAndCloseInStrip(lastTab());
+      });
+
+      it("reveals a file opening into a blank last tab at its final width", async () => {
+        const { track, lastTab } = await mountWithVariableWidths();
+        await command("document.new");
+        expect(tabs()).toHaveLength(5);
+        expect(active()).toBe(4);
+        expect(tabs()[4]!.textContent).toBe("Untitled");
+        expect(track.style.transform).toBe("translateX(-468px)");
+        expectTabAndCloseInStrip(lastTab());
+
+        // The pristine tab keeps its id, so only its title changes; no resize callback fires.
+        await open("Quarterly review");
+        expect(tabs()).toHaveLength(5);
+        expect(active()).toBe(4);
+        expect(tabs()[4]!.textContent).toBe("Quarterly review.chemdraft");
+        expect(track.style.transform).toBe("translateX(-598px)");
+        expectTabAndCloseInStrip(lastTab());
+      });
+
+      it("does not pull the strip back when the user scrolled away before the tab grew", async () => {
+        const { track, widths, resize, lastTab } = await mountWithVariableWidths();
+        expect(wheel(track, -300, 0)).toBe(true);
+        expect(track.style.transform).toBe("translateX(-76px)");
+
+        widths.set(lastTab(), 200);
+        resize.get(track)!();
+
+        expect(track.style.transform).toBe("translateX(-76px)");
+      });
+    });
+
     it.each(["×", "Cmd+W", "Ctrl+W"] as const)(
       "scrolls before removing the last active tab via %s",
       async (route) => {

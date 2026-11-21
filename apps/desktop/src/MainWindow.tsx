@@ -1837,7 +1837,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.20.22.50-sonnet";
+const CURRENT_BUILD_STAMP = "11.20.23.15-sonnet";
 const TABLE_DRAFT_RECOVERY_WARNING = "session.tableDraftDropped";
 
 function clearTableDraftRecoveryWarnings(report: OpenWarningsReport | undefined): OpenWarningsReport | undefined {
@@ -10268,6 +10268,10 @@ export function MainWindow({
   }, [activateDocumentTab]);
 
   const documentTabOrder = documentTabs.map((tab) => tab.id).join(",");
+  const activeDocumentTabTitle = (() => {
+    const tab = documentTabs.find((candidate) => candidate.id === activeDocumentTabId);
+    return tab ? documentTabTitle(tab, fileState) : "";
+  })();
   useLayoutEffect(() => {
     const scroll = pendingTabScrollRef.current;
     const canvas = canvasRegionRef.current;
@@ -23054,11 +23058,12 @@ export function MainWindow({
       ) : null}
       <section className="workspace workspace-with-tabs">
         <div className="document-tab-strip">
-          <DocumentTabList ref={documentTabListRef} activeId={activeDocumentTabId} order={documentTabOrder}>
+          <DocumentTabList ref={documentTabListRef} activeId={activeDocumentTabId} order={documentTabOrder}
+            activeTitle={activeDocumentTabTitle}>
             {documentTabs.map((tab) => {
               const active = tab.id === activeDocumentTabId;
               const file = active ? fileState : documentTabSnapshotsRef.current.get(tab.id)?.file;
-              const title = file?.path ? nativePathBasename(file.path) : tab.title;
+              const title = documentTabTitle(tab, file);
               return (
                 <div className="document-tab" key={tab.id} data-document-tab-id={tab.id} data-active={active}>
                   <button type="button" role="tab" aria-selected={active}
@@ -34281,6 +34286,11 @@ export function documentTabPathKey(path: string, platform = detectDesktopShortcu
 
 export function nativePathBasename(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
+}
+
+// The title a document tab shows: the file's name once it has a path, else the document's own title.
+function documentTabTitle(tab: { title: string }, file: NativeFileState | undefined): string {
+  return file?.path ? nativePathBasename(file.path) : tab.title;
 }
 
 export function nativePathDirname(path: string): string | undefined {
