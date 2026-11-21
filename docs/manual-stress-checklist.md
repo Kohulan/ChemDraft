@@ -91,7 +91,9 @@ On Linux (XWayland and native Wayland), open Drawn Structure Settings and a plug
 text field. Check that showing each leaves the document focused. Click Target bond length and type
 `30`, then repeat in the panel field. Verify both fields receive the digits, including after hiding
 and reopening each window. Repeat with a digit immediately after the click. No ring should appear.
-Click the drawing and verify its shortcuts work again.
+Click the drawing and verify its shortcuts work again. Run this pass under KDE Plasma (Wayland
+session, where both packages use XWayland) as well as GNOME: their window managers answer a
+palette's focus request differently.
 
 On Linux (XWayland and native Wayland with `GDK_BACKEND=wayland`), maximize the document, open
 several floating toolbars, and click the canvas. Verify the toolbars stay above the document and
