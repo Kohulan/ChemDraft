@@ -170,7 +170,10 @@ compositors ChemDraft writes one `[palette-focus] linux-acquire` line per field 
 Linux, whatever the agent-bridge setting, and the script prints those lines: they show whether the
 click reached the app (`gtk-click`), whether a ChemDraft window had focus when the request ran
 (`app-foreground=`) and when one last lost focus relative to the press (`app-focus-lost=`, such
-as `40ms-before-press` or `never`), what its focus gate decided (`request=`), whether it called
+as `40ms-before-press` or `never`), which X window held the keyboard when the request ran
+(`focus-holder=`, one of `chemdraft(0x...)`, `none`, `pointer-root`, `root`, `wm(0x...)`,
+`other(0x...)`, `unknown`, or `n/a` off X11, followed by `net-active=` with the root window's
+`_NET_ACTIVE_WINDOW`), what its focus gate decided (`request=`), whether it called
 `XSetInputFocus`, and which X window held focus afterwards. The script then repeats
 `app-foreground`, `app-focus-lost`, `request` and `outcome` for each line. If moving the pointer to the field
 does not take, the script retries a few times and then moves it with relative XTEST motion before
@@ -181,17 +184,46 @@ another application is really in front does not take the keyboard. The keys stay
 application, and the user clicks a ChemDraft window first. The only exception covers the X11
 focus handoff race. A window manager may move X focus off the document as it offers the click to
 the palette, which does not accept focus until the field asks, so no ChemDraft window has focus
-when the request runs although ChemDraft was in front at the press. ChemDraft records the last
-time any of its windows lost toplevel focus. Without a focused ChemDraft window, the gate lets a
-request through only when a live GTK button press on that same palette backs it (with an X
-server time, less than one second old) and a ChemDraft window lost focus at most one second
-before that press, or after it. Otherwise it refuses with `denied:app-not-focused-at-press`
-when there was such a press, and `denied:app-not-focused` when there was none (a
-JavaScript-only or delayed request, a press older than one second, one with no X server time,
-or one on another window). Hidden and minimized palettes are always refused. A switch from
-ChemDraft to another application less than a second before a palette click still counts as the
-race. The X server ignores `XSetInputFocus` with a click time older than the last focus change,
-so a click followed by a switch to another application cannot pull focus back.
+when the request runs although ChemDraft was in front at the press.
+
+Without a focused ChemDraft window, the gate needs positive evidence of that race. It lets a
+request through only when all of these hold:
+
+- a live GTK button press on that same palette backs it, with an X server time, less than one
+  second old;
+- the X window holding the keyboard when the request runs is a ChemDraft window (a toplevel or a
+  child of one), or nobody's: `None`, `PointerRoot`, the root window, or a window no client
+  manages, which is the window manager's own no-focus window. ChemDraft reads this with
+  `XGetInputFocus`, walking up the window tree for a ChemDraft window or a window carrying
+  `WM_STATE` (a managed client), and down through a window manager frame to its client. A
+  `_NET_ACTIVE_WINDOW` on the root window that names another client counts as that client
+  holding the keyboard;
+- a ChemDraft window lost toplevel focus at most 300 ms before the press, or after it. The
+  handoff happens within the dispatch of the press itself, so the loss should land within
+  milliseconds of it (`app-focus-lost=` in the log shows the real figure); a person who switches
+  away first needs about 400 ms just to move a hand from the keyboard to the mouse (the
+  Keystroke-Level Model's homing time).
+
+When another client holds the keyboard, the gate refuses with `denied:other-app-focused`, however
+recently ChemDraft lost focus: Alt+Tab to a terminal and an immediate click on a palette field
+leaves the keys with the terminal. A failed X query refuses with `denied:focus-holder-unknown`.
+Otherwise a press with no recent ChemDraft focus loss is refused with
+`denied:app-not-focused-at-press`, and a request with no live press with
+`denied:app-not-focused` (a JavaScript-only or delayed request, a press older than one second,
+one with no X server time, or one on another window). Hidden and minimized palettes are always
+refused. The X server ignores `XSetInputFocus` with a click time older than the last focus
+change, so a click followed by a switch to another application cannot pull focus back.
+
+One limit remains, under XWayland only. A native Wayland application (one not running through
+XWayland) in front is invisible to X: the compositor's X window manager leaves X focus on its
+no-focus window, on `None`, or on the ChemDraft window that last had it, and `_NET_ACTIVE_WINDOW`
+names no X window. The handoff itself can produce the same readings, so ChemDraft cannot tell the
+two apart, and only the 300 ms bound applies. A palette click within 300 ms of switching from
+ChemDraft to a native Wayland application can still take the keyboard. Under native Wayland
+(`CHEMDRAFT_NATIVE_WAYLAND=1`), ChemDraft makes no X focus call and the compositor alone decides
+whether the palette gets focus. Without any window manager, no window carries `WM_STATE`, so
+another client's window reads as a window manager window and, again, only the 300 ms bound
+applies.
 
 ## Updates
 

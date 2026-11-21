@@ -6,13 +6,14 @@ use crate::{
     is_input_focus_window_label, panel_window, run_on_main_thread_blocking, MAIN_WINDOW_LABEL,
 };
 use gtk::{gdk, glib::translate::ToGlibPtr, prelude::*};
-use std::os::raw::{c_int, c_ulong, c_void};
+use std::os::raw::{c_char, c_int, c_long, c_uchar, c_uint, c_ulong, c_void};
 use std::sync::Mutex;
 use tauri::{Manager, Runtime, WebviewWindow};
 
 /// The last time any ChemDraft toplevel lost focus, on `now()`'s clock; `None` before the
-/// first loss. The field gate reads it to tell the X11 focus handoff race from a click made
-/// while another application was in front (`state::acquire_refusal`). Kept apart from `GUARD`
+/// first loss. The field gate reads it, with the X focus holder (`x11_focus_holder`), to tell
+/// the X11 focus handoff race from a click made while another application was in front
+/// (`state::acquire_refusal`). Kept apart from `GUARD`
 /// so a focus change GTK reports while the guard is locked can never deadlock.
 static APP_FOCUS_LOST: Mutex<Option<u64>> = Mutex::new(None);
 
@@ -139,6 +140,249 @@ extern "C" {
         focus_return: *mut c_ulong,
         revert_to_return: *mut c_int,
     ) -> c_int;
+    fn XDefaultRootWindow(display: *mut c_void) -> c_ulong;
+    fn XInternAtom(display: *mut c_void, name: *const c_char, only_if_exists: c_int) -> c_ulong;
+    #[allow(clippy::too_many_arguments)]
+    fn XGetWindowProperty(
+        display: *mut c_void,
+        window: c_ulong,
+        property: c_ulong,
+        long_offset: c_long,
+        long_length: c_long,
+        delete: c_int,
+        req_type: c_ulong,
+        actual_type_return: *mut c_ulong,
+        actual_format_return: *mut c_int,
+        nitems_return: *mut c_ulong,
+        bytes_after_return: *mut c_ulong,
+        prop_return: *mut *mut c_uchar,
+    ) -> c_int;
+    fn XQueryTree(
+        display: *mut c_void,
+        window: c_ulong,
+        root_return: *mut c_ulong,
+        parent_return: *mut c_ulong,
+        children_return: *mut *mut c_ulong,
+        nchildren_return: *mut c_uint,
+    ) -> c_int;
+    fn XFree(data: *mut c_void) -> c_int;
+}
+
+/// Read-only X queries for `x11_focus_holder`. Every method must run on GTK's main thread,
+/// on an X11 display, inside a GDK error trap: a window can be destroyed between two
+/// requests, and the trap turns the resulting BadWindow into a failed status here instead of
+/// Xlib's default handler exiting the process. Each method frees what Xlib allocated.
+struct XQuery(*mut c_void);
+
+/// A failed X request (an error the trap absorbed, or a failed status).
+struct XFailed;
+
+impl XQuery {
+    /// The first 32-bit item of `window`'s `property`: `Ok(None)` when the window lacks the
+    /// property, `Ok(Some(0))` when it has no 32-bit items. Xlib returns format-32 data as an
+    /// array of C longs.
+    unsafe fn property(
+        &self,
+        window: c_ulong,
+        property: c_ulong,
+    ) -> Result<Option<c_ulong>, XFailed> {
+        const SUCCESS: c_int = 0;
+        const ANY_PROPERTY_TYPE: c_ulong = 0;
+        let (mut kind, mut format, mut items, mut after) = (0, 0, 0, 0);
+        let mut data: *mut c_uchar = std::ptr::null_mut();
+        let status = XGetWindowProperty(
+            self.0,
+            window,
+            property,
+            0,
+            1,
+            0,
+            ANY_PROPERTY_TYPE,
+            &mut kind,
+            &mut format,
+            &mut items,
+            &mut after,
+            &mut data,
+        );
+        let first = if data.is_null() || format != 32 || items == 0 {
+            0
+        } else {
+            data.cast::<c_ulong>().read()
+        };
+        if !data.is_null() {
+            XFree(data.cast());
+        }
+        match status {
+            SUCCESS if kind == 0 => Ok(None),
+            SUCCESS => Ok(Some(first)),
+            _ => Err(XFailed),
+        }
+    }
+
+    /// `window`'s parent and children.
+    unsafe fn tree(&self, window: c_ulong) -> Result<(c_ulong, Vec<c_ulong>), XFailed> {
+        let (mut root, mut parent, mut count) = (0, 0, 0);
+        let mut children: *mut c_ulong = std::ptr::null_mut();
+        let ok = XQueryTree(
+            self.0,
+            window,
+            &mut root,
+            &mut parent,
+            &mut children,
+            &mut count,
+        ) != 0;
+        let list = if ok && !children.is_null() {
+            std::slice::from_raw_parts(children, count as usize).to_vec()
+        } else {
+            Vec::new()
+        };
+        if !children.is_null() {
+            XFree(children.cast());
+        }
+        if ok {
+            Ok((parent, list))
+        } else {
+            Err(XFailed)
+        }
+    }
+
+    /// Whether `window` is a client toplevel the window manager manages: ICCCM 4.1.3.1 has the
+    /// window manager put `WM_STATE` on each one. `wm_state` is 0 when no client ever set it.
+    unsafe fn managed(&self, window: c_ulong, wm_state: c_ulong) -> Result<bool, XFailed> {
+        Ok(wm_state != 0 && self.property(window, wm_state)?.is_some())
+    }
+
+    /// Classifies the X focus window. `ours` lists the X window of every realized ChemDraft
+    /// toplevel. Walking up from the focus window, a ChemDraft window means ChemDraft, and a
+    /// managed client window means another client (focus may sit on a child of its toplevel).
+    /// A window with neither may be a window manager frame, which holds the client one level
+    /// down, or two under KWin's wrapper window, so those are checked the same way. A window
+    /// that leads to no client at all belongs to the window manager: its no-focus window.
+    /// Without any window manager there is no `WM_STATE` and every window reads as that, so
+    /// only the time bound in `state::acquire_refusal` applies.
+    unsafe fn classify(
+        &self,
+        focus: c_ulong,
+        root: c_ulong,
+        ours: &[c_ulong],
+        wm_state: c_ulong,
+    ) -> Result<state::FocusHolder, XFailed> {
+        const NONE: c_ulong = 0;
+        const POINTER_ROOT: c_ulong = 1;
+        match focus {
+            NONE => return Ok(state::FocusHolder::NoFocus),
+            POINTER_ROOT => return Ok(state::FocusHolder::PointerRoot),
+            _ if focus == root => return Ok(state::FocusHolder::Root),
+            _ => {}
+        }
+        let mut window = focus;
+        let mut client = None;
+        let mut below = Vec::new();
+        // X window trees are shallow; the bound only guards against a malformed reply.
+        for depth in 0..64 {
+            if ours.contains(&window) {
+                return Ok(state::FocusHolder::ChemDraft(focus));
+            }
+            if client.is_none() && self.managed(window, wm_state)? {
+                client = Some(window);
+            }
+            let (parent, children) = self.tree(window)?;
+            if depth == 0 {
+                below = children;
+            }
+            if parent == NONE || parent == root {
+                break;
+            }
+            window = parent;
+        }
+        if let Some(client) = client {
+            return Ok(state::FocusHolder::Other(client));
+        }
+        for level in 0..2 {
+            let mut next = Vec::new();
+            for child in below {
+                if ours.contains(&child) {
+                    return Ok(state::FocusHolder::ChemDraft(focus));
+                }
+                if self.managed(child, wm_state)? {
+                    return Ok(state::FocusHolder::Other(child));
+                }
+                if level == 0 {
+                    next.extend(self.tree(child)?.1);
+                }
+            }
+            below = next;
+        }
+        Ok(state::FocusHolder::WindowManager(focus))
+    }
+
+    /// The X focus holder, and the root window's `_NET_ACTIVE_WINDOW` for the log. When X
+    /// focus is on no client's window (or still on ChemDraft's), a `_NET_ACTIVE_WINDOW` that
+    /// names another client means the window manager has made that client active, and it
+    /// counts as the holder.
+    unsafe fn focus_holder(
+        &self,
+        ours: &[c_ulong],
+    ) -> Result<(state::FocusHolder, String), XFailed> {
+        const ONLY_IF_EXISTS: c_int = 1;
+        let root = XDefaultRootWindow(self.0);
+        let (mut focus, mut revert) = (0, 0);
+        XGetInputFocus(self.0, &mut focus, &mut revert);
+        let wm_state = XInternAtom(self.0, c"WM_STATE".as_ptr(), ONLY_IF_EXISTS);
+        let holder = self.classify(focus, root, ours, wm_state)?;
+        let net_active = XInternAtom(self.0, c"_NET_ACTIVE_WINDOW".as_ptr(), ONLY_IF_EXISTS);
+        let active = if net_active == 0 {
+            None
+        } else {
+            self.property(root, net_active)?
+        };
+        Ok(match active {
+            None => (holder, "unset".to_owned()),
+            Some(0) => (holder, "none".to_owned()),
+            Some(active) if ours.contains(&active) => (holder, format!("chemdraft(0x{active:x})")),
+            Some(active) => (
+                match holder {
+                    state::FocusHolder::Other(_) => holder,
+                    _ => state::FocusHolder::Other(active),
+                },
+                format!("other(0x{active:x})"),
+            ),
+        })
+    }
+}
+
+/// Which X window holds the keyboard as a field acquisition runs (see `state::FocusHolder`
+/// and `state::acquire_refusal`), and the root window's `_NET_ACTIVE_WINDOW` for the log.
+/// Under XWayland a native Wayland application in front is invisible here: X focus then sits
+/// on no client's window or on the ChemDraft window that last had it, readings the handoff can
+/// produce too (the limit `state::acquire_refusal` documents).
+fn x11_focus_holder(native: &gtk::ApplicationWindow) -> (state::FocusHolder, String) {
+    let display = native.display();
+    if !display.backend().is_x11() {
+        return (state::FocusHolder::NotX11, "n/a".into());
+    }
+    let ours: Vec<c_ulong> = gtk::Window::list_toplevels()
+        .iter()
+        .filter_map(|widget| widget.window())
+        .filter(|window| window.display() == display)
+        .map(|window| {
+            let window_ptr: *mut gdk::ffi::GdkWindow = window.to_glib_none().0;
+            // SAFETY: a realized window on this X11 display, alive for the call.
+            unsafe { gdk_x11_window_get_xid(window_ptr) }
+        })
+        .collect();
+    let display_ptr: *mut gdk::ffi::GdkDisplay = display.to_glib_none().0;
+    // SAFETY: GTK's main thread, on an X11 display (checked above), inside an error trap as
+    // `XQuery` requires. Popping the trap synchronizes, so any X error is known here.
+    let (result, error) = unsafe {
+        gdk_x11_display_error_trap_push(display_ptr);
+        let result = XQuery(gdk_x11_display_get_xdisplay(display_ptr)).focus_holder(&ours);
+        (result, gdk_x11_display_error_trap_pop(display_ptr))
+    };
+    match result {
+        Ok(found) if error == 0 => found,
+        _ => (state::FocusHolder::Unknown, "unknown".into()),
+    }
 }
 
 /// The palette refused the click's WM_TAKE_FOCUS: it was not yet accepting focus. A window
@@ -219,7 +463,8 @@ fn x11_focus_report(native: &gtk::ApplicationWindow) -> String {
 /// One line per Linux field acquisition, written whatever the agent-bridge setting, so a
 /// CI log shows where focus went without changing what the smoke tests. Field order: what
 /// started it, the window system, whether a ChemDraft window had focus, when one last lost
-/// focus relative to the press, accept-focus before and after, the request the key guard made,
+/// focus relative to the press, which X window held the keyboard (and `_NET_ACTIVE_WINDOW`),
+/// accept-focus before and after, the request the key guard made,
 /// the X11 focus call, the presentation, the outcome, and the key guard at the end.
 struct AcquireLog {
     label: String,
@@ -227,6 +472,7 @@ struct AcquireLog {
     backend: &'static str,
     app_foreground: Option<bool>,
     app_focus_lost: String,
+    focus_holder: String,
     accept_before: Option<bool>,
     request: String,
     x11: String,
@@ -245,6 +491,7 @@ impl AcquireLog {
             backend: "unknown",
             app_foreground: None,
             app_focus_lost: "unknown".into(),
+            focus_holder: "not-queried".into(),
             accept_before: None,
             request: String::new(),
             x11: "not-called".into(),
@@ -262,9 +509,15 @@ impl AcquireLog {
             .map_or_else(|| "not-called".to_owned(), |time| format!("time={time}"));
         crate::palette_focus_log_always(format_args!(
             "linux-acquire label={} {} backend={} app-foreground={app_foreground} \
-             app-focus-lost={} accept-focus-before={accept_before} request={} \
-             xsetinputfocus={} present-with-time={present} outcome={outcome} {end}",
-            self.label, self.trigger, self.backend, self.app_focus_lost, self.request, self.x11
+             app-focus-lost={} focus-holder={} accept-focus-before={accept_before} \
+             request={} xsetinputfocus={} present-with-time={present} outcome={outcome} {end}",
+            self.label,
+            self.trigger,
+            self.backend,
+            self.app_focus_lost,
+            self.focus_holder,
+            self.request,
+            self.x11
         ));
     }
 }
@@ -350,14 +603,18 @@ pub(crate) async fn acquire(
         let lost_at = app_focus_lost_at();
         log.app_foreground = Some(app_foreground);
         log.app_focus_lost = state::describe_focus_loss(lost_at, &request);
+        let (focus_holder, net_active) = x11_focus_holder(&native);
+        log.focus_holder = format!("{} net-active={net_active}", focus_holder.describe());
         // Without a ChemDraft window in front, only this palette's own live GTK press (a
-        // Present request) may take focus, and only when a ChemDraft window lost focus just
-        // before it: the X11 focus handoff race. A click while another application is in
-        // front leaves the keys with that application, as on Windows and macOS.
+        // Present request) may take focus, and only with evidence of the X11 focus handoff
+        // race: no other client holds X focus, and a ChemDraft window lost focus just before
+        // the press. A click while another application is in front leaves the keys with that
+        // application, as on Windows and macOS.
         let refusal = state::acquire_refusal(
             native.is_visible(),
             target.is_minimized().unwrap_or(true),
             app_foreground,
+            focus_holder,
             lost_at,
             &request,
         );

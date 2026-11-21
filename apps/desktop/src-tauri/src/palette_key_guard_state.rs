@@ -393,19 +393,67 @@ pub(super) fn click_focus_time(x11: bool, timestamp: u32) -> Option<u32> {
 }
 
 /// How long before a palette press a ChemDraft toplevel may have lost focus for the press to
-/// count as a click inside ChemDraft rather than a click from another application.
+/// count as part of a click inside ChemDraft. The focus handoff happens inside the dispatch of
+/// the press: the window manager handles the button press and moves focus, and GTK sees the
+/// loss, so it lands within milliseconds of the press, or after it (`app-focus-lost=` in the
+/// acquire log records the real figure). A person switching away first takes longer: the
+/// Keystroke-Level Model (Card, Moran and Newell, 1980) puts moving a hand from the keyboard to
+/// the mouse alone at 400 ms, before any pointing. 300 ms leaves the handoff ample room on a
+/// loaded machine and stays under that.
 #[cfg(any(target_os = "linux", test))]
-pub(super) const FOCUS_HANDOFF_MS: u64 = 1_000;
+pub(super) const FOCUS_HANDOFF_MS: u64 = 300;
 
-/// Whether ChemDraft had focus at the press, for an acquisition that finds no ChemDraft
-/// toplevel focused. `lost_at` is the last time any ChemDraft toplevel lost focus and
-/// `pressed_at` the press, both on the same monotonic clock. A loss after the press means the
-/// app was in front when the user pressed; one up to `FOCUS_HANDOFF_MS` before it is the
-/// window manager handing the click to the palette. Never losing focus means ChemDraft never
-/// had it, and an older loss means another application was in front.
+/// Whether a ChemDraft toplevel lost focus close enough to the press, for an acquisition that
+/// finds no ChemDraft toplevel focused. `lost_at` is the last time any ChemDraft toplevel lost
+/// focus and `pressed_at` the press, both on the same monotonic clock. A loss after the press
+/// means the app was in front when the user pressed; one up to `FOCUS_HANDOFF_MS` before it
+/// can be the window manager handing the click to the palette. Never losing focus means
+/// ChemDraft never had it, and an older loss means another application was in front.
 #[cfg(any(target_os = "linux", test))]
 pub(super) fn focus_handoff(lost_at: Option<u64>, pressed_at: u64) -> bool {
     lost_at.is_some_and(|lost| pressed_at.saturating_sub(lost) <= FOCUS_HANDOFF_MS)
+}
+
+/// Which X window holds the keyboard when a field acquisition runs, classified from
+/// `XGetInputFocus` and the root window's `_NET_ACTIVE_WINDOW`. The ids are X window ids
+/// (Xlib's `Window`, a C `unsigned long`), kept for the acquire log.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FocusHolder {
+    /// A ChemDraft X window: one of its toplevels or a child of one.
+    ChemDraft(std::os::raw::c_ulong),
+    /// X focus is `None`.
+    NoFocus,
+    /// X focus is `PointerRoot`.
+    PointerRoot,
+    /// X focus is the root window.
+    Root,
+    /// An X window no client manages (no `WM_STATE` on it, its ancestors or its frame's
+    /// client): the window manager's own no-focus window.
+    WindowManager(std::os::raw::c_ulong),
+    /// Another client's window holds X focus, or `_NET_ACTIVE_WINDOW` names one.
+    Other(std::os::raw::c_ulong),
+    /// The GDK backend is not X11 (native Wayland), so there is no X focus to read.
+    NotX11,
+    /// An X query failed, so the holder cannot be known.
+    Unknown,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl FocusHolder {
+    /// The value of the acquire log's `focus-holder=` field.
+    pub fn describe(self) -> String {
+        match self {
+            Self::ChemDraft(xid) => format!("chemdraft(0x{xid:x})"),
+            Self::NoFocus => "none".to_owned(),
+            Self::PointerRoot => "pointer-root".to_owned(),
+            Self::Root => "root".to_owned(),
+            Self::WindowManager(xid) => format!("wm(0x{xid:x})"),
+            Self::Other(xid) => format!("other(0x{xid:x})"),
+            Self::NotX11 => "n/a".to_owned(),
+            Self::Unknown => "unknown".to_owned(),
+        }
+    }
 }
 
 /// Where the last ChemDraft focus loss falls relative to the press, for the acquire log.
@@ -422,8 +470,9 @@ pub(super) fn describe_focus_loss(lost_at: Option<u64>, request: &FocusRequest) 
 }
 
 /// Why a Linux field acquisition stops before it touches native focus, or `None` to go on.
-/// `app_foreground` is whether any ChemDraft toplevel holds focus when the IPC runs, and
-/// `app_focus_lost_at` the last time one lost focus (see `focus_handoff`).
+/// `app_foreground` is whether any ChemDraft toplevel holds focus when the IPC runs,
+/// `focus_holder` which X window holds the keyboard then, and `app_focus_lost_at` the last
+/// time a ChemDraft toplevel lost focus (see `focus_handoff`).
 ///
 /// Linux matches Windows and macOS (owner decision, 2026-11-21): a click on a palette field
 /// while another application is really in front does not take the keyboard; the user clicks a
@@ -431,17 +480,34 @@ pub(super) fn describe_focus_loss(lost_at: Option<u64>, request: &FocusRequest) 
 /// can move X focus off the document while it offers the click to the palette (which is not
 /// yet accepting focus), so no ChemDraft toplevel holds focus when the IPC runs even though
 /// ChemDraft was in front at the press. Without app focus, then, only a `Present` request goes
-/// on, and only when a ChemDraft toplevel lost focus at most `FOCUS_HANDOFF_MS` before that
-/// press (or after it). `request_focus` returns `Present` only for a GTK button press on this
-/// same window, with a server timestamp, less than `TIMEOUT_MS` old, so a JavaScript-only,
-/// delayed or zero-time request has no live press and stays refused. The X server ignores the
-/// click-time `XSetInputFocus` if focus changed after the press, so a later switch to another
+/// on, and only with positive evidence of that race:
+///
+/// - the X focus holder is a ChemDraft window, or nobody's (`None`, `PointerRoot`, the root
+///   window, or the window manager's no-focus window). Another client's window refuses, since
+///   that application is in front (`denied:other-app-focused`), and so does a failed X query
+///   (`denied:focus-holder-unknown`);
+/// - and a ChemDraft toplevel lost focus at most `FOCUS_HANDOFF_MS` before the press, or after
+///   it.
+///
+/// `request_focus` returns `Present` only for a GTK button press on this same window, with a
+/// server timestamp, less than `TIMEOUT_MS` old, so a JavaScript-only, delayed or zero-time
+/// request has no live press and stays refused. The X server ignores the click-time
+/// `XSetInputFocus` if focus changed after the press, so a later switch to another
 /// application wins.
+///
+/// Known limit, XWayland only: a native Wayland application in front is invisible to X. The
+/// compositor's X window manager then leaves X focus on its no-focus window, on `None`, or
+/// on the ChemDraft window that last had it, and `_NET_ACTIVE_WINDOW` names no X window, the
+/// same readings the handoff itself can produce. Only the time bound applies there: a palette
+/// click within `FOCUS_HANDOFF_MS` of switching from ChemDraft to a native Wayland
+/// application can still take focus. Under native Wayland (`NotX11`) ChemDraft makes no X
+/// focus call, and the compositor alone decides whether the presentation gets focus.
 #[cfg(any(target_os = "linux", test))]
 pub(super) fn acquire_refusal(
     visible: bool,
     minimized: bool,
     app_foreground: bool,
+    focus_holder: FocusHolder,
     app_focus_lost_at: Option<u64>,
     request: &FocusRequest,
 ) -> Option<&'static str> {
@@ -453,6 +519,12 @@ pub(super) fn acquire_refusal(
         None
     } else {
         match request {
+            FocusRequest::Present { .. } if matches!(focus_holder, FocusHolder::Other(_)) => {
+                Some("denied:other-app-focused")
+            }
+            FocusRequest::Present { .. } if focus_holder == FocusHolder::Unknown => {
+                Some("denied:focus-holder-unknown")
+            }
             FocusRequest::Present { pressed_at, .. }
                 if focus_handoff(app_focus_lost_at, *pressed_at) =>
             {
@@ -578,6 +650,20 @@ mod tests {
         guard.request_focus(label, Some(click.sequence), 1_000, 120, false)
     }
 
+    /// X focus holders the handoff race can leave: still a ChemDraft window, or nobody's.
+    /// Native Wayland has no X focus to read.
+    const HANDOFF_HOLDERS: [FocusHolder; 6] = [
+        FocusHolder::ChemDraft(0x2a0_0007),
+        FocusHolder::NoFocus,
+        FocusHolder::PointerRoot,
+        FocusHolder::Root,
+        FocusHolder::WindowManager(0x60_0001),
+        FocusHolder::NotX11,
+    ];
+
+    /// A terminal's window: another X client holds the keyboard.
+    const TERMINAL: FocusHolder = FocusHolder::Other(0x3c0_0004);
+
     #[test]
     fn the_x11_focus_handoff_race_lets_the_palette_press_take_focus() {
         // The document had focus. As it hands the click to the palette, the window manager
@@ -593,35 +679,87 @@ mod tests {
                     ..
                 }
             ));
-            // The document lost focus just before the press, at the press, or after it
-            // (GTK may process the focus-out after the button press).
-            for lost_at in [99, 100, 110, 125] {
+            for holder in HANDOFF_HOLDERS {
+                // The document lost focus just before the press, at the press, or after it
+                // (GTK may process the focus-out after the button press).
+                for lost_at in [99, 100, 110, 125] {
+                    assert_eq!(
+                        acquire_refusal(true, false, false, holder, Some(lost_at), &request),
+                        None,
+                        "{label} {holder:?} lost at {lost_at}"
+                    );
+                }
+                // Up to FOCUS_HANDOFF_MS before the press, inclusive. Time 0 is the earliest
+                // monotonic reading, so it needs a later press.
+                let mut guard = Guard::new();
+                let click = guard.gtk_pointer(label, FOCUS_HANDOFF_MS + 5, 1_000, 511_203);
+                let late = guard.request_focus(
+                    label,
+                    Some(click.sequence),
+                    1_000,
+                    FOCUS_HANDOFF_MS + 20,
+                    false,
+                );
                 assert_eq!(
-                    acquire_refusal(true, false, false, Some(lost_at), &request),
+                    acquire_refusal(true, false, false, holder, Some(5), &late),
                     None,
-                    "{label} lost at {lost_at}"
+                    "{label} {holder:?}"
                 );
             }
-            // Up to FOCUS_HANDOFF_MS before the press, inclusive. Time 0 is the earliest
-            // monotonic reading, so it needs a later press.
-            let mut guard = Guard::new();
-            let click = guard.gtk_pointer(label, FOCUS_HANDOFF_MS + 5, 1_000, 511_203);
-            let late = guard.request_focus(
-                label,
-                Some(click.sequence),
-                1_000,
-                FOCUS_HANDOFF_MS + 20,
-                false,
-            );
-            assert_eq!(
-                acquire_refusal(true, false, false, Some(5), &late),
-                None,
-                "{label}"
-            );
             assert_eq!(describe_focus_loss(Some(99), &request), "1ms-before-press");
             assert_eq!(describe_focus_loss(Some(125), &request), "25ms-after-press");
-            // With ChemDraft still focused, nothing about focus loss matters.
-            assert_eq!(acquire_refusal(true, false, true, None, &request), None);
+            // With ChemDraft still focused, neither the X holder nor focus loss matters.
+            for holder in HANDOFF_HOLDERS
+                .into_iter()
+                .chain([TERMINAL, FocusHolder::Unknown])
+            {
+                assert_eq!(
+                    acquire_refusal(true, false, true, holder, None, &request),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn alt_tab_to_another_app_then_a_palette_click_does_not_take_focus() {
+        // Kimi review of 0b210e2b: Alt+Tab from ChemDraft to a terminal, then click a visible
+        // palette field within a second. The recent ChemDraft focus loss alone satisfied the
+        // old one-second handoff rule, so XSetInputFocus took the keyboard from the terminal.
+        // Parity with Windows and macOS (owner decision, 2026-11-21): the terminal holds X
+        // focus, so the click is refused however recent the loss.
+        for label in LABELS {
+            let mut guard = Guard::new();
+            let click = guard.gtk_pointer(label, 5_000, 9_000, 511_203);
+            let request = guard.request_focus(label, Some(click.sequence), 9_000, 5_020, false);
+            assert!(matches!(request, FocusRequest::Present { .. }));
+            for since_loss in [0, 50, FOCUS_HANDOFF_MS, 600, 999] {
+                assert_eq!(
+                    acquire_refusal(
+                        true,
+                        false,
+                        false,
+                        TERMINAL,
+                        Some(5_000 - since_loss),
+                        &request
+                    ),
+                    Some("denied:other-app-focused"),
+                    "{label} {since_loss}ms after the switch"
+                );
+                // A failed X query cannot prove the handoff either.
+                assert_eq!(
+                    acquire_refusal(
+                        true,
+                        false,
+                        false,
+                        FocusHolder::Unknown,
+                        Some(5_000 - since_loss),
+                        &request
+                    ),
+                    Some("denied:focus-holder-unknown"),
+                    "{label} {since_loss}ms"
+                );
+            }
         }
     }
 
@@ -629,28 +767,32 @@ mod tests {
     fn a_palette_press_while_another_app_is_in_front_does_not_take_focus() {
         // Parity with Windows and macOS (owner decision, 2026-11-21): another application is
         // really in front, so the keys stay with it and the user must click ChemDraft first.
-        // eea7e344 allowed every live press here; this test fails against that rule.
+        // eea7e344 allowed every live press here; this test fails against that rule. Even
+        // with no foreign X window holding focus (a native Wayland application in front of
+        // XWayland reads that way), a loss older than FOCUS_HANDOFF_MS is no handoff.
         for label in LABELS {
             let mut guard = Guard::new();
             let click = guard.gtk_pointer(label, 5_000, 9_000, 511_203);
             let request = guard.request_focus(label, Some(click.sequence), 9_000, 5_020, false);
             assert!(matches!(request, FocusRequest::Present { .. }));
-            // ChemDraft never had focus in this session.
-            assert_eq!(
-                acquire_refusal(true, false, false, None, &request),
-                Some("denied:app-not-focused-at-press"),
-                "{label}"
-            );
-            assert_eq!(describe_focus_loss(None, &request), "never");
-            // ChemDraft lost focus to the other application more than the handoff window
-            // before the press.
-            for lost_at in [0, 5_000 - FOCUS_HANDOFF_MS - 1, 2_000] {
+            for holder in HANDOFF_HOLDERS {
+                // ChemDraft never had focus in this session.
                 assert_eq!(
-                    acquire_refusal(true, false, false, Some(lost_at), &request),
+                    acquire_refusal(true, false, false, holder, None, &request),
                     Some("denied:app-not-focused-at-press"),
-                    "{label} lost at {lost_at}"
+                    "{label} {holder:?}"
                 );
+                // ChemDraft lost focus more than the handoff window before the press,
+                // including losses the old one-second window accepted.
+                for lost_at in [0, 2_000, 4_400, 5_000 - FOCUS_HANDOFF_MS - 1] {
+                    assert_eq!(
+                        acquire_refusal(true, false, false, holder, Some(lost_at), &request),
+                        Some("denied:app-not-focused-at-press"),
+                        "{label} {holder:?} lost at {lost_at}"
+                    );
+                }
             }
+            assert_eq!(describe_focus_loss(None, &request), "never");
             assert_eq!(
                 describe_focus_loss(Some(2_000), &request),
                 "3000ms-before-press"
@@ -660,28 +802,47 @@ mod tests {
 
     #[test]
     fn hidden_minimized_and_unbacked_requests_stay_refused() {
-        // Hidden and minimized windows are refused whatever the focus history.
+        // Hidden and minimized windows are refused whatever the focus history or X holder.
         for label in LABELS {
             let request = live_press(label);
-            for (foreground, lost_at) in [(true, None), (false, Some(100)), (false, None)] {
-                assert_eq!(
-                    acquire_refusal(false, false, foreground, lost_at, &request),
-                    Some("denied:hidden")
-                );
-                assert_eq!(
-                    acquire_refusal(true, true, foreground, lost_at, &request),
-                    Some("denied:minimized")
-                );
+            for holder in HANDOFF_HOLDERS
+                .into_iter()
+                .chain([TERMINAL, FocusHolder::Unknown])
+            {
+                for (foreground, lost_at) in [(true, None), (false, Some(100)), (false, None)] {
+                    assert_eq!(
+                        acquire_refusal(false, false, foreground, holder, lost_at, &request),
+                        Some("denied:hidden")
+                    );
+                    assert_eq!(
+                        acquire_refusal(true, true, foreground, holder, lost_at, &request),
+                        Some("denied:minimized")
+                    );
+                }
             }
         }
         // Requests without a live press on this palette are refused without app focus,
-        // even when the document lost focus a moment ago.
+        // even when the document lost focus a moment ago and nobody holds X focus.
         let label = LABELS[0];
         let refused = |guard: &mut Guard, sequence, now| {
             let request = guard.request_focus(label, sequence, 100, now, false);
             assert!(matches!(request, FocusRequest::Denied));
             assert_eq!(describe_focus_loss(Some(now), &request), "n/a");
-            acquire_refusal(true, false, false, Some(now), &request)
+            for holder in HANDOFF_HOLDERS.into_iter().chain([TERMINAL]) {
+                assert_eq!(
+                    acquire_refusal(true, false, false, holder, Some(now), &request),
+                    Some("denied:app-not-focused"),
+                    "{holder:?}"
+                );
+            }
+            acquire_refusal(
+                true,
+                false,
+                false,
+                FocusHolder::NoFocus,
+                Some(now),
+                &request,
+            )
         };
         // JS-only: the page asks with no GTK press at all.
         let mut guard = Guard::new();
@@ -723,8 +884,37 @@ mod tests {
         // With ChemDraft focused, a request without a press passes the gate but presents
         // nothing (unchanged): only `Present` ever calls XSetInputFocus.
         assert_eq!(
-            acquire_refusal(true, false, true, None, &FocusRequest::Denied),
+            acquire_refusal(
+                true,
+                false,
+                true,
+                FocusHolder::NoFocus,
+                None,
+                &FocusRequest::Denied
+            ),
             None
+        );
+    }
+
+    #[test]
+    fn the_acquire_log_names_the_x_focus_holder() {
+        let described: Vec<String> = HANDOFF_HOLDERS
+            .into_iter()
+            .chain([TERMINAL, FocusHolder::Unknown])
+            .map(FocusHolder::describe)
+            .collect();
+        assert_eq!(
+            described,
+            [
+                "chemdraft(0x2a00007)",
+                "none",
+                "pointer-root",
+                "root",
+                "wm(0x600001)",
+                "n/a",
+                "other(0x3c00004)",
+                "unknown",
+            ]
         );
     }
 
