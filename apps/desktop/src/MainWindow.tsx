@@ -1836,7 +1836,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.19.22.57-codex";
+const CURRENT_BUILD_STAMP = "11.20.21.39-opus";
 const TABLE_DRAFT_RECOVERY_WARNING = "session.tableDraftDropped";
 
 function clearTableDraftRecoveryWarnings(report: OpenWarningsReport | undefined): OpenWarningsReport | undefined {
@@ -10716,6 +10716,9 @@ export function MainWindow({
       previewArrangementSpacing: (tabId, percent) => previewSpacingRef.current(tabId, percent),
       applyArrangementSpacing: (tabId, percent) => applySpacingRef.current(tabId, percent),
       onSpacingSettled: tabId => { nativeSpacingSourcesRef.current.delete(tabId); }, onError: setStatus,
+      onPageEnlargementClosed: tabId => {
+        if (activeDocumentTabIdRef.current === tabId) canvasRegionRef.current?.focus({ preventScroll: true });
+      },
       export: (tabId, options, live, progress) => exportToTabRef.current(tabId, options, live, progress),
       previewExport: (tabId, options, live) => previewExportRef.current(tabId, options, live),
       chooseExportDestination: (tabId, options, live) => chooseExportDestinationRef.current(tabId, options, live),
@@ -13073,7 +13076,17 @@ export function MainWindow({
     },
     requestPageSpace: {
       plan: planRequestPageFit,
-      confirm: signal => new PageEnlargementConsent(shortcutPlatform).confirm(signal)
+      confirm: async (signal, documentKey) => {
+        if (!isDesktopRuntime()) return new PageEnlargementConsent(shortcutPlatform).confirm(signal);
+        const coordinator = dialogCoordinatorRef.current;
+        // Own the question by the tab the request started in (resolved from the request document's
+        // key), not whichever tab is active now. A key with no tab means that document was closed.
+        const requestTabId = [...requestDocumentKeysRef.current].find(([, key]) => key === documentKey)?.[0];
+        if (coordinator && !requestTabId) return "unanswered";
+        if (coordinator) return coordinator.confirmPageEnlargement(requestTabId!, signal);
+        setStatus("Page enlargement could not open: the dialog host is unavailable.");
+        return signal?.aborted ? "keep" : "unanswered";
+      }
     },
     openRequestHistory: (document, label) => {
       const tabId = [...requestDocumentKeysRef.current].find(([, key]) => key === document.key)?.[0];
