@@ -8345,8 +8345,14 @@ fn palette_focus_diagnostic(window: tauri::WebviewWindow, line: String) -> Resul
 // Diagnostics share the existing bridge gate; no separate flag.
 fn palette_focus_log(message: std::fmt::Arguments<'_>) {
     if agent_bridge_status().enabled {
-        eprintln!("[palette-focus] {message}");
+        palette_focus_log_always(message);
     }
+}
+
+// Ungated, for the few lines CI must read without the agent bridge (which would change what
+// a smoke tests). Callers write at most one line per user action, such as a field click.
+fn palette_focus_log_always(message: std::fmt::Arguments<'_>) {
+    eprintln!("[palette-focus] {message}");
 }
 
 fn agent_bridge_status_from<I, S>(env_value: Option<&str>, args: I) -> AgentBridgeStatus

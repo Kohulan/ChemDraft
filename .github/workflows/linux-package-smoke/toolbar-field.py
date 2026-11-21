@@ -22,6 +22,15 @@ Edit > Paste, Copy and Select All go to whichever ChemDraft window has focus, or
 window when none does, so the check first requires that no other ChemDraft window has focus. Only the field click
 and the typing in step 4 use XTEST input, because that is what the check tests.
 
+Weston limits what step 4 can show. Its X window manager (xwayland/window-manager.c in Weston
+16) gives X focus only to the window the compositor last activated, and resets any other focus
+change a client makes, ChemDraft's own XSetInputFocus included. It also ignores
+_NET_ACTIVE_WINDOW. The compositor activates a window only on input it sees through a Wayland
+seat, and headless Weston has no seat unless started with --fake-seat, while XTEST input stays
+inside XWayland. So under Weston X focus stays on Weston's no-focus window (1x1 at -100,-100)
+whatever the app does. ChemDraft logs one "[palette-focus] linux-acquire" line per field click
+to chemdraft.log, and this script prints those lines, so the log shows how far the app got.
+
 Native Wayland (CHEMDRAFT_NATIVE_WAYLAND=1) is not covered. Weston offers no protocol that lets
 one client type into another client's window, and xdotool reaches X11 windows only.
 
@@ -449,8 +458,12 @@ def number_field(Atspi, pid):
             states = node.get_state_set()
             usable = (states.contains(Atspi.StateType.ENABLED)
                       or states.contains(Atspi.StateType.SENSITIVE))
+            # The AppImage's WebKit reports the same fields with the role "embedded" (the .deb
+            # from the same build reports "entry"). Its exact label and the editable state still
+            # identify a number field; type_into_field logs the odd role.
+            labelled = name in FIELD_LABELS and states.contains(Atspi.StateType.EDITABLE)
             if usable and (role == Atspi.Role.SPIN_BUTTON
-                           or (role == Atspi.Role.ENTRY and name in FIELD_LABELS)):
+                           or (role == Atspi.Role.ENTRY and name in FIELD_LABELS) or labelled):
                 fields.append(node)
         stack.extend((child, depth + 1) for child in reversed(list(children(node))))
     LAST_SCAN["outline"] = outline
@@ -459,7 +472,8 @@ def number_field(Atspi, pid):
         raise SmokeFailure(f"{SETTINGS_TITLE!r} shows no enabled number field "
                            f"({visited} accessibles, {len(candidates)} candidates)")
     fields.sort(key=lambda node: (node.get_name() != PREFERRED_FIELD,
-                                  not node.get_state_set().contains(Atspi.StateType.SHOWING)))
+                                  not node.get_state_set().contains(Atspi.StateType.SHOWING),
+                                  node.get_role() not in roles))
     return fields[0]
 
 
@@ -479,6 +493,55 @@ def field_value(Atspi, field):
 def pointer():
     location = run("xdotool", "getmouselocation", "--shell").stdout.decode()
     return dict(line.split("=", 1) for line in location.split() if "=" in line)
+
+
+def pointer_at(location, x, y):
+    return (abs(int(location.get("X", -1)) - x) <= 1 and abs(int(location.get("Y", -1)) - y) <= 1)
+
+
+def move_pointer(session, x, y):
+    """Move the X pointer to x,y, retrying briefly; return where it ended up.
+
+    On Fedora the pointer once stayed at XWayland's starting point (the screen centre) after
+    the first move of the run, while the same XWayland version on Debian moved it. XWayland
+    routes XTEST through libei when it can and logs "[xwayland ei]" to display.log when that
+    setup fails, so the first request may be lost while that setup is in flight. Repeat the
+    move after short waits, then try a relative XTEST move, the path the click itself takes.
+    The caller still requires the pointer to reach x,y.
+    """
+    seen = []
+    for wait in (0.2, 0.5, 1.0):
+        run("xdotool", "mousemove", str(x), str(y))
+        time.sleep(wait)
+        location = pointer()
+        seen.append(f"{location.get('X')},{location.get('Y')}")
+        if pointer_at(location, x, y):
+            break
+    else:
+        dx = x - int(location.get("X", x))
+        dy = y - int(location.get("Y", y))
+        run("xdotool", "mousemove_relative", "--", str(dx), str(dy))
+        time.sleep(0.5)
+        location = pointer()
+        seen.append(f"relative {dx},{dy} -> {location.get('X')},{location.get('Y')}")
+    if len(seen) > 1:
+        print(f"Moving the pointer to {x},{y} took {len(seen)} tries: {'; '.join(seen)}",
+              flush=True)
+        ei = [line for line in (session.logs / "display.log").read_text(errors="replace")
+              .splitlines() if "xwayland ei" in line.lower()]
+        print_scan("XWayland libei lines in display.log:", ei)
+    return location
+
+
+def report_app_focus_log(session):
+    """Print ChemDraft's one-line diagnostics for each field acquisition."""
+    try:
+        lines = [line for line in (session.logs / "chemdraft.log").read_text(errors="replace")
+                 .splitlines() if "[palette-focus] linux-acquire" in line]
+    except OSError as error:
+        lines = [f"chemdraft.log unreadable: {error}"]
+    print_scan("ChemDraft field acquisitions (chemdraft.log):",
+               lines or ["none: this build may predate the diagnostic, or no click reached it"])
 
 
 def diag(*command):
@@ -572,6 +635,10 @@ def type_into_field(session, Atspi, settings):
         raise
     print_scan("Number field candidates (role, name, process, states):", LAST_SCAN["candidates"])
     name = field.get_name()
+    role = field.get_role_name()
+    if field.get_role() not in (Atspi.Role.SPIN_BUTTON, Atspi.Role.ENTRY):
+        print(f"Note: {name!r} has the AT-SPI role {role!r}, not spin button or entry; "
+              "it was chosen by its label and editable state", flush=True)
     before = field_value(Atspi, field)
     extents = Atspi.Component.get_extents(field, Atspi.CoordType.SCREEN)
     if extents.width <= 4 or extents.height <= 4:
@@ -580,12 +647,11 @@ def type_into_field(session, Atspi, settings):
     x = extents.x + max(3, extents.width // 4)
     y = extents.y + extents.height // 2
     print(f"Clicking {name!r} (value {before!r}) at {x},{y}", flush=True)
-    run("xdotool", "mousemove", str(x), str(y))
+    location = move_pointer(session, x, y)
     print(f"AT-SPI extents of {name!r} (screen): x={extents.x} y={extents.y} "
           f"w={extents.width} h={extents.height}; click point {x},{y}", flush=True)
     log_x_state("before clicking", (x, y), settings)
-    location = pointer()
-    if (abs(int(location.get("X", -1)) - x) > 1 or abs(int(location.get("Y", -1)) - y) > 1):
+    if not pointer_at(location, x, y):
         raise SmokeFailure(f"XWayland did not move the X pointer to {x},{y}: {location}")
     if location.get("WINDOW") != settings:
         raise SmokeFailure(f"window {location.get('WINDOW')} covers the field, not {settings}")
@@ -609,7 +675,11 @@ def type_into_field(session, Atspi, settings):
             raise SmokeFailure(f"value {before!r} became {after!r}")
         return after
 
-    after = wait_for(changed, f"Typing {TYPED!r} did not reach the {name!r} field", seconds=5)
+    try:
+        after = wait_for(changed, f"Typing {TYPED!r} did not reach the {name!r} field",
+                         seconds=5)
+    finally:
+        report_app_focus_log(session)
     print(f"Typing {TYPED!r} changed {name!r} from {before!r} to {after!r}", flush=True)
     # Discard the draft so no setting is committed.
     keys("Escape")

@@ -221,6 +221,18 @@ impl Guard {
         }
     }
 
+    /// The native press the guard holds, for the acquisition diagnostic. `gtk-click=none`
+    /// means no press reached the GTK observer, or a later event already ended it.
+    pub fn describe_pending_click(&self) -> String {
+        match &self.pending {
+            Some(p) => format!(
+                "gtk-click={}#{} gtk-time={}",
+                p.label, p.sequence, p.native_time
+            ),
+            None => "gtk-click=none".to_owned(),
+        }
+    }
+
     pub fn allows_window_keys(&self, label: &str) -> bool {
         self.has_confirmed_focus(label) || self.keyboard_popover.as_deref() == Some(label)
     }
@@ -477,6 +489,19 @@ mod tests {
         assert_eq!(click_focus_time(true, 0), None);
         assert_eq!(click_focus_time(false, 42), None);
         assert_eq!(click_focus_time(false, 0), None);
+    }
+
+    #[test]
+    fn acquisition_diagnostic_names_the_native_click() {
+        let mut guard = Guard::new();
+        assert_eq!(guard.describe_pending_click(), "gtk-click=none");
+        let click = guard.gtk_pointer("toolset-structure", 10, 100, 42);
+        assert_eq!(
+            guard.describe_pending_click(),
+            format!("gtk-click=toolset-structure#{} gtk-time=42", click.sequence)
+        );
+        guard.end("", End::Outside, None, 0);
+        assert_eq!(guard.describe_pending_click(), "gtk-click=none");
     }
 
     #[test]

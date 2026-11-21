@@ -128,7 +128,8 @@ propane and reads the document back with **Edit > Paste**, **Select All**, **Cop
 **Copy**, opens Drawn Structure Settings from **View > Toolbars**, clicks into one of its number
 fields with an XTEST click and types `30`. Those fields are enabled only while a molecule is
 selected, which **Select All** leaves in place. It finds the field over AT-SPI as WebKitGTK exposes
-it (a spin button, or a text entry named for a number field, that is enabled or sensitive),
+it (a spin button, or an editable entry named for a number field, that is enabled or sensitive;
+the AppImage's WebKitGTK reports these fields with the role "embedded", and the log notes it),
 clearing libatspi's cache before each scan, and logs every candidate it saw. When it finds none,
 it also logs the palette's accessibility tree, so the log shows whether the web content, the
 selection or only the field's state was missing. It chooses every menu command over AT-SPI rather than
@@ -140,6 +141,17 @@ did not. The native Wayland job does
 not run it: Weston has no protocol that lets a test client type into another client's window, and
 `xdotool` reaches X11 windows only. Weston's own X window manager also differs from KWin and
 Mutter, so a pass does not prove focus handling under every desktop.
+
+Under headless Weston the typing step cannot pass yet, whatever the app does. Weston's X window
+manager gives X focus only to the window the compositor last activated and resets any other
+focus change a client makes; it ignores `_NET_ACTIVE_WINDOW`. The compositor activates a window
+only on input from a Wayland seat. Headless Weston has no seat unless started with `--fake-seat`,
+and XTEST clicks never leave XWayland, so X focus stays on Weston's 1x1 no-focus window. ChemDraft
+writes one `[palette-focus] linux-acquire` line per field click to its log on Linux, whatever the
+agent-bridge setting, and the script prints those lines: they show whether the click reached the
+app, whether it asked for focus, and which X window held focus afterwards. If moving the pointer
+to the field does not take, the script retries a few times and then moves it with relative XTEST
+motion before it gives up, and prints XWayland's libei lines from `display.log`.
 
 ## Updates
 
