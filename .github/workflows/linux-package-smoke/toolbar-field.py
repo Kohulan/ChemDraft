@@ -481,6 +481,86 @@ def pointer():
     return dict(line.split("=", 1) for line in location.split() if "=" in line)
 
 
+def diag(*command):
+    """Run a diagnostic command; never raises. Returns output text, or None when the tool is missing."""
+    try:
+        result = run(*command, check=False)
+    except FileNotFoundError:
+        return None
+    except Exception as error:  # diagnostics must never fail the run
+        return f"error: {error}"
+    return result.stdout.decode(errors="replace") + result.stderr.decode(errors="replace")
+
+
+def window_id(value):
+    try:
+        return int(str(value).strip(), 0)
+    except ValueError:
+        return None
+
+
+def describe_x_window(label, value):
+    """Log id, names, class, pid, map state and absolute geometry of one X window; return its parent."""
+    number = window_id(value)
+    if number is None:
+        print(f"  [{label}] window {value!r}: not a window id", flush=True)
+        return None
+    info = diag("xwininfo", "-id", str(number))
+    tree = diag("xwininfo", "-tree", "-id", str(number))
+    props = diag("xprop", "-id", str(number), "WM_NAME", "_NET_WM_NAME", "WM_CLASS", "_NET_WM_PID")
+    print(f"  [{label}] window {number} (0x{number:x})", flush=True)
+    if info is None or props is None:
+        print(f"    tool missing: {'xwininfo ' if info is None else ''}{'xprop' if props is None else ''}"
+              .rstrip(), flush=True)
+    if props:
+        for line in props.strip().splitlines():
+            print(f"    {line}", flush=True)
+    if info:
+        for line in info.splitlines():
+            if any(key in line for key in ("Absolute upper-left", "Width:", "Height:", "Map State",
+                                           "Override Redirect", "xwininfo:")):
+                print(f"    {line.strip()}", flush=True)
+    if info is None:
+        geometry = diag("xdotool", "getwindowgeometry", str(number))
+        print(f"    xdotool geometry (xwininfo unavailable): {geometry!r}", flush=True)
+    if props is None and info is None:
+        print(f"    xdotool name: {diag('xdotool', 'getwindowname', str(number))!r}", flush=True)
+    parent = None
+    if tree:
+        found = re.search(r"Parent window id: (0x[0-9a-fA-F]+)", tree)
+        if found:
+            parent = int(found.group(1), 16)
+    return parent
+
+
+def describe_x_ancestry(label, value):
+    number = window_id(value)
+    seen = set()
+    depth = 0
+    while number and number not in seen and depth < 12:
+        seen.add(number)
+        number = describe_x_window(f"{label} ancestor {depth}" if depth else label, number)
+        depth += 1
+
+
+def log_x_state(moment, point=None, settings=None):
+    """Log the window under the pointer (with ancestry), the palette window and the focus window."""
+    try:
+        print(f"X diagnostics {moment}:", flush=True)
+        location = diag("xdotool", "getmouselocation", "--shell") or ""
+        fields = dict(line.split("=", 1) for line in location.split() if "=" in line)
+        print(f"  pointer at {fields.get('X')},{fields.get('Y')}"
+              + (f"; click point {point[0]},{point[1]}" if point else ""), flush=True)
+        describe_x_ancestry("under pointer", fields.get("WINDOW"))
+        if settings:
+            describe_x_ancestry("palette", settings)
+        focus = (diag("xdotool", "getwindowfocus") or "").strip()
+        print(f"  X focus window {focus!r}", flush=True)
+        describe_x_ancestry("focus", focus)
+    except Exception as error:  # diagnostics must never fail the run
+        print(f"  X diagnostics failed: {error}", flush=True)
+
+
 def type_into_field(session, Atspi, settings):
     try:
         field = wait_for(lambda: number_field(Atspi, session.main_pid),
@@ -501,12 +581,16 @@ def type_into_field(session, Atspi, settings):
     y = extents.y + extents.height // 2
     print(f"Clicking {name!r} (value {before!r}) at {x},{y}", flush=True)
     run("xdotool", "mousemove", str(x), str(y))
+    print(f"AT-SPI extents of {name!r} (screen): x={extents.x} y={extents.y} "
+          f"w={extents.width} h={extents.height}; click point {x},{y}", flush=True)
+    log_x_state("before clicking", (x, y), settings)
     location = pointer()
     if (abs(int(location.get("X", -1)) - x) > 1 or abs(int(location.get("Y", -1)) - y) > 1):
         raise SmokeFailure(f"XWayland did not move the X pointer to {x},{y}: {location}")
     if location.get("WINDOW") != settings:
         raise SmokeFailure(f"window {location.get('WINDOW')} covers the field, not {settings}")
     run("xdotool", "click", "1")
+    log_x_state("after clicking", (x, y), settings)
     report_focus(Atspi, session.main_pid, f"after clicking {name!r}")
 
     def focused():
