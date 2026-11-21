@@ -190,6 +190,28 @@ describe("plugin text prompt and document tabs", () => {
     await act(async () => { runtime.prompts.cancel(runtime.prompts.getOpenPrompt()!.id); await invocation; });
   });
 
+  it("recomputes the prompt tab's position when an earlier tab closes and the active tab does not change", async () => {
+    const { runtime } = await mount();
+    const tab1 = activeTabId();
+    await command("document.new");
+    const tab2 = activeTabId();
+    await command("document.new");
+    const tab3 = activeTabId();
+    expect(new Set([tab1, tab2, tab3]).size).toBe(3);
+    const { invocation } = await start(runtime);
+    await command("document.previousTab");
+    expect(activeTabId()).toBe(tab2);
+    expect(statusText()).toContain("Switch back to Untitled (tab 3) to insert.");
+    // Closing an earlier, non-active tab moves the prompt's tab up one place; the active tab stays tab 2,
+    // so only the documentTabs effect can refresh the line.
+    await command(closeDocumentTabCommandId(tab1));
+    expect(getAssistantHistoryPort().read(tab1)).toBeUndefined();
+    expect(activeTabId()).toBe(tab2);
+    expect(statusText()).toContain("Switch back to Untitled (tab 2) to insert.");
+    expect(statusText()).not.toContain("(tab 3)");
+    await act(async () => { runtime.prompts.cancel(runtime.prompts.getOpenPrompt()!.id); await invocation; });
+  });
+
   it("keeps the plain tab name in the status line when it is unique", async () => {
     const { runtime } = await mount({ ...createEmptyDocument(), title: "Benzene" });
     const { invocation } = await start(runtime);
