@@ -109,8 +109,8 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN: '1'
           # linuxdeploy's bundled strip predates the .relr.dyn sections newer toolchains emit.
           NO_STRIP: 'true'
-          # The Vite build of the whole editor needs more than Node's default heap.
-          NODE_OPTIONS: --max-old-space-size=4096
+          # The Vite build of the whole editor needs more than Node's default heap (peak RSS near 4.8 GB).
+          NODE_OPTIONS: --max-old-space-size=6144  # 16 GB runner
         # linuxdeploy resolves the dependencies of every ELF file in the AppDir, the bundled OPSIN
         # JRE included. Its libraries need libjvm.so from the JRE's lib/server, which they find at
         # run time through their own RUNPATH but linuxdeploy does not search: show it the folder.
