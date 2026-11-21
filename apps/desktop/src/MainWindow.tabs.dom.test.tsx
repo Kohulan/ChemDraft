@@ -2303,6 +2303,115 @@ describe("documents in one window", () => {
         expect(translationX(track)).toBe(-377);
       });
     });
+
+    // Display scaling (Windows at 125%, devicePixelRatio 1.25) makes every layout width fractional, while
+    // clientWidth and scrollWidth round to whole pixels.
+    describe("fractional geometry at a display scale such as 125%", () => {
+      const gap = 2;
+      const stripLeft = 24;
+      const closeWidth = 30;
+
+      async function mountFractional(tabWidth: number, stripExact: number) {
+        const resize = new Map<Element, () => void>();
+        vi.stubGlobal("ResizeObserver", class {
+          constructor(private readonly onResize: () => void) {}
+          observe(element: Element) { resize.set(element, this.onResize); }
+          unobserve(element: Element) { resize.delete(element); }
+          disconnect() {}
+        });
+        await remount();
+        const strip = container.querySelector<HTMLDivElement>(".document-tab-list")!;
+        const track = strip.querySelector<HTMLDivElement>(".document-tab-track")!;
+        const scrollbar = strip.querySelector<HTMLDivElement>(".document-tab-scrollbar")!;
+        const thumb = scrollbar.querySelector<HTMLDivElement>(".document-tab-scrollbar-thumb")!;
+        const trackExact = () => Math.max(0, track.childElementCount * (tabWidth + gap) - gap);
+        track.style.columnGap = `${gap}px`;
+        vi.spyOn(strip, "clientWidth", "get").mockImplementation(() => Math.round(stripExact));
+        vi.spyOn(track, "scrollWidth", "get").mockImplementation(() => Math.round(trackExact()));
+        vi.spyOn(strip, "getBoundingClientRect").mockImplementation(() => new DOMRect(stripLeft, 0, stripExact, 24));
+        vi.spyOn(track, "getBoundingClientRect").mockImplementation(() =>
+          new DOMRect(stripLeft + translationX(track), 0, trackExact(), 24));
+        vi.spyOn(thumb, "getBoundingClientRect").mockImplementation(() =>
+          new DOMRect(stripLeft + translationX(thumb), 24, Number.parseFloat(thumb.style.width), 8));
+        const bounds = HTMLDivElement.prototype.getBoundingClientRect;
+        vi.spyOn(HTMLDivElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLDivElement) {
+          if (this.parentElement !== track) return bounds.call(this);
+          const index = Array.from(track.children).indexOf(this);
+          return new DOMRect(stripLeft + index * (tabWidth + gap) + translationX(track), 0, tabWidth, 24);
+        });
+        // Measure the layout as stubbed; the observers are the only trigger a lone tab has.
+        await act(async () => { resize.get(strip)?.(); resize.get(track)?.(); });
+        return { strip, track, scrollbar, thumb };
+      }
+
+      // The first file opens into the pristine blank tab, so opening `count` files leaves `count` tabs.
+      async function openTabs(count: number) {
+        for (const name of ["First drawing", "Second drawing", "Third drawing", "Fourth drawing", "Fifth drawing"].slice(0, count)) await open(name);
+        expect(tabs()).toHaveLength(count);
+      }
+
+      it.each([82, 82.33])("hides the scrollbar for one tab whose track is 82.33 px in a %s px viewport", async (stripExact) => {
+        const { scrollbar, track } = await mountFractional(82.33, stripExact);
+        expect(tabs()).toHaveLength(1);
+        expect(scrollbar.style.visibility).toBe("hidden");
+        expect(track.style.transform).toBe("translateX(0px)");
+        expect(wheel(track, 100, 0)).toBe(false);
+      });
+
+      it("hides the scrollbar for tabs that exactly fit at fractional widths", async () => {
+        // Five tabs and four gaps make 419.63 px in a 419.63 px strip, which rounds to 420 for scrollWidth and clientWidth.
+        const { strip, track, scrollbar } = await mountFractional((419.63 - 4 * gap) / 5, 419.63);
+        await openTabs(5);
+        expect(track.scrollWidth).toBe(420);
+        expect(strip.clientWidth).toBe(420);
+        expect(scrollbar.style.visibility).toBe("hidden");
+        expect(track.style.transform).toBe("translateX(0px)");
+        expect(wheel(track, 100, 0)).toBe(false);
+        await activate(0);
+        expect(scrollbar.style.visibility).toBe("hidden");
+        expect(track.style.transform).toBe("translateX(0px)");
+      });
+
+      it("scrolls a real 1.5 px overflow and keeps the last close button fully inside", async () => {
+        // Two tabs and a gap make 231.5 px in a 230 px strip.
+        const { strip, track, scrollbar, thumb } = await mountFractional((231.5 - gap) / 2, 230);
+        await openTabs(2);
+        expect(scrollbar.style.visibility).toBe("visible");
+        expect(Number.parseFloat(thumb.style.width)).toBeLessThan(230);
+        expect(active()).toBe(1);
+        // The range rounds up, so the end of the last tab clears the strip.
+        expect(translationX(track)).toBe(-2);
+        const last = tabs()[1]!;
+        const close = last.querySelector<HTMLElement>(".document-tab-close")!;
+        vi.spyOn(close, "getBoundingClientRect").mockImplementation(() => {
+          const box = last.getBoundingClientRect();
+          return new DOMRect(box.right - closeWidth, box.top, closeWidth, box.height);
+        });
+        const bounds = strip.getBoundingClientRect();
+        expect(last.getBoundingClientRect().right).toBeLessThanOrEqual(bounds.right);
+        expect(close.getBoundingClientRect().left).toBeGreaterThanOrEqual(bounds.left);
+        expect(close.getBoundingClientRect().right).toBeLessThanOrEqual(bounds.right);
+      });
+
+      it("ends at the same offset by wheel and by revealing the last tab with Ctrl+Shift+Tab", async () => {
+        // Four 150.1 px tabs make 606.4 px in a 229.6 px strip: the range rounds up from 376.8 to 377.
+        const { track } = await mountFractional(150.1, 229.6);
+        await openTabs(4);
+        expect(translationX(track)).toBe(-377);
+
+        expect(wheel(track, -100000, 0)).toBe(true);
+        expect(translationX(track)).toBe(0);
+        expect(wheel(track, 100000, 0)).toBe(true);
+        const byWheel = translationX(track);
+        expect(byWheel).toBe(-377);
+
+        await activate(0);
+        expect(translationX(track)).toBe(0);
+        await key(true);
+        expect(active()).toBe(3);
+        expect(translationX(track)).toBe(byWheel);
+      });
+    });
   });
 
   it("dirty tab x uses the registered close command; Cancel retains it and Discard selects its neighbour", async () => {

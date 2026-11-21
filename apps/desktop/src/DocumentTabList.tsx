@@ -11,21 +11,27 @@ function clampOffset(offset: number, max: number) {
 // Layout works in 1/64 px; ignore a sliver that cannot be seen.
 const LAYOUT_EPSILON = 1 / 64;
 
-// scrollWidth and clientWidth round to whole pixels, so a fractional track (text widths always are) could end up
-// to a pixel wider than the range they report. Read the exact box and use the larger track width.
+// An overflow smaller than this many CSS pixels is a rounding artifact of fractional layout (display scaling such as
+// 125% makes every width fractional), not a real overflow: nothing scrolls and the scrollbar stays hidden.
+const MIN_OVERFLOW = 1;
+
+// scrollWidth and clientWidth round to whole pixels, so mixing them with an exact box invents a sliver of overflow.
+// The track and the viewport are both measured as exact boxes (the strip has no border or padding); the rounded
+// scrollWidth is only the fallback for a box that reports no size.
 function measureTrack(track: HTMLElement) {
-  return Math.max(track.scrollWidth, track.getBoundingClientRect().width);
+  const exact = track.getBoundingClientRect().width;
+  return exact > 0 ? exact : track.scrollWidth;
 }
 
-// The visible width, never rounded up past the real box: clientWidth rounds to the nearest pixel.
 function measureViewport(strip: HTMLElement) {
   const exact = strip.getBoundingClientRect().width;
-  return exact > 0 ? Math.min(strip.clientWidth, exact) : strip.clientWidth;
+  return exact > 0 ? exact : strip.clientWidth;
 }
 
 function scrollGeometry(viewportWidth: number, trackWidth: number) {
-  // Round the range up so a fractional overflow never leaves the end of the last tab, its close button included, clipped.
-  const max = Math.max(0, Math.ceil(trackWidth - viewportWidth - LAYOUT_EPSILON));
+  const overflow = trackWidth - viewportWidth;
+  // Round a real overflow up so the end of the last tab, its close button included, is never clipped by a sub-pixel.
+  const max = overflow < MIN_OVERFLOW ? 0 : Math.ceil(overflow - LAYOUT_EPSILON);
   // The scrollbar spans the viewport.
   const thumbWidth = max > 0 ? Math.min(viewportWidth, Math.max(24, viewportWidth ** 2 / trackWidth)) : viewportWidth;
   return { max, thumbWidth, thumbTravel: viewportWidth - thumbWidth };
@@ -45,7 +51,10 @@ function offsetToReveal(strip: HTMLElement, tab: HTMLElement | null, offset: num
   const left = strip.getBoundingClientRect().left + strip.clientLeft;
   // Use the nearest edge, or align the start of a tab wider than the strip.
   const delta = Math.min(rect.left - left, Math.max(0, rect.right - left - measureViewport(strip)));
-  return clampOffset(offset + delta, max);
+  // Revealing the last tab aligns its exact right edge, which sits under the rounded-up end of the range. Land on the
+  // end itself, so a reveal and a wheel or thumb move to the end leave the same offset.
+  const target = delta > 0 && max - (offset + delta) < MIN_OVERFLOW ? max : offset + delta;
+  return clampOffset(target, max);
 }
 
 export function DocumentTabList({ ref, activeId, order, activeTitle, children }: {
