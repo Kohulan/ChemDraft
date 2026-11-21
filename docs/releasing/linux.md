@@ -129,7 +129,11 @@ run `.github/workflows/linux-package-smoke/toolbar-field.py` twice: once under h
 `/usr/bin/kwin_wayland`). Each run starts its own compositor with XWayland, pastes
 propane and reads the document back with **Edit > Paste**, **Select All**, **Copy As > SMILES** and
 **Copy**, opens Drawn Structure Settings from **View > Toolbars**, clicks into one of its number
-fields with an XTEST click and types `30`. Those fields are enabled only while a molecule is
+fields with an XTEST click and types `30`. Under KWin it first clicks an empty area of the
+document's canvas with an XTEST click, as a user would to bring ChemDraft to the front, waits
+until the document has focus (falling back to `xdotool windowfocus`, and saying so, if KWin did
+not focus it on the click), and chooses **Select All** again, since that click clears the
+selection. Those fields are enabled only while a molecule is
 selected, which **Select All** leaves in place. It finds the field over AT-SPI as WebKitGTK exposes
 it (a spin button, or an editable entry named for a number field, that is enabled or sensitive;
 the AppImage's WebKitGTK reports these fields with the role "embedded", and the log notes it),
@@ -156,20 +160,30 @@ only on input from a Wayland seat. Headless Weston has no seat unless started wi
 and XTEST clicks never leave XWayland, so X focus stays on Weston's 1x1 no-focus window. Under both
 compositors ChemDraft writes one `[palette-focus] linux-acquire` line per field click to its log on
 Linux, whatever the agent-bridge setting, and the script prints those lines: they show whether the
-click reached the app (`gtk-click`), what its focus gate decided (`request=`), whether it called
-`XSetInputFocus`, and which X window held focus afterwards. If moving the pointer to the field
+click reached the app (`gtk-click`), whether a ChemDraft window had focus when the request ran
+(`app-foreground=`) and when one last lost focus relative to the press (`app-focus-lost=`, such
+as `40ms-before-press` or `never`), what its focus gate decided (`request=`), whether it called
+`XSetInputFocus`, and which X window held focus afterwards. The script then repeats
+`app-foreground`, `app-focus-lost`, `request` and `outcome` for each line. If moving the pointer to the field
 does not take, the script retries a few times and then moves it with relative XTEST motion before
 it gives up, and prints XWayland's libei lines from `display.log`.
 
-A real click on a palette's own field may take the keyboard even when no ChemDraft window had
-focus when the request ran. That can happen with ChemDraft in front: a window manager may move
-X focus off the document as it offers the click to the palette, which does not accept focus until
-the field asks, and in CI no ChemDraft window may have had focus at all. The gate still refuses
-any request that no live GTK button press on that same palette backs (a JavaScript-only or
-delayed request, a press older than one second, or one with no X server time), and a hidden or
-minimized palette. The X server ignores `XSetInputFocus` with a
-click time older than the last focus change, so a click followed by a switch to another
-application cannot pull focus back.
+Linux follows Windows and macOS (owner decision, 2026-11-21): a click on a palette field while
+another application is really in front does not take the keyboard. The keys stay with that
+application, and the user clicks a ChemDraft window first. The only exception covers the X11
+focus handoff race. A window manager may move X focus off the document as it offers the click to
+the palette, which does not accept focus until the field asks, so no ChemDraft window has focus
+when the request runs although ChemDraft was in front at the press. ChemDraft records the last
+time any of its windows lost toplevel focus. Without a focused ChemDraft window, the gate lets a
+request through only when a live GTK button press on that same palette backs it (with an X
+server time, less than one second old) and a ChemDraft window lost focus at most one second
+before that press, or after it. Otherwise it refuses with `denied:app-not-focused-at-press`
+when there was such a press, and `denied:app-not-focused` when there was none (a
+JavaScript-only or delayed request, a press older than one second, one with no X server time,
+or one on another window). Hidden and minimized palettes are always refused. A switch from
+ChemDraft to another application less than a second before a palette click still counts as the
+race. The X server ignores `XSetInputFocus` with a click time older than the last focus change,
+so a click followed by a switch to another application cannot pull focus back.
 
 ## Updates
 

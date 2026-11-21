@@ -7,7 +7,20 @@ use crate::{
 };
 use gtk::{gdk, glib::translate::ToGlibPtr, prelude::*};
 use std::os::raw::{c_int, c_ulong, c_void};
+use std::sync::Mutex;
 use tauri::{Manager, Runtime, WebviewWindow};
+
+/// The last time any ChemDraft toplevel lost focus, on `now()`'s clock; `None` before the
+/// first loss. The field gate reads it to tell the X11 focus handoff race from a click made
+/// while another application was in front (`state::acquire_refusal`). Kept apart from `GUARD`
+/// so a focus change GTK reports while the guard is locked can never deadlock.
+static APP_FOCUS_LOST: Mutex<Option<u64>> = Mutex::new(None);
+
+fn app_focus_lost_at() -> Option<u64> {
+    *APP_FOCUS_LOST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 pub(crate) fn install<R: Runtime>(window: &WebviewWindow<R>) -> Result<(), String> {
     let native = window.gtk_window().map_err(|error| error.to_string())?;
@@ -58,6 +71,16 @@ pub(crate) fn install<R: Runtime>(window: &WebviewWindow<R>) -> Result<(), Strin
     });
     // SAFETY: same key and type as above; GTK drops the value with the widget.
     unsafe { native.set_data(OBSERVER, press) };
+    // Every ChemDraft webview window passes through here once (on page load), the document
+    // included. `has-toplevel-focus` is the property `foreground_belongs_to_app` reads, so a
+    // loss recorded here is exactly a window leaving that check.
+    native.connect_has_toplevel_focus_notify(|window| {
+        if !window.has_toplevel_focus() {
+            *APP_FOCUS_LOST
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(now());
+        }
+    });
 
     if window.label() == MAIN_WINDOW_LABEL {
         let app = window.app_handle().clone();
@@ -195,14 +218,15 @@ fn x11_focus_report(native: &gtk::ApplicationWindow) -> String {
 
 /// One line per Linux field acquisition, written whatever the agent-bridge setting, so a
 /// CI log shows where focus went without changing what the smoke tests. Field order: what
-/// started it, the window system, whether a ChemDraft window had focus, accept-focus before
-/// and after, the request the key guard made, the X11 focus call, the presentation, the
-/// outcome, and the key guard at the end.
+/// started it, the window system, whether a ChemDraft window had focus, when one last lost
+/// focus relative to the press, accept-focus before and after, the request the key guard made,
+/// the X11 focus call, the presentation, the outcome, and the key guard at the end.
 struct AcquireLog {
     label: String,
     trigger: String,
     backend: &'static str,
     app_foreground: Option<bool>,
+    app_focus_lost: String,
     accept_before: Option<bool>,
     request: String,
     x11: String,
@@ -220,6 +244,7 @@ impl AcquireLog {
             ),
             backend: "unknown",
             app_foreground: None,
+            app_focus_lost: "unknown".into(),
             accept_before: None,
             request: String::new(),
             x11: "not-called".into(),
@@ -237,9 +262,9 @@ impl AcquireLog {
             .map_or_else(|| "not-called".to_owned(), |time| format!("time={time}"));
         crate::palette_focus_log_always(format_args!(
             "linux-acquire label={} {} backend={} app-foreground={app_foreground} \
-             accept-focus-before={accept_before} request={} xsetinputfocus={} \
-             present-with-time={present} outcome={outcome} {end}",
-            self.label, self.trigger, self.backend, self.request, self.x11
+             app-focus-lost={} accept-focus-before={accept_before} request={} \
+             xsetinputfocus={} present-with-time={present} outcome={outcome} {end}",
+            self.label, self.trigger, self.backend, self.app_focus_lost, self.request, self.x11
         ));
     }
 }
@@ -322,13 +347,18 @@ pub(crate) async fn acquire(
         };
         log.request = kind.into();
         let app_foreground = crate::foreground_belongs_to_app();
+        let lost_at = app_focus_lost_at();
         log.app_foreground = Some(app_foreground);
-        // Without a ChemDraft window in front, only this palette's own live GTK press
-        // (a Present request) may take focus; anything else could steal it from another app.
+        log.app_focus_lost = state::describe_focus_loss(lost_at, &request);
+        // Without a ChemDraft window in front, only this palette's own live GTK press (a
+        // Present request) may take focus, and only when a ChemDraft window lost focus just
+        // before it: the X11 focus handoff race. A click while another application is in
+        // front leaves the keys with that application, as on Windows and macOS.
         let refusal = state::acquire_refusal(
             native.is_visible(),
             target.is_minimized().unwrap_or(true),
             app_foreground,
+            lost_at,
             &request,
         );
         if let Some(refusal) = refusal {

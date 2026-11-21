@@ -9,7 +9,9 @@ the .deb picks it itself when WAYLAND_DISPLAY is set. It runs once per composito
 - --compositor kwin (the click-to-focus gate): a virtual KWin (kwin_wayland --virtual
   --xwayland), as on KDE Plasma. KWin's X window manager honors a client's own focus request,
   so ChemDraft's XSetInputFocus with the click's time decides whether the field gets the keys.
-  The field must change.
+  The field must change. As a user would, the check first clicks the document so ChemDraft is
+  in front: like Windows and macOS, ChemDraft gives a palette field the keyboard only when
+  ChemDraft had focus at the click, not while another application is in front.
 - --compositor weston (the default; setup and accessibility only): headless Weston, which
   cannot test click-to-focus (see below). The field may stay unchanged; the log says so.
 
@@ -20,18 +22,20 @@ The check:
    Edit > Copy As > SMILES and Edit > Copy (the native selection JSON);
 3. opens Drawn Structure Settings from View > Toolbars, whose number fields are enabled only
    while a molecule is selected (Select All in step 2 leaves propane selected);
-4. finds an enabled number field over AT-SPI (a spin button, or a text entry with a number field's
+4. under KWin only, clicks an empty canvas area of the document with a real XTEST click, waits
+   for the document to have focus, and selects all again (the click clears the selection);
+5. finds an enabled number field over AT-SPI (a spin button, or a text entry with a number field's
    label), logging every candidate it saw, then clicks into it with a real XTEST click and types "30";
-5. requires the field's value to change and the document's chemistry not to.
+6. requires the field's value to change and the document's chemistry not to.
 
 Every menu command in steps 2 and 3 is chosen over AT-SPI, not typed. The compositor's X window
 manager decides where X keyboard focus goes and can put it back when an X client such as xdotool
 moves it, so keyboard shortcuts meant for the document window may land elsewhere or nowhere.
 Edit > Paste, Copy and Select All go to whichever ChemDraft window has focus, or to the document
-window when none does, so the check first requires that no other ChemDraft window has focus. Only the field click
-and the typing in step 4 use XTEST input, because that is what the check tests.
+window when none does, so the check first requires that no other ChemDraft window has focus. Only the clicks
+and the typing in steps 4 and 5 use XTEST input, because that is what the check tests.
 
-Weston cannot test click-to-focus, so under Weston step 5 checks only the chemistry. Its X
+Weston cannot test click-to-focus, so under Weston step 6 checks only the chemistry. Its X
 window manager (xwayland/window-manager.c in Weston 16) gives X focus only to the window the
 compositor last activated, and resets any other focus change a client makes, ChemDraft's own
 XSetInputFocus included. It also ignores _NET_ACTIVE_WINDOW. The compositor activates a window
@@ -41,8 +45,10 @@ Weston's no-focus window (1x1 at -100,-100) whatever the app does.
 
 Under both compositors ChemDraft logs one "[palette-focus] linux-acquire" line per field click
 to chemdraft.log, and this script prints those lines, so the log shows how far the app got:
-whether the click reached it, what its focus gate decided (request=...), whether it called
-XSetInputFocus, and the outcome.
+whether the click reached it, whether a ChemDraft window had focus (app-foreground=...) and
+when one last lost it (app-focus-lost=...), what its focus gate decided (request=...),
+whether it called XSetInputFocus, and the outcome. The script repeats app-foreground for
+each line.
 
 Native Wayland (CHEMDRAFT_NATIVE_WAYLAND=1) is not covered. Weston offers no protocol that lets
 one client type into another client's window, and xdotool reaches X11 windows only.
@@ -451,6 +457,61 @@ def require_document_focus(session, Atspi, document):
         report_focus(Atspi, session.main_pid, "before the Edit menu commands")
 
 
+# Points to try for an empty canvas click, as fractions of the document window. Propane is
+# pasted near the middle; the menu bar is at the top. The first point whose X window is the
+# document itself (not a palette over it) is used.
+CANVAS_POINTS = ((0.85, 0.8), (0.15, 0.8), (0.85, 0.35), (0.15, 0.35), (0.5, 0.88))
+
+
+def window_geometry(window):
+    shell = run("xdotool", "getwindowgeometry", "--shell", window).stdout.decode()
+    values = dict(line.split("=", 1) for line in shell.split() if "=" in line)
+    return int(values["X"]), int(values["Y"]), int(values["WIDTH"]), int(values["HEIGHT"])
+
+
+def click_document(session, Atspi, document):
+    """Give the document focus the way a user does: click an empty area of its canvas.
+
+    ChemDraft gives a palette field the keyboard only when ChemDraft had focus at the click,
+    as on Windows and macOS, so the field click must come from a ChemDraft in front. The click
+    is a real XTEST press on empty canvas with the Select tool (the startup tool), which adds
+    nothing and only clears the selection; the caller selects all again. If KWin does not
+    focus the document on that click within a few seconds, the check asks for it with
+    xdotool windowfocus and says so, so the field click still starts from a focused document.
+    """
+    left, top, width, height = window_geometry(document)
+    tried = []
+    for fx, fy in CANVAS_POINTS:
+        x, y = left + int(width * fx), top + int(height * fy)
+        location = move_pointer(session, x, y)
+        tried.append(f"{x},{y} -> window {location.get('WINDOW')}")
+        if pointer_at(location, x, y) and location.get("WINDOW") == document:
+            break
+    else:
+        raise SmokeFailure(f"no uncovered canvas point in the document window: {'; '.join(tried)}")
+    print(f"Clicking the document canvas at {x},{y} to bring ChemDraft to the front", flush=True)
+    run("xdotool", "click", "1")
+
+    def document_focused():
+        session.alive()
+        active = active_windows(Atspi, session.main_pid)
+        if active != ["ChemDraft"]:
+            raise SmokeFailure(f"focused ChemDraft windows {active}")
+
+    try:
+        wait_for(document_focused, "The document did not take focus on a click", seconds=5,
+                 interval=0.2)
+        how = "the click"
+    except SmokeFailure as error:
+        print(f"{error}; asking for it with xdotool windowfocus", flush=True)
+        run("xdotool", "windowfocus", document, check=False)
+        wait_for(document_focused, "The document did not take focus", seconds=10, interval=0.2)
+        how = "xdotool windowfocus after the click"
+    report_focus(Atspi, session.main_pid, f"after focusing the document by {how}")
+    # The click on empty canvas cleared the selection that enables the settings fields.
+    choose(Atspi, session.main_pid, "Edit", "Select All")
+
+
 def open_settings_toolbar(Atspi, pid):
     item = wait_for(lambda: menu_item(Atspi, pid, "View", "Toolbars", "Drawn Structure Settings"),
                     "View > Toolbars > Drawn Structure Settings is missing")
@@ -589,15 +650,29 @@ def move_pointer(session, x, y):
     return location
 
 
+def acquire_field(line, name):
+    found = re.search(rf"\b{re.escape(name)}=(\S+)", line)
+    return found.group(1) if found else "absent"
+
+
 def report_app_focus_log(session):
-    """Print ChemDraft's one-line diagnostics for each field acquisition."""
+    """Print ChemDraft's one-line diagnostics for each field acquisition, then the focus gate's
+    inputs and verdict from each line: whether a ChemDraft window had focus when the request
+    ran (app-foreground), when one last lost it relative to the press (app-focus-lost), the
+    request and the outcome."""
     try:
         lines = [line for line in (session.logs / "chemdraft.log").read_text(errors="replace")
                  .splitlines() if "[palette-focus] linux-acquire" in line]
     except OSError as error:
-        lines = [f"chemdraft.log unreadable: {error}"]
+        print_scan("ChemDraft field acquisitions (chemdraft.log):",
+                   [f"chemdraft.log unreadable: {error}"])
+        return
     print_scan("ChemDraft field acquisitions (chemdraft.log):",
                lines or ["none: this build may predate the diagnostic, or no click reached it"])
+    print_scan("Focus gate per acquisition:",
+               [" ".join(f"{name}={acquire_field(line, name)}" for name in
+                         ("app-foreground", "app-focus-lost", "request", "outcome"))
+                for line in lines])
 
 
 def diag(*command):
@@ -775,6 +850,10 @@ def main(bundle, package, logs, compositor):
         open_settings_toolbar(Atspi, session.main_pid)
         settings = wait_for(lambda: session.window(SETTINGS_TITLE),
                             f"The {SETTINGS_TITLE} window did not appear", seconds=30)
+        if session.tests_focus:
+            # Bring ChemDraft to the front first, as a user would: a field click while no
+            # ChemDraft window has focus leaves the keys with the other application.
+            click_document(session, Atspi, document)
         typed = type_into_field(session, Atspi, settings)
 
         session.alive()

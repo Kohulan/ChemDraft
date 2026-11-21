@@ -229,9 +229,12 @@ jobs:
 
       # The same check under a virtual KWin, the compositor of KDE Plasma. KWin's X window
       # manager honors a client's own focus request, so here the field must change: this is
-      # the pass/fail check for click-to-focus in a toolbar number field. Its log prints
+      # the pass/fail check for click-to-focus in a toolbar number field. It clicks the
+      # document first, as a user would, because ChemDraft (like Windows and macOS) gives a
+      # field the keyboard only when ChemDraft had focus at the click. Its log prints
       # ChemDraft's "[palette-focus] linux-acquire" line for the click, which shows the app's
-      # focus decision (request=...), the XSetInputFocus call and the outcome.
+      # focus inputs (app-foreground=..., app-focus-lost=...), its decision (request=...),
+      # the XSetInputFocus call and the outcome.
       - name: Type into a toolbar number field under KWin (focus check)
         if: >-
           !cancelled() && matrix.backend == 'wayland' && matrix.native_wayland != '1' &&

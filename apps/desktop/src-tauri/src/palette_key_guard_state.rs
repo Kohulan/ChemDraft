@@ -174,6 +174,8 @@ pub(super) enum FocusRequest {
     Present {
         sequence: u64,
         timestamp: u32,
+        /// When the GTK observer saw the press, on the caller's monotonic clock.
+        pressed_at: u64,
         remaining_ms: u64,
         confirmed: tokio::sync::oneshot::Receiver<()>,
     },
@@ -372,6 +374,7 @@ impl Guard {
             FocusRequest::Present {
                 sequence: p.sequence,
                 timestamp: p.native_time,
+                pressed_at: p.started,
                 remaining_ms,
                 confirmed,
             }
@@ -389,33 +392,75 @@ pub(super) fn click_focus_time(x11: bool, timestamp: u32) -> Option<u32> {
     (x11 && timestamp != 0).then_some(timestamp)
 }
 
+/// How long before a palette press a ChemDraft toplevel may have lost focus for the press to
+/// count as a click inside ChemDraft rather than a click from another application.
+#[cfg(any(target_os = "linux", test))]
+pub(super) const FOCUS_HANDOFF_MS: u64 = 1_000;
+
+/// Whether ChemDraft had focus at the press, for an acquisition that finds no ChemDraft
+/// toplevel focused. `lost_at` is the last time any ChemDraft toplevel lost focus and
+/// `pressed_at` the press, both on the same monotonic clock. A loss after the press means the
+/// app was in front when the user pressed; one up to `FOCUS_HANDOFF_MS` before it is the
+/// window manager handing the click to the palette. Never losing focus means ChemDraft never
+/// had it, and an older loss means another application was in front.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn focus_handoff(lost_at: Option<u64>, pressed_at: u64) -> bool {
+    lost_at.is_some_and(|lost| pressed_at.saturating_sub(lost) <= FOCUS_HANDOFF_MS)
+}
+
+/// Where the last ChemDraft focus loss falls relative to the press, for the acquire log.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn describe_focus_loss(lost_at: Option<u64>, request: &FocusRequest) -> String {
+    let FocusRequest::Present { pressed_at, .. } = request else {
+        return "n/a".to_owned();
+    };
+    match lost_at {
+        None => "never".to_owned(),
+        Some(lost) if lost > *pressed_at => format!("{}ms-after-press", lost - pressed_at),
+        Some(lost) => format!("{}ms-before-press", pressed_at - lost),
+    }
+}
+
 /// Why a Linux field acquisition stops before it touches native focus, or `None` to go on.
-/// `app_foreground` is whether any ChemDraft toplevel holds focus when the IPC runs.
+/// `app_foreground` is whether any ChemDraft toplevel holds focus when the IPC runs, and
+/// `app_focus_lost_at` the last time one lost focus (see `focus_handoff`).
 ///
-/// Without app focus, only a `Present` request goes on. `request_focus` returns one only for
-/// a GTK button press on this same window, with a server timestamp, less than `TIMEOUT_MS`
-/// old: the user clicked our palette. A window manager can move X focus off the document
-/// while it offers that click to the palette (which is not yet accepting focus), so app focus
-/// at IPC time cannot tell that click from a background request. A JavaScript-only or
-/// delayed request has no live press and stays refused. The X server ignores the click-time
-/// `XSetInputFocus` if focus changed after the press, so a later switch to another
-/// application wins. macOS likewise makes the panel key on the native mouse-down whatever
-/// the app's activation (`panel_focus_macos.rs`).
+/// Linux matches Windows and macOS (owner decision, 2026-11-21): a click on a palette field
+/// while another application is really in front does not take the keyboard; the user clicks a
+/// ChemDraft window first. The one exception is the X11 focus handoff race. A window manager
+/// can move X focus off the document while it offers the click to the palette (which is not
+/// yet accepting focus), so no ChemDraft toplevel holds focus when the IPC runs even though
+/// ChemDraft was in front at the press. Without app focus, then, only a `Present` request goes
+/// on, and only when a ChemDraft toplevel lost focus at most `FOCUS_HANDOFF_MS` before that
+/// press (or after it). `request_focus` returns `Present` only for a GTK button press on this
+/// same window, with a server timestamp, less than `TIMEOUT_MS` old, so a JavaScript-only,
+/// delayed or zero-time request has no live press and stays refused. The X server ignores the
+/// click-time `XSetInputFocus` if focus changed after the press, so a later switch to another
+/// application wins.
 #[cfg(any(target_os = "linux", test))]
 pub(super) fn acquire_refusal(
     visible: bool,
     minimized: bool,
     app_foreground: bool,
+    app_focus_lost_at: Option<u64>,
     request: &FocusRequest,
 ) -> Option<&'static str> {
     if !visible {
         Some("denied:hidden")
     } else if minimized {
         Some("denied:minimized")
-    } else if !app_foreground && !matches!(request, FocusRequest::Present { .. }) {
-        Some("denied:app-not-focused")
-    } else {
+    } else if app_foreground {
         None
+    } else {
+        match request {
+            FocusRequest::Present { pressed_at, .. }
+                if focus_handoff(app_focus_lost_at, *pressed_at) =>
+            {
+                None
+            }
+            FocusRequest::Present { .. } => Some("denied:app-not-focused-at-press"),
+            _ => Some("denied:app-not-focused"),
+        }
     }
 }
 
@@ -521,53 +566,122 @@ mod tests {
         assert_eq!(click_focus_time(false, 0), None);
     }
 
+    const LABELS: [&str; 2] = [
+        "toolset-core-drawnStructureSettings",
+        "plugin-panel-example",
+    ];
+
+    /// A live GTK press on `label` at monotonic time 100 (X time 511_203), asked for at 120.
+    fn live_press(label: &str) -> FocusRequest {
+        let mut guard = Guard::new();
+        let click = guard.gtk_pointer(label, 100, 1_000, 511_203);
+        guard.request_focus(label, Some(click.sequence), 1_000, 120, false)
+    }
+
     #[test]
-    fn a_native_press_on_the_palette_may_take_focus_with_no_chemdraft_window_focused() {
-        // A window manager can move X focus off the document as it offers the click to the
-        // palette, so when the IPC runs no ChemDraft toplevel holds focus. The press asked.
-        for label in [
-            "toolset-core-drawnStructureSettings",
-            "plugin-panel-example",
-        ] {
-            let mut guard = Guard::new();
-            let click = guard.gtk_pointer(label, 10, 100, 511_203);
-            let request = guard.request_focus(label, Some(click.sequence), 100, 20, false);
+    fn the_x11_focus_handoff_race_lets_the_palette_press_take_focus() {
+        // The document had focus. As it hands the click to the palette, the window manager
+        // moves X focus off the document, so no ChemDraft toplevel holds focus when the IPC
+        // runs. The press still came from inside ChemDraft.
+        for label in LABELS {
+            let request = live_press(label);
             assert!(matches!(
                 request,
                 FocusRequest::Present {
                     timestamp: 511_203,
+                    pressed_at: 100,
                     ..
                 }
             ));
+            // The document lost focus just before the press, at the press, or after it
+            // (GTK may process the focus-out after the button press).
+            for lost_at in [99, 100, 110, 125] {
+                assert_eq!(
+                    acquire_refusal(true, false, false, Some(lost_at), &request),
+                    None,
+                    "{label} lost at {lost_at}"
+                );
+            }
+            // Up to FOCUS_HANDOFF_MS before the press, inclusive. Time 0 is the earliest
+            // monotonic reading, so it needs a later press.
+            let mut guard = Guard::new();
+            let click = guard.gtk_pointer(label, FOCUS_HANDOFF_MS + 5, 1_000, 511_203);
+            let late = guard.request_focus(
+                label,
+                Some(click.sequence),
+                1_000,
+                FOCUS_HANDOFF_MS + 20,
+                false,
+            );
             assert_eq!(
-                acquire_refusal(true, false, false, &request),
+                acquire_refusal(true, false, false, Some(5), &late),
                 None,
                 "{label}"
             );
+            assert_eq!(describe_focus_loss(Some(99), &request), "1ms-before-press");
+            assert_eq!(describe_focus_loss(Some(125), &request), "25ms-after-press");
+            // With ChemDraft still focused, nothing about focus loss matters.
+            assert_eq!(acquire_refusal(true, false, true, None, &request), None);
+        }
+    }
+
+    #[test]
+    fn a_palette_press_while_another_app_is_in_front_does_not_take_focus() {
+        // Parity with Windows and macOS (owner decision, 2026-11-21): another application is
+        // really in front, so the keys stay with it and the user must click ChemDraft first.
+        // eea7e344 allowed every live press here; this test fails against that rule.
+        for label in LABELS {
+            let mut guard = Guard::new();
+            let click = guard.gtk_pointer(label, 5_000, 9_000, 511_203);
+            let request = guard.request_focus(label, Some(click.sequence), 9_000, 5_020, false);
+            assert!(matches!(request, FocusRequest::Present { .. }));
+            // ChemDraft never had focus in this session.
             assert_eq!(
-                acquire_refusal(true, false, true, &request),
-                None,
+                acquire_refusal(true, false, false, None, &request),
+                Some("denied:app-not-focused-at-press"),
                 "{label}"
             );
-            // Still never for a hidden or minimized window.
+            assert_eq!(describe_focus_loss(None, &request), "never");
+            // ChemDraft lost focus to the other application more than the handoff window
+            // before the press.
+            for lost_at in [0, 5_000 - FOCUS_HANDOFF_MS - 1, 2_000] {
+                assert_eq!(
+                    acquire_refusal(true, false, false, Some(lost_at), &request),
+                    Some("denied:app-not-focused-at-press"),
+                    "{label} lost at {lost_at}"
+                );
+            }
             assert_eq!(
-                acquire_refusal(false, false, false, &request),
-                Some("denied:hidden")
-            );
-            assert_eq!(
-                acquire_refusal(true, true, false, &request),
-                Some("denied:minimized")
+                describe_focus_loss(Some(2_000), &request),
+                "3000ms-before-press"
             );
         }
     }
 
     #[test]
-    fn requests_without_a_live_native_press_stay_refused_in_the_background() {
-        let label = "toolset-core-drawnStructureSettings";
+    fn hidden_minimized_and_unbacked_requests_stay_refused() {
+        // Hidden and minimized windows are refused whatever the focus history.
+        for label in LABELS {
+            let request = live_press(label);
+            for (foreground, lost_at) in [(true, None), (false, Some(100)), (false, None)] {
+                assert_eq!(
+                    acquire_refusal(false, false, foreground, lost_at, &request),
+                    Some("denied:hidden")
+                );
+                assert_eq!(
+                    acquire_refusal(true, true, foreground, lost_at, &request),
+                    Some("denied:minimized")
+                );
+            }
+        }
+        // Requests without a live press on this palette are refused without app focus,
+        // even when the document lost focus a moment ago.
+        let label = LABELS[0];
         let refused = |guard: &mut Guard, sequence, now| {
             let request = guard.request_focus(label, sequence, 100, now, false);
             assert!(matches!(request, FocusRequest::Denied));
-            acquire_refusal(true, false, false, &request)
+            assert_eq!(describe_focus_loss(Some(now), &request), "n/a");
+            acquire_refusal(true, false, false, Some(now), &request)
         };
         // JS-only: the page asks with no GTK press at all.
         let mut guard = Guard::new();
@@ -609,7 +723,7 @@ mod tests {
         // With ChemDraft focused, a request without a press passes the gate but presents
         // nothing (unchanged): only `Present` ever calls XSetInputFocus.
         assert_eq!(
-            acquire_refusal(true, false, true, &FocusRequest::Denied),
+            acquire_refusal(true, false, true, None, &FocusRequest::Denied),
             None
         );
     }
