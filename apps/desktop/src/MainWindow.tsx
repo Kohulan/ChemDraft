@@ -21,7 +21,7 @@ import { dropElectronMark, dropElectronMarksInSelection, electronMarkDropTarget,
 import { chargeAssociationUndoLabel, electronMarkUndoLabel } from "./electronMarkUndoLabel";
 import {
   CHEMISTRY_EDIT, PLUGIN_WRITE, PRESERVE_CHEMISTRY, TEXT_EDIT, chemistryEditOf, chemistryRefusalStatus, policyChemistryRefusals,
-  preserveChemistry, selectionTransformChemistry, structureEditChemistry, type CommitChemistryPolicy
+  preserveChemistry, selectionTransformChemistry, structureEditChemistry, structureEditorChemistry, type CommitChemistryPolicy
 } from "./commitChemistryGuard";
 import { nativeBenzeneHotkeyAtAtomTarget, nativeFragmentSproutTarget, nativeDieneFuseTarget, nativeOxoHotkeyTarget, nativeBranchedHotkeyTarget, type FragmentSproutKind } from "./sproutHotkeys";
 import { applyTableCommand, applyTableFontCommand, applyTableObjectEdit, createTableCommands, createTableInsertAction, parseTableInsertCommandId, resolveActiveTableCell, selectedTable, tableInsertCommandId, tableInspectorSnapshot, type ActiveTableCell, type TableInsertDimensions } from "./tableCommands";
@@ -611,6 +611,7 @@ import {
   cleanUpStructureStatus,
   type NativeMoleculeRelayoutEngine,
   carryElectronMarksWithMovedAtoms,
+  type AtomMotion,
   cleanUpNativeMolecules2d,
   moleculeHasFusedRingSystem,
   attachSpin3dModelFromConformer,
@@ -3853,10 +3854,13 @@ export function MainWindow({
   // Ordinary edits and assistant history pushes/amendments share commit preparation.
   // Given the document the edit started from, every mark associated with an atom the edit moved
   // follows it first (owner ruling 2026-11-21, charge always follows): Clean Up, relayout, Spin 3D
-  // flatten, bond-length scaling and any other edit that moves atoms commit with marks kept.
+  // flatten, bond-length scaling and any other edit that moves atoms commit with marks kept. A
+  // commit whose policy rebuilt atoms under new ids (a structure-editor save) is not followed:
+  // its ids do not name the same atoms (`marksFollowAtoms`).
   const prepareDocumentCommit = useCallback((nextDocument: ChemDraftDocument, undoLabel?: string,
-    assertFinalDocument?: (document: ChemDraftDocument) => ChemDraftDocument | void, before?: ChemDraftDocument) => {
-    const normalized = normalizeCommittedDocument(before ? carryElectronMarksWithMovedAtoms(before, nextDocument) : nextDocument);
+    assertFinalDocument?: (document: ChemDraftDocument) => ChemDraftDocument | void, before?: ChemDraftDocument,
+    chemistry?: CommitChemistryPolicy) => {
+    const normalized = normalizeCommittedDocument(before ? carryElectronMarksWithMovedAtoms(before, nextDocument, chemistry) : nextDocument);
     const present = assertFinalDocument?.(normalized) ?? normalized;
     const label = undoLabel ?? documentUndoLabelsRef.current.get(nextDocument);
     if (label) documentUndoLabelsRef.current.set(present, label);
@@ -3877,8 +3881,8 @@ export function MainWindow({
   ): boolean => {
     if (quitMutationFrozenRef.current) throw new Error("Quit is completing; the pending edit was not applied.");
     const prepare = (before: ChemDraftDocument, next: ChemDraftDocument) => {
-      if (typeof undoLabel !== "function") return prepareDocumentCommit(next, undoLabel, assertFinalDocument, before);
-      const present = prepareDocumentCommit(next, undefined, assertFinalDocument, before);
+      if (typeof undoLabel !== "function") return prepareDocumentCommit(next, undoLabel, assertFinalDocument, before, chemistry);
+      const present = prepareDocumentCommit(next, undefined, assertFinalDocument, before, chemistry);
       documentUndoLabelsRef.current.set(present, undoLabel(before, present));
       return present;
     };
@@ -3960,7 +3964,7 @@ export function MainWindow({
     const uncheckedNext = typeof update === "function" ? update(unchecked) : update;
     if (uncheckedNext !== unchecked) {
       let finalDocument: ChemDraftDocument | undefined;
-      try { finalDocument = prepareDocumentCommit(uncheckedNext, label, assertFinalDocument, unchecked); } catch { finalDocument = undefined; }
+      try { finalDocument = prepareDocumentCommit(uncheckedNext, label, assertFinalDocument, unchecked, chemistry); } catch { finalDocument = undefined; }
       const earlyRefusal = finalDocument && commitChemistryRefusal(unchecked, uncheckedNext, finalDocument, chemistry, label);
       if (earlyRefusal) {
         reportChemistryRefusal(earlyRefusal);
@@ -3974,7 +3978,7 @@ export function MainWindow({
       // Reuse the checked result while the checkpoint left the document as it was.
       const next = before === unchecked ? uncheckedNext : typeof update === "function" ? update(before) : update;
       if (next === before) return false;
-      const proposed = prepareDocumentCommit(next, label, undefined, before);
+      const proposed = prepareDocumentCommit(next, label, undefined, before, chemistry);
       // Refuse before asking about the page size; the final commit checks again. A caller's own
       // final-document assertion (Clean Up) runs first there, keeping its more specific refusal.
       const refusal = assertFinalDocument ? undefined : commitChemistryRefusal(before, next, proposed, chemistry, label);
@@ -4183,8 +4187,8 @@ export function MainWindow({
     chemistry: CommitChemistryPolicy = PRESERVE_CHEMISTRY
   ): boolean => {
     if (quitMutationFrozenRef.current) throw new Error("Quit is completing; the pending edit was not applied.");
-    const verified = assertFinalDocument ? prepareDocumentCommit(nextDocument, undoLabel, assertFinalDocument, startDocument) : undefined;
-    const present = verified ?? prepareDocumentCommit(nextDocument, undoLabel, undefined, startDocument);
+    const verified = assertFinalDocument ? prepareDocumentCommit(nextDocument, undoLabel, assertFinalDocument, startDocument, chemistry) : undefined;
+    const present = verified ?? prepareDocumentCommit(nextDocument, undoLabel, undefined, startDocument, chemistry);
     // The gesture's final document must not change a molecule that existed before it. On refusal the
     // pre-gesture document is put back (a drag leaves its last preview frame as the present) and
     // nothing is recorded.
@@ -4215,7 +4219,7 @@ export function MainWindow({
   const commitInsertionHistoryWithPageFit = useCallback((start: ChemDraftDocument, proposed: ChemDraftDocument, undoLabel?: string,
     chemistry: CommitChemistryPolicy = PRESERVE_CHEMISTRY) => {
     const placed = proposed;
-    proposed = prepareDocumentCommit(proposed, undefined, undefined, start);
+    proposed = prepareDocumentCommit(proposed, undefined, undefined, start, chemistry);
     // Refused before the page-size question; commitDocumentHistoryFrom puts `start` back.
     if (commitChemistryRefusal(start, placed, proposed, chemistry, undoLabel)) {
       commitDocumentHistoryFrom(start, placed, undoLabel, undefined, chemistry);
@@ -12737,10 +12741,12 @@ export function MainWindow({
           return;
         }
 
-        const commitSelectionTransform = (transform: (current: ChemDraftDocument) => ChemDraftDocument, emptyStatus: string) => {
+        // `motion` names a turn or flip, which two atoms (or atoms on one line) cannot tell apart.
+        const commitSelectionTransform = (transform: (current: ChemDraftDocument) => ChemDraftDocument, emptyStatus: string,
+          motion?: AtomMotion) => {
           let markStatus: string | undefined;
           const changed = commitDocumentChange(current => {
-            const result = resolveElectronMarksInSelectionTransform(current, transform(current));
+            const result = resolveElectronMarksInSelectionTransform(current, transform(current), { motion });
             markStatus = result.status;
             return result.document;
           }, layoutUndoLabel, false, undefined, selectionTransformChemistry());
@@ -12749,7 +12755,7 @@ export function MainWindow({
 
         if (action.id === "layout.flipHorizontal" || action.id === "layout.flipVertical") {
           const axis = action.id === "layout.flipHorizontal" ? "horizontal" : "vertical";
-          commitSelectionTransform(current => flipSelectedDocumentObjects(current, axis), "No selected object");
+          commitSelectionTransform(current => flipSelectedDocumentObjects(current, axis), "No selected object", "mirror");
           return;
         }
 
@@ -12768,7 +12774,7 @@ export function MainWindow({
         }
 
         if (action.id === "layout.rotate90") {
-          commitSelectionTransform(rotateSelectedDocumentObjects90, "No selected object");
+          commitSelectionTransform(rotateSelectedDocumentObjects90, "No selected object", "turn");
           return;
         }
 
@@ -17365,7 +17371,7 @@ export function MainWindow({
     const rotated = drag.target
       ? rotateNativeMoleculeParts(drag.startDocument, drag.target, degrees)
       : rotateDocumentObject(drag.startDocument, drag.objectId, degrees);
-    return resolveElectronMarksInSelectionTransform(drag.startDocument, rotated).document;
+    return resolveElectronMarksInSelectionTransform(drag.startDocument, rotated, { motion: "turn" }).document;
   }, []);
 
   // Snapshot the molecule's persisted Spin 3D model for a whole-molecule rotate drag.
@@ -17915,7 +17921,8 @@ export function MainWindow({
     }
 
     replacePresentDocument(result.kind === "xy" && result.verifiedSpin3d
-      ? result.document : resolveElectronMarksInSelectionTransform(nextInput.startDocument, result.document).document);
+      ? result.document : resolveElectronMarksInSelectionTransform(nextInput.startDocument, result.document,
+        result.kind === "z" ? { motion: "turn" } : {}).document);
     if (result.kind === "xy") {
       showProjectedPlaneTiltReadout(nextInput.objectId, result.tiltXRad, result.tiltYRad, result.clamped, false);
     } else {
@@ -18950,7 +18957,8 @@ export function MainWindow({
           setStatus(`3D rotate: ${projectedPlaneTiltReadoutLabel(result.tiltXRad, result.tiltYRad)}`);
         } else {
           const before = groupTransform.startDocument;
-          const preview = resolveElectronMarksInSelectionTransform(before, groupTransformDocument(groupTransform, point, event.shiftKey));
+          const preview = resolveElectronMarksInSelectionTransform(before, groupTransformDocument(groupTransform, point, event.shiftKey),
+            groupTransform.mode === "rotate" ? { motion: "turn" } : {});
           replacePresentDocument(preview.document);
         }
       }
@@ -19369,7 +19377,7 @@ export function MainWindow({
           : undefined;
         const before = groupTransform.startDocument;
         const transformed = result?.document ?? groupTransformDocument(groupTransform, point, event.shiftKey);
-        const edit = resolveElectronMarksInSelectionTransform(before, transformed);
+        const edit = resolveElectronMarksInSelectionTransform(before, transformed, groupTransform.mode === "rotate" ? { motion: "turn" } : {});
         if (edit.document !== before) {
           const label = groupTransform.mode === "rotate" ? "Rotate selection"
             : groupTransform.mode === "resize" ? "Resize selection" : "3D rotate";
@@ -22715,7 +22723,9 @@ export function MainWindow({
     // A side-dependent label the save could not carry is read again from its drawing: say so (short
     // on the status line, each atom named in the log) rather than let the save change it silently.
     const applied = applyEditorSaveResultWithLabelWarnings(documentRef.current, result);
-    commitDocumentChangeWithPageFit(applied.document, undefined, undefined, undefined, CHEMISTRY_EDIT);
+    // Only the edited molecule may change. The save reuses atom ids by index, so its marks are not
+    // carried by the charge-follows rule: they stay put and normal association applies.
+    commitDocumentChangeWithPageFit(applied.document, undefined, undefined, undefined, structureEditorChemistry(result.object.id));
     const labelStatus = editorSaveLabelWarningsStatus(applied.labelWarnings);
     if (labelStatus) {
       setStatus(labelStatus);

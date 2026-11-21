@@ -62,13 +62,20 @@ export type CommitChemistryPolicy =
     readonly structureEdit?: boolean;
     /** Molecules (by id, on any page) the operation is meant to change: `chemistryEditOf`. */
     readonly editedMoleculeIds?: readonly string[];
+    /**
+     * Molecules whose atoms the operation rebuilt with ids that do not name the same atoms as
+     * before (`structureEditorChemistry`). The commit funnel then does not run the charge-follows
+     * rule (`marksFollowAtoms`): it pairs atoms by id, and would carry a mark to, and anchor it on,
+     * whichever atom inherited its atom's id.
+     */
+    readonly rebuiltMoleculeIds?: readonly string[];
   }
   | { readonly kind: "exempt"; readonly reason: "chemistry edit" | "text edit" | "plugin write" };
 
 export const PRESERVE_CHEMISTRY: CommitChemistryPolicy = { kind: "preserve" };
 /**
- * Document-wide exemption: deleting, label edits, mark drops and drags, atom drags, Ketcher edits,
- * the point-based charge tool. Prefer the scoped `structureEditChemistry` / `chemistryEditOf`
+ * Document-wide exemption: deleting, label edits, mark drops and drags, atom drags, the point-based
+ * charge tool (a Ketcher save is scoped: `structureEditorChemistry`). Prefer the scoped `structureEditChemistry` / `chemistryEditOf`
  * wherever the molecules an operation is meant to change are known.
  */
 export const CHEMISTRY_EDIT: CommitChemistryPolicy = { kind: "exempt", reason: "chemistry edit" };
@@ -95,10 +102,30 @@ export function chemistryEditOf(moleculeIds: readonly string[], operation?: stri
 }
 
 /**
+ * A structure-editor (Ketcher) save of one molecule: only that molecule may change. The save
+ * rebuilds the molecule and reuses its previous atom ids by array index (`parseV3000MoleculeGraph`),
+ * so deleting or reordering an earlier atom shifts later atoms onto other atoms' old ids. No id can
+ * be trusted to name the same atom, so marks are not carried by the charge-follows rule: they stay
+ * where they are and normal mark association applies, inside the edited molecule only.
+ */
+export function structureEditorChemistry(moleculeId: string): CommitChemistryPolicy {
+  return { kind: "preserve", operation: "apply this structure edit", editedMoleculeIds: [moleculeId], rebuiltMoleculeIds: [moleculeId] };
+}
+
+/**
+ * Whether the commit funnel runs the charge-follows rule (owner ruling 2026-11-21) for a commit
+ * under `policy`: always, except for a commit that rebuilt atoms under new ids
+ * (`rebuiltMoleculeIds`), where pairing atoms by id would pair different atoms.
+ */
+export function marksFollowAtoms(policy: CommitChemistryPolicy | undefined): boolean {
+  return !(policy?.kind === "preserve" && policy.rebuiltMoleculeIds?.length);
+}
+
+/**
  * A move or selection transform (align, rotate, nudge, a drag…). Owner ruling 2026-11-21 (charge
  * always follows): marks move with their atoms, so a move preserves every molecule's chemistry,
- * moved or not. Only a selected mark the transform moved without its atom may change chemistry,
- * under the mark-move policy (`movedSelectedMarkAtomKeys`).
+ * moved or not, with no exempt atom. Only a selected mark the transform moved without its atom (a
+ * mark drop) may change chemistry, under the mark-move policy (`movedSelectedMarkAtomKeys`).
  */
 export function selectionTransformChemistry(operation?: string): CommitChemistryPolicy {
   return preserveChemistry(operation);
@@ -251,9 +278,9 @@ export interface CommitChemistryCheck {
  *
  * Some changes are the operation's own, and only charge or radical changes on atoms that remain
  * (a removed atom or molecule is never exempt):
- * - a charge or radical mark the user selected and the operation moved or explicitly re-anchored:
- *   its old and new atoms (align, distribute, arrange, nudge, rotate or resize of a selection that
- *   includes the mark, which decide and announce the mark's new atom);
+ * - a charge or radical mark the user selected and the operation moved or explicitly re-anchored
+ *   without its atom (a mark drop, or a mark in a selection moved without its molecule): its old
+ *   and new atoms. A mark that followed its moved atom explains nothing (`movedSelectedMarkAtomKeys`);
  * - for a scoped chemistry edit (`structureEdit`, `editedMoleculeIds`), every change, removal
  *   included, to the molecules it structurally edited or names.
  * Molecules the operation did not select and move, edit or name are never exempt: the legacy loose
@@ -375,11 +402,15 @@ function selectedTargets(document: ChemDraftDocument): { pageId: string | undefi
 }
 
 /**
- * Atoms whose change a selected, moved charge or radical mark explains: the atoms the mark is
- * attributed to in each of `documents`, on the selection's page. A mark counts as moved when the
+ * Atoms whose change a selected charge or radical mark moved BY ITSELF explains: the atoms the mark
+ * is attributed to in each of `documents`, on the selection's page. A mark counts as moved when the
  * operation changed its position or size, or gave it an explicit anchor it did not have
  * (normalization never moves a mark and never makes an anchor explicit, so a mark it merely
- * re-attributed does not count).
+ * re-attributed does not count), and its own atom did not move: that is a mark drop or a mark
+ * moved off its atom, under the mark-move policy. A mark whose atom moved followed it (owner ruling
+ * 2026-11-21, charge always follows) and explains nothing, so a pure move (a selection drag, nudge,
+ * align, distribute, arrange, spacing, rotate, flip, resize, a part drag) has no exempt atom at
+ * all: every molecule's charges and radicals must come out as they were.
  */
 export function movedSelectedMarkAtomKeys(
   before: ChemDraftDocument,
@@ -391,8 +422,21 @@ export function movedSelectedMarkAtomKeys(
   const { pageId, ids } = selectedTargets(before);
   const page = before.pages.find((candidate) => candidate.id === pageId);
   if (!page || ids.size === 0) return keys;
-  const nextMarks = new Map((next.pages.find((candidate) => candidate.id === pageId)?.objects ?? [])
+  const nextPage = next.pages.find((candidate) => candidate.id === pageId);
+  const nextMarks = new Map((nextPage?.objects ?? [])
     .flatMap((object) => object.type === "electron-mark" ? [[object.id, object] as const] : []));
+  const molecules = moleculesById(page), nextMolecules = moleculesById(nextPage);
+  // Whether the operation moved the atom the mark belonged to before it: its molecule's placement
+  // or the atom's own position changed.
+  const ownAtomMoved = (mark: ElectronMarkObject) => markAtoms(page, mark).some((owner) => {
+    const molecule = molecules.get(owner.objectId), moved = nextMolecules.get(owner.objectId);
+    if (!molecule || !moved || moved === molecule) return false;
+    if (moved.x !== molecule.x || moved.y !== molecule.y || moved.width !== molecule.width ||
+      moved.height !== molecule.height || moved.rotation !== molecule.rotation) return true;
+    const atom = molecule.atoms.find((candidate) => candidate.id === owner.atomId);
+    const after = moved.atoms.find((candidate) => candidate.id === owner.atomId);
+    return atom !== undefined && after !== undefined && (after.x !== atom.x || after.y !== atom.y);
+  });
   const moved = new Set<string>();
   for (const mark of page.objects) {
     if (mark.type !== "electron-mark" || !ids.has(mark.id)) continue;
@@ -403,7 +447,7 @@ export function movedSelectedMarkAtomKeys(
     const repositioned = after.x !== mark.x || after.y !== mark.y || after.width !== mark.width || after.height !== mark.height;
     const reanchored = after.atomAssociation === "explicit" &&
       (mark.atomAssociation !== "explicit" || JSON.stringify(after.anchor) !== JSON.stringify(mark.anchor));
-    if (repositioned || reanchored) moved.add(mark.id);
+    if ((repositioned || reanchored) && !ownAtomMoved(mark)) moved.add(mark.id);
   }
   if (moved.size === 0) return keys;
   for (const document of documents) {

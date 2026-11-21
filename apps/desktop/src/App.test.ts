@@ -2601,7 +2601,8 @@ describe("ChemDraft desktop shell", () => {
     // a part drag carries its marks, is labelled plain "Move" and preserves chemistry (1.2.2 named a
     // charge-aware label with chargeAssociationUndoLabel and declared CHEMISTRY_EDIT).
     // prepareDocumentCommit, given the document an edit started from, first carries every mark of
-    // an atom the edit moved (carryElectronMarksWithMovedAtoms) before normalizing.
+    // an atom the edit moved (carryElectronMarksWithMovedAtoms) before normalizing, unless the
+    // commit's policy rebuilt atoms under new ids (a structure-editor save, review fix P1).
     expect(mainWindowSource.match(/normalizeCommittedDocument\(/g)).toHaveLength(15);
     expect(mainWindowSource).toContain(
       "const committed = normalizeCommittedDocument(result.document);\n    if (!commitDocumentHistoryFrom(drag.startDocument, committed, \"Move\", undefined, preserveChemistry(\"move\"))) return;"
@@ -2611,23 +2612,27 @@ describe("ChemDraft desktop shell", () => {
       mainWindowSource.indexOf("const pageFitPendingRef =")
     );
     expect(prepareDocumentCommitSource).toMatch(
-      /const normalized = normalizeCommittedDocument\(before \? carryElectronMarksWithMovedAtoms\(before, nextDocument\) : nextDocument\);\s*const present = assertFinalDocument\?\.\(normalized\) \?\? normalized;/
+      /const normalized = normalizeCommittedDocument\(before \? carryElectronMarksWithMovedAtoms\(before, nextDocument, chemistry\) : nextDocument\);\s*const present = assertFinalDocument\?\.\(normalized\) \?\? normalized;/
     );
     expect(prepareDocumentCommitSource).toContain("return present;");
+    // A structure-editor (Ketcher) save may change only the molecule it edited, and its marks are
+    // not carried by id (it reuses atom ids by index).
+    expect(mainWindowSource).toContain(
+      "commitDocumentChangeWithPageFit(applied.document, undefined, undefined, undefined, structureEditorChemistry(result.object.id));");
     const commitDocumentHistorySource = mainWindowSource.slice(
       mainWindowSource.indexOf("const commitDocumentHistoryFrom ="),
       mainWindowSource.indexOf("const commitInsertionHistoryWithPageFit =")
     );
-    expect(commitDocumentHistorySource).toContain("const verified = assertFinalDocument ? prepareDocumentCommit(nextDocument, undoLabel, assertFinalDocument, startDocument) : undefined;");
-    expect(commitDocumentHistorySource).toContain("const present = verified ?? prepareDocumentCommit(nextDocument, undoLabel, undefined, startDocument);");
+    expect(commitDocumentHistorySource).toContain("const verified = assertFinalDocument ? prepareDocumentCommit(nextDocument, undoLabel, assertFinalDocument, startDocument, chemistry) : undefined;");
+    expect(commitDocumentHistorySource).toContain("const present = verified ?? prepareDocumentCommit(nextDocument, undoLabel, undefined, startDocument, chemistry);");
     const commitDocumentChangeSource = mainWindowSource.slice(
       mainWindowSource.indexOf("const commitDocumentChange ="),
       mainWindowSource.indexOf("const commitDocumentChangeWithPageFit =")
     );
     // The Undo label may be a function (before, after) => string, so both guarded and unguarded
     // paths go through one local `prepare` helper that still calls prepareDocumentCommit.
-    expect(commitDocumentChangeSource).toContain("return prepareDocumentCommit(next, undoLabel, assertFinalDocument, before);");
-    expect(commitDocumentChangeSource).toContain("const present = prepareDocumentCommit(next, undefined, assertFinalDocument, before);");
+    expect(commitDocumentChangeSource).toContain("return prepareDocumentCommit(next, undoLabel, assertFinalDocument, before, chemistry);");
+    expect(commitDocumentChangeSource).toContain("const present = prepareDocumentCommit(next, undefined, assertFinalDocument, before, chemistry);");
     expect(commitDocumentChangeSource).toContain("const present = reusablePresent ?? prepare(currentHistory.present, nextDocument);");
     const finalGuardIndex = commitDocumentChangeSource.indexOf("guardedPresent = prepare(current, next);");
     expect(finalGuardIndex).toBeGreaterThan(-1);

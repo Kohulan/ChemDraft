@@ -5,7 +5,7 @@ import { createNativeTextObject, nativeSingleBondGraphMetadata, nativeSingleBond
 import {
   CHEMISTRY_EDIT, atomChemistry, chemistryEditOf, chemistryRefusalStatus, commitChemistryRefusals, describeMoleculeChemistryChange,
   moleculeAtomChemistryChanges, moleculeKey, policyChemistryRefusals, preexistingMoleculeChemistryChanges,
-  structureEditChemistry, structurallyEditedMoleculeKeys
+  marksFollowAtoms, structureEditChemistry, structureEditorChemistry, structurallyEditedMoleculeKeys
 } from "./commitChemistryGuard";
 import * as workflow from "./documentWorkflow";
 import { dropMark, dropMolecule, electronMarkDropFixture } from "./testSupport/electronMarkDropFixture";
@@ -199,6 +199,28 @@ describe("the commit check against commit normalization", () => {
       `^Cannot align without changing the chemistry of molecule "${dropMolecule(document).id}": its atom "${nitrogen.id}" would have charge 2 `))]);
   });
 
+  it("exempts nothing for a pure move: a selected mark that followed its moved atom explains no change", () => {
+    // Review P2c: a selection holding A and its + moved together. The + followed N, so it is not a
+    // mark moved by itself: N's chemistry changing is refused (it was exempt as a moved selected mark).
+    const { document, nitrogen } = electronMarkDropFixture();
+    const a = dropMolecule(document), mark = dropMark(document);
+    const selected = workflow.selectDocumentObjects(document, document.pages[0].id, [a.id, mark.id]);
+    const together = applyPatches(selected, [
+      { op: "updateObject", objectId: a.id, changes: { x: a.x, y: a.y + 200,
+        atoms: a.atoms.map(atom => ({ ...atom, y: atom.y + 200,
+          ...(atom.id === nitrogen.id ? { formalCharge: atom.formalCharge + 1 } : {}) })) } },
+      { op: "updateObject", objectId: mark.id, changes: { y: mark.y + 200 } }
+    ], { now: phase4Timestamp });
+    expect(check(selected, together, "move")).toEqual([expect.stringMatching(new RegExp(
+      `^Cannot move without changing the chemistry of molecule "${a.id}": its atom "${nitrogen.id}" would have charge 2 `))]);
+    // The same move done right (the + carried, N untouched) passes with no exemption needed.
+    const carried = applyPatches(selected, [
+      { op: "updateObject", objectId: a.id, changes: { x: a.x, y: a.y + 200, atoms: a.atoms.map(atom => ({ ...atom, y: atom.y + 200 })) } },
+      { op: "updateObject", objectId: mark.id, changes: { y: mark.y + 200 } }
+    ], { now: phase4Timestamp });
+    expect(check(selected, carried, "move")).toEqual([]);
+  });
+
   it("refuses a move that changes any molecule's chemistry, moved or not", () => {
     // owner ruling 2026-11-21: charge always follows. Moves preserve: the move paths carry every
     // mark with its atom (`followElectronMarksWithMovedAtoms`), so a move that would leave A's +
@@ -294,6 +316,18 @@ describe("scoped chemistry edits", () => {
     const joined = applyPatch(addCarbon(document, a.id), { op: "removeObject", objectId: b.id }, { now: phase4Timestamp });
     expect(check(document, joined, structureEditChemistry())).toEqual([]);
     expect(commitChemistryRefusals({ before: document, next: joined, after: joined, normalize: identity, markAtoms })).toHaveLength(1);
+  });
+
+  it("lets a structure-editor (Ketcher) save change only the molecule it edited, and turns off the follow rule", () => {
+    // Review P1: the editor save reuses atom ids by index, so it may not be document-wide exempt.
+    const { document, a, b, nitrogen } = aAndB();
+    const policy = structureEditorChemistry(a.id);
+    expect(marksFollowAtoms(policy)).toBe(false);
+    expect(marksFollowAtoms(chemistryEditOf([a.id]))).toBe(true);
+    expect(marksFollowAtoms(CHEMISTRY_EDIT)).toBe(true);
+    expect(check(document, charge(addCarbon(document, a.id), a.id, nitrogen.id, 2), policy)).toEqual([]);
+    expect(check(document, charge(document, B_ID, b.atoms[0].id, 1), policy)).toEqual([
+      expect.stringMatching(new RegExp(`molecule "${B_ID}"`))]);
   });
 
   it("lets a named-molecule edit change only the molecules it names", () => {

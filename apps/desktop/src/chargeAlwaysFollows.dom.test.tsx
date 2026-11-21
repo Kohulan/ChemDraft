@@ -468,10 +468,10 @@ describe.each(["macos", "windows"] as const)("charge always follows its atom (%s
 
   describe("duplicate", () => {
     // Only the molecule is selected. Duplicate keeps atom ids, so the copy's atom is read by the
-    // original id. Today `duplicateSelectedDocumentObjects` (documentWorkflow.ts) copies only the
-    // selected objects and not the marks anchored to a copied molecule, which the clipboard copy
-    // does carry (`anchoredElectronMarksForTransform`), so the copy's atom loses its charge on
-    // normalization. That is a behavior gap this test pins, not a setup error.
+    // original id. `duplicateSelectedDocumentObjects` (documentWorkflow.ts) copies every mark
+    // associated with a copied molecule's atoms, legacy bond, object and loose marks included, as
+    // the clipboard copy does, anchored to the copy's atom; and where the copy would capture the
+    // original's legacy mark, the original's mark is anchored explicitly to its own atom.
     it.each(variants)("duplicates a molecule with the $name: the copy carries the charge and its mark", async ({ build }) => {
       const charged = build();
       expectChargedFixture(charged);

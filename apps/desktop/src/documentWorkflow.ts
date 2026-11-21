@@ -32,7 +32,7 @@ import { doubleBondStereoState, perceivedSpecifiedDoubleBondIds } from "./intera
 import { separateProjectedStereoLigands, serializeSpin3dMolfile, type Spin3dStereoIssue, type Spin3dStereoReference } from "./interaction/spin3dStereo";
 import { projectPoint } from "./interaction/rotation3d";
 import { loadDrawingSettings } from "./drawingSettings";
-import { moleculeAtomChemistryChanges } from "./commitChemistryGuard";
+import { marksFollowAtoms, moleculeAtomChemistryChanges, type CommitChemistryPolicy } from "./commitChemistryGuard";
 import type { storedCoordinatesMatchStereo } from "@chemdraft/ocl-adapter";
 import type { DoubleBondStereoReader } from "./interaction/doubleBondStereo";
 import { nativeDocumentExportWarnings, nativeMoleculeExportWarnings } from "@chemdraft/document-workflow-core";
@@ -8662,12 +8662,15 @@ export interface ElectronMarkMoveAssociationResult {
 }
 
 /**
- * The general move/transform association policy. Direct drops have their own explicit policy.
- * This deliberately preserves origin/main behaviour:
- * charges lose sticky anchors on direct moves/group transforms; radicals and lone pairs keep
- * theirs until normal distance-based reconciliation releases them. Point anchors on the latter
- * keep their old coordinates. The editing preference never changes chemistry policy.
- * Chemistry is reported separately from the actual reconciled commit, never a predicted move.
+ * The association policy for a mark an operation moves. Direct drops have their own explicit
+ * policy. A mark carried with its atom (`operation: "carry"`: a molecule transform, or any move
+ * that `followElectronMarksWithMovedAtoms` follows) keeps its anchor, so its charge stays with its
+ * atom (owner ruling 2026-11-21, charge always follows). Only a mark moved or transformed WITHOUT
+ * its atom (`"move"`, `"transform"`: selected without its molecule) follows the mark-move policy:
+ * a charge loses its sticky anchor; radicals and lone pairs keep theirs until normal
+ * distance-based reconciliation releases them. Point anchors on the latter keep their old
+ * coordinates. The editing preference never changes chemistry policy. Chemistry is reported
+ * separately from the actual reconciled commit, never a predicted move.
  */
 export function electronMarkMoveAssociation(
   _document: ChemDraftDocument | DocumentPage,
@@ -14021,12 +14024,28 @@ const IDENTITY_OFFSET_MAP: OffsetMap = { a: 1, b: 0, c: 0, d: 1 };
 const MARK_FOLLOW_EPSILON_PX = 1e-6;
 
 /**
- * The linear part of the map that takes `from` onto `to` (same length, paired by index): a least
- * squares affine fit, accepted only when it reproduces every pair. Fewer than three non-collinear
- * points fall back to a similarity fit (rotation and uniform scale; a mirror of a straight chain
- * cannot be told from a turn). `undefined` when no single map explains the motion.
+ * What a caller knows of the move it asks `followElectronMarksWithMovedAtoms` to follow: a turn
+ * (rotation, with any uniform scale) or a mirror.
  */
-function fittedOffsetMap(from: readonly PagePoint[], to: readonly PagePoint[]): OffsetMap | undefined {
+export type AtomMotion = "turn" | "mirror";
+
+export interface ElectronMarkFollowOptions {
+  /**
+   * The operation's own transform, where the caller knows it (a part turn, a flip). Consulted only
+   * where the atoms cannot tell: two atoms, or atoms on one line, fit a turn and a mirror equally.
+   * Without it such a move translates the mark with its atom and never guesses a turn or a mirror.
+   */
+  motion?: AtomMotion;
+}
+
+/**
+ * The linear part of the map that takes `from` onto `to` (same length, paired by index): a least
+ * squares affine fit, accepted only when it reproduces every pair. Two points, or points on one
+ * line, fit a turn and a mirror equally (each with uniform scale): the caller's `motion` picks
+ * one, and without it the map is the identity (the offset is translated only, never guessed) as
+ * long as either fits. `undefined` when no single map explains the motion.
+ */
+function fittedOffsetMap(from: readonly PagePoint[], to: readonly PagePoint[], motion?: AtomMotion): OffsetMap | undefined {
   const count = from.length;
   if (count === 0) return undefined;
   const mean = (points: readonly PagePoint[]) => ({
@@ -14041,35 +14060,45 @@ function fittedOffsetMap(from: readonly PagePoint[], to: readonly PagePoint[]): 
     uxx += qx * px; uxy += qx * py; uyx += qy * px; uyy += qy * py;
   }
   const scale = Math.max(sxx + syy, 1e-12);
+  const tolerance = 1e-3 * Math.max(1, Math.sqrt(scale / count));
+  const fits = (map: OffsetMap) => {
+    for (let i = 0; i < count; i++) {
+      const px = from[i].x - p0.x, py = from[i].y - p0.y;
+      const x = q0.x + map.a * px + map.b * py, y = q0.y + map.c * px + map.d * py;
+      if (Math.hypot(x - to[i].x, y - to[i].y) > tolerance) return false;
+    }
+    return true;
+  };
   const det = sxx * syy - sxy * sxy;
-  let map: OffsetMap;
   if (count >= 3 && det > 1e-9 * scale * scale) {
-    map = {
+    const map = {
       a: (uxx * syy - uxy * sxy) / det, b: (uxy * sxx - uxx * sxy) / det,
       c: (uyx * syy - uyy * sxy) / det, d: (uyy * sxx - uyx * sxy) / det
     };
-  } else if (sxx + syy > 1e-9) {
-    const cos = (uxx + uyy) / (sxx + syy), sin = (uyx - uxy) / (sxx + syy);
-    map = { a: cos, b: -sin, c: sin, d: cos };
-  } else {
-    map = IDENTITY_OFFSET_MAP;
+    return fits(map) ? map : undefined;
   }
-  const tolerance = 1e-3 * Math.max(1, Math.sqrt(scale / count));
-  for (let i = 0; i < count; i++) {
-    const px = from[i].x - p0.x, py = from[i].y - p0.y;
-    const x = q0.x + map.a * px + map.b * py, y = q0.y + map.c * px + map.d * py;
-    if (Math.hypot(x - to[i].x, y - to[i].y) > tolerance) return undefined;
+  if (sxx + syy <= 1e-9) return fits(IDENTITY_OFFSET_MAP) ? IDENTITY_OFFSET_MAP : undefined;
+  // Least-squares similarity fits: a turn [[c, -s], [s, c]] and a mirror [[m, n], [n, -m]].
+  const norm = sxx + syy;
+  const cos = (uxx + uyy) / norm, sin = (uyx - uxy) / norm;
+  const turn: OffsetMap = { a: cos, b: -sin, c: sin, d: cos };
+  const m = (uxx - uyy) / norm, n = (uxy + uyx) / norm;
+  const mirror: OffsetMap = { a: m, b: n, c: n, d: -m };
+  if (motion) {
+    const map = motion === "turn" ? turn : mirror;
+    return fits(map) ? map : undefined;
   }
-  return map;
+  return fits(turn) || fits(mirror) ? IDENTITY_OFFSET_MAP : undefined;
 }
 
 /**
- * How a molecule's atoms moved: the offset map for the atoms that moved together. A whole-molecule
- * transform (translate, rotate, flip, scale) maps every atom; a part move or turn maps the atoms
- * it moved; a relayout (Clean Up, 3D flatten) that no single map explains translates each mark
- * with its own atom, keeping its offset.
+ * How a molecule's atoms moved: the offset map, and whether it maps the WHOLE molecule. A
+ * whole-molecule transform (translate, rotate, flip, scale) maps every atom, an atom it leaves in
+ * place (the pivot of a turn) included. A part move or turn maps only the atoms it displaced: an
+ * atom it left in place keeps its marks exactly where they were. A relayout (Clean Up, 3D
+ * flatten) that no single map explains translates each mark with its own atom, keeping its offset.
  */
-function moleculeOffsetMap(before: MoleculeObject, after: MoleculeObject): OffsetMap {
+function moleculeOffsetMap(before: MoleculeObject, after: MoleculeObject, motion?: AtomMotion): { map: OffsetMap; whole: boolean } {
   const afterAtoms = new Map(after.atoms.map((atom) => [atom.id, atom]));
   const from: PagePoint[] = [], to: PagePoint[] = [], movedFrom: PagePoint[] = [], movedTo: PagePoint[] = [];
   for (const atom of before.atoms) {
@@ -14079,7 +14108,12 @@ function moleculeOffsetMap(before: MoleculeObject, after: MoleculeObject): Offse
     from.push(p); to.push(q);
     if (Math.hypot(q.x - p.x, q.y - p.y) > MARK_FOLLOW_EPSILON_PX) { movedFrom.push(p); movedTo.push(q); }
   }
-  return fittedOffsetMap(from, to) ?? (movedFrom.length >= 3 ? fittedOffsetMap(movedFrom, movedTo) : undefined) ?? IDENTITY_OFFSET_MAP;
+  const whole = fittedOffsetMap(from, to, motion);
+  if (whole) return { map: whole, whole: true };
+  // Two displaced atoms define a turn (rotation, scale, translation) as well as three do; whether
+  // it was a turn or a mirror is for the caller's `motion` to say.
+  const part = movedFrom.length >= 2 ? fittedOffsetMap(movedFrom, movedTo, motion) : undefined;
+  return { map: part ?? IDENTITY_OFFSET_MAP, whole: false };
 }
 
 /**
@@ -14119,7 +14153,11 @@ export interface ElectronMarkFollowResult {
  * Marks the operation moved without their atom (a mark drag, or a mark transformed in a selection
  * without its molecule) are left to the mark-move policy.
  */
-export function followElectronMarksWithMovedAtoms(before: ChemDraftDocument, after: ChemDraftDocument): ElectronMarkFollowResult {
+export function followElectronMarksWithMovedAtoms(
+  before: ChemDraftDocument,
+  after: ChemDraftDocument,
+  options: ElectronMarkFollowOptions = {}
+): ElectronMarkFollowResult {
   const followedMarkIds = new Set<string>();
   if (before === after || before.pages === after.pages) return { document: after, followedMarkIds };
   const patches: DocumentPatch[] = [];
@@ -14130,7 +14168,7 @@ export function followElectronMarksWithMovedAtoms(before: ChemDraftDocument, aft
     if (!page.objects.some((object) => object.type === "electron-mark")) continue;
     const nextObjects = objectByIdIndex(nextPage.objects);
     // Only molecules whose drawn atoms moved matter; most edits move none.
-    const movedMolecules = new Map<string, { before: MoleculeObject; after: MoleculeObject; map?: OffsetMap }>();
+    const movedMolecules = new Map<string, { before: MoleculeObject; after: MoleculeObject; fit?: { map: OffsetMap; whole: boolean } }>();
     const changedMoleculeIds = new Set<string>();
     for (const object of page.objects) {
       if (object.type !== "molecule") continue;
@@ -14183,9 +14221,12 @@ export function followElectronMarksWithMovedAtoms(before: ChemDraftDocument, aft
         continue;
       }
       const from = transformPointForObject(molecules.before, atom), to = transformPointForObject(molecules.after, nextAtom);
-      const map = molecules.map ??= moleculeOffsetMap(molecules.before, molecules.after);
-      const atomMoved = Math.hypot(to.x - from.x, to.y - from.y) > MARK_FOLLOW_EPSILON_PX ||
-        Math.abs(map.a - 1) > 1e-9 || Math.abs(map.b) > 1e-9 || Math.abs(map.c) > 1e-9 || Math.abs(map.d - 1) > 1e-9;
+      const { map, whole } = molecules.fit ??= moleculeOffsetMap(molecules.before, molecules.after, options.motion);
+      // An atom left in place moves only under a whole-molecule map (the pivot of a turn of the
+      // molecule). A part map is fitted to the displaced atoms alone: an atom the part move left
+      // in place keeps its marks where they are, offset and all.
+      const atomMoved = Math.hypot(to.x - from.x, to.y - from.y) > MARK_FOLLOW_EPSILON_PX || (whole &&
+        (Math.abs(map.a - 1) > 1e-9 || Math.abs(map.b) > 1e-9 || Math.abs(map.c) > 1e-9 || Math.abs(map.d - 1) > 1e-9));
       if (!atomMoved) {
         if (!markMoved) stationary.add(mark.id);
         else if (carriedInPlace(mark, next)) followedMarkIds.add(mark.id);
@@ -14238,8 +14279,18 @@ export function followElectronMarksWithMovedAtoms(before: ChemDraftDocument, aft
   return { document, followedMarkIds };
 }
 
-/** `followElectronMarksWithMovedAtoms` for callers that need only the document. */
-export function carryElectronMarksWithMovedAtoms(before: ChemDraftDocument, after: ChemDraftDocument): ChemDraftDocument {
+/**
+ * `followElectronMarksWithMovedAtoms` as the commit funnel applies it, for callers that need only
+ * the document. Under a commit policy that rebuilt atoms under new ids (a structure-editor save,
+ * `marksFollowAtoms`), an atom id does not name the same atom before and after, so the rule is not
+ * run: marks stay where they are and normal mark association applies.
+ */
+export function carryElectronMarksWithMovedAtoms(
+  before: ChemDraftDocument,
+  after: ChemDraftDocument,
+  policy?: CommitChemistryPolicy
+): ChemDraftDocument {
+  if (!marksFollowAtoms(policy)) return after;
   return followElectronMarksWithMovedAtoms(before, after).document;
 }
 

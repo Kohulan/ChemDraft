@@ -4,7 +4,7 @@ import { atomDisplayLabel, transformPointForObject } from "@chemdraft/layout-eng
 import { documentDrawingDefaults, nativeAtomChargeSupportsValence, nativeAtomExternalValence, nativeChargeAssociationRadiusPx,
   nativeElectronMarkAssignments, nativeElectronMarkAtomKey, nativeElementFromAtomLabel, phase4Timestamp, type PagePoint } from "@chemdraft/document-workflow-core";
 import { committedElectronMarkAssignments, electronMarkAtomContribution, electronMarkChemistryChanges, findDocumentObject,
-  followElectronMarksWithMovedAtoms, isEditableNativeMoleculeGraph, moveDocumentObject, moveDocumentObjects, nativeChargeMarkCenter,
+  followElectronMarksWithMovedAtoms, isEditableNativeMoleculeGraph, type ElectronMarkFollowOptions, moveDocumentObject, moveDocumentObjects, nativeChargeMarkCenter,
   nativeChargePlacementPointForAtom, normalizeCommittedDocument, resolveGroupedDocumentObjectIds, type NativeMoleculeDeleteTarget } from "./documentWorkflow";
 
 /** Document-space radius, independent of zoom and of the direct-editing preference. */
@@ -227,13 +227,14 @@ export function resolveElectronMarksAfterMoleculePartMove(
 /**
  * Marks associated with an atom the transform moved follow it (owner ruling 2026-11-21). A mark
  * the transform moved without its atom (selected without its molecule) keeps the mark-move policy:
- * it detaches when it leaves its atom's association radius, and a free mark stays free.
+ * it detaches when it leaves its atom's association radius, and a free mark stays free. `follow`
+ * names the transform where the caller knows it (a turn, a flip): see `ElectronMarkFollowOptions`.
  */
 export function resolveElectronMarksInSelectionTransform(
-  document: ChemDraftDocument, transformed: ChemDraftDocument
+  document: ChemDraftDocument, transformed: ChemDraftDocument, follow: ElectronMarkFollowOptions = {}
 ): { document: ChemDraftDocument; status?: string; refused?: boolean } {
   if (transformed === document) return { document };
-  const { document: followed, followedMarkIds } = followElectronMarksWithMovedAtoms(document, transformed);
+  const { document: followed, followedMarkIds } = followElectronMarksWithMovedAtoms(document, transformed, follow);
   const drops: ElectronMarkDrop[] = [];
   const preserve: DocumentPatch[] = [];
   for (const page of document.pages) {
