@@ -17,7 +17,11 @@ the .deb picks it itself when WAYLAND_DISPLAY is set. It runs once per composito
 
 The check:
 
-1. starts the compositor with XWayland, then the package with no GDK_BACKEND of its own;
+1. starts the compositor with XWayland, then the package with no GDK_BACKEND of its own. Under
+   KWin it first writes [Xwayland] XwaylandEisNoPrompt=true to the session's own kwinrc, so
+   KWin accepts XWayland's emulated (XTEST) input without its "Remote Control" prompt
+   (Session.preauthorize_kwin_input cites the KWin source), and it logs the input path and
+   whether that prompt (kwin_eis_prompter) appeared;
 2. pastes propane with Edit > Paste and records the document's chemistry with Edit > Select All,
    Edit > Copy As > SMILES and Edit > Copy (the native selection JSON);
 3. opens Drawn Structure Settings from View > Toolbars, whose number fields are enabled only
@@ -141,6 +145,7 @@ class Session:
         self.server = None
         self.app = None
         self.main_pid = None
+        self.prompter_seen = False
 
     def __enter__(self):
         return self
@@ -212,6 +217,7 @@ class Session:
                           f"mv '{reported}.tmp' '{reported}'\n"
                           "exec sleep 86400\n")
         helper.chmod(0o755)
+        self.preauthorize_kwin_input()
         # QPainter compositing needs no GPU or EGL device in the container.
         environment = {**os.environ, "KWIN_COMPOSE": "Q"}
         self.server = subprocess.Popen(
@@ -227,6 +233,68 @@ class Session:
             return display
 
         return ready
+
+    def preauthorize_kwin_input(self):
+        """Let XWayland's emulated input through KWin without the "Remote Control" prompt.
+
+        KWin 6 hands XWayland a libei socket (LIBEI_SOCKET, src/plugins/eis/eisbackend.cpp:57
+        in v6.7.4, :58 in v6.8.3), and XWayland sends XTEST input, such as xdotool's, through
+        it. When XWayland connects, XWaylandEisContext::connectionRequested
+        (src/plugins/eis/xwaylandeiscontext.cpp:42 in v6.7.4, :46 in v6.8.3) accepts it at
+        once if options->xwaylandEisNoPrompt() is true or the client name is listed in
+        xwaylandEisNoPromptApps(). Otherwise it starts kwin_eis_prompter, the "Remote Control"
+        window, and holds every emulated event until someone presses Allow. Both settings are
+        kwinrc entries in group [Xwayland] (src/kwin.kcfg:328 and :352-355, default false in
+        both versions), read at startup (src/options.cpp:739-740 in v6.7.4, :743-744 in
+        v6.8.3) from the kwinrc that KSharedConfig finds under XDG_CONFIG_HOME
+        (src/main.cpp:84 in v6.7.4, :86 in v6.8.3). start_display points XDG_CONFIG_HOME at
+        this session's own folder, so this changes only the throwaway session.
+        """
+        kwinrc = Path(os.environ["XDG_CONFIG_HOME"]) / "kwinrc"
+        kwinrc.write_text("[Xwayland]\nXwaylandEisNoPrompt=true\n")
+        print(f"KWin input emulation pre-authorized: wrote [Xwayland] XwaylandEisNoPrompt=true "
+              f"to {kwinrc}, so XWayland's XTEST input should not raise kwin_eis_prompter",
+              flush=True)
+
+    def report_input_path(self, moment):
+        """Under KWin, log how XTEST input reaches the compositor and whether KWin's input
+        emulation prompt (kwin_eis_prompter, the "Remote Control" window) is up."""
+        if self.compositor != "kwin":
+            return
+        try:
+            xwayland = []
+            prompters = []
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    command = (entry / "cmdline").read_bytes().split(b"\0")
+                    name = os.path.basename(command[0].decode(errors="replace"))
+                    if name == "Xwayland":
+                        environ = (entry / "environ").read_bytes().split(b"\0")
+                        xwayland.append((entry.name, any(item.startswith(b"LIBEI_SOCKET=")
+                                                         for item in environ)))
+                    elif name == "kwin_eis_prompter":
+                        prompters.append(entry.name)
+                except (OSError, IndexError):
+                    continue
+            windows = (diag("xdotool", "search", "--classname", "kwin_eis_prompter") or "").split()
+            windows = [window for window in windows if window.isdigit()]
+            if prompters or windows:
+                self.prompter_seen = True
+            if not xwayland:
+                path = "unknown (no Xwayland process found)"
+            elif any(libei for _, libei in xwayland):
+                path = ("XTEST from xdotool -> XWayland -> libei (LIBEI_SOCKET from KWin) -> "
+                        "KWin's XWayland EIS context")
+            else:
+                path = "XTEST from xdotool, handled inside XWayland (no LIBEI_SOCKET, no libei)"
+            print(f"KWin input path {moment}: {path}; Xwayland pids "
+                  f"{[pid for pid, _ in xwayland]}; kwin_eis_prompter processes {prompters}, "
+                  f"windows {windows}; prompter seen this run: "
+                  f"{'yes' if self.prompter_seen else 'no'}", flush=True)
+        except Exception as error:  # diagnostics must never fail the run
+            print(f"KWin input path {moment}: unknown ({error})", flush=True)
 
     def server_alive(self):
         if self.server.poll() is not None:
@@ -647,6 +715,7 @@ def move_pointer(session, x, y):
         ei = [line for line in (session.logs / "display.log").read_text(errors="replace")
               .splitlines() if "xwayland ei" in line.lower()]
         print_scan("XWayland libei lines in display.log:", ei)
+        session.report_input_path("after a slow pointer move")
     return location
 
 
@@ -826,6 +895,7 @@ def type_into_field(session, Atspi, settings):
         after = None
     finally:
         report_app_focus_log(session)
+        session.report_input_path("after typing")
     if after is not None:
         print(f"Typing {TYPED!r} changed {name!r} from {before!r} to {after!r}", flush=True)
     # Discard any draft so no setting is committed.
@@ -844,6 +914,7 @@ def main(bundle, package, logs, compositor):
                  "The Main Toolbar window did not appear", seconds=30, interval=1)
         Atspi = atspi()
         report_focus(Atspi, session.main_pid, "after startup")
+        session.report_input_path("after startup")
         before = paste_propane(session, Atspi, document)
         print(f"Document before typing: {before[0].decode()} {before[1]}", flush=True)
 

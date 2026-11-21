@@ -152,6 +152,14 @@ not run it: Weston has no protocol that lets a test client type into another cli
 `xdotool` reaches X11 windows only. KWin and Weston still differ from Mutter and other X window
 managers, so a pass does not prove focus handling under every desktop.
 
+KWin 6 routes XWayland's XTEST input, which is what `xdotool` sends, through libei, and by default
+it holds that input behind a "Remote Control" prompt (`kwin_eis_prompter`) until someone presses
+Allow. Before starting KWin, the check writes `XwaylandEisNoPrompt=true` in group `[Xwayland]` to
+the `kwinrc` in the session's own `XDG_CONFIG_HOME`. That is the setting System Settings' "Legacy
+X11 App Support" page writes, and it makes KWin accept XWayland's input without asking (KWin 6.7.4
+and 6.8.3, `src/kwin.kcfg` and `src/plugins/eis/xwaylandeiscontext.cpp`). The log says which input
+path XWayland used (libei when its process has `LIBEI_SOCKET`) and whether the prompt appeared.
+
 Weston cannot test click-to-focus, whatever the app does, so its run is not a focus gate; it
 keeps its setup, accessibility and chemistry checks. Weston's X window
 manager gives X focus only to the window the compositor last activated and resets any other
