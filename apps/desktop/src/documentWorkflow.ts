@@ -21570,7 +21570,7 @@ function nativeMoleculeAfterPartDelete(
   return refreshNativeSingleBondGraph(molecule, atoms, bonds);
 }
 
-function refreshNativeSingleBondGraph(
+export function refreshNativeSingleBondGraph(
   molecule: MoleculeObject,
   atoms: readonly MoleculeAtom[],
   bonds: readonly MoleculeBond[]

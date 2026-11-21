@@ -225,6 +225,7 @@ import { createPersistentPluginStorage } from "./plugins/pluginStorage";
 import {
   applyAcceptedPluginProposal,
   applyPluginDocumentPatch,
+  refreshPluginPatchChemistry,
   placeInsertedObjectsInFreeSpace,
   createPluginWriteGate,
   describePatchFailure,
@@ -1841,7 +1842,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.20.21.40-sonnet";
+const CURRENT_BUILD_STAMP = "11.20.21.50-sonnet";
 const TABLE_DRAFT_RECOVERY_WARNING = "session.tableDraftDropped";
 
 function clearTableDraftRecoveryWarnings(report: OpenWarningsReport | undefined): OpenWarningsReport | undefined {
@@ -13125,8 +13126,9 @@ export function MainWindow({
   // to the session's snapshot as well was the alternative, but every session keeps its snapshot in a
   // different shape; one predicate is easier to keep true than two dozen snapshot rewrites.
   const pluginWriteGateRef = useRef<PluginWriteGate | undefined>(undefined);
+  const pluginChemistryPendingRef = useRef(false);
   useEffect(() => {
-    const gate = createPluginWriteGate({ isGestureActive: isSnapshotSessionActive });
+    const gate = createPluginWriteGate({ isGestureActive: () => pluginChemistryPendingRef.current || isSnapshotSessionActive() });
     pluginWriteGateRef.current = gate;
     // Sessions end on a release; check right after the canvas handlers have committed (window listeners
     // run after React's). The gate's own timer covers endings that are not a release (a double-click).
@@ -13234,18 +13236,30 @@ export function MainWindow({
             });
           }
         }
-        const prepared = normalizeCommittedDocument(placed);
+        const authored = rebasePluginPatch(before, patch);
+        const normalized = normalizeCommittedDocument(placed);
+        const refreshed = refreshPluginPatchChemistry(before, normalized, authored, writeScopeObjectIds, signal);
+        const isCurrent = () => mountedRef.current && !quitInteractionRef.current && documentIdentityRef.current === documentIdentity &&
+          assistantDocumentContentUnchanged(before, documentRef.current, { checkBracketIdentity: true });
+        let prepared = normalized;
+        if (refreshed) {
+          pluginChemistryPendingRef.current = true;
+          try { prepared = await refreshed; } finally { pluginChemistryPendingRef.current = false; }
+          signal?.throwIfAborted();
+          if (!isCurrent() || isSnapshotSessionActive()) {
+            throw new Error("The drawing changed while refreshing stored chemistry. Try the plugin command again.");
+          }
+        }
         let committed = prepared;
         const pending = commitWithPageFit(before, prepared, (document, fitBaseline) => {
           // Compare the fitted commit against the original pages plus their consented deltas.
           const baseline = fitBaseline(before);
-          const authoredPatch = rebasePluginPatch(before, patch).patch;
           let cleanup: ReturnType<typeof finishScopedRepeatUnitCleanup>;
           const assertFinalDocument = (document: ChemDraftDocument) => {
             assertPluginDocumentWriteScope(baseline, document, patch, writeScopeObjectIds);
             signal?.throwIfAborted();
             pluginRuntimeRef.current!.host.requirePermission(plugin.id, "document.write");
-            cleanup = finishScopedRepeatUnitCleanup(repeatUnitCleanup, before, document, authoredPatch);
+            cleanup = finishScopedRepeatUnitCleanup(repeatUnitCleanup, before, document, authored.patch);
             committed = cleanup?.document ?? document;
             return committed;
           };
@@ -13255,8 +13269,7 @@ export function MainWindow({
           cleanup?.record();
         }, { // Allocate request consent only if page fitting actually needs a question.
           get consent() { return assistantTxId ? assistantTransactions.pageEnlargementConsent(assistantTxId, shortcutPlatform) : consent; }, signal,
-          isCurrent: () => mountedRef.current && !quitInteractionRef.current && documentIdentityRef.current === documentIdentity &&
-          assistantDocumentContentUnchanged(before, documentRef.current, { checkBracketIdentity: true }) });
+          isCurrent });
         if (pending) {
           pageFitPendingRef.current += 1;
           try { await pending; } finally { pageFitPendingRef.current -= 1; }
@@ -13543,7 +13556,7 @@ export function MainWindow({
   }, [pluginRuntime.detachedPanels]);
 
   // The user accepting a proposal is the review step itself, so it goes through the host's user path
-  // (`acceptProposedPatch`), never the plugin-gated `documents.applyPatch`. What was inserted is
+  // (`acceptProposedPatch`), never the plugin-gated `documents.applyPatch`. What changed is
   // selected in the same history entry, and every outcome — success included — is reported: the
   // status line here, and the review window through the returned outcome.
   const acceptPluginProposal = useCallback(
@@ -13601,14 +13614,22 @@ export function MainWindow({
           }
         }
         prepared = normalizeCommittedDocument(prepared);
+        const authored = rebasePluginPatch(before, proposal.proposal, true);
+        const isCurrent = () => mountedRef.current && !quitInteractionRef.current &&
+          activeDocumentTabIdRef.current === tab.id && documentIdentityRef.current === documentIdentity &&
+          assistantDocumentContentUnchanged(before, documentRef.current, { checkBracketIdentity: true });
+        const refreshed = refreshPluginPatchChemistry(before, prepared, authored);
+        if (refreshed) {
+          prepared = await refreshed;
+          if (!isCurrent() || isSnapshotSessionActive()) {
+            throw new Error("The drawing changed or is busy; accept the proposal again.");
+          }
+        }
         // Keep the proposal pending until the page question and stale-document check succeed.
         const pending = commitWithPageFit(before, prepared, document => {
           const updated = host.acceptProposedPatch(proposal.id, documentRef.current, { apply: () => document });
           commitDocumentChange(updated, `${pluginName}: ${recognized ? "Insert Recognized Structure" : "Apply Proposal"}`);
-        }, { consent: new PageEnlargementConsent(shortcutPlatform), isCurrent: () =>
-          mountedRef.current && !quitInteractionRef.current && documentIdentityRef.current === documentIdentity &&
-          assistantDocumentContentUnchanged(before, documentRef.current, { checkBracketIdentity: true })
-        });
+        }, { consent: new PageEnlargementConsent(shortcutPlatform), isCurrent });
         if (pending) {
           pageFitPendingRef.current += 1;
           try { await pending; } finally { pageFitPendingRef.current -= 1; }
