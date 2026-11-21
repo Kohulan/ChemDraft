@@ -175,7 +175,12 @@ fn kind_spec(kind: &str) -> Result<DialogKindSpec, String> {
 fn native_window_title(kind: &str, spec_title: &str, snapshot_title: &str) -> String {
     if matches!(
         kind,
-        "engineInstall" | "toolInstall" | "vibeCodeGuide" | "guidedTour" | "about" | "pageEnlargement"
+        "engineInstall"
+            | "toolInstall"
+            | "vibeCodeGuide"
+            | "guidedTour"
+            | "about"
+            | "pageEnlargement"
     ) {
         snapshot_title.to_string()
     } else {
