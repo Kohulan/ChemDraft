@@ -136,6 +136,7 @@ OPSIN archive versions and license exceptions are recorded in `NOTICE` and the [
 | `sha2` | Verifies downloaded artifacts against their pinned SHA-256. | MIT OR Apache-2.0 | Desktop native runtime | License and version from the locked crate. |
 | `libc` | Unix process and filesystem calls, including macOS single-instance locking. | MIT OR Apache-2.0 | Desktop native runtime | License and version from the locked crate. |
 | `gtk` | Linux clipboard and utility-window integration. | MIT | Desktop native runtime | License and version from the locked crate. |
+| `webkit2gtk` 2.0.2 | Rust binding to WebKitGTK, used on Linux to match Tauri's platform webview type for the web-process-terminated signal. | MIT | Desktop native runtime, Linux only | Pinned `=2.0.2` under `[target.'cfg(target_os = "linux")'.dependencies]`; version and checksum from `Cargo.lock`. The Rust binding is statically compiled into the Linux build only. The WebKitGTK system library itself is a dynamically linked OS package (LGPL-2.1+ / BSD), not shipped by ChemDraft, and absent from the macOS and Windows builds. |
 | `block2` | Objective-C blocks used by the macOS AppKit bridge. | MIT | Desktop native runtime | License and version from the locked crate. |
 | `dirs` | Resolves the macOS app-data directory. | MIT OR Apache-2.0 | Desktop native runtime | License and version from the locked crate. |
 | `objc2` | Rust bindings for the Objective-C runtime used by the macOS desktop shell. | MIT | Desktop native runtime | License and version from the locked crate. |

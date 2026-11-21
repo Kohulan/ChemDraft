@@ -244,6 +244,14 @@
       ],
       "from": "license file"
     },
+    "cargo:webkit2gtk@2.0.2": {
+      "holders": [
+        "Copyright (c) 2016 Boucher, Antoni",
+        "Copyright (c) 2017-2021, The Gtk-rs Project Developers",
+        "Copyright (c) 2021, Tauri Programme within The Commons Conservancy"
+      ],
+      "from": "license file"
+    },
     "cargo:webpki-roots@1.0.9": {
       "holders": [
         "see license"
