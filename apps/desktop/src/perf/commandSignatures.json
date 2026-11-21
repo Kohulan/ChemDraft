@@ -272,6 +272,14 @@
     "returnType": "()"
   },
   {
+    "file": "first_paint.rs",
+    "name": "window_first_paint",
+    "async": false,
+    "generics": "",
+    "parameters": "window: WebviewWindow",
+    "returnType": "Result<(), String>"
+  },
+  {
     "file": "fonts.rs",
     "name": "list_system_fonts",
     "async": true,
