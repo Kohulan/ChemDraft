@@ -22,7 +22,7 @@ def wait_for(check, description, seconds=20):
             time.sleep(0.5)
 
 
-def check_toolbars_menu(pid):
+def check_toolbars_menu(pid, window):
     import gi
 
     gi.require_version("Atspi", "2.0")
@@ -59,9 +59,23 @@ def check_toolbars_menu(pid):
             app = next((child for child in children(desktop) if child.get_process_id() == pid), None)
             if app is None:
                 raise SmokeFailure(f"process {pid} never registered with AT-SPI")
-            bar = menu_bar(named_child(app, "ChemDraft"))
-            if bar is None:
-                raise SmokeFailure("the document has no accessible native menu bar")
+            # The document title follows the active tab, so find the document frame by role: it is
+            # the only ChemDraft toplevel with a GTK menu bar. Palettes carry no menu bar.
+            frames = [(frame, menu_bar(frame)) for frame in children(app) if frame.get_role() == Atspi.Role.FRAME]
+            frames = [(frame, bar) for frame, bar in frames if bar is not None]
+            if not frames:
+                raise SmokeFailure("no ChemDraft frame has an accessible native menu bar")
+            # Cross-check against the X window the harness found by WM_CLASS and transient state.
+            x_title = subprocess.run(["xdotool", "getwindowname", window], capture_output=True,
+                                     text=True, timeout=5).stdout.strip()
+            matching = [(frame, bar) for frame, bar in frames if frame.get_name() == x_title]
+            if len(matching) == 1:
+                frames = matching
+            elif len(frames) != 1:
+                names = [frame.get_name() for frame, _ in frames]
+                raise SmokeFailure(f"{len(frames)} frames have menu bars {names!r}; none unique for X window {x_title!r}")
+            frame, bar = frames[0]
+            print(f"GTK document frame: {frame.get_name()!r} (X window title {x_title!r})", flush=True)
             toolbars = named_child(named_child(bar, "View"), "Toolbars")
             entries = [row.get_name() for row in children(toolbars) if row.get_role() == Atspi.Role.CHECK_MENU_ITEM]
         except GLib.Error as error:
@@ -160,7 +174,7 @@ def check_clipboard(window, logs):
 
 if __name__ == "__main__":
     try:
-        check_toolbars_menu(int(sys.argv[1]))
+        check_toolbars_menu(int(sys.argv[1]), sys.argv[2])
     except (ImportError, ValueError, SmokeFailure) as error:
         sys.exit(f"::error::GTK Toolbars menu check failed: {error}")
     try:

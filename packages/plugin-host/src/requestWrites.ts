@@ -25,7 +25,9 @@ export interface RequestPageFit {
   project(document: ChemDraftDocument): ChemDraftDocument;
 }
 export interface RequestPageSpaceProvider {
-  confirm(signal: AbortSignal): Promise<RequestPageChoice>;
+  /** `documentKey` is the request document's `RequestDocument.key`, so the host can own the question
+   * by the document the request started in, whichever document is active when it is asked. */
+  confirm(signal: AbortSignal, documentKey: string): Promise<RequestPageChoice>;
   plan(before: ChemDraftDocument, proposed: ChemDraftDocument,
     minimum?: { pageId: string; width: number; height: number }): RequestPageFit;
 }

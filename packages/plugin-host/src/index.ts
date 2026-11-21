@@ -1452,7 +1452,7 @@ export class PluginHost {
     try {
       if (!state.pageChoice) {
         const deadline = setTimeout(cancel, 300_000);
-        const choice = Promise.resolve().then(() => wait.signal.aborted ? "unanswered" : this.requestPageSpace!.confirm(wait.signal));
+        const choice = Promise.resolve().then(() => wait.signal.aborted ? "unanswered" : this.requestPageSpace!.confirm(wait.signal, state.document.key));
         const answer = waitForPageChoice(choice, wait.signal).then(result => {
           if (result !== "unanswered") checkCurrent();
           const answer = { requestId: state.id, key, pages, outcome: result };
