@@ -8,7 +8,7 @@ import {
   marksFollowAtoms, structureEditChemistry, structureEditorChemistry, structurallyEditedMoleculeKeys
 } from "./commitChemistryGuard";
 import * as workflow from "./documentWorkflow";
-import { dropMark, dropMolecule, electronMarkDropFixture } from "./testSupport/electronMarkDropFixture";
+import { ammoniumElectronMarkDropFixture, dropMark, dropMolecule, electronMarkDropFixture } from "./testSupport/electronMarkDropFixture";
 
 // The commit funnel's chemistry guard (AGENTS.md section 7). These cases pin the one comparison it
 // makes; MainWindow.pasteRefusal.dom.test.tsx drives it through a real paste.
@@ -219,6 +219,53 @@ describe("the commit check against commit normalization", () => {
       { op: "updateObject", objectId: mark.id, changes: { y: mark.y + 200 } }
     ], { now: phase4Timestamp });
     expect(check(selected, carried, "move")).toEqual([]);
+  });
+
+  it.each([
+    { name: "rotate", transform: (document: ChemDraftDocument, moleculeId: string) =>
+      workflow.rotateDocumentObject(document, moleculeId, 90) },
+    { name: "scale", transform: (document: ChemDraftDocument, moleculeId: string, center: { x: number; y: number }) =>
+      workflow.scaleDocumentObjectsAroundPoint(document, [moleculeId], center, 2, 2) }
+  ])("exempts nothing when a lone marked atom is turned or scaled about itself ($name): the mark moved with its atom", ({ transform }) => {
+    // Review 2 P2b(i): turning or scaling a one-atom molecule about its atom leaves the atom's
+    // coordinates and frame as they were but carries its mark (the molecule's transform changed).
+    // The mark followed its atom, so it explains no change: N's chemistry must stay as it was.
+    const { document, nitrogen } = ammoniumElectronMarkDropFixture();
+    const molecule = dropMolecule(document), mark = dropMark(document);
+    const selected = workflow.selectDocumentObjects(document, document.pages[0].id, [molecule.id, mark.id]);
+    // As the commit funnel runs it: the transform, then the charge-follows rule.
+    const turned = workflow.followElectronMarksWithMovedAtoms(selected,
+      transform(selected, molecule.id, { x: nitrogen.x, y: nitrogen.y })).document;
+    const center = workflow.nativeChargeMarkCenter(mark), nextCenter = workflow.nativeChargeMarkCenter(dropMark(turned));
+    expect(Math.hypot(nextCenter.x - center.x, nextCenter.y - center.y), "the transform carries the mark").toBeGreaterThan(1);
+    expect(dropMolecule(turned).atoms[0]).toMatchObject({ x: nitrogen.x, y: nitrogen.y });
+    // Done right, the chemistry is unchanged and the move passes.
+    expect(check(selected, turned, "rotate")).toEqual([]);
+    // N's charge changing with it is refused: a pure move has no exempt atom.
+    const recharged = withAtomChanges(turned, molecule.id, atoms => atoms.map(atom =>
+      atom.id === nitrogen.id ? { ...atom, formalCharge: atom.formalCharge + 1 } : atom));
+    expect(check(selected, recharged, "rotate")).toEqual([expect.stringMatching(new RegExp(
+      `^Cannot rotate without changing the chemistry of molecule "${molecule.id}": its atom "${nitrogen.id}" would have charge 2 `))]);
+  });
+
+  it("keeps a mark drop's exemption when other atoms of its molecule change the molecule's bounds", () => {
+    // Review 2 P2b(ii): the + is dropped off N while another atom (the terminal methyl) moves and
+    // widens the molecule's frame. N itself stayed put, so the + moved by itself: N losing its
+    // charge is the drop's own business, and the drop commits.
+    const { document, nitrogen } = electronMarkDropFixture();
+    const molecule = dropMolecule(document), mark = dropMark(document);
+    const selected = workflow.selectDocumentObjects(document, document.pages[0].id, [molecule.id, mark.id]);
+    const methyl = molecule.atoms[0];
+    const dropped = applyPatches(selected, [
+      { op: "updateObject", objectId: molecule.id, changes: { x: molecule.x - 40, width: molecule.width + 40,
+        atoms: molecule.atoms.map(atom => atom.id === methyl.id ? { ...atom, x: atom.x - 40 } : atom) } },
+      { op: "updateObject", objectId: mark.id, changes: {
+        x: mark.x + 200, y: mark.y + 200, anchor: { kind: "point", point: { x: mark.x + 200, y: mark.y + 200 } }, atomAssociation: "explicit" } }
+    ], { now: phase4Timestamp });
+    expect(dropMolecule(dropped).atoms.find(atom => atom.id === nitrogen.id)).toMatchObject({ x: nitrogen.x, y: nitrogen.y });
+    expect(moleculeById(workflow.normalizeCommittedDocument(dropped), molecule.id)
+      .atoms.find(atom => atom.id === nitrogen.id)).toMatchObject({ formalCharge: 0 });
+    expect(check(selected, dropped, "move")).toEqual([]);
   });
 
   it("refuses a move that changes any molecule's chemistry, moved or not", () => {

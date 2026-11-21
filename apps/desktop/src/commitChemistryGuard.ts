@@ -1,5 +1,6 @@
 import type { ChemDraftDocument, DocumentPage, ElectronMarkObject, MoleculeAtom, MoleculeObject } from "@chemdraft/chem-core";
 import { electronMarkAtomContribution } from "@chemdraft/document-workflow-core";
+import { transformPointForObject } from "@chemdraft/layout-engine";
 
 /**
  * The commit-time chemistry guard (AGENTS.md section 7: an operation that is not a chemistry edit
@@ -401,6 +402,23 @@ function selectedTargets(document: ChemDraftDocument): { pageId: string | undefi
   return { pageId, ids };
 }
 
+/** Page positions closer than this are the same place (frame rotation leaves float noise). */
+const ATOM_PAGE_EPSILON_PX = 1e-6;
+
+/** Whether `atom` of `molecule` and `after` of `moved` are drawn at different page positions. */
+function atomPageMoved(molecule: MoleculeObject, atom: MoleculeAtom, moved: MoleculeObject, after: MoleculeAtom): boolean {
+  const p = transformPointForObject(molecule, atom), q = transformPointForObject(moved, after);
+  return Math.hypot(q.x - p.x, q.y - p.y) > ATOM_PAGE_EPSILON_PX;
+}
+
+/** Whether the molecule's stored transform (scale, rotation, tilt) changed; absent is the identity. */
+function moleculeTransformChanged(molecule: MoleculeObject, moved: MoleculeObject): boolean {
+  const state = (object: MoleculeObject) => [object.transform?.scaleX ?? 1, object.transform?.scaleY ?? 1,
+    object.transform?.rotationDegrees ?? 0, object.transform?.tiltXDegrees ?? 0, object.transform?.tiltYDegrees ?? 0];
+  const before = state(molecule), after = state(moved);
+  return before.some((value, index) => Math.abs(value - after[index]) > 1e-9);
+}
+
 /**
  * Atoms whose change a selected charge or radical mark moved BY ITSELF explains: the atoms the mark
  * is attributed to in each of `documents`, on the selection's page. A mark counts as moved when the
@@ -426,16 +444,24 @@ export function movedSelectedMarkAtomKeys(
   const nextMarks = new Map((nextPage?.objects ?? [])
     .flatMap((object) => object.type === "electron-mark" ? [[object.id, object] as const] : []));
   const molecules = moleculesById(page), nextMolecules = moleculesById(nextPage);
-  // Whether the operation moved the atom the mark belonged to before it: its molecule's placement
-  // or the atom's own position changed.
+  // Whether the operation moved the atom the mark belonged to before it, read from the atom itself
+  // (review 2 P2b), never from the molecule's frame size (another atom moving changes that):
+  // - its page position changed (its coordinates under the molecule's frame rotation); or
+  // - the molecule's transform changed (a turn or scale about this very atom, such as a lone atom
+  //   turned or scaled about itself, carries its marks while the atom stays put); or
+  // - every other atom of the molecule moved: the whole molecule was turned, flipped or scaled
+  //   with this atom as its fixed point.
+  // A mark moved while none of these holds moved by itself.
   const ownAtomMoved = (mark: ElectronMarkObject) => markAtoms(page, mark).some((owner) => {
     const molecule = molecules.get(owner.objectId), moved = nextMolecules.get(owner.objectId);
     if (!molecule || !moved || moved === molecule) return false;
-    if (moved.x !== molecule.x || moved.y !== molecule.y || moved.width !== molecule.width ||
-      moved.height !== molecule.height || moved.rotation !== molecule.rotation) return true;
     const atom = molecule.atoms.find((candidate) => candidate.id === owner.atomId);
     const after = moved.atoms.find((candidate) => candidate.id === owner.atomId);
-    return atom !== undefined && after !== undefined && (after.x !== atom.x || after.y !== atom.y);
+    if (!atom || !after) return false;
+    if (atomPageMoved(molecule, atom, moved, after) || moleculeTransformChanged(molecule, moved)) return true;
+    const nextAtoms = new Map(moved.atoms.map((candidate) => [candidate.id, candidate]));
+    const others = molecule.atoms.filter((candidate) => candidate.id !== atom.id && nextAtoms.has(candidate.id));
+    return others.length > 0 && others.every((candidate) => atomPageMoved(molecule, candidate, moved, nextAtoms.get(candidate.id)!));
   });
   const moved = new Set<string>();
   for (const mark of page.objects) {

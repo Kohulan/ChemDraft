@@ -59,10 +59,14 @@ function expectCommittedWithMarkKept(before: ChemDraftDocument, moved: ChemDraft
   return committed;
 }
 
-/** Turn or mirror every atom of the molecule about N, leaving the mark where it was. */
+/**
+ * Turn or mirror every atom of the molecule about a point just off N (so N moves too), leaving the
+ * mark where it was. A turn about N itself leaves N, and so its mark, in place (review 2 P2a).
+ */
 function mapAtomsAboutNitrogen(document: ChemDraftDocument, nitrogenId: string, map: (offset: Point) => Point) {
   const molecule = dropMolecule(document);
-  const pivot = molecule.atoms.find(atom => atom.id === nitrogenId)!;
+  const nitrogen = molecule.atoms.find(atom => atom.id === nitrogenId)!;
+  const pivot = { x: nitrogen.x + 7, y: nitrogen.y + 5 };
   const atoms = molecule.atoms.map(atom => {
     const next = map({ x: atom.x - pivot.x, y: atom.y - pivot.y });
     return { ...atom, x: pivot.x + next.x, y: pivot.y + next.y };
@@ -99,7 +103,7 @@ describe.each(["atom", "bond"] as const)("charge always follows: the shared rule
     expect(Math.hypot(kept.x, kept.y)).toBeCloseTo(Math.hypot(original.x, original.y), 3);
   });
 
-  it("a quarter turn of the atoms about N turns the mark's offset with them", () => {
+  it("a quarter turn of all the atoms turns the mark's offset with them", () => {
     const { document, nitrogenId } = chargedNitrogen(kind);
     const turned = mapAtomsAboutNitrogen(document, nitrogenId, ({ x, y }) => ({ x: -y, y: x }));
     const committed = expectCommittedWithMarkKept(document, turned, nitrogenId);
@@ -108,7 +112,7 @@ describe.each(["atom", "bond"] as const)("charge always follows: the shared rule
     expect(kept.y).toBeCloseTo(original.x, 3);
   });
 
-  it("a mirror of the atoms through N mirrors the mark's offset", () => {
+  it("a mirror of all the atoms mirrors the mark's offset", () => {
     const { document, nitrogenId } = chargedNitrogen(kind);
     const mirrored = mapAtomsAboutNitrogen(document, nitrogenId, ({ x, y }) => ({ x, y: -y }));
     const committed = expectCommittedWithMarkKept(document, mirrored, nitrogenId);
@@ -222,6 +226,51 @@ describe.each(["atom", "bond"] as const)("charge always follows: review fixes (%
     expect(translated.x).toBeCloseTo(original.x, 6);
     expect(translated.y).toBeCloseTo(original.y, 6);
   });
+});
+
+describe("charge always follows: an unmoved atom keeps its mark (review 2 P2a)", () => {
+  /** Tetramethylammonium: N+ at the centre, its four methyls symmetric about it, the charge tool's mark on N. */
+  function chargedTetramethylammonium() {
+    const fixture = electronMarkDropFixture(), molecule = dropMolecule(fixture.document);
+    const graph = testMoleculeFromSmiles("CN(C)(C)C");
+    expect(graph.atoms.map(atom => atom.element)).toEqual(["C", "N", "C", "C", "C"]);
+    const n = { x: 228, y: 250 };
+    const points = [{ x: n.x - 22, y: n.y }, n, { x: n.x + 22, y: n.y }, { x: n.x, y: n.y - 22 }, { x: n.x, y: n.y + 22 }];
+    const atoms = graph.atoms.map((atom, index) => ({ ...atom, ...points[index] }));
+    let document = applyPatches(fixture.document, [
+      { op: "removeObject", objectId: dropMark(fixture.document).id },
+      { op: "updateObject", objectId: molecule.id, changes: {
+        x: n.x - 22, y: n.y - 22, width: 44, height: 44, atoms, bonds: graph.bonds,
+        structure: nativeSingleBondGraphSmiles(atoms, graph.bonds), chemistry: nativeSingleBondGraphMetadata(atoms, graph.bonds)
+      } }
+    ], { now: phase4Timestamp });
+    document = workflow.normalizeCommittedDocument(workflow.applyChargeToolAtNativeAtom(document, 1,
+      { kind: "atom", objectId: molecule.id, atomId: atoms[1].id, distanceToPointer: 0 }));
+    return { document, nitrogenId: atoms[1].id, methylIds: [atoms[0].id, atoms[2].id, atoms[3].id, atoms[4].id] };
+  }
+
+  it.each(["turn", undefined] as const)(
+    "the four methyls turned about the unselected N leave N's mark exactly where it was (motion %s)", motion => {
+      // Every atom, N included, fits the same quarter turn about N; N did not move, so its mark
+      // must neither move nor turn (it was treated as a whole-molecule turn and turned with it).
+      const { document, nitrogenId, methylIds } = chargedTetramethylammonium();
+      const molecule = dropMolecule(document), mark = dropMark(document);
+      expect(owner(document, mark.id)).toEqual({ objectId: molecule.id, atomId: nitrogenId });
+      const nitrogen = molecule.atoms.find(atom => atom.id === nitrogenId)!;
+      const turned = workflow.rotateNativeMoleculeParts(document,
+        { objectId: molecule.id, kind: "parts", atomIds: methylIds, bondIds: [] }, 90);
+      const nAfter = dropMolecule(turned).atoms.find(atom => atom.id === nitrogenId)!;
+      expect(nAfter, "N is the pivot").toMatchObject({ x: nitrogen.x, y: nitrogen.y });
+      expect(dropMolecule(turned).atoms.find(atom => atom.id === methylIds[0])!.x, "the methyls turned")
+        .not.toBeCloseTo(molecule.atoms.find(atom => atom.id === methylIds[0])!.x, 3);
+      const followed = workflow.followElectronMarksWithMovedAtoms(document, turned, motion ? { motion } : {});
+      expect(followed.followedMarkIds.has(mark.id)).toBe(false);
+      expect(markCenter(followed.document)).toEqual(markCenter(document));
+      expect(dropMark(followed.document).rotation).toBe(mark.rotation);
+      const committed = workflow.normalizeCommittedDocument(followed.document);
+      expect(owner(committed, mark.id)).toEqual({ objectId: molecule.id, atomId: nitrogenId });
+      expect(dropMolecule(committed).atoms.map(chemistry)).toEqual(molecule.atoms.map(chemistry));
+    });
 });
 
 describe("charge always follows: a two-atom molecule mirrored or turned by an edit that does not say which", () => {

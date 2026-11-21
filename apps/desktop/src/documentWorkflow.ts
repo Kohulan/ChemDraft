@@ -14092,13 +14092,15 @@ function fittedOffsetMap(from: readonly PagePoint[], to: readonly PagePoint[], m
 }
 
 /**
- * How a molecule's atoms moved: the offset map, and whether it maps the WHOLE molecule. A
- * whole-molecule transform (translate, rotate, flip, scale) maps every atom, an atom it leaves in
- * place (the pivot of a turn) included. A part move or turn maps only the atoms it displaced: an
- * atom it left in place keeps its marks exactly where they were. A relayout (Clean Up, 3D
- * flatten) that no single map explains translates each mark with its own atom, keeping its offset.
+ * How a molecule's atoms moved: the offset map a moved atom's marks are turned, mirrored or scaled
+ * by. Fitted to every atom when one map explains them all (a whole-molecule translate, rotate,
+ * flip or scale), else to the atoms the edit displaced (a part move or turn). A relayout (Clean
+ * Up, 3D flatten) that no single map explains translates each mark with its own atom, keeping its
+ * offset. The map applies only to marks of atoms that moved: whether an atom moved is read from
+ * its own page position, never from the fit (an atom a turn leaves in place keeps its marks
+ * exactly where they were, even when every atom fits the turn).
  */
-function moleculeOffsetMap(before: MoleculeObject, after: MoleculeObject, motion?: AtomMotion): { map: OffsetMap; whole: boolean } {
+function moleculeOffsetMap(before: MoleculeObject, after: MoleculeObject, motion?: AtomMotion): OffsetMap {
   const afterAtoms = new Map(after.atoms.map((atom) => [atom.id, atom]));
   const from: PagePoint[] = [], to: PagePoint[] = [], movedFrom: PagePoint[] = [], movedTo: PagePoint[] = [];
   for (const atom of before.atoms) {
@@ -14109,11 +14111,11 @@ function moleculeOffsetMap(before: MoleculeObject, after: MoleculeObject, motion
     if (Math.hypot(q.x - p.x, q.y - p.y) > MARK_FOLLOW_EPSILON_PX) { movedFrom.push(p); movedTo.push(q); }
   }
   const whole = fittedOffsetMap(from, to, motion);
-  if (whole) return { map: whole, whole: true };
+  if (whole) return whole;
   // Two displaced atoms define a turn (rotation, scale, translation) as well as three do; whether
   // it was a turn or a mirror is for the caller's `motion` to say.
   const part = movedFrom.length >= 2 ? fittedOffsetMap(movedFrom, movedTo, motion) : undefined;
-  return { map: part ?? IDENTITY_OFFSET_MAP, whole: false };
+  return part ?? IDENTITY_OFFSET_MAP;
 }
 
 /**
@@ -14168,7 +14170,7 @@ export function followElectronMarksWithMovedAtoms(
     if (!page.objects.some((object) => object.type === "electron-mark")) continue;
     const nextObjects = objectByIdIndex(nextPage.objects);
     // Only molecules whose drawn atoms moved matter; most edits move none.
-    const movedMolecules = new Map<string, { before: MoleculeObject; after: MoleculeObject; fit?: { map: OffsetMap; whole: boolean } }>();
+    const movedMolecules = new Map<string, { before: MoleculeObject; after: MoleculeObject; fit?: OffsetMap }>();
     const changedMoleculeIds = new Set<string>();
     for (const object of page.objects) {
       if (object.type !== "molecule") continue;
@@ -14221,18 +14223,18 @@ export function followElectronMarksWithMovedAtoms(
         continue;
       }
       const from = transformPointForObject(molecules.before, atom), to = transformPointForObject(molecules.after, nextAtom);
-      const { map, whole } = molecules.fit ??= moleculeOffsetMap(molecules.before, molecules.after, options.motion);
-      // An atom left in place moves only under a whole-molecule map (the pivot of a turn of the
-      // molecule). A part map is fitted to the displaced atoms alone: an atom the part move left
-      // in place keeps its marks where they are, offset and all.
-      const atomMoved = Math.hypot(to.x - from.x, to.y - from.y) > MARK_FOLLOW_EPSILON_PX || (whole &&
-        (Math.abs(map.a - 1) > 1e-9 || Math.abs(map.b) > 1e-9 || Math.abs(map.c) > 1e-9 || Math.abs(map.d - 1) > 1e-9));
+      // Whether THIS atom moved is read from its own page position (coordinates under the
+      // molecule's frame rotation), whatever map the molecule's atoms fit: an atom a turn left in
+      // place (its pivot, even when every atom fits the turn) keeps its marks where they are,
+      // offset and all (review 2 P2a). A transform that carried the mark itself is kept below.
+      const atomMoved = Math.hypot(to.x - from.x, to.y - from.y) > MARK_FOLLOW_EPSILON_PX;
       if (!atomMoved) {
         if (!markMoved) stationary.add(mark.id);
         else if (carriedInPlace(mark, next)) followedMarkIds.add(mark.id);
         continue;
       }
       followedMarkIds.add(mark.id);
+      const map = molecules.fit ??= moleculeOffsetMap(molecules.before, molecules.after, options.motion);
       const changes: Partial<ElectronMarkObject> = {};
       if (!markMoved) {
         const ox = center.x - from.x, oy = center.y - from.y;
