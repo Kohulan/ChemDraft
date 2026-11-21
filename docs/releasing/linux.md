@@ -124,9 +124,14 @@ drawing during that entry are skipped because the package harness has no documen
 
 The Debian and Fedora Wayland jobs where ChemDraft uses XWayland (both packages, by default) also
 run `.github/workflows/linux-package-smoke/toolbar-field.py`. It starts its own headless Weston with XWayland, pastes
-propane, opens Drawn Structure Settings from **View > Toolbars** over AT-SPI, clicks into one of its
-number fields with an XTEST click and types `30`. It passes only if the field's value changed and
-the document's Copy As SMILES text and native selection JSON did not. The native Wayland job does
+propane and reads the document back with **Edit > Paste**, **Select All**, **Copy As > SMILES** and
+**Copy**, opens Drawn Structure Settings from **View > Toolbars**, clicks into one of its number
+fields with an XTEST click and types `30`. It chooses every menu command over AT-SPI rather than
+typing its shortcut, because Weston's X window manager decides where X keyboard focus goes and
+can undo a focus change that `xdotool` makes. It first requires that no ChemDraft window other
+than the document has focus, since the Edit commands follow the focused window. It passes only
+if the field's value changed and the document's Copy As SMILES text and native selection JSON
+did not. The native Wayland job does
 not run it: Weston has no protocol that lets a test client type into another client's window, and
 `xdotool` reaches X11 windows only. Weston's own X window manager also differs from KWin and
 Mutter, so a pass does not prove focus handling under every desktop.

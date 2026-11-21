@@ -7,11 +7,18 @@ That is the default for both packages: the AppImage's GTK hook exports GDK_BACKE
 the .deb picks it itself when WAYLAND_DISPLAY is set. The check:
 
 1. starts headless Weston with XWayland, then the package with no GDK_BACKEND of its own;
-2. pastes propane and records the document's chemistry (Copy As SMILES and the native
-   selection JSON);
-3. opens Drawn Structure Settings from View > Toolbars over AT-SPI;
+2. pastes propane with Edit > Paste and records the document's chemistry with Edit > Select All,
+   Edit > Copy As > SMILES and Edit > Copy (the native selection JSON);
+3. opens Drawn Structure Settings from View > Toolbars;
 4. clicks into one of its number fields with a real XTEST click and types "30";
 5. requires the field's value to change and the document's chemistry not to.
+
+Every menu command in steps 2 and 3 is chosen over AT-SPI, not typed. Weston's X window manager
+decides where X keyboard focus goes and can put it back when an X client such as xdotool moves
+it, so keyboard shortcuts meant for the document window may land elsewhere or nowhere.
+Edit > Paste, Copy and Select All go to whichever ChemDraft window has focus, or to the document
+window when none does, so the check first requires that no other ChemDraft window has focus. Only the field click
+and the typing in step 4 use XTEST input, because that is what the check tests.
 
 Native Wayland (CHEMDRAFT_NATIVE_WAYLAND=1) is not covered. Weston offers no protocol that lets
 one client type into another client's window, and xdotool reaches X11 windows only.
@@ -226,14 +233,14 @@ def copied(target):
     return wait_for(check, f"ChemDraft did not copy {target}", seconds=5)
 
 
-def chemistry():
+def chemistry(Atspi, pid):
     """The whole document's SMILES and a summary of its native selection JSON."""
-    keys("ctrl+a")
+    choose(Atspi, pid, "Edit", "Select All")
     host_clipboard(SENTINEL)
-    keys("ctrl+alt+c")
+    choose(Atspi, pid, "Edit", "Copy As", "SMILES")
     smiles = copied(TEXT)
     host_clipboard(SENTINEL)
-    keys("ctrl+c")
+    choose(Atspi, pid, "Edit", "Copy")
     try:
         payload = json.loads(copied(SELECTION))
         objects = [
@@ -246,14 +253,15 @@ def chemistry():
     return smiles, sorted(objects)
 
 
-def paste_propane(session, document):
-    run("xdotool", "windowfocus", document, check=False)
+def paste_propane(session, Atspi, document):
+    require_document_focus(session, Atspi, document)
     host_clipboard(b"C-C-C")
-    keys("ctrl+v")
+    # Paste once: a retried paste could add a second propane.
+    choose(Atspi, session.main_pid, "Edit", "Paste")
 
     def pasted():
         session.alive()
-        smiles, summary = chemistry()
+        smiles, summary = chemistry(Atspi, session.main_pid)
         if smiles != b"CCC":
             raise SmokeFailure(f"Copy As SMILES read {smiles[:120]!r}")
         return smiles, summary
@@ -297,21 +305,84 @@ def named_child(node, name):
     raise SmokeFailure(f"missing {name!r} in the accessibility tree")
 
 
-def open_settings_toolbar(Atspi, pid):
-    def menu_item():
-        app = application(Atspi, pid)
-        stack = [named_child(app, "ChemDraft")]
-        while stack:
-            node = stack.pop()
-            if node.get_role() == Atspi.Role.MENU_BAR:
-                toolbars = named_child(named_child(node, "View"), "Toolbars")
-                return named_child(toolbars, "Drawn Structure Settings")
-            stack.extend(children(node))
-        raise SmokeFailure("the document has no accessible native menu bar")
+def menu_item(Atspi, pid, *path):
+    """The document window's native menu item at this path, such as Edit > Copy As > SMILES."""
+    stack = [named_child(application(Atspi, pid), "ChemDraft")]
+    while stack:
+        node = stack.pop()
+        if node.get_role() == Atspi.Role.MENU_BAR:
+            for name in path:
+                node = named_child(node, name)
+            return node
+        stack.extend(children(node))
+    raise SmokeFailure("the document has no accessible native menu bar")
 
-    item = wait_for(menu_item, "View > Toolbars > Drawn Structure Settings is missing")
+
+def choose(Atspi, pid, *path):
+    """Choose a native menu item over AT-SPI, as a click on it would, with no keyboard focus."""
+    label = " > ".join(path)
+
+    def enabled():
+        item = menu_item(Atspi, pid, *path)
+        if not item.get_state_set().contains(Atspi.StateType.SENSITIVE):
+            raise SmokeFailure(f"{label} is disabled")
+        return item
+
+    item = wait_for(enabled, f"{label} was not available", seconds=10)
+    # Act once, never in a retry loop: a repeated Paste adds a second structure, and a
+    # repeated toggle closes the toolbar it opened.
+    try:
+        acted = Atspi.Action.do_action(item, 0)
+    except RETRY as error:
+        raise SmokeFailure(f"Choosing {label} failed: {error}") from error
+    if not acted:
+        raise SmokeFailure(f"{label} refused its action")
+
+
+def active_windows(Atspi, pid):
+    """The titles of the ChemDraft windows GTK reports as focused."""
+    return [child.get_name() for child in children(application(Atspi, pid))
+            if child.get_state_set().contains(Atspi.StateType.ACTIVE)]
+
+
+def report_focus(Atspi, pid, moment):
+    focus = run("xdotool", "getwindowfocus", check=False)
+    window = focus.stdout.decode().strip() or focus.stderr.decode(errors="replace").strip()
+    name = ""
+    if focus.returncode == 0 and window.isdigit():
+        name = run("xdotool", "getwindowname", window, check=False).stdout.decode(
+            errors="replace").strip()
+    try:
+        active = active_windows(Atspi, pid)
+    except RETRY as error:
+        active = f"unknown ({error})"
+    print(f"Focus {moment}: X input focus {window} {name!r}; focused ChemDraft windows {active}",
+          flush=True)
+
+
+def require_document_focus(session, Atspi, document):
+    """Edit > Paste, Copy and Select All follow the focused ChemDraft window, if there is one."""
+    # Under Openbox this hands the document the focus. Weston's X window manager may undo it.
+    run("xdotool", "windowfocus", document, check=False)
+
+    def document_or_none():
+        session.alive()
+        others = [name for name in active_windows(Atspi, session.main_pid) if name != "ChemDraft"]
+        if others:
+            raise SmokeFailure(f"{others} has focus, so Edit menu commands would go there")
+
+    try:
+        wait_for(document_or_none, "Another ChemDraft window kept the focus from the document",
+                 seconds=10)
+    finally:
+        report_focus(Atspi, session.main_pid, "before the Edit menu commands")
+
+
+def open_settings_toolbar(Atspi, pid):
+    item = wait_for(lambda: menu_item(Atspi, pid, "View", "Toolbars", "Drawn Structure Settings"),
+                    "View > Toolbars > Drawn Structure Settings is missing")
     if not item.get_state_set().contains(Atspi.StateType.CHECKED):
-        Atspi.Action.do_action(item, 0)
+        choose(Atspi, pid, "View", "Toolbars", "Drawn Structure Settings")
 
 
 def number_field(Atspi, pid):
@@ -365,6 +436,7 @@ def type_into_field(session, Atspi, settings):
     if location.get("WINDOW") != settings:
         raise SmokeFailure(f"window {location.get('WINDOW')} covers the field, not {settings}")
     run("xdotool", "click", "1")
+    report_focus(Atspi, session.main_pid, f"after clicking {name!r}")
 
     def focused():
         if not field.get_state_set().contains(Atspi.StateType.FOCUSED):
@@ -397,19 +469,20 @@ def main(bundle, package, logs):
                             "No ChemDraft document window appeared", seconds=60, interval=1)
         wait_for(lambda: session.window("ChemDraft Main Toolbar"),
                  "The Main Toolbar window did not appear", seconds=30, interval=1)
-        before = paste_propane(session, document)
+        Atspi = atspi()
+        report_focus(Atspi, session.main_pid, "after startup")
+        before = paste_propane(session, Atspi, document)
         print(f"Document before typing: {before[0].decode()} {before[1]}", flush=True)
 
-        Atspi = atspi()
         open_settings_toolbar(Atspi, session.main_pid)
         settings = wait_for(lambda: session.window(SETTINGS_TITLE),
                             f"The {SETTINGS_TITLE} window did not appear", seconds=30)
         type_into_field(session, Atspi, settings)
 
         session.alive()
-        run("xdotool", "windowfocus", document, check=False)
         time.sleep(0.5)
-        after = chemistry()
+        require_document_focus(session, Atspi, document)
+        after = chemistry(Atspi, session.main_pid)
         print(f"Document after typing: {after[0].decode()} {after[1]}", flush=True)
         if after != before:
             raise SmokeFailure(f"the document's chemistry changed from {before} to {after}")
