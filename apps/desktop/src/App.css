@@ -775,10 +775,15 @@ textarea:focus-visible,
   display: flex;
   gap: 2px;
   width: max-content;
+  /* DocumentTabList pans horizontal touch and pen drags itself; the browser keeps only vertical panning, so it
+     neither scrolls nor zooms sideways underneath, and taps still click. */
+  touch-action: pan-y;
 }
 
 .document-tab-scrollbar {
   position: relative;
+  /* A finger or pen on the thumb drags it; the browser takes no gesture from it. */
+  touch-action: none;
   flex: 0 0 8px;
   visibility: hidden;
   background: var(--cd-border-subtle);

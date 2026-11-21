@@ -1,4 +1,4 @@
-import { useCallback, useImperativeHandle, useLayoutEffect, useRef, type PointerEvent, type ReactNode, type Ref } from "react";
+import { useCallback, useImperativeHandle, useLayoutEffect, useRef, type MouseEvent, type PointerEvent, type ReactNode, type Ref } from "react";
 
 export interface DocumentTabListHandle {
   beforeRemove(remaining: readonly { id: string }[]): void;
@@ -18,6 +18,21 @@ const MIN_OVERFLOW = 1;
 // scrollWidth and clientWidth round to whole pixels, so mixing them with an exact box invents a sliver of overflow.
 // The track and the viewport are both measured as exact boxes (the strip has no border or padding); the rounded
 // scrollWidth is only the fallback for a box that reports no size.
+// A touch or pen contact pans the strip only after it travels more than this many CSS pixels horizontally; anything
+// shorter is a tap. A fingertip rolls a few pixels as it lands and lifts, so a smaller slop turns taps into pans, while
+// a larger one makes a deliberate swipe feel stuck before it starts.
+export const TOUCH_PAN_SLOP = 8;
+
+// A touch click can trail its pointerup; a click arriving later than this after a pan ends is not that pan's click.
+export const PAN_CLICK_WINDOW_MS = 500;
+
+// Pointers that pan the strip by dragging across the tabs. The mouse never does, so a mouse press-and-move on a tab
+// keeps its existing behavior. A pen pans like a finger: it has no wheel, and a pen could pan the earlier native
+// overflow strip in WebView2 just as a finger could.
+function pansByDrag(pointerType: string) {
+  return pointerType === "touch" || pointerType === "pen";
+}
+
 function measureTrack(track: HTMLElement) {
   const exact = track.getBoundingClientRect().width;
   return exact > 0 ? exact : track.scrollWidth;
@@ -75,6 +90,11 @@ export function DocumentTabList({ ref, activeId, order, activeTitle, children }:
   // A wheel or thumb move away clears it, so a later growth never pulls the strip back.
   const activeInView = useRef(false);
   const drag = useRef<{ pointerId: number; startX: number; startOffset: number } | null>(null);
+  // A touch or pen contact on the tabs: a tap until it moves past the slop horizontally, then a pan.
+  const pan = useRef<{ pointerId: number; startX: number; startY: number; startOffset: number; panning: boolean } | null>(null);
+  // The pan whose trailing click is swallowed. Only that gesture's click: the next press, a key press, or the end of
+  // PAN_CLICK_WINDOW_MS after release clears it, so a later tap, click or keyboard activation is never eaten.
+  const suppressedClick = useRef<object | null>(null);
 
   const moveTrack = useCallback((left: number, remainingWidth?: number) => {
     const strip = stripRef.current;
@@ -164,7 +184,8 @@ export function DocumentTabList({ ref, activeId, order, activeTitle, children }:
     const strip = stripRef.current;
     const track = trackRef.current;
     const thumb = thumbRef.current;
-    if (!strip || !track || !thumb || drag.current || event.button !== 0 || event.pointerType !== "mouse") return;
+    // Mouse, pen and touch alike; for the mouse only the primary button (a pen tip or a finger presses button 0).
+    if (!strip || !track || !thumb || drag.current || event.button !== 0) return;
     const stripWidth = measureViewport(strip);
     if (scrollGeometry(stripWidth, measureTrack(track)).max === 0) return;
 
@@ -192,14 +213,81 @@ export function DocumentTabList({ ref, activeId, order, activeTitle, children }:
     if (drag.current?.pointerId === event.pointerId) drag.current = null;
   }
 
+  function onScrollbarLostPointerCapture(event: PointerEvent<HTMLDivElement>) {
+    // A touch or pen press is implicitly captured by the thumb; moving that capture to the scrollbar fires
+    // lostpointercapture at the thumb, which bubbles here. Only the scrollbar's own capture ending ends the drag.
+    if (event.target === event.currentTarget) endScrollbarDrag(event);
+  }
+
+  function onTrackPointerDown(event: PointerEvent<HTMLDivElement>) {
+    // A second finger joins the gesture in progress; it neither pans nor ends it.
+    if (pan.current && !event.isPrimary) return;
+    // Every new press is a new gesture, so an earlier pan's suppression never reaches this one's click.
+    pan.current = null;
+    suppressedClick.current = null;
+    if (!pansByDrag(event.pointerType) || event.button !== 0) return;
+    // No preventDefault: a tap must still focus and click the tab under it.
+    pan.current = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, startOffset: offset.current, panning: false };
+  }
+
+  function onTrackPointerMove(event: PointerEvent<HTMLDivElement>) {
+    const gesture = pan.current;
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    const dx = event.clientX - gesture.startX;
+    if (!gesture.panning) {
+      const dy = event.clientY - gesture.startY;
+      // A vertical-dominant move never becomes a pan, even if it later turns sideways.
+      if (Math.abs(dy) > TOUCH_PAN_SLOP && Math.abs(dy) >= Math.abs(dx)) {
+        pan.current = null;
+        return;
+      }
+      if (Math.abs(dx) <= TOUCH_PAN_SLOP || Math.abs(dx) <= Math.abs(dy)) return;
+      gesture.panning = true;
+      suppressedClick.current = gesture;
+      event.currentTarget.setPointerCapture(event.pointerId);
+    }
+    // The content under the finger stays under it.
+    moveTrack(gesture.startOffset - dx);
+  }
+
+  function endPan(event: PointerEvent<HTMLDivElement>) {
+    const gesture = pan.current;
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    pan.current = null;
+    if (!gesture.panning) return;
+    window.setTimeout(() => {
+      if (suppressedClick.current === gesture) suppressedClick.current = null;
+    }, PAN_CLICK_WINDOW_MS);
+  }
+
+  function onTrackLostPointerCapture(event: PointerEvent<HTMLDivElement>) {
+    // Taking the capture from the tab under the finger fires lostpointercapture there; that does not end the pan.
+    if (event.target === event.currentTarget) endPan(event);
+  }
+
+  function onTrackClickCapture(event: MouseEvent<HTMLDivElement>) {
+    if (!suppressedClick.current) return;
+    // The click that ends a pan neither activates nor closes the tab under the finger.
+    suppressedClick.current = null;
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
+  function onTrackKeyDownCapture() {
+    suppressedClick.current = null;
+  }
+
   return (
     <div ref={stripRef} className="document-tab-list" role="tablist" aria-label="Open documents">
       <div className="document-tab-clip">
-        <div ref={trackRef} className="document-tab-track">{children}</div>
+        <div ref={trackRef} className="document-tab-track"
+          onPointerDown={onTrackPointerDown} onPointerMove={onTrackPointerMove} onPointerUp={endPan}
+          onPointerCancel={endPan} onLostPointerCapture={onTrackLostPointerCapture}
+          onClickCapture={onTrackClickCapture} onKeyDownCapture={onTrackKeyDownCapture}>{children}</div>
       </div>
       <div ref={scrollbarRef} className="document-tab-scrollbar" aria-hidden="true"
         onPointerDown={onScrollbarPointerDown} onPointerMove={onScrollbarPointerMove}
-        onPointerUp={endScrollbarDrag} onPointerCancel={endScrollbarDrag} onLostPointerCapture={endScrollbarDrag}>
+        onPointerUp={endScrollbarDrag} onPointerCancel={endScrollbarDrag} onLostPointerCapture={onScrollbarLostPointerCapture}>
         <div ref={thumbRef} className="document-tab-scrollbar-thumb" />
       </div>
     </div>

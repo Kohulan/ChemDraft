@@ -15,6 +15,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { Molecule } from "openchemlib";
 import { dropMark, dropMolecule, electronMarkDropFixture } from "./testSupport/electronMarkDropFixture";
 import { MainWindow, documentTabPathKey } from "./MainWindow";
+import { PAN_CLICK_WINDOW_MS, TOUCH_PAN_SLOP } from "./DocumentTabList";
 import { exportPhase4Svg, applyNativeChainTool, createNativeSingleBondMolecule, arrangeSelectedDocumentObjects, createNativeSavePayload, createPhase4Document, openNativeDocument, selectDocumentObjects } from "./documentWorkflow";
 import { openChemDraftPayload } from "@chemdraft/cdx-compat";
 import { saveCompoundLayoutSettings } from "./compoundLayoutSettings";
@@ -1905,6 +1906,196 @@ describe("documents in one window", () => {
       expect(track.style.transform).toBe("translateX(-230px)");
       pointer(scrollbar, "pointerdown", bounds.left + 1);
       expect(track.style.transform).toBe("translateX(0px)");
+    });
+
+    function touch(target: Element, type: string, clientX: number, clientY = 12, options: PointerEventInit = {}) {
+      return pointer(target, type, clientX, { pointerType: "touch", pointerId: 21, isPrimary: true, clientY, ...options });
+    }
+
+    function lostCapture(target: Element, pointerId: number, pointerType: string) {
+      target.dispatchEvent(new PointerEvent("lostpointercapture", { pointerId, pointerType, bubbles: true }));
+    }
+
+    it("drags the thumb and pages the scrollbar with a finger or a pen exactly as with the mouse", async () => {
+      const { strip, scrollbar, thumb, track } = await openOverflowingTabs();
+      const thumbTravel = 230 - 230 * (230 / 606);
+      const capture = scrollbar.setPointerCapture = vi.fn();
+      for (const [pointerType, pointerId, end] of [["touch", 11, "pointerup"], ["pen", 12, "pointercancel"]] as const) {
+        wheel(track, -1000, 0);
+        expect(translationX(track)).toBe(0);
+        const options = { pointerType, pointerId, isPrimary: true };
+        expect(pointer(thumb, "pointerdown", 44, options)).toBe(true);
+        expect(capture).toHaveBeenLastCalledWith(pointerId);
+        // Moving the implicit touch or pen capture from the thumb to the scrollbar does not end the drag.
+        lostCapture(thumb, pointerId, pointerType);
+        pointer(scrollbar, "pointermove", 104, options);
+        expect(translationX(track)).toBeCloseTo(-60 / thumbTravel * 376);
+        expect(translationX(thumb)).toBeCloseTo(60);
+        pointer(scrollbar, "pointermove", 500, options);
+        expect(translationX(track)).toBe(-376);
+        pointer(scrollbar, "pointermove", 12, options);
+        expect(translationX(track)).toBe(0);
+        pointer(scrollbar, end, 12, options);
+        pointer(scrollbar, "pointermove", 500, options);
+        expect(translationX(track)).toBe(0);
+      }
+      expect(capture).toHaveBeenCalledTimes(2);
+
+      // The scrollbar's own capture ending does end a touch drag.
+      expect(pointer(thumb, "pointerdown", 44, { pointerType: "touch", pointerId: 13, isPrimary: true })).toBe(true);
+      lostCapture(scrollbar, 13, "touch");
+      pointer(scrollbar, "pointermove", 500, { pointerType: "touch", pointerId: 13 });
+      expect(translationX(track)).toBe(0);
+
+      // A tap or pen press on the scrollbar track pages one viewport toward it.
+      const bounds = strip.getBoundingClientRect();
+      expect(pointer(scrollbar, "pointerdown", bounds.right - 1, { pointerType: "touch", pointerId: 14, isPrimary: true })).toBe(true);
+      expect(track.style.transform).toBe("translateX(-230px)");
+      pointer(scrollbar, "pointerdown", bounds.left + 1, { pointerType: "pen", pointerId: 15, isPrimary: true });
+      expect(track.style.transform).toBe("translateX(0px)");
+    });
+
+    it("pans the tabs with a touch or pen drag past the slop and never activates the tab under it", async () => {
+      const { track, thumb } = await openOverflowingTabs();
+      const thumbTravel = 230 - 230 * (230 / 606);
+      const capture = track.setPointerCapture = vi.fn();
+      const third = tabs()[2]!;
+      touch(third, "pointerdown", 60);
+      touch(third, "pointermove", 60 + TOUCH_PAN_SLOP + 1, 14);
+      expect(capture).toHaveBeenCalledExactlyOnceWith(21);
+      expect(translationX(track)).toBe(-376 + TOUCH_PAN_SLOP + 1);
+      // Taking the capture from the tab under the finger does not end the pan.
+      lostCapture(third, 21, "touch");
+      touch(track, "pointermove", 160);
+      expect(translationX(track)).toBe(-276);
+      touch(track, "pointermove", 1000);
+      expect(translationX(track)).toBe(0);
+      touch(track, "pointermove", 110);
+      expect(translationX(track)).toBe(-326);
+      expect(translationX(thumb)).toBeCloseTo(326 / 376 * thumbTravel);
+      touch(track, "pointerup", 110);
+      await act(async () => third.click());
+      expect(active()).toBe(3);
+      expect(bridge().snapshot().document.title).toBe("Fourth drawing");
+      expect(translationX(track)).toBe(-326);
+      touch(track, "pointermove", 160);
+      expect(translationX(track)).toBe(-326);
+
+      const pen = { pointerType: "pen", pointerId: 22, isPrimary: true, clientY: 12 };
+      pointer(third, "pointerdown", 60, pen);
+      pointer(third, "pointermove", 80, pen);
+      expect(translationX(track)).toBe(-306);
+      pointer(track, "pointerup", 80, pen);
+      await act(async () => third.click());
+      expect(active()).toBe(3);
+    });
+
+    it("lets a touch tap activate a tab or close it from its ×, and scopes a pan's suppression to its own click", async () => {
+      const { track } = await openOverflowingTabs();
+      track.setPointerCapture = vi.fn();
+      // A pan whose release brings no click; the next tap's press starts a new gesture.
+      touch(tabs()[3]!, "pointerdown", 150);
+      touch(tabs()[3]!, "pointermove", 200);
+      expect(translationX(track)).toBe(-326);
+      touch(track, "pointerup", 200);
+
+      const third = tabs()[2]!;
+      touch(third, "pointerdown", 80, 12);
+      touch(third, "pointermove", 80 + TOUCH_PAN_SLOP, 15);
+      expect(translationX(track)).toBe(-326);
+      touch(third, "pointerup", 80 + TOUCH_PAN_SLOP, 15);
+      await act(async () => third.click());
+      expect(active()).toBe(2);
+      expect(bridge().snapshot().document.title).toBe("Third drawing");
+
+      // After a pan's click window, a click that no press preceded (keyboard or automation) still activates.
+      vi.useFakeTimers();
+      touch(tabs()[2]!, "pointerdown", 100);
+      touch(tabs()[2]!, "pointermove", 60);
+      expect(translationX(track)).toBe(-344);
+      touch(track, "pointerup", 60);
+      await act(async () => vi.advanceTimersByTimeAsync(PAN_CLICK_WINDOW_MS));
+      await act(async () => tabs()[3]!.click());
+      expect(active()).toBe(3);
+      vi.useRealTimers();
+
+      const close = container.querySelectorAll<HTMLButtonElement>(".document-tab-close")[3]!;
+      touch(close, "pointerdown", 200);
+      touch(close, "pointerup", 200);
+      await act(async () => close.click());
+      expect(tabs()).toHaveLength(3);
+      expect(tabs().map(tab => tab.textContent)).not.toContain("Fourth drawing");
+    });
+
+    it("does not pan on a vertical-dominant touch move", async () => {
+      const { track } = await openOverflowingTabs();
+      const capture = track.setPointerCapture = vi.fn();
+      const third = tabs()[2]!;
+      touch(third, "pointerdown", 60, 4);
+      touch(third, "pointermove", 63, 4 + TOUCH_PAN_SLOP + 1);
+      // Turning sideways afterwards does not make it a pan.
+      touch(third, "pointermove", 160, 14);
+      expect(translationX(track)).toBe(-376);
+      touch(third, "pointerup", 160, 14);
+      // Diagonal, more vertical than horizontal, both past the slop.
+      touch(third, "pointerdown", 60, 0);
+      touch(third, "pointermove", 60 + TOUCH_PAN_SLOP + 2, TOUCH_PAN_SLOP + 2);
+      touch(third, "pointermove", 160, TOUCH_PAN_SLOP + 2);
+      expect(translationX(track)).toBe(-376);
+      touch(third, "pointerup", 160, TOUCH_PAN_SLOP + 2);
+      expect(capture).not.toHaveBeenCalled();
+
+      // The next horizontal swipe pans.
+      touch(third, "pointerdown", 60, 4);
+      touch(third, "pointermove", 160, 6);
+      expect(translationX(track)).toBe(-276);
+    });
+
+    it("treats a touch move of slop−1 as a tap and slop+1 as a pan", async () => {
+      const { track } = await openOverflowingTabs();
+      track.setPointerCapture = vi.fn();
+      const third = tabs()[2]!;
+      touch(third, "pointerdown", 60);
+      touch(third, "pointermove", 60 + TOUCH_PAN_SLOP - 1);
+      expect(translationX(track)).toBe(-376);
+      touch(third, "pointerup", 60 + TOUCH_PAN_SLOP - 1);
+      await act(async () => third.click());
+      expect(active()).toBe(2);
+      expect(translationX(track)).toBe(-304);
+
+      const fourth = tabs()[3]!;
+      touch(fourth, "pointerdown", 200);
+      touch(fourth, "pointermove", 200 + TOUCH_PAN_SLOP + 1);
+      expect(translationX(track)).toBe(-304 + TOUCH_PAN_SLOP + 1);
+      touch(fourth, "pointerup", 200 + TOUCH_PAN_SLOP + 1);
+      await act(async () => fourth.click());
+      expect(active()).toBe(2);
+      expect(translationX(track)).toBe(-304 + TOUCH_PAN_SLOP + 1);
+    });
+
+    it("does not pan when the mouse presses and moves on a tab", async () => {
+      const { track } = await openOverflowingTabs();
+      const capture = track.setPointerCapture = vi.fn();
+      const third = tabs()[2]!;
+      pointer(third, "pointerdown", 60, { clientY: 12, isPrimary: true });
+      pointer(third, "pointermove", 160, { clientY: 12, isPrimary: true });
+      expect(translationX(track)).toBe(-376);
+      pointer(third, "pointerup", 160, { clientY: 12, isPrimary: true });
+      expect(capture).not.toHaveBeenCalled();
+      await act(async () => third.click());
+      expect(active()).toBe(2);
+    });
+
+    it("moves by horizontal and vertical wheel deltas, as a trackpad sends them, by the same amounts as before", async () => {
+      const { track } = await openOverflowingTabs();
+      expect(wheel(track, -100, 0)).toBe(true);
+      expect(translationX(track)).toBe(-276);
+      expect(wheel(track, 0, -50)).toBe(true);
+      expect(translationX(track)).toBe(-226);
+      expect(wheel(tabs()[2]!, 12.5, 40)).toBe(true);
+      expect(translationX(track)).toBe(-238.5);
+      expect(wheel(track, 0, 1, WheelEvent.DOM_DELTA_LINE)).toBe(true);
+      expect(translationX(track)).toBeLessThan(-238.5);
     });
 
     it("keeps new, activated and cycled tabs in view and clamps after a close widens the strip", async () => {
