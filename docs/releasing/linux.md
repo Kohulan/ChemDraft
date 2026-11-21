@@ -38,7 +38,14 @@ The workflow:
 4. Checks the bundle identity and that the `.deb` carries `chemdraft`, the 3D sidecar and the
    OPSIN runtime.
 5. Repacks the AppImage after Tauri bundles it. It uses the host's Wayland and compiler runtime
-   libraries and the host's `libgpg-error.so.0`; the job verifies that the finished image contains no `libwayland-*`,
+   libraries and the host's `libgpg-error.so.0`. It also removes the bundled copies of libraries
+   that host Mesa (`libEGL_mesa`, `libgallium`, `libgbm`, the DRI drivers) depends on, so the
+   Ubuntu 22.04 copies never shadow the host's newer ones: `libzstd.so*`, `libelf.so*` and
+   `libelf-*.so`, `libffi.so*`, `libXau.so*`, `libXdmcp.so*`, `libxcb-randr.so*`,
+   `libxcb-shm.so*`, `libbsd.so*`, and `libmd.so*`. Each is a standard base package on every
+   supported host (on Debian and Ubuntu: `libzstd1`, `libelf1`, `libffi8`, `libxau6`,
+   `libxdmcp6`, `libxcb-randr0`, `libxcb-shm0`, `libbsd0`, `libmd0`); `libxcb.so.1` stays
+   bundled. The job verifies that the finished image contains none of these and no `libwayland-*`,
    `libstdc++.so*`, or `libgcc_s.so*` files or symlinks. The job logs the bundled shared libraries
    under `usr/lib` and rejects bundled `libEGL*`, `libGL.so*`, `libGLX*`, `libOpenGL.so*`,
    `libGLESv1_CM.so*`, `libGLESv2.so*`, `libGLU.so*`, `libGLdispatch*`, `libgbm*`, `libdrm*`,
@@ -51,7 +58,8 @@ The workflow:
 7. Runs independent smoke jobs on **Ubuntu 22.04 and 24.04**. Each downloads and verifies the same
    22.04-built packages against `SHA256SUMS-linux.txt`. The jobs run both package checks, even
    when the AppImage or the other runner fails.
-8. After both smoke jobs pass, fetches the draft's tag and checks that it resolves to the build
+8. The Debian sid, Fedora and Arch container checks also have to pass before upload. After the
+   smoke jobs pass, the workflow fetches the draft's tag and checks that it resolves to the build
    commit. It uploads to the existing draft, validates the attached builds, and refreshes the
    combined checksums.
 
@@ -102,16 +110,24 @@ gh workflow run linux-container-smoke.yml --ref <branch-or-tag>
 To test existing packages, add `-f artifact_run_id=<linux-release-run-id>` and optionally
 `-f artifact_name=<name>` (defaults to `linux-release-amd64`). A reusable caller can also supply
 `artifact_name` for packages uploaded earlier in the same run. Reusable callers need
-`actions: read` for artifact downloads and must allow the `contents: write` permission declared
-by the release workflow's separate publishing job. The build itself runs with read access.
+`actions: read` for artifact downloads. The shared build runs with read access.
 
-The workflow checks Debian sid and Fedora under Xvfb and headless Weston. The containers install
+The workflow checks Debian sid and Fedora under Xvfb and headless Weston, and Arch under Xvfb.
+AppImage jobs extract the image and use its library search path to check host Mesa, DRI, GBM and
+DRM dependencies with `ldd`; missing or AppImage-shadowed dependencies fail the job. The containers install
 libgpg-error as a desktop system would. Debian installs the
 .deb with apt and Fedora extracts its payload and runs it with Fedora's libraries. Each job
 uploads display, app, and process logs. These tests cover startup and subprocess crashes. GPU
 rendering still needs a desktop check. The privileged containers allow `strace` to trace the app
 and glycin's bubblewrap to create user namespaces. Weston runs the AppImage both with and without
 XWayland.
+
+On Ubuntu and in the Xvfb container jobs, readiness requires the Main Toolbar window and more
+than 16 distinct colors in the document screenshot below the native menu bar. The check reads
+the Main Toolbar and Drawn Structure Settings entries from the GTK **View > Toolbars** accessibility
+tree. It uses `xclip` and real keyboard shortcuts to round-trip plain SMILES text and the native
+ChemDraft selection format through the X11 clipboard. Inspector digit entry and preservation of the
+drawing during that entry are skipped because the package harness has no document snapshot reader.
 
 ## Updates
 
@@ -152,4 +168,4 @@ repository on GitHub Pages, or a Flathub listing.
   `node scripts/build-opsin-runtime.mjs` and
   `LD_LIBRARY_PATH=$PWD/apps/desktop/src-tauri/resources/opsin/jre/lib/server APPIMAGE_EXTRACT_AND_RUN=1 NO_STRIP=true pnpm --filter @chemdraft/desktop build --bundles deb,appimage`.
   The `LD_LIBRARY_PATH` lets linuxdeploy find `libjvm.so` for the bundled OPSIN runtime. Apply the
-  repack step in `linux-release.yml` before launching the AppImage.
+  repack step in `linux-build.yml` before launching the AppImage.
