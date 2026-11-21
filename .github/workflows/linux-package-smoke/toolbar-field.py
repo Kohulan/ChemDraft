@@ -9,8 +9,10 @@ the .deb picks it itself when WAYLAND_DISPLAY is set. The check:
 1. starts headless Weston with XWayland, then the package with no GDK_BACKEND of its own;
 2. pastes propane with Edit > Paste and records the document's chemistry with Edit > Select All,
    Edit > Copy As > SMILES and Edit > Copy (the native selection JSON);
-3. opens Drawn Structure Settings from View > Toolbars;
-4. clicks into one of its number fields with a real XTEST click and types "30";
+3. opens Drawn Structure Settings from View > Toolbars, whose number fields are enabled only
+   while a molecule is selected (Select All in step 2 leaves propane selected);
+4. finds an enabled number field over AT-SPI (a spin button, or a text entry with a number field's
+   label), logging every candidate it saw, then clicks into it with a real XTEST click and types "30";
 5. requires the field's value to change and the document's chemistry not to.
 
 Every menu command in steps 2 and 3 is chosen over AT-SPI, not typed. Weston's X window manager
@@ -43,6 +45,12 @@ SELECTION = "application/x-chemdraft-selection+json"
 SETTINGS_TITLE = "ChemDraft Drawn Structure Settings"
 # Chain angle only sets the angle of chains drawn later, so committing it cannot move atoms.
 PREFERRED_FIELD = "Chain angle"
+# The <input type="number"> fields on the palette's Structure tab, by their aria-label. They are
+# disabled until a molecule, atom, bond or ring is selected (MoleculeInspectorControls in
+# apps/desktop/src/ToolPalette.tsx), which Edit > Select All in chemistry() leaves in place.
+FIELD_LABELS = ("Chain angle", "Target bond length", "Line width", "Bold width", "Spacing %",
+                "Spacing abs.", "Margin width", "Hash spacing", "Double-bond inset")
+LOGGED_STATES = ("enabled", "sensitive", "showing", "visible", "editable", "focusable", "focused")
 TYPED = "30"
 
 
@@ -385,24 +393,80 @@ def open_settings_toolbar(Atspi, pid):
         choose(Atspi, pid, "View", "Toolbars", "Drawn Structure Settings")
 
 
+def describe(Atspi, node, depth):
+    """One line per accessible: role, name, owning process, child count and the states we use."""
+    states = node.get_state_set()
+    flags = " ".join(name for name in LOGGED_STATES
+                     if states.contains(getattr(Atspi.StateType, name.upper())))
+    line = (f"{'  ' * depth}{node.get_role_name()} {node.get_name()!r} "
+            f"pid={node.get_process_id()} children={node.get_child_count()} [{flags}]")
+    if not node.get_name() and node.get_child_count() == 0:
+        # Unnamed leaves are mostly static text, such as "1 molecule" or "No molecule" in the
+        # palette's target row, which shows whether the selection reached it.
+        try:
+            if "Text" in node.get_interfaces():
+                text = Atspi.Text.get_text(node, 0, min(60, Atspi.Text.get_character_count(node)))
+                if text.strip():
+                    line += f" text={text.strip()!r}"
+        except RETRY:
+            pass
+    return line
+
+
+# The last complete scan of the settings window, printed when no field is found.
+LAST_SCAN = {"outline": [], "candidates": []}
+
+
 def number_field(Atspi, pid):
-    """The settings toolbar's preferred enabled number field, or any other one."""
+    """The settings toolbar's preferred enabled number field, or any other one.
+
+    WebKitGTK exposes <input type="number"> as a spin button whose name is its aria-label.
+    Older builds expose it as a text entry, so an entry counts when its name is one of the
+    palette's number field labels. A field is usable when it is enabled or sensitive; WebKit
+    sets both on an enabled control and neither on a disabled one.
+    """
     window = named_child(application(Atspi, pid), SETTINGS_TITLE)
+    # libatspi caches child lists and state sets. The palette's web content renders disabled
+    # fields first and enables them when the main window sends its selection, so drop the
+    # cache before every scan rather than read a stale "disabled" or an empty subtree.
+    window.clear_cache()
+    roles = (Atspi.Role.SPIN_BUTTON, Atspi.Role.ENTRY)
     fields = []
-    stack = [window]
+    outline = []
+    candidates = []
+    stack = [(window, 0)]
     visited = 0
-    while stack and visited < 20000:
-        node = stack.pop()
+    while stack and visited < 5000:
+        node, depth = stack.pop()
         visited += 1
-        if node.get_role() == Atspi.Role.SPIN_BUTTON:
+        line = describe(Atspi, node, depth)
+        if len(outline) < 400:
+            outline.append(line)
+        role = node.get_role()
+        name = node.get_name()
+        if role in roles or name in FIELD_LABELS:
+            candidates.append(line.strip())
             states = node.get_state_set()
-            if states.contains(Atspi.StateType.ENABLED) and states.contains(Atspi.StateType.SHOWING):
+            usable = (states.contains(Atspi.StateType.ENABLED)
+                      or states.contains(Atspi.StateType.SENSITIVE))
+            if usable and (role == Atspi.Role.SPIN_BUTTON
+                           or (role == Atspi.Role.ENTRY and name in FIELD_LABELS)):
                 fields.append(node)
-        stack.extend(children(node))
+        stack.extend((child, depth + 1) for child in reversed(list(children(node))))
+    LAST_SCAN["outline"] = outline
+    LAST_SCAN["candidates"] = candidates
     if not fields:
-        raise SmokeFailure(f"{SETTINGS_TITLE!r} shows no enabled number field")
-    fields.sort(key=lambda node: node.get_name() != PREFERRED_FIELD)
+        raise SmokeFailure(f"{SETTINGS_TITLE!r} shows no enabled number field "
+                           f"({visited} accessibles, {len(candidates)} candidates)")
+    fields.sort(key=lambda node: (node.get_name() != PREFERRED_FIELD,
+                                  not node.get_state_set().contains(Atspi.StateType.SHOWING)))
     return fields[0]
+
+
+def print_scan(title, lines):
+    print(title, flush=True)
+    for line in lines or ["(none)"]:
+        print(f"  {line}", flush=True)
 
 
 def field_value(Atspi, field):
@@ -418,8 +482,15 @@ def pointer():
 
 
 def type_into_field(session, Atspi, settings):
-    field = wait_for(lambda: number_field(Atspi, session.main_pid),
-                     f"No enabled number field in {SETTINGS_TITLE}")
+    try:
+        field = wait_for(lambda: number_field(Atspi, session.main_pid),
+                         f"No enabled number field in {SETTINGS_TITLE}", seconds=30)
+    except SmokeFailure:
+        print_scan("Number field candidates in the last scan (role, name, process, states):",
+                   LAST_SCAN["candidates"])
+        print_scan(f"{SETTINGS_TITLE} accessibility tree in the last scan:", LAST_SCAN["outline"])
+        raise
+    print_scan("Number field candidates (role, name, process, states):", LAST_SCAN["candidates"])
     name = field.get_name()
     before = field_value(Atspi, field)
     extents = Atspi.Component.get_extents(field, Atspi.CoordType.SCREEN)

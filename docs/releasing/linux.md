@@ -126,7 +126,12 @@ The Debian and Fedora Wayland jobs where ChemDraft uses XWayland (both packages,
 run `.github/workflows/linux-package-smoke/toolbar-field.py`. It starts its own headless Weston with XWayland, pastes
 propane and reads the document back with **Edit > Paste**, **Select All**, **Copy As > SMILES** and
 **Copy**, opens Drawn Structure Settings from **View > Toolbars**, clicks into one of its number
-fields with an XTEST click and types `30`. It chooses every menu command over AT-SPI rather than
+fields with an XTEST click and types `30`. Those fields are enabled only while a molecule is
+selected, which **Select All** leaves in place. It finds the field over AT-SPI as WebKitGTK exposes
+it (a spin button, or a text entry named for a number field, that is enabled or sensitive),
+clearing libatspi's cache before each scan, and logs every candidate it saw. When it finds none,
+it also logs the palette's accessibility tree, so the log shows whether the web content, the
+selection or only the field's state was missing. It chooses every menu command over AT-SPI rather than
 typing its shortcut, because Weston's X window manager decides where X keyboard focus goes and
 can undo a focus change that `xdotool` makes. It first requires that no ChemDraft window other
 than the document has focus, since the Edit commands follow the focused window. It passes only
