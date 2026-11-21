@@ -264,8 +264,21 @@ runs:
           done
           return 1
         }
+        # The document title follows the active tab ("Untitled — ChemDraft"), so find the document
+        # by WM_CLASS and by not being a transient palette, never by its title.
+        document_window() {
+          local window owner
+          for window in $(xdotool search --onlyvisible --class chemdraft 2>/dev/null || true); do
+            owner=$(xdotool getwindowpid "$window" 2>/dev/null) || continue
+            belongs_to_launch "$owner" || continue
+            xprop -id "$window" WM_TRANSIENT_FOR 2>/dev/null | grep -q 'window id' && continue
+            printf '%s\n' "$window"
+            return 0
+          done
+          return 1
+        }
         window_ready() {
-          [[ "$check_window" != true ]] || visible_window '^ChemDraft$' >/dev/null
+          [[ "$check_window" != true ]] || document_window >/dev/null
         }
         web_process_running() {
           launched_pid -f '(^|/)WebKitWebProcess([[:space:]:]|$)' >/dev/null
@@ -355,7 +368,7 @@ runs:
           fi
           for _ in {1..30}; do
             captured=false
-            document=$(visible_window '^ChemDraft$' || true)
+            document=$(document_window || true)
             toolbar=$(visible_window '^ChemDraft Main Toolbar$' || true)
             if [[ -n "$document" ]] && "${capture[@]}" -window "$document" "$logs/document.png" 2> "$logs/screenshot.log"; then
               captured=true
