@@ -20420,6 +20420,61 @@ export function applyEditorSaveResultToSelectedObject(
   );
 }
 
+export const EDITOR_SAVE_MARK_SHIFT_REFUSAL =
+  "Ketcher can't keep this molecule's charge and radical marks on the right atoms when atoms are added or removed. Remove the marks first, or edit on the canvas.";
+
+/**
+ * Whether a structure-editor save could silently put one of the molecule's charge or radical marks
+ * on a different atom. The save reuses atom and bond ids by array index (`parseV3000MoleculeGraph`),
+ * so after an earlier atom is deleted, added or reordered a mark's atom id (or bond id) names
+ * another atom, inside the edited molecule where the commit guard cannot see it. Conservative: with
+ * any charge or radical mark associated with the molecule (atom-anchored, bond-anchored, or a legacy
+ * mark normalization assigns to one of its atoms), any change to the atom or bond count, any reused
+ * atom id with a different element, a marked bond id joining different atoms, or a marked atom
+ * (both ends of a marked bond included) with a different multiset of neighbour elements counts.
+ * Bond-order changes, in-place moves and unmarked molecules pass.
+ */
+function editorSaveMayShiftElectronMarks(
+  pageObjects: readonly DocumentObject[],
+  previous: MoleculeObject,
+  next: MoleculeObject
+): boolean {
+  const isChargeOrRadical = (object: DocumentObject | undefined): object is ElectronMarkObject =>
+    object?.type === "electron-mark" && (object.markKind === "charge" || object.markKind === "radical-dot");
+  const objectById = objectByIdIndex(pageObjects);
+  const markedAtomIds = new Set<string>();
+  const markedBondIds = new Set<string>();
+  for (const { markId, atomId } of atomOwnedMarksByMoleculeId(pageObjects).get(previous.id) ?? []) {
+    if (isChargeOrRadical(objectById.get(markId))) markedAtomIds.add(atomId);
+  }
+  for (const object of pageObjects) {
+    if (isChargeOrRadical(object) && object.anchor.kind === "bond" && object.anchor.objectId === previous.id && object.anchor.bondId) {
+      markedBondIds.add(object.anchor.bondId);
+    }
+  }
+  if (markedAtomIds.size === 0 && markedBondIds.size === 0) return false;
+  if (previous.atoms.length !== next.atoms.length || previous.bonds.length !== next.bonds.length) return true;
+
+  const nextAtomById = new Map(next.atoms.map((atom) => [atom.id, atom]));
+  if (previous.atoms.some((atom) => nextAtomById.get(atom.id)?.element !== atom.element)) return true;
+  const endsKey = (bond: MoleculeBond) => [bond.fromAtomId, bond.toAtomId].sort().join("\n");
+  for (const bondId of markedBondIds) {
+    const before = previous.bonds.find((bond) => bond.id === bondId);
+    const after = next.bonds.find((bond) => bond.id === bondId);
+    if (!before || !after || endsKey(before) !== endsKey(after)) return true;
+    markedAtomIds.add(before.fromAtomId).add(before.toAtomId);
+  }
+  const neighbourElements = (molecule: MoleculeObject, atomId: string) => {
+    const elementById = new Map(molecule.atoms.map((atom) => [atom.id, atom.element]));
+    return molecule.bonds
+      .flatMap((bond) => bond.fromAtomId === atomId ? [bond.toAtomId] : bond.toAtomId === atomId ? [bond.fromAtomId] : [])
+      .map((id) => elementById.get(id) ?? "")
+      .sort()
+      .join(",");
+  };
+  return [...markedAtomIds].some((atomId) => neighbourElements(previous, atomId) !== neighbourElements(next, atomId));
+}
+
 /**
  * Apply a structure-editor save to the selected molecule, returning the side-dependent labels the
  * save read again from their drawing (`carryLabelBondSidesThroughEditorSave`), for the caller to show.
@@ -20427,7 +20482,7 @@ export function applyEditorSaveResultToSelectedObject(
 export function applyEditorSaveResultWithLabelWarnings(
   document: ChemDraftDocument,
   result: EditorSaveResult
-): { document: ChemDraftDocument; labelWarnings: EditorSaveLabelWarning[] } {
+): { document: ChemDraftDocument; labelWarnings: EditorSaveLabelWarning[]; refusal?: string } {
   const selectedMolecule = getSelectedMolecule(document);
   if (!selectedMolecule) {
     throw new Error("Cannot apply editor save result: no molecule is selected.");
@@ -20437,6 +20492,10 @@ export function applyEditorSaveResultWithLabelWarnings(
   }
 
   const synced = syncMoleculePreviewFromEditorSave(selectedMolecule, result.object);
+  const page = document.pages.find((candidate) => candidate.objects.some((object) => object.id === selectedMolecule.id));
+  if (page && editorSaveMayShiftElectronMarks(page.objects, selectedMolecule, synced.molecule)) {
+    return { document, labelWarnings: [], refusal: EDITOR_SAVE_MARK_SHIFT_REFUSAL };
+  }
   return {
     document: applyEditorSaveResultToSelectedObject(document, { ...result, object: synced.molecule }),
     labelWarnings: synced.labelWarnings

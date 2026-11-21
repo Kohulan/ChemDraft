@@ -22723,6 +22723,12 @@ export function MainWindow({
     // A side-dependent label the save could not carry is read again from its drawing: say so (short
     // on the status line, each atom named in the log) rather than let the save change it silently.
     const applied = applyEditorSaveResultWithLabelWarnings(documentRef.current, result);
+    // The save reuses atom ids by index, so adding or removing atoms could silently put a charge or
+    // radical mark on another atom: refuse it, leaving the document and undo stack unchanged.
+    if (applied.refusal) {
+      setStatus(applied.refusal);
+      return;
+    }
     // Only the edited molecule may change. The save reuses atom ids by index, so its marks are not
     // carried by the charge-follows rule: they stay put and normal association applies.
     commitDocumentChangeWithPageFit(applied.document, undefined, undefined, undefined, structureEditorChemistry(result.object.id));
