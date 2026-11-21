@@ -2620,8 +2620,12 @@ describe("ChemDraft desktop shell", () => {
       mainWindowSource.indexOf("const commitDocumentChange ="),
       mainWindowSource.indexOf("const commitDocumentChangeWithPageFit =")
     );
-    expect(commitDocumentChangeSource).toContain("prepareDocumentCommit(nextDocument, undoLabel, assertFinalDocument)");
-    const finalGuardIndex = commitDocumentChangeSource.indexOf("prepareDocumentCommit(next, undoLabel, assertFinalDocument)");
+    // The Undo label may be a function (before, after) => string, so both guarded and unguarded
+    // paths go through one local `prepare` helper that still calls prepareDocumentCommit.
+    expect(commitDocumentChangeSource).toContain("return prepareDocumentCommit(next, undoLabel, assertFinalDocument);");
+    expect(commitDocumentChangeSource).toContain("const present = prepareDocumentCommit(next, undefined, assertFinalDocument);");
+    expect(commitDocumentChangeSource).toContain("const present = reusablePresent ?? prepare(currentHistory.present, nextDocument);");
+    const finalGuardIndex = commitDocumentChangeSource.indexOf("guardedPresent = prepare(current, next);");
     expect(finalGuardIndex).toBeGreaterThan(-1);
     expect(finalGuardIndex).toBeLessThan(commitDocumentChangeSource.indexOf("checkpointTextEditBeforeCommitRef.current()"));
     const assistantHistorySource = mainWindowSource.slice(
