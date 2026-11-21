@@ -60,6 +60,7 @@ it("expires page consent once per request and ignores a late affirmative answer"
     const answer = requests.requestPageSpace!(input);
     ready.resolve();
     expect(await answer).toEqual({ ok: true, value: { outcome: "unanswered" } });
+    expect(confirm).toHaveBeenCalledExactlyOnceWith(expect.any(AbortSignal), "document");
     late.resolve("enlarge");
     expect(await requests.requestPageSpace!(input)).toEqual({ ok: true, value: { outcome: "unanswered" } });
   } } });
