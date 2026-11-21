@@ -86,7 +86,7 @@ export function AboutWindow({ version, buildStamp, error, onReady, onCopy, onClo
           </ul>
           <details className="about-group">
             <summary>Bug reports and testing ({testers.handles.length})</summary>
-            <p>Thank you to everyone who reported problems or commented on the project's GitHub issues.</p>
+            <p>Thank you to everyone who reported problems or commented on the project's GitHub issues and pull requests.</p>
             <ul className="about-handles">
               {testers.handles.map(handle => <li key={handle}>
                 <ExternalLink href={"https://github.com/" + handle}>@{handle}</ExternalLink>

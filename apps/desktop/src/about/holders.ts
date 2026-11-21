@@ -1,19 +1,19 @@
-// Copyright holders for the About window's open-source list. Every holder string is read
-// at build time from a record the package itself ships (its license file or package
-// metadata) or from the repository's own NOTICE. Nothing is typed in by hand, and when no
-// record names a holder the list says "see license" instead of guessing.
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
-import { URL, fileURLToPath } from "node:url";
+// Copyright holders for the About window's open-source list. Every holder string comes from a
+// record the package itself ships (its license file or package metadata) or from the
+// repository's own NOTICE. Nothing is typed in by hand, and when no record names a holder the
+// list says "see license" instead of guessing.
+//
+// The package records are read by `node scripts/generate-about-holders.mjs` (scripts/generate-about-holders.mjs, via
+// holdersFromDisk.ts) into the committed holderData.json. The build reads only that file, so every
+// platform shows the same holders whatever its install or cargo registry looks like.
+import holderData from "./holderData.json";
 
 export const SEE_LICENSE = "see license";
 
-const root = new URL("../../../../", import.meta.url);
 const maxStatement = 200;
 const maxContributors = 5;
 
-function dedupe(values: string[]): string[] {
+export function dedupe(values: string[]): string[] {
   const seen = new Set<string>();
   return values.filter(value => {
     const key = value.toLowerCase();
@@ -76,81 +76,34 @@ export function licenseFileStatements(text: string): string[] {
   return dedupe(found);
 }
 
-function readOptional(path: string): string | undefined {
-  try {
-    if (!statSync(path).isFile() || statSync(path).size > 256 * 1024) return undefined;
-    return readFileSync(path, "utf8");
-  } catch {
-    return undefined;
-  }
-}
 
-function licenseFiles(directory: string): string[] {
-  try {
-    return readdirSync(directory).filter(file => /^(?:licen[cs]e|copying|notice)(?:[-._].*)?$/i.test(file))
-      .sort().map(file => join(directory, file));
-  } catch {
-    return [];
-  }
-}
-
-function personName(value: unknown): string | undefined {
+export function personName(value: unknown): string | undefined {
   const raw = typeof value === "string" ? value : (value as { name?: unknown } | null)?.name;
   if (typeof raw !== "string") return undefined;
   const name = raw.replace(/<[^>]*>/g, "").replace(/\([^)]*\)/g, "").replace(/\s+/g, " ").trim();
   return name || undefined;
 }
 
+export const AND_OTHERS = "and others";
+
+// Metadata lists are cut to maxContributors; when they are, the list says so.
+function limitPeople(names: string[]): string[] {
+  const unique = dedupe(names);
+  return unique.length > maxContributors ? [...unique.slice(0, maxContributors), AND_OTHERS] : unique;
+}
+
 // The package.json author and contributors, used only when the package has no copyright line.
-function manifestPeople(manifest: { author?: unknown; contributors?: unknown }): string[] {
+export function manifestPeople(manifest: { author?: unknown; contributors?: unknown }): string[] {
   const author = personName(manifest.author);
   const contributors = Array.isArray(manifest.contributors)
     ? manifest.contributors.map(personName).filter((name): name is string => Boolean(name)) : [];
-  return dedupe([...(author ? [author] : []), ...contributors].slice(0, maxContributors));
+  return limitPeople([...(author ? [author] : []), ...contributors]);
 }
 
-let npmIndex: Map<string, string> | undefined;
-
-function npmPackageDirectory(name: string, version: string): string | undefined {
-  if (!npmIndex) {
-    npmIndex = new Map();
-    const store = new URL("node_modules/.pnpm/", root);
-    let entries: string[] = [];
-    try { entries = readdirSync(store); } catch { /* no install: every holder falls back to "see license" */ }
-    for (const entry of entries) {
-      const at = entry.indexOf("@", 1);
-      if (at < 0) continue;
-      const packageName = entry.slice(0, at).replace("+", "/");
-      const packageVersion = entry.slice(at + 1).split(/[_(]/)[0]!;
-      const directory = join(fileURLToPath(store), entry, "node_modules", packageName);
-      if (!existsSync(directory)) continue;
-      npmIndex.set(packageName + "@" + packageVersion, directory);
-      if (!npmIndex.has(packageName)) npmIndex.set(packageName, directory);
-    }
-  }
-  return npmIndex.get(name + "@" + version) ?? npmIndex.get(name);
-}
-
-let cargoIndex: Map<string, string> | undefined;
-
-function cargoCrateDirectory(name: string, version: string): string | undefined {
-  if (!cargoIndex) {
-    cargoIndex = new Map();
-    const registry = join(process.env.CARGO_HOME || join(homedir(), ".cargo"), "registry", "src");
-    try {
-      for (const index of readdirSync(registry)) {
-        for (const crate of readdirSync(join(registry, index))) cargoIndex.set(crate, join(registry, index, crate));
-      }
-    } catch { /* no cargo registry on this host */ }
-  }
-  return cargoIndex.get(name + "-" + version);
-}
-
-function cargoAuthors(manifest: string): string[] {
+export function cargoAuthors(manifest: string): string[] {
   const list = manifest.match(/^authors\s*=\s*\[([^\]]*)\]/m)?.[1];
   if (!list) return [];
-  return dedupe([...list.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map(match => personName(match[1]!)).filter((name): name is string => Boolean(name))
-    .slice(0, maxContributors));
+  return limitPeople([...list.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map(match => personName(match[1]!)).filter((name): name is string => Boolean(name)));
 }
 
 export interface LibraryRef {
@@ -165,22 +118,20 @@ export interface LibraryHolders {
   from: "license file" | "package metadata" | "none";
 }
 
-export function libraryHolders(library: LibraryRef): LibraryHolders {
-  for (const version of library.versions) {
-    const directory = library.kind === "npm" ? npmPackageDirectory(library.name, version) : cargoCrateDirectory(library.name, version);
-    if (!directory) continue;
-    const statements = dedupe(licenseFiles(directory).flatMap(file => licenseFileStatements(readOptional(file) ?? "")));
-    if (statements.length) return { holders: statements, from: "license file" };
-    const metadata = library.kind === "npm"
-      ? manifestPeople(JSON.parse(readOptional(join(directory, "package.json")) ?? "{}"))
-      : cargoAuthors(readOptional(join(directory, "Cargo.toml")) ?? "");
-    if (metadata.length) return { holders: metadata, from: "package metadata" };
-  }
-  return { holders: [], from: "none" };
+export type HolderTable = Readonly<Record<string, LibraryHolders>>;
+
+/** The committed table holds one entry per exact package version: "npm:react@19.2.0". */
+export function holderKey(kind: LibraryRef["kind"], name: string, version: string): string {
+  return kind + ":" + name + "@" + version;
 }
 
-export function resolveHolders(noticeHolders: string[], libraries: LibraryRef[]): string[] {
+export const committedHolders: HolderTable = (holderData as { entries: HolderTable }).entries;
+
+// Only the exact locked version counts: another version of a package can name other holders.
+export function resolveHolders(noticeHolders: string[], libraries: LibraryRef[], table: HolderTable = committedHolders): string[] {
   if (noticeHolders.length) return dedupe(noticeHolders);
-  const fromLibraries = dedupe(libraries.flatMap(library => libraryHolders(library).holders));
-  return fromLibraries.length ? fromLibraries : [SEE_LICENSE];
+  const fromLibraries = dedupe(libraries.flatMap(library => library.versions.flatMap(version =>
+    table[holderKey(library.kind, library.name, version)]?.holders ?? [])));
+  const named = fromLibraries.filter(holder => holder !== SEE_LICENSE);
+  return named.length ? named : [SEE_LICENSE];
 }

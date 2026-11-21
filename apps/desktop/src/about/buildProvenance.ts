@@ -184,6 +184,7 @@ export function buildAboutProvenance(): AboutProvenance & {
   inventoryCoverage: Map<string, string>;
   noticeCoverage: Map<string, string>;
   npmCoverage: Map<string, string>;
+  libraries: LibraryRef[];
 } {
   const inventory = readInventoryRows(readAboutSource(inventoryPath));
   const notice = readAboutSource("NOTICE");
@@ -284,6 +285,7 @@ export function buildAboutProvenance(): AboutProvenance & {
   const licenseTexts = Object.fromEntries([...licensePaths].map(path => [path, readAboutSource(path)]));
   return {
     components: [...components.values()].sort((a, b) => a.name.localeCompare(b.name, "en")),
-    licenseTexts, inventoryCoverage, noticeCoverage, npmCoverage
+    licenseTexts, inventoryCoverage, noticeCoverage, npmCoverage,
+    libraries: [...libraryRefs.values()].flat()
   };
 }

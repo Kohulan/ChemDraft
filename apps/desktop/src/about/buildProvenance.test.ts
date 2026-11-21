@@ -1,4 +1,3 @@
-import { existsSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { buildAboutProvenance, readAboutSource } from "./buildProvenance";
 import contributors from "./contributors.json";
@@ -87,10 +86,9 @@ describe("About provenance", () => {
     expect(holders("@tanstack/react-hotkeys")).toBe("Copyright (c) 2026 Tanner Linsley");
     // Never invented: a holder is absent where no record names one.
     expect(holders("Eigen 3.4.0")).toBe(SEE_LICENSE);
-    if (existsSync(new URL("../../../../node_modules/.pnpm/", import.meta.url))) {
-      expect(holders("react")).toMatch(/Meta Platforms/);
-      expect(holders("zod")).toMatch(/Colin McDonnell/);
-    }
+    // From the committed holderData.json, so the same on a host with no install.
+    expect(holders("react")).toMatch(/Meta Platforms/);
+    expect(holders("zod")).toMatch(/Colin McDonnell/);
   });
 
   it("reads holders only from copyright statements, never from license prose or templates", () => {
