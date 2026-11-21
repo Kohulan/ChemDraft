@@ -4,9 +4,18 @@
 The Linux container smoke (.github/workflows/linux-container-smoke.yml) runs this as its
 unprivileged user under dbus-run-session, in the Wayland jobs where ChemDraft uses XWayland.
 That is the default for both packages: the AppImage's GTK hook exports GDK_BACKEND=x11, and
-the .deb picks it itself when WAYLAND_DISPLAY is set. The check:
+the .deb picks it itself when WAYLAND_DISPLAY is set. It runs once per compositor:
 
-1. starts headless Weston with XWayland, then the package with no GDK_BACKEND of its own;
+- --compositor kwin (the click-to-focus gate): a virtual KWin (kwin_wayland --virtual
+  --xwayland), as on KDE Plasma. KWin's X window manager honors a client's own focus request,
+  so ChemDraft's XSetInputFocus with the click's time decides whether the field gets the keys.
+  The field must change.
+- --compositor weston (the default; setup and accessibility only): headless Weston, which
+  cannot test click-to-focus (see below). The field may stay unchanged; the log says so.
+
+The check:
+
+1. starts the compositor with XWayland, then the package with no GDK_BACKEND of its own;
 2. pastes propane with Edit > Paste and records the document's chemistry with Edit > Select All,
    Edit > Copy As > SMILES and Edit > Copy (the native selection JSON);
 3. opens Drawn Structure Settings from View > Toolbars, whose number fields are enabled only
@@ -15,28 +24,33 @@ the .deb picks it itself when WAYLAND_DISPLAY is set. The check:
    label), logging every candidate it saw, then clicks into it with a real XTEST click and types "30";
 5. requires the field's value to change and the document's chemistry not to.
 
-Every menu command in steps 2 and 3 is chosen over AT-SPI, not typed. Weston's X window manager
-decides where X keyboard focus goes and can put it back when an X client such as xdotool moves
-it, so keyboard shortcuts meant for the document window may land elsewhere or nowhere.
+Every menu command in steps 2 and 3 is chosen over AT-SPI, not typed. The compositor's X window
+manager decides where X keyboard focus goes and can put it back when an X client such as xdotool
+moves it, so keyboard shortcuts meant for the document window may land elsewhere or nowhere.
 Edit > Paste, Copy and Select All go to whichever ChemDraft window has focus, or to the document
 window when none does, so the check first requires that no other ChemDraft window has focus. Only the field click
 and the typing in step 4 use XTEST input, because that is what the check tests.
 
-Weston limits what step 4 can show. Its X window manager (xwayland/window-manager.c in Weston
-16) gives X focus only to the window the compositor last activated, and resets any other focus
-change a client makes, ChemDraft's own XSetInputFocus included. It also ignores
-_NET_ACTIVE_WINDOW. The compositor activates a window only on input it sees through a Wayland
-seat, and headless Weston has no seat unless started with --fake-seat, while XTEST input stays
-inside XWayland. So under Weston X focus stays on Weston's no-focus window (1x1 at -100,-100)
-whatever the app does. ChemDraft logs one "[palette-focus] linux-acquire" line per field click
-to chemdraft.log, and this script prints those lines, so the log shows how far the app got.
+Weston cannot test click-to-focus, so under Weston step 5 checks only the chemistry. Its X
+window manager (xwayland/window-manager.c in Weston 16) gives X focus only to the window the
+compositor last activated, and resets any other focus change a client makes, ChemDraft's own
+XSetInputFocus included. It also ignores _NET_ACTIVE_WINDOW. The compositor activates a window
+only on input it sees through a Wayland seat, and headless Weston has no seat unless started
+with --fake-seat, while XTEST input stays inside XWayland. So under Weston X focus stays on
+Weston's no-focus window (1x1 at -100,-100) whatever the app does.
+
+Under both compositors ChemDraft logs one "[palette-focus] linux-acquire" line per field click
+to chemdraft.log, and this script prints those lines, so the log shows how far the app got:
+whether the click reached it, what its focus gate decided (request=...), whether it called
+XSetInputFocus, and the outcome.
 
 Native Wayland (CHEMDRAFT_NATIVE_WAYLAND=1) is not covered. Weston offers no protocol that lets
 one client type into another client's window, and xdotool reaches X11 windows only.
 
-Usage: toolbar-field.py <bundle> <appimage|deb> <log directory>
+Usage: toolbar-field.py [--compositor weston|kwin] <bundle> <appimage|deb> <log directory>
 """
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -61,6 +75,7 @@ FIELD_LABELS = ("Chain angle", "Target bond length", "Line width", "Bold width",
                 "Spacing abs.", "Margin width", "Hash spacing", "Double-bond inset")
 LOGGED_STATES = ("enabled", "sensitive", "showing", "visible", "editable", "focusable", "focused")
 TYPED = "30"
+COMPOSITORS = ("weston", "kwin")
 
 
 class SmokeFailure(Exception):
@@ -106,14 +121,18 @@ def read_clipboard(target):
 
 
 class Session:
-    """Weston, its XWayland display and the package, all torn down together."""
+    """The compositor, its XWayland display and the package, all torn down together."""
 
-    def __init__(self, bundle, package, logs):
+    def __init__(self, bundle, package, logs, compositor="weston"):
         self.bundle = bundle
         self.package = package
         self.logs = logs
+        self.compositor = compositor
+        # Weston resets every client focus change (see the module docstring), so only KWin
+        # can show whether a click on a palette field gives it the keyboard.
+        self.tests_focus = compositor == "kwin"
         self.work = Path(tempfile.mkdtemp(prefix="chemdraft-field-"))
-        self.weston = None
+        self.server = None
         self.app = None
         self.main_pid = None
 
@@ -130,12 +149,12 @@ class Session:
                     os.killpg(self.app.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-        if self.weston is not None and self.weston.poll() is None:
-            self.weston.terminate()
+        if self.server is not None and self.server.poll() is None:
+            self.server.terminate()
             try:
-                self.weston.wait(timeout=5)
+                self.server.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self.weston.kill()
+                self.server.kill()
         shutil.rmtree(self.work, ignore_errors=True)
 
     def start_display(self):
@@ -151,24 +170,61 @@ class Session:
             os.environ[name] = str(self.work / folder)
         os.environ["RUST_BACKTRACE"] = "1"
         display_log = self.logs / "display.log"
-        self.weston = subprocess.Popen(
+        if self.compositor == "kwin":
+            ready = self.start_kwin(runtime, display_log)
+        else:
+            ready = self.start_weston(runtime, display_log)
+        name = "KWin" if self.compositor == "kwin" else "Weston"
+        os.environ["DISPLAY"] = wait_for(ready, f"{name} and XWayland did not start", seconds=60)
+        os.environ["WAYLAND_DISPLAY"] = SOCKET
+        print(f"{name} session: WAYLAND_DISPLAY={SOCKET} DISPLAY={os.environ['DISPLAY']}",
+              flush=True)
+
+    def start_weston(self, runtime, display_log):
+        self.server = subprocess.Popen(
             ["weston", "--backend=headless", "--renderer=pixman", "--shell=kiosk-shell.so",
              "--xwayland", f"--socket={SOCKET}", "--idle-time=0", "--width=1920", "--height=1080"],
             stdout=display_log.open("wb"), stderr=subprocess.STDOUT)
 
         def ready():
-            if self.weston.poll() is not None:
-                raise SmokeFailure(f"Weston exited with status {self.weston.returncode}")
+            self.server_alive()
             found = re.findall(r"xserver listening on display (:\d+)",
                                display_log.read_text(errors="replace"))
             if not (runtime / SOCKET).is_socket() or not found:
                 raise SmokeFailure("no Wayland socket or XWayland display yet")
             return found[-1]
 
-        os.environ["DISPLAY"] = wait_for(ready, "Weston and XWayland did not start")
-        os.environ["WAYLAND_DISPLAY"] = SOCKET
-        print(f"Weston session: WAYLAND_DISPLAY={SOCKET} DISPLAY={os.environ['DISPLAY']}",
-              flush=True)
+        return ready
+
+    def start_kwin(self, runtime, display_log):
+        """A virtual KWin with XWayland. KWin picks the X display itself and passes it in
+        DISPLAY to the programs named on its command line, so one of those reports it."""
+        reported = self.work / "x-display"
+        helper = self.work / "report-display.sh"
+        helper.write_text("#!/bin/sh\n"
+                          f"printf '%s\\n' \"$DISPLAY\" > '{reported}.tmp' && "
+                          f"mv '{reported}.tmp' '{reported}'\n"
+                          "exec sleep 86400\n")
+        helper.chmod(0o755)
+        # QPainter compositing needs no GPU or EGL device in the container.
+        environment = {**os.environ, "KWIN_COMPOSE": "Q"}
+        self.server = subprocess.Popen(
+            ["kwin_wayland", "--virtual", "--xwayland", f"--socket={SOCKET}", "--width=1920",
+             "--height=1080", "--no-lockscreen", "--no-global-shortcuts", str(helper)],
+            stdout=display_log.open("wb"), stderr=subprocess.STDOUT, env=environment)
+
+        def ready():
+            self.server_alive()
+            display = reported.read_text().strip() if reported.exists() else ""
+            if not (runtime / SOCKET).is_socket() or not display:
+                raise SmokeFailure("no Wayland socket or XWayland display yet")
+            return display
+
+        return ready
+
+    def server_alive(self):
+        if self.server.poll() is not None:
+            raise SmokeFailure(f"{self.compositor} exited with status {self.server.returncode}")
 
     def launch(self):
         command = [self.bundle]
@@ -206,8 +262,7 @@ class Session:
     def alive(self):
         if self.app.poll() is not None:
             raise SmokeFailure(f"ChemDraft exited with status {self.app.returncode}")
-        if self.weston.poll() is not None:
-            raise SmokeFailure(f"Weston exited with status {self.weston.returncode}")
+        self.server_alive()
 
     def window(self, title):
         """The visible X11 window with this exact title that belongs to the launch."""
@@ -379,7 +434,8 @@ def report_focus(Atspi, pid, moment):
 
 def require_document_focus(session, Atspi, document):
     """Edit > Paste, Copy and Select All follow the focused ChemDraft window, if there is one."""
-    # Under Openbox this hands the document the focus. Weston's X window manager may undo it.
+    # Under Openbox and KWin this hands the document the focus. Weston's X window manager may
+    # undo it.
     run("xdotool", "windowfocus", document, check=False)
 
     def document_or_none():
@@ -684,16 +740,27 @@ def type_into_field(session, Atspi, settings):
     try:
         after = wait_for(changed, f"Typing {TYPED!r} did not reach the {name!r} field",
                          seconds=5)
+    except SmokeFailure as error:
+        if session.tests_focus:
+            raise SmokeFailure(f"{error}; the linux-acquire lines above show why") from error
+        # Weston resets ChemDraft's focus request, so this is expected there. Record it
+        # without failing; the chemistry check that follows still applies.
+        print(f"::notice title=Weston cannot test click-to-focus::{error}. Weston's X window "
+              "manager resets client focus changes; the KWin check is the focus gate",
+              flush=True)
+        after = None
     finally:
         report_app_focus_log(session)
-    print(f"Typing {TYPED!r} changed {name!r} from {before!r} to {after!r}", flush=True)
-    # Discard the draft so no setting is committed.
+    if after is not None:
+        print(f"Typing {TYPED!r} changed {name!r} from {before!r} to {after!r}", flush=True)
+    # Discard any draft so no setting is committed.
     keys("Escape")
+    return after is not None
 
 
-def main(bundle, package, logs):
+def main(bundle, package, logs, compositor):
     logs.mkdir(parents=True, exist_ok=True)
-    with Session(bundle, package, logs) as session:
+    with Session(bundle, package, logs, compositor) as session:
         session.start_display()
         session.launch()
         document = wait_for(lambda: session.window("ChemDraft"),
@@ -708,7 +775,7 @@ def main(bundle, package, logs):
         open_settings_toolbar(Atspi, session.main_pid)
         settings = wait_for(lambda: session.window(SETTINGS_TITLE),
                             f"The {SETTINGS_TITLE} window did not appear", seconds=30)
-        type_into_field(session, Atspi, settings)
+        typed = type_into_field(session, Atspi, settings)
 
         session.alive()
         time.sleep(0.5)
@@ -718,14 +785,26 @@ def main(bundle, package, logs):
         if after != before:
             raise SmokeFailure(f"the document's chemistry changed from {before} to {after}")
         session.alive()
-    print("Typing into a toolbar number field changed the field and left the chemistry alone.",
-          flush=True)
+    if typed:
+        print(f"Under {compositor}, typing into a toolbar number field changed the field and left "
+              "the chemistry alone.", flush=True)
+    else:
+        print(f"Under {compositor}, the toolbar number field did not take the keys (expected: "
+              "Weston cannot test click-to-focus) and the chemistry was left alone.", flush=True)
+
+
+def arguments(argv):
+    parser = argparse.ArgumentParser(usage=__doc__.rsplit("Usage: ", 1)[1].strip())
+    parser.add_argument("--compositor", choices=COMPOSITORS, default="weston")
+    parser.add_argument("bundle")
+    parser.add_argument("package", choices=("appimage", "deb"))
+    parser.add_argument("logs", type=Path)
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4 or sys.argv[2] not in ("appimage", "deb"):
-        sys.exit(__doc__)
+    options = arguments(sys.argv[1:])
     try:
-        main(sys.argv[1], sys.argv[2], Path(sys.argv[3]))
+        main(options.bundle, options.package, options.logs, options.compositor)
     except Exception as error:  # noqa: BLE001 - report every failure as one annotation.
         sys.exit(f"::error::Toolbar number field check failed: {type(error).__name__}: {error}")

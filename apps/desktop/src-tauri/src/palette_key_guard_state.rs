@@ -389,6 +389,36 @@ pub(super) fn click_focus_time(x11: bool, timestamp: u32) -> Option<u32> {
     (x11 && timestamp != 0).then_some(timestamp)
 }
 
+/// Why a Linux field acquisition stops before it touches native focus, or `None` to go on.
+/// `app_foreground` is whether any ChemDraft toplevel holds focus when the IPC runs.
+///
+/// Without app focus, only a `Present` request goes on. `request_focus` returns one only for
+/// a GTK button press on this same window, with a server timestamp, less than `TIMEOUT_MS`
+/// old: the user clicked our palette. A window manager can move X focus off the document
+/// while it offers that click to the palette (which is not yet accepting focus), so app focus
+/// at IPC time cannot tell that click from a background request. A JavaScript-only or
+/// delayed request has no live press and stays refused. The X server ignores the click-time
+/// `XSetInputFocus` if focus changed after the press, so a later switch to another
+/// application wins. macOS likewise makes the panel key on the native mouse-down whatever
+/// the app's activation (`panel_focus_macos.rs`).
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn acquire_refusal(
+    visible: bool,
+    minimized: bool,
+    app_foreground: bool,
+    request: &FocusRequest,
+) -> Option<&'static str> {
+    if !visible {
+        Some("denied:hidden")
+    } else if minimized {
+        Some("denied:minimized")
+    } else if !app_foreground && !matches!(request, FocusRequest::Present { .. }) {
+        Some("denied:app-not-focused")
+    } else {
+        None
+    }
+}
+
 #[cfg(any(target_os = "linux", test))]
 pub(super) fn blocks_document_key(
     pending: bool,
@@ -489,6 +519,99 @@ mod tests {
         assert_eq!(click_focus_time(true, 0), None);
         assert_eq!(click_focus_time(false, 42), None);
         assert_eq!(click_focus_time(false, 0), None);
+    }
+
+    #[test]
+    fn a_native_press_on_the_palette_may_take_focus_with_no_chemdraft_window_focused() {
+        // A window manager can move X focus off the document as it offers the click to the
+        // palette, so when the IPC runs no ChemDraft toplevel holds focus. The press asked.
+        for label in [
+            "toolset-core-drawnStructureSettings",
+            "plugin-panel-example",
+        ] {
+            let mut guard = Guard::new();
+            let click = guard.gtk_pointer(label, 10, 100, 511_203);
+            let request = guard.request_focus(label, Some(click.sequence), 100, 20, false);
+            assert!(matches!(
+                request,
+                FocusRequest::Present {
+                    timestamp: 511_203,
+                    ..
+                }
+            ));
+            assert_eq!(
+                acquire_refusal(true, false, false, &request),
+                None,
+                "{label}"
+            );
+            assert_eq!(
+                acquire_refusal(true, false, true, &request),
+                None,
+                "{label}"
+            );
+            // Still never for a hidden or minimized window.
+            assert_eq!(
+                acquire_refusal(false, false, false, &request),
+                Some("denied:hidden")
+            );
+            assert_eq!(
+                acquire_refusal(true, true, false, &request),
+                Some("denied:minimized")
+            );
+        }
+    }
+
+    #[test]
+    fn requests_without_a_live_native_press_stay_refused_in_the_background() {
+        let label = "toolset-core-drawnStructureSettings";
+        let refused = |guard: &mut Guard, sequence, now| {
+            let request = guard.request_focus(label, sequence, 100, now, false);
+            assert!(matches!(request, FocusRequest::Denied));
+            acquire_refusal(true, false, false, &request)
+        };
+        // JS-only: the page asks with no GTK press at all.
+        let mut guard = Guard::new();
+        assert_eq!(
+            refused(&mut guard, None, 20),
+            Some("denied:app-not-focused")
+        );
+        assert_eq!(
+            refused(&mut guard, Some(1), 20),
+            Some("denied:app-not-focused")
+        );
+        // A press with no server timestamp cannot be proved to be the user's.
+        let click = guard.gtk_pointer(label, 10, 100, 0);
+        assert_eq!(
+            refused(&mut guard, Some(click.sequence), 20),
+            Some("denied:app-not-focused")
+        );
+        // A press on another window, or one that has expired, is not this request's.
+        let mut guard = Guard::new();
+        let click = guard.gtk_pointer("toolset-core-main", 10, 100, 42);
+        assert_eq!(
+            refused(&mut guard, Some(click.sequence), 20),
+            Some("denied:app-not-focused")
+        );
+        let mut guard = Guard::new();
+        let click = guard.gtk_pointer(label, 10, 100, 42);
+        assert_eq!(
+            refused(&mut guard, Some(click.sequence), 10 + TIMEOUT_MS),
+            Some("denied:app-not-focused")
+        );
+        // An outside click or hide ended the press before the IPC arrived.
+        let mut guard = Guard::new();
+        let click = guard.gtk_pointer(label, 10, 100, 42);
+        guard.end("", End::Outside, None, 0);
+        assert_eq!(
+            refused(&mut guard, Some(click.sequence), 20),
+            Some("denied:app-not-focused")
+        );
+        // With ChemDraft focused, a request without a press passes the gate but presents
+        // nothing (unchanged): only `Present` ever calls XSetInputFocus.
+        assert_eq!(
+            acquire_refusal(true, false, true, &FocusRequest::Denied),
+            None
+        );
     }
 
     #[test]

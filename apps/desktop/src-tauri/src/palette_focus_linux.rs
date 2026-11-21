@@ -195,12 +195,14 @@ fn x11_focus_report(native: &gtk::ApplicationWindow) -> String {
 
 /// One line per Linux field acquisition, written whatever the agent-bridge setting, so a
 /// CI log shows where focus went without changing what the smoke tests. Field order: what
-/// started it, the window system, accept-focus before and after, the request the key guard
-/// made, the X11 focus call, the presentation, the outcome, and the key guard at the end.
+/// started it, the window system, whether a ChemDraft window had focus, accept-focus before
+/// and after, the request the key guard made, the X11 focus call, the presentation, the
+/// outcome, and the key guard at the end.
 struct AcquireLog {
     label: String,
     trigger: String,
     backend: &'static str,
+    app_foreground: Option<bool>,
     accept_before: Option<bool>,
     request: String,
     x11: String,
@@ -217,6 +219,7 @@ impl AcquireLog {
                 GUARD.lock().unwrap().describe_pending_click()
             ),
             backend: "unknown",
+            app_foreground: None,
             accept_before: None,
             request: String::new(),
             x11: "not-called".into(),
@@ -225,15 +228,17 @@ impl AcquireLog {
     }
 
     fn emit(&self, outcome: &str, end: &str) {
-        let accept_before = self
-            .accept_before
-            .map_or_else(|| "unknown".to_owned(), |a| a.to_string());
+        let known =
+            |value: Option<bool>| value.map_or_else(|| "unknown".to_owned(), |v| v.to_string());
+        let (app_foreground, accept_before) =
+            (known(self.app_foreground), known(self.accept_before));
         let present = self
             .present
             .map_or_else(|| "not-called".to_owned(), |time| format!("time={time}"));
         crate::palette_focus_log_always(format_args!(
-            "linux-acquire label={} {} backend={} accept-focus-before={accept_before} \
-             request={} xsetinputfocus={} present-with-time={present} outcome={outcome} {end}",
+            "linux-acquire label={} {} backend={} app-foreground={app_foreground} \
+             accept-focus-before={accept_before} request={} xsetinputfocus={} \
+             present-with-time={present} outcome={outcome} {end}",
             self.label, self.trigger, self.backend, self.request, self.x11
         ));
     }
@@ -316,17 +321,16 @@ pub(crate) async fn acquire(
             state::FocusRequest::Present { .. } => "present",
         };
         log.request = kind.into();
-        let refusal = if !native.is_visible() {
-            Some("denied:hidden")
-        } else if target.is_minimized().unwrap_or(true) {
-            Some("denied:minimized")
-        } else if !crate::foreground_belongs_to_app() {
-            // No ChemDraft window has toplevel focus, so a delayed request could steal
-            // focus from another application.
-            Some("denied:app-not-focused")
-        } else {
-            None
-        };
+        let app_foreground = crate::foreground_belongs_to_app();
+        log.app_foreground = Some(app_foreground);
+        // Without a ChemDraft window in front, only this palette's own live GTK press
+        // (a Present request) may take focus; anything else could steal it from another app.
+        let refusal = state::acquire_refusal(
+            native.is_visible(),
+            target.is_minimized().unwrap_or(true),
+            app_foreground,
+            &request,
+        );
         if let Some(refusal) = refusal {
             // Keep the guard's own verdict: it shows whether the GTK press matched.
             log.request = format!("{refusal}(guard:{kind})");

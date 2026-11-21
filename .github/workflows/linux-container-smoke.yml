@@ -163,17 +163,24 @@ jobs:
                 ;;
             esac
           elif [[ "$NATIVE_WAYLAND" != 1 ]]; then
-            # The toolbar field check drives ChemDraft's XWayland windows in the Weston session.
+            # The toolbar field checks drive ChemDraft's XWayland windows in a Weston session and
+            # in a virtual KWin session (Plasma's compositor, whose X window manager honors a
+            # client's own focus request).
             case "$DISTRO" in
               debian)
                 apt-get install -y --no-install-recommends at-spi2-core gir1.2-atspi-2.0 python3-gi \
-                  fonts-dejavu-core x11-utils xclip xdotool
+                  fonts-dejavu-core x11-utils xclip xdotool kwin-wayland
                 ;;
               fedora)
                 dnf install -y at-spi2-core python3-gobject-base dejavu-sans-fonts /usr/bin/xprop \
-                  xclip xdotool
+                  xclip xdotool /usr/bin/kwin_wayland
                 ;;
             esac
+            if ! command -v kwin_wayland >/dev/null; then
+              echo "::error::The $DISTRO KWin package did not install kwin_wayland"
+              exit 1
+            fi
+            kwin_wayland --version || true
           fi
 
           if [[ "$PACKAGE" == appimage ]]; then
@@ -203,10 +210,14 @@ jobs:
           check-window: ${{ matrix.backend == 'x11' }}
 
       # Both packages use XWayland in a Wayland session by default. Type into a floating
-      # toolbar's number field there with a real click and keys, and require the field to
-      # change and the document's chemistry not to. Native Wayland is not covered: Weston has
-      # no protocol that lets a test client type into another client's window.
-      - name: Type into a toolbar number field in the Wayland session
+      # toolbar's number field there with a real click and keys, and require the document's
+      # chemistry not to change. Weston cannot test click-to-focus: its X window manager resets
+      # every client focus change and activates a window only on Wayland seat input, which
+      # XTEST never reaches. So this step checks setup, accessibility and chemistry only, and
+      # notes an unchanged field without failing. The KWin step below is the focus gate.
+      # Native Wayland is not covered: Weston has no protocol that lets a test client type
+      # into another client's window.
+      - name: Type into a toolbar number field under Weston (no focus check)
         if: matrix.backend == 'wayland' && matrix.native_wayland != '1'
         run: |
           set -euo pipefail
@@ -214,7 +225,24 @@ jobs:
           install -d -o smoke "$logs"
           runuser -u smoke -- env WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 dbus-run-session -- \
             /usr/bin/python3 "$GITHUB_WORKSPACE/.github/workflows/linux-package-smoke/toolbar-field.py" \
-            "$BUNDLE" "$PACKAGE" "$logs" 2>&1 | tee "$logs/harness.log"
+            --compositor weston "$BUNDLE" "$PACKAGE" "$logs" 2>&1 | tee "$logs/harness.log"
+
+      # The same check under a virtual KWin, the compositor of KDE Plasma. KWin's X window
+      # manager honors a client's own focus request, so here the field must change: this is
+      # the pass/fail check for click-to-focus in a toolbar number field. Its log prints
+      # ChemDraft's "[palette-focus] linux-acquire" line for the click, which shows the app's
+      # focus decision (request=...), the XSetInputFocus call and the outcome.
+      - name: Type into a toolbar number field under KWin (focus check)
+        if: >-
+          !cancelled() && matrix.backend == 'wayland' && matrix.native_wayland != '1' &&
+          (matrix.distro == 'debian' || matrix.distro == 'fedora')
+        run: |
+          set -euo pipefail
+          logs="$GITHUB_WORKSPACE/smoke-logs/toolbar-field-kwin"
+          install -d -o smoke "$logs"
+          runuser -u smoke -- env WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 dbus-run-session -- \
+            /usr/bin/python3 "$GITHUB_WORKSPACE/.github/workflows/linux-package-smoke/toolbar-field.py" \
+            --compositor kwin "$BUNDLE" "$PACKAGE" "$logs" 2>&1 | tee "$logs/harness.log"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
