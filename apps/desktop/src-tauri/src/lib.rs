@@ -1,3 +1,7 @@
+#[cfg(target_os = "linux")]
+mod appimage_dialogs;
+#[cfg(target_os = "linux")]
+mod appimage_single_instance;
 mod assistant_mcp;
 mod canvas_context_menu;
 mod canvas_occlusion;
@@ -138,6 +142,21 @@ impl WithoutConsoleWindow for Command {
         self
     }
 }
+
+/// AppRun's working folder is for WebKitGTK. App-owned children start in the user's home
+/// unless the caller sets a resource or workspace directory of its own.
+fn child_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let command = Command::new(program);
+    #[cfg(target_os = "linux")]
+    {
+        let mut command = command;
+        linux_startup::set_child_directory(&mut command);
+        command
+    }
+    #[cfg(not(target_os = "linux"))]
+    command
+}
+
 const SPIN3D_DEBUGGER_WINDOW_LABEL: &str = "spin3d-debugger";
 const SPIN3D_DEBUGGER_WINDOW_ROUTE: &str = "/?window=spin3d-debugger";
 const SPIN3D_DEBUGGER_TOGGLE_COMMAND_ID: &str = "view.toggle3dDebugger";
@@ -1311,6 +1330,8 @@ pub fn run() {
     let perf_log = perf_log::PerfLog::new(perf_enabled);
     let builder = tauri::Builder::default();
     #[cfg(target_os = "linux")]
+    let is_appimage = startup.appimage.is_some();
+    #[cfg(target_os = "linux")]
     let builder = builder.manage(startup);
 
     // Both guards run before any webview or app setup can touch session/settings files.
@@ -1333,8 +1354,19 @@ pub fn run() {
     } else {
         builder.enable_macos_default_menu(false)
     };
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(handle_second_launch));
+    #[cfg(target_os = "linux")]
+    let builder = builder.plugin(if is_appimage {
+        appimage_single_instance::init()
+    } else {
+        tauri_plugin_single_instance::init(handle_second_launch)
+    });
 
     let builder = if perf_enabled {
         builder.plugin(
@@ -1372,8 +1404,17 @@ pub fn run() {
         // handler rather than adding a scheme — a new scheme would be a new origin, and M35 measured
         // that a plugin package only loads same-origin. The origin is unchanged, so no origin-keyed
         // state (localStorage, IndexedDB) is disturbed. See `installed_plugins` for the full rationale.
-        .register_uri_scheme_protocol("tauri", installed_plugins::handle_tauri_request)
-        .plugin(tauri_plugin_dialog::init())
+        .register_uri_scheme_protocol("tauri", installed_plugins::handle_tauri_request);
+    let dialogs = tauri_plugin_dialog::init();
+    #[cfg(target_os = "linux")]
+    let builder = if is_appimage {
+        builder.plugin(appimage_dialogs::AppImageDialogs(dialogs))
+    } else {
+        builder.plugin(dialogs)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let builder = builder.plugin(dialogs);
+    let builder = builder
         .plugin(tauri_plugin_fs::init())
         // Host-owned network transport for the allowlisted plugin-update catalog. Installed plugin
         // workers remain under connect-src 'self' and never receive this capability.
@@ -8452,6 +8493,8 @@ fn resolve_engine3d_sidecar_path(env_override: Option<String>) -> Option<PathBuf
     // Development / explicit override: an absolute path to a locally built sidecar wins.
     if let Some(path) = env_override {
         let candidate = PathBuf::from(path.trim());
+        #[cfg(target_os = "linux")]
+        let candidate = linux_startup::user_path(&candidate).into_owned();
         if is_runnable_sidecar(&candidate) {
             return Some(candidate);
         }
@@ -8537,7 +8580,7 @@ fn start_engine3d_sidecar_session_from_path(
         std::process::id(),
         ENGINE3D_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
-    let mut child = Command::new(path)
+    let mut child = child_command(path)
         .arg("--stdio")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

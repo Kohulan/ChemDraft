@@ -1647,9 +1647,11 @@ whole-molecule cleanup with the existing behavior, and check save/reopen and exp
   prompt open. Stall the renderer and verify that shutdown is bounded and reports an
   unconfirmed flush.
 - In a directory containing `drawing.cdxml`, launch `/path/to/ChemDraft.AppImage drawing.cdxml`.
-  Verify that the drawing opens, then repeat with ChemDraft already running. Check that WebKit
-  starts and that an untitled document's Save dialog starts outside the image mount. Check the
-  process's working folder with and without `OWD`.
+  Verify that the drawing opens, then launch from a different directory containing a second
+  `drawing.cdxml` and check that the running instance opens that file. With no remembered folder,
+  verify that Open and Save for an untitled document start in the primary launch folder, or home
+  when `OWD` is unavailable. Check that opening a report link, revealing saved screen captures,
+  and running OPSIN work while WebKit runs from the AppRun working folder.
 - Start a native Wayland session with XWayland disabled. With `DISPLAY` and `GDK_BACKEND` unset,
   launch both packages and verify that the document window and drawing canvas appear. Repeat
   on Wayland with XWayland enabled and check the default and an explicit Wayland override.

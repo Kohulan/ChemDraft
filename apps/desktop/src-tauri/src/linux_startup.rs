@@ -6,6 +6,28 @@ use std::{
 #[cfg(target_os = "linux")]
 pub(super) struct Startup {
     pub(super) documents: Vec<PathBuf>,
+    pub(super) appimage: Option<AppImageDirectories>,
+}
+
+pub(super) struct AppImageDirectories {
+    launch: PathBuf,
+    pub(super) dialogs: PathBuf,
+}
+
+impl AppImageDirectories {
+    fn new(
+        owd: Option<&Path>,
+        home: Option<PathBuf>,
+        root: &Path,
+        is_dir: impl Fn(&Path) -> bool,
+    ) -> Self {
+        let home = child_directory(home, root, &is_dir);
+        Self {
+            launch: launch_directory(owd, &home).to_owned(),
+            dialogs: launch_directory(owd.filter(|path| path.is_absolute() && is_dir(path)), &home)
+                .to_owned(),
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -14,44 +36,69 @@ pub(super) fn configure() -> Startup {
 
     configure_webkit_renderer();
     let cwd = env::current_dir().ok();
-    let appdir = appimage_root(
+    let appimage = appimage_root(
         env::var_os("APPIMAGE").as_deref(),
         env::var_os("APPDIR").as_deref(),
         cwd.as_deref(),
-    );
-    let owd = env::var_os("OWD");
-    let home = dirs::home_dir();
-    let mut launch_folders =
-        user_working_directories(owd.as_deref().map(Path::new), home.as_deref())
-            .filter(|_| appdir.is_some())
-            .peekable();
-    let document_base = launch_folders.peek().copied().or(cwd.as_deref());
+    )
+    .map(|appdir| {
+        let appdir = appdir.canonicalize().unwrap_or(appdir);
+        env::set_var("APPDIR", &appdir);
+        let variable = "WEBKIT_INJECTED_BUNDLE_PATH";
+        if let Some(path) = appimage_path_override(&appdir, env::var_os(variable).as_deref()) {
+            env::set_var(variable, path);
+        }
+        AppImageDirectories::new(
+            env::var_os("OWD").as_deref().map(Path::new),
+            dirs::home_dir(),
+            Path::new("/"),
+            Path::is_dir,
+        )
+    });
+
+    // AppRun's working folder stays in the image for WebKitGTK's relative helper paths.
+    let document_base = appimage
+        .as_ref()
+        .map(|dirs| dirs.launch.as_path())
+        .or(cwd.as_deref());
     let documents = env::args_os()
         .skip(1)
         .filter_map(|arg| document_argument(&arg, document_base))
         .collect();
 
-    if let Some(appdir) = &appdir {
-        let appdir = appdir.canonicalize().unwrap_or_else(|_| appdir.clone());
-        env::set_var("APPDIR", &appdir);
-        for variable in ["WEBKIT_EXEC_PATH", "WEBKIT_INJECTED_BUNDLE_PATH"] {
-            let value = env::var_os(variable);
-            if let Some(path) = appimage_path_override(&appdir, value.as_deref()) {
-                env::set_var(variable, path);
-            }
-        }
+    Startup {
+        documents,
+        appimage,
     }
+}
 
-    for folder in launch_folders {
-        match env::set_current_dir(folder) {
-            Ok(()) => break,
-            Err(error) => {
-                eprintln!("ChemDraft: could not enter AppImage launch folder {folder:?}: {error}");
-            }
-        }
+#[cfg(target_os = "linux")]
+fn is_appimage() -> bool {
+    present(std::env::var_os("APPIMAGE").as_deref())
+        && present(std::env::var_os("APPDIR").as_deref())
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn set_child_directory(command: &mut std::process::Command) {
+    if is_appimage() {
+        command.current_dir(child_directory(
+            dirs::home_dir(),
+            Path::new("/"),
+            Path::is_dir,
+        ));
     }
+}
 
-    Startup { documents }
+/// Resolve an explicitly supplied path before launching a process with its own working folder.
+#[cfg(target_os = "linux")]
+pub(super) fn user_path(path: &Path) -> std::borrow::Cow<'_, Path> {
+    if is_appimage() && !path.is_absolute() {
+        let home = child_directory(dirs::home_dir(), Path::new("/"), Path::is_dir);
+        let owd = std::env::var_os("OWD");
+        let base = launch_directory(owd.as_deref().map(Path::new), &home);
+        return std::borrow::Cow::Owned(base.join(path));
+    }
+    std::borrow::Cow::Borrowed(path)
 }
 
 #[cfg(target_os = "linux")]
@@ -151,14 +198,13 @@ fn appimage_root(
     absolute_path(Path::new(root), cwd)
 }
 
-fn user_working_directories<'a>(
-    owd: Option<&'a Path>,
-    home: Option<&'a Path>,
-) -> impl Iterator<Item = &'a Path> {
-    [owd, home.filter(|path| Some(*path) != owd)]
-        .into_iter()
-        .flatten()
-        .filter(|path| path.is_absolute())
+fn child_directory(home: Option<PathBuf>, root: &Path, is_dir: impl Fn(&Path) -> bool) -> PathBuf {
+    home.filter(|path| path.is_absolute() && is_dir(path))
+        .unwrap_or_else(|| root.to_owned())
+}
+
+fn launch_directory<'a>(owd: Option<&'a Path>, home: &'a Path) -> &'a Path {
+    owd.filter(|path| path.is_absolute()).unwrap_or(home)
 }
 
 fn document_argument(arg: &OsStr, cwd: Option<&Path>) -> Option<PathBuf> {
@@ -166,6 +212,13 @@ fn document_argument(arg: &OsStr, cwd: Option<&Path>) -> Option<PathBuf> {
         return None;
     }
     absolute_path(Path::new(arg), cwd)
+}
+
+pub(super) fn file_dialog_default_path(default: Option<&Path>, directory: &Path) -> PathBuf {
+    match default.filter(|path| !path.as_os_str().is_empty()) {
+        Some(path) => directory.join(path),
+        None => directory.to_owned(),
+    }
 }
 
 fn appimage_path_override(root: &Path, value: Option<&OsStr>) -> Option<PathBuf> {
@@ -279,13 +332,13 @@ mod tests {
         let home = test_root().join("home");
         let name = OsStr::new("drawing.cdxml");
         for (original, expected) in [(Some(owd.as_path()), &owd), (None, &home)] {
-            let folder = user_working_directories(original, Some(&home)).next();
-            assert_eq!(document_argument(name, folder), Some(expected.join(name)));
+            let folder = launch_directory(original, &home);
+            assert_eq!(
+                document_argument(name, Some(folder)),
+                Some(expected.join(name))
+            );
         }
-        assert_eq!(
-            user_working_directories(Some(Path::new("relative")), Some(&home)).next(),
-            Some(home.as_path())
-        );
+        assert_eq!(launch_directory(Some(Path::new("relative")), &home), home);
         let absolute = owd.join("absolute.cdx");
         assert_eq!(
             document_argument(absolute.as_os_str(), Some(&home)),
@@ -315,17 +368,52 @@ mod tests {
     }
 
     #[test]
-    fn working_directory_candidates_try_owd_then_home_without_duplicates() {
+    fn dialogs_prefer_a_live_launch_folder_and_children_prefer_home() {
         let owd = test_root().join("original");
         let home = test_root().join("home");
-        let folders: Vec<_> = user_working_directories(Some(&owd), Some(&home)).collect();
-        assert_eq!(folders, [owd.as_path(), home.as_path()]);
-        let folders: Vec<_> = user_working_directories(Some(&home), Some(&home)).collect();
-        assert_eq!(folders, [home.as_path()]);
+        let is_dir = |path: &Path| path == owd || path == home;
+        let directories =
+            AppImageDirectories::new(Some(&owd), Some(home.clone()), test_root(), is_dir);
+        assert_eq!(directories.launch, owd);
+        assert_eq!(directories.dialogs, owd);
         assert_eq!(
-            user_working_directories(None, Some(Path::new("relative"))).next(),
-            None
+            child_directory(Some(home.clone()), test_root(), is_dir),
+            home
         );
+        let directories =
+            AppImageDirectories::new(Some(&owd), Some(home.clone()), test_root(), |path| {
+                path == home
+            });
+        assert_eq!(directories.launch, owd);
+        assert_eq!(directories.dialogs, home);
+        assert_eq!(
+            child_directory(Some(home), test_root(), |_| false),
+            test_root()
+        );
+        assert_eq!(
+            child_directory(Some(PathBuf::from("relative")), test_root(), |_| true),
+            test_root()
+        );
+    }
+
+    #[test]
+    fn dialog_default_paths_use_the_launch_folder_and_keep_explicit_absolute_paths() {
+        let directory = test_root().join("original folder");
+        let remembered = test_root().join("last location");
+        assert_eq!(file_dialog_default_path(None, &directory), directory);
+        assert_eq!(
+            file_dialog_default_path(Some(Path::new("")), &directory),
+            directory
+        );
+        let filename = Path::new("Untitled.chemdraft");
+        assert_eq!(
+            file_dialog_default_path(Some(filename), &directory),
+            directory.join(filename)
+        );
+        let remembered_file = remembered.join(filename);
+        for path in [remembered, remembered_file] {
+            assert_eq!(file_dialog_default_path(Some(&path), &directory), path);
+        }
     }
 
     #[test]

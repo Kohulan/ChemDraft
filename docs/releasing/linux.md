@@ -43,9 +43,9 @@ The workflow:
    under `usr/lib` and rejects bundled `libEGL*`, `libGL.so*`, `libGLX*`, `libOpenGL.so*`,
    `libGLESv1_CM.so*`, `libGLESv2.so*`, `libGLU.so*`, `libGLdispatch*`, `libgbm*`, `libdrm*`,
    `libglapi*`, `*_dri.so`, `libvulkan*`, and any `dri` directory or symlink.
-   The repack lets ChemDraft select the GTK backend and sets absolute WebKit and bundled GIO
-   paths in the AppRun hook. An AppImage-only adapter uses that WebKit directory for helper
-   launches because release WebKitGTK uses compiled-in paths.
+   The repack lets ChemDraft select the GTK backend and sets absolute paths for the WebKit injected
+   bundle and bundled GIO modules in the AppRun hook. WebKitGTK starts its helpers relative to the
+   working folder set by AppRun.
 6. Records the source commit and final bytes of each package, then stages the packages, records,
    and checksums as the `linux-release-amd64` workflow artifact.
 7. Runs independent smoke jobs on **Ubuntu 22.04 and 24.04**. Each downloads and verifies the same
@@ -71,8 +71,8 @@ with a visible window and live web process at the end. A WebKit web process cras
 the check. The harness matches processes and windows to the active launch by process ancestry.
 The smoke test also reports EGL display initialization failures and logs the display backend settings.
 For the AppImage, it checks that the extracted GTK hook preserves the caller's backend, the
-exported paths point inside the extraction, and both WebKit helpers launch by absolute path while
-ChemDraft runs from the caller's directory.
+exported resource paths point inside the extraction, and ChemDraft reads relative document
+arguments from two separate launch folders on startup and single-instance handoff.
 
 The `linux-smoke-amd64-ubuntu-22.04` and `linux-smoke-amd64-ubuntu-24.04` artifacts preserve
 package setup, library versions, display, app, and process logs even when smoke fails. The harness
@@ -130,10 +130,10 @@ repository on GitHub Pages, or a Flathub listing.
   For AppImage launches, an explicit `EGL_PLATFORM` takes precedence. Otherwise, a `GDK_BACKEND`
   starting with `x11` or `wayland` selects that EGL platform. For other or unset backends, ChemDraft
   selects `wayland` when `WAYLAND_DISPLAY` is non-empty and `x11` otherwise.
-- An AppImage uses `OWD` or the user's home folder for its working directory and resolves
-  relative document arguments against the original launch folder. A secondary instance forwards
-  the caller's working folder when handing off documents to a running instance. AppRun supplies
-  absolute paths from `APPDIR` for the bundled WebKit helpers.
+- AppRun's working folder stays inside the image for WebKitGTK. ChemDraft resolves relative
+  document arguments against the caller's `OWD` or home folder before opening or forwarding them.
+  File dialogs use an explicit start path when supplied, otherwise they start in `OWD` or home.
+  ChemDraft starts its child processes in the home folder or a directory required by the tool.
 - Linux session end uses the same recovery write as File ▸ Exit. The app requests it on SIGTERM,
   SIGINT, SIGHUP, a GNOME session-end notification, or a logind shutdown notification. When
   available, a logind delay inhibitor gives the renderer up to two seconds to confirm the

@@ -206,11 +206,16 @@ runs:
           fi
         fi
         command=("$bundle")
+        trace=execve
         launch_dir=$PWD
         if [[ "$package" == appimage ]]; then
-          command+=(--appimage-extract-and-run)
+          trace+=,openat
+          command+=(--appimage-extract-and-run drawing.cdxml)
           launch_dir="$work/launch folder"
-          mkdir "$launch_dir"
+          second_dir="$work/second launch folder"
+          mkdir "$launch_dir" "$second_dir"
+          printf '<CDXML><page/></CDXML>\n' > "$launch_dir/drawing.cdxml"
+          cp "$launch_dir/drawing.cdxml" "$second_dir/drawing.cdxml"
         fi
         report_egl_error() {
           if grep -qE 'Could not create default EGL display|EGL_BAD_PARAMETER.*Aborting|Aborting.*EGL_BAD_PARAMETER' "$logs/chemdraft.log"; then
@@ -225,6 +230,7 @@ runs:
           exit 1
         }
         # Trace execs and process exits so a child SIGABRT fails even without a systemd journal.
+        # For AppImage launches, also trace file opens to verify relative document resolution.
         smoke_uid=$(id -u)
         # AppImage may fork AppRun, and WebKit may start helpers in another process group.
         belongs_to_launch() {
@@ -263,7 +269,7 @@ runs:
           if [[ "$package" == appimage ]]; then
             export OWD="$PWD"
           fi
-          exec setsid strace -f -e trace=execve -s 256 -o "$logs/process.log" "${command[@]}"
+          exec setsid strace -f -e trace="$trace" -s 256 -o "$logs/process.log" "${command[@]}"
         ) > "$logs/chemdraft.log" 2>&1 &
         launcher_pid=$!
         for _ in {1..60}; do
@@ -282,7 +288,6 @@ runs:
         if [[ "$package" == appimage ]]; then
           app_env_value() { sed -n "s/^$1=//p" <<< "$app_environment"; }
           appdir=$(app_env_value APPDIR)
-          webkit_dir=$(app_env_value WEBKIT_EXEC_PATH)
           injected_dir=$(app_env_value WEBKIT_INJECTED_BUNDLE_PATH)
           gtk_hook="$appdir/apprun-hooks/linuxdeploy-plugin-gtk.sh"
           [[ "$appdir" == /* && -f "$gtk_hook" ]] || fail 'Could not find the extracted AppImage GTK hook'
@@ -300,9 +305,8 @@ runs:
               fail "The AppImage GTK hook changed GDK_BACKEND from $backend_value"
             fi
           done
-          [[ "$webkit_dir" == "$appdir/"* && "$injected_dir" == "$appdir/"* &&
-            -f "$injected_dir/libwebkit2gtkinjectedbundle.so" ]] \
-            || fail 'WebKit helper or injected bundle directory is missing or outside APPDIR'
+          [[ "$injected_dir" == "$appdir/"* && -f "$injected_dir/libwebkit2gtkinjectedbundle.so" ]] \
+            || fail 'WebKit injected bundle directory is missing or outside APPDIR'
           for variable in GIO_MODULE_DIR GIO_EXTRA_MODULES; do
             module_dir=$(app_env_value "$variable")
             [[ -z "$module_dir" || ( "$module_dir" == "$appdir/"* && -d "$module_dir" ) ]] \
@@ -314,11 +318,11 @@ runs:
           elif grep -q '^GDK_BACKEND=' <<< "$app_environment"; then
             fail 'The AppImage set GDK_BACKEND before ChemDraft starts'
           fi
-          [[ $(readlink "/proc/$main_pid/cwd") == "$(realpath "$launch_dir")" ]] \
-            || fail 'The primary AppImage instance did not keep the caller’s working directory'
-          for helper in WebKitWebProcess WebKitNetworkProcess; do
-            [[ -x "$webkit_dir/$helper" ]] || fail "The AppImage is missing $helper"
-          done
+          if [[ "$backend" == wayland && "$native_wayland" == 1 ]]; then
+            [[ -z $(app_env_value DISPLAY) ]] || fail 'X11 DISPLAY leaked into native Wayland smoke'
+            grep -Fq 'keeping native Wayland because DISPLAY is unavailable' "$logs/chemdraft.log" \
+              || fail 'ChemDraft did not select its Wayland default without XWayland'
+          fi
         fi
         echo 'Display environment inherited by ChemDraft:'
         grep -E '^(EGL_PLATFORM|GDK_BACKEND|WAYLAND_DISPLAY|DISPLAY|CHEMDRAFT_NATIVE_WAYLAND)=' <<< "$app_environment" || true
@@ -334,6 +338,17 @@ runs:
         fi
         web_process_running || fail 'No WebKitWebProcess stayed alive during startup'
         window_ready || fail 'No ChemDraft window appeared within 60 seconds'
+        if [[ "$package" == appimage ]]; then
+          # Reuse the extraction so the secondary launch can't remove the primary's files.
+          if ! (
+            cd "$second_dir"
+            APPDIR="$appdir" APPIMAGE="$bundle" OWD="$PWD" timeout --kill-after=5s 30s \
+              "$appdir/AppRun" drawing.cdxml
+          ) > "$logs/second-launch.log" 2>&1; then
+            cat "$logs/second-launch.log"
+            fail 'The AppImage second launch did not hand off to the running instance'
+          fi
+        fi
         for _ in {1..20}; do
           sleep 1
           for pid in "$launcher_pid" "$main_pid" "$display_pid"; do
@@ -358,11 +373,22 @@ runs:
         web_process_running || fail 'No WebKitWebProcess was alive at the end of the smoke test'
         window_ready || fail 'No ChemDraft window was visible at the end of the smoke test'
         if [[ "$package" == appimage ]]; then
-          for helper in WebKitWebProcess WebKitNetworkProcess; do
-            grep -Fq "execve(\"$webkit_dir/$helper\"," "$logs/process.log" \
-              || fail "$helper was not launched by its absolute AppImage path"
+          for folder in "$launch_dir" "$second_dir"; do
+            if ! awk -v path="$folder/drawing.cdxml" '
+              index($0, "openat(AT_FDCWD, \"" path "\",") {
+                if (/ = [0-9]+$/) opened = 1
+                if (/<unfinished \.\.\.>$/) pending[$1] = 1
+              }
+              /<\.\.\. openat resumed>/ && ($1 in pending) {
+                if (/ = [0-9]+$/) opened = 1
+                delete pending[$1]
+              }
+              END { exit !opened }
+            ' "$logs/process.log"; then
+              fail "The running AppImage did not open the relative document from $folder"
+            fi
           done
-          echo 'AppImage GTK settings, WebKit paths and working directory passed.'
+          echo 'AppImage GTK settings and relative document opens passed.'
         fi
         echo 'ChemDraft started WebKitWebProcess and stayed alive for 20 seconds.'
         SMOKE

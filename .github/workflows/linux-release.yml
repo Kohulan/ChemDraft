@@ -168,7 +168,7 @@ jobs:
           echo "deb-name=$(basename "$deb")" >> "$GITHUB_OUTPUT"
           echo "appimage-name=$(basename "$appimage")" >> "$GITHUB_OUTPUT"
 
-      - name: Repack AppImage with host runtimes and relocatable WebKit helpers
+      - name: Repack AppImage with host runtimes and GTK backend selection
         env:
           APPIMAGE: ${{ steps.bundle.outputs.appimage }}
         run: |
@@ -202,26 +202,13 @@ jobs:
           # Keep the generated GTK settings and let ChemDraft choose the default backend.
           sed -i -E '/^[[:space:]]*export[[:space:]]+GDK_BACKEND=x11([[:space:]]|$)/d; /^[[:space:]]*export[[:space:]]+GIO_EXTRA_MODULES=/d' "$gtk_hook"
           cat >> "$gtk_hook" <<HOOK
-          export WEBKIT_EXEC_PATH="\$APPDIR/$webkit_dir"
-          export WEBKIT_INJECTED_BUNDLE_PATH="\$WEBKIT_EXEC_PATH/injected-bundle"
+          export WEBKIT_INJECTED_BUNDLE_PATH="\$APPDIR/$webkit_dir/injected-bundle"
           HOOK
           gio_dir="usr/lib/$multiarch/gio/modules"
           if [[ -d "$appdir/$gio_dir" ]]; then
             printf 'export GIO_EXTRA_MODULES="$APPDIR/%s"\n' "$gio_dir" >> "$gtk_hook"
           fi
           bash -n "$gtk_hook"
-
-          # Release WebKitGTK uses its compiled-in helper paths. Load the path adapter only in
-          # the packaged ChemDraft executable and before libgio in the symbol lookup order.
-          read -r -a gio_flags <<< "$(pkg-config --cflags --libs gio-2.0)"
-          shim=libchemdraft-appimage-webkit.so
-          cc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC \
-            "-DWEBKIT_DIRECTORY=\"/$webkit_dir\"" "$GITHUB_WORKSPACE/scripts/appimage-webkit-path.c" \
-            "${gio_flags[@]}" -ldl -o "$appdir/usr/lib/$shim"
-          dependency='$ORIGIN/../lib/'"$shim"
-          patchelf --add-needed "$dependency" "$appdir/usr/bin/chemdraft"
-          dependencies=$(patchelf --print-needed "$appdir/usr/bin/chemdraft")
-          [[ "${dependencies%%$'\n'*}" == "$dependency" ]]
 
           # The AppImage runtime reads only zlib or zstd.
           mksquashfs squashfs-root app.squashfs -noappend -all-root -comp zstd -no-progress
