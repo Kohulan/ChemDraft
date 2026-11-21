@@ -17,6 +17,7 @@ on:
       - scripts/desktop-tauri.mjs
       - tools/release/verify-bundle-licenses.mjs
       - tools/release/record-build.mjs
+      - scripts/linux-smoke-toolbar-field.py
   workflow_call:
     inputs:
       artifact_run_id:
@@ -94,6 +95,7 @@ jobs:
       DISTRO: ${{ matrix.distro }}
       PACKAGE: ${{ matrix.package }}
       BACKEND: ${{ matrix.backend }}
+      NATIVE_WAYLAND: ${{ matrix.native_wayland }}
       DEBIAN_FRONTEND: noninteractive
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -161,6 +163,18 @@ jobs:
                   openbox xorg-xdpyinfo xorg-xprop xclip
                 ;;
             esac
+          elif [[ "$NATIVE_WAYLAND" != 1 ]]; then
+            # The toolbar field check drives ChemDraft's XWayland windows in the Weston session.
+            case "$DISTRO" in
+              debian)
+                apt-get install -y --no-install-recommends at-spi2-core gir1.2-atspi-2.0 python3-gi \
+                  fonts-dejavu-core x11-utils xclip xdotool
+                ;;
+              fedora)
+                dnf install -y at-spi2-core python3-gobject-base dejavu-sans-fonts /usr/bin/xprop \
+                  xclip xdotool
+                ;;
+            esac
           fi
 
           if [[ "$PACKAGE" == appimage ]]; then
@@ -188,6 +202,20 @@ jobs:
           logs: ${{ github.workspace }}/smoke-logs
           container-user: smoke
           check-window: ${{ matrix.backend == 'x11' }}
+
+      # Both packages use XWayland in a Wayland session by default. Type into a floating
+      # toolbar's number field there with a real click and keys, and require the field to
+      # change and the document's chemistry not to. Native Wayland is not covered: Weston has
+      # no protocol that lets a test client type into another client's window.
+      - name: Type into a toolbar number field in the Wayland session
+        if: matrix.backend == 'wayland' && matrix.native_wayland != '1'
+        run: |
+          set -euo pipefail
+          logs="$GITHUB_WORKSPACE/smoke-logs/toolbar-field"
+          install -d -o smoke "$logs"
+          runuser -u smoke -- env WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 dbus-run-session -- \
+            /usr/bin/python3 "$GITHUB_WORKSPACE/scripts/linux-smoke-toolbar-field.py" \
+            "$BUNDLE" "$PACKAGE" "$logs" 2>&1 | tee "$logs/harness.log"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()

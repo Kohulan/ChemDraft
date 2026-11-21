@@ -95,6 +95,59 @@ pub(crate) fn install<R: Runtime>(window: &WebviewWindow<R>) -> Result<(), Strin
     Ok(())
 }
 
+/// The palette refused the click's WM_TAKE_FOCUS: it was not yet accepting focus. A window
+/// manager may then keep it as its pending focus target and drop the `_NET_ACTIVE_WINDOW`
+/// request that `present_with_time` sends (KWin returns early for its most recently activated
+/// window, XWayland clients in a Plasma Wayland session included). No focus-in arrives, and
+/// the field never gets keys. ICCCM 4.1.7 lets a client focus its own window with the
+/// timestamp of the button press that asked for it, so take the focus directly. The X server
+/// ignores a stale timestamp. Native Wayland is unaffected.
+fn take_x11_click_focus(native: &gtk::ApplicationWindow, timestamp: u32) {
+    use gtk::glib::translate::ToGlibPtr;
+    use std::os::raw::{c_int, c_ulong, c_void};
+
+    #[link(name = "gdk-3")]
+    extern "C" {
+        fn gdk_x11_window_get_xid(window: *mut gdk::ffi::GdkWindow) -> c_ulong;
+        fn gdk_x11_display_get_xdisplay(display: *mut gdk::ffi::GdkDisplay) -> *mut c_void;
+        fn gdk_x11_display_error_trap_push(display: *mut gdk::ffi::GdkDisplay);
+        fn gdk_x11_display_error_trap_pop_ignored(display: *mut gdk::ffi::GdkDisplay);
+    }
+    #[link(name = "X11")]
+    extern "C" {
+        fn XSetInputFocus(
+            display: *mut c_void,
+            focus: c_ulong,
+            revert_to: c_int,
+            time: c_ulong,
+        ) -> c_int;
+    }
+    const REVERT_TO_PARENT: c_int = 2;
+
+    let Some(window) = native.window() else {
+        return;
+    };
+    let display = window.display();
+    let Some(time) = state::click_focus_time(display.backend().is_x11(), timestamp) else {
+        return;
+    };
+    let window_ptr: *mut gdk::ffi::GdkWindow = window.to_glib_none().0;
+    let display_ptr: *mut gdk::ffi::GdkDisplay = display.to_glib_none().0;
+    // SAFETY: GTK's main thread, on an X11 display (checked above) and a realized toplevel
+    // that outlives these calls. The trap absorbs BadMatch if the window stopped being viewable.
+    unsafe {
+        gdk_x11_display_error_trap_push(display_ptr);
+        XSetInputFocus(
+            gdk_x11_display_get_xdisplay(display_ptr),
+            gdk_x11_window_get_xid(window_ptr),
+            REVERT_TO_PARENT,
+            c_ulong::from(time),
+        );
+        gdk_x11_display_error_trap_pop_ignored(display_ptr);
+    }
+    display.flush();
+}
+
 pub(crate) fn set_keyboard_popover(label: &str, keyboard: bool) {
     GUARD.lock().unwrap().set_keyboard_popover(label, keyboard);
 }
@@ -157,6 +210,7 @@ pub(crate) async fn acquire(
             native.set_accept_focus(true);
         }
         if let state::FocusRequest::Present { timestamp, .. } = &request {
+            take_x11_click_focus(&native, *timestamp);
             native.present_with_time(*timestamp);
         }
         Some((epoch, sequence, request))

@@ -369,6 +369,14 @@ impl Guard {
     }
 }
 
+/// An X11 client may take the focus for its own window only with the server timestamp of
+/// the press that asked for it. GDK_CURRENT_TIME (0) is never a valid click time, and native
+/// Wayland has no such request.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn click_focus_time(x11: bool, timestamp: u32) -> Option<u32> {
+    (x11 && timestamp != 0).then_some(timestamp)
+}
+
 #[cfg(any(target_os = "linux", test))]
 pub(super) fn blocks_document_key(
     pending: bool,
@@ -462,6 +470,14 @@ pub(super) fn editing_key(key: &str, command: bool, control: bool, alt: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn x11_click_focus_uses_only_a_real_click_time() {
+        assert_eq!(click_focus_time(true, 42), Some(42));
+        assert_eq!(click_focus_time(true, 0), None);
+        assert_eq!(click_focus_time(false, 42), None);
+        assert_eq!(click_focus_time(false, 0), None);
+    }
 
     #[test]
     fn presentation_uses_the_native_click_and_waits_for_its_window() {
