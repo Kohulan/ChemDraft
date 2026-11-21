@@ -4,6 +4,7 @@ import type { RequestPageSpaceProvider } from "@chemdraft/plugin-host";
 import { moleculeVisualBoundsForArrangement, objectFrameBoundsForPageFit, tableVisualBoundsForArrangement,
   textVisualBoundsForPageFit, unionLayoutBounds, type LayoutBounds } from "@chemdraft/layout-engine";
 import { nativePrompt } from "./nativePrompt";
+import { PAGE_ENLARGEMENT_MESSAGE } from "./dialogs/dialogProtocol";
 import { documentObjectVisualBounds, expectedPageTranslation, translateDocumentPage } from "./documentWorkflow";
 
 export type PageEnlargementDecision = "enlarge" | "keep" | "unanswered";
@@ -22,7 +23,7 @@ export class PageEnlargementConsent {
       return "unanswered";
     }
     const decision = this.decision ??= nativePrompt({ title: "ChemDraft", owner: "document", kind: "info",
-      message: "This doesn't fit on the page. Enlarge the page to fit? Content on the page may shift to make room.",
+      message: PAGE_ENLARGEMENT_MESSAGE,
       choices: [{ id: "enlarge", label: "Enlarge" }, { id: "keep", label: "Keep Page Size", cancel: true }]
     }, async () => "keep", this.promptAbort.signal, undefined, this.platform)
       .then(choice => this.promptAbort.signal.aborted ? "unanswered" : choice === "enlarge" ? "enlarge" : "keep");
