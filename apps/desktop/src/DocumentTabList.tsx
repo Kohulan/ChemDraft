@@ -92,8 +92,10 @@ export function DocumentTabList({ ref, activeId, order, activeTitle, children }:
   const drag = useRef<{ pointerId: number; startX: number; startOffset: number } | null>(null);
   // A touch or pen contact on the tabs: a tap until it moves past the slop horizontally, then a pan.
   const pan = useRef<{ pointerId: number; startX: number; startY: number; startOffset: number; panning: boolean } | null>(null);
-  // The pan whose trailing click is swallowed. Only that gesture's click: the next press, a key press, or the end of
-  // PAN_CLICK_WINDOW_MS after release clears it, so a later tap, click or keyboard activation is never eaten.
+  // The released pan whose own release click is swallowed. It is armed only when the pan's pointer lifts or is
+  // cancelled, and any press anywhere in the window (seen in the capture phase, before any handler below can stop it),
+  // a key press, or the end of PAN_CLICK_WINDOW_MS disarms it. So a click only counts as the pan's own when no press
+  // has landed since the pan ended, and a later tap, click or keyboard activation is never eaten.
   const suppressedClick = useRef<object | null>(null);
 
   const moveTrack = useCallback((left: number, remainingWidth?: number) => {
@@ -169,14 +171,30 @@ export function DocumentTabList({ ref, activeId, order, activeTitle, children }:
       const activeTab = track.querySelector<HTMLElement>('.document-tab[data-active="true"]');
       moveTrack(activeInView.current ? offsetToReveal(strip, activeTab, offset.current, maxOffset()) : offset.current);
     });
+    // Once a finger pans the strip, its touch moves are consumed, so the browser never runs a scroll or a fling of its
+    // own for that contact. A browser fling outlives the release, and in Chromium (WebView2) the next tap within about
+    // 180 ms only cancels the fling and fires no click, so a quick tap after a pan would never activate its tab.
+    const onTouchMove = (event: TouchEvent) => {
+      if (pan.current?.panning && event.cancelable) event.preventDefault();
+    };
+    // A new press or a key press, anywhere, ends the window for an earlier pan's release click.
+    const disarmPanClick = () => {
+      suppressedClick.current = null;
+    };
     resize?.observe(strip);
     resize?.observe(track);
     strip.addEventListener("wheel", onWheel, { passive: false });
     strip.addEventListener("focusin", onFocus);
+    track.addEventListener("touchmove", onTouchMove, { passive: false });
+    window.addEventListener("pointerdown", disarmPanClick, true);
+    window.addEventListener("keydown", disarmPanClick, true);
     return () => {
       resize?.disconnect();
       strip.removeEventListener("wheel", onWheel);
       strip.removeEventListener("focusin", onFocus);
+      track.removeEventListener("touchmove", onTouchMove);
+      window.removeEventListener("pointerdown", disarmPanClick, true);
+      window.removeEventListener("keydown", disarmPanClick, true);
     };
   }, [moveTrack]);
 
@@ -222,9 +240,9 @@ export function DocumentTabList({ ref, activeId, order, activeTitle, children }:
   function onTrackPointerDown(event: PointerEvent<HTMLDivElement>) {
     // A second finger joins the gesture in progress; it neither pans nor ends it.
     if (pan.current && !event.isPrimary) return;
-    // Every new press is a new gesture, so an earlier pan's suppression never reaches this one's click.
+    // Every new press is a new gesture. The window capture listener has already disarmed an earlier pan's release
+    // click, so that suppression never reaches this press's click.
     pan.current = null;
-    suppressedClick.current = null;
     if (!pansByDrag(event.pointerType) || event.button !== 0) return;
     // No preventDefault: a tap must still focus and click the tab under it.
     pan.current = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, startOffset: offset.current, panning: false };
@@ -243,7 +261,6 @@ export function DocumentTabList({ ref, activeId, order, activeTitle, children }:
       }
       if (Math.abs(dx) <= TOUCH_PAN_SLOP || Math.abs(dx) <= Math.abs(dy)) return;
       gesture.panning = true;
-      suppressedClick.current = gesture;
       event.currentTarget.setPointerCapture(event.pointerId);
     }
     // The content under the finger stays under it.
@@ -255,6 +272,8 @@ export function DocumentTabList({ ref, activeId, order, activeTitle, children }:
     if (!gesture || gesture.pointerId !== event.pointerId) return;
     pan.current = null;
     if (!gesture.panning) return;
+    // Arm only now: the click this pan's release can bring follows its pointerup with no press in between.
+    suppressedClick.current = gesture;
     window.setTimeout(() => {
       if (suppressedClick.current === gesture) suppressedClick.current = null;
     }, PAN_CLICK_WINDOW_MS);
@@ -273,17 +292,13 @@ export function DocumentTabList({ ref, activeId, order, activeTitle, children }:
     event.stopPropagation();
   }
 
-  function onTrackKeyDownCapture() {
-    suppressedClick.current = null;
-  }
-
   return (
     <div ref={stripRef} className="document-tab-list" role="tablist" aria-label="Open documents">
       <div className="document-tab-clip">
         <div ref={trackRef} className="document-tab-track"
           onPointerDown={onTrackPointerDown} onPointerMove={onTrackPointerMove} onPointerUp={endPan}
           onPointerCancel={endPan} onLostPointerCapture={onTrackLostPointerCapture}
-          onClickCapture={onTrackClickCapture} onKeyDownCapture={onTrackKeyDownCapture}>{children}</div>
+          onClickCapture={onTrackClickCapture}>{children}</div>
       </div>
       <div ref={scrollbarRef} className="document-tab-scrollbar" aria-hidden="true"
         onPointerDown={onScrollbarPointerDown} onPointerMove={onScrollbarPointerMove}

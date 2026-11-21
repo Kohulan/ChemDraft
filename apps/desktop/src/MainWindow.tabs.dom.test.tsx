@@ -2027,6 +2027,84 @@ describe("documents in one window", () => {
       expect(tabs().map(tab => tab.textContent)).not.toContain("Fourth drawing");
     });
 
+    // A pan with no trailing click, as Chromium sends after a moved touch: down on a tab, past the slop, up on the track.
+    function panWithoutClick(track: HTMLElement, from: Element, pointerId: number) {
+      touch(from, "pointerdown", 150, 12, { pointerId });
+      touch(from, "pointermove", 150 - TOUCH_PAN_SLOP - 20, 12, { pointerId });
+      touch(track, "pointerup", 150 - TOUCH_PAN_SLOP - 20, 12, { pointerId });
+    }
+
+    it("activates a different tab tapped 0, 50 or 150 ms after a pan, and swallows only the pan's own release click", async () => {
+      const { track } = await openOverflowingTabs();
+      track.setPointerCapture = vi.fn();
+      vi.useFakeTimers();
+      let pointerId = 30;
+      for (const [delay, target] of [[0, 0], [50, 1], [150, 2]] as const) {
+        panWithoutClick(track, tabs()[active()]!, ++pointerId);
+        if (delay > 0) await act(async () => vi.advanceTimersByTimeAsync(delay));
+        const tap = { pointerId: ++pointerId };
+        touch(tabs()[target]!, "pointerdown", 100, 12, tap);
+        touch(tabs()[target]!, "pointerup", 100, 12, tap);
+        await act(async () => tabs()[target]!.click());
+        expect(active()).toBe(target);
+      }
+
+      // The pan's own release click, on the panned tab right after its pointerup with no press between, is swallowed.
+      panWithoutClick(track, tabs()[0]!, ++pointerId);
+      await act(async () => tabs()[0]!.click());
+      expect(active()).toBe(2);
+      // An immediate tap on that same tab is a new press, so its click activates.
+      const tap = { pointerId: ++pointerId };
+      touch(tabs()[0]!, "pointerdown", 100, 12, tap);
+      touch(tabs()[0]!, "pointerup", 100, 12, tap);
+      await act(async () => tabs()[0]!.click());
+      expect(active()).toBe(0);
+      vi.useRealTimers();
+    });
+
+    it("lets a press or a key press anywhere end a pan's release-click window", async () => {
+      const { track } = await openOverflowingTabs();
+      track.setPointerCapture = vi.fn();
+      // A press outside the tab track, here on the page body, still ends the window.
+      panWithoutClick(track, tabs()[3]!, 40);
+      pointer(document.body, "pointerdown", 4, { pointerType: "mouse", pointerId: 1 });
+      pointer(document.body, "pointerup", 4, { pointerType: "mouse", pointerId: 1 });
+      await act(async () => tabs()[1]!.click());
+      expect(active()).toBe(1);
+      // So does a key press outside the track.
+      panWithoutClick(track, tabs()[1]!, 41);
+      document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Shift", bubbles: true, cancelable: true }));
+      await act(async () => tabs()[2]!.click());
+      expect(active()).toBe(2);
+    });
+
+    it("consumes a panning finger's touch moves so the browser starts no scroll or fling of its own", async () => {
+      const { track } = await openOverflowingTabs();
+      track.setPointerCapture = vi.fn();
+      const touchMove = (target: Element) => {
+        const event = new Event("touchmove", { bubbles: true, cancelable: true });
+        target.dispatchEvent(event);
+        return event.defaultPrevented;
+      };
+      const third = tabs()[2]!;
+      touch(third, "pointerdown", 60);
+      touch(third, "pointermove", 60 + TOUCH_PAN_SLOP - 1);
+      // Still a tap: the browser keeps the touch.
+      expect(touchMove(third)).toBe(false);
+      touch(third, "pointermove", 60 + TOUCH_PAN_SLOP + 1);
+      expect(touchMove(third)).toBe(true);
+      touch(track, "pointermove", 160);
+      expect(touchMove(track)).toBe(true);
+      touch(track, "pointerup", 160);
+      expect(touchMove(track)).toBe(false);
+
+      // A vertical-dominant move is left to the browser.
+      touch(third, "pointerdown", 60, 4, { pointerId: 22 });
+      touch(third, "pointermove", 62, 4 + TOUCH_PAN_SLOP + 1, { pointerId: 22 });
+      expect(touchMove(third)).toBe(false);
+      touch(third, "pointerup", 62, 4 + TOUCH_PAN_SLOP + 1, { pointerId: 22 });
+    });
+
     it("does not pan on a vertical-dominant touch move", async () => {
       const { track } = await openOverflowingTabs();
       const capture = track.setPointerCapture = vi.fn();
