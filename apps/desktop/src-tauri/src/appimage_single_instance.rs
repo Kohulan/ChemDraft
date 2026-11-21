@@ -35,10 +35,12 @@ pub(super) fn init<R: Runtime>() -> plugin::TauriPlugin<R> {
                     // Forward the paths resolved against the caller's OWD at startup. Absolute
                     // paths work even when the running instance was started in another folder.
                     // The stock D-Bus protocol uses UTF-8 and expects argv[0] before the paths.
+                    // A non-UTF-8 path cannot be saved back to in either instance, so it is
+                    // refused here, by name and with a failing exit, never dropped silently.
                     let startup = app.state::<super::linux_startup::Startup>();
-                    let argv: Vec<_> = std::iter::once("")
-                        .chain(startup.documents.iter().filter_map(|path| path.to_str()))
-                        .collect();
+                    let (forwarded, refused) =
+                        super::linux_startup::forwardable_documents(&startup.documents);
+                    let argv: Vec<_> = std::iter::once("").chain(forwarded).collect();
                     Connection::session()?.call_method(
                         Some(name.as_str()),
                         path.as_str(),
@@ -46,8 +48,16 @@ pub(super) fn init<R: Runtime>() -> plugin::TauriPlugin<R> {
                         "ExecuteCallback",
                         &(argv, ""),
                     )?;
+                    let code = if refused.is_empty() {
+                        0
+                    } else {
+                        let message = super::linux_startup::refused_documents_message(&refused);
+                        eprintln!("ChemDraft: {message}");
+                        show_refusal(&message);
+                        1
+                    };
                     app.cleanup_before_exit();
-                    std::process::exit(0);
+                    std::process::exit(code);
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -61,4 +71,23 @@ pub(super) fn init<R: Runtime>() -> plugin::TauriPlugin<R> {
             }
         })
         .build()
+}
+
+/// The secondary exits from plugin setup, before any ChemDraft window exists. A modal GTK dialog
+/// runs its own loop on this (the main) thread, so the refusal is seen even from a file manager.
+fn show_refusal(message: &str) {
+    use gtk::prelude::{DialogExt, GtkWindowExt, WidgetExt};
+    if !gtk::is_initialized_main_thread() {
+        return;
+    }
+    let dialog = gtk::MessageDialog::new(
+        None::<&gtk::Window>,
+        gtk::DialogFlags::MODAL,
+        gtk::MessageType::Error,
+        gtk::ButtonsType::Ok,
+        message,
+    );
+    dialog.set_title("ChemDraft Could Not Open a Document");
+    dialog.run();
+    dialog.hide();
 }

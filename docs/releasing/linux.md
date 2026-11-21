@@ -58,7 +58,8 @@ The workflow:
 7. Runs independent smoke jobs on **Ubuntu 22.04 and 24.04**. Each downloads and verifies the same
    22.04-built packages against `SHA256SUMS-linux.txt`. The jobs run both package checks, even
    when the AppImage or the other runner fails.
-8. The Debian sid, Fedora and Arch container checks also have to pass before upload. After the
+8. The Debian sid, Fedora and Arch container checks, including the native-Wayland AppImage and
+   .deb jobs, also have to pass before upload. After the
    smoke jobs pass, the workflow fetches the draft's tag and checks that it resolves to the build
    commit. It uploads to the existing draft, validates the attached builds, and refreshes the
    combined checksums.
@@ -99,7 +100,8 @@ detail depends on the binary's available symbols.
 
 ## Container smoke test
 
-Pull requests changing Linux packaging paths also build and smoke-test packages from the PR head.
+Pull requests changing Linux packaging paths, any desktop Rust source, `Cargo.toml` or `Cargo.lock`
+also build and smoke-test packages from the PR head.
 
 Build and test both packages using the workflow from a branch or tag:
 
@@ -148,12 +150,19 @@ repository on GitHub Pages, or a Flathub listing.
   selects `wayland` when `WAYLAND_DISPLAY` is non-empty and `x11` otherwise.
 - AppRun's working folder stays inside the image for WebKitGTK. ChemDraft resolves relative
   document arguments against the caller's `OWD` or home folder before opening or forwarding them.
-  File dialogs use an explicit start path when supplied, otherwise they start in `OWD` or home.
+  File dialogs use an explicit start path when supplied, otherwise they start in `OWD` or home
+  (home also when `OWD` cannot be listed or entered).
+- A document whose file name is not valid UTF-8 cannot be saved back in place, because the
+  renderer keeps the path as text. ChemDraft refuses to open it and shows a message naming the
+  file. A second AppImage launch forwards its other documents, shows the same message, and exits
+  with status 1.
   ChemDraft starts its child processes in the home folder or a directory required by the tool.
 - Linux session end uses the same recovery write as File ▸ Exit. The app requests it on SIGTERM,
   SIGINT, SIGHUP, a GNOME session-end notification, or a logind shutdown notification. When
   available, a logind delay inhibitor gives the renderer up to two seconds to confirm the
-  write. A separate three-second deadline covers a stalled event loop or teardown.
+  write. A separate three-second deadline covers a stalled event loop or teardown. When the
+  write is not confirmed in time, ChemDraft answers GNOME's session-end request with "not OK"
+  and the reason "ChemDraft could not save your open documents", and exits with status 1.
 - Menus: on the document window, as on Windows (`install_app_menu`). Edit ▸ Cut / Copy / Paste
   invoke WebKitGTK's native editing commands in the focused window. The webview receives
   Ctrl+X / C / V directly and uses the same clipboard events for menu clicks and shortcuts.

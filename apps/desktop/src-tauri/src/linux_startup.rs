@@ -15,19 +15,32 @@ pub(super) struct AppImageDirectories {
 }
 
 impl AppImageDirectories {
+    /// `browsable` decides whether a file dialog can list the launch folder. A folder that exists
+    /// but cannot be read or searched falls back to home rather than opening a dialog on it.
     fn new(
         owd: Option<&Path>,
         home: Option<PathBuf>,
         root: &Path,
         is_dir: impl Fn(&Path) -> bool,
+        browsable: impl Fn(&Path) -> bool,
     ) -> Self {
         let home = child_directory(home, root, &is_dir);
         Self {
             launch: launch_directory(owd, &home).to_owned(),
-            dialogs: launch_directory(owd.filter(|path| path.is_absolute() && is_dir(path)), &home)
-                .to_owned(),
+            dialogs: launch_directory(
+                owd.filter(|path| path.is_absolute() && is_dir(path) && browsable(path)),
+                &home,
+            )
+            .to_owned(),
         }
     }
+}
+
+/// Whether a directory can be listed (read) and entered (search). `read_dir` needs read access;
+/// `stat` of `<dir>/.` needs search access.
+fn is_browsable_dir(path: &Path) -> bool {
+    std::fs::read_dir(path).is_ok()
+        && std::fs::metadata(path.join(".")).is_ok_and(|metadata| metadata.is_dir())
 }
 
 #[cfg(target_os = "linux")]
@@ -53,6 +66,7 @@ pub(super) fn configure() -> Startup {
             dirs::home_dir(),
             Path::new("/"),
             Path::is_dir,
+            is_browsable_dir,
         )
     });
 
@@ -214,6 +228,32 @@ fn document_argument(arg: &OsStr, cwd: Option<&Path>) -> Option<PathBuf> {
     absolute_path(Path::new(arg), cwd)
 }
 
+/// Split documents into the paths the stock single-instance handoff carries as UTF-8 strings and
+/// the paths it cannot. ChemDraft could not save back to a non-UTF-8 path in either instance
+/// (`open_document_path_text`), so the secondary refuses those by name instead of forwarding them
+/// to a primary that would refuse them out of the user's sight.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn forwardable_documents(documents: &[PathBuf]) -> (Vec<&str>, Vec<&Path>) {
+    let mut forwarded = Vec::new();
+    let mut refused = Vec::new();
+    for path in documents {
+        match path.to_str() {
+            Some(text) => forwarded.push(text),
+            None => refused.push(path.as_path()),
+        }
+    }
+    (forwarded, refused)
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn refused_documents_message(refused: &[&Path]) -> String {
+    refused
+        .iter()
+        .map(|path| super::unsavable_document_path_message(path))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub(super) fn file_dialog_default_path(default: Option<&Path>, directory: &Path) -> PathBuf {
     match default.filter(|path| !path.as_os_str().is_empty()) {
         Some(path) => directory.join(path),
@@ -373,17 +413,32 @@ mod tests {
         let home = test_root().join("home");
         let is_dir = |path: &Path| path == owd || path == home;
         let directories =
-            AppImageDirectories::new(Some(&owd), Some(home.clone()), test_root(), is_dir);
+            AppImageDirectories::new(Some(&owd), Some(home.clone()), test_root(), is_dir, |_| {
+                true
+            });
         assert_eq!(directories.launch, owd);
         assert_eq!(directories.dialogs, owd);
+        // An existing launch folder that cannot be listed or entered sends dialogs home.
+        let directories = AppImageDirectories::new(
+            Some(&owd),
+            Some(home.clone()),
+            test_root(),
+            is_dir,
+            |path| path != owd,
+        );
+        assert_eq!(directories.launch, owd);
+        assert_eq!(directories.dialogs, home);
         assert_eq!(
             child_directory(Some(home.clone()), test_root(), is_dir),
             home
         );
-        let directories =
-            AppImageDirectories::new(Some(&owd), Some(home.clone()), test_root(), |path| {
-                path == home
-            });
+        let directories = AppImageDirectories::new(
+            Some(&owd),
+            Some(home.clone()),
+            test_root(),
+            |path| path == home,
+            |_| true,
+        );
         assert_eq!(directories.launch, owd);
         assert_eq!(directories.dialogs, home);
         assert_eq!(
@@ -394,6 +449,77 @@ mod tests {
             child_directory(Some(PathBuf::from("relative")), test_root(), |_| true),
             test_root()
         );
+    }
+
+    #[cfg(unix)]
+    fn non_utf8_path() -> PathBuf {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(OsStr::from_bytes(b"/home/caf\xe9.chemdraft"))
+    }
+
+    #[cfg(windows)]
+    fn non_utf8_path() -> PathBuf {
+        use std::os::windows::ffi::OsStringExt;
+        // An unpaired surrogate has no UTF-8 form.
+        let mut wide: Vec<u16> = "C:\\caf".encode_utf16().collect();
+        wide.push(0xD800);
+        wide.extend(".chemdraft".encode_utf16());
+        PathBuf::from(std::ffi::OsString::from_wide(&wide))
+    }
+
+    #[test]
+    fn handoff_forwards_utf8_documents_and_refuses_the_rest_by_name() {
+        let utf8 = test_root().join("caf\u{e9}.chemdraft");
+        let other = test_root().join("second.cdxml");
+        let invalid = non_utf8_path();
+        let documents = vec![utf8.clone(), invalid.clone(), other.clone()];
+        let (forwarded, refused) = forwardable_documents(&documents);
+        assert_eq!(
+            forwarded,
+            [utf8.to_str().unwrap(), other.to_str().unwrap()],
+            "UTF-8 paths keep their order"
+        );
+        assert_eq!(refused, [invalid.as_path()]);
+        let message = refused_documents_message(&refused);
+        assert!(message.contains("not valid UTF-8"), "{message}");
+        assert!(message.contains("caf"), "{message}");
+        assert_eq!(forwardable_documents(&[]), (vec![], vec![]));
+    }
+
+    #[test]
+    fn browsable_directories_must_exist_and_be_listable() {
+        let root = std::env::temp_dir().join(format!(
+            "chemdraft-browsable-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&root).expect("create test folder");
+        assert!(is_browsable_dir(&root));
+        assert!(!is_browsable_dir(&root.join("missing")));
+        let file = root.join("file.txt");
+        std::fs::write(&file, b"").expect("create test file");
+        assert!(!is_browsable_dir(&file));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = root.join("locked");
+            std::fs::create_dir(&locked).expect("create locked folder");
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+                .expect("lock folder");
+            // A privileged test runner bypasses permission bits, so only check as a normal user.
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            if unsafe { libc::geteuid() } != 0 {
+                assert!(locked.is_dir());
+                assert!(!is_browsable_dir(&locked));
+            }
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))
+                .expect("unlock folder");
+        }
+        std::fs::remove_dir_all(&root).expect("remove test folder");
     }
 
     #[test]

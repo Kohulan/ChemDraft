@@ -2058,6 +2058,7 @@ fn setup_primary_app(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::E
             .cloned(),
     ) {
         eprintln!("Could not open ChemDraft document from launch arguments: {error}");
+        show_open_document_error(app, &error);
     }
 
     Ok(())
@@ -3266,9 +3267,15 @@ fn second_launch_action(quitting: bool, setup_completed: bool) -> SecondLaunchAc
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
 fn handle_second_launch<R: Runtime>(app: &tauri::AppHandle<R>, argv: Vec<String>, cwd: String) {
-    let _ = handle_second_launch_with(app, || {
+    let result = handle_second_launch_with(app, || {
         handle_opened_document_args(app, argv.into_iter().skip(1), Path::new(&cwd))
     });
+    #[cfg(target_os = "linux")]
+    if let Some(Err(error)) = &result {
+        show_open_document_error(app, error);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = result;
 }
 
 #[cfg(target_os = "macos")]
@@ -9358,8 +9365,44 @@ fn decode_document_text(bytes: &[u8]) -> String {
 
 const MAX_OPEN_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The renderer keeps an opened document's path as a JavaScript string and saves back through it.
+/// A path with no UTF-8 form cannot survive that trip, so on Linux (where file names are raw bytes)
+/// it is refused by name rather than replaced with a lossy look-alike that a save would miss.
+/// Other hosts keep their earlier conversion: macOS paths are always UTF-8, and `exact` stays off
+/// on Windows so its behavior does not change.
+fn open_document_path_text(path: &Path, exact: bool) -> Result<String, String> {
+    match path.to_str() {
+        Some(text) => Ok(text.to_owned()),
+        None if exact => Err(unsavable_document_path_message(path)),
+        None => Ok(path.to_string_lossy().into_owned()),
+    }
+}
+
+fn unsavable_document_path_message(path: &Path) -> String {
+    format!(
+        "Could not open \"{}\": its file name is not valid UTF-8, so ChemDraft could not save \
+         changes back to it. Rename the file and open it again.",
+        path.display()
+    )
+}
+
+/// Off macOS a failed shell open is otherwise reported only on stderr.
+#[cfg(target_os = "linux")]
+fn show_open_document_error<R: Runtime>(app: &tauri::AppHandle<R>, error: &str) {
+    let mut message = app
+        .dialog()
+        .message(error)
+        .title("ChemDraft Could Not Open a Document")
+        .kind(tauri_plugin_dialog::MessageDialogKind::Error);
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        message = message.parent(&window);
+    }
+    message.show(|_| {});
+}
+
 fn open_document_payload_from_path(path: &Path) -> Result<NativeOpenDocumentPayload, String> {
     use std::io::Read;
+    let path_text = open_document_path_text(path, cfg!(target_os = "linux"))?;
     let display_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -9388,7 +9431,7 @@ fn open_document_payload_from_path(path: &Path) -> Result<NativeOpenDocumentPayl
     Ok(NativeOpenDocumentPayload {
         #[cfg(target_os = "macos")]
         receipt: None,
-        path: path.to_string_lossy().to_string(),
+        path: path_text,
         display_name,
         contents,
         bytes,
@@ -12534,6 +12577,44 @@ mod tests {
                 assert!(!should_focus_main_window(mode));
             }
         }
+    }
+
+    #[test]
+    fn opened_document_paths_are_exact_or_refused_by_name() {
+        let utf8 = std::env::temp_dir().join("caf\u{e9} drawing.chemdraft");
+        for exact in [true, false] {
+            assert_eq!(
+                open_document_path_text(&utf8, exact).as_deref(),
+                Ok(utf8.to_str().unwrap())
+            );
+        }
+
+        #[cfg(unix)]
+        let invalid = {
+            use std::os::unix::ffi::OsStrExt;
+            PathBuf::from(std::ffi::OsStr::from_bytes(b"/home/caf\xe9.chemdraft"))
+        };
+        #[cfg(windows)]
+        let invalid = {
+            use std::os::windows::ffi::OsStringExt;
+            let mut wide: Vec<u16> = "C:\\caf".encode_utf16().collect();
+            wide.push(0xD800);
+            wide.extend(".chemdraft".encode_utf16());
+            PathBuf::from(std::ffi::OsString::from_wide(&wide))
+        };
+        // Linux: never hand the renderer a look-alike path that a save would write elsewhere.
+        let error = open_document_path_text(&invalid, true).unwrap_err();
+        assert!(error.contains("not valid UTF-8"), "{error}");
+        assert!(error.contains("Rename the file"), "{error}");
+        // Other hosts keep their earlier conversion.
+        assert_eq!(
+            open_document_path_text(&invalid, false),
+            Ok(invalid.to_string_lossy().into_owned())
+        );
+        #[cfg(target_os = "linux")]
+        assert!(open_document_payload_from_path(&invalid)
+            .unwrap_err()
+            .contains("not valid UTF-8"));
     }
 
     fn opened_document_test_payload() -> NativeOpenDocumentPayload {

@@ -45,6 +45,17 @@ fn logout_action(signal: Option<&str>) -> LogoutAction {
     }
 }
 
+/// GNOME's `EndSessionResponse` arguments. A flush that failed or timed out is not confirmed, so
+/// ChemDraft must not answer OK: GNOME then names ChemDraft and its reason to the user.
+#[cfg(any(target_os = "linux", test))]
+const fn end_session_response(flush_confirmed: bool) -> (bool, &'static str) {
+    if flush_confirmed {
+        (true, "")
+    } else {
+        (false, "ChemDraft could not save your open documents")
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 pub(super) fn in_progress() -> bool {
     false
@@ -61,8 +72,8 @@ pub(super) use linux::{acknowledge_flush, blocks_exit, in_progress, install};
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{
-        exit_budget, flush_budget, logout_action, termination_signals, LogoutAction,
-        TerminationSignal,
+        end_session_response, exit_budget, flush_budget, logout_action, termination_signals,
+        LogoutAction, TerminationSignal,
     };
     use crate::{request_document_quit_flush, APP_QUITTING, QUIT};
     use futures_lite::StreamExt;
@@ -279,17 +290,14 @@ mod linux {
                     .await;
                 }
                 LogoutAction::FlushAndExit => {
+                    // flush() is bounded by flush_budget(); a timeout returns false.
                     let flushed = flush(app).await;
-                    // Allow logout even on a failed write. This response is permission to end
-                    // the session, and reports no success for an unconfirmed write.
-                    let reason = if flushed {
-                        ""
-                    } else {
-                        "Session flush was not confirmed"
-                    };
+                    // Never answer OK for an unconfirmed write. The hard exit deadline set by
+                    // flush() still ends this process, so the refusal cannot hold logout open.
+                    let response = end_session_response(flushed);
                     let _ = tokio::time::timeout(
                         exit_budget().saturating_sub(flush_budget()),
-                        client.call::<_, _, ()>("EndSessionResponse", &(true, reason)),
+                        client.call::<_, _, ()>("EndSessionResponse", &response),
                     )
                     .await;
                     exit(app, flushed);
@@ -340,5 +348,13 @@ mod tests {
             LogoutAction::Ignore
         );
         assert_eq!(logout_action(None), LogoutAction::Ignore);
+    }
+
+    #[test]
+    fn logout_reports_ok_only_for_a_confirmed_flush() {
+        assert_eq!(end_session_response(true), (true, ""));
+        let (is_ok, reason) = end_session_response(false);
+        assert!(!is_ok);
+        assert_eq!(reason, "ChemDraft could not save your open documents");
     }
 }
