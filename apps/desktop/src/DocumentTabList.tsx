@@ -1,17 +1,4 @@
-import { useCallback, useImperativeHandle, useLayoutEffect, useRef, useState, type ReactNode, type Ref } from "react";
-
-type Strategy = "current" | "remount" | "transform" | "toggle";
-
-function tabStripStrategy(): Strategy {
-  // Temporary WebKit diagnostic. In devtools set chemdraft.debug.tabStripStrategy and reload the document window.
-  if (import.meta.env.DEV) {
-    try {
-      const value = localStorage.getItem("chemdraft.debug.tabStripStrategy");
-      if (value === "transform" || value === "remount" || value === "toggle" || value === "current") return value;
-    } catch { /* Storage can be unavailable in a webview. */ }
-  }
-  return "transform";
-}
+import { useCallback, useImperativeHandle, useLayoutEffect, useRef, type PointerEvent, type ReactNode, type Ref } from "react";
 
 export interface DocumentTabListHandle {
   beforeRemove(remaining: readonly { id: string }[]): void;
@@ -19,6 +6,13 @@ export interface DocumentTabListHandle {
 
 function clampOffset(offset: number, max: number) {
   return Math.max(0, Math.min(offset, max));
+}
+
+function scrollGeometry(viewportWidth: number, trackWidth: number) {
+  const max = Math.max(0, trackWidth - viewportWidth);
+  // The scrollbar spans the viewport.
+  const thumbWidth = max > 0 ? Math.min(viewportWidth, Math.max(24, viewportWidth ** 2 / trackWidth)) : viewportWidth;
+  return { max, thumbWidth, thumbTravel: viewportWidth - thumbWidth };
 }
 
 function offsetToReveal(strip: HTMLElement, tab: HTMLElement | null, offset: number, max: number) {
@@ -30,147 +24,63 @@ function offsetToReveal(strip: HTMLElement, tab: HTMLElement | null, offset: num
   return clampOffset(offset + delta, max);
 }
 
-const activeTabSelector = '.document-tab[data-active="true"]';
-
-function revealNativeActiveTab(strip: HTMLElement, max: number) {
-  if (max > 0) {
-    const target = offsetToReveal(strip, strip.querySelector(activeTabSelector), strip.scrollLeft, max);
-    if (target !== strip.scrollLeft) strip.scrollLeft = target;
-  }
-  return strip.scrollLeft;
-}
-
 export function DocumentTabList({ ref, activeId, order, children }: {
   ref: Ref<DocumentTabListHandle>;
   activeId: string;
   order: string;
   children: ReactNode;
 }) {
-  const [strategy] = useState(tabStripStrategy);
   const stripRef = useRef<HTMLDivElement>(null);
   const trackRef = useRef<HTMLDivElement>(null);
+  const scrollbarRef = useRef<HTMLDivElement>(null);
+  const thumbRef = useRef<HTMLDivElement>(null);
   const offset = useRef(0);
-  const removal = useRef<{ offset: number; max: number } | null>(null);
-  const [generation, setGeneration] = useState(0);
-  const restore = useRef<{ offset: number; reveal: boolean; tabId?: string; close: boolean } | null>(null);
+  const drag = useRef<{ pointerId: number; startX: number; startOffset: number } | null>(null);
 
-  const moveTrack = useCallback((track: HTMLElement, left: number) => {
-    offset.current = left;
-    track.style.transform = `translateX(${-left}px)`;
+  const moveTrack = useCallback((left: number, remainingWidth?: number) => {
+    const strip = stripRef.current;
+    const track = trackRef.current;
+    const scrollbar = scrollbarRef.current;
+    const thumb = thumbRef.current;
+    if (!strip || !track || !scrollbar || !thumb) return;
+
+    const viewportWidth = strip.clientWidth;
+    const { max, thumbWidth, thumbTravel } = scrollGeometry(viewportWidth, remainingWidth ?? track.scrollWidth);
+    const next = clampOffset(left, max);
+    // A shared transform keeps the painted tabs and their hit targets in sync.
+    offset.current = next;
+    track.style.transform = `translateX(${-next}px)`;
+    scrollbar.style.visibility = max > 0 && viewportWidth > 0 ? "visible" : "hidden";
+    thumb.style.width = `${thumbWidth}px`;
+    thumb.style.transform = `translateX(${max > 0 ? next / max * thumbTravel : 0}px)`;
   }, []);
 
   useImperativeHandle(ref, () => ({
     beforeRemove(remaining) {
       const strip = stripRef.current;
-      if (!strip) return;
       const track = trackRef.current;
-      if (strategy === "remount" || strategy === "toggle") {
-        removal.current = { offset: strip.scrollLeft, max: Math.max(0, strip.scrollWidth - strip.clientWidth) };
-        return;
-      }
-      const left = track ? offset.current : strip.scrollLeft;
-      if (left > 0) {
-        // Include tabs whose removal React has queued but whose elements are still in the strip.
-        const row = track ?? strip;
-        const remainingIds = new Set(remaining.map(tab => tab.id));
-        const tabs = Array.from(row.querySelectorAll<HTMLElement>("[data-document-tab-id]"));
-        const closing = tabs.filter(tab => !remainingIds.has(tab.dataset.documentTabId!));
-        const gap = Number.parseFloat(window.getComputedStyle(row).columnGap) || 0;
-        const gapsRemoved = Math.min(closing.length, Math.max(0, tabs.length - 1));
-        const widthRemoved = closing.reduce((width, tab) => width + tab.offsetWidth, 0) + gapsRemoved * gap;
-        const target = Math.max(0, row.scrollWidth - widthRemoved - strip.clientWidth);
-        if (target < left) {
-          if (track) moveTrack(track, target);
-          else strip.scrollLeft = target;
-        }
-      }
-      if (!track) offset.current = strip.scrollLeft;
-    }
-  }), [strategy, moveTrack]);
+      if (!strip || !track || offset.current <= 0) return;
 
-  const replaceStrip = useCallback((strip: HTMLElement, left: number, reveal: boolean) => {
-    const focused = document.activeElement;
-    const tab = strip.contains(focused) ? focused?.closest<HTMLElement>("[data-document-tab-id]") : null;
-    restore.current = { offset: left, reveal, tabId: tab?.dataset.documentTabId,
-      close: focused?.classList.contains("document-tab-close") ?? false };
-    setGeneration(previous => previous + 1);
-  }, []);
+      // Include tabs whose removal React has queued but whose elements are still in the strip.
+      const remainingIds = new Set(remaining.map(tab => tab.id));
+      const tabs = Array.from(track.querySelectorAll<HTMLElement>("[data-document-tab-id]"));
+      const closing = tabs.filter(tab => !remainingIds.has(tab.dataset.documentTabId!));
+      const gap = Number.parseFloat(window.getComputedStyle(track).columnGap) || 0;
+      const gapsRemoved = Math.min(closing.length, Math.max(0, tabs.length - 1));
+      const widthRemoved = closing.reduce((width, tab) => width + tab.offsetWidth, 0) + gapsRemoved * gap;
+      const remainingWidth = track.scrollWidth - widthRemoved;
+      if (remainingWidth - strip.clientWidth < offset.current) moveTrack(offset.current, remainingWidth);
+    }
+  }), [moveTrack]);
 
   useLayoutEffect(() => {
     const strip = stripRef.current;
-    const saved = restore.current;
-    if (!strip || !saved) return;
-    restore.current = null;
-    const max = Math.max(0, strip.scrollWidth - strip.clientWidth);
-    strip.scrollLeft = clampOffset(saved.offset, max);
-    if (saved.tabId) {
-      const tab = Array.from(strip.querySelectorAll<HTMLElement>("[data-document-tab-id]"))
-        .find(element => element.dataset.documentTabId === saved.tabId);
-      tab?.querySelector<HTMLElement>(saved.close ? ".document-tab-close" : '[role="tab"]')?.focus({ preventScroll: true });
-    }
-    if (saved.reveal) revealNativeActiveTab(strip, max);
-  }, [generation]);
-
-  useLayoutEffect(() => {
-    if (strategy !== "remount") return;
-    let frame = 0;
-    function onFocus() {
-      window.cancelAnimationFrame(frame);
-      frame = window.requestAnimationFrame(() => {
-        const strip = stripRef.current;
-        if (!strip) return;
-        // A click may be making this window key. Keep its target alive through mouseup and click.
-        if (strip.querySelector("button:active")) onFocus();
-        else replaceStrip(strip, strip.scrollLeft, false);
-      });
-    }
-    window.addEventListener("focus", onFocus);
-    return () => {
-      window.removeEventListener("focus", onFocus);
-      window.cancelAnimationFrame(frame);
-    };
-  }, [strategy, replaceStrip]);
-
-  useLayoutEffect(() => {
-    const strip = stripRef.current;
-    if (!strip) return;
     const track = trackRef.current;
-    const max = Math.max(0, (track ?? strip).scrollWidth - strip.clientWidth);
-    if (track) {
-      moveTrack(track, offsetToReveal(strip, strip.querySelector(activeTabSelector), offset.current, max));
-      return;
-    }
-    const before = removal.current;
-    removal.current = null;
-    if (strategy === "remount" && before && before.max !== max) {
-      replaceStrip(strip, before.offset, true);
-      return;
-    }
-    if (strategy === "toggle" && before) {
-      strip.style.overflowX = "hidden";
-      void strip.offsetWidth;
-      strip.style.overflowX = "auto";
-      const frame = window.requestAnimationFrame(() => {
-        const limit = Math.max(0, strip.scrollWidth - strip.clientWidth);
-        strip.scrollLeft = clampOffset(before.offset, limit);
-        revealNativeActiveTab(strip, limit);
-      });
-      return () => window.cancelAnimationFrame(frame);
-    }
-    if (strategy !== "current" || max === 0 || offset.current <= max) {
-      offset.current = revealNativeActiveTab(strip, max);
-      return;
-    }
-    // HEAD baseline: when WebKit clamps beyond the pre-close target, nudge and return next frame.
-    const nudge = Math.max(0, max - 1);
-    if (strip.scrollLeft !== nudge) strip.scrollLeft = nudge;
-    offset.current = strip.scrollLeft;
-    const frame = window.requestAnimationFrame(() => {
-      if (strip.scrollLeft !== max) strip.scrollLeft = max;
-      offset.current = revealNativeActiveTab(strip, max);
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [strategy, activeId, order, moveTrack, replaceStrip]);
+    if (!strip || !track) return;
+    const max = Math.max(0, track.scrollWidth - strip.clientWidth);
+    const activeTab = track.querySelector<HTMLElement>('.document-tab[data-active="true"]');
+    moveTrack(offsetToReveal(strip, activeTab, offset.current, max));
+  }, [activeId, order, moveTrack]);
 
   useLayoutEffect(() => {
     const strip = stripRef.current;
@@ -186,15 +96,15 @@ export function DocumentTabList({ ref, activeId, order, children }: {
       const next = clampOffset(offset.current + delta, maxOffset());
       if (next === offset.current) return;
       event.preventDefault();
-      moveTrack(track, next);
+      moveTrack(next);
     };
     const onFocus = (event: FocusEvent) => {
       // Leave a partially visible pointer target in place between mouse-down and click.
       const tab = event.target instanceof Element ? event.target.closest<HTMLElement>(".document-tab") : null;
-      if (tab && !tab.matches(":active")) moveTrack(track, offsetToReveal(strip, tab, offset.current, maxOffset()));
+      if (tab && !tab.matches(":active")) moveTrack(offsetToReveal(strip, tab, offset.current, maxOffset()));
     };
     const resize = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(() => {
-      moveTrack(track, clampOffset(offset.current, maxOffset()));
+      moveTrack(offset.current);
     });
     resize?.observe(strip);
     resize?.observe(track);
@@ -207,14 +117,48 @@ export function DocumentTabList({ ref, activeId, order, children }: {
     };
   }, [moveTrack]);
 
+  function onScrollbarPointerDown(event: PointerEvent<HTMLDivElement>) {
+    const strip = stripRef.current;
+    const track = trackRef.current;
+    const thumb = thumbRef.current;
+    if (!strip || !track || !thumb || drag.current || event.button !== 0 || event.pointerType !== "mouse") return;
+    const viewportWidth = strip.clientWidth;
+    if (track.scrollWidth <= viewportWidth) return;
+
+    event.preventDefault();
+    if (event.target === thumb) {
+      event.currentTarget.setPointerCapture(event.pointerId);
+      drag.current = { pointerId: event.pointerId, startX: event.clientX, startOffset: offset.current };
+    } else {
+      const direction = event.clientX < thumb.getBoundingClientRect().left ? -1 : 1;
+      moveTrack(offset.current + direction * viewportWidth);
+    }
+  }
+
+  function onScrollbarPointerMove(event: PointerEvent<HTMLDivElement>) {
+    const start = drag.current;
+    const strip = stripRef.current;
+    const track = trackRef.current;
+    if (!start || start.pointerId !== event.pointerId || !strip || !track) return;
+
+    const { max, thumbTravel } = scrollGeometry(strip.clientWidth, track.scrollWidth);
+    if (thumbTravel > 0) moveTrack(start.startOffset + (event.clientX - start.startX) / thumbTravel * max);
+  }
+
+  function endScrollbarDrag(event: PointerEvent<HTMLDivElement>) {
+    if (drag.current?.pointerId === event.pointerId) drag.current = null;
+  }
+
   return (
-    <div key={generation} ref={stripRef} className="document-tab-list" role="tablist" aria-label="Open documents"
-      data-strategy={strategy} onScroll={strategy === "current" ? event => { offset.current = event.currentTarget.scrollLeft; } : undefined}>
-      {strategy === "transform" ? (
-        <div className="document-tab-clip">
-          <div ref={trackRef} className="document-tab-track">{children}</div>
-        </div>
-      ) : children}
+    <div ref={stripRef} className="document-tab-list" role="tablist" aria-label="Open documents">
+      <div className="document-tab-clip">
+        <div ref={trackRef} className="document-tab-track">{children}</div>
+      </div>
+      <div ref={scrollbarRef} className="document-tab-scrollbar" aria-hidden="true"
+        onPointerDown={onScrollbarPointerDown} onPointerMove={onScrollbarPointerMove}
+        onPointerUp={endScrollbarDrag} onPointerCancel={endScrollbarDrag} onLostPointerCapture={endScrollbarDrag}>
+        <div ref={thumbRef} className="document-tab-scrollbar-thumb" />
+      </div>
     </div>
   );
 }
