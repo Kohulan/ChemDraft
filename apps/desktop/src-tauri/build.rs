@@ -13,6 +13,7 @@ fn main() {
     ensure_opsin_runtime_dir();
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
+            "window_first_paint",
             "popup_canvas_context_menu",
             "file_warnings_open",
             "file_warnings_request",

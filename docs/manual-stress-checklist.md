@@ -102,6 +102,19 @@ cover the toolbars. Hover for a tooltip, open and reopen a palette popover, and 
 Check that each opens after prewarming or reuse and that mouse-opened utilities leave the document
 focused. On native Wayland, the compositor places these windows.
 
+Palette first paint (Windows): quit ChemDraft, then cold-launch it. The Main toolbar and the other
+open palettes appear with their content in the palette's light grey, with no black frame and no
+blank light frames first. Press and hold a flyout button and open a color picker: each popover, and
+the first hovered tooltip, appears with its content and no black or blank frame. Focus stays on the
+document throughout (its title bar stays active and M switches tools). Close a palette from
+View ▸ Toolbars right after launch: it stays closed. Minimize the document right after launch,
+before the palettes appear: no palette shows until the document is restored, and then they all do.
+If a palette appears before its content, it shows only an empty panel in the palette's own grey,
+never the darker document-window grey. With the agent bridge diagnostics on, the
+`[windows-activation]` log has one `palette reveal label=... ms=... trigger=ack|fallback|release
+result=...` line per palette; on a cold launch `trigger=ack` is expected, since the fallback waits
+5 s.
+
 Palette field input (macOS and Windows): in Drawn Structure Settings, click Target bond length,
 type 30 and press Return; the value changes, the canvas does not, and no hotkey fires. Switch to
 another app and back, then click the field again; Customize gallery search still types.

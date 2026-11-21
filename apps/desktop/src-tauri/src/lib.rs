@@ -14,6 +14,7 @@ mod download_diagnosis;
 mod export;
 mod external_tools;
 mod file_warnings_window;
+mod first_paint;
 mod fonts;
 mod installed_plugins;
 #[cfg(target_os = "linux")]
@@ -34,6 +35,7 @@ mod network_error;
 mod network_test_http;
 mod ocsr_engine;
 mod opsin;
+mod palette_first_paint;
 mod panel_full_size;
 mod panel_window;
 mod panel_window_controls;
@@ -1573,6 +1575,7 @@ pub fn run() {
                     // Windows sends Resized when the owner is restored from the taskbar;
                     // macOS also reports its restored frame. Never release a prompt here.
                     schedule_suspended_utility_restore(window.app_handle());
+                    palette_first_paint::release_held(window.app_handle());
                     if let Err(error) = persist_main_window_geometry(window) {
                         eprintln!("Could not persist ChemDraft main window frame: {error}");
                     }
@@ -1619,6 +1622,7 @@ pub fn run() {
                         #[cfg(target_os = "macos")]
                         reattach_visible_plugin_panels(window.app_handle());
                         schedule_suspended_utility_restore(window.app_handle());
+                        palette_first_paint::release_held(window.app_handle());
                     }
                     _ => {}
                 }
@@ -1788,6 +1792,7 @@ pub fn run() {
             setup_primary_app(app.handle())
         })
         .invoke_handler(tauri::generate_handler![
+            first_paint::window_first_paint,
             canvas_context_menu::popup_canvas_context_menu,
             file_warnings_window::file_warnings_open,
             file_warnings_window::file_warnings_request,
@@ -2982,7 +2987,10 @@ async fn suspend_toolset_windows(
             }
             Ok(())
         } else {
-            restore_suspended_utility_windows(&app)?;
+            let restored = restore_suspended_utility_windows(&app);
+            // A palette whose first paint arrived during the suspension was held; show it now.
+            palette_first_paint::release_held(&app);
+            restored?;
             if let Some(session_id) = focus_export_session_id {
                 dialog_windows::focus_export_after_picker(&app, &session_id)?;
             }
@@ -3026,7 +3034,12 @@ fn schedule_suspended_utility_restore<R: Runtime>(app: &tauri::AppHandle<R>) {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .pending_restore();
-            restore_utility_labels(&app, labels)
+            let restored = restore_utility_labels(&app, labels);
+            // This restoration is what clears a suspension whose prompt ended while the document
+            // was minimized; the restore event's own retry ran while it was still active. Retry
+            // the held first-paint reveals now that it may have cleared.
+            palette_first_paint::release_held(&app);
+            restored
         });
         if let Err(error) = result
             .and_then(|result| result)
@@ -3510,14 +3523,23 @@ async fn open_toolset_window(
     toolset_id: String,
     window: Option<ToolsetWindowGeometry>,
 ) -> Result<ToolsetWindowState, String> {
+    // Windows: recorded before waiting for the creation lock, so a close that arrives while this
+    // open waits, builds or arms wins over it (palette_first_paint.rs). No-op elsewhere.
+    palette_first_paint::requested(&toolset_window_label(&toolset_id));
     let _creation = lock_window_creation()?;
     if utility_windows_suspended() {
         return toolset_state(&app, &toolset_id);
     }
     ensure_toolset_window(&app, &toolset_id, window.as_ref())?;
-    set_toolset_menu_checked(&app, &toolset_id, true)?;
 
     let state = toolset_state(&app, &toolset_id)?;
+    // Windows: a palette closed while this open was in flight stays closed, menu item included.
+    // macOS and Linux check it as before.
+    set_toolset_menu_checked(
+        &app,
+        &toolset_id,
+        state.open || !palette_first_paint::tracks_palettes(),
+    )?;
     let _ = emit_toolset_window_state_to_main(&app, &state);
     Ok(state)
 }
@@ -3530,6 +3552,9 @@ fn close_toolset_window(
     if utility_windows_suspended() {
         return toolset_state(&app, &toolset_id);
     }
+    // Windows: before anything else, and whether or not the window exists yet, so an open still
+    // waiting for, building or arming its window does not show it afterwards (a later open does).
+    palette_first_paint::closed(&toolset_window_label(&toolset_id));
     let window = app.get_webview_window(&toolset_window_label(&toolset_id));
     if let Some(window) = window.as_ref() {
         let webview: &tauri::Webview = window.as_ref();
@@ -6704,6 +6729,9 @@ fn build_toolset_popover_window(
     config.resizable |= native_wayland;
     let builder =
         WebviewWindowBuilder::from_config(app, &config).map_err(|error| error.to_string())?;
+    // Windows: the palette background as its first frame. Still shown only by its own reveal.
+    let builder =
+        palette_first_paint::builder_step(builder, palette_first_paint::PaletteWindowKind::Popover);
     let builder = if native_wayland {
         builder
     } else {
@@ -7333,7 +7361,7 @@ fn build_toolset_tooltip_window(app: &tauri::AppHandle) -> Result<(), String> {
     }
 
     let native_wayland = utility_window::uses_native_wayland(app)?;
-    let window = utility_window_builder(
+    let builder = utility_window_builder(
         WebviewWindowBuilder::new(
             app,
             TOOLSET_TOOLTIP_WINDOW_LABEL,
@@ -7350,9 +7378,12 @@ fn build_toolset_tooltip_window(app: &tauri::AppHandle) -> Result<(), String> {
     .resizable(native_wayland)
     .decorations(false)
     .skip_taskbar(true)
-    .visible(false)
-    .build()
-    .map_err(|error| error.to_string())?;
+    .visible(false);
+    // Windows: the tooltip background as its first frame. Still shown only by its own reveal.
+    let window =
+        palette_first_paint::builder_step(builder, palette_first_paint::PaletteWindowKind::Tooltip)
+            .build()
+            .map_err(|error| error.to_string())?;
 
     disable_default_context_menus(&window);
     utility_window::prepare(&window, utility_window::Kind::Tooltip, native_wayland)?;
@@ -10897,7 +10928,11 @@ fn ensure_toolset_window<R: Runtime>(
         // display it lived on may have been unplugged while it was hidden. Re-clamp on the way in,
         // so re-opening from View ▸ Toolbars is always enough to recover a lost palette.
         recover_offscreen_toolset_window(app, &window, resizable);
-        window.show().map_err(|error| error.to_string())?;
+        // Its page has painted, so show it now — unless it is still waiting for its first paint
+        // (Windows, palette_first_paint.rs), whose reveal will show it.
+        if !palette_first_paint::reopened(&label) {
+            window.show().map_err(|error| error.to_string())?;
+        }
         configure_toolset_utility_window(&window, true)?;
         return Ok(());
     }
@@ -10986,13 +11021,16 @@ fn ensure_toolset_window<R: Runtime>(
     } else {
         builder.position(position.x, position.y)
     };
+    // Windows: hidden with the palette's background as its first frame, until its page paints.
+    let builder =
+        palette_first_paint::builder_step(builder, palette_first_paint::PaletteWindowKind::Toolbar);
     #[cfg(windows)]
     let builder = if placement.is_some() {
         // Tao's builder accepts logical positions only. Set the physical frame before showing
         // the window so it does not flash at an ambiguous logical position on another display.
-        builder.visible(false)
+        builder
     } else {
-        builder.visible(false).position(position.x, position.y)
+        builder.position(position.x, position.y)
     };
     // Only scrolling inspectors need a floor for manual resize. A toolbar's frame is fixed
     // at the DOM's measured size until the next fit. A floor here would leave narrow grids padded.
@@ -11033,7 +11071,10 @@ fn ensure_toolset_window<R: Runtime>(
                 let webview: &tauri::Webview<R> = target.as_ref();
                 panel_full_size::apply(&webview.window(), placement, "initial toolbar placement")?;
             }
-            target.show().map_err(|error| error.to_string())
+            // Stays hidden until its page reports its first paint, or the fallback fires; a
+            // palette closed or minimized meanwhile is not shown by either (palette_first_paint.rs).
+            palette_first_paint::arm_toolbar(&target);
+            Ok::<(), String>(())
         })
         .and_then(|result| result);
         panel_window::finish_installation(placed, || {
@@ -11364,7 +11405,9 @@ fn toolset_state<R: Runtime>(
 ) -> Result<ToolsetWindowState, String> {
     match app.get_webview_window(&toolset_window_label(toolset_id)) {
         Some(window) => {
-            let actual_visible = window.is_visible().unwrap_or(false);
+            // A palette still hidden until its first paint (Windows) is open, not closed.
+            let actual_visible = window.is_visible().unwrap_or(false)
+                || palette_first_paint::opening(window.label());
             let visible = UTILITY_SUSPENSION
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
