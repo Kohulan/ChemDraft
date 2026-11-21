@@ -1972,6 +1972,55 @@ describe("documents in one window", () => {
       expect(wheel(track, 10, 0)).toBe(false);
     });
 
+    describe("resizing the strip", () => {
+      async function openWithResize() {
+        const resize = new Map<Element, () => void>();
+        vi.stubGlobal("ResizeObserver", class {
+          constructor(private readonly onResize: () => void) {}
+          observe(element: Element) { resize.set(element, this.onResize); }
+          unobserve(element: Element) { resize.delete(element); }
+          disconnect() {}
+        });
+        await remount();
+        const opened = await openOverflowingTabs();
+        expect(opened.track.style.transform).toBe("translateX(-376px)");
+        return { ...opened, resize };
+      }
+
+      function expectActiveTabInView(strip: HTMLElement) {
+        const tab = strip.querySelector('[data-active="true"]')!.getBoundingClientRect();
+        const bounds = strip.getBoundingClientRect();
+        expect(tab.left).toBeGreaterThanOrEqual(bounds.left);
+        expect(tab.right).toBeLessThanOrEqual(bounds.right);
+      }
+
+      it("keeps a fully visible active tab in view when the strip narrows", async () => {
+        const { strip, track, stripWidth, resize } = await openWithResize();
+        stripWidth.mockReturnValue(200);
+        resize.get(strip)!();
+        expect(track.style.transform).toBe("translateX(-406px)");
+        expectActiveTabInView(strip);
+      });
+
+      it("only clamps when the user had scrolled the active tab out of view before narrowing", async () => {
+        const { strip, track, stripWidth, resize } = await openWithResize();
+        expect(wheel(track, -300, 0)).toBe(true);
+        expect(track.style.transform).toBe("translateX(-76px)");
+        stripWidth.mockReturnValue(200);
+        resize.get(strip)!();
+        expect(track.style.transform).toBe("translateX(-76px)");
+      });
+
+      it("clamps to the new maximum with no gap when the strip widens", async () => {
+        const { strip, track, stripWidth, resize } = await openWithResize();
+        stripWidth.mockReturnValue(320);
+        resize.get(strip)!();
+        expect(track.style.transform).toBe("translateX(-286px)");
+        expect(286 + 320).toBe(606);
+        expectActiveTabInView(strip);
+      });
+    });
+
     it.each(["×", "Cmd+W", "Ctrl+W"] as const)(
       "scrolls before removing the last active tab via %s",
       async (route) => {

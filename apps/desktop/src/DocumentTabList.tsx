@@ -35,6 +35,7 @@ export function DocumentTabList({ ref, activeId, order, children }: {
   const scrollbarRef = useRef<HTMLDivElement>(null);
   const thumbRef = useRef<HTMLDivElement>(null);
   const offset = useRef(0);
+  const viewportWidth = useRef(0);
   const drag = useRef<{ pointerId: number; startX: number; startOffset: number } | null>(null);
 
   const moveTrack = useCallback((left: number, remainingWidth?: number) => {
@@ -44,13 +45,14 @@ export function DocumentTabList({ ref, activeId, order, children }: {
     const thumb = thumbRef.current;
     if (!strip || !track || !scrollbar || !thumb) return;
 
-    const viewportWidth = strip.clientWidth;
-    const { max, thumbWidth, thumbTravel } = scrollGeometry(viewportWidth, remainingWidth ?? track.scrollWidth);
+    const stripWidth = strip.clientWidth;
+    viewportWidth.current = stripWidth;
+    const { max, thumbWidth, thumbTravel } = scrollGeometry(stripWidth, remainingWidth ?? track.scrollWidth);
     const next = clampOffset(left, max);
     // A shared transform keeps the painted tabs and their hit targets in sync.
     offset.current = next;
     track.style.transform = `translateX(${-next}px)`;
-    scrollbar.style.visibility = max > 0 && viewportWidth > 0 ? "visible" : "hidden";
+    scrollbar.style.visibility = max > 0 && stripWidth > 0 ? "visible" : "hidden";
     thumb.style.width = `${thumbWidth}px`;
     thumb.style.transform = `translateX(${max > 0 ? next / max * thumbTravel : 0}px)`;
   }, []);
@@ -104,7 +106,16 @@ export function DocumentTabList({ ref, activeId, order, children }: {
       if (tab && !tab.matches(":active")) moveTrack(offsetToReveal(strip, tab, offset.current, maxOffset()));
     };
     const resize = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(() => {
-      moveTrack(offset.current);
+      // The track still sits at its old offset, so the tab's rect and the last viewport width describe the
+      // layout before this resize. Keep an active tab that was fully in view in view; otherwise only clamp.
+      const activeTab = track.querySelector<HTMLElement>('.document-tab[data-active="true"]');
+      let wasInView = false;
+      if (activeTab) {
+        const rect = activeTab.getBoundingClientRect();
+        const left = strip.getBoundingClientRect().left + strip.clientLeft;
+        wasInView = rect.left - left >= -0.5 && rect.right - left <= viewportWidth.current + 0.5;
+      }
+      moveTrack(wasInView ? offsetToReveal(strip, activeTab, offset.current, maxOffset()) : offset.current);
     });
     resize?.observe(strip);
     resize?.observe(track);
