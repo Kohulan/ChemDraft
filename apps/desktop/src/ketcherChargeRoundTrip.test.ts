@@ -41,19 +41,25 @@ import {
 const objectId = "mol_ketcher_roundtrip";
 
 function methylamine(): { document: ChemDraftDocument; nitrogenId: string } {
-  const graph = testMoleculeFromSmiles("CN");
+  const { document } = linearMolecule("CN");
+  return { document, nitrogenId: moleculeOf(document).atoms.find(atom => atom.element === "N")!.id };
+}
+
+/** A native molecule of `smiles` (written as an unbranched chain) laid out left to right, 30 px apart. */
+function linearMolecule(smiles: string): { document: ChemDraftDocument; atomIds: string[] } {
+  const graph = testMoleculeFromSmiles(smiles);
   const atoms: MoleculeAtom[] = graph.atoms.map((atom, index) => ({ ...atom, x: 100 + index * 30, y: 100 }));
   const molecule: MoleculeObject = {
-    id: objectId, type: "molecule", x: 90, y: 80, width: 60, height: 40, rotation: 0, style: {},
+    id: objectId, type: "molecule", x: 90, y: 80, width: Math.max(60, (atoms.length - 1) * 30 + 20), height: 40,
+    rotation: 0, style: {},
     atoms, bonds: graph.bonds, structureFormat: "smiles",
     structure: nativeSingleBondGraphSmiles(atoms, graph.bonds),
     chemistry: nativeSingleBondGraphMetadata(atoms, graph.bonds),
     superatoms: [], rGroups: []
   };
-  const nitrogen = atoms.find(atom => atom.element === "N")!;
   const document = applyPatch(createPhase4Document("Ketcher charge round trip"),
     { op: "addObject", pageId: createPhase4Document().pages[0].id, object: molecule });
-  return { document: normalizeCommittedDocument(document), nitrogenId: nitrogen.id };
+  return { document: normalizeCommittedDocument(document), atomIds: atoms.map(atom => atom.id) };
 }
 
 function selectMolecule(document: ChemDraftDocument): ChemDraftDocument {
@@ -149,8 +155,68 @@ function chargeState(document: ChemDraftDocument, atomId: string) {
   return { formalCharge: atom.formalCharge, markCharge: atom.markCharge ?? 0, marks: marksOf(document).length };
 }
 
+/** The V3000 Ketcher returns with atoms `first` and `second` (1-based) trading places: a geometry-only edit. */
+function swapAtomPositions(first: number, second: number): (v3000: string) => string {
+  return v3000 => {
+    const lines = v3000.split(/\r?\n/);
+    const begin = lines.findIndex(line => line.includes("BEGIN ATOM"));
+    const end = lines.findIndex(line => line.includes("END ATOM"));
+    const find = (atom: number) => lines.findIndex((line, index) => index > begin && index < end &&
+      new RegExp(`^M\\s+V30\\s+${atom}\\s`).test(line));
+    const a = find(first), b = find(second);
+    const partsA = lines[a]!.trim().split(/\s+/), partsB = lines[b]!.trim().split(/\s+/);
+    // M V30 <index> <element> <x> <y> <z> ...
+    [partsA[4], partsB[4], partsA[5], partsB[5]] = [partsB[4]!, partsA[4]!, partsB[5]!, partsA[5]!];
+    lines[a] = `M  V30 ${partsA.slice(2).join(" ")}`;
+    lines[b] = `M  V30 ${partsB.slice(2).join(" ")}`;
+    return lines.join("\n");
+  };
+}
+
+/** A V3000 as the editor writes it for these atoms (page px, y down) and 1-based bonds, all single. */
+function editorV3000(atoms: ReadonlyArray<{ element: string; x: number; y: number }>, bonds: ReadonlyArray<[number, number]>): string {
+  return [
+    "-INDIGO-", "", "  0  0  0  0  0  0  0  0  0  0  0 V3000",
+    "M  V30 BEGIN CTAB",
+    `M  V30 COUNTS ${atoms.length} ${bonds.length} 0 0 0`,
+    "M  V30 BEGIN ATOM",
+    ...atoms.map((atom, index) => `M  V30 ${index + 1} ${atom.element} ${(atom.x / 30).toFixed(4)} ${(-atom.y / 30).toFixed(4)} 0.0 0`),
+    "M  V30 END ATOM",
+    "M  V30 BEGIN BOND",
+    ...bonds.map(([from, to], index) => `M  V30 ${index + 1} 1 ${from} ${to}`),
+    "M  V30 END BOND", "M  V30 END CTAB", "M  END"
+  ].join("\n");
+}
+
+function markCenter(mark: ElectronMarkObject) {
+  return { x: mark.x + mark.width / 2, y: mark.y + mark.height / 2 };
+}
+
+/** Where the mark sits relative to its atom: unchanged when the mark rode with the atom. */
+function markOffset(document: ChemDraftDocument, mark: ElectronMarkObject, atomId: string) {
+  const atom = atomOf(document, atomId), center = markCenter(mark);
+  return { dx: center.x - atom.x, dy: center.y - atom.y };
+}
+
 function nitrogenLine(v3000: string): string {
   return v3000.split(/\r?\n/).find(line => /^M\s+V30\s+\d+\s+N\s/.test(line.trim())) ?? "";
+}
+
+/**
+ * N+ whose + mark is a legacy loose mark: a point anchor and no explicit association, so commit
+ * normalization associates it with N only by distance. Not normalized again, so it reaches the
+ * editor save still loose (normalization would anchor it to N).
+ */
+function looseChargeOnNitrogen(plain: ChemDraftDocument, nitrogenId: string): ChemDraftDocument {
+  const anchored = chargedByTool(plain, nitrogenId, [1]);
+  const mark = marksOf(anchored)[0]!;
+  const loose = applyPatch(anchored, { op: "updateObject", objectId: mark.id,
+    changes: { anchor: { kind: "point", point: markCenter(mark) }, atomAssociation: undefined } });
+  expect(marksOf(loose)[0]!.anchor).toEqual({ kind: "point", point: markCenter(mark) });
+  expect(marksOf(loose)[0]!.atomAssociation).toBeUndefined();
+  expect(chargeState(loose, nitrogenId)).toEqual({ formalCharge: 1, markCharge: 1, marks: 1 });
+  expect(chargeState(normalizeCommittedDocument(loose), nitrogenId)).toEqual({ formalCharge: 1, markCharge: 1, marks: 1 });
+  return loose;
 }
 
 describe("unchanged Ketcher save keeps charge and electron marks", () => {
@@ -178,16 +244,7 @@ describe("unchanged Ketcher save keeps charge and electron marks", () => {
 
   it("(b) the same with a legacy loose + mark that only associates by distance", () => {
     const { document: plain, nitrogenId } = methylamine();
-    const anchored = normalizeCommittedDocument(applyChargeToolAtNativeAtom(plain, { kind: "charge", charge: 1 },
-      { kind: "atom", objectId, atomId: nitrogenId, distanceToPointer: 0 }));
-    const mark = marksOf(anchored)[0];
-    const center = { x: mark.x + mark.width / 2, y: mark.y + mark.height / 2 };
-    // A legacy mark: a floating point anchor and no explicit association; commit normalization
-    // associates it with N by distance and derives markCharge from that.
-    const loose = normalizeCommittedDocument(applyPatch(anchored, { op: "updateObject", objectId: mark.id,
-      changes: { anchor: { kind: "point", point: center }, atomAssociation: undefined } }));
-    expect(nitrogenOf(loose, nitrogenId)).toMatchObject({ formalCharge: 1, markCharge: 1 });
-    expect(marksOf(loose)).toHaveLength(1);
+    const loose = looseChargeOnNitrogen(plain, nitrogenId);
 
     const { v3000, committed } = unchangedKetcherSave(loose);
     expect(nitrogenLine(v3000)).toContain("CHG=1");
@@ -384,5 +441,115 @@ describe("a Ketcher charge that contradicts a charge mark still on the atom", ()
     const { selected, refusal } = editedKetcherSave(charged, withCharge("C", charge));
     expect(refusal).toBe(editorSaveChargeContradictsMarkRefusal("C", 1));
     expect(chargeState(selected, carbonId)).toEqual({ formalCharge: -1, markCharge: -1, marks: 1 });
+  });
+});
+
+describe("a Ketcher save keeps every charge and radical mark on its atom", () => {
+  const carbonIdOf = (document: ChemDraftDocument) => moleculeOf(document).atoms.find(atom => atom.element === "C")!.id;
+
+  it("a bond-anchored radical on N follows N when C and N trade places in Ketcher", () => {
+    const { document: plain, nitrogenId } = methylamine();
+    const anchored = normalizeCommittedDocument(applyChargeToolAtNativeAtom(plain, { kind: "radical-dot" },
+      { kind: "atom", objectId, atomId: nitrogenId, distanceToPointer: 0 }));
+    const mark = marksOf(anchored)[0]!;
+    const bond = moleculeOf(anchored).bonds[0]!;
+    // A legacy bond-anchored radical: normalization resolves it to N by distance.
+    const radical = normalizeCommittedDocument(applyPatch(anchored, { op: "updateObject", objectId: mark.id,
+      changes: { anchor: { kind: "bond", objectId, bondId: bond.id }, atomAssociation: undefined } }));
+    expect(marksOf(radical)[0]!.anchor).toMatchObject({ kind: "bond", bondId: bond.id });
+    expect(nitrogenOf(radical, nitrogenId)).toMatchObject({ formalCharge: 0, markRadicals: 1 });
+    const offsetBefore = markOffset(radical, marksOf(radical)[0]!, nitrogenId);
+
+    const { refusal, committed } = editedKetcherSave(radical, swapAtomPositions(1, 2));
+    expect(refusal).toBeUndefined();
+    const carbonId = carbonIdOf(committed);
+    // N really moved: it now sits where C was.
+    expect(nitrogenOf(committed, nitrogenId).x).toBeLessThan(atomOf(committed, carbonId).x);
+    expect(nitrogenOf(committed, nitrogenId).markRadicals ?? 0).toBe(1);
+    expect(atomOf(committed, carbonId).markRadicals ?? 0).toBe(0);
+    expect(marksOf(committed)).toHaveLength(1);
+    const after = marksOf(committed)[0]!;
+    expect(after.anchor).toMatchObject({ kind: "atom", objectId, atomId: nitrogenId });
+    const offsetAfter = markOffset(committed, after, nitrogenId);
+    expect(offsetAfter.dx).toBeCloseTo(offsetBefore.dx, 6);
+    expect(offsetAfter.dy).toBeCloseTo(offsetBefore.dy, 6);
+  });
+
+  it("a legacy loose + mark on N follows N when C and N trade places in Ketcher", () => {
+    const { document: plain, nitrogenId } = methylamine();
+    const loose = looseChargeOnNitrogen(plain, nitrogenId);
+    const offsetBefore = markOffset(loose, marksOf(loose)[0]!, nitrogenId);
+
+    const { v3000, refusal, committed } = editedKetcherSave(loose, swapAtomPositions(1, 2));
+    expect(nitrogenLine(v3000)).toContain("CHG=1");
+    expect(refusal).toBeUndefined();
+    const carbonId = carbonIdOf(committed);
+    expect(chargeState(committed, nitrogenId)).toEqual({ formalCharge: 1, markCharge: 1, marks: 1 });
+    expect(chargeState(committed, carbonId)).toEqual({ formalCharge: 0, markCharge: 0, marks: 1 });
+    const after = marksOf(committed)[0]!;
+    expect(after.anchor).toMatchObject({ kind: "atom", objectId, atomId: nitrogenId });
+    const offsetAfter = markOffset(committed, after, nitrogenId);
+    expect(offsetAfter.dx).toBeCloseTo(offsetBefore.dx, 6);
+    expect(offsetAfter.dy).toBeCloseTo(offsetBefore.dy, 6);
+  });
+});
+
+describe("the Ketcher id-shift guard on a molecule with a radical", () => {
+  function radicalOn(smiles: string, atom: number) {
+    const { document: plain, atomIds } = linearMolecule(smiles);
+    const document = normalizeCommittedDocument(applyChargeToolAtNativeAtom(plain, { kind: "radical-dot" },
+      { kind: "atom", objectId, atomId: atomIds[atom]!, distanceToPointer: 0 }));
+    expect(atomOf(document, atomIds[atom]!).markRadicals).toBe(1);
+    return { document, atomIds };
+  }
+
+  it("refuses a delete-and-re-add that keeps every count, element and the marked atom's neighbour elements", () => {
+    // C1-C2(radical)-C3-C4: C1 deleted, a new carbon drawn on C2. By index the ids now name
+    // C2, C3, C4 and the new carbon, so the radical's id names C3; only the bond graph shows it.
+    const { document, atomIds } = radicalOn("CCCC", 1);
+    const atoms = moleculeOf(document).atoms;
+    const [, c2, c3, c4] = atoms;
+    const v3000 = editorV3000([c2!, c3!, c4!, { element: "C", x: c2!.x, y: c2!.y + 30 }], [[1, 2], [2, 3], [1, 4]]);
+    const { selected, refusal } = editedKetcherSave(document, () => v3000);
+    expect(refusal).toBe(EDITOR_SAVE_MARK_SHIFT_REFUSAL);
+    expect(moleculeOf(selected).atoms.map(atom => atom.id)).toEqual(atomIds);
+    expect(atomOf(selected, atomIds[1]!).markRadicals).toBe(1);
+  });
+
+  it("commits an element change far from the radical, which stays on its atom", () => {
+    const { document, atomIds } = radicalOn("CCCCC", 0);
+    const { refusal, committed } = editedKetcherSave(document, molfile =>
+      molfile.replace(/^(M\s+V30\s+5\s+)C(\s)/m, "$1N$2"));
+    expect(refusal).toBeUndefined();
+    expect(moleculeOf(committed).atoms.map(atom => atom.element)).toEqual(["C", "C", "C", "C", "N"]);
+    expect(atomOf(committed, atomIds[0]!).markRadicals).toBe(1);
+    expect(marksOf(committed)[0]!.anchor).toMatchObject({ kind: "atom", atomId: atomIds[0] });
+  });
+
+  it("still refuses an element change on a direct neighbour of the radical's atom", () => {
+    const { document } = radicalOn("CCCCC", 0);
+    const { refusal } = editedKetcherSave(document, molfile => molfile.replace(/^(M\s+V30\s+2\s+)C(\s)/m, "$1N$2"));
+    expect(refusal).toBe(EDITOR_SAVE_MARK_SHIFT_REFUSAL);
+  });
+});
+
+describe("an unchanged charge under a mark always commits", () => {
+  it("N with an intrinsic -1 and a + mark (total 0) survives an unchanged save", () => {
+    const { document: plain, nitrogenId } = methylamine();
+    const molecule = moleculeOf(plain);
+    const atoms = molecule.atoms.map(atom => atom.id === nitrogenId ? { ...atom, formalCharge: -1 } : atom);
+    const intrinsic = normalizeCommittedDocument(applyPatch(plain, { op: "updateObject", objectId,
+      changes: {
+        atoms,
+        structure: nativeSingleBondGraphSmiles(atoms, molecule.bonds),
+        chemistry: nativeSingleBondGraphMetadata(atoms, molecule.bonds)
+      } }));
+    const charged = chargedByTool(intrinsic, nitrogenId, [1]);
+    expect(chargeState(charged, nitrogenId)).toEqual({ formalCharge: 0, markCharge: 1, marks: 1 });
+
+    const { v3000, refusal, committed } = editedKetcherSave(charged, molfile => molfile);
+    expect(nitrogenLine(v3000)).not.toContain("CHG=");
+    expect(refusal).toBeUndefined();
+    expect(chargeState(committed, nitrogenId)).toEqual({ formalCharge: 0, markCharge: 1, marks: 1 });
   });
 });

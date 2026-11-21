@@ -2,6 +2,7 @@
 // so an edit that adds, removes or rewires atoms could silently put a charge or radical mark on a
 // different atom. Such a save of a marked molecule is refused; same-count edits and unmarked
 // molecules commit as before.
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { applyPatch, type ChemDraftDocument, type MoleculeAtom, type MoleculeBond, type MoleculeObject } from "@chemdraft/chem-core";
 import { phase4Timestamp } from "@chemdraft/document-workflow-core";
@@ -151,6 +152,16 @@ describe("Ketcher Apply status", () => {
     const statuses: string[] = [];
     await applyKetcherSave({ saveObject: async () => saved }, () => true, (message) => statuses.push(message));
     expect(statuses).toEqual(["Applied Ketcher molecule edit"]);
+  });
+
+  it("MainWindow reports the edit applied only when its commit went through (a page-size question or a refusal keeps its own status)", () => {
+    const source = readFileSync(new URL("./MainWindow.tsx", import.meta.url), "utf8");
+    const start = source.indexOf("const handleApplyKetcherEdit = useCallback(");
+    expect(start).toBeGreaterThan(-1);
+    const body = source.slice(start, source.indexOf("}, [commitDocumentChangeWithPageFit]);", start));
+    expect(body).toMatch(/const committed = commitDocumentChangeWithPageFit\(applied\.document,/);
+    expect(body).toMatch(/if \(!committed\) return false;/);
+    expect(body.indexOf("if (!committed) return false;")).toBeLessThan(body.lastIndexOf("return true;"));
   });
 
   it("reports a failed save and returns its message", async () => {
