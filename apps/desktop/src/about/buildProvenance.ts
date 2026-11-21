@@ -1,6 +1,6 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { URL } from "node:url";
-import { SEE_LICENSE, noticeStatements, resolveHolders, type LibraryRef } from "./holders";
+import { SEE_LICENSE, noticeStatements, resolveHolders, resolvePlatforms, type LibraryRef } from "./holders";
 import type { AboutComponent, AboutProvenance } from "./provenanceTypes";
 
 const root = new URL("../../../../", import.meta.url);
@@ -282,6 +282,7 @@ export function buildAboutProvenance(): AboutProvenance & {
   }
   for (const component of components.values()) {
     component.holders = resolveHolders(noticeHolders.get(component.name) ?? [], libraryRefs.get(component.name) ?? []);
+    component.platforms = resolvePlatforms(libraryRefs.get(component.name) ?? []);
   }
   const licensePaths = new Set(["LICENSE", ...[...components.values()].flatMap(c => c.licenseText ? [c.licenseText] : [])]);
   const licenseTexts = Object.fromEntries([...licensePaths].map(path => [path, readAboutSource(path)]));

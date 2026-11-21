@@ -2,7 +2,8 @@ import { useEffect, useState, type ReactNode } from "react";
 import packageInfo from "../../package.json";
 import contributorData from "./contributors.json";
 import testerData from "./testers.json";
-import type { AboutContributor, AboutProvenance, AboutTesters } from "./provenanceTypes";
+import { componentsForPlatform } from "./aboutPlatforms";
+import type { AboutContributor, AboutPlatform, AboutProvenance, AboutTesters } from "./provenanceTypes";
 import "./about.css";
 
 declare const __ABOUT_PROVENANCE__: AboutProvenance;
@@ -20,16 +21,19 @@ interface AboutWindowProps {
   version: string;
   buildStamp: string;
   error?: string;
+  /** Whose components to list. Defaults to the running platform; tests pass each one. */
+  platform?: AboutPlatform;
   onReady?: () => void;
   onCopy: () => Promise<void>;
   onClose?: () => void;
 }
 
-export function AboutWindow({ version, buildStamp, error, onReady, onCopy, onClose }: AboutWindowProps) {
+export function AboutWindow({ version, buildStamp, error, platform, onReady, onCopy, onClose }: AboutWindowProps) {
   const [copyMessage, setCopyMessage] = useState("");
   const [copying, setCopying] = useState(false);
   const [license, setLicense] = useState<{ path: string; heading: string }>();
-  const { components, licenseTexts } = __ABOUT_PROVENANCE__;
+  const { licenseTexts } = __ABOUT_PROVENANCE__;
+  const components = componentsForPlatform(__ABOUT_PROVENANCE__.components, platform);
   useEffect(() => { onReady?.(); }, [onReady]);
 
   function showLicense(path: string, heading: string) {

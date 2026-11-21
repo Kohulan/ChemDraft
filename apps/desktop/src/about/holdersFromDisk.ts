@@ -78,3 +78,14 @@ export function installedHolders(kind: LibraryRef["kind"], name: string, version
     : cargoAuthors(readOptional(join(directory, "Cargo.toml")) ?? "");
   return metadata.length ? { holders: metadata, from: "package metadata", found: true } : { holders: [], from: "none", found: true };
 }
+
+/** The Cargo.toml of one exact locked crate, with no size cap (generated manifests such as windows-sys are large). */
+export function cargoCrateManifest(name: string, version: string): string | undefined {
+  const directory = cargoCrateDirectory(name, version);
+  if (!directory) return undefined;
+  try {
+    return readFileSync(join(directory, "Cargo.toml"), "utf8");
+  } catch {
+    return undefined;
+  }
+}

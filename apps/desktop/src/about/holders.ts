@@ -7,6 +7,7 @@
 // holdersFromDisk.ts) into the committed holderData.json. The build reads only that file, so every
 // platform shows the same holders whatever its install or cargo registry looks like.
 import holderData from "./holderData.json";
+import type { AboutPlatform, PlatformTag } from "./provenanceTypes";
 
 export const SEE_LICENSE = "see license";
 
@@ -118,7 +119,12 @@ export interface LibraryHolders {
   from: "license file" | "package metadata" | "none";
 }
 
-export type HolderTable = Readonly<Record<string, LibraryHolders>>;
+/** A committed entry also says which platforms ship the package. Absent means every platform. */
+export interface HolderEntry extends LibraryHolders {
+  platforms?: PlatformTag;
+}
+
+export type HolderTable = Readonly<Record<string, HolderEntry>>;
 
 /** The committed table holds one entry per exact package version: "npm:react@19.2.0". */
 export function holderKey(kind: LibraryRef["kind"], name: string, version: string): string {
@@ -134,4 +140,24 @@ export function resolveHolders(noticeHolders: string[], libraries: LibraryRef[],
     table[holderKey(library.kind, library.name, version)]?.holders ?? [])));
   const named = fromLibraries.filter(holder => holder !== SEE_LICENSE);
   return named.length ? named : [SEE_LICENSE];
+}
+
+/**
+ * The platforms whose build ships a component made of these packages: every platform when any one
+ * of its packages ships on all of them, else the union. A component with no resolvable package
+ * (a vendored binary, a font) ships everywhere.
+ */
+export function resolvePlatforms(libraries: LibraryRef[], table: HolderTable = committedHolders): PlatformTag {
+  const found = new Set<AboutPlatform>();
+  let any = false;
+  for (const library of libraries) {
+    for (const version of library.versions) {
+      any = true;
+      const tag = table[holderKey(library.kind, library.name, version)]?.platforms ?? "all";
+      if (tag === "all") return "all";
+      for (const platform of tag) found.add(platform);
+    }
+  }
+  if (!any) return "all";
+  return ["macos", "windows", "linux"].filter((platform): platform is AboutPlatform => found.has(platform as AboutPlatform));
 }
