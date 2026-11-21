@@ -3,7 +3,7 @@ import { applyPatch, applyPatches, nativeDrawingStyleFromObjectStyle,
 import { atomDisplayLabel, transformPointForObject } from "@chemdraft/layout-engine";
 import { documentDrawingDefaults, nativeAtomChargeSupportsValence, nativeAtomExternalValence, nativeChargeAssociationRadiusPx,
   nativeElectronMarkAssignments, nativeElectronMarkAtomKey, nativeElementFromAtomLabel, phase4Timestamp, type PagePoint } from "@chemdraft/document-workflow-core";
-import { committedElectronMarkAssignments, electronMarkAtomContribution, electronMarkChemistryChanges, findDocumentObject,
+import { committedElectronMarkAssignments, committedElectronMarkAtoms, electronMarkAtomContribution, electronMarkChemistryChanges, findDocumentObject,
   followElectronMarksWithMovedAtoms, isEditableNativeMoleculeGraph, type ElectronMarkFollowOptions, moveDocumentObject, moveDocumentObjects, nativeChargeMarkCenter,
   nativeChargePlacementPointForAtom, normalizeCommittedDocument, resolveGroupedDocumentObjectIds, type NativeMoleculeDeleteTarget } from "./documentWorkflow";
 
@@ -114,6 +114,57 @@ export interface ElectronMarkDropResult {
   status: string;
   undoLabel: string;
   refused?: boolean;
+  /** The mark this drop moved by itself, for the commit (`IndependentMarkMoves`). */
+  independentlyMovedMarkIds: ReadonlySet<string>;
+}
+
+const NO_MARKS: ReadonlySet<string> = new Set();
+
+/**
+ * The electron marks among `objectIds` (selected groups' members included) on `page` that the
+ * operation transforms as objects of their own: marks whose molecule is not among them. Its owner is
+ * the molecule its anchor names, or for a loose mark the one commit normalization gives it. A mark
+ * selected with its molecule is moved, if at all, by the charge-follows rule with its atom.
+ */
+function marksSelectedWithoutTheirMolecule(page: DocumentPage | undefined, objectIds: readonly string[]): Set<string> {
+  const marks = new Set<string>();
+  if (!page || !objectIds.length) return marks;
+  const selected = new Set(resolveGroupedDocumentObjectIds(page.objects, objectIds));
+  for (const mark of page.objects) {
+    if (mark.type !== "electron-mark" || !selected.has(mark.id)) continue;
+    const owners = mark.anchor.kind !== "point" && mark.anchor.objectId !== undefined ? [mark.anchor.objectId]
+      : committedElectronMarkAtoms(page, mark).map(owner => owner.objectId);
+    if (!owners.some(owner => selected.has(owner))) marks.add(mark.id);
+  }
+  return marks;
+}
+
+/**
+ * Of `candidates`, the marks the operation did move or re-anchor (`before` against `after`) and
+ * the charge-follows rule did not carry with a moved atom: the commit's `IndependentMarkMoves`.
+ */
+function independentMarkMoves(
+  before: ChemDraftDocument, after: ChemDraftDocument, candidates: ReadonlySet<string>, followed: ReadonlySet<string>
+): ReadonlySet<string> {
+  if (!candidates.size || before === after) return NO_MARKS;
+  const moved = new Set<string>();
+  for (const page of before.pages) {
+    const nextPage = after.pages.find(candidate => candidate.id === page.id);
+    if (!nextPage || nextPage.objects === page.objects) continue;
+    const nextObjects = new Map(nextPage.objects.map(object => [object.id, object]));
+    for (const mark of page.objects) {
+      if (mark.type !== "electron-mark" || !candidates.has(mark.id) || followed.has(mark.id)) continue;
+      const next = nextObjects.get(mark.id);
+      if (next && next !== mark) moved.add(mark.id);
+    }
+  }
+  return moved;
+}
+
+/** The page of the document's selection (its `pageId`, else the first page). */
+function selectionPage(document: ChemDraftDocument): DocumentPage | undefined {
+  const pageId = document.selection.pageId ?? document.pages[0]?.id;
+  return document.pages.find(page => page.id === pageId);
 }
 
 interface ElectronMarkDrop {
@@ -171,28 +222,35 @@ export function dropElectronMark(
   document: ChemDraftDocument, markId: string, position: PagePoint, dropPoint: PagePoint
 ): ElectronMarkDropResult {
   const mark = findDocumentObject(document, markId);
-  if (mark?.type !== "electron-mark") return { document, status: "Electron mark no longer exists", undoLabel: "Move electron mark" };
+  if (mark?.type !== "electron-mark") {
+    return { document, status: "Electron mark no longer exists", undoLabel: "Move electron mark", independentlyMovedMarkIds: NO_MARKS };
+  }
   const center = { x: position.x + mark.width / 2, y: position.y + mark.height / 2 };
   const drop = planElectronMarkDrop(document, document, mark, center, dropPoint);
   const moved = moveDocumentObject(document, markId, position);
   const result = applyElectronMarkDrops(document, moved, [drop]);
-  return { ...result, undoLabel: drop.source || drop.destination ? `Move ${electronMarkName(mark)}` : "Move electron mark" };
+  return { ...result, undoLabel: drop.source || drop.destination ? `Move ${electronMarkName(mark)}` : "Move electron mark",
+    independentlyMovedMarkIds: result.document === document ? NO_MARKS : new Set([markId]) };
 }
 
 /**
  * Validate independent marks against the selection's final geometry and commit the move as a unit.
  * Marks associated with a moved atom follow it (`followElectronMarksWithMovedAtoms`, owner ruling
- * 2026-11-21); only selected marks moved without their atom are drops under the mark-move policy.
+ * 2026-11-21); only selected marks moved without their molecule are drops under the mark-move
+ * policy. The result names them (`independentlyMovedMarkIds`) for the commit: they are the only
+ * marks whose atoms' chemistry the move may change.
  */
 export function dropElectronMarksInSelection(
   document: ChemDraftDocument, objectIds: readonly string[], delta: PagePoint,
   release: { grabbedObjectId: string; point: PagePoint }
-): { document: ChemDraftDocument; status?: string } {
+): { document: ChemDraftDocument; status?: string; independentlyMovedMarkIds: ReadonlySet<string> } {
   const translated = moveDocumentObjects(document, objectIds, delta.x, delta.y, { preserveCarriedMarkAnchors: true });
-  if (translated === document) return { document };
-  const { document: moved, followedMarkIds } = followElectronMarksWithMovedAtoms(document, translated);
-
+  if (translated === document) return { document, independentlyMovedMarkIds: NO_MARKS };
   const page = document.pages.find(page => page.objects.some(object => object.id === release.grabbedObjectId));
+  const candidates = marksSelectedWithoutTheirMolecule(page, objectIds);
+  const { document: moved, followedMarkIds } = followElectronMarksWithMovedAtoms(document, translated,
+    { independentlyMovedMarkIds: candidates });
+
   const selectedIds = new Set(resolveGroupedDocumentObjectIds(page?.objects ?? [], objectIds));
   const drops = (page?.objects ?? []).flatMap((mark) => {
     if (mark.type !== "electron-mark" || !selectedIds.has(mark.id) || followedMarkIds.has(mark.id)) return [];
@@ -209,7 +267,8 @@ export function dropElectronMarksInSelection(
     drops.push(...legacyAnchorAssociationChanges(document, page, nextPage)
       .filter(drop => !directMarkIds.has(drop.mark.id) && !followedMarkIds.has(drop.mark.id)));
   }
-  return drops.length ? applyElectronMarkDrops(document, moved, drops) : { document: moved };
+  const result = drops.length ? applyElectronMarkDrops(document, moved, drops) : { document: moved };
+  return { ...result, independentlyMovedMarkIds: independentMarkMoves(document, result.document, candidates, followedMarkIds) };
 }
 
 /**
@@ -225,16 +284,20 @@ export function resolveElectronMarksAfterMoleculePartMove(
 }
 
 /**
- * Marks associated with an atom the transform moved follow it (owner ruling 2026-11-21). A mark
- * the transform moved without its atom (selected without its molecule) keeps the mark-move policy:
- * it detaches when it leaves its atom's association radius, and a free mark stays free. `follow`
- * names the transform where the caller knows it (a turn, a flip): see `ElectronMarkFollowOptions`.
+ * Marks associated with an atom the transform moved follow it (owner ruling 2026-11-21), and a mark
+ * of an atom it left in place stays exactly where it was. A mark the transform moved as an object of
+ * its own (selected in `document`'s selection without its molecule) keeps the mark-move policy: it
+ * detaches when it leaves its atom's association radius, and a free mark stays free. The result
+ * names those marks (`independentlyMovedMarkIds`) for the commit's policy. `follow` names the
+ * transform where the caller knows it (a turn, a flip): see `ElectronMarkFollowOptions`.
  */
 export function resolveElectronMarksInSelectionTransform(
-  document: ChemDraftDocument, transformed: ChemDraftDocument, follow: ElectronMarkFollowOptions = {}
-): { document: ChemDraftDocument; status?: string; refused?: boolean } {
-  if (transformed === document) return { document };
-  const { document: followed, followedMarkIds } = followElectronMarksWithMovedAtoms(document, transformed, follow);
+  document: ChemDraftDocument, transformed: ChemDraftDocument, follow: Omit<ElectronMarkFollowOptions, "independentlyMovedMarkIds"> = {}
+): { document: ChemDraftDocument; status?: string; refused?: boolean; independentlyMovedMarkIds: ReadonlySet<string> } {
+  if (transformed === document) return { document, independentlyMovedMarkIds: NO_MARKS };
+  const candidates = marksSelectedWithoutTheirMolecule(selectionPage(document), document.selection.objectIds);
+  const { document: followed, followedMarkIds } = followElectronMarksWithMovedAtoms(document, transformed,
+    { ...follow, independentlyMovedMarkIds: candidates });
   const drops: ElectronMarkDrop[] = [];
   const preserve: DocumentPatch[] = [];
   for (const page of document.pages) {
@@ -279,7 +342,8 @@ export function resolveElectronMarksInSelectionTransform(
     }
   }
   const prepared = preserve.length ? applyPatches(followed, preserve, { now: phase4Timestamp }) : followed;
-  return drops.length ? applyElectronMarkDrops(document, prepared, drops) : { document: prepared };
+  const result = drops.length ? applyElectronMarkDrops(document, prepared, drops) : { document: prepared };
+  return { ...result, independentlyMovedMarkIds: independentMarkMoves(document, result.document, candidates, followedMarkIds) };
 }
 
 function applyElectronMarkDrops(

@@ -55,13 +55,12 @@ describe("selection transform admission", () => {
     }
   });
 
-  it.each(["single", "group"])("carries an attached ammonium charge outside the old radius during %s resize", mode => {
+  it("carries an attached ammonium charge outside the old radius during single resize", () => {
     const { document } = ammoniumElectronMarkDropFixture();
     const molecule = dropMolecule(document), mark = dropMark(document);
     const center = workflow.nativeChargeMarkCenter(mark);
     const pivot = molecule.atoms[0];
-    const scaled = mode === "single" ? workflow.resizeNativeMoleculeObject(document, molecule.id, { x: 3, y: 3 })
-      : workflow.scaleDocumentObjectsAroundPoint(document, [molecule.id, mark.id], pivot, 3, 3);
+    const scaled = workflow.resizeNativeMoleculeObject(document, molecule.id, { x: 3, y: 3 });
     const result = resolveElectronMarksInSelectionTransform(document, scaled);
     const committed = workflow.normalizeCommittedDocument(result.document);
     const newMark = dropMark(committed);
@@ -71,6 +70,23 @@ describe("selection transform admission", () => {
     const nextAtom = dropMolecule(committed).atoms[0], nextCenter = workflow.nativeChargeMarkCenter(newMark);
     expect(nextCenter.x - nextAtom.x).toBeCloseTo(3 * (center.x - pivot.x));
     expect(nextCenter.y - nextAtom.y).toBeCloseTo(3 * (center.y - pivot.y));
+    expect(atomDropState(committed, pivot.id)).toMatchObject({ charge: 1, hydrogens: 4 });
+  });
+
+  it("keeps an ammonium charge exactly where it was when a group resize is pivoted on N", () => {
+    // Owner ruling 2026-11-21: a mark whose atom did not move does not move. The selected N and its
+    // + are scaled about N itself, so N stays put and the + keeps its place, size and atom.
+    const fixture = ammoniumElectronMarkDropFixture();
+    const molecule = dropMolecule(fixture.document), mark = dropMark(fixture.document);
+    const document = workflow.selectDocumentObjects(fixture.document, fixture.document.pages[0].id, [molecule.id, mark.id]);
+    const pivot = molecule.atoms[0];
+    const scaled = workflow.scaleDocumentObjectsAroundPoint(document, [molecule.id, mark.id], pivot, 3, 3);
+    const result = resolveElectronMarksInSelectionTransform(document, scaled);
+    expect(result.independentlyMovedMarkIds.size).toBe(0);
+    const committed = workflow.normalizeCommittedDocument(result.document);
+    const newMark = dropMark(committed);
+    expect(result.status).toBeUndefined();
+    expect(newMark).toMatchObject({ anchor: mark.anchor, x: mark.x, y: mark.y, width: mark.width, height: mark.height, rotation: mark.rotation });
     expect(atomDropState(committed, pivot.id)).toMatchObject({ charge: 1, hydrogens: 4 });
   });
 });

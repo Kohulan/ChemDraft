@@ -7,7 +7,7 @@ import { applyPatch, applyPatches, type ChemDraftDocument, type ElectronMarkObje
 import { transformPointForObject } from "@chemdraft/layout-engine";
 import { nativeSingleBondGraphMetadata, nativeSingleBondGraphSmiles, phase4Timestamp } from "@chemdraft/document-workflow-core";
 import { testMoleculeFromSmiles } from "@chemdraft/layout-engine/testing";
-import { ensureOclResources, relayoutMolfile2D } from "@chemdraft/ocl-adapter";
+import { depictSmiles2D, ensureOclResources, perceiveDoubleBondStereoFromMolfile, relayoutMolfile2D } from "@chemdraft/ocl-adapter";
 import * as workflow from "./documentWorkflow";
 import { commitChemistryRefusals, marksFollowAtoms, structureEditorChemistry } from "./commitChemistryGuard";
 import { dropMark, dropMolecule, electronMarkDropFixture } from "./testSupport/electronMarkDropFixture";
@@ -357,5 +357,54 @@ describe("charge always follows: a structure-editor (Ketcher) save", () => {
     expect(ownerAtom).toMatchObject({ formalCharge: 1, markCharge: 1 });
     expect(dropMolecule(committed).atoms.find(atom => atom.id === nitrogenId)).toMatchObject({ element: "C", formalCharge: 0 });
     expect(dropMark(committed).anchor).not.toMatchObject({ kind: "atom", atomId: nitrogenId });
+  });
+});
+
+describe("charge always follows: a partial double-bond reflection (round 4)", () => {
+  beforeAll(async () => { await ensureOclResources(); });
+
+  it("c: partial double-bond reflection leaves the mark of an atom on the mirror line unchanged", () => {
+    // Flipping E/Z mirrors one end of C=C about the double bond's own line. That end's double-bond
+    // carbon lies ON the line, so it does not move: its + must neither move nor turn (the reflection
+    // patched every mark of the end, and the charge-follows rule accepted the patch).
+    const drawn = workflow.insertNativeMolfileMolecule(workflow.createPhase4Document(), { x: 220, y: 220 },
+      depictSmiles2D("C/C=C/C").molfile, "molfile-v2000");
+    const molecule = workflow.getSelectedMolecule(drawn)!;
+    const bond = molecule.bonds.find(candidate => candidate.order === "double")!;
+    const from = molecule.atoms.find(atom => atom.id === bond.fromAtomId)!;
+    const to = molecule.atoms.find(atom => atom.id === bond.toAtomId)!;
+    // The reflected end is the smaller side; for 2-butene the two are equal and the `to` side is mirrored.
+    const onLine = to;
+    const length = Math.hypot(to.x - from.x, to.y - from.y);
+    const normal = { x: -(to.y - from.y) / length, y: (to.x - from.x) / length };
+    const markCenter0 = { x: onLine.x + 6 * normal.x, y: onLine.y + 6 * normal.y };
+    const mark: ElectronMarkObject = {
+      id: "on-line-plus", type: "electron-mark", markKind: "charge", charge: 1,
+      x: markCenter0.x - 5, y: markCenter0.y - 5, width: 10, height: 10, rotation: 17, style: {},
+      anchor: { kind: "atom", objectId: molecule.id, atomId: onLine.id }, atomAssociation: "explicit"
+    };
+    const document = workflow.normalizeCommittedDocument(applyPatch(drawn, { op: "addObject", pageId: drawn.pages[0].id, object: mark },
+      { now: phase4Timestamp }));
+    expect(owner(document, mark.id)).toEqual({ objectId: molecule.id, atomId: onLine.id });
+    const target = { objectId: molecule.id, bondId: bond.id };
+    const flipped = workflow.applyMoleculeBondStereo(document, [target], "flipped", perceiveDoubleBondStereoFromMolfile);
+    expect(flipped, "the flip is enabled").not.toBe(document);
+    const atom = (drawing: ChemDraftDocument, id: string) => dropMolecule(drawing).atoms.find(candidate => candidate.id === id)!;
+    expect(atom(flipped, onLine.id), "the carbon on the mirror line stays put").toMatchObject({ x: onLine.x, y: onLine.y });
+    const methyl = dropMolecule(document).bonds.flatMap(edge => edge.id === bond.id ? []
+      : edge.fromAtomId === onLine.id ? [edge.toAtomId] : edge.toAtomId === onLine.id ? [edge.fromAtomId] : [])[0];
+    expect(Math.hypot(atom(flipped, methyl).x - atom(document, methyl).x, atom(flipped, methyl).y - atom(document, methyl).y),
+      "the end's methyl is mirrored").toBeGreaterThan(1);
+    const original = dropMark(document);
+    // The reflection itself no longer carries it.
+    expect(dropMark(flipped)).toEqual(original);
+    // As the commit funnel runs it: the flip, then the charge-follows rule.
+    const followed = workflow.followElectronMarksWithMovedAtoms(document, flipped, { motion: "mirror" });
+    expect(followed.followedMarkIds.has(mark.id)).toBe(false);
+    expect(dropMark(followed.document)).toMatchObject({ x: original.x, y: original.y, width: original.width,
+      height: original.height, rotation: original.rotation, anchor: original.anchor });
+    const committed = workflow.normalizeCommittedDocument(followed.document);
+    expect(owner(committed, mark.id)).toEqual({ objectId: molecule.id, atomId: onLine.id });
+    expect(dropMolecule(committed).atoms.map(chemistry)).toEqual(dropMolecule(document).atoms.map(chemistry));
   });
 });

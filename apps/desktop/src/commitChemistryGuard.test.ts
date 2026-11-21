@@ -147,9 +147,11 @@ describe("the commit check against commit normalization", () => {
     return { document, mark: dropMark(document), a: dropMolecule(document), hydroxylOxygen: fixture.hydroxylOxygen };
   }
 
-  function check(before: ChemDraftDocument, next: ChemDraftDocument, operation?: string): string[] {
+  /** `independentlyMovedMarkIds`: the marks the operation declares it moved by itself (none when absent). */
+  function check(before: ChemDraftDocument, next: ChemDraftDocument, operation?: string,
+    independentlyMovedMarkIds?: ReadonlySet<string>): string[] {
     return commitChemistryRefusals({ before, next, after: workflow.normalizeCommittedDocument(next),
-      normalize: workflow.normalizeCommittedDocument, markAtoms, operation });
+      normalize: workflow.normalizeCommittedDocument, markAtoms, operation, independentlyMovedMarkIds });
   }
 
   it("refuses a copy placed where normalization hands B's loose + to it, naming B", () => {
@@ -179,7 +181,7 @@ describe("the commit check against commit normalization", () => {
     expect(check(document, withText)).toEqual([]);
   });
 
-  it("lets a selected mark the operation moved change its own atoms, but not an unselected one", () => {
+  it("lets a mark the operation declares it moved by itself change its own atoms, and nothing else", () => {
     const { document, nitrogen } = electronMarkDropFixture();
     const mark = dropMark(document);
     const pageId = document.pages[0].id;
@@ -190,12 +192,14 @@ describe("the commit check against commit normalization", () => {
     const unselected = workflow.selectDocumentObjects(document, pageId, []);
     expect(moleculeById(workflow.normalizeCommittedDocument(moved(selected)), dropMolecule(document).id)
       .atoms.find(atom => atom.id === nitrogen.id)).toMatchObject({ formalCharge: 0 });
-    expect(check(selected, moved(selected), "align")).toEqual([]);
+    // The exemption comes only from the operation's own declaration, never from the selection.
+    expect(check(selected, moved(selected), "align", new Set([mark.id]))).toEqual([]);
+    expect(check(selected, moved(selected), "align")).toHaveLength(1);
     expect(check(unselected, moved(unselected), "align")).toHaveLength(1);
-    // A selected mark the operation left where it was explains nothing: N's own charge changing is refused.
+    // A declared mark the operation left where it was explains nothing: N's own charge changing is refused.
     const recharged = withAtomChanges(selected, dropMolecule(document).id, atoms => atoms.map(atom =>
       atom.id === nitrogen.id ? { ...atom, formalCharge: atom.formalCharge + 1 } : atom));
-    expect(check(selected, recharged, "align")).toEqual([expect.stringMatching(new RegExp(
+    expect(check(selected, recharged, "align", new Set([mark.id]))).toEqual([expect.stringMatching(new RegExp(
       `^Cannot align without changing the chemistry of molecule "${dropMolecule(document).id}": its atom "${nitrogen.id}" would have charge 2 `))]);
   });
 
@@ -226,18 +230,23 @@ describe("the commit check against commit normalization", () => {
       workflow.rotateDocumentObject(document, moleculeId, 90) },
     { name: "scale", transform: (document: ChemDraftDocument, moleculeId: string, center: { x: number; y: number }) =>
       workflow.scaleDocumentObjectsAroundPoint(document, [moleculeId], center, 2, 2) }
-  ])("exempts nothing when a lone marked atom is turned or scaled about itself ($name): the mark moved with its atom", ({ transform }) => {
-    // Review 2 P2b(i): turning or scaling a one-atom molecule about its atom leaves the atom's
-    // coordinates and frame as they were but carries its mark (the molecule's transform changed).
-    // The mark followed its atom, so it explains no change: N's chemistry must stay as it was.
+  ])("exempts nothing when a lone marked atom is turned or scaled about itself ($name): the mark stays with its unmoved atom", ({ transform }) => {
+    // Review 2 P2b(i): turning or scaling a one-atom molecule about its atom leaves the atom where
+    // it was. Owner ruling 2026-11-21: a mark whose atom did not move does not move, so the
+    // charge-follows rule puts back the mark the transform carried (round 4). Nothing was moved by
+    // itself, so nothing is exempt: N's chemistry must stay as it was.
     const { document, nitrogen } = ammoniumElectronMarkDropFixture();
     const molecule = dropMolecule(document), mark = dropMark(document);
     const selected = workflow.selectDocumentObjects(document, document.pages[0].id, [molecule.id, mark.id]);
     // As the commit funnel runs it: the transform, then the charge-follows rule.
     const turned = workflow.followElectronMarksWithMovedAtoms(selected,
       transform(selected, molecule.id, { x: nitrogen.x, y: nitrogen.y })).document;
-    const center = workflow.nativeChargeMarkCenter(mark), nextCenter = workflow.nativeChargeMarkCenter(dropMark(turned));
-    expect(Math.hypot(nextCenter.x - center.x, nextCenter.y - center.y), "the transform carries the mark").toBeGreaterThan(1);
+    const transformed = transform(selected, molecule.id, { x: nitrogen.x, y: nitrogen.y });
+    const center = workflow.nativeChargeMarkCenter(mark);
+    const carried = workflow.nativeChargeMarkCenter(dropMark(transformed)), nextCenter = workflow.nativeChargeMarkCenter(dropMark(turned));
+    expect(Math.hypot(carried.x - center.x, carried.y - center.y), "the transform itself carries the mark").toBeGreaterThan(1);
+    expect(nextCenter, "the charge-follows rule puts it back").toEqual(center);
+    expect(dropMark(turned)).toMatchObject({ width: mark.width, height: mark.height, rotation: mark.rotation });
     expect(dropMolecule(turned).atoms[0]).toMatchObject({ x: nitrogen.x, y: nitrogen.y });
     // Done right, the chemistry is unchanged and the move passes.
     expect(check(selected, turned, "rotate")).toEqual([]);
@@ -265,7 +274,77 @@ describe("the commit check against commit normalization", () => {
     expect(dropMolecule(dropped).atoms.find(atom => atom.id === nitrogen.id)).toMatchObject({ x: nitrogen.x, y: nitrogen.y });
     expect(moleculeById(workflow.normalizeCommittedDocument(dropped), molecule.id)
       .atoms.find(atom => atom.id === nitrogen.id)).toMatchObject({ formalCharge: 0 });
-    expect(check(selected, dropped, "move")).toEqual([]);
+    // The drop declares the mark it moved by itself; without that declaration nothing is inferred.
+    expect(check(selected, dropped, "move", new Set([mark.id]))).toEqual([]);
+    expect(check(selected, dropped, "move")).toHaveLength(1);
+  });
+
+  // Round 4: the guard infers nothing from how atoms moved. Only the marks the operation declares it
+  // moved by itself (`independentlyMovedMarkIds`) are exempt, so both of these were wrong on 1.2.3's
+  // "every other atom moved" clause.
+  const turnAbout = (pivot: { x: number; y: number }, radians: number) => (point: { x: number; y: number }) => ({
+    x: pivot.x + (point.x - pivot.x) * Math.cos(radians) - (point.y - pivot.y) * Math.sin(radians),
+    y: pivot.y + (point.x - pivot.x) * Math.sin(radians) + (point.y - pivot.y) * Math.cos(radians)
+  });
+
+  it("a: dragging a mark off a stationary N during a partial turn keeps the mark-drop exemption", () => {
+    // Every atom but N turns a quarter about N (a partial turn of the rest of the molecule), while
+    // the selected + is dragged well off N. N did not move; the + moved by itself, and the operation
+    // says so. N losing its charge is the drop's own business, so the commit goes through.
+    const { document, nitrogen } = electronMarkDropFixture();
+    const molecule = dropMolecule(document), mark = dropMark(document);
+    const selected = workflow.selectDocumentObjects(document, document.pages[0].id, [mark.id]);
+    const turn = turnAbout({ x: nitrogen.x, y: nitrogen.y }, Math.PI / 2);
+    const dragged = applyPatches(selected, [
+      { op: "updateObject", objectId: molecule.id, changes: {
+        atoms: molecule.atoms.map(atom => atom.id === nitrogen.id ? atom : { ...atom, ...turn(atom) }) } },
+      { op: "updateObject", objectId: mark.id, changes: {
+        x: mark.x + 200, y: mark.y + 200, anchor: { kind: "point", point: { x: mark.x + 200, y: mark.y + 200 } }, atomAssociation: "explicit" } }
+    ], { now: phase4Timestamp });
+    expect(dropMolecule(dragged).atoms.find(atom => atom.id === nitrogen.id)).toMatchObject({ x: nitrogen.x, y: nitrogen.y });
+    expect(dropMolecule(dragged).atoms.filter(atom => atom.id !== nitrogen.id)
+      .every(atom => { const before = molecule.atoms.find(old => old.id === atom.id)!; return Math.hypot(atom.x - before.x, atom.y - before.y) > 1; }),
+    "every other atom moved").toBe(true);
+    expect(moleculeById(workflow.normalizeCommittedDocument(dragged), molecule.id)
+      .atoms.find(atom => atom.id === nitrogen.id)).toMatchObject({ formalCharge: 0 });
+    expect(check(selected, dragged, "rotate", new Set([mark.id]))).toEqual([]);
+  });
+
+  it("b: a reflection whose axis contains the marked N and another atom does not exempt a charge change on N", () => {
+    // The whole molecule, with its + selected, is mirrored about the line through N and one of its
+    // neighbours: both stay put, every other atom moves, and the transform carries N's + across the
+    // line. Nothing moved by itself, so nothing is exempt: a charge change on N riding along is refused.
+    const { document, nitrogen } = electronMarkDropFixture();
+    const molecule = dropMolecule(document), mark = dropMark(document);
+    const center = workflow.nativeChargeMarkCenter(mark);
+    const neighbours = molecule.bonds.flatMap(bond => bond.fromAtomId === nitrogen.id ? [bond.toAtomId]
+      : bond.toAtomId === nitrogen.id ? [bond.fromAtomId] : []).map(id => molecule.atoms.find(atom => atom.id === id)!);
+    const mirrorAbout = (on: { x: number; y: number }) => {
+      const dx = on.x - nitrogen.x, dy = on.y - nitrogen.y, squared = dx * dx + dy * dy;
+      return (point: { x: number; y: number }) => {
+        const t = ((point.x - nitrogen.x) * dx + (point.y - nitrogen.y) * dy) / squared;
+        return { x: 2 * (nitrogen.x + t * dx) - point.x, y: 2 * (nitrogen.y + t * dy) - point.y };
+      };
+    };
+    // The neighbour whose line through N leaves the + farthest off it, so the mirror carries the + visibly.
+    const axisAtom = neighbours.reduce((best, atom) => {
+      const away = (on: typeof atom) => { const m = mirrorAbout(on)(center); return Math.hypot(m.x - center.x, m.y - center.y); };
+      return away(atom) > away(best) ? atom : best;
+    });
+    const mirror = mirrorAbout(axisAtom);
+    const carried = mirror(center);
+    expect(Math.hypot(carried.x - center.x, carried.y - center.y), "the mirror carries the +").toBeGreaterThan(1);
+    const selected = workflow.selectDocumentObjects(document, document.pages[0].id, [molecule.id, mark.id]);
+    const reflected = applyPatches(selected, [
+      { op: "updateObject", objectId: molecule.id, changes: { atoms: molecule.atoms.map(atom => ({ ...atom, ...mirror(atom),
+        ...(atom.id === nitrogen.id ? { formalCharge: atom.formalCharge + 1 } : {}) })) } },
+      { op: "updateObject", objectId: mark.id, changes: { x: carried.x - mark.width / 2, y: carried.y - mark.height / 2 } }
+    ], { now: phase4Timestamp });
+    const stays = (id: string) => dropMolecule(reflected).atoms.find(atom => atom.id === id)!;
+    expect(stays(nitrogen.id).x).toBeCloseTo(nitrogen.x, 9);
+    expect(stays(axisAtom.id).x).toBeCloseTo(axisAtom.x, 9);
+    expect(check(selected, reflected, "flip")).toEqual([expect.stringMatching(new RegExp(
+      `^Cannot flip without changing the chemistry of molecule "${molecule.id}": its atom "${nitrogen.id}" would have charge 2 `))]);
   });
 
   it("refuses a move that changes any molecule's chemistry, moved or not", () => {

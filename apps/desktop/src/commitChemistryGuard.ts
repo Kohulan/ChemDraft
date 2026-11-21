@@ -1,6 +1,5 @@
 import type { ChemDraftDocument, DocumentPage, ElectronMarkObject, MoleculeAtom, MoleculeObject } from "@chemdraft/chem-core";
 import { electronMarkAtomContribution } from "@chemdraft/document-workflow-core";
-import { transformPointForObject } from "@chemdraft/layout-engine";
 
 /**
  * The commit-time chemistry guard (AGENTS.md section 7: an operation that is not a chemistry edit
@@ -70,8 +69,27 @@ export type CommitChemistryPolicy =
      * whichever atom inherited its atom's id.
      */
     readonly rebuiltMoleculeIds?: readonly string[];
+    /** See `IndependentMarkMoves`. */
+    readonly independentlyMovedMarkIds?: ReadonlySet<string>;
   }
-  | { readonly kind: "exempt"; readonly reason: "chemistry edit" | "text edit" | "plugin write" };
+  | {
+    readonly kind: "exempt";
+    readonly reason: "chemistry edit" | "text edit" | "plugin write";
+    /** See `IndependentMarkMoves`: an exempt commit is not checked, but the charge-follows rule still reads it. */
+    readonly independentlyMovedMarkIds?: ReadonlySet<string>;
+  };
+
+/**
+ * `independentlyMovedMarkIds`: the electron marks the operation moved BY ITSELF, as the operation
+ * that moved them declares them (a mark dragged or dropped, a mark transformed in a selection
+ * without its molecule: `electronMarkDrop.ts`). It is the only source of a mark-move exemption:
+ * nothing infers from atom motion that a mark moved by itself. The commit guard exempts the old and
+ * new atoms of these marks (a mark drop under the mark-move policy) and nothing else; a mark the
+ * charge-follows rule carried with its atom is never exempt. The charge-follows rule leaves these
+ * marks where the operation put them when their atom stayed put, and puts every other mark of an
+ * unmoved atom back exactly as it was. Every other move path passes none.
+ */
+export type IndependentMarkMoves = ReadonlySet<string>;
 
 export const PRESERVE_CHEMISTRY: CommitChemistryPolicy = { kind: "preserve" };
 /**
@@ -125,11 +143,17 @@ export function marksFollowAtoms(policy: CommitChemistryPolicy | undefined): boo
 /**
  * A move or selection transform (align, rotate, nudge, a drag…). Owner ruling 2026-11-21 (charge
  * always follows): marks move with their atoms, so a move preserves every molecule's chemistry,
- * moved or not, with no exempt atom. Only a selected mark the transform moved without its atom (a
- * mark drop) may change chemistry, under the mark-move policy (`movedSelectedMarkAtomKeys`).
+ * moved or not, with no exempt atom. Only the marks the transform itself reports it moved without
+ * their atom (`independentlyMovedMarkIds`, a mark drop) may change chemistry, under the mark-move
+ * policy; a transform that moved none passes none.
  */
-export function selectionTransformChemistry(operation?: string): CommitChemistryPolicy {
-  return preserveChemistry(operation);
+export function selectionTransformChemistry(operation?: string, independentlyMovedMarkIds?: IndependentMarkMoves): CommitChemistryPolicy {
+  return withIndependentlyMovedMarks(preserveChemistry(operation), independentlyMovedMarkIds);
+}
+
+/** `policy` with the marks the operation moved by itself (`IndependentMarkMoves`); unchanged for none. */
+export function withIndependentlyMovedMarks(policy: CommitChemistryPolicy, markIds?: IndependentMarkMoves): CommitChemistryPolicy {
+  return markIds === undefined ? policy : { ...policy, independentlyMovedMarkIds: markIds };
 }
 
 /** Object ids are unique only within a page, so an atom is keyed by its page as well. */
@@ -264,9 +288,11 @@ export interface CommitChemistryCheck {
    * change the operation causes is caught even where the stored value happened to match it.
    */
   normalize: (document: ChemDraftDocument) => ChemDraftDocument;
-  /** Resolves which atoms a mark's chemistry goes to; see `movedSelectedMarkAtomKeys`. */
+  /** Resolves which atoms a mark's chemistry goes to; see `independentlyMovedMarkAtomKeys`. */
   markAtoms: MarkAtomResolver;
   operation?: string;
+  /** The marks the operation moved by itself (`IndependentMarkMoves`); none when absent. */
+  independentlyMovedMarkIds?: IndependentMarkMoves;
   /** A scoped structure edit: the molecules it structurally edited may change (`structurallyEditedMoleculeKeys`). */
   structureEdit?: boolean;
   /** Molecules (by id, on any page) the operation is meant to change. */
@@ -279,9 +305,10 @@ export interface CommitChemistryCheck {
  *
  * Some changes are the operation's own, and only charge or radical changes on atoms that remain
  * (a removed atom or molecule is never exempt):
- * - a charge or radical mark the user selected and the operation moved or explicitly re-anchored
- *   without its atom (a mark drop, or a mark in a selection moved without its molecule): its old
- *   and new atoms. A mark that followed its moved atom explains nothing (`movedSelectedMarkAtomKeys`);
+ * - a charge or radical mark the operation declares it moved by itself (`independentlyMovedMarkIds`:
+ *   a mark drop, or a mark in a selection moved without its molecule) and did move or re-anchor:
+ *   its old and new atoms (`independentlyMovedMarkAtomKeys`). No other mark explains anything; a
+ *   mark the charge-follows rule carried with its atom never does;
  * - for a scoped chemistry edit (`structureEdit`, `editedMoleculeIds`), every change, removal
  *   included, to the molecules it structurally edited or names.
  * Molecules the operation did not select and move, edit or name are never exempt: the legacy loose
@@ -301,7 +328,8 @@ export function commitChemistryRefusals(check: CommitChemistryCheck): string[] {
     changes = changes.filter((change) => !named.has(change.moleculeId) && !edited.has(moleculeKey(change.pageId, change.moleculeId)));
     if (changes.length === 0) return [];
   }
-  const exempt = movedSelectedMarkAtomKeys(check.before, check.next, [baseline, check.after], check.markAtoms);
+  const exempt = independentlyMovedMarkAtomKeys(check.before, check.next, [baseline, check.after],
+    check.independentlyMovedMarkIds, check.markAtoms);
   return changes
     .filter((change) => change.atomId === undefined || !change.after ||
       !exempt.has(atomChemistryKey(change.pageId, change.moleculeId, change.atomId)))
@@ -375,112 +403,59 @@ export function structurallyEditedMoleculeKeys(before: ChemDraftDocument, next: 
  */
 export function policyChemistryRefusals(
   policy: CommitChemistryPolicy,
-  check: Omit<CommitChemistryCheck, "operation" | "structureEdit" | "editedMoleculeIds">,
+  check: Omit<CommitChemistryCheck, "operation" | "structureEdit" | "editedMoleculeIds" | "independentlyMovedMarkIds">,
   operation?: string
 ): string[] {
   if (policy.kind !== "preserve") return [];
   return commitChemistryRefusals({ ...check, operation: policy.operation ?? operation,
-    structureEdit: policy.structureEdit, editedMoleculeIds: policy.editedMoleculeIds });
+    structureEdit: policy.structureEdit, editedMoleculeIds: policy.editedMoleculeIds,
+    independentlyMovedMarkIds: policy.independentlyMovedMarkIds });
 }
 
 /**
- * The selection's page and its ids plus every member of a selected group, nested groups included.
- * A selection belongs to one page (its `pageId`, else the first page).
+ * Atoms whose change the operation's own mark moves explain: for every mark it declares it moved
+ * by itself (`markIds`) that carries charge or radicals and that it did reposition, resize or give
+ * an explicit anchor it did not have, the atoms the mark is attributed to in each of `documents`,
+ * on the page where it moved. Normalization never moves a mark and never makes an anchor explicit,
+ * so a declared mark that normalization merely re-attributed explains nothing. Nothing is inferred
+ * from how atoms moved: a mark not declared, including every mark the charge-follows rule carried
+ * with its atom, has no exempt atom, so a pure move (a selection drag, nudge, align, distribute,
+ * arrange, spacing, rotate, flip, resize, a part drag) must leave every charge and radical as it was.
  */
-function selectedTargets(document: ChemDraftDocument): { pageId: string | undefined; ids: Set<string> } {
-  const pageId = document.selection.pageId ?? document.pages[0]?.id;
-  const page = document.pages.find((candidate) => candidate.id === pageId);
-  const ids = new Set<string>(document.selection.objectIds);
-  const members = new Map<string, readonly string[]>();
-  for (const object of page?.objects ?? []) if (object.type === "group") members.set(object.id, object.childObjectIds);
-  const pending: string[] = [...ids];
-  while (pending.length > 0) {
-    for (const child of members.get(pending.pop()!) ?? []) {
-      if (!ids.has(child)) { ids.add(child); pending.push(child); }
-    }
-  }
-  return { pageId, ids };
-}
-
-/** Page positions closer than this are the same place (frame rotation leaves float noise). */
-const ATOM_PAGE_EPSILON_PX = 1e-6;
-
-/** Whether `atom` of `molecule` and `after` of `moved` are drawn at different page positions. */
-function atomPageMoved(molecule: MoleculeObject, atom: MoleculeAtom, moved: MoleculeObject, after: MoleculeAtom): boolean {
-  const p = transformPointForObject(molecule, atom), q = transformPointForObject(moved, after);
-  return Math.hypot(q.x - p.x, q.y - p.y) > ATOM_PAGE_EPSILON_PX;
-}
-
-/** Whether the molecule's stored transform (scale, rotation, tilt) changed; absent is the identity. */
-function moleculeTransformChanged(molecule: MoleculeObject, moved: MoleculeObject): boolean {
-  const state = (object: MoleculeObject) => [object.transform?.scaleX ?? 1, object.transform?.scaleY ?? 1,
-    object.transform?.rotationDegrees ?? 0, object.transform?.tiltXDegrees ?? 0, object.transform?.tiltYDegrees ?? 0];
-  const before = state(molecule), after = state(moved);
-  return before.some((value, index) => Math.abs(value - after[index]) > 1e-9);
-}
-
-/**
- * Atoms whose change a selected charge or radical mark moved BY ITSELF explains: the atoms the mark
- * is attributed to in each of `documents`, on the selection's page. A mark counts as moved when the
- * operation changed its position or size, or gave it an explicit anchor it did not have
- * (normalization never moves a mark and never makes an anchor explicit, so a mark it merely
- * re-attributed does not count), and its own atom did not move: that is a mark drop or a mark
- * moved off its atom, under the mark-move policy. A mark whose atom moved followed it (owner ruling
- * 2026-11-21, charge always follows) and explains nothing, so a pure move (a selection drag, nudge,
- * align, distribute, arrange, spacing, rotate, flip, resize, a part drag) has no exempt atom at
- * all: every molecule's charges and radicals must come out as they were.
- */
-export function movedSelectedMarkAtomKeys(
+export function independentlyMovedMarkAtomKeys(
   before: ChemDraftDocument,
   next: ChemDraftDocument,
   documents: readonly ChemDraftDocument[],
+  markIds: IndependentMarkMoves | undefined,
   markAtoms: MarkAtomResolver
 ): Set<string> {
   const keys = new Set<string>();
-  const { pageId, ids } = selectedTargets(before);
-  const page = before.pages.find((candidate) => candidate.id === pageId);
-  if (!page || ids.size === 0) return keys;
-  const nextPage = next.pages.find((candidate) => candidate.id === pageId);
-  const nextMarks = new Map((nextPage?.objects ?? [])
-    .flatMap((object) => object.type === "electron-mark" ? [[object.id, object] as const] : []));
-  const molecules = moleculesById(page), nextMolecules = moleculesById(nextPage);
-  // Whether the operation moved the atom the mark belonged to before it, read from the atom itself
-  // (review 2 P2b), never from the molecule's frame size (another atom moving changes that):
-  // - its page position changed (its coordinates under the molecule's frame rotation); or
-  // - the molecule's transform changed (a turn or scale about this very atom, such as a lone atom
-  //   turned or scaled about itself, carries its marks while the atom stays put); or
-  // - every other atom of the molecule moved: the whole molecule was turned, flipped or scaled
-  //   with this atom as its fixed point.
-  // A mark moved while none of these holds moved by itself.
-  const ownAtomMoved = (mark: ElectronMarkObject) => markAtoms(page, mark).some((owner) => {
-    const molecule = molecules.get(owner.objectId), moved = nextMolecules.get(owner.objectId);
-    if (!molecule || !moved || moved === molecule) return false;
-    const atom = molecule.atoms.find((candidate) => candidate.id === owner.atomId);
-    const after = moved.atoms.find((candidate) => candidate.id === owner.atomId);
-    if (!atom || !after) return false;
-    if (atomPageMoved(molecule, atom, moved, after) || moleculeTransformChanged(molecule, moved)) return true;
-    const nextAtoms = new Map(moved.atoms.map((candidate) => [candidate.id, candidate]));
-    const others = molecule.atoms.filter((candidate) => candidate.id !== atom.id && nextAtoms.has(candidate.id));
-    return others.length > 0 && others.every((candidate) => atomPageMoved(molecule, candidate, moved, nextAtoms.get(candidate.id)!));
-  });
-  const moved = new Set<string>();
-  for (const mark of page.objects) {
-    if (mark.type !== "electron-mark" || !ids.has(mark.id)) continue;
-    const { charge, radicals } = electronMarkAtomContribution(mark);
-    if (charge === 0 && radicals === 0) continue;
-    const after = nextMarks.get(mark.id);
-    if (!after) continue;
-    const repositioned = after.x !== mark.x || after.y !== mark.y || after.width !== mark.width || after.height !== mark.height;
-    const reanchored = after.atomAssociation === "explicit" &&
-      (mark.atomAssociation !== "explicit" || JSON.stringify(after.anchor) !== JSON.stringify(mark.anchor));
-    if ((repositioned || reanchored) && !ownAtomMoved(mark)) moved.add(mark.id);
-  }
-  if (moved.size === 0) return keys;
-  for (const document of documents) {
-    const documentPage = document.pages.find((candidate) => candidate.id === pageId);
-    for (const mark of documentPage?.objects ?? []) {
-      if (mark.type !== "electron-mark" || !moved.has(mark.id)) continue;
-      for (const owner of markAtoms(documentPage!, mark)) keys.add(atomChemistryKey(pageId!, owner.objectId, owner.atomId));
+  if (!markIds?.size) return keys;
+  const nextPages = new Map(next.pages.map((page) => [page.id, page]));
+  for (const page of before.pages) {
+    const nextPage = nextPages.get(page.id);
+    if (!nextPage || nextPage.objects === page.objects) continue;
+    const nextMarks = new Map(nextPage.objects
+      .flatMap((object) => object.type === "electron-mark" && markIds.has(object.id) ? [[object.id, object] as const] : []));
+    const moved = new Set<string>();
+    for (const mark of page.objects) {
+      if (mark.type !== "electron-mark" || !markIds.has(mark.id)) continue;
+      const { charge, radicals } = electronMarkAtomContribution(mark);
+      if (charge === 0 && radicals === 0) continue;
+      const after = nextMarks.get(mark.id);
+      if (!after || after === mark) continue;
+      const repositioned = after.x !== mark.x || after.y !== mark.y || after.width !== mark.width || after.height !== mark.height;
+      const reanchored = after.atomAssociation === "explicit" &&
+        (mark.atomAssociation !== "explicit" || JSON.stringify(after.anchor) !== JSON.stringify(mark.anchor));
+      if (repositioned || reanchored) moved.add(mark.id);
+    }
+    if (moved.size === 0) continue;
+    for (const document of documents) {
+      const documentPage = document.pages.find((candidate) => candidate.id === page.id);
+      for (const mark of documentPage?.objects ?? []) {
+        if (mark.type !== "electron-mark" || !moved.has(mark.id)) continue;
+        for (const owner of markAtoms(documentPage!, mark)) keys.add(atomChemistryKey(page.id, owner.objectId, owner.atomId));
+      }
     }
   }
   return keys;

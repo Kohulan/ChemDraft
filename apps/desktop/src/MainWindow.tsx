@@ -22,7 +22,8 @@ import { dropElectronMark, dropElectronMarksInSelection, electronMarkDropTarget,
 import { chargeAssociationUndoLabel, electronMarkUndoLabel } from "./electronMarkUndoLabel";
 import {
   CHEMISTRY_EDIT, PLUGIN_WRITE, PRESERVE_CHEMISTRY, TEXT_EDIT, chemistryEditOf, chemistryRefusalStatus, policyChemistryRefusals,
-  preserveChemistry, selectionTransformChemistry, structureEditChemistry, structureEditorChemistry, type CommitChemistryPolicy
+  preserveChemistry, selectionTransformChemistry, structureEditChemistry, structureEditorChemistry, withIndependentlyMovedMarks,
+  type CommitChemistryPolicy, type IndependentMarkMoves
 } from "./commitChemistryGuard";
 import { nativeBenzeneHotkeyAtAtomTarget, nativeFragmentSproutTarget, nativeDieneFuseTarget, nativeOxoHotkeyTarget, nativeBranchedHotkeyTarget, type FragmentSproutKind } from "./sproutHotkeys";
 import { applyTableCommand, applyTableFontCommand, applyTableObjectEdit, createTableCommands, createTableInsertAction, parseTableInsertCommandId, resolveActiveTableCell, selectedTable, tableInsertCommandId, tableInspectorSnapshot, type ActiveTableCell, type TableInsertDimensions } from "./tableCommands";
@@ -1855,6 +1856,15 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
 const CURRENT_BUILD_STAMP = "11.21.15.00-opus";
 
 /**
+ * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
+ * the funnel builds the policy before the updater runs, and reads the set after each run.
+ */
+function replaceMarkIds(target: Set<string>, markIds: ReadonlySet<string>): void {
+  target.clear();
+  for (const id of markIds) target.add(id);
+}
+
+/**
  * The commit funnel's chemistry check (AGENTS.md section 7, `commitChemistryGuard.ts`). `before`
  * is the committed document the operation started from, `next` the operation's own result and
  * `after` the normalized document about to be committed, so placement and normalization are both
@@ -2883,7 +2893,11 @@ export function MainWindow({
   // single-molecule operation — drag, spin, delete, the inspector, dependency arrays — unchanged.
   const [selectedNativeMoleculeParts, setSelectedNativeMoleculeParts] = useState<NativeMoleculeSelectionPart[]>([]);
   const bracketActions = useMemo(() => createBracketCommands(document, selectedNativeMoleculeParts), [document, selectedNativeMoleculeParts]);
-  const arrowNudgeBurstRef = useRef<{ history: DocumentHistory; lastPress: number } | undefined>(undefined);
+  // A burst's one history entry is checked against the document before the burst, so it carries
+  // every mark any of its presses moved by itself (`IndependentMarkMoves`).
+  const arrowNudgeBurstRef = useRef<{ history: DocumentHistory; lastPress: number; markIds: ReadonlySet<string> } | undefined>(undefined);
+  // The marks the typed rotation or stretch preview moved by itself, for `commitLiveInputPreview`.
+  const liveInputMarkMovesRef = useRef<{ startDocument: ChemDraftDocument; markIds: IndependentMarkMoves } | undefined>(undefined);
   useLayoutEffect(() => { arrowNudgeBurstRef.current = undefined; }, [selectedNativeMoleculeParts]);
   useEffect(() => {
     const endBurst = () => { arrowNudgeBurstRef.current = undefined; };
@@ -4302,7 +4316,11 @@ export function MainWindow({
   // chemistry, so a refused preview is withdrawn (the start document comes back) and not recorded.
   const commitLiveInputPreview = useCallback((startDocument: ChemDraftDocument, undoLabel?: string): boolean => {
     const previewDocument = documentRef.current;
-    const refusal = commitChemistryRefusal(startDocument, previewDocument, previewDocument, selectionTransformChemistry(), undoLabel);
+    // The marks the last preview moved by itself (`IndependentMarkMoves`), when it is this preview.
+    const independent = liveInputMarkMovesRef.current?.startDocument === startDocument ? liveInputMarkMovesRef.current.markIds : undefined;
+    liveInputMarkMovesRef.current = undefined;
+    const refusal = commitChemistryRefusal(startDocument, previewDocument, previewDocument,
+      selectionTransformChemistry(undefined, independent), undoLabel);
     if (refusal) {
       installDocumentHistory((history) => history.present === startDocument ? history : { ...history, present: startDocument });
       reportChemistryRefusal(refusal);
@@ -10790,7 +10808,7 @@ export function MainWindow({
     if (!result.ok) throw new Error(result.status);
     if (tabId === activeDocumentTabIdRef.current) {
       commitDocumentChange(result.document, (before, after) => chargeAssociationUndoLabel(before, after, "Adjust arrangement spacing"),
-        false, undefined, selectionTransformChemistry());
+        false, undefined, selectionTransformChemistry(undefined, result.independentlyMovedMarkIds));
       setStatus(result.status);
       return;
     }
@@ -10798,7 +10816,8 @@ export function MainWindow({
     if (result.document === source) return;
     const present = normalizeCommittedDocument(result.document);
     // The same commit-time chemistry guard as the active tab's funnel; the dialog shows the refusal.
-    const refusal = commitChemistryRefusal(source, result.document, present, selectionTransformChemistry("adjust arrangement spacing"));
+    const refusal = commitChemistryRefusal(source, result.document, present,
+      selectionTransformChemistry("adjust arrangement spacing", result.independentlyMovedMarkIds));
     if (refusal) throw new Error(refusal);
     documentUndoLabelsRef.current.set(present, chargeAssociationUndoLabel(source, present, "Adjust arrangement spacing"));
     for (const listener of assistantUserEditListenersRef.current) listener(tabId);
@@ -12190,7 +12209,7 @@ export function MainWindow({
       const moved = result.document;
       if (moved === current) {
         // Repeats against a page edge are still presses, so they renew an existing burst.
-        arrowNudgeBurstRef.current = continuesBurst ? { history: documentHistoryRef.current, lastPress: now } : undefined;
+        arrowNudgeBurstRef.current = continuesBurst ? { history: documentHistoryRef.current, lastPress: now, markIds: burst!.markIds } : undefined;
         setStatus(result.status ?? "Selection is already at the page edge");
         return;
       }
@@ -12199,7 +12218,8 @@ export function MainWindow({
       // selection change, tab switch or Undo/Redo, even when it arrived outside keyboard routing.
       // Owner ruling 2026-11-21 (charge always follows): nudging atoms or whole objects carries
       // their marks, so no nudge may change any molecule's chemistry.
-      const chemistry = selectionTransformChemistry("move");
+      const markIds = continuesBurst ? new Set([...burst!.markIds, ...result.independentlyMovedMarkIds]) : result.independentlyMovedMarkIds;
+      const chemistry = selectionTransformChemistry("move", markIds);
       if (continuesBurst) {
         const before = documentHistoryRef.current.past.at(-1) ?? current;
         // A burst amends its one entry, so it is checked against the document before the burst.
@@ -12216,7 +12236,7 @@ export function MainWindow({
         arrowNudgeBurstRef.current = undefined;
         return;
       }
-      arrowNudgeBurstRef.current = { history: documentHistoryRef.current, lastPress: now };
+      arrowNudgeBurstRef.current = { history: documentHistoryRef.current, lastPress: now, markIds };
       if (result.status) {
         setStatus(result.status);
         return;
@@ -12723,12 +12743,15 @@ export function MainWindow({
           if (action.id === "layout.adjustArrangementSpacing") { openArrangementSpacingRef.current(); return; }
           const layout = arrangementLayoutForCommand(action.id)!;
           let operationStatus = "";
+          // Filled by the updater (`IndependentMarkMoves`); the funnel reads it after each run.
+          const markIds = new Set<string>();
           commitDocumentChange(current => {
             const result = arrangeSelectedDocumentObjects(current, layout, { gridAlignment: arrangementGridAlignmentForCommand(action.id) });
             const edit = resolveElectronMarksInSelectionTransform(current, result.document);
             operationStatus = edit.status ?? result.status;
+            replaceMarkIds(markIds, edit.independentlyMovedMarkIds);
             return edit.document;
-          }, layoutUndoLabel, false, undefined, selectionTransformChemistry());
+          }, layoutUndoLabel, false, undefined, selectionTransformChemistry(undefined, markIds));
           setStatus(operationStatus); return;
         }
         if (action.id === distributeModeCommandIds.centers || action.id === distributeModeCommandIds.spacing) {
@@ -12756,11 +12779,13 @@ export function MainWindow({
         const commitSelectionTransform = (transform: (current: ChemDraftDocument) => ChemDraftDocument, emptyStatus: string,
           motion?: AtomMotion) => {
           let markStatus: string | undefined;
+          const markIds = new Set<string>();
           const changed = commitDocumentChange(current => {
             const result = resolveElectronMarksInSelectionTransform(current, transform(current), { motion });
             markStatus = result.status;
+            replaceMarkIds(markIds, result.independentlyMovedMarkIds);
             return result.document;
-          }, layoutUndoLabel, false, undefined, selectionTransformChemistry());
+          }, layoutUndoLabel, false, undefined, selectionTransformChemistry(undefined, markIds));
           setStatus(markStatus ?? (changed ? action.title : emptyStatus));
         };
 
@@ -17393,11 +17418,11 @@ export function MainWindow({
       : snapRotationDegrees(degrees, { shiftKey: drag.shiftKey });
   }, []);
 
-  const objectRotateDocumentFromDrag = useCallback((drag: ObjectRotateDragState, degrees: number): ChemDraftDocument => {
+  const objectRotateDocumentFromDrag = useCallback((drag: ObjectRotateDragState, degrees: number) => {
     const rotated = drag.target
       ? rotateNativeMoleculeParts(drag.startDocument, drag.target, degrees)
       : rotateDocumentObject(drag.startDocument, drag.objectId, degrees);
-    return resolveElectronMarksInSelectionTransform(drag.startDocument, rotated, { motion: "turn" }).document;
+    return resolveElectronMarksInSelectionTransform(drag.startDocument, rotated, { motion: "turn" });
   }, []);
 
   // Snapshot the molecule's persisted Spin 3D model for a whole-molecule rotate drag.
@@ -17558,7 +17583,7 @@ export function MainWindow({
       }
 
       clearObjectTransformPreview(drag.pointerId);
-      replacePresentDocument(objectRotateDocumentFromDrag(drag, degrees));
+      replacePresentDocument(objectRotateDocumentFromDrag(drag, degrees).document);
     });
   }, [clearObjectTransformPreview, objectRotateDocumentFromDrag, objectRotateDragDegrees, replacePresentDocument, scheduleObjectTransformPreview]);
 
@@ -17638,8 +17663,10 @@ export function MainWindow({
         replacePresentDocument(drag.startDocument);
         return false;
       }
-      // Dropping a mark onto an atom, or dragging it off one, is a chemistry edit.
-      commitDocumentHistoryFrom(drag.startDocument, result.document, result.undoLabel, undefined, CHEMISTRY_EDIT);
+      // Dropping a mark onto an atom, or dragging it off one, is a chemistry edit. The mark moved by
+      // itself: the charge-follows rule leaves it where the drop put it.
+      commitDocumentHistoryFrom(drag.startDocument, result.document, result.undoLabel, undefined,
+        withIndependentlyMovedMarks(CHEMISTRY_EDIT, result.independentlyMovedMarkIds));
       return true;
     }
     const selectionDrop = drag.groupObjectIds && drag.groupObjectIds.length > 1
@@ -17667,7 +17694,7 @@ export function MainWindow({
       : object?.type === "text" && object.arrowAttachment?.kind === "conditions" ? "Move Reaction Conditions" : undefined;
     return commitDocumentHistoryFrom(drag.startDocument, moved,
       selectionDrop?.status ? chargeAssociationUndoLabel(drag.startDocument, moved, label ?? "Move") : label,
-      undefined, selectionTransformChemistry("move"));
+      undefined, selectionTransformChemistry("move", selectionDrop?.independentlyMovedMarkIds));
   }, [assignHoveredNativeDeleteTarget, clearObjectTransformPreview, commitDocumentHistoryFrom, objectDragDelta, objectDragDocument, replacePresentDocument]);
 
   const commitGraphicCornerRadius = useCallback((drag: GraphicCornerRadiusDragState, point: ClientPoint): boolean => {
@@ -17696,7 +17723,7 @@ export function MainWindow({
 
   const commitObjectRotateDrag = useCallback((drag: ObjectRotateDragState): boolean => {
     const degrees = objectRotateDragDegrees(drag);
-    const rotated = objectRotateDocumentFromDrag(drag, degrees);
+    const { document: rotated, independentlyMovedMarkIds } = objectRotateDocumentFromDrag(drag, degrees);
     clearObjectTransformPreview(drag.pointerId);
     if (rotated === drag.startDocument) {
       replacePresentDocument(drag.startDocument);
@@ -17726,7 +17753,7 @@ export function MainWindow({
     }
 
     return commitDocumentHistoryFrom(drag.startDocument, committed, findDocumentObject(drag.startDocument, drag.objectId)?.type === "electron-mark" ? "Rotate electron mark" : undefined,
-      undefined, selectionTransformChemistry("rotate"));
+      undefined, selectionTransformChemistry("rotate", independentlyMovedMarkIds));
   }, [clearObjectTransformPreview, commitDocumentHistoryFrom, objectRotateDocumentFromDrag, objectRotateDragDegrees, replacePresentDocument]);
 
   const commitProjectedPlaneTilt = useCallback((drag: ProjectedPlaneTiltDragState, point: ClientPoint): boolean => {
@@ -17946,9 +17973,10 @@ export function MainWindow({
       return;
     }
 
-    replacePresentDocument(result.kind === "xy" && result.verifiedSpin3d
-      ? result.document : resolveElectronMarksInSelectionTransform(nextInput.startDocument, result.document,
-        result.kind === "z" ? { motion: "turn" } : {}).document);
+    const edit = result.kind === "xy" && result.verifiedSpin3d ? undefined
+      : resolveElectronMarksInSelectionTransform(nextInput.startDocument, result.document, result.kind === "z" ? { motion: "turn" } : {});
+    liveInputMarkMovesRef.current = edit ? { startDocument: nextInput.startDocument, markIds: edit.independentlyMovedMarkIds } : undefined;
+    replacePresentDocument(edit?.document ?? result.document);
     if (result.kind === "xy") {
       showProjectedPlaneTiltReadout(nextInput.objectId, result.tiltXRad, result.tiltYRad, result.clamped, false);
     } else {
@@ -18076,7 +18104,9 @@ export function MainWindow({
       return;
     }
 
-    replacePresentDocument(resolveElectronMarksInSelectionTransform(nextInput.startDocument, result.document).document);
+    const edit = resolveElectronMarksInSelectionTransform(nextInput.startDocument, result.document);
+    liveInputMarkMovesRef.current = { startDocument: nextInput.startDocument, markIds: edit.independentlyMovedMarkIds };
+    replacePresentDocument(edit.document);
     showObjectResizeReadout(nextInput.objectId, result.targetScale, false);
   }, [objectResizeInputDocumentFromDraft, replacePresentDocument, showObjectResizeReadout, updateObjectResizeInput]);
 
@@ -18148,14 +18178,14 @@ export function MainWindow({
     drag: ObjectResizeDragState,
     point: ClientPoint,
     stretching: boolean
-  ): ChemDraftDocument => {
+  ) => {
     const scale = objectResizeScaleFromDrag(drag.centerPoint, drag.startPoint, point, stretching);
     const object = findDocumentObject(drag.startDocument, drag.objectId);
     const resized = drag.target
       ? resizeNativeMoleculeParts(drag.startDocument, drag.target, scale)
       : object?.type === "molecule" ? resizeNativeMoleculeObject(drag.startDocument, drag.objectId, scale)
         : scaleDocumentObjectsAroundPoint(drag.startDocument, [drag.objectId], drag.centerPoint, scale.x, scale.y);
-    return resolveElectronMarksInSelectionTransform(drag.startDocument, resized).document;
+    return resolveElectronMarksInSelectionTransform(drag.startDocument, resized);
   }, []);
 
   const previewObjectResize = useCallback((drag: ObjectResizeDragState, point: ClientPoint, stretching: boolean) => {
@@ -18166,14 +18196,14 @@ export function MainWindow({
       drag.latestCumulativeScale = cumulativeObjectResizeScale(drag.startCumulativeScale, drag.latestScale);
       showObjectResizeReadout(drag.objectId, drag.latestCumulativeScale);
       clearObjectTransformPreview(drag.pointerId);
-      replacePresentDocument(objectResizeDocumentFromDrag(drag, point, stretching));
+      replacePresentDocument(objectResizeDocumentFromDrag(drag, point, stretching).document);
     });
   }, [clearObjectTransformPreview, objectResizeDocumentFromDrag, replacePresentDocument, showObjectResizeReadout]);
 
   const commitObjectResize = useCallback((drag: ObjectResizeDragState, point: ClientPoint): boolean => {
     drag.latestScale = objectResizeScaleFromDrag(drag.centerPoint, drag.startPoint, point, drag.stretching);
     drag.latestCumulativeScale = cumulativeObjectResizeScale(drag.startCumulativeScale, drag.latestScale);
-    const resized = objectResizeDocumentFromDrag(drag, point, drag.stretching);
+    const { document: resized, independentlyMovedMarkIds } = objectResizeDocumentFromDrag(drag, point, drag.stretching);
     showObjectResizeReadout(drag.objectId, drag.latestCumulativeScale, true);
     clearObjectTransformPreview(drag.pointerId);
     if (resized === drag.startDocument) {
@@ -18182,7 +18212,7 @@ export function MainWindow({
     }
 
     return commitDocumentHistoryFrom(drag.startDocument, resized, findDocumentObject(drag.startDocument, drag.objectId)?.type === "electron-mark" ? "Resize electron mark" : undefined,
-      undefined, selectionTransformChemistry("resize"));
+      undefined, selectionTransformChemistry("resize", independentlyMovedMarkIds));
   }, [clearObjectTransformPreview, commitDocumentHistoryFrom, objectResizeDocumentFromDrag, replacePresentDocument, showObjectResizeReadout]);
 
   const nativePartDocumentFromDrag = useCallback((drag: NativePartDragState, point: ClientPoint): ChemDraftDocument => {
@@ -19408,7 +19438,7 @@ export function MainWindow({
           const label = groupTransform.mode === "rotate" ? "Rotate selection"
             : groupTransform.mode === "resize" ? "Resize selection" : "3D rotate";
           commitDocumentHistoryFrom(before, edit.document, chargeAssociationUndoLabel(before, edit.document, label), undefined,
-            selectionTransformChemistry());
+            selectionTransformChemistry(undefined, edit.independentlyMovedMarkIds));
         } else {
           replacePresentDocument(before);
         }
@@ -24170,9 +24200,11 @@ export function MainWindow({
             setSpacingSource(undefined); setStatus("Drawing changed. Reopen Adjust spacing to preview the current selection."); return;
           }
           let ok = false, operationStatus = "";
+          const markIds = new Set<string>();
           commitDocumentChange(current => { const result = checkedArrangementSpacing(current, factor);
-            ok = result.ok; operationStatus = result.status; return result.document;
-          }, (before, after) => chargeAssociationUndoLabel(before, after, "Adjust arrangement spacing"), false, undefined, selectionTransformChemistry());
+            ok = result.ok; operationStatus = result.status; replaceMarkIds(markIds, result.independentlyMovedMarkIds); return result.document;
+          }, (before, after) => chargeAssociationUndoLabel(before, after, "Adjust arrangement spacing"), false, undefined,
+          selectionTransformChemistry(undefined, markIds));
           if (ok) setSpacingSource(undefined); setStatus(operationStatus);
         }} /> : null}
       {objectContextMenu ? (

@@ -9343,9 +9343,16 @@ function applyFlippedMoleculeBondStereo(
       ? { ...edge, display: { ...edge.display, bondStyle: style === "wedge" ? "hashed" as const : "wedge" as const } } : edge;
   });
   const changes = withStoredBondStereoMolfile(normalizeNativeMoleculeGeometry({ ...molecule, atoms, bonds }));
+  // The end's double-bond atom lies on the mirror line and does not move: its marks stay exactly
+  // as they were (owner ruling 2026-11-21), so only the marks of atoms the reflection moves are carried.
+  const movedEnd = new Set(molecule.atoms.filter(atom => {
+    if (!end.has(atom.id)) return false;
+    const image = reflect(atom);
+    return Math.hypot(image.x - atom.x, image.y - atom.y) > 1e-6;
+  }).map(atom => atom.id));
   return applyPatches(document, [
     { op: "updateObject", objectId: molecule.id, changes },
-    ...anchoredElectronMarkTransformPatches(page, molecule.id, end, reflect, {
+    ...anchoredElectronMarkTransformPatches(page, molecule.id, movedEnd, reflect, {
       reflectionAxisDegrees: radiansToDegrees(Math.atan2(dy, dx))
     })
   ], { now: phase4Timestamp });
@@ -14036,6 +14043,13 @@ export interface ElectronMarkFollowOptions {
    * Without it such a move translates the mark with its atom and never guesses a turn or a mirror.
    */
   motion?: AtomMotion;
+  /**
+   * Marks the operation itself moved, independently of their atoms (a mark dragged or transformed
+   * as its own selected object, without the molecule it belongs to). Only these may move while
+   * their atom stays put; they are left to the mark-move policy. Every other mark of an atom that
+   * did not move is kept exactly as it was.
+   */
+  independentlyMovedMarkIds?: ReadonlySet<string>;
 }
 
 /**
@@ -14131,6 +14145,30 @@ function electronMarkAtomOwners(page: DocumentPage): Map<string, { objectId: str
   return owners;
 }
 
+/** Whether a molecule's stored frame (rotation, transform scale, turn or tilt) changed; absent is the identity. */
+function moleculeFrameTransformChanged(before: MoleculeObject, after: MoleculeObject): boolean {
+  const state = (molecule: MoleculeObject) => [molecule.rotation ?? 0, molecule.transform?.scaleX ?? 1, molecule.transform?.scaleY ?? 1,
+    molecule.transform?.rotationDegrees ?? 0, molecule.transform?.tiltXDegrees ?? 0, molecule.transform?.tiltYDegrees ?? 0];
+  const a = state(before), b = state(after);
+  return a.some((value, index) => Math.abs(value - b[index]) > 1e-9);
+}
+
+/**
+ * The changes that put `next` back where `mark` was: its position, size, angle and atom
+ * association, and nothing else (a style the operation applied stands). `undefined` when none of
+ * them changed.
+ */
+function electronMarkRestoreChanges(mark: ElectronMarkObject, next: ElectronMarkObject): Partial<ElectronMarkObject> | undefined {
+  if (next === mark) return undefined;
+  const changes: Partial<ElectronMarkObject> = {};
+  for (const key of ["x", "y", "width", "height", "rotation"] as const) {
+    if (next[key] !== mark[key]) changes[key] = mark[key];
+  }
+  if (JSON.stringify(next.anchor) !== JSON.stringify(mark.anchor)) changes.anchor = mark.anchor;
+  if (next.atomAssociation !== mark.atomAssociation) changes.atomAssociation = mark.atomAssociation;
+  return Object.keys(changes).length ? changes : undefined;
+}
+
 export interface ElectronMarkFollowResult {
   document: ChemDraftDocument;
   /** Marks whose atom moved: they moved with it and keep their association. */
@@ -14148,12 +14186,18 @@ export interface ElectronMarkFollowResult {
  * (a whole-object transform carries its marks) keeps the operation's placement. A legacy bond,
  * object or loose mark that followed is re-anchored explicitly to its atom, as Duplicate does.
  *
+ * A mark whose atom did not move does not move: a mark of an atom the operation left in place (a
+ * turn's pivot, an atom on a mirror line, a lone atom turned or scaled about itself) that the
+ * operation's own transform patched is put back exactly as it was, position, size and angle.
+ *
  * Then no stationary mark may change association because atoms moved: a charge or radical mark the
  * operation did not move keeps the atom commit normalization gave it before (or stays free), made
  * explicit where normalization of the moved geometry would decide otherwise.
  *
- * Marks the operation moved without their atom (a mark drag, or a mark transformed in a selection
- * without its molecule) are left to the mark-move policy.
+ * Marks the operation moved by itself, as the caller declares them
+ * (`independentlyMovedMarkIds`: a mark dragged, or transformed in a selection without its
+ * molecule), are left to the mark-move policy when their atom stayed put; so is a mark of a
+ * molecule the operation did not change. Nothing here guesses that a mark moved by itself.
  */
 export function followElectronMarksWithMovedAtoms(
   before: ChemDraftDocument,
@@ -14172,6 +14216,9 @@ export function followElectronMarksWithMovedAtoms(
     // Only molecules whose drawn atoms moved matter; most edits move none.
     const movedMolecules = new Map<string, { before: MoleculeObject; after: MoleculeObject; fit?: OffsetMap }>();
     const changedMoleculeIds = new Set<string>();
+    // Molecules the operation moved or transformed: an atom moved, or the stored frame turned,
+    // scaled or tilted (a lone atom turned or scaled about itself moves no atom).
+    const transformedMoleculeIds = new Set<string>();
     for (const object of page.objects) {
       if (object.type !== "molecule") continue;
       const next = nextObjects.get(object.id);
@@ -14185,28 +14232,12 @@ export function followElectronMarksWithMovedAtoms(
         return Math.hypot(q.x - p.x, q.y - p.y) > MARK_FOLLOW_EPSILON_PX;
       });
       if (moved) movedMolecules.set(object.id, { before: object, after: next });
+      if (moved || moleculeFrameTransformChanged(object, next)) transformedMoleculeIds.add(object.id);
     }
     const owners = electronMarkAtomOwners(page);
-    // A transform of a molecule about one of its atoms (a lone atom scaled or turned about itself)
-    // leaves that atom in place but carries its marks: the transform's placement stands.
-    const carriedInPlace = (mark: ElectronMarkObject, next: ElectronMarkObject) => {
-      const owner = owners.get(mark.id);
-      return owner !== undefined && changedMoleculeIds.has(owner.objectId) && next.anchor.kind === "atom" &&
-        next.anchor.objectId === owner.objectId && next.anchor.atomId === owner.atomId;
-    };
-    if (!movedMolecules.size) {
-      let carried = false;
-      for (const mark of page.objects) {
-        const next = mark.type === "electron-mark" ? nextObjects.get(mark.id) : undefined;
-        if (mark.type === "electron-mark" && next?.type === "electron-mark" && next !== mark && carriedInPlace(mark, next)) {
-          followedMarkIds.add(mark.id);
-          carried = true;
-        }
-      }
-      if (carried) pinnedPages.push({ pageId: page.id, owners: committedElectronMarkAssignments(page).anchorByMarkId, stationary: new Set() });
-      continue;
-    }
+    const independent = options.independentlyMovedMarkIds;
     const stationary = new Set<string>();
+    let carriedInPlace = false;
     for (const mark of page.objects) {
       if (mark.type !== "electron-mark") continue;
       const next = nextObjects.get(mark.id);
@@ -14214,26 +14245,43 @@ export function followElectronMarksWithMovedAtoms(
       const center = nativeChargeMarkCenter(mark), nextCenter = nativeChargeMarkCenter(next);
       const markMoved = next !== mark && Math.hypot(nextCenter.x - center.x, nextCenter.y - center.y) > MARK_FOLLOW_EPSILON_PX;
       const owner = owners.get(mark.id);
-      const molecules = owner && movedMolecules.get(owner.objectId);
-      const atom = molecules?.before.atoms.find((candidate) => candidate.id === owner!.atomId);
-      const nextAtom = molecules?.after.atoms.find((candidate) => candidate.id === owner!.atomId);
-      if (!owner || !molecules || !atom || !nextAtom) {
+      const ownerMolecule = owner && changedMoleculeIds.has(owner.objectId) ? page.objects.find((object) => object.id === owner.objectId) : undefined;
+      const nextOwnerMolecule = ownerMolecule && nextObjects.get(owner!.objectId);
+      const atom = ownerMolecule?.type === "molecule" ? ownerMolecule.atoms.find((candidate) => candidate.id === owner!.atomId) : undefined;
+      const nextAtom = nextOwnerMolecule?.type === "molecule" ? nextOwnerMolecule.atoms.find((candidate) => candidate.id === owner!.atomId) : undefined;
+      if (!owner || !atom || !nextAtom || ownerMolecule?.type !== "molecule" || nextOwnerMolecule?.type !== "molecule") {
+        // No atom of a molecule the operation changed: a stationary mark keeps its association; a
+        // mark the operation moved itself is the mark-move policy's.
         if (!markMoved) stationary.add(mark.id);
-        else if (carriedInPlace(mark, next)) followedMarkIds.add(mark.id);
         continue;
       }
-      const from = transformPointForObject(molecules.before, atom), to = transformPointForObject(molecules.after, nextAtom);
+      const from = transformPointForObject(ownerMolecule, atom), to = transformPointForObject(nextOwnerMolecule, nextAtom);
       // Whether THIS atom moved is read from its own page position (coordinates under the
-      // molecule's frame rotation), whatever map the molecule's atoms fit: an atom a turn left in
-      // place (its pivot, even when every atom fits the turn) keeps its marks where they are,
-      // offset and all (review 2 P2a). A transform that carried the mark itself is kept below.
+      // molecule's frame rotation), whatever map the molecule's atoms fit: an atom the operation
+      // left in place (a turn's pivot, a point on a mirror line, a lone atom turned or scaled about
+      // itself) keeps its marks exactly as they were, offset, size and angle (owner ruling
+      // 2026-11-21). A transform that patched such a mark directly is undone here; only a mark the
+      // operation moved by itself (`independentlyMovedMarkIds`) is left to the mark-move policy.
       const atomMoved = Math.hypot(to.x - from.x, to.y - from.y) > MARK_FOLLOW_EPSILON_PX;
       if (!atomMoved) {
-        if (!markMoved) stationary.add(mark.id);
-        else if (carriedInPlace(mark, next)) followedMarkIds.add(mark.id);
+        if (independent?.has(mark.id)) continue;
+        if (!transformedMoleculeIds.has(owner.objectId)) {
+          // An edit that moved no atom of the molecule (a label, charge or substituent edit) may
+          // place its atom's marks itself; its placement stands.
+          if (!markMoved) stationary.add(mark.id);
+          else if (next.anchor.kind === "atom" && next.anchor.objectId === owner.objectId && next.anchor.atomId === owner.atomId) {
+            followedMarkIds.add(mark.id);
+            carriedInPlace = true;
+          }
+          continue;
+        }
+        const restore = electronMarkRestoreChanges(mark, next);
+        if (restore) patches.push({ op: "updateObject", objectId: mark.id, changes: restore });
+        stationary.add(mark.id);
         continue;
       }
       followedMarkIds.add(mark.id);
+      const molecules = movedMolecules.get(owner.objectId)!;
       const map = molecules.fit ??= moleculeOffsetMap(molecules.before, molecules.after, options.motion);
       const changes: Partial<ElectronMarkObject> = {};
       if (!markMoved) {
@@ -14254,7 +14302,11 @@ export function followElectronMarksWithMovedAtoms(
       }
       if (Object.keys(changes).length) patches.push({ op: "updateObject", objectId: mark.id, changes });
     }
-    pinnedPages.push({ pageId: page.id, owners: committedElectronMarkAssignments(page).anchorByMarkId, stationary });
+    // An edit that moved or transformed no molecule pins only the marks it placed on their atoms.
+    const transformed = transformedMoleculeIds.size > 0;
+    if (!transformed && !carriedInPlace) continue;
+    pinnedPages.push({ pageId: page.id, owners: committedElectronMarkAssignments(page).anchorByMarkId,
+      stationary: transformed ? stationary : new Set() });
   }
   let document = patches.length ? applyPatches(after, patches, { now: phase4Timestamp }) : after;
   // Moved atoms must neither take a stationary mark nor lose one that followed: pin every
@@ -14285,7 +14337,8 @@ export function followElectronMarksWithMovedAtoms(
  * `followElectronMarksWithMovedAtoms` as the commit funnel applies it, for callers that need only
  * the document. Under a commit policy that rebuilt atoms under new ids (a structure-editor save,
  * `marksFollowAtoms`), an atom id does not name the same atom before and after, so the rule is not
- * run: marks stay where they are and normal mark association applies.
+ * run: marks stay where they are and normal mark association applies. The policy's
+ * `independentlyMovedMarkIds` are the marks the operation moved by itself.
  */
 export function carryElectronMarksWithMovedAtoms(
   before: ChemDraftDocument,
@@ -14293,7 +14346,8 @@ export function carryElectronMarksWithMovedAtoms(
   policy?: CommitChemistryPolicy
 ): ChemDraftDocument {
   if (!marksFollowAtoms(policy)) return after;
-  return followElectronMarksWithMovedAtoms(before, after).document;
+  return followElectronMarksWithMovedAtoms(before, after,
+    { independentlyMovedMarkIds: policy?.independentlyMovedMarkIds }).document;
 }
 
 /**
