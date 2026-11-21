@@ -17,10 +17,17 @@ export function TourForm({
   platform?: ShortcutPlatform;
 }) {
   const [index, setIndex] = useState(0);
+  // The host keeps its error until the next action, but an error belongs to the step whose action
+  // raised it. Moving to another step, forward or back, clears it, including a late error from an
+  // action still in flight; the next action on the new step shows errors again.
+  const [errorStep, setErrorStep] = useState<number | undefined>(0);
   const heading = useRef<HTMLHeadingElement>(null);
   const steps = tourSteps(scheme, platform);
   const step = steps[index];
   const tryCommand = step.tryCommand;
+  const visibleError = errorStep === index ? error : undefined;
+  const goTo = (next: number) => { setErrorStep(undefined); setIndex(next); };
+  const send = (action: TourAction) => { setErrorStep(index); onAction(action); };
 
   useEffect(() => { onReady?.(); }, [onReady]);
   useEffect(() => { heading.current?.focus(); }, [index]);
@@ -28,11 +35,12 @@ export function TourForm({
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || event.defaultPrevented || event.isComposing) return;
       event.preventDefault();
+      setErrorStep(index);
       onAction({ action: "cancel" });
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [onAction]);
+  }, [onAction, index]);
 
   return (
     <section className="guided-tour" role="dialog" aria-label={TOUR_TITLE}>
@@ -46,7 +54,7 @@ export function TourForm({
             {tourShortcutChoices(platform).map(choice => (
               <label key={choice.scheme}>
                 <input type="radio" name="tour-shortcuts" checked={scheme === choice.scheme}
-                  onChange={() => onAction({ action: "chooseShortcuts", scheme: choice.scheme })} />
+                  onChange={() => send({ action: "chooseShortcuts", scheme: choice.scheme })} />
                 <span>{choice.label}
                   <small>{choice.examples.map(({ label, key }) => <span key={label}>{label} <kbd>{key}</kbd></span>)}</small>
                 </span>
@@ -55,16 +63,16 @@ export function TourForm({
           </fieldset>
         ) : null}
         {tryCommand ? <button type="button" disabled={busy}
-          onClick={() => onAction({ action: "tryTourCommand", command: tryCommand })}>Try it</button> : null}
-        {error ? <p role="alert">{error}</p> : null}
+          onClick={() => send({ action: "tryTourCommand", command: tryCommand })}>Try it</button> : null}
+        {visibleError ? <p role="alert">{visibleError}</p> : null}
       </div>
       <footer>
-        <button type="button" onClick={() => onAction({ action: "cancel" })}>Skip tour</button>
-        <button type="button" disabled={index === 0} onClick={() => setIndex(index - 1)}>Back</button>
+        <button type="button" onClick={() => send({ action: "cancel" })}>Skip tour</button>
+        <button type="button" disabled={index === 0} onClick={() => goTo(index - 1)}>Back</button>
         {index < steps.length - 1
-          ? <button type="button" className="guided-tour-primary" onClick={() => setIndex(index + 1)}>Next</button>
+          ? <button type="button" className="guided-tour-primary" onClick={() => goTo(index + 1)}>Next</button>
           : <button type="button" className="guided-tour-primary" disabled={busy}
-              onClick={() => onAction({ action: "finish" })}>Finish</button>}
+              onClick={() => send({ action: "finish" })}>Finish</button>}
       </footer>
     </section>
   );

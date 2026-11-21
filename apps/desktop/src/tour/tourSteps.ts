@@ -4,6 +4,7 @@ import { createQuickActions, numericAtomDrawingHotkeys, KEYBOARD_PREFERENCES_COM
 import { chemDrawHoveredTargetHotkeyCommand } from "../keybindingScheme";
 import { KEYBINDING_SCHEME_LABELS, type KeybindingScheme } from "../keybindingSettings";
 import { createMainWindowShortcutCommands, detectDesktopShortcutPlatform } from "../keyboardShortcuts";
+import { preferencesMenuPlacement } from "../appMenu";
 import { formatShortcutLabel, getToolsetCommandSpecs } from "../toolsets";
 import { TOUR_INSPECTOR_COMMAND, TOUR_NAME_COMMAND, TOUR_SAMPLE_COMMAND, type TourTryCommand } from "./tourCommands";
 
@@ -49,7 +50,8 @@ export function tourSteps(
   const bondKey = Object.keys(numericAtomDrawingHotkeys).find(key => (
     scheme === "chemdraw" ? chemDrawHoveredTargetHotkeyCommand("atom", key) : numericAtomDrawingHotkeys[key]
   ) === "atom.addSingleBondToHoveredAtom");
-  const preferences = formatShortcutLabel(viewActions.find(command => command.id === PREFERENCES_COMMAND_ID)?.shortcut, platform);
+  const preferencesShortcut = formatShortcutLabel(viewActions.find(command => command.id === PREFERENCES_COMMAND_ID)?.shortcut, platform);
+  const preferences = preferencesMenuPlacement(platform);
   return [
     {
       title: "Welcome to ChemDraft",
@@ -57,7 +59,7 @@ export function tourSteps(
     },
     {
       title: "Choose your shortcuts",
-      text: "If you’ve used other drawing programs, try Classic desktop-compatible shortcuts. ChemDraft opens CDX and CDXML files. You can change any assignable shortcut in Preferences > Keyboard.",
+      text: "If you’ve used other drawing programs, try Classic desktop-compatible shortcuts. Your choice applies right away. ChemDraft opens CDX and CDXML files. You can change any assignable shortcut in Preferences > Keyboard.",
       shortcuts: true,
       tryCommand: KEYBOARD_PREFERENCES_COMMAND_ID
     },
@@ -82,7 +84,7 @@ export function tourSteps(
     },
     {
       title: "Make it yours",
-      text: `Open Preferences in the ${platform === "macos" ? "ChemDraft" : "File"} menu (${preferences}). Use View > Customize Main Toolbar to arrange your tools, and the Plugins menu to add features.`
+      text: `Choose ${preferences.menu} > ${preferences.label} (${preferencesShortcut}) to open Preferences. Use View > Customize Main Toolbar to arrange your tools, and the Plugins menu to add features.`
     }
   ];
 }

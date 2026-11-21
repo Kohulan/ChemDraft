@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TourForm } from "./TourForm";
 import { tourShortcutChoices, tourSteps } from "./tourSteps";
 import { parseDialogMessage } from "../dialogs/dialogProtocol";
+import { buildAppMenuModel, flattenAppMenuCommands } from "../appMenu";
 
 let container: HTMLDivElement;
 let root: Root;
@@ -76,7 +77,67 @@ describe.each(platforms)("guided tour on %s", platform => {
     click("Next");
     click("Next");
     const text = container.textContent;
-    expect(text).toContain(platform === "macos" ? "ChemDraft menu (⌘,)" : "File menu (Ctrl+,)");
+    expect(text).toContain(platform === "macos" ? "Choose ChemDraft > Settings… (⌘,)" : "Choose File > Preferences… (Ctrl+,)");
+  });
+
+  it("names the Preferences menu item exactly as the menu bar labels it", () => {
+    const sections = buildAppMenuModel({
+      platform, rulersVisible: true, crosshairsVisible: true, canUndo: false, canRedo: false,
+      hasSelection: false, hasSelectedMolecule: false, toolbars: []
+    });
+    const owner = sections.find(section => section.items.some(item => item.kind === "command" && item.commandId === "view.togglePreferences"))!;
+    const item = flattenAppMenuCommands([owner]).find(command => command.commandId === "view.togglePreferences")!;
+    expect([owner.label, item.label, item.shortcut]).toEqual(platform === "macos" ? ["ChemDraft", "Settings…", "⌘,"] : ["File", "Preferences…", "Ctrl+,"]);
+    for (const scheme of schemes) {
+      expect(tourSteps(scheme, platform).at(-1)!.text).toContain(`Choose ${owner.label} > ${item.label} (${item.shortcut}) to open Preferences.`);
+    }
+    if (platform !== "macos") {
+      // Off macOS the native File menu shows the native item's own title.
+      const source = readFileSync(resolve("apps", "desktop", "src-tauri", "src", "lib.rs"), "utf8");
+      const native = source.split("fn preferences_menu_item<R: Runtime>")[1]!.split("fn create_view_menu")[0]!;
+      expect(native).toContain(`"${item.label}",`);
+    }
+  });
+
+  it("clears a step's error when the step changes, forward or back", () => {
+    const onAction = vi.fn();
+    const render = (error?: string) => act(() => root.render(<TourForm scheme="chemdraft" platform={platform} onAction={onAction} error={error} />));
+    const alert = () => container.querySelector('[role="alert"]')?.textContent;
+    const missing = "Add Name to Structure from Plugins > Add or Remove Plugins, then try again.";
+    render();
+    for (let step = 1; step < 4; step++) click("Next");
+    expect(container.textContent).toContain("Step 4 of 7");
+    click("Try it");
+    render(missing);
+    expect(alert()).toBe(missing);
+
+    click("Next");
+    expect(container.textContent).toContain("Step 5 of 7");
+    expect(alert()).toBeUndefined();
+    click("Back");
+    expect(container.textContent).toContain("Step 4 of 7");
+    expect(alert()).toBeUndefined();
+
+    // A new action shows its own error again; leaving that step backward clears it too.
+    click("Try it");
+    render(undefined);
+    render(missing);
+    expect(alert()).toBe(missing);
+    click("Back");
+    expect(alert()).toBeUndefined();
+
+    // A late error from an action sent on an earlier step does not appear on the new one.
+    render(undefined);
+    click("Next");
+    click("Try it");
+    click("Next");
+    render("Late failure");
+    expect(container.textContent).toContain("Step 5 of 7");
+    expect(alert()).toBeUndefined();
+    click("Try it");
+    render(undefined);
+    render("Inspector failed");
+    expect(alert()).toBe("Inspector failed");
   });
 
   it("keeps public copy free of other drawing product names", () => {
