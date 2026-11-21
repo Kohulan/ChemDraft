@@ -1,3 +1,4 @@
+import { basename } from "@tauri-apps/api/path";
 import { CanvasContextMenu, NATIVE_CANVAS_MENU_CLOSED_EVENT } from "./CanvasContextMenu";
 import { buildObjectCanvasMenu, pageCanvasMenu, SET_DEFAULT_ARROW_STYLE_COMMAND_ID } from "./canvasContextMenuModel";
 import { RequestWriteError } from "@chemdraft/plugin-host";
@@ -1837,7 +1838,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.21.00.45-opus";
+const CURRENT_BUILD_STAMP = "11.21.13.40-sonnet";
 const TABLE_DRAFT_RECOVERY_WARNING = "session.tableDraftDropped";
 
 function clearTableDraftRecoveryWarnings(report: OpenWarningsReport | undefined): OpenWarningsReport | undefined {
@@ -10268,10 +10269,8 @@ export function MainWindow({
   }, [activateDocumentTab]);
 
   const documentTabOrder = documentTabs.map((tab) => tab.id).join(",");
-  const activeDocumentTabTitle = (() => {
-    const tab = documentTabs.find((candidate) => candidate.id === activeDocumentTabId);
-    return tab ? documentTabTitle(tab, fileState) : "";
-  })();
+  // The strip re-reveals the active tab when its title changes; the title is the tab's own, as drawn.
+  const activeDocumentTabTitle = documentTabs.find((candidate) => candidate.id === activeDocumentTabId)?.title ?? "";
   useLayoutEffect(() => {
     const scroll = pendingTabScrollRef.current;
     const canvas = canvasRegionRef.current;
@@ -10724,6 +10723,9 @@ export function MainWindow({
       previewArrangementSpacing: (tabId, percent) => previewSpacingRef.current(tabId, percent),
       applyArrangementSpacing: (tabId, percent) => applySpacingRef.current(tabId, percent),
       onSpacingSettled: tabId => { nativeSpacingSourcesRef.current.delete(tabId); }, onError: setStatus,
+      onPageEnlargementClosed: tabId => {
+        if (activeDocumentTabIdRef.current === tabId) canvasRegionRef.current?.focus({ preventScroll: true });
+      },
       export: (tabId, options, live, progress) => exportToTabRef.current(tabId, options, live, progress),
       previewExport: (tabId, options, live) => previewExportRef.current(tabId, options, live),
       chooseExportDestination: (tabId, options, live) => chooseExportDestinationRef.current(tabId, options, live),
@@ -10888,11 +10890,6 @@ export function MainWindow({
             }
           }
           if (!active) return;
-          const pristine = documentTabsRef.current.length === 1
-            && !nonPristineTabsRef.current.has(activeDocumentTabIdRef.current)
-            && !fileStateRef.current.path
-            && !fileStateRef.current.dirty
-            && documentIsBlank(documentRef.current);
           unrestoredSessionTabsRef.current = skipped;
           setUnrestoredSessionTabCount(skipped.length);
           const restoreNotice = unrestoredTabsNotice(skipped.length);
@@ -10905,7 +10902,16 @@ export function MainWindow({
             setStatus(`Could not restore the last session${restoreNotice}`);
             return;
           }
-          const restoredTabs = restored.map(({ id, session }) => ({ id, title: session.displayName }));
+          const restoredTabs = await Promise.all(restored.map(async ({ id, session }) => ({
+            id,
+            title: session.path ? await resolveNativePathBasename(session.path) : session.displayName
+          })));
+          if (!active) return;
+          const pristine = documentTabsRef.current.length === 1
+            && !nonPristineTabsRef.current.has(activeDocumentTabIdRef.current)
+            && !fileStateRef.current.path
+            && !fileStateRef.current.dirty
+            && documentIsBlank(documentRef.current);
           let tabs: Array<{ id: string; title: string }> = restoredTabs;
           if (!pristine) {
             snapshotDocumentTab(false);
@@ -11013,7 +11019,7 @@ export function MainWindow({
         const draft = tab.id === committedDraft?.tabId ? committedDraft : undefined;
         const tabDocument = draft?.document ?? (tab.id === activeDocumentTabIdRef.current ? flushed : snapshot.history.present);
         const file = draft ? { ...snapshot.file, dirty: draft.dirty } : snapshot.file;
-        const displayName = file.path ? nativePathBasename(file.path) : tab.title;
+        const displayName = tab.title;
         const warning = draft?.warning;
         const openWarnings = warning ? {
           displayName, sourceLabel: snapshot.warnings?.sourceLabel ?? "a recovered session",
@@ -11453,7 +11459,7 @@ export function MainWindow({
     const savedDocument = active ? documentForFlush() : savingDocument;
     // The baseline and payload describe the same single draft snapshot.
     let payload = createDocumentFileSave(savedDocument);
-    const finishSave = (path?: string) => {
+    const finishSave = (destination?: { path: string; displayName: string }) => {
       savedDocumentsRef.current.set(savingTabId, savedDocument);
       documentSaveRevisionsRef.current.set(savingTabId, (documentSaveRevisionsRef.current.get(savingTabId) ?? 0) + 1);
       nonPristineTabsRef.current.add(savingTabId);
@@ -11461,8 +11467,8 @@ export function MainWindow({
         documentTabSnapshotsRef.current.get(savingTabId)?.history.present;
       // The editor may have committed/cancelled (or its tab switched) while the write awaited I/O.
       const dirty = !currentDocument || !assistantDocumentContentUnchanged(savedDocument, currentDocument);
-      const nextFileState = { path: path ?? savingFileState.path, dirty };
-      const displayName = path ? nativePathBasename(path) : payload.filename;
+      const nextFileState = { path: destination?.path ?? savingFileState.path, dirty };
+      const displayName = destination?.displayName ?? payload.filename;
       const warningsReport: OpenWarningsReport | undefined = payload.warnings.length > 0 ? {
         operation: "save", displayName, sourceLabel: payload.kind === "binary" ? "ChemDraft CDX envelope" : "ChemDraft CDXML envelope", warnings: payload.warnings
       } : undefined;
@@ -11487,7 +11493,7 @@ export function MainWindow({
         });
       }
       const tabs = documentTabsRef.current.map((tab) => tab.id === savingTabId
-        ? { ...tab, title: path ? nativePathBasename(path) : tab.title } : tab);
+        ? { ...tab, title: destination?.displayName ?? tab.title } : tab);
       documentTabsRef.current = tabs;
       setDocumentTabs(tabs);
     };
@@ -11510,8 +11516,11 @@ export function MainWindow({
       }
       const finalPath = ensureChemDraftFileExtension(path);
       payload = createDocumentFileSave(savedDocument, finalPath);
-      await writeNativeExportResult(finalPath, payload);
-      finishSave(finalPath);
+      const [displayName] = await Promise.all([
+        resolveNativePathBasename(finalPath),
+        writeNativeExportResult(finalPath, payload)
+      ]);
+      finishSave({ path: finalPath, displayName });
       return true;
     } catch (error) {
       const message = `Save failed: ${error instanceof Error ? error.message : String(error)}`;
@@ -13081,7 +13090,17 @@ export function MainWindow({
     },
     requestPageSpace: {
       plan: planRequestPageFit,
-      confirm: signal => new PageEnlargementConsent(shortcutPlatform).confirm(signal)
+      confirm: async (signal, documentKey) => {
+        if (!isDesktopRuntime()) return new PageEnlargementConsent(shortcutPlatform).confirm(signal);
+        const coordinator = dialogCoordinatorRef.current;
+        // Own the question by the tab the request started in (resolved from the request document's
+        // key), not whichever tab is active now. A key with no tab means that document was closed.
+        const requestTabId = [...requestDocumentKeysRef.current].find(([, key]) => key === documentKey)?.[0];
+        if (coordinator && !requestTabId) return "unanswered";
+        if (coordinator) return coordinator.confirmPageEnlargement(requestTabId!, signal);
+        setStatus("Page enlargement could not open: the dialog host is unavailable.");
+        return signal?.aborted ? "keep" : "unanswered";
+      }
     },
     openRequestHistory: (document, label) => {
       const tabId = [...requestDocumentKeysRef.current].find(([, key]) => key === document.key)?.[0];
@@ -15936,15 +15955,20 @@ export function MainWindow({
     };
   }, [openWarningsListShown]);
 
-  // Label the web document by its worktree so browser tabs and accessibility state distinguish
-  // nearby checkouts. On macOS, index.html's initial title can overwrite the Rust setup title without
-  // following this later React update, so the Tauri page-load hook separately reasserts the same
-  // baked label on the native NSWindow title bar. See AGENTS.md.
+  const activeDocumentName = documentTabs.find((tab) => tab.id === activeDocumentTabId)?.title ?? document.title;
+  const nativeTitleWriteRef = useRef(Promise.resolve());
   useEffect(() => {
-    const tab = documentTabs.find((candidate) => candidate.id === activeDocumentTabId);
-    const name = fileState.path ? nativePathBasename(fileState.path) : tab?.title ?? document.title;
-    window.document.title = `${name}${fileState.dirty ? " •" : ""} — ChemDraft${__WORKTREE_LABEL__ ? ` — ${__WORKTREE_LABEL__}` : ""}`;
-  }, [activeDocumentTabId, document.title, documentTabs, fileState]);
+    const title = `${activeDocumentName}${fileState.dirty ? " •" : ""} — ChemDraft${__WORKTREE_LABEL__ ? ` — ${__WORKTREE_LABEL__}` : ""}`;
+    window.document.title = title;
+    if (!isDesktopRuntime()) return;
+    let current = true;
+    nativeTitleWriteRef.current = nativeTitleWriteRef.current.then(async () => {
+      const { invoke } = await import("@tauri-apps/api/core");
+      // With no label, Tauri sets the title of the invoking document window.
+      if (current) await invoke("plugin:window|set_title", { value: title });
+    }).catch((error: unknown) => console.warn("Could not update the document window title", error));
+    return () => { current = false; };
+  }, [activeDocumentName, fileState.dirty]);
 
   const handleOpenFile = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -23063,7 +23087,7 @@ export function MainWindow({
             {documentTabs.map((tab) => {
               const active = tab.id === activeDocumentTabId;
               const file = active ? fileState : documentTabSnapshotsRef.current.get(tab.id)?.file;
-              const title = documentTabTitle(tab, file);
+              const title = tab.title;
               return (
                 <div className="document-tab" key={tab.id} data-document-tab-id={tab.id} data-active={active}>
                   <button type="button" role="tab" aria-selected={active}
@@ -34288,9 +34312,8 @@ export function nativePathBasename(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
 }
 
-// The title a document tab shows: the file's name once it has a path, else the document's own title.
-function documentTabTitle(tab: { title: string }, file: NativeFileState | undefined): string {
-  return file?.path ? nativePathBasename(file.path) : tab.title;
+async function resolveNativePathBasename(path: string): Promise<string> {
+  return await basename(path).catch(() => undefined) ?? nativePathBasename(path);
 }
 
 export function nativePathDirname(path: string): string | undefined {
