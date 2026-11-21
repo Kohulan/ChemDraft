@@ -14053,11 +14053,17 @@ export interface ElectronMarkFollowOptions {
 }
 
 /**
- * The linear part of the map that takes `from` onto `to` (same length, paired by index): a least
- * squares affine fit, accepted only when it reproduces every pair. Two points, or points on one
- * line, fit a turn and a mirror equally (each with uniform scale): the caller's `motion` picks
+ * The turn or mirror that takes `from` onto `to` (same length, paired by index), as the map a
+ * moved atom's mark offset is turned or mirrored by: a least-squares similarity fit (rotation or
+ * reflection with uniform scale, plus translation), accepted only when it reproduces every pair
+ * within a negligible residual, i.e. only when the atoms moved as one rigid piece. A shear, an
+ * uneven stretch or a relayout fits no similarity: `undefined`, and the caller translates the mark
+ * with its atom. The fit's scale is dropped: a mark is a label-like glyph, so a bond-length change,
+ * a part resize or any other uniform scale of the atoms keeps its offset from its atom (a
+ * whole-object resize scales its marks itself, as part of the object, before this rule runs).
+ * Two points, or points on one line, fit a turn and a mirror equally: the caller's `motion` picks
  * one, and without it the map is the identity (the offset is translated only, never guessed) as
- * long as either fits. `undefined` when no single map explains the motion.
+ * long as either fits.
  */
 function fittedOffsetMap(from: readonly PagePoint[], to: readonly PagePoint[], motion?: AtomMotion): OffsetMap | undefined {
   const count = from.length;
@@ -14083,36 +14089,43 @@ function fittedOffsetMap(from: readonly PagePoint[], to: readonly PagePoint[], m
     }
     return true;
   };
-  const det = sxx * syy - sxy * sxy;
-  if (count >= 3 && det > 1e-9 * scale * scale) {
-    const map = {
-      a: (uxx * syy - uxy * sxy) / det, b: (uxy * sxx - uxx * sxy) / det,
-      c: (uyx * syy - uyy * sxy) / det, d: (uyy * sxx - uyx * sxy) / det
-    };
-    return fits(map) ? map : undefined;
-  }
   if (sxx + syy <= 1e-9) return fits(IDENTITY_OFFSET_MAP) ? IDENTITY_OFFSET_MAP : undefined;
-  // Least-squares similarity fits: a turn [[c, -s], [s, c]] and a mirror [[m, n], [n, -m]].
+  // Least-squares similarity fits: a turn [[c, -s], [s, c]] and a mirror [[m, n], [n, -m]], each
+  // with its uniform scale. Only these are rigid (up to scale); a general affine fit would turn
+  // any three atoms' relayout into an exact "map" that shears the mark's offset.
   const norm = sxx + syy;
   const cos = (uxx + uyy) / norm, sin = (uyx - uxy) / norm;
   const turn: OffsetMap = { a: cos, b: -sin, c: sin, d: cos };
   const m = (uxx - uyy) / norm, n = (uxy + uyx) / norm;
   const mirror: OffsetMap = { a: m, b: n, c: n, d: -m };
+  /** The map without its scale: the mark's offset is turned or mirrored, never stretched. */
+  const unscaled = (map: OffsetMap): OffsetMap | undefined => {
+    const size = Math.sqrt(Math.abs(map.a * map.d - map.b * map.c));
+    return size > 1e-9 ? { a: map.a / size, b: map.b / size, c: map.c / size, d: map.d / size } : undefined;
+  };
+  const det = sxx * syy - sxy * sxy;
+  if (count >= 3 && det > 1e-9 * scale * scale) {
+    // Points spread in two dimensions tell a turn from a mirror by themselves.
+    if (fits(turn)) return unscaled(turn);
+    if (fits(mirror)) return unscaled(mirror);
+    return undefined;
+  }
   if (motion) {
     const map = motion === "turn" ? turn : mirror;
-    return fits(map) ? map : undefined;
+    return fits(map) ? unscaled(map) : undefined;
   }
   return fits(turn) || fits(mirror) ? IDENTITY_OFFSET_MAP : undefined;
 }
 
 /**
- * How a molecule's atoms moved: the offset map a moved atom's marks are turned, mirrored or scaled
- * by. Fitted to every atom when one map explains them all (a whole-molecule translate, rotate,
- * flip or scale), else to the atoms the edit displaced (a part move or turn). A relayout (Clean
- * Up, 3D flatten) that no single map explains translates each mark with its own atom, keeping its
- * offset. The map applies only to marks of atoms that moved: whether an atom moved is read from
- * its own page position, never from the fit (an atom a turn leaves in place keeps its marks
- * exactly where they were, even when every atom fits the turn).
+ * How a molecule's atoms moved: the offset map a moved atom's marks are turned or mirrored by.
+ * Fitted to every atom when they all moved as one rigid piece (a whole-molecule translate, rotate,
+ * flip or uniform scale), else to the atoms the edit displaced when those moved rigidly (a part
+ * move or turn). A relayout (Clean Up, 3D flatten), a shear, an uneven stretch, or a move of one
+ * atom against the rest fits no turn or mirror, and translates each mark with its own atom,
+ * keeping its offset exactly. The map applies only to marks of atoms that moved: whether an atom
+ * moved is read from its own page position, never from the fit (an atom a turn leaves in place
+ * keeps its marks exactly where they were, even when every atom fits the turn).
  */
 function moleculeOffsetMap(before: MoleculeObject, after: MoleculeObject, motion?: AtomMotion): OffsetMap {
   const afterAtoms = new Map(after.atoms.map((atom) => [atom.id, atom]));

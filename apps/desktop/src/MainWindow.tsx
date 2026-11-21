@@ -28273,6 +28273,9 @@ export function pruneNativeMoleculePart(
 
   const atomIds = part.atomIds.filter((atomId) => object.atoms.some((atom) => atom.id === atomId));
   const bondIds = part.bondIds.filter((bondId) => object.bonds.some((bond) => bond.id === bondId));
+  // Nothing pruned: keep the identity, so an edit that keeps every atom (an arrow-key nudge) does not
+  // churn the part selection, which would end the nudge burst and split it into one Undo per press.
+  if (atomIds.length === part.atomIds.length && bondIds.length === part.bondIds.length) return part;
   return atomIds.length > 0 || bondIds.length > 0 ? { ...part, atomIds, bondIds } : undefined;
 }
 

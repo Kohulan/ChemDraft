@@ -14,7 +14,7 @@ import { MainWindow } from "./MainWindow";
 import * as workflow from "./documentWorkflow";
 import { DOM_COMMAND_EVENT } from "./window-manager";
 import { ammoniumElectronMarkDropFixture, dropMark, dropMolecule, electronMarkDropFixture,
-  fourBondNitrogenElectronMarkDropFixture } from "./testSupport/electronMarkDropFixture";
+  fourBondNitrogenElectronMarkDropFixture, threeAtomChainElectronMarkFixture } from "./testSupport/electronMarkDropFixture";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -357,6 +357,54 @@ describe.each(["macos", "windows"] as const)("charge always follows its atom (%s
       expectNoChargeReport();
       await expectSingleUndo(before, after, "Move");
     });
+
+    /** Press ArrowDown `presses` times in one burst, with the given atoms of a three-atom chain part-selected. */
+    async function nudgeDown(document: ChemDraftDocument, moleculeId: string, atomIds: readonly string[], presses: number) {
+      await mount(workflow.selectDocumentObjects(document, document.pages[0].id, []));
+      for (const atomId of atomIds) await shiftClickAtom(moleculeId, atomPagePoint(document, moleculeId, atomId));
+      vi.spyOn(Date, "now").mockReturnValue(Date.now());
+      const before = snapshot();
+      for (let press = 0; press < presses; press++) {
+        await act(async () => page().dispatchEvent(new KeyboardEvent("keydown", {
+          key: "ArrowDown", repeat: press > 0, bubbles: true, cancelable: true
+        })));
+      }
+      return { before, after: snapshot() };
+    }
+    /** The mark moved by exactly its atom's displacement (1.2.3 hands-on: it moved by more, or drifted). */
+    function expectMovedByAtomDisplacement(before: ChemDraftDocument, after: ChemDraftDocument, charged: Charged, displacement: Point) {
+      const from = atomPagePoint(before, charged.moleculeId, charged.atomId), to = atomPagePoint(after, charged.moleculeId, charged.atomId);
+      expect(to.x - from.x).toBeCloseTo(displacement.x, 9);
+      expect(to.y - from.y).toBeCloseTo(displacement.y, 9);
+      const start = workflow.nativeChargeMarkCenter(markOf(before, charged.markId));
+      const end = workflow.nativeChargeMarkCenter(markOf(after, charged.markId));
+      expect(Math.abs(end.x - start.x - displacement.x), "the mark moves by its atom's displacement (x)").toBeLessThan(1e-6);
+      expect(Math.abs(end.y - start.y - displacement.y), "the mark moves by its atom's displacement (y)").toBeLessThan(1e-6);
+      expect(markOf(after, charged.markId).rotation).toBe(markOf(before, charged.markId).rotation);
+      expectChargeFollowed(before, after, charged);
+    }
+
+    it("nudging one marked atom 12 times moves its radical by exactly the same vector", async () => {
+      // Propane with a radical dot on the middle carbon, only that carbon selected.
+      const { document, moleculeId, markedAtomId } = threeAtomChainElectronMarkFixture("CCC", 1, { kind: "radical-dot" });
+      const charged: Charged = { document, moleculeId, atomId: markedAtomId, markId: dropMark(document).id };
+      expectChargedFixture(charged);
+      const { before, after } = await nudgeDown(document, moleculeId, [markedAtomId], 12);
+      expectMovedByAtomDisplacement(before, after, charged, { x: 0, y: 12 });
+      expectNoChargeReport();
+      await expectSingleUndo(before, after, "Move");
+    });
+
+    it("nudging two atoms keeps the + offset exactly", async () => {
+      // Ethylamine C–C–N+ with N and the middle carbon selected.
+      const { document, moleculeId, atomIds, markedAtomId } = threeAtomChainElectronMarkFixture("CCN", 2);
+      const charged: Charged = { document, moleculeId, atomId: markedAtomId, markId: dropMark(document).id };
+      expectChargedFixture(charged);
+      const { before, after } = await nudgeDown(document, moleculeId, [markedAtomId, atomIds[1]], 10);
+      expectMovedByAtomDisplacement(before, after, charged, { x: 0, y: 10 });
+      expectNoChargeReport();
+      await expectSingleUndo(before, after, "Move");
+    });
   });
 
   describe("whole-molecule and multi-object drags", () => {
@@ -454,7 +502,9 @@ describe.each(["macos", "windows"] as const)("charge always follows its atom (%s
       expectKeptThrough(before, after, charged, 1);
     });
 
-    it.each(variants)("doubling the bond length of the $name keeps the mark one scaled offset from its atom", async ({ build }) => {
+    // 1.2.3: the mark is a label-like glyph; a bond-length change scales the atoms, not the mark or
+    // its offset from its atom (it was scaled with the bonds and ended a bond length off).
+    it.each(variants)("doubling the bond length of the $name keeps the mark at its offset from its atom", async ({ build }) => {
       const charged = build();
       expectChargedFixture(charged);
       await mount(workflow.selectDocumentObjects(charged.document, charged.document.pages[0].id, [charged.moleculeId]));
@@ -462,7 +512,8 @@ describe.each(["macos", "windows"] as const)("charge always follows its atom (%s
       await command("molecule.structure.bondLength:44");
       const after = snapshot();
       expectAtomMoved(before, after, charged, 1);
-      expectKeptThrough(before, after, charged, 2);
+      expectKeptThrough(before, after, charged, 1);
+      expectChargeFollowed(before, after, charged);
     });
   });
 

@@ -9,8 +9,10 @@ import { nativeSingleBondGraphMetadata, nativeSingleBondGraphSmiles, phase4Times
 import { testMoleculeFromSmiles } from "@chemdraft/layout-engine/testing";
 import { depictSmiles2D, ensureOclResources, perceiveDoubleBondStereoFromMolfile, relayoutMolfile2D } from "@chemdraft/ocl-adapter";
 import * as workflow from "./documentWorkflow";
-import { commitChemistryRefusals, marksFollowAtoms, structureEditorChemistry } from "./commitChemistryGuard";
-import { dropMark, dropMolecule, electronMarkDropFixture } from "./testSupport/electronMarkDropFixture";
+import { commitChemistryRefusals, marksFollowAtoms, selectionTransformChemistry, structureEditorChemistry } from "./commitChemistryGuard";
+import { resolveElectronMarksAfterMoleculePartMove, resolveElectronMarksInSelectionTransform } from "./electronMarkDrop";
+import { arrowNudgeOffset } from "./keyboardShortcuts";
+import { dropMark, dropMolecule, electronMarkDropFixture, threeAtomChainElectronMarkFixture } from "./testSupport/electronMarkDropFixture";
 
 type Point = { x: number; y: number };
 
@@ -406,5 +408,130 @@ describe("charge always follows: a partial double-bond reflection (round 4)", ()
     const committed = workflow.normalizeCommittedDocument(followed.document);
     expect(owner(committed, mark.id)).toEqual({ objectId: molecule.id, atomId: onLine.id });
     expect(dropMolecule(committed).atoms.map(chemistry)).toEqual(dropMolecule(document).atoms.map(chemistry));
+  });
+});
+
+describe("charge always follows: a mark keeps its exact offset unless its atoms turned or mirrored rigidly (1.2.3 hands-on)", () => {
+  beforeAll(async () => { await ensureOclResources(); });
+
+  /** The mark's center minus its atom's page point. */
+  function chainOffset(document: ChemDraftDocument, atomId: string): Point {
+    const molecule = dropMolecule(document);
+    const atom = transformPointForObject(molecule, molecule.atoms.find(candidate => candidate.id === atomId)!);
+    const center = markCenter(document);
+    return { x: center.x - atom.x, y: center.y - atom.y };
+  }
+  function atomPoint(document: ChemDraftDocument, atomId: string): Point {
+    const molecule = dropMolecule(document);
+    return transformPointForObject(molecule, molecule.atoms.find(candidate => candidate.id === atomId)!);
+  }
+  /** As the commit funnel runs it (`prepareDocumentCommit`): follow from `before`, then normalize. */
+  const commit = (before: ChemDraftDocument, next: ChemDraftDocument, policy = selectionTransformChemistry("move")) =>
+    workflow.normalizeCommittedDocument(workflow.carryElectronMarksWithMovedAtoms(before, next, policy));
+  function expectOffsetKept(before: ChemDraftDocument, after: ChemDraftDocument, atomId: string, tolerance = 1e-6) {
+    const original = chainOffset(before, atomId), kept = chainOffset(after, atomId);
+    expect(Math.abs(kept.x - original.x), `offset x ${kept.x} vs ${original.x}`).toBeLessThan(tolerance);
+    expect(Math.abs(kept.y - original.y), `offset y ${kept.y} vs ${original.y}`).toBeLessThan(tolerance);
+    expect(dropMark(after).rotation).toBe(dropMark(before).rotation);
+    expect(owner(after, dropMark(before).id)).toEqual({ objectId: dropMolecule(before).id, atomId });
+    expect(dropMolecule(after).atoms.map(chemistry)).toEqual(dropMolecule(before).atoms.map(chemistry));
+  }
+  function expectAtomMoved(before: ChemDraftDocument, after: ChemDraftDocument, atomId: string, atLeast: number) {
+    const from = atomPoint(before, atomId), to = atomPoint(after, atomId);
+    expect(Math.hypot(to.x - from.x, to.y - from.y), "the edit moves the marked atom").toBeGreaterThan(atLeast);
+  }
+  /** C–C–N+ with the far carbon dragged off (a part drag, as the app runs it), distorting the chain. */
+  function distortedEthylamine() {
+    const fixture = threeAtomChainElectronMarkFixture("CCN", 2);
+    const [farCarbon] = fixture.atomIds;
+    const dragged = workflow.moveNativeMoleculeParts(fixture.document, { objectId: fixture.moleculeId, kind: "atom", atomId: farCarbon }, { x: -14, y: 30 });
+    const document = commit(fixture.document, resolveElectronMarksAfterMoleculePartMove(fixture.document, dragged).document);
+    expect(markCenter(document), "dragging the far carbon leaves N's mark").toEqual(markCenter(fixture.document));
+    expect(dropMolecule(document).atoms[2]).toMatchObject({ formalCharge: 1 });
+    return { ...fixture, document };
+  }
+
+  it("Clean Up of a distorted ethylamine keeps the + at its offset from N", () => {
+    const { document, moleculeId, markedAtomId } = distortedEthylamine();
+    const cleaned = workflow.cleanUpNativeMolecules2d(document, [moleculeId]);
+    expectAtomMoved(document, cleaned, markedAtomId, 0.5);
+    const committed = commit(document, cleaned, undefined);
+    expectOffsetKept(document, committed, markedAtomId);
+  });
+
+  it("an engine 2D relayout of a distorted ethylamine keeps the + at its offset from N", () => {
+    const { document, moleculeId, markedAtomId } = distortedEthylamine();
+    const relaid = workflow.applyNativeMoleculeEngineRelayout(document, moleculeId, relayoutMolfile2D);
+    expectAtomMoved(document, relaid, markedAtomId, 0.5);
+    expectOffsetKept(document, commit(document, relaid, undefined), markedAtomId);
+  });
+
+  it("bond-length scaling keeps the mark offset", () => {
+    const { document, moleculeId, markedAtomId } = threeAtomChainElectronMarkFixture("CCN", 2);
+    const scaled = workflow.applyMoleculeTargetBondLength(document, [moleculeId], 44);
+    expectAtomMoved(document, scaled, markedAtomId, 1);
+    expectOffsetKept(document, commit(document, scaled, undefined), markedAtomId);
+  });
+
+  /** Arrow-key nudges as the app runs them: each press from the current document, the first one
+   * committed and the rest amending that entry (both through the commit funnel's follow). */
+  function nudge(document: ChemDraftDocument, moleculeId: string, atomIds: readonly string[], bondIds: readonly string[],
+    presses: number) {
+    const fragments = [{ objectId: moleculeId, atomIds, bondIds }];
+    const delta = arrowNudgeOffset("ArrowDown")!;
+    let current = workflow.selectDocumentObjects(document, document.pages[0].id, []);
+    for (let press = 0; press < presses; press++) {
+      const { document: transformed } = workflow.moveCanvasSelectionWithPositions(current, fragments, delta);
+      const result = resolveElectronMarksInSelectionTransform(current, transformed);
+      expect(result.independentlyMovedMarkIds.size).toBe(0);
+      current = commit(current, result.document, selectionTransformChemistry("move", result.independentlyMovedMarkIds));
+    }
+    return current;
+  }
+
+  it("nudging one marked atom 12 times moves its radical by exactly the same vector", () => {
+    const { document, moleculeId, markedAtomId } = threeAtomChainElectronMarkFixture("CCC", 1, { kind: "radical-dot" });
+    expect(dropMolecule(document).atoms[1].markRadicals).toBe(1);
+    const nudged = nudge(document, moleculeId, [markedAtomId], [], 12);
+    const from = atomPoint(document, markedAtomId), to = atomPoint(nudged, markedAtomId);
+    expect(to.x - from.x).toBeCloseTo(0, 9);
+    expect(to.y - from.y).toBeCloseTo(12, 9);
+    const start = markCenter(document), end = markCenter(nudged);
+    expect(Math.abs(end.x - start.x - (to.x - from.x))).toBeLessThan(1e-6);
+    expect(Math.abs(end.y - start.y - (to.y - from.y))).toBeLessThan(1e-6);
+    expectOffsetKept(document, nudged, markedAtomId);
+  });
+
+  it("nudging two atoms keeps the + offset exactly", () => {
+    const { document, moleculeId, atomIds, bondIds, markedAtomId } = threeAtomChainElectronMarkFixture("CCN", 2);
+    const nudged = nudge(document, moleculeId, [atomIds[1], markedAtomId], [bondIds[1]], 10);
+    expectAtomMoved(document, nudged, markedAtomId, 9);
+    expectOffsetKept(document, nudged, markedAtomId);
+  });
+
+  it("a part-selection resize carries the mark of a resized atom at its offset", () => {
+    // Choice (1.2.3): a part resize scales atom positions only; the mark is a label-like glyph that
+    // the resize does not scale, so it keeps its exact offset from its atom. (A whole-object resize
+    // scales the mark with the object, its size and offset alike: electronMarkDrop.test.ts.)
+    const { document, moleculeId, atomIds, bondIds, markedAtomId } = threeAtomChainElectronMarkFixture("CCN", 2);
+    const selected = workflow.selectDocumentObjects(document, document.pages[0].id, []);
+    const resized = workflow.resizeNativeMoleculeParts(selected,
+      { objectId: moleculeId, kind: "parts", atomIds: [atomIds[1], markedAtomId], bondIds: [bondIds[1]] }, { x: 2.5, y: 2.5 });
+    expectAtomMoved(selected, resized, markedAtomId, 10);
+    const edit = resolveElectronMarksInSelectionTransform(selected, resized);
+    const committed = commit(selected, edit.document, selectionTransformChemistry("resize", edit.independentlyMovedMarkIds));
+    expectOffsetKept(selected, committed, markedAtomId);
+  });
+
+  it("a uniform scale of the whole molecule's atoms keeps the offset; a rigid turn of the chain still turns it", () => {
+    const { document, moleculeId, atomIds, markedAtomId } = threeAtomChainElectronMarkFixture("CCN", 2);
+    const pivot = { x: 190, y: 240 };
+    const scaled = mapAtoms(document, atomIds, ({ x, y }) => ({ x: pivot.x + 1.7 * (x - pivot.x), y: pivot.y + 1.7 * (y - pivot.y) }));
+    expectOffsetKept(document, commit(document, scaled, undefined), markedAtomId);
+    const turned = mapAtoms(document, atomIds, turnAbout(pivot, Math.PI / 2));
+    const original = chainOffset(document, markedAtomId), kept = chainOffset(commit(document, turned, undefined), markedAtomId);
+    expect(kept.x).toBeCloseTo(-original.y, 6);
+    expect(kept.y).toBeCloseTo(original.x, 6);
+    expect(moleculeId).toBe(dropMolecule(document).id);
   });
 });
