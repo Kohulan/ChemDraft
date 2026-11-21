@@ -637,8 +637,14 @@ def type_into_field(session, Atspi, settings):
     name = field.get_name()
     role = field.get_role_name()
     if field.get_role() not in (Atspi.Role.SPIN_BUTTON, Atspi.Role.ENTRY):
-        print(f"Note: {name!r} has the AT-SPI role {role!r}, not spin button or entry; "
+        print(f"Warning: {name!r} has the AT-SPI role {role!r}, not spin button or entry; "
               "it was chosen by its label and editable state", flush=True)
+        distro = os.environ.get("DISTRO")
+        distro_text = f" on {distro}" if distro else ""
+        print("::warning title=AppImage accessibility::"
+              f"The {session.package} package{distro_text} reports the toolbar number field "
+              f"{name!r} with the AT-SPI role {role!r}; the .deb reports 'entry'. "
+              "This may be an accessibility regression", flush=True)
     before = field_value(Atspi, field)
     extents = Atspi.Component.get_extents(field, Atspi.CoordType.SCREEN)
     if extents.width <= 4 or extents.height <= 4:
