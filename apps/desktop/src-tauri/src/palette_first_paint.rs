@@ -23,11 +23,15 @@
 //! prompt, a quit), the reveal is held instead, and the held palette is shown when the document
 //! window is restored or focused again, or when a deferred restoration of the floating windows
 //! finishes ([`release_held`]). Reopening a held palette shows it at once.
+//!
+//! Each reveal writes one debug line to the `chemdraft::windows_activation` log (on with the agent
+//! bridge diagnostics): `palette reveal label=<label> ms=<since the window was built>
+//! trigger=<ack|fallback|release> result=<shown|held|abandoned|error>`, so a Windows test can read
+//! the reveal timings without sampling the screen.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
-#[cfg(windows)]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tauri::window::Color;
 use tauri::{Manager, Runtime, WebviewWindow, WebviewWindowBuilder};
@@ -55,17 +59,25 @@ pub(crate) enum FirstShow {
 }
 
 /// `--cd-bg-panel` in `App.css`, the background of `palette-window-*` and
-/// `palette-popover-window-*`. Palettes have no dark theme: only the light palette exists.
+/// `palette-popover-window-*`, and of a palette or popover page before React has mounted
+/// (`html[data-cd-first-frame="panel"]`, set by `index.html`). The app has no dark theme and no
+/// theme setting: `App.css` defines only the light tokens, whatever the system appearance.
 pub(crate) const PANEL_BACKGROUND: Color = Color(0xee, 0xf1, 0xef, 0xff);
 
 /// `--cd-bg-control-opaque` in `App.css` (white at 96%) composited over white, the tooltip window's
 /// background.
 pub(crate) const TOOLTIP_BACKGROUND: Color = Color(0xff, 0xff, 0xff, 0xff);
 
-/// How long a palette waits for its page before the fallback shows it anyway. The same as the
-/// helper's other caller; a palette page acknowledges well within it.
-#[cfg(windows)]
-pub(crate) const TOOLBAR_FIRST_PAINT_FALLBACK: Duration = Duration::from_millis(1500);
+/// How long a palette waits for its page before the fallback shows it anyway.
+///
+/// The fallback exists only for a page that never paints; a page that paints acknowledges, and
+/// that shows the palette. So it must not fire before a slow but healthy page paints: a Windows VM
+/// cold start (dev build, a 20-tab session restored at launch) measured up to 4.0 s from the
+/// hidden palette window being created to its first content, and at 1.5 s the fallback fired on
+/// every palette and showed each one empty for up to 1.8 s. Warm opens acknowledge within a few
+/// hundred milliseconds.
+#[cfg_attr(not(windows), allow(dead_code))] // only Windows palettes wait for their first paint
+pub(crate) const TOOLBAR_FIRST_PAINT_FALLBACK: Duration = Duration::from_millis(5000);
 
 /// The decision: which kinds use the first-paint helper, on which platform.
 pub(crate) fn first_show(kind: PaletteWindowKind, windows: bool) -> FirstShow {
@@ -135,6 +147,8 @@ struct Pending {
     armed: bool,
     /// The first-paint reveal ran and was held.
     held: bool,
+    /// When the window was armed, just after it was built; for the reveal log.
+    armed_at: Option<Instant>,
 }
 
 impl Pending {
@@ -143,6 +157,7 @@ impl Pending {
             wanted,
             armed: false,
             held: false,
+            armed_at: None,
         }
     }
 }
@@ -164,14 +179,18 @@ impl PendingReveals {
 
     /// A palette was just built hidden and armed. A close that arrived after the open request
     /// (before or during the build, or before this arm) is kept: the reveal will abandon it.
+    /// Returns when it was armed.
     #[cfg_attr(not(windows), allow(dead_code))] // only Windows palettes are armed
-    pub(crate) fn armed(&mut self, label: &str) {
+    pub(crate) fn armed(&mut self, label: &str) -> Instant {
         let pending = self
             .0
             .entry(label.to_owned())
             .or_insert(Pending::requested(true));
+        let now = Instant::now();
         pending.armed = true;
         pending.held = false;
+        pending.armed_at = Some(now);
+        now
     }
 
     /// The user closed the palette. Recorded even before the window exists or is armed, so the
@@ -243,6 +262,14 @@ impl PendingReveals {
             .collect()
     }
 
+    /// How long ago `label` was armed, if it is still tracked.
+    fn since_armed(&self, label: &str) -> Option<Duration> {
+        self.0
+            .get(label)
+            .and_then(|pending| pending.armed_at)
+            .map(|at| at.elapsed())
+    }
+
     /// Retry a held reveal. A palette whose first-paint reveal has not run yet is left to it.
     pub(crate) fn release(&mut self, label: &str, conditions: RevealConditions) -> Reveal {
         match self.0.get(label) {
@@ -276,7 +303,7 @@ fn conditions<R: Runtime>(window: &WebviewWindow<R>) -> RevealConditions {
 #[cfg(windows)]
 pub(crate) fn arm_toolbar<R: Runtime>(window: &WebviewWindow<R>) {
     let label = window.label().to_owned();
-    pending().armed(&label);
+    let armed_at = pending().armed(&label);
     window.on_window_event(move |event| {
         if matches!(event, tauri::WindowEvent::Destroyed) {
             pending().forget(&label);
@@ -289,16 +316,41 @@ pub(crate) fn arm_toolbar<R: Runtime>(window: &WebviewWindow<R>) {
             let conditions = conditions(window);
             match pending().first_paint(window.label(), conditions) {
                 Reveal::Show => Ok(()),
-                reveal => Err(format!("palette first show declined: {reveal:?}")),
+                reveal => Err(declined(reveal).to_owned()),
             }
         },
-        |window, shown| {
-            if let Err(error) = shown {
-                log::debug!(target: "chemdraft::windows_activation",
-                    "palette first paint label={} result={error}", window.label());
-            }
+        move |window, trigger, shown| {
+            log::debug!(target: "chemdraft::windows_activation", "{}",
+                reveal_log_line(window.label(), Some(armed_at.elapsed()), trigger.name(), &shown));
         },
     );
+}
+
+/// The `result=` of a reveal that did not show the palette.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn declined(reveal: Reveal) -> &'static str {
+    match reveal {
+        Reveal::Show => "shown",
+        Reveal::Hold => "held",
+        Reveal::Abandon => "abandoned",
+        Reveal::NotPending => "not pending",
+    }
+}
+
+/// The one debug line written per palette reveal (see the module docs). `since_built` is `None`
+/// only if the palette was no longer tracked.
+fn reveal_log_line(
+    label: &str,
+    since_built: Option<Duration>,
+    trigger: &str,
+    result: &Result<(), String>,
+) -> String {
+    let ms = since_built.map_or_else(|| "?".to_owned(), |since| since.as_millis().to_string());
+    let result = match result {
+        Ok(()) => "shown",
+        Err(error) => error.as_str(),
+    };
+    format!("palette reveal label={label} ms={ms} trigger={trigger} result={result}")
 }
 
 /// Whether new palettes on this platform wait for their first paint (Windows). Elsewhere nothing is
@@ -346,24 +398,28 @@ pub(crate) fn release_held<R: Runtime>(app: &tauri::AppHandle<R>) {
         &PENDING,
         |label| app.get_webview_window(label),
         conditions,
-        |window| {
-            if let Err(error) = window.show() {
+        |window, since_built| {
+            let shown = window.show().map_err(|error| error.to_string());
+            if let Err(error) = &shown {
                 eprintln!(
                     "Could not show ChemDraft palette {}: {error}",
                     window.label()
                 );
             }
+            log::debug!(target: "chemdraft::windows_activation", "{}",
+                reveal_log_line(window.label(), since_built, "release", &shown));
         },
     );
 }
 
 /// [`release_held`] with the window lookup, the conditions and the show passed in, so tests can
-/// drive it without a runtime. `show` runs with the registry unlocked.
+/// drive it without a runtime. `show` runs with the registry unlocked and receives how long ago
+/// the palette was built.
 fn release_held_in<W>(
     reveals: &Mutex<PendingReveals>,
     window: impl Fn(&str) -> Option<W>,
     conditions: impl Fn(&W) -> RevealConditions,
-    show: impl Fn(&W),
+    show: impl Fn(&W, Option<Duration>),
 ) {
     let lock = || reveals.lock().unwrap_or_else(PoisonError::into_inner);
     let labels = lock().held();
@@ -373,9 +429,15 @@ fn release_held_in<W>(
             continue;
         };
         let conditions = conditions(&window);
-        let reveal = lock().release(&label, conditions);
+        let (since_built, reveal) = {
+            let mut reveals = lock();
+            (
+                reveals.since_armed(&label),
+                reveals.release(&label, conditions),
+            )
+        };
         if reveal == Reveal::Show {
-            show(&window);
+            show(&window, since_built);
         }
     }
 }
@@ -433,11 +495,64 @@ mod tests {
         );
         assert!(rule("html.palette-tooltip-window-html,")
             .contains("background: var(--cd-bg-control-opaque);"));
-        // No dark palette theme exists for the first frame to follow.
+        // Before React mounts, palette and popover pages paint the same token from their first
+        // frame (`index.html` sets the attribute synchronously), and the tooltip page its own.
+        assert!(rule("html[data-cd-first-frame=\"panel\"] {")
+            .contains("background: var(--cd-bg-panel);"));
+        assert!(rule("html[data-cd-first-frame=\"tooltip\"] {")
+            .contains("background: var(--cd-bg-control-opaque);"));
+        // No dark theme exists for the first frame to follow: App.css has only light tokens and
+        // no theme attribute or media query switches them.
         assert!(!css.contains("prefers-color-scheme"));
+        assert!(!css.contains("data-theme"));
         for color in [PANEL_BACKGROUND, TOOLTIP_BACKGROUND] {
             assert_eq!(color.3, 0xff, "opaque, like the palette windows");
         }
+    }
+
+    #[test]
+    fn the_fallback_waits_past_a_slow_cold_start_first_paint() {
+        // A Windows VM cold start measured up to 4.0 s from window creation to first content.
+        assert_eq!(TOOLBAR_FIRST_PAINT_FALLBACK, Duration::from_secs(5));
+        let source = include_str!("palette_first_paint.rs");
+        let arm = &source[source.find("pub(crate) fn arm_toolbar<").unwrap()..];
+        assert!(arm[..arm.find("\n}\n").unwrap()].contains("TOOLBAR_FIRST_PAINT_FALLBACK,"));
+    }
+
+    #[test]
+    fn each_reveal_writes_one_log_line_with_its_label_timing_and_trigger() {
+        assert_eq!(
+            reveal_log_line(
+                "toolset-core-main",
+                Some(Duration::from_millis(1681)),
+                "fallback",
+                &Ok(())
+            ),
+            "palette reveal label=toolset-core-main ms=1681 trigger=fallback result=shown"
+        );
+        assert_eq!(
+            reveal_log_line(
+                "toolset-core-art",
+                Some(Duration::from_millis(177)),
+                crate::first_paint::FirstPaintTrigger::Acknowledged.name(),
+                &Err(declined(Reveal::Hold).to_owned())
+            ),
+            "palette reveal label=toolset-core-art ms=177 trigger=ack result=held"
+        );
+        assert_eq!(
+            reveal_log_line("toolset-core-main", None, "release", &Err("gone".into())),
+            "palette reveal label=toolset-core-main ms=? trigger=release result=gone"
+        );
+        assert_eq!(declined(Reveal::Abandon), "abandoned");
+        // The armed time is kept for a held reveal released later.
+        let mut reveals = PendingReveals::default();
+        reveals.armed("toolset-core-main");
+        assert!(reveals.since_armed("toolset-core-main").is_some());
+        assert_eq!(reveals.since_armed("toolset-core-other"), None);
+        // One line per reveal: the first-paint hook logs every outcome, and release logs its show.
+        let source = include_str!("palette_first_paint.rs");
+        let code = &source[..source.find("#[cfg(test)]\nmod tests").unwrap()];
+        assert_eq!(code.matches("reveal_log_line(window.label()").count(), 2);
     }
 
     #[test]
@@ -668,7 +783,10 @@ mod tests {
                 &reveals,
                 |label| (label == palette.label).then_some(&palette),
                 |_| state.get(),
-                |window| window.shows.set(window.shows.get() + 1),
+                |window, since_built| {
+                    assert!(since_built.is_some(), "the reveal log knows its build time");
+                    window.shows.set(window.shows.get() + 1);
+                },
             )
         };
         // The page paints during a native prompt: held.

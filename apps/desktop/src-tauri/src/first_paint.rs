@@ -78,14 +78,15 @@ fn first_frame_background(color: Color) -> Color {
 ///
 /// Two hooks run once, on the main thread, at the reveal:
 /// `before_show` may decline it (the window stays hidden and its error goes to `after_show`), and
-/// `after_show` receives the result of `show()`. Neither runs if the window is destroyed first;
+/// `after_show` receives what triggered the reveal ([`FirstPaintTrigger`]) and the result of
+/// `show()`. Neither runs if the window is destroyed first;
 /// both are dropped then.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn arm_first_paint_fallback_with<R: Runtime>(
     window: &WebviewWindow<R>,
     timeout: Duration,
     before_show: impl FnOnce(&WebviewWindow<R>) -> Result<(), String> + Send + 'static,
-    after_show: impl FnOnce(&WebviewWindow<R>, Result<(), String>) + Send + 'static,
+    after_show: impl FnOnce(&WebviewWindow<R>, FirstPaintTrigger, Result<(), String>) + Send + 'static,
 ) {
     let (generation, revealed) =
         arm_and_consume_early_ack(window, Hooks::new(before_show, after_show));
@@ -102,7 +103,7 @@ pub fn arm_first_paint_fallback_with<R: Runtime>(
     schedule(timeout, move || {
         let target = fallback.clone();
         let _ = fallback.run_on_main_thread(move || {
-            reveal(&target, Some(generation));
+            reveal(&target, Some(generation), FirstPaintTrigger::Fallback);
         });
     });
 }
@@ -112,7 +113,27 @@ pub fn arm_first_paint_fallback_with<R: Runtime>(
 /// armed. Main thread.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn show_after_first_paint<R: Runtime>(window: &WebviewWindow<R>) -> bool {
-    reveal(window, None)
+    reveal(window, None, FirstPaintTrigger::Acknowledged)
+}
+
+/// What revealed a window waiting for its first paint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirstPaintTrigger {
+    /// The page acknowledged its first paint (before or after the arm).
+    Acknowledged,
+    /// The page had not acknowledged when the fallback timer fired.
+    Fallback,
+}
+
+impl FirstPaintTrigger {
+    /// A short name for logs: `ack` or `fallback`.
+    #[cfg_attr(not(windows), allow(dead_code))] // only Windows palettes log their reveal trigger
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Acknowledged => "ack",
+            Self::Fallback => "fallback",
+        }
+    }
 }
 
 /// The page has painted: shows the window that sent this, and only that window (there is no label
@@ -157,7 +178,7 @@ impl<R: Runtime> PaintedWindow for WebviewWindow<R> {
 }
 
 type BeforeShow<W> = Box<dyn FnOnce(&W) -> Result<(), String> + Send>;
-type AfterShow<W> = Box<dyn FnOnce(&W, Result<(), String>) + Send>;
+type AfterShow<W> = Box<dyn FnOnce(&W, FirstPaintTrigger, Result<(), String>) + Send>;
 
 struct Hooks<W> {
     before_show: BeforeShow<W>,
@@ -167,7 +188,7 @@ struct Hooks<W> {
 impl<W> Hooks<W> {
     fn new(
         before_show: impl FnOnce(&W) -> Result<(), String> + Send + 'static,
-        after_show: impl FnOnce(&W, Result<(), String>) + Send + 'static,
+        after_show: impl FnOnce(&W, FirstPaintTrigger, Result<(), String>) + Send + 'static,
     ) -> Self {
         Self {
             before_show: Box::new(before_show),
@@ -211,7 +232,10 @@ fn forget_early_ack(label: &str) {
 fn arm_and_consume_early_ack<W: PaintedWindow>(window: &W, hooks: Hooks<W>) -> (u64, bool) {
     let generation = arm(window, hooks);
     let painted = early_acks().remove(window.label());
-    (generation, painted && reveal(window, Some(generation)))
+    (
+        generation,
+        painted && reveal(window, Some(generation), FirstPaintTrigger::Acknowledged),
+    )
 }
 
 fn arm<W: PaintedWindow>(window: &W, hooks: Hooks<W>) -> u64 {
@@ -240,8 +264,13 @@ fn forget(label: &str, generation: u64) {
 }
 
 /// The one reveal: takes the window's entry (only if `generation` matches, when given), then runs
-/// `before_show`, `show()` and `after_show` with the lock released. At most once per arm.
-fn reveal<W: PaintedWindow>(window: &W, generation: Option<u64>) -> bool {
+/// `before_show`, `show()` and `after_show` (told `trigger`) with the lock released. At most once
+/// per arm.
+fn reveal<W: PaintedWindow>(
+    window: &W,
+    generation: Option<u64>,
+    trigger: FirstPaintTrigger,
+) -> bool {
     let taken = {
         let mut waiting = waiting();
         match waiting.get(window.label()) {
@@ -259,7 +288,7 @@ fn reveal<W: PaintedWindow>(window: &W, generation: Option<u64>) -> bool {
         after_show,
     } = *hooks;
     let result = before_show(window).and_then(|()| window.show());
-    after_show(window, result);
+    after_show(window, trigger, result);
     true
 }
 
@@ -304,8 +333,11 @@ mod tests {
         }
     }
 
+    const ACK: FirstPaintTrigger = FirstPaintTrigger::Acknowledged;
+    const FALLBACK: FirstPaintTrigger = FirstPaintTrigger::Fallback;
+
     fn plain() -> Hooks<Fake> {
-        Hooks::new(|_| Ok(()), |_, _| {})
+        Hooks::new(|_| Ok(()), |_, _, _| {})
     }
 
     /// Function body from `source`, from `signature` to its closing brace at column 0.
@@ -379,6 +411,9 @@ mod tests {
         let consumed = armed.find("arm_and_consume_early_ack(").unwrap();
         let returned = armed.find("if revealed {\n        return;\n    }").unwrap();
         assert!(consumed < returned && returned < armed.find("schedule(").unwrap());
+        assert!(armed.contains("reveal(&target, Some(generation), FirstPaintTrigger::Fallback);"));
+        assert!(body(source, "pub fn show_after_first_paint<")
+            .contains("reveal(window, None, FirstPaintTrigger::Acknowledged)"));
         assert!(!command.contains("get_webview_window"));
         assert!(!code.contains("get_webview_window"));
         // The only `show()` is the reveal's own.
@@ -392,16 +427,16 @@ mod tests {
         let other = Fake::new("other");
         arm(&calling, plain());
         arm(&other, plain());
-        assert!(reveal(&calling, None));
+        assert!(reveal(&calling, None, ACK));
         assert_eq!((calling.shows(), other.shows()), (1, 0));
         // Idempotent: a second acknowledgement, and the fallback after it, do nothing.
-        assert!(!reveal(&calling, None));
+        assert!(!reveal(&calling, None, ACK));
         assert_eq!(calling.shows(), 1);
-        assert!(reveal(&other, None));
+        assert!(reveal(&other, None, ACK));
         assert_eq!((calling.shows(), other.shows()), (1, 1));
         // A window that was never armed (hidden on purpose, say) is never shown by it.
         let unarmed = Fake::new("unarmed");
-        assert!(!reveal(&unarmed, None));
+        assert!(!reveal(&unarmed, None, ACK));
         assert_eq!(unarmed.shows(), 0);
     }
 
@@ -412,11 +447,16 @@ mod tests {
         let (fired, done) = std::sync::mpsc::channel();
         let target = Arc::clone(&window);
         schedule(Duration::from_millis(20), move || {
-            fired.send(reveal(&*target, Some(generation))).unwrap();
+            fired
+                .send(reveal(&*target, Some(generation), FALLBACK))
+                .unwrap();
         });
         assert_eq!(done.recv_timeout(Duration::from_secs(5)), Ok(true));
         assert_eq!(window.shows(), 1);
-        assert!(!reveal(&*window, None), "the page's late acknowledgement");
+        assert!(
+            !reveal(&*window, None, ACK),
+            "the page's late acknowledgement"
+        );
         assert_eq!(window.shows(), 1);
     }
 
@@ -424,17 +464,17 @@ mod tests {
     fn first_paint_fallback_is_a_no_op_once_shown_or_for_a_recreated_window() {
         let window = Fake::new("stale");
         let first = arm(&window, plain());
-        assert!(reveal(&window, None));
+        assert!(reveal(&window, None, ACK));
         assert!(
-            !reveal(&window, Some(first)),
+            !reveal(&window, Some(first), FALLBACK),
             "fallback after the page acknowledged"
         );
         // The same label re-created: the old window's timer and Destroyed event leave it alone.
         let second = arm(&window, plain());
-        assert!(!reveal(&window, Some(first)));
+        assert!(!reveal(&window, Some(first), FALLBACK));
         forget(&window.label, first);
         assert_eq!(window.shows(), 1);
-        assert!(reveal(&window, Some(second)));
+        assert!(reveal(&window, Some(second), FALLBACK));
         assert_eq!(window.shows(), 2);
     }
 
@@ -450,17 +490,20 @@ mod tests {
                     before.lock().unwrap().push(format!("before {}", w.shows()));
                     Ok(())
                 },
-                move |w: &Fake, result| {
+                move |w: &Fake, trigger, result| {
                     after
                         .lock()
                         .unwrap()
-                        .push(format!("after {} {result:?}", w.shows()));
+                        .push(format!("after {} {trigger:?} {result:?}", w.shows()));
                 },
             ),
         );
-        assert!(reveal(&window, None));
-        assert!(!reveal(&window, None));
-        assert_eq!(*calls.lock().unwrap(), ["before 0", "after 1 Ok(())"]);
+        assert!(reveal(&window, None, ACK));
+        assert!(!reveal(&window, None, ACK));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["before 0", "after 1 Acknowledged Ok(())"]
+        );
 
         let declined = Fake::new("declined");
         let (sent, result) = std::sync::mpsc::channel();
@@ -468,10 +511,10 @@ mod tests {
             &declined,
             Hooks::new(
                 |_| Err("closing".into()),
-                move |_, outcome| sent.send(outcome).unwrap(),
+                move |_, _, outcome| sent.send(outcome).unwrap(),
             ),
         );
-        assert!(reveal(&declined, None));
+        assert!(reveal(&declined, None, ACK));
         assert_eq!(result.recv(), Ok(Err("closing".to_string())));
         assert_eq!(declined.shows(), 0);
     }
@@ -482,17 +525,17 @@ mod tests {
         let (sent, result) = std::sync::mpsc::channel::<Result<(), String>>();
         let generation = arm(
             &window,
-            Hooks::new(|_| Ok(()), move |_, outcome| sent.send(outcome).unwrap()),
+            Hooks::new(|_| Ok(()), move |_, _, outcome| sent.send(outcome).unwrap()),
         );
         forget(&window.label, generation);
         assert!(result.recv().is_err(), "hooks dropped without running");
-        assert!(!reveal(&window, None));
+        assert!(!reveal(&window, None, ACK));
         assert_eq!(window.shows(), 0);
     }
 
     /// The page acknowledges before the window is armed, as `window_first_paint` does it.
     fn early_ack(window: &Fake) {
-        assert!(!reveal(window, None), "nothing armed yet");
+        assert!(!reveal(window, None, ACK), "nothing armed yet");
         remember_early_ack(window);
     }
 
@@ -505,14 +548,14 @@ mod tests {
         assert!(revealed);
         assert_eq!(window.shows(), 1);
         // The fallback, had one been scheduled, and a repeated acknowledgement do nothing.
-        assert!(!reveal(&window, Some(generation)));
-        assert!(!reveal(&window, None));
+        assert!(!reveal(&window, Some(generation), FALLBACK));
+        assert!(!reveal(&window, None, ACK));
         assert_eq!(window.shows(), 1);
         // Consumed: the next arm of this label waits for its own acknowledgement.
         let (next, revealed) = arm_and_consume_early_ack(&window, plain());
         assert!(!revealed);
         assert_eq!(window.shows(), 1);
-        assert!(reveal(&window, Some(next)));
+        assert!(reveal(&window, Some(next), FALLBACK));
         assert_eq!(window.shows(), 2);
     }
 
@@ -525,11 +568,12 @@ mod tests {
             &window,
             Hooks::new(
                 |_| Err("closed".into()),
-                move |_, outcome| sent.send(outcome).unwrap(),
+                move |_, trigger, outcome| sent.send((trigger, outcome)).unwrap(),
             ),
         );
         assert!(revealed, "the reveal ran (and was declined)");
-        assert_eq!(result.recv(), Ok(Err("closed".to_string())));
+        // An acknowledgement consumed at the arm is still the page's acknowledgement.
+        assert_eq!(result.recv(), Ok((ACK, Err("closed".to_string()))));
         assert_eq!(window.shows(), 0);
     }
 
@@ -542,7 +586,7 @@ mod tests {
         assert!(!revealed);
         assert_eq!(window.shows(), 0);
         // Only the fallback or a fresh acknowledgement shows it now.
-        assert!(reveal(&window, Some(generation)));
+        assert!(reveal(&window, Some(generation), FALLBACK));
         assert_eq!(window.shows(), 1);
         assert!(!early_acks().contains(&window.label));
     }

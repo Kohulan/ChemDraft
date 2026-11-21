@@ -107,6 +107,11 @@ the first hovered tooltip, appears with its content and no black or blank frame.
 document throughout (its title bar stays active and M switches tools). Close a palette from
 View ▸ Toolbars right after launch: it stays closed. Minimize the document right after launch,
 before the palettes appear: no palette shows until the document is restored, and then they all do.
+If a palette appears before its content, it shows only an empty panel in the palette's own grey,
+never the darker document-window grey. With the agent bridge diagnostics on, the
+`[windows-activation]` log has one `palette reveal label=... ms=... trigger=ack|fallback|release
+result=...` line per palette; on a cold launch `trigger=ack` is expected, since the fallback waits
+5 s.
 
 Palette field input (macOS and Windows): in Drawn Structure Settings, click Target bond length,
 type 30 and press Return; the value changes, the canvas does not, and no hotkey fires. Switch to
