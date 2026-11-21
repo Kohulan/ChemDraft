@@ -165,7 +165,9 @@ describe("palette work-area sizing", () => {
   it("fits a restored inspector frame to the work area before creating or showing the window", () => {
     const nativeSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../src-tauri/src/lib.rs"), "utf8");
     const open = nativeSource.split("fn ensure_toolset_window<")[1]!.split("fn install_toolset_input_focus<")[0]!;
-    expect(open).toMatch(/recover_offscreen_toolset_window\(app, &window, resizable\);\s*window\.show\(/);
+    expect(open).toMatch(
+      /recover_offscreen_toolset_window\(app, &window, resizable\);(?:\s*\/\/[^\n]*)*\s*if !palette_first_paint::reopened\(&label\) \{\s*window\.show\(/,
+    );
     expect(open).toMatch(/let \(position, width, height\) = clamp_toolset_frame\([\s\S]*?\.inner_size\(width, height\)/);
     expect(open).toMatch(/clamp_windows_toolset_frame\([\s\S]*?\.visible\(false\)[\s\S]*?panel_full_size::apply\([\s\S]*?target\.show\(/);
   });
