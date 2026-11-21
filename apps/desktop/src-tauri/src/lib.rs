@@ -8505,6 +8505,19 @@ fn palette_focus_log(message: std::fmt::Arguments<'_>) {
     }
 }
 
+// Opt-in switch for the one `linux-acquire` line per field click. CI's Linux smoke and tester
+// reports need that line without the agent bridge, which would change what the smoke tests.
+#[cfg(target_os = "linux")]
+const PALETTE_FOCUS_LOG_ENV_VAR: &str = "CHEMDRAFT_PALETTE_FOCUS_LOG";
+
+#[cfg(target_os = "linux")]
+fn palette_focus_acquire_log(message: std::fmt::Arguments<'_>) {
+    let env_enabled = std::env::var(PALETTE_FOCUS_LOG_ENV_VAR).is_ok_and(|value| value == "1");
+    if agent_bridge_status().enabled || env_enabled {
+        eprintln!("[palette-focus] {message}");
+    }
+}
+
 fn agent_bridge_status_from<I, S>(env_value: Option<&str>, args: I) -> AgentBridgeStatus
 where
     I: IntoIterator<Item = S>,
