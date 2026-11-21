@@ -779,6 +779,90 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
     await exactUndoRedo(before, after, "Move and Remove Charge");
   });
 
+  function legacyNitrogenMarks(bondCount: number, charge: number, secondCharge?: number) {
+    const { document, nitrogen } = ammoniumElectronMarkDropFixture();
+    const molecule = dropMolecule(document), mark = dropMark(document), pageId = document.pages[0].id;
+    // Space the neighbors outside the mark's association radius so moving N leaves the marks free.
+    const hydrogens = [[-56, 0], [56, 0], [0, -56], [0, 56]].slice(0, bondCount).map(([dx, dy], index) => ({
+      id: `legacy_h${index}`, element: "H", formalCharge: 0, x: nitrogen.x + dx, y: nitrogen.y + dy
+    }));
+    const bonds = hydrogens.map(atom => ({
+      id: `bond_${atom.id}`, fromAtomId: nitrogen.id, toAtomId: atom.id, order: "single" as const
+    }));
+    const placement = { x: nitrogen.x - mark.width / 2, y: nitrogen.y - mark.height / 2, atomAssociation: undefined };
+    const secondMark: ElectronMarkObject = { ...mark, ...placement, id: "legacy_second_mark",
+      markKind: secondCharge === undefined ? "radical-dot" : "charge", charge: secondCharge,
+      anchor: { kind: "bond", objectId: molecule.id, bondId: bonds[0].id } };
+    const drawing = workflow.normalizeCommittedDocument(applyPatches(document, [
+      { op: "updateObject", objectId: molecule.id, changes: {
+        x: nitrogen.x - 56, y: nitrogen.y - 56, width: 112, height: bondCount === 4 ? 112 : 56,
+        atoms: [...molecule.atoms, ...hydrogens], bonds
+      } },
+      { op: "updateObject", objectId: mark.id, changes: {
+        ...placement, charge, anchor: { kind: "object", objectId: molecule.id }
+      } },
+      { op: "addObject", pageId, object: secondMark }
+    ], { now: phase4Timestamp }));
+    return { drawing, molecule, nitrogen, marks: [mark.id, secondMark.id] };
+  }
+
+  async function moveNitrogenAway(fixture: ReturnType<typeof legacyNitrogenMarks>, operation: "part drag" | "group rotation") {
+    const { drawing, molecule, nitrogen } = fixture;
+    if (operation === "part drag") {
+      await mount(drawing);
+      return (await dragAtom(molecule.id, nitrogen, { x: nitrogen.x + 100, y: nitrogen.y + 100 })).before;
+    }
+
+    const pageId = drawing.pages[0].id;
+    const caption = createNativeTextObject(drawing, { x: 620, y: 250 }, "Caption");
+    const withCaption = applyPatch(drawing, { op: "addObject", pageId, object: caption }, { now: phase4Timestamp });
+    await mount(workflow.selectDocumentObjects(withCaption, pageId, [molecule.id, caption.id]));
+    const before = snapshot();
+    const frame = container.querySelector<HTMLElement>("[data-group-selection]")!;
+    const frameNumber = (key: "left" | "top" | "width" | "height") => Number(/calc\(([-\d.]+)px/.exec(frame.style[key])![1]);
+    const center = { x: frameNumber("left") + frameNumber("width") / 2, y: frameNumber("top") + frameNumber("height") / 2 };
+    const handle = frame.querySelector("[data-group-rotate-handle]")!;
+    const end = { x: center.x + 150, y: center.y };
+    await act(async () => pointer(handle, "pointerdown", { x: center.x, y: frameNumber("top") - 20 }));
+    await move(page(), end);
+    await act(async () => pointer(page(), "pointerup", end));
+    return before;
+  }
+
+  const legacyMarkOperations = ["part drag", "group rotation"] as const;
+  const validLegacyDetachments = [{ marks: "opposite charges", secondCharge: -1 }, { marks: "a charge and a radical" }];
+  it.each(validLegacyDetachments.flatMap(example => legacyMarkOperations.map(operation => ({ ...example, operation }))))(
+    "detaches $marks from three-bond N during a $operation", async ({ operation, secondCharge }) => {
+      const fixture = legacyNitrogenMarks(3, 1, secondCharge);
+      const before = await moveNitrogenAway(fixture, operation);
+      const after = snapshot();
+      const nitrogenIn = (document: ChemDraftDocument) => dropMolecule(document).atoms.find(atom => atom.id === fixture.nitrogen.id)!;
+      const beforeAssignments = workflow.committedElectronMarkAssignments(before.pages[0]).anchorByMarkId;
+      const afterAssignments = workflow.committedElectronMarkAssignments(after.pages[0]).anchorByMarkId;
+      expect(nitrogenIn(before).formalCharge).toBe(secondCharge === undefined ? 1 : 0);
+      expect(nitrogenIn(before).markRadicals ?? 0).toBe(secondCharge === undefined ? 1 : 0);
+      expect(status()).toMatch(/^Charge removed from N/);
+      expect(dropMolecule(after)).not.toEqual(dropMolecule(before));
+      expect(nitrogenIn(after).formalCharge).toBe(0);
+      expect(nitrogenIn(after).markCharge ?? 0).toBe(0);
+      expect(nitrogenIn(after).markRadicals ?? 0).toBe(0);
+      for (const markId of fixture.marks) {
+        expect(beforeAssignments.get(markId)).toEqual({ objectId: fixture.molecule.id, atomId: fixture.nitrogen.id });
+        expect(afterAssignments.get(markId)).toBeUndefined();
+        expect(workflow.findDocumentObject(after, markId)).toEqual(workflow.findDocumentObject(before, markId));
+      }
+      await exactUndoRedo(before, after, operation === "part drag" ? "Move and Remove Charge" : "Rotate selection and Remove Charge");
+    });
+
+  it.each(legacyMarkOperations)("names the invalid final valence when both charges would detach during a %s", async operation => {
+    const fixture = legacyNitrogenMarks(4, 2, -1);
+    const before = await moveNitrogenAway(fixture, operation);
+    expect(dropMolecule(before).atoms[0]).toMatchObject({ formalCharge: 1, markCharge: 1 });
+    expect(status()).toBe("Cannot move Charge from N: N cannot carry formal charge 0 with bond/radical valence 4");
+    expect(snapshot()).toEqual(before);
+    expect(container.querySelector("main")?.getAttribute("data-can-undo")).toBe("false");
+  });
+
   it.each(["point", "bond", "object"] as const)("preserves the %s anchor when only a rotated carbon's raw coordinates reach the mark", async kind => {
     const { document, saturatedCarbon } = electronMarkDropFixture();
     const molecule = dropMolecule(document);

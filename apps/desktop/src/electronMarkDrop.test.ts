@@ -485,7 +485,7 @@ describe.each([false, true])("electron-mark drops with direct editing %s", enabl
     const result = dropElectronMarksInSelection(before, [firstRadical.id, secondRadical.id], delta,
       { grabbedObjectId: firstRadical.id, point });
     expect(result.document).toBe(before);
-    expect(result.status).toBe("Cannot move Radical electron to N: N has unsupported valence after moving this mark");
+    expect(result.status).toBe("Cannot move Radical electron to N: N cannot carry formal charge 0 with bond/radical valence 4");
   });
 
   it("re-associates unknown display marks too", () => {

@@ -333,50 +333,51 @@ export function resolveElectronMarksInSelectionTransform(
 function applyElectronMarkDrops(
   document: ChemDraftDocument, moved: ChemDraftDocument, drops: readonly ElectronMarkDrop[]
 ): { document: ChemDraftDocument; status: string; refused?: boolean } {
-  const refusal = ({ mark, source, destination }: ElectronMarkDrop, reason: string) => ({ document, refused: true,
-    status: `Cannot move ${electronMarkName(mark)}${source ? ` from ${source.atom.element}` : ""}${destination ? ` to ${destination.atom.element}` : ""}: ${reason}` });
+  const refusal = (affected: readonly ElectronMarkDrop[], reason: string) => {
+    const moves = new Set(affected.map(({ mark, source, destination }) =>
+      `${electronMarkName(mark)}${source ? ` from ${source.atom.element}` : ""}${destination ? ` to ${destination.atom.element}` : ""}`));
+    return { document, refused: true, status: `Cannot move ${[...moves].join(" and ")}: ${reason}` };
+  };
   // Validate the actual associations, including any destination that normalization resolved.
   const anchorUpdates = drops.filter(drop => !drop.preserveAnchor).map(({ mark, anchor }) => ({
     op: "updateObject", objectId: mark.id, changes: { anchor, atomAssociation: "explicit" }
   } as const));
   let after = normalizeCommittedDocument(anchorUpdates.length ? applyPatches(moved, anchorUpdates, { now: phase4Timestamp }) : moved);
-  const expected = new Map<string, { endpoint: AtomEndpoint; charge: number; radicals: number; drop: ElectronMarkDrop }>();
+  const expected = new Map<string, { endpoint: AtomEndpoint; charge: number; radicals: number; drops: ElectronMarkDrop[] }>();
   for (const drop of drops) {
     const { mark, source } = drop;
     const destination = committedDropDestination(document, after, drop);
     if (drop.destination && !sameAtom(drop.destination, destination)) {
-      return refusal(drop, "the atom cannot accept this mark's charge or unpaired electrons");
+      return refusal([drop], "the atom cannot accept this mark's charge or unpaired electrons");
     }
     const contribution = electronMarkAtomContribution(mark);
     if (sameAtom(source, destination) || (!contribution.charge && !contribution.radicals)) continue;
-    // Use the same admission rule as typed charge stacking, including the radical bonding slots.
-    // Check removal too: a four-bond N cannot lose its +1 without an explicit bond edit.
+    const resolvedDrop = { ...drop, destination };
     for (const [endpoint, sign] of [[source, -1], [destination, 1]] as const) {
       if (!endpoint) continue;
       const { molecule, atom } = endpoint;
-      const element = nativeElementFromAtomLabel(atom.element);
-      const charge = atom.formalCharge + sign * contribution.charge;
-      const usage = nativeAtomExternalValence(molecule, atom) + sign * contribution.radicals;
-      if (element && !nativeAtomChargeSupportsValence(element, usage, charge)) {
-        return refusal({ ...drop, destination }, `${atom.element} cannot carry formal charge ${charge > 0 ? "+" : ""}${charge} with bond/radical valence ${usage}`);
-      }
       const key = nativeElectronMarkAtomKey(molecule.id, atom.id);
-      const previous = expected.get(key);
-      expected.set(key, { endpoint, drop,
-        charge: (previous?.charge ?? atom.formalCharge) + sign * contribution.charge,
-        radicals: (previous?.radicals ?? atom.markRadicals ?? 0) + sign * contribution.radicals });
+      let totals = expected.get(key);
+      if (!totals) {
+        totals = { endpoint, charge: atom.formalCharge, radicals: atom.markRadicals ?? 0, drops: [] };
+        expected.set(key, totals);
+      }
+      totals.charge += sign * contribution.charge;
+      totals.radicals += sign * contribution.radicals;
+      totals.drops.push(resolvedDrop);
     }
   }
 
-  // Two individually valid drops can exceed the same atom's capacity together.
-  for (const { endpoint, charge, radicals, drop } of expected.values()) {
-    const final = associatedAtom(after, { kind: "atom", objectId: endpoint.molecule.id, atomId: endpoint.atom.id });
+  // Check each affected atom once, using all attachments and detachments in the gesture.
+  for (const { endpoint, charge, radicals, drops: affected } of expected.values()) {
+    const final = findAtomEndpoint(after, { objectId: endpoint.molecule.id, atomId: endpoint.atom.id });
     if (!final || final.atom.formalCharge !== charge || (final.atom.markRadicals ?? 0) !== radicals) {
-      return refusal(drop, "the atom associations could not preserve the existing charges or unpaired electrons");
+      return refusal(affected, "the atom associations could not preserve the existing charges or unpaired electrons");
     }
     const element = nativeElementFromAtomLabel(final.atom.element);
-    if (element && !nativeAtomChargeSupportsValence(element, nativeAtomExternalValence(final.molecule, final.atom), final.atom.formalCharge)) {
-      return refusal(drop, `${final.atom.element} has unsupported valence after moving this mark`);
+    const usage = nativeAtomExternalValence(final.molecule, final.atom);
+    if (element && !nativeAtomChargeSupportsValence(element, usage, charge)) {
+      return refusal(affected, `${final.atom.element} cannot carry formal charge ${charge > 0 ? "+" : ""}${charge} with bond/radical valence ${usage}`);
     }
   }
 
