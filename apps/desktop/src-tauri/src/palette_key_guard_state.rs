@@ -3,19 +3,35 @@
 
 pub(super) const TIMEOUT_MS: u64 = 1_000;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Pending {
     label: String,
     sequence: u64,
     started: u64,
     wall_time: u64,
+    #[cfg(any(target_os = "linux", test))]
+    native_time: u32,
+    #[cfg(any(target_os = "linux", test))]
+    presentation: Option<Presentation>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug)]
+struct Presentation {
+    sequence: u64,
+    deadline: u64,
+    confirmation: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 #[derive(Default)]
 pub(super) struct Guard {
-    #[cfg(any(target_os = "macos", windows, test))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows, test))]
     sequence: u64,
     pending: Option<Pending>,
+    #[cfg(any(target_os = "linux", test))]
+    confirmed_focus: Option<(String, u64)>,
+    #[cfg(any(target_os = "linux", test))]
+    keyboard_popover: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
@@ -35,21 +51,23 @@ pub(crate) enum End {
     Hide,
     Destroy,
     Deactivated,
-    // Raised by the macOS and Windows pointer monitors only.
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
     Outside,
 }
 
 impl Guard {
     pub const fn new() -> Self {
         Self {
-            #[cfg(any(target_os = "macos", windows, test))]
+            #[cfg(any(target_os = "linux", target_os = "macos", windows, test))]
             sequence: 0,
             pending: None,
+            #[cfg(any(target_os = "linux", test))]
+            confirmed_focus: None,
+            #[cfg(any(target_os = "linux", test))]
+            keyboard_popover: None,
         }
     }
 
-    #[cfg(any(target_os = "macos", windows, test))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows, test))]
     pub fn pointer(&mut self, label: &str, now: u64, wall_time: u64) -> Event {
         self.sequence += 1;
         self.pending = Some(Pending {
@@ -57,6 +75,10 @@ impl Guard {
             sequence: self.sequence,
             started: now,
             wall_time,
+            #[cfg(any(target_os = "linux", test))]
+            native_time: 0,
+            #[cfg(any(target_os = "linux", test))]
+            presentation: None,
         });
         Event {
             sequence: self.sequence,
@@ -90,6 +112,18 @@ impl Guard {
         sequence: Option<u64>,
         before: u64,
     ) -> Option<(String, Event)> {
+        #[cfg(any(target_os = "linux", test))]
+        if matches!(
+            why,
+            End::Deactivated | End::Hide | End::Destroy | End::Released
+        ) && self.has_confirmed_focus(label)
+        {
+            self.confirmed_focus = None;
+        }
+        #[cfg(any(target_os = "linux", test))]
+        if matches!(why, End::Hide | End::Destroy) {
+            self.set_keyboard_popover(label, false);
+        }
         let pending = self.pending.as_ref()?;
         if matches!(why, End::Outside) || (matches!(why, End::Deactivated) && label.is_empty()) {
             return self.clear();
@@ -116,7 +150,7 @@ impl Guard {
         self.clear()
     }
 
-    #[cfg(any(target_os = "macos", windows, test))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows, test))]
     pub fn timeout(&mut self, sequence: u64, now: u64) -> Option<(String, Event)> {
         if self
             .pending
@@ -129,6 +163,241 @@ impl Guard {
             None
         }
     }
+}
+
+// A GTK presentation completes on a later window event. Keeping the reply with the
+// click lets the existing hide, outside-click and expiry paths cancel the wait.
+#[cfg(any(target_os = "linux", test))]
+pub(super) enum FocusRequest {
+    Denied,
+    Focused(u64),
+    Present {
+        sequence: u64,
+        timestamp: u32,
+        remaining_ms: u64,
+        confirmed: tokio::sync::oneshot::Receiver<()>,
+    },
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl FocusRequest {
+    pub fn sequence(&self) -> Option<u64> {
+        match self {
+            Self::Denied => None,
+            Self::Focused(sequence) | Self::Present { sequence, .. } => Some(*sequence),
+        }
+    }
+
+    pub async fn confirmed(self) -> bool {
+        match self {
+            Self::Denied => false,
+            Self::Focused(_) => true,
+            Self::Present {
+                confirmed,
+                remaining_ms,
+                ..
+            } => matches!(
+                tokio::time::timeout(std::time::Duration::from_millis(remaining_ms), confirmed)
+                    .await,
+                Ok(Ok(()))
+            ),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl Guard {
+    pub fn has_confirmed_focus(&self, label: &str) -> bool {
+        self.confirmed_focus
+            .as_ref()
+            .is_some_and(|(owner, _)| owner == label)
+    }
+
+    pub fn set_keyboard_popover(&mut self, label: &str, keyboard: bool) {
+        if keyboard {
+            self.keyboard_popover = Some(label.to_owned());
+        } else if self.keyboard_popover.as_deref() == Some(label) {
+            self.keyboard_popover = None;
+        }
+    }
+
+    pub fn allows_window_keys(&self, label: &str) -> bool {
+        self.has_confirmed_focus(label) || self.keyboard_popover.as_deref() == Some(label)
+    }
+
+    pub fn gtk_pointer(&mut self, label: &str, now: u64, wall_time: u64, timestamp: u32) -> Event {
+        if self.has_confirmed_focus(label) {
+            self.confirmed_focus = None;
+        }
+        // Palette fields share their in-flight IPC across clicks. Keep its original
+        // ticket and deadline. Plugin panels request a new generation on every click.
+        let presentation = self
+            .pending
+            .as_mut()
+            .filter(|p| p.label == label && !crate::is_plugin_panel_window_label(label))
+            .and_then(|p| p.presentation.take())
+            .filter(|p| now < p.deadline);
+        let event = self.pointer(label, now, wall_time);
+        let pending = self.pending.as_mut().unwrap();
+        pending.native_time = timestamp;
+        pending.presentation = presentation;
+        event
+    }
+
+    // GTK focus events have no acquisition ID. They can wake a waiter, but only
+    // its completion can authorize keys, after rechecking the click and native focus.
+    pub fn focus_in(&mut self, label: &str, now: u64) {
+        if let Some(reply) = self
+            .pending
+            .as_mut()
+            .filter(|p| p.label == label)
+            .and_then(|p| p.presentation.as_mut())
+            .filter(|p| now < p.deadline)
+            .and_then(|p| p.confirmation.take())
+        {
+            let _ = reply.send(());
+        }
+    }
+
+    pub fn ticket_is_current(&self, label: &str, sequence: u64, now: u64) -> bool {
+        self.confirmed_focus
+            .as_ref()
+            .is_some_and(|(owner, seq)| owner == label && *seq == sequence)
+            || self
+                .pending
+                .as_ref()
+                .filter(|p| p.label == label)
+                .and_then(|p| p.presentation.as_ref())
+                .is_some_and(|p| p.sequence == sequence && now < p.deadline)
+    }
+
+    pub fn finish_focus(
+        &mut self,
+        label: &str,
+        sequence: Option<u64>,
+        now: u64,
+        settle_lease: impl FnOnce(bool) -> bool,
+    ) -> (bool, Option<(String, Event)>) {
+        let held =
+            settle_lease(sequence.is_some_and(|seq| self.ticket_is_current(label, seq, now)));
+        if let Some(sequence) = sequence.filter(|_| held) {
+            self.confirmed_focus = Some((label.to_owned(), sequence));
+        } else if self
+            .confirmed_focus
+            .as_ref()
+            .is_some_and(|(owner, seq)| owner == label && sequence.is_none_or(|s| s == *seq))
+        {
+            self.confirmed_focus = None;
+        }
+        let click = self
+            .pending
+            .as_ref()
+            .filter(|p| {
+                p.label == label
+                    && p.presentation
+                        .as_ref()
+                        .is_some_and(|p| Some(p.sequence) == sequence)
+            })
+            .map(|p| p.sequence);
+        let event = if click.is_some() {
+            self.end(
+                label,
+                if held { End::Acquired } else { End::Refused },
+                click,
+                0,
+            )
+        } else {
+            None
+        };
+        (held, event)
+    }
+
+    pub fn request_focus(
+        &mut self,
+        label: &str,
+        sequence: Option<u64>,
+        before: u64,
+        now: u64,
+        native_focused: bool,
+    ) -> FocusRequest {
+        self.set_keyboard_popover(label, false);
+        // A second control in a key window will not produce another focus-in event.
+        if let Some((_, sequence)) = self
+            .confirmed_focus
+            .as_ref()
+            .filter(|(owner, _)| native_focused && owner == label)
+        {
+            return FocusRequest::Focused(*sequence);
+        }
+        let Some(p) = self.pending.as_mut().filter(|p| {
+            p.label == label
+                && p.native_time != 0
+                && match sequence {
+                    // The pointerdown may still have the preceding click's sequence if the
+                    // native event is in flight. Its wall time can identify the newer click.
+                    Some(seq) => p.sequence == seq || (seq < p.sequence && p.wall_time < before),
+                    None => before == 0 || p.wall_time <= before,
+                }
+        }) else {
+            return FocusRequest::Denied;
+        };
+        let remaining_ms = TIMEOUT_MS.saturating_sub(now.saturating_sub(p.started));
+        if remaining_ms == 0 {
+            return FocusRequest::Denied;
+        }
+        // A delayed presentation may already have made the window key. A fresh
+        // click can acquire it without waiting for another focus-in transition.
+        let mut presentation = Presentation {
+            sequence: p.sequence,
+            deadline: p.started + TIMEOUT_MS,
+            confirmation: None,
+        };
+        let request = if native_focused {
+            FocusRequest::Focused(p.sequence)
+        } else {
+            let (reply, confirmed) = tokio::sync::oneshot::channel();
+            presentation.confirmation = Some(reply);
+            FocusRequest::Present {
+                sequence: p.sequence,
+                timestamp: p.native_time,
+                remaining_ms,
+                confirmed,
+            }
+        };
+        p.presentation = Some(presentation);
+        request
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn blocks_document_key(
+    pending: bool,
+    leased: bool,
+    key: &str,
+    meta: bool,
+    ctrl: bool,
+    alt: bool,
+) -> bool {
+    (pending || leased)
+        && (editing_key(key, meta, ctrl, alt)
+            || (!meta
+                && !alt
+                && matches!(
+                    key.strip_prefix("KP_").unwrap_or(key),
+                    "Left"
+                        | "Right"
+                        | "Up"
+                        | "Down"
+                        | "Home"
+                        | "End"
+                        | "Page_Up"
+                        | "Page_Down"
+                        | "Tab"
+                        | "ISO_Left_Tab"
+                        | "Return"
+                        | "Enter"
+                        | "Escape"
+                )))
 }
 
 pub(crate) fn blocks_menu(pending: bool, document_target: bool, command: &str) -> bool {
@@ -193,6 +462,290 @@ pub(super) fn editing_key(key: &str, command: bool, control: bool, alt: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presentation_uses_the_native_click_and_waits_for_its_window() {
+        use tokio::sync::oneshot::error::TryRecvError;
+        for label in ["toolset-structure", "plugin-panel-example"] {
+            let mut guard = Guard::new();
+            assert!(matches!(
+                guard.request_focus(label, None, 0, 10, true),
+                FocusRequest::Denied
+            ));
+            let click = guard.gtk_pointer(label, 10, 100, 42);
+            let FocusRequest::Present {
+                timestamp,
+                remaining_ms,
+                mut confirmed,
+                ..
+            } = guard.request_focus(label, Some(click.sequence), 0, 20, false)
+            else {
+                panic!("expected a pending focus request");
+            };
+            assert_eq!(timestamp, 42);
+            assert_eq!(remaining_ms, TIMEOUT_MS - 10);
+            guard.focus_in("another-window", 21);
+            assert_eq!(confirmed.try_recv(), Err(TryRecvError::Empty));
+            if !crate::is_plugin_panel_window_label(label) {
+                // The palette frontend shares a single acquisition across a double-click.
+                assert_ne!(
+                    guard.gtk_pointer(label, 22, 112, 54).sequence,
+                    click.sequence
+                );
+            }
+            guard.focus_in(label, 23);
+            assert_eq!(confirmed.try_recv(), Ok(()));
+            if !crate::is_plugin_panel_window_label(label) {
+                // A click can also precede the queued UI-thread completion.
+                guard.gtk_pointer(label, 24, 114, 56);
+            }
+            assert!(!guard.allows_window_keys(label));
+            assert!(
+                guard
+                    .finish_focus(label, Some(click.sequence), 24, |eligible| eligible)
+                    .0
+            );
+            assert!(guard.allows_window_keys(label));
+            assert!(matches!(
+                guard.request_focus(label, None, 0, 30, true),
+                FocusRequest::Focused(_)
+            ));
+            guard.end(label, End::Deactivated, None, 0);
+            assert!(matches!(
+                guard.request_focus(label, None, 0, 31, true),
+                FocusRequest::Denied
+            ));
+        }
+    }
+
+    #[test]
+    fn timeout_hide_and_other_clicks_deny_unconfirmed_focus() {
+        use tokio::sync::oneshot::error::TryRecvError;
+        let label = "toolset-inspector";
+        for end in [End::Hide, End::Destroy, End::Deactivated, End::Outside] {
+            let mut guard = Guard::new();
+            guard.gtk_pointer(label, 0, 100, 7);
+            let FocusRequest::Present { mut confirmed, .. } =
+                guard.request_focus(label, None, 0, 1, false)
+            else {
+                panic!("expected a pending focus request");
+            };
+            guard.end(label, end, None, 0);
+            guard.focus_in(label, 2);
+            assert_eq!(confirmed.try_recv(), Err(TryRecvError::Closed));
+        }
+        let mut guard = Guard::new();
+        let click = guard.gtk_pointer(label, 0, 100, 7);
+        assert!(matches!(
+            guard.request_focus(label, Some(click.sequence + 1), 0, 1, false),
+            FocusRequest::Denied
+        ));
+        let FocusRequest::Present { mut confirmed, .. } =
+            guard.request_focus(label, None, 0, 0, false)
+        else {
+            panic!("expected a pending focus request");
+        };
+        guard.focus_in(label, TIMEOUT_MS);
+        assert_eq!(confirmed.try_recv(), Err(TryRecvError::Empty));
+        guard.timeout(click.sequence, TIMEOUT_MS);
+        assert_eq!(confirmed.try_recv(), Err(TryRecvError::Closed));
+        assert!(matches!(
+            guard.request_focus(label, None, 0, TIMEOUT_MS, false),
+            FocusRequest::Denied
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_focus_event_has_a_bounded_ipc_reply() {
+        let mut guard = Guard::new();
+        guard.gtk_pointer("palette", 0, 100, 7);
+        let request = guard.request_focus("palette", None, 0, TIMEOUT_MS - 1, false);
+        assert!(!request.confirmed().await);
+        guard.focus_in("palette", TIMEOUT_MS + 1);
+        guard.end("palette", End::Hide, None, 0);
+        assert!(
+            !guard
+                .request_focus("palette", None, 0, TIMEOUT_MS + 2, false)
+                .confirmed()
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_click_in_another_window_revokes_the_first_presentation() {
+        let mut guard = Guard::new();
+        let first = guard.gtk_pointer("palette", 0, 100, 7);
+        let waiting = guard.request_focus("palette", Some(first.sequence), 101, 1, false);
+        guard.gtk_pointer("panel", 2, 102, 9);
+        guard.focus_in("palette", 3);
+        assert!(!waiting.confirmed().await);
+        // A delayed IPC predating this panel click cannot borrow its timestamp.
+        assert!(matches!(
+            guard.request_focus("panel", None, 101, 4, false),
+            FocusRequest::Denied
+        ));
+        let waiting = guard.request_focus("panel", None, 103, 4, false);
+        guard.focus_in("panel", 5);
+        assert!(waiting.confirmed().await);
+    }
+
+    #[test]
+    fn refused_and_expired_presentations_cannot_authorize_keys_on_late_focus_in() {
+        for label in ["plugin-panel-example", "toolset-inspector"] {
+            for expired in [false, true] {
+                let mut guard = Guard::new();
+                let click = guard.gtk_pointer(label, 0, 100, 7);
+                let request = guard.request_focus(label, Some(click.sequence), 101, 1, false);
+                if expired {
+                    guard.timeout(click.sequence, TIMEOUT_MS);
+                } else {
+                    guard.finish_focus(label, request.sequence(), 2, |_| false);
+                }
+                guard.focus_in(label, TIMEOUT_MS + 1);
+                assert!(!guard.blocks(TIMEOUT_MS + 1));
+                assert!(!guard.allows_window_keys(label));
+                assert!(matches!(
+                    guard.request_focus(label, None, 0, TIMEOUT_MS + 2, true),
+                    FocusRequest::Denied
+                ));
+                // Even a completion that sampled focus before expiry cannot commit later.
+                assert!(
+                    !guard
+                        .finish_focus(label, request.sequence(), TIMEOUT_MS + 3, |eligible| {
+                            eligible
+                        })
+                        .0
+                );
+                assert!(!guard.has_confirmed_focus(label));
+
+                // The user can acquire the now physically focused window with a fresh click.
+                let retry = guard.gtk_pointer(label, TIMEOUT_MS + 4, 1200, 8);
+                let request =
+                    guard.request_focus(label, Some(retry.sequence), 1201, TIMEOUT_MS + 5, true);
+                assert!(matches!(request, FocusRequest::Focused(_)));
+                assert!(
+                    guard
+                        .finish_focus(label, request.sequence(), TIMEOUT_MS + 6, |eligible| {
+                            eligible
+                        })
+                        .0
+                );
+                assert!(guard.allows_window_keys(label));
+            }
+        }
+    }
+
+    #[test]
+    fn closing_a_window_cancels_even_a_grant_already_queued_for_its_page() {
+        for label in ["plugin-panel-example", "toolset-inspector"] {
+            for close in [End::Hide, End::Destroy] {
+                let mut guard = Guard::new();
+                let click = guard.gtk_pointer(label, 0, 100, 7);
+                let first = guard.request_focus(label, Some(click.sequence), 101, 1, false);
+                guard.focus_in(label, 2);
+                guard.end(label, close, None, 0);
+                guard.focus_in(label, 3);
+                assert!(!guard.allows_window_keys(label));
+
+                let reopened = guard.gtk_pointer(label, 4, 104, 8);
+                let next = guard.request_focus(label, Some(reopened.sequence), 105, 5, false);
+                assert!(
+                    !guard
+                        .finish_focus(label, first.sequence(), 6, |eligible| eligible)
+                        .0
+                );
+                assert!(guard.blocks(6));
+                assert!(!guard.allows_window_keys(label));
+                guard.focus_in(label, 7);
+                assert!(
+                    guard
+                        .finish_focus(label, next.sequence(), 8, |eligible| eligible)
+                        .0
+                );
+                assert!(guard.allows_window_keys(label));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn superseded_grant_cannot_commit_or_clear_the_second_acquisition() {
+        for label in ["plugin-panel-example", "toolset-inspector"] {
+            let mut guard = Guard::new();
+            let first = guard.gtk_pointer(label, 0, 100, 7);
+            let request = guard.request_focus(label, Some(first.sequence), 101, 1, false);
+            guard.focus_in(label, 2);
+            assert!(request.confirmed().await);
+            let second = guard.gtk_pointer(label, 3, 103, 8);
+            let retry = guard.request_focus(label, Some(second.sequence), 104, 4, false);
+            // GTK cannot tag focus-in with an epoch. The notification can wake the
+            // retry, but only the retry can explicitly acquire the now-focused window.
+            guard.focus_in(label, 5);
+            assert!(retry.confirmed().await);
+            assert!(!guard.allows_window_keys(label));
+            assert!(
+                !guard
+                    .finish_focus(label, Some(first.sequence), 6, |eligible| eligible)
+                    .0
+            );
+            assert!(guard.blocks(6));
+            assert!(
+                guard
+                    .finish_focus(label, Some(second.sequence), 7, |eligible| eligible)
+                    .0
+            );
+            assert!(
+                !guard
+                    .finish_focus(label, Some(first.sequence), 8, |eligible| eligible)
+                    .0
+            );
+            assert!(guard.allows_window_keys(label));
+        }
+    }
+
+    #[test]
+    fn keyboard_popover_navigation_needs_no_field_and_ends_on_close_or_mouse_reopen() {
+        let label = "toolset-popover-stereo";
+        let mut guard = Guard::new();
+        for close in [true, false] {
+            guard.set_keyboard_popover(label, true);
+            assert!(guard.allows_window_keys(label));
+            assert!(!guard.has_confirmed_focus(label));
+            if close {
+                guard.end(label, End::Hide, None, 0);
+            } else {
+                guard.set_keyboard_popover(label, false);
+            }
+            assert!(!guard.allows_window_keys(label));
+        }
+    }
+
+    #[test]
+    fn document_key_presses_guard_the_field_before_and_after_confirmation() {
+        for (pending, leased) in [(true, false), (false, true)] {
+            for key in [
+                "3",
+                "0",
+                "n",
+                "Delete",
+                "Backspace",
+                "Return",
+                "Left",
+                "KP_Up",
+                "ISO_Left_Tab",
+            ] {
+                assert!(blocks_document_key(
+                    pending, leased, key, false, false, false
+                ));
+                assert!(!blocks_document_key(false, false, key, false, false, false));
+            }
+            assert!(blocks_document_key(
+                pending, leased, "a", false, true, false
+            ));
+            assert!(!blocks_document_key(
+                pending, leased, "s", false, true, false
+            ));
+        }
+    }
 
     #[test]
     fn every_terminal_path_clears_pending_only() {
