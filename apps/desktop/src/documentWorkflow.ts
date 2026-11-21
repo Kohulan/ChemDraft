@@ -20101,7 +20101,7 @@ export function applyEditorSaveResultToSelectedObject(
 export function applyEditorSaveResultWithLabelWarnings(
   document: ChemDraftDocument,
   result: EditorSaveResult
-): { document: ChemDraftDocument; labelWarnings: EditorSaveLabelWarning[]; refusal?: string } {
+): { document: ChemDraftDocument; labelWarnings: EditorSaveLabelWarning[]; refusal?: string; unchanged?: boolean } {
   const selectedMolecule = getSelectedMolecule(document);
   if (!selectedMolecule) {
     throw new Error("Cannot apply editor save result: no molecule is selected.");
@@ -20111,6 +20111,15 @@ export function applyEditorSaveResultWithLabelWarnings(
   }
 
   const synced = syncMoleculePreviewFromEditorSave(selectedMolecule, result.object);
+  // 1.2.2 fallback: a molecule with charge or radical marks is never rewritten from the structure
+  // editor. An unchanged save is a no-op; any chemical change is refused. The carry and refusal
+  // logic below stays in place but is unreachable for a marked molecule.
+  const markedPage = document.pages.find((candidate) => candidate.objects.some((object) => object.id === selectedMolecule.id));
+  if (markedPage && moleculeHasElectronMarks(markedPage, selectedMolecule)) {
+    return editorSaveChemistryUnchanged(selectedMolecule, synced.molecule, result.object)
+      ? { document, labelWarnings: [], unchanged: true }
+      : { document, labelWarnings: [], refusal: EDITOR_SAVE_MARKED_MOLECULE_REFUSAL };
+  }
   // The save reuses atom and bond ids by index, so adding or removing atoms could silently put a
   // charge or radical mark on another atom: refuse it, leaving the document unchanged.
   const page = document.pages.find((candidate) => candidate.objects.some((object) => object.id === selectedMolecule.id));
@@ -20125,6 +20134,122 @@ export function applyEditorSaveResultWithLabelWarnings(
   return "refusal" in applied
     ? { document, labelWarnings: [], refusal: applied.refusal }
     : { document: applied.document, labelWarnings: synced.labelWarnings };
+}
+
+export const EDITOR_SAVE_MARKED_MOLECULE_REFUSAL =
+  "This molecule has charge or radical marks; edit it on the canvas, or remove the marks first, then use the structure editor.";
+
+/**
+ * Whether the molecule carries any charge or radical mark: anchored to one of its atoms, bonds or to
+ * the object itself, or a legacy loose mark that commit normalization assigns to one of its atoms.
+ * Read from the mark objects on the page, not from the atoms' `markCharge`/`markRadicals`, which
+ * normalization recomputes from them.
+ */
+export function moleculeHasElectronMarks(page: DocumentPage, molecule: MoleculeObject): boolean {
+  const objectById = objectByIdIndex(page.objects);
+  const isChargeOrRadical = (object: DocumentObject | undefined): object is ElectronMarkObject =>
+    object?.type === "electron-mark" && (object.markKind === "charge" || object.markKind === "radical-dot");
+  for (const [markId, owner] of committedElectronMarkAssignments(page).anchorByMarkId) {
+    if (owner?.objectId === molecule.id && isChargeOrRadical(objectById.get(markId))) return true;
+  }
+  return page.objects.some((object) =>
+    isChargeOrRadical(object) && (object.anchor as { objectId?: string }).objectId === molecule.id);
+}
+
+/**
+ * Whether a structure-editor result describes the same chemistry as the molecule it was opened on:
+ * the same atoms by position with the same elements (and isotopes), the same bonds as atom-index
+ * pairs with the same orders, and the same total charge and radical count on every atom.
+ * Coordinates are ignored (the editor re-centres). `saved` is the molecule rebuilt from the V3000
+ * (or the editor's own object when it is not V3000); `raw` is the editor's object, read for RAD.
+ */
+function editorSaveChemistryUnchanged(previous: MoleculeObject, saved: MoleculeObject, raw: MoleculeObject): boolean {
+  if (previous.atoms.length !== saved.atoms.length || previous.bonds.length !== saved.bonds.length) return false;
+  const radicalCodeFromV3000 = new Map<number, number>();
+  if (raw.structureFormat === "molfile-v3000") {
+    let inAtoms = false;
+    let index = 0;
+    for (const rawLine of raw.structure.split(/\r?\n/)) {
+      const line = rawLine.trim().replace(/^M\s+V30\b/, "M V30");
+      if (line === "M V30 BEGIN ATOM") { inAtoms = true; continue; }
+      if (line === "M V30 END ATOM") { inAtoms = false; continue; }
+      if (!inAtoms || !line.startsWith("M V30 ")) continue;
+      index += 1;
+      const rad = /\bRAD=(\d+)\b/.exec(line);
+      if (rad) radicalCodeFromV3000.set(index, Number(rad[1]));
+    }
+  }
+  // The molfile writer's radical code: 1 radical -> 2, 2 -> 3, anything else none.
+  const radicalCode = (radicals: number | undefined) => radicals === 1 ? 2 : radicals === 2 ? 3 : 0;
+  // The stored SMILES given to the editor carries no radicals, so the editor returns no RAD for an
+  // unchanged radical-marked molecule: radicals live in the marks and take part in the comparison
+  // only when the returned V3000 carries RAD= on some atom.
+  const compareRadicals = radicalCodeFromV3000.size > 0;
+  const atomsMatch = previous.atoms.every((atom, index) => {
+    const after = saved.atoms[index]!;
+    return atom.element === after.element && (atom.isotope ?? 0) === (after.isotope ?? 0) &&
+      atom.formalCharge === after.formalCharge &&
+      (!compareRadicals || radicalCode(atom.markRadicals) === (radicalCodeFromV3000.get(index + 1) ?? 0));
+  });
+  if (!atomsMatch) return false;
+  const bondKeys = (molecule: MoleculeObject) => {
+    const indexById = new Map(molecule.atoms.map((atom, index) => [atom.id, index] as const));
+    return molecule.bonds.map((bond) => {
+      const ends = [indexById.get(bond.fromAtomId), indexById.get(bond.toAtomId)].sort();
+      return `${ends.join("-")}:${bond.order}`;
+    }).sort().join("\t");
+  };
+  if (bondKeys(previous) !== bondKeys(saved)) return false;
+  return editorSaveBondStereoUnchanged(previous, raw);
+}
+
+/**
+ * The bond stereo (CFG on the V3000 bond lines) of a molfile as sorted keys. A wedge or hash is
+ * directional (narrow end first), so its key keeps the atom order; an "either" bond (CFG=2) does not.
+ */
+function v3000BondStereoKeys(structure: string): string[] {
+  const keys: string[] = [];
+  let inBonds = false;
+  let pending = "";
+  for (const rawLine of structure.split(/\r?\n/)) {
+    let line = rawLine.trim().replace(/^M\s+V30\b/, "M V30");
+    if (line === "M V30 BEGIN BOND") { inBonds = true; continue; }
+    if (line === "M V30 END BOND") { inBonds = false; pending = ""; continue; }
+    if (!inBonds || !line.startsWith("M V30 ")) continue;
+    line = pending + line.slice("M V30 ".length);
+    if (line.endsWith("-")) { pending = line.slice(0, -1); continue; }
+    pending = "";
+    const fields = line.trim().split(/\s+/);
+    const cfg = /\bCFG=(\d+)\b/.exec(line);
+    if (!cfg || cfg[1] === "0") continue;
+    const ends = [fields[2], fields[3]];
+    keys.push(cfg[1] === "2" ? `${[...ends].sort().join("-")}:CFG2` : `${ends.join(">")}:CFG${cfg[1]}`);
+  }
+  return keys.sort();
+}
+
+/**
+ * Whether the editor's returned bond stereo (wedges, hashes, either-bonds) is exactly what the
+ * app's own writer emits for the molecule it was opened on. Anything else, or anything that cannot
+ * be compared, counts as a change: the save path does not read bond stereo back, so a stereo-only
+ * edit must be refused rather than silently dropped.
+ */
+function editorSaveBondStereoUnchanged(previous: MoleculeObject, raw: MoleculeObject): boolean {
+  if (raw.structureFormat !== "molfile-v3000") {
+    const styleKey = (bond: MoleculeBond) => `${bond.display?.bondStyle ?? ""}|${bond.stereo ?? ""}`;
+    return previous.bonds.length === raw.bonds.length &&
+      previous.bonds.every((bond, index) => styleKey(bond) === styleKey(raw.bonds[index]!));
+  }
+  const returned = v3000BondStereoKeys(raw.structure);
+  if (returned.length === 0 && !previous.bonds.some((bond) => bond.display?.bondStyle !== undefined || bond.stereo !== undefined)) {
+    return true;
+  }
+  try {
+    const expected = v3000BondStereoKeys(moleculeToMolfileV3000(previous, { kekuleBondOrders: new Map() }).contents);
+    return expected.length === returned.length && expected.every((key, index) => key === returned[index]);
+  } catch {
+    return false;
+  }
 }
 
 export const EDITOR_SAVE_MARK_SHIFT_REFUSAL =

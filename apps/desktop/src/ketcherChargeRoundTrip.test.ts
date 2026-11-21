@@ -13,8 +13,7 @@ import {
   applyChargeToolAtNativeAtom,
   applyEditorSaveResultWithLabelWarnings,
   createPhase4Document,
-  EDITOR_SAVE_MARK_SHIFT_REFUSAL,
-  editorSaveChargeContradictsMarkRefusal,
+  EDITOR_SAVE_MARKED_MOLECULE_REFUSAL,
   normalizeCommittedDocument
 } from "./documentWorkflow";
 
@@ -92,7 +91,7 @@ function unchangedKetcherSave(document: ChemDraftDocument): { opened: MoleculeOb
 function editedKetcherSave(
   document: ChemDraftDocument,
   edit: (v3000: string) => string
-): { v3000: string; selected: ChemDraftDocument; refusal?: string; committed: ChemDraftDocument } {
+): { v3000: string; selected: ChemDraftDocument; refusal?: string; unchanged?: boolean; applied: ChemDraftDocument; committed: ChemDraftDocument } {
   const selected = selectMolecule(document);
   const opened = moleculeOf(selected);
   const v3000 = edit(moleculeToMolfileV3000(opened, { kekuleBondOrders: new Map() }).contents);
@@ -100,7 +99,9 @@ function editedKetcherSave(
   const applied = applyEditorSaveResultWithLabelWarnings(selected, { object: saved, warnings: [] });
   // A refused save returns the document it was given, untouched: the caller commits nothing.
   if (applied.refusal) expect(applied.document).toBe(selected);
-  return { v3000, selected, refusal: applied.refusal, committed: normalizeCommittedDocument(applied.document) };
+  if (applied.unchanged) expect(applied.document).toBe(selected);
+  return { v3000, selected, refusal: applied.refusal, unchanged: applied.unchanged, applied: applied.document,
+    committed: normalizeCommittedDocument(applied.document) };
 }
 
 /** The V3000 Ketcher returns with `element`'s atom set to CHG=`charge` (the atom's total charge). */
@@ -323,36 +324,36 @@ describe("unchanged Ketcher save keeps charge and electron marks", () => {
     expect(marksOf(committed)[0]).toMatchObject({ markKind: "charge", charge: -1 });
   });
 
-  it("(g) a methyl added on the marked N in Ketcher is refused (ids are reused by index), document unchanged", () => {
+  it("(g) 1.2.2 fallback: a methyl added on the marked N in Ketcher is refused, document unchanged", () => {
     const { document: plain, nitrogenId } = methylamine();
     const charged = chargedByTool(plain, nitrogenId, [1]);
     expect(chargeState(charged, nitrogenId)).toEqual({ formalCharge: 1, markCharge: 1, marks: 1 });
 
     const { v3000, selected, refusal } = editedKetcherSave(charged, appendMethylOnNitrogen);
     expect(nitrogenLine(v3000)).toContain("CHG=1");
-    expect(refusal).toBe(EDITOR_SAVE_MARK_SHIFT_REFUSAL);
+    expect(refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
     expect(moleculeOf(selected).atoms).toHaveLength(2);
     expect(chargeState(selected, nitrogenId)).toEqual({ formalCharge: 1, markCharge: 1, marks: 1 });
   });
 
-  it("(g2) a bond order changed in Ketcher (C-N to C=N) keeps N's mark-derived +1 and its mark", () => {
+  it("(g2) 1.2.2 fallback: a bond order changed in Ketcher (C-N to C=N) on a marked molecule is refused", () => {
     const { document: plain, nitrogenId } = methylamine();
     const charged = chargedByTool(plain, nitrogenId, [1]);
-    const { v3000, committed } = editedKetcherSave(charged, molfile =>
+    const { v3000, selected, refusal } = editedKetcherSave(charged, molfile =>
       molfile.replace(/^(M\s+V30\s+1\s+)1(\s+1\s+2)\s*$/m, "$12$2"));
     expect(v3000).toMatch(/^M\s+V30\s+1\s+2\s+1\s+2\s*$/m);
-    expect(moleculeOf(committed).bonds[0].order).toBe("double");
-    expect(chargeState(committed, nitrogenId)).toEqual({ formalCharge: 1, markCharge: 1, marks: 1 });
-    expect(marksOf(committed)[0]).toMatchObject({ markKind: "charge", charge: 1, anchor: { kind: "atom", atomId: nitrogenId } });
+    expect(refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
+    expect(moleculeOf(selected).bonds[0].order).toBe("single");
+    expect(chargeState(selected, nitrogenId)).toEqual({ formalCharge: 1, markCharge: 1, marks: 1 });
   });
 
-  it("(i) deleting the marked N in Ketcher is refused, leaving the molecule and its + mark unchanged", () => {
+  it("(i) 1.2.2 fallback: deleting the marked N in Ketcher is refused, leaving the molecule and its + mark unchanged", () => {
     const { document: plain, nitrogenId } = methylamine();
     const charged = chargedByTool(plain, nitrogenId, [1]);
     const { selected, refusal } = editedKetcherSave(charged, molfile => molfile.split(/\r?\n/)
       .filter(line => !/^M\s+V30\s+2\s+N\s/.test(line) && !/^M\s+V30\s+1\s+1\s+1\s+2\s*$/.test(line))
       .map(line => line.replace(/^(M\s+V30\s+COUNTS\s+)2\s+1\b/, "$11 0")).join("\n"));
-    expect(refusal).toBe(EDITOR_SAVE_MARK_SHIFT_REFUSAL);
+    expect(refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
     expect(moleculeOf(selected).atoms.map(atom => atom.element)).toEqual(["C", "N"]);
     expect(chargeState(selected, nitrogenId)).toEqual({ formalCharge: 1, markCharge: 1, marks: 1 });
   });
@@ -384,7 +385,9 @@ describe("unchanged Ketcher save keeps charge and electron marks", () => {
   });
 });
 
-describe("a Ketcher charge that contradicts a charge mark still on the atom", () => {
+// 1.2.2 fallback: any charge change on a marked molecule is refused with the one fallback message,
+// whether or not it contradicts the mark (the contradiction check is unreachable for marked molecules).
+describe("a Ketcher charge change on a molecule with a charge mark (1.2.2 fallback: refused)", () => {
   function plusMarkedNitrogen() {
     const { document: plain, nitrogenId } = methylamine();
     const charged = chargedByTool(plain, nitrogenId, [1]);
@@ -402,12 +405,12 @@ describe("a Ketcher charge that contradicts a charge mark still on the atom", ()
     return { charged, carbonId };
   }
 
-  it("refuses N's charge cleared in Ketcher while its + mark stays, naming the atom; document unchanged", () => {
+  it("refuses N's charge cleared in Ketcher while its + mark stays; document unchanged", () => {
     const { charged, nitrogenId } = plusMarkedNitrogen();
     const { v3000, selected, refusal } = editedKetcherSave(charged, withCharge("N", 0));
     expect(nitrogenLine(v3000)).not.toContain("CHG=");
-    expect(refusal).toBe(editorSaveChargeContradictsMarkRefusal("N", 2));
-    expect(refusal).toBe("Ketcher changed the charge on N atom 2 but its charge mark is still on the canvas. Remove or move the charge mark on the canvas first.");
+    expect(refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
+    expect(refusal).toBe("This molecule has charge or radical marks; edit it on the canvas, or remove the marks first, then use the structure editor.");
     expect(chargeState(selected, nitrogenId)).toEqual({ formalCharge: 1, markCharge: 1, marks: 1 });
   });
 
@@ -415,39 +418,37 @@ describe("a Ketcher charge that contradicts a charge mark still on the atom", ()
     const { charged, nitrogenId } = plusMarkedNitrogen();
     const { v3000, selected, refusal } = editedKetcherSave(charged, withCharge("N", -1));
     expect(nitrogenLine(v3000)).toContain("CHG=-1");
-    expect(refusal).toBe(editorSaveChargeContradictsMarkRefusal("N", 2));
+    expect(refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
     expect(chargeState(selected, nitrogenId)).toEqual({ formalCharge: 1, markCharge: 1, marks: 1 });
   });
 
-  it("commits N with a + mark raised to 2+ in Ketcher: total 2, one + of it from the one mark", () => {
+  it("refuses N with a + mark raised to 2+ in Ketcher (was committed before the fallback)", () => {
     const { charged, nitrogenId } = plusMarkedNitrogen();
-    const { v3000, refusal, committed } = editedKetcherSave(charged, withCharge("N", 2));
+    const { v3000, selected, refusal } = editedKetcherSave(charged, withCharge("N", 2));
     expect(nitrogenLine(v3000)).toContain("CHG=2");
-    expect(refusal).toBeUndefined();
-    expect(chargeState(committed, nitrogenId)).toEqual({ formalCharge: 2, markCharge: 1, marks: 1 });
-    expect(marksOf(committed)[0]).toMatchObject({ markKind: "charge", charge: 1 });
+    expect(refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
+    expect(chargeState(selected, nitrogenId)).toEqual({ formalCharge: 1, markCharge: 1, marks: 1 });
   });
 
-  it("commits C with a - mark lowered to 2- in Ketcher: total -2, one - of it from the one mark", () => {
+  it("refuses C with a - mark lowered to 2- in Ketcher (was committed before the fallback)", () => {
     const { charged, carbonId } = minusMarkedCarbon();
-    const { refusal, committed } = editedKetcherSave(charged, withCharge("C", -2));
-    expect(refusal).toBeUndefined();
-    expect(chargeState(committed, carbonId)).toEqual({ formalCharge: -2, markCharge: -1, marks: 1 });
-    expect(marksOf(committed)[0]).toMatchObject({ markKind: "charge", charge: -1 });
+    const { selected, refusal } = editedKetcherSave(charged, withCharge("C", -2));
+    expect(refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
+    expect(chargeState(selected, carbonId)).toEqual({ formalCharge: -1, markCharge: -1, marks: 1 });
   });
 
-  it.each([0, 1])("refuses C with a - mark set to CHG %i in Ketcher, naming the atom", (charge) => {
+  it.each([0, 1])("refuses C with a - mark set to CHG %i in Ketcher", (charge) => {
     const { charged, carbonId } = minusMarkedCarbon();
     const { selected, refusal } = editedKetcherSave(charged, withCharge("C", charge));
-    expect(refusal).toBe(editorSaveChargeContradictsMarkRefusal("C", 1));
+    expect(refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
     expect(chargeState(selected, carbonId)).toEqual({ formalCharge: -1, markCharge: -1, marks: 1 });
   });
 });
 
-describe("a Ketcher save keeps every charge and radical mark on its atom", () => {
-  const carbonIdOf = (document: ChemDraftDocument) => moleculeOf(document).atoms.find(atom => atom.element === "C")!.id;
-
-  it("a bond-anchored radical on N follows N when C and N trade places in Ketcher", () => {
+// 1.2.2 fallback: atoms trading places is a coordinate-only edit, so the save is a no-op: the
+// document is returned exactly as it was and the marks are never moved.
+describe("a coordinate-only Ketcher save on a marked molecule leaves the document exactly as it was", () => {
+  it("a bond-anchored radical on N: C and N trading places in Ketcher is a no-op", () => {
     const { document: plain, nitrogenId } = methylamine();
     const anchored = normalizeCommittedDocument(applyChargeToolAtNativeAtom(plain, { kind: "radical-dot" },
       { kind: "atom", objectId, atomId: nitrogenId, distanceToPointer: 0 }));
@@ -458,43 +459,30 @@ describe("a Ketcher save keeps every charge and radical mark on its atom", () =>
       changes: { anchor: { kind: "bond", objectId, bondId: bond.id }, atomAssociation: undefined } }));
     expect(marksOf(radical)[0]!.anchor).toMatchObject({ kind: "bond", bondId: bond.id });
     expect(nitrogenOf(radical, nitrogenId)).toMatchObject({ formalCharge: 0, markRadicals: 1 });
-    const offsetBefore = markOffset(radical, marksOf(radical)[0]!, nitrogenId);
 
-    const { refusal, committed } = editedKetcherSave(radical, swapAtomPositions(1, 2));
+    const { selected, refusal, unchanged, applied } = editedKetcherSave(radical, swapAtomPositions(1, 2));
     expect(refusal).toBeUndefined();
-    const carbonId = carbonIdOf(committed);
-    // N really moved: it now sits where C was.
-    expect(nitrogenOf(committed, nitrogenId).x).toBeLessThan(atomOf(committed, carbonId).x);
-    expect(nitrogenOf(committed, nitrogenId).markRadicals ?? 0).toBe(1);
-    expect(atomOf(committed, carbonId).markRadicals ?? 0).toBe(0);
-    expect(marksOf(committed)).toHaveLength(1);
-    const after = marksOf(committed)[0]!;
-    expect(after.anchor).toMatchObject({ kind: "atom", objectId, atomId: nitrogenId });
-    const offsetAfter = markOffset(committed, after, nitrogenId);
-    expect(offsetAfter.dx).toBeCloseTo(offsetBefore.dx, 6);
-    expect(offsetAfter.dy).toBeCloseTo(offsetBefore.dy, 6);
+    expect(unchanged).toBe(true);
+    expect(applied).toBe(selected);
+    expect(marksOf(applied)[0]!.anchor).toMatchObject({ kind: "bond", bondId: bond.id });
+    expect(nitrogenOf(applied, nitrogenId)).toMatchObject({ formalCharge: 0, markRadicals: 1 });
   });
 
-  it("a legacy loose + mark on N follows N when C and N trade places in Ketcher", () => {
+  it("a legacy loose + mark on N: C and N trading places in Ketcher is a no-op, the mark stays loose", () => {
     const { document: plain, nitrogenId } = methylamine();
     const loose = looseChargeOnNitrogen(plain, nitrogenId);
-    const offsetBefore = markOffset(loose, marksOf(loose)[0]!, nitrogenId);
 
-    const { v3000, refusal, committed } = editedKetcherSave(loose, swapAtomPositions(1, 2));
+    const { v3000, selected, refusal, unchanged, applied } = editedKetcherSave(loose, swapAtomPositions(1, 2));
     expect(nitrogenLine(v3000)).toContain("CHG=1");
     expect(refusal).toBeUndefined();
-    const carbonId = carbonIdOf(committed);
-    expect(chargeState(committed, nitrogenId)).toEqual({ formalCharge: 1, markCharge: 1, marks: 1 });
-    expect(chargeState(committed, carbonId)).toEqual({ formalCharge: 0, markCharge: 0, marks: 1 });
-    const after = marksOf(committed)[0]!;
-    expect(after.anchor).toMatchObject({ kind: "atom", objectId, atomId: nitrogenId });
-    const offsetAfter = markOffset(committed, after, nitrogenId);
-    expect(offsetAfter.dx).toBeCloseTo(offsetBefore.dx, 6);
-    expect(offsetAfter.dy).toBeCloseTo(offsetBefore.dy, 6);
+    expect(unchanged).toBe(true);
+    expect(applied).toBe(selected);
+    expect(marksOf(applied)[0]!.anchor.kind).toBe("point");
+    expect(chargeState(applied, nitrogenId)).toEqual({ formalCharge: 1, markCharge: 1, marks: 1 });
   });
 });
 
-describe("the Ketcher id-shift guard on a molecule with a radical", () => {
+describe("1.2.2 fallback: every chemical edit on a molecule with a radical is refused", () => {
   function radicalOn(smiles: string, atom: number) {
     const { document: plain, atomIds } = linearMolecule(smiles);
     const document = normalizeCommittedDocument(applyChargeToolAtNativeAtom(plain, { kind: "radical-dot" },
@@ -511,25 +499,24 @@ describe("the Ketcher id-shift guard on a molecule with a radical", () => {
     const [, c2, c3, c4] = atoms;
     const v3000 = editorV3000([c2!, c3!, c4!, { element: "C", x: c2!.x, y: c2!.y + 30 }], [[1, 2], [2, 3], [1, 4]]);
     const { selected, refusal } = editedKetcherSave(document, () => v3000);
-    expect(refusal).toBe(EDITOR_SAVE_MARK_SHIFT_REFUSAL);
+    expect(refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
     expect(moleculeOf(selected).atoms.map(atom => atom.id)).toEqual(atomIds);
     expect(atomOf(selected, atomIds[1]!).markRadicals).toBe(1);
   });
 
-  it("commits an element change far from the radical, which stays on its atom", () => {
+  it("refuses an element change far from the radical (was committed before the fallback)", () => {
     const { document, atomIds } = radicalOn("CCCCC", 0);
-    const { refusal, committed } = editedKetcherSave(document, molfile =>
+    const { selected, refusal } = editedKetcherSave(document, molfile =>
       molfile.replace(/^(M\s+V30\s+5\s+)C(\s)/m, "$1N$2"));
-    expect(refusal).toBeUndefined();
-    expect(moleculeOf(committed).atoms.map(atom => atom.element)).toEqual(["C", "C", "C", "C", "N"]);
-    expect(atomOf(committed, atomIds[0]!).markRadicals).toBe(1);
-    expect(marksOf(committed)[0]!.anchor).toMatchObject({ kind: "atom", atomId: atomIds[0] });
+    expect(refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
+    expect(moleculeOf(selected).atoms.map(atom => atom.element)).toEqual(["C", "C", "C", "C", "C"]);
+    expect(atomOf(selected, atomIds[0]!).markRadicals).toBe(1);
   });
 
-  it("still refuses an element change on a direct neighbour of the radical's atom", () => {
+  it("refuses an element change on a direct neighbour of the radical's atom", () => {
     const { document } = radicalOn("CCCCC", 0);
     const { refusal } = editedKetcherSave(document, molfile => molfile.replace(/^(M\s+V30\s+2\s+)C(\s)/m, "$1N$2"));
-    expect(refusal).toBe(EDITOR_SAVE_MARK_SHIFT_REFUSAL);
+    expect(refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
   });
 });
 

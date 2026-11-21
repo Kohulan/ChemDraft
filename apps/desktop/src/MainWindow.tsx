@@ -22743,6 +22743,12 @@ export function MainWindow({
       setStatus(applied.refusal);
       return false;
     }
+    // 1.2.2 fallback: an unchanged save of a molecule with electron marks leaves the document, the
+    // selection and the undo stack alone. Returning false keeps the host from saying "Applied".
+    if (applied.unchanged) {
+      setStatus("No changes from the structure editor");
+      return false;
+    }
     // The commit can still decline (a page-size question already open, a chemistry refusal): it has
     // set its own status then, which an "Applied" from the host must not overwrite.
     const committed = commitDocumentChangeWithPageFit(applied.document, undefined, undefined, undefined, CHEMISTRY_EDIT);

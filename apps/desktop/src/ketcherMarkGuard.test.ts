@@ -1,14 +1,14 @@
 // A Ketcher (structure-editor) save reuses atom and bond ids by array index (`parseV3000MoleculeGraph`),
 // so an edit that adds, removes or rewires atoms could silently put a charge or radical mark on a
-// different atom. Such a save of a marked molecule is refused; same-count edits and unmarked
-// molecules commit as before.
+// different atom. 1.2.2 fallback: any chemical edit of a marked molecule is refused with one message
+// (see ketcherMarkedFallback.test.ts); unmarked molecules commit as before.
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { applyPatch, type ChemDraftDocument, type MoleculeAtom, type MoleculeBond, type MoleculeObject } from "@chemdraft/chem-core";
 import { phase4Timestamp } from "@chemdraft/document-workflow-core";
 import {
   applyEditorSaveResultWithLabelWarnings,
-  EDITOR_SAVE_MARK_SHIFT_REFUSAL,
+  EDITOR_SAVE_MARKED_MOLECULE_REFUSAL,
   normalizeCommittedDocument,
   selectDocumentObject
 } from "./documentWorkflow";
@@ -69,8 +69,8 @@ describe("Ketcher saves of a molecule with charge or radical marks", () => {
     const { document } = electronMarkDropFixture();
     const { atoms, bonds } = withoutFirstAtom(dropMolecule(document));
     const { selected, applied } = save(document, atoms, bonds);
-    expect(applied.refusal).toBe(EDITOR_SAVE_MARK_SHIFT_REFUSAL);
-    expect(applied.refusal).toMatch(/^Ketcher can't keep this molecule's charge and radical marks on the right atoms/);
+    expect(applied.refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
+    expect(applied.refusal).toMatch(/^This molecule has charge or radical marks; edit it on the canvas/);
     expect(applied.document).toBe(selected);
   });
 
@@ -78,7 +78,7 @@ describe("Ketcher saves of a molecule with charge or radical marks", () => {
     const document = bondAnchoredCharge();
     const { atoms, bonds } = withoutFirstAtom(dropMolecule(document));
     const { selected, applied } = save(document, atoms, bonds);
-    expect(applied.refusal).toBe(EDITOR_SAVE_MARK_SHIFT_REFUSAL);
+    expect(applied.refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
     expect(applied.document).toBe(selected);
   });
 
@@ -98,11 +98,11 @@ describe("Ketcher saves of a molecule with charge or radical marks", () => {
     expect(atoms).toHaveLength(molecule.atoms.length);
     expect(bonds).toHaveLength(molecule.bonds.length);
     const { selected, applied } = save(document, atoms, bonds);
-    expect(applied.refusal).toBe(EDITOR_SAVE_MARK_SHIFT_REFUSAL);
+    expect(applied.refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
     expect(applied.document).toBe(selected);
   });
 
-  it("commits a same-count bond-order change and keeps the charge on N", () => {
+  it("1.2.2 fallback: refuses a same-count bond-order change (was committed before the fallback)", () => {
     const { document, nitrogen } = electronMarkDropFixture();
     const molecule = dropMolecule(document);
     const before = molecule.atoms.find((atom) => atom.id === nitrogen.id)!;
@@ -111,15 +111,13 @@ describe("Ketcher saves of a molecule with charge or radical marks", () => {
       molecule.atoms.findIndex((atom) => atom.id === bond.fromAtomId) > 7)!;
     expect(target).toBeDefined();
     const bonds = molecule.bonds.map((bond) => bond.id === target.id ? { ...bond, order: "single" as const } : bond);
-    const { applied } = save(document, molecule.atoms, bonds);
-    expect(applied.refusal).toBeUndefined();
-    const committed = normalizeCommittedDocument(applied.document);
-    const after = dropMolecule(committed);
-    expect(after.bonds.find((bond) => bond.id === target.id)?.order).toBe("single");
-    const n = after.atoms.find((atom) => atom.id === nitrogen.id)!;
-    expect(n.element).toBe("N");
-    expect(n).toMatchObject({ formalCharge: before.formalCharge, markCharge: 1 });
-    expect(dropMark(committed).anchor).toMatchObject({ kind: "atom", atomId: nitrogen.id });
+    const { selected, applied } = save(document, molecule.atoms, bonds);
+    expect(applied.refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
+    expect(applied.document).toBe(selected);
+    const after = dropMolecule(applied.document);
+    expect(after.bonds.find((bond) => bond.id === target.id)?.order).toBe("double");
+    expect(after.atoms.find((atom) => atom.id === nitrogen.id)).toMatchObject({ formalCharge: before.formalCharge, markCharge: 1 });
+    expect(dropMark(applied.document).anchor).toMatchObject({ kind: "atom", atomId: nitrogen.id });
   });
 
   it("lets a molecule without marks delete atoms freely", () => {
@@ -139,13 +137,13 @@ describe("Ketcher Apply status", () => {
   it("keeps a refusal on the status line: no success message after a refused edit", async () => {
     const statuses: string[] = [];
     const onApply = vi.fn(() => {
-      statuses.push(EDITOR_SAVE_MARK_SHIFT_REFUSAL);
+      statuses.push(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
       return false;
     });
     const error = await applyKetcherSave({ saveObject: async () => saved }, onApply, (message) => statuses.push(message));
     expect(onApply).toHaveBeenCalledWith(saved);
     expect(error).toBeUndefined();
-    expect(statuses).toEqual([EDITOR_SAVE_MARK_SHIFT_REFUSAL]);
+    expect(statuses).toEqual([EDITOR_SAVE_MARKED_MOLECULE_REFUSAL]);
   });
 
   it("reports success when the edit was applied", async () => {
