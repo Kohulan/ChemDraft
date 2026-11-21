@@ -2898,7 +2898,12 @@ fn schedule_suspended_utility_restore<R: Runtime>(app: &tauri::AppHandle<R>) {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .pending_restore();
-            restore_utility_labels(&app, labels)
+            let restored = restore_utility_labels(&app, labels);
+            // This restoration is what clears a suspension whose prompt ended while the document
+            // was minimized; the restore event's own retry ran while it was still active. Retry
+            // the held first-paint reveals now that it may have cleared.
+            palette_first_paint::release_held(&app);
+            restored
         });
         if let Err(error) = result
             .and_then(|result| result)
@@ -3376,14 +3381,23 @@ async fn open_toolset_window(
     toolset_id: String,
     window: Option<ToolsetWindowGeometry>,
 ) -> Result<ToolsetWindowState, String> {
+    // Windows: recorded before waiting for the creation lock, so a close that arrives while this
+    // open waits, builds or arms wins over it (palette_first_paint.rs). No-op elsewhere.
+    palette_first_paint::requested(&toolset_window_label(&toolset_id));
     let _creation = lock_window_creation()?;
     if utility_windows_suspended() {
         return toolset_state(&app, &toolset_id);
     }
     ensure_toolset_window(&app, &toolset_id, window.as_ref())?;
-    set_toolset_menu_checked(&app, &toolset_id, true)?;
 
     let state = toolset_state(&app, &toolset_id)?;
+    // Windows: a palette closed while this open was in flight stays closed, menu item included.
+    // macOS and Linux check it as before.
+    set_toolset_menu_checked(
+        &app,
+        &toolset_id,
+        state.open || !palette_first_paint::tracks_palettes(),
+    )?;
     let _ = emit_toolset_window_state_to_main(&app, &state);
     Ok(state)
 }
@@ -3396,6 +3410,9 @@ fn close_toolset_window(
     if utility_windows_suspended() {
         return toolset_state(&app, &toolset_id);
     }
+    // Windows: before anything else, and whether or not the window exists yet, so an open still
+    // waiting for, building or arming its window does not show it afterwards (a later open does).
+    palette_first_paint::closed(&toolset_window_label(&toolset_id));
     let window = app.get_webview_window(&toolset_window_label(&toolset_id));
     if let Some(window) = window.as_ref() {
         let webview: &tauri::Webview = window.as_ref();
@@ -3421,8 +3438,6 @@ fn close_toolset_window(
     let state = mark_toolset_window_closed(&app, &toolset_id)?;
 
     if let Some(window) = window {
-        // A palette still waiting for its first paint must stay hidden now.
-        palette_first_paint::closed(window.label());
         panel_window::end_for_hide(window.app_handle(), window.label());
         window.hide().map_err(|error| error.to_string())?;
     }

@@ -6,15 +6,20 @@
 //! 1. passes its builder through [`hidden_until_first_paint`] (hidden, with a first-frame
 //!    background) and builds it,
 //! 2. calls [`arm_first_paint_fallback_with`] on the built
-//!    window in the same main-thread turn as the build,
+//!    window on the main thread once it is set up,
 //! 3. and lets the page call `ackFirstPaint()` (`src/firstPaint.ts`), which invokes
 //!    [`window_first_paint`].
 //!
 //! Whichever comes first, the page's acknowledgement or the fallback timer, shows the window;
-//! later ones do nothing. The window is shown with `show()` only, never focused: a window built
-//! `focused(false)` keeps that on its first show (tao shows it with `SW_SHOWNOACTIVATE` on
-//! Windows), so palettes and popovers never take focus or activate. A caller that does want focus
-//! (an editor the user just opened) takes it in its own `after_show` hook.
+//! later ones do nothing. An acknowledgement that arrives before the window is armed (a cached
+//! page can paint before the caller finishes setting the window up) is remembered for that label
+//! and consumed by the arm, which then shows the window at once and schedules no fallback. A
+//! remembered acknowledgement is dropped when its window is closed or destroyed.
+//!
+//! The window is shown with `show()` only, never focused: a window built `focused(false)` keeps
+//! that on its first show (tao shows it with `SW_SHOWNOACTIVATE` on Windows), so palettes and
+//! popovers never take focus or activate. A caller that does want focus (an editor the user just
+//! opened) takes it in its own `after_show` hook.
 //!
 //! macOS: tao's `show()` is `makeKeyAndOrderFront`, so a window revealed here becomes key there.
 //! A macOS utility that must not take key status keeps its own non-activating reveal (such as
@@ -23,7 +28,7 @@
 //! Each window that uses this needs `allow-window-first-paint` in its capability.
 
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -68,7 +73,8 @@ fn first_frame_background(color: Color) -> Color {
 
 /// Registers a window built with [`hidden_until_first_paint`] as waiting for its first paint and
 /// shows it after `timeout` if the page has not acknowledged by then. Call it on the main thread,
-/// in the same turn as `build()`, so the page cannot acknowledge before the window is registered.
+/// once per window. If the page already acknowledged (before this arm), the window is revealed
+/// here, at once, and no fallback is scheduled.
 ///
 /// Two hooks run once, on the main thread, at the reveal:
 /// `before_show` may decline it (the window stays hidden and its error goes to `after_show`), and
@@ -81,7 +87,11 @@ pub fn arm_first_paint_fallback_with<R: Runtime>(
     before_show: impl FnOnce(&WebviewWindow<R>) -> Result<(), String> + Send + 'static,
     after_show: impl FnOnce(&WebviewWindow<R>, Result<(), String>) + Send + 'static,
 ) {
-    let generation = arm(window, Hooks::new(before_show, after_show));
+    let (generation, revealed) =
+        arm_and_consume_early_ack(window, Hooks::new(before_show, after_show));
+    if revealed {
+        return;
+    }
     let label = window.label().to_owned();
     window.on_window_event(move |event| {
         if matches!(event, WindowEvent::Destroyed) {
@@ -107,13 +117,25 @@ pub fn show_after_first_paint<R: Runtime>(window: &WebviewWindow<R>) -> bool {
 
 /// The page has painted: shows the window that sent this, and only that window (there is no label
 /// argument). Idempotent: once the window has been shown, by this or by the fallback, it does
-/// nothing, and a window that was never armed is never shown by it.
+/// nothing, and a window that was never armed is never shown by it. An acknowledgement that finds
+/// nothing armed is remembered until the window is armed (which consumes it), closed or destroyed.
 #[tauri::command]
 pub fn window_first_paint(window: WebviewWindow) -> Result<(), String> {
     let target = window.clone();
     window
         .run_on_main_thread(move || {
-            show_after_first_paint(&target);
+            if !show_after_first_paint(&target) {
+                remember_early_ack(&target);
+                let label = target.label().to_owned();
+                target.on_window_event(move |event| {
+                    if matches!(
+                        event,
+                        WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed
+                    ) {
+                        forget_early_ack(&label);
+                    }
+                });
+            }
         })
         .map_err(|error| error.to_string())
 }
@@ -163,9 +185,33 @@ struct Waiting {
 
 static WAITING: Mutex<BTreeMap<String, Waiting>> = Mutex::new(BTreeMap::new());
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Labels whose page acknowledged its first paint while nothing was armed for them.
+static EARLY_ACKS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 fn waiting() -> MutexGuard<'static, BTreeMap<String, Waiting>> {
     WAITING.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn early_acks() -> MutexGuard<'static, BTreeSet<String>> {
+    EARLY_ACKS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// An acknowledgement that found nothing armed: remembered for the arm that follows. Main thread,
+/// like the arm, so an acknowledgement and an arm of the same window cannot interleave.
+fn remember_early_ack<W: PaintedWindow>(window: &W) {
+    early_acks().insert(window.label().to_owned());
+}
+
+fn forget_early_ack(label: &str) {
+    early_acks().remove(label);
+}
+
+/// [`arm`], then the reveal at once if the page already acknowledged. Returns the generation and
+/// whether the window was revealed here.
+fn arm_and_consume_early_ack<W: PaintedWindow>(window: &W, hooks: Hooks<W>) -> (u64, bool) {
+    let generation = arm(window, hooks);
+    let painted = early_acks().remove(window.label());
+    (generation, painted && reveal(window, Some(generation)))
 }
 
 fn arm<W: PaintedWindow>(window: &W, hooks: Hooks<W>) -> u64 {
@@ -323,7 +369,16 @@ mod tests {
         // The command takes the invoking window and nothing else: no label to aim it elsewhere.
         let command = body(source, "pub fn window_first_paint(");
         assert!(command.starts_with("pub fn window_first_paint(window: WebviewWindow) ->"));
-        assert!(command.contains("show_after_first_paint(&target);"));
+        assert!(command.contains("if !show_after_first_paint(&target) {"));
+        assert!(command.contains("remember_early_ack(&target);"));
+        let dropped = &command[command.find("on_window_event").unwrap()..];
+        assert!(dropped.contains("WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed"));
+        assert!(dropped.contains("forget_early_ack(&label);"));
+        // The arm consumes an early acknowledgement and then schedules no fallback.
+        let armed = body(source, "pub fn arm_first_paint_fallback_with<");
+        let consumed = armed.find("arm_and_consume_early_ack(").unwrap();
+        let returned = armed.find("if revealed {\n        return;\n    }").unwrap();
+        assert!(consumed < returned && returned < armed.find("schedule(").unwrap());
         assert!(!command.contains("get_webview_window"));
         assert!(!code.contains("get_webview_window"));
         // The only `show()` is the reveal's own.
@@ -433,6 +488,63 @@ mod tests {
         assert!(result.recv().is_err(), "hooks dropped without running");
         assert!(!reveal(&window, None));
         assert_eq!(window.shows(), 0);
+    }
+
+    /// The page acknowledges before the window is armed, as `window_first_paint` does it.
+    fn early_ack(window: &Fake) {
+        assert!(!reveal(window, None), "nothing armed yet");
+        remember_early_ack(window);
+    }
+
+    #[test]
+    fn first_paint_ack_before_arm_reveals_at_the_arm_and_skips_the_fallback() {
+        let window = Fake::new("early");
+        early_ack(&window);
+        assert_eq!(window.shows(), 0, "never shown before it is armed");
+        let (generation, revealed) = arm_and_consume_early_ack(&window, plain());
+        assert!(revealed);
+        assert_eq!(window.shows(), 1);
+        // The fallback, had one been scheduled, and a repeated acknowledgement do nothing.
+        assert!(!reveal(&window, Some(generation)));
+        assert!(!reveal(&window, None));
+        assert_eq!(window.shows(), 1);
+        // Consumed: the next arm of this label waits for its own acknowledgement.
+        let (next, revealed) = arm_and_consume_early_ack(&window, plain());
+        assert!(!revealed);
+        assert_eq!(window.shows(), 1);
+        assert!(reveal(&window, Some(next)));
+        assert_eq!(window.shows(), 2);
+    }
+
+    #[test]
+    fn first_paint_ack_before_arm_runs_the_hooks_and_may_be_declined() {
+        let window = Fake::new("early-declined");
+        early_ack(&window);
+        let (sent, result) = std::sync::mpsc::channel();
+        let (_, revealed) = arm_and_consume_early_ack(
+            &window,
+            Hooks::new(
+                |_| Err("closed".into()),
+                move |_, outcome| sent.send(outcome).unwrap(),
+            ),
+        );
+        assert!(revealed, "the reveal ran (and was declined)");
+        assert_eq!(result.recv(), Ok(Err("closed".to_string())));
+        assert_eq!(window.shows(), 0);
+    }
+
+    #[test]
+    fn first_paint_early_ack_is_dropped_when_its_window_closes_or_is_destroyed() {
+        let window = Fake::new("early-closed");
+        early_ack(&window);
+        forget_early_ack(&window.label);
+        let (generation, revealed) = arm_and_consume_early_ack(&window, plain());
+        assert!(!revealed);
+        assert_eq!(window.shows(), 0);
+        // Only the fallback or a fresh acknowledgement shows it now.
+        assert!(reveal(&window, Some(generation)));
+        assert_eq!(window.shows(), 1);
+        assert!(!early_acks().contains(&window.label));
     }
 
     #[test]

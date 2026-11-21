@@ -15,10 +15,14 @@
 //! `restore_utility_window` / `configure_toolset_utility_window`, since tao's `show()` is
 //! `makeKeyAndOrderFront` there).
 //!
-//! A palette waiting for its first paint is never shown by the reveal if the user closed it in the
-//! meantime. While the document window or the palette is minimized, or the floating windows are
-//! suspended (a prompt, a quit), the reveal is held instead, and the held palette is shown when the
-//! document window is restored or focused again ([`release_held`]).
+//! A palette is tracked from the moment its open is requested ([`requested`], before the open even
+//! waits for the window-creation lock), so a close at any point after that (while the open waits,
+//! while the window builds, between the build and [`arm_toolbar`], or while it waits for its page)
+//! wins: the reveal never shows a palette the user closed. An explicit later open shows it again.
+//! While the document window or the palette is minimized, or the floating windows are suspended (a
+//! prompt, a quit), the reveal is held instead, and the held palette is shown when the document
+//! window is restored or focused again, or when a deferred restoration of the floating windows
+//! finishes ([`release_held`]). Reopening a held palette shows it at once.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -126,41 +130,76 @@ fn decide(wanted: bool, conditions: RevealConditions) -> Reveal {
 struct Pending {
     /// The palette is still open as far as the user is concerned.
     wanted: bool,
+    /// The window was built and its first-paint reveal armed ([`PendingReveals::armed`]). Before
+    /// that, the entry only records the open request and any close that followed it.
+    armed: bool,
     /// The first-paint reveal ran and was held.
     held: bool,
 }
 
-/// Palettes built hidden whose first show has not happened yet, by window label.
+impl Pending {
+    const fn requested(wanted: bool) -> Self {
+        Self {
+            wanted,
+            armed: false,
+            held: false,
+        }
+    }
+}
+
+/// Palettes built hidden whose first show has not happened yet, by window label, and palettes
+/// whose open was requested but whose window is not armed yet.
 #[derive(Debug, Default)]
 pub(crate) struct PendingReveals(BTreeMap<String, Pending>);
 
 impl PendingReveals {
-    /// A palette was just built hidden and armed.
-    #[cfg_attr(not(windows), allow(dead_code))] // only Windows palettes are armed
-    pub(crate) fn armed(&mut self, label: &str) {
-        self.0.insert(
-            label.to_owned(),
-            Pending {
-                wanted: true,
-                held: false,
-            },
-        );
+    /// The user asked for the palette to open. Recorded before the open waits for the creation
+    /// lock, so a close from here on is not lost; a new request after a close wants it again.
+    pub(crate) fn requested(&mut self, label: &str) {
+        self.0
+            .entry(label.to_owned())
+            .and_modify(|pending| pending.wanted = true)
+            .or_insert(Pending::requested(true));
     }
 
-    /// The user closed the palette.
+    /// A palette was just built hidden and armed. A close that arrived after the open request
+    /// (before or during the build, or before this arm) is kept: the reveal will abandon it.
+    #[cfg_attr(not(windows), allow(dead_code))] // only Windows palettes are armed
+    pub(crate) fn armed(&mut self, label: &str) {
+        let pending = self
+            .0
+            .entry(label.to_owned())
+            .or_insert(Pending::requested(true));
+        pending.armed = true;
+        pending.held = false;
+    }
+
+    /// The user closed the palette. Recorded even before the window exists or is armed, so the
+    /// open in flight cannot show it afterwards.
     pub(crate) fn closed(&mut self, label: &str) {
-        if let Some(pending) = self.0.get_mut(label) {
-            pending.wanted = false;
-        }
+        self.0
+            .entry(label.to_owned())
+            .and_modify(|pending| pending.wanted = false)
+            .or_insert(Pending::requested(false));
     }
 
     /// The user opened an already-built palette again. Returns whether a pending reveal will show
     /// it, in which case the caller must not show it now (its page may not have painted yet).
+    ///
+    /// Only an armed reveal that has not run yet is left to show it. A held reveal already ran (the
+    /// page painted, or the fallback fired), and an unarmed entry is a stale request whose build
+    /// never armed (the caller holds the creation lock, so no build is in flight): both are
+    /// dropped and the caller shows the palette now, so a stale entry can never keep a palette the
+    /// user reopens hidden.
     pub(crate) fn reopened(&mut self, label: &str) -> bool {
         match self.0.get_mut(label) {
-            Some(pending) => {
+            Some(pending) if pending.armed && !pending.held => {
                 pending.wanted = true;
                 true
+            }
+            Some(_) => {
+                self.0.remove(label);
+                false
             }
             None => false,
         }
@@ -169,7 +208,9 @@ impl PendingReveals {
     /// Whether `label` is a palette the user has open that is still hidden until its first paint
     /// (or held), so it reads as open even though the window is not visible yet.
     pub(crate) fn opening(&self, label: &str) -> bool {
-        self.0.get(label).is_some_and(|pending| pending.wanted)
+        self.0
+            .get(label)
+            .is_some_and(|pending| pending.armed && pending.wanted)
     }
 
     /// The window is gone.
@@ -179,7 +220,7 @@ impl PendingReveals {
 
     /// The first-paint reveal (the page's acknowledgement, or the fallback) for `label`.
     pub(crate) fn first_paint(&mut self, label: &str, conditions: RevealConditions) -> Reveal {
-        let Some(pending) = self.0.get_mut(label) else {
+        let Some(pending) = self.0.get_mut(label).filter(|pending| pending.armed) else {
             return Reveal::NotPending;
         };
         let reveal = decide(pending.wanted, conditions);
@@ -260,9 +301,29 @@ pub(crate) fn arm_toolbar<R: Runtime>(window: &WebviewWindow<R>) {
     );
 }
 
-/// The user closed a palette: a reveal still waiting for its first paint must not show it.
+/// Whether new palettes on this platform wait for their first paint (Windows). Elsewhere nothing is
+/// recorded, so macOS and Linux keep their reveal unchanged.
+pub(crate) fn tracks_palettes() -> bool {
+    matches!(
+        first_show(PaletteWindowKind::Toolbar, cfg!(windows)),
+        FirstShow::AfterFirstPaint(_)
+    )
+}
+
+/// See [`PendingReveals::requested`]. Call it as soon as an open arrives, before waiting for the
+/// window-creation lock.
+pub(crate) fn requested(label: &str) {
+    if tracks_palettes() {
+        pending().requested(label);
+    }
+}
+
+/// The user closed a palette: a reveal still waiting for its first paint, or an open still waiting
+/// for or building its window, must not show it.
 pub(crate) fn closed(label: &str) {
-    pending().closed(label);
+    if tracks_palettes() {
+        pending().closed(label);
+    }
 }
 
 /// See [`PendingReveals::opening`].
@@ -276,20 +337,45 @@ pub(crate) fn reopened(label: &str) -> bool {
 }
 
 /// Shows palettes whose first-paint reveal was held, now that nothing holds them any more. Main
-/// thread; called when the document window is restored, moved, resized or focused. `show()` only:
-/// a palette is built unfocused, so this never activates it.
+/// thread; called when the document window is restored, moved, resized or focused, when a
+/// suspension ends, and when a deferred restoration of the floating windows has run (it is what
+/// clears a suspension that ended while the document was minimized). `show()` only: a palette is
+/// built unfocused, so this never activates it.
 pub(crate) fn release_held<R: Runtime>(app: &tauri::AppHandle<R>) {
-    let labels = pending().held();
+    release_held_in(
+        &PENDING,
+        |label| app.get_webview_window(label),
+        conditions,
+        |window| {
+            if let Err(error) = window.show() {
+                eprintln!(
+                    "Could not show ChemDraft palette {}: {error}",
+                    window.label()
+                );
+            }
+        },
+    );
+}
+
+/// [`release_held`] with the window lookup, the conditions and the show passed in, so tests can
+/// drive it without a runtime. `show` runs with the registry unlocked.
+fn release_held_in<W>(
+    reveals: &Mutex<PendingReveals>,
+    window: impl Fn(&str) -> Option<W>,
+    conditions: impl Fn(&W) -> RevealConditions,
+    show: impl Fn(&W),
+) {
+    let lock = || reveals.lock().unwrap_or_else(PoisonError::into_inner);
+    let labels = lock().held();
     for label in labels {
-        let Some(window) = app.get_webview_window(&label) else {
-            pending().forget(&label);
+        let Some(window) = window(&label) else {
+            lock().forget(&label);
             continue;
         };
         let conditions = conditions(&window);
-        if pending().release(&label, conditions) == Reveal::Show {
-            if let Err(error) = window.show() {
-                eprintln!("Could not show ChemDraft palette {label}: {error}");
-            }
+        let reveal = lock().release(&label, conditions);
+        if reveal == Reveal::Show {
+            show(&window);
         }
     }
 }
@@ -478,6 +564,161 @@ mod tests {
     }
 
     #[test]
+    fn a_palette_closed_before_its_window_was_built_is_never_shown() {
+        let mut reveals = PendingReveals::default();
+        // The open arrives and waits for the creation lock; the user closes the palette meanwhile.
+        reveals.requested("toolset-core-main");
+        reveals.closed("toolset-core-main");
+        // The open then builds and arms the window.
+        reveals.armed("toolset-core-main");
+        assert!(!reveals.opening("toolset-core-main"));
+        assert_eq!(
+            reveals.first_paint("toolset-core-main", shown()),
+            Reveal::Abandon
+        );
+        // An explicit later open of the built window shows it at once.
+        reveals.requested("toolset-core-main");
+        assert!(!reveals.reopened("toolset-core-main"), "caller shows it");
+        assert_eq!(
+            reveals.first_paint("toolset-core-main", shown()),
+            Reveal::NotPending
+        );
+    }
+
+    #[test]
+    fn a_palette_closed_after_its_build_but_before_its_arm_is_never_shown() {
+        let mut reveals = PendingReveals::default();
+        reveals.requested("toolset-core-arrows");
+        // The window exists but is not armed yet: the close finds it and hides it.
+        reveals.closed("toolset-core-arrows");
+        reveals.armed("toolset-core-arrows");
+        let minimized = RevealConditions {
+            document_minimized: true,
+            ..shown()
+        };
+        // Neither the reveal nor a later release shows it.
+        assert_eq!(
+            reveals.first_paint("toolset-core-arrows", minimized),
+            Reveal::Abandon
+        );
+        assert!(reveals.held().is_empty());
+        // Reopened while its armed reveal is still waiting: that reveal shows it.
+        reveals.requested("toolset-core-text");
+        reveals.closed("toolset-core-text");
+        reveals.armed("toolset-core-text");
+        reveals.requested("toolset-core-text");
+        assert!(reveals.reopened("toolset-core-text"));
+        assert_eq!(
+            reveals.first_paint("toolset-core-text", shown()),
+            Reveal::Show
+        );
+    }
+
+    #[test]
+    fn a_stale_pending_entry_never_keeps_a_reopened_palette_hidden() {
+        let mut reveals = PendingReveals::default();
+        // Held by a prompt, and never released (the user reopens it before anything retries).
+        reveals.armed("toolset-core-main");
+        let suspended = RevealConditions {
+            suspended: true,
+            ..shown()
+        };
+        assert_eq!(
+            reveals.first_paint("toolset-core-main", suspended),
+            Reveal::Hold
+        );
+        reveals.closed("toolset-core-main");
+        reveals.requested("toolset-core-main");
+        assert!(
+            !reveals.reopened("toolset-core-main"),
+            "its reveal already ran: the caller shows it"
+        );
+        assert!(reveals.held().is_empty());
+        assert_eq!(
+            reveals.release("toolset-core-main", shown()),
+            Reveal::NotPending
+        );
+        // An open whose build never armed (it failed, or the open was refused) leaves a request
+        // behind; reopening the window shows it too.
+        reveals.requested("toolset-core-text");
+        assert!(!reveals.opening("toolset-core-text"));
+        assert!(!reveals.reopened("toolset-core-text"));
+    }
+
+    /// A palette window for [`release_held_in`] that counts its shows.
+    struct FakePalette {
+        label: &'static str,
+        shows: std::cell::Cell<usize>,
+    }
+
+    #[test]
+    fn a_palette_held_by_a_prompt_that_ended_while_the_document_was_minimized_shows_after_restoration(
+    ) {
+        let reveals = Mutex::new(PendingReveals::default());
+        let palette = FakePalette {
+            label: "toolset-core-main",
+            shows: std::cell::Cell::new(0),
+        };
+        let state = std::cell::Cell::new(RevealConditions {
+            suspended: true,
+            ..shown()
+        });
+        let retry = || {
+            release_held_in(
+                &reveals,
+                |label| (label == palette.label).then_some(&palette),
+                |_| state.get(),
+                |window| window.shows.set(window.shows.get() + 1),
+            )
+        };
+        // The page paints during a native prompt: held.
+        reveals.lock().unwrap().requested(palette.label);
+        reveals.lock().unwrap().armed(palette.label);
+        assert_eq!(
+            reveals
+                .lock()
+                .unwrap()
+                .first_paint(palette.label, state.get()),
+            Reveal::Hold
+        );
+        // The document is minimized and the prompt ends: restoration is deferred, so the
+        // suspension stays active, and the suspension release's retry holds it.
+        state.set(RevealConditions {
+            suspended: true,
+            document_minimized: true,
+            ..shown()
+        });
+        retry();
+        // The document is restored: its event retries while the deferred restoration is pending.
+        state.set(RevealConditions {
+            suspended: true,
+            ..shown()
+        });
+        retry();
+        assert_eq!(palette.shows.get(), 0);
+        // The deferred restoration clears the suspension and retries (lib.rs, below): shown once.
+        state.set(shown());
+        retry();
+        assert_eq!(palette.shows.get(), 1);
+        retry();
+        assert_eq!(palette.shows.get(), 1);
+        assert!(reveals.lock().unwrap().held().is_empty());
+
+        // lib.rs's deferred restoration is that last retry, after it restored the windows.
+        let lib = include_str!("lib.rs");
+        let start = lib.find("fn schedule_suspended_utility_restore<").unwrap();
+        let schedule = &lib[start..];
+        let schedule = &schedule[..schedule.find("\n}\n").unwrap()];
+        let restore = schedule
+            .find("restore_utility_labels(&app, labels)")
+            .unwrap();
+        let release = schedule
+            .find("palette_first_paint::release_held(&app);")
+            .expect("the deferred restoration retries held palettes");
+        assert!(restore < release);
+    }
+
+    #[test]
     fn windows_builders_use_the_helper_and_show_palettes_only_after_first_paint() {
         let lib = include_str!("lib.rs");
         let body = |signature: &str| {
@@ -499,13 +740,25 @@ mod tests {
         // The reopen path keeps its immediate show unless a first-paint reveal is still pending.
         let reopen = &toolbar[..toolbar.find("builder.build()").unwrap()];
         assert!(reopen.contains("if !palette_first_paint::reopened(&label) {"));
-        assert!(body("fn close_toolset_window(").contains("palette_first_paint::closed("));
+        // The open is recorded before it waits for the creation lock, and a close is recorded
+        // whether or not the window exists yet.
+        let open = body("async fn open_toolset_window(");
+        let requested = open
+            .find("palette_first_paint::requested(&toolset_window_label(&toolset_id));")
+            .unwrap();
+        assert!(requested < open.find("lock_window_creation()").unwrap());
+        let close = body("fn close_toolset_window(");
+        let closed = close
+            .find("palette_first_paint::closed(&toolset_window_label(&toolset_id));")
+            .unwrap();
+        assert!(closed < close.find("app.get_webview_window(").unwrap());
         assert!(body("fn toolset_state<").contains("palette_first_paint::opening(window.label())"));
-        // Held reveals are retried when the document returns and when a suspension ends.
+        // Held reveals are retried when the document returns, when a suspension ends, and when a
+        // deferred restoration has run.
         assert_eq!(
             lib.matches("palette_first_paint::release_held(").count(),
-            3,
-            "main window geometry, main window focus, suspension release"
+            4,
+            "main window geometry, main window focus, suspension release, deferred restoration"
         );
 
         let popover = body("fn build_toolset_popover_window(");

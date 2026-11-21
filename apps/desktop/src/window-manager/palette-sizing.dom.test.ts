@@ -173,8 +173,14 @@ describe("palette work-area sizing", () => {
     expect(open).toMatch(
       /clamp_windows_toolset_frame\([\s\S]*?palette_first_paint::builder_step\([\s\S]*?builder\.build\(\)[\s\S]*?panel_full_size::apply\([\s\S]*?palette_first_paint::arm_toolbar\(&target\)/,
     );
-    // The new window is never shown directly: only palette_first_paint reveals it.
-    expect(open).not.toMatch(/target\.show\(/);
+    // The new window is never shown directly: only palette_first_paint reveals it. The creation path
+    // (everything from the builder on) has no `.show(` call on any receiver.
+    const creationStart = open.indexOf("let builder = utility_window_builder(");
+    expect(creationStart).toBeGreaterThan(open.indexOf("palette_first_paint::reopened(&label)"));
+    const creation = open.slice(creationStart);
+    expect(creation).toContain("builder.build()");
+    expect(creation).not.toMatch(/\.show\s*\(/);
+    expect(creation).not.toMatch(/\bshow\s*\(\s*&?(?:window|target)\b/);
   });
 
   it("sends the requested size unchanged when it fits within the work area", async () => {
