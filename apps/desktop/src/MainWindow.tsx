@@ -1850,7 +1850,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.21.14.30-sonnet";
+const CURRENT_BUILD_STAMP = "11.21.14.45-sonnet";
 
 /**
  * The commit funnel's chemistry check (AGENTS.md section 7, `commitChemistryGuard.ts`). `before`
@@ -22741,12 +22741,6 @@ export function MainWindow({
     // and the host keeps this message on the status line (it reports success only for `true`).
     if (applied.refusal) {
       setStatus(applied.refusal);
-      return false;
-    }
-    // 1.2.2 fallback: an unchanged save of a molecule with electron marks leaves the document, the
-    // selection and the undo stack alone. Returning false keeps the host from saying "Applied".
-    if (applied.unchanged) {
-      setStatus("No changes from the structure editor");
       return false;
     }
     // The commit can still decline (a page-size question already open, a chemistry refusal): it has

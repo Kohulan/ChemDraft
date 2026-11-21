@@ -19,7 +19,8 @@ import {
 
 /**
  * ChemDraft AGENTS.md section 7: chemistry is never silently changed. An unchanged Ketcher
- * Apply must leave an atom's charge and electron marks exactly as they were.
+ * Apply must leave an atom's charge and electron marks exactly as they were. 1.2.2: on a molecule
+ * with any charge or radical mark every Apply is refused and the document is left untouched.
  *
  * The round trip, as the app runs it:
  *  - open: KetcherEditorHost -> adapter.loadObject({ object: molecule }) -> engine.loadMolecule with
@@ -78,20 +79,24 @@ function nitrogenOf(document: ChemDraftDocument, nitrogenId: string): MoleculeAt
 }
 
 /** Open in Ketcher, return it unchanged, apply, and commit the way the app does. */
-function unchangedKetcherSave(document: ChemDraftDocument): { opened: MoleculeObject; v3000: string; committed: ChemDraftDocument } {
+function unchangedKetcherSave(document: ChemDraftDocument): {
+  opened: MoleculeObject; v3000: string; selected: ChemDraftDocument; refusal?: string; committed: ChemDraftDocument;
+} {
   const selected = selectMolecule(document);
   const opened = moleculeOf(selected);
   const v3000 = moleculeToMolfileV3000(opened, { kekuleBondOrders: new Map() }).contents;
   const saved: MoleculeObject = { ...opened, structureFormat: "molfile-v3000", structure: v3000 };
   const applied = applyEditorSaveResultWithLabelWarnings(selected, { object: saved, warnings: [] });
-  return { opened, v3000, committed: normalizeCommittedDocument(applied.document) };
+  // A refused save returns the document it was given, untouched: the caller commits nothing.
+  if (applied.refusal) expect(applied.document).toBe(selected);
+  return { opened, v3000, selected, refusal: applied.refusal, committed: normalizeCommittedDocument(applied.document) };
 }
 
 /** Open in Ketcher, let `edit` change the V3000 Ketcher returns, apply, and commit. */
 function editedKetcherSave(
   document: ChemDraftDocument,
   edit: (v3000: string) => string
-): { v3000: string; selected: ChemDraftDocument; refusal?: string; unchanged?: boolean; applied: ChemDraftDocument; committed: ChemDraftDocument } {
+): { v3000: string; selected: ChemDraftDocument; refusal?: string; applied: ChemDraftDocument; committed: ChemDraftDocument } {
   const selected = selectMolecule(document);
   const opened = moleculeOf(selected);
   const v3000 = edit(moleculeToMolfileV3000(opened, { kekuleBondOrders: new Map() }).contents);
@@ -99,8 +104,7 @@ function editedKetcherSave(
   const applied = applyEditorSaveResultWithLabelWarnings(selected, { object: saved, warnings: [] });
   // A refused save returns the document it was given, untouched: the caller commits nothing.
   if (applied.refusal) expect(applied.document).toBe(selected);
-  if (applied.unchanged) expect(applied.document).toBe(selected);
-  return { v3000, selected, refusal: applied.refusal, unchanged: applied.unchanged, applied: applied.document,
+  return { v3000, selected, refusal: applied.refusal, applied: applied.document,
     committed: normalizeCommittedDocument(applied.document) };
 }
 
@@ -220,7 +224,10 @@ function looseChargeOnNitrogen(plain: ChemDraftDocument, nitrogenId: string): Ch
   return loose;
 }
 
-describe("unchanged Ketcher save keeps charge and electron marks", () => {
+// 1.2.2: an unchanged save of a molecule with a charge or radical mark is refused, and what it
+// leaves is the document exactly as it was (charge, marks and positions). (c) has no mark, so its
+// unchanged save still commits.
+describe("unchanged Ketcher save of a marked molecule is refused and keeps charge and electron marks", () => {
   it("(a) N+ whose charge comes from an atom-anchored + mark stays +1 with exactly one + mark", () => {
     const { document: plain, nitrogenId } = methylamine();
     const charged = normalizeCommittedDocument(applyChargeToolAtNativeAtom(plain, { kind: "charge", charge: 1 },
@@ -230,7 +237,9 @@ describe("unchanged Ketcher save keeps charge and electron marks", () => {
     expect(marksOf(charged)).toHaveLength(1);
     expect(marksOf(charged)[0].anchor).toMatchObject({ kind: "atom", atomId: nitrogenId });
 
-    const { opened, v3000, committed } = unchangedKetcherSave(charged);
+    const { opened, v3000, selected, refusal, committed } = unchangedKetcherSave(charged);
+    expect(refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
+    expect(committed).toBe(normalizeCommittedDocument(selected));
 
     // What Ketcher is given: a stored SMILES carrying the total charge, so it returns CHG=1.
     expect(opened.structureFormat).toBe("smiles");
@@ -247,7 +256,8 @@ describe("unchanged Ketcher save keeps charge and electron marks", () => {
     const { document: plain, nitrogenId } = methylamine();
     const loose = looseChargeOnNitrogen(plain, nitrogenId);
 
-    const { v3000, committed } = unchangedKetcherSave(loose);
+    const { v3000, refusal, committed } = unchangedKetcherSave(loose);
+    expect(refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
     expect(nitrogenLine(v3000)).toContain("CHG=1");
 
     const nitrogen = nitrogenOf(committed, nitrogenId);
@@ -284,7 +294,8 @@ describe("unchanged Ketcher save keeps charge and electron marks", () => {
     expect(nitrogenOf(radical, nitrogenId)).toMatchObject({ formalCharge: 0, markRadicals: 1 });
     expect(marksOf(radical)).toHaveLength(1);
 
-    const { committed } = unchangedKetcherSave(radical);
+    const { refusal, committed } = unchangedKetcherSave(radical);
+    expect(refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
 
     const nitrogen = nitrogenOf(committed, nitrogenId);
     expect({
@@ -306,7 +317,8 @@ describe("unchanged Ketcher save keeps charge and electron marks", () => {
     const charged = chargedByTool(intrinsic, nitrogenId, [1]);
     expect(chargeState(charged, nitrogenId)).toEqual({ formalCharge: 2, markCharge: 1, marks: 1 });
 
-    const { v3000, committed } = unchangedKetcherSave(charged);
+    const { v3000, refusal, committed } = unchangedKetcherSave(charged);
+    expect(refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
     expect(nitrogenLine(v3000)).toContain("CHG=2");
     expect(chargeState(committed, nitrogenId)).toEqual({ formalCharge: 2, markCharge: 1, marks: 1 });
     expect(marksOf(committed)[0]).toMatchObject({ markKind: "charge", charge: 1 });
@@ -318,7 +330,8 @@ describe("unchanged Ketcher save keeps charge and electron marks", () => {
     const charged = chargedByTool(plain, carbonId, [-1]);
     expect(chargeState(charged, carbonId)).toEqual({ formalCharge: -1, markCharge: -1, marks: 1 });
 
-    const { v3000, committed } = unchangedKetcherSave(charged);
+    const { v3000, refusal, committed } = unchangedKetcherSave(charged);
+    expect(refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
     expect(v3000).toContain("CHG=-1");
     expect(chargeState(committed, carbonId)).toEqual({ formalCharge: -1, markCharge: -1, marks: 1 });
     expect(marksOf(committed)[0]).toMatchObject({ markKind: "charge", charge: -1 });
@@ -363,7 +376,8 @@ describe("unchanged Ketcher save keeps charge and electron marks", () => {
     const charged = chargedByTool(plain, nitrogenId, [1, 1]);
     expect(chargeState(charged, nitrogenId)).toEqual({ formalCharge: 2, markCharge: 2, marks: 1 });
 
-    const { v3000, committed } = unchangedKetcherSave(charged);
+    const { v3000, refusal, committed } = unchangedKetcherSave(charged);
+    expect(refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
     expect(nitrogenLine(v3000)).toContain("CHG=2");
     expect(chargeState(committed, nitrogenId)).toEqual({ formalCharge: 2, markCharge: 2, marks: 1 });
     expect(marksOf(committed)[0]).toMatchObject({ markKind: "charge", charge: 2 });
@@ -379,7 +393,8 @@ describe("unchanged Ketcher save keeps charge and electron marks", () => {
       object: { ...first, id: `${first.id}_second`, y: first.y + first.height } }));
     expect(chargeState(twice, nitrogenId)).toEqual({ formalCharge: 2, markCharge: 2, marks: 2 });
 
-    const { v3000, committed } = unchangedKetcherSave(twice);
+    const { v3000, refusal, committed } = unchangedKetcherSave(twice);
+    expect(refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
     expect(nitrogenLine(v3000)).toContain("CHG=2");
     expect(chargeState(committed, nitrogenId)).toEqual({ formalCharge: 2, markCharge: 2, marks: 2 });
   });
@@ -445,10 +460,10 @@ describe("a Ketcher charge change on a molecule with a charge mark (1.2.2 fallba
   });
 });
 
-// 1.2.2 fallback: atoms trading places is a coordinate-only edit, so the save is a no-op: the
+// 1.2.2 fallback: atoms trading places is refused like every other Apply on a marked molecule: the
 // document is returned exactly as it was and the marks are never moved.
-describe("a coordinate-only Ketcher save on a marked molecule leaves the document exactly as it was", () => {
-  it("a bond-anchored radical on N: C and N trading places in Ketcher is a no-op", () => {
+describe("a coordinate-only Ketcher save on a marked molecule is refused and leaves the document exactly as it was", () => {
+  it("a bond-anchored radical on N: C and N trading places in Ketcher is refused", () => {
     const { document: plain, nitrogenId } = methylamine();
     const anchored = normalizeCommittedDocument(applyChargeToolAtNativeAtom(plain, { kind: "radical-dot" },
       { kind: "atom", objectId, atomId: nitrogenId, distanceToPointer: 0 }));
@@ -460,22 +475,20 @@ describe("a coordinate-only Ketcher save on a marked molecule leaves the documen
     expect(marksOf(radical)[0]!.anchor).toMatchObject({ kind: "bond", bondId: bond.id });
     expect(nitrogenOf(radical, nitrogenId)).toMatchObject({ formalCharge: 0, markRadicals: 1 });
 
-    const { selected, refusal, unchanged, applied } = editedKetcherSave(radical, swapAtomPositions(1, 2));
-    expect(refusal).toBeUndefined();
-    expect(unchanged).toBe(true);
+    const { selected, refusal, applied } = editedKetcherSave(radical, swapAtomPositions(1, 2));
+    expect(refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
     expect(applied).toBe(selected);
     expect(marksOf(applied)[0]!.anchor).toMatchObject({ kind: "bond", bondId: bond.id });
     expect(nitrogenOf(applied, nitrogenId)).toMatchObject({ formalCharge: 0, markRadicals: 1 });
   });
 
-  it("a legacy loose + mark on N: C and N trading places in Ketcher is a no-op, the mark stays loose", () => {
+  it("a legacy loose + mark on N: C and N trading places in Ketcher is refused, the mark stays loose", () => {
     const { document: plain, nitrogenId } = methylamine();
     const loose = looseChargeOnNitrogen(plain, nitrogenId);
 
-    const { v3000, selected, refusal, unchanged, applied } = editedKetcherSave(loose, swapAtomPositions(1, 2));
+    const { v3000, selected, refusal, applied } = editedKetcherSave(loose, swapAtomPositions(1, 2));
     expect(nitrogenLine(v3000)).toContain("CHG=1");
-    expect(refusal).toBeUndefined();
-    expect(unchanged).toBe(true);
+    expect(refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
     expect(applied).toBe(selected);
     expect(marksOf(applied)[0]!.anchor.kind).toBe("point");
     expect(chargeState(applied, nitrogenId)).toEqual({ formalCharge: 1, markCharge: 1, marks: 1 });
@@ -520,8 +533,8 @@ describe("1.2.2 fallback: every chemical edit on a molecule with a radical is re
   });
 });
 
-describe("an unchanged charge under a mark always commits", () => {
-  it("N with an intrinsic -1 and a + mark (total 0) survives an unchanged save", () => {
+describe("an unchanged charge under a mark is still refused (1.2.2)", () => {
+  it("N with an intrinsic -1 and a + mark (total 0): an unchanged save is refused and leaves it as it was", () => {
     const { document: plain, nitrogenId } = methylamine();
     const molecule = moleculeOf(plain);
     const atoms = molecule.atoms.map(atom => atom.id === nitrogenId ? { ...atom, formalCharge: -1 } : atom);
@@ -536,7 +549,7 @@ describe("an unchanged charge under a mark always commits", () => {
 
     const { v3000, refusal, committed } = editedKetcherSave(charged, molfile => molfile);
     expect(nitrogenLine(v3000)).not.toContain("CHG=");
-    expect(refusal).toBeUndefined();
+    expect(refusal).toBe(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL);
     expect(chargeState(committed, nitrogenId)).toEqual({ formalCharge: 0, markCharge: 1, marks: 1 });
   });
 });

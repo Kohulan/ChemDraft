@@ -1,6 +1,8 @@
 // ChemDraft 1.2.2 fallback (AGENTS.md section 7): a molecule that carries any charge or radical mark
-// is never rewritten from the structure editor. A save that changes nothing chemically is a no-op;
-// any chemical change is refused with one message. Molecules without marks save as before.
+// is never rewritten from the structure editor: EVERY Apply on it is refused with one message and
+// leaves the document, selection and undo untouched, even a save that looks chemically unchanged
+// (comparing a save to the stored molecule could misread a real edit as no change).
+// Molecules without marks save as before.
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
@@ -92,7 +94,7 @@ describe("1.2.2 fallback: a marked molecule's editor save", () => {
     expect(EDITOR_SAVE_MARKED_MOLECULE_REFUSAL).toBe(REFUSAL);
   });
 
-  it("an unchanged save of N+ with a + mark is a no-op: the document is the same object, N stays +1", () => {
+  it("an unchanged save of N+ with a + mark is refused: the document is the same object, N stays +1", () => {
     const { document: plain, nitrogenId } = methylamine();
     const charged = withChargeMark(plain, nitrogenId);
     expect(atomOf(charged, nitrogenId)).toMatchObject({ formalCharge: 1, markCharge: 1 });
@@ -100,19 +102,19 @@ describe("1.2.2 fallback: a marked molecule's editor save", () => {
 
     const { selected, applied, v3000 } = save(charged);
     expect(v3000).toMatch(/\bN\b.*CHG=1/);
-    expect(applied.refusal).toBeUndefined();
-    expect(applied.unchanged).toBe(true);
+    expect(applied.refusal).toBe(REFUSAL);
+    expect(applied).not.toHaveProperty("unchanged");
     expect(applied.document).toBe(selected);
+    expect(applied.document.selection).toEqual(selected.selection);
     expect(atomOf(applied.document, nitrogenId).formalCharge).toBe(1);
     expect(marksOf(applied.document)).toEqual(marksOf(selected));
     expect(moleculeOf(applied.document)).toBe(moleculeOf(selected));
   });
 
-  it("moving atoms only is not a change: the editor's re-centred result is a no-op", () => {
+  it("moving atoms only is refused too: the editor's re-centred result leaves the document untouched", () => {
     const { document: plain, nitrogenId } = methylamine();
     const { selected, applied } = save(withChargeMark(plain, nitrogenId), shifted);
-    expect(applied.refusal).toBeUndefined();
-    expect(applied.unchanged).toBe(true);
+    expect(applied.refusal).toBe(REFUSAL);
     expect(applied.document).toBe(selected);
   });
 
@@ -126,21 +128,20 @@ describe("1.2.2 fallback: a marked molecule's editor save", () => {
     const charged = withChargeMark(plain, nitrogenId);
     const { selected, applied } = save(charged, edit);
     expect(applied.refusal).toBe(REFUSAL);
-    expect(applied.unchanged).toBeUndefined();
     expect(applied.document).toBe(selected);
     expect(applied.document.selection).toEqual(selected.selection);
     expect(atomOf(applied.document, nitrogenId)).toMatchObject({ formalCharge: 1, markCharge: 1 });
   });
 
-  it("refuses an element change and a changed bond order on a radical-marked molecule", () => {
+  it("refuses a move, an element change and a changed bond order on a radical-marked molecule", () => {
     const { document: plain, nitrogenId } = methylamine();
     const radical = normalizeCommittedDocument(applyChargeToolAtNativeAtom(plain, { kind: "radical-dot" },
       { kind: "atom", objectId, atomId: nitrogenId, distanceToPointer: 0 }));
     expect(atomOf(radical, nitrogenId).markRadicals).toBe(1);
 
-    const unchanged = save(radical, shifted);
-    expect(unchanged.applied.unchanged).toBe(true);
-    expect(unchanged.applied.document).toBe(unchanged.selected);
+    const moved = save(radical, shifted);
+    expect(moved.applied.refusal).toBe(REFUSAL);
+    expect(moved.applied.document).toBe(moved.selected);
 
     const element = save(radical, v3000 => v3000.replace(/^(M\s+V30\s+2\s+)N(\s)/m, "$1O$2"));
     expect(element.applied.refusal).toBe(REFUSAL);
@@ -148,15 +149,14 @@ describe("1.2.2 fallback: a marked molecule's editor save", () => {
     expect(bond.applied.refusal).toBe(REFUSAL);
   });
 
-  it("an unchanged save of a radical-marked molecule (V3000 without RAD) is a no-op", () => {
+  it("an unchanged save of a radical-marked molecule (V3000 without RAD) is refused", () => {
     const { document: plain, nitrogenId } = methylamine();
     const radical = normalizeCommittedDocument(applyChargeToolAtNativeAtom(plain, { kind: "radical-dot" },
       { kind: "atom", objectId, atomId: nitrogenId, distanceToPointer: 0 }));
-    // The stored SMILES carries no radicals, so Ketcher returns none: radicals are not compared then.
+    // The stored SMILES carries no radicals, so Ketcher returns none.
     const { selected, applied, v3000 } = save(radical, v3000 => v3000.replace(/\s+RAD=\d+/, ""));
     expect(v3000).not.toMatch(/RAD=/);
-    expect(applied.refusal).toBeUndefined();
-    expect(applied.unchanged).toBe(true);
+    expect(applied.refusal).toBe(REFUSAL);
     expect(applied.document).toBe(selected);
   });
 
@@ -186,7 +186,7 @@ describe("1.2.2 fallback: a marked molecule's editor save", () => {
     } });
     expect(moleculeHasElectronMarks(loose.pages[0], moleculeOf(loose))).toBe(true);
     const same = save(loose);
-    expect(same.applied.unchanged).toBe(true);
+    expect(same.applied.refusal).toBe(REFUSAL);
     expect(same.applied.document).toBe(same.selected);
     const edited = save(loose, doubleBond);
     expect(edited.applied.refusal).toBe(REFUSAL);
@@ -197,12 +197,14 @@ describe("1.2.2 fallback: a marked molecule's editor save", () => {
     expect(moleculeHasElectronMarks(document.pages[0], moleculeOf(document))).toBe(false);
   });
 
-  it("MainWindow keeps the no-change status and leaves the host from reporting Applied", () => {
+  it("MainWindow returns false on a refusal, so the host never reports Applied, and has no unchanged branch", () => {
     const source = readFileSync(new URL("./MainWindow.tsx", import.meta.url), "utf8");
     const start = source.indexOf("const handleApplyKetcherEdit = useCallback(");
     const body = source.slice(start, source.indexOf("}, [commitDocumentChangeWithPageFit]);", start));
-    expect(body).toMatch(/if \(applied\.unchanged\) \{\s*setStatus\("No changes from the structure editor"\);\s*return false;\s*\}/);
-    expect(body.indexOf("applied.unchanged")).toBeLessThan(body.indexOf("commitDocumentChangeWithPageFit(applied.document"));
+    expect(body).toMatch(/if \(applied\.refusal\) \{\s*setStatus\(applied\.refusal\);\s*return false;\s*\}/);
+    expect(body.indexOf("applied.refusal")).toBeLessThan(body.indexOf("commitDocumentChangeWithPageFit(applied.document"));
+    expect(body).not.toContain("unchanged");
+    expect(source).not.toContain("No changes from the structure editor");
   });
 });
 
@@ -218,28 +220,26 @@ function withWedge(document: ChemDraftDocument): ChemDraftDocument {
 const addCfg = (cfg: number) => (v3000: string) => v3000.replace(/^(M\s+V30\s+1\s+1\s+1\s+2)\s*$/m, `$1 CFG=${cfg}`);
 
 describe("1.2.2 fallback: bond stereo on a marked molecule", () => {
-  it("a stereo-only edit (a wedge added) is refused, not a silent no-op", () => {
+  it("a stereo-only edit (a wedge added) is refused", () => {
     const { document: plain, nitrogenId } = methylamine();
     const charged = withChargeMark(plain, nitrogenId);
     const { selected, applied, v3000 } = save(charged, addCfg(1));
     expect(v3000).toMatch(/CFG=1/);
-    expect(applied.unchanged).toBeUndefined();
     expect(applied.refusal).toBe(REFUSAL);
     expect(applied.document).toBe(selected);
     const hashed = save(charged, addCfg(3));
     expect(hashed.applied.refusal).toBe(REFUSAL);
   });
 
-  it("an unchanged save of a marked molecule with an existing wedge is a no-op", () => {
+  it("an unchanged save of a marked molecule with an existing wedge is refused", () => {
     const { document: plain, nitrogenId } = methylamine();
     const wedged = withChargeMark(withWedge(plain), nitrogenId);
     expect(moleculeOf(wedged).bonds[0]!.display?.bondStyle).toBe("wedge");
     const { selected, applied, v3000 } = save(wedged);
     expect(v3000).toMatch(/CFG=1/);
-    expect(applied.refusal).toBeUndefined();
-    expect(applied.unchanged).toBe(true);
+    expect(applied.refusal).toBe(REFUSAL);
     expect(applied.document).toBe(selected);
-    expect(save(wedged, shifted).applied.unchanged).toBe(true);
+    expect(save(wedged, shifted).applied.refusal).toBe(REFUSAL);
   });
 
   it("removing or flipping an existing wedge on a marked molecule is refused", () => {
@@ -255,11 +255,10 @@ describe("1.2.2 fallback: bond stereo on a marked molecule", () => {
 });
 
 describe("1.2.2 fallback: a molecule without marks saves as before", () => {
-  it("a bond-order edit commits and is not reported as unchanged or refused", () => {
+  it("a bond-order edit commits and is not refused", () => {
     const { document } = methylamine();
     const { applied } = save(document, doubleBond);
     expect(applied.refusal).toBeUndefined();
-    expect(applied.unchanged).toBeUndefined();
     expect(moleculeOf(normalizeCommittedDocument(applied.document)).bonds[0]!.order).toBe("double");
   });
 
@@ -274,7 +273,6 @@ describe("1.2.2 fallback: a molecule without marks saves as before", () => {
     const { document } = methylamine();
     const { selected, applied } = save(document);
     expect(applied.refusal).toBeUndefined();
-    expect(applied.unchanged).toBeUndefined();
     expect(applied.document).not.toBe(selected);
   });
 });
