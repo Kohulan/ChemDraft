@@ -103,6 +103,27 @@ export async function verifyStoredSources(context: StructureInspectionContext, m
   }
 }
 
+/** Superatoms, R-groups and retained compatibility records (other than the cached SMILES) have
+ * no counterpart the editable graph can verify, so a write may keep them but never change them. */
+export function assertRetainedAnnotationsKept(original: MoleculeObject, molecule: MoleculeObject) {
+  if (abbreviationRecords(original) !== abbreviationRecords(molecule) ||
+      retainedCompatibility(original) !== retainedCompatibility(molecule)) {
+    throw new Error(`The chemical edit cannot verify changes to retained annotations or abbreviations of "${molecule.id}".`);
+  }
+}
+
+/** A chemistry record the write supplied must state what the graph-derived record states. */
+export function assertChemistryClaims(molecule: MoleculeObject, original: MoleculeObject | undefined, record: MoleculeObject) {
+  if (!molecule.chemistry || stableRecord(molecule.chemistry) === stableRecord(original?.chemistry)) return;
+  for (const key of ["stereochemistry", "isotopeLabels", "radicalCount", "totalCharge", "formula"] as const) {
+    const claim = molecule.chemistry[key];
+    if (claim !== undefined && (key !== "stereochemistry" || molecule.chemistry.stereochemistry.length > 0) &&
+        stableRecord(claim) !== stableRecord(record.chemistry![key])) {
+      throw new Error(`The stored ${key} of "${molecule.id}" differs from the verified chemical edit.`);
+    }
+  }
+}
+
 /** Only insertions and declared chemical edits reach this writer. Verify both the source
  * being replaced and the graph that will supply the new storage and export records. */
 export async function verifiedChemicalRecord(context: StructureInspectionContext, molecule: MoleculeObject,
@@ -112,10 +133,7 @@ export async function verifiedChemicalRecord(context: StructureInspectionContext
   if (previous) {
     const original = previous.molecule;
     await verifyStoredSources(context, original, { graph: previous.graph, reference: storedCtabReference(original) });
-    if (abbreviationRecords(original) !== abbreviationRecords(molecule) ||
-        retainedCompatibility(original) !== retainedCompatibility(molecule)) {
-      throw new Error(`The chemical edit cannot verify changes to retained annotations or abbreviations of "${id}".`);
-    }
+    assertRetainedAnnotationsKept(original, molecule);
     if (original.chemistry) {
       const native = nativeSingleBondGraphMetadata(original.atoms, original.bonds);
       if (original.chemistry.stereochemistry.length) native.stereochemistry = previous.graph.stereochemistry ?? [];
@@ -126,15 +144,7 @@ export async function verifiedChemicalRecord(context: StructureInspectionContext
   }
   await verifyStoredSources(context, molecule, { graph, alreadyVerified: previous?.molecule });
   const record = refreshVerifiedMoleculeChemistry(molecule, graph, previous?.molecule.structureFormat);
-  if (molecule.chemistry && stableRecord(molecule.chemistry) !== stableRecord(previous?.molecule.chemistry)) {
-    for (const key of ["stereochemistry", "isotopeLabels", "radicalCount", "totalCharge", "formula"] as const) {
-      const claim = molecule.chemistry[key];
-      if (claim !== undefined && (key !== "stereochemistry" || molecule.chemistry.stereochemistry.length > 0) &&
-          stableRecord(claim) !== stableRecord(record.chemistry![key])) {
-        throw new Error(`The stored ${key} of "${id}" differs from the verified chemical edit.`);
-      }
-    }
-  }
+  assertChemistryClaims(molecule, previous?.molecule, record);
   if (record.structureFormat === "molfile-v3000") {
     await verifyStoredSources(context, record, { graph });
   }

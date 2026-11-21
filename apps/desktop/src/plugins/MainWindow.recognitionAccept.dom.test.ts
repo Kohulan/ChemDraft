@@ -184,6 +184,13 @@ async function sendAction(action: AnalysisWindowAction): Promise<void> {
     window.dispatchEvent(new CustomEvent(ANALYSIS_WINDOW_ACTION_EVENT, { detail: action }));
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
+  if (action.kind !== "acceptPluginProposal") return;
+  // Accepting verifies the inserted chemistry off-thread before it commits; wait for it to land or be refused.
+  await vi.waitFor(async () => {
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    const pending = harness.runtime!.host.listProposedPatches("pending").some((proposal) => proposal.id === action.proposalId);
+    expect(!pending || /Could not|already resolved|Finish/.test(statusText())).toBe(true);
+  }, { timeout: 15_000 });
 }
 
 function statusText(): string {

@@ -13,13 +13,16 @@ import {
   type AppliedPatchReceipt,
   type NormalizedProposedDocumentPatch
 } from "@chemdraft/plugin-api";
-import { assertPluginDocumentWriteScope, rebasePluginPatch, storedCtabReference, writePatchOps } from "@chemdraft/plugin-host";
+import { assertPluginDocumentWriteScope, rebasePluginPatch, retainedCtabCompatibility, storedCtabReference, writePatchOps } from "@chemdraft/plugin-host";
 import { selectionBounds, translateInsertedDocumentObjects } from "../documentWorkflow";
 import { choosePlacement, objectRect, overlaps as boundsOverlap, pageContentRect, RELATIVE_GAP, unionRects } from "../assistant/placement";
 import type { ViewportRect } from "@chemdraft/viewport-engine";
 import { nativeSingleBondGraphMetadata, tryNativeSingleBondGraphSmiles } from "@chemdraft/document-workflow-core";
 import { nativeElementFromAtomLabel } from "@chemdraft/layout-engine";
-import { refreshVerifiedMoleculeChemistry, stableRecord, verifiedChemicalRecord, verifyStoredSources } from "./requestWrites/storedChemistry";
+import {
+  assertChemistryClaims, assertRetainedAnnotationsKept, refreshVerifiedMoleculeChemistry, stableRecord, verifiedChemicalRecord,
+  verifyStoredSources, withoutGeometry
+} from "./requestWrites/storedChemistry";
 import { desktopWriteInspectionContext, inspectMolecule } from "./requestWrites/structureIdentity";
 
 export interface PluginPatchPlacementOptions extends ApplyPatchOptions {
@@ -34,17 +37,23 @@ export interface AppliedPluginDocumentPatch {
   receipt: AppliedPatchReceipt;
 }
 
+/** The fields that carry a molecule's chemistry beside its editable graph, for save and export. */
+const STORED_CHEMISTRY_FIELDS = ["structure", "structureFormat", "chemistry", "compatibility", "superatoms", "rGroups"] as const;
+
 /** Match draft molecules with the graphs they had before the batch's updates.
- * Reviewed proposals are authorized by acceptance and have no command selection scope. */
+ * Reviewed proposals are authorized by acceptance and have no command selection scope, but their
+ * insertions are verified exactly like a scoped plugin's. */
 export function refreshPluginPatchChemistry(before: ChemDraftDocument, draft: ChemDraftDocument,
   rebased: NormalizedProposedDocumentPatch, writeScopeObjectIds?: readonly string[], signal?: AbortSignal
 ): Promise<ChemDraftDocument> | undefined {
   const scope = writeScopeObjectIds && new Set(writeScopeObjectIds);
   const inserted = new Set<string>();
   const atomUpdates = new Set<string>();
+  const storedUpdates = new Set<string>();
   const positions = writePatchOps(rebased.patch).filter(op => {
     if (op.op === "addObject") inserted.add(op.object.id);
     if (op.op === "updateObject" && "atoms" in op.changes) atomUpdates.add(op.objectId);
+    if (op.op === "updateObject" && STORED_CHEMISTRY_FIELDS.some(key => key in op.changes)) storedUpdates.add(op.objectId);
     return op.op === "addObject" || op.op === "addAnnotation" || op.op === "removeObject" ||
       op.op === "removeAnnotation" || op.op === "reorderObject" || op.op === "setObjectOrder";
   });
@@ -55,6 +64,7 @@ export function refreshPluginPatchChemistry(before: ChemDraftDocument, draft: Ch
   }) : before;
   const context = desktopWriteInspectionContext(signal);
   const edits: Promise<void>[] = [];
+  let retained = false;
   const pages = draft.pages.map((page, pageIndex) => {
     // Reviewed edits can also remove orphaned brackets and groups during patch application.
     const prior = baseline.pages[pageIndex]!.objects.filter(object => object.type === "molecule");
@@ -65,23 +75,38 @@ export function refreshPluginPatchChemistry(before: ChemDraftDocument, draft: Ch
       const previous = prior[moleculeIndex++];
       const isInsertion = inserted.has(object.id);
       if (previous?.id !== object.id || (scope && !isInsertion && !scope.has(object.id))) continue;
-      const verifyInsertion = !!scope && isInsertion;
+      // Every insertion is verified, whether a scoped command wrote it or the user accepted it.
+      const verifyInsertion = isInsertion;
       // An authored atom move can change 2D stereo, but only where geometry defines stereo, and
       // never when every atom moved together keeping every stereo side. Host placement
       // translates an insertion as a unit.
       const graphChanged = object !== previous && (graphSignature(previous) !== graphSignature(object) ||
         atomUpdates.has(object.id) && hasGeometryStereo(object) &&
         !(movedAsUnit(previous, object) && keptStereoSides(previous, object)));
-      if (!verifyInsertion && !graphChanged) continue;
+      // A write to the stored records must agree with the graph the canvas draws, changed or not.
+      const storedChanged = object !== previous && storedUpdates.has(object.id) && storedRecord(previous) !== storedRecord(object);
+      if (!verifyInsertion && !graphChanged && !storedChanged) {
+        // The graph and its chemistry are unchanged, but a retained CTAB still holds the old atom
+        // coordinates. Keep them beside it, as a request write does, so a later edit can map its stereo.
+        if (object !== previous && atomUpdates.has(object.id)) {
+          const compatibility = retainedCtabCompatibility(previous, object);
+          if (compatibility !== previous.compatibility) {
+            if (objects === page.objects) objects = [...objects];
+            objects[index] = { ...object, compatibility };
+            retained = true;
+          }
+        }
+        continue;
+      }
       // Records the canvas itself derives from this graph cannot disagree with it.
-      if (verifyInsertion && !graphChanged && storesNativeDerivation(object)) continue;
+      if (verifyInsertion && !graphChanged && !storedChanged && storesNativeDerivation(object)) continue;
       // Give existing scope refusals priority over chemistry inspection of a draft that cannot commit.
       if (!edits.length && writeScopeObjectIds) assertPluginDocumentWriteScope(before, draft, rebased, writeScopeObjectIds);
       if (objects === page.objects) objects = [...objects];
       edits.push((async () => {
         try {
           if (!object.atoms.length) throw new Error("The molecule has no editable atoms to verify.");
-          if (verifyInsertion && !graphChanged) {
+          if (verifyInsertion && !graphChanged && !storedChanged) {
             // Verification only: an insertion that matches its graph keeps its records as authored.
             const insertion = withoutBracketContext(object);
             await verifiedChemicalRecord(context, insertion, await inspectMolecule(context, insertion));
@@ -95,8 +120,11 @@ export function refreshPluginPatchChemistry(before: ChemDraftDocument, draft: Ch
             await verifyStoredSources(context, previous, { graph, reference: storedCtabReference(previous) });
           }
           const graph = await inspectMolecule(context, withoutBracketContext(object));
+          if (storedChanged) assertRetainedAnnotationsKept(previous, object);
           await verifyStoredSources(context, object, { graph, alreadyVerified: previous });
           const refreshed = refreshVerifiedMoleculeChemistry(object, graph, previous.structureFormat);
+          // A supplied record is checked against the graph's, then replaced by it like every other field.
+          if (storedChanged) assertChemistryClaims(withoutBracketContext(object), withoutBracketContext(previous), refreshed);
           if (refreshed.structureFormat === "molfile-v3000") await verifyStoredSources(context, refreshed, { graph });
           objects[index] = refreshed;
         } catch (error) {
@@ -108,6 +136,14 @@ export function refreshPluginPatchChemistry(before: ChemDraftDocument, draft: Ch
     return objects === page.objects ? page : { ...page, objects };
   });
   if (edits.length) return Promise.all(edits).then(() => adoptDerivedDocument(draft, { ...draft, pages }));
+  if (retained) return Promise.resolve(adoptDerivedDocument(draft, { ...draft, pages }));
+}
+
+/** Everything a molecule stores for save and export beside its graph, without geometry. */
+function storedRecord(molecule: MoleculeObject): string {
+  const { superatoms, rGroups } = withoutGeometry(molecule);
+  return stableRecord([molecule.structure, molecule.structureFormat, withoutBracketContext(molecule).chemistry,
+    molecule.compatibility, superatoms, rGroups]);
 }
 
 function graphSignature(molecule: MoleculeObject): string {
