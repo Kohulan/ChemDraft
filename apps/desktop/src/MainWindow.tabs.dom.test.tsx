@@ -2381,7 +2381,7 @@ describe("documents in one window", () => {
         expect(active()).toBe(1);
         // The range rounds up, so the end of the last tab clears the strip.
         expect(translationX(track)).toBe(-2);
-        const last = tabs()[1]!;
+        const last = Array.from(strip.querySelectorAll<HTMLElement>(".document-tab")).at(-1)!;
         const close = last.querySelector<HTMLElement>(".document-tab-close")!;
         vi.spyOn(close, "getBoundingClientRect").mockImplementation(() => {
           const box = last.getBoundingClientRect();
