@@ -123,7 +123,7 @@ ChemDraft selection format through the X11 clipboard. Inspector digit entry and 
 drawing during that entry are skipped because the package harness has no document snapshot reader.
 
 The Debian and Fedora Wayland jobs where ChemDraft uses XWayland (both packages, by default) also
-run `scripts/linux-smoke-toolbar-field.py`. It starts its own headless Weston with XWayland, pastes
+run `.github/workflows/linux-package-smoke/toolbar-field.py`. It starts its own headless Weston with XWayland, pastes
 propane, opens Drawn Structure Settings from **View > Toolbars** over AT-SPI, clicks into one of its
 number fields with an XTEST click and types `30`. It passes only if the field's value changed and
 the document's Copy As SMILES text and native selection JSON did not. The native Wayland job does

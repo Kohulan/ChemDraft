@@ -16,7 +16,7 @@ the .deb picks it itself when WAYLAND_DISPLAY is set. The check:
 Native Wayland (CHEMDRAFT_NATIVE_WAYLAND=1) is not covered. Weston offers no protocol that lets
 one client type into another client's window, and xdotool reaches X11 windows only.
 
-Usage: linux-smoke-toolbar-field.py <bundle> <appimage|deb> <log directory>
+Usage: toolbar-field.py <bundle> <appimage|deb> <log directory>
 """
 
 import json

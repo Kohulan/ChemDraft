@@ -17,7 +17,6 @@ on:
       - scripts/desktop-tauri.mjs
       - tools/release/verify-bundle-licenses.mjs
       - tools/release/record-build.mjs
-      - scripts/linux-smoke-toolbar-field.py
   workflow_call:
     inputs:
       artifact_run_id:
@@ -214,7 +213,7 @@ jobs:
           logs="$GITHUB_WORKSPACE/smoke-logs/toolbar-field"
           install -d -o smoke "$logs"
           runuser -u smoke -- env WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 dbus-run-session -- \
-            /usr/bin/python3 "$GITHUB_WORKSPACE/scripts/linux-smoke-toolbar-field.py" \
+            /usr/bin/python3 "$GITHUB_WORKSPACE/.github/workflows/linux-package-smoke/toolbar-field.py" \
             "$BUNDLE" "$PACKAGE" "$logs" 2>&1 | tee "$logs/harness.log"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
