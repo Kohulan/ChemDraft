@@ -20422,61 +20422,6 @@ export function applyEditorSaveResultToSelectedObject(
   );
 }
 
-export const EDITOR_SAVE_MARK_SHIFT_REFUSAL =
-  "Ketcher can't keep this molecule's charge and radical marks on the right atoms when atoms are added or removed. Remove the marks first, or edit on the canvas.";
-
-/**
- * Whether a structure-editor save could silently put one of the molecule's charge or radical marks
- * on a different atom. The save reuses atom and bond ids by array index (`parseV3000MoleculeGraph`),
- * so after an earlier atom is deleted, added or reordered a mark's atom id (or bond id) names
- * another atom, inside the edited molecule where the commit guard cannot see it. Conservative: with
- * any charge or radical mark associated with the molecule (atom-anchored, bond-anchored, or a legacy
- * mark normalization assigns to one of its atoms), any change to the atom or bond count, any reused
- * atom id with a different element, a marked bond id joining different atoms, or a marked atom
- * (both ends of a marked bond included) with a different multiset of neighbour elements counts.
- * Bond-order changes, in-place moves and unmarked molecules pass.
- */
-function editorSaveMayShiftElectronMarks(
-  pageObjects: readonly DocumentObject[],
-  previous: MoleculeObject,
-  next: MoleculeObject
-): boolean {
-  const isChargeOrRadical = (object: DocumentObject | undefined): object is ElectronMarkObject =>
-    object?.type === "electron-mark" && (object.markKind === "charge" || object.markKind === "radical-dot");
-  const objectById = objectByIdIndex(pageObjects);
-  const markedAtomIds = new Set<string>();
-  const markedBondIds = new Set<string>();
-  for (const { markId, atomId } of atomOwnedMarksByMoleculeId(pageObjects).get(previous.id) ?? []) {
-    if (isChargeOrRadical(objectById.get(markId))) markedAtomIds.add(atomId);
-  }
-  for (const object of pageObjects) {
-    if (isChargeOrRadical(object) && object.anchor.kind === "bond" && object.anchor.objectId === previous.id && object.anchor.bondId) {
-      markedBondIds.add(object.anchor.bondId);
-    }
-  }
-  if (markedAtomIds.size === 0 && markedBondIds.size === 0) return false;
-  if (previous.atoms.length !== next.atoms.length || previous.bonds.length !== next.bonds.length) return true;
-
-  const nextAtomById = new Map(next.atoms.map((atom) => [atom.id, atom]));
-  if (previous.atoms.some((atom) => nextAtomById.get(atom.id)?.element !== atom.element)) return true;
-  const endsKey = (bond: MoleculeBond) => [bond.fromAtomId, bond.toAtomId].sort().join("\n");
-  for (const bondId of markedBondIds) {
-    const before = previous.bonds.find((bond) => bond.id === bondId);
-    const after = next.bonds.find((bond) => bond.id === bondId);
-    if (!before || !after || endsKey(before) !== endsKey(after)) return true;
-    markedAtomIds.add(before.fromAtomId).add(before.toAtomId);
-  }
-  const neighbourElements = (molecule: MoleculeObject, atomId: string) => {
-    const elementById = new Map(molecule.atoms.map((atom) => [atom.id, atom.element]));
-    return molecule.bonds
-      .flatMap((bond) => bond.fromAtomId === atomId ? [bond.toAtomId] : bond.toAtomId === atomId ? [bond.fromAtomId] : [])
-      .map((id) => elementById.get(id) ?? "")
-      .sort()
-      .join(",");
-  };
-  return [...markedAtomIds].some((atomId) => neighbourElements(previous, atomId) !== neighbourElements(next, atomId));
-}
-
 /**
  * Apply a structure-editor save to the selected molecule, returning the side-dependent labels the
  * save read again from their drawing (`carryLabelBondSidesThroughEditorSave`), for the caller to show.
@@ -20494,14 +20439,224 @@ export function applyEditorSaveResultWithLabelWarnings(
   }
 
   const synced = syncMoleculePreviewFromEditorSave(selectedMolecule, result.object);
+  // 1.2.2 fallback: a molecule with charge or radical marks is never rewritten from the structure
+  // editor, whatever the save contains: every Apply is refused and the document is left untouched.
+  // The carry and refusal logic below stays in place but is unreachable for a marked molecule.
+  const markedPage = document.pages.find((candidate) => candidate.objects.some((object) => object.id === selectedMolecule.id));
+  if (markedPage && moleculeHasElectronMarks(markedPage, selectedMolecule)) {
+    return { document, labelWarnings: [], refusal: EDITOR_SAVE_MARKED_MOLECULE_REFUSAL };
+  }
+  // The save reuses atom and bond ids by index, so adding or removing atoms could silently put a
+  // charge or radical mark on another atom: refuse it, leaving the document unchanged.
   const page = document.pages.find((candidate) => candidate.objects.some((object) => object.id === selectedMolecule.id));
-  if (page && editorSaveMayShiftElectronMarks(page.objects, selectedMolecule, synced.molecule)) {
+  if (page && editorSaveMayShiftElectronMarks(page, selectedMolecule, synced.molecule)) {
     return { document, labelWarnings: [], refusal: EDITOR_SAVE_MARK_SHIFT_REFUSAL };
   }
-  return {
-    document: applyEditorSaveResultToSelectedObject(document, { ...result, object: synced.molecule }),
-    labelWarnings: synced.labelWarnings
-  };
+  if (synced.molecule === result.object) {
+    return { document: applyEditorSaveResultToSelectedObject(document, result), labelWarnings: synced.labelWarnings };
+  }
+  // A molecule rebuilt from the editor's V3000 carries each atom's charge as the editor returned it.
+  const applied = applyEditorV3000SaveKeepingElectronMarks(document, result, selectedMolecule, synced.molecule);
+  return "refusal" in applied
+    ? { document, labelWarnings: [], refusal: applied.refusal }
+    : { document: applied.document, labelWarnings: synced.labelWarnings };
+}
+
+export const EDITOR_SAVE_MARKED_MOLECULE_REFUSAL =
+  "This molecule has charge or radical marks; edit it on the canvas, or remove the marks first, then use the structure editor.";
+
+/**
+ * Whether the molecule carries any charge or radical mark: anchored to one of its atoms, bonds or to
+ * the object itself, or a legacy loose mark that commit normalization assigns to one of its atoms.
+ * Read from the mark objects on the page, not from the atoms' `markCharge`/`markRadicals`, which
+ * normalization recomputes from them.
+ */
+export function moleculeHasElectronMarks(page: DocumentPage, molecule: MoleculeObject): boolean {
+  const objectById = objectByIdIndex(page.objects);
+  const isChargeOrRadical = (object: DocumentObject | undefined): object is ElectronMarkObject =>
+    object?.type === "electron-mark" && (object.markKind === "charge" || object.markKind === "radical-dot");
+  for (const [markId, owner] of committedElectronMarkAssignments(page).anchorByMarkId) {
+    if (owner?.objectId === molecule.id && isChargeOrRadical(objectById.get(markId))) return true;
+  }
+  return page.objects.some((object) =>
+    isChargeOrRadical(object) && (object.anchor as { objectId?: string }).objectId === molecule.id);
+}
+
+export const EDITOR_SAVE_MARK_SHIFT_REFUSAL =
+  "Ketcher can't keep this molecule's charge and radical marks on the right atoms when atoms are added or removed. Remove the marks first, or edit on the canvas.";
+
+/** The refusal for a Ketcher save whose charge on an atom contradicts the charge marks still on it. */
+export function editorSaveChargeContradictsMarkRefusal(element: string, atomNumber: number): string {
+  return `Ketcher changed the charge on ${element} atom ${atomNumber} but its charge mark is still on the canvas. Remove or move the charge mark on the canvas first.`;
+}
+
+/**
+ * Whether a structure-editor save could silently put one of the molecule's charge or radical marks
+ * on a different atom. The save reuses atom and bond ids by array index (`parseV3000MoleculeGraph`),
+ * so after an earlier atom is deleted, added or reordered a mark's atom id (or bond id) names
+ * another atom, inside the edited molecule where the commit guard cannot see it. Conservative: with
+ * any charge or radical mark associated with the molecule (atom-anchored, bond-anchored, or a legacy
+ * mark normalization assigns to one of its atoms), any change to the atom or bond count, any change
+ * to the bond graph in id terms (the set of atom-id pairs the bonds join), a marked bond id joining
+ * different atoms, or a different element on a marked atom (both ends of a marked bond included) or
+ * on a direct neighbour of one counts. Bond-order changes, in-place moves, element changes away from
+ * every mark and unmarked molecules pass.
+ */
+function editorSaveMayShiftElectronMarks(
+  page: DocumentPage,
+  previous: MoleculeObject,
+  next: MoleculeObject
+): boolean {
+  const isChargeOrRadical = (object: DocumentObject | undefined): object is ElectronMarkObject =>
+    object?.type === "electron-mark" && (object.markKind === "charge" || object.markKind === "radical-dot");
+  const objectById = objectByIdIndex(page.objects);
+  const markedAtomIds = new Set<string>();
+  const markedBondIds = new Set<string>();
+  for (const [markId, owner] of committedElectronMarkAssignments(page).anchorByMarkId) {
+    if (owner?.objectId === previous.id && isChargeOrRadical(objectById.get(markId))) markedAtomIds.add(owner.atomId);
+  }
+  for (const object of page.objects) {
+    if (!isChargeOrRadical(object)) continue;
+    if (object.anchor.kind === "atom" && object.anchor.objectId === previous.id && object.anchor.atomId) {
+      markedAtomIds.add(object.anchor.atomId);
+    }
+    if (object.anchor.kind === "bond" && object.anchor.objectId === previous.id && object.anchor.bondId) {
+      markedBondIds.add(object.anchor.bondId);
+    }
+  }
+  if (markedAtomIds.size === 0 && markedBondIds.size === 0) return false;
+  if (previous.atoms.length !== next.atoms.length || previous.bonds.length !== next.bonds.length) return true;
+
+  // Same counts can still hide a delete-and-re-add: the reused id then names a different atom even
+  // when every element and neighbour element matches (C1-C2(radical)-C3-C4 with C1 deleted and a
+  // carbon drawn on C2). The bond graph in id terms catches it; a bond-order change keeps it.
+  const endsKey = (bond: MoleculeBond) => [bond.fromAtomId, bond.toAtomId].sort().join("\n");
+  const topology = (molecule: MoleculeObject) => molecule.bonds.map(endsKey).sort().join("\t");
+  if (topology(previous) !== topology(next)) return true;
+  for (const bondId of markedBondIds) {
+    const before = previous.bonds.find((bond) => bond.id === bondId);
+    const after = next.bonds.find((bond) => bond.id === bondId);
+    if (!before || !after || endsKey(before) !== endsKey(after)) return true;
+    markedAtomIds.add(before.fromAtomId).add(before.toAtomId);
+  }
+  // With the bond graph unchanged, an element change matters only on a marked atom or a direct
+  // neighbour of one (what the mark's chemistry is judged against); one far from every mark passes.
+  const checkedAtomIds = new Set(markedAtomIds);
+  for (const bond of previous.bonds) {
+    if (markedAtomIds.has(bond.fromAtomId)) checkedAtomIds.add(bond.toAtomId);
+    if (markedAtomIds.has(bond.toAtomId)) checkedAtomIds.add(bond.fromAtomId);
+  }
+  const nextAtomById = new Map(next.atoms.map((atom) => [atom.id, atom]));
+  return previous.atoms.some((atom) => checkedAtomIds.has(atom.id) && nextAtomById.get(atom.id)?.element !== atom.element);
+}
+
+/**
+ * Applies a molecule rebuilt from the structure editor's V3000 without changing what the page's
+ * electron marks mean (AGENTS.md section 7).
+ *
+ * The editor is handed each atom's TOTAL formal charge (the stored SMILES is written from
+ * `formalCharge`, which includes what the charge marks contribute) and returns it as CHG, so the
+ * parsed atoms carry that total and no `markCharge`. Commit normalization computes
+ * `formalCharge - markCharge + contribution`; left at zero, `markCharge` would let a + mark add its
+ * charge a second time. So:
+ *
+ * 1. The rebuilt atoms are placed afresh (re-centred on the old box), which can move an atom away
+ *    from its marks. A mark anchored to an atom that survives the save (same id and element) is
+ *    carried by that atom's displacement — the carry every molecule transform applies
+ *    (`anchoredElectronMarkTransformPatches`) — so it stays with the atom it was on, rather than
+ *    falling out of radius or being taken by a neighbour, which would move its charge. A charge or
+ *    radical mark that is bond-, object- or loosely anchored is first resolved to its owning atom
+ *    the way commit normalization resolves it, then anchored to that atom and carried the same way.
+ * 2. Each atom records, as `markCharge`/`markRadicals`, exactly what the marks associated with it on
+ *    the page after the save contribute, found by the assignment commit normalization runs
+ *    (`committedElectronMarkAssignments`). Normalization's sum then returns the editor's CHG.
+ *
+ * 3. An atom whose charge the editor changed so that it contradicts the charge marks still on it
+ *    is refused (see below). An unchanged charge always commits.
+ *
+ * A mark that associates with no atom after the save (its atom was deleted in the editor, or it is
+ * a loose mark now out of radius) contributes nothing: the editor's CHG stays the atom's whole
+ * charge, and the mark stays on the page, loose. No mark is ever removed.
+ */
+function applyEditorV3000SaveKeepingElectronMarks(
+  document: ChemDraftDocument,
+  result: EditorSaveResult,
+  previous: MoleculeObject,
+  molecule: MoleculeObject
+): { document: ChemDraftDocument } | { refusal: string } {
+  const apply = (base: ChemDraftDocument, object: MoleculeObject) =>
+    applyEditorSaveResultToSelectedObject(base, { ...result, object });
+
+  // 1. Every charge or radical mark of the molecule rides with its atom. Positions are compared as
+  // the page stores them; an atom survives the save when its id comes back with the same element.
+  const placed = selectionPage(apply(document, molecule)).objects.find((object) => object.id === molecule.id);
+  const placedAtomById = new Map(placed?.type === "molecule" ? placed.atoms.map((atom) => [atom.id, atom] as const) : []);
+  const page = selectionPage(document);
+  const displacementByAtomId = new Map<string, { dx: number; dy: number }>();
+  for (const atom of previous.atoms) {
+    const next = placedAtomById.get(atom.id);
+    if (next && next.element === atom.element) displacementByAtomId.set(atom.id, { dx: next.x - atom.x, dy: next.y - atom.y });
+  }
+  // Atom-anchored marks: the carry every molecule transform applies.
+  const carryPatches: DocumentPatch[] = [...displacementByAtomId].flatMap(([atomId, { dx, dy }]) =>
+    dx === 0 && dy === 0 ? [] : anchoredElectronMarkTransformPatches(page, previous.id, new Set([atomId]),
+      (point) => ({ x: point.x + dx, y: point.y + dy })));
+  // Bond-, object- and loose marks: resolved to their owning atom before the save, as commit
+  // normalization resolves them, then anchored to that atom and moved by its displacement. Left at
+  // their old coordinates they could fall out of radius (a radical silently lost, V3000 carries no
+  // RAD back) or be taken by a neighbour the save moved closer. A mark that resolves to no atom
+  // (an explicit floating drop, or a loose mark out of radius) stays where it is.
+  const objectById = objectByIdIndex(page.objects);
+  for (const [markId, owner] of committedElectronMarkAssignments(page).anchorByMarkId) {
+    if (owner?.objectId !== previous.id) continue;
+    const mark = objectById.get(markId);
+    if (mark?.type !== "electron-mark" || mark.anchor.kind === "atom" ||
+      (mark.markKind !== "charge" && mark.markKind !== "radical-dot")) continue;
+    const displacement = displacementByAtomId.get(owner.atomId);
+    if (!displacement) continue;
+    carryPatches.push({ op: "updateObject", objectId: mark.id, changes: {
+      anchor: { kind: "atom", objectId: previous.id, atomId: owner.atomId },
+      x: mark.x + displacement.dx,
+      y: mark.y + displacement.dy
+    } });
+  }
+  const carried = carryPatches.length ? applyPatches(document, carryPatches, { now: phase4Timestamp }) : document;
+
+  // 2. Record each atom's mark contribution on the page exactly as it will be committed. The parsed
+  // atoms carry no mark fields yet, which is also what normalization's legacy-anchor rule sees.
+  const { assignedChargeByAtomKey, assignedRadicalsByAtomKey } =
+    committedElectronMarkAssignments(selectionPage(apply(carried, molecule)));
+  if (assignedChargeByAtomKey.size === 0 && assignedRadicalsByAtomKey.size === 0) {
+    return { document: apply(carried, molecule) };
+  }
+  // 3. The editor's charge must not contradict a charge mark still on the atom. With CHG the
+  // atom's total and c its marks' contribution, the plain charge left is CHG - c. A plain charge of
+  // the opposite sign to the mark (the charge cleared or flipped in the editor, the + still drawn)
+  // would hide a counter-charge under the visible mark: refuse. Zero, or the same sign (a + marked
+  // N raised to 2+), is consistent and commits, and so does any charge the editor left unchanged.
+  const previousChargeByAtomId = new Map(previous.atoms.map((atom) => [atom.id, atom.formalCharge] as const));
+  for (const [index, atom] of molecule.atoms.entries()) {
+    const markCharge = assignedChargeByAtomKey.get(nativeElectronMarkAtomKey(molecule.id, atom.id)) ?? 0;
+    // Only a charge the editor changed can contradict a mark: an unchanged total (for example an
+    // intrinsic -1 under a + mark, total 0) is what the page already committed.
+    if (markCharge === 0 || previousChargeByAtomId.get(atom.id) === atom.formalCharge) continue;
+    const plain = atom.formalCharge - markCharge;
+    if (plain !== 0 && Math.sign(plain) !== Math.sign(markCharge)) {
+      return { refusal: editorSaveChargeContradictsMarkRefusal(atom.element, index + 1) };
+    }
+  }
+  const atoms = molecule.atoms.map((atom) => {
+    const key = nativeElectronMarkAtomKey(molecule.id, atom.id);
+    const markCharge = assignedChargeByAtomKey.get(key) ?? 0;
+    const markRadicals = assignedRadicalsByAtomKey.get(key) ?? 0;
+    const { markCharge: _markCharge, markRadicals: _markRadicals, ...baseAtom } = atom;
+    return {
+      ...baseAtom,
+      ...(markCharge === 0 ? {} : { markCharge }),
+      ...(markRadicals === 0 ? {} : { markRadicals })
+    };
+  });
+  return { document: apply(carried, { ...molecule, atoms }) };
 }
 
 /**

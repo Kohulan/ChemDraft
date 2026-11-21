@@ -1,3 +1,4 @@
+import { basename } from "@tauri-apps/api/path";
 import { CanvasContextMenu, NATIVE_CANVAS_MENU_CLOSED_EVENT } from "./CanvasContextMenu";
 import { PLUGIN_CHANGE_REFUSED, RECOGNITION_REFUSED, chemistryRefusalOf, refusalSentence } from "./plugins/requestWrites/chemistryRefusal";
 import { buildObjectCanvasMenu, pageCanvasMenu, SET_DEFAULT_ARROW_STYLE_COMMAND_ID } from "./canvasContextMenuModel";
@@ -1851,7 +1852,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.21.10.45-sonnet";
+const CURRENT_BUILD_STAMP = "11.21.15.00-opus";
 
 /**
  * The commit funnel's chemistry check (AGENTS.md section 7, `commitChemistryGuard.ts`). `before`
@@ -10918,6 +10919,9 @@ export function MainWindow({
       previewArrangementSpacing: (tabId, percent) => previewSpacingRef.current(tabId, percent),
       applyArrangementSpacing: (tabId, percent) => applySpacingRef.current(tabId, percent),
       onSpacingSettled: tabId => { nativeSpacingSourcesRef.current.delete(tabId); }, onError: setStatus,
+      onPageEnlargementClosed: tabId => {
+        if (activeDocumentTabIdRef.current === tabId) canvasRegionRef.current?.focus({ preventScroll: true });
+      },
       export: (tabId, options, live, progress) => exportToTabRef.current(tabId, options, live, progress),
       previewExport: (tabId, options, live) => previewExportRef.current(tabId, options, live),
       chooseExportDestination: (tabId, options, live) => chooseExportDestinationRef.current(tabId, options, live),
@@ -11084,11 +11088,6 @@ export function MainWindow({
             }
           }
           if (!active) return;
-          const pristine = documentTabsRef.current.length === 1
-            && !nonPristineTabsRef.current.has(activeDocumentTabIdRef.current)
-            && !fileStateRef.current.path
-            && !fileStateRef.current.dirty
-            && documentIsBlank(documentRef.current);
           unrestoredSessionTabsRef.current = skipped;
           setUnrestoredSessionTabCount(skipped.length);
           const restoreNotice = unrestoredTabsNotice(skipped.length);
@@ -11101,7 +11100,16 @@ export function MainWindow({
             setStatus(`Could not restore the last session${restoreNotice}`);
             return;
           }
-          const restoredTabs = restored.map(({ id, session }) => ({ id, title: session.displayName }));
+          const restoredTabs = await Promise.all(restored.map(async ({ id, session }) => ({
+            id,
+            title: session.path ? await resolveNativePathBasename(session.path) : session.displayName
+          })));
+          if (!active) return;
+          const pristine = documentTabsRef.current.length === 1
+            && !nonPristineTabsRef.current.has(activeDocumentTabIdRef.current)
+            && !fileStateRef.current.path
+            && !fileStateRef.current.dirty
+            && documentIsBlank(documentRef.current);
           let tabs: Array<{ id: string; title: string }> = restoredTabs;
           if (!pristine) {
             snapshotDocumentTab(false);
@@ -11210,7 +11218,7 @@ export function MainWindow({
         const draft = tab.id === committedDraft?.tabId ? committedDraft : undefined;
         const tabDocument = draft?.document ?? (tab.id === activeDocumentTabIdRef.current ? flushed : snapshot.history.present);
         const file = draft ? { ...snapshot.file, dirty: draft.dirty } : snapshot.file;
-        const displayName = file.path ? nativePathBasename(file.path) : tab.title;
+        const displayName = tab.title;
         const warning = draft?.warning;
         const openWarnings = warning ? {
           displayName, sourceLabel: snapshot.warnings?.sourceLabel ?? "a recovered session",
@@ -11650,7 +11658,7 @@ export function MainWindow({
     const savedDocument = active ? documentForFlush() : savingDocument;
     // The baseline and payload describe the same single draft snapshot.
     let payload = createDocumentFileSave(savedDocument);
-    const finishSave = (path?: string) => {
+    const finishSave = (destination?: { path: string; displayName: string }) => {
       savedDocumentsRef.current.set(savingTabId, savedDocument);
       documentSaveRevisionsRef.current.set(savingTabId, (documentSaveRevisionsRef.current.get(savingTabId) ?? 0) + 1);
       nonPristineTabsRef.current.add(savingTabId);
@@ -11658,8 +11666,8 @@ export function MainWindow({
         documentTabSnapshotsRef.current.get(savingTabId)?.history.present;
       // The editor may have committed/cancelled (or its tab switched) while the write awaited I/O.
       const dirty = !currentDocument || !assistantDocumentContentUnchanged(savedDocument, currentDocument);
-      const nextFileState = { path: path ?? savingFileState.path, dirty };
-      const displayName = path ? nativePathBasename(path) : payload.filename;
+      const nextFileState = { path: destination?.path ?? savingFileState.path, dirty };
+      const displayName = destination?.displayName ?? payload.filename;
       const warningsReport: OpenWarningsReport | undefined = payload.warnings.length > 0 ? {
         operation: "save", displayName, sourceLabel: payload.kind === "binary" ? "ChemDraft CDX envelope" : "ChemDraft CDXML envelope", warnings: payload.warnings
       } : undefined;
@@ -11684,7 +11692,7 @@ export function MainWindow({
         });
       }
       const tabs = documentTabsRef.current.map((tab) => tab.id === savingTabId
-        ? { ...tab, title: path ? nativePathBasename(path) : tab.title } : tab);
+        ? { ...tab, title: destination?.displayName ?? tab.title } : tab);
       documentTabsRef.current = tabs;
       setDocumentTabs(tabs);
     };
@@ -11707,8 +11715,11 @@ export function MainWindow({
       }
       const finalPath = ensureChemDraftFileExtension(path);
       payload = createDocumentFileSave(savedDocument, finalPath);
-      await writeNativeExportResult(finalPath, payload);
-      finishSave(finalPath);
+      const [displayName] = await Promise.all([
+        resolveNativePathBasename(finalPath),
+        writeNativeExportResult(finalPath, payload)
+      ]);
+      finishSave({ path: finalPath, displayName });
       return true;
     } catch (error) {
       const message = `Save failed: ${error instanceof Error ? error.message : String(error)}`;
@@ -13333,7 +13344,17 @@ export function MainWindow({
     },
     requestPageSpace: {
       plan: planRequestPageFit,
-      confirm: signal => new PageEnlargementConsent(shortcutPlatform).confirm(signal)
+      confirm: async (signal, documentKey) => {
+        if (!isDesktopRuntime()) return new PageEnlargementConsent(shortcutPlatform).confirm(signal);
+        const coordinator = dialogCoordinatorRef.current;
+        // Own the question by the tab the request started in (resolved from the request document's
+        // key), not whichever tab is active now. A key with no tab means that document was closed.
+        const requestTabId = [...requestDocumentKeysRef.current].find(([, key]) => key === documentKey)?.[0];
+        if (coordinator && !requestTabId) return "unanswered";
+        if (coordinator) return coordinator.confirmPageEnlargement(requestTabId!, signal);
+        setStatus("Page enlargement could not open: the dialog host is unavailable.");
+        return signal?.aborted ? "keep" : "unanswered";
+      }
     },
     openRequestHistory: (document, label) => {
       const tabId = [...requestDocumentKeysRef.current].find(([, key]) => key === document.key)?.[0];
@@ -16262,15 +16283,20 @@ export function MainWindow({
     };
   }, [openWarningsListShown]);
 
-  // Label the web document by its worktree so browser tabs and accessibility state distinguish
-  // nearby checkouts. On macOS, index.html's initial title can overwrite the Rust setup title without
-  // following this later React update, so the Tauri page-load hook separately reasserts the same
-  // baked label on the native NSWindow title bar. See AGENTS.md.
+  const activeDocumentName = documentTabs.find((tab) => tab.id === activeDocumentTabId)?.title ?? document.title;
+  const nativeTitleWriteRef = useRef(Promise.resolve());
   useEffect(() => {
-    const tab = documentTabs.find((candidate) => candidate.id === activeDocumentTabId);
-    const name = fileState.path ? nativePathBasename(fileState.path) : tab?.title ?? document.title;
-    window.document.title = `${name}${fileState.dirty ? " •" : ""} — ChemDraft${__WORKTREE_LABEL__ ? ` — ${__WORKTREE_LABEL__}` : ""}`;
-  }, [activeDocumentTabId, document.title, documentTabs, fileState]);
+    const title = `${activeDocumentName}${fileState.dirty ? " •" : ""} — ChemDraft${__WORKTREE_LABEL__ ? ` — ${__WORKTREE_LABEL__}` : ""}`;
+    window.document.title = title;
+    if (!isDesktopRuntime()) return;
+    let current = true;
+    nativeTitleWriteRef.current = nativeTitleWriteRef.current.then(async () => {
+      const { invoke } = await import("@tauri-apps/api/core");
+      // With no label, Tauri sets the title of the invoking document window.
+      if (current) await invoke("plugin:window|set_title", { value: title });
+    }).catch((error: unknown) => console.warn("Could not update the document window title", error));
+    return () => { current = false; };
+  }, [activeDocumentName, fileState.dirty]);
 
   const handleOpenFile = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -22723,20 +22749,26 @@ export function MainWindow({
     // A side-dependent label the save could not carry is read again from its drawing: say so (short
     // on the status line, each atom named in the log) rather than let the save change it silently.
     const applied = applyEditorSaveResultWithLabelWarnings(documentRef.current, result);
-    // The save reuses atom ids by index, so adding or removing atoms could silently put a charge or
-    // radical mark on another atom: refuse it, leaving the document and undo stack unchanged.
+    // A molecule with charge or radical marks is refused before commit (1.2.2 fallback: every
+    // structure-editor Apply on it), as is a save whose charge contradicts a mark: the document and
+    // undo stack are unchanged, and the host keeps this message on the status line (it reports
+    // success only for `true`).
     if (applied.refusal) {
       setStatus(applied.refusal);
-      return;
+      return false;
     }
     // Only the edited molecule may change. The save reuses atom ids by index, so its marks are not
-    // carried by the charge-follows rule: they stay put and normal association applies.
-    commitDocumentChangeWithPageFit(applied.document, undefined, undefined, undefined, structureEditorChemistry(result.object.id));
+    // carried by the charge-follows rule: they stay put and normal association applies. The commit
+    // can still decline (a page-size question already open, a chemistry refusal): it has set its own
+    // status then, which an "Applied" from the host must not overwrite.
+    const committed = commitDocumentChangeWithPageFit(applied.document, undefined, undefined, undefined, structureEditorChemistry(result.object.id));
+    if (!committed) return false;
     const labelStatus = editorSaveLabelWarningsStatus(applied.labelWarnings);
     if (labelStatus) {
       setStatus(labelStatus);
       applied.labelWarnings.forEach((warning) => console.info(warning.detail));
     }
+    return true;
   }, [commitDocumentChangeWithPageFit]);
 
   const createAgentSnapshot = useCallback((): AgentSnapshot => {
@@ -23423,7 +23455,7 @@ export function MainWindow({
             {documentTabs.map((tab) => {
               const active = tab.id === activeDocumentTabId;
               const file = active ? fileState : documentTabSnapshotsRef.current.get(tab.id)?.file;
-              const title = file?.path ? nativePathBasename(file.path) : tab.title;
+              const title = tab.title;
               return (
                 <div className="document-tab" key={tab.id} data-active={active}>
                   <button type="button" role="tab" aria-selected={active}
@@ -34620,6 +34652,10 @@ export function documentTabPathKey(path: string, platform = detectDesktopShortcu
 
 export function nativePathBasename(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
+}
+
+async function resolveNativePathBasename(path: string): Promise<string> {
+  return await basename(path).catch(() => undefined) ?? nativePathBasename(path);
 }
 
 export function nativePathDirname(path: string): string | undefined {

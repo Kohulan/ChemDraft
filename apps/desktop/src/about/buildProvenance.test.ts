@@ -18,7 +18,7 @@ describe("About provenance", () => {
     // Component paragraphs start with a heading, then indent the details.
     const paragraphs = notice.split(/\n{2,}/);
     const headings = paragraphs.flatMap(paragraph => {
-      if (!/^\S/.test(paragraph) || /^(?:APPENDIX A\.|A\.\d )/.test(paragraph)) return [];
+      if (!/^\S/.test(paragraph) || /^(?:APPENDIX A\.|A\.\d+ )/.test(paragraph)) return [];
       const lines = paragraph.split("\n");
       const detailStart = lines.findIndex(line => line.startsWith("  "));
       return detailStart > 0 ? [lines.slice(0, detailStart).join(" ")] : [];
@@ -35,7 +35,7 @@ describe("About provenance", () => {
     ]);
     for (const disposition of provenance.inventoryCoverage.values()) {
       expect(displayed.has(disposition) ||
-        ["Development or build tooling", "Distributed separately", "Linkage remains unconfirmed"].includes(disposition)).toBe(true);
+        ["Development or build tooling", "Distributed separately"].includes(disposition)).toBe(true);
     }
     for (const disposition of provenance.noticeCoverage.values()) {
       expect(displayed.has(disposition) ||
@@ -55,7 +55,10 @@ describe("About provenance", () => {
       expect.objectContaining({ name: "IsoSpec WASM (vendored)", version: "2.3.5" }),
       expect.objectContaining({ name: "indigo-ketcher", version: "1.40.0" }),
       expect.objectContaining({ name: "OPSIN (vendored JAR + bundled JRE)", version: "2.9.0" }),
-      expect.objectContaining({ name: "InChI (inside the RDKit MinimalLib WASM)", version: "1.07.3", license: expect.stringContaining("unconfirmed") }),
+      expect.objectContaining({ name: "InChI (inside the RDKit MinimalLib WASM)", version: "1.07.3", license: expect.stringContaining("MIT") }),
+      expect.objectContaining({ name: "FreeType 2.13.3 (inside the RDKit MinimalLib WASM)", version: "2.13.3", license: expect.stringContaining("elected: FTL") }),
+      expect.objectContaining({ name: "zlib 1.3.2 (inside the RDKit MinimalLib WASM)", version: "1.3.2" }),
+      expect.objectContaining({ name: "Telex Regular (font embedded in the RDKit MinimalLib WASM)", license: expect.stringContaining("SIL Open Font License") }),
       expect.objectContaining({ name: "avogadrolibs (Avogadro Core + Calc)", version: "416651ddaef33a4e20392392e7c0b505d446491b" })
     ]));
     for (const component of provenance.components) {

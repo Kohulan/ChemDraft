@@ -100,6 +100,8 @@ detail depends on the binary's available symbols.
 
 ## Container smoke test
 
+A tester can run ChemDraft with `CHEMDRAFT_PALETTE_FOCUS_LOG=1` to get one `[palette-focus] linux-acquire` line per field click on stderr; the smoke sets it.
+
 Pull requests changing Linux packaging paths, any desktop Rust source, `Cargo.toml` or `Cargo.lock`
 also build and smoke-test packages from the PR head.
 
@@ -130,6 +132,109 @@ the Main Toolbar and Drawn Structure Settings entries from the GTK **View > Tool
 tree. It uses `xclip` and real keyboard shortcuts to round-trip plain SMILES text and the native
 ChemDraft selection format through the X11 clipboard. Inspector digit entry and preservation of the
 drawing during that entry are skipped because the package harness has no document snapshot reader.
+
+The Debian and Fedora Wayland jobs where ChemDraft uses XWayland (both packages, by default) also
+run `.github/workflows/linux-package-smoke/toolbar-field.py` twice: once under headless Weston
+(`--compositor weston`) and once under a virtual KWin (`--compositor kwin`, which runs
+`kwin_wayland --virtual --xwayland`; the jobs install Debian's `kwin-wayland` or Fedora's
+`/usr/bin/kwin_wayland`). Each run starts its own compositor with XWayland, pastes
+propane and reads the document back with **Edit > Paste**, **Select All**, **Copy As > SMILES** and
+**Copy**, opens Drawn Structure Settings from **View > Toolbars**, clicks into one of its number
+fields with an XTEST click and types `30`. Under KWin it first clicks an empty area of the
+document's canvas with an XTEST click, as a user would to bring ChemDraft to the front, waits
+until the document has focus (falling back to `xdotool windowfocus`, and saying so, if KWin did
+not focus it on the click), and chooses **Select All** again, since that click clears the
+selection. Those fields are enabled only while a molecule is
+selected, which **Select All** leaves in place. It finds the field over AT-SPI as WebKitGTK exposes
+it (a spin button, or an editable entry named for a number field, that is enabled or sensitive;
+the AppImage's WebKitGTK reports these fields with the role "embedded", and the log notes it),
+clearing libatspi's cache before each scan, and logs every candidate it saw. When it finds none,
+it also logs the palette's accessibility tree, so the log shows whether the web content, the
+selection or only the field's state was missing. It chooses every menu command over AT-SPI rather than
+typing its shortcut, because the compositor's X window manager decides where X keyboard focus goes and
+can undo a focus change that `xdotool` makes. It first requires that no ChemDraft window other
+than the document has focus, since the Edit commands follow the focused window. Under KWin it passes only
+if the field's value changed and the document's Copy As SMILES text and native selection JSON
+did not. KWin's X window manager honors a client's own focus request, as on KDE Plasma, so the
+KWin run is the pass/fail check for click-to-focus in a toolbar field. Under Weston only the
+chemistry must stay the same: an unchanged field is logged as a notice, not a failure, because
+Weston cannot test click-to-focus (below). The native Wayland job does
+not run it: Weston has no protocol that lets a test client type into another client's window, and
+`xdotool` reaches X11 windows only. KWin and Weston still differ from Mutter and other X window
+managers, so a pass does not prove focus handling under every desktop.
+
+KWin 6 routes XWayland's XTEST input, which is what `xdotool` sends, through libei, and by default
+it holds that input behind a "Remote Control" prompt (`kwin_eis_prompter`) until someone presses
+Allow. Before starting KWin, the check writes `XwaylandEisNoPrompt=true` in group `[Xwayland]` to
+the `kwinrc` in the session's own `XDG_CONFIG_HOME`. That is the setting System Settings' "Legacy
+X11 App Support" page writes, and it makes KWin accept XWayland's input without asking (KWin 6.7.4
+and 6.8.3, `src/kwin.kcfg` and `src/plugins/eis/xwaylandeiscontext.cpp`). The log says which input
+path XWayland used (libei when its process has `LIBEI_SOCKET`) and whether the prompt appeared.
+
+Weston cannot test click-to-focus, whatever the app does, so its run is not a focus gate; it
+keeps its setup, accessibility and chemistry checks. Weston's X window
+manager gives X focus only to the window the compositor last activated and resets any other
+focus change a client makes; it ignores `_NET_ACTIVE_WINDOW`. The compositor activates a window
+only on input from a Wayland seat. Headless Weston has no seat unless started with `--fake-seat`,
+and XTEST clicks never leave XWayland, so X focus stays on Weston's 1x1 no-focus window. Under both
+compositors ChemDraft writes one `[palette-focus] linux-acquire` line per field click to its log on
+Linux, whatever the agent-bridge setting, and the script prints those lines: they show whether the
+click reached the app (`gtk-click`), whether a ChemDraft window had focus when the request ran
+(`app-foreground=`) and when one last lost focus relative to the press (`app-focus-lost=`, such
+as `40ms-before-press` or `never`), which X window held the keyboard when the request ran
+(`focus-holder=`, one of `chemdraft(0x...)`, `none`, `pointer-root`, `root`, `wm(0x...)`,
+`other(0x...)`, `unknown`, or `n/a` off X11, followed by `net-active=` with the root window's
+`_NET_ACTIVE_WINDOW`), what its focus gate decided (`request=`), whether it called
+`XSetInputFocus`, and which X window held focus afterwards. The script then repeats
+`app-foreground`, `app-focus-lost`, `request` and `outcome` for each line. If moving the pointer to the field
+does not take, the script retries a few times and then moves it with relative XTEST motion before
+it gives up, and prints XWayland's libei lines from `display.log`.
+
+Linux follows Windows and macOS (owner decision, 2026-11-21): a click on a palette field while
+another application is really in front does not take the keyboard. The keys stay with that
+application, and the user clicks a ChemDraft window first. The only exception covers the X11
+focus handoff race. A window manager may move X focus off the document as it offers the click to
+the palette, which does not accept focus until the field asks, so no ChemDraft window has focus
+when the request runs although ChemDraft was in front at the press.
+
+Without a focused ChemDraft window, the gate needs positive evidence of that race. It lets a
+request through only when all of these hold:
+
+- a live GTK button press on that same palette backs it, with an X server time, less than one
+  second old;
+- the X window holding the keyboard when the request runs is a ChemDraft window (a toplevel or a
+  child of one), or nobody's: `None`, `PointerRoot`, the root window, or a window no client
+  manages, which is the window manager's own no-focus window. ChemDraft reads this with
+  `XGetInputFocus`, walking up the window tree for a ChemDraft window or a window carrying
+  `WM_STATE` (a managed client), and down through a window manager frame to its client. A
+  `_NET_ACTIVE_WINDOW` on the root window that names another client counts as that client
+  holding the keyboard;
+- a ChemDraft window lost toplevel focus at most 300 ms before the press, or after it. The
+  handoff happens within the dispatch of the press itself, so the loss should land within
+  milliseconds of it (`app-focus-lost=` in the log shows the real figure); a person who switches
+  away first needs about 400 ms just to move a hand from the keyboard to the mouse (the
+  Keystroke-Level Model's homing time).
+
+When another client holds the keyboard, the gate refuses with `denied:other-app-focused`, however
+recently ChemDraft lost focus: Alt+Tab to a terminal and an immediate click on a palette field
+leaves the keys with the terminal. A failed X query refuses with `denied:focus-holder-unknown`.
+Otherwise a press with no recent ChemDraft focus loss is refused with
+`denied:app-not-focused-at-press`, and a request with no live press with
+`denied:app-not-focused` (a JavaScript-only or delayed request, a press older than one second,
+one with no X server time, or one on another window). Hidden and minimized palettes are always
+refused. The X server ignores `XSetInputFocus` with a click time older than the last focus
+change, so a click followed by a switch to another application cannot pull focus back.
+
+One limit remains, under XWayland only. A native Wayland application (one not running through
+XWayland) in front is invisible to X: the compositor's X window manager leaves X focus on its
+no-focus window, on `None`, or on the ChemDraft window that last had it, and `_NET_ACTIVE_WINDOW`
+names no X window. The handoff itself can produce the same readings, so ChemDraft cannot tell the
+two apart, and only the 300 ms bound applies. A palette click within 300 ms of switching from
+ChemDraft to a native Wayland application can still take the keyboard. Under native Wayland
+(`CHEMDRAFT_NATIVE_WAYLAND=1`), ChemDraft makes no X focus call and the compositor alone decides
+whether the palette gets focus. Without any window manager, no window carries `WM_STATE`, so
+another client's window reads as a window manager window and, again, only the 300 ms bound
+applies.
 
 ## Updates
 

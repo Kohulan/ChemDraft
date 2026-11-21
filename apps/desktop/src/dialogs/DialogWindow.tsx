@@ -21,6 +21,7 @@ const TourForm = lazy(() => import("../tour/TourForm").then(module => ({ default
 const VibeCodeGuideForm = lazy(() => import("./VibeCodeGuideForm").then(module => ({ default: module.VibeCodeGuideForm })));
 const ExportForm = lazy(() => import("./ExportForm").then(module => ({ default: module.ExportForm })));
 const CustomColorForm = lazy(() => import("./CustomColorForm").then(module => ({ default: module.CustomColorForm })));
+const PageEnlargementForm = lazy(() => import("./PageEnlargementForm").then(module => ({ default: module.PageEnlargementForm })));
 const StructureTemplatePicker = lazy(() => import("./StructureTemplatePicker").then(module => ({ default: module.StructureTemplatePicker })));
 
 export function DialogWindow({ hostId }: { hostId: string }) {
@@ -204,6 +205,15 @@ function DialogWindowContent({ hostId }: { hostId: string }) {
   }, [hostId, snapshot, percent]);
   const sendAction = (data: Extract<DialogMessage, { type: "action" }>["data"]) => {
     if (!snapshot) return;
+    if (snapshot.dialogKind === "pageEnlargement") {
+      if (actionPending.current) return;
+      actionPending.current = true;
+      setBusy(true);
+      setError(undefined);
+      void sendDialogMessage(hostId, { ...dialogEnvelope(snapshot), requestId: crypto.randomUUID(), type: "action", data })
+        .catch(e => { actionPending.current = false; setBusy(false); setError(String(e)); });
+      return;
+    }
     clearPreview();
     if (data.action === "cancel" && snapshot.dialogKind === "guidedTour") {
       if (cancellationRequested.current) return;
@@ -251,6 +261,10 @@ function DialogWindowContent({ hostId }: { hostId: string }) {
     });
   };
   if (!snapshot) return <p role="status">{error ?? "Opening dialog…"}</p>;
+  if (snapshot.dialogKind === "pageEnlargement") return <Suspense fallback={<p role="status">Opening dialog…</p>}>
+    <PageEnlargementForm onReady={reportReady} busy={busy} error={error}
+      onKeep={() => sendAction({ action: "cancel" })} onEnlarge={() => sendAction({ action: "enlarge" })} />
+  </Suspense>;
   if (snapshot.dialogKind === "atomProblem") return <AtomProblemForm data={snapshot.data} busy={busy} error={error} onReady={reportReady}
     onAction={action => sendAction({ action, targetVersion: snapshot.data.targetVersion })} onClose={() => sendAction({ action: "cancel" })} />;
   if (snapshot.dialogKind === "about") return <Suspense fallback={<p role="status">Opening About ChemDraft…</p>}>

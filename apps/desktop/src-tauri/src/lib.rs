@@ -1523,11 +1523,9 @@ pub fn run() {
             if webview.label() == MAIN_WINDOW_LABEL
                 && matches!(payload.event(), PageLoadEvent::Finished)
             {
-                // WKWebView applies index.html's initial `<title>ChemDraft</title>` after setup,
-                // overwriting the label set by ensure_main_window_visible. Reassert the baked
-                // worktree title at the page-load boundary so the actual macOS title bar, not only
-                // the web document/build stamp, identifies this checkout.
-                let _ = webview.window().set_title(&main_window_title());
+                // WKWebView can apply index.html's title after setup. Restore the worktree label
+                // if the React document has yet to publish its title.
+                let _ = set_startup_title(&webview.window());
             }
         })
         .on_menu_event(|app, event| {
@@ -1775,6 +1773,9 @@ pub fn run() {
             }
         })
         .setup(move |app| {
+            app.add_capability(
+                r#"{"identifier":"document-window-title","webviews":["main"],"permissions":["core:window:allow-set-title"]}"#,
+            )?;
             #[cfg(target_os = "macos")]
             {
                 if let Err(error) = macos_quit::install(app.handle(), setup_secondary) {
@@ -2219,10 +2220,9 @@ fn ensure_main_window_visible<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<(
     let already_on_screen = window.is_visible().unwrap_or(false);
     main_window_placement::reveal_after_preparation(
         |errors| {
-            // Tauri auto-creates the config "main" window at startup (title "ChemDraft" from tauri.conf.json),
-            // so create_main_window's set_title never runs on that path — apply the worktree-labeled title
-            // here on the window we actually resolved, so every worktree's window is distinguishable.
-            errors.record("set title", window.set_title(&main_window_title()));
+            // The auto-created window starts with the config title. On subsequent reveals the
+            // active document's title is already set.
+            errors.record("set title", set_startup_title(&window.as_ref().window()));
             errors.record("set decorations", window.set_decorations(true));
             errors.record("configure webview", configure_document_webview(&window));
             errors.record("set focusable", window.set_focusable(true));
@@ -2611,6 +2611,17 @@ fn main_window_title() -> String {
     window_title_for(option_env!("CHEMDRAFT_WORKTREE_LABEL"))
 }
 
+fn set_startup_title<R: Runtime>(window: &tauri::Window<R>) -> tauri::Result<()> {
+    if needs_initial_main_window_title(&window.title()?) {
+        window.set_title(&main_window_title())?;
+    }
+    Ok(())
+}
+
+fn needs_initial_main_window_title(current_title: &str) -> bool {
+    matches!(current_title, "" | "ChemDraft")
+}
+
 fn window_title_for(label: Option<&str>) -> String {
     match label {
         Some(label) if !label.trim().is_empty() => format!("ChemDraft — {}", label.trim()),
@@ -2620,7 +2631,7 @@ fn window_title_for(label: Option<&str>) -> String {
 
 #[cfg(test)]
 mod window_title_tests {
-    use super::window_title_for;
+    use super::{needs_initial_main_window_title, window_title_for};
 
     #[test]
     fn unlabeled_builds_get_the_plain_title() {
@@ -2636,6 +2647,18 @@ mod window_title_tests {
             "ChemDraft — chemdraw [x]"
         );
         assert_eq!(window_title_for(Some(" a [b] ")), "ChemDraft — a [b]");
+    }
+
+    #[test]
+    fn revealing_the_window_preserves_the_document_title() {
+        assert!(needs_initial_main_window_title(""));
+        assert!(needs_initial_main_window_title("ChemDraft"));
+        assert!(!needs_initial_main_window_title(
+            "Probe A.chemdraft — ChemDraft"
+        ));
+        assert!(!needs_initial_main_window_title(
+            "Probe A.chemdraft • — ChemDraft — worktree [branch]"
+        ));
     }
 }
 
@@ -8478,6 +8501,19 @@ fn palette_focus_diagnostic(window: tauri::WebviewWindow, line: String) -> Resul
 // Diagnostics share the existing bridge gate; no separate flag.
 fn palette_focus_log(message: std::fmt::Arguments<'_>) {
     if agent_bridge_status().enabled {
+        eprintln!("[palette-focus] {message}");
+    }
+}
+
+// Opt-in switch for the one `linux-acquire` line per field click. CI's Linux smoke and tester
+// reports need that line without the agent bridge, which would change what the smoke tests.
+#[cfg(target_os = "linux")]
+const PALETTE_FOCUS_LOG_ENV_VAR: &str = "CHEMDRAFT_PALETTE_FOCUS_LOG";
+
+#[cfg(target_os = "linux")]
+fn palette_focus_acquire_log(message: std::fmt::Arguments<'_>) {
+    let env_enabled = std::env::var(PALETTE_FOCUS_LOG_ENV_VAR).is_ok_and(|value| value == "1");
+    if agent_bridge_status().enabled || env_enabled {
         eprintln!("[palette-focus] {message}");
     }
 }
