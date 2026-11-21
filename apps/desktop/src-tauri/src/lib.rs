@@ -12613,8 +12613,8 @@ mod tests {
         );
         #[cfg(target_os = "linux")]
         assert!(open_document_payload_from_path(&invalid)
-            .unwrap_err()
-            .contains("not valid UTF-8"));
+            .err()
+            .is_some_and(|error| error.contains("not valid UTF-8")));
     }
 
     fn opened_document_test_payload() -> NativeOpenDocumentPayload {
