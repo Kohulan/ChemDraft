@@ -352,6 +352,27 @@ class Session:
                 continue
         raise SmokeFailure(f"no visible {title!r} window")
 
+    def document_window(self):
+        """The visible X11 document window of the launch: class chemdraft, not transient.
+
+        The document title follows the active tab, so it is found by WM_CLASS and by not being
+        a transient palette or dialog, never by its title.
+        """
+        self.alive()
+        result = run("xdotool", "search", "--onlyvisible", "--class", "chemdraft", check=False)
+        for window in result.stdout.decode().split():
+            owner = run("xdotool", "getwindowpid", window, check=False)
+            try:
+                if os.getsid(int(owner.stdout.decode().strip())) != self.app.pid:
+                    continue
+            except (ValueError, ProcessLookupError):
+                continue
+            transient = run("xprop", "-id", window, "WM_TRANSIENT_FOR", check=False)
+            if "window id" in transient.stdout.decode(errors="replace"):
+                continue
+            return window
+        raise SmokeFailure("no visible ChemDraft document window")
+
 
 SENTINEL = b"chemdraft-smoke-sentinel"
 
@@ -451,9 +472,47 @@ def named_child(node, name):
     raise SmokeFailure(f"missing {name!r} in the accessibility tree")
 
 
+def find_menu_bar(Atspi, node):
+    stack = [node]
+    while stack:
+        node = stack.pop()
+        if node.get_role() == Atspi.Role.MENU_BAR:
+            return node
+        stack.extend(children(node))
+    return None
+
+
+def document_frame(Atspi, pid, window=None):
+    """The document's top-level frame: the only one with a native menu bar, never found by title.
+
+    The title follows the active tab. Palettes and dialogs carry no menu bar. When several frames
+    have one, the X window the harness found (class chemdraft, not transient) picks by its title.
+    """
+    frames = [frame for frame in children(application(Atspi, pid))
+              if frame.get_role() == Atspi.Role.FRAME and find_menu_bar(Atspi, frame) is not None]
+    if not frames:
+        raise SmokeFailure("the document has no accessible native menu bar")
+    if window is not None:
+        x_title = run("xdotool", "getwindowname", window, check=False).stdout.decode(
+            errors="replace").strip()
+        matching = [frame for frame in frames if frame.get_name() == x_title]
+        if len(matching) == 1:
+            return matching[0]
+    if len(frames) != 1:
+        names = [frame.get_name() for frame in frames]
+        raise SmokeFailure(f"{len(frames)} frames have menu bars {names!r}; none unique")
+    return frames[0]
+
+
+def non_document_windows(Atspi, pid, window):
+    """The titles of the focused ChemDraft windows other than the document."""
+    document = document_frame(Atspi, pid, window).get_name()
+    return [name for name in active_windows(Atspi, pid) if name != document]
+
+
 def menu_item(Atspi, pid, *path):
     """The document window's native menu item at this path, such as Edit > Copy As > SMILES."""
-    stack = [named_child(application(Atspi, pid), "ChemDraft")]
+    stack = [document_frame(Atspi, pid)]
     while stack:
         node = stack.pop()
         if node.get_role() == Atspi.Role.MENU_BAR:
@@ -514,7 +573,7 @@ def require_document_focus(session, Atspi, document):
 
     def document_or_none():
         session.alive()
-        others = [name for name in active_windows(Atspi, session.main_pid) if name != "ChemDraft"]
+        others = non_document_windows(Atspi, session.main_pid, document)
         if others:
             raise SmokeFailure(f"{others} has focus, so Edit menu commands would go there")
 
@@ -563,7 +622,7 @@ def click_document(session, Atspi, document):
     def document_focused():
         session.alive()
         active = active_windows(Atspi, session.main_pid)
-        if active != ["ChemDraft"]:
+        if len(active) != 1 or non_document_windows(Atspi, session.main_pid, document):
             raise SmokeFailure(f"focused ChemDraft windows {active}")
 
     try:
@@ -908,7 +967,7 @@ def main(bundle, package, logs, compositor):
     with Session(bundle, package, logs, compositor) as session:
         session.start_display()
         session.launch()
-        document = wait_for(lambda: session.window("ChemDraft"),
+        document = wait_for(lambda: session.document_window(),
                             "No ChemDraft document window appeared", seconds=60, interval=1)
         wait_for(lambda: session.window("ChemDraft Main Toolbar"),
                  "The Main Toolbar window did not appear", seconds=30, interval=1)
