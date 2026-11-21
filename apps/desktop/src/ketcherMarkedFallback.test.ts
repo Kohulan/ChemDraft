@@ -203,7 +203,9 @@ describe("1.2.2 fallback: a marked molecule's editor save", () => {
     const body = source.slice(start, source.indexOf("}, [commitDocumentChangeWithPageFit]);", start));
     expect(body).toMatch(/if \(applied\.refusal\) \{\s*setStatus\(applied\.refusal\);\s*return false;\s*\}/);
     expect(body.indexOf("applied.refusal")).toBeLessThan(body.indexOf("commitDocumentChangeWithPageFit(applied.document"));
-    expect(body).not.toContain("unchanged");
+    expect(body).not.toContain(".unchanged");
+    expect(body).not.toContain("unchanged:");
+    expect(body).not.toContain("No changes from the structure editor");
     expect(source).not.toContain("No changes from the structure editor");
   });
 });
