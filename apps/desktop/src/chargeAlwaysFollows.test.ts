@@ -534,4 +534,31 @@ describe("charge always follows: a mark keeps its exact offset unless its atoms 
     expect(kept.y).toBeCloseTo(original.x, 6);
     expect(moleculeId).toBe(dropMolecule(document).id);
   });
+
+  it("a whole-object resize pivoted on the mark's own center keeps the resize's placement of the mark", () => {
+    // Review P2 (1.2.3): the object transform scales the mark about the pivot, so a mark centered on
+    // the pivot keeps its center while its size and its atom change. Only its size moved, and the
+    // follow rule must not re-place it at its unscaled offset (A' + (P - A)): a whole-object resize
+    // scales the mark with the object, size and offset alike.
+    const { document, moleculeId, markedAtomId } = threeAtomChainElectronMarkFixture("CCN", 2);
+    const selected = workflow.selectDocumentObjects(document, document.pages[0].id, [moleculeId]);
+    const pivot = markCenter(selected), mark = dropMark(selected);
+    const atom = atomPoint(selected, markedAtomId);
+    expect(Math.hypot(pivot.x - atom.x, pivot.y - atom.y), "the mark sits off its atom").toBeGreaterThan(1);
+    const scale = 2;
+    const resized = workflow.scaleDocumentObjectsAroundPoint(selected, [moleculeId], pivot, scale, scale);
+    expect(dropMark(resized).width).toBeCloseTo(scale * mark.width, 9);
+    expectAtomMoved(selected, resized, markedAtomId, 1);
+    const edit = resolveElectronMarksInSelectionTransform(selected, resized);
+    for (const placed of [edit.document, commit(selected, edit.document, selectionTransformChemistry("resize", edit.independentlyMovedMarkIds))]) {
+      const center = markCenter(placed), nextAtom = atomPoint(placed, markedAtomId);
+      expect(Math.abs(center.x - pivot.x), `mark x ${center.x} vs pivot ${pivot.x}`).toBeLessThan(1e-6);
+      expect(Math.abs(center.y - pivot.y), `mark y ${center.y} vs pivot ${pivot.y}`).toBeLessThan(1e-6);
+      expect(center.x - nextAtom.x).toBeCloseTo(scale * (pivot.x - atom.x), 6);
+      expect(center.y - nextAtom.y).toBeCloseTo(scale * (pivot.y - atom.y), 6);
+      expect(dropMark(placed).width).toBeCloseTo(scale * mark.width, 9);
+      expect(owner(placed, mark.id)).toEqual({ objectId: moleculeId, atomId: markedAtomId });
+      expect(dropMolecule(placed).atoms.map(chemistry)).toEqual(dropMolecule(selected).atoms.map(chemistry));
+    }
+  });
 });

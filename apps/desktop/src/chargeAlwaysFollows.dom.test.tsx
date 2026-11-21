@@ -8,8 +8,9 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { applyPatch, type ChemDraftDocument, type ElectronMarkObject,
   type MoleculeAtom, type MoleculeObject } from "@chemdraft/chem-core";
-import { transformPointForObject } from "@chemdraft/layout-engine";
-import { createNativeTextObject, phase4Timestamp } from "@chemdraft/document-workflow-core";
+import { nativeMoleculeRings, transformPointForObject } from "@chemdraft/layout-engine";
+import { createNativeTextObject, createSmilesMolecule, phase4Timestamp } from "@chemdraft/document-workflow-core";
+import { depictSmiles2D, ensureOclResources } from "@chemdraft/ocl-adapter";
 import { MainWindow } from "./MainWindow";
 import * as workflow from "./documentWorkflow";
 import { DOM_COMMAND_EVENT } from "./window-manager";
@@ -405,6 +406,54 @@ describe.each(["macos", "windows"] as const)("charge always follows its atom (%s
       expectNoChargeReport();
       await expectSingleUndo(before, after, "Move");
     });
+
+    /** Naphthalene with a tool-placed ⊖ on an atom of one ring only (the first ring's own atom). */
+    async function chargedNaphthalene() {
+      await ensureOclResources();
+      const smiles = "c1ccc2ccccc2c1";
+      let document = workflow.createPhase4Document("Charged naphthalene");
+      const naphthalene = createSmilesMolecule(document, { x: 300, y: 300 }, depictSmiles2D(smiles), smiles);
+      document = applyPatch(document, { op: "addObject", pageId: document.pages[0].id, object: naphthalene }, { now: phase4Timestamp });
+      const rings = nativeMoleculeRings(molecule(document, naphthalene.id));
+      expect(rings).toHaveLength(2);
+      const atomId = rings[0].atomIds.find(id => !rings[1].atomIds.includes(id))!;
+      document = workflow.normalizeCommittedDocument(workflow.applyChargeToolAtNativeAtom(document,
+        { kind: "charge", charge: -1 }, { kind: "atom", objectId: naphthalene.id, atomId, distanceToPointer: 0 }));
+      const charged: Charged = { document, moleculeId: naphthalene.id, atomId, markId: dropMark(document).id };
+      expectChargedFixture(charged);
+      return { charged, rings: nativeMoleculeRings(molecule(document, naphthalene.id)) };
+    }
+    async function clickRing(objectId: string, ring: { ringKey: string; center: Point }, shiftKey: boolean) {
+      const targets = [...container.querySelectorAll<SVGElement>(`[data-object-id="${objectId}"] .native-molecule-ring-hit-target`)];
+      const target = targets.find(candidate => candidate.getAttribute("data-ring-hit-key") === ring.ringKey) ?? targets[0];
+      expect(target, "a ring hit target").toBeDefined();
+      await act(async () => pointer(target, "pointerdown", ring.center, shiftKey));
+      await act(async () => pointer(target, "pointerup", ring.center, shiftKey));
+    }
+
+    // Review P2 (1.2.3): a ring or ring-set selection was rebuilt on every document change, which
+    // ended the nudge burst after each press (one Undo per press).
+    it.each([["ring", 1], ["rings", 2]] as const)("nudging a %s selection 8 times makes one Undo entry and keeps the mark with its atom",
+      async (kind, ringCount) => {
+        const { charged, rings } = await chargedNaphthalene();
+        await mount(workflow.selectDocumentObjects(charged.document, charged.document.pages[0].id, []));
+        await command("view.toggleRingInspector");
+        for (let index = 0; index < ringCount; index++) await clickRing(charged.moleculeId, rings[index], index > 0);
+        expect(status()).toBe(kind === "ring" ? "Selected ring" : "Selected 2 rings");
+        expect(container.querySelector(`[data-object-controls="${charged.moleculeId}"]`)!
+          .querySelectorAll(".native-molecule-selected-ring")).toHaveLength(ringCount);
+        vi.spyOn(Date, "now").mockReturnValue(Date.now());
+        const before = snapshot();
+        for (let press = 0; press < 8; press++) {
+          await act(async () => page().dispatchEvent(new KeyboardEvent("keydown", {
+            key: "ArrowDown", repeat: press > 0, bubbles: true, cancelable: true
+          })));
+        }
+        const after = snapshot();
+        expectMovedByAtomDisplacement(before, after, charged, { x: 0, y: 8 });
+        expectNoChargeReport();
+        await expectSingleUndo(before, after, "Move");
+      });
   });
 
   describe("whole-molecule and multi-object drags", () => {

@@ -1853,7 +1853,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.21.15.00-opus";
+const CURRENT_BUILD_STAMP = "11.21.17.40-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -28228,6 +28228,11 @@ function nativeRingSelectionFromItems(
   return { objectId, kind: "rings", rings: unique };
 }
 
+/** Whether two id lists hold the same ids in the same order. */
+function sameIds(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((id, index) => id === b[index]);
+}
+
 /**
  * Validate one molecule's selected part against the current document (atoms/bonds/rings may have
  * been deleted, or the Rings toolbar closed) and return the still-valid part, or undefined to drop it.
@@ -28259,7 +28264,10 @@ export function pruneNativeMoleculePart(
 
   if (part.kind === "ring") {
     const ring = nativeMoleculeRings(object).find((candidate) => candidate.ringKey === part.ringKey);
-    return ring ? { ...part, atomIds: ring.atomIds, bondIds: ring.bondIds } : undefined;
+    if (!ring) return undefined;
+    // Same ring, same atoms and bonds: keep the identity (see the parts case below).
+    if (sameIds(ring.atomIds, part.atomIds) && sameIds(ring.bondIds, part.bondIds)) return part;
+    return { ...part, atomIds: ring.atomIds, bondIds: ring.bondIds };
   }
 
   if (part.kind === "rings") {
@@ -28268,7 +28276,12 @@ export function pruneNativeMoleculePart(
       const ring = objectRings.find((candidate) => candidate.ringKey === selectedRing.ringKey);
       return ring ? [{ ringKey: ring.ringKey, atomIds: ring.atomIds, bondIds: ring.bondIds }] : [];
     });
-    return nativeRingSelectionFromItems(part.objectId, rings);
+    const next = nativeRingSelectionFromItems(part.objectId, rings);
+    // The same rings with the same atoms and bonds: keep the identity (see the parts case below).
+    if (next?.kind === "rings" && next.rings.length === part.rings.length && next.rings.every((ring, index) =>
+      ring.ringKey === part.rings[index].ringKey && sameIds(ring.atomIds, part.rings[index].atomIds) &&
+      sameIds(ring.bondIds, part.rings[index].bondIds))) return part;
+    return next;
   }
 
   const atomIds = part.atomIds.filter((atomId) => object.atoms.some((atom) => atom.id === atomId));

@@ -14195,7 +14195,7 @@ export interface ElectronMarkFollowResult {
  * Given a document before and after any atom move (translate, rotate, flip, scale, part drag,
  * relayout), every mark associated in `before` with an atom that moved is placed by its atom's
  * transform: its offset from the atom is mapped by the molecule's fitted offset map (translated
- * with the atom, turned or mirrored for a turn or flip). A mark the operation already moved itself
+ * with the atom, turned or mirrored for a turn or flip). A mark the operation already moved or resized itself
  * (a whole-object transform carries its marks) keeps the operation's placement. A legacy bond,
  * object or loose mark that followed is re-anchored explicitly to its atom, as Duplicate does.
  *
@@ -14257,6 +14257,9 @@ export function followElectronMarksWithMovedAtoms(
       if (next?.type !== "electron-mark") continue;
       const center = nativeChargeMarkCenter(mark), nextCenter = nativeChargeMarkCenter(next);
       const markMoved = next !== mark && Math.hypot(nextCenter.x - center.x, nextCenter.y - center.y) > MARK_FOLLOW_EPSILON_PX;
+      // A mark the operation resized was transformed by it, even when its center stayed put (a
+      // whole-object resize pivoted on the mark's own center): its placement is the operation's.
+      const markResized = next !== mark && (next.width !== mark.width || next.height !== mark.height);
       const owner = owners.get(mark.id);
       const ownerMolecule = owner && changedMoleculeIds.has(owner.objectId) ? page.objects.find((object) => object.id === owner.objectId) : undefined;
       const nextOwnerMolecule = ownerMolecule && nextObjects.get(owner!.objectId);
@@ -14297,7 +14300,7 @@ export function followElectronMarksWithMovedAtoms(
       const molecules = movedMolecules.get(owner.objectId)!;
       const map = molecules.fit ??= moleculeOffsetMap(molecules.before, molecules.after, options.motion);
       const changes: Partial<ElectronMarkObject> = {};
-      if (!markMoved) {
+      if (!markMoved && !markResized) {
         const ox = center.x - from.x, oy = center.y - from.y;
         const target = { x: to.x + map.a * ox + map.b * oy, y: to.y + map.c * ox + map.d * oy };
         if (Math.hypot(target.x - nextCenter.x, target.y - nextCenter.y) > MARK_FOLLOW_EPSILON_PX) {
