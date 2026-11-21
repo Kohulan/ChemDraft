@@ -64,7 +64,7 @@ describe.each(["macos", "windows"] as const)("charge drag Save (%s)", platform =
     Object.defineProperties(event, { pointerId: { value: 7 }, isPrimary: { value: true }, pointerType: { value: "mouse" } });
     await act(async () => target.dispatchEvent(event));
   }
-  it("saves the committed charge while an atom drag previews removal", async () => {
+  it("saves the committed drawing while an atom drag previews the moved atom and its charge", async () => {
     const { document: initialDocument, nitrogen } = ammoniumElectronMarkDropFixture();
     await act(async () => root.render(<MainWindow initialDocument={initialDocument} initialActiveToolCommandId="tool.select"
       initialPaletteMode="hidden" initialCrosshairsVisible={false} initialRulersVisible={false} nativePalette shortcutPlatform={platform} />));
@@ -77,7 +77,11 @@ describe.each(["macos", "windows"] as const)("charge drag Save (%s)", platform =
     await pointer(target, "pointerdown", nitrogen);
     const before = snapshot().document;
     await pointer(page, "pointermove", { x: nitrogen.x + 100, y: nitrogen.y + 100 });
-    expect(dropMolecule(snapshot().document).atoms[0].formalCharge).toBe(0);
+    // owner ruling 2026-11-21: charge always follows. The preview moves N and its mark together and
+    // keeps the charge (1.2.2 previewed the charge's removal, formalCharge 0); Save still writes the
+    // committed drawing, not the preview.
+    expect(dropMolecule(snapshot().document).atoms[0]).toMatchObject({ x: nitrogen.x + 100, y: nitrogen.y + 100, formalCharge: 1 });
+    expect(dropMark(snapshot().document).x).toBeCloseTo(dropMark(before).x + 100, 3);
     await key("s");
     expect(savedWrites()).toHaveLength(1);
     const saved = openChemDraftPayload(savedWrites()[0][1]).document!;

@@ -2595,38 +2595,39 @@ describe("ChemDraft desktop shell", () => {
     // Inactive-tab spacing keeps its original direct normalization; insertion tab commits
     // share preparation, and plugin/proposal preflight also normalizes before checking fit.
     // The conditions editor also commits to its original tab while it is inactive.
-    // A molecule-part drag (commitNativePartDrag) normalizes before naming its charge-aware Undo
-    // label (chargeAssociationUndoLabel), so the label describes the reconciled charge marks the
-    // committed document carries; commitDocumentHistoryFrom then normalizes it again, idempotently.
-    // The funnel now also runs the commit-time chemistry guard (commitChemistryGuard.ts) on every
-    // commit; a part drag moves atoms of a molecule, which is drawing, so it declares itself a
-    // chemistry edit (CHEMISTRY_EDIT) as the funnel's last argument.
+    // A molecule-part drag (commitNativePartDrag) normalizes its result; commitDocumentHistoryFrom
+    // then normalizes it again, idempotently. The funnel also runs the commit-time chemistry guard
+    // (commitChemistryGuard.ts) on every commit. owner ruling 2026-11-21: charge always follows, so
+    // a part drag carries its marks, is labelled plain "Move" and preserves chemistry (1.2.2 named a
+    // charge-aware label with chargeAssociationUndoLabel and declared CHEMISTRY_EDIT).
+    // prepareDocumentCommit, given the document an edit started from, first carries every mark of
+    // an atom the edit moved (carryElectronMarksWithMovedAtoms) before normalizing.
     expect(mainWindowSource.match(/normalizeCommittedDocument\(/g)).toHaveLength(15);
     expect(mainWindowSource).toContain(
-      "const committed = normalizeCommittedDocument(result.document);\n    commitDocumentHistoryFrom(drag.startDocument, committed, chargeAssociationUndoLabel(drag.startDocument, committed, \"Move\"), undefined, CHEMISTRY_EDIT);"
+      "const committed = normalizeCommittedDocument(result.document);\n    if (!commitDocumentHistoryFrom(drag.startDocument, committed, \"Move\", undefined, preserveChemistry(\"move\"))) return;"
     );
     const prepareDocumentCommitSource = mainWindowSource.slice(
       mainWindowSource.indexOf("const prepareDocumentCommit = useCallback("),
       mainWindowSource.indexOf("const pageFitPendingRef =")
     );
     expect(prepareDocumentCommitSource).toMatch(
-      /const normalized = normalizeCommittedDocument\(nextDocument\);\s*const present = assertFinalDocument\?\.\(normalized\) \?\? normalized;/
+      /const normalized = normalizeCommittedDocument\(before \? carryElectronMarksWithMovedAtoms\(before, nextDocument\) : nextDocument\);\s*const present = assertFinalDocument\?\.\(normalized\) \?\? normalized;/
     );
     expect(prepareDocumentCommitSource).toContain("return present;");
     const commitDocumentHistorySource = mainWindowSource.slice(
       mainWindowSource.indexOf("const commitDocumentHistoryFrom ="),
       mainWindowSource.indexOf("const commitInsertionHistoryWithPageFit =")
     );
-    expect(commitDocumentHistorySource).toContain("const verified = assertFinalDocument ? prepareDocumentCommit(nextDocument, undoLabel, assertFinalDocument) : undefined;");
-    expect(commitDocumentHistorySource).toContain("const present = verified ?? prepareDocumentCommit(nextDocument, undoLabel);");
+    expect(commitDocumentHistorySource).toContain("const verified = assertFinalDocument ? prepareDocumentCommit(nextDocument, undoLabel, assertFinalDocument, startDocument) : undefined;");
+    expect(commitDocumentHistorySource).toContain("const present = verified ?? prepareDocumentCommit(nextDocument, undoLabel, undefined, startDocument);");
     const commitDocumentChangeSource = mainWindowSource.slice(
       mainWindowSource.indexOf("const commitDocumentChange ="),
       mainWindowSource.indexOf("const commitDocumentChangeWithPageFit =")
     );
     // The Undo label may be a function (before, after) => string, so both guarded and unguarded
     // paths go through one local `prepare` helper that still calls prepareDocumentCommit.
-    expect(commitDocumentChangeSource).toContain("return prepareDocumentCommit(next, undoLabel, assertFinalDocument);");
-    expect(commitDocumentChangeSource).toContain("const present = prepareDocumentCommit(next, undefined, assertFinalDocument);");
+    expect(commitDocumentChangeSource).toContain("return prepareDocumentCommit(next, undoLabel, assertFinalDocument, before);");
+    expect(commitDocumentChangeSource).toContain("const present = prepareDocumentCommit(next, undefined, assertFinalDocument, before);");
     expect(commitDocumentChangeSource).toContain("const present = reusablePresent ?? prepare(currentHistory.present, nextDocument);");
     const finalGuardIndex = commitDocumentChangeSource.indexOf("guardedPresent = prepare(current, next);");
     expect(finalGuardIndex).toBeGreaterThan(-1);

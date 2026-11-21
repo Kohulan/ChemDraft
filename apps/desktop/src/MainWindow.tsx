@@ -610,6 +610,7 @@ import {
   prepareNativeMoleculeEngineRelayout,
   cleanUpStructureStatus,
   type NativeMoleculeRelayoutEngine,
+  carryElectronMarksWithMovedAtoms,
   cleanUpNativeMolecules2d,
   moleculeHasFusedRingSystem,
   attachSpin3dModelFromConformer,
@@ -3850,9 +3851,12 @@ export function MainWindow({
     queueMicrotask(() => setStatus(message));
   }, []);
   // Ordinary edits and assistant history pushes/amendments share commit preparation.
+  // Given the document the edit started from, every mark associated with an atom the edit moved
+  // follows it first (owner ruling 2026-11-21, charge always follows): Clean Up, relayout, Spin 3D
+  // flatten, bond-length scaling and any other edit that moves atoms commit with marks kept.
   const prepareDocumentCommit = useCallback((nextDocument: ChemDraftDocument, undoLabel?: string,
-    assertFinalDocument?: (document: ChemDraftDocument) => ChemDraftDocument | void) => {
-    const normalized = normalizeCommittedDocument(nextDocument);
+    assertFinalDocument?: (document: ChemDraftDocument) => ChemDraftDocument | void, before?: ChemDraftDocument) => {
+    const normalized = normalizeCommittedDocument(before ? carryElectronMarksWithMovedAtoms(before, nextDocument) : nextDocument);
     const present = assertFinalDocument?.(normalized) ?? normalized;
     const label = undoLabel ?? documentUndoLabelsRef.current.get(nextDocument);
     if (label) documentUndoLabelsRef.current.set(present, label);
@@ -3873,8 +3877,8 @@ export function MainWindow({
   ): boolean => {
     if (quitMutationFrozenRef.current) throw new Error("Quit is completing; the pending edit was not applied.");
     const prepare = (before: ChemDraftDocument, next: ChemDraftDocument) => {
-      if (typeof undoLabel !== "function") return prepareDocumentCommit(next, undoLabel, assertFinalDocument);
-      const present = prepareDocumentCommit(next, undefined, assertFinalDocument);
+      if (typeof undoLabel !== "function") return prepareDocumentCommit(next, undoLabel, assertFinalDocument, before);
+      const present = prepareDocumentCommit(next, undefined, assertFinalDocument, before);
       documentUndoLabelsRef.current.set(present, undoLabel(before, present));
       return present;
     };
@@ -3956,7 +3960,7 @@ export function MainWindow({
     const uncheckedNext = typeof update === "function" ? update(unchecked) : update;
     if (uncheckedNext !== unchecked) {
       let finalDocument: ChemDraftDocument | undefined;
-      try { finalDocument = prepareDocumentCommit(uncheckedNext, label, assertFinalDocument); } catch { finalDocument = undefined; }
+      try { finalDocument = prepareDocumentCommit(uncheckedNext, label, assertFinalDocument, unchecked); } catch { finalDocument = undefined; }
       const earlyRefusal = finalDocument && commitChemistryRefusal(unchecked, uncheckedNext, finalDocument, chemistry, label);
       if (earlyRefusal) {
         reportChemistryRefusal(earlyRefusal);
@@ -3970,7 +3974,7 @@ export function MainWindow({
       // Reuse the checked result while the checkpoint left the document as it was.
       const next = before === unchecked ? uncheckedNext : typeof update === "function" ? update(before) : update;
       if (next === before) return false;
-      const proposed = prepareDocumentCommit(next, label);
+      const proposed = prepareDocumentCommit(next, label, undefined, before);
       // Refuse before asking about the page size; the final commit checks again. A caller's own
       // final-document assertion (Clean Up) runs first there, keeping its more specific refusal.
       const refusal = assertFinalDocument ? undefined : commitChemistryRefusal(before, next, proposed, chemistry, label);
@@ -4179,8 +4183,8 @@ export function MainWindow({
     chemistry: CommitChemistryPolicy = PRESERVE_CHEMISTRY
   ): boolean => {
     if (quitMutationFrozenRef.current) throw new Error("Quit is completing; the pending edit was not applied.");
-    const verified = assertFinalDocument ? prepareDocumentCommit(nextDocument, undoLabel, assertFinalDocument) : undefined;
-    const present = verified ?? prepareDocumentCommit(nextDocument, undoLabel);
+    const verified = assertFinalDocument ? prepareDocumentCommit(nextDocument, undoLabel, assertFinalDocument, startDocument) : undefined;
+    const present = verified ?? prepareDocumentCommit(nextDocument, undoLabel, undefined, startDocument);
     // The gesture's final document must not change a molecule that existed before it. On refusal the
     // pre-gesture document is put back (a drag leaves its last preview frame as the present) and
     // nothing is recorded.
@@ -4211,7 +4215,7 @@ export function MainWindow({
   const commitInsertionHistoryWithPageFit = useCallback((start: ChemDraftDocument, proposed: ChemDraftDocument, undoLabel?: string,
     chemistry: CommitChemistryPolicy = PRESERVE_CHEMISTRY) => {
     const placed = proposed;
-    proposed = prepareDocumentCommit(proposed);
+    proposed = prepareDocumentCommit(proposed, undefined, undefined, start);
     // Refused before the page-size question; commitDocumentHistoryFrom puts `start` back.
     if (commitChemistryRefusal(start, placed, proposed, chemistry, undoLabel)) {
       commitDocumentHistoryFrom(start, placed, undoLabel, undefined, chemistry);
@@ -12178,9 +12182,9 @@ export function MainWindow({
       // Like assistant-history amendments, retain the first before-snapshot and replace only
       // the current snapshot. History identity also ends a burst after any intervening edit,
       // selection change, tab switch or Undo/Redo, even when it arrived outside keyboard routing.
-      // Nudging selected atoms within a molecule moves them as a part drag does: a chemistry edit.
-      // Nudging whole objects must leave every molecule's chemistry as it was.
-      const chemistry = fragments.length > 0 ? CHEMISTRY_EDIT : selectionTransformChemistry("move");
+      // Owner ruling 2026-11-21 (charge always follows): nudging atoms or whole objects carries
+      // their marks, so no nudge may change any molecule's chemistry.
+      const chemistry = selectionTransformChemistry("move");
       if (continuesBurst) {
         const before = documentHistoryRef.current.past.at(-1) ?? current;
         // A burst amends its one entry, so it is checked against the document before the burst.
@@ -18176,10 +18180,11 @@ export function MainWindow({
       return;
     }
 
-    // Dragging atoms and bonds of a molecule is drawing: a chemistry edit, which reports a charge it
-    // moves or removes itself.
+    // Owner ruling 2026-11-21 (charge always follows): every mark associated with a dragged atom
+    // moves with it, so a part drag never changes chemistry and the commit guard checks that it
+    // did not.
     const committed = normalizeCommittedDocument(result.document);
-    commitDocumentHistoryFrom(drag.startDocument, committed, chargeAssociationUndoLabel(drag.startDocument, committed, "Move"), undefined, CHEMISTRY_EDIT);
+    if (!commitDocumentHistoryFrom(drag.startDocument, committed, "Move", undefined, preserveChemistry("move"))) return;
     setStatus(result.status ?? "Moved selected molecule part");
   }, [commitDocumentHistoryFrom, nativePartDocumentFromDrag, replacePresentDocument]);
 

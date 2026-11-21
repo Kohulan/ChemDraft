@@ -429,6 +429,43 @@ describe.each(["macos", "windows"] as const)("charge always follows its atom (%s
       });
   });
 
+  describe("relayout and scaling", () => {
+    // owner ruling 2026-11-21: charge always follows. Clean Up and bond-length scaling move atoms;
+    // the marks of the moved atoms follow them, so these commit with the chemistry kept (1.2.2
+    // refused them when a mark was left out of range, or silently re-associated it).
+    function expectKeptThrough(before: ChemDraftDocument, after: ChemDraftDocument, charged: Charged, scale: number) {
+      expect(after.pages, "the command commits").not.toEqual(before.pages);
+      expect(status(), "no refusal").not.toMatch(/Cannot|refused/i);
+      expect(canUndo()).toBe("true");
+      expect(molecule(after, charged.moleculeId).atoms.map(chemistryOf)).toEqual(molecule(before, charged.moleculeId).atoms.map(chemistryOf));
+      expect(association(after, charged.markId)).toEqual({ objectId: charged.moleculeId, atomId: charged.atomId });
+      const offset = markOffset(before, charged), next = markOffset(after, charged);
+      expect(Math.hypot(next.x, next.y), "the mark keeps its distance from its atom").toBeCloseTo(scale * Math.hypot(offset.x, offset.y), 3);
+    }
+
+    it.each(variants)("Clean Up of a drawn chain with the $name keeps the mark with its atom and commits", async ({ build }) => {
+      const charged = build();
+      expectChargedFixture(charged);
+      await mount(workflow.selectDocumentObjects(charged.document, charged.document.pages[0].id, [charged.moleculeId]));
+      const before = snapshot();
+      await command("structure.cleanup2d");
+      const after = snapshot();
+      expectAtomMoved(before, after, charged, 0.5);
+      expectKeptThrough(before, after, charged, 1);
+    });
+
+    it.each(variants)("doubling the bond length of the $name keeps the mark one scaled offset from its atom", async ({ build }) => {
+      const charged = build();
+      expectChargedFixture(charged);
+      await mount(workflow.selectDocumentObjects(charged.document, charged.document.pages[0].id, [charged.moleculeId]));
+      const before = snapshot();
+      await command("molecule.structure.bondLength:44");
+      const after = snapshot();
+      expectAtomMoved(before, after, charged, 1);
+      expectKeptThrough(before, after, charged, 2);
+    });
+  });
+
   describe("duplicate", () => {
     // Only the molecule is selected. Duplicate keeps atom ids, so the copy's atom is read by the
     // original id. Today `duplicateSelectedDocumentObjects` (documentWorkflow.ts) copies only the

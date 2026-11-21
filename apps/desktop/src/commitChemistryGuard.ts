@@ -42,16 +42,15 @@ export interface MoleculeChemistryChange {
 /**
  * How the commit funnel treats one commit. `preserve` (the default) refuses the commit when a
  * molecule that existed before it would change; `operation` names it in the refusal ("Cannot
- * <operation> without changing…"). `transform` marks a selection transform whose mark associations
- * `resolveElectronMarksInSelectionTransform` (or a drop) has already decided and announced: the
- * atoms of the selected molecules it moved may change, nothing else may. `exempt` is declared by a
- * caller whose commit is meant to change chemistry, or that is verified elsewhere; `reason` says which.
+ * <operation> without changing…"). Moves and selection transforms preserve: owner ruling 2026-11-21
+ * (charge always follows) carries every mark with its atom, so a move never changes chemistry and
+ * this guard is the check that it did not. `exempt` is declared by a caller whose commit is meant to
+ * change chemistry, or that is verified elsewhere; `reason` says which.
  */
 export type CommitChemistryPolicy =
   | {
     readonly kind: "preserve";
     readonly operation?: string;
-    readonly transform?: boolean;
     /**
      * A SCOPED chemistry edit: the molecules whose atoms or bonds the operation itself added,
      * removed or changed (`structurallyEditedMoleculeKeys`, `before` against the operation's own
@@ -95,9 +94,14 @@ export function chemistryEditOf(moleculeIds: readonly string[], operation?: stri
   return { kind: "preserve", operation, editedMoleculeIds: moleculeIds };
 }
 
-/** A selection transform (align, rotate, nudge, a drag…): see `CommitChemistryPolicy`. */
+/**
+ * A move or selection transform (align, rotate, nudge, a drag…). Owner ruling 2026-11-21 (charge
+ * always follows): marks move with their atoms, so a move preserves every molecule's chemistry,
+ * moved or not. Only a selected mark the transform moved without its atom may change chemistry,
+ * under the mark-move policy (`movedSelectedMarkAtomKeys`).
+ */
 export function selectionTransformChemistry(operation?: string): CommitChemistryPolicy {
-  return { kind: "preserve", operation, transform: true };
+  return preserveChemistry(operation);
 }
 
 /** Object ids are unique only within a page, so an atom is keyed by its page as well. */
@@ -235,8 +239,6 @@ export interface CommitChemistryCheck {
   /** Resolves which atoms a mark's chemistry goes to; see `movedSelectedMarkAtomKeys`. */
   markAtoms: MarkAtomResolver;
   operation?: string;
-  /** A selection transform: the selected molecules it moved may change (`movedSelectedMoleculeAtomKeys`). */
-  transform?: boolean;
   /** A scoped structure edit: the molecules it structurally edited may change (`structurallyEditedMoleculeKeys`). */
   structureEdit?: boolean;
   /** Molecules (by id, on any page) the operation is meant to change. */
@@ -252,8 +254,6 @@ export interface CommitChemistryCheck {
  * - a charge or radical mark the user selected and the operation moved or explicitly re-anchored:
  *   its old and new atoms (align, distribute, arrange, nudge, rotate or resize of a selection that
  *   includes the mark, which decide and announce the mark's new atom);
- * - for a selection transform (`transform`), the atoms of the selected molecules it moved: moving
- *   a molecule away from its own stationary mark is announced by the transform as well.
  * - for a scoped chemistry edit (`structureEdit`, `editedMoleculeIds`), every change, removal
  *   included, to the molecules it structurally edited or names.
  * Molecules the operation did not select and move, edit or name are never exempt: the legacy loose
@@ -274,7 +274,6 @@ export function commitChemistryRefusals(check: CommitChemistryCheck): string[] {
     if (changes.length === 0) return [];
   }
   const exempt = movedSelectedMarkAtomKeys(check.before, check.next, [baseline, check.after], check.markAtoms);
-  if (check.transform) for (const key of movedSelectedMoleculeAtomKeys(check.before, check.next)) exempt.add(key);
   return changes
     .filter((change) => change.atomId === undefined || !change.after ||
       !exempt.has(atomChemistryKey(change.pageId, change.moleculeId, change.atomId)))
@@ -344,16 +343,15 @@ export function structurallyEditedMoleculeKeys(before: ChemDraftDocument, next: 
 
 /**
  * `commitChemistryRefusals` under a commit policy, as the commit funnel applies it: an exempt
- * policy is not checked; a preserving one passes its operation name (else `operation`), transform
- * flag and scope. Empty when the commit may proceed.
+ * policy is not checked; a preserving one passes its operation name (else `operation`) and scope. Empty when the commit may proceed.
  */
 export function policyChemistryRefusals(
   policy: CommitChemistryPolicy,
-  check: Omit<CommitChemistryCheck, "operation" | "transform" | "structureEdit" | "editedMoleculeIds">,
+  check: Omit<CommitChemistryCheck, "operation" | "structureEdit" | "editedMoleculeIds">,
   operation?: string
 ): string[] {
   if (policy.kind !== "preserve") return [];
-  return commitChemistryRefusals({ ...check, operation: policy.operation ?? operation, transform: policy.transform,
+  return commitChemistryRefusals({ ...check, operation: policy.operation ?? operation,
     structureEdit: policy.structureEdit, editedMoleculeIds: policy.editedMoleculeIds });
 }
 
@@ -374,29 +372,6 @@ function selectedTargets(document: ChemDraftDocument): { pageId: string | undefi
     }
   }
   return { pageId, ids };
-}
-
-/**
- * The atoms of every selected molecule (group members included) whose placement or atom positions
- * differ between `before` and `next`: the molecules a selection transform itself moved.
- */
-export function movedSelectedMoleculeAtomKeys(before: ChemDraftDocument, next: ChemDraftDocument): Set<string> {
-  const keys = new Set<string>();
-  const { pageId, ids } = selectedTargets(before);
-  const page = before.pages.find((candidate) => candidate.id === pageId);
-  if (!page || ids.size === 0) return keys;
-  const nextMolecules = moleculesById(next.pages.find((candidate) => candidate.id === pageId));
-  for (const molecule of page.objects) {
-    if (molecule.type !== "molecule" || !ids.has(molecule.id)) continue;
-    const moved = nextMolecules.get(molecule.id);
-    if (!moved || moved === molecule) continue;
-    const atomsAfter = new Map(moved.atoms.map((atom) => [atom.id, atom]));
-    const placementChanged = moved.x !== molecule.x || moved.y !== molecule.y || moved.width !== molecule.width ||
-      moved.height !== molecule.height || moved.rotation !== molecule.rotation ||
-      molecule.atoms.some((atom) => { const after = atomsAfter.get(atom.id); return !after || after.x !== atom.x || after.y !== atom.y; });
-    if (placementChanged) for (const atom of molecule.atoms) keys.add(atomChemistryKey(page.id, molecule.id, atom.id));
-  }
-  return keys;
 }
 
 /**

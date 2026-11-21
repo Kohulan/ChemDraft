@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { createRoot, type Root } from "react-dom/client";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { applyPatch, applyPatches, type ChemDraftDocument, type ElectronMarkObject } from "@chemdraft/chem-core";
+import { applyPatch, applyPatches, type ChemDraftDocument, type ElectronMarkObject, type MoleculeAtom } from "@chemdraft/chem-core";
 import { exportDocumentToSvg } from "@chemdraft/export-engine";
 import { atomDisplayLabel, lonePairPlacementPlanForAtom, moleculeLayoutLabelBoxes, transformPointForObject } from "@chemdraft/layout-engine";
 import { createNativeTextObject, documentDrawingDefaults, nativeAtomBondOrderUsage, nativeImplicitHydrogenCount,
@@ -644,31 +644,52 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
     return { before, preview };
   }
 
-  it("labels Undo when nitrogen moves away from its stationary charge", async () => {
+  /** Owner ruling 2026-11-21: charge always follows. The mark kept its offset from the drawn atom. */
+  function expectMarkFollowed(before: ChemDraftDocument, after: ChemDraftDocument, markId: string, atomId: string) {
+    const offset = (document: ChemDraftDocument) => {
+      const molecule = dropMolecule(document), mark = workflow.findDocumentObject(document, markId) as ElectronMarkObject;
+      const atom = transformPointForObject(molecule, molecule.atoms.find(candidate => candidate.id === atomId)!);
+      const center = workflow.nativeChargeMarkCenter(mark);
+      return { x: center.x - atom.x, y: center.y - atom.y };
+    };
+    expect(offset(after).x).toBeCloseTo(offset(before).x, 3);
+    expect(offset(after).y).toBeCloseTo(offset(before).y, 3);
+  }
+
+  it("carries the charge when nitrogen of NH4+ is dragged, and labels Undo Move", async () => {
+    // owner ruling 2026-11-21: charge always follows. 1.2.2 left the mark behind and removed the
+    // charge ("Charge removed from N (N now NH3)", Undo "Move and Remove Charge").
     const { document, nitrogen } = ammoniumElectronMarkDropFixture();
     const molecule = dropMolecule(document);
     await mount(document);
     const end = { x: nitrogen.x + 100, y: nitrogen.y + 100 };
-    const { before } = await dragAtom(molecule.id, nitrogen, end);
+    const { before, preview } = await dragAtom(molecule.id, nitrogen, end);
     const after = snapshot();
-    expect(dropMolecule(after).atoms[0]).toMatchObject({ ...end, formalCharge: 0 });
-    expect(dropMark(after)).toMatchObject({ x: dropMark(before).x, y: dropMark(before).y, anchor: { kind: "point" } });
-    expect(labels()[0]).toBe("NH3");
-    expect.soft(status()).toBe("Charge removed from N (N now NH3)");
-    await exactUndoRedo(before, after, "Move and Remove Charge");
+    expect(dropMolecule(after).atoms[0]).toMatchObject({ ...end, formalCharge: 1, markCharge: 1 });
+    expect(dropMolecule(preview).atoms[0]).toMatchObject({ formalCharge: 1 });
+    expect(dropMark(after).anchor).toMatchObject({ kind: "atom", atomId: nitrogen.id });
+    expectMarkFollowed(before, after, dropMark(before).id, nitrogen.id);
+    expect(labels()[0]).toBe("NH4");
+    expect(status()).toBe("Moved selected molecule part");
+    await exactUndoRedo(before, after, "Move");
   });
 
-  it("refuses an atom drag that would leave a neutral four-bond nitrogen", async () => {
+  it("carries the charge when a four-bond nitrogen is dragged, without a refusal", async () => {
+    // owner ruling 2026-11-21: charge always follows. 1.2.2 refused this drag ("Cannot move Charge
+    // from N: … bond/radical valence 4") because the mark stayed behind.
     const { document, nitrogen } = fourBondNitrogenElectronMarkDropFixture();
     await mount(document);
-    const { before, preview } = await dragAtom(dropMolecule(document).id, nitrogen, { x: nitrogen.x + 100, y: nitrogen.y + 100 });
-    expect(status()).toMatch(/^Cannot move Charge from N.*bond\/radical valence 4/);
-    expect(preview).toEqual(before);
-    expect(snapshot()).toEqual(before);
-    expect(container.querySelector("main")?.getAttribute("data-can-undo")).toBe("false");
+    const { before } = await dragAtom(dropMolecule(document).id, nitrogen, { x: nitrogen.x + 100, y: nitrogen.y + 100 });
+    const after = snapshot();
+    expect(status()).toBe("Moved selected molecule part");
+    expect(dropMolecule(after).atoms.find(atom => atom.id === nitrogen.id)).toMatchObject({ formalCharge: 1, markCharge: 1 });
+    expectMarkFollowed(before, after, dropMark(before).id, nitrogen.id);
+    await exactUndoRedo(before, after, "Move");
   });
 
-  it("names a charge transfer to oxygen when nitrogen moves away from a stationary mark", async () => {
+  it("keeps a charge on nitrogen when nitrogen moves past oxygen, instead of transferring it", async () => {
+    // owner ruling 2026-11-21: charge always follows. 1.2.2 left the mark beside the carbonyl O and
+    // transferred the charge ("Charge moved from N to O", Undo "Move and Transfer Charge").
     const { document, nitrogen } = electronMarkDropFixture();
     const molecule = dropMolecule(document);
     const mark = dropMark(document);
@@ -678,11 +699,11 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
     const { before } = await dragAtom(molecule.id, nitrogen, { x: nitrogen.x + 100, y: nitrogen.y + 100 });
     expect(dropMark(before).anchor.atomId).toBe(nitrogen.id);
     const after = snapshot();
-    expect(dropMark(after)).toMatchObject({
-      x: dropMark(before).x, y: dropMark(before).y, anchor: { kind: "atom", atomId: molecule.atoms[6].id }
-    });
-    expect(status()).toBe("Charge moved from N to O (O now OH, N now NH)");
-    await exactUndoRedo(before, after, "Move and Transfer Charge");
+    expect(dropMark(after).anchor).toMatchObject({ kind: "atom", atomId: nitrogen.id });
+    expectMarkFollowed(before, after, mark.id, nitrogen.id);
+    expect(dropMolecule(after).atoms.map(atom => atom.formalCharge)).toEqual(dropMolecule(before).atoms.map(atom => atom.formalCharge));
+    expect(status()).toBe("Moved selected molecule part");
+    await exactUndoRedo(before, after, "Move");
   });
 
   function rotatedMoleculeWithCharge(drawing: ChemDraftDocument, center: { x: number; y: number },
@@ -730,8 +751,11 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
       }
     });
 
-  it.each(legacyAnchorCases)("preserves the $anchorKind anchor and $name when dragging a part of its rotated molecule",
+  it.each(legacyAnchorCases)("keeps the $anchorKind-anchored $name with N when dragging a part of its rotated molecule",
     async ({ anchorKind, fixture, chemistry }) => {
+      // owner ruling 2026-11-21: charge always follows. Dragging C re-centres the rotated molecule's
+      // frame, so N is drawn elsewhere and its legacy mark follows it, re-anchored explicitly to N
+      // (1.2.2 kept the legacy anchor and left the mark where it was).
       const { drawing, anchor, molecule, mark, nitrogen, saturatedCarbon } = legacyNitrogenMark(anchorKind, fixture);
       const rotated = applyPatch(drawing, { op: "updateObject", objectId: molecule.id, changes: { rotation: 90 } });
       await mount(rotated);
@@ -740,30 +764,40 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
       const { before, preview } = await dragAtom(molecule.id, start, end);
       const after = snapshot();
       expect(dropMolecule(after).atoms.find(atom => atom.id === saturatedCarbon.id)).not.toEqual(saturatedCarbon);
+      expect(dropMark(before).anchor).toEqual(anchor);
       for (const document of [before, preview, after]) {
         expect(dropMark(document).id).toBe(mark.id);
-        expect(dropMark(document).anchor).toEqual(anchor);
         expect(dropMolecule(document).atoms.find(atom => atom.id === nitrogen.id)).toMatchObject(chemistry);
+      }
+      for (const document of [preview, after]) {
+        expect(dropMark(document)).toMatchObject({ anchor: { kind: "atom", objectId: molecule.id, atomId: nitrogen.id }, atomAssociation: "explicit" });
+        expectMarkFollowed(before, document, mark.id, nitrogen.id);
       }
       await exactUndoRedo(before, after, "Move");
     });
 
-  it.each(["bond", "object"] as const)("refuses to drag four-bond N away from its legacy %s-anchored charge",
+  it.each(["bond", "object"] as const)("carries the legacy %s-anchored charge with a dragged four-bond N, without a refusal",
     async anchorKind => {
-      const { drawing, anchor, molecule, nitrogen } = legacyNitrogenMark(anchorKind, fourBondNitrogenElectronMarkDropFixture);
+      // owner ruling 2026-11-21: charge always follows. 1.2.2 refused this drag ("Cannot move Charge
+      // from N: N cannot carry formal charge 0 with bond/radical valence 4").
+      const { drawing, anchor, molecule, mark, nitrogen } = legacyNitrogenMark(anchorKind, fourBondNitrogenElectronMarkDropFixture);
       const rotated = applyPatch(drawing, { op: "updateObject", objectId: molecule.id, changes: { rotation: 90 } });
       await mount(rotated);
       const start = transformPointForObject(dropMolecule(rotated), nitrogen);
-      const { before, preview } = await dragAtom(molecule.id, start, { x: start.x + 100, y: start.y + 100 });
+      const { before } = await dragAtom(molecule.id, start, { x: start.x + 100, y: start.y + 100 });
+      const after = snapshot();
       expect(dropMark(before).anchor).toEqual(anchor);
       expect(dropMolecule(before).atoms.find(atom => atom.id === nitrogen.id)).toMatchObject({ formalCharge: 1, markCharge: 1 });
-      expect(status()).toMatch(/^Cannot move Charge from N(?: to \w+)?: N cannot carry formal charge 0 with bond\/radical valence 4$/);
-      expect(preview).toEqual(before);
-      expect(snapshot()).toEqual(before);
-      expect(container.querySelector("main")?.getAttribute("data-can-undo")).toBe("false");
+      expect(status()).toBe("Moved selected molecule part");
+      expect(dropMolecule(after).atoms.find(atom => atom.id === nitrogen.id)).toMatchObject({ formalCharge: 1, markCharge: 1 });
+      expect(dropMark(after)).toMatchObject({ anchor: { kind: "atom", objectId: molecule.id, atomId: nitrogen.id }, atomAssociation: "explicit" });
+      expectMarkFollowed(before, after, mark.id, nitrogen.id);
+      await exactUndoRedo(before, after, "Move");
     });
 
-  it("names a valid charge removal without changing its legacy object anchor", async () => {
+  it("carries a legacy object-anchored charge with the dragged nitrogen of NH4+", async () => {
+    // owner ruling 2026-11-21: charge always follows. 1.2.2 removed the charge ("Charge removed from
+    // N (N now NH3)", Undo "Move and Remove Charge") and kept the object anchor.
     const { document, nitrogen } = ammoniumElectronMarkDropFixture();
     const molecule = dropMolecule(document), mark = dropMark(document);
     const anchor = { kind: "object", objectId: molecule.id } as const;
@@ -773,10 +807,11 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
     await mount(drawing);
     const { before } = await dragAtom(molecule.id, nitrogen, { x: nitrogen.x + 100, y: nitrogen.y + 100 });
     const after = snapshot();
-    expect(dropMark(after)).toEqual(dropMark(before));
-    expect(dropMolecule(after).atoms[0].formalCharge).toBe(0);
-    expect(status()).toBe("Charge removed from N (N now NH3)");
-    await exactUndoRedo(before, after, "Move and Remove Charge");
+    expect(dropMark(after)).toMatchObject({ anchor: { kind: "atom", objectId: molecule.id, atomId: nitrogen.id }, atomAssociation: "explicit" });
+    expectMarkFollowed(before, after, mark.id, nitrogen.id);
+    expect(dropMolecule(after).atoms[0]).toMatchObject({ formalCharge: 1, markCharge: 1 });
+    expect(status()).toBe("Moved selected molecule part");
+    await exactUndoRedo(before, after, "Move");
   });
 
   function legacyNitrogenMarks(bondCount: number, charge: number, secondCharge?: number) {
@@ -832,7 +867,9 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
   const legacyMarkOperations = ["part drag", "group rotation"] as const;
   const validLegacyDetachments = [{ marks: "opposite charges", secondCharge: -1 }, { marks: "a charge and a radical" }];
   it.each(validLegacyDetachments.flatMap(example => legacyMarkOperations.map(operation => ({ ...example, operation }))))(
-    "detaches $marks from three-bond N during a $operation", async ({ operation, secondCharge }) => {
+    "carries $marks with three-bond N during a $operation", async ({ operation, secondCharge }) => {
+      // owner ruling 2026-11-21: charge always follows. 1.2.2 detached both legacy marks ("Charge
+      // removed from N", Undo "… and Remove Charge"); now they follow N and keep its chemistry.
       const fixture = legacyNitrogenMarks(3, 1, secondCharge);
       const before = await moveNitrogenAway(fixture, operation);
       const after = snapshot();
@@ -841,26 +878,30 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
       const afterAssignments = workflow.committedElectronMarkAssignments(after.pages[0]).anchorByMarkId;
       expect(nitrogenIn(before).formalCharge).toBe(secondCharge === undefined ? 1 : 0);
       expect(nitrogenIn(before).markRadicals ?? 0).toBe(secondCharge === undefined ? 1 : 0);
-      expect(status()).toMatch(/^Charge removed from N/);
+      expect(status()).not.toMatch(/Charge|Cannot/);
       expect(dropMolecule(after)).not.toEqual(dropMolecule(before));
-      expect(nitrogenIn(after).formalCharge).toBe(0);
-      expect(nitrogenIn(after).markCharge ?? 0).toBe(0);
-      expect(nitrogenIn(after).markRadicals ?? 0).toBe(0);
+      const chemistry = (atom: MoleculeAtom) => [atom.formalCharge, atom.markCharge ?? 0, atom.markRadicals ?? 0];
+      expect(chemistry(nitrogenIn(after))).toEqual(chemistry(nitrogenIn(before)));
       for (const markId of fixture.marks) {
         expect(beforeAssignments.get(markId)).toEqual({ objectId: fixture.molecule.id, atomId: fixture.nitrogen.id });
-        expect(afterAssignments.get(markId)).toBeUndefined();
-        expect(workflow.findDocumentObject(after, markId)).toEqual(workflow.findDocumentObject(before, markId));
+        expect(afterAssignments.get(markId)).toEqual({ objectId: fixture.molecule.id, atomId: fixture.nitrogen.id });
+        expect(workflow.findDocumentObject(after, markId)).toMatchObject({ atomAssociation: "explicit",
+          anchor: { kind: "atom", objectId: fixture.molecule.id, atomId: fixture.nitrogen.id } });
       }
-      await exactUndoRedo(before, after, operation === "part drag" ? "Move and Remove Charge" : "Rotate selection and Remove Charge");
+      await exactUndoRedo(before, after, operation === "part drag" ? "Move" : "Rotate selection");
     });
 
-  it.each(legacyMarkOperations)("names the invalid final valence when both charges would detach during a %s", async operation => {
+  it.each(legacyMarkOperations)("keeps both charges on four-bond N during a %s, without a refusal", async operation => {
+    // owner ruling 2026-11-21: charge always follows. 1.2.2 refused ("Cannot move Charge from N: N
+    // cannot carry formal charge 0 with bond/radical valence 4").
     const fixture = legacyNitrogenMarks(4, 2, -1);
     const before = await moveNitrogenAway(fixture, operation);
+    const after = snapshot();
     expect(dropMolecule(before).atoms[0]).toMatchObject({ formalCharge: 1, markCharge: 1 });
-    expect(status()).toBe("Cannot move Charge from N: N cannot carry formal charge 0 with bond/radical valence 4");
-    expect(snapshot()).toEqual(before);
-    expect(container.querySelector("main")?.getAttribute("data-can-undo")).toBe("false");
+    expect(after.pages).not.toEqual(before.pages);
+    expect(dropMolecule(after).atoms[0]).toMatchObject({ formalCharge: 1, markCharge: 1 });
+    expect(status()).not.toMatch(/Charge|Cannot/);
+    await exactUndoRedo(before, after, operation === "part drag" ? "Move" : "Rotate selection");
   });
 
   it.each(["point", "bond", "object"] as const)("preserves the %s anchor when only a rotated carbon's raw coordinates reach the mark", async kind => {

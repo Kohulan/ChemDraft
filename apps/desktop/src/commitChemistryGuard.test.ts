@@ -147,9 +147,9 @@ describe("the commit check against commit normalization", () => {
     return { document, mark: dropMark(document), a: dropMolecule(document), hydroxylOxygen: fixture.hydroxylOxygen };
   }
 
-  function check(before: ChemDraftDocument, next: ChemDraftDocument, operation?: string, transform = false): string[] {
+  function check(before: ChemDraftDocument, next: ChemDraftDocument, operation?: string): string[] {
     return commitChemistryRefusals({ before, next, after: workflow.normalizeCommittedDocument(next),
-      normalize: workflow.normalizeCommittedDocument, markAtoms, operation, transform });
+      normalize: workflow.normalizeCommittedDocument, markAtoms, operation });
   }
 
   it("refuses a copy placed where normalization hands B's loose + to it, naming B", () => {
@@ -199,9 +199,11 @@ describe("the commit check against commit normalization", () => {
       `^Cannot align without changing the chemistry of molecule "${dropMolecule(document).id}": its atom "${nitrogen.id}" would have charge 2 `))]);
   });
 
-  it("lets a selection transform change the molecules it moved, never one it did not", () => {
-    // A + on A's nitrogen, B neutral. Moving A 200 px away leaves its stationary + behind (a
-    // selection transform announces that itself); a + left beside B must not land on B.
+  it("refuses a move that changes any molecule's chemistry, moved or not", () => {
+    // owner ruling 2026-11-21: charge always follows. Moves preserve: the move paths carry every
+    // mark with its atom (`followElectronMarksWithMovedAtoms`), so a move that would leave A's +
+    // behind is refused even when A is selected (1.2.2 exempted the selected molecules a selection
+    // transform moved). A + left beside B must not land on B either.
     const { document, nitrogen } = electronMarkDropFixture();
     const a = dropMolecule(document);
     const pageId = document.pages[0].id;
@@ -213,11 +215,14 @@ describe("the commit check against commit normalization", () => {
     const away = shiftA(selectedA, 0, 200);
     expect(moleculeById(workflow.normalizeCommittedDocument(away), a.id).atoms.find(atom => atom.id === nitrogen.id))
       .toMatchObject({ formalCharge: 0 });
-    expect(check(selectedA, away, "move", true)).toEqual([]);
-    // The same change is refused when the operation is not a selection transform, or A was not selected.
     expect(check(selectedA, away, "move")).toHaveLength(1);
     const unselected = workflow.selectDocumentObjects(withB, pageId, []);
-    expect(check(unselected, shiftA(unselected, 0, 200), "move", true)).toHaveLength(1);
+    expect(check(unselected, shiftA(unselected, 0, 200), "move")).toHaveLength(1);
+    // The move path's own result carries the + with N, and passes.
+    const followed = workflow.followElectronMarksWithMovedAtoms(selectedA, away).document;
+    expect(moleculeById(workflow.normalizeCommittedDocument(followed), a.id).atoms.find(atom => atom.id === nitrogen.id))
+      .toMatchObject({ formalCharge: 1 });
+    expect(check(selectedA, followed, "move")).toEqual([]);
     // B, not moved, is never exempt: put the + beside B's first atom and move A away.
     const mark = dropMark(withB);
     const besideB = applyPatch(selectedA, { op: "updateObject", objectId: mark.id, changes: {
@@ -229,8 +234,10 @@ describe("the commit check against commit normalization", () => {
     const { hydroxylOxygen } = electronMarkDropFixture();
     const onMark = shiftA(besideB, B_AT.x - 10 - hydroxylOxygen.x, B_AT.y - hydroxylOxygen.y);
     expect(moleculeById(workflow.normalizeCommittedDocument(onMark), B_ID).atoms[0]).toMatchObject({ formalCharge: 0 });
-    expect(check(besideB, onMark, "move", true)).toEqual([expect.stringMatching(
-      new RegExp(`^Cannot move without changing the chemistry of molecule "${B_ID}": `))]);
+    // Both are refused: B would lose its +, and A, moved, would take it.
+    expect(check(besideB, onMark, "move")).toEqual(expect.arrayContaining([expect.stringMatching(
+      new RegExp(`^Cannot move without changing the chemistry of molecule "${B_ID}": `))]));
+    expect(check(besideB, onMark, "move")).toHaveLength(2);
   });
 });
 
