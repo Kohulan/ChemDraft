@@ -43,9 +43,12 @@ mod structure_search;
 mod utility_suspension;
 #[cfg(test)]
 mod utility_suspension_tests;
+mod utility_window;
 mod webview_context_menus;
 #[cfg(test)]
 mod webview_context_menus_tests;
+#[cfg(any(target_os = "linux", test))]
+mod webview_recovery;
 mod window_drag;
 mod windows_activation_log;
 mod windows_clipboard;
@@ -1402,6 +1405,9 @@ pub fn run() {
         // workers remain under connect-src 'self' and never receive this capability.
         .plugin(tauri_plugin_http::init());
 
+    #[cfg(target_os = "linux")]
+    let builder = builder.plugin(webview_recovery::plugin());
+
     // Windows app updates: a signed manifest on main (`plugins.updater` in tauri.windows.conf.json)
     // and a signed NSIS installer. The webview drives the flow, and only a stable build ever checks;
     // see docs/releasing/windows-updates.md.
@@ -1600,8 +1606,12 @@ pub fn run() {
                     .closed(window.label());
             }
 
-            // Focused is queued by Tao and may describe an older activation by delivery.
-            // Lease ownership is observed synchronously at the OS boundary instead.
+            #[cfg(target_os = "linux")]
+            if is_input_focus_window_label(window.label()) {
+                if let WindowEvent::Focused(active) = event {
+                    panel_window::linux::focus_changed(window, *active);
+                }
+            }
             if is_input_focus_window_label(window.label())
                 && matches!(event, WindowEvent::Destroyed)
             {
@@ -2244,7 +2254,18 @@ fn foreground_belongs_to_app() -> bool {
         .is_some_and(|mtm| objc2_app_kit::NSApplication::sharedApplication(mtm).isActive())
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(target_os = "linux")]
+fn foreground_belongs_to_app() -> bool {
+    use gtk::prelude::*;
+    gtk::is_initialized_main_thread()
+        && gtk::Window::list_toplevels().iter().any(|widget| {
+            widget
+                .downcast_ref::<gtk::Window>()
+                .is_some_and(|window| window.has_toplevel_focus())
+        })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn foreground_belongs_to_app() -> bool {
     false
 }
@@ -4731,6 +4752,7 @@ fn plugin_panel_event_forward(
         return run_on_main_thread_blocking(&window, move || {
             if !utility_windows_suspended()
                 && !panel_window::palette_blocks_forwarded_shortcut(
+                    target.label(),
                     &shortcut.key,
                     shortcut.meta_key,
                     shortcut.ctrl_key,
@@ -4786,6 +4808,17 @@ async fn set_plugin_panel_input_focus(
     select_interaction: Option<bool>,
 ) -> Result<bool, String> {
     validate_plugin_panel_focus_caller(window.label())?;
+    #[cfg(target_os = "linux")]
+    if editing {
+        return panel_window::linux::acquire(
+            window,
+            &page_token,
+            generation,
+            click_sequence,
+            pointer_before.unwrap_or(0),
+        )
+        .await;
+    }
     if is_plugin_panel_window_label(window.label()) {
         return set_plugin_panel_activation(window, page_token, editing, generation);
     }
@@ -4836,6 +4869,7 @@ async fn set_plugin_panel_input_focus(
                 );
                 return Ok(false);
             }
+            #[cfg(not(target_os = "linux"))]
             if editing {
                 let result = (|| -> Result<bool, String> {
                     // An acquisition dispatched before a hide can arrive afterwards.
@@ -4882,7 +4916,7 @@ async fn set_plugin_panel_input_focus(
                             return Ok(true);
                         }
                     }
-                    #[cfg(not(any(target_os = "macos", windows)))]
+                    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
                     {
                         target
                             .set_focusable(false)
@@ -4901,7 +4935,7 @@ async fn set_plugin_panel_input_focus(
                         &*(target.ns_window().map_err(|error| error.to_string())? as *mut NSWindow)
                     }
                     .isKeyWindow());
-                    #[cfg(not(any(target_os = "macos", windows)))]
+                    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
                     target.is_focused().map_err(|error| error.to_string())
                 })();
                 let held = panel_window::acquired(
@@ -4924,33 +4958,31 @@ async fn set_plugin_panel_input_focus(
                 if !held && panel_window::is_current(&target, generation, epoch) {
                     let _ = target.set_focusable(false);
                 }
-                result.map(|_| held)
-            } else {
-                panel_window::end_pointer_guard(
-                    target.app_handle(),
-                    target.label(),
-                    panel_window::PointerGuardEnd::Released,
-                    click_sequence,
-                    before,
-                );
-                // Hand back before disabling key eligibility: AppKit can resign a panel as
-                // that flag changes. The helper checks the actual key/foreground window,
-                // current lease and app activation; native loss/cleanup never request it.
-                if let Err(error) = panel_window::return_focus_after_interaction(
-                    &target,
-                    return_focus.unwrap_or(false),
-                ) {
-                    palette_focus_log(format_args!(
-                        "hand-back label={} result=skipped reason=error error={error}",
-                        target.label()
-                    ));
-                    eprintln!("Could not return panel keyboard focus after release: {error}");
-                }
-                target
-                    .set_focusable(false)
-                    .map_err(|error| error.to_string())?;
-                Ok(false)
+                return result.map(|_| held);
             }
+            panel_window::end_pointer_guard(
+                target.app_handle(),
+                target.label(),
+                panel_window::PointerGuardEnd::Released,
+                click_sequence,
+                before,
+            );
+            // Hand back before disabling key eligibility: AppKit can resign a panel as
+            // that flag changes. The helper checks the actual key/foreground window,
+            // current lease and app activation; native loss/cleanup never request it.
+            if let Err(error) =
+                panel_window::return_focus_after_interaction(&target, return_focus.unwrap_or(false))
+            {
+                palette_focus_log(format_args!(
+                    "hand-back label={} result=skipped reason=error error={error}",
+                    target.label()
+                ));
+                eprintln!("Could not return panel keyboard focus after release: {error}");
+            }
+            target
+                .set_focusable(false)
+                .map_err(|error| error.to_string())?;
+            Ok(false)
         })?
     })();
     palette_focus_log(format_args!(
@@ -4962,7 +4994,8 @@ async fn set_plugin_panel_input_focus(
     ));
     result
 }
-// Plugin panels never enter the palette lease/acquisition/hand-back path above.
+// Panel releases only clear input bookkeeping. macOS and Windows already observe
+// pointer activation before their panel acquisition runs.
 fn set_plugin_panel_activation(
     window: tauri::WebviewWindow,
     page_token: String,
@@ -6515,8 +6548,9 @@ fn toolset_popover_title(label: &str, kind: &str) -> &'static str {
 }
 
 /// The actual builder configuration is also the test seam for native creation.
-/// `parent` is an owner on Windows (not a child HWND). Keep macOS popovers unparented:
-/// AppKit child windows can reveal hidden/prewarmed windows and alter their level/Spaces behavior.
+/// `parent` gives Windows an owner and Linux a GTK transient parent. Keep macOS popovers
+/// unparented because AppKit child windows can reveal hidden/prewarmed windows and alter their
+/// level/Spaces behavior.
 fn toolset_popover_window_config(
     label: &str,
     toolset_id: &str,
@@ -6532,9 +6566,9 @@ fn toolset_popover_window_config(
                 .into(),
         ),
         title: toolset_popover_title(&toolset_popover_window_label(toolset_id), kind).into(),
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         parent: Some(MAIN_WINDOW_LABEL.into()),
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         parent: None,
         width: 320.0,
         height: 300.0,
@@ -6564,14 +6598,20 @@ fn build_toolset_popover_window(
     position: (f64, f64),
     focus_mode: ToolsetPopoverFocusMode,
 ) -> Result<(), String> {
-    let config = toolset_popover_window_config(label, toolset_id, kind, prewarm, focus_mode);
-    let window = WebviewWindowBuilder::from_config(app, &config)
-        .map_err(|error| error.to_string())?
-        .position(position.0, position.1)
-        .build()
-        .map_err(|error| error.to_string())?;
+    let native_wayland = utility_window::uses_native_wayland(app)?;
+    let mut config = toolset_popover_window_config(label, toolset_id, kind, prewarm, focus_mode);
+    config.resizable |= native_wayland;
+    let builder =
+        WebviewWindowBuilder::from_config(app, &config).map_err(|error| error.to_string())?;
+    let builder = if native_wayland {
+        builder
+    } else {
+        builder.position(position.0, position.1)
+    };
+    let window = builder.build().map_err(|error| error.to_string())?;
 
     disable_default_context_menus(&window);
+    utility_window::prepare(&window, utility_window::Kind::Popover, native_wayland)?;
     configure_toolset_popover_window(&window, focus_mode)?;
     install_toolset_input_focus(&window)?;
     panel_window::set_popover_content(&window, kind)?;
@@ -6596,6 +6636,11 @@ fn configure_toolset_popover_window<R: Runtime>(
         target
             .set_focusable(focus_mode == ToolsetPopoverFocusMode::Focus)
             .map_err(|error| error.to_string())?;
+        // Keyboard-opened popovers own their navigation keys without a field lease.
+        panel_window::set_keyboard_popover(
+            target.label(),
+            focus_mode == ToolsetPopoverFocusMode::Focus,
+        );
         #[cfg(windows)]
         {
             use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -6628,6 +6673,9 @@ fn toolset_popover_extended_style(style: isize) -> isize {
 fn close_toolset_popover(app: tauri::AppHandle, toolset_id: String) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(&toolset_popover_window_label(&toolset_id)) {
         panel_window::end_for_hide(window.app_handle(), window.label());
+        #[cfg(target_os = "linux")]
+        utility_window::set_visible(&window, false)?;
+        #[cfg(not(target_os = "linux"))]
         window.hide().map_err(|error| error.to_string())?;
         toolset_popover_command_sources().remove(window.label());
     }
@@ -6752,6 +6800,7 @@ fn show_toolset_tooltip_window(
     {
         // The tooltip is built `focused(false)` (utility_window_builder), so this is
         // ShowWindow(SW_SHOWNOACTIVATE) on Windows and never takes activation from the document.
+        // On Linux Tao queues this after the position request, so it maps at the new anchor.
         window.show().map_err(|error| error.to_string())?;
     }
     // SW_SHOWNOACTIVATE keeps the hidden window's old z-order, which left the tooltip behind the
@@ -6883,7 +6932,7 @@ fn show_toolset_popover_window(
     #[cfg(not(target_os = "macos"))]
     // `focus: false` at creation makes Tao use SW_SHOWNOACTIVATE on Windows.
     // Keep its visibility state in sync (a raw ShowWindow alone breaks later hide()).
-    window.show().map_err(|error| error.to_string())?;
+    utility_window::set_visible(&window, true)?;
     raise_among_owned_windows(&window)?;
     let visibility = window.is_visible();
     #[cfg(windows)]
@@ -6975,6 +7024,10 @@ fn set_window_global_logical_position<R: Runtime>(
     x: f64,
     y: f64,
 ) -> Result<(), String> {
+    // On native Wayland the compositor positions transient toplevels.
+    if utility_window::uses_native_wayland(window.app_handle())? {
+        return Ok(());
+    }
     let monitors = monitor_query::available_monitors(window.app_handle())
         .unwrap_or_default()
         .iter()
@@ -7056,6 +7109,15 @@ fn resize_toolset_window(
         .map_err(|error| error.to_string())?
         .or_else(|| monitor_query::primary_monitor(app).ok().flatten())
         .ok_or("The tool palette's monitor is unavailable.")?;
+    if utility_window::uses_native_wayland(app)? {
+        window
+            .set_size(tauri::LogicalSize::new(
+                width,
+                height.min(monitor_logical_work_area(&monitor).height),
+            ))
+            .map_err(|error| error.to_string())?;
+        return Ok(true);
+    }
     let scale = monitor.scale_factor();
     #[cfg(not(target_os = "macos"))]
     let window_scale = window.scale_factor().unwrap_or(scale);
@@ -7169,6 +7231,7 @@ fn build_toolset_tooltip_window(app: &tauri::AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
+    let native_wayland = utility_window::uses_native_wayland(app)?;
     let window = utility_window_builder(
         WebviewWindowBuilder::new(
             app,
@@ -7176,14 +7239,14 @@ fn build_toolset_tooltip_window(app: &tauri::AppHandle) -> Result<(), String> {
             WebviewUrl::App("/?window=toolsetTooltip".into()),
         ),
         app,
-    )
+    )?
     .title("ChemDraft tooltip")
     // The JS side sizes this to the rendered text before every show.
     .inner_size(120.0, 26.0)
     .min_inner_size(16.0, 14.0)
     .accept_first_mouse(false)
     .focusable(false)
-    .resizable(false)
+    .resizable(native_wayland)
     .decorations(false)
     .skip_taskbar(true)
     .visible(false)
@@ -7191,6 +7254,7 @@ fn build_toolset_tooltip_window(app: &tauri::AppHandle) -> Result<(), String> {
     .map_err(|error| error.to_string())?;
 
     disable_default_context_menus(&window);
+    utility_window::prepare(&window, utility_window::Kind::Tooltip, native_wayland)?;
     configure_toolset_utility_window(&window, false)?;
     // Pure chrome: click-through and invisible to hit-testing. Without this, the tooltip appearing
     // under the cursor would win windowNumberAtPoint in the pointer feed, read as "cursor left the
@@ -10731,12 +10795,7 @@ fn ensure_toolset_window<R: Runtime>(
         })?;
     #[cfg(not(target_os = "linux"))]
     let native_resizable = resizable;
-
-    // Record label -> id so the Moved/Destroyed handlers and enumeration can resolve the toolset
-    // without the manifest (the label itself is lossy).
-    if let Ok(mut labels) = app.state::<ToolsetWindowDirectory>().labels.lock() {
-        labels.insert(label.clone(), toolset_id.to_string());
-    }
+    let native_wayland = utility_window::uses_native_wayland(app)?;
 
     windows_activation_log::frame_set(&label, "toolbar creation", "logical", || {
         ((position.x, position.y), (width, height))
@@ -10750,7 +10809,7 @@ fn ensure_toolset_window<R: Runtime>(
             ),
         ),
         app,
-    )
+    )?
     .title(title)
     .inner_size(width, height)
     .accept_first_mouse(true)
@@ -10762,7 +10821,11 @@ fn ensure_toolset_window<R: Runtime>(
     .shadow(true)
     .skip_taskbar(true);
     #[cfg(not(windows))]
-    let builder = builder.position(position.x, position.y);
+    let builder = if native_wayland {
+        builder
+    } else {
+        builder.position(position.x, position.y)
+    };
     #[cfg(windows)]
     let builder = if placement.is_some() {
         // Tao's builder accepts logical positions only. Set the physical frame before showing
@@ -10778,6 +10841,11 @@ fn ensure_toolset_window<R: Runtime>(
     } else {
         builder
     };
+    // Record label -> id so the Moved/Destroyed handlers and enumeration can resolve the toolset
+    // without the manifest (the label itself is lossy).
+    if let Ok(mut labels) = app.state::<ToolsetWindowDirectory>().labels.lock() {
+        labels.insert(label.clone(), toolset_id.to_string());
+    }
     let window = match builder.build() {
         Ok(window) => window,
         Err(error) => {
@@ -10792,8 +10860,11 @@ fn ensure_toolset_window<R: Runtime>(
     };
 
     disable_default_context_menus(&window);
+    utility_window::prepare(&window, utility_window::Kind::Toolbar, native_wayland)?;
     configure_toolset_utility_window(&window, true)?;
     install_toolset_input_focus(&window)?;
+    #[cfg(target_os = "linux")]
+    utility_window::set_visible(&window, true)?;
     #[cfg(windows)]
     {
         let target = window.clone();
@@ -11073,9 +11144,8 @@ fn toolset_window_hides_on_deactivate() -> bool {
     true
 }
 
-/// Off macOS there is no panel treatment to apply after the build: everything a utility window
-/// needs is set on its builder by [`utility_window_builder`]. (No menu bar needs stripping either —
-/// the app menu is attached to the document window only; see `install_app_menu`.)
+/// AppKit applies its panel level during reconfiguration. Linux applies its GTK hints only
+/// before the first show in [`utility_window::prepare`].
 #[cfg(not(target_os = "macos"))]
 fn configure_toolset_utility_window<R: Runtime>(
     _window: &tauri::WebviewWindow<R>,
@@ -11084,8 +11154,9 @@ fn configure_toolset_utility_window<R: Runtime>(
     Ok(())
 }
 
-/// Builder settings every floating utility window (palettes, popovers, the tooltip, plugin panels)
-/// shares. On Windows:
+/// Set ownership and initial activation for toolbars and the tooltip.
+/// On Linux, Tauri sets GTK's transient parent at construction. Keep the window hidden until
+/// [`utility_window::prepare`] applies the GTK hints. On Windows:
 /// - **owned by the document window**, given to tao at build time: an owned window stays above its
 ///   owner, hides while it is minimized and is destroyed with it — and tao creates it as a popup
 ///   without `WS_EX_APPWINDOW`. (Setting `GWLP_HWNDPARENT` afterwards left tao believing the window
@@ -11097,22 +11168,33 @@ fn configure_toolset_utility_window<R: Runtime>(
 fn utility_window_builder<'a, R: Runtime, M: Manager<R>>(
     builder: WebviewWindowBuilder<'a, R, M>,
     app: &tauri::AppHandle<R>,
-) -> WebviewWindowBuilder<'a, R, M> {
+) -> Result<WebviewWindowBuilder<'a, R, M>, String> {
     #[cfg(windows)]
     {
         let builder = builder.focused(false);
-        match app
+        let owner = app
             .get_webview_window(MAIN_WINDOW_LABEL)
-            .and_then(|main| main.hwnd().ok())
-        {
+            .and_then(|main| main.hwnd().ok());
+        Ok(match owner {
             Some(owner) => builder.owner_raw(owner),
             None => builder,
-        }
+        })
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        let main = app
+            .get_webview_window(MAIN_WINDOW_LABEL)
+            .ok_or("The document window is unavailable for this utility window.")?;
+        builder
+            .focused(false)
+            .visible(false)
+            .parent(&main)
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = app;
-        builder
+        Ok(builder)
     }
 }
 
@@ -11454,6 +11536,9 @@ fn recover_offscreen_toolset_window<R: Runtime>(
     window: &tauri::WebviewWindow<R>,
     resizable: bool,
 ) {
+    if utility_window::uses_native_wayland(app).unwrap_or(true) {
+        return;
+    }
     let Some(position) = current_toolset_window_position(window) else {
         return;
     };
@@ -15077,9 +15162,9 @@ mod tests {
             ToolsetPopoverFocusMode::Preserve,
         );
         // These are passed directly to WebviewWindowBuilder::from_config.
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         assert_eq!(config.parent.as_deref(), Some(MAIN_WINDOW_LABEL));
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         assert_eq!(config.parent, None);
         assert!(!config.focusable);
         assert!(!config.focus); // Tao's Windows SW_SHOWNOACTIVATE path.
@@ -15102,9 +15187,15 @@ mod tests {
         assert_eq!(toolset_popover_extended_style(style), style);
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     #[test]
     fn bond_stereo_mouse_popover_is_unparented_and_nonactivating() {
+        assert_bond_stereo_mouse_creation();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bond_stereo_mouse_popover_is_transient_and_nonactivating() {
         assert_bond_stereo_mouse_creation();
     }
 
@@ -15137,9 +15228,9 @@ mod tests {
             );
             assert!(!config.focus);
             assert!(!config.visible);
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             assert_eq!(config.parent.as_deref(), Some(MAIN_WINDOW_LABEL));
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "linux")))]
             assert_eq!(config.parent, None);
         }
     }

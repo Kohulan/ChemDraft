@@ -20,7 +20,7 @@ inputs:
     description: Unprivileged smoke user in an already isolated container
     required: false
   check-window:
-    description: Require a visible ChemDraft window under Xvfb with openbox and xdotool
+    description: Check document rendering, toolbar windows, menus and clipboard under Xvfb
     default: 'false'
   diagnostics:
     description: Record Ubuntu library resolution and retry startup failures under GDB
@@ -183,6 +183,7 @@ runs:
           "${EGL_PLATFORM-<unset>}" "${GDK_BACKEND-<unset>}" "${WAYLAND_DISPLAY-}" "${DISPLAY-}" \
           "${CHEMDRAFT_NATIVE_WAYLAND-<unset>}"
         if [[ "$check_window" == true ]]; then
+          unset NO_AT_BRIDGE AT_SPI_BUS_ADDRESS
           openbox > "$logs/openbox.log" 2>&1 &
           wm_pid=$!
           xdpyinfo > "$logs/xdpyinfo.log"
@@ -235,14 +236,19 @@ runs:
           done
           return 1
         }
-        window_ready() {
-          [[ "$check_window" != true ]] && return 0
+        visible_window() {
           local window owner
-          for window in $(xdotool search --onlyvisible --name '^ChemDraft' 2>/dev/null || true); do
+          for window in $(xdotool search --onlyvisible --name "$1" 2>/dev/null || true); do
             owner=$(xdotool getwindowpid "$window" 2>/dev/null) || continue
-            belongs_to_launch "$owner" && return 0
+            if belongs_to_launch "$owner"; then
+              printf '%s\n' "$window"
+              return 0
+            fi
           done
           return 1
+        }
+        window_ready() {
+          [[ "$check_window" != true ]] || visible_window '^ChemDraft$' >/dev/null
         }
         web_process_running() {
           launched_pid -f '(^|/)WebKitWebProcess([[:space:]:]|$)' >/dev/null
@@ -277,6 +283,35 @@ runs:
         fi
         web_process_running || fail 'No WebKitWebProcess stayed alive during startup'
         window_ready || fail 'No ChemDraft window appeared within 60 seconds'
+        if [[ "$check_window" == true ]]; then
+          # Exclude the native menu bar: a blank WebKit surface has few colors. A rendered
+          # document includes antialiased rulers, page edges and canvas controls.
+          capture=(import)
+          image_info=(convert)
+          if command -v magick >/dev/null 2>&1; then
+            capture=(magick import)
+            image_info=(magick)
+          fi
+          for _ in {1..30}; do
+            captured=false
+            document=$(visible_window '^ChemDraft$' || true)
+            toolbar=$(visible_window '^ChemDraft Main Toolbar$' || true)
+            if [[ -n "$document" ]] && "${capture[@]}" -window "$document" "$logs/document.png" 2> "$logs/screenshot.log"; then
+              captured=true
+              colors=$("${image_info[@]}" "$logs/document.png" -gravity north -chop 0x50 -format '%k' info: 2>> "$logs/screenshot.log") \
+                || fail 'Could not count colors in the X11 document screenshot. See screenshot.log'
+              echo "Document content colors: $colors"
+              if [[ -n "$toolbar" ]] && (( colors > 16 )); then break; fi
+            fi
+            sleep 1
+          done
+          [[ -n "$document" ]] || fail 'The ChemDraft document window disappeared before the readiness screenshot'
+          [[ -n "$toolbar" ]] || fail 'The ChemDraft Main Toolbar window did not appear within 30 seconds'
+          [[ "$captured" == true ]] || fail 'Could not capture the X11 document screenshot. See screenshot.log'
+          (( colors > 16 )) || fail 'The document screenshot had 16 or fewer colors below the native menu. See document.png'
+          /usr/bin/python3 "$action_path/x11-interaction.py" "$main_pid" "$document" "$logs" \
+            || fail 'X11 menu or clipboard check failed. See the preceding check output'
+        fi
         for _ in {1..20}; do
           sleep 1
           for pid in "$launcher_pid" "$main_pid" "$display_pid"; do
