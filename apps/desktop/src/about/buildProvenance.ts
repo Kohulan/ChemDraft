@@ -45,7 +45,7 @@ export function readNoticeRows(source: string): NoticeRow[] {
   const rows = headings.map((match, index) => ({
     heading: match[1]!.replace(/\n/g, " "),
     body: source.slice(match.index + match[0].length, headings[index + 1]?.index)
-  })).filter(({ heading }) => !/^(?:APPENDIX A\.|A\.\d )/.test(heading));
+  })).filter(({ heading }) => !/^(?:APPENDIX A\.|A\.\d+ )/.test(heading));
   const nested = [
     ...source.matchAll(/^ {2}([a-z][a-z-]+ \d+\.\d+\.\d+): (.+)$/gm),
     ...source.matchAll(/^ {4}(\S.+?\)) {2,}((?:Apache|BSD|MIT).+)$/gm),
@@ -166,6 +166,9 @@ const noticeAliases: ReadonlyArray<readonly [RegExp, string]> = [
   [/^jna-inchi /, "jna-inchi 1.3.1 (inside the OPSIN jar)"],
   [/^InChI 1\.07\.2/, "InChI 1.07.2 (inside the jna-inchi natives)"],
   [/^InChI \(statically linked/, "InChI (inside the RDKit MinimalLib WASM)"],
+  [/^FreeType 2\.13\.3 /, "FreeType 2.13.3 (inside the RDKit MinimalLib WASM)"],
+  [/^zlib 1\.3\.2 /, "zlib 1.3.2 (inside the RDKit MinimalLib WASM)"],
+  [/^Telex Regular /, "Telex Regular (font embedded in the RDKit MinimalLib WASM)"],
   [/^Bundled Java runtime/, "OpenJDK runtime (jlink)"],
   [/^Avogadro libraries/, "avogadrolibs (Avogadro Core + Calc)"],
   [/^Eigen 3\.4\.0/, "Eigen 3.4.0"],
@@ -176,7 +179,6 @@ const noticeAliases: ReadonlyArray<readonly [RegExp, string]> = [
 function inventoryExclusion(row: InventoryRow): string | undefined {
   if (/development|build dependency/i.test(row.scope) && !/runtime/i.test(row.scope) && row.name !== "Eigen 3.4.0") return "Development or build tooling";
   if (/not bundled|not core|user-installed|host-managed|optional runtime|optional installer|optional model/i.test(row.scope)) return "Distributed separately";
-  if (row.name.startsWith("FreeType ")) return "Linkage remains unconfirmed";
   return undefined;
 }
 
@@ -257,7 +259,7 @@ export function buildAboutProvenance(): AboutProvenance & {
       components.set(heading, {
         name: heading,
         version: "Snapshot used to train the shipped pKa model",
-        license: heading.startsWith("Dwar-iBond") ? "Dataset license unresolved" : license,
+        license: heading.startsWith("Dwar-iBond") ? "No published data license; redistributed with attribution by owner decision" : license,
         holders: [SEE_LICENSE],
         purpose: "Training data for the shipped pKa model. See NOTICE for provenance and attribution.",
         sourceUrl: trainingSet[1]!
