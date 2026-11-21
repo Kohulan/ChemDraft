@@ -8,8 +8,24 @@ function clampOffset(offset: number, max: number) {
   return Math.max(0, Math.min(offset, max));
 }
 
+// Layout works in 1/64 px; ignore a sliver that cannot be seen.
+const LAYOUT_EPSILON = 1 / 64;
+
+// scrollWidth and clientWidth round to whole pixels, so a fractional track (text widths always are) could end up
+// to a pixel wider than the range they report. Read the exact box and use the larger track width.
+function measureTrack(track: HTMLElement) {
+  return Math.max(track.scrollWidth, track.getBoundingClientRect().width);
+}
+
+// The visible width, never rounded up past the real box: clientWidth rounds to the nearest pixel.
+function measureViewport(strip: HTMLElement) {
+  const exact = strip.getBoundingClientRect().width;
+  return exact > 0 ? Math.min(strip.clientWidth, exact) : strip.clientWidth;
+}
+
 function scrollGeometry(viewportWidth: number, trackWidth: number) {
-  const max = Math.max(0, trackWidth - viewportWidth);
+  // Round the range up so a fractional overflow never leaves the end of the last tab, its close button included, clipped.
+  const max = Math.max(0, Math.ceil(trackWidth - viewportWidth - LAYOUT_EPSILON));
   // The scrollbar spans the viewport.
   const thumbWidth = max > 0 ? Math.min(viewportWidth, Math.max(24, viewportWidth ** 2 / trackWidth)) : viewportWidth;
   return { max, thumbWidth, thumbTravel: viewportWidth - thumbWidth };
@@ -20,7 +36,7 @@ function offsetToReveal(strip: HTMLElement, tab: HTMLElement | null, offset: num
   const rect = tab.getBoundingClientRect();
   const left = strip.getBoundingClientRect().left + strip.clientLeft;
   // Use the nearest edge, or align the start of a tab wider than the strip.
-  const delta = Math.min(rect.left - left, Math.max(0, rect.right - left - strip.clientWidth));
+  const delta = Math.min(rect.left - left, Math.max(0, rect.right - left - measureViewport(strip)));
   return clampOffset(offset + delta, max);
 }
 
@@ -45,9 +61,9 @@ export function DocumentTabList({ ref, activeId, order, children }: {
     const thumb = thumbRef.current;
     if (!strip || !track || !scrollbar || !thumb) return;
 
-    const stripWidth = strip.clientWidth;
+    const stripWidth = measureViewport(strip);
     viewportWidth.current = stripWidth;
-    const { max, thumbWidth, thumbTravel } = scrollGeometry(stripWidth, remainingWidth ?? track.scrollWidth);
+    const { max, thumbWidth, thumbTravel } = scrollGeometry(stripWidth, remainingWidth ?? measureTrack(track));
     const next = clampOffset(left, max);
     // A shared transform keeps the painted tabs and their hit targets in sync.
     offset.current = next;
@@ -70,8 +86,8 @@ export function DocumentTabList({ ref, activeId, order, children }: {
       const gap = Number.parseFloat(window.getComputedStyle(track).columnGap) || 0;
       const gapsRemoved = Math.min(closing.length, Math.max(0, tabs.length - 1));
       const widthRemoved = closing.reduce((width, tab) => width + tab.offsetWidth, 0) + gapsRemoved * gap;
-      const remainingWidth = track.scrollWidth - widthRemoved;
-      if (remainingWidth - strip.clientWidth < offset.current) moveTrack(offset.current, remainingWidth);
+      const remainingWidth = measureTrack(track) - widthRemoved;
+      if (scrollGeometry(measureViewport(strip), remainingWidth).max < offset.current) moveTrack(offset.current, remainingWidth);
     }
   }), [moveTrack]);
 
@@ -79,7 +95,7 @@ export function DocumentTabList({ ref, activeId, order, children }: {
     const strip = stripRef.current;
     const track = trackRef.current;
     if (!strip || !track) return;
-    const max = Math.max(0, track.scrollWidth - strip.clientWidth);
+    const max = scrollGeometry(measureViewport(strip), measureTrack(track)).max;
     const activeTab = track.querySelector<HTMLElement>('.document-tab[data-active="true"]');
     moveTrack(offsetToReveal(strip, activeTab, offset.current, max));
   }, [activeId, order, moveTrack]);
@@ -88,13 +104,13 @@ export function DocumentTabList({ ref, activeId, order, children }: {
     const strip = stripRef.current;
     const track = trackRef.current;
     if (!strip || !track) return;
-    const maxOffset = () => Math.max(0, track.scrollWidth - strip.clientWidth);
+    const maxOffset = () => scrollGeometry(measureViewport(strip), measureTrack(track)).max;
     const onWheel = (event: WheelEvent) => {
       if (event.ctrlKey) return; // Preserve pinch-to-zoom.
       const unit = event.deltaMode;
       let delta = event.deltaX || event.deltaY;
       if (unit === WheelEvent.DOM_DELTA_LINE) delta *= parseFloat(getComputedStyle(track).lineHeight) || 16;
-      if (unit === WheelEvent.DOM_DELTA_PAGE) delta *= strip.clientWidth;
+      if (unit === WheelEvent.DOM_DELTA_PAGE) delta *= measureViewport(strip);
       const next = clampOffset(offset.current + delta, maxOffset());
       if (next === offset.current) return;
       event.preventDefault();
@@ -133,8 +149,8 @@ export function DocumentTabList({ ref, activeId, order, children }: {
     const track = trackRef.current;
     const thumb = thumbRef.current;
     if (!strip || !track || !thumb || drag.current || event.button !== 0 || event.pointerType !== "mouse") return;
-    const viewportWidth = strip.clientWidth;
-    if (track.scrollWidth <= viewportWidth) return;
+    const stripWidth = measureViewport(strip);
+    if (scrollGeometry(stripWidth, measureTrack(track)).max === 0) return;
 
     event.preventDefault();
     if (event.target === thumb) {
@@ -142,7 +158,7 @@ export function DocumentTabList({ ref, activeId, order, children }: {
       drag.current = { pointerId: event.pointerId, startX: event.clientX, startOffset: offset.current };
     } else {
       const direction = event.clientX < thumb.getBoundingClientRect().left ? -1 : 1;
-      moveTrack(offset.current + direction * viewportWidth);
+      moveTrack(offset.current + direction * stripWidth);
     }
   }
 
@@ -152,7 +168,7 @@ export function DocumentTabList({ ref, activeId, order, children }: {
     const track = trackRef.current;
     if (!start || start.pointerId !== event.pointerId || !strip || !track) return;
 
-    const { max, thumbTravel } = scrollGeometry(strip.clientWidth, track.scrollWidth);
+    const { max, thumbTravel } = scrollGeometry(measureViewport(strip), measureTrack(track));
     if (thumbTravel > 0) moveTrack(start.startOffset + (event.clientX - start.startX) / thumbTravel * max);
   }
 

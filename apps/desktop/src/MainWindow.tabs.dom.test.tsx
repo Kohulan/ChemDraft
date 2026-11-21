@@ -2095,6 +2095,111 @@ describe("documents in one window", () => {
       expect(clickedTab.getAttribute("aria-selected")).toBe("true");
       expect(bridge().snapshot().document.title).toBe("Second drawing");
     });
+
+    describe("last tab close button", () => {
+      const closeWidth = 30;
+
+      // Give each close button the box it has at the right end of its tab, and put the "+" button where the
+      // layout puts it: beside the strip, two pixels past its right edge.
+      function stubCloseButtonsAndNewTab(strip: HTMLElement) {
+        for (const tab of Array.from(strip.querySelectorAll<HTMLElement>(".document-tab"))) {
+          const close = tab.querySelector<HTMLElement>(".document-tab-close")!;
+          vi.spyOn(close, "getBoundingClientRect").mockImplementation(() => {
+            const box = tab.getBoundingClientRect();
+            return new DOMRect(box.right - closeWidth, box.top, closeWidth, box.height);
+          });
+        }
+        const plus = container.querySelector<HTMLElement>(".document-tab-new")!;
+        vi.spyOn(plus, "getBoundingClientRect").mockImplementation(() =>
+          new DOMRect(strip.getBoundingClientRect().right + 2, 0, 30, 24));
+        return plus;
+      }
+
+      function expectLastTabFullyVisible(strip: HTMLElement, plus: HTMLElement) {
+        const bounds = strip.getBoundingClientRect();
+        // The visible right edge stops where a sibling begins to cover the strip.
+        const visibleRight = Math.min(bounds.right, plus.getBoundingClientRect().left);
+        const last = Array.from(strip.querySelectorAll<HTMLElement>(".document-tab")).at(-1)!;
+        const tab = last.getBoundingClientRect();
+        const close = last.querySelector<HTMLElement>(".document-tab-close")!.getBoundingClientRect();
+        const slack = 1e-6;
+        expect(tab.left).toBeGreaterThanOrEqual(bounds.left - slack);
+        expect(tab.right).toBeLessThanOrEqual(visibleRight + slack);
+        expect(close.left).toBeGreaterThanOrEqual(bounds.left - slack);
+        expect(close.right).toBeLessThanOrEqual(visibleRight + slack);
+      }
+
+      async function exerciseLastTab(strip: HTMLElement, track: HTMLElement) {
+        const plus = stubCloseButtonsAndNewTab(strip);
+        // Opening the fourth tab revealed it.
+        expectLastTabFullyVisible(strip, plus);
+
+        // Reveal it again from the far end, by activating it.
+        await activate(0);
+        expect(translationX(track)).toBe(0);
+        await activate(3);
+        expect(active()).toBe(3);
+        expectLastTabFullyVisible(strip, plus);
+
+        // Scroll to the end by wheel, and past it.
+        expect(wheel(track, -100000, 0)).toBe(true);
+        expect(translationX(track)).toBe(0);
+        expect(wheel(track, 100000, 0)).toBe(true);
+        expectLastTabFullyVisible(strip, plus);
+        expect(wheel(track, 100000, 0)).toBe(false);
+
+        // Scroll to the end by dragging the scrollbar thumb past its end.
+        expect(wheel(track, -100000, 0)).toBe(true);
+        const scrollbar = strip.querySelector<HTMLDivElement>(".document-tab-scrollbar")!;
+        const thumb = scrollbar.querySelector<HTMLDivElement>(".document-tab-scrollbar-thumb")!;
+        scrollbar.setPointerCapture = vi.fn();
+        pointer(thumb, "pointerdown", 0);
+        pointer(scrollbar, "pointermove", 100000);
+        pointer(scrollbar, "pointerup", 100000);
+        expectLastTabFullyVisible(strip, plus);
+      }
+
+      it("keeps the last tab and its close button inside the visible strip at the end and when revealed", async () => {
+        const { strip, track } = await openOverflowingTabs();
+        await exerciseLastTab(strip, track);
+        expect(translationX(track)).toBe(-376);
+      });
+
+      it("rounds a fractional overflow up so the close button is not clipped by a sub-pixel", async () => {
+        const strip = container.querySelector<HTMLDivElement>(".document-tab-list")!;
+        const track = strip.querySelector<HTMLDivElement>(".document-tab-track")!;
+        const thumb = strip.querySelector<HTMLDivElement>(".document-tab-scrollbar-thumb")!;
+        // Real text widths are fractional. The track is 606.4 px and the strip 229.6 px, but scrollWidth and
+        // clientWidth report 606 and 230, which understates the overflow (376 against 376.8).
+        const tabWidth = 150.1;
+        const gap = 2;
+        const stripLeft = 24;
+        const stripExact = 229.6;
+        const trackExact = () => Math.max(0, track.childElementCount * (tabWidth + gap) - gap);
+        track.style.columnGap = `${gap}px`;
+        vi.spyOn(strip, "clientWidth", "get").mockImplementation(() => Math.round(stripExact));
+        vi.spyOn(track, "scrollWidth", "get").mockImplementation(() => Math.round(trackExact()));
+        vi.spyOn(strip, "getBoundingClientRect").mockImplementation(() => new DOMRect(stripLeft, 0, stripExact, 24));
+        vi.spyOn(track, "getBoundingClientRect").mockImplementation(() =>
+          new DOMRect(stripLeft + translationX(track), 0, trackExact(), 24));
+        vi.spyOn(thumb, "getBoundingClientRect").mockImplementation(() =>
+          new DOMRect(stripLeft + translationX(thumb), 24, Number.parseFloat(thumb.style.width), 8));
+        const bounds = HTMLDivElement.prototype.getBoundingClientRect;
+        vi.spyOn(HTMLDivElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLDivElement) {
+          if (this.parentElement !== track) return bounds.call(this);
+          const index = Array.from(track.children).indexOf(this);
+          return new DOMRect(stripLeft + index * (tabWidth + gap) + translationX(track), 0, tabWidth, 24);
+        });
+        for (const name of ["First drawing", "Second drawing", "Third drawing", "Fourth drawing"]) await open(name);
+        expect(tabs()).toHaveLength(4);
+        expect(active()).toBe(3);
+        expect(track.scrollWidth).toBe(606);
+        expect(strip.clientWidth).toBe(230);
+
+        await exerciseLastTab(strip, track);
+        expect(translationX(track)).toBe(-377);
+      });
+    });
   });
 
   it("dirty tab x uses the registered close command; Cancel retains it and Discard selects its neighbour", async () => {
