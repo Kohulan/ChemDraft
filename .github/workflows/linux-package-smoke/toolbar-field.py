@@ -180,6 +180,7 @@ class Session:
             (self.work / folder).mkdir()
             os.environ[name] = str(self.work / folder)
         os.environ["RUST_BACKTRACE"] = "1"
+        os.environ["CHEMDRAFT_PALETTE_FOCUS_LOG"] = "1"
         display_log = self.logs / "display.log"
         if self.compositor == "kwin":
             ready = self.start_kwin(runtime, display_log)

@@ -100,6 +100,8 @@ detail depends on the binary's available symbols.
 
 ## Container smoke test
 
+A tester can run ChemDraft with `CHEMDRAFT_PALETTE_FOCUS_LOG=1` to get one `[palette-focus] linux-acquire` line per field click on stderr; the smoke sets it.
+
 Pull requests changing Linux packaging paths, any desktop Rust source, `Cargo.toml` or `Cargo.lock`
 also build and smoke-test packages from the PR head.
 

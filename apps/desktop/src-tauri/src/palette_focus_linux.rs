@@ -507,7 +507,7 @@ impl AcquireLog {
         let present = self
             .present
             .map_or_else(|| "not-called".to_owned(), |time| format!("time={time}"));
-        crate::palette_focus_log_always(format_args!(
+        crate::palette_focus_acquire_log(format_args!(
             "linux-acquire label={} {} backend={} app-foreground={app_foreground} \
              app-focus-lost={} focus-holder={} accept-focus-before={accept_before} \
              request={} xsetinputfocus={} present-with-time={present} outcome={outcome} {end}",
