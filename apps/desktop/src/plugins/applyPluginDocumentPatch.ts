@@ -14,7 +14,8 @@ import {
   type AppliedPatchReceipt,
   type NormalizedProposedDocumentPatch
 } from "@chemdraft/plugin-api";
-import { assertPluginDocumentWriteScope, rebasePluginPatch, retainedCtabCompatibility, storedCtabReference, writePatchOps } from "@chemdraft/plugin-host";
+import { assertPluginDocumentWriteScope, bareIdTargetPage, effectiveScopePages, objectInWriteScope, rebasePluginPatch,
+  retainedCtabCompatibility, storedCtabReference, writePatchOps, type PageObjectRef, type PluginWriteScopePages } from "@chemdraft/plugin-host";
 import { selectionBounds, translateInsertedDocumentObjects } from "../documentWorkflow";
 import { choosePlacement, objectRect, overlaps as boundsOverlap, pageContentRect, RELATIVE_GAP, unionRects } from "../assistant/placement";
 import type { ViewportRect } from "@chemdraft/viewport-engine";
@@ -45,9 +46,13 @@ const STORED_CHEMISTRY_FIELDS = ["structure", "structureFormat", "chemistry", "c
  * Reviewed proposals are authorized by acceptance and have no command selection scope, but their
  * insertions are verified exactly like a scoped plugin's. */
 export function refreshPluginPatchChemistry(before: ChemDraftDocument, draft: ChemDraftDocument,
-  rebased: NormalizedProposedDocumentPatch, writeScopeObjectIds?: readonly string[], signal?: AbortSignal
+  rebased: NormalizedProposedDocumentPatch, writeScopeObjectIds?: readonly string[], signal?: AbortSignal,
+  /** Legacy writes: a selected id is in scope only on the page its selection named. */
+  writeScopePages?: PluginWriteScopePages
 ): Promise<ChemDraftDocument> | undefined {
   const scope = writeScopeObjectIds && new Set(writeScopeObjectIds);
+  // Follow a uniquely identified selected object that moved pages; never a same-id object elsewhere.
+  const scopePages = effectiveScopePages(before, writeScopePages);
   const inserted = new Set<string>();
   const atomUpdates = new Set<string>();
   const storedUpdates = new Set<string>();
@@ -75,7 +80,7 @@ export function refreshPluginPatchChemistry(before: ChemDraftDocument, draft: Ch
       if (object.type !== "molecule") continue;
       const previous = prior[moleculeIndex++];
       const isInsertion = inserted.has(object.id);
-      if (previous?.id !== object.id || (scope && !isInsertion && !scope.has(object.id))) continue;
+      if (previous?.id !== object.id || (scope && !isInsertion && !objectInWriteScope(scope, scopePages, page.id, object.id))) continue;
       // Every insertion is verified, whether a scoped command wrote it or the user accepted it.
       const verifyInsertion = isInsertion;
       // An authored atom move can change 2D stereo, but only where geometry defines stereo, and
@@ -102,7 +107,7 @@ export function refreshPluginPatchChemistry(before: ChemDraftDocument, draft: Ch
       // Records the canvas itself derives from this graph cannot disagree with it.
       if (verifyInsertion && !graphChanged && !storedChanged && storesNativeDerivation(object)) continue;
       // Give existing scope refusals priority over chemistry inspection of a draft that cannot commit.
-      if (!edits.length && writeScopeObjectIds) assertPluginDocumentWriteScope(before, draft, rebased, writeScopeObjectIds);
+      if (!edits.length && writeScopeObjectIds) assertPluginDocumentWriteScope(before, draft, rebased, writeScopeObjectIds, writeScopePages);
       if (objects === page.objects) objects = [...objects];
       edits.push((async () => {
         try {
@@ -345,26 +350,32 @@ export function applyPluginDocumentPatch(
     }
     patched = translateInsertedDocumentObjects(patched, objects.map(object => object.id), x - bounds.x, y - bounds.y);
   }
+  // Record each touched object by page and id: the page an insertion names, and the page chem-core's
+  // bare-id op acted on (its first occurrence). A same-id object on another page is never "touched".
   const touched = new Set<string>();
+  const touchedRefs: PageObjectRef[] = [];
+  const touch = (pageId: string | undefined, objectId: string) => {
+    if (pageId === undefined || touched.has(`${pageId}\u0000${objectId}`)) return;
+    touched.add(`${pageId}\u0000${objectId}`);
+    touchedRefs.push({ pageId, objectId });
+  };
   for (const op of writePatchOps(proposed.patch)) {
     switch (op.op) {
-      case "addObject": touched.add(op.object.id); break;
-      case "addAnnotation": touched.add(op.annotation.id); break;
+      case "addObject": touch(op.pageId, op.object.id); break;
+      case "addAnnotation": touch(op.pageId, op.annotation.id); break;
       case "updateObject":
       case "moveObject":
-      case "reorderObject": touched.add(op.objectId); break;
-      case "setObjectOrder": op.objectIds.forEach((id) => touched.add(id)); break;
+      case "reorderObject": touch(bareIdTargetPage(patched, op.objectId), op.objectId); break;
+      case "setObjectOrder": op.objectIds.forEach((id) => touch(op.pageId, id)); break;
     }
   }
   const objectIds = patched.pages.flatMap((page) =>
-    page.objects.filter((object) => touched.has(object.id)).map((object) => object.id)
+    page.objects.filter((object) => touched.has(`${page.id}\u0000${object.id}`)).map((object) => object.id)
   );
 
   let selected = patched;
   if (objectIds.length > 0) {
-    const page = patched.pages.find((candidate) =>
-      objectIds.every((objectId) => candidate.objects.some((object) => object.id === objectId))
-    );
+    const page = patched.pages.find((candidate) => touchedRefs.every((ref) => ref.pageId === candidate.id));
     if (page) {
       selected = applyPatch(
         patched,
