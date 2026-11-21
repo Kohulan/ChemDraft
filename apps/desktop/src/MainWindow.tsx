@@ -1836,7 +1836,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.20.17.30-codex";
+const CURRENT_BUILD_STAMP = "11.20.20.00-codex";
 const TABLE_DRAFT_RECOVERY_WARNING = "session.tableDraftDropped";
 
 function clearTableDraftRecoveryWarnings(report: OpenWarningsReport | undefined): OpenWarningsReport | undefined {
@@ -2555,6 +2555,7 @@ export function MainWindow({
   const [documentTabs, setDocumentTabs] = useState([{ id: "initial", title: initialDocument?.title ?? "Untitled" }]);
   const [activeDocumentTabId, setActiveDocumentTabId] = useState("initial");
   const documentTabListRef = useRef<HTMLDivElement>(null);
+  const documentTabScrollLeftRef = useRef(0);
   const documentTabsRef = useRef(documentTabs);
   documentTabsRef.current = documentTabs;
   const pluginRuntimeRef = useRef<DesktopPluginRuntime | undefined>(undefined);
@@ -10239,6 +10240,22 @@ export function MainWindow({
     savedDocumentsRef.current.delete(id);
     nonPristineTabsRef.current.delete(id);
     browserFileKeysRef.current.delete(id);
+    const strip = documentTabListRef.current;
+    if (strip) {
+      if (strip.scrollLeft > 0) {
+        // Include tabs whose removal React has queued but whose elements are still in the strip.
+        const remainingIds = new Set(remaining.map((tab) => tab.id));
+        const renderedTabs = Array.from(strip.querySelectorAll<HTMLElement>("[data-document-tab-id]"));
+        const closingTabs = renderedTabs.filter((tab) => !remainingIds.has(tab.dataset.documentTabId!));
+        const gap = Number.parseFloat(window.getComputedStyle(strip).columnGap) || 0;
+        const removedGaps = Math.min(closingTabs.length, Math.max(0, renderedTabs.length - 1));
+        const removedWidth = closingTabs.reduce((width, tab) => width + tab.offsetWidth, 0) + removedGaps * gap;
+        const target = Math.max(0, strip.scrollWidth - removedWidth - strip.clientWidth);
+        // Scroll while the old range is still available, before WebKit can clamp the offset.
+        if (target < strip.scrollLeft) strip.scrollLeft = target;
+      }
+      documentTabScrollLeftRef.current = strip.scrollLeft;
+    }
     documentTabsRef.current = remaining;
     setDocumentTabs(remaining);
     setCloseTabPrompt(undefined);
@@ -10270,27 +10287,35 @@ export function MainWindow({
     const strip = documentTabListRef.current;
     if (!strip) return;
 
-    const commitScrollLeft = () => {
-      const maxScrollLeft = Math.max(0, strip.scrollWidth - strip.clientWidth);
-      // WebKit can report the clamped position while a non-key window still draws the old one.
-      // Re-assert the offset even if the DOM already reports it.
-      strip.scrollLeft = clamp(strip.scrollLeft, 0, maxScrollLeft);
-      return maxScrollLeft;
+    const maxScrollLeft = Math.max(0, strip.scrollWidth - strip.clientWidth);
+    const revealActiveTab = () => {
+      const activeTab = strip.querySelector<HTMLElement>('.document-tab[data-active="true"]');
+      if (maxScrollLeft > 0 && activeTab) {
+        const tabRect = activeTab.getBoundingClientRect();
+        const stripLeft = strip.getBoundingClientRect().left + strip.clientLeft;
+        const stripRight = stripLeft + strip.clientWidth;
+        // Use the nearest edge, or align the start of a tab wider than the strip.
+        const delta = Math.min(tabRect.left - stripLeft, Math.max(0, tabRect.right - stripRight));
+        const target = clamp(strip.scrollLeft + delta, 0, maxScrollLeft);
+        if (target !== strip.scrollLeft) strip.scrollLeft = target;
+      }
+      documentTabScrollLeftRef.current = strip.scrollLeft;
     };
 
-    const maxScrollLeft = commitScrollLeft();
-    const activeTab = strip.querySelector<HTMLElement>('.document-tab[data-active="true"]');
-    if (maxScrollLeft > 0 && activeTab) {
-      const tabRect = activeTab.getBoundingClientRect();
-      const stripLeft = strip.getBoundingClientRect().left + strip.clientLeft;
-      const stripRight = stripLeft + strip.clientWidth;
-      // Use the nearest edge, or align the start of a tab wider than the strip.
-      const delta = Math.min(tabRect.left - stripLeft, Math.max(0, tabRect.right - stripRight));
-      if (delta !== 0) strip.scrollLeft = clamp(strip.scrollLeft + delta, 0, maxScrollLeft);
+    // WebKit can report a clamped offset while drawing a non-key window at the old one.
+    // When there is still room to scroll, move away from the clamp and back on the next frame.
+    if (maxScrollLeft === 0 || documentTabScrollLeftRef.current <= maxScrollLeft) {
+      revealActiveTab();
+      return;
     }
-
-    window.addEventListener("focus", commitScrollLeft);
-    return () => window.removeEventListener("focus", commitScrollLeft);
+    const nudge = Math.max(0, maxScrollLeft - 1);
+    if (strip.scrollLeft !== nudge) strip.scrollLeft = nudge;
+    documentTabScrollLeftRef.current = strip.scrollLeft;
+    const frame = window.requestAnimationFrame(() => {
+      if (strip.scrollLeft !== maxScrollLeft) strip.scrollLeft = maxScrollLeft;
+      revealActiveTab();
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, [activeDocumentTabId, documentTabOrder]);
 
   useLayoutEffect(() => {
@@ -23079,13 +23104,14 @@ export function MainWindow({
       ) : null}
       <section className="workspace workspace-with-tabs">
         <div className="document-tab-strip">
-          <div ref={documentTabListRef} className="document-tab-list" role="tablist" aria-label="Open documents">
+          <div ref={documentTabListRef} className="document-tab-list" role="tablist" aria-label="Open documents"
+            onScroll={(event) => { documentTabScrollLeftRef.current = event.currentTarget.scrollLeft; }}>
             {documentTabs.map((tab) => {
               const active = tab.id === activeDocumentTabId;
               const file = active ? fileState : documentTabSnapshotsRef.current.get(tab.id)?.file;
               const title = file?.path ? nativePathBasename(file.path) : tab.title;
               return (
-                <div className="document-tab" key={tab.id} data-active={active}>
+                <div className="document-tab" key={tab.id} data-document-tab-id={tab.id} data-active={active}>
                   <button type="button" role="tab" aria-selected={active}
                     title={title} onClick={() => void invoke(activateDocumentTabCommandId(tab.id))}>
                     <span>{title}</span>{file?.dirty ? <span aria-label="Unsaved changes"> •</span> : null}

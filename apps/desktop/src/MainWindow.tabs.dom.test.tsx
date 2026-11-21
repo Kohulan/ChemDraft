@@ -1804,7 +1804,7 @@ describe("documents in one window", () => {
   });
 
   describe("overflowing document tab strip", () => {
-    async function openOverflowingTabs(browserClampsScroll = false) {
+    async function openOverflowingTabs(clientWidthAfterClose = 230) {
       for (const name of ["First drawing", "Second drawing", "Third drawing", "Fourth drawing"]) {
         await open(name);
       }
@@ -1813,66 +1813,110 @@ describe("documents in one window", () => {
 
       const strip = container.querySelector<HTMLDivElement>(".document-tab-list")!;
       const tabWidth = 150;
-      const clientWidth = 230;
+      const tabGap = 2;
+      strip.style.columnGap = `${tabGap}px`;
+      const clientWidth = () => strip.childElementCount === 4 ? 230 : clientWidthAfterClose;
       const stripLeft = 24;
-      const scrollWidth = () => strip.childElementCount * tabWidth;
-      const maxScrollLeft = () => scrollWidth() - clientWidth;
+      const scrollWidth = () => strip.childElementCount * (tabWidth + tabGap) - tabGap;
+      const maxScrollLeft = () => Math.max(0, scrollWidth() - clientWidth());
       let scrollLeft = maxScrollLeft();
-      const writeScrollLeft = vi.fn((left: number) => { scrollLeft = left; });
+      const writes: { from: number; to: number; tabCount: number }[] = [];
       Object.defineProperties(strip, {
-        clientWidth: { value: clientWidth },
+        clientWidth: { get: clientWidth },
         scrollWidth: { get: scrollWidth },
         scrollLeft: {
-          get: () => browserClampsScroll ? Math.min(scrollLeft, maxScrollLeft()) : scrollLeft,
-          set: writeScrollLeft
+          get: () => Math.min(scrollLeft, maxScrollLeft()),
+          set: vi.fn((left: number) => {
+            writes.push({ from: strip.scrollLeft, to: left, tabCount: strip.childElementCount });
+            scrollLeft = Math.min(left, maxScrollLeft());
+          })
         }
       });
-      vi.spyOn(strip, "getBoundingClientRect").mockImplementation(() => new DOMRect(stripLeft, 0, clientWidth, 24));
+      vi.spyOn(strip, "getBoundingClientRect").mockImplementation(() => new DOMRect(stripLeft, 0, clientWidth(), 24));
       for (const tab of strip.children) {
+        Object.defineProperty(tab, "offsetWidth", { value: tabWidth });
         vi.spyOn(tab, "getBoundingClientRect").mockImplementation(() => {
           const index = Array.from(strip.children).indexOf(tab);
-          return new DOMRect(stripLeft + index * tabWidth - strip.scrollLeft, 0, tabWidth, 24);
+          return new DOMRect(stripLeft + index * (tabWidth + tabGap) - strip.scrollLeft, 0, tabWidth, 24);
         });
       }
-      return { strip, writeScrollLeft };
+      await act(async () => strip.dispatchEvent(new Event("scroll")));
+      return { strip, writes };
     }
 
-    it.each([false, true])("commits the clamped offset after closing the last active tab (browser already clamped: %s)", async (browserClampsScroll) => {
-      const { strip, writeScrollLeft } = await openOverflowingTabs(browserClampsScroll);
+    it.each(["×", "Cmd+W", "Ctrl+W"] as const)(
+      "scrolls before removing the last active tab via %s",
+      async (route) => {
+        if (route !== "×") await mountForShortcutPlatform(route === "Cmd+W" ? "macos" : "windows");
+        const { strip, writes } = await openOverflowingTabs();
+        if (route === "×") {
+          await closeTab();
+        } else {
+          const event = new KeyboardEvent("keydown", {
+            key: "w", metaKey: route === "Cmd+W", ctrlKey: route === "Ctrl+W",
+            bubbles: true, cancelable: true
+          });
+          await act(async () => window.dispatchEvent(event));
+          expect(event.defaultPrevented).toBe(true);
+        }
+
+        expect(tabs()).toHaveLength(3);
+        expect(active()).toBe(2);
+        expect(writes).toEqual([{ from: 376, to: 224, tabCount: 4 }]);
+        expect(strip.scrollLeft).toBe(224);
+        const activeTabRect = strip.querySelector('[data-active="true"]')!.getBoundingClientRect();
+        const stripRect = strip.getBoundingClientRect();
+        expect(activeTabRect.left).toBeGreaterThanOrEqual(stripRect.left);
+        expect(activeTabRect.right).toBeLessThanOrEqual(stripRect.right);
+      }
+    );
+
+    it("accounts for both closing tabs when React batches the removals", async () => {
+      const { strip, writes } = await openOverflowingTabs();
+      const buttons = strip.querySelectorAll<HTMLButtonElement>(".document-tab-close");
+      await act(async () => {
+        buttons[3]!.click();
+        buttons[2]!.click();
+      });
+
+      expect(tabs()).toHaveLength(2);
+      expect(writes).toEqual([
+        { from: 376, to: 224, tabCount: 4 },
+        { from: 224, to: 72, tabCount: 4 }
+      ]);
+    });
+
+    it("nudges the offset and restores it next frame if removal still clamps the strip", async () => {
+      // The strip gains room after removal, so the browser clamps below the measured target.
+      const { strip, writes } = await openOverflowingTabs(250);
+      vi.useFakeTimers({ toFake: ["requestAnimationFrame", "cancelAnimationFrame"] });
       await closeTab();
 
       expect(tabs()).toHaveLength(3);
-      expect(active()).toBe(2);
-      expect(writeScrollLeft).toHaveBeenCalledWith(220);
-      expect(strip.scrollLeft).toBe(220);
-      const activeTabRect = strip.querySelector('[data-active="true"]')!.getBoundingClientRect();
-      const stripRect = strip.getBoundingClientRect();
-      expect(activeTabRect.left).toBeGreaterThanOrEqual(stripRect.left);
-      expect(activeTabRect.right).toBeLessThanOrEqual(stripRect.right);
+      expect(writes.filter(({ tabCount }) => tabCount === 3)).toEqual([{ from: 204, to: 203, tabCount: 3 }]);
+      expect(strip.scrollLeft).toBe(203);
+
+      await act(async () => vi.advanceTimersToNextFrame());
+
+      expect(writes).toEqual([
+        { from: 376, to: 224, tabCount: 4 },
+        { from: 204, to: 203, tabCount: 3 },
+        { from: 203, to: 204, tabCount: 3 }
+      ]);
+      expect(strip.scrollLeft).toBe(204);
     });
 
     it("reveals the active tab when closing an inactive tab shrinks the strip", async () => {
-      const { strip, writeScrollLeft } = await openOverflowingTabs();
+      const { strip, writes } = await openOverflowingTabs();
       await activate(0);
-      strip.scrollLeft = 370;
-      writeScrollLeft.mockClear();
+      strip.scrollLeft = 376;
+      writes.length = 0;
 
       await closeTab(3);
 
       expect(active()).toBe(0);
-      expect(writeScrollLeft).toHaveBeenCalledWith(220);
+      expect(writes).toContainEqual({ from: 376, to: 224, tabCount: 4 });
       expect(strip.scrollLeft).toBe(0);
-    });
-
-    it("re-asserts the offset on window focus even if it is already clamped", async () => {
-      const { strip, writeScrollLeft } = await openOverflowingTabs(true);
-      await closeTab();
-      expect(strip.scrollLeft).toBe(220);
-      writeScrollLeft.mockClear();
-
-      await act(async () => window.dispatchEvent(new FocusEvent("focus")));
-
-      expect(writeScrollLeft).toHaveBeenCalledExactlyOnceWith(220);
     });
 
     it("activates the clicked tab by id after closing the last active tab", async () => {
