@@ -1804,45 +1804,139 @@ describe("documents in one window", () => {
   });
 
   describe("overflowing document tab strip", () => {
-    async function openOverflowingTabs(clientWidthAfterClose = 230) {
-      for (const name of ["First drawing", "Second drawing", "Third drawing", "Fourth drawing"]) {
-        await open(name);
+    const list = () => container.querySelector<HTMLDivElement>(".document-tab-list")!;
+    async function openOverflowingTabs(clientWidthAfterClose = 230, strategy: "current" | "remount" | "transform" | "toggle" | "default" = "current") {
+      if (strategy !== "default") {
+        localStorage.setItem("chemdraft.debug.tabStripStrategy", strategy);
+        vi.mocked(createPluginRuntime).mockClear();
+        await remount();
       }
+
+      // Prototype geometry also applies to tabs added later and to replacement scrolling nodes.
+      const tabWidth = 150;
+      const gap = 2;
+      const tabCount = (row: Element) => row.querySelectorAll(".document-tab").length;
+      const scrollWidth = (row: Element) => Math.max(0, tabCount(row) * (tabWidth + gap) - gap);
+      const stripLeft = 24;
+      vi.spyOn(HTMLDivElement.prototype, "clientWidth", "get").mockImplementation(function (this: HTMLDivElement) {
+        if (!this.matches(".document-tab-list")) return 0;
+        return tabCount(this) === 4 ? 230 : clientWidthAfterClose;
+      });
+      vi.spyOn(HTMLDivElement.prototype, "scrollWidth", "get").mockImplementation(function (this: HTMLDivElement) {
+        return this.matches(".document-tab-list, .document-tab-track") ? scrollWidth(this) : 0;
+      });
+      vi.spyOn(HTMLDivElement.prototype, "offsetWidth", "get").mockImplementation(function (this: HTMLDivElement) {
+        return this.matches(".document-tab") ? tabWidth : this.clientWidth;
+      });
+      const positions = new WeakMap<Element, number>();
+      const writes: { from: number; to: number; tabCount: number }[] = [];
+      vi.spyOn(HTMLDivElement.prototype, "scrollLeft", "get").mockImplementation(function (this: HTMLDivElement) {
+        const left = positions.get(this) ?? 0;
+        return this.matches(".document-tab-list") ? Math.min(left, Math.max(0, this.scrollWidth - this.clientWidth)) : left;
+      });
+      vi.spyOn(HTMLDivElement.prototype, "scrollLeft", "set").mockImplementation(function (this: HTMLDivElement, to: number) {
+        if (this.matches(".document-tab-list")) writes.push({ from: this.scrollLeft, to, tabCount: tabCount(this) });
+        positions.set(this, to);
+      });
+      const bounds = HTMLDivElement.prototype.getBoundingClientRect;
+      vi.spyOn(HTMLDivElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLDivElement) {
+        if (this.matches(".document-tab-list")) return new DOMRect(stripLeft, 0, this.clientWidth, 24);
+        if (!this.matches(".document-tab")) return bounds.call(this);
+        const strip = this.closest<HTMLElement>(".document-tab-list")!;
+        const row = this.parentElement!;
+        const translation = Number.parseFloat(row.style.transform.replace("translateX(", "")) || 0;
+        const index = Array.from(row.children).indexOf(this);
+        return new DOMRect(stripLeft + index * (tabWidth + gap) + translation - strip.scrollLeft, 0, tabWidth, 24);
+      });
+      (list().querySelector<HTMLElement>(".document-tab-track") ?? list()).style.columnGap = `${gap}px`;
+      for (const name of ["First drawing", "Second drawing", "Third drawing", "Fourth drawing"]) await open(name);
       expect(tabs()).toHaveLength(4);
       expect(active()).toBe(3);
-
-      const strip = container.querySelector<HTMLDivElement>(".document-tab-list")!;
-      const tabWidth = 150;
-      const tabGap = 2;
-      strip.style.columnGap = `${tabGap}px`;
-      const clientWidth = () => strip.childElementCount === 4 ? 230 : clientWidthAfterClose;
-      const stripLeft = 24;
-      const scrollWidth = () => strip.childElementCount * (tabWidth + tabGap) - tabGap;
-      const maxScrollLeft = () => Math.max(0, scrollWidth() - clientWidth());
-      let scrollLeft = maxScrollLeft();
-      const writes: { from: number; to: number; tabCount: number }[] = [];
-      Object.defineProperties(strip, {
-        clientWidth: { get: clientWidth },
-        scrollWidth: { get: scrollWidth },
-        scrollLeft: {
-          get: () => Math.min(scrollLeft, maxScrollLeft()),
-          set: vi.fn((left: number) => {
-            writes.push({ from: strip.scrollLeft, to: left, tabCount: strip.childElementCount });
-            scrollLeft = Math.min(left, maxScrollLeft());
-          })
-        }
-      });
-      vi.spyOn(strip, "getBoundingClientRect").mockImplementation(() => new DOMRect(stripLeft, 0, clientWidth(), 24));
-      for (const tab of strip.children) {
-        Object.defineProperty(tab, "offsetWidth", { value: tabWidth });
-        vi.spyOn(tab, "getBoundingClientRect").mockImplementation(() => {
-          const index = Array.from(strip.children).indexOf(tab);
-          return new DOMRect(stripLeft + index * (tabWidth + tabGap) - strip.scrollLeft, 0, tabWidth, 24);
-        });
-      }
-      await act(async () => strip.dispatchEvent(new Event("scroll")));
-      return { strip, writes };
+      writes.length = 0;
+      return { strip: list(), writes };
     }
+
+    it("remounts after the scroll range shrinks and restores the offset and focused button on window focus", async () => {
+      const { strip, writes } = await openOverflowingTabs(250, "remount");
+      expect(strip.scrollLeft).toBe(376);
+      await closeTab();
+      const replacement = list();
+      expect(replacement).not.toBe(strip);
+      expect(writes).toContainEqual({ from: 0, to: 204, tabCount: 3 });
+      expect(replacement.scrollLeft).toBe(204);
+
+      tabs()[1]!.focus({ preventScroll: true });
+      replacement.scrollLeft = 120;
+      vi.useFakeTimers({ toFake: ["requestAnimationFrame", "cancelAnimationFrame"] });
+      await act(async () => {
+        window.dispatchEvent(new FocusEvent("focus"));
+        vi.advanceTimersToNextFrame();
+      });
+      expect(list()).not.toBe(replacement);
+      expect(list().scrollLeft).toBe(120);
+      expect(document.activeElement).toBe(tabs()[1]);
+    });
+
+    it.each(["default", "transform"] as const)("keeps new, activated and cycled tabs in view using the %s transform offset", async strategy => {
+      const { strip, writes } = await openOverflowingTabs(250, strategy);
+      const track = strip.querySelector<HTMLElement>(".document-tab-track")!;
+      expect(track.style.transform).toBe("translateX(-376px)");
+      const movement = vi.spyOn(track.style, "transform", "set");
+      await closeTab();
+      expect(movement.mock.calls.map(([value]) => value)).toEqual(["translateX(-224px)", "translateX(-204px)"]);
+      expect(track.style.transform).toBe("translateX(-204px)");
+      expect(active()).toBe(2);
+
+      await key();
+      expect(active()).toBe(0);
+      expect(track.style.transform).toBe("translateX(0px)");
+      await key(true);
+      expect(active()).toBe(2);
+      expect(track.style.transform).toBe("translateX(-204px)");
+      await activate(1);
+      expect(bridge().snapshot().document.title).toBe("Second drawing");
+      expect(track.style.transform).toBe("translateX(-152px)");
+      expect(writes).toEqual([]);
+    });
+
+    it("uses horizontal wheel input first, accepts vertical input, and releases the wheel at either edge", async () => {
+      const { strip } = await openOverflowingTabs(230, "transform");
+      const track = strip.querySelector<HTMLElement>(".document-tab-track")!;
+      const wheel = (deltaX: number, deltaY: number, deltaMode = 0) => {
+        const event = new WheelEvent("wheel", { deltaX, deltaY, deltaMode, bubbles: true, cancelable: true });
+        track.dispatchEvent(event);
+        return event.defaultPrevented;
+      };
+      expect(wheel(1, 0)).toBe(false);
+      expect(wheel(-23.5, 80)).toBe(true);
+      expect(track.style.transform).toBe("translateX(-352.5px)");
+      expect(wheel(0, -1000)).toBe(true);
+      expect(track.style.transform).toBe("translateX(0px)");
+      expect(wheel(0, -1)).toBe(false);
+      expect(wheel(0, 1, WheelEvent.DOM_DELTA_PAGE)).toBe(true);
+      expect(track.style.transform).toBe("translateX(-230px)");
+      await act(async () => tabs()[0]!.focus());
+      expect(track.style.transform).toBe("translateX(0px)");
+      expect(active()).toBe(3);
+    });
+
+    it("toggles overflow around forced layout after removal and reapplies the clamped offset next frame", async () => {
+      const { strip, writes } = await openOverflowingTabs(250, "toggle");
+      const forcedLayout = vi.fn(() => {
+        expect(strip.style.overflowX).toBe("hidden");
+        expect(tabs()).toHaveLength(3);
+        return strip.clientWidth;
+      });
+      Object.defineProperty(strip, "offsetWidth", { get: forcedLayout });
+      vi.useFakeTimers({ toFake: ["requestAnimationFrame", "cancelAnimationFrame"] });
+      await closeTab();
+      expect(forcedLayout).toHaveBeenCalledOnce();
+      expect(list()).toBe(strip);
+      expect(strip.style.overflowX).toBe("auto");
+      expect(writes).toEqual([]);
+      await act(async () => vi.advanceTimersToNextFrame());
+      expect(writes).toEqual([{ from: 204, to: 204, tabCount: 3 }]);
+    });
 
     it.each(["×", "Cmd+W", "Ctrl+W"] as const)(
       "scrolls before removing the last active tab via %s",

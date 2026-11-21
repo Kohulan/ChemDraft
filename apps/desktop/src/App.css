@@ -757,12 +757,30 @@ textarea:focus-visible,
   border-bottom: 1px solid var(--cd-border);
 }
 
-.document-tab-list {
+.document-tab-list,
+.document-tab-track {
   display: flex;
-  flex: 0 1 auto;
   gap: 2px;
+}
+
+.document-tab-list {
+  flex: 0 1 auto;
   min-width: 0;
   overflow-x: auto;
+}
+
+.document-tab-list[data-strategy="transform"] {
+  overflow: hidden;
+}
+
+.document-tab-clip {
+  /* Give focus navigation no native scroll range inside the hidden viewport. */
+  min-width: 0;
+  overflow: clip;
+}
+
+.document-tab-track {
+  width: max-content;
 }
 
 .document-tab-new {
