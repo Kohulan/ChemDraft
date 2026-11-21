@@ -11,7 +11,7 @@ inputs:
     description: x11 or wayland
     required: true
   native-wayland:
-    description: Set to 1 to exercise the native Wayland opt-out under Weston
+    description: Set to 1 to exercise native Wayland under Weston
     default: '0'
   logs:
     description: Directory for display, app, and process logs
@@ -142,7 +142,11 @@ runs:
 
         if [[ "$backend" == wayland ]]; then
           export WAYLAND_DISPLAY=chemdraft-smoke
-          weston --backend=headless --renderer=pixman --shell=kiosk-shell.so --xwayland \
+          weston_args=()
+          if [[ "$native_wayland" != 1 || "$package" == deb ]]; then
+            weston_args+=(--xwayland)
+          fi
+          weston --backend=headless --renderer=pixman --shell=kiosk-shell.so "${weston_args[@]}" \
             --socket="$WAYLAND_DISPLAY" --idle-time=0 > "$logs/display.log" 2>&1 &
           ready="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
         else
@@ -166,8 +170,12 @@ runs:
         if [[ "$backend" == x11 ]]; then
           export GDK_BACKEND=x11
         elif [[ "$native_wayland" == 1 ]]; then
-          export CHEMDRAFT_NATIVE_WAYLAND=1
-          echo 'Testing the native Wayland opt-out with only the Wayland display available.'
+          if [[ "$package" == deb ]]; then
+            export CHEMDRAFT_NATIVE_WAYLAND=1
+            echo 'Testing the native Wayland opt-out with only the Wayland display available.'
+          else
+            echo 'Testing the AppImage backend default under Weston without XWayland.'
+          fi
         else
           for _ in {1..20}; do
             display=$(sed -n 's/.*xserver listening on display \(:[0-9][0-9]*\).*/\1/p' "$logs/display.log" | tail -n 1)
@@ -198,8 +206,11 @@ runs:
           fi
         fi
         command=("$bundle")
+        launch_dir=$PWD
         if [[ "$package" == appimage ]]; then
           command+=(--appimage-extract-and-run)
+          launch_dir="$work/launch folder"
+          mkdir "$launch_dir"
         fi
         report_egl_error() {
           if grep -qE 'Could not create default EGL display|EGL_BAD_PARAMETER.*Aborting|Aborting.*EGL_BAD_PARAMETER' "$logs/chemdraft.log"; then
@@ -247,8 +258,13 @@ runs:
         web_process_running() {
           launched_pid -f '(^|/)WebKitWebProcess([[:space:]:]|$)' >/dev/null
         }
-        setsid strace -f -e trace=execve -s 256 -o "$logs/process.log" "${command[@]}" \
-          > "$logs/chemdraft.log" 2>&1 &
+        (
+          cd "$launch_dir"
+          if [[ "$package" == appimage ]]; then
+            export OWD="$PWD"
+          fi
+          exec setsid strace -f -e trace=execve -s 256 -o "$logs/process.log" "${command[@]}"
+        ) > "$logs/chemdraft.log" 2>&1 &
         launcher_pid=$!
         for _ in {1..60}; do
           kill -0 "$launcher_pid" 2>/dev/null || fail 'ChemDraft or its tracer exited during startup'
@@ -262,6 +278,47 @@ runs:
         if ! app_environment=$(tr '\0' '\n' < "/proc/$main_pid/environ"); then
           echo "::error::Could not read ChemDraft process environment at /proc/$main_pid/environ"
           exit 1
+        fi
+        if [[ "$package" == appimage ]]; then
+          app_env_value() { sed -n "s/^$1=//p" <<< "$app_environment"; }
+          appdir=$(app_env_value APPDIR)
+          webkit_dir=$(app_env_value WEBKIT_EXEC_PATH)
+          injected_dir=$(app_env_value WEBKIT_INJECTED_BUNDLE_PATH)
+          gtk_hook="$appdir/apprun-hooks/linuxdeploy-plugin-gtk.sh"
+          [[ "$appdir" == /* && -f "$gtk_hook" ]] || fail 'Could not find the extracted AppImage GTK hook'
+          for backend_value in unset wayland; do
+            if ! (
+              set +u # The generated GTK hook reads optional environment variables.
+              export APPDIR="$appdir"
+              unset GDK_BACKEND
+              if [[ "$backend_value" != unset ]]; then
+                export GDK_BACKEND="$backend_value"
+              fi
+              source "$gtk_hook"
+              [[ "${GDK_BACKEND-unset}" == "$backend_value" ]]
+            ); then
+              fail "The AppImage GTK hook changed GDK_BACKEND from $backend_value"
+            fi
+          done
+          [[ "$webkit_dir" == "$appdir/"* && "$injected_dir" == "$appdir/"* &&
+            -f "$injected_dir/libwebkit2gtkinjectedbundle.so" ]] \
+            || fail 'WebKit helper or injected bundle directory is missing or outside APPDIR'
+          for variable in GIO_MODULE_DIR GIO_EXTRA_MODULES; do
+            module_dir=$(app_env_value "$variable")
+            [[ -z "$module_dir" || ( "$module_dir" == "$appdir/"* && -d "$module_dir" ) ]] \
+              || fail "$variable is missing its bundled directory"
+          done
+          if [[ "${GDK_BACKEND+x}" ]]; then
+            grep -Fxq "GDK_BACKEND=$GDK_BACKEND" <<< "$app_environment" \
+              || fail 'The AppImage changed the caller’s GDK_BACKEND'
+          elif grep -q '^GDK_BACKEND=' <<< "$app_environment"; then
+            fail 'The AppImage set GDK_BACKEND before ChemDraft starts'
+          fi
+          [[ $(readlink "/proc/$main_pid/cwd") == "$(realpath "$launch_dir")" ]] \
+            || fail 'The primary AppImage instance did not keep the caller’s working directory'
+          for helper in WebKitWebProcess WebKitNetworkProcess; do
+            [[ -x "$webkit_dir/$helper" ]] || fail "The AppImage is missing $helper"
+          done
         fi
         echo 'Display environment inherited by ChemDraft:'
         grep -E '^(EGL_PLATFORM|GDK_BACKEND|WAYLAND_DISPLAY|DISPLAY|CHEMDRAFT_NATIVE_WAYLAND)=' <<< "$app_environment" || true
@@ -300,5 +357,12 @@ runs:
         fi
         web_process_running || fail 'No WebKitWebProcess was alive at the end of the smoke test'
         window_ready || fail 'No ChemDraft window was visible at the end of the smoke test'
+        if [[ "$package" == appimage ]]; then
+          for helper in WebKitWebProcess WebKitNetworkProcess; do
+            grep -Fq "execve(\"$webkit_dir/$helper\"," "$logs/process.log" \
+              || fail "$helper was not launched by its absolute AppImage path"
+          done
+          echo 'AppImage GTK settings, WebKit paths and working directory passed.'
+        fi
         echo 'ChemDraft started WebKitWebProcess and stayed alive for 20 seconds.'
         SMOKE

@@ -7,9 +7,11 @@ on:
       - .github/workflows/linux-release.yml
       - .github/workflows/linux-package-smoke/**
       - apps/desktop/src-tauri/src/main.rs
+      - apps/desktop/src-tauri/src/linux_startup.rs
       - apps/desktop/src-tauri/tauri.conf.json
       - apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu
       - scripts/build-opsin-runtime.mjs
+      - scripts/appimage-webkit-path.c
       - scripts/desktop-tauri.mjs
       - tools/release/verify-bundle-licenses.mjs
       - tools/release/record-build.mjs
@@ -73,9 +75,11 @@ jobs:
             package: deb
             backend: wayland
             native_wayland: '1'
-          # The AppImage cannot run natively on Wayland: linuxdeploy-plugin-gtk's AppRun hook
-          # always exports GDK_BACKEND=x11 before ChemDraft starts, so it always uses XWayland.
-          # Native Wayland is covered by the .deb job.
+          - distro: debian
+            image: debian:sid
+            package: appimage
+            backend: wayland
+            native_wayland: '1'
     container:
       image: ${{ matrix.image }}
       # strace needs ptrace and glycin's bubblewrap needs user namespaces.
@@ -146,7 +150,7 @@ jobs:
           install -d -m 1777 /tmp/.X11-unix
 
       # Xvfb catches missing libraries and baseline startup failures in both packages. Weston
-      # exercises the XWayland default and native Wayland launches of both packages with the opt-out.
+      # exercises the XWayland default, the .deb opt-out, and the AppImage without XWayland.
       # Both virtual displays exercise WebKit startup on newer host libraries without a GPU.
       - name: Launch and watch the WebKit process
         uses: ./.github/workflows/linux-package-smoke

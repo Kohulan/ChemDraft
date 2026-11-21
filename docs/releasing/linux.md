@@ -43,6 +43,9 @@ The workflow:
    under `usr/lib` and rejects bundled `libEGL*`, `libGL.so*`, `libGLX*`, `libOpenGL.so*`,
    `libGLESv1_CM.so*`, `libGLESv2.so*`, `libGLU.so*`, `libGLdispatch*`, `libgbm*`, `libdrm*`,
    `libglapi*`, `*_dri.so`, `libvulkan*`, and any `dri` directory or symlink.
+   The repack lets ChemDraft select the GTK backend and sets absolute WebKit and bundled GIO
+   paths in the AppRun hook. An AppImage-only adapter uses that WebKit directory for helper
+   launches because release WebKitGTK uses compiled-in paths.
 6. Records the source commit and final bytes of each package, then stages the packages, records,
    and checksums as the `linux-release-amd64` workflow artifact.
 7. Runs independent smoke jobs on **Ubuntu 22.04 and 24.04**. Each downloads and verifies the same
@@ -67,6 +70,9 @@ start and a ChemDraft window appears within 60 seconds. The app must stay up for
 with a visible window and live web process at the end. A WebKit web process crash or app panic fails
 the check. The harness matches processes and windows to the active launch by process ancestry.
 The smoke test also reports EGL display initialization failures and logs the display backend settings.
+For the AppImage, it checks that the extracted GTK hook preserves the caller's backend, the
+exported paths point inside the extraction, and both WebKit helpers launch by absolute path while
+ChemDraft runs from the caller's directory.
 
 The `linux-smoke-amd64-ubuntu-22.04` and `linux-smoke-amd64-ubuntu-24.04` artifacts preserve
 package setup, library versions, display, app, and process logs even when smoke fails. The harness
@@ -104,7 +110,8 @@ libgpg-error as a desktop system would. Debian installs the
 .deb with apt and Fedora extracts its payload and runs it with Fedora's libraries. Each job
 uploads display, app, and process logs. These tests cover startup and subprocess crashes. GPU
 rendering still needs a desktop check. The privileged containers allow `strace` to trace the app
-and glycin's bubblewrap to create user namespaces; Weston enables Xwayland for Wayland smoke tests.
+and glycin's bubblewrap to create user namespaces. Weston runs the AppImage both with and without
+XWayland.
 
 ## Updates
 
@@ -117,19 +124,16 @@ repository on GitHub Pages, or a Flathub listing.
 - On Wayland with a non-empty `DISPLAY`, ChemDraft defaults to XWayland so it can position
   floating toolbars and dialogs. With no X11 display, GTK chooses native Wayland.
   `CHEMDRAFT_NATIVE_WAYLAND=1` skips this default and an explicit `GDK_BACKEND` takes precedence.
-  The generated AppImage GTK hook still sets `GDK_BACKEND=x11` before ChemDraft starts, so that
-  launcher requires X11 or XWayland.
 - Webview: WebKitGTK, origin `tauri://localhost` (as on macOS). Before startup on Linux,
   ChemDraft defaults `WEBKIT_DISABLE_DMABUF_RENDERER` to `1` to avoid Wayland graphics
   problems. An explicit value, including `0`, takes precedence.
   For AppImage launches, an explicit `EGL_PLATFORM` takes precedence. Otherwise, a `GDK_BACKEND`
   starting with `x11` or `wayland` selects that EGL platform. For other or unset backends, ChemDraft
   selects `wayland` when `WAYLAND_DISPLAY` is non-empty and `x11` otherwise.
-- An AppImage resolves document arguments from `OWD` or the user's home folder and
-  resolves relative WebKit path overrides from `APPDIR`. The bundled WebKit in the generated
-  AppImage uses helper paths relative to the mount, so a primary instance restores that
-  working folder before WebKit starts. It forwards the caller's folder when handing off
-  documents to a running instance.
+- An AppImage uses `OWD` or the user's home folder for its working directory and resolves
+  relative document arguments against the original launch folder. A secondary instance forwards
+  the caller's working folder when handing off documents to a running instance. AppRun supplies
+  absolute paths from `APPDIR` for the bundled WebKit helpers.
 - Linux session end uses the same recovery write as File ▸ Exit. The app requests it on SIGTERM,
   SIGINT, SIGHUP, a GNOME session-end notification, or a logind shutdown notification. When
   available, a logind delay inhibitor gives the renderer up to two seconds to confirm the
@@ -147,4 +151,5 @@ repository on GitHub Pages, or a Flathub listing.
   libayatana-appindicator3-dev libsoup-3.0-dev libssl-dev libxdo-dev patchelf`, then
   `node scripts/build-opsin-runtime.mjs` and
   `LD_LIBRARY_PATH=$PWD/apps/desktop/src-tauri/resources/opsin/jre/lib/server APPIMAGE_EXTRACT_AND_RUN=1 NO_STRIP=true pnpm --filter @chemdraft/desktop build --bundles deb,appimage`.
-  The `LD_LIBRARY_PATH` lets linuxdeploy find `libjvm.so` for the bundled OPSIN runtime.
+  The `LD_LIBRARY_PATH` lets linuxdeploy find `libjvm.so` for the bundled OPSIN runtime. Apply the
+  repack step in `linux-release.yml` before launching the AppImage.

@@ -6,7 +6,6 @@ use std::{
 #[cfg(target_os = "linux")]
 pub(super) struct Startup {
     pub(super) documents: Vec<PathBuf>,
-    pub(super) legacy_webkit_cwd: Option<PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
@@ -22,81 +21,37 @@ pub(super) fn configure() -> Startup {
     );
     let owd = env::var_os("OWD");
     let home = dirs::home_dir();
-    let destination = appdir
-        .as_ref()
-        .and_then(|_| user_working_directory(owd.as_deref().map(Path::new), home.as_deref()));
+    let mut launch_folders =
+        user_working_directories(owd.as_deref().map(Path::new), home.as_deref())
+            .filter(|_| appdir.is_some())
+            .peekable();
+    let document_base = launch_folders.peek().copied().or(cwd.as_deref());
     let documents = env::args_os()
         .skip(1)
-        .filter_map(|arg| document_argument(&arg, destination.or(cwd.as_deref())))
+        .filter_map(|arg| document_argument(&arg, document_base))
         .collect();
 
-    let mut legacy_webkit_cwd = None;
-    if let Some(appdir) = appdir {
-        let appdir = appdir.canonicalize().unwrap_or(appdir);
+    if let Some(appdir) = &appdir {
+        let appdir = appdir.canonicalize().unwrap_or_else(|_| appdir.clone());
         env::set_var("APPDIR", &appdir);
-        let bundled_webkit = appdir
-            .join("usr")
-            .join("lib")
-            .join(format!("{}-linux-gnu", env::consts::ARCH))
-            .join("webkit2gtk-4.1");
-        let helper_override = env::var_os("WEBKIT_EXEC_PATH");
-        let has_helper_override = present(helper_override.as_deref());
-        let mut injected_bundle = env::var_os("WEBKIT_INJECTED_BUNDLE_PATH");
-        if injected_bundle.is_none() {
-            let bundled = bundled_webkit
-                .join("injected-bundle")
-                .join("libwebkit2gtkinjectedbundle.so");
-            if bundled.is_file() {
-                injected_bundle = Some(bundled.into_os_string());
-            }
-        }
-        for (variable, value) in [
-            ("WEBKIT_EXEC_PATH", helper_override),
-            ("WEBKIT_INJECTED_BUNDLE_PATH", injected_bundle),
-        ] {
+        for variable in ["WEBKIT_EXEC_PATH", "WEBKIT_INJECTED_BUNDLE_PATH"] {
+            let value = env::var_os(variable);
             if let Some(path) = appimage_path_override(&appdir, value.as_deref()) {
                 env::set_var(variable, path);
             }
         }
-        legacy_webkit_cwd = legacy_webkit_working_directory(
-            cwd.as_deref(),
-            &appdir,
-            bundled_webkit.join("WebKitWebProcess").is_file(),
-            has_helper_override,
-        )
-        .map(Path::to_owned);
-        if let Some(destination) = destination {
-            let fallback =
-                user_working_directory(None, home.as_deref()).filter(|path| *path != destination);
-            for folder in std::iter::once(destination).chain(fallback) {
-                match env::set_current_dir(folder) {
-                    Ok(()) => break,
-                    Err(error) => {
-                        eprintln!(
-                            "ChemDraft: could not enter AppImage launch folder {folder:?}: {error}"
-                        );
-                    }
-                }
+    }
+
+    for folder in launch_folders {
+        match env::set_current_dir(folder) {
+            Ok(()) => break,
+            Err(error) => {
+                eprintln!("ChemDraft: could not enter AppImage launch folder {folder:?}: {error}");
             }
         }
     }
 
-    Startup {
-        documents,
-        legacy_webkit_cwd,
-    }
-}
-
-#[cfg(target_os = "linux")]
-pub(super) fn restore_legacy_webkit_cwd(cwd: Option<&Path>) {
-    // The single-instance plugin has already forwarded the caller's cwd during build().
-    // Tauri creates its first WebKit webview only after the event loop emits Ready.
-    if let Some(cwd) = cwd {
-        match std::env::set_current_dir(cwd) {
-            Ok(()) => eprintln!("ChemDraft: retaining the AppImage working folder for bundled WebKit helpers"),
-            Err(error) => eprintln!("ChemDraft: could not restore the AppImage folder for bundled WebKit helpers: {error}"),
-        }
-    }
+    Startup { documents }
 }
 
 #[cfg(target_os = "linux")]
@@ -196,9 +151,14 @@ fn appimage_root(
     absolute_path(Path::new(root), cwd)
 }
 
-fn user_working_directory<'a>(owd: Option<&'a Path>, home: Option<&'a Path>) -> Option<&'a Path> {
-    owd.filter(|path| path.is_absolute())
-        .or_else(|| home.filter(|path| path.is_absolute()))
+fn user_working_directories<'a>(
+    owd: Option<&'a Path>,
+    home: Option<&'a Path>,
+) -> impl Iterator<Item = &'a Path> {
+    [owd, home.filter(|path| Some(*path) != owd)]
+        .into_iter()
+        .flatten()
+        .filter(|path| path.is_absolute())
 }
 
 fn document_argument(arg: &OsStr, cwd: Option<&Path>) -> Option<PathBuf> {
@@ -211,21 +171,6 @@ fn document_argument(arg: &OsStr, cwd: Option<&Path>) -> Option<PathBuf> {
 fn appimage_path_override(root: &Path, value: Option<&OsStr>) -> Option<PathBuf> {
     let path = Path::new(value.filter(|value| !value.is_empty())?);
     absolute_path(path, Some(root))
-}
-
-fn legacy_webkit_working_directory<'a>(
-    cwd: Option<&'a Path>,
-    root: &Path,
-    bundled_webkit: bool,
-    helper_override: bool,
-) -> Option<&'a Path> {
-    // linuxdeploy's standard WebKit build embeds relative helper paths. An AppImage whose
-    // WebKit supports the absolute override can provide WEBKIT_EXEC_PATH before launch.
-    if bundled_webkit && !helper_override {
-        cwd.filter(|cwd| cwd.starts_with(root))
-    } else {
-        None
-    }
 }
 
 fn appimage_egl_platform(
@@ -334,11 +279,11 @@ mod tests {
         let home = test_root().join("home");
         let name = OsStr::new("drawing.cdxml");
         for (original, expected) in [(Some(owd.as_path()), &owd), (None, &home)] {
-            let folder = user_working_directory(original, Some(&home));
+            let folder = user_working_directories(original, Some(&home)).next();
             assert_eq!(document_argument(name, folder), Some(expected.join(name)));
         }
         assert_eq!(
-            user_working_directory(Some(Path::new("relative")), Some(&home)),
+            user_working_directories(Some(Path::new("relative")), Some(&home)).next(),
             Some(home.as_path())
         );
         let absolute = owd.join("absolute.cdx");
@@ -370,23 +315,15 @@ mod tests {
     }
 
     #[test]
-    fn retain_cwd_for_bundles_with_relative_webkit_helpers() {
-        let appdir = test_root().join("AppDir");
-        let cwd = appdir.join("usr");
+    fn working_directory_candidates_try_owd_then_home_without_duplicates() {
+        let owd = test_root().join("original");
+        let home = test_root().join("home");
+        let folders: Vec<_> = user_working_directories(Some(&owd), Some(&home)).collect();
+        assert_eq!(folders, [owd.as_path(), home.as_path()]);
+        let folders: Vec<_> = user_working_directories(Some(&home), Some(&home)).collect();
+        assert_eq!(folders, [home.as_path()]);
         assert_eq!(
-            legacy_webkit_working_directory(Some(&cwd), &appdir, true, false),
-            Some(cwd.as_path())
-        );
-        assert_eq!(
-            legacy_webkit_working_directory(Some(&cwd), &appdir, true, true),
-            None
-        );
-        assert_eq!(
-            legacy_webkit_working_directory(Some(&cwd), &appdir, false, false),
-            None
-        );
-        assert_eq!(
-            legacy_webkit_working_directory(Some(test_root()), &appdir, true, false),
+            user_working_directories(None, Some(Path::new("relative"))).next(),
             None
         );
     }

@@ -1829,12 +1829,6 @@ pub fn run() {
         ])
         .build(context)
         .expect("error while building ChemDraft");
-    #[cfg(target_os = "linux")]
-    linux_startup::restore_legacy_webkit_cwd(
-        app.state::<linux_startup::Startup>()
-            .legacy_webkit_cwd
-            .as_deref(),
-    );
     #[cfg(target_os = "macos")]
     let app = {
         let mut app = app;
