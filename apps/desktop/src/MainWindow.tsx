@@ -1838,7 +1838,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.21.14.58-sonnet";
+const CURRENT_BUILD_STAMP = "11.21.15.25-sonnet";
 const TABLE_DRAFT_RECOVERY_WARNING = "session.tableDraftDropped";
 
 function clearTableDraftRecoveryWarnings(report: OpenWarningsReport | undefined): OpenWarningsReport | undefined {
@@ -10227,9 +10227,7 @@ export function MainWindow({
     let tabs = documentTabsRef.current;
     const index = tabs.findIndex((tab) => tab.id === id);
     if (index < 0) return;
-    invalidateRequestDocument(id);
     pluginRuntimeRef.current?.closeProposalDocumentTab(id, tabs[index]!.title);
-    void dialogCoordinatorRef.current?.closeTab(id);
     setBrowserTemplates(current => current?.tabId === id ? undefined : current);
     exportGrantsRef.current.delete(id);
     if (browserExportTabRef.current === id) { browserExportTabRef.current = undefined; browserExportSessionRef.current = undefined; setExportDialog(undefined); }
@@ -10243,6 +10241,10 @@ export function MainWindow({
       if (!snapshotDocumentTab()) return;
       installDocumentTab(remaining[Math.min(index, remaining.length - 1)]!.id);
     }
+    // The tab is now really going away (a refused snapshot above leaves it open): only here do a
+    // plugin text prompt bound to it, its request and its dialog windows end as cancelled.
+    invalidateRequestDocument(id);
+    void dialogCoordinatorRef.current?.closeTab(id);
     importedPageFitGateRef.current.dismiss(id);
     documentTabSnapshotsRef.current.delete(id);
     savedDocumentsRef.current.delete(id);
@@ -13243,9 +13245,14 @@ export function MainWindow({
       coordinator: () => dialogCoordinatorRef.current,
       documentTab: documentTabForKey,
       activeTabId: () => activeDocumentTabIdRef.current,
+      tabs: () => documentTabsRef.current,
       onError: setStatus
     });
   }, [documentTabForKey, pluginRuntime.runtime]);
+  // Opening, closing or moving a tab can change which "(tab N)" an open prompt's status line names.
+  useEffect(() => {
+    pluginRuntime.runtime.prompts.activeDocumentChanged();
+  }, [documentTabs, pluginRuntime.runtime]);
   useEffect(() => {
     const runtime = pluginRuntime.runtime;
     runtime.notifyActiveDocumentChanged(requestDocumentKey(activeDocumentTabIdRef.current));
@@ -22900,7 +22907,7 @@ export function MainWindow({
         <PluginPromptTextDialog
           key={pluginRuntime.openTextPrompt.id}
           prompt={pluginRuntime.openTextPrompt}
-          state={(tab => tab ? pluginTextPromptTabState(tab, activeDocumentTabId) : { submitEnabled: false })(
+          state={(tab => tab ? pluginTextPromptTabState(tab, activeDocumentTabId, documentTabs) : { submitEnabled: false })(
             documentTabForKey(pluginRuntime.openTextPrompt.documentKey))}
           onSubmit={pluginRuntime.submitTextPrompt}
           onCancel={pluginRuntime.cancelTextPrompt}

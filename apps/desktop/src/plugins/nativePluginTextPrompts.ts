@@ -13,14 +13,21 @@ export interface PluginTextPromptDialogHost {
    *  bound to no document), or undefined once that tab closed or its document was replaced. */
   documentTab(documentKey: string | undefined): { id: string; title: string } | undefined;
   activeTabId(): string | undefined;
+  /** The open tabs in tab-strip order, read each time a status is pushed (tabs open, close and move). */
+  tabs?(): readonly { id: string; title: string }[];
   onError(message: string): void;
 }
 
 /** Submit is available only while the prompt's own tab is active: its command can write nowhere else. */
-export function pluginTextPromptTabState(tab: { id: string; title: string }, activeTabId: string | undefined): PluginTextPromptState {
+export function pluginTextPromptTabState(tab: { id: string; title: string }, activeTabId: string | undefined,
+  tabs?: readonly { id: string; title: string }[]): PluginTextPromptState {
   if (tab.id === activeTabId) return {};
   const name = Array.from(tab.title);
-  return { submitEnabled: false, statusLine: `Switch back to ${name.length > 160 ? `${name.slice(0, 159).join("")}…` : tab.title} to insert.` };
+  // Another open tab with the same name: say which one by its 1-based position in the tab strip.
+  const position = tabs && tabs.some(other => other.id !== tab.id && other.title === tab.title)
+    ? tabs.findIndex(other => other.id === tab.id) + 1 : 0;
+  const label = name.length > 160 ? `${name.slice(0, 159).join("")}…` : tab.title;
+  return { submitEnabled: false, statusLine: `Switch back to ${label}${position > 0 ? ` (tab ${position})` : ""} to insert.` };
 }
 
 export function pluginTextPromptSnapshot(prompt: OpenPluginTextPrompt): PluginTextPromptSnapshot {
@@ -60,7 +67,7 @@ export function presentPluginTextPromptsNatively(prompts: PluginTextPromptQueue,
     // Its tab closed or its document was replaced: the controller normally cancels it first.
     const tab = prompt && host.documentTab(prompt.documentKey);
     if (prompt && !tab) { prompts.cancel(prompt.id); return; }
-    const state = tab && pluginTextPromptTabState(tab, host.activeTabId());
+    const state = tab && pluginTextPromptTabState(tab, host.activeTabId(), host.tabs?.());
     if (presented && presented.id === prompt?.id) {
       const current = presented;
       if (!state || (state.statusLine === current.state.statusLine && state.submitEnabled === current.state.submitEnabled)) return;

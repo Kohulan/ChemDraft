@@ -29,6 +29,8 @@ vi.mock("./plugins/createPluginRuntime", async original => {
 
 const pluginId = "org.chemdraft.test.promptTabs";
 const commandId = "plugin.promptTabs.insert";
+const touchCommandId = "plugin.promptTabs.touch";
+const touched = DocumentObjectSchema.parse({ id: "unsaved-edit", type: "plus", x: 80, y: 80, width: 20, height: 20 });
 const inserted = DocumentObjectSchema.parse({ id: "named-structure", type: "plus", x: 40, y: 40, width: 20, height: 20 });
 
 let root: Root, container: HTMLDivElement;
@@ -53,15 +55,19 @@ const tabDocument = (tabId: string) => getAssistantHistoryPort().read(tabId)!;
 const objectIds = (drawing: ChemDraftDocument) => drawing.pages.flatMap(page => page.objects.map(object => object.id));
 
 /** Mounts the window with a Name-to-Structure-shaped plugin: ask for text, then insert into the drawing. */
-async function mount() {
-  await act(async () => root.render(<MainWindow initialDocument={createEmptyDocument()} initialPaletteMode="hidden"
+async function mount(initialDocument: ChemDraftDocument = createEmptyDocument()) {
+  await act(async () => root.render(<MainWindow initialDocument={initialDocument} initialPaletteMode="hidden"
     initialRulersVisible={false} nativePalette={false} />));
   const runtime = captured.runtime!;
   const prompts: PluginPromptTextResult[] = [];
   await act(async () => {
     runtime.registerPlugin({ id: pluginId, name: "Prompt tabs", version: "0.1.0", apiVersion: "^0.1.22", entry: "test.js",
-      permissions: ["ui.panel", "document.write"], contributes: { commands: [{ id: commandId, title: "Insert Named Structure" }] }
-    }, { commandHandlers: { [commandId]: async context => {
+      permissions: ["ui.panel", "document.write"], contributes: { commands: [{ id: commandId, title: "Insert Named Structure" }, { id: touchCommandId, title: "Edit Without Asking" }] }
+    }, { commandHandlers: { [touchCommandId]: async context => {
+      const pageId = tabDocument(activeTabId()).pages[0]!.id;
+      await context.documents.applyPatch!({ reason: "Edit Without Asking", patch: { op: "addObject", pageId, object: touched } });
+      return { status: "edited" };
+    }, [commandId]: async context => {
       const result = await context.dialogs!.promptText({ title: "Insert Structure from Name", label: "Chemical name" });
       prompts.push(result);
       if (result.status !== "submitted") return { status: "cancelled" };
@@ -112,7 +118,7 @@ describe("plugin text prompt and document tabs", () => {
     expect(runtime.prompts.getOpenPrompt()?.id).toBe(promptId);
     expect(input().value).toBe("benzene");
     expect(submitButton().disabled).toBe(true);
-    expect(document.body.textContent).toContain("Switch back to Untitled to insert.");
+    expect(document.body.textContent).toContain("Switch back to Untitled (tab 1) to insert.");
     // An answer arriving while tab B is active is refused: the prompt stays open and nothing is written.
     await act(async () => { runtime.prompts.submit(promptId, "benzene"); });
     expect(runtime.prompts.getOpenPrompt()?.id).toBe(promptId);
@@ -162,5 +168,113 @@ describe("plugin text prompt and document tabs", () => {
     await act(async () => { runtime.prompts.submit(promptId, "benzene"); await invocation; });
     expect(prompts).toEqual([{ status: "submitted", value: "benzene" }]);
     expect(objectIds(tabDocument(tabA))).toContain(inserted.id);
+  });
+
+  const statusText = () => document.body.querySelector(".plugin-prompt-dialog")?.textContent ?? "";
+
+  it("names the prompt's tab by position when another open tab has the same name", async () => {
+    const { runtime } = await mount();
+    const tabA = activeTabId();
+    await command("document.new");
+    const tabB = activeTabId();
+    expect(tabB).not.toBe(tabA);
+    const { invocation } = await start(runtime);
+    await command("document.previousTab");
+    expect(activeTabId()).toBe(tabA);
+    expect(statusText()).toContain("Switch back to Untitled (tab 2) to insert.");
+    // A tab opened while the prompt is open does not move the origin tab; the position is recomputed on each push.
+    await command("document.new");
+    await command("document.nextTab");
+    expect(activeTabId()).toBe(tabA);
+    expect(statusText()).toContain("Switch back to Untitled (tab 2) to insert.");
+    await act(async () => { runtime.prompts.cancel(runtime.prompts.getOpenPrompt()!.id); await invocation; });
+  });
+
+  it("keeps the plain tab name in the status line when it is unique", async () => {
+    const { runtime } = await mount({ ...createEmptyDocument(), title: "Benzene" });
+    const { invocation } = await start(runtime);
+    await command("document.new");
+    expect(statusText()).toContain("Switch back to Benzene to insert.");
+    expect(statusText()).not.toContain("(tab");
+    await act(async () => { runtime.prompts.cancel(runtime.prompts.getOpenPrompt()!.id); await invocation; });
+  });
+
+  describe("closing the prompt's tab", () => {
+    const closeQuestion = () => document.body.querySelector('[role="dialog"][aria-label="Save changes before closing?"]');
+    const answer = async (label: string) => {
+      const button = Array.from(closeQuestion()!.querySelectorAll("button")).find(candidate => candidate.textContent === label)!;
+      await act(async () => { button.click(); });
+    };
+    const input = () => document.body.querySelector<HTMLInputElement>(".plugin-prompt-dialog input")!;
+    const submitButton = () => document.body.querySelector<HTMLButtonElement>('.plugin-prompt-dialog button[type="submit"]')!;
+    /** Tab A holds an unsaved edit and the prompt (with typed text); tab B exists and A is active. */
+    async function dirtyOriginWithPrompt() {
+      const mounted = await mount();
+      const tabA = activeTabId();
+      await command("document.new");
+      const tabB = activeTabId();
+      await command("document.previousTab");
+      expect(activeTabId()).toBe(tabA);
+      await act(async () => { await mounted.runtime.invokeCommand(touchCommandId); });
+      const started = await start(mounted.runtime);
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input(), "benzene");
+        input().dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      await command("document.nextTab");
+      expect(activeTabId()).toBe(tabB);
+      return { ...mounted, ...started, tabA, tabB };
+    }
+
+    it("keeps the prompt, its text and its tab binding when the close is cancelled", async () => {
+      const { runtime, prompts, promptId, tabA, tabB } = await dirtyOriginWithPrompt();
+      await command(closeDocumentTabCommandId(tabA));
+      expect(closeQuestion()).not.toBeNull();
+      await answer("Cancel");
+      expect(closeQuestion()).toBeNull();
+      expect(getAssistantHistoryPort().read(tabA)).toBeDefined();
+      expect(runtime.prompts.getOpenPrompt()?.id).toBe(promptId);
+      expect(prompts).toEqual([]);
+      expect(input().value).toBe("benzene");
+      // Still bound to tab A: disabled while another tab is active, enabled once back.
+      await command("document.nextTab");
+      expect(activeTabId()).toBe(tabB);
+      expect(submitButton().disabled).toBe(true);
+      expect(statusText()).toContain("Switch back to Untitled (tab 1) to insert.");
+      await command("document.previousTab");
+      expect(activeTabId()).toBe(tabA);
+      expect(submitButton().disabled).toBe(false);
+      await act(async () => { runtime.prompts.cancel(promptId); });
+    });
+
+    it("cancels the prompt only once Don't Save removes the tab, inserting nothing", async () => {
+      const { runtime, prompts, invocation, promptId, tabA, tabB } = await dirtyOriginWithPrompt();
+      const beforeB = tabDocument(tabB);
+      await command(closeDocumentTabCommandId(tabA));
+      expect(closeQuestion()).not.toBeNull();
+      expect(runtime.prompts.getOpenPrompt()?.id).toBe(promptId);
+      expect(prompts).toEqual([]);
+      await answer("Don't Save");
+      expect(getAssistantHistoryPort().read(tabA)).toBeUndefined();
+      expect(runtime.prompts.getOpenPrompt()).toBeUndefined();
+      expect(await invocation).toEqual({ status: "cancelled" });
+      expect(prompts).toEqual([{ status: "cancelled" }]);
+      expect(objectIds(tabDocument(tabB))).not.toContain(inserted.id);
+      expect(tabDocument(tabB)).toBe(beforeB);
+    });
+
+    it("cancels the prompt right away when a clean origin tab closes", async () => {
+      const { runtime, prompts } = await mount();
+      const tabA = activeTabId();
+      await command("document.new");
+      await command("document.previousTab");
+      const { invocation } = await start(runtime);
+      await command(closeDocumentTabCommandId(tabA));
+      expect(closeQuestion()).toBeNull();
+      expect(getAssistantHistoryPort().read(tabA)).toBeUndefined();
+      expect(runtime.prompts.getOpenPrompt()).toBeUndefined();
+      expect(await invocation).toEqual({ status: "cancelled" });
+      expect(prompts).toEqual([{ status: "cancelled" }]);
+    });
   });
 });
