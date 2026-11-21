@@ -169,7 +169,12 @@ describe("palette work-area sizing", () => {
       /recover_offscreen_toolset_window\(app, &window, resizable\);(?:\s*\/\/[^\n]*)*\s*if !palette_first_paint::reopened\(&label\) \{\s*window\.show\(/,
     );
     expect(open).toMatch(/let \(position, width, height\) = clamp_toolset_frame\([\s\S]*?\.inner_size\(width, height\)/);
-    expect(open).toMatch(/clamp_windows_toolset_frame\([\s\S]*?\.visible\(false\)[\s\S]*?panel_full_size::apply\([\s\S]*?target\.show\(/);
+    // Windows: clamp, build hidden through palette_first_paint, place, then the reveal is armed.
+    expect(open).toMatch(
+      /clamp_windows_toolset_frame\([\s\S]*?palette_first_paint::builder_step\([\s\S]*?builder\.build\(\)[\s\S]*?panel_full_size::apply\([\s\S]*?palette_first_paint::arm_toolbar\(&target\)/,
+    );
+    // The new window is never shown directly: only palette_first_paint reveals it.
+    expect(open).not.toMatch(/target\.show\(/);
   });
 
   it("sends the requested size unchanged when it fits within the work area", async () => {
