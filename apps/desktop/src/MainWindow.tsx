@@ -22736,12 +22736,20 @@ export function MainWindow({
     // A side-dependent label the save could not carry is read again from its drawing: say so (short
     // on the status line, each atom named in the log) rather than let the save change it silently.
     const applied = applyEditorSaveResultWithLabelWarnings(documentRef.current, result);
+    // A save that would move a charge or radical mark onto another atom, or whose charge contradicts
+    // a mark still on the atom, is refused before commit: the document and undo stack are unchanged,
+    // and the host keeps this message on the status line (it reports success only for `true`).
+    if (applied.refusal) {
+      setStatus(applied.refusal);
+      return false;
+    }
     commitDocumentChangeWithPageFit(applied.document, undefined, undefined, undefined, CHEMISTRY_EDIT);
     const labelStatus = editorSaveLabelWarningsStatus(applied.labelWarnings);
     if (labelStatus) {
       setStatus(labelStatus);
       applied.labelWarnings.forEach((warning) => console.info(warning.detail));
     }
+    return true;
   }, [commitDocumentChangeWithPageFit]);
 
   const createAgentSnapshot = useCallback((): AgentSnapshot => {
