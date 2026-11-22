@@ -163,6 +163,54 @@ pub(super) fn set_visible<R: Runtime>(
     })?
 }
 
+/// Make `window` transient for `owner`, the window it must stay stacked above.
+///
+/// A popover that is transient for the document window is constrained only to sit above the
+/// document. On KDE Plasma (XWayland) KWin maps it with focus-stealing prevention, which stacks it
+/// under the active application's windows, so it opened behind the palette that owns it. KWin, like
+/// other window managers, keeps a transient above its parent, so a popover transient for its
+/// palette stays above that palette. Setting the parent changes no focus or activation state.
+#[cfg(target_os = "linux")]
+pub(super) fn set_transient_owner<R: Runtime>(
+    window: &WebviewWindow<R>,
+    owner: &WebviewWindow<R>,
+) -> Result<(), String> {
+    let target = window.clone();
+    let owner = owner.clone();
+    super::run_on_main_thread_blocking(window, move || {
+        use gtk::prelude::{Cast, GtkWindowExt};
+
+        let native = target.gtk_window().map_err(|error| error.to_string())?;
+        let owner = owner.gtk_window().map_err(|error| error.to_string())?;
+        let owner: &gtk::Window = owner.upcast_ref();
+        // Rewriting an unchanged parent would only churn WM_TRANSIENT_FOR on every open.
+        if native.transient_for().as_ref() != Some(owner) {
+            native.set_transient_for(Some(owner));
+        }
+        Ok(())
+    })?
+}
+
+/// Ask the window manager to raise a just-shown window, without activating it.
+///
+/// gdk_window_raise only sends a restack request (XRaiseWindow on X11; nothing on Wayland). Unlike
+/// gtk_window_present it neither requests activation (_NET_ACTIVE_WINDOW) nor moves focus. KWin
+/// honours a raise from the active application, so the window lands above that application's other
+/// windows, and its transient parent (`set_transient_owner`) still keeps it above its owner.
+#[cfg(target_os = "linux")]
+pub(super) fn raise<R: Runtime>(window: &WebviewWindow<R>) -> Result<(), String> {
+    let target = window.clone();
+    super::run_on_main_thread_blocking(window, move || {
+        use gtk::prelude::WidgetExt;
+
+        let native = target.gtk_window().map_err(|error| error.to_string())?;
+        if let Some(surface) = native.window() {
+            surface.raise();
+        }
+        Ok(())
+    })?
+}
+
 #[cfg(not(target_os = "linux"))]
 pub(super) fn set_visible<R: Runtime>(
     window: &WebviewWindow<R>,

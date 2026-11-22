@@ -102,6 +102,15 @@ cover the toolbars. Hover for a tooltip, open and reopen a palette popover, and 
 Check that each opens after prewarming or reuse and that mouse-opened utilities leave the document
 focused. On native Wayland, the compositor places these windows.
 
+Toolbar flyout stacking (Linux, B7): on KDE Plasma under XWayland, with the default palette layout
+(include 1280x800, where the Arrows palette overlaps Main), long-press Single Bond on the Main
+toolbar. The "ChemDraft tools" flyout shows in full above the Main toolbar and above every other
+palette, not just a strip. Repeat with Reaction Arrow on Main, then with a flyout on another
+palette and the Art color picker. `xprop -root _NET_CLIENT_LIST_STACKING` lists the flyout after
+its palette, and `xprop` on the flyout shows WM_TRANSIENT_FOR set to that palette, not the
+document. The document keeps focus (its title stays active and M still switches tools). Close and
+reopen the palette from View ▸ Toolbars, then long-press again: the flyout still opens above it.
+
 Palette first paint (Windows): quit ChemDraft, then cold-launch it. The Main toolbar and the other
 open palettes appear with their content in the palette's light grey, with no black frame and no
 blank light frames first. Press and hold a flyout button and open a color picker: each popover, and

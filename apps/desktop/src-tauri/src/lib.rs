@@ -6633,6 +6633,7 @@ async fn open_toolset_popover(
         // both the warm and cold paths.
         panel_window::set_popover_content(&window, &kind)?;
         configure_toolset_popover_window(&window, focus_mode)?;
+        attach_toolset_popover_to_owner(&window, &toolset_id)?;
         window
             .set_title(toolset_popover_title(&label, &kind))
             .map_err(|error| error.to_string())?;
@@ -6758,6 +6759,7 @@ fn build_toolset_popover_window(
     disable_default_context_menus(&window);
     utility_window::prepare(&window, utility_window::Kind::Popover, native_wayland)?;
     configure_toolset_popover_window(&window, focus_mode)?;
+    attach_toolset_popover_to_owner(&window, toolset_id)?;
     install_toolset_input_focus(&window)?;
     panel_window::set_popover_content(&window, kind)?;
     // Re-assert the anchor as the FINAL step, mirroring the warm path: panel configuration
@@ -6829,6 +6831,46 @@ fn close_toolset_popover(app: tauri::AppHandle, toolset_id: String) -> Result<()
 
 fn toolset_popover_window_label(toolset_id: &str) -> String {
     format!("toolset-popover-{}", toolset_id.replace('.', "-"))
+}
+
+/// The window a popover stacks above on Linux: the palette that opened it, since every palette
+/// opens and prewarms popovers under its own toolset id. The canvas's E/Z popover has no palette,
+/// and a palette may be gone; both fall back to the document window, the builder's parent.
+#[cfg(any(target_os = "linux", test))]
+fn toolset_popover_owner_label(toolset_id: &str, window_exists: impl Fn(&str) -> bool) -> String {
+    let palette = toolset_window_label(toolset_id);
+    if window_exists(&palette) {
+        palette
+    } else {
+        MAIN_WINDOW_LABEL.to_string()
+    }
+}
+
+/// Linux: make the popover transient for the palette that owns it, so the window manager keeps
+/// it above that palette (B7: on KDE it opened behind the Main toolbar). Rechecked on every open,
+/// in case the palette's native window was rebuilt; an unchanged parent is not rewritten.
+#[cfg(target_os = "linux")]
+fn attach_toolset_popover_to_owner<R: Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    toolset_id: &str,
+) -> Result<(), String> {
+    let app = window.app_handle();
+    let owner_label =
+        toolset_popover_owner_label(toolset_id, |label| app.get_webview_window(label).is_some());
+    match app.get_webview_window(&owner_label) {
+        Some(owner) => utility_window::set_transient_owner(window, &owner),
+        None => Ok(()),
+    }
+}
+
+/// macOS keeps popovers unparented (see `toolset_popover_window_config`) and Windows orders them
+/// through their owner and `raise_among_owned_windows`.
+#[cfg(not(target_os = "linux"))]
+fn attach_toolset_popover_to_owner<R: Runtime>(
+    _window: &tauri::WebviewWindow<R>,
+    _toolset_id: &str,
+) -> Result<(), String> {
+    Ok(())
 }
 
 /// Palette popovers (colour pickers and flyouts) never take key status when they open: their
@@ -7078,6 +7120,11 @@ fn show_toolset_popover_window(
     // `focus: false` at creation makes Tao use SW_SHOWNOACTIVATE on Windows.
     // Keep its visibility state in sync (a raw ShowWindow alone breaks later hide()).
     utility_window::set_visible(&window, true)?;
+    // Linux: a restack request, not gtk_window_present, so the document keeps focus. KWin's
+    // focus-stealing prevention maps the non-activating popover under the active application's
+    // windows; this raise and its palette parent (attach_toolset_popover_to_owner) lift it again.
+    #[cfg(target_os = "linux")]
+    utility_window::raise(&window)?;
     raise_among_owned_windows(&window)?;
     let visibility = window.is_visible();
     #[cfg(windows)]
@@ -15307,6 +15354,30 @@ mod tests {
         expect_eq(
             "toolset-plugin-fixture",
             &toolset_window_label("plugin.fixture"),
+        );
+    }
+
+    #[test]
+    fn toolset_popovers_stack_above_the_palette_that_opened_them() {
+        let open = ["main", "toolset-core-main", "toolset-plugin-my-tools"];
+        let exists = |label: &str| open.contains(&label);
+        expect_eq(
+            "toolset-core-main",
+            &toolset_popover_owner_label("core.main", exists),
+        );
+        // The palette label's sanitizing, not the popover label's dot-only replacement.
+        expect_eq(
+            "toolset-plugin-my-tools",
+            &toolset_popover_owner_label("plugin.my_tools", exists),
+        );
+        // The canvas's E/Z popover has no palette; a closed palette's popover falls back too.
+        expect_eq(
+            MAIN_WINDOW_LABEL,
+            &toolset_popover_owner_label("core.bondStereo", exists),
+        );
+        expect_eq(
+            MAIN_WINDOW_LABEL,
+            &toolset_popover_owner_label("core.arrows", exists),
         );
     }
 
