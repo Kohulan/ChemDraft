@@ -3,7 +3,7 @@ import {
   PluginAssistantToolResultSchema, PluginAssistantToolSessionRequestSchema, AssistantCapabilityPermissions,
   type PluginAssistantToolDescriptor, type PluginAssistantAPI, type PluginAssistantToolResult, type PluginManifest
 } from "@chemdraft/plugin-api";
-import { assertLegacyWritePages, beginScopedRepeatUnitCleanup, finishScopedRepeatUnitCleanup, legacyWriteScopePages, writePatchOps,
+import { assertLegacyWritePages, beginScopedRepeatUnitCleanup, finishScopedRepeatUnitCleanup, legacyWriteScopePages, withoutPins, writePatchOps,
   type PluginHost, type PluginHostAssistant, type PluginWriteScopePages, type ScopedRepeatUnitCleanup } from "@chemdraft/plugin-host";
 import { PluginWriteGateTimeoutError, type PluginWriteGate } from "../plugins/applyPluginDocumentPatch";
 import { runThumbnail } from "./runThumbnail";
@@ -30,7 +30,8 @@ interface Request {
   pluginId: string;
   tabId: string;
   selection: string[];
-  /** Send-time selection bound to its page, so a duplicate id elsewhere is never in scope. */
+  /** Send-time pins of the selection (host identity), so a same-id object is never in scope. Dropped for
+   * an id the request later inserts under: that id then names the request's own insertion. */
   selectionPages: PluginWriteScopePages | undefined;
   /** The document identity captured at Send, when the host provides one. */
   binding: AssistantDocumentBinding | undefined;
@@ -138,7 +139,7 @@ export class AssistantToolsController implements PluginHostAssistant {
     const request: Request = { pluginId: plugin.id, tabId, selection, selectionPages, binding, repeatUnitCleanup, inserted: new Set(), touched: new Set(), transactions,
       ended: false, cancellations: new Map(), opening: 0,
       context: { ...services, plugin: manifest, tabId, getDocument, getSelectionAtSend: () => selection,
-        getSelectionPagesAtSend: () => selectionPages,
+        getSelectionPagesAtSend: () => request.selectionPages,
         chemistry: { ...services.chemistry, reactionProductAligner: async () => {
           const adapter = await loadRdkitWithAppLoader(() => import("@chemdraft/rdkit-adapter/depiction"));
           return adapter.createReactionProductAligner();
@@ -291,6 +292,8 @@ export class AssistantToolsController implements PluginHostAssistant {
                   cleanup?.record();
                   const existing = new Set(before.pages.flatMap(page => page.objects.map(object => object.id)));
                   for (const id of touched) { request.touched.add(id); if (!existing.has(id)) request.inserted.add(id); }
+                  // An id that was free could only be inserted: it now names this request's insertion, not a pin.
+                  request.selectionPages = withoutPins(request.selectionPages, touched.filter(id => !existing.has(id)));
                   return { applied: true as const, objectIds: touched };
                 }
               });

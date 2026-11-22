@@ -1580,3 +1580,111 @@ describe("Kimi security review: an assistant pin unique at Send never follows it
     } finally { await s.finish(); }
   });
 });
+
+describe("1.2.3: assistant and plugin pins follow the selected object by host-owned identity", () => {
+  /** Send selects the fixture molecule on page 1 of a two-page document (page 2 starts empty). */
+  async function sendOnPage1(s: ReturnType<typeof setup>) {
+    const document = s.context.getDocument()!;
+    const pageA = document.pages[0]!;
+    s.replace({ ...document, pages: [pageA, { ...pageA, id: "page_b", objects: [] }], selection: { pageId: pageA.id, objectIds: [s.molecule.id] } });
+    s.select([s.molecule.id]);
+    return s.controller.beginRequest(s.plugin, { prompt: "restyle the selection" });
+  }
+  const reselect = "The object you selected on page 1 is no longer there; reselect it and try again.";
+  const restyle = (id: string, color: string) => ({ name: "style_objects", input: { objectIds: [id], style: { color } } });
+  const findMolecule = (document: ChemDraftDocument, id: string) => document.pages.flatMap(page => page.objects).find(object => object.id === id)!;
+
+  it("refuses a same-page id reuse after the user deletes the selection and pastes an exact copy back under its id", async () => {
+    const s = setup();
+    try {
+      const { requestId } = await sendOnPage1(s);
+      const current = s.context.getDocument()!;
+      const copy = structuredClone(findMolecule(current, s.molecule.id));
+      const pasted = applyPatch(applyPatch(current, { op: "removeObject", objectId: s.molecule.id }),
+        { op: "addObject", pageId: current.pages[0]!.id, object: copy });
+      expect(findMolecule(pasted, s.molecule.id)).toBeDefined();
+      s.replace(pasted);
+      const result = await s.controller.callTool(s.plugin, restyle(s.molecule.id, "#112233"));
+      expect(result).toMatchObject({ isError: true, content: [{ text: expect.stringContaining(reselect) }] });
+      expect(s.context.getDocument()).toBe(pasted);
+      expect(s.history).toHaveLength(0);
+      await s.controller.endRequest(s.plugin, { requestId });
+    } finally { await s.finish(); }
+  });
+
+  it("writes the selected molecule after the user moved it to another page, and keeps reaching it on the next write", async () => {
+    const s = setup();
+    try {
+      const { requestId } = await sendOnPage1(s);
+      const current = s.context.getDocument()!;
+      const selected = findMolecule(current, s.molecule.id);
+      s.replace({ ...current, pages: [{ ...current.pages[0]!, objects: current.pages[0]!.objects.filter(object => object !== selected) },
+        { ...current.pages[1]!, objects: [selected] }] });
+      const first = await s.controller.callTool(s.plugin, restyle(s.molecule.id, "#112233"));
+      expect(first.isError, JSON.stringify(first)).not.toBe(true);
+      expect(JSON.stringify(s.context.getDocument()!.pages[1]!.objects[0])).toContain("#112233");
+      // The host's own write and its normalization keep the molecule's identity: a second write still resolves.
+      const second = await s.controller.callTool(s.plugin, restyle(s.molecule.id, "#445566"));
+      expect(second.isError, JSON.stringify(second)).not.toBe(true);
+      const after = s.context.getDocument()!;
+      expect(JSON.stringify(after.pages[1]!.objects[0])).toContain("#445566");
+      expect(after.pages[0]!.objects.some(object => object.id === s.molecule.id)).toBe(false);
+      await s.controller.endRequest(s.plugin, { requestId });
+    } finally { await s.finish(); }
+  });
+
+  it("an undo back past a user edit of the selection keeps its pin", async () => {
+    const s = setup();
+    try {
+      const { requestId } = await sendOnPage1(s);
+      const sent = s.context.getDocument()!;
+      s.replace(applyPatch(sent, { op: "updateObject", objectId: s.molecule.id, changes: { y: findMolecule(sent, s.molecule.id).y + 15 } }));
+      s.replace(sent); // undo reinstates the earlier document
+      const result = await s.controller.callTool(s.plugin, restyle(s.molecule.id, "#112233"));
+      expect(result.isError, JSON.stringify(result)).not.toBe(true);
+      await s.controller.endRequest(s.plugin, { requestId });
+    } finally { await s.finish(); }
+  });
+
+  it("a plugin command reaches its pinned molecule on a second write, but never a pasted newcomer under its id", async () => {
+    const document = toEngineDocument(testContext().context.getDocument()!);
+    const target = document.pages[0]!.objects.find(object => object.type === "molecule")!;
+    const run = async (edit?: (current: ChemDraftDocument) => ChemDraftDocument) => {
+      let current: ChemDraftDocument = { ...document, selection: { pageId: document.pages[0]!.id, objectIds: [target.id] } };
+      let release!: () => void;
+      const held = new Promise<void>(resolve => { release = resolve; });
+      const runtime = createPluginRuntime({ getActiveDocument: () => current, applyDocumentPatch: request => {
+        assertPluginPatchWriteScope(current, request.patch, request.writeScopeObjectIds, undefined, undefined, request.writeScopePages);
+        const applied = applyPluginDocumentPatch(current, request.patch);
+        assertPluginDocumentWriteScope(current, applied.document, request.patch, request.writeScopeObjectIds, request.writeScopePages);
+        current = applied.document;
+        return applied.receipt;
+      } });
+      runtime.registerPlugin({ id: "org.test.pins", name: "Pins", version: "1", apiVersion: "^0.1.18", entry: "plugin.js",
+        permissions: ["document.write"], contributes: { commands: [{ id: "plugin.pins.twice", title: "Write twice" }] }
+      }, { commandHandlers: { "plugin.pins.twice": async context => {
+        await context.documents.applyPatch!({ reason: "Restyle", patch: { op: "updateObject", objectId: target.id, changes: { style: { color: "#112233" } } } });
+        await held;
+        await context.documents.applyPatch!({ reason: "Restyle again", patch: { op: "updateObject", objectId: target.id, changes: { style: { color: "#445566" } } } });
+      } } });
+      const pending = runtime.invokeCommand("plugin.pins.twice");
+      await vi.waitFor(() => expect(JSON.stringify(current)).toContain("#112233"));
+      if (edit) current = edit(current);
+      release();
+      return { pending, document: () => current };
+    };
+    const plain = await run();
+    await expect(plain.pending).resolves.not.toThrow();
+    expect(JSON.stringify(plain.document().pages[0]!.objects.find(object => object.id === target.id))).toContain("#445566");
+
+    let pasted!: ChemDraftDocument;
+    const reused = await run(current => {
+      const copy = structuredClone(current.pages[0]!.objects.find(object => object.id === target.id)!);
+      pasted = applyPatch(applyPatch(current, { op: "removeObject", objectId: target.id }),
+        { op: "addObject", pageId: current.pages[0]!.id, object: copy });
+      return pasted;
+    });
+    await expect(reused.pending).rejects.toThrow(reselect);
+    expect(reused.document()).toBe(pasted);
+  });
+});

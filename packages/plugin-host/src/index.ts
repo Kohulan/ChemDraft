@@ -4,8 +4,9 @@ import { sameDocumentValue } from "./documentValue";
 // however, is taken from `@chemdraft/plugin-api` so a consumer using both SDK packages sees ONE canonical
 // document type — not a second, structurally-identical copy inlined here.
 import type { ApplyPatchOptions, DocumentObject, DocumentPatch, DocumentPage, OrphanedRepeatUnit } from "@chemdraft/chem-core";
-import { bareIdTargetPage, duplicateIdRefusalMessage, objectInWriteScope, pinnedObjectMissingMessage, pinSelectionPages, resolveObjectOnPage,
-  scopedObjectRefs, type PageObjectRef, type PluginWriteScopePages } from "./pageObjects";
+import { duplicateIdRefusalMessage, objectInWriteScope, objectLocations, pinnedObjectMissingMessage, pinObject, pinSelectionPages,
+  resolvePinnedObject, resolvePinnedPages, scopedObjectRefs, withoutPins, type PageObjectRef, type PagePin, type PinnedObjectPages,
+  type PluginWriteScopePages } from "./pageObjects";
 import { applyPatch, planOrphanedRepeatUnitCleanup, pruneReactionObjectReferences, removeOrphanedRepeatUnitBrackets, sameBracketIdentity } from "@chemdraft/chem-core";
 import {
   commitRequestPatch, containsBounds, pageContainsBounds, RequestWriteError, type BoundRequestWrite, type RequestDocument, type RequestHistory,
@@ -57,7 +58,7 @@ function authoredObjectValue(object: DocumentObject): DocumentObject {
 /** Page fitting must already be replayed on `before`. Only objects and crossings have scoped
  * write semantics; all other page fields (including future additions) are host-owned. */
 function assertPluginPageWriteScope(before: ChemDraftDocument, after: ChemDraftDocument, scope: ReadonlySet<string>,
-  scopePages?: PluginWriteScopePages): void {
+  pinned?: PinnedObjectPages): void {
   for (let index = 0; index < Math.max(before.pages.length, after.pages.length); index++) {
     const original = before.pages[index], next = after.pages[index];
     if (!original || !next) {
@@ -72,7 +73,7 @@ function assertPluginPageWriteScope(before: ChemDraftDocument, after: ChemDraftD
     }
     // Preserve the protected sequence, including duplicate pairs: rendering uses the FIRST
     // matching override. In-scope records may change without shifting this protected sequence.
-    const inScope = (objectId: string) => objectInWriteScope(scope, scopePages, original.id, objectId);
+    const inScope = (objectId: string) => objectInWriteScope(scope, pinned, original.id, objectId);
     const protectedCrossings = (values: DocumentPage["crossings"]) =>
       values.filter(crossing => crossing.bonds.some(ref => !inScope(ref.objectId)));
     const protectedBefore = protectedCrossings(crossings), protectedAfter = protectedCrossings(nextCrossings);
@@ -85,39 +86,65 @@ function assertPluginPageWriteScope(before: ChemDraftDocument, after: ChemDraftD
   }
 }
 
-export { bareIdTargetPage, duplicateIdRefusalMessage, pageNumberLabel, objectInWriteScope, objectLocations, pinnedObjectMissingMessage, pinSelectionPages,
-  resolveObjectOnPage, resolveScopedObject, scopedObjectPage, scopedObjectRefs, type PageObjectLocation, type PageObjectRef,
-  type PluginWriteScopePages } from "./pageObjects";
+export { bareIdTargetPage, duplicateIdRefusalMessage, pageNumberLabel, objectInWriteScope, objectLocations, pinnedObjectMissingMessage, pinObject,
+  pinSelectionPages, resolveObjectOnPage, resolvePinnedObject, resolvePinnedPages, resolveScopedObject, scopedObjectPage, scopedObjectRefs,
+  withoutPins, type PageObjectLocation, type PageObjectRef, type PagePin, type PinnedObjectPages, type PluginWriteScopePages } from "./pageObjects";
 
-/** The legacy selection's page binding (Send time). Ids on `pageId` bind to it; see pinSelectionPages. */
+/** The legacy selection's pins (Send time): each id pins the object it names, preferring `pageId`, by its
+ * host-owned identity; see pinSelectionPages. */
 export function legacyWriteScopePages(document: ChemDraftDocument | undefined, objectIds: readonly string[],
-  pageId = document?.selection.pageId ?? document?.pages[0]?.id): Map<string, string> | undefined {
+  pageId = document?.selection.pageId ?? document?.pages[0]?.id): Map<string, PagePin> | undefined {
   if (!document?.pages.some(page => page.id === pageId)) return undefined;
   return pinSelectionPages(document, objectIds, pageId).pages;
 }
 
-/** A pin resolves only on its Send-time page (pageObjects.ts, scopedObjectPage). An op naming a pinned
- * id whose object is gone from that page (deleted, or moved to another page) is refused: the id may
- * now name an unrelated object elsewhere. No patch op moves an object between pages, so a command's
- * own writes never need a pin carried to another page. */
+/** A request's live Send-time pins: an id the request has since inserted under names its own insertion,
+ * granted by that insertion's ref, not by the pin (see withoutPins). */
+function requestPins(state: RequestState): PluginWriteScopePages | undefined {
+  return withoutPins(state.selectionPins, state.inserted.keys());
+}
+
+/** Pins for a request's Send-time selection refs: each ref pins the object it names on its page. A ref
+ * whose id names several objects on its page gets no pin; the request preflight refuses such a page. */
+function requestSelectionPins(document: ChemDraftDocument | undefined, refs: readonly RequestObjectRef[]): Map<string, PagePin> {
+  const pins = new Map<string, PagePin>();
+  if (!document) return pins;
+  for (const ref of refs) {
+    const page = document.pages.find(candidate => candidate.id === ref.pageId);
+    const objects = page?.objects.filter(object => object.id === ref.objectId) ?? [];
+    if (page && objects.length === 1) pins.set(ref.objectId, pinObject(page, objects[0]!));
+  }
+  return pins;
+}
+
+/** A pin resolves to the object holding its identity, on whatever page it now is (pageObjects.ts,
+ * resolvePinnedObject). An op naming a pinned id whose object is gone (deleted, or replaced by a
+ * different object reusing the id) is refused. chem-core applies an op to the FIRST object with its
+ * id in page order, so that object must be the pinned one; otherwise the op would reach a same-id
+ * object (on another page, or reusing the id) and is refused too. */
 function assertLegacyWriteTargetPage(document: ChemDraftDocument, scopePages: PluginWriteScopePages | undefined,
   op: ReturnType<typeof writePatchOps>[number]): void {
   if (!scopePages?.size || op.op === "addObject" || op.op === "addAnnotation") return;
   const ids = op.op === "setObjectOrder" ? op.objectIds : "objectId" in op ? [op.objectId] : [];
   for (const id of ids) {
-    const pinned = scopePages.get(id);
-    if (pinned === undefined) continue;
-    if (!resolveObjectOnPage(document, pinned, id)) {
-      throw new PluginHostError(`Plugin write refused: the change was not applied. ${pinnedObjectMissingMessage(document, pinned)}`);
+    const pin = scopePages.get(id);
+    if (pin === undefined) continue;
+    const pinned = resolvePinnedObject(document, id, pin);
+    if (!pinned) {
+      throw new PluginHostError(`Plugin write refused: the change was not applied. ${pinnedObjectMissingMessage(document, pin.pageId)}`);
     }
-    const target = op.op === "setObjectOrder" ? op.pageId : bareIdTargetPage(document, id);
-    if (target === undefined || target === pinned) continue;
-    throw new PluginHostError(duplicateIdRefusalMessage(document, id, pinned, [target]));
+    if (op.op === "setObjectOrder") {
+      if (op.pageId === pinned.page.id) continue;
+      throw new PluginHostError(duplicateIdRefusalMessage(document, id, pinned.page.id, [op.pageId]));
+    }
+    const target = objectLocations(document, id)[0];
+    if (!target || target.object === pinned.object) continue;
+    throw new PluginHostError(duplicateIdRefusalMessage(document, id, pinned.page.id, [target.page.id]));
   }
 }
 
-/** Refuse a legacy write whose page-bound target id is gone from its Send-time page, or would resolve
- * to a same-id object on another page. */
+/** Refuse a legacy write whose pinned target object is gone, or whose op would reach a same-id object
+ * other than the pinned one. */
 export function assertLegacyWritePages(document: ChemDraftDocument, patch: DocumentPatch,
   scopePages: PluginWriteScopePages | undefined): void {
   for (const op of writePatchOps(patch)) assertLegacyWriteTargetPage(document, scopePages, op);
@@ -134,8 +161,9 @@ export function assertPluginPatchWriteScope(
   /** Legacy writes only: bind selected ids to their selection page. */
   scopePages?: PluginWriteScopePages
 ): ChemDraftDocument {
-  // Pins resolve only on their Send-time page; never a same-id object on another page.
+  // A pin resolves to the object holding its identity, never a same-id object on any page.
   const scope = new Set(objectIds);
+  const pinned = resolvePinnedPages(document, scopePages);
   for (const op of writePatchOps(preflight.patch)) {
     assertLegacyWriteTargetPage(document, scopePages, op);
     if (op.op === "addObject") scope.add(op.object.id);
@@ -152,7 +180,7 @@ export function assertPluginPatchWriteScope(
     const removed = new Set(objectIds);
     for (const page of draft.pages) {
       for (const object of page.objects) {
-        if (object.type === "reaction" && !removed.has(object.id) && !objectInWriteScope(scope, scopePages, page.id, object.id)
+        if (object.type === "reaction" && !removed.has(object.id) && !objectInWriteScope(scope, pinned, page.id, object.id)
           && !sameDocumentValue(pruneReactionObjectReferences(object, removed), object)
           && page.objects.some(candidate => removed.has(candidate.id))) {
           const id = objectIds.find(id => page.objects.some(candidate => candidate.id === id) &&
@@ -195,7 +223,7 @@ export function assertPluginPatchWriteScope(
     const index = occurrences.get(object.id) ?? 0;
     occurrences.set(object.id, index + 1);
     const survivor = remainingById.get(object.id)?.[index];
-    if (objectInWriteScope(scope, scopePages, page.id, object.id) ||
+    if (objectInWriteScope(scope, pinned, page.id, object.id) ||
       (survivor && sameDocumentValue(authoredObjectValue(object), authoredObjectValue(survivor)))) continue;
     if (object.type === "bracket") {
       const removal = writePatchOps(preflight.patch).find(op => op.op === "removeObject" &&
@@ -207,7 +235,7 @@ export function assertPluginPatchWriteScope(
     }
     throw new PluginHostError(`Patch would change object "${object.id}", which is not selected`);
   }
-  assertPluginPageWriteScope(document, validated, scope, scopePages);
+  assertPluginPageWriteScope(document, validated, scope, pinned);
   return validated;
 }
 
@@ -263,9 +291,10 @@ export function assertPluginDocumentWriteScope(
   after: ChemDraftDocument,
   proposed: NormalizedProposedDocumentPatch,
   objectIds: readonly string[],
-  /** Legacy writes only: a granted id is exempt only on the page its selection named. */
+  /** Legacy writes only: a granted id is exempt only for its pinned object, wherever that object is. */
   scopePages?: PluginWriteScopePages
 ): void {
+  const pinned = resolvePinnedPages(before, scopePages);
   const originals = before.pages.flatMap(page => page.objects.map(object => ({ pageId: page.id, object })));
   const survivors = after.pages.flatMap(page => page.objects.map(object => ({ pageId: page.id, object })));
   const existingIds = new Set(originals.map(entry => entry.object.id));
@@ -302,7 +331,7 @@ export function assertPluginDocumentWriteScope(
   for (const original of originals) {
     const survivor = matches.get(original) ?? byId.get(original.object.id)?.shift();
     if (survivor) matched.add(survivor);
-    if (objectInWriteScope(scope, scopePages, original.pageId, original.object.id)) continue;
+    if (objectInWriteScope(scope, pinned, original.pageId, original.object.id)) continue;
     if (survivor?.pageId === original.pageId && sameDocumentValue(original.object, survivor.object)) continue;
     const detail = !survivor ? "removed" : survivor.pageId !== original.pageId ? "moved to another page"
       : pluginObjectChangeDescription(original.object, survivor.object);
@@ -313,7 +342,7 @@ export function assertPluginDocumentWriteScope(
       throw new PluginHostError(`Plugin write refused: ${entry.object.type} "${entry.object.id}" was added outside this command's insertions.`);
     }
   }
-  assertPluginPageWriteScope(before, after, new Set([...scope, ...inserted]), scopePages);
+  assertPluginPageWriteScope(before, after, new Set([...scope, ...inserted]), pinned);
 }
 
 function pluginObjectChangeDescription(before: DocumentObject, after: DocumentObject): string {
@@ -737,8 +766,8 @@ export interface ToolSessionBinding {
   signal: AbortSignal;
   document: RequestDocument;
   selection(): string[];
-  /** The request selection's ids bound to their Send-time pages. */
-  selectionPages?(): Map<string, string>;
+  /** The request selection's Send-time pins (host-only; see PluginWriteScopePages). */
+  selectionPages?(): PluginWriteScopePages | undefined;
   insertions(): string[];
   check(): void;
   hasHandler: boolean;
@@ -1355,6 +1384,7 @@ export class PluginHost {
       const concurrent = [...this.requests.values()].find(request => request.document.key === document.key);
       const state = createRequestState(pluginId, token, document, invocation.sendSelection ?? [], crypto.randomUUID(),
         (value as { label: string }).label, concurrent?.pageAnswers);
+      state.selectionPins = invocation.sendPins;
       invocation.requestId = state.id;
       this.requests.set(state.id, state);
       invocation.writeStop.signal.addEventListener("abort", () => this.closeRequest(state), { once: true });
@@ -1376,7 +1406,7 @@ export class PluginHost {
         plugin: this.requireRegisteredPlugin(pluginId).manifest, owner: token, requestId: state.id,
         signal: state.stop.signal, document: state.document, hasHandler: !!handler,
         selection: () => state.selection.map(ref => ref.objectId),
-        selectionPages: () => new Map(state.selection.map(ref => [ref.objectId, ref.pageId])),
+        selectionPages: () => requestPins(state),
         insertions: () => [...state.inserted.keys()],
         check: () => { this.ownedRequest(pluginId, token, state.id); },
         invoke: (call, signal, readOnly, execution) => this.invokeRequestTool(pluginId, state.id, token, call, signal, readOnly,
@@ -2050,6 +2080,7 @@ export class PluginHost {
         document: state.document,
         history: state.history ??= this.openRequestHistory(state.document, state.label),
         selection: [...state.selection, ...state.inserted.values()],
+        selectionPins: requestPins(state),
         // A dispatched tool's writeStop follows both the request and that call's cancellation.
         signal: token === state.owner ? state.stop.signal : invocation.writeStop.signal,
         authorize,
@@ -2184,6 +2215,9 @@ export class PluginHost {
       }
     };
     checkDocumentKey();
+    // Pinned ids this patch inserts under that were free when scope was checked: only an insertion can
+    // write them, since an op naming a pin whose object is gone is refused.
+    let reinsertedPins: string[] = [];
     {
       const document = await (requestScope ? requestScope.getDocument() : this.getActiveDocument?.());
       checkDocumentKey();
@@ -2192,6 +2226,11 @@ export class PluginHost {
       }
       assertPluginPatchWriteScope(document, parsedPatch, requestScope?.objectIds ?? [...invocation.writeScope],
         undefined, undefined, requestScope ? requestScope.scopePages : invocation.writeScopePages);
+      if (!requestScope && invocation.writeScopePages?.size) {
+        const existing = new Set(document.pages.flatMap(page => page.objects.map(object => object.id)));
+        reinsertedPins = ops.flatMap(op => op.op === "addObject" ? [op.object.id] : op.op === "addAnnotation" ? [op.annotation.id] : [])
+          .filter(id => invocation.writeScopePages!.has(id) && !existing.has(id));
+      }
     }
     const plugin = this.requireRegisteredPlugin(pluginId).manifest;
     const receipt = await apply({
@@ -2211,6 +2250,9 @@ export class PluginHost {
     // surrounding command's ordinary document-write grant or the next request's grant.
     if (!requestScope) {
       for (const id of parsedReceipt.objectIds) invocation.writeScope.add(id);
+      // A pinned id this write inserted under now names that insertion, not the selected object.
+      invocation.writeScopePages = withoutPins(invocation.writeScopePages,
+        reinsertedPins.filter(id => parsedReceipt.objectIds.includes(id)));
       invocation.onAppliedPatch?.(parsedReceipt);
     }
     return parsedReceipt;
@@ -2346,6 +2388,7 @@ export class PluginHost {
             const sendDocument = requestDocument?.read();
             const override = invocationContext.writeSelection;
             const sendSelection = captureRequestSelection(sendDocument, override?.objectIds, override?.pageId);
+            const sendPins = requestSelectionPins(sendDocument, sendSelection);
             // Read selection ids and the cleanup baseline from the same snapshot. The plugin-visible
             // selection provider may build molfiles, so only use it when the plugin reads selection.
             const overrideIds = override?.objectIds.slice();
@@ -2364,6 +2407,7 @@ export class PluginHost {
               documentKey,
               requestDocument,
               sendSelection,
+              sendPins,
               ordinaryStop,
               writeScope: new Set(selectedIds),
               writeScopePages: pins.pages,
@@ -2875,10 +2919,13 @@ interface ActiveCommandInvocation {
   requestId?: string;
   requestDocument?: RequestDocument;
   sendSelection?: RequestObjectRef[];
+  /** Host-only pins of `sendSelection`, captured from the same Send snapshot. */
+  sendPins?: PluginWriteScopePages;
   ordinaryStop?: AbortController;
   onAppliedPatch?: (receipt: AppliedPatchReceipt) => void;
   writeScope: Set<string>;
-  /** Legacy invocations: selected id -> selection page. Insertions stay unpinned (fresh ids). */
+  /** Legacy invocations: selected id -> its Send-time pin (page and host identity). Insertions stay
+   * unpinned: their ids did not exist when they were inserted. */
   writeScopePages?: PluginWriteScopePages;
   repeatUnitCleanup?: ScopedRepeatUnitCleanup;
   pluginId: string;

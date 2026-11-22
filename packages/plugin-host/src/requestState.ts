@@ -6,6 +6,7 @@ import {
   RequestRevisions, RequestWriteError, type RequestDocument, type RequestHistory, type RequestObjectRef, type RequestPageChoice,
   type RequestViewport
 } from "./requestWrites";
+import type { PluginWriteScopePages } from "./pageObjects";
 
 export interface RequestPageAnswer {
   requestId: string;
@@ -21,6 +22,8 @@ export interface RequestState {
   label: string;
   document: RequestDocument;
   selection: RequestObjectRef[];
+  /** Host-only pins of `selection`, captured at Send with it (see BoundRequestWrite.selectionPins). */
+  selectionPins?: PluginWriteScopePages;
   inserted: Map<string, RequestObjectRef>;
   touched: Map<string, RequestObjectRef>;
   revisions: RequestRevisions;

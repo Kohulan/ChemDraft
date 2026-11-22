@@ -1,5 +1,5 @@
 import { retainedCtabCompatibility } from "./storedCtabGeometry";
-import { adoptDerivedDocument, DocumentPatchError, type ChemDraftDocument, type DocumentObject, type DocumentPage, type DocumentPatch, type MoleculeObject } from "@chemdraft/chem-core";
+import { adoptDerivedDocument, DocumentPatchError, hasObjectIdentity, type ChemDraftDocument, type DocumentObject, type DocumentPage, type DocumentPatch, type MoleculeObject } from "@chemdraft/chem-core";
 import {
   PluginRequestLimits, type NormalizedProposedDocumentPatch, type PluginExpectedStructure,
   type PluginRequestError, type PluginRequestPrecondition
@@ -9,6 +9,7 @@ import {
 } from "./index";
 import { sameDocumentValue } from "./documentValue";
 import { rebasePluginPatch } from "./rebasePluginPatch";
+import type { PluginWriteScopePages } from "./pageObjects";
 import { assertAuthoredBracketReferences, assertRequestReferences, requestReferenceScope } from "./requestReferences";
 
 export class RequestWriteError extends Error {
@@ -71,6 +72,9 @@ export interface BoundRequestWrite {
   document: RequestDocument;
   history: RequestHistory;
   selection: readonly RequestObjectRef[];
+  /** Host-only Send-time pins of the selection refs (pageObjects.ts): a pinned ref grants only the object
+   * holding its identity, never a different object that reuses its id on its page. */
+  selectionPins?: PluginWriteScopePages;
   signal: AbortSignal;
   authorize(): void;
   enterGestureWait?(): (() => void) | undefined;
@@ -185,6 +189,8 @@ export class RequestRevisions {
 
 interface WriteOptions {
   useInsertionSource?: boolean;
+  /** See BoundRequestWrite.selectionPins. */
+  selectionPins?: PluginWriteScopePages;
   revisions?: RequestRevisions;
   preconditions?: readonly PluginRequestPrecondition[];
   expected?: readonly PluginExpectedStructure[];
@@ -220,7 +226,13 @@ export async function preflightRequestPatch(before: ChemDraftDocument, proposal:
     if (new Set(before.pages.map(page => page.id)).size !== before.pages.length) {
       throw new RequestWriteError("invalid", "The document contains an ambiguous page or object ID.");
     }
-    const scope = selection.filter(ref => byId.get(ref.objectId)?.pageId === ref.pageId).map(ref => ref.objectId);
+    // A pinned Send-time ref grants only its own object: a same-id object that does not hold the pin's
+    // identity (a paste, undo, or insert reusing the id after Send) is never in scope.
+    const scope = selection.filter(ref => {
+      const entry = byId.get(ref.objectId);
+      const pin = options.selectionPins?.get(ref.objectId);
+      return entry?.pageId === ref.pageId && (!pin || hasObjectIdentity(entry.object, pin.identity));
+    }).map(ref => ref.objectId);
     const targets = new Set<string>();
     const ordered = new Set<string>();
     const granted = new Set(scope);
@@ -333,7 +345,8 @@ export async function commitRequestPatch(binding: BoundRequestWrite, proposal: N
   }
   const before = read();
   const { prepare, planned, verified, inspectedFinal } = await preflightRequestPatch(before, proposal, binding.selection,
-    (...args) => binding.history.verify(...args), binding.signal, options).catch(error => {
+    (...args) => binding.history.verify(...args), binding.signal,
+    binding.selectionPins?.size ? { ...options, selectionPins: binding.selectionPins } : options).catch(error => {
       read(); // Cancellation and lost authorization take priority over verification failures.
       throw error;
     });

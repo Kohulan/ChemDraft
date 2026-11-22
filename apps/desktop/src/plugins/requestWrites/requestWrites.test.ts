@@ -1753,3 +1753,53 @@ describe("verified request writes", () => {
     } finally { await f.finish(); }
   });
 });
+
+describe("1.2.3: a request's Send-time selection pins its object by host-owned identity", () => {
+  /** After Send, the user deletes the selected note and pastes an exact copy back under its id. */
+  const deleteAndPasteAnchor = (pageId: string) => (document: ChemDraftDocument) => {
+    const copy = structuredClone(document.pages[0]!.objects.find(object => object.id === "anchor")!);
+    return applyPatch(applyPatch(document, { op: "removeObject", objectId: "anchor" }), { op: "addObject", pageId, object: copy });
+  };
+
+  it("refuses a write to a same-page object that reuses a selected id after Send", async () => {
+    const f = setup(["anchor"]);
+    try {
+      const requestId = await f.begin();
+      f.edit(deleteAndPasteAnchor(f.pageId));
+      const pasted = f.pinned();
+      expect(await f.context.documents.applyRequestPatch!({ requestId, patch: {
+        op: "updateObject", objectId: "anchor", changes: { text: "Edited" }
+      } })).toMatchObject({ ok: false, error: { code: "scope" } });
+      expect(f.pinned()).toBe(pasted);
+      expect(f.history).toHaveLength(0);
+    } finally { await f.finish(); }
+  });
+
+  it("an object the request inserts under its deleted selection's id stays writable as its insertion", async () => {
+    const f = setup(["anchor"]);
+    try {
+      const requestId = await f.begin();
+      const apply = f.context.documents.applyRequestPatch!;
+      expect(await apply({ requestId, patch: { op: "removeObject", objectId: "anchor" } })).toMatchObject({ ok: true });
+      expect(await apply({ requestId, patch: { op: "addObject", pageId: f.pageId, object: note("anchor", "Replacement") } }))
+        .toMatchObject({ ok: true });
+      expect(await apply({ requestId, patch: { op: "updateObject", objectId: "anchor", changes: { text: "Edited replacement" } } }))
+        .toMatchObject({ ok: true });
+      expect(f.pinned().pages[0]!.objects.find(object => object.id === "anchor")).toMatchObject({ text: "Edited replacement" });
+    } finally { await f.finish(); }
+  });
+
+  it("still writes the selected object after the user edits it, and again after the request's own write", async () => {
+    const f = setup(["anchor"]);
+    try {
+      const requestId = await f.begin();
+      f.edit(document => applyPatch(document, { op: "updateObject", objectId: "anchor", changes: { x: 160 } }));
+      const apply = f.context.documents.applyRequestPatch!;
+      expect(await apply({ requestId, patch: { op: "updateObject", objectId: "anchor", changes: { text: "First" } } }))
+        .toMatchObject({ ok: true });
+      expect(await apply({ requestId, patch: { op: "updateObject", objectId: "anchor", changes: { text: "Second" } } }))
+        .toMatchObject({ ok: true });
+      expect(f.pinned().pages[0]!.objects.find(object => object.id === "anchor")).toMatchObject({ x: 160, text: "Second" });
+    } finally { await f.finish(); }
+  });
+});

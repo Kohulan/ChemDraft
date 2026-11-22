@@ -27,6 +27,7 @@ import { bracketPairs, retainBracketIdentity, sameBracketIdentity,
 import { planImportedRepeatUnitDeletion, resolveRepeatUnitAtomMembership, type RepeatUnitMembershipOptions } from "./repeatUnitMembership";
 import { rotatePointAboutCenter } from "./pointRotation";
 import { nativeExtensionObjectScope, retainNativeExtension } from "./nativeCompatibilityState";
+import { retainObjectIdentity } from "./objectIdentity";
 
 export type ObjectReorderPlacement = "front" | "back" | "forward" | "backward";
 
@@ -245,19 +246,29 @@ export function adoptDerivedDocument(base: ChemDraftDocument, next: ChemDraftDoc
       validated.add(object);
     }
   }
+  let kept: Set<DocumentObject> | undefined;
   const adopted = validateDraft({
     ...next,
     selection: { ...next.selection, objectIds: [...next.selection.objectIds] },
-    pages: next.pages.map((page) => ({
-      ...page,
-      objects: page.objects.map(object => {
-        if (validated.has(object)) return object;
-        const parsed = DocumentObjectSchema.parse(object);
-        retainBracketIdentity(object, parsed);
-        return parsed;
-      }),
-      crossings: [...page.crossings]
-    }))
+    pages: next.pages.map((page) => {
+      let replaced: Map<string, DocumentObject> | undefined;
+      return {
+        ...page,
+        objects: page.objects.map(object => {
+          if (validated.has(object)) return object;
+          const parsed = DocumentObjectSchema.parse(object);
+          retainBracketIdentity(object, parsed);
+          // A derived value continues the base object it replaced, unless it has an identity of its own.
+          kept ??= new Set(next.pages.flatMap(candidate => candidate.objects));
+          replaced ??= replacedObjects(base.pages.find(candidate => candidate.id === page.id), page, kept);
+          const predecessor = replaced.get(object.id);
+          if (predecessor) retainObjectIdentity(predecessor, object);
+          retainObjectIdentity(object, parsed);
+          return parsed;
+        }),
+        crossings: [...page.crossings]
+      };
+    })
   }, {
     // Shell fields `next` still shares with `base` were validated with it; replaced ones were not.
     compatibility: next.compatibility !== base.compatibility,
@@ -269,6 +280,32 @@ export function adoptDerivedDocument(base: ChemDraftDocument, next: ChemDraftDoc
     deepFreezeNew(adopted);
   }
   return adopted;
+}
+
+/**
+ * The base objects a derived page replaced in place, by id: a base object gone from the derived
+ * document (`kept` holds every object it still has, on any page) whose id names exactly one object
+ * on each of the two pages, of the same type. adoptDerivedDocument
+ * is for normalization passes that swap an object for an edited copy of itself, so such a copy
+ * continues the object's host identity. An id that is ambiguous on either page carries nothing, and
+ * the copy stays a different object (objectIdentity.ts: fail closed).
+ */
+function replacedObjects(base: DocumentPage | undefined, next: DocumentPage,
+  kept: ReadonlySet<DocumentObject>): Map<string, DocumentObject> {
+  const replaced = new Map<string, DocumentObject>();
+  if (!base) return replaced;
+  const successors = uniqueObjectsById(next.objects);
+  for (const [id, object] of uniqueObjectsById(base.objects)) {
+    if (object && !kept.has(object) && successors.get(id)?.type === object.type) replaced.set(id, object);
+  }
+  return replaced;
+}
+
+/** Each id's object, or undefined for an id that names several objects. */
+function uniqueObjectsById(objects: readonly DocumentObject[]): Map<string, DocumentObject | undefined> {
+  const byId = new Map<string, DocumentObject | undefined>();
+  for (const object of objects) byId.set(object.id, byId.has(object.id) ? undefined : object);
+  return byId;
 }
 
 /** Fresh containers for everything a patch can write: the document, its selection, each page, and
@@ -306,6 +343,7 @@ function validateDraft(
       if (containedObjectIds.length === object.containedObjectIds.length && crossingBondIds?.length === object.crossingBondIds?.length) return object;
       const pruned = { ...object, containedObjectIds, ...(crossingBondIds ? { crossingBondIds } : {}) };
       retainBracketIdentity(object, pruned);
+      retainObjectIdentity(object, pruned);
       return pruned;
     });
   }
@@ -420,6 +458,7 @@ function planRepeatUnitDeletion(before: ChemDraftDocument, after: ChemDraftDocum
               ...bracket.compatibility, unknown: { ...bracket.compatibility.unknown, cdxmlBracketDeletedAtoms: imported.deletedAtoms }
             } };
             retainBracketIdentity(bracket, edited);
+            retainObjectIdentity(bracket, edited);
             importedEdits.set(bracket, edited);
           }
         }
@@ -484,6 +523,7 @@ function pruneDeletedObjects(document: ChemDraftDocument, orphaned: readonly Orp
         if (object.type !== "bracket" || !object.containedObjectIds.some(id => removed.has(id))) return object;
         const pruned = { ...object, containedObjectIds: object.containedObjectIds.filter(id => !removed.has(id)) };
         retainBracketIdentity(object, pruned);
+        retainObjectIdentity(object, pruned);
         return pruned;
       });
     }
@@ -503,7 +543,11 @@ function pruneGroupReferences(page: DocumentPage, removed: Set<string>, removeEm
       if (object.type !== "group") return [object];
       const childObjectIds = object.childObjectIds.filter(id => !removed.has(id));
       if (childObjectIds.length === object.childObjectIds.length) return [object];
-      if (childObjectIds.length || !removeEmptyGroups) return [{ ...object, childObjectIds }];
+      if (childObjectIds.length || !removeEmptyGroups) {
+        const pruned = { ...object, childObjectIds };
+        retainObjectIdentity(object, pruned);
+        return [pruned];
+      }
       removed.add(object.id);
       return [];
     });
@@ -618,7 +662,12 @@ function pruneObjectNativeExtensions(document: ChemDraftDocument, pageId: string
 
 /** Replace changed reactions rather than mutating objects shared with undo snapshots. */
 function pruneReactionReferences(page: DocumentPage, removed: ReadonlySet<string>): void {
-  page.objects = page.objects.map(object => object.type === "reaction" ? pruneReactionObjectReferences(object, removed) : object);
+  page.objects = page.objects.map(object => {
+    if (object.type !== "reaction") return object;
+    const pruned = pruneReactionObjectReferences(object, removed);
+    retainObjectIdentity(object, pruned);
+    return pruned;
+  });
 }
 
 /** Pure removal rule, shared with write-scope checks. Returns the original object if unchanged. */
@@ -836,6 +885,8 @@ function updateObject(
   const updated = mergeObjectChanges(location.object, changes, objectId);
   beforeObjectWrite?.(location.page.id, location.object, updated);
   retainBracketIdentity(location.object, updated);
+  // An edit, restyle, or move keeps the object's host identity (objectIdentity.ts).
+  retainObjectIdentity(location.object, updated);
   if (location.object.type === "molecule" && updated.type === "molecule") {
     updated.atoms = clearChangedAtomHydrogenHints(location.object, updated.atoms, updated.bonds);
   }

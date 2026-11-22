@@ -1,7 +1,8 @@
-import { applyPatch, createEmptyDocument, toEngineDocument, type ChemDraftDocument, type DocumentObject, type MoleculeObject } from "@chemdraft/chem-core";
+import { applyPatch, applyPatchWithHistory, createDocumentHistory, createEmptyDocument, deserializeDocument, redo, serializeDocument, toEngineDocument,
+  undo, type ChemDraftDocument, type DocumentObject, type MoleculeObject } from "@chemdraft/chem-core";
 import { describe, expect, it, vi } from "vitest";
-import { assertLegacyWritePages, assertPluginDocumentWriteScope, assertPluginPatchWriteScope, objectInWriteScope, PluginHost,
-  resolveScopedObject, scopedObjectPage, type PluginPatchApplicationRequest } from "./index";
+import { assertLegacyWritePages, assertPluginDocumentWriteScope, assertPluginPatchWriteScope, legacyWriteScopePages, objectInWriteScope, PluginHost,
+  resolvePinnedPages, resolveScopedObject, scopedObjectPage, writePatchOps, type PluginPatchApplicationRequest } from "./index";
 
 const now = "2026-11-21T00:00:00.000Z";
 const molecule = (id: string, x: number): MoleculeObject => ({
@@ -71,7 +72,7 @@ describe("legacy direct writes are scoped by page and id", () => {
     const proposed = { reason: "Move", warnings: [], requiresUserApproval: true as const,
       patch: { op: "updateObject" as const, objectId: "X", changes: { x: 500 } } };
     const after = applyPatch(before, proposed.patch, { now });
-    expect(() => assertPluginDocumentWriteScope(before, after, proposed, ["X"], new Map([["X", "page-b"]])))
+    expect(() => assertPluginDocumentWriteScope(before, after, proposed, ["X"], legacyWriteScopePages(before, ["X"], "page-b")))
       .toThrow('Plugin write refused: molecule "X" was changed (x), but was not selected when the command started.');
     // Bare-id scope (request-bound and table callers) keeps its existing meaning.
     expect(() => assertPluginDocumentWriteScope(before, after, proposed, ["X"])).not.toThrow();
@@ -107,10 +108,10 @@ const reselect = (page: number) =>
   `Plugin write refused: the change was not applied. The object you selected on page ${page} is no longer there; reselect it and try again.`;
 
 describe("legacy page binding follows the Send-time selection", () => {
-  // Option A (1.2.2): a pin resolves only on its own page. Following a "uniquely identified" object to
-  // another page is spoofable (delete it, insert an unrelated same-id object elsewhere), so a selected
-  // object the user moved to another page is refused with a reselect message instead.
-  it("refuses a write to a selected object that moved to another page while the command was pending", async () => {
+  // 1.2.3: a pin names the selected object by its host-owned identity, so it follows a genuine move to
+  // another page (1.2.2's option A refused one with the reselect message). An unrelated same-id object
+  // never holds that identity, so following the object is no longer spoofable (see the Kimi cases below).
+  it("writes a selected object that moved to another page while the command was pending", async () => {
     const empty = createEmptyDocument({ now });
     const pageA = { ...empty.pages[0]!, id: "page-a", objects: [] };
     const pageB = { ...empty.pages[0]!, id: "page-b", objects: [molecule("X", 0)] };
@@ -120,14 +121,14 @@ describe("legacy page binding follows the Send-time selection", () => {
     // The user moves X from page B to page A; X is still the only object with that id.
     const current = f.document();
     f.edit({ ...current, pages: [{ ...current.pages[0]!, objects: [current.pages[1]!.objects[0]!] }, { ...current.pages[1]!, objects: [] }] });
-    const edited = f.document();
     f.release();
-    await expect(pending).rejects.toThrow(reselect(2));
-    expect(f.document()).toBe(edited);
-    expect(f.document().pages[0]!.objects[0]).toMatchObject({ id: "X", x: 0 });
+    await expect(pending).resolves.toMatchObject({ applied: true });
+    expect(f.applyDocumentPatch).toHaveBeenCalledTimes(1);
+    expect(f.document().pages[0]!.objects[0]).toMatchObject({ id: "X", x: 500 });
+    expect(f.document().pages[1]!.objects).toEqual([]);
   });
 
-  it("still refuses when the moved object's id now also names another object", async () => {
+  it("writes the moved object, not a same-id object on a later page", async () => {
     const empty = createEmptyDocument({ now });
     const pageA = { ...empty.pages[0]!, id: "page-a", objects: [] };
     const pageB = { ...empty.pages[0]!, id: "page-b", objects: [molecule("X", 0)] };
@@ -137,9 +138,26 @@ describe("legacy page binding follows the Send-time selection", () => {
     await Promise.resolve();
     const current = f.document();
     f.edit({ ...current, pages: [{ ...current.pages[0]!, objects: [current.pages[1]!.objects[0]!] }, { ...current.pages[1]!, objects: [] }, current.pages[2]!] });
+    f.release();
+    await expect(pending).resolves.toMatchObject({ applied: true });
+    expect(f.document().pages[0]!.objects[0]).toMatchObject({ id: "X", x: 500 });
+    expect(f.document().pages[2]!.objects).toEqual([text("X")]);
+  });
+
+  it("refuses a moved object that now sits behind a same-id object chem-core would change instead", async () => {
+    // Moved from page B to page C, behind page A's unrelated "X": a bare-id op would reach page A's.
+    const empty = createEmptyDocument({ now });
+    const pageA = { ...empty.pages[0]!, id: "page-a", objects: [text("X")] };
+    const pageB = { ...empty.pages[0]!, id: "page-b", objects: [molecule("X", 0)] };
+    const pageC = { ...empty.pages[0]!, id: "page-c", objects: [] };
+    const f = pendingHost(toEngineDocument({ ...empty, pages: [pageA, pageB, pageC], selection: { pageId: "page-b", objectIds: ["X"] } }));
+    const pending = f.host.invokeCommand("plugin.pending.run");
+    await Promise.resolve();
+    const current = f.document();
+    f.edit({ ...current, pages: [current.pages[0]!, { ...current.pages[1]!, objects: [] }, { ...current.pages[2]!, objects: [current.pages[1]!.objects[0]!] }] });
     const edited = f.document();
     f.release();
-    await expect(pending).rejects.toThrow(reselect(2));
+    await expect(pending).rejects.toThrow("The object you selected on page 3 shares its internal ID with an object on page 1");
     expect(f.document()).toBe(edited);
   });
 
@@ -175,13 +193,14 @@ const withoutPage1Object = (document: ChemDraftDocument): ChemDraftDocument =>
 
 describe("CodeRabbit PR #422: a pinned id missing from its page never reaches a same-id object elsewhere", () => {
   it("cr4656567628/cr4656567661: resolution and scope do not rebind page 1's deleted pin to page 2's object", () => {
-    const pins = new Map([["X", "page-1"]]);
-    const document = withoutPage1Object(sharedIdDocument());
+    const sent = sharedIdDocument();
+    const pins = legacyWriteScopePages(sent, ["X"], "page-1");
+    const document = withoutPage1Object(sent);
     // Assistant tools resolve every id through resolveScopedObject (writeBuilder.findObject).
     expect(scopedObjectPage(document, "X", pins)).toBeUndefined();
     expect(() => resolveScopedObject(document, "X", pins)).toThrow(/no longer there/);
-    // Plugin and assistant write scope both check the Send-time pin directly.
-    expect(objectInWriteScope(new Set(["X"]), pins, "page-2", "X")).toBe(false);
+    // Plugin and assistant write scope both check the Send-time pin, resolved against the written document.
+    expect(objectInWriteScope(new Set(["X"]), resolvePinnedPages(document, pins), "page-2", "X")).toBe(false);
   });
 
   it("cr4656567661: a pending command whose selected duplicate was deleted cannot write the surviving one", async () => {
@@ -211,12 +230,12 @@ function spoofedDocument(): { sent: ChemDraftDocument; spoofed: ChemDraftDocumen
 
 describe("Kimi security review: a pin unique at Send never follows its id to an unrelated object on another page", () => {
   it("resolution, scope, preflight and the final check all refuse page 2's newcomer", () => {
-    const { spoofed } = spoofedDocument();
-    const pins = new Map([["X", "page-1"]]);
+    const { sent, spoofed } = spoofedDocument();
+    const pins = legacyWriteScopePages(sent, ["X"], "page-1");
     expect(scopedObjectPage(spoofed, "X", pins)).toBeUndefined();
     expect(() => resolveScopedObject(spoofed, "X", pins)).toThrow(
       "The object you selected on page 1 is no longer there; reselect it and try again.");
-    expect(objectInWriteScope(new Set(["X"]), pins, "page-2", "X")).toBe(false);
+    expect(objectInWriteScope(new Set(["X"]), resolvePinnedPages(spoofed, pins), "page-2", "X")).toBe(false);
     const proposed = { reason: "Move", warnings: [], requiresUserApproval: true as const,
       patch: { op: "updateObject" as const, objectId: "X", changes: { x: 500 } } };
     expect(() => assertLegacyWritePages(spoofed, proposed.patch, pins)).toThrow(reselect(1));
@@ -236,5 +255,175 @@ describe("Kimi security review: a pin unique at Send never follows its id to an 
     await expect(pending).rejects.toThrow(reselect(1));
     expect(f.document()).toBe(spoofed);
     expect(f.document().pages[1]!.objects).toEqual([molecule("X", 300)]);
+  });
+});
+
+/** Send selects page 1's molecule "X"; page 1 also holds a caption, page 2 is empty. */
+function identitySent(): ChemDraftDocument {
+  const empty = createEmptyDocument({ now });
+  const page1 = { ...empty.pages[0]!, id: "page-1", objects: [molecule("X", 0), text("T")] };
+  const page2 = { ...empty.pages[0]!, id: "page-2", objects: [] };
+  return toEngineDocument({ ...empty, pages: [page1, page2], selection: { pageId: "page-1", objectIds: ["X"] } });
+}
+const objectX = (document: ChemDraftDocument) => document.pages.flatMap(page => page.objects).find(object => object.id === "X")!;
+/** The user deletes X and pastes an exact copy that gets the freed id back, on `pageId`. */
+function deleteAndPaste(document: ChemDraftDocument, pageId = "page-1"): ChemDraftDocument {
+  const copy = structuredClone(objectX(document));
+  return applyPatch(applyPatch(document, { op: "removeObject", objectId: "X" }, { now }),
+    { op: "addObject", pageId, object: copy }, { now });
+}
+
+describe("1.2.3 host-owned identity: a pin binds the selected object, never a same-id newcomer", () => {
+  it("refuses a same-page id reuse after delete and paste, even of an exact copy", async () => {
+    const f = pendingHost(identitySent());
+    const pending = f.host.invokeCommand("plugin.pending.run");
+    await Promise.resolve();
+    const pasted = deleteAndPaste(f.document());
+    expect(pasted.pages[0]!.objects.map(object => object.id)).toEqual(["T", "X"]);
+    f.edit(pasted);
+    f.release();
+    await expect(pending).rejects.toThrow(reselect(1));
+    expect(f.applyDocumentPatch).not.toHaveBeenCalled();
+    expect(f.document()).toBe(pasted);
+  });
+
+  it("refuses a same-page id reuse by another command's plugin insert", async () => {
+    const f = pendingHost(identitySent());
+    const pending = f.host.invokeCommand("plugin.pending.run");
+    await Promise.resolve();
+    const removed = applyPatch(f.document(), { op: "removeObject", objectId: "X" }, { now });
+    const inserted = applyPatch(removed, { op: "addObject", pageId: "page-1", object: molecule("X", 120) }, { now });
+    f.edit(inserted);
+    f.release();
+    await expect(pending).rejects.toThrow(reselect(1));
+    expect(f.document()).toBe(inserted);
+  });
+
+  it("refuses an insert that hands back the pinned object value itself: an insertion is always a new object", () => {
+    const sent = identitySent();
+    const pins = legacyWriteScopePages(sent, ["X"], "page-1");
+    const reinserted = applyPatch(applyPatch(sent, { op: "removeObject", objectId: "X" }, { now }),
+      { op: "addObject", pageId: "page-1", object: objectX(sent) }, { now });
+    expect(scopedObjectPage(reinserted, "X", pins)).toBeUndefined();
+    expect(() => assertLegacyWritePages(reinserted, { op: "updateObject", objectId: "X", changes: { x: 5 } }, pins)).toThrow(reselect(1));
+  });
+
+  it("a pasted copy of the pinned object on another page is not the pinned object", async () => {
+    const f = pendingHost(identitySent());
+    const pending = f.host.invokeCommand("plugin.pending.run");
+    await Promise.resolve();
+    const pasted = deleteAndPaste(f.document(), "page-2");
+    f.edit(pasted);
+    f.release();
+    await expect(pending).rejects.toThrow(reselect(1));
+    expect(f.document()).toBe(pasted);
+  });
+
+  it("a pinned object moved to another page stays writable after an edit and a restyle", async () => {
+    const f = pendingHost(identitySent());
+    const pending = f.host.invokeCommand("plugin.pending.run");
+    await Promise.resolve();
+    // The user nudges and restyles X (patch edits), then moves it to page 2.
+    const edited = applyPatch(applyPatch(f.document(), { op: "updateObject", objectId: "X", changes: { y: 40 } }, { now }),
+      { op: "updateObject", objectId: "X", changes: { style: { color: "#112233" } } }, { now });
+    const [page1, page2] = edited.pages;
+    f.edit({ ...edited, pages: [{ ...page1!, objects: page1!.objects.filter(object => object.id !== "X") },
+      { ...page2!, objects: [objectX(edited)] }] });
+    f.release();
+    await expect(pending).resolves.toMatchObject({ applied: true });
+    expect(f.document().pages[1]!.objects[0]).toMatchObject({ id: "X", x: 500, y: 40, style: { color: "#112233" } });
+    expect(f.document().pages[0]!.objects).toEqual([text("T")]);
+  });
+
+  it("undo and redo of an edit or a deletion keep the pinned object's identity", () => {
+    let history = createDocumentHistory(identitySent());
+    history = applyPatchWithHistory(history, { op: "updateObject", objectId: "X", changes: { y: 40 } }, { now });
+    // Send happens on the edited document.
+    const pins = legacyWriteScopePages(history.present, ["X"], "page-1");
+    const write = { op: "updateObject" as const, objectId: "X", changes: { x: 500 } };
+    history = undo(history);
+    expect(objectX(history.present)).toMatchObject({ y: 0 });
+    expect(() => assertLegacyWritePages(history.present, write, pins)).not.toThrow();
+    history = redo(history);
+    expect(() => assertLegacyWritePages(history.present, write, pins)).not.toThrow();
+    history = applyPatchWithHistory(history, { op: "removeObject", objectId: "X" }, { now });
+    expect(() => assertLegacyWritePages(history.present, write, pins)).toThrow(reselect(1));
+    history = undo(history);
+    expect(() => assertLegacyWritePages(history.present, write, pins)).not.toThrow();
+  });
+
+  it("undo back to the object a pasted newcomer replaced does not rebind the newcomer's pin, and redo restores it", () => {
+    let history = createDocumentHistory(identitySent());
+    history = applyPatchWithHistory(history, { op: "removeObject", objectId: "X" }, { now });
+    history = applyPatchWithHistory(history, { op: "addObject", pageId: "page-1", object: molecule("X", 300) }, { now });
+    // Send selects the pasted newcomer.
+    const pins = legacyWriteScopePages(history.present, ["X"], "page-1");
+    const write = { op: "updateObject" as const, objectId: "X", changes: { x: 500 } };
+    history = undo(undo(history));
+    // The original X is back on page 1 under the same id; it is not the object that was selected.
+    expect(objectX(history.present)).toMatchObject({ x: 0 });
+    expect(() => assertLegacyWritePages(history.present, write, pins)).toThrow(reselect(1));
+    history = redo(redo(history));
+    expect(() => assertLegacyWritePages(history.present, write, pins)).not.toThrow();
+  });
+
+  it("the final check refuses a write that reached a same-page newcomer", () => {
+    const sent = identitySent();
+    const pins = legacyWriteScopePages(sent, ["X"], "page-1");
+    const pasted = deleteAndPaste(sent);
+    const proposed = { reason: "Move", warnings: [], requiresUserApproval: true as const,
+      patch: { op: "updateObject" as const, objectId: "X", changes: { x: 500 } } };
+    expect(() => assertPluginPatchWriteScope(pasted, proposed, ["X"], undefined, undefined, pins)).toThrow(reselect(1));
+    const after = applyPatch(pasted, proposed.patch, { now });
+    expect(() => assertPluginDocumentWriteScope(pasted, after, proposed, ["X"], pins))
+      .toThrow('Plugin write refused: molecule "X" was changed (x), but was not selected when the command started.');
+  });
+
+  it("an object the command inserts under its own deleted pin's id stays writable as its insertion", async () => {
+    let current = identitySent();
+    const applyDocumentPatch = vi.fn((request: PluginPatchApplicationRequest) => {
+      const before = current;
+      assertPluginPatchWriteScope(before, request.patch, request.writeScopeObjectIds, undefined, undefined, request.writeScopePages);
+      const after = applyPatch(before, request.patch.patch, { now });
+      assertPluginDocumentWriteScope(before, after, request.patch, request.writeScopeObjectIds, request.writeScopePages);
+      current = after;
+      return { applied: true as const, objectIds: writePatchOps(request.patch.patch).flatMap(op =>
+        op.op === "addObject" ? [op.object.id] : "objectId" in op ? [op.objectId] : []) };
+    });
+    const host = new PluginHost({ getActiveDocument: () => current, applyDocumentPatch });
+    host.registerPlugin({ id: "org.test.replace", name: "Replace", version: "0.0.1", apiVersion: "^0.1.8", entry: "plugin.js",
+      permissions: ["document.write"], contributes: { commands: [{ id: "plugin.replace.run", title: "Replace" }] }
+    }, { commandHandlers: { "plugin.replace.run": async ctx => {
+      await ctx.documents.applyPatch!({ reason: "Remove", patch: { op: "removeObject", objectId: "X" } });
+      await ctx.documents.applyPatch!({ reason: "Insert", patch: { op: "addObject", pageId: "page-1", object: molecule("X", 200) } });
+      return ctx.documents.applyPatch!({ reason: "Edit the insertion", patch: { op: "updateObject", objectId: "X", changes: { x: 300 } } });
+    } } });
+    await expect(host.invokeCommand("plugin.replace.run")).resolves.toMatchObject({ applied: true });
+    expect(applyDocumentPatch).toHaveBeenCalledTimes(3);
+    expect(objectX(current)).toMatchObject({ x: 300 });
+  });
+
+  it("an id selected at Send that names no object pins nothing a later object could take", () => {
+    const sent = identitySent();
+    const pins = legacyWriteScopePages(sent, ["Y"], "page-1");
+    const later = applyPatch(sent, { op: "addObject", pageId: "page-1", object: molecule("Y", 200) }, { now });
+    expect(() => assertLegacyWritePages(later, { op: "updateObject", objectId: "Y", changes: { x: 5 } }, pins)).toThrow(reselect(1));
+  });
+
+  it("the identity is host memory only: never in the document's data, its file, or a structured clone", () => {
+    const sent = identitySent();
+    const before = JSON.stringify(sent);
+    const file = serializeDocument(sent);
+    const pins = legacyWriteScopePages(sent, ["X"], "page-1")!;
+    expect(JSON.stringify(sent)).toBe(before);
+    expect(serializeDocument(sent)).toBe(file);
+    expect(Object.getOwnPropertySymbols(objectX(sent))).toEqual([]);
+    expect(scopedObjectPage(sent, "X", pins)).toBe("page-1");
+    // The same data read back from its file or cloned is a different object: the pin does not match it.
+    expect(scopedObjectPage(deserializeDocument(file), "X", pins)).toBeUndefined();
+    expect(scopedObjectPage(structuredClone(sent), "X", pins)).toBeUndefined();
+    // A pin cannot be posted to a worker or written out as data.
+    expect(() => structuredClone(pins.get("X"))).toThrow();
+    expect(JSON.stringify(pins.get("X"))).not.toContain("chemdraft");
   });
 });

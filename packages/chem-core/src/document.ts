@@ -9,6 +9,7 @@ import {
 } from "./schemas";
 import { engineDocuments } from "./engineDocuments";
 import { normalizeBracketPairs, retainBracketIdentity } from "./brackets";
+import { retainObjectIdentity } from "./objectIdentity";
 import { DefaultPageLayout, createPageLayout, pageMarginFromLayout } from "./page-layout";
 import { ignorableFieldsForNativeFeatures, minimumAppVersionForDocument, NativeDocumentBaselineAppVersion, NativeDocumentFormatVersion } from "./documentFeatures";
 import { compareNativeVersions, restoreNativeExtensions, type NativeDocumentWriteWarning } from "./nativeCompatibilityState";
@@ -186,8 +187,11 @@ export function migrateLegacyTableObjects(candidate: unknown): unknown {
 
 export function cloneDocument(document: ChemDraftDocument): ChemDraftDocument {
   const clone = parseDocument(JSON.parse(JSON.stringify(document)) as unknown);
+  // A copy of the same document: each object keeps its host identity (objectIdentity.ts).
   document.pages.forEach((page, pageIndex) => page.objects.forEach((object, objectIndex) => {
-    if (object.type === "bracket") retainBracketIdentity(object, clone.pages[pageIndex]!.objects[objectIndex]!);
+    const copy = clone.pages[pageIndex]!.objects[objectIndex]!;
+    retainObjectIdentity(object, copy);
+    if (object.type === "bracket") retainBracketIdentity(object, copy);
   }));
   return clone;
 }
