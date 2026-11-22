@@ -170,8 +170,10 @@ describe.each([["macos", "MacIntel"], ["windows", "Win32"]] as const)("the nativ
       ["guidedTour", "action", { action: "openGuide", url: PLUGIN_AUTHORING_GUIDE_URL }],
       ["guidedTour", "action", { action: "openGuide", url: PLUGIN_AUTHORING_GUIDE_URL }]
     ]);
+    const isOpenGuide = (data: DialogMessage["data"]) =>
+      typeof data === "object" && data !== null && "action" in data && data.action === "openGuide";
     expect(host.invoke.mock.calls.filter(([command, args]) => command === "dialog_send" &&
-      (args as { message: DialogMessage }).message.data.action === "openGuide")).toHaveLength(3);
+      isOpenGuide((args as { message: DialogMessage }).message.data))).toHaveLength(3);
     expect(new Set(host.sent.map(message => message.requestId)).size).toBe(3);
     expect(window.location.href).toBe(location);
     expect(invokeCommand).not.toHaveBeenCalled();
