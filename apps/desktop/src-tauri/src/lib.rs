@@ -13366,12 +13366,23 @@ mod tests {
 
     #[test]
     fn committed_sidecar_placeholders_are_never_runnable() {
-        let binaries = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("binaries");
-        for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
-            let placeholder = binaries.join(format!("avogadro3d-sidecar-{triple}"));
-            assert!(is_sidecar_placeholder(&placeholder), "{triple}");
-            assert!(!is_runnable_sidecar(&placeholder), "{triple}");
-        }
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let binaries = manifest.join("binaries");
+        let placeholder = binaries.join("avogadro3d-sidecar-aarch64-unknown-linux-gnu");
+        assert!(is_sidecar_placeholder(&placeholder));
+        assert!(!is_runnable_sidecar(&placeholder));
+        // The x86_64 Linux sidecar is a placeholder exactly until a maintainer commits the build
+        // pinned in scripts/engine3d-sidecar-linux.json.
+        let pin: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(manifest.join("../../../scripts/engine3d-sidecar-linux.json"))
+                .expect("Linux sidecar pin"),
+        )
+        .expect("Linux sidecar pin JSON");
+        let pending = pin["sha256"] == "PENDING-MAINTAINER-COMMIT";
+        let linux = binaries.join("avogadro3d-sidecar-x86_64-unknown-linux-gnu");
+        assert_eq!(is_sidecar_placeholder(&linux), pending);
+        // Windows also requires a PE image, which an ELF is not.
+        assert_eq!(is_runnable_sidecar(&linux), !pending && !cfg!(windows));
         for real in [
             "avogadro3d-sidecar-aarch64-apple-darwin",
             "avogadro3d-sidecar-x86_64-apple-darwin",

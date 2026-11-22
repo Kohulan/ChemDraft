@@ -82,11 +82,13 @@ That path contains the committed Intel x86_64 Mach-O sidecar, built for macOS
 `apps/desktop/src-tauri/binaries/README.md`.
 The Intel smoke workflow runs only the committed artifact, never a local build.
 
-### x86_64 Linux sidecar (built in CI, not committed)
+### x86_64 Linux sidecar (built in CI, committed by a maintainer)
 
-The Linux packages ship a sidecar that CI builds from source on every Linux package
-build (`.github/workflows/linux-build.yml`, Ubuntu 22.04, the oldest supported host).
-It fetches the same pinned dependencies with the commands above, then:
+The Linux packages ship the committed
+`apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu`, like the
+macOS and Windows sidecars. It is built by `.github/workflows/linux-sidecar-build.yml`
+(dispatched by hand, Ubuntu 22.04, the oldest supported host), which fetches the same
+pinned dependencies with the commands above, then:
 
 ```bash
 cd native/avogadro3d-sidecar
@@ -102,11 +104,19 @@ The job fails unless `scripts/check-engine3d-sidecar.mjs` (an ELF, glibc and
 handshake check that needs only Node, no binutils) finds a real x86-64 ELF whose
 `DT_NEEDED` entries are only glibc libraries, with no symbol version newer than glibc
 2.35, that completes the protocol handshake. It then runs `pnpm audit:engine3d-sidecar`
-and all three smokes below, and copies the
-executable over `apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu`
-for the bundle step only. That committed file stays the placeholder. The container
-smoke repeats the handshake on the sidecar installed from the `.deb` and the
-AppImage on each distro. aarch64 Linux has no build and stays a placeholder.
+and all three smokes below, and uploads the artifact `engine3d-sidecar-linux-x86_64`
+(the binary and its `.sha256`), printing the SHA-256 and the run id in the job summary.
+
+A maintainer commits that binary (mode 0755) and puts the run id and SHA-256 into
+`scripts/engine3d-sidecar-linux.json` and `docs/architecture/dependency-inventory.md`;
+`docs/releasing/linux.md` ("The x86_64 3D sidecar") lists the steps. Linux packaging
+(`.github/workflows/linux-build.yml`) never builds the sidecar or writes over the
+committed file: `scripts/verify-committed-linux-sidecar.mjs` checks its SHA-256
+against the pin and repeats the handshake check, and fails while the pin still reads
+`PENDING-MAINTAINER-COMMIT`. The container smoke repeats the handshake on the sidecar
+installed from the `.deb` and the AppImage on each distro. Changing the avogadrolibs
+commit pinned in `CMakeLists.txt` requires a rebuilt, recommitted Linux sidecar, as
+for the other platforms. aarch64 Linux has no build and stays a placeholder.
 
 Without the local `_deps` checkout, the CMake preset intentionally fails rather
 than falling back to placeholder mechanics. A no-Avogadro fallback build can be

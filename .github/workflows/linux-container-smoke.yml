@@ -16,6 +16,8 @@ on:
       - native/avogadro3d-sidecar/**
       - scripts/build-opsin-runtime.mjs
       - scripts/check-engine3d-sidecar.mjs
+      - scripts/engine3d-sidecar-linux.json
+      - scripts/verify-committed-linux-sidecar.mjs
       - scripts/desktop-tauri.mjs
       - tools/release/verify-bundle-licenses.mjs
       - tools/release/record-build.mjs
@@ -202,7 +204,7 @@ jobs:
         run: bash .github/workflows/linux-package-smoke/host-mesa.sh "$BUNDLE"
 
       # Interactive 3D needs the native sidecar: the installed copy must be a real x86-64 ELF, not
-      # the committed placeholder, need only glibc, and complete its protocol handshake on this
+      # a placeholder, need only glibc, and complete its protocol handshake on this
       # distro's glibc.
       - name: Check the installed 3D sidecar
         run: |

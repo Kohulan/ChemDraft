@@ -33,19 +33,21 @@ The workflow:
 
 1. Checks that `ref` is a tag (or full SHA) and that `upload_to_release` is `v<app version>`.
    For uploads, the build ref must also match the workflow commit.
-2. Builds the x86_64 3D sidecar from source: fetches the pinned avogadrolibs commit and Eigen
-   3.4.0 (by its commit, `3147391d946bb4b6c68edd901f2add6ac1f31f8c`, never the tag name) into
-   `native/avogadro3d-sidecar/_deps` as that directory's README describes, builds it with `cmake --preset linux-x86_64` (Release, libstdc++ and libgcc linked statically, so it
-   needs only glibc 2.35 or newer), and fails unless it is an x86-64 ELF that needs only glibc.
-   Then builds the OPSIN Java runtime on the runner and smoke-tests it (benzene).
-3. Runs `pnpm audit:engine3d-sidecar`, the sidecar handshake
-   (`scripts/check-engine3d-sidecar.mjs`) and the three `smoke:engine3d-*`
-   smokes against the sidecar, copies it over the committed placeholder for the bundle step only,
-   builds a stable `.deb` and AppImage (`CHEMDRAFT_STABLE_BUILD=1`, no worktree label), and
-   restores the placeholder. Any failure fails the job; it never ships the placeholder.
+2. Verifies the committed x86_64 3D sidecar before anything else: runs the sidecar audit, then
+   `scripts/verify-committed-linux-sidecar.mjs`, which fails unless
+   `scripts/engine3d-sidecar-linux.json` is filled in, the committed file is not a placeholder, its
+   SHA-256 equals the pinned one, and `scripts/check-engine3d-sidecar.mjs` passes it (a native
+   x86-64 ELF that needs only glibc libraries, at most glibc 2.35, and completes the protocol
+   handshake). Packaging never builds the sidecar or writes over it; see
+   [The x86_64 3D sidecar](#the-x86_64-3d-sidecar). Until a maintainer commits it, the pin reads
+   `PENDING-MAINTAINER-COMMIT` and every Linux package build fails here, on purpose.
+3. Builds the OPSIN Java runtime on the runner and smoke-tests it (benzene), then a stable `.deb`
+   and AppImage (`CHEMDRAFT_STABLE_BUILD=1`, no worktree label), and fails if the bundle build left
+   the source tree dirty. Any failure fails the job.
 4. Checks the bundle identity and that the `.deb` carries `chemdraft`, the 3D sidecar and the
-   OPSIN runtime. The `.deb`'s sidecar must be byte-identical to the build, and the repacked
-   AppImage's copy must pass the handshake.
+   OPSIN runtime. The `.deb`'s sidecar must be byte-identical to the committed file and pass the
+   handshake, and so must the repacked AppImage's copy (by the handshake; linuxdeploy may rewrite
+   its RUNPATH).
 5. Repacks the AppImage after Tauri bundles it. It uses the host's Wayland and compiler runtime
    libraries and the host's `libgpg-error.so.0`. It also removes the bundled copies of libraries
    that host Mesa (`libEGL_mesa`, `libgallium`, `libgbm`, the DRI drivers) depends on, so the
@@ -76,6 +78,32 @@ The workflow:
 The [release body generator](three-builds.md#draft-the-body-on-macos) adds `## Linux` when both
 packages and their records are present and verified. Passing `--include-linux` requires that complete
 verified set in the assets directory.
+
+## The x86_64 3D sidecar
+
+`apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu` is a committed
+binary, pinned by SHA-256 in `scripts/engine3d-sidecar-linux.json`, the one place packaging reads
+its hash. Once the file is no longer the placeholder, `scripts/verify-committed-linux-sidecar.test.ts`
+checks the bytes on disk against the pin, and the dependency inventory against both pinned values.
+`.github/workflows/linux-sidecar-build.yml` builds it from the pinned avogadrolibs and Eigen
+commits on Ubuntu 22.04, as `native/avogadro3d-sidecar/README.md` describes, runs the audit, the
+handshake check and the three `smoke:engine3d-*` smokes, and uploads the artifact
+`engine3d-sidecar-linux-x86_64` (the binary and its `.sha256`). To land or replace it:
+
+1. `gh workflow run linux-sidecar-build.yml --ref <branch or tag>`; it has no inputs and builds
+   that ref's sources.
+2. From the run's summary, note the run id and the SHA-256. Download the artifact
+   (`gh run download <run id> -n engine3d-sidecar-linux-x86_64 -D <dir>`) and check it with
+   `sha256sum --check avogadro3d-sidecar-x86_64-unknown-linux-gnu.sha256` in that folder.
+3. `install -m 0755 <dir>/avogadro3d-sidecar-x86_64-unknown-linux-gnu
+   apps/desktop/src-tauri/binaries/` (git must record mode 100755).
+4. In `scripts/engine3d-sidecar-linux.json`, replace both `PENDING-MAINTAINER-COMMIT` values:
+   `buildRunId` with the run id, `sha256` with the SHA-256.
+5. In `docs/architecture/dependency-inventory.md`, fill in the same `run id:` and `SHA-256:`
+   in the `avogadrolibs` row.
+6. Commit all three files together. Any change to the avogadrolibs commit pinned in
+   `native/avogadro3d-sidecar/CMakeLists.txt` needs a rebuilt, recommitted sidecar: the handshake
+   check requires the binary to report that commit.
 
 ## Ubuntu smoke diagnostics
 
@@ -280,12 +308,12 @@ repository on GitHub Pages, or a Flathub listing.
 - Menus: on the document window, as on Windows (`install_app_menu`). Edit ▸ Cut / Copy / Paste
   invoke WebKitGTK's native editing commands in the focused window. The webview receives
   Ctrl+X / C / V directly and uses the same clipboard events for menu clicks and shortcuts.
-- 3D: the x86_64 `avogadro3d-sidecar` is built in CI from source (step 2 above) and never
-  committed; the committed x86_64 and aarch64 Linux files are placeholders (`binaries/README.md`).
-  The container smoke checks that the installed sidecar from the `.deb` and from the AppImage is
-  a real ELF that completes its handshake on each distro. A local build that still bundles a
-  placeholder shows Interactive 3D disabled with "Interactive 3D isn't available in this Linux
-  build yet"; Spin 3D does not use the sidecar.
+- 3D: the x86_64 `avogadro3d-sidecar` is committed like the macOS and Windows ones, built by
+  `linux-sidecar-build.yml` (see [The x86_64 3D sidecar](#the-x86_64-3d-sidecar)); the aarch64
+  Linux file stays a placeholder (`binaries/README.md`). The container smoke checks that the
+  installed sidecar from the `.deb` and from the AppImage is a real ELF that completes its
+  handshake on each distro. A build that bundles a placeholder shows Interactive 3D disabled with
+  "Interactive 3D isn't available in this Linux build yet"; Spin 3D does not use the sidecar.
 - Clipboard: `linux_clipboard.rs`, GTK's clipboard (X11 and Wayland). Targets are MIME types, so
   the editor's payload types are written unchanged; plain text is also offered as `UTF8_STRING`,
   `STRING` and `TEXT` for older X11 applications.

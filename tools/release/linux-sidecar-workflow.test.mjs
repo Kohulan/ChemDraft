@@ -4,39 +4,60 @@ import test from "node:test";
 
 const read = (path) => readFileSync(new URL(`../../${path}`, import.meta.url), "utf8");
 
-test("the Linux package build ships a native 3D sidecar built from the pinned sources, never the placeholder", () => {
-  const build = read(".github/workflows/linux-build.yml");
-  const commit = read("native/avogadro3d-sidecar/CMakeLists.txt").match(/"([0-9a-f]{40})"/)?.[1];
-  assert.ok(commit);
-  const at = (needle) => {
-    const index = build.indexOf(needle);
-    assert.ok(index >= 0, `linux-build.yml lacks ${needle}`);
-    return index;
-  };
+const indexer = (text, file) => (needle) => {
+  const index = text.indexOf(needle);
+  assert.ok(index >= 0, `${file} lacks ${needle}`);
+  return index;
+};
+
+test("the Linux sidecar workflow builds the pinned sources, checks them, and uploads one binary with its SHA-256", () => {
+  const sidecar = read(".github/workflows/linux-sidecar-build.yml");
+  const at = indexer(sidecar, "linux-sidecar-build.yml");
+  assert.match(sidecar, /^on:\n  workflow_dispatch:\n\n/m);
+  assert.match(sidecar, /runs-on: ubuntu-22\.04/);
   const fetch = at("git clone https://github.com/OpenChemistry/avogadrolibs.git _deps/avogadrolibs");
   const eigen = at('git -C _deps/eigen fetch --depth 1 origin "$eigen"');
   const configure = at("cmake --preset linux-x86_64");
   const compile = at("cmake --build --preset linux-x86_64");
   const handshake = at('node "$GITHUB_WORKSPACE/scripts/check-engine3d-sidecar.mjs" "$bin"');
-  const smoke = at("pnpm smoke:engine3d-real-structure");
-  const stage = at('install -m 0755 "$CHEMDRAFT_ENGINE3D_SIDECAR" "$target"');
+  const audit = at("pnpm run audit:engine3d-sidecar");
+  const smokes = ["real-structure", "hold-steady", "anneal-energy"].map((name) => at(`pnpm smoke:engine3d-${name}`));
+  const stage = at('sha256sum -- "$name" > "$name.sha256"');
+  const upload = at("name: engine3d-sidecar-linux-x86_64");
+  const summary = at('>> "$GITHUB_STEP_SUMMARY"');
+  assert.ok(fetch < eigen && eigen < configure && configure < compile && compile < handshake && handshake < audit);
+  assert.ok(smokes.every((smoke) => audit < smoke && smoke < stage) && stage < upload && upload < summary);
+  assert.match(sidecar, /echo "- run id: \\`\$GITHUB_RUN_ID\\`"/);
+  assert.match(sidecar, /echo "- SHA-256: \\`\$SHA256\\`"/);
+  // Eigen 3.4.0 by commit, verified, never by the movable tag name.
+  assert.match(sidecar, /eigen=3147391d946bb4b6c68edd901f2add6ac1f31f8c/);
+  assert.match(sidecar, /\[ "\$\(git -C _deps\/eigen rev-parse HEAD\)" = "\$eigen" \]/);
+  assert.doesNotMatch(sidecar, /--branch 3\.4\.0/);
+  // The commit comes from CMakeLists.txt, the one place it is pinned.
+  assert.match(sidecar, /commit=\$\(grep -oE '\[0-9a-f\]\{40\}' CMakeLists\.txt \| sort -u\)/);
+  for (const text of [sidecar, read(".github/workflows/linux-build.yml")]) {
+    assert.doesNotMatch(text, /sidecar-check\.sh|readelf|objdump/);
+    assert.doesNotMatch(text, /continue-on-error/);
+    // Every action is pinned by commit.
+    for (const [, ref] of text.matchAll(/uses: [\w./-]+@(\S+)/g)) assert.match(ref, /^[0-9a-f]{40}$/);
+  }
+});
+
+test("the Linux package build ships the committed sidecar it verified and never writes over it", () => {
+  const build = read(".github/workflows/linux-build.yml");
+  const at = indexer(build, "linux-build.yml");
+  const verify = at("node scripts/verify-committed-linux-sidecar.mjs");
   const bundle = at("pnpm --filter @chemdraft/desktop build --bundles deb,appimage");
-  const restore = at("git checkout -- apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu");
-  const debCheck = at('cmp native/avogadro3d-sidecar/build/linux-x86_64/avogadro3d-sidecar "$payload/usr/bin/avogadro3d-sidecar"');
+  const clean = at("- name: Check the source tree is still clean after the bundle build");
+  const debCheck = at('cmp apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu "$payload/usr/bin/avogadro3d-sidecar"');
   const debSidecarCheck = at('node scripts/check-engine3d-sidecar.mjs "$payload/usr/bin/avogadro3d-sidecar"');
   const appImageCheck = at('check-engine3d-sidecar.mjs" squashfs-root/usr/bin/avogadro3d-sidecar');
   const record = at('record-build.mjs --artifact "$DEB"');
-  assert.ok(fetch < eigen && eigen < configure && configure < compile && compile < handshake);
-  assert.ok(handshake < smoke && smoke < stage && stage < bundle && bundle < restore);
-  assert.ok(restore < debCheck && debCheck < debSidecarCheck && debSidecarCheck < appImageCheck && appImageCheck < record);
-  // Eigen 3.4.0 by commit, verified, never by the movable tag name.
-  assert.match(build, /eigen=3147391d946bb4b6c68edd901f2add6ac1f31f8c/);
-  assert.match(build, /\[ "\$\(git -C _deps\/eigen rev-parse HEAD\)" = "\$eigen" \]/);
-  assert.doesNotMatch(build, /--branch 3\.4\.0/);
-  assert.doesNotMatch(build, /sidecar-check\.sh|readelf|objdump/);
-  // The commit comes from CMakeLists.txt, the one place it is pinned.
-  assert.match(build, /commit=\$\(grep -oE '\[0-9a-f\]\{40\}' CMakeLists\.txt \| sort -u\)/);
-  assert.doesNotMatch(build, /continue-on-error/);
+  assert.ok(verify < at("- name: Install Linux build dependencies") && verify < bundle);
+  assert.ok(bundle < clean && clean < debCheck && debCheck < debSidecarCheck && debSidecarCheck < appImageCheck && appImageCheck < record);
+  // Packaging neither builds the sidecar nor touches the tracked file.
+  assert.doesNotMatch(build, /cmake|_deps|native\/avogadro3d-sidecar\/build/);
+  assert.doesNotMatch(build, /git checkout --|install -m 0755 [^\n]*binaries\//);
 });
 
 test("the Linux CMake preset matches the shipped sidecar options and links only glibc dynamically", () => {
@@ -70,8 +91,8 @@ test("the container smoke checks the installed sidecar from the .deb and the App
   assert.match(check, /export const MAX_GLIBC = "2\.35";/);
 });
 
-test("the committed Linux sidecars stay placeholders", () => {
-  for (const triple of ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]) {
-    assert.match(read(`apps/desktop/src-tauri/binaries/avogadro3d-sidecar-${triple}`), /avogadro3d-sidecar placeholder/);
-  }
+// The x86_64 file is pinned in scripts/engine3d-sidecar-linux.json and checked against its bytes by
+// scripts/verify-committed-linux-sidecar.test.ts.
+test("the committed aarch64 Linux sidecar stays a placeholder", () => {
+  assert.match(read("apps/desktop/src-tauri/binaries/avogadro3d-sidecar-aarch64-unknown-linux-gnu"), /avogadro3d-sidecar placeholder/);
 });
