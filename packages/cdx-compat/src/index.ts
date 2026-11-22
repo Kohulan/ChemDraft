@@ -47,6 +47,7 @@ import {
 import { measureTextRun, planTableLayout, textObjectSpansForRendering, transformPointForObject } from "@chemdraft/layout-engine";
 import { bondedElementLabelMeaning, isGenericAtomLabel } from "@chemdraft/template-library";
 import { planMoleculeAtomLabels } from "@chemdraft/layout-engine";
+import { dativeDeprotonationCount, nativeAtomValenceForCharge, nativeBondOrderResolution, nativeElementFromAtomLabel } from "@chemdraft/layout-engine";
 import { sha256Hex, utf8Bytes, utf8String } from "./sha256";
 import { PROPS } from "./cdxTags";
 import { equalPrintMargins, fitPageSetup, importPageSetup, pagePrintMargins, type VisiblePageSetup } from "./pageSetup";
@@ -4510,12 +4511,18 @@ function importFragment(
     bond.order === "aromatic" ? [bond.fromAtomId, bond.toAtomId] : []));
   const snapshotAtomIds = new Set(expansion.abbreviations.filter(item => !item.expanded)
     .flatMap(item => item.atomCdxmlIds.map(id => atomIdByCdxmlId.get(id))));
+  const droppedHydrogenAtoms: MoleculeAtom[] = [];
   for (const atom of atoms) {
     const stated = statedHydrogensByAtomId.get(atom.id);
     if (stated !== undefined && (atom.labelLiteral || aromaticAtomIds.has(atom.id) || snapshotAtomIds.has(atom.id))) {
       atom.hydrogenCount = stated;
+    } else if (stated !== undefined) {
+      droppedHydrogenAtoms.push(atom);
     }
   }
+  const hydrogenCountWarning = droppedStatedHydrogensWarning(droppedHydrogenAtoms, atoms, normalizedBonds,
+    statedHydrogensByAtomId, atomIdByCdxmlId, context.sourceFormat, objectId);
+  if (hydrogenCountWarning) warnings.push(hydrogenCountWarning);
   const atomStereochemistry = Object.entries(cdxmlAtomStereochemistryByAtomId).map(
     ([atomId, stereo]) => `${atomId}:${stereo.assignment}`
   );
@@ -6342,6 +6349,55 @@ function cdxmlBondDisplayForBondStyle(display: MoleculeBond["display"]): string 
     return undefined;
   }
   return cdxmlBeginDisplayByBondStyle[bondStyle];
+}
+
+/**
+ * An ordinary atom's NumHydrogens is not kept: ChemDraft derives the count from valence, exactly as
+ * the drawn label and the formula do (layout-engine's label planner and document-workflow-core's
+ * `nativeAtomDiagnostic`: valence for the charge, less the bond orders, radicals and any dative
+ * deprotonation). Where the file stated a different count, the opened chemistry is not the file's,
+ * so one warning per fragment names each such atom and both counts (AGENTS.md §7). Atoms with no
+ * single derived count (no element, hydrogen itself, a carbon bonded only datively, whose label
+ * shows no H while the formula counts them) are left alone rather than described wrongly.
+ */
+function droppedStatedHydrogensWarning(
+  droppedAtoms: readonly MoleculeAtom[],
+  atoms: readonly MoleculeAtom[],
+  bonds: readonly MoleculeBond[],
+  statedHydrogensByAtomId: ReadonlyMap<string, number>,
+  atomIdByCdxmlId: ReadonlyMap<string, string>,
+  sourceFormat: string,
+  objectId: string
+): CompatibilityConversionWarning | undefined {
+  if (droppedAtoms.length === 0) return undefined;
+  const cdxmlIdByAtomId = new Map([...atomIdByCdxmlId].map(([cdxmlId, atomId]) => [atomId, cdxmlId]));
+  const resolution = nativeBondOrderResolution(atoms, bonds);
+  const mismatches: { atomId: string; label: string; stated: number; derived: number }[] = [];
+  for (const atom of droppedAtoms) {
+    const element = nativeElementFromAtomLabel(atom.element);
+    const stated = statedHydrogensByAtomId.get(atom.id);
+    if (!element || element === "H" || stated === undefined) continue;
+    const incident = resolution.bondsByAtom.get(atom.id) ?? [];
+    if (element === "C" && incident.length > 0 && incident.every(isDativeBond)) continue;
+    const derived = Math.max(0, nativeAtomValenceForCharge(element, atom.formalCharge)
+      - (resolution.bondOrderUsage.get(atom.id) ?? 0) - (atom.markRadicals ?? 0)
+      - dativeDeprotonationCount(atom, bonds, atoms, resolution));
+    if (derived === stated) continue;
+    mismatches.push({ atomId: atom.id, label: `atom ${cdxmlIdByAtomId.get(atom.id) ?? atom.id} (${element})`, stated, derived });
+  }
+  if (mismatches.length === 0) return undefined;
+  const hydrogens = (count: number) => `${count} hydrogen${count === 1 ? "" : "s"}`;
+  const [only] = mismatches;
+  const message = mismatches.length === 1
+    ? `${sourceFormat} import: ${only.label} states ${hydrogens(only.stated)}; ChemDraft derives ${only.derived}. The derived count is used.`
+    : `${sourceFormat} import: ${mismatches.length} atoms state hydrogen counts ChemDraft derives differently: ` +
+      `${mismatches.map((item) => `${item.label} states ${item.stated}, derives ${item.derived}`).join("; ")}. The derived counts are used.`;
+  return {
+    code: "cdxml.atom_hydrogen_count_derived",
+    message,
+    sourceObjectId: objectId,
+    atomIds: mismatches.map((item) => item.atomId)
+  };
 }
 
 function cdxmlAtomStereoAssignment(value: string | undefined): "R" | "S" | undefined {
