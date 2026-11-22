@@ -49,6 +49,7 @@ mod problem_reports;
 mod screen_capture;
 mod shortcut_recording_menu;
 mod structure_search;
+mod toolset_fit;
 mod utility_suspension;
 #[cfg(test)]
 mod utility_suspension_tests;
@@ -1776,6 +1777,13 @@ pub fn run() {
                     {
                         return;
                     }
+                    // A work-area fit is ChemDraft's adjustment, not the user's position (B9).
+                    let decision = toolset_fit::with_memory(|memory| {
+                        memory.moved(window.label(), (position.x, position.y))
+                    });
+                    if decision == toolset_fit::FitEventDecision::Skip {
+                        return;
+                    }
                     if let Err(error) = persist_toolset_position(
                         app,
                         &toolset_id,
@@ -1786,13 +1794,50 @@ pub fn run() {
                             "Could not persist ChemDraft toolset position {toolset_id}: {error}"
                         );
                     }
+                    // Moving a fitted inspector makes its fitted size the user's too.
+                    if decision == toolset_fit::FitEventDecision::PersistFrame
+                        && toolset_is_resizable(&toolset_id)
+                    {
+                        if let Err(error) = persist_toolset_size(window, &toolset_id) {
+                            eprintln!(
+                                "Could not persist ChemDraft toolset size {toolset_id}: {error}"
+                            );
+                        }
+                    }
                 }
                 WindowEvent::Resized(_) if toolset_is_resizable(&toolset_id) => {
+                    let Ok(size) = window.inner_size() else {
+                        return;
+                    };
+                    let decision = toolset_fit::with_memory(|memory| {
+                        memory.resized(window.label(), (size.width, size.height))
+                    });
+                    if decision == toolset_fit::FitEventDecision::Skip {
+                        return;
+                    }
                     if let Err(error) = persist_toolset_size(window, &toolset_id) {
                         eprintln!("Could not persist ChemDraft toolset size {toolset_id}: {error}");
                     }
+                    // Resizing a fitted inspector makes its fitted position the user's too.
+                    if decision == toolset_fit::FitEventDecision::PersistFrame {
+                        if let Some(position) = visible_toolset_physical_position(window) {
+                            if let Err(error) = persist_toolset_position(
+                                app,
+                                &toolset_id,
+                                position,
+                                window.scale_factor().unwrap_or(1.0),
+                            ) {
+                                eprintln!(
+                                    "Could not persist ChemDraft toolset position {toolset_id}: {error}"
+                                );
+                            }
+                        }
+                    }
                 }
                 WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed => {
+                    if matches!(event, WindowEvent::Destroyed) {
+                        toolset_fit::with_memory(|memory| memory.forget(window.label()));
+                    }
                     // Only a user close reaches the saved layout state; quit teardown must not.
                     if APP_QUITTING.load(Ordering::SeqCst) {
                         return;
@@ -7339,7 +7384,25 @@ fn resize_toolset_window(
     let window_scale = window.scale_factor().unwrap_or(scale);
     let position = window.outer_position().map_err(|error| error.to_string())?;
     let origin = (position.x, position.y);
-    let mut placement = toolset_content_placement(origin, (width, height), scale, area);
+    let label = window.label();
+    // A palette ChemDraft moved to fit a smaller work area starts from the user's saved position,
+    // so it returns there once the work area can hold it again (B9).
+    let fitted = toolset_fit::with_memory(|memory| memory.is_fitted(label));
+    let source = fitted
+        .then(|| saved_toolset_state(app, label))
+        .flatten()
+        .and_then(|state| {
+            let saved = state.position()?;
+            let saved_scale = state
+                .position_scale
+                .unwrap_or_else(|| window.scale_factor().unwrap_or(scale));
+            Some((
+                (saved.x * saved_scale).round() as i32,
+                (saved.y * saved_scale).round() as i32,
+            ))
+        })
+        .unwrap_or(origin);
+    let mut placement = toolset_content_placement(source, (width, height), scale, area);
     // Linux: a palette wider than its work area is capped to it and moved to the area's left edge,
     // the one place it fits (toolset_content_placement). Keep that move rather than the old origin.
     #[cfg(target_os = "linux")]
@@ -7347,7 +7410,7 @@ fn resize_toolset_window(
     #[cfg(not(target_os = "linux"))]
     let keep_fitted_position = false;
     // The monitor under most of the palette can differ from the one under its title.
-    if placement.position != origin
+    if placement.position != source
         && !keep_fitted_position
         && monitor_query::available_monitors(app)
             .unwrap_or_default()
@@ -7357,8 +7420,8 @@ fn resize_toolset_window(
                 #[cfg(target_os = "macos")]
                 {
                     monitor_logical_work_area(monitor).contains_title_strip(
-                        f64::from(position.x) / scale,
-                        f64::from(position.y) / scale,
+                        f64::from(source.0) / scale,
+                        f64::from(source.1) / scale,
                         width,
                         TOOLSET_TITLE_HEIGHT,
                     )
@@ -7368,7 +7431,7 @@ fn resize_toolset_window(
                 #[cfg(not(target_os = "macos"))]
                 {
                     toolset_title_in_physical_work_area(
-                        origin,
+                        source,
                         width,
                         window_scale,
                         monitor.work_area(),
@@ -7376,8 +7439,29 @@ fn resize_toolset_window(
                 }
             })
     {
-        placement.position = origin;
+        placement.position = source;
     }
+    // A move made only to fit the work area is not saved as the user's position (B9).
+    let plan = toolset_fit::plan_fit(
+        placement.position == origin,
+        placement.position != source,
+        fitted,
+    );
+    let live_size = window.inner_size().map_err(|error| error.to_string())?;
+    toolset_fit::with_memory(|memory| match plan.memory {
+        toolset_fit::FitMemoryChange::Keep => {}
+        toolset_fit::FitMemoryChange::Forget => memory.forget(label),
+        toolset_fit::FitMemoryChange::Record => memory.record(
+            label,
+            toolset_fit::FittedFrame {
+                from: origin,
+                to: placement.position,
+                from_size: (live_size.width, live_size.height),
+                to_size: placement.size,
+                tolerance: toolset_fit::tolerance(scale),
+            },
+        ),
+    });
     // X11/XWayland: pin the GtkWindow to the new size before resizing it. GTK clamps a resize to
     // the window's current hints, which still hold the previous content size.
     #[cfg(target_os = "linux")]
@@ -11313,18 +11397,50 @@ fn ensure_toolset_window<R: Runtime>(
     // A persisted position wins (the user moved it before); otherwise the JS-supplied default.
     // Either way it's clamped onto an attached monitor — a position saved on a display that's since
     // been unplugged would otherwise open the palette offscreen with no way to get it back.
-    let position = saved
-        .and_then(PersistedToolsetState::position)
-        .unwrap_or(default_position);
+    let saved_position = saved.and_then(PersistedToolsetState::position);
+    let position = saved_position.unwrap_or(default_position);
+    // A saved frame squeezed onto a smaller work area at creation is a fit, not a new user frame:
+    // its creation events must not overwrite the saved one (B9).
+    let record_creation_fit = |to: (i32, i32), to_size: (u32, u32), scale: f64| {
+        toolset_fit::with_memory(|memory| {
+            memory.record(
+                &label,
+                toolset_fit::FittedFrame {
+                    from: to,
+                    to,
+                    from_size: to_size,
+                    to_size,
+                    tolerance: toolset_fit::tolerance(scale),
+                },
+            )
+        });
+    };
     #[cfg(not(windows))]
-    let (position, width, height) = clamp_toolset_frame(app, position, (width, height), resizable);
+    let (position, width, height) = {
+        let (position, width, height, adjusted) =
+            clamp_toolset_frame(app, &label, position, (width, height), resizable);
+        if adjusted && saved_position.is_some() {
+            let scale = scale_at_logical_point(app, position.x, position.y);
+            let to = tauri::LogicalPosition::new(position.x, position.y).to_physical::<i32>(scale);
+            let to_size = tauri::LogicalSize::new(width, height).to_physical::<u32>(scale);
+            record_creation_fit((to.x, to.y), (to_size.width, to_size.height), scale);
+        }
+        (position, width, height)
+    };
     #[cfg(windows)]
     let placement = clamp_windows_toolset_frame(
         app,
+        &label,
         ToolsetFrameOrigin::Logical(position, saved.and_then(|state| state.position_scale)),
         (width, height),
         resizable,
-    );
+    )
+    .map(|(placement, adjusted)| {
+        if adjusted && saved_position.is_some() {
+            record_creation_fit(placement.position, placement.size, placement.scale);
+        }
+        placement
+    });
 
     // Keep every palette GtkWindow resizable on Linux. On native Wayland, a non-resizable
     // GtkWindow's fixed size hints can conflict with the compositor's configure (Weston's kiosk
@@ -11381,7 +11497,7 @@ fn ensure_toolset_window<R: Runtime>(
     // Only scrolling inspectors need a floor for manual resize. A toolbar's frame is fixed
     // at the DOM's measured size until the next fit. A floor here would leave narrow grids padded.
     let builder = if resizable {
-        builder.min_inner_size(96.0, 56.0)
+        builder.min_inner_size(TOOLSET_INSPECTOR_MIN_SIZE.0, TOOLSET_INSPECTOR_MIN_SIZE.1)
     } else {
         builder
     };
@@ -11827,6 +11943,10 @@ fn is_routed_menu_command(command_id: &str) -> bool {
 }
 
 const TOOLSET_TITLE_HEIGHT: f64 = 22.0;
+/// The Main toolbar, which stacks above the other palettes (`DEFAULT_TOOLSET_ID` in TypeScript).
+const MAIN_TOOLSET_ID: &str = "core.main";
+/// The smallest a scrolling inspector may be resized to (its builder's `min_inner_size`).
+const TOOLSET_INSPECTOR_MIN_SIZE: (f64, f64) = (96.0, 56.0);
 
 /// A monitor's full bounds in global logical points.
 #[cfg(not(windows))]
@@ -11840,6 +11960,24 @@ fn monitor_logical_bounds(monitor: &tauri::Monitor) -> (f64, f64, f64, f64) {
         origin.x + size.width,
         origin.y + size.height,
     )
+}
+
+/// The scale of the monitor holding a global logical point (1.0 when none does).
+#[cfg(not(windows))]
+fn scale_at_logical_point<R: Runtime>(app: &tauri::AppHandle<R>, x: f64, y: f64) -> f64 {
+    monitor_query::available_monitors(app)
+        .ok()
+        .and_then(|monitors| {
+            monitors
+                .iter()
+                .find(|monitor| {
+                    let (left, top, right, bottom) = monitor_logical_bounds(monitor);
+                    (left..right).contains(&x) && (top..bottom).contains(&y)
+                })
+                .map(tauri::Monitor::scale_factor)
+        })
+        .filter(|scale| scale.is_finite() && *scale > 0.0)
+        .unwrap_or(1.0)
 }
 
 /// A monitor's work area (minus menu bar and Dock) in the same logical points.
@@ -11889,19 +12027,23 @@ fn inspector_frame_in_work_area(
 /// created successfully and painted into nowhere — which reads to the user as "the toolbar won't
 /// open" even though View ▸ Toolbars shows it checked, with no UI path to recover it. Clamp onto the
 /// primary monitor (the one that's certainly present) whenever the saved spot is unreachable.
+///
+/// Returns the frame and whether it differs from the one given. A frame this moves also keeps its
+/// title strip out from under the Main toolbar (`label` is the palette being placed).
 #[cfg(not(windows))]
 fn clamp_toolset_frame<R: Runtime>(
     app: &tauri::AppHandle<R>,
+    label: &str,
     position: ToolsetWindowPosition,
     size: (f64, f64),
     resizable: bool,
-) -> (ToolsetWindowPosition, f64, f64) {
+) -> (ToolsetWindowPosition, f64, f64, bool) {
     let (width, height) = size;
     let monitors = match monitor_query::available_monitors(app) {
         Ok(monitors) if !monitors.is_empty() => monitors,
         // No monitor info (headless, or the platform refused): trust the saved position rather than
         // moving a window the user may have deliberately placed.
-        _ => return (position, width, height),
+        _ => return (position, width, height, false),
     };
 
     let areas = monitors
@@ -11918,7 +12060,89 @@ fn clamp_toolset_frame<R: Runtime>(
         let primary = monitor_query::primary_monitor(app).ok().flatten();
         monitor_logical_work_area(primary.as_ref().unwrap_or(&monitors[0]))
     });
-    toolset_frame_in_work_area(position, size, resizable, area)
+    let (clamped, width, height) = toolset_frame_in_work_area(position, size, resizable, area);
+    if !toolset_frame_differs(position, size, clamped, (width, height)) {
+        return (clamped, width, height, false);
+    }
+    let Some((toolbar, scale)) = main_toolbar_frame(app, label) else {
+        return (clamped, width, height, true);
+    };
+    let toolbar = ScreenRect::new(
+        toolbar.x / scale,
+        toolbar.y / scale,
+        toolbar.width / scale,
+        toolbar.height / scale,
+    );
+    let (clamped, width, height, _) = toolset_fit::frame_clear_of_toolbar(
+        clamped,
+        (width, height),
+        resizable,
+        area,
+        toolbar,
+        TOOLSET_TITLE_HEIGHT,
+        TOOLSET_INSPECTOR_MIN_SIZE.1,
+    );
+    (clamped, width, height, true)
+}
+
+/// Whether two logical palette frames differ by half a point or more on any edge.
+fn toolset_frame_differs(
+    position: ToolsetWindowPosition,
+    size: (f64, f64),
+    other_position: ToolsetWindowPosition,
+    other_size: (f64, f64),
+) -> bool {
+    [
+        position.x - other_position.x,
+        position.y - other_position.y,
+        size.0 - other_size.0,
+        size.1 - other_size.1,
+    ]
+    .into_iter()
+    .any(|difference| difference.abs() >= 0.5)
+}
+
+/// The Main toolbar's live outer frame in physical pixels, and its scale, unless it is the palette
+/// being placed or is hidden or minimized.
+fn main_toolbar_frame<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    placing_label: &str,
+) -> Option<(ScreenRect, f64)> {
+    let label = toolset_window_label(MAIN_TOOLSET_ID);
+    if label == placing_label {
+        return None;
+    }
+    let window = app.get_webview_window(&label)?;
+    if !window.is_visible().unwrap_or(false) || window.is_minimized().unwrap_or(true) {
+        return None;
+    }
+    let scale = window.scale_factor().ok()?;
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let position = window.outer_position().ok()?;
+    let size = window.outer_size().ok()?;
+    Some((
+        ScreenRect::new(
+            f64::from(position.x),
+            f64::from(position.y),
+            f64::from(size.width),
+            f64::from(size.height),
+        ),
+        scale,
+    ))
+}
+
+/// A palette's saved layout entry, read through its window label.
+fn saved_toolset_state<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    label: &str,
+) -> Option<PersistedToolsetState> {
+    let toolset_id = toolset_id_for_window_label(app, label)?;
+    load_toolset_layout_state(app)
+        .toolsets
+        .get(&toolset_id)
+        .cloned()
 }
 
 #[cfg(any(not(windows), test))]
@@ -11986,9 +12210,7 @@ fn monitor_containing_physical_point(
         .find(|monitor| toolset_monitor_contains(monitor, point))
 }
 
-/// Select a Windows monitor in virtual-desktop pixels. Only after selecting it do we use its
-/// scale to clamp the frame in monitor-local points and convert it back to pixels.
-#[cfg(any(windows, test))]
+#[cfg(test)]
 fn clamp_toolset_frame_in_physical_space(
     origin: ToolsetFrameOrigin,
     size: (f64, f64),
@@ -11996,6 +12218,23 @@ fn clamp_toolset_frame_in_physical_space(
     monitors: &[ToolsetMonitor],
     primary: &ToolsetMonitor,
 ) -> panel_window_frame::Placement {
+    clamp_toolset_frame_in_physical_space_clear_of(origin, size, resizable, monitors, primary, None)
+        .0
+}
+
+/// Select a Windows monitor in virtual-desktop pixels. Only after selecting it do we use its
+/// scale to clamp the frame in monitor-local points and convert it back to pixels. A frame this
+/// moves keeps its title strip out from under `toolbar` (the Main toolbar's frame in virtual-desktop
+/// pixels). Also returns whether the frame differs from the one given.
+#[cfg(any(windows, test))]
+fn clamp_toolset_frame_in_physical_space_clear_of(
+    origin: ToolsetFrameOrigin,
+    size: (f64, f64),
+    resizable: bool,
+    monitors: &[ToolsetMonitor],
+    primary: &ToolsetMonitor,
+    toolbar: Option<ScreenRect>,
+) -> (panel_window_frame::Placement, bool) {
     let (physical, source_scale) = match origin {
         ToolsetFrameOrigin::Physical((x, y), scale) => ((f64::from(x), f64::from(y)), scale),
         ToolsetFrameOrigin::Logical(position, saved_scale) => {
@@ -12055,26 +12294,54 @@ fn clamp_toolset_frame_in_physical_space(
         x: (physical.0 - f64::from(x)) / scale,
         y: (physical.1 - f64::from(y)) / scale,
     };
-    let (position, width, height) =
+    let (clamped, width, height) =
         toolset_frame_in_work_area(position, size, resizable, monitor.work_area);
+    let adjusted = toolset_frame_differs(position, size, clamped, (width, height));
+    let (position, width, height) = match toolbar.filter(|_| adjusted) {
+        Some(toolbar) => {
+            let toolbar = ScreenRect::new(
+                (toolbar.x - f64::from(x)) / scale,
+                (toolbar.y - f64::from(y)) / scale,
+                toolbar.width / scale,
+                toolbar.height / scale,
+            );
+            let (position, width, height, _) = toolset_fit::frame_clear_of_toolbar(
+                clamped,
+                (width, height),
+                resizable,
+                monitor.work_area,
+                toolbar,
+                TOOLSET_TITLE_HEIGHT,
+                TOOLSET_INSPECTOR_MIN_SIZE.1,
+            );
+            (position, width, height)
+        }
+        None => (clamped, width, height),
+    };
     let size = tauri::LogicalSize::new(width, height).to_physical::<u32>(scale);
-    panel_window_frame::Placement {
-        position: (
-            (f64::from(x) + position.x * scale).round() as i32,
-            (f64::from(y) + position.y * scale).round() as i32,
-        ),
-        size: (size.width, size.height),
-        scale,
-    }
+    (
+        panel_window_frame::Placement {
+            position: (
+                (f64::from(x) + position.x * scale).round() as i32,
+                (f64::from(y) + position.y * scale).round() as i32,
+            ),
+            size: (size.width, size.height),
+            scale,
+        },
+        adjusted,
+    )
 }
 
+/// Also returns whether the frame differs from the one given (see
+/// [`clamp_toolset_frame_in_physical_space_clear_of`]); `label` is the palette being placed.
 #[cfg(windows)]
 fn clamp_windows_toolset_frame<R: Runtime>(
     app: &tauri::AppHandle<R>,
+    label: &str,
     origin: ToolsetFrameOrigin,
     size: (f64, f64),
     resizable: bool,
-) -> Option<panel_window_frame::Placement> {
+) -> Option<(panel_window_frame::Placement, bool)> {
     let monitors: Vec<_> = monitor_query::available_monitors(app)
         .ok()?
         .iter()
@@ -12086,8 +12353,13 @@ fn clamp_windows_toolset_frame<R: Runtime>(
         .as_ref()
         .map(ToolsetMonitor::from_native);
     let primary = primary.as_ref().or_else(|| monitors.first())?;
-    Some(clamp_toolset_frame_in_physical_space(
-        origin, size, resizable, &monitors, primary,
+    Some(clamp_toolset_frame_in_physical_space_clear_of(
+        origin,
+        size,
+        resizable,
+        &monitors,
+        primary,
+        main_toolbar_frame(app, label).map(|(toolbar, _)| toolbar),
     ))
 }
 
@@ -12108,16 +12380,59 @@ fn recover_offscreen_toolset_window<R: Runtime>(
     let Ok(scale) = window.scale_factor() else {
         return;
     };
-    let Ok(size) = window.outer_size() else {
+    let (Ok(size), Ok(inner)) = (window.outer_size(), window.inner_size()) else {
         return;
     };
     let size = size.to_logical::<f64>(scale);
-    let (clamped, width, height) =
-        clamp_toolset_frame(app, position, (size.width, size.height), resizable);
-    if (width - size.width).abs() >= 0.5 || (height - size.height).abs() >= 0.5 {
+    let live_size = (size.width, size.height);
+    let label = window.label();
+    // A palette ChemDraft fitted to a smaller work area is re-placed from the user's saved frame,
+    // so it returns there once the work area can hold it again (B9).
+    let fitted = toolset_fit::with_memory(|memory| memory.is_fitted(label));
+    let (source, source_size) = fitted
+        .then(|| saved_toolset_state(app, label))
+        .flatten()
+        .and_then(|state| {
+            let position = state.position()?;
+            Some((position, state.window_size(resizable).unwrap_or(live_size)))
+        })
+        .unwrap_or((position, live_size));
+    let (clamped, width, height, adjusted) =
+        clamp_toolset_frame(app, label, source, source_size, resizable);
+    let resize = (width - size.width).abs() >= 0.5 || (height - size.height).abs() >= 0.5;
+    let reposition = (clamped.x - position.x).abs() >= 0.5 || (clamped.y - position.y).abs() >= 0.5;
+    let plan = toolset_fit::plan_fit(!resize && !reposition, adjusted, fitted);
+    toolset_fit::with_memory(|memory| match plan.memory {
+        toolset_fit::FitMemoryChange::Keep => {}
+        toolset_fit::FitMemoryChange::Forget => memory.forget(label),
+        toolset_fit::FitMemoryChange::Record => {
+            let from =
+                tauri::LogicalPosition::new(position.x, position.y).to_physical::<i32>(scale);
+            let to = tauri::LogicalPosition::new(clamped.x, clamped.y).to_physical::<i32>(scale);
+            let to_size = if resize {
+                tauri::LogicalSize::new(width, height).to_physical::<u32>(scale)
+            } else {
+                inner
+            };
+            memory.record(
+                label,
+                toolset_fit::FittedFrame {
+                    from: (from.x, from.y),
+                    to: (to.x, to.y),
+                    from_size: (inner.width, inner.height),
+                    to_size: (to_size.width, to_size.height),
+                    tolerance: toolset_fit::tolerance(scale),
+                },
+            );
+        }
+    });
+    if !plan.apply {
+        return;
+    }
+    if resize {
         let _ = window.set_size(tauri::LogicalSize::new(width, height));
     }
-    if (clamped.x - position.x).abs() < 0.5 && (clamped.y - position.y).abs() < 0.5 {
+    if !reposition {
         return;
     }
 
@@ -12154,14 +12469,50 @@ fn recover_offscreen_toolset_window<R: Runtime>(
         };
         let physical = (position.x, position.y);
         let logical_size = size.to_logical::<f64>(scale);
-        let Some(placement) = clamp_windows_toolset_frame(
-            &app,
-            ToolsetFrameOrigin::Physical(physical, scale),
-            (logical_size.width, logical_size.height),
-            resizable,
-        ) else {
+        let live_size = (logical_size.width, logical_size.height);
+        let label = window.label();
+        // A palette ChemDraft fitted to a smaller work area is re-placed from the user's saved
+        // frame, so it returns there once the work area can hold it again (B9).
+        let fitted = toolset_fit::with_memory(|memory| memory.is_fitted(label));
+        let (origin, source_size) = fitted
+            .then(|| saved_toolset_state(&app, label))
+            .flatten()
+            .and_then(|state| {
+                let position = state.position()?;
+                Some((
+                    ToolsetFrameOrigin::Logical(position, state.position_scale),
+                    state.window_size(resizable).unwrap_or(live_size),
+                ))
+            })
+            .unwrap_or((ToolsetFrameOrigin::Physical(physical, scale), live_size));
+        let Some((placement, adjusted)) =
+            clamp_windows_toolset_frame(&app, label, origin, source_size, resizable)
+        else {
             return;
         };
+        let live_size = (size.width, size.height);
+        let plan = toolset_fit::plan_fit(
+            placement.position == physical && placement.size == live_size,
+            adjusted,
+            fitted,
+        );
+        toolset_fit::with_memory(|memory| match plan.memory {
+            toolset_fit::FitMemoryChange::Keep => {}
+            toolset_fit::FitMemoryChange::Forget => memory.forget(label),
+            toolset_fit::FitMemoryChange::Record => memory.record(
+                label,
+                toolset_fit::FittedFrame {
+                    from: physical,
+                    to: placement.position,
+                    from_size: live_size,
+                    to_size: placement.size,
+                    tolerance: toolset_fit::tolerance(scale),
+                },
+            ),
+        });
+        if !plan.apply {
+            return;
+        }
         if placement.position == physical {
             if placement.size != (size.width, size.height) {
                 let _ =
@@ -13659,6 +14010,55 @@ mod tests {
         );
         assert_eq!(centered.position, (1920, 0));
         assert_eq!(centered.size, expected.size);
+    }
+
+    #[test]
+    fn a_squeezed_inspector_title_lands_below_the_main_toolbar_and_a_user_frame_is_kept() {
+        // B9: 1024x768 with a 44 px panel, Main 1024x85 at 0,135.
+        let monitor = ToolsetMonitor {
+            identity: panel_window_frame::MonitorIdentity {
+                name: None,
+                position: (0, 0),
+                size: (1024, 768),
+            },
+            scale: 1.0,
+            work_area: ScreenRect::new(0.0, 0.0, 1024.0, 724.0),
+        };
+        let monitors = [monitor];
+        let main = Some(ScreenRect::new(0.0, 135.0, 1024.0, 85.0));
+        let clamp = |origin: (i32, i32), size: (f64, f64), toolbar: Option<ScreenRect>| {
+            clamp_toolset_frame_in_physical_space_clear_of(
+                ToolsetFrameOrigin::Physical(origin, 1.0),
+                size,
+                true,
+                &monitors,
+                &monitors[0],
+                toolbar,
+            )
+        };
+
+        // The 1680 frame squeezed onto 1024: its clamped title (y 124) would sit inside Main, so
+        // it goes below Main and gives up height to stay inside the work area.
+        let (placement, adjusted) = clamp((900, 160), (520.0, 600.0), main);
+        assert!(adjusted);
+        assert_eq!(
+            (placement.position, placement.size),
+            ((504, 220), (520, 504))
+        );
+        // Without a Main toolbar the clamp is unchanged.
+        let (placement, adjusted) = clamp((900, 160), (520.0, 600.0), None);
+        assert!(adjusted);
+        assert_eq!(
+            (placement.position, placement.size),
+            ((504, 124), (520, 600))
+        );
+        // A frame that fits is the user's and is never moved, wherever it sits.
+        let (placement, adjusted) = clamp((100, 150), (300.0, 300.0), main);
+        assert!(!adjusted);
+        assert_eq!(
+            (placement.position, placement.size),
+            ((100, 150), (300, 300))
+        );
     }
 
     #[test]

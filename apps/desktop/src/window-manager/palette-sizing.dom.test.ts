@@ -136,8 +136,10 @@ describe("palette work-area sizing", () => {
     const nativeSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../src-tauri/src/lib.rs"), "utf8");
     const resize = nativeSource.split("fn resize_toolset_window(")[1]!.split("/// Pre-build")[0]!;
     expect(resize).toMatch(
-      /let area = monitor_logical_work_area\(&monitor\);[\s\S]*let position = window\.outer_position\(\)[^\n]*\n\s*let origin = \(position\.x, position\.y\);\s*let mut placement = toolset_content_placement\(origin, \(width, height\), scale, area\);/,
+      /let area = monitor_logical_work_area\(&monitor\);[\s\S]*let position = window\.outer_position\(\)[^\n]*\n\s*let origin = \(position\.x, position\.y\);[\s\S]*?\.unwrap_or\(origin\);\s*let mut placement = toolset_content_placement\(source, \(width, height\), scale, area\);/,
     );
+    // A palette ChemDraft fitted to a smaller work area starts from its saved position (B9).
+    expect(resize).toMatch(/let source = fitted\s*\.then\(\|\| saved_toolset_state\(app, label\)\)/);
     expect(resize.match(/let area = /g)).toHaveLength(1);
     expect(resize).toContain("toolset_position_in_work_area(position, width, height, area)");
     const recover = nativeSource.split("fn toolset_position_in_work_area(")[1]!.split("/// Pull a palette")[0]!;
@@ -174,7 +176,7 @@ describe("palette work-area sizing", () => {
     expect(open).toMatch(
       /recover_offscreen_toolset_window\(app, &window, resizable\);(?:\s*\/\/[^\n]*)*\s*if !palette_first_paint::reopened\(&label\) \{\s*window\.show\(/,
     );
-    expect(open).toMatch(/let \(position, width, height\) = clamp_toolset_frame\([\s\S]*?\.inner_size\(width, height\)/);
+    expect(open).toMatch(/let \(position, width, height, adjusted\) =\s*clamp_toolset_frame\([\s\S]*?\.inner_size\(width, height\)/);
     // Windows: clamp, build hidden through palette_first_paint, place, then the reveal is armed.
     expect(open).toMatch(
       /clamp_windows_toolset_frame\([\s\S]*?palette_first_paint::builder_step\([\s\S]*?builder\.build\(\)[\s\S]*?panel_full_size::apply\([\s\S]*?palette_first_paint::arm_toolbar\(&target\)/,

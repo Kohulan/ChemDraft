@@ -1815,6 +1815,16 @@ Run under KDE Plasma (Wayland session, so the app uses XWayland) and on GNOME.
   Shift+Ctrl+S and Esc, and Ctrl+O and Esc, several times. Every palette comes back exactly where
   it was, and after quitting and relaunching it opens at that same spot (toolbar-state.json is
   unchanged by the dialogs).
+- Work-area fits are not saved (B9, all three builds; on Linux run under XWayland): open Drawn
+  Structure Settings at 1680x1050 and drag it to the right half, top edge about 160 px down.
+  Switch the display live to 1024x768. It is pulled onto the smaller screen, and its title strip
+  is below the Main toolbar, never under it: drag it by the title to prove it. Without touching it,
+  switch back to 1680x1050: within about a second it returns to the exact spot and size it had
+  before (toolbar-state.json still holds that frame throughout). Repeat, but this time drag it a
+  little while at 1024x768: back at 1680x1050 it stays where you dropped it. The same holds for
+  the Main toolbar on Linux: at 1024 it starts at the left edge, and back at 1680 it returns to
+  its saved position. Quit at 1024x768 and relaunch at 1680x1050: palettes open at their 1680
+  positions, not the squeezed ones.
 
 ## Linux Interactive 3D (1.2.2)
 
