@@ -78,6 +78,31 @@ That path contains the committed Intel x86_64 Mach-O sidecar, built for macOS
 `apps/desktop/src-tauri/binaries/README.md`.
 The Intel smoke workflow runs only the committed artifact, never a local build.
 
+### x86_64 Linux sidecar (built in CI, not committed)
+
+The Linux packages ship a sidecar that CI builds from source on every Linux package
+build (`.github/workflows/linux-build.yml`, Ubuntu 22.04, the oldest supported host).
+It fetches the same pinned dependencies with the commands above, then:
+
+```bash
+cd native/avogadro3d-sidecar
+cmake --preset linux-x86_64
+cmake --build --preset linux-x86_64
+cd ../..
+```
+
+The `linux-x86_64` preset inherits `protocol-scout` (the same Avogadro Core/Calc
+subset and commit define), builds Release, and links libstdc++ and libgcc
+statically, so the executable needs only glibc (2.35 or newer, from the build host).
+The job fails unless `readelf -d` lists only glibc libraries and no symbol needs a
+glibc newer than 2.35. It then runs `pnpm audit:engine3d-sidecar`,
+`.github/workflows/linux-package-smoke/sidecar-check.sh` (an ELF and handshake check
+that needs only bash and coreutils) and all three smokes below, and copies the
+executable over `apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu`
+for the bundle step only. That committed file stays the placeholder. The container
+smoke repeats the handshake on the sidecar installed from the `.deb` and the
+AppImage on each distro. aarch64 Linux has no build and stays a placeholder.
+
 Without the local `_deps` checkout, the CMake preset intentionally fails rather
 than falling back to placeholder mechanics. A no-Avogadro fallback build can be
 made explicitly for protocol debugging only:

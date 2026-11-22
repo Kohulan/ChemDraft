@@ -96,6 +96,25 @@ export async function readEngine3dSidecarStatus(): Promise<Engine3dSidecarStatus
   }
 }
 
+/**
+ * Why Interactive 3D cannot start, or `undefined` when it can (or when there is no desktop shell to
+ * ask). The shell reports `available: false` when the bundled sidecar is missing or is one of the
+ * `binaries/` placeholders (the files carrying "avogadro3d-sidecar placeholder"), on every platform.
+ * The command then shows as disabled with this reason instead of failing after a click.
+ */
+export function engine3dSidecarDisabledReason(status: Engine3dSidecarStatus | undefined): string | undefined {
+  if (!status || status.available) return undefined;
+  if (status.envOverridePath?.trim()) {
+    return `Interactive 3D isn't available: ${status.envVar} doesn't point to a runnable 3D engine`;
+  }
+  const triple = status.targetTriple ?? "";
+  const platform = triple.includes("linux") ? "Linux "
+    : triple.includes("apple-darwin") ? "macOS "
+      : triple.includes("windows") ? "Windows "
+        : "";
+  return `Interactive 3D isn't available in this ${platform}build yet`;
+}
+
 export async function startEngine3dSidecarSession(lines: string[] = []): Promise<Engine3dSidecarSessionOutput> {
   const { invoke } = await import("@tauri-apps/api/core");
   return await invoke<Engine3dSidecarSessionOutput>("engine3d_sidecar_start_session", { lines });

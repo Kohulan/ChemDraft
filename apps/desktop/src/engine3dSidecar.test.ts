@@ -12,9 +12,11 @@ import {
 import {
   createEngine3dSessionInputFromMolecule,
   describeEngine3dWorkspaceSession,
+  engine3dSidecarDisabledReason,
   initialEngine3dCoordsFromMolecule2d,
   reduceEngine3dSidecarOutput,
   type Engine3dSidecarSessionOutput,
+  type Engine3dSidecarStatus,
   type Engine3dWorkspaceSessionState
 } from "./engine3dSidecar";
 
@@ -286,5 +288,42 @@ describe("engine3d sidecar client", () => {
 
     expect(withSelection.selectedAtomIds).toEqual(["a2"]);
     expect(invalid.errors.at(-1)).toContain("not valid JSON");
+  });
+});
+
+describe("engine3d sidecar disabled reason", () => {
+  const status = (targetTriple: string, patch: Partial<Engine3dSidecarStatus> = {}): Engine3dSidecarStatus => ({
+    available: false,
+    protocolVersion: 2,
+    source: "missing",
+    envVar: "CHEMDRAFT_ENGINE3D_SIDECAR",
+    bundledBinaryName: "avogadro3d-sidecar",
+    targetTriple,
+    ...patch
+  });
+
+  it("names the platform for every placeholder or missing bundled sidecar", () => {
+    expect(engine3dSidecarDisabledReason(status("x86_64-unknown-linux-gnu")))
+      .toBe("Interactive 3D isn't available in this Linux build yet");
+    expect(engine3dSidecarDisabledReason(status("aarch64-unknown-linux-gnu")))
+      .toBe("Interactive 3D isn't available in this Linux build yet");
+    expect(engine3dSidecarDisabledReason(status("aarch64-apple-darwin")))
+      .toBe("Interactive 3D isn't available in this macOS build yet");
+    expect(engine3dSidecarDisabledReason(status("x86_64-apple-darwin")))
+      .toBe("Interactive 3D isn't available in this macOS build yet");
+    expect(engine3dSidecarDisabledReason(status("x86_64-pc-windows-msvc")))
+      .toBe("Interactive 3D isn't available in this Windows build yet");
+    expect(engine3dSidecarDisabledReason(status("riscv64gc-unknown-none-elf")))
+      .toBe("Interactive 3D isn't available in this build yet");
+  });
+
+  it("blames an override that does not run", () => {
+    expect(engine3dSidecarDisabledReason(status("x86_64-unknown-linux-gnu", { envOverridePath: "/tmp/nope" })))
+      .toBe("Interactive 3D isn't available: CHEMDRAFT_ENGINE3D_SIDECAR doesn't point to a runnable 3D engine");
+  });
+
+  it("has no reason when the sidecar runs or there is no desktop shell", () => {
+    expect(engine3dSidecarDisabledReason(status("x86_64-unknown-linux-gnu", { available: true, source: "bundled" }))).toBeUndefined();
+    expect(engine3dSidecarDisabledReason(undefined)).toBeUndefined();
   });
 });

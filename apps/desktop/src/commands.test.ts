@@ -59,7 +59,7 @@ describe("double-bond position commands", () => {
     expect(createDoubleBondPositionActions(0).every((action) => !action.enabled && action.disabledReason === "Select a double bond")).toBe(true);
   });
 });
-import { allShellCommands, convertTextToAtomLabelCommandId } from "./commands";
+import { allShellCommands, convertTextToAtomLabelCommandId, structureInteractive3dCommandId } from "./commands";
 import { editActions, fragmentAtomDrawingHotkeys, fragmentBondDrawingHotkeys, fragmentSproutCommandId, fragmentSproutCommands, fragmentSproutKindForCommand } from "./commands";
 import { createPhase4Document, insertNativeSingleBondMolecule, insertNativeTextObject, getSelectedMolecule, selectDocumentObjects } from "./documentWorkflow";
 import { buildAppMenuModel, flattenAppMenuCommands } from "./appMenu";
@@ -297,5 +297,24 @@ describe("Molecule Inspector commands", () => {
       value: false
     });
     expect(moleculeAtomLabelHideImplicitHydrogensForCommand("molecule.atomLabel.hideImplicitHydrogens:toggle")).toBeUndefined();
+  });
+});
+
+describe("Interactive 3D availability", () => {
+  const spec = (interactive3dDisabledReason?: string) =>
+    allShellCommands(createPhase4Document(), undefined, { interactive3dDisabledReason })
+      .find((command) => command.id === structureInteractive3dCommandId)!;
+
+  it("stays enabled when the sidecar can run", () => {
+    expect(spec()).toMatchObject({ title: "Interactive 3D Workspace" });
+    expect(spec().enabled).not.toBe(false);
+    expect(spec().disabledReason).toBeUndefined();
+  });
+
+  it("is disabled with the sidecar's reason, keeping its catalog presentation", () => {
+    const reason = "Interactive 3D isn't available in this Linux build yet";
+    expect(spec(reason)).toMatchObject({ title: spec().title, icon: spec().icon, enabled: false, disabledReason: reason });
+    expect(allShellCommands(createPhase4Document(), undefined, { interactive3dDisabledReason: reason })
+      .filter((command) => command.id === structureInteractive3dCommandId)).toHaveLength(1);
   });
 });

@@ -481,6 +481,7 @@ import {
   endEngine3dWorkspaceDrag,
   engine3dCoordsInAtomOrder,
   engine3dDragStereoBlocked,
+  engine3dSidecarDisabledReason,
   openEngine3dWorkspaceSession,
   pollEngine3dWorkspaceSessionState,
   readEngine3dSidecarStatus,
@@ -2781,6 +2782,16 @@ export function MainWindow({
   const compoundLayoutSettings = useCompoundLayoutSettings();
   const compoundLayoutsEnabled = compoundLayoutSettings.enabled;
   const structureSearchEnabled = useStructureSearchEnabled();
+  // The bundled 3D sidecar is fixed for the life of the process: read its status once. A missing or
+  // placeholder sidecar disables Interactive 3D with an honest reason instead of failing on click.
+  const [interactive3dDisabledReason, setInteractive3dDisabledReason] = useState<string>();
+  useEffect(() => {
+    let disposed = false;
+    void readEngine3dSidecarStatus().then(status => {
+      if (!disposed) setInteractive3dDisabledReason(engine3dSidecarDisabledReason(status));
+    });
+    return () => { disposed = true; };
+  }, []);
   const structureSearchEnabledRef = useRef(structureSearchEnabled);
   structureSearchEnabledRef.current = structureSearchEnabled;
   const structureSearchController = useRef<ReturnType<typeof createStructureSearchController> | undefined>(undefined);
@@ -3616,11 +3627,12 @@ export function MainWindow({
         paletteCommands: baseToolbarCommands,
         compoundLayoutsEnabled, compoundLayoutSettings,
         structureSearchEnabled,
-        hasSearchableStructure
+        hasSearchableStructure,
+        interactive3dDisabledReason
       }).map(command => customSwatchActions.find(action => action.id === command.id) ?? command).filter(command => command.id !== "arrow.conditions" || isDesktopRuntime()),
       keybindingScheme, shortcutOverrides, shortcutPlatform
     ),
-    [shortcutOverrides, shortcutPlatform, baseToolbarCommands, customSwatches, customSwatchActions, activeTableCell?.tableId, activeTableCell?.rowId, activeTableCell?.columnId, canRedo, canUndo, document, documentTabs.length, keybindingScheme, openWarnings, selectedMolecule, selectedNativeMoleculeParts, toolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, structureSearchEnabled, hasSearchableStructure]
+    [shortcutOverrides, shortcutPlatform, baseToolbarCommands, customSwatches, customSwatchActions, activeTableCell?.tableId, activeTableCell?.rowId, activeTableCell?.columnId, canRedo, canUndo, document, documentTabs.length, keybindingScheme, openWarnings, selectedMolecule, selectedNativeMoleculeParts, toolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, structureSearchEnabled, hasSearchableStructure, interactive3dDisabledReason]
   );
   const shellCommandsById = useMemo(
     () => createShellCommandMap(shellCommandSpecs),
@@ -6820,11 +6832,8 @@ export function MainWindow({
 
     const status = await readEngine3dSidecarStatus();
     if (!status?.available) {
-      setStatus(
-        status
-          ? `Interactive 3D unavailable; sidecar not configured: ${status.bundledBinaryName}`
-          : "Interactive 3D unavailable; Tauri bridge not present"
-      );
+      // The native menu routes here even while the toolbar shows the command disabled.
+      setStatus(engine3dSidecarDisabledReason(status) ?? "Interactive 3D unavailable; Tauri bridge not present");
       return;
     }
 

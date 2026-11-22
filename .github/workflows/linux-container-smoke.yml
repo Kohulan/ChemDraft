@@ -13,6 +13,7 @@ on:
       - .github/workflows/linux-build.yml
       - apps/desktop/src-tauri/tauri.conf.json
       - apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu
+      - native/avogadro3d-sidecar/**
       - scripts/build-opsin-runtime.mjs
       - scripts/desktop-tauri.mjs
       - tools/release/verify-bundle-licenses.mjs
@@ -197,6 +198,21 @@ jobs:
       - name: Check AppImage library resolution against host Mesa
         if: matrix.package == 'appimage'
         run: bash .github/workflows/linux-package-smoke/host-mesa.sh "$BUNDLE"
+
+      # Interactive 3D needs the native sidecar: the installed copy must be a real x86-64 ELF, not
+      # the committed placeholder, and complete its protocol handshake on this distro's glibc.
+      - name: Check the installed 3D sidecar
+        run: |
+          set -euo pipefail
+          check="$GITHUB_WORKSPACE/.github/workflows/linux-package-smoke/sidecar-check.sh"
+          if [[ "$PACKAGE" == deb ]]; then
+            bash "$check" /usr/bin/avogadro3d-sidecar
+          else
+            work=$(mktemp -d)
+            trap 'rm -rf -- "$work"' EXIT
+            (cd "$work" && "$BUNDLE" --appimage-extract > /dev/null)
+            bash "$check" "$work/squashfs-root/usr/bin/avogadro3d-sidecar"
+          fi
 
       # Xvfb also runs the document, menu and clipboard checks. Weston exercises the XWayland
       # default, the .deb's native Wayland opt-out, and the AppImage without XWayland. Both use

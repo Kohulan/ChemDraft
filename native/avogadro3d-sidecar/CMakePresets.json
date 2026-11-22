@@ -53,6 +53,22 @@
         "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded",
         "CMAKE_POLICY_VERSION_MINIMUM": "3.5"
       }
+    },
+    {
+      "name": "linux-x86_64",
+      "displayName": "Protocol scout (x86_64 Linux, static libstdc++/libgcc)",
+      "inherits": "protocol-scout",
+      "binaryDir": "${sourceDir}/build/linux-x86_64",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXE_LINKER_FLAGS": "-static-libstdc++ -static-libgcc",
+        "CMAKE_POLICY_VERSION_MINIMUM": "3.5"
+      }
     }
   ],
   "buildPresets": [
@@ -68,6 +84,10 @@
       "name": "windows-msvc",
       "configurePreset": "windows-msvc",
       "configuration": "Release"
+    },
+    {
+      "name": "linux-x86_64",
+      "configurePreset": "linux-x86_64"
     }
   ]
 }

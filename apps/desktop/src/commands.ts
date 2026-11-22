@@ -84,6 +84,11 @@ export interface ShellCommandOptions {
   registry?: DesktopToolsetRegistry;
   /** The uncustomized command catalog. The live registry still supplies toolbar launchers. */
   paletteCommands?: readonly CommandSpec[];
+  /**
+   * Set when this build's 3D sidecar is missing or a placeholder (`engine3dSidecarDisabledReason`):
+   * Interactive 3D then shows as disabled with this reason. Unset leaves the command enabled.
+   */
+  interactive3dDisabledReason?: string;
 }
 
 export interface CommandSpec extends CommandDefinition {
@@ -2476,6 +2481,7 @@ export function allShellCommands(
   options: ShellCommandOptions = {}
 ): CommandSpec[] {
   const registry = options.registry ?? desktopToolsetRegistry;
+  const paletteCommands = options.paletteCommands ?? allPaletteCommands();
   return dedupeCommands([
     ...createSelectionNudgeActions(document.selection.objectIds.length > 0 || options.availability?.hasMoleculeFragmentSelection === true),
     ...atomProblemCommands(document).map(command => command.spec),
@@ -2491,7 +2497,9 @@ export function allShellCommands(
       options.structureSearchEnabled ?? loadStructureSearchEnabled(),
       options.hasSearchableStructure ?? structureSearchDocument(document) !== undefined
     ),
-    ...(options.paletteCommands ?? allPaletteCommands()),
+    // Ahead of the catalog so first-wins dedupe keeps the disabled copy.
+    ...interactive3dAvailabilityCommands(paletteCommands, options.interactive3dDisabledReason),
+    ...paletteCommands,
     ...copyAsActions,
     ...editActions,
     ...atomElementActions,
@@ -2508,6 +2516,16 @@ export function allShellCommands(
     ...toolbarCustomizationActions,
     vibeCodeStarterCommand
   ]);
+}
+
+/** Interactive 3D disabled with its reason when the sidecar can't run; nothing otherwise. */
+export function interactive3dAvailabilityCommands(
+  paletteCommands: readonly CommandSpec[],
+  disabledReason: string | undefined
+): CommandSpec[] {
+  if (!disabledReason) return [];
+  const base = paletteCommands.find(command => command.id === structureInteractive3dCommandId);
+  return base ? [{ ...base, enabled: false, disabledReason }] : [];
 }
 
 /** Finite value-encoded family. Only the two-slot widgets are offered by the toolbar gallery. */

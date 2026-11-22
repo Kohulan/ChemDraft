@@ -271,7 +271,8 @@ better-enums (compiled into the Intel Mac naming engine's RDKit wheel)
   The wheel carries the better-enums license text. Not bundled with ChemDraft.
 
 Avogadro libraries (avogadrolibs Core + Calc, statically linked into the
-avogadro3d-sidecar executable shipped beside the app on macOS and Windows)
+avogadro3d-sidecar executable shipped beside the app on macOS, Windows and
+x86_64 Linux)
   BSD-3-Clause. Copyright (c) 2011-2020, Kitware, Inc.
   Source: https://github.com/OpenChemistry/avogadrolibs, commit
   416651ddaef33a4e20392392e7c0b505d446491b. Built without Open Babel, GPL plugins,
@@ -283,7 +284,8 @@ Eigen 3.4.0 (header-only, compiled into the avogadro3d-sidecar executable)
   Source for the MPL-2.0 files is available at the URL above. Eigen also carries a
   few LGPL-licensed modules. The sidecar is built with EIGEN_MPL2_ONLY, which makes
   including any of them a compile error, so the shipped Windows and macOS arm64
-  binaries, both built with the flag, contain none.
+  binaries and the x86_64 Linux binary (built from source in CI for each Linux
+  package), all built with the flag, contain none.
   Full licence text: native/avogadro3d-sidecar/licenses/Eigen-COPYING.MPL2.txt
 
 --------------------------------------------------------------------------------

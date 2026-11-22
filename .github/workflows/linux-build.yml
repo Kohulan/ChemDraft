@@ -83,6 +83,48 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
             libayatana-appindicator3-dev libsoup-3.0-dev libssl-dev libxdo-dev
 
+      # The 3D sidecar, built from the pinned sources exactly as native/avogadro3d-sidecar/README.md
+      # describes for macOS and Windows (the same Avogadro Core/Calc subset and commit define). Only
+      # this bundle gets it: the committed x86_64 Linux file stays the placeholder. A failed fetch,
+      # build or check fails the job; it never falls back to the placeholder.
+      - name: Fetch the pinned 3D sidecar sources
+        working-directory: native/avogadro3d-sidecar
+        run: |
+          set -euo pipefail
+          commit=$(grep -oE '[0-9a-f]{40}' CMakeLists.txt | sort -u)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::CMakeLists.txt must pin exactly one avogadrolibs commit.'; exit 1; }
+          rm -rf _deps
+          git clone https://github.com/OpenChemistry/avogadrolibs.git _deps/avogadrolibs
+          git -C _deps/avogadrolibs checkout "$commit"
+          git clone --depth 1 --branch 3.4.0 https://gitlab.com/libeigen/eigen.git _deps/eigen
+          [ "$(git -C _deps/avogadrolibs rev-parse HEAD)" = "$commit" ] || { echo "::error::avogadrolibs is not at $commit."; exit 1; }
+          test -f _deps/eigen/Eigen/Core || { echo '::error::Eigen 3.4.0 checkout has no Eigen/Core.'; exit 1; }
+          echo "avogadrolibs $commit; Eigen $(git -C _deps/eigen describe --tags)"
+
+      # Release build with libstdc++ and libgcc linked statically, so the sidecar needs only glibc.
+      # Built on Ubuntu 22.04, the oldest supported host, it requires at most glibc 2.35.
+      - name: Build the x86_64 Linux 3D sidecar
+        working-directory: native/avogadro3d-sidecar
+        run: |
+          set -euo pipefail
+          cmake --version
+          cmake --preset linux-x86_64
+          cmake --build --preset linux-x86_64 --parallel "$(nproc)"
+          bin=build/linux-x86_64/avogadro3d-sidecar
+          file "$bin"
+          file -b "$bin" | grep -q '^ELF 64-bit LSB .*x86-64' || { echo '::error::The sidecar is not an x86-64 ELF.'; exit 1; }
+          needed=$(readelf -d "$bin" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')
+          echo "Shared libraries the sidecar needs:" $needed
+          for lib in $needed; do
+            case "$lib" in
+              libc.so.6|libm.so.6|libpthread.so.0|libdl.so.2|librt.so.1|ld-linux-x86-64.so.2) ;;
+              *) echo "::error::The sidecar needs $lib; only glibc libraries are allowed."; exit 1 ;;
+            esac
+          done
+          newest=$(objdump -T "$bin" | { grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' || true; } | sed 's/^GLIBC_//' | sort -uV | tail -n1)
+          echo "Newest glibc symbol version: ${newest:-none}"
+          [ -z "$newest" ] || printf '%s\n' "$newest" 2.35 | sort -V -C || { echo "::error::The sidecar needs glibc $newest; the oldest supported host has 2.35."; exit 1; }
+
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -102,6 +144,24 @@ jobs:
       - name: Build host-native OPSIN runtime and smoke test benzene
         run: node scripts/build-opsin-runtime.mjs
 
+      # The same audit and smokes the Intel macOS job runs on its sidecar, then the bash handshake
+      # the distro containers repeat on the installed copy. Only a sidecar that passes them replaces
+      # the placeholder for the bundle step; the next step after the bundle restores the placeholder.
+      - name: Check the x86_64 Linux 3D sidecar and stage it for the bundle
+        env:
+          CHEMDRAFT_ENGINE3D_SIDECAR: native/avogadro3d-sidecar/build/linux-x86_64/avogadro3d-sidecar
+        run: |
+          set -euo pipefail
+          pnpm run audit:engine3d-sidecar
+          bash .github/workflows/linux-package-smoke/sidecar-check.sh "$CHEMDRAFT_ENGINE3D_SIDECAR"
+          pnpm smoke:engine3d-real-structure
+          pnpm smoke:engine3d-hold-steady
+          pnpm smoke:engine3d-anneal-energy
+          target=apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu
+          grep -aqF 'avogadro3d-sidecar placeholder' "$target" || { echo "::error::$target is no longer the committed placeholder."; exit 1; }
+          install -m 0755 "$CHEMDRAFT_ENGINE3D_SIDECAR" "$target"
+          cmp "$CHEMDRAFT_ENGINE3D_SIDECAR" "$target"
+
       - name: Build stable .deb and AppImage
         env:
           CHEMDRAFT_STABLE_BUILD: '1'
@@ -117,6 +177,15 @@ jobs:
         run: |
           export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/apps/desktop/src-tauri/resources/opsin/jre/lib/server"
           pnpm --filter @chemdraft/desktop build --bundles deb,appimage
+
+      # The release record refuses a dirty tree. Put the committed placeholder back now that the
+      # bundles hold the native sidecar (the next step compares the .deb's copy with the build).
+      - name: Restore the committed sidecar placeholder
+        run: |
+          set -euo pipefail
+          git checkout -- apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu
+          git status --porcelain --untracked-files=normal
+          [ -z "$(git status --porcelain --untracked-files=normal)" ] || { echo '::error::The source tree is dirty after the bundle build.'; exit 1; }
 
       - name: Verify stable bundle identity
         id: bundle
@@ -141,13 +210,17 @@ jobs:
           [ -f "$appimage" ] || { echo "::error::Missing $appimage"; exit 1; }
           # The .deb must carry the 3D sidecar, the OPSIN runtime and the bundled licences, as the
           # other platforms do.
-          # (The Linux sidecar is still the placeholder from binaries/README.md; the app reports 3D
-          # as unavailable until a real Linux build replaces it.)
           contents=$(dpkg-deb -c "$deb" | awk '{print $NF}' | sed 's|^\./||')
           licences=$(node --input-type=module -e "import { requiredLicenseFiles } from './tools/release/required-license-files.mjs'; for (const { target } of requiredLicenseFiles) console.log('usr/lib/ChemDraft/' + target);")
           for path in usr/bin/chemdraft usr/bin/avogadro3d-sidecar usr/lib/ChemDraft/resources/opsin/jre/bin/java $licences; do
             grep -qxF "$path" <<<"$contents" || { echo "::error::$deb lacks $path"; exit 1; }
           done
+          # Its sidecar must be the native build checked above, never the placeholder.
+          payload=$(mktemp -d)
+          dpkg-deb -x "$deb" "$payload"
+          cmp native/avogadro3d-sidecar/build/linux-x86_64/avogadro3d-sidecar "$payload/usr/bin/avogadro3d-sidecar" || { echo "::error::$deb does not carry the native 3D sidecar built above."; exit 1; }
+          bash .github/workflows/linux-package-smoke/sidecar-check.sh "$payload/usr/bin/avogadro3d-sidecar"
+          rm -rf -- "$payload"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "deb=$deb" >> "$GITHUB_OUTPUT"
           echo "appimage=$appimage" >> "$GITHUB_OUTPUT"
@@ -217,6 +290,8 @@ jobs:
           cd verify
           ../repacked.AppImage --appimage-extract > repacked-extraction.log
           test -x squashfs-root/AppRun
+          # linuxdeploy may rewrite the sidecar's RUNPATH, so check the copy itself, not its bytes.
+          bash "$GITHUB_WORKSPACE/.github/workflows/linux-package-smoke/sidecar-check.sh" squashfs-root/usr/bin/avogadro3d-sidecar
           echo 'Shared libraries under usr/lib in the repacked AppImage:'
           find squashfs-root/usr/lib \( -type f -o -type l \) \( -name '*.so' -o -name '*.so.*' \) -print | LC_ALL=C sort
           leftovers=$(find squashfs-root \( "${host_libs[@]}" \) -print)

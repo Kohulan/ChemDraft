@@ -33,10 +33,19 @@ The workflow:
 
 1. Checks that `ref` is a tag (or full SHA) and that `upload_to_release` is `v<app version>`.
    For uploads, the build ref must also match the workflow commit.
-2. Builds the OPSIN Java runtime on the runner and smoke-tests it (benzene).
-3. Builds a stable `.deb` and AppImage (`CHEMDRAFT_STABLE_BUILD=1`, no worktree label).
+2. Builds the x86_64 3D sidecar from source: clones the pinned avogadrolibs commit and Eigen
+   3.4.0 into `native/avogadro3d-sidecar/_deps` as that directory's README describes, builds it
+   with `cmake --preset linux-x86_64` (Release, libstdc++ and libgcc linked statically, so it
+   needs only glibc 2.35 or newer), and fails unless it is an x86-64 ELF that needs only glibc.
+   Then builds the OPSIN Java runtime on the runner and smoke-tests it (benzene).
+3. Runs `pnpm audit:engine3d-sidecar`, the sidecar handshake
+   (`.github/workflows/linux-package-smoke/sidecar-check.sh`) and the three `smoke:engine3d-*`
+   smokes against the sidecar, copies it over the committed placeholder for the bundle step only,
+   builds a stable `.deb` and AppImage (`CHEMDRAFT_STABLE_BUILD=1`, no worktree label), and
+   restores the placeholder. Any failure fails the job; it never ships the placeholder.
 4. Checks the bundle identity and that the `.deb` carries `chemdraft`, the 3D sidecar and the
-   OPSIN runtime.
+   OPSIN runtime. The `.deb`'s sidecar must be byte-identical to the build, and the repacked
+   AppImage's copy must pass the handshake.
 5. Repacks the AppImage after Tauri bundles it. It uses the host's Wayland and compiler runtime
    libraries and the host's `libgpg-error.so.0`. It also removes the bundled copies of libraries
    that host Mesa (`libEGL_mesa`, `libgallium`, `libgbm`, the DRI drivers) depends on, so the
@@ -271,8 +280,12 @@ repository on GitHub Pages, or a Flathub listing.
 - Menus: on the document window, as on Windows (`install_app_menu`). Edit ▸ Cut / Copy / Paste
   invoke WebKitGTK's native editing commands in the focused window. The webview receives
   Ctrl+X / C / V directly and uses the same clipboard events for menu clicks and shortcuts.
-- 3D: the `avogadro3d-sidecar` for Linux is still the placeholder (`binaries/README.md`), so 3D
-  reports itself unavailable until a real Linux sidecar is built.
+- 3D: the x86_64 `avogadro3d-sidecar` is built in CI from source (step 2 above) and never
+  committed; the committed x86_64 and aarch64 Linux files are placeholders (`binaries/README.md`).
+  The container smoke checks that the installed sidecar from the `.deb` and from the AppImage is
+  a real ELF that completes its handshake on each distro. A local build that still bundles a
+  placeholder shows Interactive 3D disabled with "Interactive 3D isn't available in this Linux
+  build yet"; Spin 3D does not use the sidecar.
 - Clipboard: `linux_clipboard.rs`, GTK's clipboard (X11 and Wayland). Targets are MIME types, so
   the editor's payload types are written unchanged; plain text is also offered as `UTF8_STRING`,
   `STRING` and `TEXT` for older X11 applications.
