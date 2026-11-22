@@ -1,7 +1,8 @@
 import { beforeAll, describe, expect, it } from "vitest";
-import { moleculeToMolfileV2000 } from "@chemdraft/chem-core";
+import { moleculeToMolfileV2000, type MoleculeObject } from "@chemdraft/chem-core";
 import { ensureRdkit } from "../../rdkit-adapter/src/conformer";
 import { compositionFromRdkitJson } from "../../rdkit-adapter/src/composition";
+import { stereochemistryLabels } from "@chemdraft/rdkit-adapter";
 import { chargeSeparationCases } from "./chargeSeparationFixtures";
 import type { ExportWarning } from "@chemdraft/export-engine";
 import { computeStructureIdentifiers } from "@chemdraft/rdkit-adapter/identifiers";
@@ -234,4 +235,40 @@ it("explains why preserving three radicals requires the stereo-limited native wr
     code: "export.smiles_stereo_dropped",
     message: expect.stringContaining("the native writer required to preserve its radical count does not support stereochemistry")
   })]);
+});
+
+describe("Kimi 1.2.3 finding 6: the engine-unavailable fallback warns only for assigned stereo", () => {
+  /** CC(F)Cl drawn with no wedge: its centre is a stereocentre the drawing leaves unassigned. */
+  const unassignedCentre = (stereochemistry: string[]): MoleculeObject => ({
+    id: "m", type: "molecule", x: 0, y: 0, width: 40, height: 40, rotation: 0, style: {},
+    structureFormat: "smiles", structure: "CC(F)Cl", superatoms: [], rGroups: [],
+    atoms: [
+      { id: "a", element: "C", x: 0, y: 0, formalCharge: 0 },
+      { id: "b", element: "C", x: 20, y: 0, formalCharge: 0 },
+      { id: "c", element: "F", x: 30, y: 17, formalCharge: 0 },
+      { id: "d", element: "Cl", x: 30, y: -17, formalCharge: 0 }
+    ],
+    bonds: [
+      { id: "ab", fromAtomId: "a", toAtomId: "b", order: "single" },
+      { id: "bc", fromAtomId: "b", toAtomId: "c", order: "single" },
+      { id: "bd", fromAtomId: "b", toAtomId: "d", order: "single" }
+    ],
+    chemistry: { isotopeLabels: [], stereochemistry, warnings: [] }
+  });
+
+  it("writes the unassigned centre without a stereo-loss warning: plain SMILES says the same", async () => {
+    const warnings: ExportWarning[] = [];
+    // The note the write verifier stores for an unassigned centre, as stereochemistryLabels writes it.
+    const note = stereochemistryLabels(JSON.stringify({ CIP_atoms: [[1, "(?)"]] }), 1);
+    expect(note).toHaveLength(1);
+    expect(await moleculeSmiles(unassignedCentre(note), 0, warnings, undefined)).toBe("CC(F)Cl");
+    expect(warnings.filter(warning => warning.code === "export.smiles_stereo_dropped")).toEqual([]);
+  });
+
+  it("still warns when the record holds an assigned descriptor beside the note", async () => {
+    const warnings: ExportWarning[] = [];
+    const labels = stereochemistryLabels(JSON.stringify({ CIP_atoms: [[1, "(S)"]] }), 1);
+    await moleculeSmiles(unassignedCentre(labels), 0, warnings, undefined);
+    expect(warnings).toEqual([expect.objectContaining({ code: "export.smiles_stereo_dropped" })]);
+  });
 });
