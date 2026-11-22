@@ -1,7 +1,10 @@
 import { expect, it } from "vitest";
 import { createEmptyDocument, type GraphicObject, type TextObject } from "@chemdraft/chem-core";
 import { exportDocumentToCdxml, openChemDraftPayload } from "./index";
-import { cdxmlFontOperationsForTesting, resetCdxmlFontOperationsForTesting } from "./cdxmlFontIndex";
+import {
+  cdxmlFontOperationsForTesting, resetCdxmlFontOperationsForTesting,
+  startCdxmlFontTableTrackingForTesting, stopCdxmlFontTableTrackingForTesting
+} from "./cdxmlFontIndex";
 
 const plain = { embedNativePayload: false };
 
@@ -142,27 +145,40 @@ it("writes a sweep too small for CDXML as the smallest sweep it holds, with a wa
 // Before the map, 40,000 runs against 40,000 fonts took about 9 s. These tests count font-table
 // work (entries indexed or merged, plus lookups; `cdxmlFontIndex.ts`) instead of timing it, so
 // they cannot flake on a loaded runner: linear work is a small multiple of fonts + runs, while
-// any return of the quadratic search would cost fonts × runs (1.6 billion here).
+// any return of the quadratic search would cost fonts × runs (1.6 billion here). Helper calls
+// alone would miss a raw `table.find(...)` per run, so the 40,000-run tests also count every
+// element read of the font tables (and per-caption copies) built while counting, and stop with
+// an error once a read budget is spent.
 const fontTable = (count: number, name = (id: number) => `Font${id}`) =>
   `<fonttable>${Array.from({ length: count }, (_, i) => `<font id="${i + 1}" charset="iso-8859-1" name="${name(i + 1)}"/>`).join("")}</fonttable>`;
 const caption = (id: number, runs: number, font: number, y = 72) =>
   `<t id="${id}" p="30 ${y}" BoundingBox="30 ${y - 12} 54 ${y}" Justification="Left">` +
   `${Array.from({ length: runs }, () => `<s font="${font}" size="10" face="0">x</s>`).join("")}</t>`;
-const counted = <T>(run: () => T) => {
+const counted = <T>(run: () => T, tableReadLimit = Number.POSITIVE_INFINITY) => {
   resetCdxmlFontOperationsForTesting();
-  const result = run();
-  return { result, operations: cdxmlFontOperationsForTesting() };
+  startCdxmlFontTableTrackingForTesting(tableReadLimit);
+  let result: T, tableReads: number;
+  try {
+    result = run();
+  } finally {
+    tableReads = stopCdxmlFontTableTrackingForTesting();
+  }
+  return { result, operations: cdxmlFontOperationsForTesting(), tableReads };
 };
-const countedOpen = (source: string) => {
-  const { result: opened, operations } = counted(() => openChemDraftPayload(source));
-  return { opened, operations };
+const countedOpen = (source: string, tableReadLimit?: number) => {
+  const { result: opened, operations, tableReads } = counted(() => openChemDraftPayload(source), tableReadLimit);
+  return { opened, operations, tableReads };
 };
 const textsOf = (opened: ReturnType<typeof openChemDraftPayload>) =>
   opened.document!.pages[0].objects.filter((object): object is TextObject => object.type === "text");
 
 it("resolves 40,000 caption runs against 40,000 fonts with linear work", { timeout: 60_000 }, () => {
-  const { opened, operations } = countedOpen(`<CDXML>${fontTable(40_000)}<page>${caption(9, 40_000, 40_000)}</page></CDXML>`);
+  const { opened, operations, tableReads } = countedOpen(`<CDXML>${fontTable(40_000)}<page>${caption(9, 40_000, 40_000)}</page></CDXML>`,
+    2 * (40_000 + 40_000));
   expect(operations).toBeLessThanOrEqual(2 * (40_000 + 40_000));
+  // Indexing reads each font once; the reads prove the table is tracked at all.
+  expect(tableReads).toBeGreaterThanOrEqual(40_000);
+  expect(tableReads).toBeLessThanOrEqual(2 * (40_000 + 40_000));
   const [text] = textsOf(opened);
   expect(text?.spans).toHaveLength(40_000);
   // A run states its font only where it differs from the caption's own (here, none do).
@@ -170,20 +186,26 @@ it("resolves 40,000 caption runs against 40,000 fonts with linear work", { timeo
   expect(text?.style.fontFamily).toBe("Font40000");
   expect(opened.warnings.map((warning) => warning.code)).not.toContain("cdxml.font_table_truncated");
   // Saving it again builds the CDXML font table once and indexes it by name (Codex security finding).
-  const saved = counted(() => exportDocumentToCdxml(opened.document!, plain));
+  const saved = counted(() => exportDocumentToCdxml(opened.document!, plain), 4 * (40_000 + 40_000));
   expect(saved.operations).toBeLessThanOrEqual(4 * (40_000 + 40_000));
+  expect(saved.tableReads).toBeGreaterThanOrEqual(40_000);
+  expect(saved.tableReads).toBeLessThanOrEqual(4 * (40_000 + 40_000));
   expect(saved.result.contents.match(/<font /g)).toHaveLength(40_000);
 });
 
 // Codex: Save As wrote an edited caption by scanning the font table for every run (the
 // 40,000-font, 40,000-run file took ~68 s); fonts are looked up by name, so saving is linear too.
 it("saves an edited 40,000-run caption against 40,000 fonts with linear work", { timeout: 60_000 }, () => {
-  const opened = openChemDraftPayload(`<CDXML>${fontTable(40_000)}<page>${caption(9, 40_000, 40_000)}</page></CDXML>`);
+  // Opened while counting, so the caption's copy of the font table is tracked on save as well.
+  const { opened } = countedOpen(`<CDXML>${fontTable(40_000)}<page>${caption(9, 40_000, 40_000)}</page></CDXML>`,
+    2 * (40_000 + 40_000));
   const [text] = textsOf(opened);
   text.spans[0].text = "y";
   text.text = `y${text.text.slice(1)}`;
-  const saved = counted(() => exportDocumentToCdxml(opened.document!, plain));
+  const saved = counted(() => exportDocumentToCdxml(opened.document!, plain), 4 * (40_000 + 40_000));
   expect(saved.operations).toBeLessThanOrEqual(4 * (40_000 + 40_000));
+  expect(saved.tableReads).toBeGreaterThanOrEqual(40_000);
+  expect(saved.tableReads).toBeLessThanOrEqual(4 * (40_000 + 40_000));
   expect(saved.result.warnings).toEqual([]);
   expect(saved.result.contents.match(/<s font="40000" size="10" face="0">/g)).toHaveLength(40_000);
   expect(saved.result.contents).toContain('<s font="40000" size="10" face="0">y</s>');

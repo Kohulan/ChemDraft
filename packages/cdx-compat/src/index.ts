@@ -64,7 +64,7 @@ import {
 } from "./cdxBinary";
 import { abbreviationExpansionIssue, cdxmlAtomChemistry, cdxmlAtomNativeState, elementFromCdxmlAtom, restoreCdxmlAbbreviations } from "./abbreviations";
 import { cdxmlToCssPx, cssPxToCdxml, formatNumber, formatPoint } from "./coordinates";
-import { countCdxmlFontEntries, indexCdxmlFonts, lookupCdxmlFont, type CdxmlFont } from "./cdxmlFontIndex";
+import { countCdxmlFontEntries, indexCdxmlFonts, lookupCdxmlFont, trackCdxmlFontTable, type CdxmlFont } from "./cdxmlFontIndex";
 import { nativeChargePlacementPointForAtom, nativeRadicalPlacementPointForAtom, nativeChargeMarkSizePx } from "@chemdraft/layout-engine";
 
 export interface CompatibilityConversionWarning {
@@ -391,7 +391,7 @@ function importCdxmlFonts(tree: OrderedXmlTree, sourceFormat: string, warnings: 
       `more than the ${CDXML_FONT_TABLE_LIMIT} supported; only the first ${CDXML_FONT_TABLE_LIMIT} were imported, ` +
       "and text set in a later font keeps the default font."));
   }
-  const table = listed.slice(0, CDXML_FONT_TABLE_LIMIT);
+  const table = trackCdxmlFontTable(listed.slice(0, CDXML_FONT_TABLE_LIMIT));
   return { table, byId: indexCdxmlFonts(table, font => font.id),
     usage: { captionRuns: 0, captionRunLimitReached: false, fontTableEntries: 0 } };
 }
@@ -976,7 +976,7 @@ function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityCo
       byName.set(name, font);
     }
   }
-  return { table: [...fonts.values()], byName, plainCaptionIds, captionRunLimitWarned: false };
+  return { table: trackCdxmlFontTable([...fonts.values()]), byName, plainCaptionIds, captionRunLimitWarned: false };
 }
 
 function buildCdxmlEnvelope(creationProgram: string, pages: readonly string[], fonts: readonly CdxmlFont[], colors: ExportColorTable, embedded = true, pageSetup: Record<string, string> = {}): string {
@@ -5303,7 +5303,7 @@ function textFontTable(element: XmlElementView, context: ImportPageContext): rea
     if (font) own.set(id, font);
   }
   usage.fontTableEntries += own.size;
-  return [...own.values()];
+  return trackCdxmlFontTable([...own.values()]);
 }
 
 // Only adopt the single-line layout when every visible run has an exact mapping.
