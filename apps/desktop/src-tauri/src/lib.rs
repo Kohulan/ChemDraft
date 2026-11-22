@@ -11398,7 +11398,16 @@ fn ensure_toolset_window<R: Runtime>(
     // Either way it's clamped onto an attached monitor — a position saved on a display that's since
     // been unplugged would otherwise open the palette offscreen with no way to get it back.
     let saved_position = saved.and_then(PersistedToolsetState::position);
-    let position = saved_position.unwrap_or(default_position);
+    // Linux and Windows carry the menu bar inside the document window: a first-ever placement
+    // stays clear of it, so the Main toolbar never covers the menus. Saved positions are the user's.
+    let position = saved_position.unwrap_or_else(|| {
+        toolset_fit::position_clear_of_document_chrome(
+            default_position,
+            (width, height),
+            document_chrome_frame(app),
+            TOOLSET_DOCUMENT_CHROME_GAP,
+        )
+    });
     // A saved frame squeezed onto a smaller work area at creation is a fit, not a new user frame:
     // its creation events must not overwrite the saved one (B9).
     let record_creation_fit = |to: (i32, i32), to_size: (u32, u32), scale: f64| {
@@ -11947,6 +11956,44 @@ const TOOLSET_TITLE_HEIGHT: f64 = 22.0;
 const MAIN_TOOLSET_ID: &str = "core.main";
 /// The smallest a scrolling inspector may be resized to (its builder's `min_inner_size`).
 const TOOLSET_INSPECTOR_MIN_SIZE: (f64, f64) = (96.0, 56.0);
+/// Space between the document window's menu bar and a palette placed below it.
+const TOOLSET_DOCUMENT_CHROME_GAP: f64 = 8.0;
+/// Height of the menu bar GTK draws inside the document window's client area (Breeze and Adwaita
+/// draw about 26-30 px at scale 1; this errs on the side of clearing it).
+#[cfg(target_os = "linux")]
+const DOCUMENT_IN_CLIENT_MENU_BAR_HEIGHT: f64 = 32.0;
+/// Windows draws the menu bar in the non-client area, above the client origin.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const DOCUMENT_IN_CLIENT_MENU_BAR_HEIGHT: f64 = 0.0;
+
+/// The document window's title and menu bars in global logical points, where a palette's first
+/// placement must not go. `None` while it is hidden or minimized.
+#[cfg(not(target_os = "macos"))]
+fn document_chrome_frame<R: Runtime>(app: &tauri::AppHandle<R>) -> Option<ScreenRect> {
+    let document = app.get_webview_window(MAIN_WINDOW_LABEL)?;
+    if !document.is_visible().unwrap_or(false) || document.is_minimized().unwrap_or(true) {
+        return None;
+    }
+    let scale = document
+        .scale_factor()
+        .ok()
+        .filter(|scale| scale.is_finite() && *scale > 0.0)?;
+    let outer = document.outer_position().ok()?;
+    let inner = document.inner_position().ok()?;
+    let width = document.outer_size().ok()?.width;
+    Some(toolset_fit::document_chrome(
+        (f64::from(outer.x) / scale, f64::from(outer.y) / scale),
+        f64::from(inner.y) / scale,
+        f64::from(width) / scale,
+        DOCUMENT_IN_CLIENT_MENU_BAR_HEIGHT,
+    ))
+}
+
+/// macOS uses the global menu bar, so a palette cannot cover the document's menus (unchanged).
+#[cfg(target_os = "macos")]
+fn document_chrome_frame<R: Runtime>(_app: &tauri::AppHandle<R>) -> Option<ScreenRect> {
+    None
+}
 
 /// A monitor's full bounds in global logical points.
 #[cfg(not(windows))]

@@ -1825,6 +1825,14 @@ Run under KDE Plasma (Wayland session, so the app uses XWayland) and on GNOME.
   the Main toolbar on Linux: at 1024 it starts at the left edge, and back at 1680 it returns to
   its saved position. Quit at 1024x768 and relaunch at 1680x1050: palettes open at their 1680
   positions, not the squeezed ones.
+- Document menu bar stays clickable (Linux and Windows; macOS has the global menu bar and is
+  unchanged): start from a fresh profile (delete toolbar-state.json) so every palette takes its
+  first-ever position. With the document window unmaximized at its default size, the Main toolbar
+  and the other palettes sit below the document's menu bar, never over it or the title bar: open
+  each menu by clicking it. On Linux, check at 1680x1050 and 1280x800; on Windows, check at
+  1920x1200 (or 2560x1440 at 125%), where the old default covered the menu bar, and at 1920x1080,
+  where Main keeps its old spot. Then move Main elsewhere, quit and relaunch: it opens where you
+  left it, not at the default.
 
 ## Linux Interactive 3D (1.2.2)
 

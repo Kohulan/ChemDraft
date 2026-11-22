@@ -11,6 +11,11 @@
 //!   work area can hold it again ([`ToolsetFitMemory`], [`plan_fit`]).
 //! - A palette ChemDraft moves never lands with its title strip under the Main toolbar
 //!   ([`frame_clear_of_toolbar`]).
+//!
+//! Also: on Linux and Windows the document window carries its own menu bar. In the 1.2.2 VM run the
+//! unmaximized document's GTK menu bar (y about 199) sat under the Main toolbar (bottom 220), so no
+//! menu could be clicked. A palette's first-ever position stays clear of the document's title and
+//! menu bars ([`position_clear_of_document_chrome`]).
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -201,9 +206,82 @@ pub(crate) fn frame_clear_of_toolbar(
     at(below, height)
 }
 
+/// The document window's title bar and in-window menu bar: from the outer top to the client top
+/// plus `menu_height` (a menu bar drawn inside the client area, as GTK does on Linux; zero where
+/// the menu is non-client, as on Windows). All values in global logical points.
+#[cfg(any(not(target_os = "macos"), test))]
+pub(crate) fn document_chrome(
+    outer: (f64, f64),
+    client_top: f64,
+    width: f64,
+    menu_height: f64,
+) -> ScreenRect {
+    ScreenRect::new(
+        outer.0,
+        outer.1,
+        width,
+        (client_top + menu_height - outer.1).max(0.0),
+    )
+}
+
+/// A palette's first-ever position, moved straight down below `chrome` (the document window's
+/// title and menu bars) plus `gap` when its frame would cover any of it. A position the user saved
+/// never comes through here.
+pub(crate) fn position_clear_of_document_chrome(
+    position: ToolsetWindowPosition,
+    size: (f64, f64),
+    chrome: Option<ScreenRect>,
+    gap: f64,
+) -> ToolsetWindowPosition {
+    let Some(chrome) = chrome else {
+        return position;
+    };
+    let frame = ScreenRect::new(position.x, position.y, size.0, size.1);
+    if frame.overlap_area(&chrome) <= 0.0 {
+        return position;
+    }
+    ToolsetWindowPosition {
+        x: position.x,
+        y: chrome.y + chrome.height + gap,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_main_toolbar_never_covers_the_document_menu_bar() {
+        let main_default = position(88.0, 154.0);
+        let main_size = (1311.0, 85.0);
+
+        // Linux, 1680x1050: the unmaximized 1280x820 document at 200,115 with a 30 px title bar
+        // and the GTK menu bar inside its client area. Main moves below the menu bar.
+        let linux = document_chrome((200.0, 115.0), 145.0, 1280.0, 32.0);
+        assert_eq!(linux, ScreenRect::new(200.0, 115.0, 1280.0, 62.0));
+        let placed = position_clear_of_document_chrome(main_default, main_size, Some(linux), 8.0);
+        assert_eq!((placed.x, placed.y), (88.0, 185.0));
+
+        // Windows, 1920x1200 at 100%: the centred document's non-client menu ends at its client top
+        // (192), inside Main's default rows 154..239. The same rule moves Main below it.
+        let windows = document_chrome((312.0, 141.0), 192.0, 1296.0, 0.0);
+        let placed = position_clear_of_document_chrome(main_default, main_size, Some(windows), 8.0);
+        assert_eq!((placed.x, placed.y), (88.0, 200.0));
+
+        // Windows, 1680x1050: the menu ends at 117, above Main. Unchanged.
+        let clear = document_chrome((192.0, 66.0), 117.0, 1296.0, 0.0);
+        let placed = position_clear_of_document_chrome(main_default, main_size, Some(clear), 8.0);
+        assert_eq!((placed.x, placed.y), (88.0, 154.0));
+
+        // macOS (global menu bar) or no visible document window: the default stands.
+        let placed = position_clear_of_document_chrome(main_default, main_size, None, 8.0);
+        assert_eq!((placed.x, placed.y), (88.0, 154.0));
+
+        // A document beside the palette, not under it, is no reason to move.
+        let beside = document_chrome((1500.0, 100.0), 130.0, 1000.0, 32.0);
+        let placed = position_clear_of_document_chrome(main_default, main_size, Some(beside), 8.0);
+        assert_eq!((placed.x, placed.y), (88.0, 154.0));
+    }
 
     fn frame(
         from: (i32, i32),
