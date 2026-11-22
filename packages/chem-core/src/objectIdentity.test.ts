@@ -98,6 +98,61 @@ describe("host-owned object identity (objectIdentity.ts)", () => {
     expect(hasObjectIdentity(find(retyped, "T"), textIdentity)).toBe(false);
   });
 
+  it("Kimi 1.2.3 finding 4: an edited cross-page move beside a same-id newcomer donates the identity to neither", () => {
+    const before = twoPages();
+    const original = find(before, "X");
+    const identity = objectIdentity(original);
+    // The selected X moves to page 2 as an edited copy; an unrelated X takes its place on page 1.
+    const newcomer = molecule("X", 200);
+    const adopted = adoptDerivedDocument(before, { ...before, pages: [
+      { ...before.pages[0]!, objects: [newcomer, find(before, "T")] },
+      { ...before.pages[1]!, objects: [{ ...original, y: 40 }] }
+    ] });
+    expect(adopted.pages[0]!.objects[0]).toMatchObject({ id: "X", x: 200 });
+    expect(adopted.pages[1]!.objects[0]).toMatchObject({ id: "X", y: 40 });
+    // Never the newcomer. Which of the two new values continues X cannot be told apart, so neither does.
+    expect(hasObjectIdentity(adopted.pages[0]!.objects[0]!, identity)).toBe(false);
+    expect(hasObjectIdentity(adopted.pages[1]!.objects[0]!, identity)).toBe(false);
+  });
+
+  it("Kimi 1.2.3 finding 4: an id whose replacements are ambiguous across pages carries nothing, and a lone in-place replacement still carries", () => {
+    const empty = createEmptyDocument({ now });
+    const before = toEngineDocument({ ...empty, pages: [
+      { ...empty.pages[0]!, id: "page-1", objects: [molecule("X", 0)] },
+      { ...empty.pages[0]!, id: "page-2", objects: [molecule("X", 300)] }
+    ], selection: { pageId: "page-1", objectIds: [] } });
+    const [first, second] = [before.pages[0]!.objects[0]!, before.pages[1]!.objects[0]!];
+    const firstIdentity = objectIdentity(first), secondIdentity = objectIdentity(second);
+    // Both same-id objects swap pages as edited copies: each page's new value may be either one.
+    const swapped = adoptDerivedDocument(before, { ...before, pages: [
+      { ...before.pages[0]!, objects: [{ ...second, y: 5 }] }, { ...before.pages[1]!, objects: [{ ...first, y: 5 }] }
+    ] });
+    for (const object of swapped.pages.flatMap(page => page.objects)) {
+      expect(hasObjectIdentity(object, firstIdentity) || hasObjectIdentity(object, secondIdentity)).toBe(false);
+    }
+    // Only page 1's X is replaced in place; page 2's is kept: the replacement is unambiguous.
+    const inPlace = adoptDerivedDocument(before, { ...before, pages: [
+      { ...before.pages[0]!, objects: [{ ...first, y: 9 }] }, before.pages[1]!
+    ] });
+    expect(hasObjectIdentity(inPlace.pages[0]!.objects[0]!, firstIdentity)).toBe(true);
+    expect(inPlace.pages[1]!.objects[0]).toBe(second);
+  });
+
+  it("Kimi 1.2.3 finding 5: deleting a bracket's partner keeps the surviving bracket's identity", () => {
+    const empty = createEmptyDocument({ now });
+    const bracket = (id: string, side: "open" | "close", x: number): DocumentObject => ({ id, type: "bracket", bracketKind: "square",
+      x, y: 0, width: 16, height: 64, rotation: 0, style: {}, containedObjectIds: [], pairId: "pair", side });
+    const before = toEngineDocument({ ...empty, pages: [{ ...empty.pages[0]!, id: "page-1",
+      objects: [bracket("open", "open", 0), bracket("close", "close", 80)] }], selection: { pageId: "page-1", objectIds: [] } });
+    const identity = objectIdentity(find(before, "open"));
+    const after = applyPatch(before, { op: "removeObject", objectId: "close" }, { now, preserveRepeatUnitBrackets: true });
+    const survivor = find(after, "open");
+    // The orphaned bracket loses its pair metadata, but it is still the same object.
+    expect(survivor).not.toBe(find(before, "open"));
+    expect(survivor).not.toHaveProperty("pairId");
+    expect(hasObjectIdentity(survivor, identity)).toBe(true);
+  });
+
   it("retainObjectIdentity carries only to a same-id, same-type value without an identity of its own", () => {
     const a = molecule("X", 0);
     const identity = objectIdentity(a);

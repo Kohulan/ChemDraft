@@ -246,12 +246,11 @@ export function adoptDerivedDocument(base: ChemDraftDocument, next: ChemDraftDoc
       validated.add(object);
     }
   }
-  let kept: Set<DocumentObject> | undefined;
+  let replaced: Map<DocumentObject, DocumentObject> | undefined;
   const adopted = validateDraft({
     ...next,
     selection: { ...next.selection, objectIds: [...next.selection.objectIds] },
     pages: next.pages.map((page) => {
-      let replaced: Map<string, DocumentObject> | undefined;
       return {
         ...page,
         objects: page.objects.map(object => {
@@ -259,9 +258,8 @@ export function adoptDerivedDocument(base: ChemDraftDocument, next: ChemDraftDoc
           const parsed = DocumentObjectSchema.parse(object);
           retainBracketIdentity(object, parsed);
           // A derived value continues the base object it replaced, unless it has an identity of its own.
-          kept ??= new Set(next.pages.flatMap(candidate => candidate.objects));
-          replaced ??= replacedObjects(base.pages.find(candidate => candidate.id === page.id), page, kept);
-          const predecessor = replaced.get(object.id);
+          replaced ??= replacedObjects(base, next, validated);
+          const predecessor = replaced.get(object);
           if (predecessor) retainObjectIdentity(predecessor, object);
           retainObjectIdentity(object, parsed);
           return parsed;
@@ -283,20 +281,45 @@ export function adoptDerivedDocument(base: ChemDraftDocument, next: ChemDraftDoc
 }
 
 /**
- * The base objects a derived page replaced in place, by id: a base object gone from the derived
- * document (`kept` holds every object it still has, on any page) whose id names exactly one object
- * on each of the two pages, of the same type. adoptDerivedDocument
- * is for normalization passes that swap an object for an edited copy of itself, so such a copy
- * continues the object's host identity. An id that is ambiguous on either page carries nothing, and
- * the copy stays a different object (objectIdentity.ts: fail closed).
+ * Each derived value that replaced a base object in place, mapped to that base object.
+ * adoptDerivedDocument is for normalization passes that swap an object for an edited copy of itself,
+ * so such a copy continues the object's host identity. A value can only be told to continue a base
+ * object when nothing else could be that object's copy: across the WHOLE document, the id names exactly
+ * one base object that is gone from `next` and exactly one new value (one `base` does not hold), both on
+ * the same page, of the same type, and the id is unique on that page in both documents.
+ *
+ * Anything else carries nothing (objectIdentity.ts: fail closed). In particular an edited copy moved to
+ * another page while an unrelated same-id object took the original page leaves two new values with
+ * the id, so neither inherits: a newcomer must never receive the selected object's identity, and which
+ * value is the moved copy cannot be read from the values themselves.
  */
-function replacedObjects(base: DocumentPage | undefined, next: DocumentPage,
-  kept: ReadonlySet<DocumentObject>): Map<string, DocumentObject> {
-  const replaced = new Map<string, DocumentObject>();
-  if (!base) return replaced;
-  const successors = uniqueObjectsById(next.objects);
-  for (const [id, object] of uniqueObjectsById(base.objects)) {
-    if (object && !kept.has(object) && successors.get(id)?.type === object.type) replaced.set(id, object);
+function replacedObjects(base: ChemDraftDocument, next: ChemDraftDocument,
+  validated: ReadonlySet<DocumentObject>): Map<DocumentObject, DocumentObject> {
+  type Located = { pageId: string; object: DocumentObject };
+  const kept = new Set(next.pages.flatMap(page => page.objects));
+  const gone = new Map<string, Located[]>(), fresh = new Map<string, Located[]>();
+  const add = (map: Map<string, Located[]>, pageId: string, object: DocumentObject) => {
+    const list = map.get(object.id);
+    if (list) list.push({ pageId, object });
+    else map.set(object.id, [{ pageId, object }]);
+  };
+  for (const page of base.pages) {
+    for (const object of page.objects) if (!kept.has(object)) add(gone, page.id, object);
+  }
+  for (const page of next.pages) {
+    for (const object of page.objects) if (!validated.has(object)) add(fresh, page.id, object);
+  }
+  const replaced = new Map<DocumentObject, DocumentObject>();
+  for (const [id, successors] of fresh) {
+    const predecessors = gone.get(id);
+    if (successors.length !== 1 || predecessors?.length !== 1) continue;
+    const [successor] = successors as [Located], [predecessor] = predecessors as [Located];
+    if (successor.pageId !== predecessor.pageId || successor.object.type !== predecessor.object.type) continue;
+    const basePage = base.pages.find(page => page.id === predecessor.pageId);
+    const nextPage = next.pages.find(page => page.id === successor.pageId);
+    if (!basePage || !nextPage || uniqueObjectsById(basePage.objects).get(id) !== predecessor.object ||
+      uniqueObjectsById(nextPage.objects).get(id) !== successor.object) continue;
+    replaced.set(successor.object, predecessor.object);
   }
   return replaced;
 }
@@ -334,7 +357,12 @@ function validateDraft(
     const objects = new Map(page.objects.map(object => [object.id, object]));
     page.objects = page.objects.map(object => {
       if (object.type !== "bracket") return object;
-      if (object.pairId && !pairs.has(object.pairId)) return withoutBracketPairMetadata(object);
+      if (object.pairId && !pairs.has(object.pairId)) {
+        // An orphaned bracket loses its pair metadata, not its host identity (objectIdentity.ts).
+        const plain = withoutBracketPairMetadata(object);
+        retainObjectIdentity(object, plain);
+        return plain;
+      }
       const containedObjectIds = object.containedObjectIds.filter(id => objects.has(id));
       const crossingBondIds = object.crossingBondIds?.filter(ref => {
         const molecule = objects.get(ref.objectId);
