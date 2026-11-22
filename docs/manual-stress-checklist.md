@@ -1770,6 +1770,12 @@ Run under KDE Plasma (Wayland session, so the app uses XWayland) and on GNOME.
 - 1280-wide screen: set the display to 1280x800 and relaunch. The Main toolbar is no wider than
   the screen and starts at its left edge; nothing runs off the right edge of the screen. At
   1680x1050 the Main toolbar keeps its full width and saved position.
+- 1024-wide screen: set the display to 1024x768 and relaunch. The Main toolbar is as wide as the
+  screen and scrolls sideways: drag its horizontal scrollbar (or Shift+wheel over it) to the right
+  end and every tool, up to the last one, is reachable and clickable. The scrollbar is fully
+  visible below the tool row, not cut off by the palette's bottom edge, and the row above it is
+  not clipped either. Palettes that fit the screen (Arrows, Orbitals, Style) show no scrollbar.
+  Relaunched at 1680x1050, the Main toolbar shows no scrollbar.
 - Palette positions after Save/Open: place Main and Art somewhere distinctive, then press
   Shift+Ctrl+S and Esc, and Ctrl+O and Esc, several times. Every palette comes back exactly where
   it was, and after quitting and relaunching it opens at that same spot (toolbar-state.json is

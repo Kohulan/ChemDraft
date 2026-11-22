@@ -191,6 +191,146 @@ describe("palette work-area sizing", () => {
     expect(native.invoke).toHaveBeenCalledExactlyOnceWith("resize_toolset_window", { width: 520, height: 600 });
   });
 
+  describe("Linux horizontal overflow of a capped palette (B3 follow-up)", () => {
+    // The Main toolbar's natural content is 1311 px wide; on a 1024x768 screen Rust caps the window
+    // at the work area. jsdom has no layout, so the shell and content body report a model of what
+    // WebKitGTK lays out: the body capped at its inline max-width once it scrolls sideways, with a
+    // 15 px classic horizontal scrollbar added to its auto height.
+    const NATURAL_WIDTH = 1311;
+    const TITLE_HEIGHT = 22;
+    const ROW_HEIGHT = 58;
+    const SCROLLBAR = 15;
+
+    const scrollerOf = (element: Element) =>
+      (element.classList.contains("palette-window-content") ? element : element.querySelector(".palette-window-content")) as HTMLElement | null;
+    const scrolling = (scroller: HTMLElement | null) => scroller?.style.overflowX === "auto";
+    const cappedWidth = (scroller: HTMLElement) => Math.min(NATURAL_WIDTH, Number.parseFloat(scroller.style.maxWidth) || NATURAL_WIDTH);
+    const rect = (width: number, height: number) =>
+      ({ x: 0, y: 0, left: 0, top: 0, width, height, right: width, bottom: height, toJSON: () => ({}) }) as DOMRect;
+
+    const installLayoutModel = () => {
+      vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+        if (!this.classList.contains("palette-window-shell")) return rect(0, 0);
+        const scroller = scrollerOf(this);
+        if (!scroller || !scrolling(scroller)) return rect(NATURAL_WIDTH, TITLE_HEIGHT + ROW_HEIGHT);
+        return rect(cappedWidth(scroller), TITLE_HEIGHT + ROW_HEIGHT + SCROLLBAR);
+      });
+      const isScroller = (element: Element) => element.classList.contains("palette-window-content");
+      vi.spyOn(Element.prototype, "scrollWidth", "get").mockImplementation(function (this: Element) {
+        return isScroller(this) ? NATURAL_WIDTH : 0;
+      });
+      vi.spyOn(Element.prototype, "clientWidth", "get").mockImplementation(function (this: Element) {
+        if (!isScroller(this)) return 0;
+        return scrolling(this as HTMLElement) ? cappedWidth(this as HTMLElement) : NATURAL_WIDTH;
+      });
+      vi.spyOn(Element.prototype, "scrollHeight", "get").mockImplementation(function (this: Element) {
+        return isScroller(this) ? ROW_HEIGHT : 0;
+      });
+      vi.spyOn(Element.prototype, "clientHeight", "get").mockImplementation(function (this: Element) {
+        return isScroller(this) ? ROW_HEIGHT : 0;
+      });
+      vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
+        if (!isScroller(this)) return 0;
+        return ROW_HEIGHT + (scrolling(this) ? SCROLLBAR : 0);
+      });
+    };
+
+    const resizeRequests = () => native.invoke.mock.calls
+      .filter(([name]) => name === "resize_toolset_window")
+      .map(([, payload]) => payload as { width: number; height: number });
+    // A size-effect rerun (registry or settings state landing) may resend an identical size, which
+    // is harmless; the distinct sizes in order are what the window actually went through.
+    const distinctSizes = () => resizeRequests().filter((size, index, all) =>
+      index === 0 || size.width !== all[index - 1]!.width || size.height !== all[index - 1]!.height);
+
+    // Mount Main at the given platform and window width, then stand in for the native resize that
+    // follows the first fit (Rust capped the width, so the webview viewport keeps `windowWidth`).
+    const mountMain = async (platform: "linux" | "macos" | "windows", windowWidth: number) => {
+      vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+      vi.stubGlobal("innerWidth", windowWidth);
+      vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => window.setTimeout(() => callback(0), 0));
+      vi.stubGlobal("cancelAnimationFrame", (handle: number) => window.clearTimeout(handle));
+      native.workArea.mockResolvedValue({ left: 0, top: 0, right: windowWidth, bottom: 768 });
+      installLayoutModel();
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      const settle = async () => {
+        for (let turn = 0; turn < 6; turn += 1) {
+          await act(async () => { await new Promise(resolve => window.setTimeout(resolve, 0)); });
+        }
+      };
+      await act(async () => root.render(createElement(PaletteWindow, { toolsetId: "core.main", platform })));
+      await settle();
+      const nativeResize = async () => {
+        window.dispatchEvent(new Event("resize"));
+        await settle();
+      };
+      await nativeResize();
+      const shell = container.querySelector<HTMLElement>(".palette-window-shell")!;
+      const scroller = container.querySelector<HTMLElement>(".palette-window-content")!;
+      const unmount = async () => {
+        await act(async () => root.unmount());
+        container.remove();
+      };
+      return { shell, scroller, nativeResize, unmount };
+    };
+
+    it("scrolls the Main toolbar sideways in a 1024 px Linux window and reports the scrollbar's height", async () => {
+      const { shell, scroller, nativeResize, unmount } = await mountMain("linux", 1024);
+      try {
+        expect(scroller.style.overflowX).toBe("auto");
+        expect(scroller.style.maxWidth).toBe("1024px");
+        expect(scroller.dataset.paletteHorizontalOverflow).toBe("true");
+        // Every tool sits inside the scroller, and its scroll range reaches the natural right edge.
+        const tools = shell.querySelectorAll<HTMLElement>("[data-command-id]");
+        expect(tools.length).toBeGreaterThan(0);
+        for (const tool of Array.from(tools)) expect(scroller.contains(tool)).toBe(true);
+        expect(scroller.clientWidth).toBe(1024);
+        expect(scroller.scrollWidth - scroller.clientWidth).toBe(NATURAL_WIDTH - 1024);
+        // Width stays the natural width; only the height gains the measured scrollbar.
+        expect(distinctSizes()).toEqual([
+          { width: NATURAL_WIDTH, height: TITLE_HEIGHT + ROW_HEIGHT },
+          { width: NATURAL_WIDTH, height: TITLE_HEIGHT + ROW_HEIGHT + SCROLLBAR }
+        ]);
+        // No resize loop: the resizes that follow the height fit ask for nothing new.
+        const settled = resizeRequests().length;
+        await nativeResize();
+        await nativeResize();
+        expect(resizeRequests()).toHaveLength(settled);
+        expect(scroller.style.overflowX).toBe("auto");
+      } finally {
+        await unmount();
+      }
+    });
+
+    it.each(["macos", "windows"] as const)("leaves the same 1024 px window unchanged on %s", async platform => {
+      const { scroller, nativeResize, unmount } = await mountMain(platform, 1024);
+      try {
+        await nativeResize();
+        expect(scroller.style.overflowX).toBe("");
+        expect(scroller.style.maxWidth).toBe("");
+        expect(scroller.dataset.paletteHorizontalOverflow).toBeUndefined();
+        expect(distinctSizes()).toEqual([{ width: NATURAL_WIDTH, height: TITLE_HEIGHT + ROW_HEIGHT }]);
+      } finally {
+        await unmount();
+      }
+    });
+
+    it("gives a Linux palette that fits its window no scrollbar", async () => {
+      const { scroller, nativeResize, unmount } = await mountMain("linux", 1400);
+      try {
+        await nativeResize();
+        expect(scroller.style.overflowX).toBe("");
+        expect(scroller.style.maxWidth).toBe("");
+        expect(scroller.dataset.paletteHorizontalOverflow).toBeUndefined();
+        expect(distinctSizes()).toEqual([{ width: NATURAL_WIDTH, height: TITLE_HEIGHT + ROW_HEIGHT }]);
+      } finally {
+        await unmount();
+      }
+    });
+  });
+
   it("reports a skipped native resize so the caller can retry the same measurement", async () => {
     native.invoke.mockResolvedValueOnce(false);
     const size = { width: 520, height: 600 };

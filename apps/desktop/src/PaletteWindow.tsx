@@ -133,6 +133,57 @@ function pendingPlaceholderToolset(toolsetId: string): DesktopToolsetDefinition 
   };
 }
 
+/** Rounding slack between the reported content width and the window's integer viewport width. */
+const LINUX_PALETTE_OVERFLOW_TOLERANCE_PX = 1;
+
+/**
+ * Linux only (B3 follow-up). Rust caps a palette window's width at the monitor work area, but the
+ * shell is width:max-content with a nowrap row, so on a narrow screen the right end of the Main
+ * toolbar (natural 1311 px) was clipped and unreachable. Once the window we were given is narrower
+ * than the natural width we reported, cap the content body at the viewport and let it scroll
+ * sideways. Returns the size to report:
+ * - width stays the NATURAL content width in both modes (the capped body's hidden part is added back
+ *   from scrollWidth - clientWidth), so turning the scroller on or off never changes the width
+ *   request and cannot change the window width that decides the mode;
+ * - height gains the horizontal scrollbar's measured thickness (offsetHeight - clientHeight of the
+ *   scroller; 0 for an overlay scrollbar), so the X11 min = max pin (B1) shows the row and the bar.
+ * `fittedWidth` is the width Rust last accepted. The scroller turns on only after Rust has been given
+ * this natural width (so a window that has not been fitted yet never flashes a scrollbar) and stays
+ * on while the natural width still exceeds the viewport.
+ */
+function fitLinuxPaletteHorizontalOverflow(
+  shell: HTMLElement,
+  body: HTMLElement,
+  measured: DOMRect,
+  fittedWidth: number | undefined,
+  viewportWidth: number
+): { width: number; height: number } {
+  const wasOverflowing = body.dataset.paletteHorizontalOverflow === "true";
+  let width = Math.ceil(wasOverflowing ? measured.width + body.scrollWidth - body.clientWidth : measured.width);
+  // A capped body's scrollWidth is rounded to whole pixels; keep the accepted width across that
+  // rounding so the size key does not jitter by a pixel between the two modes.
+  if (wasOverflowing && fittedWidth !== undefined
+    && Math.abs(width - fittedWidth) <= LINUX_PALETTE_OVERFLOW_TOLERANCE_PX) {
+    width = fittedWidth;
+  }
+  const overflow = (wasOverflowing || width === fittedWidth)
+    && width - viewportWidth > LINUX_PALETTE_OVERFLOW_TOLERANCE_PX;
+  const maxWidth = overflow ? `${Math.max(0, Math.floor(viewportWidth))}px` : "";
+  let rect = measured;
+  if (overflow !== wasOverflowing || body.style.maxWidth !== maxWidth) {
+    if (overflow) body.dataset.paletteHorizontalOverflow = "true";
+    else delete body.dataset.paletteHorizontalOverflow;
+    body.style.overflowX = overflow ? "auto" : "";
+    body.style.maxWidth = maxWidth;
+    rect = shell.getBoundingClientRect();
+  }
+  if (!overflow) return { width, height: Math.ceil(rect.height) };
+  const scrollbar = Math.max(0, body.offsetHeight - body.clientHeight);
+  // Everything but the scroller's box, plus the scroller's full content and its scrollbar. Correct
+  // whether the engine adds the bar to the auto height or takes it out of the content area.
+  return { width, height: Math.ceil(rect.height - body.offsetHeight + body.scrollHeight + scrollbar) };
+}
+
 export function PaletteWindow({
   toolsetId = "core.main",
   resizable = false,
@@ -153,6 +204,8 @@ export function PaletteWindow({
   const settlingBeforeForwardRef = useRef(false);
   const lastLoggedSizeRef = useRef<string>("");
   const sizeAnimationFrameRef = useRef<number | undefined>(undefined);
+  // Linux: the content width Rust last accepted, kept across size-effect reruns.
+  const fittedPaletteWidthRef = useRef<number | undefined>(undefined);
   const compoundLayoutSettings = useCompoundLayoutSettings();
   const compoundLayoutsEnabled = compoundLayoutSettings.enabled;
   const [unfilteredToolsetRegistry, setToolsetRegistry] = useState(() => initialRegistry ?? desktopToolsetRegistry);
@@ -516,8 +569,14 @@ export function PaletteWindow({
         // the window shrinks when the manifest size is too big (blank gaps) and grows when
         // content is larger (crowded rows). colorPickerOpen reserves room for the open swatch.
         const rect = shell?.getBoundingClientRect();
-        const contentWidth = rect ? Math.ceil(rect.width) : 0;
-        const contentHeight = rect ? Math.ceil(rect.height) : 0;
+        let contentWidth = rect ? Math.ceil(rect.width) : 0;
+        let contentHeight = rect ? Math.ceil(rect.height) : 0;
+        // Linux: when the capped window is narrower than the content, scroll sideways (width stays
+        // natural; height gains the scrollbar). macOS and Windows never take this branch.
+        if (platform === "linux" && shell && bodyRef.current && rect && contentWidth > 0) {
+          ({ width: contentWidth, height: contentHeight } = fitLinuxPaletteHorizontalOverflow(
+            shell, bodyRef.current, rect, fittedPaletteWidthRef.current, window.innerWidth));
+        }
         const width = contentWidth || fallbackWidth;
         const height = Math.min(availableHeight,
           Math.max(colorPickerOpen ? 292 : 0, contentHeight || fallbackHeight));
@@ -534,6 +593,7 @@ export function PaletteWindow({
         const sizeKey = `${width}x${height}`;
         if (sizeKey !== lastSize && await fitCurrentPaletteWindow({ width, height }, area)) {
           lastSize = sizeKey;
+          fittedPaletteWidthRef.current = width;
         }
       } finally {
         sizing = false;
@@ -572,7 +632,7 @@ export function PaletteWindow({
         sizeAnimationFrameRef.current = undefined;
       }
     };
-  }, [colorPickerOpen, fallbackHeight, fallbackWidth, knownToolset, resizable, toolset.id]);
+  }, [colorPickerOpen, fallbackHeight, fallbackWidth, knownToolset, platform, resizable, toolset.id]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
