@@ -1933,7 +1933,6 @@ function exportMoleculeObject(
   const labels = hasIsotopes
     ? new Map(planMoleculeAtomLabels(molecule).map((plan) => [plan.atom.id, plan.layout.runs]))
     : undefined;
-  const sourceAtoms = molecule.compatibility?.unknown.sourceAtomAttributesByAtomId;
   const atomLines = molecule.atoms.map((atom) => {
     const nodeId = idFor(atomIds, atom.id, allocator);
     const sourceAtomId = preservedCurveAttributes(molecule.compatibility?.unknown.cdxmlAtomIdsByAtomId)[atom.id];
@@ -2018,12 +2017,7 @@ function exportMoleculeObject(
     if (rGroupLabel || literalLabel) {
       // A regenerated literal node must retain its label semantics too, including any explicit
       // NumHydrogens. Element text alone does not identify a literal label to a CDXML reader.
-      // Zero explicitly attached hydrogens can require a literal display label on an
-      // imported element. Keep its atom identity when the current chemistry agrees.
-      const source = isRecord(sourceAtoms) ? preservedCurveAttributes(sourceAtoms[atom.id]) : {};
-      const explicitElement = elementNumber !== undefined && Number(source.Element) === elementNumber &&
-        (!source.NodeType || source.NodeType === "Element") && source.NumHydrogens === "0" && atom.hydrogenCount === 0;
-      if (literalLabel && !rGroupLabel && !explicitElement) attributes.push('NodeType="GenericNickname"', `GenericNickname="${escapeXmlAttribute(atom.element)}"`);
+      if (literalLabel && !rGroupLabel) attributes.push('NodeType="GenericNickname"', `GenericNickname="${escapeXmlAttribute(atom.element)}"`);
       return `<n ${attributes.join(" ")}><t><s>${escapeXmlText(atom.element)}</s></t></n>`;
     }
     if (isotope !== undefined) {

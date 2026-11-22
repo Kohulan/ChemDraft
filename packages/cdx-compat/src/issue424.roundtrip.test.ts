@@ -7,7 +7,7 @@
 // test, and are not copied from any vendor sample.
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
-  applyPatches, createEmptyDocument, moleculeToMolfileV2000,
+  moleculeToMolfileV2000,
   type ChemDraftDocument, type ElectronMarkObject, type GraphicObject, type MoleculeObject, type TextObject
 } from "@chemdraft/chem-core";
 import { nativeBondOrderResolution } from "@chemdraft/layout-engine";
@@ -238,57 +238,6 @@ describe("issue #424: lone pairs", () => {
     const opened = openChemDraftPayload(etherWithLonePairs.replaceAll('object="12"', 'object="404"'));
     expect(codes(opened.warnings)).toContain("cdxml.lone_pair_anchor_unresolved");
     expect(objectsOf<ElectronMarkObject>(opened.document!, "electron-mark").every(p => p.anchor.kind === "point")).toBe(true);
-  });
-});
-
-describe("issue #424 follow-up: atomic number versus generic nickname", () => {
-  // No reader in this tree records sourceAtomAttributesByAtomId, so the retained source attributes
-  // are supplied here the way the contributor's own test does.
-  function chargedHydrogen(source: Record<string, string>) {
-    const base = createEmptyDocument({ title: "issue 424" });
-    const molecule: MoleculeObject = {
-      id: "mol_h", type: "molecule", x: 0, y: 0, width: 20, height: 20, rotation: 0, style: {},
-      structureFormat: "smiles", structure: "", superatoms: [], rGroups: [], bonds: [],
-      atoms: [{ id: "h", element: "H", x: 20, y: 30, formalCharge: 1, hydrogenCount: 0, labelLiteral: true }],
-      compatibility: { warnings: [], unknown: { sourceAtomAttributesByAtomId: { h: source } } }
-    };
-    const document = structuredClone(applyPatches(base, [{ op: "addObject", pageId: base.pages[0]!.id, object: molecule }]));
-    const live = objectsOf<MoleculeObject>(document, "molecule")[0]!;
-    live.atoms[0]!.hydrogenCount = 0;
-    return { document, atom: live.atoms[0]! };
-  }
-  const node = (xml: string) => xml.match(/<n\b[^>]*>/)?.[0] ?? "";
-
-  it("writes an explicit element (not a nickname) when the retained atomic number and zero H agree", () => {
-    const { document } = chargedHydrogen({ Element: "1", NumHydrogens: "0" });
-    const { plain, reopened } = saveAsWithoutPayload(document);
-    expect(node(plain)).toContain('Element="1"');
-    expect(node(plain)).toContain('NumHydrogens="0"');
-    expect(plain).not.toContain("GenericNickname");
-    expect(objectsOf<MoleculeObject>(reopened, "molecule")[0]!.atoms[0]).toMatchObject({ element: "H", formalCharge: 1 });
-  });
-
-  it.each([
-    ["the element was edited", { element: "Li" }, "Li"],
-    ["a hydrogen was added", { hydrogenCount: 1 }, "H"]
-  ])("never keeps a stale atomic number when %s", (_case, edit, element) => {
-    const { document, atom } = chargedHydrogen({ Element: "1", NumHydrogens: "0" });
-    Object.assign(atom, edit);
-    const { plain, reopened } = saveAsWithoutPayload(document);
-    expect(node(plain)).toContain('NodeType="GenericNickname"');
-    expect(node(plain)).toContain(`GenericNickname="${element}"`);
-    if (element !== "H") expect(node(plain)).not.toContain('Element="1"');
-    const reopenedAtom = objectsOf<MoleculeObject>(reopened, "molecule")[0]!.atoms[0]!;
-    expect(reopenedAtom.element).toBe(element);
-    expect(reopenedAtom.formalCharge).toBe(1);
-  });
-
-  it("does not take the identity from a disagreeing retained atomic number", () => {
-    const { document } = chargedHydrogen({ Element: "3", NumHydrogens: "0" });
-    const { plain, reopened } = saveAsWithoutPayload(document);
-    expect(node(plain)).toContain('GenericNickname="H"');
-    expect(node(plain)).not.toContain('Element="3"');
-    expect(objectsOf<MoleculeObject>(reopened, "molecule")[0]!.atoms[0]!.element).toBe("H");
   });
 });
 

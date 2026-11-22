@@ -155,20 +155,3 @@ describe("CDXML export of a cyano label whose recorded reading differs from its 
     expect(turnedWarnings(scn("right", 0))).toEqual([]);
   });
 });
-
-it("keeps an explicitly identified atom with zero hydrogens distinct from a generic nickname", () => {
-  const doc = structuredClone(documentWith([{ id: "h", element: "H", x: 20, y: 30, z: -16, formalCharge: 1,
-    hydrogenCount: 0, labelLiteral: true }], []));
-  const mol = doc.pages[0].objects[0] as MoleculeObject;
-  mol.atoms[0].hydrogenCount = 0;
-  mol.compatibility = { warnings: [], unknown: { sourceAtomAttributesByAtomId: { h: { Element: "1", NumHydrogens: "0" } } } };
-  const out = exportDocumentToCdxml(doc, { embedNativePayload: false });
-  expect(out.contents).toContain('Element="1"');
-  expect(out.contents).not.toContain('NodeType="GenericNickname"');
-  expect(out.contents).toContain('xyz="15 22.5 -12"');
-  const reopened = openChemDraftPayload(out.contents).document!;
-  expect((reopened.pages[0].objects[0] as MoleculeObject).atoms[0]).toMatchObject({ element: "H", z: -16, formalCharge: 1 });
-  expect(out.contents).toContain('NumHydrogens="0"');
-  mol.atoms[0].element = "Me";
-  expect(exportDocumentToCdxml(doc, { embedNativePayload: false }).contents).toContain('GenericNickname="Me"');
-});
