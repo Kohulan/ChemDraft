@@ -556,6 +556,75 @@ describe("Kimi 1.2.3 finding 3: a command's insertions are granted by identity, 
 });
 
 /**
+ * Kimi run-20261122-123139-b532aa, finding 1: insertions were granted only for receipt ids absent before
+ * the write, so a batch that deletes the selected X and inserts its replacement X in the same write left
+ * the replacement ungranted (and X's Send pin on the deleted object): the command's next write to its own
+ * insertion was refused with "The object you selected on page 1 is no longer there". The replacement is
+ * this write's insertion, granted by the identity of the object committed, whether or not its id existed.
+ */
+describe("Kimi 1.2.3 xhigh finding 1: a same-batch replacement under the selected id is the command's insertion", () => {
+  function batchHost(document: ChemDraftDocument, firstPage = "page-1") {
+    let current = document;
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const applyDocumentPatch = vi.fn((request: PluginPatchApplicationRequest) => {
+      const before = current;
+      assertPluginPatchWriteScope(before, request.patch, request.writeScopeObjectIds, undefined, undefined, request.writeScopePages);
+      const after = applyPatch(before, request.patch.patch, { now });
+      assertPluginDocumentWriteScope(before, after, request.patch, request.writeScopeObjectIds, request.writeScopePages);
+      current = after;
+      return { applied: true as const, objectIds: writePatchOps(request.patch.patch).flatMap(op =>
+        op.op === "addObject" ? [op.object.id] : "objectId" in op ? [op.objectId] : []) };
+    });
+    const host = new PluginHost({ getActiveDocument: () => current, applyDocumentPatch });
+    host.registerPlugin({ id: "org.test.replace", name: "Replace", version: "0.0.1", apiVersion: "^0.1.8", entry: "plugin.js",
+      permissions: ["document.write"], contributes: { commands: [{ id: "plugin.replace.run", title: "Replace" }] }
+    }, { commandHandlers: { "plugin.replace.run": async ctx => {
+      await ctx.documents.applyPatch!({ reason: "Replace", patch: { op: "batch", patches: [
+        { op: "removeObject", objectId: "X" }, { op: "addObject", pageId: firstPage, object: molecule("X", 200) }] } });
+      await held;
+      return ctx.documents.applyPatch!({ reason: "Edit the replacement", patch: { op: "updateObject", objectId: "X", changes: { x: 300 } } });
+    } } });
+    const pending = host.invokeCommand("plugin.replace.run");
+    return { pending, release, applyDocumentPatch, document: () => current, edit: (next: ChemDraftDocument) => { current = next; } };
+  }
+
+  it("commits the replacement and then writes it: the later update reaches the command's own insertion", async () => {
+    const f = batchHost(identitySent());
+    await vi.waitFor(() => expect(f.applyDocumentPatch).toHaveBeenCalledTimes(1));
+    expect(objectX(f.document())).toMatchObject({ x: 200 });
+    f.release();
+    await expect(f.pending).resolves.toMatchObject({ applied: true });
+    expect(f.applyDocumentPatch).toHaveBeenCalledTimes(2);
+    expect(f.document().pages[0]!.objects.filter(object => object.id === "X")).toEqual([expect.objectContaining({ x: 300 })]);
+  });
+
+  it("still refuses an unrelated same-id object: the user's pasted copy of the replacement", async () => {
+    const f = batchHost(identitySent());
+    await vi.waitFor(() => expect(f.applyDocumentPatch).toHaveBeenCalledTimes(1));
+    const replaced = deleteAndPaste(f.document());
+    f.edit(replaced);
+    f.release();
+    await expect(f.pending).rejects.toThrow(/Plugin write refused/);
+    expect(f.document()).toBe(replaced);
+  });
+
+  it("still refuses an unrelated same-id object ahead of the replacement in page order", async () => {
+    // The replacement lands on page 2; another X then appears on page 1 (an import or merge chem-core's
+    // addObject would refuse), which a bare-id op reaches first.
+    const f = batchHost(identitySent(), "page-2");
+    await vi.waitFor(() => expect(f.applyDocumentPatch).toHaveBeenCalledTimes(1));
+    const [page1, page2] = f.document().pages;
+    expect(page2!.objects.map(object => object.id)).toEqual(["X"]);
+    const pasted = { ...f.document(), pages: [{ ...page1!, objects: [...page1!.objects, molecule("X", 50)] }, page2!] };
+    f.edit(pasted);
+    f.release();
+    await expect(f.pending).rejects.toThrow(/Plugin write refused/);
+    expect(f.document()).toBe(pasted);
+  });
+});
+
+/**
  * Probe run-20261122-074045-5fa6da (1.2.2): a native .chemdraft file holding two same-page objects with
  * the id "X" opens unchanged (the schema has no uniqueness rule; chem-core resolves a bare id to its first
  * remaining occurrence). With the first X selected, "removeObject X; updateObject X", "reorderObject X;

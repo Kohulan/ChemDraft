@@ -263,20 +263,28 @@ export function withoutPins(pins: PluginWriteScopePages | undefined, insertedIds
 }
 
 /**
- * Pins for the objects a write inserted, read from the document that write committed: each id pins the
- * object it names there, by that object's own identity. A command's or request's insertion is then in
- * its scope exactly as a selected object is, and a later object reusing the id (the user deletes the
- * insertion and pastes a copy back, an undo, another plugin's insert) is not. An id that names no object
- * or several in `committed` gets no pin, so nothing is in scope under it (fail closed).
+ * Pins for the objects a write inserted, read from `committed`, the document that write committed. The
+ * write's insertion under an id is the one object named by it there that is new to the write: a value
+ * whose identity no object of `before` (the document the write was checked against) held. An insertion
+ * parses a new value, so it is new even under an id the same write freed (a batch that deletes the
+ * selected X and inserts its replacement X); an object the write only edited carries its identity and is
+ * never taken for one. Each id pins that object by its own identity, so the insertion is in scope exactly
+ * as a selected object is, and a later object reusing the id (the user deletes the insertion and pastes a
+ * copy back, an undo, another plugin's insert) is not. An id naming no new object, or several, gets no
+ * pin, so nothing is in scope under it (fail closed). Never a grant by bare id.
  */
-export function insertionPins(committed: ChemDraftDocument | undefined, insertedIds: Iterable<string>): Map<string, PagePin> {
+export function insertionPins(before: ChemDraftDocument, committed: ChemDraftDocument | undefined,
+  insertedIds: Iterable<string>): Map<string, PagePin> {
   const pins = new Map<string, PagePin>();
   const wanted = new Set(insertedIds);
   if (!committed || !wanted.size) return pins;
+  const existing = new Set<ObjectIdentity>();
+  for (const page of before.pages) for (const object of page.objects) existing.add(objectIdentity(object));
   const found = new Map<string, PageObjectLocation | null>();
   for (const page of committed.pages) {
     for (const object of page.objects) {
-      if (wanted.has(object.id)) found.set(object.id, found.has(object.id) ? null : { page, object });
+      if (!wanted.has(object.id) || existing.has(objectIdentity(object))) continue;
+      found.set(object.id, found.has(object.id) ? null : { page, object });
     }
   }
   for (const [objectId, location] of found) if (location) pins.set(objectId, pinObject(location.page, location.object));

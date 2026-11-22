@@ -18,6 +18,14 @@ import { applyChargeToolAtPoint, normalizeCommittedDocument, openNativeDocument 
 import { PluginWorkerBridge } from "../plugins/PluginWorkerBridge";
 import { createWorkerRoutedOptions } from "../plugins/registerBundledPlugins";
 import { createPluginRuntime } from "../plugins/createPluginRuntime";
+import { callAssistantTool } from "./assistantTools";
+
+// Every tool runs for real; a test may substitute one call (mockImplementationOnce) to write a patch no
+// built-in tool produces.
+vi.mock("./assistantTools", async importOriginal => {
+  const actual = await importOriginal<typeof import("./assistantTools")>();
+  return { ...actual, callAssistantTool: vi.fn(actual.callAssistantTool) };
+});
 
 function setup(onAssistantToolCall?: PluginAssistantToolHandler, directWrites = false, workerRouted = false, platform?: "macos" | "windows",
   bindDocument = false) {
@@ -1576,6 +1584,62 @@ describe("Kimi security review: an assistant pin unique at Send never follows it
       expect(JSON.stringify(caption)).toContain("#112233");
       const refused = await s.controller.callTool(s.plugin, { name: "style_objects", input: { objectIds: [s.molecule.id], style: { color: "#445566" } } });
       expect(refused).toMatchObject({ isError: true, content: [{ text: expect.stringContaining(reselect) }] });
+      await s.controller.endRequest(s.plugin, { requestId });
+    } finally { await s.finish(); }
+  });
+});
+
+/**
+ * Kimi run-20261122-123139-b532aa, finding 1, assistant bookkeeping: an insertion was granted only when its
+ * id was free before the write, so a write that deletes the selected molecule and inserts its replacement
+ * under the same id in one batch left the replacement ungranted and the next write to it refused.
+ */
+describe("Kimi 1.2.3 xhigh finding 1: an assistant write's same-batch replacement under the selected id is its insertion", () => {
+  /** Send selects the fixture molecule; one tool call then replaces it in a single batch under its own id. */
+  async function replaceInOneBatch(s: ReturnType<typeof setup>) {
+    s.select([s.molecule.id]);
+    const { requestId } = await s.controller.beginRequest(s.plugin, { prompt: "redraw the selection" });
+    vi.mocked(callAssistantTool).mockImplementationOnce(async context => {
+      const document = context.getDocument()!;
+      const page = document.pages.find(candidate => candidate.objects.some(object => object.id === s.molecule.id))!;
+      const replacement = translateObject(structuredClone(page.objects.find(object => object.id === s.molecule.id)!), 40, 0);
+      await context.write({ op: "batch", patches: [{ op: "removeObject", objectId: s.molecule.id },
+        { op: "addObject", pageId: page.id, object: replacement }] });
+      return { content: [{ type: "text", text: "Replaced" }], structuredContent: { objectIds: [s.molecule.id] } };
+    });
+    const replaced = await s.controller.callTool(s.plugin, { name: "style_objects", input: { objectIds: [s.molecule.id], style: {} } });
+    expect(replaced.isError, JSON.stringify(replaced)).not.toBe(true);
+    return requestId;
+  }
+  const restyle = (id: string, color: string) => ({ name: "style_objects", input: { objectIds: [id], style: { color } } });
+  const findMolecule = (document: ChemDraftDocument, id: string) => document.pages.flatMap(page => page.objects).find(object => object.id === id)!;
+
+  it("writes the replacement on the request's next call", async () => {
+    const s = setup();
+    try {
+      const requestId = await replaceInOneBatch(s);
+      const replacement = findMolecule(s.context.getDocument()!, s.molecule.id);
+      expect(replacement.x).toBeCloseTo(s.molecule.x + 40);
+      const styled = await s.controller.callTool(s.plugin, restyle(s.molecule.id, "#112233"));
+      expect(styled.isError, JSON.stringify(styled)).not.toBe(true);
+      expect(JSON.stringify(findMolecule(s.context.getDocument()!, s.molecule.id))).toContain("#112233");
+      await s.controller.endRequest(s.plugin, { requestId });
+    } finally { await s.finish(); }
+  });
+
+  it("still refuses an unrelated same-id object: the user's pasted copy of the replacement", async () => {
+    const s = setup();
+    try {
+      const requestId = await replaceInOneBatch(s);
+      const current = s.context.getDocument()!;
+      const page = current.pages.find(candidate => candidate.objects.some(object => object.id === s.molecule.id))!;
+      const copy = structuredClone(findMolecule(current, s.molecule.id));
+      const pasted = applyPatch(applyPatch(current, { op: "removeObject", objectId: s.molecule.id }),
+        { op: "addObject", pageId: page.id, object: copy });
+      s.replace(pasted);
+      const result = await s.controller.callTool(s.plugin, restyle(s.molecule.id, "#112233"));
+      expect(result).toMatchObject({ isError: true, content: [{ text: expect.stringMatching(/no longer there/) }] });
+      expect(s.context.getDocument()).toBe(pasted);
       await s.controller.endRequest(s.plugin, { requestId });
     } finally { await s.finish(); }
   });

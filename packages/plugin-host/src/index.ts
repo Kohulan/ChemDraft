@@ -2257,6 +2257,8 @@ export class PluginHost {
     }
     const parsedPatch = ProposedDocumentPatchSchema.parse(patch);
     const scope = new Set(requestScope?.objectIds ?? invocation.writeScope);
+    /** Ids the patch inserts objects under, as the plugin wrote them. */
+    const insertedIds = new Set<string>();
     const ops = writePatchOps(parsedPatch.patch);
     for (const op of ops) {
       if (!(DirectWritePatchOps as readonly string[]).includes(op.op)) {
@@ -2272,6 +2274,7 @@ export class PluginHost {
           throw new PluginHostError(`Invalid ${op.op} patch: provide a valid ${op.op === "addObject" ? "object" : "annotation"} and pageId.`);
         }
         scope.add(object.id);
+        insertedIds.add(object.id);
       } else {
         const ids = op.op === "setObjectOrder" ? op.objectIds : "objectId" in op ? [op.objectId] : [];
         for (const id of ids) {
@@ -2305,18 +2308,15 @@ export class PluginHost {
       }
     };
     checkDocumentKey();
-    // Ids taken when scope was checked: a receipt id outside them is an object this write inserted.
-    let takenIds: ReadonlySet<string> = new Set();
-    {
-      const document = await (requestScope ? requestScope.getDocument() : this.getActiveDocument?.());
-      checkDocumentKey();
-      if (!document) {
-        throw new PluginHostError(`Plugin patch refused: no ${requestScope ? "request" : "active"} document is available to check ${ops.some(op => op.op === "removeObject") ? "reaction removal scope" : "write scope"}.`);
-      }
-      assertPluginPatchWriteScope(document, parsedPatch, requestScope?.objectIds ?? [...invocation.writeScope],
-        undefined, undefined, requestScope ? requestScope.scopePages : invocation.writeScopePages);
-      takenIds = new Set(document.pages.flatMap(page => page.objects.map(object => object.id)));
+    // The document scope was checked against: an object of the committed document whose identity none
+    // of its objects held is new, so under an id this write inserted it is that insertion.
+    const checked = await (requestScope ? requestScope.getDocument() : this.getActiveDocument?.());
+    checkDocumentKey();
+    if (!checked) {
+      throw new PluginHostError(`Plugin patch refused: no ${requestScope ? "request" : "active"} document is available to check ${ops.some(op => op.op === "removeObject") ? "reaction removal scope" : "write scope"}.`);
     }
+    assertPluginPatchWriteScope(checked, parsedPatch, requestScope?.objectIds ?? [...invocation.writeScope],
+      undefined, undefined, requestScope ? requestScope.scopePages : invocation.writeScopePages);
     const plugin = this.requireRegisteredPlugin(pluginId).manifest;
     let committed: ChemDraftDocument | undefined;
     const receipt = await apply({
@@ -2338,10 +2338,14 @@ export class PluginHost {
     // surrounding command's ordinary document-write grant or the next request's grant.
     if (!requestScope) {
       // Grant this write's insertions by the identity of the objects it actually inserted, never by bare
-      // id: a later paste, undo or insert reusing the id is a different object. A pinned id the write
-      // inserted under (its selected object already gone) now pins that insertion instead.
-      const inserted = parsedReceipt.objectIds.filter(id => !takenIds.has(id));
-      const pins = insertionPins(inserted.length ? committed ?? this.committedDocumentAfterWrite(invocation) : undefined, inserted);
+      // id: a later paste, undo or insert reusing the id is a different object. Its insertions are the new
+      // objects committed under a receipt id the patch inserts (or the host allocated, rebasing a colliding
+      // insertion), whether or not the id existed before: a batch that deletes the selected X and inserts
+      // its replacement X inserts X. A pinned id the write inserted under (its selected object gone, in
+      // this write or an earlier one) now pins that insertion instead.
+      const takenIds = new Set(checked.pages.flatMap(page => page.objects.map(object => object.id)));
+      const inserted = parsedReceipt.objectIds.filter(id => insertedIds.has(id) || !takenIds.has(id));
+      const pins = insertionPins(checked, inserted.length ? committed ?? this.committedDocumentAfterWrite(invocation) : undefined, inserted);
       for (const id of pins.keys()) invocation.writeScope.add(id);
       invocation.writeScopePages = withPins(invocation.writeScopePages, pins);
       invocation.onAppliedPatch?.(parsedReceipt, pins);

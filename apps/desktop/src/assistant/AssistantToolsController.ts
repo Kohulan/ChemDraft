@@ -292,12 +292,14 @@ export class AssistantToolsController implements PluginHostAssistant {
                     return cleanup?.document;
                   });
                   cleanup?.record();
-                  const existing = new Set(before.pages.flatMap(page => page.objects.map(object => object.id)));
                   for (const id of touched) request.touched.add(id);
-                  // An id that was free could only be inserted. Grant it by the identity of the object this
-                  // write committed under it (read synchronously, before anything else can edit), never by
-                  // bare id; a pin of a selected object that was gone is replaced by the insertion's.
-                  const pins = insertionPins(request.context.getDocument(), touched.filter(id => !existing.has(id)));
+                  // Grant each insertion by the identity of the new object this write committed under its id
+                  // (read synchronously, before anything else can edit), never by bare id, and whether or not
+                  // the id existed before: a batch that deletes the selected X and inserts its replacement X
+                  // inserts X. A pin of a selected object that is gone is replaced by the insertion's.
+                  const insertedIds = writePatchOps(patch).flatMap(op => op.op === "addObject" ? [op.object.id] :
+                    op.op === "addAnnotation" ? [op.annotation.id] : []);
+                  const pins = insertionPins(before, request.context.getDocument(), insertedIds);
                   for (const id of pins.keys()) request.inserted.add(id);
                   request.selectionPages = withPins(request.selectionPages, pins);
                   return { applied: true as const, objectIds: touched };
