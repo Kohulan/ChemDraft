@@ -64,6 +64,7 @@ import {
 } from "./cdxBinary";
 import { abbreviationExpansionIssue, cdxmlAtomChemistry, cdxmlAtomNativeState, elementFromCdxmlAtom, restoreCdxmlAbbreviations } from "./abbreviations";
 import { cdxmlToCssPx, cssPxToCdxml, formatNumber, formatPoint } from "./coordinates";
+import { countCdxmlFontEntries, indexCdxmlFonts, lookupCdxmlFont, type CdxmlFont } from "./cdxmlFontIndex";
 import { nativeChargePlacementPointForAtom, nativeRadicalPlacementPointForAtom, nativeChargeMarkSizePx } from "@chemdraft/layout-engine";
 
 export interface CompatibilityConversionWarning {
@@ -348,8 +349,6 @@ interface CdxmlColorTable {
   colorByIndex: Map<number, string>;
 }
 
-type CdxmlFont = Record<string, string>;
-
 /**
  * Import caps for the font table and for one caption's runs. CDX font ids and styled-text run
  * offsets are 16-bit (export writes no font id at or above 65535), so nothing ChemDraw writes
@@ -358,11 +357,31 @@ type CdxmlFont = Record<string, string>;
  */
 const CDXML_FONT_TABLE_LIMIT = 65_535;
 const CDXML_CAPTION_RUN_LIMIT = 65_535;
+/**
+ * Document-wide cap on the caption runs whose fonts are resolved on import and on export (2^18).
+ * The per-caption cap alone still let a crafted file stack thousands of capped captions. Real
+ * documents stay far below it: the largest local CDXML documents (up to ~1 MB) hold under 1,000
+ * styled runs in total, so this is over 250 times that and four maximal captions' worth. Captions
+ * past it keep their text and run styles as plain styled text, with one warning.
+ */
+const CDXML_DOCUMENT_CAPTION_RUN_LIMIT = 262_144;
+/**
+ * Every imported caption carries the font table its runs were written against, so a later save
+ * can rebuild the CDXML font table. Saving a copy of the whole table on every caption is
+ * quadratic in a crafted file's size (1,000 captions over 1,000 fonts, 160 KB, saved as a 70 MB
+ * payload), so after the first caption the whole table is shared only while the copies total at
+ * most this many entries (2^14); later captions keep just the fonts their own runs name. Real
+ * documents (at most a few fonts across a few hundred captions) stay far below it, so what they
+ * save is unchanged.
+ */
+const CDXML_TEXT_FONT_TABLE_COPY_LIMIT = 16_384;
 
-/** The imported font table, and each id's name (the first entry wins, as a linear search did). */
+/** The imported font table, indexed by id (the first entry wins, as a linear search did). */
 interface CdxmlImportFonts {
   table: readonly CdxmlFont[];
-  nameById: ReadonlyMap<string | undefined, string | undefined>;
+  byId: ReadonlyMap<string | undefined, CdxmlFont>;
+  /** Document-wide budgets, shared by every page's import. */
+  usage: { captionRuns: number; captionRunLimitReached: boolean; fontTableEntries: number };
 }
 
 function importCdxmlFonts(tree: OrderedXmlTree, sourceFormat: string, warnings: CompatibilityConversionWarning[]): CdxmlImportFonts {
@@ -373,9 +392,18 @@ function importCdxmlFonts(tree: OrderedXmlTree, sourceFormat: string, warnings: 
       "and text set in a later font keeps the default font."));
   }
   const table = listed.slice(0, CDXML_FONT_TABLE_LIMIT);
-  const nameById = new Map<string | undefined, string | undefined>();
-  for (const font of table) if (!nameById.has(font.id)) nameById.set(font.id, font.name);
-  return { table, nameById };
+  return { table, byId: indexCdxmlFonts(table, font => font.id),
+    usage: { captionRuns: 0, captionRunLimitReached: false, fontTableEntries: 0 } };
+}
+
+/** The fonts a CDXML export writes, indexed by name (the first entry wins, as a linear search did). */
+interface CdxmlExportFonts {
+  table: readonly CdxmlFont[];
+  byName: ReadonlyMap<string | undefined, CdxmlFont>;
+  /** Restored captions past the document-wide run cap; they are written as plain styled text. */
+  plainCaptionIds: ReadonlySet<string>;
+  /** Set once the export has reported the cap (one warning per document). */
+  captionRunLimitWarned: boolean;
 }
 
 interface CdxmlCrossingImportHint {
@@ -393,9 +421,8 @@ interface ImportPageContext {
   displayByRefKey: Map<string, string>;
   crossingHints: CdxmlCrossingImportHint[];
   colorTable: CdxmlColorTable;
-  fonts: readonly CdxmlFont[];
-  /** Font name by id, built once per document (`importCdxmlFonts`). */
-  fontNameById: ReadonlyMap<string | undefined, string | undefined>;
+  /** The document's font table, indexed by id once per document (`importCdxmlFonts`). */
+  fonts: CdxmlImportFonts;
   curveLineDefaults: Record<string, string>;
   preserveReactionIds: boolean;
   /** Every node id a lone pair may reference, abbreviation aliases included; undefined when ambiguous. */
@@ -548,7 +575,7 @@ function exportCdxml(
     });
   }
   const visiblePages = fittedPages.map(({ page, children, setup }) => buildPageXml(page, children, setup));
-  const visibleEnvelope = buildCdxmlEnvelope(creationProgram, visiblePages, fonts, colors, embedded, rootPageSetup);
+  const visibleEnvelope = buildCdxmlEnvelope(creationProgram, visiblePages, fonts.table, colors, embedded, rootPageSetup);
   const visibleCdxmlHash = visibleHashForCdxml(visibleEnvelope);
   const metadata = buildMetadataObjectTags({
     codecVersion: CdxmlEnvelopeCodecVersion,
@@ -560,7 +587,7 @@ function exportCdxml(
   const envelopePages = fittedPages.map(({ page, children, setup }, pageIndex) =>
     buildPageXml(page, `${children}${pageIndex === 0 ? metadata : ""}`, setup)
   );
-  const contents = buildCdxmlEnvelope(creationProgram, envelopePages, fonts, colors, embedded, rootPageSetup);
+  const contents = buildCdxmlEnvelope(creationProgram, envelopePages, fonts.table, colors, embedded, rootPageSetup);
   // No runtime self-check that the metadata leaves the visible hash alone. The one this replaced
   // re-parsed and re-hashed the whole finished envelope, payload included — a full XML parse of
   // megabytes on every save — and a textual stand-in could never fire, since `contents` is the
@@ -893,11 +920,15 @@ function unsupportedSchemaWarningFromJson(contents: string): CompatibilityConver
   return undefined;
 }
 
-function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityConversionWarning[]): CdxmlFont[] {
+// The font table is built once per export and indexed by name, so registering each restored
+// caption run's font is a lookup, not a scan of the table (Codex security finding: autosave runs
+// this right after a file opens, and a crafted 1.5 MB file cost ~400 million comparisons).
+function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityConversionWarning[]): CdxmlExportFonts {
   const fonts = new Map<string, CdxmlFont>();
   for (const page of document.pages) for (const object of page.objects) {
     const source = object.compatibility?.unknown.cdxmlTextFontTable;
     if (!Array.isArray(source)) continue;
+    countCdxmlFontEntries(source.length);
     for (const entry of source) {
       const font = preservedCurveAttributes(entry);
       if (!/^\d+$/.test(font.id ?? "") || Number(font.id) >= 65535) continue;
@@ -909,19 +940,32 @@ function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityCo
       fonts.set(font.id, font);
     }
   }
-  let nextId = 1;
+  const byName = indexCdxmlFonts<string | undefined>(fonts.values(), font => font.name);
+  const plainCaptionIds = new Set<string>();
+  let nextId = 1, captionRuns = 0;
   for (const page of document.pages) for (const object of page.objects) {
-    const names = object.type === "table" ? [nativeTextStyleFromObjectStyle(object.style).fontFamily]
-      : object.type === "text" && object.compatibility?.unknown.sourceCdxmlAttributes
-        ? textObjectSpansForRendering(object).map(span => span.style.fontFamily ?? object.style.fontFamily) : [];
+    let names: unknown[] = [];
+    if (object.type === "table") names = [nativeTextStyleFromObjectStyle(object.style).fontFamily];
+    else if (object.type === "text" && object.compatibility?.unknown.sourceCdxmlAttributes) {
+      const spans = textObjectSpansForRendering(object);
+      // Past the document-wide cap a caption is written as plain styled text (exportTextObject).
+      if (plainCaptionIds.size || captionRuns + spans.length > CDXML_DOCUMENT_CAPTION_RUN_LIMIT) {
+        plainCaptionIds.add(object.id);
+        continue;
+      }
+      captionRuns += spans.length;
+      names = spans.map(span => span.style.fontFamily ?? object.style.fontFamily);
+    }
     for (const name of names) {
-      if (typeof name !== "string" || !name || [...fonts.values()].some(font => font.name === name)) continue;
+      if (typeof name !== "string" || !name || lookupCdxmlFont(byName, name)) continue;
       while (fonts.has(String(nextId))) nextId++;
       const id = String(nextId++);
-      fonts.set(id, { id, charset: "iso-8859-1", name });
+      const font = { id, charset: "iso-8859-1", name };
+      fonts.set(id, font);
+      byName.set(name, font);
     }
   }
-  return [...fonts.values()];
+  return { table: [...fonts.values()], byName, plainCaptionIds, captionRunLimitWarned: false };
 }
 
 function buildCdxmlEnvelope(creationProgram: string, pages: readonly string[], fonts: readonly CdxmlFont[], colors: ExportColorTable, embedded = true, pageSetup: Record<string, string> = {}): string {
@@ -1036,7 +1080,7 @@ function restorePageOffset(page: XmlElementView, warnings: CompatibilityConversi
   }
 }
 
-function buildVisiblePageChildren(page: DocumentPage, pageBackgroundColor: string, warnings: CompatibilityConversionWarning[], fonts: readonly CdxmlFont[], colors: ExportColorTable, allocator: IdAllocator, unknownObjects: UnknownObjectExportDiagnostics): string {
+function buildVisiblePageChildren(page: DocumentPage, pageBackgroundColor: string, warnings: CompatibilityConversionWarning[], fonts: CdxmlExportFonts, colors: ExportColorTable, allocator: IdAllocator, unknownObjects: UnknownObjectExportDiagnostics): string {
   const context = createVisibleExportContext(page, pageBackgroundColor, colors, unknownObjects.format === "cdx" ? "CDX" : "CDXML", unknownObjects.embedNativePayload);
   const objectsById = new Map(page.objects.map((object) => [object.id, object]));
   const preserveSourceIds = page.objects.some(needsSourceGraphicIds);
@@ -1426,7 +1470,7 @@ function exportVisibleObject(
   allocator: IdAllocator,
   warnings: CompatibilityConversionWarning[],
   objectsById: ReadonlyMap<string, DocumentObject>,
-  fonts: readonly CdxmlFont[],
+  fonts: CdxmlExportFonts,
   unknownObjects: UnknownObjectExportDiagnostics
 ): string {
   if (object.type === "unknown-compatibility-object" && object.sourceObjectType === "curve") {
@@ -2214,12 +2258,12 @@ function exportTableObject(
   ids: Map<string, string>,
   allocator: IdAllocator,
   warnings: CompatibilityConversionWarning[],
-  fonts: readonly CdxmlFont[],
+  fonts: CdxmlExportFonts,
   colors: ExportColorTable
 ): string {
   const layout = planTableLayout(table);
   const style = nativeTextStyleFromObjectStyle(table.style);
-  const font = fonts.find(font => font.name === style.fontFamily)?.id ?? "1";
+  const font = fonts.table.find(font => font.name === style.fontFamily)?.id ?? "1";
   const texts: string[] = [];
   const writeLines = (lines: typeof layout.cells[number]["lines"], fontSizePx: number) => {
     for (const line of lines) {
@@ -2276,7 +2320,7 @@ function textSourceState(text: TextObject): string {
 
 // CDXML stores the baseline independently of the editable text frame. Keep the source
 // inset when placing the current runs, including after the user translates a caption.
-function exportFramedCaption(text: TextObject, id: string, fonts: readonly CdxmlFont[], colors: ExportColorTable): string | undefined {
+function exportFramedCaption(text: TextObject, id: string, fonts: CdxmlExportFonts, colors: ExportColorTable): string | undefined {
   const a = preservedCurveAttributes(text.compatibility?.unknown.sourceCdxmlAttributes);
   const box = parseCdxmlXyBoundingBox(a.BoundingBox);
   const baseline = parseCdxmlXyPoint(a.p);
@@ -2292,7 +2336,7 @@ function exportFramedCaption(text: TextObject, id: string, fonts: readonly Cdxml
   for (const span of textObjectSpansForRendering(text)) {
     if (Object.keys(span.style).some(k => !runKeys.includes(k))) return undefined;
     const style = { ...text.style, ...span.style };
-    const font = fonts.find(f => f.name === style.fontFamily);
+    const font = fonts.table.find(f => f.name === style.fontFamily);
     if (!font || typeof style.fontSizePx !== "number" || !(style.fontSizePx > 0) ||
         ![400, 700].includes(Number(style.fontWeight ?? 400)) ||
         !["normal", "italic"].includes(String(style.fontStyle ?? "normal")) ||
@@ -2325,10 +2369,20 @@ function exportFramedCaption(text: TextObject, id: string, fonts: readonly Cdxml
     Justification: alignment })}>${runs.join("")}</t>`;
 }
 
-function exportTextObject(text: TextObject, context: VisibleExportContext, allocator: IdAllocator, warnings: CompatibilityConversionWarning[], fonts: readonly CdxmlFont[]): string {
+function exportTextObject(text: TextObject, context: VisibleExportContext, allocator: IdAllocator, warnings: CompatibilityConversionWarning[], fonts: CdxmlExportFonts): string {
   const { ids, colors, format } = context;
   const textId = idFor(ids, text.id, allocator);
   const source = text.compatibility?.unknown.cdxmlTextElement;
+  const framedCaption = () => {
+    if (!fonts.plainCaptionIds.has(text.id)) return exportFramedCaption(text, textId, fonts, colors);
+    if (!fonts.captionRunLimitWarned) {
+      fonts.captionRunLimitWarned = true;
+      warnings.push({ code: "cdxml.document_caption_runs_limited", sourceObjectId: text.id,
+        message: `${format} export: the captions in this document have more than ${CDXML_DOCUMENT_CAPTION_RUN_LIMIT} styled runs ` +
+          `in total; from text ${text.id} on, captions past that total were written as plain styled text, without their caption frame and run fonts.` });
+    }
+    return undefined;
+  };
   if (typeof source === "string") {
     if (text.compatibility?.unknown.cdxmlTextNativeState === textSourceState(text)) {
       // Reparse our serialized source rather than injecting compatibility data as unchecked XML.
@@ -2350,13 +2404,13 @@ function exportTextObject(text: TextObject, context: VisibleExportContext, alloc
         // Invalid compatibility data must not prevent the current native text from being written.
       }
     }
-    const edited = exportFramedCaption(text, textId, fonts, colors);
+    const edited = framedCaption();
     if (edited) return edited;
     warnings.push({ code: "cdxml.text_source_formatting_not_kept", sourceObjectId: text.id,
       message: `Text ${text.id} (source ${text.compatibility?.originalId ?? "<unnamed>"}) was edited or its source text is unavailable; source formatting was not kept. The current native text is written.` });
   }
   if (typeof source !== "string") {
-    const caption = exportFramedCaption(text, textId, fonts, colors);
+    const caption = framedCaption();
     if (caption) return caption;
   }
   const unsupportedTextStyle = (style: Record<string, unknown>) =>
@@ -3730,8 +3784,7 @@ function importPageObjects(
     displayByRefKey: new Map(),
     crossingHints: [],
     colorTable,
-    fonts: fonts.table,
-    fontNameById: fonts.nameById,
+    fonts,
     curveLineDefaults: { ...curveLineDefaults, ...cdxmlCurveLineDefaults(pageElement.attributes) },
     preserveReactionIds: findElements(pageElement.children, "scheme").length > 0 || findElements(pageElement.children, "step").length > 0,
     atomAnchorsBySourceId: new Map(),
@@ -5173,7 +5226,7 @@ function importText(textElement: XmlElementView, pageIndex: number, objectIndex:
       warnings: [],
       unknown: {
         cdxmlTextElement: serializeVisibleTree([{ t: textElement.children, ":@": textElement.attributes }]),
-        cdxmlTextFontTable: context.fonts,
+        cdxmlTextFontTable: textFontTable(textElement, context),
         cdxmlTextColorTable: Object.fromEntries(context.colorTable.colorByIndex)
       }
     }
@@ -5181,6 +5234,26 @@ function importText(textElement: XmlElementView, pageIndex: number, objectIndex:
   restoreFramedCaption(object, textElement, context);
   object.compatibility!.unknown.cdxmlTextNativeState = textSourceState(object);
   return object;
+}
+
+// The whole table for the first text and while the document's budget lasts (shared, as before),
+// then only the fonts this text's own runs name: export needs no more to write every font the
+// source runs refer to, and the first text still lists the rest.
+function textFontTable(element: XmlElementView, context: ImportPageContext): readonly CdxmlFont[] {
+  const { table, byId, usage } = context.fonts;
+  if (!usage.fontTableEntries || usage.fontTableEntries + table.length <= CDXML_TEXT_FONT_TABLE_COPY_LIMIT) {
+    usage.fontTableEntries += table.length;
+    return table;
+  }
+  const own = new Map<string, CdxmlFont>();
+  for (const run of findElements(element.children, "s")) {
+    const id = run.attributes.font;
+    if (id === undefined || own.has(id)) continue;
+    const font = lookupCdxmlFont(byId, id);
+    if (font) own.set(id, font);
+  }
+  usage.fontTableEntries += own.size;
+  return [...own.values()];
 }
 
 // Only adopt the single-line layout when every visible run has an exact mapping.
@@ -5198,9 +5271,20 @@ function restoreFramedCaption(object: TextObject, element: XmlElementView, conte
   }
   if ((!box && a.BoundingBox !== undefined) || !parseCdxmlXyPoint(a.p) || !align || !runs.length || runs.length !== object.spans.length ||
       Object.keys(a).some(k => !["id", "p", "BoundingBox", "Justification", "color"].includes(k))) return;
+  const usage = context.fonts.usage;
+  if (usage.captionRunLimitReached || usage.captionRuns + runs.length > CDXML_DOCUMENT_CAPTION_RUN_LIMIT) {
+    if (!usage.captionRunLimitReached) {
+      usage.captionRunLimitReached = true;
+      context.warnings.push({ code: "cdxml.document_caption_runs_limited", sourceObjectId: object.id,
+        message: `${context.sourceFormat} import: the captions in this document have more than ${CDXML_DOCUMENT_CAPTION_RUN_LIMIT} styled runs ` +
+          `in total; from text ${a.id ?? object.id} on, captions past that total were imported as plain styled text, without their caption frame and run fonts.` });
+    }
+    return;
+  }
+  usage.captionRuns += runs.length;
   const spans: TextObject["spans"] = [];
   for (const [i, run] of runs.entries()) {
-    const font = context.fontNameById.get(run.attributes.font);
+    const font = lookupCdxmlFont(context.fonts.byId, run.attributes.font)?.name;
     const size = parseNumber(run.attributes.size), face = parseInteger(run.attributes.face ?? "0");
     if (!font || !size || size <= 0 || face === undefined || (face & ~103) || (face & 96) === 96 ||
         Object.keys(run.attributes).some(k => !["font", "size", "face", "color"].includes(k))) return;

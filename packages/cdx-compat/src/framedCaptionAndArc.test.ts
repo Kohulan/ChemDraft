@@ -1,6 +1,7 @@
 import { expect, it } from "vitest";
 import { createEmptyDocument, type GraphicObject, type TextObject } from "@chemdraft/chem-core";
 import { exportDocumentToCdxml, openChemDraftPayload } from "./index";
+import { cdxmlFontOperationsForTesting, resetCdxmlFontOperationsForTesting } from "./cdxmlFontIndex";
 
 const plain = { embedNativePayload: false };
 
@@ -102,32 +103,39 @@ it.each([["0.5", 0.5], ["360", 360], ["-90", -90]])("keeps a stored arc's %s deg
 // Codex 4658948336: resolving each caption run's font by a linear search of the font table made
 // a crafted file O(fonts × runs). Fonts are looked up by id from a map built once per document,
 // and the font table and a caption's runs are capped at CDX's 16-bit limit (65,535).
-// Before the map, 40,000 runs against 40,000 fonts took about 9 s; with it the whole import takes
-// about 0.7 s on a laptop, all of it the linear cost of parsing 80,000 elements (40,000 fonts
-// alone take ~0.26 s, 40,000 runs alone ~0.48 s). The bound leaves room for a loaded test runner
-// while still failing on any return of the quadratic search.
-const NO_HANG_MS = 2000;
+// Before the map, 40,000 runs against 40,000 fonts took about 9 s. These tests count font-table
+// work (entries indexed or merged, plus lookups; `cdxmlFontIndex.ts`) instead of timing it, so
+// they cannot flake on a loaded runner: linear work is a small multiple of fonts + runs, while
+// any return of the quadratic search would cost fonts × runs (1.6 billion here).
 const fontTable = (count: number, name = (id: number) => `Font${id}`) =>
   `<fonttable>${Array.from({ length: count }, (_, i) => `<font id="${i + 1}" charset="iso-8859-1" name="${name(i + 1)}"/>`).join("")}</fonttable>`;
 const caption = (id: number, runs: number, font: number, y = 72) =>
   `<t id="${id}" p="30 ${y}" BoundingBox="30 ${y - 12} 54 ${y}" Justification="Left">` +
   `${Array.from({ length: runs }, () => `<s font="${font}" size="10" face="0">x</s>`).join("")}</t>`;
-const timedOpen = (source: string) => {
-  const started = performance.now();
-  const opened = openChemDraftPayload(source);
-  return { opened, ms: performance.now() - started };
+const counted = <T>(run: () => T) => {
+  resetCdxmlFontOperationsForTesting();
+  const result = run();
+  return { result, operations: cdxmlFontOperationsForTesting() };
+};
+const countedOpen = (source: string) => {
+  const { result: opened, operations } = counted(() => openChemDraftPayload(source));
+  return { opened, operations };
 };
 const textsOf = (opened: ReturnType<typeof openChemDraftPayload>) =>
   opened.document!.pages[0].objects.filter((object): object is TextObject => object.type === "text");
 
-it("resolves 40,000 caption runs against 40,000 fonts in linear time", () => {
-  const { opened, ms } = timedOpen(`<CDXML>${fontTable(40_000)}<page>${caption(9, 40_000, 40_000)}</page></CDXML>`);
-  expect(ms).toBeLessThan(NO_HANG_MS);
+it("resolves 40,000 caption runs against 40,000 fonts with linear work", () => {
+  const { opened, operations } = countedOpen(`<CDXML>${fontTable(40_000)}<page>${caption(9, 40_000, 40_000)}</page></CDXML>`);
+  expect(operations).toBeLessThanOrEqual(2 * (40_000 + 40_000));
   const [text] = textsOf(opened);
   expect(text?.spans).toHaveLength(40_000);
   expect(text?.spans[39_999]?.style.fontFamily).toBe("Font40000");
   expect(text?.style.fontFamily).toBe("Font40000");
   expect(opened.warnings.map((warning) => warning.code)).not.toContain("cdxml.font_table_truncated");
+  // Saving it again builds the CDXML font table once and indexes it by name (Codex security finding).
+  const saved = counted(() => exportDocumentToCdxml(opened.document!, plain));
+  expect(saved.operations).toBeLessThanOrEqual(4 * (40_000 + 40_000));
+  expect(saved.result.contents.match(/<font /g)).toHaveLength(40_000);
 });
 
 it("resolves a duplicated font id to its first entry, as before", () => {
@@ -136,10 +144,10 @@ it("resolves a duplicated font id to its first entry, as before", () => {
   expect(textsOf(openChemDraftPayload(source))[0]?.style.fontFamily).toBe("Arial");
 });
 
-it("keeps the first 65,535 fonts of an oversized font table, warns, and does not hang", () => {
+it("keeps the first 65,535 fonts of an oversized font table, warns, and does linear work", () => {
   const source = `<CDXML>${fontTable(70_000)}<page>${caption(9, 1, 3)}${caption(10, 1, 70_000, 120)}</page></CDXML>`;
-  const { opened, ms } = timedOpen(source);
-  expect(ms).toBeLessThan(NO_HANG_MS);
+  const { opened, operations } = countedOpen(source);
+  expect(operations).toBeLessThanOrEqual(2 * (70_000 + 2));
   const truncated = opened.warnings.filter((warning) => warning.code === "cdxml.font_table_truncated");
   expect(truncated.map((warning) => warning.message)).toEqual([
     "CDXML import: the font table lists 70000 fonts, more than the 65535 supported; only the first 65535 were imported, and text set in a later font keeps the default font."
@@ -150,9 +158,9 @@ it("keeps the first 65,535 fonts of an oversized font table, warns, and does not
   expect(dropped?.style.fontFamily).toBeUndefined();
 });
 
-it("imports a caption with more than 65,535 runs as plain text with a warning, without hanging", () => {
-  const { opened, ms } = timedOpen(`<CDXML>${fontTable(3)}<page>${caption(9, 70_000, 3)}</page></CDXML>`);
-  expect(ms).toBeLessThan(NO_HANG_MS);
+it("imports a caption with more than 65,535 runs as plain text with a warning, resolving none of its fonts", () => {
+  const { opened, operations } = countedOpen(`<CDXML>${fontTable(3)}<page>${caption(9, 70_000, 3)}</page></CDXML>`);
+  expect(operations).toBeLessThanOrEqual(3);
   const [text] = textsOf(opened);
   expect(text?.text).toBe("x".repeat(70_000));
   expect(text?.style.fontFamily).toBeUndefined();
@@ -160,4 +168,70 @@ it("imports a caption with more than 65,535 runs as plain text with a warning, w
   expect(opened.warnings.filter((warning) => warning.code === "cdxml.text_runs_truncated").map((warning) => warning.message)).toEqual([
     "CDXML import: text 9 has 70000 styled runs, more than the 65535 supported; its caption frame and run fonts were not restored, and it was imported as plain styled text."
   ]);
+});
+
+// Codex security finding: every caption shared the whole font table, and saving wrote a copy per
+// caption, so a crafted file of many captions over many fonts saved a payload quadratic in its size.
+it("shares the whole font table only within a budget, so many captions over many fonts save linearly", () => {
+  const count = 1_000;
+  const source = `<CDXML>${fontTable(count)}<page>${Array.from({ length: count }, (_, i) => caption(i + 10, 1, i + 1, 72 + i)).join("")}</page></CDXML>`;
+  const { opened, operations } = countedOpen(source);
+  expect(operations).toBeLessThanOrEqual(2 * (count + count));
+  const texts = textsOf(opened);
+  expect(texts).toHaveLength(count);
+  expect(texts.map(text => text.style.fontFamily)).toEqual(Array.from({ length: count }, (_, i) => `Font${i + 1}`));
+  const tables = texts.map(text => text.compatibility?.unknown.cdxmlTextFontTable as unknown[]);
+  expect(tables[0]).toHaveLength(count);
+  // 16,384 entries (`CDXML_TEXT_FONT_TABLE_COPY_LIMIT`) at most beyond the first whole table, plus one per run.
+  expect(tables.reduce((total, table) => total + table.length, 0)).toBeLessThanOrEqual(count + 16_384 + count);
+  expect(tables.at(-1)).toEqual([{ id: String(count), charset: "iso-8859-1", name: `Font${count}` }]);
+  const saved = counted(() => exportDocumentToCdxml(opened.document!, plain));
+  expect(saved.operations).toBeLessThanOrEqual(4 * (count + 16_384 + count));
+  // The saved font table still lists every source font, in source order.
+  expect([...saved.result.contents.matchAll(/<font id="(\d+)"/g)].map(match => Number(match[1])))
+    .toEqual(Array.from({ length: count }, (_, i) => i + 1));
+  const again = openChemDraftPayload(saved.result.contents);
+  expect(textsOf(again).map(text => text.style.fontFamily)).toEqual(texts.map(text => text.style.fontFamily));
+});
+
+it("keeps sharing the whole font table across an ordinary document's captions", () => {
+  const source = `<CDXML>${fontTable(3)}<page>${caption(9, 2, 1)}${caption(10, 1, 3, 120)}${caption(11, 3, 2, 160)}</page></CDXML>`;
+  const texts = textsOf(openChemDraftPayload(source));
+  for (const text of texts) expect(text.compatibility?.unknown.cdxmlTextFontTable).toHaveLength(3);
+});
+
+// The per-caption cap still let a crafted file stack many capped captions; the document-wide cap
+// (262,144 runs, `CDXML_DOCUMENT_CAPTION_RUN_LIMIT`) bounds the total, and keeps every caption's text.
+it("restores captions up to the document-wide run cap and imports the rest as plain styled text, with one warning", { timeout: 60_000 }, () => {
+  const source = `<CDXML>${fontTable(3)}<page>${Array.from({ length: 6 }, (_, i) => caption(i + 10, 55_000, 2, 72 + 20 * i)).join("")}</page></CDXML>`;
+  const { opened, operations } = countedOpen(source);
+  expect(operations).toBeLessThanOrEqual(2 * (3 + 6 * 55_000));
+  const texts = textsOf(opened);
+  expect(texts.map(text => text.text.length)).toEqual(Array(6).fill(55_000));
+  expect(texts.map(text => text.style.fontFamily)).toEqual(["Font2", "Font2", "Font2", "Font2", undefined, undefined]);
+  expect(texts.map(text => text.compatibility?.unknown.sourceCdxmlAttributes !== undefined)).toEqual([true, true, true, true, false, false]);
+  expect(opened.warnings.filter(warning => warning.code === "cdxml.document_caption_runs_limited").map(warning => warning.message)).toEqual([
+    "CDXML import: the captions in this document have more than 262144 styled runs in total; from text 14 on, captions past that total were imported as plain styled text, without their caption frame and run fonts."
+  ]);
+});
+
+it("writes restored captions past the document-wide run cap as plain styled text, with one warning", { timeout: 60_000 }, () => {
+  const document = createEmptyDocument();
+  document.pages[0].objects = Array.from({ length: 6 }, (_, i): TextObject => ({
+    type: "text", id: `caption${i}`, x: 36, y: 80 + 30 * i, width: 40, height: 22, rotation: 0, text: "x".repeat(55_000),
+    style: { fontFamily: `Face${i}`, fontSizePx: 16 },
+    spans: Array.from({ length: 55_000 }, () => ({ text: "x", script: "normal" as const, style: {} })),
+    compatibility: { warnings: [], unknown: { sourceCdxmlAttributes: { p: `30 ${72 + 30 * i}`, Justification: "Left" } } }
+  }));
+  const saved = counted(() => exportDocumentToCdxml(document, plain));
+  expect(saved.operations).toBeLessThanOrEqual(4 * 6 * 55_000);
+  // Only the captions within the cap register (and are written with) their fonts.
+  expect([...saved.result.contents.matchAll(/<font [^>]*name="([^"]+)"/g)].map(match => match[1])).toEqual(["Face0", "Face1", "Face2", "Face3"]);
+  expect(saved.result.contents.match(/<t /g)).toHaveLength(6);
+  expect(saved.result.contents.match(/>x</g)?.length ?? 0).toBeGreaterThanOrEqual(4 * 55_000);
+  expect(saved.result.warnings.filter(warning => warning.code === "cdxml.document_caption_runs_limited").map(warning => warning.message)).toEqual([
+    "CDXML export: the captions in this document have more than 262144 styled runs in total; from text caption4 on, captions past that total were written as plain styled text, without their caption frame and run fonts."
+  ]);
+  const again = openChemDraftPayload(saved.result.contents);
+  expect(textsOf(again).map(text => text.text)).toEqual(document.pages[0].objects.map(object => (object as TextObject).text));
 });
