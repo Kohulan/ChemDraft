@@ -7126,6 +7126,11 @@ fn show_toolset_popover_window(
     } else {
         window.show().map_err(|error| error.to_string())?;
     }
+    // Linux: map it as the answer to the opening press, so KWin neither refuses it nor marks a
+    // newly created popover as demanding attention. Windows shows it with SW_SHOWNOACTIVATE and
+    // macOS orders it front above; neither has a user time to carry.
+    #[cfg(target_os = "linux")]
+    utility_window::stamp_user_time(&window)?;
     #[cfg(not(target_os = "macos"))]
     // `focus: false` at creation makes Tao use SW_SHOWNOACTIVATE on Windows.
     // Keep its visibility state in sync (a raw ShowWindow alone breaks later hide()).

@@ -211,6 +211,54 @@ pub(super) fn raise<R: Runtime>(window: &WebviewWindow<R>) -> Result<(), String>
     })?
 }
 
+/// Stamp a popover with the time of the user's latest input before it is shown, so the window
+/// manager treats the map as the answer to that input (B7 follow-up).
+///
+/// `prepare` turns GTK's focus-on-map off, and GDK then writes `_NET_WM_USER_TIME` 0: "never
+/// activate this window". KWin's focus-stealing prevention refuses activation for user time 0 even
+/// within the active application, and marks a refused window `_NET_WM_STATE_DEMANDS_ATTENTION`
+/// unless it is a dock, toolbar or notification type. So a newly created "ChemDraft tools" flyout
+/// kept the flag. A popover the user has clicked carries a real user time from GDK's own input
+/// handling, which is why a reused one did not. With a real time KWin allows the map, and still
+/// moves no focus: it focuses a newly mapped window only when it is a normal window or a dialog,
+/// never a UTILITY one (Mutter never focuses a utility window on map either). This is no
+/// `present()` and no activation request. The time is the display's last user input, the press or
+/// key that opened the popover, never a later one. X11 only (XWayland included): a native Wayland
+/// display has no user time to stamp.
+#[cfg(target_os = "linux")]
+pub(super) fn stamp_user_time<R: Runtime>(window: &WebviewWindow<R>) -> Result<(), String> {
+    // From libgdk-3 (gdk/x11/gdkx11display.h, gdkx11window.h), which gdk-sys already links. The
+    // signatures are gdkx11-sys 0.18's; a GdkX11Display/GdkX11Window is its GdkDisplay/GdkWindow.
+    unsafe extern "C" {
+        fn gdk_x11_display_get_user_time(display: *mut gtk::gdk::ffi::GdkDisplay) -> u32;
+        fn gdk_x11_window_set_user_time(window: *mut gtk::gdk::ffi::GdkWindow, timestamp: u32);
+    }
+    let target = window.clone();
+    super::run_on_main_thread_blocking(window, move || {
+        use gtk::{gdk::prelude::DisplayExtManual, glib::translate::ToGlibPtr, prelude::WidgetExt};
+
+        let native = target.gtk_window().map_err(|error| error.to_string())?;
+        // The webview realizes its window when it is built; an unrealized one has nothing to stamp.
+        let Some(surface) = native.window() else {
+            return Ok(());
+        };
+        let display = surface.display();
+        if !display.backend().is_x11() {
+            return Ok(());
+        }
+        // SAFETY: on the GTK main thread, with a live display and window that are X11 objects
+        // (checked above). The stashes keep both alive for the calls.
+        unsafe {
+            let time = gdk_x11_display_get_user_time(display.to_glib_none().0);
+            // 0: no input on this display yet, so nothing opened the popover; leave it unstamped.
+            if time != 0 {
+                gdk_x11_window_set_user_time(surface.to_glib_none().0, time);
+            }
+        }
+        Ok(())
+    })?
+}
+
 #[cfg(not(target_os = "linux"))]
 pub(super) fn set_visible<R: Runtime>(
     window: &WebviewWindow<R>,
