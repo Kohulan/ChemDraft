@@ -37,6 +37,9 @@ function menuItemsFor(installed: readonly string[], disabled: readonly string[] 
 
 const allPluginIds = OFFICIAL_PLUGIN_CATALOG.map(entry => entry.pluginId);
 const PLUGINS_TITLE = "Add features with plugins";
+const STATUS_BAR_TITLE = "Keep an eye on the status bar";
+const STATUS_BAR_TEXT = "The status bar in the lower-left corner of the drawing window keeps you posted as you work. It shows tips for " +
+  "the tool you’re using and for keys that change what a drag does, and it tells you what you’ve selected.";
 const PLUGINS_TEXT = "ChemDraft does more through plugins. Official plugins add NMR prediction, structure recognition from images, " +
   "and chemical naming. To get them, choose Plugins > Add or Remove Plugins… and install one from the catalog of official plugins. " +
   "Beyond the official ones, you can vibe code your own: choose Plugins > Vibe Code Your Own Plugin… for step-by-step help. " +
@@ -99,25 +102,27 @@ describe.each(platforms)("tour plugin steps on %s", platform => {
     expect(availableTourPluginCommands([greyed])).toEqual([]);
   });
 
-  it("with no plugins installed, shows no plugin step or Try it, counts 8 steps, and finishes", () => {
+  it("with no plugins installed, shows no plugin step or Try it, counts 9 steps, and finishes", () => {
     for (const plugins of [undefined, availableTourPluginCommands(menuItemsFor([]))]) {
       act(() => root.unmount());
       root = createRoot(container);
       const onAction = vi.fn();
       act(() => root.render(<TourForm scheme="chemdraft" platform={platform} plugins={plugins} onAction={onAction} />));
       const seen = walk(onAction);
-      expect(seen.map(step => step.counter)).toEqual([1, 2, 3, 4, 5, 6, 7, 8].map(n => `Step ${n} of 8`));
+      expect(seen.map(step => step.counter)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9].map(n => `Step ${n} of 9`));
       expect(seen.map(step => step.tried)).toEqual([
         undefined,
         { action: "tryTourCommand", command: "view.openKeyboardPreferences" },
         { action: "tryTourCommand", command: "help.tour.openSample" },
         undefined,
         undefined,
+        undefined,
         { action: "tryTourCommand", command: "analyze.molecularProperties" },
         undefined, undefined
       ]);
-      expect(seen[3]).toMatchObject({ title: PLUGINS_TITLE, text: `${PLUGINS_TEXT}\n${PLUGIN_AUTHORING_GUIDE_URL}` });
-      expect(seen[4]).toMatchObject({
+      expect(seen[3]).toMatchObject({ title: STATUS_BAR_TITLE, text: STATUS_BAR_TEXT });
+      expect(seen[4]).toMatchObject({ title: PLUGINS_TITLE, text: `${PLUGINS_TEXT}\n${PLUGIN_AUTHORING_GUIDE_URL}` });
+      expect(seen[5]).toMatchObject({
         title: "Structure search",
         text: "Use Tools to search PubChem or Reaxys by the selected structure. Optional plugin: add Name to Structure from " +
           "Plugins > Add or Remove Plugins… to draw a structure from a chemical name."
@@ -132,17 +137,17 @@ describe.each(platforms)("tour plugin steps on %s", platform => {
     const plugins = availableTourPluginCommands(menuItemsFor(allPluginIds));
     act(() => root.render(<TourForm scheme="chemdraft" platform={platform} plugins={plugins} onAction={onAction} />));
     const seen = walk(onAction);
-    expect(seen.map(step => step.counter)).toEqual([1, 2, 3, 4, 5, 6, 7, 8].map(n => `Step ${n} of 8`));
+    expect(seen.map(step => step.counter)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9].map(n => `Step ${n} of 9`));
     expect(seen.map(step => step.title)).toEqual([
-      "Welcome to ChemDraft", "Choose your shortcuts", "Draw a structure", PLUGINS_TITLE,
+      "Welcome to ChemDraft", "Choose your shortcuts", "Draw a structure", STATUS_BAR_TITLE, PLUGINS_TITLE,
       "Names and structure search", "Analysis and 3D", "Save, export, and copy", "Make it yours"
     ]);
-    expect(seen[4]).toEqual({
-      counter: "Step 5 of 8", title: "Names and structure search",
+    expect(seen[5]).toEqual({
+      counter: "Step 6 of 9", title: "Names and structure search",
       text: "The Name to Structure plugin draws from a chemical name through the Structure menu. Use Tools to search PubChem or Reaxys by the selected structure.",
       tried: { action: "tryTourCommand", command: TOUR_NAME_COMMAND }
     });
-    expect(seen[3]).toMatchObject({ text: `${PLUGINS_TEXT}\n${PLUGIN_AUTHORING_GUIDE_URL}`, tried: undefined });
+    expect(seen[4]).toMatchObject({ text: `${PLUGINS_TEXT}\n${PLUGIN_AUTHORING_GUIDE_URL}`, tried: undefined });
   });
 
   it("always explains plugins before any step shows a plugin feature (derived from the step data)", () => {
@@ -198,23 +203,23 @@ describe.each(platforms)("tour plugin steps on %s", platform => {
     const render = (plugins: readonly TourPluginCommand[]) =>
       act(() => root.render(<TourForm scheme="chemdraft" platform={platform} plugins={plugins} onAction={onAction} />));
     render([...TOUR_PLUGIN_COMMANDS]);
-    for (let step = 1; step < 5; step++) click("Next");
-    expect(container.textContent).toContain("Step 5 of 8");
+    for (let step = 1; step < 6; step++) click("Next");
+    expect(container.textContent).toContain("Step 6 of 9");
     render([]);
-    expect(container.textContent).toContain("Step 5 of 8");
+    expect(container.textContent).toContain("Step 6 of 9");
     expect(container.querySelector("h1")!.textContent).toBe("Names and structure search");
     expect(button("Try it")).toBeDefined();
 
     act(() => root.unmount());
     root = createRoot(container);
     render([]);
-    for (let step = 1; step < 5; step++) click("Next");
+    for (let step = 1; step < 6; step++) click("Next");
     render([...TOUR_PLUGIN_COMMANDS]);
-    expect(container.textContent).toContain("Step 5 of 8");
+    expect(container.textContent).toContain("Step 6 of 9");
     expect(container.querySelector("h1")!.textContent).toBe("Structure search");
     expect(button("Try it")).toBeUndefined();
-    for (let step = 5; step < 8; step++) click("Next");
-    expect(container.textContent).toContain("Step 8 of 8");
+    for (let step = 6; step < 9; step++) click("Next");
+    expect(container.textContent).toContain("Step 9 of 9");
     expect(button("Next")).toBeUndefined();
     click("Finish");
     expect(onAction).toHaveBeenLastCalledWith({ action: "finish" });
@@ -235,13 +240,13 @@ describe.each(platforms)("tour plugin steps on %s", platform => {
     await act(async () => root.render(createElement(Host)));
     await act(async () => { await api!.open(); });
     await act(async () => { await import("./TourForm"); });
-    expect(container.textContent).toContain("Step 1 of 8");
+    expect(container.textContent).toContain("Step 1 of 9");
     available = [...TOUR_PLUGIN_COMMANDS];
-    for (let step = 1; step < 5; step++) await act(async () => { button("Next")!.click(); });
-    // Installed after the tour opened: step 5 stays the version without it.
-    expect(container.textContent).toContain("Step 5 of 8");
+    for (let step = 1; step < 6; step++) await act(async () => { button("Next")!.click(); });
+    // Installed after the tour opened: step 6 stays the version without it.
+    expect(container.textContent).toContain("Step 6 of 9");
     expect(button("Try it")).toBeUndefined();
-    for (let step = 5; step < 8; step++) await act(async () => { button("Next")!.click(); });
+    for (let step = 6; step < 9; step++) await act(async () => { button("Next")!.click(); });
     await act(async () => { button("Finish")!.click(); });
     await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
     expect(localStorage.getItem("chemdraft.guidedTourSeen")).toBe("true");
@@ -249,8 +254,8 @@ describe.each(platforms)("tour plugin steps on %s", platform => {
 
     // Reopened after the plugin was installed: its step is back, and Try it reaches it.
     await act(async () => { await api!.open(); });
-    expect(container.textContent).toContain("Step 1 of 8");
-    for (let step = 1; step < 5; step++) await act(async () => { button("Next")!.click(); });
+    expect(container.textContent).toContain("Step 1 of 9");
+    for (let step = 1; step < 6; step++) await act(async () => { button("Next")!.click(); });
     await act(async () => { button("Try it")!.click(); });
     await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
     expect(invoke).toHaveBeenLastCalledWith(TOUR_NAME_COMMAND);

@@ -6,7 +6,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TourForm } from "./TourForm";
 import { tourShortcutChoices, tourSteps } from "./tourSteps";
-import { TOUR_PLUGIN_COMMANDS } from "./tourCommands";
+import { PLUGIN_AUTHORING_GUIDE_URL, TOUR_PLUGIN_COMMANDS } from "./tourCommands";
 import { parseDialogMessage } from "../dialogs/dialogProtocol";
 import { buildAppMenuModel, flattenAppMenuCommands } from "../appMenu";
 
@@ -37,16 +37,16 @@ describe.each(platforms)("guided tour on %s", platform => {
     const onAction = vi.fn();
     act(() => root.render(<TourForm scheme="chemdraft" platform={platform} plugins={allPlugins} onAction={onAction} />));
     expect(button("Back").disabled).toBe(true);
-    for (let step = 1; step <= 8; step++) {
-      expect(container.textContent).toContain(`Step ${step} of 8`);
+    for (let step = 1; step <= 9; step++) {
+      expect(container.textContent).toContain(`Step ${step} of 9`);
       expect(button("Skip tour").disabled).toBe(false);
       click("Skip tour");
       expect(onAction).toHaveBeenLastCalledWith({ action: "cancel" });
-      if (step < 8) click("Next");
+      if (step < 9) click("Next");
     }
-    expect(onAction).toHaveBeenCalledTimes(8);
+    expect(onAction).toHaveBeenCalledTimes(9);
     click("Back");
-    expect(container.textContent).toContain("Step 7 of 8");
+    expect(container.textContent).toContain("Step 8 of 9");
     click("Next");
     click("Finish");
     expect(onAction).toHaveBeenLastCalledWith({ action: "finish" });
@@ -72,11 +72,12 @@ describe.each(platforms)("guided tour on %s", platform => {
     click("Try it");
     expect(onAction).toHaveBeenLastCalledWith({ action: "tryTourCommand", command: "view.openKeyboardPreferences" });
 
-    for (const command of ["help.tour.openSample", undefined, "plugin.opsinNameToStructure.convert", "analyze.molecularProperties"]) {
+    for (const command of ["help.tour.openSample", "status", "plugins", "plugin.opsinNameToStructure.convert", "analyze.molecularProperties"]) {
       click("Next");
-      if (!command) {
-        // The plugins card explains plugins before the tour shows one; it has no Try it.
-        expect(container.querySelector("h1")!.textContent).toBe("Add features with plugins");
+      if (command === "status" || command === "plugins") {
+        // The status-bar card is text only. The plugins card explains plugins before the tour shows one;
+        // it has no Try it either.
+        expect(container.querySelector("h1")!.textContent).toBe(command === "status" ? "Keep an eye on the status bar" : "Add features with plugins");
         expect(button("Try it")).toBeUndefined();
         continue;
       }
@@ -87,6 +88,46 @@ describe.each(platforms)("guided tour on %s", platform => {
     click("Next");
     const text = container.textContent;
     expect(text).toContain(platform === "macos" ? "Choose ChemDraft > Settings… (⌘,)" : "Choose File > Preferences… (Ctrl+,)");
+  });
+
+  it("opens the plugin authoring guide from a real link, by click or Enter, without navigating the tour", () => {
+    const onAction = vi.fn();
+    act(() => root.render(<TourForm scheme="chemdraft" platform={platform} plugins={allPlugins} onAction={onAction} />));
+    while (container.querySelector("h1")!.textContent !== "Add features with plugins") click("Next");
+    const links = container.querySelectorAll<HTMLAnchorElement>(".guided-tour-url a");
+    expect(links).toHaveLength(1);
+    const link = links[0]!;
+    // The user still sees the same address, now as a link to it.
+    expect(link.textContent).toBe(PLUGIN_AUTHORING_GUIDE_URL);
+    expect(link.getAttribute("href")).toBe(PLUGIN_AUTHORING_GUIDE_URL);
+    expect(container.querySelector(".guided-tour-url")!.textContent).toBe(PLUGIN_AUTHORING_GUIDE_URL);
+
+    const location = window.location.href;
+    const clicks: boolean[] = [];
+    const record = (event: MouseEvent) => clicks.push(event.defaultPrevented);
+    document.addEventListener("click", record);
+    try {
+      act(() => link.click());
+      expect(onAction).toHaveBeenCalledTimes(1);
+      expect(onAction).toHaveBeenLastCalledWith({ action: "openGuide", url: PLUGIN_AUTHORING_GUIDE_URL });
+
+      // A browser activates a focused link on Enter by firing click, unless the keydown was cancelled.
+      // jsdom does not, so do what the browser does: the form must neither cancel Enter nor act on it twice.
+      act(() => {
+        link.focus();
+        if (link.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }))) link.click();
+        link.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", bubbles: true, cancelable: true }));
+      });
+      expect(document.activeElement).toBe(link);
+      expect(onAction).toHaveBeenCalledTimes(2);
+      expect(onAction).toHaveBeenLastCalledWith({ action: "openGuide", url: PLUGIN_AUTHORING_GUIDE_URL });
+    } finally {
+      document.removeEventListener("click", record);
+    }
+    // Both clicks were cancelled, so the tour window never followed the link.
+    expect(clicks).toEqual([true, true]);
+    expect(window.location.href).toBe(location);
+    expect(container.querySelector("h1")!.textContent).toBe("Add features with plugins");
   });
 
   it("names the Preferences menu item exactly as the menu bar labels it", () => {
@@ -114,17 +155,17 @@ describe.each(platforms)("guided tour on %s", platform => {
     const alert = () => container.querySelector('[role="alert"]')?.textContent;
     const missing = "Add Name to Structure from Plugins > Add or Remove Plugins, then try again.";
     render();
-    for (let step = 1; step < 5; step++) click("Next");
-    expect(container.textContent).toContain("Step 5 of 8");
+    for (let step = 1; step < 6; step++) click("Next");
+    expect(container.textContent).toContain("Step 6 of 9");
     click("Try it");
     render(missing);
     expect(alert()).toBe(missing);
 
     click("Next");
-    expect(container.textContent).toContain("Step 6 of 8");
+    expect(container.textContent).toContain("Step 7 of 9");
     expect(alert()).toBeUndefined();
     click("Back");
-    expect(container.textContent).toContain("Step 5 of 8");
+    expect(container.textContent).toContain("Step 6 of 9");
     expect(alert()).toBeUndefined();
 
     // A new action shows its own error again; leaving that step backward clears it too.
@@ -141,7 +182,7 @@ describe.each(platforms)("guided tour on %s", platform => {
     click("Try it");
     click("Next");
     render("Late failure");
-    expect(container.textContent).toContain("Step 6 of 8");
+    expect(container.textContent).toContain("Step 7 of 9");
     expect(alert()).toBeUndefined();
     click("Try it");
     render(undefined);
@@ -176,6 +217,22 @@ it("keeps TypeScript tour commands in sync with the native allowlist", () => {
   for (const command of tourCommands) {
     expect(parseDialogMessage({ ...envelope, type: "action", data: { action: "tryTourCommand", command } })).toBeDefined();
   }
+});
+
+it("keeps the plugin authoring guide address the same in TypeScript and in the native allowlist", () => {
+  const source = readFileSync(resolve("apps", "desktop", "src-tauri", "src", "dialog_windows.rs"), "utf8");
+  const native = [...source.matchAll(/const GUIDED_TOUR_GUIDE_URL: &str =\s*"([^"]+)";/g)].map(match => match[1]);
+  expect(native).toEqual([PLUGIN_AUTHORING_GUIDE_URL]);
+  // The step that shows a link shows exactly this address.
+  const urls = new Set(platforms.flatMap(platform => schemes.flatMap(scheme => [
+    ...tourSteps(scheme, platform), ...tourSteps(scheme, platform, TOUR_PLUGIN_COMMANDS)
+  ])).flatMap(step => step.url ? [step.url] : []));
+  expect([...urls]).toEqual([PLUGIN_AUTHORING_GUIDE_URL]);
+});
+
+it("never relays the guide link to the document window", () => {
+  // The native host opens the guide itself; the owner's side of the protocol does not accept it.
+  expect(parseDialogMessage({ ...envelope, type: "action", data: { action: "openGuide", url: PLUGIN_AUTHORING_GUIDE_URL } })).toBeUndefined();
 });
 
 it("rejects invalid tour actions in the TypeScript dialog protocol", () => {

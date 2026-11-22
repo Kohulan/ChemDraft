@@ -6,10 +6,9 @@ import { KEYBINDING_SCHEME_LABELS, type KeybindingScheme } from "../keybindingSe
 import { createMainWindowShortcutCommands, detectDesktopShortcutPlatform } from "../keyboardShortcuts";
 import { PLUGINS_MENU_LABELS, preferencesMenuPlacement } from "../appMenu";
 import { formatShortcutLabel, getToolsetCommandSpecs } from "../toolsets";
-import { TOUR_INSPECTOR_COMMAND, TOUR_NAME_COMMAND, TOUR_SAMPLE_COMMAND, type TourPluginCommand, type TourTryCommand } from "./tourCommands";
+import { PLUGIN_AUTHORING_GUIDE_URL, TOUR_INSPECTOR_COMMAND, TOUR_NAME_COMMAND, TOUR_SAMPLE_COMMAND, type TourPluginCommand, type TourTryCommand } from "./tourCommands";
 
-/** Where to learn to write a plugin. Shown as text: the tour has no way to open a browser. */
-export const PLUGIN_AUTHORING_GUIDE_URL = "https://github.com/jgassens/ChemDraft/blob/main/docs/plugin-architecture/AUTHORING.md";
+export { PLUGIN_AUTHORING_GUIDE_URL } from "./tourCommands";
 
 const shortcutExamples = [
   ["tool.bond", "Single Bond"],
@@ -44,8 +43,8 @@ interface TourStep {
   text: string;
   shortcuts?: true;
   tryCommand?: TourTryCommand;
-  /** A web address shown as plain text under the step's text. */
-  url?: string;
+  /** The web address of a link shown under the step's text. It opens in the system browser. */
+  url?: typeof PLUGIN_AUTHORING_GUIDE_URL;
   /** The card that explains plugins. It comes before every step that shows a plugin feature. */
   introducesPlugins?: true;
   /** The plugin this step shows, whether as its Try it or in its text (installed or offered as optional). */
@@ -85,6 +84,10 @@ export function tourSteps(
       title: "Draw a structure",
       text: `Click and drag with the bond tool, or pick a ring from Ring Templates on the toolbar. Hover over an atom and type a label or press ${bondKey} to add a single bond.`,
       tryCommand: TOUR_SAMPLE_COMMAND
+    },
+    {
+      title: "Keep an eye on the status bar",
+      text: "The status bar in the lower-left corner of the drawing window keeps you posted as you work. It shows tips for the tool you’re using and for keys that change what a drag does, and it tells you what you’ve selected."
     },
     {
       title: "Add features with plugins",

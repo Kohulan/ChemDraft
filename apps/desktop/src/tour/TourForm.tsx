@@ -31,6 +31,7 @@ export function TourForm({
   const steps = tourSteps(scheme, platform, openedWith);
   const step = steps[index];
   const tryCommand = step.tryCommand;
+  const url = step.url;
   const visibleError = errorStep === index ? error : undefined;
   const goTo = (next: number) => { setErrorStep(undefined); setIndex(next); };
   const send = (action: TourAction) => { setErrorStep(index); onAction(action); };
@@ -54,7 +55,11 @@ export function TourForm({
         <p className="guided-tour-counter">Step {index + 1} of {steps.length}</p>
         <h1 ref={heading} tabIndex={-1}>{step.title}</h1>
         <p>{step.text}</p>
-        {step.url ? <p className="guided-tour-url">{step.url}</p> : null}
+        {url ? <p className="guided-tour-url">
+          {/* The link never navigates this window: the host opens the address in the system browser.
+              Enter on the focused link fires this click, as it does for any link. */}
+          <a href={url} onClick={event => { event.preventDefault(); send({ action: "openGuide", url }); }}>{url}</a>
+        </p> : null}
         {step.shortcuts ? (
           <fieldset disabled={busy}>
             <legend>Keyboard shortcuts</legend>

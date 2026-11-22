@@ -246,6 +246,33 @@ enum GuidedTourAction {
         #[serde(rename = "command")]
         _command: GuidedTourCommand,
     },
+    /// The plugins card's link. Handled here, never relayed to the owner, and opened only when
+    /// `url` is exactly `GUIDED_TOUR_GUIDE_URL` (`open_guided_tour_guide`).
+    OpenGuide {
+        url: String,
+    },
+}
+
+/// The one web address the guided tour may open: the plugin authoring guide its plugins card
+/// shows. Keep it equal to `PLUGIN_AUTHORING_GUIDE_URL` in `tour/tourCommands.ts` (a TypeScript test
+/// compares them).
+const GUIDED_TOUR_GUIDE_URL: &str =
+    "https://github.com/jgassens/ChemDraft/blob/main/docs/plugin-architecture/AUTHORING.md";
+
+/// Opens the plugin authoring guide in the system browser through `open`, never in the tour's
+/// webview. Any address other than exactly `GUIDED_TOUR_GUIDE_URL` is refused and logged.
+fn open_guided_tour_guide(
+    url: &str,
+    open: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    if url != GUIDED_TOUR_GUIDE_URL {
+        eprintln!("Refused a guided tour link that is not the plugin authoring guide: {url:?}");
+        return Err("The tour can open only the plugin authoring guide.".into());
+    }
+    open(GUIDED_TOUR_GUIDE_URL).map_err(|error| {
+        eprintln!("Could not open the plugin authoring guide: {error}");
+        format!("Could not open the plugin authoring guide in your browser: {error}")
+    })
 }
 
 #[derive(Deserialize)]
@@ -2036,6 +2063,20 @@ pub(crate) async fn dialog_send(
                         required: true,
                     }],
                 )?);
+            }
+            if message.dialog_kind == "guidedTour" {
+                if let Ok(GuidedTourAction::OpenGuide { url }) =
+                    serde_json::from_value::<GuidedTourAction>(message.data.clone())
+                {
+                    // The link opens in the system browser and is not a terminal action: it
+                    // reserves nothing and never reaches the owner.
+                    drop(registry);
+                    drop(creation);
+                    return open_guided_tour_guide(
+                        &url,
+                        super::problem_reports::open_external_address,
+                    );
+                }
             }
             if let Some(receipt) = session.receipts.get(&message.request_id) {
                 return send_host(session, receipt);
@@ -5701,6 +5742,63 @@ mod tests {
         }
         message.data = json!({"action":"tryTourCommand","command":"document.save"});
         assert!(message.validate().is_err());
+    }
+
+    #[test]
+    fn guided_tour_opens_only_the_plugin_authoring_guide() {
+        let mut message = snapshot();
+        message.dialog_kind = "guidedTour".into();
+        message.message_type = "action".into();
+        message.data = json!({"action":"openGuide","url":GUIDED_TOUR_GUIDE_URL});
+        assert_eq!(message.validate(), Ok(()));
+        for data in [
+            json!({"action":"openGuide"}),
+            json!({"action":"openGuide","url":1}),
+            json!({"action":"openGuide","url":GUIDED_TOUR_GUIDE_URL,"extra":true}),
+        ] {
+            message.data = data.clone();
+            assert!(message.validate().is_err(), "{data}");
+        }
+
+        let mut opened = Vec::new();
+        assert_eq!(
+            open_guided_tour_guide(GUIDED_TOUR_GUIDE_URL, |url| {
+                opened.push(url.to_string());
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(opened, [GUIDED_TOUR_GUIDE_URL]);
+        assert!(
+            open_guided_tour_guide(GUIDED_TOUR_GUIDE_URL, |_| Err("no opener".into()))
+                .is_err_and(|error| error.contains("no opener"))
+        );
+
+        let lookalikes = [
+            format!("{GUIDED_TOUR_GUIDE_URL}/extra"),
+            format!("{GUIDED_TOUR_GUIDE_URL}?x=1"),
+            format!("{GUIDED_TOUR_GUIDE_URL}#top"),
+            format!("{GUIDED_TOUR_GUIDE_URL} "),
+            GUIDED_TOUR_GUIDE_URL.replace("https://", "http://"),
+            GUIDED_TOUR_GUIDE_URL.replace("github.com", "github.com.example.net"),
+            GUIDED_TOUR_GUIDE_URL.replace("github.com", "evil.example"),
+            GUIDED_TOUR_GUIDE_URL.replace("https://github.com", "https://user@github.com"),
+            GUIDED_TOUR_GUIDE_URL.to_uppercase(),
+            "file:///etc/passwd".to_string(),
+            String::new(),
+        ];
+        for url in lookalikes {
+            let mut called = false;
+            assert!(
+                open_guided_tour_guide(&url, |_| {
+                    called = true;
+                    Ok(())
+                })
+                .is_err(),
+                "{url}"
+            );
+            assert!(!called, "{url}");
+        }
     }
 
     #[test]

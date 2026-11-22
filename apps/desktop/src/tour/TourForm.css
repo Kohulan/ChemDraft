@@ -101,3 +101,13 @@
   user-select: text;
   -webkit-user-select: text;
 }
+
+.guided-tour-url a {
+  color: #154c8f;
+}
+
+.guided-tour-url a:focus-visible {
+  outline: 2px solid #154c8f;
+  outline-offset: 2px;
+  border-radius: 2px;
+}

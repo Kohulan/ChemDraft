@@ -13,6 +13,8 @@ import { parseDialogMessage, type DialogMessage } from "../dialogs/dialogProtoco
 const host = vi.hoisted(() => ({
   invoke: vi.fn(),
   opened: [] as DialogMessage[],
+  /** Every message the dialog window sent to the native host. */
+  sent: [] as DialogMessage[],
   toDialog: undefined as ((message: DialogMessage) => void) | undefined,
   toOwner: undefined as ((message: DialogMessage) => void) | undefined
 }));
@@ -30,7 +32,12 @@ vi.mock("../dialogs/dialogTransport", () => ({
     host.toDialog = receive;
     return () => {};
   },
-  sendDialogMessage: async (_hostId: string, message: DialogMessage) => { setTimeout(() => host.toOwner!(message), 0); }
+  sendDialogMessage: async (_hostId: string, message: DialogMessage) => {
+    host.sent.push(message);
+    // Like Rust's dialog_send: the guide link is opened by the host itself and never relayed to the owner.
+    if (message.type === "action" && message.data.action === "openGuide") return;
+    setTimeout(() => host.toOwner!(message), 0);
+  }
 }));
 
 import { DialogWindow } from "../dialogs/DialogWindow";
@@ -38,7 +45,7 @@ import { DialogCoordinator } from "../dialogs/DialogCoordinator";
 import { buildOfficialPluginMenuItems, NAME_TO_STRUCTURE_COMMAND_ID } from "../plugins/officialPluginMenus";
 import { buildPluginMenuItems } from "../plugins/pluginMenuModel";
 import { useGuidedTour } from "./useGuidedTour";
-import { availableTourPluginCommands, TOUR_NAME_COMMAND, type TourAction } from "./tourCommands";
+import { availableTourPluginCommands, PLUGIN_AUTHORING_GUIDE_URL, TOUR_NAME_COMMAND, type TourAction } from "./tourCommands";
 
 const DIALOG_LABEL = "dialog-main-guidedTour-1";
 const invokeCommand = vi.fn(async (_id: string) => undefined);
@@ -88,6 +95,7 @@ beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("localStorage", new MemoryStorage());
   host.opened = [];
+  host.sent = [];
   host.invoke.mockReset().mockResolvedValue({});
   invokeCommand.mockClear();
 });
@@ -98,16 +106,16 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-/** Open the tour from the document window into the native dialog window and go to step 5, which shows
- *  Name to Structure (the plugins card, step 4, comes first). */
+/** Open the tour from the document window into the native dialog window and go to step 6, which shows
+ *  Name to Structure (the plugins card, step 5, comes first). */
 async function openToNameStep(nameToStructure: boolean) {
   const tour = await mount(createElement(DialogWindow, { hostId: "tour" }));
   await mount(createElement(DocumentWindow, { nameToStructure }));
   await act(async () => { await import("./TourForm"); });
   await settle();
   const button = (text: string) => [...tour.querySelectorAll("button")].find(item => item.textContent === text);
-  for (let step = 1; step < 5; step++) await act(async () => { button("Next")!.click(); });
-  expect(tour.querySelector(".guided-tour-counter")!.textContent).toBe("Step 5 of 8");
+  for (let step = 1; step < 6; step++) await act(async () => { button("Next")!.click(); });
+  expect(tour.querySelector(".guided-tour-counter")!.textContent).toBe("Step 6 of 9");
   return { tour, button };
 }
 
@@ -128,8 +136,37 @@ describe.each([["macos", "MacIntel"], ["windows", "Win32"]] as const)("the nativ
     expect(tour.querySelector("[role=alert]")).toBeNull();
 
     // The dialog window used this platform's own wording on the last step.
-    for (let step = 5; step < 8; step++) await act(async () => { button("Next")!.click(); });
+    for (let step = 6; step < 9; step++) await act(async () => { button("Next")!.click(); });
     expect(tour.textContent).toContain(platform === "macos" ? "Choose ChemDraft > Settings… (⌘,)" : "Choose File > Preferences… (Ctrl+,)");
+  });
+
+  it("sends the guide link to the native host once per click or Enter, never to the document window", async () => {
+    const { tour, button } = await openToNameStep(false);
+    await act(async () => { button("Back")!.click(); });
+    expect(tour.querySelector("h1")!.textContent).toBe("Add features with plugins");
+    const link = tour.querySelector<HTMLAnchorElement>(".guided-tour-url a")!;
+    expect(link.getAttribute("href")).toBe(PLUGIN_AUTHORING_GUIDE_URL);
+    const location = window.location.href;
+    host.sent = [];
+    await act(async () => { link.click(); });
+    // Enter on a focused link: the browser fires click unless keydown was cancelled (jsdom does not).
+    await act(async () => {
+      link.focus();
+      if (link.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }))) link.click();
+    });
+    await settle();
+    expect(host.sent.map(message => [message.dialogKind, message.type, message.data])).toEqual([
+      ["guidedTour", "action", { action: "openGuide", url: PLUGIN_AUTHORING_GUIDE_URL }],
+      ["guidedTour", "action", { action: "openGuide", url: PLUGIN_AUTHORING_GUIDE_URL }]
+    ]);
+    expect(new Set(host.sent.map(message => message.requestId)).size).toBe(2);
+    expect(window.location.href).toBe(location);
+    expect(invokeCommand).not.toHaveBeenCalled();
+    // Opening the guide is not a pending tour action: nothing is busy and the tour carries on.
+    expect(tour.querySelector("[role=alert]")).toBeNull();
+    expect(button("Skip tour")!.disabled).toBe(false);
+    await act(async () => { button("Next")!.click(); });
+    expect(tour.querySelector(".guided-tour-counter")!.textContent).toBe("Step 6 of 9");
   });
 
   it("names the plugin as optional, with no Try it, when the menus do not offer it", async () => {
@@ -140,7 +177,7 @@ describe.each([["macos", "MacIntel"], ["windows", "Win32"]] as const)("the nativ
       "Plugins > Add or Remove Plugins… to draw a structure from a chemical name.");
     expect(tour.textContent).not.toContain("The Name to Structure plugin draws");
     expect(button("Try it")).toBeUndefined();
-    for (let step = 5; step < 8; step++) await act(async () => { button("Next")!.click(); });
+    for (let step = 6; step < 9; step++) await act(async () => { button("Next")!.click(); });
     expect(tour.textContent).toContain(platform === "macos" ? "Choose ChemDraft > Settings… (⌘,)" : "Choose File > Preferences… (Ctrl+,)");
     expect(invokeCommand).not.toHaveBeenCalled();
   });
