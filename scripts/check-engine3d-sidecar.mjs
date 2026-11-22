@@ -2,7 +2,8 @@
 // Checks that an avogadro3d-sidecar is a real x86-64 ELF build, not the committed placeholder
 // (apps/desktop/src-tauri/binaries/README.md); that it needs only glibc, and at most the glibc of the
 // oldest supported host; and that it completes the stdio protocol handshake with Avogadro's UFF
-// linked in and the pinned avogadrolibs commit reported.
+// linked in and the pinned avogadrolibs commit reported. Every stdout line is parsed as a protocol
+// message, as the app parses it (packages/engine3d-api).
 // Node built-ins only, and no binutils: it reads the ELF's dynamic section itself, so it runs the
 // same on the build runner and inside every distro container (which installs only `nodejs`).
 // Usage: node scripts/check-engine3d-sidecar.mjs <path to avogadro3d-sidecar>
@@ -15,8 +16,12 @@ import { fileURLToPath } from "node:url";
 const ROOT_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 const PLACEHOLDER_MARKER = "avogadro3d-sidecar placeholder";
 const HANDSHAKE_TIMEOUT_MS = 60_000;
+/** How long a sidecar may take to exit after SIGTERM, and then after SIGKILL, before the check gives up. */
+const KILL_GRACE_MS = 5_000;
 /** The process status GNU `timeout` reports when it had to stop the command. */
 const TIMEOUT_STATUS = 124;
+/** The session the handshake creates; every message the sidecar writes back must carry it. */
+export const HANDSHAKE_SESSION = "sidecar-check";
 
 /** Libraries glibc itself provides. libstdc++ and libgcc are linked statically (linux-build.yml). */
 export const GLIBC_LIBRARIES = new Set([
@@ -181,7 +186,7 @@ const ETHANOL_MOLFILE = [
   "  1  2  1  0  0  0  0", "  2  3  1  0  0  0  0", "M  END", ""
 ].join("\n");
 
-export function handshakeRequests(session = "sidecar-check") {
+export function handshakeRequests(session = HANDSHAKE_SESSION) {
   const request = (requestId, type, extra = {}) =>
     JSON.stringify({ protocolVersion: 2, requestId, sessionId: session, type, ...extra });
   return [
@@ -197,24 +202,80 @@ export function handshakeRequests(session = "sidecar-check") {
   ].map((line) => `${line}\n`).join("");
 }
 
-/** The first handshake problem in the sidecar's stdout, worded as before, or undefined. */
-export function handshakeProblem(stdout, commit) {
-  const lines = stdout.split("\n");
-  if (lines.at(-1) === "") lines.pop();
-  // stdout is protocol-only: one JSON object per line.
-  if (lines.some((line) => !line.startsWith('{"protocolVersion":2,'))) return "wrote a non-protocol line to stdout";
+const HANDSHAKE_REQUEST_IDS = ["check-create", "check-ping", "check-commit", "check-dispose"];
+/** Engine3DEventType in packages/engine3d-api. */
+const EVENT_TYPES = new Set([
+  "ready", "coordinatesChanged", "energyChanged", "selectionChanged", "warning", "error", "heartbeat", "closed"
+]);
+
+const isRecord = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+const field = (value, path) => path.split(".").reduce((node, key) => isRecord(node) ? node[key] : undefined, value);
+const isCoordinate = (value) => isRecord(value) && ["x", "y", "z"].every((axis) => Number.isFinite(value[axis]));
+const coordinatesFor = (atomIds) => (value) => isRecord(value) &&
+  Object.keys(value).sort().join() === [...atomIds].sort().join() && atomIds.every((id) => isCoordinate(value[id]));
+
+/**
+ * The sidecar's stdout as the app reads it (packages/engine3d-api parseEngine3DMessageLine): one
+ * protocol-version-2 JSON object per newline-terminated line, each a response or an event for this
+ * session. Returns the messages, or the first problem.
+ */
+export function parseHandshakeMessages(stdout, session = HANDSHAKE_SESSION) {
+  if (stdout === "") return { messages: [] };
+  if (!stdout.endsWith("\n")) return { problem: "wrote a non-protocol line to stdout (the last line is not newline-terminated)" };
+  const messages = [];
+  for (const [index, line] of stdout.slice(0, -1).split("\n").entries()) {
+    const bad = (why) => ({ problem: `wrote a non-protocol line to stdout (line ${index + 1} ${why})` });
+    let message;
+    try { message = JSON.parse(line); } catch { return bad("is not JSON"); }
+    if (!isRecord(message)) return bad("is not a JSON object");
+    if (message.protocolVersion !== 2) return bad(`has protocolVersion ${JSON.stringify(message.protocolVersion)}, not 2`);
+    if (message.type !== "response" && message.type !== "event") return bad(`has type ${JSON.stringify(message.type)}, not response or event`);
+    if (typeof message.requestId !== "string" || message.requestId === "") return bad("has no requestId");
+    if (message.sessionId !== session) return bad(`has sessionId ${JSON.stringify(message.sessionId)}, not "${session}"`);
+    const ids = message.type === "response" ? HANDSHAKE_REQUEST_IDS : HANDSHAKE_REQUEST_IDS.map((id) => `${id}.event`);
+    if (!ids.includes(message.requestId)) return bad(`answers requestId ${JSON.stringify(message.requestId)}, which was never sent`);
+    if (message.type === "response" && typeof message.ok !== "boolean") return bad("is a response without a boolean ok");
+    if (message.type === "event" && !EVENT_TYPES.has(message.eventType)) return bad(`has eventType ${JSON.stringify(message.eventType)}`);
+    messages.push(message);
+  }
+  return { messages };
+}
+
+/** The first handshake problem in the sidecar's stdout, or undefined. */
+export function handshakeProblem(stdout, commit, session = HANDSHAKE_SESSION) {
+  const { messages, problem } = parseHandshakeMessages(stdout, session);
+  if (problem) return problem;
+  const response = (requestId) => messages.filter((message) => message.type === "response" && message.requestId === requestId);
+  const event = (requestId, eventType) => messages.filter((message) =>
+    message.type === "event" && message.requestId === `${requestId}.event` && message.eventType === eventType);
+  const atoms = ["a1", "a2", "a3"];
+  // [what, the matching messages, [field path, expected value or predicate, description]...]
   const expectations = [
-    ["the createSession response", "check-create", ['"type":"response"', '"ok":true']],
-    ["the ready event", "check-create.event", ['"eventType":"ready"', '"headlessPhysics":true']],
-    ["the ping response", "check-ping", ['"ok":true']],
-    ["the commit response", "check-commit", ['"ok":true', '"engine":{"name":"avogadro3d-sidecar"',
-      `"sourceCommit":"${commit}"`, '"forceField":{"name":"UFF"', '"avogadroBacked":true']],
-    ["the dispose response", "check-dispose", ['"ok":true']]
+    ["the createSession response", response("check-create"), [["ok", true], ["result.sessionId", session]]],
+    ["the ready event", event("check-create", "ready"), [
+      ["capabilities.headlessPhysics", true], ["capabilities.forceField", "UFF"],
+      ["coords3dByAtomId", coordinatesFor(atoms), "a coordinate for each of a1, a2, a3"]
+    ]],
+    ["the ping response", response("check-ping"), [["ok", true]]],
+    ["the commit response", response("check-commit"), [
+      ["ok", true], ["result.sessionId", session], ["result.graphSignature", "check"], ["result.bondSignature", "check"],
+      ["result.engine.name", "avogadro3d-sidecar"], ["result.engine.sourceCommit", commit],
+      ["result.forceField.name", "UFF"], ["result.forceField.avogadroBacked", true],
+      ["result.coords3dByAtomId", coordinatesFor(atoms), "a coordinate for each of a1, a2, a3"]
+    ]],
+    ["the dispose response", response("check-dispose"), [["ok", true]]]
   ];
-  for (const [what, requestId, needles] of expectations) {
-    const response = lines.filter((line) => line.includes(`"requestId":"${requestId}"`)).join("\n");
-    const missing = needles.find((needle) => !response.includes(needle));
-    if (missing) return `handshake is missing ${what} (${missing})`;
+  for (const [what, found, fields] of expectations) {
+    if (found.length === 0) return `handshake is missing ${what}`;
+    if (found.length > 1) return `handshake has ${found.length} of ${what}, not one`;
+    for (const [path, expected, description] of fields) {
+      const actual = field(found[0], path);
+      const matches = typeof expected === "function" ? expected(actual) : actual === expected;
+      if (!matches) {
+        const wanted = description ?? JSON.stringify(expected);
+        return `handshake has an unexpected ${what.replace(/^the /, "")} (${path} must be ${wanted}, not ${JSON.stringify(actual) ?? "missing"})`;
+      }
+    }
   }
   return undefined;
 }
@@ -224,7 +285,12 @@ function launchFailureStatus(error) {
   return error.code === "ENOENT" ? 127 : ["EACCES", "ENOEXEC"].includes(error.code) ? 126 : 1;
 }
 
-export function runSidecarHandshake(sidecar, input) {
+/**
+ * Runs `<sidecar> --stdio` with `input` on stdin. After `timeoutMs` it sends SIGTERM, after a further
+ * `killGraceMs` SIGKILL, and after one more `killGraceMs` it stops waiting (a process the sidecar left
+ * behind can hold the pipes open), reporting status 124 and `timedOut`.
+ */
+export function runSidecarHandshake(sidecar, input, { timeoutMs = HANDSHAKE_TIMEOUT_MS, killGraceMs = KILL_GRACE_MS } = {}) {
   return new Promise((resolveRun) => {
     let stdout = "";
     let stderr = "";
@@ -233,24 +299,38 @@ export function runSidecarHandshake(sidecar, input) {
     try {
       child = spawn(sidecar, ["--stdio"], { stdio: ["pipe", "pipe", "pipe"] });
     } catch (error) {
-      resolveRun({ status: launchFailureStatus(error), stdout, stderr: `${error.message}\n` });
+      resolveRun({ status: launchFailureStatus(error), stdout, stderr: `${error.message}\n`, timedOut });
       return;
     }
-    const timer = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); }, HANDSHAKE_TIMEOUT_MS);
+    const timers = [];
+    const later = (ms, action) => timers.push(setTimeout(action, ms));
+    let settled = false;
+    const finish = (status) => {
+      if (settled) return;
+      settled = true;
+      timers.forEach(clearTimeout);
+      resolveRun({ status: timedOut ? TIMEOUT_STATUS : status, stdout, stderr, timedOut });
+    };
+    later(timeoutMs, () => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      later(killGraceMs, () => {
+        child.kill("SIGKILL");
+        later(killGraceMs, () => {
+          for (const stream of [child.stdin, child.stdout, child.stderr]) stream.destroy();
+          finish(TIMEOUT_STATUS);
+        });
+      });
+    });
     child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
     child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
     // A sidecar that exits before reading every request closes the pipe; its status says why.
     child.stdin.on("error", () => undefined);
     child.on("error", (error) => {
-      clearTimeout(timer);
       stderr += `${error.message}\n`;
-      resolveRun({ status: launchFailureStatus(error), stdout, stderr });
+      finish(launchFailureStatus(error));
     });
-    child.on("close", (code, signal) => {
-      clearTimeout(timer);
-      const status = timedOut ? TIMEOUT_STATUS : code ?? 128 + (osConstants.signals[signal] ?? 0);
-      resolveRun({ status, stdout, stderr });
-    });
+    child.on("close", (code, signal) => finish(code ?? 128 + (osConstants.signals[signal] ?? 0)));
     child.stdin.end(input);
   });
 }
@@ -281,11 +361,12 @@ export async function checkEngine3dSidecar(sidecar, { rootDir = ROOT_DIR, log = 
   const commit = pinnedAvogadroCommit(readFileSync(join(rootDir, "native", "avogadro3d-sidecar", "CMakeLists.txt"), "utf8"));
   if (!commit) fail("CMakeLists.txt must pin exactly one avogadrolibs commit");
 
-  const { status, stdout, stderr } = await runSidecarHandshake(sidecar, handshakeRequests());
+  const { status, stdout, stderr, timedOut } = await runSidecarHandshake(sidecar, handshakeRequests());
   const show = () => {
     log("--- sidecar stdout"); process.stdout.write(stdout);
     log("--- sidecar stderr"); process.stdout.write(stderr);
   };
+  if (timedOut) { show(); fail(`did not finish the handshake within ${HANDSHAKE_TIMEOUT_MS / 1000} s and was killed`); }
   if (status !== 0) { show(); fail(`exited with status ${status}`); }
   const problem = handshakeProblem(stdout, commit);
   if (problem) { show(); fail(problem); }

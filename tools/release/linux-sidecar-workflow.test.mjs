@@ -102,7 +102,10 @@ test("the container smoke checks the installed sidecar from the .deb and the App
   const check = read("scripts/check-engine3d-sidecar.mjs");
   assert.match(check, /avogadro3d-sidecar placeholder/);
   assert.match(check, /7f454c460201/);
-  assert.match(check, /"avogadroBacked":true/);
+  // The handshake is parsed as protocol JSON, and Avogadro's UFF must back the commit.
+  assert.match(check, /JSON\.parse\(line\)/);
+  assert.match(check, /\["result\.forceField\.avogadroBacked", true\]/);
+  assert.match(check, /child\.kill\("SIGKILL"\)/);
   assert.match(check, /export const MAX_GLIBC = "2\.35";/);
 });
 

@@ -8,6 +8,7 @@ import {
   elfHeaderProblem,
   GLIBC_LIBRARIES,
   glibcVersions,
+  HANDSHAKE_SESSION,
   handshakeProblem,
   handshakeRequests,
   MAX_GLIBC,
@@ -124,13 +125,28 @@ describe("ELF header", () => {
 
 describe("handshake", () => {
   const commit = "416651ddaef33a4e20392392e7c0b505d446491b";
-  const goodStdout = [
-    '{"protocolVersion":2,"requestId":"check-create","type":"response","ok":true}',
-    '{"protocolVersion":2,"requestId":"check-create.event","eventType":"ready","headlessPhysics":true}',
-    '{"protocolVersion":2,"requestId":"check-ping","ok":true}',
-    `{"protocolVersion":2,"requestId":"check-commit","ok":true,"engine":{"name":"avogadro3d-sidecar","sourceCommit":"${commit}"},"forceField":{"name":"UFF","avogadroBacked":true}}`,
-    '{"protocolVersion":2,"requestId":"check-dispose","ok":true}'
-  ].join("\n") + "\n";
+  // The lines native/avogadro3d-sidecar/src/main.cpp writes for handshakeRequests(), in order: every
+  // message carries the session, events answer "<requestId>.event", and the commit metadata sits
+  // inside the commit response's result (Engine3DCommitResult in packages/engine3d-api).
+  const coords = '{"a1":{"x":-1.2000,"y":0.1000,"z":0.0000},"a2":{"x":0.3000,"y":-0.2000,"z":0.0500},"a3":{"x":0.9000,"y":1.1000,"z":-0.0500}}';
+  const forceField = '{"name":"UFF","status":"converged","energy":2.4167,"energyUnits":"kJ/mol","avogadroBacked":true}';
+  const envelope = (requestId: string, type: string) =>
+    `{"protocolVersion":2,"requestId":"${requestId}","sessionId":"sidecar-check","type":"${type}"`;
+  const goodLines = [
+    `${envelope("check-create", "response")},"ok":true,"result":{"sessionId":"sidecar-check"}}`,
+    `${envelope("check-create.event", "event")},"eventType":"ready","capabilities":{"headlessPhysics":true,"worldSpaceDrag":true,"frontendRendering":true,"autoOptimize":true,"forceField":"UFF"},"coordinateRevision":0,"coords3dByAtomId":${coords}}`,
+    `${envelope("check-create.event", "event")},"eventType":"coordinatesChanged","coordinateRevision":0,"reason":"embed","coords3dByAtomId":${coords}}`,
+    `${envelope("check-create.event", "event")},"eventType":"coordinatesChanged","coordinateRevision":1,"reason":"initial-relax","coords3dByAtomId":${coords}}`,
+    `${envelope("check-create.event", "event")},"eventType":"energyChanged","energy":2.4167,"forceField":${forceField}}`,
+    `${envelope("check-ping", "response")},"ok":true}`,
+    `${envelope("check-ping.event", "event")},"eventType":"heartbeat"}`,
+    `${envelope("check-commit", "response")},"ok":true,"result":{"sessionId":"sidecar-check","coords3dByAtomId":${coords},"coordinateRevision":1,"graphSignature":"check","bondSignature":"check","engine":{"name":"avogadro3d-sidecar","version":"protocol-scout","sourceCommit":"${commit}"},"forceField":${forceField},"warnings":[]}}`,
+    `${envelope("check-dispose", "response")},"ok":true}`,
+    `${envelope("check-dispose.event", "event")},"eventType":"closed"}`
+  ];
+  const goodStdout = goodLines.join("\n") + "\n";
+  const withLine = (index: number, line: string) => goodLines.map((original, at) => at === index ? line : original).join("\n") + "\n";
+  const commitLine = goodLines.findIndex(line => line.includes('"requestId":"check-commit"'));
 
   it("reads the pinned commit from CMakeLists.txt", () => {
     expect(pinnedAvogadroCommit(`GIT_TAG ${commit}\n# ${commit}`)).toBe(commit);
@@ -147,19 +163,62 @@ describe("handshake", () => {
     expect(requests.map(request => [request.requestId, request.type])).toEqual([
       ["check-create", "createSession"], ["check-ping", "ping"], ["check-commit", "commit"], ["check-dispose", "dispose"]
     ]);
-    expect(requests.every(request => request.protocolVersion === 2 && request.sessionId === "sidecar-check")).toBe(true);
+    expect(requests.every(request => request.protocolVersion === 2 && request.sessionId === HANDSHAKE_SESSION)).toBe(true);
     expect(lines[0]).toMatch(/^\{"protocolVersion":2,"requestId":"check-create","sessionId":"sidecar-check","type":"createSession","input":\{"molfile":"ethanol\\n  ChemDraft\\n\\n  3  2/);
     expect(requests[0].input.molfile.endsWith("M  END\n")).toBe(true);
   });
 
-  it("accepts a complete handshake and names the first missing part", () => {
+  it("accepts the sidecar's real handshake", () => {
+    expect(goodLines.every(line => JSON.parse(line).sessionId === HANDSHAKE_SESSION)).toBe(true);
     expect(handshakeProblem(goodStdout, commit)).toBeUndefined();
-    expect(handshakeProblem(`log line\n${goodStdout}`, commit)).toBe("wrote a non-protocol line to stdout");
+  });
+
+  it("refuses a line that is not a complete protocol message, even when it holds every expected field", () => {
+    // Cut after the fields a substring search looked for: no longer JSON the app could parse.
+    const truncated = goodLines[commitLine]!.slice(0, goodLines[commitLine]!.indexOf('"avogadroBacked":true') + '"avogadroBacked":true'.length);
+    expect(handshakeProblem(withLine(commitLine, truncated), commit))
+      .toBe(`wrote a non-protocol line to stdout (line ${commitLine + 1} is not JSON)`);
+    expect(handshakeProblem(goodStdout.slice(0, -1), commit))
+      .toBe("wrote a non-protocol line to stdout (the last line is not newline-terminated)");
+    expect(handshakeProblem(`log line\n${goodStdout}`, commit)).toBe("wrote a non-protocol line to stdout (line 1 is not JSON)");
+    expect(handshakeProblem(`[1]\n${goodStdout}`, commit)).toBe("wrote a non-protocol line to stdout (line 1 is not a JSON object)");
+    expect(handshakeProblem(goodStdout.replace('"protocolVersion":2,"requestId":"check-ping"', '"protocolVersion":3,"requestId":"check-ping"'), commit))
+      .toMatch(/^wrote a non-protocol line to stdout \(line \d+ has protocolVersion 3, not 2\)$/);
+  });
+
+  it("refuses messages for another session, an unsent request, or an unknown type", () => {
+    expect(handshakeProblem(goodStdout.replace('"requestId":"check-ping","sessionId":"sidecar-check"', '"requestId":"check-ping","sessionId":"other"'), commit))
+      .toMatch(/line \d+ has sessionId "other", not "sidecar-check"/);
+    expect(handshakeProblem(goodStdout.replace('"requestId":"check-ping","sessionId":"sidecar-check","type":"response"', '"requestId":"check-ping","type":"response"'), commit))
+      .toMatch(/line \d+ has sessionId undefined, not "sidecar-check"/);
+    expect(handshakeProblem(`${envelope("check-other", "response")},"ok":true}\n${goodStdout}`, commit))
+      .toBe('wrote a non-protocol line to stdout (line 1 answers requestId "check-other", which was never sent)');
+    expect(handshakeProblem(`${envelope("check-ping", "request")}}\n${goodStdout}`, commit))
+      .toBe('wrote a non-protocol line to stdout (line 1 has type "request", not response or event)');
+    expect(handshakeProblem(`${envelope("check-ping.event", "event")},"eventType":"bogus"}\n${goodStdout}`, commit))
+      .toBe('wrote a non-protocol line to stdout (line 1 has eventType "bogus")');
+  });
+
+  it("refuses commit metadata outside the result object, as the app reads it", () => {
+    const outside = `${envelope("check-commit", "response")},"ok":true,"engine":{"name":"avogadro3d-sidecar","sourceCommit":"${commit}"},"forceField":{"name":"UFF","avogadroBacked":true}}`;
+    expect(handshakeProblem(withLine(commitLine, outside), commit))
+      .toBe("handshake has an unexpected commit response (result.sessionId must be \"sidecar-check\", not missing)");
+  });
+
+  it("names the first missing or wrong part", () => {
     expect(handshakeProblem(goodStdout.replace('"headlessPhysics":true', '"headlessPhysics":false'), commit))
-      .toBe('handshake is missing the ready event ("headlessPhysics":true)');
+      .toBe("handshake has an unexpected ready event (capabilities.headlessPhysics must be true, not false)");
     expect(handshakeProblem(goodStdout, "0".repeat(40)))
-      .toBe(`handshake is missing the commit response ("sourceCommit":"${"0".repeat(40)}")`);
-    expect(handshakeProblem("", commit)).toBe('handshake is missing the createSession response ("type":"response")');
+      .toBe(`handshake has an unexpected commit response (result.engine.sourceCommit must be "${"0".repeat(40)}", not "${commit}")`);
+    expect(handshakeProblem(goodStdout.replaceAll('"avogadroBacked":true', '"avogadroBacked":false'), commit))
+      .toBe("handshake has an unexpected commit response (result.forceField.avogadroBacked must be true, not false)");
+    expect(handshakeProblem(goodStdout.replace('"requestId":"check-dispose","sessionId":"sidecar-check","type":"response","ok":true', '"requestId":"check-dispose","sessionId":"sidecar-check","type":"response","ok":false'), commit))
+      .toBe("handshake has an unexpected dispose response (ok must be true, not false)");
+    expect(handshakeProblem(withLine(commitLine, goodLines[commitLine]!.replace('"a3":', '"a4":')), commit))
+      .toMatch(/^handshake has an unexpected commit response \(result\.coords3dByAtomId must be a coordinate for each of a1, a2, a3, not /);
+    expect(handshakeProblem(goodLines.filter((_, index) => index !== 1).join("\n") + "\n", commit)).toBe("handshake is missing the ready event");
+    expect(handshakeProblem(goodStdout + goodLines[5] + "\n", commit)).toBe("handshake has 2 of the ping response, not one");
+    expect(handshakeProblem("", commit)).toBe("handshake is missing the createSession response");
   });
 
   describe.skipIf(process.platform === "win32")("running a sidecar", () => {
@@ -174,12 +233,26 @@ describe("handshake", () => {
 
     it("feeds the requests on stdin and returns its stdout", async () => {
       const result = await runSidecarHandshake(stub("echo", '[ "$1" = --stdio ] || exit 9\ncat'), handshakeRequests());
-      expect(result).toMatchObject({ status: 0, stdout: handshakeRequests() });
+      expect(result).toMatchObject({ status: 0, stdout: handshakeRequests(), timedOut: false });
     });
 
     it("reports the exit status, and the shell's 127 for a missing file", async () => {
       expect((await runSidecarHandshake(stub("fails", "echo oops >&2; exit 3"), "")).status).toBe(3);
       expect((await runSidecarHandshake(join(work, "absent"), "")).status).toBe(127);
+    });
+
+    it("kills a sidecar that ignores SIGTERM and fails with status 124", async () => {
+      const started = Date.now();
+      const result = await runSidecarHandshake(stub("stubborn", "trap '' TERM\nwhile :; do :; done"), "", { timeoutMs: 200, killGraceMs: 200 });
+      expect(result).toMatchObject({ status: 124, timedOut: true });
+      expect(Date.now() - started).toBeLessThan(4_000);
+    });
+
+    it("stops waiting when a process the sidecar left behind holds its output open", async () => {
+      const started = Date.now();
+      const result = await runSidecarHandshake(stub("orphan", "trap '' TERM\nsleep 3"), "", { timeoutMs: 200, killGraceMs: 200 });
+      expect(result).toMatchObject({ status: 124, timedOut: true });
+      expect(Date.now() - started).toBeLessThan(2_500);
     });
   });
 });

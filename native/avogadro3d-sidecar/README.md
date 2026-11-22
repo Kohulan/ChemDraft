@@ -104,7 +104,10 @@ statically, so the executable needs only glibc (2.35 or newer, from the build ho
 The job fails unless `scripts/check-engine3d-sidecar.mjs` (an ELF, glibc and
 handshake check that needs only Node, no binutils) finds a real x86-64 ELF whose
 `DT_NEEDED` entries are only glibc libraries, with no symbol version newer than glibc
-2.35, that completes the protocol handshake. It then runs `pnpm audit:engine3d-sidecar`
+2.35, that completes the protocol handshake: every stdout line must parse as a
+protocol message for the check's session, and the commit result must report
+Avogadro-backed UFF and the pinned commit. A sidecar that hangs is killed (SIGTERM,
+then SIGKILL) and fails the check. It then runs `pnpm audit:engine3d-sidecar`
 and all three smokes below, and uploads the artifact `engine3d-sidecar-linux-x86_64`
 (the binary and its `.sha256`), printing the SHA-256 and the run id in the job summary.
 
