@@ -47,7 +47,7 @@ import {
 import { measureTextRun, planTableLayout, textObjectSpansForRendering, transformPointForObject } from "@chemdraft/layout-engine";
 import { bondedElementLabelMeaning, isGenericAtomLabel } from "@chemdraft/template-library";
 import { planMoleculeAtomLabels } from "@chemdraft/layout-engine";
-import { dativeDeprotonationCount, nativeAtomValenceForCharge, nativeBondOrderResolution, nativeElementFromAtomLabel } from "@chemdraft/layout-engine";
+import { atomImplicitHydrogenCount, nativeBondOrderResolution, nativeElementFromAtomLabel } from "@chemdraft/layout-engine";
 import { sha256Hex, utf8Bytes, utf8String } from "./sha256";
 import { PROPS } from "./cdxTags";
 import { equalPrintMargins, fitPageSetup, importPageSetup, pagePrintMargins, type VisiblePageSetup } from "./pageSetup";
@@ -6424,8 +6424,8 @@ function cdxmlBondDisplayForBondStyle(display: MoleculeBond["display"]): string 
 /**
  * An ordinary atom's NumHydrogens is not kept: ChemDraft derives the count from valence, exactly as
  * the drawn label and the formula do (layout-engine's label planner and document-workflow-core's
- * `nativeAtomDiagnostic`: valence for the charge, less the bond orders, radicals and any dative
- * deprotonation). Where the file stated a different count, the opened chemistry is not the file's,
+ * `nativeAtomDiagnostic`), by layout-engine's `atomImplicitHydrogenCount`, the one copy of that
+ * calculation (AGENTS.md §9). Where the file stated a different count, the opened chemistry is not the file's,
  * so one warning per fragment names each such atom and both counts (AGENTS.md §7). Atoms with no
  * single derived count (no element, hydrogen itself, a carbon bonded only datively, whose label
  * shows no H while the formula counts them) are left alone rather than described wrongly.
@@ -6447,12 +6447,8 @@ function droppedStatedHydrogensWarning(
     const element = nativeElementFromAtomLabel(atom.element);
     const stated = statedHydrogensByAtomId.get(atom.id);
     if (!element || element === "H" || stated === undefined) continue;
-    const incident = resolution.bondsByAtom.get(atom.id) ?? [];
-    if (element === "C" && incident.length > 0 && incident.every(isDativeBond)) continue;
-    const derived = Math.max(0, nativeAtomValenceForCharge(element, atom.formalCharge)
-      - (resolution.bondOrderUsage.get(atom.id) ?? 0) - (atom.markRadicals ?? 0)
-      - dativeDeprotonationCount(atom, bonds, atoms, resolution));
-    if (derived === stated) continue;
+    const derived = atomImplicitHydrogenCount(atom, bonds, atoms, resolution);
+    if (derived === undefined || derived === stated) continue;
     mismatches.push({ atomId: atom.id, label: `atom ${cdxmlIdByAtomId.get(atom.id) ?? atom.id} (${element})`, stated, derived });
   }
   if (mismatches.length === 0) return undefined;
