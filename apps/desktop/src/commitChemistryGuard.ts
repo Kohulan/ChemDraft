@@ -218,7 +218,8 @@ function movedPageMatcher(before: ChemDraftDocument, after: ChemDraftDocument): 
   let matched: Map<string, MoleculeObject> | undefined;
   return (pageId, id) => {
     if (!matched) {
-      matched = new Map();
+      const map = new Map<string, MoleculeObject>();
+      matched = map;
       const beforePages = new Map(before.pages.map((page) => [page.id, page]));
       const afterPages = new Map(after.pages.map((page) => [page.id, page]));
       const destinations = new Map<string, MoleculeObject[]>();
@@ -256,7 +257,7 @@ function movedPageMatcher(before: ChemDraftDocument, after: ChemDraftDocument): 
             if (sourcePaired[sourceIndex]) return;
             const destinationIndex = arrived.findIndex((destination, index) => !destinationPaired[index] && pairs(source.molecule, destination));
             if (destinationIndex < 0) return;
-            matched.set(moleculeKey(source.pageId, moleculeId), arrived[destinationIndex]);
+            map.set(moleculeKey(source.pageId, moleculeId), arrived[destinationIndex]);
             sourcePaired[sourceIndex] = destinationPaired[destinationIndex] = true;
           });
         }
