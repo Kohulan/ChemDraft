@@ -473,8 +473,8 @@ describe("native Window and full-screen menus", () => {
     expect(windowMenu).toMatch(/#\[cfg\(windows\)\]\s*&PredefinedMenuItem::close_window\(app, None\)/);
     expect(windowMenu.match(/PredefinedMenuItem::(?:minimize|maximize|close_window)\(/g)).toHaveLength(3);
     // muda leaves the predefined items out of GTK menus, so Linux builds ordinary items instead.
-    expect(windowMenu).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*&linux_window_menu_item\(app, LINUX_MINIMIZE_MENU_ID\)\?/);
-    expect(windowMenu).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*&linux_window_menu_item\(app, LINUX_TOGGLE_MAXIMIZE_MENU_ID\)\?/);
+    expect(windowMenu).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*&linux_window_menu_item\(app, WINDOW_MINIMIZE_COMMAND_ID\)\?/);
+    expect(windowMenu).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*&linux_window_menu_item\(app, WINDOW_TOGGLE_MAXIMIZE_COMMAND_ID\)\?/);
     expect(windowMenu).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*&linux_window_menu_item\(app, LINUX_CLOSE_WINDOW_WINDOW_MENU_ID\)\?/);
   });
 
