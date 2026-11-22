@@ -392,6 +392,44 @@ describe("issue #424: malformed input fails safely", () => {
     expect(plain).not.toContain("xyz=");
   });
 
+  // Codex (1.2.3): an expanded abbreviation's id names its attachment atom. When another node
+  // carries the same id, a bond naming it was joined to whichever the last mapping said; it may
+  // mean either, so it now joins neither, with a warning, as a lone pair naming a shared id does.
+  const abbreviation = (id: string, x: number, inner: number, element: number, label: string) =>
+    `<n id="${id}" p="${x} 100" NodeType="Fragment"><fragment id="${inner}"><n id="${inner + 1}" p="${x} 100" Element="${element}"/>` +
+    `<n id="${inner + 2}" p="${x - 10} 100" NodeType="ExternalConnectionPoint"/><b id="${inner + 3}" B="${inner + 2}" E="${inner + 1}"/></fragment>` +
+    `<t p="${x - 4} 104"><s font="3" size="10" face="0">${label}</s></t></n>`;
+  const moleculeOf = (source: string) => {
+    const opened = openChemDraftPayload(`<CDXML>${fontTable}<page><fragment id="1">${source}</fragment></page></CDXML>`);
+    const molecule = objectsOf<MoleculeObject>(opened.document!, "molecule")[0]!;
+    const bonds = molecule.bonds.map(bond => [bond.fromAtomId, bond.toAtomId].map(id => molecule.atoms.find(atom => atom.id === id)!.element).join("-"));
+    return { opened, molecule, bonds };
+  };
+
+  it("joins a bond to an abbreviation's atom when its id is unique", () => {
+    const { bonds, opened } = moleculeOf(`<n id="2" p="100 100"/><n id="8" p="120 100"/>${abbreviation("9", 140, 20, 8, "OH")}<b id="4" B="2" E="9"/>`);
+    expect(bonds).toEqual(["C-O"]);
+    expect(codes(opened.warnings)).not.toContain("cdxml.bond_alias_id_ambiguous");
+  });
+
+  it("skips, with a warning, a bond naming an id that an abbreviation shares with another node", () => {
+    const { molecule, bonds, opened } = moleculeOf(`<n id="2" p="100 100"/><n id="9" p="120 100"/>${abbreviation("9", 140, 20, 8, "OH")}<b id="4" B="2" E="9"/>`);
+    expect(molecule.atoms.map(atom => atom.element).sort()).toEqual(["C", "C", "O"]);
+    expect(bonds).toEqual([]);
+    expect(opened.warnings.filter(w => w.code === "cdxml.bond_alias_id_ambiguous").map(w => w.message)).toEqual([
+      "CDXML bond 4 names node 9, an id carried by an expanded abbreviation and by another node; it was not joined to either and was skipped."
+    ]);
+    expect(codes(opened.warnings)).toContain("cdxml.bond_endpoints_invalid");
+  });
+
+  it("skips, with a warning, bonds naming an id two abbreviations share", () => {
+    const { molecule, bonds, opened } = moleculeOf(`<n id="2" p="100 100"/><n id="3" p="120 100"/><b id="4" B="2" E="3"/>` +
+      `${abbreviation("9", 80, 20, 8, "OH")}${abbreviation("9", 160, 30, 7, "NH2")}<b id="5" B="2" E="9"/><b id="6" B="3" E="9"/>`);
+    expect(molecule.atoms.map(atom => atom.element).sort()).toEqual(["C", "C", "N", "O"]);
+    expect(bonds).toEqual(["C-C"]);
+    expect(opened.warnings.filter(w => w.code === "cdxml.bond_alias_id_ambiguous")).toHaveLength(2);
+  });
+
   it("says that an atom with neither p nor a usable xyz has lost its position", () => {
     const opened = openChemDraftPayload('<CDXML><page><fragment id="1"><n id="2" xyz="NaN 5 1" Element="8"/>' +
       '<n id="3" p="120 100"/><b id="4" B="2" E="3"/></fragment></page></CDXML>');

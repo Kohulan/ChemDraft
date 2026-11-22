@@ -4491,13 +4491,28 @@ function importFragment(
     };
   });
   // A bond drawn to an abbreviation now lands on the atom its connection point marked — the sulfur
-  // of an expanded SO3, not the vanished node.
+  // of an expanded SO3, not the vanished node. When another node, or another expanded abbreviation,
+  // carries the same id, a bond naming that id could mean either, so it resolves to neither and is
+  // skipped with a warning, as a lone pair naming a shared id stays unattached.
+  const nodeCdxmlIds = new Set(atomElements.flatMap(atomElement => atomElement.attributes.id ?? []));
+  const expandedCountByCdxmlId = new Map<string, number>();
+  for (const item of expansion.abbreviations) {
+    const id = item.source.attributes.id;
+    if (item.expanded && id !== undefined) expandedCountByCdxmlId.set(id, (expandedCountByCdxmlId.get(id) ?? 0) + 1);
+  }
+  const ambiguousAliasIds = new Set<string>();
   expansion.attachmentByCdxmlId.forEach((attachmentCdxmlId, abbreviationCdxmlId) => {
+    if (nodeCdxmlIds.has(abbreviationCdxmlId) || (expandedCountByCdxmlId.get(abbreviationCdxmlId) ?? 0) > 1) {
+      ambiguousAliasIds.add(abbreviationCdxmlId);
+      return;
+    }
     const atomId = atomIdByCdxmlId.get(attachmentCdxmlId);
     if (atomId) {
       atomIdByCdxmlId.set(abbreviationCdxmlId, atomId);
     }
   });
+  const bondEndpoint = (cdxmlId: string | undefined) =>
+    cdxmlId !== undefined && ambiguousAliasIds.has(cdxmlId) ? "" : atomIdByCdxmlId.get(cdxmlId ?? "") ?? cdxmlId ?? "";
   const atomByCdxmlId = new Map<string, MoleculeAtom>(
     atomElements.map((atomElement, atomIndex) => [atomElement.attributes.id ?? atoms[atomIndex].id, atoms[atomIndex]])
   );
@@ -4514,10 +4529,14 @@ function importFragment(
     }
     const bond: MoleculeBond = {
       id: bondId,
-      fromAtomId: atomIdByCdxmlId.get(bondElement.attributes.B ?? "") ?? bondElement.attributes.B ?? "",
-      toAtomId: atomIdByCdxmlId.get(bondElement.attributes.E ?? "") ?? bondElement.attributes.E ?? "",
+      fromAtomId: bondEndpoint(bondElement.attributes.B),
+      toAtomId: bondEndpoint(bondElement.attributes.E),
       order
     };
+    const ambiguousEnd = [bondElement.attributes.B, bondElement.attributes.E].find(id => id !== undefined && ambiguousAliasIds.has(id));
+    if (ambiguousEnd !== undefined) warnings.push({ code: "cdxml.bond_alias_id_ambiguous", sourceObjectId: objectId,
+      message: `${context.sourceFormat} bond ${bondElement.attributes.id ?? bondId} names node ${ambiguousEnd}, an id carried by an ` +
+        "expanded abbreviation and by another node; it was not joined to either and was skipped." });
     const cdxmlBondId = bondElement.attributes.id ?? bondId;
     const ref = { objectId, bondId };
     context.bondRefsByCdxmlId.set(cdxmlBondId, ref);
