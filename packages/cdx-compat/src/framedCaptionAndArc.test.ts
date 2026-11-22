@@ -138,6 +138,23 @@ it("resolves 40,000 caption runs against 40,000 fonts with linear work", () => {
   expect(saved.result.contents.match(/<font /g)).toHaveLength(40_000);
 });
 
+// Codex: Save As wrote an edited caption by scanning the font table for every run (the
+// 40,000-font, 40,000-run file took ~68 s); fonts are looked up by name, so saving is linear too.
+it("saves an edited 40,000-run caption against 40,000 fonts with linear work", () => {
+  const opened = openChemDraftPayload(`<CDXML>${fontTable(40_000)}<page>${caption(9, 40_000, 40_000)}</page></CDXML>`);
+  const [text] = textsOf(opened);
+  text.spans[0].text = "y";
+  text.text = `y${text.text.slice(1)}`;
+  const saved = counted(() => exportDocumentToCdxml(opened.document!, plain));
+  expect(saved.operations).toBeLessThanOrEqual(4 * (40_000 + 40_000));
+  expect(saved.result.warnings).toEqual([]);
+  expect(saved.result.contents.match(/<s font="40000" size="10" face="0">/g)).toHaveLength(40_000);
+  expect(saved.result.contents).toContain('<s font="40000" size="10" face="0">y</s>');
+  const [again] = textsOf(openChemDraftPayload(saved.result.contents));
+  expect(again?.text).toBe(text.text);
+  expect(again?.spans[0]?.style.fontFamily).toBe("Font40000");
+});
+
 it("resolves a duplicated font id to its first entry, as before", () => {
   const source = '<CDXML><fonttable><font id="3" charset="iso-8859-1" name="Arial"/><font id="3" charset="iso-8859-1" name="Times"/></fonttable>' +
     `<page>${caption(9, 1, 3)}</page></CDXML>`;

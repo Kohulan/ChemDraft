@@ -2263,7 +2263,7 @@ function exportTableObject(
 ): string {
   const layout = planTableLayout(table);
   const style = nativeTextStyleFromObjectStyle(table.style);
-  const font = fonts.table.find(font => font.name === style.fontFamily)?.id ?? "1";
+  const font = lookupCdxmlFont(fonts.byName, style.fontFamily)?.id ?? "1";
   const texts: string[] = [];
   const writeLines = (lines: typeof layout.cells[number]["lines"], fontSizePx: number) => {
     for (const line of lines) {
@@ -2336,7 +2336,8 @@ function exportFramedCaption(text: TextObject, id: string, fonts: CdxmlExportFon
   for (const span of textObjectSpansForRendering(text)) {
     if (Object.keys(span.style).some(k => !runKeys.includes(k))) return undefined;
     const style = { ...text.style, ...span.style };
-    const font = fonts.table.find(f => f.name === style.fontFamily);
+    // A name lookup, not a scan of the font table per run: Save As stays linear like opening.
+    const font = lookupCdxmlFont(fonts.byName, style.fontFamily);
     if (!font || typeof style.fontSizePx !== "number" || !(style.fontSizePx > 0) ||
         ![400, 700].includes(Number(style.fontWeight ?? 400)) ||
         !["normal", "italic"].includes(String(style.fontStyle ?? "normal")) ||
