@@ -4,6 +4,43 @@ import { moveDocumentObject, moveNativeMoleculeParts, normalizeCommittedDocument
 import { exportDocumentToCdx, exportDocumentToCdxml, importCdx, openChemDraftPayload } from "./index";
 
 describe("electron-mark CDXML appearance warnings", () => {
+  it("keeps lone-pair geometry, color and a forward atom reference through plain CDXML and CDX", () => {
+    const source = '<CDXML><colortable><color r="1" g="0" b="1"/></colortable><page>' +
+      '<graphic id="3" GraphicType="Symbol" SymbolType="LonePair" color="2" BoundingBox="70 72 67 68">' +
+      '<represent object="21" attribute="Radical"/></graphic><fragment id="8"><n id="20" Element="6" p="48 64"/>' +
+      '<n id="21" Element="8" p="70 64"/><b id="22" B="20" E="21" Order="1"/></fragment></page></CDXML>';
+    const document = openChemDraftPayload(source).document!;
+    const mark = document.pages[0].objects[0] as ElectronMarkObject;
+    expect(mark.markKind).toBe("lone-pair");
+    mark.x += 4; mark.y += 8; mark.rotation = 90;
+    for (const embedNativePayload of [false, true]) {
+      const xml = exportDocumentToCdxml(document, { embedNativePayload });
+      const binary = exportDocumentToCdx(document, { embedNativePayload });
+      for (const result of [xml, binary]) expect(result.warnings).toEqual([]);
+      expect(xml.contents).toContain('BoundingBox="73 78 73 73"');
+      expect(xml.contents.match(/SymbolType="LonePair"/g)).toHaveLength(1);
+      const reference = xml.contents.match(/<represent object="(\d+)" attribute="Radical"/)?.[1];
+      expect(reference).toBeTruthy();
+      expect(xml.contents).toMatch(new RegExp(`<n (?=[^>]*id="${reference}")(?=[^>]*Element="8")`));
+      expect(xml.contents).not.toContain(' Radical="Doublet"');
+      for (const read of [openChemDraftPayload(xml.contents), importCdx(binary.bytes)]) {
+        const objects = read.document!.pages[0].objects;
+        const pair = objects.find(o => o.type === "electron-mark") as ElectronMarkObject;
+        const molecule = objects.find(o => o.type === "molecule") as MoleculeObject;
+        expect(pair.anchor).toMatchObject({ kind: "atom", objectId: molecule.id, atomId: molecule.atoms[1].id });
+        expect(pair.style.color).toBe("#ff00ff");
+        expect(pair.x).toBeCloseTo(mark.x, 3);
+        expect(pair.y).toBeCloseTo(mark.y, 3);
+        expect(pair.width).toBeCloseTo(mark.width, 3);
+        expect(pair.rotation).toBe(90);
+        expect(molecule.atoms[1].markRadicals ?? 0).toBe(0);
+      }
+    }
+    const orphan = openChemDraftPayload(source.replace('object="21"', 'object="99"'));
+    expect(orphan.warnings.some(w => w.code === "cdxml.lone_pair_anchor_unresolved")).toBe(true);
+    expect(orphan.document!.pages[0].objects[0]).toMatchObject({ anchor: { kind: "point" } });
+  });
+
   it.each([false, true])("warns when moving an imported doublet atom leaves its dot behind (legacy=%s)", legacy => {
     const imported = openChemDraftPayload('<CDXML><page><fragment id="1"><n id="2" p="100 100" Element="6" Radical="Doublet"/></fragment></page></CDXML>').document!;
     const molecule = imported.pages[0].objects.find((object): object is MoleculeObject => object.type === "molecule")!;
