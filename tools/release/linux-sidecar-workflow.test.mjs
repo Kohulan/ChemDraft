@@ -51,9 +51,12 @@ test("the Linux package build ships the committed sidecar it verified and never 
   const cleanBefore = at("- name: Check the source tree is clean before the bundle build");
   const bundle = at("pnpm --filter @chemdraft/desktop build --bundles deb,appimage");
   const clean = at("- name: Check the source tree is still clean after the bundle build");
-  const debCheck = at('cmp apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu "$payload/usr/bin/avogadro3d-sidecar"');
-  const debSidecarCheck = at('node scripts/check-engine3d-sidecar.mjs "$payload/usr/bin/avogadro3d-sidecar"');
-  const appImageCheck = at('check-engine3d-sidecar.mjs" squashfs-root/usr/bin/avogadro3d-sidecar');
+  // Both packages' sidecars are compared with the pinned SHA-256 itself, not only with the checkout.
+  const debCheck = at('node scripts/verify-committed-linux-sidecar.mjs --packaged "$payload/usr/bin/avogadro3d-sidecar"');
+  const appImageStage = at('install -m 0755 -- "$GITHUB_WORKSPACE/apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu" "$sidecar"');
+  const squash = at("mksquashfs squashfs-root app.squashfs");
+  const reextract = at("../repacked.AppImage --appimage-extract");
+  const appImageCheck = at('verify-committed-linux-sidecar.mjs" --packaged squashfs-root/usr/bin/avogadro3d-sidecar');
   const record = at('record-build.mjs --artifact "$DEB"');
   assert.ok(verify < at("- name: Install Linux build dependencies") && verify < bundle);
   // Nothing may run between the clean-tree check and the bundle build: vite.config.ts stamps
@@ -63,10 +66,13 @@ test("the Linux package build ships the committed sidecar it verified and never 
   const guard = build.slice(cleanBefore, bundle);
   assert.match(guard, /cargo metadata --locked [^\n]*apps\/desktop\/src-tauri\/Cargo\.toml/);
   assert.match(guard, /dirty=\$\(git status --porcelain --untracked-files=normal\)\n\s+\[ -z "\$dirty" \] \|\| \{ printf '::error::[^']*\\n%s\\n' "\$dirty"; exit 1; \}/);
-  assert.ok(bundle < clean && clean < debCheck && debCheck < debSidecarCheck && debSidecarCheck < appImageCheck && appImageCheck < record);
-  // Packaging neither builds the sidecar nor touches the tracked file.
+  assert.ok(bundle < clean && clean < debCheck && debCheck < appImageStage && appImageStage < squash);
+  assert.ok(squash < reextract && reextract < appImageCheck && appImageCheck < record);
+  assert.match(build, /sidecar="\$appdir\/usr\/bin\/avogadro3d-sidecar"\n\s+test -f "\$sidecar" \|\|/);
+  assert.doesNotMatch(build, /check-engine3d-sidecar\.mjs/, "packaged sidecars go through the pin, which runs the same checks");
+  // Packaging neither builds the sidecar nor touches the tracked file: nothing is written into binaries/.
   assert.doesNotMatch(build, /cmake|_deps|native\/avogadro3d-sidecar\/build/);
-  assert.doesNotMatch(build, /git checkout --|install -m 0755 [^\n]*binaries\//);
+  assert.doesNotMatch(build, /git checkout --|(install|cp|mv) [^\n]*binaries\/\S*"?\s*$/m);
 });
 
 test("the Linux CMake preset matches the shipped sidecar options and links only glibc dynamically", () => {

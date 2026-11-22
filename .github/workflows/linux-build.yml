@@ -77,7 +77,8 @@ jobs:
       # builds it from the pinned sources and a maintainer commits it. Packaging never builds it or
       # writes over it; it checks that the committed file is that build (SHA-256 pinned in
       # scripts/engine3d-sidecar-linux.json), a native x86-64 ELF needing at most glibc 2.35, and
-      # completes the protocol handshake. It fails while the pin is still pending.
+      # completes the protocol handshake. It fails while the pin is still pending. The sidecars in the
+      # finished .deb and AppImage are checked against the same pin below.
       - name: Verify the committed x86_64 Linux 3D sidecar
         run: |
           set -euo pipefail
@@ -177,11 +178,11 @@ jobs:
           for path in usr/bin/chemdraft usr/bin/avogadro3d-sidecar usr/lib/ChemDraft/resources/opsin/jre/bin/java $licences; do
             grep -qxF "$path" <<<"$contents" || { echo "::error::$deb lacks $path"; exit 1; }
           done
-          # Its sidecar must be the committed binary verified above, never a placeholder.
+          # Its sidecar must be the pinned build (scripts/engine3d-sidecar-linux.json) byte for byte,
+          # never a placeholder, and complete the handshake.
           payload=$(mktemp -d)
           dpkg-deb -x "$deb" "$payload"
-          cmp apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu "$payload/usr/bin/avogadro3d-sidecar" || { echo "::error::$deb does not carry the committed 3D sidecar verified above."; exit 1; }
-          node scripts/check-engine3d-sidecar.mjs "$payload/usr/bin/avogadro3d-sidecar"
+          node scripts/verify-committed-linux-sidecar.mjs --packaged "$payload/usr/bin/avogadro3d-sidecar" || { echo "::error::$deb does not carry the pinned 3D sidecar."; exit 1; }
           rm -rf -- "$payload"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "deb=$deb" >> "$GITHUB_OUTPUT"
@@ -242,6 +243,12 @@ jobs:
           fi
           bash -n "$gtk_hook"
 
+          # Ship the committed sidecar verified against the pin, not linuxdeploy's copy, which may have
+          # had its RUNPATH rewritten (the sidecar needs no bundled library). Tauri put it here.
+          sidecar="$appdir/usr/bin/avogadro3d-sidecar"
+          test -f "$sidecar" || { echo '::error::The AppImage has no usr/bin/avogadro3d-sidecar.'; exit 1; }
+          install -m 0755 -- "$GITHUB_WORKSPACE/apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu" "$sidecar"
+
           # The AppImage runtime reads only zlib or zstd.
           mksquashfs squashfs-root app.squashfs -noappend -all-root -comp zstd -no-progress
           head -c "$offset" "$image" > repacked.AppImage
@@ -252,8 +259,8 @@ jobs:
           cd verify
           ../repacked.AppImage --appimage-extract > repacked-extraction.log
           test -x squashfs-root/AppRun
-          # linuxdeploy may rewrite the sidecar's RUNPATH, so check the copy itself, not its bytes.
-          node "$GITHUB_WORKSPACE/scripts/check-engine3d-sidecar.mjs" squashfs-root/usr/bin/avogadro3d-sidecar
+          # The shipped payload's sidecar must be the pinned build byte for byte and complete the handshake.
+          node "$GITHUB_WORKSPACE/scripts/verify-committed-linux-sidecar.mjs" --packaged squashfs-root/usr/bin/avogadro3d-sidecar || { echo "::error::$APPIMAGE does not carry the pinned 3D sidecar."; exit 1; }
           echo 'Shared libraries under usr/lib in the repacked AppImage:'
           find squashfs-root/usr/lib \( -type f -o -type l \) \( -name '*.so' -o -name '*.so.*' \) -print | LC_ALL=C sort
           leftovers=$(find squashfs-root \( "${host_libs[@]}" \) -print)

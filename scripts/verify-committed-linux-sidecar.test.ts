@@ -1,11 +1,14 @@
-import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, describe, expect, it } from "vitest";
 import {
   committedSidecarProblem,
   isSidecarPlaceholder,
   PENDING,
   readLinuxSidecarPin,
-  sha256Hex
+  sha256Hex,
+  verifyPackagedLinuxSidecar
 } from "./verify-committed-linux-sidecar.mjs";
 
 const read = (path: string) => readFileSync(new URL(`../${path}`, import.meta.url));
@@ -57,5 +60,40 @@ describe("committedSidecarProblem", () => {
 
   it("accepts the pinned bytes", () => {
     expect(committedSidecarProblem(bytes, filled)).toBeUndefined();
+  });
+
+  it("names a packaged payload's sidecar in place of the committed path", () => {
+    expect(committedSidecarProblem(Buffer.from("other"), filled, "payload/usr/bin/avogadro3d-sidecar"))
+      .toMatch(/^payload\/usr\/bin\/avogadro3d-sidecar has SHA-256 [0-9a-f]{64}; /);
+  });
+});
+
+describe("verifyPackagedLinuxSidecar", () => {
+  const root = mkdtempSync(join(tmpdir(), "linux-sidecar-pin-"));
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  const pinned = Buffer.from("\x7fELF pinned build");
+  mkdirSync(join(root, "scripts"));
+  writeFileSync(join(root, "scripts", "engine3d-sidecar-linux.json"), JSON.stringify({
+    path: "apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu",
+    buildWorkflow: ".github/workflows/linux-sidecar-build.yml",
+    buildRunId: "42",
+    sha256: sha256Hex(pinned)
+  }));
+  const payload = (name: string, contents: Buffer) => {
+    const path = join(root, name);
+    writeFileSync(path, contents, { mode: 0o755 });
+    return path;
+  };
+  const verify = (path: string) => verifyPackagedLinuxSidecar(path, { rootDir: root, log: () => undefined });
+
+  it("refuses a payload sidecar whose bytes differ from the pin, before running it", async () => {
+    const stale = payload("stale", Buffer.from("\x7fELF a different build"));
+    await expect(verify(stale)).rejects.toThrow(`${stale} has SHA-256 ${sha256Hex(Buffer.from("\x7fELF a different build"))}; `);
+    await expect(verify(stale)).rejects.toThrow(`scripts/engine3d-sidecar-linux.json pins ${sha256Hex(pinned)} (run 42).`);
+  });
+
+  it("refuses a missing payload sidecar and the placeholder", async () => {
+    await expect(verify(join(root, "absent"))).rejects.toThrow(/absent is missing\./);
+    await expect(verify(payload("placeholder", Buffer.from("ChemDraft avogadro3d-sidecar placeholder.")))).rejects.toThrow(/is the placeholder/);
   });
 });

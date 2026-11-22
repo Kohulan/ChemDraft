@@ -48,11 +48,13 @@ The workflow:
    (`CHEMDRAFT_STABLE_BUILD=1`, no worktree label) and fails if the bundle build left the tree
    dirty. Any failure fails the job.
 4. Checks the bundle identity and that the `.deb` carries `chemdraft`, the 3D sidecar and the
-   OPSIN runtime. The `.deb`'s sidecar must be byte-identical to the committed file and pass the
-   handshake, and so must the repacked AppImage's copy (by the handshake; linuxdeploy may rewrite
-   its RUNPATH).
-5. Repacks the AppImage after Tauri bundles it. It uses the host's Wayland and compiler runtime
-   libraries and the host's `libgpg-error.so.0`. It also removes the bundled copies of libraries
+   OPSIN runtime. The `.deb`'s sidecar must have the SHA-256 pinned in
+   `scripts/engine3d-sidecar-linux.json` and pass the same checks as the committed file
+   (`scripts/verify-committed-linux-sidecar.mjs --packaged`).
+5. Repacks the AppImage after Tauri bundles it. It replaces linuxdeploy's copy of the sidecar
+   (whose RUNPATH linuxdeploy may rewrite) with the committed file verified in step 2, and after
+   repacking re-extracts the AppImage and checks that copy against the pin the same way. It uses
+   the host's Wayland and compiler runtime libraries and the host's `libgpg-error.so.0`. It also removes the bundled copies of libraries
    that host Mesa (`libEGL_mesa`, `libgallium`, `libgbm`, the DRI drivers) depends on, so the
    Ubuntu 22.04 copies never shadow the host's newer ones: `libzstd.so*`, `libelf.so*` and
    `libelf-*.so`, `libffi.so*`, `libXau.so*`, `libXdmcp.so*`, `libxcb-randr.so*`,
