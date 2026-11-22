@@ -368,6 +368,8 @@ interface ImportPageContext {
   fonts: readonly CdxmlFont[];
   curveLineDefaults: Record<string, string>;
   preserveReactionIds: boolean;
+  /** Every node id a lone pair may reference, abbreviation aliases included; undefined when ambiguous. */
+  atomAnchorsBySourceId: Map<string, Anchor | undefined>;
 }
 
 type DoubleBondSide = NonNullable<MoleculeBond["display"]>["doubleBondSide"];
@@ -3696,7 +3698,8 @@ function importPageObjects(
     colorTable,
     fonts,
     curveLineDefaults: { ...curveLineDefaults, ...cdxmlCurveLineDefaults(pageElement.attributes) },
-    preserveReactionIds: findElements(pageElement.children, "scheme").length > 0 || findElements(pageElement.children, "step").length > 0
+    preserveReactionIds: findElements(pageElement.children, "scheme").length > 0 || findElements(pageElement.children, "step").length > 0,
+    atomAnchorsBySourceId: new Map()
   };
   const schemes: XmlElementView[] = [];
   // A step need not have a scheme wrapper. Collect these even inside containers whose
@@ -3872,15 +3875,8 @@ function importPageObjects(
     objects.push(...importElement(element).objects);
   }
   if (lonePairRefs.size) {
-    const anchors = new Map<string, Anchor | undefined>();
-    for (const object of objects) {
-      if (object.type !== "molecule") continue;
-      for (const [atomId, sourceId] of Object.entries(preservedCurveAttributes(object.compatibility?.unknown.cdxmlAtomIdsByAtomId))) {
-        anchors.set(sourceId, anchors.has(sourceId) ? undefined : { kind: "atom", objectId: object.id, atomId });
-      }
-    }
     for (const [mark, ref] of lonePairRefs) {
-      const anchor = anchors.get(ref);
+      const anchor = context.atomAnchorsBySourceId.get(ref);
       if (anchor) mark.anchor = anchor;
       else warnings.push({ code: "cdxml.lone_pair_anchor_unresolved", sourceObjectId: mark.id,
         message: `Lone-pair symbol has no unique atom with id "${ref}"; imported at its drawn position without an atom attachment.` });
@@ -4613,6 +4609,18 @@ function importFragment(
       attachmentPoints: attachmentAtomId ? [{ kind: "atom" as const, objectId, atomId: attachmentAtomId }] : [], warnings: [] }];
   });
 
+  // A source id shared by two nodes names neither: keep it out so no reference resolves to one.
+  const uniqueSourceIds = [...atomIdByCdxmlId].filter(([sourceId]) =>
+    atomElements.filter(atomElement => atomElement.attributes.id === sourceId).length < 2);
+  if (context.preserveReactionIds) {
+    // Lone pairs resolve through every id, so an expanded abbreviation node and its nested
+    // attachment atom both name that atom; the reversed map below keeps only one of them.
+    for (const [sourceId, atomId] of uniqueSourceIds) {
+      context.atomAnchorsBySourceId.set(sourceId, context.atomAnchorsBySourceId.has(sourceId)
+        ? undefined : { kind: "atom", objectId, atomId });
+    }
+  }
+
   return {
     id: objectId,
     type: "molecule",
@@ -4647,10 +4655,7 @@ function importFragment(
         ...(abbreviationRecords.length ? { cdxmlAbbreviations: abbreviationRecords } : {}),
         ...(Object.keys(cdxmlAbbreviationAttachmentsByBondId).length ? { cdxmlAbbreviationAttachmentsByBondId } : {}),
         ...(context.preserveReactionIds ? {
-          // A source id shared by two nodes names neither: keep it out so no reference resolves to one.
-          cdxmlAtomIdsByAtomId: Object.fromEntries([...atomIdByCdxmlId].filter(([sourceId]) =>
-            atomElements.filter(atomElement => atomElement.attributes.id === sourceId).length < 2)
-            .map(([sourceId, atomId]) => [atomId, sourceId])),
+          cdxmlAtomIdsByAtomId: Object.fromEntries(uniqueSourceIds.map(([sourceId, atomId]) => [atomId, sourceId])),
           cdxmlBondIdsByBondId: Object.fromEntries(cdxmlIdByBondId)
         } : {}),
         ...(Object.keys(cdxmlAtomStereochemistryByAtomId).length > 0 ? { cdxmlAtomStereochemistryByAtomId } : {}),

@@ -69,6 +69,32 @@ describe("electron-mark CDXML appearance warnings", () => {
     expect(pair.anchor).toMatchObject({ kind: "point" });
   });
 
+  // CodeRabbit 4658691387: an expanded abbreviation node (10) aliases its nested attachment atom (12).
+  // Both ids name the same oxygen, so a lone pair may reference either; neither is a duplicate.
+  it.each(["12", "10"])("attaches a lone pair referencing %s to the attachment atom of an expanded OMe", reference => {
+    const source = '<CDXML><page><graphic id="3" GraphicType="Symbol" SymbolType="LonePair" BoundingBox="92 72 89 68">' +
+      `<represent object="${reference}" attribute="Radical"/></graphic><fragment id="1"><n id="2" Element="6" p="48 64"/>` +
+      '<n id="10" NodeType="Fragment" p="70 64"><fragment id="11"><n id="12" Element="8" p="70 64"/>' +
+      '<n id="13" Element="6" p="92 64"/><n id="14" NodeType="ExternalConnectionPoint" p="48 64"/>' +
+      '<b id="15" B="14" E="12" Order="1"/><b id="16" B="12" E="13" Order="1"/></fragment>' +
+      '<t p="66 68"><s font="3" size="10" face="96">OMe</s></t></n><b id="5" B="2" E="10" Order="1"/></fragment></page></CDXML>';
+    const read = openChemDraftPayload(source);
+    expect(read.warnings.filter(w => w.code === "cdxml.lone_pair_anchor_unresolved")).toEqual([]);
+    const objects = read.document!.pages[0].objects;
+    const molecule = objects.find(o => o.type === "molecule") as MoleculeObject;
+    const oxygen = molecule.atoms.find(atom => atom.element === "O")!;
+    const pair = objects.find(o => o.type === "electron-mark") as ElectronMarkObject;
+    expect(pair.anchor).toMatchObject({ kind: "atom", objectId: molecule.id, atomId: oxygen.id });
+    // Plain Save As keeps the attachment: the written reference resolves to the same oxygen.
+    const reread = openChemDraftPayload(exportDocumentToCdxml(read.document!, { embedNativePayload: false }).contents);
+    expect(reread.warnings.filter(w => w.code === "cdxml.lone_pair_anchor_unresolved")).toEqual([]);
+    const rereadObjects = reread.document!.pages[0].objects;
+    const rereadMolecule = rereadObjects.find(o => o.type === "molecule") as MoleculeObject;
+    const rereadPair = rereadObjects.find(o => o.type === "electron-mark") as ElectronMarkObject;
+    expect(rereadPair.anchor).toMatchObject({ kind: "atom", objectId: rereadMolecule.id,
+      atomId: rereadMolecule.atoms.find(atom => atom.element === "O")!.id });
+  });
+
   it.each([false, true])("warns when moving an imported doublet atom leaves its dot behind (legacy=%s)", legacy => {
     const imported = openChemDraftPayload('<CDXML><page><fragment id="1"><n id="2" p="100 100" Element="6" Radical="Doublet"/></fragment></page></CDXML>').document!;
     const molecule = imported.pages[0].objects.find((object): object is MoleculeObject => object.type === "molecule")!;
