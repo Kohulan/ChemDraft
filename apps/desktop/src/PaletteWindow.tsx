@@ -32,7 +32,7 @@ import { ToolbarCustomizeController } from "./toolbars/CustomizeMainToolbar/Tool
 import { CustomizeBar } from "./toolbars/CustomizeMainToolbar/CustomizeBar";
 import { GalleryTray } from "./toolbars/CustomizeMainToolbar/GalleryTray";
 import { SHELL_COMMAND_IDS } from "./shellCommandIds";
-import { useSessionUnavailableCommandIds } from "./sessionUnavailableCommands";
+import { useSessionUnavailableCommandIds, withoutSessionUnavailableCommands } from "./sessionUnavailableCommands";
 import {
   createDesktopToolsetRegistry,
   desktopToolsetRegistry,
@@ -292,9 +292,13 @@ export function PaletteWindow({
   // palettes. The state initializer above is only a first-paint fallback before that handshake.
   // Snapshots arrive already remapped for the active keybinding scheme; re-applying here covers the
   // first-paint fallback and live scheme flips (the transform is idempotent by command id).
+  // The fallback specs are built before the sidecar status is known: filter them too, so the
+  // Customize gallery and shortcuts never offer what the palette leaves out.
   const allCommands = useMemo(
-    () => applyKeybindingSchemeToCommands(commandSpecs, keybindingScheme, shortcutOverrides),
-    [commandSpecs, keybindingScheme, shortcutOverrides]
+    () => applyKeybindingSchemeToCommands(
+      withoutSessionUnavailableCommands(commandSpecs, unavailableCommandIds), keybindingScheme, shortcutOverrides
+    ),
+    [commandSpecs, keybindingScheme, shortcutOverrides, unavailableCommandIds]
   );
   const galleryCommands = useMemo(
     () => filterToolbarCustomizationCommands(allCommands, compoundLayoutSettings),

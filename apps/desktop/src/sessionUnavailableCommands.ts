@@ -28,6 +28,18 @@ export function sessionUnavailableCommandIds(
   return sidecar?.available === false ? INTERACTIVE_3D_UNAVAILABLE : NONE;
 }
 
+/**
+ * `commands` without the session's unavailable ones, for command lists built before the status was
+ * known (a palette's fallback specs feed its Customize gallery and shortcuts). The same array when
+ * nothing is unavailable.
+ */
+export function withoutSessionUnavailableCommands<T extends { readonly id: string }>(
+  commands: readonly T[],
+  unavailable: ReadonlySet<string>
+): readonly T[] {
+  return unavailable.size === 0 ? commands : commands.filter(command => !unavailable.has(command.id));
+}
+
 /** Read once per window: the bundled sidecar is fixed for the life of the process. */
 export function useSessionUnavailableCommandIds(desktop: boolean = isDesktopRuntime()): ReadonlySet<string> {
   // Without a desktop bridge the answer is already known; with one it is pending until the status.

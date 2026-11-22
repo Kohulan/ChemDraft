@@ -61,7 +61,7 @@ describe("double-bond position commands", () => {
 });
 import { allShellCommands, convertTextToAtomLabelCommandId, structureInteractive3dCommandId, structureSpin3dCommandId } from "./commands";
 import type { Engine3dSidecarStatus } from "./engine3dSidecar";
-import { sessionUnavailableCommandIds } from "./sessionUnavailableCommands";
+import { sessionUnavailableCommandIds, withoutSessionUnavailableCommands } from "./sessionUnavailableCommands";
 import { filterToolbarCustomizationCommands } from "./toolbars/toolbarCustomizationCommands";
 import { editActions, fragmentAtomDrawingHotkeys, fragmentBondDrawingHotkeys, fragmentSproutCommandId, fragmentSproutCommands, fragmentSproutKindForCommand } from "./commands";
 import { createPhase4Document, insertNativeSingleBondMolecule, insertNativeTextObject, getSelectedMolecule, selectDocumentObjects } from "./documentWorkflow";
@@ -355,5 +355,17 @@ describe("Interactive 3D availability", () => {
     // Customize gallery: built from the shell commands, so it never offers the tool either.
     expect(filterToolbarCustomizationCommands(commands(sidecar(false)), { enabled: true }).map(command => command.id))
       .not.toContain(structureInteractive3dCommandId);
+  });
+
+  it("is filtered out of command lists built before the sidecar status was known", () => {
+    // A palette's fallback specs come from allShellCommands with no session filter.
+    const fallback = commands(sidecar(true));
+    expect(fallback.map(command => command.id)).toContain(structureInteractive3dCommandId);
+    const shown = withoutSessionUnavailableCommands(fallback, sessionUnavailableCommandIds(sidecar(false), true));
+    expect(shown.map(command => command.id)).not.toContain(structureInteractive3dCommandId);
+    expect(shown.map(command => command.id)).toContain(structureSpin3dCommandId);
+    expect(filterToolbarCustomizationCommands(shown, { enabled: true }).map(command => command.id))
+      .not.toContain(structureInteractive3dCommandId);
+    expect(withoutSessionUnavailableCommands(fallback, new Set())).toBe(fallback);
   });
 });
