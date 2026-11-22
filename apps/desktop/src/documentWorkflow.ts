@@ -9514,13 +9514,17 @@ export function applyNativeAtomProblemFix(
 ): { document: ChemDraftDocument; label: string; status: string } | undefined {
   const molecule = document.pages.flatMap(page => page.objects).find(object => object.id === objectId);
   if (molecule?.type !== "molecule" || !isEditableNativeMoleculeGraph(molecule)) return undefined;
-  const fix = atomProblem(molecule, atomId)?.fixes.find(fix => fix.action === action);
-  if (!fix) return undefined;
+  const problem = atomProblem(molecule, atomId);
+  const fix = problem?.fixes.find(fix => fix.action === action);
+  if (!problem || !fix) return undefined;
   const atom = molecule.atoms.find(atom => atom.id === atomId)!;
   const name = JSON.stringify(atom.element || "atom");
+  // A stated count that disagreed is fixed by dropping it: the atom then counts what its bonds give.
+  const derivedHydrogens = fix.atom.hydrogenCount === undefined ? problem.state.statedHydrogens?.derived : undefined;
   const status = action === "ignore" ? `Warning ignored for ${name}`
     : action === "restore" ? `Warning restored for ${name}`
     : action === "charge" ? `Formal charge set to ${fix.atom.formalCharge > 0 ? "+" : ""}${fix.atom.formalCharge} for ${name}`
+    : derivedHydrogens !== undefined ? `Hydrogen count set to the derived ${derivedHydrogens} for ${name}`
     : `Explicit hydrogens set to ${fix.atom.hydrogenCount} for ${name}`;
   const atoms = molecule.atoms.map(atom => atom.id === atomId ? fix.atom : atom);
   const updated = refreshNativeSingleBondGraph(molecule, atoms, molecule.bonds);

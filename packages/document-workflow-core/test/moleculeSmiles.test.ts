@@ -128,8 +128,13 @@ it("reparses native radical spelling with a branched traversal in a different at
   molecule.atoms[0]!.hydrogenCount = 2;
   const changedWarnings: ExportWarning[] = [];
   await moleculeSmiles(molecule, 0, changedWarnings, computeStructureIdentifiers);
-  expect(changedWarnings).toEqual([expect.objectContaining({ code: "export.smiles_hydrogen_loss",
-    message: "Atom a0 (C) is drawn with 2 total hydrogens; SMILES reparses with 3 total hydrogens." })]);
+  // The count disagrees with the derived one on an atom with no aromatic bond, so the atom is also
+  // badged, and the badge is an export warning of its own (owner ruling 1.2.3).
+  expect(changedWarnings).toEqual([
+    expect.objectContaining({ code: "export.invalid_structure", message: "C1 states 2 H, but its bonds and charge give 3." }),
+    expect.objectContaining({ code: "export.smiles_hydrogen_loss",
+      message: "Atom a0 (C) is drawn with 2 total hydrogens; SMILES reparses with 3 total hydrogens." })
+  ]);
 });
 
 describe.each([

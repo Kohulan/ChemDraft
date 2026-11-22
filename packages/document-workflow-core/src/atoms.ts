@@ -15,6 +15,7 @@ import {
   type MoleculeObject
 } from "@chemdraft/chem-core";
 import {
+  atomImplicitHydrogenCount,
   dativeDeprotonationCount,
   nativeAtomChargeIsExpressible,
   nativeAtomLabelReading,
@@ -97,6 +98,12 @@ export interface NativeAtomValidationState {
   tautomerGuessed?: true;
   /** Set when the label is not an element, a condensed formula, an abbreviation or a placeholder. */
   unrecognizedLabel?: true;
+  /**
+   * Set when an atom with no aromatic bond states a hydrogen count (`hydrogenCount`, a CDXML
+   * NumHydrogens) that disagrees with the count derived from its bonds, charge and radicals. The
+   * stated count is kept (owner ruling 1.2.3); `derived` is what the label and formula count.
+   */
+  statedHydrogens?: { stated: number; derived: number };
 }
 
 /**
@@ -296,8 +303,50 @@ export function nativeAtomValidationState(
   atoms: readonly MoleculeAtom[] = [atom],
   resolution: NativeBondOrderResolution = nativeBondOrderResolution(atoms, bonds)
 ): NativeAtomValidationState {
-  const state = nativeAtomDiagnostic(atom, bonds, effectiveFormalCharge, atoms, resolution);
+  const diagnostic = nativeAtomDiagnostic(atom, bonds, effectiveFormalCharge, atoms, resolution);
+  const state = diagnostic.valid
+    ? nativeStatedHydrogenDiagnostic(atom, bonds, effectiveFormalCharge, atoms, resolution) ?? diagnostic
+    : diagnostic;
   return atom.warningSuppressed === true ? { ...state, warningSuppressed: true } : state;
+}
+
+/**
+ * A stated count on an atom with no aromatic bond is the source's count for that atom, not a
+ * Kekulé constraint. Owner ruling (1.2.3): where it disagrees with the count derived from the bonds,
+ * charge and radicals (layout-engine's `atomImplicitHydrogenCount`, the count the drawn label and
+ * formula use) it is kept and badged, like any under- or over-filled atom. Checked only once the
+ * atom is otherwise valid, so a valence or charge problem is reported (and fixed) first. A typed
+ * literal label spells its own hydrogens and has its own check; a carbon bonded only datively has
+ * no single derived count, so neither is judged here.
+ */
+function nativeStatedHydrogenDiagnostic(
+  atom: MoleculeAtom,
+  bonds: readonly MoleculeBond[],
+  effectiveFormalCharge: number,
+  atoms: readonly MoleculeAtom[],
+  resolution: NativeBondOrderResolution
+): NativeAtomValidationState | undefined {
+  const stated = atom.hydrogenCount;
+  if (stated === undefined || atom.labelLiteral === true) return undefined;
+  const element = nativeElementFromAtomLabel(atom.element);
+  if (!element) return undefined;
+  // An atom on an aromatic bond is judged by the Kekulé check in `nativeAtomDiagnostic`.
+  if (bonds.some((bond) => bond.order === "aromatic" && (bond.fromAtomId === atom.id || bond.toAtomId === atom.id))) {
+    return undefined;
+  }
+  const derived = atomImplicitHydrogenCount({ ...atom, formalCharge: effectiveFormalCharge }, bonds, atoms, resolution);
+  if (derived === undefined || derived === stated) return undefined;
+  return {
+    atomId: atom.id,
+    element,
+    valenceUsed: (resolution.bondOrderUsage.get(atom.id) ?? 0) + (atom.markRadicals ?? 0),
+    formalCharge: effectiveFormalCharge,
+    valid: false,
+    statedHydrogens: { stated, derived },
+    invalidReason: `${element} states ${stated} H, but its bonds and charge give ${derived}.`,
+    invalidDetail: `${element} atom ${atom.id} states ${stated} hydrogen${stated === 1 ? "" : "s"} (NumHydrogens), but its bonds and charge give ${derived}; ` +
+      `the stated count is kept, and the drawn label and formula count ${derived} until the count or the atom is changed.`
+  };
 }
 
 function nativeAtomDiagnostic(
@@ -315,9 +364,10 @@ function nativeAtomDiagnostic(
   // have a number, but that number is a guess: say so on the atom rather than let it pass.
   // A stated count is a number, not just an N–H toggle. Check it even on charged atoms and
   // on fallback readings; the warning must say exactly which source constraint could not hold.
-  // The count was stated to settle an aromatic ring; on an atom with no aromatic bond left it
-  // describes a graph that no longer exists, so it is ignored rather than badged. The resolution's
-  // bonds are already rewritten, so an aromatic bond shows as a Kekulé order or an unresolved atom.
+  // Here the count was stated to settle an aromatic ring. A count on an atom with no aromatic bond
+  // is the atom's own and is checked by `nativeStatedHydrogenDiagnostic` once the atom is otherwise
+  // valid. The resolution's bonds are already rewritten, so an aromatic bond shows as a Kekulé
+  // order or an unresolved atom.
   const statedCount = atom.hydrogenCount;
   const hint = statedCount !== undefined && (resolution.unresolvedAtomIds.has(atom.id) ||
     (resolution.bondsByAtom.get(atom.id) ?? []).some((bond) => resolution.kekuleOrders.has(bond.id)))

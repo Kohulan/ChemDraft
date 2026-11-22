@@ -17103,12 +17103,18 @@ describe("aromatic bond orders: one count for the formula, the label and the val
     }
   });
 
-  it("the stated-count check ignores a hint left on an atom with no aromatic bond", () => {
+  it("the stated-count check badges a disagreeing count on an atom with no aromatic bond", () => {
+    // Owner ruling (1.2.3): such a count is the source's count for the atom, kept and badged.
     const graph = testMoleculeFromSmiles("CN");
-    // Bypasses every patch: a stale count on a molecule read straight from storage.
     const atoms = graph.atoms.map((atom) => (atom.element === "N" ? { ...atom, hydrogenCount: 1 } : atom));
-    const molecule = { ...fixtureMolecule(graph, graph.bonds, "mol_stale_hint"), atoms };
-    expect(nativeMoleculeInvalidAtomStates(molecule)).toEqual([]);
+    const molecule = { ...fixtureMolecule(graph, graph.bonds, "mol_stated_hint"), atoms };
+    const nitrogen = atoms.find((atom) => atom.element === "N")!;
+    expect(nativeMoleculeInvalidAtomStates(molecule)).toEqual([expect.objectContaining({
+      atomId: nitrogen.id, statedHydrogens: { stated: 1, derived: 2 }, invalidReason: "N states 1 H, but its bonds and charge give 2."
+    })]);
+    // An agreeing count is no problem at all.
+    const agreeing = { ...molecule, atoms: graph.atoms.map((atom) => (atom.element === "N" ? { ...atom, hydrogenCount: 2 } : atom)) };
+    expect(nativeMoleculeInvalidAtomStates(agreeing)).toEqual([]);
   });
 
   it("relabeling an atom to another element drops a hydrogen count stated for the old one", () => {
