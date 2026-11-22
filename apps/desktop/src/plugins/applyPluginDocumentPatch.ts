@@ -15,7 +15,7 @@ import {
   type NormalizedProposedDocumentPatch
 } from "@chemdraft/plugin-api";
 import { assertPluginDocumentWriteScope, bareIdTargetPage, objectInWriteScope, rebasePluginPatch,
-  retainedCtabCompatibility, storedCtabReference, writePatchOps, type PageObjectRef, type PluginWriteScopePages } from "@chemdraft/plugin-host";
+  retainedCtabCompatibility, storedCtabReference, writePatchOps, type PluginWriteScopePages } from "@chemdraft/plugin-host";
 import { selectionBounds, translateInsertedDocumentObjects } from "../documentWorkflow";
 import { choosePlacement, objectRect, overlaps as boundsOverlap, pageContentRect, RELATIVE_GAP, unionRects } from "../assistant/placement";
 import type { ViewportRect } from "@chemdraft/viewport-engine";
@@ -85,8 +85,10 @@ export function refreshPluginPatchChemistry(before: ChemDraftDocument, draft: Ch
       // An authored atom move can change 2D stereo, but only where geometry defines stereo, and
       // never when every atom moved together keeping every stereo side. Host placement
       // translates an insertion as a unit.
+      // An exact translation keeps every relative position, including degenerate ones such as two
+      // opposite neighbours of a wedged centre, which the side check cannot read as kept.
       const graphChanged = object !== previous && (graphSignature(previous) !== graphSignature(object) ||
-        atomUpdates.has(object.id) && hasGeometryStereo(object) &&
+        atomUpdates.has(object.id) && hasGeometryStereo(object) && !translatedExactly(previous, object) &&
         !(movedAsUnit(previous, object) && keptStereoSides(previous, object)));
       // A write to the stored records must agree with the graph the canvas draws, changed or not.
       const storedChanged = object !== previous && storedUpdates.has(object.id) && storedRecord(previous) !== storedRecord(object);
@@ -211,6 +213,24 @@ function movedAsUnit(before: MoleculeObject, after: MoleculeObject): boolean {
   const zx = real / spread, zy = imaginary / spread;
   if (!(Math.hypot(zx, zy) > 1e-9)) return false;
   return offsets.every(({ ux, uy, vx, vy }) => Math.hypot(vx - (zx * ux - zy * uy), vy - (zx * uy + zy * ux)) <= tolerance);
+}
+
+/** True when the same atoms all moved by one vector, within floating-point rounding of the
+ * coordinates. Every relative position is then unchanged, so no 2D stereo can have changed.
+ * Rotation, reflection, scale or any per-atom difference beyond rounding does not count. */
+function translatedExactly(before: MoleculeObject, after: MoleculeObject): boolean {
+  const start = new Map(before.atoms.map(atom => [atom.id, atom]));
+  if (after.atoms.length !== start.size) return false;
+  const pairs = after.atoms.map(atom => [start.get(atom.id), atom] as const);
+  const [first] = pairs;
+  if (!first?.[0] || pairs.some(([from]) => !from)) return false;
+  const dx = first[1].x - first[0].x, dy = first[1].y - first[0].y;
+  // A few units in the last place of the largest coordinate: x + d - x can differ from d by rounding.
+  let magnitude = 1;
+  for (const [from, to] of pairs) magnitude = Math.max(magnitude, Math.abs(from!.x), Math.abs(from!.y), Math.abs(to.x), Math.abs(to.y));
+  const tolerance = 8 * Number.EPSILON * magnitude;
+  return pairs.every(([from, to]) => Number.isFinite(to.x) && Number.isFinite(to.y) &&
+    Math.abs(to.x - from!.x - dx) <= tolerance && Math.abs(to.y - from!.y - dy) <= tolerance);
 }
 
 /** Smallest |sin| of the angle between a stereo bond and its reference that still reads as a side.
@@ -352,11 +372,8 @@ export function applyPluginDocumentPatch(
   // Record each touched object by page and id: the page an insertion names, and the page chem-core's
   // bare-id op acted on (its first occurrence). A same-id object on another page is never "touched".
   const touched = new Set<string>();
-  const touchedRefs: PageObjectRef[] = [];
   const touch = (pageId: string | undefined, objectId: string) => {
-    if (pageId === undefined || touched.has(`${pageId}\u0000${objectId}`)) return;
-    touched.add(`${pageId}\u0000${objectId}`);
-    touchedRefs.push({ pageId, objectId });
+    if (pageId !== undefined) touched.add(`${pageId}\u0000${objectId}`);
   };
   for (const op of writePatchOps(proposed.patch)) {
     switch (op.op) {
@@ -368,13 +385,18 @@ export function applyPluginDocumentPatch(
       case "setObjectOrder": op.objectIds.forEach((id) => touch(op.pageId, id)); break;
     }
   }
+  const survivingPages = new Set<string>();
   const objectIds = patched.pages.flatMap((page) =>
-    page.objects.filter((object) => touched.has(`${page.id}\u0000${object.id}`)).map((object) => object.id)
+    page.objects.filter((object) => touched.has(`${page.id}\u0000${object.id}`)).map((object) => {
+      survivingPages.add(page.id);
+      return object.id;
+    })
   );
 
   let selected = patched;
   if (objectIds.length > 0) {
-    const page = patched.pages.find((candidate) => touchedRefs.every((ref) => ref.pageId === candidate.id));
+    // Select what survived: a touched object the batch later removed no longer pins a page.
+    const page = survivingPages.size === 1 ? patched.pages.find((candidate) => survivingPages.has(candidate.id)) : undefined;
     if (page) {
       selected = applyPatch(
         patched,
