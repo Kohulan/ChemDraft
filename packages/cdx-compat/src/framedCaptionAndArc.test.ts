@@ -84,3 +84,17 @@ it("retains and resizes explicit straight arrowhead dimensions on plain CDXML ro
   const again = openChemDraftPayload(out.contents).document!;
   expect((again.pages[0].objects[0] as GraphicObject).data.markerEnd?.sizePx).toBe(18);
 });
+
+// CodeRabbit 4658591585: once its heads are removed, a stored arc still saves its own sweep.
+it.each([["0.5", 0.5], ["360", 360], ["-90", -90]])("keeps a stored arc's %s degree sweep after its head is removed", (angular, degrees) => {
+  const end = (d: number) => { const r = d * Math.PI / 180; return `${60 + 30 * Math.cos(r)} ${60 + 20 * Math.sin(r)} 0`; };
+  const source = `<CDXML><page><arrow id="8" AngularSize="${angular}" Center3D="60 60 0" MajorAxisEnd3D="90 60 0" MinorAxisEnd3D="60 80 0" Tail3D="90 60 0" Head3D="${end(degrees)}" BoundingBox="30 40 90 80" HeadSize="900" ArrowheadHead="Full" ArrowheadType="Solid"/></page></CDXML>`;
+  const document = openChemDraftPayload(source).document!;
+  const g = document.pages[0].objects[0] as GraphicObject;
+  expect(g.data.arcSweepRadians).toBeCloseTo(degrees * Math.PI / 180, 10);
+  g.data.markerEnd = undefined; g.data.markerStart = undefined;
+  const output = exportDocumentToCdxml(document, plain);
+  expect(output.contents).toContain(`AngularSize="${angular}"`);
+  const again = openChemDraftPayload(output.contents).document!.pages[0].objects[0] as GraphicObject;
+  expect(again.data.arcSweepRadians).toBeCloseTo(degrees * Math.PI / 180, 6);
+});

@@ -2897,7 +2897,8 @@ function exportGraphicAsCdxmlArrow(
     ...cdxmlArrowheadAttributes(graphic, warnings),
     ...cdxmlArrowShaftAttributes(graphic),
     ...cdxmlStraightHeadDimensions(graphic, warnings, Boolean(stored)),
-    ...(isArc ? [`AngularSize="${escapeXmlAttribute(cdxmlAngularSizeForGraphic(graphic))}"`] : []),
+    ...(isArc ? [`AngularSize="${escapeXmlAttribute(stored ? formatNumber(radiansToDegrees(stored.sweep))
+      : cdxmlAngularSizeForGraphic(graphic))}"`] : []),
     `Head3D="${formatXyPoint(line.end)}"`,
     `Tail3D="${formatXyPoint(line.start)}"`,
     ...(stored?.axes ?? cdxmlLineAxisAttributes(line.start, line.end))
@@ -2908,17 +2909,22 @@ function exportGraphicAsCdxmlArrow(
 // An arc that carries its own ellipse is written as drawn (the renderer's fallbacks for a missing
 // field included); axes from the chord or endpoints from the padded frame would move it.
 function storedArcForCdxml(graphic: GraphicObject, warnings: CompatibilityConversionWarning[]):
-  { start: Point; end: Point; axes: string[] } | undefined {
+  { start: Point; end: Point; sweep: number; axes: string[] } | undefined {
   const d = graphic.data;
   if (d.arcCenter === undefined && d.arcRadiusX === undefined && d.arcRadiusY === undefined) return undefined;
   const finite = (v: unknown) => typeof v === "number" && Number.isFinite(v) ? v : undefined;
   const center = pointMetadata(d.arcCenter) ?? objectCenter(graphic);
   const rx = Math.max(finite(d.arcRadiusX) ?? graphic.width / 2 - 4, 1);
   const ry = Math.max(finite(d.arcRadiusY) ?? graphic.height / 2 - 4, 1);
-  const { startRadians, endRadians } = nativeGraphicArcAngles(graphic);
+  // A valid stored sweep (the reader accepts 0 < |sweep| <= 360 degrees) is written as stored, the
+  // same as the exact writer; only a missing or out-of-range sweep takes the legacy clamp.
+  const storedSweep = finite(d.arcSweepRadians);
+  const sweep = storedSweep && Math.abs(storedSweep) <= 2 * Math.PI ? storedSweep : nativeGraphicArcAngles(graphic).sweepRadians;
+  const startRadians = finite(d.arcStartRadians) ?? -Math.PI / 2 - sweep / 2;
+  const endRadians = startRadians + sweep;
   if (graphic.rotation) warnings.push({ code: "cdxml.arc_rotation_payload_only", sourceObjectId: graphic.id,
     message: `CDXML export: arc arrow ${graphic.id} is written unrotated; its ${formatNumber(graphic.rotation)} degree rotation is kept only in the native payload.` });
-  return { start: ellipsePointAtRadians(center, rx, ry, startRadians), end: ellipsePointAtRadians(center, rx, ry, endRadians),
+  return { start: ellipsePointAtRadians(center, rx, ry, startRadians), end: ellipsePointAtRadians(center, rx, ry, endRadians), sweep,
     axes: [`Center3D="${formatXyPoint(center)}"`, `MajorAxisEnd3D="${formatXyPoint({ x: center.x + rx, y: center.y })}"`,
       `MinorAxisEnd3D="${formatXyPoint({ x: center.x, y: center.y + ry })}"`] };
 }
