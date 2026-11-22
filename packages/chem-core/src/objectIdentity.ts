@@ -7,13 +7,15 @@ import type { DocumentObject } from "./schemas";
  * reused by a paste, an undo, or a plugin insert. So an id cannot tell "the object the user selected"
  * from "a different object that now has its id". This identity can. It lives only in memory, keyed
  * by the object value itself, like the bracket creation identity in brackets.ts, in one runtime that
- * every chem-core copy in the realm shares (below): it is never part of the schema, never serialized
+ * every chem-core copy in the realm shares (below; a copy that cannot adopt it keeps a private one):
+ * it is never part of the schema, never serialized
  * (JSON and structured clone both drop it), and never reachable from a plugin, which imports only
  * `@chemdraft/plugin-api`.
  *
  * - Every object value has one identity, and never exchanges it for another. The engine gives one to
- *   every object of every document it adopts (`holdObjectIdentities`); the early returns of
- *   `applyPatches` with no patches and of `adoptDerivedDocument` are not pre-identified. Any other
+ *   every object of every document it adopts (`holdObjectIdentities`). Two early returns hand their
+ *   input back unchanged, neither cloned nor adopted nor pre-identified: `applyPatches` with no
+ *   patches, and `adoptDerivedDocument` when it adopts nothing (see `holdObjectIdentities`). Any other
  *   value gets one the first time it is asked for.
  * - An edit that replaces an object value with an edited copy of the same object carries the
  *   identity to the copy (`retainObjectIdentity`): a patch update or move, a normalization pass
@@ -70,10 +72,11 @@ const { ownKeys } = Reflect;
  *   shape, and behave as this module's runtime does on fresh probe values, which a stand-in whose
  *   `holds` matches anything, or anything with the id, does not. A copy that finds anything else keeps
  *   a private runtime and says so once on the console: identity is then not shared, and a pin made in
- *   one copy matches nothing edited in another (fail closed, never a wrong match). The check cannot
- *   tell chem-core from a forgery that a script placed in the realm before the first copy loaded and
- *   that behaves exactly like chem-core until asked about an object it targets. Such a script controls
- *   the realm the host runs in, which is out of scope: run untrusted code in a Worker.
+ *   one copy matches nothing edited in another (fail closed, never a wrong match). Trust boundary: code
+ *   that runs in the page before ChemDraft's chem-core copies load is outside what the page can
+ *   defend. The check cannot tell chem-core from a fake runtime that such code published and that
+ *   behaves correctly except for a targeted object, and no check made from inside the realm can. Run
+ *   untrusted code in a Worker.
  * - Built-ins are captured per chem-core copy, when that copy loads, not once per realm. A copy that
  *   loads after untrusted code has replaced `Object.isFrozen`, `WeakMap.prototype.get` or the like
  *   captures the replacements: it rejects the genuine runtime, makes a private one, and calls the
@@ -286,13 +289,22 @@ export function parseWithoutIdentityTransfers<T>(parse: () => T): T {
 /**
  * Give every object of `document` that has no identity yet a fresh one. The engine calls it on each
  * document it adopts (a patch result, `toEngineDocument`, `admitParsedDocument`, an adopted derived
- * document), so every value in an engine-adopted document holds an identity before anything else can
- * reach it, and `retain`, which only fills in a missing identity, can never hand it another object's.
- * This does not cover `adoptDerivedDocument`'s early return, which hands back a `next` that is the
- * `base` itself, is already an engine document, or comes with a `base` that is not an engine document:
- * such a `next` is not adopted and is not pre-identified here. (An engine `base` or `next` was
- * pre-identified when it was adopted. Making the early return mint identities would change what a
- * non-engine document's own objects can retain, so it deliberately does not.)
+ * document), so once a document is adopted, `retain`, which only fills in a missing identity, can
+ * never hand any of its objects another object's.
+ *
+ * This applies to documents the engine adopts. Two early returns hand back their input unchanged,
+ * neither cloned nor adopted nor pre-identified: `applyPatches` with no patches, and
+ * `adoptDerivedDocument` when `next` is `base` itself, is already an engine document, or comes with a
+ * `base` that is not an engine document. (An engine `base` or `next` was pre-identified when it was
+ * adopted. Making these returns mint identities would change what a non-engine document's own
+ * objects can retain, so they deliberately do not.)
+ *
+ * A value that already holds an identity keeps it, so a value that was given a selected object's
+ * identity with `retain` while outside every document (the retain residual) keeps it once a document
+ * containing it is adopted. That document reaches the engine only through `adoptDerivedDocument`,
+ * `admitParsedDocument`, `toEngineDocument`, `cloneDocument`, or `applyPatches` on a non-engine input
+ * (cloned only when there are patches; returned unchanged when there are none), and each needs a
+ * trusted caller to submit it. Ordinary patch insertion is not a bypass: it parses a new value.
  * Index loops: nothing here goes through `Array.prototype`. Not exported from the package.
  */
 export function holdObjectIdentities(document: { readonly pages: readonly { readonly objects: readonly DocumentObject[] }[] }): void {

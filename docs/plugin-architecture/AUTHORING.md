@@ -997,12 +997,12 @@ The first chem-core copy to load publishes the runtime as a fixed, hidden proper
 replaced. It exposes only what chem-core already exports: read an object's identity, test one, and
 continue an object onto its edited copy. Nothing in it can replace an identity an object already
 holds. The engine gives every object of every document it adopts (a patch result, `toEngineDocument`,
-`admitParsedDocument`, an adopted derived document) an identity, so nothing can move another object's
-identity onto an object in an engine-adopted document. This applies to engine-adopted documents only:
-`adoptDerivedDocument` returns its `next` unchanged when `next` is `base`, is already an engine
-document, or comes with a `base` that is not an engine document, and such a `next` is not adopted and
-is not pre-identified. The runtime calls only
-built-ins captured when chem-core loads, so replacing `WeakMap.prototype` methods,
+`admitParsedDocument`, an adopted derived document) an identity, so once a document is adopted,
+nothing can move another object's identity onto any of its objects. This applies to documents the
+engine adopts. Two early returns hand back their input unchanged, neither cloned nor adopted nor
+pre-identified: `applyPatches` with no patches, and `adoptDerivedDocument` when `next` is `base`, is
+already an engine document, or comes with a `base` that is not an engine document. The runtime calls
+only built-ins captured when each chem-core copy loads, so replacing `WeakMap.prototype` methods,
 `Function.prototype.call` or `Symbol` later changes nothing. A later copy adopts a published runtime
 only if it has exactly the runtime's shape and behaves as chem-core's on fresh probe objects. A
 runtime that answers every identity check with "yes" is not adopted. A copy that finds anything else
@@ -1023,12 +1023,12 @@ so ordinary patch insertion is not a bypass. Such a value reaches a document onl
 gives the engine a document that contains it. Each of these paths takes such a document, and each
 needs a trusted caller to submit it:
 
-- `adoptDerivedDocument` (a `next` whose objects were pre-retained);
-- `admitParsedDocument`, which admits the document as it is;
+- `adoptDerivedDocument`, when it adopts (a `next` whose objects were pre-retained);
+- `admitParsedDocument`, which admits the document as it is and keeps any identity an object holds;
 - `toEngineDocument` and `cloneDocument`, which copy each object's identity onto its copy;
-- `applyPatches` on an input that is not an engine document, which starts with `cloneDocument` when
-  `patches.length > 0`. With no patches it returns the supplied document unchanged, without cloning or
-  pre-identifying it, so an identity retained beforehand survives.
+- `applyPatches` on an input that is not an engine document, which starts with `cloneDocument` only
+  when `patches.length > 0`. With no patches it returns the supplied document unchanged, without
+  cloning, adopting or pre-identifying it, so an identity retained beforehand survives.
 
 Code the host trusts that far can change the document without any pin.
 

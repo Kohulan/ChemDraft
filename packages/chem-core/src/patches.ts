@@ -114,6 +114,9 @@ export function applyPatch(
  * `DocumentObjectSchema` as before, and every page's shell (layout, margins, crossings) and the
  * document's own fields through the full schemas.
  *
+ * A `document` that is not an engine document is first copied with `cloneDocument` (each copy keeps its
+ * original's identity), so with patches the result is always an adopted, pre-identified document.
+ *
  * Sharing makes in-place mutation of a returned document unsafe: it would reach every snapshot that
  * shares the object. Under test, results are therefore deep-frozen, so any such mutation throws.
  */
@@ -123,6 +126,8 @@ export function applyPatches(
   options: ApplyPatchOptions = {}
 ): ChemDraftDocument {
   if (patches.length === 0) {
+    // Nothing to apply: `document` comes back as it is, whether or not it is an engine document, and so
+    // neither cloned nor adopted nor pre-identified (objectIdentity.ts, `holdObjectIdentities`).
     return document;
   }
   // Validate batches before creating a draft, then use the existing atomic engine.
@@ -213,7 +218,9 @@ export function isEngineDocument(document: ChemDraftDocument): boolean {
  * first edit. For a document that enters from outside — opened, restored, created — so that saves
  * before the first edit skip re-validation and the first edit shares its unchanged objects rather
  * than deep-copying the whole page. The result is an independent copy; the input is never adopted,
- * since its caller may still hold and mutate it.
+ * since its caller may still hold and mutate it. The copy is pre-identified, and each copied object
+ * keeps the identity of its original, including one the original was given with `retainObjectIdentity`
+ * while outside every document: a trusted caller is needed to submit such a document.
  */
 export function toEngineDocument(document: ChemDraftDocument): ChemDraftDocument {
   if (engineDocuments.has(document)) {
@@ -240,7 +247,9 @@ export function toEngineDocument(document: ChemDraftDocument): ChemDraftDocument
  * not retain, mutate, or share it afterwards: the engine will share its objects with every later
  * patch result and undo snapshot, so a later mutation would reach all of them. Under test it is
  * deep-frozen, like every engine document, so such a mutation throws. When in doubt, use
- * `toEngineDocument`.
+ * `toEngineDocument`. The document is pre-identified in place: an object that already holds an
+ * identity keeps it, so the caller must be trusted not to have given one to an object that was
+ * outside every document (objectIdentity.ts, `holdObjectIdentities`).
  */
 export function admitParsedDocument(document: ChemDraftDocument): ChemDraftDocument {
   if (engineDocuments.has(document)) {
@@ -258,14 +267,17 @@ export function admitParsedDocument(document: ChemDraftDocument): ChemDraftDocum
  * `next`, re-admitted to the engine's structural sharing. For a document the app derived from an
  * engine result by replacing whole objects — a normalization pass such as charge-mark reconciliation
  * — without going through a patch. A derived document is otherwise unknown to the engine, so the
- * next patch deep-copied and re-parsed all of it and gave every object a new identity: the undo
- * history stopped sharing, and every per-object render cache missed at once.
+ * next patch deep-copied and re-parsed all of it into new values: the undo history stopped sharing,
+ * and every per-object render cache missed at once.
  *
  * Objects `next` shares with `base` were validated when `base` was produced; only the others are
  * parsed, and the document and page shells are validated as a patch result's are — including any
  * compatibility, styles, or plugin data `next` replaced. Throws, like a
- * patch, when a replaced object is invalid. A `base` the engine did not produce gains nothing, and
- * `next` comes back unchanged.
+ * patch, when a replaced object is invalid. Nothing is adopted, and `next` comes back unchanged (not
+ * cloned, not pre-identified), when `next` is `base` itself, when `next` is already an engine
+ * document, or when `base` is not an engine document. Otherwise the result is pre-identified, and an
+ * object of `next` that holds an identity keeps it, so the caller must be trusted not to have given
+ * one to a value outside every document (objectIdentity.ts, `holdObjectIdentities`).
  */
 export function adoptDerivedDocument(base: ChemDraftDocument, next: ChemDraftDocument): ChemDraftDocument {
   if (next === base || !engineDocuments.has(base) || engineDocuments.has(next)) {
