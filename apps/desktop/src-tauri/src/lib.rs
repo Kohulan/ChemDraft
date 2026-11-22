@@ -8902,9 +8902,10 @@ fn engine3d_sidecar_stop_session(
 }
 
 /// Interactive 3D needs the 3D sidecar. A build where neither the override nor the bundled binary
-/// can run (missing, or a `binaries/` placeholder) cannot gain one while it runs, so the Structure
-/// menu leaves the item out for the session instead of showing it disabled (AGENTS.md §10). The
-/// webview applies the same rule to toolbars and the gallery (`sessionUnavailableCommandIds`).
+/// can run (missing, a `binaries/` placeholder, or not executable) cannot gain one while it runs,
+/// so the Structure menu leaves the item out for the session instead of showing it disabled
+/// (AGENTS.md §10). The webview applies the same rule to toolbars and the gallery
+/// (`sessionUnavailableCommandIds`).
 fn interactive3d_menu_item_shown() -> bool {
     static SHOWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *SHOWN.get_or_init(|| engine3d_sidecar_status(None).available)
@@ -9071,7 +9072,9 @@ const SIDECAR_PLACEHOLDER_MARKER: &[u8] = b"avogadro3d-sidecar placeholder";
 /// without a real build (Linux) are small `#!/bin/sh … exit 2` scripts: `is_file`
 /// accepted them, so status said "bundled" and every session failed when the script exited. They
 /// are recognised by their marker on every platform; Windows additionally requires a PE image
-/// (a text placeholder there failed to start with OS error 193).
+/// (a text placeholder there failed to start with OS error 193). On macOS and Linux the file must
+/// also carry its owner's execute bit: a non-executable override used to pass, win over a working
+/// bundled sidecar, and fail every session with "permission denied".
 fn is_runnable_sidecar(path: &Path) -> bool {
     if !path.is_file() || is_sidecar_placeholder(path) {
         return false;
@@ -9082,7 +9085,9 @@ fn is_runnable_sidecar(path: &Path) -> bool {
     }
     #[cfg(not(windows))]
     {
-        true
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o100 != 0)
     }
 }
 
@@ -17239,9 +17244,21 @@ mod tests {
         let (path, owned) = (std::env::current_exe().expect("test executable"), false);
         #[cfg(not(windows))]
         let (path, owned) = {
+            use std::os::unix::fs::PermissionsExt;
+
             let path = std::env::temp_dir()
                 .join(format!("chemdraft-engine3d-status-{}", std::process::id()));
             fs::write(&path, "").expect("fixture should write");
+            // A file its owner cannot execute is never the sidecar: the override is skipped (the
+            // bundled sidecar or "missing" decides) rather than winning and failing every session.
+            for mode in [0o644, 0o600, 0o055] {
+                fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("chmod");
+                expect_true(!is_runnable_sidecar(&path));
+                let status = engine3d_sidecar_status_from(Some(path.to_string_lossy().to_string()));
+                expect_true(status.source != "environment");
+                expect_true(status.resolved_path != Some(path.to_string_lossy().to_string()));
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
             (path, true)
         };
 

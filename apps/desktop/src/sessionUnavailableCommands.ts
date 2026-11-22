@@ -1,8 +1,11 @@
 import { useEffect, useState } from "react";
 import { structureInteractive3dCommandId } from "./commands";
 import { readEngine3dSidecarStatus, type Engine3dSidecarStatus } from "./engine3dSidecar";
+import { isDesktopRuntime } from "./window-manager";
 
 const NONE: ReadonlySet<string> = new Set();
+
+const INTERACTIVE_3D_UNAVAILABLE: ReadonlySet<string> = new Set([structureInteractive3dCommandId]);
 
 /**
  * Commands this build cannot provide for the whole session. AGENTS.md §10: such tools are removed
@@ -10,24 +13,32 @@ const NONE: ReadonlySet<string> = new Set();
  * `disabledReason` is only for transient, state-dependent unavailability.
  *
  * Interactive 3D needs the 3D sidecar. The shell reports `available: false` only when neither the
- * developer override nor the bundled binary can run (missing, or a `binaries/` placeholder), and
- * neither changes while the app runs. Spin 3D does not use the sidecar, so it always stays.
- * Before the status is known, and in the browser build (no shell to ask), nothing is removed.
- * The native menu applies the same rule in Rust (`interactive3d_menu_item_shown` in lib.rs).
+ * developer override nor the bundled binary can run (missing, a `binaries/` placeholder, or not
+ * executable), and neither changes while the app runs. The browser build has no desktop bridge and
+ * so no sidecar at all: it leaves Interactive 3D out from the start. In the desktop build, before
+ * the status is known (`undefined`), nothing is removed. Spin 3D does not use the sidecar, so it
+ * always stays. The native menu applies the same rule in Rust (`interactive3d_menu_item_shown` in
+ * lib.rs).
  */
-export function sessionUnavailableCommandIds(sidecar: Engine3dSidecarStatus | undefined): ReadonlySet<string> {
-  return sidecar?.available === false ? new Set([structureInteractive3dCommandId]) : NONE;
+export function sessionUnavailableCommandIds(
+  sidecar: Engine3dSidecarStatus | undefined,
+  desktop: boolean = isDesktopRuntime()
+): ReadonlySet<string> {
+  if (!desktop) return INTERACTIVE_3D_UNAVAILABLE;
+  return sidecar?.available === false ? INTERACTIVE_3D_UNAVAILABLE : NONE;
 }
 
 /** Read once per window: the bundled sidecar is fixed for the life of the process. */
-export function useSessionUnavailableCommandIds(): ReadonlySet<string> {
-  const [ids, setIds] = useState(NONE);
+export function useSessionUnavailableCommandIds(desktop: boolean = isDesktopRuntime()): ReadonlySet<string> {
+  // Without a desktop bridge the answer is already known; with one it is pending until the status.
+  const [ids, setIds] = useState(() => sessionUnavailableCommandIds(undefined, desktop));
   useEffect(() => {
+    if (!desktop) return;
     let disposed = false;
     void readEngine3dSidecarStatus().then(status => {
-      if (!disposed) setIds(sessionUnavailableCommandIds(status));
+      if (!disposed) setIds(sessionUnavailableCommandIds(status, desktop));
     });
     return () => { disposed = true; };
-  }, []);
+  }, [desktop]);
   return ids;
 }

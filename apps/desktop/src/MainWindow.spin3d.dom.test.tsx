@@ -22,6 +22,13 @@ import { DOM_COMMAND_EVENT } from "./window-manager";
 vi.mock("./rdkitWasmLoader", () => ({ registerRdkitWasmLoader: vi.fn() }));
 vi.mock("./clipboard", async original => ({ ...await original<typeof import("./clipboard")>(), writeClipboardText: vi.fn() }));
 vi.mock("@tauri-apps/api/core", async original => ({ ...await original<typeof import("@tauri-apps/api/core")>(), invoke: vi.fn() }));
+// The mocked invoke stands in for the desktop shell and its sidecar, so keep Interactive 3D as the
+// desktop build does while its status is pending; jsdom alone looks like the browser build, which
+// leaves the command out (sessionUnavailableCommands.ts).
+vi.mock("./sessionUnavailableCommands", async original => ({
+  ...await original<typeof import("./sessionUnavailableCommands")>(),
+  useSessionUnavailableCommandIds: () => new Set<string>()
+}));
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 class TestResizeObserver { observe() {} unobserve() {} disconnect() {} }

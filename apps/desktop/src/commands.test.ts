@@ -304,14 +304,14 @@ describe("Molecule Inspector commands", () => {
 });
 
 describe("Interactive 3D availability", () => {
-  const commands = (sidecar?: Engine3dSidecarStatus) =>
-    allShellCommands(createPhase4Document(), undefined, { unavailableCommandIds: sessionUnavailableCommandIds(sidecar) });
+  const commands = (sidecar?: Engine3dSidecarStatus, desktop = true) =>
+    allShellCommands(createPhase4Document(), undefined, { unavailableCommandIds: sessionUnavailableCommandIds(sidecar, desktop) });
   const sidecar = (available: boolean): Engine3dSidecarStatus => ({
     available, protocolVersion: 2, source: available ? "bundled" : "missing", envVar: "CHEMDRAFT_ENGINE3D_SIDECAR",
     bundledBinaryName: "avogadro3d-sidecar", targetTriple: "x86_64-unknown-linux-gnu"
   });
 
-  it("stays enabled when the sidecar can run, or before (or without) a shell to ask", () => {
+  it("stays enabled when the sidecar can run, or while the desktop shell has not answered yet", () => {
     for (const status of [sidecar(true), undefined]) {
       const spec = commands(status).find((command) => command.id === structureInteractive3dCommandId)!;
       expect(spec).toMatchObject({ title: "Interactive 3D Workspace" });
@@ -326,13 +326,22 @@ describe("Interactive 3D availability", () => {
     const ids = commands(sidecar(false)).map((command) => command.id);
     expect(ids).not.toContain(structureInteractive3dCommandId);
     expect(ids).toContain(structureSpin3dCommandId);
-    expect(sessionUnavailableCommandIds(sidecar(false))).toEqual(new Set([structureInteractive3dCommandId]));
-    expect(sessionUnavailableCommandIds(sidecar(true)).size).toBe(0);
-    expect(sessionUnavailableCommandIds(undefined).size).toBe(0);
+    expect(sessionUnavailableCommandIds(sidecar(false), true)).toEqual(new Set([structureInteractive3dCommandId]));
+    expect(sessionUnavailableCommandIds(sidecar(true), true).size).toBe(0);
+    expect(sessionUnavailableCommandIds(undefined, true).size).toBe(0);
+  });
+
+  it("is left out of the browser build, which has no desktop bridge and so no sidecar", () => {
+    const ids = commands(undefined, false).map((command) => command.id);
+    expect(ids).not.toContain(structureInteractive3dCommandId);
+    expect(ids).toContain(structureSpin3dCommandId);
+    expect(sessionUnavailableCommandIds(undefined, false)).toEqual(new Set([structureInteractive3dCommandId]));
+    // With no Tauri globals (this test host), detection reports the browser build.
+    expect(sessionUnavailableCommandIds(undefined)).toEqual(new Set([structureInteractive3dCommandId]));
   });
 
   it("is left out of the displayed toolbars without touching the shipped registry", () => {
-    const unavailable = sessionUnavailableCommandIds(sidecar(false));
+    const unavailable = sessionUnavailableCommandIds(sidecar(false), true);
     const shown = sessionAvailableRegistry(desktopToolsetRegistry, unavailable);
     const commandIds = (registry: typeof desktopToolsetRegistry) => registry.listToolsets().flatMap(toolset =>
       toolset.groups.flatMap(group => group.items.flatMap(item => [
