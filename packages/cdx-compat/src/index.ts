@@ -441,7 +441,11 @@ function exportCdxml(
   for (const color of standardCdxmlColorTable) if (!colors.includes(color)) colors.push(color);
   // Source reaction lists use document-wide ids. Reserve them before allocating any new ids,
   // including atom/bond ids carried by opaque atom-mapping attributes.
-  const preserveReferenceIds = parsedDocument.pages.some(page => page.objects.some(needsSourceGraphicIds));
+  // Retained source atom/bond ids (a lone pair's atom reference, say) are document-wide too: a
+  // per-page allocator would reissue them on another page.
+  const preserveReferenceIds = parsedDocument.pages.some(page => page.objects.some(object => needsSourceGraphicIds(object) ||
+    ["cdxmlAtomIdsByAtomId", "cdxmlBondIdsByBondId"].some(key =>
+      Object.keys(preservedCurveAttributes(object.compatibility?.unknown[key])).length > 0)));
   const reactionIds = new Set<string>(parsedDocument.pages.map(page => page.id));
   for (const page of parsedDocument.pages) {
     for (const object of page.objects) {

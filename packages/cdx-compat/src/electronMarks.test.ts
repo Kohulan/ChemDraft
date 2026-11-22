@@ -41,6 +41,23 @@ describe("electron-mark CDXML appearance warnings", () => {
     expect(orphan.document!.pages[0].objects[0]).toMatchObject({ anchor: { kind: "point" } });
   });
 
+  // CodeRabbit 4658591582: a retained source atom id on one page must not be reissued on another.
+  it("keeps every CDXML id unique when a lone pair retains source atom ids on another page", () => {
+    const source = '<CDXML><page><graphic id="3" GraphicType="Symbol" SymbolType="LonePair" BoundingBox="70 72 67 68">' +
+      '<represent object="10002" attribute="Radical"/></graphic><fragment id="8"><n id="10001" Element="6" p="48 64"/>' +
+      '<n id="10002" Element="8" p="70 64"/><b id="22" B="10001" E="10002" Order="1"/></fragment></page>' +
+      '<page><fragment id="1"><n id="2" Element="6" p="20 20"/><n id="3" Element="7" p="40 20"/>' +
+      '<b id="4" B="2" E="3" Order="1"/></fragment></page></CDXML>';
+    const document = openChemDraftPayload(source).document!;
+    expect(document.pages).toHaveLength(2);
+    const xml = exportDocumentToCdxml(document, { embedNativePayload: false }).contents;
+    const ids = [...xml.matchAll(/<(?:fragment|n|b|graphic) [^>]*?\bid="([^"]+)"/g)].map(match => match[1]);
+    expect(ids.length).toBeGreaterThanOrEqual(8);
+    expect(new Set(ids).size).toBe(ids.length);
+    const reference = xml.match(/<represent object="(\d+)" attribute="Radical"/)?.[1];
+    expect(xml).toMatch(new RegExp(`<n (?=[^>]*id="${reference}")(?=[^>]*Element="8")`));
+  });
+
   it.each([false, true])("warns when moving an imported doublet atom leaves its dot behind (legacy=%s)", legacy => {
     const imported = openChemDraftPayload('<CDXML><page><fragment id="1"><n id="2" p="100 100" Element="6" Radical="Doublet"/></fragment></page></CDXML>').document!;
     const molecule = imported.pages[0].objects.find((object): object is MoleculeObject => object.type === "molecule")!;
