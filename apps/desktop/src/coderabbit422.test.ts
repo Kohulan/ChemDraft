@@ -230,7 +230,7 @@ function staleAtomAnchorFixture() {
 }
 
 describe("F/G: copying a molecule whose stored anchor disagrees with the resolver", () => {
-  it.fails("F: a clipboard copy of A carries no charge that normalized A does not have", () => {
+  it("F: a clipboard copy of A carries no charge that normalized A does not have", () => {
     const { drawing, a, nitrogen } = staleAtomAnchorFixture();
     const selected = workflow.selectDocumentObjects(drawing, drawing.pages[0].id, [a.id]);
     const payload = workflow.createSelectionClipboardPayload(selected)!;
@@ -243,7 +243,7 @@ describe("F/G: copying a molecule whose stored anchor disagrees with the resolve
     expect(copy.atoms.find(atom => atom.id === nitrogen.id)!.formalCharge).toBe(0);
   });
 
-  it.fails("G: Duplicate of A succeeds with a copy faithful to normalized A", () => {
+  it("G: Duplicate of A succeeds with a copy faithful to normalized A", () => {
     const { drawing, a } = staleAtomAnchorFixture();
     const selected = workflow.selectDocumentObjects(drawing, drawing.pages[0].id, [a.id]);
     const warnings: string[] = [];
@@ -261,7 +261,7 @@ describe("F/G: copying a molecule whose stored anchor disagrees with the resolve
 // H: documentWorkflow.ts:20314 — an editor save moves a neutral atom onto a loose +
 // ---------------------------------------------------------------------------------------------
 describe("H: structure-editor save that brings a neutral atom to a loose +", () => {
-  it.fails("H: the save is refused, or the atom's total charge follows the mark it now carries", () => {
+  it("H: the save is refused, or the atom's total charge follows the mark it now carries", () => {
     // Methylamine C–N, left to right; a loose (unowned) + below the bond's midpoint, out of range of both.
     const graph = testMoleculeFromSmiles("CN");
     const atoms: MoleculeAtom[] = graph.atoms.map((atom, index) => ({ ...atom, x: 100 + index * 30, y: 100 }));
@@ -367,7 +367,7 @@ describe("K: legacy-anchored marks on a rotated molecule", () => {
     expect(atomOf(after, base.id, "n").formalCharge).toBe(1);
   });
 
-  it.fails("K2: a legacy + drawn outside rotated N's radius is not kept on N because N stores another + (explicit)", () => {
+  it("K2: a legacy + drawn outside rotated N's radius is not kept on N because N stores another + (explicit)", () => {
     const { document, nitrogen } = electronMarkDropFixture();
     const molecule = dropMolecule(document), explicit = dropMark(document);
     const rotated = applyPatches(document, [

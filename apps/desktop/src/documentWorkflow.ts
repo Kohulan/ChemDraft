@@ -8401,6 +8401,29 @@ export function committedElectronMarkAssignments(page: DocumentPage, options: Na
   if (!legacyMarks.length) return assignments;
 
   const objects = objectByIdIndex(page.objects);
+  // What each atom's stored contribution leaves for its legacy marks: `markCharge`/`markRadicals`
+  // less what the atom's other (atom- or point-anchored) assigned marks contribute. Only that
+  // remainder can be a legacy mark's own stored contribution; an explicit + on the same atom is
+  // not evidence that a different, legacy + was ever attributed to it.
+  const legacyMarkIds = new Set(legacyMarks.map(mark => mark.id));
+  const storedForLegacy = new Map<string, { charge: number; radicals: number }>();
+  const storedRemainder = (objectId: string, atom: MoleculeAtom) => {
+    const key = nativeElectronMarkAtomKey(objectId, atom.id);
+    let remainder = storedForLegacy.get(key);
+    if (!remainder) {
+      remainder = { charge: atom.markCharge ?? 0, radicals: atom.markRadicals ?? 0 };
+      for (const [markId, other] of assignments.anchorByMarkId) {
+        if (legacyMarkIds.has(markId) || other?.objectId !== objectId || other.atomId !== atom.id) continue;
+        const otherMark = objects.get(markId);
+        if (otherMark?.type !== "electron-mark") continue;
+        const contribution = electronMarkAtomContribution(otherMark);
+        remainder.charge -= contribution.charge;
+        remainder.radicals -= contribution.radicals;
+      }
+      storedForLegacy.set(key, remainder);
+    }
+    return remainder;
+  };
   for (const mark of legacyMarks) {
     const owner = assignments.anchorByMarkId.get(mark.id);
     const molecule = owner && objects.get(owner.objectId);
@@ -8408,10 +8431,18 @@ export function committedElectronMarkAssignments(page: DocumentPage, options: Na
     const atom = molecule.atoms.find(candidate => candidate.id === owner.atomId);
     if (!atom) continue;
     const { charge, radicals } = electronMarkAtomContribution(mark);
-    // Honor stored contributions attributed by the legacy raw-coordinate matcher. A new
-    // association also has to reach the drawn atom, including after a rotated part drag.
-    if ((charge !== 0 && Math.sign(atom.markCharge ?? 0) === Math.sign(charge)) ||
-        (radicals !== 0 && (atom.markRadicals ?? 0) >= radicals)) continue;
+    // Honor stored contributions attributed by the legacy raw-coordinate matcher, each legacy mark
+    // consuming its own share of what the atom stores for them. A new association also has to reach
+    // the drawn atom, including after a rotated part drag.
+    const remainder = storedRemainder(owner.objectId, atom);
+    const chargeStored = charge !== 0 && Math.sign(remainder.charge) === Math.sign(charge) &&
+      Math.abs(remainder.charge) >= Math.abs(charge);
+    const radicalsStored = radicals !== 0 && remainder.radicals >= radicals;
+    if (chargeStored || radicalsStored) {
+      remainder.charge -= charge;
+      remainder.radicals -= radicals;
+      continue;
+    }
     const radius = Math.max(nativeChargeAssociationRadiusPx,
       nativeDrawingStyleFromObjectStyle(molecule.style).bondLengthPx * 1.15);
     if (distance(nativeChargeMarkCenter(mark), transformPointForObject(molecule, atom)) <= radius) continue;
@@ -13995,7 +14026,8 @@ interface CarriedElectronMark {
  * It starts from `anchoredElectronMarksForTransform`, the atom-anchored rule every molecule
  * transform uses, and adds the marks whose anchor is not an atom (a bond or object anchor, or a
  * legacy loose point) but which the committed assignment resolver attributes to one of the copied
- * atoms: normalization derives markCharge and markRadicals from exactly that attribution, so a copy
+ * atoms. A non-explicit atom-anchored charge or radical is taken from the resolver too, never from
+ * its stored anchor alone, so a stale anchor cannot give the copy a charge its source lacks: normalization derives markCharge and markRadicals from exactly that attribution, so a copy
  * that left such a mark behind would be recomputed to a different charge. No second association
  * rule: the resolver is the one the commit funnel runs.
  *
@@ -14010,11 +14042,31 @@ function electronMarksCarriedWithMolecules(
   molecules: readonly MoleculeObject[]
 ): CarriedElectronMark[] {
   const ownerByMarkId = new Map<string, { moleculeId: string; atomId?: string }>();
+  const copiedAtomIdsByMoleculeId = new Map(molecules.map((molecule) =>
+    [molecule.id, new Set(molecule.atoms.map((atom) => atom.id))] as const));
+  // A non-explicit atom-anchored charge or radical belongs where the committed resolver puts it, not
+  // where its stored anchor says: an older file can store an anchor on an atom whose association
+  // radius the glyph has left, and normalization then gives its chemistry to another atom (of this
+  // molecule, of another one, or none). A copy follows the resolver, so it has exactly the chemistry
+  // its source has; a mark the resolver gives to no copied atom stays with its source, uncopied.
+  const followsResolver = (mark: ElectronMarkObject) => mark.anchor.kind === "atom" &&
+    mark.atomAssociation !== "explicit" && (mark.markKind === "charge" || mark.markKind === "radical-dot");
   for (const molecule of molecules) {
-    const atomIds = new Set(molecule.atoms.map((atom) => atom.id));
+    const atomIds = copiedAtomIdsByMoleculeId.get(molecule.id)!;
     for (const { mark, atomId, resolved } of atomOwnedMarksForTransform(page.objects, molecule.id, atomIds)) {
+      if (followsResolver(mark)) continue;
       if (!ownerByMarkId.has(mark.id)) ownerByMarkId.set(mark.id, resolved ? { moleculeId: molecule.id, atomId } : { moleculeId: molecule.id });
     }
+  }
+  let assignments: ReturnType<typeof committedElectronMarkAssignments>["anchorByMarkId"] | undefined;
+  for (const object of page.objects) {
+    if (object.type !== "electron-mark" || !followsResolver(object) || ownerByMarkId.has(object.id)) continue;
+    assignments ??= committedElectronMarkAssignments(page).anchorByMarkId;
+    const owner = assignments.get(object.id);
+    if (!owner || !copiedAtomIdsByMoleculeId.get(owner.objectId)?.has(owner.atomId)) continue;
+    const anchor = object.anchor as { objectId?: string; atomId?: string };
+    const agrees = anchor.objectId === owner.objectId && anchor.atomId === owner.atomId;
+    ownerByMarkId.set(object.id, agrees ? { moleculeId: owner.objectId } : { moleculeId: owner.objectId, atomId: owner.atomId });
   }
   return page.objects.flatMap((object) => {
     const owner = object.type === "electron-mark" ? ownerByMarkId.get(object.id) : undefined;
@@ -20555,6 +20607,9 @@ export function moleculeHasElectronMarks(page: DocumentPage, molecule: MoleculeO
 export const EDITOR_SAVE_MARK_SHIFT_REFUSAL =
   "Ketcher can't keep this molecule's charge and radical marks on the right atoms when atoms are added or removed. Remove the marks first, or edit on the canvas.";
 
+export const EDITOR_SAVE_TAKES_MARK_REFUSAL =
+  "The edited structure would place an atom on a charge or radical mark that is not this molecule's. Move the mark or the molecule apart on the canvas first, then use the structure editor.";
+
 /** The refusal for a Ketcher save whose charge on an atom contradicts the charge marks still on it. */
 export function editorSaveChargeContradictsMarkRefusal(element: string, atomNumber: number): string {
   return `Ketcher changed the charge on ${element} atom ${atomNumber} but its charge mark is still on the canvas. Remove or move the charge mark on the canvas first.`;
@@ -20642,7 +20697,10 @@ function editorSaveMayShiftElectronMarks(
  *    (`committedElectronMarkAssignments`). Normalization's sum then returns the editor's CHG.
  *
  * 3. An atom whose charge the editor changed so that it contradicts the charge marks still on it
- *    is refused (see below). An unchanged charge always commits.
+ *    is refused (see below). An unchanged charge always commits. A save that would attribute to the
+ *    molecule a charge or radical mark it did not own before (a loose mark, or another molecule's,
+ *    reached by a re-placed atom) is refused: only the molecule's own marks count, and no
+ *    countercharge is ever recorded for a mark it picked up.
  *
  * A mark that associates with no atom after the save (its atom was deleted in the editor, or it is
  * a loose mark now out of radius) contributes nothing: the editor's CHG stays the atom's whole
@@ -20677,8 +20735,15 @@ function applyEditorV3000SaveKeepingElectronMarks(
   // RAD back) or be taken by a neighbour the save moved closer. A mark that resolves to no atom
   // (an explicit floating drop, or a loose mark out of radius) stays where it is.
   const objectById = objectByIdIndex(page.objects);
+  const isChargeOrRadical = (object: DocumentObject | undefined): object is ElectronMarkObject =>
+    object?.type === "electron-mark" && (object.markKind === "charge" || object.markKind === "radical-dot");
+  // The charge and radical marks the molecule owns before the save: anchored to it, or attributed
+  // to one of its atoms by the resolver commit normalization runs.
+  const ownedMarkIds = new Set(page.objects.flatMap((object) => isChargeOrRadical(object) &&
+    (object.anchor as { objectId?: string }).objectId === previous.id ? [object.id] : []));
   for (const [markId, owner] of committedElectronMarkAssignments(page).anchorByMarkId) {
     if (owner?.objectId !== previous.id) continue;
+    if (isChargeOrRadical(objectById.get(markId))) ownedMarkIds.add(markId);
     const mark = objectById.get(markId);
     if (mark?.type !== "electron-mark" || mark.anchor.kind === "atom" ||
       (mark.markKind !== "charge" && mark.markKind !== "radical-dot")) continue;
@@ -20694,8 +20759,19 @@ function applyEditorV3000SaveKeepingElectronMarks(
 
   // 2. Record each atom's mark contribution on the page exactly as it will be committed. The parsed
   // atoms carry no mark fields yet, which is also what normalization's legacy-anchor rule sees.
-  const { assignedChargeByAtomKey, assignedRadicalsByAtomKey } =
-    committedElectronMarkAssignments(selectionPage(apply(carried, molecule)));
+  const savedPage = selectionPage(apply(carried, molecule));
+  const { anchorByMarkId: savedOwners, assignedChargeByAtomKey, assignedRadicalsByAtomKey } =
+    committedElectronMarkAssignments(savedPage);
+  // Only the molecule's own marks count. A rebuilt atom placed onto a loose mark, or onto another
+  // molecule's mark, would take that mark's charge or radical: chemistry changed by a move, and
+  // recording it as the atom's mark contribution would hide a countercharge under the mark (the
+  // editor's CHG has no such charge). The mark is not the molecule's to take: refuse.
+  const savedObjectById = objectByIdIndex(savedPage.objects);
+  for (const [markId, owner] of savedOwners) {
+    if (owner?.objectId === molecule.id && !ownedMarkIds.has(markId) && isChargeOrRadical(savedObjectById.get(markId))) {
+      return { refusal: EDITOR_SAVE_TAKES_MARK_REFUSAL };
+    }
+  }
   if (assignedChargeByAtomKey.size === 0 && assignedRadicalsByAtomKey.size === 0) {
     return { document: apply(carried, molecule) };
   }
