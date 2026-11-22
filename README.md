@@ -81,7 +81,7 @@ offers a `.deb` (Ubuntu 22.04+, Linux Mint 21+, Debian 12+ and relatives) and an
 **Files and sharing**
 
 - Open and save ChemDraft documents, CDXML and binary CDX.
-- Export SVG, PDF, PNG, JPEG, TIFF, GIF, BMP, CDXML, CDX, MOL, SDF and SMILES.
+- Export SVG, PDF, PNG, JPEG, TIFF, GIF, BMP, CDXML, CDX, SDF and SMILES. To get a molfile, use **Edit ▸ Copy As ▸ MOL Text**.
 - Copy tables into Word, Excel or PowerPoint as real tables. There is no Office add-in in 1.2.2.
 
 **About CDXML and CDX compatibility.** We claim only what our test fixtures cover. Atoms, bonds,
