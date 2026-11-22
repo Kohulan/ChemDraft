@@ -216,9 +216,18 @@ function movedAsUnit(before: MoleculeObject, after: MoleculeObject): boolean {
   return offsets.every(({ ux, uy, vx, vy }) => Math.hypot(vx - (zx * ux - zy * uy), vy - (zx * uy + zy * ux)) <= tolerance);
 }
 
+/** The largest rounding allowance `translatedExactly` accepts, as a fraction of the molecule's
+ * shortest bond. Far below anything that can move a substituent to another side of a bond. */
+const TRANSLATION_ROUNDING_PER_BOND_LENGTH = 1e-9;
+
 /** True when the same atoms all moved by one vector, within floating-point rounding of the
  * coordinates. Every relative position is then unchanged, so no 2D stereo can have changed.
- * Rotation, reflection, scale or any per-atom difference beyond rounding does not count. */
+ * Rotation, reflection, scale or any per-atom difference beyond rounding does not count.
+ *
+ * Rounding grows with the coordinates' magnitude, not with the molecule: far enough from the
+ * origin it reaches a small molecule's own bond lengths, and a reflection, rotation or reshaping
+ * would fit inside it. So the allowance must also be negligible against the shortest bond; when it
+ * is not, the move is not treated as a translation and goes through the stereo checks. */
 function translatedExactly(before: MoleculeObject, after: MoleculeObject): boolean {
   const start = new Map(before.atoms.map(atom => [atom.id, atom]));
   if (after.atoms.length !== start.size) return false;
@@ -230,6 +239,14 @@ function translatedExactly(before: MoleculeObject, after: MoleculeObject): boole
   let magnitude = 1;
   for (const [from, to] of pairs) magnitude = Math.max(magnitude, Math.abs(from!.x), Math.abs(from!.y), Math.abs(to.x), Math.abs(to.y));
   const tolerance = 8 * Number.EPSILON * magnitude;
+  let shortestBond = Infinity;
+  for (const bond of before.bonds) {
+    const from = start.get(bond.fromAtomId), to = start.get(bond.toAtomId);
+    if (!from || !to) return false;
+    shortestBond = Math.min(shortestBond, Math.hypot(to.x - from.x, to.y - from.y));
+  }
+  // No bond, a zero-length bond, or rounding comparable to the geometry: not provably a translation.
+  if (!Number.isFinite(shortestBond) || !(tolerance <= TRANSLATION_ROUNDING_PER_BOND_LENGTH * shortestBond)) return false;
   return pairs.every(([from, to]) => Number.isFinite(to.x) && Number.isFinite(to.y) &&
     Math.abs(to.x - from!.x - dx) <= tolerance && Math.abs(to.y - from!.y - dy) <= tolerance);
 }

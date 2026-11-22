@@ -64,3 +64,27 @@ describe("CodeRabbit PR #422 cr4656567659: exact translations of wedged molecule
     expect(chemistryGate(cross, mirror)).toBeInstanceOf(Promise);
   });
 });
+
+describe("Kimi 1.2.3 finding 1: rounding tolerance cannot pass a changed configuration as a translation", () => {
+  // One unit in the last place is 2 at 1e16, so 8 ULPs of the coordinates (about 17.8) exceed this
+  // molecule's own size (bonds of 4 to 4.5): a reflection moves no atom further than 8 from a translation.
+  const far = 1e16;
+  const small = (molecule: MoleculeObject): MoleculeObject => ({ ...molecule, x: far, y: far,
+    atoms: molecule.atoms.map(atom => ({ ...atom, ...{ c: { x: far, y: far }, u: { x: far, y: far - 4 },
+      l: { x: far - 4, y: far + 2 }, r: { x: far + 4, y: far + 2 }, d: { x: far + 2, y: far + 4 } }[atom.id]! })) });
+  const tiny = small(skewed);
+
+  it("still verifies the mirror image of a small wedged centre at large coordinates", () => {
+    expect(chemistryGate(tiny, (x, y) => [2 * far - x, y])).toBeInstanceOf(Promise);
+  });
+
+  it("still verifies a reshaping that moves one substituent across the wedge at large coordinates", () => {
+    // Only "r" moves, by 8: it crosses to the other side of the line through l and c.
+    expect(chemistryGate(tiny, (x, y) => x === far + 4 && y === far + 2 ? [x, y - 8] : [x, y])).toBeInstanceOf(Promise);
+  });
+
+  it("lets an exact translation at large but ordinary page coordinates skip verification (control)", () => {
+    const shifted = { ...skewed, atoms: skewed.atoms.map(atom => ({ ...atom, x: atom.x + 1e6, y: atom.y + 1e6 })) };
+    expect(chemistryGate(shifted, (x, y) => [x + 40, y - 25])).toBeUndefined();
+  });
+});
