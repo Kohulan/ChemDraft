@@ -4,9 +4,12 @@ import { createQuickActions, numericAtomDrawingHotkeys, KEYBOARD_PREFERENCES_COM
 import { chemDrawHoveredTargetHotkeyCommand } from "../keybindingScheme";
 import { KEYBINDING_SCHEME_LABELS, type KeybindingScheme } from "../keybindingSettings";
 import { createMainWindowShortcutCommands, detectDesktopShortcutPlatform } from "../keyboardShortcuts";
-import { preferencesMenuPlacement } from "../appMenu";
+import { PLUGINS_MENU_LABELS, preferencesMenuPlacement } from "../appMenu";
 import { formatShortcutLabel, getToolsetCommandSpecs } from "../toolsets";
-import { TOUR_INSPECTOR_COMMAND, TOUR_NAME_COMMAND, TOUR_SAMPLE_COMMAND, type TourTryCommand } from "./tourCommands";
+import { TOUR_INSPECTOR_COMMAND, TOUR_NAME_COMMAND, TOUR_SAMPLE_COMMAND, type TourPluginCommand, type TourTryCommand } from "./tourCommands";
+
+/** Where to learn to write a plugin. Shown as text: the tour has no way to open a browser. */
+export const PLUGIN_AUTHORING_GUIDE_URL = "https://github.com/jgassens/ChemDraft/blob/main/docs/plugin-architecture/AUTHORING.md";
 
 const shortcutExamples = [
   ["tool.bond", "Single Bond"],
@@ -41,17 +44,26 @@ interface TourStep {
   text: string;
   shortcuts?: true;
   tryCommand?: TourTryCommand;
+  /** A web address shown as plain text under the step's text. */
+  url?: string;
 }
 
+/**
+ * The tour's steps. `plugins` lists the plugin commands the menus offer (`availableTourPluginCommands`);
+ * a step that demonstrates a plugin appears only when its command is listed, and otherwise is reworded
+ * to name the plugin as optional, with no Try it. Callers take the list once, when the tour opens.
+ */
 export function tourSteps(
   scheme: KeybindingScheme,
-  platform: ShortcutPlatform = detectDesktopShortcutPlatform()
+  platform: ShortcutPlatform = detectDesktopShortcutPlatform(),
+  plugins: readonly TourPluginCommand[] = []
 ): readonly TourStep[] {
   const bondKey = Object.keys(numericAtomDrawingHotkeys).find(key => (
     scheme === "chemdraw" ? chemDrawHoveredTargetHotkeyCommand("atom", key) : numericAtomDrawingHotkeys[key]
   ) === "atom.addSingleBondToHoveredAtom");
   const preferencesShortcut = formatShortcutLabel(viewActions.find(command => command.id === PREFERENCES_COMMAND_ID)?.shortcut, platform);
   const preferences = preferencesMenuPlacement(platform);
+  const menu = PLUGINS_MENU_LABELS;
   return [
     {
       title: "Welcome to ChemDraft",
@@ -68,10 +80,13 @@ export function tourSteps(
       text: `Click and drag with the bond tool, or pick a ring from Ring Templates on the toolbar. Hover over an atom and type a label or press ${bondKey} to add a single bond.`,
       tryCommand: TOUR_SAMPLE_COMMAND
     },
-    {
+    plugins.includes(TOUR_NAME_COMMAND) ? {
       title: "Names and structure search",
       text: "The Name to Structure plugin draws from a chemical name through the Structure menu. Use Tools to search PubChem or Reaxys by the selected structure.",
       tryCommand: TOUR_NAME_COMMAND
+    } : {
+      title: "Structure search",
+      text: `Use Tools to search PubChem or Reaxys by the selected structure. Optional plugin: add Name to Structure from ${menu.menu} > ${menu.manager} to draw a structure from a chemical name.`
     },
     {
       title: "Analysis and 3D",
@@ -81,6 +96,11 @@ export function tourSteps(
     {
       title: "Save, export, and copy",
       text: "Save your drawing as a ChemDraft file or export to SVG, PDF, PNG, CDXML, CDX, MOL, or SDF. Copy structures into Office documents."
+    },
+    {
+      title: "Add features with plugins",
+      text: `ChemDraft does more through plugins. Official plugins add NMR prediction, structure recognition from images, and chemical naming. To get them, open the ${menu.menu} menu, choose ${menu.menu} > ${menu.manager}, and install one from its catalog of official plugins. Beyond the official ones, you can vibe code your own: choose ${menu.menu} > ${menu.vibeCode} for step-by-step help. The plugin authoring guide is at:`,
+      url: PLUGIN_AUTHORING_GUIDE_URL
     },
     {
       title: "Make it yours",

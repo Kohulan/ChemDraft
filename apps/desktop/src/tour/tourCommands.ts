@@ -1,5 +1,6 @@
 import { KEYBOARD_PREFERENCES_COMMAND_ID } from "../commands";
 import { NAME_TO_STRUCTURE_COMMAND_ID } from "../plugins/officialPluginMenus";
+import type { PluginAppMenuItem } from "../appMenu";
 import type { KeybindingScheme } from "../keybindingSettings";
 
 export const SHOW_TOUR_COMMAND = "help.showTour";
@@ -10,6 +11,21 @@ export const TOUR_INSPECTOR_COMMAND = "analyze.molecularProperties";
 export const TOUR_TITLE = "Take the Tour";
 
 export type TourTryCommand = typeof TOUR_SAMPLE_COMMAND | typeof TOUR_NAME_COMMAND | typeof TOUR_INSPECTOR_COMMAND | typeof KEYBOARD_PREFERENCES_COMMAND_ID;
+
+/** Every plugin command a tour step teaches. Each one comes from an official plugin that may not be
+ *  installed: `plugin.opsinNameToStructure.convert` is Name to Structure (`org.chemdraft.opsin.nameToStructure`). */
+export const TOUR_PLUGIN_COMMANDS = [TOUR_NAME_COMMAND] as const;
+export type TourPluginCommand = typeof TOUR_PLUGIN_COMMANDS[number];
+
+/**
+ * The tour's plugin commands that the menus offer right now. This reads the menu items themselves
+ * (`usePluginRuntime().pluginMenuItems`), so a step is shown exactly when its menu item is: the
+ * official items exist only for a registered, enabled plugin command (`buildOfficialPluginMenuItems`),
+ * and contributed items carry the registry's enabled state.
+ */
+export function availableTourPluginCommands(menuItems: readonly PluginAppMenuItem[]): TourPluginCommand[] {
+  return TOUR_PLUGIN_COMMANDS.filter(id => menuItems.some(item => item.command.commandId === id && item.command.enabled));
+}
 
 export type TourAction =
   | { action: "cancel" | "finish" }

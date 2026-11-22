@@ -95,3 +95,9 @@
 .guided-tour-preview .guided-tour {
   height: min(375px, 95vh);
 }
+
+.guided-tour-url {
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+}
