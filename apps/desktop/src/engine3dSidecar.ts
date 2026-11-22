@@ -1,4 +1,9 @@
 import { moleculeToMolfileV2000, type MoleculeObject } from "@chemdraft/chem-core";
+// One static import. Each function here used to run its own `import("@tauri-apps/api/core")`, and
+// the fire-and-forget one in logEngine3dDiagnostic overlapped the session start's; under Vitest's
+// module mocker the overlapping import resolved to the real module, not the test's mock. The browser
+// build loads this module too: `invoke` throws only when called, and every caller here handles that.
+import { invoke } from "@tauri-apps/api/core";
 import { nativeBondOrderResolution } from "@chemdraft/layout-engine";
 import {
   Engine3DProtocolVersion,
@@ -93,7 +98,6 @@ let engine3dDiagnosticsEnabled = false;
 
 export async function readEngine3dSidecarStatus(): Promise<Engine3dSidecarStatus | undefined> {
   try {
-    const { invoke } = await import("@tauri-apps/api/core");
     const status = await invoke<Engine3dSidecarStatus>("engine3d_sidecar_status");
     engine3dDiagnosticsEnabled = status?.logEnabled === true;
     return status;
@@ -111,9 +115,9 @@ export async function readEngine3dSidecarStatus(): Promise<Engine3dSidecarStatus
  */
 export function logEngine3dDiagnostic(line: string): void {
   if (!engine3dDiagnosticsEnabled) return;
-  void import("@tauri-apps/api/core")
-    .then(({ invoke }) => invoke("engine3d_sidecar_status", { diagnostic: line }))
-    .catch(() => undefined);
+  void (async () => {
+    await invoke("engine3d_sidecar_status", { diagnostic: line });
+  })().catch(() => undefined);
 }
 
 /**
@@ -137,7 +141,6 @@ export function engine3dSidecarDisabledReason(status: Engine3dSidecarStatus | un
 }
 
 export async function startEngine3dSidecarSession(lines: string[] = []): Promise<Engine3dSidecarSessionOutput> {
-  const { invoke } = await import("@tauri-apps/api/core");
   return await invoke<Engine3dSidecarSessionOutput>("engine3d_sidecar_start_session", { lines });
 }
 
@@ -145,17 +148,14 @@ export async function sendEngine3dSidecarSession(
   processSessionId: string,
   lines: string[]
 ): Promise<Engine3dSidecarSessionOutput> {
-  const { invoke } = await import("@tauri-apps/api/core");
   return await invoke<Engine3dSidecarSessionOutput>("engine3d_sidecar_send_session", { processSessionId, lines });
 }
 
 export async function pollEngine3dSidecarSession(processSessionId: string): Promise<Engine3dSidecarSessionOutput> {
-  const { invoke } = await import("@tauri-apps/api/core");
   return await invoke<Engine3dSidecarSessionOutput>("engine3d_sidecar_poll_session", { processSessionId });
 }
 
 export async function stopEngine3dSidecarSession(processSessionId: string): Promise<Engine3dSidecarSessionOutput> {
-  const { invoke } = await import("@tauri-apps/api/core");
   return await invoke<Engine3dSidecarSessionOutput>("engine3d_sidecar_stop_session", { processSessionId });
 }
 
