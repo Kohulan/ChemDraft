@@ -322,8 +322,9 @@ repository on GitHub Pages, or a Flathub listing.
   `linux-sidecar-build.yml` (see [The x86_64 3D sidecar](#the-x86_64-3d-sidecar)); the aarch64
   Linux file stays a placeholder (`binaries/README.md`). The container smoke checks that the
   installed sidecar from the `.deb` and from the AppImage is a real ELF that completes its
-  handshake on each distro. A build that bundles a placeholder shows Interactive 3D disabled with
-  "Interactive 3D isn't available in this Linux build yet"; Spin 3D does not use the sidecar.
+  handshake on each distro. A build that bundles a placeholder omits Interactive 3D from the
+  toolbars, menus, palettes and Customize gallery for the whole session (AGENTS.md §10) rather
+  than showing it disabled; Spin 3D does not use the sidecar and always stays.
 - Clipboard: `linux_clipboard.rs`, GTK's clipboard (X11 and Wayland). Targets are MIME types, so
   the editor's payload types are written unchanged; plain text is also offered as `UTF8_STRING`,
   `STRING` and `TEXT` for older X11 applications.

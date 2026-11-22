@@ -20,8 +20,10 @@ Interactive 3D is hidden there.
 Every placeholder
 carries the text `avogadro3d-sidecar placeholder`, which the app looks for (and on
 Windows it also requires a PE image), so a placeholder reports the sidecar
-unavailable rather than failing to start it: Interactive 3D shows as disabled with
-"Interactive 3D isn't available in this <platform> build yet". Keep that text in any
+unavailable rather than failing to start it: Interactive 3D is then omitted from the
+toolbars, menus (`interactive3d_menu_item_shown` in `src/lib.rs`), palettes and the
+Customize gallery for the session (`apps/desktop/src/sessionUnavailableCommands.ts`),
+never shown disabled. Spin 3D does not use the sidecar and stays. Keep that text in any
 new placeholder.
 
 macOS sidecar builds must target macOS 11.0, the app's declared minimum. Check
