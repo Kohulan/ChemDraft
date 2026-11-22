@@ -316,6 +316,9 @@ importers:
 
   packages/document-workflow-core:
     dependencies:
+      '@chemdraft/analysis-core':
+        specifier: workspace:*
+        version: link:../analysis-core
       '@chemdraft/chem-core':
         specifier: workspace:*
         version: link:../chem-core
