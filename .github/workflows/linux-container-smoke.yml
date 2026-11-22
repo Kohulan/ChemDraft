@@ -15,6 +15,7 @@ on:
       - apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu
       - native/avogadro3d-sidecar/**
       - scripts/build-opsin-runtime.mjs
+      - scripts/check-engine3d-sidecar.mjs
       - scripts/desktop-tauri.mjs
       - tools/release/verify-bundle-licenses.mjs
       - tools/release/record-build.mjs
@@ -127,10 +128,11 @@ jobs:
             exit 1
           fi
 
+          # nodejs runs scripts/check-engine3d-sidecar.mjs on the installed sidecar.
           if [[ "$DISTRO" == debian ]]; then
             apt-get update
             apt-get install -y --no-install-recommends \
-              dbus-daemon passwd procps strace util-linux weston xwayland xvfb libgtk-3-0t64 libxdo3 \
+              dbus-daemon passwd procps strace util-linux weston xwayland xvfb libgtk-3-0t64 libxdo3 nodejs \
               libegl1 libegl-mesa0 libgl1 libgl1-mesa-dri libgpg-error0 \
               libwayland-client0 libwayland-egl1 libwayland-cursor0 libwayland-server0
             if [[ "$PACKAGE" == deb ]]; then
@@ -138,7 +140,7 @@ jobs:
             fi
           elif [[ "$DISTRO" == fedora ]]; then
             dnf install -y /usr/bin/dbus-run-session procps-ng shadow-utils strace util-linux weston xorg-x11-server-Xwayland xorg-x11-server-Xvfb \
-              gtk3 libxdo mesa-dri-drivers mesa-libEGL libglvnd-egl libglvnd-glx libgpg-error \
+              nodejs gtk3 libxdo mesa-dri-drivers mesa-libEGL libglvnd-egl libglvnd-glx libgpg-error \
               libwayland-client libwayland-egl libwayland-cursor libwayland-server
             if [[ "$PACKAGE" == deb ]]; then
               # Fedora exercises the payload against Fedora libraries. Debian tests apt install.
@@ -146,7 +148,7 @@ jobs:
               dpkg-deb -x "${bundles[0]}" /
             fi
           else
-            pacman -Syu --noconfirm --needed bash dbus procps-ng shadow strace util-linux \
+            pacman -Syu --noconfirm --needed bash dbus procps-ng shadow strace util-linux nodejs \
               xorg-server-xvfb gtk3 xdotool mesa libglvnd libdrm libgpg-error wayland
           fi
 
@@ -200,18 +202,20 @@ jobs:
         run: bash .github/workflows/linux-package-smoke/host-mesa.sh "$BUNDLE"
 
       # Interactive 3D needs the native sidecar: the installed copy must be a real x86-64 ELF, not
-      # the committed placeholder, and complete its protocol handshake on this distro's glibc.
+      # the committed placeholder, need only glibc, and complete its protocol handshake on this
+      # distro's glibc.
       - name: Check the installed 3D sidecar
         run: |
           set -euo pipefail
-          check="$GITHUB_WORKSPACE/.github/workflows/linux-package-smoke/sidecar-check.sh"
+          check="$GITHUB_WORKSPACE/scripts/check-engine3d-sidecar.mjs"
+          node --version
           if [[ "$PACKAGE" == deb ]]; then
-            bash "$check" /usr/bin/avogadro3d-sidecar
+            node "$check" /usr/bin/avogadro3d-sidecar
           else
             work=$(mktemp -d)
             trap 'rm -rf -- "$work"' EXIT
             (cd "$work" && "$BUNDLE" --appimage-extract > /dev/null)
-            bash "$check" "$work/squashfs-root/usr/bin/avogadro3d-sidecar"
+            node "$check" "$work/squashfs-root/usr/bin/avogadro3d-sidecar"
           fi
 
       # Xvfb also runs the document, menu and clipboard checks. Weston exercises the XWayland

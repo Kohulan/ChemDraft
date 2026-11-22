@@ -112,18 +112,10 @@ jobs:
           cmake --build --preset linux-x86_64 --parallel "$(nproc)"
           bin=build/linux-x86_64/avogadro3d-sidecar
           file "$bin"
-          file -b "$bin" | grep -q '^ELF 64-bit LSB .*x86-64' || { echo '::error::The sidecar is not an x86-64 ELF.'; exit 1; }
-          needed=$(readelf -d "$bin" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')
-          echo "Shared libraries the sidecar needs:" $needed
-          for lib in $needed; do
-            case "$lib" in
-              libc.so.6|libm.so.6|libpthread.so.0|libdl.so.2|librt.so.1|ld-linux-x86-64.so.2) ;;
-              *) echo "::error::The sidecar needs $lib; only glibc libraries are allowed."; exit 1 ;;
-            esac
-          done
-          newest=$(objdump -T "$bin" | { grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' || true; } | sed 's/^GLIBC_//' | sort -uV | tail -n1)
-          echo "Newest glibc symbol version: ${newest:-none}"
-          [ -z "$newest" ] || printf '%s\n' "$newest" 2.35 | sort -V -C || { echo "::error::The sidecar needs glibc $newest; the oldest supported host has 2.35."; exit 1; }
+          # A native x86-64 ELF, not the placeholder; only glibc libraries (NEEDED), at most glibc
+          # 2.35; and a complete protocol handshake. The runner's preinstalled Node runs it.
+          node --version
+          node "$GITHUB_WORKSPACE/scripts/check-engine3d-sidecar.mjs" "$bin"
 
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -144,16 +136,16 @@ jobs:
       - name: Build host-native OPSIN runtime and smoke test benzene
         run: node scripts/build-opsin-runtime.mjs
 
-      # The same audit and smokes the Intel macOS job runs on its sidecar, then the bash handshake
-      # the distro containers repeat on the installed copy. Only a sidecar that passes them replaces
-      # the placeholder for the bundle step; the next step after the bundle restores the placeholder.
+      # The same audit and smokes the Intel macOS job runs on its sidecar; the build step above already
+      # ran scripts/check-engine3d-sidecar.mjs, which the distro containers repeat on the installed
+      # copy. Only a sidecar that passes them replaces the placeholder for the bundle step; the next
+      # step after the bundle restores the placeholder.
       - name: Check the x86_64 Linux 3D sidecar and stage it for the bundle
         env:
           CHEMDRAFT_ENGINE3D_SIDECAR: native/avogadro3d-sidecar/build/linux-x86_64/avogadro3d-sidecar
         run: |
           set -euo pipefail
           pnpm run audit:engine3d-sidecar
-          bash .github/workflows/linux-package-smoke/sidecar-check.sh "$CHEMDRAFT_ENGINE3D_SIDECAR"
           pnpm smoke:engine3d-real-structure
           pnpm smoke:engine3d-hold-steady
           pnpm smoke:engine3d-anneal-energy
@@ -219,7 +211,7 @@ jobs:
           payload=$(mktemp -d)
           dpkg-deb -x "$deb" "$payload"
           cmp native/avogadro3d-sidecar/build/linux-x86_64/avogadro3d-sidecar "$payload/usr/bin/avogadro3d-sidecar" || { echo "::error::$deb does not carry the native 3D sidecar built above."; exit 1; }
-          bash .github/workflows/linux-package-smoke/sidecar-check.sh "$payload/usr/bin/avogadro3d-sidecar"
+          node scripts/check-engine3d-sidecar.mjs "$payload/usr/bin/avogadro3d-sidecar"
           rm -rf -- "$payload"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "deb=$deb" >> "$GITHUB_OUTPUT"
@@ -291,7 +283,7 @@ jobs:
           ../repacked.AppImage --appimage-extract > repacked-extraction.log
           test -x squashfs-root/AppRun
           # linuxdeploy may rewrite the sidecar's RUNPATH, so check the copy itself, not its bytes.
-          bash "$GITHUB_WORKSPACE/.github/workflows/linux-package-smoke/sidecar-check.sh" squashfs-root/usr/bin/avogadro3d-sidecar
+          node "$GITHUB_WORKSPACE/scripts/check-engine3d-sidecar.mjs" squashfs-root/usr/bin/avogadro3d-sidecar
           echo 'Shared libraries under usr/lib in the repacked AppImage:'
           find squashfs-root/usr/lib \( -type f -o -type l \) \( -name '*.so' -o -name '*.so.*' \) -print | LC_ALL=C sort
           leftovers=$(find squashfs-root \( "${host_libs[@]}" \) -print)
