@@ -150,7 +150,7 @@ server that exposes the same operations as typed tools to Claude Code, Claude De
 clients. To register it with Claude Code:
 
 ```sh
-claude mcp add chemdraft -- pnpm -s --dir <path-to-your-ChemDraft-checkout> chemdraft-mcp
+claude mcp add chemdraft -- pnpm -s --dir "<checkout>" chemdraft-mcp
 ```
 
 **Agent Skill** ([skills/chemdraft](skills/chemdraft/SKILL.md)). One skill folder in the open Agent
@@ -158,6 +158,7 @@ Skills format. It teaches an assistant to use ChemDraft's tools instead of drawi
 hand or quoting chemistry numbers from memory. On macOS, link it into Claude Code:
 
 ```sh
+mkdir -p "$HOME/.claude/skills"
 ln -s "<checkout>/skills/chemdraft" "$HOME/.claude/skills/chemdraft"
 ```
 
@@ -183,6 +184,7 @@ Before sending a change, run the same checks as CI:
 ```sh
 pnpm lint
 pnpm vitest run
+node --test "scripts/*.test.mjs" "tools/release/*.test.mjs"
 pnpm build
 git diff --check
 cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check
