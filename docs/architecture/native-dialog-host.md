@@ -415,19 +415,37 @@ result message. Rust also checks a submitted value against the retained snapshot
 Snapshot and action share the 3400-byte serialized budget used by `engineInstall`, which keeps the
 complete channel delivery below 4096 bytes. The owner fits every request into that budget: the
 initial value keeps priority, then the display strings share the remaining room (an ordinary request
-passes unchanged). The form disables Submit, with a message, for an answer that would not fit.
+passes unchanged). Every byte count here is serialized: UTF-8 after JSON string escaping, so a
+quotation mark or backslash costs 2 bytes and a control character 2 or 6, not its raw UTF-8 size.
+Even with every display string and the status line at their reserved minimums, at least 1,600
+serialized bytes remain for the initial value, so an `initialValue` within `maxLength` whose
+serialized size is at most 1,600 bytes (for example 533 CJK characters) is always delivered whole
+(except that NUL, U+0000, characters are removed; no other character is stripped),
+and a longer one may be cut at a code-point boundary. The form disables Submit, with a message, for
+an answer that would not fit (over about 2,800 serialized bytes: 933 CJK characters fit, 934 do not).
+`PluginDialogsAPI.promptText` and the plugin authoring guide state both limits.
 
 `PluginPromptTextController` keeps its queue and the plugin host keeps its one-prompt-per-plugin rule;
 `presentPluginTextPromptsNatively` shows the queue's head in its own session, one window at a time,
-owned by the tab active when it is shown. Submit (button or Enter; an Enter that confirms an IME
-composition does not submit) resolves the request with the exact text. Cancel, Escape (on key
-release, so its auto-repeat stays in the dialog), Cmd+. (macOS only), Cmd/Ctrl+W, the title-bar
-close and closing the owning tab resolve it as cancelled. When the request ends first (the command
-returned, the plugin was disabled), its signal closes the window, even one still opening. As with
-page enlargement, the native host returns focus to the document window when the question held focus,
-and the document restores focus to the active canvas. A native creation failure reports status and
-cancels the request; there is no in-page fallback on desktop. The browser build has no owned native
-windows and renders the same `PluginTextPromptForm` as an in-page modal.
+owned by the tab whose document the asking command was invoked on (`documentKey`; the active tab for a
+prompt bound to no document), even when another tab is active when it is shown. A document-bound
+prompt can be answered only on its own tab: while another tab is active it stays open with Submit off
+and a status line naming its tab; that neither cancels it nor changes its tab, and switching back turns
+Submit on again. A prompt bound to no document keeps Submit on whichever tab is active, because
+`PluginPromptTextController` accepts its answer on any tab; its window stays with the tab that was
+active when it opened. An answer to a document-bound prompt refused because its tab lost focus while
+the window was closing reopens the prompt on its tab with the submitted text as its draft. That draft
+is bounded as if the status line were at its longest, so no later state change clips it; when even
+that cuts it short, the owner keeps the whole answer, a status line on its own tab says so, and
+submitting the shown draft unchanged delivers the whole answer (an edited draft is sent as edited). Submit
+(button or Enter; an Enter that confirms an IME composition does not submit) resolves the request
+with the exact text. Cancel, Escape (on key release, so its auto-repeat stays in the dialog), Cmd+.
+(macOS only), Cmd/Ctrl+W, the title-bar close and closing the owning tab resolve it as cancelled.
+When the request ends first (the command returned, the plugin was disabled), its signal
+closes the window, even one still opening. As with page enlargement, the native host returns focus
+to the document window when the question held focus, and the document restores focus to the
+active canvas. A native creation failure reports status and cancels the request; there is no in-page
+fallback on desktop. The browser build has no owned native windows and renders the same `PluginTextPromptForm` as an in-page modal.
 
 ## Stage 2: modeless Export
 

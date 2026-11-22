@@ -112,7 +112,9 @@ const worstCaseEnvelope = (dialogKind: DialogKind) => ({ protocolVersion: 1, own
   documentTabId: "x".repeat(128), sessionId: "x".repeat(128), requestId: "x".repeat(128), snapshotRevision: Number.MAX_SAFE_INTEGER });
 const textBytes = (text: string) => serializedBytes(text) - 2;
 /** Fit a prompt into the native message budget. The initial value is the user's data and keeps
- * priority; the display strings keep a minimum, then share whatever room remains. */
+ * priority; the display strings keep a minimum, then share whatever room remains. With every display
+ * string and the status line at that minimum, at least 1,600 serialized bytes remain for the initial
+ * value; a longer one is cut at a code-point boundary. PluginDialogsAPI.promptText documents this limit. */
 export function boundedPluginTextPromptSnapshot(data: PluginTextPromptSnapshot): PluginTextPromptSnapshot {
   const L = PLUGIN_TEXT_PROMPT_LIMITS;
   const display = [

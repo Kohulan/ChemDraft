@@ -68,6 +68,22 @@ describe("pluginTextPrompt contract", () => {
     expect(bytes({ ...worstEnvelope, type: "snapshot", data: emoji })).toBeLessThanOrEqual(PLUGIN_TEXT_PROMPT_MAX_BYTES);
   });
 
+  it("always delivers the documented 1,600 bytes of initial value and accepts answers of about 2,800 bytes", () => {
+    // The limits PluginDialogsAPI.promptText and AUTHORING.md state, with every other field at its worst.
+    const worstEnvelope = { ...envelope, documentTabId: "x".repeat(128), sessionId: "x".repeat(128), requestId: "x".repeat(128),
+      snapshotRevision: Number.MAX_SAFE_INTEGER };
+    const worst = (initialValue: string) => boundedPluginTextPromptSnapshot(prompt({ title: "題".repeat(200), label: "標".repeat(200),
+      placeholder: "例".repeat(200), submitLabel: "挿".repeat(200), pluginName: "名".repeat(128), pluginId: "i".repeat(256),
+      maxLength: 2000, statusLine: "状".repeat(200), submitEnabled: false, initialValue }));
+    for (const initialValue of ["a".repeat(1600), "語".repeat(533)]) {
+      const bounded = worst(initialValue);
+      expect(bounded.initialValue).toBe(initialValue);
+      expect(bytes({ ...worstEnvelope, type: "snapshot", data: bounded })).toBeLessThanOrEqual(PLUGIN_TEXT_PROMPT_MAX_BYTES);
+    }
+    expect(pluginTextPromptValueFits("語".repeat(933), 2000)).toBe(true);
+    expect(pluginTextPromptValueFits("語".repeat(934), 2000)).toBe(false);
+  });
+
   it("checks a submitted value against the request's limit and the channel budget", () => {
     expect(pluginTextPromptValueFits("benzene", 500)).toBe(true);
     expect(pluginTextPromptValueFits("", 500)).toBe(false);

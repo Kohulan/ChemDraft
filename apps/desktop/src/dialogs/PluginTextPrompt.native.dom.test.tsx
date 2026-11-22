@@ -83,7 +83,7 @@ it.each([
 ] as const)("%s %s: the plugin text prompt is its own native window, not part of the document", async (platform, method: Method) => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("localStorage", new MemoryStorage());
-  vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+  vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
   vi.spyOn(navigator, "platform", "get").mockReturnValue(platform === "macos" ? "MacIntel" : "Win32");
   native.open.mockResolvedValue({ hostId: "host", windowLabel: label });
   native.send.mockImplementation(async (_id, message) => {
@@ -184,7 +184,7 @@ it.each([
 it("keeps the prompt open with Submit off while another tab is active, and inserts only into its own tab", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("localStorage", new MemoryStorage());
-  vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+  vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
   vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
   native.open.mockResolvedValue({ hostId: "host", windowLabel: label });
   native.publish.mockImplementation(async (_id, message) => { native.receiveHost!(message); });
