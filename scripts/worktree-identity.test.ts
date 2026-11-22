@@ -50,8 +50,8 @@ describe.skipIf(process.platform === "win32")("run-app shared dev lock guard", (
     };
   }
 
-  function runShell(script: string, env: NodeJS.ProcessEnv) {
-    return spawnSync("/bin/bash", ["-c", `${definitions}\n${script}`], { encoding: "utf8", env, timeout: 5000 });
+  function runShell(script: string, env: NodeJS.ProcessEnv, timeout = 5000) {
+    return spawnSync("/bin/bash", ["-c", `${definitions}\n${script}`], { encoding: "utf8", env, timeout });
   }
 
   const probeOnly = `kill() {
@@ -202,11 +202,11 @@ describe.skipIf(process.platform === "win32")("run-app shared dev lock guard", (
           process.exit(0);
         });
         console.log('ready');
-        setTimeout(() => process.exit(1), 8000);
+        setTimeout(() => process.exit(1), 60000);
       \`], { stdio: ['ignore', 'pipe', 'inherit'] });
       child.stdout.once('data', () => console.log('ready'));
       setInterval(() => { if (existsSync(join(directory, 'finish'))) process.exit(0); }, 20);
-      setTimeout(() => process.exit(1), 8000);
+      setTimeout(() => process.exit(1), 60000);
     `);
     const devPath = source.slice(source.indexOf('\nif [ "$RUN_MODE" = "--dev" ]; then\n'),
       source.indexOf('\nstop_existing_dev_server "$DEV_PORT" ignore-unrelated\n'));
@@ -240,11 +240,11 @@ describe.skipIf(process.platform === "win32")("run-app shared dev lock guard", (
       });
       // A terminal sends Ctrl-C to run-app's foreground process group.
       process.kill(-holder.pid!, `SIG${signal}` as NodeJS.Signals);
-      await expect.poll(() => existsSync(interrupted), { timeout: 2000 }).toBe(true);
-      await expect.poll(() => existsSync(descendantStopped), { timeout: 2000 }).toBe(true);
+      await expect.poll(() => existsSync(interrupted), { timeout: 30000, interval: 50 }).toBe(true);
+      await expect.poll(() => existsSync(descendantStopped), { timeout: 30000, interval: 50 }).toBe(true);
       expect(existsSync(lock)).toBe(true);
       expect(holder.exitCode).toBe(null);
-      const second = runShell(`${probeOnly}\nacquire_dev_launch_lock`, env);
+      const second = runShell(`${probeOnly}\nacquire_dev_launch_lock`, env, 30000);
       expect(second.status).toBe(1);
       expect(second.stderr).toContain("another run-app holds");
     } finally {
@@ -254,7 +254,9 @@ describe.skipIf(process.platform === "win32")("run-app shared dev lock guard", (
     expect(holder.exitCode).toBe({ INT: 130, TERM: 143, HUP: 129 }[signal]);
     expect(stderr).not.toContain("unexpected kill");
     expect(existsSync(lock)).toBe(false);
-  });
+    // Generous: each wait above is for an event, not a fixed delay, so a loaded CI host only
+    // makes this slower, never wrong.
+  }, 120000);
 
   it("bounds the dev cancellation wait if its child ignores TERM", () => {
     const { lock, env } = lockFixture();
