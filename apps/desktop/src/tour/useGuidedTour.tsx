@@ -32,7 +32,7 @@ export function useGuidedTour(options: {
     if (isDesktopRuntime()) {
       const coordinator = options.coordinator();
       if (!coordinator) throw new Error("The dialog host is unavailable.");
-      await coordinator.openGuidedTour(options.scheme, automatic);
+      await coordinator.openGuidedTour(options.scheme, automatic, options.plugins?.() ?? []);
     } else {
       setBrowserError(undefined);
       setBrowserPlugins(options.plugins?.() ?? []);

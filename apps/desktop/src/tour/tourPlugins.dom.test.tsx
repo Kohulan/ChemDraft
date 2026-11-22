@@ -38,8 +38,8 @@ function menuItemsFor(installed: readonly string[], disabled: readonly string[] 
 const allPluginIds = OFFICIAL_PLUGIN_CATALOG.map(entry => entry.pluginId);
 const PLUGINS_TITLE = "Add features with plugins";
 const PLUGINS_TEXT = "ChemDraft does more through plugins. Official plugins add NMR prediction, structure recognition from images, " +
-  "and chemical naming. To get them, open the Plugins menu, choose Plugins > Add or Remove Plugins…, and install one from its " +
-  "catalog of official plugins. Beyond the official ones, you can vibe code your own: choose Plugins > Vibe Code Your Own Plugin… for step-by-step help. " +
+  "and chemical naming. To get them, choose Plugins > Add or Remove Plugins… and install one from the catalog of official plugins. " +
+  "Beyond the official ones, you can vibe code your own: choose Plugins > Vibe Code Your Own Plugin… for step-by-step help. " +
   "The plugin authoring guide is at:";
 
 let container: HTMLDivElement;

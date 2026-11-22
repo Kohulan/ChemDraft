@@ -99,7 +99,7 @@ export function tourSteps(
     },
     {
       title: "Add features with plugins",
-      text: `ChemDraft does more through plugins. Official plugins add NMR prediction, structure recognition from images, and chemical naming. To get them, open the ${menu.menu} menu, choose ${menu.menu} > ${menu.manager}, and install one from its catalog of official plugins. Beyond the official ones, you can vibe code your own: choose ${menu.menu} > ${menu.vibeCode} for step-by-step help. The plugin authoring guide is at:`,
+      text: `ChemDraft does more through plugins. Official plugins add NMR prediction, structure recognition from images, and chemical naming. To get them, choose ${menu.menu} > ${menu.manager} and install one from the catalog of official plugins. Beyond the official ones, you can vibe code your own: choose ${menu.menu} > ${menu.vibeCode} for step-by-step help. The plugin authoring guide is at:`,
       url: PLUGIN_AUTHORING_GUIDE_URL
     },
     {
