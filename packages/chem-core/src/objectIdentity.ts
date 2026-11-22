@@ -3,8 +3,8 @@ import type { DocumentObject } from "./schemas";
 /**
  * Host-owned object identity (ChemDraft 1.2.3).
  *
- * An object id is document data: unique within a page, free again once its object is deleted, and
- * reused by a paste, an undo, or a plugin insert. So an id cannot tell "the object the user selected"
+ * An object id is document data and is not guaranteed unique within a page; imported or hand-edited
+ * documents can repeat ids, and ids can also be freed and reused. So an id cannot tell "the object the user selected"
  * from "a different object that now has its id". This identity can. It lives only in memory, keyed
  * by the object value itself, like the bracket creation identity in brackets.ts, in one runtime that
  * every chem-core copy in the realm shares (below; a copy that cannot adopt it keeps a private one):
@@ -14,15 +14,17 @@ import type { DocumentObject } from "./schemas";
  *
  * - Every object value has one identity, and never exchanges it for another. The engine gives one to
  *   every object of every document it adopts (`holdObjectIdentities`). Two early returns hand their
- *   input back unchanged, neither cloned nor adopted nor pre-identified: `applyPatches` with no
- *   patches, and `adoptDerivedDocument` when it adopts nothing (see `holdObjectIdentities`). Any other
- *   value gets one the first time it is asked for.
+ *   input back unchanged: `applyPatches` with no patches, and `adoptDerivedDocument` when it adopts
+ *   nothing (see `holdObjectIdentities`). These returns perform no cloning, adoption, or identity
+ *   minting. A non-engine input is returned unadopted and is not newly pre-identified; an already-engine
+ *   input remains adopted and pre-identified. Any other value gets one the first time it is asked for.
  * - An edit that replaces an object value with an edited copy of the same object carries the
  *   identity to the copy (`retainObjectIdentity`): a patch update or move, a normalization pass
  *   re-admitted through `adoptDerivedDocument`, the engine's copy of a whole document. A move to
  *   another page keeps the value itself; undo and redo reinstate earlier values, which still hold
- *   theirs. Carrying only ever fills in an identity a value does not have yet, so a value that is
- *   already in a document can never be handed another object's identity.
+ *   theirs. Carrying only fills a missing identity, so an object in an engine-adopted document cannot be
+ *   handed another object's identity; an unidentified value, including one already in a non-engine
+ *   document, still can.
  * - An insertion (`addObject`: paste, duplicate, template, plugin insert) parses a new value, and so
  *   gets a fresh identity even when it reuses an id.
  * - Any other new value, including one made by a path that forgot to carry the identity, also gets a
@@ -52,14 +54,17 @@ const { create, defineProperty, freeze, getOwnPropertyDescriptor, getPrototypeOf
 const { ownKeys } = Reflect;
 
 /**
- * One identity runtime per JavaScript realm, shared by every chem-core copy loaded in it.
+ * One identity runtime per JavaScript realm. Compatible copies that successfully adopt the published runtime
+ * share it; copies finding another version, an untrusted runtime, or an unpublishable global keep private
+ * runtimes.
  *
  * A host can hold more than one chem-core: the published plugin-host SDK bundles its own, and an
  * embedder applies writes through another (its own `@chemdraft/chem-core`, or a writer built on it). A
  * module-private map would split identity between them: the embedder's edit would carry the identity in
  * its copy only, and the SDK's next pin check would find nothing (fail closed, but a legitimate second
  * write to the same selected object refused). So the first copy to load publishes its runtime on
- * `globalThis` under a registered symbol, and every later copy uses that one.
+ * `globalThis` under a registered symbol, only if the global property can be defined, and every later
+ * compatible copy uses that one.
  *
  * - The runtime is a frozen, prototype-less object holding `version` and three operations, each a
  *   fixed property: `identityOf`, `holds` and `retain`, the operations chem-core already exports. It
@@ -67,7 +72,8 @@ const { ownKeys } = Reflect;
  *   `carry` of 1.2.3's first build did; Kimi run-20261122-134802-dbfee4, finding 2), so a holder of the
  *   global can do nothing a chem-core import cannot already do. The global property is non-enumerable,
  *   non-writable and non-configurable: once published it cannot be replaced.
- * - A later copy adopts a published runtime only after checking that it came from chem-core
+ * - A later copy adopts a published runtime only after checking its fixed property, version,
+ *   shape, and behavior on fresh probes; these checks do not establish provenance
  *   (`adoptablePublishedRuntime`; finding 1): it must sit in exactly that property, have exactly that
  *   shape, and behave as this module's runtime does on fresh probe values, which a stand-in whose
  *   `holds` matches anything, or anything with the id, does not. A copy that finds anything else keeps
@@ -292,19 +298,20 @@ export function parseWithoutIdentityTransfers<T>(parse: () => T): T {
  * document), so once a document is adopted, `retain`, which only fills in a missing identity, can
  * never hand any of its objects another object's.
  *
- * This applies to documents the engine adopts. Two early returns hand back their input unchanged,
- * neither cloned nor adopted nor pre-identified: `applyPatches` with no patches, and
+ * This applies to documents the engine adopts. Early returns hand back their input unchanged:
+ * `applyPatches` with no patches, `toEngineDocument` and `admitParsedDocument` for an engine input, and
  * `adoptDerivedDocument` when `next` is `base` itself, is already an engine document, or comes with a
- * `base` that is not an engine document. (An engine `base` or `next` was pre-identified when it was
- * adopted. Making these returns mint identities would change what a non-engine document's own
- * objects can retain, so they deliberately do not.)
+ * `base` that is not an engine document. These returns perform no cloning, adoption, or identity
+ * minting. A non-engine input is returned unadopted and is not newly pre-identified; an already-engine
+ * input remains adopted and pre-identified. (Making these returns mint identities would change what a
+ * non-engine document's own objects can retain, so they deliberately do not.)
  *
  * A value that already holds an identity keeps it, so a value that was given a selected object's
  * identity with `retain` while outside every document (the retain residual) keeps it once a document
- * containing it is adopted. That document reaches the engine only through `adoptDerivedDocument`,
- * `admitParsedDocument`, `toEngineDocument`, `cloneDocument`, or `applyPatches` on a non-engine input
- * (cloned only when there are patches; returned unchanged when there are none), and each needs a
- * trusted caller to submit it. Ordinary patch insertion is not a bypass: it parses a new value.
+ * containing it is adopted. Adoption occurs through `adoptDerivedDocument` when it adopts,
+ * `admitParsedDocument`, `toEngineDocument`, or `applyPatches` with patches on a non-engine input.
+ * `cloneDocument` only copies identities and returns a non-engine document; zero-patch `applyPatches`
+ * returns its input without adoption. Each needs a trusted caller to submit such a document. Ordinary patch insertion is not a bypass: it parses a new value.
  * Index loops: nothing here goes through `Array.prototype`. Not exported from the package.
  */
 export function holdObjectIdentities(document: { readonly pages: readonly { readonly objects: readonly DocumentObject[] }[] }): void {

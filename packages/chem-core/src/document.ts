@@ -189,8 +189,9 @@ export function cloneDocument(document: ChemDraftDocument): ChemDraftDocument {
   // A copy of the same document: each object keeps its host identity (objectIdentity.ts), whatever
   // that identity is, so an original that was given a selected object's identity while outside every
   // document passes it on (the retain residual: a trusted caller is needed to submit such a document).
-  // The parse gives the copies none of their own, so each can take its original's. The copy is not
-  // an engine document and is not pre-identified; `toEngineDocument` and `applyPatches` do that.
+  // The parse gives the copies none of their own, so each can take its original's. The copy is not an
+  // engine document, but every copied object holds its original's identity (minted on the original if
+  // necessary); `toEngineDocument` and `applyPatches` subsequently adopt the copy.
   const clone = parseWithoutIdentityTransfers(() => parseDocument(JSON.parse(JSON.stringify(document)) as unknown));
   document.pages.forEach((page, pageIndex) => page.objects.forEach((object, objectIndex) => {
     const copy = clone.pages[pageIndex]!.objects[objectIndex]!;

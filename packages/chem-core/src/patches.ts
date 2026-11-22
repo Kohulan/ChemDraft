@@ -126,8 +126,10 @@ export function applyPatches(
   options: ApplyPatchOptions = {}
 ): ChemDraftDocument {
   if (patches.length === 0) {
-    // Nothing to apply: `document` comes back as it is, whether or not it is an engine document, and so
-    // neither cloned nor adopted nor pre-identified (objectIdentity.ts, `holdObjectIdentities`).
+    // Nothing to apply: `document` comes back as it is, whether or not it is an engine document. This
+    // return performs no cloning, adoption, or identity minting. A non-engine input is returned unadopted
+    // and is not newly pre-identified; an already-engine input remains adopted and pre-identified
+    // (objectIdentity.ts, `holdObjectIdentities`).
     return document;
   }
   // Validate batches before creating a draft, then use the existing atomic engine.
@@ -205,8 +207,8 @@ export function applyPatches(
 }
 
 /**
- * Whether the patch engine produced `document` (as a patch result or through
- * `adoptDerivedDocument`). Such a document is already validated and normalized, so a consumer that
+ * Whether the document has been admitted to the engine, including as a patch result or through
+ * `toEngineDocument`, `admitParsedDocument`, or `adoptDerivedDocument`. Such a document is already validated and normalized, so a consumer that
  * would otherwise re-parse it — a save, run after every pause in editing — can use it as it is.
  */
 export function isEngineDocument(document: ChemDraftDocument): boolean {
@@ -217,8 +219,8 @@ export function isEngineDocument(document: ChemDraftDocument): boolean {
  * `document` as an engine document: validated and normalized once, now, as a patch would on its
  * first edit. For a document that enters from outside — opened, restored, created — so that saves
  * before the first edit skip re-validation and the first edit shares its unchanged objects rather
- * than deep-copying the whole page. The result is an independent copy; the input is never adopted,
- * since its caller may still hold and mutate it. The copy is pre-identified, and each copied object
+ * than deep-copying the whole page. For a non-engine input, the result is an independent copy and the input is not adopted,
+ * since its caller may still hold and mutate it. An already-engine input is returned unchanged. The copy is pre-identified, and each copied object
  * keeps the identity of its original, including one the original was given with `retainObjectIdentity`
  * while outside every document: a trusted caller is needed to submit such a document.
  */
@@ -273,9 +275,10 @@ export function admitParsedDocument(document: ChemDraftDocument): ChemDraftDocum
  * Objects `next` shares with `base` were validated when `base` was produced; only the others are
  * parsed, and the document and page shells are validated as a patch result's are — including any
  * compatibility, styles, or plugin data `next` replaced. Throws, like a
- * patch, when a replaced object is invalid. Nothing is adopted, and `next` comes back unchanged (not
- * cloned, not pre-identified), when `next` is `base` itself, when `next` is already an engine
- * document, or when `base` is not an engine document. Otherwise the result is pre-identified, and an
+ * patch, when a replaced object is invalid. `next` comes back unchanged when `next` is `base` itself, when
+ * `next` is already an engine document, or when `base` is not an engine document. These returns perform
+ * no cloning, adoption, or identity minting. A non-engine input is returned unadopted and is not newly
+ * pre-identified; an already-engine input remains adopted and pre-identified. Otherwise the result is pre-identified, and an
  * object of `next` that holds an identity keeps it, so the caller must be trusted not to have given
  * one to a value outside every document (objectIdentity.ts, `holdObjectIdentities`).
  */
