@@ -5657,7 +5657,8 @@ mod tests {
         let mut message = snapshot();
         message.dialog_kind = "guidedTour".into();
         let tour = |plugins: Option<Value>| {
-            let mut data = json!({"title":"Take the Tour", "scheme":"chemdraft", "automatic":false});
+            let mut data =
+                json!({"title":"Take the Tour", "scheme":"chemdraft", "automatic":false});
             if let Some(plugins) = plugins {
                 data["plugins"] = plugins;
             }
