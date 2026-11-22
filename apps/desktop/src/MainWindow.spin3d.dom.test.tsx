@@ -12,9 +12,10 @@ import { writeClipboardText } from "./clipboard";
 import { analysisFacingStructure, assertSpin3dDocumentIdentity, attachSpin3dModelFromConformer, createPhase4Document, getSelectedMolecule,
   insertNativeMolfileMolecule, normalizeCommittedDocument, spin3dModelCoordsForMolecule, validSpin3dModelFor } from "./documentWorkflow";
 import type { Engine3dSidecarSessionOutput } from "./engine3dSidecar";
+import { interactive3dPhaseLabel } from "./interactive3dStatus";
 import { serializeSpin3dMolfile, Spin3dStereoReference } from "./interaction/spin3dStereo";
 import { quatFromAxisAngle, quatToViewMatrix } from "./interaction/rotation3d";
-import { orientedOverlayScale, projectSpin } from "./interaction/spinOverlay";
+import { medianBondLength3d, orientedOverlayScale, projectSpin } from "./interaction/spinOverlay";
 import { installDomRdkitLoader } from "./testSupport/rdkitIdentity";
 import { DOM_COMMAND_EVENT } from "./window-manager";
 
@@ -201,6 +202,73 @@ describe("Spin 3D on the canvas", () => {
       .toThrow(/the stereocenter at CMe\d+ would lose its stereo assignment/);
   });
 
+  it("shows Interactive 3D's instructions, not its phase name, and rotates on a drag in empty space", async () => {
+    // Linux 1.2.2 B8: the status line read the raw phase "tug-ready", which hid the only text saying
+    // that a drag on an atom pulls it and a drag in empty space rotates.
+    const initial = modeledDrawing();
+    const molecule = getSelectedMolecule(initial)!;
+    const ids = molecule.atoms.map(atom => atom.id);
+    const pairs: [number, number][] = molecule.bonds.map(bond => [ids.indexOf(bond.fromAtomId), ids.indexOf(bond.toAtomId)]);
+    const placement = {
+      centerX: molecule.atoms.reduce((sum, a) => sum + a.x, 0) / ids.length,
+      centerY: molecule.atoms.reduce((sum, a) => sum + a.y, 0) / ids.length,
+      scale: orientedOverlayScale(molecule.atoms, seed, pairs, quatToViewMatrix(orientation))
+    };
+    const requests: Engine3DRequest[] = [];
+    vi.mocked(invoke).mockImplementation(async (name, args) => {
+      if (name === "engine3d_sidecar_status") return { available: true, source: "bundled", logEnabled: true };
+      if (!name.startsWith("engine3d_sidecar_")) return undefined;
+      const line = (args as { lines?: string[] })?.lines?.[0];
+      const request = line ? JSON.parse(line) as Engine3DRequest : undefined;
+      if (request) requests.push(request);
+      const output: Engine3dSidecarSessionOutput = { processSessionId: "process", stdoutLines: [], stderr: "", exited: false };
+      if (request?.type !== "createSession") return output;
+      const envelope = { protocolVersion: Engine3DProtocolVersion, sessionId: "session", requestId: request.requestId };
+      output.stdoutLines.push(
+        JSON.stringify({ ...envelope, type: "response", ok: true, result: { sessionId: "session" } }),
+        JSON.stringify({ ...envelope, type: "event", eventType: "coordinatesChanged", reason: "embed",
+          coordinateRevision: 1, coords3dByAtomId: positionMap(ids, seed) })
+      );
+      return output;
+    });
+    await mount(initial);
+    await command("structure.openInteractive3d");
+    const rawStatus = /tug-ready|attaching|coord rev|beginDrag|updateDrag|endDrag/;
+    await vi.waitFor(() => expect(status()).toContain(`${interactive3dPhaseLabel("ready")} · `));
+    expect(status()).not.toMatch(rawStatus);
+
+    // A point inside the selection box's 14-unit margin and outside every atom's pull radius.
+    const atoms = projectSpin(seed, pairs, orientation, placement).atoms;
+    const pullRadius = Math.max(6, 0.5 * placement.scale * medianBondLength3d(seed, pairs));
+    const clearance = (point: { x: number; y: number }) =>
+      Math.min(...atoms.map(atom => Math.hypot(atom.sx - point.x, atom.sy - point.y)));
+    const candidates = [0, 0.25, 0.5, 0.75, 1].flatMap(fx => [0, 0.25, 0.5, 0.75, 1].map(fy => ({
+      x: molecule.x - 12 + fx * (molecule.width + 24),
+      y: molecule.y - 12 + fy * (molecule.height + 24)
+    })));
+    const spot = candidates.reduce((best, point) => clearance(point) > clearance(best) ? point : best);
+    expect(clearance(spot)).toBeGreaterThan(pullRadius);
+
+    const svg = overlay()!;
+    svg.getBoundingClientRect = () => rectFor(initial);
+    const before = svg.innerHTML;
+    await act(async () => {
+      pointer(svg, "pointerdown", spot.x, spot.y);
+      pointer(svg, "pointermove", spot.x + 40, spot.y + 25);
+      pointer(svg, "pointerup", spot.x + 40, spot.y + 25);
+    });
+    expect(requests.map(request => request.type)).toEqual(["createSession"]);
+    expect(overlay()).toBe(svg);
+    expect(svg.innerHTML).not.toBe(before);
+    expect(status()).toContain(`${interactive3dPhaseLabel("ready")} · `);
+    expect(status()).not.toMatch(rawStatus);
+    // CHEMDRAFT_ENGINE3D_LOG: the press routing reaches the shell's stderr log.
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith("engine3d_sidecar_status",
+      { diagnostic: expect.stringMatching(/^press 1 at .*: rotate$/) }));
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith("engine3d_sidecar_status",
+      { diagnostic: "release 1: rotate ended after 1 moves" }));
+  });
+
   it.each(["outside click", "second grab", "second grab and outside click", "settle timeout",
     "grab during settle timeout", "quick grab after blocked tug"])(
     "handles %s during or after a tug's settle", async action => {
@@ -266,7 +334,7 @@ describe("Spin 3D on the canvas", () => {
     });
     await mount(initial);
     await command("structure.openInteractive3d");
-    await vi.waitFor(() => expect(status()).toContain("tug-ready"));
+    await vi.waitFor(() => expect(status()).toContain(interactive3dPhaseLabel("ready")));
     const svg = overlay()!;
     svg.getBoundingClientRect = () => rectFor(initial);
     await act(async () => {
@@ -314,7 +382,7 @@ describe("Spin 3D on the canvas", () => {
         return;
       }
       await command("structure.openInteractive3d");
-      await vi.waitFor(() => expect(status()).toContain("tug-ready"));
+      await vi.waitFor(() => expect(status()).toContain(interactive3dPhaseLabel("ready")));
       const creates = requests.filter(request => request.type === "createSession");
       expect(creates).toHaveLength(2);
       expect(creates[1].input.coords3dByAtomId).toEqual(positionMap(ids, settled));

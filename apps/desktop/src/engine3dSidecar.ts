@@ -29,6 +29,8 @@ export interface Engine3dSidecarStatus {
   resolvedPath?: string;
   bundledBinaryName: string;
   targetTriple: string;
+  /** The shell was started with CHEMDRAFT_ENGINE3D_LOG=1 (see `logEngine3dDiagnostic`). */
+  logEnabled?: boolean;
 }
 
 export interface Engine3dSidecarSessionOutput {
@@ -87,13 +89,31 @@ const Engine3dWorkspaceReadyTimeoutMs = 12_000;
 const Engine3dWorkspaceReadyPollMs = 80;
 const Engine3dWorkspaceSettleTimeoutMs = 2_000;
 
+let engine3dDiagnosticsEnabled = false;
+
 export async function readEngine3dSidecarStatus(): Promise<Engine3dSidecarStatus | undefined> {
   try {
     const { invoke } = await import("@tauri-apps/api/core");
-    return await invoke<Engine3dSidecarStatus>("engine3d_sidecar_status");
+    const status = await invoke<Engine3dSidecarStatus>("engine3d_sidecar_status");
+    engine3dDiagnosticsEnabled = status?.logEnabled === true;
+    return status;
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The webview's half of the opt-in Interactive 3D diagnostic (CHEMDRAFT_ENGINE3D_LOG=1, read by the
+ * shell): session phases and how each press on the 3D view was routed (rotate, pull, flatten or
+ * ignored), so a tester's stderr shows whether input reached the view at all next to the shell's
+ * protocol lines. A no-op unless the last status read reported the log enabled. The line travels on
+ * the status command because the app's command set is fixed by its ACL (build.rs, capabilities).
+ */
+export function logEngine3dDiagnostic(line: string): void {
+  if (!engine3dDiagnosticsEnabled) return;
+  void import("@tauri-apps/api/core")
+    .then(({ invoke }) => invoke("engine3d_sidecar_status", { diagnostic: line }))
+    .catch(() => undefined);
 }
 
 /**

@@ -213,6 +213,9 @@ const ENGINE3D_PROTOCOL_VERSION: u32 = 2;
 const ENGINE3D_SIDECAR_BASENAME: &str = "avogadro3d-sidecar";
 const STRUCTURE_INTERACTIVE3D_COMMAND_ID: &str = "structure.openInteractive3d";
 const ENGINE3D_SIDECAR_ENV_VAR: &str = "CHEMDRAFT_ENGINE3D_SIDECAR";
+/// `CHEMDRAFT_ENGINE3D_LOG=1` turns on the Interactive 3D diagnostic on stderr (`engine3d_log`).
+/// Off by default, and the same on every platform.
+const ENGINE3D_LOG_ENV_VAR: &str = "CHEMDRAFT_ENGINE3D_LOG";
 const ENGINE3D_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const ENGINE3D_MAX_BATCH_LINES: usize = 128;
 const ENGINE3D_SESSION_OUTPUT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -1242,6 +1245,8 @@ struct Engine3dManagedSession {
     stdin: Option<ChildStdin>,
     stdout_rx: Receiver<String>,
     stderr_rx: Receiver<String>,
+    /// The diagnostic reports the process's exit once, not on every later poll.
+    exit_logged: bool,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -1289,6 +1294,7 @@ struct Engine3dSidecarStatus {
     resolved_path: Option<String>,
     bundled_binary_name: String,
     target_triple: String,
+    log_enabled: bool,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -8687,8 +8693,14 @@ fn agent_bridge_flag_enabled(value: Option<&str>) -> bool {
     )
 }
 
+/// `diagnostic` carries the webview's half of the Interactive 3D log (session phases and how each
+/// press on the 3D view was routed). It rides on this command because the app's command set is fixed
+/// by its ACL; the webview sends it only when the status said the log is on.
 #[tauri::command]
-fn engine3d_sidecar_status() -> Engine3dSidecarStatus {
+fn engine3d_sidecar_status(diagnostic: Option<String>) -> Engine3dSidecarStatus {
+    if let Some(line) = diagnostic {
+        engine3d_log(format_args!("webview: {}", engine3d_log_text(&line)));
+    }
     engine3d_sidecar_status_from(std::env::var(ENGINE3D_SIDECAR_ENV_VAR).ok())
 }
 
@@ -8741,7 +8753,7 @@ fn engine3d_sidecar_stop_session(
 /// webview applies the same rule to toolbars and the gallery (`sessionUnavailableCommandIds`).
 fn interactive3d_menu_item_shown() -> bool {
     static SHOWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SHOWN.get_or_init(|| engine3d_sidecar_status().available)
+    *SHOWN.get_or_init(|| engine3d_sidecar_status(None).available)
 }
 
 fn engine3d_sidecar_status_from(env_override: Option<String>) -> Engine3dSidecarStatus {
@@ -8763,7 +8775,79 @@ fn engine3d_sidecar_status_from(env_override: Option<String>) -> Engine3dSidecar
         resolved_path: resolved_path.map(|path| path.to_string_lossy().to_string()),
         bundled_binary_name: engine3d_bundled_binary_name(),
         target_triple: engine3d_target_triple().to_string(),
+        log_enabled: engine3d_log_enabled(),
     }
+}
+
+fn engine3d_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        engine3d_log_flag_enabled(std::env::var(ENGINE3D_LOG_ENV_VAR).ok().as_deref())
+    })
+}
+
+fn engine3d_log_flag_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.trim() == "1")
+}
+
+/// One line of the opt-in Interactive 3D diagnostic: every sidecar start, exit and stop, the kind of
+/// every protocol message in each direction (`engine3d_protocol_line_summary`), the sidecar's own
+/// stderr, and the webview's phases and press routing. The tester reads it to tell "no input reached
+/// the 3D view" from "the sidecar never answered" from "the answer never reached the view".
+fn engine3d_log(message: std::fmt::Arguments<'_>) {
+    if engine3d_log_enabled() {
+        eprintln!("[engine3d] {message}");
+    }
+}
+
+fn engine3d_log_lines(process_session_id: &str, direction: &str, lines: &[String]) {
+    if !engine3d_log_enabled() {
+        return;
+    }
+    for line in lines {
+        engine3d_log(format_args!(
+            "{process_session_id} {direction} {}",
+            engine3d_protocol_line_summary(line)
+        ));
+    }
+}
+
+/// A protocol line as its type and the fields that say what happened (event type, ok/error, reason,
+/// error text, request id), never its payload: coordinates and molfiles would bury the sequence.
+fn engine3d_protocol_line_summary(line: &str) -> String {
+    let Ok(serde_json::Value::Object(message)) = serde_json::from_str::<serde_json::Value>(line)
+    else {
+        return format!("unparsed line ({} bytes)", line.len());
+    };
+    let text = |key: &str| message.get(key).and_then(serde_json::Value::as_str);
+    let mut summary = text("type").unwrap_or("untyped").to_string();
+    if let Some(event_type) = text("eventType") {
+        summary.push(' ');
+        summary.push_str(event_type);
+    }
+    match message.get("ok").and_then(serde_json::Value::as_bool) {
+        Some(true) => summary.push_str(" ok"),
+        Some(false) => summary.push_str(" failed"),
+        None => {}
+    }
+    if let Some(reason) = text("reason") {
+        summary.push_str(&format!(" reason={reason}"));
+    }
+    if let Some(error) = text("error").or_else(|| text("message")) {
+        summary.push_str(&format!(": {}", engine3d_log_text(error)));
+    }
+    if let Some(request_id) = text("requestId") {
+        summary.push_str(&format!(" ({request_id})"));
+    }
+    summary
+}
+
+/// Untrusted text for one log line: control characters become spaces and it stops at 300 chars.
+fn engine3d_log_text(text: &str) -> String {
+    text.chars()
+        .take(300)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 fn normalize_engine3d_protocol_lines(
@@ -8896,7 +8980,18 @@ fn start_engine3d_sidecar_session_from_path(
         .stderr(Stdio::piped())
         .without_console_window()
         .spawn()
-        .map_err(|error| format!("Could not start interactive 3D sidecar: {error}"))?;
+        .map_err(|error| {
+            engine3d_log(format_args!(
+                "{process_session_id} could not start {}: {error}",
+                path.display()
+            ));
+            format!("Could not start interactive 3D sidecar: {error}")
+        })?;
+    engine3d_log(format_args!(
+        "{process_session_id} started {} (pid {})",
+        path.display(),
+        child.id()
+    ));
 
     let stdout = child
         .stdout
@@ -8911,9 +9006,10 @@ fn start_engine3d_sidecar_session_from_path(
         child,
         stdout_rx: spawn_engine3d_line_reader(stdout),
         stderr_rx: spawn_engine3d_line_reader(stderr),
+        exit_logged: false,
     };
 
-    write_engine3d_protocol_lines(&mut session, lines)?;
+    write_engine3d_protocol_lines(&process_session_id, &mut session, lines)?;
     let mut output = collect_engine3d_session_output(
         &process_session_id,
         &mut session,
@@ -8969,7 +9065,7 @@ fn send_engine3d_sidecar_session_lines(
     let mut session = handle
         .lock()
         .map_err(|_| "Interactive 3D sidecar session state is poisoned.".to_string())?;
-    write_engine3d_protocol_lines(&mut session, lines)?;
+    write_engine3d_protocol_lines(process_session_id, &mut session, lines)?;
     Ok(collect_engine3d_session_output(
         process_session_id,
         &mut session,
@@ -9012,6 +9108,7 @@ fn stop_engine3d_sidecar_session(
     let mut session = handle
         .lock()
         .map_err(|_| "Interactive 3D sidecar session state is poisoned.".to_string())?;
+    engine3d_log(format_args!("{process_session_id} stopping"));
     drop(session.stdin.take());
     let graceful_started = Instant::now();
     loop {
@@ -9034,6 +9131,9 @@ fn stop_engine3d_sidecar_session(
         .map_err(|error| format!("Could not poll interactive 3D sidecar: {error}"))?
         .is_none()
     {
+        engine3d_log(format_args!(
+            "{process_session_id} did not exit after stdin closed; killing it"
+        ));
         let _ = session.child.kill();
     }
     let _ = session.child.wait();
@@ -9046,9 +9146,11 @@ fn stop_engine3d_sidecar_session(
 }
 
 fn write_engine3d_protocol_lines(
+    process_session_id: &str,
     session: &mut Engine3dManagedSession,
     lines: &[String],
 ) -> Result<(), String> {
+    engine3d_log_lines(process_session_id, "->", lines);
     let stdin = session
         .stdin
         .as_mut()
@@ -9102,6 +9204,17 @@ fn collect_engine3d_session_output(
     let status = session.child.try_wait().ok().flatten();
     let exited = status.is_some();
     let exit_code = status.and_then(|status| status.code());
+    engine3d_log_lines(process_session_id, "<-", &stdout_lines);
+    for line in &stderr_lines {
+        engine3d_log(format_args!(
+            "{process_session_id} stderr: {}",
+            engine3d_log_text(line)
+        ));
+    }
+    if let Some(status) = status.filter(|_| !session.exit_logged) {
+        session.exit_logged = true;
+        engine3d_log(format_args!("{process_session_id} exited ({status})"));
+    }
 
     Engine3dSidecarSessionOutput {
         process_session_id: process_session_id.to_string(),
@@ -16626,6 +16739,52 @@ mod tests {
         if owned {
             let _ = fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn engine3d_log_is_opt_in_with_exactly_one() {
+        expect_true(engine3d_log_flag_enabled(Some("1")));
+        expect_true(engine3d_log_flag_enabled(Some(" 1\n")));
+        expect_true(!engine3d_log_flag_enabled(None));
+        expect_true(!engine3d_log_flag_enabled(Some("")));
+        expect_true(!engine3d_log_flag_enabled(Some("0")));
+        expect_true(!engine3d_log_flag_enabled(Some("true")));
+    }
+
+    #[test]
+    fn engine3d_log_summarizes_protocol_lines_without_payloads() {
+        expect_eq(
+            "beginDrag (engine3d-4)".to_string(),
+            engine3d_protocol_line_summary(
+                "{\"protocolVersion\":2,\"requestId\":\"engine3d-4\",\"type\":\"beginDrag\",\"sessionId\":\"s1\",\"atomId\":\"a1\"}",
+            ),
+        );
+        expect_eq(
+            "response ok (engine3d-4)".to_string(),
+            engine3d_protocol_line_summary(
+                "{\"protocolVersion\":2,\"requestId\":\"engine3d-4\",\"sessionId\":\"s1\",\"type\":\"response\",\"ok\":true}",
+            ),
+        );
+        expect_eq(
+            "response failed: Unknown dragged atom id. (engine3d-5)".to_string(),
+            engine3d_protocol_line_summary(
+                "{\"protocolVersion\":2,\"requestId\":\"engine3d-5\",\"sessionId\":\"s1\",\"type\":\"response\",\"ok\":false,\"error\":\"Unknown dragged atom id.\"}",
+            ),
+        );
+        let coordinates = engine3d_protocol_line_summary(
+            "{\"protocolVersion\":2,\"requestId\":\"engine3d-6.event\",\"sessionId\":\"s1\",\"type\":\"event\",\"eventType\":\"coordinatesChanged\",\"coordinateRevision\":7,\"reason\":\"settle\",\"coords3dByAtomId\":{\"a1\":{\"x\":1.25,\"y\":0,\"z\":0}}}",
+        );
+        expect_eq(
+            "event coordinatesChanged reason=settle (engine3d-6.event)".to_string(),
+            coordinates.clone(),
+        );
+        expect_true(!coordinates.contains("1.25"));
+        expect_eq(
+            "unparsed line (8 bytes)".to_string(),
+            engine3d_protocol_line_summary("not json"),
+        );
+        expect_eq("a b".to_string(), engine3d_log_text("a\nb"));
+        expect_eq(300, engine3d_log_text(&"x".repeat(400)).chars().count());
     }
 
     #[test]

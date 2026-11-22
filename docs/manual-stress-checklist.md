@@ -1815,3 +1815,32 @@ Run under KDE Plasma (Wayland session, so the app uses XWayland) and on GNOME.
   Shift+Ctrl+S and Esc, and Ctrl+O and Esc, several times. Every palette comes back exactly where
   it was, and after quitting and relaunching it opens at that same spot (toolbar-state.json is
   unchanged by the dialogs).
+
+## Linux Interactive 3D (1.2.2)
+
+Run under KDE Plasma (Wayland session, so the app uses XWayland) from a terminal, with
+`CHEMDRAFT_ENGINE3D_LOG=1` set, using the x86_64 package that bundles the real sidecar.
+
+- Paste `CCO` (ethanol), select it and open Interactive 3D from the Main toolbar's 3D button and
+  again from Structure ▸ Interactive 3D Workspace…. The status line reads "Drag empty space to
+  rotate · drag an atom to pull it · click outside to flatten · Esc to close" (a force-field
+  readout may follow the instructions). It never shows a raw name such as `tug-ready`,
+  `attaching`, `beginDrag`, `updateDrag`, `endDrag` or "3 atoms · coord rev 2".
+- Drag in empty space inside the selection box, away from the atoms: the molecule
+  rotates with the drag and stays rotated after release; drag again to keep rotating. stderr shows
+  `[engine3d] webview: press 1 at …: rotate` and `release 1: rotate ended after N moves` with N
+  above 0. If the view does not turn, keep that log: `press` lines missing means the press never
+  reached the 3D view; `rotate ended after 0 moves` means no pointer moves arrived during the drag.
+- Drag an atom: while dragging, the status reads "Pulling the atom · release to let the structure
+  settle" and the atom follows the cursor; after release it reads the instructions again. stderr
+  shows `press … pull atom …`, then the sidecar lines `-> beginDrag`, `-> updateDrag`,
+  `<- event coordinatesChanged reason=drag`, `-> endDrag` and
+  `<- event coordinatesChanged reason=settle`, each answered by `<- response ok`.
+- Arrow keys and typing a number (for example "90" then Enter) with the canvas focused do not
+  rotate the 3D view: Interactive 3D has no keyboard rotation on any platform. They must not
+  change the drawing either; Esc still closes the view with "Spin canceled" and the original 2D
+  drawing.
+- Click outside the selection box: the view flattens to the rotated perspective as one undo step.
+  Repeat with `C[C@H](O)CC` ((S)-butan-2-ol, one wedged stereocenter): rotate, pull and flatten,
+  and the Molecular Inspector still reports (S) afterwards.
+- Without `CHEMDRAFT_ENGINE3D_LOG`, the same session writes no `[engine3d]` lines.
