@@ -63,9 +63,11 @@ fn kind_spec(kind: &str) -> Result<DialogKindSpec, String> {
             maximizable: false,
             resizable: true,
             title: "Take the Tour",
+            // Height before ready, and the fallback without a measurement. TourForm reserves its
+            // tallest step, so ready's height fits every step and Try it never falls below the fold.
             size: (520.0, 375.0),
             min_size: (360.0, 260.0),
-            fit_content: false,
+            fit_content: true,
             preserve_user_frame: false,
         }),
         "vibeCodeGuide" => Ok(DialogKindSpec {
@@ -5670,6 +5672,8 @@ mod tests {
     fn guided_tour_is_a_resizable_modeless_kind_with_typed_actions() {
         let spec = kind_spec("guidedTour").unwrap();
         assert!(spec.resizable && !spec.maximizable);
+        // Sized to the tallest step's measured content, clamped to the work area.
+        assert!(spec.fit_content && !spec.preserve_user_frame);
         assert_eq!(
             native_window_title("guidedTour", spec.title, spec.title),
             "Take the Tour"
