@@ -4885,8 +4885,7 @@ impl PluginPanelShortcut {
             || shortcut.command_id.is_empty()
             || shortcut.command_id.len() > 4096
             || shortcut.command_id.trim() != shortcut.command_id
-            || shortcut.command_id == "document.closeTab"
-            || shortcut.command_id.starts_with("document.closeTab.")
+            || panel_shortcut_reaches_document_window(&shortcut.command_id)
         {
             return Err("Invalid panel shortcut command.".into());
         }
@@ -4902,6 +4901,23 @@ impl PluginPanelShortcut {
             self.command_id.clone()
         }
     }
+}
+
+/// Commands a panel's shortcut bridge must never forward: closing a document tab, and the window
+/// commands, whose native half minimizes, maximizes or closes the whole document window on the
+/// panel's behalf. Compared without any `:` routing suffix (`document_command_id`) or `.` variant.
+fn panel_shortcut_reaches_document_window(command_id: &str) -> bool {
+    let command = command_id
+        .split_once(':')
+        .map_or(command_id, |(command, _)| command);
+    std::iter::once("document.closeTab")
+        .chain(LINUX_WINDOW_COMMAND_IDS.iter().copied())
+        .any(|blocked| {
+            command == blocked
+                || command
+                    .strip_prefix(blocked)
+                    .is_some_and(|variant| variant.starts_with('.'))
+        })
 }
 
 fn validate_plugin_panel_event(
@@ -5403,9 +5419,59 @@ mod plugin_panel_label_tests {
             serde_json::json!({"commandId": " edit.undo"}),
             serde_json::json!({"commandId": "document.closeTab"}),
             serde_json::json!({"commandId": "document.closeTab.other"}),
+            serde_json::json!({"commandId": "document.closeTab:forceDocumentHistory"}),
             serde_json::json!({"commandId": "edit.undo", "sourceLabel": "main"}),
         ] {
             assert!(validate_plugin_panel_event(&label, event, &payload).is_err());
+        }
+        // The window commands act natively on the whole document window, on every platform's
+        // bridge, so a panel can no more minimize, maximize or close it than close its tab.
+        for command in [
+            "window.close",
+            "window.minimize",
+            "window.toggleMaximize",
+            "window.close.fileMenu",
+            "window.close:forceDocumentHistory",
+            "window.minimize:forceDocumentHistory",
+            "window.toggleMaximize.other",
+        ] {
+            let payload = serde_json::json!({"commandId": command});
+            assert!(
+                validate_plugin_panel_event(&label, event, &payload).is_err(),
+                "{command}"
+            );
+            assert!(
+                super::PluginPanelShortcut::parse(&payload).is_err(),
+                "{command}"
+            );
+        }
+        for allowed in [
+            "window.minimizeAll",
+            "document.closeTabs",
+            "view.window.close",
+        ] {
+            let payload = serde_json::json!({"commandId": allowed});
+            assert!(
+                validate_plugin_panel_event(&label, event, &payload).is_ok(),
+                "{allowed}"
+            );
+        }
+        // window-action is a plain event: only the trusted app windows may emit at all. Plugin
+        // panels hold no emit permission, so their only route to it was the shortcut bridge.
+        let panel_capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/plugin-panel.json")).unwrap();
+        for permission in panel_capability["permissions"].as_array().unwrap() {
+            let permission = permission.as_str().unwrap_or_default();
+            assert!(
+                !matches!(
+                    permission,
+                    "core:default"
+                        | "core:event:default"
+                        | "core:event:allow-emit"
+                        | "core:event:allow-emit-to"
+                ),
+                "{permission}"
+            );
         }
         let request = "chemdraft://toolset-command-specs-request";
         assert!(validate_plugin_panel_event(&label, request, &serde_json::json!({})).is_ok());
@@ -10940,8 +11006,10 @@ fn linux_window_menu_item<R: Runtime>(
     MenuItem::with_id(app, id, linux_window_menu_title(id), true, None::<&str>)
 }
 
-/// The window commands' native half. Only the app windows in the default capability may emit
-/// events; plugin panels may only listen, so they cannot reach this.
+/// The window commands' native half. It acts only on the document window. Only the trusted app
+/// windows in the default capability may emit events; plugin panels may only listen, and their
+/// shortcut bridge refuses these commands (`panel_shortcut_reaches_document_window`). The webview
+/// half sends only from the document window (`requestWindowAction` in windowCommands.ts).
 #[cfg(target_os = "linux")]
 fn listen_for_linux_window_actions(app: &tauri::AppHandle) {
     let target = app.clone();

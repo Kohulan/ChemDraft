@@ -1,8 +1,19 @@
 import type { PluginPanelReport } from "@chemdraft/plugin-api";
 import type { PluginHost } from "@chemdraft/plugin-host";
 
+import { isDocumentWindowCommandId } from "../windowCommands";
 import { pluginPanelIdentityKey } from "./panelBridge";
 import type { OpenPluginPanel, PluginDiagnostic } from "./types";
+
+/**
+ * The command "Run again" invokes: the report's `rerunCommandId`, else the panel's default command.
+ * A report is plugin data, so it may never name a command that closes a tab or minimizes, maximizes
+ * or closes the document window (AGENTS.md sections 3 and 4); such a name falls back to the default.
+ */
+function runAgainCommandId(report: PluginPanelReport, panelCommandId: string | undefined): string | undefined {
+  const usable = (id: string | undefined) => (id !== undefined && !isDocumentWindowCommandId(id) ? id : undefined);
+  return usable(report.rerunCommandId) ?? usable(panelCommandId);
+}
 
 /**
  * Holds the desktop's live panel state and receives declarative reports from the persistent host.
@@ -49,7 +60,7 @@ export class PluginPanelController {
       this.detached.set(detachedKey, {
         ...detachedPanel,
         report,
-        commandId: report.rerunCommandId ?? panel.commandId
+        commandId: runAgainCommandId(report, panel.commandId)
       });
       this.notify();
       return;
@@ -62,7 +73,7 @@ export class PluginPanelController {
         title: panel.title,
         preferredWindowSize: panel.preferredWindowSize,
         report,
-        commandId: report.rerunCommandId ?? panel.commandId,
+        commandId: runAgainCommandId(report, panel.commandId),
         openedAt: this.nowIso()
       });
       this.notify();
@@ -86,7 +97,7 @@ export class PluginPanelController {
       report,
       // A report may name the exact command "Run again" should re-invoke (e.g. the ¹H vs ¹³C command
       // that produced it); otherwise fall back to the panel contribution's default command.
-      commandId: report.rerunCommandId ?? panel.commandId,
+      commandId: runAgainCommandId(report, panel.commandId),
       // Pending -> result reports for the same panel are updates, not close/reopen cycles.
       openedAt: updatesOpenPanel ? previous.openedAt : this.nowIso()
     };

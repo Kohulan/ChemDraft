@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  isDocumentWindowCommandId,
   requestWindowAction,
   WINDOW_ACTION_EVENT,
   windowCommandId,
@@ -40,9 +41,33 @@ describe("window commands", () => {
 
   it("asks the native side to run the command's action", async () => {
     const emit = vi.fn(async () => undefined);
-    for (const id of windowCommandIds) await requestWindowAction(id, emit);
+    const fromDocument = async () => "main";
+    for (const id of windowCommandIds) await requestWindowAction(id, emit, fromDocument);
     expect(emit.mock.calls).toEqual(windowCommandIds.map(commandId => [WINDOW_ACTION_EVENT, { commandId }]));
-    await expect(requestWindowAction("document.closeTab", emit)).rejects.toThrow("not a window command");
+    await expect(requestWindowAction("document.closeTab", emit, fromDocument)).rejects.toThrow("not a window command");
     expect(emit).toHaveBeenCalledTimes(windowCommandIds.length);
+  });
+
+  it("asks only from the document window, never a panel, palette or dialog", async () => {
+    const emit = vi.fn(async () => undefined);
+    for (const label of ["plugin-panel-abc", "toolset-core-main", "preferences", "dialog-main-x"]) {
+      for (const id of windowCommandIds) {
+        await expect(requestWindowAction(id, emit, async () => label)).rejects.toThrow("only in the document window");
+      }
+    }
+    expect(emit).not.toHaveBeenCalled();
+  });
+
+  it("names every command that acts on the whole document window", () => {
+    for (const id of [
+      ...windowCommandIds,
+      "window.close.fileMenu",
+      "window.minimize:forceDocumentHistory",
+      "document.closeTab",
+      "document.closeTab.other"
+    ]) expect(isDocumentWindowCommandId(id), id).toBe(true);
+    for (const id of ["window.minimizeAll", "document.closeTabs", "edit.undo", "plugin.demo.run"]) {
+      expect(isDocumentWindowCommandId(id), id).toBe(false);
+    }
   });
 });
