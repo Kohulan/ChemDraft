@@ -8949,9 +8949,12 @@ fn engine3d_log_flag_enabled(value: Option<&str>) -> bool {
 /// every protocol message in each direction (`engine3d_protocol_line_summary`), the sidecar's own
 /// stderr, and the webview's phases and press routing. The tester reads it to tell "no input reached
 /// the 3D view" from "the sidecar never answered" from "the answer never reached the view".
+///
+/// Best effort: `eprintln!` panics when stderr rejects the write, which could interrupt a session
+/// start after the child spawned, or poison the session lock mid-send so stop could not clean up.
 fn engine3d_log(message: std::fmt::Arguments<'_>) {
     if engine3d_log_enabled() {
-        eprintln!("[engine3d] {message}");
+        let _ = writeln!(std::io::stderr(), "[engine3d] {message}");
     }
 }
 
@@ -8969,16 +8972,18 @@ fn engine3d_log_lines(process_session_id: &str, direction: &str, lines: &[String
 
 /// A protocol line as its type and the fields that say what happened (event type, ok/error, reason,
 /// error text, request id), never its payload: coordinates and molfiles would bury the sequence.
+/// Every field is untrusted text: a decoded `\n` in any of them must not start a second log line.
 fn engine3d_protocol_line_summary(line: &str) -> String {
     let Ok(serde_json::Value::Object(message)) = serde_json::from_str::<serde_json::Value>(line)
     else {
         return format!("unparsed line ({} bytes)", line.len());
     };
-    let text = |key: &str| message.get(key).and_then(serde_json::Value::as_str);
-    let mut summary = text("type").unwrap_or("untyped").to_string();
+    let raw = |key: &str| message.get(key).and_then(serde_json::Value::as_str);
+    let text = |key: &str| raw(key).map(engine3d_log_field);
+    let mut summary = text("type").unwrap_or_else(|| "untyped".to_string());
     if let Some(event_type) = text("eventType") {
         summary.push(' ');
-        summary.push_str(event_type);
+        summary.push_str(&event_type);
     }
     match message.get("ok").and_then(serde_json::Value::as_bool) {
         Some(true) => summary.push_str(" ok"),
@@ -8988,7 +8993,7 @@ fn engine3d_protocol_line_summary(line: &str) -> String {
     if let Some(reason) = text("reason") {
         summary.push_str(&format!(" reason={reason}"));
     }
-    if let Some(error) = text("error").or_else(|| text("message")) {
+    if let Some(error) = raw("error").or_else(|| raw("message")) {
         summary.push_str(&format!(": {}", engine3d_log_text(error)));
     }
     if let Some(request_id) = text("requestId") {
@@ -8999,8 +9004,18 @@ fn engine3d_protocol_line_summary(line: &str) -> String {
 
 /// Untrusted text for one log line: control characters become spaces and it stops at 300 chars.
 fn engine3d_log_text(text: &str) -> String {
+    engine3d_log_bounded(text, 300)
+}
+
+/// A protocol identifier (type, event type, reason, request id) for one log line: control
+/// characters become spaces and it stops at 80 chars, so metadata cannot bury the sequence.
+fn engine3d_log_field(text: &str) -> String {
+    engine3d_log_bounded(text, 80)
+}
+
+fn engine3d_log_bounded(text: &str, limit: usize) -> String {
     text.chars()
-        .take(300)
+        .take(limit)
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
 }
@@ -9309,20 +9324,33 @@ fn write_engine3d_protocol_lines(
     session: &mut Engine3dManagedSession,
     lines: &[String],
 ) -> Result<(), String> {
-    engine3d_log_lines(process_session_id, "->", lines);
-    let stdin = session
-        .stdin
-        .as_mut()
-        .ok_or_else(|| "Interactive 3D sidecar stdin is not available.".to_string())?;
+    let Some(stdin) = session.stdin.as_mut() else {
+        engine3d_log(format_args!(
+            "{process_session_id} -> not sent: stdin is not available"
+        ));
+        return Err("Interactive 3D sidecar stdin is not available.".to_string());
+    };
+    // Each line is traced only once its newline is written, so a pipe that closes mid-batch never
+    // shows the unwritten lines as sent.
     for line in lines {
-        stdin
+        if let Err(error) = stdin
             .write_all(line.as_bytes())
             .and_then(|_| stdin.write_all(b"\n"))
-            .map_err(|error| format!("Could not write interactive 3D protocol: {error}"))?;
+        {
+            engine3d_log(format_args!(
+                "{process_session_id} -> write failed: {} ({error})",
+                engine3d_protocol_line_summary(line)
+            ));
+            return Err(format!("Could not write interactive 3D protocol: {error}"));
+        }
+        engine3d_log_lines(process_session_id, "->", std::slice::from_ref(line));
     }
-    stdin
-        .flush()
-        .map_err(|error| format!("Could not flush interactive 3D protocol: {error}"))
+    stdin.flush().map_err(|error| {
+        engine3d_log(format_args!(
+            "{process_session_id} -> flush failed ({error})"
+        ));
+        format!("Could not flush interactive 3D protocol: {error}")
+    })
 }
 
 fn collect_engine3d_session_output(
@@ -17321,6 +17349,14 @@ mod tests {
         );
         expect_eq("a b".to_string(), engine3d_log_text("a\nb"));
         expect_eq(300, engine3d_log_text(&"x".repeat(400)).chars().count());
+        // Decoded newlines in metadata stay on one line, and long metadata is bounded.
+        let hostile = engine3d_protocol_line_summary(&format!(
+            "{{\"type\":\"event\\nforged\",\"eventType\":\"a\\rb\",\"reason\":\"r\\nq\",\"requestId\":\"{}\"}}",
+            "i".repeat(200)
+        ));
+        expect_true(!hostile.contains('\n') && !hostile.contains('\r'));
+        expect_true(hostile.starts_with("event forged a b reason=r q ("));
+        expect_eq(80, hostile.matches('i').count());
     }
 
     #[test]
