@@ -4641,7 +4641,10 @@ function importFragment(
         ...(abbreviationRecords.length ? { cdxmlAbbreviations: abbreviationRecords } : {}),
         ...(Object.keys(cdxmlAbbreviationAttachmentsByBondId).length ? { cdxmlAbbreviationAttachmentsByBondId } : {}),
         ...(context.preserveReactionIds ? {
-          cdxmlAtomIdsByAtomId: Object.fromEntries([...atomIdByCdxmlId].map(([sourceId, atomId]) => [atomId, sourceId])),
+          // A source id shared by two nodes names neither: keep it out so no reference resolves to one.
+          cdxmlAtomIdsByAtomId: Object.fromEntries([...atomIdByCdxmlId].filter(([sourceId]) =>
+            atomElements.filter(atomElement => atomElement.attributes.id === sourceId).length < 2)
+            .map(([sourceId, atomId]) => [atomId, sourceId])),
           cdxmlBondIdsByBondId: Object.fromEntries(cdxmlIdByBondId)
         } : {}),
         ...(Object.keys(cdxmlAtomStereochemistryByAtomId).length > 0 ? { cdxmlAtomStereochemistryByAtomId } : {}),

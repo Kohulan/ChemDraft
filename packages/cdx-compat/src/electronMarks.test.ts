@@ -58,6 +58,17 @@ describe("electron-mark CDXML appearance warnings", () => {
     expect(xml).toMatch(new RegExp(`<n (?=[^>]*id="${reference}")(?=[^>]*Element="8")`));
   });
 
+  // CodeRabbit 4658591589: two nodes sharing one source id leave the reference ambiguous.
+  it("does not attach a lone pair to one of two atoms that share its referenced source id", () => {
+    const source = '<CDXML><page><graphic id="3" GraphicType="Symbol" SymbolType="LonePair" BoundingBox="70 72 67 68">' +
+      '<represent object="21" attribute="Radical"/></graphic><fragment id="8"><n id="21" Element="6" p="48 64"/>' +
+      '<n id="21" Element="8" p="70 64"/></fragment></page></CDXML>';
+    const read = openChemDraftPayload(source);
+    expect(read.warnings.some(w => w.code === "cdxml.lone_pair_anchor_unresolved")).toBe(true);
+    const pair = read.document!.pages[0].objects.find(o => o.type === "electron-mark") as ElectronMarkObject;
+    expect(pair.anchor).toMatchObject({ kind: "point" });
+  });
+
   it.each([false, true])("warns when moving an imported doublet atom leaves its dot behind (legacy=%s)", legacy => {
     const imported = openChemDraftPayload('<CDXML><page><fragment id="1"><n id="2" p="100 100" Element="6" Radical="Doublet"/></fragment></page></CDXML>').document!;
     const molecule = imported.pages[0].objects.find((object): object is MoleculeObject => object.type === "molecule")!;
