@@ -114,6 +114,18 @@ jobs:
       - name: Build host-native OPSIN runtime and smoke test benzene
         run: node scripts/build-opsin-runtime.mjs
 
+      # vite.config.ts stamps the footer "+dirty" from `git status --porcelain` while bundling, so a
+      # release must start bundling from a clean tree. No earlier step writes to tracked files: the
+      # sidecar is verified in place, pnpm installs from the frozen lockfile, and the OPSIN runtime
+      # goes to the ignored resources/opsin/jre. Cargo.lock must already be current, or cargo would
+      # rewrite it during the bundle build.
+      - name: Check the source tree is clean before the bundle build
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 --manifest-path apps/desktop/src-tauri/Cargo.toml > /dev/null
+          dirty=$(git status --porcelain --untracked-files=normal)
+          [ -z "$dirty" ] || { printf '::error::The source tree is dirty before the bundle build:\n%s\n' "$dirty"; exit 1; }
+
       - name: Build stable .deb and AppImage
         env:
           CHEMDRAFT_STABLE_BUILD: '1'

@@ -47,6 +47,8 @@ test("the Linux package build ships the committed sidecar it verified and never 
   const build = read(".github/workflows/linux-build.yml");
   const at = indexer(build, "linux-build.yml");
   const verify = at("node scripts/verify-committed-linux-sidecar.mjs");
+  const opsin = at("node scripts/build-opsin-runtime.mjs");
+  const cleanBefore = at("- name: Check the source tree is clean before the bundle build");
   const bundle = at("pnpm --filter @chemdraft/desktop build --bundles deb,appimage");
   const clean = at("- name: Check the source tree is still clean after the bundle build");
   const debCheck = at('cmp apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu "$payload/usr/bin/avogadro3d-sidecar"');
@@ -54,6 +56,13 @@ test("the Linux package build ships the committed sidecar it verified and never 
   const appImageCheck = at('check-engine3d-sidecar.mjs" squashfs-root/usr/bin/avogadro3d-sidecar');
   const record = at('record-build.mjs --artifact "$DEB"');
   assert.ok(verify < at("- name: Install Linux build dependencies") && verify < bundle);
+  // Nothing may run between the clean-tree check and the bundle build: vite.config.ts stamps
+  // "+dirty" from `git status --porcelain`.
+  assert.ok(verify < opsin && opsin < cleanBefore && cleanBefore < bundle);
+  assert.equal(build.indexOf("\n      - ", cleanBefore + 1), build.indexOf("      - name: Build stable .deb and AppImage") - 1);
+  const guard = build.slice(cleanBefore, bundle);
+  assert.match(guard, /cargo metadata --locked [^\n]*apps\/desktop\/src-tauri\/Cargo\.toml/);
+  assert.match(guard, /dirty=\$\(git status --porcelain --untracked-files=normal\)\n\s+\[ -z "\$dirty" \] \|\| \{ printf '::error::[^']*\\n%s\\n' "\$dirty"; exit 1; \}/);
   assert.ok(bundle < clean && clean < debCheck && debCheck < debSidecarCheck && debSidecarCheck < appImageCheck && appImageCheck < record);
   // Packaging neither builds the sidecar nor touches the tracked file.
   assert.doesNotMatch(build, /cmake|_deps|native\/avogadro3d-sidecar\/build/);

@@ -41,9 +41,12 @@ The workflow:
    handshake). Packaging never builds the sidecar or writes over it; see
    [The x86_64 3D sidecar](#the-x86_64-3d-sidecar). Until a maintainer commits it, the pin reads
    `PENDING-MAINTAINER-COMMIT` and every Linux package build fails here, on purpose.
-3. Builds the OPSIN Java runtime on the runner and smoke-tests it (benzene), then a stable `.deb`
-   and AppImage (`CHEMDRAFT_STABLE_BUILD=1`, no worktree label), and fails if the bundle build left
-   the source tree dirty. Any failure fails the job.
+3. Builds the OPSIN Java runtime on the runner and smoke-tests it (benzene). Then, right before
+   bundling, it fails unless `Cargo.lock` is current (`cargo metadata --locked`) and
+   `git status --porcelain --untracked-files=normal` is empty, printing any dirty paths: the
+   footer's build stamp says `+dirty` otherwise. It builds a stable `.deb` and AppImage
+   (`CHEMDRAFT_STABLE_BUILD=1`, no worktree label) and fails if the bundle build left the tree
+   dirty. Any failure fails the job.
 4. Checks the bundle identity and that the `.deb` carries `chemdraft`, the 3D sidecar and the
    OPSIN runtime. The `.deb`'s sidecar must be byte-identical to the committed file and pass the
    handshake, and so must the repacked AppImage's copy (by the handshake; linuxdeploy may rewrite
