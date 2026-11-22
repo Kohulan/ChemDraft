@@ -2,12 +2,12 @@ import { useEffect, useRef, useState } from "react";
 import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import type { KeybindingScheme } from "../keybindingSettings";
 import { detectDesktopShortcutPlatform } from "../keyboardShortcuts";
-import { TOUR_TITLE, type TourAction } from "./tourCommands";
+import { TOUR_TITLE, type TourAction, type TourPluginCommand } from "./tourCommands";
 import { tourShortcutChoices, tourSteps } from "./tourSteps";
 import "./TourForm.css";
 
 export function TourForm({
-  scheme, onAction, onReady, busy, error, platform = detectDesktopShortcutPlatform()
+  scheme, onAction, onReady, busy, error, platform = detectDesktopShortcutPlatform(), plugins = []
 }: {
   scheme: KeybindingScheme;
   onAction: (action: TourAction) => void;
@@ -15,14 +15,20 @@ export function TourForm({
   busy?: boolean;
   error?: string;
   platform?: ShortcutPlatform;
+  /** Plugin commands the menus offered when the tour opened. Missing means none: never demo a plugin
+   *  that might not be installed. */
+  plugins?: readonly TourPluginCommand[];
 }) {
   const [index, setIndex] = useState(0);
+  // The step list is fixed when the tour opens. Installing or removing a plugin while it is open does
+  // not add or drop steps under the user, so the step number, Back, Next and Finish stay put.
+  const [openedWith] = useState(() => [...plugins]);
   // The host keeps its error until the next action, but an error belongs to the step whose action
   // raised it. Moving to another step, forward or back, clears it, including a late error from an
   // action still in flight; the next action on the new step shows errors again.
   const [errorStep, setErrorStep] = useState<number | undefined>(0);
   const heading = useRef<HTMLHeadingElement>(null);
-  const steps = tourSteps(scheme, platform);
+  const steps = tourSteps(scheme, platform, openedWith);
   const step = steps[index];
   const tryCommand = step.tryCommand;
   const visibleError = errorStep === index ? error : undefined;
@@ -48,6 +54,7 @@ export function TourForm({
         <p className="guided-tour-counter">Step {index + 1} of {steps.length}</p>
         <h1 ref={heading} tabIndex={-1}>{step.title}</h1>
         <p>{step.text}</p>
+        {step.url ? <p className="guided-tour-url">{step.url}</p> : null}
         {step.shortcuts ? (
           <fieldset disabled={busy}>
             <legend>Keyboard shortcuts</legend>

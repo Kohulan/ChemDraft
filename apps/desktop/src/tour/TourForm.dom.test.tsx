@@ -6,6 +6,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TourForm } from "./TourForm";
 import { tourShortcutChoices, tourSteps } from "./tourSteps";
+import { TOUR_PLUGIN_COMMANDS } from "./tourCommands";
 import { parseDialogMessage } from "../dialogs/dialogProtocol";
 import { buildAppMenuModel, flattenAppMenuCommands } from "../appMenu";
 
@@ -13,6 +14,8 @@ let container: HTMLDivElement;
 let root: Root;
 const platforms = ["macos", "windows"] as const;
 const schemes = ["chemdraft", "chemdraw"] as const;
+// Every plugin a step can demonstrate, installed and enabled.
+const allPlugins = TOUR_PLUGIN_COMMANDS;
 
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -32,18 +35,18 @@ describe.each(platforms)("guided tour on %s", platform => {
 
   it("offers a one-click Skip on every step and Finish on the last step", () => {
     const onAction = vi.fn();
-    act(() => root.render(<TourForm scheme="chemdraft" platform={platform} onAction={onAction} />));
+    act(() => root.render(<TourForm scheme="chemdraft" platform={platform} plugins={allPlugins} onAction={onAction} />));
     expect(button("Back").disabled).toBe(true);
-    for (let step = 1; step <= 7; step++) {
-      expect(container.textContent).toContain(`Step ${step} of 7`);
+    for (let step = 1; step <= 8; step++) {
+      expect(container.textContent).toContain(`Step ${step} of 8`);
       expect(button("Skip tour").disabled).toBe(false);
       click("Skip tour");
       expect(onAction).toHaveBeenLastCalledWith({ action: "cancel" });
-      if (step < 7) click("Next");
+      if (step < 8) click("Next");
     }
-    expect(onAction).toHaveBeenCalledTimes(7);
+    expect(onAction).toHaveBeenCalledTimes(8);
     click("Back");
-    expect(container.textContent).toContain("Step 6 of 7");
+    expect(container.textContent).toContain("Step 7 of 8");
     click("Next");
     click("Finish");
     expect(onAction).toHaveBeenLastCalledWith({ action: "finish" });
@@ -53,7 +56,7 @@ describe.each(platforms)("guided tour on %s", platform => {
 
   it("offers real commands and displays platform-specific shortcut examples", () => {
     const onAction = vi.fn();
-    act(() => root.render(<TourForm scheme="chemdraft" platform={platform} onAction={onAction} />));
+    act(() => root.render(<TourForm scheme="chemdraft" platform={platform} plugins={allPlugins} onAction={onAction} />));
     click("Next");
     const radios = container.querySelectorAll<HTMLInputElement>("input[type=radio]");
     expect(radios[0].checked).toBe(true);
@@ -74,6 +77,7 @@ describe.each(platforms)("guided tour on %s", platform => {
       click("Try it");
       expect(onAction).toHaveBeenLastCalledWith({ action: "tryTourCommand", command });
     }
+    click("Next");
     click("Next");
     click("Next");
     const text = container.textContent;
@@ -101,21 +105,21 @@ describe.each(platforms)("guided tour on %s", platform => {
 
   it("clears a step's error when the step changes, forward or back", () => {
     const onAction = vi.fn();
-    const render = (error?: string) => act(() => root.render(<TourForm scheme="chemdraft" platform={platform} onAction={onAction} error={error} />));
+    const render = (error?: string) => act(() => root.render(<TourForm scheme="chemdraft" platform={platform} plugins={allPlugins} onAction={onAction} error={error} />));
     const alert = () => container.querySelector('[role="alert"]')?.textContent;
     const missing = "Add Name to Structure from Plugins > Add or Remove Plugins, then try again.";
     render();
     for (let step = 1; step < 4; step++) click("Next");
-    expect(container.textContent).toContain("Step 4 of 7");
+    expect(container.textContent).toContain("Step 4 of 8");
     click("Try it");
     render(missing);
     expect(alert()).toBe(missing);
 
     click("Next");
-    expect(container.textContent).toContain("Step 5 of 7");
+    expect(container.textContent).toContain("Step 5 of 8");
     expect(alert()).toBeUndefined();
     click("Back");
-    expect(container.textContent).toContain("Step 4 of 7");
+    expect(container.textContent).toContain("Step 4 of 8");
     expect(alert()).toBeUndefined();
 
     // A new action shows its own error again; leaving that step backward clears it too.
@@ -132,7 +136,7 @@ describe.each(platforms)("guided tour on %s", platform => {
     click("Try it");
     click("Next");
     render("Late failure");
-    expect(container.textContent).toContain("Step 5 of 7");
+    expect(container.textContent).toContain("Step 5 of 8");
     expect(alert()).toBeUndefined();
     click("Try it");
     render(undefined);
@@ -143,7 +147,7 @@ describe.each(platforms)("guided tour on %s", platform => {
   it("keeps public copy free of other drawing product names", () => {
     const banned = /chemdraw|marvin(?:sketch)?|isischem|isis\/draw|acd\/chemsketch|chemsketch|ketcher|chemwindow|bkchem/i;
     for (const scheme of schemes) {
-      for (const step of tourSteps(scheme, platform)) {
+      for (const step of [...tourSteps(scheme, platform), ...tourSteps(scheme, platform, allPlugins)]) {
         expect(step.title + step.text).not.toMatch(banned);
       }
     }
@@ -160,7 +164,7 @@ it("keeps TypeScript tour commands in sync with the native allowlist", () => {
   const nativeEnum = source.match(/enum GuidedTourCommand\s*\{([^}]*)\}/)?.[1] ?? "";
   const nativeCommands = new Set([...nativeEnum.matchAll(/#\[serde\(rename = "([^"]+)"\)\]/g)].map(match => match[1]!));
   const tourCommands = new Set(platforms
-    .flatMap(platform => schemes.flatMap(scheme => tourSteps(scheme, platform)))
+    .flatMap(platform => schemes.flatMap(scheme => tourSteps(scheme, platform, TOUR_PLUGIN_COMMANDS)))
     .map(step => step.tryCommand)
     .filter(command => command !== undefined));
   expect(nativeCommands).toEqual(tourCommands);

@@ -5,7 +5,7 @@ import type { DialogCoordinator } from "../dialogs/DialogCoordinator";
 import type { KeybindingScheme } from "../keybindingSettings";
 import { updateShortcutPreference } from "../useShortcutPreference";
 import { isDesktopRuntime } from "../window-manager";
-import { TOUR_NAME_COMMAND, TOUR_SAMPLE_COMMAND, type TourAction } from "./tourCommands";
+import { TOUR_NAME_COMMAND, TOUR_SAMPLE_COMMAND, type TourAction, type TourPluginCommand } from "./tourCommands";
 import { saveTourSeen, useAutomaticTour, type TourMode } from "./tourState";
 
 const TourForm = lazy(() => import("./TourForm").then(module => ({ default: module.TourForm })));
@@ -15,12 +15,15 @@ export function useGuidedTour(options: {
   readyAndIdle: () => boolean;
   scheme: KeybindingScheme;
   platform?: ShortcutPlatform;
+  /** Plugin commands the menus offer now (`availableTourPluginCommands`); read once per open. */
+  plugins?: () => readonly TourPluginCommand[];
   mode?: TourMode;
   setStatus: (message: string) => void;
 }) {
   const [browserOpen, setBrowserOpen] = useState(false);
   const [browserError, setBrowserError] = useState<string>();
   const [browserBusy, setBrowserBusy] = useState(false);
+  const [browserPlugins, setBrowserPlugins] = useState<readonly TourPluginCommand[]>([]);
   const [retry, setRetry] = useState(0);
   const manual = useRef(false);
 
@@ -29,9 +32,10 @@ export function useGuidedTour(options: {
     if (isDesktopRuntime()) {
       const coordinator = options.coordinator();
       if (!coordinator) throw new Error("The dialog host is unavailable.");
-      await coordinator.openGuidedTour(options.scheme, automatic);
+      await coordinator.openGuidedTour(options.scheme, automatic, options.plugins?.() ?? []);
     } else {
       setBrowserError(undefined);
+      setBrowserPlugins(options.plugins?.() ?? []);
       setBrowserOpen(true);
     }
     if (!automatic) manual.current = true;
@@ -59,6 +63,7 @@ export function useGuidedTour(options: {
         await updateShortcutPreference(action.scheme);
         break;
       case "tryTourCommand":
+        // The step list is fixed when the tour opens, so a plugin removed since then can still be asked for.
         if (action.command === TOUR_NAME_COMMAND && !commands.has(TOUR_NAME_COMMAND)) {
           throw new Error("Add Name to Structure from Plugins > Add or Remove Plugins, then try again.");
         }
@@ -78,7 +83,7 @@ export function useGuidedTour(options: {
     renderBrowser: (onAction: (action: TourAction) => Promise<void>) => browserOpen ? (
       <div className="guided-tour-preview">
         <Suspense fallback={<p>Opening tour…</p>}>
-          <TourForm scheme={options.scheme} platform={options.platform} busy={browserBusy} error={browserError}
+          <TourForm scheme={options.scheme} platform={options.platform} plugins={browserPlugins} busy={browserBusy} error={browserError}
             onAction={action => {
               setBrowserError(undefined);
               setBrowserBusy(true);

@@ -209,12 +209,28 @@ struct GuidedTourSnapshot {
     _scheme: super::KeybindingScheme,
     #[serde(rename = "automatic")]
     _automatic: bool,
+    /// Plugin commands the menus offered when the tour opened. Absent in older payloads.
+    #[serde(default)]
+    plugins: Vec<GuidedTourPluginCommand>,
 }
 
 impl GuidedTourSnapshot {
     fn valid(self) -> bool {
-        valid_title(&self.title) && !self.title.contains('\0')
+        valid_title(&self.title)
+            && !self.title.contains('\0')
+            && self
+                .plugins
+                .iter()
+                .enumerate()
+                .all(|(index, plugin)| !self.plugins[..index].contains(plugin))
     }
+}
+
+/// The plugin commands a tour step teaches (`TOUR_PLUGIN_COMMANDS` in `tour/tourCommands.ts`).
+#[derive(Deserialize, PartialEq)]
+enum GuidedTourPluginCommand {
+    #[serde(rename = "plugin.opsinNameToStructure.convert")]
+    NameToStructure,
 }
 
 #[derive(Deserialize)]
@@ -5633,6 +5649,39 @@ mod tests {
         ] {
             message.data = data;
             assert!(message.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn guided_tour_snapshot_accepts_only_known_unique_plugins() {
+        let mut message = snapshot();
+        message.dialog_kind = "guidedTour".into();
+        let tour = |plugins: Option<Value>| {
+            let mut data =
+                json!({"title":"Take the Tour", "scheme":"chemdraft", "automatic":false});
+            if let Some(plugins) = plugins {
+                data["plugins"] = plugins;
+            }
+            data
+        };
+        let name = "plugin.opsinNameToStructure.convert";
+        // Without plugins (an older payload), with none, and with Name to Structure.
+        for plugins in [None, Some(json!([])), Some(json!([name]))] {
+            message.data = tour(plugins.clone());
+            assert_eq!(message.validate(), Ok(()), "{plugins:?}");
+        }
+        // An unknown plugin, a duplicate, or a value of the wrong shape.
+        for plugins in [
+            json!(["plugin.unknown.command"]),
+            json!([name, "document.save"]),
+            json!([name, name]),
+            json!(name),
+            json!([1]),
+            json!({}),
+            json!(null),
+        ] {
+            message.data = tour(Some(plugins.clone()));
+            assert!(message.validate().is_err(), "{plugins}");
         }
     }
 

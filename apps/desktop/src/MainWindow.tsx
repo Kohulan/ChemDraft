@@ -979,7 +979,7 @@ import type { KeybindingScheme } from "./keybindingSettings";
 import { nativeMenuShortcutOverrides } from "./customKeyboardShortcuts";
 import { useShortcutPreference } from "./useShortcutPreference";
 import { aboutCommand, openAbout } from "./about/aboutCommand";
-import { SHOW_TOUR_COMMAND, TOUR_NAME_COMMAND, TOUR_SAMPLE_COMMAND, TOUR_TITLE, type TourAction } from "./tour/tourCommands";
+import { availableTourPluginCommands, SHOW_TOUR_COMMAND, TOUR_NAME_COMMAND, TOUR_SAMPLE_COMMAND, TOUR_TITLE, type TourAction, type TourPluginCommand } from "./tour/tourCommands";
 import type { TourMode } from "./tour/tourState";
 import { buildTourSample } from "./tour/tourSample";
 import { useGuidedTour } from "./tour/useGuidedTour";
@@ -1851,7 +1851,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.21.20.30-opus";
+const CURRENT_BUILD_STAMP = "11.21.21.30-opus";
 
 /**
  * The commit funnel's chemistry check (AGENTS.md section 7, `commitChemistryGuard.ts`). `before`
@@ -2609,6 +2609,7 @@ export function MainWindow({
   const pluginRuntimeRef = useRef<DesktopPluginRuntime | undefined>(undefined);
   const dialogCoordinatorRef = useRef<DialogCoordinator | undefined>(undefined);
   const tourActionRef = useRef<(action: TourAction) => Promise<void>>(async () => {});
+  const tourPluginCommandsRef = useRef<readonly TourPluginCommand[]>([]);
   const deferTourRef = useRef<() => void>(() => {});
   const tourSampleRef = useRef<{ tabId: string; moleculeId: string } | undefined>(undefined);
   const atomProblemTargetRef = useRef<{ tabId: string; target: AtomProblemTarget; source: ChemDraftDocument; version: number } | undefined>(undefined);
@@ -12150,6 +12151,7 @@ export function MainWindow({
       && !tableCellEditorRef.current && !bracketLabelEditorRef.current,
     scheme: keybindingScheme,
     platform: shortcutPlatform,
+    plugins: () => tourPluginCommandsRef.current,
     mode: tourMode,
     setStatus
   });
@@ -13483,6 +13485,8 @@ export function MainWindow({
     }
   });
   const { isPluginCommand: pluginCommandExists, invokePluginCommand } = pluginRuntime;
+  // The tour shows a plugin's step only when the menus show that plugin's item.
+  tourPluginCommandsRef.current = availableTourPluginCommands(pluginRuntime.pluginMenuItems);
   tourActionRef.current = action => tour.completeOrRun(action, {
     has: id => registry.get(id)?.enabled === true,
     invoke: async id => {

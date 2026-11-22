@@ -93,6 +93,13 @@ export function preferencesMenuPlacement(platform: ShortcutPlatform): { menu: st
   return platform === "macos" ? { menu: "ChemDraft", label: "Settings…" } : { menu: "File", label: "Preferences…" };
 }
 
+/** The Plugins menu and its fixed items. The same labels on every platform; the guided tour quotes them. */
+export const PLUGINS_MENU_LABELS = {
+  menu: "Plugins",
+  manager: "Add or Remove Plugins…",
+  vibeCode: vibeCodeStarterCommand.title
+} as const;
+
 /** A toolbar toggle entry for the View ▸ Toolbars submenu (mirrors the native dynamic submenu). */
 export interface AppMenuToolbarToggle {
   id: string;
@@ -372,11 +379,11 @@ export function buildAppMenuModel(context: AppMenuContext): AppMenuSection[] {
     },
     {
       id: "plugins",
-      label: "Plugins",
+      label: PLUGINS_MENU_LABELS.menu,
       items: [
-        command(PLUGIN_MANAGER_COMMAND_ID, "Add or Remove Plugins…"),
+        command(PLUGIN_MANAGER_COMMAND_ID, PLUGINS_MENU_LABELS.manager),
         separator(),
-        command(VIBE_CODE_STARTER_COMMAND_ID, vibeCodeStarterCommand.title)
+        command(VIBE_CODE_STARTER_COMMAND_ID, PLUGINS_MENU_LABELS.vibeCode)
       ]
     },
     {

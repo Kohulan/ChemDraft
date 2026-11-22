@@ -272,7 +272,7 @@ function DialogWindowContent({ hostId }: { hostId: string }) {
       onCopy={() => sendDialogMessage(hostId, { ...dialogEnvelope(snapshot), requestId: crypto.randomUUID(), type: "action", data: { action: "copyVersion" } })} />
   </Suspense>;
   if (snapshot.dialogKind === "guidedTour") return <Suspense fallback={<p>Opening tour…</p>}>
-    <TourForm scheme={snapshot.data.scheme} onReady={reportReady} busy={busy} error={error} onAction={sendAction} />
+    <TourForm scheme={snapshot.data.scheme} plugins={snapshot.data.plugins} onReady={reportReady} busy={busy} error={error} onAction={sendAction} />
   </Suspense>;
   if (snapshot.dialogKind === "vibeCodeGuide") return <Suspense fallback={<p>Opening guide…</p>}><VibeCodeGuideForm onReady={reportReady} onAction={action => sendAction({ action })} /></Suspense>;
   if (snapshot.dialogKind === "structureTemplates") return <Suspense fallback={<p role="status">Opening Templates…</p>}>
