@@ -43,7 +43,7 @@ function fileWith(ids: [string, string]): string {
 
 /** A clean, untitled session tab as autosave records it. */
 function sessionTab(ids: [string, string], displayName: string) {
-  return buildDocumentSessionEnvelope({ contents: fileWith(ids), payloadHash: `test-${displayName}` }, { dirty: false }, displayName, false);
+  return buildDocumentSessionEnvelope({ contents: fileWith(ids), payloadHash: `test-${displayName}`, filename: displayName }, { dirty: false }, displayName, false);
 }
 
 describe.each(["macos", "windows"] as const)("restoring a session tab with duplicate same-page ids (%s)", platform => {
