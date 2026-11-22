@@ -4,7 +4,7 @@ import {
   type PluginAssistantToolDescriptor, type PluginAssistantAPI, type PluginAssistantToolResult, type PluginManifest
 } from "@chemdraft/plugin-api";
 import { assertLegacyWritePages, beginScopedRepeatUnitCleanup, finishScopedRepeatUnitCleanup, legacyWriteScopePages, writePatchOps,
-  type PluginHost, type PluginHostAssistant, type ScopedRepeatUnitCleanup } from "@chemdraft/plugin-host";
+  type PluginHost, type PluginHostAssistant, type PluginWriteScopePages, type ScopedRepeatUnitCleanup } from "@chemdraft/plugin-host";
 import { PluginWriteGateTimeoutError, type PluginWriteGate } from "../plugins/applyPluginDocumentPatch";
 import { runThumbnail } from "./runThumbnail";
 import { PAGE_GROWTH_UNANSWERED, type AssistantToolContext, type AssistantPageGrowth } from "./AssistantToolContext";
@@ -31,7 +31,7 @@ interface Request {
   tabId: string;
   selection: string[];
   /** Send-time selection bound to its page, so a duplicate id elsewhere is never in scope. */
-  selectionPages: ReadonlyMap<string, string> | undefined;
+  selectionPages: PluginWriteScopePages | undefined;
   /** The document identity captured at Send, when the host provides one. */
   binding: AssistantDocumentBinding | undefined;
   repeatUnitCleanup: ScopedRepeatUnitCleanup | undefined;

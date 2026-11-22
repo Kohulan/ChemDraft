@@ -1,6 +1,7 @@
 import { applyPatch, createEmptyDocument, toEngineDocument, type ChemDraftDocument, type DocumentObject, type MoleculeObject } from "@chemdraft/chem-core";
 import { describe, expect, it, vi } from "vitest";
-import { assertPluginDocumentWriteScope, assertPluginPatchWriteScope, PluginHost, type PluginPatchApplicationRequest } from "./index";
+import { assertLegacyWritePages, assertPluginDocumentWriteScope, assertPluginPatchWriteScope, objectInWriteScope, PluginHost,
+  resolveScopedObject, scopedObjectPage, type PluginPatchApplicationRequest } from "./index";
 
 const now = "2026-11-21T00:00:00.000Z";
 const molecule = (id: string, x: number): MoleculeObject => ({
@@ -101,8 +102,15 @@ function pendingHost(document: ChemDraftDocument) {
   return { host, applyDocumentPatch, release, document: () => current, edit: (next: ChemDraftDocument) => { current = next; } };
 }
 
+/** The refusal for a pinned object that is gone from its Send-time page (deleted or moved). */
+const reselect = (page: number) =>
+  `Plugin write refused: the change was not applied. The object you selected on page ${page} is no longer there; reselect it and try again.`;
+
 describe("legacy page binding follows the Send-time selection", () => {
-  it("allows a write to a uniquely identified selected object that moved to another page while the command was pending", async () => {
+  // Option A (1.2.2): a pin resolves only on its own page. Following a "uniquely identified" object to
+  // another page is spoofable (delete it, insert an unrelated same-id object elsewhere), so a selected
+  // object the user moved to another page is refused with a reselect message instead.
+  it("refuses a write to a selected object that moved to another page while the command was pending", async () => {
     const empty = createEmptyDocument({ now });
     const pageA = { ...empty.pages[0]!, id: "page-a", objects: [] };
     const pageB = { ...empty.pages[0]!, id: "page-b", objects: [molecule("X", 0)] };
@@ -112,10 +120,11 @@ describe("legacy page binding follows the Send-time selection", () => {
     // The user moves X from page B to page A; X is still the only object with that id.
     const current = f.document();
     f.edit({ ...current, pages: [{ ...current.pages[0]!, objects: [current.pages[1]!.objects[0]!] }, { ...current.pages[1]!, objects: [] }] });
+    const edited = f.document();
     f.release();
-    await expect(pending).resolves.toMatchObject({ applied: true });
-    expect(f.document().pages[0]!.objects[0]).toMatchObject({ id: "X", x: 500 });
-    expect(f.document().pages[1]!.objects).toEqual([]);
+    await expect(pending).rejects.toThrow(reselect(2));
+    expect(f.document()).toBe(edited);
+    expect(f.document().pages[0]!.objects[0]).toMatchObject({ id: "X", x: 0 });
   });
 
   it("still refuses when the moved object's id now also names another object", async () => {
@@ -130,8 +139,7 @@ describe("legacy page binding follows the Send-time selection", () => {
     f.edit({ ...current, pages: [{ ...current.pages[0]!, objects: [current.pages[1]!.objects[0]!] }, { ...current.pages[1]!, objects: [] }, current.pages[2]!] });
     const edited = f.document();
     f.release();
-    await expect(pending).rejects.toThrow(
-      `Plugin write refused: the change was not applied. The object you selected on page 2 is no longer there, and its internal ID now matches objects on page 1 and page 3, so ChemDraft can't tell which one to change safely. To edit it, make the change by hand, or copy the object and paste it as a new object, then try again.`);
+    await expect(pending).rejects.toThrow(reselect(2));
     expect(f.document()).toBe(edited);
   });
 
@@ -152,5 +160,81 @@ describe("legacy page binding follows the Send-time selection", () => {
     await expect(f.host.invokeCommand("plugin.pages.run", { writeSelection: { objectIds: ["X"], molecules: [] } }))
       .rejects.toThrow("X was not selected when the command started");
     expect(f.document().pages[0]!.objects[0]).toEqual(original.pages[0]!.objects[0]);
+  });
+});
+
+/** Fixture F2's shape: two pages, each holding its own molecule with the same id. Page 1's is selected. */
+function sharedIdDocument(): ChemDraftDocument {
+  const empty = createEmptyDocument({ now });
+  const page1 = { ...empty.pages[0]!, id: "page-1", objects: [molecule("X", 0)] };
+  const page2 = { ...empty.pages[0]!, id: "page-2", objects: [molecule("X", 300)] };
+  return toEngineDocument({ ...empty, pages: [page1, page2], selection: { pageId: "page-1", objectIds: ["X"] } });
+}
+const withoutPage1Object = (document: ChemDraftDocument): ChemDraftDocument =>
+  ({ ...document, pages: [{ ...document.pages[0]!, objects: [] }, document.pages[1]!] });
+
+describe("CodeRabbit PR #422: a pinned id missing from its page never reaches a same-id object elsewhere", () => {
+  it("cr4656567628/cr4656567661: resolution and scope do not rebind page 1's deleted pin to page 2's object", () => {
+    const pins = new Map([["X", "page-1"]]);
+    const document = withoutPage1Object(sharedIdDocument());
+    // Assistant tools resolve every id through resolveScopedObject (writeBuilder.findObject).
+    expect(scopedObjectPage(document, "X", pins)).toBeUndefined();
+    expect(() => resolveScopedObject(document, "X", pins)).toThrow(/no longer there/);
+    // Plugin and assistant write scope both check the Send-time pin directly.
+    expect(objectInWriteScope(new Set(["X"]), pins, "page-2", "X")).toBe(false);
+  });
+
+  it("cr4656567661: a pending command whose selected duplicate was deleted cannot write the surviving one", async () => {
+    const f = pendingHost(sharedIdDocument());
+    const pending = f.host.invokeCommand("plugin.pending.run");
+    await Promise.resolve();
+    // While the command waits, the user deletes the selected X on page 1. Page 2's X was never selected.
+    f.edit(withoutPage1Object(f.document()));
+    const edited = f.document();
+    f.release();
+    await expect(pending).rejects.toThrow(/Plugin write refused/);
+    expect(f.document()).toBe(edited);
+    expect(f.document().pages[1]!.objects[0]).toMatchObject({ id: "X", x: 300 });
+  });
+});
+
+/** Kimi's spoof: X was the only "X" at Send. After Send, X is deleted and an unrelated "X" is inserted
+ * on page 2. Under the old "follow an id unique at Send" rule the pin followed the newcomer. */
+function spoofedDocument(): { sent: ChemDraftDocument; spoofed: ChemDraftDocument } {
+  const empty = createEmptyDocument({ now });
+  const page1 = { ...empty.pages[0]!, id: "page-1", objects: [molecule("X", 0)] };
+  const page2 = { ...empty.pages[0]!, id: "page-2", objects: [] };
+  const sent = toEngineDocument({ ...empty, pages: [page1, page2], selection: { pageId: "page-1", objectIds: ["X"] } });
+  const spoofed = { ...sent, pages: [{ ...sent.pages[0]!, objects: [] }, { ...sent.pages[1]!, objects: [molecule("X", 300)] }] };
+  return { sent, spoofed };
+}
+
+describe("Kimi security review: a pin unique at Send never follows its id to an unrelated object on another page", () => {
+  it("resolution, scope, preflight and the final check all refuse page 2's newcomer", () => {
+    const { spoofed } = spoofedDocument();
+    const pins = new Map([["X", "page-1"]]);
+    expect(scopedObjectPage(spoofed, "X", pins)).toBeUndefined();
+    expect(() => resolveScopedObject(spoofed, "X", pins)).toThrow(
+      "The object you selected on page 1 is no longer there; reselect it and try again.");
+    expect(objectInWriteScope(new Set(["X"]), pins, "page-2", "X")).toBe(false);
+    const proposed = { reason: "Move", warnings: [], requiresUserApproval: true as const,
+      patch: { op: "updateObject" as const, objectId: "X", changes: { x: 500 } } };
+    expect(() => assertLegacyWritePages(spoofed, proposed.patch, pins)).toThrow(reselect(1));
+    expect(() => assertPluginPatchWriteScope(spoofed, proposed, ["X"], undefined, undefined, pins)).toThrow(reselect(1));
+    const after = applyPatch(spoofed, proposed.patch, { now });
+    expect(() => assertPluginDocumentWriteScope(spoofed, after, proposed, ["X"], pins))
+      .toThrow('Plugin write refused: molecule "X" was changed (x), but was not selected when the command started.');
+  });
+
+  it("a pending command refuses the write and leaves page 2's newcomer unchanged", async () => {
+    const { sent, spoofed } = spoofedDocument();
+    const f = pendingHost(sent);
+    const pending = f.host.invokeCommand("plugin.pending.run");
+    await Promise.resolve();
+    f.edit(spoofed);
+    f.release();
+    await expect(pending).rejects.toThrow(reselect(1));
+    expect(f.document()).toBe(spoofed);
+    expect(f.document().pages[1]!.objects).toEqual([molecule("X", 300)]);
   });
 });
