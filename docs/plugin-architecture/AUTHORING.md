@@ -982,7 +982,11 @@ second write to the same object still resolves. For that, the embedder:
 - uses a chem-core with the same identity-runtime version, currently 2 (a copy that finds another
   version keeps its identities private, so pins stop resolving and writes are refused: fail closed,
   never a wrong match);
-- loads `@chemdraft/plugin-host` or chem-core before any script it does not trust runs in that realm;
+- loads every chem-core copy it will use (its own, the host's, the `@chemdraft/plugin-host` SDK
+  bundle's) before any script it does not trust runs in that realm, not only the first copy: each
+  copy captures the built-ins it relies on (`Object.isFrozen`, the `WeakMap.prototype` methods and
+  so on) when it loads, so a copy that loads after untrusted code replaced one rejects the genuine
+  runtime, makes a private one and calls the replaced methods;
 - calls `retainObjectIdentity(before, after)` from `@chemdraft/chem-core` for each object value it
   edits itself instead of through chem-core's patches (only a same-id, same-type value continues an
   object);
@@ -992,8 +996,12 @@ second write to the same object still resolves. For that, the embedder:
 The first chem-core copy to load publishes the runtime as a fixed, hidden property that cannot be
 replaced. It exposes only what chem-core already exports: read an object's identity, test one, and
 continue an object onto its edited copy. Nothing in it can replace an identity an object already
-holds. The engine gives every object of every document it returns an identity, so nothing can move
-another object's identity onto an object in a document the engine returned. The runtime calls only
+holds. The engine gives every object of every document it adopts (a patch result, `toEngineDocument`,
+`admitParsedDocument`, an adopted derived document) an identity, so nothing can move another object's
+identity onto an object in an engine-adopted document. This applies to engine-adopted documents only:
+`adoptDerivedDocument` returns its `next` unchanged when `next` is `base`, is already an engine
+document, or comes with a `base` that is not an engine document, and such a `next` is not adopted and
+is not pre-identified. The runtime calls only
 built-ins captured when chem-core loads, so replacing `WeakMap.prototype` methods,
 `Function.prototype.call` or `Symbol` later changes nothing. A later copy adopts a published runtime
 only if it has exactly the runtime's shape and behaves as chem-core's on fresh probe objects. A
@@ -1002,15 +1010,25 @@ under that key keeps its identities private: silently for a runtime of another v
 with one console warning.
 
 Run untrusted plugins in a Worker, as the app does: code in the host's own realm can always reach
-the host's globals. Two limits remain. First, a script that runs in the realm before the first
-chem-core copy loads can publish a forgery that passes the adoption check: it behaves exactly like
-chem-core until it is asked about an object it targets. No check made from inside the realm can tell
-the two apart, and a script that runs first controls the realm anyway. Such scripts are out of
-scope. Second, a value created outside every document can still take an object's identity through
-the runtime's `retain` (chem-core's `retainObjectIdentity`), as an edited copy does. A patch parses
-anything it inserts into a new value. Such a value therefore reaches a document only if the host
-itself gives the engine a document that contains it (`adoptDerivedDocument`). Code the host trusts
-that far can change the document without any pin.
+the host's globals. The accepted trust boundary is this: code that runs in the page before
+ChemDraft's chem-core copies load is outside what the page can defend, and a fake runtime that
+behaves correctly except for a targeted object cannot be detected from inside the realm. Two limits
+follow. First, a script that runs in the realm before a chem-core copy loads can publish a forgery
+that passes the adoption check: it behaves exactly like chem-core until it is asked about an object it
+targets. No check made from inside the realm can tell the two apart, and a script that runs first
+controls the realm anyway. Such scripts are out of scope. Second, a value created outside every
+document can still take an object's identity through the runtime's `retain` (chem-core's
+`retainObjectIdentity`), as an edited copy does. A patch parses anything it inserts into a new value,
+so ordinary patch insertion is not a bypass. Such a value reaches a document only if a trusted caller
+gives the engine a document that contains it. Each of these paths takes such a document, and each
+needs a trusted caller to submit it:
+
+- `adoptDerivedDocument` (a `next` whose objects were pre-retained);
+- `admitParsedDocument`, which admits the document as it is;
+- `toEngineDocument` and `cloneDocument`, which copy each object's identity onto its copy;
+- `applyPatches` on an input that is not an engine document, which starts with `cloneDocument`.
+
+Code the host trusts that far can change the document without any pin.
 
 ### Native tables (0.1.18)
 

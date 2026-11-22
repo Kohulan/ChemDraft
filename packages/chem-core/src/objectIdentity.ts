@@ -73,6 +73,11 @@ const { ownKeys } = Reflect;
  *   tell chem-core from a forgery that a script placed in the realm before the first copy loaded and
  *   that behaves exactly like chem-core until asked about an object it targets. Such a script controls
  *   the realm the host runs in, which is out of scope: run untrusted code in a Worker.
+ * - Built-ins are captured per chem-core copy, when that copy loads, not once per realm. A copy that
+ *   loads after untrusted code has replaced `Object.isFrozen`, `WeakMap.prototype.get` or the like
+ *   captures the replacements: it rejects the genuine runtime, makes a private one, and calls the
+ *   poisoned methods. So every chem-core copy that will be used (the host's, the plugin-host SDK
+ *   bundle's, an embedder's) must load before any untrusted code runs in the realm, not only the first.
  * - `version` names the semantics below. A copy that finds a runtime of another version, or cannot
  *   publish one (a frozen global), also keeps a private runtime, silently. Bump the version on any
  *   change to what an identity means, how it is carried, or the runtime's shape.
@@ -279,8 +284,14 @@ export function parseWithoutIdentityTransfers<T>(parse: () => T): T {
 
 /**
  * Give every object of `document` that has no identity yet a fresh one. The engine calls it on each
- * document it returns, so every value in an engine document holds an identity before anything else can
+ * document it adopts (a patch result, `toEngineDocument`, `admitParsedDocument`, an adopted derived
+ * document), so every value in an engine-adopted document holds an identity before anything else can
  * reach it, and `retain`, which only fills in a missing identity, can never hand it another object's.
+ * This does not cover `adoptDerivedDocument`'s early return, which hands back a `next` that is the
+ * `base` itself, is already an engine document, or comes with a `base` that is not an engine document:
+ * such a `next` is not adopted and is not pre-identified here. (An engine `base` or `next` was
+ * pre-identified when it was adopted. Making the early return mint identities would change what a
+ * non-engine document's own objects can retain, so it deliberately does not.)
  * Index loops: nothing here goes through `Array.prototype`. Not exported from the package.
  */
 export function holdObjectIdentities(document: { readonly pages: readonly { readonly objects: readonly DocumentObject[] }[] }): void {
