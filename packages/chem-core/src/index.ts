@@ -212,6 +212,7 @@ export {
   applyPatches,
   pruneReactionObjectReferences,
   type ApplyPatchOptions,
+  type PatchObjectTarget,
   type OrphanedRepeatUnit,
   planOrphanedRepeatUnitCleanup,
   removeOrphanedRepeatUnitBrackets,

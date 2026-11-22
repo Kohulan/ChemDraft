@@ -69,6 +69,21 @@ describe("host-owned object identity (objectIdentity.ts)", () => {
     expect(hasObjectIdentity(find(toEngineDocument(spread), "X"), identity)).toBe(true);
   });
 
+  it("the engine's copy of a whole document keeps the identity of a molecule inside a repeat unit", () => {
+    const empty = createEmptyDocument({ now });
+    const unit = (id: string, side: "open" | "close", x: number): DocumentObject => ({ id, type: "bracket", bracketKind: "square",
+      x, y: 0, width: 10, height: 60, rotation: 0, style: {}, containedObjectIds: ["X"], pairId: "pair", side, repeatUnit: true,
+      bracketUsage: "sru", ...(side === "close" ? { label: "n" } : {}) });
+    const withRecord = { ...molecule("X", 0), chemistry: { formula: "C2H6", isotopeLabels: [], stereochemistry: [], warnings: [] } };
+    const before = applyPatches(toEngineDocument({ ...empty, pages: [{ ...empty.pages[0]!, id: "page-1", objects: [] }] }),
+      [withRecord, unit("open", "open", -10), unit("close", "close", 40)].map(object => ({ op: "addObject" as const, pageId: "page-1", object })), { now });
+    const identity = objectIdentity(find(before, "X"));
+    // Parsing the copy regenerates the molecule's repeat-unit warning before the copy is matched to it.
+    const copy = toEngineDocument({ ...before, pages: [...before.pages] });
+    expect(find(copy, "X")).not.toBe(find(before, "X"));
+    expect(hasObjectIdentity(find(copy, "X"), identity)).toBe(true);
+  });
+
   it("adoptDerivedDocument carries identity to a same-id, same-page derived copy", () => {
     const before = twoPages();
     const identity = objectIdentity(find(before, "X"));

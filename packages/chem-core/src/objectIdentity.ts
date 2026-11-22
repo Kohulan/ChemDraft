@@ -53,3 +53,15 @@ export function retainObjectIdentity(before: DocumentObject, after: DocumentObje
   const identity = objectIdentity(before);
   if (!identities.has(after)) identities.set(after, identity);
 }
+
+/**
+ * Record that `copy` is `original` itself, re-parsed: the engine's copy of a whole document
+ * (`cloneDocument`). Unlike `retainObjectIdentity`, this replaces an identity the copy was given while
+ * it was being parsed: normalization inside the parse (the repeat-unit warning pass) can ask for the
+ * fresh value's identity before the copy is matched to its original, and that minted identity belongs
+ * to nothing else. Only a same-id, same-type value is a copy.
+ */
+export function carryObjectIdentityToCopy(original: DocumentObject, copy: DocumentObject): void {
+  if (original === copy || original.id !== copy.id || original.type !== copy.type) return;
+  identities.set(copy, objectIdentity(original));
+}

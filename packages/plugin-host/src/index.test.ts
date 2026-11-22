@@ -911,6 +911,9 @@ describe("PluginHost", () => {
     expect(applyDocumentPatch).toHaveBeenCalledWith({
       signal: expect.any(AbortSignal),
       writeScopeObjectIds: [],
+      // Pins travel even when there are none, so the embedder's scope checks never grant by bare id.
+      writeScopePages: new Map(),
+      onCommitted: expect.any(Function),
       repeatUnitCleanup: { commandStartDocument, authoredRemovals: new Map() },
       plugin: { id: "org.test.direct-write", name: "Direct Writer", version: "0.0.1" },
       command: { id: "plugin.directWrite.insert", title: "Insert Structure" },

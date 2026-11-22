@@ -427,3 +427,130 @@ describe("1.2.3 host-owned identity: a pin binds the selected object, never a sa
     expect(JSON.stringify(pins.get("X"))).not.toContain("chemdraft");
   });
 });
+
+/** One page holding two molecules that share the id "X" (an imported file can); the first is selected. */
+function samePageDuplicates(): ChemDraftDocument {
+  const empty = createEmptyDocument({ now });
+  const page1 = { ...empty.pages[0]!, id: "page-1", objects: [molecule("X", 0), molecule("X", 100)] };
+  return toEngineDocument({ ...empty, pages: [page1], selection: { pageId: "page-1", objectIds: ["X"] } });
+}
+const batch = (...patches: ReturnType<typeof writePatchOps>) => ({ reason: "Batch", warnings: [], requiresUserApproval: true as const,
+  patch: { op: "batch" as const, patches } });
+
+describe("Kimi 1.2.3 finding 2: each batch operation is authorized against the object it actually reaches", () => {
+  const unselectedX = (document: ChemDraftDocument) => document.pages[0]!.objects.filter(object => object.id === "X");
+
+  it.each([
+    ["removeObject X; updateObject X", batch({ op: "removeObject", objectId: "X" }, { op: "updateObject", objectId: "X", changes: { x: 500 } })],
+    ["reorderObject X to front; updateObject X", batch({ op: "reorderObject", objectId: "X", placement: "front" },
+      { op: "updateObject", objectId: "X", changes: { x: 500 } })]
+  ])("refuses %s, which reaches the unselected same-page X second", (_name, proposed) => {
+    const before = samePageDuplicates();
+    const pins = legacyWriteScopePages(before, ["X"], "page-1");
+    // chem-core applies the batch in order: the update lands on the second, unselected X.
+    const after = applyPatch(before, proposed.patch, { now });
+    expect(unselectedX(after).some(object => object.x === 500 && object !== before.pages[0]!.objects[0])).toBe(true);
+    expect(() => assertPluginPatchWriteScope(before, proposed, ["X"], undefined, undefined, pins)).toThrow(/Plugin write refused/);
+    expect(() => assertLegacyWritePages(before, proposed.patch, pins)).toThrow(/Plugin write refused/);
+    expect(() => assertPluginDocumentWriteScope(before, after, proposed, ["X"], pins)).toThrow(/Plugin write refused/);
+  });
+
+  it("still writes the selected X when the batch only reaches it", () => {
+    const before = samePageDuplicates();
+    const pins = legacyWriteScopePages(before, ["X"], "page-1");
+    const proposed = batch({ op: "updateObject", objectId: "X", changes: { y: 5 } }, { op: "updateObject", objectId: "X", changes: { x: 7 } });
+    expect(() => assertPluginPatchWriteScope(before, proposed, ["X"], undefined, undefined, pins)).not.toThrow();
+    expect(() => assertLegacyWritePages(before, proposed.patch, pins)).not.toThrow();
+    const after = applyPatch(before, proposed.patch, { now });
+    expect(after.pages[0]!.objects.map(object => object.x)).toEqual([7, 100]);
+    expect(() => assertPluginDocumentWriteScope(before, after, proposed, ["X"], pins)).not.toThrow();
+  });
+
+  it("a host command's batch never reaches the unselected X, and the document is unchanged", async () => {
+    let current = samePageDuplicates();
+    const applyDocumentPatch = vi.fn((request: PluginPatchApplicationRequest) => {
+      assertPluginPatchWriteScope(current, request.patch, request.writeScopeObjectIds, undefined, undefined, request.writeScopePages);
+      const after = applyPatch(current, request.patch.patch, { now });
+      assertPluginDocumentWriteScope(current, after, request.patch, request.writeScopeObjectIds, request.writeScopePages);
+      current = after;
+      return { applied: true as const, objectIds: [] };
+    });
+    const host = new PluginHost({ getActiveDocument: () => current, applyDocumentPatch });
+    host.registerPlugin({ id: "org.test.batch", name: "Batch", version: "0.0.1", apiVersion: "^0.1.8", entry: "plugin.js",
+      permissions: ["document.write"], contributes: { commands: [{ id: "plugin.batch.run", title: "Batch" }] }
+    }, { commandHandlers: { "plugin.batch.run": ctx => ctx.documents.applyPatch!({ reason: "Batch", patch: { op: "batch", patches: [
+      { op: "removeObject", objectId: "X" }, { op: "updateObject", objectId: "X", changes: { x: 500 } }] } }) } });
+    const original = current;
+    await expect(host.invokeCommand("plugin.batch.run")).rejects.toThrow(/Plugin write refused/);
+    expect(applyDocumentPatch).not.toHaveBeenCalled();
+    expect(current).toBe(original);
+  });
+});
+
+describe("Kimi 1.2.3 finding 3: a command's insertions are granted by identity, never by bare id", () => {
+  /** A command that writes `first`, waits for `release`, then writes `second`. Receipts name every op's id. */
+  function twoStepHost(document: ChemDraftDocument, first: PluginPatchApplicationRequest["patch"]["patch"][],
+    second: PluginPatchApplicationRequest["patch"]["patch"]) {
+    let current = document;
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const applyDocumentPatch = vi.fn((request: PluginPatchApplicationRequest) => {
+      const before = current;
+      assertPluginPatchWriteScope(before, request.patch, request.writeScopeObjectIds, undefined, undefined, request.writeScopePages);
+      const after = applyPatch(before, request.patch.patch, { now });
+      assertPluginDocumentWriteScope(before, after, request.patch, request.writeScopeObjectIds, request.writeScopePages);
+      current = after;
+      return { applied: true as const, objectIds: writePatchOps(request.patch.patch).flatMap(op =>
+        op.op === "addObject" ? [op.object.id] : "objectId" in op ? [op.objectId] : []) };
+    });
+    const host = new PluginHost({ getActiveDocument: () => current, applyDocumentPatch });
+    host.registerPlugin({ id: "org.test.insert", name: "Insert", version: "0.0.1", apiVersion: "^0.1.8", entry: "plugin.js",
+      permissions: ["document.write"], contributes: { commands: [{ id: "plugin.insert.run", title: "Insert" }] }
+    }, { commandHandlers: { "plugin.insert.run": async ctx => {
+      for (const patch of first) await ctx.documents.applyPatch!({ reason: "First", patch });
+      await held;
+      return ctx.documents.applyPatch!({ reason: "Second", patch: second });
+    } } });
+    const pending = host.invokeCommand("plugin.insert.run");
+    return { pending, release, applyDocumentPatch, document: () => current, edit: (next: ChemDraftDocument) => { current = next; } };
+  }
+  const edit = { op: "updateObject" as const, objectId: "N", changes: { x: 999 } };
+  /** The user deletes the command's insertion "N" and pastes an exact copy back under its id. */
+  const replaceN = (document: ChemDraftDocument) => {
+    const copy = structuredClone(document.pages.flatMap(page => page.objects).find(object => object.id === "N")!);
+    return applyPatch(applyPatch(document, { op: "removeObject", objectId: "N" }, { now }), { op: "addObject", pageId: "page-1", object: copy }, { now });
+  };
+
+  it("refuses a later write to a pasted replacement of the command's own insertion", async () => {
+    const f = twoStepHost(identitySent(), [{ op: "addObject", pageId: "page-1", object: molecule("N", 200) }], edit);
+    await vi.waitFor(() => expect(f.applyDocumentPatch).toHaveBeenCalledTimes(1));
+    const replaced = replaceN(f.document());
+    f.edit(replaced);
+    f.release();
+    await expect(f.pending).rejects.toThrow(/Plugin write refused/);
+    expect(f.document()).toBe(replaced);
+  });
+
+  it("refuses it too when the insertion reused the id of the command's own deleted selection", async () => {
+    // Send selects X; the command deletes X, inserts a new X, and the user then replaces that insertion.
+    const f = twoStepHost(identitySent(), [{ op: "removeObject", objectId: "X" },
+      { op: "addObject", pageId: "page-1", object: molecule("X", 200) }], { op: "updateObject", objectId: "X", changes: { x: 999 } });
+    await vi.waitFor(() => expect(f.applyDocumentPatch).toHaveBeenCalledTimes(2));
+    const copy = structuredClone(objectX(f.document()));
+    const replaced = applyPatch(applyPatch(f.document(), { op: "removeObject", objectId: "X" }, { now }),
+      { op: "addObject", pageId: "page-1", object: copy }, { now });
+    f.edit(replaced);
+    f.release();
+    await expect(f.pending).rejects.toThrow(/Plugin write refused/);
+    expect(f.document()).toBe(replaced);
+  });
+
+  it("still writes the command's own insertion after the user edits it", async () => {
+    const f = twoStepHost(identitySent(), [{ op: "addObject", pageId: "page-1", object: molecule("N", 200) }], edit);
+    await vi.waitFor(() => expect(f.applyDocumentPatch).toHaveBeenCalledTimes(1));
+    f.edit(applyPatch(f.document(), { op: "updateObject", objectId: "N", changes: { y: 40 } }, { now }));
+    f.release();
+    await expect(f.pending).resolves.toMatchObject({ applied: true });
+    expect(f.document().pages[0]!.objects.find(object => object.id === "N")).toMatchObject({ x: 999, y: 40 });
+  });
+});

@@ -72,8 +72,9 @@ export interface BoundRequestWrite {
   document: RequestDocument;
   history: RequestHistory;
   selection: readonly RequestObjectRef[];
-  /** Host-only Send-time pins of the selection refs (pageObjects.ts): a pinned ref grants only the object
-   * holding its identity, never a different object that reuses its id on its page. */
+  /** Host-only pins of the selection refs, Send-time and insertion (pageObjects.ts): a ref grants only the
+   * object holding its pin's identity, never a different object that reuses its id; a ref without a pin
+   * grants nothing. Hosts always pass them; only a write with no pins at all is scoped by ref. */
   selectionPins?: PluginWriteScopePages;
   signal: AbortSignal;
   authorize(): void;
@@ -226,12 +227,15 @@ export async function preflightRequestPatch(before: ChemDraftDocument, proposal:
     if (new Set(before.pages.map(page => page.id)).size !== before.pages.length) {
       throw new RequestWriteError("invalid", "The document contains an ambiguous page or object ID.");
     }
-    // A pinned Send-time ref grants only its own object: a same-id object that does not hold the pin's
-    // identity (a paste, undo, or insert reusing the id after Send) is never in scope.
+    // With pins, a ref grants only the object holding its pin's identity: a same-id object that does not
+    // (a paste, undo, or insert reusing the id after Send or after the request's own insertion) is never
+    // in scope, and neither is a ref without a pin. Only a caller with no pins at all (a figure-plan
+    // preview of a detached draft) grants by ref.
+    const pins = options.selectionPins;
     const scope = selection.filter(ref => {
       const entry = byId.get(ref.objectId);
-      const pin = options.selectionPins?.get(ref.objectId);
-      return entry?.pageId === ref.pageId && (!pin || hasObjectIdentity(entry.object, pin.identity));
+      const pin = pins?.get(ref.objectId);
+      return entry?.pageId === ref.pageId && (!pins || !!pin && hasObjectIdentity(entry.object, pin.identity));
     }).map(ref => ref.objectId);
     const targets = new Set<string>();
     const ordered = new Set<string>();
@@ -269,6 +273,9 @@ export async function preflightRequestPatch(before: ChemDraftDocument, proposal:
 
     // This preflight applies the whole draft atomically and detects implicit bracket, reaction
     // and crossing changes. Its original proposal is kept so commit-time rebasing uses live IDs.
+    // `scope` already holds only refs whose object carries its pin, in a document whose ids are
+    // unique (refused above otherwise), so these checks may compare by id; the final guard reruns
+    // prepare on the live document inside the same history step.
     let draft: ChemDraftDocument;
     try { draft = assertPluginPatchWriteScope(before, proposal, scope, rebased, checkReferenceScope); }
     catch (error) {
@@ -346,7 +353,7 @@ export async function commitRequestPatch(binding: BoundRequestWrite, proposal: N
   const before = read();
   const { prepare, planned, verified, inspectedFinal } = await preflightRequestPatch(before, proposal, binding.selection,
     (...args) => binding.history.verify(...args), binding.signal,
-    binding.selectionPins?.size ? { ...options, selectionPins: binding.selectionPins } : options).catch(error => {
+    binding.selectionPins ? { ...options, selectionPins: binding.selectionPins } : options).catch(error => {
       read(); // Cancellation and lost authorization take priority over verification failures.
       throw error;
     });

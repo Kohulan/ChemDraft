@@ -68,6 +68,21 @@ export interface ApplyPatchOptions {
   allowOrphanedRepeatUnitRemoval?: (unit: OrphanedRepeatUnit) => boolean;
   /** Trusted host preflight for a parsed add or update, before draft normalization can prune links. */
   beforeObjectWrite?: (pageId: string, previous: DocumentObject | undefined, next: DocumentObject) => void;
+  /**
+   * Trusted host preflight, called before each operation that acts on objects already in the draft
+   * (remove, update, move, reorder, set order, remove annotation) with the objects it is about to act
+   * on, resolved in the draft as it stands at that moment. A bare id names its first occurrence in
+   * page order then, so an earlier operation of the same batch can change which object a later one
+   * reaches. An operation whose target does not exist gets no targets (it fails afterwards). Throw to
+   * refuse the batch. The draft and targets are borrowed for inspection only.
+   */
+  beforeObjectTargets?: (document: ChemDraftDocument, patch: DocumentPatch, targets: readonly PatchObjectTarget[]) => void;
+}
+
+/** An object a patch operation is about to act on, and the page it is on (`beforeObjectTargets`). */
+export interface PatchObjectTarget {
+  pageId: string;
+  object: DocumentObject;
 }
 
 export class DocumentPatchError extends Error {
@@ -128,6 +143,17 @@ export function applyPatches(
       while (end < patches.length && patches[end]!.op === "removeObject") {
         end += 1;
       }
+      if (options.beforeObjectTargets) {
+        // As removeObjects applies the run: each removal takes the next remaining occurrence of its id.
+        const taken = new Map<string, number>();
+        for (const entry of patches.slice(index, end)) {
+          const objectId = (entry as Extract<DocumentPatch, { op: "removeObject" }>).objectId;
+          const occurrence = taken.get(objectId) ?? 0;
+          taken.set(objectId, occurrence + 1);
+          const target = nthObjectWithId(draft, objectId, occurrence);
+          options.beforeObjectTargets(draft, entry, target ? [target] : []);
+        }
+      }
       options.beforeRemoveObjects?.(draft, patches.slice(index, end).map(entry =>
         (entry as Extract<DocumentPatch, { op: "removeObject" }>).objectId));
       if (end - index > 1) {
@@ -135,6 +161,8 @@ export function applyPatches(
         index = end;
         continue;
       }
+    } else if (options.beforeObjectTargets) {
+      options.beforeObjectTargets(draft, patch, patchObjectTargets(draft, patch));
     }
     try {
       applyPatchInPlace(draft, patch, options.beforeObjectWrite);
@@ -1154,6 +1182,42 @@ function buildObjectLocationIndex(document: ChemDraftDocument): Map<string, { pa
 function forgetShiftedDuplicateLocations(document: ChemDraftDocument): void {
   if (documentsWithDuplicateIds.has(document)) {
     objectLocationIndexes.delete(document);
+  }
+}
+
+/** The `occurrence`-th object (0-based) with id `objectId`, searching pages in order, as removeObjects takes them. */
+function nthObjectWithId(document: ChemDraftDocument, objectId: string, occurrence: number): PatchObjectTarget | undefined {
+  let remaining = occurrence;
+  for (const page of document.pages) {
+    for (const object of page.objects) {
+      if (object.id !== objectId) continue;
+      if (remaining === 0) return { pageId: page.id, object };
+      remaining -= 1;
+    }
+  }
+  return undefined;
+}
+
+/** The existing objects a single operation acts on, resolved exactly as applyPatchInPlace will resolve them. */
+function patchObjectTargets(document: ChemDraftDocument, patch: DocumentPatch): PatchObjectTarget[] {
+  const located = (objectId: string): PatchObjectTarget[] => {
+    const location = findObject(document, objectId);
+    return location ? [{ pageId: location.page.id, object: location.object }] : [];
+  };
+  switch (patch.op) {
+    case "removeObject":
+    case "updateObject":
+    case "moveObject":
+    case "reorderObject":
+      return located(patch.objectId);
+    case "removeAnnotation":
+      return located(patch.annotationId);
+    case "setObjectOrder": {
+      const page = document.pages.find(candidate => candidate.id === patch.pageId);
+      return page ? page.objects.map(object => ({ pageId: page.id, object })) : [];
+    }
+    default:
+      return [];
   }
 }
 

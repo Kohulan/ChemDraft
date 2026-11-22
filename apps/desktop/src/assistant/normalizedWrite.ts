@@ -1,6 +1,6 @@
 import type { ChemDraftDocument, DocumentObject, MoleculeObject } from "@chemdraft/chem-core";
-import { duplicateIdRefusalMessage, objectInWriteScope, pinnedObjectMissingMessage, resolvePinnedPages, type PinnedObjectPages,
-  type PluginWriteScopePages } from "@chemdraft/plugin-host";
+import { duplicateIdRefusalMessage, objectInWriteScope, pinnedObjectMissingMessage, resolvePinnedObject, resolvePinnedPages,
+  type PinnedObjectPages, type PluginWriteScopePages } from "@chemdraft/plugin-host";
 import { normalizeCommittedDocument } from "../documentWorkflow";
 import type { AssistantToolContext } from "./AssistantToolContext";
 import { assertCanonical, inspectMolecule } from "../plugins/requestWrites/structureIdentity";
@@ -27,11 +27,13 @@ function normalizeScopedWrite(before: ChemDraftDocument, patched: ChemDraftDocum
   const normalized = normalizeCommittedDocument(patched);
   assertOffPageDuplicatesUnchanged(before, normalized, scopePages, pinned);
   const previous = objectsById(before), proposed = objectsById(patched), committed = objectsById(normalized);
+  // This write's own insertions: granted ids that named nothing before it. Pins cover everything else.
+  const taken = new Set(before.pages.flatMap(page => page.objects.map(object => object.id)));
   for (const key of new Set([...previous.keys(), ...proposed.keys(), ...committed.keys()])) {
     const old = previous.get(key), next = committed.get(key);
     const entry = (old ?? proposed.get(key) ?? next)!;
     const id = entry.object.id;
-    if (objectInWriteScope(scope, pinned, entry.pageId, id)) continue;
+    if (objectInWriteScope(scope, pinned, entry.pageId, id) || (!taken.has(id) && scope.has(id))) continue;
     if (equalEntry(old, next)) continue;
     if (old?.object.type === "electron-mark" && next?.object.type === "electron-mark" && next.object.anchor.kind === "atom") {
       const mark = old.object;
@@ -62,7 +64,8 @@ function assertOffPageDuplicatesUnchanged(before: ChemDraftDocument, after: Chem
   for (let index = 0; index < Math.max(previous.length, next.length); index++) {
     if (equalEntry(previous[index], next[index])) continue;
     const entry = (previous[index] ?? next[index])!;
-    const pinnedPage = pinned.get(entry.object.id);
+    // The pinned object's own page, even when a same-id object there keeps page checks from naming it.
+    const pinnedPage = resolvePinnedObject(before, entry.object.id, scopePages.get(entry.object.id)!)?.page.id;
     throw new Error(pinnedPage ? duplicateIdRefusalMessage(before, entry.object.id, pinnedPage, [entry.pageId])
       : pinnedObjectMissingMessage(before, scopePages.get(entry.object.id)!.pageId));
   }

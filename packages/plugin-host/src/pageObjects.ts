@@ -28,9 +28,14 @@ export interface PagePin {
 export type PluginWriteScopePages = ReadonlyMap<string, PagePin>;
 
 /** Each pinned id's page in one document ({@link resolvePinnedPages}): the page now holding the pinned
- * object, or null when it is gone. A write-scope check resolves its pins once, against the document
- * the write starts from, and passes this to {@link objectInWriteScope}. */
+ * object, or null when it is gone, or when no page-level check could single it out. A write-scope check
+ * resolves its pins once, against the document the write starts from, and passes this to
+ * {@link objectInWriteScope}. */
 export type PinnedObjectPages = ReadonlyMap<string, string | null>;
+
+/** Each pinned id's object in one document ({@link resolvePinnedObjects}): the one object value holding
+ * the pin's identity, or null when it is gone or (failing closed) found more than once. */
+export type PinnedObjects = ReadonlyMap<string, DocumentObject | null>;
 
 export interface PageObjectLocation<Object extends DocumentObject = DocumentObject> {
   page: DocumentPage;
@@ -120,18 +125,41 @@ export function resolvePinnedObject(document: ChemDraftDocument, objectId: strin
   return found;
 }
 
-/** Resolve every pin in one pass over `document` (see {@link resolvePinnedObject}). */
-export function resolvePinnedPages(document: ChemDraftDocument, scopePages: PluginWriteScopePages | undefined): PinnedObjectPages | undefined {
-  if (!scopePages?.size) return undefined;
-  const pages = new Map<string, string | null>();
+/** Resolve every pin's object in one pass over `document` (see {@link resolvePinnedObject}). Undefined
+ * only when there are no pins at all (`scopePages` undefined): a caller that passes pins, even none,
+ * gets pinned scope, in which an id without a pin grants nothing. */
+export function resolvePinnedObjects(document: ChemDraftDocument, scopePages: PluginWriteScopePages | undefined): PinnedObjects | undefined {
+  if (!scopePages) return undefined;
+  const objects = new Map<string, DocumentObject | null>();
   const found = new Set<string>();
-  for (const objectId of scopePages.keys()) pages.set(objectId, null);
+  for (const objectId of scopePages.keys()) objects.set(objectId, null);
   for (const page of document.pages) {
     for (const object of page.objects) {
       const pin = scopePages.get(object.id);
       if (!pin || !hasObjectIdentity(object, pin.identity)) continue;
-      pages.set(object.id, found.has(object.id) ? null : page.id);
+      objects.set(object.id, found.has(object.id) ? null : object);
       found.add(object.id);
+    }
+  }
+  return objects;
+}
+
+/**
+ * Resolve every pin's page in one pass over `document` (see {@link resolvePinnedObject}), for checks that
+ * can only name an object by page and id, such as crossings. A pinned object whose page also holds
+ * another object with its id gets null too: by page and id the two cannot be told apart, so neither is
+ * in scope there. Undefined only without pins, as in {@link resolvePinnedObjects}.
+ */
+export function resolvePinnedPages(document: ChemDraftDocument, scopePages: PluginWriteScopePages | undefined): PinnedObjectPages | undefined {
+  const objects = resolvePinnedObjects(document, scopePages);
+  if (!objects) return undefined;
+  const pages = new Map<string, string | null>();
+  for (const objectId of objects.keys()) pages.set(objectId, null);
+  for (const page of document.pages) {
+    const counts = new Map<string, number>();
+    for (const object of page.objects) if (objects.has(object.id)) counts.set(object.id, (counts.get(object.id) ?? 0) + 1);
+    for (const object of page.objects) {
+      if (objects.get(object.id) === object && counts.get(object.id) === 1) pages.set(object.id, page.id);
     }
   }
   return pages;
@@ -172,14 +200,26 @@ export function resolveScopedObject(document: ChemDraftDocument, objectId: strin
   throw new Error(`Object id "${objectId}" names objects on pages ${pageList(locations)}; select the one you mean and retry.`);
 }
 
-/** True when the object `objectId` on page `pageId` is in write scope: a pinned id only where its pinned
- * object is (`pinned`, resolved by {@link resolvePinnedPages} against the document being written; the
- * same rule as {@link scopedObjectPage}), and nowhere once it is gone. Unpinned ids (insertions,
- * request-bound refs checked elsewhere) keep bare-id scope. */
+/** True when the object `objectId` on page `pageId` is in write scope, for checks that can only name an
+ * object by page and id (crossings, page-keyed comparisons). With pins (`pinned`, resolved by
+ * {@link resolvePinnedPages} against the document being written), a granted id only on the page holding
+ * its pinned object, alone under that id there; nowhere once it is gone, and nowhere for an id without a
+ * pin. Without pins (`pinned` undefined: request-bound callers that resolved identity themselves, and
+ * table builders) a granted id keeps bare-id scope. Prefer {@link objectIsInWriteScope} wherever the
+ * object itself is at hand. */
 export function objectInWriteScope(scope: ReadonlySet<string>, pinned: PinnedObjectPages | undefined,
   pageId: string, objectId: string): boolean {
   if (!scope.has(objectId)) return false;
-  return !pinned?.has(objectId) || pinned.get(objectId) === pageId;
+  return !pinned || pinned.get(objectId) === pageId;
+}
+
+/** True when `object` itself is in write scope: with pins (`pinned`, resolved by
+ * {@link resolvePinnedObjects} against the same document as `object`), only the one object holding its
+ * id's pin, by identity: never another object with the id, on any page including its own, and never an
+ * id without a pin. Without pins, as {@link objectInWriteScope}. */
+export function objectIsInWriteScope(scope: ReadonlySet<string>, pinned: PinnedObjects | undefined, object: DocumentObject): boolean {
+  if (!scope.has(object.id)) return false;
+  return !pinned || pinned.get(object.id) === object;
 }
 
 /**
@@ -213,13 +253,39 @@ export function pinSelectionPages(document: ChemDraftDocument | undefined, objec
 /**
  * `pins` without the pins of `insertedIds`: ids the command or request has since inserted objects under.
  * An insertion needs its id to be free, so the pinned object was already gone; the id now names the
- * insertion, which is in scope as an insertion of that command, not as the selected object.
+ * insertion, which is in scope only through its own insertion pin ({@link insertionPins}).
  */
 export function withoutPins(pins: PluginWriteScopePages | undefined, insertedIds: Iterable<string>): PluginWriteScopePages | undefined {
   if (!pins?.size) return pins;
   const dropped = [...insertedIds].filter(id => pins.has(id));
   if (!dropped.length) return pins;
   return new Map([...pins].filter(([id]) => !dropped.includes(id)));
+}
+
+/**
+ * Pins for the objects a write inserted, read from the document that write committed: each id pins the
+ * object it names there, by that object's own identity. A command's or request's insertion is then in
+ * its scope exactly as a selected object is, and a later object reusing the id (the user deletes the
+ * insertion and pastes a copy back, an undo, another plugin's insert) is not. An id that names no object
+ * or several in `committed` gets no pin, so nothing is in scope under it (fail closed).
+ */
+export function insertionPins(committed: ChemDraftDocument | undefined, insertedIds: Iterable<string>): Map<string, PagePin> {
+  const pins = new Map<string, PagePin>();
+  const wanted = new Set(insertedIds);
+  if (!committed || !wanted.size) return pins;
+  const found = new Map<string, PageObjectLocation | null>();
+  for (const page of committed.pages) {
+    for (const object of page.objects) {
+      if (wanted.has(object.id)) found.set(object.id, found.has(object.id) ? null : { page, object });
+    }
+  }
+  for (const [objectId, location] of found) if (location) pins.set(objectId, pinObject(location.page, location.object));
+  return pins;
+}
+
+/** `pins` with `added` laid over it: an id re-inserted under a pin now pins the insertion instead. */
+export function withPins(pins: PluginWriteScopePages | undefined, added: ReadonlyMap<string, PagePin>): Map<string, PagePin> {
+  return new Map([...(pins ?? []), ...added]);
 }
 
 /** Each scoped id as a page reference, for placement beside the selection. Unresolvable ids are omitted. */

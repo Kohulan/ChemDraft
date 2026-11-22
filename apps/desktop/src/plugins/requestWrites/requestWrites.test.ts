@@ -1803,3 +1803,57 @@ describe("1.2.3: a request's Send-time selection pins its object by host-owned i
     } finally { await f.finish(); }
   });
 });
+
+describe("Kimi 1.2.3 finding 3: a request's insertions are granted by identity, never by bare id", () => {
+  // The desktop history refuses any write after a user edit that follows the request's own write
+  // ("interrupted"). These edits are made without telling the history, so the scope check itself
+  // must refuse: it may never stand on that unrelated guard.
+  /** The user deletes `id` and pastes an exact copy back under it, on the first page. */
+  const deleteAndPaste = (id: string, pageId: string) => (document: ChemDraftDocument) => {
+    const copy = structuredClone(document.pages[0]!.objects.find(object => object.id === id)!);
+    return applyPatch(applyPatch(document, { op: "removeObject", objectId: id }), { op: "addObject", pageId, object: copy });
+  };
+
+  it("refuses a write to a pasted replacement of the request's own insertion", async () => {
+    const f = setup();
+    try {
+      const requestId = await f.begin();
+      const apply = f.context.documents.applyRequestPatch!;
+      expect(await apply({ requestId, patch: { op: "addObject", pageId: f.pageId, object: note("inserted") } })).toMatchObject({ ok: true });
+      f.edit(deleteAndPaste("inserted", f.pageId), false);
+      const pasted = f.pinned();
+      expect(await apply({ requestId, patch: { op: "updateObject", objectId: "inserted", changes: { text: "Edited" } } }))
+        .toMatchObject({ ok: false, error: { code: "scope" } });
+      expect(f.pinned()).toBe(pasted);
+    } finally { await f.finish(); }
+  });
+
+  it("refuses it when the insertion reused the id of the request's deleted selection", async () => {
+    const f = setup(["anchor"]);
+    try {
+      const requestId = await f.begin();
+      const apply = f.context.documents.applyRequestPatch!;
+      expect(await apply({ requestId, patch: { op: "removeObject", objectId: "anchor" } })).toMatchObject({ ok: true });
+      expect(await apply({ requestId, patch: { op: "addObject", pageId: f.pageId, object: note("anchor", "Replacement") } }))
+        .toMatchObject({ ok: true });
+      f.edit(deleteAndPaste("anchor", f.pageId), false);
+      const pasted = f.pinned();
+      expect(await apply({ requestId, patch: { op: "updateObject", objectId: "anchor", changes: { text: "Edited" } } }))
+        .toMatchObject({ ok: false, error: { code: "scope" } });
+      expect(f.pinned()).toBe(pasted);
+    } finally { await f.finish(); }
+  });
+
+  it("still writes its own insertion after the user edits it", async () => {
+    const f = setup();
+    try {
+      const requestId = await f.begin();
+      const apply = f.context.documents.applyRequestPatch!;
+      expect(await apply({ requestId, patch: { op: "addObject", pageId: f.pageId, object: note("inserted") } })).toMatchObject({ ok: true });
+      f.edit(document => applyPatch(document, { op: "updateObject", objectId: "inserted", changes: { y: 160 } }), false);
+      expect(await apply({ requestId, patch: { op: "updateObject", objectId: "inserted", changes: { text: "Edited" } } }))
+        .toMatchObject({ ok: true });
+      expect(f.pinned().pages[0]!.objects.find(object => object.id === "inserted")).toMatchObject({ y: 160, text: "Edited" });
+    } finally { await f.finish(); }
+  });
+});

@@ -14,7 +14,7 @@ import {
   type AppliedPatchReceipt,
   type NormalizedProposedDocumentPatch
 } from "@chemdraft/plugin-api";
-import { assertPluginDocumentWriteScope, bareIdTargetPage, objectInWriteScope, rebasePluginPatch, resolvePinnedPages,
+import { assertPluginDocumentWriteScope, bareIdTargetPage, rebasePluginPatch,
   retainedCtabCompatibility, storedCtabReference, writePatchOps, type PluginWriteScopePages } from "@chemdraft/plugin-host";
 import { selectionBounds, translateInsertedDocumentObjects } from "../documentWorkflow";
 import { choosePlacement, objectRect, overlaps as boundsOverlap, pageContentRect, RELATIVE_GAP, unionRects } from "../assistant/placement";
@@ -51,8 +51,6 @@ export function refreshPluginPatchChemistry(before: ChemDraftDocument, draft: Ch
   scopePages?: PluginWriteScopePages
 ): Promise<ChemDraftDocument> | undefined {
   const scope = writeScopeObjectIds && new Set(writeScopeObjectIds);
-  // A Send-time pin resolves to the object holding its identity in `before`; never a same-id object.
-  const pinned = resolvePinnedPages(before, scopePages);
   const inserted = new Set<string>();
   const atomUpdates = new Set<string>();
   const storedUpdates = new Set<string>();
@@ -80,7 +78,10 @@ export function refreshPluginPatchChemistry(before: ChemDraftDocument, draft: Ch
       if (object.type !== "molecule") continue;
       const previous = prior[moleculeIndex++];
       const isInsertion = inserted.has(object.id);
-      if (previous?.id !== object.id || (scope && !isInsertion && !objectInWriteScope(scope, pinned, page.id, object.id))) continue;
+      // Skip only ids the write was never granted. Which same-id object a pin grants is the scope check's
+      // to decide (it runs before the first inspection below and refuses the rest); this gate only ever
+      // errs toward verifying, so a granted molecule's chemistry is never left unchecked.
+      if (previous?.id !== object.id || (scope && !isInsertion && !scope.has(object.id))) continue;
       // Every insertion is verified, whether a scoped command wrote it or the user accepted it.
       const verifyInsertion = isInsertion;
       // An authored atom move can change 2D stereo, but only where geometry defines stereo, and

@@ -1688,3 +1688,61 @@ describe("1.2.3: assistant and plugin pins follow the selected object by host-ow
     expect(reused.document()).toBe(pasted);
   });
 });
+
+describe("Kimi 1.2.3 finding 3: assistant insertions are granted by identity, never by bare id", () => {
+  const findObject = (document: ChemDraftDocument, id: string) => document.pages.flatMap(page => page.objects).find(object => object.id === id)!;
+  /** The user deletes `id` and pastes an exact copy back under it, on page 1. */
+  const deleteAndPaste = (document: ChemDraftDocument, id: string) =>
+    applyPatch(applyPatch(document, { op: "removeObject", objectId: id }),
+      { op: "addObject", pageId: document.pages[0]!.id, object: structuredClone(findObject(document, id)) });
+
+  it("refuses a write to a pasted replacement of the request's own insertion", async () => {
+    const s = setup();
+    try {
+      const { requestId } = await s.controller.beginRequest(s.plugin, { prompt: "caption it" });
+      const inserted = await s.controller.callTool(s.plugin, { name: "insert_text", input: { text: "Caption" } });
+      expect(inserted.isError, JSON.stringify(inserted)).not.toBe(true);
+      const [captionId] = inserted.structuredContent!.objectIds as string[];
+      const pasted = deleteAndPaste(s.context.getDocument()!, captionId!);
+      s.replace(pasted);
+      const styled = await s.controller.callTool(s.plugin, { name: "style_objects", input: { objectIds: [captionId!], style: { color: "#112233" } } });
+      expect(styled.isError, JSON.stringify(styled)).toBe(true);
+      expect(s.context.getDocument()).toBe(pasted);
+      await s.controller.endRequest(s.plugin, { requestId });
+    } finally { await s.finish(); }
+  });
+
+  it("refuses a write to a pasted replacement of an object a plugin assistant tool inserted", async () => {
+    const s = setup(async context => {
+      await context.documents.applyPatch!({ reason: "Insert record", patch: {
+        op: "addObject", pageId: s.context.getDocument()!.pages[0]!.id, object: { ...s.text, id: "record-note" } } });
+      return TOOL_OK;
+    }, true);
+    try {
+      const { requestId } = await s.controller.beginRequest(s.plugin, { prompt: "record" });
+      const session = await s.controller.createToolSession(s.plugin, { requestId, extraTools: [EXTRA_TOOL] });
+      expect(await s.bridge(session.sessionId, EXTRA_TOOL.name, {})).toEqual({ result: TOOL_OK });
+      const pasted = deleteAndPaste(s.context.getDocument()!, "record-note");
+      s.replace(pasted);
+      const styled = await s.controller.callTool(s.plugin, { name: "style_objects", input: { objectIds: ["record-note"], style: { color: "#112233" } } });
+      expect(styled.isError, JSON.stringify(styled)).toBe(true);
+      expect(s.context.getDocument()).toBe(pasted);
+      await s.controller.endRequest(s.plugin, { requestId });
+    } finally { await s.finish(); }
+  });
+
+  it("still writes its own insertion after the user moves it", async () => {
+    const s = setup();
+    try {
+      const { requestId } = await s.controller.beginRequest(s.plugin, { prompt: "caption it" });
+      const inserted = await s.controller.callTool(s.plugin, { name: "insert_text", input: { text: "Caption" } });
+      const [captionId] = inserted.structuredContent!.objectIds as string[];
+      const current = s.context.getDocument()!;
+      s.replace(applyPatch(current, { op: "updateObject", objectId: captionId!, changes: { y: findObject(current, captionId!).y + 10 } }));
+      const styled = await s.controller.callTool(s.plugin, { name: "style_objects", input: { objectIds: [captionId!], style: { color: "#112233" } } });
+      expect(styled.isError, JSON.stringify(styled)).not.toBe(true);
+      expect(JSON.stringify(findObject(s.context.getDocument()!, captionId!))).toContain("#112233");
+      await s.controller.endRequest(s.plugin, { requestId });
+    } finally { await s.finish(); }
+  });
+});
