@@ -289,3 +289,24 @@ it("writes restored captions past the document-wide run cap as plain styled text
   const again = openChemDraftPayload(saved.result.contents);
   expect(textsOf(again).map(text => text.text)).toEqual(document.pages[0].objects.map(object => (object as TextObject).text));
 });
+
+// Codex (1.2.3): a caption capped on import kept its source XML, so saving the unchanged file
+// copied that caption's frame and run fonts back out and bypassed the cap on Save As.
+it("saves an opened file past the document-wide run cap with its capped captions as plain styled text, with one warning", { timeout: 60_000 }, () => {
+  const source = `<CDXML>${fontTable(3)}<page>${Array.from({ length: 6 }, (_, i) => caption(i + 10, 55_000, 2, 72 + 20 * i)).join("")}</page></CDXML>`;
+  const opened = openChemDraftPayload(source);
+  const texts = textsOf(opened);
+  const saved = counted(() => exportDocumentToCdxml(opened.document!, plain));
+  expect(saved.operations).toBeLessThanOrEqual(4 * (3 + 6 * 55_000));
+  expect(saved.result.warnings.map(warning => [warning.code, warning.message])).toEqual([["cdxml.document_caption_runs_limited",
+    `CDXML export: the captions in this document have more than 262144 styled runs in total; from text ${texts[4].id} on, captions past that total were written as plain styled text, without their caption frame and run fonts.`]]);
+  const written = saved.result.contents.match(/<t [^>]*>/g) ?? [];
+  expect(written).toHaveLength(6);
+  // The first four keep their source frames; the capped two are written without a frame or run fonts.
+  expect(written.map(tag => tag.includes("BoundingBox="))).toEqual([true, true, true, true, false, false]);
+  const runs = saved.result.contents.split("<t ").slice(1).map(t => t.match(/<s font=/g)?.length ?? 0);
+  expect(runs).toEqual([55_000, 55_000, 55_000, 55_000, 0, 0]);
+  const again = openChemDraftPayload(saved.result.contents);
+  expect(textsOf(again).map(text => text.text)).toEqual(texts.map(text => text.text));
+  expect(textsOf(again).map(text => text.style.fontFamily)).toEqual(["Font2", "Font2", "Font2", "Font2", undefined, undefined]);
+});

@@ -400,7 +400,10 @@ function importCdxmlFonts(tree: OrderedXmlTree, sourceFormat: string, warnings: 
 interface CdxmlExportFonts {
   table: readonly CdxmlFont[];
   byName: ReadonlyMap<string | undefined, CdxmlFont>;
-  /** Restored captions past the document-wide run cap; they are written as plain styled text. */
+  /**
+   * Captions past the document-wide run cap, on this export or on import; they are written as
+   * plain styled text, even when unchanged since import.
+   */
   plainCaptionIds: ReadonlySet<string>;
   /** Set once the export has reported the cap (one warning per document). */
   captionRunLimitWarned: boolean;
@@ -946,14 +949,18 @@ function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityCo
   }
   const byName = indexCdxmlFonts<string | undefined>(fonts.values(), font => font.name);
   const plainCaptionIds = new Set<string>();
-  let nextId = 1, captionRuns = 0;
+  let nextId = 1, captionRuns = 0, captionRunLimitReached = false;
   for (const page of document.pages) for (const object of page.objects) {
     let names: unknown[] = [];
     if (object.type === "table") names = [nativeTextStyleFromObjectStyle(object.style).fontFamily];
-    else if (object.type === "text" && object.compatibility?.unknown.sourceCdxmlAttributes) {
+    else if (object.type === "text" && object.compatibility?.unknown.cdxmlCaptionRunsLimited === true) {
+      // Imported past the cap: it has no caption frame to restore, so it stays plain styled text.
+      plainCaptionIds.add(object.id);
+    } else if (object.type === "text" && object.compatibility?.unknown.sourceCdxmlAttributes) {
       const spans = textObjectSpansForRendering(object);
       // Past the document-wide cap a caption is written as plain styled text (exportTextObject).
-      if (plainCaptionIds.size || captionRuns + spans.length > CDXML_DOCUMENT_CAPTION_RUN_LIMIT) {
+      if (captionRunLimitReached || captionRuns + spans.length > CDXML_DOCUMENT_CAPTION_RUN_LIMIT) {
+        captionRunLimitReached = true;
         plainCaptionIds.add(object.id);
         continue;
       }
@@ -2388,8 +2395,10 @@ function exportTextObject(text: TextObject, context: VisibleExportContext, alloc
     }
     return undefined;
   };
+  const plainCaption = fonts.plainCaptionIds.has(text.id);
   if (typeof source === "string") {
-    if (text.compatibility?.unknown.cdxmlTextNativeState === textSourceState(text)) {
+    // A caption past the cap skips the unchanged-source copy too, which would write its frame and run fonts.
+    if (!plainCaption && text.compatibility?.unknown.cdxmlTextNativeState === textSourceState(text)) {
       // Reparse our serialized source rather than injecting compatibility data as unchecked XML.
       try {
         const tree = parseCdxml(source);
@@ -2411,7 +2420,8 @@ function exportTextObject(text: TextObject, context: VisibleExportContext, alloc
     }
     const edited = framedCaption();
     if (edited) return edited;
-    warnings.push({ code: "cdxml.text_source_formatting_not_kept", sourceObjectId: text.id,
+    // The document's one cap warning already says why a capped caption lost its source formatting.
+    if (!plainCaption) warnings.push({ code: "cdxml.text_source_formatting_not_kept", sourceObjectId: text.id,
       message: `Text ${text.id} (source ${text.compatibility?.originalId ?? "<unnamed>"}) was edited or its source text is unavailable; source formatting was not kept. The current native text is written.` });
   }
   if (typeof source !== "string") {
@@ -5319,6 +5329,8 @@ function restoreFramedCaption(object: TextObject, element: XmlElementView, conte
         message: `${context.sourceFormat} import: the captions in this document have more than ${CDXML_DOCUMENT_CAPTION_RUN_LIMIT} styled runs ` +
           `in total; from text ${a.id ?? object.id} on, captions past that total were imported as plain styled text, without their caption frame and run fonts.` });
     }
+    // Saving writes it as plain styled text too, not its unchanged source frame and fonts.
+    object.compatibility!.unknown.cdxmlCaptionRunsLimited = true;
     return;
   }
   usage.captionRuns += runs.length;
