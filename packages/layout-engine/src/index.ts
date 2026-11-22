@@ -4188,12 +4188,53 @@ export function textObjectSpansForRendering(object: Pick<TextObject, "text" | "s
   return [{ text: object.text, script: "normal", style: {} }];
 }
 
-function electronMarkFrameHalfExtents(mark: Pick<ElectronMarkObject, "width" | "height" | "rotation">) {
-  const radians = degreesToRadians(mark.rotation);
+interface FrameHalfExtents { halfWidth: number; halfHeight: number }
+interface BoxEdges { left: number; right: number; top: number; bottom: number }
+
+/** Half the axis-aligned extents of a `width` x `height` frame turned by `radians`. */
+function rotatedFrameHalfExtents(width: number, height: number, radians: number): FrameHalfExtents {
+  const cos = Math.abs(Math.cos(radians)), sin = Math.abs(Math.sin(radians));
+  return { halfWidth: (cos * width + sin * height) / 2, halfHeight: (sin * width + cos * height) / 2 };
+}
+
+/**
+ * `box` grown on every side by a frame's half extents plus `margin`: the region a centre of that
+ * frame must leave for the frame to clear `box` by `margin`.
+ */
+function frameExclusionEdges(box: LayoutBounds, { halfWidth, halfHeight }: FrameHalfExtents, margin: number): BoxEdges {
   return {
-    halfWidth: (Math.abs(Math.cos(radians)) * mark.width + Math.abs(Math.sin(radians)) * mark.height) / 2,
-    halfHeight: (Math.abs(Math.sin(radians)) * mark.width + Math.abs(Math.cos(radians)) * mark.height) / 2
+    left: box.x - halfWidth - margin,
+    right: box.x + box.width + halfWidth + margin,
+    top: box.y - halfHeight - margin,
+    bottom: box.y + box.height + halfHeight + margin
   };
+}
+
+const strictlyInsideEdges = (edges: BoxEdges, point: LayoutPoint) =>
+  point.x > edges.left && point.x < edges.right && point.y > edges.top && point.y < edges.bottom;
+
+/** The unit direction from `from` to `to` and their distance; upper right when they are within `epsilon`. */
+function radialDirection(from: LayoutPoint, to: LayoutPoint, epsilon: number): LayoutPoint & { length: number } {
+  const length = distance(from, to);
+  return {
+    x: length > epsilon ? (to.x - from.x) / length : Math.SQRT1_2,
+    y: length > epsilon ? (to.y - from.y) / length : -Math.SQRT1_2,
+    length
+  };
+}
+
+/**
+ * How far along the unit `direction` from `from` (inside `edges`) the ray leaves `edges`; a component
+ * under `epsilon` in magnitude never leaves along its axis.
+ */
+function radialEdgesExit(from: LayoutPoint, direction: LayoutPoint, edges: BoxEdges, epsilon: number): number {
+  const exitX = Math.abs(direction.x) < epsilon ? Infinity : ((direction.x > 0 ? edges.right : edges.left) - from.x) / direction.x;
+  const exitY = Math.abs(direction.y) < epsilon ? Infinity : ((direction.y > 0 ? edges.bottom : edges.top) - from.y) / direction.y;
+  return Math.min(exitX, exitY);
+}
+
+function electronMarkFrameHalfExtents(mark: Pick<ElectronMarkObject, "width" | "height" | "rotation">) {
+  return rotatedFrameHalfExtents(mark.width, mark.height, degreesToRadians(mark.rotation));
 }
 
 function clampElectronMarkCenterToPage(
@@ -4209,29 +4250,21 @@ function clampElectronMarkCenterToPage(
 function electronMarkLabelClearer(
   molecule: MoleculeObject,
   atom: MoleculeAtom,
-  { halfWidth, halfHeight }: ReturnType<typeof electronMarkFrameHalfExtents>,
+  frame: FrameHalfExtents,
   avoidLabelOverlap: boolean
 ) {
   const plan = avoidLabelOverlap ? planMoleculeAtomLabels(molecule).find(plan => plan.atom.id === atom.id) : undefined;
   const glyph = plan && atomLabelGlyphBounds(plan);
   const clearance = 2;
-  const exclusion = plan && glyph ? {
-    left: plan.anchor.x + glyph.x - halfWidth - clearance,
-    right: plan.anchor.x + glyph.x + glyph.width + halfWidth + clearance,
-    top: plan.anchor.y + glyph.y - halfHeight - clearance,
-    bottom: plan.anchor.y + glyph.y + glyph.height + halfHeight + clearance
-  } : undefined;
-  const insideLabel = (point: LayoutPoint) => exclusion && point.x > exclusion.left && point.x < exclusion.right &&
-    point.y > exclusion.top && point.y < exclusion.bottom;
+  const exclusion = plan && glyph ? frameExclusionEdges({
+    x: plan.anchor.x + glyph.x, y: plan.anchor.y + glyph.y, width: glyph.width, height: glyph.height
+  }, frame, clearance) : undefined;
+  const insideLabel = (point: LayoutPoint) => exclusion && strictlyInsideEdges(exclusion, point);
   const clearLabel = (point: LayoutPoint): LayoutPoint => {
     if (exclusion && insideLabel(point)) {
-      const length = distance(atom, point);
-      const dx = length > 0.0001 ? (point.x - atom.x) / length : Math.SQRT1_2;
-      const dy = length > 0.0001 ? (point.y - atom.y) / length : -Math.SQRT1_2;
-      const exitX = Math.abs(dx) < 0.0001 ? Infinity : ((dx > 0 ? exclusion.right : exclusion.left) - atom.x) / dx;
-      const exitY = Math.abs(dy) < 0.0001 ? Infinity : ((dy > 0 ? exclusion.bottom : exclusion.top) - atom.y) / dy;
-      const radius = Math.min(exitX, exitY) + 0.001;
-      point = { x: atom.x + dx * radius, y: atom.y + dy * radius };
+      const direction = radialDirection(atom, point, 0.0001);
+      const radius = radialEdgesExit(atom, direction, exclusion, 0.0001) + 0.001;
+      point = { x: atom.x + direction.x * radius, y: atom.y + direction.y * radius };
     }
     return point;
   };
@@ -6563,21 +6596,13 @@ export function electronMarkCentreClearOfAtomLabel(
   const atom = molecule.atoms[atomIndex];
   const gap = options.gapPx ?? electronMarkLabelGapPx;
   const centre = inverseTransformPointForObject(molecule, { x: mark.x + mark.width / 2, y: mark.y + mark.height / 2 });
-  const turn = degreesToRadians((mark.rotation ?? 0) - molecule.rotation);
-  const cos = Math.abs(Math.cos(turn)), sin = Math.abs(Math.sin(turn));
-  const halfWidth = (cos * mark.width + sin * mark.height) / 2 + gap;
-  const halfHeight = (sin * mark.width + cos * mark.height) / 2 + gap;
-  const left = label.x - halfWidth, right = label.x + label.width + halfWidth;
-  const top = label.y - halfHeight, bottom = label.y + label.height + halfHeight;
-  if (centre.x <= left || centre.x >= right || centre.y <= top || centre.y >= bottom) return undefined;
-  const offset = { x: centre.x - atom.x, y: centre.y - atom.y };
-  const length = Math.hypot(offset.x, offset.y);
-  const direction = length > 1e-6 ? { x: offset.x / length, y: offset.y / length } : { x: Math.SQRT1_2, y: -Math.SQRT1_2 };
-  const exit = (from: number, low: number, high: number, step: number) =>
-    step > 1e-9 ? (high - from) / step : step < -1e-9 ? (low - from) / step : Infinity;
-  const distance = Math.min(exit(atom.x, left, right, direction.x), exit(atom.y, top, bottom, direction.y), maxDistance);
-  if (!Number.isFinite(distance) || distance <= length) return undefined;
-  return transformPointForObject(molecule, { x: atom.x + direction.x * distance, y: atom.y + direction.y * distance });
+  const frame = rotatedFrameHalfExtents(mark.width, mark.height, degreesToRadians((mark.rotation ?? 0) - molecule.rotation));
+  const edges = frameExclusionEdges(label, frame, gap);
+  if (!strictlyInsideEdges(edges, centre)) return undefined;
+  const direction = radialDirection(atom, centre, 1e-6);
+  const reach = Math.min(radialEdgesExit(atom, direction, edges, 1e-9), maxDistance);
+  if (!Number.isFinite(reach) || reach <= direction.length) return undefined;
+  return transformPointForObject(molecule, { x: atom.x + direction.x * reach, y: atom.y + direction.y * reach });
 }
 
 /** Selection frames are unrotated page coordinates, like the atoms. Handwriting labels

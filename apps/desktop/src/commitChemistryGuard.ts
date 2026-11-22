@@ -207,11 +207,12 @@ const moleculesById = (page: DocumentPage | undefined) => new Map((page?.objects
  * one-to-one. A source is a molecule of `before` whose page no longer holds its id in `after`; a
  * destination is a molecule of `after` on a page that did not hold that id in `before` (a molecule
  * already on its page in `before` is that page's own and never stands in for a same-id molecule
- * removed from another page). Each destination is consumed by at most one source and each source by
- * at most one destination: when several sources share an id with one destination (pages A and B both
- * held "m"; only page C holds it now), one of them is matched, preferring the one the destination
- * still equals, and the rest have no match and so are reported removed. An id that arrived on more
- * than one page names no single molecule: none of its sources match. Built lazily.
+ * removed from another page). For each id, every source is paired with at most one destination and
+ * every destination with at most one source: first pairs where the destination IS the source, then
+ * pairs with the same structure and chemistry, then any remaining pairs, each in document order. A
+ * source left unpaired has no match and so is reported removed (pages A and B both held "m"; only
+ * page C holds it now: one of them moved, the other is gone); a destination left unpaired is an
+ * addition and matches nothing. Built lazily.
  */
 function movedPageMatcher(before: ChemDraftDocument, after: ChemDraftDocument): (pageId: string, id: string) => MoleculeObject | undefined {
   let matched: Map<string, MoleculeObject> | undefined;
@@ -239,15 +240,26 @@ function movedPageMatcher(before: ChemDraftDocument, after: ChemDraftDocument): 
           if (list) list.push({ pageId: page.id, molecule: object }); else sources.set(object.id, [{ pageId: page.id, molecule: object }]);
         }
       }
+      const tiers: ((source: MoleculeObject, destination: MoleculeObject) => boolean)[] = [
+        (source, destination) => source === destination,
+        (source, destination) => sameMoleculeStructure(source, destination) &&
+          moleculeAtomChemistryChanges(source, destination).length === 0,
+        () => true
+      ];
       for (const [moleculeId, candidates] of sources) {
+        // By position, not identity: one molecule object can sit on several pages.
         const arrived = destinations.get(moleculeId)!;
-        if (arrived.length !== 1) continue;
-        const destination = arrived[0];
-        const source = candidates.find(({ molecule }) => molecule === destination) ??
-          candidates.find(({ molecule }) => sameMoleculeStructure(molecule, destination) &&
-            moleculeAtomChemistryChanges(molecule, destination).length === 0) ??
-          candidates[0];
-        matched.set(moleculeKey(source.pageId, moleculeId), destination);
+        const sourcePaired = candidates.map(() => false);
+        const destinationPaired = arrived.map(() => false);
+        for (const pairs of tiers) {
+          candidates.forEach((source, sourceIndex) => {
+            if (sourcePaired[sourceIndex]) return;
+            const destinationIndex = arrived.findIndex((destination, index) => !destinationPaired[index] && pairs(source.molecule, destination));
+            if (destinationIndex < 0) return;
+            matched.set(moleculeKey(source.pageId, moleculeId), arrived[destinationIndex]);
+            sourcePaired[sourceIndex] = destinationPaired[destinationIndex] = true;
+          });
+        }
       }
     }
     return matched.get(moleculeKey(pageId, id));

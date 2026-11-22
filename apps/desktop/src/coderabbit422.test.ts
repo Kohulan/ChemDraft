@@ -81,6 +81,52 @@ describe("A: cross-page same-id molecule match", () => {
       { ...before.pages[2], objects: [molecule] }] };
     expect(preexistingMoleculeChemistryChanges(before, moveOnly)).toEqual([]);
   });
+
+  /** Page A holds the fixture's molecule and an ethane "m"; pages B and C start empty. */
+  function threePagesWithEthane() {
+    const { document } = electronMarkDropFixture();
+    const pageA = document.pages[0];
+    const m = ethane("m", { x: 420, y: 400 });
+    const before: ChemDraftDocument = { ...document, pages: [{ ...pageA, objects: [...pageA.objects, m] },
+      { ...pageA, id: "page_b", objects: [] }, { ...pageA, id: "page_c", objects: [] }] };
+    return { before, pageA: before.pages[0], m };
+  }
+
+  it("A (multiple arrivals): A's m moves to B while a different same-id m arrives on C — no removal", () => {
+    const { before, pageA, m } = threePagesWithEthane();
+    const other = { ...ethane("m", { x: 100, y: 100 }), atoms: ethane("m", { x: 100, y: 100 }).atoms.map(atom => ({ ...atom, id: `${atom.id}_other` })) };
+    const after: ChemDraftDocument = { ...before, pages: [{ ...pageA, objects: pageA.objects.filter(object => object.id !== "m") },
+      { ...before.pages[1], objects: [m] }, { ...before.pages[2], objects: [other] }] };
+    expect(preexistingMoleculeChemistryChanges(before, after)).toEqual([]);
+    expect(commitChemistryRefusals({ before, next: after, after, normalize: identity, markAtoms })).toEqual([]);
+  });
+
+  it("A (multiple arrivals): two same-id molecules on A and B moving to new pages C and D are two moves, not removals", () => {
+    const { before: three, pageA, m } = threePagesWithEthane();
+    const before: ChemDraftDocument = { ...three, pages: [three.pages[0], { ...three.pages[1], objects: [m] }, three.pages[2],
+      { ...three.pages[2], id: "page_d", objects: [] }] };
+    const after: ChemDraftDocument = { ...before, pages: [{ ...pageA, objects: pageA.objects.filter(object => object.id !== "m") },
+      { ...before.pages[1], objects: [] }, { ...before.pages[2], objects: [m] }, { ...before.pages[3], objects: [m] }] };
+    expect(preexistingMoleculeChemistryChanges(before, after)).toEqual([]);
+    expect(commitChemistryRefusals({ before, next: after, after, normalize: identity, markAtoms })).toEqual([]);
+  });
+
+  it("A (multiple arrivals): a real deletion is still reported when an unrelated molecule arrives elsewhere", () => {
+    const { before, pageA } = threePagesWithEthane();
+    const deleted = { ...pageA, objects: pageA.objects.filter(object => object.id !== "m") };
+    // A molecule with another id arriving on B does not stand in for the deleted m.
+    const otherId: ChemDraftDocument = { ...before, pages: [deleted, { ...before.pages[1], objects: [ethane("n", { x: 100, y: 100 })] },
+      before.pages[2]] };
+    expect(preexistingMoleculeChemistryChanges(before, otherId)).toEqual([{ pageId: pageA.id, moleculeId: "m" }]);
+    expect(commitChemistryRefusals({ before, next: otherId, after: otherId, normalize: identity, markAtoms })).toHaveLength(1);
+    // A same-id m with none of its atoms arriving on B and C: whichever it pairs with, m's atoms are reported gone.
+    const stranger = (at: number) => ({ ...ethane("m", { x: at, y: at }), atoms: ethane("m", { x: at, y: at }).atoms.map(atom => ({ ...atom, id: `${atom.id}_x` })) });
+    const sameId: ChemDraftDocument = { ...before, pages: [deleted, { ...before.pages[1], objects: [stranger(100)] },
+      { ...before.pages[2], objects: [stranger(200)] }] };
+    const changes = preexistingMoleculeChemistryChanges(before, sameId);
+    expect(changes.length).toBeGreaterThan(0);
+    expect(changes.every(change => change.pageId === pageA.id && change.moleculeId === "m")).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------
