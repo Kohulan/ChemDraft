@@ -25,8 +25,8 @@ export interface AssistantToolContext {
   getSelectionAtSend(): readonly string[];
   /** The Send-time selection's ids bound to the page they were selected on. Every object lookup in a
    * tool resolves through it (resolveScopedObject), so an id never resolves to a same-id object on
-   * another page. A pinned object missing from its page follows a move only when its id was unique in
-   * the document at Send; otherwise it resolves to nothing and writes to it are refused.
+   * another page. A pinned object missing from its page (deleted, or moved to another page) resolves
+   * to nothing: reads and writes to it are refused with a reselect message.
    * Absent: ids resolve only when they are unique in the document. */
   getSelectionPagesAtSend?(): PluginWriteScopePages | undefined;
   /** Transaction-owned ids, including writes through another session for this run. */
