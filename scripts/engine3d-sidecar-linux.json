@@ -2,6 +2,6 @@
   "$comment": "The committed x86_64 Linux 3D sidecar. A maintainer builds it with .github/workflows/linux-sidecar-build.yml, commits the artifact's binary at `path`, and replaces both PENDING values with the run id and the SHA-256 that run printed. Linux packaging refuses to build while either is pending. See native/avogadro3d-sidecar/README.md.",
   "path": "apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu",
   "buildWorkflow": ".github/workflows/linux-sidecar-build.yml",
-  "buildRunId": "PENDING-MAINTAINER-COMMIT",
-  "sha256": "PENDING-MAINTAINER-COMMIT"
+  "buildRunId": "45028772269",
+  "sha256": "1997d0619f0b06af93cc04bbd742d00d1158b13312b21173849b54a1eeca9f54"
 }
