@@ -2904,7 +2904,7 @@ function exportExplicitArc(graphic: GraphicObject, id: string, warnings: Compati
   const end = ellipsePointAtRadians(center, rx, ry, start + sweep);
   const begin = ellipsePointAtRadians(center, rx, ry, start);
   const geometry = { id, BoundingBox: formatXyBoundingBox([{ x: center.x - rx, y: center.y - ry },
-    { x: center.x + rx, y: center.y + ry }]), AngularSize: formatNumber(radiansToDegrees(sweep)),
+    { x: center.x + rx, y: center.y + ry }]), AngularSize: formatArcSweepDegrees(radiansToDegrees(sweep), graphic.id, warnings),
     Center3D: formatXyPoint(center), MajorAxisEnd3D: formatXyPoint({ x: center.x + rx, y: center.y }),
     MinorAxisEnd3D: formatXyPoint({ x: center.x, y: center.y + ry }), Tail3D: formatXyPoint(begin), Head3D: formatXyPoint(end) };
   // Half-head handedness and hollow vs open are not distinguished by the native marker kind.
@@ -2919,6 +2919,22 @@ function exportExplicitArc(graphic: GraphicObject, id: string, warnings: Compati
   const attrs = [xmlAttributes(geometry), xmlAttributes(headAttrs), ...cdxmlGraphicColorAttribute(graphic, warnings, colors),
     ...cdxmlLineTypeAttributes(graphic), ...cdxmlArrowLineWidthAttributes(graphic)];
   return `<arrow ${attrs.join(" ")}/>`;
+}
+
+/**
+ * A stored arc's AngularSize. Four decimals round a sweep under 0.00005 degrees to 0, which no
+ * reader takes as an arc (it reopened at the old 1 degree minimum), so a tiny sweep keeps as many
+ * decimals as its first four significant digits need. Past 100 decimals (a sweep no drawing can
+ * show) it is written as the smallest such value, with a warning.
+ */
+function formatArcSweepDegrees(degrees: number, graphicId: string, warnings: CompatibilityConversionWarning[]): string {
+  const text = formatNumber(degrees);
+  if (Number(text) !== 0 || degrees === 0) return text;
+  const decimals = 3 - Math.floor(Math.log10(Math.abs(degrees)));
+  if (decimals <= 100) return degrees.toFixed(decimals).replace(/0+$/, "");
+  warnings.push({ code: "cdxml.arc_sweep_rounded", sourceObjectId: graphicId,
+    message: `CDXML export: arc arrow ${graphicId} sweeps ${degrees} degrees, less than CDXML can write; it was written with the smallest sweep CDXML can hold (1e-100 degrees).` });
+  return `${degrees < 0 ? "-" : ""}0.${"0".repeat(99)}1`;
 }
 
 // Read genuine axis-aligned ellipse axes. Older files also used Center3D/axes for a
@@ -2992,7 +3008,7 @@ function exportGraphicAsCdxmlArrow(
     ...cdxmlArrowheadAttributes(graphic, warnings),
     ...cdxmlArrowShaftAttributes(graphic),
     ...cdxmlStraightHeadDimensions(graphic, warnings, Boolean(stored)),
-    ...(isArc ? [`AngularSize="${escapeXmlAttribute(stored ? formatNumber(radiansToDegrees(stored.sweep))
+    ...(isArc ? [`AngularSize="${escapeXmlAttribute(stored ? formatArcSweepDegrees(radiansToDegrees(stored.sweep), graphic.id, warnings)
       : cdxmlAngularSizeForGraphic(graphic))}"`] : []),
     `Head3D="${formatXyPoint(line.end)}"`,
     `Tail3D="${formatXyPoint(line.start)}"`,

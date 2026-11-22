@@ -100,6 +100,42 @@ it.each([["0.5", 0.5], ["360", 360], ["-90", -90]])("keeps a stored arc's %s deg
   expect(again.data.arcSweepRadians).toBeCloseTo(degrees * Math.PI / 180, 6);
 });
 
+// Codex (1.2.3): AngularSize was written with four decimals, so a valid sweep under 0.00005 degrees
+// was saved as 0 and reopened at the old 1 degree minimum.
+const tinyArc = (angular: string, degrees: number) => {
+  const end = (d: number) => { const r = d * Math.PI / 180; return `${60 + 30 * Math.cos(r)} ${60 + 20 * Math.sin(r)} 0`; };
+  return `<CDXML><page><arrow id="8" AngularSize="${angular}" Center3D="60 60 0" MajorAxisEnd3D="90 60 0" MinorAxisEnd3D="60 80 0" Tail3D="90 60 0" Head3D="${end(degrees)}" BoundingBox="30 40 90 80" HeadSize="900" ArrowheadHead="Full" ArrowheadType="Solid"/></page></CDXML>`;
+};
+it.each([["0.00001", 0.00001], ["-0.00002", -0.00002], ["0.0000000123", 0.0000000123]])(
+  "keeps a stored arc's tiny %s degree sweep through a save, with and without its head", (angular, degrees) => {
+    const radians = degrees * Math.PI / 180;
+    for (const withoutHead of [false, true]) {
+      const document = openChemDraftPayload(tinyArc(angular, degrees)).document!;
+      const g = document.pages[0].objects[0] as GraphicObject;
+      expect(g.data.arcSweepRadians! / radians).toBeCloseTo(1, 9);
+      g.data.arcCenter = { x: g.data.arcCenter!.x + 4, y: g.data.arcCenter!.y };
+      if (withoutHead) { g.data.markerEnd = undefined; g.data.markerStart = undefined; }
+      const output = exportDocumentToCdxml(document, plain);
+      expect(output.warnings).toEqual([]);
+      expect(output.contents).toContain(`AngularSize="${angular}"`);
+      const again = openChemDraftPayload(output.contents).document!.pages[0].objects[0] as GraphicObject;
+      expect(again.data.artPathKind).toBe("arc");
+      expect(again.data.arcSweepRadians! / radians).toBeCloseTo(1, 6);
+    }
+  });
+
+it("writes a sweep too small for CDXML as the smallest sweep it holds, with a warning", () => {
+  const document = openChemDraftPayload(tinyArc("1e-118", 1e-118)).document!;
+  const g = document.pages[0].objects[0] as GraphicObject;
+  g.data.markerEnd = undefined;
+  const output = exportDocumentToCdxml(document, plain);
+  expect(output.contents).toContain(`AngularSize="0.${"0".repeat(99)}1"`);
+  expect(output.warnings.map(warning => warning.code)).toEqual(["cdxml.arc_sweep_rounded"]);
+  const again = openChemDraftPayload(output.contents).document!.pages[0].objects[0] as GraphicObject;
+  expect(again.data.arcSweepRadians).toBeGreaterThan(0);
+  expect(again.data.arcSweepRadians).toBeLessThan(1e-90);
+});
+
 // Codex 4658948336: resolving each caption run's font by a linear search of the font table made
 // a crafted file O(fonts × runs). Fonts are looked up by id from a map built once per document,
 // and the font table and a caption's runs are capped at CDX's 16-bit limit (65,535).
