@@ -111,6 +111,16 @@ its palette, and `xprop` on the flyout shows WM_TRANSIENT_FOR set to that palett
 document. The document keeps focus (its title stays active and M still switches tools). Close and
 reopen the palette from View ▸ Toolbars, then long-press again: the flyout still opens above it.
 
+New flyouts do not demand attention (Linux, B7 follow-up): on KDE Plasma under XWayland, quit and
+relaunch ChemDraft so every popover is new, then long-press a flyout button on a palette whose
+flyout has not opened yet. While it is open, `xprop _NET_WM_STATE _NET_WM_USER_TIME` on the
+"ChemDraft tools" window shows no `_NET_WM_STATE_DEMANDS_ATTENTION` and a nonzero user time, and the
+taskbar and task switcher show no attention highlight for ChemDraft. The document keeps focus (its
+title stays active and M still switches tools), and `xprop -root _NET_ACTIVE_WINDOW` still names the
+document window, not the flyout. Do the same for a never-opened color picker and for the E/Z
+popover from a canvas double bond. Reopen each: still no attention state and no focus change. On
+GNOME (X11 or XWayland), a new flyout opens above its palette and leaves the document focused.
+
 Palette first paint (Windows): quit ChemDraft, then cold-launch it. The Main toolbar and the other
 open palettes appear with their content in the palette's light grey, with no black frame and no
 blank light frames first. Press and hold a flyout button and open a color picker: each popover, and
