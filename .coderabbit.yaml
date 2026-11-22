@@ -3,7 +3,9 @@
 # CodeRabbit review settings for ChemDraft. Rules cite AGENTS.md section numbers.
 # Reviews every pull request, draft or not, whatever branch it targets
 # (main, release/*, feature branches). Draft PRs are reviewed too, since
-# they are often opened only to run CI. Every push gets an incremental review.
+# they are often opened only to run CI. Every push gets an incremental review
+# (auto_pause_after_reviewed_commits: 0 disables auto-pause). Summaries: high-level only; no
+# changed-files table or sequence diagrams.
 language: en-US
 
 tone_instructions: >-
@@ -17,12 +19,15 @@ chat:
 reviews:
   profile: assertive
   high_level_summary: true
+  changed_files_summary: false
+  sequence_diagrams: false
   poem: false
   in_progress_fortune: false
   auto_review:
     enabled: true
     drafts: true
     auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 0
     base_branches:
       - ".*"
   path_filters:
