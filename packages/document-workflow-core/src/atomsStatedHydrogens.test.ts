@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { MoleculeAtom, MoleculeBond, MoleculeObject } from "@chemdraft/chem-core";
+import type { ExportWarning } from "@chemdraft/export-engine";
 import {
   atomProblem,
+  moleculeSmiles,
   nativeAtomValidationState,
   nativeMoleculeExportWarnings,
   nativeSingleBondGraphMetadata,
-  nativeSingleBondGraphSmiles
+  nativeSingleBondGraphSmiles,
+  nativeSmilesRadicalWarnings
 } from "./index";
 
 /**
@@ -99,6 +102,20 @@ describe("a stated hydrogen count on an atom with no aromatic bond", () => {
       objectId: "o"
     }]);
     expect(nativeSingleBondGraphSmiles(stated.atoms, stated.bonds)).toBe("CCO");
+  });
+});
+
+describe("SMILES export of a kept count, without the structure engine", () => {
+  it("warns with the badge, not with a radical the written SMILES does not imply", async () => {
+    // The native writer writes the derived count (a bare O), so the SMILES implies no radical; the
+    // difference from the stated count is the badge's to report.
+    const stated = ethanol({ hydrogenCount: 0 });
+    expect(nativeSmilesRadicalWarnings(stated)).toEqual([]);
+    const warnings: ExportWarning[] = [];
+    expect(await moleculeSmiles(stated, 0, warnings, undefined)).toBe("CCO");
+    expect(warnings.map((warning) => [warning.code, warning.message])).toEqual([
+      ["export.invalid_structure", "O3 states 0 H, but its bonds and charge give 1."]
+    ]);
   });
 });
 

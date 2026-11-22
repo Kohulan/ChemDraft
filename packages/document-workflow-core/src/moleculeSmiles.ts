@@ -24,6 +24,11 @@ export type ComputeStructureIdentifiers = typeof import("@chemdraft/rdkit-adapte
 export function nativeSmilesRadicalWarnings(molecule: MoleculeObject, evidence?: ExportProblemEvidence): ExportWarning[] {
   const { molecule: expanded } = expandNativeMoleculeLabelGroups(molecule);
   const resolution = nativeBondOrderResolution(expanded.atoms, expanded.bonds);
+  // The writer carries a stated count only through an aromatic ring's Kekulé resolution. Elsewhere
+  // it writes the derived count, so a stated count that disagrees there (kept on import and badged)
+  // implies no radical; the badge reports the difference instead.
+  const aromaticAtomIds = new Set(expanded.bonds.flatMap((bond) =>
+    bond.order === "aromatic" ? [bond.fromAtomId, bond.toAtomId] : []));
   return expanded.atoms.flatMap((atom): ExportWarning[] => {
     const radicals = atom.markRadicals ?? 0;
     const used = resolution.bondOrderUsage.get(atom.id) ?? 0;
@@ -35,8 +40,9 @@ export function nativeSmilesRadicalWarnings(molecule: MoleculeObject, evidence?:
     if (element && nativeAtomValence[element] !== undefined &&
         nativeAtomChargeIsExpressible(element, atom.formalCharge)) {
       const valence = nativeAtomValenceForCharge(element, atom.formalCharge);
+      const stated = aromaticAtomIds.has(atom.id) ? atom.hydrogenCount : undefined;
       const hydrogens = element === "H" ? 0 : atom.labelLiteral ? (spelled?.hydrogens ?? 0) :
-        atom.hydrogenCount ?? spelled?.hydrogens ?? Math.max(0, valence - used - radicals);
+        stated ?? spelled?.hydrogens ?? Math.max(0, valence - used - radicals);
       implied = Math.max(0, valence - used - hydrogens);
     } else if (element && nativeAtomValence[element] === undefined) {
       // The drawing's covalent valence table says nothing about the parser's metal valence.
