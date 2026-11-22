@@ -48,7 +48,7 @@ function translated(molecule: MoleculeObject, dx: number, dy: number): Partial<M
 // A: commitChemistryGuard.ts:182 — a removed molecule matched to a same-id survivor on another page
 // ---------------------------------------------------------------------------------------------
 describe("A: cross-page same-id molecule match", () => {
-  it.fails("A: reports a molecule removed from page 1 while a same-id twin survives on page 2", () => {
+  it("A: reports a molecule removed from page 1 while a same-id twin survives on page 2", () => {
     const { document } = electronMarkDropFixture();
     const molecule = dropMolecule(document);
     const twoPages: ChemDraftDocument = { ...document, pages: [document.pages[0],
@@ -130,7 +130,7 @@ function chargeAtom(molecule: MoleculeObject, charge: number): MoleculeObject {
 }
 
 describe("C/D: delimiter collisions in guard keys", () => {
-  it.fails("C: a structure edit of molecule \"q\\nr\" on page \"p\" does not exempt molecule \"r\" on page \"p\\nq\"", () => {
+  it("C: a structure edit of molecule \"q\\nr\" on page \"p\" does not exempt molecule \"r\" on page \"p\\nq\"", () => {
     const base = electronMarkDropFixture().document;
     const grown = ethane("q\nr", { x: 100, y: 100 }), other = ethane("r", { x: 300, y: 100 });
     const before: ChemDraftDocument = { ...base, pages: [

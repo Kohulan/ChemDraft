@@ -156,8 +156,11 @@ export function withIndependentlyMovedMarks(policy: CommitChemistryPolicy, markI
   return markIds === undefined ? policy : { ...policy, independentlyMovedMarkIds: markIds };
 }
 
-/** Object ids are unique only within a page, so an atom is keyed by its page as well. */
-export const atomChemistryKey = (pageId: string, moleculeId: string, atomId: string) => `${pageId}\n${moleculeId}\n${atomId}`;
+/**
+ * Object ids are unique only within a page, so an atom is keyed by its page as well. The key is a
+ * JSON tuple, so no id (one holding a newline or any other delimiter) can alias another triple.
+ */
+export const atomChemistryKey = (pageId: string, moleculeId: string, atomId: string) => JSON.stringify([pageId, moleculeId, atomId]);
 
 export function atomChemistry(atom: MoleculeAtom): AtomChemistry {
   return { formalCharge: atom.formalCharge, markCharge: atom.markCharge ?? 0, markRadicals: atom.markRadicals ?? 0 };
@@ -200,10 +203,36 @@ const moleculesById = (page: DocumentPage | undefined) => new Map((page?.objects
   .flatMap((object) => object.type === "molecule" ? [[object.id, object] as const] : []));
 
 /**
+ * The molecule of `after` a molecule of `before` that is gone from its own page moved to: the one
+ * molecule in `after` with its id on a page that did not hold that id in `before`. A molecule that
+ * was already on its page in `before` is that page's own molecule and never stands in for a
+ * same-id molecule removed from another page; an id that arrived on more than one page names no
+ * single molecule. Built lazily.
+ */
+function movedPageMatcher(before: ChemDraftDocument, after: ChemDraftDocument): (id: string) => MoleculeObject | undefined {
+  let arrived: Map<string, MoleculeObject | undefined> | undefined;
+  return (id) => {
+    if (!arrived) {
+      arrived = new Map();
+      const beforePages = new Map(before.pages.map((page) => [page.id, page]));
+      for (const page of after.pages) {
+        const heldBefore = moleculesById(beforePages.get(page.id));
+        for (const object of page.objects) {
+          if (object.type !== "molecule" || heldBefore.has(object.id)) continue;
+          arrived.set(object.id, arrived.has(object.id) ? undefined : object);
+        }
+      }
+    }
+    return arrived.get(id);
+  };
+}
+
+/**
  * Every molecule in `before` against the molecule with the same id in `after`: changed atoms,
  * removed atoms, and molecules that are gone. Object ids are unique only within a page, so a
- * molecule is matched on its own page, and on another page only when that page set holds the id
- * once (it moved pages). Molecules only `after` has (pasted, duplicated, drawn) are ignored.
+ * molecule is matched on its own page, and on another page only when it moved pages
+ * (`movedPageMatcher`): a same-id molecule another page already held never masks its removal.
+ * Molecules only `after` has (pasted, duplicated, drawn) are ignored.
  * Compare committed (normalized) documents: that is the chemistry the user sees.
  */
 export function preexistingMoleculeChemistryChanges(
@@ -213,20 +242,7 @@ export function preexistingMoleculeChemistryChanges(
 ): MoleculeChemistryChange[] {
   if (before === after || before.pages === after.pages) return [];
   const afterPages = new Map(after.pages.map((page) => [page.id, page]));
-  let elsewhere: Map<string, MoleculeObject | undefined> | undefined;
-  const movedPages = (id: string) => {
-    if (!elsewhere) {
-      elsewhere = new Map();
-      for (const page of after.pages) {
-        for (const object of page.objects) {
-          if (object.type !== "molecule") continue;
-          // An id held by more than one page names no single molecule.
-          elsewhere.set(object.id, elsewhere.has(object.id) ? undefined : object);
-        }
-      }
-    }
-    return elsewhere.get(id);
-  };
+  const movedPages = movedPageMatcher(before, after);
   const changes: MoleculeChemistryChange[] = [];
   for (const page of before.pages) {
     if (options.pageId !== undefined && page.id !== options.pageId) continue;
@@ -336,8 +352,8 @@ export function commitChemistryRefusals(check: CommitChemistryCheck): string[] {
     .map((change) => describeMoleculeChemistryChange(change, check.operation));
 }
 
-/** A molecule on a page, as `structurallyEditedMoleculeKeys` keys it. */
-export const moleculeKey = (pageId: string, moleculeId: string) => `${pageId}\n${moleculeId}`;
+/** A molecule on a page, as `structurallyEditedMoleculeKeys` keys it: a JSON tuple, so no id can alias another pair. */
+export const moleculeKey = (pageId: string, moleculeId: string) => JSON.stringify([pageId, moleculeId]);
 
 function sameAtomStructure(a: MoleculeAtom, b: MoleculeAtom): boolean {
   return a.element === b.element && a.isotope === b.isotope && a.x === b.x && a.y === b.y;
@@ -372,18 +388,7 @@ export function structurallyEditedMoleculeKeys(before: ChemDraftDocument, next: 
   const keys = new Set<string>();
   if (before === next || before.pages === next.pages) return keys;
   const nextPages = new Map(next.pages.map((page) => [page.id, page]));
-  let elsewhere: Map<string, MoleculeObject | undefined> | undefined;
-  const onAnyPage = (id: string) => {
-    if (!elsewhere) {
-      elsewhere = new Map();
-      for (const page of next.pages) {
-        for (const object of page.objects) {
-          if (object.type === "molecule") elsewhere.set(object.id, elsewhere.has(object.id) ? undefined : object);
-        }
-      }
-    }
-    return elsewhere.get(id);
-  };
+  const onAnyPage = movedPageMatcher(before, next);
   for (const page of before.pages) {
     const nextPage = nextPages.get(page.id);
     if (nextPage?.objects === page.objects) continue;
