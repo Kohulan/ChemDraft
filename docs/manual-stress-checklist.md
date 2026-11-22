@@ -629,6 +629,11 @@ there; the problem window offers "Use the derived hydrogen count (1)", which cle
 changing the O to S, or its bond to double, clears it too. The same file without `NumHydrogens`
 opens with no warning and no badge.
 
+Stated hydrogen counts shown everywhere (1.2.3, `cdxml.atom_hydrogen_count_kept`): open a CDXML C–C–O
+whose singly bonded O has `NumHydrogens="0"` — the label reads "O" (not "OH"), the red (!) badge shows,
+and the formula reads C2H5O; Copy As SMILES gives `CC[O]` and the mass matches C2H5O. Move and paste
+it and the label stays "O"; apply "Use the derived hydrogen count" and it becomes "OH" (C2H6O).
+
 Abbreviation surfaces added since: every table abbreviation (`packages/template-library/README.md`)
 placed by hotkey and by typing on a chain end, where it is valid, and on a ring carbon, where it is
 badged (hover the badge for its reason); Ome, OME and ome badged as unrecognized text with the "did
