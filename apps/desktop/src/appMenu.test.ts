@@ -475,7 +475,7 @@ describe("native Window and full-screen menus", () => {
     // muda leaves the predefined items out of GTK menus, so Linux builds ordinary items instead.
     expect(windowMenu).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*&linux_window_menu_item\(app, WINDOW_MINIMIZE_COMMAND_ID\)\?/);
     expect(windowMenu).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*&linux_window_menu_item\(app, WINDOW_TOGGLE_MAXIMIZE_COMMAND_ID\)\?/);
-    expect(windowMenu).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*&linux_window_menu_item\(app, LINUX_CLOSE_WINDOW_WINDOW_MENU_ID\)\?/);
+    expect(windowMenu).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*&linux_window_menu_item\(app, WINDOW_CLOSE_COMMAND_ID\)\?/);
   });
 
   it("builds one native full-screen item in View with the current document state on macOS", () => {
