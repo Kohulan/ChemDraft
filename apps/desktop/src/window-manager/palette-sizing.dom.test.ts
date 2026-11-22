@@ -391,6 +391,73 @@ describe("palette work-area sizing", () => {
       }
     });
 
+    // A panel added, removed or resized changes the work area with no move, resize or scale event.
+    // Only the interval is faked, so the palette's frame callbacks still run on real timeouts.
+    const withWorkAreaPoll = async (run: (pollTick: () => Promise<void>) => Promise<void>) => {
+      vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+      vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+      const pollTick = async () => {
+        await act(async () => { vi.advanceTimersByTime(1000); });
+        for (let turn = 0; turn < 6; turn += 1) {
+          await act(async () => { await new Promise(resolve => window.setTimeout(resolve, 0)); });
+        }
+      };
+      try {
+        await run(pollTick);
+      } finally {
+        vi.useRealTimers();
+      }
+    };
+
+    it("re-fits a Linux palette once when only its work area changes", async () => {
+      await withWorkAreaPoll(async pollTick => {
+        const { scroller, nativeResizeTo, unmount } = await mountMain("linux", 1024);
+        try {
+          expect(scroller.dataset.paletteHorizontalOverflow).toBe("true");
+          const before = resizeRequests().length;
+          // Unchanged work area: the poll asks for nothing.
+          await pollTick();
+          expect(resizeRequests()).toHaveLength(before);
+          // A panel went away: the work area widens, but the window neither moves nor resizes.
+          native.workArea.mockResolvedValue({ left: 0, top: 0, right: 1680, bottom: 1050 });
+          await pollTick();
+          expect(resizeRequests().slice(before)).toEqual([{ width: NATURAL_WIDTH, height: TITLE_HEIGHT + ROW_HEIGHT + SCROLLBAR }]);
+          await nativeResizeTo(NATURAL_WIDTH);
+          expectNoOverflow(scroller);
+          // No loop: later polls of the same work area re-send nothing.
+          await pollTick();
+          await pollTick();
+          expect(resizeRequests().slice(before)).toEqual([
+            { width: NATURAL_WIDTH, height: TITLE_HEIGHT + ROW_HEIGHT + SCROLLBAR },
+            { width: NATURAL_WIDTH, height: TITLE_HEIGHT + ROW_HEIGHT }
+          ]);
+          // A panel came back: the palette is capped again without being moved.
+          native.workArea.mockResolvedValue({ left: 0, top: 0, right: 1024, bottom: 768 });
+          await pollTick();
+          expect(resizeRequests().slice(before + 2)).toEqual([{ width: NATURAL_WIDTH, height: TITLE_HEIGHT + ROW_HEIGHT }]);
+        } finally {
+          await unmount();
+        }
+      });
+    });
+
+    it.each(["macos", "windows"] as const)("does not poll a content-fit palette's work area on %s", async platform => {
+      await withWorkAreaPoll(async pollTick => {
+        const { unmount } = await mountMain(platform, 1024);
+        try {
+          const before = resizeRequests().length;
+          const workAreaReads = native.workArea.mock.calls.length;
+          native.workArea.mockResolvedValue({ left: 0, top: 0, right: 1680, bottom: 1050 });
+          await pollTick();
+          await pollTick();
+          expect(resizeRequests()).toHaveLength(before);
+          expect(native.workArea.mock.calls).toHaveLength(workAreaReads);
+        } finally {
+          await unmount();
+        }
+      });
+    });
+
     it("adds no height for an overlay scrollbar, capped or not", async () => {
       const { scroller, moveToWorkArea, nativeResizeTo, unmount } = await mountMain("linux", 1024, 0);
       try {

@@ -329,6 +329,67 @@ pub(super) fn stamp_user_time<R: Runtime>(window: &WebviewWindow<R>) -> Result<(
     })?
 }
 
+/// Whether a GDK leave-notify on a palette's toplevel GdkWindow means the pointer left the palette.
+///
+/// `window_system_crossing` is a crossing the window system reported (GDK_CROSSING_NORMAL, GRAB or
+/// UNGRAB): the pointer moved to another window, another window was mapped or raised over the
+/// palette, or another client grabbed the pointer. GTK's own grab and state crossings are not.
+/// `into_child` is GDK_NOTIFY_INFERIOR: the pointer moved into the webview's child window, inside
+/// the palette.
+#[cfg(any(target_os = "linux", test))]
+fn leave_ends_palette_hover(window_system_crossing: bool, into_child: bool) -> bool {
+    window_system_crossing && !into_child
+}
+
+/// Call `handler` whenever the pointer leaves `window`, or another window covers it under the
+/// pointer.
+///
+/// WebKitGTK does not reliably turn those crossings into a DOM pointerleave, so a palette tooltip
+/// could stay on screen after the pointer had gone (B5). X11 reports both as a LeaveNotify on the
+/// palette's toplevel, which GTK delivers here. The handler runs on the GTK main thread.
+#[cfg(target_os = "linux")]
+pub(super) fn on_pointer_leave<R: Runtime>(
+    window: &WebviewWindow<R>,
+    handler: impl Fn() + Send + 'static,
+) -> Result<(), String> {
+    let target = window.clone();
+    super::run_on_main_thread_blocking(window, move || {
+        use gtk::{
+            gdk, glib,
+            prelude::{WidgetExt, WidgetExtManual},
+        };
+
+        let native = target.gtk_window().map_err(|error| error.to_string())?;
+        // GtkWindow already selects crossing events; make sure, as the handler depends on them.
+        native.add_events(gdk::EventMask::LEAVE_NOTIFY_MASK);
+        native.connect_leave_notify_event(move |_, event| {
+            let window_system_crossing = matches!(
+                event.mode(),
+                gdk::CrossingMode::Normal | gdk::CrossingMode::Grab | gdk::CrossingMode::Ungrab
+            );
+            if leave_ends_palette_hover(
+                window_system_crossing,
+                event.detail() == gdk::NotifyType::Inferior,
+            ) {
+                handler();
+            }
+            // Tao and WebKit keep their own crossing handling.
+            glib::Propagation::Proceed
+        });
+        Ok(())
+    })?
+}
+
+/// macOS feeds palette hover from its own pointer poll (start_palette_pointer_feed), and Windows
+/// delivers hover to the palettes natively; neither needs this.
+#[cfg(not(target_os = "linux"))]
+pub(super) fn on_pointer_leave<R: Runtime>(
+    _window: &WebviewWindow<R>,
+    _handler: impl Fn() + Send + 'static,
+) -> Result<(), String> {
+    Ok(())
+}
+
 #[cfg(not(target_os = "linux"))]
 pub(super) fn set_visible<R: Runtime>(
     window: &WebviewWindow<R>,
@@ -344,7 +405,7 @@ pub(super) fn set_visible<R: Runtime>(
 
 #[cfg(test)]
 mod tests {
-    use super::{linux_policy, Kind, OpeningUserTimes, TypeHint};
+    use super::{leave_ends_palette_hover, linux_policy, Kind, OpeningUserTimes, TypeHint};
 
     #[test]
     fn a_popover_reveal_takes_the_user_time_of_its_own_opening() {
@@ -393,6 +454,17 @@ mod tests {
                 .unwrap()
                 .contains("gdk_x11_display_get_user_time")
         );
+    }
+
+    #[test]
+    fn only_a_window_system_leave_out_of_the_palette_ends_its_hover() {
+        // Pointer moved to another window, or a window was mapped over the palette.
+        assert!(leave_ends_palette_hover(true, false));
+        // Pointer moved into the webview's own child window: still inside the palette.
+        assert!(!leave_ends_palette_hover(true, true));
+        // GTK's own grab or state crossings leave the pointer where it was.
+        assert!(!leave_ends_palette_hover(false, false));
+        assert!(!leave_ends_palette_hover(false, true));
     }
 
     #[test]

@@ -21,6 +21,8 @@ import { createDesktopShortcutRegistry, detectDesktopShortcutPlatform } from "./
 import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import { NATIVE_MENU_COMMAND_IDS, paletteMenuShortcut } from "./paletteMenuShortcuts";
 import { installNativeFlyoutKeyboard } from "./nativeFlyoutKeyboard";
+import { createPaletteTooltipDismissal, dispatchPaletteTooltipDismiss } from "./paletteTooltipDismissal";
+import { pollWorkAreaChanges } from "./window-manager/workAreaPoll";
 import { disabledControlAtPointer, installPaletteInputFocus, isPaletteInputFocusPending, paletteInputFocusControl, PALETTE_INPUT_FOCUS_COMMIT_EVENT } from "./plugins/pluginPanelInputFocus";
 import { editHistoryDirection, forceDocumentHistoryCommandId, isCleanPaletteNumberInput, isTextEditingElement } from "./editHistoryRouting";
 import { applyKeybindingSchemeToCommands } from "./keybindingScheme";
@@ -524,23 +526,7 @@ export function PaletteWindow({
       }, 150);
     };
     // Taskbar or Dock changes can shrink the work area without a move or a webview resize.
-    let lastArea: string | undefined;
-    let checking = false;
-    const checkWorkArea = async () => {
-      if (checking || document.hidden) return;
-      checking = true;
-      try {
-        const { left, top, right, bottom } = await currentWindowLogicalWorkArea();
-        const area = `${left}:${top}:${right}:${bottom}`;
-        if (lastArea !== undefined && lastArea !== area) scheduleClamp();
-        lastArea = area;
-      } finally {
-        checking = false;
-      }
-    };
-    const check = () => { void checkWorkArea().catch(() => undefined); };
-    check();
-    const areaTimer = window.setInterval(check, 1000);
+    const stopAreaPoll = pollWorkAreaChanges(scheduleClamp, currentWindowLogicalWorkArea);
     void listenForCurrentWindowWorkAreaChanges(scheduleClamp).then(cleanup => {
       if (disposed) cleanup();
       else unlisten = cleanup;
@@ -548,7 +534,7 @@ export function PaletteWindow({
     return () => {
       disposed = true;
       window.clearTimeout(timer);
-      window.clearInterval(areaTimer);
+      stopAreaPoll();
       unlisten?.();
     };
   }, [knownToolset, resizable]);
@@ -655,10 +641,19 @@ export function PaletteWindow({
       if (disposed) cleanup();
       else unlisten = cleanup;
     });
+    // Linux: a panel added, removed or resized changes the work area with no move, resize or scale
+    // event, and the palette stayed capped (or uncapped) until its next move. Poll it like the
+    // inspector does. A change only schedules the same fit; applySize re-sends only when the work
+    // area differs from the last accepted fit's (placementChanged), so this cannot loop. macOS and
+    // Windows keep the plain size dedupe and do not poll.
+    const stopAreaPoll = platform === "linux"
+      ? pollWorkAreaChanges(scheduleSize, currentWindowLogicalWorkArea)
+      : undefined;
 
     return () => {
       disposed = true;
       observer?.disconnect();
+      stopAreaPoll?.();
       unlisten?.();
       if (sizeAnimationFrameRef.current !== undefined) {
         window.cancelAnimationFrame(sizeAnimationFrameRef.current);
@@ -816,9 +811,22 @@ export function PaletteWindow({
     // previous request; the token is re-checked after the await, immediately before emitting.
     let tooltipRequest = 0;
     let tooltipOwner: string | undefined;
+    // Linux (B5): also hide when the pointer leaves the palette without a DOM pointerleave (native
+    // leave, page hidden, idle last resort). Inert on macOS and Windows.
+    const dismissal = createPaletteTooltipDismissal({
+      platform,
+      dismiss: () => {
+        tooltipOwner = undefined;
+        tooltipRequest += 1;
+        dispatchPaletteTooltipDismiss();
+        void hidePaletteFloatingTooltip().catch(() => undefined);
+      },
+      subscribePointerLeave: handler => listenForPalettePointerLeave(toolset.id, handler)
+    });
     const handleTooltip = (event: Event) => {
       if (customizeThisPaletteRef.current) {
         tooltipRequest += 1;
+        dismissal.hidden();
         void hidePaletteFloatingTooltip().catch(() => undefined);
         return;
       }
@@ -831,12 +839,14 @@ export function PaletteWindow({
         if (detail.ownerId && detail.ownerId !== tooltipOwner) return;
         tooltipOwner = undefined;
         tooltipRequest += 1;
+        dismissal.hidden();
         void hidePaletteFloatingTooltip().catch(() => undefined);
         return;
       }
       const { title, description, shortcut, anchor } = detail;
       tooltipOwner = detail.ownerId;
       tooltipRequest += 1;
+      dismissal.shown();
       const request = tooltipRequest;
       void (async () => {
         const windowPosition = await currentWindowLogicalPosition().catch(() => undefined);
@@ -856,10 +866,11 @@ export function PaletteWindow({
     window.addEventListener(PALETTE_TOOLTIP_DOM_EVENT, handleTooltip);
     return () => {
       tooltipRequest += 1;
+      dismissal.dispose();
       window.removeEventListener(PALETTE_TOOLTIP_DOM_EVENT, handleTooltip);
       void hidePaletteFloatingTooltip().catch(() => undefined);
     };
-  }, []);
+  }, [platform, toolset.id]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {

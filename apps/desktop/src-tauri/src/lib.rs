@@ -200,7 +200,8 @@ const WINDOW_ACTION_EVENT: &str = "chemdraft://window-action";
 const DOM_COMMAND_EVENT: &str = "chemdraft:native-command";
 #[cfg(target_os = "macos")]
 const PALETTE_POINTER_EVENT: &str = "chemdraft://palette-pointer";
-#[cfg(target_os = "macos")]
+/// macOS: the pointer poll's leave. Linux: a GTK leave-notify on the palette
+/// (install_toolset_pointer_leave). Windows never emits it.
 const PALETTE_POINTER_LEAVE_EVENT: &str = "chemdraft://palette-pointer-leave";
 const OPEN_DOCUMENT_EVENT: &str = "chemdraft://open-document";
 const TOOLSET_WINDOW_STATE_EVENT: &str = "chemdraft://toolset-window-state";
@@ -7076,11 +7077,17 @@ fn toolset_tooltip_suppressed<'a>(windows: impl IntoIterator<Item = (&'a str, bo
 /// front. The tooltip webview invokes this after sizing itself: palettes and popovers become visible
 /// through this same NSWindow::orderFront path, whereas Tauri's JS `show()` did not reliably display
 /// the focusable(false) panel.
+///
+/// Linux passes the measured `width`/`height` too: the size is pinned (min = max hints) and applied
+/// here, on the main thread, before the position and the map, so each tooltip gets its own size.
+/// macOS and Windows size the window from the webview first and pass neither.
 #[tauri::command]
 fn show_toolset_tooltip_window(
     app: tauri::AppHandle,
     x: Option<f64>,
     y: Option<f64>,
+    width: Option<f64>,
+    height: Option<f64>,
 ) -> Result<(), String> {
     if utility_windows_suspended() {
         return Ok(());
@@ -7101,6 +7108,18 @@ fn show_toolset_tooltip_window(
     let Some(window) = app.get_webview_window(TOOLSET_TOOLTIP_WINDOW_LABEL) else {
         return Ok(());
     };
+    // Linux: a GtkWindow resize is clamped to the window's current size hints, and GTK's own
+    // non-resizable sizing could keep the previous tooltip's larger frame (a one-line tooltip in a
+    // 220x64 window). Pin this tooltip's size, then resize, before the position and the map.
+    #[cfg(target_os = "linux")]
+    if let Some((width, height)) = tooltip_content_size(width, height) {
+        let webview: &tauri::Webview = window.as_ref();
+        let size = tauri::LogicalSize::new(width, height);
+        utility_window::pin_content_fit_frame(&webview.window(), size.into())?;
+        window.set_size(size).map_err(|error| error.to_string())?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (width, height);
     // Placing and showing in one command halves the tooltip's IPC round trips (it used to be
     // monitor query → set size → set position → show, all strictly sequential).
     if let (Some(x), Some(y)) = (x, y) {
@@ -7123,6 +7142,16 @@ fn show_toolset_tooltip_window(
     // SW_SHOWNOACTIVATE keeps the hidden window's old z-order, which left the tooltip behind the
     // palette it describes.
     raise_among_owned_windows(&window)
+}
+
+/// A tooltip size the show command may apply: both sides given, finite and positive.
+#[cfg(any(target_os = "linux", test))]
+fn tooltip_content_size(width: Option<f64>, height: Option<f64>) -> Option<(f64, f64)> {
+    let (width, height) = (width?, height?);
+    [width, height]
+        .into_iter()
+        .all(|n| n.is_finite() && n > 0.0)
+        .then_some((width, height))
 }
 
 /// Raise a just-shown floating window above its siblings (the palettes and the other utility
@@ -7282,6 +7311,10 @@ fn show_toolset_popover_window(
 /// strand the tooltip visible over the palette.
 #[tauri::command]
 fn hide_toolset_tooltip_window(app: tauri::AppHandle) -> Result<(), String> {
+    hide_toolset_tooltip(&app)
+}
+
+fn hide_toolset_tooltip<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
     let Some(window) = app.get_webview_window(TOOLSET_TOOLTIP_WINDOW_LABEL) else {
         return Ok(());
     };
@@ -7628,6 +7661,14 @@ fn build_toolset_tooltip_window(app: &tauri::AppHandle) -> Result<(), String> {
     }
 
     let native_wayland = utility_window::uses_native_wayland(app)?;
+    // Linux keeps the tooltip GtkWindow resizable, like the palettes: GTK sizes a non-resizable
+    // X11 window from its remembered frame, which left a smaller tooltip in the previous one's
+    // frame. Every show pins it with min = max hints instead (show_toolset_tooltip_window).
+    #[cfg(target_os = "linux")]
+    let native_resizable = true;
+    // Only Linux builds use native Wayland, so this stays false on macOS and Windows.
+    #[cfg(not(target_os = "linux"))]
+    let native_resizable = native_wayland;
     let builder = utility_window_builder(
         WebviewWindowBuilder::new(
             app,
@@ -7642,7 +7683,7 @@ fn build_toolset_tooltip_window(app: &tauri::AppHandle) -> Result<(), String> {
     .min_inner_size(16.0, 14.0)
     .accept_first_mouse(false)
     .focusable(false)
-    .resizable(native_wayland)
+    .resizable(native_resizable)
     .decorations(false)
     .skip_taskbar(true)
     .visible(false);
@@ -11671,6 +11712,7 @@ fn ensure_toolset_window<R: Runtime>(
     utility_window::prepare(&window, utility_window::Kind::Toolbar, native_wayland)?;
     configure_toolset_utility_window(&window, true)?;
     install_toolset_input_focus(&window)?;
+    install_toolset_pointer_leave(&window, toolset_id)?;
     #[cfg(target_os = "linux")]
     utility_window::set_visible(&window, true)?;
     #[cfg(windows)]
@@ -11700,6 +11742,33 @@ fn install_toolset_input_focus<R: Runtime>(window: &tauri::WebviewWindow<R>) -> 
     let installed =
         run_on_main_thread_blocking(window, move || panel_window::install_input_focus(&target))
             .and_then(|result| result);
+    panel_window::finish_installation(installed, || {
+        window.destroy().map_err(|error| error.to_string())
+    })
+}
+
+/// Linux (B5): when the pointer leaves a palette, or another window covers it, hide the shared
+/// tooltip at once and tell the palette, which clears its tooltip state (PaletteWindow). WebKitGTK
+/// did not always deliver the DOM pointerleave, and the tooltip stayed up until the next hover.
+/// A no-op on macOS and Windows (utility_window::on_pointer_leave).
+fn install_toolset_pointer_leave<R: Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    toolset_id: &str,
+) -> Result<(), String> {
+    let app = window.app_handle().clone();
+    let label = window.label().to_owned();
+    let toolset_id = toolset_id.to_owned();
+    let installed = utility_window::on_pointer_leave(window, move || {
+        // Best-effort: the palette's own hide below still runs if the native hide fails.
+        let _ = hide_toolset_tooltip(&app);
+        let _ = app.emit_to(
+            label.as_str(),
+            PALETTE_POINTER_LEAVE_EVENT,
+            PalettePointerLeavePayload {
+                toolset_id: toolset_id.clone(),
+            },
+        );
+    });
     panel_window::finish_installation(installed, || {
         window.destroy().map_err(|error| error.to_string())
     })
@@ -11791,7 +11860,7 @@ struct PalettePointerPayload {
     y: f64,
 }
 
-#[cfg(target_os = "macos")]
+/// The PALETTE_POINTER_LEAVE_EVENT payload, on every platform that emits it (see that constant).
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PalettePointerLeavePayload {
@@ -16459,6 +16528,22 @@ mod tests {
     #[test]
     fn toolset_windows_do_not_take_focus_from_document_window() {
         expect_false(toolset_window_focusable());
+    }
+
+    #[test]
+    fn tooltip_show_applies_only_a_complete_positive_size() {
+        assert_eq!(
+            tooltip_content_size(Some(105.0), Some(22.0)),
+            Some((105.0, 22.0))
+        );
+        // macOS and Windows pass no size; the webview already sized the window.
+        assert_eq!(tooltip_content_size(None, None), None);
+        assert_eq!(tooltip_content_size(Some(105.0), None), None);
+        assert_eq!(tooltip_content_size(None, Some(22.0)), None);
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(tooltip_content_size(Some(bad), Some(22.0)), None);
+            assert_eq!(tooltip_content_size(Some(105.0), Some(bad)), None);
+        }
     }
 
     #[test]

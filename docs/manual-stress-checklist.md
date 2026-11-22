@@ -1866,3 +1866,33 @@ Run under KDE Plasma (Wayland session, so the app uses XWayland) from a terminal
   Repeat with `C[C@H](O)CC` ((S)-butan-2-ol, one wedged stereocenter): rotate, pull and flatten,
   and the Molecular Inspector still reports (S) afterwards.
 - Without `CHEMDRAFT_ENGINE3D_LOG`, the same session writes no `[engine3d]` lines.
+
+## Linux palette tooltips, work-area changes and the Save dialog (1.2.3)
+
+Run under KDE Plasma (Wayland session, so the app uses XWayland) and on GNOME.
+
+- Tooltip hides when the pointer leaves (B5): hover several palette buttons about 1-2 s apart,
+  then move the pointer straight onto the canvas. The last tooltip disappears at once. Repeat,
+  moving the pointer quickly off a button at the palette's edge, onto another application's
+  window, and onto the desktop. Hover a button, then open a window over the palette without moving
+  the pointer (for example Alt+Tab to another app, or a dialog opened from the keyboard): the
+  tooltip goes away. Move back over the palette: hovering a button shows its tooltip again after
+  the usual delay.
+  As a last resort, a tooltip left with the pointer resting still on its button hides after about
+  8 s; moving the pointer within the palette keeps it up.
+- Tooltip size follows its text: hover a long tooltip that wraps (Single Bond), then a short one
+  (Orbital Lobe Tool, Eraser Tool, Formula Text Style). Each tooltip window hugs its text with no
+  blank band below or beside it; `xwininfo` on "ChemDraft tooltip" shows a size close to its
+  text box, and `xprop WM_NORMAL_HINTS` shows min = max = that size. Then hover short, long,
+  short again: the window shrinks as well as grows.
+- Work-area change with no window event: with the 1024x768 display from the 1.2.2 section (Main
+  capped and scrolling), remove or auto-hide the bottom panel without touching the palette. Within
+  about a second Main is re-fitted to the new work area; put the panel back and it is capped
+  again. On a wide display, add a vertical panel on the left or right that narrows the work area
+  below Main's width: Main is capped and scrolls without being moved. No palette flickers or keeps
+  resizing afterwards (watch for a few seconds).
+- GTK Save dialog file types: open a `.cdxml` file and press Shift+Ctrl+S. The file-type dropdown
+  at the bottom of the dialog is not blank: it reads CDXML, the existing file is selected in the
+  list, and the dropdown also offers ChemDraft and CDX. Repeat with a `.chemdraft` and a `.cdx`
+  file, and with a new untitled document. Export (File ▸ Export) dialogs show their format name.
+  macOS and Windows Save dialogs list their file types in the same order as before.
