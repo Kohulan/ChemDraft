@@ -412,7 +412,15 @@ describe("native Window and full-screen menus", () => {
     expect(windowMenu).toContain("PredefinedMenuItem::minimize(app, None)");
     expect(windowMenu).toContain("PredefinedMenuItem::maximize(app, None)");
     expect(windowMenu).toContain("CLOSE_WINDOW_WINDOW_MENU_ID");
-    expect(windowMenu).toMatch(/#\[cfg\(not\(target_os = "macos"\)\)\]\s*&PredefinedMenuItem::close_window\(app, None\)/);
+    // macOS and Windows keep muda's predefined items; Windows keeps the predefined Close Window.
+    expect(windowMenu).toMatch(/#\[cfg\(not\(target_os = "linux"\)\)\]\s*&PredefinedMenuItem::minimize\(app, None\)/);
+    expect(windowMenu).toMatch(/#\[cfg\(not\(target_os = "linux"\)\)\]\s*&PredefinedMenuItem::maximize\(app, None\)/);
+    expect(windowMenu).toMatch(/#\[cfg\(windows\)\]\s*&PredefinedMenuItem::close_window\(app, None\)/);
+    expect(windowMenu.match(/PredefinedMenuItem::(?:minimize|maximize|close_window)\(/g)).toHaveLength(3);
+    // muda leaves the predefined items out of GTK menus, so Linux builds ordinary items instead.
+    expect(windowMenu).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*&linux_window_menu_item\(app, LINUX_MINIMIZE_MENU_ID\)\?/);
+    expect(windowMenu).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*&linux_window_menu_item\(app, LINUX_TOGGLE_MAXIMIZE_MENU_ID\)\?/);
+    expect(windowMenu).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*&linux_window_menu_item\(app, LINUX_CLOSE_WINDOW_WINDOW_MENU_ID\)\?/);
   });
 
   it("builds one native full-screen item in View with the current document state on macOS", () => {
