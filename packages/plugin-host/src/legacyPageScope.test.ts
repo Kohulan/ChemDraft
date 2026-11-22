@@ -1,4 +1,4 @@
-import { applyPatch, applyPatchWithHistory, createDocumentHistory, createEmptyDocument, deserializeDocument, redo, serializeDocument, toEngineDocument,
+import { admitParsedDocument, applyPatch, applyPatchWithHistory, createDocumentHistory, createEmptyDocument, deserializeDocument, hasObjectIdentity, objectIdentity, readSerializedDocument, redo, serializeDocument, toEngineDocument,
   undo, type ChemDraftDocument, type DocumentObject, type MoleculeObject } from "@chemdraft/chem-core";
 import { describe, expect, it, vi } from "vitest";
 import { assertLegacyWritePages, assertPluginDocumentWriteScope, assertPluginPatchWriteScope, legacyWriteScopePages, objectInWriteScope, PluginHost,
@@ -552,5 +552,120 @@ describe("Kimi 1.2.3 finding 3: a command's insertions are granted by identity, 
     f.release();
     await expect(f.pending).resolves.toMatchObject({ applied: true });
     expect(f.document().pages[0]!.objects.find(object => object.id === "N")).toMatchObject({ x: 999, y: 40 });
+  });
+});
+
+/**
+ * Probe run-20261122-074045-5fa6da (1.2.2): a native .chemdraft file holding two same-page objects with
+ * the id "X" opens unchanged (the schema has no uniqueness rule; chem-core resolves a bare id to its first
+ * remaining occurrence). With the first X selected, "removeObject X; updateObject X", "reorderObject X;
+ * updateObject X" and two separate writes under the same pin all moved the SECOND, unselected X, and both
+ * the preflight and the final check passed. These cases open the document through chem-core's native file
+ * reader (readSerializedDocument: the reader openNativeDocument -> openChemDraftPayload uses for .chemdraft
+ * JSON) and drive the real PluginHost command path, which pins the selection at invocation.
+ */
+describe("1.2.2 probe: a native file with two same-page objects sharing an id", () => {
+  /** Serialize, then read back and admit as File > Open does: the two X are separate values with separate identities. */
+  function openedDuplicates(): ChemDraftDocument {
+    const empty = createEmptyDocument({ now });
+    const file = serializeDocument({ ...empty, pages: [{ ...empty.pages[0]!, id: "page-1", objects: [molecule("X", 0), molecule("X", 100)] }],
+      selection: { pageId: "page-1", objectIds: ["X"] } });
+    // File > Open admits the parsed document as the engine's own (MainWindow resetDocumentHistory).
+    const opened = admitParsedDocument(readSerializedDocument(file).document);
+    expect(opened.pages[0]!.objects.map(object => [object.id, object.x])).toEqual([["X", 0], ["X", 100]]);
+    expect(opened.selection).toMatchObject({ pageId: "page-1", objectIds: ["X"] });
+    return opened;
+  }
+  type Patch = PluginPatchApplicationRequest["patch"]["patch"];
+  const moveX: Patch = { op: "updateObject", objectId: "X", changes: { x: 500 } };
+
+  /** A command that applies each of `writes` in turn, through the host preflight and the desktop's final check. */
+  function commandHost(document: ChemDraftDocument, writes: Patch[]) {
+    let current = document;
+    const applied: Patch[] = [];
+    const applyDocumentPatch = vi.fn((request: PluginPatchApplicationRequest) => {
+      const before = current;
+      assertPluginPatchWriteScope(before, request.patch, request.writeScopeObjectIds, undefined, undefined, request.writeScopePages);
+      const after = applyPatch(before, request.patch.patch, { now });
+      assertPluginDocumentWriteScope(before, after, request.patch, request.writeScopeObjectIds, request.writeScopePages);
+      current = after;
+      applied.push(request.patch.patch);
+      return { applied: true as const, objectIds: [] };
+    });
+    const host = new PluginHost({ getActiveDocument: () => current, applyDocumentPatch });
+    host.registerPlugin({ id: "org.test.dupid", name: "Duplicate ids", version: "0.0.1", apiVersion: "^0.1.8", entry: "plugin.js",
+      permissions: ["document.write"], contributes: { commands: [{ id: "plugin.dupid.run", title: "Run" }] }
+    }, { commandHandlers: { "plugin.dupid.run": async ctx => {
+      for (const patch of writes) await ctx.documents.applyPatch!({ reason: "Write", patch });
+    } } });
+    return { run: () => host.invokeCommand("plugin.dupid.run"), applied, document: () => current };
+  }
+  /** The second X, the copy that was not selected. */
+  const secondX = (document: ChemDraftDocument) => document.pages[0]!.objects.filter(object => object.id === "X")[1];
+  /** `object` is still `unselected` as opened: the same value, and the same host-owned identity. */
+  const expectUntouched = (object: DocumentObject | undefined, unselected: DocumentObject) => {
+    expect(object).toEqual(unselected);
+    expect(hasObjectIdentity(object!, objectIdentity(unselected))).toBe(true);
+  };
+  const removeThenMove: Patch = { op: "batch", patches: [{ op: "removeObject", objectId: "X" }, moveX] };
+  const reorderThenMove: Patch = { op: "batch", patches: [{ op: "reorderObject", objectId: "X", placement: "front" }, moveX] };
+
+  it("refuses the batch removeObject X; updateObject X, and the unselected X never moves", async () => {
+    const opened = openedDuplicates();
+    const unselected = secondX(opened)!;
+    const f = commandHost(opened, [removeThenMove]);
+    await expect(f.run()).rejects.toThrow(/Plugin write refused/);
+    expect(f.applied).toEqual([]);
+    expect(f.document()).toBe(opened);
+    expectUntouched(secondX(f.document()), unselected);
+  });
+
+  it("refuses the batch reorderObject X; updateObject X: the command path rejects the op, and the scope checks refuse it too", async () => {
+    const opened = openedDuplicates();
+    const unselected = secondX(opened)!;
+    // documents.applyPatch does not accept reorderObject from a plugin command at all (DirectWritePatchOps).
+    const f = commandHost(opened, [reorderThenMove]);
+    await expect(f.run()).rejects.toThrow(`Plugin "org.test.dupid" passed an unsupported "reorderObject" patch to documents.applyPatch.`);
+    expect(f.applied).toEqual([]);
+    expect(f.document()).toBe(opened);
+    // Should that ever change, the identity-based preflight and final check still refuse this batch on the
+    // opened document: chem-core applies it in order and the update reaches the unselected X.
+    const pins = legacyWriteScopePages(opened, ["X"]);
+    const proposed = { reason: "Batch", warnings: [], requiresUserApproval: true as const, patch: reorderThenMove };
+    const after = applyPatch(opened, reorderThenMove, { now });
+    expect(after.pages[0]!.objects.map(object => object.x)).toEqual([500, 0]);
+    expect(() => assertPluginPatchWriteScope(opened, proposed, ["X"], undefined, undefined, pins)).toThrow(/Plugin write refused/);
+    expect(() => assertLegacyWritePages(opened, reorderThenMove, pins)).toThrow(/Plugin write refused/);
+    expect(() => assertPluginDocumentWriteScope(opened, after, proposed, ["X"], pins)).toThrow(/Plugin write refused/);
+    expectUntouched(secondX(opened), unselected);
+  });
+
+  it("refuses the second of two separate writes under the same pin: the first removed the selected X", async () => {
+    const opened = openedDuplicates();
+    const unselected = secondX(opened)!;
+    const f = commandHost(opened, [{ op: "removeObject", objectId: "X" }, moveX]);
+    // The preflight refuses the update before it reaches the desktop: the pinned X is gone, and the only X
+    // left is the unselected copy, which never held the pin.
+    await expect(f.run()).rejects.toThrow(reselect(1));
+    expect(f.applied).toEqual([{ op: "removeObject", objectId: "X" }]);
+    expect(f.document().pages[0]!.objects).toHaveLength(1);
+    expectUntouched(f.document().pages[0]!.objects[0], unselected);
+    // The final check, on its own, refuses the same update too.
+    const removed = f.document();
+    const proposed = { reason: "Move", warnings: [], requiresUserApproval: true as const, patch: moveX };
+    expect(() => assertPluginDocumentWriteScope(removed, applyPatch(removed, moveX, { now }), proposed, ["X"],
+      legacyWriteScopePages(opened, ["X"]))).toThrow(/Plugin write refused/);
+  });
+
+  it("writes a single update to the selected X: the command path pins the first X on the Send page", async () => {
+    // Documented behavior: the legacy command pin is the first object with the id on the selection's page
+    // (pinSelectionPages), which is also the object chem-core's bare-id update reaches, so the write lands
+    // on the selected copy and only there.
+    const opened = openedDuplicates();
+    const unselected = secondX(opened)!;
+    const f = commandHost(opened, [moveX]);
+    await expect(f.run()).resolves.toBeUndefined();
+    expect(f.document().pages[0]!.objects.map(object => object.x)).toEqual([500, 100]);
+    expectUntouched(secondX(f.document()), unselected);
   });
 });

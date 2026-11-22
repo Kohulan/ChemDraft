@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { applyPatch, createCustomPageLayout, createEmptyDocument, DocumentObjectSchema, nativeDrawingStyleFromObjectStyle, toEngineDocument, undo, redo, type ChemDraftDocument, type ReactionObject } from "@chemdraft/chem-core";
+import { admitParsedDocument, applyPatch, createCustomPageLayout, createEmptyDocument, DocumentObjectSchema, hasObjectIdentity, objectIdentity, serializeDocument, nativeDrawingStyleFromObjectStyle, toEngineDocument, undo, redo, type ChemDraftDocument, type ReactionObject } from "@chemdraft/chem-core";
 import { AssistantCapabilityPermissions, ProposedDocumentPatchSchema, runPluginWorker, parsePluginManifest, type PluginWorkerHandle,
   type PluginCommandContext, type PluginAssistantToolHandler } from "@chemdraft/plugin-api";
 import { assertPluginDocumentWriteScope, assertPluginPatchWriteScope, PluginHost } from "@chemdraft/plugin-host";
@@ -14,7 +14,7 @@ import { setNativePromptProvider, type NativePromptOptions } from "../nativeProm
 import { commitWithPageFit } from "../pageEnlargement";
 import { objectRect } from "./placement";
 import { buildMoveObjects, translateObject } from "./writeBuilder";
-import { applyChargeToolAtPoint } from "../documentWorkflow";
+import { applyChargeToolAtPoint, normalizeCommittedDocument, openNativeDocument } from "../documentWorkflow";
 import { PluginWorkerBridge } from "../plugins/PluginWorkerBridge";
 import { createWorkerRoutedOptions } from "../plugins/registerBundledPlugins";
 import { createPluginRuntime } from "../plugins/createPluginRuntime";
@@ -1742,6 +1742,145 @@ describe("Kimi 1.2.3 finding 3: assistant insertions are granted by identity, ne
       const styled = await s.controller.callTool(s.plugin, { name: "style_objects", input: { objectIds: [captionId!], style: { color: "#112233" } } });
       expect(styled.isError, JSON.stringify(styled)).not.toBe(true);
       expect(JSON.stringify(findObject(s.context.getDocument()!, captionId!))).toContain("#112233");
+      await s.controller.endRequest(s.plugin, { requestId });
+    } finally { await s.finish(); }
+  });
+});
+
+/**
+ * Probe run-20261122-074045-5fa6da (1.2.2): a native .chemdraft file holding two same-page objects with
+ * one id opens unchanged, and with that id selected, "removeObject X; updateObject X", "reorderObject X;
+ * updateObject X" and two separate writes under the same pin all reached the SECOND, unselected copy. The
+ * probe judged the assistant path affected by inspection only. Here the document goes through the app's
+ * real open path (openNativeDocument, then admitParsedDocument and normalizeCommittedDocument, as
+ * resetDocumentHistory installs it), beginRequest pins the selection at Send, and the writes go through
+ * the assistant's host tools and a plugin assistant tool's documents.applyPatch.
+ */
+describe("1.2.2 probe: assistant writes on a native file with two same-page objects sharing an id", () => {
+  /** Opens a file whose page 1 holds the fixture molecule and, after it, a copy under the same id 200 px lower. */
+  function openDuplicates(s: ReturnType<typeof setup>) {
+    const document = s.context.getDocument()!;
+    const page = document.pages[0]!;
+    const copy = translateObject(structuredClone(s.molecule), 0, 200);
+    const file = serializeDocument({ ...document, pages: [{ ...page, objects: [s.molecule, copy, ...page.objects.slice(1)] }],
+      selection: { pageId: page.id, objectIds: [s.molecule.id] } });
+    const opened = openNativeDocument(file);
+    expect(opened.document).toBeDefined();
+    const installed = normalizeCommittedDocument(admitParsedDocument(opened.document!), { preserveElectronMarks: true });
+    const copies = installed.pages[0]!.objects.filter(object => object.id === s.molecule.id);
+    expect(copies).toHaveLength(2);
+    expect(copies[1]!.y).toBeCloseTo(copies[0]!.y + 200);
+    s.replace(installed);
+    s.select([s.molecule.id]);
+    return { installed, unselected: copies[1]! };
+  }
+  const copiesOf = (document: ChemDraftDocument, id: string) => document.pages[0]!.objects.filter(object => object.id === id);
+  /** The unselected copy keeps its value and its host-owned identity. */
+  const expectUntouched = (document: ChemDraftDocument, id: string, unselected: ChemDraftDocument["pages"][number]["objects"][number]) => {
+    const second = copiesOf(document, id).find(object => hasObjectIdentity(object, objectIdentity(unselected)));
+    expect(second).toEqual(unselected);
+  };
+
+  type Patch = Parameters<NonNullable<PluginCommandContext["documents"]["applyPatch"]>>[0]["patch"];
+  const moveTo500 = (id: string): Patch => ({ op: "updateObject", objectId: id, changes: { x: 500 } });
+  const shapes: [string, (id: string) => Patch[]][] = [
+    ["batch removeObject; updateObject", id => [{ op: "batch", patches: [{ op: "removeObject", objectId: id }, moveTo500(id)] }]],
+    ["batch reorderObject to front; updateObject", id => [{ op: "batch", patches: [{ op: "reorderObject", objectId: id, placement: "front" }, moveTo500(id)] }]],
+    ["two separate writes: removeObject, then updateObject", id => [{ op: "removeObject", objectId: id }, moveTo500(id)]]
+  ];
+
+  it.each(shapes)("a plugin assistant tool's %s never reaches the unselected copy", async (name, writesFor) => {
+    const errors: string[] = [];
+    let writes: Patch[] = [];
+    const s = setup(async context => {
+      for (const patch of writes) {
+        try { await context.documents.applyPatch!({ reason: "Write", patch }); } catch (error) { errors.push((error as Error).message); break; }
+      }
+      return TOOL_OK;
+    }, true);
+    try {
+      const { installed, unselected } = openDuplicates(s);
+      const id = s.molecule.id;
+      writes = writesFor(id);
+      const { requestId } = await s.controller.beginRequest(s.plugin, { prompt: "edit the selection" });
+      const session = await s.controller.createToolSession(s.plugin, { requestId, extraTools: [EXTRA_TOOL] });
+      expect(await s.bridge(session.sessionId, EXTRA_TOOL.name, {})).toEqual({ result: TOOL_OK });
+      expect(errors).toHaveLength(1);
+      if (name.includes("reorderObject")) {
+        // documents.applyPatch does not accept reorderObject from a plugin at all (DirectWritePatchOps).
+        expect(errors[0]).toMatch(/unsupported "reorderObject" patch/);
+        expect(s.context.getDocument()).toBe(installed);
+      } else if (name.startsWith("two separate")) {
+        // The first write removed the selected copy; the second, which chem-core would apply to the
+        // unselected copy, is refused because the pinned object is gone.
+        expect(errors[0]).toMatch(/Plugin write refused: the change was not applied\. The object you selected on page 1 is no longer there; reselect it and try again\./);
+        expect(copiesOf(s.context.getDocument()!, id)).toHaveLength(1);
+      } else {
+        expect(errors[0]).toMatch(/Plugin write refused/);
+        expect(s.context.getDocument()).toBe(installed);
+      }
+      expectUntouched(s.context.getDocument()!, id, unselected);
+      await s.controller.endRequest(s.plugin, { requestId });
+    } finally { await s.finish(); }
+  });
+
+  const duplicateRefusal = "Plugin write refused: the change was not applied. The object you selected on page 1 shares its internal ID with an object on page 1, so ChemDraft can't tell which one to change safely. To edit it, make the change by hand, or copy the object and paste it as a new object, then try again.";
+
+  it("host tools: delete_objects then style_objects and move_objects under the same pin are all refused", async () => {
+    // The host tools refuse an id that names two objects on the pinned page outright, with the existing
+    // duplicate-id wording, so the two-separate-writes shape never gets past its first write.
+    const s = setup();
+    try {
+      const { installed, unselected } = openDuplicates(s);
+      const id = s.molecule.id;
+      const { requestId } = await s.controller.beginRequest(s.plugin, { prompt: "edit the selection" });
+      for (const input of [{ name: "delete_objects", input: { objectIds: [id] } },
+        { name: "style_objects", input: { objectIds: [id], style: { color: "#112233" } } },
+        { name: "move_objects", input: { objectIds: [id], to: { arrange: "row" } } }]) {
+        const result = await s.controller.callTool(s.plugin, input);
+        expect(result, JSON.stringify(result)).toMatchObject({ isError: true, content: [{ text: expect.stringContaining(duplicateRefusal) }] });
+      }
+      expect(s.context.getDocument()).toBe(installed);
+      expect(s.history).toHaveLength(0);
+      expectUntouched(s.context.getDocument()!, id, unselected);
+      await s.controller.endRequest(s.plugin, { requestId });
+    } finally { await s.finish(); }
+  });
+
+  it("a single host-tool update of the selected copy is refused with the existing duplicate-id wording", async () => {
+    // Documented behavior for the host tools: identity could tell the copies apart (Send pins the first one
+    // on the page), but the host tools refuse an id that is ambiguous on its page, using the
+    // existing duplicate-id wording. Nothing changes.
+    const s = setup();
+    try {
+      const { installed } = openDuplicates(s);
+      const { requestId } = await s.controller.beginRequest(s.plugin, { prompt: "restyle the selection" });
+      const result = await s.controller.callTool(s.plugin, { name: "style_objects", input: { objectIds: [s.molecule.id], style: { color: "#112233" } } });
+      expect(result).toMatchObject({ isError: true, content: [{ text: expect.stringContaining(duplicateRefusal) }] });
+      expect(s.context.getDocument()).toBe(installed);
+      await s.controller.endRequest(s.plugin, { requestId });
+    } finally { await s.finish(); }
+  });
+
+  it("a single plugin assistant tool update reaches the selected copy only", async () => {
+    // Documented behavior for plugin writes: the Send pin is the first object with the id on the selection's
+    // page (legacyWriteScopePages), which is also the object chem-core's bare-id update reaches.
+    const errors: string[] = [];
+    let id = "";
+    const s = setup(async context => {
+      try { await context.documents.applyPatch!({ reason: "Move", patch: moveTo500(id) }); } catch (error) { errors.push((error as Error).message); }
+      return TOOL_OK;
+    }, true);
+    try {
+      const { unselected } = openDuplicates(s);
+      id = s.molecule.id;
+      const { requestId } = await s.controller.beginRequest(s.plugin, { prompt: "move the selection" });
+      const session = await s.controller.createToolSession(s.plugin, { requestId, extraTools: [EXTRA_TOOL] });
+      expect(await s.bridge(session.sessionId, EXTRA_TOOL.name, {})).toEqual({ result: TOOL_OK });
+      expect(errors).toEqual([]);
+      const copies = copiesOf(s.context.getDocument()!, id);
+      expect(copies.map(object => object.x)).toEqual([500, unselected.x]);
+      expectUntouched(s.context.getDocument()!, id, unselected);
       await s.controller.endRequest(s.plugin, { requestId });
     } finally { await s.finish(); }
   });
