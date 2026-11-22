@@ -1481,3 +1481,102 @@ describe("legacy assistant writes resolve a duplicate id by its Send-time page",
     } finally { await s.finish(); }
   });
 });
+
+describe("legacy assistant pins never rebind to an unselected same-id object (CodeRabbit cr4656567628/cr4656567661)", () => {
+  it.each([
+    ["style_objects", (id: string) => ({ objectIds: [id], style: { color: "#112233" } })],
+    ["delete_objects", (id: string) => ({ objectIds: [id] })],
+    ["insert_text", (id: string) => ({ text: "Beside the selection", relativeTo: { objectId: id, side: "right" } })]
+  ] as const)("%s refuses once the selected page 1 duplicate is deleted, leaving page 2's object alone", async (name, input) => {
+    const s = setup();
+    try {
+      const document = s.context.getDocument()!;
+      const pageA = document.pages[0]!;
+      // Page 2 holds its own molecule with the same id; Send selects page 1's.
+      const copy = translateObject(structuredClone(s.molecule), 0, 200);
+      const pageB = { ...pageA, id: "page_b", objects: [copy] };
+      s.replace({ ...document, pages: [pageA, pageB], selection: { pageId: pageA.id, objectIds: [s.molecule.id] } });
+      s.select([s.molecule.id]);
+      const { requestId } = await s.controller.beginRequest(s.plugin, { prompt: "edit the selection" });
+      // After Send, the user deletes page 1's selected molecule. Page 2's was never selected.
+      const sent = s.context.getDocument()!;
+      const edited = { ...sent, pages: [{ ...sent.pages[0]!, objects: sent.pages[0]!.objects.filter(object => object.id !== s.molecule.id) },
+        sent.pages[1]!] };
+      s.replace(edited);
+      const result = await s.controller.callTool(s.plugin, { name, input: input(s.molecule.id) });
+      // Refused at lookup (findObject) or at the write scope check; either way the pin is "no longer there".
+      expect(result).toMatchObject({ isError: true, content: [{ text: expect.stringMatching(/no longer there/) }] });
+      const after = s.context.getDocument()!;
+      expect(after.pages[1]!.objects).toEqual([copy]);
+      expect(after.pages[0]!.objects).toEqual(edited.pages[0]!.objects);
+      expect(s.history).toHaveLength(0);
+      await s.controller.endRequest(s.plugin, { requestId });
+    } finally { await s.finish(); }
+  });
+});
+
+describe("Kimi security review: an assistant pin unique at Send never follows its id to an unrelated object on another page", () => {
+  /** Send selects page 1's molecule, the only object with its id. After Send, the user deletes it and
+   * inserts a different object with the same id on page 2. */
+  async function spoofed(s: ReturnType<typeof setup>) {
+    const document = s.context.getDocument()!;
+    const pageA = document.pages[0]!;
+    const sent = { ...document, pages: [pageA, { ...pageA, id: "page_b", objects: [] }],
+      selection: { pageId: pageA.id, objectIds: [s.molecule.id] } };
+    s.replace(sent);
+    s.select([s.molecule.id]);
+    const { requestId } = await s.controller.beginRequest(s.plugin, { prompt: "edit the selection" });
+    const newcomer = translateObject(structuredClone(s.molecule), 0, 200);
+    const edited = { ...sent, pages: [{ ...pageA, objects: pageA.objects.filter(object => object.id !== s.molecule.id) },
+      { ...sent.pages[1]!, objects: [newcomer] }] };
+    s.replace(edited);
+    return { requestId, newcomer, edited };
+  }
+  const reselect = "The object you selected on page 1 is no longer there; reselect it and try again.";
+
+  it.each([
+    ["get_structure", (id: string) => ({ objectId: id, format: "smiles" })],
+    ["structure_to_name", (id: string) => ({ objectId: id })],
+    ["style_objects", (id: string) => ({ objectIds: [id], style: { color: "#112233" } })],
+    ["delete_objects", (id: string) => ({ objectIds: [id] })],
+    ["move_objects", (id: string) => ({ objectIds: [id], to: { arrange: "row" } })],
+    ["insert_text", (id: string) => ({ text: "Beside the selection", relativeTo: { objectId: id, side: "right" } })]
+  ] as const)("%s is refused with the reselect message and page 2's object is unchanged", async (name, input) => {
+    const s = setup();
+    try {
+      const { requestId, newcomer, edited } = await spoofed(s);
+      const result = await s.controller.callTool(s.plugin, { name, input: input(s.molecule.id) });
+      expect(result).toMatchObject({ isError: true, content: [{ text: expect.stringContaining(reselect) }] });
+      expect(s.context.chemistry.structureToName).not.toHaveBeenCalled();
+      expect(s.context.getDocument()).toBe(edited);
+      expect(s.context.getDocument()!.pages[1]!.objects).toEqual([newcomer]);
+      expect(s.history).toHaveLength(0);
+      await s.controller.endRequest(s.plugin, { requestId });
+    } finally { await s.finish(); }
+  });
+
+  it("objects the request inserted stay writable beside a refused pin", async () => {
+    const s = setup();
+    try {
+      const document = s.context.getDocument()!;
+      s.replace({ ...document, pages: [document.pages[0]!, { ...document.pages[0]!, id: "page_b", objects: [] }],
+        selection: { pageId: document.pages[0]!.id, objectIds: [s.molecule.id] } });
+      s.select([s.molecule.id]);
+      const { requestId } = await s.controller.beginRequest(s.plugin, { prompt: "caption it" });
+      const inserted = await s.controller.callTool(s.plugin, { name: "insert_text", input: { text: "Caption" } });
+      expect(inserted.isError, JSON.stringify(inserted)).not.toBe(true);
+      const [captionId] = inserted.structuredContent!.objectIds as string[];
+      // The selected molecule is then deleted by the user: its pin refuses, the insertion does not.
+      const current = s.context.getDocument()!;
+      s.replace({ ...current, pages: [{ ...current.pages[0]!, objects: current.pages[0]!.objects.filter(object => object.id !== s.molecule.id) },
+        current.pages[1]!] });
+      const styled = await s.controller.callTool(s.plugin, { name: "style_objects", input: { objectIds: [captionId!], style: { color: "#112233" } } });
+      expect(styled.isError, JSON.stringify(styled)).not.toBe(true);
+      const caption = s.context.getDocument()!.pages.flatMap(page => page.objects).find(object => object.id === captionId)!;
+      expect(JSON.stringify(caption)).toContain("#112233");
+      const refused = await s.controller.callTool(s.plugin, { name: "style_objects", input: { objectIds: [s.molecule.id], style: { color: "#445566" } } });
+      expect(refused).toMatchObject({ isError: true, content: [{ text: expect.stringContaining(reselect) }] });
+      await s.controller.endRequest(s.plugin, { requestId });
+    } finally { await s.finish(); }
+  });
+});
