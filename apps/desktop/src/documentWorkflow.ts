@@ -12093,18 +12093,33 @@ export function reorderNativeMoleculeParts(
   return document;
 }
 
+/**
+ * Moves the target atoms so their drawn positions shift by the page-space `delta`. On a rotated
+ * molecule the delta is turned into the molecule's own frame, and the stored frame is re-anchored
+ * after its bounds are recomputed so the rotation pivot moving with the bounds does not shift any
+ * drawn atom (CodeRabbit #422 item I). Pass `frame: "molecule"` when the delta is already in the
+ * molecule's raw frame (the part-drag snap works there).
+ */
 export function moveNativeMoleculeParts(
   document: ChemDraftDocument,
   target: NativeMoleculePartMoveTarget,
-  delta: PagePoint
+  delta: PagePoint,
+  frame: "page" | "molecule" = "page"
 ): ChemDraftDocument {
-  return moveNativeMoleculePartsWithPositions(document, target, delta).document;
+  return moveNativeMoleculePartsWithPositions(document, target, delta, frame).document;
+}
+
+/** Turns a page-space displacement into `molecule`'s unrotated frame, or back with `toPage`. */
+export function moleculeFrameDelta(molecule: MoleculeObject, delta: PagePoint, toPage = false): PagePoint {
+  if (!molecule.rotation) return delta;
+  return rotateVector(delta, (toPage ? 1 : -1) * molecule.rotation * Math.PI / 180);
 }
 
 function moveNativeMoleculePartsWithPositions(
   document: ChemDraftDocument,
   target: NativeMoleculePartMoveTarget,
-  delta: PagePoint
+  pageOrFrameDelta: PagePoint,
+  frame: "page" | "molecule" = "page"
 ): { document: ChemDraftDocument; positions: readonly number[] } {
   const page = document.pages.find((candidate) => candidate.objects.some((object) => object.id === target.objectId));
   const molecule = page?.objects.find((object): object is MoleculeObject =>
@@ -12119,6 +12134,7 @@ function moveNativeMoleculePartsWithPositions(
     return { document, positions: [] };
   }
 
+  const delta = frame === "page" ? moleculeFrameDelta(molecule, pageOrFrameDelta) : pageOrFrameDelta;
   const targetAtoms = molecule.atoms.filter((atom) => targetAtomIds.has(atom.id));
   const minX = Math.min(...targetAtoms.map((atom) => atom.x));
   const maxX = Math.max(...targetAtoms.map((atom) => atom.x));
@@ -12131,7 +12147,7 @@ function moveNativeMoleculePartsWithPositions(
   }
 
   const positions: number[] = [];
-  const moved = normalizeNativeMoleculeGeometry({
+  let moved = normalizeNativeMoleculeGeometry({
     ...molecule,
     atoms: molecule.atoms.map((atom, index) => {
       if (!targetAtomIds.has(atom.id)) return atom;
@@ -12139,6 +12155,21 @@ function moveNativeMoleculePartsWithPositions(
       return { ...atom, x: atom.x + dx, y: atom.y + dy };
     })
   });
+  if (molecule.rotation) {
+    // The pivot is the frame centre, so recomputed bounds would rotate every atom about a new
+    // point. Translating the raw frame translates the drawing by the same vector, so shift it by
+    // the drawn error of one atom (the error is the same for all of them).
+    const reference = molecule.atoms[0];
+    const pageDelta = moleculeFrameDelta(molecule, { x: dx, y: dy }, true);
+    const was = transformPointForObject(molecule, reference);
+    const intended = targetAtomIds.has(reference.id) ? { x: was.x + pageDelta.x, y: was.y + pageDelta.y } : was;
+    const drawn = transformPointForObject(moved, moved.atoms[0]);
+    const sx = intended.x - drawn.x, sy = intended.y - drawn.y;
+    if (Math.abs(sx) > 1e-9 || Math.abs(sy) > 1e-9) {
+      moved = { ...moved, x: moved.x + sx, y: moved.y + sy,
+        atoms: moved.atoms.map(atom => ({ ...atom, x: atom.x + sx, y: atom.y + sy })) };
+    }
+  }
   return { positions, document: applyPatch(
     document,
     {
@@ -19403,17 +19434,13 @@ export function flattenSpunMolecule(
   // associations explicit so a crowded projection cannot reassign them.
   const oldAtoms = new Map(molecule.atoms.map(atom => [atom.id, atom]));
   const newAtoms = new Map(flattened.atoms.map(atom => [atom.id, atom]));
-  const assignments = nativeElectronMarkAssignments(page).anchorByMarkId;
-  for (const mark of page.objects) {
-    if (mark.type !== "electron-mark") continue;
-    const owner = spin3dElectronMarkOwner(mark, assignments);
-    if (owner?.objectId !== objectId) continue;
-    const before = oldAtoms.get(owner.atomId);
-    const after = newAtoms.get(owner.atomId);
+  for (const { mark, atomId } of spin3dCarriedElectronMarks(page, objectId)) {
+    const before = oldAtoms.get(atomId);
+    const after = newAtoms.get(atomId);
     if (!before || !after) continue;
     patches.push({ op: "updateObject", objectId: mark.id, changes: {
       x: mark.x + after.x - before.x, y: mark.y + after.y - before.y, atomAssociation: "explicit",
-      anchor: { kind: "atom", objectId, atomId: owner.atomId }
+      anchor: { kind: "atom", objectId, atomId }
     } });
   }
   const pageId = page.id;
@@ -19465,6 +19492,22 @@ export function flattenSpunMolecule(
 
 function isSpin3dStereoMarker(bond: MoleculeBond): boolean {
   return bond.display?.bondStyle === "wedge" || bond.display?.bondStyle === "hashed";
+}
+
+/**
+ * The charge/radical marks a Spin 3D session carries with molecule `objectId`, each with the atom it
+ * follows. Flatten moves each by its atom's (flattened − drawn) offset, and the live overlay paints
+ * each at the same offset from the projected atom, so the mark never lags the spin.
+ */
+export function spin3dCarriedElectronMarks(
+  page: DocumentPage, objectId: string
+): Array<{ mark: ElectronMarkObject; atomId: string }> {
+  const assignments = nativeElectronMarkAssignments(page).anchorByMarkId;
+  return page.objects.flatMap(mark => {
+    if (mark.type !== "electron-mark") return [];
+    const owner = spin3dElectronMarkOwner(mark, assignments);
+    return owner?.objectId === objectId ? [{ mark, atomId: owner.atomId }] : [];
+  });
 }
 
 function spin3dElectronMarkOwner(

@@ -3,7 +3,7 @@
 // A claim that reproduces is `it.fails` (the fix removes `.fails`).
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { applyPatch, applyPatches, type ChemDraftDocument, type ElectronMarkObject } from "@chemdraft/chem-core";
 import { transformPointForObject } from "@chemdraft/layout-engine";
 import { phase4Timestamp } from "@chemdraft/document-workflow-core";
@@ -12,6 +12,11 @@ import * as workflow from "./documentWorkflow";
 import { DOM_COMMAND_EVENT } from "./window-manager";
 import { dropMark, dropMolecule, electronMarkDropFixture } from "./testSupport/electronMarkDropFixture";
 import { MemoryStorage } from "./testSupport/memoryStorage";
+import { ensureRdkit, rdkitConformerGenerator, resetRdkitForTesting, setRdkitModuleLoader } from "@chemdraft/rdkit-adapter";
+import { installDomRdkitLoader } from "./testSupport/rdkitIdentity";
+import { quatFromAxisAngle } from "./interaction/rotation3d";
+
+vi.mock("./rdkitWasmLoader", () => ({ registerRdkitWasmLoader: vi.fn() }));
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 class TestResizeObserver { observe() {} unobserve() {} disconnect() {} }
@@ -119,7 +124,7 @@ describe.each(["macos", "windows"] as const)("CodeRabbit #422 gesture items on %
   // -------------------------------------------------------------------------------------------
   // I: electronMarkDrop.dom.test.ts:886 — a part drag on a rotated molecule does not follow the pointer
   // -------------------------------------------------------------------------------------------
-  it.fails("I: an atom dragged on a 90°-rotated molecule is drawn at the release point", async () => {
+  it("I: an atom dragged on a 90°-rotated molecule is drawn at the release point", async () => {
     const { document, hydroxylOxygen } = electronMarkDropFixture();
     const molecule = dropMolecule(document);
     const rotated = applyPatches(document, [
@@ -136,5 +141,79 @@ describe.each(["macos", "windows"] as const)("CodeRabbit #422 gesture items on %
     const drawn = transformPointForObject(moved, oxygen);
     // The drag snap may adjust the drop by a few px; a raw-frame delta misses by ~85 px at 90°.
     expect(Math.hypot(drawn.x - end.x, drawn.y - end.y)).toBeLessThan(12);
+  });
+});
+
+// -------------------------------------------------------------------------------------------
+// S (hands-on follow-up): during the live Spin 3D overlay a + stayed at its old screen position and
+// only jumped to its N on flatten. The overlay must draw it at its atom's projected position, offset
+// exactly as flatten commits it (the shared ScreenPlacement contract).
+// -------------------------------------------------------------------------------------------
+describe("S: Spin 3D live overlay carries a charge mark with its atom", () => {
+  let container: HTMLDivElement, root: Root;
+  beforeAll(async () => {
+    installDomRdkitLoader();
+    installDomRdkitLoader(setRdkitModuleLoader);
+    await ensureRdkit();
+  });
+  afterAll(() => resetRdkitForTesting());
+  beforeEach(() => {
+    vi.stubGlobal("localStorage", new MemoryStorage());
+    vi.stubGlobal("ResizeObserver", TestResizeObserver);
+    vi.stubGlobal("CSS", { escape: (value: string) => value });
+    window.history.replaceState(null, "", "/?agentBridge=1");
+    container = document.createElement("div"); document.body.append(container);
+    root = createRoot(container);
+  });
+  afterEach(async () => {
+    await act(async () => root.unmount());
+    container.remove();
+    window.history.replaceState(null, "", "/");
+    delete window.__CHEMDRAFT_AGENT__;
+    vi.restoreAllMocks(); vi.unstubAllGlobals();
+  });
+
+  it("S: the + on N is painted at N's projected position while spinning, where flatten then commits it", async () => {
+    const { document: drawing, nitrogen } = electronMarkDropFixture();
+    const molecule = dropMolecule(drawing), mark = dropMark(drawing);
+    const coords3d = (await rdkitConformerGenerator.generate3DConformer(
+      { molfile: workflow.analysisFacingStructure(molecule).structure }, { seed: 42, optimize: "none" }
+    )).mapping.coords3dByOriginalAtom.slice(0, molecule.atoms.length * 3);
+    const modeled = workflow.selectDocumentObjects(workflow.attachSpin3dModelFromConformer(drawing, molecule.id,
+      { coords3d, orientation: quatFromAxisAngle([1, 0, 0], 0) }), drawing.pages[0].id, [molecule.id]);
+    const { width, height } = modeled.pages[0];
+    const rect = { x: 0, y: 0, left: 0, top: 0, width, height, right: width, bottom: height, toJSON: () => ({}) };
+    await act(async () => root.render(createElement(MainWindow, { initialDocument: modeled,
+      initialActiveToolCommandId: "tool.select", initialPaletteMode: "hidden", nativePalette: true,
+      initialRulersVisible: false, initialCrosshairsVisible: false })));
+    container.querySelector<HTMLElement>(".page")!.getBoundingClientRect = () => rect;
+    const before = window.__CHEMDRAFT_AGENT__!.snapshot().document;
+    await act(async () => window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "structure.spin3d" } })));
+    const overlay = () => container.querySelector<SVGSVGElement>("[data-spin3d-overlay]");
+    await vi.waitFor(() => expect(overlay()).toBeTruthy());
+    // The live overlay paints the + translated with N; the stationary page copy is hidden.
+    const live = overlay()!.querySelector(`[data-spin3d-electron-mark="${mark.id}"]`);
+    expect(live).not.toBeNull();
+    const [dx, dy] = live!.getAttribute("data-spin3d-mark-offset")!.split(" ").map(Number);
+    expect(Math.hypot(dx, dy)).toBeGreaterThan(1);
+    expect(live!.getAttribute("transform")).toBe(`translate(${dx} ${dy})`);
+    expect(container.querySelector(`[data-page-svg-object-visual="${mark.id}"]`)?.getAttribute("visibility")).toBe("hidden");
+    // Flatten (click outside): the committed + sits exactly where the overlay drew it.
+    const svg = overlay()!;
+    svg.getBoundingClientRect = () => rect;
+    await act(async () => {
+      const down = new MouseEvent("pointerdown", { bubbles: true, cancelable: true, button: 0, buttons: 1, clientX: 20, clientY: 20 });
+      Object.defineProperties(down, { pointerId: { value: 1 }, isPrimary: { value: true }, pointerType: { value: "mouse" } });
+      svg.dispatchEvent(down);
+    });
+    await vi.waitFor(() => expect(overlay()).toBeNull());
+    const after = window.__CHEMDRAFT_AGENT__!.snapshot().document;
+    expect(after).not.toEqual(before);
+    const flattened = dropMark(after);
+    expect(flattened.x - mark.x).toBeCloseTo(dx, 6);
+    expect(flattened.y - mark.y).toBeCloseTo(dy, 6);
+    // A spin never changes chemistry.
+    expect(dropMolecule(after).atoms.find(atom => atom.id === nitrogen.id)).toMatchObject({ formalCharge: 1 });
+    expect(container.querySelector(`[data-page-svg-object-visual="${mark.id}"]`)?.getAttribute("visibility")).not.toBe("hidden");
   });
 });

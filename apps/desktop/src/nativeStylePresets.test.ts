@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { Acs1996StylePreset, NativeStylePresets, createEmptyDocument, applyPatches,
   type CompatibilityWarning, type ElectronMarkObject, type MoleculeObject } from "@chemdraft/chem-core";
 import { createSmilesMolecule } from "@chemdraft/document-workflow-core";
+import { moleculeLayoutLabelBoxes } from "@chemdraft/layout-engine";
 import { allShellCommands, nativeStylePresetActions, nativeStylePresetCommandId, nativeStylePresetIdForCommand } from "./commands";
 import { buildAppMenuModel, flattenAppMenuCommands, nativeStylePresetMenuItems } from "./appMenu";
 import { pluginItemsForNativeMenu } from "./plugins/nativePluginMenu";
@@ -53,8 +54,15 @@ describe("native style presets through commit normalization", () => {
     expect(styledMark).toMatchObject({ anchor: mark.anchor, charge: -1 });
     expect(styledMark.atomAssociation).toBe(mark.atomAssociation);
     const offset = kind === "explicit far" ? 400 : -20;
-    expect(styledMark.x + styledMark.width / 2 - styled.atoms[0]!.x)
-      .toBeCloseTo(offset * Acs1996StylePreset.drawing.bondLengthPx / 40, 9);
+    const scaled = offset * Acs1996StylePreset.drawing.bondLengthPx / 40;
+    // CodeRabbit #422 follow-up O: a scaled mark that would overlap its atom's label is pushed out
+    // along its direction to sit 1 px clear of the label box. The far mark stays at its scaled offset;
+    // the over-valent O⁻'s scaled -11 px would overlap the O label, so it moves just clear of it.
+    const label = moleculeLayoutLabelBoxes(styled).find(box => box.atom === 0);
+    const expected = kind === "explicit far" ? scaled : label!.x - styledMark.width / 2 - 1 - styled.atoms[0]!.x;
+    if (kind !== "explicit far") expect(scaled + styledMark.width / 2).toBeGreaterThan(label!.x - styled.atoms[0]!.x);
+    expect(styledMark.y + styledMark.height / 2).toBeCloseTo(mark.y + mark.height / 2, 9);
+    expect(styledMark.x + styledMark.width / 2 - styled.atoms[0]!.x).toBeCloseTo(expected, 9);
     expect(normalizeCommittedDocument(result)).toBe(result);
   });
 

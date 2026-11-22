@@ -718,6 +718,8 @@ import {
   scaleDocumentObjectsAroundPoint,
   ungroupSelectedDocumentObjects,
   moveNativeMoleculeParts,
+  moleculeFrameDelta,
+  spin3dCarriedElectronMarks,
   findForeignNativeMoleculeBondTarget,
   openNativeDocument,
   previewNativeMoleculeBondGrowth,
@@ -1853,7 +1855,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.21.17.40-opus";
+const CURRENT_BUILD_STAMP = "11.22.07.30-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -18222,11 +18224,12 @@ export function MainWindow({
     };
     // Magnetic canonical-geometry snap: the drop clicks onto exact bond length / canonical
     // angles when the drag comes close, so hand-placed geometry lands "correct".
+    // The snap and the move both work in the molecule's own (unrotated) frame, so a rotated
+    // molecule's part lands where the pointer drops it (CodeRabbit #422 item I).
     const molecule = findDocumentObject(drag.startDocument, drag.objectId);
-    const delta = molecule?.type === "molecule"
-      ? snapNativeMoleculePartDragDelta(molecule, drag.target, rawDelta)
-      : rawDelta;
-    return moveNativeMoleculeParts(drag.startDocument, drag.target, delta);
+    if (molecule?.type !== "molecule") return moveNativeMoleculeParts(drag.startDocument, drag.target, rawDelta);
+    const delta = snapNativeMoleculePartDragDelta(molecule, drag.target, moleculeFrameDelta(molecule, rawDelta));
+    return moveNativeMoleculeParts(drag.startDocument, drag.target, delta, "molecule");
   }, []);
 
   const previewNativePartDrag = useCallback((drag: NativePartDragState, point: ClientPoint) => {
@@ -22966,6 +22969,21 @@ export function MainWindow({
   const activeSpin3dState = spin3dState && findDocumentObject(document, spin3dState.objectId)?.type === "molecule"
     ? spin3dState
     : undefined;
+  // Charge/radical marks follow their atom through the live spin (owner ruling 2026-11-21): the
+  // overlay paints each at its atom's projected position, offset exactly as flatten will commit it,
+  // and the page hides the stationary copy until the spin ends.
+  const spinObjectId = activeSpin3dState?.objectId;
+  const spinCarriedMarks = useMemo((): readonly SpinCarriedMark[] => {
+    if (!spinObjectId) return [];
+    const spinAtoms = activeSpin3dState?.atoms ?? [];
+    return spin3dCarriedElectronMarks(activePage, spinObjectId).flatMap(({ mark, atomId }) => {
+      const atomIndex = spinAtoms.findIndex(atom => atom.id === atomId);
+      const fragments = objectOverlayFragments.get(mark.id);
+      return atomIndex >= 0 && fragments?.length ? [{ markId: mark.id, atomIndex, fragments }] : [];
+    });
+  }, [activePage, objectOverlayFragments, spinObjectId, activeSpin3dState?.atoms]);
+  const spinCarriedMarkIds = useMemo(() => spinCarriedMarks.length > 0
+    ? new Set(spinCarriedMarks.map(mark => mark.markId)) : undefined, [spinCarriedMarks]);
 
   // The browser build has no native OS menu, so it renders the shared app-menu model in-viewport.
   // On the Tauri desktop build the native menu owns this, so the in-window bar stays hidden.
@@ -23677,6 +23695,7 @@ export function MainWindow({
                   objectOverlayFragments={objectOverlayFragments}
                   objectTransformPreview={objectTransformPreview}
                   spinningObjectId={activeSpin3dState?.objectId}
+                  spinCarriedMarkIds={spinCarriedMarkIds}
                   editingTextObjectId={activeTextEditObjectId}
                   editingTableCell={tableCellEdit && !("kind" in tableCellEdit) ? tableCellEdit : undefined}
                 />
@@ -23980,6 +23999,7 @@ export function MainWindow({
                   return (
                     <SpinOverlay
                       state={activeSpin3dState}
+                      carriedMarks={spinCarriedMarks}
                       pageWidth={activePage.width}
                       pageHeight={activePage.height}
                       drawingStyle={spinStyle}
@@ -26764,8 +26784,17 @@ function Spin3dGeneratingCue({ box, atomCount, pageWidth, pageHeight }: {
  * drag — so it needs no changes to the existing page/object pointer handlers. It
  * never mutates the document; the flatten-on-release commit is Phase 5.
  */
+interface SpinCarriedMark {
+  markId: string;
+  /** Index of the mark's atom in `Spin3dState.atoms` (and so in the projection). */
+  atomIndex: number;
+  /** The mark's page paint, drawn where it stands now; the overlay translates it with its atom. */
+  fragments: readonly PageSvgElementFragment[];
+}
+
 function SpinOverlay({
   state,
+  carriedMarks = [],
   pageWidth,
   pageHeight,
   drawingStyle,
@@ -26775,6 +26804,8 @@ function SpinOverlay({
   onPointerCancel
 }: {
   state: Spin3dState;
+  /** Charge/radical marks that follow their atoms through the spin. */
+  carriedMarks?: readonly SpinCarriedMark[];
   pageWidth: number;
   pageHeight: number;
   /** The molecule's own 2D drawing style — the overlay renders with the SAME colors,
@@ -26913,6 +26944,21 @@ function SpinOverlay({
           ))}
         </g>
       ))}
+      {/* Each mark keeps the offset from its atom that flatten commits (the ScreenPlacement
+          contract): translated by its atom's projected minus drawn position. */}
+      {carriedMarks.map(({ markId, atomIndex, fragments }) => {
+        const projected = projectedByIndex.get(atomIndex);
+        const source = state.atoms[atomIndex];
+        if (!projected || !source) return null;
+        return (
+          <g key={`mark-${markId}`} data-spin3d-electron-mark={markId}
+            data-spin3d-mark-offset={`${projected.sx - source.x} ${projected.sy - source.y}`}
+            transform={`translate(${projected.sx - source.x} ${projected.sy - source.y})`}
+            style={{ pointerEvents: "none" }}>
+            {fragments.map(renderStaticPageSvgFragment)}
+          </g>
+        );
+      })}
       <text
         x={pageWidth / 2}
         y={24}
@@ -29203,6 +29249,7 @@ function PageSvgSurfaceContent({
   objectOverlayFragments,
   objectTransformPreview,
   spinningObjectId,
+  spinCarriedMarkIds,
   editingTextObjectId,
   editingTableCell,
   ...handlers
@@ -29218,6 +29265,8 @@ function PageSvgSurfaceContent({
   objectTransformPreview?: ObjectTransformPreviewState;
   /** The id of the molecule being spun in 3D; its drawn structure fades to a faint ghost. */
   spinningObjectId?: string;
+  /** Marks the Spin 3D overlay paints at their spun atoms; hidden here so they are not drawn twice. */
+  spinCarriedMarkIds?: ReadonlySet<string>;
   /** The SVG editing preview owns this text's paint until its edit ends. */
   editingTextObjectId?: string;
   editingTableCell?: ActiveTableCell;
@@ -29281,9 +29330,9 @@ function PageSvgSurfaceContent({
                   data-object-type={object.type}
                   data-layer-index={Number(fragments[0]!.attrs["data-layer-index"])}
                   opacity={object.id === spinningObjectId ? 0.1 : undefined}
-                  visibility={editingText ? "hidden" : undefined}
+                  visibility={editingText || spinCarriedMarkIds?.has(object.id) ? "hidden" : undefined}
                   transform={preview ? objectTransformPreviewSvgTransform(preview) : undefined}
-                  style={{ pointerEvents: object.id === spinningObjectId || editingText ? "none" : "auto" }}
+                  style={{ pointerEvents: object.id === spinningObjectId || editingText || spinCarriedMarkIds?.has(object.id) ? "none" : "auto" }}
                   onPointerDown={event => handlers.onPointerDown(object.id, event)}
                   onPointerMove={event => handlers.onPointerMove(object.id, event)}
                   onPointerUp={event => handlers.onPointerUp(object.id, event)}

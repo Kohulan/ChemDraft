@@ -9,11 +9,12 @@ import { applyPatch, applyPatches, type ChemDraftDocument, type ElectronMarkObje
 import { exportDocumentToSvg } from "@chemdraft/export-engine";
 import { atomDisplayLabel, lonePairPlacementPlanForAtom, moleculeLayoutLabelBoxes, transformPointForObject } from "@chemdraft/layout-engine";
 import { createNativeTextObject, documentDrawingDefaults, nativeAtomBondOrderUsage, nativeImplicitHydrogenCount,
-  phase4Timestamp, stereoPerceptionMolfile } from "@chemdraft/document-workflow-core";
+  normalizeNativeMoleculeGeometry, phase4Timestamp, stereoPerceptionMolfile } from "@chemdraft/document-workflow-core";
 import { ensureRdkit, resetRdkitForTesting, setRdkitModuleLoader } from "../../../packages/rdkit-adapter/src/conformer";
 import { inspectStructureInWorker } from "./depiction2d/identityInspect";
 import { MainWindow } from "./MainWindow";
 import * as workflow from "./documentWorkflow";
+import { resolveElectronMarksAfterMoleculePartMove } from "./electronMarkDrop";
 import { DOM_COMMAND_EVENT } from "./window-manager";
 import { saveDirectElectronMarkEditing } from "./electronMarkEditingSettings";
 import { ammoniumElectronMarkDropFixture, distantAttachedElectronMarkFixture, dropMark, dropMolecule,
@@ -904,10 +905,14 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
     await exactUndoRedo(before, after, operation === "part drag" ? "Move" : "Rotate selection");
   });
 
-  it.each(["point", "bond", "object"] as const)("preserves the %s anchor when only a rotated carbon's raw coordinates reach the mark", async kind => {
+  it.each(["point", "bond", "object"] as const)("preserves the %s anchor when only a rotated carbon's raw coordinates reach the mark", kind => {
+    // A part drag now moves the drawn atom to the pointer (CodeRabbit #422 item I), so no drop leaves
+    // the raw coordinates on the mark while the drawing misses it. That legacy geometry is set
+    // directly here, before and after, and run through the resolver and commit normalization the
+    // part-drag commit uses.
     const { document, saturatedCarbon } = electronMarkDropFixture();
     const molecule = dropMolecule(document);
-    // Start on the rotation pivot so the raw and drawn positions agree at the press.
+    // Start on the rotation pivot so the raw and drawn positions agree at the start.
     const start = { x: molecule.x + molecule.width / 2, y: saturatedCarbon.y };
     const center = { x: start.x - 100, y: start.y + 100 };
     const drawing = applyPatch(document, { op: "updateObject", objectId: molecule.id, changes: {
@@ -916,22 +921,22 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
     const anchor: ElectronMarkObject["anchor"] = kind === "point"
       ? { kind, point: center }
       : { kind, objectId: molecule.id, ...(kind === "bond" ? { bondId: molecule.bonds[0].id } : {}) };
-    await mount(rotatedMoleculeWithCharge(drawing, center, anchor));
-    const { before } = await dragAtom(molecule.id, start, center);
+    const before = rotatedMoleculeWithCharge(drawing, center, anchor);
     expect(dropMark(before).anchor).toEqual(anchor);
-    const after = snapshot();
-    const moved = dropMolecule(after);
-    const carbon = moved.atoms.find(atom => atom.id === saturatedCarbon.id)!;
+    const rotated = dropMolecule(before);
+    const geometry = normalizeNativeMoleculeGeometry({ ...rotated,
+      atoms: rotated.atoms.map(atom => atom.id === saturatedCarbon.id ? { ...atom, ...center } : atom) });
+    const moved = applyPatch(before, { op: "updateObject", objectId: rotated.id, changes: {
+      x: geometry.x, y: geometry.y, width: geometry.width, height: geometry.height, atoms: geometry.atoms } },
+    { now: phase4Timestamp });
+    const after = workflow.normalizeCommittedDocument(resolveElectronMarksAfterMoleculePartMove(before, moved).document);
+    const carbon = dropMolecule(after).atoms.find(atom => atom.id === saturatedCarbon.id)!;
     expect(Math.hypot(carbon.x - center.x, carbon.y - center.y)).toBeLessThan(1);
-    const drawn = transformPointForObject(moved, carbon);
+    const drawn = transformPointForObject(dropMolecule(after), carbon);
     expect(Math.hypot(drawn.x - center.x, drawn.y - center.y)).toBeGreaterThan(26);
     expect(dropMark(after).anchor).toEqual(anchor);
     expect(carbon.formalCharge).toBe(0);
-    await command("edit.undo");
-    expect(snapshot()).toEqual(before);
-    await command("edit.redo");
-    expect(snapshot()).toEqual(after);
-    const saved = workflow.createNativeSavePayload(snapshot());
+    const saved = workflow.createNativeSavePayload(after);
     const reopened = workflow.openNativeDocument(saved.contents).document!;
     expect(dropMark(reopened).anchor).toEqual(anchor);
     expect(dropMark(workflow.normalizeCommittedDocument(reopened)).anchor).toEqual(anchor);

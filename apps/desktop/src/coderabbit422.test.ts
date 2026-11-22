@@ -5,13 +5,14 @@ import { describe, expect, it } from "vitest";
 import { applyPatch, applyPatches, type ChemDraftDocument, type ElectronMarkObject, type MoleculeAtom,
   type MoleculeObject } from "@chemdraft/chem-core";
 import { testMoleculeFromSmiles } from "@chemdraft/layout-engine/testing";
-import { transformPointForObject } from "@chemdraft/layout-engine";
+import { moleculeLayoutLabelBoxes, transformPointForObject } from "@chemdraft/layout-engine";
 import { nativeSingleBondGraphMetadata, nativeSingleBondGraphSmiles, phase4Timestamp } from "@chemdraft/document-workflow-core";
 import { moleculeToMolfileV3000 } from "@chemdraft/chem-core";
 import { commitChemistryRefusals, moleculeAtomChemistryChanges, policyChemistryRefusals, preexistingMoleculeChemistryChanges,
   selectionTransformChemistry } from "./commitChemistryGuard";
 import * as workflow from "./documentWorkflow";
 import { resolveElectronMarksAfterMoleculePartMove, resolveElectronMarksInSelectionTransform } from "./electronMarkDrop";
+import { nativeStylePresetPatchForSelection } from "./nativeStylePresetCommand";
 import { ammoniumElectronMarkDropFixture, dropMark, dropMolecule, electronMarkDropFixture } from "./testSupport/electronMarkDropFixture";
 
 const markAtoms = workflow.committedElectronMarkAtoms;
@@ -359,7 +360,8 @@ describe("K: legacy-anchored marks on a rotated molecule", () => {
       anchor: { kind: "object", objectId: base.id }, atomAssociation: undefined,
       x: plus.x - mark.width / 2, y: plus.y - mark.height / 2 } }, { now: phase4Timestamp });
     expect(workflow.committedElectronMarkAssignments(drawing.pages[0]).anchorByMarkId.get(mark.id)).toEqual({ objectId: base.id, atomId: "n" });
-    const moved = workflow.moveNativeMoleculeParts(drawing, { objectId: base.id, kind: "atom", atomId: "n" }, { x: 0.9 * r, y: 0 });
+    // The move is 0.9 r along raw +x, in the molecule's own frame (the part-drag snap's frame).
+    const moved = workflow.moveNativeMoleculeParts(drawing, { objectId: base.id, kind: "atom", atomId: "n" }, { x: 0.9 * r, y: 0 }, "molecule");
     const drawn = rendered(moved, "n");
     expect(Math.hypot(drawn.x - plus.x, drawn.y - plus.y)).toBeLessThan(2);
     const result = resolveElectronMarksAfterMoleculePartMove(drawing, moved);
@@ -385,5 +387,58 @@ describe("K: legacy-anchored marks on a rotated molecule", () => {
     expect(atomOf(drawing, molecule.id, nitrogen.id)).toMatchObject({ formalCharge: 1, markCharge: 1 });
     expect(workflow.committedElectronMarkAssignments(drawing.pages[0]).anchorByMarkId.get(legacy.id)).toBeUndefined();
     expect(atomOf(normalize(drawing), molecule.id, nitrogen.id).formalCharge).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// O (hands-on follow-up): Structure > Drawing style with shorter bonds scaled the + on N into N's
+// label and bond. The mark keeps its direction from N and sits clear of N's label box.
+// ---------------------------------------------------------------------------------------------
+describe("O: a style that shortens the bonds keeps a + clear of its atom's label", () => {
+  type Box = { x: number; y: number; width: number; height: number };
+  const overlaps = (a: Box, b: Box) => Math.min(a.x + a.width, b.x + b.width) > Math.max(a.x, b.x)
+    && Math.min(a.y + a.height, b.y + b.height) > Math.max(a.y, b.y);
+  const labelOf = (molecule: MoleculeObject, atomId: string) =>
+    moleculeLayoutLabelBoxes(molecule).find(box => molecule.atoms[box.atom].id === atomId)!;
+  const bond = (m: MoleculeObject) => Math.hypot(m.atoms[0].x - m.atoms[1].x, m.atoms[0].y - m.atoms[1].y);
+
+  it.each(["chemdraft.acs1996", "chemdraft.rscjournal"])("O: %s leaves a close + on N outside N's label box, in its old direction", presetId => {
+    // The molecule drawn with long (33 px) bonds; its + set close by N, up and to the right, clear of
+    // N's label. Both styles shorten the bonds to 22 px or less and scale the + offset with them.
+    const fixture = electronMarkDropFixture();
+    const { nitrogen } = fixture;
+    const plain = applyPatches(fixture.document, [{ op: "removeObject", objectId: dropMark(fixture.document).id }],
+      { now: phase4Timestamp });
+    const big = workflow.resizeNativeMoleculeObject(plain, dropMolecule(plain).id, { x: 1.5, y: 1.5 });
+    const bigN = dropMolecule(big).atoms.find(atom => atom.id === nitrogen.id)!;
+    const charged = normalize(workflow.applyChargeToolAtNativeAtom(big, 1,
+      { kind: "atom", objectId: dropMolecule(big).id, atomId: bigN.id, distanceToPointer: 0 }));
+    const charge = dropMark(charged);
+    const document = normalize(workflow.moveDocumentObject(charged, charge.id,
+      { x: bigN.x + 16 - charge.width / 2, y: bigN.y - 16 - charge.height / 2 }));
+    const molecule = dropMolecule(document), mark = dropMark(document);
+    const nBefore = molecule.atoms.find(atom => atom.id === nitrogen.id)!;
+    expect(nBefore).toMatchObject({ formalCharge: 1, markCharge: 1 });
+    expect(markAtoms(document.pages[0], mark).every(owner => owner.atomId === nitrogen.id)).toBe(true);
+    expect(overlaps(mark, labelOf(molecule, nitrogen.id)), "precondition: + clear of N's label before the style").toBe(false);
+
+    const selected = workflow.selectDocumentObjects(document, document.pages[0].id, [molecule.id, mark.id]);
+    const warnings: Parameters<typeof nativeStylePresetPatchForSelection>[3] = [];
+    const styled = normalize(applyPatches(selected, nativeStylePresetPatchForSelection(selected, presetId, [], warnings).patches));
+    expect(warnings).toEqual([]);
+    const after = dropMolecule(styled), moved = dropMark(styled);
+    expect(bond(after)).toBeLessThan(bond(molecule) - 1);
+    const n = after.atoms.find(atom => atom.id === nitrogen.id)!;
+    const label = labelOf(after, nitrogen.id);
+    expect(overlaps(moved, label), `+ frame ${JSON.stringify(moved)} overlaps N label ${JSON.stringify(label)}`).toBe(false);
+    const direction = (from: { x: number; y: number }, m: ElectronMarkObject) =>
+      Math.atan2(m.y + m.height / 2 - from.y, m.x + m.width / 2 - from.x);
+    expect(Math.abs(direction(n, moved) - direction(nBefore, mark))).toBeLessThan(1e-6);
+    // Chemistry unchanged: N keeps its + and the mark still belongs to N.
+    expect({ formalCharge: n.formalCharge, markCharge: n.markCharge })
+      .toEqual({ formalCharge: nBefore.formalCharge, markCharge: nBefore.markCharge });
+    const owners = markAtoms(styled.pages[0], moved);
+    expect(owners.length).toBeGreaterThan(0);
+    expect(owners.every(owner => owner.objectId === molecule.id && owner.atomId === nitrogen.id)).toBe(true);
   });
 });
