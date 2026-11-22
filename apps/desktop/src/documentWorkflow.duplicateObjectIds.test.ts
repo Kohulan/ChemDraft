@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Molecule } from "openchemlib";
 import { createEmptyDocument, parseDocument, serializeDocument, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
-import { createNativeMolfileMolecule, createNativeSavePayload, openNativeDocument } from "./documentWorkflow";
+import { createNativeMolfileMolecule, createNativeSavePayload, openNativeDocument, openedDocumentRenumberedObjectIds } from "./documentWorkflow";
 
 /**
  * A native .chemdraft file whose page 1 holds two objects with one id (the schema has no uniqueness
@@ -9,7 +9,7 @@ import { createNativeMolfileMolecule, createNativeSavePayload, openNativeDocumen
  * as an open warning, and never changes chemistry (AGENTS.md section 7).
  */
 const canonical = (molecule: MoleculeObject) => Molecule.fromMolfile(molecule.structure).toIsomericSmiles();
-const message = "This file had 2 objects sharing an id on page 1; ChemDraft gave the duplicates new ids.";
+const message = "This file had 2 objects sharing an id on page 1; ChemDraft gave the duplicates new ids. Save to keep the fix.";
 
 function documentWith(objects: (base: ChemDraftDocument) => MoleculeObject[]): ChemDraftDocument {
   const empty = createEmptyDocument();
@@ -52,6 +52,29 @@ describe("opening a native file with two same-page objects sharing an id", () =>
     expect(canonical(objects[0]!)).toBe(canonical(original[0]!));
     objects.forEach((object, index) => expect(chemistryOf(object)).toEqual(chemistryOf(original[index]!)));
     expect(opened.document!.selection.objectIds).toEqual(["X"]);
+  });
+
+  it("flags the renumbering open as differing from its file, from the structured warning code", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const json = serializeDocument(duplicated());
+    const opened = openNativeDocument(json);
+    expect(openedDocumentRenumberedObjectIds(opened, opened.document!)).toBe(true);
+    const normal = openNativeDocument(serializeDocument(documentWith(base => [alanine(base, "X", 120), alanine(base, "Y", 320)])));
+    expect(openedDocumentRenumberedObjectIds(normal, normal.document!)).toBe(false);
+    // Saving writes the new ids, so the saved file reopens clean, through native JSON and the envelope.
+    for (const saved of [serializeDocument(opened.document!), createNativeSavePayload(opened.document!).contents]) {
+      const reopened = openNativeDocument(saved);
+      expect(reopened.warnings.some(warning => warning.code === "NATIVE_DUPLICATE_OBJECT_IDS_RENUMBERED")).toBe(false);
+      expect(openedDocumentRenumberedObjectIds(reopened, reopened.document!)).toBe(false);
+      expect(reopened.document!.pages[0]!.objects.map(object => object.id)).toEqual(["X", "X_002"]);
+    }
+    // A visible-layer conflict resolved to the edited visible CDXML installs a document the reader
+    // never renumbered; restoring the embedded document does count.
+    const embedded = opened.document!;
+    const visible = { ...embedded };
+    const conflict = { ...opened, document: undefined, conflict: { kind: "visible-layer-modified" as const, embeddedDocument: embedded, visibleDocument: visible } };
+    expect(openedDocumentRenumberedObjectIds(conflict, visible)).toBe(false);
+    expect(openedDocumentRenumberedObjectIds(conflict, embedded)).toBe(true);
   });
 
   it("opens a normal file unchanged: the same document model, and no renumbering warning", () => {

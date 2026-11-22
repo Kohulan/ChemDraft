@@ -47,7 +47,7 @@ describe("native open renumbers duplicate object ids on the same page", () => {
     expect(read.warnings).toEqual([{
       code: "NATIVE_DUPLICATE_OBJECT_IDS_RENUMBERED", path: ["pages"],
       originalValue: [{ pageIndex: 0, objectIndex: 1, from: "X", to: "X_003" }],
-      message: "This file had 2 objects sharing an id on page 1; ChemDraft gave the duplicates new ids."
+      message: "This file had 2 objects sharing an id on page 1; ChemDraft gave the duplicates new ids. Save to keep the fix."
     }]);
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0]!.join(" ")).toMatch(/renumbered duplicate same-page object ids.*page 1 object 1: X -> X_003/);
@@ -73,7 +73,7 @@ describe("native open renumbers duplicate object ids on the same page", () => {
     // Ids are page-scoped: page 2's X is a different, legitimate object.
     expect(read.document.pages[1]!.objects.map(object => object.id)).toEqual(["X"]);
     expect(read.warnings.map(warning => warning.message))
-      .toEqual(["This file had 2 objects sharing an id on page 1; ChemDraft gave the duplicates new ids."]);
+      .toEqual(["This file had 2 objects sharing an id on page 1; ChemDraft gave the duplicates new ids. Save to keep the fix."]);
   });
 
   it("names every page and counts every object sharing an id", () => {
@@ -84,7 +84,7 @@ describe("native open renumbers duplicate object ids on the same page", () => {
     expect(new Set(ids).size).toBe(ids.length);
     expect(read.document.pages[0]!.objects.map(object => object.id)).toEqual(["X", "X_004", "X_005", "t", "t_006"]);
     expect(read.warnings.map(warning => warning.message)).toEqual([
-      "This file had 5 objects sharing ids on page 1 and 2 objects sharing an id on page 2; ChemDraft gave the duplicates new ids."
+      "This file had 5 objects sharing ids on page 1 and 2 objects sharing an id on page 2; ChemDraft gave the duplicates new ids. Save to keep the fix."
     ]);
   });
 

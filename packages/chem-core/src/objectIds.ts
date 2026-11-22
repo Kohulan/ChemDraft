@@ -115,5 +115,5 @@ export function duplicateObjectIdsMessage(renumbered: readonly RenumberedObjectI
     return `${count} objects sharing ${ids.size === 1 ? "an id" : "ids"} on page ${pageIndex + 1}`;
   });
   const listed = parts.length <= 1 ? parts.join("") : `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}`;
-  return `This file had ${listed}; ChemDraft gave the duplicates new ids.`;
+  return `This file had ${listed}; ChemDraft gave the duplicates new ids. Save to keep the fix.`;
 }
