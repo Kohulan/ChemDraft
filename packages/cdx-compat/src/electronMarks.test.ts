@@ -95,6 +95,79 @@ describe("electron-mark CDXML appearance warnings", () => {
       atomId: rereadMolecule.atoms.find(atom => atom.element === "O")!.id });
   });
 
+  // Kimi run-20261122-093358-18979d: an abbreviation alias id is an occurrence of that id too. When it
+  // collides with another node's id (here a nitrogen), the reference names two atoms and must not
+  // resolve to the alias target, whether the colliding node sits in the same fragment or another one.
+  const lonePairOn = (reference: string) => '<graphic id="3" GraphicType="Symbol" SymbolType="LonePair" BoundingBox="92 72 89 68">' +
+    `<represent object="${reference}" attribute="Radical"/></graphic>`;
+  const ome = '<n id="10" NodeType="Fragment" p="70 64"><fragment id="11"><n id="12" Element="8" p="70 64"/>' +
+    '<n id="13" Element="6" p="92 64"/><n id="14" NodeType="ExternalConnectionPoint" p="48 64"/>' +
+    '<b id="15" B="14" E="12" Order="1"/><b id="16" B="12" E="13" Order="1"/></fragment>' +
+    '<t p="66 68"><s font="3" size="10" face="96">OMe</s></t></n>';
+  const expectUnresolved = (source: string) => {
+    const read = openChemDraftPayload(source);
+    expect(read.warnings.filter(w => w.code === "cdxml.lone_pair_anchor_unresolved")).toHaveLength(1);
+    const pair = read.document!.pages[0].objects.find(o => o.type === "electron-mark") as ElectronMarkObject;
+    expect(pair.anchor).toMatchObject({ kind: "point" });
+  };
+  it.each([
+    ["the same fragment", '<fragment id="1"><n id="2" Element="6" p="48 64"/>' + ome +
+      '<b id="5" B="2" E="12" Order="1"/><n id="10" Element="7" p="20 120"/></fragment>'],
+    ["another fragment, after it", '<fragment id="1"><n id="2" Element="6" p="48 64"/>' + ome +
+      '<b id="5" B="2" E="12" Order="1"/></fragment><fragment id="30"><n id="10" Element="7" p="20 120"/></fragment>'],
+    ["another fragment, before it", '<fragment id="30"><n id="10" Element="7" p="20 120"/></fragment>' +
+      '<fragment id="1"><n id="2" Element="6" p="48 64"/>' + ome + '<b id="5" B="2" E="12" Order="1"/></fragment>']
+  ])("does not attach a lone pair through an abbreviation alias that collides with a node in %s", (_where, fragments) => {
+    expectUnresolved(`<CDXML><page>${lonePairOn("10")}${fragments}</page></CDXML>`);
+  });
+
+  // Kimi run-20261122-093358-18979d: ambiguity is decided over the whole page, so an id duplicated in
+  // a later (or earlier) fragment never leaves another fragment's atom as the resolved anchor.
+  it.each([
+    ["the duplicate fragment comes later", '<fragment id="1"><n id="21" Element="8" p="70 64"/></fragment>' +
+      '<fragment id="30"><n id="21" Element="6" p="20 120"/><n id="21" Element="7" p="40 120"/></fragment>'],
+    ["the duplicate fragment comes first", '<fragment id="30"><n id="21" Element="6" p="20 120"/><n id="21" Element="7" p="40 120"/></fragment>' +
+      '<fragment id="1"><n id="21" Element="8" p="70 64"/></fragment>'],
+    ["each fragment holds the id once", '<fragment id="1"><n id="21" Element="8" p="70 64"/></fragment>' +
+      '<fragment id="30"><n id="21" Element="7" p="20 120"/></fragment>']
+  ])("does not attach a lone pair to a source id duplicated across fragments when %s", (_order, fragments) => {
+    expectUnresolved(`<CDXML><page>${lonePairOn("21")}${fragments}</page></CDXML>`);
+  });
+
+  // A nested abbreviation (NH-OMe holding OMe) has two connection points, each aliased by its node id.
+  // A lone pair on each attachment atom resolves through either the atom id or the alias, and survives
+  // a plain Save As re-import.
+  it.each([["12", "22"], ["10", "20"]])("attaches lone pairs referencing %s and %s through a nested abbreviation", (onNitrogen, onOxygen) => {
+    const pair = (id: string, reference: string, x: number) => `<graphic id="${id}" GraphicType="Symbol" SymbolType="LonePair" ` +
+      `BoundingBox="${x + 3} 72 ${x} 68"><represent object="${reference}" attribute="Radical"/></graphic>`;
+    const source = '<CDXML><page>' + pair("3", onNitrogen, 70) + pair("4", onOxygen, 92) +
+      '<fragment id="1"><n id="2" Element="6" p="48 64"/>' +
+      '<n id="10" NodeType="Fragment" p="70 64"><fragment id="11"><n id="12" Element="7" p="70 64"/>' +
+      '<n id="20" NodeType="Fragment" p="92 64"><fragment id="21"><n id="22" Element="8" p="92 64"/>' +
+      '<n id="23" Element="6" p="114 64"/><n id="24" NodeType="ExternalConnectionPoint" p="70 64"/>' +
+      '<b id="25" B="24" E="22" Order="1"/><b id="26" B="22" E="23" Order="1"/></fragment>' +
+      '<t p="88 68"><s font="3" size="10" face="96">OMe</s></t></n>' +
+      '<n id="14" NodeType="ExternalConnectionPoint" p="48 64"/>' +
+      '<b id="15" B="14" E="12" Order="1"/><b id="16" B="12" E="20" Order="1"/></fragment>' +
+      '<t p="66 68"><s font="3" size="10" face="96">NHOMe</s></t></n><b id="5" B="2" E="10" Order="1"/></fragment></page></CDXML>';
+    const expectAttached = (read: ReturnType<typeof openChemDraftPayload>) => {
+      expect(read.warnings.filter(w => w.code === "cdxml.lone_pair_anchor_unresolved")).toEqual([]);
+      const objects = read.document!.pages[0].objects;
+      const molecule = objects.find(o => o.type === "molecule") as MoleculeObject;
+      const marks = objects.filter((o): o is ElectronMarkObject => o.type === "electron-mark");
+      expect(marks).toHaveLength(2);
+      const atomOf = (element: string) => molecule.atoms.filter(atom => atom.element === element);
+      expect(atomOf("N")).toHaveLength(1);
+      expect(atomOf("O")).toHaveLength(1);
+      const byX = [...marks].sort((a, b) => a.x - b.x);
+      expect(byX[0].anchor).toMatchObject({ kind: "atom", objectId: molecule.id, atomId: atomOf("N")[0].id });
+      expect(byX[1].anchor).toMatchObject({ kind: "atom", objectId: molecule.id, atomId: atomOf("O")[0].id });
+    };
+    const read = openChemDraftPayload(source);
+    expectAttached(read);
+    expectAttached(openChemDraftPayload(exportDocumentToCdxml(read.document!, { embedNativePayload: false }).contents));
+  });
+
   it.each([false, true])("warns when moving an imported doublet atom leaves its dot behind (legacy=%s)", legacy => {
     const imported = openChemDraftPayload('<CDXML><page><fragment id="1"><n id="2" p="100 100" Element="6" Radical="Doublet"/></fragment></page></CDXML>').document!;
     const molecule = imported.pages[0].objects.find((object): object is MoleculeObject => object.type === "molecule")!;

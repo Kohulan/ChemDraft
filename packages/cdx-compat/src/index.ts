@@ -370,6 +370,8 @@ interface ImportPageContext {
   preserveReactionIds: boolean;
   /** Every node id a lone pair may reference, abbreviation aliases included; undefined when ambiguous. */
   atomAnchorsBySourceId: Map<string, Anchor | undefined>;
+  /** How many <n> elements on the whole page carry each id (nested and skipped fragments included). */
+  nodeCountBySourceId: Map<string, number>;
 }
 
 type DoubleBondSide = NonNullable<MoleculeBond["display"]>["doubleBondSide"];
@@ -3699,7 +3701,8 @@ function importPageObjects(
     fonts,
     curveLineDefaults: { ...curveLineDefaults, ...cdxmlCurveLineDefaults(pageElement.attributes) },
     preserveReactionIds: findElements(pageElement.children, "scheme").length > 0 || findElements(pageElement.children, "step").length > 0,
-    atomAnchorsBySourceId: new Map()
+    atomAnchorsBySourceId: new Map(),
+    nodeCountBySourceId: new Map()
   };
   const schemes: XmlElementView[] = [];
   // A step need not have a scheme wrapper. Collect these even inside containers whose
@@ -3717,6 +3720,14 @@ function importPageObjects(
   const supersededBySourceId = new Map<string, string>();
   context.preserveReactionIds ||= findElements(pageElement.children, "bracketedgroup").length > 0 ||
     findElements(pageElement.children, "represent").some(ref => ref.attributes.attribute === "Radical");
+  if (context.preserveReactionIds) {
+    // Lone-pair references are decided over the whole page before any of them resolves: an id
+    // carried by two nodes anywhere (another fragment, a skipped one, an abbreviation node) is ambiguous.
+    for (const node of findElements(pageElement.children, "n")) {
+      const sourceId = node.attributes.id;
+      if (sourceId !== undefined) context.nodeCountBySourceId.set(sourceId, (context.nodeCountBySourceId.get(sourceId) ?? 0) + 1);
+    }
+  }
   const stepReferencedIds = new Set(findElements(pageElement.children, "step").flatMap(step =>
     reactionListAttributes.flatMap(attribute => splitCdxmlIdList(step.attributes[attribute]))));
   let objectIndex = 1;
@@ -4618,11 +4629,29 @@ function importFragment(
   }
   const uniqueSourceIds = [...atomIdByCdxmlId].filter(([sourceId]) => (nodeCountBySourceId.get(sourceId) ?? 0) < 2);
   if (context.preserveReactionIds) {
-    // Lone pairs resolve through every id, so an expanded abbreviation node and its nested
-    // attachment atom both name that atom; the reversed map below keeps only one of them.
-    for (const [sourceId, atomId] of uniqueSourceIds) {
-      context.atomAnchorsBySourceId.set(sourceId, context.atomAnchorsBySourceId.has(sourceId)
+    // Lone pairs resolve through every id, so an expanded abbreviation node (an alias) and its nested
+    // attachment atom both name that atom; the reversed map below keeps only one of them. Every
+    // occurrence is recorded, and an id resolves only when exactly one <n> on the page carries it and
+    // every occurrence names the same atom; otherwise it stays ambiguous (undefined) for good.
+    const pageUnique = (sourceId: string) => context.nodeCountBySourceId.get(sourceId) === 1;
+    const record = (sourceId: string, atomId: string | undefined) => {
+      const anchors = context.atomAnchorsBySourceId;
+      const existing = anchors.get(sourceId);
+      const sameAtom = existing?.kind === "atom" && existing.objectId === objectId && existing.atomId === atomId;
+      anchors.set(sourceId, atomId === undefined || !pageUnique(sourceId) || (anchors.has(sourceId) && !sameAtom)
         ? undefined : { kind: "atom", objectId, atomId });
+    };
+    atomElements.forEach((atomElement, index) => {
+      if (atomElement.attributes.id !== undefined) record(atomElement.attributes.id, atoms[index].id);
+    });
+    for (const item of expansion.abbreviations) {
+      const aliasId = item.source.attributes.id;
+      if (!item.expanded || aliasId === undefined || item.attachmentCdxmlId === undefined) continue;
+      // The alias was resolved through ids inside the abbreviation (nested aliases included); trust it
+      // only when none of them is shared, or it may name a guessed atom.
+      const resolvedUniquely = findElements(item.source.children, "n").every(node =>
+        node.attributes.id === undefined || pageUnique(node.attributes.id));
+      record(aliasId, resolvedUniquely ? atomIdByCdxmlId.get(item.attachmentCdxmlId) : undefined);
     }
   }
 
