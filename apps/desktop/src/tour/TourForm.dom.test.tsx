@@ -130,6 +130,41 @@ describe.each(platforms)("guided tour on %s", platform => {
     expect(container.querySelector("h1")!.textContent).toBe("Add features with plugins");
   });
 
+  it("opens the guide only through the host for modified clicks, middle-clicks and drags", () => {
+    const onAction = vi.fn();
+    act(() => root.render(<TourForm scheme="chemdraft" platform={platform} plugins={allPlugins} onAction={onAction} />));
+    while (container.querySelector("h1")!.textContent !== "Add features with plugins") click("Next");
+    const link = container.querySelector<HTMLAnchorElement>(".guided-tour-url a")!;
+    const location = window.location.href;
+    const guide = { action: "openGuide", url: PLUGIN_AUTHORING_GUIDE_URL };
+    // dispatchEvent returns false when the event's default action was cancelled.
+    const fire = (event: Event) => { let followed = true; act(() => { followed = link.dispatchEvent(event); }); return followed; };
+
+    // Cmd-, Ctrl- and Shift-click are clicks: cancelled, and sent to the host once each.
+    for (const modifier of [{ metaKey: true }, { ctrlKey: true }, { shiftKey: true }]) {
+      onAction.mockClear();
+      expect(fire(new MouseEvent("click", { ...modifier, button: 0, bubbles: true, cancelable: true })), JSON.stringify(modifier)).toBe(false);
+      expect(onAction.mock.calls).toEqual([[guide]]);
+    }
+
+    // A middle-click arrives as auxclick: cancelled, and sent to the host like a click.
+    onAction.mockClear();
+    expect(fire(new MouseEvent("auxclick", { button: 1, bubbles: true, cancelable: true }))).toBe(false);
+    expect(onAction.mock.calls).toEqual([[guide]]);
+    // Any other non-primary button is cancelled and does nothing.
+    onAction.mockClear();
+    expect(fire(new MouseEvent("auxclick", { button: 2, bubbles: true, cancelable: true }))).toBe(false);
+    expect(onAction).not.toHaveBeenCalled();
+
+    // The link cannot be dragged out to another window or dropped back on this one.
+    expect(link.getAttribute("draggable")).toBe("false");
+    expect(fire(new MouseEvent("dragstart", { bubbles: true, cancelable: true }))).toBe(false);
+    expect(onAction).not.toHaveBeenCalled();
+
+    expect(window.location.href).toBe(location);
+    expect(container.querySelector("h1")!.textContent).toBe("Add features with plugins");
+  });
+
   it("names the Preferences menu item exactly as the menu bar labels it", () => {
     const sections = buildAppMenuModel({
       platform, rulersVisible: true, crosshairsVisible: true, canUndo: false, canRedo: false,
@@ -230,9 +265,19 @@ it("keeps the plugin authoring guide address the same in TypeScript and in the n
   expect([...urls]).toEqual([PLUGIN_AUTHORING_GUIDE_URL]);
 });
 
-it("never relays the guide link to the document window", () => {
-  // The native host opens the guide itself; the owner's side of the protocol does not accept it.
-  expect(parseDialogMessage({ ...envelope, type: "action", data: { action: "openGuide", url: PLUGIN_AUTHORING_GUIDE_URL } })).toBeUndefined();
+it("lets the tour window send the guide link to the native host, which checks the exact address", () => {
+  // sendDialogMessage refuses anything this parser rejects, so the link must pass it to reach Rust.
+  // Rust opens only its one allowed address and never relays the action to the document window.
+  expect(parseDialogMessage({ ...envelope, type: "action", data: { action: "openGuide", url: PLUGIN_AUTHORING_GUIDE_URL } })).toBeDefined();
+  for (const data of [
+    { action: "openGuide" },
+    { action: "openGuide", url: 1 },
+    { action: "openGuide", url: "" },
+    { action: "openGuide", url: "x".repeat(2049) },
+    { action: "openGuide", url: PLUGIN_AUTHORING_GUIDE_URL, extra: true }
+  ]) {
+    expect(parseDialogMessage({ ...envelope, type: "action", data }), JSON.stringify(data).slice(0, 80)).toBeUndefined();
+  }
 });
 
 it("rejects invalid tour actions in the TypeScript dialog protocol", () => {

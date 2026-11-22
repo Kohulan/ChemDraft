@@ -26,19 +26,26 @@ vi.mock("../window-manager", async original => ({
   ...await original<typeof import("../window-manager")>(),
   isDesktopRuntime: () => true
 }));
-// The dialog window's side of the native host: messages hop through a macrotask, as over IPC.
-vi.mock("../dialogs/dialogTransport", () => ({
+// The dialog window's side of the native host: messages hop through a macrotask, as over IPC. Sending
+// is the real sendDialogMessage, so a message its protocol check refuses never reaches the host; only
+// the IPC call underneath it, Rust's dialog_send, is stood in for (see dialogSend below).
+vi.mock("../dialogs/dialogTransport", async original => ({
+  ...await original<typeof import("../dialogs/dialogTransport")>(),
   subscribeDialogHost: async (_hostId: string, receive: (message: DialogMessage) => void) => {
     host.toDialog = receive;
     return () => {};
-  },
-  sendDialogMessage: async (_hostId: string, message: DialogMessage) => {
-    host.sent.push(message);
-    // Like Rust's dialog_send: the guide link is opened by the host itself and never relayed to the owner.
-    if (message.type === "action" && message.data.action === "openGuide") return;
-    setTimeout(() => host.toOwner!(message), 0);
   }
 }));
+
+/** Rust's dialog_send: the guide link is opened by the host itself and never relayed to the owner. */
+function dialogSend(command: string, args?: unknown) {
+  if (command !== "dialog_send") return {};
+  const { message } = args as { hostId: string; message: DialogMessage };
+  host.sent.push(message);
+  if (message.type === "action" && message.data.action === "openGuide") return undefined;
+  setTimeout(() => host.toOwner!(message), 0);
+  return undefined;
+}
 
 import { DialogWindow } from "../dialogs/DialogWindow";
 import { DialogCoordinator } from "../dialogs/DialogCoordinator";
@@ -96,7 +103,7 @@ beforeEach(() => {
   vi.stubGlobal("localStorage", new MemoryStorage());
   host.opened = [];
   host.sent = [];
-  host.invoke.mockReset().mockResolvedValue({});
+  host.invoke.mockReset().mockImplementation(async (command: string, args?: unknown) => dialogSend(command, args));
   invokeCommand.mockClear();
 });
 afterEach(() => {
@@ -140,7 +147,7 @@ describe.each([["macos", "MacIntel"], ["windows", "Win32"]] as const)("the nativ
     expect(tour.textContent).toContain(platform === "macos" ? "Choose ChemDraft > Settings… (⌘,)" : "Choose File > Preferences… (Ctrl+,)");
   });
 
-  it("sends the guide link to the native host once per click or Enter, never to the document window", async () => {
+  it("sends the guide link to the native host once per click, Enter or middle-click, never to the document window", async () => {
     const { tour, button } = await openToNameStep(false);
     await act(async () => { button("Back")!.click(); });
     expect(tour.querySelector("h1")!.textContent).toBe("Add features with plugins");
@@ -154,12 +161,18 @@ describe.each([["macos", "MacIntel"], ["windows", "Win32"]] as const)("the nativ
       link.focus();
       if (link.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }))) link.click();
     });
+    // A middle-click arrives as auxclick and goes the same way.
+    await act(async () => { link.dispatchEvent(new MouseEvent("auxclick", { button: 1, bubbles: true, cancelable: true })); });
     await settle();
+    // Each passed the real protocol check in sendDialogMessage and reached the host's dialog_send.
     expect(host.sent.map(message => [message.dialogKind, message.type, message.data])).toEqual([
+      ["guidedTour", "action", { action: "openGuide", url: PLUGIN_AUTHORING_GUIDE_URL }],
       ["guidedTour", "action", { action: "openGuide", url: PLUGIN_AUTHORING_GUIDE_URL }],
       ["guidedTour", "action", { action: "openGuide", url: PLUGIN_AUTHORING_GUIDE_URL }]
     ]);
-    expect(new Set(host.sent.map(message => message.requestId)).size).toBe(2);
+    expect(host.invoke.mock.calls.filter(([command, args]) => command === "dialog_send" &&
+      (args as { message: DialogMessage }).message.data.action === "openGuide")).toHaveLength(3);
+    expect(new Set(host.sent.map(message => message.requestId)).size).toBe(3);
     expect(window.location.href).toBe(location);
     expect(invokeCommand).not.toHaveBeenCalled();
     // Opening the guide is not a pending tour action: nothing is busy and the tour carries on.

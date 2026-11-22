@@ -34,8 +34,14 @@ function TourStepContent({ step, index, count, scheme, platform, busy, heading, 
       <p>{step.text}</p>
       {url ? <p className="guided-tour-url">
         {/* The link never navigates this window: the host opens the address in the system browser.
-            Enter on the focused link fires this click, as it does for any link. */}
-        <a href={url} onClick={event => { event.preventDefault(); send?.({ action: "openGuide", url }); }}>{url}</a>
+            Enter on the focused link fires this click, as it does for any link, and a Cmd/Ctrl- or
+            Shift-click is a click too. A middle-click arrives as auxclick and opens the guide the same
+            way; other buttons do nothing. The link cannot be dragged out or dropped elsewhere. The
+            native window also refuses any navigation or new window (dialog_windows.rs). */}
+        <a href={url} draggable={false}
+          onClick={event => { event.preventDefault(); send?.({ action: "openGuide", url }); }}
+          onAuxClick={event => { event.preventDefault(); if (event.button === 1) send?.({ action: "openGuide", url }); }}
+          onDragStart={event => event.preventDefault()}>{url}</a>
       </p> : null}
       {step.shortcuts ? (
         <fieldset disabled={ghost || busy}>

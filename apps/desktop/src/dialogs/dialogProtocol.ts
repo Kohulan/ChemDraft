@@ -206,6 +206,9 @@ export function parseDialogMessage(value: unknown): DialogMessage | undefined {
             d.plugins.every(command => TOUR_PLUGIN_COMMANDS.some(known => known === command))); break;
         case "action": valid = d.action === "cancel" || d.action === "finish" ? keys(d, ["action"])
           : d.action === "chooseShortcuts" ? keys(d, ["action", "scheme"]) && isKeybindingScheme(d.scheme)
+          // The plugins card's link, sent by the tour window to the native host, which opens it only when
+          // `url` is exactly its one allowed address (`open_guided_tour_guide`) and never relays it to the owner.
+          : d.action === "openGuide" ? keys(d, ["action", "url"]) && typeof d.url === "string" && d.url.length > 0 && d.url.length <= 2048
           : d.action === "tryTourCommand" && keys(d, ["action", "command"]) &&
             [TOUR_SAMPLE_COMMAND, TOUR_NAME_COMMAND, TOUR_INSPECTOR_COMMAND, KEYBOARD_PREFERENCES_COMMAND_ID].some(command => d.command === command); break;
         case "request": case "ready": valid = keys(d, []); break;
