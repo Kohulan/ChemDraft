@@ -4610,8 +4610,13 @@ function importFragment(
   });
 
   // A source id shared by two nodes names neither: keep it out so no reference resolves to one.
-  const uniqueSourceIds = [...atomIdByCdxmlId].filter(([sourceId]) =>
-    atomElements.filter(atomElement => atomElement.attributes.id === sourceId).length < 2);
+  // Count once: rescanning every node per id made large fragments quadratic.
+  const nodeCountBySourceId = new Map<string, number>();
+  for (const atomElement of atomElements) {
+    const sourceId = atomElement.attributes.id;
+    if (sourceId !== undefined) nodeCountBySourceId.set(sourceId, (nodeCountBySourceId.get(sourceId) ?? 0) + 1);
+  }
+  const uniqueSourceIds = [...atomIdByCdxmlId].filter(([sourceId]) => (nodeCountBySourceId.get(sourceId) ?? 0) < 2);
   if (context.preserveReactionIds) {
     // Lone pairs resolve through every id, so an expanded abbreviation node and its nested
     // attachment atom both name that atom; the reversed map below keeps only one of them.
