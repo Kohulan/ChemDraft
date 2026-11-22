@@ -509,8 +509,12 @@ function exportCdxml(
       Object.keys(preservedCurveAttributes(object.compatibility?.unknown[key])).length > 0)));
   const reactionIds = new Set<string>(parsedDocument.pages.map(page => page.id));
   for (const page of parsedDocument.pages) {
+    // Object ids are written back only on a page whose source graphics refer to them
+    // (buildVisiblePageChildren); elsewhere objects get new ids. Reserving those unused ids too
+    // made the new ids skip past them, so successive saves alternated between two id sets.
+    const retainsObjectIds = page.objects.some(needsSourceGraphicIds);
     for (const object of page.objects) {
-      if (object.compatibility?.originalId) reactionIds.add(object.compatibility.originalId);
+      if (retainsObjectIds && object.compatibility?.originalId) reactionIds.add(object.compatibility.originalId);
       const source = object.compatibility?.unknown;
       if (typeof source?.cdxmlSchemeId === "string") reactionIds.add(source.cdxmlSchemeId);
       for (const key of ["cdxmlAtomIdsByAtomId", "cdxmlBondIdsByBondId"]) {

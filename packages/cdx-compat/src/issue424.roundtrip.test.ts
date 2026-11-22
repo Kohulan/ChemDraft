@@ -255,6 +255,18 @@ describe("issue #424: lone pairs", () => {
     }
   });
 
+  // Codex (1.2.3): the new ids of a file that keeps lone-pair source ids alternated between two
+  // sets on successive saves (1-4, then 5-8, then 1-4), so only the bytes changed.
+  it("writes the same bytes on every plain save of a file that keeps lone-pair source ids", () => {
+    const plainSave = (document: ChemDraftDocument) => exportDocumentToCdxml(document, { embedNativePayload: false }).contents;
+    const first = plainSave(open(etherWithLonePairs));
+    const second = plainSave(open(first));
+    expect(second).toBe(first);
+    expect(plainSave(open(second))).toBe(second);
+    expect(first.match(/<represent object="12" attribute="Radical"\/>/g)).toHaveLength(2);
+    expect(first).toMatch(/<n id="12" [^>]*Element="8"/);
+  });
+
   it("does not attach a lone pair to an atom that is not the referenced one", () => {
     const opened = openChemDraftPayload(etherWithLonePairs.replaceAll('object="12"', 'object="404"'));
     expect(codes(opened.warnings)).toContain("cdxml.lone_pair_anchor_unresolved");
