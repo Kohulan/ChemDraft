@@ -5,6 +5,9 @@ name: Linux 3D sidecar build
 # the committed binary against the SHA-256 pinned in scripts/engine3d-sidecar-linux.json.
 #
 #   gh workflow run linux-sidecar-build.yml --ref <branch or tag to build>
+#       (works once this file is on the default branch; GitHub dispatches only such files), or
+#   git push origin <commit to build>:refs/heads/ci/linux-sidecar-build
+#       (a push to the branch ci/linux-sidecar-build, and only that branch, runs it).
 #
 # The artifact holds the binary and its .sha256; the job summary prints the SHA-256 and the run id
 # that go into scripts/engine3d-sidecar-linux.json and docs/architecture/dependency-inventory.md.
@@ -12,6 +15,9 @@ name: Linux 3D sidecar build
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - ci/linux-sidecar-build
 
 permissions:
   contents: read

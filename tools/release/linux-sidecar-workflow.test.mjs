@@ -13,7 +13,7 @@ const indexer = (text, file) => (needle) => {
 test("the Linux sidecar workflow builds the pinned sources, checks them, and uploads one binary with its SHA-256", () => {
   const sidecar = read(".github/workflows/linux-sidecar-build.yml");
   const at = indexer(sidecar, "linux-sidecar-build.yml");
-  assert.match(sidecar, /^on:\n  workflow_dispatch:\n\n/m);
+  assert.match(sidecar, /^on:\n  workflow_dispatch:\n  push:\n    branches:\n      - ci\/linux-sidecar-build\n\n/m);
   assert.match(sidecar, /runs-on: ubuntu-22\.04/);
   const fetch = at("git clone https://github.com/OpenChemistry/avogadrolibs.git _deps/avogadrolibs");
   const eigen = at('git -C _deps/eigen fetch --depth 1 origin "$eigen"');

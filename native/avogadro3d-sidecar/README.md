@@ -87,7 +87,8 @@ The Intel smoke workflow runs only the committed artifact, never a local build.
 The Linux packages ship the committed
 `apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu`, like the
 macOS and Windows sidecars. It is built by `.github/workflows/linux-sidecar-build.yml`
-(dispatched by hand, Ubuntu 22.04, the oldest supported host), which fetches the same
+(run with `gh workflow run linux-sidecar-build.yml --ref <ref>` once the file is on `main`, or by
+pushing the commit to build to the branch `ci/linux-sidecar-build`; Ubuntu 22.04, the oldest supported host), which fetches the same
 pinned dependencies with the commands above, then:
 
 ```bash

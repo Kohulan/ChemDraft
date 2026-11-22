@@ -93,8 +93,10 @@ commits on Ubuntu 22.04, as `native/avogadro3d-sidecar/README.md` describes, run
 handshake check and the three `smoke:engine3d-*` smokes, and uploads the artifact
 `engine3d-sidecar-linux-x86_64` (the binary and its `.sha256`). To land or replace it:
 
-1. `gh workflow run linux-sidecar-build.yml --ref <branch or tag>`; it has no inputs and builds
-   that ref's sources.
+1. `gh workflow run linux-sidecar-build.yml --ref <branch or tag>` once the file is on `main`
+   (GitHub dispatches only workflows on the default branch), or push the commit to build to the
+   branch `ci/linux-sidecar-build` (`git push -f origin <commit>:refs/heads/ci/linux-sidecar-build`),
+   which triggers it. It has no inputs and builds that ref's sources.
 2. From the run's summary, note the run id and the SHA-256. Download the artifact
    (`gh run download <run id> -n engine3d-sidecar-linux-x86_64 -D <dir>`) and check it with
    `sha256sum --check avogadro3d-sidecar-x86_64-unknown-linux-gnu.sha256` in that folder.
