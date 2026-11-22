@@ -199,6 +199,7 @@ export {
   type NativeDocumentWarningCode
 } from "./documentRead";
 export { compareNativeVersions, type NativeDocumentWriteWarning } from "./nativeCompatibilityState";
+export { nextObjectId, renumberDuplicatePageObjectIds, type ObjectIdSource, type RenumberedObjectId } from "./objectIds";
 export { copyNativeObjectExtensions, preservedNativeChemistryValues } from "./nativeObjectExtensions";
 
 export {

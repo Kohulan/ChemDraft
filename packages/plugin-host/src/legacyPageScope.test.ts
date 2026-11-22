@@ -1,4 +1,4 @@
-import { admitParsedDocument, applyPatch, applyPatchWithHistory, createDocumentHistory, createEmptyDocument, deserializeDocument, hasObjectIdentity, objectIdentity, readSerializedDocument, redo, serializeDocument, toEngineDocument,
+import { admitParsedDocument, applyPatch, applyPatchWithHistory, createDocumentHistory, createEmptyDocument, deserializeDocument, hasObjectIdentity, objectIdentity, parseDocument, readSerializedDocument, redo, serializeDocument, toEngineDocument,
   undo, type ChemDraftDocument, type DocumentObject, type MoleculeObject } from "@chemdraft/chem-core";
 import { describe, expect, it, vi } from "vitest";
 import { assertLegacyWritePages, assertPluginDocumentWriteScope, assertPluginPatchWriteScope, legacyWriteScopePages, objectInWriteScope, PluginHost,
@@ -565,13 +565,19 @@ describe("Kimi 1.2.3 finding 3: a command's insertions are granted by identity, 
  * JSON) and drive the real PluginHost command path, which pins the selection at invocation.
  */
 describe("1.2.2 probe: a native file with two same-page objects sharing an id", () => {
-  /** Serialize, then read back and admit as File > Open does: the two X are separate values with separate identities. */
-  function openedDuplicates(): ChemDraftDocument {
+  function duplicateFile(): string {
     const empty = createEmptyDocument({ now });
-    const file = serializeDocument({ ...empty, pages: [{ ...empty.pages[0]!, id: "page-1", objects: [molecule("X", 0), molecule("X", 100)] }],
+    return serializeDocument({ ...empty, pages: [{ ...empty.pages[0]!, id: "page-1", objects: [molecule("X", 0), molecule("X", 100)] }],
       selection: { pageId: "page-1", objectIds: ["X"] } });
-    // File > Open admits the parsed document as the engine's own (MainWindow resetDocumentHistory).
-    const opened = admitParsedDocument(readSerializedDocument(file).document);
+  }
+  /**
+   * The probe's document, admitted as File > Open admits a parsed document (MainWindow resetDocumentHistory).
+   * Since 1.2.3 the native reader renumbers the second X on open (see the last case), so these defense-in-depth
+   * cases build the document with the strict in-memory validator, which still accepts a duplicate id: the
+   * write paths must stay safe for a duplicate that reaches the engine some other way.
+   */
+  function openedDuplicates(): ChemDraftDocument {
+    const opened = admitParsedDocument(parseDocument(JSON.parse(duplicateFile())));
     expect(opened.pages[0]!.objects.map(object => [object.id, object.x])).toEqual([["X", 0], ["X", 100]]);
     expect(opened.selection).toMatchObject({ pageId: "page-1", objectIds: ["X"] });
     return opened;
@@ -667,5 +673,25 @@ describe("1.2.2 probe: a native file with two same-page objects sharing an id", 
     await expect(f.run()).resolves.toBeUndefined();
     expect(f.document().pages[0]!.objects.map(object => object.x)).toEqual([500, 100]);
     expectUntouched(secondX(f.document()), unselected);
+  });
+
+  it("1.2.3: File > Open renumbers the second X, so a single update reaches the selected X and the other copy keeps its new id", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const read = readSerializedDocument(duplicateFile());
+      expect(read.warnings.map(warning => warning.code)).toEqual(["NATIVE_DUPLICATE_OBJECT_IDS_RENUMBERED"]);
+      const opened = admitParsedDocument(read.document);
+      expect(opened.pages[0]!.objects.map(object => [object.id, object.x])).toEqual([["X", 0], ["X_002", 100]]);
+      const other = opened.pages[0]!.objects[1]!;
+      const f = commandHost(opened, [moveX]);
+      await expect(f.run()).resolves.toBeUndefined();
+      expect(f.document().pages[0]!.objects.map(object => [object.id, object.x])).toEqual([["X", 500], ["X_002", 100]]);
+      expectUntouched(f.document().pages[0]!.objects[1], other);
+      // The batch that was refused on the duplicate now has one X to name: it removes the selected X, then the
+      // update finds nothing, and the renamed copy is out of the command's scope either way.
+      const g = commandHost(opened, [removeThenMove]);
+      await expect(g.run()).rejects.toThrow();
+      expectUntouched(g.document().pages[0]!.objects.find(object => object.id === "X_002"), other);
+    } finally { vi.restoreAllMocks(); }
   });
 });

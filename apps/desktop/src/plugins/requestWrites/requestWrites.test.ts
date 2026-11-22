@@ -7,7 +7,7 @@ import { repeatUnitMolfileGroups, repeatUnits } from "@chemdraft/export-engine";
 import type { ExportWarning } from "@chemdraft/export-engine";
 import { exportDocumentToCdxml, openChemDraftPayload } from "@chemdraft/cdx-compat";
 import { parseMolfileGraph } from "@chemdraft/clipboard-adapter";
-import { admitParsedDocument, applyPatch, BracketObjectSchema, createEmptyDocument, hasObjectIdentity, moleculeToMolfileV2000, objectIdentity, serializeDocument, resolveRepeatUnitAtomMembership,
+import { admitParsedDocument, applyPatch, BracketObjectSchema, createEmptyDocument, hasObjectIdentity, moleculeToMolfileV2000, objectIdentity, parseDocument, serializeDocument, resolveRepeatUnitAtomMembership,
   toEngineDocument, type ChemDraftDocument, type DocumentObject, type MoleculeObject, type ReactionObject } from "@chemdraft/chem-core";
 import { PluginApiVersion, type PluginCommandContext, type PluginPermission, type PluginToolHandler } from "@chemdraft/plugin-api";
 import { PluginHost, type RequestDocument, type PluginPatchApplicationRequest } from "@chemdraft/plugin-host";
@@ -1869,13 +1869,19 @@ describe("Kimi 1.2.3 finding 3: a request's insertions are granted by identity, 
  * does (the command invocation), and the writes go through the request-bound path.
  */
 describe("1.2.2 probe: a request on a native file with two same-page objects sharing an id", () => {
-  function openedDuplicates(): ChemDraftDocument {
+  function duplicateFile(): string {
     const empty = createEmptyDocument();
     const page = { ...empty.pages[0]!, id: "page-1", objects: [note("X", "Selected"), { ...note("X", "Not selected"), x: 300 }] };
-    const file = serializeDocument({ ...empty, pages: [page], selection: { pageId: "page-1", objectIds: ["X"] } });
-    const opened = openNativeDocument(file);
-    expect(opened.document).toBeDefined();
-    const installed = normalizeCommittedDocument(admitParsedDocument(opened.document!), { preserveElectronMarks: true });
+    return serializeDocument({ ...empty, pages: [page], selection: { pageId: "page-1", objectIds: ["X"] } });
+  }
+  /**
+   * The probe's document, installed as resetDocumentHistory installs an opened file. Since 1.2.3 the native
+   * reader renumbers the second X on open (see the last case), so these defense-in-depth cases build the
+   * document with the strict in-memory validator, which still accepts a duplicate id: the request path must
+   * stay safe for a duplicate that reaches the engine some other way.
+   */
+  function openedDuplicates(): ChemDraftDocument {
+    const installed = normalizeCommittedDocument(admitParsedDocument(parseDocument(JSON.parse(duplicateFile()))), { preserveElectronMarks: true });
     expect(installed.pages[0]!.objects.map(object => [object.id, object.x])).toEqual([["X", 120], ["X", 300]]);
     expect(installed.selection).toMatchObject({ pageId: "page-1", objectIds: ["X"] });
     return installed;
@@ -1933,6 +1939,25 @@ describe("1.2.2 probe: a request on a native file with two same-page objects sha
         expect(result, JSON.stringify(result)).toMatchObject({ ok: false, error: { code: "invalid", message: refusal } });
       }
       expectUnchanged(f, opened, unselected);
+    } finally { await f.finish(); }
+  });
+
+  it("1.2.3: File > Open renumbers the second X, so a request can begin and a single update of the selected X now lands", async () => {
+    // Previously refused at begin ("ambiguous object ID"): the opened file now holds one X and one X_002.
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const opened = openNativeDocument(duplicateFile());
+    vi.restoreAllMocks();
+    expect(opened.warnings.map(warning => warning.code)).toContain("NATIVE_DUPLICATE_OBJECT_IDS_RENUMBERED");
+    const installed = normalizeCommittedDocument(admitParsedDocument(opened.document!), { preserveElectronMarks: true });
+    expect(installed.pages[0]!.objects.map(object => [object.id, object.x])).toEqual([["X", 120], ["X_002", 300]]);
+    const other = installed.pages[0]!.objects[1]!;
+    const f = setup(["X"], undefined, { document: installed });
+    try {
+      const requestId = await f.begin();
+      expect(await f.context.documents.applyRequestPatch!({ requestId, patch: moveX })).toMatchObject({ ok: true });
+      expect(f.pinned().pages[0]!.objects.map(object => [object.id, object.x])).toEqual([["X", 500], ["X_002", 300]]);
+      expect(f.pinned().pages[0]!.objects[1]).toEqual(other);
+      expect(hasObjectIdentity(f.pinned().pages[0]!.objects[1]!, objectIdentity(other))).toBe(true);
     } finally { await f.finish(); }
   });
 });

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { admitParsedDocument, applyPatch, createCustomPageLayout, createEmptyDocument, DocumentObjectSchema, hasObjectIdentity, objectIdentity, serializeDocument, nativeDrawingStyleFromObjectStyle, toEngineDocument, undo, redo, type ChemDraftDocument, type ReactionObject } from "@chemdraft/chem-core";
+import { admitParsedDocument, applyPatch, createCustomPageLayout, createEmptyDocument, DocumentObjectSchema, hasObjectIdentity, objectIdentity, parseDocument, serializeDocument, nativeDrawingStyleFromObjectStyle, toEngineDocument, undo, redo, type ChemDraftDocument, type ReactionObject } from "@chemdraft/chem-core";
 import { AssistantCapabilityPermissions, ProposedDocumentPatchSchema, runPluginWorker, parsePluginManifest, type PluginWorkerHandle,
   type PluginCommandContext, type PluginAssistantToolHandler } from "@chemdraft/plugin-api";
 import { assertPluginDocumentWriteScope, assertPluginPatchWriteScope, PluginHost } from "@chemdraft/plugin-host";
@@ -1757,16 +1757,22 @@ describe("Kimi 1.2.3 finding 3: assistant insertions are granted by identity, ne
  * the assistant's host tools and a plugin assistant tool's documents.applyPatch.
  */
 describe("1.2.2 probe: assistant writes on a native file with two same-page objects sharing an id", () => {
-  /** Opens a file whose page 1 holds the fixture molecule and, after it, a copy under the same id 200 px lower. */
-  function openDuplicates(s: ReturnType<typeof setup>) {
+  /** A file whose page 1 holds the fixture molecule and, after it, a copy under the same id 200 px lower. */
+  function duplicateFile(s: ReturnType<typeof setup>): string {
     const document = s.context.getDocument()!;
     const page = document.pages[0]!;
     const copy = translateObject(structuredClone(s.molecule), 0, 200);
-    const file = serializeDocument({ ...document, pages: [{ ...page, objects: [s.molecule, copy, ...page.objects.slice(1)] }],
+    return serializeDocument({ ...document, pages: [{ ...page, objects: [s.molecule, copy, ...page.objects.slice(1)] }],
       selection: { pageId: page.id, objectIds: [s.molecule.id] } });
-    const opened = openNativeDocument(file);
-    expect(opened.document).toBeDefined();
-    const installed = normalizeCommittedDocument(admitParsedDocument(opened.document!), { preserveElectronMarks: true });
+  }
+  /**
+   * Installs the duplicate file's document as resetDocumentHistory installs an opened file. Since 1.2.3 the
+   * native reader renumbers the copy on open (see the last case), so these defense-in-depth cases build the
+   * document with the strict in-memory validator, which still accepts a duplicate id: the assistant paths
+   * must stay safe for a duplicate that reaches the engine some other way.
+   */
+  function openDuplicates(s: ReturnType<typeof setup>) {
+    const installed = normalizeCommittedDocument(admitParsedDocument(parseDocument(JSON.parse(duplicateFile(s)))), { preserveElectronMarks: true });
     const copies = installed.pages[0]!.objects.filter(object => object.id === s.molecule.id);
     expect(copies).toHaveLength(2);
     expect(copies[1]!.y).toBeCloseTo(copies[0]!.y + 200);
@@ -1881,6 +1887,31 @@ describe("1.2.2 probe: assistant writes on a native file with two same-page obje
       const copies = copiesOf(s.context.getDocument()!, id);
       expect(copies.map(object => object.x)).toEqual([500, unselected.x]);
       expectUntouched(s.context.getDocument()!, id, unselected);
+      await s.controller.endRequest(s.plugin, { requestId });
+    } finally { await s.finish(); }
+  });
+
+  it("1.2.3: File > Open renumbers the copy, so a single host-tool update of the selected copy now lands", async () => {
+    // Previously refused with the duplicate-id wording: the opened file now holds the id once, and the copy a new id.
+    const s = setup();
+    try {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const opened = openNativeDocument(duplicateFile(s));
+      warn.mockRestore();
+      expect(opened.warnings.map(warning => warning.code)).toContain("NATIVE_DUPLICATE_OBJECT_IDS_RENUMBERED");
+      const installed = normalizeCommittedDocument(admitParsedDocument(opened.document!), { preserveElectronMarks: true });
+      const id = s.molecule.id;
+      expect(copiesOf(installed, id)).toHaveLength(1);
+      const other = installed.pages[0]!.objects[1]!;
+      expect(other.id).not.toBe(id);
+      expect(other.y).toBeCloseTo(copiesOf(installed, id)[0]!.y + 200);
+      s.replace(installed);
+      s.select([id]);
+      const { requestId } = await s.controller.beginRequest(s.plugin, { prompt: "restyle the selection" });
+      const result = await s.controller.callTool(s.plugin, { name: "style_objects", input: { objectIds: [id], style: { color: "#112233" } } });
+      expect(result, JSON.stringify(result)).not.toMatchObject({ isError: true });
+      expect(s.context.getDocument()).not.toBe(installed);
+      expect(s.context.getDocument()!.pages[0]!.objects.find(object => object.id === other.id)).toEqual(other);
       await s.controller.endRequest(s.plugin, { requestId });
     } finally { await s.finish(); }
   });
