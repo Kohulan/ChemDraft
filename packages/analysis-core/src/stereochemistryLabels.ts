@@ -1,6 +1,9 @@
 /**
  * The stereochemistry labels stored in a molecule's chemistry record, and how to read them back.
- * Imports nothing, so `@chemdraft/rdkit-adapter/constants` can re-export it without loading the engine.
+ * Imports nothing. It lives here, not in `rdkit-adapter`, so `document-workflow-core` (which may reach
+ * `rdkit-adapter` for types only, never load an engine) can read the labels the adapter writes from
+ * the one copy of their wording. `rdkit-adapter` re-exports both functions from its barrel and
+ * `/constants`.
  */
 
 /** The note for centres the drawing left unassigned: "1 unspecified stereocenter", "2 unspecified stereocenters". */

@@ -18,4 +18,4 @@ export {
   PINNED_RDKIT_WASM_SHA256
 } from "./methods";
 export { SOURCE_INTERPRETATION_ID, sourceInterpretation } from "./sourceInterpretation";
-export { isAssignedStereochemistryLabel, stereochemistryLabels } from "./stereochemistryLabels";
+export { isAssignedStereochemistryLabel, stereochemistryLabels } from "@chemdraft/analysis-core";

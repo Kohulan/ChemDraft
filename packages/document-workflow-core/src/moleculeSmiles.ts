@@ -2,9 +2,9 @@
 // native graph writer otherwise, with every approximation reported as an export warning.
 // Callers own engine loading; this shared writer also serves headless exports.
 
+import { isAssignedStereochemistryLabel } from "@chemdraft/analysis-core";
 import { isDativeBond, moleculeToMolfileV2000, moleculeBracketWarningMessages, rGroupNumberFromLabel, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
 import type { ExportWarning } from "@chemdraft/export-engine";
-import { isAssignedStereochemistryLabel } from "@chemdraft/rdkit-adapter/constants";
 import {
   nativeAtomChargeIsExpressible,
   nativeAtomValence,

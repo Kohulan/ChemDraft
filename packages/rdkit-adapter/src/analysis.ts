@@ -30,6 +30,7 @@ import {
   methodKey,
   runFingerprint,
   SOURCE_INTERPRETATION_ID,
+  stereochemistryLabels,
   type AnalysisResult,
   type AnalysisRun,
   type AnalysisStatus,
@@ -119,7 +120,6 @@ import type { PkaMolecularGraph } from "./pkaModel";
 // Re-exported so the barrel and every existing importer keep working; it LIVES in its own module so
 // `constants.ts` can offer it without the engine. See that file for why the split exists.
 import { sourceInterpretation } from "./sourceInterpretation";
-import { stereochemistryLabels } from "./stereochemistryLabels";
 
 export { sourceInterpretation };
 // The corpus size is read from the shipped artifact, never typed here. The decline messages quote it
@@ -593,9 +593,9 @@ function unsupportedIdentifier(
 
 
 
-// stereochemistryLabels lives beside the note predicate in ./stereochemistryLabels, which imports
-// nothing, so lightweight consumers can read it through `@chemdraft/rdkit-adapter/constants`.
-export { isAssignedStereochemistryLabel, stereochemistryLabels } from "./stereochemistryLabels";
+// stereochemistryLabels lives beside the note predicate in analysis-core, which document-workflow-core
+// may import as values; lightweight consumers also read both through `@chemdraft/rdkit-adapter/constants`.
+export { isAssignedStereochemistryLabel, stereochemistryLabels } from "@chemdraft/analysis-core";
 
 export interface DetailedAnalysis {
   run: AnalysisRun;
