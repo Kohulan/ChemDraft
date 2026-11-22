@@ -15,6 +15,11 @@ import { checkEngine3dSidecar, SidecarCheckFailure } from "./check-engine3d-side
 const ROOT_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 /** The one place the committed Linux sidecar's SHA-256 is pinned. */
 export const LINUX_SIDECAR_PIN = "scripts/engine3d-sidecar-linux.json";
+/**
+ * The only file the pin may name: the externalBin Tauri bundles into the .deb and AppImage. Hashing any
+ * other file would verify one binary and ship another.
+ */
+export const LINUX_SIDECAR_PATH = "apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu";
 /** What the pin holds until a maintainer commits a binary built by the sidecar workflow. */
 export const PENDING = "PENDING-MAINTAINER-COMMIT";
 const PLACEHOLDER_MARKER = "avogadro3d-sidecar placeholder";
@@ -35,7 +40,14 @@ export function sha256Hex(bytes) {
  * Why these bytes cannot ship against this pin, or undefined when they can. `label` names the file in
  * messages: the committed path, or a packaged payload's sidecar.
  */
+export function pinPathProblem(pin) {
+  if (pin.path === LINUX_SIDECAR_PATH) return undefined;
+  return `${LINUX_SIDECAR_PIN} path must be ${LINUX_SIDECAR_PATH}, the file Tauri bundles; it is ${JSON.stringify(pin.path)}.`;
+}
+
 export function committedSidecarProblem(bytes, pin, label = pin.path) {
+  const pathProblem = pinPathProblem(pin);
+  if (pathProblem) return pathProblem;
   if (pin.sha256 === PENDING || pin.buildRunId === PENDING) {
     return `The x86_64 Linux 3D sidecar is not committed yet: ${LINUX_SIDECAR_PIN} still says ${PENDING}. ` +
       `A maintainer runs ${pin.buildWorkflow}, commits its binary as ${pin.path}, and fills in buildRunId and sha256.`;
@@ -52,9 +64,12 @@ export function committedSidecarProblem(bytes, pin, label = pin.path) {
 
 export async function verifyCommittedLinuxSidecar({ rootDir = ROOT_DIR, log = console.log } = {}) {
   const pin = readLinuxSidecarPin(rootDir);
-  const path = join(rootDir, pin.path);
+  // Refuse any other path before reading anything, and read only the canonical file.
+  const pathProblem = pinPathProblem(pin);
+  if (pathProblem) throw new SidecarCheckFailure(pathProblem, { perFile: false });
+  const path = join(rootDir, LINUX_SIDECAR_PATH);
   let bytes;
-  try { bytes = readFileSync(path); } catch { throw new SidecarCheckFailure(`${pin.path} is missing.`, { perFile: false }); }
+  try { bytes = readFileSync(path); } catch { throw new SidecarCheckFailure(`${LINUX_SIDECAR_PATH} is missing.`, { perFile: false }); }
   const problem = committedSidecarProblem(bytes, pin);
   if (problem) throw new SidecarCheckFailure(problem, { perFile: false });
   log(`${pin.path}: SHA-256 ${pin.sha256} matches ${LINUX_SIDECAR_PIN} (run ${pin.buildRunId}).`);

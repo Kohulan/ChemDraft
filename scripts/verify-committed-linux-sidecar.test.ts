@@ -5,6 +5,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import {
   committedSidecarProblem,
   isSidecarPlaceholder,
+  LINUX_SIDECAR_PATH,
   PENDING,
   readLinuxSidecarPin,
   sha256Hex,
@@ -18,6 +19,7 @@ const committed = read(pin.path);
 describe("the committed x86_64 Linux 3D sidecar pin", () => {
   it("names the binary and the workflow that builds it", () => {
     expect(pin.path).toBe("apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu");
+    expect(pin.path).toBe(LINUX_SIDECAR_PATH);
     expect(pin.buildWorkflow).toBe(".github/workflows/linux-sidecar-build.yml");
     expect(read(pin.buildWorkflow).toString("utf8")).toContain("engine3d-sidecar-linux-x86_64");
   });
@@ -44,7 +46,14 @@ describe("the committed x86_64 Linux 3D sidecar pin", () => {
 
 describe("committedSidecarProblem", () => {
   const bytes = Buffer.from("\x7fELF native build");
-  const filled = { path: "bin", buildWorkflow: "build.yml", buildRunId: "42", sha256: sha256Hex(bytes) };
+  const filled = { path: LINUX_SIDECAR_PATH, buildWorkflow: "build.yml", buildRunId: "42", sha256: sha256Hex(bytes) };
+
+  it("refuses a pin that names any file but the one Tauri bundles, whatever its bytes", () => {
+    for (const path of ["bin", "apps/desktop/src-tauri/binaries/avogadro3d-sidecar-aarch64-unknown-linux-gnu",
+      `./${LINUX_SIDECAR_PATH}`, `${LINUX_SIDECAR_PATH}/../avogadro3d-sidecar-x86_64-unknown-linux-gnu`]) {
+      expect(committedSidecarProblem(bytes, { ...filled, path })).toMatch(/path must be apps\/desktop\/src-tauri\/binaries\/avogadro3d-sidecar-x86_64-unknown-linux-gnu, the file Tauri bundles/);
+    }
+  });
 
   it("refuses a pending pin, naming the workflow that builds the sidecar", () => {
     expect(committedSidecarProblem(bytes, { ...filled, sha256: PENDING })).toMatch(/not committed yet.*build\.yml/);
@@ -90,6 +99,19 @@ describe("verifyPackagedLinuxSidecar", () => {
     const stale = payload("stale", Buffer.from("\x7fELF a different build"));
     await expect(verify(stale)).rejects.toThrow(`${stale} has SHA-256 ${sha256Hex(Buffer.from("\x7fELF a different build"))}; `);
     await expect(verify(stale)).rejects.toThrow(`scripts/engine3d-sidecar-linux.json pins ${sha256Hex(pinned)} (run 42).`);
+  });
+
+  it("refuses a pin naming another path even when the payload matches its hash", async () => {
+    writeFileSync(join(root, "scripts", "engine3d-sidecar-linux.json"), JSON.stringify({
+      path: "elsewhere", buildWorkflow: ".github/workflows/linux-sidecar-build.yml", buildRunId: "42", sha256: sha256Hex(pinned)
+    }));
+    try {
+      await expect(verify(payload("matching", pinned))).rejects.toThrow(/path must be /);
+    } finally {
+      writeFileSync(join(root, "scripts", "engine3d-sidecar-linux.json"), JSON.stringify({
+        path: LINUX_SIDECAR_PATH, buildWorkflow: ".github/workflows/linux-sidecar-build.yml", buildRunId: "42", sha256: sha256Hex(pinned)
+      }));
+    }
   });
 
   it("refuses a missing payload sidecar and the placeholder", async () => {
