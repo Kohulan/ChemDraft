@@ -185,8 +185,10 @@ describe("issue #424: caption layout", () => {
     const reopened = objectsOf<TextObject>(first.reopened, "text")[0]!;
     expect(reopened.text).toBe("Yields 2");
     expect(reopened.style.textAlign).toBe("center");
-    expect(reopened.spans[0]).toMatchObject({ style: { fontFamily: "Arial", fontSizePx: pt(12), fontWeight: 700 } });
-    expect(reopened.spans[1]).toMatchObject({ text: "2", script: "subscript", style: { fontFamily: "Arial", fontSizePx: pt(9) } });
+    // Resolved run styles: a run states only what differs from the caption's own style.
+    expect({ ...reopened.style, ...reopened.spans[0]!.style }).toMatchObject({ fontFamily: "Arial", fontSizePx: pt(12), fontWeight: 700 });
+    expect(reopened.spans[1]).toMatchObject({ text: "2", script: "subscript" });
+    expect({ ...reopened.style, ...reopened.spans[1]!.style }).toMatchObject({ fontFamily: "Arial", fontSizePx: pt(9) });
     const second = saveAsWithoutPayload(first.reopened);
     expect(elementWith(second.plain, "t", 'Justification="')).toBe(t);
   });
@@ -209,7 +211,7 @@ describe("issue #424: caption layout", () => {
     expect(first.plain).toMatch(/<s font="\d+" size="10" face="2">line A\nline B<\/s>/);
     const reopened = objectsOf<TextObject>(first.reopened, "text")[0]!;
     expect(reopened.text).toBe("line A\nline B");
-    expect(reopened.spans[0]).toMatchObject({ style: { fontFamily: "Arial", fontSizePx: pt(10), fontStyle: "italic" } });
+    expect({ ...reopened.style, ...reopened.spans[0]!.style }).toMatchObject({ fontFamily: "Arial", fontSizePx: pt(10), fontStyle: "italic" });
     expect(elementWith(saveAsWithoutPayload(first.reopened).plain, "t", 'Justification="')).toContain('p="46 260"');
   });
 });

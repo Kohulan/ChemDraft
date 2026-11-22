@@ -129,7 +129,8 @@ it("resolves 40,000 caption runs against 40,000 fonts with linear work", () => {
   expect(operations).toBeLessThanOrEqual(2 * (40_000 + 40_000));
   const [text] = textsOf(opened);
   expect(text?.spans).toHaveLength(40_000);
-  expect(text?.spans[39_999]?.style.fontFamily).toBe("Font40000");
+  // A run states its font only where it differs from the caption's own (here, none do).
+  expect(text?.spans[39_999]?.style.fontFamily ?? text?.style.fontFamily).toBe("Font40000");
   expect(text?.style.fontFamily).toBe("Font40000");
   expect(opened.warnings.map((warning) => warning.code)).not.toContain("cdxml.font_table_truncated");
   // Saving it again builds the CDXML font table once and indexes it by name (Codex security finding).
@@ -152,7 +153,7 @@ it("saves an edited 40,000-run caption against 40,000 fonts with linear work", (
   expect(saved.result.contents).toContain('<s font="40000" size="10" face="0">y</s>');
   const [again] = textsOf(openChemDraftPayload(saved.result.contents));
   expect(again?.text).toBe(text.text);
-  expect(again?.spans[0]?.style.fontFamily).toBe("Font40000");
+  expect(again?.spans[0]?.style.fontFamily ?? again?.style.fontFamily).toBe("Font40000");
 });
 
 it("resolves a duplicated font id to its first entry, as before", () => {

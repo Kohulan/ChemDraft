@@ -5283,17 +5283,25 @@ function restoreFramedCaption(object: TextObject, element: XmlElementView, conte
     return;
   }
   usage.captionRuns += runs.length;
+  // The caption's own style takes its first run's font and size. A run states only what differs
+  // from that (another font or size, or bold, italic, underline: importText already set the bold
+  // and italic), never a value equal to the caption's, so whole-caption formatting still reaches
+  // every run instead of being overridden by an explicit regular run.
   const spans: TextObject["spans"] = [];
+  let captionFont = "", captionSizePx = 0;
   for (const [i, run] of runs.entries()) {
     const font = lookupCdxmlFont(context.fonts.byId, run.attributes.font)?.name;
     const size = parseNumber(run.attributes.size), face = parseInteger(run.attributes.face ?? "0");
     if (!font || !size || size <= 0 || face === undefined || (face & ~103) || (face & 96) === 96 ||
         Object.keys(run.attributes).some(k => !["font", "size", "face", "color"].includes(k))) return;
-    spans.push({ ...object.spans[i], style: { ...object.spans[i].style, fontFamily: font, fontSizePx: cdxmlToCssPx(size),
-      fontWeight: face & 1 ? 700 : 400, fontStyle: face & 2 ? "italic" : "normal", textDecoration: face & 4 ? "underline" : "none" } });
+    const sizePx = cdxmlToCssPx(size);
+    if (i === 0) { captionFont = font; captionSizePx = sizePx; }
+    spans.push({ ...object.spans[i], style: { ...object.spans[i].style,
+      ...(font !== captionFont ? { fontFamily: font } : {}), ...(sizePx !== captionSizePx ? { fontSizePx: sizePx } : {}),
+      ...(face & 4 ? { textDecoration: "underline" } : {}) } });
   }
-  Object.assign(object, box ?? {}, { spans, style: { ...object.style, fontFamily: spans[0].style.fontFamily,
-    fontSizePx: spans[0].style.fontSizePx, textAlign: align } });
+  Object.assign(object, box ?? {}, { spans, style: { ...object.style, fontFamily: captionFont,
+    fontSizePx: captionSizePx, textAlign: align } });
   Object.assign(object.compatibility!.unknown, { sourceCdxmlAttributes: { ...a },
     cdxmlTextFrameOrigin: { x: object.x, y: object.y }, cdxmlTextFrameSize: { width: object.width, height: object.height } });
 }
