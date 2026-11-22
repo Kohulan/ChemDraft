@@ -73,6 +73,25 @@ describe("issue #424: arrowhead dimensions", () => {
     for (const a of ['HeadSize="600"', 'ArrowheadWidth="200"', 'ArrowheadCenterSize="500"']) expect(written).toContain(a);
     expect(objectsOf<GraphicObject>(reopened, "graphic")[0]!.data.markerEnd?.sizePx).toBeCloseTo(pt(6), 6);
   });
+
+  // Codex 4658939345: head dimensions do not depend on the shaft, so a wavy arrow keeps them too.
+  it("keeps the head dimensions of a wavy arrow through two plain Save As cycles", () => {
+    const wavy = '<CDXML><page><arrow id="5" LineType="Wavy" Head3D="160 50 0" Tail3D="40 50 0" ArrowheadHead="Full" ' +
+      'ArrowheadType="Solid" HeadSize="900" ArrowheadWidth="300" ArrowheadCenterSize="750"/></page></CDXML>';
+    const document = open(wavy);
+    const arrow = objectsOf<GraphicObject>(document, "graphic")[0]!;
+    expect(arrow.data.artPathKind).toBe("wavy");
+    expect(arrow.data.markerEnd?.sizePx).toBeCloseTo(pt(9), 6);
+    const first = saveAsWithoutPayload(document);
+    const written = elementWith(first.plain, "arrow", 'LineType="Wavy"');
+    for (const a of ['HeadSize="900"', 'ArrowheadWidth="300"', 'ArrowheadCenterSize="750"']) expect(written).toContain(a);
+    const again = objectsOf<GraphicObject>(first.reopened, "graphic")[0]!;
+    expect(again.data.artPathKind).toBe("wavy");
+    expect(again.data.markerEnd?.sizePx).toBeCloseTo(pt(9), 6);
+    const second = saveAsWithoutPayload(first.reopened);
+    expect(elementWith(second.plain, "arrow", 'LineType="Wavy"')).toBe(written);
+    expect(objectsOf<GraphicObject>(second.reopened, "graphic")[0]!.data.markerEnd?.sizePx).toBeCloseTo(pt(9), 6);
+  });
 });
 
 describe("issue #424: circular arrows", () => {

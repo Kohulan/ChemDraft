@@ -2865,8 +2865,10 @@ function cdxmlHeadDimensions(sizePx: number, sourceSize: number, source: Record<
 // One set of dimensions applies to both ends in CDXML. Use the current editable
 // marker length and scale the retained width and inset by the same factor. A stored arc
 // keeps its HeadSize even without heads: the reader recognizes an explicit arc by it.
+// Head dimensions do not depend on the shaft, so a wavy shaft keeps them as a straight one does.
 function cdxmlStraightHeadDimensions(graphic: GraphicObject, warnings: CompatibilityConversionWarning[], storedArc = false): string[] {
-  if (graphic.data.artPathKind !== "line" && !storedArc) return [];
+  const kind = graphic.data.artPathKind;
+  if (kind !== "line" && kind !== "wavy" && !storedArc) return [];
   const source = preservedCurveAttributes(graphic.compatibility?.unknown.sourceCdxmlAttributes);
   const sourceSize = parseNumber(source.HeadSize);
   if (!sourceSize || sourceSize <= 0) return [];
