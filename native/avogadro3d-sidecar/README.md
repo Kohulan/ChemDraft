@@ -118,8 +118,9 @@ A maintainer commits that binary (mode 0755) and puts the run id and SHA-256 int
 committed file: `scripts/verify-committed-linux-sidecar.mjs` checks its SHA-256
 against the pin and repeats the handshake check, and fails while the pin still reads
 `PENDING-MAINTAINER-COMMIT`. The sidecars inside the finished `.deb` and AppImage are
-checked against the same pin (`--packaged`). The container smoke repeats the handshake on the sidecar
-installed from the `.deb` and the AppImage on each distro. Changing the avogadrolibs
+checked against the same pin and must be regular files with mode 0755 (`--packaged`). The
+container smoke repeats the mode and handshake checks on the sidecar installed from the
+`.deb` and the AppImage on each distro. Changing the avogadrolibs
 commit pinned in `CMakeLists.txt` requires a rebuilt, recommitted Linux sidecar, as
 for the other platforms. aarch64 Linux has no build and stays a placeholder.
 

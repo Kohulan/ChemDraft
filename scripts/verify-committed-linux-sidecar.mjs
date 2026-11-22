@@ -79,8 +79,8 @@ export async function verifyCommittedLinuxSidecar({ rootDir = ROOT_DIR, log = co
 
 /**
  * The sidecar inside a built package (an extracted .deb or AppImage payload) must be the pinned build
- * byte for byte, so a package cannot ship another binary than the one verified, and must pass the same
- * checks as the committed file.
+ * byte for byte, so a package cannot ship another binary than the one verified, must pass the same
+ * checks as the committed file, and must be a regular file with mode 0755.
  */
 export async function verifyPackagedLinuxSidecar(payloadPath, { rootDir = ROOT_DIR, log = console.log } = {}) {
   const pin = readLinuxSidecarPin(rootDir);
@@ -89,7 +89,7 @@ export async function verifyPackagedLinuxSidecar(payloadPath, { rootDir = ROOT_D
   const problem = committedSidecarProblem(bytes, pin, payloadPath);
   if (problem) throw new SidecarCheckFailure(problem, { perFile: false });
   log(`${payloadPath}: SHA-256 ${pin.sha256} matches ${LINUX_SIDECAR_PIN} (run ${pin.buildRunId}).`);
-  await checkEngine3dSidecar(payloadPath, { rootDir, log });
+  await checkEngine3dSidecar(payloadPath, { rootDir, log, packaged: true });
   return payloadPath;
 }
 

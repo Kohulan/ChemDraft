@@ -179,7 +179,10 @@ jobs:
             grep -qxF "$path" <<<"$contents" || { echo "::error::$deb lacks $path"; exit 1; }
           done
           # Its sidecar must be the pinned build (scripts/engine3d-sidecar-linux.json) byte for byte,
-          # never a placeholder, and complete the handshake.
+          # never a placeholder, a regular file with mode 0755 (in the archive itself, before any
+          # umask applies on extraction), and complete the handshake.
+          sidecar_entry=$(dpkg-deb -c "$deb" | awk '$NF == "./usr/bin/avogadro3d-sidecar" { print $1 }')
+          [ "$sidecar_entry" = -rwxr-xr-x ] || { echo "::error::$deb holds usr/bin/avogadro3d-sidecar as '$sidecar_entry', not a regular file with mode 0755."; exit 1; }
           payload=$(mktemp -d)
           dpkg-deb -x "$deb" "$payload"
           node scripts/verify-committed-linux-sidecar.mjs --packaged "$payload/usr/bin/avogadro3d-sidecar" || { echo "::error::$deb does not carry the pinned 3D sidecar."; exit 1; }

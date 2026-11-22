@@ -1,8 +1,9 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import {
+  checkEngine3dSidecar,
   compareVersions,
   disallowedLibraries,
   elfHeaderProblem,
@@ -13,6 +14,7 @@ import {
   handshakeRequests,
   MAX_GLIBC,
   newestVersion,
+  packagedModeProblem,
   pinnedAvogadroCommit,
   readElfDependencies,
   runSidecarHandshake,
@@ -120,6 +122,35 @@ describe("ELF header", () => {
     const elf32 = syntheticElf({ needed: [], versions: [] });
     elf32[4] = 1;
     expect(elfHeaderProblem(elf32)).toMatch(/^is not a 64-bit little-endian ELF \(header 7f454c460101/);
+  });
+});
+
+describe("packaged sidecar mode", () => {
+  const work = mkdtempSync(join(tmpdir(), "engine3d-sidecar-mode-"));
+  afterAll(() => rmSync(work, { recursive: true, force: true }));
+  const file = (name: string, mode: number) => {
+    const path = join(work, name);
+    writeFileSync(path, "ChemDraft avogadro3d-sidecar placeholder.");
+    chmodSync(path, mode);
+    return path;
+  };
+
+  it.skipIf(process.platform === "win32")("requires a regular file with mode exactly 0755", () => {
+    expect(packagedModeProblem(statSync(file("ok", 0o755)))).toBeUndefined();
+    expect(packagedModeProblem(statSync(file("owner-only", 0o700)))).toBe("has mode 0700 in the package; it must be 0755");
+    expect(packagedModeProblem(statSync(file("group-writable", 0o775)))).toBe("has mode 0775 in the package; it must be 0755");
+    expect(packagedModeProblem(statSync(file("setuid", 0o4755)))).toBe("has mode 4755 in the package; it must be 0755");
+    expect(packagedModeProblem(statSync(work))).toBe("is not a regular file in the package");
+  });
+
+  it.skipIf(process.platform === "win32")("fails a packaged 0700 copy or a symlink the CI account could still run", async () => {
+    const ownerOnly = file("installed-0700", 0o700);
+    await expect(checkEngine3dSidecar(ownerOnly, { packaged: true, log: () => undefined })).rejects.toThrow("has mode 0700 in the package; it must be 0755");
+    const link = join(work, "link");
+    symlinkSync(file("target", 0o755), link);
+    await expect(checkEngine3dSidecar(link, { packaged: true, log: () => undefined })).rejects.toThrow("is not a regular file in the package");
+    // Unpackaged, only executability is required; this one then fails as the placeholder it is.
+    await expect(checkEngine3dSidecar(ownerOnly, { log: () => undefined })).rejects.toThrow("is the committed placeholder");
   });
 });
 

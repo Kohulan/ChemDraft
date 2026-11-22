@@ -204,20 +204,20 @@ jobs:
         run: bash .github/workflows/linux-package-smoke/host-mesa.sh "$BUNDLE"
 
       # Interactive 3D needs the native sidecar: the installed copy must be a real x86-64 ELF, not
-      # a placeholder, need only glibc, and complete its protocol handshake on this
-      # distro's glibc.
+      # a placeholder, a regular file with mode 0755, need only glibc, and complete its protocol
+      # handshake on this distro's glibc.
       - name: Check the installed 3D sidecar
         run: |
           set -euo pipefail
           check="$GITHUB_WORKSPACE/scripts/check-engine3d-sidecar.mjs"
           node --version
           if [[ "$PACKAGE" == deb ]]; then
-            node "$check" /usr/bin/avogadro3d-sidecar
+            node "$check" --packaged /usr/bin/avogadro3d-sidecar
           else
             work=$(mktemp -d)
             trap 'rm -rf -- "$work"' EXIT
             (cd "$work" && "$BUNDLE" --appimage-extract > /dev/null)
-            node "$check" "$work/squashfs-root/usr/bin/avogadro3d-sidecar"
+            node "$check" --packaged "$work/squashfs-root/usr/bin/avogadro3d-sidecar"
           fi
 
       # Xvfb also runs the document, menu and clipboard checks. Weston exercises the XWayland

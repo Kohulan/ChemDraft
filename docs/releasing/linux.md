@@ -49,11 +49,14 @@ The workflow:
    dirty. Any failure fails the job.
 4. Checks the bundle identity and that the `.deb` carries `chemdraft`, the 3D sidecar and the
    OPSIN runtime. The `.deb`'s sidecar must have the SHA-256 pinned in
-   `scripts/engine3d-sidecar-linux.json` and pass the same checks as the committed file
-   (`scripts/verify-committed-linux-sidecar.mjs --packaged`).
+   `scripts/engine3d-sidecar-linux.json`, pass the same checks as the committed file
+   (`scripts/verify-committed-linux-sidecar.mjs --packaged`), and be a regular file with mode
+   exactly 0755, both in the archive listing and once extracted, so every user can run it after a
+   root-owned install.
 5. Repacks the AppImage after Tauri bundles it. It replaces linuxdeploy's copy of the sidecar
    (whose RUNPATH linuxdeploy may rewrite) with the committed file verified in step 2, and after
-   repacking re-extracts the AppImage and checks that copy against the pin the same way. It uses
+   repacking re-extracts the AppImage and checks that copy against the pin and for mode 0755 the
+   same way. It uses
    the host's Wayland and compiler runtime libraries and the host's `libgpg-error.so.0`. It also removes the bundled copies of libraries
    that host Mesa (`libEGL_mesa`, `libgallium`, `libgbm`, the DRI drivers) depends on, so the
    Ubuntu 22.04 copies never shadow the host's newer ones: `libzstd.so*`, `libelf.so*` and

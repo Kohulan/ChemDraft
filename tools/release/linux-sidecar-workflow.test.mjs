@@ -69,6 +69,12 @@ test("the Linux package build ships the committed sidecar it verified and never 
   assert.ok(bundle < clean && clean < debCheck && debCheck < appImageStage && appImageStage < squash);
   assert.ok(squash < reextract && reextract < appImageCheck && appImageCheck < record);
   assert.match(build, /sidecar="\$appdir\/usr\/bin\/avogadro3d-sidecar"\n\s+test -f "\$sidecar" \|\|/);
+  // The .deb archive itself must hold the sidecar as a regular file with mode 0755, checked before
+  // extraction can apply a umask.
+  const debMode = at(`sidecar_entry=$(dpkg-deb -c "$deb" | awk '$NF == "./usr/bin/avogadro3d-sidecar" { print $1 }')`);
+  assert.match(build, /\[ "\$sidecar_entry" = -rwxr-xr-x \] \|\| \{ echo "::error::[^"]+"; exit 1; \}/);
+  assert.ok(clean < debMode && debMode < debCheck);
+  assert.match(read("scripts/verify-committed-linux-sidecar.mjs"), /checkEngine3dSidecar\(payloadPath, \{ rootDir, log, packaged: true \}\)/);
   assert.doesNotMatch(build, /check-engine3d-sidecar\.mjs/, "packaged sidecars go through the pin, which runs the same checks");
   // Packaging neither builds the sidecar nor touches the tracked file: nothing is written into binaries/.
   assert.doesNotMatch(build, /cmake|_deps|native\/avogadro3d-sidecar\/build/);
@@ -90,8 +96,9 @@ test("the container smoke checks the installed sidecar from the .deb and the App
   const container = read(".github/workflows/linux-container-smoke.yml");
   const step = container.slice(container.indexOf("- name: Check the installed 3D sidecar"));
   assert.match(step, /check="\$GITHUB_WORKSPACE\/scripts\/check-engine3d-sidecar\.mjs"/);
-  assert.match(step, /node "\$check" \/usr\/bin\/avogadro3d-sidecar/);
-  assert.match(step, /"\$BUNDLE" --appimage-extract[\s\S]+node "\$check" "\$work\/squashfs-root\/usr\/bin\/avogadro3d-sidecar"/);
+  // Installed or extracted from a package, the sidecar must be a regular file with mode 0755.
+  assert.match(step, /node "\$check" --packaged \/usr\/bin\/avogadro3d-sidecar/);
+  assert.match(step, /"\$BUNDLE" --appimage-extract[\s\S]+node "\$check" --packaged "\$work\/squashfs-root\/usr\/bin\/avogadro3d-sidecar"/);
   assert.ok(container.indexOf("- name: Check the installed 3D sidecar") < container.indexOf("- name: Smoke test the Linux package"));
   assert.match(container, /- native\/avogadro3d-sidecar\/\*\*/);
   assert.match(container, /- scripts\/check-engine3d-sidecar\.mjs/);

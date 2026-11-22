@@ -6,9 +6,11 @@
 // message, as the app parses it (packages/engine3d-api).
 // Node built-ins only, and no binutils: it reads the ELF's dynamic section itself, so it runs the
 // same on the build runner and inside every distro container (which installs only `nodejs`).
-// Usage: node scripts/check-engine3d-sidecar.mjs <path to avogadro3d-sidecar>
+// With --packaged (a sidecar inside an extracted .deb or AppImage, or installed from one), it must also
+// be a regular file with mode exactly 0755, so every user can run it after a root-owned install.
+// Usage: node scripts/check-engine3d-sidecar.mjs [--packaged] <path to avogadro3d-sidecar>
 import { spawn } from "node:child_process";
-import { accessSync, constants, readFileSync, statSync } from "node:fs";
+import { accessSync, constants, lstatSync, readFileSync, statSync } from "node:fs";
 import { constants as osConstants } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -335,10 +337,23 @@ export function runSidecarHandshake(sidecar, input, { timeoutMs = HANDSHAKE_TIME
   });
 }
 
-export async function checkEngine3dSidecar(sidecar, { rootDir = ROOT_DIR, log = console.log } = {}) {
+/** Why a packaged sidecar's file type or mode is wrong, or undefined for a regular file with mode 0755. */
+export function packagedModeProblem(stats) {
+  if (!stats.isFile()) return "is not a regular file in the package";
+  const mode = stats.mode & 0o7777;
+  if (mode !== 0o755) return `has mode ${mode.toString(8).padStart(4, "0")} in the package; it must be 0755`;
+  return undefined;
+}
+
+export async function checkEngine3dSidecar(sidecar, { rootDir = ROOT_DIR, log = console.log, packaged = false } = {}) {
   const fail = (message) => { throw new SidecarCheckFailure(message); };
   let stats;
-  try { stats = statSync(sidecar); } catch { fail("missing"); }
+  // X_OK says only that this account may run it; a package must let every user run it.
+  try { stats = packaged ? lstatSync(sidecar) : statSync(sidecar); } catch { fail("missing"); }
+  if (packaged) {
+    const modeProblem = packagedModeProblem(stats);
+    if (modeProblem) fail(modeProblem);
+  }
   if (!stats.isFile()) fail("missing");
   try { accessSync(sidecar, constants.X_OK); } catch { fail("not executable"); }
   const binary = readFileSync(sidecar);
@@ -370,17 +385,19 @@ export async function checkEngine3dSidecar(sidecar, { rootDir = ROOT_DIR, log = 
   if (status !== 0) { show(); fail(`exited with status ${status}`); }
   const problem = handshakeProblem(stdout, commit);
   if (problem) { show(); fail(problem); }
-  log(`3D sidecar ${sidecar}: native x86-64 ELF; handshake complete (UFF, avogadrolibs ${commit}).`);
+  log(`3D sidecar ${sidecar}: native x86-64 ELF${packaged ? ", mode 0755" : ""}; handshake complete (UFF, avogadrolibs ${commit}).`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const sidecar = process.argv[2];
-  if (!sidecar) {
-    console.error("usage: check-engine3d-sidecar.mjs <path to avogadro3d-sidecar>");
+  const args = process.argv.slice(2);
+  const packaged = args[0] === "--packaged";
+  const sidecar = packaged ? args[1] : args[0];
+  if (!sidecar || args.length !== (packaged ? 2 : 1)) {
+    console.error("usage: check-engine3d-sidecar.mjs [--packaged] <path to avogadro3d-sidecar>");
     process.exit(2);
   }
   try {
-    await checkEngine3dSidecar(sidecar);
+    await checkEngine3dSidecar(sidecar, { packaged });
   } catch (error) {
     if (!(error instanceof SidecarCheckFailure)) throw error;
     // GitHub annotations, worded as the shell checks printed them.
