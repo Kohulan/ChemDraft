@@ -350,6 +350,34 @@ interface CdxmlColorTable {
 
 type CdxmlFont = Record<string, string>;
 
+/**
+ * Import caps for the font table and for one caption's runs. CDX font ids and styled-text run
+ * offsets are 16-bit (export writes no font id at or above 65535), so nothing ChemDraw writes
+ * exceeds these; a crafted file that does is cut to the cap with a warning rather than hanging the
+ * import (AGENTS.md §13).
+ */
+const CDXML_FONT_TABLE_LIMIT = 65_535;
+const CDXML_CAPTION_RUN_LIMIT = 65_535;
+
+/** The imported font table, and each id's name (the first entry wins, as a linear search did). */
+interface CdxmlImportFonts {
+  table: readonly CdxmlFont[];
+  nameById: ReadonlyMap<string | undefined, string | undefined>;
+}
+
+function importCdxmlFonts(tree: OrderedXmlTree, sourceFormat: string, warnings: CompatibilityConversionWarning[]): CdxmlImportFonts {
+  const listed = findElements(tree, "fonttable").flatMap(table => childElements(table, "font").map(font => font.attributes));
+  if (listed.length > CDXML_FONT_TABLE_LIMIT) {
+    warnings.push(warning("cdxml.font_table_truncated", `${sourceFormat} import: the font table lists ${listed.length} fonts, ` +
+      `more than the ${CDXML_FONT_TABLE_LIMIT} supported; only the first ${CDXML_FONT_TABLE_LIMIT} were imported, ` +
+      "and text set in a later font keeps the default font."));
+  }
+  const table = listed.slice(0, CDXML_FONT_TABLE_LIMIT);
+  const nameById = new Map<string | undefined, string | undefined>();
+  for (const font of table) if (!nameById.has(font.id)) nameById.set(font.id, font.name);
+  return { table, nameById };
+}
+
 interface CdxmlCrossingImportHint {
   sourceBondId: string;
   partnerBondIds: string[];
@@ -366,6 +394,8 @@ interface ImportPageContext {
   crossingHints: CdxmlCrossingImportHint[];
   colorTable: CdxmlColorTable;
   fonts: readonly CdxmlFont[];
+  /** Font name by id, built once per document (`importCdxmlFonts`). */
+  fontNameById: ReadonlyMap<string | undefined, string | undefined>;
   curveLineDefaults: Record<string, string>;
   preserveReactionIds: boolean;
   /** Every node id a lone pair may reference, abbreviation aliases included; undefined when ambiguous. */
@@ -3543,7 +3573,7 @@ function importVisibleCdxmlFromTree(tree: OrderedXmlTree, sourceFormat: "CDXML" 
 
   const importTransform = importTransformForTree(tree);
   const colorTable = importCdxmlColorTable(tree, warnings);
-  const fonts = findElements(tree, "fonttable").flatMap(table => childElements(table, "font").map(font => font.attributes));
+  const fonts = importCdxmlFonts(tree, sourceFormat, warnings);
   const root = tree.map(elementView).find(element => element?.name.toLowerCase() === "cdxml");
   const isChemDraftSource = root?.attributes.CreationProgram === chemDraftCreationProgram;
   const curveLineDefaults = cdxmlCurveLineDefaults(root?.attributes ?? {});
@@ -3683,7 +3713,7 @@ function importPageObjects(
   pageIndex: number,
   warnings: CompatibilityConversionWarning[],
   colorTable: CdxmlColorTable,
-  fonts: readonly CdxmlFont[],
+  fonts: CdxmlImportFonts,
   curveLineDefaults: Record<string, string>,
   sourceFormat: "CDXML" | "CDX",
   isChemDraftSource: boolean
@@ -3700,7 +3730,8 @@ function importPageObjects(
     displayByRefKey: new Map(),
     crossingHints: [],
     colorTable,
-    fonts,
+    fonts: fonts.table,
+    fontNameById: fonts.nameById,
     curveLineDefaults: { ...curveLineDefaults, ...cdxmlCurveLineDefaults(pageElement.attributes) },
     preserveReactionIds: findElements(pageElement.children, "scheme").length > 0 || findElements(pageElement.children, "step").length > 0,
     atomAnchorsBySourceId: new Map(),
@@ -5159,11 +5190,17 @@ function restoreFramedCaption(object: TextObject, element: XmlElementView, conte
   const alignments: Record<string, string> = { Center: "center", Right: "right", Left: "left", Full: "justify" };
   const align = alignments[a.Justification ?? "Left"];
   const runs = childElements(element, "s");
+  if (runs.length > CDXML_CAPTION_RUN_LIMIT) {
+    context.warnings.push({ code: "cdxml.text_runs_truncated", sourceObjectId: object.id,
+      message: `${context.sourceFormat} import: text ${a.id ?? object.id} has ${runs.length} styled runs, more than the ` +
+        `${CDXML_CAPTION_RUN_LIMIT} supported; its caption frame and run fonts were not restored, and it was imported as plain styled text.` });
+    return;
+  }
   if ((!box && a.BoundingBox !== undefined) || !parseCdxmlXyPoint(a.p) || !align || !runs.length || runs.length !== object.spans.length ||
       Object.keys(a).some(k => !["id", "p", "BoundingBox", "Justification", "color"].includes(k))) return;
   const spans: TextObject["spans"] = [];
   for (const [i, run] of runs.entries()) {
-    const font = context.fonts.find(f => f.id === run.attributes.font)?.name;
+    const font = context.fontNameById.get(run.attributes.font);
     const size = parseNumber(run.attributes.size), face = parseInteger(run.attributes.face ?? "0");
     if (!font || !size || size <= 0 || face === undefined || (face & ~103) || (face & 96) === 96 ||
         Object.keys(run.attributes).some(k => !["font", "size", "face", "color"].includes(k))) return;

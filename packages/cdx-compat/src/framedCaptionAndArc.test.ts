@@ -98,3 +98,66 @@ it.each([["0.5", 0.5], ["360", 360], ["-90", -90]])("keeps a stored arc's %s deg
   const again = openChemDraftPayload(output.contents).document!.pages[0].objects[0] as GraphicObject;
   expect(again.data.arcSweepRadians).toBeCloseTo(degrees * Math.PI / 180, 6);
 });
+
+// Codex 4658948336: resolving each caption run's font by a linear search of the font table made
+// a crafted file O(fonts × runs). Fonts are looked up by id from a map built once per document,
+// and the font table and a caption's runs are capped at CDX's 16-bit limit (65,535).
+// Before the map, 40,000 runs against 40,000 fonts took about 9 s; with it the whole import takes
+// about 0.7 s on a laptop, all of it the linear cost of parsing 80,000 elements (40,000 fonts
+// alone take ~0.26 s, 40,000 runs alone ~0.48 s). The bound leaves room for a loaded test runner
+// while still failing on any return of the quadratic search.
+const NO_HANG_MS = 2000;
+const fontTable = (count: number, name = (id: number) => `Font${id}`) =>
+  `<fonttable>${Array.from({ length: count }, (_, i) => `<font id="${i + 1}" charset="iso-8859-1" name="${name(i + 1)}"/>`).join("")}</fonttable>`;
+const caption = (id: number, runs: number, font: number, y = 72) =>
+  `<t id="${id}" p="30 ${y}" BoundingBox="30 ${y - 12} 54 ${y}" Justification="Left">` +
+  `${Array.from({ length: runs }, () => `<s font="${font}" size="10" face="0">x</s>`).join("")}</t>`;
+const timedOpen = (source: string) => {
+  const started = performance.now();
+  const opened = openChemDraftPayload(source);
+  return { opened, ms: performance.now() - started };
+};
+const textsOf = (opened: ReturnType<typeof openChemDraftPayload>) =>
+  opened.document!.pages[0].objects.filter((object): object is TextObject => object.type === "text");
+
+it("resolves 40,000 caption runs against 40,000 fonts in linear time", () => {
+  const { opened, ms } = timedOpen(`<CDXML>${fontTable(40_000)}<page>${caption(9, 40_000, 40_000)}</page></CDXML>`);
+  expect(ms).toBeLessThan(NO_HANG_MS);
+  const [text] = textsOf(opened);
+  expect(text?.spans).toHaveLength(40_000);
+  expect(text?.spans[39_999]?.style.fontFamily).toBe("Font40000");
+  expect(text?.style.fontFamily).toBe("Font40000");
+  expect(opened.warnings.map((warning) => warning.code)).not.toContain("cdxml.font_table_truncated");
+});
+
+it("resolves a duplicated font id to its first entry, as before", () => {
+  const source = '<CDXML><fonttable><font id="3" charset="iso-8859-1" name="Arial"/><font id="3" charset="iso-8859-1" name="Times"/></fonttable>' +
+    `<page>${caption(9, 1, 3)}</page></CDXML>`;
+  expect(textsOf(openChemDraftPayload(source))[0]?.style.fontFamily).toBe("Arial");
+});
+
+it("keeps the first 65,535 fonts of an oversized font table, warns, and does not hang", () => {
+  const source = `<CDXML>${fontTable(70_000)}<page>${caption(9, 1, 3)}${caption(10, 1, 70_000, 120)}</page></CDXML>`;
+  const { opened, ms } = timedOpen(source);
+  expect(ms).toBeLessThan(NO_HANG_MS);
+  const truncated = opened.warnings.filter((warning) => warning.code === "cdxml.font_table_truncated");
+  expect(truncated.map((warning) => warning.message)).toEqual([
+    "CDXML import: the font table lists 70000 fonts, more than the 65535 supported; only the first 65535 were imported, and text set in a later font keeps the default font."
+  ]);
+  const [kept, dropped] = textsOf(opened);
+  expect(kept?.style.fontFamily).toBe("Font3");
+  expect(dropped?.text).toBe("x");
+  expect(dropped?.style.fontFamily).toBeUndefined();
+});
+
+it("imports a caption with more than 65,535 runs as plain text with a warning, without hanging", () => {
+  const { opened, ms } = timedOpen(`<CDXML>${fontTable(3)}<page>${caption(9, 70_000, 3)}</page></CDXML>`);
+  expect(ms).toBeLessThan(NO_HANG_MS);
+  const [text] = textsOf(opened);
+  expect(text?.text).toBe("x".repeat(70_000));
+  expect(text?.style.fontFamily).toBeUndefined();
+  expect(text?.compatibility?.unknown.sourceCdxmlAttributes).toBeUndefined();
+  expect(opened.warnings.filter((warning) => warning.code === "cdxml.text_runs_truncated").map((warning) => warning.message)).toEqual([
+    "CDXML import: text 9 has 70000 styled runs, more than the 65535 supported; its caption frame and run fonts were not restored, and it was imported as plain styled text."
+  ]);
+});
