@@ -979,17 +979,38 @@ writes through its own `@chemdraft/chem-core` keeps the identities the SDK pinne
 second write to the same object still resolves. For that, the embedder:
 
 - commits in the same realm as its `PluginHost` (not in another Worker or iframe);
-- uses a chem-core with the same identity-runtime version (a copy that finds another version keeps
-  its identities private, so pins stop resolving and writes are refused: fail closed, never a wrong
-  match);
+- uses a chem-core with the same identity-runtime version, currently 2 (a copy that finds another
+  version keeps its identities private, so pins stop resolving and writes are refused: fail closed,
+  never a wrong match);
+- loads `@chemdraft/plugin-host` or chem-core before any script it does not trust runs in that realm;
 - calls `retainObjectIdentity(before, after)` from `@chemdraft/chem-core` for each object value it
   edits itself instead of through chem-core's patches (only a same-id, same-type value continues an
   object);
 - reports the document each write committed through the request's `onCommitted`, so the write's
   insertions are granted by the identity of the objects actually inserted.
 
-Run untrusted plugins in a Worker, as the app does: code in the host's own realm can always reach the
-host's globals.
+The first chem-core copy to load publishes the runtime as a fixed, hidden property that cannot be
+replaced. It exposes only what chem-core already exports: read an object's identity, test one, and
+continue an object onto its edited copy. Nothing in it can replace an identity an object already
+holds. The engine gives every object of every document it returns an identity, so nothing can move
+another object's identity onto an object in a document the engine returned. The runtime calls only
+built-ins captured when chem-core loads, so replacing `WeakMap.prototype` methods,
+`Function.prototype.call` or `Symbol` later changes nothing. A later copy adopts a published runtime
+only if it has exactly the runtime's shape and behaves as chem-core's on fresh probe objects. A
+runtime that answers every identity check with "yes" is not adopted. A copy that finds anything else
+under that key keeps its identities private: silently for a runtime of another version, otherwise
+with one console warning.
+
+Run untrusted plugins in a Worker, as the app does: code in the host's own realm can always reach
+the host's globals. Two limits remain. First, a script that runs in the realm before the first
+chem-core copy loads can publish a forgery that passes the adoption check: it behaves exactly like
+chem-core until it is asked about an object it targets. No check made from inside the realm can tell
+the two apart, and a script that runs first controls the realm anyway. Such scripts are out of
+scope. Second, a value created outside every document can still take an object's identity through
+the runtime's `retain` (chem-core's `retainObjectIdentity`), as an edited copy does. A patch parses
+anything it inserts into a new value. Such a value therefore reaches a document only if the host
+itself gives the engine a document that contains it (`adoptDerivedDocument`). Code the host trusts
+that far can change the document without any pin.
 
 ### Native tables (0.1.18)
 

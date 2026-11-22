@@ -27,7 +27,7 @@ import { bracketPairs, retainBracketIdentity, sameBracketIdentity,
 import { planImportedRepeatUnitDeletion, resolveRepeatUnitAtomMembership, type RepeatUnitMembershipOptions } from "./repeatUnitMembership";
 import { rotatePointAboutCenter } from "./pointRotation";
 import { nativeExtensionObjectScope, retainNativeExtension } from "./nativeCompatibilityState";
-import { retainObjectIdentity } from "./objectIdentity";
+import { holdObjectIdentities, retainObjectIdentity } from "./objectIdentity";
 
 export type ObjectReorderPlacement = "front" | "back" | "forward" | "backward";
 
@@ -191,6 +191,7 @@ export function applyPatches(
   }
   draft.updatedAt = toIsoTimestamp(options.now ?? new Date());
   const next = validateDraft(draft);
+  holdObjectIdentities(next);
   engineDocuments.add(next);
   if (freezeResults) {
     deepFreezeNew(next);
@@ -219,6 +220,7 @@ export function toEngineDocument(document: ChemDraftDocument): ChemDraftDocument
     return document;
   }
   const admitted = cloneDocument(document);
+  holdObjectIdentities(admitted);
   engineDocuments.add(admitted);
   if (freezeResults) {
     deepFreezeNew(admitted);
@@ -244,6 +246,7 @@ export function admitParsedDocument(document: ChemDraftDocument): ChemDraftDocum
   if (engineDocuments.has(document)) {
     return document;
   }
+  holdObjectIdentities(document);
   engineDocuments.add(document);
   if (freezeResults) {
     deepFreezeNew(document);
@@ -301,6 +304,7 @@ export function adoptDerivedDocument(base: ChemDraftDocument, next: ChemDraftDoc
     styles: next.styles !== base.styles,
     plugins: next.plugins !== base.plugins
   });
+  holdObjectIdentities(adopted);
   engineDocuments.add(adopted);
   if (freezeResults) {
     deepFreezeNew(adopted);

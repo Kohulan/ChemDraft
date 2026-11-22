@@ -9,7 +9,7 @@ import {
 } from "./schemas";
 import { engineDocuments } from "./engineDocuments";
 import { normalizeBracketPairs, retainBracketIdentity } from "./brackets";
-import { carryObjectIdentityToCopy } from "./objectIdentity";
+import { parseWithoutIdentityTransfers, retainObjectIdentity } from "./objectIdentity";
 import { DefaultPageLayout, createPageLayout, pageMarginFromLayout } from "./page-layout";
 import { ignorableFieldsForNativeFeatures, minimumAppVersionForDocument, NativeDocumentBaselineAppVersion, NativeDocumentFormatVersion } from "./documentFeatures";
 import { compareNativeVersions, restoreNativeExtensions, type NativeDocumentWriteWarning } from "./nativeCompatibilityState";
@@ -186,11 +186,12 @@ export function migrateLegacyTableObjects(candidate: unknown): unknown {
 }
 
 export function cloneDocument(document: ChemDraftDocument): ChemDraftDocument {
-  const clone = parseDocument(JSON.parse(JSON.stringify(document)) as unknown);
-  // A copy of the same document: each object keeps its host identity (objectIdentity.ts).
+  // A copy of the same document: each object keeps its host identity (objectIdentity.ts). The parse
+  // gives the copies none of their own, so each can take its original's.
+  const clone = parseWithoutIdentityTransfers(() => parseDocument(JSON.parse(JSON.stringify(document)) as unknown));
   document.pages.forEach((page, pageIndex) => page.objects.forEach((object, objectIndex) => {
     const copy = clone.pages[pageIndex]!.objects[objectIndex]!;
-    carryObjectIdentityToCopy(object, copy);
+    retainObjectIdentity(object, copy);
     if (object.type === "bracket") retainBracketIdentity(object, copy);
   }));
   return clone;
