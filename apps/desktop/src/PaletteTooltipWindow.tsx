@@ -88,9 +88,13 @@ export function placePaletteTooltip(input: {
   return { x, y };
 }
 
+export interface PaletteTooltipWindowProps {
+  platform?: ShortcutPlatform;
+}
+
 export function PaletteTooltipWindow({
   platform = detectShortcutPlatform()
-}: { platform?: ShortcutPlatform } = {}) {
+}: PaletteTooltipWindowProps) {
   const shellRef = useRef<HTMLDivElement | null>(null);
   const [payload, setPayload] = useState<PaletteTooltipPayload | undefined>();
   // Bumped SYNCHRONOUSLY by every show/hide broadcast. The layout effect's `cancelled` flag only
