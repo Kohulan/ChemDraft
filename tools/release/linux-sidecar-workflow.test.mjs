@@ -15,8 +15,11 @@ test("the Linux sidecar workflow builds the pinned sources, checks them, and upl
   const at = indexer(sidecar, "linux-sidecar-build.yml");
   assert.match(sidecar, /^on:\n  workflow_dispatch:\n  push:\n    branches:\n      - ci\/linux-sidecar-build\n\n/m);
   assert.match(sidecar, /runs-on: ubuntu-22\.04/);
-  const fetch = at("git clone https://github.com/OpenChemistry/avogadrolibs.git _deps/avogadrolibs");
-  const eigen = at('git -C _deps/eigen fetch --depth 1 origin "$eigen"');
+  // Both sources by commit alone, with no tags: avogadrolibs' CMake reads `git describe`.
+  const fetch = at('git -C _deps/avogadrolibs fetch --no-tags --depth 1 origin "$commit"');
+  const eigen = at('git -C _deps/eigen fetch --no-tags --depth 1 origin "$eigen"');
+  assert.doesNotMatch(sidecar, /git clone|fetch (?![^\n]*--no-tags)[^\n]*origin/);
+  assert.match(sidecar, /\[ -z "\$\(git -C _deps\/avogadrolibs tag\)" \] \|\|/);
   const configure = at("cmake --preset linux-x86_64");
   const compile = at("cmake --build --preset linux-x86_64");
   const handshake = at('node "$GITHUB_WORKSPACE/scripts/check-engine3d-sidecar.mjs" "$bin"');

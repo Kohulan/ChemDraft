@@ -33,12 +33,16 @@ Milestone 1 native build rules:
 Fetch local source dependencies into the ignored `_deps` directory:
 
 ```bash
-git clone https://github.com/OpenChemistry/avogadrolibs.git native/avogadro3d-sidecar/_deps/avogadrolibs
-git -C native/avogadro3d-sidecar/_deps/avogadrolibs checkout 416651ddaef33a4e20392392e7c0b505d446491b
+# By commit alone, with no tags: avogadrolibs' CMake reads `git describe`, which then falls
+# back to its fixed version (only Avogadro::version() uses it, and the sidecar never links that).
+git init -q native/avogadro3d-sidecar/_deps/avogadrolibs
+git -C native/avogadro3d-sidecar/_deps/avogadrolibs remote add origin https://github.com/OpenChemistry/avogadrolibs.git
+git -C native/avogadro3d-sidecar/_deps/avogadrolibs fetch --no-tags --depth 1 origin 416651ddaef33a4e20392392e7c0b505d446491b
+git -C native/avogadro3d-sidecar/_deps/avogadrolibs -c advice.detachedHead=false checkout FETCH_HEAD
 # Eigen 3.4.0 by its commit, not by the tag name, which upstream could move.
 git init -q native/avogadro3d-sidecar/_deps/eigen
 git -C native/avogadro3d-sidecar/_deps/eigen remote add origin https://gitlab.com/libeigen/eigen.git
-git -C native/avogadro3d-sidecar/_deps/eigen fetch --depth 1 origin 3147391d946bb4b6c68edd901f2add6ac1f31f8c
+git -C native/avogadro3d-sidecar/_deps/eigen fetch --no-tags --depth 1 origin 3147391d946bb4b6c68edd901f2add6ac1f31f8c
 git -C native/avogadro3d-sidecar/_deps/eigen -c advice.detachedHead=false checkout FETCH_HEAD
 ```
 

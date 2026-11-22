@@ -45,6 +45,10 @@ jobs:
 
       # The same Avogadro Core/Calc subset and commit define as the macOS and Windows sidecars
       # (native/avogadro3d-sidecar/README.md). A failed fetch or a moved pin fails the job.
+      # Both sources are fetched by commit alone, with no tags: avogadrolibs' CMake runs
+      # `git describe`, and upstream tags are movable input. With no tag it falls back to its
+      # fixed version (2.0.0, set in its CMakeLists.txt); that string feeds only
+      # Avogadro::version(), which the sidecar never links, so the binary does not change.
       - name: Fetch the pinned 3D sidecar sources
         id: sources
         working-directory: native/avogadro3d-sidecar
@@ -53,15 +57,18 @@ jobs:
           commit=$(grep -oE '[0-9a-f]{40}' CMakeLists.txt | sort -u)
           [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::CMakeLists.txt must pin exactly one avogadrolibs commit.'; exit 1; }
           rm -rf _deps
-          git clone https://github.com/OpenChemistry/avogadrolibs.git _deps/avogadrolibs
-          git -C _deps/avogadrolibs checkout "$commit"
+          git init -q _deps/avogadrolibs
+          git -C _deps/avogadrolibs remote add origin https://github.com/OpenChemistry/avogadrolibs.git
+          git -C _deps/avogadrolibs fetch --no-tags --depth 1 origin "$commit"
+          git -C _deps/avogadrolibs -c advice.detachedHead=false checkout FETCH_HEAD
           # Eigen 3.4.0 by its commit, not by the tag name, which upstream could move.
           eigen=3147391d946bb4b6c68edd901f2add6ac1f31f8c
           git init -q _deps/eigen
           git -C _deps/eigen remote add origin https://gitlab.com/libeigen/eigen.git
-          git -C _deps/eigen fetch --depth 1 origin "$eigen"
+          git -C _deps/eigen fetch --no-tags --depth 1 origin "$eigen"
           git -C _deps/eigen -c advice.detachedHead=false checkout FETCH_HEAD
           [ "$(git -C _deps/avogadrolibs rev-parse HEAD)" = "$commit" ] || { echo "::error::avogadrolibs is not at $commit."; exit 1; }
+          [ -z "$(git -C _deps/avogadrolibs tag)" ] || { echo '::error::The avogadrolibs checkout has tags; git describe must not see any.'; exit 1; }
           [ "$(git -C _deps/eigen rev-parse HEAD)" = "$eigen" ] || { echo "::error::Eigen is not at $eigen (3.4.0)."; exit 1; }
           test -f _deps/eigen/Eigen/Core || { echo '::error::Eigen 3.4.0 checkout has no Eigen/Core.'; exit 1; }
           echo "avogadrolibs $commit; Eigen 3.4.0 $(git -C _deps/eigen rev-parse HEAD)"
