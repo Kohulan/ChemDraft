@@ -175,6 +175,17 @@ const CHECK_FOR_UPDATES_COMMAND_ID: &str = "app.checkForUpdates";
 const CLOSE_WINDOW_FILE_MENU_ID: &str = "app.closeWindow.file";
 #[cfg(target_os = "macos")]
 const CLOSE_WINDOW_WINDOW_MENU_ID: &str = "app.closeWindow.window";
+/// Linux: muda's predefined Minimize, Maximize and Close Window are unsupported in GTK menus, so
+/// Linux builds ordinary items with these ids, acting on the document window. Two Close ids, one
+/// per menu, because muda item ids are meant to be unique.
+#[cfg(any(target_os = "linux", test))]
+const LINUX_MINIMIZE_MENU_ID: &str = "app.window.minimize";
+#[cfg(any(target_os = "linux", test))]
+const LINUX_TOGGLE_MAXIMIZE_MENU_ID: &str = "app.window.toggleMaximize";
+#[cfg(any(target_os = "linux", test))]
+const LINUX_CLOSE_WINDOW_FILE_MENU_ID: &str = "app.window.close.file";
+#[cfg(any(target_os = "linux", test))]
+const LINUX_CLOSE_WINDOW_WINDOW_MENU_ID: &str = "app.window.close.window";
 const DOM_COMMAND_EVENT: &str = "chemdraft:native-command";
 #[cfg(target_os = "macos")]
 const PALETTE_POINTER_EVENT: &str = "chemdraft://palette-pointer";
@@ -1551,6 +1562,11 @@ pub fn run() {
             if command_id == CLOSE_WINDOW_FILE_MENU_ID || command_id == CLOSE_WINDOW_WINDOW_MENU_ID
             {
                 close_key_window(app);
+                return;
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(action) = linux_window_menu_action(command_id) {
+                run_linux_window_menu_action(app, action);
                 return;
             }
             if (is_routed_menu_command(command_id)
@@ -7238,11 +7254,14 @@ fn resize_toolset_window(
         .map_err(|error| error.to_string())?
         .or_else(|| monitor_query::primary_monitor(app).ok().flatten())
         .ok_or("The tool palette's monitor is unavailable.")?;
+    let area = monitor_logical_work_area(&monitor);
+    // Only Linux builds use native Wayland (uses_native_wayland is false elsewhere). The compositor
+    // places the window, so cap both sides to the work area and leave the position alone.
     if utility_window::uses_native_wayland(app)? {
         window
             .set_size(tauri::LogicalSize::new(
-                width,
-                height.min(monitor_logical_work_area(&monitor).height),
+                width.min(area.width),
+                height.min(area.height),
             ))
             .map_err(|error| error.to_string())?;
         return Ok(true);
@@ -7252,14 +7271,16 @@ fn resize_toolset_window(
     let window_scale = window.scale_factor().unwrap_or(scale);
     let position = window.outer_position().map_err(|error| error.to_string())?;
     let origin = (position.x, position.y);
-    let mut placement = toolset_content_placement(
-        origin,
-        (width, height),
-        scale,
-        monitor_logical_work_area(&monitor),
-    );
+    let mut placement = toolset_content_placement(origin, (width, height), scale, area);
+    // Linux: a palette wider than its work area is capped to it and moved to the area's left edge,
+    // the one place it fits (toolset_content_placement). Keep that move rather than the old origin.
+    #[cfg(target_os = "linux")]
+    let keep_fitted_position = width > area.width;
+    #[cfg(not(target_os = "linux"))]
+    let keep_fitted_position = false;
     // The monitor under most of the palette can differ from the one under its title.
     if placement.position != origin
+        && !keep_fitted_position
         && monitor_query::available_monitors(app)
             .unwrap_or_default()
             .iter()
@@ -7289,6 +7310,13 @@ fn resize_toolset_window(
     {
         placement.position = origin;
     }
+    // X11/XWayland: pin the GtkWindow to the new size before resizing it. GTK clamps a resize to
+    // the window's current hints, which still hold the previous content size.
+    #[cfg(target_os = "linux")]
+    utility_window::pin_content_fit_frame(
+        &window,
+        tauri::PhysicalSize::new(placement.size.0, placement.size.1).into(),
+    )?;
     #[cfg(not(target_os = "macos"))]
     if placement.position == origin {
         windows_activation_log::frame_set(window.label(), "toolbar content fit", "pixels", || {
@@ -7333,7 +7361,24 @@ fn toolset_content_placement(
 ) -> panel_window_frame::Placement {
     let position =
         logical_toolset_position_from_physical(f64::from(position.0), f64::from(position.1), scale);
-    let (width, height) = (size.0, size.1.min(area.height));
+    let height = size.1.min(area.height);
+    // Linux: also cap the width (a 1311-px Main toolbar ran off a 1280-px screen), and start a
+    // capped palette at the work area's left edge, the only place a frame that wide fits. A palette
+    // that already fits keeps its width and position. macOS and Windows keep the measured width.
+    #[cfg(target_os = "linux")]
+    let (width, position) = if size.0 > area.width {
+        (
+            area.width,
+            ToolsetWindowPosition {
+                x: area.x,
+                ..position
+            },
+        )
+    } else {
+        (size.0, position)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let width = size.0;
     let position = toolset_position_in_work_area(position, width, height, area);
     let position = tauri::LogicalPosition::new(position.x, position.y).to_physical::<i32>(scale);
     let size = tauri::LogicalSize::new(width, height).to_physical::<u32>(scale);
@@ -10357,8 +10402,10 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                         CLOSE_WINDOW_FILE_MENU_ID,
                         view_state.has_multiple_document_tabs,
                     )?,
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(windows)]
                     &PredefinedMenuItem::close_window(app, None)?,
+                    #[cfg(target_os = "linux")]
+                    &linux_window_menu_item(app, LINUX_CLOSE_WINDOW_FILE_MENU_ID)?,
                     // A routed item, not PredefinedMenuItem::quit: on Windows muda's predefined Quit
                     // is a bare PostQuitMessage, which ends the event loop before the document
                     // window can flush its pending session autosave (see request_quit).
@@ -10492,8 +10539,16 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                 "Window",
                 true,
                 &[
+                    // muda leaves these predefined items out of GTK menus, which left Linux with
+                    // an empty Window menu. Linux uses ordinary items (linux_window_menu_item).
+                    #[cfg(not(target_os = "linux"))]
                     &PredefinedMenuItem::minimize(app, None)?,
+                    #[cfg(not(target_os = "linux"))]
                     &PredefinedMenuItem::maximize(app, None)?,
+                    #[cfg(target_os = "linux")]
+                    &linux_window_menu_item(app, LINUX_MINIMIZE_MENU_ID)?,
+                    #[cfg(target_os = "linux")]
+                    &linux_window_menu_item(app, LINUX_TOGGLE_MAXIMIZE_MENU_ID)?,
                     &PredefinedMenuItem::separator(app)?,
                     #[cfg(target_os = "macos")]
                     &close_window_menu_item(
@@ -10501,8 +10556,10 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                         CLOSE_WINDOW_WINDOW_MENU_ID,
                         view_state.has_multiple_document_tabs,
                     )?,
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(windows)]
                     &PredefinedMenuItem::close_window(app, None)?,
+                    #[cfg(target_os = "linux")]
+                    &linux_window_menu_item(app, LINUX_CLOSE_WINDOW_WINDOW_MENU_ID)?,
                 ],
             )?,
             // macOS keeps About in the application menu; elsewhere Help is its home.
@@ -10549,6 +10606,71 @@ fn close_window_menu_item<R: Runtime>(
         true,
         Some("CmdOrCtrl+W"),
     )
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinuxWindowMenuAction {
+    Minimize,
+    ToggleMaximize,
+    Close,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_window_menu_action(command_id: &str) -> Option<LinuxWindowMenuAction> {
+    match command_id {
+        LINUX_MINIMIZE_MENU_ID => Some(LinuxWindowMenuAction::Minimize),
+        LINUX_TOGGLE_MAXIMIZE_MENU_ID => Some(LinuxWindowMenuAction::ToggleMaximize),
+        LINUX_CLOSE_WINDOW_FILE_MENU_ID | LINUX_CLOSE_WINDOW_WINDOW_MENU_ID => {
+            Some(LinuxWindowMenuAction::Close)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_window_menu_title(command_id: &str) -> &'static str {
+    match linux_window_menu_action(command_id) {
+        Some(LinuxWindowMenuAction::Minimize) => "Minimize",
+        Some(LinuxWindowMenuAction::ToggleMaximize) => "Maximize / Restore",
+        Some(LinuxWindowMenuAction::Close) | None => "Close Window",
+    }
+}
+
+/// No accelerator: a GTK menu accelerator would take Ctrl+W (document.closeTab) and others from the
+/// webview, which owns those shortcuts on Linux.
+#[cfg(target_os = "linux")]
+fn linux_window_menu_item<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    id: &str,
+) -> tauri::Result<MenuItem<R>> {
+    MenuItem::with_id(app, id, linux_window_menu_title(id), true, None::<&str>)
+}
+
+/// The GTK menu bar belongs to the document window, so these act on it. Close goes through
+/// CloseRequested, the same path as the title bar's close button (it flushes autosave and quits).
+#[cfg(target_os = "linux")]
+fn run_linux_window_menu_action<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    action: LinuxWindowMenuAction,
+) {
+    let Some(main) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+        return;
+    };
+    let result = match action {
+        LinuxWindowMenuAction::Minimize => main.minimize(),
+        LinuxWindowMenuAction::ToggleMaximize => {
+            if main.is_maximized().unwrap_or(false) {
+                main.unmaximize()
+            } else {
+                main.maximize()
+            }
+        }
+        LinuxWindowMenuAction::Close => main.close(),
+    };
+    if let Err(error) = result {
+        eprintln!("Could not apply the ChemDraft Window menu action {action:?}: {error}");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -10978,16 +11100,14 @@ fn ensure_toolset_window<R: Runtime>(
         resizable,
     );
 
-    // A non-resizable GtkWindow publishes fixed size hints. On native Wayland these
-    // can conflict with the compositor's configure, such as Weston's kiosk fullscreen.
-    // Keep GTK resizable there while the toolbar still uses content-fit sizing.
+    // Keep every palette GtkWindow resizable on Linux. On native Wayland, a non-resizable
+    // GtkWindow's fixed size hints can conflict with the compositor's configure (Weston's kiosk
+    // fullscreen). On X11/XWayland, GTK 3 never shrinks a non-resizable window below 200x200, so
+    // every smaller palette gained an empty grey band (Main: 1311x200 for 85 px of content). X11
+    // content-fit palettes are pinned with min = max size hints instead
+    // (utility_window::pin_content_fit_frame), so the user still cannot resize them.
     #[cfg(target_os = "linux")]
-    let native_resizable = resizable
-        || run_on_main_thread_blocking(app, || {
-            use gtk::gdk::prelude::DisplayExtManual;
-
-            gtk::gdk::Display::default().is_some_and(|display| display.backend().is_wayland())
-        })?;
+    let native_resizable = true;
     #[cfg(not(target_os = "linux"))]
     let native_resizable = resizable;
     let native_wayland = utility_window::uses_native_wayland(app)?;
@@ -11058,6 +11178,19 @@ fn ensure_toolset_window<R: Runtime>(
     };
 
     disable_default_context_menus(&window);
+    // Before the first map: the size hints replace GTK's 200x200 floor, and the position hint
+    // keeps the window manager from re-placing the palette whenever it is shown again.
+    #[cfg(target_os = "linux")]
+    if !resizable && !native_wayland {
+        let webview: &tauri::Webview<R> = window.as_ref();
+        let pinned = utility_window::pin_content_fit_frame(
+            &webview.window(),
+            tauri::LogicalSize::new(width, height).into(),
+        );
+        panel_window::finish_installation(pinned, || {
+            window.destroy().map_err(|error| error.to_string())
+        })?;
+    }
     utility_window::prepare(&window, utility_window::Kind::Toolbar, native_wayland)?;
     configure_toolset_utility_window(&window, true)?;
     install_toolset_input_focus(&window)?;
@@ -15229,6 +15362,98 @@ mod tests {
             assert_eq!(fit.position, origin);
             assert_eq!(fit.size, ((60.0 * scale) as u32, (54.0 * scale) as u32));
         }
+    }
+
+    #[test]
+    fn palette_wider_than_the_work_area_is_capped_only_on_linux() {
+        // Linux VM report B3: a 1311-px Main toolbar on a 1280-px screen ran off the right edge.
+        let area = ScreenRect::new(0.0, 32.0, 1280.0, 768.0);
+        for scale in [1.0, 2.0] {
+            let physical = |(x, y): (f64, f64)| ((x * scale) as i32, (y * scale) as i32);
+            let origin = physical((88.0, 154.0));
+            let fit = toolset_content_placement(origin, (1311.0, 85.0), scale, area);
+            let size = ((1311.0 * scale) as u32, (85.0 * scale) as u32);
+            if cfg!(target_os = "linux") {
+                assert_eq!(fit.size, ((1280.0 * scale) as u32, size.1));
+                assert_eq!(fit.position, physical((0.0, 154.0)));
+            } else {
+                assert_eq!(fit.size, size);
+                assert_eq!(fit.position, origin);
+            }
+            // A palette that fits keeps its frame on every platform.
+            let fit = toolset_content_placement(origin, (1180.0, 85.0), scale, area);
+            assert_eq!(fit.size, ((1180.0 * scale) as u32, size.1));
+            assert_eq!(fit.position, origin);
+        }
+    }
+
+    #[test]
+    fn linux_window_menu_items_act_on_the_document_window() {
+        let ids = [
+            LINUX_MINIMIZE_MENU_ID,
+            LINUX_TOGGLE_MAXIMIZE_MENU_ID,
+            LINUX_CLOSE_WINDOW_FILE_MENU_ID,
+            LINUX_CLOSE_WINDOW_WINDOW_MENU_ID,
+        ];
+        assert_eq!(
+            ids.map(linux_window_menu_action),
+            [
+                Some(LinuxWindowMenuAction::Minimize),
+                Some(LinuxWindowMenuAction::ToggleMaximize),
+                Some(LinuxWindowMenuAction::Close),
+                Some(LinuxWindowMenuAction::Close),
+            ]
+        );
+        assert_eq!(
+            ids.map(linux_window_menu_title),
+            [
+                "Minimize",
+                "Maximize / Restore",
+                "Close Window",
+                "Close Window"
+            ]
+        );
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            ids.len()
+        );
+        for id in ids {
+            // Handled natively, never sent to the webview's command dispatcher.
+            assert!(!is_routed_menu_command(id));
+        }
+        assert_eq!(linux_window_menu_action("document.closeTab"), None);
+
+        // muda drops the predefined items from GTK menus, so Linux must build its own.
+        let source = include_str!("lib.rs");
+        let menu = source
+            .split("tauri::menu::WINDOW_SUBMENU_ID,")
+            .nth(1)
+            .unwrap()
+            .split("// macOS keeps About in the application menu")
+            .next()
+            .unwrap();
+        for item in [
+            "#[cfg(not(target_os = \"linux\"))]\n                    &PredefinedMenuItem::minimize",
+            "#[cfg(not(target_os = \"linux\"))]\n                    &PredefinedMenuItem::maximize",
+            "#[cfg(windows)]\n                    &PredefinedMenuItem::close_window",
+            "&linux_window_menu_item(app, LINUX_MINIMIZE_MENU_ID)?",
+            "&linux_window_menu_item(app, LINUX_TOGGLE_MAXIMIZE_MENU_ID)?",
+            "&linux_window_menu_item(app, LINUX_CLOSE_WINDOW_WINDOW_MENU_ID)?",
+        ] {
+            assert!(menu.contains(item), "Window menu lacks {item}");
+        }
+        assert!(source.contains("&linux_window_menu_item(app, LINUX_CLOSE_WINDOW_FILE_MENU_ID)?"));
+        let dispatch = source
+            .split(".on_menu_event(|app, event| {")
+            .nth(1)
+            .unwrap()
+            .split(".on_window_event(")
+            .next()
+            .unwrap();
+        assert!(dispatch.contains(
+            "if let Some(action) = linux_window_menu_action(command_id) {\n                \
+             run_linux_window_menu_action(app, action);\n                return;"
+        ));
     }
 
     #[test]

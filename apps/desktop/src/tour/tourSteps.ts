@@ -55,7 +55,7 @@ export function tourSteps(
   return [
     {
       title: "Welcome to ChemDraft",
-      text: "ChemDraft is a free, open-source chemical drawing app for Mac and Windows. Open Help > Take the Tour to revisit these steps."
+      text: "ChemDraft is a free, open-source chemical drawing app for Mac, Windows and Linux. Open Help > Take the Tour to revisit these steps."
     },
     {
       title: "Choose your shortcuts",
