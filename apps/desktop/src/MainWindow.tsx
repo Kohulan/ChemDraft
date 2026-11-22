@@ -15,7 +15,7 @@ import { documentDrawingDefaults } from "@chemdraft/document-workflow-core";
 import { nativeStylePresetPatchForSelection } from "./nativeStylePresetCommand";
 import { AtomProblemMarker } from "./AtomProblemMarker";
 import { atomProblemCommandId, atomProblemCommands, atomProblemSnapshot, type AtomProblemTarget } from "./atomProblemCommands";
-import { atomProblem, nativeImplicitHydrogenCount, type AtomProblemAction } from "@chemdraft/document-workflow-core";
+import { atomProblem, type AtomProblemAction } from "@chemdraft/document-workflow-core";
 import { applyNativeAtomProblemFix } from "./documentWorkflow";
 import { dropElectronMark, dropElectronMarksInSelection, electronMarkDropTarget, electronMarkName,
   resolveElectronMarksAfterMoleculePartMove, resolveElectronMarksInSelectionTransform } from "./electronMarkDrop";
@@ -287,11 +287,11 @@ import {
   atomLabelHaloWidthPx,
   atomLabelLayout,
   atomLabelRunFontSize,
+  atomDrawnHydrogenCount,
   averageDefinedDepthWeights,
   bondRefKey,
   depthCuedLabelColor,
   depthCuedLabelScale,
-  dativeDeprotonationCount,
   nativeAtomLabelReading,
   nativeBondOrderResolution,
   nativeElementFromAtomLabel,
@@ -34976,14 +34976,9 @@ export function electronMarkSpecStatusNoun(spec: NativeElectronMarkSpec, placedC
 function atomHasImplicitHydrogen(molecule: MoleculeObject, atom: MoleculeAtom): boolean {
   const element = nativeElementFromAtomLabel(atom.element);
   if (!element || element === "H" || atom.labelLiteral === true) return false;
-  const { atoms, bonds } = molecule;
-  const resolution = nativeBondOrderResolution(atoms, bonds);
-  const incidentBonds = resolution.bondsByAtom.get(atom.id) ?? [];
-  if (element === "C" && incidentBonds.length > 0 && incidentBonds.every(isDativeBond)) return false;
-  const count = nativeImplicitHydrogenCount(
-    element, resolution.bondOrderUsage.get(atom.id) ?? 0, atom.formalCharge, atom.markRadicals ?? 0
-  );
-  return count > dativeDeprotonationCount(atom, bonds, atoms, resolution);
+  // The hydrogens the drawn label shows (layout-engine, AGENTS.md §9): a stated count where the atom
+  // has one; none for a carbon bonded only datively.
+  return (atomDrawnHydrogenCount(atom, molecule.bonds, molecule.atoms) ?? 0) > 0;
 }
 
 function moleculeAriaLabel(object: MoleculeObject): string {

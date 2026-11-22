@@ -121,9 +121,12 @@ Synthetic coverage includes biphenyl/Ph, Boc-NH, OTBS, OMe and three independent
   charge and radicals (layout-engine's `atomImplicitHydrogenCount`). Owner ruling, 1.2.3: the
   file's count is kept exactly as written, the atom shows the red (!) badge (document-workflow-core's
   `nativeAtomValidationState`, `statedHydrogens`), and `cdxml.atom_hydrogen_count_kept` names each
-  such atom and both counts. A count that agrees is not stored. The drawn label, the formula and
-  SMILES count the derived hydrogens; the badge says by how much they differ, and the atom-problem
-  fix is "Use the derived hydrogen count", which drops the stated one;
+  such atom and both counts. A count that agrees is not stored. The kept count is the one the atom
+  has everywhere, exactly as if the atom had been made under-filled by hand (a typed literal "O"):
+  the drawn label ("O", not "OH"), the formula, the mass and SMILES count the stated hydrogens, and
+  RDKit receives them through the typed label's own route, the molfile's explicit valence (chem-core's
+  `atomStatedHydrogenCount`). The badge says how the stated count differs from the derived one, and
+  the atom-problem fix is "Use the derived hydrogen count", which drops the stated one;
 - on an atom with no single derived count, always: a label that is not an element, a hydrogen atom
   (named in the warning where its label counts differently), and a carbon bonded only datively.
 

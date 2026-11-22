@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { MoleculeObject } from "@chemdraft/chem-core";
+import { DefaultNativeDrawingStyle, type MoleculeObject } from "@chemdraft/chem-core";
+import { atomDisplayLabel } from "@chemdraft/layout-engine";
 import {
   nativeAtomValidationState,
   nativeMoleculeExportWarnings,
@@ -16,8 +17,10 @@ import { exportDocumentToCdx, exportDocumentToCdxml, importCdx, openChemDraftPay
  *
  * What the model does with a kept count on an atom with no aromatic bond: the atom carries it
  * (`hydrogenCount`), validation badges it, CDXML and CDX write it back, and an export warns. The
- * drawn label, the formula and SMILES count the derived hydrogens (layout-engine's
- * `atomImplicitHydrogenCount`), and the badge says by how much they differ.
+ * drawn label, the formula, the mass and SMILES count the STATED hydrogens, exactly as for the same
+ * atom made under-filled by hand (a typed literal "O"): chem-core's `atomStatedHydrogenCount`, which
+ * the molfile writer carries to RDKit in the typed label's own explicit-valence field. The badge
+ * compares it with the derived count (layout-engine's `atomImplicitHydrogenCount`).
  */
 function ethanolCdxml(attributes: { c1?: string; c2?: string; o?: string } = {}): string {
   return `<CDXML><page id="1"><fragment id="2">
@@ -46,6 +49,9 @@ const hydrogenWarnings = (result: ReturnType<typeof openChemDraftPayload>) =>
 
 const hydrogenCounts = (molecule: MoleculeObject) => molecule.atoms.map((atom) => atom.hydrogenCount);
 
+const labels = (molecule: MoleculeObject) => molecule.atoms.map((atom) =>
+  atomDisplayLabel(atom, molecule.bonds, DefaultNativeDrawingStyle, molecule.atoms));
+
 const badges = (molecule: MoleculeObject) => molecule.atoms.flatMap((atom) => {
   const state = nativeAtomValidationState(atom, molecule.bonds, atom.formalCharge, molecule.atoms);
   return state.valid ? [] : [[atom.id, state.invalidReason]];
@@ -72,14 +78,35 @@ describe("CDXML NumHydrogens that disagrees with the derived count", () => {
     expect(warnings[0]!.atomIds).toEqual([molecule.atoms[2]!.id]);
   });
 
-  it("keeps the label, formula and SMILES on the derived count, with the badge as their warning", () => {
+  it("draws, counts and writes the stated 0 H, exactly as an O made under-filled by hand, with the badge", () => {
     const { molecule } = open(ethanolCdxml({ o: 'NumHydrogens="0"' }));
     const metadata = nativeSingleBondGraphMetadata(molecule.atoms, molecule.bonds);
-    expect(metadata.formula).toBe("C2H6O");
+    expect(metadata.formula).toBe("C2H5O");
     expect(metadata.warnings.map((warning) => warning.code)).toEqual(["chemistry.invalid_valence"]);
-    expect(nativeSingleBondGraphSmiles(molecule.atoms, molecule.bonds)).toBe("CCO");
+    expect(labels(molecule)).toEqual([undefined, undefined, "O"]);
+    expect(nativeSingleBondGraphSmiles(molecule.atoms, molecule.bonds)).toBe("CC[O]");
     expect(nativeMoleculeExportWarnings(molecule).map((warning) => warning.message))
       .toEqual(["O3 states 0 H, but its bonds and charge give 1."]);
+    // The same O typed by hand (a literal label): the same label, formula, mass and SMILES.
+    const typed = { ...molecule, atoms: molecule.atoms.map((atom) => {
+      if (atom.element !== "O") return atom;
+      const { hydrogenCount: _stated, ...rest } = atom;
+      return { ...rest, labelLiteral: true };
+    }) };
+    const typedMetadata = nativeSingleBondGraphMetadata(typed.atoms, typed.bonds);
+    expect(labels(typed)).toEqual(labels(molecule));
+    expect([typedMetadata.formula, typedMetadata.averageMass, typedMetadata.exactMass])
+      .toEqual([metadata.formula, metadata.averageMass, metadata.exactMass]);
+    expect(nativeSingleBondGraphSmiles(typed.atoms, typed.bonds)).toBe(nativeSingleBondGraphSmiles(molecule.atoms, molecule.bonds));
+    expect(badges(typed).map(([id]) => id)).toEqual(badges(molecule).map(([id]) => id));
+  });
+
+  it("draws a methyl stated with 2 H as its label, and counts 2", () => {
+    const { molecule } = open(ethanolCdxml({ c1: 'NumHydrogens="2"' }));
+    // Its bond leaves to the right, so the hydrogens are drawn first, as for H3C.
+    expect(labels(molecule)[0]).toBe("H2C");
+    expect(nativeSingleBondGraphMetadata(molecule.atoms, molecule.bonds).formula).toBe("C2H5O");
+    expect(nativeSingleBondGraphSmiles(molecule.atoms, molecule.bonds)).toBe("[CH2]CO");
   });
 
   it("stores nothing and gives no warning where the stated counts agree with the derived ones", () => {
@@ -100,6 +127,8 @@ describe("CDXML NumHydrogens that disagrees with the derived count", () => {
     expect(molecule.bonds).toEqual(agreeing.molecule.bonds);
     expect(result.warnings).toEqual(agreeing.result.warnings);
     expect(nativeSingleBondGraphMetadata(molecule.atoms, molecule.bonds).formula).toBe("C2H6O");
+    expect(labels(molecule)).toEqual([undefined, undefined, "OH"]);
+    expect(nativeSingleBondGraphSmiles(molecule.atoms, molecule.bonds)).toBe("CCO");
   });
 
   it("names every disagreeing atom of a fragment in one warning", () => {

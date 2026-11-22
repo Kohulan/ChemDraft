@@ -51,7 +51,7 @@ describe("a stated hydrogen count on an atom with no aromatic bond", () => {
       statedHydrogens: { stated: 0, derived: 1 },
       invalidReason: "O states 0 H, but its bonds and charge give 1.",
       invalidDetail: "O atom o states 0 hydrogens (NumHydrogens), but its bonds and charge give 1; " +
-        "the stated count is kept, and the drawn label and formula count 1 until the count or the atom is changed."
+        "the stated count is kept, and the drawn label, formula and SMILES count 0 until the count or the atom is changed."
     });
   });
 
@@ -92,29 +92,56 @@ describe("a stated hydrogen count on an atom with no aromatic bond", () => {
       .toEqual(["O3 states 0 H, but its bonds and charge give 1."]);
   });
 
-  it("keeps the formula and SMILES on the derived count, the one the drawn label shows, and says so", () => {
+  it("counts the stated hydrogens in the formula, mass and SMILES, exactly as a typed literal O, and says so", () => {
     const stated = ethanol({ hydrogenCount: 0 });
+    const typed = ethanol({ labelLiteral: true });
     const metadata = nativeSingleBondGraphMetadata(stated.atoms, stated.bonds);
-    expect(metadata.formula).toBe("C2H6O");
+    const typedMetadata = nativeSingleBondGraphMetadata(typed.atoms, typed.bonds);
+    expect(metadata.formula).toBe("C2H5O");
+    expect({ ...metadata, warnings: [] }).toEqual({ ...typedMetadata, warnings: [] });
     expect(metadata.warnings).toEqual([{
       code: "chemistry.invalid_valence",
       message: state(stated, "o").invalidDetail,
       objectId: "o"
     }]);
-    expect(nativeSingleBondGraphSmiles(stated.atoms, stated.bonds)).toBe("CCO");
+    expect(typedMetadata.warnings.map((warning) => warning.code)).toEqual(["chemistry.invalid_valence"]);
+    expect(nativeSingleBondGraphSmiles(stated.atoms, stated.bonds)).toBe("CC[O]");
+    expect(nativeSingleBondGraphSmiles(stated.atoms, stated.bonds)).toBe(nativeSingleBondGraphSmiles(typed.atoms, typed.bonds));
+  });
+
+  it("writes a count above zero as the bracket atom the spelled label writes", () => {
+    const amine = ethanol({ element: "N", hydrogenCount: 1 });
+    const typed = ethanol({ element: "NH", labelLiteral: true });
+    expect(nativeSingleBondGraphSmiles(amine.atoms, amine.bonds)).toBe("CC[NH]");
+    expect(nativeSingleBondGraphSmiles(amine.atoms, amine.bonds)).toBe(nativeSingleBondGraphSmiles(typed.atoms, typed.bonds));
+    expect(nativeSingleBondGraphMetadata(amine.atoms, amine.bonds).formula).toBe("C2H6N");
+    const methyl = ethanol({}, { hydrogenCount: 2 });
+    expect(nativeSingleBondGraphSmiles(methyl.atoms, methyl.bonds)).toBe("[CH2]CO");
+    expect(nativeSingleBondGraphMetadata(methyl.atoms, methyl.bonds).formula).toBe("C2H5O");
+  });
+
+  it("changes nothing where the count agrees or there is none", () => {
+    for (const subject of [ethanol(), ethanol({ hydrogenCount: 1 }), ethanol({}, { hydrogenCount: 3 })]) {
+      expect(nativeSingleBondGraphMetadata(subject.atoms, subject.bonds).formula).toBe("C2H6O");
+      expect(nativeSingleBondGraphSmiles(subject.atoms, subject.bonds)).toBe("CCO");
+    }
   });
 });
 
 describe("SMILES export of a kept count, without the structure engine", () => {
-  it("warns with the badge, not with a radical the written SMILES does not imply", async () => {
-    // The native writer writes the derived count (a bare O), so the SMILES implies no radical; the
-    // difference from the stated count is the badge's to report.
+  it("warns exactly as for a typed literal O: the written [O] implies a radical the drawing does not show", async () => {
+    // The native writer writes the stated count (a bracket [O]), as it writes a typed O, so the SMILES
+    // implies a radical electron; that warning accounts for the badge on both, as it always has.
     const stated = ethanol({ hydrogenCount: 0 });
-    expect(nativeSmilesRadicalWarnings(stated)).toEqual([]);
+    const typed = ethanol({ labelLiteral: true });
+    expect(nativeSmilesRadicalWarnings(stated)).toEqual(nativeSmilesRadicalWarnings(typed));
     const warnings: ExportWarning[] = [];
-    expect(await moleculeSmiles(stated, 0, warnings, undefined)).toBe("CCO");
+    const typedWarnings: ExportWarning[] = [];
+    expect(await moleculeSmiles(stated, 0, warnings, undefined)).toBe("CC[O]");
+    expect(await moleculeSmiles(typed, 0, typedWarnings, undefined)).toBe("CC[O]");
+    expect(warnings).toEqual(typedWarnings);
     expect(warnings.map((warning) => [warning.code, warning.message])).toEqual([
-      ["export.invalid_structure", "O3 states 0 H, but its bonds and charge give 1."]
+      ["export.smiles_radical_loss", "Atom o (O) is drawn with 0 radical electrons; SMILES would imply 1 radical electron with its hydrogen count and formal charge."]
     ]);
   });
 });

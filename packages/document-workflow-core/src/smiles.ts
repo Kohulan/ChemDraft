@@ -2,8 +2,8 @@
 // Moved verbatim from apps/desktop/src/documentWorkflow.ts; see this package's README.
 
 import type { MoleculeAtom, MoleculeBond, MoleculeObject } from "@chemdraft/chem-core";
-import { rGroupNumberFromLabel } from "@chemdraft/chem-core";
-import { nativeBondOrderResolution } from "@chemdraft/layout-engine";
+import { atomStatedHydrogenCount, rGroupNumberFromLabel } from "@chemdraft/chem-core";
+import { atomImplicitHydrogenCount, nativeBondOrderResolution } from "@chemdraft/layout-engine";
 import {
   atomBondOrderUsageMap,
   expandNativeLabelGroups,
@@ -170,7 +170,7 @@ function nativeGraphSmiles(
   }
   const { atoms, bonds: inputBonds } = expandNativeLabelGroups(drawnAtoms, drawnBonds);
   const bonds = nativeSmilesWritableBonds(atoms, inputBonds, warningsOut);
-  const smilesByAtomId = nativeAtomSmilesById(atoms, bonds);
+  const smilesByAtomId = nativeAtomSmilesById(atoms, bonds, inputBonds);
   if (markedIds) {
     for (const [id, token] of smilesByAtomId) {
       smilesByAtomId.set(id, `\u0000${markedIds.length}\u0000${token}`);
@@ -479,7 +479,7 @@ function smilesChargeSuffix(charge: number): string {
   return magnitude === 1 ? sign : `${sign}${magnitude}`;
 }
 
-function nativeAtomSmiles(atom: MoleculeAtom | undefined, implicitHydrogens = 0): string {
+function nativeAtomSmiles(atom: MoleculeAtom | undefined, implicitHydrogens = 0, statedHydrogens?: number): string {
   if (!atom) {
     return "C";
   }
@@ -507,8 +507,11 @@ function nativeAtomSmiles(atom: MoleculeAtom | undefined, implicitHydrogens = 0)
     return `[${spelled.element}${hydrogens}${smilesChargeSuffix(atom.formalCharge)}]`;
   }
 
-  if (atom.isotope !== undefined || atom.formalCharge !== 0 || (atom.markRadicals ?? 0) > 0) {
-    const hydrogens = implicitHydrogens > 0 ? `H${implicitHydrogens === 1 ? "" : implicitHydrogens}` : "";
+  // A count the atom states for itself is written as stated, in brackets, as the spelled label that
+  // names it is ("OH" → [OH]); zero is a bracket atom with no H, as a typed literal O ([O]).
+  if (statedHydrogens !== undefined || atom.isotope !== undefined || atom.formalCharge !== 0 || (atom.markRadicals ?? 0) > 0) {
+    const count = statedHydrogens ?? implicitHydrogens;
+    const hydrogens = count > 0 ? `H${count === 1 ? "" : count}` : "";
     return `[${atom.isotope ?? ""}${element}${hydrogens}${smilesChargeSuffix(atom.formalCharge)}]`;
   }
 
@@ -531,14 +534,26 @@ function nativeAtomSmiles(atom: MoleculeAtom | undefined, implicitHydrogens = 0)
 /**
  * Per-atom SMILES tokens for the graph writers above, precomputed in one pass: the bracketed
  * charged/non-subset form must spell the atom's implicit hydrogens, and that count depends on the
- * whole bond set (`atomBondOrderUsageMap`), not on the atom alone.
+ * whole bond set (`atomBondOrderUsageMap`), not on the atom alone. `sourceBonds` are the bonds as
+ * drawn, before aromatic bonds were kekulized: whether an atom states its own hydrogen count
+ * (`atomStatedHydrogenCount`) depends on whether it has an aromatic bond.
  */
 function nativeAtomSmilesById(
   atoms: readonly MoleculeAtom[],
-  bonds: readonly MoleculeBond[]
+  bonds: readonly MoleculeBond[],
+  sourceBonds: readonly MoleculeBond[] = bonds
 ): Map<string, string> {
   const valenceUsage = atomBondOrderUsageMap(atoms, bonds);
   const placeholders = nativeElementLabelPlaceholders(atoms, bonds);
+  // A stated count is written only where it says something the bare atom does not: one that agrees
+  // with the derived count writes exactly as the same atom without it.
+  let sourceResolution: ReturnType<typeof nativeBondOrderResolution> | undefined;
+  const writtenStatedCount = (atom: MoleculeAtom): number | undefined => {
+    const stated = atomStatedHydrogenCount(atom, sourceBonds);
+    if (stated === undefined) return undefined;
+    sourceResolution ??= nativeBondOrderResolution(atoms, sourceBonds);
+    return stated === atomImplicitHydrogenCount(atom, sourceBonds, atoms, sourceResolution) ? undefined : stated;
+  };
   return new Map(atoms.map((atom) => {
     if (placeholders.has(atom.id)) {
       // A bonded "Ar" is aryl, not argon: the warned dummy atom any unspellable label gets.
@@ -562,6 +577,6 @@ function nativeAtomSmilesById(
           atom.markRadicals ?? 0
         )
       : 0;
-    return [atom.id, nativeAtomSmiles(atom, implicitHydrogens)] as const;
+    return [atom.id, nativeAtomSmiles(atom, implicitHydrogens, writtenStatedCount(atom))] as const;
   }));
 }

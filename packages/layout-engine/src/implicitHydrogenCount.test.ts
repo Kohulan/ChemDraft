@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { DefaultNativeDrawingStyle, type MoleculeAtom, type MoleculeBond } from "@chemdraft/chem-core";
 
-import { atomDisplayLabel, atomImplicitHydrogenCount } from "./index";
+import { atomDisplayLabel, atomDrawnHydrogenCount, atomImplicitHydrogenCount } from "./index";
 import { nativeBondOrderResolution } from "./valence";
 
 /**
@@ -93,3 +93,92 @@ describe("atomImplicitHydrogenCount agrees with the drawn label", () => {
     expect(atomDisplayLabel(atoms[0]!, [], { ...DefaultNativeDrawingStyle, atomLabelHideImplicitHydrogens: true }, atoms, resolution)).toBe("O");
   });
 });
+
+/**
+ * Owner ruling (1.2.3): a stated hydrogen count kept on an atom (a CDXML NumHydrogens that disagrees
+ * with the derived count; chem-core's `atomStatedHydrogenCount`) shows in the drawn label exactly as
+ * a hand-drawn under-filled atom does. `atomImplicitHydrogenCount` stays the derived count, the one
+ * the badge and the importer compare the stated count against.
+ */
+describe("a stated hydrogen count draws in the label", () => {
+  const ethanol = (oxygen: Partial<MoleculeAtom> = {}, methyl: Partial<MoleculeAtom> = {}) => {
+    const atoms = [atom("c1", "C", 0, 0, methyl), atom("c2", "C", 14, 8), atom("o", "O", 28, 0, oxygen)];
+    return { atoms, bonds: [bond("b1", "c1", "c2"), bond("b2", "c2", "o")] };
+  };
+  const label = (target: string, { atoms, bonds }: { atoms: MoleculeAtom[]; bonds: MoleculeBond[] }) =>
+    atomDisplayLabel(atoms.find((candidate) => candidate.id === target)!, bonds, DefaultNativeDrawingStyle, atoms);
+
+  it("an O stated with 0 H reads O, exactly as a typed literal O, while the derived count stays 1", () => {
+    const stated = ethanol({ hydrogenCount: 0 });
+    expect(both("o", stated.atoms, stated.bonds)).toEqual({ count: 1, countWithoutResolution: 1, label: "O" });
+    const typed = ethanol({ labelLiteral: true });
+    expect(label("o", stated)).toBe(label("o", typed));
+  });
+
+  it("a count above or below the derived one draws as stated, on either side of its bond", () => {
+    expect(label("o", ethanol({ hydrogenCount: 2 }))).toBe("OH2");
+    const amine = ethanol({ element: "N", hydrogenCount: 1 });
+    expect(label("o", amine)).toBe("NH");
+    // Bond from the right: the hydrogens go before the element, as for any implicit count.
+    const turned = { atoms: amine.atoms.map((candidate) => candidate.id === "o" ? { ...candidate, x: -14 } : candidate), bonds: amine.bonds };
+    turned.bonds = [bond("b1", "c1", "c2"), bond("b2", "c1", "o")];
+    expect(label("o", turned)).toBe("HN");
+  });
+
+  it("a carbon whose stated count disagrees shows its label, as a typed carbon does", () => {
+    // A methyl stated with 2 H (derived 3), internal and terminal; skeletal style hides an ordinary one.
+    // c1's bond comes from its right, so the hydrogens go first, as for H3C.
+    expect(label("c1", ethanol({}, { hydrogenCount: 2 }))).toBe("H2C");
+    expect(label("c1", ethanol())).toBeUndefined();
+    const ring = ringOf(["C", "C", "C", "C", "C", "C"], ["single", "double"]);
+    ring.atoms[0] = { ...ring.atoms[0]!, hydrogenCount: 0 };
+    expect(label("k0", ring)).toBe("C");
+    expect(label("k1", ring)).toBeUndefined();
+    // A label hidden on purpose stays hidden; the badge still marks the atom.
+    expect(label("c1", ethanol({}, { hydrogenCount: 2, labelVisible: false }))).toBeUndefined();
+  });
+
+  it("changes nothing where the count agrees, on an aromatic atom, or with no count", () => {
+    expect(label("o", ethanol({ hydrogenCount: 1 }))).toBe("OH");
+    expect(label("c1", ethanol({}, { hydrogenCount: 3 }))).toBeUndefined();
+    expect(label("o", ethanol())).toBe("OH");
+    // A pyrrole N–H stated on the ring: the Kekulé resolution carries it, as before.
+    const pyrrole = ringOf(["N", "C", "C", "C", "C"], ["aromatic"]);
+    pyrrole.atoms[0] = { ...pyrrole.atoms[0]!, hydrogenCount: 1 };
+    expect(label("k0", pyrrole)).toBe("NH");
+    const pyridine = ringOf(["N", "C", "C", "C", "C", "C"], ["aromatic"]);
+    pyridine.atoms[0] = { ...pyridine.atoms[0]!, hydrogenCount: 0 };
+    expect(label("k0", pyridine)).toBe("N");
+  });
+
+  it("a hydrogen atom and a carbon bonded only datively keep their labels as before", () => {
+    expect(label("h", { atoms: [atom("h", "H", 0, 0, { hydrogenCount: 0 })], bonds: [] }))
+      .toBe(label("h", { atoms: [atom("h", "H", 0, 0)], bonds: [] }));
+    const carbonyl = { atoms: [atom("c", "C", 0, 0, { labelVisible: true, hydrogenCount: 2 }), atom("fe", "Fe", 14)], bonds: [bond("d", "c", "fe", "single", true)] };
+    expect(label("c", carbonyl)).toBe("C");
+  });
+
+  it("atomDrawnHydrogenCount is the count the label draws: the stated one where the atom has it", () => {
+    const drawn = (target: string, { atoms, bonds }: { atoms: MoleculeAtom[]; bonds: MoleculeBond[] }) =>
+      atomDrawnHydrogenCount(atoms.find((candidate) => candidate.id === target)!, bonds, atoms);
+    expect(drawn("o", ethanol({ hydrogenCount: 0 }))).toBe(0);
+    expect(drawn("o", ethanol({ hydrogenCount: 2 }))).toBe(2);
+    expect(drawn("o", ethanol())).toBe(1);
+    expect(drawn("c1", ethanol())).toBe(3);
+    const pyrrole = ringOf(["N", "C", "C", "C", "C"], ["aromatic"]);
+    pyrrole.atoms[0] = { ...pyrrole.atoms[0]!, hydrogenCount: 1 };
+    expect(drawn("k0", pyrrole)).toBe(1);
+    const carbonyl = { atoms: [atom("c", "C", 0, 0, { hydrogenCount: 2 }), atom("fe", "Fe", 14)], bonds: [bond("d", "c", "fe", "single", true)] };
+    expect(drawn("c", carbonyl)).toBeUndefined();
+  });
+
+  it("the hidden-hydrogen style hides a stated count as it hides a derived one", () => {
+    const stated = ethanol({ element: "N", hydrogenCount: 1 });
+    const o = stated.atoms[2]!;
+    expect(atomDisplayLabel(o, stated.bonds, { ...DefaultNativeDrawingStyle, atomLabelHideImplicitHydrogens: true }, stated.atoms)).toBe("N");
+  });
+});
+
+function ringOf(elements: string[], orders: MoleculeBond["order"][]) {
+  return ring("k", elements, orders);
+}

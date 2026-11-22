@@ -2,7 +2,7 @@
 // native graph writer otherwise, with every approximation reported as an export warning.
 // Callers own engine loading; this shared writer also serves headless exports.
 
-import { isDativeBond, moleculeToMolfileV2000, moleculeBracketWarningMessages, rGroupNumberFromLabel, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
+import { atomStatedHydrogenCount, isDativeBond, moleculeToMolfileV2000, moleculeBracketWarningMessages, rGroupNumberFromLabel, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
 import type { ExportWarning } from "@chemdraft/export-engine";
 import {
   nativeAtomChargeIsExpressible,
@@ -24,9 +24,9 @@ export type ComputeStructureIdentifiers = typeof import("@chemdraft/rdkit-adapte
 export function nativeSmilesRadicalWarnings(molecule: MoleculeObject, evidence?: ExportProblemEvidence): ExportWarning[] {
   const { molecule: expanded } = expandNativeMoleculeLabelGroups(molecule);
   const resolution = nativeBondOrderResolution(expanded.atoms, expanded.bonds);
-  // The writer carries a stated count only through an aromatic ring's Kekulé resolution. Elsewhere
-  // it writes the derived count, so a stated count that disagrees there (kept on import and badged)
-  // implies no radical; the badge reports the difference instead.
+  // The writer carries a stated count through an aromatic ring's Kekulé resolution, and writes a
+  // count an atom states for itself elsewhere (`atomStatedHydrogenCount`) as a bracket atom with
+  // exactly that many H, as it writes a typed label. Any other stated count it does not write.
   const aromaticAtomIds = new Set(expanded.bonds.flatMap((bond) =>
     bond.order === "aromatic" ? [bond.fromAtomId, bond.toAtomId] : []));
   return expanded.atoms.flatMap((atom): ExportWarning[] => {
@@ -40,7 +40,7 @@ export function nativeSmilesRadicalWarnings(molecule: MoleculeObject, evidence?:
     if (element && nativeAtomValence[element] !== undefined &&
         nativeAtomChargeIsExpressible(element, atom.formalCharge)) {
       const valence = nativeAtomValenceForCharge(element, atom.formalCharge);
-      const stated = aromaticAtomIds.has(atom.id) ? atom.hydrogenCount : undefined;
+      const stated = aromaticAtomIds.has(atom.id) ? atom.hydrogenCount : atomStatedHydrogenCount(atom, expanded.bonds);
       const hydrogens = element === "H" ? 0 : atom.labelLiteral ? (spelled?.hydrogens ?? 0) :
         stated ?? spelled?.hydrogens ?? Math.max(0, valence - used - radicals);
       implied = Math.max(0, valence - used - hydrogens);

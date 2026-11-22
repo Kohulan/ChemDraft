@@ -32,6 +32,7 @@ import {
   DocumentStylePreset,
   Acs1996StylePreset,
   RscJournalStylePreset,
+  atomStatedHydrogenCount,
   drawnLabelBondSide,
   isDativeBond,
   isMetalSymbol,
@@ -7478,11 +7479,15 @@ export function atomDisplayLabelPlacement(
   // hydrogen count ever. Everything else follows the classic skeletal convention: the
   // remaining valence (`atomImplicitHydrogenCount`, the one count the formula, the valence check
   // and the CDXML importer share) is drawn as implicit hydrogens unless the style hides them. A
-  // carbon bonded only datively has no count and draws none.
+  // carbon bonded only datively has no count and draws none. A count the atom states for itself
+  // (chem-core's `atomStatedHydrogenCount`, a kept CDXML NumHydrogens) is drawn in place of the
+  // derived one, as the formula, SMILES and the engine's molfile count it (owner ruling 1.2.3), so
+  // an O stated with 0 H reads "O", exactly like a typed one.
   const incidentBonds = resolution.bondsByAtom.get(atom.id) ?? [];
+  const drawnHydrogens = atomDrawnHydrogenCount(atom, bonds, atoms, resolution);
   const implicitHydrogens = drawingStyle.atomLabelHideImplicitHydrogens || atom.labelLiteral === true
     ? ""
-    : implicitHydrogenLabel(atomImplicitHydrogenCount(atom, bonds, atoms, resolution) ?? 0);
+    : implicitHydrogenLabel(drawnHydrogens ?? 0);
 
   if (element === "C" && formalCharge === 0 && atom.isotope === undefined) {
     const terminalCarbon = atoms.length > 0 && heavyAtomNeighborCount(atom.id, resolution) === 1;
@@ -7490,10 +7495,15 @@ export function atomDisplayLabelPlacement(
     // contributes no valence, so testing valenceUsed here labeled the carbon at the end of
     // every dashed bond as CH4 instead of drawing a plain stick.
     const bonded = incidentBonds.length > 0;
+    // A carbon whose stated count disagrees with the derived one is drawn with its label, as a
+    // typed carbon is: a skeletal vertex cannot show that it carries fewer or more hydrogens.
+    const statedHydrogens = atomStatedHydrogenCount(atom, bonds);
+    const statedCountShows = statedHydrogens !== undefined &&
+      statedHydrogens !== atomImplicitHydrogenCount(atom, bonds, atoms, resolution);
     const shouldShowCarbon =
       atom.labelVisible === true ||
       !bonded ||
-      (atom.labelVisible !== false && drawingStyle.atomLabelShowTerminalCarbons && terminalCarbon);
+      (atom.labelVisible !== false && (statedCountShows || (drawingStyle.atomLabelShowTerminalCarbons && terminalCarbon)));
     if (!shouldShowCarbon) {
       return undefined;
     }
@@ -7516,14 +7526,33 @@ export function atomDisplayLabelPlacement(
 }
 
 /**
+ * The hydrogens an element atom's label draws when its style shows them, for a label that is not a
+ * typed literal: the count the atom states for itself (chem-core's `atomStatedHydrogenCount`, a kept
+ * CDXML NumHydrogens) where it has one, else the derived `atomImplicitHydrogenCount`. The formula,
+ * SMILES and the engine's molfile count the same hydrogens (owner ruling 1.2.3). Undefined where
+ * there is no single count. App code that needs "the hydrogens this atom shows" asks here.
+ */
+export function atomDrawnHydrogenCount(
+  atom: MoleculeAtom,
+  bonds: readonly CoreMoleculeBond[],
+  atoms: readonly MoleculeAtom[],
+  resolution: NativeBondOrderResolution = nativeBondOrderResolution(atoms, bonds)
+): number | undefined {
+  return atomStatedHydrogenCount(atom, bonds) ?? atomImplicitHydrogenCount(atom, bonds, atoms, resolution);
+}
+
+/**
  * The implicit hydrogens an element atom carries, exactly as `atomDisplayLabelPlacement` draws them
  * when its style shows hydrogens: valence for the FULL formal charge (a floating mark's charge
  * included), less the bond orders (aromatic bonds at their Kekulé orders), each radical's unpaired
  * electron, and any dative deprotonation (`dativeDeprotonationCount`). Undefined where there is no
  * single count: a label that is not an element symbol, and a carbon bonded only datively, whose
  * label shows no H while the formula counts them. Display choices (a literal label, the
- * hidden-hydrogen style) are the planner's and do not change the count. The CDXML importer compares
- * a stated NumHydrogens against this same function, so the warning and the drawing cannot disagree.
+ * hidden-hydrogen style) are the planner's and do not change the count. This is always the DERIVED
+ * count: the CDXML importer and the validator compare a stated NumHydrogens against it, so the
+ * warning, the badge and the drawing cannot disagree. Where an atom states its own count
+ * (chem-core's `atomStatedHydrogenCount`), the label draws that count instead, as the formula,
+ * SMILES and the engine's molfile do.
  */
 export function atomImplicitHydrogenCount(
   atom: MoleculeAtom,

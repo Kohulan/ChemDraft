@@ -4,6 +4,7 @@
 // this package's README.
 
 import {
+  atomStatedHydrogenCount,
   drawnLabelBondSide,
   normalizeAtomIsotope,
   UnknownBondOrderError,
@@ -101,7 +102,8 @@ export interface NativeAtomValidationState {
   /**
    * Set when an atom with no aromatic bond states a hydrogen count (`hydrogenCount`, a CDXML
    * NumHydrogens) that disagrees with the count derived from its bonds, charge and radicals. The
-   * stated count is kept (owner ruling 1.2.3); `derived` is what the label and formula count.
+   * stated count is kept and is the one the label, formula, SMILES and the engine's molfile count
+   * (owner ruling 1.2.3); `derived` is what the bonds, charge and radicals give.
    */
   statedHydrogens?: { stated: number; derived: number };
 }
@@ -313,11 +315,12 @@ export function nativeAtomValidationState(
 /**
  * A stated count on an atom with no aromatic bond is the source's count for that atom, not a
  * Kekulé constraint. Owner ruling (1.2.3): where it disagrees with the count derived from the bonds,
- * charge and radicals (layout-engine's `atomImplicitHydrogenCount`, the count the drawn label and
- * formula use) it is kept and badged, like any under- or over-filled atom. Checked only once the
- * atom is otherwise valid, so a valence or charge problem is reported (and fixed) first. A typed
- * literal label spells its own hydrogens and has its own check; a carbon bonded only datively has
- * no single derived count, so neither is judged here.
+ * charge and radicals (layout-engine's `atomImplicitHydrogenCount`) it is kept, counted everywhere
+ * (label, formula, SMILES, the engine's molfile: chem-core's `atomStatedHydrogenCount`) and badged,
+ * like any under- or over-filled atom. Checked only once the atom is otherwise valid, so a valence
+ * or charge problem is reported (and fixed) first. A typed literal label spells its own hydrogens
+ * and has its own check; a carbon bonded only datively has no single derived count, so neither is
+ * judged here.
  */
 function nativeStatedHydrogenDiagnostic(
   atom: MoleculeAtom,
@@ -345,7 +348,7 @@ function nativeStatedHydrogenDiagnostic(
     statedHydrogens: { stated, derived },
     invalidReason: `${element} states ${stated} H, but its bonds and charge give ${derived}.`,
     invalidDetail: `${element} atom ${atom.id} states ${stated} hydrogen${stated === 1 ? "" : "s"} (NumHydrogens), but its bonds and charge give ${derived}; ` +
-      `the stated count is kept, and the drawn label and formula count ${derived} until the count or the atom is changed.`
+      `the stated count is kept, and the drawn label, formula and SMILES count ${stated} until the count or the atom is changed.`
   };
 }
 
@@ -1079,10 +1082,12 @@ export function nativeSingleBondGraphMetadata(
 
     // A literal label (typed with the text tool) contributes exactly what it says — the
     // formula must not invent hydrogens for it: a lone typed "C" is C, not CH4. Drawn atoms
-    // keep the skeletal convention and count their implicit hydrogens.
+    // keep the skeletal convention and count their implicit hydrogens, except that a count the
+    // atom states for itself (`atomStatedHydrogenCount`, a kept CDXML NumHydrogens) is counted as
+    // stated, as the label and the engine's molfile count it.
     const valenceUsed = valenceUsage.get(atom.id) ?? 0;
     if (element !== "H" && atom.labelLiteral !== true) {
-      const implicitHydrogens = Math.max(0, nativeImplicitHydrogenCount(
+      const implicitHydrogens = atomStatedHydrogenCount(sourceAtom, countedBonds) ?? Math.max(0, nativeImplicitHydrogenCount(
         element,
         valenceUsed,
         atom.formalCharge,

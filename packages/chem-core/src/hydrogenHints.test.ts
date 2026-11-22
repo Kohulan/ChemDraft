@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyPatches, createEmptyDocument, dropOrphanedHydrogenHints, type MoleculeObject } from "./index";
+import { applyPatches, atomStatedHydrogenCount, createEmptyDocument, dropOrphanedHydrogenHints, type MoleculeObject } from "./index";
 
 // A pyrrole as CDXML imports it (aromatic ring bonds, the N's NumHydrogens and one carbon's kept),
 // with a single N–Zn bond whose dative meaning an edit can toggle.
@@ -201,5 +201,44 @@ describe("a stated count on an atom with no aromatic bond lasts until that atom 
     const added = applyPatches(document, [{ op: "addObject", pageId: document.pages[0]!.id, object: ethoxy() }])
       .pages[0]!.objects[0] as MoleculeObject;
     expect(oxygen(added).hydrogenCount).toBe(0);
+  });
+});
+
+describe("atomStatedHydrogenCount: the count an atom states for itself", () => {
+  const chain = (atom: Partial<MoleculeObject["atoms"][number]>, order: MoleculeObject["bonds"][number]["order"] = "single", dashed = false) => {
+    const atoms: MoleculeObject["atoms"] = [
+      { id: "c", element: "C", x: 0, y: 0, formalCharge: 0 },
+      { id: "x", element: "O", x: 20, y: 0, formalCharge: 0, ...atom }
+    ];
+    const bonds: MoleculeObject["bonds"] = [
+      { id: "b", fromAtomId: "c", toAtomId: "x", order, ...(dashed ? { display: { bondStyle: "dashed" as const } } : {}) }
+    ];
+    return { atom: atoms[1]!, bonds };
+  };
+  const stated = (atom: Partial<MoleculeObject["atoms"][number]>, order?: MoleculeObject["bonds"][number]["order"], dashed?: boolean) => {
+    const subject = chain(atom, order, dashed);
+    return atomStatedHydrogenCount(subject.atom, subject.bonds);
+  };
+
+  it("is the stated count on an ordinary element atom, zero included", () => {
+    expect(stated({ hydrogenCount: 0 })).toBe(0);
+    expect(stated({ hydrogenCount: 2, element: "N" })).toBe(2);
+    expect(stated({ hydrogenCount: 0 }, "double")).toBe(0);
+    expect(stated({ hydrogenCount: 3, element: "C" })).toBe(3);
+  });
+
+  it("is undefined with no count, on a typed literal label, and on an aromatic bond", () => {
+    expect(stated({})).toBeUndefined();
+    expect(stated({ hydrogenCount: 0, labelLiteral: true })).toBeUndefined();
+    expect(stated({ hydrogenCount: 0 }, "aromatic")).toBeUndefined();
+    const pyrrole = imported();
+    expect(pyrrole.atoms.map((atom) => atomStatedHydrogenCount(atom, pyrrole.bonds))).toEqual(pyrrole.atoms.map(() => undefined));
+  });
+
+  it("is undefined on hydrogen, a label that is not an element, and a carbon bonded only datively", () => {
+    for (const element of ["H", "D", "T", "*", "R1", "OMe", "o"]) expect(stated({ hydrogenCount: 0, element })).toBeUndefined();
+    expect(stated({ hydrogenCount: 0, element: "C" }, "single", true)).toBeUndefined();
+    // Only carbon lacks a single derived count on a dative bond alone; a dative N donor has one.
+    expect(stated({ hydrogenCount: 0, element: "N" }, "single", true)).toBe(0);
   });
 });

@@ -1,25 +1,36 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { Molecule } from "openchemlib";
-import { atomProblem, nativeAtomValidationState, nativeAtomLabelReading, nativeSingleBondGraphSmiles } from "@chemdraft/document-workflow-core";
+import { atomProblem, moleculeSmiles, nativeAtomValidationState, nativeAtomLabelReading, nativeSingleBondGraphMetadata, nativeSingleBondGraphSmiles } from "@chemdraft/document-workflow-core";
+import { exportDocumentToCdxml } from "@chemdraft/cdx-compat";
+import type { ExportWarning } from "@chemdraft/export-engine";
+import { atomDisplayLabel } from "@chemdraft/layout-engine";
+import { computeStructureIdentifiers } from "@chemdraft/rdkit-adapter/identifiers";
+import { analyzeStructure, type AnalysisInputFormat } from "../../../packages/rdkit-adapter/src/analysis";
+import { resetRdkitForTesting } from "../../../packages/rdkit-adapter/src/conformer";
+import { installRealRdkitModuleLoader } from "../../../packages/rdkit-adapter/src/testing";
 import { CommandRegistry } from "@chemdraft/plugin-host";
 import { allShellCommands } from "./commands";
 import { createCoreCommandRegistrar } from "./commands/coreCommandRegistrar";
 import { atomProblemCommandId, atomProblemCommands } from "./atomProblemCommands";
 import {
+  analysisFacingStructure,
   applyNativeAtomElementTarget,
   applyNativeAtomProblemFix,
+  commitNativeAtomLabelTarget,
+  copyAsMolfile,
   applyNativeMoleculeBondOrderValueTarget,
   createNativeSavePayload,
   createSelectionClipboardPayload,
   duplicateSelectedDocumentObjects,
   moveNativeMoleculeParts,
+  nativeMoleculeInvalidAtomStates,
   normalizeCommittedDocument,
   openNativeDocument,
   pasteSelectionClipboardPayload,
   rotateSelectedDocumentObjects90
 } from "./documentWorkflow";
-import type { ChemDraftDocument, MoleculeObject } from "@chemdraft/chem-core";
+import { nativeDrawingStyleFromObjectStyle, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
 import { problemDocument, problemMolecule } from "./testSupport/atomProblemFixtures";
 import { DialogCoordinator } from "./dialogs/DialogCoordinator";
 import { dialogEnvelope, parseDialogMessage, type AtomProblemSnapshot, type DialogMessage } from "./dialogs/dialogProtocol";
@@ -276,6 +287,122 @@ describe("a CDXML atom whose stated hydrogen count disagrees, in the app", () =>
     expect(oxygenOf(fixed).hydrogenCount).toBeUndefined();
     expect(atomProblem(fixed, oxygen.id)).toBeUndefined();
     expect(canonical(nativeSingleBondGraphSmiles(fixed.atoms, fixed.bonds))).toBe(canonical("CCO"));
+  });
+});
+
+// Owner ruling (1.2.3), confirmed: the stated count shows everywhere, exactly like a hand-drawn
+// under-filled atom. The same ethanol, its O made under-filled by hand through the label editor (a
+// typed "O", which the app keeps literal), is the reference: label, badge, formula, exact mass and
+// SMILES must be equal, each read the way the app reads it (layout-engine's label, the validator's
+// badge, RDKit for the formula, mass and SMILES through the structure the app hands the engine).
+describe("a stated hydrogen count shows everywhere, as a hand-drawn under-filled atom does", () => {
+  beforeAll(() => { installRealRdkitModuleLoader(); });
+  afterAll(() => { resetRdkitForTesting(); });
+
+  const plainCdxml = statedOxygenCdxml.replace(' NumHydrogens="0"', "");
+  const handDrawn = () => {
+    const document = openedDocument(plainCdxml);
+    const [molecule] = moleculesOrThrow(document);
+    const oxygen = oxygenOf(molecule);
+    const typed = commitNativeAtomLabelTarget(document, { objectId: molecule.id, kind: "atom", atomId: oxygen.id, distanceToPointer: 0 },
+      "O", { literal: true, replaceElement: true });
+    return normalizeCommittedDocument(typed.document);
+  };
+  let runs = 0;
+  async function reading(document: ChemDraftDocument) {
+    const [molecule] = moleculesOrThrow(document);
+    const style = nativeDrawingStyleFromObjectStyle(molecule.style);
+    const { structureFormat, structure } = analysisFacingStructure(molecule);
+    runs += 1;
+    const run = await analyzeStructure({ format: structureFormat as AnalysisInputFormat, value: structure,
+      runId: `stated-h-${runs}`, startedAt: "2026-11-22T12:00:00.000Z" });
+    const composition = run.results.find((entry) => entry.id === "rdkit.composition");
+    if (composition?.kind !== "composition") throw new Error(`no composition result (run status ${run.status})`);
+    const mass = run.results.find((entry) => entry.id === "rdkit.monoisotopic-mass");
+    if (mass?.kind !== "scalar") throw new Error(`no monoisotopic mass result (run status ${run.status})`);
+    const exactMass = mass.value;
+    const smilesWarnings: ExportWarning[] = [];
+    const smiles = await moleculeSmiles(molecule, 0, smilesWarnings, computeStructureIdentifiers);
+    // The metadata an edit stores on the molecule (a freshly opened file has none cached yet).
+    const native = nativeSingleBondGraphMetadata(molecule.atoms, molecule.bonds);
+    return {
+      labels: molecule.atoms.map((atom) => atomDisplayLabel(atom, molecule.bonds, style, molecule.atoms)),
+      badged: nativeMoleculeInvalidAtomStates(molecule).filter((state) => !state.warningSuppressed).map((state) => state.atomId),
+      formula: composition.formula,
+      storedFormula: native.formula,
+      storedExactMass: native.exactMass,
+      exactMass,
+      smiles,
+      smilesWarnings: smilesWarnings.map((warning) => [warning.code, warning.message])
+    };
+  }
+
+  it("opened with the O stated at 0 H: label O, the badge, and RDKit's formula and SMILES for that O", async () => {
+    const document = openedDocument();
+    const [molecule] = moleculesOrThrow(document);
+    const read = await reading(document);
+    expect(read.labels).toEqual([undefined, undefined, "O"]);
+    expect(read.badged).toEqual([oxygenOf(molecule).id]);
+    expect(read.formula).toBe("C2H5O");
+    expect(read.storedFormula).toBe("C2H5O");
+    expect(read.smiles).toBe("CC[O]");
+    // C2H5O: 2 × 12 + 5 × 1.00782503207 + 15.99491461956, RDKit's monoisotopic mass for the radical.
+    expect(read.exactMass).toBeCloseTo(45.0340, 4);
+    expect(read.storedExactMass).toBeCloseTo(45.0340, 4);
+  });
+
+  it("is identical to the same O made under-filled by hand", async () => {
+    const typedDocument = handDrawn();
+    const [typedMolecule] = moleculesOrThrow(typedDocument);
+    expect(oxygenOf(typedMolecule)).toMatchObject({ labelLiteral: true });
+    expect(oxygenOf(typedMolecule).hydrogenCount).toBeUndefined();
+    const typed = await reading(typedDocument);
+    const stated = await reading(openedDocument());
+    expect(stated).toEqual(typed);
+    expect(typed.badged).toEqual([oxygenOf(typedMolecule).id]);
+  });
+
+  it("\"Use the derived hydrogen count\" gives OH, C2H6O and CCO", async () => {
+    const document = openedDocument();
+    const [molecule] = moleculesOrThrow(document);
+    const fixed = normalizeCommittedDocument(applyNativeAtomProblemFix(document, molecule.id, oxygenOf(molecule).id, "hydrogens")!.document);
+    const read = await reading(fixed);
+    expect(read).toMatchObject({ labels: [undefined, undefined, "OH"], badged: [], formula: "C2H6O", storedFormula: "C2H6O", smiles: "CCO", smilesWarnings: [] });
+    expect(read).toEqual(await reading(openedDocument(plainCdxml)));
+  });
+
+  it("leaves a file without NumHydrogens, or with agreeing ones, as it was", async () => {
+    const agreeing = statedOxygenCdxml.replace('NumHydrogens="0"', 'NumHydrogens="1"').replace('<n id="10" p="100 100"/>', '<n id="10" p="100 100" NumHydrogens="3"/>');
+    for (const contents of [plainCdxml, agreeing]) {
+      expect(await reading(openedDocument(contents))).toMatchObject({
+        labels: [undefined, undefined, "OH"], badged: [], formula: "C2H6O", storedFormula: "C2H6O", smiles: "CCO", smilesWarnings: []
+      });
+    }
+  });
+
+  it("exports the stated count as the hand-drawn O is exported: MOL valence, CDXML and SMILES, each with its warning", async () => {
+    const stated = openedDocument();
+    const typed = handDrawn();
+    for (const flavor of ["v2000", "v3000"] as const) {
+      const statedWarnings: string[] = [];
+      const typedWarnings: string[] = [];
+      const statedMolfile = copyAsMolfile(stated, flavor, statedWarnings)!;
+      expect(statedMolfile).toBe(copyAsMolfile(typed, flavor, typedWarnings));
+      expect(statedMolfile).toMatch(flavor === "v2000" ? /^.{31}O {3}0 {2}0 {2}0 {2}0 {2}0 {2}1/m : /V30 3 O [^\n]* VAL=1/);
+      expect(statedWarnings).toEqual(["O3 states 0 H, but its bonds and charge give 1."]);
+      expect(typedWarnings).toHaveLength(1);
+    }
+    // CDXML, plain (no ChemDraft payload) as another program reads it: reopened, both read the same.
+    for (const document of [stated, typed]) {
+      const plain = exportDocumentToCdxml(document, { embedNativePayload: false });
+      expect(await reading(openedDocument(plain.contents))).toEqual(await reading(stated));
+    }
+    expect(exportDocumentToCdxml(stated, { embedNativePayload: false }).contents).toMatch(/<n [^>]*Element="8"[^>]*NumHydrogens="0"/);
+    // SMILES: the radical the bare [O] implies is reported, for both, instead of a silent CCO.
+    const read = await reading(stated);
+    expect(read.smilesWarnings).toEqual([[
+      "export.smiles_radical_loss", `Atom ${oxygenOf(moleculesOrThrow(stated)[0]).id} (O) is drawn with 0 radical electrons; SMILES reparses with 1 radical electron.`
+    ]]);
   });
 });
 

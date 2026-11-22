@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from "vitest";
-import { moleculeToMolfileV2000 } from "@chemdraft/chem-core";
+import { moleculeToMolfileV2000, type MoleculeAtom, type MoleculeObject } from "@chemdraft/chem-core";
 import { ensureRdkit } from "../../rdkit-adapter/src/conformer";
 import { compositionFromRdkitJson } from "../../rdkit-adapter/src/composition";
 import { chargeSeparationCases } from "./chargeSeparationFixtures";
@@ -124,17 +124,60 @@ it("reparses native radical spelling with a branched traversal in a different at
   const smiles = await moleculeSmiles(molecule, 0, warnings, computeStructureIdentifiers);
   expect(warnings).toEqual([]);
   expect((await readAtomStates(smiles)).map(({ radicals }) => radicals).sort()).toEqual([0, 0, 0, 3]);
-  // A stated hydrogen count that the native writer cannot carry must also be checked here.
+  // A stated hydrogen count on the native route is checked here too. The count disagrees with the
+  // derived one on an atom with no aromatic bond, so the atom is badged, and the badge is an export
+  // warning of its own (owner ruling 1.2.3). The native writer now writes the stated count ([CH2],
+  // as it writes a typed "CH2"), so SMILES keeps the 2 H and the engine reads the open valence as a
+  // radical, which is reported instead of the hydrogen loss the derived count used to cause.
   molecule.atoms[0]!.hydrogenCount = 2;
   const changedWarnings: ExportWarning[] = [];
-  await moleculeSmiles(molecule, 0, changedWarnings, computeStructureIdentifiers);
-  // The count disagrees with the derived one on an atom with no aromatic bond, so the atom is also
-  // badged, and the badge is an export warning of its own (owner ruling 1.2.3).
+  const changed = await moleculeSmiles(molecule, 0, changedWarnings, computeStructureIdentifiers);
   expect(changedWarnings).toEqual([
     expect.objectContaining({ code: "export.invalid_structure", message: "C1 states 2 H, but its bonds and charge give 3." }),
-    expect.objectContaining({ code: "export.smiles_hydrogen_loss",
-      message: "Atom a0 (C) is drawn with 2 total hydrogens; SMILES reparses with 3 total hydrogens." })
+    expect.objectContaining({ code: "export.smiles_radical_loss",
+      message: "Atom a0 (C) is drawn with 0 radical electrons; SMILES reparses with 1 radical electron." })
   ]);
+  expect((await readAtomStates(changed)).map(({ radicals }) => radicals).sort()).toEqual([0, 0, 1, 3]);
+});
+
+// Owner ruling (1.2.3): a stated hydrogen count kept on an atom shows everywhere, exactly like a
+// hand-drawn under-filled atom. RDKit receives it through the typed label's own route, the molfile's
+// explicit valence, so SMILES and every warning match the typed atom's.
+describe("SMILES of a stated hydrogen count through the structure engine", () => {
+  const ethanol = (oxygen: Partial<MoleculeAtom>): MoleculeObject => ({
+    id: "m", type: "molecule", x: 0, y: 0, width: 60, height: 20, rotation: 0, style: {},
+    structureFormat: "smiles", structure: "", superatoms: [], rGroups: [],
+    atoms: [
+      { id: "c1", element: "C", x: 0, y: 0, formalCharge: 0 },
+      { id: "c2", element: "C", x: 14, y: 8, formalCharge: 0 },
+      { id: "o", element: "O", x: 28, y: 0, formalCharge: 0, ...oxygen }
+    ],
+    bonds: [
+      { id: "b1", fromAtomId: "c1", toAtomId: "c2", order: "single" },
+      { id: "b2", fromAtomId: "c2", toAtomId: "o", order: "single" }
+    ]
+  });
+
+  it("writes an O stated with 0 H exactly as a typed literal O, with the same warnings", async () => {
+    const stated: ExportWarning[] = [];
+    const typed: ExportWarning[] = [];
+    const smiles = await moleculeSmiles(ethanol({ hydrogenCount: 0 }), 0, stated, computeStructureIdentifiers);
+    expect(smiles).toBe(await moleculeSmiles(ethanol({ labelLiteral: true }), 0, typed, computeStructureIdentifiers));
+    expect(smiles).toBe("CC[O]");
+    expect(stated).toEqual(typed);
+    expect(stated.map((warning) => warning.code)).toEqual(["export.smiles_radical_loss"]);
+  });
+
+  it("writes an N stated with 1 H as the typed NH, and changes nothing without a count or with an agreeing one", async () => {
+    const amine = await moleculeSmiles({ ...ethanol({ element: "N", hydrogenCount: 1 }) }, 0, [], computeStructureIdentifiers);
+    expect(amine).toBe(await moleculeSmiles(ethanol({ element: "NH", labelLiteral: true }), 0, [], computeStructureIdentifiers));
+    expect(amine).toBe("CC[NH]");
+    for (const oxygen of [{}, { hydrogenCount: 1 }]) {
+      const warnings: ExportWarning[] = [];
+      expect(await moleculeSmiles(ethanol(oxygen), 0, warnings, computeStructureIdentifiers)).toBe("CCO");
+      expect(warnings).toEqual([]);
+    }
+  });
 });
 
 describe.each([

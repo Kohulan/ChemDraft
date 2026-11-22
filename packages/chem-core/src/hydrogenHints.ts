@@ -1,6 +1,42 @@
-import { bridgeBondIndices } from "./bondGraph";
-import { isDativeBond } from "./molfile";
+import { bridgeBondIndices, isDativeBond } from "./bondGraph";
+import { atomicNumberForElementSymbol } from "./elements";
 import type { MoleculeAtom, MoleculeBond, MoleculeObject } from "./schemas";
+
+/**
+ * The hydrogen count an atom states for itself — a CDXML NumHydrogens kept because it disagrees with
+ * the derived count (owner ruling 1.2.3) — or undefined. Where it is defined it replaces the derived
+ * count everywhere the atom is read: the drawn label (layout-engine), the formula and SMILES
+ * (document-workflow-core) and the molfile every engine reads (`moleculeToMolfileV2000`/`V3000`),
+ * where it takes the same explicit-valence field as a typed literal label's hydrogens. So an O stated
+ * with 0 H and a typed literal "O" are the same atom to the label, the formula, the mass and RDKit.
+ *
+ * Undefined where the count means something else, or where there is no derived count to stand in for:
+ * - no count, or a typed literal label (its own text says what hydrogens it has);
+ * - an atom on an aromatic bond, where the count settles which ring atom carries the H and the
+ *   Kekulé resolution carries it;
+ * - a label that is not a plain element symbol, and hydrogen itself (H, D, T);
+ * - a carbon bonded only datively, which has no single derived count (layout-engine's
+ *   `atomImplicitHydrogenCount` gives none).
+ * No valence model here: the count is passed through as stated, never re-derived.
+ */
+export function atomStatedHydrogenCount(
+  atom: MoleculeAtom,
+  bonds: readonly MoleculeBond[]
+): number | undefined {
+  const stated = atom.hydrogenCount;
+  if (stated === undefined || atom.labelLiteral === true) return undefined;
+  if (atomicNumberForElementSymbol(atom.element) === undefined || atom.element === "H") return undefined;
+  let incident = 0;
+  let dative = 0;
+  for (const bond of bonds) {
+    if (bond.fromAtomId !== atom.id && bond.toAtomId !== atom.id) continue;
+    if (bond.order === "aromatic") return undefined;
+    incident += 1;
+    if (isDativeBond(bond)) dative += 1;
+  }
+  if (atom.element === "C" && incident > 0 && dative === incident) return undefined;
+  return stated;
+}
 
 /**
  * An imported H count describes the imported graph, not subsequent chemical edits. A chemical edit
