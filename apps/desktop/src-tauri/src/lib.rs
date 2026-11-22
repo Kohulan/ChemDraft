@@ -211,6 +211,7 @@ const AGENT_BRIDGE_ENV_VAR: &str = "CHEMDRAFT_AGENT_BRIDGE";
 const AGENT_BRIDGE_CLI_ARG: &str = "--chemdraft-agent-bridge";
 const ENGINE3D_PROTOCOL_VERSION: u32 = 2;
 const ENGINE3D_SIDECAR_BASENAME: &str = "avogadro3d-sidecar";
+const STRUCTURE_INTERACTIVE3D_COMMAND_ID: &str = "structure.openInteractive3d";
 const ENGINE3D_SIDECAR_ENV_VAR: &str = "CHEMDRAFT_ENGINE3D_SIDECAR";
 const ENGINE3D_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const ENGINE3D_MAX_BATCH_LINES: usize = 128;
@@ -1033,7 +1034,7 @@ const MENU_COMMAND_IDS: &[&str] = &[
     "text.convertToAtomLabel",
     "analyze.molecularProperties",
     "chemistry.validateSelection",
-    "structure.openInteractive3d",
+    STRUCTURE_INTERACTIVE3D_COMMAND_ID,
     "plugins.manage",
     "plugins.vibeCodeStarter",
     ABOUT_COMMAND_ID,
@@ -8729,6 +8730,15 @@ fn engine3d_sidecar_stop_session(
     stop_engine3d_sidecar_session(&process_session_id, &sessions)
 }
 
+/// Interactive 3D needs the 3D sidecar. A build where neither the override nor the bundled binary
+/// can run (missing, or a `binaries/` placeholder) cannot gain one while it runs, so the Structure
+/// menu leaves the item out for the session instead of showing it disabled (AGENTS.md §10). The
+/// webview applies the same rule to toolbars and the gallery (`sessionUnavailableCommandIds`).
+fn interactive3d_menu_item_shown() -> bool {
+    static SHOWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SHOWN.get_or_init(|| engine3d_sidecar_status().available)
+}
+
 fn engine3d_sidecar_status_from(env_override: Option<String>) -> Engine3dSidecarStatus {
     let resolved_path = resolve_engine3d_sidecar_path(env_override.clone());
     let source = if resolved_path.is_some() && env_override.is_some() {
@@ -10311,16 +10321,20 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                 true,
                 None::<&str>,
             )?,
+        ],
+    )?;
+    if interactive3d_menu_item_shown() {
+        structure_menu.append_items(&[
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(
                 app,
-                "structure.openInteractive3d",
+                STRUCTURE_INTERACTIVE3D_COMMAND_ID,
                 "Interactive 3D Workspace...",
                 true,
                 None::<&str>,
             )?,
-        ],
-    )?;
+        ])?;
+    }
     let structure_plugin_items = plugin_menu_items_in(plugin_items, "structure");
     if !structure_plugin_items.is_empty() {
         structure_menu.append(&PredefinedMenuItem::separator(app)?)?;
@@ -16496,6 +16510,33 @@ mod tests {
     fn structure_menu_commands_are_routed() {
         expect_true(is_routed_menu_command("structure.cleanup2d"));
         expect_true(is_routed_menu_command("structure.openInteractive3d"));
+    }
+
+    #[test]
+    fn interactive3d_menu_item_is_omitted_without_a_runnable_sidecar() {
+        // Built only when the sidecar can run: never a permanently disabled item (AGENTS.md §10).
+        let source = include_str!("lib.rs");
+        let structure = source
+            .split("let structure_menu = Submenu::with_id_and_items(")
+            .nth(1)
+            .unwrap()
+            .split("let structure_plugin_items")
+            .next()
+            .unwrap();
+        let gated = structure
+            .split("if interactive3d_menu_item_shown() {")
+            .nth(1)
+            .expect("the Interactive 3D item is gated on the sidecar");
+        assert!(gated.contains("STRUCTURE_INTERACTIVE3D_COMMAND_ID,"));
+        assert_eq!(
+            structure
+                .matches("STRUCTURE_INTERACTIVE3D_COMMAND_ID")
+                .count(),
+            1
+        );
+        assert!(!structure.contains("\"structure.openInteractive3d\""));
+        let status = engine3d_sidecar_status_from(Some("/definitely/not/a/sidecar".to_owned()));
+        assert_eq!(status.available, status.source != "missing");
     }
 
     #[test]

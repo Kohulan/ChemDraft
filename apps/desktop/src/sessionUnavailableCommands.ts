@@ -1,0 +1,33 @@
+import { useEffect, useState } from "react";
+import { structureInteractive3dCommandId } from "./commands";
+import { readEngine3dSidecarStatus, type Engine3dSidecarStatus } from "./engine3dSidecar";
+
+const NONE: ReadonlySet<string> = new Set();
+
+/**
+ * Commands this build cannot provide for the whole session. AGENTS.md §10: such tools are removed
+ * from toolbars, menus, palettes and the Customize gallery, never shown permanently disabled;
+ * `disabledReason` is only for transient, state-dependent unavailability.
+ *
+ * Interactive 3D needs the 3D sidecar. The shell reports `available: false` only when neither the
+ * developer override nor the bundled binary can run (missing, or a `binaries/` placeholder), and
+ * neither changes while the app runs. Spin 3D does not use the sidecar, so it always stays.
+ * Before the status is known, and in the browser build (no shell to ask), nothing is removed.
+ * The native menu applies the same rule in Rust (`interactive3d_menu_item_shown` in lib.rs).
+ */
+export function sessionUnavailableCommandIds(sidecar: Engine3dSidecarStatus | undefined): ReadonlySet<string> {
+  return sidecar?.available === false ? new Set([structureInteractive3dCommandId]) : NONE;
+}
+
+/** Read once per window: the bundled sidecar is fixed for the life of the process. */
+export function useSessionUnavailableCommandIds(): ReadonlySet<string> {
+  const [ids, setIds] = useState(NONE);
+  useEffect(() => {
+    let disposed = false;
+    void readEngine3dSidecarStatus().then(status => {
+      if (!disposed) setIds(sessionUnavailableCommandIds(status));
+    });
+    return () => { disposed = true; };
+  }, []);
+  return ids;
+}

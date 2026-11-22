@@ -32,10 +32,12 @@ import { ToolbarCustomizeController } from "./toolbars/CustomizeMainToolbar/Tool
 import { CustomizeBar } from "./toolbars/CustomizeMainToolbar/CustomizeBar";
 import { GalleryTray } from "./toolbars/CustomizeMainToolbar/GalleryTray";
 import { SHELL_COMMAND_IDS } from "./shellCommandIds";
+import { useSessionUnavailableCommandIds } from "./sessionUnavailableCommands";
 import {
   createDesktopToolsetRegistry,
   desktopToolsetRegistry,
   compoundLayoutRegistry,
+  sessionAvailableRegistry,
   getToolsetPaletteGroups,
   initialToolsetWindowSize,
   paletteCommandGroupsFromItemGroups,
@@ -209,8 +211,13 @@ export function PaletteWindow({
   const compoundLayoutSettings = useCompoundLayoutSettings();
   const compoundLayoutsEnabled = compoundLayoutSettings.enabled;
   const [unfilteredToolsetRegistry, setToolsetRegistry] = useState(() => initialRegistry ?? desktopToolsetRegistry);
-  const toolsetRegistry = useMemo(() => compoundLayoutRegistry(unfilteredToolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings),
-    [unfilteredToolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings]);
+  // Same session rule as the document window: a build without a runnable 3D sidecar omits
+  // Interactive 3D from this palette rather than showing it disabled.
+  const unavailableCommandIds = useSessionUnavailableCommandIds();
+  const toolsetRegistry = useMemo(() => sessionAvailableRegistry(
+    compoundLayoutRegistry(unfilteredToolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings),
+    unavailableCommandIds
+  ), [unfilteredToolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, unavailableCommandIds]);
   const [commandSpecs, setCommandSpecs] = useState<CommandSpec[]>(() =>
     allShellCommands(createPhase4Document(), undefined, {
       registry: initialRegistry ?? desktopToolsetRegistry

@@ -59,7 +59,10 @@ describe("double-bond position commands", () => {
     expect(createDoubleBondPositionActions(0).every((action) => !action.enabled && action.disabledReason === "Select a double bond")).toBe(true);
   });
 });
-import { allShellCommands, convertTextToAtomLabelCommandId, structureInteractive3dCommandId } from "./commands";
+import { allShellCommands, convertTextToAtomLabelCommandId, structureInteractive3dCommandId, structureSpin3dCommandId } from "./commands";
+import type { Engine3dSidecarStatus } from "./engine3dSidecar";
+import { sessionUnavailableCommandIds } from "./sessionUnavailableCommands";
+import { filterToolbarCustomizationCommands } from "./toolbars/toolbarCustomizationCommands";
 import { editActions, fragmentAtomDrawingHotkeys, fragmentBondDrawingHotkeys, fragmentSproutCommandId, fragmentSproutCommands, fragmentSproutKindForCommand } from "./commands";
 import { createPhase4Document, insertNativeSingleBondMolecule, insertNativeTextObject, getSelectedMolecule, selectDocumentObjects } from "./documentWorkflow";
 import { buildAppMenuModel, flattenAppMenuCommands } from "./appMenu";
@@ -67,7 +70,7 @@ import { normalizeShortcut, parseShortcutDisplay } from "@chemdraft/shortcut-eng
 import { createLayerActions, createQuickActions } from "./commands";
 import { withStandaloneDrawingToolCommands } from "./drawingTools";
 import { createMainWindowShortcutCommands } from "./keyboardShortcuts";
-import { desktopToolsetRegistry, getToolsetCommandSpecs } from "./toolsets";
+import { desktopToolsetRegistry, getToolsetCommandSpecs, sessionAvailableRegistry } from "./toolsets";
 import { elementSymbols } from "@chemdraft/chem-core";
 import { chemDrawHoveredTargetHotkeyCommand } from "./keybindingScheme";
 
@@ -301,20 +304,47 @@ describe("Molecule Inspector commands", () => {
 });
 
 describe("Interactive 3D availability", () => {
-  const spec = (interactive3dDisabledReason?: string) =>
-    allShellCommands(createPhase4Document(), undefined, { interactive3dDisabledReason })
-      .find((command) => command.id === structureInteractive3dCommandId)!;
-
-  it("stays enabled when the sidecar can run", () => {
-    expect(spec()).toMatchObject({ title: "Interactive 3D Workspace" });
-    expect(spec().enabled).not.toBe(false);
-    expect(spec().disabledReason).toBeUndefined();
+  const commands = (sidecar?: Engine3dSidecarStatus) =>
+    allShellCommands(createPhase4Document(), undefined, { unavailableCommandIds: sessionUnavailableCommandIds(sidecar) });
+  const sidecar = (available: boolean): Engine3dSidecarStatus => ({
+    available, protocolVersion: 2, source: available ? "bundled" : "missing", envVar: "CHEMDRAFT_ENGINE3D_SIDECAR",
+    bundledBinaryName: "avogadro3d-sidecar", targetTriple: "x86_64-unknown-linux-gnu"
   });
 
-  it("is disabled with the sidecar's reason, keeping its catalog presentation", () => {
-    const reason = "Interactive 3D isn't available in this Linux build yet";
-    expect(spec(reason)).toMatchObject({ title: spec().title, icon: spec().icon, enabled: false, disabledReason: reason });
-    expect(allShellCommands(createPhase4Document(), undefined, { interactive3dDisabledReason: reason })
-      .filter((command) => command.id === structureInteractive3dCommandId)).toHaveLength(1);
+  it("stays enabled when the sidecar can run, or before (or without) a shell to ask", () => {
+    for (const status of [sidecar(true), undefined]) {
+      const spec = commands(status).find((command) => command.id === structureInteractive3dCommandId)!;
+      expect(spec).toMatchObject({ title: "Interactive 3D Workspace" });
+      expect(spec.enabled).not.toBe(false);
+      expect(spec.disabledReason).toBeUndefined();
+    }
+  });
+
+  // Changed from "is disabled with the sidecar's reason": AGENTS.md §10 removes a tool the build
+  // cannot provide for the whole session; disabledReason is only for transient state.
+  it("is left out, not disabled, when this build has no runnable sidecar; Spin 3D stays", () => {
+    const ids = commands(sidecar(false)).map((command) => command.id);
+    expect(ids).not.toContain(structureInteractive3dCommandId);
+    expect(ids).toContain(structureSpin3dCommandId);
+    expect(sessionUnavailableCommandIds(sidecar(false))).toEqual(new Set([structureInteractive3dCommandId]));
+    expect(sessionUnavailableCommandIds(sidecar(true)).size).toBe(0);
+    expect(sessionUnavailableCommandIds(undefined).size).toBe(0);
+  });
+
+  it("is left out of the displayed toolbars without touching the shipped registry", () => {
+    const unavailable = sessionUnavailableCommandIds(sidecar(false));
+    const shown = sessionAvailableRegistry(desktopToolsetRegistry, unavailable);
+    const commandIds = (registry: typeof desktopToolsetRegistry) => registry.listToolsets().flatMap(toolset =>
+      toolset.groups.flatMap(group => group.items.flatMap(item => [
+        ...(item.primary?.type === "command" ? [item.primary.commandId] : []),
+        ...(item.submenu?.items.map(entry => entry.commandId) ?? [])
+      ])));
+    expect(commandIds(desktopToolsetRegistry)).toContain(structureInteractive3dCommandId);
+    expect(commandIds(shown)).not.toContain(structureInteractive3dCommandId);
+    expect(commandIds(shown)).toContain(structureSpin3dCommandId);
+    expect(sessionAvailableRegistry(desktopToolsetRegistry, new Set())).toBe(desktopToolsetRegistry);
+    // Customize gallery: built from the shell commands, so it never offers the tool either.
+    expect(filterToolbarCustomizationCommands(commands(sidecar(false)), { enabled: true }).map(command => command.id))
+      .not.toContain(structureInteractive3dCommandId);
   });
 });

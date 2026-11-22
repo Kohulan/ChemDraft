@@ -77,8 +77,21 @@ export const PLUGIN_COMMAND_WITHOUT_HANDLER = "Plugin command has no registered 
 
 /** Filter only the displayed catalog; saved customization keeps disabled feature entries intact. */
 export function compoundLayoutRegistry(registry: DesktopToolsetRegistry, enabled: boolean, settings: CompoundLayoutSettings = loadCompoundLayoutSettings(), desktop = true): DesktopToolsetRegistry {
-  const hidden = (id: string) => isCompoundLayoutCommandHidden(id, { ...settings, enabled }, desktop);
-  if (enabled && !registry.listToolsets().some(toolset => toolset.groups.some(group => group.items.some(item => {
+  return withoutHiddenCommands(registry, id => isCompoundLayoutCommandHidden(id, { ...settings, enabled }, desktop));
+}
+
+/**
+ * The displayed catalog without the commands this build cannot run this session
+ * (`sessionUnavailableCommandIds`). Like the compound-layout filter, it never touches the saved
+ * customization, so the tools come back in a build that can run them.
+ */
+export function sessionAvailableRegistry(registry: DesktopToolsetRegistry, unavailableCommandIds: ReadonlySet<string>): DesktopToolsetRegistry {
+  return unavailableCommandIds.size === 0 ? registry : withoutHiddenCommands(registry, id => unavailableCommandIds.has(id));
+}
+
+/** Drop toolbar items and submenu entries whose command is hidden; `registry` itself when none is. */
+function withoutHiddenCommands(registry: DesktopToolsetRegistry, hidden: (id: string) => boolean): DesktopToolsetRegistry {
+  if (!registry.listToolsets().some(toolset => toolset.groups.some(group => group.items.some(item => {
     const id = item.primary?.type === "command" ? item.primary.commandId : item.commandId ?? item.id;
     return !!id && hidden(id) || item.submenu?.items.some(entry => hidden(entry.commandId));
   })))) return registry;

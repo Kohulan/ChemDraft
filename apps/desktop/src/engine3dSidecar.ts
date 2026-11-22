@@ -100,7 +100,8 @@ export async function readEngine3dSidecarStatus(): Promise<Engine3dSidecarStatus
  * Why Interactive 3D cannot start, or `undefined` when it can (or when there is no desktop shell to
  * ask). The shell reports `available: false` when the bundled sidecar is missing or is one of the
  * `binaries/` placeholders (the files carrying "avogadro3d-sidecar placeholder"), on every platform.
- * The command then shows as disabled with this reason instead of failing after a click.
+ * Toolbars and menus then leave Interactive 3D out (`sessionUnavailableCommandIds`); this reason is
+ * the status line for a click that arrives before the status did.
  */
 export function engine3dSidecarDisabledReason(status: Engine3dSidecarStatus | undefined): string | undefined {
   if (!status || status.available) return undefined;

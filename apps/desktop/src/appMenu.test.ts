@@ -99,6 +99,22 @@ describe("Linux Window menu", () => {
   });
 });
 
+describe("Interactive 3D in the app menu", () => {
+  it.each(["macos", "windows", "linux"] as const)("is left out, not disabled, when the build cannot run it on %s", platform => {
+    const ids = (unavailableCommandIds?: ReadonlySet<string>) =>
+      flattenAppMenuCommands(buildAppMenuModel({ ...EMPTY_CONTEXT, platform, unavailableCommandIds })).map(item => item.commandId);
+    expect(ids()).toContain("structure.openInteractive3d");
+    expect(ids(new Set())).toEqual(ids());
+    const without = ids(new Set(["structure.openInteractive3d"]));
+    expect(without).not.toContain("structure.openInteractive3d");
+    expect(without).toContain("structure.cleanup2d");
+    const structure = buildAppMenuModel({ ...EMPTY_CONTEXT, platform, unavailableCommandIds: new Set(["structure.openInteractive3d"]) })
+      .find(section => section.id === "structure")!;
+    // No dangling separator where the item was (the drawing-style block brings its own).
+    expect(structure.items.filter((item, index, items) => item.kind === "separator" && items[index + 1]?.kind === "separator")).toEqual([]);
+  });
+});
+
 describe("app menu model", () => {
   it.each([["macos", "app"], ["windows", "help"]] as const)("places About ChemDraft in the %s menu", (platform, sectionId) => {
     const sections = buildAppMenuModel({ ...EMPTY_CONTEXT, platform });

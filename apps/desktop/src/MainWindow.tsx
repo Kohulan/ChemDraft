@@ -879,6 +879,7 @@ import {
   defaultVisibleToolsetIds,
   desktopToolsetRegistry,
   compoundLayoutRegistry,
+  sessionAvailableRegistry,
   getToolbarsMenuModel,
   getToolsetCommandSpecs,
   getToolsetItemGroups,
@@ -954,6 +955,7 @@ import {
   watchForCrashes
 } from "./problemReports";
 import { requestWindowAction, windowCommands } from "./windowCommands";
+import { useSessionUnavailableCommandIds } from "./sessionUnavailableCommands";
 import {
   APP_CHECK_FOR_UPDATES_COMMAND_ID,
   AUTO_CHECK_DELAY_MS,
@@ -1853,7 +1855,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.22.01.00-opus";
+const CURRENT_BUILD_STAMP = "11.22.07.15-opus";
 
 /**
  * The commit funnel's chemistry check (AGENTS.md section 7, `commitChemistryGuard.ts`). `before`
@@ -2783,16 +2785,10 @@ export function MainWindow({
   const compoundLayoutSettings = useCompoundLayoutSettings();
   const compoundLayoutsEnabled = compoundLayoutSettings.enabled;
   const structureSearchEnabled = useStructureSearchEnabled();
-  // The bundled 3D sidecar is fixed for the life of the process: read its status once. A missing or
-  // placeholder sidecar disables Interactive 3D with an honest reason instead of failing on click.
-  const [interactive3dDisabledReason, setInteractive3dDisabledReason] = useState<string>();
-  useEffect(() => {
-    let disposed = false;
-    void readEngine3dSidecarStatus().then(status => {
-      if (!disposed) setInteractive3dDisabledReason(engine3dSidecarDisabledReason(status));
-    });
-    return () => { disposed = true; };
-  }, []);
+  // The bundled 3D sidecar is fixed for the life of the process: its status is read once. A build
+  // without a runnable sidecar leaves Interactive 3D out of every toolbar, menu and gallery
+  // (AGENTS.md §10) instead of listing it disabled for the whole session.
+  const unavailableCommandIds = useSessionUnavailableCommandIds();
   const structureSearchEnabledRef = useRef(structureSearchEnabled);
   structureSearchEnabledRef.current = structureSearchEnabled;
   const structureSearchController = useRef<ReturnType<typeof createStructureSearchController> | undefined>(undefined);
@@ -2801,8 +2797,10 @@ export function MainWindow({
   }
   const directElectronMarkEditing = useDirectElectronMarkEditing();
   const [unfilteredToolsetRegistry, setToolsetRegistry] = useState<DesktopToolsetRegistry>(() => desktopToolsetRegistry);
-  const toolsetRegistry = useMemo(() => compoundLayoutRegistry(unfilteredToolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, isDesktopRuntime()),
-    [unfilteredToolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings]);
+  const toolsetRegistry = useMemo(() => sessionAvailableRegistry(
+    compoundLayoutRegistry(unfilteredToolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, isDesktopRuntime()),
+    unavailableCommandIds
+  ), [unfilteredToolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, unavailableCommandIds]);
 
   // The toolbar catalog is the single data brain: it composes the core manifest with live
   // plugin toolsets and the user's saved layout, and hands out immutable registry snapshots.
@@ -3629,11 +3627,11 @@ export function MainWindow({
         compoundLayoutsEnabled, compoundLayoutSettings,
         structureSearchEnabled,
         hasSearchableStructure,
-        interactive3dDisabledReason
+        unavailableCommandIds
       }).map(command => customSwatchActions.find(action => action.id === command.id) ?? command).filter(command => command.id !== "arrow.conditions" || isDesktopRuntime()),
       keybindingScheme, shortcutOverrides, shortcutPlatform
     ),
-    [shortcutOverrides, shortcutPlatform, baseToolbarCommands, customSwatches, customSwatchActions, activeTableCell?.tableId, activeTableCell?.rowId, activeTableCell?.columnId, canRedo, canUndo, document, documentTabs.length, keybindingScheme, openWarnings, selectedMolecule, selectedNativeMoleculeParts, toolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, structureSearchEnabled, hasSearchableStructure, interactive3dDisabledReason]
+    [shortcutOverrides, shortcutPlatform, baseToolbarCommands, customSwatches, customSwatchActions, activeTableCell?.tableId, activeTableCell?.rowId, activeTableCell?.columnId, canRedo, canUndo, document, documentTabs.length, keybindingScheme, openWarnings, selectedMolecule, selectedNativeMoleculeParts, toolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, structureSearchEnabled, hasSearchableStructure, unavailableCommandIds]
   );
   const shellCommandsById = useMemo(
     () => createShellCommandMap(shellCommandSpecs),
@@ -6833,7 +6831,8 @@ export function MainWindow({
 
     const status = await readEngine3dSidecarStatus();
     if (!status?.available) {
-      // The native menu routes here even while the toolbar shows the command disabled.
+      // Unreachable from toolbars and menus once the status is known (they omit the command), but a
+      // click made before it arrived still lands here.
       setStatus(engine3dSidecarDisabledReason(status) ?? "Interactive 3D unavailable; Tauri bridge not present");
       return;
     }
@@ -22969,7 +22968,8 @@ export function MainWindow({
         availablePluginUpdateCount,
         keybindingScheme,
         keybindingOverrides: shortcutOverrides,
-        platform: shortcutPlatform
+        platform: shortcutPlatform,
+        unavailableCommandIds
       }),
     [
       rulersVisible,
@@ -22988,7 +22988,8 @@ export function MainWindow({
       availablePluginUpdateCount,
       structureSearchEnabled,
       hasSearchableStructure,
-      bracketMenuItems
+      bracketMenuItems,
+      unavailableCommandIds
     ]
   );
 
@@ -24114,7 +24115,7 @@ export function MainWindow({
             baseToolsets={toolbarCatalog.baseToolsets()}
             layoutState={layoutStateRef.current ?? emptyLayoutState()}
             availableCommands={galleryCommands}
-            isCommandHidden={id => isCompoundLayoutCommandHidden(id, compoundLayoutSettings)}
+            isCommandHidden={id => isCompoundLayoutCommandHidden(id, compoundLayoutSettings) || unavailableCommandIds.has(id)}
             onApply={applyCustomizeToolbars}
             onLiveApply={liveApplyCustomizeToolbars}
             onClose={() => setCustomizeToolbarsOpen(false)}

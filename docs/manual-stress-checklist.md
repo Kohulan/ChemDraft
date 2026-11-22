@@ -287,6 +287,18 @@ switch tabs while it opens and verify that a late action cannot affect the new s
 Ring bonds refuse the flip with a reason. If retained isotope/radical properties cannot be mapped
 through a label expansion, both geometry choices refuse rather than discarding those properties.
 
+## Interactive 3D availability (macOS, Windows and Linux)
+
+- In a build whose 3D sidecar is a placeholder (a Linux package built without the engine, or a
+  dev build with the `binaries/` placeholder): Interactive 3D Workspace is absent from the
+  Structure menu, from every toolbar (Main and Structure), from Customize Toolbars and the Main
+  toolbar's Customize gallery, and from the palette flyouts. There is no greyed-out copy anywhere,
+  and no empty separator at the end of the Structure menu. Spin 3D is still on its toolbar and works.
+  A saved toolbar layout that holds Interactive 3D keeps it: in a build with a real sidecar the
+  button is back in the same spot.
+- In a build with a real sidecar, Interactive 3D shows in the Structure menu and on its toolbar,
+  enabled, and opens on a selected molecule.
+
 ## Spin 3D (macOS and Windows)
 
 Paste `c1ccccc1.CC(C)(C)C.OCCO` as one native molecule object; with RDKit and the OCL fallback,
