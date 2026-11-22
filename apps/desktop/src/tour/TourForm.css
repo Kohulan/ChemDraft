@@ -7,7 +7,10 @@
   font: 14px/1.45 system-ui, sans-serif;
 }
 
+/* content-box: the reserve and the ceiling TourForm sets (max-height) are the text's own height, without
+   the padding, so they agree with the reserving float below. */
 .guided-tour-content {
+  box-sizing: content-box;
   flex: 1 1 0;
   overflow: auto;
   padding: 22px 24px;
@@ -36,9 +39,11 @@
 }
 
 /* Step actions never scroll: Try it and its error sit between the step's text and the footer. */
+/* margin-top: auto keeps the actions and footer at the bottom of a window taller than the capped text. */
 .guided-tour-actions {
   display: flex;
   flex: none;
+  margin-top: auto;
   flex-wrap: wrap;
   align-items: center;
   gap: 8px 12px;

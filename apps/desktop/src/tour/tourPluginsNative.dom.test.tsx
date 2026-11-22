@@ -19,9 +19,6 @@ const host = vi.hoisted(() => ({
   toOwner: undefined as ((message: DialogMessage) => void) | undefined
 }));
 vi.mock("@tauri-apps/api/core", () => ({ isTauri: () => true, invoke: host.invoke }));
-vi.mock("../dialogs/dialogContentFit", () => ({
-  measureDialogContentWhenFontsReady: async () => undefined, observeDialogContent: () => () => {}
-}));
 vi.mock("../window-manager", async original => ({
   ...await original<typeof import("../window-manager")>(),
   isDesktopRuntime: () => true
@@ -98,8 +95,22 @@ const mount = async (element: Parameters<Root["render"]>[0]) => {
 };
 const settle = () => act(async () => { for (let i = 0; i < 4; i++) await new Promise(resolve => setTimeout(resolve, 10)); });
 
+/** The tour window's laid-out size. Measurement itself is the real dialogContentFit code; only layout,
+ *  which jsdom does not do, is stood in for, so the window sends the same measured ready it sends natively. */
+const TOUR_WIDTH = 520;
+const TOUR_HEIGHT = 412;
+const rect = (width: number, height: number) => ({
+  x: 0, y: 0, top: 0, left: 0, right: width, bottom: height, width, height, toJSON: () => ({})
+}) as DOMRect;
+
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+    if (this.matches(".guided-tour")) return rect(TOUR_WIDTH, TOUR_HEIGHT);
+    if (this.matches(".guided-tour-sizer-step")) return rect(TOUR_WIDTH - 48, 240);
+    if (this.matches(".guided-tour-sizer .guided-tour-actions")) return rect(TOUR_WIDTH - 48, 44);
+    return rect(0, 0);
+  });
   vi.stubGlobal("localStorage", new MemoryStorage());
   host.opened = [];
   host.sent = [];
@@ -128,6 +139,27 @@ async function openToNameStep(nameToStructure: boolean) {
 
 describe.each([["macos", "MacIntel"], ["windows", "Win32"]] as const)("the native tour window on %s", (platform, navigatorPlatform) => {
   beforeEach(() => { vi.spyOn(navigator, "platform", "get").mockReturnValue(navigatorPlatform); });
+
+  it("reports its measured size in ready, through the real protocol check, to the native host's dialog_send", async () => {
+    const tour = await mount(createElement(DialogWindow, { hostId: "tour" }));
+    await mount(createElement(DocumentWindow, { nameToStructure: false }));
+    await act(async () => { await import("./TourForm"); });
+    await settle();
+    expect(tour.querySelector(".guided-tour")).not.toBeNull();
+    // The window is a content-fit dialog: its one ready carries the measurement, and Rust reveals the
+    // hidden window only when that ready arrives. A refused ready never reaches dialog_send at all.
+    const readies = host.invoke.mock.calls.filter(([command, args]) => command === "dialog_send" &&
+      (args as { message: DialogMessage }).message.type === "ready");
+    expect(readies).toHaveLength(1);
+    const [, args] = readies[0]!;
+    expect(args).toMatchObject({ hostId: "tour" });
+    const { message } = args as { message: DialogMessage };
+    expect(message).toMatchObject({ dialogKind: "guidedTour", type: "ready",
+      data: { contentHeight: TOUR_HEIGHT, contentWidth: TOUR_WIDTH, pixelRatio: window.devicePixelRatio || 1 } });
+    // What crosses IPC is JSON, and the serialized message passes the same check on arrival.
+    expect(parseDialogMessage(JSON.parse(JSON.stringify(message)))).toEqual(message);
+    expect(tour.querySelector("[role=alert]")).toBeNull();
+  });
 
   it("shows Name to Structure and its Try it when the menus offer the plugin", async () => {
     const { tour, button } = await openToNameStep(true);

@@ -314,7 +314,9 @@ describe.each(["macos", "windows", "linux"] as const)("tour actions above the fo
         const actions = this.querySelector<HTMLElement>(":scope > .guided-tour-actions")!;
         const reserve = Number.parseFloat(content.style.getPropertyValue("--guided-tour-step-reserve")) || 0;
         const action = Number.parseFloat(actions.style.minHeight) || 0;
-        return rect(width(), PADDING + Math.max(reserve, ownStep(content)) + action + FOOTER);
+        // As in the browser: the text area grows to its reserve or its own step, up to its max-height.
+        const ceiling = Number.parseFloat(content.style.maxHeight) || Infinity;
+        return rect(width(), PADDING + Math.min(Math.max(reserve, ownStep(content)), ceiling) + action + FOOTER);
       }
       return rect(0, 0);
     });
@@ -367,6 +369,36 @@ describe.each(["macos", "windows", "linux"] as const)("tour actions above the fo
     expect(onReady).toHaveBeenCalledTimes(1);
   });
 
+  it("reports the capped height on every step, even one taller than the cap, and never refits between steps", async () => {
+    const { measureDialogContent, observeDialogContent } = await import("../dialogs/dialogContentFit");
+    const { TOUR_STEP_MAX_RESERVED_HEIGHT } = await import("./TourForm");
+    const overCap = "Add features with plugins";
+    mockLayout(() => 520, title => title === overCap ? TOUR_STEP_MAX_RESERVED_HEIGHT + 300 : stepHeight(title));
+    const onReady = vi.fn();
+    act(() => root.render(<TourForm scheme="chemdraft" platform={platform} plugins={allPlugins} onAction={vi.fn()} onReady={onReady} />));
+    const tour = onReady.mock.calls[0]![0] as HTMLElement;
+    const content = tour.querySelector<HTMLElement>(".guided-tour-content")!;
+    expect(content.style.getPropertyValue("--guided-tour-step-reserve")).toBe(`${TOUR_STEP_MAX_RESERVED_HEIGHT}px`);
+    expect(content.style.maxHeight).toBe(`${TOUR_STEP_MAX_RESERVED_HEIGHT}px`);
+    const capped = PADDING + TOUR_STEP_MAX_RESERVED_HEIGHT + 44 + FOOTER;
+    const initial = measureDialogContent(tour)!;
+    expect(initial.contentHeight).toBe(capped);
+    // The dialog host's own content observer, as DialogWindow starts it after ready.
+    const refits = vi.fn();
+    const stop = observeDialogContent(tour, initial, refits);
+    try {
+      let sawOverCap = false;
+      for (let step = 1; step <= 9; step++) {
+        await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
+        sawOverCap ||= tour.querySelector("h1")!.textContent === overCap;
+        expect(measureDialogContent(tour)!.contentHeight).toBe(capped);
+        if (step < 9) click("Next");
+      }
+      expect(sawOverCap).toBe(true);
+    } finally { stop(); }
+    expect(refits).not.toHaveBeenCalled();
+  });
+
   it("measures again for a new width, and caps the reserve so long text scrolls instead", async () => {
     const { TOUR_STEP_MAX_RESERVED_HEIGHT } = await import("./TourForm");
     let width = 520;
@@ -398,6 +430,9 @@ it("styles only the step text as the scroll container and fits the native window
   expect(rule(".guided-tour-actions")).toContain("flex: none");
   expect(rule(".guided-tour-actions")).not.toContain("overflow");
   expect(rule(".guided-tour-content::before")).toContain("height: var(--guided-tour-step-reserve, 0px)");
+  // The ceiling TourForm sets (max-height) is the text's own height, like the reserve, not its padding box.
+  expect(rule(".guided-tour-content")).toContain("box-sizing: content-box");
+  expect(rule(".guided-tour-actions")).toContain("margin-top: auto");
   const source = readFileSync(resolve("apps", "desktop", "src-tauri", "src", "dialog_windows.rs"), "utf8");
   const spec = source.split(`"guidedTour" => Ok(DialogKindSpec {`)[1]!.split("}),")[0]!;
   expect(spec).toContain("fit_content: true");

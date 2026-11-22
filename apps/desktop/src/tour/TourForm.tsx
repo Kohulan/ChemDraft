@@ -170,8 +170,12 @@ export function TourForm({
     return () => document.removeEventListener("keydown", onKey);
   }, [onAction, index]);
 
+  // The reserve is also the text area's ceiling, on every step and in the host's intrinsic measurement
+  // (dialogContentFit.ts lifts only the root's and `.cd-dialog-fit-body` heights), so a step taller than
+  // TOUR_STEP_MAX_RESERVED_HEIGHT scrolls inside the text area instead of reporting a taller window.
+  // The text area is `content-box`, so the ceiling, like the reserve, excludes its padding.
   const contentStyle = reserved.step === undefined ? undefined
-    : { "--guided-tour-step-reserve": `${reserved.step}px` } as CSSProperties;
+    : { "--guided-tour-step-reserve": `${reserved.step}px`, maxHeight: `${reserved.step}px` } as CSSProperties;
   const actionStyle = reserved.action === undefined ? undefined : { minHeight: `${reserved.action}px` };
 
   return (

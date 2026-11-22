@@ -211,7 +211,10 @@ export function parseDialogMessage(value: unknown): DialogMessage | undefined {
           : d.action === "openGuide" ? keys(d, ["action", "url"]) && typeof d.url === "string" && d.url.length > 0 && d.url.length <= 2048
           : d.action === "tryTourCommand" && keys(d, ["action", "command"]) &&
             [TOUR_SAMPLE_COMMAND, TOUR_NAME_COMMAND, TOUR_INSPECTOR_COMMAND, KEYBOARD_PREFERENCES_COMMAND_ID].some(command => d.command === command); break;
-        case "request": case "ready": valid = keys(d, []); break;
+        case "request": valid = keys(d, []); break;
+        // The tour is a content-fit window (`fit_content` in dialog_windows.rs): its ready carries the
+        // measured height, as every other fit dialog's does. Refusing it here would never reveal the window.
+        case "ready": valid = keys(d, []) || validDialogContentFit(d); break;
         case "closed": valid = keys(d, ["reason"]) && reasons.has(d.reason as DialogCloseReason); break;
         case "result": valid = keys(d, ["status"], ["error"]) && ["accepted", "cancelled", "error"].includes(String(d.status)) &&
           (d.error === undefined || typeof d.error === "string" && d.error.length <= 1024); break;
