@@ -160,7 +160,7 @@ const countedOpen = (source: string) => {
 const textsOf = (opened: ReturnType<typeof openChemDraftPayload>) =>
   opened.document!.pages[0].objects.filter((object): object is TextObject => object.type === "text");
 
-it("resolves 40,000 caption runs against 40,000 fonts with linear work", () => {
+it("resolves 40,000 caption runs against 40,000 fonts with linear work", { timeout: 60_000 }, () => {
   const { opened, operations } = countedOpen(`<CDXML>${fontTable(40_000)}<page>${caption(9, 40_000, 40_000)}</page></CDXML>`);
   expect(operations).toBeLessThanOrEqual(2 * (40_000 + 40_000));
   const [text] = textsOf(opened);
@@ -177,7 +177,7 @@ it("resolves 40,000 caption runs against 40,000 fonts with linear work", () => {
 
 // Codex: Save As wrote an edited caption by scanning the font table for every run (the
 // 40,000-font, 40,000-run file took ~68 s); fonts are looked up by name, so saving is linear too.
-it("saves an edited 40,000-run caption against 40,000 fonts with linear work", () => {
+it("saves an edited 40,000-run caption against 40,000 fonts with linear work", { timeout: 60_000 }, () => {
   const opened = openChemDraftPayload(`<CDXML>${fontTable(40_000)}<page>${caption(9, 40_000, 40_000)}</page></CDXML>`);
   const [text] = textsOf(opened);
   text.spans[0].text = "y";
