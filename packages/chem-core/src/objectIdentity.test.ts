@@ -1,8 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   adoptDerivedDocument, applyPatch, applyPatches, createEmptyDocument, hasObjectIdentity, objectIdentity, retainObjectIdentity,
   serializeDocument, toEngineDocument, type ChemDraftDocument, type DocumentObject, type MoleculeObject
 } from "./index";
+import { OBJECT_IDENTITY_RUNTIME_VERSION, resolveObjectIdentityRuntime } from "./objectIdentity";
 
 const now = "2026-11-22T00:00:00.000Z";
 const molecule = (id: string, x: number): MoleculeObject => ({
@@ -193,5 +194,82 @@ describe("host-owned object identity (objectIdentity.ts)", () => {
     expect(JSON.stringify(document)).toBe(json);
     expect(Object.getOwnPropertySymbols(find(edited, "X"))).toEqual([]);
     expect(Object.keys(find(edited, "X"))).toEqual(Object.keys(find(document, "X")));
+  });
+});
+
+/**
+ * Kimi run-20261122-123139-b532aa, finding 2: identity was a module-private WeakMap, while the published
+ * plugin-host SDK bundles its own chem-core. An embedder applying writes through another chem-core copy
+ * carried identity in that copy only: the first write passed, and the next write to the same selected
+ * object no longer resolved its pin. Every chem-core copy in a realm now shares one identity runtime.
+ */
+describe("one identity runtime per realm, shared by every chem-core copy", () => {
+  /** A second, separately evaluated chem-core module instance: the embedder's own copy. */
+  async function secondCopy() {
+    vi.resetModules();
+    const copy = await import("./index");
+    expect(copy.applyPatch).not.toBe(applyPatch);
+    expect(copy.objectIdentity).not.toBe(objectIdentity);
+    return copy;
+  }
+
+  it("two writes through another copy keep the identity this copy pinned, and each copy sees the other's", async () => {
+    const embedder = await secondCopy();
+    const before = twoPages();
+    const pin = objectIdentity(find(before, "X")); // The SDK's copy pins the selected X.
+    const first = embedder.applyPatch(before, { op: "updateObject", objectId: "X", changes: { x: 10 } }, { now });
+    expect(hasObjectIdentity(find(first, "X"), pin)).toBe(true);
+    const second = embedder.applyPatch(first, { op: "updateObject", objectId: "X", changes: { x: 20 } }, { now });
+    expect(find(second, "X")).toMatchObject({ x: 20 });
+    expect(hasObjectIdentity(find(second, "X"), pin)).toBe(true);
+    expect(embedder.hasObjectIdentity(find(second, "X"), pin)).toBe(true);
+    // And the other way round: an identity the embedder's copy minted holds across this copy's edits.
+    const theirs = embedder.objectIdentity(find(second, "T"));
+    const third = applyPatch(second, { op: "updateObject", objectId: "T", changes: { x: 5 } }, { now });
+    expect(embedder.hasObjectIdentity(find(third, "T"), theirs)).toBe(true);
+  });
+
+  it("an insertion through another copy is still a new object, even under a freed id", async () => {
+    const embedder = await secondCopy();
+    const before = twoPages();
+    const pin = objectIdentity(find(before, "X"));
+    const replaced = embedder.applyPatches(before, [{ op: "removeObject", objectId: "X" },
+      { op: "addObject", pageId: "page-1", object: structuredClone(find(before, "X")) }], { now });
+    expect(hasObjectIdentity(find(replaced, "X"), pin)).toBe(false);
+  });
+
+  it("publishes a frozen runtime that exposes no map and cannot be replaced", () => {
+    const scope = {};
+    const runtime = resolveObjectIdentityRuntime(scope);
+    expect(resolveObjectIdentityRuntime(scope)).toBe(runtime);
+    const key = Symbol.for("chemdraft.chem-core.objectIdentity");
+    const descriptor = Object.getOwnPropertyDescriptor(scope, key)!;
+    expect(descriptor).toMatchObject({ value: runtime, enumerable: false, writable: false, configurable: false });
+    expect(Object.keys(scope)).toEqual([]);
+    expect(Object.isFrozen(runtime)).toBe(true);
+    expect(runtime.version).toBe(OBJECT_IDENTITY_RUNTIME_VERSION);
+    expect(Object.values(runtime).some(value => value instanceof WeakMap)).toBe(false);
+    expect(() => { (scope as Record<symbol, unknown>)[key] = {}; }).toThrow(TypeError);
+    // This realm's chem-core uses the runtime published on globalThis.
+    const object = molecule("Y", 0);
+    const identity = objectIdentity(object);
+    const realm = (globalThis as unknown as Record<symbol, ReturnType<typeof resolveObjectIdentityRuntime>>)[key]!;
+    expect(realm.holds(object, identity)).toBe(true);
+  });
+
+  it("a copy that finds another version's runtime, or cannot publish, keeps its identities private (fail closed)", () => {
+    const key = Symbol.for("chemdraft.chem-core.objectIdentity");
+    const other = Object.freeze({ version: OBJECT_IDENTITY_RUNTIME_VERSION + 1, identityOf: () => Symbol(), holds: () => true,
+      retain: () => {}, carry: () => {} });
+    const newer = Object.defineProperty({}, key, { value: other });
+    const mismatched = resolveObjectIdentityRuntime(newer);
+    expect(mismatched).not.toBe(other);
+    expect(resolveObjectIdentityRuntime(newer)).not.toBe(mismatched);
+    const object = molecule("Y", 0);
+    expect(mismatched.holds(object, mismatched.identityOf(structuredClone(object)))).toBe(false);
+    const frozen = Object.freeze({});
+    const unpublished = resolveObjectIdentityRuntime(frozen);
+    expect(Object.getOwnPropertySymbols(frozen)).toEqual([]);
+    expect(resolveObjectIdentityRuntime(frozen)).not.toBe(unpublished);
   });
 });

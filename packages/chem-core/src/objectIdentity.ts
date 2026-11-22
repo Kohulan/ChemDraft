@@ -6,9 +6,10 @@ import type { DocumentObject } from "./schemas";
  * An object id is document data: unique within a page, free again once its object is deleted, and
  * reused by a paste, an undo, or a plugin insert. So an id cannot tell "the object the user selected"
  * from "a different object that now has its id". This identity can. It lives only in memory, keyed
- * by the object value itself, like the bracket creation identity in brackets.ts: it is never part of
- * the schema, never serialized (JSON and structured clone both drop it), and never reachable from a
- * plugin, which imports only `@chemdraft/plugin-api`.
+ * by the object value itself, like the bracket creation identity in brackets.ts, in one runtime that
+ * every chem-core copy in the realm shares (below): it is never part of the schema, never serialized
+ * (JSON and structured clone both drop it), and never reachable from a plugin, which imports only
+ * `@chemdraft/plugin-api`.
  *
  * - Every object value has one identity, minted the first time it is asked for.
  * - An edit that replaces an object value with an edited copy of the same object carries the
@@ -25,21 +26,101 @@ import type { DocumentObject } from "./schemas";
 declare const objectIdentityBrand: unique symbol;
 export type ObjectIdentity = symbol & { readonly [objectIdentityBrand]: true };
 
-const identities = new WeakMap<DocumentObject, ObjectIdentity>();
+/**
+ * One identity runtime per JavaScript realm, shared by every chem-core copy loaded in it.
+ *
+ * A host can hold more than one chem-core: the published plugin-host SDK bundles its own, and an
+ * embedder applies writes through another (its own `@chemdraft/chem-core`, or a writer built on it). A
+ * module-private map would split identity between them: the embedder's edit would carry the identity in
+ * its copy only, and the SDK's next pin check would find nothing (fail closed, but a legitimate second
+ * write to the same selected object refused). So the first copy to need identity publishes its runtime
+ * on `globalThis` under a registered symbol, and every later copy uses that one.
+ *
+ * - The runtime is a frozen set of the same four operations this module exports; it never exposes its
+ *   map, so a holder can do nothing a chem-core import cannot already do. The global property is
+ *   non-enumerable, non-writable and non-configurable: once published it cannot be replaced.
+ * - `version` names the semantics below. A copy that finds a runtime of another version, or cannot
+ *   publish one (a frozen global), keeps a private runtime: identity is then not shared, and a pin made
+ *   in one copy matches nothing edited in the other (fail closed, never a wrong match).
+ * - Plugins never receive it. In the app they run in per-plugin Workers, another realm with its own
+ *   global; and the host gives any plugin only deep-frozen structured clones (which hold no identity),
+ *   while everything a plugin writes is parsed into a new value. Bump the version on any change to what
+ *   an identity means or how it is carried.
+ */
+export const OBJECT_IDENTITY_RUNTIME_VERSION = 1;
+const runtimeKey = Symbol.for("chemdraft.chem-core.objectIdentity");
+
+interface ObjectIdentityRuntime {
+  readonly version: typeof OBJECT_IDENTITY_RUNTIME_VERSION;
+  identityOf(object: DocumentObject): ObjectIdentity;
+  holds(object: DocumentObject, identity: ObjectIdentity): boolean;
+  retain(before: DocumentObject, after: DocumentObject): void;
+  carry(original: DocumentObject, copy: DocumentObject): void;
+}
+
+function createObjectIdentityRuntime(): ObjectIdentityRuntime {
+  const identities = new WeakMap<DocumentObject, ObjectIdentity>();
+  const identityOf = (object: DocumentObject): ObjectIdentity => {
+    let identity = identities.get(object);
+    if (!identity) {
+      identity = Symbol("chemdraft.object") as ObjectIdentity;
+      identities.set(object, identity);
+    }
+    return identity;
+  };
+  return Object.freeze({
+    version: OBJECT_IDENTITY_RUNTIME_VERSION,
+    identityOf,
+    holds: (object: DocumentObject, identity: ObjectIdentity) => identities.get(object) === identity,
+    retain: (before: DocumentObject, after: DocumentObject) => {
+      if (before === after || before.id !== after.id || before.type !== after.type) return;
+      const identity = identityOf(before);
+      if (!identities.has(after)) identities.set(after, identity);
+    },
+    carry: (original: DocumentObject, copy: DocumentObject) => {
+      if (original === copy || original.id !== copy.id || original.type !== copy.type) return;
+      identities.set(copy, identityOf(original));
+    }
+  });
+}
+
+function isObjectIdentityRuntime(value: unknown): value is ObjectIdentityRuntime {
+  if (typeof value !== "object" || value === null || !Object.isFrozen(value)) return false;
+  const runtime = value as Partial<Record<keyof ObjectIdentityRuntime, unknown>>;
+  return runtime.version === OBJECT_IDENTITY_RUNTIME_VERSION && typeof runtime.identityOf === "function" &&
+    typeof runtime.holds === "function" && typeof runtime.retain === "function" && typeof runtime.carry === "function";
+}
+
+/**
+ * The identity runtime of `scope` (a realm's `globalThis`): the one already published there when it is
+ * this version's, else a new one, published when nothing holds the key yet. A runtime that cannot be
+ * shared stays private to the caller. Exported for tests; chem-core resolves it once, on first use.
+ */
+export function resolveObjectIdentityRuntime(scope: object): ObjectIdentityRuntime {
+  const published = (scope as Record<symbol, unknown>)[runtimeKey];
+  if (isObjectIdentityRuntime(published)) return published;
+  const runtime = createObjectIdentityRuntime();
+  if (published === undefined) {
+    try {
+      Object.defineProperty(scope, runtimeKey, { value: runtime, enumerable: false, writable: false, configurable: false });
+    } catch {
+      // A frozen or locked-down global: this copy keeps its identities to itself.
+    }
+  }
+  return runtime;
+}
+
+let realmRuntime: ObjectIdentityRuntime | undefined;
+const identityRuntime = () => realmRuntime ??= resolveObjectIdentityRuntime(globalThis);
 
 /** The identity of `object`, minting a fresh one if it has none yet. */
 export function objectIdentity(object: DocumentObject): ObjectIdentity {
-  let identity = identities.get(object);
-  if (!identity) {
-    identity = Symbol("chemdraft.object") as ObjectIdentity;
-    identities.set(object, identity);
-  }
-  return identity;
+  return identityRuntime().identityOf(object);
 }
 
 /** Whether `object` holds `identity`. Never mints: an object without an identity matches nothing. */
 export function hasObjectIdentity(object: DocumentObject, identity: ObjectIdentity): boolean {
-  return identities.get(object) === identity;
+  return identityRuntime().holds(object, identity);
 }
 
 /**
@@ -49,9 +130,7 @@ export function hasObjectIdentity(object: DocumentObject, identity: ObjectIdenti
  * way the call does nothing and `after` stays a different object (fail closed).
  */
 export function retainObjectIdentity(before: DocumentObject, after: DocumentObject): void {
-  if (before === after || before.id !== after.id || before.type !== after.type) return;
-  const identity = objectIdentity(before);
-  if (!identities.has(after)) identities.set(after, identity);
+  identityRuntime().retain(before, after);
 }
 
 /**
@@ -62,6 +141,5 @@ export function retainObjectIdentity(before: DocumentObject, after: DocumentObje
  * to nothing else. Only a same-id, same-type value is a copy.
  */
 export function carryObjectIdentityToCopy(original: DocumentObject, copy: DocumentObject): void {
-  if (original === copy || original.id !== copy.id || original.type !== copy.type) return;
-  identities.set(copy, objectIdentity(original));
+  identityRuntime().carry(original, copy);
 }

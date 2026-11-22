@@ -963,6 +963,34 @@ accepted deletions. Cleanup drops references to the glyphs and the command's del
 the same undo entry. The host checks again against the commit-time document after any
 canvas gesture wait. Writes are refused when no active document is available to validate the scope.
 
+### Embedding hosts: object identity (1.2.3)
+
+The host binds each object selected when a command or request started, and each object it inserts,
+to that object's in-memory identity, never to its id alone: an id freed by a deletion and reused by a
+paste, an undo or another insert names a different object, and writes to it are refused. The identity
+lives in chem-core beside the document, never in it. It is not serialized or structured-cloned, a
+plugin never receives one, and everything a plugin writes is parsed into a new value. chem-core's own
+edits (`applyPatch`, `adoptDerivedDocument`) carry it to the edited value.
+
+`@chemdraft/plugin-host` bundles its own chem-core runtime. Every chem-core copy loaded in one
+JavaScript realm shares one identity runtime, published on `globalThis` under
+`Symbol.for("chemdraft.chem-core.objectIdentity")` and versioned, so an embedder that commits plugin
+writes through its own `@chemdraft/chem-core` keeps the identities the SDK pinned, and a command's
+second write to the same object still resolves. For that, the embedder:
+
+- commits in the same realm as its `PluginHost` (not in another Worker or iframe);
+- uses a chem-core with the same identity-runtime version (a copy that finds another version keeps
+  its identities private, so pins stop resolving and writes are refused: fail closed, never a wrong
+  match);
+- calls `retainObjectIdentity(before, after)` from `@chemdraft/chem-core` for each object value it
+  edits itself instead of through chem-core's patches (only a same-id, same-type value continues an
+  object);
+- reports the document each write committed through the request's `onCommitted`, so the write's
+  insertions are granted by the identity of the objects actually inserted.
+
+Run untrusted plugins in a Worker, as the app does: code in the host's own realm can always reach the
+host's globals.
+
 ### Native tables (0.1.18)
 
 Plugins may read the optional `tableStyle.autoColumnMinEm` minimum auto column width in em.

@@ -8,7 +8,9 @@
 // chem-core is never a runtime dependency of either published package: for `plugin-api` its use is
 // type-only (esbuild erases it; the dts inlines it), and for `plugin-host` its runtime (`applyPatch`) is
 // bundled in via an esbuild alias while the shared `ChemDraftDocument` type is kept canonical by taking
-// it from `@chemdraft/plugin-api` (external) rather than re-inlining a second copy.
+// it from `@chemdraft/plugin-api` (external) rather than re-inlining a second copy. The bundled copy
+// shares chem-core's object-identity runtime with every other chem-core copy in the realm (published on
+// globalThis, see chem-core/src/objectIdentity.ts), so a host's own chem-core keeps the SDK's pins.
 //
 // Usage: node scripts/build-sdk.mjs <plugin-api|plugin-host>
 import { build as esbuild } from "esbuild";
