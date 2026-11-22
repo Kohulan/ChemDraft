@@ -11581,7 +11581,11 @@ fn ensure_toolset_window<R: Runtime>(
     let native_resizable = true;
     #[cfg(not(target_os = "linux"))]
     let native_resizable = resizable;
-    let native_wayland = utility_window::uses_native_wayland(app)?;
+    // A creation that fails from here on leaves no window, so no Destroyed event clears a fit
+    // recorded above; a stale one would swallow the next window's first matching Moved or Resized.
+    let forget_creation_fit = || toolset_fit::with_memory(|memory| memory.forget(&label));
+    let native_wayland =
+        utility_window::uses_native_wayland(app).inspect_err(|_| forget_creation_fit())?;
 
     windows_activation_log::frame_set(&label, "toolbar creation", "logical", || {
         ((position.x, position.y), (width, height))
@@ -11595,7 +11599,8 @@ fn ensure_toolset_window<R: Runtime>(
             ),
         ),
         app,
-    )?
+    )
+    .inspect_err(|_| forget_creation_fit())?
     .title(title)
     .inner_size(width, height)
     .accept_first_mouse(true)
@@ -11644,6 +11649,7 @@ fn ensure_toolset_window<R: Runtime>(
             if let Ok(mut labels) = app.state::<ToolsetWindowDirectory>().labels.lock() {
                 labels.remove(&label);
             }
+            forget_creation_fit();
             return Err(error.to_string());
         }
     };
