@@ -33,13 +33,13 @@ The workflow:
 
 1. Checks that `ref` is a tag (or full SHA) and that `upload_to_release` is `v<app version>`.
    For uploads, the build ref must also match the workflow commit.
-2. Builds the x86_64 3D sidecar from source: clones the pinned avogadrolibs commit and Eigen
-   3.4.0 into `native/avogadro3d-sidecar/_deps` as that directory's README describes, builds it
-   with `cmake --preset linux-x86_64` (Release, libstdc++ and libgcc linked statically, so it
+2. Builds the x86_64 3D sidecar from source: fetches the pinned avogadrolibs commit and Eigen
+   3.4.0 (by its commit, `3147391d946bb4b6c68edd901f2add6ac1f31f8c`, never the tag name) into
+   `native/avogadro3d-sidecar/_deps` as that directory's README describes, builds it with `cmake --preset linux-x86_64` (Release, libstdc++ and libgcc linked statically, so it
    needs only glibc 2.35 or newer), and fails unless it is an x86-64 ELF that needs only glibc.
    Then builds the OPSIN Java runtime on the runner and smoke-tests it (benzene).
 3. Runs `pnpm audit:engine3d-sidecar`, the sidecar handshake
-   (`.github/workflows/linux-package-smoke/sidecar-check.sh`) and the three `smoke:engine3d-*`
+   (`scripts/check-engine3d-sidecar.mjs`) and the three `smoke:engine3d-*`
    smokes against the sidecar, copies it over the committed placeholder for the bundle step only,
    builds a stable `.deb` and AppImage (`CHEMDRAFT_STABLE_BUILD=1`, no worktree label), and
    restores the placeholder. Any failure fails the job; it never ships the placeholder.

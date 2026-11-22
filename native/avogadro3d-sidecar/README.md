@@ -35,7 +35,11 @@ Fetch local source dependencies into the ignored `_deps` directory:
 ```bash
 git clone https://github.com/OpenChemistry/avogadrolibs.git native/avogadro3d-sidecar/_deps/avogadrolibs
 git -C native/avogadro3d-sidecar/_deps/avogadrolibs checkout 416651ddaef33a4e20392392e7c0b505d446491b
-git clone --depth 1 --branch 3.4.0 https://gitlab.com/libeigen/eigen.git native/avogadro3d-sidecar/_deps/eigen
+# Eigen 3.4.0 by its commit, not by the tag name, which upstream could move.
+git init -q native/avogadro3d-sidecar/_deps/eigen
+git -C native/avogadro3d-sidecar/_deps/eigen remote add origin https://gitlab.com/libeigen/eigen.git
+git -C native/avogadro3d-sidecar/_deps/eigen fetch --depth 1 origin 3147391d946bb4b6c68edd901f2add6ac1f31f8c
+git -C native/avogadro3d-sidecar/_deps/eigen -c advice.detachedHead=false checkout FETCH_HEAD
 ```
 
 Build the Avogadro-backed protocol scout:
@@ -94,10 +98,11 @@ cd ../..
 The `linux-x86_64` preset inherits `protocol-scout` (the same Avogadro Core/Calc
 subset and commit define), builds Release, and links libstdc++ and libgcc
 statically, so the executable needs only glibc (2.35 or newer, from the build host).
-The job fails unless `readelf -d` lists only glibc libraries and no symbol needs a
-glibc newer than 2.35. It then runs `pnpm audit:engine3d-sidecar`,
-`.github/workflows/linux-package-smoke/sidecar-check.sh` (an ELF and handshake check
-that needs only bash and coreutils) and all three smokes below, and copies the
+The job fails unless `scripts/check-engine3d-sidecar.mjs` (an ELF, glibc and
+handshake check that needs only Node, no binutils) finds a real x86-64 ELF whose
+`DT_NEEDED` entries are only glibc libraries, with no symbol version newer than glibc
+2.35, that completes the protocol handshake. It then runs `pnpm audit:engine3d-sidecar`
+and all three smokes below, and copies the
 executable over `apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu`
 for the bundle step only. That committed file stays the placeholder. The container
 smoke repeats the handshake on the sidecar installed from the `.deb` and the

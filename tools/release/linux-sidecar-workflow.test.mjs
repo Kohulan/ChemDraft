@@ -14,20 +14,26 @@ test("the Linux package build ships a native 3D sidecar built from the pinned so
     return index;
   };
   const fetch = at("git clone https://github.com/OpenChemistry/avogadrolibs.git _deps/avogadrolibs");
-  const eigen = at("git clone --depth 1 --branch 3.4.0 https://gitlab.com/libeigen/eigen.git _deps/eigen");
+  const eigen = at('git -C _deps/eigen fetch --depth 1 origin "$eigen"');
   const configure = at("cmake --preset linux-x86_64");
   const compile = at("cmake --build --preset linux-x86_64");
-  const handshake = at('sidecar-check.sh "$CHEMDRAFT_ENGINE3D_SIDECAR"');
+  const handshake = at('node "$GITHUB_WORKSPACE/scripts/check-engine3d-sidecar.mjs" "$bin"');
   const smoke = at("pnpm smoke:engine3d-real-structure");
   const stage = at('install -m 0755 "$CHEMDRAFT_ENGINE3D_SIDECAR" "$target"');
   const bundle = at("pnpm --filter @chemdraft/desktop build --bundles deb,appimage");
   const restore = at("git checkout -- apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu");
   const debCheck = at('cmp native/avogadro3d-sidecar/build/linux-x86_64/avogadro3d-sidecar "$payload/usr/bin/avogadro3d-sidecar"');
-  const appImageCheck = at("sidecar-check.sh\" squashfs-root/usr/bin/avogadro3d-sidecar");
+  const debSidecarCheck = at('node scripts/check-engine3d-sidecar.mjs "$payload/usr/bin/avogadro3d-sidecar"');
+  const appImageCheck = at('check-engine3d-sidecar.mjs" squashfs-root/usr/bin/avogadro3d-sidecar');
   const record = at('record-build.mjs --artifact "$DEB"');
   assert.ok(fetch < eigen && eigen < configure && configure < compile && compile < handshake);
   assert.ok(handshake < smoke && smoke < stage && stage < bundle && bundle < restore);
-  assert.ok(restore < debCheck && debCheck < appImageCheck && appImageCheck < record);
+  assert.ok(restore < debCheck && debCheck < debSidecarCheck && debSidecarCheck < appImageCheck && appImageCheck < record);
+  // Eigen 3.4.0 by commit, verified, never by the movable tag name.
+  assert.match(build, /eigen=3147391d946bb4b6c68edd901f2add6ac1f31f8c/);
+  assert.match(build, /\[ "\$\(git -C _deps\/eigen rev-parse HEAD\)" = "\$eigen" \]/);
+  assert.doesNotMatch(build, /--branch 3\.4\.0/);
+  assert.doesNotMatch(build, /sidecar-check\.sh|readelf|objdump/);
   // The commit comes from CMakeLists.txt, the one place it is pinned.
   assert.match(build, /commit=\$\(grep -oE '\[0-9a-f\]\{40\}' CMakeLists\.txt \| sort -u\)/);
   assert.doesNotMatch(build, /continue-on-error/);
@@ -47,14 +53,21 @@ test("the Linux CMake preset matches the shipped sidecar options and links only 
 test("the container smoke checks the installed sidecar from the .deb and the AppImage", () => {
   const container = read(".github/workflows/linux-container-smoke.yml");
   const step = container.slice(container.indexOf("- name: Check the installed 3D sidecar"));
-  assert.match(step, /bash "\$check" \/usr\/bin\/avogadro3d-sidecar/);
-  assert.match(step, /"\$BUNDLE" --appimage-extract[\s\S]+bash "\$check" "\$work\/squashfs-root\/usr\/bin\/avogadro3d-sidecar"/);
+  assert.match(step, /check="\$GITHUB_WORKSPACE\/scripts\/check-engine3d-sidecar\.mjs"/);
+  assert.match(step, /node "\$check" \/usr\/bin\/avogadro3d-sidecar/);
+  assert.match(step, /"\$BUNDLE" --appimage-extract[\s\S]+node "\$check" "\$work\/squashfs-root\/usr\/bin\/avogadro3d-sidecar"/);
   assert.ok(container.indexOf("- name: Check the installed 3D sidecar") < container.indexOf("- name: Smoke test the Linux package"));
   assert.match(container, /- native\/avogadro3d-sidecar\/\*\*/);
-  const check = read(".github/workflows/linux-package-smoke/sidecar-check.sh");
+  assert.match(container, /- scripts\/check-engine3d-sidecar\.mjs/);
+  // Every distro installs Node for the check.
+  assert.match(container, /libgtk-3-0t64 libxdo3 nodejs \\\n/);
+  assert.match(container, /xorg-x11-server-Xvfb \\\n\s+nodejs gtk3 libxdo/);
+  assert.match(container, /pacman -Syu --noconfirm --needed bash dbus procps-ng shadow strace util-linux nodejs \\\n/);
+  const check = read("scripts/check-engine3d-sidecar.mjs");
   assert.match(check, /avogadro3d-sidecar placeholder/);
   assert.match(check, /7f454c460201/);
   assert.match(check, /"avogadroBacked":true/);
+  assert.match(check, /export const MAX_GLIBC = "2\.35";/);
 });
 
 test("the committed Linux sidecars stay placeholders", () => {
