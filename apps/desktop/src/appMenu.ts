@@ -22,7 +22,8 @@ import { VIBE_CODE_STARTER_COMMAND_ID, vibeCodeStarterCommand } from "./commands
  *
  * Deliberately omitted from the web bar (they are OS-level, not in-document actions):
  * Services/Hide/Quit, the Window menu (minimize/maximize), and File ▸
- * Close Window / Quit. File ▸ Check for Updates is also native-only because Sparkle owns its UI and
+ * Close Window / Quit. The Linux native menu builds its Window items from the registry commands in
+ * `windowCommands.ts` (`LINUX_WINDOW_COMMAND_IDS` in lib.rs), routed apart from `MENU_COMMAND_IDS`. File ▸ Check for Updates is also native-only because Sparkle owns its UI and
  * lifecycle rather than the frontend command registry.
  */
 

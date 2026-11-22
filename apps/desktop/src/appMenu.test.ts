@@ -18,6 +18,7 @@ import {
 import { pluginItemsForNativeMenu } from "./plugins/nativePluginMenu";
 import { VIBE_CODE_STARTER_COMMAND_ID } from "./commands/vibeCodeStarter";
 import { nativeStylePresetCommandId } from "./commands";
+import { WINDOW_ACTION_EVENT, windowCommandIds } from "./windowCommands";
 
 const EMPTY_CONTEXT: AppMenuContext = {
   rulersVisible: true,
@@ -59,6 +60,44 @@ function parseNativeMenuCommandIds(): string[] {
   }
   return [...ids];
 }
+
+/** The Linux Window menu's routed command ids (`LINUX_WINDOW_COMMAND_IDS` in lib.rs), resolved. */
+function parseLinuxWindowCommandIds(): string[] {
+  const source = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+  const block = source.match(/const LINUX_WINDOW_COMMAND_IDS:\s*&\[&str\]\s*=\s*&\[([\s\S]*?)\];/);
+  if (!block) throw new Error("Could not find LINUX_WINDOW_COMMAND_IDS in lib.rs");
+  return [...block[1].matchAll(/\b([A-Z][A-Z0-9_]+)\b/g)].map(([, name]) => {
+    const value = source.match(new RegExp(`const ${name}:\\s*&str\\s*=\\s*"([^"]+)"`));
+    if (!value) throw new Error(`Could not resolve LINUX_WINDOW_COMMAND_IDS constant ${name}`);
+    return value[1];
+  });
+}
+
+describe("Linux Window menu", () => {
+  it("routes each native Linux Window item to a registry window command", () => {
+    expect(parseLinuxWindowCommandIds()).toEqual(windowCommandIds);
+    expect(windowCommandIds).toEqual(["window.minimize", "window.toggleMaximize", "window.close"]);
+    const native = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+    expect(native).toContain(`const WINDOW_ACTION_EVENT: &str = "${WINDOW_ACTION_EVENT}";`);
+    // Routed through the same click path as every other menu item, after the Close-id mapping.
+    const click = native.split(".on_menu_event(")[1]!.split(".on_window_event(")[0]!;
+    expect(click).toMatch(/let command_id = linux_menu_command_id\(command_id\);\s*if \(is_routed_menu_command\(command_id\)/);
+    expect(native.split("fn is_routed_menu_command")[1]!.split("\n}\n")[0])
+      .toContain('(cfg!(target_os = "linux") && LINUX_WINDOW_COMMAND_IDS.contains(&command_id))');
+    const main = readFileSync(new URL("./MainWindow.tsx", import.meta.url), "utf8");
+    expect(main).toContain("for (const command of windowCommands({ isDesktop: isDesktopRuntime(), platform: detectDesktopShortcutPlatform() })) {");
+  });
+
+  it.each(["macos", "windows", "linux"] as const)("keeps the window commands out of the shared menu model on %s", platform => {
+    // The web bar has no Window menu, and macOS/Windows show the OS's own predefined items.
+    const model = buildAppMenuModel({ ...EMPTY_CONTEXT, platform });
+    const ids = flattenAppMenuCommands(model).map(item => item.commandId);
+    for (const id of windowCommandIds) {
+      expect(ids).not.toContain(id);
+      expect(parseNativeMenuCommandIds()).not.toContain(id);
+    }
+  });
+});
 
 describe("app menu model", () => {
   it.each([["macos", "app"], ["windows", "help"]] as const)("places About ChemDraft in the %s menu", (platform, sectionId) => {

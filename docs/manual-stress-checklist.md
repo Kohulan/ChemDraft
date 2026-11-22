@@ -1766,7 +1766,15 @@ Run under KDE Plasma (Wayland session, so the app uses XWayland) and on GNOME.
 - Window menu: it lists Minimize, Maximize / Restore and Close Window. Minimize iconifies the
   document window; Maximize / Restore toggles it; Close Window closes it the same way as the
   title bar button (Save on Quit prompt for unsaved edits, then ChemDraft quits). File ▸ Close
-  Window does the same. Ctrl+W still closes the current document tab.
+  Window does the same. Ctrl+W still closes the current document tab. These items are registry
+  commands (`window.minimize`, `window.toggleMaximize`, `window.close`) routed like every other
+  menu item: run each with a palette focused (click a tool in Main first) and check that it still
+  acts on the document window, never on the palette. With the document window minimized from the
+  menu, restore it from the taskbar and check the palettes come back with it.
+- Window menu on macOS and Windows (regression): it still shows the operating system's own
+  Minimize and Zoom/Maximize items with their usual shortcuts (Cmd+M on macOS), and no
+  "Maximize / Restore" item or disabled copy of the Linux items appears in any menu, toolbar or
+  the Customize gallery.
 - 1280-wide screen: set the display to 1280x800 and relaunch. The Main toolbar is no wider than
   the screen and starts at its left edge; nothing runs off the right edge of the screen. At
   1680x1050 the Main toolbar keeps its full width and saved position.

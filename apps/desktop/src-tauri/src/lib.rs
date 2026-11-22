@@ -176,16 +176,26 @@ const CLOSE_WINDOW_FILE_MENU_ID: &str = "app.closeWindow.file";
 #[cfg(target_os = "macos")]
 const CLOSE_WINDOW_WINDOW_MENU_ID: &str = "app.closeWindow.window";
 /// Linux: muda's predefined Minimize, Maximize and Close Window are unsupported in GTK menus, so
-/// Linux builds ordinary items with these ids, acting on the document window. Two Close ids, one
-/// per menu, because muda item ids are meant to be unique.
+/// Linux builds ordinary items backed by these registry commands (`windowCommands.ts`). A click
+/// routes to the webview like any other menu command, and the command asks for the native action
+/// on the document window over `WINDOW_ACTION_EVENT`. macOS and Windows keep the predefined items.
+const WINDOW_MINIMIZE_COMMAND_ID: &str = "window.minimize";
+const WINDOW_TOGGLE_MAXIMIZE_COMMAND_ID: &str = "window.toggleMaximize";
+const WINDOW_CLOSE_COMMAND_ID: &str = "window.close";
+/// Routed only on Linux, the one build whose menu carries them (`is_routed_menu_command`).
+const LINUX_WINDOW_COMMAND_IDS: &[&str] = &[
+    WINDOW_MINIMIZE_COMMAND_ID,
+    WINDOW_TOGGLE_MAXIMIZE_COMMAND_ID,
+    WINDOW_CLOSE_COMMAND_ID,
+];
+/// File ▸ Close Window has its own id because muda item ids are meant to be unique; it routes as
+/// `window.close`, like the Window menu's item (`linux_menu_command_id`).
 #[cfg(any(target_os = "linux", test))]
-const LINUX_MINIMIZE_MENU_ID: &str = "app.window.minimize";
+const LINUX_CLOSE_WINDOW_FILE_MENU_ID: &str = "window.close.fileMenu";
+/// Sent by the window commands with `{ commandId }`. Mirrors `WINDOW_ACTION_EVENT` in
+/// apps/desktop/src/windowCommands.ts.
 #[cfg(any(target_os = "linux", test))]
-const LINUX_TOGGLE_MAXIMIZE_MENU_ID: &str = "app.window.toggleMaximize";
-#[cfg(any(target_os = "linux", test))]
-const LINUX_CLOSE_WINDOW_FILE_MENU_ID: &str = "app.window.close.file";
-#[cfg(any(target_os = "linux", test))]
-const LINUX_CLOSE_WINDOW_WINDOW_MENU_ID: &str = "app.window.close.window";
+const WINDOW_ACTION_EVENT: &str = "chemdraft://window-action";
 const DOM_COMMAND_EVENT: &str = "chemdraft:native-command";
 #[cfg(target_os = "macos")]
 const PALETTE_POINTER_EVENT: &str = "chemdraft://palette-pointer";
@@ -1565,10 +1575,7 @@ pub fn run() {
                 return;
             }
             #[cfg(target_os = "linux")]
-            if let Some(action) = linux_window_menu_action(command_id) {
-                run_linux_window_menu_action(app, action);
-                return;
-            }
+            let command_id = linux_menu_command_id(command_id);
             if (is_routed_menu_command(command_id)
                 || (is_clipboard_edit_menu_command(command_id)
                     && custom_menu_shortcut(app, command_id).is_some()))
@@ -2041,6 +2048,8 @@ fn setup_primary_app(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::E
     if let Err(error) = linux_session_end::install(app) {
         eprintln!("Could not install ChemDraft Linux termination handlers: {error}");
     }
+    #[cfg(target_os = "linux")]
+    listen_for_linux_window_actions(app);
     panel_window::observe_document_pointer_release(app);
     file_warnings_window::observe_document(app)?;
     // Programmatic panel removal hides a reusable window, so it produces neither
@@ -10593,9 +10602,9 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                     #[cfg(not(target_os = "linux"))]
                     &PredefinedMenuItem::maximize(app, None)?,
                     #[cfg(target_os = "linux")]
-                    &linux_window_menu_item(app, LINUX_MINIMIZE_MENU_ID)?,
+                    &linux_window_menu_item(app, WINDOW_MINIMIZE_COMMAND_ID)?,
                     #[cfg(target_os = "linux")]
-                    &linux_window_menu_item(app, LINUX_TOGGLE_MAXIMIZE_MENU_ID)?,
+                    &linux_window_menu_item(app, WINDOW_TOGGLE_MAXIMIZE_COMMAND_ID)?,
                     &PredefinedMenuItem::separator(app)?,
                     #[cfg(target_os = "macos")]
                     &close_window_menu_item(
@@ -10606,7 +10615,7 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                     #[cfg(windows)]
                     &PredefinedMenuItem::close_window(app, None)?,
                     #[cfg(target_os = "linux")]
-                    &linux_window_menu_item(app, LINUX_CLOSE_WINDOW_WINDOW_MENU_ID)?,
+                    &linux_window_menu_item(app, WINDOW_CLOSE_COMMAND_ID)?,
                 ],
             )?,
             // macOS keeps About in the application menu; elsewhere Help is its home.
@@ -10663,21 +10672,42 @@ enum LinuxWindowMenuAction {
     Close,
 }
 
+/// The registry command a Linux menu item routes as. File ▸ Close Window's own menu id becomes
+/// `window.close`; every other menu id already is its command id.
 #[cfg(any(target_os = "linux", test))]
-fn linux_window_menu_action(command_id: &str) -> Option<LinuxWindowMenuAction> {
-    match command_id {
-        LINUX_MINIMIZE_MENU_ID => Some(LinuxWindowMenuAction::Minimize),
-        LINUX_TOGGLE_MAXIMIZE_MENU_ID => Some(LinuxWindowMenuAction::ToggleMaximize),
-        LINUX_CLOSE_WINDOW_FILE_MENU_ID | LINUX_CLOSE_WINDOW_WINDOW_MENU_ID => {
-            Some(LinuxWindowMenuAction::Close)
-        }
-        _ => None,
+fn linux_menu_command_id(menu_id: &str) -> &str {
+    if menu_id == LINUX_CLOSE_WINDOW_FILE_MENU_ID {
+        WINDOW_CLOSE_COMMAND_ID
+    } else {
+        menu_id
     }
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn linux_window_menu_title(command_id: &str) -> &'static str {
-    match linux_window_menu_action(command_id) {
+fn linux_window_command_action(command_id: &str) -> Option<LinuxWindowMenuAction> {
+    match command_id {
+        WINDOW_MINIMIZE_COMMAND_ID => Some(LinuxWindowMenuAction::Minimize),
+        WINDOW_TOGGLE_MAXIMIZE_COMMAND_ID => Some(LinuxWindowMenuAction::ToggleMaximize),
+        WINDOW_CLOSE_COMMAND_ID => Some(LinuxWindowMenuAction::Close),
+        _ => None,
+    }
+}
+
+/// The action a `WINDOW_ACTION_EVENT` payload (`{ "commandId": "window.minimize" }`) asks for.
+#[cfg(any(target_os = "linux", test))]
+fn linux_window_action_request(payload: &str) -> Option<LinuxWindowMenuAction> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Request {
+        command_id: String,
+    }
+    let request = serde_json::from_str::<Request>(payload).ok()?;
+    linux_window_command_action(&request.command_id)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_window_menu_title(menu_id: &str) -> &'static str {
+    match linux_window_command_action(linux_menu_command_id(menu_id)) {
         Some(LinuxWindowMenuAction::Minimize) => "Minimize",
         Some(LinuxWindowMenuAction::ToggleMaximize) => "Maximize / Restore",
         Some(LinuxWindowMenuAction::Close) | None => "Close Window",
@@ -10692,6 +10722,23 @@ fn linux_window_menu_item<R: Runtime>(
     id: &str,
 ) -> tauri::Result<MenuItem<R>> {
     MenuItem::with_id(app, id, linux_window_menu_title(id), true, None::<&str>)
+}
+
+/// The window commands' native half. Only the app windows in the default capability may emit
+/// events; plugin panels may only listen, so they cannot reach this.
+#[cfg(target_os = "linux")]
+fn listen_for_linux_window_actions(app: &tauri::AppHandle) {
+    let target = app.clone();
+    app.listen(
+        WINDOW_ACTION_EVENT,
+        move |event| match linux_window_action_request(event.payload()) {
+            Some(action) => run_linux_window_menu_action(&target, action),
+            None => eprintln!(
+                "Ignored an unknown ChemDraft window action: {}",
+                event.payload()
+            ),
+        },
+    );
 }
 
 /// The GTK menu bar belongs to the document window, so these act on it. Close goes through
@@ -11641,6 +11688,7 @@ fn toolset_toggle_command_id(toolset_id: &str) -> String {
 
 fn is_routed_menu_command(command_id: &str) -> bool {
     MENU_COMMAND_IDS.contains(&command_id)
+        || (cfg!(target_os = "linux") && LINUX_WINDOW_COMMAND_IDS.contains(&command_id))
         || native_clipboard_edit_command(command_id).is_some()
         || command_id.starts_with(TOOLSET_TOGGLE_PREFIX)
         || command_id.starts_with(PLUGIN_COMMAND_PREFIX)
@@ -15459,24 +15507,32 @@ mod tests {
     }
 
     #[test]
-    fn linux_window_menu_items_act_on_the_document_window() {
-        let ids = [
-            LINUX_MINIMIZE_MENU_ID,
-            LINUX_TOGGLE_MAXIMIZE_MENU_ID,
+    fn linux_window_menu_items_route_as_registry_commands() {
+        let menu_ids = [
+            WINDOW_MINIMIZE_COMMAND_ID,
+            WINDOW_TOGGLE_MAXIMIZE_COMMAND_ID,
             LINUX_CLOSE_WINDOW_FILE_MENU_ID,
-            LINUX_CLOSE_WINDOW_WINDOW_MENU_ID,
+            WINDOW_CLOSE_COMMAND_ID,
         ];
         assert_eq!(
-            ids.map(linux_window_menu_action),
+            menu_ids
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            menu_ids.len(),
+            "muda menu ids must be unique"
+        );
+        assert_eq!(
+            menu_ids.map(linux_menu_command_id),
             [
-                Some(LinuxWindowMenuAction::Minimize),
-                Some(LinuxWindowMenuAction::ToggleMaximize),
-                Some(LinuxWindowMenuAction::Close),
-                Some(LinuxWindowMenuAction::Close),
+                WINDOW_MINIMIZE_COMMAND_ID,
+                WINDOW_TOGGLE_MAXIMIZE_COMMAND_ID,
+                WINDOW_CLOSE_COMMAND_ID,
+                WINDOW_CLOSE_COMMAND_ID,
             ]
         );
         assert_eq!(
-            ids.map(linux_window_menu_title),
+            menu_ids.map(linux_window_menu_title),
             [
                 "Minimize",
                 "Maximize / Restore",
@@ -15485,14 +15541,44 @@ mod tests {
             ]
         );
         assert_eq!(
-            ids.iter().collect::<std::collections::HashSet<_>>().len(),
-            ids.len()
+            linux_menu_command_id("document.closeTab"),
+            "document.closeTab"
         );
-        for id in ids {
-            // Handled natively, never sent to the webview's command dispatcher.
-            assert!(!is_routed_menu_command(id));
+        for command_id in LINUX_WINDOW_COMMAND_IDS {
+            // Routed to the webview's command registry on Linux only; macOS and Windows show the
+            // predefined OS items, which never reach the dispatcher.
+            assert_eq!(
+                is_routed_menu_command(command_id),
+                cfg!(target_os = "linux"),
+                "{command_id}"
+            );
+            assert!(!MENU_COMMAND_IDS.contains(command_id));
         }
-        assert_eq!(linux_window_menu_action("document.closeTab"), None);
+        assert!(!is_routed_menu_command(LINUX_CLOSE_WINDOW_FILE_MENU_ID));
+
+        // The command's native half: its event payload names the command it runs.
+        assert_eq!(
+            [
+                r#"{"commandId":"window.minimize"}"#,
+                r#"{"commandId":"window.toggleMaximize"}"#,
+                r#"{"commandId":"window.close"}"#,
+            ]
+            .map(linux_window_action_request),
+            [
+                Some(LinuxWindowMenuAction::Minimize),
+                Some(LinuxWindowMenuAction::ToggleMaximize),
+                Some(LinuxWindowMenuAction::Close),
+            ]
+        );
+        for payload in [
+            r#"{"commandId":"window.close.fileMenu"}"#,
+            r#"{"commandId":"document.closeTab"}"#,
+            r#"{"action":"minimize"}"#,
+            "not json",
+        ] {
+            assert_eq!(linux_window_action_request(payload), None, "{payload}");
+        }
+        assert_eq!(WINDOW_ACTION_EVENT, "chemdraft://window-action");
 
         // muda drops the predefined items from GTK menus, so Linux must build its own.
         let source = include_str!("lib.rs");
@@ -15507,9 +15593,9 @@ mod tests {
             "#[cfg(not(target_os = \"linux\"))]\n                    &PredefinedMenuItem::minimize",
             "#[cfg(not(target_os = \"linux\"))]\n                    &PredefinedMenuItem::maximize",
             "#[cfg(windows)]\n                    &PredefinedMenuItem::close_window",
-            "&linux_window_menu_item(app, LINUX_MINIMIZE_MENU_ID)?",
-            "&linux_window_menu_item(app, LINUX_TOGGLE_MAXIMIZE_MENU_ID)?",
-            "&linux_window_menu_item(app, LINUX_CLOSE_WINDOW_WINDOW_MENU_ID)?",
+            "&linux_window_menu_item(app, WINDOW_MINIMIZE_COMMAND_ID)?",
+            "&linux_window_menu_item(app, WINDOW_TOGGLE_MAXIMIZE_COMMAND_ID)?",
+            "&linux_window_menu_item(app, WINDOW_CLOSE_COMMAND_ID)?",
         ] {
             assert!(menu.contains(item), "Window menu lacks {item}");
         }
@@ -15521,10 +15607,13 @@ mod tests {
             .split(".on_window_event(")
             .next()
             .unwrap();
+        // No native shortcut: the Linux items take the same routed path as every other menu item.
         assert!(dispatch.contains(
-            "if let Some(action) = linux_window_menu_action(command_id) {\n                \
-             run_linux_window_menu_action(app, action);\n                return;"
+            "#[cfg(target_os = \"linux\")]\n            let command_id = linux_menu_command_id(command_id);"
         ));
+        assert!(!dispatch.contains("run_linux_window_menu_action"));
+        assert!(source
+            .contains("#[cfg(target_os = \"linux\")]\n    listen_for_linux_window_actions(app);"));
     }
 
     #[test]

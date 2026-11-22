@@ -953,6 +953,7 @@ import {
   runtimeProblemReportDeps,
   watchForCrashes
 } from "./problemReports";
+import { requestWindowAction, windowCommands } from "./windowCommands";
 import {
   APP_CHECK_FOR_UPDATES_COMMAND_ID,
   AUTO_CHECK_DELAY_MS,
@@ -12447,6 +12448,14 @@ export function MainWindow({
         },
         () => runAppUpdateCheckRef.current("manual")
       );
+    }
+
+    // Window ▸ Minimize, Maximize / Restore and Close Window on Linux, whose GTK menu lacks the
+    // predefined OS items. macOS and Windows keep those, so the commands exist only on Linux.
+    for (const command of windowCommands({ isDesktop: isDesktopRuntime(), platform: detectDesktopShortcutPlatform() })) {
+      register(command, () => requestWindowAction(command.id).catch(error => {
+        setStatus(`Could not ${command.title.toLowerCase()} the window: ${describeError(error).brief}`);
+      }));
     }
 
     documentTabs.forEach((tab) => {
