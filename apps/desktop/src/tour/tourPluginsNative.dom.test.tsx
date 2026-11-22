@@ -98,15 +98,16 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-/** Open the tour from the document window into the native dialog window and go to step 4. */
-async function openToStep4(nameToStructure: boolean) {
+/** Open the tour from the document window into the native dialog window and go to step 5, which shows
+ *  Name to Structure (the plugins card, step 4, comes first). */
+async function openToNameStep(nameToStructure: boolean) {
   const tour = await mount(createElement(DialogWindow, { hostId: "tour" }));
   await mount(createElement(DocumentWindow, { nameToStructure }));
   await act(async () => { await import("./TourForm"); });
   await settle();
   const button = (text: string) => [...tour.querySelectorAll("button")].find(item => item.textContent === text);
-  for (let step = 1; step < 4; step++) await act(async () => { button("Next")!.click(); });
-  expect(tour.querySelector(".guided-tour-counter")!.textContent).toBe("Step 4 of 8");
+  for (let step = 1; step < 5; step++) await act(async () => { button("Next")!.click(); });
+  expect(tour.querySelector(".guided-tour-counter")!.textContent).toBe("Step 5 of 8");
   return { tour, button };
 }
 
@@ -114,7 +115,7 @@ describe.each([["macos", "MacIntel"], ["windows", "Win32"]] as const)("the nativ
   beforeEach(() => { vi.spyOn(navigator, "platform", "get").mockReturnValue(navigatorPlatform); });
 
   it("shows Name to Structure and its Try it when the menus offer the plugin", async () => {
-    const { tour, button } = await openToStep4(true);
+    const { tour, button } = await openToNameStep(true);
     expect(host.opened).toHaveLength(1);
     expect(host.opened[0]).toMatchObject({ dialogKind: "guidedTour", type: "snapshot",
       data: { title: "Take the Tour", scheme: "chemdraft", automatic: false, plugins: [TOUR_NAME_COMMAND] } });
@@ -127,19 +128,19 @@ describe.each([["macos", "MacIntel"], ["windows", "Win32"]] as const)("the nativ
     expect(tour.querySelector("[role=alert]")).toBeNull();
 
     // The dialog window used this platform's own wording on the last step.
-    for (let step = 4; step < 8; step++) await act(async () => { button("Next")!.click(); });
+    for (let step = 5; step < 8; step++) await act(async () => { button("Next")!.click(); });
     expect(tour.textContent).toContain(platform === "macos" ? "Choose ChemDraft > Settings… (⌘,)" : "Choose File > Preferences… (Ctrl+,)");
   });
 
   it("names the plugin as optional, with no Try it, when the menus do not offer it", async () => {
-    const { tour, button } = await openToStep4(false);
+    const { tour, button } = await openToNameStep(false);
     expect(host.opened[0]).toMatchObject({ dialogKind: "guidedTour", data: { plugins: [] } });
     expect(tour.querySelector("h1")!.textContent).toBe("Structure search");
     expect(tour.textContent).toContain("Use Tools to search PubChem or Reaxys by the selected structure. Optional plugin: add Name to Structure from " +
       "Plugins > Add or Remove Plugins… to draw a structure from a chemical name.");
     expect(tour.textContent).not.toContain("The Name to Structure plugin draws");
     expect(button("Try it")).toBeUndefined();
-    for (let step = 4; step < 8; step++) await act(async () => { button("Next")!.click(); });
+    for (let step = 5; step < 8; step++) await act(async () => { button("Next")!.click(); });
     expect(tour.textContent).toContain(platform === "macos" ? "Choose ChemDraft > Settings… (⌘,)" : "Choose File > Preferences… (Ctrl+,)");
     expect(invokeCommand).not.toHaveBeenCalled();
   });

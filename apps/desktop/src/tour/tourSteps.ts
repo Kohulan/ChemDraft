@@ -46,12 +46,18 @@ interface TourStep {
   tryCommand?: TourTryCommand;
   /** A web address shown as plain text under the step's text. */
   url?: string;
+  /** The card that explains plugins. It comes before every step that shows a plugin feature. */
+  introducesPlugins?: true;
+  /** The plugin this step shows, whether as its Try it or in its text (installed or offered as optional). */
+  plugin?: TourPluginCommand;
 }
 
 /**
  * The tour's steps. `plugins` lists the plugin commands the menus offer (`availableTourPluginCommands`);
  * a step that demonstrates a plugin appears only when its command is listed, and otherwise is reworded
  * to name the plugin as optional, with no Try it. Callers take the list once, when the tour opens.
+ * The plugins card comes before every step that shows a plugin (`plugin`, or a plugin Try it), so the
+ * tour explains plugins before it demonstrates one.
  */
 export function tourSteps(
   scheme: KeybindingScheme,
@@ -80,13 +86,21 @@ export function tourSteps(
       text: `Click and drag with the bond tool, or pick a ring from Ring Templates on the toolbar. Hover over an atom and type a label or press ${bondKey} to add a single bond.`,
       tryCommand: TOUR_SAMPLE_COMMAND
     },
+    {
+      title: "Add features with plugins",
+      text: `ChemDraft does more through plugins. Official plugins add NMR prediction, structure recognition from images, and chemical naming. To get them, choose ${menu.menu} > ${menu.manager} and install one from the catalog of official plugins. Beyond the official ones, you can vibe code your own: choose ${menu.menu} > ${menu.vibeCode} for step-by-step help. The plugin authoring guide is at:`,
+      url: PLUGIN_AUTHORING_GUIDE_URL,
+      introducesPlugins: true
+    },
     plugins.includes(TOUR_NAME_COMMAND) ? {
       title: "Names and structure search",
       text: "The Name to Structure plugin draws from a chemical name through the Structure menu. Use Tools to search PubChem or Reaxys by the selected structure.",
-      tryCommand: TOUR_NAME_COMMAND
+      tryCommand: TOUR_NAME_COMMAND,
+      plugin: TOUR_NAME_COMMAND
     } : {
       title: "Structure search",
-      text: `Use Tools to search PubChem or Reaxys by the selected structure. Optional plugin: add Name to Structure from ${menu.menu} > ${menu.manager} to draw a structure from a chemical name.`
+      text: `Use Tools to search PubChem or Reaxys by the selected structure. Optional plugin: add Name to Structure from ${menu.menu} > ${menu.manager} to draw a structure from a chemical name.`,
+      plugin: TOUR_NAME_COMMAND
     },
     {
       title: "Analysis and 3D",
@@ -96,11 +110,6 @@ export function tourSteps(
     {
       title: "Save, export, and copy",
       text: "Save your drawing as a ChemDraft file or export to SVG, PDF, PNG, CDXML, CDX, MOL, or SDF. Copy structures into Office documents."
-    },
-    {
-      title: "Add features with plugins",
-      text: `ChemDraft does more through plugins. Official plugins add NMR prediction, structure recognition from images, and chemical naming. To get them, choose ${menu.menu} > ${menu.manager} and install one from the catalog of official plugins. Beyond the official ones, you can vibe code your own: choose ${menu.menu} > ${menu.vibeCode} for step-by-step help. The plugin authoring guide is at:`,
-      url: PLUGIN_AUTHORING_GUIDE_URL
     },
     {
       title: "Make it yours",

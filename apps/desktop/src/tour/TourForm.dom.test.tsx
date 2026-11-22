@@ -72,12 +72,17 @@ describe.each(platforms)("guided tour on %s", platform => {
     click("Try it");
     expect(onAction).toHaveBeenLastCalledWith({ action: "tryTourCommand", command: "view.openKeyboardPreferences" });
 
-    for (const command of ["help.tour.openSample", "plugin.opsinNameToStructure.convert", "analyze.molecularProperties"]) {
+    for (const command of ["help.tour.openSample", undefined, "plugin.opsinNameToStructure.convert", "analyze.molecularProperties"]) {
       click("Next");
+      if (!command) {
+        // The plugins card explains plugins before the tour shows one; it has no Try it.
+        expect(container.querySelector("h1")!.textContent).toBe("Add features with plugins");
+        expect(button("Try it")).toBeUndefined();
+        continue;
+      }
       click("Try it");
       expect(onAction).toHaveBeenLastCalledWith({ action: "tryTourCommand", command });
     }
-    click("Next");
     click("Next");
     click("Next");
     const text = container.textContent;
@@ -109,17 +114,17 @@ describe.each(platforms)("guided tour on %s", platform => {
     const alert = () => container.querySelector('[role="alert"]')?.textContent;
     const missing = "Add Name to Structure from Plugins > Add or Remove Plugins, then try again.";
     render();
-    for (let step = 1; step < 4; step++) click("Next");
-    expect(container.textContent).toContain("Step 4 of 8");
+    for (let step = 1; step < 5; step++) click("Next");
+    expect(container.textContent).toContain("Step 5 of 8");
     click("Try it");
     render(missing);
     expect(alert()).toBe(missing);
 
     click("Next");
-    expect(container.textContent).toContain("Step 5 of 8");
+    expect(container.textContent).toContain("Step 6 of 8");
     expect(alert()).toBeUndefined();
     click("Back");
-    expect(container.textContent).toContain("Step 4 of 8");
+    expect(container.textContent).toContain("Step 5 of 8");
     expect(alert()).toBeUndefined();
 
     // A new action shows its own error again; leaving that step backward clears it too.
@@ -136,7 +141,7 @@ describe.each(platforms)("guided tour on %s", platform => {
     click("Try it");
     click("Next");
     render("Late failure");
-    expect(container.textContent).toContain("Step 5 of 8");
+    expect(container.textContent).toContain("Step 6 of 8");
     expect(alert()).toBeUndefined();
     click("Try it");
     render(undefined);
