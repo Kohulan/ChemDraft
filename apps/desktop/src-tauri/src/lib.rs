@@ -8864,7 +8864,7 @@ fn engine3d_sidecar_start_session(
     sessions: tauri::State<'_, Engine3dSidecarSessions>,
 ) -> Result<Engine3dSidecarSessionOutput, String> {
     let lines = normalize_engine3d_protocol_lines(lines, true)?;
-    let path = resolve_engine3d_sidecar_path(std::env::var(ENGINE3D_SIDECAR_ENV_VAR).ok())
+    let (path, _) = resolve_engine3d_sidecar(std::env::var(ENGINE3D_SIDECAR_ENV_VAR).ok())
         .ok_or_else(|| {
             format!(
                 "Interactive 3D sidecar is not configured. Set {ENGINE3D_SIDECAR_ENV_VAR} to a sidecar executable or bundle {}.",
@@ -8912,14 +8912,20 @@ fn interactive3d_menu_item_shown() -> bool {
 }
 
 fn engine3d_sidecar_status_from(env_override: Option<String>) -> Engine3dSidecarStatus {
-    let resolved_path = resolve_engine3d_sidecar_path(env_override.clone());
-    let source = if resolved_path.is_some() && env_override.is_some() {
-        "environment"
-    } else if resolved_path.is_some() {
-        "bundled"
-    } else {
-        "missing"
-    };
+    let executable = std::env::current_exe().ok();
+    engine3d_sidecar_status_in(env_override, executable.as_deref().and_then(Path::parent))
+}
+
+/// The status for a sidecar resolved against `executable_dir`. The source comes from the branch
+/// that chose the path: an override that cannot run falls back to the bundled sidecar, and the
+/// status then says "bundled", not "environment".
+fn engine3d_sidecar_status_in(
+    env_override: Option<String>,
+    executable_dir: Option<&Path>,
+) -> Engine3dSidecarStatus {
+    let resolved = resolve_engine3d_sidecar_in(env_override.clone(), executable_dir);
+    let source = resolved.as_ref().map_or("missing", |(_, source)| *source);
+    let resolved_path = resolved.map(|(path, _)| path);
 
     Engine3dSidecarStatus {
         available: resolved_path.is_some(),
@@ -9052,32 +9058,36 @@ fn normalize_engine3d_protocol_lines(
         .collect()
 }
 
-fn resolve_engine3d_sidecar_path(env_override: Option<String>) -> Option<PathBuf> {
+/// The sidecar to start and where it came from (`"environment"` or `"bundled"`).
+fn resolve_engine3d_sidecar(env_override: Option<String>) -> Option<(PathBuf, &'static str)> {
+    let executable = std::env::current_exe().ok();
+    resolve_engine3d_sidecar_in(env_override, executable.as_deref().and_then(Path::parent))
+}
+
+fn resolve_engine3d_sidecar_in(
+    env_override: Option<String>,
+    executable_dir: Option<&Path>,
+) -> Option<(PathBuf, &'static str)> {
     // Development / explicit override: an absolute path to a locally built sidecar wins.
     if let Some(path) = env_override {
         let candidate = PathBuf::from(path.trim());
         #[cfg(target_os = "linux")]
         let candidate = linux_startup::user_path(&candidate).into_owned();
         if is_runnable_sidecar(&candidate) {
-            return Some(candidate);
+            return Some((candidate, "environment"));
         }
     }
     // Packaged app: Tauri bundles the `externalBin` sidecar (target-triple suffix stripped) next to
     // the main executable. Resolve it there so a normally launched bundle finds its sidecar instead
     // of reporting Interactive 3D unavailable when the env override is unset.
-    let executable_dir = std::env::current_exe().ok()?;
-    let executable_dir = executable_dir.parent()?;
+    let executable_dir = executable_dir?;
     let sidecar_name = if cfg!(windows) {
         "avogadro3d-sidecar.exe"
     } else {
         "avogadro3d-sidecar"
     };
     let bundled = executable_dir.join(sidecar_name);
-    if is_runnable_sidecar(&bundled) {
-        Some(bundled)
-    } else {
-        None
-    }
+    is_runnable_sidecar(&bundled).then_some((bundled, "bundled"))
 }
 
 /// Marker text every `binaries/` placeholder carries (see binaries/README.md).
@@ -17303,6 +17313,52 @@ mod tests {
         if owned {
             let _ = fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn engine3d_sidecar_status_names_the_source_it_resolved() {
+        let dir =
+            std::env::temp_dir().join(format!("chemdraft-engine3d-source-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("fixture dir");
+        let missing_override = Some(dir.join("no-such-sidecar").to_string_lossy().to_string());
+
+        // An override that cannot run, and nothing bundled: missing.
+        let status = engine3d_sidecar_status_in(missing_override.clone(), Some(&dir));
+        expect_eq("missing", status.source.as_str());
+        expect_true(!status.available);
+        expect_eq(None, status.resolved_path);
+
+        // The same override beside a runnable bundled sidecar: the bundle is chosen, and the
+        // status says so rather than "environment".
+        #[cfg(windows)]
+        let bundled = {
+            // The smallest file is_pe_image accepts: MZ, e_lfanew = 0x40, then PE\0\0.
+            let mut image = vec![0u8; 0x44];
+            image[..2].copy_from_slice(b"MZ");
+            image[0x3c] = 0x40;
+            image[0x40..].copy_from_slice(b"PE\0\0");
+            let path = dir.join("avogadro3d-sidecar.exe");
+            fs::write(&path, image).expect("fixture should write");
+            path
+        };
+        #[cfg(not(windows))]
+        let bundled = {
+            use std::os::unix::fs::PermissionsExt;
+
+            let path = dir.join("avogadro3d-sidecar");
+            fs::write(&path, "#!/bin/sh\n").expect("fixture should write");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+            path
+        };
+        let status = engine3d_sidecar_status_in(missing_override, Some(&dir));
+        expect_eq("bundled", status.source.as_str());
+        expect_true(status.available);
+        expect_eq(
+            Some(bundled.to_string_lossy().to_string()),
+            status.resolved_path,
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
