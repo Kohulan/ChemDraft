@@ -408,13 +408,17 @@ describe.each(["macos", "windows"] as const)("ring label commits (%s)", platform
     const before = molecule();
     await pointer("pointerdown", before.atoms[0]!, container.querySelector(`[data-object-id="${before.id}"]`)!);
     for (const char of "OMe") await key(char);
-    expect(molecule().atoms.every(atom => atom.hydrogenCount === undefined)).toBe(true);
+    // A relabel is a chemical edit of the relabeled atom only: the other ring atoms keep their
+    // stated counts (owner ruling 1.2.3).
+    expect(molecule().atoms.map(atom => atom.hydrogenCount)).toEqual(before.atoms.map((_, index) => index === 0 ? undefined : 2));
     if (finish !== "Escape") await input(editor()!, finish === "empty" ? "" : "C");
     await key(finish === "Escape" ? "Escape" : "Enter");
     expect(editor()).toBeNull();
     if (finish === "same-label") {
       expect(molecule().atoms[0]).toMatchObject({ element: "C", labelLiteral: true });
-      expect(molecule().atoms.every(atom => atom.hydrogenCount === undefined)).toBe(true);
+      // Retyping the same element is not a chemical edit: atom 0 is still the atom its count was
+      // stated for, as for an element typed as a literal label (documentWorkflow.test.ts).
+      expect(molecule().atoms.every(atom => atom.hydrogenCount === 2)).toBe(true);
       expect(status()).toBe("Labeled atom C");
       await history(); expect(status()).toBe("Undid Edit Atom Label");
     }

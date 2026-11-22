@@ -16,7 +16,8 @@ function replaceMolecule(document: ChemDraftDocument, next: MoleculeObject): Che
 function fixture() {
   const document = insertNativeTemplateMolecule(createPhase4Document(), { x: 300, y: 300 }, "cyclohexane");
   const original = molecule(document);
-  // Import hints left on non-aromatic atoms exercise relabel's molecule-wide orphan cleanup.
+  // A stated count on every atom: a relabel is a chemical edit of the relabeled atom only, so it
+  // drops that atom's count and the others keep theirs (owner ruling 1.2.3); rollback stays exact.
   const before: MoleculeObject = { ...original, structureFormat: "molfile-v2000",
     structure: moleculeToMolfileV2000(original, { kekuleBondOrders: nativeBondOrderResolution(original.atoms, original.bonds).kekuleOrders }).contents,
     atoms: original.atoms.map(atom => ({ ...atom, hydrogenCount: 2, warningSuppressed: true,
@@ -64,10 +65,10 @@ describe("atom-label draft rollback", () => {
     expect(molecule(restoreAtomLabelDraft(continued, state))).toBe(accepted);
   });
 
-  it("restores an imported molecule exactly, including hints cleared on other atoms", () => {
+  it("restores an imported molecule exactly; the relabel kept the other atoms' stated counts", () => {
     const { document, before, state } = fixture();
     const preview = draft(document, state);
-    expect(molecule(preview).atoms.every(atom => atom.hydrogenCount === undefined)).toBe(true);
+    expect(molecule(preview).atoms.map(atom => atom.hydrogenCount)).toEqual([undefined, 2, 2, 2, 2, 2]);
     expect(molecule(restoreAtomLabelDraft(preview, state))).toEqual(before);
   });
 
@@ -80,7 +81,8 @@ describe("atom-label draft rollback", () => {
     expect(restored.atoms[0]).toEqual(before.atoms[0]);
     expect(restored.atoms[2]).toEqual(molecule(moved).atoms[2]);
     expect(restored.atoms[1]).toEqual(before.atoms[1]);
-    expect(restored.atoms[2]!.hydrogenCount).toBeUndefined();
+    // A move is not a chemical edit: the moved atom keeps its stated count.
+    expect(restored.atoms[2]!.hydrogenCount).toBe(2);
     expect(restored.width).toBeGreaterThan(before.width);
     expectDerivedFromGraph(restored);
   });
@@ -107,7 +109,8 @@ describe("atom-label draft rollback", () => {
     const restored = molecule(restoreAtomLabelDraft(preview, state));
     expect(restored.atoms[2]).toEqual(molecule(preview).atoms[2]);
     expect(restored.atoms[2]!.warningSuppressed).toBe(false);
-    expect(restored.atoms[2]!.hydrogenCount).toBeUndefined();
+    // The external edit's count stays: the later keys edited atom 0, not this atom.
+    expect(restored.atoms[2]!.hydrogenCount).toBe(0);
     expect(restored.atoms[1]).toEqual(before.atoms[1]);
     expectDerivedFromGraph(restored);
   });
@@ -135,7 +138,8 @@ describe("atom-label draft rollback", () => {
         .map((bond, index) => index === 1 ? { ...bond, order: "double" as const } : bond) };
     const restored = molecule(restoreAtomLabelDraft(replaceMolecule(preview, changed), state));
     expect(restored.atoms.some(atom => atom.id === before.atoms[4]!.id)).toBe(false);
-    expect(restored.atoms[2]!.hydrogenCount).toBeUndefined();
+    // The atom whose bond changed after the preview is left as that edit left it, never rolled back.
+    expect(restored.atoms[2]).toEqual(changed.atoms[2]);
     expect(restored.bonds).toEqual(changed.bonds);
     expectDerivedFromGraph(restored);
   });

@@ -64,7 +64,7 @@ describe("imported hydrogen hints expire on chemical edits", () => {
   });
 });
 
-describe("a hint only survives on an atom with an aromatic bond in a ring", () => {
+describe("a new molecule drops only a hint orphaned from its aromatic ring", () => {
   const add = (molecule: MoleculeObject): MoleculeObject => {
     const document = createEmptyDocument();
     return applyPatches(document, [{ op: "addObject", pageId: document.pages[0]!.id, object: molecule }])
@@ -91,7 +91,10 @@ describe("a hint only survives on an atom with an aromatic bond in a ring", () =
     expect(fragment.atoms[0]!.hydrogenCount).toBe(1);
   });
 
-  it("drops a hint on an atom with no aromatic bond at all", () => {
+  it("keeps a stated count on an atom with no aromatic bond at all: it describes the atom itself", () => {
+    // Owner ruling (1.2.3): a CDXML NumHydrogens that disagrees with the derived count is kept as
+    // written and badged, so a molecule entering the document (an import, a whole-molecule paste or
+    // duplicate) keeps it. Only an atom whose aromatic bonds no longer sit in a ring loses its count.
     const molecule: MoleculeObject = {
       ...imported(),
       atoms: [
@@ -100,7 +103,17 @@ describe("a hint only survives on an atom with an aromatic bond in a ring", () =
       ],
       bonds: [{ id: "b", fromAtomId: "n", toAtomId: "c", order: "single" }]
     };
-    expect(add(molecule).atoms.map((atom) => atom.hydrogenCount)).toEqual([undefined, undefined]);
+    expect(add(molecule).atoms.map((atom) => atom.hydrogenCount)).toEqual([2, 3]);
+    expect(dropOrphanedHydrogenHints(molecule.atoms, molecule.bonds)).toBe(molecule.atoms);
+  });
+
+  it("keeps a lone atom's stated count (no bonds, so no ring that could have been cut)", () => {
+    const molecule: MoleculeObject = {
+      ...imported(),
+      atoms: [{ id: "o", element: "O", x: 0, y: 0, formalCharge: 0, hydrogenCount: 0 }],
+      bonds: []
+    };
+    expect(add(molecule).atoms[0]!.hydrogenCount).toBe(0);
   });
 
   it("drops the hint through an update that cuts the ring down to an acyclic aromatic bond", () => {
@@ -119,5 +132,74 @@ describe("a hint only survives on an atom with an aromatic bond in a ring", () =
   it("returns the same array when there is nothing to drop", () => {
     const { atoms, bonds } = imported();
     expect(dropOrphanedHydrogenHints(atoms, bonds)).toBe(atoms);
+  });
+});
+
+// Ethanol as a CDXML file with NumHydrogens="0" on the O imports it: the O's stated count disagrees
+// with the derived one and is kept on the atom (owner ruling, 1.2.3).
+const ethoxy = (): MoleculeObject => ({
+  id: "m", type: "molecule", x: 0, y: 0, width: 40, height: 20, rotation: 0, style: {},
+  structureFormat: "molfile-v2000", structure: "", superatoms: [], rGroups: [],
+  atoms: [
+    { id: "c1", element: "C", x: 0, y: 0, formalCharge: 0 },
+    { id: "c2", element: "C", x: 14, y: 8, formalCharge: 0 },
+    { id: "o", element: "O", x: 28, y: 0, formalCharge: 0, hydrogenCount: 0 },
+    { id: "s", element: "S", x: 60, y: 0, formalCharge: 0 }
+  ],
+  bonds: [
+    { id: "b1", fromAtomId: "c1", toAtomId: "c2", order: "single" },
+    { id: "b2", fromAtomId: "c2", toAtomId: "o", order: "single" }
+  ]
+});
+
+describe("a stated count on an atom with no aromatic bond lasts until that atom is edited chemically", () => {
+  const update = (edit: (molecule: MoleculeObject) => void): MoleculeObject => {
+    const document = createEmptyDocument();
+    const before = ethoxy();
+    const after = structuredClone(before);
+    edit(after);
+    return applyPatches(document, [
+      { op: "addObject", pageId: document.pages[0]!.id, object: before },
+      { op: "updateObject", objectId: before.id, changes: after }
+    ]).pages[0]!.objects[0] as MoleculeObject;
+  };
+  const oxygen = (molecule: MoleculeObject) => molecule.atoms.find((atom) => atom.id === "o")!;
+
+  it.each([
+    ["a move", (m: MoleculeObject) => { m.atoms.forEach((atom) => { atom.x += 50; atom.y -= 20; }); }],
+    ["a rotation", (m: MoleculeObject) => { m.atoms.forEach((atom) => { [atom.x, atom.y] = [-atom.y, atom.x]; }); }],
+    ["an alignment of one atom", (m: MoleculeObject) => { m.atoms[2]!.y = m.atoms[0]!.y; }],
+    ["a reversed bond with a new style", (m: MoleculeObject) => {
+      m.bonds[1] = { ...m.bonds[1]!, fromAtomId: "o", toAtomId: "c2", display: { bondStyle: "bold" } };
+    }],
+    ["a label offset and color", (m: MoleculeObject) => {
+      m.atoms[2]!.labelOffset = { x: 2, y: 1 };
+      m.style = { atomLabelColors: { o: "#123456" } };
+    }],
+    ["a chemical edit of another atom", (m: MoleculeObject) => { m.atoms[0]!.element = "N"; m.atoms[0]!.formalCharge = 1; }],
+    ["a bond added elsewhere", (m: MoleculeObject) => { m.bonds.push({ id: "b3", fromAtomId: "c1", toAtomId: "s", order: "single" }); }]
+  ] as const)("keeps it through %s", (_name, edit) => {
+    expect(oxygen(update(edit)).hydrogenCount).toBe(0);
+  });
+
+  it.each([
+    ["an element change", (m: MoleculeObject) => { m.atoms[2]!.element = "S"; }],
+    ["a charge change", (m: MoleculeObject) => { m.atoms[2]!.formalCharge = -1; }],
+    ["a bond order change at it", (m: MoleculeObject) => { m.bonds[1]!.order = "double"; }],
+    ["a bond added at it", (m: MoleculeObject) => { m.bonds.push({ id: "b3", fromAtomId: "o", toAtomId: "s", order: "single" }); }],
+    ["a dative bond added at it", (m: MoleculeObject) => {
+      m.bonds.push({ id: "b3", fromAtomId: "o", toAtomId: "s", order: "single", display: { bondStyle: "dashed" } });
+    }],
+    ["its bond made dative", (m: MoleculeObject) => { m.bonds[1]!.display = { bondStyle: "dashed" }; }],
+    ["its bond removed", (m: MoleculeObject) => { m.bonds.pop(); }]
+  ] as const)("drops it on %s", (_name, edit) => {
+    expect(oxygen(update(edit)).hydrogenCount).toBeUndefined();
+  });
+
+  it("is kept when the molecule is added whole (an import, a paste or a duplicate)", () => {
+    const document = createEmptyDocument();
+    const added = applyPatches(document, [{ op: "addObject", pageId: document.pages[0]!.id, object: ethoxy() }])
+      .pages[0]!.objects[0] as MoleculeObject;
+    expect(oxygen(added).hydrogenCount).toBe(0);
   });
 });
