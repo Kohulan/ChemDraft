@@ -96,7 +96,7 @@ describe("B: moved selected mark exemption", () => {
     const { before, next, a, nitrogen } = legacyPlusTakenByMovedB();
     const after = normalize(next);
     expect(atomOf(after, a.id, nitrogen.id).formalCharge).toBe(1);
-    const refusals = commitChemistryRefusals({ before, next, after, normalize, markAtoms, operation: "move", transform: true });
+    const refusals = commitChemistryRefusals({ before, next, after, normalize, markAtoms, operation: "move" });
     // ADAPTED on charge-follows: B's own atom, now carrying the transferred +, is also (correctly) refused.
     expect(refusals).toEqual(expect.arrayContaining([expect.stringMatching(new RegExp(`molecule "${a.id}": its atom "${nitrogen.id}"`))]));
   });
@@ -117,7 +117,7 @@ describe("B: moved selected mark exemption", () => {
     const explicitId = dropMark(before).id;
     const unmoved = applyPatch(next, { op: "updateObject", objectId: explicitId,
       changes: { x: markById(before, explicitId).x } }, { now: phase4Timestamp });
-    expect(commitChemistryRefusals({ before, next: unmoved, after: normalize(unmoved), normalize, markAtoms, operation: "move", transform: true }))
+    expect(commitChemistryRefusals({ before, next: unmoved, after: normalize(unmoved), normalize, markAtoms, operation: "move" }))
       // ADAPTED on charge-follows: B's own atom, now carrying the transferred +, is also (correctly) refused.
       .toEqual(expect.arrayContaining([expect.stringMatching(new RegExp(`molecule "${a.id}": its atom "${nitrogen.id}"`))]));
   });
@@ -162,7 +162,7 @@ describe("C/D: delimiter collisions in guard keys", () => {
     const moveNext: ChemDraftDocument = { ...moveBefore, pages: [{ ...moveBefore.pages[0], objects: [
       { ...m, ...translated(m, 40, 0) }, chargeAtom(unselected, 1)] }] };
     expect(commitChemistryRefusals({ before: moveBefore, next: moveNext, after: moveNext, normalize: identity, markAtoms,
-      operation: "move", transform: true })).toEqual([expect.stringContaining('molecule "m_a"')]);
+      operation: "move" })).toEqual([expect.stringContaining('molecule "m_a"')]);
   });
 
   it("D: moving selected molecule \"m\" (atom \"a\\nx\") does not exempt atom \"x\" of unselected molecule \"m\\na\"", () => {
@@ -180,7 +180,7 @@ describe("C/D: delimiter collisions in guard keys", () => {
       pages: [{ ...base.pages[0], objects: [m, unselected] }] };
     const next: ChemDraftDocument = { ...before, pages: [{ ...before.pages[0], objects: [
       { ...m, ...translated(m, 40, 0) }, chargeAtom(unselected, 1)] }] };
-    const refusals = commitChemistryRefusals({ before, next, after: next, normalize: identity, markAtoms, operation: "move", transform: true });
+    const refusals = commitChemistryRefusals({ before, next, after: next, normalize: identity, markAtoms, operation: "move" });
     expect(refusals).toEqual([expect.stringContaining('molecule "m\na"')]);
   });
 });

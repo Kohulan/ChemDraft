@@ -905,7 +905,7 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
     await exactUndoRedo(before, after, operation === "part drag" ? "Move" : "Rotate selection");
   });
 
-  it.each(["point", "bond", "object"] as const)("preserves the %s anchor when only a rotated carbon's raw coordinates reach the mark", kind => {
+  it.each(["point", "bond", "object"] as const)("preserves the %s anchor when only a rotated carbon's raw coordinates reach the mark", async kind => {
     // A part drag now moves the drawn atom to the pointer (CodeRabbit #422 item I), so no drop leaves
     // the raw coordinates on the mark while the drawing misses it. That legacy geometry is set
     // directly here, before and after, and run through the resolver and commit normalization the
@@ -940,6 +940,18 @@ describe.each([false, true])("electron-mark drop interaction with direct editing
     const reopened = workflow.openNativeDocument(saved.contents).document!;
     expect(dropMark(reopened).anchor).toEqual(anchor);
     expect(dropMark(workflow.normalizeCommittedDocument(reopened)).anchor).toEqual(anchor);
+
+    // Undo and Redo through the real commit path: the app's own part-drag commit is handed the
+    // direct-geometry result above (the drag itself can no longer produce it), so Undo must return
+    // the pre-drag document and Redo the post-drag document, exactly.
+    vi.spyOn(workflow, "moveNativeMoleculeParts").mockImplementation(() => moved);
+    await mount(before);
+    const dragged = await dragAtom(rotated.id, start, center);
+    const committed = snapshot();
+    expect(status()).toBe("Moved selected molecule part");
+    expect(committed).toEqual(after);
+    expect(dropMark(committed).anchor).toEqual(anchor);
+    await exactUndoRedo(dragged.before, committed, "Move");
   });
 
   it("leaves a legacy floating plus by a stationary rotated oxygen when another molecule's atom moves", async () => {
