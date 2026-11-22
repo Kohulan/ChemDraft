@@ -203,27 +203,54 @@ const moleculesById = (page: DocumentPage | undefined) => new Map((page?.objects
   .flatMap((object) => object.type === "molecule" ? [[object.id, object] as const] : []));
 
 /**
- * The molecule of `after` a molecule of `before` that is gone from its own page moved to: the one
- * molecule in `after` with its id on a page that did not hold that id in `before`. A molecule that
- * was already on its page in `before` is that page's own molecule and never stands in for a
- * same-id molecule removed from another page; an id that arrived on more than one page names no
- * single molecule. Built lazily.
+ * The molecule of `after` that a molecule of `before`, gone from its own page, moved to; matching is
+ * one-to-one. A source is a molecule of `before` whose page no longer holds its id in `after`; a
+ * destination is a molecule of `after` on a page that did not hold that id in `before` (a molecule
+ * already on its page in `before` is that page's own and never stands in for a same-id molecule
+ * removed from another page). Each destination is consumed by at most one source and each source by
+ * at most one destination: when several sources share an id with one destination (pages A and B both
+ * held "m"; only page C holds it now), one of them is matched, preferring the one the destination
+ * still equals, and the rest have no match and so are reported removed. An id that arrived on more
+ * than one page names no single molecule: none of its sources match. Built lazily.
  */
-function movedPageMatcher(before: ChemDraftDocument, after: ChemDraftDocument): (id: string) => MoleculeObject | undefined {
-  let arrived: Map<string, MoleculeObject | undefined> | undefined;
-  return (id) => {
-    if (!arrived) {
-      arrived = new Map();
+function movedPageMatcher(before: ChemDraftDocument, after: ChemDraftDocument): (pageId: string, id: string) => MoleculeObject | undefined {
+  let matched: Map<string, MoleculeObject> | undefined;
+  return (pageId, id) => {
+    if (!matched) {
+      matched = new Map();
       const beforePages = new Map(before.pages.map((page) => [page.id, page]));
+      const afterPages = new Map(after.pages.map((page) => [page.id, page]));
+      const destinations = new Map<string, MoleculeObject[]>();
       for (const page of after.pages) {
         const heldBefore = moleculesById(beforePages.get(page.id));
         for (const object of page.objects) {
           if (object.type !== "molecule" || heldBefore.has(object.id)) continue;
-          arrived.set(object.id, arrived.has(object.id) ? undefined : object);
+          const list = destinations.get(object.id);
+          if (list) list.push(object); else destinations.set(object.id, [object]);
         }
       }
+      const sources = new Map<string, { pageId: string; molecule: MoleculeObject }[]>();
+      for (const page of before.pages) {
+        if (!page.objects.some((object) => object.type === "molecule" && destinations.has(object.id))) continue;
+        const heldAfter = moleculesById(afterPages.get(page.id));
+        for (const object of page.objects) {
+          if (object.type !== "molecule" || heldAfter.has(object.id) || !destinations.has(object.id)) continue;
+          const list = sources.get(object.id);
+          if (list) list.push({ pageId: page.id, molecule: object }); else sources.set(object.id, [{ pageId: page.id, molecule: object }]);
+        }
+      }
+      for (const [moleculeId, candidates] of sources) {
+        const arrived = destinations.get(moleculeId)!;
+        if (arrived.length !== 1) continue;
+        const destination = arrived[0];
+        const source = candidates.find(({ molecule }) => molecule === destination) ??
+          candidates.find(({ molecule }) => sameMoleculeStructure(molecule, destination) &&
+            moleculeAtomChemistryChanges(molecule, destination).length === 0) ??
+          candidates[0];
+        matched.set(moleculeKey(source.pageId, moleculeId), destination);
+      }
     }
-    return arrived.get(id);
+    return matched.get(moleculeKey(pageId, id));
   };
 }
 
@@ -231,7 +258,8 @@ function movedPageMatcher(before: ChemDraftDocument, after: ChemDraftDocument): 
  * Every molecule in `before` against the molecule with the same id in `after`: changed atoms,
  * removed atoms, and molecules that are gone. Object ids are unique only within a page, so a
  * molecule is matched on its own page, and on another page only when it moved pages
- * (`movedPageMatcher`): a same-id molecule another page already held never masks its removal.
+ * (`movedPageMatcher`, one-to-one): a same-id molecule another page already held never masks its
+ * removal, and two removed same-id molecules never both match one arrival.
  * Molecules only `after` has (pasted, duplicated, drawn) are ignored.
  * Compare committed (normalized) documents: that is the chemistry the user sees.
  */
@@ -251,7 +279,7 @@ export function preexistingMoleculeChemistryChanges(
     const samePage = moleculesById(afterPage);
     for (const molecule of page.objects) {
       if (molecule.type !== "molecule" || options.skipMoleculeIds?.has(molecule.id)) continue;
-      const found = samePage.get(molecule.id) ?? movedPages(molecule.id);
+      const found = samePage.get(molecule.id) ?? movedPages(page.id, molecule.id);
       if (found === molecule) continue;
       if (!found) {
         changes.push({ pageId: page.id, moleculeId: molecule.id });
@@ -395,7 +423,7 @@ export function structurallyEditedMoleculeKeys(before: ChemDraftDocument, next: 
     const samePage = moleculesById(nextPage);
     for (const molecule of page.objects) {
       if (molecule.type !== "molecule") continue;
-      const found = samePage.get(molecule.id) ?? onAnyPage(molecule.id);
+      const found = samePage.get(molecule.id) ?? onAnyPage(page.id, molecule.id);
       if (!found || !sameMoleculeStructure(molecule, found)) keys.add(moleculeKey(page.id, molecule.id));
     }
   }

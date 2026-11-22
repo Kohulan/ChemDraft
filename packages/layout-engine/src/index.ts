@@ -6533,6 +6533,53 @@ export function moleculeLayoutLabelBoxes(object: MoleculeObject): LayoutLabelBox
   });
 }
 
+/** Room left between an electron mark's frame and its atom's label box, in px. */
+export const electronMarkLabelGapPx = 1;
+
+/** An electron mark's stored page frame and angle, as `electronMarkCentreClearOfAtomLabel` reads it. */
+export interface ElectronMarkLabelClearanceFrame { x: number; y: number; width: number; height: number; rotation?: number }
+
+/**
+ * Where an electron mark beside `atomId` must sit so its frame clears that atom's label box (the
+ * collision box `moleculeLayoutLabelBoxes` gives, plus `gapPx`), as a page-frame centre; undefined
+ * when the frame is already clear or the atom draws no label. The mark keeps its direction from the
+ * atom and moves out along it just far enough, never farther than `maxDistance` from the atom; a
+ * mark on its atom has no direction and goes upper right. The label box and atoms share the
+ * molecule's unrotated frame, so the test runs there, with the mark's extents in that frame: a mark
+ * turned relative to its molecule (its `rotation` less the molecule's) covers its rotated box, not
+ * its stored width and height. `labelBoxes` lets a caller reuse boxes it already measured.
+ */
+export function electronMarkCentreClearOfAtomLabel(
+  molecule: MoleculeObject,
+  atomId: string,
+  mark: ElectronMarkLabelClearanceFrame,
+  maxDistance: number,
+  options: { gapPx?: number; labelBoxes?: readonly LayoutLabelBox[] } = {}
+): LayoutPoint | undefined {
+  const atomIndex = molecule.atoms.findIndex(atom => atom.id === atomId);
+  if (atomIndex < 0) return undefined;
+  const label = (options.labelBoxes ?? moleculeLayoutLabelBoxes(molecule)).find(box => box.atom === atomIndex);
+  if (!label) return undefined;
+  const atom = molecule.atoms[atomIndex];
+  const gap = options.gapPx ?? electronMarkLabelGapPx;
+  const centre = inverseTransformPointForObject(molecule, { x: mark.x + mark.width / 2, y: mark.y + mark.height / 2 });
+  const turn = degreesToRadians((mark.rotation ?? 0) - molecule.rotation);
+  const cos = Math.abs(Math.cos(turn)), sin = Math.abs(Math.sin(turn));
+  const halfWidth = (cos * mark.width + sin * mark.height) / 2 + gap;
+  const halfHeight = (sin * mark.width + cos * mark.height) / 2 + gap;
+  const left = label.x - halfWidth, right = label.x + label.width + halfWidth;
+  const top = label.y - halfHeight, bottom = label.y + label.height + halfHeight;
+  if (centre.x <= left || centre.x >= right || centre.y <= top || centre.y >= bottom) return undefined;
+  const offset = { x: centre.x - atom.x, y: centre.y - atom.y };
+  const length = Math.hypot(offset.x, offset.y);
+  const direction = length > 1e-6 ? { x: offset.x / length, y: offset.y / length } : { x: Math.SQRT1_2, y: -Math.SQRT1_2 };
+  const exit = (from: number, low: number, high: number, step: number) =>
+    step > 1e-9 ? (high - from) / step : step < -1e-9 ? (low - from) / step : Infinity;
+  const distance = Math.min(exit(atom.x, left, right, direction.x), exit(atom.y, top, bottom, direction.y), maxDistance);
+  if (!Number.isFinite(distance) || distance <= length) return undefined;
+  return transformPointForObject(molecule, { x: atom.x + direction.x * distance, y: atom.y + direction.y * distance });
+}
+
 /** Selection frames are unrotated page coordinates, like the atoms. Handwriting labels
  * can overhang the stored atom frame; reserve their measured boxes before drawing chrome.
  * Other fonts retain their established selection geometry. */

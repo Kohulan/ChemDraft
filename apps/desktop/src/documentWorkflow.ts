@@ -8432,13 +8432,15 @@ export function committedElectronMarkAssignments(page: DocumentPage, options: Na
     if (!atom) continue;
     const { charge, radicals } = electronMarkAtomContribution(mark);
     // Honor stored contributions attributed by the legacy raw-coordinate matcher, each legacy mark
-    // consuming its own share of what the atom stores for them. A new association also has to reach
-    // the drawn atom, including after a rotated part drag.
+    // consuming its own share of what the atom stores for them. Every nonzero component is proven on
+    // its own: a radical-ion mark (+1 and a radical) is kept only when the atom stores both its
+    // charge and its radical, so a stored radical never admits an unproven charge, nor the reverse.
+    // An unproven mark has to reach the drawn atom, including after a rotated part drag.
     const remainder = storedRemainder(owner.objectId, atom);
-    const chargeStored = charge !== 0 && Math.sign(remainder.charge) === Math.sign(charge) &&
-      Math.abs(remainder.charge) >= Math.abs(charge);
-    const radicalsStored = radicals !== 0 && remainder.radicals >= radicals;
-    if (chargeStored || radicalsStored) {
+    const chargeProven = charge === 0 || (Math.sign(remainder.charge) === Math.sign(charge) &&
+      Math.abs(remainder.charge) >= Math.abs(charge));
+    const radicalsProven = radicals === 0 || remainder.radicals >= radicals;
+    if ((charge !== 0 || radicals !== 0) && chargeProven && radicalsProven) {
       remainder.charge -= charge;
       remainder.radicals -= radicals;
       continue;
@@ -13938,7 +13940,9 @@ interface AtomOwnedMark {
  * Every electron mark that belongs to an atom, by the atom's molecule, in page order, built once
  * per array. Owner ruling 2026-11-21 (charge always follows): the marks a molecule transform
  * carries are ALL the marks associated with its atoms, not only atom-anchored ones, so a legacy
- * mark's chemistry can never stay behind when its atom moves.
+ * mark's chemistry can never stay behind when its atom moves. A charge or radical mark that is not
+ * explicitly atom-anchored belongs to the atom the committed resolver gives it: the ONE owner rule
+ * for drag, every molecule transform and copy (`electronMarksCarriedWithMolecules`).
  */
 const anchoredMarkIndexes = new WeakMap<
   readonly DocumentObject[],
@@ -13954,12 +13958,18 @@ function atomOwnedMarksByMoleculeId(pageObjects: readonly DocumentObject[]): Rea
       if (object.type !== "electron-mark") continue;
       let owner: { objectId?: string; atomId?: string } | undefined;
       let resolved = false;
-      if (object.anchor.kind === "atom") {
+      const chargeOrRadical = object.markKind === "charge" || object.markKind === "radical-dot";
+      if (object.anchor.kind === "atom" && (!chargeOrRadical || object.atomAssociation === "explicit")) {
         owner = object.anchor;
-      } else if (object.markKind === "charge" || object.markKind === "radical-dot") {
+      } else if (chargeOrRadical) {
+        // A legacy bond, object or loose mark, or a non-explicit atom-anchored one, belongs to the
+        // atom the committed resolver gives it (`committedElectronMarkAssignments`), never to a stale
+        // stored anchor: the owner copy uses, so drag and copy agree. `resolved` when that owner is
+        // not the stored anchor, so carrying it re-anchors it to its owner explicitly.
         assignments ??= committedElectronMarkAssignments({ objects: pageObjects } as DocumentPage).anchorByMarkId;
         owner = assignments.get(object.id);
-        resolved = true;
+        const anchor = object.anchor as { objectId?: string; atomId?: string };
+        resolved = object.anchor.kind !== "atom" || anchor.objectId !== owner?.objectId || anchor.atomId !== owner?.atomId;
       }
       if (owner?.objectId === undefined || owner.atomId === undefined) continue;
       const entry = { markId: object.id, atomId: owner.atomId, resolved };
@@ -14054,13 +14064,13 @@ interface CarriedElectronMark {
  * lasso fragments). `molecules` are the molecules as they will be copied (a fragment passes its
  * pruned molecule, which keeps its id), so a mark belongs only when the atom it sits on is copied.
  *
- * It starts from `anchoredElectronMarksForTransform`, the atom-anchored rule every molecule
- * transform uses, and adds the marks whose anchor is not an atom (a bond or object anchor, or a
- * legacy loose point) but which the committed assignment resolver attributes to one of the copied
- * atoms. A non-explicit atom-anchored charge or radical is taken from the resolver too, never from
- * its stored anchor alone, so a stale anchor cannot give the copy a charge its source lacks: normalization derives markCharge and markRadicals from exactly that attribution, so a copy
- * that left such a mark behind would be recomputed to a different charge. No second association
- * rule: the resolver is the one the commit funnel runs.
+ * It is `atomOwnedMarksForTransform`, the owner rule every molecule transform (drag included)
+ * uses: an explicitly atom-anchored mark (and any lone pair) by its anchor, and every other charge
+ * or radical mark (a bond or object anchor, a legacy loose point, or a non-explicit atom anchor) by
+ * the atom the committed assignment resolver attributes it to, never by a stored anchor alone, so a
+ * stale anchor cannot give the copy a charge its source lacks: normalization derives markCharge and
+ * markRadicals from exactly that attribution. No second association rule: the resolver is the one
+ * the commit funnel runs.
  *
  * Bond, object and point anchors resolve by distance to the nearest atom of ANY molecule, so a copy
  * placed near its original could be attributed to the original's atoms instead of the copy's. Their
@@ -14072,32 +14082,16 @@ function electronMarksCarriedWithMolecules(
   page: DocumentPage,
   molecules: readonly MoleculeObject[]
 ): CarriedElectronMark[] {
+  // The same owner rule as every molecule transform (`atomOwnedMarksForTransform`): a charge or
+  // radical mark that is not explicitly atom-anchored follows the committed resolver, so a copy has
+  // exactly the chemistry its source has, and a mark the resolver gives to no copied atom stays with
+  // its source, uncopied. A mark whose owner is not its stored anchor is copied re-anchored to it.
   const ownerByMarkId = new Map<string, { moleculeId: string; atomId?: string }>();
-  const copiedAtomIdsByMoleculeId = new Map(molecules.map((molecule) =>
-    [molecule.id, new Set(molecule.atoms.map((atom) => atom.id))] as const));
-  // A non-explicit atom-anchored charge or radical belongs where the committed resolver puts it, not
-  // where its stored anchor says: an older file can store an anchor on an atom whose association
-  // radius the glyph has left, and normalization then gives its chemistry to another atom (of this
-  // molecule, of another one, or none). A copy follows the resolver, so it has exactly the chemistry
-  // its source has; a mark the resolver gives to no copied atom stays with its source, uncopied.
-  const followsResolver = (mark: ElectronMarkObject) => mark.anchor.kind === "atom" &&
-    mark.atomAssociation !== "explicit" && (mark.markKind === "charge" || mark.markKind === "radical-dot");
   for (const molecule of molecules) {
-    const atomIds = copiedAtomIdsByMoleculeId.get(molecule.id)!;
+    const atomIds = new Set(molecule.atoms.map((atom) => atom.id));
     for (const { mark, atomId, resolved } of atomOwnedMarksForTransform(page.objects, molecule.id, atomIds)) {
-      if (followsResolver(mark)) continue;
       if (!ownerByMarkId.has(mark.id)) ownerByMarkId.set(mark.id, resolved ? { moleculeId: molecule.id, atomId } : { moleculeId: molecule.id });
     }
-  }
-  let assignments: ReturnType<typeof committedElectronMarkAssignments>["anchorByMarkId"] | undefined;
-  for (const object of page.objects) {
-    if (object.type !== "electron-mark" || !followsResolver(object) || ownerByMarkId.has(object.id)) continue;
-    assignments ??= committedElectronMarkAssignments(page).anchorByMarkId;
-    const owner = assignments.get(object.id);
-    if (!owner || !copiedAtomIdsByMoleculeId.get(owner.objectId)?.has(owner.atomId)) continue;
-    const anchor = object.anchor as { objectId?: string; atomId?: string };
-    const agrees = anchor.objectId === owner.objectId && anchor.atomId === owner.atomId;
-    ownerByMarkId.set(object.id, agrees ? { moleculeId: owner.objectId } : { moleculeId: owner.objectId, atomId: owner.atomId });
   }
   return page.objects.flatMap((object) => {
     const owner = object.type === "electron-mark" ? ownerByMarkId.get(object.id) : undefined;
