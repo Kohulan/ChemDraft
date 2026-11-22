@@ -1026,7 +1026,9 @@ needs a trusted caller to submit it:
 - `adoptDerivedDocument` (a `next` whose objects were pre-retained);
 - `admitParsedDocument`, which admits the document as it is;
 - `toEngineDocument` and `cloneDocument`, which copy each object's identity onto its copy;
-- `applyPatches` on an input that is not an engine document, which starts with `cloneDocument`.
+- `applyPatches` on an input that is not an engine document, which starts with `cloneDocument` when
+  `patches.length > 0`. With no patches it returns the supplied document unchanged, without cloning or
+  pre-identifying it, so an identity retained beforehand survives.
 
 Code the host trusts that far can change the document without any pin.
 

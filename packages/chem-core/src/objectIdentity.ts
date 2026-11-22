@@ -12,8 +12,9 @@ import type { DocumentObject } from "./schemas";
  * `@chemdraft/plugin-api`.
  *
  * - Every object value has one identity, and never exchanges it for another. The engine gives one to
- *   every object of every document it returns (`holdObjectIdentities`); any other value gets one the
- *   first time it is asked for.
+ *   every object of every document it adopts (`holdObjectIdentities`); the early returns of
+ *   `applyPatches` with no patches and of `adoptDerivedDocument` are not pre-identified. Any other
+ *   value gets one the first time it is asked for.
  * - An edit that replaces an object value with an edited copy of the same object carries the
  *   identity to the copy (`retainObjectIdentity`): a patch update or move, a normalization pass
  *   re-admitted through `adoptDerivedDocument`, the engine's copy of a whole document. A move to
