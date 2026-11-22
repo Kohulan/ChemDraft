@@ -1776,6 +1776,11 @@ Run under KDE Plasma (Wayland session, so the app uses XWayland) and on GNOME.
   visible below the tool row, not cut off by the palette's bottom edge, and the row above it is
   not clipped either. Palettes that fit the screen (Arrows, Orbitals, Style) show no scrollbar.
   Relaunched at 1680x1050, the Main toolbar shows no scrollbar.
+- Moving between screens without relaunching (a 1024x768 and a 1680x1050 monitor side by side):
+  drag the scrolling Main toolbar onto the wide monitor. It widens to its full width, the
+  horizontal scrollbar disappears and the palette loses the scrollbar's height. Drag it back to
+  the narrow monitor: it is capped at that screen's width again and scrolls sideways with the bar
+  fully visible. Neither move leaves the palette flickering or resizing on its own.
 - Palette positions after Save/Open: place Main and Art somewhere distinctive, then press
   Shift+Ctrl+S and Esc, and Ctrl+O and Esc, several times. Every palette comes back exactly where
   it was, and after quitting and relaunching it opens at that same spot (toolbar-state.json is

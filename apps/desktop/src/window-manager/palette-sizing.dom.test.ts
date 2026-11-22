@@ -21,12 +21,15 @@ vi.mock("./tauriEvents", async original => ({
   listenTauriEvent: async () => () => {},
   listenCurrentWindowEvent: async (name: string, handler: () => void) => {
     native.workAreaEvents.set(name, handler);
-    return () => { native.workAreaEvents.delete(name); };
+    // Only the handler still registered under this name: a re-run effect's late cleanup must not
+    // drop the listener its successor installed.
+    return () => { if (native.workAreaEvents.get(name) === handler) native.workAreaEvents.delete(name); };
   }
 }));
 
 describe("palette work-area sizing", () => {
   beforeEach(() => {
+    native.workAreaEvents.clear();
     native.workArea.mockReset().mockResolvedValue(null);
     native.boundsAt.mockReset().mockResolvedValue(null);
     native.invoke.mockReset().mockImplementation(async (command, payload) => {
@@ -208,12 +211,12 @@ describe("palette work-area sizing", () => {
     const rect = (width: number, height: number) =>
       ({ x: 0, y: 0, left: 0, top: 0, width, height, right: width, bottom: height, toJSON: () => ({}) }) as DOMRect;
 
-    const installLayoutModel = () => {
+    const installLayoutModel = (scrollbar: number) => {
       vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
         if (!this.classList.contains("palette-window-shell")) return rect(0, 0);
         const scroller = scrollerOf(this);
         if (!scroller || !scrolling(scroller)) return rect(NATURAL_WIDTH, TITLE_HEIGHT + ROW_HEIGHT);
-        return rect(cappedWidth(scroller), TITLE_HEIGHT + ROW_HEIGHT + SCROLLBAR);
+        return rect(cappedWidth(scroller), TITLE_HEIGHT + ROW_HEIGHT + scrollbar);
       });
       const isScroller = (element: Element) => element.classList.contains("palette-window-content");
       vi.spyOn(Element.prototype, "scrollWidth", "get").mockImplementation(function (this: Element) {
@@ -231,7 +234,7 @@ describe("palette work-area sizing", () => {
       });
       vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
         if (!isScroller(this)) return 0;
-        return ROW_HEIGHT + (scrolling(this) ? SCROLLBAR : 0);
+        return ROW_HEIGHT + (scrolling(this) ? scrollbar : 0);
       });
     };
 
@@ -245,13 +248,14 @@ describe("palette work-area sizing", () => {
 
     // Mount Main at the given platform and window width, then stand in for the native resize that
     // follows the first fit (Rust capped the width, so the webview viewport keeps `windowWidth`).
-    const mountMain = async (platform: "linux" | "macos" | "windows", windowWidth: number) => {
+    // `scrollbar` is the horizontal scrollbar's thickness (0 for an overlay scrollbar).
+    const mountMain = async (platform: "linux" | "macos" | "windows", windowWidth: number, scrollbar = SCROLLBAR) => {
       vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
       vi.stubGlobal("innerWidth", windowWidth);
       vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => window.setTimeout(() => callback(0), 0));
       vi.stubGlobal("cancelAnimationFrame", (handle: number) => window.clearTimeout(handle));
       native.workArea.mockResolvedValue({ left: 0, top: 0, right: windowWidth, bottom: 768 });
-      installLayoutModel();
+      installLayoutModel(scrollbar);
       const container = document.createElement("div");
       document.body.append(container);
       const root = createRoot(container);
@@ -266,6 +270,18 @@ describe("palette work-area sizing", () => {
         window.dispatchEvent(new Event("resize"));
         await settle();
       };
+      // The native window moves to a monitor with this work area; the viewport keeps its width until
+      // Rust resizes the window (a move alone never resizes it).
+      const moveToWorkArea = async (right: number, bottom: number) => {
+        native.workArea.mockResolvedValue({ left: 0, top: 0, right, bottom });
+        native.workAreaEvents.get("tauri://move")?.();
+        await settle();
+      };
+      // Rust applied a frame of this width; the webview reports the resize.
+      const nativeResizeTo = async (width: number) => {
+        vi.stubGlobal("innerWidth", width);
+        await nativeResize();
+      };
       await nativeResize();
       const shell = container.querySelector<HTMLElement>(".palette-window-shell")!;
       const scroller = container.querySelector<HTMLElement>(".palette-window-content")!;
@@ -273,7 +289,13 @@ describe("palette work-area sizing", () => {
         await act(async () => root.unmount());
         container.remove();
       };
-      return { shell, scroller, nativeResize, unmount };
+      return { shell, scroller, nativeResize, moveToWorkArea, nativeResizeTo, unmount };
+    };
+
+    const expectNoOverflow = (scroller: HTMLElement) => {
+      expect(scroller.style.overflowX).toBe("");
+      expect(scroller.style.maxWidth).toBe("");
+      expect(scroller.dataset.paletteHorizontalOverflow).toBeUndefined();
     };
 
     it("scrolls the Main toolbar sideways in a 1024 px Linux window and reports the scrollbar's height", async () => {
@@ -312,6 +334,88 @@ describe("palette work-area sizing", () => {
         expect(scroller.style.maxWidth).toBe("");
         expect(scroller.dataset.paletteHorizontalOverflow).toBeUndefined();
         expect(distinctSizes()).toEqual([{ width: NATURAL_WIDTH, height: TITLE_HEIGHT + ROW_HEIGHT }]);
+      } finally {
+        await unmount();
+      }
+    });
+
+    it("turns the scroller off when a capped Linux palette moves to a wider work area", async () => {
+      const { scroller, nativeResize, moveToWorkArea, nativeResizeTo, unmount } = await mountMain("linux", 1024);
+      try {
+        expect(scroller.dataset.paletteHorizontalOverflow).toBe("true");
+        const before = resizeRequests().length;
+        await moveToWorkArea(1680, 1050);
+        // The natural size did not change, but the monitor did: the size is re-sent once so Rust
+        // re-runs its placement against the new work area (no cap there).
+        expect(resizeRequests().slice(before)).toEqual([{ width: NATURAL_WIDTH, height: TITLE_HEIGHT + ROW_HEIGHT + SCROLLBAR }]);
+        // Rust gave the window its natural width: the scroller and the scrollbar's height go away.
+        await nativeResizeTo(NATURAL_WIDTH);
+        expectNoOverflow(scroller);
+        expect(resizeRequests().slice(before)).toEqual([
+          { width: NATURAL_WIDTH, height: TITLE_HEIGHT + ROW_HEIGHT + SCROLLBAR },
+          { width: NATURAL_WIDTH, height: TITLE_HEIGHT + ROW_HEIGHT }
+        ]);
+        // Settled: the resize after the height fit, and further moves on the same monitor, send nothing.
+        await nativeResize();
+        await moveToWorkArea(1680, 1050);
+        expect(resizeRequests()).toHaveLength(before + 2);
+        expectNoOverflow(scroller);
+      } finally {
+        await unmount();
+      }
+    });
+
+    it("caps and scrolls a Linux palette that moves to a narrower work area", async () => {
+      const { scroller, nativeResize, moveToWorkArea, nativeResizeTo, unmount } = await mountMain("linux", 1680);
+      try {
+        expectNoOverflow(scroller);
+        const before = resizeRequests().length;
+        await moveToWorkArea(1024, 768);
+        // Re-sent even though the viewport still has the old width, so Rust caps the window.
+        expect(resizeRequests().slice(before)).toEqual([{ width: NATURAL_WIDTH, height: TITLE_HEIGHT + ROW_HEIGHT }]);
+        await nativeResizeTo(1024);
+        expect(scroller.style.overflowX).toBe("auto");
+        expect(scroller.style.maxWidth).toBe("1024px");
+        expect(scroller.dataset.paletteHorizontalOverflow).toBe("true");
+        expect(resizeRequests().slice(before)).toEqual([
+          { width: NATURAL_WIDTH, height: TITLE_HEIGHT + ROW_HEIGHT },
+          { width: NATURAL_WIDTH, height: TITLE_HEIGHT + ROW_HEIGHT + SCROLLBAR }
+        ]);
+        await nativeResize();
+        await nativeResize();
+        expect(resizeRequests()).toHaveLength(before + 2);
+      } finally {
+        await unmount();
+      }
+    });
+
+    it("adds no height for an overlay scrollbar, capped or not", async () => {
+      const { scroller, moveToWorkArea, nativeResizeTo, unmount } = await mountMain("linux", 1024, 0);
+      try {
+        expect(scroller.style.overflowX).toBe("auto");
+        expect(scroller.dataset.paletteHorizontalOverflow).toBe("true");
+        expect(distinctSizes()).toEqual([{ width: NATURAL_WIDTH, height: TITLE_HEIGHT + ROW_HEIGHT }]);
+        await moveToWorkArea(1680, 1050);
+        await nativeResizeTo(NATURAL_WIDTH);
+        expectNoOverflow(scroller);
+        expect(distinctSizes()).toEqual([{ width: NATURAL_WIDTH, height: TITLE_HEIGHT + ROW_HEIGHT }]);
+      } finally {
+        await unmount();
+      }
+    });
+
+    it.each(["macos", "windows"] as const)("does not re-send on monitor moves, scale changes or resizes on %s", async platform => {
+      const { scroller, nativeResize, moveToWorkArea, nativeResizeTo, unmount } = await mountMain(platform, 1024);
+      try {
+        const before = resizeRequests().length;
+        await moveToWorkArea(1680, 1050);
+        native.workAreaEvents.get("tauri://scale-change")?.();
+        await nativeResizeTo(NATURAL_WIDTH);
+        await moveToWorkArea(1024, 768);
+        await nativeResizeTo(1024);
+        await nativeResize();
+        expect(resizeRequests()).toHaveLength(before);
+        expectNoOverflow(scroller);
       } finally {
         await unmount();
       }

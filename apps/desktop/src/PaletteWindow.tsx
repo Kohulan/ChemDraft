@@ -550,6 +550,9 @@ export function PaletteWindow({
     let sizing = false;
     let pending = false;
     let lastSize = "";
+    // Linux: the work area + scale and the window's inner width at the last accepted fit (below).
+    let fittedPlacementKey: string | undefined;
+    let fittedViewportWidth: number | undefined;
     const applySize = async () => {
       if (disposed) return;
       if (sizing) {
@@ -571,11 +574,13 @@ export function PaletteWindow({
         const rect = shell?.getBoundingClientRect();
         let contentWidth = rect ? Math.ceil(rect.width) : 0;
         let contentHeight = rect ? Math.ceil(rect.height) : 0;
+        // The window's live inner width: the overflow decision and the re-send check below both use it.
+        const viewportWidth = window.innerWidth;
         // Linux: when the capped window is narrower than the content, scroll sideways (width stays
         // natural; height gains the scrollbar). macOS and Windows never take this branch.
         if (platform === "linux" && shell && bodyRef.current && rect && contentWidth > 0) {
           ({ width: contentWidth, height: contentHeight } = fitLinuxPaletteHorizontalOverflow(
-            shell, bodyRef.current, rect, fittedPaletteWidthRef.current, window.innerWidth));
+            shell, bodyRef.current, rect, fittedPaletteWidthRef.current, viewportWidth));
         }
         const width = contentWidth || fallbackWidth;
         const height = Math.min(availableHeight,
@@ -591,9 +596,26 @@ export function PaletteWindow({
           }
         }
         const sizeKey = `${width}x${height}`;
-        if (sizeKey !== lastSize && await fitCurrentPaletteWindow({ width, height }, area)) {
+        // Linux: Rust caps a palette's width at its monitor's work area (toolset_content_placement),
+        // so one natural size needs a different window on another monitor. Re-send an unchanged size
+        // when what Rust caps against changed since the last accepted fit: the work area or scale (a
+        // move to another monitor, a resolution or panel change), or the window's inner width when it
+        // is not simply the width we asked for. Rust then widens a capped palette on a wide monitor
+        // or caps it on a narrow one, and the resize that follows re-runs the overflow decision
+        // against the new width. Both values are recorded on every accepted fit, so a re-run with
+        // nothing changed (including the resize after our own height change, which leaves the inner
+        // width alone) never re-sends; an identical request on an unchanged monitor gives the same
+        // frame, so a forced re-send settles after at most one more fit. macOS and Windows keep the
+        // plain size dedupe.
+        const placementKey = `${area.left}:${area.top}:${area.right}:${area.bottom}@${window.devicePixelRatio || 1}`;
+        const placementChanged = platform === "linux" && fittedPlacementKey !== undefined && (
+          placementKey !== fittedPlacementKey
+          || (viewportWidth !== fittedViewportWidth && viewportWidth !== fittedPaletteWidthRef.current));
+        if ((sizeKey !== lastSize || placementChanged) && await fitCurrentPaletteWindow({ width, height }, area)) {
           lastSize = sizeKey;
           fittedPaletteWidthRef.current = width;
+          fittedPlacementKey = placementKey;
+          fittedViewportWidth = viewportWidth;
         }
       } finally {
         sizing = false;
