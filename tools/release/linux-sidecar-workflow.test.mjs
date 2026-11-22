@@ -74,7 +74,10 @@ test("the Linux package build ships the committed sidecar it verified and never 
   assert.match(build, /sidecar="\$appdir\/usr\/bin\/avogadro3d-sidecar"\n\s+test -f "\$sidecar" \|\|/);
   // The .deb archive itself must hold the sidecar as a regular file with mode 0755, checked before
   // extraction can apply a umask.
-  const debMode = at(`sidecar_entry=$(dpkg-deb -c "$deb" | awk '$NF == "./usr/bin/avogadro3d-sidecar" { print $1 }')`);
+  // dpkg-deb -c lists paths with or without "./"; the listing strips it and takes a link's own path.
+  assert.match(build, /dpkg-deb -c "\$1" \| awk '\{ p = \$NF; if \(\$\(NF-1\) == "->"\) p = \$\(NF-2\);[^']*sub\(\/\^\\\.\\\/\/, "", p\); print \$1, p \}'/);
+  assert.doesNotMatch(build, /"\.\/usr\/bin\/avogadro3d-sidecar"/, "never match the sidecar path only with a ./ prefix");
+  const debMode = at(`sidecar_entry=$(awk '$2 == "usr/bin/avogadro3d-sidecar" { print $1 }' <<<"$listing")`);
   assert.match(build, /\[ "\$sidecar_entry" = -rwxr-xr-x \] \|\| \{ echo "::error::[^"]+"; exit 1; \}/);
   assert.ok(clean < debMode && debMode < debCheck);
   assert.match(read("scripts/verify-committed-linux-sidecar.mjs"), /checkEngine3dSidecar\(payloadPath, \{ rootDir, log, packaged: true \}\)/);
