@@ -9097,8 +9097,9 @@ const SIDECAR_PLACEHOLDER_MARKER: &[u8] = b"avogadro3d-sidecar placeholder";
 /// without a real build (Linux) are small `#!/bin/sh … exit 2` scripts: `is_file`
 /// accepted them, so status said "bundled" and every session failed when the script exited. They
 /// are recognised by their marker on every platform; Windows additionally requires a PE image
-/// (a text placeholder there failed to start with OS error 193). On macOS and Linux the file must
-/// also carry its owner's execute bit: a non-executable override used to pass, win over a working
+/// (a text placeholder there failed to start with OS error 193). On macOS and Linux ChemDraft must
+/// be allowed to execute the file (`access(X_OK)`, which applies the owner, group or other bits
+/// that fit this process, and ACLs): a non-executable override used to pass, win over a working
 /// bundled sidecar, and fail every session with "permission denied".
 fn is_runnable_sidecar(path: &Path) -> bool {
     if !path.is_file() || is_sidecar_placeholder(path) {
@@ -9110,9 +9111,13 @@ fn is_runnable_sidecar(path: &Path) -> bool {
     }
     #[cfg(not(windows))]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::ffi::OsStrExt;
 
-        fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o100 != 0)
+        std::ffi::CString::new(path.as_os_str().as_bytes()).is_ok_and(|path| {
+            // SAFETY: `path` is a NUL-terminated string that outlives the call; access only
+            // reads it.
+            unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
+        })
     }
 }
 
