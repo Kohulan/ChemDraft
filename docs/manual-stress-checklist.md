@@ -622,6 +622,13 @@ N–H was inferred, and its reason in the status bar on hover; ring picking and 
 over a badge; a CDXML pyrrole with `NumHydrogens` N-methylated leaves no stale badge; Copy As MOL and
 CDXML of a pasted aromatic reopen with the same tautomer; and Spin 3D on a pasted aromatic.
 
+Stated hydrogen counts (1.2.3): open a CDXML ethanol whose O has `NumHydrogens="0"` — the import
+warning names the O, the O shows the red (!) badge, and hovering it says it states 0 H but its bonds
+give 1; move, rotate and duplicate it and the badge stays; Save As, close and reopen and it is still
+there; the problem window offers "Use the derived hydrogen count (1)", which clears the badge;
+changing the O to S, or its bond to double, clears it too. The same file without `NumHydrogens`
+opens with no warning and no badge.
+
 Abbreviation surfaces added since: every table abbreviation (`packages/template-library/README.md`)
 placed by hotkey and by typing on a chain end, where it is valid, and on a ring carbon, where it is
 badged (hover the badge for its reason); Ome, OME and ome badged as unrecognized text with the "did

@@ -2103,7 +2103,8 @@ function exportMoleculeObject(
     }
     // NumHydrogens is the standard CDXML atom constraint, understood without ChemDraft's native
     // payload. Keep aromatic display (Order=1.5) while preserving the source's chosen N–H site.
-    // In particular, zero is a constraint too; omitting it reopens the tautomer choice.
+    // In particular, zero is a constraint too; omitting it reopens the tautomer choice, and on an
+    // ordinary atom (a kept count that disagrees with the derived one) adds the implicit H back.
     if (atom.hydrogenCount !== undefined) {
       attributes.push(`NumHydrogens="${atom.hydrogenCount}"`);
     }
@@ -4451,9 +4452,14 @@ function importFragment(
     const color = colorForCdxmlIndex(labelRun?.attributes.color ?? label?.attributes.color ?? atomElement.attributes.color ?? fragment.attributes.color, context.colorTable);
     if (color) atomLabelColors[atomId] = color;
     atomIdByCdxmlId.set(cdxmlId, atomId);
-    const statedHydrogens = parseInteger(atomElement.attributes.NumHydrogens);
+    const statedHydrogensText = atomElement.attributes.NumHydrogens;
+    const statedHydrogens = statedHydrogensText?.trim() ? parseInteger(statedHydrogensText) : undefined;
     if (statedHydrogens !== undefined && statedHydrogens >= 0) {
       statedHydrogensByAtomId.set(atomId, statedHydrogens);
+    } else if (statedHydrogensText !== undefined) {
+      // Never dropped silently (AGENTS.md §7): a value that is no count cannot be kept, so say so.
+      warnings.push({ code: "cdxml.atom_hydrogen_count_invalid", sourceObjectId: objectId, atomIds: [atomId],
+        message: `${context.sourceFormat} atom ${cdxmlId} has NumHydrogens="${statedHydrogensText}", which is not a hydrogen count; it was not imported.` });
     }
     const xyz = atomElement.attributes.xyz?.trim().split(/\s+/).map(Number);
     const spatial = xyz?.length === 3 && xyz.every(Number.isFinite) ? xyz : undefined;
@@ -4677,21 +4683,22 @@ function importFragment(
   // can, so it is kept for the Kekulé resolution to honour. Literal labels also retain an explicit
   // count: their text supplies no implicit hydrogens and cannot replace the source constraint.
   // Snapshot atoms use the same policy even when nonliteral: only a source-fixed count becomes
-  // a constraint. An absent attribute never freezes an ordinary atom's engine-derived H count.
+  // a constraint. An absent attribute never freezes an ordinary atom's engine-derived H count; an
+  // ordinary atom's stated count is decided by `keepStatedHydrogens` once those are in place.
   const aromaticAtomIds = new Set(normalizedBonds.flatMap((bond) =>
     bond.order === "aromatic" ? [bond.fromAtomId, bond.toAtomId] : []));
   const snapshotAtomIds = new Set(expansion.abbreviations.filter(item => !item.expanded)
     .flatMap(item => item.atomCdxmlIds.map(id => atomIdByCdxmlId.get(id))));
-  const droppedHydrogenAtoms: MoleculeAtom[] = [];
+  const ordinaryStatedAtoms: MoleculeAtom[] = [];
   for (const atom of atoms) {
     const stated = statedHydrogensByAtomId.get(atom.id);
     if (stated !== undefined && (atom.labelLiteral || aromaticAtomIds.has(atom.id) || snapshotAtomIds.has(atom.id))) {
       atom.hydrogenCount = stated;
     } else if (stated !== undefined) {
-      droppedHydrogenAtoms.push(atom);
+      ordinaryStatedAtoms.push(atom);
     }
   }
-  const hydrogenCountWarning = droppedStatedHydrogensWarning(droppedHydrogenAtoms, atoms, normalizedBonds,
+  const hydrogenCountWarning = keepStatedHydrogens(ordinaryStatedAtoms, atoms, normalizedBonds,
     statedHydrogensByAtomId, atomIdByCdxmlId, context.sourceFormat, objectId);
   if (hydrogenCountWarning) warnings.push(hydrogenCountWarning);
   const atomStereochemistry = Object.entries(cdxmlAtomStereochemistryByAtomId).map(
@@ -6605,16 +6612,21 @@ function cdxmlBondDisplayForBondStyle(display: MoleculeBond["display"]): string 
 }
 
 /**
- * An ordinary atom's NumHydrogens is not kept: ChemDraft derives the count from valence, exactly as
- * the drawn label and the formula do (layout-engine's label planner and document-workflow-core's
- * `nativeAtomDiagnostic`), by layout-engine's `atomImplicitHydrogenCount`, the one copy of that
- * calculation (AGENTS.md §9). Where the file stated a different count, the opened chemistry is not the file's,
- * so one warning per fragment names each such atom and both counts (AGENTS.md §7). Atoms with no
- * single derived count (no element, hydrogen itself, a carbon bonded only datively, whose label
- * shows no H while the formula counts them) are left alone rather than described wrongly.
+ * An ordinary atom's NumHydrogens, by the owner's ruling for 1.2.3: where it disagrees with the
+ * count ChemDraft derives from the atom's bonds, charge and radicals — layout-engine's
+ * `atomImplicitHydrogenCount`, the one copy of that calculation, which the drawn label, the formula
+ * and `nativeAtomValidationState` share (AGENTS.md §9) — it is kept exactly as written
+ * (`hydrogenCount`), the atom is badged, and one warning per fragment names each such atom and both
+ * counts (AGENTS.md §7). A count that agrees is not stored: the atom already counts it.
+ *
+ * Atoms with no single derived count keep what the file states, since nothing could replace it:
+ * an atom whose label is not an element (an unknown atom, a generic label) and a carbon bonded only
+ * datively (its label shows no H while the formula counts them). A hydrogen atom keeps its count
+ * too (the formula never counts H on a hydrogen atom, while its label does) and is named where the
+ * file's count differs from its label's. Mutates `candidates`; returns the warning, if any.
  */
-function droppedStatedHydrogensWarning(
-  droppedAtoms: readonly MoleculeAtom[],
+function keepStatedHydrogens(
+  candidates: readonly MoleculeAtom[],
   atoms: readonly MoleculeAtom[],
   bonds: readonly MoleculeBond[],
   statedHydrogensByAtomId: ReadonlyMap<string, number>,
@@ -6622,27 +6634,33 @@ function droppedStatedHydrogensWarning(
   sourceFormat: string,
   objectId: string
 ): CompatibilityConversionWarning | undefined {
-  if (droppedAtoms.length === 0) return undefined;
+  if (candidates.length === 0) return undefined;
   const cdxmlIdByAtomId = new Map([...atomIdByCdxmlId].map(([cdxmlId, atomId]) => [atomId, cdxmlId]));
   const resolution = nativeBondOrderResolution(atoms, bonds);
-  const mismatches: { atomId: string; label: string; stated: number; derived: number }[] = [];
-  for (const atom of droppedAtoms) {
+  // Every count is derived before any is stored: a stored count is part of the resolution's key.
+  const decisions = candidates.map((atom) => {
+    const stated = statedHydrogensByAtomId.get(atom.id)!;
     const element = nativeElementFromAtomLabel(atom.element);
-    const stated = statedHydrogensByAtomId.get(atom.id);
-    if (!element || element === "H" || stated === undefined) continue;
-    const derived = atomImplicitHydrogenCount(atom, bonds, atoms, resolution);
-    if (derived === undefined || derived === stated) continue;
+    const derived = element ? atomImplicitHydrogenCount(atom, bonds, atoms, resolution) : undefined;
+    return { atom, element, stated, derived };
+  });
+  const mismatches: { atomId: string; label: string; stated: number; derived: number }[] = [];
+  for (const { atom, element, stated, derived } of decisions) {
+    if (derived === stated && element !== "H") continue;
+    atom.hydrogenCount = stated;
+    if (!element || derived === undefined || derived === stated) continue;
     mismatches.push({ atomId: atom.id, label: `atom ${cdxmlIdByAtomId.get(atom.id) ?? atom.id} (${element})`, stated, derived });
   }
   if (mismatches.length === 0) return undefined;
   const hydrogens = (count: number) => `${count} hydrogen${count === 1 ? "" : "s"}`;
   const [only] = mismatches;
   const message = mismatches.length === 1
-    ? `${sourceFormat} import: ${only.label} states ${hydrogens(only.stated)}; ChemDraft derives ${only.derived}. The derived count is used.`
+    ? `${sourceFormat} import: ${only.label} states ${hydrogens(only.stated)}; ChemDraft derives ${only.derived}. The stated count is kept, and the atom is flagged.`
     : `${sourceFormat} import: ${mismatches.length} atoms state hydrogen counts ChemDraft derives differently: ` +
-      `${mismatches.map((item) => `${item.label} states ${item.stated}, derives ${item.derived}`).join("; ")}. The derived counts are used.`;
+      `${mismatches.map((item) => `${item.label} states ${item.stated}, derives ${item.derived}`).join("; ")}. ` +
+      "The stated counts are kept, and the atoms are flagged.";
   return {
-    code: "cdxml.atom_hydrogen_count_derived",
+    code: "cdxml.atom_hydrogen_count_kept",
     message,
     sourceObjectId: objectId,
     atomIds: mismatches.map((item) => item.atomId)

@@ -6,7 +6,20 @@ import { CommandRegistry } from "@chemdraft/plugin-host";
 import { allShellCommands } from "./commands";
 import { createCoreCommandRegistrar } from "./commands/coreCommandRegistrar";
 import { atomProblemCommandId, atomProblemCommands } from "./atomProblemCommands";
-import { applyNativeAtomProblemFix } from "./documentWorkflow";
+import {
+  applyNativeAtomElementTarget,
+  applyNativeAtomProblemFix,
+  applyNativeMoleculeBondOrderValueTarget,
+  createNativeSavePayload,
+  createSelectionClipboardPayload,
+  duplicateSelectedDocumentObjects,
+  moveNativeMoleculeParts,
+  normalizeCommittedDocument,
+  openNativeDocument,
+  pasteSelectionClipboardPayload,
+  rotateSelectedDocumentObjects90
+} from "./documentWorkflow";
+import type { ChemDraftDocument, MoleculeObject } from "@chemdraft/chem-core";
 import { problemDocument, problemMolecule } from "./testSupport/atomProblemFixtures";
 import { DialogCoordinator } from "./dialogs/DialogCoordinator";
 import { dialogEnvelope, parseDialogMessage, type AtomProblemSnapshot, type DialogMessage } from "./dialogs/dialogProtocol";
@@ -165,3 +178,109 @@ describe("atom problem native host policy", () => {
     expect(h.transport.open).not.toHaveBeenCalled();
   });
 });
+
+// Owner ruling (1.2.3): a CDXML NumHydrogens that disagrees with the derived count is kept as written
+// and badged. Ethanol whose O states 0 hydrogens, through the app's own open, save and edit paths.
+const statedOxygenCdxml = `<CDXML><page id="1"><fragment id="2">
+  <n id="10" p="100 100"/><n id="11" p="114 108"/><n id="12" p="128 100" Element="8" NumHydrogens="0"/>
+  <b id="20" B="10" E="11"/><b id="21" B="11" E="12"/>
+</fragment></page></CDXML>`;
+const openedDocument = (contents = statedOxygenCdxml) => normalizeCommittedDocument(openNativeDocument(contents).document!);
+const moleculesOf = (document: ChemDraftDocument) =>
+  document.pages[0]!.objects.filter((object): object is MoleculeObject => object.type === "molecule");
+const oxygenOf = (molecule: MoleculeObject) => molecule.atoms.find(atom => atom.element === "O")!;
+const selecting = (document: ChemDraftDocument, objectIds: string[]): ChemDraftDocument =>
+  ({ ...document, selection: { ...document.selection, objectIds } });
+const bondTarget = (molecule: MoleculeObject, bondId: string) => {
+  const bond = molecule.bonds.find(candidate => candidate.id === bondId)!;
+  return { objectId: molecule.id, kind: "bond" as const, bondId, fromAtomId: bond.fromAtomId, toAtomId: bond.toAtomId, distanceToPointer: 0 };
+};
+
+describe("a CDXML atom whose stated hydrogen count disagrees, in the app", () => {
+  it("opens with the stated 0 H and the badge; Save As writes NumHydrogens=\"0\" and reopens with it", () => {
+    const document = openedDocument();
+    const [molecule] = moleculesOf(document);
+    const oxygen = oxygenOf(molecule!);
+    expect(oxygen.hydrogenCount).toBe(0);
+    expect(atomProblem(molecule!, oxygen.id)!.state).toMatchObject({ valid: false, statedHydrogens: { stated: 0, derived: 1 } });
+    const saved = createNativeSavePayload(document);
+    expect(saved.contents).toMatch(/<n [^>]*Element="8"[^>]*NumHydrogens="0"/);
+    expect(saved.warnings.map(warning => warning.message)).toContain("O3 states 0 H, but its bonds and charge give 1.");
+    expect(oxygenOf(moleculesOf(openedDocument(saved.contents))[0]!).hydrogenCount).toBe(0);
+  });
+
+  it("opens a file without NumHydrogens, or with an agreeing one, with nothing stored and no badge", () => {
+    for (const contents of [statedOxygenCdxml.replace(' NumHydrogens="0"', ""), statedOxygenCdxml.replace('NumHydrogens="0"', 'NumHydrogens="1"')]) {
+      const [molecule] = moleculesOrThrow(openedDocument(contents));
+      expect(molecule.atoms.every(atom => atom.hydrogenCount === undefined)).toBe(true);
+      expect(molecule.atoms.map(atom => atomProblem(molecule, atom.id))).toEqual([undefined, undefined, undefined]);
+    }
+  });
+
+  it("keeps the count through a move, a rotation and a duplicate", () => {
+    const document = openedDocument();
+    const [molecule] = moleculesOrThrow(document);
+    const oxygen = oxygenOf(molecule);
+    const moved = moveNativeMoleculeParts(document, { objectId: molecule.id, kind: "atom", atomId: oxygen.id }, { x: 30, y: -12 });
+    expect(oxygenOf(moleculesOrThrow(moved)[0]).hydrogenCount).toBe(0);
+    expect(oxygenOf(moleculesOrThrow(moved)[0]).x).not.toBe(oxygen.x);
+    const rotated = rotateSelectedDocumentObjects90(selecting(document, [molecule.id]));
+    expect(oxygenOf(moleculesOrThrow(rotated)[0]).hydrogenCount).toBe(0);
+    const duplicated = moleculesOrThrow(duplicateSelectedDocumentObjects(selecting(document, [molecule.id])));
+    expect(duplicated).toHaveLength(2);
+    expect(duplicated.map(copy => oxygenOf(copy).hydrogenCount)).toEqual([0, 0]);
+  });
+
+  it("a copied fragment keeps it while the O keeps its bond, and drops it when the copy cuts the O off", () => {
+    const document = openedDocument();
+    const [molecule] = moleculesOrThrow(document);
+    const oxygen = oxygenOf(molecule);
+    const oxygenBond = molecule.bonds.find(bond => bond.fromAtomId === oxygen.id || bond.toAtomId === oxygen.id)!;
+    const neighbour = oxygenBond.fromAtomId === oxygen.id ? oxygenBond.toAtomId : oxygenBond.fromAtomId;
+    const paste = (atomIds: string[], bondIds: string[]) => {
+      const payload = createSelectionClipboardPayload(document, [{ objectId: molecule.id, atomIds, bondIds }])!;
+      return moleculesOrThrow(pasteSelectionClipboardPayload(document, payload, { x: 300, y: 300 })).at(-1)!;
+    };
+    expect(oxygenOf(paste([oxygen.id, neighbour], [oxygenBond.id])).hydrogenCount).toBe(0);
+    const lone = paste([oxygen.id], []);
+    expect(lone.atoms).toHaveLength(1);
+    expect(oxygenOf(lone).hydrogenCount).toBeUndefined();
+  });
+
+  it("drops it on a chemical edit of the O, and keeps it through one elsewhere", () => {
+    const document = openedDocument();
+    const [molecule] = moleculesOrThrow(document);
+    const oxygen = oxygenOf(molecule);
+    const oxygenBond = molecule.bonds.find(bond => bond.fromAtomId === oxygen.id || bond.toAtomId === oxygen.id)!;
+    const otherBond = molecule.bonds.find(bond => bond !== oxygenBond)!;
+    const relabeled = moleculesOrThrow(applyNativeAtomElementTarget(document,
+      { objectId: molecule.id, kind: "atom", atomId: oxygen.id, distanceToPointer: 0 }, "S"))[0];
+    expect(relabeled.atoms.find(atom => atom.id === oxygen.id)).toMatchObject({ element: "S" });
+    expect(relabeled.atoms.find(atom => atom.id === oxygen.id)!.hydrogenCount).toBeUndefined();
+    const carbonyl = moleculesOrThrow(applyNativeMoleculeBondOrderValueTarget(document, bondTarget(molecule, oxygenBond.id), "double"))[0];
+    expect(oxygenOf(carbonyl).hydrogenCount).toBeUndefined();
+    expect(atomProblem(carbonyl, oxygen.id)).toBeUndefined();
+    const ethene = moleculesOrThrow(applyNativeMoleculeBondOrderValueTarget(document, bondTarget(molecule, otherBond.id), "double"))[0];
+    expect(oxygenOf(ethene).hydrogenCount).toBe(0);
+  });
+
+  it("the problem window's hydrogen fix uses the derived count", () => {
+    const document = openedDocument();
+    const [molecule] = moleculesOrThrow(document);
+    const oxygen = oxygenOf(molecule);
+    expect(atomProblem(molecule, oxygen.id)!.fixes.map(fix => fix.label)).toEqual(["Use the derived hydrogen count (1)", "Ignore warning"]);
+    const result = applyNativeAtomProblemFix(document, molecule.id, oxygen.id, "hydrogens")!;
+    expect(result.label).toBe("Use the derived hydrogen count (1)");
+    expect(result.status).toBe('Hydrogen count set to the derived 1 for "O"');
+    const fixed = moleculesOrThrow(result.document)[0];
+    expect(oxygenOf(fixed).hydrogenCount).toBeUndefined();
+    expect(atomProblem(fixed, oxygen.id)).toBeUndefined();
+    expect(canonical(nativeSingleBondGraphSmiles(fixed.atoms, fixed.bonds))).toBe(canonical("CCO"));
+  });
+});
+
+function moleculesOrThrow(document: ChemDraftDocument): [MoleculeObject, ...MoleculeObject[]] {
+  const molecules = moleculesOf(document);
+  if (molecules.length === 0) throw new Error("Expected a molecule");
+  return molecules as [MoleculeObject, ...MoleculeObject[]];
+}

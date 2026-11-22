@@ -111,6 +111,28 @@ label and original source expansion instead of silently flattening it. Original 
 cannot be collapsed safely exports its live graph with `cdxml.superatom_not_collapsed`.
 Synthetic coverage includes biphenyl/Ph, Boc-NH, OTBS, OMe and three independent Me groups.
 
+### Stated hydrogen counts (`NumHydrogens`)
+
+`NumHydrogens` is kept as the atom field `hydrogenCount` where it carries information:
+
+- on an atom of an `Order="1.5"` bond, a literal label, or a snapshotted abbreviation atom, always
+  (it settles a ring N–H or stands for the source constraint);
+- on an ordinary atom, when it disagrees with the count ChemDraft derives from the atom's bonds,
+  charge and radicals (layout-engine's `atomImplicitHydrogenCount`). Owner ruling, 1.2.3: the
+  file's count is kept exactly as written, the atom shows the red (!) badge (document-workflow-core's
+  `nativeAtomValidationState`, `statedHydrogens`), and `cdxml.atom_hydrogen_count_kept` names each
+  such atom and both counts. A count that agrees is not stored. The drawn label, the formula and
+  SMILES count the derived hydrogens; the badge says by how much they differ, and the atom-problem
+  fix is "Use the derived hydrogen count", which drops the stated one;
+- on an atom with no single derived count, always: a label that is not an element, a hydrogen atom
+  (named in the warning where its label counts differently), and a carbon bonded only datively.
+
+A value that is not a non-negative integer is not imported and is reported as
+`cdxml.atom_hydrogen_count_invalid`. Every kept count is written back as `NumHydrogens` on CDXML and
+CDX export, with or without the embedded native document, so a reopened atom keeps it. The count
+lasts until a chemical edit of that atom (element, charge, a bond added or removed at it, a bond
+order or dative change at it); moves, rotations, alignment and edits of other atoms keep it.
+
 ### Merging source atom snapshots
 
 Visible CDXML and CDX export starts from the imported atom node. An unchanged snapshot keeps its
