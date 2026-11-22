@@ -4323,6 +4323,9 @@ function importFragment(
     }
     const xyz = atomElement.attributes.xyz?.trim().split(/\s+/).map(Number);
     const spatial = xyz?.length === 3 && xyz.every(Number.isFinite) ? xyz : undefined;
+    if (xyz && !spatial) warnings.push({ code: "cdxml.atom_xyz_malformed", sourceObjectId: objectId, atomIds: [atomId],
+      message: `${context.sourceFormat} atom ${cdxmlId} has xyz="${atomElement.attributes.xyz}", which is not three finite numbers; its depth is not imported` +
+        (atomElement.attributes.p === undefined ? " and, with no page position (p), it is placed at the origin." : ".") });
     const point = parseCdxmlPoint(atomElement.attributes.p ?? (spatial ? atomElement.attributes.xyz : undefined));
     // A native atom shares x/y between its page and spatial coordinates. Restore
     // depth when both projections agree, including projections without a separate p.

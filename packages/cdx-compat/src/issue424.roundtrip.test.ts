@@ -274,12 +274,12 @@ describe("issue #424 follow-up: spatial coordinates", () => {
 });
 
 describe("issue #424: chemistry invariants through a plain Save As of a whole scheme", () => {
-  // (S)-alaninate zwitterion with a wedge, an attached lone pair, depths on two atoms, a captioned
+  // (S)-alaninate zwitterion (its methyl a 13C radical) with a wedge, an attached lone pair, depths on two atoms, a captioned
   // straight arrow and a circular arrow, all on one page.
   const scheme = `<CDXML>${fontTable}<page>` +
     '<graphic id="40" GraphicType="Symbol" SymbolType="LonePair" BoundingBox="126 84 129 84"><represent object="26" attribute="Radical"/></graphic>' +
     '<fragment id="20">' +
-    '<n id="21" p="60 100" xyz="60 100 3"/><n id="22" p="80 90" xyz="80 90 -2"/><n id="23" p="80 70" Element="7" Charge="1"/>' +
+    '<n id="21" p="60 100" xyz="60 100 3" Isotope="13" Radical="Doublet"/><n id="22" p="80 90" xyz="80 90 -2"/><n id="23" p="80 70" Element="7" Charge="1"/>' +
     '<n id="24" p="100 100"/><n id="25" p="100 120" Element="8"/><n id="26" p="120 90" Element="8" Charge="-1"/>' +
     '<b id="31" B="22" E="21" Display="WedgeBegin"/><b id="32" B="22" E="23"/><b id="33" B="22" E="24"/>' +
     '<b id="34" B="24" E="25" Order="2"/><b id="35" B="24" E="26"/></fragment>' +
@@ -307,7 +307,9 @@ describe("issue #424: chemistry invariants through a plain Save As of a whole sc
   it("keeps canonical SMILES, charges, stereo, counts, coordinates and every #424 feature", async () => {
     const document = open(scheme);
     const source = objectsOf<MoleculeObject>(document, "molecule")[0]!;
+    expect(source.atoms[0]).toMatchObject({ element: "C", isotope: 13, markRadicals: 1 });
     const smiles = await canonical(source);
+    expect(smiles).toContain("13C");
     expect(smiles).toContain("@");
     expect(source.bonds.some(b => b.display?.bondStyle)).toBe(true);
     let current = document;
@@ -336,5 +338,123 @@ describe("issue #424: chemistry invariants through a plain Save As of a whole sc
       expect(elementWith(plain, "t", 'Justification="')).toContain('p="190 92" BoundingBox="180 82 240 94" Justification="Center"');
       current = reopened;
     }
+  });
+});
+
+describe("issue #424: malformed input fails safely", () => {
+  const noNumberLeak = (xml: string) => expect(xml).not.toMatch(/NaN|Infinity|undefined/);
+
+  it.each([
+    ["words", 'xyz="a b c"'], ["NaN", 'xyz="100 100 NaN"'], ["Infinity", 'xyz="100 100 Infinity"'], ["two numbers", 'xyz="100 100"']
+  ])("drops an xyz of %s with a warning, keeping the page position", (_kind, xyz) => {
+    const opened = openChemDraftPayload(`<CDXML><page><fragment id="1"><n id="2" p="100 100" ${xyz} Element="8"/>` +
+      '<n id="3" p="120 100"/><b id="4" B="2" E="3"/></fragment></page></CDXML>');
+    const warning = opened.warnings.find(w => w.code === "cdxml.atom_xyz_malformed");
+    expect(warning?.message).toContain("atom 2");
+    const atom = objectsOf<MoleculeObject>(opened.document!, "molecule")[0]!.atoms[0]!;
+    expect(atom).toMatchObject({ element: "O", x: pt(100), y: pt(100) });
+    expect(atom.z).toBeUndefined();
+    const { plain } = saveAsWithoutPayload(opened.document!);
+    noNumberLeak(plain);
+    expect(plain).not.toContain("xyz=");
+  });
+
+  it("says that an atom with neither p nor a usable xyz has lost its position", () => {
+    const opened = openChemDraftPayload('<CDXML><page><fragment id="1"><n id="2" xyz="NaN 5 1" Element="8"/>' +
+      '<n id="3" p="120 100"/><b id="4" B="2" E="3"/></fragment></page></CDXML>');
+    expect(opened.warnings.find(w => w.code === "cdxml.atom_xyz_malformed")?.message).toContain("no page position");
+    noNumberLeak(saveAsWithoutPayload(opened.document!).plain);
+  });
+
+  it("keeps a lone pair whose represent has no object as a plain LonePair symbol at its drawn place", () => {
+    const opened = openChemDraftPayload('<CDXML><page><fragment id="10"><n id="12" p="100 100" Element="8"/></fragment>' +
+      '<graphic id="30" GraphicType="Symbol" SymbolType="LonePair" BoundingBox="100 93 103 93"><represent attribute="Radical"/></graphic></page></CDXML>');
+    expect(objectsOf<ElectronMarkObject>(opened.document!, "electron-mark")).toEqual([]);
+    const { plain, reopened } = saveAsWithoutPayload(opened.document!);
+    noNumberLeak(plain);
+    expect(elementWith(plain, "graphic", 'SymbolType="LonePair"')).toContain('BoundingBox="100 93 103 93"');
+    expect(objectsOf<MoleculeObject>(reopened, "molecule")[0]!.atoms[0]!.element).toBe("O");
+  });
+
+  it("writes a lone pair with a dangling atom reference back at its drawn place without a reference", () => {
+    const opened = openChemDraftPayload('<CDXML><page><fragment id="10"><n id="12" p="100 100" Element="8"/></fragment>' +
+      '<graphic id="30" GraphicType="Symbol" SymbolType="LonePair" BoundingBox="100 93 103 93"><represent object="99" attribute="Radical"/></graphic></page></CDXML>');
+    expect(codes(opened.warnings)).toContain("cdxml.lone_pair_anchor_unresolved");
+    const { plain, reopened } = saveAsWithoutPayload(opened.document!);
+    noNumberLeak(plain);
+    expect(plain).not.toContain("<represent");
+    expect(elementWith(plain, "graphic", 'SymbolType="LonePair"')).toContain('BoundingBox="100 93 103 93"');
+    expect(objectsOf<ElectronMarkObject>(reopened, "electron-mark")[0]!.anchor.kind).toBe("point");
+  });
+
+  const arcWith = (attributes: string) => '<CDXML><page><arrow id="7" BoundingBox="70 70 130 130" AngularSize="270" ' +
+    `${attributes} ArrowheadHead="Full" ArrowheadTail="None" ArrowheadType="Solid"/></page></CDXML>`;
+  const axes = 'MajorAxisEnd3D="130 100 0" MinorAxisEnd3D="100 130 0" Tail3D="130 100 0" Head3D="100 70 0"';
+  it.each([
+    ["a non-numeric HeadSize", `Center3D="100 100 0" ${axes} HeadSize="abc" ArrowheadWidth="250"`, false],
+    ["a negative HeadSize", `Center3D="100 100 0" ${axes} HeadSize="-5"`, false],
+    ["no Center3D", `${axes} HeadSize="1000"`, false],
+    ["a non-numeric Center3D", `Center3D="x NaN 0" ${axes} HeadSize="1000"`, false],
+    ["NaN and Infinity head width and inset", `Center3D="100 100 0" ${axes} HeadSize="1000" ArrowheadWidth="NaN" ArrowheadCenterSize="Infinity"`, true]
+  ])("opens and saves an arc with %s without throwing or writing a non-number", (_kind, attributes, explicit) => {
+    const opened = openChemDraftPayload(arcWith(attributes));
+    const graphic = objectsOf<GraphicObject>(opened.document!, "graphic")[0]!;
+    expect(graphic.data.artPathKind).toBe("arc");
+    expect(graphic.data.arcCenter !== undefined).toBe(explicit);
+    const { plain, reopened } = saveAsWithoutPayload(opened.document!);
+    noNumberLeak(plain);
+    expect(plain).not.toContain("ArrowheadWidth=");
+    expect(objectsOf<GraphicObject>(reopened, "graphic")[0]!.data.artPathKind).toBe("arc");
+  });
+
+  it.each([
+    ["no p", ' BoundingBox="40 200 100 214" Justification="Center"'],
+    ["no BoundingBox", ' p="52 210" Justification="Center"'],
+    ["neither p nor BoundingBox", ""]
+  ])("opens, moves and saves a caption with %s without throwing or writing a non-number", (_kind, frame) => {
+    const document = open(`<CDXML>${fontTable}<page><t id="10"${frame}><s font="3" size="12" face="1">Yield</s></t></page></CDXML>`);
+    objectsOf<TextObject>(document, "text")[0]!.x += pt(6);
+    const { plain, reopened } = saveAsWithoutPayload(document);
+    noNumberLeak(plain);
+    expect(objectsOf<TextObject>(reopened, "text")[0]!.text).toBe("Yield");
+  });
+});
+
+describe("issue #424: files without the new attributes", () => {
+  // Expected elements are the output of the writer before the contributor's patch (93476a887),
+  // byte for byte; the arc's chord-derived axes are that writer's known approximation.
+  const plainSave = (source: string, edit?: (document: ChemDraftDocument) => void) => {
+    const opened = openChemDraftPayload(source);
+    edit?.(opened.document!);
+    const out = exportDocumentToCdxml(opened.document!, { embedNativePayload: false });
+    expect(out.warnings).toEqual([]);
+    return { body: out.contents.replace(/^[\s\S]*?<page[^>]*>\s*/, "").replace(/\s*<\/page>[\s\S]*$/, ""), openWarnings: codes(opened.warnings) };
+  };
+
+  it.each([
+    ["a straight arrow", '<arrow id="5" Head3D="160 50 0" Tail3D="40 50 0" ArrowheadHead="Full" ArrowheadType="Solid"/>',
+      '<arrow id="1" BoundingBox="39.25 49.25 160.75 51.5" FillType="None" ArrowheadHead="Full" ArrowheadType="Solid" Head3D="160 50 0" Tail3D="40 50 0" Center3D="100 50 0" MajorAxisEnd3D="220 50 0" MinorAxisEnd3D="100 170 0"/>'],
+    ["an arc arrow", '<arrow id="7" BoundingBox="70 70 130 130" AngularSize="270" Center3D="100 100 0" MajorAxisEnd3D="130 100 0" MinorAxisEnd3D="100 130 0" Tail3D="130 100 0" Head3D="100 70 0" ArrowheadHead="Full" ArrowheadTail="None" ArrowheadType="Solid"/>',
+      '<arrow id="1" BoundingBox="70 70 130 130" FillType="None" ArrowheadHead="Full" ArrowheadType="Solid" AngularSize="270" Head3D="100 73 0" Tail3D="127 100 0" Center3D="113.5 86.5 0" MajorAxisEnd3D="151.6838 86.5 0" MinorAxisEnd3D="113.5 124.6838 0"/>'],
+    ["an arc graphic", '<graphic id="7" BoundingBox="70 70 130 130" GraphicType="Arc" AngularSize="90" ArrowType="FullHead" Center3D="100 100 0" MajorAxisEnd3D="130 100 0" MinorAxisEnd3D="100 130 0"/>',
+      '<graphic id="1" GraphicType="Arc" BoundingBox="70 70 130 130" Start="80.9081 80.9081" End="119.0919 80.9081" AngularSize="90"/>'],
+    ["a molecule with a charge, an isotope and a radical",
+      '<fragment id="1"><n id="2" p="100 100" Element="8" Charge="-1"/><n id="3" p="120 100" Isotope="13" Radical="Doublet"/><n id="5" p="140 100" Element="7"/><b id="4" B="2" E="3"/><b id="6" B="3" E="5" Order="2"/></fragment>',
+      '<fragment id="1" BoundingBox="94 94 146 106">\n  <n id="2" p="100 100" Element="8" Charge="-1"/>\n  <n id="3" p="120 100" Isotope="13" Radical="Doublet"><t><s face="64">13</s><s>C</s></t></n>\n  <n id="4" p="140 100" Element="7"/>\n  <b id="5" B="2" E="3" Order="1"/>\n  <b id="6" B="3" E="4" Order="2"/>\n</fragment>']
+  ])("writes %s exactly as before", (_kind, source, expected) => {
+    expect(plainSave(`<CDXML><page>${source}</page></CDXML>`).body).toBe(expected);
+  });
+
+  it("moves a plain caption exactly as before", () => {
+    const source = `<CDXML>${fontTable}<page><t id="10" p="52 210"><s font="3" size="12" face="1">Yield</s></t></page></CDXML>`;
+    expect(plainSave(source).body).toBe('<t id="10" p="52 210"><s font="3" size="12" face="1">Yield</s></t>');
+    expect(plainSave(source, d => { objectsOf<TextObject>(d, "text")[0]!.x += pt(6); }).body)
+      .toBe('<t id="10" p="58 210"><s font="3" size="12" face="1">Yield</s></t>');
+  });
+
+  it("imports a molecule without xyz with no depth and no xyz warning", () => {
+    const opened = openChemDraftPayload('<CDXML><page><fragment id="1"><n id="2" p="100 100" Element="8"/><n id="3" p="120 100"/><b id="4" B="2" E="3"/></fragment></page></CDXML>');
+    expect(codes(opened.warnings)).not.toContain("cdxml.atom_xyz_malformed");
+    expect(objectsOf<MoleculeObject>(opened.document!, "molecule")[0]!.atoms.every(a => a.z === undefined)).toBe(true);
   });
 });
