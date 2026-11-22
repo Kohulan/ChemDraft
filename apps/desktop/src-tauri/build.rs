@@ -13,6 +13,15 @@ fn main() {
     ensure_opsin_runtime_dir();
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
+            "window_first_paint",
+            "popup_canvas_context_menu",
+            "file_warnings_open",
+            "file_warnings_request",
+            "file_warnings_publish",
+            "file_warnings_ready",
+            "file_warnings_action",
+            "file_warnings_close",
+            "file_warnings_dismiss",
             "assistant_mcp_session_open",
             "assistant_mcp_session_close",
             "assistant_mcp_respond",
@@ -41,6 +50,7 @@ fn main() {
             "dialog_send",
             "dialog_publish",
             "dialog_close",
+            "document_canvas_occlusion",
             "open_toolset_window",
             "close_toolset_window",
             "suspend_toolset_windows",
@@ -66,6 +76,8 @@ fn main() {
             "show_toolset_tooltip_window",
             "hide_toolset_tooltip_window",
             "set_current_window_global_position",
+            "clamp_current_inspector_frame",
+            "resize_toolset_window",
             "current_window_logical_work_area",
             "monitor_logical_bounds_at",
             "start_window_drag",

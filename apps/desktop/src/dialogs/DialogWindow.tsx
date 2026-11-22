@@ -19,6 +19,7 @@ import { measureDialogContentWhenFontsReady, observeDialogContent, type DialogCo
 const VibeCodeGuideForm = lazy(() => import("./VibeCodeGuideForm").then(module => ({ default: module.VibeCodeGuideForm })));
 const ExportForm = lazy(() => import("./ExportForm").then(module => ({ default: module.ExportForm })));
 const CustomColorForm = lazy(() => import("./CustomColorForm").then(module => ({ default: module.CustomColorForm })));
+const PageEnlargementForm = lazy(() => import("./PageEnlargementForm").then(module => ({ default: module.PageEnlargementForm })));
 const StructureTemplatePicker = lazy(() => import("./StructureTemplatePicker").then(module => ({ default: module.StructureTemplatePicker })));
 
 export function DialogWindow({ hostId }: { hostId: string }) {
@@ -124,7 +125,8 @@ function DialogWindowContent({ hostId }: { hostId: string }) {
       } else if (latest && sameDialog(message, latest) && message.type === "result" && message.data.status === "frame" && message.data.frame) {
         // Keep the newest frame even while Choose is pending. A frame may arrive before
         // the picker receipt releases actionPending; dropping it loses that revision forever.
-        clearPreview();
+        // The form aborts its pending render when the frame changes. A repeat frame
+        // leaves its preview key unchanged and must leave that request in flight.
         setFrame(message.data.frame);
       } else if (latest && sameDialog(message, latest) && message.type === "result" && message.requestId === previewPending.current?.id) {
         const pending = previewPending.current!;
@@ -143,9 +145,17 @@ function DialogWindowContent({ hostId }: { hostId: string }) {
           return;
         }
         clearTimeout(actionTimer.current);
+        if (message.data.status === "exported") setExported(true);
+        if (latest.dialogKind === "export" && message.data.status === "exported" && !message.data.notice) {
+          // The owner sends a notice for every warning-bearing export. Close clean exports
+          // through the same host action as the form's Cancel and Close controls.
+          cancellationRequested.current = true;
+          pendingRequestId.current = undefined;
+          void sendDialogMessage(hostId, { ...dialogEnvelope(latest), requestId: crypto.randomUUID(), type: "action", data: { action: "cancel" } }).catch(e => { cancellationRequested.current = false; actionPending.current = false; setBusy(false); setError(String(e)); });
+          return;
+        }
         // A successful terminal receipt precedes native destruction. Never reopen Apply here.
         if (message.data.status !== "applied" || latest.dialogKind === "atomProblem") { actionPending.current = false; setBusy(false); }
-        if (message.data.status === "exported") setExported(true);
         if (message.data.status === "picked" && message.data.destinationPath && message.data.filename) {
           const { destinationPath, filename } = message.data;
           setExportDraft(current => current ? { ...current, destinationPath, filename } : current);
@@ -190,10 +200,17 @@ function DialogWindowContent({ hostId }: { hostId: string }) {
     }, percent === 100 ? 0 : 120);
     return () => { clearTimeout(debounce); clearTimeout(previewTimer.current); };
   }, [hostId, snapshot, percent]);
-  // Other forms report readiness after measuring their committed content.
-  useEffect(() => { if (snapshot?.dialogKind === "atomProblem" || snapshot?.dialogKind === "reactionConditions") reportReady(); }, [snapshot, reportReady]);
   const sendAction = (data: Extract<DialogMessage, { type: "action" }>["data"]) => {
     if (!snapshot) return;
+    if (snapshot.dialogKind === "pageEnlargement") {
+      if (actionPending.current) return;
+      actionPending.current = true;
+      setBusy(true);
+      setError(undefined);
+      void sendDialogMessage(hostId, { ...dialogEnvelope(snapshot), requestId: crypto.randomUUID(), type: "action", data })
+        .catch(e => { actionPending.current = false; setBusy(false); setError(String(e)); });
+      return;
+    }
     clearPreview();
     if (data.action === "cancel" || data.action === "close") {
       cancellationRequested.current = true;
@@ -223,14 +240,18 @@ function DialogWindowContent({ hostId }: { hostId: string }) {
     });
   };
   if (!snapshot) return <p role="status">{error ?? "Opening dialog…"}</p>;
-  if (snapshot.dialogKind === "atomProblem") return <AtomProblemForm data={snapshot.data} busy={busy} error={error}
+  if (snapshot.dialogKind === "pageEnlargement") return <Suspense fallback={<p role="status">Opening dialog…</p>}>
+    <PageEnlargementForm onReady={reportReady} busy={busy} error={error}
+      onKeep={() => sendAction({ action: "cancel" })} onEnlarge={() => sendAction({ action: "enlarge" })} />
+  </Suspense>;
+  if (snapshot.dialogKind === "atomProblem") return <AtomProblemForm data={snapshot.data} busy={busy} error={error} onReady={reportReady}
     onAction={action => sendAction({ action, targetVersion: snapshot.data.targetVersion })} onClose={() => sendAction({ action: "cancel" })} />;
   if (snapshot.dialogKind === "vibeCodeGuide") return <Suspense fallback={<p>Opening guide…</p>}><VibeCodeGuideForm onReady={reportReady} onAction={action => sendAction({ action })} /></Suspense>;
   if (snapshot.dialogKind === "structureTemplates") return <Suspense fallback={<p role="status">Opening Templates…</p>}>
     <StructureTemplatePicker {...snapshot.data} busy={busy} error={error} onReady={reportReady}
       onInsert={templateId => sendAction({ action: "insert", templateId })} onClose={() => sendAction({ action: "cancel" })} />
   </Suspense>;
-  if (snapshot.dialogKind === "reactionConditions" && conditions) return <ReactionConditionsForm title={snapshot.data.title}
+  if (snapshot.dialogKind === "reactionConditions" && conditions) return <ReactionConditionsForm title={snapshot.data.title} onReady={reportReady}
     draft={conditions} onChange={setConditions} busy={busy} error={error} onCancel={() => sendAction({ action: "cancel" })}
     onSave={() => sendAction({ action: "apply", draft: conditions })} />;
   if (snapshot.dialogKind === "arrangementSpacing") return <ArrangementSpacingForm onReady={reportReady} {...snapshot.data} percent={percent}
@@ -254,7 +275,7 @@ function DialogWindowContent({ hostId }: { hostId: string }) {
     });
   };
   if (snapshot?.dialogKind === "export" && exportDraft) return <Suspense fallback={<p role="status">Opening Export…</p>}><ExportForm frame={frame} renderPreview={renderPreview} title={snapshot.data.title} onReady={reportReady}
-    state={{ ...exportDraft, busy: busy || exported }} onChange={setExportDraft} error={error} notice={notice} completed={exported}
+    state={{ ...exportDraft, busy }} onChange={draft => { setExportDraft(draft); setExported(false); }} error={error} notice={notice} completed={exported}
     onCancel={() => sendAction({ action: "cancel" })}
     onChooseDestination={() => sendAction({ action: "chooseDestination", options: exportOptions(exportDraft) })}
     onSubmit={() => sendAction({ action: "export", options: exportOptions(exportDraft) })} /></Suspense>;

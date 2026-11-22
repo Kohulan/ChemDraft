@@ -1,10 +1,26 @@
 [
   {
+    "file": "appimage_dialogs.rs",
+    "name": "open",
+    "async": true,
+    "generics": "<R: Runtime>",
+    "parameters": "window: Window<R>, options: Options,",
+    "returnType": "tauri_plugin_dialog::Result<Selection>"
+  },
+  {
+    "file": "appimage_dialogs.rs",
+    "name": "save",
+    "async": true,
+    "generics": "<R: Runtime>",
+    "parameters": "window: Window<R>, options: Options,",
+    "returnType": "tauri_plugin_dialog::Result<Option<FilePath>>"
+  },
+  {
     "file": "assistant_mcp/mod.rs",
     "name": "assistant_mcp_session_open",
     "async": true,
     "generics": "",
-    "parameters": "plugin_id: String, plugin_name: String, on_request: Channel<McpBridgeRequest>,",
+    "parameters": "plugin_id: String, plugin_name: String, catalog: protocol::SessionCatalog, on_request: Channel<McpBridgeRequest>,",
     "returnType": "Result<SessionOpened, String>"
   },
   {
@@ -30,6 +46,22 @@
     "generics": "",
     "parameters": "",
     "returnType": "McpStatus"
+  },
+  {
+    "file": "canvas_context_menu.rs",
+    "name": "popup_canvas_context_menu",
+    "async": true,
+    "generics": "<R: Runtime>",
+    "parameters": "app: AppHandle<R>, window: WebviewWindow<R>, items: Vec<NativeItem>, position: PopupPosition,",
+    "returnType": "Result<Option<String>, String>"
+  },
+  {
+    "file": "canvas_occlusion.rs",
+    "name": "document_canvas_occlusion",
+    "async": false,
+    "generics": "",
+    "parameters": "window: tauri::WebviewWindow, app: tauri::AppHandle,",
+    "returnType": "Result<CanvasOcclusion, String>"
   },
   {
     "file": "dialog_windows.rs",
@@ -200,6 +232,70 @@
     "returnType": "Result<(), String>"
   },
   {
+    "file": "file_warnings_window.rs",
+    "name": "file_warnings_open",
+    "async": true,
+    "generics": "",
+    "parameters": "window: tauri::WebviewWindow, snapshot: Snapshot, anchor: Anchor, focus: bool, on_action: Channel<Action>,",
+    "returnType": "Result<(), String>"
+  },
+  {
+    "file": "file_warnings_window.rs",
+    "name": "file_warnings_request",
+    "async": false,
+    "generics": "",
+    "parameters": "window: tauri::WebviewWindow, on_snapshot: Channel<Chunk>,",
+    "returnType": "Result<(), String>"
+  },
+  {
+    "file": "file_warnings_window.rs",
+    "name": "file_warnings_publish",
+    "async": false,
+    "generics": "",
+    "parameters": "window: tauri::WebviewWindow, snapshot: Snapshot,",
+    "returnType": "Result<(), String>"
+  },
+  {
+    "file": "file_warnings_window.rs",
+    "name": "file_warnings_ready",
+    "async": false,
+    "generics": "",
+    "parameters": "window: tauri::WebviewWindow, session_id: String, revision: u32,",
+    "returnType": "Result<(), String>"
+  },
+  {
+    "file": "file_warnings_window.rs",
+    "name": "file_warnings_action",
+    "async": false,
+    "generics": "",
+    "parameters": "window: tauri::WebviewWindow, action: Action,",
+    "returnType": "Result<(), String>"
+  },
+  {
+    "file": "file_warnings_window.rs",
+    "name": "file_warnings_close",
+    "async": false,
+    "generics": "",
+    "parameters": "window: tauri::WebviewWindow, session_id: String,",
+    "returnType": "Result<(), String>"
+  },
+  {
+    "file": "file_warnings_window.rs",
+    "name": "file_warnings_dismiss",
+    "async": false,
+    "generics": "",
+    "parameters": "window: tauri::WebviewWindow",
+    "returnType": "()"
+  },
+  {
+    "file": "first_paint.rs",
+    "name": "window_first_paint",
+    "async": false,
+    "generics": "",
+    "parameters": "window: WebviewWindow",
+    "returnType": "Result<(), String>"
+  },
+  {
     "file": "fonts.rs",
     "name": "list_system_fonts",
     "async": true,
@@ -212,8 +308,8 @@
     "name": "quit_after_flush",
     "async": true,
     "generics": "",
-    "parameters": "app: tauri::AppHandle",
-    "returnType": "()"
+    "parameters": "app: tauri::AppHandle, window: tauri::WebviewWindow, request_id: u64,",
+    "returnType": "Result<(), String>"
   },
   {
     "file": "lib.rs",
@@ -244,8 +340,8 @@
     "name": "cancel_quit",
     "async": true,
     "generics": "",
-    "parameters": "window: tauri::WebviewWindow, request_id: u64",
-    "returnType": "Result<bool, String>"
+    "parameters": "window: tauri::WebviewWindow, request_id: u64,",
+    "returnType": "Result<QuitCancelOutcome, String>"
   },
   {
     "file": "lib.rs",
@@ -300,8 +396,8 @@
     "name": "list_toolset_window_states",
     "async": false,
     "generics": "",
-    "parameters": "app: tauri::AppHandle",
-    "returnType": "Result<Vec<ToolsetWindowState>, String>"
+    "parameters": "app: tauri::AppHandle, foreground_only: Option<bool>,",
+    "returnType": "Result<ToolsetWindowQueryResult, String>"
   },
   {
     "file": "lib.rs",
@@ -330,7 +426,7 @@
   {
     "file": "lib.rs",
     "name": "save_document_session",
-    "async": false,
+    "async": true,
     "generics": "",
     "parameters": "app: tauri::AppHandle, window: tauri::WebviewWindow, state: serde_json::Value,",
     "returnType": "Result<(), String>"
@@ -500,8 +596,8 @@
     "name": "show_toolset_popover_window",
     "async": false,
     "generics": "",
-    "parameters": "window: tauri::WebviewWindow, focus_mode: Option<ToolsetPopoverFocusMode>, kind: Option<String>,",
-    "returnType": "Result<(), String>"
+    "parameters": "window: tauri::WebviewWindow, focus_mode: Option<ToolsetPopoverFocusMode>, kind: Option<String>, flyout_opening: Option<ToolsetFlyoutOpening>,",
+    "returnType": "Result<bool, String>"
   },
   {
     "file": "lib.rs",
@@ -521,6 +617,22 @@
   },
   {
     "file": "lib.rs",
+    "name": "clamp_current_inspector_frame",
+    "async": false,
+    "generics": "",
+    "parameters": "window: tauri::WebviewWindow",
+    "returnType": "()"
+  },
+  {
+    "file": "lib.rs",
+    "name": "resize_toolset_window",
+    "async": false,
+    "generics": "",
+    "parameters": "window: tauri::WebviewWindow, width: f64, height: f64,",
+    "returnType": "Result<bool, String>"
+  },
+  {
+    "file": "lib.rs",
     "name": "set_palette_command_hit_boxes",
     "async": false,
     "generics": "",
@@ -532,7 +644,7 @@
     "name": "route_toolset_command",
     "async": false,
     "generics": "",
-    "parameters": "app: tauri::AppHandle, window: tauri::WebviewWindow, command_id: String, preserve_input_focus: Option<bool>, commit: Option<bool>,",
+    "parameters": "app: tauri::AppHandle, window: tauri::WebviewWindow, command_id: String, preserve_input_focus: Option<bool>, commit: Option<bool>, flyout_opening: Option<ToolsetFlyoutOpening>,",
     "returnType": "Result<(), String>"
   },
   {
@@ -676,8 +788,16 @@
     "name": "take_pending_open_document",
     "async": false,
     "generics": "",
+    "parameters": "window: tauri::WebviewWindow, state: tauri::State<'_, PendingOpenDocument>, confirmation: Option<macos_single_instance::OpenConfirmation>,",
+    "returnType": "Result<Vec<NativeOpenDocumentPayload>, String>"
+  },
+  {
+    "file": "lib.rs",
+    "name": "take_pending_open_document",
+    "async": false,
+    "generics": "",
     "parameters": "state: tauri::State<'_, PendingOpenDocument>,",
-    "returnType": "Result<Option<NativeOpenDocumentPayload>, String>"
+    "returnType": "Result<Vec<NativeOpenDocumentPayload>, String>"
   },
   {
     "file": "lib.rs",

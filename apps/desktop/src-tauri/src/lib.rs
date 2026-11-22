@@ -1,4 +1,10 @@
+#[cfg(target_os = "linux")]
+mod appimage_dialogs;
+#[cfg(target_os = "linux")]
+mod appimage_single_instance;
 mod assistant_mcp;
+mod canvas_context_menu;
+mod canvas_occlusion;
 mod clipboard_formats;
 mod clipboard_images;
 mod clipboard_limits;
@@ -7,13 +13,20 @@ mod document_session;
 mod download_diagnosis;
 mod export;
 mod external_tools;
+mod file_warnings_window;
+mod first_paint;
 mod fonts;
 mod installed_plugins;
 #[cfg(target_os = "linux")]
 mod linux_clipboard;
+mod linux_session_end;
+#[cfg(any(target_os = "linux", test))]
+mod linux_startup;
 mod local_engine;
 #[cfg(target_os = "macos")]
 mod macos_quit;
+#[cfg(target_os = "macos")]
+mod macos_single_instance;
 mod main_window_placement;
 mod monitor_query;
 mod naming_engine;
@@ -22,6 +35,7 @@ mod network_error;
 mod network_test_http;
 mod ocsr_engine;
 mod opsin;
+mod palette_first_paint;
 mod panel_full_size;
 mod panel_window;
 mod panel_window_controls;
@@ -37,12 +51,16 @@ mod structure_search;
 mod utility_suspension;
 #[cfg(test)]
 mod utility_suspension_tests;
+mod utility_window;
 mod webview_context_menus;
 #[cfg(test)]
 mod webview_context_menus_tests;
+#[cfg(any(target_os = "linux", test))]
+mod webview_recovery;
 mod window_drag;
 mod windows_activation_log;
 mod windows_clipboard;
+mod windows_session_end;
 
 use clipboard_formats::{
     validate_clipboard_items, ClipboardWriteItem, ClipboardWriteResult, ValidatedClipboardItem,
@@ -91,6 +109,26 @@ use tauri_plugin_sparkle_updater::SparkleUpdaterExt;
 
 const MAIN_WINDOW_LABEL: &str = "main";
 
+/// The single place that decides whether a window label is a document window. Today only the
+/// main window is one; the multi-window work must replace this body with a document-window
+/// registry lookup.
+pub(crate) fn is_document_window(label: &str) -> bool {
+    label == MAIN_WINDOW_LABEL
+}
+
+#[cfg(test)]
+mod document_window_tests {
+    use super::is_document_window;
+
+    #[test]
+    fn recognizes_only_document_window_labels() {
+        assert!(is_document_window("main"));
+        for label in ["palette-main", "dialog-x", ""] {
+            assert!(!is_document_window(label));
+        }
+    }
+}
+
 /// Helper processes (the Engine 3D sidecar, OPSIN's JVM) are console programs. Spawned from a
 /// GUI-subsystem app on Windows, each would flash a console window; CREATE_NO_WINDOW suppresses it.
 /// A no-op elsewhere.
@@ -109,6 +147,21 @@ impl WithoutConsoleWindow for Command {
         self
     }
 }
+
+/// AppRun's working folder is for WebKitGTK. App-owned children start in the user's home
+/// unless the caller sets a resource or workspace directory of its own.
+fn child_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let command = Command::new(program);
+    #[cfg(target_os = "linux")]
+    {
+        let mut command = command;
+        linux_startup::set_child_directory(&mut command);
+        command
+    }
+    #[cfg(not(target_os = "linux"))]
+    command
+}
+
 const SPIN3D_DEBUGGER_WINDOW_LABEL: &str = "spin3d-debugger";
 const SPIN3D_DEBUGGER_WINDOW_ROUTE: &str = "/?window=spin3d-debugger";
 const SPIN3D_DEBUGGER_TOGGLE_COMMAND_ID: &str = "view.toggle3dDebugger";
@@ -154,8 +207,8 @@ static APP_QUITTING: AtomicBool = AtomicBool::new(false);
 
 /// Application-menu Quit on macOS, File ▸ Exit elsewhere.
 const APP_QUIT_COMMAND_ID: &str = "app.quit";
-/// Sent to the document window when the app is about to quit; it flushes its pending session
-/// autosave and answers with `quit_after_flush`. Mirrors `QUIT_FLUSH_REQUEST_EVENT` in
+/// Sent with the `committed` phase once native quit can no longer be cancelled. The document
+/// window flushes its session and answers with `quit_after_flush`. Mirrors `QUIT_FLUSH_REQUEST_EVENT` in
 /// apps/desktop/src/window-manager/index.ts.
 const QUIT_FLUSH_REQUEST_EVENT: &str = "chemdraft://flush-before-quit";
 /// How long a quit waits for the document window's flush before quitting anyway.
@@ -208,7 +261,7 @@ fn appkit_quit_decision(
         return if reason == 0 || reason == u32::from_be_bytes(*b"quit") {
             AppkitQuitDecision::Prompt
         } else {
-            AppkitQuitDecision::TerminateNow
+            AppkitQuitDecision::DeferReply
         };
     }
     AppkitQuitDecision::DeferReply
@@ -271,8 +324,12 @@ struct QuitFlow {
     quitting: &'static AtomicBool,
     /// Set once the exit watchdog is running, so it is started at most once.
     watchdog_armed: AtomicBool,
+    /// Confirmation joins final frame writes once, inside the original flush grace.
+    position_drain_started: AtomicBool,
     /// Generation and visible-prompt flag, serialized with timeout/cancel decisions.
     prompt: Mutex<(u64, QuitPromptPhase)>,
+    next_request_id: AtomicU64,
+    flush: Mutex<Option<QuitFlush>>,
     /// Claiming a reply and delivering it on the main thread are separate transitions.
     #[cfg(any(target_os = "macos", test))]
     appkit_reply: Mutex<AppkitReplyState>,
@@ -280,7 +337,24 @@ struct QuitFlow {
     exit_watchdog: Duration,
 }
 
+#[derive(Clone, Copy)]
+struct QuitFlush {
+    id: u64,
+    confirmed: bool,
+}
+
 impl QuitFlow {
+    fn in_progress(&self) -> bool {
+        self.requested.load(Ordering::SeqCst) || self.quitting.load(Ordering::SeqCst)
+    }
+
+    // The user can still use save dialogs while the prompt is up, but a second launch
+    // must wait for cancellation or take over after a confirmed quit.
+    #[cfg(target_os = "macos")]
+    fn refuses_macos_launch(&self) -> bool {
+        self.prompt.lock().unwrap().1 != QuitPromptPhase::Idle || self.in_progress()
+    }
+
     const fn new(
         quitting: &'static AtomicBool,
         flush_grace: Duration,
@@ -289,14 +363,82 @@ impl QuitFlow {
         Self {
             requested: AtomicBool::new(false),
             prompt: Mutex::new((0, QuitPromptPhase::Idle)),
+            next_request_id: AtomicU64::new(1),
+            flush: Mutex::new(None),
             #[cfg(any(target_os = "macos", test))]
             appkit_reply: Mutex::new(AppkitReplyState::Idle),
             quitting,
             watchdog_armed: AtomicBool::new(false),
+            position_drain_started: AtomicBool::new(false),
             flush_grace,
             exit_watchdog,
         }
     }
+
+    /// Menu, window-close, and OS termination all share one committed flush.
+    fn begin_flush(&self, prompt_id: Option<u64>) -> (u64, bool) {
+        let mut flush = self.flush.lock().unwrap();
+        if let Some(existing) = *flush {
+            return (existing.id, false);
+        }
+        let id = prompt_id.unwrap_or_else(|| self.next_request_id.fetch_add(1, Ordering::SeqCst));
+        *flush = Some(QuitFlush {
+            id,
+            confirmed: false,
+        });
+        (id, true)
+    }
+
+    fn request_flush<E>(&self, emit: impl FnOnce(u64) -> Result<(), E>) -> Result<u64, E> {
+        let (request_id, started) = self.begin_flush(None);
+        if !started {
+            return Ok(request_id);
+        }
+        if let Err(error) = emit(request_id) {
+            let mut flush = self.flush.lock().unwrap();
+            if flush.is_some_and(|current| current.id == request_id) {
+                *flush = None;
+            }
+            return Err(error);
+        }
+        Ok(request_id)
+    }
+
+    fn confirm_flush(&self, request_id: u64) -> bool {
+        let mut flush = self.flush.lock().unwrap();
+        let Some(current) = flush.as_mut() else {
+            return false;
+        };
+        if current.id != request_id || current.confirmed {
+            return false;
+        }
+        current.confirmed = true;
+        true
+    }
+
+    #[cfg(any(windows, target_os = "linux", test))]
+    fn flush_confirmed(&self, request_id: u64) -> bool {
+        self.flush
+            .lock()
+            .unwrap()
+            .is_some_and(|flush| flush.id == request_id && flush.confirmed)
+    }
+}
+
+fn request_document_quit_flush<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> tauri::Result<Option<u64>> {
+    if app.get_webview_window(MAIN_WINDOW_LABEL).is_none() {
+        return Ok(None);
+    }
+    QUIT.request_flush(|request_id| {
+        app.emit_to(
+            MAIN_WINDOW_LABEL,
+            QUIT_FLUSH_REQUEST_EVENT,
+            serde_json::json!({ "phase": "committed", "requestId": request_id }),
+        )
+    })
+    .map(Some)
 }
 
 /// How a quit was decided. The forced-exit line names it, since only a confirmed flush means the
@@ -342,6 +484,18 @@ trait QuitHost: Clone + Send + 'static {
         let _ = request_id;
         self.ask_document_to_flush()
     }
+    /// Independent timers never join persistence workers.
+    fn schedule_after(&self, wait: Duration, task: impl FnOnce() + Send + 'static) {
+        let deadline = Instant::now() + wait;
+        thread::spawn(move || {
+            thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            task();
+        });
+    }
+    fn dispatch_worker(&self, task: impl FnOnce() + Send + 'static) {
+        thread::spawn(task);
+    }
+    fn drain_pending_position_writes(&self) {}
     /// Asks the event loop, on the main thread, to end the app.
     fn exit(&self);
     /// Completes the pending AppKit termination handshake on the main thread.
@@ -355,12 +509,32 @@ trait QuitHost: Clone + Send + 'static {
 
 impl<R: Runtime> QuitHost for tauri::AppHandle<R> {
     fn ask_document_to_flush(&self) -> bool {
-        // Native sessions settle before the final document flush, even with an unresponsive renderer.
-        dialog_windows::dismiss_owned(self, "quit");
-        self.get_webview_window(MAIN_WINDOW_LABEL).is_some()
-            && self
-                .emit_to(MAIN_WINDOW_LABEL, QUIT_FLUSH_REQUEST_EVENT, ())
-                .is_ok()
+        let app = self.clone();
+        // Queue the request after applicationShouldTerminate returns TerminateLater.
+        self.dispatch_worker(move || {
+            let request = app.clone();
+            if let Err(error) = app.run_on_main_thread(move || {
+                if !matches!(request_document_quit_flush(&request), Ok(Some(_))) {
+                    complete_quit_flush_with(&QUIT, &request, QuitReason::NoDocument);
+                }
+            }) {
+                eprintln!("Could not dispatch session flush: {error}");
+                // The independent grace still completes the quit.
+            }
+        });
+        true
+    }
+
+    fn drain_pending_position_writes(&self) {
+        // Capture and close native dialogs only after the renderer has written the session.
+        let app = self.clone();
+        if let Err(error) =
+            run_on_main_thread_blocking(self, move || capture_quit_window_frames(&app))
+        {
+            eprintln!("Could not dispatch final dialog capture: {error}");
+        }
+        LAYOUT_POSITION_WRITER.drain();
+        dialog_windows::drain_pending_position_writes();
     }
 
     fn ask_document_to_prompt(&self, request_id: u64) -> bool {
@@ -425,6 +599,9 @@ impl<R: Runtime> QuitHost for tauri::AppHandle<R> {
 /// the last moment. Ask the document window to flush first; it confirms through `quit_after_flush`,
 /// and a grace timer quits regardless if the webview can't answer.
 fn request_quit<R: Runtime>(app: &tauri::AppHandle<R>) {
+    if windows_session_end::in_progress() || linux_session_end::in_progress() {
+        return;
+    }
     if ASK_TO_SAVE_ON_QUIT.load(Ordering::SeqCst) {
         // A repeated menu/Dock quit also reveals a prompt that was subsequently minimized.
         if prompt_waits_for_user(&QUIT) {
@@ -450,7 +627,7 @@ fn prompt_waits_for_user(flow: &QuitFlow) -> bool {
     )
 }
 
-// The preference-off path is the original #99 flow.
+// Preference-off and system termination share the original #99 flush handshake.
 fn request_quit_with<H: QuitHost>(flow: &'static QuitFlow, host: &H, force_repeated_quit: bool) {
     if flow.requested.swap(true, Ordering::SeqCst) {
         if force_repeated_quit {
@@ -458,14 +635,42 @@ fn request_quit_with<H: QuitHost>(flow: &'static QuitFlow, host: &H, force_repea
         }
         return;
     }
+    arm_quit_flush_grace(flow, host);
     if !host.ask_document_to_flush() {
         quit_now_with(flow, host, QuitReason::NoDocument);
+    }
+}
+
+fn arm_quit_flush_grace<H: QuitHost>(flow: &'static QuitFlow, host: &H) {
+    let timer_host = host.clone();
+    host.schedule_after(flow.flush_grace, move || {
+        expire_quit_flush_with(flow, &timer_host);
+    });
+}
+
+/// Read native frames on the main thread and queue their writes for the bounded drain.
+fn capture_quit_window_frames<R: Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let webview: &tauri::Webview<R> = window.as_ref();
+        if let Err(error) = persist_main_window_geometry(&webview.window()) {
+            eprintln!("Could not capture ChemDraft main window frame for quit: {error}");
+        }
+    }
+    dialog_windows::dismiss_owned(app, "quit");
+}
+
+/// Session confirmation has priority; only then join geometry workers. The deadline never joins.
+fn complete_quit_flush_with<H: QuitHost>(flow: &'static QuitFlow, host: &H, reason: QuitReason) {
+    if windows_session_end::in_progress()
+        || linux_session_end::in_progress()
+        || flow.position_drain_started.swap(true, Ordering::SeqCst)
+    {
         return;
     }
-    let host = host.clone();
-    thread::spawn(move || {
-        thread::sleep(flow.flush_grace);
-        expire_quit_flush_with(flow, &host);
+    let drain_host = host.clone();
+    host.dispatch_worker(move || {
+        drain_host.drain_pending_position_writes();
+        quit_now_with(flow, &drain_host, reason);
     });
 }
 
@@ -487,6 +692,8 @@ fn request_appkit_quit_with<H: QuitHost>(flow: &'static QuitFlow, host: &H) -> b
     }
     *reply = AppkitReplyState::Pending;
     drop(reply);
+    // Logout supersedes a pending ordinary save prompt, including its timers and late answers.
+    flow.prompt.lock().unwrap().1 = QuitPromptPhase::Flushing;
     request_quit_with(flow, host, false);
     true
 }
@@ -499,7 +706,7 @@ fn request_prompted_quit_with<H: QuitHost>(flow: &'static QuitFlow, host: &H) ->
     {
         return None;
     }
-    prompt.0 += 1;
+    prompt.0 = flow.next_request_id.fetch_add(1, Ordering::SeqCst);
     prompt.1 = QuitPromptPhase::AwaitingWindow;
     let request_id = prompt.0;
     drop(prompt);
@@ -517,12 +724,20 @@ fn arm_prompt_grace<H: QuitHost>(
     request_id: u64,
     phase: QuitPromptPhase,
 ) {
-    let host = host.clone();
-    thread::spawn(move || {
-        thread::sleep(flow.flush_grace);
-        let prompt = flow.prompt.lock().unwrap();
-        if *prompt == (request_id, phase) && !flow.quitting.load(Ordering::SeqCst) {
-            quit_now_with(flow, &host, QuitReason::GraceExpired);
+    let timer_host = host.clone();
+    host.schedule_after(flow.flush_grace, move || {
+        let expired = {
+            let prompt = flow.prompt.lock().unwrap();
+            if *prompt == (request_id, phase) && !flow.quitting.load(Ordering::SeqCst) {
+                // Serialize expiration with Cancel, then release the lock before dispatching exit.
+                flow.quitting.store(true, Ordering::SeqCst);
+                true
+            } else {
+                false
+            }
+        };
+        if expired {
+            quit_now_with(flow, &timer_host, QuitReason::GraceExpired);
         }
     });
 }
@@ -539,11 +754,13 @@ fn resume_prompted_quit_with<H: QuitHost>(
             QuitPromptPhase::AwaitingWindow | QuitPromptPhase::Showing
         )
         || flow.quitting.load(Ordering::SeqCst)
+        || !flow.begin_flush(Some(request_id)).1
     {
         return false;
     }
     prompt.1 = QuitPromptPhase::Flushing;
     flow.requested.store(true, Ordering::SeqCst);
+    drop(prompt);
     arm_prompt_grace(flow, host, request_id, QuitPromptPhase::Flushing);
     true
 }
@@ -551,6 +768,10 @@ fn resume_prompted_quit_with<H: QuitHost>(
 /// The session is written, or its grace has run out. Reply to a deferred AppKit termination;
 /// otherwise arm the exit watchdog here and nowhere else, then request event-loop exit.
 fn quit_now_with<H: QuitHost>(flow: &'static QuitFlow, host: &H, reason: QuitReason) {
+    if windows_session_end::in_progress() || linux_session_end::in_progress() {
+        // The committed system shutdown owns the flush and the exit deadline.
+        return;
+    }
     #[cfg(any(target_os = "macos", test))]
     {
         let mut reply = flow.appkit_reply.lock().unwrap();
@@ -587,11 +808,10 @@ fn quit_now_with<H: QuitHost>(flow: &'static QuitFlow, host: &H, reason: QuitRea
     #[cfg(not(any(target_os = "macos", test)))]
     flow.quitting.store(true, Ordering::SeqCst);
     if !flow.watchdog_armed.swap(true, Ordering::SeqCst) {
-        let host = host.clone();
+        let timer_host = host.clone();
         let wait = flow.exit_watchdog;
-        thread::spawn(move || {
-            thread::sleep(wait);
-            host.force_exit(wait, reason);
+        host.schedule_after(wait, move || {
+            timer_host.force_exit(wait, reason);
         });
     }
     host.exit();
@@ -602,15 +822,25 @@ fn quit_now_with<H: QuitHost>(flow: &'static QuitFlow, host: &H, reason: QuitRea
 /// held that thread the answer waited too, so the quit (and the exit watchdog) started only when the
 /// 3 s grace ran out. Deciding here posts the exit request or AppKit reply to the main thread.
 #[tauri::command]
-async fn quit_after_flush(app: tauri::AppHandle) {
-    quit_now_with(&QUIT, &app, QuitReason::FlushConfirmed);
+async fn quit_after_flush(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    request_id: u64,
+) -> Result<(), String> {
+    authorize_quit_window(window.label())?;
+    if QUIT.confirm_flush(request_id) {
+        #[cfg(target_os = "linux")]
+        linux_session_end::acknowledge_flush();
+        complete_quit_flush_with(&QUIT, &app, QuitReason::FlushConfirmed);
+    }
+    Ok(())
 }
 
 fn authorize_quit_window(label: &str) -> Result<(), String> {
     if label == MAIN_WINDOW_LABEL {
         Ok(())
     } else {
-        Err("Only the document window can control quit prompts.".into())
+        Err("Only the document window can control quitting.".into())
     }
 }
 
@@ -630,20 +860,24 @@ fn acknowledge_quit_prompt(flow: &QuitFlow, request_id: u64, visible: bool) -> b
     true
 }
 
-fn cancel_quit_with(flow: &QuitFlow, request_id: u64) -> bool {
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+enum QuitCancelOutcome {
+    Cancelled,
+    Superseded,
+    Committed,
+}
+
+fn cancel_quit_with(flow: &QuitFlow, request_id: u64) -> QuitCancelOutcome {
     let mut prompt = flow.prompt.lock().unwrap();
-    if request_id == 0
-        || prompt.0 != request_id
-        || !matches!(
-            prompt.1,
-            QuitPromptPhase::Idle | QuitPromptPhase::AwaitingWindow | QuitPromptPhase::Showing
-        )
-        || flow.quitting.load(Ordering::SeqCst)
-    {
-        return false;
+    if prompt.1 == QuitPromptPhase::Flushing || flow.in_progress() {
+        return QuitCancelOutcome::Committed;
+    }
+    if request_id == 0 || prompt.0 != request_id {
+        return QuitCancelOutcome::Superseded;
     }
     prompt.1 = QuitPromptPhase::Idle;
-    true
+    QuitCancelOutcome::Cancelled
 }
 
 #[tauri::command]
@@ -695,7 +929,10 @@ async fn quit_prompt_showing(
 }
 
 #[tauri::command]
-async fn cancel_quit(window: tauri::WebviewWindow, request_id: u64) -> Result<bool, String> {
+async fn cancel_quit(
+    window: tauri::WebviewWindow,
+    request_id: u64,
+) -> Result<QuitCancelOutcome, String> {
     authorize_quit_window(window.label())?;
     Ok(cancel_quit_with(&QUIT, request_id))
 }
@@ -726,12 +963,7 @@ async fn confirm_prompted_quit(
     window: tauri::WebviewWindow,
     request_id: u64,
 ) -> Result<(), String> {
-    authorize_quit_window(window.label())?;
-    let prompt = QUIT.prompt.lock().unwrap();
-    if *prompt == (request_id, QuitPromptPhase::Flushing) && !QUIT.quitting.load(Ordering::SeqCst) {
-        quit_now_with(&QUIT, &app, QuitReason::FlushConfirmed);
-    }
-    Ok(())
+    quit_after_flush(app, window, request_id).await
 }
 
 const TOOLSET_LAYOUT_STATE_FILENAME: &str = "toolbar-state.json";
@@ -838,6 +1070,10 @@ struct PluginNativeMenuItems(std::sync::Mutex<Vec<PluginMenuItemInput>>);
 #[derive(Default)]
 struct ToolbarsMenuModel(std::sync::Mutex<(Vec<ToolbarMenuEntry>, ViewMenuState)>);
 
+/// Set after a failed native update. Only a complete rebuild can trust the cached models again.
+#[derive(Default)]
+struct NativeMenuNeedsRebuild(AtomicBool);
+
 /// Which keyboard-shortcut scheme the app runs under (mirrors the webview's persisted setting; JS
 /// pushes it on startup and on change via `set_keybinding_scheme`). Read at menu-build time so the
 /// few native accelerators that differ between the schemes stay in step with the webview registry.
@@ -882,6 +1118,9 @@ struct ToolsetCommandPayload {
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NativeOpenDocumentPayload {
+    #[cfg(target_os = "macos")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt: Option<macos_single_instance::RendererReceipt>,
     path: String,
     display_name: String,
     contents: String,
@@ -891,7 +1130,7 @@ struct NativeOpenDocumentPayload {
 
 #[derive(Default)]
 struct PendingOpenDocument {
-    payload: Mutex<Option<NativeOpenDocumentPayload>>,
+    payloads: Mutex<Vec<NativeOpenDocumentPayload>>,
     // Window existence is not a readiness signal: macOS may close every window after setup.
     setup_completed: AtomicBool,
 }
@@ -906,10 +1145,13 @@ enum OpenDocumentDelivery {
 impl PendingOpenDocument {
     fn record(
         &self,
-        payload: NativeOpenDocumentPayload,
+        payloads: Vec<NativeOpenDocumentPayload>,
         main_window_exists: bool,
     ) -> Result<OpenDocumentDelivery, String> {
-        *self.payload.lock().map_err(|error| error.to_string())? = Some(payload);
+        self.payloads
+            .lock()
+            .map_err(|error| error.to_string())?
+            .extend(payloads);
         Ok(if !self.setup_completed.load(Ordering::SeqCst) {
             OpenDocumentDelivery::PendingOnly
         } else if main_window_exists {
@@ -917,6 +1159,11 @@ impl PendingOpenDocument {
         } else {
             OpenDocumentDelivery::CreateWindowAndEmit
         })
+    }
+
+    fn drain(&self) -> Result<Vec<NativeOpenDocumentPayload>, String> {
+        let mut pending = self.payloads.lock().map_err(|error| error.to_string())?;
+        Ok(std::mem::take(&mut *pending))
     }
 }
 
@@ -1010,6 +1257,28 @@ struct PersistedToolsetState {
     x: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     y: Option<f64>,
+    // The backing scale makes x/y unambiguous in the Windows virtual desktop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position_scale: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    width: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height: Option<f64>,
+}
+
+impl PersistedToolsetState {
+    fn position(&self) -> Option<ToolsetWindowPosition> {
+        Some(ToolsetWindowPosition {
+            x: self.x?,
+            y: self.y?,
+        })
+    }
+
+    fn window_size(&self, resizable: bool) -> Option<(f64, f64)> {
+        let (width, height) = (self.width?, self.height?);
+        (resizable && width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
+            .then_some((width, height))
+    }
 }
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
@@ -1056,6 +1325,8 @@ const MAIN_WINDOW_TITLE_GRAB_PT: f64 = 22.0;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    let startup = linux_startup::configure();
     // First, before GTK opens the display: see monitor_query.rs.
     #[cfg(target_os = "linux")]
     monitor_query::init_xlib_threads();
@@ -1063,35 +1334,44 @@ pub fn run() {
     windows_activation_log::init(perf_enabled);
     let perf_log = perf_log::PerfLog::new(perf_enabled);
     let builder = tauri::Builder::default();
+    #[cfg(target_os = "linux")]
+    let is_appimage = startup.appimage.is_some();
+    #[cfg(target_os = "linux")]
+    let builder = builder.manage(startup);
 
-    // Registered first, as the plugin requires. A second launch forwards its argv here (a document
-    // double-clicked while ChemDraft runs) instead of starting a rival process on the same
-    // app_data_dir. macOS routes such opens to the running app itself (RunEvent::Opened).
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
-        let setup_completed = app
-            .state::<PendingOpenDocument>()
-            .setup_completed
-            .load(Ordering::SeqCst);
-        let action = second_launch_action(quit_in_progress(), setup_completed);
-        if action == SecondLaunchAction::IgnoreWhileQuitting {
-            eprintln!("ChemDraft: a second launch arrived while quitting; ignored (this process is exiting)");
-            return;
-        }
-        let cwd = PathBuf::from(cwd);
-        if let Err(error) = handle_opened_document_args(app, argv.into_iter().skip(1), &cwd) {
-            eprintln!("Could not open ChemDraft document from a second launch: {error}");
-        }
-        if action == SecondLaunchAction::OpenOnly {
-            return;
-        }
-        if let Err(error) = ensure_main_window_visible(app) {
-            eprintln!("Could not show ChemDraft main window for a second launch: {error}");
-        }
-        if let Err(error) = focus_main_document_window_impl(app, MainWindowFocusMode::Force) {
-            eprintln!("Could not focus ChemDraft document window for a second launch: {error}");
-        }
-    }));
+    // Both guards run before any webview or app setup can touch session/settings files.
+    let context = tauri::generate_context!();
+    #[cfg(target_os = "macos")]
+    let (context, primary_lock, secondary) = {
+        let mut context = context;
+        let (primary_lock, secondary) = macos_single_instance::init(&mut context);
+        (context, primary_lock, secondary)
+    };
+    #[cfg(target_os = "macos")]
+    let builder = if let Some(guard) = primary_lock {
+        builder
+            .plugin(macos_single_instance::plugin(
+                guard,
+                handle_macos_second_launch,
+            ))
+            .plugin(tauri_plugin_sparkle_updater::init())
+            .menu(create_app_menu)
+    } else {
+        builder.enable_macos_default_menu(false)
+    };
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(handle_second_launch));
+    #[cfg(target_os = "linux")]
+    let builder = builder.plugin(if is_appimage {
+        appimage_single_instance::init()
+    } else {
+        tauri_plugin_single_instance::init(handle_second_launch)
+    });
 
     let builder = if perf_enabled {
         builder.plugin(
@@ -1112,6 +1392,7 @@ pub fn run() {
     let builder = builder
         .manage(perf_log)
         .manage(PendingOpenDocument::default())
+        .manage(canvas_context_menu::PopupState::default())
         .manage(panel_window::PanelFocusState::default())
         .manage(panel_full_size::State::default())
         .manage(Engine3dSidecarSessions::default())
@@ -1121,21 +1402,31 @@ pub fn run() {
         .manage(ToolsetWindowDirectory::default())
         .manage(PluginNativeMenuItems::default())
         .manage(ToolbarsMenuModel::default())
+        .manage(NativeMenuNeedsRebuild::default())
         .manage(KeybindingSchemeState::default())
         // Take over the app's OWN `tauri://` origin so one handler serves both the document and any
         // staged plugin package (ADR-0029 §6 as amended; M36). This *replaces* Tauri's built-in
         // handler rather than adding a scheme — a new scheme would be a new origin, and M35 measured
         // that a plugin package only loads same-origin. The origin is unchanged, so no origin-keyed
         // state (localStorage, IndexedDB) is disturbed. See `installed_plugins` for the full rationale.
-        .register_uri_scheme_protocol("tauri", installed_plugins::handle_tauri_request)
-        .plugin(tauri_plugin_dialog::init())
+        .register_uri_scheme_protocol("tauri", installed_plugins::handle_tauri_request);
+    let dialogs = tauri_plugin_dialog::init();
+    #[cfg(target_os = "linux")]
+    let builder = if is_appimage {
+        builder.plugin(appimage_dialogs::AppImageDialogs(dialogs))
+    } else {
+        builder.plugin(dialogs)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let builder = builder.plugin(dialogs);
+    let builder = builder
         .plugin(tauri_plugin_fs::init())
         // Host-owned network transport for the allowlisted plugin-update catalog. Installed plugin
         // workers remain under connect-src 'self' and never receive this capability.
         .plugin(tauri_plugin_http::init());
 
-    #[cfg(target_os = "macos")]
-    let builder = builder.plugin(tauri_plugin_sparkle_updater::init());
+    #[cfg(target_os = "linux")]
+    let builder = builder.plugin(webview_recovery::plugin());
 
     // Windows app updates: a signed manifest on main (`plugins.updater` in tauri.windows.conf.json)
     // and a signed NSIS installer. The webview drives the flow, and only a stable build ever checks;
@@ -1147,9 +1438,38 @@ pub fn run() {
     // window, which subclasses each palette/popover with muda's menu proc; see `install_app_menu`
     // for why that crashed. There the menu is attached to the document window in `setup` instead.
     #[cfg(target_os = "macos")]
-    let builder = builder.menu(create_app_menu);
+    let builder = builder.manage(FullscreenMenuItem::<tauri::Wry>(Mutex::new(None)));
+    #[cfg(target_os = "macos")]
+    let builder = builder.plugin(
+        tauri::plugin::Builder::<tauri::Wry>::new("windows-menu")
+            .on_window_ready(|window| {
+                match window.ns_window() {
+                    Ok(pointer) => {
+                        // SAFETY: Tauri calls this hook on the main thread with a live window.
+                        if let Some(native) = unsafe { pointer.cast::<NSWindow>().as_ref() } {
+                            if is_document_window(window.label()) {
+                                observe_document_fullscreen(window.app_handle(), native);
+                            } else {
+                                native.setExcludedFromWindowsMenu(true);
+                            }
+                        }
+                    }
+                    Err(error) => eprintln!(
+                        "Could not configure the native menu for ChemDraft window {}: {error}",
+                        window.label()
+                    ),
+                }
+            })
+            .build(),
+    );
 
-    builder
+    #[cfg(target_os = "macos")]
+    let builder = builder.manage(Mutex::new(macos_single_instance::RendererOpens::default()));
+    #[cfg(target_os = "macos")]
+    let collecting_launch = secondary.is_some();
+    #[cfg(target_os = "macos")]
+    let setup_secondary = secondary.clone();
+    let app = builder
         .on_page_load(|webview, payload| {
             if matches!(payload.event(), PageLoadEvent::Finished) {
                 if let Some(window) = webview.app_handle().get_webview_window(webview.label()) {
@@ -1172,14 +1492,16 @@ pub fn run() {
             if webview.label() == MAIN_WINDOW_LABEL
                 && matches!(payload.event(), PageLoadEvent::Finished)
             {
-                // WKWebView applies index.html's initial `<title>ChemDraft</title>` after setup,
-                // overwriting the label set by ensure_main_window_visible. Reassert the baked
-                // worktree title at the page-load boundary so the actual macOS title bar, not only
-                // the web document/build stamp, identifies this checkout.
-                let _ = webview.window().set_title(&main_window_title());
+                // WKWebView can apply index.html's title after setup. Restore the worktree label
+                // if the React document has yet to publish its title.
+                let _ = set_startup_title(&webview.window());
             }
         })
         .on_menu_event(|app, event| {
+            windows_activation_log::menu(Some(event.id().as_ref()));
+            if canvas_context_menu::menu_event(app, event.id().as_ref()) {
+                return;
+            }
             // Single brain: every menu click (toolset toggles included) routes to the JS
             // command dispatcher, which owns visibility and pushes checkmarks back via
             // `set_menu_checked`. Rust no longer opens palettes or special-cases toolsets.
@@ -1207,7 +1529,19 @@ pub fn run() {
             }
         })
         .on_window_event(|window, event| {
+            file_warnings_window::on_window_event(window, event);
             if window.label() == MAIN_WINDOW_LABEL {
+                if on_main_window_geometry_event_with(&QUIT, event, || {
+                    // Windows sends Resized when the owner is restored from the taskbar;
+                    // macOS also reports its restored frame. Never release a prompt here.
+                    schedule_suspended_utility_restore(window.app_handle());
+                    palette_first_paint::release_held(window.app_handle());
+                    if let Err(error) = persist_main_window_geometry(window) {
+                        eprintln!("Could not persist ChemDraft main window frame: {error}");
+                    }
+                }) {
+                    return;
+                }
                 match event {
                     // macOS: closing the document window hides it and the app lives on in the
                     // Dock (RunEvent::Reopen brings it back).
@@ -1244,27 +1578,21 @@ pub fn run() {
                             .state::<naming_engine::NamingEngineState>()
                             .shutdown();
                     }
-                    WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
-                        // Frames changed by quit teardown are not the user's; skip like palettes do.
-                        // An early return rather than clippy's suggested match guard: a guard that
-                        // fails falls through to the next arm, which is only equivalent as long as
-                        // nothing below also matches Moved/Resized. This says what it means.
-                        if APP_QUITTING.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        // Windows sends Resized when the owner is restored from the taskbar;
-                        // macOS also reports its restored frame. Never release a prompt here.
-                        schedule_suspended_utility_restore(window.app_handle());
-                        if let Err(error) = persist_main_window_geometry(window) {
-                            eprintln!("Could not persist ChemDraft main window frame: {error}");
-                        }
-                    }
                     WindowEvent::Focused(true) => {
+                        #[cfg(target_os = "macos")]
+                        reattach_visible_plugin_panels(window.app_handle());
                         schedule_suspended_utility_restore(window.app_handle());
+                        palette_first_paint::release_held(window.app_handle());
                     }
                     _ => {}
                 }
                 return;
+            }
+
+            if window.label().starts_with("toolset-popover-")
+                && matches!(event, WindowEvent::Destroyed)
+            {
+                toolset_popover_command_sources().remove(window.label());
             }
 
             // Owned windows may finish unminimizing after their owner's Resized event.
@@ -1291,8 +1619,12 @@ pub fn run() {
                     .closed(window.label());
             }
 
-            // Focused is queued by Tao and may describe an older activation by delivery.
-            // Lease ownership is observed synchronously at the OS boundary instead.
+            #[cfg(target_os = "linux")]
+            if is_input_focus_window_label(window.label()) {
+                if let WindowEvent::Focused(active) = event {
+                    panel_window::linux::focus_changed(window, *active);
+                }
+            }
             if is_input_focus_window_label(window.label())
                 && matches!(event, WindowEvent::Destroyed)
             {
@@ -1362,12 +1694,11 @@ pub fn run() {
             }
 
             match event {
-                // Minimizing the document minimizes its owned palettes too, and Windows parks a
-                // minimized window far off-screen and reports that as a Moved. Persisting it saved
-                // the palettes at (-16000, -16000), so the next launch clamped them to the screen
-                // corner. Like persist_main_window_geometry, minimized frames are not user frames.
-                WindowEvent::Moved(_) if toolset_frame_is_transient(app, window) => {}
-                WindowEvent::Moved(position) => {
+                WindowEvent::Moved(_) => {
+                    // A queued Moved can arrive after a hide or report an older position.
+                    let Some(position) = visible_toolset_physical_position(window) else {
+                        return;
+                    };
                     if !UTILITY_SUSPENSION
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1375,20 +1706,20 @@ pub fn run() {
                     {
                         return;
                     }
-                    let logical_position = logical_toolset_position_from_physical(
-                        position.x as f64,
-                        position.y as f64,
-                        window.scale_factor().unwrap_or(1.0),
-                    );
                     if let Err(error) = persist_toolset_position(
                         app,
                         &toolset_id,
-                        logical_position.x,
-                        logical_position.y,
+                        position,
+                        window.scale_factor().unwrap_or(1.0),
                     ) {
                         eprintln!(
                             "Could not persist ChemDraft toolset position {toolset_id}: {error}"
                         );
+                    }
+                }
+                WindowEvent::Resized(_) if toolset_is_resizable(&toolset_id) => {
+                    if let Err(error) = persist_toolset_size(window, &toolset_id) {
+                        eprintln!("Could not persist ChemDraft toolset size {toolset_id}: {error}");
                     }
                 }
                 WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed => {
@@ -1405,80 +1736,31 @@ pub fn run() {
                 _ => {}
             }
         })
-        .setup(|app| {
-            let app = app.handle();
-            panel_window::observe_document_pointer_release(app);
-            // Programmatic panel removal hides a reusable window, so it produces neither
-            // CloseRequested nor Destroyed. Cancel its native restore work via the same bridge
-            // messages that clear the report and notify the host of a panel's close control.
-            for event in [PLUGIN_PANEL_REPORT_CLEARED_EVENT, PLUGIN_PANEL_CLOSED_EVENT] {
-                app.listen(event, |event| {
-                    cancel_plugin_panel_restore(&UTILITY_SUSPENSION, event.payload());
-                });
-            }
-            problem_reports::install_panic_hook(app);
+        .setup(move |app| {
+            app.add_capability(
+                r#"{"identifier":"document-window-title","webviews":["main"],"permissions":["core:window:allow-set-title"]}"#,
+            )?;
             #[cfg(target_os = "macos")]
-            if let Err(error) = macos_quit::install(app) {
-                eprintln!("Could not install ChemDraft AppKit quit handler: {error}");
-            }
-            let ocsr = app.state::<ocsr_engine::OcsrEngineState>();
-            ocsr.start_idle_reaper();
-            ocsr.remove_stale_staging(app);
-            external_tools::setup(app);
-            let naming = app.state::<naming_engine::NamingEngineState>();
-            naming.start_idle_reaper();
-            naming.remove_stale_staging(app);
-            // The Toolbars menu starts empty and is filled by JS (set_toolbars_menu) once the main
-            // window loads; Rust no longer parses the manifest or applies customization for it.
-            // Activation policy is a macOS Dock concept; other platforms have no equivalent.
-            #[cfg(target_os = "macos")]
-            if let Err(error) = app.set_activation_policy(tauri::ActivationPolicy::Regular) {
-                eprintln!("Could not set ChemDraft activation policy: {error}");
-            }
-
-            #[cfg(not(target_os = "macos"))]
-            if let Err(error) = create_app_menu(app).and_then(|menu| install_app_menu(app, menu)) {
-                eprintln!("Could not install the ChemDraft menu: {error}");
-            }
-
-            if let Err(error) = ensure_main_window_visible(app) {
-                eprintln!("Could not show ChemDraft main window: {error}");
-            }
-
-            if let Err(error) = focus_main_document_window_impl(app, MainWindowFocusMode::Force) {
-                eprintln!("Could not focus ChemDraft document window: {error}");
-            }
-
-            // Palettes never become key, so hover must be fed to their webviews (see
-            // start_palette_pointer_feed's doc for why the OS won't deliver it).
-            start_palette_pointer_feed(app.clone());
-
-            #[cfg(target_os = "macos")]
-            observe_hide_for_document_key_restore(app.clone());
-
-            // The tooltip window is NOT built here: a palette prewarms it once it has painted
-            // (prewarm_toolset_tooltip). Building it in setup put a hidden webview ahead of every
-            // palette in the queue for window creation.
-
-            app.state::<PendingOpenDocument>()
-                .setup_completed
-                .store(true, Ordering::SeqCst);
-
-            // Off macOS a document opened from the shell arrives as a launch argument. Keep the
-            // existing queue-and-emit behavior, now that setup and the config window are ready.
-            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
-            if let Ok(cwd) = std::env::current_dir() {
-                let args = std::env::args_os()
-                    .skip(1)
-                    .map(|arg| arg.to_string_lossy().into_owned());
-                if let Err(error) = handle_opened_document_args(app, args, &cwd) {
-                    eprintln!("Could not open ChemDraft document from launch arguments: {error}");
+            {
+                if let Err(error) = macos_quit::install(app.handle(), setup_secondary) {
+                    eprintln!("Could not install ChemDraft AppKit quit handler: {error}");
+                }
+                if collecting_launch {
+                    return Ok(());
                 }
             }
-
-            Ok(())
+            setup_primary_app(app.handle())
         })
         .invoke_handler(tauri::generate_handler![
+            first_paint::window_first_paint,
+            canvas_context_menu::popup_canvas_context_menu,
+            file_warnings_window::file_warnings_open,
+            file_warnings_window::file_warnings_request,
+            file_warnings_window::file_warnings_publish,
+            file_warnings_window::file_warnings_ready,
+            file_warnings_window::file_warnings_action,
+            file_warnings_window::file_warnings_close,
+            file_warnings_window::file_warnings_dismiss,
             assistant_mcp::assistant_mcp_session_open,
             assistant_mcp::assistant_mcp_session_close,
             assistant_mcp::assistant_mcp_respond,
@@ -1539,6 +1821,8 @@ pub fn run() {
             show_toolset_tooltip_window,
             hide_toolset_tooltip_window,
             set_current_window_global_position,
+            clamp_current_inspector_frame,
+            resize_toolset_window,
             monitor_query::current_window_logical_work_area,
             monitor_query::monitor_logical_bounds_at,
             start_window_drag,
@@ -1562,6 +1846,7 @@ pub fn run() {
             toggle_preferences_window,
             dialog_windows::preferences_ready,
             window_logical_position,
+            canvas_occlusion::document_canvas_occlusion,
             agent_bridge_status,
             palette_focus_diagnostic,
             perf_log::perf_log_clock,
@@ -1599,11 +1884,31 @@ pub fn run() {
             export::rasterize_svg,
             fonts::list_system_fonts
         ])
-        .build(tauri::generate_context!())
-        .expect("error while building ChemDraft")
-        .run(|app, event| match event {
+        .build(context)
+        .expect("error while building ChemDraft");
+    #[cfg(target_os = "macos")]
+    let app = {
+        let mut app = app;
+        if collecting_launch {
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+        }
+        app
+    };
+    app.run(move |app, event| {
+        #[cfg(target_os = "macos")]
+        if secondary
+            .as_ref()
+            .is_some_and(|launch| launch.handle_event(app, &event, start_macos_primary))
+        {
+            return;
+        }
+        match event {
+            RunEvent::MainEventsCleared => canvas_context_menu::events_cleared(app),
             RunEvent::ExitRequested { code, api, .. } => {
-                if should_flush_exit_request(
+                if windows_session_end::in_progress() || linux_session_end::blocks_exit() {
+                    // A queued app quit must give the committed OS flush time to finish.
+                    api.prevent_exit();
+                } else if should_flush_exit_request(
                     cfg!(target_os = "macos"),
                     code,
                     APP_QUITTING.load(Ordering::SeqCst),
@@ -1624,6 +1929,8 @@ pub fn run() {
             RunEvent::Exit => {
                 // AppKit quit decisions are handled before this final cleanup.
                 APP_QUITTING.store(true, Ordering::SeqCst);
+                #[cfg(target_os = "macos")]
+                macos_single_instance::renderer_exiting(app);
                 panel_full_size::restore_all(app);
                 app.state::<ocsr_engine::OcsrEngineState>().shutdown();
                 external_tools::shutdown(app);
@@ -1649,7 +1956,118 @@ pub fn run() {
                 }
             }
             _ => {}
+        }
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn start_macos_primary(
+    app: &tauri::AppHandle,
+    guard: macos_single_instance::InstanceLock,
+) -> Result<(), Box<dyn std::error::Error>> {
+    app.plugin(macos_single_instance::plugin(
+        guard,
+        handle_macos_second_launch,
+    ))?;
+    app.plugin(tauri_plugin_sparkle_updater::init())?;
+    install_app_menu(app, create_app_menu(app)?)?;
+
+    create_main_window(app)?;
+    setup_primary_app(app)
+}
+
+fn setup_primary_app(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    if let Err(error) = windows_session_end::install(app) {
+        eprintln!("Could not install ChemDraft session-end handler: {error}");
+    }
+    #[cfg(target_os = "linux")]
+    if let Err(error) = linux_session_end::install(app) {
+        eprintln!("Could not install ChemDraft Linux termination handlers: {error}");
+    }
+    panel_window::observe_document_pointer_release(app);
+    file_warnings_window::observe_document(app)?;
+    // Programmatic panel removal hides a reusable window, so it produces neither
+    // CloseRequested nor Destroyed. Cancel its native restore work via the same bridge
+    // messages that clear the report and notify the host of a panel's close control.
+    for event in [PLUGIN_PANEL_REPORT_CLEARED_EVENT, PLUGIN_PANEL_CLOSED_EVENT] {
+        app.listen(event, |event| {
+            cancel_plugin_panel_restore(&UTILITY_SUSPENSION, event.payload());
         });
+    }
+    problem_reports::install_panic_hook(app);
+    let ocsr = app.state::<ocsr_engine::OcsrEngineState>();
+    ocsr.start_idle_reaper();
+    ocsr.remove_stale_staging(app);
+    external_tools::setup(app);
+    let naming = app.state::<naming_engine::NamingEngineState>();
+    naming.start_idle_reaper();
+    naming.remove_stale_staging(app);
+    // The Toolbars menu starts empty and is filled by JS (set_toolbars_menu) once the main
+    // window loads; Rust no longer parses the manifest or applies customization for it.
+    // Activation policy is a macOS Dock concept; other platforms have no equivalent.
+    #[cfg(target_os = "macos")]
+    if let Err(error) = app.set_activation_policy(tauri::ActivationPolicy::Regular) {
+        eprintln!("Could not set ChemDraft activation policy: {error}");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    if let Err(error) = create_app_menu(app).and_then(|menu| install_app_menu(app, menu)) {
+        eprintln!("Could not install the ChemDraft menu: {error}");
+    }
+
+    if let Err(error) = ensure_main_window_visible(app) {
+        eprintln!("Could not show ChemDraft main window: {error}");
+    }
+
+    if let Err(error) = focus_main_document_window_impl(app, MainWindowFocusMode::Force) {
+        eprintln!("Could not focus ChemDraft document window: {error}");
+    }
+
+    // Palettes never become key, so hover must be fed to their webviews (see
+    // start_palette_pointer_feed's doc for why the OS won't deliver it).
+    start_palette_pointer_feed(app.clone());
+
+    #[cfg(target_os = "macos")]
+    observe_hide_for_document_key_restore(app.clone());
+
+    // The tooltip window is NOT built here: a palette prewarms it once it has painted
+    // (prewarm_toolset_tooltip). Building it in setup put a hidden webview ahead of every
+    // palette in the queue for window creation.
+
+    app.state::<PendingOpenDocument>()
+        .setup_completed
+        .store(true, Ordering::SeqCst);
+
+    // Off macOS a document opened from the shell arrives as a launch argument. Keep the
+    // existing queue-and-emit behavior, now that setup and the config window are ready.
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
+    if let Ok(cwd) = std::env::current_dir() {
+        let args = std::env::args_os()
+            .skip(1)
+            .map(|arg| arg.to_string_lossy().into_owned());
+        if let Err(error) = handle_opened_document_args(app, args, &cwd) {
+            eprintln!("Could not open ChemDraft document from launch arguments: {error}");
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if let Err(error) = handle_opened_document_paths(
+        app,
+        app.state::<linux_startup::Startup>()
+            .documents
+            .iter()
+            .filter(|path| is_openable_document_path(path))
+            .cloned(),
+    ) {
+        eprintln!("Could not open ChemDraft document from launch arguments: {error}");
+        show_open_document_error(app, &error);
+    }
+
+    Ok(())
 }
 
 // Must match appUpdateChannelNotice in apps/desktop/src/appUpdates.ts.
@@ -1766,10 +2184,9 @@ fn ensure_main_window_visible<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<(
     let already_on_screen = window.is_visible().unwrap_or(false);
     main_window_placement::reveal_after_preparation(
         |errors| {
-            // Tauri auto-creates the config "main" window at startup (title "ChemDraft" from tauri.conf.json),
-            // so create_main_window's set_title never runs on that path — apply the worktree-labeled title
-            // here on the window we actually resolved, so every worktree's window is distinguishable.
-            errors.record("set title", window.set_title(&main_window_title()));
+            // The auto-created window starts with the config title. On subsequent reveals the
+            // active document's title is already set.
+            errors.record("set title", set_startup_title(&window.as_ref().window()));
             errors.record("set decorations", window.set_decorations(true));
             errors.record("configure webview", configure_document_webview(&window));
             errors.record("set focusable", window.set_focusable(true));
@@ -1785,7 +2202,10 @@ fn ensure_main_window_visible<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<(
             let geometry = if keep_frame {
                 None
             } else {
-                load_toolset_layout_state(app).main_window
+                let latest = *LATEST_MAIN_WINDOW_GEOMETRY
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                latest.for_restore(|| load_toolset_layout_state(app).main_window)
             };
             match main_window_frame_action(keep_frame, geometry.is_some()) {
                 MainWindowFrameAction::Keep => false,
@@ -1833,10 +2253,15 @@ fn configure_document_webview<R: Runtime>(window: &tauri::WebviewWindow<R>) -> R
 enum MainWindowFocusMode {
     Force,
     OnlyIfAppActive,
+    RestoreForPreferences,
 }
 
 fn should_raise_main_window(mode: MainWindowFocusMode, foreground_is_ours: bool) -> bool {
-    matches!(mode, MainWindowFocusMode::Force) || foreground_is_ours
+    !matches!(mode, MainWindowFocusMode::OnlyIfAppActive) || foreground_is_ours
+}
+
+fn should_focus_main_window(mode: MainWindowFocusMode) -> bool {
+    !matches!(mode, MainWindowFocusMode::RestoreForPreferences)
 }
 
 #[cfg(windows)]
@@ -1865,7 +2290,18 @@ fn foreground_belongs_to_app() -> bool {
         .is_some_and(|mtm| objc2_app_kit::NSApplication::sharedApplication(mtm).isActive())
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(target_os = "linux")]
+fn foreground_belongs_to_app() -> bool {
+    use gtk::prelude::*;
+    gtk::is_initialized_main_thread()
+        && gtk::Window::list_toplevels().iter().any(|widget| {
+            widget
+                .downcast_ref::<gtk::Window>()
+                .is_some_and(|window| window.has_toplevel_focus())
+        })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn foreground_belongs_to_app() -> bool {
     false
 }
@@ -1885,6 +2321,11 @@ fn focus_main_document_window_impl<R: Runtime>(
         .get_webview_window(MAIN_WINDOW_LABEL)
         .ok_or_else(|| "Main document window is not available.".to_string())?;
 
+    if !should_focus_main_window(mode) {
+        clear_document_key_after_unhide_for_preferences();
+        restore_main_document_window_without_focus(&window)?;
+        return Ok(true);
+    }
     window
         .set_focusable(true)
         .map_err(|error| error.to_string())?;
@@ -1896,6 +2337,211 @@ fn focus_main_document_window_impl<R: Runtime>(
     focus_native_document_window(&window)?;
     window.set_focus().map_err(|error| error.to_string())?;
     Ok(true)
+}
+
+#[cfg(any(windows, test))]
+trait WindowEnabledState {
+    fn is_enabled(&self) -> Result<bool, String>;
+    fn set_enabled(&self, enabled: bool) -> Result<(), String>;
+}
+
+#[cfg(windows)]
+impl<R: Runtime> WindowEnabledState for tauri::WebviewWindow<R> {
+    fn is_enabled(&self) -> Result<bool, String> {
+        tauri::WebviewWindow::is_enabled(self).map_err(|error| error.to_string())
+    }
+
+    fn set_enabled(&self, enabled: bool) -> Result<(), String> {
+        tauri::WebviewWindow::set_enabled(self, enabled).map_err(|error| error.to_string())
+    }
+}
+
+/// Restores the prior enabled state even if owner restoration exits early or unwinds.
+#[cfg(any(windows, test))]
+struct WindowEnabledGuard<'a, W: WindowEnabledState> {
+    window: &'a W,
+    restore_enabled: Option<bool>,
+}
+
+#[cfg(any(windows, test))]
+impl<'a, W: WindowEnabledState> WindowEnabledGuard<'a, W> {
+    fn disable(window: &'a W) -> Result<Self, String> {
+        let enabled = window.is_enabled()?;
+        window.set_enabled(false)?;
+        // Arm immediately after a successful disable; no fallible work may intervene.
+        Ok(Self {
+            window,
+            restore_enabled: Some(enabled),
+        })
+    }
+
+    fn restore(&mut self) -> Result<(), String> {
+        if let Some(enabled) = self.restore_enabled {
+            self.window.set_enabled(enabled)?;
+            self.restore_enabled = None;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(windows, test))]
+impl<W: WindowEnabledState> Drop for WindowEnabledGuard<'_, W> {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            eprintln!("ChemDraft: could not restore document window enabled state: {error}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod window_enabled_guard_tests {
+    use super::{WindowEnabledGuard, WindowEnabledState};
+    use std::cell::{Cell, RefCell};
+
+    struct FakeWindow {
+        enabled: Cell<bool>,
+        fail_next_set: Cell<bool>,
+        set_calls: RefCell<Vec<bool>>,
+    }
+
+    impl FakeWindow {
+        fn new(enabled: bool) -> Self {
+            Self {
+                enabled: Cell::new(enabled),
+                fail_next_set: Cell::new(false),
+                set_calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl WindowEnabledState for FakeWindow {
+        fn is_enabled(&self) -> Result<bool, String> {
+            Ok(self.enabled.get())
+        }
+
+        fn set_enabled(&self, enabled: bool) -> Result<(), String> {
+            self.set_calls.borrow_mut().push(enabled);
+            if self.fail_next_set.replace(false) {
+                return Err("set_enabled failed".into());
+            }
+            self.enabled.set(enabled);
+            Ok(())
+        }
+    }
+
+    fn restore_owner(
+        window: &FakeWindow,
+        skip_restore: bool,
+        restore: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut guard = WindowEnabledGuard::disable(window)?;
+        assert!(!window.enabled.get());
+        if skip_restore {
+            return Ok(());
+        }
+        restore()?;
+        guard.restore()
+    }
+
+    #[test]
+    fn restores_prior_enabled_state_after_success() {
+        for enabled in [true, false] {
+            let window = FakeWindow::new(enabled);
+            assert!(restore_owner(&window, false, || Ok(())).is_ok());
+            assert_eq!(window.enabled.get(), enabled);
+            assert_eq!(*window.set_calls.borrow(), [false, enabled]);
+        }
+    }
+
+    #[test]
+    fn restores_prior_enabled_state_after_restore_error() {
+        for enabled in [true, false] {
+            let window = FakeWindow::new(enabled);
+            let result = restore_owner(&window, false, || Err("owner restore failed".into()));
+            assert_eq!(result, Err("owner restore failed".into()));
+            assert_eq!(window.enabled.get(), enabled);
+            assert_eq!(*window.set_calls.borrow(), [false, enabled]);
+        }
+    }
+
+    #[test]
+    fn restores_prior_enabled_state_after_early_return() {
+        for enabled in [true, false] {
+            let window = FakeWindow::new(enabled);
+            assert!(restore_owner(&window, true, || panic!("must return early")).is_ok());
+            assert_eq!(window.enabled.get(), enabled);
+            assert_eq!(*window.set_calls.borrow(), [false, enabled]);
+        }
+    }
+
+    #[test]
+    fn restores_prior_enabled_state_after_panic() {
+        for enabled in [true, false] {
+            let window = FakeWindow::new(enabled);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                restore_owner(&window, false, || panic!("owner restore panicked"))
+            }));
+            assert!(result.is_err());
+            assert_eq!(window.enabled.get(), enabled);
+            assert_eq!(*window.set_calls.borrow(), [false, enabled]);
+        }
+    }
+
+    #[test]
+    fn failed_disable_leaves_state_unchanged_and_does_not_arm_guard() {
+        for enabled in [true, false] {
+            let window = FakeWindow::new(enabled);
+            window.fail_next_set.set(true);
+            assert!(WindowEnabledGuard::disable(&window).is_err());
+            assert_eq!(window.enabled.get(), enabled);
+            assert_eq!(*window.set_calls.borrow(), [false]);
+        }
+    }
+
+    #[test]
+    fn failed_explicit_reenable_returns_error_and_drop_retries() {
+        let window = FakeWindow::new(true);
+        let result = restore_owner(&window, false, || {
+            window.fail_next_set.set(true);
+            Ok(())
+        });
+        assert_eq!(result, Err("set_enabled failed".into()));
+        assert!(window.enabled.get());
+        assert_eq!(*window.set_calls.borrow(), [false, true, true]);
+    }
+}
+
+/// Main-thread-only. Tauri's show() makes the document key on macOS, and its Windows
+/// unminimize path can activate the owner. Preferences needs only a restored, visible owner.
+fn restore_main_document_window_without_focus<R: Runtime>(
+    window: &tauri::WebviewWindow<R>,
+) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let ptr = window.ns_window().map_err(|error| error.to_string())? as *mut NSWindow;
+        let native =
+            unsafe { ptr.as_ref() }.ok_or("Could not access native ChemDraft document window.")?;
+        if native.isMiniaturized() {
+            native.deminiaturize(None);
+        }
+        native.orderFront(None);
+        reattach_visible_plugin_panels(window.app_handle());
+    }
+    #[cfg(windows)]
+    {
+        // A disabled HWND cannot receive focus. Use Tauri for restoration so Tao's cached
+        // visible/minimized flags stay in sync, and always restore the prior enabled state.
+        let mut enabled_guard = WindowEnabledGuard::disable(window)?;
+        window.unminimize().map_err(|error| error.to_string())?;
+        window.show().map_err(|error| error.to_string())?;
+        enabled_guard.restore()?;
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        window.unminimize().map_err(|error| error.to_string())?;
+        window.show().map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1929,6 +2575,17 @@ fn main_window_title() -> String {
     window_title_for(option_env!("CHEMDRAFT_WORKTREE_LABEL"))
 }
 
+fn set_startup_title<R: Runtime>(window: &tauri::Window<R>) -> tauri::Result<()> {
+    if needs_initial_main_window_title(&window.title()?) {
+        window.set_title(&main_window_title())?;
+    }
+    Ok(())
+}
+
+fn needs_initial_main_window_title(current_title: &str) -> bool {
+    matches!(current_title, "" | "ChemDraft")
+}
+
 fn window_title_for(label: Option<&str>) -> String {
     match label {
         Some(label) if !label.trim().is_empty() => format!("ChemDraft — {}", label.trim()),
@@ -1938,7 +2595,7 @@ fn window_title_for(label: Option<&str>) -> String {
 
 #[cfg(test)]
 mod window_title_tests {
-    use super::window_title_for;
+    use super::{needs_initial_main_window_title, window_title_for};
 
     #[test]
     fn unlabeled_builds_get_the_plain_title() {
@@ -1954,6 +2611,18 @@ mod window_title_tests {
             "ChemDraft — chemdraw [x]"
         );
         assert_eq!(window_title_for(Some(" a [b] ")), "ChemDraft — a [b]");
+    }
+
+    #[test]
+    fn revealing_the_window_preserves_the_document_title() {
+        assert!(needs_initial_main_window_title(""));
+        assert!(needs_initial_main_window_title("ChemDraft"));
+        assert!(!needs_initial_main_window_title(
+            "Probe A.chemdraft — ChemDraft"
+        ));
+        assert!(!needs_initial_main_window_title(
+            "Probe A.chemdraft • — ChemDraft — worktree [branch]"
+        ));
     }
 }
 
@@ -2277,7 +2946,10 @@ async fn suspend_toolset_windows(
             }
             Ok(())
         } else {
-            restore_suspended_utility_windows(&app)?;
+            let restored = restore_suspended_utility_windows(&app);
+            // A palette whose first paint arrived during the suspension was held; show it now.
+            palette_first_paint::release_held(&app);
+            restored?;
             if let Some(session_id) = focus_export_session_id {
                 dialog_windows::focus_export_after_picker(&app, &session_id)?;
             }
@@ -2321,7 +2993,12 @@ fn schedule_suspended_utility_restore<R: Runtime>(app: &tauri::AppHandle<R>) {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .pending_restore();
-            restore_utility_labels(&app, labels)
+            let restored = restore_utility_labels(&app, labels);
+            // This restoration is what clears a suspension whose prompt ended while the document
+            // was minimized; the restore event's own retry ran while it was still active. Retry
+            // the held first-paint reveals now that it may have cleared.
+            palette_first_paint::release_held(&app);
+            restored
         });
         if let Err(error) = result
             .and_then(|result| result)
@@ -2396,9 +3073,9 @@ fn restore_utility_labels<R: Runtime>(
         if window.is_minimized().unwrap_or(true) {
             continue;
         }
-        if toolset_id_for_window_label(app, &label).is_some() {
+        if let Some(toolset_id) = toolset_id_for_window_label(app, &label) {
             buffer_utility_recovery_position(&window);
-            recover_offscreen_toolset_window(app, &window);
+            recover_offscreen_toolset_window(app, &window, toolset_is_resizable(&toolset_id));
         }
         if dialog_windows::is_dialog_label(&label) {
             dialog_windows::mark_transient(&label);
@@ -2480,6 +3157,9 @@ fn restore_utility_in_document_group<R: Runtime>(
     };
     let anchor =
         anchor.ok_or_else(|| "ChemDraft utility restore anchor disappeared.".to_string())?;
+    if is_plugin_panel_window_label(window.label()) {
+        recover_hidden_plugin_panel_frame(window, None)?;
+    }
     restore_utility_window(window, &main, &anchor, below)
 }
 
@@ -2510,14 +3190,14 @@ fn restore_utility_window<R: Runtime>(
             anchor.ns_window().map_err(|error| error.to_string())? as *mut NSWindow;
         let anchor = unsafe { anchor_pointer.as_ref() }
             .ok_or_else(|| "Could not access native ChemDraft restore anchor.".to_string())?;
-        // Ordering out can detach children. Preserve recorded relationships for original windows;
-        // newly deferred windows use the normal creation policy (panels parented, toolbars and
-        // dialogs unparented). Dialogs must never inherit the document's normal window level.
+        // Ordering out can detach children. Reports belong to the now-visible document, even
+        // when they first opened while it was hidden. Preserve other recorded relationships.
         // Both children and unparented utilities use the retained relative stacking position below.
-        let restore_as_document_child = UTILITY_SUSPENSION
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .restore_as_document_child(window.label());
+        let restore_as_document_child = is_plugin_panel_window_label(window.label())
+            || UTILITY_SUSPENSION
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .restore_as_document_child(window.label());
         if restore_as_document_child
             && native
                 .parentWindow()
@@ -2596,10 +3276,7 @@ fn restore_utility_window<R: Runtime>(
 const QUITTING_WINDOW_REFUSAL: &str = "ChemDraft is quitting; no new windows";
 
 /// What a second launch, forwarded here by the single-instance lock, does to this process.
-#[cfg_attr(
-    any(target_os = "macos", target_os = "ios", target_os = "android"),
-    allow(dead_code)
-)]
+#[cfg_attr(any(target_os = "ios", target_os = "android"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SecondLaunchAction {
     /// Open its documents and bring the document window up.
@@ -2608,18 +3285,12 @@ enum SecondLaunchAction {
     OpenOnly,
     /// This process is quitting. Opening a document into it, or showing (even rebuilding) the
     /// document window, would be lost with the process and would hold the main thread the quit is
-    /// waiting on. The exit is at most the flush plus `EXIT_WATCHDOG` away, and a launch after it
-    /// starts a fresh process; one made inside that window is lost, as the log line says. While a
-    /// window build holds the main thread this callback cannot run at all: the plugin's handoff
-    /// (a blocking WM_COPYDATA) waits until this process ends, then the second process exits, so
-    /// that launch is lost too, without the log line (measured on Windows).
+    /// waiting on. macOS refuses the handoff so the second process can wait for the lock.
+    /// Windows keeps the single-instance plugin's WM_COPYDATA behavior.
     IgnoreWhileQuitting,
 }
 
-#[cfg_attr(
-    any(target_os = "macos", target_os = "ios", target_os = "android"),
-    allow(dead_code)
-)]
+#[cfg_attr(any(target_os = "ios", target_os = "android"), allow(dead_code))]
 fn second_launch_action(quitting: bool, setup_completed: bool) -> SecondLaunchAction {
     if quitting {
         SecondLaunchAction::IgnoreWhileQuitting
@@ -2630,10 +3301,157 @@ fn second_launch_action(quitting: bool, setup_completed: bool) -> SecondLaunchAc
     }
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+fn handle_second_launch<R: Runtime>(app: &tauri::AppHandle<R>, argv: Vec<String>, cwd: String) {
+    let result = handle_second_launch_with(app, || {
+        handle_opened_document_args(app, argv.into_iter().skip(1), Path::new(&cwd))
+    });
+    #[cfg(target_os = "linux")]
+    if let Some(Err(error)) = &result {
+        show_open_document_error(app, error);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = result;
+}
+
+#[cfg(target_os = "macos")]
+fn handle_macos_second_launch(
+    app: &tauri::AppHandle,
+    launch: macos_single_instance::LaunchRequest,
+    reply: macos_single_instance::Reply,
+) {
+    use macos_single_instance::Acknowledgement;
+    let ready = app
+        .state::<PendingOpenDocument>()
+        .setup_completed
+        .load(Ordering::SeqCst);
+    if second_launch_action(QUIT.refuses_macos_launch(), ready) != SecondLaunchAction::OpenAndShow {
+        reply.finish(
+            Acknowledgement::Refused,
+            "ChemDraft is starting or quitting.",
+        );
+        return;
+    }
+    // Refusal is only valid before queuing anything. After this point a failure is
+    // definitive or ambiguous, and the secondary must not resend to the same owner.
+    if let Err(error) = ensure_main_window_visible(app) {
+        reply.finish(Acknowledgement::Failed, &error);
+        return;
+    }
+    if let Err(error) = focus_main_document_window_impl(app, MainWindowFocusMode::Force) {
+        eprintln!("Could not focus ChemDraft document window for a second launch: {error}");
+    }
+    open_macos_launch(app, &launch, reply);
+}
+
+#[cfg(target_os = "macos")]
+fn open_macos_launch(
+    app: &tauri::AppHandle,
+    launch: &macos_single_instance::LaunchRequest,
+    reply: macos_single_instance::Reply,
+) {
+    use macos_single_instance::Acknowledgement;
+    if QUIT.refuses_macos_launch() {
+        reply.finish(Acknowledgement::Refused, "ChemDraft is quitting.");
+        return;
+    }
+    let (mut opened, mut errors) = read_opened_documents(forwarded_document_payloads(launch));
+    if !errors.is_empty() {
+        if !opened.is_empty() {
+            if let Err(error) = deliver_opened_document(app, opened) {
+                errors.push(error);
+            }
+        }
+        reply.finish(Acknowledgement::Failed, &errors.join("\n"));
+    } else if opened.is_empty() {
+        reply.finish(Acknowledgement::Accepted, "");
+    } else {
+        let id = macos_single_instance::track_renderer_open(app, &mut opened, reply);
+        if let Err(error) = deliver_opened_document(app, opened) {
+            macos_single_instance::fail_renderer_open(app, id, &error);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn forwarded_document_payloads(
+    launch: &macos_single_instance::LaunchRequest,
+) -> impl Iterator<Item = Result<NativeOpenDocumentPayload, String>> {
+    let event_paths: std::collections::HashSet<_> = launch
+        .urls
+        .iter()
+        .filter_map(|url| url.to_file_path().ok())
+        .collect();
+    let cwd = Path::new(&launch.cwd);
+    let arg_paths: Vec<_> = launch
+        .argv
+        .iter()
+        .skip(1)
+        .filter(|arg| !arg.starts_with('-'))
+        .map(|arg| cwd.join(arg))
+        .filter(|path| has_document_extension(path) || is_openable_document_path(path))
+        .collect();
+    // Preserve the native event batch. Some callers can also supply the same file in argv.
+    opened_document_payloads_from_urls(launch.urls.clone()).chain(
+        arg_paths
+            .into_iter()
+            .filter(move |path| !event_paths.contains(path))
+            .map(|path| open_document_payload_from_path(&path)),
+    )
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+fn handle_second_launch_with<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    open: impl FnOnce() -> Result<(), String>,
+) -> Option<Result<(), String>> {
+    let setup_completed = app
+        .state::<PendingOpenDocument>()
+        .setup_completed
+        .load(Ordering::SeqCst);
+    let action = second_launch_action(quit_in_progress(), setup_completed);
+    if action == SecondLaunchAction::IgnoreWhileQuitting {
+        eprintln!(
+            "ChemDraft: a second launch arrived while quitting; ignored (this process is exiting)"
+        );
+        return None;
+    }
+    let result = open();
+    if let Err(error) = &result {
+        eprintln!("Could not open ChemDraft document from a second launch: {error}");
+    }
+    if action == SecondLaunchAction::OpenOnly {
+        return Some(result);
+    }
+    if let Err(error) = ensure_main_window_visible(app) {
+        eprintln!("Could not show ChemDraft main window for a second launch: {error}");
+    }
+    if let Err(error) = focus_main_document_window_impl(app, MainWindowFocusMode::Force) {
+        eprintln!("Could not focus ChemDraft document window for a second launch: {error}");
+    }
+    Some(result)
+}
+
 /// Whether a quit has begun: off macOS a document-window close requests one, and the exit itself
 /// raises `APP_QUITTING` everywhere.
 fn quit_in_progress() -> bool {
-    QUIT.requested.load(Ordering::SeqCst) || APP_QUITTING.load(Ordering::SeqCst)
+    QUIT.in_progress()
+}
+
+/// The production Moved/Resized event path, shared with the stalled-writer regression. Queued
+/// events during the drain must not replace the explicit final capture with teardown geometry.
+fn on_main_window_geometry_event_with(
+    flow: &QuitFlow,
+    event: &WindowEvent,
+    persist: impl FnOnce(),
+) -> bool {
+    if !matches!(event, WindowEvent::Moved(_) | WindowEvent::Resized(_)) {
+        return false;
+    }
+    if !flow.in_progress() {
+        persist();
+    }
+    true
 }
 
 /// Takes the window-creation lock, and refuses once a quit has begun. A window built during a quit
@@ -2664,14 +3482,23 @@ async fn open_toolset_window(
     toolset_id: String,
     window: Option<ToolsetWindowGeometry>,
 ) -> Result<ToolsetWindowState, String> {
+    // Windows: recorded before waiting for the creation lock, so a close that arrives while this
+    // open waits, builds or arms wins over it (palette_first_paint.rs). No-op elsewhere.
+    palette_first_paint::requested(&toolset_window_label(&toolset_id));
     let _creation = lock_window_creation()?;
     if utility_windows_suspended() {
         return toolset_state(&app, &toolset_id);
     }
     ensure_toolset_window(&app, &toolset_id, window.as_ref())?;
-    set_toolset_menu_checked(&app, &toolset_id, true)?;
 
     let state = toolset_state(&app, &toolset_id)?;
+    // Windows: a palette closed while this open was in flight stays closed, menu item included.
+    // macOS and Linux check it as before.
+    set_toolset_menu_checked(
+        &app,
+        &toolset_id,
+        state.open || !palette_first_paint::tracks_palettes(),
+    )?;
     let _ = emit_toolset_window_state_to_main(&app, &state);
     Ok(state)
 }
@@ -2684,16 +3511,24 @@ fn close_toolset_window(
     if utility_windows_suspended() {
         return toolset_state(&app, &toolset_id);
     }
+    // Windows: before anything else, and whether or not the window exists yet, so an open still
+    // waiting for, building or arming its window does not show it afterwards (a later open does).
+    palette_first_paint::closed(&toolset_window_label(&toolset_id));
     let window = app.get_webview_window(&toolset_window_label(&toolset_id));
     if let Some(window) = window.as_ref() {
-        if let Some(position) = current_toolset_window_position(window) {
+        let webview: &tauri::Webview = window.as_ref();
+        if let Some(position) = visible_toolset_physical_position(&webview.window()) {
             // Best-effort, exactly like the `Moved` handler. Remembering where the palette was is
             // housekeeping; it must never be able to veto the close the user asked for. Once
             // `update_toolset_layout_state` began propagating read errors instead of swallowing
             // them as defaults, a `?` here meant an unreadable toolbar-state.json left the palette
             // on screen with its menu item still checked and no state event emitted.
-            if let Err(error) = persist_toolset_position(&app, &toolset_id, position.x, position.y)
-            {
+            if let Err(error) = persist_toolset_position(
+                &app,
+                &toolset_id,
+                position,
+                window.scale_factor().unwrap_or(1.0),
+            ) {
                 eprintln!(
                     "chemdraft: could not save the position of toolset {toolset_id}: {error}"
                 );
@@ -2711,8 +3546,24 @@ fn close_toolset_window(
     Ok(state)
 }
 
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum ToolsetWindowQueryResult {
+    States(Vec<ToolsetWindowState>),
+    Foreground(Option<String>),
+}
+
 #[tauri::command]
-fn list_toolset_window_states(app: tauri::AppHandle) -> Result<Vec<ToolsetWindowState>, String> {
+fn list_toolset_window_states(
+    app: tauri::AppHandle,
+    foreground_only: Option<bool>,
+) -> Result<ToolsetWindowQueryResult, String> {
+    if foreground_only == Some(true) {
+        let target = app.clone();
+        return run_on_main_thread_blocking(&app, move || foreground_app_window_label(&target))
+            .map(ToolsetWindowQueryResult::Foreground);
+    }
+
     // Report the state of every palette window we've opened this session (from the directory),
     // rather than scanning the manifest. The JS reconciler only cares about which are open.
     let toolset_ids: Vec<String> = {
@@ -2723,7 +3574,53 @@ fn list_toolset_window_states(app: tauri::AppHandle) -> Result<Vec<ToolsetWindow
     toolset_ids
         .iter()
         .map(|toolset_id| toolset_state(&app, toolset_id))
-        .collect()
+        .collect::<Result<_, _>>()
+        .map(ToolsetWindowQueryResult::States)
+}
+
+#[cfg(target_os = "macos")]
+fn foreground_app_window_label(app: &tauri::AppHandle) -> Option<String> {
+    let marker = MainThreadMarker::new()?;
+    let application = objc2_app_kit::NSApplication::sharedApplication(marker);
+    if !application.isActive() {
+        return None;
+    }
+    let key_window = application.keyWindow()?;
+    let key_ptr = objc2::rc::Retained::as_ptr(&key_window).cast::<std::ffi::c_void>();
+    app.webview_windows()
+        .into_iter()
+        .find_map(|(label, window)| {
+            window
+                .ns_window()
+                .is_ok_and(|pointer| pointer.cast_const() == key_ptr)
+                .then_some(label)
+        })
+}
+
+#[cfg(windows)]
+fn foreground_app_window_label(app: &tauri::AppHandle) -> Option<String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetAncestor, GetForegroundWindow, GA_ROOT};
+
+    // Foreground is sampled once. The parent chain maps a WebView2 child back to its host
+    // without following the owner of a separate foreground window.
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.is_null() {
+        return None;
+    }
+    let root = unsafe { GetAncestor(foreground, GA_ROOT) };
+    app.webview_windows()
+        .into_iter()
+        .find_map(|(label, window)| {
+            window
+                .hwnd()
+                .is_ok_and(|hwnd| hwnd.0 == foreground || hwnd.0 == root)
+                .then_some(label)
+        })
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn foreground_app_window_label(_app: &tauri::AppHandle) -> Option<String> {
+    None
 }
 
 /// Read a file, distinguishing "not there yet" (`Ok(None)`) from a genuine read failure (`Err`).
@@ -3409,9 +4306,9 @@ fn load_document_session(
 
 /// The working document's autosave (serialized contents + file association). JS owns the envelope
 /// and writes it on every edit so a relaunch resumes the last edited state; Rust just persists the
-/// opaque JSON, exactly like the toolbar customization state.
+/// opaque JSON. Async keeps session disk I/O off AppKit's reply queue.
 #[tauri::command]
-fn save_document_session(
+async fn save_document_session(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
     state: serde_json::Value,
@@ -3424,10 +4321,7 @@ fn save_document_session(
     write_file_atomic(&path, &contents)
 }
 
-/// JS pushes the Toolbars menu model (which toolsets exist, their titles, current visibility) and
-/// Rust rebuilds the app menu with that Toolbars submenu — so the menu's source of truth is the TS
-/// toolbar registry, not Rust's manifest copy. Runs on the main thread; per-toggle checkmark flips
-/// still go through set_menu_checked (in place, no rebuild).
+/// Apply the webview's toolbar rows and View state to the document menu on the UI thread.
 #[tauri::command]
 fn set_toolbars_menu(
     app: tauri::AppHandle,
@@ -3443,48 +4337,70 @@ fn set_toolbars_menu(
         crosshairs_visible,
         has_multiple_document_tabs: has_multiple_document_tabs.unwrap_or(false),
     };
-    // Remember the pushed model so plugin-menu syncs can rebuild the full menu from it later
-    // (reinstall_app_menu) without waiting for the next toolbar push. JS pushes on every toolbar
-    // visibility or rulers/crosshairs toggle; most pushes only move checkmarks, and a full rebuild
-    // swaps the whole menu bar (on Windows: two SetMenu calls, a resize of the document's client
-    // area and two layout-file writes), so only a structural change rebuilds.
-    let update = {
-        let state = app.state::<ToolbarsMenuModel>();
-        let mut guard = state.0.lock().map_err(|error| error.to_string())?;
-        let update = classify_toolbars_menu_update(&guard, &entries, view_state);
-        *guard = (entries.clone(), view_state);
-        update
-    };
-    if update == ToolbarsMenuUpdate::Unchanged {
-        return Ok(());
-    }
-    app.clone()
-        .run_on_main_thread(move || {
-            let result = if update == ToolbarsMenuUpdate::ChecksOnly {
-                entries
-                    .iter()
-                    .map(|entry| (toolset_toggle_command_id(&entry.toolset_id), entry.visible))
-                    .chain([
-                        ("view.toggleRulers".to_string(), view_state.rulers_visible),
-                        (
-                            "view.toggleCrosshairs".to_string(),
-                            view_state.crosshairs_visible,
-                        ),
-                    ])
-                    .try_for_each(|(command_id, checked)| {
-                        set_check_menu_item_checked_now(&app, &command_id, checked)
-                    })
-            } else {
-                let plugin_items = current_plugin_menu_items(&app);
-                create_app_menu_for_toolsets(&app, &entries, view_state, &plugin_items)
-                    .and_then(|menu| install_app_menu(&app, menu))
-                    .map_err(|error| error.to_string())
-            };
-            if let Err(error) = result {
-                eprintln!("Could not update ChemDraft toolbar menu: {error}");
-            }
-        })
-        .map_err(|error| error.to_string())
+    run_on_main_thread_blocking(&app.clone(), move || {
+        let previous = current_toolbars_menu_model(&app);
+        apply_menu_update(
+            &app.state::<NativeMenuNeedsRebuild>().0,
+            classify_toolbars_menu_update(&previous, &entries, view_state),
+            || {
+                let menu = installed_app_menu(&app)?;
+                for (old, new) in previous.0.iter().zip(&entries) {
+                    if old == new {
+                        continue;
+                    }
+                    let id = toolset_toggle_command_id(&new.toolset_id);
+                    let MenuItemKind::Check(item) = required_menu_item(&menu, &id)? else {
+                        return Err(format!("Expected a checkable toolbar menu item for {id}"));
+                    };
+                    if new.title != old.title {
+                        item.set_text(&new.title).map_err(|e| e.to_string())?;
+                    }
+                    item.set_checked(new.visible).map_err(|e| e.to_string())?;
+                }
+                for (id, old, new) in [
+                    (
+                        "view.toggleRulers",
+                        previous.1.rulers_visible,
+                        view_state.rulers_visible,
+                    ),
+                    (
+                        "view.toggleCrosshairs",
+                        previous.1.crosshairs_visible,
+                        view_state.crosshairs_visible,
+                    ),
+                ] {
+                    if old != new {
+                        let MenuItemKind::Check(item) = required_menu_item(&menu, id)? else {
+                            return Err(format!("Expected a checkable View menu item for {id}"));
+                        };
+                        item.set_checked(new).map_err(|e| e.to_string())?;
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                if previous.1.has_multiple_document_tabs != view_state.has_multiple_document_tabs {
+                    for id in [CLOSE_WINDOW_FILE_MENU_ID, CLOSE_WINDOW_WINDOW_MENU_ID] {
+                        let MenuItemKind::MenuItem(item) = required_menu_item(&menu, id)? else {
+                            return Err(format!("Expected a close menu item for {id}"));
+                        };
+                        item.set_text(close_menu_title(view_state.has_multiple_document_tabs))
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+                Ok(())
+            },
+            || {
+                reinstall_app_menu(
+                    &app,
+                    &entries,
+                    view_state,
+                    &current_plugin_menu_items(&app),
+                    current_keybinding_scheme(&app),
+                )
+            },
+        )?;
+        *app.state::<ToolbarsMenuModel>().0.lock().unwrap() = (entries, view_state);
+        Ok(())
+    })?
 }
 
 #[tauri::command]
@@ -3759,21 +4675,6 @@ struct OpenPluginPanelRequest {
     _focus: bool,
 }
 
-struct PanelWindowPresentation {
-    focused_on_build: bool,
-    visible_on_build: bool,
-}
-
-impl OpenPluginPanelRequest {
-    fn presentation(&self, deferred: bool) -> PanelWindowPresentation {
-        PanelWindowPresentation {
-            // Tao's Windows show mode is a lifetime creation trait, not the current focus state.
-            focused_on_build: false,
-            visible_on_build: !deferred,
-        }
-    }
-}
-
 /// The native window label for a panel id. Must be injective: `panel.a-b.c` and `panel.a.b-c` are
 /// different panels and must never share (and so replace or reveal) one window. Tauri labels allow
 /// `:` but not `.`, and panel ids never contain `:` (`is_valid_plugin_storage_id`), so swapping `.`
@@ -3936,6 +4837,7 @@ fn plugin_panel_event_forward(
         return run_on_main_thread_blocking(&window, move || {
             if !utility_windows_suspended()
                 && !panel_window::palette_blocks_forwarded_shortcut(
+                    target.label(),
                     &shortcut.key,
                     shortcut.meta_key,
                     shortcut.ctrl_key,
@@ -3991,6 +4893,17 @@ async fn set_plugin_panel_input_focus(
     select_interaction: Option<bool>,
 ) -> Result<bool, String> {
     validate_plugin_panel_focus_caller(window.label())?;
+    #[cfg(target_os = "linux")]
+    if editing {
+        return panel_window::linux::acquire(
+            window,
+            &page_token,
+            generation,
+            click_sequence,
+            pointer_before.unwrap_or(0),
+        )
+        .await;
+    }
     if is_plugin_panel_window_label(window.label()) {
         return set_plugin_panel_activation(window, page_token, editing, generation);
     }
@@ -4041,6 +4954,7 @@ async fn set_plugin_panel_input_focus(
                 );
                 return Ok(false);
             }
+            #[cfg(not(target_os = "linux"))]
             if editing {
                 let result = (|| -> Result<bool, String> {
                     // An acquisition dispatched before a hide can arrive afterwards.
@@ -4087,7 +5001,7 @@ async fn set_plugin_panel_input_focus(
                             return Ok(true);
                         }
                     }
-                    #[cfg(not(any(target_os = "macos", windows)))]
+                    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
                     {
                         target
                             .set_focusable(false)
@@ -4106,7 +5020,7 @@ async fn set_plugin_panel_input_focus(
                         &*(target.ns_window().map_err(|error| error.to_string())? as *mut NSWindow)
                     }
                     .isKeyWindow());
-                    #[cfg(not(any(target_os = "macos", windows)))]
+                    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
                     target.is_focused().map_err(|error| error.to_string())
                 })();
                 let held = panel_window::acquired(
@@ -4129,33 +5043,31 @@ async fn set_plugin_panel_input_focus(
                 if !held && panel_window::is_current(&target, generation, epoch) {
                     let _ = target.set_focusable(false);
                 }
-                result.map(|_| held)
-            } else {
-                panel_window::end_pointer_guard(
-                    target.app_handle(),
-                    target.label(),
-                    panel_window::PointerGuardEnd::Released,
-                    click_sequence,
-                    before,
-                );
-                // Hand back before disabling key eligibility: AppKit can resign a panel as
-                // that flag changes. The helper checks the actual key/foreground window,
-                // current lease and app activation; native loss/cleanup never request it.
-                if let Err(error) = panel_window::return_focus_after_interaction(
-                    &target,
-                    return_focus.unwrap_or(false),
-                ) {
-                    palette_focus_log(format_args!(
-                        "hand-back label={} result=skipped reason=error error={error}",
-                        target.label()
-                    ));
-                    eprintln!("Could not return panel keyboard focus after release: {error}");
-                }
-                target
-                    .set_focusable(false)
-                    .map_err(|error| error.to_string())?;
-                Ok(false)
+                return result.map(|_| held);
             }
+            panel_window::end_pointer_guard(
+                target.app_handle(),
+                target.label(),
+                panel_window::PointerGuardEnd::Released,
+                click_sequence,
+                before,
+            );
+            // Hand back before disabling key eligibility: AppKit can resign a panel as
+            // that flag changes. The helper checks the actual key/foreground window,
+            // current lease and app activation; native loss/cleanup never request it.
+            if let Err(error) =
+                panel_window::return_focus_after_interaction(&target, return_focus.unwrap_or(false))
+            {
+                palette_focus_log(format_args!(
+                    "hand-back label={} result=skipped reason=error error={error}",
+                    target.label()
+                ));
+                eprintln!("Could not return panel keyboard focus after release: {error}");
+            }
+            target
+                .set_focusable(false)
+                .map_err(|error| error.to_string())?;
+            Ok(false)
         })?
     })();
     palette_focus_log(format_args!(
@@ -4167,7 +5079,8 @@ async fn set_plugin_panel_input_focus(
     ));
     result
 }
-// Plugin panels never enter the palette lease/acquisition/hand-back path above.
+// Panel releases only clear input bookkeeping. macOS and Windows already observe
+// pointer activation before their panel acquisition runs.
 fn set_plugin_panel_activation(
     window: tauri::WebviewWindow,
     page_token: String,
@@ -4580,23 +5493,6 @@ mod plugin_panel_label_tests {
     }
 
     #[test]
-    fn explicit_panel_focus_never_changes_the_non_activating_restore_trait() {
-        for focus in [false, true] {
-            let request: OpenPluginPanelRequest = serde_json::from_value(serde_json::json!({
-                "panelId": "v1x61x62", "title": "Analyze", "focus": focus
-            }))
-            .unwrap();
-            for deferred in [false, true] {
-                let presentation = request.presentation(deferred);
-                // On Windows this selects SW_SHOWNOACTIVATE for ALL subsequent shows, including
-                // restoration of an Analyze panel that was explicitly focused after its build.
-                assert!(!presentation.focused_on_build);
-                assert_eq!(presentation.visible_on_build, !deferred);
-            }
-        }
-    }
-
-    #[test]
     fn native_close_interception_covers_every_panel_window_and_nothing_else() {
         assert!(is_plugin_panel_window_label(&plugin_panel_window_label(
             "v1x6f7267x70616e656c"
@@ -4959,7 +5855,6 @@ fn build_or_show_plugin_panel<R: Runtime>(
         return Err(QUITTING_WINDOW_REFUSAL.to_string());
     }
     let label = plugin_panel_window_label(&request.panel_id);
-    let presentation = request.presentation(restoring);
     if let Some(window) = app.get_webview_window(&label) {
         if restoring {
             let target = window.clone();
@@ -4967,28 +5862,13 @@ fn build_or_show_plugin_panel<R: Runtime>(
                 restore_utility_in_document_group(&target)
             })?;
         }
-        if !window.is_visible().unwrap_or(true) {
-            // Reopening a reusable window also checks for a monitor disconnected since close.
-            // Prompt restoration above deliberately leaves its live frame and ordering alone.
-            let webview: &tauri::Webview<R> = window.as_ref();
-            let live = current_plugin_panel_geometry(&webview.window());
-            let (_, _, placement) = plugin_panel_initial_geometry(app, &request, live);
-            if let Some(placement) = placement {
-                let target = window.clone();
-                run_on_main_thread_blocking(&window, move || {
-                    let webview: &tauri::Webview<R> = target.as_ref();
-                    panel_full_size::apply(&webview.window(), placement)
-                })??;
-            }
-        }
-        // `show()` makes the window key on macOS (tao's `set_visible` is makeKeyAndOrderFront), so
-        // an automatic re-show leaves visibility to `configure_analysis_window`, which only orders
-        // the window front.
-        if !cfg!(target_os = "macos") {
-            window.show().map_err(|error| error.to_string())?;
-        }
-        configure_analysis_window(&window)?;
-        return Ok(());
+        let target = window.clone();
+        return run_on_main_thread_blocking(&window, move || {
+            // Read and recover the frame just before revealing the panel. A separate placement
+            // task could apply old coordinates after another reveal or move.
+            recover_hidden_plugin_panel_frame(&target, Some(&request))?;
+            reveal_plugin_panel(&target)
+        })?;
     }
 
     let saved = load_toolset_layout_state(app)
@@ -5012,21 +5892,24 @@ fn build_or_show_plugin_panel<R: Runtime>(
     .accept_first_mouse(true)
     .focusable(false)
     // Windows uses this creation trait for EVERY later show, not just the initial reveal.
-    .focused(presentation.focused_on_build)
-    .visible(presentation.visible_on_build && placement.is_none())
+    .focused(false)
+    .visible(false)
     .resizable(true)
     .decorations(false)
     // Overlapping panels need a visible edge, matching the palette popover's native shadow.
     .shadow(true)
     .skip_taskbar(true);
-    // AppKit parent attachment orders even a hidden child in. A deferred build stays unparented
-    // until the main-thread restore checks activation and attaches it relative to the document.
-    if utility_window_has_document_parent(&label) && !(restoring && cfg!(target_os = "macos")) {
+    // AppKit parent attachment can order a hidden child in before the queued placement runs.
+    // Attach at reveal on macOS so a user cannot drag the panel before its initial frame is set.
+    if !cfg!(target_os = "macos") && utility_window_has_document_parent(&label) {
         if let Some(main) = app.get_webview_window(MAIN_WINDOW_LABEL) {
             builder = builder.parent(&main).map_err(|error| error.to_string())?;
         }
     }
     let window = builder.build().map_err(|error| error.to_string())?;
+    windows_activation_log::frame_set(&label, "panel creation", "pixels", || {
+        (window.outer_position().ok(), window.inner_size().ok())
+    });
     disable_default_context_menus(&window);
     let target = window.clone();
     let installed = run_on_main_thread_blocking(&window, move || {
@@ -5038,9 +5921,9 @@ fn build_or_show_plugin_panel<R: Runtime>(
             let native = unsafe { &*(pointer as *const NSWindow) };
             configure_analysis_window_traits(&target, native)?;
         }
-        if let Some(placement) = placement {
+        if let Some(placement) = placement.filter(|_| !target.is_visible().unwrap_or(true)) {
             let webview: &tauri::Webview<R> = target.as_ref();
-            panel_full_size::apply(&webview.window(), placement)?;
+            panel_full_size::apply(&webview.window(), placement, "initial panel placement")?;
         }
         panel_window::install_resize_hit_test(&target)
     })
@@ -5049,16 +5932,61 @@ fn build_or_show_plugin_panel<R: Runtime>(
         window.destroy().map_err(|error| error.to_string())
     })?;
 
-    if restoring {
-        let target = window.clone();
-        return run_on_main_thread_blocking(&window, move || {
+    let target = window.clone();
+    run_on_main_thread_blocking(&window, move || {
+        if restoring {
             restore_utility_in_document_group(&target)
-        })?;
-    }
-    if !cfg!(target_os = "macos") {
+        } else {
+            reveal_plugin_panel(&target)
+        }
+    })?
+}
+
+#[cfg(target_os = "macos")]
+fn reveal_plugin_panel<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), String> {
+    configure_analysis_window_on_main_thread(window)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn reveal_plugin_panel<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), String> {
+    if !window.is_visible().map_err(|error| error.to_string())? {
         window.show().map_err(|error| error.to_string())?;
+        window
+            .set_focusable(false)
+            .map_err(|error| error.to_string())?;
     }
-    configure_analysis_window(&window)?;
+    Ok(())
+}
+
+/// Main-thread-only. Recover a hidden panel immediately before either reveal path.
+fn recover_hidden_plugin_panel_frame<R: Runtime>(
+    target: &tauri::WebviewWindow<R>,
+    request: Option<&OpenPluginPanelRequest>,
+) -> Result<(), String> {
+    if target.is_visible().unwrap_or(true) || target.is_minimized().unwrap_or(true) {
+        return Ok(());
+    }
+    let app = target.app_handle();
+    let webview: &tauri::Webview<R> = target.as_ref();
+    let window = webview.window();
+    let live = current_plugin_panel_geometry(&window);
+    let placement = panel_window_frame::Frame::hidden_reopen(
+        live.as_ref(),
+        &plugin_panel_monitors(app),
+        || {
+            let (width, height) = match request {
+                Some(request) => panel_window_frame::default_size(request.width, request.height),
+                None => live.as_ref().map_or_else(
+                    || panel_window_frame::default_size(None, None),
+                    |frame| (frame.width, frame.height),
+                ),
+            };
+            plugin_panel_default_placement(app, width, height)
+        },
+    );
+    if let Some(placement) = placement {
+        panel_full_size::apply(&window, placement, "recover hidden panel")?;
+    }
     Ok(())
 }
 
@@ -5083,34 +6011,54 @@ fn plugin_panel_initial_geometry<R: Runtime>(
     saved: Option<panel_window_frame::Frame>,
 ) -> (f64, f64, Option<panel_window_frame::Placement>) {
     let (width, height) = panel_window_frame::default_size(request.width, request.height);
-    let placement = saved
-        .as_ref()
-        .and_then(|frame| plugin_panel_saved_placement(app, frame))
-        .or_else(|| plugin_panel_default_placement(app, width, height));
+    let placement = match saved.as_ref() {
+        Some(frame) => plugin_panel_saved_placement(app, frame),
+        None => plugin_panel_first_placement(app, (width, height)),
+    }
+    .or_else(|| plugin_panel_default_placement(app, width, height));
     (width, height, placement)
+}
+
+fn plugin_panel_first_placement<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    size: (f64, f64),
+) -> Option<panel_window_frame::Placement> {
+    let owner = app.get_webview_window(MAIN_WINDOW_LABEL)?;
+    let monitor = panel_window_frame::Monitor::from_native(
+        &monitor_query::current_monitor(&owner).ok().flatten()?,
+    );
+    let position = owner.inner_position().ok()?;
+    let owner_size = owner.inner_size().ok()?;
+    panel_window_frame::Frame::first_placement(
+        (position.x, position.y),
+        (owner_size.width, owner_size.height),
+        size,
+        &monitor,
+    )
 }
 
 fn plugin_panel_saved_placement<R: Runtime>(
     app: &tauri::AppHandle<R>,
     frame: &panel_window_frame::Frame,
 ) -> Option<panel_window_frame::Placement> {
-    let monitors = monitor_query::available_monitors(app).unwrap_or_default();
-    let monitors: Vec<_> = monitors
+    frame.restore(&plugin_panel_monitors(app))
+}
+
+fn plugin_panel_monitors<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Vec<panel_window_frame::Monitor> {
+    monitor_query::available_monitors(app)
+        .unwrap_or_default()
         .iter()
         .map(panel_window_frame::Monitor::from_native)
-        .collect();
-    frame.restore(&monitors)
+        .collect()
 }
 
 fn plugin_panel_restore_geometry<R: Runtime>(
     app: &tauri::AppHandle<R>,
     saved: &panel_window_frame::Frame,
 ) -> Option<(panel_window_frame::Placement, panel_window_frame::Frame)> {
-    let monitors = monitor_query::available_monitors(app).unwrap_or_default();
-    let monitors: Vec<_> = monitors
-        .iter()
-        .map(panel_window_frame::Monitor::from_native)
-        .collect();
+    let monitors = plugin_panel_monitors(app);
     if let Some(placement) = saved.restore_normal(&monitors) {
         let monitor = monitors.iter().find(|m| m.identity == saved.monitor)?;
         let frame =
@@ -5133,9 +6081,12 @@ fn plugin_panel_default_placement<R: Runtime>(
     width: f64,
     height: f64,
 ) -> Option<panel_window_frame::Placement> {
-    let position = analysis_window_initial_position(app, width, height)?;
     let main = app.get_webview_window(MAIN_WINDOW_LABEL)?;
     let monitor = monitor_query::current_monitor(&main).ok().flatten()?;
+    let work_area = monitor_logical_work_area(&monitor);
+    let width = width.min(work_area.width);
+    let height = height.min(work_area.height);
+    let position = analysis_window_initial_position(app, width, height, work_area)?;
     let scale = monitor.scale_factor();
     let position = position.to_physical::<i32>(scale);
     let size = tauri::LogicalSize::new(width, height).to_physical::<u32>(scale);
@@ -5150,6 +6101,7 @@ fn analysis_window_initial_position<R: Runtime>(
     app: &tauri::AppHandle<R>,
     width: f64,
     height: f64,
+    work_area: ScreenRect,
 ) -> Option<tauri::LogicalPosition<f64>> {
     let main = app.get_webview_window(MAIN_WINDOW_LABEL)?;
     let scale = main.scale_factor().ok()?;
@@ -5157,8 +6109,6 @@ fn analysis_window_initial_position<R: Runtime>(
     let main_size = main.inner_size().ok()?.to_logical::<f64>(scale);
     // Clamp to the work area, not the full display: a window pushed under the menu bar or the Dock
     // has its title strip -- the only way to drag an undecorated window -- out of reach.
-    let work_area =
-        monitor_logical_work_area(&monitor_query::current_monitor(&main).ok().flatten()?);
     // The floating palettes sit at a higher window level than this window, so wherever they are is
     // somewhere the new window would open underneath them, title bar and all.
     let palettes: Vec<ScreenRect> = app
@@ -5197,7 +6147,7 @@ fn analysis_window_initial_position<R: Runtime>(
     Some(tauri::LogicalPosition::new(x, y))
 }
 
-/// A window frame in logical screen coordinates.
+/// A rectangle in screen coordinates. Comparisons use the same units for both rectangles.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ScreenRect {
     x: f64,
@@ -5224,6 +6174,26 @@ impl ScreenRect {
         } else {
             width * height
         }
+    }
+
+    fn contains_title_strip(&self, x: f64, y: f64, width: f64, title_height: f64) -> bool {
+        self.contains_title_strip_at_scale(x, y, width, title_height, 1.0)
+    }
+
+    fn contains_title_strip_at_scale(
+        &self,
+        x: f64,
+        y: f64,
+        width: f64,
+        title_height: f64,
+        scale: f64,
+    ) -> bool {
+        // Leave enough horizontal room to grab the title, and keep its full height clear of
+        // the menu bar, taskbar or Dock.
+        let overlap = (x + width).min(self.x + self.width) - x.max(self.x);
+        overlap >= width.min(48.0 * scale)
+            && y >= self.y
+            && y + title_height <= self.y + self.height
     }
 }
 
@@ -5290,18 +6260,7 @@ fn choose_analysis_window_position(
     best
 }
 
-/// Non-activating by default. Only the caller-validated input focus command makes a panel key.
-///
-/// Marshalled: `open_plugin_panel_window` is async (a worker thread, required for WebView2 on
-/// Windows), and every call below is raw AppKit, which is main-thread-only.
-#[cfg(target_os = "macos")]
-fn configure_analysis_window<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), String> {
-    let target = window.clone();
-    run_on_main_thread_blocking(window, move || {
-        configure_analysis_window_on_main_thread(&target)
-    })?
-}
-
+/// Order the panel front without making it key. Called on the UI thread.
 #[cfg(target_os = "macos")]
 fn configure_analysis_window_on_main_thread<R: Runtime>(
     window: &tauri::WebviewWindow<R>,
@@ -5351,11 +6310,10 @@ fn configure_analysis_window_traits<R: Runtime>(
 
 /// Makes `child` a child window of the main document window again, if it is not one already.
 ///
-/// The builder's `.parent(&main)` attaches a report window only once, at creation, and AppKit drops
-/// the relationship whenever the child is ordered out — which is what `hide()` does. Without this a
-/// re-shown report window is an ordinary window that falls behind the document on the next canvas
-/// click. Call it only once `child` is on screen: `addChildWindow:` orders a hidden child in. A
-/// hidden main window is left alone, because attaching to it would tie the child to its visibility.
+/// AppKit drops the relationship whenever the child is ordered out. Attach on each reveal so the
+/// panel stays above the document on the next canvas click. Call it only once `child` is on screen:
+/// `addChildWindow:` orders a hidden child in. Leave a hidden main window alone so the child can
+/// stay visible independently until the document returns.
 #[cfg(target_os = "macos")]
 fn attach_to_main_window<R: Runtime>(app: &tauri::AppHandle<R>, label: &str, child: &NSWindow) {
     if !should_attach_as_document_child(label) {
@@ -5393,12 +6351,14 @@ pub(crate) fn attach_webview_window_to_main<R: Runtime>(window: &tauri::WebviewW
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn configure_analysis_window<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), String> {
-    window
-        .set_focusable(false)
-        .map_err(|error| error.to_string())?;
-    Ok(())
+/// Main-thread-only. Panels already on screen can be attached without changing the key window.
+#[cfg(target_os = "macos")]
+fn reattach_visible_plugin_panels<R: Runtime>(app: &tauri::AppHandle<R>) {
+    for (label, panel) in app.webview_windows() {
+        if is_plugin_panel_window_label(&label) {
+            attach_webview_window_to_main(&panel);
+        }
+    }
 }
 
 /// Whether the document should get keyboard focus back once a hidden app is active again.
@@ -5407,14 +6367,14 @@ fn configure_analysis_window<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Re
 /// document it picks the report — so typing after Cmd+H and back went to the report, not the
 /// canvas. The decision is platform-neutral so it is tested everywhere; only the hide/activate
 /// notifications that drive it are AppKit's (`observe_hide_for_document_key_restore`).
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Default)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct DocumentKeyAfterUnhide {
     /// `Some` between a hide and the next activation: whether the document was key when hidden.
     document_was_key_at_hide: Option<bool>,
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(any(target_os = "macos", test))]
 impl DocumentKeyAfterUnhide {
     fn will_hide(&mut self, document_was_key: bool) {
         self.document_was_key_at_hide = Some(document_was_key);
@@ -5425,6 +6385,10 @@ impl DocumentKeyAfterUnhide {
     fn take_restore(&mut self, document_visible: bool, document_is_key: bool) -> bool {
         self.document_was_key_at_hide.take() == Some(true) && document_visible && !document_is_key
     }
+
+    fn preferences_raised(&mut self) {
+        self.document_was_key_at_hide = None;
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -5432,6 +6396,18 @@ static DOCUMENT_KEY_AFTER_UNHIDE: Mutex<DocumentKeyAfterUnhide> =
     Mutex::new(DocumentKeyAfterUnhide {
         document_was_key_at_hide: None,
     });
+
+#[cfg(target_os = "macos")]
+fn clear_document_key_after_unhide_for_preferences() {
+    if let Ok(mut state) = DOCUMENT_KEY_AFTER_UNHIDE.lock() {
+        state.preferences_raised();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clear_document_key_after_unhide_for_preferences() {
+    // There is no document-key-after-unhide observer on other platforms.
+}
 
 #[cfg(test)]
 mod document_key_after_unhide_tests {
@@ -5467,6 +6443,21 @@ mod document_key_after_unhide_tests {
     }
 
     #[test]
+    fn explicit_preferences_raise_clears_pending_document_key_restore() {
+        for was_key in [false, true] {
+            let mut state = DocumentKeyAfterUnhide::default();
+            state.will_hide(was_key);
+            state.preferences_raised();
+            assert_eq!(state.document_was_key_at_hide, None);
+            assert!(!state.take_restore(true, false));
+            assert!(!state.take_restore(true, false));
+            // A later hide still records the user's new choice normally.
+            state.will_hide(true);
+            assert!(state.take_restore(true, false));
+        }
+    }
+
+    #[test]
     fn does_nothing_when_the_document_is_already_key_or_hidden() {
         let mut state = DocumentKeyAfterUnhide::default();
         state.will_hide(true);
@@ -5487,8 +6478,8 @@ fn main_ns_window<R: Runtime>(app: &tauri::AppHandle<R>) -> Option<&'static NSWi
 }
 
 /// Records whether the document was key at Cmd+H, and restores it after the app is active again.
-/// The restore is deferred one turn of the event loop so it lands after AppKit's own key-window
-/// choice during activation. It uses `makeKeyWindow` (no reordering): layering is already right.
+/// The main-thread callback can run inline during activation. Explicit Preferences requests
+/// clear its pending restore before activation; `makeKeyWindow` preserves the existing layering.
 #[cfg(target_os = "macos")]
 fn observe_hide_for_document_key_restore<R: Runtime>(app: tauri::AppHandle<R>) {
     use objc2_app_kit::{
@@ -5512,6 +6503,7 @@ fn observe_hide_for_document_key_restore<R: Runtime>(app: tauri::AppHandle<R>) {
             let Some(main) = main_ns_window(&restore_app) else {
                 return;
             };
+            reattach_visible_plugin_panels(&restore_app);
             let restore = DOCUMENT_KEY_AFTER_UNHIDE
                 .lock()
                 .map(|mut state| state.take_restore(main.isVisible(), main.isKeyWindow()))
@@ -5641,8 +6633,9 @@ fn toolset_popover_title(label: &str, kind: &str) -> &'static str {
 }
 
 /// The actual builder configuration is also the test seam for native creation.
-/// `parent` is an owner on Windows (not a child HWND). Keep macOS popovers unparented:
-/// AppKit child windows can reveal hidden/prewarmed windows and alter their level/Spaces behavior.
+/// `parent` gives Windows an owner and Linux a GTK transient parent. Keep macOS popovers
+/// unparented because AppKit child windows can reveal hidden/prewarmed windows and alter their
+/// level/Spaces behavior.
 fn toolset_popover_window_config(
     label: &str,
     toolset_id: &str,
@@ -5658,9 +6651,9 @@ fn toolset_popover_window_config(
                 .into(),
         ),
         title: toolset_popover_title(&toolset_popover_window_label(toolset_id), kind).into(),
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         parent: Some(MAIN_WINDOW_LABEL.into()),
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         parent: None,
         width: 320.0,
         height: 300.0,
@@ -5690,14 +6683,23 @@ fn build_toolset_popover_window(
     position: (f64, f64),
     focus_mode: ToolsetPopoverFocusMode,
 ) -> Result<(), String> {
-    let config = toolset_popover_window_config(label, toolset_id, kind, prewarm, focus_mode);
-    let window = WebviewWindowBuilder::from_config(app, &config)
-        .map_err(|error| error.to_string())?
-        .position(position.0, position.1)
-        .build()
-        .map_err(|error| error.to_string())?;
+    let native_wayland = utility_window::uses_native_wayland(app)?;
+    let mut config = toolset_popover_window_config(label, toolset_id, kind, prewarm, focus_mode);
+    config.resizable |= native_wayland;
+    let builder =
+        WebviewWindowBuilder::from_config(app, &config).map_err(|error| error.to_string())?;
+    // Windows: the palette background as its first frame. Still shown only by its own reveal.
+    let builder =
+        palette_first_paint::builder_step(builder, palette_first_paint::PaletteWindowKind::Popover);
+    let builder = if native_wayland {
+        builder
+    } else {
+        builder.position(position.0, position.1)
+    };
+    let window = builder.build().map_err(|error| error.to_string())?;
 
     disable_default_context_menus(&window);
+    utility_window::prepare(&window, utility_window::Kind::Popover, native_wayland)?;
     configure_toolset_popover_window(&window, focus_mode)?;
     install_toolset_input_focus(&window)?;
     panel_window::set_popover_content(&window, kind)?;
@@ -5722,6 +6724,11 @@ fn configure_toolset_popover_window<R: Runtime>(
         target
             .set_focusable(focus_mode == ToolsetPopoverFocusMode::Focus)
             .map_err(|error| error.to_string())?;
+        // Keyboard-opened popovers own their navigation keys without a field lease.
+        panel_window::set_keyboard_popover(
+            target.label(),
+            focus_mode == ToolsetPopoverFocusMode::Focus,
+        );
         #[cfg(windows)]
         {
             use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -5754,7 +6761,11 @@ fn toolset_popover_extended_style(style: isize) -> isize {
 fn close_toolset_popover(app: tauri::AppHandle, toolset_id: String) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(&toolset_popover_window_label(&toolset_id)) {
         panel_window::end_for_hide(window.app_handle(), window.label());
+        #[cfg(target_os = "linux")]
+        utility_window::set_visible(&window, false)?;
+        #[cfg(not(target_os = "linux"))]
         window.hide().map_err(|error| error.to_string())?;
+        toolset_popover_command_sources().remove(window.label());
     }
     Ok(())
 }
@@ -5877,6 +6888,7 @@ fn show_toolset_tooltip_window(
     {
         // The tooltip is built `focused(false)` (utility_window_builder), so this is
         // ShowWindow(SW_SHOWNOACTIVATE) on Windows and never takes activation from the document.
+        // On Linux Tao queues this after the position request, so it maps at the new anchor.
         window.show().map_err(|error| error.to_string())?;
     }
     // SW_SHOWNOACTIVATE keeps the hidden window's old z-order, which left the tooltip behind the
@@ -5913,6 +6925,38 @@ fn raise_among_owned_windows<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Re
     Ok(())
 }
 
+#[derive(Debug, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolsetFlyoutOpening {
+    toolset_id: String,
+    flyout_id: String,
+    opened_at: f64,
+    generation: Option<u64>,
+    bond_stereo_session_id: Option<String>,
+}
+
+enum ToolsetPopoverCommandSource {
+    TextColor,
+    Flyout(ToolsetFlyoutOpening),
+}
+
+fn toolset_popover_command_sources(
+) -> std::sync::MutexGuard<'static, HashMap<String, ToolsetPopoverCommandSource>> {
+    static SOURCES: std::sync::LazyLock<Mutex<HashMap<String, ToolsetPopoverCommandSource>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    SOURCES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn can_dispatch_flyout_command(
+    visible: bool,
+    current: &ToolsetFlyoutOpening,
+    requested: Option<&ToolsetFlyoutOpening>,
+) -> bool {
+    visible && requested == Some(current)
+}
+
 /// Reveal the calling palette popover once it has painted its content at the right size, and put it
 /// above the palette it belongs to. A mouse-opened E/Z popover must not become key/active.
 #[tauri::command]
@@ -5920,12 +6964,32 @@ fn show_toolset_popover_window(
     window: tauri::WebviewWindow,
     focus_mode: Option<ToolsetPopoverFocusMode>,
     kind: Option<String>,
-) -> Result<(), String> {
+    flyout_opening: Option<ToolsetFlyoutOpening>,
+) -> Result<bool, String> {
     if !window.label().starts_with("toolset-popover-") {
         return Err("Only toolset popovers may reveal popover content".into());
     }
     if utility_windows_suspended() {
-        return Ok(());
+        #[cfg(windows)]
+        log::debug!(target: "chemdraft::windows_activation",
+            "popover acceptance refused label={} reason=utility-windows-suspended", window.label());
+        return Ok(false);
+    }
+    let source = match (kind.as_deref(), flyout_opening) {
+        (Some("flyout"), Some(opening))
+            if window.label() == toolset_popover_window_label(&opening.toolset_id) =>
+        {
+            Some(ToolsetPopoverCommandSource::Flyout(opening))
+        }
+        (_, Some(_)) => return Err("Flyout opening does not match its popover window".into()),
+        (Some("textColor"), None) => Some(ToolsetPopoverCommandSource::TextColor),
+        _ => None,
+    };
+    // The renderer has painted this content. Retire the previous opening even if reveal fails.
+    if let Some(source) = source {
+        toolset_popover_command_sources().insert(window.label().to_string(), source);
+    } else {
+        toolset_popover_command_sources().remove(window.label());
     }
     // The page owns the live content, including a prewarmed/reused Art window switching
     // between its colour picker and command flyouts. Titles are fixed native strings.
@@ -5956,8 +7020,20 @@ fn show_toolset_popover_window(
     #[cfg(not(target_os = "macos"))]
     // `focus: false` at creation makes Tao use SW_SHOWNOACTIVATE on Windows.
     // Keep its visibility state in sync (a raw ShowWindow alone breaks later hide()).
-    window.show().map_err(|error| error.to_string())?;
-    raise_among_owned_windows(&window)
+    utility_window::set_visible(&window, true)?;
+    raise_among_owned_windows(&window)?;
+    let visibility = window.is_visible();
+    #[cfg(windows)]
+    if !matches!(visibility, Ok(true)) {
+        let reason = if visibility.is_err() {
+            "visibility-query-failed"
+        } else {
+            "native-window-hidden"
+        };
+        log::debug!(target: "chemdraft::windows_activation",
+            "popover acceptance refused label={} reason={reason}", window.label());
+    }
+    Ok(visibility.unwrap_or(false))
 }
 
 /// Hide the tooltip window. Deliberately a sync command like `show_toolset_tooltip_window`: both
@@ -6036,6 +7112,10 @@ fn set_window_global_logical_position<R: Runtime>(
     x: f64,
     y: f64,
 ) -> Result<(), String> {
+    // On native Wayland the compositor positions transient toplevels.
+    if utility_window::uses_native_wayland(window.app_handle())? {
+        return Ok(());
+    }
     let monitors = monitor_query::available_monitors(window.app_handle())
         .unwrap_or_default()
         .iter()
@@ -6049,11 +7129,18 @@ fn set_window_global_logical_position<R: Runtime>(
         .collect::<Vec<_>>();
     let current_scale = window.scale_factor().unwrap_or(1.0);
     let (physical_x, physical_y) = global_logical_to_physical(&monitors, x, y, current_scale);
+    let position =
+        tauri::PhysicalPosition::new(physical_x.round() as i32, physical_y.round() as i32);
+    if is_plugin_panel_window_label(window.label()) || window.label().starts_with("toolset-") {
+        windows_activation_log::frame_set(
+            window.label(),
+            "global position request",
+            "pixels",
+            || (position, window.inner_size().ok()),
+        );
+    }
     window
-        .set_position(tauri::PhysicalPosition::new(
-            physical_x.round() as i32,
-            physical_y.round() as i32,
-        ))
+        .set_position(position)
         .map_err(|error| error.to_string())
 }
 
@@ -6067,6 +7154,153 @@ fn set_current_window_global_position(
     y: f64,
 ) -> Result<(), String> {
     set_window_global_logical_position(&window, x, y)
+}
+
+/// Constrain the live frame after the inspector webview observes a move or work-area change.
+#[tauri::command]
+fn clamp_current_inspector_frame(window: tauri::WebviewWindow) {
+    let app = window.app_handle();
+    if toolset_id_for_window_label(app, window.label()).is_some_and(|id| toolset_is_resizable(&id))
+        && window.is_visible().unwrap_or(false)
+        && !utility_windows_suspended()
+    {
+        recover_offscreen_toolset_window(app, &window, true);
+    }
+}
+
+/// Resize to measured content, keeping the native top-left that is current when the resize runs.
+#[tauri::command]
+fn resize_toolset_window(
+    window: tauri::WebviewWindow,
+    width: f64,
+    height: f64,
+) -> Result<bool, String> {
+    let app = window.app_handle();
+    let toolset_id = toolset_id_for_window_label(app, window.label());
+    if toolset_id.is_none_or(|id| toolset_is_resizable(&id)) {
+        return Err("Only a ChemDraft tool palette may resize to fit its content.".into());
+    }
+    if ![width, height]
+        .into_iter()
+        .all(|n| n.is_finite() && n > 0.0)
+    {
+        return Err("Tool palette dimensions must be positive and finite.".into());
+    }
+    // This synchronous command runs on the UI thread. On macOS, applying the frame directly
+    // also avoids Tao queuing independent resize and top-left updates on the AppKit queue.
+    let webview: &tauri::Webview = window.as_ref();
+    let window = webview.window();
+    if toolset_frame_is_transient(app, &window) {
+        return Ok(false);
+    }
+    let monitor = monitor_query::current_monitor(&window)
+        .map_err(|error| error.to_string())?
+        .or_else(|| monitor_query::primary_monitor(app).ok().flatten())
+        .ok_or("The tool palette's monitor is unavailable.")?;
+    if utility_window::uses_native_wayland(app)? {
+        window
+            .set_size(tauri::LogicalSize::new(
+                width,
+                height.min(monitor_logical_work_area(&monitor).height),
+            ))
+            .map_err(|error| error.to_string())?;
+        return Ok(true);
+    }
+    let scale = monitor.scale_factor();
+    #[cfg(not(target_os = "macos"))]
+    let window_scale = window.scale_factor().unwrap_or(scale);
+    let position = window.outer_position().map_err(|error| error.to_string())?;
+    let origin = (position.x, position.y);
+    let mut placement = toolset_content_placement(
+        origin,
+        (width, height),
+        scale,
+        monitor_logical_work_area(&monitor),
+    );
+    // The monitor under most of the palette can differ from the one under its title.
+    if placement.position != origin
+        && monitor_query::available_monitors(app)
+            .unwrap_or_default()
+            .iter()
+            .any(|monitor| {
+                // AppKit reports the outer position in the window's backing scale.
+                #[cfg(target_os = "macos")]
+                {
+                    monitor_logical_work_area(monitor).contains_title_strip(
+                        f64::from(position.x) / scale,
+                        f64::from(position.y) / scale,
+                        width,
+                        TOOLSET_TITLE_HEIGHT,
+                    )
+                }
+                // Windows uses one virtual desktop in physical pixels. Size the title with
+                // the window's DPI before comparing it to another monitor's physical work area.
+                #[cfg(not(target_os = "macos"))]
+                {
+                    toolset_title_in_physical_work_area(
+                        origin,
+                        width,
+                        window_scale,
+                        monitor.work_area(),
+                    )
+                }
+            })
+    {
+        placement.position = origin;
+    }
+    #[cfg(not(target_os = "macos"))]
+    if placement.position == origin {
+        windows_activation_log::frame_set(window.label(), "toolbar content fit", "pixels", || {
+            (placement.position, placement.size)
+        });
+        window
+            .set_size(tauri::PhysicalSize::new(placement.size.0, placement.size.1))
+            .map_err(|error| error.to_string())?;
+        return Ok(true);
+    }
+    panel_full_size::apply(&window, placement, "toolbar content fit")?;
+    Ok(true)
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn toolset_title_in_physical_work_area(
+    position: (i32, i32),
+    width: f64,
+    window_scale: f64,
+    area: &tauri::PhysicalRect<i32, u32>,
+) -> bool {
+    ScreenRect::new(
+        f64::from(area.position.x),
+        f64::from(area.position.y),
+        f64::from(area.size.width),
+        f64::from(area.size.height),
+    )
+    .contains_title_strip_at_scale(
+        f64::from(position.0),
+        f64::from(position.1),
+        width * window_scale,
+        TOOLSET_TITLE_HEIGHT * window_scale,
+        window_scale,
+    )
+}
+
+fn toolset_content_placement(
+    position: (i32, i32),
+    size: (f64, f64),
+    scale: f64,
+    area: ScreenRect,
+) -> panel_window_frame::Placement {
+    let position =
+        logical_toolset_position_from_physical(f64::from(position.0), f64::from(position.1), scale);
+    let (width, height) = (size.0, size.1.min(area.height));
+    let position = toolset_position_in_work_area(position, width, height, area);
+    let position = tauri::LogicalPosition::new(position.x, position.y).to_physical::<i32>(scale);
+    let size = tauri::LogicalSize::new(width, height).to_physical::<u32>(scale);
+    panel_window_frame::Placement {
+        position: (position.x, position.y),
+        size: (size.width, size.height),
+        scale,
+    }
 }
 
 /// Pre-build the single shared floating tooltip window, hidden. Palettes can't paint a tooltip
@@ -6085,28 +7319,33 @@ fn build_toolset_tooltip_window(app: &tauri::AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
-    let window = utility_window_builder(
+    let native_wayland = utility_window::uses_native_wayland(app)?;
+    let builder = utility_window_builder(
         WebviewWindowBuilder::new(
             app,
             TOOLSET_TOOLTIP_WINDOW_LABEL,
             WebviewUrl::App("/?window=toolsetTooltip".into()),
         ),
         app,
-    )
+    )?
     .title("ChemDraft tooltip")
     // The JS side sizes this to the rendered text before every show.
     .inner_size(120.0, 26.0)
     .min_inner_size(16.0, 14.0)
     .accept_first_mouse(false)
     .focusable(false)
-    .resizable(false)
+    .resizable(native_wayland)
     .decorations(false)
     .skip_taskbar(true)
-    .visible(false)
-    .build()
-    .map_err(|error| error.to_string())?;
+    .visible(false);
+    // Windows: the tooltip background as its first frame. Still shown only by its own reveal.
+    let window =
+        palette_first_paint::builder_step(builder, palette_first_paint::PaletteWindowKind::Tooltip)
+            .build()
+            .map_err(|error| error.to_string())?;
 
     disable_default_context_menus(&window);
+    utility_window::prepare(&window, utility_window::Kind::Tooltip, native_wayland)?;
     configure_toolset_utility_window(&window, false)?;
     // Pure chrome: click-through and invisible to hit-testing. Without this, the tooltip appearing
     // under the cursor would win windowNumberAtPoint in the pointer feed, read as "cursor left the
@@ -6186,6 +7425,7 @@ fn route_toolset_command(
     command_id: String,
     preserve_input_focus: Option<bool>,
     commit: Option<bool>,
+    flyout_opening: Option<ToolsetFlyoutOpening>,
 ) -> Result<(), String> {
     if utility_windows_suspended() && !commit.unwrap_or(false) {
         return Ok(());
@@ -6193,6 +7433,38 @@ fn route_toolset_command(
     let command_id = command_id.trim();
     if command_id.is_empty() {
         return Err("Toolset command id cannot be empty.".to_string());
+    }
+
+    if window.label().starts_with("toolset-popover-") {
+        if commit.unwrap_or(false) {
+            return Ok(());
+        }
+        let allowed = match toolset_popover_command_sources().get(window.label()) {
+            Some(ToolsetPopoverCommandSource::TextColor) => flyout_opening.is_none(),
+            Some(ToolsetPopoverCommandSource::Flyout(current)) => can_dispatch_flyout_command(
+                window.is_visible().unwrap_or(false),
+                current,
+                flyout_opening.as_ref(),
+            ),
+            None => false,
+        };
+        if !allowed {
+            return Ok(());
+        }
+    } else if flyout_opening.is_some() {
+        return Ok(());
+    }
+
+    if let Some(session_id) = flyout_opening.and_then(|opening| opening.bond_stereo_session_id) {
+        if matches!(command_id, "geometry" | "flipped" | "keep") {
+            app.emit_to(
+                MAIN_WINDOW_LABEL,
+                "chemdraft://bond-stereo-popover-action",
+                serde_json::json!({ "sessionId": session_id, "action": command_id }),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        return Ok(());
     }
 
     if commit.unwrap_or(false) {
@@ -7082,8 +8354,11 @@ fn ensure_preferences_window<R: Runtime>(
                         ))
                     },
                     || {
-                        focus_main_document_window_impl(&target, MainWindowFocusMode::Force)
-                            .map(|_| ())
+                        focus_main_document_window_impl(
+                            &target,
+                            MainWindowFocusMode::RestoreForPreferences,
+                        )
+                        .map(|_| ())
                     },
                 )
             })
@@ -7104,6 +8379,10 @@ fn with_preferences_owner_restored<T>(
     create_or_raise()
 }
 
+fn preferences_owner_needs_restoration(minimized: bool, visible: bool) -> bool {
+    minimized || !visible
+}
+
 /// Main-thread-only in production. Leave visible documents in their current stacking order;
 /// suspended reveals continue through the shared dialog path, which defers them until release.
 fn restore_preferences_owner_if_needed(
@@ -7120,7 +8399,7 @@ fn restore_preferences_owner_if_needed(
     }
     let restore_error = |error| format!("Could not restore document for Preferences: {error}");
     let (minimized, visible) = owner_state().map_err(restore_error)?;
-    if minimized || !visible {
+    if preferences_owner_needs_restoration(minimized, visible) {
         restore_owner().map_err(restore_error)?;
     }
     Ok(())
@@ -7198,6 +8477,19 @@ fn palette_focus_diagnostic(window: tauri::WebviewWindow, line: String) -> Resul
 // Diagnostics share the existing bridge gate; no separate flag.
 fn palette_focus_log(message: std::fmt::Arguments<'_>) {
     if agent_bridge_status().enabled {
+        eprintln!("[palette-focus] {message}");
+    }
+}
+
+// Opt-in switch for the one `linux-acquire` line per field click. CI's Linux smoke and tester
+// reports need that line without the agent bridge, which would change what the smoke tests.
+#[cfg(target_os = "linux")]
+const PALETTE_FOCUS_LOG_ENV_VAR: &str = "CHEMDRAFT_PALETTE_FOCUS_LOG";
+
+#[cfg(target_os = "linux")]
+fn palette_focus_acquire_log(message: std::fmt::Arguments<'_>) {
+    let env_enabled = std::env::var(PALETTE_FOCUS_LOG_ENV_VAR).is_ok_and(|value| value == "1");
+    if agent_bridge_status().enabled || env_enabled {
         eprintln!("[palette-focus] {message}");
     }
 }
@@ -7339,6 +8631,8 @@ fn resolve_engine3d_sidecar_path(env_override: Option<String>) -> Option<PathBuf
     // Development / explicit override: an absolute path to a locally built sidecar wins.
     if let Some(path) = env_override {
         let candidate = PathBuf::from(path.trim());
+        #[cfg(target_os = "linux")]
+        let candidate = linux_startup::user_path(&candidate).into_owned();
         if is_runnable_sidecar(&candidate) {
             return Some(candidate);
         }
@@ -7424,7 +8718,7 @@ fn start_engine3d_sidecar_session_from_path(
         std::process::id(),
         ENGINE3D_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
-    let mut child = Command::new(path)
+    let mut child = child_command(path)
         .arg("--stdio")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -7704,12 +8998,35 @@ fn engine3d_target_triple() -> &'static str {
     }
 }
 
+// Receipts travel on the same document-window IPC as the destructive drain. A receipt call
+// never drains the next batch, which may still be waiting for its queue-change notification.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+fn take_pending_open_document(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, PendingOpenDocument>,
+    confirmation: Option<macos_single_instance::OpenConfirmation>,
+) -> Result<Vec<NativeOpenDocumentPayload>, String> {
+    if !is_document_window(window.label()) {
+        return Err("Only the document window can take or confirm file opens.".into());
+    }
+    if let Some(confirmation) = confirmation {
+        macos_single_instance::renderer_consumed(
+            window.app_handle(),
+            confirmation.receipt,
+            confirmation.opened,
+        );
+        return Ok(Vec::new());
+    }
+    state.drain()
+}
+
+#[cfg(not(target_os = "macos"))]
 #[tauri::command]
 fn take_pending_open_document(
     state: tauri::State<'_, PendingOpenDocument>,
-) -> Result<Option<NativeOpenDocumentPayload>, String> {
-    let mut pending = state.payload.lock().map_err(|error| error.to_string())?;
-    Ok(pending.take())
+) -> Result<Vec<NativeOpenDocumentPayload>, String> {
+    state.drain()
 }
 
 /// Tauri restart cannot be prevented (ExitRequestApi::prevent_exit ignores RESTART_EXIT_CODE).
@@ -7761,6 +9078,7 @@ const EDIT_HISTORY_MENU_ITEMS: [EditHistoryMenuItem; 2] = [
 ];
 
 /// Edit ▸ Cut / Copy / Paste, in menu order, as (command id, label).
+#[cfg(target_os = "linux")]
 const CLIPBOARD_EDIT_MENU_ITEMS: [(&str, &str); 3] = [
     ("clipboard.cut", "Cut"),
     ("clipboard.copy", "Copy"),
@@ -7783,9 +9101,8 @@ fn clipboard_edit_menu_item<R: Runtime>(
 
 /// muda's Linux predefined Cut/Copy/Paste only fake a Ctrl+X/C/V key press through libxdo: nothing
 /// on Wayland, and on X11 the press can land before the menu releases its grab, so the click did
-/// nothing. Route them to the editor's own commands instead. No accelerator: a GTK menu
-/// accelerator wins over the focused widget, so Ctrl+C in a text field would copy the drawing.
-/// The keys keep reaching the webview, which handles them as on the other platforms.
+/// nothing. Invoke WebKit's editing commands directly. With no GTK accelerator, the keys still
+/// reach the webview and raise the same DOM clipboard events as the menu commands.
 #[cfg(target_os = "linux")]
 fn clipboard_edit_menu_item<R: Runtime>(
     app: &tauri::AppHandle<R>,
@@ -7824,14 +9141,32 @@ fn is_edit_history_command(command_id: &str) -> bool {
         .any(|item| item.command_id == command_id)
 }
 
+#[cfg(target_os = "linux")]
+fn native_clipboard_edit_command(command_id: &str) -> Option<&'static std::ffi::CStr> {
+    match command_id {
+        "clipboard.cut" => Some(c"Cut"),
+        "clipboard.copy" => Some(c"Copy"),
+        "clipboard.paste" => Some(c"Paste"),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn native_clipboard_edit_command(_command_id: &str) -> Option<&'static std::ffi::CStr> {
+    None
+}
+
 /// Which window a routed menu command is delivered to. Everything goes to the main document window,
-/// except Select All and Undo / Redo, which follow the key window. As with AppKit's
-/// predefined items, ⌘Z in a palette's text field undoes that text. The secondary window forwards
+/// except text editing actions, which follow the key window. The secondary window forwards
 /// history commands to the main window itself
 /// when it has no text field focused (`installSecondaryWindowEditHistory` in the webview).
 fn menu_command_target_label<'a>(command_id: &str, focused_label: Option<&'a str>) -> &'a str {
     match focused_label {
-        Some(label) if is_edit_history_command(command_id) || command_id == "edit.selectAll" => {
+        Some(label)
+            if is_edit_history_command(command_id)
+                || command_id == "edit.selectAll"
+                || native_clipboard_edit_command(command_id).is_some() =>
+        {
             label
         }
         _ => MAIN_WINDOW_LABEL,
@@ -7848,10 +9183,17 @@ fn emit_menu_command<R: Runtime>(
         .find(|(_, window)| window.is_focused().unwrap_or(false))
         .map(|(label, _)| label);
     let target_label = menu_command_target_label(command_id, focused_label.as_deref());
+    if target_label == MAIN_WINDOW_LABEL && panel_window::palette_blocks_menu(true, command_id) {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(command) = native_clipboard_edit_command(command_id) {
+        let target = app
+            .get_webview_window(target_label)
+            .ok_or_else(|| format!("Window {target_label} is not available."))?;
+        return linux_clipboard::execute_editing_command(&target, command);
+    }
     if target_label == MAIN_WINDOW_LABEL {
-        if panel_window::palette_blocks_menu(true, command_id) {
-            return Ok(());
-        }
         return emit_command_to_main(app, command_id);
     }
     let target = app
@@ -7907,56 +9249,54 @@ fn handle_opened_document_urls<R: Runtime>(
     app: &tauri::AppHandle<R>,
     urls: Vec<tauri::Url>,
 ) -> Result<(), String> {
-    let mut opened_payload = None;
-    for url in urls {
-        if let Some(payload) = open_document_payload_from_url(&url)? {
-            opened_payload = Some(payload);
-            break;
-        }
-    }
-    let Some(payload) = opened_payload else {
-        return Ok(());
-    };
-    deliver_opened_document(app, payload)
+    deliver_opened_documents(opened_document_payloads_from_urls(urls), |payload| {
+        deliver_opened_document(app, payload)
+    })
 }
 
 /// Document paths passed on the command line (Windows/Linux shell opens, and argv forwarded from a
-/// second launch). Flags are skipped; the first supported document file wins,
-/// mirroring the first-file-URL rule of the macOS path.
+/// second launch). Skip flags and open every supported file in argument order.
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
 fn handle_opened_document_args<R: Runtime>(
     app: &tauri::AppHandle<R>,
     args: impl IntoIterator<Item = String>,
     cwd: &Path,
 ) -> Result<(), String> {
-    let path = args
-        .into_iter()
-        .filter(|arg| !arg.starts_with('-'))
-        .map(|arg| cwd.join(arg))
-        .find(|path| is_openable_document_path(path));
-    let Some(path) = path else {
-        return Ok(());
-    };
-    deliver_opened_document(app, open_document_payload_from_path(&path)?)
+    handle_opened_document_paths(app, openable_document_paths_from_args(args, cwd))
 }
 
-#[cfg_attr(
-    any(target_os = "macos", target_os = "ios", target_os = "android"),
-    allow(dead_code)
-)]
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+fn handle_opened_document_paths<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> Result<(), String> {
+    let payloads = paths
+        .into_iter()
+        .map(|path| open_document_payload_from_path(&path));
+    deliver_opened_documents(payloads, |payload| deliver_opened_document(app, payload))
+}
+
+#[cfg(any(
+    test,
+    not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+))]
+fn openable_document_paths_from_args(
+    args: impl IntoIterator<Item = String>,
+    cwd: &Path,
+) -> Vec<PathBuf> {
+    args.into_iter()
+        .filter(|arg| !arg.starts_with('-'))
+        .map(|arg| cwd.join(arg))
+        .filter(|path| is_openable_document_path(path))
+        .collect()
+}
+
+#[cfg(any(test, not(any(target_os = "ios", target_os = "android"))))]
 fn is_openable_document_path(path: &Path) -> bool {
-    let extension_ok = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("chemdraft")
-                || extension.eq_ignore_ascii_case("cdxml")
-                || extension.eq_ignore_ascii_case("cdx")
-        });
     if !path.is_file() {
         return false;
     }
-    if extension_ok {
+    if has_document_extension(path) {
         return true;
     }
     // A renamed binary CDX still opens; inspect only its header here.
@@ -7968,38 +9308,92 @@ fn is_openable_document_path(path: &Path) -> bool {
         && header == *b"VjCD0100"
 }
 
+#[cfg(any(test, not(any(target_os = "ios", target_os = "android"))))]
+fn has_document_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("chemdraft")
+                || extension.eq_ignore_ascii_case("cdxml")
+                || extension.eq_ignore_ascii_case("cdx")
+        })
+}
+
 /// Queue an opened document for the window to drain on mount (cold start). Only after setup,
 /// bring the window up and deliver it to an already-listening window.
 fn deliver_opened_document<R: Runtime>(
     app: &tauri::AppHandle<R>,
-    payload: NativeOpenDocumentPayload,
+    payloads: Vec<NativeOpenDocumentPayload>,
 ) -> Result<(), String> {
     // The file was read here in Rust, which no fs scope governs — but Save writes it back through
     // the fs plugin's writeTextFile, which only allows $HOME/$DOCUMENT/$DESKTOP/$DOWNLOAD/$TEMP. A
     // document double-clicked on another drive or a share (D:\…, \\server\…) opened fine and then
     // could not be saved in place. Grant this one file, exactly as the dialog plugin does for a
     // file the user picks.
-    allow_opened_document_in_scope(app, Path::new(&payload.path));
+    for payload in &payloads {
+        allow_opened_document_in_scope(app, Path::new(&payload.path));
+    }
 
     let state = app.state::<PendingOpenDocument>();
     let delivery = state.record(
-        payload.clone(),
+        payloads,
         app.get_webview_window(MAIN_WINDOW_LABEL).is_some(),
     )?;
     if delivery == OpenDocumentDelivery::PendingOnly {
         // macOS can send Opened before Tauri creates its config windows. Building `main` here
         // would collide with Tauri's window creation and abort inside the AppKit callback.
-        // Setup will show the config window; its mount drains the pending document.
+        // Setup will show the config window; its mount drains every pending document.
         return Ok(());
     }
 
     if let Err(error) = ensure_main_window_visible(app) {
         eprintln!("Could not show ChemDraft main window for opened document: {error}");
     }
-    emit_open_document_to_main(app, &payload)
+    emit_open_document_to_main(app)
 }
 
-#[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
+/// Read every file before delivering the OS request as one atomic queue append. A concurrent drain
+/// must not split the batch and let a later success hide an earlier file's parse failure.
+fn deliver_opened_documents(
+    payloads: impl IntoIterator<Item = Result<NativeOpenDocumentPayload, String>>,
+    mut deliver: impl FnMut(Vec<NativeOpenDocumentPayload>) -> Result<(), String>,
+) -> Result<(), String> {
+    let (opened, mut errors) = read_opened_documents(payloads);
+    if !opened.is_empty() {
+        if let Err(error) = deliver(opened) {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+fn read_opened_documents(
+    payloads: impl IntoIterator<Item = Result<NativeOpenDocumentPayload, String>>,
+) -> (Vec<NativeOpenDocumentPayload>, Vec<String>) {
+    let mut opened = Vec::new();
+    let mut errors = Vec::new();
+    for payload in payloads {
+        match payload {
+            Ok(payload) => opened.push(payload),
+            Err(error) => errors.push(error),
+        }
+    }
+    (opened, errors)
+}
+
+#[cfg(any(test, target_os = "macos", target_os = "ios", target_os = "android"))]
+fn opened_document_payloads_from_urls(
+    urls: Vec<tauri::Url>,
+) -> impl Iterator<Item = Result<NativeOpenDocumentPayload, String>> {
+    urls.into_iter()
+        .filter_map(|url| open_document_payload_from_url(&url).transpose())
+}
+
+#[cfg(any(test, target_os = "macos", target_os = "ios", target_os = "android"))]
 fn open_document_payload_from_url(
     url: &tauri::Url,
 ) -> Result<Option<NativeOpenDocumentPayload>, String> {
@@ -8038,11 +9432,53 @@ fn decode_document_text(bytes: &[u8]) -> String {
 
 const MAX_OPEN_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The renderer keeps an opened document's path as a JavaScript string and saves back through it.
+/// A path with no UTF-8 form cannot survive that trip, so on Linux (where file names are raw bytes)
+/// it is refused by name rather than replaced with a lossy look-alike that a save would miss.
+/// Other hosts keep their earlier conversion: macOS paths are always UTF-8, and `exact` stays off
+/// on Windows so its behavior does not change.
+fn open_document_path_text(path: &Path, exact: bool) -> Result<String, String> {
+    match path.to_str() {
+        Some(text) => Ok(text.to_owned()),
+        None if exact => Err(unsavable_document_path_message(path)),
+        None => Ok(path.to_string_lossy().into_owned()),
+    }
+}
+
+fn unsavable_document_path_message(path: &Path) -> String {
+    format!(
+        "Could not open \"{}\": its file name is not valid UTF-8, so ChemDraft could not save \
+         changes back to it. Rename the file and open it again.",
+        path.display()
+    )
+}
+
+/// Off macOS a failed shell open is otherwise reported only on stderr.
+#[cfg(target_os = "linux")]
+fn show_open_document_error<R: Runtime>(app: &tauri::AppHandle<R>, error: &str) {
+    let mut message = app
+        .dialog()
+        .message(error)
+        .title("ChemDraft Could Not Open a Document")
+        .kind(tauri_plugin_dialog::MessageDialogKind::Error);
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        message = message.parent(&window);
+    }
+    message.show(|_| {});
+}
+
 fn open_document_payload_from_path(path: &Path) -> Result<NativeOpenDocumentPayload, String> {
     use std::io::Read;
-    let read_error = |error| format!("Could not read document {}: {error}", path.display());
+    let path_text = open_document_path_text(path, cfg!(target_os = "linux"))?;
+    let display_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Untitled.chemdraft")
+        .to_string();
+    let read_error = |error| format!("Could not open {display_name}: {error}");
     let file = fs::File::open(path).map_err(read_error)?;
-    let too_big = || "Document exceeds the 64 MB size limit".to_string();
+    let too_big =
+        || format!("Could not open {display_name}: Document exceeds the 64 MB size limit");
     if file.metadata().map_err(read_error)?.len() > MAX_OPEN_DOCUMENT_BYTES {
         return Err(too_big());
     }
@@ -8059,14 +9495,10 @@ fn open_document_payload_from_path(path: &Path) -> Result<NativeOpenDocumentPayl
     } else {
         (decode_document_text(&data), None)
     };
-    let display_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("Untitled.chemdraft")
-        .to_string();
-
     Ok(NativeOpenDocumentPayload {
-        path: path.to_string_lossy().to_string(),
+        #[cfg(target_os = "macos")]
+        receipt: None,
+        path: path_text,
         display_name,
         contents,
         bytes,
@@ -8093,14 +9525,10 @@ fn allow_opened_document_in_scope<R: Runtime>(app: &tauri::AppHandle<R>, path: &
     }
 }
 
-fn emit_open_document_to_main<R: Runtime>(
-    app: &tauri::AppHandle<R>,
-    payload: &NativeOpenDocumentPayload,
-) -> Result<(), String> {
-    // Deliver via the Tauri event for a running window; a cold start (window not yet
-    // listening) is covered by the pending-document state drained on mount. We deliberately
-    // do not `eval` document contents into the webview to avoid a script-injection surface.
-    app.emit_to(MAIN_WINDOW_LABEL, OPEN_DOCUMENT_EVENT, payload.clone())
+fn emit_open_document_to_main<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
+    // Events only signal that the queue changed. The window subscribes before its first drain,
+    // then serializes drains, so an event overlapping a drain cannot deliver a file twice.
+    app.emit_to(MAIN_WINDOW_LABEL, OPEN_DOCUMENT_EVENT, ())
         .map_err(|error| error.to_string())
 }
 
@@ -8116,11 +9544,7 @@ fn emit_toolset_window_state_to_main<R: Runtime>(
         .map_err(|error| error.to_string())
 }
 
-/// The checkable View-menu toggle states that must survive a full menu rebuild. `set_toolbars_menu`
-/// rebuilds the whole bar via `set_menu`, which recreates the Show Rulers / Show Crosshairs items;
-/// carrying their real state here keeps them from snapping back to a hardcoded default (the checkmark
-/// would otherwise desync and then invert on the next click). JS is the source of truth and passes
-/// the current values; the startup menu uses the defaults, which match the app's initial state.
+/// Webview-owned View checkmarks and Close Tab / Close Window label.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ViewMenuState {
     rulers_visible: bool,
@@ -8138,68 +9562,250 @@ impl Default for ViewMenuState {
     }
 }
 
-/// Sync the webview's plugin menu items into the native menu (ADR-0016): store them, then
-/// rebuild + reinstall the app menu so they appear natively. Clicks route back by the `plugin.`
-/// prefix or an explicit `core_routed` flag through the existing native→webview command bridge.
+/// Compare and store the requested model on the UI thread, alongside the native menu mutations.
 #[tauri::command]
 fn sync_plugin_menu_items(
     app: tauri::AppHandle,
     items: Vec<PluginMenuItemInput>,
 ) -> Result<(), String> {
-    {
-        let state = app.state::<PluginNativeMenuItems>();
-        let mut guard = state.0.lock().map_err(|error| error.to_string())?;
-        // The webview re-sends the list on every plugin host/panel change (each report push, panel
-        // open/close), almost always unchanged. A rebuild swaps the whole menu bar — on Windows two
-        // SetMenu calls that resize the document's client area — so identical syncs are dropped.
-        if *guard == items {
-            return Ok(());
-        }
-        *guard = items;
-    }
-    reinstall_app_menu(&app)
+    run_on_main_thread_blocking(&app.clone(), move || {
+        app.state::<PluginNativeMenuItems>().apply_update(
+            &app.state::<NativeMenuNeedsRebuild>().0,
+            items,
+            |previous, next| update_installed_plugin_menu(&app, previous, next),
+            |next| {
+                let (entries, view) = current_toolbars_menu_model(&app);
+                reinstall_app_menu(&app, &entries, view, next, current_keybinding_scheme(&app))
+            },
+        )
+    })?
 }
 
-/// How a Toolbars-menu push differs from the menu already installed.
+impl PluginNativeMenuItems {
+    fn apply_update(
+        &self,
+        needs_rebuild: &AtomicBool,
+        items: Vec<PluginMenuItemInput>,
+        update_properties: impl FnOnce(
+            &[PluginMenuItemInput],
+            &[PluginMenuItemInput],
+        ) -> Result<(), String>,
+        rebuild: impl FnOnce(&[PluginMenuItemInput]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let previous = self.0.lock().unwrap().clone();
+        let result = apply_menu_update(
+            needs_rebuild,
+            classify_plugin_menu_update(&previous, &items),
+            || update_properties(&previous, &items),
+            || rebuild(&items),
+        );
+        // A rebuild from another menu update still needs the latest request after a setter fails.
+        *self.0.lock().unwrap() = items;
+        result
+    }
+}
+
 #[derive(Debug, PartialEq)]
-enum ToolbarsMenuUpdate {
-    /// Same rows, same checkmarks: nothing to do.
+enum MenuUpdate {
     Unchanged,
-    /// Same rows (ids and titles, in order); only checkmarks changed — flip them in place.
-    ChecksOnly,
-    /// Rows were added, removed, reordered or renamed: rebuild the menu.
+    Properties,
     Rebuild,
+}
+
+fn apply_menu_update(
+    needs_rebuild: &AtomicBool,
+    update: MenuUpdate,
+    update_properties: impl FnOnce() -> Result<(), String>,
+    rebuild: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let result = match (needs_rebuild.load(Ordering::Relaxed), update) {
+        (true, _) | (_, MenuUpdate::Rebuild) => rebuild(),
+        (false, MenuUpdate::Properties) => update_properties(),
+        (false, MenuUpdate::Unchanged) => return Ok(()),
+    };
+    needs_rebuild.store(result.is_err(), Ordering::Relaxed);
+    result
+}
+
+const DYNAMIC_MENU_SECTIONS: [&str; 4] = ["structure", "tools", "analyze", "plugins"];
+
+fn classify_plugin_menu_update(
+    old: &[PluginMenuItemInput],
+    new: &[PluginMenuItemInput],
+) -> MenuUpdate {
+    if old == new {
+        return MenuUpdate::Unchanged;
+    }
+    for section in DYNAMIC_MENU_SECTIONS {
+        let old = plugin_menu_items_in(old, section);
+        let new = plugin_menu_items_in(new, section);
+        if old.len() != new.len()
+            || old.into_iter().zip(new).any(|(a, b)| {
+                a.id != b.id || (section == "structure" && a.separator_before != b.separator_before)
+            })
+        {
+            return MenuUpdate::Rebuild;
+        }
+    }
+    MenuUpdate::Properties
+}
+
+fn update_installed_plugin_menu<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    previous: &[PluginMenuItemInput],
+    next: &[PluginMenuItemInput],
+) -> Result<(), String> {
+    let menu = installed_app_menu(app)?;
+    let sections = menu.items().map_err(|e| e.to_string())?;
+    update_plugin_menu_properties(
+        previous,
+        next,
+        |section| {
+            let (section_position, submenu) = sections
+                .iter()
+                .enumerate()
+                .find(|(_, item)| item.id().as_ref() == section)
+                .and_then(|(position, item)| item.as_submenu().map(|submenu| (position, submenu)))
+                .ok_or_else(|| format!("Missing native menu section {section}"))?;
+            let items = submenu.items().map_err(|e| e.to_string())?;
+            let row_count = items.len();
+            Ok(items
+                .into_iter()
+                .enumerate()
+                .filter_map(|(position, kind)| {
+                    let MenuItemKind::MenuItem(item) = kind else {
+                        return None;
+                    };
+                    let id = item.id().as_ref().to_string();
+                    Some((id, (item, (submenu, section_position, position, row_count))))
+                })
+                .collect())
+        },
+        |(item, position), enabled| {
+            item.set_enabled(enabled).map_err(|e| e.to_string())?;
+            #[cfg(windows)]
+            if !enabled {
+                gray_disabled_menu_item(app, *position)?;
+            }
+            #[cfg(not(windows))]
+            let _ = position;
+            Ok(())
+        },
+        |(item, _), label| item.set_text(label).map_err(|e| e.to_string()),
+    )
+}
+
+#[cfg(windows)]
+fn gray_disabled_menu_item<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    position: (&Submenu<R>, usize, usize, usize),
+) -> Result<(), String> {
+    use tauri::menu::ContextMenu;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnableMenuItem, GetMenu, GetMenuItemCount, GetSubMenu, HMENU, MF_BYPOSITION, MF_GRAYED,
+    };
+
+    let (submenu, section_position, row_position, row_count) = position;
+    let window = app
+        .get_webview_window(MAIN_WINDOW_LABEL)
+        .ok_or("The native document window is unavailable.")?;
+    let hwnd = window.hwnd().map_err(|e| e.to_string())?;
+    let popup = submenu.hpopupmenu().map_err(|e| e.to_string())? as HMENU;
+    // Stock muda uses MF_DISABLED when mutating rows and MF_GRAYED when building them.
+    // The installed bar and Tauri's popup copy both preserve the submenu's item order.
+    // Positions distinguish duplicate command aliases and include separator rows.
+    // SAFETY: This runs on the UI thread with the document window and menu handles live.
+    unsafe {
+        let installed = GetSubMenu(GetMenu(hwnd.0 as _), section_position as i32);
+        for handle in [installed, popup] {
+            if GetMenuItemCount(handle) != row_count as i32
+                || EnableMenuItem(handle, row_position as u32, MF_BYPOSITION | MF_GRAYED) == -1
+            {
+                return Err(format!(
+                    "Could not gray native menu item in {}",
+                    submenu.id().as_ref()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn update_plugin_menu_properties<Row>(
+    previous: &[PluginMenuItemInput],
+    next: &[PluginMenuItemInput],
+    mut section_rows: impl FnMut(&str) -> Result<Vec<(String, Row)>, String>,
+    mut set_enabled: impl FnMut(&Row, bool) -> Result<(), String>,
+    mut set_text: impl FnMut(&Row, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    for section in DYNAMIC_MENU_SECTIONS {
+        let old = plugin_menu_items_in(previous, section);
+        let new = plugin_menu_items_in(next, section);
+        if old == new {
+            continue;
+        }
+        // Dynamic rows are appended in payload order. Match from the end so multiple
+        // aliases of one command can each keep their own title and enabled state.
+        let mut commands = section_rows(section)?.into_iter().rev();
+        for (old, new) in old.into_iter().zip(new).rev() {
+            let (_, item) = commands
+                .next()
+                .filter(|(id, _)| id == &new.id)
+                .ok_or_else(|| format!("Missing native menu item {} in {section}", new.id))?;
+            if old.enabled != new.enabled {
+                set_enabled(&item, new.enabled)?;
+            }
+            if old.label != new.label {
+                set_text(&item, &new.label)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn classify_toolbars_menu_update(
     previous: &(Vec<ToolbarMenuEntry>, ViewMenuState),
     next_entries: &[ToolbarMenuEntry],
     next_view: ViewMenuState,
-) -> ToolbarsMenuUpdate {
+) -> MenuUpdate {
     let (previous_entries, previous_view) = previous;
-    let same_rows = previous_entries.len() == next_entries.len()
-        && previous_entries
-            .iter()
-            .zip(next_entries)
-            .all(|(old, new)| old.toolset_id == new.toolset_id && old.title == new.title);
-    let tab_close_changed = cfg!(target_os = "macos")
-        && previous_view.has_multiple_document_tabs != next_view.has_multiple_document_tabs;
-    if !same_rows || tab_close_changed {
-        ToolbarsMenuUpdate::Rebuild
-    } else if previous_entries.as_slice() == next_entries && *previous_view == next_view {
-        ToolbarsMenuUpdate::Unchanged
+    if previous_entries.as_slice() == next_entries && *previous_view == next_view {
+        MenuUpdate::Unchanged
+    } else if previous_entries
+        .iter()
+        .map(|row| &row.toolset_id)
+        .eq(next_entries.iter().map(|row| &row.toolset_id))
+    {
+        MenuUpdate::Properties
     } else {
-        ToolbarsMenuUpdate::ChecksOnly
+        MenuUpdate::Rebuild
     }
 }
 
-/// Rebuild and install the app menu on the main thread from the last JS-pushed toolbar model plus the
-/// current plugin menu items. Toolbar rows and View-toggle state come from `ToolbarsMenuModel` (what
-/// `set_toolbars_menu` last stored), so a plugin sync never resets the Toolbars submenu or the View
-/// checkmarks while JS remains the source of truth for both.
-/// Store the webview-owned keybinding scheme and rebuild the native menu so its accelerators match.
-/// JS pushes this on startup and whenever the Preferences toggle changes; the scheme itself is
-/// persisted by the webview (localStorage), so Rust only mirrors it.
+impl KeybindingScheme {
+    fn export(self) -> &'static str {
+        match self {
+            Self::ChemDraft => "CmdOrCtrl+Shift+E",
+            Self::ChemDraw if cfg!(target_os = "macos") => "Ctrl+Command+E",
+            Self::ChemDraw => "CmdOrCtrl+E",
+        }
+    }
+
+    fn rulers(self) -> &'static str {
+        match self {
+            Self::ChemDraft => "CmdOrCtrl+R",
+            Self::ChemDraw => "CmdOrCtrl+;",
+        }
+    }
+
+    fn crosshairs(self) -> &'static str {
+        match self {
+            Self::ChemDraft => "CmdOrCtrl+Shift+R",
+            Self::ChemDraw => "Alt+CmdOrCtrl+X",
+        }
+    }
+}
+
 #[tauri::command]
 fn set_keybinding_scheme(app: tauri::AppHandle, scheme: String) -> Result<(), String> {
     let parsed = match scheme.as_str() {
@@ -8207,21 +9813,50 @@ fn set_keybinding_scheme(app: tauri::AppHandle, scheme: String) -> Result<(), St
         "chemdraw" => KeybindingScheme::ChemDraw,
         other => return Err(format!("unknown keybinding scheme: {other}")),
     };
-    let state = app.state::<KeybindingSchemeState>();
-    let changed = {
-        let mut guard = state.0.lock().map_err(|error| error.to_string())?;
-        let changed = *guard != parsed;
-        *guard = parsed;
-        changed
-    };
-    if changed {
-        reinstall_app_menu(&app)?;
-    }
-    Ok(())
+    run_on_main_thread_blocking(&app.clone(), move || {
+        let update = if current_keybinding_scheme(&app) == parsed {
+            MenuUpdate::Unchanged
+        } else if cfg!(windows) {
+            MenuUpdate::Rebuild
+        } else {
+            MenuUpdate::Properties
+        };
+        apply_menu_update(
+            &app.state::<NativeMenuNeedsRebuild>().0,
+            update,
+            || {
+                let menu = installed_app_menu(&app)?;
+                for (id, accelerator) in [
+                    ("export.open", parsed.export()),
+                    ("view.toggleRulers", parsed.rulers()),
+                    ("view.toggleCrosshairs", parsed.crosshairs()),
+                ] {
+                    match required_menu_item(&menu, id)? {
+                        MenuItemKind::MenuItem(item) => item.set_accelerator(Some(accelerator)),
+                        MenuItemKind::Check(item) => item.set_accelerator(Some(accelerator)),
+                        _ => return Err(format!("Expected an accelerator menu item for {id}")),
+                    }
+                    .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            },
+            || {
+                let (entries, view) = current_toolbars_menu_model(&app);
+                reinstall_app_menu(
+                    &app,
+                    &entries,
+                    view,
+                    &current_plugin_menu_items(&app),
+                    parsed,
+                )
+            },
+        )?;
+        *app.state::<KeybindingSchemeState>().0.lock().unwrap() = parsed;
+        Ok(())
+    })?
 }
 
-/// Install a (re)built app menu. Must run on the main thread (every caller does: `setup`, and the
-/// `run_on_main_thread` closures of `set_toolbars_menu` / `reinstall_app_menu`).
+/// Install the document menu during setup or a structural update on the UI thread.
 ///
 /// macOS has one app-wide menu bar. Elsewhere the menu belongs to the document window alone and is
 /// set on that window, never app-wide. An app-wide Tauri menu is attached to EVERY window, and
@@ -8246,22 +9881,20 @@ fn install_app_menu<R: Runtime>(app: &tauri::AppHandle<R>, menu: Menu<R>) -> tau
         };
         window.set_menu(menu)?;
     }
+    windows_activation_log::menu(None);
     Ok(())
 }
 
-fn reinstall_app_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
-    let app = app.clone();
-    app.clone()
-        .run_on_main_thread(move || {
-            let (entries, view_state) = current_toolbars_menu_model(&app);
-            let plugin_items = current_plugin_menu_items(&app);
-            let result = create_app_menu_for_toolsets(&app, &entries, view_state, &plugin_items)
-                .and_then(|menu| install_app_menu(&app, menu));
-            if let Err(error) = result {
-                eprintln!("Could not update ChemDraft plugin menu: {error}");
-            }
-        })
-        .map_err(|error| error.to_string())
+fn reinstall_app_menu<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    entries: &[ToolbarMenuEntry],
+    view: ViewMenuState,
+    plugin_items: &[PluginMenuItemInput],
+    scheme: KeybindingScheme,
+) -> Result<(), String> {
+    create_app_menu_for_toolsets(app, entries, view, plugin_items, scheme)
+        .and_then(|menu| install_app_menu(app, menu))
+        .map_err(|e| e.to_string())
 }
 
 /// Shared Insert menu for the macOS application menu and Windows document-window menu.
@@ -8331,14 +9964,20 @@ fn build_analyze_submenu<R: Runtime>(
             items.push(item);
         }
     }
-    Submenu::with_items(app, "Analyze", true, &items)
+    Submenu::with_id_and_items(app, "analyze", "Analyze", true, &items)
 }
 
 fn create_app_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<Menu<R>> {
     // Empty Toolbars submenu; JS pushes the real rows via set_toolbars_menu once it loads. Plugin
     // items are read from state so menu rebuilds after a plugin sync keep them (ADR-0016).
     let plugin_items = current_plugin_menu_items(app);
-    create_app_menu_for_toolsets(app, &[], ViewMenuState::default(), &plugin_items)
+    create_app_menu_for_toolsets(
+        app,
+        &[],
+        ViewMenuState::default(),
+        &plugin_items,
+        current_keybinding_scheme(app),
+    )
 }
 
 /// The plugin menu items last synced from the webview (empty until the first sync). Read on every menu
@@ -8363,14 +10002,25 @@ fn create_app_menu_for_toolsets<R: Runtime>(
     entries: &[ToolbarMenuEntry],
     view_state: ViewMenuState,
     plugin_items: &[PluginMenuItemInput],
+    scheme: KeybindingScheme,
 ) -> tauri::Result<Menu<R>> {
     #[cfg(target_os = "macos")]
     let native_app_menu = create_native_app_menu(app)?;
     let page_setup_menu = create_page_setup_menu(app)?;
     let insert_menu = build_insert_submenu(app)?;
-    let view_menu = create_view_menu(app, entries, view_state)?;
-    let structure_menu = Submenu::with_items(
+    let view_menu = create_view_menu(app, entries, view_state, scheme)?;
+    #[cfg(target_os = "macos")]
+    let fullscreen = {
+        // The initial app menu is built before the document window exists.
+        let is_fullscreen = main_ns_window(app)
+            .is_some_and(|window| window.styleMask().contains(NSWindowStyleMask::FullScreen));
+        let item = PredefinedMenuItem::fullscreen(app, Some(fullscreen_menu_title(is_fullscreen)))?;
+        view_menu.append_items(&[&PredefinedMenuItem::separator(app)?, &item])?;
+        item
+    };
+    let structure_menu = Submenu::with_id_and_items(
         app,
+        "structure",
         "Structure",
         true,
         &[
@@ -8414,7 +10064,7 @@ fn create_app_menu_for_toolsets<R: Runtime>(
             )?)?;
         }
     }
-    let tools_menu = Submenu::with_items(app, "Tools", true, &[])?;
+    let tools_menu = Submenu::with_id_and_items(app, "tools", "Tools", true, &[])?;
     for item in plugin_menu_items_in(plugin_items, "tools") {
         tools_menu.append(&MenuItem::with_id(
             app,
@@ -8425,8 +10075,9 @@ fn create_app_menu_for_toolsets<R: Runtime>(
         )?)?;
     }
     let analyze_menu = build_analyze_submenu(app, plugin_items)?;
-    let plugins_menu = Submenu::with_items(
+    let plugins_menu = Submenu::with_id_and_items(
         app,
+        "plugins",
         "Plugins",
         true,
         &[
@@ -8461,7 +10112,9 @@ fn create_app_menu_for_toolsets<R: Runtime>(
         }
     }
 
-    Menu::with_items(
+    // On Windows, the document webview handles the shortcuts. Attaching accelerated rows after
+    // their submenu joins the root would allocate a table stock muda leaves behind on drop.
+    let menu = Menu::with_items(
         app,
         &[
             #[cfg(target_os = "macos")]
@@ -8489,15 +10142,7 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                         "export.open",
                         "Export...",
                         true,
-                        Some(match current_keybinding_scheme(app) {
-                            KeybindingScheme::ChemDraft => "CmdOrCtrl+Shift+E",
-                            #[cfg(target_os = "macos")]
-                            KeybindingScheme::ChemDraw => "Ctrl+Command+E",
-                            // "Command" is the Windows/Super key off macOS. The shortcut engine
-                            // folds Cmd into Ctrl there, so the ChemDraw scheme's chord is Ctrl+E.
-                            #[cfg(not(target_os = "macos"))]
-                            KeybindingScheme::ChemDraw => "CmdOrCtrl+E",
-                        }),
+                        Some(scheme.export()),
                     )?,
                     &PredefinedMenuItem::separator(app)?,
                     #[cfg(not(target_os = "macos"))]
@@ -8632,8 +10277,10 @@ fn create_app_menu_for_toolsets<R: Runtime>(
             &tools_menu,
             &analyze_menu,
             &plugins_menu,
-            &Submenu::with_items(
+            // Tauri registers this reserved ID with NSApp whenever it installs the app menu.
+            &Submenu::with_id_and_items(
                 app,
+                tauri::menu::WINDOW_SUBMENU_ID,
                 "Window",
                 true,
                 &[
@@ -8664,7 +10311,16 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                 ],
             )?,
         ],
-    )
+    )?;
+
+    #[cfg(target_os = "macos")]
+    {
+        // Keep only the new item's handle so transitions never retitle retired menus.
+        let state = app.state::<FullscreenMenuItem<R>>();
+        let previous = state.0.lock().unwrap().replace(fullscreen);
+        drop(previous);
+    }
+    Ok(menu)
 }
 
 /// Close Window (Cmd+W) on macOS. The predefined item sends `performClose:`, which AppKit refuses
@@ -8680,14 +10336,19 @@ fn close_window_menu_item<R: Runtime>(
     MenuItem::with_id(
         app,
         id,
-        if has_multiple_document_tabs {
-            "Close Tab"
-        } else {
-            "Close Window"
-        },
+        close_menu_title(has_multiple_document_tabs),
         true,
         Some("CmdOrCtrl+W"),
     )
+}
+
+#[cfg(target_os = "macos")]
+fn close_menu_title(has_multiple_document_tabs: bool) -> &'static str {
+    if has_multiple_document_tabs {
+        "Close Tab"
+    } else {
+        "Close Window"
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -8892,20 +10553,17 @@ fn create_view_menu<R: Runtime>(
     app: &tauri::AppHandle<R>,
     entries: &[ToolbarMenuEntry],
     view_state: ViewMenuState,
+    scheme: KeybindingScheme,
 ) -> tauri::Result<Submenu<R>> {
     // Real checked state (from JS), not a hardcoded true — otherwise a full-menu rebuild would
     // re-check these while the feature is off, desyncing the menu from the document.
-    let scheme = current_keybinding_scheme(app);
     let show_rulers = CheckMenuItem::with_id(
         app,
         "view.toggleRulers",
         "Show Rulers",
         true,
         view_state.rulers_visible,
-        Some(match scheme {
-            KeybindingScheme::ChemDraft => "CmdOrCtrl+R",
-            KeybindingScheme::ChemDraw => "CmdOrCtrl+;",
-        }),
+        Some(scheme.rulers()),
     )?;
     let show_crosshairs = CheckMenuItem::with_id(
         app,
@@ -8913,10 +10571,7 @@ fn create_view_menu<R: Runtime>(
         "Show Crosshairs",
         true,
         view_state.crosshairs_visible,
-        Some(match scheme {
-            KeybindingScheme::ChemDraft => "CmdOrCtrl+Shift+R",
-            KeybindingScheme::ChemDraw => "Alt+CmdOrCtrl+X",
-        }),
+        Some(scheme.crosshairs()),
     )?;
     let separator = PredefinedMenuItem::separator(app)?;
     let debugger_separator = PredefinedMenuItem::separator(app)?;
@@ -8960,6 +10615,70 @@ fn create_view_menu<R: Runtime>(
     )
 }
 
+#[cfg(target_os = "macos")]
+struct FullscreenMenuItem<R: Runtime>(Mutex<Option<PredefinedMenuItem<R>>>);
+
+#[cfg(any(target_os = "macos", test))]
+fn fullscreen_menu_title(fullscreen: bool) -> &'static str {
+    if fullscreen {
+        "Exit Full Screen"
+    } else {
+        "Enter Full Screen"
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn observe_document_fullscreen<R: Runtime>(app: &tauri::AppHandle<R>, window: &NSWindow) {
+    use objc2_app_kit::{
+        NSWindowDidEnterFullScreenNotification, NSWindowDidExitFullScreenNotification,
+    };
+    use objc2_foundation::{NSNotification, NSNotificationCenter};
+    use std::ptr::NonNull;
+
+    let center = NSNotificationCenter::defaultCenter();
+    // Muda disables AppKit menu validation. The window's completion notifications tell us when
+    // to retitle the native toggleFullScreen: item, including transitions from the green button.
+    for (notification, entered) in unsafe {
+        [
+            (NSWindowDidEnterFullScreenNotification, true),
+            (NSWindowDidExitFullScreenNotification, false),
+        ]
+    } {
+        let app = app.clone();
+        let callback = block2::RcBlock::new(move |_: NonNull<NSNotification>| {
+            let state = app.state::<FullscreenMenuItem<R>>();
+            let item = state.0.lock().unwrap().clone();
+            let Some(item) = item else { return };
+            let title = fullscreen_menu_title(entered);
+            let result = item.text().and_then(|current| {
+                if current != title {
+                    item.set_text(title)?;
+                }
+                Ok(())
+            });
+            if let Err(error) = result {
+                eprintln!("Could not update the ChemDraft full-screen menu title: {error}");
+            }
+        });
+        // The document window lives for the process, like the other document observers.
+        std::mem::forget(unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(notification),
+                Some(window),
+                None,
+                &callback,
+            )
+        });
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn fullscreen_menu_titles_match_window_state() {
+    assert_eq!(fullscreen_menu_title(false), "Enter Full Screen");
+    assert_eq!(fullscreen_menu_title(true), "Exit Full Screen");
+}
+
 /// One Toolbars-menu row. JS is the source of truth for the toolset set + titles now and pushes
 /// these via `set_toolbars_menu`; the startup menu derives the same shape from the manifest until
 /// the manifest is removed from Rust.
@@ -8992,19 +10711,31 @@ fn create_toolbars_menu<R: Runtime>(
     Ok(menu)
 }
 
+fn toolset_is_resizable(toolset_id: &str) -> bool {
+    matches!(
+        toolset_id,
+        "core.molecularInspector" | "core.drawnStructureSettings" | "core.ringInspector"
+    )
+}
+
 fn ensure_toolset_window<R: Runtime>(
     app: &tauri::AppHandle<R>,
     toolset_id: &str,
     geometry: Option<&ToolsetWindowGeometry>,
 ) -> Result<(), String> {
     let label = toolset_window_label(toolset_id);
+    let resizable = toolset_is_resizable(toolset_id);
 
     if let Some(window) = app.get_webview_window(&label) {
         // Already built — but it may have been created (or dragged) offscreen earlier, or the
         // display it lived on may have been unplugged while it was hidden. Re-clamp on the way in,
         // so re-opening from View ▸ Toolbars is always enough to recover a lost palette.
-        recover_offscreen_toolset_window(app, &window);
-        window.show().map_err(|error| error.to_string())?;
+        recover_offscreen_toolset_window(app, &window, resizable);
+        // Its page has painted, so show it now — unless it is still waiting for its first paint
+        // (Windows, palette_first_paint.rs), whose reveal will show it.
+        if !palette_first_paint::reopened(&label) {
+            window.show().map_err(|error| error.to_string())?;
+        }
         configure_toolset_utility_window(&window, true)?;
         return Ok(());
     }
@@ -9029,47 +10760,94 @@ fn ensure_toolset_window<R: Runtime>(
             ToolsetWindowPosition { x: 88.0, y: 154.0 },
         ),
     };
+    let layout = load_toolset_layout_state(app);
+    let saved = layout.toolsets.get(toolset_id);
+    let (width, height) = saved
+        .and_then(|state| state.window_size(resizable))
+        .unwrap_or((width, height));
     // A persisted position wins (the user moved it before); otherwise the JS-supplied default.
     // Either way it's clamped onto an attached monitor — a position saved on a display that's since
     // been unplugged would otherwise open the palette offscreen with no way to get it back.
-    let position = clamp_toolset_position(
+    let position = saved
+        .and_then(PersistedToolsetState::position)
+        .unwrap_or(default_position);
+    #[cfg(not(windows))]
+    let (position, width, height) = clamp_toolset_frame(app, position, (width, height), resizable);
+    #[cfg(windows)]
+    let placement = clamp_windows_toolset_frame(
         app,
-        persisted_toolset_position(app, toolset_id).unwrap_or(default_position),
-        width,
-        height,
+        ToolsetFrameOrigin::Logical(position, saved.and_then(|state| state.position_scale)),
+        (width, height),
+        resizable,
     );
 
+    // A non-resizable GtkWindow publishes fixed size hints. On native Wayland these
+    // can conflict with the compositor's configure, such as Weston's kiosk fullscreen.
+    // Keep GTK resizable there while the toolbar still uses content-fit sizing.
+    #[cfg(target_os = "linux")]
+    let native_resizable = resizable
+        || run_on_main_thread_blocking(app, || {
+            use gtk::gdk::prelude::DisplayExtManual;
+
+            gtk::gdk::Display::default().is_some_and(|display| display.backend().is_wayland())
+        })?;
+    #[cfg(not(target_os = "linux"))]
+    let native_resizable = resizable;
+    let native_wayland = utility_window::uses_native_wayland(app)?;
+
+    windows_activation_log::frame_set(&label, "toolbar creation", "logical", || {
+        ((position.x, position.y), (width, height))
+    });
+    let builder = utility_window_builder(
+        WebviewWindowBuilder::new(
+            app,
+            label.clone(),
+            WebviewUrl::App(
+                format!("/?window=toolset&toolsetId={toolset_id}&resizable={resizable}").into(),
+            ),
+        ),
+        app,
+    )?
+    .title(title)
+    .inner_size(width, height)
+    .accept_first_mouse(true)
+    .focusable(toolset_window_focusable())
+    .resizable(native_resizable)
+    .maximizable(resizable)
+    .decorations(false)
+    // Overlapping palettes need a visible edge, matching the popover's native shadow.
+    .shadow(true)
+    .skip_taskbar(true);
+    #[cfg(not(windows))]
+    let builder = if native_wayland {
+        builder
+    } else {
+        builder.position(position.x, position.y)
+    };
+    // Windows: hidden with the palette's background as its first frame, until its page paints.
+    let builder =
+        palette_first_paint::builder_step(builder, palette_first_paint::PaletteWindowKind::Toolbar);
+    #[cfg(windows)]
+    let builder = if placement.is_some() {
+        // Tao's builder accepts logical positions only. Set the physical frame before showing
+        // the window so it does not flash at an ambiguous logical position on another display.
+        builder
+    } else {
+        builder.position(position.x, position.y)
+    };
+    // Only scrolling inspectors need a floor for manual resize. A toolbar's frame is fixed
+    // at the DOM's measured size until the next fit. A floor here would leave narrow grids padded.
+    let builder = if resizable {
+        builder.min_inner_size(96.0, 56.0)
+    } else {
+        builder
+    };
     // Record label -> id so the Moved/Destroyed handlers and enumeration can resolve the toolset
     // without the manifest (the label itself is lossy).
     if let Ok(mut labels) = app.state::<ToolsetWindowDirectory>().labels.lock() {
         labels.insert(label.clone(), toolset_id.to_string());
     }
-
-    let window = match utility_window_builder(
-        WebviewWindowBuilder::new(
-            app,
-            label.clone(),
-            WebviewUrl::App(format!("/?window=toolset&toolsetId={toolset_id}").into()),
-        ),
-        app,
-    )
-    .title(title)
-    .inner_size(width, height)
-    // The window is sized to its actual palette content by the JS side (PaletteWindow
-    // applySize). The manifest's min sizes were tuned for the old docked/web layout and are far too
-    // large for a content-fit floating window (e.g. Art's 760), which left a big blank area beside
-    // the tools — so keep only a tiny hard floor here.
-    .min_inner_size(96.0, 56.0)
-    .accept_first_mouse(true)
-    .focusable(toolset_window_focusable())
-    .resizable(true)
-    .decorations(false)
-    // Overlapping palettes need a visible edge, matching the popover's native shadow.
-    .shadow(true)
-    .skip_taskbar(true)
-    .position(position.x, position.y)
-    .build()
-    {
+    let window = match builder.build() {
         Ok(window) => window,
         Err(error) => {
             // Roll back the directory entry we optimistically inserted above, so a failed build
@@ -9083,8 +10861,29 @@ fn ensure_toolset_window<R: Runtime>(
     };
 
     disable_default_context_menus(&window);
+    utility_window::prepare(&window, utility_window::Kind::Toolbar, native_wayland)?;
     configure_toolset_utility_window(&window, true)?;
     install_toolset_input_focus(&window)?;
+    #[cfg(target_os = "linux")]
+    utility_window::set_visible(&window, true)?;
+    #[cfg(windows)]
+    {
+        let target = window.clone();
+        let placed = run_on_main_thread_blocking(&window, move || {
+            if let Some(placement) = placement {
+                let webview: &tauri::Webview<R> = target.as_ref();
+                panel_full_size::apply(&webview.window(), placement, "initial toolbar placement")?;
+            }
+            // Stays hidden until its page reports its first paint, or the fallback fires; a
+            // palette closed or minimized meanwhile is not shown by either (palette_first_paint.rs).
+            palette_first_paint::arm_toolbar(&target);
+            Ok::<(), String>(())
+        })
+        .and_then(|result| result);
+        panel_window::finish_installation(placed, || {
+            window.destroy().map_err(|error| error.to_string())
+        })?;
+    }
     Ok(())
 }
 
@@ -9349,9 +11148,8 @@ fn toolset_window_hides_on_deactivate() -> bool {
     true
 }
 
-/// Off macOS there is no panel treatment to apply after the build: everything a utility window
-/// needs is set on its builder by [`utility_window_builder`]. (No menu bar needs stripping either —
-/// the app menu is attached to the document window only; see `install_app_menu`.)
+/// AppKit applies its panel level during reconfiguration. Linux applies its GTK hints only
+/// before the first show in [`utility_window::prepare`].
 #[cfg(not(target_os = "macos"))]
 fn configure_toolset_utility_window<R: Runtime>(
     _window: &tauri::WebviewWindow<R>,
@@ -9360,8 +11158,9 @@ fn configure_toolset_utility_window<R: Runtime>(
     Ok(())
 }
 
-/// Builder settings every floating utility window (palettes, popovers, the tooltip, plugin panels)
-/// shares. On Windows:
+/// Set ownership and initial activation for toolbars and the tooltip.
+/// On Linux, Tauri sets GTK's transient parent at construction. Keep the window hidden until
+/// [`utility_window::prepare`] applies the GTK hints. On Windows:
 /// - **owned by the document window**, given to tao at build time: an owned window stays above its
 ///   owner, hides while it is minimized and is destroyed with it — and tao creates it as a popup
 ///   without `WS_EX_APPWINDOW`. (Setting `GWLP_HWNDPARENT` afterwards left tao believing the window
@@ -9373,22 +11172,33 @@ fn configure_toolset_utility_window<R: Runtime>(
 fn utility_window_builder<'a, R: Runtime, M: Manager<R>>(
     builder: WebviewWindowBuilder<'a, R, M>,
     app: &tauri::AppHandle<R>,
-) -> WebviewWindowBuilder<'a, R, M> {
+) -> Result<WebviewWindowBuilder<'a, R, M>, String> {
     #[cfg(windows)]
     {
         let builder = builder.focused(false);
-        match app
+        let owner = app
             .get_webview_window(MAIN_WINDOW_LABEL)
-            .and_then(|main| main.hwnd().ok())
-        {
+            .and_then(|main| main.hwnd().ok());
+        Ok(match owner {
             Some(owner) => builder.owner_raw(owner),
             None => builder,
-        }
+        })
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        let main = app
+            .get_webview_window(MAIN_WINDOW_LABEL)
+            .ok_or("The document window is unavailable for this utility window.")?;
+        builder
+            .focused(false)
+            .visible(false)
+            .parent(&main)
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = app;
-        builder
+        Ok(builder)
     }
 }
 
@@ -9398,7 +11208,9 @@ fn toolset_state<R: Runtime>(
 ) -> Result<ToolsetWindowState, String> {
     match app.get_webview_window(&toolset_window_label(toolset_id)) {
         Some(window) => {
-            let actual_visible = window.is_visible().unwrap_or(false);
+            // A palette still hidden until its first paint (Windows) is open, not closed.
+            let actual_visible = window.is_visible().unwrap_or(false)
+                || palette_first_paint::opening(window.label());
             let visible = UTILITY_SUSPENSION
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -9452,18 +11264,15 @@ fn toolset_toggle_command_id(toolset_id: &str) -> String {
 
 fn is_routed_menu_command(command_id: &str) -> bool {
     MENU_COMMAND_IDS.contains(&command_id)
-        || (cfg!(target_os = "linux")
-            && CLIPBOARD_EDIT_MENU_ITEMS
-                .iter()
-                .any(|(id, _)| *id == command_id))
+        || native_clipboard_edit_command(command_id).is_some()
         || command_id.starts_with(TOOLSET_TOGGLE_PREFIX)
         || command_id.starts_with(PLUGIN_COMMAND_PREFIX)
 }
 
-/// How much of a palette must land on a monitor for the user to be able to grab and move it.
-const TOOLSET_WINDOW_MIN_VISIBLE_PX: f64 = 48.0;
+const TOOLSET_TITLE_HEIGHT: f64 = 22.0;
 
-/// A monitor's bounds in the same logical points palette positions are persisted in.
+/// A monitor's full bounds in global logical points.
+#[cfg(not(windows))]
 fn monitor_logical_bounds(monitor: &tauri::Monitor) -> (f64, f64, f64, f64) {
     let scale = monitor.scale_factor();
     let origin = monitor.position().to_logical::<f64>(scale);
@@ -9485,64 +11294,257 @@ fn monitor_logical_work_area(monitor: &tauri::Monitor) -> ScreenRect {
     ScreenRect::new(origin.x, origin.y, size.width, size.height)
 }
 
-/// True when the rect overlaps some attached monitor enough to be seen and dragged.
-fn toolset_position_is_reachable(
-    monitors: &[tauri::Monitor],
-    position: &ToolsetWindowPosition,
+fn toolset_position_in_work_area(
+    position: ToolsetWindowPosition,
     width: f64,
     height: f64,
-) -> bool {
-    monitors.iter().any(|monitor| {
-        let (left, top, right, bottom) = monitor_logical_bounds(monitor);
-        let overlap_w = (position.x + width).min(right) - position.x.max(left);
-        let overlap_h = (position.y + height).min(bottom) - position.y.max(top);
-        overlap_w >= TOOLSET_WINDOW_MIN_VISIBLE_PX && overlap_h >= TOOLSET_WINDOW_MIN_VISIBLE_PX
-    })
+    area: ScreenRect,
+) -> ToolsetWindowPosition {
+    if area.contains_title_strip(position.x, position.y, width, TOOLSET_TITLE_HEIGHT) {
+        return position;
+    }
+    // Pin oversized palettes to the top-left of the work area.
+    ToolsetWindowPosition {
+        x: position.x.min(area.x + area.width - width).max(area.x),
+        y: position.y.min(area.y + area.height - height).max(area.y),
+    }
 }
 
-/// Pull a palette position back onto an attached monitor.
+fn inspector_frame_in_work_area(
+    position: ToolsetWindowPosition,
+    size: (f64, f64),
+    area: ScreenRect,
+) -> (ToolsetWindowPosition, f64, f64) {
+    let width = size.0.min(area.width);
+    let height = size.1.min(area.height);
+    let position = ToolsetWindowPosition {
+        x: position.x.clamp(area.x, area.x + (area.width - width)),
+        y: position.y.clamp(area.y, area.y + (area.height - height)),
+    };
+    (position, width, height)
+}
+
+/// Pull a palette back onto an attached monitor. Scrolling inspectors need the full viewport
+/// inside the work area, while a toolbar only needs a reachable title before it fits its content.
 ///
 /// Positions are persisted in logical points, so a toolbar last parked on an external display comes
 /// back at coordinates that no longer exist once that display is unplugged. The window is then
 /// created successfully and painted into nowhere — which reads to the user as "the toolbar won't
 /// open" even though View ▸ Toolbars shows it checked, with no UI path to recover it. Clamp onto the
 /// primary monitor (the one that's certainly present) whenever the saved spot is unreachable.
-fn clamp_toolset_position<R: Runtime>(
+#[cfg(not(windows))]
+fn clamp_toolset_frame<R: Runtime>(
     app: &tauri::AppHandle<R>,
     position: ToolsetWindowPosition,
-    width: f64,
-    height: f64,
-) -> ToolsetWindowPosition {
+    size: (f64, f64),
+    resizable: bool,
+) -> (ToolsetWindowPosition, f64, f64) {
+    let (width, height) = size;
     let monitors = match monitor_query::available_monitors(app) {
         Ok(monitors) if !monitors.is_empty() => monitors,
         // No monitor info (headless, or the platform refused): trust the saved position rather than
         // moving a window the user may have deliberately placed.
-        _ => return position,
+        _ => return (position, width, height),
     };
 
-    if toolset_position_is_reachable(&monitors, &position, width, height) {
-        return position;
-    }
+    let areas = monitors
+        .iter()
+        .map(|monitor| {
+            let (left, top, right, bottom) = monitor_logical_bounds(monitor);
+            (
+                ScreenRect::new(left, top, right - left, bottom - top),
+                monitor_logical_work_area(monitor),
+            )
+        })
+        .collect::<Vec<_>>();
+    let area = toolset_work_area_for_origin(position, width, &areas).unwrap_or_else(|| {
+        let primary = monitor_query::primary_monitor(app).ok().flatten();
+        monitor_logical_work_area(primary.as_ref().unwrap_or(&monitors[0]))
+    });
+    toolset_frame_in_work_area(position, size, resizable, area)
+}
 
-    let target = monitor_query::primary_monitor(app)
+#[cfg(any(not(windows), test))]
+fn toolset_work_area_for_origin(
+    position: ToolsetWindowPosition,
+    width: f64,
+    monitors: &[(ScreenRect, ScreenRect)],
+) -> Option<ScreenRect> {
+    monitors
+        .iter()
+        // The saved origin can still identify the monitor when it falls in the Dock or menu bar.
+        .find(|(bounds, _)| {
+            (bounds.x..bounds.x + bounds.width).contains(&position.x)
+                && (bounds.y..bounds.y + bounds.height).contains(&position.y)
+        })
+        .or_else(|| {
+            monitors.iter().find(|(_, area)| {
+                area.contains_title_strip(position.x, position.y, width, TOOLSET_TITLE_HEIGHT)
+            })
+        })
+        .map(|(_, area)| *area)
+}
+
+fn toolset_frame_in_work_area(
+    position: ToolsetWindowPosition,
+    size: (f64, f64),
+    resizable: bool,
+    area: ScreenRect,
+) -> (ToolsetWindowPosition, f64, f64) {
+    if resizable {
+        return inspector_frame_in_work_area(position, size, area);
+    }
+    let (width, height) = size;
+    (
+        toolset_position_in_work_area(position, width, height, area),
+        width,
+        height,
+    )
+}
+
+#[cfg(any(windows, test))]
+type ToolsetMonitor = panel_window_frame::Monitor;
+
+#[cfg(any(windows, test))]
+enum ToolsetFrameOrigin {
+    Physical((i32, i32), f64),
+    Logical(ToolsetWindowPosition, Option<f64>),
+}
+
+#[cfg(any(windows, test))]
+fn toolset_monitor_contains(monitor: &ToolsetMonitor, point: (f64, f64)) -> bool {
+    let (x, y) = monitor.identity.position;
+    let (width, height) = monitor.identity.size;
+    let (x, y) = (f64::from(x), f64::from(y));
+    (x..x + f64::from(width)).contains(&point.0) && (y..y + f64::from(height)).contains(&point.1)
+}
+
+#[cfg(any(windows, test))]
+fn monitor_containing_physical_point(
+    monitors: &[ToolsetMonitor],
+    point: (f64, f64),
+) -> Option<&ToolsetMonitor> {
+    monitors
+        .iter()
+        .find(|monitor| toolset_monitor_contains(monitor, point))
+}
+
+/// Select a Windows monitor in virtual-desktop pixels. Only after selecting it do we use its
+/// scale to clamp the frame in monitor-local points and convert it back to pixels.
+#[cfg(any(windows, test))]
+fn clamp_toolset_frame_in_physical_space(
+    origin: ToolsetFrameOrigin,
+    size: (f64, f64),
+    resizable: bool,
+    monitors: &[ToolsetMonitor],
+    primary: &ToolsetMonitor,
+) -> panel_window_frame::Placement {
+    let (physical, source_scale) = match origin {
+        ToolsetFrameOrigin::Physical((x, y), scale) => ((f64::from(x), f64::from(y)), scale),
+        ToolsetFrameOrigin::Logical(position, saved_scale) => {
+            let scale = saved_scale
+                .filter(|scale| scale.is_finite() && *scale > 0.0)
+                .unwrap_or_else(|| {
+                    // Legacy saves have no scale. Use a monitor that can explain the saved
+                    // position, preferring the primary if the old coordinates are ambiguous.
+                    std::iter::once(primary)
+                        .chain(monitors)
+                        .find(|monitor| {
+                            toolset_monitor_contains(
+                                monitor,
+                                (position.x * monitor.scale, position.y * monitor.scale),
+                            )
+                        })
+                        .unwrap_or(primary)
+                        .scale
+                });
+            ((position.x * scale, position.y * scale), scale)
+        }
+    };
+    let center = (
+        physical.0 + size.0 * source_scale / 2.0,
+        physical.1 + size.1 * source_scale / 2.0,
+    );
+    let monitor = monitor_containing_physical_point(monitors, physical)
+        .or_else(|| monitor_containing_physical_point(monitors, center))
+        .or_else(|| {
+            if resizable {
+                return None;
+            }
+            // A partially offscreen toolbar can still have a reachable title.
+            monitors.iter().find(|monitor| {
+                let (x, y) = monitor.identity.position;
+                let area = monitor.work_area;
+                let scale = monitor.scale;
+                ScreenRect::new(
+                    f64::from(x) + area.x * scale,
+                    f64::from(y) + area.y * scale,
+                    area.width * scale,
+                    area.height * scale,
+                )
+                .contains_title_strip_at_scale(
+                    physical.0,
+                    physical.1,
+                    size.0 * source_scale,
+                    TOOLSET_TITLE_HEIGHT * source_scale,
+                    source_scale,
+                )
+            })
+        })
+        .unwrap_or(primary);
+    let (x, y) = monitor.identity.position;
+    let scale = monitor.scale;
+    let position = ToolsetWindowPosition {
+        x: (physical.0 - f64::from(x)) / scale,
+        y: (physical.1 - f64::from(y)) / scale,
+    };
+    let (position, width, height) =
+        toolset_frame_in_work_area(position, size, resizable, monitor.work_area);
+    let size = tauri::LogicalSize::new(width, height).to_physical::<u32>(scale);
+    panel_window_frame::Placement {
+        position: (
+            (f64::from(x) + position.x * scale).round() as i32,
+            (f64::from(y) + position.y * scale).round() as i32,
+        ),
+        size: (size.width, size.height),
+        scale,
+    }
+}
+
+#[cfg(windows)]
+fn clamp_windows_toolset_frame<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    origin: ToolsetFrameOrigin,
+    size: (f64, f64),
+    resizable: bool,
+) -> Option<panel_window_frame::Placement> {
+    let monitors: Vec<_> = monitor_query::available_monitors(app)
+        .ok()?
+        .iter()
+        .map(ToolsetMonitor::from_native)
+        .collect();
+    let primary = monitor_query::primary_monitor(app)
         .ok()
         .flatten()
-        .unwrap_or_else(|| monitors[0].clone());
-    let (left, top, right, bottom) = monitor_logical_bounds(&target);
-    // max() before min() so a palette taller/wider than the monitor still pins to the top-left
-    // corner instead of inverting to a negative offset.
-    ToolsetWindowPosition {
-        x: position.x.min(right - width).max(left),
-        y: position.y.min(bottom - height).max(top),
-    }
+        .as_ref()
+        .map(ToolsetMonitor::from_native);
+    let primary = primary.as_ref().or_else(|| monitors.first())?;
+    Some(clamp_toolset_frame_in_physical_space(
+        origin, size, resizable, &monitors, primary,
+    ))
 }
 
 /// Move an already-built palette back onscreen if its current spot is unreachable. Best-effort: a
 /// window we can't measure or move is left exactly as it is rather than teleported on a guess.
+#[cfg(not(windows))]
 fn recover_offscreen_toolset_window<R: Runtime>(
     app: &tauri::AppHandle<R>,
     window: &tauri::WebviewWindow<R>,
+    resizable: bool,
 ) {
+    if utility_window::uses_native_wayland(app).unwrap_or(true) {
+        return;
+    }
     let Some(position) = current_toolset_window_position(window) else {
         return;
     };
@@ -9553,35 +11555,82 @@ fn recover_offscreen_toolset_window<R: Runtime>(
         return;
     };
     let size = size.to_logical::<f64>(scale);
-    // `position` is Copy on this branch (the clamping helpers wanted it), so main's `.clone()` here is
-    // a lint neither side trips alone -- main's struct is Clone-only. A merge artifact, not a bug.
-    let clamped = clamp_toolset_position(app, position, size.width, size.height);
+    let (clamped, width, height) =
+        clamp_toolset_frame(app, position, (size.width, size.height), resizable);
+    if (width - size.width).abs() >= 0.5 || (height - size.height).abs() >= 0.5 {
+        let _ = window.set_size(tauri::LogicalSize::new(width, height));
+    }
     if (clamped.x - position.x).abs() < 0.5 && (clamped.y - position.y).abs() < 0.5 {
         return;
     }
 
-    let physical = tauri::LogicalPosition::new(clamped.x, clamped.y).to_physical::<i32>(scale);
-    if utility_windows_suspended() {
-        // Register before SetWindowPos: Windows may buffer Moved until after finish_restore.
-        UTILITY_SUSPENSION
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .recovery_move(window.label(), (physical.x, physical.y));
-    }
-    let _ = window.set_position(physical);
+    windows_activation_log::frame_set(
+        window.label(),
+        "recover offscreen toolbar",
+        "logical",
+        || ((clamped.x, clamped.y), (width, height)),
+    );
+    let _ = window.set_position(tauri::LogicalPosition::new(clamped.x, clamped.y));
+}
+
+/// Recover a Windows palette in virtual-desktop pixels.
+#[cfg(windows)]
+fn recover_offscreen_toolset_window<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    window: &tauri::WebviewWindow<R>,
+    resizable: bool,
+) {
+    let target = window.clone();
+    let app = app.clone();
+    let _ = run_on_main_thread_blocking(window, move || {
+        let webview: &tauri::Webview<R> = target.as_ref();
+        let window = webview.window();
+        if toolset_frame_is_transient(&app, &window) {
+            return;
+        }
+        let (Ok(position), Ok(size), Ok(scale)) = (
+            window.outer_position(),
+            window.inner_size(),
+            window.scale_factor(),
+        ) else {
+            return;
+        };
+        let physical = (position.x, position.y);
+        let logical_size = size.to_logical::<f64>(scale);
+        let Some(placement) = clamp_windows_toolset_frame(
+            &app,
+            ToolsetFrameOrigin::Physical(physical, scale),
+            (logical_size.width, logical_size.height),
+            resizable,
+        ) else {
+            return;
+        };
+        if placement.position == physical {
+            if placement.size != (size.width, size.height) {
+                let _ =
+                    window.set_size(tauri::PhysicalSize::new(placement.size.0, placement.size.1));
+            }
+            return;
+        }
+        if utility_windows_suspended() {
+            // Register before SetWindowPos: Windows may buffer Moved until after finish_restore.
+            UTILITY_SUSPENSION
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recovery_move(window.label(), placement.position);
+        }
+        let _ = panel_full_size::apply(&window, placement, "recover offscreen toolbar");
+    });
 }
 
 fn persisted_toolset_position<R: Runtime>(
     app: &tauri::AppHandle<R>,
     toolset_id: &str,
 ) -> Option<ToolsetWindowPosition> {
-    let layout_state = load_toolset_layout_state(app);
-    layout_state.toolsets.get(toolset_id).and_then(|state| {
-        Some(ToolsetWindowPosition {
-            x: state.x?,
-            y: state.y?,
-        })
-    })
+    load_toolset_layout_state(app)
+        .toolsets
+        .get(toolset_id)
+        .and_then(PersistedToolsetState::position)
 }
 
 /// Whether a palette's current frame is a transient OS state (it or the document window it belongs
@@ -9590,10 +11639,10 @@ fn toolset_frame_is_transient<R: Runtime>(
     app: &tauri::AppHandle<R>,
     window: &tauri::Window<R>,
 ) -> bool {
-    let palette_minimized = window.is_minimized().unwrap_or(false);
+    let palette_minimized = window.is_minimized().unwrap_or(true);
     let document_minimized = app
         .get_webview_window(MAIN_WINDOW_LABEL)
-        .is_some_and(|main| main.is_minimized().unwrap_or(false));
+        .is_some_and(|main| main.is_minimized().unwrap_or(true));
     toolset_frame_state_is_transient(palette_minimized, document_minimized)
 }
 
@@ -9605,10 +11654,22 @@ fn toolset_frame_state_is_transient(palette_minimized: bool, document_minimized:
     palette_minimized || (cfg!(windows) && document_minimized)
 }
 
+fn visible_toolset_physical_position<R: Runtime>(
+    window: &tauri::Window<R>,
+) -> Option<tauri::PhysicalPosition<i32>> {
+    if !window.is_visible().unwrap_or(false)
+        || toolset_frame_is_transient(window.app_handle(), window)
+    {
+        return None;
+    }
+    window.outer_position().ok()
+}
+
 fn current_toolset_window_position<R: Runtime>(
     window: &tauri::WebviewWindow<R>,
 ) -> Option<ToolsetWindowPosition> {
-    if window.is_minimized().unwrap_or(false) {
+    let webview: &tauri::Webview<R> = window.as_ref();
+    if toolset_frame_is_transient(window.app_handle(), &webview.window()) {
         return None;
     }
     let position = window.outer_position().ok()?;
@@ -9651,21 +11712,48 @@ fn logical_toolset_position_from_physical(
 fn persist_toolset_position<R: Runtime>(
     app: &tauri::AppHandle<R>,
     toolset_id: &str,
-    x: f64,
-    y: f64,
+    physical: tauri::PhysicalPosition<i32>,
+    scale: f64,
 ) -> Result<(), String> {
-    update_toolset_layout_state(app, |layout_state| {
-        let state = layout_state
-            .toolsets
-            .entry(toolset_id.to_string())
-            .or_default();
-        state.x = Some(x);
-        state.y = Some(y);
+    let toolset_id = toolset_id.to_string();
+    let position =
+        logical_toolset_position_from_physical(f64::from(physical.x), f64::from(physical.y), scale);
+    update_toolset_layout_state(app, move |layout_state| {
+        let state = layout_state.toolsets.entry(toolset_id).or_default();
+        state.x = Some(position.x);
+        state.y = Some(position.y);
+        state.position_scale = (cfg!(windows) && scale.is_finite() && scale > 0.0).then_some(scale);
+    })
+}
+
+fn persist_toolset_size<R: Runtime>(
+    window: &tauri::Window<R>,
+    toolset_id: &str,
+) -> Result<(), String> {
+    if visible_toolset_physical_position(window).is_none()
+        || window.is_maximized().unwrap_or(true)
+        || window.is_fullscreen().unwrap_or(true)
+    {
+        return Ok(());
+    }
+    let scale = window.scale_factor().map_err(|error| error.to_string())?;
+    let size = window
+        .inner_size()
+        .map_err(|error| error.to_string())?
+        .to_logical::<f64>(scale);
+    if size.width <= 0.0 || size.height <= 0.0 {
+        return Ok(());
+    }
+    let toolset_id = toolset_id.to_string();
+    update_toolset_layout_state(window.app_handle(), move |layout_state| {
+        let state = layout_state.toolsets.entry(toolset_id).or_default();
+        state.width = Some(size.width);
+        state.height = Some(size.height);
     })
 }
 
 /// What a main-window resize or move should persist.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum MainWindowGeometryUpdate {
     /// Fullscreen or minimized: a transient OS state, not a user-chosen frame.
     Skip,
@@ -9675,6 +11763,44 @@ enum MainWindowGeometryUpdate {
     /// A normal frame: save it, clearing the maximized flag.
     SaveFrame,
 }
+
+#[derive(Clone, Copy, Default)]
+struct LatestMainWindowGeometry {
+    frame: Option<MainWindowGeometry>,
+    maximized_without_frame: bool,
+}
+
+impl LatestMainWindowGeometry {
+    fn record(
+        &mut self,
+        update: MainWindowGeometryUpdate,
+        normal_frame: Option<MainWindowGeometry>,
+    ) {
+        update_main_window_geometry(&mut self.frame, update, normal_frame);
+        if update != MainWindowGeometryUpdate::Skip {
+            self.maximized_without_frame =
+                self.frame.is_none() && update == MainWindowGeometryUpdate::MarkMaximized;
+        }
+    }
+
+    fn for_restore(
+        self,
+        read_disk: impl FnOnce() -> Option<MainWindowGeometry>,
+    ) -> Option<MainWindowGeometry> {
+        self.frame.or_else(|| {
+            read_disk().map(|mut frame| {
+                frame.maximized |= self.maximized_without_frame;
+                frame
+            })
+        })
+    }
+}
+
+static LATEST_MAIN_WINDOW_GEOMETRY: Mutex<LatestMainWindowGeometry> =
+    Mutex::new(LatestMainWindowGeometry {
+        frame: None,
+        maximized_without_frame: false,
+    });
 
 fn main_window_geometry_update(
     fullscreen: bool,
@@ -9729,13 +11855,31 @@ fn persist_main_window_geometry<R: Runtime>(window: &tauri::Window<R>) -> Result
     } else {
         None
     };
-    update_toolset_layout_state(window.app_handle(), |layout_state| {
+    // The final quit capture is valid even while a save prompt has suspended utility windows.
+    // Native minimized/fullscreen checks above still reject transient frames.
+    if !quit_in_progress() && utility_windows_suspended() {
+        return Ok(());
+    }
+    // Reopen can run before the writer commits this frame. Publish it on the event thread
+    // before dispatch, and release the lock before any layout I/O.
+    LATEST_MAIN_WINDOW_GEOMETRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .record(update, normal_frame);
+    queue_toolset_layout_update(window.app_handle(), move |layout_state| {
         update_main_window_geometry(&mut layout_state.main_window, update, normal_frame);
     })
 }
 
 fn persist_plugin_panel_geometry<R: Runtime>(window: &tauri::Window<R>) -> Result<(), String> {
-    if APP_QUITTING.load(Ordering::SeqCst) || utility_windows_suspended() {
+    save_plugin_panel_frame(window, || panel_full_size::frame_for_save(window))
+}
+
+fn save_plugin_panel_frame<R: Runtime>(
+    window: &tauri::Window<R>,
+    frame: impl FnOnce() -> Option<panel_window_frame::Frame>,
+) -> Result<(), String> {
+    if !window.is_visible().unwrap_or(false) || utility_windows_suspended() {
         return Ok(());
     }
     // Native state is authoritative before Tao's cached minimized flag catches up. Windows may
@@ -9745,23 +11889,14 @@ fn persist_plugin_panel_geometry<R: Runtime>(window: &tauri::Window<R>) -> Resul
         .app_handle()
         .get_webview_window(MAIN_WINDOW_LABEL)
         .is_some_and(|owner| owner.is_minimized().unwrap_or(true));
-    let Some(frame) = panel_full_size::frame_for_save(window) else {
-        return Ok(());
-    };
-    let Some(frame) = frame.for_save(
+    let Some(frame) = panel_window_frame::Frame::for_save(
         native.minimized || window.is_minimized().unwrap_or(true),
         owner_minimized,
         native.fullscreen || window.is_fullscreen().unwrap_or(true),
+        frame,
     ) else {
         return Ok(());
     };
-    save_plugin_panel_frame(window, frame)
-}
-
-fn save_plugin_panel_frame<R: Runtime>(
-    window: &tauri::Window<R>,
-    frame: panel_window_frame::Frame,
-) -> Result<(), String> {
     // Reject off-screen/parked positions rather than replacing the last usable frame.
     if plugin_panel_saved_placement(window.app_handle(), &frame).is_none() {
         return Ok(());
@@ -9772,8 +11907,9 @@ fn save_plugin_panel_frame<R: Runtime>(
     else {
         return Ok(());
     };
-    update_toolset_layout_state(window.app_handle(), |layout| {
-        layout.plugin_panels.insert(id.replace(':', "."), frame);
+    let id = id.replace(':', ".");
+    update_toolset_layout_state(window.app_handle(), move |layout| {
+        layout.plugin_panels.insert(id, frame);
     })
 }
 
@@ -9916,23 +12052,56 @@ fn mark_toolset_window_closed<R: Runtime>(
     Ok(state)
 }
 
+static LAYOUT_POSITION_WRITER: std::sync::LazyLock<dialog_windows::PositionWriteWorker> =
+    std::sync::LazyLock::new(Default::default);
+
 fn update_toolset_layout_state<R: Runtime>(
     app: &tauri::AppHandle<R>,
-    update: impl FnOnce(&mut ToolsetLayoutState),
+    update: impl FnOnce(&mut ToolsetLayoutState) + Send + 'static,
 ) -> Result<(), String> {
-    let suspension = UTILITY_SUSPENSION
+    let suspended = UTILITY_SUSPENSION
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if suspension.active() {
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .active();
+    if suspended {
         return Ok(());
     }
-    // Read-then-write, so a read failure must NOT become a write. This used to swallow every read
-    // error as `default()`, and a transient failure during a window `Moved` event then wrote those
-    // defaults over toolbar-state.json -- losing every saved position and visibility. Same trap the
-    // write side was rewired to avoid; propagate instead, and the mutation is simply skipped.
-    let mut layout_state = read_toolset_layout_state(app)?;
-    update(&mut layout_state);
-    save_toolset_layout_state(app, &layout_state)
+    queue_toolset_layout_update(app, update)
+}
+
+fn queue_toolset_layout_update<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    update: impl FnOnce(&mut ToolsetLayoutState) + Send + 'static,
+) -> Result<(), String> {
+    let read_app = app.clone();
+    let save_app = app.clone();
+    queue_toolset_layout_update_with(
+        &LAYOUT_POSITION_WRITER,
+        move || read_toolset_layout_state(&read_app),
+        update,
+        move |layout| save_toolset_layout_state(&save_app, layout),
+    )
+}
+
+fn queue_toolset_layout_update_with(
+    writer: &dialog_windows::PositionWriteWorker,
+    read: impl FnOnce() -> Result<ToolsetLayoutState, String> + Send + 'static,
+    update: impl FnOnce(&mut ToolsetLayoutState) + Send + 'static,
+    save: impl FnOnce(&ToolsetLayoutState) -> Result<(), String> + Send + 'static,
+) -> Result<(), String> {
+    writer.dispatch(move || {
+        // One serial worker owns all layout read-modify-write transactions. No suspension lock
+        // crosses I/O, and native close/hide callbacks never wait behind a stalled geometry write.
+        // A read failure must NOT become defaults and overwrite an otherwise valid saved layout.
+        let persist = || {
+            let mut layout_state = read()?;
+            update(&mut layout_state);
+            save(&layout_state)
+        };
+        if let Err(error) = persist() {
+            eprintln!("Could not persist ChemDraft window geometry: {error}");
+        }
+    })
 }
 
 /// What a layout-state read means, separated from where it came from so it can be tested directly.
@@ -10031,16 +12200,7 @@ fn set_check_menu_item_checked_now<R: Runtime>(
     command_id: &str,
     checked: bool,
 ) -> Result<(), String> {
-    // Off macOS the menu lives on the document window, not the app (see `install_app_menu`).
-    #[cfg(target_os = "macos")]
-    let menu = app.menu();
-    #[cfg(not(target_os = "macos"))]
-    let menu = app
-        .get_webview_window(MAIN_WINDOW_LABEL)
-        .and_then(|window| window.menu());
-    let Some(menu) = menu else {
-        return Ok(());
-    };
+    let menu = installed_app_menu(app)?;
     let Some(item) = find_menu_item_by_id(menu.items().unwrap_or_default(), command_id) else {
         return Ok(());
     };
@@ -10051,6 +12211,22 @@ fn set_check_menu_item_checked_now<R: Runtime>(
     check_item
         .set_checked(checked)
         .map_err(|error| error.to_string())
+}
+
+fn installed_app_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<Menu<R>, String> {
+    // Off macOS the menu lives on the document window, not the app (see `install_app_menu`).
+    #[cfg(target_os = "macos")]
+    let menu = app.menu();
+    #[cfg(not(target_os = "macos"))]
+    let menu = app
+        .get_webview_window(MAIN_WINDOW_LABEL)
+        .and_then(|window| window.menu());
+    menu.ok_or_else(|| "The native document menu is unavailable.".to_string())
+}
+
+fn required_menu_item<R: Runtime>(menu: &Menu<R>, id: &str) -> Result<MenuItemKind<R>, String> {
+    find_menu_item_by_id(menu.items().map_err(|e| e.to_string())?, id)
+        .ok_or_else(|| format!("Missing native menu item {id}"))
 }
 
 fn find_menu_item_by_id<R: Runtime>(
@@ -10451,6 +12627,10 @@ mod tests {
                 MainWindowFocusMode::Force,
                 foreground_is_ours
             ));
+            assert!(should_focus_main_window(MainWindowFocusMode::Force));
+            assert!(should_focus_main_window(
+                MainWindowFocusMode::OnlyIfAppActive
+            ));
             assert_eq!(
                 should_raise_main_window(MainWindowFocusMode::OnlyIfAppActive, foreground_is_ours),
                 foreground_is_ours
@@ -10458,8 +12638,68 @@ mod tests {
         }
     }
 
+    #[test]
+    fn preferences_restores_minimized_or_hidden_owner_without_requesting_key() {
+        for (minimized, visible, needs_restoration) in [
+            (true, true, true),
+            (true, false, true),
+            (false, false, true),
+            (false, true, false),
+        ] {
+            assert_eq!(
+                preferences_owner_needs_restoration(minimized, visible),
+                needs_restoration
+            );
+            for foreground_is_ours in [false, true] {
+                let mode = MainWindowFocusMode::RestoreForPreferences;
+                assert!(should_raise_main_window(mode, foreground_is_ours));
+                assert!(!should_focus_main_window(mode));
+            }
+        }
+    }
+
+    #[test]
+    fn opened_document_paths_are_exact_or_refused_by_name() {
+        let utf8 = std::env::temp_dir().join("caf\u{e9} drawing.chemdraft");
+        for exact in [true, false] {
+            assert_eq!(
+                open_document_path_text(&utf8, exact).as_deref(),
+                Ok(utf8.to_str().unwrap())
+            );
+        }
+
+        #[cfg(unix)]
+        let invalid = {
+            use std::os::unix::ffi::OsStrExt;
+            PathBuf::from(std::ffi::OsStr::from_bytes(b"/home/caf\xe9.chemdraft"))
+        };
+        #[cfg(windows)]
+        let invalid = {
+            use std::os::windows::ffi::OsStringExt;
+            let mut wide: Vec<u16> = "C:\\caf".encode_utf16().collect();
+            wide.push(0xD800);
+            wide.extend(".chemdraft".encode_utf16());
+            PathBuf::from(std::ffi::OsString::from_wide(&wide))
+        };
+        // Linux: never hand the renderer a look-alike path that a save would write elsewhere.
+        let error = open_document_path_text(&invalid, true).unwrap_err();
+        assert!(error.contains("not valid UTF-8"), "{error}");
+        assert!(error.contains("Rename the file"), "{error}");
+        // Other hosts keep their earlier conversion.
+        assert_eq!(
+            open_document_path_text(&invalid, false),
+            Ok(invalid.to_string_lossy().into_owned())
+        );
+        #[cfg(target_os = "linux")]
+        assert!(open_document_payload_from_path(&invalid)
+            .err()
+            .is_some_and(|error| error.contains("not valid UTF-8")));
+    }
+
     fn opened_document_test_payload() -> NativeOpenDocumentPayload {
         NativeOpenDocumentPayload {
+            #[cfg(target_os = "macos")]
+            receipt: None,
             path: "cold-open.chemdraft".into(),
             display_name: "cold-open.chemdraft".into(),
             contents: "<CDXML/>".into(),
@@ -10474,16 +12714,19 @@ mod tests {
             let state = PendingOpenDocument::default();
             assert_eq!(
                 state
-                    .record(opened_document_test_payload(), main_window_exists)
+                    .record(vec![opened_document_test_payload()], main_window_exists)
                     .expect("record document"),
                 OpenDocumentDelivery::PendingOnly
             );
             state.setup_completed.store(true, Ordering::SeqCst);
-            let payload = state.payload.lock().expect("pending lock").take();
-            let payload = payload.expect("document survives setup for the mount drain");
+            let payloads = state
+                .drain()
+                .expect("documents survive setup for the mount drain");
+            assert_eq!(payloads.len(), 1);
+            let payload = &payloads[0];
             assert_eq!(payload.path, "cold-open.chemdraft");
             assert_eq!(payload.contents, "<CDXML/>");
-            assert!(state.payload.lock().expect("pending lock").is_none());
+            assert!(state.drain().expect("empty drain").is_empty());
         }
     }
 
@@ -10494,16 +12737,15 @@ mod tests {
         // Closing every window on macOS must not reset setup readiness.
         assert_eq!(
             state
-                .record(opened_document_test_payload(), false)
+                .record(vec![opened_document_test_payload()], false)
                 .expect("record document"),
             OpenDocumentDelivery::CreateWindowAndEmit
         );
         assert_eq!(
             state
-                .payload
-                .lock()
-                .expect("pending lock")
-                .as_ref()
+                .drain()
+                .expect("drain")
+                .first()
                 .expect("pending document for the new window")
                 .contents,
             "<CDXML/>"
@@ -10516,11 +12758,114 @@ mod tests {
         state.setup_completed.store(true, Ordering::SeqCst);
         assert_eq!(
             state
-                .record(opened_document_test_payload(), true)
+                .record(vec![opened_document_test_payload()], true)
                 .expect("record document"),
             OpenDocumentDelivery::ShowWindowAndEmit
         );
-        assert!(state.payload.lock().expect("pending lock").is_some());
+        assert_eq!(state.drain().expect("drain").len(), 1);
+    }
+
+    #[test]
+    fn pending_open_documents_append_before_setup_and_drain_in_order() {
+        let state = PendingOpenDocument::default();
+        for name in ["first.chemdraft", "second.chemdraft", "third.chemdraft"] {
+            let mut payload = opened_document_test_payload();
+            payload.path = name.into();
+            assert_eq!(
+                state.record(vec![payload], false).expect("record"),
+                OpenDocumentDelivery::PendingOnly
+            );
+        }
+        state.setup_completed.store(true, Ordering::SeqCst);
+        let paths: Vec<_> = state
+            .drain()
+            .expect("drain")
+            .into_iter()
+            .map(|payload| payload.path)
+            .collect();
+        assert_eq!(
+            paths,
+            ["first.chemdraft", "second.chemdraft", "third.chemdraft"]
+        );
+        assert!(state.drain().expect("empty drain").is_empty());
+        state
+            .record(vec![opened_document_test_payload()], true)
+            .expect("later record");
+        let later = state.drain().expect("later drain");
+        assert_eq!(later.len(), 1);
+        assert_eq!(later[0].path, "cold-open.chemdraft");
+    }
+
+    #[test]
+    fn opened_document_urls_deliver_every_file_and_report_a_bad_middle_file() {
+        let dir = std::env::temp_dir().join(format!("chemdraft-open-urls-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        for name in ["first.chemdraft", "third.cdxml"] {
+            fs::write(dir.join(name), name).expect("fixture");
+        }
+        let urls = vec![
+            tauri::Url::from_file_path(dir.join("first.chemdraft")).expect("first URL"),
+            tauri::Url::parse("https://example.com/ignored.chemdraft").expect("non-file URL"),
+            tauri::Url::from_file_path(dir.join("missing.chemdraft")).expect("bad URL"),
+            tauri::Url::from_file_path(dir.join("third.cdxml")).expect("third URL"),
+        ];
+        let mut delivered = Vec::new();
+        let error =
+            deliver_opened_documents(opened_document_payloads_from_urls(urls), |payloads| {
+                assert_eq!(
+                    payloads.len(),
+                    2,
+                    "one delivery contains the entire OS batch"
+                );
+                delivered.extend(payloads);
+                Ok(())
+            })
+            .expect_err("report unreadable middle file");
+        assert!(error.contains("Could not open missing.chemdraft:"));
+        assert!(!error.contains(dir.to_string_lossy().as_ref()));
+        assert!(error.contains("missing.chemdraft"));
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(delivered[0].display_name, "first.chemdraft");
+        assert_eq!(delivered[0].contents, "first.chemdraft");
+        assert_eq!(delivered[1].display_name, "third.cdxml");
+        assert_eq!(delivered[1].contents, "third.cdxml");
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn single_instance_opened_document_args_keep_all_openable_paths_in_argument_order() {
+        let dir =
+            std::env::temp_dir().join(format!("chemdraft-open-many-args-{}", std::process::id()));
+        fs::create_dir_all(dir.join("nested")).expect("temp dir");
+        let second = Path::new("nested").join("second.CDXML");
+        for path in [
+            Path::new("first.chemdraft"),
+            &second,
+            Path::new("third.cdx"),
+            Path::new("notes.txt"),
+            Path::new("-flag.chemdraft"),
+        ] {
+            fs::write(dir.join(path), "<CDXML/>").expect("fixture");
+        }
+        let third = dir.join("third.cdx");
+        let paths = openable_document_paths_from_args(
+            vec![
+                "--chemdraft-agent-bridge".into(),
+                "first.chemdraft".into(),
+                "notes.txt".into(),
+                "-flag.chemdraft".into(),
+                "missing.chemdraft".into(),
+                "nested".into(),
+                second.to_string_lossy().into_owned(),
+                third.to_string_lossy().into_owned(),
+            ],
+            &dir,
+        );
+        assert_eq!(
+            paths,
+            [dir.join("first.chemdraft"), dir.join(second), third]
+        );
+        fs::remove_dir_all(dir).expect("cleanup");
     }
 
     #[cfg(windows)]
@@ -10572,6 +12917,176 @@ mod tests {
         // Windows minimizes owned palettes with the document and parks them off-screen; macOS
         // leaves them visible and draggable, so a move then is a real user move.
         assert_eq!(toolset_frame_state_is_transient(false, true), cfg!(windows));
+    }
+
+    #[test]
+    fn palette_content_fit_recovers_the_title_strip_and_keeps_a_reachable_dragged_origin() {
+        let area = ScreenRect::new(0.0, 24.0, 950.0, 636.0);
+        for scale in [1.0, 1.5, 2.0] {
+            let physical = |(x, y): (f64, f64)| ((x * scale) as i32, (y * scale) as i32);
+            // In each case the body may be visible but the title does not have a usable strip.
+            for origin in [
+                (286.0, -100.0),
+                (286.0, 0.0),
+                (904.0, 110.0),
+                (310.0, 640.0),
+            ] {
+                let fit = toolset_content_placement(physical(origin), (940.0, 200.0), scale, area);
+                assert_ne!(fit.position, physical(origin));
+                assert!(area.contains_title_strip(
+                    f64::from(fit.position.0) / scale,
+                    f64::from(fit.position.1) / scale,
+                    940.0,
+                    TOOLSET_TITLE_HEIGHT,
+                ));
+            }
+            for origin in [(310.0, 110.0), (902.0, 638.0)] {
+                let dragged = physical(origin);
+                let fit = toolset_content_placement(dragged, (940.0, 660.0), scale, area);
+                assert_eq!(fit.position, dragged);
+                assert_eq!(fit.size, ((940.0 * scale) as u32, (636.0 * scale) as u32));
+            }
+        }
+    }
+
+    #[test]
+    fn restored_inspector_keeps_its_display_when_the_dock_overlaps_its_saved_title() {
+        let primary = ScreenRect::new(0.0, 0.0, 1200.0, 900.0);
+        let secondary = ScreenRect::new(1200.0, 0.0, 800.0, 660.0);
+        let secondary_work_area = ScreenRect::new(1200.0, 24.0, 800.0, 600.0);
+        let origin = ToolsetWindowPosition {
+            x: 1400.0,
+            y: 615.0,
+        };
+        let area = toolset_work_area_for_origin(
+            origin,
+            500.0,
+            &[(primary, primary), (secondary, secondary_work_area)],
+        )
+        .unwrap();
+        assert_eq!(area, secondary_work_area);
+        let (position, width, height) = inspector_frame_in_work_area(origin, (500.0, 900.0), area);
+        assert_eq!(
+            (position.x, position.y, width, height),
+            (1400.0, 24.0, 500.0, 600.0)
+        );
+    }
+
+    #[test]
+    fn restored_inspector_frame_fits_a_smaller_monitor_work_area() {
+        let area = ScreenRect::new(1200.0, 24.0, 800.0, 600.0);
+        let (position, width, height) = inspector_frame_in_work_area(
+            ToolsetWindowPosition {
+                x: 1400.0,
+                y: 140.0,
+            },
+            (900.0, 900.0),
+            area,
+        );
+        assert_eq!(
+            (position.x, position.y, width, height),
+            (1200.0, 24.0, 800.0, 600.0)
+        );
+
+        let (position, width, height) = inspector_frame_in_work_area(
+            ToolsetWindowPosition {
+                x: 1400.0,
+                y: 400.0,
+            },
+            (500.0, 300.0),
+            area,
+        );
+        assert_eq!(
+            (position.x, position.y, width, height),
+            (1400.0, 324.0, 500.0, 300.0)
+        );
+
+        let monitors = [
+            ToolsetMonitor {
+                identity: panel_window_frame::MonitorIdentity {
+                    name: None,
+                    position: (0, 0),
+                    size: (1920, 1080),
+                },
+                scale: 1.0,
+                work_area: ScreenRect::new(0.0, 0.0, 1920.0, 1080.0),
+            },
+            ToolsetMonitor {
+                identity: panel_window_frame::MonitorIdentity {
+                    name: None,
+                    position: (1920, 0),
+                    size: (2560, 1500),
+                },
+                scale: 2.0,
+                work_area: ScreenRect::new(0.0, 0.0, 1280.0, 720.0),
+            },
+        ];
+        let expected = panel_window_frame::Placement {
+            position: (2400, 0),
+            size: (1000, 1440),
+            scale: 2.0,
+        };
+        for origin in [
+            ToolsetFrameOrigin::Physical((2400, 200), 2.0),
+            // A window moving to the secondary can still report its previous backing scale.
+            ToolsetFrameOrigin::Physical((2400, 200), 1.0),
+            ToolsetFrameOrigin::Logical(
+                ToolsetWindowPosition {
+                    x: 1200.0,
+                    y: 100.0,
+                },
+                Some(2.0),
+            ),
+        ] {
+            assert_eq!(
+                clamp_toolset_frame_in_physical_space(
+                    origin,
+                    (500.0, 900.0),
+                    true,
+                    &monitors,
+                    &monitors[0]
+                ),
+                expected
+            );
+        }
+        let centered = clamp_toolset_frame_in_physical_space(
+            ToolsetFrameOrigin::Physical((1880, -20), 1.0),
+            (500.0, 900.0),
+            true,
+            &monitors,
+            &monitors[0],
+        );
+        assert_eq!(centered.position, (1920, 0));
+        assert_eq!(centered.size, expected.size);
+    }
+
+    #[test]
+    fn palette_title_does_not_overlap_a_high_dpi_monitor_across_a_physical_gap() {
+        // The 200% display starts at x = 1920. The 160 px palette on the 100% display starts
+        // 200 physical pixels before that edge, leaving a 40 px gap.
+        let high_dpi_work_area = tauri::PhysicalRect {
+            position: tauri::PhysicalPosition::new(1920, 0),
+            size: tauri::PhysicalSize::new(3840, 2080),
+        };
+        assert!(!toolset_title_in_physical_work_area(
+            (1720, 100),
+            160.0,
+            1.0,
+            &high_dpi_work_area,
+        ));
+        assert!(toolset_title_in_physical_work_area(
+            (1808, 100),
+            160.0,
+            1.0,
+            &high_dpi_work_area,
+        ));
+        // At 200%, a 22-point title needs 44 physical pixels below the top edge.
+        assert!(!toolset_title_in_physical_work_area(
+            (1920, 2040),
+            160.0,
+            2.0,
+            &high_dpi_work_area,
+        ));
     }
 
     #[test]
@@ -10755,6 +13270,135 @@ mod tests {
     }
 
     #[test]
+    fn selecting_a_structure_updates_existing_native_search_items() {
+        let row = PluginMenuItemInput {
+            id: "search.pubchem".into(),
+            location: "tools".into(),
+            label: "Search PubChem".into(),
+            core_routed: true,
+            enabled: false,
+            separator_before: false,
+        };
+        let mut selected = row.clone();
+        selected.enabled = true;
+        let old = [row];
+        let mut new = [selected];
+        assert_eq!(
+            classify_plugin_menu_update(&old, &new),
+            MenuUpdate::Properties
+        );
+        new[0].label.push('…');
+        assert_eq!(
+            classify_plugin_menu_update(&old, &new),
+            MenuUpdate::Properties
+        );
+        new[0].location = "structure".into();
+        assert_eq!(classify_plugin_menu_update(&old, &new), MenuUpdate::Rebuild);
+        assert_eq!(classify_plugin_menu_update(&old, &[]), MenuUpdate::Rebuild);
+    }
+
+    #[test]
+    fn native_menu_updates_call_the_enabled_setter_for_each_changed_row() {
+        let row = |enabled| PluginMenuItemInput {
+            id: "search.pubchem".into(),
+            location: "tools".into(),
+            label: "Search PubChem".into(),
+            core_routed: true,
+            enabled,
+            separator_before: false,
+        };
+        let old = [row(false), row(true), row(true)];
+        let new = [row(true), row(false), row(true)];
+        let mut calls = Vec::new();
+        update_plugin_menu_properties(
+            &old,
+            &new,
+            |section| {
+                assert_eq!(section, "tools");
+                Ok(old
+                    .iter()
+                    .enumerate()
+                    .map(|(i, row)| (row.id.clone(), i))
+                    .collect())
+            },
+            |position, enabled| {
+                calls.push((*position, enabled));
+                Ok(())
+            },
+            |_, _| panic!("Enabled changes do not rename items"),
+        )
+        .unwrap();
+        assert_eq!(calls, [(1, false), (0, true)]);
+    }
+
+    #[test]
+    fn partial_plugin_menu_failure_rebuilds_with_the_requested_items_on_a_toolbar_update() {
+        let row = |id: &str, enabled| PluginMenuItemInput {
+            id: id.into(),
+            location: "tools".into(),
+            label: id.into(),
+            core_routed: true,
+            enabled,
+            separator_before: false,
+        };
+        let plugin_model = PluginNativeMenuItems(Mutex::new(vec![
+            row("search.pubchem", true),
+            row("search.reaxys", true),
+        ]));
+        let new = vec![row("search.pubchem", false), row("search.reaxys", false)];
+        let needs_rebuild = AtomicBool::new(false);
+        let mut native_enabled = [true, true];
+
+        let result = plugin_model.apply_update(
+            &needs_rebuild,
+            new,
+            |previous, next| {
+                update_plugin_menu_properties(
+                    previous,
+                    next,
+                    |_| {
+                        Ok(previous
+                            .iter()
+                            .enumerate()
+                            .map(|(i, row)| (row.id.clone(), i))
+                            .collect())
+                    },
+                    |&position, enabled| {
+                        if position == 0 {
+                            return Err("setter failed".into());
+                        }
+                        native_enabled[position] = enabled;
+                        Ok(())
+                    },
+                    |_, _| panic!("Enabled changes do not rename items"),
+                )
+            },
+            |_| panic!("First update should use the in-place setters"),
+        );
+        assert_eq!(result, Err("setter failed".into()));
+        assert_eq!(native_enabled, [true, false]);
+
+        let toolbars = (Vec::new(), ViewMenuState::default());
+        let view = ViewMenuState {
+            rulers_visible: false,
+            ..toolbars.1
+        };
+        apply_menu_update(
+            &needs_rebuild,
+            classify_toolbars_menu_update(&toolbars, &toolbars.0, view),
+            || panic!("An in-place update cannot repair the stale native state"),
+            || {
+                let items = plugin_model.0.lock().unwrap();
+                native_enabled = [items[0].enabled, items[1].enabled];
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(native_enabled, [false, false]);
+        assert!(!needs_rebuild.load(Ordering::Relaxed));
+    }
+
+    #[test]
     fn toolbars_menu_pushes_rebuild_only_on_structural_change() {
         let entry = |id: &str, visible: bool| ToolbarMenuEntry {
             toolset_id: id.to_string(),
@@ -10768,7 +13412,7 @@ mod tests {
         );
         assert_eq!(
             classify_toolbars_menu_update(&previous, &previous.0, view),
-            ToolbarsMenuUpdate::Unchanged
+            MenuUpdate::Unchanged
         );
         assert_eq!(
             classify_toolbars_menu_update(
@@ -10776,7 +13420,7 @@ mod tests {
                 &[entry("core.main", true), entry("core.art", true)],
                 view
             ),
-            ToolbarsMenuUpdate::ChecksOnly
+            MenuUpdate::Properties
         );
         assert_eq!(
             classify_toolbars_menu_update(
@@ -10787,11 +13431,11 @@ mod tests {
                     ..view
                 }
             ),
-            ToolbarsMenuUpdate::ChecksOnly
+            MenuUpdate::Properties
         );
         assert_eq!(
             classify_toolbars_menu_update(&previous, &[entry("core.main", true)], view),
-            ToolbarsMenuUpdate::Rebuild
+            MenuUpdate::Rebuild
         );
         assert_eq!(
             classify_toolbars_menu_update(
@@ -10802,17 +13446,13 @@ mod tests {
                     ..view
                 }
             ),
-            if cfg!(target_os = "macos") {
-                ToolbarsMenuUpdate::Rebuild
-            } else {
-                ToolbarsMenuUpdate::ChecksOnly
-            }
+            MenuUpdate::Properties
         );
         let mut renamed = previous.0.clone();
         renamed[1].title = "Art (renamed)".to_string();
         assert_eq!(
             classify_toolbars_menu_update(&previous, &renamed, view),
-            ToolbarsMenuUpdate::Rebuild
+            MenuUpdate::Properties
         );
     }
 
@@ -10900,6 +13540,450 @@ mod tests {
 
     const NEVER: Duration = Duration::from_secs(3600);
 
+    type QuitTestTask = Box<dyn FnOnce() + Send>;
+    type QuitTestQueue = Arc<Mutex<Vec<QuitTestTask>>>;
+
+    /// Injected clock and dispatch queues: no wall-clock wait is needed to expire a quit.
+    #[derive(Clone)]
+    struct ControlledQuitHost {
+        app: StuckAppHost,
+        timers: Arc<Mutex<Vec<(Duration, QuitTestTask)>>>,
+        workers: QuitTestQueue,
+        main: QuitTestQueue,
+        capture_frames: Arc<dyn Fn() + Send + Sync>,
+        drain: Arc<dyn Fn() + Send + Sync>,
+    }
+
+    impl ControlledQuitHost {
+        fn new() -> Self {
+            Self {
+                app: StuckAppHost::new(true),
+                timers: Default::default(),
+                workers: Default::default(),
+                main: Default::default(),
+                capture_frames: Arc::new(|| {}),
+                drain: Arc::new(|| {}),
+            }
+        }
+
+        fn fire_timer(&self) {
+            let (_, task) = self.timers.lock().unwrap().remove(0);
+            task();
+        }
+
+        fn take_worker(&self) -> QuitTestTask {
+            self.workers.lock().unwrap().remove(0)
+        }
+
+        fn emit_flush_request(&self) {
+            self.take_worker()();
+            let task = self.main.lock().unwrap().remove(0);
+            task();
+        }
+    }
+
+    impl QuitHost for ControlledQuitHost {
+        fn ask_document_to_flush(&self) -> bool {
+            let host = self.clone();
+            self.dispatch_worker(move || {
+                let capture = host.clone();
+                host.main.lock().unwrap().push(Box::new(move || {
+                    capture.app.ask_document_to_flush();
+                }));
+            });
+            true
+        }
+
+        fn ask_document_to_prompt(&self, _request_id: u64) -> bool {
+            self.app.calls.lock().unwrap().push("prompt");
+            true
+        }
+
+        fn schedule_after(&self, wait: Duration, task: impl FnOnce() + Send + 'static) {
+            self.app.calls.lock().unwrap().push("timer armed");
+            self.timers.lock().unwrap().push((wait, Box::new(task)));
+        }
+
+        fn dispatch_worker(&self, task: impl FnOnce() + Send + 'static) {
+            self.workers.lock().unwrap().push(Box::new(task));
+        }
+
+        fn drain_pending_position_writes(&self) {
+            (self.capture_frames)();
+            self.app.calls.lock().unwrap().push("dialogs settled");
+            self.app.calls.lock().unwrap().push("drain positions");
+            (self.drain)();
+        }
+
+        fn exit(&self) {
+            self.app.exit();
+        }
+
+        fn reply_to_appkit_termination(&self, flow: &'static QuitFlow) {
+            self.app.reply_to_appkit_termination(flow);
+        }
+
+        fn force_exit(&self, waited: Duration, reason: QuitReason) {
+            self.app.force_exit(waited, reason);
+        }
+    }
+
+    fn queue_test_layout_frame(
+        writer: &dialog_windows::PositionWriteWorker,
+        path: PathBuf,
+        frame: MainWindowGeometry,
+        before_write: impl FnOnce() + Send + 'static,
+    ) {
+        let read_path = path.clone();
+        queue_toolset_layout_update_with(
+            writer,
+            move || toolset_layout_state_from_read(read_optional_file(&read_path)),
+            move |layout| {
+                update_main_window_geometry(
+                    &mut layout.main_window,
+                    MainWindowGeometryUpdate::SaveFrame,
+                    Some(frame),
+                );
+            },
+            move |layout| {
+                before_write();
+                let contents = serde_json::to_string_pretty(layout).unwrap();
+                write_file_atomic(&path, &contents)
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn main_window_reopen_uses_latest_frame_while_disk_write_is_pending() {
+        let writer = dialog_windows::PositionWriteWorker::default();
+        let path = std::env::temp_dir().join(format!(
+            "chemdraft-reopen-frame-{}.json",
+            std::process::id()
+        ));
+        let old = MainWindowGeometry {
+            x: 100.0,
+            y: 100.0,
+            width: 900.0,
+            height: 640.0,
+            maximized: false,
+        };
+        let moved = MainWindowGeometry {
+            x: 200.0,
+            height: 700.0,
+            ..old
+        };
+        queue_test_layout_frame(&writer, path.clone(), old, || {});
+        writer.drain();
+
+        let read_disk = || {
+            toolset_layout_state_from_read(read_optional_file(&path))
+                .unwrap()
+                .main_window
+        };
+        let mut latest = LatestMainWindowGeometry::default();
+        assert_eq!(latest.for_restore(read_disk), Some(old));
+        latest.record(MainWindowGeometryUpdate::MarkMaximized, None);
+        assert_eq!(
+            latest.for_restore(read_disk),
+            Some(MainWindowGeometry {
+                maximized: true,
+                ..old
+            })
+        );
+
+        let (started, starting) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        latest.record(MainWindowGeometryUpdate::SaveFrame, Some(moved));
+        queue_test_layout_frame(&writer, path.clone(), moved, move || {
+            started.send(()).unwrap();
+            blocked.recv().unwrap();
+        });
+        starting.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(read_disk(), Some(old));
+        assert_eq!(
+            latest.for_restore(|| panic!("cached restore must skip disk")),
+            Some(moved)
+        );
+        release.send(()).unwrap();
+        writer.drain();
+        assert_eq!(read_disk(), Some(moved));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn moved_and_resized_events_during_quit_drain_cannot_block_the_deadline() {
+        // Exercise the handler used by Builder::on_window_event with real Tauri events and the
+        // real serial/tracked layout writer, rather than making QuitHost::drain itself stall.
+        for appkit in [true, false] {
+            for expire in [true, false] {
+                let flow = test_quit_flow(QUIT_FLUSH_GRACE, EXIT_WATCHDOG);
+                let mut host = ControlledQuitHost::new();
+                let writer = dialog_windows::PositionWriteWorker::default();
+                let path = std::env::temp_dir().join(format!(
+                    "chemdraft-quit-event-{}-{appkit}-{expire}.json",
+                    std::process::id()
+                ));
+                let _ = fs::remove_file(&path);
+                let capture_thread = thread::current().id();
+                let old_frame = MainWindowGeometry {
+                    x: 50.0,
+                    y: 60.0,
+                    width: 900.0,
+                    height: 700.0,
+                    maximized: false,
+                };
+                let final_frame = MainWindowGeometry {
+                    x: 150.0,
+                    ..old_frame
+                };
+                let moved = WindowEvent::Moved(tauri::PhysicalPosition::new(150, 60));
+                let resized = WindowEvent::Resized(tauri::PhysicalSize::new(900, 700));
+                let (started, starting) = mpsc::channel();
+                let (release, blocked) = mpsc::channel();
+                assert!(on_main_window_geometry_event_with(flow, &moved, || {
+                    queue_test_layout_frame(&writer, path.clone(), old_frame, move || {
+                        started.send(thread::current().id()).unwrap();
+                        blocked.recv().unwrap(); // A filesystem write that cannot finish yet.
+                    });
+                }));
+                assert_ne!(
+                    starting.recv_timeout(Duration::from_secs(2)).unwrap(),
+                    capture_thread
+                );
+
+                let final_writer = writer.clone();
+                let final_path = path.clone();
+                host.capture_frames = Arc::new(move || {
+                    queue_test_layout_frame(&final_writer, final_path.clone(), final_frame, || {});
+                });
+                let drain_writer = writer.clone();
+                let (draining, drain_started) = mpsc::channel();
+                host.drain = Arc::new(move || {
+                    draining.send(()).unwrap();
+                    drain_writer.drain();
+                });
+                if appkit {
+                    assert!(request_appkit_quit_with(flow, &host));
+                } else {
+                    request_quit_with(flow, &host, false);
+                }
+                host.emit_flush_request();
+                complete_quit_flush_with(flow, &host, QuitReason::FlushConfirmed);
+                // Final frame capture queues behind the stalled write before the drain joins it.
+                let drain = thread::spawn(host.take_worker());
+                drain_started.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert!(flow.requested.load(Ordering::SeqCst));
+                assert!(!flow.quitting.load(Ordering::SeqCst));
+                assert!(!drain.is_finished());
+
+                for event in [&moved, &resized] {
+                    assert!(on_main_window_geometry_event_with(flow, event, || {
+                        panic!("A queued quit-time event must not enter geometry persistence");
+                    }));
+                }
+                // This thread can still deliver the OS reply while the real writer is stalled.
+                if expire {
+                    host.fire_timer();
+                    assert!(flow.quitting.load(Ordering::SeqCst));
+                    assert_eq!(
+                        host.app.calls().last(),
+                        Some(&if appkit { "reply YES" } else { "exit" })
+                    );
+                    if !appkit {
+                        host.fire_timer();
+                        assert_eq!(host.app.calls().last(), Some(&"force exit"));
+                    }
+                    assert!(!drain.is_finished());
+                }
+                release.send(()).unwrap();
+                drain.join().unwrap();
+                let saved = toolset_layout_state_from_read(read_optional_file(&path)).unwrap();
+                assert_eq!(saved.main_window, Some(final_frame));
+                if !expire {
+                    assert_eq!(
+                        host.app.calls().last(),
+                        Some(&if appkit { "reply YES" } else { "exit" })
+                    );
+                    host.fire_timer(); // Late deadline cannot reply YES a second time.
+                }
+                if appkit {
+                    assert_eq!(
+                        host.app
+                            .calls()
+                            .iter()
+                            .filter(|&&call| call == "reply YES")
+                            .count(),
+                        1
+                    );
+                }
+                fs::remove_file(path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn queued_layout_read_failure_never_mutates_or_overwrites_the_file() {
+        let writer = dialog_windows::PositionWriteWorker::default();
+        let mutated = Arc::new(AtomicBool::new(false));
+        let overwritten = Arc::new(AtomicBool::new(false));
+        let mutation = mutated.clone();
+        let overwrite = overwritten.clone();
+        queue_toolset_layout_update_with(
+            &writer,
+            || Err("The saved layout is unreadable".into()),
+            move |_| mutation.store(true, Ordering::SeqCst),
+            move |_| {
+                overwrite.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+        writer.drain();
+        assert!(!mutated.load(Ordering::SeqCst));
+        assert!(!overwritten.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn quit_deadline_precedes_the_flush_and_dialogs_settle_after_confirmation() {
+        let flow = test_quit_flow(QUIT_FLUSH_GRACE, EXIT_WATCHDOG);
+        let host = ControlledQuitHost::new();
+        assert!(request_appkit_quit_with(flow, &host)); // TerminateLater
+        assert_eq!(host.app.calls(), ["timer armed"]);
+        assert_eq!(host.timers.lock().unwrap()[0].0, QUIT_FLUSH_GRACE);
+        host.emit_flush_request();
+        assert_eq!(host.app.calls(), ["timer armed", "ask to flush"]);
+        complete_quit_flush_with(flow, &host, QuitReason::FlushConfirmed);
+        assert!(!flow.quitting.load(Ordering::SeqCst));
+        host.take_worker()();
+        assert_eq!(
+            host.app.calls(),
+            [
+                "timer armed",
+                "ask to flush",
+                "dialogs settled",
+                "drain positions",
+                "reply YES"
+            ]
+        );
+        host.fire_timer();
+        assert_eq!(
+            host.app
+                .calls()
+                .iter()
+                .filter(|&&call| call == "reply YES")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn stalled_position_writer_cannot_hold_appkit_reply_or_windows_watchdog() {
+        for appkit in [true, false] {
+            let flow = test_quit_flow(QUIT_FLUSH_GRACE, EXIT_WATCHDOG);
+            let mut host = ControlledQuitHost::new();
+            let (entered, entering) = mpsc::channel();
+            let (release, blocked) = mpsc::channel();
+            let blocked = Mutex::new(blocked);
+            host.drain = Arc::new(move || {
+                entered.send(()).unwrap();
+                // This writer cannot finish until after the deadline and watchdog assertions.
+                blocked.lock().unwrap().recv().unwrap();
+            });
+            if appkit {
+                assert!(request_appkit_quit_with(flow, &host));
+            } else {
+                request_quit_with(flow, &host, false); // Windows document close
+            }
+            assert_eq!(host.app.calls(), ["timer armed"]);
+            host.emit_flush_request();
+            complete_quit_flush_with(flow, &host, QuitReason::FlushConfirmed);
+            let drain = thread::spawn(host.take_worker());
+            entering.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(!drain.is_finished());
+            host.fire_timer();
+            assert!(flow.quitting.load(Ordering::SeqCst));
+            if appkit {
+                assert_eq!(host.app.calls().last(), Some(&"reply YES"));
+                assert!(!flow.watchdog_armed.load(Ordering::SeqCst));
+            } else {
+                assert_eq!(host.app.calls().last(), Some(&"exit"));
+                assert_eq!(host.timers.lock().unwrap()[0].0, EXIT_WATCHDOG);
+                host.fire_timer();
+                assert_eq!(host.app.calls().last(), Some(&"force exit"));
+                assert_eq!(host.app.forced_reason(), Some(QuitReason::GraceExpired));
+            }
+            assert!(!drain.is_finished());
+            release.send(()).unwrap();
+            drain.join().unwrap();
+            if appkit {
+                assert_eq!(
+                    host.app
+                        .calls()
+                        .iter()
+                        .filter(|&&call| call == "reply YES")
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn opt_in_system_quits_flush_then_reply_without_a_prompt() {
+        for reason in [*b"logo", *b"rlgo", *b"rest", *b"shut", *b"rrst", *b"rsdn"] {
+            assert_eq!(
+                appkit_quit_decision(true, true, false, false, u32::from_be_bytes(reason)),
+                AppkitQuitDecision::DeferReply
+            );
+            let flow = test_quit_flow(QUIT_FLUSH_GRACE, EXIT_WATCHDOG);
+            let host = ControlledQuitHost::new();
+            assert!(request_appkit_quit_with(flow, &host));
+            host.emit_flush_request();
+            complete_quit_flush_with(flow, &host, QuitReason::FlushConfirmed);
+            host.take_worker()();
+            assert_eq!(
+                host.app.calls(),
+                [
+                    "timer armed",
+                    "ask to flush",
+                    "dialogs settled",
+                    "drain positions",
+                    "reply YES"
+                ]
+            );
+            host.fire_timer();
+            assert_eq!(host.app.calls().last(), Some(&"reply YES"));
+        }
+    }
+
+    #[test]
+    fn ordinary_opt_in_quit_keeps_its_prompt_and_system_quit_retires_it() {
+        assert_eq!(
+            appkit_quit_decision(true, true, false, false, 0),
+            AppkitQuitDecision::Prompt
+        );
+        let flow = test_quit_flow(QUIT_FLUSH_GRACE, EXIT_WATCHDOG);
+        let host = ControlledQuitHost::new();
+        let id = request_prompted_quit_with(flow, &host).unwrap();
+        assert!(acknowledge_quit_prompt(flow, id, true));
+        host.fire_timer();
+        assert_eq!(host.app.calls(), ["prompt", "timer armed"]);
+        assert!(!flow.quitting.load(Ordering::SeqCst));
+        assert_eq!(cancel_quit_with(flow, id), QuitCancelOutcome::Cancelled);
+        let id = request_prompted_quit_with(flow, &host).unwrap();
+        assert!(acknowledge_quit_prompt(flow, id, true));
+        assert!(request_appkit_quit_with(flow, &host));
+        assert_eq!(cancel_quit_with(flow, id), QuitCancelOutcome::Committed);
+        assert!(!resume_prompted_quit_with(flow, &host, id));
+        host.fire_timer(); // The superseded prompt's timer cannot decide the quit.
+        assert!(!flow.quitting.load(Ordering::SeqCst));
+        host.emit_flush_request();
+        complete_quit_flush_with(flow, &host, QuitReason::FlushConfirmed);
+        host.take_worker()();
+        assert_eq!(host.app.calls().last(), Some(&"reply YES"));
+    }
+
     #[test]
     fn visible_prompt_pauses_grace_without_blocking_save_as_or_utility_suspension() {
         let flow = test_quit_flow(Duration::from_millis(400), Duration::from_millis(20));
@@ -10916,7 +14000,7 @@ mod tests {
         thread::sleep(Duration::from_millis(600));
         assert_eq!(host.calls(), ["ask to flush"]);
         assert!(!flow.quitting.load(Ordering::SeqCst));
-        assert!(cancel_quit_with(flow, id));
+        assert_eq!(cancel_quit_with(flow, id), QuitCancelOutcome::Cancelled);
         assert!(!prompt_waits_for_user(flow));
         assert!(lock_window_creation_with(flow).is_ok());
     }
@@ -10927,11 +14011,11 @@ mod tests {
         let host = StuckAppHost::new(true);
         let first = request_prompted_quit_with(flow, &host).unwrap();
         assert!(acknowledge_quit_prompt(flow, first, true));
-        assert!(cancel_quit_with(flow, first));
+        assert_eq!(cancel_quit_with(flow, first), QuitCancelOutcome::Cancelled);
         // A lost cancellation reply may be retried, but must never affect a newer request.
-        assert!(cancel_quit_with(flow, first));
+        assert_eq!(cancel_quit_with(flow, first), QuitCancelOutcome::Cancelled);
         let next = request_prompted_quit_with(flow, &host).unwrap();
-        assert!(!cancel_quit_with(flow, first));
+        assert_eq!(cancel_quit_with(flow, first), QuitCancelOutcome::Superseded);
         assert!(!acknowledge_quit_prompt(flow, first, true));
         assert!(acknowledge_quit_prompt(flow, next, true));
         thread::sleep(Duration::from_millis(600));
@@ -10946,6 +14030,7 @@ mod tests {
             let id = request_prompted_quit_with(flow, &host).unwrap();
             assert!(acknowledge_quit_prompt(flow, id, true));
             assert!(resume_prompted_quit_with(flow, &host, id));
+            assert_eq!(cancel_quit_with(flow, id), QuitCancelOutcome::Committed);
             assert!(!resume_prompted_quit_with(flow, &host, id));
             assert!(lock_window_creation_with(flow).is_err());
             assert_eq!(
@@ -10995,6 +14080,70 @@ mod tests {
     }
 
     #[test]
+    fn session_end_joins_an_existing_flush_and_ignores_unmatched_acknowledgements() {
+        for prompted in [false, true] {
+            let flow = test_quit_flow(NEVER, NEVER);
+            let host = ControlledQuitHost::new();
+            let request_id = if prompted {
+                let id = request_prompted_quit_with(flow, &host).unwrap();
+                assert!(resume_prompted_quit_with(flow, &host, id));
+                id
+            } else {
+                let (id, started) = flow.begin_flush(None);
+                assert!(started);
+                id
+            };
+            assert_eq!(flow.begin_flush(None), (request_id, false));
+            assert!(!flow.confirm_flush(request_id + 1));
+            assert!(!flow.flush_confirmed(request_id));
+            assert!(flow.confirm_flush(request_id));
+            assert!(!flow.confirm_flush(request_id));
+            assert!(flow.flush_confirmed(request_id));
+            assert_eq!(flow.begin_flush(None), (request_id, false));
+        }
+    }
+
+    #[test]
+    fn session_end_requests_a_fresh_flush_after_an_emit_failure() {
+        let flow = test_quit_flow(NEVER, NEVER);
+        let mut failed_id = 0;
+        assert_eq!(
+            flow.request_flush(|id| {
+                failed_id = id;
+                Err("emit failed")
+            }),
+            Err("emit failed")
+        );
+        let mut emitted_id = 0;
+        let id = flow
+            .request_flush(|id| {
+                emitted_id = id;
+                Ok::<(), &str>(())
+            })
+            .unwrap();
+        assert_eq!(emitted_id, id);
+        assert_ne!(id, failed_id);
+        assert!(!flow.confirm_flush(failed_id));
+        assert!(flow.confirm_flush(id));
+    }
+
+    #[test]
+    fn session_end_watchdog_forces_exit_only_if_the_flush_stalls() {
+        let host = StuckAppHost::new(true);
+        let (disarm, watchdog) = mpsc::channel();
+        windows_session_end::watch_flush(watchdog, Duration::ZERO, &host);
+        assert_eq!(host.calls(), ["force exit"]);
+        assert_eq!(host.forced_reason(), Some(QuitReason::GraceExpired));
+        drop(disarm);
+
+        let host = StuckAppHost::new(true);
+        let (disarm, watchdog) = mpsc::channel();
+        drop(disarm);
+        windows_session_end::watch_flush(watchdog, Duration::ZERO, &host);
+        assert!(host.calls().is_empty());
+    }
+
+    #[test]
     fn appkit_quit_checks_platform_preference_and_pending_reply() {
         for reason in [0, u32::from_be_bytes(*b"quit")] {
             assert_eq!(
@@ -11041,7 +14190,7 @@ mod tests {
             );
             assert_eq!(
                 appkit_quit_decision(true, true, false, false, u32::from_be_bytes(reason)),
-                AppkitQuitDecision::TerminateNow
+                AppkitQuitDecision::DeferReply
             );
         }
     }
@@ -11401,15 +14550,45 @@ mod tests {
         // measured). Tauri runs an async command on a worker. Lines are compared trimmed, so a CRLF
         // checkout matches and this test's own quoted text never does.
         let lines: Vec<&str> = include_str!("lib.rs").lines().map(str::trim).collect();
-        let declared_async = lines.windows(2).any(|pair| {
-            pair[0] == "#[tauri::command]"
-                && pair[1] == "async fn quit_after_flush(app: tauri::AppHandle) {"
-        });
+        let declared_async = lines
+            .windows(2)
+            .any(|pair| pair[0] == "#[tauri::command]" && pair[1] == "async fn quit_after_flush(");
         assert!(declared_async);
+        assert!(lines.windows(2).any(|pair| {
+            pair[0] == "#[tauri::command]" && pair[1] == "async fn save_document_session("
+        }));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn single_instance_refuses_a_prompt_from_request_until_cancel_or_quit() {
+        let flow = test_quit_flow(QUIT_FLUSH_GRACE, EXIT_WATCHDOG);
+        let host = ControlledQuitHost::new();
+        for cancel in [true, false] {
+            assert!(!flow.refuses_macos_launch());
+            let id = request_prompted_quit_with(flow, &host).unwrap();
+            assert!(flow.refuses_macos_launch());
+            assert!(acknowledge_quit_prompt(flow, id, true));
+            assert!(flow.refuses_macos_launch());
+            assert_eq!(cancel_quit_with(flow, 0), QuitCancelOutcome::Superseded);
+            assert!(flow.refuses_macos_launch());
+            assert!(
+                !flow.in_progress(),
+                "Save As must still be usable during the prompt"
+            );
+            if cancel {
+                assert_eq!(cancel_quit_with(flow, id), QuitCancelOutcome::Cancelled);
+                assert!(!flow.refuses_macos_launch());
+            } else {
+                assert!(resume_prompted_quit_with(flow, &host, id));
+                assert_eq!(cancel_quit_with(flow, id), QuitCancelOutcome::Committed);
+                assert!(flow.refuses_macos_launch());
+            }
+        }
     }
 
     #[test]
-    fn a_second_launch_while_quitting_opens_and_shows_nothing() {
+    fn single_instance_a_second_launch_while_quitting_opens_and_shows_nothing() {
         assert_eq!(
             second_launch_action(true, true),
             SecondLaunchAction::IgnoreWhileQuitting
@@ -11453,7 +14632,7 @@ mod tests {
     }
 
     #[test]
-    fn openable_document_paths_are_existing_chemdraft_cdxml_or_cdx_files() {
+    fn single_instance_openable_document_paths_are_existing_chemdraft_cdxml_or_cdx_files() {
         let dir = std::env::temp_dir().join(format!("chemdraft-open-args-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("temp dir");
         for name in ["a.chemdraft", "b.CDXML", "c.txt", "d.Cdx"] {
@@ -11700,6 +14879,8 @@ mod tests {
             include_str!("../capabilities/toolset-command-hit-boxes.json"),
             include_str!("../capabilities/palette-focus-diagnostic.json"),
             include_str!("../capabilities/window-drag.json"),
+            include_str!("../capabilities/toolset-window-size.json"),
+            include_str!("../capabilities/inspector-window-clamp.json"),
             include_str!("../capabilities/default.json"),
             include_str!("../capabilities/document-dialogs.json"),
             include_str!("../capabilities/plugin-panel.json"),
@@ -11763,6 +14944,119 @@ mod tests {
             "toolset-plugin-fixture",
             &toolset_window_label("plugin.fixture"),
         );
+    }
+
+    #[test]
+    fn only_scrolling_toolsets_allow_user_resize() {
+        for id in [
+            "core.molecularInspector",
+            "core.drawnStructureSettings",
+            "core.ringInspector",
+        ] {
+            assert!(toolset_is_resizable(id), "{id}");
+        }
+        for id in [
+            "core.main",
+            "core.structure",
+            "core.arrows",
+            "core.annotations",
+            "core.art",
+            "core.orbitals",
+            "core.layout",
+            "core.style",
+            "core.text",
+            "plugin.fixture",
+            "user.fixture",
+        ] {
+            assert!(!toolset_is_resizable(id), "{id}");
+        }
+    }
+
+    #[test]
+    fn legacy_toolset_sizes_only_restore_for_scrolling_inspectors() {
+        let state: PersistedToolsetState =
+            serde_json::from_str(r#"{"x":-125.0,"y":275.0,"width":413.0,"height":317.0}"#).unwrap();
+        for (id, expected) in [
+            ("core.layout", None),
+            ("core.molecularInspector", Some((413.0, 317.0))),
+        ] {
+            let position = state.position().unwrap();
+            assert_eq!((position.x, position.y), (-125.0, 275.0));
+            assert_eq!(state.window_size(toolset_is_resizable(id)), expected);
+        }
+        let position_only: PersistedToolsetState =
+            serde_json::from_str(r#"{"x":-125.0,"y":275.0}"#).unwrap();
+        assert_eq!(position_only.window_size(true), None);
+    }
+
+    #[test]
+    fn two_column_palette_fit_accepts_the_measured_size_below_the_old_floor() {
+        let area = ScreenRect::new(0.0, 24.0, 950.0, 636.0);
+        for scale in [1.0, 1.5, 2.0] {
+            let origin = ((160.0 * scale) as i32, (104.0 * scale) as i32);
+            let fit = toolset_content_placement(origin, (60.0, 54.0), scale, area);
+            assert_eq!(fit.position, origin);
+            assert_eq!(fit.size, ((60.0 * scale) as u32, (54.0 * scale) as u32));
+        }
+    }
+
+    #[test]
+    fn toolset_window_size_capability_covers_custom_palette_labels() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/toolset-window-size.json")).unwrap();
+        assert_eq!(capability["windows"], serde_json::json!(["toolset-*"]));
+        assert_eq!(toolset_window_label("lab.quick"), "toolset-lab-quick");
+    }
+
+    #[test]
+    fn native_flyout_dispatch_requires_a_visible_matching_opening() {
+        let opening = || ToolsetFlyoutOpening {
+            toolset_id: "core.main".into(),
+            flyout_id: "rings".into(),
+            opened_at: 123.5,
+            generation: Some(2),
+            bond_stereo_session_id: None,
+        };
+        let current = opening();
+        assert!(can_dispatch_flyout_command(
+            true,
+            &current,
+            Some(&opening())
+        ));
+        assert!(!can_dispatch_flyout_command(
+            false,
+            &current,
+            Some(&opening())
+        ));
+        assert!(!can_dispatch_flyout_command(true, &current, None));
+        for stale in [
+            ToolsetFlyoutOpening {
+                toolset_id: "core.structure".into(),
+                ..opening()
+            },
+            ToolsetFlyoutOpening {
+                flyout_id: "bonds".into(),
+                ..opening()
+            },
+            ToolsetFlyoutOpening {
+                opened_at: 123.0,
+                ..opening()
+            },
+            ToolsetFlyoutOpening {
+                generation: Some(1),
+                ..opening()
+            },
+            ToolsetFlyoutOpening {
+                generation: None,
+                ..opening()
+            },
+            ToolsetFlyoutOpening {
+                bond_stereo_session_id: Some("session-1".into()),
+                ..opening()
+            },
+        ] {
+            assert!(!can_dispatch_flyout_command(true, &current, Some(&stale)));
+        }
     }
 
     #[test]
@@ -11878,9 +15172,9 @@ mod tests {
             ToolsetPopoverFocusMode::Preserve,
         );
         // These are passed directly to WebviewWindowBuilder::from_config.
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         assert_eq!(config.parent.as_deref(), Some(MAIN_WINDOW_LABEL));
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         assert_eq!(config.parent, None);
         assert!(!config.focusable);
         assert!(!config.focus); // Tao's Windows SW_SHOWNOACTIVATE path.
@@ -11903,9 +15197,15 @@ mod tests {
         assert_eq!(toolset_popover_extended_style(style), style);
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     #[test]
     fn bond_stereo_mouse_popover_is_unparented_and_nonactivating() {
+        assert_bond_stereo_mouse_creation();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bond_stereo_mouse_popover_is_transient_and_nonactivating() {
         assert_bond_stereo_mouse_creation();
     }
 
@@ -11938,9 +15238,9 @@ mod tests {
             );
             assert!(!config.focus);
             assert!(!config.visible);
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             assert_eq!(config.parent.as_deref(), Some(MAIN_WINDOW_LABEL));
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "linux")))]
             assert_eq!(config.parent, None);
         }
     }
@@ -12247,9 +15547,18 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn clipboard_edit_menu_commands_are_routed_on_linux() {
-        for command in ["clipboard.cut", "clipboard.copy", "clipboard.paste"] {
+        for (command, expected) in [
+            ("clipboard.cut", c"Cut"),
+            ("clipboard.copy", c"Copy"),
+            ("clipboard.paste", c"Paste"),
+        ] {
             assert!(is_routed_menu_command(command), "{command}");
+            assert_eq!(native_clipboard_edit_command(command), Some(expected));
             assert_eq!(menu_command_target_label(command, None), MAIN_WINDOW_LABEL);
+            assert_eq!(
+                menu_command_target_label(command, Some("dialog-main-pageSize-12")),
+                "dialog-main-pageSize-12"
+            );
         }
     }
 
@@ -12534,8 +15843,14 @@ mod tests {
             Ok(_) => panic!("oversized document must be refused"),
             Err(error) => error,
         };
-        fs::remove_file(path).expect("remove fixture");
-        assert_eq!(error, "Document exceeds the 64 MB size limit");
+        fs::remove_file(&path).expect("remove fixture");
+        assert_eq!(
+            error,
+            format!(
+                "Could not open {}: Document exceeds the 64 MB size limit",
+                path.file_name().expect("file name").to_string_lossy()
+            )
+        );
     }
 
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]

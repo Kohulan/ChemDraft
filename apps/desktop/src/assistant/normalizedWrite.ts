@@ -1,7 +1,7 @@
 import type { ChemDraftDocument, DocumentObject, MoleculeObject } from "@chemdraft/chem-core";
 import { normalizeCommittedDocument } from "../documentWorkflow";
 import type { AssistantToolContext } from "./AssistantToolContext";
-import { assertCanonical, inspectMolecule } from "./writeBuilder";
+import { assertCanonical, inspectMolecule } from "../plugins/requestWrites/structureIdentity";
 
 const objectsById = (document: ChemDraftDocument) => new Map(document.pages.flatMap(page =>
   page.objects.map(object => [object.id, { pageId: page.id, object }] as const)));
@@ -14,7 +14,7 @@ const equalEntry = (a: ObjectEntry | undefined, b: ObjectEntry | undefined) =>
 
 /** Host boundary for every assistant tool write. Verify the exact desktop commit, not just
  * the patch: charge/radical reconciliation can also mutate unselected neighbouring objects.
- * The caller must recheck normalization inside the synchronous gesture gate. */
+ * The caller rechecks the authored result inside the synchronous gesture gate before host cleanup. */
 function normalizeScopedWrite(before: ChemDraftDocument, patched: ChemDraftDocument, scope: ReadonlySet<string>): ChemDraftDocument {
   const normalized = normalizeCommittedDocument(patched);
   const previous = objectsById(before), proposed = objectsById(patched), committed = objectsById(normalized);

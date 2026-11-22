@@ -5,7 +5,7 @@ import { compareNativeVersions, isNativeRecord, nativeExtensionTarget, ownNative
 
 export const NativeDocumentBaselineAppVersion = "1.1.1";
 export const NativeDocumentFormatVersion = "1.2.0";
-export const NativeDocumentReaderVersion = "1.2.0";
+export const NativeDocumentReaderVersion = "1.2.1";
 
 export interface NativeDocumentFeatureVersion {
   introducedIn: string;
@@ -88,6 +88,8 @@ export const NativeDocumentFeatureVersions: Readonly<Record<string, NativeDocume
   "field:pages.*.objects.*[type=bracket].crossingBondIds": { introducedIn: "1.2.0", kind: "feature", ignorable: false },
   "field:pages.*.objects.*[type=bracket].crossingBondIds.*.objectId": { introducedIn: "1.2.0", kind: "feature", ignorable: false },
   "field:pages.*.objects.*[type=bracket].crossingBondIds.*.bondId": { introducedIn: "1.2.0", kind: "feature", ignorable: false },
+
+  "field:pages.*.objects.*[type=bracket].compatibility.unknown.cdxmlBracketDeletedAtoms": { introducedIn: "1.2.1", kind: "feature", ignorable: false },
 
   // Import identity snapshots carry chemistry provenance, but 1.1.1 already preserves
   // this entire open compatibility record. Typing it must not raise the file version.

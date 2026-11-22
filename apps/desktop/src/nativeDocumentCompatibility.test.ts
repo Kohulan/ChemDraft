@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { applyPatch, createEmptyDocument, readSerializedDocument, serializeDocument } from "@chemdraft/chem-core";
+import { applyPatch, applyPatches, createEmptyDocument, readSerializedDocument, serializeDocument } from "@chemdraft/chem-core";
 import { createNativeSavePayload, normalizeCommittedDocument, openNativeDocument } from "./documentWorkflow";
 import { notifyNativeDocumentCompatibility } from "./nativeDocumentNotice";
 import { nativePromptButtons, setNativePromptProvider, type NativePromptOptions } from "./nativePrompt";
@@ -37,6 +37,34 @@ describe("native document compatibility notice", () => {
       await notifyNativeDocumentCompatibility(opened, opened.document!);
       expect(prompt).not.toHaveBeenCalled();
     } finally { restore(); }
+  });
+
+  it("reopens its own staged SRU deletion without a notice and lowers the minimum when only 1.2.0 metadata remains", async () => {
+    const imported = openNativeDocument(`<CDXML><page id="1">
+      <fragment id="10"><n id="11" Element="6" p="100 140"/><n id="12" Element="6" p="130 140"/>
+        <b id="13" B="11" E="12" Order="1"/></fragment>
+      <graphic id="20" GraphicType="Bracket" BracketType="Round" BoundingBox="85 120 90 160"/>
+      <graphic id="21" GraphicType="Bracket" BracketType="Round" BoundingBox="145 120 150 160"/>
+      <bracketedgroup id="30" BracketedObjectIDs="11 12" BracketUsage="SRU">
+        <bracketattachment id="31" GraphicID="20"/><bracketattachment id="33" GraphicID="21"/>
+      </bracketedgroup></page></CDXML>`).document!;
+    const molecule = imported.pages[0].objects.find(object => object.type === "molecule")!;
+    const staged = applyPatch(imported, { op: "updateObject", objectId: molecule.id, changes: { atoms: molecule.atoms.slice(1), bonds: [] } });
+    const reopened = openNativeDocument(createNativeSavePayload(staged).contents);
+    const document = reopened.document!;
+    expect(document.minAppVersion).toBe("1.2.1");
+    const glyphs = document.pages[0].objects.filter(object => object.type === "bracket");
+    expect(glyphs).toHaveLength(2);
+    for (const glyph of glyphs) expect(glyph.compatibility?.unknown.cdxmlBracketDeletedAtoms).toEqual([["11", molecule.atoms[0].id]]);
+    const present = vi.fn(async () => "ok");
+    await notifyNativeDocumentCompatibility(reopened, document, "macos", present);
+    expect(present).not.toHaveBeenCalled();
+
+    const withoutDeletionProof = applyPatches(document, glyphs.map(glyph => {
+      const { cdxmlBracketDeletedAtoms: _proof, ...unknown } = glyph.compatibility!.unknown;
+      return { op: "updateObject", objectId: glyph.id, changes: { compatibility: { ...glyph.compatibility!, unknown } } };
+    }));
+    expect(openNativeDocument(createNativeSavePayload(withoutDeletionProof).contents).document?.minAppVersion).toBe("1.2.0");
   });
 
   it("notifies for a newer minimum even without any fallback warnings", async () => {

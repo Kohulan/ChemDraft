@@ -1,7 +1,9 @@
 export { normalizeAtomIsotope } from "./isotopes";
 export { rGroupNumberFromLabel } from "./rGroups";
-export { bracketPairs, withoutBracketPairMetadata, bracketChemistryWarnings, withBracketChemistryWarnings, moleculeBracketWarningMessages } from "./brackets";
-export { resolveRepeatUnitAtomMembership, type RepeatUnitAtomMembership, type RepeatUnitMembershipOptions } from "./repeatUnitMembership";
+export { bracketPairSemantics, bracketPairUsage, bracketUsageSemantics, importedBracketUsage } from "./bracketSemantics";
+export { bracketPairs, sameBracketIdentity, retainBracketIdentity, withoutBracketPairMetadata,
+  bracketChemistryWarnings, withBracketChemistryWarnings, moleculeBracketWarningMessages } from "./brackets";
+export { isRepeatUnitBoundaryBond, remapImportedRepeatUnitAfterMoleculeMerge, resolveRepeatUnitAtomMembership, type RepeatUnitAtomMembership, type RepeatUnitMembershipOptions } from "./repeatUnitMembership";
 export { rotatePointAboutCenter } from "./pointRotation";
 export { MAX_IMAGE_OBJECT_BYTES } from "./imageBytes";
 export { MAX_IMAGE_SIDE, MAX_IMAGE_DECODED_BYTES, imagePixelLimitError, validatePngImage, validateSvgImage, isSvgImageSource, createImageGraphicObject, readPngInfo, readSvgInfo, type CreateImageGraphicObjectOptions, type ImagePixelInfo } from "./image";
@@ -16,6 +18,7 @@ export {
   ArrowObjectSchema,
   BracketObjectSchema,
   CdxmlBracketAtomSnapshotSchema,
+  checkChangedObjectReferences,
   ChemDraftDocumentSchema,
   ChemicalMetadataSchema,
   CompatibilityMetadataSchema,
@@ -208,6 +211,9 @@ export {
   applyPatches,
   pruneReactionObjectReferences,
   type ApplyPatchOptions,
+  type OrphanedRepeatUnit,
+  planOrphanedRepeatUnitCleanup,
+  removeOrphanedRepeatUnitBrackets,
   type DocumentPatch,
   type ObjectReorderPlacement
 } from "./patches";

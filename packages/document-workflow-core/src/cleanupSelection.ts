@@ -1,4 +1,5 @@
 import { applyPatches, nativeDrawingStyleFromObjectStyle, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
+import { atomPairOverlaps, distance, evaluateLayoutContacts, ringInteriorDoubleBondSides, transformPointForObject } from "@chemdraft/layout-engine";
 import { moleculeGeometryFromAtoms, stereoPerceptionMolfile, type PastedStructureDepiction } from "./molecule";
 import { phase4Timestamp } from "./shared";
 
@@ -25,10 +26,10 @@ export function cleanupSelectionAtomIds(molecule: MoleculeObject, selection: Cle
   return new Set(molecule.atoms.filter(atom => ids.has(atom.id)).map(atom => atom.id));
 }
 
-/** Lay out only selected connected parts. Unselected atom records and every bond are retained.
+/** Lay out only selected connected parts. Unselected atoms and bond topology are retained.
  * Isolated selected atoms are deliberately no-ops. Full selections use the caller's existing
- * whole-molecule path. No reflection or wedge reassignment is allowed: a stereo change refuses
- * the operation, including changes at fixed centres with a moving ligand or across an alkene.
+ * whole-molecule path. Wedges are retained and any stereo change refuses the operation,
+ * including changes at fixed centers with a moving ligand or across an alkene.
  * Engines are injected so the same pure operation is available to desktop and headless callers.
  */
 export function cleanUpMoleculeSelection2d(
@@ -174,18 +175,46 @@ export function cleanUpMoleculeSelection2d(
   }
   const atoms = molecule.atoms.map((atom, i) => movable.has(i) ? { ...atom, ...points[i] } : atom);
   if (atoms.every((atom, i) => atom.x === molecule.atoms[i]!.x && atom.y === molecule.atoms[i]!.y)) return molecule;
+  const layoutBonds = edges.map(([from, to]) => ({ from, to }));
+  const { overlappingAtoms } = evaluateLayoutContacts(atoms, layoutBonds, target);
+  if (overlappingAtoms.length) {
+    const before = evaluateLayoutContacts(molecule.atoms, layoutBonds, target);
+    const existingPairs = new Set(before.overlappingAtoms.map(pair => pair.join(",")));
+    if (overlappingAtoms.some(pair => !existingPairs.has(pair.join(",")))) {
+      throw new Error("Clean Up Selection: the fitted layout would create overlapping atoms.");
+    }
+  }
   // Rotation uses the stored frame's centre as its SVG pivot. Keep that frame for a rotated
   // partial edit so unchanged native coordinates also keep their exact rendered positions.
   const result = { ...molecule, atoms, ...(molecule.rotation === 0 ? moleculeGeometryFromAtoms(atoms) : {}) };
+  result.bonds = preserveRingDoubleBondSides(molecule, result);
   // The native records, not the engine's rebuilt graph, are the chemistry source of truth.
   engines.assertIdentity(source, stereoPerceptionMolfile(result));
   return result;
 }
 
+function preserveRingDoubleBondSides(before: MoleculeObject, after: MoleculeObject): MoleculeObject["bonds"] {
+  if (!before.bonds.some(bond => bond.order === "double" &&
+    (bond.display?.doubleBondSide === "left" || bond.display?.doubleBondSide === "right"))) return before.bonds;
+  const previousInteriors = ringInteriorDoubleBondSides(before);
+  if (!previousInteriors.size) return before.bonds;
+  const nextInteriors = ringInteriorDoubleBondSides(after);
+  let bonds = before.bonds;
+  before.bonds.forEach((bond, i) => {
+    const side = bond.display?.doubleBondSide;
+    if (side !== "left" && side !== "right") return;
+    const previous = previousInteriors.get(bond.id), next = nextInteriors.get(bond.id);
+    if (!previous || !next || previous === next) return;
+    if (bonds === before.bonds) bonds = [...bonds];
+    bonds[i] = { ...bond, display: { ...bond.display, doubleBondSide: side === "left" ? "right" : "left" } };
+  });
+  return bonds;
+}
+
 /** Prepare every partial target before applying any patch; callers commit once with one label. */
 export function cleanUpMoleculeSelections2d(
   document: ChemDraftDocument, selections: readonly (CleanupMoleculeSelection & { objectId: string })[],
-  engines: ConstrainedCleanupEngines
+  engines: ConstrainedCleanupEngines, options: { deferPageOverlapCheck?: boolean } = {}
 ): ChemDraftDocument {
   const movedAtoms = new Map<string, Map<string, { x: number; y: number }>>();
   const patches = selections.flatMap(selection => {
@@ -225,5 +254,54 @@ export function cleanUpMoleculeSelections2d(
     return offset ? [{ op: "updateObject" as const, objectId: object.id,
       changes: { x: object.x + offset.x, y: object.y + offset.y } }] : [];
   }));
-  return patches.length ? applyPatches(document, [...patches, ...markPatches], { now: phase4Timestamp }) : document;
+  if (!patches.length) return document;
+  const candidate = applyPatches(document, [...patches, ...markPatches], { now: phase4Timestamp });
+  if (!options.deferPageOverlapCheck) assertNoNewCleanupMoleculeOverlaps(document, candidate);
+  return candidate;
+}
+
+/** Compare rendered atom positions once all molecules in the cleanup have been laid out. */
+export function assertNoNewCleanupMoleculeOverlaps(
+  original: ChemDraftDocument, candidate: ChemDraftDocument, commandLabel = "Clean Up Selection"
+): void {
+  for (const page of original.pages) {
+    const finalPage = candidate.pages.find(other => other.id === page.id);
+    if (!finalPage || finalPage === page) continue;
+    // Cleanup updates objects in place, so the page position identifies each occurrence.
+    const molecules = page.objects.flatMap((molecule, index) => {
+      if (molecule.type !== "molecule") return [];
+      const next = finalPage.objects[index];
+      const cleaned = next?.type === "molecule" && next.id === molecule.id ? next : molecule;
+      return [{ molecule, cleaned }];
+    });
+    if (molecules.length < 2) continue;
+    checkOverlapsBetweenMolecules(molecules, commandLabel);
+  }
+}
+
+function checkOverlapsBetweenMolecules(
+  molecules: { molecule: MoleculeObject; cleaned: MoleculeObject }[], commandLabel: string
+): void {
+  const pageAtoms = molecules.map(({ molecule, cleaned }) => {
+    const before = molecule.atoms.map(atom => transformPointForObject(molecule, atom));
+    const after = cleaned !== molecule ? cleaned.atoms.map(atom => transformPointForObject(cleaned, atom)) : before;
+    return { molecule, before, after };
+  });
+  for (const entry of pageAtoms) {
+    if (entry.after === entry.before) continue;
+    const { bondLengthPx } = nativeDrawingStyleFromObjectStyle(entry.molecule.style);
+    for (const [i, after] of entry.after.entries()) {
+      const before = entry.before[i]!;
+      if (after.x === before.x && after.y === before.y) continue;
+      for (const other of pageAtoms) {
+        if (other === entry) continue;
+        const introducedOverlap = other.after.some((otherAfter, j) => {
+          const otherBefore = other.before[j]!;
+          return atomPairOverlaps(distance(after, otherAfter), bondLengthPx) &&
+            !atomPairOverlaps(distance(before, otherBefore), bondLengthPx);
+        });
+        if (introducedOverlap) throw new Error(`${commandLabel}: the fitted layout would create overlapping atoms.`);
+      }
+    }
+  }
 }

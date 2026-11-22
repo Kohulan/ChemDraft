@@ -41,7 +41,7 @@ const MAX_HEAVY_ATOMS = 500;
 /** Stop recreating a crashed worker after this many restarts; something is systematically wrong. */
 const MAX_WORKER_RESTARTS = 3;
 
-export type AnalysisClientRequestSpec = AnalysisRequestSpec & { refusalReason?: string };
+export type AnalysisClientRequestSpec = AnalysisRequestSpec & { refusalReason?: string; refusalCode?: string };
 
 export interface AnalysisClient {
   /**
@@ -189,7 +189,7 @@ export function createAnalysisClient(workerFactory?: () => Worker): AnalysisClie
           finishedAt: now,
           interpretation: sourceInterpretation(spec.format, spec.value),
           status: "unsupported",
-          warnings: [{ code: "structure.unknown_bond_order", severity: "error", message: spec.refusalReason, affectedResultIds: [] }]
+          warnings: [{ code: spec.refusalCode ?? "structure.unknown_bond_order", severity: "error", message: spec.refusalReason, affectedResultIds: [] }]
         }));
       }
       return scheduler.request(slot, spec, options);

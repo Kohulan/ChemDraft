@@ -42,7 +42,7 @@ const loadFace = {
 };
 
 /** Keep standard-font elements; split embedded text runs by actual cmap coverage. */
-export async function preparePdfFonts(svg: Element, pdf: jsPDF): Promise<() => void> {
+export async function preparePdfFonts(svg: Element, pdf: jsPDF, warn: (face: string) => void = () => {}): Promise<() => void> {
   const fonts = new Map<string, {
     family: Family; face: Face;
   }>();
@@ -111,6 +111,9 @@ export async function preparePdfFonts(svg: Element, pdf: jsPDF): Promise<() => v
   }
 
   const browserFonts: FontFace[] = [];
+  for (const { family, face } of fonts.values()) {
+    if (family === "ChemDraftPatrickHand" && face !== "normal") warn(face);
+  }
   const fontSet = globalThis.document?.fonts;
   const release = () => { for (const font of browserFonts) fontSet?.delete(font); };
   try {

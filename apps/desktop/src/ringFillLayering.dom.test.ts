@@ -7,15 +7,17 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChemDraftDocument, ElectronMarkObject, DocumentObject, MoleculeObject, TextObject, GraphicObject } from "@chemdraft/chem-core";
 import { exportDocumentToSvg } from "@chemdraft/export-engine";
 import { nativeMoleculeRings, planPageSvgRender } from "@chemdraft/layout-engine";
+import { ensureRdkit, resetRdkitForTesting, setRdkitModuleLoader } from "@chemdraft/rdkit-adapter";
 import { MainWindow } from "./MainWindow";
 import { saveDirectElectronMarkEditing } from "./electronMarkEditingSettings";
 import { electronMarkInteractionFrames } from "./electronMarkInteraction";
 import { broadcastElectronMarkEditingSettings } from "./window-manager";
 import { MemoryStorage } from "./testSupport/memoryStorage";
+import { installDomRdkitLoader } from "./testSupport/rdkitIdentity";
 import {
   createPhase4Document,
   applyChargeToolAtPoint,
@@ -29,6 +31,14 @@ import {
 } from "./documentWorkflow";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+vi.mock("./rdkitWasmLoader", () => ({ registerRdkitWasmLoader: vi.fn() }));
+
+beforeAll(async () => {
+  installDomRdkitLoader(setRdkitModuleLoader);
+  await ensureRdkit();
+});
+afterAll(() => resetRdkitForTesting());
 
 const fills = [
   { name: "solid", style: { fillColor: "#ef8a24", fillOpacity: 0.8 } },
@@ -497,6 +507,14 @@ describe("canvas ring-fill layers", () => {
 
   async function command(commandId: string, eventName = DOM_COMMAND_EVENT) {
     await act(async () => window.dispatchEvent(new CustomEvent(eventName, { detail: { commandId } })));
+  }
+
+  async function startStoredSpin() {
+    await command("structure.spin3d");
+    await vi.waitFor(async () => {
+      await act(async () => {});
+      expect(container.querySelector("[data-spin3d-overlay]")).not.toBeNull();
+    });
   }
 
   async function pointer(target: Element, type: "pointerdown" | "pointermove" | "pointerup", point: { x: number; y: number }, buttons = type === "pointerup" ? 0 : 1, shiftKey = false) {
@@ -1139,7 +1157,7 @@ describe("canvas ring-fill layers", () => {
     const nativeDocument = attachSpin3dModel(documentWithObjects(fixture.document,
       [fixture.molecule, fixture.frontLetter], [fixture.molecule.id]), fixture.molecule.id, model);
     await renderDocument(nativeDocument);
-    await command("structure.spin3d");
+    await startStoredSpin();
     expect(container.querySelector("[data-spin3d-overlay]")).not.toBeNull();
     expect(moleculeLayer(fixture.molecule.id).querySelector<SVGElement>(".native-molecule-overlay")!.style.opacity).toBe("0.1");
     expect(objectVisual(fixture.frontLetter.id)!.getAttribute("opacity")).toBeNull();
@@ -1216,7 +1234,7 @@ describe("canvas ring-fill layers", () => {
     const nativeDocument = attachSpin3dModel(documentWithObjects(fixture.document,
       [...labels.slice(0, 200), fixture.molecule, ...labels.slice(200)], [fixture.molecule.id]), fixture.molecule.id, model);
     await renderDocument(nativeDocument, kind === "lasso" ? "tool.lasso" : "tool.select");
-    if (kind === "spin") await command("structure.spin3d");
+    if (kind === "spin") await startStoredSpin();
     else {
       const page = container.querySelector(".page")!;
       await pointer(page, "pointerdown", { x: 50, y: 50 });

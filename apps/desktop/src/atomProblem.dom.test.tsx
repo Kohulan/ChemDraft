@@ -49,9 +49,30 @@ async function mount(document: ChemDraftDocument, shortcutPlatform?: "macos" | "
 const current = () => window.__CHEMDRAFT_AGENT__!.snapshot();
 const molecule = () => current().document.pages[0]!.objects.find(o => o.id === target.objectId) as MoleculeObject;
 const badge = () => container.querySelector<SVGGElement>(`[data-invalid-atom-id="${target.atomId}"]`)!;
+describe.each(["macos", "windows"] as const)("problem marker keyboard propagation (%s)", platform => {
+  it("lets only platform undo and redo reach the canvas", async () => {
+    Object.defineProperty(navigator, "platform", { configurable: true, value: platform === "macos" ? "MacIntel" : "Win32" });
+    const received: string[] = [];
+    await act(async () => root.render(createElement("svg", { onKeyDown: event => received.push(event.key) },
+      createElement(AtomProblemMarker, { target, x: 0, y: 0, invoke: () => {} }))));
+    const marker = badge();
+    for (const [key, modifiers] of [["z", platform === "macos" ? { metaKey: true } : { ctrlKey: true }],
+      ["Z", platform === "macos" ? { metaKey: true, shiftKey: true } : { ctrlKey: true, shiftKey: true }],
+      ...(platform === "windows" ? [["y", { ctrlKey: true }]] as const : []),
+      ["z", platform === "macos" ? { ctrlKey: true } : { metaKey: true }],
+      ["z", { ctrlKey: true, metaKey: true }], ["y", { metaKey: true }], ["Y", { ctrlKey: true, shiftKey: true }],
+      ["r", { ctrlKey: true }], ["r", { metaKey: true }], ["F5", {}],
+      ["ArrowLeft", {}], ["Escape", {}]] as const) {
+      marker.dispatchEvent(new KeyboardEvent("keydown", { key, ...modifiers, bubbles: true }));
+    }
+    expect(received).toEqual(["z", "Z", ...(platform === "windows" ? ["y"] : [])]);
+  });
+});
 describe.each(["macos", "windows"] as const)("reload on a focused problem marker (%s)", platform => {
+  // The badge must follow the window's platform override even when host detection disagrees.
+  beforeEach(() => Object.defineProperty(navigator, "platform", { configurable: true, value: platform === "macos" ? "Win32" : "MacIntel" }));
   it.each([
-    ["F5", {}], ["r", { ctrlKey: true }],
+    ["F5", {}], ["r", { ctrlKey: true }], ["r", { metaKey: true }],
     ["R", { ctrlKey: true, shiftKey: true }], ["F5", { ctrlKey: true }]
   ] as const)("consumes %s %j without invoking a command", async (key, modifiers) => {
     await mount(problemDocument(), platform);
@@ -150,6 +171,43 @@ it("Ignore hides only the badge; context-menu Restore works for a suppressed inv
   await command("edit.undo"); expect(badge()).not.toBeNull();
   expect(container.querySelector('[role="status"]')!.textContent).toContain("Undid Ignore warning");
   expect(container.querySelector("main")!.dataset.canUndo).toBe("false");
+});
+describe.each(["MacIntel", "Win32"])("problem completion (%s)", platform => {
+  it("updates the same window while the restored warning remains, then closes after its fix", async () => {
+    Object.defineProperty(navigator, "platform", { configurable: true, value: platform });
+    const source = problemMolecule("N", Array(4).fill("C"));
+    source.atoms[0]!.warningSuppressed = true;
+    await mount(problemDocument(source));
+    await command(atomProblemCommandId(target));
+    await deliver("ready", {});
+    if (snapshot.dialogKind !== "atomProblem") throw new Error("Expected problem window");
+    const version = snapshot.data.targetVersion;
+    await deliver("action", { action: "restore", targetVersion: version });
+    expect(native.close).not.toHaveBeenCalled();
+    expect(native.open).toHaveBeenCalledTimes(1);
+    expect(snapshot.data.targetVersion).toBeGreaterThan(version);
+    expect(snapshot.data.fixes.map(fix => fix.action)).toContain("charge");
+    expect(snapshot.data.fixes.map(fix => fix.action)).toContain("ignore");
+    expect(snapshot.data.fixes.map(fix => fix.action)).not.toContain("restore");
+    await deliver("action", { action: "charge", targetVersion: snapshot.data.targetVersion });
+    expect(native.close).toHaveBeenCalledExactlyOnceWith("opaque", "close");
+  });
+  it.each([
+    ["ignore", problemMolecule("N", Array(4).fill("C"))],
+    ["ignore", problemMolecule("OH2")],
+    ["charge", problemMolecule("N", Array(4).fill("C"))],
+    ["hydrogens", problemMolecule("OH2")]
+  ] as const)("closes after %s even when the warning offers a suggested fix", async (action, source) => {
+    Object.defineProperty(navigator, "platform", { configurable: true, value: platform });
+    await mount(problemDocument(source));
+    await command(atomProblemCommandId(target));
+    await deliver("ready", {});
+    if (snapshot.dialogKind !== "atomProblem") throw new Error("Expected problem window");
+    expect(snapshot.data.fixes.some(fix => fix.action === "charge" || fix.action === "hydrogens")).toBe(true);
+    await deliver("action", { action, targetVersion: snapshot.data.targetVersion });
+    expect(badge()).toBeNull();
+    expect(native.close).toHaveBeenCalledExactlyOnceWith("opaque", "close");
+  });
 });
 it("stops drawing gestures at the marker even with the bond tool active", async () => {
   await mount(problemDocument()); await command("tool.bond.single");

@@ -1,12 +1,14 @@
 import { lazy, Suspense, useEffect, type ReactElement } from "react";
 import {
   PREFERENCES_WINDOW_KIND,
+  isDesktopRuntime,
   routeToolsetCommand,
   TOOLSET_POPOVER_WINDOW_KIND,
   TOOLSET_TOOLTIP_WINDOW_KIND
 } from "./window-manager";
 import { installSecondaryWindowEditHistory } from "./editHistoryRouting";
 import { installBrowserReloadGuard } from "./browserReloadGuard";
+import { acknowledgeFirstPaintOnce } from "./paletteFirstPaint";
 
 const MainWindow = lazy(() => import("./MainWindow").then(m => ({ default: m.MainWindow })));
 const PaletteWindow = lazy(() => import("./PaletteWindow").then(m => ({ default: m.PaletteWindow })));
@@ -16,8 +18,22 @@ const PluginPanelWindow = lazy(() => import("./plugins/PluginPanelWindow").then(
 const Spin3dDebuggerWindow = lazy(() => import("./Spin3dDebuggerWindow").then(m => ({ default: m.Spin3dDebuggerWindow })));
 const PreferencesWindow = lazy(() => import("./PreferencesWindow").then(m => ({ default: m.PreferencesWindow })));
 const DialogWindow = lazy(() => import("./dialogs/DialogWindow").then(m => ({ default: m.DialogWindow })));
+const FileWarningsWindow = lazy(() => import("./FileWarningsWindow").then(m => ({ default: m.FileWarningsWindow })));
 
 export function App() {
+  useEffect(() => {
+    if (!isDesktopRuntime()) return;
+    const kind = new URLSearchParams(window.location.search).get("window");
+    // Main handles its own outside press, excluding the toggle. Other native app
+    // windows have a dismissal-only capability; warning-row clicks stay inside.
+    if (!kind || kind === "fileWarnings") return;
+    const dismiss = () => { void import("@tauri-apps/api/core").then(({ invoke }) => invoke("file_warnings_dismiss")).catch(() => undefined); };
+    window.addEventListener("pointerdown", dismiss, true);
+    return () => window.removeEventListener("pointerdown", dismiss, true);
+  }, []);
+  if (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("window") === "fileWarnings") {
+    return <Suspense fallback={null}><FileWarningsWindow /></Suspense>;
+  }
   const dialog = dialogRoute();
   if (dialog !== undefined) {
     return <Suspense fallback={<p role="status">Opening dialog…</p>}>
@@ -48,6 +64,15 @@ function SecondaryWindowEditHistory({ dialog = false }: { dialog?: boolean }): n
   return null;
 }
 
+/**
+ * Rendered beside a palette, popover or tooltip window, inside the same Suspense boundary, so its
+ * effect runs once that window's first render has committed.
+ */
+function FirstPaintAcknowledgement(): null {
+  useEffect(() => acknowledgeFirstPaintOnce(), []);
+  return null;
+}
+
 export function dialogRoute(): string | undefined {
   if (typeof window === "undefined") return undefined;
   const params = new URLSearchParams(window.location.search);
@@ -66,21 +91,24 @@ function secondaryWindowContent(): ReactElement | undefined {
   const popoverRoute = toolsetPopoverRoute();
   if (popoverRoute) {
     return (
-      <PalettePopoverWindow
-        toolsetId={popoverRoute.toolsetId}
-        kind={popoverRoute.kind}
-        prewarm={popoverRoute.prewarm}
-      />
+      <>
+        <PalettePopoverWindow
+          toolsetId={popoverRoute.toolsetId}
+          kind={popoverRoute.kind}
+          prewarm={popoverRoute.prewarm}
+        />
+        <FirstPaintAcknowledgement />
+      </>
     );
   }
 
   if (isToolsetTooltipRoute()) {
-    return <PaletteTooltipWindow />;
+    return <><PaletteTooltipWindow /><FirstPaintAcknowledgement /></>;
   }
 
-  const toolsetId = toolsetRouteId();
-  if (toolsetId) {
-    return <PaletteWindow toolsetId={toolsetId} />;
+  const toolset = toolsetRoute();
+  if (toolset) {
+    return <><PaletteWindow {...toolset} /><FirstPaintAcknowledgement /></>;
   }
 
   const pluginPanelId = pluginPanelRouteId();
@@ -150,7 +178,7 @@ function toolsetPopoverRoute(): { toolsetId: string; kind: string; prewarm: bool
   };
 }
 
-function toolsetRouteId(): string | undefined {
+function toolsetRoute(): { toolsetId: string; resizable: boolean } | undefined {
   if (typeof window === "undefined") {
     return undefined;
   }
@@ -158,11 +186,14 @@ function toolsetRouteId(): string | undefined {
   const params = new URLSearchParams(window.location.search);
   const windowKind = params.get("window");
   if (windowKind === "toolset") {
-    return params.get("toolsetId") ?? "core.main";
+    return {
+      toolsetId: params.get("toolsetId") ?? "core.main",
+      resizable: params.get("resizable") === "true"
+    };
   }
 
   if (windowKind === "tool-palette") {
-    return "core.main";
+    return { toolsetId: "core.main", resizable: false };
   }
 
   return undefined;

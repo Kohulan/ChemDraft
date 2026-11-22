@@ -2,8 +2,9 @@
 
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { Generate3DConformerResult } from "@chemdraft/chemistry-adapter";
+import { ensureRdkit, resetRdkitForTesting, setRdkitModuleLoader } from "@chemdraft/rdkit-adapter";
 import type { ConformerStageHandlers } from "./conformerClient";
 import type { ChemDraftAgentBridge } from "./agentBridge";
 
@@ -42,6 +43,7 @@ vi.mock("./conformerClient", () => ({
 vi.mock("@scena/react-ruler", () => ({
   default: () => null
 }));
+vi.mock("./rdkitWasmLoader", () => ({ registerRdkitWasmLoader: vi.fn() }));
 
 import { AGENT_BRIDGE_GLOBAL_NAME } from "./agentBridge";
 import type { ChemDraftDocument, MoleculeObject } from "@chemdraft/chem-core";
@@ -56,6 +58,13 @@ import * as documentWorkflow from "./documentWorkflow";
 import * as fragmentPlacement from "./interaction/spinFragmentPlacement";
 import { initialViewQuaternion, medianBondLength3d, overlayScale, projectSpin } from "./interaction/spinOverlay";
 import { quatToViewMatrix } from "./interaction/rotation3d";
+import { installDomRdkitLoader } from "./testSupport/rdkitIdentity";
+
+beforeAll(async () => {
+  installDomRdkitLoader(setRdkitModuleLoader);
+  await ensureRdkit();
+});
+afterAll(() => resetRdkitForTesting());
 
 function installDomMocks() {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;

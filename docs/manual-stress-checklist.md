@@ -62,6 +62,20 @@ Canvas context menus (macOS and Windows): open the page and object menus with th
 use arrows, Home/End, Arrange and Copy As submenus, Enter, Space, Escape and Tab, then verify canvas
 focus and drawing shortcuts return after an action or dismissal.
 
+Native canvas context menus (macOS and Windows):
+
+- Move a floating palette over the canvas, right-click a page and then an object beside it so the
+  popup overlaps the palette: the native menu and its submenus stay above the palette. Open Arrange,
+  Copy As and table alignment submenus; check enabled items and disabled items with their reasons.
+  Click a disabled item: no command runs. Choose an enabled edit: exactly one edit/Undo entry occurs.
+- Open again and cancel with Escape, then reopen and click outside. Both close without an edit;
+  canvas focus and drawing shortcuts return. With a plugin canvas prompt visible, right-click and
+  choose an item, then repeat and cancel: the prompt reappears after tracking ends, and a subsequent
+  canvas drag hides/shows it normally. Repeat mouse opens and keyboard activation rapidly.
+- On Windows, run `pnpm smoke:windows-menu-churn`; churn the main menu, context submenus, palettes,
+  flyouts and warnings together, then quit and relaunch. No startup/quit crash or duplicate action;
+  utility windows never gain a document menu, taskbar button or separate Alt-Tab entry.
+
 Selection nudging (macOS and Windows): select a molecule, an atom/bond fragment, text, arrow,
 graphic, and a mixed selection in turn. Arrow keys move by 1 document unit (one CSS pixel);
 Shift+arrow moves by 10, and Down increases document y. Check at several zoom levels and page edges.
@@ -73,6 +87,34 @@ While atom labels, text, table cells, form controls or editable plugin text hold
 real arrow caret/navigation behavior and no canvas movement. Cmd/Ctrl/Alt+arrows retain their
 usual behavior.
 Brackets (macOS and Windows): drag square/round pairs in both directions, including over a molecule; verify matching sides, both visibly selected after returning to Select, one labeled Undo/Redo, and Escape cancellation. Right-click either side, mark a repeat unit, then double-click the painted n and type m without switching tools (Enter/blur commits once; Escape cancels). A single Select click only selects, matching text objects. Duplicate, copy/paste, save/reopen and compare canvas/SVG/PDF placement. Select only the molecule: Copy As SMILES and SMILES file export must name the omitted repeat label and atom count. Both MOL text formats must contain an SRU SGroup (including membership/crossing bonds, repeat label and EU connectivity), or warn naming the bracket if it cannot be represented. Recheck CDXML label/connectivity limitations. Open Main with a saved pre-Round-Bracket order: Round Bracket belongs immediately after Square Bracket; explicit custom placement remains where saved.
+On Linux (XWayland and native Wayland), open Drawn Structure Settings and a plugin panel with a
+text field. Check that showing each leaves the document focused. Click Target bond length and type
+`30`, then repeat in the panel field. Verify both fields receive the digits, including after hiding
+and reopening each window. Repeat with a digit immediately after the click. No ring should appear.
+Click the drawing and verify its shortcuts work again. Run this pass under KDE Plasma (Wayland
+session, where both packages use XWayland) as well as GNOME: their window managers answer a
+palette's focus request differently.
+
+On Linux (XWayland and native Wayland with `GDK_BACKEND=wayland`), maximize the document, open
+several floating toolbars, and click the canvas. Verify the toolbars stay above the document and
+have no standalone taskbar or pager entries. Switch to another app and check that its window can
+cover the toolbars. Hover for a tooltip, open and reopen a palette popover, and open a file warning.
+Check that each opens after prewarming or reuse and that mouse-opened utilities leave the document
+focused. On native Wayland, the compositor places these windows.
+
+Palette first paint (Windows): quit ChemDraft, then cold-launch it. The Main toolbar and the other
+open palettes appear with their content in the palette's light grey, with no black frame and no
+blank light frames first. Press and hold a flyout button and open a color picker: each popover, and
+the first hovered tooltip, appears with its content and no black or blank frame. Focus stays on the
+document throughout (its title bar stays active and M switches tools). Close a palette from
+View ▸ Toolbars right after launch: it stays closed. Minimize the document right after launch,
+before the palettes appear: no palette shows until the document is restored, and then they all do.
+If a palette appears before its content, it shows only an empty panel in the palette's own grey,
+never the darker document-window grey. With the agent bridge diagnostics on, the
+`[windows-activation]` log has one `palette reveal label=... ms=... trigger=ack|fallback|release
+result=...` line per palette; on a cold launch `trigger=ack` is expected, since the fallback waits
+5 s.
+
 Palette field input (macOS and Windows): in Drawn Structure Settings, click Target bond length,
 type 30 and press Return; the value changes, the canvas does not, and no hotkey fires. Switch to
 another app and back, then click the field again; Customize gallery search still types.
@@ -317,6 +359,55 @@ must still be blocked by CSP without host permission. On macOS, confirm the entr
 worker still load directly from `tauri://localhost` with working prediction. In a Windows web
 preview, confirm construction remains native; classic and cross-origin calls must remain unchanged.
 
+Request tools: perform each check in packaged builds on macOS Apple silicon and Intel (WKWebView)
+and Windows x64 (WebView2). Record the build, platform, probe results and any errors.
+
+- Install [Request Tools Probe](../examples/plugins/request-tools-probe/README.md) through
+  **Plugins > Add or Remove Plugins… > Add plugin from package…**. Check that the nine **Probe**
+  commands appear in **Plugins**. The API 0.1.26 worker opts in to request capabilities, tool
+  calls and document-change delivery.
+- Package the [Request Tools Legacy Fixture](../examples/plugins/request-tools-legacy-fixture/README.md)
+  with `pnpm plugin:package -- examples/plugins/request-tools-legacy-fixture` and install its ZIP
+  with the adjacent `.sha256` file. Verify that **Legacy Fixture: Read active document** and
+  **Legacy Fixture: Read selection** report the current document and selection.
+  **Legacy Fixture: Attempt to start request** should report `unsupported`. Switch tabs and run
+  **Legacy Fixture: Show document-change events**. The report should show zero received events.
+- In tab A, click **Plugins > Probe: Read pinned document**. When the report says **Switch tab now**,
+  click distinct tab B. Verify that the report shows A's document and captured selection.
+- In tab A, click **Plugins > Probe: Insert text and molecule**, then switch to B when prompted.
+  Verify B is unchanged, then switch back to A and check that both insertions appear and are selected there. **Edit > Undo** restores the
+  exact original state in one step. **Edit > Redo** restores the result without another prompt.
+- Select one object and leave a text object unselected. Click **Plugins > Probe: Attempt out-of-scope edit**.
+  Expect a `scope` refusal, unchanged documents and no new history entry.
+- Click **Plugins > Probe: Request page space**, then **Ask for page space** in the panel. Use a fresh
+  request for each answer. **Keep Page Size** preserves the page
+  dimensions and requested positions; **Enlarge** fits the content and includes any page translation
+  in the single undo entry. Undo and redo restore the exact page and object states. Dismiss the prompt: it acts as **Keep Page Size** and inserts at the requested position. Undo it.
+  In a fresh request, leave the prompt unanswered for five minutes: expect `unanswered` and no write
+  or history entry.
+- Repeat **Probe: Request page space** and click **Ask and end after 10 seconds**. Leave the prompt
+  open past the timer, then answer it if it remains visible. Verify the report says `PASSED`, no write or history entry appears, and
+  the request and its session ended.
+- Use **Plugins > Probe: Print active-document events** before and after a tab switch, opening a
+  file into a pristine tab, and closing a tab. Verify that
+  keys identify the current document instance (or null when none is active), sequences increase, and
+  an edit within one instance does not generate a change. Closing or replacing the pinned document
+  ends its request and session.
+- Click **Plugins > Probe: Open tool session**. Verify that the panel lists `get_document` and
+  `get_selection`. Inspect listeners with `lsof -iTCP -sTCP:LISTEN` on macOS or `netstat -ano` on
+  Windows and verify that the server listens on 127.0.0.1 only. Click **Plugins > Probe: End request**
+  and verify the listener disappears when the probe owns the only session. With a host-authorized
+  client, check separately that the tools return the pinned context after switching tabs and fail
+  after the request ends.
+- Select a text object or molecule and click **Plugins > Probe: Measure selection**. Inspect the
+  reported ink bounds and document units.
+- Click **Plugins > Probe: Render selection PNG** with the same selection. Verify that the panel
+  displays the 400 × 300 PNG of the measured region.
+- Run **Probe: Open tool session** and disable the probe in **Plugins > Add or Remove Plugins…**.
+  Verify that its commands and listener disappear. Switch tabs and re-enable the probe. Verify
+  that **Probe: Print active-document events** shows a fresh worker log. With a host-authorized
+  client, verify separately that subsequent calls to the original session fail.
+
 Plugin panel focus (both macOS and Windows): open/re-show a panel from Analyze or a plugin command;
 click a panel button, heading, chart, empty area and title/drag area, hover its controls and scroll.
 Buttons must run exactly once and hover feedback must work; after each ordinary click the drawing
@@ -435,13 +526,21 @@ Keybinding and molecule-editing surfaces added since: the Chain tools flyout (Ch
 Chain) opened cold and warm, with a flexible-chain drag that turns corners both free and
 atom-anchored while a straight drag still reproduces the straight planner exactly; the numeric
 hover hotkeys in both keybinding schemes (rings 3–0 attach/fuse over atoms and bonds, wedge/hash
-sprouts 4/5, carbonyl 2, gem-dimethyl 9, the 0-key cyclic bond closing a ring), with tool keys
+sprouts 4/5, carbonyl 2, gem-dimethyl 9, the 0-key cyclic bond closing a ring), `g` over an atom or bond
+for cyclopropyl or fused cyclopropane, `u` over a bond for fused cyclobutane, and `.` over an atom
+for a radical; each edit undoes in one step. In the compatibility scheme, `v` mirrors `g`; in the
+default scheme, `v` selects the Select tool even over an atom. Check these on both platforms, with tool keys
 following the selected scheme — `e` over an atom applies the Et nickname in the ChemDraw scheme,
 while ChemDraft's `e` arms the eraser; charge stacking
 by hotkey and by the charge tool up to ±9 and back down to mark removal;
 with **Direct electron-mark editing** off (the default), check radical/lone-pair painted-ink-only picking over
 atoms, bonds and filled rings, repeated radical/lone-pair tool placement on existing ink, and
-absence of mark resize/rotation handles. Enable the preference live, then drag circled/plain
+absence of mark resize/rotation handles.
+With the Lone Pair tool, click an atom to auto-place in its largest free gap; repeat for a second pair.
+Press an atom and drag: check the live tangent pair follows in 15° steps; hold Alt/Option for a free angle.
+Release once, then Undo/Redo once to remove/restore the exact pair; confirm molecular identity is unchanged.
+Escape, pointer cancellation or lost capture during placement must remove the preview without an Undo entry.
+Enable the preference live, then drag circled/plain
 charges, radical ions, radical dots and lone pairs from blank corners of their rotated frames
 with Select and electron tools; check overlap picking and no duplicates. Resize with corners,
 rotate with handles and typed entry, and check one labeled Undo/Redo per gesture. Adjust Art
@@ -745,6 +844,26 @@ the list without cancelling a drag or leaving the eyedropper, and with the list 
 always did; File ▸ New or a cleanly opening file removes the count; and on Windows the list fits and
 scrolls in a small window at 125% and 150% display scale.
 
+Native file warnings (macOS and Windows):
+
+- Open either warning fixture above. Move a palette over the status button, click the warning count,
+  and verify the list appears above all palettes. Click Show on molecule and atom rows: the correct
+  target is selected and centered; missing/whole-file rows offer no invalid Show action. Scroll long
+  lists and repeat at mixed display scales. The warnings window cannot be dragged.
+- Close with ×; wait with it hidden, then reopen repeatedly. Repeat with keyboard focus on the
+  count and Enter/Space. Escape, outside clicks in the document or a palette, and switching apps
+  dismiss the list and clear the count button's expanded state. Reopen after each dismissal.
+- Open warnings and minimize the document (yellow button on macOS, taskbar/minimize on Windows):
+  no warning window remains visible. Restore the document: the transient stays dismissed, the count
+  button is collapsed, and clicking it opens the list again above palettes. Closing/hiding the
+  document also leaves no orphan warnings window.
+- Click inside warnings to give it keyboard focus; press Cmd+Z / Shift+Cmd+Z / Cmd+A on macOS or
+  Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y / Ctrl+A on Windows. Undo, Redo and Select All affect the drawing
+  exactly once, return focus to the document and leave no stuck canvas pointer state. Repeat through
+  the native Edit menu on macOS; F5 and Cmd/Ctrl+R never reload the warnings webview.
+- On Windows, verify warnings have no taskbar button or Alt-Tab entry; repeatedly open/dismiss them
+  while using context menus and palettes, including `pnpm smoke:windows-menu-churn`.
+
 Status row: at the 900×640 minimum window, open a file with warnings under a long name; the status text ends
 in an ellipsis, "N warnings" stays whole and clickable, and the build stamp at the right never overlaps either,
 in a branch build (long stamp with the worktree label) and in a stable build (short stamp), on both platforms.
@@ -845,7 +964,7 @@ and Art toolbars open, including at 125%/150% display scale:
   Before insertion, expect exactly one native box: "This doesn't fit on the page. Enlarge the page
   to fit? Content on the page may shift to make room." with Enlarge / Keep Page Size. Enlarge and all content undo together; Keep Page Size keeps
   the exact proposed positions without resizing. Fitting content asks nothing. Repeat with an
-  assistant request containing several tool calls and direct patches: only one question per request,
+  legacy assistant request containing several tool calls and direct patches: only one question per request,
   one Undo, and Redo never reopens the question. Check template/table dialogs targeting an inactive
   tab, changes or tab closure while a question is pending, and Stop during an assistant question.
   Duplicate, structure-editor Save, Spin Flatten/Release and native ring/bracket/symbol/art stamps
@@ -1196,6 +1315,7 @@ with a preview/flyout open: it closes, controls disappear and direct commands re
 - In an existing customized layout without Double Bond or Triple Bond, add both from Customize Main Toolbar, then activate each; verify distinct icons and active highlight.
 - Click and drag on empty page, extend from an atom, connect atoms and separate molecules, and click an existing bond to set its order. Confirm the requested order, normal snapping/Alt behavior, and one Undo/Redo step per gesture.
 - Allow growth or order changes that exceed available valence and show (!) on the affected atoms; retain existing atoms and coordinates, with only the requested graph changes. Still refuse unrepresentable multiple bonds to group labels or dashed dative bonds. Check save/reopen and SVG/MOL export, including valence warnings. Switch back to Single Bond and wedge/hash/dashed/bold tools.
+- Transition metals use a coordination ceiling (Pt: 6 in `packages/document-workflow-core/src/atoms.ts`); check (!) only above it, such as Pt with 7 attached atoms. The Ru example's (!) belongs on N.
 - Repeat in native Windows/WebView2 and macOS, including customized Main layouts, reset, and narrow palettes; verify browser fallback.
 
 ## Isotope insertion (macOS and Windows)
@@ -1336,6 +1456,7 @@ formatted.
 - Draw a Ru donor complex with neutral N bonded to Ru and two carbons. Set the solid Ru–N bond
   to double using hover `2`, order cycling, and the bond tool. Each edit must land with (!) on N;
   Undo/Redo restores the exact authored graph without adding charge. Dashed Ru–N stays single.
+- Transition metals show (!) only above their coordination ceiling (Pt: 6; test 7 attached atoms); the Ru example's (!) belongs on N.
 - Draw neopentane, relabel its center S and endpoints O, then raise two S–O bonds to double one
   at a time. The intermediate S(V) has (!); the final H2SO4 has no (!). Repeat with literal S/O
   labels and explicit OH for the acid oxygens. Keep every atom, coordinate and charge as drawn.
@@ -1366,14 +1487,15 @@ formatted.
 - Select waves together with a molecule, straight line and rectangle; adjust every slider and
   confirm only selected waves change. Check the molecule's bonds, stereo, charge and labels, and an
   unselected wave. Repeat Undo/Redo and cancel; mixed wave values should read Mixed until adjusted.
-- Open Customize Main Toolbar and search for Wave; value-specific smoothness, height and width
-  commands should be available and work when added to a toolbar.
+- Value-specific wave smoothness/height/width commands are hidden from the Customize gallery on purpose
+  (they remain registered; `galleryModel.ts` excludes `object.wave.*`). Search “wavy” finds Wavy bond
+  and Wavy Line; adjust waves with the Object Settings sliders.
 
 ## Newer native documents (macOS and Windows)
 
 Open a versioned future native JSON file and a `.chemdraft` envelope with a greater `minAppVersion`,
 an unknown visual field, a future bond style and a future drawing preset ID. Repeat through File
-Open, recent files, OS Open With and file drop. Each newly opened document must show exactly one
+Open, OS Open With and file drop. Each newly opened document must show exactly one
 native OK message with that file's full minimum version, owned by the document window. Verify that
 floating utilities hide and restore around the box, focus returns correctly, and Windows gains no
 taskbar entry. Activating an already-open file must not repeat the box. Legacy and same-version
@@ -1463,7 +1585,8 @@ whole-molecule cleanup with the existing behavior, and check save/reopen and exp
 - Choose Wavy bond from the bond flyout and draw a bond, then click a single bond to convert it.
   It displays a wave. Undo and Redo restore each edit; export MOL and check the unknown stereo survives.
 - Choose it from the Customize gallery too; click a wavy bond again to reverse its unknown stereo
-  end, then convert back to wedge/plain. Each edit is one Undo/Redo step. Check label clearance and
+  end, then convert back to wedge. To make wedge/hash/wavy plain, hover the bond and press 1, or click
+  it with the Single Bond tool; each is one Undo step labeled “Made bond plain”. Check label clearance and
   canvas/SVG/PDF/PNG parity, no R/S at the wave's `from` atom, SMILES without `@` there, MOL V2000
   stereo 4 and V3000 CFG=2.
 
@@ -1477,7 +1600,9 @@ whole-molecule cleanup with the existing behavior, and check save/reopen and exp
 
 - With Direct electron-mark editing off (the default), drag a charge mark onto an atom: it lands
   beside the atom label. Undo and Redo the drop. Enable Direct electron-mark editing in Preferences,
-  then move, resize and rotate the mark; Undo and Redo restore each edit.
+  then move, resize and rotate the mark; Undo and Redo restore each edit. With the mark selected,
+  dragging from its center moves it; corner handles resize. Repeat at 50%, 100% and 200% zoom,
+  including a rotated mark.
 - With either preference setting, grab positive/negative, plain/circled and radical-ion charges
   outside their drawn sign and saved frame, within the centered 36 CSS-pixel move area. Repeat at
   25%, 50%, 100%, 200% and 400% zoom, using Select and the matching charge tool: one mark moves,
@@ -1541,3 +1666,28 @@ whole-molecule cleanup with the existing behavior, and check save/reopen and exp
 - Use File > Open to open a binary `.cdx` with known structures. Check bonds, labels and any import
   warnings against the source. Open a truncated CDX: it reports an import failure. On Windows use
   the file chooser or Open With; the installer does not register `.cdx` as an association.
+
+## Linux startup and session end
+
+- Disable “Start with a fresh document”, make an unsaved edit, and log out before the autosave
+  debounce expires. Log back in and verify that the last edit is recovered. Repeat with
+  `kill -TERM`, `kill -HUP`, and `kill -INT` against ChemDraft, including with the Save on Quit
+  prompt open. Stall the renderer and verify that shutdown is bounded and reports an
+  unconfirmed flush. On GNOME, a stalled renderer at logout must make the session manager
+  name ChemDraft with "ChemDraft could not save your open documents", and logout must still
+  finish within a few seconds.
+- In a directory containing `drawing.cdxml`, launch `/path/to/ChemDraft.AppImage drawing.cdxml`.
+  Verify that the drawing opens, then launch from a different directory containing a second
+  `drawing.cdxml` and check that the running instance opens that file. With no remembered folder,
+  verify that Open and Save for an untitled document start in the primary launch folder, or home
+  when `OWD` is unavailable. Repeat from a launch folder with mode `000` (accessible parents):
+  the dialogs must start in home.
+- Create a drawing whose file name is not valid UTF-8 (for example
+  `cp drawing.cdxml "$(printf 'caf\351.cdxml')"`). Opening it from the first launch must show
+  an error naming the file, not open it. With ChemDraft running, launch the AppImage with that
+  file and a normal one: the normal file opens in the running instance, the second launch shows
+  the same error and exits with status 1. Check that opening a report link, revealing saved screen captures,
+  and running OPSIN work while WebKit runs from the AppRun working folder.
+- Start a native Wayland session with XWayland disabled. With `DISPLAY` and `GDK_BACKEND` unset,
+  launch both packages and verify that the document window and drawing canvas appear. Repeat
+  on Wayland with XWayland enabled and check the default and an explicit Wayland override.

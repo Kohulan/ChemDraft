@@ -102,7 +102,8 @@ describe("fragment hotkey commands", () => {
         const shortcut = command.shortcut ?? command.defaultShortcut;
         return shortcut ? [normalizeShortcut({ commandId: command.id, keys: parseShortcutDisplay(shortcut) }, platform)] : [];
       });
-      for (const key of new Set([...Object.keys(fragmentAtomDrawingHotkeys), ...Object.keys(fragmentBondDrawingHotkeys)])) {
+      const keys = new Set([...Object.keys(fragmentAtomDrawingHotkeys), ...Object.keys(fragmentBondDrawingHotkeys), ".", ...(scheme === "chemdraw" ? ["v"] : [])]);
+      for (const key of keys) {
         const fragment = normalizeShortcut({ commandId: "fragment", keys: /^[A-Z]$/.test(key) ? ["Shift", key] : [key] }, platform);
         expect(bindings.filter(binding => binding.key === fragment.key &&
           binding.modifiers.join("+") === fragment.modifiers.join("+")), `${platform}, ${key}`).toEqual([]);

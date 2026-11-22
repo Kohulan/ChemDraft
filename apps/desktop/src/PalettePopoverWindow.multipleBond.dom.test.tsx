@@ -9,7 +9,7 @@ import type { ToolsetPopoverContentPayload } from "./window-manager";
 
 const native = vi.hoisted(() => ({
   content: undefined as undefined | ((payload: ToolsetPopoverContentPayload) => void),
-  command: vi.fn(async () => {}), hide: vi.fn(async () => {}), show: vi.fn(async () => {})
+  command: vi.fn(async () => {}), hide: vi.fn(async () => {}), show: vi.fn(async () => true)
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => {}) }));
 vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ hide: native.hide, setFocus: vi.fn(async () => {}) }) }));
@@ -20,6 +20,7 @@ vi.mock("./plugins/pluginPanelInputFocus", async importOriginal => ({
 }));
 vi.mock("./window-manager", async importOriginal => ({
   ...await importOriginal<typeof import("./window-manager")>(),
+  isToolsetPopoverVisible: async () => true,
   listenForToolsetPopoverContent: vi.fn(async handler => { native.content = handler; return () => {}; }),
   listenForToolsetPopoverDismiss: vi.fn(async () => () => {}),
   listenForToolsetPopoverRelease: vi.fn(async () => () => {}),
@@ -61,7 +62,9 @@ describe.each(["macos", "windows"] as const)("native multiple-bond flyout on %s"
     expect(menu.querySelectorAll('[role="menuitem"]')).toHaveLength(id === "tool.wavyBond" ? 6 : 3);
     const button = menu.querySelector<HTMLButtonElement>(`[data-command-id="${id}"]`)!;
     await act(async () => { button.click(); button.click(); });
-    expect(native.command).toHaveBeenCalledExactlyOnceWith(id);
+    expect(native.command).toHaveBeenCalledExactlyOnceWith(id, {
+      flyoutOpening: expect.objectContaining({ toolsetId: "core.main", openedAt: expect.any(Number) })
+    });
     expect(native.hide).toHaveBeenCalledTimes(1);
   });
 

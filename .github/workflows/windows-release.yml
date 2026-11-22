@@ -109,6 +109,7 @@ jobs:
         env:
           CHEMDRAFT_STABLE_BUILD: '1'
           CHEMDRAFT_SKIP_UPDATER_SIGNING: '1'
+          NODE_OPTIONS: --max-old-space-size=6144  # 16 GB runner; build:web peaks near 4.8 GB (see ci.yml)
         run: pnpm --filter @chemdraft/desktop build --bundles nsis
 
       - name: Verify stable bundle identity and stage unsigned installer
@@ -260,14 +261,14 @@ jobs:
           $record.size = (Get-Item -LiteralPath $installer).Length
           $record | ConvertTo-Json | Set-Content -LiteralPath $recordPath -Encoding utf8NoBOM
 
-      - name: Print SHA-256 and sizes and write checksums
+      - name: Print SHA-256 and sizes and write LF checksums
         run: |
-          $checksums = @(Get-ChildItem release-assets -File | Sort-Object Name | ForEach-Object {
+          Get-ChildItem release-assets -File | Where-Object Name -ne 'SHA256SUMS.txt' | Sort-Object Name | ForEach-Object {
             $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
             Write-Host "$hash  $($_.Length) bytes  $($_.Name)"
-            "$hash  $($_.Name)"
-          })
-          $checksums | Set-Content -Encoding utf8NoBOM release-assets/SHA256SUMS.txt
+          }
+          node tools/release/release-checksums.mjs --assets release-assets
+          if ($LASTEXITCODE -ne 0) { throw 'Release checksum generation failed.' }
       - name: Upload final release artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -279,6 +280,9 @@ jobs:
     needs: build
     if: github.repository == 'jgassens/ChemDraft' && !github.event.repository.fork && inputs.upload_to_release != ''
     runs-on: windows-latest
+    concurrency:
+      group: draft-release-upload-${{ inputs.upload_to_release }}
+      cancel-in-progress: false
     permissions:
       contents: write # Upload and validate draft assets here; all other jobs stay read-only.
       actions: read
@@ -305,6 +309,10 @@ jobs:
         with:
           name: windows-release
           path: release-assets
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          token: ''
       - name: Upload only to an existing draft release
         shell: pwsh
         env:
@@ -324,15 +332,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Target release must already exist.' }
           $release = $releaseJson | ConvertFrom-Json
           if ($release.isDraft -ne $true -or $release.tagName -cne $env:RELEASE_TAG) { throw 'Refusing to upload to a published release.' }
-          $assets = @(Get-ChildItem release-assets -File | ForEach-Object { $_.FullName })
+          node tools/release/release-checksums.mjs --assets release-assets --verify
+          if ($LASTEXITCODE -ne 0) { throw 'Staged Windows checksum verification failed.' }
+          # The artifact's sums cover only Windows. Never upload them over combined release sums.
+          $assets = @(Get-ChildItem release-assets -File | Where-Object Name -ne 'SHA256SUMS.txt' | ForEach-Object { $_.FullName })
           gh release upload $env:RELEASE_TAG @assets --clobber
           if ($LASTEXITCODE -ne 0) { throw 'Release asset upload failed.' }
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: 24
-          token: ''
-      - name: Check all attached release builds when complete
+      - name: Refresh combined checksums and check all attached release builds when complete
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -341,5 +348,8 @@ jobs:
           BUILD_COMMIT: ${{ needs.build.outputs.commit }}
         # Draft assets need this upload job's token. A Windows-only result is not a publishing pass.
         run: |
+          # Recompute from every attached file so Mac-first uploads and Windows reruns retain coverage.
+          node tools/release/release-checksums.mjs --tag "$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { throw 'Combined release checksum upload failed.' }
           node tools/release/check-release-assets.mjs --tag "$env:RELEASE_TAG" --commit "$env:BUILD_COMMIT" --allow-incomplete --skip-dmg-provenance
           if ($LASTEXITCODE -ne 0) { throw 'Release asset validation failed.' }
