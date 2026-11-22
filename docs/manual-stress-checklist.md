@@ -120,6 +120,10 @@ title stays active and M still switches tools), and `xprop -root _NET_ACTIVE_WIN
 document window, not the flyout. Do the same for a never-opened color picker and for the E/Z
 popover from a canvas double bond. Reopen each: still no attention state and no focus change. On
 GNOME (X11 or XWayland), a new flyout opens above its palette and leaves the document focused.
+Cold open with later input: after a fresh relaunch, long-press a never-opened flyout and, before it
+appears, click once on an empty part of another palette. The flyout's `_NET_WM_USER_TIME` is the
+long-press's time, not the later click's (`xev -root` or `xinput test-xi2 --root` shows both), and
+it still opens without an attention state.
 
 Palette first paint (Windows): quit ChemDraft, then cold-launch it. The Main toolbar and the other
 open palettes appear with their content in the palette's light grey, with no black frame and no

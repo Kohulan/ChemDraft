@@ -6742,6 +6742,9 @@ async fn open_toolset_popover(
     focus_mode: Option<ToolsetPopoverFocusMode>,
 ) -> Result<(), String> {
     let label = toolset_popover_window_label(&toolset_id);
+    // Linux: capture the opening press's user time now, before a cold build can let later input
+    // through; the reveal stamps it on the popover before its first map.
+    utility_window::record_opening_user_time(&app, &label)?;
     let focus_mode = effective_toolset_popover_focus_mode(&label, focus_mode.unwrap_or_default());
     let _creation = lock_window_creation()?;
     if utility_windows_suspended() {
@@ -7243,8 +7246,9 @@ fn show_toolset_popover_window(
     } else {
         window.show().map_err(|error| error.to_string())?;
     }
-    // Linux: map it as the answer to the opening press, so KWin neither refuses it nor marks a
-    // newly created popover as demanding attention. Windows shows it with SW_SHOWNOACTIVATE and
+    // Linux: map it as the answer to the opening press (its user time, recorded by
+    // open_toolset_popover), so KWin neither refuses it nor marks a newly created popover as
+    // demanding attention. Windows shows it with SW_SHOWNOACTIVATE and
     // macOS orders it front above; neither has a user time to carry.
     #[cfg(target_os = "linux")]
     utility_window::stamp_user_time(&window)?;

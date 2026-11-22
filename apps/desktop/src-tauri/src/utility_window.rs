@@ -211,8 +211,81 @@ pub(super) fn raise<R: Runtime>(window: &WebviewWindow<R>) -> Result<(), String>
     })?
 }
 
-/// Stamp a popover with the time of the user's latest input before it is shown, so the window
-/// manager treats the map as the answer to that input (B7 follow-up).
+// From libgdk-3 (gdk/x11/gdkx11display.h, gdkx11window.h), which gdk-sys already links. The
+// signatures are gdkx11-sys 0.18's; a GdkX11Display/GdkX11Window is its GdkDisplay/GdkWindow.
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn gdk_x11_display_get_user_time(display: *mut gtk::gdk::ffi::GdkDisplay) -> u32;
+    fn gdk_x11_window_set_user_time(window: *mut gtk::gdk::ffi::GdkWindow, timestamp: u32);
+}
+
+/// The X11 user time of the input that opened each popover, by window label. Recorded when the
+/// open is requested (`record_opening_user_time`) and taken by the reveal that maps the popover
+/// (`stamp_user_time`), so a later press during a cold open can never stand in for the opening one.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Default)]
+struct OpeningUserTimes(std::collections::HashMap<String, u32>);
+
+#[cfg(any(target_os = "linux", test))]
+impl OpeningUserTimes {
+    /// A new opening always replaces the last one; an opening with no user time (no input on
+    /// the display yet, or a native Wayland display) clears it, so no older time is reused.
+    fn record(&mut self, label: &str, time: Option<u32>) {
+        match time.filter(|time| *time != 0) {
+            Some(time) => {
+                self.0.insert(label.to_string(), time);
+            }
+            None => {
+                self.0.remove(label);
+            }
+        }
+    }
+
+    fn take(&mut self, label: &str) -> Option<u32> {
+        self.0.remove(label)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn opening_user_times() -> std::sync::MutexGuard<'static, OpeningUserTimes> {
+    static TIMES: std::sync::LazyLock<std::sync::Mutex<OpeningUserTimes>> =
+        std::sync::LazyLock::new(Default::default);
+    TIMES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Record the user time of the press or key that is opening the popover `label`, at the moment
+/// the open is requested. The palette or document webview sends the request from that input's own
+/// handler, so the display's latest user time is that input: GDK updated it while delivering the
+/// event, before the webview saw it. X11 only (XWayland included).
+#[cfg(target_os = "linux")]
+pub(super) fn record_opening_user_time<R: Runtime>(
+    app: &AppHandle<R>,
+    label: &str,
+) -> Result<(), String> {
+    let time = super::run_on_main_thread_blocking(app, || {
+        use gtk::{gdk::prelude::DisplayExtManual, glib::translate::ToGlibPtr};
+
+        let display = gtk::gdk::Display::default().filter(|display| display.backend().is_x11())?;
+        // SAFETY: on the GTK main thread, with a live display that is an X11 object (checked
+        // above). The stash keeps it alive for the call.
+        Some(unsafe { gdk_x11_display_get_user_time(display.to_glib_none().0) })
+    })?;
+    opening_user_times().record(label, time);
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn record_opening_user_time<R: Runtime>(
+    _app: &AppHandle<R>,
+    _label: &str,
+) -> Result<(), String> {
+    Ok(())
+}
+
+/// Stamp a popover with the user time of the input that opened it before it is mapped, so the
+/// window manager treats the map as the answer to that input (B7 follow-up).
 ///
 /// `prepare` turns GTK's focus-on-map off, and GDK then writes `_NET_WM_USER_TIME` 0: "never
 /// activate this window". KWin's focus-stealing prevention refuses activation for user time 0 even
@@ -222,39 +295,36 @@ pub(super) fn raise<R: Runtime>(window: &WebviewWindow<R>) -> Result<(), String>
 /// handling, which is why a reused one did not. With a real time KWin allows the map, and still
 /// moves no focus: it focuses a newly mapped window only when it is a normal window or a dialog,
 /// never a UTILITY one (Mutter never focuses a utility window on map either). This is no
-/// `present()` and no activation request. The time is the display's last user input, the press or
-/// key that opened the popover, never a later one. X11 only (XWayland included): a native Wayland
-/// display has no user time to stamp.
+/// `present()` and no activation request.
+///
+/// The time is the one `record_opening_user_time` captured when this opening was requested, never
+/// the display's latest input at reveal time, which on a cold open may be a later press. The window
+/// is realized first if it is not yet, so its first map always carries the stamp. Nothing recorded
+/// (a native Wayland display, or no input yet) leaves the window unstamped.
 #[cfg(target_os = "linux")]
 pub(super) fn stamp_user_time<R: Runtime>(window: &WebviewWindow<R>) -> Result<(), String> {
-    // From libgdk-3 (gdk/x11/gdkx11display.h, gdkx11window.h), which gdk-sys already links. The
-    // signatures are gdkx11-sys 0.18's; a GdkX11Display/GdkX11Window is its GdkDisplay/GdkWindow.
-    unsafe extern "C" {
-        fn gdk_x11_display_get_user_time(display: *mut gtk::gdk::ffi::GdkDisplay) -> u32;
-        fn gdk_x11_window_set_user_time(window: *mut gtk::gdk::ffi::GdkWindow, timestamp: u32);
-    }
+    let Some(time) = opening_user_times().take(window.label()) else {
+        return Ok(());
+    };
     let target = window.clone();
     super::run_on_main_thread_blocking(window, move || {
         use gtk::{gdk::prelude::DisplayExtManual, glib::translate::ToGlibPtr, prelude::WidgetExt};
 
         let native = target.gtk_window().map_err(|error| error.to_string())?;
-        // The webview realizes its window when it is built; an unrealized one has nothing to stamp.
-        let Some(surface) = native.window() else {
-            return Ok(());
-        };
-        let display = surface.display();
-        if !display.backend().is_x11() {
+        // The webview normally realizes its window when it is built. If it has not, realize it
+        // now: the stamp must be on the GdkWindow before its first map, never after.
+        if !native.is_realized() {
+            native.realize();
+        }
+        let surface = native
+            .window()
+            .ok_or("The popover window could not be realized for its user time.")?;
+        if !surface.display().backend().is_x11() {
             return Ok(());
         }
-        // SAFETY: on the GTK main thread, with a live display and window that are X11 objects
-        // (checked above). The stashes keep both alive for the calls.
-        unsafe {
-            let time = gdk_x11_display_get_user_time(display.to_glib_none().0);
-            // 0: no input on this display yet, so nothing opened the popover; leave it unstamped.
-            if time != 0 {
-                gdk_x11_window_set_user_time(surface.to_glib_none().0, time);
-            }
-        }
+        // SAFETY: on the GTK main thread, with a live, realized X11 window (checked above). The
+        // stash keeps it alive for the call.
+        unsafe { gdk_x11_window_set_user_time(surface.to_glib_none().0, time) };
         Ok(())
     })?
 }
@@ -274,7 +344,56 @@ pub(super) fn set_visible<R: Runtime>(
 
 #[cfg(test)]
 mod tests {
-    use super::{linux_policy, Kind, TypeHint};
+    use super::{linux_policy, Kind, OpeningUserTimes, TypeHint};
+
+    #[test]
+    fn a_popover_reveal_takes_the_user_time_of_its_own_opening() {
+        let mut times = OpeningUserTimes::default();
+        times.record("toolset-popover-a", Some(100));
+        times.record("toolset-popover-b", Some(150));
+        // A later opening of the same popover replaces the earlier one.
+        times.record("toolset-popover-a", Some(120));
+        assert_eq!(times.take("toolset-popover-a"), Some(120));
+        // Taken once: a second reveal without a new opening never reuses it.
+        assert_eq!(times.take("toolset-popover-a"), None);
+        assert_eq!(times.take("toolset-popover-b"), Some(150));
+        // An opening with no input time (0) or no X11 display clears an older time.
+        times.record("toolset-popover-a", Some(130));
+        times.record("toolset-popover-a", Some(0));
+        assert_eq!(times.take("toolset-popover-a"), None);
+        times.record("toolset-popover-a", Some(140));
+        times.record("toolset-popover-a", None);
+        assert_eq!(times.take("toolset-popover-a"), None);
+    }
+
+    #[test]
+    fn the_user_time_is_captured_at_the_open_request_and_applied_before_the_map() {
+        let lib = include_str!("lib.rs");
+        let open = &lib[lib.find("async fn open_toolset_popover(").unwrap()..];
+        let open = &open[..open.find("\n}\n").unwrap()];
+        let record = open
+            .find("utility_window::record_opening_user_time(&app, &label)")
+            .unwrap();
+        assert!(record < open.find("lock_window_creation()").unwrap());
+        let reveal = &lib[lib.find("fn show_toolset_popover_window(").unwrap()..];
+        let stamp = reveal
+            .find("utility_window::stamp_user_time(&window)?;")
+            .unwrap();
+        assert!(
+            stamp
+                < reveal
+                    .find("utility_window::set_visible(&window, true)?;")
+                    .unwrap()
+        );
+        let source = include_str!("utility_window.rs");
+        assert!(
+            !source[source.find("pub(super) fn stamp_user_time").unwrap()..]
+                .split("\n}\n")
+                .next()
+                .unwrap()
+                .contains("gdk_x11_display_get_user_time")
+        );
+    }
 
     #[test]
     fn linux_utility_hints_and_flags_cover_every_window_kind() {
