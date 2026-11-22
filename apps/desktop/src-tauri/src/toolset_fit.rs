@@ -262,7 +262,7 @@ mod tests {
         let placed = position_clear_of_document_chrome(main_default, main_size, Some(linux), 8.0);
         assert_eq!((placed.x, placed.y), (88.0, 185.0));
 
-        // Windows, 1920x1200 at 100%: the centred document's non-client menu ends at its client top
+        // Windows, 1920x1200 at 100%: the centered document's non-client menu ends at its client top
         // (192), inside Main's default rows 154..239. The same rule moves Main below it.
         let windows = document_chrome((312.0, 141.0), 192.0, 1296.0, 0.0);
         let placed = position_clear_of_document_chrome(main_default, main_size, Some(windows), 8.0);

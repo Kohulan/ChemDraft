@@ -4,9 +4,10 @@ Tauri requires `bundle.externalBin` entries to have target-triple-suffixed files
 at build time. These binaries keep the desktop shell buildable; macOS and Windows
 targets and x86_64 Linux have committed real builds; aarch64 Linux is a placeholder.
 
-Real binaries: `aarch64-apple-darwin`, `x86_64-apple-darwin`, and
+Real binaries: `aarch64-apple-darwin`, `x86_64-apple-darwin`,
 `x86_64-pc-windows-msvc` (built with `cmake --preset windows-msvc && cmake --build
---preset windows-msvc` — static CRT, depends only on KERNEL32.dll).
+--preset windows-msvc` — static CRT, depends only on KERNEL32.dll), and
+`x86_64-unknown-linux-gnu` (described below).
 
 `x86_64-unknown-linux-gnu` is a real binary, committed like the macOS and Windows ones. It is
 built by `.github/workflows/linux-sidecar-build.yml` (Ubuntu 22.04, `cmake --preset
