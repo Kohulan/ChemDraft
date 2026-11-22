@@ -2861,14 +2861,16 @@ function cdxmlHeadDimensions(sizePx: number, sourceSize: number, source: Record<
 }
 
 // One set of dimensions applies to both ends in CDXML. Use the current editable
-// marker length and scale the retained width and inset by the same factor.
-function cdxmlStraightHeadDimensions(graphic: GraphicObject, warnings: CompatibilityConversionWarning[]): string[] {
-  if (graphic.data.artPathKind !== "line") return [];
+// marker length and scale the retained width and inset by the same factor. A stored arc
+// keeps its HeadSize even without heads: the reader recognizes an explicit arc by it.
+function cdxmlStraightHeadDimensions(graphic: GraphicObject, warnings: CompatibilityConversionWarning[], storedArc = false): string[] {
+  if (graphic.data.artPathKind !== "line" && !storedArc) return [];
   const source = preservedCurveAttributes(graphic.compatibility?.unknown.sourceCdxmlAttributes);
   const sourceSize = parseNumber(source.HeadSize);
   if (!sourceSize || sourceSize <= 0) return [];
   const markers = [graphic.data.markerEnd, graphic.data.markerStart].filter(
     (marker): marker is GraphicMarker => !!cdxmlArrowheadForMarker(marker));
+  if (storedArc && !markers.length) return [`HeadSize="${formatNumber(sourceSize)}"`];
   const size = markers[0]?.sizePx;
   if (!size || size <= 0) return [];
   if (markers.some(m => m.sizePx !== size)) warnings.push({
@@ -2884,8 +2886,9 @@ function exportGraphicAsCdxmlArrow(
   warnings: CompatibilityConversionWarning[],
   colors: ExportColorTable
 ): string {
-  const line = graphicLineEndpointsForCdxml(graphic);
   const isArc = graphic.data.artPathKind === "arc" && !pointMetadata(graphic.data.pathControlPoint);
+  const stored = isArc ? storedArcForCdxml(graphic, warnings) : undefined;
+  const line = stored ?? graphicLineEndpointsForCdxml(graphic);
   const attrs = [
     `id="${graphicId}"`,
     `BoundingBox="${escapeXmlAttribute(cdxmlBoundingBoxForGraphic(graphic, objectCornerPoints(graphic)))}"`,
@@ -2895,13 +2898,31 @@ function exportGraphicAsCdxmlArrow(
     'FillType="None"',
     ...cdxmlArrowheadAttributes(graphic, warnings),
     ...cdxmlArrowShaftAttributes(graphic),
-    ...cdxmlStraightHeadDimensions(graphic, warnings),
+    ...cdxmlStraightHeadDimensions(graphic, warnings, Boolean(stored)),
     ...(isArc ? [`AngularSize="${escapeXmlAttribute(cdxmlAngularSizeForGraphic(graphic))}"`] : []),
     `Head3D="${formatXyPoint(line.end)}"`,
     `Tail3D="${formatXyPoint(line.start)}"`,
-    ...cdxmlLineAxisAttributes(line.start, line.end)
+    ...(stored?.axes ?? cdxmlLineAxisAttributes(line.start, line.end))
   ];
   return `<arrow ${attrs.join(" ")}/>`;
+}
+
+// An arc that carries its own ellipse is written as drawn (the renderer's fallbacks for a missing
+// field included); axes from the chord or endpoints from the padded frame would move it.
+function storedArcForCdxml(graphic: GraphicObject, warnings: CompatibilityConversionWarning[]):
+  { start: Point; end: Point; axes: string[] } | undefined {
+  const d = graphic.data;
+  if (d.arcCenter === undefined && d.arcRadiusX === undefined && d.arcRadiusY === undefined) return undefined;
+  const finite = (v: unknown) => typeof v === "number" && Number.isFinite(v) ? v : undefined;
+  const center = pointMetadata(d.arcCenter) ?? objectCenter(graphic);
+  const rx = Math.max(finite(d.arcRadiusX) ?? graphic.width / 2 - 4, 1);
+  const ry = Math.max(finite(d.arcRadiusY) ?? graphic.height / 2 - 4, 1);
+  const { startRadians, endRadians } = nativeGraphicArcAngles(graphic);
+  if (graphic.rotation) warnings.push({ code: "cdxml.arc_rotation_payload_only", sourceObjectId: graphic.id,
+    message: `CDXML export: arc arrow ${graphic.id} is written unrotated; its ${formatNumber(graphic.rotation)} degree rotation is kept only in the native payload.` });
+  return { start: ellipsePointAtRadians(center, rx, ry, startRadians), end: ellipsePointAtRadians(center, rx, ry, endRadians),
+    axes: [`Center3D="${formatXyPoint(center)}"`, `MajorAxisEnd3D="${formatXyPoint({ x: center.x + rx, y: center.y })}"`,
+      `MinorAxisEnd3D="${formatXyPoint({ x: center.x, y: center.y + ry })}"`] };
 }
 
 /** Use real Arrow objects in both CDXML and binary CDX (0x8021), with directed endpoints.

@@ -105,6 +105,45 @@ describe("issue #424: circular arrows", () => {
     expect(second.plain).not.toContain("<curve");
     expect(elementWith(second.plain, "arrow", "AngularSize=")).toBe(written);
   });
+
+  const storedGeometry = ['AngularSize="270"', 'Center3D="100 100 0"', 'MajorAxisEnd3D="130 100 0"',
+    'MinorAxisEnd3D="100 130 0"', 'Tail3D="130 100 0"', 'Head3D="100 70 0"'];
+
+  it("writes the stored ellipse for a headless arc and reads it back through two plain Save As cycles", () => {
+    const document = open(arc.replace('ArrowheadHead="Full"', 'ArrowheadHead="None"'));
+    expect(objectsOf<GraphicObject>(document, "graphic")[0]!.data).toMatchObject({ artPathKind: "arc", arcRadiusX: pt(30) });
+    let current = document, written = "";
+    for (let cycle = 0; cycle < 2; cycle++) {
+      const { saved, plain, reopened } = saveAsWithoutPayload(current);
+      expect(saved.warnings).toEqual([]);
+      const arrow = elementWith(plain, "arrow", "AngularSize=");
+      for (const a of storedGeometry) expect(arrow).toContain(a);
+      if (cycle === 1) expect(arrow).toBe(written);
+      written = arrow;
+      const again = objectsOf<GraphicObject>(reopened, "graphic")[0]!;
+      expect(again.data.arcCenter!.x).toBeCloseTo(pt(100), 6);
+      expect(again.data.arcRadiusX).toBeCloseTo(pt(30), 6);
+      expect(again.data.arcRadiusY).toBeCloseTo(pt(30), 6);
+      expect(again.data.arcSweepRadians).toBeCloseTo(3 * Math.PI / 2, 9);
+      current = reopened;
+    }
+  });
+
+  it("writes the stored ellipse when the two heads no longer share one CDXML head size", () => {
+    const document = open(arc.replace('ArrowheadTail="None"', 'ArrowheadTail="Full"'));
+    const graphic = objectsOf<GraphicObject>(document, "graphic")[0]!;
+    graphic.data.markerStart!.sizePx = pt(14);
+    const arrow = elementWith(saveAsWithoutPayload(document).plain, "arrow", "AngularSize=");
+    for (const a of storedGeometry) expect(arrow).toContain(a);
+  });
+
+  it("warns instead of silently dropping the rotation of a stored arc", () => {
+    const document = open(arc);
+    objectsOf<GraphicObject>(document, "graphic")[0]!.rotation = 30;
+    const { saved, plain } = saveAsWithoutPayload(document);
+    expect(codes(saved.warnings)).toContain("cdxml.arc_rotation_payload_only");
+    for (const a of storedGeometry) expect(elementWith(plain, "arrow", "AngularSize=")).toContain(a);
+  });
 });
 
 describe("issue #424: caption layout", () => {
