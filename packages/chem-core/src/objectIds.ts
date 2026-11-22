@@ -43,12 +43,13 @@ export interface RenumberedObjectId {
  * duplicated id, so they are unique across the whole document.
  *
  * References: only references that can be attributed to the renamed copy are updated, and those are
- * the copy's own warnings that name its id (`compatibility.warnings`, and a mechanism arrow's
- * `warnings`). Every other reference to the duplicated id — another object's anchor, reaction
- * component, group child, bracket member, a page crossing, the document selection or document-level
- * warnings — cannot tell the copies apart, so it keeps the id and still points at the FIRST copy,
- * which is the object a bare-id lookup resolved to before renumbering. Only ids change: no atom,
- * bond, charge, stereo, coordinate or reaction role is touched.
+ * the copy's own warnings that name its id: `compatibility.warnings`, a mechanism arrow's `warnings`,
+ * and its chemical metadata's warnings (a molecule's `chemistry`, `superatoms` and `rGroups`, a
+ * superatom's `metadata`, an R-group label's `display`). Every other reference to the duplicated id
+ * — another object's anchor, reaction component, group child, bracket member, a page crossing, the
+ * document selection or document-level warnings — cannot tell the copies apart, so it keeps the id and
+ * still points at the FIRST copy, which is the object a bare-id lookup resolved to before renumbering.
+ * Only ids change: no atom, bond, charge, stereo, coordinate or reaction role is touched.
  */
 export function renumberDuplicatePageObjectIds(root: unknown): RenumberedObjectId[] {
   const pages = ownNativeValue(root, "pages");
@@ -82,16 +83,28 @@ export function renumberDuplicatePageObjectIds(root: unknown): RenumberedObjectI
       object.id = to;
       entry.id = to;
       seen.add(to);
-      renameOwnWarnings(ownNativeValue(object, "compatibility"), from, to);
-      if (ownNativeValue(object, "type") === "mechanism-arrow") renameWarningList(ownNativeValue(object, "warnings"), from, to);
+      renameOwnWarnings(object, from, to);
       renumbered.push({ pageIndex, objectIndex, from, to });
     });
   });
   return renumbered;
 }
 
-function renameOwnWarnings(compatibility: unknown, from: string, to: string): void {
-  renameWarningList(ownNativeValue(compatibility, "warnings"), from, to);
+/** Rename `from` to `to` in every warning list a renamed copy owns (see renumberDuplicatePageObjectIds). */
+function renameOwnWarnings(object: Record<string, unknown>, from: string, to: string): void {
+  const inRecord = (record: unknown) => renameWarningList(ownNativeValue(record, "warnings"), from, to);
+  const inEach = (records: unknown) => { if (Array.isArray(records)) records.forEach(inRecord); };
+  inRecord(ownNativeValue(object, "compatibility"));
+  switch (ownNativeValue(object, "type")) {
+    case "mechanism-arrow": inRecord(object); break;
+    case "molecule":
+      inRecord(ownNativeValue(object, "chemistry"));
+      inEach(ownNativeValue(object, "superatoms"));
+      inEach(ownNativeValue(object, "rGroups"));
+      break;
+    case "superatom": inRecord(ownNativeValue(object, "metadata")); break;
+    case "r-group-label": inRecord(ownNativeValue(object, "display")); break;
+  }
 }
 
 function renameWarningList(warnings: unknown, from: string, to: string): void {

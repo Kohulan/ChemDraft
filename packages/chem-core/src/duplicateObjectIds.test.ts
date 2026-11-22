@@ -98,6 +98,44 @@ describe("native open renumbers duplicate object ids on the same page", () => {
     expect(serializeDocument(read.document)).toBe(source);
   });
 
+  it("Kimi xhigh finding 3: a renamed copy's own chemistry warnings name its new id, the first copy's keep the old one", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    // Each copy carries its own chemical-metadata warnings naming its id; another object's warning stays as written.
+    const note = (message: string, objectId?: string) => ({ code: "x.note", message, ...(objectId ? { objectId } : {}) });
+    const withChemistry = (x: number, label: string) => ({ ...molecule("X", x),
+      chemistry: { formula: "C3H8N2O2", isotopeLabels: [], stereochemistry: [], warnings: [note(`${label} chemistry`, "X"), note(`${label} other`, "label")] },
+      superatoms: [{ label: "Ph", attachmentPoints: [], warnings: [note(`${label} superatom`, "X")] }],
+      rGroups: [{ label: "R1", querySemantics: "unknown", attachmentPoints: [], warnings: [note(`${label} r-group`, "X")] }]
+    }) as DocumentObject;
+    const superatom = (x: number) => ({ id: "S", type: "superatom", x, y: 0, width: 10, height: 10, rotation: 0, style: {}, label: "Ph",
+      metadata: { label: "Ph", attachmentPoints: [], warnings: [note("superatom object", "S")] } }) as DocumentObject;
+    const rLabel = (x: number) => ({ id: "R", type: "r-group-label", x, y: 0, width: 10, height: 10, rotation: 0, style: {}, label: "R1",
+      display: { label: "R1", querySemantics: "unknown", attachmentPoints: [], warnings: [note("r-group label", "R")] } }) as DocumentObject;
+    const source = file([withChemistry(0, "first"), withChemistry(100, "second")]);
+    const objects = readSerializedDocument(source).document.pages[0]!.objects as MoleculeObject[];
+    expect(objects.map(object => object.id)).toEqual(["X", "X_002"]);
+    expect(objects[0]!.chemistry!.warnings).toEqual([note("first chemistry", "X"), note("first other", "label")]);
+    expect(objects[1]!.chemistry!.warnings).toEqual([note("second chemistry", "X_002"), note("second other", "label")]);
+    expect(objects[0]!.superatoms[0]!.warnings).toEqual([note("first superatom", "X")]);
+    expect(objects[1]!.superatoms[0]!.warnings).toEqual([note("second superatom", "X_002")]);
+    expect(objects[0]!.rGroups[0]!.warnings).toEqual([note("first r-group", "X")]);
+    expect(objects[1]!.rGroups[0]!.warnings).toEqual([note("second r-group", "X_002")]);
+    // Chemistry is untouched apart from the renamed id in the copy's own warnings.
+    const original = parseDocument(JSON.parse(source)).pages[0]!.objects as MoleculeObject[];
+    expect(objects[0]).toEqual(original[0]);
+    const rename = (warnings: { objectId?: string }[]) => warnings.map(warning => warning.objectId === "X" ? { ...warning, objectId: "X_002" } : warning);
+    expect(chemistry(objects[1]!)).toEqual(chemistry({ ...original[1]!,
+      chemistry: { ...original[1]!.chemistry!, warnings: rename(original[1]!.chemistry!.warnings) },
+      superatoms: original[1]!.superatoms.map(entry => ({ ...entry, warnings: rename(entry.warnings) })),
+      rGroups: original[1]!.rGroups.map(entry => ({ ...entry, warnings: rename(entry.warnings) })) } as MoleculeObject));
+
+    // A superatom's metadata and an R-group label's display warnings follow the same policy.
+    const labels = readSerializedDocument(file([superatom(0), superatom(20), rLabel(40), rLabel(60)])).document.pages[0]!.objects;
+    expect(labels.map(object => object.id)).toEqual(["S", "S_003", "R", "R_004"]);
+    expect(labels.map(object => object.type === "superatom" ? object.metadata.warnings : object.type === "r-group-label" ? object.display.warnings : []))
+      .toEqual([[note("superatom object", "S")], [note("superatom object", "S_003")], [note("r-group label", "R")], [note("r-group label", "R_004")]]);
+  });
+
   it("allocates with the shared nextObjectId scheme", () => {
     const document = parseDocument(JSON.parse(file([molecule("mol_001", 0), molecule("mol_002", 10)])));
     expect(nextObjectId(document, "mol")).toBe("mol_003");
