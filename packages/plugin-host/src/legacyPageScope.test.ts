@@ -1,6 +1,7 @@
 import { applyPatch, createEmptyDocument, toEngineDocument, type ChemDraftDocument, type DocumentObject, type MoleculeObject } from "@chemdraft/chem-core";
 import { describe, expect, it, vi } from "vitest";
-import { assertPluginDocumentWriteScope, assertPluginPatchWriteScope, PluginHost, type PluginPatchApplicationRequest } from "./index";
+import { assertPluginDocumentWriteScope, assertPluginPatchWriteScope, effectiveScopePages, objectInWriteScope, PluginHost,
+  resolveScopedObject, scopedObjectPage, type PluginPatchApplicationRequest } from "./index";
 
 const now = "2026-11-21T00:00:00.000Z";
 const molecule = (id: string, x: number): MoleculeObject => ({
@@ -152,5 +153,42 @@ describe("legacy page binding follows the Send-time selection", () => {
     await expect(f.host.invokeCommand("plugin.pages.run", { writeSelection: { objectIds: ["X"], molecules: [] } }))
       .rejects.toThrow("X was not selected when the command started");
     expect(f.document().pages[0]!.objects[0]).toEqual(original.pages[0]!.objects[0]);
+  });
+});
+
+/** Fixture F2's shape: two pages, each holding its own molecule with the same id. Page 1's is selected. */
+function sharedIdDocument(): ChemDraftDocument {
+  const empty = createEmptyDocument({ now });
+  const page1 = { ...empty.pages[0]!, id: "page-1", objects: [molecule("X", 0)] };
+  const page2 = { ...empty.pages[0]!, id: "page-2", objects: [molecule("X", 300)] };
+  return toEngineDocument({ ...empty, pages: [page1, page2], selection: { pageId: "page-1", objectIds: ["X"] } });
+}
+const withoutPage1Object = (document: ChemDraftDocument): ChemDraftDocument =>
+  ({ ...document, pages: [{ ...document.pages[0]!, objects: [] }, document.pages[1]!] });
+
+describe("CodeRabbit PR #422: a pinned id missing from its page never reaches a same-id object elsewhere", () => {
+  it("cr4656567628/cr4656567661: resolution and scope do not rebind page 1's deleted pin to page 2's object", () => {
+    const pins = new Map([["X", "page-1"]]);
+    const document = withoutPage1Object(sharedIdDocument());
+    // Assistant tools resolve every id through resolveScopedObject (writeBuilder.findObject).
+    expect(scopedObjectPage(document, "X", pins)).toBeUndefined();
+    expect(() => resolveScopedObject(document, "X", pins)).toThrow(/no longer there/);
+    // Plugin and assistant write scope both rebind pins with effectiveScopePages first.
+    const effective = effectiveScopePages(document, pins);
+    expect(effective?.get("X")).toBe("page-1");
+    expect(objectInWriteScope(new Set(["X"]), effective, "page-2", "X")).toBe(false);
+  });
+
+  it("cr4656567661: a pending command whose selected duplicate was deleted cannot write the surviving one", async () => {
+    const f = pendingHost(sharedIdDocument());
+    const pending = f.host.invokeCommand("plugin.pending.run");
+    await Promise.resolve();
+    // While the command waits, the user deletes the selected X on page 1. Page 2's X was never selected.
+    f.edit(withoutPage1Object(f.document()));
+    const edited = f.document();
+    f.release();
+    await expect(pending).rejects.toThrow(/Plugin write refused/);
+    expect(f.document()).toBe(edited);
+    expect(f.document().pages[1]!.objects[0]).toMatchObject({ id: "X", x: 300 });
   });
 });

@@ -11,7 +11,26 @@ import type { ChemDraftDocument } from "@chemdraft/plugin-api";
  */
 
 /** Host-only legacy scope: object id -> the page the command's selection named it on at Send. */
-export type PluginWriteScopePages = ReadonlyMap<string, string>;
+export interface PluginWriteScopePages extends ReadonlyMap<string, string> {
+  /** Pinned ids that named exactly one object in the whole document at Send (set by
+   * {@link pinSelectionPages}). Only these may follow their object to another page; a pin without this
+   * record (a plain map, or an id that also named objects elsewhere at Send) never leaves its page. */
+  readonly uniqueAtSend?: ReadonlySet<string>;
+}
+
+/** Pins with their Send-time uniqueness record, as {@link pinSelectionPages} builds them. */
+export type SendScopePages = Map<string, string> & { readonly uniqueAtSend: ReadonlySet<string> };
+
+function withUniqueAtSend(pages: Map<string, string>, uniqueAtSend: ReadonlySet<string>): SendScopePages {
+  return Object.assign(pages, { uniqueAtSend });
+}
+
+/** A mutable copy of `scopePages` that keeps its Send-time uniqueness record. Copy pins only with this:
+ * a plain `new Map(pins)` drops the record, so no pin could follow a moved object any more. */
+export function copyScopePages(scopePages: PluginWriteScopePages): Map<string, string> & Pick<PluginWriteScopePages, "uniqueAtSend"> {
+  const copy = new Map(scopePages);
+  return scopePages.uniqueAtSend ? withUniqueAtSend(copy, scopePages.uniqueAtSend) : copy;
+}
 
 export interface PageObjectLocation<Object extends DocumentObject = DocumentObject> {
   page: DocumentPage;
@@ -74,13 +93,19 @@ export function bareIdTargetPage(document: ChemDraftDocument, objectId: string):
 /**
  * The page `objectId` resolves to in `document`:
  * - its Send-time page while the object is still there, even when the id also exists elsewhere;
- * - otherwise (unpinned, or a uniquely identified object that moved to another page) its only page;
+ * - a pinned id missing from its page: its only page now, but only when the id was unique in the whole
+ *   document at Send (the selected object moved). Otherwise the object that remains elsewhere was never
+ *   selected, so the pin resolves to nothing;
+ * - an unpinned id: its only page;
  * - undefined when the id is gone or is ambiguous (on several pages, none of them the pinned one).
  */
 export function scopedObjectPage(document: ChemDraftDocument, objectId: string,
   scopePages?: PluginWriteScopePages): string | undefined {
   const pinned = scopePages?.get(objectId);
-  if (pinned !== undefined && resolveObjectOnPage(document, pinned, objectId)) return pinned;
+  if (pinned !== undefined) {
+    if (resolveObjectOnPage(document, pinned, objectId)) return pinned;
+    if (!scopePages?.uniqueAtSend?.has(objectId)) return undefined;
+  }
   const locations = objectLocations(document, objectId);
   return locations.length === 1 ? locations[0]!.page.id : undefined;
 }
@@ -103,16 +128,16 @@ export function resolveScopedObject(document: ChemDraftDocument, objectId: strin
     : `Object id "${objectId}" names objects on pages ${pageList(locations)}; select the one you mean and retry.`);
 }
 
-/** Rebind Send-time pins to `document`. A pinned object still on its page keeps the pin; a uniquely
- * identified object that moved to another page follows it. An ambiguous or missing one keeps its
- * original pin, so no same-id object elsewhere is ever in scope. */
+/** Rebind Send-time pins to `document`. A pinned object still on its page keeps the pin; an object
+ * whose id was unique at Send and still is follows it to another page. Any other missing or ambiguous
+ * one keeps its original pin, so no same-id object elsewhere is ever in scope. */
 export function effectiveScopePages(document: ChemDraftDocument,
   scopePages: PluginWriteScopePages | undefined): PluginWriteScopePages | undefined {
   if (!scopePages?.size) return scopePages;
-  let rebound: Map<string, string> | undefined;
+  let rebound: ReturnType<typeof copyScopePages> | undefined;
   for (const [objectId, pinned] of scopePages) {
     const pageId = scopedObjectPage(document, objectId, scopePages);
-    if (pageId !== undefined && pageId !== pinned) (rebound ??= new Map(scopePages)).set(objectId, pageId);
+    if (pageId !== undefined && pageId !== pinned) (rebound ??= copyScopePages(scopePages)).set(objectId, pageId);
   }
   return rebound ?? scopePages;
 }
@@ -130,19 +155,22 @@ export function objectInWriteScope(scope: ReadonlySet<string>, scopePages: Plugi
 /**
  * Bind selected ids to a page at Send. Ids on `pageId` bind to it. Ids elsewhere bind to their only
  * page; an id found on several other pages cannot be bound and is returned in `ambiguous` (or bound
- * to `pageId`, when one is given, so that nothing on another page is in scope).
+ * to `pageId`, when one is given, so that nothing on another page is in scope). Ids that name exactly
+ * one object in the document are recorded in `pages.uniqueAtSend`: only those may follow a move.
  */
 export function pinSelectionPages(document: ChemDraftDocument | undefined, objectIds: readonly string[],
-  pageId: string | undefined): { pages: Map<string, string>; ambiguous: string[] } {
-  const pages = new Map<string, string>();
+  pageId: string | undefined): { pages: SendScopePages; ambiguous: string[] } {
+  const uniqueAtSend = new Set<string>();
+  const pages = withUniqueAtSend(new Map<string, string>(), uniqueAtSend);
   const ambiguous: string[] = [];
   if (!document) return { pages, ambiguous };
   for (const objectId of new Set(objectIds)) {
+    const locations = objectLocations(document, objectId);
+    if (locations.length === 1) uniqueAtSend.add(objectId);
     if (pageId !== undefined && resolveObjectOnPage(document, pageId, objectId)) {
       pages.set(objectId, pageId);
       continue;
     }
-    const locations = objectLocations(document, objectId);
     if (locations.length === 1) pages.set(objectId, locations[0]!.page.id);
     else if (locations.length > 1) {
       if (pageId !== undefined && document.pages.some(page => page.id === pageId)) pages.set(objectId, pageId);

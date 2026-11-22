@@ -1481,3 +1481,36 @@ describe("legacy assistant writes resolve a duplicate id by its Send-time page",
     } finally { await s.finish(); }
   });
 });
+
+describe("legacy assistant pins never rebind to an unselected same-id object (CodeRabbit cr4656567628/cr4656567661)", () => {
+  it.each([
+    ["style_objects", (id: string) => ({ objectIds: [id], style: { color: "#112233" } })],
+    ["delete_objects", (id: string) => ({ objectIds: [id] })],
+    ["insert_text", (id: string) => ({ text: "Beside the selection", relativeTo: { objectId: id, side: "right" } })]
+  ] as const)("%s refuses once the selected page 1 duplicate is deleted, leaving page 2's object alone", async (name, input) => {
+    const s = setup();
+    try {
+      const document = s.context.getDocument()!;
+      const pageA = document.pages[0]!;
+      // Page 2 holds its own molecule with the same id; Send selects page 1's.
+      const copy = translateObject(structuredClone(s.molecule), 0, 200);
+      const pageB = { ...pageA, id: "page_b", objects: [copy] };
+      s.replace({ ...document, pages: [pageA, pageB], selection: { pageId: pageA.id, objectIds: [s.molecule.id] } });
+      s.select([s.molecule.id]);
+      const { requestId } = await s.controller.beginRequest(s.plugin, { prompt: "edit the selection" });
+      // After Send, the user deletes page 1's selected molecule. Page 2's was never selected.
+      const sent = s.context.getDocument()!;
+      const edited = { ...sent, pages: [{ ...sent.pages[0]!, objects: sent.pages[0]!.objects.filter(object => object.id !== s.molecule.id) },
+        sent.pages[1]!] };
+      s.replace(edited);
+      const result = await s.controller.callTool(s.plugin, { name, input: input(s.molecule.id) });
+      // Refused at lookup (findObject) or at the write scope check; either way the pin is "no longer there".
+      expect(result).toMatchObject({ isError: true, content: [{ text: expect.stringMatching(/no longer there/) }] });
+      const after = s.context.getDocument()!;
+      expect(after.pages[1]!.objects).toEqual([copy]);
+      expect(after.pages[0]!.objects).toEqual(edited.pages[0]!.objects);
+      expect(s.history).toHaveLength(0);
+      await s.controller.endRequest(s.plugin, { requestId });
+    } finally { await s.finish(); }
+  });
+});

@@ -4,8 +4,8 @@ import { sameDocumentValue } from "./documentValue";
 // however, is taken from `@chemdraft/plugin-api` so a consumer using both SDK packages sees ONE canonical
 // document type — not a second, structurally-identical copy inlined here.
 import type { ApplyPatchOptions, DocumentObject, DocumentPatch, DocumentPage, OrphanedRepeatUnit } from "@chemdraft/chem-core";
-import { bareIdTargetPage, duplicateIdRefusalMessage, effectiveScopePages, objectInWriteScope, objectLocations, pinSelectionPages, resolveObjectOnPage,
-  scopedObjectRefs, type PageObjectRef, type PluginWriteScopePages } from "./pageObjects";
+import { bareIdTargetPage, copyScopePages, duplicateIdRefusalMessage, effectiveScopePages, objectInWriteScope, objectLocations, pinSelectionPages, resolveObjectOnPage,
+  scopedObjectRefs, type PageObjectRef, type PluginWriteScopePages, type SendScopePages } from "./pageObjects";
 import { applyPatch, planOrphanedRepeatUnitCleanup, pruneReactionObjectReferences, removeOrphanedRepeatUnitBrackets, sameBracketIdentity } from "@chemdraft/chem-core";
 import {
   commitRequestPatch, containsBounds, pageContainsBounds, RequestWriteError, type BoundRequestWrite, type RequestDocument, type RequestHistory,
@@ -85,13 +85,13 @@ function assertPluginPageWriteScope(before: ChemDraftDocument, after: ChemDraftD
   }
 }
 
-export { bareIdTargetPage, duplicateIdRefusalMessage, pageNumberLabel, effectiveScopePages, objectInWriteScope, objectLocations, pinSelectionPages, resolveObjectOnPage,
+export { bareIdTargetPage, copyScopePages, duplicateIdRefusalMessage, pageNumberLabel, effectiveScopePages, objectInWriteScope, objectLocations, pinSelectionPages, resolveObjectOnPage,
   resolveScopedObject, scopedObjectPage, scopedObjectRefs, type PageObjectLocation, type PageObjectRef,
-  type PluginWriteScopePages } from "./pageObjects";
+  type PluginWriteScopePages, type SendScopePages } from "./pageObjects";
 
 /** The legacy selection's page binding (Send time). Ids on `pageId` bind to it; see pinSelectionPages. */
 export function legacyWriteScopePages(document: ChemDraftDocument | undefined, objectIds: readonly string[],
-  pageId = document?.selection.pageId ?? document?.pages[0]?.id): Map<string, string> | undefined {
+  pageId = document?.selection.pageId ?? document?.pages[0]?.id): SendScopePages | undefined {
   if (!document?.pages.some(page => page.id === pageId)) return undefined;
   return pinSelectionPages(document, objectIds, pageId).pages;
 }
@@ -1185,7 +1185,7 @@ export class PluginHost {
     const token = Symbol(call.name);
     this.activeCommandInvocations.set(token, {
       pluginId, commandId: call.name, commandTitle: call.name, documentKey: this.getActiveDocumentKey?.(),
-      writeScope: new Set(writeSelection), writeScopePages: writeScopePages && new Map(writeScopePages),
+      writeScope: new Set(writeSelection), writeScopePages: writeScopePages && copyScopePages(writeScopePages),
       recognized: false, recognizedImages: [],
       writeStop: new AbortController(), onAppliedPatch, repeatUnitCleanup, tool: true
     });
@@ -2200,8 +2200,8 @@ export class PluginHost {
       command: { id: invocation.commandId, title: invocation.commandTitle },
       patch: parsedPatch,
       writeScopeObjectIds: [...(requestScope?.objectIds ?? invocation.writeScope)],
-      ...(requestScope ? (requestScope.scopePages?.size ? { writeScopePages: new Map(requestScope.scopePages) } : {})
-        : invocation.writeScopePages?.size ? { writeScopePages: new Map(invocation.writeScopePages) } : {}),
+      ...(requestScope ? (requestScope.scopePages?.size ? { writeScopePages: copyScopePages(requestScope.scopePages) } : {})
+        : invocation.writeScopePages?.size ? { writeScopePages: copyScopePages(invocation.writeScopePages) } : {}),
       repeatUnitCleanup: requestScope ? undefined : invocation.repeatUnitCleanup,
       undoLabel: undoLabel ?? `${plugin.name}: ${invocation.commandTitle}`,
       signal
@@ -2880,7 +2880,7 @@ interface ActiveCommandInvocation {
   onAppliedPatch?: (receipt: AppliedPatchReceipt) => void;
   writeScope: Set<string>;
   /** Legacy invocations: selected id -> selection page. Insertions stay unpinned (fresh ids). */
-  writeScopePages?: Map<string, string>;
+  writeScopePages?: PluginWriteScopePages;
   repeatUnitCleanup?: ScopedRepeatUnitCleanup;
   pluginId: string;
   commandId: string;
