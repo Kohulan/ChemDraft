@@ -457,6 +457,21 @@ describe("molfile element symbols", () => {
     expect(warnings).toEqual([]);
   });
 
+  // The structure engine decides a lone hydrogen atom's hydrogens from this line (AGENTS.md §8): with
+  // no valence field RDKit reads a lone H as H2, D as HD and T as HT, which the label, the native
+  // formula and SMILES then count; a stated 0 or a typed label writes the zero-valence sentinel (15),
+  // which RDKit reads as the bare atom.
+  it.each(["H", "D", "T"])("writes a lone %s with no valence field, and stated 0 or typed with the zero-valence sentinel", (element) => {
+    const vvv = (atom: Partial<MoleculeAtom>) => {
+      const graph = molecule([{ id: "a", element, x: 0, y: 0 }], []);
+      graph.atoms[0] = { ...graph.atoms[0]!, ...atom };
+      return atomLines(moleculeToMolfileV2000(graph, { kekuleBondOrders: new Map() }).contents)[0].slice(48, 51);
+    };
+    expect(vvv({})).toBe("  0");
+    expect(vvv({ hydrogenCount: 0 })).toBe(" 15");
+    expect(vvv({ labelLiteral: true })).toBe(" 15");
+  });
+
   it("recognizes metal families without treating metalloids or other non-metals as metals", () => {
     for (const symbol of ["Li", "Cs", "Be", "Ra", "Sc", "Zn", "Cn", "La", "Lu", "Ac", "Lr", "Al", "Ga", "In", "Sn", "Tl", "Pb", "Bi", "Po"]) {
       expect(isMetalSymbol(symbol), symbol).toBe(true);

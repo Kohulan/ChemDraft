@@ -181,7 +181,7 @@ describe("a stated hydrogen count draws in the label", () => {
     expect(derived("o", ethanol())).toEqual([1, 1]);
     expect(derived("c1", ethanol())).toEqual([3, 3]);
     expect(derived("h", { atoms: [atom("h", "H", 0)], bonds: [] })).toEqual([1, 1]);
-    expect(derived("d", { atoms: [atom("d", "D", 0)], bonds: [] })).toEqual([undefined, undefined]);
+    expect(derived("d", { atoms: [atom("d", "D", 0)], bonds: [] })).toEqual([1, 1]);
     const carbonyl = { atoms: [atom("c", "C", 0), atom("fe", "Fe", 14)], bonds: [bond("d", "c", "fe", "single", true)] };
     expect(derived("c", carbonyl)).toEqual([4, undefined]);
     const cation = { atoms: [atom("c", "C", 0, 0, { formalCharge: 1 }), atom("fe", "Fe", 14)], bonds: [bond("d", "c", "fe", "single", true)] };
@@ -214,3 +214,41 @@ describe("a stated hydrogen count draws in the label", () => {
 function ringOf(elements: string[], orders: MoleculeBond["order"][]) {
   return ring("k", elements, orders);
 }
+
+/**
+ * A lone hydrogen atom with no stated count is what the structure engine reads from the molfile the
+ * app writes (no valence field): RDKit gives a lone H one implicit hydrogen (H2, [HH]), a lone D one
+ * (HD, [2HH]) and a lone T one (HT, [3HH]). The label draws that hydrogen, as the formula and SMILES
+ * count it (AGENTS.md §8: never re-decide hydrogens against the engine).
+ */
+describe("a lone H, D or T atom draws the hydrogen the structure engine gives it", () => {
+  it("a lone H draws H2, a lone D DH and a lone T TH, each with one hydrogen", () => {
+    expect(both("h", [atom("h", "H", 0)])).toEqual({ count: 1, countWithoutResolution: 1, label: "H2" });
+    expect(both("d", [atom("d", "D", 0)])).toEqual({ count: 1, countWithoutResolution: 1, label: "DH" });
+    expect(both("t", [atom("t", "T", 0)])).toEqual({ count: 1, countWithoutResolution: 1, label: "TH" });
+    for (const element of ["H", "D", "T"]) {
+      expect(atomDrawnHydrogenCount(atom("h", element, 0), [], [atom("h", element, 0)])).toBe(1);
+    }
+  });
+
+  it("a bonded H, D or T draws no hydrogen and reads as its symbol, as before", () => {
+    for (const element of ["H", "D", "T"]) {
+      const atoms = [atom("h", element, 0), atom("cl", "Cl", 14)];
+      expect(both("h", atoms, [bond("b", "h", "cl")])).toEqual({ count: 0, countWithoutResolution: 0, label: element });
+    }
+  });
+
+  it("a charged or radical lone H or D has no room for a hydrogen", () => {
+    expect(both("h", [atom("h", "H", 0, 0, { formalCharge: 1 })]).label).toBe("H+");
+    expect(both("h", [atom("h", "H", 0, 0, { formalCharge: -1 })]).label).toBe("H-");
+    expect(both("d", [atom("d", "D", 0, 0, { formalCharge: 1 })])).toEqual({ count: 0, countWithoutResolution: 0, label: "D+" });
+    expect(both("h", [atom("h", "H", 0, 0, { markRadicals: 1 })]).count).toBe(0);
+  });
+
+  it("a lone H, D or T stated with 0, or typed, draws its symbol alone", () => {
+    for (const element of ["H", "D", "T"]) {
+      expect(both("h", [atom("h", element, 0, 0, { hydrogenCount: 0 })]).label).toBe(element);
+      expect(both("h", [atom("h", element, 0, 0, { labelLiteral: true })]).label).toBe(element);
+    }
+  });
+});

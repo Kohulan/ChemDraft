@@ -5,6 +5,7 @@
 import { atomStatedHydrogenCount, isDativeBond, moleculeToMolfileV2000, moleculeBracketWarningMessages, rGroupNumberFromLabel, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
 import type { ExportWarning } from "@chemdraft/export-engine";
 import {
+  atomDrawnHydrogenCount,
   nativeAtomChargeIsExpressible,
   nativeAtomValence,
   nativeAtomValenceForCharge,
@@ -41,7 +42,9 @@ export function nativeSmilesRadicalWarnings(molecule: MoleculeObject, evidence?:
         nativeAtomChargeIsExpressible(element, atom.formalCharge)) {
       const valence = nativeAtomValenceForCharge(element, atom.formalCharge);
       const stated = aromaticAtomIds.has(atom.id) ? atom.hydrogenCount : atomStatedHydrogenCount(atom, expanded.bonds);
-      const hydrogens = element === "H" ? 0 : atom.labelLiteral ? (spelled?.hydrogens ?? 0) :
+      // An H, D or T atom counts like any element: a lone one carries the one hydrogen its label draws
+      // and the writer spells ([HH], [2HH]), a bonded or typed one none.
+      const hydrogens = atom.labelLiteral ? (spelled?.hydrogens ?? 0) :
         stated ?? spelled?.hydrogens ?? Math.max(0, valence - used - radicals);
       implied = Math.max(0, valence - used - hydrogens);
     } else if (element && nativeAtomValence[element] === undefined) {
@@ -51,13 +54,9 @@ export function nativeSmilesRadicalWarnings(molecule: MoleculeObject, evidence?:
     if (implied === radicals) return [];
     if (implied !== undefined) evidence?.inferredRadicals?.set(atom.id, implied);
     const drawn = `Atom ${atom.id} (${atom.element}) is drawn with ${radicals} radical electron${radicals === 1 ? "" : "s"}`;
-    const addedIsotopeHydrogen = isotopeHydrogen && used === 0 && radicals === 0 &&
-      atom.formalCharge === 0 && !atom.labelLiteral;
     return [{
       code: "export.smiles_radical_loss",
-      message: addedIsotopeHydrogen
-        ? `${drawn}; SMILES cannot preserve its hydrogen count: the engine adds 1 hydrogen; the native writer instead implies 1 radical electron.`
-        : implied === undefined
+      message: implied === undefined
           ? `${drawn}; SMILES' implied radical count cannot be reliably determined without the structure engine for this element and charge.`
           : `${drawn}; SMILES would imply ${implied} radical electron${implied === 1 ? "" : "s"} with its hydrogen count and formal charge.`,
       severity: "warning",
@@ -301,7 +300,10 @@ export function engineSmilesAtomWarnings(
       const neighbor = atomsById.get(bond.fromAtomId === atom.id ? bond.toAtomId : bond.fromAtomId);
       return neighbor && ["H", "D", "T"].includes(neighbor.element);
     }).length;
-    const hydrogens = bondedHydrogens + (isotopeHydrogen || element === "H" ? 0 :
+    // An H, D or T atom has the hydrogens its label draws (`atomDrawnHydrogenCount`): one on a lone
+    // one, as RDKit reads it from the molfile ([HH], [2HH]); none when bonded or typed.
+    const hydrogens = bondedHydrogens + (element === "H" ? (atom.labelLiteral ? 0 :
+      atomDrawnHydrogenCount(atom, expanded.bonds, expanded.atoms, resolution) ?? 0) :
       atom.labelLiteral ? spelled?.hydrogens ?? 0 :
       atom.hydrogenCount ?? spelled?.hydrogens ?? (direct
         ? nativeImplicitHydrogenCount(direct, resolution.bondOrderUsage.get(atom.id) ?? 0, atom.formalCharge, radicals)

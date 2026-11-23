@@ -3,7 +3,7 @@
 
 import type { MoleculeAtom, MoleculeBond, MoleculeObject } from "@chemdraft/chem-core";
 import { atomStatedHydrogenCount, rGroupNumberFromLabel } from "@chemdraft/chem-core";
-import { atomImplicitHydrogenCount, nativeBondOrderResolution } from "@chemdraft/layout-engine";
+import { atomImplicitHydrogenCount, hydrogenCountElement, nativeBondOrderResolution } from "@chemdraft/layout-engine";
 import {
   atomBondOrderUsageMap,
   expandNativeLabelGroups,
@@ -488,7 +488,9 @@ function nativeAtomSmiles(atom: MoleculeAtom | undefined, implicitHydrogens = 0,
   if (rgroup !== undefined) return `[*${smilesChargeSuffix(atom.formalCharge)}:${rgroup}]`;
 
   if (atom.element === "D" || atom.element === "T") {
-    return `[${atom.element === "D" ? 2 : 3}H${smilesChargeSuffix(atom.formalCharge)}]`;
+    const count = statedHydrogens ?? implicitHydrogens;
+    const hydrogens = count > 0 ? `H${count === 1 ? "" : count}` : "";
+    return `[${atom.element === "D" ? 2 : 3}H${hydrogens}${smilesChargeSuffix(atom.formalCharge)}]`;
   }
 
   const element = nativeElementFromAtomLabel(atom.element);
@@ -516,7 +518,9 @@ function nativeAtomSmiles(atom: MoleculeAtom | undefined, implicitHydrogens = 0,
   }
 
   if (element === "H") {
-    return "[H]";
+    // A lone H carries the hydrogen RDKit gives it: [HH], as the label draws "H2".
+    const hydrogens = implicitHydrogens > 0 ? `H${implicitHydrogens === 1 ? "" : implicitHydrogens}` : "";
+    return `[H${hydrogens}]`;
   }
 
   if (atom.labelLiteral === true) {
@@ -559,11 +563,13 @@ function nativeAtomSmilesById(
       // A bonded "Ar" is aryl, not argon: the warned dummy atom any unspellable label gets.
       return [atom.id, `[*${smilesChargeSuffix(atom.formalCharge)}]`] as const;
     }
-    const element = nativeElementFromAtomLabel(atom.element);
+    // The element the count is derived from: H for a D or T atom (`hydrogenCountElement`). An H, D
+    // or T atom spells the hydrogen a lone one carries ([HH], [2HH]), as RDKit reads it from the
+    // molfile and the label draws it; a bonded one has none.
+    const element = hydrogenCountElement(atom);
     const needsSpelledHydrogens = element !== undefined &&
-      element !== "H" &&
       atom.labelLiteral !== true &&
-      (atom.isotope !== undefined || atom.formalCharge !== 0 ||
+      (element === "H" || atom.isotope !== undefined || atom.formalCharge !== 0 ||
         (atom.markRadicals ?? 0) > 0 || !smilesOrganicSubset.has(element));
     // The dative-deprotonation rule (a pyrrole-type N–H donating to a metal) never reaches
     // this spelling: it applies only to a neutral nitrogen, which is organic-subset and written

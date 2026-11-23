@@ -1084,6 +1084,17 @@ export function nativeSingleBondGraphMetadata(
   // An element symbol standing for a group (a bonded "Ar", aryl) is a placeholder: it counts nothing.
   const placeholders = nativeElementLabelPlaceholders(atoms, bonds);
 
+  // An H, D or T atom that is not a typed literal counts the hydrogens its label draws: a stated 0,
+  // else the derived count (layout-engine's `atomDerivedHydrogenCount`, the one the label draws). A
+  // lone one carries one, as RDKit reads the molfile's lone H as H2, D as HD and T as HT; a bonded
+  // one carries none.
+  const addHydrogenAtomHydrogens = (sourceAtom: MoleculeAtom, atom: MoleculeAtom) => {
+    if (atom.labelLiteral === true) return;
+    const hydrogens = atomStatedHydrogenCount(sourceAtom, countedBonds) ??
+      atomDerivedHydrogenCount(atom, countedBonds, countedAtoms, resolution) ?? 0;
+    if (hydrogens > 0) elementCounts.set("H", (elementCounts.get("H") ?? 0) + hydrogens);
+  };
+
   countedAtoms.forEach((sourceAtom) => {
     const atom = normalizeAtomIsotope(sourceAtom);
     if (placeholders.has(atom.id)) {
@@ -1093,6 +1104,7 @@ export function nativeSingleBondGraphMetadata(
       // Heavy hydrogen keeps its own symbol in the formula (CH3D) and its own mass, matching
       // the [2H]/[3H] the SMILES writer spells for the same atom.
       elementCounts.set(atom.element, (elementCounts.get(atom.element) ?? 0) + 1);
+      addHydrogenAtomHydrogens(sourceAtom, atom);
       return;
     }
     const element = nativeElementFromAtomLabel(atom.element);
@@ -1120,7 +1132,9 @@ export function nativeSingleBondGraphMetadata(
     // atom states for itself (`atomStatedHydrogenCount`, a kept CDXML NumHydrogens) is counted as
     // stated, as the label and the engine's molfile count it.
     const valenceUsed = valenceUsage.get(atom.id) ?? 0;
-    if (element !== "H" && atom.labelLiteral !== true) {
+    if (element === "H") {
+      addHydrogenAtomHydrogens(sourceAtom, atom);
+    } else if (atom.labelLiteral !== true) {
       const implicitHydrogens = atomStatedHydrogenCount(sourceAtom, countedBonds) ?? Math.max(0, nativeImplicitHydrogenCount(
         element,
         valenceUsed,

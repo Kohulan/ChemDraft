@@ -7470,7 +7470,9 @@ export function atomDisplayLabelPlacement(
   // charge, because the deprotonation is real regardless of which object displays the sign.
   const labelCharge = atom.formalCharge - (atom.markCharge ?? 0);
   const element = nativeElementFromAtomLabel(atom.element);
-  if (!element) {
+  // A D or T atom is hydrogen to its count (`hydrogenCountElement`) and draws its own symbol.
+  const symbol = element ?? heavyHydrogenSymbol(atom.element);
+  if (!symbol) {
     const neighbors = heavyAtomNeighbors(atom.id, resolution);
     return nonElementAtomLabelPlacement(atom, neighbors, drawingStyle, recordedLabelBondSide(atom, neighbors.map((neighbor) => neighbor.id)))!;
   }
@@ -7483,7 +7485,9 @@ export function atomDisplayLabelPlacement(
   // (chem-core's `atomStatedHydrogenCount`, a kept CDXML NumHydrogens) is drawn in place of the
   // derived one, as the formula, SMILES and the engine's molfile count it (owner ruling 1.2.3), so
   // an O stated with 0 H reads "O", a lone H stated with 0 reads "H", and a carbon bonded only
-  // datively stated with 3 reads "CH3", exactly like the typed labels.
+  // datively stated with 3 reads "CH3", exactly like the typed labels. A lone H, D or T with no
+  // stated count carries the one hydrogen the structure engine gives it (RDKit reads the molfile's
+  // lone H as H2, D as HD, T as HT), so it reads "H2", "DH" and "TH".
   const incidentBonds = resolution.bondsByAtom.get(atom.id) ?? [];
   const drawnHydrogens = atomDrawnHydrogenCount(atom, bonds, atoms, resolution);
   const implicitHydrogens = drawingStyle.atomLabelHideImplicitHydrogens || atom.labelLiteral === true
@@ -7517,13 +7521,19 @@ export function atomDisplayLabelPlacement(
   const hydrogenBeforeElement =
     atom.isotope === undefined &&
     implicitHydrogens !== "" &&
-    element !== "H" &&
+    hydrogenCountElement(atom) !== "H" &&
     singleHeavyNeighbor !== undefined &&
     drawnLabelBondSide(atom, [singleHeavyNeighbor]) === "right";
+  // An H atom with hydrogens of its own is one element: "H2", never "HH".
+  const ownHydrogens = element === "H" && atom.isotope === undefined && implicitHydrogens !== ""
+    ? `H${(drawnHydrogens ?? 0) + 1}`
+    : undefined;
   return {
     label: hydrogenBeforeElement
-      ? `${implicitHydrogens}${element}${chargeLabelSuffix(labelCharge)}`
-      : `${atom.isotope ?? ""}${element}${implicitHydrogens}${chargeLabelSuffix(labelCharge)}`
+      ? `${implicitHydrogens}${symbol}${chargeLabelSuffix(labelCharge)}`
+      : ownHydrogens !== undefined
+        ? `${ownHydrogens}${chargeLabelSuffix(labelCharge)}`
+        : `${atom.isotope ?? ""}${symbol}${implicitHydrogens}${chargeLabelSuffix(labelCharge)}`
   };
 }
 
@@ -7553,7 +7563,8 @@ export function atomDrawnHydrogenCount(
  * hidden-hydrogen style) are the planner's and do not change the count. This is always the DERIVED
  * count (`atomDerivedHydrogenCount`, less that carbon), so the drawing and the badge cannot
  * disagree. Where an atom states its own count (chem-core's `atomStatedHydrogenCount`), the label
- * draws that count instead, as the formula, SMILES and the engine's molfile do.
+ * draws that count instead, as the formula, SMILES and the engine's molfile do. A D or T atom is
+ * counted as the hydrogen it is (`hydrogenCountElement`).
  */
 export function atomImplicitHydrogenCount(
   atom: MoleculeAtom,
@@ -7561,7 +7572,7 @@ export function atomImplicitHydrogenCount(
   atoms: readonly MoleculeAtom[],
   resolution: NativeBondOrderResolution = nativeBondOrderResolution(atoms, bonds)
 ): number | undefined {
-  const element = nativeElementFromAtomLabel(atom.element);
+  const element = hydrogenCountElement(atom);
   if (!element) return undefined;
   const incidentBonds = resolution.bondsByAtom.get(atom.id) ?? [];
   // A carbon whose only bonds are dative (a CO ligand's C drawn as a bare atom) cannot carry
@@ -7577,7 +7588,8 @@ export function atomImplicitHydrogenCount(
  * importer, the validator's badge and its fix). It is `atomImplicitHydrogenCount` everywhere except a
  * carbon bonded only datively: its label draws no H, but the formula and the structure an engine
  * reads count these (a dative bond costs its donor nothing), so this is the count that carbon has.
- * Undefined only for a label that is not an element symbol.
+ * Undefined only for a label that is not an element symbol (D and T count as hydrogen,
+ * `hydrogenCountElement`).
  */
 export function atomDerivedHydrogenCount(
   atom: MoleculeAtom,
@@ -7585,13 +7597,28 @@ export function atomDerivedHydrogenCount(
   atoms: readonly MoleculeAtom[],
   resolution: NativeBondOrderResolution = nativeBondOrderResolution(atoms, bonds)
 ): number | undefined {
-  const element = nativeElementFromAtomLabel(atom.element);
+  const element = hydrogenCountElement(atom);
   if (!element) return undefined;
   return Math.max(
     0,
     nativeAtomValenceForCharge(element, atom.formalCharge) - (resolution.bondOrderUsage.get(atom.id) ?? 0)
       - (atom.markRadicals ?? 0) - dativeDeprotonationCount(atom, bonds, atoms, resolution)
   );
+}
+
+/** "D" or "T": the CTfile symbol a deuterium or tritium atom is stored and drawn with. */
+function heavyHydrogenSymbol(label: string): "D" | "T" | undefined {
+  return label === "D" || label === "T" ? label : undefined;
+}
+
+/**
+ * The element whose valence an atom's hydrogen count is derived from: its element symbol, or H for a
+ * D or T atom. The molfile writes D and T as their CTfile symbols, and RDKit reads each as an
+ * isotope of hydrogen with hydrogen's valence: with no valence field a lone D is HD ([2HH]), exactly
+ * as a lone H is H2 ([HH]). Undefined for a label that is not an element symbol.
+ */
+export function hydrogenCountElement(atom: Pick<MoleculeAtom, "element">): NativeElementSymbol | undefined {
+  return nativeElementFromAtomLabel(atom.element) ?? (heavyHydrogenSymbol(atom.element) ? "H" : undefined);
 }
 
 /**
