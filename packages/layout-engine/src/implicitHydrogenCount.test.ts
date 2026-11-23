@@ -292,5 +292,9 @@ describe("a lone H, D or T atom is one hydrogen atom, a radical", () => {
     expect(dots(molecule([atom("h", "H", 100, 100, { hydrogenCount: 0 })]))).toEqual([]);
     expect(dots(molecule([atom("h", "H", 100, 100), atom("cl", "Cl", 114, 100)], [bond("b", "h", "cl")]))).toEqual([]);
     expect(dots(molecule([atom("d", "D", 100, 100), atom("fe", "Fe", 114, 100)], [bond("b", "d", "fe", "single", true)]))).toEqual([]);
+    // Master ruling 2026-11-23: an H held only by a dative bond is a single H exactly like D (and T): no radical dot.
+    for (const element of ["H", "D", "T"]) {
+      expect(dots(molecule([atom("h", element, 100, 100), atom("fe", "Fe", 114, 100)], [bond("b", "h", "fe", "single", true)])), element).toEqual([]);
+    }
   });
 });

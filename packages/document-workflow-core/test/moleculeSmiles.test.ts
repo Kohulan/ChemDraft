@@ -344,6 +344,29 @@ describe("a lone H, D or T: label, native formula, RDKit formula and SMILES agre
       .toEqual({ label: element, nativeFormula: formula, rdkitFormula: formula, rdkitAtom: { radicals: 0, hydrogens: 0 }, smiles });
   });
 
+  // Master ruling 2026-11-23: an H held only by a dative bond is a single H exactly like D. Every
+  // reading (label, native and RDKit formula, SMILES, RDKit's radical count, the stored chemistry's
+  // radicalCount, warnings) must agree between H and D apart from the isotope itself.
+  it("a dative-only H reads exactly as a dative-only D: no radical anywhere", async () => {
+    const dativeReading = async (element: string) => {
+      const dative = molecule([hydrogen(element), { id: "fe", element: "Fe", x: 14, y: 0, formalCharge: 0 }],
+        [{ id: "b", fromAtomId: "h", toAtomId: "fe", order: "single", display: { bondStyle: "dashed" } }]);
+      return { read: await readings(dative), radicalCount: nativeSingleBondGraphMetadata(dative.atoms, dative.bonds).radicalCount };
+    };
+    const h = await dativeReading("H");
+    const d = await dativeReading("D");
+    // The exported SMILES (RDKit route) and the labels, formulas and RDKit atom states pin the H reading.
+    expect({ label: h.read.label, nativeFormula: h.read.nativeFormula, rdkitFormula: h.read.rdkitFormula, rdkitAtom: h.read.rdkitAtom, smiles: h.read.smiles })
+      .toEqual({ label: "H", nativeFormula: "FeH", rdkitFormula: "FeH", rdkitAtom: { radicals: 0, hydrogens: 0 }, smiles: "[H][Fe]" });
+    expect({ label: d.read.label, nativeFormula: d.read.nativeFormula, rdkitFormula: d.read.rdkitFormula, rdkitAtom: d.read.rdkitAtom, smiles: d.read.smiles })
+      .toEqual({ label: "D", nativeFormula: "DFe", rdkitFormula: "DFe", rdkitAtom: { radicals: 0, hydrogens: 0 }, smiles: "[2H][Fe]" });
+    // Whatever warnings the dative export raises (the dative bond, the metal's own radical), H raises exactly D's.
+    expect(h.read.warnings).toEqual(d.read.warnings);
+    expect(h.read.nativeSmiles.replace("[H]", "[2H]")).toBe(d.read.nativeSmiles);
+    expect(h.radicalCount).toBe(0);
+    expect(d.radicalCount).toBe(0);
+  });
+
   it.each([
     ["H", "ClH", "[H]Cl"],
     ["D", "DCl", "[2H]Cl"],

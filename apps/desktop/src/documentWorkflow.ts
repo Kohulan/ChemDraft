@@ -8390,14 +8390,23 @@ function withImpliedRadicalChemistryRederived(document: ChemDraftDocument): Chem
   const pages = document.pages.map((page) => {
     let pageChanged = false;
     const objects = page.objects.map((object) => {
-      if (object.type !== "molecule" ||
-          !object.atoms.some((atom) => atomImpliedRadicalCount(atom, object.bonds) > 0)) return object;
-      const derived = refreshNativeSingleBondGraph(object, object.atoms, object.bonds);
-      if (derived.structure === object.structure && derived.structureFormat === object.structureFormat &&
-          JSON.stringify(derived.chemistry) === JSON.stringify(object.chemistry)) return object;
-      pageChanged = true;
-      // Only the cached chemistry is replaced: atoms, bonds and geometry stay as stored.
-      return { ...object, structureFormat: derived.structureFormat, structure: derived.structure, chemistry: derived.chemistry };
+      if (object.type !== "molecule") return object;
+      // Fail safe: this recompute is a refresh of a cache, never a reason to refuse a document. If it
+      // throws on an unusual molecule, that molecule stays exactly as stored (no chemistry is
+      // changed), the error is logged with the molecule id, and opening continues.
+      try {
+        if (!object.atoms.some((atom) => atomImpliedRadicalCount(atom, object.bonds) > 0)) return object;
+        const derived = refreshNativeSingleBondGraph(object, object.atoms, object.bonds);
+        if (derived.structure === object.structure && derived.structureFormat === object.structureFormat &&
+            JSON.stringify(derived.chemistry) === JSON.stringify(object.chemistry)) return object;
+        // Only the cached chemistry is replaced: atoms, bonds and geometry stay as stored.
+        const refreshed = { ...object, structureFormat: derived.structureFormat, structure: derived.structure, chemistry: derived.chemistry };
+        pageChanged = true;
+        return refreshed;
+      } catch (error) {
+        console.error(`Could not re-derive the cached chemistry of molecule ${object.id} on open; keeping it as stored`, error);
+        return object;
+      }
     });
     if (!pageChanged) return page;
     changed = true;
