@@ -2,17 +2,18 @@ import { retainedCtabCompatibility } from "./storedCtabGeometry";
 import { adoptDerivedDocument, DocumentPatchError, type ChemDraftDocument, type DocumentObject, type DocumentPage, type DocumentPatch, type MoleculeObject } from "@chemdraft/chem-core";
 import {
   PluginRequestLimits, type NormalizedProposedDocumentPatch, type PluginExpectedStructure,
-  type PluginRequestError, type PluginRequestPrecondition
+  type PluginRefusalFields, type PluginRequestError, type PluginRequestPrecondition
 } from "@chemdraft/plugin-api";
 import {
-  assertPluginDocumentWriteScope, assertPluginPatchWriteScope, DirectWritePatchOps, writePatchOps
+  assertPluginDocumentWriteScope, assertPluginPatchWriteScope, DirectWritePatchOps, PluginHostError, writePatchOps
 } from "./index";
 import { sameDocumentValue } from "./documentValue";
 import { rebasePluginPatch } from "./rebasePluginPatch";
 import { assertAuthoredBracketReferences, assertRequestReferences, requestReferenceScope } from "./requestReferences";
 
 export class RequestWriteError extends Error {
-  constructor(readonly code: PluginRequestError["code"], message: string) { super(message); }
+  /** API 0.1.27 refusal fields, forwarded to plugins whose SDK accepts them. */
+  constructor(readonly code: PluginRequestError["code"], message: string, readonly refusal?: PluginRefusalFields) { super(message); }
 }
 
 export interface RequestObjectRef { pageId: string; objectId: string }
@@ -261,7 +262,10 @@ export async function preflightRequestPatch(before: ChemDraftDocument, proposal:
     try { draft = assertPluginPatchWriteScope(before, proposal, scope, rebased, checkReferenceScope); }
     catch (error) {
       if (error instanceof RequestWriteError) throw error;
-      throw new RequestWriteError(error instanceof DocumentPatchError ? "invalid" : "scope", (error as Error).message);
+      // A host refusal with a reason is about the written value (an unrepresentable hydrogen count), not scope.
+      const refusal = error instanceof PluginHostError && error.reason !== undefined
+        ? { reason: error.reason, ...(error.details ? { details: error.details } : {}) } : undefined;
+      throw new RequestWriteError(error instanceof DocumentPatchError || refusal ? "invalid" : "scope", (error as Error).message, refusal);
     }
     const nextEntries = entries(draft);
     const after = new Map(nextEntries.map(entry => [entry.objectId, entry]));

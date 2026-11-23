@@ -46,6 +46,8 @@ import type { DocumentObject } from "@chemdraft/chem-core";
  * 0.1.24 adds binary CDX import/export (#316) and optional reaction arrowObjectIds/plusObjectIds (#335); shared scheme arrows and plus signs are referenced by id, never copied.
  * 0.1.25 adds optional native bracketUsage, repeatCount and scoped crossingBondIds (#338 bracketed groups).
  * 0.1.26 adds optional request-bound document access, tool sessions, chemistry and depiction, and document-change events.
+ * 0.1.27 adds optional machine-readable refusal fields, `reason` and `details`, on PluginWorkerErrorPayload,
+ * PluginWorkerCapabilityError and PluginRequestError (first reason: `hydrogen_count_unrepresentable`).
  *
  * The MINOR stays at 1 for both. For a 0.x release `isPluginApiVersionCompatible` treats the minor as
  * the compatibility boundary, so 0.2.0 would have made every plugin declaring `^0.1.0` — the NMR
@@ -55,7 +57,7 @@ import type { DocumentObject } from "@chemdraft/chem-core";
  * local structure recognition, `^0.1.7` for structure naming, `^0.1.8` for external tools), which this host satisfies and an
  * older one correctly does not.
  */
-export const PluginApiVersion = "0.1.26" as const;
+export const PluginApiVersion = "0.1.27" as const;
 
 export const pluginPermissions = [
   "document.read",
@@ -1988,6 +1990,7 @@ export {
   isPluginApiVersionCompatible,
   supportsPluginTableInsertion,
   supportsPluginRequestTools,
+  supportsPluginRefusalFields,
   isPinnedRequestToolCapability,
   checkWorkerHandshake,
   type PluginWorkerCapabilityNamespace,
@@ -2000,6 +2003,7 @@ export {
 } from "./workerProtocol";
 
 export { runPluginWorker, PluginWorkerCapabilityError, type PluginWorkerRegistration } from "./workerRuntime";
+export { pluginRefusalFields, PluginRefusalLimits, type PluginRefusalDetails, type PluginRefusalFields } from "./refusal";
 
 // --- Built plugin package (ADR-0029 §5, M35) -------------------------------------------------------
 // The `manifest.json` contract of the installable zip: a superset of PluginManifest carrying the built

@@ -292,5 +292,6 @@ export {
 export { isDativeBond, moleculeToMolfileV2000, moleculeToMolfileV3000, UnknownBondOrderError, type MolfileWriteOptions, type MolfileWriteResult } from "./molfile";
 
 export { bridgeBondIndices } from "./bondGraph";
-export { atomStatedHydrogenCount, clearChangedAtomHydrogenHints, dropOrphanedHydrogenHints } from "./hydrogenHints";
+export { atomStatedHydrogenCount, clearChangedAtomHydrogenHints, dropOrphanedHydrogenHints, hydrogenAtomIgnoresStatedCount,
+  hydrogenAtomWithIgnoredCount } from "./hydrogenHints";
 export { drawnLabelBondSide } from "./labelBondSide";

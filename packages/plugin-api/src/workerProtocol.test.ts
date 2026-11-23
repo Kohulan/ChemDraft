@@ -12,12 +12,15 @@ import {
   PluginWorkerErrorCodes,
   checkWorkerHandshake,
   isPluginApiVersionCompatible,
+  supportsPluginRefusalFields,
   supportsPluginTableInsertion,
+  toPluginWorkerErrorPayload,
   type HostToWorkerMessage,
   type PluginWorkerEndpoint,
   type WorkerToHostMessage
 } from "./workerProtocol";
-import { runPluginWorker } from "./workerRuntime";
+import { PluginWorkerCapabilityError, runPluginWorker } from "./workerRuntime";
+import { PluginRequestErrorSchema, pluginRequestFailure } from "./requestSchemas";
 
 const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 const commandId = "plugin.runtime.run";
@@ -136,7 +139,7 @@ describe("isPluginApiVersionCompatible", () => {
     expect(isPluginApiVersionCompatible("^0.1.14", "0.1.13")).toBe(false);
     expect(isPluginApiVersionCompatible("^0.1.15", PluginApiVersion)).toBe(true);
     expect(isPluginApiVersionCompatible("^0.1.15", "0.1.14")).toBe(false);
-    expect(PluginApiVersion).toBe("0.1.26");
+    expect(PluginApiVersion).toBe("0.1.27");
     expect(isPluginApiVersionCompatible("^0.1.23", PluginApiVersion)).toBe(true);
     expect(isPluginApiVersionCompatible("^0.1.24", PluginApiVersion)).toBe(true);
     expect(isPluginApiVersionCompatible("^0.1.24", "0.1.23")).toBe(false);
@@ -618,5 +621,39 @@ describe("runPluginWorker", () => {
     endpoint.deliver({ kind: "invokeCommand", commandRequestId: 21, commandId });
     await flush();
     expect(endpoint.sent).toContainEqual(expect.objectContaining({ kind: "commandSettled", commandRequestId: 21, ok: true }));
+  });
+});
+
+describe("refusal reason and details (API 0.1.27)", () => {
+  const details = { moleculeId: "mol_3", atomId: "h", element: "H", hydrogenCount: 1 };
+
+  it("cross the worker boundary beside the code and message, and reach the plugin's error", () => {
+    const payload = toPluginWorkerErrorPayload({ code: "PluginHostError", message: "Plugin write refused.",
+      reason: "hydrogen_count_unrepresentable", details });
+    expect(payload).toEqual({ code: "PluginHostError", message: "Plugin write refused.", reason: "hydrogen_count_unrepresentable", details });
+    expect(new PluginWorkerCapabilityError(payload)).toMatchObject({ code: "PluginHostError", message: "Plugin write refused.",
+      reason: "hydrogen_count_unrepresentable", details });
+    // A refusal without them stays exactly what older hosts sent.
+    expect(toPluginWorkerErrorPayload({ code: "PluginHostError", message: "No." })).toEqual({ code: "PluginHostError", message: "No." });
+    expect(new PluginWorkerCapabilityError({ code: "X", message: "No." })).not.toHaveProperty("reason");
+  });
+
+  it("drops a malformed reason or details without failing the refusal", () => {
+    for (const [reason, bad] of [["Not Snake", { atomId: { nested: true } }], ["", [1, 2]], [7, "text"],
+      ["x".repeat(65), Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`k${i}`, i]))]] as const) {
+      expect(toPluginWorkerErrorPayload({ code: "C", message: "M", reason, details: bad })).toEqual({ code: "C", message: "M" });
+    }
+    expect(toPluginWorkerErrorPayload({ code: "C", message: "M", details: { count: Number.NaN } })).toEqual({ code: "C", message: "M" });
+  });
+
+  it("are optional on a request failure, validated, and sent only to plugins whose SDK accepts them", () => {
+    expect(pluginRequestFailure("invalid", "Refused.", { reason: "hydrogen_count_unrepresentable", details }))
+      .toEqual({ ok: false, error: { code: "invalid", message: "Refused.", reason: "hydrogen_count_unrepresentable", details } });
+    expect(pluginRequestFailure("invalid", "Refused.")).toEqual({ ok: false, error: { code: "invalid", message: "Refused." } });
+    expect(PluginRequestErrorSchema.safeParse({ code: "invalid", message: "Refused.", reason: "hydrogen_count_unrepresentable", details }).success).toBe(true);
+    expect(PluginRequestErrorSchema.safeParse({ code: "invalid", message: "Refused.", reason: "Bad Reason" }).success).toBe(false);
+    expect(PluginRequestErrorSchema.safeParse({ code: "invalid", message: "Refused.", details: { atom: { id: "h" } } }).success).toBe(false);
+    expect(["^0.1.27", "~0.1.27", "0.1.30", "^0.1.26", "^0.1.0", "bogus"].map(supportsPluginRefusalFields))
+      .toEqual([true, true, true, false, false, false]);
   });
 });

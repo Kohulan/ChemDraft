@@ -100,9 +100,14 @@ describe("a stated hydrogen count on an atom with no aromatic bond", () => {
     expect(state(lone("H", { labelLiteral: true }), "h").valid).toBe(false);
     expect(state(lone("D", { hydrogenCount: 0 }), "h")).toEqual(state(lone("D", { labelLiteral: true }), "h"));
     expect(state(lone("D", { hydrogenCount: 0 }), "h").valid).toBe(true);
-    // A count a hydrogen atom cannot carry is not counted, so it is not judged as if it were.
-    expect(state(lone("H", { hydrogenCount: 2 }), "h")).toEqual(state(lone("H"), "h"));
-    expect(state(lone("H"), "h").valid).toBe(true);
+    // A count a hydrogen atom cannot carry is not counted (the derived count stands), but it is
+    // flagged rather than ignored silently: the document keeps it as stored.
+    const { expectedFormalCharge: _expected, ...plain } = state(lone("H"), "h");
+    expect(plain.valid).toBe(true);
+    expect(state(lone("H", { hydrogenCount: 2 }), "h")).toEqual({ ...plain, valid: false, hydrogenCountNotCounted: true,
+      statedHydrogens: { stated: 2, derived: 1 }, invalidReason: "H states 2 H, which a hydrogen atom cannot carry; only 0 counts.",
+      invalidDetail: "atom h (H) states 2 hydrogens, which a hydrogen atom cannot carry: only 0 counts, as a typed H, D or T label means. " +
+        "The stated count is kept as stored but not counted, and the atom is flagged. The label, formula and SMILES count 1." });
   });
 
   it("leaves a typed literal label to its own check", () => {

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { applyPatches, applyPatchWithHistory, atomStatedHydrogenCount, createDocumentHistory, createEmptyDocument, DocumentPatchError, dropOrphanedHydrogenHints, undo, type MoleculeObject } from "./index";
+import { applyPatches, applyPatchWithHistory, atomStatedHydrogenCount, createDocumentHistory, createEmptyDocument, dropOrphanedHydrogenHints,
+  hydrogenAtomIgnoresStatedCount, hydrogenAtomWithIgnoredCount, redo, serializeDocument, deserializeDocument, undo, type MoleculeObject } from "./index";
 
 // A pyrrole as CDXML imports it (aromatic ring bonds, the N's NumHydrogens and one carbon's kept),
 // with a single N–Zn bond whose dative meaning an edit can toggle.
@@ -348,7 +349,11 @@ describe("a stated count on an atom with no aromatic bond lasts until that atom 
   });
 });
 
-describe("a patch may not store a hydrogen count an H, D or T atom cannot carry", () => {
+// chem-core's patches never refuse such a count: they also replay paste, duplicate, undo and session
+// restore, and refusing a user's own document there is worse than the ignored count. The plugin host
+// refuses a plugin or assistant write that sets one (plugin-host writeScope.test.ts); the atom
+// validator flags a stored one (apps/desktop atomProblems.test.ts).
+describe("a hydrogen count an H, D or T atom cannot carry is stored as written, never refused", () => {
   const withHydrogen = (element: string, hydrogenCount?: number): MoleculeObject => {
     const molecule = ethoxy();
     return { ...molecule,
@@ -356,40 +361,67 @@ describe("a patch may not store a hydrogen count an H, D or T atom cannot carry"
       bonds: [...molecule.bonds, { id: "bh", fromAtomId: "s", toAtomId: "h", order: "single" }] };
   };
   const pageId = () => createEmptyDocument().pages[0]!.id;
+  const hydrogenOf = (document: ReturnType<typeof createEmptyDocument>) =>
+    (document.pages[0]!.objects[0] as MoleculeObject).atoms.find((atom) => atom.id === "h")!;
 
-  it("refuses adding a molecule whose H, D or T atom states any count but 0, naming the atom", () => {
+  it("adds a molecule whose H, D or T atom states 2 or 0, keeping the count as written", () => {
     for (const element of ["H", "D", "T"]) {
-      const document = createEmptyDocument();
-      const add = () => applyPatches(document, [{ op: "addObject", pageId: pageId(), object: withHydrogen(element, 2) }]);
-      expect(add).toThrow(DocumentPatchError);
-      expect(add).toThrow(`Cannot add object: atom "h" of molecule "m" is ${element} with hydrogenCount 2, which a hydrogen atom cannot carry.`);
-      const added = applyPatches(document, [{ op: "addObject", pageId: pageId(), object: withHydrogen(element, 0) }]);
-      expect((added.pages[0]!.objects[0] as MoleculeObject).atoms.find((atom) => atom.id === "h")!.hydrogenCount).toBe(0);
+      for (const count of [2, 0]) {
+        const added = applyPatches(createEmptyDocument(), [{ op: "addObject", pageId: pageId(), object: withHydrogen(element, count) }]);
+        expect(hydrogenOf(added).hydrogenCount).toBe(count);
+      }
     }
   });
 
-  it("refuses an update that sets such a count on an H atom, and leaves the document as it was", () => {
+  it("an update setting 1 on an existing H stores it, and the native file round-trips it unchanged", () => {
     const document = applyPatches(createEmptyDocument(), [{ op: "addObject", pageId: pageId(), object: withHydrogen("H") }]);
-    const atoms = withHydrogen("H", 1).atoms;
-    expect(() => applyPatches(document, [{ op: "updateObject", objectId: "m", changes: { atoms } }]))
-      .toThrow('Cannot update object: atom "h" of molecule "m" is H with hydrogenCount 1');
-    expect((document.pages[0]!.objects[0] as MoleculeObject).atoms.find((atom) => atom.id === "h")!.hydrogenCount).toBeUndefined();
+    const updated = applyPatches(document, [{ op: "updateObject", objectId: "m", changes: { atoms: withHydrogen("H", 1).atoms } }]);
+    expect(hydrogenOf(updated).hydrogenCount).toBe(1);
+    expect(hydrogenOf(document).hydrogenCount).toBeUndefined();
+    expect(hydrogenOf(deserializeDocument(serializeDocument(updated)))).toEqual(hydrogenOf(updated));
   });
 
-  it("does not refuse an edit elsewhere in a molecule that already holds such a count unchanged", () => {
+  it("an edit elsewhere in a molecule that holds such a count keeps it", () => {
     const document = createEmptyDocument();
     document.pages[0]!.objects.push(withHydrogen("H", 1));
     const moved = applyPatches(document, [{ op: "updateObject", objectId: "m", changes: {
       atoms: withHydrogen("H", 1).atoms.map((atom) => ({ ...atom, x: atom.x + 5 }))
     } }]);
-    expect((moved.pages[0]!.objects[0] as MoleculeObject).atoms.find((atom) => atom.id === "h")!.hydrogenCount).toBe(1);
+    expect(hydrogenOf(moved).hydrogenCount).toBe(1);
   });
 
-  it("lets an element change drop the count as any element change does, rather than refusing it", () => {
+  it("undo and redo across an edit of a document holding such a count restore each state exactly", () => {
+    const document = createEmptyDocument();
+    document.pages[0]!.objects.push(withHydrogen("H", 1));
+    const edited = applyPatchWithHistory(createDocumentHistory(document), { op: "updateObject", objectId: "m", changes: {
+      atoms: withHydrogen("H", 1).atoms.map((atom) => atom.id === "c1" ? { ...atom, x: atom.x + 7 } : atom)
+    } });
+    expect(hydrogenOf(edited.present).hydrogenCount).toBe(1);
+    const undone = undo(edited);
+    expect(undone.present).toBe(document);
+    expect(hydrogenOf(undone.present)).toEqual({ id: "h", element: "H", x: 40, y: 10, formalCharge: 0, hydrogenCount: 1 });
+    const redone = redo(undone);
+    expect(redone.present).toBe(edited.present);
+    expect(hydrogenOf(redone.present).hydrogenCount).toBe(1);
+  });
+
+  it("lets an element change drop the count as any element change does", () => {
     const document = applyPatches(createEmptyDocument(), [{ op: "addObject", pageId: pageId(), object: withHydrogen("C", 2) }]);
-    const atoms = withHydrogen("H", 2).atoms;
-    const result = applyPatches(document, [{ op: "updateObject", objectId: "m", changes: { atoms } }]);
-    expect((result.pages[0]!.objects[0] as MoleculeObject).atoms.find((atom) => atom.id === "h")!.hydrogenCount).toBeUndefined();
+    const result = applyPatches(document, [{ op: "updateObject", objectId: "m", changes: { atoms: withHydrogen("H", 2).atoms } }]);
+    expect(hydrogenOf(result).hydrogenCount).toBeUndefined();
+  });
+
+  it("names the atom a write sets such a count on, not one an earlier state already held unchanged", () => {
+    const held = withHydrogen("H", 1).atoms;
+    expect(hydrogenAtomIgnoresStatedCount(held.at(-1)!)).toBe(true);
+    expect(["H", "D", "T"].map((element) => hydrogenAtomIgnoresStatedCount({ id: "h", element, x: 0, y: 0, formalCharge: 0, hydrogenCount: 0 })))
+      .toEqual([false, false, false]);
+    expect(hydrogenAtomIgnoresStatedCount({ id: "c", element: "C", x: 0, y: 0, formalCharge: 0, hydrogenCount: 2 })).toBe(false);
+    expect(hydrogenAtomWithIgnoredCount(held)?.id).toBe("h");
+    expect(hydrogenAtomWithIgnoredCount(held, held)).toBeUndefined();
+    expect(hydrogenAtomWithIgnoredCount(withHydrogen("H", 2).atoms, held)?.id).toBe("h");
+    expect(hydrogenAtomWithIgnoredCount(withHydrogen("D", 1).atoms, held)?.id).toBe("h");
+    expect(hydrogenAtomWithIgnoredCount(withHydrogen("D", 0).atoms, held)).toBeUndefined();
   });
 });
 

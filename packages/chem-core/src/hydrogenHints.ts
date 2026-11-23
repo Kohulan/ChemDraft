@@ -20,8 +20,10 @@ import type { MoleculeAtom, MoleculeBond, MoleculeObject } from "./schemas";
  *   Kekulé resolution carries it;
  * - a label that is not a plain element symbol (D and T aside);
  * - an H, D or T atom stating any count but 0: no typed label draws a hydrogen atom carrying
- *   hydrogens of its own (the CDXML importer warns and does not keep such a count, and a document
- *   patch that would store one is refused: `hydrogenAtomWithIgnoredCount`).
+ *   hydrogens of its own (`hydrogenAtomIgnoresStatedCount`). The CDXML importer warns and does not
+ *   keep such a count; a plugin or assistant write that would store one is refused at the plugin
+ *   host (`hydrogenAtomWithIgnoredCount`); a document that already holds one (an older file, a
+ *   session, a paste) keeps it as stored, and the atom is flagged.
  * No valence model here: the count is passed through as stated, never re-derived.
  */
 export function atomStatedHydrogenCount(
@@ -39,21 +41,32 @@ export function atomStatedHydrogenCount(
 }
 
 /**
+ * True for an H, D or T atom that stores a hydrogen count other than 0: a count
+ * `atomStatedHydrogenCount` ignores, because no typed label draws a hydrogen atom carrying hydrogens
+ * of its own. Patches store it as written (chem-core never refuses it, so opening, restoring,
+ * pasting or undoing a document that holds one always works); the atom validator flags it and an
+ * open reports it, as the CDXML importer's `cdxml.atom_hydrogen_count_not_kept` does.
+ */
+export function hydrogenAtomIgnoresStatedCount(atom: MoleculeAtom): boolean {
+  return (atom.element === "H" || atom.element === "D" || atom.element === "T") &&
+    atom.hydrogenCount !== undefined && atom.hydrogenCount !== 0;
+}
+
+/**
  * The first atom of `atoms` that would store a hydrogen count `atomStatedHydrogenCount` ignores
- * because it is an H, D or T atom stating any count but 0 — and that this write sets, not one
- * `previous` already held unchanged (an older document's atom is not refused for edits elsewhere).
- * The CDXML importer warns and does not keep such a count; a patch is refused instead
- * (`applyPatches`), so a plugin or the assistant is told rather than having a count stored that
- * nothing reads (AGENTS.md §7).
+ * (`hydrogenAtomIgnoresStatedCount`) and that this write sets, not one `previous` already held
+ * unchanged (an older document's atom is not refused for edits elsewhere). The plugin host refuses
+ * a plugin or assistant write that sets one, so its writer is told rather than having a count
+ * stored that nothing reads (AGENTS.md §7). chem-core's patches do not refuse it: they also replay
+ * paste, duplicate, undo and session restore, which must never refuse a user's own document.
  */
 export function hydrogenAtomWithIgnoredCount(
   atoms: readonly MoleculeAtom[],
   previous?: readonly MoleculeAtom[]
 ): MoleculeAtom | undefined {
-  const isHydrogen = (atom: MoleculeAtom) => atom.element === "H" || atom.element === "D" || atom.element === "T";
   const before = new Map(previous?.map((atom) => [atom.id, atom]));
   return atoms.find((atom) => {
-    if (!isHydrogen(atom) || atom.hydrogenCount === undefined || atom.hydrogenCount === 0) return false;
+    if (!hydrogenAtomIgnoresStatedCount(atom)) return false;
     const old = before.get(atom.id);
     return !old || old.element !== atom.element || old.hydrogenCount !== atom.hydrogenCount;
   });

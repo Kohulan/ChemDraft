@@ -36,7 +36,10 @@ import {
   reconcileNativeChargeMarks,
   rotateSelectedDocumentObjects90
 } from "./documentWorkflow";
-import { applyPatches, createDocumentHistory, nativeDrawingStyleFromObjectStyle, undo, type ChemDraftDocument, type DocumentHistory, type MoleculeObject } from "@chemdraft/chem-core";
+import { applyPatches, applyPatchWithHistory, createDocumentHistory, createEmptyDocument, nativeDrawingStyleFromObjectStyle, redo, serializeDocument, undo,
+  type ChemDraftDocument, type DocumentHistory, type MoleculeObject } from "@chemdraft/chem-core";
+import { buildDocumentSessionEnvelope, parseDocumentSessionEnvelope } from "./documentSession";
+import { restoreSessionWarningReports } from "./openWarnings";
 import { problemDocument, problemMolecule } from "./testSupport/atomProblemFixtures";
 import { DialogCoordinator } from "./dialogs/DialogCoordinator";
 import { dialogEnvelope, parseDialogMessage, type AtomProblemSnapshot, type DialogMessage } from "./dialogs/dialogProtocol";
@@ -632,6 +635,112 @@ describe("a stated hydrogen count shows everywhere, as a hand-drawn under-filled
     expect(read.smilesWarnings).toEqual([[
       "export.smiles_radical_loss", `Atom ${oxygenOf(moleculesOrThrow(stated)[0]).id} (O) is drawn with 0 radical electrons; SMILES reparses with 1 radical electron.`
     ]]);
+  });
+});
+
+// A native document written before plugin and assistant writes were refused such a count: an H atom
+// on ethane stating 1 H, and a D stating 0. Nothing in the app refuses it: it opens, restores, pastes,
+// duplicates and undoes as stored, round-trips unchanged, and the H is flagged with the native twin of
+// the CDXML importer's "not kept" warning, since no label, formula or export counts it.
+describe("an H atom a native document stores a hydrogen count on, in the app", () => {
+  const notCounted = {
+    code: "document.atom_hydrogen_count_not_counted",
+    message: "ChemDraft document: atom h (H) states 1 hydrogen, which a hydrogen atom cannot carry: only 0 counts, as a typed H, D " +
+      "or T label means. The stated count is kept as stored but not counted, and the atom is flagged.",
+    sourceObjectId: "mol_h",
+    atomIds: ["h"]
+  };
+  const stored = (): ChemDraftDocument => {
+    const document = createEmptyDocument();
+    document.pages[0]!.objects.push({ id: "mol_h", type: "molecule", x: 100, y: 100, width: 50, height: 10, rotation: 0, style: {},
+      structureFormat: "molfile-v2000", structure: "", superatoms: [], rGroups: [],
+      atoms: [{ id: "c1", element: "C", x: 100, y: 100, formalCharge: 0 }, { id: "c2", element: "C", x: 114, y: 108, formalCharge: 0 },
+        { id: "h", element: "H", x: 128, y: 100, formalCharge: 0, hydrogenCount: 1 },
+        { id: "d", element: "D", x: 100, y: 84, formalCharge: 0, hydrogenCount: 0 }],
+      bonds: [{ id: "b1", fromAtomId: "c1", toAtomId: "c2", order: "single" }, { id: "b2", fromAtomId: "c2", toAtomId: "h", order: "single" },
+        { id: "b3", fromAtomId: "c1", toAtomId: "d", order: "single" }] });
+    return document;
+  };
+  const atomOf = (molecule: MoleculeObject, id: string) => molecule.atoms.find(atom => atom.id === id)!;
+  const expectFlagged = (molecule: MoleculeObject) => {
+    expect(atomOf(molecule, "h").hydrogenCount).toBe(1);
+    expect(atomOf(molecule, "d").hydrogenCount).toBe(0);
+    const problem = atomProblem(molecule, "h")!;
+    expect(problem.state).toMatchObject({ valid: false, hydrogenCountNotCounted: true, statedHydrogens: { stated: 1, derived: 0 },
+      invalidReason: "H states 1 H, which a hydrogen atom cannot carry; only 0 counts." });
+    expect(problem.fixes.map(fix => fix.label)).toEqual(["Use the derived hydrogen count (0)", "Ignore warning"]);
+    expect(atomProblem(molecule, "d")).toBeUndefined();
+  };
+
+  it("a .chemdraft holding it opens with the count kept, the warning and the badge, and saves and reopens it unchanged", () => {
+    for (const contents of [serializeDocument(stored()), createNativeSavePayload(stored()).contents]) {
+      const opened = openNativeDocument(contents);
+      expect(opened.warnings).toContainEqual(notCounted);
+      expect(opened.warnings.filter(warning => warning.code === notCounted.code)).toHaveLength(1);
+      const document = normalizeCommittedDocument(opened.document!);
+      const [molecule] = moleculesOrThrow(document);
+      expectFlagged(molecule);
+      const saved = createNativeSavePayload(document);
+      expect(saved.warnings.map(warning => warning.message)).toContain("H3 states 1 H, which a hydrogen atom cannot carry; only 0 counts.");
+      const reopened = openNativeDocument(saved.contents);
+      expect(reopened.warnings).toContainEqual(notCounted);
+      expect(atomOf(moleculesOrThrow(reopened.document!)[0], "h")).toEqual(atomOf(molecule, "h"));
+    }
+  });
+
+  it("a D or H stating 0, or no count, opens with no warning and no badge", () => {
+    const document = stored();
+    const molecule = document.pages[0]!.objects[0] as MoleculeObject;
+    for (const hydrogenCount of [0, undefined]) {
+      molecule.atoms[2] = { id: "h", element: "H", x: 128, y: 100, formalCharge: 0, ...(hydrogenCount === undefined ? {} : { hydrogenCount }) };
+      const opened = openNativeDocument(serializeDocument(document));
+      expect(opened.warnings.filter(warning => warning.code === notCounted.code)).toEqual([]);
+      const [reopened] = moleculesOrThrow(normalizeCommittedDocument(opened.document!));
+      expect(reopened.atoms.map(atom => atomProblem(reopened, atom.id))).toEqual([undefined, undefined, undefined, undefined]);
+    }
+  });
+
+  it("session restore reads it as File > Open does: the count kept, the warning shown", () => {
+    const opened = openNativeDocument(serializeDocument(stored()));
+    const document = normalizeCommittedDocument(opened.document!);
+    const envelope = { ...buildDocumentSessionEnvelope(createNativeSavePayload(document), { dirty: true }, "Stored H", false),
+      openWarnings: { displayName: "Stored H", sourceLabel: "ChemDraft", warnings: opened.warnings } };
+    const session = parseDocumentSessionEnvelope(JSON.parse(JSON.stringify(envelope)), true)!;
+    expect(restoreSessionWarningReports(session).warnings?.warnings).toContainEqual(notCounted);
+    // The restore reads the autosaved contents through the same open path.
+    const restored = openNativeDocument(session.contents);
+    expect(restored.warnings).toContainEqual(notCounted);
+    expectFlagged(moleculesOrThrow(normalizeCommittedDocument(restored.document!))[0]);
+  });
+
+  it("paste and duplicate keep it and flag each copy", () => {
+    const document = normalizeCommittedDocument(openNativeDocument(serializeDocument(stored())).document!);
+    const payload = createSelectionClipboardPayload(selecting(document, ["mol_h"]))!;
+    const pasted = moleculesOrThrow(pasteSelectionClipboardPayload(document, payload, { x: 300, y: 300 }));
+    expect(pasted).toHaveLength(2);
+    for (const molecule of pasted) expectFlagged(molecule);
+    const [molecule] = moleculesOrThrow(document);
+    const fragment = createSelectionClipboardPayload(document, [{ objectId: molecule.id,
+      atomIds: molecule.atoms.map(atom => atom.id), bondIds: molecule.bonds.map(bond => bond.id) }])!;
+    expectFlagged(moleculesOrThrow(pasteSelectionClipboardPayload(document, fragment, { x: 300, y: 300 })).at(-1)!);
+    const duplicated = moleculesOrThrow(duplicateSelectedDocumentObjects(selecting(document, ["mol_h"])));
+    expect(duplicated).toHaveLength(2);
+    for (const copy of duplicated) expectFlagged(copy);
+  });
+
+  it("undo and redo across an edit of the document restore each state exactly", () => {
+    const document = normalizeCommittedDocument(openNativeDocument(serializeDocument(stored())).document!);
+    const [molecule] = moleculesOrThrow(document);
+    const edited = applyPatchWithHistory(createDocumentHistory(document), { op: "updateObject", objectId: molecule.id, changes: {
+      atoms: molecule.atoms.map(atom => atom.id === "c1" ? { ...atom, x: atom.x - 6 } : atom) } });
+    expectFlagged(moleculesOrThrow(edited.present)[0]);
+    const undone = undo(edited);
+    expect(undone.present).toBe(document);
+    expectFlagged(moleculesOrThrow(undone.present)[0]);
+    const redone = redo(undone);
+    expect(redone.present).toBe(edited.present);
+    expect(atomOf(moleculesOrThrow(redone.present)[0], "c1").x).toBe(atomOf(molecule, "c1").x - 6);
+    expectFlagged(moleculesOrThrow(redone.present)[0]);
   });
 });
 
