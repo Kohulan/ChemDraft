@@ -17128,9 +17128,11 @@ describe("aromatic bond orders: one count for the formula, the label and the val
       (next.pages[0]!.objects.find((object) => object.id === molecule.id) as MoleculeObject).atoms
         .find((atom) => atom.id === "a2")!;
     expect(atomAfter(applyNativeAtomElementTarget(document, target, "C")).hydrogenCount).toBeUndefined();
-    // Same element under the typed rule: still the atom the count was stated for.
-    expect(atomAfter(applyNativeAtomElementTarget(document, target, "N", { literal: true })))
-      .toMatchObject({ element: "N", labelLiteral: true, hydrogenCount: 1 });
+    // The same element typed as a literal label drops it too: retyping is an explicit statement by
+    // the user, so the typed label wins (master decision 2026-11-22).
+    const retyped = atomAfter(applyNativeAtomElementTarget(document, target, "N", { literal: true }));
+    expect(retyped).toMatchObject({ element: "N", labelLiteral: true });
+    expect(retyped.hydrogenCount).toBeUndefined();
   });
 
   it("allows a bond-order edit on an imported CH3 and validates the new H count", () => {

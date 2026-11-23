@@ -36,7 +36,7 @@ import {
   reconcileNativeChargeMarks,
   rotateSelectedDocumentObjects90
 } from "./documentWorkflow";
-import { applyPatches, nativeDrawingStyleFromObjectStyle, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
+import { applyPatches, createDocumentHistory, nativeDrawingStyleFromObjectStyle, undo, type ChemDraftDocument, type DocumentHistory, type MoleculeObject } from "@chemdraft/chem-core";
 import { problemDocument, problemMolecule } from "./testSupport/atomProblemFixtures";
 import { DialogCoordinator } from "./dialogs/DialogCoordinator";
 import { dialogEnvelope, parseDialogMessage, type AtomProblemSnapshot, type DialogMessage } from "./dialogs/dialogProtocol";
@@ -469,6 +469,77 @@ describe("a stated hydrogen count shows everywhere, as a hand-drawn under-filled
     for (const flavor of ["v2000", "v3000"] as const) {
       expect(copyAsMolfile(statedDocument, flavor, [])).toBe(copyAsMolfile(typedDocument, flavor, []));
     }
+  });
+
+  // Master decision 2026-11-22: retyping is an explicit user statement; the typed label wins. A
+  // retype through the label editor drops the O's stated count, and the O is then exactly the label
+  // that was typed; undo brings the stated count back.
+  const retyped = (label: string) => {
+    const document = openedDocument();
+    const [molecule] = moleculesOrThrow(document);
+    return normalizeCommittedDocument(commitNativeAtomLabelTarget(document,
+      { objectId: molecule.id, kind: "atom", atomId: oxygenOf(molecule).id, distanceToPointer: 0 },
+      label, { literal: true, replaceElement: true }).document);
+  };
+  const retypedOxygen = (document: ChemDraftDocument) => {
+    const [molecule] = moleculesOrThrow(document);
+    return molecule.atoms[2]!;
+  };
+
+  it("retyping \"OH\" over the O stated at 0 H drops the count: label OH, C2H6O, CCO, no badge", async () => {
+    const document = retyped("OH");
+    expect(retypedOxygen(document)).toMatchObject({ element: "OH", labelLiteral: true });
+    expect(retypedOxygen(document).hydrogenCount).toBeUndefined();
+    const read = await reading(document);
+    expect(read).toMatchObject({ labels: [undefined, undefined, "OH"], badged: [], formula: "C2H6O", storedFormula: "C2H6O", smiles: "CCO", smilesWarnings: [] });
+    const [molecule] = moleculesOrThrow(document);
+    expect(atomProblem(molecule, retypedOxygen(document).id)).toBeUndefined();
+  });
+
+  it("retyping \"O\" over the O stated at 0 H drops the count; the O is the hand-typed O exactly", async () => {
+    const document = retyped("O");
+    expect(retypedOxygen(document)).toMatchObject({ element: "O", labelLiteral: true });
+    expect(retypedOxygen(document).hydrogenCount).toBeUndefined();
+    const typedDocument = handDrawn();
+    expect(retypedOxygen(document)).toEqual(retypedOxygen(typedDocument));
+    const read = await reading(document);
+    expect(read).toEqual(await reading(typedDocument));
+    expect(read).toMatchObject({ formula: "C2H5O", smiles: "CC[O]", badged: [retypedOxygen(document).id] });
+    const [molecule] = moleculesOrThrow(document);
+    const [typedMolecule] = moleculesOrThrow(typedDocument);
+    expect(atomProblem(molecule, retypedOxygen(document).id)).toEqual(atomProblem(typedMolecule, retypedOxygen(typedDocument).id));
+    expect(atomProblem(molecule, retypedOxygen(document).id)!.state.statedHydrogens).toBeUndefined();
+  });
+
+  it("undo of either retype restores the stated count exactly", () => {
+    const document = openedDocument();
+    const [molecule] = moleculesOrThrow(document);
+    for (const label of ["O", "OH"]) {
+      // The app's history keeps whole committed documents; undo puts the one before the retype back.
+      const committed = normalizeCommittedDocument(commitNativeAtomLabelTarget(document,
+        { objectId: molecule.id, kind: "atom", atomId: oxygenOf(molecule).id, distanceToPointer: 0 },
+        label, { literal: true, replaceElement: true }).document);
+      const after: DocumentHistory = { ...createDocumentHistory(document), past: [document], present: committed };
+      expect(retypedOxygen(after.present).hydrogenCount).toBeUndefined();
+      const undone = undo(after);
+      expect(undone.present).toBe(document);
+      expect(retypedOxygen(undone.present)).toEqual(oxygenOf(molecule));
+      expect(retypedOxygen(undone.present)).toMatchObject({ element: "O", hydrogenCount: 0 });
+      expect(retypedOxygen(undone.present).labelLiteral).toBeUndefined();
+      expect(atomProblem(moleculesOrThrow(undone.present)[0], oxygenOf(molecule).id)!.state)
+        .toMatchObject({ statedHydrogens: { stated: 0, derived: 1 } });
+    }
+  });
+
+  it("a style-only change keeps the stated count", async () => {
+    const document = openedDocument();
+    const [molecule] = moleculesOrThrow(document);
+    const styled = normalizeCommittedDocument(applyMoleculeAtomLabelStylePatch(applyMoleculeObjectColorToSelection(document, "stroke", "#336699", [molecule.id]),
+      [{ objectId: molecule.id, atomId: oxygenOf(molecule).id }], { atomLabelColor: "#cc0000" }));
+    expect(oxygenOf(moleculesOrThrow(styled)[0])).toMatchObject({ hydrogenCount: 0 });
+    expect(oxygenOf(moleculesOrThrow(styled)[0]).labelLiteral).toBeUndefined();
+    const read = await reading(styled);
+    expect(read).toMatchObject({ formula: "C2H5O", smiles: "CC[O]", badged: [oxygenOf(molecule).id] });
   });
 
   it("\"Use the derived hydrogen count\" gives OH, C2H6O and CCO", async () => {

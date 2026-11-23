@@ -65,6 +65,15 @@ describe("atom-label draft rollback", () => {
     expect(molecule(restoreAtomLabelDraft(continued, state))).toBe(accepted);
   });
 
+  it("a draft retyping the same element drops that atom's stated count; rollback restores it exactly", () => {
+    // Master decision 2026-11-22: retyping is an explicit user statement; the typed label wins.
+    const { document, before, state } = fixture();
+    const preview = draft(document, state, "C");
+    expect(molecule(preview).atoms[0]).toMatchObject({ element: "C", labelLiteral: true });
+    expect(molecule(preview).atoms.map(atom => atom.hydrogenCount)).toEqual([undefined, 2, 2, 2, 2, 2]);
+    expect(molecule(restoreAtomLabelDraft(preview, state))).toEqual(before);
+  });
+
   it("restores an imported molecule exactly; the relabel kept the other atoms' stated counts", () => {
     const { document, before, state } = fixture();
     const preview = draft(document, state);

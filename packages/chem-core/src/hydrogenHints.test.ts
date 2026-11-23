@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyPatches, atomStatedHydrogenCount, createEmptyDocument, dropOrphanedHydrogenHints, type MoleculeObject } from "./index";
+import { applyPatches, applyPatchWithHistory, atomStatedHydrogenCount, createDocumentHistory, createEmptyDocument, dropOrphanedHydrogenHints, undo, type MoleculeObject } from "./index";
 
 // A pyrrole as CDXML imports it (aromatic ring bonds, the N's NumHydrogens and one carbon's kept),
 // with a single N–Zn bond whose dative meaning an edit can toggle.
@@ -195,7 +195,12 @@ describe("a stated count on an atom with no aromatic bond lasts until that atom 
     ["its bond made dative", (m: MoleculeObject) => { m.bonds[1]!.display = { bondStyle: "dashed" }; }],
     ["its bond removed", (m: MoleculeObject) => { m.bonds.pop(); }],
     ["a radical added to it", (m: MoleculeObject) => { m.atoms[2]!.markRadicals = 1; }],
-    ["an isotope set on it", (m: MoleculeObject) => { m.atoms[2]!.isotope = 18; }]
+    ["an isotope set on it", (m: MoleculeObject) => { m.atoms[2]!.isotope = 18; }],
+    // Master decision 2026-11-22: retyping is an explicit user statement; the typed label wins.
+    ["its label retyped as the same element (a typed literal O)", (m: MoleculeObject) => { m.atoms[2]!.labelLiteral = true; }],
+    ["its label retyped with its hydrogens spelled (a typed literal OH)", (m: MoleculeObject) => {
+      m.atoms[2] = { ...m.atoms[2]!, element: "OH", labelLiteral: true };
+    }]
   ] as const)("drops it on %s", (_name, edit) => {
     expect(oxygen(update(edit)).hydrogenCount).toBeUndefined();
   });
@@ -215,6 +220,33 @@ describe("a stated count on an atom with no aromatic bond lasts until that atom 
       ]).pages[0]!.objects[0] as MoleculeObject;
       expect(oxygen(result).hydrogenCount).toBeUndefined();
     }
+  });
+
+  it("drops it when a typed literal label is made a plain one again (the label was retyped)", () => {
+    const document = createEmptyDocument();
+    const before = ethoxy();
+    before.atoms[2] = { ...before.atoms[2]!, labelLiteral: true };
+    const { labelLiteral: _literal, ...plain } = before.atoms[2]!;
+    const result = applyPatches(document, [
+      { op: "addObject", pageId: document.pages[0]!.id, object: before },
+      { op: "updateObject", objectId: before.id, changes: { atoms: before.atoms.map((atom) => atom.id === "o" ? plain : atom) } }
+    ]).pages[0]!.objects[0] as MoleculeObject;
+    expect(oxygen(result)).toMatchObject({ element: "O" });
+    expect(oxygen(result).hydrogenCount).toBeUndefined();
+  });
+
+  it("undo of a retype restores the stated count exactly", () => {
+    const document = createEmptyDocument();
+    const before = ethoxy();
+    const added = applyPatchWithHistory(createDocumentHistory(document),
+      { op: "addObject", pageId: document.pages[0]!.id, object: before });
+    const retyped = applyPatchWithHistory(added, { op: "updateObject", objectId: before.id, changes: {
+      atoms: before.atoms.map((atom) => atom.id === "o" ? { ...atom, labelLiteral: true } : atom) } });
+    expect(oxygen(retyped.present.pages[0]!.objects[0] as MoleculeObject)).toMatchObject({ labelLiteral: true });
+    expect(oxygen(retyped.present.pages[0]!.objects[0] as MoleculeObject).hydrogenCount).toBeUndefined();
+    const undone = undo(retyped);
+    expect(undone.present).toBe(added.present);
+    expect(oxygen(undone.present.pages[0]!.objects[0] as MoleculeObject)).toEqual(before.atoms[2]);
   });
 
   it("keeps it through a dismissed warning, a hidden label and a label bond side recorded on it", () => {

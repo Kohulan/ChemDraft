@@ -416,9 +416,10 @@ describe.each(["macos", "windows"] as const)("ring label commits (%s)", platform
     expect(editor()).toBeNull();
     if (finish === "same-label") {
       expect(molecule().atoms[0]).toMatchObject({ element: "C", labelLiteral: true });
-      // Retyping the same element is not a chemical edit: atom 0 is still the atom its count was
-      // stated for, as for an element typed as a literal label (documentWorkflow.test.ts).
-      expect(molecule().atoms.every(atom => atom.hydrogenCount === 2)).toBe(true);
+      // Retyping is an explicit statement by the user, even as the same element: the typed label
+      // wins and atom 0's stated count goes; the other ring atoms keep theirs (master decision
+      // 2026-11-22). Undo brings atom 0's count back with the rest of the baseline.
+      expect(molecule().atoms.map(atom => atom.hydrogenCount)).toEqual(before.atoms.map((_, index) => index === 0 ? undefined : 2));
       expect(status()).toBe("Labeled atom C");
       await history(); expect(status()).toBe("Undid Edit Atom Label");
     }

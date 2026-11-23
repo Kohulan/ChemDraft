@@ -398,9 +398,9 @@ export const MoleculeAtomSchema = z
      * when the bonds are resolved into a Kekulé pattern. On any other atom it is kept only where it
      * disagrees with the derived count (owner ruling 1.2.3): it is then the atom's count everywhere
      * (`atomStatedHydrogenCount`) and the atom is badged. This is an import-time hint: a chemical edit
-     * of the atom (element, charge, isotope, radicals, a bond added, removed or changed at it) drops
-     * it before revalidation (`clearChangedAtomHydrogenHints`), and adding or updating a molecule
-     * drops it from an atom whose aromatic bonds no longer sit in a ring.
+     * of the atom (element, charge, isotope, radicals, its label retyped, a bond added, removed or
+     * changed at it) drops it before revalidation (`clearChangedAtomHydrogenHints`), and adding or
+     * updating a molecule drops it from an atom whose aromatic bonds no longer sit in a ring.
      */
     hydrogenCount: z.number().int().nonnegative().optional(),
     /**
