@@ -15,6 +15,7 @@ import { createCoreCommandRegistrar } from "./commands/coreCommandRegistrar";
 import { atomProblemCommandId, atomProblemCommands } from "./atomProblemCommands";
 import {
   analysisFacingStructure,
+  applyFreeformSingleBondToolAtPoint,
   applyNativeAtomElementTarget,
   applyNativeAtomProblemFix,
   commitNativeAtomLabelTarget,
@@ -23,6 +24,7 @@ import {
   createNativeSavePayload,
   createSelectionClipboardPayload,
   duplicateSelectedDocumentObjects,
+  insertNativeSingleBondMolecule,
   moveNativeMoleculeParts,
   nativeMoleculeInvalidAtomStates,
   normalizeCommittedDocument,
@@ -273,6 +275,37 @@ describe("a CDXML atom whose stated hydrogen count disagrees, in the app", () =>
     expect(atomProblem(carbonyl, oxygen.id)).toBeUndefined();
     const ethene = moleculesOrThrow(applyNativeMoleculeBondOrderValueTarget(document, bondTarget(molecule, otherBond.id), "double"))[0];
     expect(oxygenOf(ethene).hydrogenCount).toBe(0);
+  });
+
+  it("bonding another molecule to it keeps the O's count; the carbon the new bond reaches drops its own", () => {
+    // The imported C1 states 2 H (it derives 3) and the O states 0. A drawn ethane is bonded to C1
+    // with the bond tool, from either end: one molecule absorbs the other onto re-minted ids.
+    const document = openedDocument(statedOxygenCdxml.replace('<n id="10" p="100 100"/>', '<n id="10" p="100 100" NumHydrogens="2"/>'));
+    const [imported] = moleculesOrThrow(document);
+    const [c1] = imported.atoms;
+    expect(imported.atoms.map(atom => atom.hydrogenCount)).toEqual([2, undefined, 0]);
+    const withEthane = insertNativeSingleBondMolecule(document, { x: 400, y: 400 });
+    const ethane = moleculesOrThrow(withEthane).find(molecule => molecule.id !== imported.id)!;
+    const ethaneEnd = ethane.atoms[1]!;
+    const fromEthane = applyFreeformSingleBondToolAtPoint(withEthane, ethane.id, ethaneEnd.id, { x: c1!.x, y: c1!.y });
+    const fromImported = applyFreeformSingleBondToolAtPoint(withEthane, imported.id, c1!.id, { x: ethaneEnd.x, y: ethaneEnd.y });
+    for (const merged of [fromEthane, fromImported]) {
+      const molecules = moleculesOrThrow(merged);
+      expect(molecules).toHaveLength(1);
+      const [molecule] = molecules;
+      expect(molecule.atoms).toHaveLength(5);
+      const oxygen = oxygenOf(molecule);
+      const joined = molecule.atoms.find(atom => atom.x === c1!.x && atom.y === c1!.y)!;
+      expect(molecule.bonds.filter(bond => bond.fromAtomId === joined.id || bond.toAtomId === joined.id)).toHaveLength(2);
+      expect(oxygen.hydrogenCount).toBe(0);
+      expect(joined.hydrogenCount).toBeUndefined();
+      const style = nativeDrawingStyleFromObjectStyle(molecule.style);
+      expect(atomDisplayLabel(oxygen, molecule.bonds, style, molecule.atoms)).toBe("O");
+      expect(atomDisplayLabel(joined, molecule.bonds, style, molecule.atoms)).toBeUndefined();
+      expect(nativeMoleculeInvalidAtomStates(molecule).map(state => state.atomId)).toEqual([oxygen.id]);
+      expect(nativeSingleBondGraphMetadata(molecule.atoms, molecule.bonds).formula).toBe("C4H9O");
+      expect(canonical(nativeSingleBondGraphSmiles(molecule.atoms, molecule.bonds))).toBe(canonical("CCCC[O]"));
+    }
   });
 
   it("the problem window's hydrogen fix uses the derived count", () => {

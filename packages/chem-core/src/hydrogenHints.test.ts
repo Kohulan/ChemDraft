@@ -196,6 +196,36 @@ describe("a stated count on an atom with no aromatic bond lasts until that atom 
     expect(oxygen(update(edit)).hydrogenCount).toBeUndefined();
   });
 
+  it("a merge keeps the absorbed atoms' counts on their new ids; the joining bond drops its two ends'", () => {
+    // As the bond tool merges two molecules: the absorbed atoms and bonds are re-minted onto ids the
+    // host does not have (one update), then one bond joins the host's S to the absorbed C1 (another).
+    const host = ethoxy();
+    host.atoms[3] = { ...host.atoms[3]!, hydrogenCount: 1 };
+    const absorbedAtoms: MoleculeObject["atoms"] = [
+      { id: "m1", element: "C", x: 0, y: 40, formalCharge: 0, hydrogenCount: 2 },
+      { id: "m2", element: "C", x: 14, y: 48, formalCharge: 0 },
+      { id: "m3", element: "O", x: 28, y: 40, formalCharge: 0, hydrogenCount: 0 }
+    ];
+    const absorbedBonds: MoleculeObject["bonds"] = [
+      { id: "m-b1", fromAtomId: "m1", toAtomId: "m2", order: "single" },
+      { id: "m-b2", fromAtomId: "m2", toAtomId: "m3", order: "single" }
+    ];
+    const atoms = [...host.atoms, ...absorbedAtoms];
+    const bonds = [...host.bonds, ...absorbedBonds];
+    const document = createEmptyDocument();
+    const merged = applyPatches(document, [
+      { op: "addObject", pageId: document.pages[0]!.id, object: host },
+      { op: "updateObject", objectId: host.id, changes: { atoms, bonds } }
+    ]);
+    const counts = (result: typeof merged) => Object.fromEntries(
+      (result.pages[0]!.objects[0] as MoleculeObject).atoms.map((atom) => [atom.id, atom.hydrogenCount]));
+    expect(counts(merged)).toEqual({ c1: undefined, c2: undefined, o: 0, s: 1, m1: 2, m2: undefined, m3: 0 });
+    const joined = applyPatches(merged, [{ op: "updateObject", objectId: host.id, changes: {
+      bonds: [...bonds, { id: "join", fromAtomId: "s", toAtomId: "m1", order: "single" }]
+    } }]);
+    expect(counts(joined)).toEqual({ c1: undefined, c2: undefined, o: 0, s: undefined, m1: undefined, m2: undefined, m3: 0 });
+  });
+
   it("is kept when the molecule is added whole (an import, a paste or a duplicate)", () => {
     const document = createEmptyDocument();
     const added = applyPatches(document, [{ op: "addObject", pageId: document.pages[0]!.id, object: ethoxy() }])

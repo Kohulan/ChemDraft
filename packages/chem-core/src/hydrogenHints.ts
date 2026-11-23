@@ -43,6 +43,12 @@ export function atomStatedHydrogenCount(
  * of an atom — its element or charge, the order or dative meaning of a bond at it, a bond added or
  * removed at it — drops that atom's count; moves, rotations, alignment, bond direction, wedges,
  * styles and edits of other atoms keep it.
+ *
+ * An atom `previous` does not have (a pasted or sprouted atom, or one merged in from another
+ * molecule on a re-minted id) has nothing to be compared with, so it keeps the count it arrives
+ * with, even though every bond at it is new here. That is what keeps a merge's absorbed atoms'
+ * counts: the merge re-mints them into the host and the joining bond is added afterwards, so only
+ * the two atoms that bond reaches drop theirs (their own diff sees it as a bond added at them).
  */
 export function clearChangedAtomHydrogenHints(
   previous: Pick<MoleculeObject, "atoms" | "bonds">,
@@ -87,9 +93,10 @@ export function clearChangedAtomHydrogenHints(
  * A molecule built from part of another has no previous graph to diff against, so this is the rule
  * that applies there: an atom that still has an aromatic bond, but none of them in a ring (its ring
  * was cut), drops its hint instead of being badged for a count that described the old ring. An atom
- * with no aromatic bond keeps its count: nothing here can tell that it changed, and the callers that
- * cut a molecule (a fragment copy, a merge) rebuild it through `clearChangedAtomHydrogenHints`
- * against the source molecule, which drops the count of every atom whose bonds were cut.
+ * with no aromatic bond keeps its count: nothing here can tell that it changed. A fragment copy is
+ * rebuilt through `clearChangedAtomHydrogenHints` against its source molecule, which drops the count
+ * of every atom whose bonds were cut. A merge cuts nothing: the absorbed atoms keep their counts on
+ * their new ids, and the joining bond drops the counts of the two atoms it reaches.
  * Returns `atoms` itself when nothing changes.
  */
 export function dropOrphanedHydrogenHints(

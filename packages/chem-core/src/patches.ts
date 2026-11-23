@@ -580,9 +580,11 @@ function addObject(document: ChemDraftDocument, pageId: string, object: Document
   // sit in a ring is dropped (see dropOrphanedHydrogenHints). Every other stated count is kept:
   // - an import, and a whole-molecule paste or duplicate, is the same chemistry as its source, so a
   //   count the file stated (owner ruling 1.2.3: kept as written and badged) comes with it;
-  // - a fragment copy or a merge is rebuilt against its source molecule before it gets here
+  // - a fragment copy is rebuilt against its source molecule before it gets here
   //   (`clearChangedAtomHydrogenHints`), which has already dropped the count of every atom whose
   //   element, charge or bonds changed; this rule only catches a payload built elsewhere;
+  // - a merge never gets here: it is an updateObject of the host, whose diff keeps the absorbed
+  //   atoms' counts (they are new to it) and drops those of the two atoms the joining bond reaches;
   // - a split (deleting the bond between two parts) keeps both parts in one object, an
   //   updateObject that the same diff covers. A future split into separate objects must build
   //   each part that way too, or a cut atom keeps a count stated for its old bonds.
