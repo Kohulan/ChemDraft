@@ -293,6 +293,7 @@ export { isDativeBond, moleculeToMolfileV2000, moleculeToMolfileV3000, UnknownBo
 
 export { bridgeBondIndices } from "./bondGraph";
 export { atomIgnoresStatedHydrogenCount, atomImpliedRadicalCount, moleculeRadicalCount, atomStatedHydrogenCount, atomWithIgnoredHydrogenCount, clearChangedAtomHydrogenHints,
-  dropOrphanedHydrogenHints, ignoredHydrogenCountAtomKind, installAbbreviationLabelReader, statedHydrogenCountNotCountedReason,
-  statedHydrogenCountNotCountedText, type AbbreviationLabelReader } from "./hydrogenHints";
+  dropOrphanedHydrogenHints, ignoredHydrogenCountAtomKind, statedHydrogenCountNotCountedReason,
+  statedHydrogenCountNotCountedText } from "./hydrogenHints";
+export { isTableAbbreviationLabel } from "./abbreviationLabels";
 export { drawnLabelBondSide } from "./labelBondSide";

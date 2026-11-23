@@ -1,5 +1,6 @@
 import { bridgeBondIndices, isDativeBond } from "./bondGraph";
 import { atomicNumberForElementSymbol } from "./elements";
+import { isTableAbbreviationLabel } from "./abbreviationLabels";
 import type { MoleculeAtom, MoleculeBond, MoleculeObject } from "./schemas";
 
 /**
@@ -95,8 +96,8 @@ export function moleculeRadicalCount(atoms: readonly MoleculeAtom[], bonds: read
  *   abbreviation, stating a count other than 0. Decided before the label's literalness and its bonds, so it is a
  *   property of the atom alone.
  * "Naming no element" is read from chem-core's own element table (`statedCountCarrier`), not from a
- * list of placeholder labels; "an abbreviation" from layout-engine's label grammar
- * (`abbreviationLabelReader`), not from a second list.
+ * list of placeholder labels; "an abbreviation" from template-library's abbreviation table, the one
+ * the label grammar reads (`isTableAbbreviationLabel`), not from a second list.
  */
 function statedHydrogenCountUse(
   atom: MoleculeAtom,
@@ -125,7 +126,7 @@ function statedHydrogenCountUse(
  *   dummy atom, a typed "*") or a generic label (A, Q, M, X, an R-group …). Its label draws no
  *   stated hydrogens, the formula counts none, the molfile writes a placeholder with no valence
  *   field and RDKit gives a placeholder no hydrogens;
- * - an abbreviation (OMe, Ph, Bu, CF3 …, as the label grammar reads it): its label, formula and
+ * - an abbreviation (OMe, Ph, Bu, CF3 …: `isTableAbbreviationLabel`): its label, formula and
  *   SMILES read the hydrogens of what it stands for, never a count stated on the atom.
  * Patches store it as written (chem-core never refuses it, so opening, restoring, pasting or undoing
  * a document that holds one always works); the atom validator flags it and an open reports it
@@ -138,30 +139,8 @@ export function atomIgnoresStatedHydrogenCount(atom: MoleculeAtom): boolean {
 }
 
 /**
- * Whether a label reads as an abbreviation (a superatom such as OMe, Ph, Bu, Me, CF3, TMS) rather
- * than an element or an element spelling its hydrogens. That reading belongs to layout-engine's
- * atom-label grammar (`nativeAtomLabelReading`, AGENTS.md §6), which chem-core cannot import:
- * layout-engine depends on chem-core. So the grammar installs it here when it loads
- * (`installAbbreviationLabelReader`), and every process holding the grammar (the app, the CDXML
- * importer, document-workflow-core, the CLI) reads abbreviations by that one decision. chem-core alone
- * (its own tests; the runtime bundled into the published plugin-host SDK) has no reader: there an
- * abbreviation falls back to the element-table rule below, as before.
- */
-export type AbbreviationLabelReader = (label: string) => boolean;
-
-let abbreviationLabelReader: AbbreviationLabelReader | undefined;
-
-/**
- * Install (or, with undefined, remove) the reader `statedCountCarrier` asks whether a label is an
- * abbreviation. layout-engine's label grammar installs it at load; nothing else should.
- */
-export function installAbbreviationLabelReader(reader: AbbreviationLabelReader | undefined): void {
-  abbreviationLabelReader = reader;
-}
-
-/**
  * Which kind of atom counts no stated hydrogens of its own: hydrogen atoms, the unknown atom "*",
- * an abbreviation (its hydrogens come from what it stands for: `abbreviationLabelReader`), and any
+ * an abbreviation (its hydrogens come from what it stands for: `isTableAbbreviationLabel`), and any
  * other label naming no element — no element symbol of chem-core's table starts it (A, Q, M, X,
  * R1). A label an element symbol starts that is no abbreviation ("NH2", "CH3", "NHMe") names that
  * element, and its own text says what hydrogens it has, as a typed label does; it is no carrier.
@@ -170,7 +149,7 @@ function statedCountCarrier(atom: MoleculeAtom): "hydrogen" | "unknown" | "abbre
   if (atom.element === "H" || atom.element === "D" || atom.element === "T") return "hydrogen";
   if (atom.element === "*") return "unknown";
   const label = atom.element.trim();
-  if (atomicNumberForElementSymbol(label) === undefined && abbreviationLabelReader?.(label) === true) return "abbreviation";
+  if (isTableAbbreviationLabel(label)) return "abbreviation";
   const namesElement = atomicNumberForElementSymbol(label.slice(0, 2)) !== undefined ||
     atomicNumberForElementSymbol(label.slice(0, 1)) !== undefined;
   return namesElement ? undefined : "generic";

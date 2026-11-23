@@ -2,9 +2,6 @@ import { applyPatch, applyPatchWithHistory, createDocumentHistory, createEmptyDo
   type DocumentHistory, type DocumentPatch, type DocumentObject, type MoleculeObject, type ReactionObject } from "@chemdraft/chem-core";
 import type { PluginCommandContext, PluginSelectionSnapshot } from "@chemdraft/plugin-api";
 import { describe, expect, it, vi } from "vitest";
-// The app loads layout-engine, whose label grammar tells chem-core which labels are abbreviations
-// (chem-core `installAbbreviationLabelReader`); the plugin host reads it through chem-core.
-import "@chemdraft/layout-engine";
 import { HydrogenCountUnrepresentableReason, PluginHost, PluginHostError, writePatchOps, type PluginPatchApplicationRequest, type RequestHistory } from "./index";
 
 const now = "2026-10-22T00:00:00.000Z";
@@ -629,8 +626,8 @@ describe("direct-write invocation scope", () => {
   });
 
   it("refuses setting hydrogenCount 1 on an OMe abbreviation, naming it, leaving the document and its undo history as they were", async () => {
-    // "An abbreviation" is the label grammar's reading (layout-engine, loaded by the app and imported
-    // above), not a list here. An abbreviation's hydrogens come from what it stands for.
+    // "An abbreviation" is read by chem-core from the abbreviation table (`isTableAbbreviationLabel`),
+    // not a list here, and with no layout-engine loaded. Its hydrogens come from what it stands for.
     const molecule: MoleculeObject = { ...cachedMolecule(), atoms: [...cachedMolecule().atoms, { id: "g", element: "OMe", x: 160, y: 120, formalCharge: 0 }],
       bonds: [...cachedMolecule().bonds, { id: "bg", fromAtomId: "a2", toAtomId: "g", order: "single" }] };
     let history: DocumentHistory = createDocumentHistory(applyPatch(createEmptyDocument({ now }),

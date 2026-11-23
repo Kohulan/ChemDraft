@@ -223,8 +223,8 @@ export const HydrogenCountUnrepresentableReason = "hydrogen_count_unrepresentabl
 /**
  * Refuse a plugin or assistant write that would store a hydrogen count other than 0 on an H, D or T
  * atom, on a label naming no element (the unknown atom "*", a generic label such as A or R1), or on
- * an abbreviation such as OMe or Ph (its hydrogens come from what it stands for, read by the label
- * grammar the app loads): no label, formula or export reads it (chem-core
+ * an abbreviation such as OMe or Ph (its hydrogens come from what it stands for; chem-core reads the
+ * abbreviation table itself, so the published SDK refuses it too): no label, formula or export reads it (chem-core
  * `atomIgnoresStatedHydrogenCount`), so storing it would silently lose what the writer said
  * (AGENTS.md §7). This is the only place such a count is
  * refused. chem-core's patches keep it, because they also replay opening, restoring, pasting,

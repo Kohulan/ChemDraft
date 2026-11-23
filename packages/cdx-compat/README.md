@@ -152,9 +152,9 @@ Synthetic coverage includes biphenyl/Ph, Boc-NH, OTBS, OMe and three independent
   such an atom counts anyway and is not reported. This is chem-core's
   `atomIgnoresStatedHydrogenCount`, read from the same decision as `atomStatedHydrogenCount` (stored,
   but not counted), so no label list decides it: "naming no element" is read from chem-core's element
-  table, and "an abbreviation" from layout-engine's label grammar, which hands chem-core its reading
-  when it loads. The badge, the native open report (`document.atom_hydrogen_count_not_counted`) and
-  the plugin-host refusal share it. A label that names an element and spells its hydrogens (`NH2`,
+  table, and "an abbreviation" from template-library's abbreviation table, which chem-core reads
+  itself (`isTableAbbreviationLabel`, the table the label grammar reads). The badge, the native open
+  report (`document.atom_hydrogen_count_not_counted`) and the plugin-host refusal share it. A label that names an element and spells its hydrogens (`NH2`,
   `CH3`, `NHMe`) states its own count and is not reported.
 
 A value that is not a non-negative integer is not imported and is reported as

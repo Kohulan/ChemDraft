@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { applyPatches, applyPatchWithHistory, atomStatedHydrogenCount, createDocumentHistory, createEmptyDocument, dropOrphanedHydrogenHints,
-  atomIgnoresStatedHydrogenCount, atomWithIgnoredHydrogenCount, ignoredHydrogenCountAtomKind, installAbbreviationLabelReader,
+  atomIgnoresStatedHydrogenCount, atomWithIgnoredHydrogenCount, ignoredHydrogenCountAtomKind, isTableAbbreviationLabel,
   statedHydrogenCountNotCountedReason, statedHydrogenCountNotCountedText, redo, serializeDocument, deserializeDocument, undo, type MoleculeObject } from "./index";
 
 // A pyrrole as CDXML imports it (aromatic ring bonds, the N's NumHydrogens and one carbon's kept),
@@ -493,25 +493,24 @@ describe("a hydrogen count an H, D or T atom cannot carry is stored as written, 
 });
 
 /**
- * Which labels are abbreviations is layout-engine's label grammar's decision, which chem-core cannot
- * import; the grammar installs it (`installAbbreviationLabelReader`). A stand-in reader here pins
- * chem-core's side of that contract; cdx-compat statedHydrogens and plugin-host writeScope run the
- * real grammar.
+ * Which labels are abbreviations chem-core reads from the abbreviation table itself
+ * (`isTableAbbreviationLabel`), the table the label grammar reads, so chem-core alone (this file
+ * loads no layout-engine) decides exactly as the app does; layout-engine labelGrammar pins the two
+ * readings to each other for every spelling.
  */
-describe("a hydrogen count stated on an abbreviation (OMe, Ph): read by the installed label grammar", () => {
+describe("a hydrogen count stated on an abbreviation (OMe, Ph): read from the abbreviation table", () => {
   const atom = (element: string, hydrogenCount?: number, labelLiteral?: true, id = "x") =>
     ({ id, element, x: 0, y: 0, formalCharge: 0, ...(hydrogenCount === undefined ? {} : { hydrogenCount }), ...(labelLiteral ? { labelLiteral } : {}) });
-  const grammarStandIn = (label: string) => ["OMe", "Ph", "Me", "CF3"].includes(label);
-  afterEach(() => installAbbreviationLabelReader(undefined));
 
-  it("with no grammar installed (chem-core alone), an abbreviation reads by the element table, as before", () => {
-    expect([atom("OMe", 2), atom("Ph", 2, true), atom("CF3", 1)].map(atomIgnoresStatedHydrogenCount)).toEqual([false, false, false]);
-    expect(atomIgnoresStatedHydrogenCount(atom("Me", 2))).toBe(true);
-    expect(ignoredHydrogenCountAtomKind(atom("Me", 2))).toBe("a label naming no element");
+  it("reads a table spelling (or alias) that is no element symbol as an abbreviation, and nothing else", () => {
+    expect(["OMe", "MeO", "Ph", "Me", "CF3", "TMS", " OMe "].map(isTableAbbreviationLabel)).toEqual([true, true, true, true, true, true, true]);
+    // Elements (a bonded-only spelling such as "Ac" stays actinium on a stored atom), spelled and
+    // composite labels, generic labels and case-folded misspellings are not.
+    expect(["C", "O", "Ac", "Pr", "Ts", "NH2", "CH3", "NHMe", "OH", "A", "R1", "*", "H", "D", "", "Ome"].map(isTableAbbreviationLabel))
+      .toEqual(new Array(16).fill(false));
   });
 
-  it("flags an abbreviation stating a count other than 0, and nothing else the grammar does not call one", () => {
-    installAbbreviationLabelReader(grammarStandIn);
+  it("flags an abbreviation stating a count other than 0, and nothing else the table does not call one", () => {
     for (const subject of [atom("OMe", 2), atom("Ph", 2, true), atom("CF3", 1), atom("Me", 3, true)]) {
       expect(atomIgnoresStatedHydrogenCount(subject)).toBe(true);
       expect(atomStatedHydrogenCount(subject, [])).toBeUndefined();
@@ -528,14 +527,13 @@ describe("a hydrogen count stated on an abbreviation (OMe, Ph): read by the inst
     expect(atomStatedHydrogenCount(atom("C", 2), [])).toBe(2);
     expect([atom("A", 2, true), atom("*", 2), atom("H", 1)].map(ignoredHydrogenCountAtomKind))
       .toEqual(["a label naming no element", "an unknown atom", "a hydrogen atom"]);
-    // An element symbol is never asked: the grammar reads elements first.
-    installAbbreviationLabelReader(() => true);
-    expect(atomStatedHydrogenCount(atom("C", 2), [])).toBe(2);
+    // An element symbol is never an abbreviation, as the grammar reads elements first: a stored "Ac"
+    // stays actinium.
     expect(atomIgnoresStatedHydrogenCount(atom("N", 1, true))).toBe(false);
+    expect(atomIgnoresStatedHydrogenCount(atom("Ac", 1))).toBe(false);
   });
 
   it("words it as an abbreviation's hydrogens coming from what it stands for, alone, together and beside other kinds", () => {
-    installAbbreviationLabelReader(grammarStandIn);
     expect(statedHydrogenCountNotCountedReason(atom("OMe", 2))).toBe("OMe states 2 H, which is not counted: an abbreviation's hydrogens come from what it stands for.");
     expect(statedHydrogenCountNotCountedReason(atom("A", 2, true))).toBe("A states 2 H, which a label naming no element cannot carry; only 0 counts.");
     expect(statedHydrogenCountNotCountedText([atom("OMe", 1, undefined, "o")])).toBe("atom o (OMe) states 1 hydrogen, but an abbreviation's " +
