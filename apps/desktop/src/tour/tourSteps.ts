@@ -112,7 +112,7 @@ export function tourSteps(
     },
     {
       title: "Save, export, and copy",
-      text: "Save your drawing as a ChemDraft file or export to SVG, PDF, PNG, CDXML, CDX, MOL, or SDF. Copy structures into Office documents."
+      text: "Save your drawing as a ChemDraft file or export to SVG, PDF, PNG, CDXML, CDX, or SDF. Copy structures into Office documents. To copy a molfile, use Edit > Copy As > MOL Text."
     },
     {
       title: "Make it yours",

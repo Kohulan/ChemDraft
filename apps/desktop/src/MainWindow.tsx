@@ -1851,7 +1851,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.22.09.50-opus";
+const CURRENT_BUILD_STAMP = "11.23.09.40-opus";
 
 /**
  * The commit funnel's chemistry check (AGENTS.md section 7, `commitChemistryGuard.ts`). `before`
@@ -19910,9 +19910,13 @@ export function MainWindow({
       clearGraphicGradientDrag(event);
     }
 
+    // Clear on every cancel, previewed or not: documentForFlush saves a live part drag's startDocument,
+    // so a press canceled before the threshold would otherwise keep supplying a stale snapshot to Save.
     const nativePartDrag = nativePartDragRef.current;
-    if (nativePartDrag?.pointerId === event.pointerId && nativePartDrag.dragging) {
-      replacePresentDocument(nativePartDrag.startDocument);
+    if (nativePartDrag?.pointerId === event.pointerId) {
+      if (nativePartDrag.dragging) {
+        replacePresentDocument(nativePartDrag.startDocument);
+      }
       clearNativePartDrag(event);
     }
 
