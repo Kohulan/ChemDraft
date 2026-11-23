@@ -9,6 +9,7 @@ import { readFileSync } from "node:fs";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { DefaultNativeTextStyle, deserializeDocument } from "@chemdraft/chem-core";
+import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { PaletteWindow } from "./PaletteWindow";
 import { allShellCommands } from "./commands";
@@ -24,7 +25,8 @@ import {
 // A plain palette click is routed to the main window through the native `route_toolset_command`
 // invoke (not a DOM event), so capture what the window hands to it.
 const routed = vi.hoisted(() => [] as string[]);
-vi.mock("@tauri-apps/api/core", () => ({
+vi.mock("@tauri-apps/api/core", async original => ({
+  ...await original<typeof import("@tauri-apps/api/core")>(),
   invoke: async (command: string, payload?: { commandId?: string }) => {
     if (command === "route_toolset_command" && payload?.commandId) routed.push(payload.commandId);
   }
@@ -69,9 +71,9 @@ describe("PaletteWindow table inspector", () => {
     vi.restoreAllMocks();
   });
 
-  async function mount(toolsetId: string) {
+  async function mount(toolsetId: string, options?: { resizable: boolean; platform: ShortcutPlatform }) {
     await act(async () => {
-      root.render(createElement(PaletteWindow, { toolsetId }));
+      root.render(createElement(PaletteWindow, { toolsetId, ...options }));
     });
     await act(async () => {
       await Promise.resolve();
@@ -170,31 +172,20 @@ describe("PaletteWindow table inspector", () => {
     expect(container.querySelector('[data-toolbar-style-controls="molecule-inspector"]')).not.toBeNull();
   });
 
-  it.each(["core.drawnStructureSettings", "core.molecularInspector", "core.ringInspector"])(
-    "caps and scrolls the shared body in %s independently of its viewport height", async (toolsetId) => {
-      const availableHeight = vi.spyOn(window.screen, "availHeight", "get").mockReturnValue(600);
-      await mount(toolsetId);
-      await broadcast(tableSnapshot());
-      const body = container.querySelector<HTMLElement>(".palette-window-content")!;
-      expect(body.style.maxHeight).toBe("578px");
-      expect(getComputedStyle(body).overflowY).toBe("auto");
-      expect(container.querySelector(".palette-title")?.parentElement).toBe(body.parentElement);
-      expect(body.contains(container.querySelector(".palette-title"))).toBe(false);
-
-      // Moving to a smaller work area must update the cap; resizing the webview itself must not.
-      availableHeight.mockReturnValue(400);
-      await act(async () => {
-        window.dispatchEvent(new Event("resize"));
-        await new Promise(resolve => setTimeout(resolve, 30));
-      });
-      expect(body.style.maxHeight).toBe("378px");
-      await act(async () => {
-        window.dispatchEvent(new Event("resize"));
-        await new Promise(resolve => setTimeout(resolve, 30));
-      });
-      expect(body.style.maxHeight).toBe("378px");
-    }
-  );
+  describe.each(["macos", "windows"] as const)("resizable inspector layout (%s)", (platform) => {
+    it.each(["core.drawnStructureSettings", "core.molecularInspector", "core.ringInspector"])(
+      "scrolls the body of %s inside the user-sized viewport", async (toolsetId) => {
+        await mount(toolsetId, { resizable: true, platform });
+        const shell = container.querySelector<HTMLElement>("main")!;
+        const body = shell.querySelector<HTMLElement>(".palette-window-content")!;
+        expect(getComputedStyle(shell).height).toBe("100vh");
+        expect(getComputedStyle(body).maxHeight).toBe("none");
+        expect(getComputedStyle(body).overflow).toBe("auto");
+        expect(shell.querySelector(".palette-title")?.parentElement).toBe(shell);
+        expect(body.contains(shell.querySelector(".palette-title"))).toBe(false);
+      }
+    );
+  });
 
   it.each(["three-line", "grid"] as const)("uses shared inspector controls without wrapping labels for %s", async (preset) => {
     await mount("core.drawnStructureSettings");

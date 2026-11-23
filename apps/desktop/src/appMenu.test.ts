@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { describe, expect, it, vi } from "vitest";
+import { NativeStylePresets } from "@chemdraft/chem-core";
 
 import {
   buildAppMenuModel,
@@ -16,6 +17,7 @@ import {
 } from "./appMenu";
 import { pluginItemsForNativeMenu } from "./plugins/nativePluginMenu";
 import { VIBE_CODE_STARTER_COMMAND_ID } from "./commands/vibeCodeStarter";
+import { nativeStylePresetCommandId } from "./commands";
 
 const EMPTY_CONTEXT: AppMenuContext = {
   rulersVisible: true,
@@ -59,6 +61,40 @@ function parseNativeMenuCommandIds(): string[] {
 }
 
 describe("app menu model", () => {
+  it.each([["macos", "app"], ["windows", "help"]] as const)("places About ChemDraft in the %s menu", (platform, sectionId) => {
+    const sections = buildAppMenuModel({ ...EMPTY_CONTEXT, platform });
+    const about = expect.objectContaining({ kind: "command", commandId: "help.about", label: "About ChemDraft", enabled: true });
+    const section = sections.find(section => section.id === sectionId)!;
+    expect(section.items).toContainEqual(about);
+    if (platform === "macos") expect(section.items[0]).toEqual(about);
+    expect(flattenAppMenuCommands(sections).filter(item => item.commandId === "help.about")).toHaveLength(1);
+  });
+
+  it("uses the same routed About command in the native app and Help menus", () => {
+    const native = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+    const macMenu = native.split("fn create_native_app_menu<R: Runtime>")[1]!.split("fn create_page_setup_menu")[0]!;
+    expect(macMenu).toMatch(/&\[\s*&about_menu_item\(app\)\?/);
+    const helpMenu = native.split('"Help",\n                true,')[1]!.split("],")[0]!;
+    expect(helpMenu).toMatch(/#\[cfg\(not\(target_os = "macos"\)\)\]\s*&about_menu_item\(app\)\?/);
+    expect(parseNativeMenuCommandIds()).toContain("help.about");
+  });
+
+  it.each(["macos", "windows"] as const)("keeps a separate plugin alias block after the drawing styles on %s", platform => {
+    const context = { ...EMPTY_CONTEXT, platform };
+    const base = buildAppMenuModel(context).find(section => section.id === "structure")!;
+    const aliases: AppMenuCommand[] = ["first", "second"].map(name => ({
+      kind: "command", id: `menu.test.${name}`, commandId: `plugin.test.${name}`,
+      label: name, enabled: true, pluginContributed: true
+    }));
+    const model = buildAppMenuModel({ ...context, pluginMenuItems: aliases.map(command => ({ location: "structure", command })) });
+    const structure = model.find(section => section.id === "structure")!;
+    expect(base.items.slice(-NativeStylePresets.length)).toEqual(NativeStylePresets.map(preset =>
+      expect.objectContaining({ kind: "command", commandId: nativeStylePresetCommandId(preset.id) })));
+    expect(structure.items.slice(0, base.items.length)).toEqual(base.items);
+    expect(structure.items.slice(base.items.length)).toEqual([expect.objectContaining({ kind: "separator" }), ...aliases]);
+    expect(nativeRoutedCommandIds(model)).toEqual(nativeRoutedCommandIds(buildAppMenuModel(context)));
+  });
+
   it.each(["MacIntel", "Win32"])("shows the counted plugin update notice only for available offers on %s", platform => {
     vi.stubGlobal("navigator", { platform });
     try {
@@ -240,6 +276,7 @@ describe("app menu model", () => {
       "Insert",
       "View",
       "Structure",
+      "Tools",
       "Analyze",
       "Plugins",
       "Help"
@@ -309,6 +346,7 @@ describe("app menu model", () => {
       "Insert",
       "View",
       "Structure",
+      "Tools",
       "Analyze",
       "Plugins",
       "Help"
@@ -364,6 +402,71 @@ describe("app menu model", () => {
   });
 });
 
+describe("native Window and full-screen menus", () => {
+  const source = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+
+  it("uses Tauri's reserved Window menu ID in the shared native builder", () => {
+    const builder = source.split("fn create_app_menu_for_toolsets<R: Runtime>")[1]!.split("/// Close Window")[0]!;
+    const windowMenu = builder.split('"Window",')[1]!.split('"Help",')[0]!;
+    expect(builder).toMatch(/Submenu::with_id_and_items\(\s*app,\s*tauri::menu::WINDOW_SUBMENU_ID,\s*"Window",/);
+    expect(windowMenu).toContain("PredefinedMenuItem::minimize(app, None)");
+    expect(windowMenu).toContain("PredefinedMenuItem::maximize(app, None)");
+    expect(windowMenu).toContain("CLOSE_WINDOW_WINDOW_MENU_ID");
+    // macOS and Windows keep muda's predefined items; Windows keeps the predefined Close Window.
+    expect(windowMenu).toMatch(/#\[cfg\(not\(target_os = "linux"\)\)\]\s*&PredefinedMenuItem::minimize\(app, None\)/);
+    expect(windowMenu).toMatch(/#\[cfg\(not\(target_os = "linux"\)\)\]\s*&PredefinedMenuItem::maximize\(app, None\)/);
+    expect(windowMenu).toMatch(/#\[cfg\(windows\)\]\s*&PredefinedMenuItem::close_window\(app, None\)/);
+    expect(windowMenu.match(/PredefinedMenuItem::(?:minimize|maximize|close_window)\(/g)).toHaveLength(3);
+    // muda leaves the predefined items out of GTK menus, so Linux builds ordinary items instead.
+    expect(windowMenu).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*&linux_window_menu_item\(app, LINUX_MINIMIZE_MENU_ID\)\?/);
+    expect(windowMenu).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*&linux_window_menu_item\(app, LINUX_TOGGLE_MAXIMIZE_MENU_ID\)\?/);
+    expect(windowMenu).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*&linux_window_menu_item\(app, LINUX_CLOSE_WINDOW_WINDOW_MENU_ID\)\?/);
+  });
+
+  it("builds one native full-screen item in View with the current document state on macOS", () => {
+    expect(source.match(/PredefinedMenuItem::fullscreen\(/g)).toHaveLength(1);
+    const builder = source.split("fn create_app_menu_for_toolsets<R: Runtime>")[1]!.split("/// Close Window")[0]!;
+    expect(builder).toContain("let view_menu = create_view_menu(app, entries, view_state, scheme)?;");
+    expect(builder).toMatch(/#\[cfg\(target_os = "macos"\)\]\s*let fullscreen = \{/);
+    expect(builder).toMatch(/let is_fullscreen = main_ns_window\(app\)\s*\.is_some_and\(\|window\| window\.styleMask\(\)\.contains\(NSWindowStyleMask::FullScreen\)\)/);
+    expect(builder).toContain("PredefinedMenuItem::fullscreen(app, Some(fullscreen_menu_title(is_fullscreen)))");
+    expect(builder).toContain("view_menu.append_items(&[&PredefinedMenuItem::separator(app)?, &item])?;");
+    expect(builder).toContain("state.0.lock().unwrap().replace(fullscreen)");
+    const viewMenu = source.split("fn create_view_menu<R: Runtime>")[1]!.split("/// One Toolbars-menu row")[0]!;
+    expect(viewMenu).toMatch(/Submenu::with_items\(\s*app,\s*"View",/);
+  });
+
+  it("retitles the latest item when the document finishes entering or leaving full screen", () => {
+    const observer = source.split("fn observe_document_fullscreen<R: Runtime>")[1]!.split("/// One Toolbars-menu row")[0]!;
+    expect(observer).toContain("(NSWindowDidEnterFullScreenNotification, true)");
+    expect(observer).toContain("(NSWindowDidExitFullScreenNotification, false)");
+    expect(observer).toMatch(/addObserverForName_object_queue_usingBlock\(\s*Some\(notification\),\s*Some\(window\),/);
+    expect(observer).toContain("app.state::<FullscreenMenuItem<R>>();");
+    expect(observer).toContain("let item = state.0.lock().unwrap().clone();");
+    expect(observer).toContain("let title = fullscreen_menu_title(entered);");
+    expect(observer).toMatch(/if current != title \{\s*item\.set_text\(title\)\?;/);
+  });
+
+  it("excludes secondary windows from AppKit's list when they are created", () => {
+    const run = source.split("pub fn run() {")[1]!.split("fn start_macos_primary(")[0]!;
+    const primaryArm = run.split("let builder = if let Some(guard) = primary_lock {")[1]!.split("} else {")[0]!;
+    expect(run).toMatch(/#\[cfg\(target_os = "macos"\)\]\s*let builder = if let Some\(guard\) = primary_lock/);
+    const collectorArm = run.split(primaryArm)[1]!.split("};")[0]!;
+    expect(collectorArm).toContain("builder.enable_macos_default_menu(false)");
+    expect(collectorArm).not.toContain(".menu(");
+    expect(primaryArm).toMatch(/\bbuilder\b[\s\S]*?\.menu\(create_app_menu\)/);
+    expect(run).toMatch(/#\[cfg\(target_os = "macos"\)\]\s*let builder = builder\.manage\(FullscreenMenuItem::<tauri::Wry>\(Mutex::new\(None\)\)\);/);
+    expect(run).toMatch(/#\[cfg\(target_os = "macos"\)\]\s*let builder = builder\.plugin\(\s*tauri::plugin::Builder::<tauri::Wry>::new\("windows-menu"\)\s*\.on_window_ready\(\|window\| \{[\s\S]*?if is_document_window\(window\.label\(\)\) \{\s*observe_document_fullscreen\(window\.app_handle\(\), native\);\s*\} else \{\s*native\.setExcludedFromWindowsMenu\(true\);[\s\S]*?\.build\(\),\s*\);/);
+    expect(run).toMatch(/let builder = builder\.manage\(FullscreenMenuItem::<tauri::Wry>\(Mutex::new\(None\)\)\);[\s\S]*?let builder = builder\.plugin\([\s\S]*?new\("windows-menu"\)[\s\S]*?let app = builder\b[\s\S]*?\.build\(context\)[\s\S]*?app\.run\(/);
+    const takeover = source.split("fn start_macos_primary(")[1]!.split("fn setup_primary_app(")[0]!;
+    expect(takeover).toContain("install_app_menu(app, create_app_menu(app)?)?;");
+    expect(takeover).toMatch(/create_main_window\(app\)\?;\s*setup_primary_app\(app\)/);
+    const sharedSetup = source.split("fn setup_primary_app(")[1]!.split("const DEVELOPMENT_UPDATES_MESSAGE")[0]!;
+    expect(sharedSetup).toMatch(/#\[cfg\(not\(target_os = "macos"\)\)\]\s*if let Err\(error\) = create_app_menu\(app\)\.and_then\(\|menu\| install_app_menu\(app, menu\)\)/);
+    expect(takeover.indexOf("install_app_menu(app, create_app_menu(app)?)?;")).toBeLessThan(takeover.indexOf("create_main_window(app)?;"));
+  });
+});
+
 
 describe("Preferences placement", () => {
   it("keeps native Preferences in the macOS application menu and Windows File menu", () => {
@@ -378,7 +481,7 @@ describe("Preferences placement", () => {
     expect(appMenu.indexOf("&preferences_menu_item(app)?")).toBeLessThan(appMenu.indexOf("PredefinedMenuItem::services"));
     const item = source.split("fn preferences_menu_item<R: Runtime>")[1]!.split("fn create_view_menu")[0]!;
     expect(item).toContain("PREFERENCES_TOGGLE_COMMAND_ID");
-    expect(item).toContain('Some("CmdOrCtrl+,")');
+    expect(item).toContain('native_menu_shortcut(app, PREFERENCES_TOGGLE_COMMAND_ID, "CmdOrCtrl+,")');
     const viewMenu = source.split("fn create_view_menu<R: Runtime>")[1]!.split("fn create_toolbars_menu")[0]!;
     expect(viewMenu).not.toContain("preferences");
     expect(source).toContain('const PREFERENCES_TOGGLE_COMMAND_ID: &str = "view.togglePreferences";');

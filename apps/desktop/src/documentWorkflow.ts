@@ -1,16 +1,41 @@
-import { formulaSpansFromText } from "@chemdraft/document-workflow-core";
+import { bondDrawingToolCommandId } from "./bondToolCommands";
+import { lonePairPlacementPlanForAtom, nativeChargePlacementPointForAtom, nativeRadicalPlacementPointForAtom, nativeChargeMarkSizePx, nativeAtomHitRadiusPx } from "@chemdraft/layout-engine";
+export { nativeChargePlacementPointForAtom, nativeChargeMarkSizePx, nativeAtomHitRadiusPx } from "@chemdraft/layout-engine";
+import {
+  assertMolfileExportIdentity, type ComputeStructureIdentifiers, moleculeToInteropMolfile,
+  atomProblem, readNativeDocumentContents, formulaSpansFromText,
+  nativeElectronMarkAtomKey, nativeElectronMarkAssignments, electronMarkAtomContribution, isEditableNativeMoleculeGraph,
+  nativeChargeValue, nativeChargeMarkCenter, nativeChargeAssociationRadiusPx, nativeChargeMarkMaxMagnitude,
+  type NativeElectronMarkAssignmentOptions
+} from "@chemdraft/document-workflow-core";
+export {
+  isEditableNativeMoleculeGraph, nativeChargeMarkCenter, nativeChargeAssociationRadiusPx, nativeChargeMarkMaxMagnitude,
+  electronMarkAtomContribution
+} from "@chemdraft/document-workflow-core";
+import { loadDirectElectronMarkEditing } from "./electronMarkEditingSettings";
+import { identifiersWithMolfileStereo, sourceCoordinateWarnings } from "./documentWorkflow.molfileStereo";
+import { bracketVisualBounds } from "@chemdraft/layout-engine";
+import { repeatUnits, repeatUnitExportWarnings, repeatUnitMolfileGroups } from "@chemdraft/export-engine";
 import { nativeMoleculeLayoutQuality } from "./depiction2d/layoutQuality";
 import { planObjectArrangement, moleculeAnchorForArrangement, moleculeVisualBoundsForArrangement, textVisualBoundsForArrangement, type ArrangementLayout, type ArrangementOptions, type ArrangementItem, type LayoutBounds } from "@chemdraft/layout-engine";
+import { combinedLayoutBounds, planObjectAlignment, planObjectDistribution, type ObjectAlignMode, type ObjectDistributeAxis, type ObjectDistributeMode } from "@chemdraft/layout-engine";
+import { nativeFormattedTextObjectSize, reconcileReactionArrowAttachments } from "@chemdraft/document-workflow-core";
+import { withArrowAttachmentIds } from "@chemdraft/layout-engine";
 import { snapRotationDegrees } from "./rotationSnap";
 import { snapPlacementDegrees } from "./placementSnap";
 import { nativeTemplateForToolCommand as sharedTemplateForToolCommand } from "./ringTemplates";
 import { projectedDoubleBondSides } from "./interaction/projectedDoubleBondSides";
 import { buildTableObject, pageConstrainedShift } from "@chemdraft/document-workflow-core";
-import { planTableLayout, tableVisualBoundsForArrangement, transformPointForObject } from "@chemdraft/layout-engine";
+import { planTableLayout, planTextObjectPlacement, tableVisualBoundsForArrangement, textAutoSizePageLimits, transformPointForObject, rotatedGraphicLocalBounds } from "@chemdraft/layout-engine";
 import { validTableDimensions, type TableInsertDimensions } from "./dialogs/insertTableOptions";
 import { doubleBondStereoState, perceivedSpecifiedDoubleBondIds } from "./interaction/doubleBondStereo";
+import { separateProjectedStereoLigands, serializeSpin3dMolfile, type Spin3dStereoIssue, type Spin3dStereoReference } from "./interaction/spin3dStereo";
+import { projectPoint } from "./interaction/rotation3d";
+import { loadDrawingSettings } from "./drawingSettings";
+import { moleculeAtomChemistryChanges } from "./commitChemistryGuard";
 import type { storedCoordinatesMatchStereo } from "@chemdraft/ocl-adapter";
 import type { DoubleBondStereoReader } from "./interaction/doubleBondStereo";
+import { nativeDocumentExportWarnings, nativeMoleculeExportWarnings } from "@chemdraft/document-workflow-core";
 import {
   GRAPHIC_CORNER_RADIUS_HANDLE_SIZE_PX,
   OBJECT_RESIZE_HANDLE_OFFSET_PX,
@@ -19,6 +44,9 @@ import {
   rotatedGraphicLocalBounds as rotatedGraphicFrameBounds
 } from "./graphicHandleGeometry";
 import {
+  graphicWaveSettings,
+  waveSettingRanges,
+  type WaveSetting,
   editGraphicMarkerSize,
   snapGraphicMarkerSizePx,
   clampGraphicShaftMarkSizePx,
@@ -54,12 +82,21 @@ import {
 } from "@chemdraft/art-engine";
 import {
   adoptDerivedDocument,
+  toEngineDocument,
+  copyNativeObjectExtensions,
+  preservedNativeChemistryValues,
+  readDocument,
+  serializeDocument,
+  bracketChemistryWarnings,
+  bracketPairs,
+  withoutBracketPairMetadata,
+  moleculeBracketWarningMessages,
+  resolveRepeatUnitAtomMembership,
   applyPatch,
   applyPatches,
   ChemDraftSyntheticStylePreset,
   createEmptyDocument,
   createImageGraphicObject,
-  DocumentObjectSchema,
   createPageLayout,
   createCustomPageLayout,
   cssPxToPageSize,
@@ -86,6 +123,7 @@ import {
   type ChemDraftDocument,
   type ChemicalMetadata,
   type CompatibilityWarning,
+  remapImportedRepeatUnitAfterMoleculeMerge,
   type DocumentPatch,
   type DocumentObject,
   type DocumentPage,
@@ -120,6 +158,7 @@ import {
 import {
   exportDocumentToCdxml as exportDocumentToCdxmlEnvelope,
   openChemDraftPayload,
+  importCdx,
   type ChemDraftOpenResult,
   type CompatibilityConversionWarning
 } from "@chemdraft/cdx-compat";
@@ -128,6 +167,7 @@ import type { EditorSaveResult } from "@chemdraft/editor-adapter";
 import type { ScreenPlacement } from "./interaction/spinOverlay";
 import {
   exportDocumentToCdxml as exportDocumentToCdxmlText,
+  ensureSvgFontsLoaded,
   exportDocumentToSvg,
   type BinaryExportResult,
   type ExportWarning,
@@ -138,6 +178,7 @@ import {
   type TextExportResult
 } from "@chemdraft/export-engine";
 import {
+  atomPairOverlaps,
   compareLayoutQuality,
   layoutAtomAndLabelDefects,
   repairBridgedLayoutContacts,
@@ -213,7 +254,6 @@ import {
   nativeAtomLabelFreeValence,
   nativeAtomLabelContextInMolecule,
   type LabelOnBondedAtomDecision,
-  nativeAtomChargeSupportsValence,
   nativeAtomFormalChargeForValence,
   nativeAtomValence,
   nativeAtomValidationState,
@@ -225,7 +265,6 @@ import {
   nativeComponents,
   type NativeDoubleBondSide,
   nativeElementFromAtomLabel,
-  nativeLabelGroupVerdict,
   nativeAtomLabelReading,
   nativeLabelBondSide,
   nativeLabelReadingDependsOnBondSide,
@@ -348,6 +387,13 @@ export interface ChemDraftSelectionClipboardPayload {
   objects: DocumentObject[];
   selectionIds: string[];
   bounds: SelectionBounds;
+  warnings?: string[];
+  /** In-memory source state. Serialized clipboard objects carry the reconstructed native values
+   * and version headers instead, and are validated by the native reader when received. */
+  nativeSource?: ChemDraftDocument;
+  formatVersion?: string;
+  minAppVersion?: string;
+  ignorableFields?: string[];
 }
 
 export interface NativeTextSelectionRange {
@@ -735,6 +781,7 @@ function artArcTool(
 
 export interface NativeBondToolOptions {
   bondOrder?: NativeBondOrderValue;
+  bondStereo?: "either";
   bondStyle?: NativeBondDisplayStyle;
   /** Told why the tool refused to place the bond, so the caller can say so instead of guessing. */
   onRefusal?: (reason: string) => void;
@@ -835,24 +882,17 @@ export const documentObjectProjectedPlaneTiltMaxDegrees = projectedPlaneTiltMaxD
 
 export const projectedPlaneTiltMaxRadians = projectedPlaneTiltMaxDegrees * Math.PI / 180;
 
-export const nativeAtomHitRadiusPx = 8;
-export const nativeChargeMarkSizePx = 18;
-export const nativeChargeAssociationRadiusPx = nativeBondLengthPx * 1.15;
-/** Stacking the charge tool tops out here — beyond ±9 is a typo, not chemistry. */
-export const nativeChargeMarkMaxMagnitude = 9;
-
 const nativeBondLength = nativeBondLengthPx;
 const nativeCarbonSingleBondLengthAngstrom = 1.56;
 const atomHitRadius = nativeAtomHitRadiusPx;
 const bondHitRadius = 4;
-const nativeAtomInvalidGrowthLimit = 8;
 const freeformMinimumBondLength = 4.5;
 const freeformCustomLengthBreakawayDistance = nativeBondLength * 1.4;
 
 export const nativeSingleLetterElements = ["H", "B", "C", "N", "O", "F", "P", "S", "I"] as const;
 export type NativeSingleLetterElement = typeof nativeSingleLetterElements[number];
 /** Elements reachable by keyboard hotkey. The single letters type themselves in the ChemDraft
- *  scheme; the two-letter symbols are reachable through the ChemDraw-compatible scheme's hover
+ *  scheme; the two-letter symbols are reachable through the classic desktop-compatible scheme's hover
  *  hotkeys (b→Br, C/l→Cl, L→Li, S→Si) and through command-bound toolbar buttons. */
 export const nativeHotkeyElements = [...nativeSingleLetterElements, "Cl", "Br", "Li", "Si"] as const;
 export type NativeHotkeyElement = typeof nativeHotkeyElements[number];
@@ -995,11 +1035,15 @@ export function createNativeSingleBondMolecule(
     fromAtomId: leftAtom.id,
     toAtomId: rightAtom.id,
     order: options.bondOrder ?? "single",
-    ...nativeBondDisplayObject(options.bondStyle)
+    ...(options.bondOrder === "double" && options.bondStereo === "either" ? { stereo: "either" as const } : {}),
+    ...nativeBondDisplayObject(options.bondStyle),
+    ...(options.bondOrder === "double" && loadDrawingSettings().defaultDoubleBond === "centred"
+      ? { display: { ...nativeBondDisplayObject(options.bondStyle).display, doubleBondSide: "center" as const } }
+      : {})
   }] satisfies MoleculeBond[];
   const geometry = moleculeGeometryFromAtoms(atoms);
 
-  return normalizeNativeMoleculeGeometry({
+  const molecule = normalizeNativeMoleculeGeometry({
     id: nextObjectId(document, "mol_bond"),
     type: "molecule",
     x: geometry.x,
@@ -1026,6 +1070,7 @@ export function createNativeSingleBondMolecule(
     superatoms: [],
     rGroups: []
   });
+  return options.bondStereo === "either" ? withStoredBondStereoMolfile(molecule) : molecule;
 }
 
 export function insertNativeSingleBondMolecule(
@@ -1420,10 +1465,15 @@ export function applyNativeChainTool(
 }
 
 export function nativeBondOrderForToolCommand(commandId: string): NativeBondOrderValue {
-  return commandId === "tool.doubleBond" ? "double" : commandId === "tool.tripleBond" ? "triple" : "single";
+  return commandId === "tool.doubleBond" || nativeBondStereoForToolCommand(commandId) === "either" ? "double" : commandId === "tool.tripleBond" ? "triple" : "single";
+}
+
+export function nativeBondStereoForToolCommand(commandId: string): "either" | undefined {
+  return commandId === bondDrawingToolCommandId("double", "either") ? "either" : undefined;
 }
 
 export function nativeBondStyleForToolCommand(commandId: string): NativeBondToolStyle | undefined {
+  if (nativeBondStereoForToolCommand(commandId)) return "solid";
   switch (commandId) {
     case "tool.bond":
     case "tool.doubleBond":
@@ -1433,6 +1483,8 @@ export function nativeBondStyleForToolCommand(commandId: string): NativeBondTool
       return "wedge";
     case "tool.hashedBond":
       return "hashed";
+    case "tool.wavyBond":
+      return "wavy";
     case "tool.dashedBond":
       return "dashed";
     case "tool.boldBond":
@@ -3132,10 +3184,6 @@ export type NativeTemplatePlacementPlan = {
 export type NativeTemplateFallbackReason =
   | "structure-not-editable"
   | "target-unavailable"
-  | "atom-no-free-valence"
-  | "bond-atom-no-free-valence"
-  | "closure-atom-no-free-valence"
-  | "double-bond-overfill"
   | "bond-cannot-accept";
 
 /** Compute a previewable plan; refused placements have no preview. */
@@ -3182,15 +3230,9 @@ export function nativeTemplatePlacementResult(
         document,
         point,
         templateId,
-        nativeRingTargetFailureValenceReason(molecule, target)
-          ?? (target.kind === "bond" ? "bond-cannot-accept" : "target-unavailable")
+        target.kind === "bond" ? "bond-cannot-accept" : "target-unavailable"
       ) };
     }
-    const valenceRefusal = nativeRingPlacementValenceRefusal(molecule, nextMolecule, target);
-    if (valenceRefusal) {
-      return { plan: standaloneNativeTemplateFallbackPlan(document, point, templateId, valenceRefusal) };
-    }
-
     const existingAtomIds = new Set(molecule.atoms.map((atom) => atom.id));
     const existingBondIds = new Set(molecule.bonds.map((bond) => bond.id));
     const addedAtomIds = nextMolecule.atoms.filter((atom) => !existingAtomIds.has(atom.id)).map((atom) => atom.id);
@@ -3220,104 +3262,6 @@ export function nativeTemplatePlacementResult(
     addedAtomIds: molecule.atoms.map((atom) => atom.id),
     addedBondIds: molecule.bonds.map((bond) => bond.id)
   } };
-}
-
-/** Why a ring placement is refused for valence: the outcome {@link nativeRingPlacementValenceRefusal} reports. */
-type NativeRingValenceRefusal = Extract<
-  NativeTemplateFallbackReason,
-  "atom-no-free-valence" | "bond-atom-no-free-valence" | "closure-atom-no-free-valence" | "double-bond-overfill"
->;
-
-/**
- * The one valence guard for every placement that closes or adds a ring on an existing molecule
- * (bond fusion, closure onto a neighbouring ring, spiro attachment, the cyclic-bond closure;
- * clicks, previews and hotkeys alike). It judges the RESULT, not a prediction: every pre-existing
- * atom whose valence use (bond orders plus radicals) rose must still be supported at its element
- * and formal charge. Atoms whose valence use did not rise are not the placement's doing, and
- * group or spelled labels ("OMe", "NMe") are judged by their free valence, element labels by their
- * element, and labels with no free valence (generic R, a bare formula, unrecognized text) pass.
- * The reason names the most direct culprit: the target atom itself (an atom target) or an
- * endpoint of the target bond; else an existing atom that gained a new bond (a closure atom);
- * else an atom whose valence rose only because an aromatic template's double-bond re-pairing
- * raised one of its existing bonds. Returns undefined when the placement is chemically sound.
- */
-function nativeRingPlacementValenceRefusal(
-  before: MoleculeObject,
-  after: MoleculeObject,
-  target: NativeMoleculeDeleteTarget
-): NativeRingValenceRefusal | undefined {
-  const beforeById = new Map(before.atoms.map((atom) => [atom.id, atom]));
-  const overValentAtomIds = after.atoms.filter((atom) => {
-    const previous = beforeById.get(atom.id);
-    if (!previous) {
-      return false;
-    }
-    const usage = nativeAtomValenceUsage(after, atom);
-    return usage > nativeAtomValenceUsage(before, previous) && !nativeAtomSupportsValenceUsage(after, atom, usage);
-  }).map((atom) => atom.id);
-  if (overValentAtomIds.length === 0) {
-    return undefined;
-  }
-  if (target.kind === "atom" && overValentAtomIds.includes(target.atomId)) {
-    return "atom-no-free-valence";
-  }
-  if (target.kind === "bond") {
-    const bond = before.bonds.find((candidate) => candidate.id === target.bondId);
-    if (overValentAtomIds.some((atomId) => atomId === bond?.fromAtomId || atomId === bond?.toAtomId)) {
-      return "bond-atom-no-free-valence";
-    }
-  }
-  const bondCount = (molecule: MoleculeObject, atomId: string) =>
-    molecule.bonds.filter((bond) => bond.fromAtomId === atomId || bond.toAtomId === atomId).length;
-  return overValentAtomIds.some((atomId) => bondCount(after, atomId) > bondCount(before, atomId))
-    ? "closure-atom-no-free-valence"
-    : "double-bond-overfill";
-}
-
-/**
- * When a ring could not be drawn at its target at all, whether the target's atoms were also too
- * full to take the bonds any ring there would add: a fused ring adds one bond at each endpoint of
- * the target bond, and a spiro ring at least two single bonds at its atom. A full atom is the
- * definitive reason (no other spot on the same target could work), so it wins over the geometry
- * reason. This only names the failure; it never refuses a placement, so it cannot overrule the
- * result guard ({@link nativeRingPlacementValenceRefusal}). Group or spelled labels ("OMe", "NMe")
- * are judged by their free valence, element labels by their element, and labels with no free
- * valence (generic R, a bare formula, unrecognized text) pass.
- */
-function nativeRingTargetFailureValenceReason(
-  molecule: MoleculeObject,
-  target: NativeMoleculeDeleteTarget
-): "atom-no-free-valence" | "bond-atom-no-free-valence" | undefined {
-  const isFull = (atomId: string | undefined, added: number) => {
-    const atom = molecule.atoms.find((candidate) => candidate.id === atomId);
-    return atom !== undefined && !nativeAtomSupportsValenceUsage(molecule, atom, nativeAtomValenceUsage(molecule, atom) + added);
-  };
-  if (target.kind === "atom") {
-    return isFull(target.atomId, 2) ? "atom-no-free-valence" : undefined;
-  }
-  const bond = molecule.bonds.find((candidate) => candidate.id === target.bondId);
-  return bond && (isFull(bond.fromAtomId, 1) || isFull(bond.toAtomId, 1)) ? "bond-atom-no-free-valence" : undefined;
-}
-
-/**
- * Whether the atom admits this valence use at its formal charge. A group or spelled label (#83:
- * "OMe", "NMe") is judged by its free valence, so a one-bond "OMe" is full; an element
- * label by its element; a label with no free valence (generic R, a bare formula, unrecognized
- * text) passes, as every valence check skips it. The label is read with the drawing tools' context
- * (`nativeAtomLabelContextInMolecule`), so an "SCN" with its bond on the right is a bare formula here too.
- */
-function nativeAtomSupportsValenceUsage(molecule: MoleculeObject, atom: MoleculeAtom, usage: number): boolean {
-  const bonded = molecule.bonds.some((bond) => bond.fromAtomId === atom.id || bond.toAtomId === atom.id);
-  const context = nativeAtomLabelContextInMolecule(atom, molecule, bonded);
-  const freeValence = nativeAtomLabelFreeValence(atom.element, atom.formalCharge, context);
-  if (freeValence !== undefined) {
-    return usage <= freeValence;
-  }
-  if (nativeAtomLabelReading(atom.element, context).kind === "generic") {
-    return true;
-  }
-  const element = nativeElementFromAtomLabel(atom.element);
-  return !element || nativeAtomChargeSupportsValence(element, usage, atom.formalCharge);
 }
 
 function standaloneNativeTemplateFallbackPlan(
@@ -3646,7 +3590,6 @@ function fuseNativeTemplateRingVerticesToBond(
   const sharedAtomIds = new Set([fromAtom.id, toAtom.id]);
   const resolvedSlots: Array<{ id: string } | { vertex: PagePoint }> = [];
   const reusedAtomIds = new Set<string>();
-  let closedOntoExisting = false;
   for (const vertex of vertices.slice(2)) {
     const snapped = nearestExistingAtomWithin(molecule, vertex, nativeTemplateClosureSnapPx);
     if (snapped) {
@@ -3657,7 +3600,6 @@ function fuseNativeTemplateRingVerticesToBond(
       }
       reusedAtomIds.add(snapped.id);
       resolvedSlots.push({ id: snapped.id });
-      closedOntoExisting = true;
     } else {
       resolvedSlots.push({ vertex });
     }
@@ -3725,13 +3667,6 @@ function fuseNativeTemplateRingVerticesToBond(
     return undefined;
   }
 
-  // Guard the closure (only when a vertex actually snapped, so plain fusion is untouched): on the
-  // single-bond skeleton — BEFORE aromatic normalization, which can otherwise make a fused
-  // junction look invalid — no existing carbon may exceed degree 3 for a ring-template closure.
-  if (closedOntoExisting && nativeClosureExceedsDegreeCap(molecule, newBonds)) {
-    return undefined;
-  }
-
   const fused = refreshNativeSingleBondGraph(
     molecule,
     [...molecule.atoms, ...newAtoms],
@@ -3745,8 +3680,7 @@ function fuseNativeTemplateRingVerticesToBond(
 // a true closure — whose proposed vertices land essentially on an existing atom — merges.
 // NB: this assumes template-spaced geometry. An imported or heavily distorted molecule with atoms
 // closer than this radius could let a plain fusion vertex merge onto an unrelated atom;
-// nativeClosureExceedsDegreeCap rejects the over-connecting cases, but deriving the radius from the
-// actual nearest-neighbour spacing would be more robust if that ever bites.
+// Deriving the radius from actual nearest-neighbour spacing could improve such imported geometry.
 const nativeTemplateClosureSnapPx = nativeBondLength * 0.2;
 
 function nearestExistingAtomWithin(
@@ -3773,22 +3707,6 @@ function nativeBondExistsBetween(molecule: MoleculeObject, fromAtomId: string, t
   );
 }
 
-// True when adding `newBonds` would push any pre-existing carbon past degree 3 on the single-bond
-// skeleton — the signature of a bad closure merge (e.g. snapping that folds the ring onto itself).
-function nativeClosureExceedsDegreeCap(molecule: MoleculeObject, newBonds: readonly MoleculeBond[]): boolean {
-  const degree = new Map<string, number>();
-  const bump = (atomId: string) => degree.set(atomId, (degree.get(atomId) ?? 0) + 1);
-  molecule.bonds.forEach((bond) => {
-    bump(bond.fromAtomId);
-    bump(bond.toAtomId);
-  });
-  newBonds.forEach((bond) => {
-    bump(bond.fromAtomId);
-    bump(bond.toAtomId);
-  });
-  return molecule.atoms.some((atom) => (degree.get(atom.id) ?? 0) > 3);
-}
-
 /** Keep the preferred attachment exactly when it fits; otherwise try complete alternate rings. */
 function attachNativeTemplateRingToAtomOnPage(
   molecule: MoleculeObject,
@@ -3798,10 +3716,7 @@ function attachNativeTemplateRingToAtomOnPage(
   page: ChemDraftDocument["pages"][number]
 ): { molecule?: MoleculeObject; refusal?: "sprout-page-edge" } {
   const preferred = attachNativeTemplateRingToAtom(molecule, atomId, point, templateId);
-  // Preserve the existing geometry/valence refusals (including separate-placement tool fallbacks).
-  if (!preferred || nativeRingPlacementValenceRefusal(molecule, preferred, {
-    objectId: molecule.id, kind: "atom", atomId, distanceToPointer: 0
-  })) return { molecule: preferred };
+  if (!preferred) return {};
 
   const existingAtomIds = new Set(molecule.atoms.map((atom) => atom.id));
   const pageBounds = { x: 0, y: 0, width: page.width, height: page.height };
@@ -3895,12 +3810,12 @@ function attachNativeTemplateRingToAtom(
     } satisfies MoleculeBond;
   });
 
-  const attached = refreshNativeSingleBondGraph(
+  // This ring shares only a vertex. Its template already assigns the alternating bonds.
+  return refreshNativeSingleBondGraph(
     molecule,
     [...molecule.atoms, ...newAtoms],
     [...molecule.bonds, ...newBonds]
   );
-  return templateId === "benzene" ? normalizeNativeAromaticTemplateBonds(attached) : attached;
 }
 
 function isNativeChairTemplate(templateId: NativeMoleculeTemplateId): boolean {
@@ -4731,7 +4646,8 @@ export interface TextToAtomLabelResult {
 function nativeTextObjectToAtomLabelTarget(
   document: ChemDraftDocument,
   objectId: string,
-  hitRadius: number
+  hitRadius: number,
+  placementPoint?: PagePoint
 ): { text: TextObject; target?: NativeMoleculeDeleteTarget; molecule?: MoleculeObject } | undefined {
   const page = firstPage(document);
   const text = page.objects.find((object): object is TextObject => object.id === objectId && object.type === "text");
@@ -4740,7 +4656,7 @@ function nativeTextObjectToAtomLabelTarget(
   }
   const nearest = page.objects.flatMap((object, layerIndex) => {
     if (object.type !== "molecule") return [];
-    const hit = findNearestAtomAtPoint({ atoms: object.atoms, point: text, hitRadius });
+    const hit = findNearestAtomAtPoint({ atoms: object.atoms, point: placementPoint ?? text, hitRadius });
     return hit ? [{ object, hit, layerIndex }] : [];
   }).sort((left, right) => left.hit.distance - right.hit.distance || right.layerIndex - left.layerIndex)[0];
   return {
@@ -4797,9 +4713,10 @@ export function selectedTextToAtomLabelDisabledReason(document: ChemDraftDocumen
 export function convertNativeTextObjectToAtomLabel(
   document: ChemDraftDocument,
   objectId: string,
-  hitRadius = nativeAtomHitRadiusPx
+  hitRadius = nativeAtomHitRadiusPx,
+  placementPoint?: PagePoint
 ): TextToAtomLabelResult {
-  const candidate = nativeTextObjectToAtomLabelTarget(document, objectId, hitRadius);
+  const candidate = nativeTextObjectToAtomLabelTarget(document, objectId, hitRadius, placementPoint);
   if (!candidate) {
     return { document, disabledReason: "Select one text box" };
   }
@@ -4838,18 +4755,29 @@ export function selectedTextToAtomLabelResult(document: ChemDraftDocument): Text
     : result;
 }
 
+/** Exact elements and case-sensitive groups may auto-convert; groups need an atom target. */
+export function canAutoConvertNativeTextObjectToAtom(document: ChemDraftDocument, objectId: string): boolean {
+  const object = firstPage(document).objects.find((candidate) => candidate.id === objectId);
+  if (object?.type !== "text" || object.text.length === 0 || object.text !== object.text.trim()) return false;
+  return nativeElementFromAtomLabel(object.text) === object.text ||
+    nativeAtomLabelReading(object.text, { bonded: true }).kind === "group";
+}
+
 /**
  * Text anchored on an atom uses the literal label editor's path. In open space, keep the
- * existing exact-element conversion: a one-atom molecule at the text box's center. Other text
+ * existing exact-element conversion: a one-atom molecule centered on the edited text frame. Other text
  * stays text. A bare covalent-table element is valence-flagged until it gains enough bonds.
  */
 export function convertNativeTextObjectToAtom(
   document: ChemDraftDocument,
   objectId: string,
-  options: { skipAtomLabel?: boolean } = {}
+  options: { skipAtomLabel?: boolean; placementPoint?: PagePoint } = {}
 ): ChemDraftDocument {
+  if (!canAutoConvertNativeTextObjectToAtom(document, objectId)) {
+    return document;
+  }
   if (!options.skipAtomLabel) {
-    const labelResult = convertNativeTextObjectToAtomLabel(document, objectId);
+    const labelResult = convertNativeTextObjectToAtomLabel(document, objectId, undefined, options.placementPoint);
     if (labelResult.target) {
       return labelResult.document;
     }
@@ -4858,15 +4786,12 @@ export function convertNativeTextObjectToAtom(
   const object = page.objects.find((candidate): candidate is TextObject =>
     candidate.id === objectId && candidate.type === "text"
   );
-  if (!object) {
+  // A group belongs on an existing atom; only an exact element can become a naked atom.
+  if (!object || nativeElementFromAtomLabel(object.text) !== object.text) {
     return document;
   }
 
-  const raw = object.text.trim();
-  const normalized = normalizeNativeAtomElementLabel(raw);
-  if (raw.length === 0 || nativeElementFromAtomLabel(normalized) === undefined) {
-    return document;
-  }
+  const normalized = object.text;
 
   const center = { x: object.x + object.width / 2, y: object.y + object.height / 2 };
   const atom: MoleculeAtom = {
@@ -4922,7 +4847,8 @@ export function convertNativeTextObjectToAtom(
 
 const bracketKindByToolCommandId: ReadonlyMap<string, BracketObject["bracketKind"]> = new Map([
   ["tool.bracket", "curly"],
-  ["tool.squareBracket", "square"]
+  ["tool.squareBracket", "square"],
+  ["tool.roundBracket", "round"]
 ]);
 
 export function bracketKindForToolCommand(commandId: string): BracketObject["bracketKind"] | undefined {
@@ -4931,40 +4857,65 @@ export function bracketKindForToolCommand(commandId: string): BracketObject["bra
 
 export const nativeBracketDefaultSize = { width: 16, height: 64 } as const;
 
-/** Click placement: a default-size bracket centered on the click point, clamped to the page. */
+/** One glyph per native object; both members are added and selected in one patch batch. */
 export function insertNativeBracket(
   document: ChemDraftDocument,
   point: PagePoint,
-  bracketKind: BracketObject["bracketKind"]
+  bracketKind: BracketObject["bracketKind"],
+  end?: PagePoint
 ): ChemDraftDocument {
   const page = firstPage(document);
-  const { width, height } = nativeBracketDefaultSize;
+  const pair = nativeBracketPairForDrag(document, page, point, bracketKind, end);
+  return applyPatches(document, [
+    ...pair.map(object => ({ op: "addObject" as const, pageId: page.id, object })),
+    { op: "setSelection", pageId: page.id, objectIds: pair.map(object => object.id) }
+  ], { now: phase4Timestamp });
+}
+
+/** Shared placement and enclosure for drawn pairs and pairs created around atom selections. */
+export function nativeBracketPairForDrag(
+  document: ChemDraftDocument,
+  page: DocumentPage,
+  point: PagePoint,
+  bracketKind: BracketObject["bracketKind"],
+  end?: PagePoint
+): [BracketObject, BracketObject] {
+  // Keep the requested placement and dimensions. The shared page-fit commit asks before
+  // enlarging the page; Keep Page Size must not squeeze or move the bracket pair.
+  const left = end ? Math.min(point.x, end.x) : point.x - 40;
+  const top = end ? Math.min(point.y, end.y) : point.y - nativeBracketDefaultSize.height / 2;
+  const boxWidth = Math.max(end ? Math.abs(end.x - point.x) : 80, 2);
+  const height = Math.max(end ? Math.abs(end.y - point.y) : nativeBracketDefaultSize.height, 2);
+  const width = Math.min(nativeBracketDefaultSize.width, boxWidth / 3);
+  const containedObjectIds = page.objects.filter(object => object.type !== "bracket" &&
+    object.x >= left && object.y >= top && object.x + object.width <= left + boxWidth &&
+    object.y + object.height <= top + height).map(object => object.id);
+  const allocateId = pendingObjectIdAllocator(document);
+  const pairId = nextIndexedId("bracket_pair", page.objects.flatMap(object =>
+    object.type === "bracket" && object.pairId ? [object.pairId] : []));
   const object: BracketObject = {
-    id: nextObjectId(document, "bracket"),
+    id: allocateId("bracket"),
     type: "bracket",
-    x: clamp(point.x - width / 2, 0, Math.max(0, page.width - width)),
-    y: clamp(point.y - height / 2, 0, Math.max(0, page.height - height)),
+    x: left,
+    y: top,
     width,
     height,
     rotation: 0,
     style: {},
     bracketKind,
-    containedObjectIds: [],
+    side: "open",
+    pairId,
+    containedObjectIds,
     compatibility: {
       sourceFormat: "chemdraft-native",
       warnings: [],
       unknown: {}
     }
   };
+  const closing: BracketObject = { ...object, id: allocateId("bracket"),
+    x: left + boxWidth - width, side: "close" };
 
-  return applyPatches(
-    document,
-    [
-      { op: "addObject", pageId: page.id, object },
-      { op: "setSelection", pageId: page.id, objectIds: [object.id] }
-    ],
-    { now: phase4Timestamp }
-  );
+  return [object, closing];
 }
 
 const reactionArrowKindByToolCommandId: ReadonlyMap<string, ArrowObject["arrowKind"]> = new Map([
@@ -5103,7 +5054,7 @@ export function createNativeMolfileMolecule(
 
   const page = firstPage(document);
   const { bondLengthPx, objectStyle } = documentDrawingDefaults(document);
-  const atoms = scaleParsedMolfileAtoms(graph, point, page, bondLengthPx).map((atom) => ({
+  const atoms = scaleParsedMolfileAtoms(graph, point, page, bondLengthPx, true, "median").map((atom) => ({
     id: atom.id,
     element: atom.element,
     ...(atom.isotope === undefined ? {} : { isotope: atom.isotope }),
@@ -5219,7 +5170,8 @@ export function insertSmilesMoleculeGrid(
   const objects = molecules.map((molecule, index) => translatedClipboardObject(
     molecule,
     start.x + (index % columns) * cellWidth + (cellWidth - molecule.width) / 2 - molecule.x,
-    start.y + Math.floor(index / columns) * cellHeight + (cellHeight - molecule.height) / 2 - molecule.y
+    start.y + Math.floor(index / columns) * cellHeight + (cellHeight - molecule.height) / 2 - molecule.y,
+    nextDocument
   ));
   const objectIds = objects.map((object) => object.id);
   nextDocument = applyPatches(nextDocument, [
@@ -5236,13 +5188,21 @@ export function visibleSkippedItems<T>(skippedItems: readonly T[]): T[] {
 export function insertSmilesMoleculeGridStatus(
   result: ReturnType<typeof insertSmilesMoleculeGrid>,
   skipped: number,
-  skippedItems: readonly { line: number; token: string; reason?: string }[] = []
+  skippedItems: readonly { line: number; token: string; reason?: string }[] = [],
+  outcome: { document: ChemDraftDocument; decision: "fits" | "enlarge" | "keep"; overflowObjectIds: readonly string[] } =
+    { document: result.document, decision: "fits", overflowObjectIds: [] }
 ): string {
   let status = `Pasted ${result.objectIds.length} SMILES structures in a ${result.columns} × ${result.rows} grid`;
-  if (result.pageResized) {
-    const page = firstPage(result.document);
+  if (outcome.decision === "enlarge") {
+    const page = firstPage(outcome.document);
     const unit = pageLayoutSourceUnit(page.layout);
     status += ` (page grown to Custom ${formatPageSizeValue(cssPxToPageSize(page.width, unit))} × ${formatPageSizeValue(cssPxToPageSize(page.height, unit))} ${pageSizeUnitLabel(unit)})`;
+  } else if (outcome.decision === "keep") {
+    const page = firstPage(outcome.document);
+    const title = PageSizePresets.find(preset => preset.id === page.layout.presetId)?.title ?? page.layout.presetId;
+    const overflow = new Set(outcome.overflowObjectIds);
+    const count = result.objectIds.filter(id => overflow.has(id)).length;
+    status += ` (page kept at ${title}${count ? `; ${count} structure${count === 1 ? "" : "s"} extend${count === 1 ? "s" : ""} past it` : ""})`;
   }
   if (skippedItems.length > 0) {
     const visibleItems = visibleSkippedItems(skippedItems);
@@ -5441,7 +5401,8 @@ export function getSelectedTextObject(document: ChemDraftDocument): TextObject |
 export function updateNativeTextObjectText(
   document: ChemDraftDocument,
   objectId: string,
-  text: string
+  text: string,
+  originalFrame?: Pick<TextObject, "x" | "y" | "width" | "height">
 ): ChemDraftDocument {
   const location = findTextObjectLocation(document, objectId);
   if (!location) {
@@ -5451,13 +5412,33 @@ export function updateNativeTextObjectText(
   const spans = textObjectSpansForTextChange(object, text);
   const fixedWidth = object.style.textBoxSizingMode === "fixed-width" || object.style.textBoxSizingMode === "fixed-size";
   const fixedSize = object.style.textBoxSizingMode === "fixed-size";
+  const frame = { ...object, x: 0, y: 0 };
+  const placement = planTextObjectPlacement(frame);
+  const minimumHeight = nativeTextObjectMinimumDimensions.height;
+  const limits = fixedWidth ? undefined : textAutoSizePageLimits(object, page, minimumHeight);
   const size = nativeTextObjectSizeForText(text, object.style, {
     spans,
     width: fixedWidth ? object.width : undefined,
     height: fixedSize ? object.height : undefined,
-    maxWidth: Math.max(nativeTextObjectMinimumDimensions.width, page.width - object.x),
-    maxHeight: Math.max(nativeTextObjectMinimumDimensions.height, page.height - object.y)
+    maxWidth: limits?.maxWidth ?? page.width - object.x,
+    maxHeight: fixedWidth ? Math.max(minimumHeight, page.height - object.y) : undefined
   });
+  if (limits) size.height = Math.min(size.height, Math.max(minimumHeight, limits.maxHeight(size.width)));
+
+  let { x, y } = object;
+  if (!fixedWidth) {
+    // The SVG baseline rotates around the frame center, which moves when either dimension changes.
+    const resizedFrame = { ...frame, ...size };
+    const anchor = transformPointForObject(frame, placement);
+    const resizedAnchor = transformPointForObject(resizedFrame, planTextObjectPlacement(resizedFrame));
+    x += anchor.x - resizedAnchor.x;
+    y += anchor.y - resizedAnchor.y;
+    // Returning to the original frame should not create an undo entry for floating-point roundoff.
+    if (originalFrame && size.width === originalFrame.width && size.height === originalFrame.height &&
+        Math.abs(x - originalFrame.x) < 1e-9 && Math.abs(y - originalFrame.y) < 1e-9) {
+      ({ x, y } = originalFrame);
+    }
+  }
 
   return applyPatch(
     document,
@@ -5466,6 +5447,8 @@ export function updateNativeTextObjectText(
       objectId,
       changes: {
         text,
+        x,
+        y,
         width: size.width,
         height: size.height,
         spans
@@ -5663,7 +5646,7 @@ export function applyObjectColorToDocumentObjects(
   // Expand groups to their renderable children: a GroupObject is skipped by render/export, so
   // writing color to the group wrapper changes nothing visible while reporting success.
   const allObjects = document.pages.flatMap((page) => page.objects);
-  const selectedIds = new Set(resolveGroupedDocumentObjectIds(allObjects, objectIds));
+  const selectedIds = new Set(withArrowAttachmentIds(allObjects, resolveGroupedDocumentObjectIds(allObjects, objectIds)));
   if (selectedIds.size === 0) {
     return document;
   }
@@ -7243,25 +7226,44 @@ export function deleteSelectedDocumentObjects(
   document: ChemDraftDocument,
   selectedObjectIds: readonly string[] = document.selection.objectIds
 ): ChemDraftDocument {
+  return applyPatches(document, selectedObjectRemovalPatches(document, selectedObjectIds), { now: phase4Timestamp });
+}
+
+function selectedObjectRemovalPatches(
+  document: ChemDraftDocument,
+  selectedObjectIds: readonly string[]
+): Extract<DocumentPatch, { op: "removeObject" }>[] {
   const page = selectionPage(document);
   const selectedIds = new Set(selectedObjectIds);
-  const selectedChildIds = new Set(resolveGroupedDocumentObjectIds(page.objects, selectedObjectIds));
+  const selectedChildIds = new Set(withArrowAttachmentIds(page.objects, resolveGroupedDocumentObjectIds(page.objects, selectedObjectIds)));
   const affectedGroupIds = page.objects
     .filter((object): object is GroupObject =>
       object.type === "group" &&
       (selectedIds.has(object.id) || object.childObjectIds.some((childId) => selectedChildIds.has(childId)))
     )
     .map((object) => object.id);
-  const objectIds = [...new Set([...selectedChildIds, ...affectedGroupIds])];
-  if (objectIds.length === 0) {
-    return document;
-  }
+  return [...new Set([...selectedChildIds, ...affectedGroupIds])].map(objectId => ({ op: "removeObject", objectId }));
+}
 
-  return applyPatches(
-    document,
-    objectIds.map((objectId) => ({ op: "removeObject", objectId })),
-    { now: phase4Timestamp }
-  );
+/** Cut whole objects and copied fragments together so a partly selected pair still has its
+ * original membership when the patch engine checks for orphaned glyphs. */
+export function deleteClipboardSelection(
+  document: ChemDraftDocument,
+  payload: ChemDraftSelectionClipboardPayload,
+  wholeObjectIds: readonly string[]
+): ChemDraftDocument {
+  const carriedMarkIds = payload.objects.filter(object => object.type === "electron-mark").map(object => object.id);
+  const wholeRemovals = selectedObjectRemovalPatches(document, [...wholeObjectIds, ...carriedMarkIds]);
+  const removedIds = new Set(wholeRemovals.map(patch => patch.objectId));
+  const patches: DocumentPatch[] = [...wholeRemovals];
+  for (const object of payload.objects) {
+    if (object.type !== "molecule" || removedIds.has(object.id)) continue;
+    const patch = nativeMoleculePartDeletePatch(document, {
+      kind: "parts", objectId: object.id, atomIds: object.atoms.map(atom => atom.id), bondIds: object.bonds.map(bond => bond.id)
+    });
+    if (patch) patches.push(patch);
+  }
+  return applyPatches(document, patches, { now: phase4Timestamp });
 }
 
 export function applySingleBondToolAtPoint(
@@ -7295,7 +7297,7 @@ export function nativeSingleBondToolAtPoint(
     if (atomHit && nativeBondGrowthBlockedByPageEdge(selected, atomHit.atomId, point, page.width, page.height)) {
       return { document, refusal: "sprout-page-edge" };
     }
-    // A requested multiple bond at an atom must fail as a whole when valence refuses it.
+    // A format or geometry failure must not turn a requested multiple bond into a separate object.
     if (options.bondOrder && options.bondOrder !== "single") {
       const preview = previewNativeMoleculeBondGrowth(selected, point, page.width, page.height);
       if (atomHit || preview) {
@@ -7304,9 +7306,7 @@ export function nativeSingleBondToolAtPoint(
           const element = selected.atoms.find(atom => atom.id === atomHit.atomId)?.element ?? "the atom";
           options.onRefusal?.(!isEditableNativeMoleculeGraph(selected)
             ? "this molecule cannot be edited as a native graph"
-            : atomHit.availableBonds <= 0
-              ? `${element} has no available valence`
-              : `there is no room to place a bond from ${element}`);
+            : `there is no room to place a bond from ${element}`);
         }
         return { document };
       }
@@ -7376,7 +7376,8 @@ export function nativeFreeformSingleBondToolAtPoint(
         { op: "removeObject", objectId: foreign.molecule.id },
         { op: "setSelection", pageId: page.id, objectIds: [molecule.id] }
       ],
-      { now: phase4Timestamp }
+      // Absorption is a graph transfer even when the source membership cannot be resolved.
+      { now: phase4Timestamp, preserveRepeatUnitBrackets: true }
     ) };
   }
 
@@ -7427,10 +7428,12 @@ export function nativeBondDragSourceAtomId(molecule: MoleculeObject, point: Page
   return atomHit && canGrowNativeAtom(molecule, atomHit.atomId) ? atomHit.atomId : undefined;
 }
 
+/** The caller supplies its stereo reader to orient a newly converted wave toward a lone centre. */
 export function applyNativeBondDisplayStyleTarget(
   document: ChemDraftDocument,
   target: NativeBondOrderTarget,
-  bondStyle: NativeBondDisplayStyle
+  bondStyle: NativeBondDisplayStyle,
+  perceiveStereo?: StereoPerceiver
 ): ChemDraftDocument {
   const page = firstPage(document);
   const molecule = page.objects.find((object): object is MoleculeObject =>
@@ -7444,6 +7447,7 @@ export function applyNativeBondDisplayStyleTarget(
   if (!bond) {
     return document;
   }
+  if (bondStyle === "wavy" && bond.order !== "single") return document;
   if (bond.display?.bondStyle === bondStyle) {
     return nativeBondDisplayStyleReverses(bond, bondStyle)
       ? applyPatch(
@@ -7467,8 +7471,23 @@ export function applyNativeBondDisplayStyleTarget(
     return document;
   }
 
+  let directedBond = bond;
+  // Query bonds cannot be perceived safely; retain the stored direction in that case.
+  if (bondStyle === "wavy" && perceiveStereo && !molecule.bonds.some(candidate => candidate.order === "unknown")) {
+    // Use the same index-aligned chemical perception as wedge read-back. An unspecified
+    // centre still counts; the CIP descriptor need not already be R or S.
+    try {
+      const stereo = perceiveStereo(stereoPerceptionMolfile(molecule));
+      const from = stereo[molecule.atoms.findIndex(atom => atom.id === bond.fromAtomId)]?.isStereoCenter;
+      const to = stereo[molecule.atoms.findIndex(atom => atom.id === bond.toAtomId)]?.isStereoCenter;
+      if (from === false && to === true) directedBond = reversedNativeBond(bond);
+    } catch {
+      // Molfile limits or engine failures must not prevent styling the bond. Without
+      // perception, preserve its stored direction just as an unperceived conversion does.
+    }
+  }
   const bonds = molecule.bonds.map((candidate) =>
-    candidate.id === bond.id ? nativeBondWithDisplayStyle(candidate, bondStyle) : candidate
+    candidate.id === bond.id ? nativeBondWithDisplayStyle(directedBond, bondStyle) : candidate
   );
   const nextMolecule = refreshNativeSingleBondGraph(molecule, molecule.atoms, bonds);
 
@@ -7481,12 +7500,12 @@ export function applyNativeBondDisplayStyleTarget(
 
 /**
  * Whether applying `bondStyle` to a bond already drawn that way reverses it rather than doing
- * nothing: a wedge or hashed wedge clicked again with its own tool swaps its narrow end to the
+ * nothing: a wedge, hashed wedge or wavy bond clicked again with its own tool swaps its stereo end to the
  * other atom. The narrow end marks the stereocentre, so this is a stereo edit the user asked for
  * by clicking, and its undo restores the bond exactly. Every other style is direction-free.
  */
 export function nativeBondDisplayStyleReverses(bond: MoleculeBond, bondStyle: NativeBondDisplayStyle): boolean {
-  return bond.display?.bondStyle === bondStyle && (bondStyle === "wedge" || bondStyle === "hashed");
+  return bond.display?.bondStyle === bondStyle && (bondStyle === "wedge" || bondStyle === "hashed" || bondStyle === "wavy");
 }
 
 /** The same bond drawn from its other end; a left/right double-bond side is mirrored to stay put. */
@@ -7531,14 +7550,15 @@ function normalizeElectronMarkSpec(spec: NativeElectronMarkSpec | NativeChargeVa
 /**
  * The charge tool places a SELECTABLE, MOVABLE charge-mark object beside the atom — the mark is
  * the user's handle on the charge. Its chemical effect (deprotonation, formula, validity) is
- * applied by `reconcileNativeChargeMarks`, which every document commit runs: while the mark sits
- * within the association radius the atom carries its charge, and dragging the mark away hands
- * the proton back.
+ * applied by `reconcileNativeChargeMarks`, which every document commit runs. A direct drop chooses
+ * its atom explicitly; other operations keep the existing distance/valence association policy.
  */
 export function applyChargeToolAtNativeAtom(
   document: ChemDraftDocument,
   spec: NativeElectronMarkSpec | NativeChargeValue,
-  target: NativeMoleculeDeleteTarget
+  target: NativeMoleculeDeleteTarget,
+  /** Optional page-coordinate angle in radians for lone-pair placement. */
+  directionRadians?: number
 ): ChemDraftDocument {
   if (target.kind !== "atom") {
     return document;
@@ -7565,16 +7585,14 @@ export function applyChargeToolAtNativeAtom(
       // A radical ion stacked back to neutral is a radical, not nothing: the charge is what the
       // press removed, and the unpaired electron it did not touch stays as a bare radical dot on
       // the same atom, where the mark was.
-      const anchorAtom = plan.existing.anchor.kind === "atom" && plan.existing.anchor.objectId && plan.existing.anchor.atomId
-        ? { objectId: plan.existing.anchor.objectId, atomId: plan.existing.anchor.atomId }
-        : { objectId: molecule.id, atomId: target.atomId };
-      return addChargeMarkAtPoint(
-        applyPatches(document, [{ op: "removeObject", objectId: plan.existing.id }], { now: phase4Timestamp }),
-        page.id,
-        { kind: "radical-dot" },
-        nativeChargeMarkCenter(plan.existing),
-        anchorAtom
-      );
+      // Convert in place so the anchor and explicit drop association (as well as the mark's
+      // identity and appearance) survive even when the symbol is far from its atom.
+      return applyPatches(document, [
+        { op: "updateObject", objectId: plan.existing.id, changes: {
+          markKind: "radical-dot", charge: undefined, radical: undefined, chargeStyle: undefined
+        } },
+        { op: "setSelection", pageId: page.id, objectIds: [plan.existing.id] }
+      ], { now: phase4Timestamp });
     }
     return applyPatches(
       document,
@@ -7592,25 +7610,33 @@ export function applyChargeToolAtNativeAtom(
     );
   }
 
-  const point = nativeChargePlacementPointForAtom(molecule, target.atomId, page.objects, page.width, page.height);
+  const placement = normalized.kind === "lone-pair"
+    ? lonePairPlacementPlanForAtom(molecule, target.atomId, page.objects, page.width, page.height, directionRadians)
+    : undefined;
+  const point = normalized.kind === "lone-pair" ? placement?.center
+    : (normalized.kind === "radical-dot" ? nativeRadicalPlacementPointForAtom : nativeChargePlacementPointForAtom)(
+      molecule, target.atomId, page.objects, page.width, page.height);
   return point
     ? addChargeMarkAtPoint(document, page.id, normalized, point, {
         objectId: molecule.id,
-        atomId: target.atomId
-      })
+        atomId: target.atomId,
+        // Page-space placement must retain the chosen atom through legacy local-distance
+        // reconciliation. Leave unrotated tool marks byte-for-byte unchanged.
+        explicit: molecule.rotation !== 0
+      }, placement?.rotation)
     : document;
 }
 
 /**
  * Why a press on an atom that already carries a charge mark was refused — the increment, not
- * the mark: "cap" is the ±9 limit (`nativeChargeMarkMaxMagnitude`), "valence" is a total the
- * element cannot carry at its current bond usage. Lets the caller name the reason instead of
+ * the mark: "cap" is the ±9 representation limit (`nativeChargeMarkMaxMagnitude`).
+ * Lets the caller name the reason instead of
  * reporting that no mark could be placed.
  */
-export type NativeChargeStackRefusal = "cap" | "valence";
+export type NativeChargeStackRefusal = "cap";
 
 /**
- * What a charge-tool press does to the mark an atom already carries, and whether it is refused.
+ * What a charge-tool press does to the mark an atom already carries, within the format cap.
  * One computation feeds both the apply and the status line, so the reason MainWindow names is
  * always the reason the apply actually refused for.
  */
@@ -7632,40 +7658,7 @@ function nativeChargeStackPlan(
   if (Math.abs(next) > nativeChargeMarkMaxMagnitude) {
     return { existing, next, refusal: "cap" };
   }
-  const atom = molecule.atoms.find((candidate) => candidate.id === atomId);
-  if (next !== 0 && atom) {
-    // An atom-anchored mark is already reconciled into formalCharge, so the press moves the
-    // atom by the delta. An object-anchored one found by proximity is not yet counted, so the
-    // atom would end up carrying its intrinsic charge plus the whole mark.
-    const candidate = existing.anchor.kind === "atom"
-      ? atom.formalCharge + spec.charge
-      : atom.formalCharge - (atom.markCharge ?? 0) + next;
-    if (!nativeAtomCanCarryCharge(molecule, atom, candidate)) {
-      return { existing, next, refusal: "valence" };
-    }
-  }
   return { existing, next };
-}
-
-/**
- * Whether the atom's element admits this total formal charge at its current bond usage — the
- * same test the mark reconciliation applies. Checked BEFORE a stack is written, so the charge
- * tool never bumps a mark to a magnitude the very next commit would strip back off the atom
- * (five presses on a carbon used to reset it from +4 to neutral while reporting "Placed 5+").
- * Superatom labels stay permissive, exactly as they are in the reconciliation.
- */
-function nativeAtomCanCarryCharge(molecule: MoleculeObject, atom: MoleculeAtom, charge: number): boolean {
-  const element = nativeElementFromAtomLabel(atom.element);
-  if (!element) {
-    return true;
-  }
-  const usage = nativeAtomValenceUsage(molecule, atom);
-  return nativeAtomChargeSupportsValence(element, usage, charge);
-}
-
-/** Bond-order usage plus radical electrons, shared by every native valence admission check. */
-function nativeAtomValenceUsage(molecule: MoleculeObject, atom: MoleculeAtom): number {
-  return nativeAtomExternalValence(molecule, atom);
 }
 
 export function nativeChargeStackRefusal(
@@ -7732,73 +7725,6 @@ function nativeAssociatedChargeMarkForAtom(
     .map((mark) => ({ mark, distance: distance(nativeChargeMarkCenter(mark), atom) }))
     .filter((entry) => entry.distance <= radius)
     .sort((left, right) => left.distance - right.distance)[0]?.mark;
-}
-
-export function nativeChargePlacementPointForAtom(
-  molecule: MoleculeObject,
-  atomId: string,
-  objects: readonly DocumentObject[],
-  pageWidth: number,
-  pageHeight: number
-): PagePoint | undefined {
-  const atom = molecule.atoms.find((candidate) => candidate.id === atomId);
-  if (!atom) {
-    return undefined;
-  }
-
-  // The natural home for a charge is where the next atom would land if the chain kept growing
-  // from here — the same slot the bond tool would use. Only a saturated atom (no growth slot)
-  // falls back to the open-angle scoring below.
-  const growth = previewNativeMoleculeBondGrowth(molecule, atom, pageWidth, pageHeight);
-  if (growth && growth.atomId === atomId && !growth.targetAtomId) {
-    return growth.newAtomPoint;
-  }
-
-  const placementRadius = Math.max(nativeChargeMarkSizePx * 1.35, nativeBondLength * 0.55);
-  const neighborAngles = molecule.bonds
-    .filter((bond) => bond.fromAtomId === atomId || bond.toAtomId === atomId)
-    .map((bond) => molecule.atoms.find((candidate) =>
-      candidate.id === (bond.fromAtomId === atomId ? bond.toAtomId : bond.fromAtomId)
-    ))
-    .filter((candidate): candidate is MoleculeAtom => candidate !== undefined)
-    .map((neighbor) => Math.atan2(neighbor.y - atom.y, neighbor.x - atom.x));
-  const preferredOpenAngle = largestOpenAngle(neighborAngles) ?? -Math.PI / 4;
-  const otherAtoms = molecule.atoms.filter((candidate) => candidate.id !== atomId);
-  const chargeCenters = objects
-    .filter((object): object is ElectronMarkObject => object.type === "electron-mark" && object.markKind === "charge")
-    .map(nativeChargeMarkCenter);
-  const halfSize = nativeChargeMarkSizePx / 2;
-  const candidates = Array.from({ length: 16 }, (_, index) => {
-    const angle = -Math.PI + index * Math.PI / 8;
-    const point = {
-      x: atom.x + Math.cos(angle) * placementRadius,
-      y: atom.y + Math.sin(angle) * placementRadius
-    };
-    const clampedPoint = {
-      x: clamp(point.x, halfSize, Math.max(halfSize, pageWidth - halfSize)),
-      y: clamp(point.y, halfSize, Math.max(halfSize, pageHeight - halfSize))
-    };
-    const boundaryPenalty = distance(point, clampedPoint);
-    const bondSeparation = neighborAngles.length === 0
-      ? Math.PI
-      : Math.min(...neighborAngles.map((neighborAngle) => angularDistance(angle, neighborAngle)));
-    const atomDistanceScore = otherAtoms.reduce((sum, otherAtom) =>
-      sum + Math.min(1, distance(clampedPoint, otherAtom) / (nativeBondLength * 1.5)), 0
-    );
-    const chargeDistanceScore = chargeCenters.reduce((sum, center) =>
-      sum + Math.min(1, distance(clampedPoint, center) / (nativeBondLength * 1.5)), 0
-    );
-    const preferredScore = 1 - angularDistance(angle, preferredOpenAngle) / Math.PI;
-
-    return {
-      point: clampedPoint,
-      score: bondSeparation * 1000 + atomDistanceScore * 20 + chargeDistanceScore * 10 + preferredScore - boundaryPenalty * 10
-    };
-  });
-
-  return candidates
-    .sort((left, right) => right.score - left.score || left.point.y - right.point.y || left.point.x - right.point.x)[0]
-    ?.point;
 }
 
 /** The growth the on-canvas arrow is showing: where the new atom lands, or which existing atom
@@ -7967,8 +7893,8 @@ function nativeMoleculePatched(
 
 /**
  * Numeric atom sprout hotkeys (ChemDraw parity): 4/5 grow a wedge/hashed stereo methyl along the
- * growth-arrow direction, 8 grows =CH2, 9 grows a gem-dimethyl pair (all-or-nothing: an atom
- * without room for BOTH methyls refuses, since a lone partial methyl would commit silently),
+ * growth-arrow direction, 8 grows =CH2, and 9 grows two methyls or isopropyl on a carbon
+ * with fewer than two free valences. Geometry planning is all-or-nothing for either fragment,
  * and 0 grows a bond in "cyclic mode" — each press turns the same way as the previous chain
  * vertex by the supplement of the molecule's chain angle, so repeated presses trace a ring and
  * close it onto the starting atom.
@@ -8002,6 +7928,10 @@ export function nativeAtomSproutHotkeyTarget(
     return { document, refusal: "target-unavailable" };
   }
 
+  if (kind === "cyclic" && linearBondGrowthAimDegrees(sourceAtom.id, molecule.atoms, molecule.bonds) !== undefined) {
+    return nativeSingleBondHotkeyAtAtomTarget(document, target, plan);
+  }
+
   const growthPlan = (plan && !plan.targetAtomId ? plan : undefined)
     ?? nativeBondGrowthPlanForAtom(molecule, target.atomId, page.width, page.height);
 
@@ -8016,20 +7946,8 @@ export function nativeAtomSproutHotkeyTarget(
   }
 
   if (kind === "methylidene") {
-    // The sprouted C=C consumes two valences on the source atom, like the carbonyl.
-    const valenceUsage = atomBondOrderUsageMap(molecule.atoms, molecule.bonds);
-    const nextValence = (valenceUsage.get(target.atomId) ?? 0) + nativeBondOrderValue.double;
-    if (
-      nativeElementFromAtomLabel(sourceAtom.element) !== "C" ||
-      sourceAtom.formalCharge !== 0 ||
-      nativeAtomFormalChargeForValence("C", nextValence) !== 0 ||
-      !growthPlan || growthPlan.targetAtomId
-    ) {
-      return { document, refusal: nativeElementFromAtomLabel(sourceAtom.element) !== "C" || sourceAtom.formalCharge !== 0
-        ? "methylidene-needs-neutral-carbon"
-        : nativeAtomFormalChargeForValence("C", nextValence) !== 0
-          ? "sprout-needs-two-valences"
-          : nativeSproutFailureReason(molecule, target.atomId) };
+    if (!growthPlan || growthPlan.targetAtomId) {
+      return { document, refusal: nativeSproutFailureReason(molecule, target.atomId) };
     }
     const grown = extendNativeCarbonGraph(molecule, target.atomId, growthPlan.newAtomPoint);
     if (!grown) {
@@ -8046,13 +7964,15 @@ export function nativeAtomSproutHotkeyTarget(
   }
 
   if (kind === "gemDimethyl") {
-    // All-or-nothing: the hotkey promises a PAIR of methyls — committing one
-    // methyl when the second cannot be planned would read as success. So an atom without two free
-    // growth slots refuses up front, and a failed second plan refuses the whole sprout.
-    const valenceUsage = atomBondOrderUsageMap(molecule.atoms, molecule.bonds);
-    if (nativeAtomAvailableBondCount(sourceAtom, valenceUsage.get(target.atomId) ?? 0, molecule) < 2) {
-      return { document, refusal: "sprout-needs-two-valences" };
-    }
+    // Choose the promised fragment before growing. A tertiary carbon takes one bond
+    // to isopropyl, never two new methyl bonds on the original carbon.
+    const carbon = nativeElementFromAtomLabel(sourceAtom.element) === "C";
+    const usage = nativeAtomExternalValence(molecule, sourceAtom);
+    // The explicit "never pentavalent carbon from 9" command contract needs at least
+    // one source valence. Adding any fragment to C4 would violate it; ordinary bond
+    // drawing remains unrestricted. No existing bond, charge or atom is changed to fit.
+    if (carbon && usage >= 4) return { document, refusal: "branched-carbon-full" };
+    const isopropyl = carbon && usage > 2;
     if (!growthPlan || growthPlan.targetAtomId) {
       return { document, refusal: nativeSproutFailureReason(molecule, target.atomId) };
     }
@@ -8060,13 +7980,22 @@ export function nativeAtomSproutHotkeyTarget(
     if (!first) {
       return { document, refusal: nativeSproutFailureReason(molecule, target.atomId) };
     }
-    const secondPlan = nativeBondGrowthPlanForAtom(first, target.atomId, page.width, page.height);
+    const branchAtomId = isopropyl ? first.atoms[first.atoms.length - 1].id : target.atomId;
+    const secondPlan = nativeBondGrowthPlanForAtom(first, branchAtomId, page.width, page.height);
     const second = secondPlan && !secondPlan.targetAtomId
-      ? extendNativeCarbonGraph(first, target.atomId, secondPlan.newAtomPoint)
+      ? extendNativeCarbonGraph(first, branchAtomId, secondPlan.newAtomPoint)
       : undefined;
-    return second
-      ? { document: nativeMoleculePatched(document, page, molecule, second) }
-      : { document, refusal: nativeSproutFailureReason(first, target.atomId) };
+    if (!second) return { document, refusal: nativeSproutFailureReason(first, branchAtomId) };
+    const thirdPlan = isopropyl ? nativeBondGrowthPlanForAtom(second, branchAtomId, page.width, page.height) : undefined;
+    const grown = isopropyl
+      ? thirdPlan && !thirdPlan.targetAtomId
+        ? extendNativeCarbonGraph(second, branchAtomId, thirdPlan.newAtomPoint)
+        : undefined
+      : second;
+    // Plan the complete fragment before the single patch; geometry failure rolls it all back.
+    return grown
+      ? { document: nativeMoleculePatched(document, page, molecule, grown) }
+      : { document, refusal: nativeSproutFailureReason(second, branchAtomId) };
   }
 
   // Cyclic mode ("0"): continue the chain, turning the same way the chain last turned by the
@@ -8132,11 +8061,7 @@ export function nativeAtomSproutHotkeyTarget(
     : nativeSproutPatched(document, page, molecule, target.atomId, extendNativeCarbonGraph(molecule, target.atomId, nextPoint));
 }
 
-/**
- * Close the cyclic-bond chain onto an existing atom. Closing a ring is a ring placement, so the
- * result goes through the shared ring-placement valence guard: a closure that would over-fill
- * the closure atom (or the hovered atom) changes nothing and says why.
- */
+/** Close the cyclic-bond chain, preserving the requested graph even when it is invalid. */
 function nativeCyclicClosurePatched(
   document: ChemDraftDocument,
   page: ChemDraftDocument["pages"][number],
@@ -8148,16 +8073,14 @@ function nativeCyclicClosurePatched(
   if (!closed) {
     return { document, refusal: nativeSproutConnectionFailureReason(molecule, target.atomId, closureAtomId) };
   }
-  const refusal = nativeRingPlacementValenceRefusal(molecule, closed, target);
-  return refusal ? { document, refusal } : { document: nativeMoleculePatched(document, page, molecule, closed) };
+  return { document: nativeMoleculePatched(document, page, molecule, closed) };
 }
 
 /** Refusal diagnostics only: these helpers never decide whether a sprout is placed. */
 export type NativeAtomSproutRefusal = NativeRingHotkeyRefusal
+  | "atom-no-free-valence"
+  | "branched-carbon-full"
   | "sprout-no-free-direction"
-  | "sprout-needs-two-valences"
-  | "methylidene-needs-neutral-carbon"
-  | "connection-atom-no-free-valence"
   | "closure-bond-exists";
 
 export type NativeAtomSproutHotkeyResult = {
@@ -8167,7 +8090,7 @@ export type NativeAtomSproutHotkeyResult = {
 
 function nativeSproutFailureReason(molecule: MoleculeObject, atomId: string): NativeAtomSproutRefusal {
   if (!molecule.atoms.some((atom) => atom.id === atomId)) return "target-unavailable";
-  return canGrowNativeAtom(molecule, atomId) ? "sprout-no-free-direction" : "atom-no-free-valence";
+  return "sprout-no-free-direction";
 }
 
 function nativeSproutConnectionFailureReason(
@@ -8175,10 +8098,7 @@ function nativeSproutConnectionFailureReason(
 ): NativeAtomSproutRefusal {
   if (!molecule.atoms.some((atom) => atom.id === targetAtomId)) return "target-unavailable";
   if (sourceAtomId === targetAtomId || nativeBondExistsBetween(molecule, sourceAtomId, targetAtomId)) return "closure-bond-exists";
-  if (!canGrowNativeAtom(molecule, sourceAtomId)) return "atom-no-free-valence";
-  const sameComponent = nativeComponents(molecule.atoms, nativeAdjacency(molecule.atoms, molecule.bonds))
-    .some((atomIds) => atomIds.includes(sourceAtomId) && atomIds.includes(targetAtomId));
-  return sameComponent ? "closure-atom-no-free-valence" : "connection-atom-no-free-valence";
+  return "target-unavailable";
 }
 
 function nativeSproutPatched(
@@ -8204,13 +8124,11 @@ export type NativeRingHotkeyResult = {
 
 /**
  * Why a ring hotkey (or the cyclic-bond closure) changed nothing: the ring tools' reasons, plus
- * two only a hotkey meets — an atom whose label is an abbreviation rather than an element, and a
- * ring whose geometry could not be placed at the hovered target.
+ * the page boundary and a ring whose geometry could not be placed at the hovered target.
  */
 export type NativeRingHotkeyRefusal =
   | NativeTemplateFallbackReason
   | "sprout-page-edge"
-  | "atom-label-not-element"
   | "ring-geometry-unavailable";
 
 /** The hovered target's editable molecule, or why a hotkey cannot change it. */
@@ -8256,13 +8174,6 @@ export function nativeRingHotkeyAttachAtAtomTarget(
   if (!sourceAtom) {
     return { document, refusal: "target-unavailable" };
   }
-  // Rings never attach at a non-element label. A table group (Ph, OMe, CO2Me) takes one bond and a
-  // ring would give it two; a composite such as "NMe" or "CMe2" may take two, but a ring template
-  // laid over its head is chemistry nobody drew; any other label takes no bonds at all. Refuse
-  // them all, so "relabel it to an element first" stays the whole story for rings.
-  if (nativeElementFromAtomLabel(sourceAtom.element) === undefined) {
-    return { document, refusal: "atom-label-not-element" };
-  }
   // On a bonded atom the ring centres on the bisector of the atom's largest open angle, as a ring
   // tool click on the atom does: a methyl then sits at 120° to both hexagon bonds (126° on a
   // pentagon). The growth arrow points where one new bond would go, ±120° off the parent bond, and
@@ -8284,24 +8195,20 @@ export function nativeRingHotkeyAttachAtAtomTarget(
   if (!attached) {
     return {
       document,
-      refusal: nativeRingTargetFailureValenceReason(molecule, target) ?? "ring-geometry-unavailable"
+      refusal: "ring-geometry-unavailable"
     };
   }
-  return nativeRingHotkeyPatched(document, page, molecule, attached, target);
+  return nativeRingHotkeyPatched(document, page, molecule, attached);
 }
 
-/** Commit a hotkey's ring molecule only if it passes the shared ring-placement valence guard. */
+/** Commit the requested ring graph; validation supplies badges without changing it. */
 function nativeRingHotkeyPatched(
   document: ChemDraftDocument,
   page: ChemDraftDocument["pages"][number],
   molecule: MoleculeObject,
-  next: MoleculeObject,
-  target: NativeMoleculeDeleteTarget
+  next: MoleculeObject
 ): NativeRingHotkeyResult {
-  const refusal = nativeRingPlacementValenceRefusal(molecule, next, target);
-  return refusal
-    ? { document, refusal }
-    : { document: nativeMoleculePatched(document, page, molecule, next) };
+  return { document: nativeMoleculePatched(document, page, molecule, next) };
 }
 
 /** Fuse a ring template onto the hovered bond, bulging away from the molecule's body — pressing
@@ -8356,8 +8263,8 @@ export function nativeRingHotkeyFuseAtBondTarget(
   };
   const fused = fuseNativeTemplateRingToBond(molecule, target.bondId, orientationPoint, templateId);
   return fused
-    ? nativeRingHotkeyPatched(document, page, molecule, fused, target)
-    : { document, refusal: nativeRingTargetFailureValenceReason(molecule, target) ?? "ring-geometry-unavailable" };
+    ? nativeRingHotkeyPatched(document, page, molecule, fused)
+    : { document, refusal: "ring-geometry-unavailable" };
 }
 
 function addChargeMarkAtPoint(
@@ -8365,7 +8272,8 @@ function addChargeMarkAtPoint(
   pageId: string,
   spec: NativeElectronMarkSpec,
   point: PagePoint,
-  anchorAtom?: { objectId: string; atomId: string }
+  anchorAtom?: { objectId: string; atomId: string; explicit?: boolean },
+  rotation = 0
 ): ChemDraftDocument {
   const page = firstPage(document);
   const halfSize = nativeChargeMarkSizePx / 2;
@@ -8382,7 +8290,7 @@ function addChargeMarkAtPoint(
     y,
     width: nativeChargeMarkSizePx,
     height: nativeChargeMarkSizePx,
-    rotation: 0,
+    rotation,
     style: {
       source: "chemdraft-native-charge"
     },
@@ -8392,6 +8300,8 @@ function addChargeMarkAtPoint(
     anchor: anchorAtom
       ? { kind: "atom" as const, objectId: anchorAtom.objectId, atomId: anchorAtom.atomId }
       : { kind: "point" as const, point: center },
+    // Label clearance and rotated placement must retain the clicked atom explicitly.
+    ...(anchorAtom && (spec.kind === "lone-pair" || anchorAtom.explicit) ? { atomAssociation: "explicit" as const } : {}),
     ...(spec.kind === "charge"
       ? {
           charge: spec.charge,
@@ -8412,40 +8322,67 @@ function addChargeMarkAtPoint(
 }
 
 /**
- * Applies the chemistry of the floating charge marks. A charge mark is a selectable, movable
- * object: while it sits within `nativeChargeAssociationRadiusPx` of an atom that can legally
- * carry its charge, that atom carries the charge (a minus beside a drawn OH removes the proton);
- * drag the mark away and the atom gets its proton back — no error badge, because the atom is
- * simply neutral again.
+ * Applies the chemistry of charge and radical marks. Direct drops record a chosen atom or an
+ * intentionally floating point. Reconciliation respects either explicit placement and uses
+ * distance-based association for legacy placements. A minus on a drawn OH removes its implicit proton.
  *
  * Runs on every document commit, so it must be a cheap, IDEMPOTENT normalization. The invariant
  * that makes it self-contained: `atom.markCharge` records exactly the portion of
  * `atom.formalCharge` the marks contributed. Each pass strips that portion back out (recovering
- * the atom's intrinsic, drawn/imported charge), re-assigns every mark to its nearest supportable
- * atom, and writes both fields fresh — so deleted marks, moved molecules, edited elements, and
- * copies pasted without their mark all settle correctly with no history diffing.
+ * the atom's intrinsic, drawn/imported charge), re-assigns every mark to its nearest
+ * atom unless its association is explicit, and writes both fields fresh — so deleted marks,
+ * moved molecules, edited elements, and copies pasted without their mark all settle correctly
+ * with no history diffing.
  */
+export type CommittedDocumentNormalizationOptions = NativeElectronMarkAssignmentOptions;
+
+/** Documents produced by default commit normalization, each mapped to itself (see `committedNormalForm`). */
+const committedNormalForms = new WeakMap<ChemDraftDocument, ChemDraftDocument>();
+
 /**
  * What every committed document passes through: MainWindow's five commit paths (the initial
  * document, opening a file, each label-editor keystroke, an edit, a history commit) call this and
  * nothing else, and undo/redo only reinstate documents that passed it. So it is the one place every
  * in-app change — a paste of any format, a template, a plugin's patch, an agent command, a merge —
  * goes through, and where each side-dependent label ("SCN") gets its bond side recorded
- * (`withNativeDocumentLabelBondSides`) before a later rotation could change what it means. Charge
- * marks are reconciled first. Both passes are idempotent and keep what is already right, so a layout
- * commit changes nothing.
+ * (`withNativeDocumentLabelBondSides`) before a later rotation could change what it means. File
+ * open and session restore preserve the stored electron marks and their atom contributions.
  */
-export function normalizeCommittedDocument(document: ChemDraftDocument): ChemDraftDocument {
-  const reconciled = reconcileNativeChargeMarks(document);
+export function normalizeCommittedDocument(
+  document: ChemDraftDocument,
+  options: CommittedDocumentNormalizationOptions & { preserveElectronMarks?: boolean } = {}
+): ChemDraftDocument {
+  document = reconcileReactionArrowAttachments(document);
+  const reconciled = options.preserveElectronMarks ? document : reconcileNativeChargeMarks(document, options);
   const recorded = withNativeDocumentLabelBondSides(reconciled);
   // Re-admitted to the patch engine's sharing, as `reconcileNativeChargeMarks` does.
-  return recorded === reconciled ? reconciled : adoptDerivedDocument(reconciled, recorded);
+  const normalized = recorded === reconciled ? reconciled : adoptDerivedDocument(reconciled, recorded);
+  // Idempotent: a document the default normalization produced is its own committed normal form.
+  if (Object.keys(options).length === 0) committedNormalForms.set(normalized, normalized);
+  return normalized;
 }
 
-export function reconcileNativeChargeMarks(document: ChemDraftDocument): ChemDraftDocument {
+/**
+ * What commit normalization makes of `document`, without normalizing again a document it already
+ * produced (every committed present). The commit funnel's chemistry guard (`commitChemistryGuard.ts`)
+ * judges an operation against this form of the document it started from, so a present opened with
+ * its stored marks preserved is normalized once, and a committed one costs nothing.
+ */
+export function committedNormalForm(document: ChemDraftDocument): ChemDraftDocument {
+  let normalized = committedNormalForms.get(document);
+  if (!normalized) {
+    normalized = normalizeCommittedDocument(document);
+    committedNormalForms.set(document, normalized);
+  }
+  return normalized;
+}
+
+export function reconcileNativeChargeMarks(
+  document: ChemDraftDocument, options: CommittedDocumentNormalizationOptions = {}
+): ChemDraftDocument {
   let changed = false;
   const pages = document.pages.map((page) => {
-    const nextPage = reconcileNativeChargeMarksOnPage(page);
+    const nextPage = reconcileNativeChargeMarksOnPage(page, options);
     if (nextPage !== page) {
       changed = true;
     }
@@ -8457,7 +8394,59 @@ export function reconcileNativeChargeMarks(document: ChemDraftDocument): ChemDra
   return changed ? adoptDerivedDocument(document, { ...document, pages }) : document;
 }
 
-function reconcileNativeChargeMarksOnPage(page: DocumentPage): DocumentPage {
+export function committedElectronMarkAssignments(page: DocumentPage, options: NativeElectronMarkAssignmentOptions = {}) {
+  const assignments = nativeElectronMarkAssignments(page, options);
+  const legacyMarks = page.objects.filter((object): object is ElectronMarkObject =>
+    object.type === "electron-mark" && (object.anchor.kind === "bond" || object.anchor.kind === "object"));
+  if (!legacyMarks.length) return assignments;
+
+  const objects = objectByIdIndex(page.objects);
+  for (const mark of legacyMarks) {
+    const owner = assignments.anchorByMarkId.get(mark.id);
+    const molecule = owner && objects.get(owner.objectId);
+    if (!owner || molecule?.type !== "molecule" || !molecule.rotation) continue;
+    const atom = molecule.atoms.find(candidate => candidate.id === owner.atomId);
+    if (!atom) continue;
+    const { charge, radicals } = electronMarkAtomContribution(mark);
+    // Honor stored contributions attributed by the legacy raw-coordinate matcher. A new
+    // association also has to reach the drawn atom, including after a rotated part drag.
+    if ((charge !== 0 && Math.sign(atom.markCharge ?? 0) === Math.sign(charge)) ||
+        (radicals !== 0 && (atom.markRadicals ?? 0) >= radicals)) continue;
+    const radius = Math.max(nativeChargeAssociationRadiusPx,
+      nativeDrawingStyleFromObjectStyle(molecule.style).bondLengthPx * 1.15);
+    if (distance(nativeChargeMarkCenter(mark), transformPointForObject(molecule, atom)) <= radius) continue;
+
+    assignments.anchorByMarkId.set(mark.id, undefined);
+    const key = nativeElectronMarkAtomKey(owner.objectId, owner.atomId);
+    assignments.assignedChargeByAtomKey.set(key, (assignments.assignedChargeByAtomKey.get(key) ?? 0) - charge);
+    assignments.assignedRadicalsByAtomKey.set(key, (assignments.assignedRadicalsByAtomKey.get(key) ?? 0) - radicals);
+  }
+  return assignments;
+}
+
+const committedMarkAssignmentsByPage = new WeakMap<DocumentPage, ReturnType<typeof committedElectronMarkAssignments>["anchorByMarkId"]>();
+
+/**
+ * The atoms a charge or radical mark's chemistry goes to on a committed page: the atom commit
+ * normalization attributes it to, and the atom it is anchored to. The commit funnel's chemistry
+ * guard (`commitChemistryGuard.ts`) uses it to exempt the atoms of a mark the operation moved.
+ */
+export function committedElectronMarkAtoms(page: DocumentPage, mark: ElectronMarkObject): { objectId: string; atomId: string }[] {
+  let assignments = committedMarkAssignmentsByPage.get(page);
+  if (!assignments) {
+    assignments = committedElectronMarkAssignments(page).anchorByMarkId;
+    committedMarkAssignmentsByPage.set(page, assignments);
+  }
+  const owners: { objectId: string; atomId: string }[] = [];
+  const assigned = assignments.get(mark.id);
+  if (assigned) owners.push(assigned);
+  if (mark.anchor.kind === "atom" && mark.anchor.objectId && mark.anchor.atomId) {
+    owners.push({ objectId: mark.anchor.objectId, atomId: mark.anchor.atomId });
+  }
+  return owners;
+}
+
+function reconcileNativeChargeMarksOnPage(page: DocumentPage, options: CommittedDocumentNormalizationOptions): DocumentPage {
   const electronMarks = page.objects.filter((object): object is ElectronMarkObject =>
     object.type === "electron-mark" &&
     (object.markKind === "lone-pair" ||
@@ -8474,124 +8463,13 @@ function reconcileNativeChargeMarksOnPage(page: DocumentPage): DocumentPage {
     return page;
   }
 
-  // What a mark contributes to its atom. Lone pairs contribute nothing — they anchor for
-  // positioning only, since implied lone pairs are already part of the octet arithmetic.
-  const markContribution = (mark: ElectronMarkObject): { charge: number; radicals: number } => {
-    if (mark.markKind === "charge") {
-      return { charge: nativeChargeValue(mark.charge) ?? 0, radicals: mark.radical === true ? 1 : 0 };
-    }
-    return { charge: 0, radicals: mark.markKind === "radical-dot" ? 1 : 0 };
-  };
-
-  const atomKey = (moleculeId: string, atomId: string) => `${moleculeId}\n${atomId}`;
-  const moleculeById = new Map(molecules.map((molecule) => [molecule.id, molecule] as const));
-  const usageByMoleculeId = new Map(molecules.map((molecule) =>
-    [molecule.id, atomBondOrderUsageMap(molecule.atoms, molecule.bonds)] as const
-  ));
-  // The atom-targeted tool drops the mark one bond length out (the chain-growth slot), so a
-  // molecule drawn or pasted with longer bonds needs its radius to scale with its own bonds.
-  const associationRadiusByMoleculeId = new Map(molecules.map((molecule) => [
-    molecule.id,
-    Math.max(nativeChargeAssociationRadiusPx, nativeDrawingStyleFromObjectStyle(molecule.style).bondLengthPx * 1.15)
-  ] as const));
-  const assignedChargeByAtomKey = new Map<string, number>();
-  const assignedRadicalsByAtomKey = new Map<string, number>();
-  const anchorByMarkId = new Map<string, { objectId: string; atomId: string } | undefined>();
-
-  const markCanAssociate = (
-    moleculeId: string,
-    atomId: string,
-    center: PagePoint,
-    contribution: { charge: number; radicals: number }
-  ): boolean => {
-    const molecule = moleculeById.get(moleculeId);
-    const atom = molecule?.atoms.find((candidate) => candidate.id === atomId);
-    if (!molecule || !atom ||
-      distance(center, atom) > (associationRadiusByMoleculeId.get(moleculeId) ?? nativeChargeAssociationRadiusPx)) {
-      return false;
-    }
-
-    const element = nativeElementFromAtomLabel(atom.element);
-    if (!element) {
-      // Nicknames and condensed labels are superatoms outside the element valence tables. They
-      // still own nearby charge/radical marks; only the distance can be judged without inventing
-      // valence rules for labels such as Me, N3, or Ph.
-      return true;
-    }
-
-    if (contribution.charge === 0 && contribution.radicals === 0) {
-      return true;
-    }
-
-    const key = atomKey(moleculeId, atomId);
-    const intrinsicCharge = atom.formalCharge - (atom.markCharge ?? 0);
-    const candidateCharge = intrinsicCharge + (assignedChargeByAtomKey.get(key) ?? 0) + contribution.charge;
-    // Each unpaired electron occupies a bonding slot, so it counts as used valence.
-    const candidateUsage = (usageByMoleculeId.get(moleculeId)?.get(atomId) ?? 0) +
-      (assignedRadicalsByAtomKey.get(key) ?? 0) + contribution.radicals;
-    return nativeAtomChargeSupportsValence(element, candidateUsage, candidateCharge);
-  };
-
-  const assign = (moleculeId: string, atomId: string, contribution: { charge: number; radicals: number }) => {
-    const key = atomKey(moleculeId, atomId);
-    assignedChargeByAtomKey.set(key, (assignedChargeByAtomKey.get(key) ?? 0) + contribution.charge);
-    assignedRadicalsByAtomKey.set(key, (assignedRadicalsByAtomKey.get(key) ?? 0) + contribution.radicals);
-  };
-
-  // Pass 1 — sticky anchors. A mark that is already bound to an atom (by the charge tool or an
-  // earlier pass) keeps that atom while it stays in radius and the chemistry stays legal, so
-  // dragging a mark between two nearby atoms doesn't flicker and a crowded placement can't be
-  // stolen by whichever neighbor happens to sit marginally closer.
-  electronMarks.forEach((mark) => {
-    if (mark.anchor.kind !== "atom" || !mark.anchor.objectId || !mark.anchor.atomId) {
-      return;
-    }
-
-    const contribution = markContribution(mark);
-    const center = nativeChargeMarkCenter(mark);
-    if (markCanAssociate(mark.anchor.objectId, mark.anchor.atomId, center, contribution)) {
-      assign(mark.anchor.objectId, mark.anchor.atomId, contribution);
-      anchorByMarkId.set(mark.id, { objectId: mark.anchor.objectId, atomId: mark.anchor.atomId });
-    }
-  });
-
-  // Pass 2 — everything else associates with its nearest supportable atom in radius, or floats.
-  electronMarks.forEach((mark) => {
-    if (anchorByMarkId.has(mark.id)) {
-      return;
-    }
-
-    const contribution = markContribution(mark);
-    const center = nativeChargeMarkCenter(mark);
-    let nearest: { objectId: string; atomId: string; distance: number } | undefined;
-    molecules.forEach((molecule) => {
-      const associationRadius = associationRadiusByMoleculeId.get(molecule.id) ?? nativeChargeAssociationRadiusPx;
-      molecule.atoms.forEach((atom) => {
-        const separation = distance(center, atom);
-        if (
-          separation <= associationRadius &&
-          (!nearest || separation < nearest.distance) &&
-          markCanAssociate(molecule.id, atom.id, center, contribution)
-        ) {
-          nearest = { objectId: molecule.id, atomId: atom.id, distance: separation };
-        }
-      });
-    });
-
-    if (nearest) {
-      assign(nearest.objectId, nearest.atomId, contribution);
-      anchorByMarkId.set(mark.id, { objectId: nearest.objectId, atomId: nearest.atomId });
-    } else {
-      anchorByMarkId.set(mark.id, undefined);
-    }
-  });
-
+  const { anchorByMarkId, assignedChargeByAtomKey, assignedRadicalsByAtomKey } = committedElectronMarkAssignments(page, options);
   const nextObjectById = new Map<string, DocumentObject>();
 
   molecules.forEach((molecule) => {
     let atomsChanged = false;
     const atoms = molecule.atoms.map((atom) => {
-      const key = atomKey(molecule.id, atom.id);
+      const key = nativeElectronMarkAtomKey(molecule.id, atom.id);
       const chargeContribution = assignedChargeByAtomKey.get(key) ?? 0;
       const radicalContribution = assignedRadicalsByAtomKey.get(key) ?? 0;
       const formalCharge = atom.formalCharge - (atom.markCharge ?? 0) + chargeContribution;
@@ -8618,6 +8496,8 @@ function reconcileNativeChargeMarksOnPage(page: DocumentPage): DocumentPage {
   });
 
   electronMarks.forEach((mark) => {
+    // The stored target and the atom receiving its chemistry are separate for legacy anchors.
+    if (mark.anchor.kind === "bond" || mark.anchor.kind === "object") return;
     const anchor = anchorByMarkId.get(mark.id);
     const currentAnchor = mark.anchor.kind === "atom"
       ? { objectId: mark.anchor.objectId, atomId: mark.anchor.atomId }
@@ -8625,11 +8505,13 @@ function reconcileNativeChargeMarksOnPage(page: DocumentPage): DocumentPage {
     if (anchor && (currentAnchor?.objectId !== anchor.objectId || currentAnchor?.atomId !== anchor.atomId)) {
       nextObjectById.set(mark.id, {
         ...mark,
+        ...(mark.atomAssociation === "explicit" ? { atomAssociation: undefined } : {}),
         anchor: { kind: "atom", objectId: anchor.objectId, atomId: anchor.atomId }
       });
     } else if (!anchor && mark.anchor.kind === "atom") {
       nextObjectById.set(mark.id, {
         ...mark,
+        ...(mark.atomAssociation === "explicit" ? { atomAssociation: undefined } : {}),
         anchor: { kind: "point", point: nativeChargeMarkCenter(mark) }
       });
     }
@@ -8768,11 +8650,140 @@ export function applyMechanismArrowControlPoint(
   );
 }
 
-export function nativeChargeMarkCenter(mark: ElectronMarkObject): PagePoint {
-  return {
-    x: mark.x + mark.width / 2,
-    y: mark.y + mark.height / 2
+export interface ElectronMarkMoveAssociationOptions {
+  /** Main resets charge anchors for translations/transforms, but not a frame-only edit. */
+  operation?: "move" | "transform" | "frame" | "carry" | "paste";
+}
+
+export interface ElectronMarkMoveAssociationResult {
+  /** Anchor to store before normal commit reconciliation (including main's stale point anchors). */
+  anchor: ElectronMarkObject["anchor"];
+  atomAssociation?: ElectronMarkObject["atomAssociation"];
+}
+
+/**
+ * The general move/transform association policy. Direct drops have their own explicit policy.
+ * This deliberately preserves origin/main behaviour:
+ * charges lose sticky anchors on direct moves/group transforms; radicals and lone pairs keep
+ * theirs until normal distance-based reconciliation releases them. Point anchors on the latter
+ * keep their old coordinates. The editing preference never changes chemistry policy.
+ * Chemistry is reported separately from the actual reconciled commit, never a predicted move.
+ */
+export function electronMarkMoveAssociation(
+  _document: ChemDraftDocument | DocumentPage,
+  mark: ElectronMarkObject,
+  from: PagePoint,
+  to: PagePoint,
+  options: ElectronMarkMoveAssociationOptions = {}
+): ElectronMarkMoveAssociationResult {
+  const operation = options.operation ?? "move";
+  // Layout/appearance edits cannot erase an intentional floating drop. A later direct atom
+  // drop can replace it; newly pasted copies retain their existing separate association policy.
+  if (mark.atomAssociation === "explicit" && mark.anchor.kind === "point" && operation !== "paste") {
+    return { anchor: from.x === to.x && from.y === to.y ? mark.anchor : { ...mark.anchor, point: to } };
+  }
+  // Turning/resizing a dropped mark about its own centre changes only its appearance.
+  if (mark.atomAssociation === "explicit" && operation !== "paste" && from.x === to.x && from.y === to.y) {
+    return { anchor: mark.anchor };
+  }
+  const reset = operation === "paste" || (mark.markKind === "charge" &&
+    operation !== "frame" && operation !== "carry" &&
+    (operation === "transform" || from.x !== to.x || from.y !== to.y));
+  const anchor: ElectronMarkObject["anchor"] = reset
+    ? { ...mark.anchor, kind: "point", point: { x: to.x, y: to.y } }
+    : mark.anchor;
+  return { anchor, ...(mark.atomAssociation === "explicit" && operation !== "frame" && operation !== "carry"
+    ? { atomAssociation: undefined } : {}) };
+}
+
+export interface ElectronMarkChemistryChange {
+  markId: string;
+  // Atom ids are local to a molecule, including after duplicate/paste.
+  objectIdBefore?: string;
+  atomIdBefore?: string;
+  objectIdAfter?: string;
+  atomIdAfter?: string;
+  chargeDelta: number;
+  radicalDelta: number;
+}
+
+export interface ElectronMarkChemistryScope {
+  markIds: readonly string[];
+  atoms: readonly { objectId: string; atomId: string }[];
+}
+
+/**
+ * Used by direct electron-mark drops only, scoped to their affected marks and atoms.
+ * Compare committed states without moving anything or running reconciliation. Each chemistry-
+ * bearing mark is reported when either of its associated atoms changed formalCharge, markCharge
+ * or markRadicals. Lone pairs and association changes without a chemical difference are omitted.
+ * Deltas are net changes across the mark's unique before/after atoms: a transfer has zero net
+ * delta, with its endpoints recording the redistribution. Several marks can share an affected
+ * atom, so rows describe those marks, not independent quantities to add together.
+ */
+export function electronMarkChemistryChanges(
+  before: ChemDraftDocument, after: ChemDraftDocument, scope?: ElectronMarkChemistryScope
+): ElectronMarkChemistryChange[] {
+  if (before === after) return [];
+  const atomKey = (objectId: string, atomId: string) => `${objectId}\n${atomId}`;
+  const markIds = scope && new Set(scope.markIds);
+  const atomKeys = scope && new Set(scope.atoms.map(atom => atomKey(atom.objectId, atom.atomId)));
+  const snapshot = (document: ChemDraftDocument) => {
+    const marks = new Map<string, ElectronMarkObject>();
+    const associations = new Map<string, { objectId: string; atomId: string }>();
+    const atoms = new Map<string, { formalCharge: number; markCharge: number; markRadicals: number }>();
+    for (const page of document.pages) {
+      let assignments: ReturnType<typeof committedElectronMarkAssignments>["anchorByMarkId"] | undefined;
+      for (const object of page.objects) {
+        if (object.type === "electron-mark" && (!markIds || markIds.has(object.id))) {
+          marks.set(object.id, object);
+          const { anchor } = object;
+          if (anchor.kind === "atom" && anchor.objectId && anchor.atomId) {
+            associations.set(object.id, { objectId: anchor.objectId, atomId: anchor.atomId });
+          } else if (anchor.kind === "bond" || anchor.kind === "object") {
+            assignments ??= committedElectronMarkAssignments(page).anchorByMarkId;
+            const owner = assignments.get(object.id);
+            if (owner) associations.set(object.id, owner);
+          }
+        }
+        if (object.type === "molecule") for (const atom of object.atoms) {
+          if (atomKeys && !atomKeys.has(atomKey(object.id, atom.id))) continue;
+          atoms.set(atomKey(object.id, atom.id), {
+            formalCharge: atom.formalCharge, markCharge: atom.markCharge ?? 0, markRadicals: atom.markRadicals ?? 0
+          });
+        }
+      }
+    }
+    return { marks, associations, atoms };
   };
+  const a = snapshot(before), b = snapshot(after);
+  const association = (markId: string, snapshot: typeof a) => {
+    const owner = snapshot.associations.get(markId);
+    return owner && snapshot.atoms.has(atomKey(owner.objectId, owner.atomId)) ? owner : undefined;
+  };
+  const changes: ElectronMarkChemistryChange[] = [];
+  const zero = { formalCharge: 0, markCharge: 0, markRadicals: 0 };
+  for (const markId of new Set([...a.marks.keys(), ...b.marks.keys()])) {
+    const oldMark = a.marks.get(markId), newMark = b.marks.get(markId);
+    if (![oldMark, newMark].some(mark => mark && (mark.markKind === "radical-dot" ||
+      (mark.markKind === "charge" && nativeChargeValue(mark.charge) !== undefined)))) continue;
+    const oldAnchor = association(markId, a), newAnchor = association(markId, b);
+    const keys = new Set([oldAnchor, newAnchor].flatMap(anchor => anchor
+      ? [atomKey(anchor.objectId!, anchor.atomId!)] : []));
+    let changed = false, chargeDelta = 0, radicalDelta = 0;
+    for (const key of keys) {
+      const oldAtom = a.atoms.get(key) ?? zero, newAtom = b.atoms.get(key) ?? zero;
+      changed ||= oldAtom.formalCharge !== newAtom.formalCharge || oldAtom.markCharge !== newAtom.markCharge ||
+        oldAtom.markRadicals !== newAtom.markRadicals;
+      chargeDelta += newAtom.formalCharge - oldAtom.formalCharge;
+      radicalDelta += newAtom.markRadicals - oldAtom.markRadicals;
+    }
+    if (changed) changes.push({
+      markId, objectIdBefore: oldAnchor?.objectId, atomIdBefore: oldAnchor?.atomId,
+      objectIdAfter: newAnchor?.objectId, atomIdAfter: newAnchor?.atomId, chargeDelta, radicalDelta
+    });
+  }
+  return changes;
 }
 
 export function findNativeMoleculeAtomHit(
@@ -8797,16 +8808,10 @@ export function findNativeMoleculeAtomHit(
     return undefined;
   }
 
-  const valenceUsed = atomBondOrderUsageMap(molecule.atoms, molecule.bonds).get(hit.atomId) ?? 0;
-  const availableBonds = nativeAtomAvailableBondCount(atom, valenceUsed, molecule);
-  if (availableBonds <= 0) {
-    return undefined;
-  }
-
   return {
     atomId: hit.atomId,
     degree: atomDegreeMap(molecule.atoms, molecule.bonds).get(hit.atomId) ?? 0,
-    availableBonds,
+    availableBonds: Number.POSITIVE_INFINITY,
     distance: hit.distance
   };
 }
@@ -9000,80 +9005,30 @@ export function applyNativeMoleculePartsDelete(
   document: ChemDraftDocument,
   selection: { objectId: string; atomIds: readonly string[]; bondIds: readonly string[] }
 ): ChemDraftDocument {
-  const page = firstPage(document);
-  const molecule = page.objects.find((object): object is MoleculeObject =>
-    object.id === selection.objectId && object.type === "molecule"
-  );
-  if (!molecule || !isEditableNativeMoleculeGraph(molecule)) {
-    return document;
-  }
-
-  const removeAtomIds = new Set(selection.atomIds);
-  const removeBondIds = new Set(selection.bondIds);
-  if (removeAtomIds.size === 0 && removeBondIds.size === 0) {
-    return document;
-  }
-
-  const atoms = molecule.atoms.filter((atom) => !removeAtomIds.has(atom.id));
-  const bonds = molecule.bonds.filter((bond) =>
-    !removeBondIds.has(bond.id) &&
-    !removeAtomIds.has(bond.fromAtomId) &&
-    !removeAtomIds.has(bond.toAtomId)
-  );
-  if (atoms.length === molecule.atoms.length && bonds.length === molecule.bonds.length) {
-    return document; // selection referenced nothing that still exists
-  }
-
-  if (atoms.length === 0) {
-    return applyPatch(
-      document,
-      { op: "removeObject", objectId: molecule.id },
-      { now: phase4Timestamp }
-    );
-  }
-
-  return applyPatch(
-    document,
-    {
-      op: "updateObject",
-      objectId: molecule.id,
-      changes: moleculeWithPrunedRingStyles(refreshNativeSingleBondGraph(molecule, atoms, bonds))
-    },
-    { now: phase4Timestamp }
-  );
+  return applyNativeMoleculePartDeleteTarget(document, { ...selection, kind: "parts" });
 }
 
 export function applyNativeMoleculePartDeleteTarget(
   document: ChemDraftDocument,
   target: NativeMoleculePartReorderTarget
 ): ChemDraftDocument {
-  const page = firstPage(document);
-  const molecule = page.objects.find((object): object is MoleculeObject =>
+  const patch = nativeMoleculePartDeletePatch(document, target);
+  return patch ? applyPatch(document, patch, { now: phase4Timestamp }) : document;
+}
+
+export function nativeMoleculePartDeletePatch(
+  document: ChemDraftDocument,
+  target: NativeMoleculePartReorderTarget
+): DocumentPatch | undefined {
+  const molecule = firstPage(document).objects.find((object): object is MoleculeObject =>
     object.id === target.objectId && object.type === "molecule"
   );
-  if (!molecule || !isEditableNativeMoleculeGraph(molecule)) {
-    return document;
-  }
-
+  if (!molecule || !isEditableNativeMoleculeGraph(molecule)) return undefined;
   const nextMolecule = nativeMoleculeAfterPartDelete(molecule, target);
-  if (!nextMolecule) {
-    return document;
-  }
-  const prunedNextMolecule = moleculeWithPrunedRingStyles(nextMolecule);
-
-  if (prunedNextMolecule.atoms.length === 0) {
-    return applyPatch(
-      document,
-      { op: "removeObject", objectId: molecule.id },
-      { now: phase4Timestamp }
-    );
-  }
-
-  return applyPatch(
-    document,
-    { op: "updateObject", objectId: molecule.id, changes: prunedNextMolecule },
-    { now: phase4Timestamp }
-  );
+  if (!nextMolecule) return undefined;
+  return nextMolecule.atoms.length === 0
+    ? { op: "removeObject", objectId: molecule.id }
+    : { op: "updateObject", objectId: molecule.id, changes: moleculeWithPrunedRingStyles(nextMolecule) };
 }
 
 export function applyNativeMoleculeBondOrderTarget(
@@ -9093,7 +9048,7 @@ export function applyNativeMoleculeBondOrderTarget(
     return document;
   }
 
-  const nextOrder = nextNativeBondOrder(molecule, bond);
+  const nextOrder = nativeBondCanBeMadePlain(bond) ? "single" : nextNativeBondOrder(molecule, bond);
   return isNativeBondOrderValue(nextOrder)
     ? applyNativeMoleculeBondOrderValueTarget(document, target, nextOrder)
     : document;
@@ -9102,8 +9057,10 @@ export function applyNativeMoleculeBondOrderTarget(
 export function applyNativeMoleculeBondOrderValueTarget(
   document: ChemDraftDocument,
   target: NativeBondOrderTarget,
-  order: NativeBondOrderValue
+  order: NativeBondOrderValue,
+  stereo?: "either"
 ): ChemDraftDocument {
+  if (stereo && order !== "double") return document;
   const page = firstPage(document);
   const molecule = page.objects.find((object): object is MoleculeObject =>
     object.id === target.objectId && object.type === "molecule"
@@ -9117,21 +9074,43 @@ export function applyNativeMoleculeBondOrderValueTarget(
     return document;
   }
 
-  if ((order === bond.order && bond.stereo !== "either") || !canSetNativeBondOrder(molecule, bond, order)) {
+  const makePlain = order === "single" && nativeBondCanBeMadePlain(bond);
+  // This display-only edit keeps the order, so order-change restrictions do not apply.
+  if (!makePlain && ((order === bond.order && bond.stereo === stereo) || !canSetNativeBondOrder(molecule, bond, order))) {
     return document;
   }
 
   const bonds = molecule.bonds.map((candidate) =>
-    candidate.id === bond.id ? nativeBondWithOrderAndDisplay(molecule, withoutDoubleBondStereo(candidate), order) : candidate
+    candidate.id === bond.id
+      // Clearing an existing double bond's "either" stereo is not double-bond creation.
+      ? makePlain ? nativeBondWithoutStereoDisplay(candidate)
+        : { ...nativeBondWithOrderAndDisplay(molecule, withoutDoubleBondStereo(candidate), order, bond.order !== "double"),
+            ...(stereo ? { stereo } : {}) }
+      : candidate
   );
-  const refreshed = refreshNativeSingleBondGraph(molecule, molecule.atoms, bonds);
-  const nextMolecule = bond.stereo === "either" ? withStoredBondStereoMolfile(refreshed) : refreshed;
+  const refreshed = stereo === "either"
+    ? refreshNativeBondToolGraph(molecule, molecule.atoms, bonds, { bondStereo: stereo })
+    : refreshNativeSingleBondGraph(molecule, molecule.atoms, bonds);
+  if (!refreshed) return document;
+  const nextMolecule = !stereo && bond.stereo === "either" ? withStoredBondStereoMolfile(refreshed) : refreshed;
 
   return applyPatch(
     document,
     { op: "updateObject", objectId: molecule.id, changes: nextMolecule },
     { now: phase4Timestamp }
   );
+}
+
+/** Single-order edits clear only the explicitly authored single-bond stereo display. */
+export function nativeBondCanBeMadePlain(bond: MoleculeBond | undefined): boolean {
+  return bond?.order === "single" &&
+    (bond.display?.bondStyle === "wedge" || bond.display?.bondStyle === "hashed" || bond.display?.bondStyle === "wavy");
+}
+
+function nativeBondWithoutStereoDisplay(bond: MoleculeBond): MoleculeBond {
+  const { display: _display, ...rest } = bond;
+  const { bondStyle: _bondStyle, ...display } = bond.display ?? {};
+  return { ...rest, ...(Object.keys(display).length ? { display } : {}) };
 }
 
 /**
@@ -9151,6 +9130,7 @@ export function nativeBondOrderTargetRefusal(
   if (!isEditableNativeMoleculeGraph(molecule)) {
     return "Bond order not changed: this molecule cannot be edited as a native graph";
   }
+  if (order === "single" && nativeBondCanBeMadePlain(bond)) return undefined;
   if (order === bond.order && bond.stereo !== "either") return `Bond is already ${order}`;
   const reason = nativeBondOrderRefusalReason(molecule, bond, order);
   return reason ? `Bond order not changed: ${reason}` : undefined;
@@ -9362,7 +9342,7 @@ function applyFlippedMoleculeBondStereo(
   const changes = withStoredBondStereoMolfile(normalizeNativeMoleculeGeometry({ ...molecule, atoms, bonds }));
   return applyPatches(document, [
     { op: "updateObject", objectId: molecule.id, changes },
-    ...anchoredElectronMarkTransformPatches(page.objects, molecule.id, end, reflect, {
+    ...anchoredElectronMarkTransformPatches(page, molecule.id, end, reflect, {
       reflectionAxisDegrees: radiansToDegrees(Math.atan2(dy, dx))
     })
   ], { now: phase4Timestamp });
@@ -9514,10 +9494,31 @@ export function applyNativeWarningSuppressionToScope(
 }
 
 /**
- * Dismiss (or restore) one atom's valence warning from the context menu. Suppression is a
- * per-atom mark: the checker reports the atom valid, so the badge disappears and no warning
- * is stored, until the user restores it.
+ * Apply one explicit, currently justified problem-window action through the normal patch path.
  */
+export function applyNativeAtomProblemFix(
+  document: ChemDraftDocument,
+  objectId: string,
+  atomId: string,
+  action: import("@chemdraft/document-workflow-core").AtomProblemAction
+): { document: ChemDraftDocument; label: string; status: string } | undefined {
+  const molecule = document.pages.flatMap(page => page.objects).find(object => object.id === objectId);
+  if (molecule?.type !== "molecule" || !isEditableNativeMoleculeGraph(molecule)) return undefined;
+  const fix = atomProblem(molecule, atomId)?.fixes.find(fix => fix.action === action);
+  if (!fix) return undefined;
+  const atom = molecule.atoms.find(atom => atom.id === atomId)!;
+  const name = JSON.stringify(atom.element || "atom");
+  const status = action === "ignore" ? `Warning ignored for ${name}`
+    : action === "restore" ? `Warning restored for ${name}`
+    : action === "charge" ? `Formal charge set to ${fix.atom.formalCharge > 0 ? "+" : ""}${fix.atom.formalCharge} for ${name}`
+    : `Explicit hydrogens set to ${fix.atom.hydrogenCount} for ${name}`;
+  const atoms = molecule.atoms.map(atom => atom.id === atomId ? fix.atom : atom);
+  const updated = refreshNativeSingleBondGraph(molecule, atoms, molecule.bonds);
+  return { document: selectDocumentObject(applyPatch(document, { op: "updateObject", objectId, changes: updated }, { now: phase4Timestamp }), objectId),
+    label: fix.label, status };
+}
+
+/** Suppression hides only the badge; raw validation remains available. */
 export function applyNativeAtomWarningSuppression(
   document: ChemDraftDocument,
   target: NativeMoleculeDeleteTarget,
@@ -9735,7 +9736,7 @@ export function commitNativeAtomLabelTarget(
   document: ChemDraftDocument,
   target: NativeMoleculeDeleteTarget,
   label: string,
-  options: { literal?: boolean; beforeAtom?: MoleculeAtom; beforeMolecule?: MoleculeObject } = {}
+  options: { literal?: boolean; beforeAtom?: MoleculeAtom; beforeMolecule?: MoleculeObject; replaceElement?: boolean } = {}
 ): { document: ChemDraftDocument; target: NativeMoleculeDeleteTarget; message?: string; refusal?: string } {
   const page = firstPage(document);
   const molecule = page.objects.find((object): object is MoleculeObject => object.id === target.objectId && object.type === "molecule");
@@ -9744,7 +9745,7 @@ export function commitNativeAtomLabelTarget(
   const beforeAtom = options.beforeAtom ?? atom;
   const beforeMolecule = options.beforeMolecule ?? molecule;
   const normalized = normalizeNativeAtomElementLabel(label);
-  const decision = labelOnBondedAtom(normalized, beforeAtom, beforeMolecule);
+  const decision = labelOnBondedAtom(normalized, beforeAtom, beforeMolecule, options.replaceElement);
   const relabel = (reason?: string) => {
     const refusal = atomLabelIsotopeRefusal(beforeAtom, normalized, beforeMolecule, options.literal === true);
     if (refusal) return { document, target, message: refusal, refusal };
@@ -9761,11 +9762,11 @@ export function commitNativeAtomLabelTarget(
   const placement = planBondExtension({
     atoms, bonds: molecule.bonds, clickPoint: source, preferredAtomId: source.id,
     bondLength: style.bondLengthPx, hitRadius: atomHitRadius,
-    maxBondsPerAtom: nativeAtomInvalidGrowthLimit, targetBondAngleDegrees: style.chainAngleDegrees,
+    targetBondAngleDegrees: style.chainAngleDegrees,
     pageBounds: { x: 0, y: 0, width: page.width, height: page.height }
   });
   const pageMolecules = page.objects.filter((o): o is MoleculeObject => o.type === "molecule");
-  if (!placement || pageMolecules.some(m => m.atoms.some(a => Math.hypot(a.x - placement.newAtomPoint.x, a.y - placement.newAtomPoint.y) < style.bondLengthPx * 0.5))) {
+  if (!placement || pageMolecules.some(m => m.atoms.some(a => atomPairOverlaps(distance(a, placement.newAtomPoint), style.bondLengthPx)))) {
     return relabel("no clear substituent position on the page");
   }
   // The substituent keeps the reading the user typed — the label as written, bond on its left — on
@@ -9887,7 +9888,6 @@ function connectableNativeBondGrowthPlan(
     clickPoint,
     bondLength: drawingStyle.bondLengthPx,
     hitRadius: atomHitRadius,
-    maxBondsPerAtom: nativeAtomInvalidGrowthLimit,
     targetBondAngleDegrees: drawingStyle.chainAngleDegrees,
     preferredAtomId,
     pageBounds,
@@ -10108,7 +10108,6 @@ function previewNativeMoleculeFreeformBondGrowthInBounds(
     endPoint: point,
     bondLength: drawingStyle.bondLengthPx,
     pageBounds,
-    maxBondsPerAtom: nativeAtomInvalidGrowthLimit,
     minimumBondLength: freeformMinimumBondLength,
     customLengthBreakawayDistance: freeformCustomLengthBreakawayDistance,
     forceCustomLength: options.forceCustomLength,
@@ -10709,6 +10708,23 @@ export function applyGraphicObjectMarkerKindToSelection(
       }
     };
   }, graphicObjectSupportsMarkers);
+}
+
+/** Opt selected wavy art paths into adjustable geometry; never touches molecular bonds. */
+export function applyGraphicWaveSettingToSelection(
+  document: ChemDraftDocument,
+  setting: WaveSetting,
+  value: number,
+  objectIds: readonly string[] = document.selection.objectIds
+): ChemDraftDocument {
+  const range = waveSettingRanges[setting];
+  if (!Number.isFinite(value) || value < range.min || value > range.max ||
+    !Number.isInteger((value - range.min) / range.step)) return document;
+  return updateGraphicObjectData(document, objectIds, (object) => {
+    const settings = { ...graphicWaveSettings(object), [setting]: value };
+    if (object.data.waveSmoothness === settings.smoothness && object.data.waveHeight === settings.height && object.data.waveWidth === settings.width) return object.data;
+    return { ...object.data, waveSmoothness: settings.smoothness, waveHeight: settings.height, waveWidth: settings.width };
+  }, (object) => object?.type === "graphic" && object.graphicKind === "path" && object.data.artPathKind === "wavy");
 }
 
 /** Set every non-none head's size on the selection's marker-capable graphics, snapped to the same
@@ -12041,17 +12057,25 @@ export function moveNativeMoleculeParts(
   target: NativeMoleculePartMoveTarget,
   delta: PagePoint
 ): ChemDraftDocument {
+  return moveNativeMoleculePartsWithPositions(document, target, delta).document;
+}
+
+function moveNativeMoleculePartsWithPositions(
+  document: ChemDraftDocument,
+  target: NativeMoleculePartMoveTarget,
+  delta: PagePoint
+): { document: ChemDraftDocument; positions: readonly number[] } {
   const page = document.pages.find((candidate) => candidate.objects.some((object) => object.id === target.objectId));
   const molecule = page?.objects.find((object): object is MoleculeObject =>
     object.id === target.objectId && object.type === "molecule"
   );
   if (!page || !molecule) {
-    return document;
+    return { document, positions: [] };
   }
 
   const targetAtomIds = nativeMoleculePartAtomIds(molecule, target);
   if (targetAtomIds.size === 0) {
-    return document;
+    return { document, positions: [] };
   }
 
   const targetAtoms = molecule.atoms.filter((atom) => targetAtomIds.has(atom.id));
@@ -12062,17 +12086,19 @@ export function moveNativeMoleculeParts(
   const dx = clamp(delta.x, -minX, page.width - maxX);
   const dy = clamp(delta.y, -minY, page.height - maxY);
   if (dx === 0 && dy === 0) {
-    return document;
+    return { document, positions: [] };
   }
 
+  const positions: number[] = [];
   const moved = normalizeNativeMoleculeGeometry({
     ...molecule,
-    atoms: molecule.atoms.map((atom) => targetAtomIds.has(atom.id)
-      ? { ...atom, x: atom.x + dx, y: atom.y + dy }
-      : atom)
+    atoms: molecule.atoms.map((atom, index) => {
+      if (!targetAtomIds.has(atom.id)) return atom;
+      positions.push(index);
+      return { ...atom, x: atom.x + dx, y: atom.y + dy };
+    })
   });
-
-  return applyPatch(
+  return { positions, document: applyPatch(
     document,
     {
       op: "updateObject",
@@ -12086,7 +12112,7 @@ export function moveNativeMoleculeParts(
       }
     },
     { now: phase4Timestamp }
-  );
+  ) };
 }
 
 export function nativeMoleculePartBounds(
@@ -12141,6 +12167,30 @@ export interface MoveDocumentObjectOptions {
   cascadeAnchoredMarks?: boolean;
 }
 
+/** Change symbol appearance without changing its charge, radicals or atom identity. */
+export function applyElectronMarkStyleToSelection(
+  document: ChemDraftDocument, property: "size" | "thickness", value: number
+): ChemDraftDocument {
+  if (!Number.isFinite(value)) return document;
+  const selected = new Set(document.selection.objectIds);
+  const patches: DocumentPatch[] = document.pages.flatMap(page => page.objects.flatMap((object): DocumentPatch[] => {
+    if (object.type !== "electron-mark" || !selected.has(object.id)) return [];
+    if (property === "thickness") return [{ op: "updateObject" as const, objectId: object.id,
+      changes: { style: { ...object.style, strokeWidth: Math.max(0.5, Math.min(5.5, value)) } } }];
+    const size = Math.max(8, Math.min(108, value));
+    const ratio = size / Math.max(1, object.width, object.height);
+    const width = object.width * ratio;
+    const height = object.height * ratio;
+    return [{ op: "updateObject" as const, objectId: object.id, changes: {
+      x: object.x + (object.width - width) / 2, y: object.y + (object.height - height) / 2,
+      width, height,
+      ...electronMarkMoveAssociation(document, object, nativeChargeMarkCenter(object),
+        nativeChargeMarkCenter(object), { operation: "frame" })
+    } }];
+  }));
+  return patches.length ? applyPatches(document, patches, { now: phase4Timestamp }) : document;
+}
+
 export function moveDocumentObject(
   document: ChemDraftDocument,
   objectId: string,
@@ -12183,7 +12233,7 @@ function moveDocumentObjectPatches(
     // silently strip the chemistry they were carrying.
     const anchoredMarkPatches: DocumentPatch[] = (options.cascadeAnchoredMarks ?? true)
       ? anchoredElectronMarkTransformPatches(
-          page.objects,
+          page,
           objectId,
           new Set(object.atoms.map((atom) => atom.id)),
           (point) => ({ x: point.x + dx, y: point.y + dy })
@@ -12207,21 +12257,16 @@ function moveDocumentObjectPatches(
     ];
   }
 
-  if (object.type === "electron-mark" && object.markKind === "charge") {
+  if (object.type === "electron-mark") {
     return [{
       op: "updateObject",
       objectId,
       changes: {
         x: nextX,
         y: nextY,
-        anchor: {
-          ...object.anchor,
-          kind: "point",
-          point: {
-            x: nextX + object.width / 2,
-            y: nextY + object.height / 2
-          }
-        }
+        ...electronMarkMoveAssociation(page, object, nativeChargeMarkCenter(object), {
+          x: nextX + object.width / 2, y: nextY + object.height / 2
+        })
       }
     }];
   }
@@ -12703,27 +12748,7 @@ export function rotateDocumentObject(
   }
 
   if (object.type === "molecule" && object.atoms.length > 0) {
-    const center = nativeMoleculeCenter(object);
-    const angleRadians = (object.rotation + angleDegrees) * Math.PI / 180;
-    const atoms = object.atoms.map((atom) => ({
-      ...atom,
-      ...rotatePointAround(atom, center, angleRadians)
-    }));
-    const transform = nativeMoleculeTransformState(object);
-    const nextMolecule = withNativeMoleculeTransform(refreshNativeCyclicDoubleBondSides(normalizeNativeMoleculeGeometry({
-      ...object,
-      rotation: 0,
-      atoms
-    })), {
-      ...transform,
-      rotationDegrees: transform.rotationDegrees + angleDegrees
-    });
-
-    return applyPatch(
-      document,
-      { op: "updateObject", objectId, changes: nextMolecule },
-      { now: phase4Timestamp }
-    );
+    return rotateNativeMoleculeObjectAroundPoint(document, objectId, nativeMoleculeCenter(object), angleDegrees);
   }
 
   if (isNativeOrbitalLobe(object)) {
@@ -12754,7 +12779,9 @@ export function rotateDocumentObject(
       op: "updateObject",
       objectId,
       changes: {
-        rotation: normalizeDegrees(object.rotation + angleDegrees)
+        rotation: normalizeDegrees(object.rotation + angleDegrees),
+        ...(object.type === "electron-mark" ? electronMarkMoveAssociation(document, object,
+          nativeChargeMarkCenter(object), nativeChargeMarkCenter(object), { operation: "frame" }) : {})
       }
     },
     { now: phase4Timestamp }
@@ -12781,39 +12808,16 @@ export function rotateNativeMoleculeObjectAroundPoint(
   center: PagePoint,
   angleDegrees: number
 ): ChemDraftDocument {
-  const page = pageContainingObject(document, objectId);
-  const molecule = moleculeOnPage(page, objectId);
-  if (!page || !molecule || molecule.atoms.length === 0 || Math.abs(angleDegrees) < 0.05) {
-    return document;
-  }
-
-  const angleRadians = (molecule.rotation + angleDegrees) * Math.PI / 180;
-  const atoms = molecule.atoms.map((atom) => ({
-    ...atom,
-    ...rotatePointAround(atom, center, angleRadians)
-  }));
-  const transform = nativeMoleculeTransformState(molecule);
-  const nextMolecule = withNativeMoleculeTransform(refreshNativeCyclicDoubleBondSides(normalizeNativeMoleculeGeometry({
-    ...molecule,
-    rotation: 0,
-    atoms
-  })), {
-    ...transform,
-    rotationDegrees: transform.rotationDegrees + angleDegrees
-  });
-
-  return applyPatch(
-    document,
-    { op: "updateObject", objectId, changes: nextMolecule },
-    { now: phase4Timestamp }
-  );
+  const patches = rotateNativeMoleculeGeometryAroundPointPatches(document, objectId, center, angleDegrees, true);
+  return patches.length ? applyPatches(document, patches, { now: phase4Timestamp }) : document;
 }
 
 function rotateNativeMoleculeGeometryAroundPointPatches(
   document: ChemDraftDocument,
   objectId: string,
   center: PagePoint,
-  angleDegrees: number
+  angleDegrees: number,
+  persistTransform = false
 ): DocumentPatch[] {
   const page = pageContainingObject(document, objectId);
   const molecule = moleculeOnPage(page, objectId);
@@ -12822,7 +12826,7 @@ function rotateNativeMoleculeGeometryAroundPointPatches(
   }
 
   const angleRadians = (molecule.rotation + angleDegrees) * Math.PI / 180;
-  const nextMolecule = refreshNativeCyclicDoubleBondSides(normalizeNativeMoleculeGeometry({
+  let nextMolecule = refreshNativeCyclicDoubleBondSides(normalizeNativeMoleculeGeometry({
     ...molecule,
     rotation: 0,
     atoms: molecule.atoms.map((atom) => ({
@@ -12830,13 +12834,17 @@ function rotateNativeMoleculeGeometryAroundPointPatches(
       ...rotatePointAround(atom, center, angleRadians)
     }))
   }));
+  if (persistTransform) {
+    const transform = nativeMoleculeTransformState(molecule);
+    nextMolecule = withNativeMoleculeTransform(nextMolecule, { ...transform, rotationDegrees: transform.rotationDegrees + angleDegrees });
+  }
   // The atoms above bake in any residual frame rotation (`molecule.rotation + angleDegrees`),
   // but a mark's stored x/y is already absolute page geometry — it turns by the requested angle
   // only, or a legacy molecule with a nonzero frame rotation would fling its marks past the turn
   // the rest of the drawing takes.
   const markAngleRadians = angleDegrees * Math.PI / 180;
   const markPatches = anchoredElectronMarkTransformPatches(
-    page.objects,
+    page,
     molecule.id,
     new Set(molecule.atoms.map((atom) => atom.id)),
     (point) => rotatePointAround(point, center, markAngleRadians),
@@ -13323,26 +13331,8 @@ export function resizeNativeMoleculeObject(
     return document;
   }
 
-  const center = objectCenter(molecule);
-  const transform = nativeMoleculeTransformState(molecule);
-  const resized = withMeasuredNativeMoleculeBondLength(withNativeMoleculeTransform(normalizeNativeMoleculeGeometry({
-    ...molecule,
-    atoms: molecule.atoms.map((atom) => ({
-      ...atom,
-      x: center.x + (atom.x - center.x) * scaleX,
-      y: center.y + (atom.y - center.y) * scaleY
-    }))
-  }), {
-    ...transform,
-    scaleX: transform.scaleX * scaleX,
-    scaleY: transform.scaleY * scaleY
-  }));
-
-  return applyPatch(
-    document,
-    { op: "updateObject", objectId, changes: resized },
-    { now: phase4Timestamp }
-  );
+  const patches = scaleNativeMoleculeObjectAroundPointPatches(document, objectId, objectCenter(molecule), scaleX, scaleY);
+  return applyPatches(document, patches, { now: phase4Timestamp });
 }
 
 // ---------------------------------------------------------------------------
@@ -13481,7 +13471,7 @@ export function selectionBounds(
  */
 const objectByIdIndexes = new WeakMap<
   readonly DocumentObject[],
-  { length: number; last: DocumentObject | undefined; byId: ReadonlyMap<string, DocumentObject> }
+  { length: number; last: DocumentObject | undefined; byId: ReadonlyMap<string, DocumentObject>; positions: ReadonlyMap<string, number> }
 >();
 
 function objectByIdIndex(objects: readonly DocumentObject[]): ReadonlyMap<string, DocumentObject> {
@@ -13490,12 +13480,14 @@ function objectByIdIndex(objects: readonly DocumentObject[]): ReadonlyMap<string
     // First occurrence wins, as `objects.find` did and as the patch engine resolves an id: a page
     // with duplicate ids (the schema allows them) must not read one object and write another.
     const byId = new Map<string, DocumentObject>();
-    for (const object of objects) {
+    const positions = new Map<string, number>();
+    for (const [position, object] of objects.entries()) {
       if (!byId.has(object.id)) {
         byId.set(object.id, object);
+        positions.set(object.id, position);
       }
     }
-    index = { length: objects.length, last: objects[objects.length - 1], byId };
+    index = { length: objects.length, last: objects[objects.length - 1], byId, positions };
     objectByIdIndexes.set(objects, index);
   }
   return index.byId;
@@ -13717,49 +13709,6 @@ export function documentObjectVisualBounds(
   };
 }
 
-function rotatedGraphicLocalBounds(
-  object: GraphicObject,
-  bounds: ObjectBounds,
-  rotationDegrees: number
-): ObjectBounds {
-  if (Math.abs(rotationDegrees) < 0.001) {
-    return bounds;
-  }
-  if (
-    object.graphicKind === "ellipse" &&
-    Math.abs(Math.max(object.width, 1) - Math.max(object.height, 1)) < 0.001
-  ) {
-    return bounds;
-  }
-
-  const center = {
-    x: Math.max(object.width, 1) / 2,
-    y: Math.max(object.height, 1) / 2
-  };
-  const rotationRadians = degreesToRadians(rotationDegrees);
-  const corners = [
-    { x: bounds.x, y: bounds.y },
-    { x: bounds.x + bounds.width, y: bounds.y },
-    { x: bounds.x + bounds.width, y: bounds.y + bounds.height },
-    { x: bounds.x, y: bounds.y + bounds.height }
-  ].map((point) => rotatePointAround(point, center, rotationRadians));
-  const minX = Math.min(...corners.map((point) => point.x));
-  const maxX = Math.max(...corners.map((point) => point.x));
-  const minY = Math.min(...corners.map((point) => point.y));
-  const maxY = Math.max(...corners.map((point) => point.y));
-
-  return {
-    x: roundLayoutCoordinate(minX),
-    y: roundLayoutCoordinate(minY),
-    width: roundLayoutCoordinate(maxX - minX),
-    height: roundLayoutCoordinate(maxY - minY)
-  };
-}
-
-function roundLayoutCoordinate(value: number): number {
-  return Number(value.toFixed(3));
-}
-
 /**
  * Translate one object by a delta (no per-object clamping — the group clamps as a whole).
  *
@@ -13783,16 +13732,23 @@ function translateDocumentObjectByPatches(
     translateAnchoredGeometry?: boolean;
     /** Preserve a charge's sticky atom identity only when that atom moves by the same delta. */
     preserveChargeAnchor?: boolean;
-  } = {}
+    /** Whole insert/page translations also carry stored attachment points and text frames. */
+    translateAbsoluteCoordinates?: boolean;
+  } = {},
+  object = objectOnPage(pageContainingObject(document, objectId), objectId)
 ): DocumentPatch[] {
-  const page = pageContainingObject(document, objectId);
-  const object = objectOnPage(page, objectId);
-  if (!page || !object || (dx === 0 && dy === 0)) {
+  if (!object || (dx === 0 && dy === 0)) {
     return [];
   }
 
   const nextX = object.x + dx;
   const nextY = object.y + dy;
+  // Stored anchor points are absolute, including fallback points on atom/object anchors.
+  const anchorPoint = (anchor: Anchor): Anchor => options.translateAbsoluteCoordinates && anchor.point
+    ? { ...anchor, point: { x: anchor.point.x + dx, y: anchor.point.y + dy } }
+    : offsetAnchorPoint(anchor, dx, dy);
+  const attachments = <T extends { attachmentPoints: Anchor[] }>(value: T): T => ({ ...value,
+    attachmentPoints: value.attachmentPoints.map(anchorPoint) });
 
   if (object.type === "molecule") {
     return [{
@@ -13801,23 +13757,25 @@ function translateDocumentObjectByPatches(
         changes: {
           x: nextX,
           y: nextY,
-          atoms: object.atoms.map((atom) => ({ ...atom, x: atom.x + dx, y: atom.y + dy }))
+          atoms: object.atoms.map((atom) => ({ ...atom, x: atom.x + dx, y: atom.y + dy })),
+          ...(options.translateAbsoluteCoordinates ? {
+            superatoms: object.superatoms.map(attachments), rGroups: object.rGroups.map(attachments)
+          } : {})
         }
       }];
   }
 
-  if (object.type === "electron-mark" && object.markKind === "charge") {
+  if (object.type === "electron-mark") {
     return [{
         op: "updateObject",
         objectId,
         changes: {
           x: nextX,
           y: nextY,
-          anchor: options.preserveChargeAnchor ? object.anchor : {
-            ...object.anchor,
-            kind: "point",
-            point: { x: nextX + object.width / 2, y: nextY + object.height / 2 }
-          }
+          ...electronMarkMoveAssociation(document, object, nativeChargeMarkCenter(object), {
+            x: nextX + object.width / 2, y: nextY + object.height / 2
+          }, { operation: options.preserveChargeAnchor ? "carry" : "move" }),
+          ...(options.translateAbsoluteCoordinates ? { anchor: anchorPoint(object.anchor) } : {})
         }
       }];
   }
@@ -13841,8 +13799,8 @@ function translateDocumentObjectByPatches(
         changes: {
           x: nextX,
           y: nextY,
-          start: offsetAnchorPoint(object.start, dx, dy),
-          end: offsetAnchorPoint(object.end, dx, dy)
+          start: anchorPoint(object.start),
+          end: anchorPoint(object.end)
         }
       }];
   }
@@ -13862,13 +13820,27 @@ function translateDocumentObjectByPatches(
         changes: {
           x: nextX,
           y: nextY,
-          source: offsetAnchorPoint(object.source, dx, dy),
-          target: offsetAnchorPoint(object.target, dx, dy),
+          source: anchorPoint(object.source),
+          target: anchorPoint(object.target),
           controlPoints: object.controlPoints.map((point) => ({ ...point, x: point.x + dx, y: point.y + dy }))
         }
       }];
   }
 
+  if (options.translateAbsoluteCoordinates) {
+    if (object.type === "superatom") return [{ op: "updateObject", objectId,
+      changes: { x: nextX, y: nextY, metadata: attachments(object.metadata) } }];
+    if (object.type === "r-group-label") return [{ op: "updateObject", objectId,
+      changes: { x: nextX, y: nextY, display: attachments(object.display) } }];
+    if (object.type === "text" && object.arrowAttachment) return [{ op: "updateObject", objectId,
+      changes: { x: nextX, y: nextY, arrowAttachment: { ...object.arrowAttachment,
+        frame: { ...object.arrowAttachment.frame, origin: {
+          x: object.arrowAttachment.frame.origin.x + dx, y: object.arrowAttachment.frame.origin.y + dy
+        } }
+      } } }];
+  }
+  // Brackets and remaining types have only base-frame geometry. Atom labelOffset, text
+  // attachment offsets/axes, paint coordinates and effect offsets are relative and stay intact.
   return [{ op: "moveObject", objectId, x: nextX, y: nextY }];
 }
 
@@ -13920,7 +13892,7 @@ function expandWithAnchoredMarkIds(
       expanded.add(markId);
     }
   }
-  return expanded;
+  return new Set(withArrowAttachmentIds(pageObjects, [...expanded]));
 }
 
 /**
@@ -13966,6 +13938,66 @@ function cascadeCarriedAnchoredMarkIds(
   return markIds;
 }
 
+/** A mark that belongs to a copied molecule, and the form in which the molecule's copy carries it. */
+interface CarriedElectronMark {
+  mark: ElectronMarkObject;
+  moleculeId: string;
+  /** What to clone for the copy: the mark itself, or the mark re-anchored to its resolved atom. */
+  copySource: ElectronMarkObject;
+}
+
+/**
+ * The electron-marks that belong to each of `molecules`: the ONE association rule for every
+ * operation that copies a molecule (Duplicate, and the clipboard copy of whole molecules and of
+ * lasso fragments). `molecules` are the molecules as they will be copied (a fragment passes its
+ * pruned molecule, which keeps its id), so a mark belongs only when the atom it sits on is copied.
+ *
+ * It starts from `anchoredElectronMarksForTransform`, the atom-anchored rule every molecule
+ * transform uses, and adds the marks whose anchor is not an atom (a bond or object anchor, or a
+ * legacy loose point) but which the committed assignment resolver attributes to one of the copied
+ * atoms: normalization derives markCharge and markRadicals from exactly that attribution, so a copy
+ * that left such a mark behind would be recomputed to a different charge. No second association
+ * rule: the resolver is the one the commit funnel runs.
+ *
+ * Bond, object and point anchors resolve by distance to the nearest atom of ANY molecule, so a copy
+ * placed near its original could be attributed to the original's atoms instead of the copy's. Their
+ * `copySource` is therefore anchored to the atom the resolver chose; the copy paths remap an atom
+ * anchor to the copied molecule and make it explicit, so the copied mark belongs to the copy.
+ * Results are in page order; a mark is owned by one molecule only.
+ */
+function electronMarksCarriedWithMolecules(
+  page: DocumentPage,
+  molecules: readonly MoleculeObject[]
+): CarriedElectronMark[] {
+  const ownerByMarkId = new Map<string, { moleculeId: string; atomId?: string }>();
+  for (const molecule of molecules) {
+    const atomIds = new Set(molecule.atoms.map((atom) => atom.id));
+    for (const mark of anchoredElectronMarksForTransform(page.objects, molecule.id, atomIds)) {
+      if (!ownerByMarkId.has(mark.id)) ownerByMarkId.set(mark.id, { moleculeId: molecule.id });
+    }
+  }
+  if (page.objects.some((object) => object.type === "electron-mark" && object.anchor.kind !== "atom")) {
+    const moleculeById = new Map(molecules.map((molecule) => [molecule.id, molecule] as const));
+    const objectById = objectByIdIndex(page.objects);
+    for (const [markId, owner] of committedElectronMarkAssignments(page).anchorByMarkId) {
+      if (!owner || ownerByMarkId.has(markId)) continue;
+      const molecule = moleculeById.get(owner.objectId);
+      if (!molecule?.atoms.some((atom) => atom.id === owner.atomId)) continue;
+      const mark = objectById.get(markId);
+      if (mark?.type === "electron-mark" && mark.anchor.kind !== "atom") {
+        ownerByMarkId.set(markId, { moleculeId: owner.objectId, atomId: owner.atomId });
+      }
+    }
+  }
+  return page.objects.flatMap((object) => {
+    const owner = object.type === "electron-mark" ? ownerByMarkId.get(object.id) : undefined;
+    if (object.type !== "electron-mark" || owner === undefined) return [];
+    const copySource: ElectronMarkObject = owner.atomId === undefined ? object
+      : { ...object, anchor: { kind: "atom", objectId: owner.moleculeId, atomId: owner.atomId } };
+    return [{ mark: object, moleculeId: owner.moleculeId, copySource }];
+  });
+}
+
 /**
  * Patches that carry a molecule's anchored electron-marks along with a transform of the molecule
  * (translate/rotate/scale/flip). Marks render from their own stored x/y rather than resolving
@@ -13977,7 +14009,7 @@ function cascadeCarriedAnchoredMarkIds(
  * visible on lone-pair dot pairs, whose renderer draws them under `rotationTransform(object)`.
  */
 function anchoredElectronMarkTransformPatches(
-  pageObjects: readonly DocumentObject[],
+  page: DocumentPage,
   moleculeId: string,
   atomIds: ReadonlySet<string>,
   transformPoint: (point: PagePoint) => PagePoint,
@@ -13985,11 +14017,14 @@ function anchoredElectronMarkTransformPatches(
 ): DocumentPatch[] {
   const scaleX = frame.scaleX ?? 1;
   const scaleY = frame.scaleY ?? 1;
-  return anchoredElectronMarksForTransform(pageObjects, moleculeId, atomIds).map((mark) => {
+  return anchoredElectronMarksForTransform(page.objects, moleculeId, atomIds).map((mark) => {
     const nextWidth = mark.width * scaleX;
     const nextHeight = mark.height * scaleY;
     const nextCenter = transformPoint(nativeChargeMarkCenter(mark));
-    const changes: { x: number; y: number; width?: number; height?: number; rotation?: number } = {
+    const changes: { x: number; y: number; width?: number; height?: number; rotation?: number; anchor: Anchor } = {
+      anchor: electronMarkMoveAssociation(page, mark, nativeChargeMarkCenter(mark), nextCenter, {
+        operation: "carry"
+      }).anchor,
       x: nextCenter.x - nextWidth / 2,
       y: nextCenter.y - nextHeight / 2
     };
@@ -14027,6 +14062,14 @@ function groupMoveTranslatesArrowGeometry(object: DocumentObject, movedIds: Read
 }
 
 function clampedObjectMovePosition(page: DocumentPage, object: DocumentObject, position: PagePoint): PagePoint {
+  const attachedIds = withArrowAttachmentIds(page.objects, [object.id]);
+  if (attachedIds.length > 1) {
+    const bounds = selectionBounds(page.objects, attachedIds);
+    if (bounds) {
+      const delta = clampedSelectionMoveDelta(page, bounds, position.x - object.x, position.y - object.y);
+      return { x: object.x + delta.x, y: object.y + delta.y };
+    }
+  }
   return {
     x: clamp(position.x, 0, Math.max(0, page.width - object.width)),
     y: clamp(position.y, 0, Math.max(0, page.height - object.height))
@@ -14047,15 +14090,15 @@ export function documentObjectMoveDeltaResolver(
   objectId: string,
   groupObjectIds?: readonly string[]
 ): (dx: number, dy: number) => PagePoint {
+  const page = pageContainingObject(document, objectId);
+  if (!page) return () => ({ x: 0, y: 0 });
   if (groupObjectIds && groupObjectIds.length > 1) {
-    const page = firstPage(document);
     const ids = resolveGroupedDocumentObjectIds(page.objects, groupObjectIds);
     const bounds = selectionBounds(page.objects, [...expandWithAnchoredMarkIds(page.objects, ids)]);
     return bounds ? (dx, dy) => clampedSelectionMoveDelta(page, bounds, dx, dy) : () => ({ x: 0, y: 0 });
   }
-  const page = pageContainingObject(document, objectId);
   const object = objectOnPage(page, objectId);
-  if (!page || !object) return () => ({ x: 0, y: 0 });
+  if (!object) return () => ({ x: 0, y: 0 });
   return (dx, dy) => {
     const position = clampedObjectMovePosition(page, object, { x: object.x + dx, y: object.y + dy });
     return { x: position.x - object.x, y: position.y - object.y };
@@ -14067,9 +14110,11 @@ export function moveDocumentObjects(
   document: ChemDraftDocument,
   ids: readonly string[],
   dx: number,
-  dy: number
+  dy: number,
+  { preserveCarriedMarkAnchors = false }: { preserveCarriedMarkAnchors?: boolean } = {}
 ): ChemDraftDocument {
-  const page = firstPage(document);
+  const page = ids.length > 0 ? pageContainingObject(document, ids[0]) : undefined;
+  if (!page) return document;
   const objectIds = resolveGroupedDocumentObjectIds(page.objects, ids);
   const set = expandWithAnchoredMarkIds(page.objects, objectIds);
   const bounds = selectionBounds(page.objects, [...set]);
@@ -14085,14 +14130,78 @@ export function moveDocumentObjects(
   // One patch batch for the whole selection: each translation reads only its own object, and every
   // object is visited once, so computing all of them against `document` is the same as applying
   // them in turn — without a whole-document clone and validation per object.
+  const carriedMarkIds = cascadeCarriedAnchoredMarkIds(page.objects, set);
   const patches = page.objects.flatMap((object) =>
     set.has(object.id)
       ? translateDocumentObjectByPatches(document, object.id, cdx, cdy, {
-          translateAnchoredGeometry: groupMoveTranslatesArrowGeometry(object, set)
+          translateAnchoredGeometry: groupMoveTranslatesArrowGeometry(object, set),
+          preserveChargeAnchor: object.type === "electron-mark" &&
+            (preserveCarriedMarkAnchors || object.atomAssociation === "explicit") &&
+            carriedMarkIds.has(object.id)
         })
       : []
   );
   return patches.length > 0 ? applyPatches(document, patches, { now: phase4Timestamp }) : document;
+}
+
+/** Keyboard translation shares the object/group and fragment primitives used by canvas dragging. */
+export function moveCanvasSelection(
+  document: ChemDraftDocument,
+  fragments: readonly NativeMoleculeFragmentSelection[],
+  delta: PagePoint
+): ChemDraftDocument {
+  return moveCanvasSelectionWithPositions(document, fragments, delta).document;
+}
+
+export function moveCanvasSelectionWithPositions(
+  document: ChemDraftDocument,
+  fragments: readonly NativeMoleculeFragmentSelection[],
+  delta: PagePoint
+): { document: ChemDraftDocument; positions: ReadonlyMap<string, readonly number[]> } {
+  const selectedId = document.selection.objectIds[0];
+  const page = selectedId ? pageContainingObject(document, selectedId) : undefined;
+  // A molecule's part selection takes precedence over its object highlight, as in a part drag.
+  const fragmentIds = new Set(fragments.map(fragment => fragment.objectId));
+  const ids = page ? resolveGroupedDocumentObjectIds(page.objects, document.selection.objectIds)
+    .filter(id => !fragmentIds.has(id)) : [];
+  let moved = document;
+  if (ids.length > 1) moved = moveDocumentObjects(moved, ids, delta.x, delta.y, { preserveCarriedMarkAnchors: true });
+  else if (ids.length === 1) {
+    const object = objectOnPage(page, ids[0]);
+    if (object) moved = moveDocumentObject(moved, object.id, { x: object.x + delta.x, y: object.y + delta.y });
+  }
+  const positions = new Map<string, readonly number[]>();
+  for (const fragment of fragments) {
+    const result = moveNativeMoleculePartsWithPositions(moved, { ...fragment, kind: "parts" }, delta);
+    moved = result.document;
+    positions.set(fragment.objectId, result.positions);
+  }
+  return { document: moved, positions };
+}
+
+/** Read moved objects at their original positions; selection moves preserve page and object order. */
+export function canvasSelectionMovePairs(
+  before: ChemDraftDocument, after: ChemDraftDocument, fragments: readonly NativeMoleculeFragmentSelection[]
+): Array<[DocumentObject, DocumentObject]> {
+  const selectedId = before.selection.objectIds[0];
+  const page = selectedId ? pageContainingObject(before, selectedId) : undefined;
+  const ids = new Set([
+    ...(page ? resolveGroupedDocumentObjectIds(page.objects, before.selection.objectIds) : []),
+    ...fragments.map(fragment => fragment.objectId)
+  ]);
+  const located: Array<{ pageIndex: number; position: number; pair: [DocumentObject, DocumentObject] }> = [];
+  for (const id of ids) {
+    const sourcePage = pageContainingObject(before, id);
+    if (!sourcePage) continue;
+    const pageIndex = pageIndexByObjectIdIndexes.get(before)?.get(id);
+    objectByIdIndex(sourcePage.objects);
+    const position = objectByIdIndexes.get(sourcePage.objects)?.positions.get(id);
+    if (pageIndex === undefined || position === undefined) continue;
+    const source = sourcePage.objects[position], target = after.pages[pageIndex]?.objects[position];
+    if (target?.id === id) located.push({ pageIndex, position, pair: [source, target] });
+  }
+  located.sort((a, b) => a.pageIndex - b.pageIndex || a.position - b.position);
+  return located.map(entry => entry.pair);
 }
 
 /** Translate precisely the new objects in a plugin insertion. Unlike selection dragging,
@@ -14104,15 +14213,67 @@ export function translateInsertedDocumentObjects(
   const patches = document.pages.flatMap(page => page.objects.flatMap(object => inserted.has(object.id)
     ? translateDocumentObjectByPatches(document, object.id, dx, dy, {
       translateAnchoredGeometry: groupMoveTranslatesArrowGeometry(object, inserted),
+      translateAbsoluteCoordinates: true,
       preserveChargeAnchor: object.type === "electron-mark" && object.anchor.kind === "atom" &&
         object.anchor.objectId !== undefined && inserted.has(object.anchor.objectId)
     }) : []));
   return patches.length ? applyPatches(document, patches, { now: phase4Timestamp }) : document;
 }
 
-export type DocumentAlignMode = "left" | "center" | "right" | "top" | "middle" | "bottom";
-export type DocumentDistributeAxis = "horizontal" | "vertical";
-export type DocumentDistributeMode = "centers" | "spacing";
+/** Host-owned page enlargement: translate every frame and absolute coordinate exactly once.
+ * References still point to the same atoms/objects; no clamping, normalization or selection edit.
+ * Reuse the group translation math, including graphic paths and anchored arrow controls. */
+export function translateDocumentPage(
+  document: ChemDraftDocument, pageId: string, dx: number, dy: number
+): ChemDraftDocument {
+  const pages = document.pages.filter(candidate => candidate.id === pageId);
+  if (pages.length > 1) throw new Error(`Cannot translate ambiguous page "${pageId}".`);
+  const page = pages[0];
+  if (!page || (dx === 0 && dy === 0)) return document;
+  // Patch targets are ID-only. Restrict their lookup and application to the addressed page.
+  if (new Set(page.objects.map(object => object.id)).size !== page.objects.length) {
+    throw new Error(`Cannot translate page "${pageId}" with ambiguous object IDs.`);
+  }
+  const local = adoptDerivedDocument(toEngineDocument(document), { ...document, pages: [page] });
+  const patches = page.objects.flatMap(object => translateDocumentObjectByPatches(local, object.id, dx, dy, {
+    translateAnchoredGeometry: true, preserveChargeAnchor: true, translateAbsoluteCoordinates: true
+  }, object));
+  const moved = applyPatches(local, patches, { now: phase4Timestamp });
+  return adoptDerivedDocument(document, { ...document, pages: document.pages.map(p => p === page ? moved.pages[0]! : p) });
+}
+
+/** The page-fit grant covers only these absolute coordinates. Project them from each original
+ * object without running the mover or accepting any patch fields from it. */
+export function expectedPageTranslation(object: DocumentObject, dx: number, dy: number): DocumentObject {
+  if (!dx && !dy) return object;
+  const position = (point: PagePoint) => ({ x: point.x + dx, y: point.y + dy });
+  const anchor = (value: Anchor): Anchor => value.point ? { ...value, point: position(value.point) } : value;
+  const attachments = <T extends { attachmentPoints: Anchor[] }>(value: T): T =>
+    ({ ...value, attachmentPoints: value.attachmentPoints.map(anchor) });
+  const frame = position(object);
+  switch (object.type) {
+    case "molecule": return { ...object, ...frame, atoms: object.atoms.map(atom => ({ ...atom, ...position(atom) })),
+      superatoms: object.superatoms.map(attachments), rGroups: object.rGroups.map(attachments) };
+    case "electron-mark": return { ...object, ...frame, anchor: anchor(object.anchor) };
+    case "reaction-arrow": return { ...object, ...frame, start: anchor(object.start), end: anchor(object.end) };
+    case "mechanism-arrow": return { ...object, ...frame, source: anchor(object.source), target: anchor(object.target),
+      controlPoints: object.controlPoints.map(position) };
+    case "graphic": return { ...object, ...frame, data: translateGraphicObjectData(object.data, dx, dy) };
+    case "superatom": return { ...object, ...frame, metadata: attachments(object.metadata) };
+    case "r-group-label": return { ...object, ...frame, display: attachments(object.display) };
+    case "text": {
+      const attachment = object.arrowAttachment;
+      if (attachment) return { ...object, ...frame, arrowAttachment: { ...attachment,
+        frame: { ...attachment.frame, origin: position(attachment.frame.origin) } } };
+      return { ...object, ...frame };
+    }
+    default: return { ...object, ...frame };
+  }
+}
+
+export type DocumentAlignMode = ObjectAlignMode;
+export type DocumentDistributeAxis = ObjectDistributeAxis;
+export type DocumentDistributeMode = ObjectDistributeMode;
 
 // The top-level objects participating in the current selection — a selected group appears once as
 // its group object, not as its expanded children, so layout operations treat it as a single item.
@@ -14122,9 +14283,52 @@ function selectionLayoutObjects(document: ChemDraftDocument): DocumentObject[] {
   return page.objects.filter((object) => selectedIds.has(object.id));
 }
 
+/** Any selected atom-associated mark and its selected molecule share a target, even without a group.
+ * Merge intersecting group members too, so no member receives two layout translations. */
+function selectionLayoutUnits(document: ChemDraftDocument, selected = selectionLayoutObjects(document)): string[][] {
+  const page = selectionPage(document);
+  const objects = objectByIdIndex(page.objects);
+  const associations = nativeElectronMarkAssignments(page).anchorByMarkId;
+  const units: Set<string>[] = [];
+  const membersByItem = new Map<string, readonly string[]>();
+  for (const object of selected) {
+    const members = resolveGroupedDocumentObjectIds(page.objects, [object.id]);
+    if (members.length > 0) {
+      membersByItem.set(object.id, members);
+      units.push(new Set([object.id]));
+    }
+  }
+  const owner = new Map<string, Set<string>>();
+  const merge = (a: Set<string>, b: Set<string>) => {
+    if (a === b) return;
+    for (const id of b) {
+      a.add(id);
+      for (const memberId of membersByItem.get(id)!) owner.set(memberId, a);
+    }
+    b.clear();
+  };
+  for (const unit of units) {
+    for (const id of membersByItem.get([...unit][0])!) {
+      const existing = owner.get(id);
+      if (existing) merge(unit, existing);
+      else owner.set(id, unit);
+    }
+  }
+  for (const [id, unit] of owner) {
+    const mark = objects.get(id);
+    if (mark?.type !== "electron-mark") continue;
+    const moleculeId = associations.get(mark.id)?.objectId ??
+      (mark.atomAssociation === "explicit" && mark.anchor.kind === "atom" ? mark.anchor.objectId : undefined);
+    if (!moleculeId || objects.get(moleculeId)?.type !== "molecule") continue;
+    const moleculeUnit = owner.get(moleculeId);
+    if (moleculeUnit) merge(moleculeUnit, unit);
+  }
+  return units.filter(unit => unit.size > 0).map(unit => [...unit]);
+}
+
 // Move a top-level layout item by a delta. For a group this moves every descendant together (the
 // same primitive group dragging uses), so the group keeps its internal arrangement. Unlike
-// moveDocumentObjects it neither clamps to the page nor assumes the first page.
+// moveDocumentObjects it does not clamp to the page.
 interface LayoutItemMove {
   objectId: string;
   dx: number;
@@ -14136,7 +14340,7 @@ interface LayoutItemMove {
  *  marks anchored to them) by dx/dy. */
 function selectionLayoutItemMoves(
   pageObjects: readonly DocumentObject[],
-  itemId: string,
+  itemId: string | readonly string[],
   dx: number,
   dy: number
 ): LayoutItemMove[] {
@@ -14145,7 +14349,7 @@ function selectionLayoutItemMoves(
   }
   const memberIds = expandWithAnchoredMarkIds(
     pageObjects,
-    resolveGroupedDocumentObjectIds(pageObjects, [itemId])
+    resolveGroupedDocumentObjectIds(pageObjects, typeof itemId === "string" ? [itemId] : itemId)
   );
   const objectById = objectByIdIndex(pageObjects);
   return [...memberIds].map((memberId) => {
@@ -14166,7 +14370,9 @@ function selectionLayoutItemMoves(
  * so its deltas are summed here. Applying items one at a time cloned and validated the whole
  * document per object — quadratic for a large selection.
  */
-function applyLayoutItemMoves(document: ChemDraftDocument, moves: readonly LayoutItemMove[], preserveChargeAnchor = false): ChemDraftDocument {
+function applyLayoutItemMoves(
+  document: ChemDraftDocument, moves: readonly LayoutItemMove[], warningsOut?: string[] | null
+): ChemDraftDocument {
   const combined = new Map<string, LayoutItemMove>();
   for (const move of moves) {
     const existing = combined.get(move.objectId);
@@ -14179,21 +14385,66 @@ function applyLayoutItemMoves(document: ChemDraftDocument, moves: readonly Layou
     existing.translateAnchoredGeometry ||= move.translateAnchoredGeometry;
   }
   const objects = objectByIdIndex(selectionPage(document).objects);
+  // Commit reconciliation also visits stationary units. Report stale explicit anchors even
+  // when their unit is an outer distribution anchor or already sits on the alignment edge.
+  if (warningsOut !== null && combined.size > 0) {
+    const page = selectionPage(document);
+    const selectedIds = expandWithAnchoredMarkIds(page.objects,
+      resolveGroupedDocumentObjectIds(page.objects, document.selection.objectIds));
+    for (const id of selectedIds) {
+      const mark = objects.get(id);
+      if (mark?.type !== "electron-mark" || mark.atomAssociation !== "explicit" || mark.anchor.kind !== "atom") continue;
+      const molecule = mark.anchor.objectId ? objects.get(mark.anchor.objectId) : undefined;
+      if (molecule?.type === "molecule" && molecule.atoms.some(atom => atom.id === mark.anchor.atomId)) continue;
+      const warning = `Cannot preserve explicit electron mark "${mark.id}" association: atom "${mark.anchor.atomId}" in molecule "${mark.anchor.objectId}" is missing.`;
+      if (!warningsOut) throw new Error(warning);
+      warningsOut.push(warning);
+    }
+  }
   const patches = [...combined.values()].flatMap((move) => {
     const object = objects.get(move.objectId);
     const anchorMove = object?.type === "electron-mark" && object.anchor.kind === "atom" && object.anchor.objectId
       ? combined.get(object.anchor.objectId) : undefined;
+    const carriedTogether = anchorMove !== undefined &&
+      Math.abs(anchorMove.dx - move.dx) < 1e-9 && Math.abs(anchorMove.dy - move.dy) < 1e-9;
+    // Carried pairs retain their atom identity under one translation, including unselected ordinary
+    // marks. Independent translations keep the existing association policy.
+    const explicitAtomMark = object?.type === "electron-mark" && object.atomAssociation === "explicit" && object.anchor.kind === "atom";
+    if (warningsOut !== null && explicitAtomMark && !carriedTogether) {
+      const molecule = object.anchor.objectId ? objects.get(object.anchor.objectId) : undefined;
+      if (molecule?.type === "molecule" && molecule.atoms.some(atom => atom.id === object.anchor.atomId)) {
+        const warning = `Cannot preserve explicit electron mark "${object.id}" association: the mark is moving independently of molecule "${molecule.id}".`;
+        if (!warningsOut) throw new Error(warning);
+        warningsOut.push(warning);
+      }
+    }
     return translateDocumentObjectByPatches(document, move.objectId, move.dx, move.dy, {
       translateAnchoredGeometry: move.translateAnchoredGeometry,
-      preserveChargeAnchor: preserveChargeAnchor && anchorMove !== undefined &&
-        Math.abs(anchorMove.dx - move.dx) < 1e-9 && Math.abs(anchorMove.dy - move.dy) < 1e-9
+      preserveChargeAnchor: carriedTogether
     });
   });
-  return patches.length > 0 ? applyPatches(document, patches, { now: phase4Timestamp }) : document;
+  if (patches.length === 0) return document;
+  const next = applyPatches(document, patches, { now: phase4Timestamp });
+  // The canvas commands request geometry only and run the electron-mark drop checks themselves.
+  if (warningsOut === null) return next;
+  // Ask the existing assignment resolver what this movement will do at commit. This is a
+  // warning only: do not reconcile or alter chemistry here. Explicit marks were reported above.
+  const beforeAssignments = nativeElectronMarkAssignments(selectionPage(document)).anchorByMarkId;
+  const afterAssignments = nativeElectronMarkAssignments(selectionPage(next)).anchorByMarkId;
+  for (const [markId, anchor] of beforeAssignments) {
+    const mark = objects.get(markId);
+    if (!anchor || mark?.type !== "electron-mark" || mark.atomAssociation === "explicit") continue;
+    const after = afterAssignments.get(markId);
+    if (after?.objectId === anchor.objectId && after.atomId === anchor.atomId) continue;
+    const warning = `Cannot preserve electron mark "${markId}" association: layout movement changes its association with atom "${anchor.atomId}" in molecule "${anchor.objectId}".`;
+    if (!warningsOut) throw new Error(warning);
+    warningsOut.push(warning);
+  }
+  return next;
 }
 
 /** Groups are single items; their selected descendants and attached marks must not move twice. */
-export function selectedArrangementObjectIds(document: ChemDraftDocument): string[] {
+function arrangementRootObjectIds(document: ChemDraftDocument): string[] {
   const page = selectionPage(document);
   const selected = selectionLayoutObjects(document);
   const objects = objectByIdIndex(page.objects);
@@ -14208,6 +14459,7 @@ export function selectedArrangementObjectIds(document: ChemDraftDocument): strin
     if (object.type === "group") object.childObjectIds.forEach(includeDescendant);
   });
   const roots = selected.filter((object) => !contained.has(object.id) &&
+    !(object.type === "text" && object.arrowAttachment?.kind === "conditions") &&
     (object.type !== "group" || resolveGroupedDocumentObjectIds(page.objects, [object.id]).length > 0));
   const moleculeIds = roots.flatMap((object) =>
     resolveGroupedDocumentObjectIds(page.objects, [object.id])
@@ -14216,15 +14468,29 @@ export function selectedArrangementObjectIds(document: ChemDraftDocument): strin
   return roots.filter((object) => object.type !== "electron-mark" || !carried.has(object.id)).map((object) => object.id);
 }
 
+/** Reuse the same association units for arrangement, including marks inside separate groups. */
+function selectionArrangementUnits(document: ChemDraftDocument): string[][] {
+  const objects = objectByIdIndex(selectionPage(document).objects);
+  return selectionLayoutUnits(document, arrangementRootObjectIds(document).map(id => objects.get(id)!));
+}
+
+export function selectedArrangementObjectIds(document: ChemDraftDocument): string[] {
+  return selectionArrangementUnits(document).map(ids => ids[0]);
+}
+
 export function arrangeSelectedDocumentObjects(document: ChemDraftDocument, layout: ArrangementLayout,
   options: Pick<ArrangementOptions, "gap" | "columns" | "gridAlignment"> = {}): { document: ChemDraftDocument; status: string } {
   const page = selectionPage(document);
-  const items = selectedArrangementObjectIds(document).map(id => arrangementItem(page.objects, id)!);
+  const units = selectionArrangementUnits(document);
+  const items = units.map(ids => arrangementItem(page.objects, ids)!);
   const plan = planObjectArrangement(items, layout, { ...options, pageBounds: { x: 0, y: 0, width: page.width, height: page.height } });
   if (!plan.ok) return { document, status: plan.reason === "selection" ? "Select at least two objects or groups" :
     plan.reason === "page" ? "This arrangement does not fit on the page. Try a grid or a larger page." : "Cannot arrange this selection: invalid bounds or spacing." };
-  const next = applyLayoutItemMoves(document, plan.placements.flatMap(p => selectionLayoutItemMoves(page.objects, p.id, p.dx, p.dy)), true);
-  return { document: next, status: next === document ? "Selection is already arranged" : `Arranged ${items.length} objects in ${layout === "oval" ? "an" : "a"} ${layout}${layout === "grid" ? ` (${options.gridAlignment ?? "center"})` : ""}` };
+  const warnings: string[] = [];
+  const unitsById = new Map(units.map(ids => [ids[0], ids]));
+  const next = applyLayoutItemMoves(document, plan.placements.flatMap(p => selectionLayoutItemMoves(page.objects, unitsById.get(p.id)!, p.dx, p.dy)), warnings);
+  const status = next === document ? "Selection is already arranged" : `Arranged ${items.length} objects in ${layout === "oval" ? "an" : "a"} ${layout}${layout === "grid" ? ` (${options.gridAlignment ?? "center"})` : ""}`;
+  return { document: next, status: [status, ...warnings].join("; ") };
 }
 
 // Share a subpixel roundoff allowance between Save and the slider's page constraints. Without
@@ -14235,10 +14501,10 @@ const arrangementSpacingPageEpsilon = 1e-7;
 export function adjustArrangementSpacing(document:ChemDraftDocument,factor:number):{document:ChemDraftDocument;ok:boolean;status:string} {
   const fail=(status:string)=>({document,ok:false,status});
   if(!Number.isFinite(factor) || factor<=0) return fail("Choose a valid spacing");
-  const page=selectionPage(document),ids=selectedArrangementObjectIds(document);
-  if(ids.length<2) return fail("Select at least two compounds or groups");
+  const page=selectionPage(document),units=selectionArrangementUnits(document);
+  if(units.length<2) return fail("Select at least two compounds or groups");
   if(Math.abs(factor-1)<1e-9) return {document,ok:true,status:"Original spacing"};
-  const items=ids.map(id=>arrangementItem(page.objects,id)!);
+  const items=units.map(ids=>arrangementItem(page.objects,ids)!);
   const anchors=items.map(item=>item.anchor ?? {x:item.bounds.x+item.bounds.width/2,y:item.bounds.y+item.bounds.height/2});
   const center={x:anchors.reduce((sum,p)=>sum+p.x,0)/anchors.length,y:anchors.reduce((sum,p)=>sum+p.y,0)/anchors.length};
   const deltas=anchors.map(p=>({x:(p.x-center.x)*(factor-1),y:(p.y-center.y)*(factor-1)}));
@@ -14252,14 +14518,15 @@ export function adjustArrangementSpacing(document:ChemDraftDocument,factor:numbe
     if(a.x<b.x+b.width+12 && a.x+a.width>b.x-12 && a.y<b.y+b.height+12 && a.y+a.height>b.y-12)
       return fail("The compounds need more space between them");
   }
-  const moves=ids.flatMap((id,i)=>selectionLayoutItemMoves(page.objects,id,deltas[i].x,deltas[i].y));
-  const result=applyLayoutItemMoves(document,moves,true);
-  return {document:result,ok:true,status:`Spacing adjusted to ${Math.round(factor*100)}%`};
+  const moves=units.flatMap((ids,i)=>selectionLayoutItemMoves(page.objects,ids,deltas[i].x,deltas[i].y));
+  const warnings: string[] = [];
+  const result=applyLayoutItemMoves(document,moves,warnings);
+  return {document:result,ok:true,status:[`Spacing adjusted to ${Math.round(factor*100)}%`, ...warnings].join("; ")};
 }
 
 export function arrangementSpacingRange(document:ChemDraftDocument):{min:number;max:number} {
   const page = selectionPage(document);
-  const items = selectedArrangementObjectIds(document).map(id => arrangementItem(page.objects, id)!);
+  const items = selectionArrangementUnits(document).map(ids => arrangementItem(page.objects, ids)!);
   if (items.length < 2) return { min: 1, max: 1 };
   const anchors = items.map(item => item.anchor ?? { x: item.bounds.x + item.bounds.width / 2, y: item.bounds.y + item.bounds.height / 2 });
   const center = { x: anchors.reduce((sum, p) => sum + p.x, 0) / anchors.length,
@@ -14302,19 +14569,19 @@ export function arrangementSpacingRange(document:ChemDraftDocument):{min:number;
 }
 
 export function arrangementSpacingPreviewBounds(document:ChemDraftDocument):LayoutBounds|undefined {
-  const page=selectionPage(document),items=selectedArrangementObjectIds(document).flatMap(id=>arrangementItem(page.objects,id) ?? []);
+  const page=selectionPage(document),items=selectionArrangementUnits(document).flatMap(ids=>arrangementItem(page.objects,ids) ?? []);
   if(!items.length) return undefined;
   const x=Math.min(...items.map(i=>i.bounds.x)),y=Math.min(...items.map(i=>i.bounds.y));
   return {x,y,width:Math.max(...items.map(i=>i.bounds.x+i.bounds.width))-x,height:Math.max(...items.map(i=>i.bounds.y+i.bounds.height))-y};
 }
 
-function arrangementItem(pageObjects: readonly DocumentObject[], id: string): ArrangementItem | undefined {
+function arrangementItem(pageObjects: readonly DocumentObject[], ids: readonly string[]): ArrangementItem | undefined {
     const objects = objectByIdIndex(pageObjects);
-    if (!objects.has(id)) return undefined;
-    const members = [...expandWithAnchoredMarkIds(pageObjects, resolveGroupedDocumentObjectIds(pageObjects, [id]))]
+    if (!objects.has(ids[0])) return undefined;
+    const members = [...expandWithAnchoredMarkIds(pageObjects, resolveGroupedDocumentObjectIds(pageObjects, ids))]
       .map((memberId) => objects.get(memberId))
       .filter((object): object is DocumentObject => object !== undefined && object.type !== "group");
-    const visibleMembers = members.length > 0 ? members : [objects.get(id)!];
+    const visibleMembers = members.length > 0 ? members : [objects.get(ids[0])!];
     const boxes = visibleMembers.map((object) =>
       object.type === "molecule" ? moleculeVisualBoundsForArrangement(object) :
         object.type === "text" ? textVisualBoundsForArrangement(object) : documentObjectVisualBounds(object, pageObjects)
@@ -14324,7 +14591,7 @@ function arrangementItem(pageObjects: readonly DocumentObject[], id: string): Ar
     const anchors=moleculeMembers.map(moleculeAnchorForArrangement);
     const anchor=anchors.length ? {x:anchors.reduce((sum,p)=>sum+p.x,0)/anchors.length,
       y:anchors.reduce((sum,p)=>sum+p.y,0)/anchors.length} : undefined;
-    return { id, ...(anchor ? {anchor} : {}), bounds: {
+    return { id: ids[0], ...(anchor ? {anchor} : {}), bounds: {
       x, y,
       width: Math.max(...boxes.map((b) => b.x + b.width)) - x,
       height: Math.max(...boxes.map((b) => b.y + b.height)) - y
@@ -14333,39 +14600,18 @@ function arrangementItem(pageObjects: readonly DocumentObject[], id: string): Ar
 
 export function alignSelectedDocumentObjects(
   document: ChemDraftDocument,
-  mode: DocumentAlignMode
+  mode: DocumentAlignMode,
+  warningsOut?: string[] | null
 ): ChemDraftDocument {
   const page = selectionPage(document);
-  const layoutItems = selectionLayoutObjects(document)
-    .map((object) => ({ id: object.id, bounds: selectionBounds(page.objects, [object.id]) }))
-    .filter((item): item is { id: string; bounds: SelectionBounds } => item.bounds !== undefined);
-  if (layoutItems.length < 2) {
-    return document;
-  }
-  const bounds = selectionBounds(page.objects, layoutItems.map((item) => item.id));
-  if (!bounds) {
-    return document;
-  }
-
-  const moves: LayoutItemMove[] = [];
-  for (const { id, bounds: itemBounds } of layoutItems) {
-    const dx = mode === "left"
-      ? bounds.x - itemBounds.x
-      : mode === "center"
-        ? bounds.centerX - itemBounds.centerX
-        : mode === "right"
-          ? bounds.x + bounds.width - (itemBounds.x + itemBounds.width)
-          : 0;
-    const dy = mode === "top"
-      ? bounds.y - itemBounds.y
-      : mode === "middle"
-        ? bounds.centerY - itemBounds.centerY
-        : mode === "bottom"
-          ? bounds.y + bounds.height - (itemBounds.y + itemBounds.height)
-          : 0;
-    moves.push(...selectionLayoutItemMoves(page.objects, id, dx, dy));
-  }
-  return applyLayoutItemMoves(document, moves);
+  const units = selectionLayoutUnits(document);
+  const items = units.flatMap((ids, index) => {
+    const bounds = selectionBounds(page.objects, ids);
+    return bounds ? [{ id: String(index), bounds }] : [];
+  });
+  const moves = planObjectAlignment(items, mode).flatMap(({ id, dx, dy }) =>
+    selectionLayoutItemMoves(page.objects, units[Number(id)], dx, dy));
+  return applyLayoutItemMoves(document, moves, warningsOut);
 }
 
 // Visual bounds of a top-level layout item, treating a group as a single box (the union of its
@@ -14386,102 +14632,44 @@ function layoutItemVisualBounds(
 export function distributeSelectedDocumentObjects(
   document: ChemDraftDocument,
   axis: DocumentDistributeAxis,
-  mode: DocumentDistributeMode = "centers"
+  mode: DocumentDistributeMode = "centers",
+  warningsOut?: string[] | null
 ): ChemDraftDocument {
   const page = selectionPage(document);
-  const selectedObjects = selectionLayoutObjects(document);
-  if (selectedObjects.length < 3) {
-    return document;
-  }
-
-  if (mode === "spacing") {
-    return distributeSelectedDocumentObjectsBySpacing(document, page.objects, selectedObjects, axis);
-  }
-
-  const centerForAxis = (object: DocumentObject) => {
-    const bounds = layoutItemVisualBounds(page.objects, object);
-    return axis === "horizontal"
-      ? bounds.x + bounds.width / 2
-      : bounds.y + bounds.height / 2;
-  };
-  const sortedObjects = [...selectedObjects].sort((a, b) => centerForAxis(a) - centerForAxis(b));
-  const firstCenter = centerForAxis(sortedObjects[0]);
-  const lastCenter = centerForAxis(sortedObjects[sortedObjects.length - 1]);
-  const spacing = (lastCenter - firstCenter) / (sortedObjects.length - 1);
-  if (Math.abs(spacing) < 1e-6) {
-    return document;
-  }
-
-  const moves: LayoutItemMove[] = [];
-  sortedObjects.forEach((object, index) => {
-    const targetCenter = firstCenter + spacing * index;
-    const delta = targetCenter - centerForAxis(object);
-    moves.push(...(axis === "horizontal"
-      ? selectionLayoutItemMoves(page.objects, object.id, delta, 0)
-      : selectionLayoutItemMoves(page.objects, object.id, 0, delta)));
-  });
-  return applyLayoutItemMoves(document, moves);
-}
-
-function distributeSelectedDocumentObjectsBySpacing(
-  document: ChemDraftDocument,
-  pageObjects: readonly DocumentObject[],
-  selectedObjects: readonly DocumentObject[],
-  axis: DocumentDistributeAxis
-): ChemDraftDocument {
-  const visualBoundsById = new Map(selectedObjects.map((object) => [object.id, layoutItemVisualBounds(pageObjects, object)] as const));
-  const visualBoundsForObject = (object: DocumentObject): ObjectBounds => {
-    const bounds = visualBoundsById.get(object.id);
-    if (!bounds) {
-      throw new Error(`Expected visual bounds for selected object ${object.id}.`);
-    }
-    return bounds;
-  };
-  const startForAxis = (object: DocumentObject) => {
-    const bounds = visualBoundsForObject(object);
-    return axis === "horizontal" ? bounds.x : bounds.y;
-  };
-  const sizeForAxis = (object: DocumentObject) => {
-    const bounds = visualBoundsForObject(object);
-    return axis === "horizontal" ? bounds.width : bounds.height;
-  };
-  const sortedObjects = [...selectedObjects].sort((a, b) => startForAxis(a) - startForAxis(b));
-  const firstStart = startForAxis(sortedObjects[0]);
-  const lastObject = sortedObjects[sortedObjects.length - 1];
-  const lastEnd = startForAxis(lastObject) + sizeForAxis(lastObject);
-  const totalSize = sortedObjects.reduce((sum, object) => sum + sizeForAxis(object), 0);
-  const gap = (lastEnd - firstStart - totalSize) / (sortedObjects.length - 1);
-
-  const moves: LayoutItemMove[] = [];
-  let targetStart = firstStart;
-  sortedObjects.forEach((object, index) => {
-    if (index === 0 || index === sortedObjects.length - 1) {
-      targetStart += sizeForAxis(object) + gap;
-      return;
-    }
-    const delta = targetStart - startForAxis(object);
-    moves.push(...(axis === "horizontal"
-      ? selectionLayoutItemMoves(pageObjects, object.id, delta, 0)
-      : selectionLayoutItemMoves(pageObjects, object.id, 0, delta)));
-    targetStart += sizeForAxis(object) + gap;
-  });
-  return applyLayoutItemMoves(document, moves);
+  const units = selectionLayoutUnits(document);
+  const objects = objectByIdIndex(page.objects);
+  const items = units.map((ids, index) => ({ id: String(index), bounds: combinedLayoutBounds(
+    ids.map(id => layoutItemVisualBounds(page.objects, objects.get(id)!))
+  )! }));
+  const moves = planObjectDistribution(items, axis, mode).flatMap(({ id, dx, dy }) =>
+    selectionLayoutItemMoves(page.objects, units[Number(id)], dx, dy));
+  return applyLayoutItemMoves(document, moves, warningsOut);
 }
 
 export function duplicateSelectedDocumentObjects(
   document: ChemDraftDocument,
-  offset: PagePoint = { x: 24, y: 24 }
+  offset: PagePoint = { x: 24, y: 24 },
+  warningsOut?: string[]
 ): ChemDraftDocument {
   const page = firstPage(document);
   const directlySelected = new Set(document.selection.objectIds);
   const selectedGroups = page.objects.filter((object): object is GroupObject =>
     object.type === "group" && directlySelected.has(object.id)
   );
-  const selectedIds = new Set(selectedTransformObjectIds(document));
-  const selectedObjects = page.objects.filter((object) => selectedIds.has(object.id));
+  const selectedIds = new Set(withArrowAttachmentIds(page.objects, selectedTransformObjectIds(document)));
+  // A molecule's charge and radical marks are separate objects: copying only the molecule recomputes
+  // the copy's charge as 0. Carry each duplicated molecule's marks with it, by the same rule as the
+  // clipboard (a mark that is also selected is already in `selectedIds`, so it is copied once).
+  const carriedMarkById = new Map(electronMarksCarriedWithMolecules(page,
+    page.objects.filter((object): object is MoleculeObject => object.type === "molecule" && selectedIds.has(object.id)))
+    .map((carried) => [carried.mark.id, carried] as const));
+  const selectedObjects = page.objects.filter((object) => selectedIds.has(object.id) || carriedMarkById.has(object.id));
   if (selectedObjects.length === 0) {
     return document;
   }
+  // What each copy is cloned from: a carried mark in the form its molecule's copy keeps (anchored to
+  // its atom, so the copy cannot be attributed to the original's atoms).
+  const copySources = selectedObjects.map((object) => carriedMarkById.get(object.id)?.copySource ?? object);
 
   // One patch batch, with ids minted exactly as one-at-a-time additions would mint them: adding each
   // duplicate separately cloned and validated the whole document per object (and rescanned every id
@@ -14491,14 +14679,26 @@ export function duplicateSelectedDocumentObjects(
   const duplicates: DocumentObject[] = [];
   const duplicateIds: string[] = [];
   const duplicateIdByOriginalId = new Map<string, string>();
-  for (const object of selectedObjects) {
+  for (const object of copySources) {
     const duplicate = structuredClone(object) as DocumentObject;
+    // Standalone marks use the normal policy; attached pairs are remapped after all copies exist. A
+    // deliberately floating mark (an explicit point anchor) stays floating, as a move keeps it: losing
+    // the flag would let its copy be attributed to whichever atom it lands near, the original's included.
+    if (duplicate.type === "electron-mark" && !(duplicate.atomAssociation === "explicit" && duplicate.anchor.kind === "point")) {
+      delete duplicate.atomAssociation;
+    }
     duplicate.id = allocateId(duplicateObjectIdPrefix(object));
     duplicates.push(duplicate);
     duplicateIds.push(duplicate.id);
     duplicateIdByOriginalId.set(object.id, duplicate.id);
     patches.push({ op: "addObject", pageId: page.id, object: duplicate });
   }
+  remapCopiedElectronMarkAssociations(copySources,
+    new Map(copySources.map((object, index) => [object.id, duplicates[index]])), warningsOut);
+  // A copied charge or radical that does not belong to a copied molecule stays loose: normalization
+  // would otherwise attribute it to whatever molecule it lands near, an unselected one included.
+  const copiedMoleculeIds = new Set(duplicates.flatMap((duplicate) => duplicate.type === "molecule" ? [duplicate.id] : []));
+  for (const duplicate of duplicates) keepUnboundCopiedMarkLoose(duplicate, copiedMoleculeIds);
 
   // Every group reachable inside a selected group, innermost first, so a nested group's copy exists
   // before the group containing it maps its children. Only the selected groups used to be copied —
@@ -14563,16 +14763,81 @@ export function duplicateSelectedDocumentObjects(
     patches.push({ op: "addObject", pageId: page.id, object: duplicateGroup });
   }
 
+  remapCopiedBracketPairs(duplicates, duplicateIdByOriginalId, warningsOut);
+
   // The copies of what was selected at the top level: a nested group's copy is reached through its
   // parent's, as the original was.
+  remapCopiedReactionReferences(document, patches, duplicateIdByOriginalId);
+  // Marks copied only because their molecule was: they follow it but are not part of the selection.
+  // Every carried mark is now atom-anchored to its copied molecule, so the move below carries it with
+  // that molecule (or the group copy containing it) exactly once, like any atom-anchored mark.
+  const carriedOnlyDuplicateIds = new Set(selectedObjects.flatMap((object) =>
+    carriedMarkById.has(object.id) && !selectedIds.has(object.id) ? [duplicateIdByOriginalId.get(object.id)!] : []));
   const selectionIds = [
     ...duplicateGroupIds.filter((duplicateId) => !groupedDuplicateChildIds.has(duplicateId)),
-    ...duplicateIds.filter((duplicateId) => !groupedDuplicateChildIds.has(duplicateId))
+    ...duplicateIds.filter((duplicateId) => !groupedDuplicateChildIds.has(duplicateId) && !carriedOnlyDuplicateIds.has(duplicateId))
   ];
   patches.push({ op: "setSelection", pageId: page.id, objectIds: selectionIds });
 
+  for (const duplicate of duplicates) {
+    if (duplicate.type !== "text" || duplicate.arrowAttachment?.kind !== "conditions") continue;
+    const parentObjectId = duplicateIdByOriginalId.get(duplicate.arrowAttachment.parentObjectId);
+    duplicate.arrowAttachment = parentObjectId ? { ...duplicate.arrowAttachment, parentObjectId } : undefined;
+  }
   const next = applyPatches(document, patches, { now: phase4Timestamp });
-  return moveDocumentObjects(next, selectionIds, offset.x, offset.y);
+  const moved = moveDocumentObjects(next, selectionIds, offset.x, offset.y);
+  const result = copyNativeObjectExtensions(document, reconcileReactionArrowAttachments(moved), duplicateIdByOriginalId);
+  const chemistryChanges = duplicatedChemistryChanges(document, result, page.id, selectedObjects, duplicateIdByOriginalId);
+  if (chemistryChanges.length === 0) return result;
+  // Refuse the duplicate rather than commit a copy whose chemistry differs from its original.
+  if (!warningsOut) throw new Error(chemistryChanges[0]);
+  warningsOut.push(...chemistryChanges);
+  return document;
+}
+
+/**
+ * Duplicate must not change chemistry (AGENTS.md section 7). Commit-normalizes the document before
+ * and after, as the commit funnel will, and lists every atom of a duplicated molecule whose charge,
+ * mark charge or radicals differ: on the original (a copied mark attributed to it) or on the copy
+ * (compared with the original before the duplicate). Neutral molecules are checked too, since a
+ * copy can attract a nearby loose mark away from, or onto, them. Empty when the duplicate is faithful.
+ *
+ * Only Duplicate can check a copy against its original, so this stays here, using the commit guard's
+ * comparison (`moleculeAtomChemistryChanges`). Molecules that were not duplicated are checked once,
+ * for every operation, by the commit funnel (`commitChemistryGuard.ts`) on the final document.
+ */
+function duplicatedChemistryChanges(
+  before: ChemDraftDocument,
+  result: ChemDraftDocument,
+  pageId: string,
+  selectedObjects: readonly DocumentObject[],
+  duplicateIdByOriginalId: ReadonlyMap<string, string>
+): string[] {
+  const originals = selectedObjects.filter((object): object is MoleculeObject => object.type === "molecule");
+  // Without an electron-mark on the page, normalization treats a copy exactly as its original.
+  const resultPage = result.pages.find((candidate) => candidate.id === pageId);
+  if (originals.length === 0 || !resultPage?.objects.some((object) => object.type === "electron-mark")) return [];
+  const beforePage = normalizeCommittedDocument(before).pages.find((candidate) => candidate.id === pageId);
+  const page = normalizeCommittedDocument(result).pages.find((candidate) => candidate.id === pageId);
+  if (!beforePage || !page) return [];
+  const changes: string[] = [];
+  const compare = (sourceId: string, expected: MoleculeObject, actual: MoleculeObject, which: string) => {
+    for (const change of moleculeAtomChemistryChanges(expected, actual)) {
+      changes.push(`Cannot duplicate molecule "${sourceId}" without changing chemistry: ` + (change.after
+        ? `the ${which}'s atom "${change.atomId}" would have charge ${change.after.formalCharge} and ` +
+          `${change.after.markRadicals} radical marks instead of ${change.before.formalCharge} and ${change.before.markRadicals}.`
+        : `the ${which} would not have atom "${change.atomId}".`));
+    }
+  };
+  for (const source of originals) {
+    const original = objectOnPage(beforePage, source.id);
+    const originalAfter = objectOnPage(page, source.id);
+    const copy = objectOnPage(page, duplicateIdByOriginalId.get(source.id) ?? "");
+    if (original?.type !== "molecule") continue;
+    if (originalAfter?.type === "molecule") compare(source.id, original, originalAfter, "original");
+    if (copy?.type === "molecule") compare(source.id, original, copy, "copy");
+  }
+  return changes;
 }
 
 /**
@@ -14591,7 +14856,7 @@ export function createSelectionClipboardPayload(
   moleculeFragments: readonly NativeMoleculeFragmentSelection[] = []
 ): ChemDraftSelectionClipboardPayload | undefined {
   const page = firstPage(document);
-  const selectedObjectIds = selectedTransformObjectIds(document);
+  const selectedObjectIds = withArrowAttachmentIds(page.objects, selectedTransformObjectIds(document));
   const selectedIdSet = new Set(selectedObjectIds);
   const objects = page.objects.filter((object) => selectedIdSet.has(object.id));
   const selectedGroups = page.objects.filter((object): object is GroupObject =>
@@ -14601,9 +14866,10 @@ export function createSelectionClipboardPayload(
     document,
     moleculeFragments.filter((fragment) => !selectedIdSet.has(fragment.objectId))
   );
-  const carriedMarks = objects.flatMap((object) => object.type === "molecule"
-    ? anchoredElectronMarksForTransform(page.objects, object.id, new Set(object.atoms.map((atom) => atom.id)))
-    : []);
+  // The marks a copied molecule carries, by the rule Duplicate uses. Listed after `objects`, so a mark
+  // that was also selected is replaced, in place, by the form its molecule's copy keeps.
+  const carriedMarks = electronMarksCarriedWithMolecules(page,
+    objects.filter((object): object is MoleculeObject => object.type === "molecule")).map(({ copySource }) => copySource);
   const copiedObjects = [...new Map([
     ...objects,
     ...selectedGroups.filter((group) => group.childObjectIds.some((childId) => selectedIdSet.has(childId))),
@@ -14615,10 +14881,16 @@ export function createSelectionClipboardPayload(
     return undefined;
   }
 
+  const clipboardObjects = structuredClone(copiedObjects) as DocumentObject[];
+  const warnings: string[] = [];
+  remapCopiedBracketPairs(clipboardObjects, new Map(clipboardObjects.map(object => [object.id, object.id])), warnings);
+  const nativeSource = selectionClipboardNativeSource(document, clipboardObjects);
   return {
     kind: "chemdraft-selection",
     version: 1,
-    objects: structuredClone(copiedObjects) as DocumentObject[],
+    objects: clipboardObjects,
+    ...(nativeSource ? { nativeSource } : {}),
+    ...(warnings.length ? { warnings } : {}),
     selectionIds: [
       ...document.selection.objectIds.filter((objectId) =>
         selectedIdSet.has(objectId) || selectedGroups.some((group) => group.id === objectId)
@@ -14669,10 +14941,10 @@ function createNativeMoleculeFragmentClipboardPayload(
     const bonds = molecule.bonds.filter((bond) =>
       keptAtomIds.has(bond.fromAtomId) && keptAtomIds.has(bond.toAtomId)
     );
-    objects.push(
-      moleculeWithPrunedRingStyles(refreshNativeSingleBondGraph(molecule, atoms, bonds)),
-      ...anchoredElectronMarksForTransform(page.objects, molecule.id, keptAtomIds)
-    );
+    // The fragment keeps the molecule's id, so the shared rule keeps exactly the marks on its atoms.
+    const fragmentMolecule = moleculeWithPrunedRingStyles(refreshNativeSingleBondGraph(molecule, atoms, bonds));
+    objects.push(fragmentMolecule,
+      ...electronMarksCarriedWithMolecules(page, [fragmentMolecule]).map(({ copySource }) => copySource));
   }
 
   const bounds = selectionBounds(objects, objects.map((object) => object.id));
@@ -14692,7 +14964,20 @@ function createNativeMoleculeFragmentClipboardPayload(
 export function serializeSelectionClipboardPayload(
   payload: ChemDraftSelectionClipboardPayload
 ): string {
-  return JSON.stringify(payload);
+  const { nativeSource, ...serialized } = payload;
+  if (!nativeSource) return JSON.stringify(serialized);
+  // Ship source values through the same reader/writer contract as native files, rather than
+  // trusting an arbitrary extension-state sidecar supplied by the clipboard.
+  const native = JSON.parse(serializeDocument(nativeSource)) as ChemDraftDocument;
+  return JSON.stringify({ ...serialized, objects: native.pages[0]!.objects,
+    formatVersion: native.formatVersion, minAppVersion: native.minAppVersion, ignorableFields: native.ignorableFields });
+}
+
+function selectionClipboardNativeSource(document: ChemDraftDocument, objects: DocumentObject[]): ChemDraftDocument | undefined {
+  const empty = createEmptyDocument({ pageId: firstPage(document).id });
+  const scoped = { ...empty, pages: [{ ...empty.pages[0]!, objects }] };
+  const copied = copyNativeObjectExtensions(document, scoped, new Map(objects.map(object => [object.id, object.id])));
+  return copied.compatibility.nativeExtensions?.length ? copied : undefined;
 }
 
 // Human-readable representation for the public `text/plain` clipboard flavor. External apps (Word,
@@ -14732,9 +15017,14 @@ export function parseSelectionClipboardPayload(
       return undefined;
     }
 
-    const objects = payload.objects
-      .map(parseClipboardDocumentObject)
-      .filter((object): object is DocumentObject => object !== undefined);
+    const empty = createEmptyDocument();
+    const read = readDocument({ ...empty,
+      ...(payload.formatVersion !== undefined ? { formatVersion: payload.formatVersion } : {}),
+      ...(payload.minAppVersion !== undefined ? { minAppVersion: payload.minAppVersion } : {}),
+      ...(payload.ignorableFields !== undefined ? { ignorableFields: payload.ignorableFields } : {}),
+      pages: [{ ...empty.pages[0]!, objects: payload.objects }]
+    });
+    const objects = read.document.pages[0]!.objects;
     if (objects.length === 0 || objects.length !== payload.objects.length) {
       return undefined;
     }
@@ -14743,6 +15033,8 @@ export function parseSelectionClipboardPayload(
       kind: "chemdraft-selection",
       version: 1,
       objects,
+      ...(read.document.compatibility.nativeExtensions?.length ? { nativeSource: read.document } : {}),
+      ...(Array.isArray(payload.warnings) ? { warnings: payload.warnings.filter((message): message is string => typeof message === "string") } : {}),
       selectionIds: payload.selectionIds.filter((id): id is string => typeof id === "string"),
       bounds: {
         x: payload.bounds.x,
@@ -14762,10 +15054,115 @@ export function parseSelectionClipboardPayload(
   }
 }
 
+function remapCopiedBracketPairs(objects: DocumentObject[], idMap: ReadonlyMap<string, string>, warningsOut: string[] = []) {
+  const completePairs = bracketPairs(objects);
+  const pairs = new Map<string, string>();
+  const copiedById = new Map(objects.map(object => [object.id, object]));
+  const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
+  const missingByPair = new Map<string, string[]>();
+  // Validate the entire pair before mutating either half. Atom/bond ids stay molecule-local.
+  for (const [pairId, pair] of completePairs) {
+    const missing = new Set<string>();
+    const checkObject = (id: string, atomId?: unknown, bondId?: unknown) => {
+      const copied = copiedById.get(idMap.get(id) ?? "");
+      if (!copied || typeof atomId === "string" && (copied.type !== "molecule" || !copied.atoms.some(atom => atom.id === atomId)) ||
+        typeof bondId === "string" && (copied.type !== "molecule" || !copied.bonds.some(bond => bond.id === bondId))) {
+        missing.add([id, atomId, bondId].filter(value => typeof value === "string").join("/"));
+      }
+    };
+    for (const bracket of pair) {
+      bracket.containedObjectIds.forEach(id => checkObject(id));
+      bracket.crossingBondIds?.forEach(ref => checkObject(ref.objectId, undefined, ref.bondId));
+      const unknown = bracket.compatibility?.unknown;
+      if (typeof unknown?.cdxmlBracketMembership === "string") {
+        try {
+          const membership: unknown = JSON.parse(unknown.cdxmlBracketMembership);
+          if (!Array.isArray(membership) || membership.some(id => typeof id !== "string")) missing.add("invalid membership snapshot");
+          else membership.forEach(id => checkObject(id));
+        } catch { missing.add("invalid membership snapshot"); }
+      }
+      if (Array.isArray(unknown?.cdxmlBracketMemberObjectIds)) for (const id of unknown.cdxmlBracketMemberObjectIds) {
+        if (typeof id === "string") checkObject(id);
+      }
+      if (Array.isArray(unknown?.cdxmlBracketMembers)) for (const member of unknown.cdxmlBracketMembers) {
+        if (!record(member)) continue;
+        if (typeof member.objectId === "string") checkObject(member.objectId, member.atomId);
+        else missing.add(`member ${String(member.sourceId)}`);
+      }
+      if (Array.isArray(unknown?.cdxmlBracketCrossings)) for (const crossing of unknown.cdxmlBracketCrossings) {
+        if (!record(crossing)) continue;
+        if (record(crossing.ref) && typeof crossing.ref.objectId === "string") {
+          const molecule = copiedById.get(idMap.get(crossing.ref.objectId) ?? "");
+          const sourceInner = record(crossing.attributes) ? crossing.attributes.InnerAtomID : undefined;
+          const atomSources = molecule?.compatibility?.unknown.cdxmlAtomIdsByAtomId;
+          const innerAtomId = crossing.innerAtomId ?? (record(atomSources) ? Object.keys(atomSources).find(id => atomSources[id] === sourceInner) : undefined);
+          checkObject(crossing.ref.objectId, innerAtomId, crossing.ref.bondId);
+          if (sourceInner !== undefined && innerAtomId === undefined) missing.add(`InnerAtomID ${String(sourceInner)}`);
+        } else missing.add(`crossing BondID ${record(crossing.attributes) ? String(crossing.attributes.BondID) : "unknown"}`);
+      }
+    }
+    missingByPair.set(pairId, [...missing]);
+  }
+  for (const object of objects) if (object.type === "bracket") {
+    const complete = !!object.pairId && completePairs.has(object.pairId);
+    const missing = object.pairId ? missingByPair.get(object.pairId) ?? [] : [];
+    if (object.pairId && complete) {
+      const pairId = pairs.get(object.pairId) ?? object.id;
+      pairs.set(object.pairId, pairId); object.pairId = pairId;
+    } else {
+      const plain = withoutBracketPairMetadata(object);
+      delete object.pairId;
+      delete object.repeatUnit;
+      delete object.label;
+      delete object.bracketUsage;
+      delete object.repeatCount;
+      delete object.crossingBondIds;
+      Object.assign(object, plain);
+    }
+    object.containedObjectIds = object.containedObjectIds.flatMap(id => {
+      const mapped = idMap.get(id);
+      if (mapped === undefined) warningsOut.push(`Bracket ${object.id}: membership ${id} was dropped because the object was not copied.`);
+      return mapped === undefined ? [] : [mapped];
+    });
+    object.crossingBondIds = object.crossingBondIds?.flatMap(ref => {
+      const mapped = idMap.get(ref.objectId);
+      const molecule = objects.find(object => object.id === mapped);
+      if (!mapped || molecule?.type !== "molecule" || !molecule.bonds.some(bond => bond.id === ref.bondId)) {
+        warningsOut.push(`Bracket ${object.id}: crossing ${ref.objectId}/${ref.bondId} was dropped because the bond was not copied.`);
+      }
+      return mapped && molecule?.type === "molecule" && molecule.bonds.some(bond => bond.id === ref.bondId)
+        ? [{ objectId: mapped, bondId: ref.bondId }] : [];
+    });
+    if (object.compatibility) {
+      const unknown = object.compatibility.unknown;
+      if (complete && missing.length === 0) {
+        // Imported pairs can share the same record arrays; replace rather than remap twice.
+        if (Array.isArray(unknown.cdxmlBracketMembers)) unknown.cdxmlBracketMembers = unknown.cdxmlBracketMembers.map(member =>
+          record(member) && typeof member.objectId === "string" ? { ...member, objectId: idMap.get(member.objectId)! } : member);
+        if (Array.isArray(unknown.cdxmlBracketCrossings)) unknown.cdxmlBracketCrossings = unknown.cdxmlBracketCrossings.map(crossing =>
+          record(crossing) && record(crossing.ref) && typeof crossing.ref.objectId === "string"
+            ? { ...crossing, ref: { ...crossing.ref, objectId: idMap.get(crossing.ref.objectId)! } } : crossing);
+        if (Array.isArray(unknown.cdxmlBracketMemberObjectIds)) unknown.cdxmlBracketMemberObjectIds = unknown.cdxmlBracketMemberObjectIds.map(id => typeof id === "string" ? idMap.get(id) : id);
+        if (typeof unknown.cdxmlBracketMembership === "string") {
+          const membership: unknown = JSON.parse(unknown.cdxmlBracketMembership);
+          if (Array.isArray(membership)) unknown.cdxmlBracketMembership = JSON.stringify(membership.flatMap(id => typeof id === "string" && idMap.has(id) ? [idMap.get(id)] : []));
+        }
+      } else {
+        delete unknown.cdxmlBracketDeletedAtoms;
+        const dropped = ["bracketedGroup", "cdxmlBracketAttachment", "cdxmlBracketCrossings", "cdxmlBracketMembership",
+          "cdxmlBracketMemberObjectIds", "cdxmlBracketMembers", "cdxmlBracketState", "cdxmlBracketInvalidRepeatCount"].filter(key => key in unknown);
+        for (const key of dropped) delete unknown[key];
+        if (dropped.length) warningsOut.push(`Bracket ${object.id}: preserved ${dropped.join(", ")} data was dropped because ${complete ? `references were not copied: ${missing.join(", ")}` : "its complete pair was not copied"}.`);
+      }
+    }
+  }
+}
+
 export function pasteSelectionClipboardPayload(
   document: ChemDraftDocument,
   payload: ChemDraftSelectionClipboardPayload,
-  point: PagePoint
+  point: PagePoint,
+  warningsOut?: string[]
 ): ChemDraftDocument {
   const page = firstPage(document);
   const dx = point.x - payload.bounds.centerX;
@@ -14783,13 +15180,30 @@ export function pasteSelectionClipboardPayload(
   for (const object of sourceChildren) {
     const clone = structuredClone(object) as DocumentObject;
     clone.id = allocateId(duplicateObjectIdPrefix(object));
-    const pasted = translatedClipboardObject(clone, dx, dy);
+    const pasted = translatedClipboardObject(clone, dx, dy, document);
     idBySourceId.set(object.id, pasted.id);
     pastedById.set(pasted.id, pasted);
     patches.push({ op: "addObject", pageId: page.id, object: pasted });
   }
+  remapCopiedElectronMarkAssociations(sourceChildren,
+    new Map(sourceChildren.map(object => [object.id, pastedById.get(idBySourceId.get(object.id)!)!])), warningsOut);
+  // A pasted charge or radical that names no pasted molecule stays loose, as on Duplicate, so it can
+  // never charge a molecule already on the page. A mark naming a pasted molecule keeps the remap
+  // above, or its legacy fallback when the copied atom is missing.
+  const sourceMoleculeIds = new Set(sourceChildren.flatMap((object) => object.type === "molecule" ? [object.id] : []));
+  const pastedMoleculeIds = new Set([...sourceMoleculeIds].map((id) => idBySourceId.get(id)!));
+  for (const source of sourceChildren) {
+    if (source.type !== "electron-mark" || sourceMoleculeIds.has(source.anchor.objectId ?? "")) continue;
+    keepUnboundCopiedMarkLoose(pastedById.get(idBySourceId.get(source.id)!)!, pastedMoleculeIds);
+  }
 
   // Object ids are reminted on paste; atom ids remain local to their cloned molecule.
+  for (const object of sourceChildren) {
+    const clone = pastedById.get(idBySourceId.get(object.id)!);
+    if (clone?.type !== "text" || clone.arrowAttachment?.kind !== "conditions") continue;
+    const parentObjectId = idBySourceId.get(clone.arrowAttachment.parentObjectId);
+    clone.arrowAttachment = parentObjectId ? { ...clone.arrowAttachment, parentObjectId } : undefined;
+  }
   // Restore anchors only after every child is present, even if the mark preceded its molecule.
   for (const object of sourceChildren) {
     if (object.type !== "electron-mark" || object.anchor.kind !== "atom") {
@@ -14828,15 +15242,129 @@ export function pasteSelectionClipboardPayload(
     patches.push({ op: "addObject", pageId: page.id, object: pastedGroup });
   }
 
+  warningsOut?.push(...(payload.warnings ?? []));
+  remapCopiedBracketPairs([...pastedById.values()], idBySourceId, warningsOut);
+
   const selectedIds = payload.selectionIds
     .map((sourceId) => idBySourceId.get(sourceId))
     .filter((objectId): objectId is string => objectId !== undefined);
   const fallbackSelectionIds = selectedIds.length > 0
     ? selectedIds
     : [...idBySourceId.values()];
+  remapCopiedReactionReferences(document, patches, idBySourceId);
   patches.push({ op: "setSelection", pageId: page.id, objectIds: fallbackSelectionIds });
 
-  return applyPatches(document, patches, { now: phase4Timestamp });
+  const next = applyPatches(document, patches, { now: phase4Timestamp });
+  // No chemistry check here: MainWindow moves the pasted objects to the pointer or the repeat-paste
+  // position after this returns, so only the commit funnel sees where they finally land
+  // (`commitChemistryGuard.ts` refuses a paste that would change a molecule already on the page).
+  return payload.nativeSource ? copyNativeObjectExtensions(payload.nativeSource, next, idBySourceId) : next;
+}
+
+/**
+ * Marks a copied charge or radical mark (Duplicate, paste) as deliberately floating unless it is
+ * explicitly bound to an atom of a molecule copied in the same operation. Normalization never
+ * associates an explicit point anchor by proximity (`nativeElectronMarkAssignments`), so the copy
+ * cannot charge a molecule it was not copied with; a user's later direct drop can still attach it.
+ * Lone pairs carry no chemistry and keep the existing standalone-copy policy.
+ */
+function keepUnboundCopiedMarkLoose(copy: DocumentObject, copiedMoleculeIds: ReadonlySet<string>): void {
+  if (copy.type !== "electron-mark") return;
+  const { charge, radicals } = electronMarkAtomContribution(copy);
+  if (charge === 0 && radicals === 0) return;
+  if (copy.atomAssociation === "explicit" && (copy.anchor.kind === "point" ||
+    (copy.anchor.kind === "atom" && copy.anchor.objectId !== undefined && copiedMoleculeIds.has(copy.anchor.objectId)))) return;
+  if (copy.anchor.kind !== "point") copy.anchor = { kind: "point", point: nativeChargeMarkCenter(copy) };
+  copy.atomAssociation = "explicit";
+}
+
+/** Copies retain local atom ids: remap the molecule id and validate the copied atom identity. */
+function remapCopiedElectronMarkAssociations(
+  sources: readonly DocumentObject[],
+  copiesBySourceId: ReadonlyMap<string, DocumentObject>,
+  warningsOut?: string[]
+): void {
+  for (const source of sources) {
+    if (source.type !== "electron-mark" || source.anchor.objectId === undefined) continue;
+    if (source.anchor.kind === "bond" || source.anchor.kind === "object") {
+      // A legacy bond or object anchor names the molecule only; its bond id is local to the copy.
+      const copiedTarget = copiesBySourceId.get(source.anchor.objectId);
+      const markCopy = copiesBySourceId.get(source.id);
+      if (copiedTarget && markCopy?.type === "electron-mark") markCopy.anchor = { ...source.anchor, objectId: copiedTarget.id };
+      continue;
+    }
+    if (source.anchor.kind !== "atom") continue;
+    const molecule = copiesBySourceId.get(source.anchor.objectId);
+    // Copying just a mark retains the existing standalone association policy.
+    if (!molecule) continue;
+    const copy = copiesBySourceId.get(source.id);
+    if (copy?.type !== "electron-mark") continue;
+    if (molecule.type !== "molecule" || !molecule.atoms.some(atom => atom.id === source.anchor.atomId)) {
+      // Legacy geometric anchors may be stale; retain their existing fallback policy.
+      if (source.atomAssociation !== "explicit") continue;
+      const warning = `Cannot preserve explicit electron mark "${source.id}" association: copied atom "${source.anchor.atomId}" in molecule "${source.anchor.objectId}" is missing.`;
+      if (!warningsOut) throw new Error(warning);
+      warningsOut.push(warning);
+      continue;
+    }
+    copy.anchor = { ...source.anchor, objectId: molecule.id };
+    // Preserve the copied pair even when its offset places it nearer an original atom.
+    copy.atomAssociation = "explicit";
+  }
+}
+
+/** A copied step refers to the copied drawables, including forward references and shared intermediates. */
+function remapCopiedReactionReferences(document: ChemDraftDocument, patches: DocumentPatch[], ids: ReadonlyMap<string, string>): void {
+  const remap = (references: readonly string[]) => references.flatMap(id => {
+    const copiedId = ids.get(id);
+    return copiedId === undefined ? [] : [copiedId];
+  });
+  const copiedSchemeKeys = new Map<string, string>();
+  const schemeKeys = new Set<string>();
+  for (const object of [
+    ...document.pages.flatMap(page => page.objects),
+    ...patches.flatMap(patch => patch.op === "addObject" ? [patch.object] : [])
+  ]) {
+    const key = object.type === "reaction" ? object.compatibility?.unknown.cdxmlSchemeKey : undefined;
+    if (typeof key === "string") schemeKeys.add(key);
+  }
+  for (const patch of patches) {
+    if (patch.op !== "addObject" || patch.object.type !== "reaction") continue;
+    const reaction = patch.object;
+    const source = reaction.compatibility?.unknown;
+    let compatibility = reaction.compatibility;
+    if (source && compatibility) {
+      const unknown = { ...source };
+      if (typeof source.cdxmlSchemeKey === "string") {
+        let key = copiedSchemeKeys.get(source.cdxmlSchemeKey);
+        if (key === undefined) {
+          key = `copied_scheme_${reaction.id}`;
+          const prefix = key;
+          let suffix = 1;
+          while (schemeKeys.has(key)) key = `${prefix}_${suffix++}`;
+          schemeKeys.add(key);
+          copiedSchemeKeys.set(source.cdxmlSchemeKey, key);
+        }
+        unknown.cdxmlSchemeKey = key;
+        delete unknown.cdxmlSchemeId;
+      }
+      const references = source.cdxmlStepReferences;
+      if (references && typeof references === "object" && !Array.isArray(references)) {
+        unknown.cdxmlStepReferences = Object.fromEntries(Object.entries(references).map(([attribute, value]) => [
+          attribute, Array.isArray(value) ? remap(value.filter((id): id is string => typeof id === "string")) : []
+        ]));
+      }
+      compatibility = { ...compatibility, unknown };
+    }
+    patch.object = {
+      ...reaction,
+      ...(compatibility === undefined ? {} : { compatibility }),
+      components: reaction.components.flatMap(component => remap([component.objectId]).map(objectId => ({ ...component, objectId }))),
+      conditionsTextObjectIds: remap(reaction.conditionsTextObjectIds),
+      ...(reaction.arrowObjectIds === undefined ? {} : { arrowObjectIds: remap(reaction.arrowObjectIds) }),
+      ...(reaction.plusObjectIds === undefined ? {} : { plusObjectIds: remap(reaction.plusObjectIds) })
+    };
+  }
 }
 
 export function rotateSelectedDocumentObjects90(document: ChemDraftDocument): ChemDraftDocument {
@@ -14858,7 +15386,8 @@ export function rotateSelectedDocumentObjects90(document: ChemDraftDocument): Ch
 function translatedClipboardObject(
   object: DocumentObject,
   dx: number,
-  dy: number
+  dy: number,
+  document: ChemDraftDocument
 ): DocumentObject {
   const nextX = object.x + dx;
   const nextY = object.y + dy;
@@ -14876,11 +15405,9 @@ function translatedClipboardObject(
       ...object,
       x: nextX,
       y: nextY,
-      anchor: {
-        ...object.anchor,
-        kind: "point",
-        point: { x: nextX + object.width / 2, y: nextY + object.height / 2 }
-      }
+      ...electronMarkMoveAssociation(document, object, nativeChargeMarkCenter(object), {
+        x: nextX + object.width / 2, y: nextY + object.height / 2
+      }, { operation: "paste" })
     };
   }
 
@@ -14936,14 +15463,6 @@ function mapAnchorPoint(anchor: Anchor, map: (point: PagePoint) => PagePoint): A
     : anchor;
 }
 
-// Fully validate (and normalize) a clipboard object against the document schema. Shallow base-field
-// checks let objects with missing type-specific fields through, which then throw later at applyPatch
-// instead of being rejected so paste can fall back safely.
-function parseClipboardDocumentObject(value: unknown): DocumentObject | undefined {
-  const result = DocumentObjectSchema.safeParse(value);
-  return result.success ? result.data : undefined;
-}
-
 function duplicateObjectIdPrefix(object: DocumentObject): string {
   switch (object.type) {
     case "molecule":
@@ -14989,7 +15508,7 @@ function scaleNativeMoleculeObjectAroundPointPatches(
     scaleY: transform.scaleY * scaleY
   }));
   const markPatches = anchoredElectronMarkTransformPatches(
-    page.objects,
+    page,
     molecule.id,
     new Set(molecule.atoms.map((atom) => atom.id)),
     (point) => ({
@@ -15040,8 +15559,11 @@ function transformOtherObjectAroundPointPatches(
     height: nextHeight,
     rotation: normalizeDegrees(object.rotation + degrees)
   };
-  if (object.type === "electron-mark" && object.markKind === "charge") {
-    changes.anchor = { ...object.anchor, kind: "point", point: { x: newCenter.x, y: newCenter.y } };
+  if (object.type === "electron-mark") {
+    // Resizing about the mark's own centre changes appearance, not its atom.
+    const operation = degrees === 0 && (options.scaleX !== undefined || options.scaleY !== undefined) &&
+      oldCenter.x === newCenter.x && oldCenter.y === newCenter.y ? "frame" : "transform";
+    Object.assign(changes, electronMarkMoveAssociation(document, object, oldCenter, newCenter, { operation }));
   }
   if (object.type === "graphic") {
     changes.data = resizeGraphicObjectDataForFrame(object.data, oldCenter, newCenter, scaleX, scaleY);
@@ -15058,6 +15580,13 @@ function transformOtherObjectAroundPointPatches(
         };
       }
     }
+  }
+  if(object.type==='text' && object.arrowAttachment?.kind==='conditions') {
+    const factor=proportionalGraphicScale(scaleX,scaleY),style=nativeTextStyleFromObjectStyle(object.style);
+    const nextStyle={...object.style,fontSizePx:style.fontSizePx*factor,letterSpacingPx:style.letterSpacingPx*factor,paragraphSpacingPx:style.paragraphSpacingPx*factor};
+    const spans=object.spans.map(span=>({...span,style:{...span.style,...(typeof span.style.fontSizePx==='number'?{fontSizePx:span.style.fontSizePx*factor}:{})}}));
+    const size=nativeFormattedTextObjectSize({...object,style:nextStyle,spans});
+    Object.assign(changes,size,{x:newCenter.x-size.width/2,y:newCenter.y-size.height/2,style:nextStyle,spans});
   }
   // Arrow endpoints are absolute page points, so scaling only the frame would leave the drawn arrow
   // at its original size inside a resized box.
@@ -15098,7 +15627,7 @@ export function rotateDocumentObjectsAroundPoint(
     return document;
   }
   const page = firstPage(document);
-  const set = new Set(resolveGroupedDocumentObjectIds(page.objects, ids));
+  const set = new Set(withArrowAttachmentIds(page.objects, resolveGroupedDocumentObjectIds(page.objects, ids)));
   const cascadedMarkIds = cascadeCarriedAnchoredMarkIds(page.objects, set);
   const patches: DocumentPatch[] = [];
   for (const object of page.objects) {
@@ -15118,7 +15647,7 @@ export function rotateDocumentObjectsAroundPoint(
       ? rotateNativeMoleculeGeometryAroundPointPatches(document, object.id, center, degrees)
       : transformOtherObjectAroundPointPatches(document, object.id, center, { degrees })));
   }
-  return patches.length > 0 ? applyPatches(document, patches, { now: phase4Timestamp }) : document;
+  return patches.length > 0 ? reconcileReactionArrowAttachments(applyPatches(document, patches, { now: phase4Timestamp })) : document;
 }
 
 /** Scale every object in `ids` about the shared `center` by `scaleX`/`scaleY`. */
@@ -15135,7 +15664,7 @@ export function scaleDocumentObjectsAroundPoint(
     return document;
   }
   const page = firstPage(document);
-  const set = new Set(resolveGroupedDocumentObjectIds(page.objects, ids));
+  const set = new Set(withArrowAttachmentIds(page.objects, resolveGroupedDocumentObjectIds(page.objects, ids)));
   const cascadedMarkIds = cascadeCarriedAnchoredMarkIds(page.objects, set);
   const patches: DocumentPatch[] = [];
   for (const object of page.objects) {
@@ -15155,7 +15684,8 @@ export function scaleDocumentObjectsAroundPoint(
       ? scaleNativeMoleculeObjectAroundPointPatches(document, object.id, center, sx, sy)
       : transformOtherObjectAroundPointPatches(document, object.id, center, { scaleX: sx, scaleY: sy })));
   }
-  return patches.length > 0 ? applyPatches(document, patches, { now: phase4Timestamp }) : document;
+  return patches.length > 0 ? reconcileReactionArrowAttachments(applyPatches(document, patches, { now: phase4Timestamp }),
+    { scale: { objectIds: set, scaleX: sx, scaleY: sy } }) : document;
 }
 
 export type DocumentFlipAxis = "horizontal" | "vertical";
@@ -15190,7 +15720,7 @@ export function flipDocumentObjectsAroundPoint(
   }
 
   const page = firstPage(document);
-  const set = new Set(resolveGroupedDocumentObjectIds(page.objects, ids));
+  const set = new Set(withArrowAttachmentIds(page.objects, resolveGroupedDocumentObjectIds(page.objects, ids)));
   const cascadedMarkIds = cascadeCarriedAnchoredMarkIds(page.objects, set);
   const patches: DocumentPatch[] = [];
   for (const object of page.objects) {
@@ -15210,7 +15740,7 @@ export function flipDocumentObjectsAroundPoint(
       ? flipNativeMoleculeObjectAroundPointPatches(document, object.id, center, axis)
       : flipOtherObjectAroundPointPatches(document, object.id, center, axis)));
   }
-  return patches.length > 0 ? applyPatches(document, patches, { now: phase4Timestamp }) : document;
+  return patches.length > 0 ? reconcileReactionArrowAttachments(applyPatches(document, patches, { now: phase4Timestamp })) : document;
 }
 
 function flipNativeMoleculeObjectAroundPointPatches(
@@ -15233,7 +15763,7 @@ function flipNativeMoleculeObjectAroundPointPatches(
     }))
   }));
   const markPatches = anchoredElectronMarkTransformPatches(
-    page.objects,
+    page,
     molecule.id,
     new Set(molecule.atoms.map((atom) => atom.id)),
     (point) => flipPointAroundAxis(point, center, axis),
@@ -15277,8 +15807,8 @@ function flipOtherObjectAroundPointPatches(
       : normalizeDegrees(axis === "horizontal" ? 180 - object.rotation : -object.rotation)
   };
 
-  if (object.type === "electron-mark" && object.markKind === "charge") {
-    changes.anchor = { ...object.anchor, kind: "point", point: newCenter };
+  if (object.type === "electron-mark") {
+    Object.assign(changes, electronMarkMoveAssociation(document, object, oldCenter, newCenter, { operation: "transform" }));
   }
   if (object.type === "graphic") {
     changes.data = resizeGraphicObjectDataForFrame(object.data, oldCenter, newCenter, scaleX, scaleY);
@@ -16065,6 +16595,7 @@ function buildNativeMoleculeEngineRelayout(
   const engineBondByPair = new Map(
     engineBonds.map((bond) => [atomPairKey(`${Math.min(bond.from, bond.to)}`, `${Math.max(bond.from, bond.to)}`), bond])
   );
+  const unknownStereoAtomIds = new Set(molecule.bonds.filter(bond => bond.display?.bondStyle === "wavy").map(bond => bond.fromAtomId));
   const baseBonds: MoleculeBond[] = molecule.bonds.map((bond) => {
     const fromIndex = atomIndexById.get(bond.fromAtomId);
     const toIndex = atomIndexById.get(bond.toAtomId);
@@ -16073,7 +16604,11 @@ function buildNativeMoleculeEngineRelayout(
         ? atomPairKey(`${Math.min(fromIndex, toIndex)}`, `${Math.max(fromIndex, toIndex)}`)
         : undefined;
     const engineBond = pairKey !== undefined ? engineBondByPair.get(pairKey) : undefined;
-    const wedge = engineBond?.wedge ?? null;
+    const proposedStereoAtomId = engineBond && molecule.atoms[engineBond.from]?.id;
+    // An explicit unknown centre and its directed marker survive every depictor, even one
+    // that proposes a new wedge from the same centre on the new coordinates.
+    const wedge = bond.display?.bondStyle === "wavy" ? "wavy"
+      : proposedStereoAtomId && unknownStereoAtomIds.has(proposedStereoAtomId) ? null : engineBond?.wedge ?? null;
     const {
       bondStyle: previousStyle,
       depthWeight: _depthWeight,
@@ -16088,8 +16623,8 @@ function buildNativeMoleculeEngineRelayout(
     // A wedge/hash is narrow at `from`. OCL may move the stereo marker to a different adjacent bond
     // and may orient that bond opposite to ChemDraft's pre-existing endpoint order. Preserve the
     // engine's directed narrow end; an unordered-pair-only transfer can turn R/S into unspecified.
-    const engineFromAtomId = wedge && engineBond ? molecule.atoms[engineBond.from]?.id : undefined;
-    const engineToAtomId = wedge && engineBond ? molecule.atoms[engineBond.to]?.id : undefined;
+    const engineFromAtomId = previousStyle === "wavy" ? bond.fromAtomId : wedge && engineBond ? molecule.atoms[engineBond.from]?.id : undefined;
+    const engineToAtomId = previousStyle === "wavy" ? bond.toAtomId : wedge && engineBond ? molecule.atoms[engineBond.to]?.id : undefined;
     const directedBond = engineFromAtomId && engineToAtomId
       ? { ...bond, fromAtomId: engineFromAtomId, toAtomId: engineToAtomId }
       : bond;
@@ -17534,6 +18069,8 @@ export interface FlattenSpunOutcome {
   warnings: FlattenWarning[];
   refusalReasons: string[];
   stereoCenters: StereoCenterReport[];
+  /** Present when a same-side depiction correction made a near-collinear E/Z assignment readable. */
+  depictionCoords3d?: Float64Array;
 }
 
 // ---------------------------------------------------------------------------
@@ -18072,6 +18609,7 @@ function relocateRepeatedStereoMarkers(
 
       for (const candidate of source) {
         if (candidate.order !== "single") continue;
+        if (candidate.display?.bondStyle === "wavy" || isDativeBond(candidate)) continue;
         const neighborId = candidate.fromAtomId === centerId
           ? candidate.toAtomId
           : candidate.toAtomId === centerId
@@ -18229,6 +18767,7 @@ function relocateRepeatedStereoMarkers(
 
     for (const candidate of depthAligned) {
       if (candidate.order !== "single") continue;
+      if (candidate.display?.bondStyle === "wavy" || isDativeBond(candidate)) continue;
       const neighborId = candidate.fromAtomId === centerId
         ? candidate.toAtomId
         : candidate.toAtomId === centerId
@@ -18267,6 +18806,28 @@ function relocateRepeatedStereoMarkers(
   return depthAligned;
 }
 
+/** The native dashed style encodes dative identity, with the donor at fromAtomId. */
+function changedCoordinationBond(before: MoleculeObject, after: MoleculeObject): MoleculeBond | undefined {
+  const pending = new Map(before.bonds.filter(bond => bond.display?.bondStyle === "dashed").map(bond => [bond.id, bond]));
+  for (const bond of after.bonds) {
+    const original = pending.get(bond.id);
+    if (!original) {
+      if (bond.display?.bondStyle === "dashed") return bond;
+      continue;
+    }
+    if (bond.display?.bondStyle !== original.display?.bondStyle || bond.order !== original.order ||
+      bond.fromAtomId !== original.fromAtomId || bond.toAtomId !== original.toAtomId) return original;
+    pending.delete(bond.id);
+  }
+  return pending.values().next().value;
+}
+
+function repeatUnitMembershipKey(pair: readonly BracketObject[], objects: readonly DocumentObject[]) {
+  const { members, unresolved } = resolveRepeatUnitAtomMembership(pair, objects, { atomPosition: transformPointForObject });
+  // The resolver returns members in page-object and molecule-atom order, which flatten preserves.
+  return { unresolved, members: JSON.stringify(members.map(({ molecule, atomIds }) => [molecule.id, atomIds])) };
+}
+
 /**
  * Commit a spun 3D conformer as a flattened 2D perspective depiction (Phase 5).
  *
@@ -18284,19 +18845,18 @@ export function flattenSpunMolecule(
   coords3d: ArrayLike<number>,
   viewMatrix: ViewMatrix,
   options: { placement?: ScreenPlacement; stereoCenterAtomIds?: ReadonlySet<string>; perceiveStereo?: StereoPerceiver;
-    perceiveDoubleBondStereo?: DoubleBondStereoReader; specifiedDoubleBondIds?: ReadonlySet<string> } = {}
+    perceiveDoubleBondStereo?: DoubleBondStereoReader; specifiedDoubleBondIds?: ReadonlySet<string>;
+    stereoReference?: Spin3dStereoReference } = {}
 ): FlattenSpunOutcome {
-  let pageId: string | undefined;
-  let molecule: MoleculeObject | undefined;
-  for (const page of document.pages) {
-    const found = page.objects.find((object) => object.id === objectId);
+  let located: { page: DocumentPage; molecule: MoleculeObject } | undefined;
+  for (const candidate of document.pages) {
+    const found = candidate.objects.find((object) => object.id === objectId);
     if (found && found.type === "molecule") {
-      molecule = found;
-      pageId = page.id;
+      located = { page: candidate, molecule: found };
       break;
     }
   }
-  if (!molecule || !pageId || !isEditableNativeMoleculeGraph(molecule)) {
+  if (!located || !isEditableNativeMoleculeGraph(located.molecule)) {
     return {
       document,
       status: "refused",
@@ -18305,8 +18865,81 @@ export function flattenSpunMolecule(
       stereoCenters: []
     };
   }
-  const page = document.pages.find(candidate => candidate.id === pageId);
-  const result = flattenNativeMolecule3d(molecule, coords3d, viewMatrix, { ...options, bounds: page });
+  const { page, molecule } = located;
+  const stereo = options.stereoReference;
+  const geometryIssue = stereo?.checkGeometry(coords3d, true) ?? stereo?.checkProjectedDoubleBonds(coords3d, viewMatrix);
+  if (geometryIssue) return {
+    document, status: "refused", warnings: [], stereoCenters: [],
+    refusalReasons: [`${geometryIssue} from this view. Rotate slightly and try again.`]
+  };
+  const flatten = (coords: ArrayLike<number>) => {
+    const settings = { ...options, bounds: page,
+      specifiedDoubleBondIds: stereo?.specifiedDoubleBondIds ?? options.specifiedDoubleBondIds };
+    const attempt = flattenNativeMolecule3d(molecule, coords, viewMatrix, settings);
+    if (!stereo || attempt.status === "committed" || !attempt.stereoCenters.length) return attempt;
+    // RDKit has verified the 3D frame. If the usual encoder refuses its markers,
+    // use the same projection and require RDKit to verify a replacement below.
+    return flattenNativeMolecule3d(molecule, coords, viewMatrix, {
+      ...settings, stereoCenterAtomIds: new Set(), perceiveStereo: undefined
+    });
+  };
+  let result = flatten(coords3d);
+  let depictionCoords3d: Float64Array | undefined;
+  if (stereo && result.molecule) {
+    const readBack = (candidate: FlattenNative3DOutcome & { molecule: MoleculeObject }, coords: ArrayLike<number>) => {
+      let issues = stereo.compare(candidate.molecule);
+      const open = new Set(issues.flatMap(issue => issue.kind === "gained" && issue.bond ? [issue.bond.id] : []));
+      if (open.size > 0) {
+        // Make the source's open intent explicit if projection alone would specify E/Z.
+        const next = {
+          ...candidate.molecule,
+          bonds: candidate.molecule.bonds.map(bond => open.has(bond.id) ? { ...bond, stereo: "either" as const } : bond)
+        };
+        next.structure = serializeSpin3dMolfile(next);
+        candidate.molecule = next;
+        issues = stereo.compare(next);
+      }
+      const repeated = repeatedStereoMarkers(candidate.molecule.bonds);
+      if (!repeated.length && !issues.some(issue => issue.centerIndex !== undefined)) return issues;
+      const adjusted = repairSpin3dStereoMarkers(candidate.molecule, issues, repeated, stereo, coords, viewMatrix);
+      if (!adjusted) {
+        return issues.length ? issues : [{
+          kind: "lost" as const, message: "flatten would draw two identical wedge/hash marks at one atom"
+        }];
+      }
+      candidate.molecule = adjusted;
+      candidate.stereoCenters = candidate.stereoCenters.map(center => {
+        const marker = adjusted.bonds.find(bond => bond.fromAtomId === center.atomId && isSpin3dStereoMarker(bond));
+        return marker ? { ...center, wedgeBondId: marker.id, style: marker.display!.bondStyle as "wedge" | "hashed" } : center;
+      });
+      return stereo.compare(adjusted);
+    };
+    const staged = { ...result, molecule: result.molecule };
+    const issues = readBack(staged, coords3d);
+    // Apply only the smallest same-side correction that round trips. Each retry reruns
+    // the projection so any moved bond gets fresh wedge decisions and crossing depths.
+    let verified = issues.length === 0;
+    if (verified) {
+      result = staged;
+    } else {
+      for (const degrees of [1, 2, 4]) {
+        const separated = separateProjectedStereoLigands(coords3d, viewMatrix, issues, degrees);
+        if (!separated || stereo.checkGeometry(separated, true)) continue;
+        const candidate = flatten(separated);
+        if (!candidate.molecule) continue;
+        const staged = { ...candidate, molecule: candidate.molecule };
+        if (readBack(staged, separated).length !== 0) continue;
+        result = staged;
+        depictionCoords3d = separated;
+        verified = true;
+        break;
+      }
+    }
+    if (!verified) return {
+      document, status: "refused", warnings: result.warnings, stereoCenters: result.stereoCenters,
+      refusalReasons: [`${issues[0].message} from this view. Rotate slightly and try again.`]
+    };
+  }
   const { molecule: flattened, crossings, ...outcome } = result;
   if (!flattened || result.status !== "committed") return { document, ...outcome };
   const patches: DocumentPatch[] = [{
@@ -18316,13 +18949,219 @@ export function flattenSpunMolecule(
       structureFormat: flattened.structureFormat
     }
   }];
-  for (const crossing of page?.crossings ?? []) {
+  // Carry the mark's existing offset with its atom. Make legacy atom
+  // associations explicit so a crowded projection cannot reassign them.
+  const oldAtoms = new Map(molecule.atoms.map(atom => [atom.id, atom]));
+  const newAtoms = new Map(flattened.atoms.map(atom => [atom.id, atom]));
+  const assignments = nativeElectronMarkAssignments(page).anchorByMarkId;
+  for (const mark of page.objects) {
+    if (mark.type !== "electron-mark") continue;
+    const owner = spin3dElectronMarkOwner(mark, assignments);
+    if (owner?.objectId !== objectId) continue;
+    const before = oldAtoms.get(owner.atomId);
+    const after = newAtoms.get(owner.atomId);
+    if (!before || !after) continue;
+    patches.push({ op: "updateObject", objectId: mark.id, changes: {
+      x: mark.x + after.x - before.x, y: mark.y + after.y - before.y, atomAssociation: "explicit",
+      anchor: { kind: "atom", objectId, atomId: owner.atomId }
+    } });
+  }
+  const pageId = page.id;
+  for (const crossing of page.crossings) {
     if (crossing.bonds.every(ref => ref.objectId === objectId)) {
       patches.push({ op: "clearCrossingOverride", pageId, bonds: crossing.bonds });
     }
   }
   for (const crossing of crossings ?? []) patches.push({ op: "setCrossingOverride", pageId, crossing });
-  return { document: applyPatches(document, patches, { now: phase4Timestamp }), ...outcome };
+  const proposed = applyPatches(document, patches, { now: phase4Timestamp });
+  const repeatPairs = [...bracketPairs(page.objects)].filter(([, pair]) => pair.some(bracket =>
+    bracket.repeatUnit || bracket.bracketKind === "polymer" || bracket.bracketUsage && bracket.bracketUsage !== "generic"));
+  const hasCoordination = [molecule, flattened].some(object => object.bonds.some(bond => bond.display?.bondStyle === "dashed"));
+  const accepted = { ...outcome, ...(depictionCoords3d ? { depictionCoords3d } : {}) };
+  if (!hasCoordination && repeatPairs.length === 0) return { document: proposed, ...accepted };
+
+  // Check the same normalized graph and page geometry that will be committed and copied as MOL.
+  const normalized = normalizeCommittedDocument(proposed);
+  const nextPage = normalized.pages.find(candidate => candidate.id === pageId)!;
+  if (hasCoordination) {
+    const nextMolecule = nextPage.objects.find((object): object is MoleculeObject =>
+      object.id === objectId && object.type === "molecule")!;
+    const bond = changedCoordinationBond(molecule, nextMolecule);
+    if (bond) {
+      const donor = molecule.atoms.find(atom => atom.id === bond.fromAtomId);
+      const acceptor = molecule.atoms.find(atom => atom.id === bond.toAtomId);
+      const label = donor && acceptor ? `${donor.element}→${acceptor.element} coordination bond` : "coordination bond";
+      return { ...outcome, document, status: "refused",
+        refusalReasons: [`the ${label} would change. Rotate slightly and try again.`] };
+    }
+  }
+  if (repeatPairs.length > 0) {
+    const nextPairs = bracketPairs(nextPage.objects);
+    const refusal = repeatPairs.map(([id, pair]) => {
+      const nextPair = nextPairs.get(id);
+      if (!nextPair) return "the polymer bracket would enclose different atoms.";
+      const before = repeatUnitMembershipKey(pair, page.objects);
+      const after = repeatUnitMembershipKey(nextPair, nextPage.objects);
+      if (before.members !== after.members) return "the polymer bracket would enclose different atoms.";
+      if (before.unresolved !== after.unresolved) return after.unresolved
+        ? "the polymer bracket's crossing bonds could no longer be matched from this view. Rotate slightly and try again."
+        : "the polymer bracket's crossing bond resolution would change. Rotate slightly and try again.";
+      return undefined;
+    }).find(reason => reason !== undefined);
+    if (refusal) return { ...outcome, document, status: "refused", refusalReasons: [refusal] };
+  }
+  return { document: normalized, ...accepted };
+}
+
+function isSpin3dStereoMarker(bond: MoleculeBond): boolean {
+  return bond.display?.bondStyle === "wedge" || bond.display?.bondStyle === "hashed";
+}
+
+function spin3dElectronMarkOwner(
+  mark: ElectronMarkObject,
+  assignments: ReturnType<typeof nativeElectronMarkAssignments>["anchorByMarkId"]
+) {
+  const anchor = mark.anchor;
+  return anchor.kind === "atom" && anchor.objectId && anchor.atomId
+    ? { objectId: anchor.objectId, atomId: anchor.atomId } : assignments.get(mark.id);
+}
+
+function repairSpin3dStereoMarkers(
+  projected: MoleculeObject, issues: readonly Spin3dStereoIssue[], repeated: readonly RepeatedStereoMarker[], stereo: Spin3dStereoReference,
+  coords: ArrayLike<number>, view: ViewMatrix
+): MoleculeObject | undefined {
+  const affected = new Map<string, "specified" | "open">();
+  for (const issue of issues) {
+    const atom = issue.centerIndex === undefined ? undefined : projected.atoms[issue.centerIndex];
+    if (atom && affected.get(atom.id) !== "specified") {
+      affected.set(atom.id, issue.kind === "gained" ? "open" : "specified");
+    }
+  }
+  const repeatedIds = new Set(repeated.flatMap(entry => entry.bondIds));
+  for (const bond of projected.bonds) {
+    if (repeatedIds.has(bond.id) && !affected.has(bond.fromAtomId)) affected.set(bond.fromAtomId, "specified");
+  }
+  if (!affected.size) return undefined;
+
+  const indices = new Map(projected.atoms.map((atom, index) => [atom.id, index]));
+  const depths = projected.atoms.map((_, index) => {
+    const i = index * 3;
+    return projectPoint(view, [coords[i], coords[i + 1], coords[i + 2]])[2];
+  });
+  const lengths = projected.bonds.map(bond => {
+    const from = projected.atoms[indices.get(bond.fromAtomId)!];
+    const to = projected.atoms[indices.get(bond.toAtomId)!];
+    return Math.hypot(to.x - from.x, to.y - from.y);
+  });
+  const minLength = Math.max(1e-6, DEFAULT_MIN_PROJECTED_BOND_LENGTH_FRACTION * medianOf(lengths.filter(length => length > 0)));
+  const bonds: MoleculeBond[] = projected.bonds.map(bond => {
+    if (!isSpin3dStereoMarker(bond) || !affected.has(bond.fromAtomId)) return bond;
+    const { bondStyle: _removed, ...display } = bond.display!;
+    return { ...bond, display };
+  });
+  const centers = [...affected].filter(([, status]) => status === "specified").map(([id]) => id);
+  const choices = centers.map(centerId => {
+    const center = indices.get(centerId)!;
+    return bonds.flatMap((bond, index) => {
+      if (bond.order !== "single" || bond.display?.bondStyle === "wavy" || isDativeBond(bond) || isSpin3dStereoMarker(bond)) return [];
+      const neighborId = bond.fromAtomId === centerId ? bond.toAtomId : bond.toAtomId === centerId ? bond.fromAtomId : undefined;
+      if (!neighborId) return [];
+      const neighbor = indices.get(neighborId)!;
+      const depth = depths[neighbor] - depths[center];
+      const length = lengths[index];
+      if (length < minLength) return [];
+      return (["wedge", "hashed"] as const).flatMap(style => {
+        const alignment = style === "wedge" ? depth : -depth;
+        if (alignment < -1e-6) return [];
+        const marker = { ...bond, fromAtomId: centerId, toAtomId: neighborId, display: { ...bond.display, bondStyle: style } };
+        return [{ index, marker, alignment, length }];
+      });
+    }).sort((a, b) => b.alignment - a.alignment || b.length - a.length);
+  });
+
+  // Test complete assignments. A symmetric ring can need both markers
+  // before RDKit can distinguish either stereocenter.
+  let remaining = 256;
+  const search = (i: number): MoleculeObject | undefined => {
+    if (i === choices.length) {
+      const trial = { ...projected, bonds: bonds.slice() };
+      trial.structure = serializeSpin3dMolfile(trial);
+      return !stereo.compare(trial).some(issue => issue.centerIndex !== undefined) ? trial : undefined;
+    }
+    for (const choice of choices[i]) {
+      const original = bonds[choice.index];
+      if (isSpin3dStereoMarker(original)) continue;
+      if (--remaining < 0) return undefined;
+      bonds[choice.index] = choice.marker;
+      if (!repeatedStereoMarkers(bonds).length) {
+        const resolved = search(i + 1);
+        if (resolved) return resolved;
+      }
+      bonds[choice.index] = original;
+    }
+    return undefined;
+  };
+  return search(0);
+}
+
+/** Check the normalized document that will be installed, including stationary marks
+ * that may otherwise acquire a new atom association as the molecule moves. */
+export function assertSpin3dDocumentIdentity(
+  before: ChemDraftDocument, after: ChemDraftDocument, stereo: Spin3dStereoReference
+): void {
+  // A reference captured before attaching a model still identifies the first match used by flatten.
+  const sourcePage = before.pages.find(page => page.objects.includes(stereo.source)) ??
+    before.pages.find(page => page.objects.some(object => object.type === "molecule" && object.id === stereo.source.id));
+  const sourceIndex = sourcePage?.objects.indexOf(stereo.source) ?? -1;
+  const targetIndex = sourceIndex >= 0 ? sourceIndex : sourcePage?.objects.findIndex(object =>
+    object.type === "molecule" && object.id === stereo.source.id);
+  const nextPages = new Map(after.pages.map(page => [page.id, page]));
+  let target: MoleculeObject | undefined;
+  for (const page of before.pages) {
+    const nextPage = nextPages.get(page.id);
+    if (!nextPage) throw new Error("the rotated page is missing");
+    // Flatten and normalization preserve page object order, including duplicate ids.
+    for (const [index, molecule] of page.objects.entries()) {
+      if (molecule.type !== "molecule") continue;
+      const next = nextPage.objects[index];
+      if (next?.type !== "molecule" || next.id !== molecule.id || next.atoms.length !== molecule.atoms.length) {
+        throw new Error("the atom count would change");
+      }
+      if (page === sourcePage && index === targetIndex) target = next;
+      if (next === molecule) continue;
+      for (const [index, atom] of molecule.atoms.entries()) {
+        const other = next.atoms[index];
+        if (other.id !== atom.id || other.element !== atom.element) throw new Error(`atom ${atom.id} would change identity`);
+        if (other.formalCharge !== atom.formalCharge) throw new Error(`the formal charge on atom ${atom.id} would change`);
+        if (other.isotope !== atom.isotope) throw new Error(`the isotope on atom ${atom.id} would change`);
+        if ((other.markRadicals ?? 0) !== (atom.markRadicals ?? 0)) throw new Error(`the radicals on atom ${atom.id} would change`);
+      }
+    }
+    const originalAssignments = nativeElectronMarkAssignments(page).anchorByMarkId;
+    const nextAssignments = nativeElectronMarkAssignments(nextPage).anchorByMarkId;
+    const nextObjects = new Map(nextPage.objects.map(object => [object.id, object]));
+    for (const mark of page.objects) {
+      if (mark.type !== "electron-mark") continue;
+      const next = nextObjects.get(mark.id);
+      const owner = spin3dElectronMarkOwner(mark, originalAssignments);
+      const nextOwner = next?.type === "electron-mark" ? spin3dElectronMarkOwner(next, nextAssignments) : undefined;
+      if (next?.type !== "electron-mark" || owner?.objectId !== nextOwner?.objectId || owner?.atomId !== nextOwner?.atomId ||
+          (owner && (next.anchor.kind !== "atom" || next.anchor.objectId !== owner.objectId || next.anchor.atomId !== owner.atomId))) {
+        throw new Error(`the atom association of the ${mark.markKind} mark ${mark.id} would change`);
+      }
+      if (page !== sourcePage || owner?.objectId !== stereo.source.id) continue;
+      const atom = stereo.source.atoms.find(candidate => candidate.id === owner.atomId);
+      const moved = target?.atoms.find(candidate => candidate.id === owner.atomId);
+      const from = nativeChargeMarkCenter(mark);
+      const to = nativeChargeMarkCenter(next);
+      if (!atom || !moved || Math.hypot(to.x - moved.x - (from.x - atom.x), to.y - moved.y - (from.y - atom.y)) > 1e-6) {
+        throw new Error(`the ${mark.markKind} mark ${mark.id} would move away from its atom`);
+      }
+    }
+  }
+  if (!target) throw new Error("the rotated molecule is missing");
+  const issue = stereo.checkIdentity(target);
+  if (issue) throw new Error(issue);
 }
 
 /** Pure molecule-level Spin 3D flatten. Shared by document commits and plugin 3D chemistry:
@@ -18572,6 +19411,20 @@ export function flattenNativeMolecule3d(
   }
   mark("flatten.reconcile-stereo");
 
+  // Explicit unknown intent belongs to the wave's original directed bond, even when
+  // the reader cannot perceive that atom as stereogenic. Never lose or redirect it.
+  const committedBondById = new Map(committedBonds.map(bond => [bond.id, bond]));
+  const lostWaves = molecule.bonds.filter(bond => {
+    if (bond.display?.bondStyle !== "wavy") return false;
+    const actual = committedBondById.get(bond.id);
+    return actual?.display?.bondStyle !== "wavy" || actual.order !== "single" ||
+      actual.fromAtomId !== bond.fromAtomId || actual.toAtomId !== bond.toAtomId;
+  });
+  if (lostWaves.length) return {
+    status: "refused", warnings: result.warnings, stereoCenters: result.stereoCenters,
+    refusalReasons: [`flatten would lose or redirect explicit unknown stereo at ${lostWaves.length} bond(s); re-orient and try again`]
+  };
+
   const stagedMolecule: MoleculeObject = {
     ...molecule,
     atoms: nextAtoms,
@@ -18597,11 +19450,7 @@ export function flattenNativeMolecule3d(
   // orders so a literal atom keeps its valence, and anything the writer could not keep is reported
   // with the flatten rather than stored silently.
   const useV3000 = stagedMolecule.atoms.length > 999 || stagedMolecule.bonds.length > 999;
-  const structure = (useV3000 ? moleculeToMolfileV3000 : moleculeToMolfileV2000)(stagedMolecule, {
-    fromDocFrame: true,
-    warnings: structureWarnings,
-    kekuleBondOrders: nativeBondOrderResolution(stagedMolecule.atoms, stagedMolecule.bonds).kekuleOrders
-  }).contents;
+  const structure = serializeSpin3dMolfile(stagedMolecule, structureWarnings);
   mark("flatten.serialize");
 
   return {
@@ -19252,7 +20101,7 @@ export function applyEditorSaveResultToSelectedObject(
 export function applyEditorSaveResultWithLabelWarnings(
   document: ChemDraftDocument,
   result: EditorSaveResult
-): { document: ChemDraftDocument; labelWarnings: EditorSaveLabelWarning[] } {
+): { document: ChemDraftDocument; labelWarnings: EditorSaveLabelWarning[]; refusal?: string } {
   const selectedMolecule = getSelectedMolecule(document);
   if (!selectedMolecule) {
     throw new Error("Cannot apply editor save result: no molecule is selected.");
@@ -19262,10 +20111,224 @@ export function applyEditorSaveResultWithLabelWarnings(
   }
 
   const synced = syncMoleculePreviewFromEditorSave(selectedMolecule, result.object);
-  return {
-    document: applyEditorSaveResultToSelectedObject(document, { ...result, object: synced.molecule }),
-    labelWarnings: synced.labelWarnings
-  };
+  // 1.2.2 fallback: a molecule with charge or radical marks is never rewritten from the structure
+  // editor, whatever the save contains: every Apply is refused and the document is left untouched.
+  // The carry and refusal logic below stays in place but is unreachable for a marked molecule.
+  const markedPage = document.pages.find((candidate) => candidate.objects.some((object) => object.id === selectedMolecule.id));
+  if (markedPage && moleculeHasElectronMarks(markedPage, selectedMolecule)) {
+    return { document, labelWarnings: [], refusal: EDITOR_SAVE_MARKED_MOLECULE_REFUSAL };
+  }
+  // The save reuses atom and bond ids by index, so adding or removing atoms could silently put a
+  // charge or radical mark on another atom: refuse it, leaving the document unchanged.
+  const page = document.pages.find((candidate) => candidate.objects.some((object) => object.id === selectedMolecule.id));
+  if (page && editorSaveMayShiftElectronMarks(page, selectedMolecule, synced.molecule)) {
+    return { document, labelWarnings: [], refusal: EDITOR_SAVE_MARK_SHIFT_REFUSAL };
+  }
+  if (synced.molecule === result.object) {
+    return { document: applyEditorSaveResultToSelectedObject(document, result), labelWarnings: synced.labelWarnings };
+  }
+  // A molecule rebuilt from the editor's V3000 carries each atom's charge as the editor returned it.
+  const applied = applyEditorV3000SaveKeepingElectronMarks(document, result, selectedMolecule, synced.molecule);
+  return "refusal" in applied
+    ? { document, labelWarnings: [], refusal: applied.refusal }
+    : { document: applied.document, labelWarnings: synced.labelWarnings };
+}
+
+export const EDITOR_SAVE_MARKED_MOLECULE_REFUSAL =
+  "This molecule has charge or radical marks; edit it on the canvas, or remove the marks first, then use the structure editor.";
+
+/**
+ * Whether the molecule carries any charge or radical mark: anchored to one of its atoms, bonds or to
+ * the object itself, or a legacy loose mark that commit normalization assigns to one of its atoms.
+ * Read from the mark objects on the page, not from the atoms' `markCharge`/`markRadicals`, which
+ * normalization recomputes from them.
+ */
+export function moleculeHasElectronMarks(page: DocumentPage, molecule: MoleculeObject): boolean {
+  const objectById = objectByIdIndex(page.objects);
+  const isChargeOrRadical = (object: DocumentObject | undefined): object is ElectronMarkObject =>
+    object?.type === "electron-mark" && (object.markKind === "charge" || object.markKind === "radical-dot");
+  for (const [markId, owner] of committedElectronMarkAssignments(page).anchorByMarkId) {
+    if (owner?.objectId === molecule.id && isChargeOrRadical(objectById.get(markId))) return true;
+  }
+  return page.objects.some((object) =>
+    isChargeOrRadical(object) && (object.anchor as { objectId?: string }).objectId === molecule.id);
+}
+
+export const EDITOR_SAVE_MARK_SHIFT_REFUSAL =
+  "Ketcher can't keep this molecule's charge and radical marks on the right atoms when atoms are added or removed. Remove the marks first, or edit on the canvas.";
+
+/** The refusal for a Ketcher save whose charge on an atom contradicts the charge marks still on it. */
+export function editorSaveChargeContradictsMarkRefusal(element: string, atomNumber: number): string {
+  return `Ketcher changed the charge on ${element} atom ${atomNumber} but its charge mark is still on the canvas. Remove or move the charge mark on the canvas first.`;
+}
+
+/**
+ * Whether a structure-editor save could silently put one of the molecule's charge or radical marks
+ * on a different atom. The save reuses atom and bond ids by array index (`parseV3000MoleculeGraph`),
+ * so after an earlier atom is deleted, added or reordered a mark's atom id (or bond id) names
+ * another atom, inside the edited molecule where the commit guard cannot see it. Conservative: with
+ * any charge or radical mark associated with the molecule (atom-anchored, bond-anchored, or a legacy
+ * mark normalization assigns to one of its atoms), any change to the atom or bond count, any change
+ * to the bond graph in id terms (the set of atom-id pairs the bonds join), a marked bond id joining
+ * different atoms, or a different element on a marked atom (both ends of a marked bond included) or
+ * on a direct neighbour of one counts. Bond-order changes, in-place moves, element changes away from
+ * every mark and unmarked molecules pass.
+ */
+function editorSaveMayShiftElectronMarks(
+  page: DocumentPage,
+  previous: MoleculeObject,
+  next: MoleculeObject
+): boolean {
+  const isChargeOrRadical = (object: DocumentObject | undefined): object is ElectronMarkObject =>
+    object?.type === "electron-mark" && (object.markKind === "charge" || object.markKind === "radical-dot");
+  const objectById = objectByIdIndex(page.objects);
+  const markedAtomIds = new Set<string>();
+  const markedBondIds = new Set<string>();
+  for (const [markId, owner] of committedElectronMarkAssignments(page).anchorByMarkId) {
+    if (owner?.objectId === previous.id && isChargeOrRadical(objectById.get(markId))) markedAtomIds.add(owner.atomId);
+  }
+  for (const object of page.objects) {
+    if (!isChargeOrRadical(object)) continue;
+    if (object.anchor.kind === "atom" && object.anchor.objectId === previous.id && object.anchor.atomId) {
+      markedAtomIds.add(object.anchor.atomId);
+    }
+    if (object.anchor.kind === "bond" && object.anchor.objectId === previous.id && object.anchor.bondId) {
+      markedBondIds.add(object.anchor.bondId);
+    }
+  }
+  if (markedAtomIds.size === 0 && markedBondIds.size === 0) return false;
+  if (previous.atoms.length !== next.atoms.length || previous.bonds.length !== next.bonds.length) return true;
+
+  // Same counts can still hide a delete-and-re-add: the reused id then names a different atom even
+  // when every element and neighbour element matches (C1-C2(radical)-C3-C4 with C1 deleted and a
+  // carbon drawn on C2). The bond graph in id terms catches it; a bond-order change keeps it.
+  const endsKey = (bond: MoleculeBond) => [bond.fromAtomId, bond.toAtomId].sort().join("\n");
+  const topology = (molecule: MoleculeObject) => molecule.bonds.map(endsKey).sort().join("\t");
+  if (topology(previous) !== topology(next)) return true;
+  for (const bondId of markedBondIds) {
+    const before = previous.bonds.find((bond) => bond.id === bondId);
+    const after = next.bonds.find((bond) => bond.id === bondId);
+    if (!before || !after || endsKey(before) !== endsKey(after)) return true;
+    markedAtomIds.add(before.fromAtomId).add(before.toAtomId);
+  }
+  // With the bond graph unchanged, an element change matters only on a marked atom or a direct
+  // neighbour of one (what the mark's chemistry is judged against); one far from every mark passes.
+  const checkedAtomIds = new Set(markedAtomIds);
+  for (const bond of previous.bonds) {
+    if (markedAtomIds.has(bond.fromAtomId)) checkedAtomIds.add(bond.toAtomId);
+    if (markedAtomIds.has(bond.toAtomId)) checkedAtomIds.add(bond.fromAtomId);
+  }
+  const nextAtomById = new Map(next.atoms.map((atom) => [atom.id, atom]));
+  return previous.atoms.some((atom) => checkedAtomIds.has(atom.id) && nextAtomById.get(atom.id)?.element !== atom.element);
+}
+
+/**
+ * Applies a molecule rebuilt from the structure editor's V3000 without changing what the page's
+ * electron marks mean (AGENTS.md section 7).
+ *
+ * The editor is handed each atom's TOTAL formal charge (the stored SMILES is written from
+ * `formalCharge`, which includes what the charge marks contribute) and returns it as CHG, so the
+ * parsed atoms carry that total and no `markCharge`. Commit normalization computes
+ * `formalCharge - markCharge + contribution`; left at zero, `markCharge` would let a + mark add its
+ * charge a second time. So:
+ *
+ * 1. The rebuilt atoms are placed afresh (re-centred on the old box), which can move an atom away
+ *    from its marks. A mark anchored to an atom that survives the save (same id and element) is
+ *    carried by that atom's displacement — the carry every molecule transform applies
+ *    (`anchoredElectronMarkTransformPatches`) — so it stays with the atom it was on, rather than
+ *    falling out of radius or being taken by a neighbour, which would move its charge. A charge or
+ *    radical mark that is bond-, object- or loosely anchored is first resolved to its owning atom
+ *    the way commit normalization resolves it, then anchored to that atom and carried the same way.
+ * 2. Each atom records, as `markCharge`/`markRadicals`, exactly what the marks associated with it on
+ *    the page after the save contribute, found by the assignment commit normalization runs
+ *    (`committedElectronMarkAssignments`). Normalization's sum then returns the editor's CHG.
+ *
+ * 3. An atom whose charge the editor changed so that it contradicts the charge marks still on it
+ *    is refused (see below). An unchanged charge always commits.
+ *
+ * A mark that associates with no atom after the save (its atom was deleted in the editor, or it is
+ * a loose mark now out of radius) contributes nothing: the editor's CHG stays the atom's whole
+ * charge, and the mark stays on the page, loose. No mark is ever removed.
+ */
+function applyEditorV3000SaveKeepingElectronMarks(
+  document: ChemDraftDocument,
+  result: EditorSaveResult,
+  previous: MoleculeObject,
+  molecule: MoleculeObject
+): { document: ChemDraftDocument } | { refusal: string } {
+  const apply = (base: ChemDraftDocument, object: MoleculeObject) =>
+    applyEditorSaveResultToSelectedObject(base, { ...result, object });
+
+  // 1. Every charge or radical mark of the molecule rides with its atom. Positions are compared as
+  // the page stores them; an atom survives the save when its id comes back with the same element.
+  const placed = selectionPage(apply(document, molecule)).objects.find((object) => object.id === molecule.id);
+  const placedAtomById = new Map(placed?.type === "molecule" ? placed.atoms.map((atom) => [atom.id, atom] as const) : []);
+  const page = selectionPage(document);
+  const displacementByAtomId = new Map<string, { dx: number; dy: number }>();
+  for (const atom of previous.atoms) {
+    const next = placedAtomById.get(atom.id);
+    if (next && next.element === atom.element) displacementByAtomId.set(atom.id, { dx: next.x - atom.x, dy: next.y - atom.y });
+  }
+  // Atom-anchored marks: the carry every molecule transform applies.
+  const carryPatches: DocumentPatch[] = [...displacementByAtomId].flatMap(([atomId, { dx, dy }]) =>
+    dx === 0 && dy === 0 ? [] : anchoredElectronMarkTransformPatches(page, previous.id, new Set([atomId]),
+      (point) => ({ x: point.x + dx, y: point.y + dy })));
+  // Bond-, object- and loose marks: resolved to their owning atom before the save, as commit
+  // normalization resolves them, then anchored to that atom and moved by its displacement. Left at
+  // their old coordinates they could fall out of radius (a radical silently lost, V3000 carries no
+  // RAD back) or be taken by a neighbour the save moved closer. A mark that resolves to no atom
+  // (an explicit floating drop, or a loose mark out of radius) stays where it is.
+  const objectById = objectByIdIndex(page.objects);
+  for (const [markId, owner] of committedElectronMarkAssignments(page).anchorByMarkId) {
+    if (owner?.objectId !== previous.id) continue;
+    const mark = objectById.get(markId);
+    if (mark?.type !== "electron-mark" || mark.anchor.kind === "atom" ||
+      (mark.markKind !== "charge" && mark.markKind !== "radical-dot")) continue;
+    const displacement = displacementByAtomId.get(owner.atomId);
+    if (!displacement) continue;
+    carryPatches.push({ op: "updateObject", objectId: mark.id, changes: {
+      anchor: { kind: "atom", objectId: previous.id, atomId: owner.atomId },
+      x: mark.x + displacement.dx,
+      y: mark.y + displacement.dy
+    } });
+  }
+  const carried = carryPatches.length ? applyPatches(document, carryPatches, { now: phase4Timestamp }) : document;
+
+  // 2. Record each atom's mark contribution on the page exactly as it will be committed. The parsed
+  // atoms carry no mark fields yet, which is also what normalization's legacy-anchor rule sees.
+  const { assignedChargeByAtomKey, assignedRadicalsByAtomKey } =
+    committedElectronMarkAssignments(selectionPage(apply(carried, molecule)));
+  if (assignedChargeByAtomKey.size === 0 && assignedRadicalsByAtomKey.size === 0) {
+    return { document: apply(carried, molecule) };
+  }
+  // 3. The editor's charge must not contradict a charge mark still on the atom. With CHG the
+  // atom's total and c its marks' contribution, the plain charge left is CHG - c. A plain charge of
+  // the opposite sign to the mark (the charge cleared or flipped in the editor, the + still drawn)
+  // would hide a counter-charge under the visible mark: refuse. Zero, or the same sign (a + marked
+  // N raised to 2+), is consistent and commits, and so does any charge the editor left unchanged.
+  const previousChargeByAtomId = new Map(previous.atoms.map((atom) => [atom.id, atom.formalCharge] as const));
+  for (const [index, atom] of molecule.atoms.entries()) {
+    const markCharge = assignedChargeByAtomKey.get(nativeElectronMarkAtomKey(molecule.id, atom.id)) ?? 0;
+    // Only a charge the editor changed can contradict a mark: an unchanged total (for example an
+    // intrinsic -1 under a + mark, total 0) is what the page already committed.
+    if (markCharge === 0 || previousChargeByAtomId.get(atom.id) === atom.formalCharge) continue;
+    const plain = atom.formalCharge - markCharge;
+    if (plain !== 0 && Math.sign(plain) !== Math.sign(markCharge)) {
+      return { refusal: editorSaveChargeContradictsMarkRefusal(atom.element, index + 1) };
+    }
+  }
+  const atoms = molecule.atoms.map((atom) => {
+    const key = nativeElectronMarkAtomKey(molecule.id, atom.id);
+    const markCharge = assignedChargeByAtomKey.get(key) ?? 0;
+    const markRadicals = assignedRadicalsByAtomKey.get(key) ?? 0;
+    const { markCharge: _markCharge, markRadicals: _markRadicals, ...baseAtom } = atom;
+    return {
+      ...baseAtom,
+      ...(markCharge === 0 ? {} : { markCharge }),
+      ...(markRadicals === 0 ? {} : { markRadicals })
+    };
+  });
+  return { document: apply(carried, { ...molecule, atoms }) };
 }
 
 /**
@@ -19288,7 +20351,10 @@ export function createNativeSavePayload(document: ChemDraftDocument): NativeSave
     filename: `${sanitizeFilename(document.title.replace(/\.chemdraft$/i, ""))}.chemdraft`,
     mimeType: "chemical/x-cdxml",
     contents: result.contents,
-    warnings: result.warnings,
+    warnings: [
+      ...nativeDocumentExportWarnings(document).map(({ code, message, objectId }) => ({ code, message, sourceObjectId: objectId })),
+      ...result.warnings
+    ],
     // The embedded native document's hash, already computed by the export: hashing the whole
     // envelope again cost ~190 ms per autosave on a large page.
     payloadHash: result.nativePayloadHash
@@ -19305,7 +20371,8 @@ export function exportPhase4Cdxml(
   document: ChemDraftDocument,
   options: CdxmlTextExportOptions = {}
 ): TextExportResult {
-  return exportDocumentToCdxmlText(document, options);
+  const result = exportDocumentToCdxmlText(document, options);
+  return { ...result, warnings: [...nativeDocumentExportWarnings(document), ...result.warnings] };
 }
 
 /**
@@ -19313,22 +20380,10 @@ export function exportPhase4Cdxml(
  * bond side (an imported CDXML, a file from before the record existed) gets the side its drawing
  * shows now, and keeps it through every later layout change (`withNativeDocumentLabelBondSides`).
  */
-export function openNativeDocument(contents: string): ChemDraftOpenResult {
-  const result = openChemDraftPayload(contents);
-  const { conflict } = result;
-  return {
-    ...result,
-    ...(result.document ? { document: withNativeDocumentLabelBondSides(result.document) } : {}),
-    ...(conflict
-      ? {
-        conflict: {
-          ...conflict,
-          embeddedDocument: withNativeDocumentLabelBondSides(conflict.embeddedDocument),
-          ...(conflict.visibleDocument ? { visibleDocument: withNativeDocumentLabelBondSides(conflict.visibleDocument) } : {})
-        }
-      }
-      : {})
-  };
+export function openNativeDocument(contents: string | Uint8Array): ChemDraftOpenResult {
+  return typeof contents === "string"
+    ? readNativeDocumentContents(contents, openChemDraftPayload)
+    : readNativeDocumentContents("", () => importCdx(contents));
 }
 
 const importedPageFitPaddingPx = 24;
@@ -19580,7 +20635,8 @@ export function copyAsScopeObjects(document: ChemDraftDocument): readonly Docume
     }
   });
 
-  return page.objects.filter((object) => scopeIds.has(object.id));
+  const attachedScopeIds = new Set(withArrowAttachmentIds(page.objects, [...scopeIds]));
+  return page.objects.filter((object) => attachedScopeIds.has(object.id));
 }
 
 export function copyAsScopeMolecules(document: ChemDraftDocument): readonly MoleculeObject[] {
@@ -19646,7 +20702,10 @@ export function copyAsMergedMolecule(
  * is room: it has no 999-atom ceiling, and a V2000 overflow falls back to that lossy `structure`
  * string, silently.
  */
-export function analysisFacingStructure(molecule: MoleculeObject): { structureFormat: string; structure: string; refusalReason?: string } {
+export function analysisFacingStructure(molecule: MoleculeObject, document?: ChemDraftDocument): { structureFormat: string; structure: string; refusalReason?: string; refusalCode?: string } {
+  const bracketWarnings = moleculeBracketWarningMessages(molecule, document, { atomPosition: transformPointForObject });
+  if (bracketWarnings.length) return { structureFormat: "molfile-v3000", structure: "",
+    refusalReason: bracketWarnings.join(" "), refusalCode: "structure.repeat_unit" };
   const unknownIds = molecule.bonds.filter((bond) => bond.order === "unknown").map((bond) => bond.id);
   if (unknownIds.length > 0) {
     // No query molfile reaches a descriptor engine. The client maps this to an unsupported run,
@@ -19706,11 +20765,20 @@ export function validationFacingStructure(
  * positions left out, so moving or rotating the molecule never reads as a stale report, while any
  * change to its chemistry (an element, a charge, a bond order, a label) does.
  */
-export function analysisSubjectKey(molecule: MoleculeObject): string {
+export function analysisSubjectKey(molecule: MoleculeObject, document?: ChemDraftDocument): string {
+  const membership = document?.pages.flatMap(page => [...bracketPairs(page.objects).values()].flatMap(pair => {
+    if (!pair.some(bracket => bracket.repeatUnit || bracket.bracketKind === "polymer" ||
+      bracket.bracketUsage && bracket.bracketUsage !== "generic")) return [];
+    const resolved = resolveRepeatUnitAtomMembership(pair, page.objects, { atomPosition: transformPointForObject });
+    if (!resolved.referencedObjectIds.has(molecule.id)) return [];
+    return [[pair[0].pairId, resolved.members.find(member => member.molecule.id === molecule.id)?.atomIds, resolved.reason]];
+  }));
   return JSON.stringify([
     molecule.id,
     molecule.atoms.map(({ x: _x, y: _y, z: _z, ...atom }) => atom),
-    molecule.bonds
+    molecule.bonds,
+    moleculeBracketWarningMessages(molecule, document, { atomPosition: transformPointForObject }),
+    membership
   ]);
 }
 
@@ -19719,7 +20787,9 @@ export function analysisSubjectKey(molecule: MoleculeObject): string {
  * Keep this import on demand: copying a drawing must not load RDKit at application startup.
  */
 export async function copyAsSmiles(document: ChemDraftDocument, warningsOut?: string[]): Promise<string | undefined> {
+  if (refusePreservedChemistryCopy(document, "SMILES", warningsOut)) return undefined;
   const molecules = copyAsScopeMolecules(document);
+  reportRepeatUnitExportWarnings(document, "SMILES", molecules, warningsOut);
   if (molecules.length === 0) {
     return undefined;
   }
@@ -19733,7 +20803,7 @@ export async function copyAsSmiles(document: ChemDraftDocument, warningsOut?: st
       if (smiles.length > 0) parts.push(smiles);
     }
   } finally {
-    warningsOut?.push(...warnings.map((warning) => warning.message));
+    warningsOut?.push(...warnings.map((warning) => warning.message).filter(message => !warningsOut.some(previous => previous.includes(message))));
   }
   return parts.length > 0 ? parts.join(".") : undefined;
 }
@@ -19744,30 +20814,108 @@ export async function copyAsSmiles(document: ChemDraftDocument, warningsOut?: st
  * lossy-emission notes (V2000 flattens dative bonds to single; any other label — a placeholder,
  * unrecognized text, a flagged group, a bonded "Ar" — writes as a dummy atom) — V3000 keeps dative
  * bonds as coordination type 9 and stays silent about them.
+ * Serialization only: clipboard commands use copyAsMolfileForExport to verify the final bytes.
+ * External copies default to Angstrom units; identifier computation requests raw coordinates.
  */
 export function copyAsMolfile(
   document: ChemDraftDocument,
   flavor: "v2000" | "v3000",
-  warningsOut?: string[]
+  warningsOut?: string[],
+  options: { coordinateUnits?: "angstrom" | "raw" } = {}
 ): string | undefined {
-  const scoped = copyAsMergedMolecule(copyAsScopeMolecules(document));
+  if (refusePreservedChemistryCopy(document, "MOL", warningsOut)) return undefined;
+  const molecules = copyAsScopeMolecules(document);
+  const scoped = copyAsMergedMolecule(molecules);
   if (!scoped) {
     return undefined;
   }
   // Valid group labels are written as their atoms, each wrapped in a superatom S-group carrying
   // the label, so a reader that contracts abbreviations still shows "OMe".
   const { molecule: merged, expansions, placeholderAtoms } = expandNativeMoleculeLabelGroups(scoped);
-  const options = {
+  const writerWarnings: string[] = [];
+  const repeatWarnings: ExportWarning[] = [];
+  const repeatUnitGroups = repeatUnitMolfileGroups(document, molecules, repeatWarnings, { merged: true, expansions });
+  // A real SRU S-group preserves the polymer, so it needs no one-copy loss warning.
+  // Retain multiple/unknown context; declined SRUs already have a specific loss warning.
+  // Read it before merging, which can rebuild cached chemistry under a new molecule id, and
+  // describe molecules without native ids.
+  const nonSruGroups = new Set(repeatUnits(document, molecules).filter(unit => unit.usage !== "sru").map(unit => unit.objectId));
+  // The graph-only writer re-emits cached bracket notes with native ids. Live context below
+  // replaces those notes, including when an SRU is declined and its old note must be dropped.
+  const cachedBracketMessages = new Set(moleculeBracketWarningMessages(merged));
+  const repeatMessages = [...repeatWarnings.map(warning => molecules.reduce((message, molecule) =>
+    message.replaceAll(`member "${molecule.id}"`, "member molecule"), warning.message)),
+    ...molecules.flatMap(molecule => bracketChemistryWarnings(document, molecule, { atomPosition: transformPointForObject })
+      .filter(warning => nonSruGroups.has(warning.objectId))
+      .map(warning => warning.message.replace(`Molecule ${molecule.id} is`, "A molecule is")))];
+  warningsOut?.push(...repeatMessages);
+  const writerOptions = {
     fromDocFrame: true,
-    warnings: warningsOut,
+    warnings: writerWarnings,
     kekuleBondOrders: nativeBondOrderResolution(merged.atoms, merged.bonds).kekuleOrders,
     superatomGroups: expansions,
+    repeatUnitGroups,
     placeholderAtoms
   };
-  return flavor === "v2000" ? moleculeToMolfileV2000(merged, options).contents : moleculeToMolfileV3000(merged, options).contents;
+  try {
+    // Identifier computation keeps the raw drawing coordinates and their established rounding.
+    if (options.coordinateUnits === "raw") {
+      return (flavor === "v2000" ? moleculeToMolfileV2000 : moleculeToMolfileV3000)(merged, writerOptions).contents;
+    }
+    return moleculeToInteropMolfile(merged, flavor, documentDrawingDefaults(document).bondLengthPx, writerOptions).contents;
+  } finally {
+    warningsOut?.push(...molecules.flatMap(molecule => {
+      // Account only for labels the writer actually diagnosed, retaining drawn atom indices.
+      const unrecognizedLabels = new Set(molecule.atoms.filter(atom => writerWarnings.some(message =>
+        message.startsWith(`Atom label "${atom.element}" is not an element symbol;`)
+      )).map(atom => atom.element));
+      return nativeMoleculeExportWarnings(molecule, { unrecognizedLabels }).map(warning => warning.message);
+    }), ...writerWarnings.filter(message => !cachedBracketMessages.has(message) && !repeatMessages.some(warning => warning.includes(message))));
+  }
+}
+
+/** Prepare and verify a complete merged Copy As CTAB before any clipboard write. */
+export async function copyAsMolfileForExport(
+  document: ChemDraftDocument,
+  flavor: "v2000" | "v3000",
+  warningsOut?: string[],
+  computeStructureIdentifiers?: ComputeStructureIdentifiers
+): Promise<string | undefined> {
+  const contents = copyAsMolfile(document, flavor, warningsOut);
+  if (contents === undefined) return undefined;
+  const source = copyAsMolfile(document, flavor, undefined, { coordinateUnits: "raw" })!;
+  const identifiers = computeStructureIdentifiers ?? await (await import("./moleculeSmiles")).loadStructureIdentifiers();
+  let verifiedContents = contents;
+  const engine = identifiersWithMolfileStereo(identifiers, (sourceMolfile, reason) => {
+    verifiedContents = sourceMolfile;
+    warningsOut?.push(sourceCoordinateWarnings[reason].message);
+  });
+  await assertMolfileExportIdentity(source, contents, engine, flavor === "v2000" ? "Copy as MOL V2000" : "Copy as MOL");
+  return verifiedContents;
 }
 
 const copyAsPagePaddingPx = 16;
+
+function refusePreservedChemistryCopy(document: ChemDraftDocument, format: string, warningsOut?: string[]): boolean {
+  const scope = copyAsScopeObjects(document);
+  let values = preservedNativeChemistryValues(document, new Set(scope.map(object => object.id)));
+  // Inspect the full scope before the editable-graph filter can omit source-only chemistry.
+  // If that filter would fall back to the page, check its full scope too.
+  if (!values.length && !scope.some(object => object.type === "molecule" && isEditableNativeMoleculeGraph(object))) {
+    values = preservedNativeChemistryValues(document, new Set(firstPage(document).objects.map(object => object.id)));
+  }
+  if (!values.length) return false;
+  const message = `Copy as ${format} refused: preserved source chemistry (${values.map(value => JSON.stringify(value)).join(", ")}) cannot be represented. Use native ChemDraft copy to keep it.`;
+  if (!warningsOut) throw new Error(message);
+  warningsOut.push(message);
+  return true;
+}
+
+function reportRepeatUnitExportWarnings(document: ChemDraftDocument, format: string, molecules: readonly MoleculeObject[], warningsOut?: string[]) {
+  const messages = repeatUnitExportWarnings(document, format, { molecules }).map(warning => warning.message);
+  warningsOut?.push(...messages);
+  return messages;
+}
 
 /**
  * A temporary document holding only the copy scope, translated onto a page fitted to its bounds —
@@ -19781,8 +20929,13 @@ export function copyAsScopedDocument(document: ChemDraftDocument): ChemDraftDocu
   }
 
   const bounds = objects.map((object): ObjectBounds => {
+    // A plane tilt changes ellipse ink bounds even with zero in-plane rotation.
+    if (object.type === "graphic" && object.graphicKind === "ellipse") {
+      return documentObjectVisualBounds(object, page.objects);
+    }
     // Preserve the exact legacy crop for unrotated objects, including stored frames
     // that differ from their ink bounds (labels, table overflow and art effects).
+    if (object.type === "bracket") return bracketVisualBounds(object);
     if (object.rotation === 0) return object;
     if (object.type === "graphic") return documentObjectVisualBounds(object, page.objects);
     if (object.type === "text") return textVisualBoundsForArrangement(object);
@@ -19840,22 +20993,25 @@ export function copyAsScopedDocument(document: ChemDraftDocument): ChemDraftDocu
   return patches.length === 0 ? scoped : applyPatches(scoped, patches, { now: phase4Timestamp });
 }
 
-export function exportPhase4Svg(
+export async function exportPhase4Svg(
   document: ChemDraftDocument,
-  options: Pick<SvgExportOptions, "includeWarnings" | "includePageGuides" | "pageIndex" | "background" | "outputWidth" | "outputHeight" | "outputUnit"> = {}
-): SvgExportResult {
+  options: SvgExportOptions = {}
+): Promise<SvgExportResult> {
+  await ensureSvgFontsLoaded(document, options);
   return exportDocumentToSvg(document, {
     ...options,
+    directElectronMarkEditing: options.directElectronMarkEditing ?? loadDirectElectronMarkEditing(),
     includeWarnings: options.includeWarnings ?? true
   });
 }
 
 export async function exportPhase4Pdf(
   document: ChemDraftDocument,
-  options: Pick<PdfExportOptions, "compress" | "includePageGuides" | "pageIndex" | "outputWidth" | "outputHeight"> = {}
+  options: Pick<PdfExportOptions, "compress" | "includePageGuides" | "pageIndex" | "outputWidth" | "outputHeight" | "directElectronMarkEditing"> = {}
 ): Promise<BinaryExportResult> {
   const { exportDocumentToPdf } = await import("@chemdraft/export-engine/pdf");
-  return exportDocumentToPdf(document, options);
+  return exportDocumentToPdf(document, { ...options,
+    directElectronMarkEditing: options.directElectronMarkEditing ?? loadDirectElectronMarkEditing() });
 }
 
 export function chemistryMetadataFromAnalysis(result: StructureAnalysisResult): ChemicalMetadata {
@@ -19888,7 +21044,7 @@ function documentObjectExists(document: ChemDraftDocument, objectId: string): bo
   return document.pages.some((page) => page.objects.some((object) => object.id === objectId));
 }
 
-function findDocumentObject(document: ChemDraftDocument, objectId: string): DocumentObject | undefined {
+export function findDocumentObject(document: ChemDraftDocument, objectId: string): DocumentObject | undefined {
   for (const page of document.pages) {
     const object = page.objects.find((candidate) => candidate.id === objectId);
     if (object) {
@@ -20077,30 +21233,44 @@ function extendNativeCarbonGraph(
     }
   ];
 
-  const orderedBonds = nativeBondsWithToolOrder(molecule, { ...molecule, atoms, bonds }, options);
-  return orderedBonds ? refreshNativeSingleBondGraph(molecule, atoms, orderedBonds) : undefined;
+  const orderedBonds = nativeBondsWithToolOrder({ ...molecule, atoms, bonds }, options);
+  return orderedBonds ? refreshNativeBondToolGraph(molecule, atoms, orderedBonds, options) : undefined;
+}
+
+/** Reuse the selected-bond either writer, including its source-only chemistry guards. */
+function refreshNativeBondToolGraph(
+  molecule: MoleculeObject, atoms: readonly MoleculeAtom[], bonds: readonly MoleculeBond[], options: NativeBondToolOptions
+): MoleculeObject | undefined {
+  if (options.bondStereo !== "either") return refreshNativeSingleBondGraph(molecule, atoms, bonds);
+  try {
+    const refreshed = refreshNativeSingleBondGraph(molecule, atoms, bonds);
+    return withStoredBondStereoMolfile({ ...refreshed, structure: molecule.structure, structureFormat: molecule.structureFormat });
+  } catch (error) {
+    options.onRefusal?.(error instanceof Error ? error.message : "Cannot preserve E/Z stereo");
+    return undefined;
+  }
 }
 
 /**
  * Give the bond a tool just added the tool's order, through the same path as order cycling so a
  * double bond also stores its side. Returns the bonds unchanged for a single bond; reports the
- * reason through `onRefusal` and returns undefined when the order would break an endpoint.
+ * format refusal through `onRefusal`; unsupported valence is diagnosed after the edit lands.
  */
 function nativeBondsWithToolOrder(
-  baseline: MoleculeObject,
   molecule: MoleculeObject,
   options: NativeBondToolOptions
 ): MoleculeBond[] | undefined {
   const order = options.bondOrder ?? "single";
   const addedBond = molecule.bonds[molecule.bonds.length - 1];
   if (order === "single") return molecule.bonds;
-  const refusal = nativeBondOrderRefusalReason(molecule, addedBond, order, baseline);
+  const refusal = nativeBondOrderRefusalReason(molecule, addedBond, order);
   if (refusal) {
     options.onRefusal?.(refusal);
     return undefined;
   }
   return molecule.bonds.map(bond =>
-    bond.id === addedBond.id ? nativeBondWithOrderAndDisplay(molecule, bond, order) : bond);
+    bond.id === addedBond.id ? { ...nativeBondWithOrderAndDisplay(molecule, bond, order),
+      ...(order === "double" && options.bondStereo === "either" ? { stereo: "either" as const } : {}) } : bond);
 }
 
 /**
@@ -20126,16 +21296,7 @@ function appendNativeCarbonVertices(
   let added = 0;
 
   for (const vertex of vertices) {
-    // Valence is checked against the graph as grown so far. Only the source atom needs the
-    // whole-molecule bond-order resolution; every later attach point is a carbon this loop just
-    // made, holding one plain single bond. Resolving the growing molecule per vertex made a drag
-    // O(chain × molecule), and re-kekulized every aromatic ring per vertex.
-    const canGrow = added === 0
-      ? canGrowNativeAtom(molecule, attachAtomId)
-      : nativeAtomAvailableBondCount(atoms[atoms.length - 1], 1, molecule) > 0;
-    if (!canGrow) {
-      break;
-    }
+    if (added === 0 && !canGrowNativeAtom(molecule, attachAtomId)) break;
     const newAtom: MoleculeAtom = {
       id: atomIds[added],
       element: "C",
@@ -20298,9 +21459,8 @@ function neighborAnglesForAtom(molecule: MoleculeObject, atomId: string): number
 /**
  * The atom another molecule object offers as a bond endpoint at `point` — how a dragged bond
  * reaches across objects (a typed "Zn" is its own one-atom molecule until a bond joins it to
- * the ligand). Nearest hit wins across every other molecule on the page whose hit atom still has
- * a free growth slot and an editable graph. A preview that cannot be merged must leave the
- * ordinary bond-growth path available.
+ * the ligand). Nearest hit wins across every other editable molecule on the page. A preview
+ * that cannot be merged must leave the ordinary bond-growth path available.
  */
 export function findForeignNativeMoleculeBondTarget(
   page: DocumentPage,
@@ -20313,7 +21473,7 @@ export function findForeignNativeMoleculeBondTarget(
     )
     .map((molecule) => ({ molecule, hit: findNativeMoleculeAtomHit(molecule, point) }))
     .filter((entry): entry is { molecule: MoleculeObject; hit: NonNullable<ReturnType<typeof findNativeMoleculeAtomHit>> } =>
-      entry.hit !== undefined && entry.hit.availableBonds > 0
+      entry.hit !== undefined
     )
     .sort((left, right) => left.hit.distance - right.hit.distance || left.molecule.id.localeCompare(right.molecule.id));
   const target = hits[0];
@@ -20373,13 +21533,34 @@ function mergeNativeMoleculeObjects(
 
   return {
     molecule: refreshNativeSingleBondGraph(
-      { ...host, style: mergeIdKeyedMoleculeStyle(host.style, absorbed.style, atomIdMap, bondIdMap) },
+      { ...host, style: mergeIdKeyedMoleculeStyle(host.style, absorbed.style, atomIdMap, bondIdMap),
+        compatibility: mergeMoleculeSourceIds(host, absorbed, atomIdMap, bondIdMap) },
       atoms,
       bonds
     ),
     atomIdMap,
     bondIdMap
   };
+}
+
+function mergeMoleculeSourceIds(host: MoleculeObject, absorbed: MoleculeObject,
+  atomIds: ReadonlyMap<string, string>, bondIds: ReadonlyMap<string, string>): MoleculeObject["compatibility"] {
+  const unknown = { ...host.compatibility?.unknown };
+  let changed = false;
+  for (const [key, ids] of [["cdxmlAtomIdsByAtomId", atomIds], ["cdxmlBondIdsByBondId", bondIds]] as const) {
+    const oldIds = absorbed.compatibility?.unknown[key];
+    if (!oldIds || typeof oldIds !== "object" || Array.isArray(oldIds)) continue;
+    const mapped = [...ids].flatMap(([from, to]) => {
+      const sourceId = (oldIds as Record<string, unknown>)[from];
+      return typeof sourceId === "string" ? [[to, sourceId]] : [];
+    });
+    if (!mapped.length) continue;
+    const existing = unknown[key];
+    unknown[key] = { ...(existing && typeof existing === "object" && !Array.isArray(existing) ? existing : {}),
+      ...Object.fromEntries(mapped) };
+    changed = true;
+  }
+  return changed ? { warnings: [], ...host.compatibility, unknown } : host.compatibility;
 }
 
 /**
@@ -20488,9 +21669,15 @@ function remapAnchorsAfterMoleculeMerge(
       const childObjectIds = [...new Set(object.childObjectIds.map((id) => id === absorbedObjectId ? hostObjectId : id))];
       return [{ op: "updateObject", objectId: object.id, changes: { childObjectIds } }];
     }
-    if (object.type === "bracket" && object.containedObjectIds.includes(absorbedObjectId)) {
+    if (object.type === "bracket") {
+      const compatibility = remapImportedRepeatUnitAfterMoleculeMerge(object, absorbedObjectId, hostObjectId, atomIdMap, bondIdMap);
+      const nativeRefsChanged = object.containedObjectIds.includes(absorbedObjectId) ||
+        object.crossingBondIds?.some(ref => ref.objectId === absorbedObjectId);
+      if (!nativeRefsChanged && compatibility === object.compatibility) return [];
       const containedObjectIds = [...new Set(object.containedObjectIds.map((id) => id === absorbedObjectId ? hostObjectId : id))];
-      return [{ op: "updateObject", objectId: object.id, changes: { containedObjectIds } }];
+      return [{ op: "updateObject", objectId: object.id, changes: { containedObjectIds, compatibility,
+        crossingBondIds: object.crossingBondIds?.flatMap(ref => ref.objectId !== absorbedObjectId ? [ref] :
+          bondIdMap.has(ref.bondId) ? [{ objectId: hostObjectId, bondId: bondIdMap.get(ref.bondId)! }] : []) } }];
     }
     return [];
   });
@@ -20519,8 +21706,8 @@ function connectNativeCarbonAtoms(
     }
   ];
 
-  const orderedBonds = nativeBondsWithToolOrder(molecule, { ...molecule, bonds }, options);
-  return orderedBonds ? refreshNativeSingleBondGraph(molecule, molecule.atoms, orderedBonds) : undefined;
+  const orderedBonds = nativeBondsWithToolOrder({ ...molecule, bonds }, options);
+  return orderedBonds ? refreshNativeBondToolGraph(molecule, molecule.atoms, orderedBonds, options) : undefined;
 }
 
 function atomLabelIsotopeRefusal(atom: MoleculeAtom, label: string, molecule: MoleculeObject, literal: boolean): string | undefined {
@@ -20584,12 +21771,18 @@ function nextNativeBondOrder(molecule: MoleculeObject, bond: MoleculeBond): Mole
 function nativeBondWithOrderAndDisplay(
   molecule: MoleculeObject,
   bond: MoleculeBond,
-  order: MoleculeBond["order"]
+  order: MoleculeBond["order"],
+  useDrawingDefault = true
 ): MoleculeBond {
-  const bondStyle = bond.display?.bondStyle;
+  const bondStyle = bond.display?.bondStyle === "wavy" && order !== "single" ? undefined : bond.display?.bondStyle;
   if (order === "double") {
-    const doubleBondSide = bond.display?.doubleBondSide ?? defaultDoubleBondSide(molecule, { ...bond, order });
+    // This helper is used only by drawing/order edits. Imported and pasted graphs retain
+    // their own display data; ring/template insertion also keeps its explicit placement.
+    const doubleBondSide = bond.display?.doubleBondSide ??
+      (useDrawingDefault && loadDrawingSettings().defaultDoubleBond === "centred"
+        ? "center" : defaultDoubleBondSide(molecule, { ...bond, order }));
     const { doubleBondSide: _side, ...restDisplay } = bond.display ?? {};
+    if (restDisplay.bondStyle === "wavy") delete restDisplay.bondStyle;
     const display = { ...restDisplay, ...(doubleBondSide !== undefined ? { doubleBondSide } : {}) };
     return {
       ...bond,
@@ -20656,15 +21849,13 @@ function canSetNativeBondOrder(
 }
 
 /**
- * Why a bond cannot take `order`, in words for the status line; undefined when it can. For a bond
- * a tool has just added, pass the molecule as it was before the addition as `baseline`, so the
- * endpoints are judged against what they were rather than against the single bond just added.
+ * Format restrictions on a requested bond order, in words for the status line. Chemistry
+ * validity is diagnostic only; it never decides whether a drawing edit lands.
  */
 function nativeBondOrderRefusalReason(
   molecule: MoleculeObject,
   bond: MoleculeBond,
-  order: MoleculeBond["order"],
-  baseline: MoleculeObject = molecule
+  order: MoleculeBond["order"]
 ): string | undefined {
   if (order !== "single" && order !== "double" && order !== "triple") {
     return `a ${order} bond cannot be set with this tool`;
@@ -20689,62 +21880,7 @@ function nativeBondOrderRefusalReason(
     return `a dashed (dative) bond stays single, not ${order}`;
   }
 
-  // Judge the change by the validator the badges use, on the bonds as they WOULD be: the order
-  // swapped, the display style kept. One rule for every endpoint, the same one the drawing is
-  // checked against: a dashed (dative) bond contributes no valence before or after, a charged N
-  // is judged at its charge, and a metal is judged by its coordination ceiling rather than a
-  // covalent valence table it is not in. The old arithmetic subtracted the raw order value from
-  // a usage map that had counted a dashed bond as 0 — so a pyridine N with a dashed bond to Zn
-  // read "3 − 1 + 2 = 4", an N⁺ — and asked the neutral-valence table about the Zn, which
-  // answered `undefined` and refused every bond touching a metal. Only a change that BREAKS an
-  // endpoint is refused; an atom already flagged stays editable.
-  const nextBonds = molecule.bonds.map((candidate) => (candidate.id === bond.id ? { ...candidate, order } : candidate));
-  const nextAtoms = clearChangedAtomHydrogenHints(molecule, molecule.atoms, nextBonds);
-  const nextAtomById = new Map(nextAtoms.map((atom) => [atom.id, atom]));
-  const beforeResolution = nativeBondOrderResolution(baseline.atoms, baseline.bonds);
-  const afterResolution = nativeBondOrderResolution(nextAtoms, nextBonds);
-  const breaks = (atom: MoleculeAtom): boolean => {
-    // A dismissed badge must not license the edit: judge the bare arithmetic.
-    const { warningSuppressed: _nextSuppressed, ...nextBare } = nextAtomById.get(atom.id)!;
-    const nextState = nativeAtomValidationState(nextBare, nextBonds, nextBare.formalCharge, nextAtoms, afterResolution);
-    const nextInvalid = !nextState.valid;
-    const priorAtom = baseline.atoms.find((candidate) => candidate.id === atom.id);
-    // An atom the tool just created has no earlier state: it is judged only as it ends up.
-    if (!priorAtom) return nextInvalid;
-    // The baseline excuses a problem the atom already had, never a result past its valence: a
-    // hypovalent literal atom (three bonds on a typed "C") is flagged before the addition, yet
-    // a double bond from it would still make a pentavalent carbon. The same holds when the change
-    // is a RAISED order on an existing bond (baseline === molecule), judged against the atom's own
-    // bond-order sum; lowering an order only reduces valence, so it is never refused here.
-    const { warningSuppressed: _warningSuppressed, ...bare } = priorAtom;
-    const priorState = nativeAtomValidationState(bare, baseline.bonds, bare.formalCharge, baseline.atoms, beforeResolution);
-    const nextElement = nativeElementFromAtomLabel(nextBare.element);
-    const raisesValence = baseline !== molecule || nextState.valenceUsed > priorState.valenceUsed;
-    if (raisesValence && nextInvalid && nextElement &&
-      !nativeAtomChargeSupportsValence(nextElement, nextState.valenceUsed, nextBare.formalCharge)) {
-      return true;
-    }
-    // The proposed graph has already invalidated import-time hints. Judging it against the old
-    // H count would refuse ordinary edits such as converting imported ethane to ethene.
-    return priorState.valid && nextInvalid;
-  };
-  const broken = [fromAtom, toAtom].find(breaks);
-  if (!broken) return undefined;
-  // Say "exceed" only when the change really adds valence; a lowering that leaves a typed atom
-  // short, or an aromatic ring unresolvable, is named by the validator's own reason.
-  const { warningSuppressed: _brokenSuppressed, ...brokenBare } = nextAtomById.get(broken.id)!;
-  const brokenState = nativeAtomValidationState(brokenBare, nextBonds, brokenBare.formalCharge, nextAtoms, afterResolution);
-  const priorBroken = baseline.atoms.find((candidate) => candidate.id === broken.id);
-  const priorBrokenState = priorBroken
-    ? nativeAtomValidationState(
-      (({ warningSuppressed: _w, ...bare }) => bare)(priorBroken),
-      baseline.bonds, priorBroken.formalCharge, baseline.atoms, beforeResolution)
-    : undefined;
-  const addsValence = baseline !== molecule || !priorBrokenState || brokenState.valenceUsed > priorBrokenState.valenceUsed;
-  if (addsValence || !brokenState.invalidReason) {
-    return `${broken.element} would exceed its valence with a ${order} bond`;
-  }
-  return `a ${order} bond would leave ${broken.element} invalid: ${brokenState.invalidReason}`;
+  return undefined;
 }
 
 function canGrowNativeAtom(molecule: MoleculeObject, atomId: string): boolean {
@@ -20752,12 +21888,7 @@ function canGrowNativeAtom(molecule: MoleculeObject, atomId: string): boolean {
 }
 
 function nativeAtomGrowRefusalReason(molecule: MoleculeObject, atomId: string): string | undefined {
-  const valenceUsage = atomBondOrderUsageMap(molecule.atoms, molecule.bonds);
-  const atom = molecule.atoms.find((candidate) => candidate.id === atomId);
-  if (!atom) return "the atom to grow from is missing";
-  return nativeAtomAvailableBondCount(atom, valenceUsage.get(atomId) ?? 0, molecule) > 0
-    ? undefined
-    : `${atom.element} has no available valence`;
+  return molecule.atoms.some((atom) => atom.id === atomId) ? undefined : "the atom to grow from is missing";
 }
 
 function canConnectNativeAtoms(
@@ -20791,10 +21922,7 @@ function nativeAtomsConnectRefusalReason(
     return "those atoms are already bonded";
   }
 
-  const valenceUsage = atomBondOrderUsageMap(molecule.atoms, molecule.bonds);
-  const full = [sourceAtom, targetAtom].find((atom) =>
-    nativeAtomAvailableBondCount(atom, valenceUsage.get(atom.id) ?? 0, molecule) <= 0);
-  return full ? `${full.element} has no available valence` : undefined;
+  return undefined;
 }
 
 function deleteNativeCarbonAtom(
@@ -20870,7 +21998,7 @@ function nativeMoleculeAfterPartDelete(
   return refreshNativeSingleBondGraph(molecule, atoms, bonds);
 }
 
-function refreshNativeSingleBondGraph(
+export function refreshNativeSingleBondGraph(
   molecule: MoleculeObject,
   atoms: readonly MoleculeAtom[],
   bonds: readonly MoleculeBond[]
@@ -21286,28 +22414,6 @@ function nextOrdinalId(prefix: string, index: number): string {
   return `${prefix}_${String(index + 1).padStart(3, "0")}`;
 }
 
-function isEditableNativeMoleculeGraph(molecule: MoleculeObject): boolean {
-  const atomIds = new Set(molecule.atoms.map((atom) => atom.id));
-  const supportedBondOrders = new Set<MoleculeBond["order"]>(["single", "double", "triple", "aromatic", "unknown"]);
-
-  return (
-    molecule.atoms.length >= 1 &&
-    molecule.atoms.every((atom) =>
-      atom.id.trim().length > 0 &&
-      atom.element.trim().length > 0 &&
-      Number.isFinite(atom.x) &&
-      Number.isFinite(atom.y)
-    ) &&
-    molecule.bonds.every((bond) =>
-      bond.id.trim().length > 0 &&
-      bond.fromAtomId !== bond.toAtomId &&
-      atomIds.has(bond.fromAtomId) &&
-      atomIds.has(bond.toAtomId) &&
-      supportedBondOrders.has(bond.order)
-    )
-  );
-}
-
 function nativeMoleculePartBondIds(
   molecule: MoleculeObject,
   target: NativeMoleculePartReorderTarget
@@ -21400,27 +22506,6 @@ function reorderMoleculeBonds(
   return reordered;
 }
 
-function nativeAtomAvailableBondCount(atom: MoleculeAtom, valenceUsed: number, molecule: MoleculeObject): number {
-  // A group label ("OMe", "NMe2") has a known free valence: the bond tool may fill it — a lone
-  // "OMe" takes its one bond — but never past it. Any other label (a placeholder, a bare formula,
-  // unrecognized text) has none to fill and takes no bonds from the drawing tools. A typed "Ac",
-  // "Pr" or "Ts" on a bond is such a group too; unbonded, or from a structure file, it is an element
-  // and takes bonds like one. A cyano label ("SCN") with its bond on the right is a bare formula,
-  // read with the same bond side as the badge and the formula.
-  const reading = nativeAtomLabelReading(atom.element, nativeAtomLabelContextInMolecule(atom, molecule, valenceUsed > 0));
-  if (reading.kind === "element") {
-    return Math.max(0, nativeAtomInvalidGrowthLimit - valenceUsed);
-  }
-  if (reading.kind !== "group") {
-    return 0;
-  }
-  const used = valenceUsed + (atom.markRadicals ?? 0);
-  const verdict = nativeLabelGroupVerdict(reading.group, used, atom.formalCharge);
-  return !verdict.valid && verdict.expectedBondCount !== undefined
-    ? Math.max(0, verdict.expectedBondCount - used)
-    : 0;
-}
-
 function atomChargeLabelSuffix(charge: number): string {
   if (charge === 0) {
     return "";
@@ -21429,13 +22514,6 @@ function atomChargeLabelSuffix(charge: number): string {
   const magnitude = Math.abs(charge);
   const sign = charge > 0 ? "+" : "-";
   return magnitude === 1 ? sign : `${magnitude}${sign}`;
-}
-
-/** A drawable mark charge: any nonzero integer up to |9| — 2+ zincs, 3- phosphates. */
-function nativeChargeValue(charge: number | undefined): number | undefined {
-  return typeof charge === "number" && Number.isInteger(charge) && charge !== 0 && Math.abs(charge) <= nativeChargeMarkMaxMagnitude
-    ? charge
-    : undefined;
 }
 
 function atomDegreeMap(

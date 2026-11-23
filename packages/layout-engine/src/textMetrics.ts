@@ -1,4 +1,5 @@
 import type { NativeTextStyle, TextSpan } from "@chemdraft/chem-core";
+import { patrickHandAdvances, patrickHandInkBounds } from "./patrickHandMetrics.generated";
 import {
   helveticaAdvances, helveticaBoldAdvances, timesAdvances, timesBoldAdvances,
   timesItalicAdvances, timesBoldItalicAdvances, courierAdvances
@@ -7,6 +8,34 @@ import {
   arialAdvanceCeilings, timesAdvanceCeilings, courierAdvanceCeilings, georgiaAdvanceCeilings,
   chemistryAdvanceCeilings
 } from "./nativeFontCeilings.generated";
+
+export function isPatrickHandFont(fontFamily: string): boolean {
+  return fontFamily.split(",")[0]!.trim().replace(/["']/g, "").toLowerCase() === "patrick hand";
+}
+
+/** Exact advances from the bundled 1.003 face; independent of installed system fonts. */
+export function patrickHandTextAdvanceEm(text: string): number {
+  return [...text].reduce((sum, character) => sum + (patrickHandAdvances[character.codePointAt(0)!] ?? textAdvanceEm(character)), 0);
+}
+
+/** Outline envelope relative to the baseline, in em, from the bundled face's glyf boxes.
+ * Advances alone omit overhangs and descenders. Uncovered characters use the fallback
+ * font's conservative envelope, matching the Arial fallback in the handwriting stack. */
+export function patrickHandTextInkBoundsEm(text: string): { x: number; y: number; width: number; height: number } {
+  let cursor = 0, left = Infinity, right = -Infinity, top = Infinity, bottom = -Infinity;
+  for (const character of text) {
+    const code = character.codePointAt(0)!;
+    const advance = patrickHandAdvances[code] ?? textAdvanceEm(character);
+    const [xMin, yMin, xMax, yMax] = patrickHandInkBounds[code] ?? [0, -0.3, advance, 0.95];
+    left = Math.min(left, cursor + xMin);
+    right = Math.max(right, cursor + xMax);
+    top = Math.min(top, -yMax);
+    bottom = Math.max(bottom, -yMin);
+    cursor += advance;
+  }
+  return left === Infinity ? { x: 0, y: 0, width: 0, height: 0 }
+    : { x: left, y: top, width: right - left, height: bottom - top };
+}
 
 /** Explicit SVG script metrics. Offsets are in PARENT em, independent of script size.
  * WebKit/Chromium's historical sub/super placement was approximately this offset;
@@ -43,6 +72,10 @@ function nativeTextAdvances(fontFamily: string, bold: boolean, italic: boolean):
 } | undefined {
   // Do not skip an unknown first family: it may be installed and wider than its fallback.
   const family = fontFamily.split(",")[0]!.trim().toLowerCase().replace(/["']/g, "");
+  if (isPatrickHandFont(fontFamily)) return {
+    advances: { ...helveticaAdvances, ...patrickHandAdvances },
+    ceilings: { ...arialAdvanceCeilings[(bold ? 1 : 0) + (italic ? 2 : 0)]!, ...patrickHandAdvances }
+  };
   const face = (bold ? 1 : 0) + (italic ? 2 : 0);
   if (["courier", "courier new"].includes(family)) {
     return { advances: courierAdvances, ceilings: courierAdvanceCeilings[face]! };
@@ -81,15 +114,16 @@ const fallbackAdvances = [0, 1, 2, 3].map(face => {
  * after EVERY character; the final character's tracking is clamped at zero so negative
  * tracking never removes the final advance. This shared
  * result feeds both automatic stored-box sizing and the transient editor frame. */
-export function measureNativeTextSpanLineWidth(spans: readonly TextSpan[], style: NativeTextStyle): number {
+export function measureNativeTextSpanLineWidth(spans: readonly TextSpan[], style: NativeTextStyle,
+  renderedFontSize?: (span: TextSpan) => number): number {
   let legacyWidth = 0;
   let metricWidth = 0;
   let count = 0;
   let finalLetterSpacing = 0;
   for (const span of spans) {
-    const fontSize = span.script === "normal"
+    const fontSize = renderedFontSize?.(span) ?? (span.script === "normal"
       ? (typeof span.style.fontSizePx === "number" ? span.style.fontSizePx : style.fontSizePx)
-      : style.fontSizePx * nativeTextScriptFontScale;
+      : style.fontSizePx * nativeTextScriptFontScale);
     const letterSpacing = typeof span.style.letterSpacingPx === "number" ? span.style.letterSpacingPx : style.letterSpacingPx;
     const bold = (typeof span.style.fontWeight === "number" ? span.style.fontWeight : style.fontWeight) >= 600;
     const italic = (span.style.fontStyle ?? style.fontStyle) === "italic";

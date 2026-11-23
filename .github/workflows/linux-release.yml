@@ -1,0 +1,183 @@
+name: Linux release
+
+# Builds the Linux packages for a release from the same tag as the macOS DMG and the Windows
+# installer: a .deb (Ubuntu, Linux Mint, Debian, Pop!_OS, elementary OS, …) and an AppImage.
+# Dispatch it with the same inputs as windows-release.yml:
+#
+#   gh workflow run linux-release.yml --ref v1.2.0 -f ref=v1.2.0 -f upload_to_release=v1.2.0
+#
+# Built on Ubuntu 22.04 on purpose: a binary links against the glibc and WebKitGTK of the host it is
+# built on, so the oldest supported base sets the floor. 22.04 covers Ubuntu 22.04+, Linux Mint 21+
+# and Debian 12+. See docs/releasing/linux.md.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Public repository tag or full commit SHA to build without publishing
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Public repository tag or full commit SHA to build
+        required: true
+        type: string
+      upload_to_release:
+        description: Optional existing DRAFT release tag (v<app version>)
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+# Do not race two uploads to the same draft.
+concurrency:
+  group: linux-release-${{ inputs.upload_to_release || inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/linux-build.yml
+    with:
+      ref: ${{ inputs.ref }}
+      upload_to_release: ${{ inputs.upload_to_release }}
+
+  smoke:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40 # Ubuntu mirror package installation took up to 19 minutes on 2026-11-18.
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      NEEDRESTART_MODE: a
+    steps:
+      # Use the action that belongs to the workflow, even when building an older source ref.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: linux-release-amd64
+          path: release-assets
+
+      - name: Verify the packages and install smoke test tools
+        id: prepare
+        env:
+          APPIMAGE_PACKAGE: release-assets/${{ needs.build.outputs.appimage }}
+        run: |
+          set -euo pipefail
+          mkdir -p smoke-logs
+          exec > >(tee smoke-logs/setup.log) 2>&1
+          (cd release-assets && sha256sum --check SHA256SUMS-linux.txt)
+          sudo apt-get update
+          sudo -E apt-get install -y --no-install-recommends \
+            at-spi2-core gir1.2-atspi-2.0 python3-gi fonts-dejavu-core \
+            dbus-bin dbus-daemon gdb imagemagick openbox strace x11-utils xclip xdotool xvfb \
+            libgtk-3-bin libxdo3 libegl1 libegl-mesa0 libgl1 libgl1-mesa-dri \
+            libwayland-client0 libwayland-egl1 libwayland-cursor0 libwayland-server0
+          chmod +x "$APPIMAGE_PACKAGE"
+
+      - name: Smoke test the repacked AppImage
+        uses: ./.github/workflows/linux-package-smoke
+        with:
+          bundle: release-assets/${{ needs.build.outputs.appimage }}
+          package: appimage
+          backend: x11
+          logs: ${{ github.workspace }}/smoke-logs/appimage
+          check-window: 'true'
+          diagnostics: 'true'
+
+      - name: Install the .deb
+        id: install-deb
+        # Still test the .deb if the AppImage fails. Test the AppImage before apt adds .deb dependencies.
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        env:
+          DEB: release-assets/${{ needs.build.outputs.deb }}
+        run: |
+          set -euo pipefail
+          sudo -E apt-get install -y --no-install-recommends "./$DEB" 2>&1 | tee smoke-logs/install-deb.log
+
+      - name: Smoke test the installed .deb
+        if: ${{ !cancelled() && steps.install-deb.outcome == 'success' }}
+        uses: ./.github/workflows/linux-package-smoke
+        with:
+          bundle: /usr/bin/chemdraft
+          package: deb
+          backend: x11
+          logs: ${{ github.workspace }}/smoke-logs/deb
+          check-window: 'true'
+          diagnostics: 'true'
+
+      - name: Preserve Linux smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-smoke-amd64-${{ matrix.runner }}
+          path: smoke-logs/
+          if-no-files-found: ignore
+
+  container-smoke:
+    needs: build
+    uses: ./.github/workflows/linux-container-smoke.yml
+    permissions:
+      actions: read
+      contents: read
+    with:
+      artifact_name: linux-release-amd64
+
+  upload:
+    needs: [build, smoke, container-smoke]
+    if: github.repository == 'jgassens/ChemDraft' && !github.event.repository.fork && inputs.upload_to_release != ''
+    runs-on: ubuntu-latest
+    concurrency:
+      group: draft-release-upload-${{ inputs.upload_to_release }}
+      cancel-in-progress: false
+    permissions:
+      contents: write # Upload and validate draft assets here; the build stays read-only.
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.build.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: linux-release-*
+          merge-multiple: true
+          path: release-assets
+      - name: Upload only to an existing draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.upload_to_release }}
+          VERSION: ${{ needs.build.outputs.version }}
+          BUILD_COMMIT: ${{ needs.build.outputs.commit }}
+        run: |
+          set -euo pipefail
+          [ "$RELEASE_TAG" = "v$VERSION" ] || { echo '::error::Release tag must match the package version.'; exit 1; }
+          draft_tag=$(gh release view "$RELEASE_TAG" --json isDraft,tagName --jq 'select(.isDraft).tagName') || { echo '::error::Target release must already exist.'; exit 1; }
+          [ "$draft_tag" = "$RELEASE_TAG" ] || { echo '::error::Refusing to upload outside the requested draft.'; exit 1; }
+          # Fetch immediately before upload and peel annotated tags.
+          git fetch --no-tags origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          destination_commit=$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")
+          [ "$destination_commit" = "$BUILD_COMMIT" ] || { echo '::error::Destination release tag does not match the built commit.'; exit 1; }
+          gh release upload "$RELEASE_TAG" release-assets/* --clobber
+
+      - name: Check attached builds and refresh combined checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.upload_to_release }}
+          BUILD_COMMIT: ${{ needs.build.outputs.commit }}
+        run: |
+          set -euo pipefail
+          node tools/release/check-release-assets.mjs --tag "$RELEASE_TAG" --commit "$BUILD_COMMIT" \
+            --allow-incomplete --skip-dmg-provenance --write-checksums "$RUNNER_TEMP/SHA256SUMS.txt"
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/SHA256SUMS.txt" --clobber

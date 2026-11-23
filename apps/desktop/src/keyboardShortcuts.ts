@@ -1,8 +1,11 @@
 import {
   createShortcutRegistry,
   detectShortcutPlatform,
+  parseShortcutDisplay,
   shortcutsFromCommands,
   type CommandShortcut,
+  type KeyboardEventLike,
+  type ShortcutOverrides,
   type ShortcutPlatform,
   type ShortcutRegistry
 } from "@chemdraft/shortcut-engine";
@@ -11,6 +14,7 @@ import {
   editActions,
   pageOrientationActions,
   pageSizeActions,
+  selectionNudgeActions,
   textToolbarActions,
   toolbarCustomizationActions,
   viewActions,
@@ -18,6 +22,29 @@ import {
 } from "./commands";
 import { applyKeybindingSchemeToCommands } from "./keybindingScheme";
 import type { KeybindingScheme } from "./keybindingSettings";
+import { isEditableTarget } from "./editableTarget";
+export { isBrowserReloadChord } from "./browserReloadGuard";
+
+/** Document coordinates use CSS-pixel units, with positive y pointing down the page. */
+export function arrowNudgeOffset(key: string, shift = false): { x: number; y: number } | undefined {
+  const step = shift ? 10 : 1;
+  switch (key) {
+    case "ArrowLeft": return { x: -step, y: 0 };
+    case "ArrowRight": return { x: step, y: 0 };
+    case "ArrowUp": return { x: 0, y: -step };
+    case "ArrowDown": return { x: 0, y: step };
+    default: return undefined;
+  }
+}
+
+export function arrowNudgeContinuesBurst(lastPress: number | undefined, now: number): boolean {
+  return lastPress !== undefined && now >= lastPress && now - lastPress < 1000;
+}
+
+/** Controls keep their own arrow navigation, including toolbar flyout buttons. */
+export function isArrowNudgeEditorTarget(target: EventTarget | null): boolean {
+  return isEditableTarget(target) || (target instanceof Element && !!target.closest("input, textarea, select, button"));
+}
 
 /**
  * Platform-convention chords bound in addition to a command's own `shortcut`. Windows and Linux
@@ -33,6 +60,7 @@ const PLATFORM_ALTERNATE_SHORTCUTS: readonly CommandShortcut[] = [
 export interface DesktopShortcutRegistryOptions {
   platform?: ShortcutPlatform;
   includeDisabled?: boolean;
+  overrides?: ShortcutOverrides;
 }
 
 /**
@@ -64,20 +92,23 @@ export function createMainWindowShortcutCommands(
     layerActions: readonly CommandSpec[];
     toolCommandSpecs: readonly CommandSpec[];
   },
-  scheme: KeybindingScheme
+  scheme: KeybindingScheme,
+  overrides?: ShortcutOverrides,
+  platform?: ShortcutPlatform
 ): CommandSpec[] {
   return applyKeybindingSchemeToCommands([
     ...state.quickActions,
     ...state.layerActions,
     ...copyAsActions,
     ...editActions,
+    ...selectionNudgeActions,
     ...state.toolCommandSpecs,
     ...viewActions,
     ...pageSizeActions,
     ...pageOrientationActions,
     ...textToolbarActions,
     ...toolbarCustomizationActions
-  ], scheme);
+  ].filter(command => !isHoverOnlyShortcutCommand(command.id)), scheme, overrides, platform);
 }
 
 export function createDesktopShortcutRegistry(
@@ -87,40 +118,46 @@ export function createDesktopShortcutRegistry(
   const options = typeof platformOrOptions === "string"
     ? { platform: platformOrOptions }
     : platformOrOptions;
+  const platform = options.platform ?? detectDesktopShortcutPlatform();
   const shortcutCommands = options.includeDisabled
     ? commands.map((command) => ({ ...command, enabled: true }))
     : commands;
 
-  const commandShortcuts = shortcutsFromCommands(shortcutCommands);
+  const commandShortcuts = shortcutsFromCommands(shortcutCommands).filter(shortcut => !isHoverOnlyShortcutCommand(shortcut.commandId));
+  for (const shortcut of [...commandShortcuts]) {
+    const extras = options.overrides?.commands?.[shortcut.commandId]?.slice(1) ?? [];
+    commandShortcuts.push(...extras.map(key => ({ commandId: shortcut.commandId, keys: parseShortcutDisplay(key) })));
+  }
   const boundCommandIds = new Set(commandShortcuts.map((shortcut) => shortcut.commandId));
   // An alternate follows its command: a disabled or absent command gets no extra chord either.
-  const alternates = PLATFORM_ALTERNATE_SHORTCUTS.filter((shortcut) => boundCommandIds.has(shortcut.commandId));
+  const alternates = PLATFORM_ALTERNATE_SHORTCUTS.filter(shortcut => boundCommandIds.has(shortcut.commandId) &&
+    !Object.hasOwn(options.overrides?.commands ?? {}, shortcut.commandId));
 
   return createShortcutRegistry([...commandShortcuts, ...alternates], {
-    platform: options.platform ?? detectDesktopShortcutPlatform()
+    platform
   });
+}
+
+export function commandPlatformAlternates(commandId: string, platform: ShortcutPlatform): string[] {
+  return PLATFORM_ALTERNATE_SHORTCUTS.filter(shortcut => shortcut.commandId === commandId && shortcut.platform === platform)
+    .map(shortcut => shortcut.keys.join("+"));
+}
+
+function isHoverOnlyShortcutCommand(id: string): boolean {
+  return id.startsWith("atom.") || id.startsWith("bond.");
 }
 
 export function detectDesktopShortcutPlatform(): ShortcutPlatform {
   return detectShortcutPlatform();
 }
 
-/**
- * WebView2's built-in browser shortcuts stay enabled (wry turns them on and Tauri exposes no switch),
- * so off macOS F5 / Ctrl+F5 / Ctrl+R / Ctrl+Shift+R reload the document webview — discarding undo
- * history, selection and anything newer than the last session autosave. The document window
- * suppresses these chords unless a ChemDraft command claims them (Ctrl+R is Show Rulers in the
- * ChemDraft scheme). macOS's WKWebView has no reload shortcut.
- */
-export function isBrowserReloadChord(
-  event: { key: string; ctrlKey?: boolean; altKey?: boolean; metaKey?: boolean },
-  platform: ShortcutPlatform = detectDesktopShortcutPlatform()
-): boolean {
-  if (platform === "macos" || event.altKey || event.metaKey) {
-    return false;
+export function defaultClipboardShortcut(event: KeyboardEventLike, platform: ShortcutPlatform = detectDesktopShortcutPlatform()): string | undefined {
+  const main = platform === "macos" ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+  if (!main || event.altKey || event.shiftKey) return undefined;
+  switch (event.key.toLowerCase()) {
+    case "c": return "clipboard.copy";
+    case "x": return "clipboard.cut";
+    case "v": return "clipboard.paste";
+    default: return undefined;
   }
-  if (event.key === "F5" || event.key === "BrowserRefresh") {
-    return true;
-  }
-  return Boolean(event.ctrlKey) && event.key.toLowerCase() === "r";
 }

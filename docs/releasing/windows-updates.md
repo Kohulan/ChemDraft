@@ -80,7 +80,7 @@ for both installation scopes, so paths containing spaces remain openable.
 - **Frontend package:** `@tauri-apps/plugin-updater` 2.12.0 (Apache-2.0 OR MIT).
 - **Per-user feed:** `https://raw.githubusercontent.com/jgassens/ChemDraft/main/latest.json`.
 - **All-users feed:** `https://raw.githubusercontent.com/jgassens/ChemDraft/main/latest-allusers.json`.
-  Both sit next to the macOS `appcast.xml`; joint releases use the same commit and version for both platforms.
+  Both sit next to the macOS `appcast.xml` and `appcast-intel.xml`; joint releases use the same commit and version for all three builds.
 - **All-users overlay:** `apps/desktop/src-tauri/tauri.allusers.conf.json`, passed with `--config`
   in the release workflow. It sets NSIS `installMode: "perMachine"` and the separate feed. Both
   installers use the association quoting hook at `windows/installer-hooks.nsh` from the Windows
@@ -120,23 +120,38 @@ repository secrets/variables, workflow inputs and release checks.
 
 Dispatch on the release tag with the same tag in `ref`; optionally provide a tracked Windows notes
 file and an existing draft release tag in `upload_to_release`. The final `windows-release` artifact
-contains both installers, each `.exe.sig`, both feeds, and checksums. Missing signing secrets produce
+contains all three installers, each `.exe.build.json`, the two updater `.exe.sig` files, both feeds, and checksums. Missing signing secrets produce
 explicit warnings and dry-run output. Optional uploads refuse published releases; the workflow never
-publishes a release or commits the feeds. Review both platform artifacts from the same commit/version,
-publish the joint release, then **commit `latest-allusers.json` together with `latest.json` to `main`
-at each release**, only after both installer URLs work. Never point an all-users feed entry at the
-per-user installer.
+publishes a release or commits the feeds. Collect all three platform builds (both DMGs and all three
+Windows installers) and their `.build.json` records
+and run the [joint release body check](three-builds.md) against the release tag, declaring gaps or
+`--no-gaps`. As the last step before un-drafting on a Mac, run both DMG verifiers with
+`--release --dmg` as listed in [the final checklist](three-builds.md#last-step-before-un-drafting), and require
+`node tools/release/check-release-assets.mjs --tag vX.Y.Z --commit <full-sha>` to report PASS
+over the attached GitHub assets without skip or incomplete flags. The workflow runs the asset
+checker after upload inside the same draft-visible job, explicitly skipping mounted DMG provenance
+on Windows. Wholly missing build pairs produce INCOMPLETE; every supplied build is still checked.
+The checker verifies both `latest.json` and `latest-allusers.json` against their own installer's
+`.exe.sig`. A Windows-only upload is not a publishing pass.
+Publish the joint release only after the strict gate passes, then **commit `latest-allusers.json`
+together with `latest.json` to `main` at each release**, only after both installer URLs work. Never
+point an all-users feed entry at the per-user installer. Build records bind SHA-256 and size to the
+final signed bytes.
 
-The workflow's variant list shares build/rename, identity checks, signing, verification and upload.
-Tauri initially names each installer `ChemDraft_<ver>_x64-setup.exe`; the workflow stages it with
-the variant suffix before the next build overwrites that output. Adding a future variant with no
-feed requires a variant entry and config; it still goes through signing and upload.
+The workflow's variant list shares build/rename, identity checks, build records, signing,
+verification and upload. Tauri initially names each installer `ChemDraft_<ver>_x64-setup.exe`; the
+workflow stages it with the variant suffix outside the checkout, records it, and only then builds the
+next variant, which overwrites that output. Adding a future variant with no feed requires a variant
+entry and config, plus its suffix in `BUILD_TARGETS` (`tools/release/record-build.mjs`) so the asset
+checker accepts it; it still goes through signing and upload.
 
-The offline variant adds the generated `ci-offline.conf.json` after the all-users overlay. The
+The offline variant adds the generated `ci-offline.conf.json` (written to the runner's temporary
+directory, outside the checkout) after the all-users overlay. The
 generator, `scripts/windows-offline-installer.mjs`, sets `offlineInstaller` with `silent: true` for
 WebView2 and disables updater artifacts without changing file associations. This variant skips
-updater signing and feed generation while retaining Authenticode signing and upload. The workflow
-assertion rejects offline updater signatures and any mention of `offline` in either generated feed.
+updater signing and feed generation while retaining Authenticode signing, its build record and upload. The workflow
+assertion rejects offline updater signatures and any mention of `offline` in either generated feed,
+and the asset checker refuses an offline `.exe.sig`.
 
 To regenerate the all-users feed from its already signed CI artifact:
 
@@ -202,7 +217,11 @@ Run it separately for each installer scope; do not install both copies at once:
    - accepting it downloads, saves the session, shows the passive installer, and reopens ChemDraft
      on the newer version;
    - a drawing made before the update is still there after the relaunch.
-5. Uninstall the test build.
+5. Uninstall the test build. The NSIS installer remembers the folder it last installed to, so a
+   silent install (`/S`) without `/D=<folder>` reuses that remembered folder instead of the default
+   per-user location. After installing a test build into a separate folder with `/D=...`, pass
+   `/D=%LOCALAPPDATA%\ChemDraft` explicitly when reinstalling the stable release (or it lands in the
+   test folder); `/D` must be the last argument and must not be quoted.
 
 For all-users verification, retain the all-users overlay on both CI builds and override its endpoint
 with the local `latest-allusers.json` feed. Check Program Files and the all-users Start Menu shortcut,

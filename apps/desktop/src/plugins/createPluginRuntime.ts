@@ -1,6 +1,15 @@
-import { PluginStructureToNameRequestSchema } from "@chemdraft/plugin-api";
+import { buildPluginSelectionSnapshot } from "./selectionSnapshot";
+import { computePropertiesForPlugin } from "./pluginProperties";
+import { PluginRequestLimits, PluginStructureToNameRequestSchema } from "@chemdraft/plugin-api";
 import { inspectStructureOffThread } from "../depiction2d/identityClient";
+import { createStructureInspection } from "./depiction/structureInspection";
+import { measure } from "./depiction/measureRegion";
+import { createRenderRegion } from "./depiction/renderRegion";
+import { createFigurePlanProviders } from "./figurePlans";
 import type { AssistantToolContext } from "../assistant/AssistantToolContext";
+import { DesktopToolCalls } from "./toolSessions/transport";
+import { ToolSessionController } from "./toolSessions/ToolSessionController";
+import { compatibilityTools } from "../assistant/compatibilityToolCatalog";
 import { AssistantToolsController, type AssistantToolsControllerOptions } from "../assistant/AssistantToolsController";
 import { TauriAssistantMcpEngine, UnsupportedAssistantMcpEngine, type AssistantMcpEngine } from "../assistant/assistantMcpEngine";
 import { getAssistantHistoryPort } from "../assistant/historyPort";
@@ -13,6 +22,7 @@ import { scopedNamingMolecule, type NamingCanonicalizer } from "./pluginStructur
 import type { ChemDraftDocument } from "@chemdraft/chem-core";
 import type {
   AppliedPatchReceipt,
+  PluginActiveDocumentChanged,
   PluginIsotopeEnvelopeRequest,
   PluginIsotopeEnvelopeResult,
   PluginNameToStructureRequest,
@@ -30,16 +40,20 @@ import type {
 } from "@chemdraft/plugin-api";
 import {
   PluginHost,
+  resolveObjectOnPage,
+  resolveScopedObject,
   validateTrustedPluginManifest,
+  type CommandDefinition,
   type CommandRegistry,
   type PluginPatchApplicationRequest,
+  type PluginHostOptions,
   type RegisterPluginOptions
 } from "@chemdraft/plugin-host";
 
 import type { RegisteredCanvasOverlay } from "./types";
 import type { CanvasOverlayContentSection, CanvasOverlayDraftRestore } from "./pluginCanvasOverlayControls";
 
-import type { DesktopToolsetDefinition } from "../toolsets";
+import { PLUGIN_COMMAND_WITHOUT_HANDLER, type DesktopToolsetDefinition } from "../toolsets";
 import { PluginPanelController } from "./PluginPanelController";
 import { PluginPromptTextController } from "./PluginPromptTextController";
 import { createDefaultImageSourceRegistry, type ImageSourceRegistry } from "./ImageSourceProvider";
@@ -102,8 +116,13 @@ export interface DesktopPluginRuntimeOptions {
    * pushing onto it. Without one, the runtime falls back to {@link documentIdentityKey}.
    */
   getActiveDocumentKey?: () => string | undefined;
+  captureRequestDocument?: PluginHostOptions["captureRequestDocument"];
+  openRequestHistory?: PluginHostOptions["openRequestHistory"];
+  requestPageSpace?: PluginHostOptions["requestPageSpace"];
   /** Desktop tab ownership, captured when a command starts even if its proposal arrives later. */
   getActiveDocumentTab?: () => Pick<ProposalDocumentTab, "id">;
+  /** Reads a background tab when a command creates a proposal after a tab switch. */
+  getDocumentForTab?: (tabId: string) => ChemDraftDocument | undefined;
   /** Reads the latest title of an open tab at display time. */
   getDocumentTabTitle?: (tabId: string) => string | undefined;
   /**
@@ -207,6 +226,7 @@ export interface DesktopPluginRuntime {
   naming: StructureNamingController;
   externalTools: ExternalToolsController;
   assistant: AssistantToolsController;
+  notifyActiveDocumentChanged(documentKey: string | null): void;
   proposalDocumentTab(proposalId: string): ProposalDocumentTab | undefined;
   /** Retain the final title while pending proposals or running commands reference a closed tab. */
   closeProposalDocumentTab(tabId: string, title: string): void;
@@ -241,6 +261,7 @@ export interface DesktopPluginRuntime {
   getCanvasOverlayOpenRequests(): ReadonlyMap<string, { readonly focus: boolean }>;
   subscribeCanvasOverlayOpen(listener: () => void): () => void;
   listPluginToolsets(): DesktopToolsetDefinition[];
+  listPluginCommandsWithHandlers(): CommandDefinition[];
   pluginIdForToolset(toolsetId: string): string | undefined;
   /** Notified when plugin contributions change. Returns unsubscribe. */
   onDidChange(listener: () => void): () => void;
@@ -278,7 +299,8 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
   // controller, and the controller reads manifests back off the host. Close the loop with a
   // late-bound reference so neither construction depends on the other existing first.
   let controller: PluginPanelController | undefined;
-  const prompts = new PluginPromptTextController();
+  const activeDocumentKey = () => options.getActiveDocumentKey?.() ?? documentIdentityKey(options.getActiveDocument());
+  const prompts = new PluginPromptTextController(activeDocumentKey);
   const images = new PluginImageRequestController(
     options.imageSourceRegistry ?? createDefaultImageSourceRegistry()
   );
@@ -305,9 +327,37 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
   // collector to the snapshot builder for the synchronous span of each read, and nothing else can.
   const naming = new StructureNamingController(options.structureNamingEngine ?? new TauriStructureNamingEngine(), options.namingCanonicalizer);
   const externalTools = new ExternalToolsController(options.externalToolsEngine ?? (isTauriHost() ? new TauriExternalToolsEngine() : new UnsupportedExternalToolsEngine()));
+  const createContext: AssistantToolsControllerOptions["createContext"] = options.assistantContext ?? (({ getDocument }) => ({
+    getViewportRect: options.getAssistantViewportRect ?? (tabId => getAssistantHistoryPort().getViewportRect?.(tabId)),
+    now: options.now ?? (() => new Date()),
+    render: (svg, settings) => rasterizeSvgNative(svg, "png", settings),
+    chemistry: {
+      nameToStructure: request => nameProvider ? nameProvider(request) : Promise.resolve({ available: false, reason: "Name-to-structure engine unavailable." }),
+      structureFromSmiles: request => options.buildStructureFromSmiles === null ?
+        Promise.resolve({ available: false, reason: "Structure layout engine unavailable." }) :
+        options.buildStructureFromSmiles ? options.buildStructureFromSmiles(request) : structureFromSmilesForPlugin(request, getDocument),
+      inspectStructure: inspectStructureOffThread,
+      structureToName: async (request, pageId) => {
+        const engine = options.structureNamingEngine ?? new TauriStructureNamingEngine();
+        const status = await engine.status();
+        if (status.state === "unsupported") return { status: "unsupported", reason: status.detail ?? "This computer cannot run the naming engine." };
+        if (status.state !== "installed") return { status: "engineNotInstalled" };
+        const document = getDocument();
+        // By page and id: an id that also names an object on another page never resolves to it.
+        const molecule = !document ? undefined : pageId !== undefined ? resolveObjectOnPage(document, pageId, request.objectId)?.object
+          : resolveScopedObject(document, request.objectId).object;
+        if (!molecule || molecule.type !== "molecule") throw new Error("The requested molecule is unavailable.");
+        return nameStructureForPlugin(molecule, engine, status, options.namingCanonicalizer);
+      }
+    }
+  }));
+  const engine = options.assistantMcpEngine ?? (isTauriHost() ? new TauriAssistantMcpEngine() : new UnsupportedAssistantMcpEngine());
+  const calls = new DesktopToolCalls();
+  const toolSessions = options.assistantMcpEngine || isTauriHost()
+    ? new ToolSessionController(engine, compatibilityTools(createContext, !!options.requestPageSpace), calls) : undefined;
   const assistant = new AssistantToolsController({
     host: (): PluginHost => host,
-    engine: options.assistantMcpEngine ?? (isTauriHost() ? new TauriAssistantMcpEngine() : new UnsupportedAssistantMcpEngine()),
+    engine, calls, createContext,
     getActiveTabId: () => options.getActiveDocumentTab?.().id,
     getSelectionIds: () => options.getActiveDocument()?.selection.objectIds ?? [],
     runWrite: options.runAssistantWrite ?? (apply => {
@@ -316,31 +366,10 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
       return port.runWrite(apply);
     }),
     readDocument: options.getAssistantDocument ?? (tabId => getAssistantHistoryPort().read(tabId)),
+    // The same per-tab document identity public requests use, so a legacy request never follows its
+    // tab into a replaced document.
+    captureDocument: options.captureRequestDocument,
     transactions: options.assistantTransactions,
-    createContext: options.assistantContext ?? (({ getDocument }) => {
-      // These services live for the assistant request, beyond the command that begins it. The
-      // controller owns tool cancellation but exposes no signal here; never capture a command's.
-      return ({
-      getViewportRect: options.getAssistantViewportRect ?? (tabId => getAssistantHistoryPort().getViewportRect?.(tabId)),
-      now: options.now ?? (() => new Date()),
-      render: (svg, settings) => rasterizeSvgNative(svg, "png", settings),
-      chemistry: {
-        nameToStructure: request => nameProvider ? nameProvider(request) : Promise.resolve({ available: false, reason: "Name-to-structure engine unavailable." }),
-        structureFromSmiles: request => options.buildStructureFromSmiles === null ?
-          Promise.resolve({ available: false, reason: "Structure layout engine unavailable." }) :
-          options.buildStructureFromSmiles ? options.buildStructureFromSmiles(request) : structureFromSmilesForPlugin(request, getDocument),
-        inspectStructure: inspectStructureOffThread,
-        structureToName: async request => {
-          const engine = options.structureNamingEngine ?? new TauriStructureNamingEngine();
-          const status = await engine.status();
-          if (status.state === "unsupported") return { status: "unsupported", reason: status.detail ?? "This computer cannot run the naming engine." };
-          if (status.state !== "installed") return { status: "engineNotInstalled" };
-          const molecule = getDocument()?.pages.flatMap(page => page.objects).find(object => object.id === request.objectId);
-          if (!molecule || molecule.type !== "molecule") throw new Error("The requested molecule is unavailable.");
-          return nameStructureForPlugin(molecule, engine, status, options.namingCanonicalizer);
-        }
-      }
-    }); })
   });
   const commandInvocations = new Map<symbol, { pluginId: string; stop: AbortController }>();
   let commandFrame: symbol[] | undefined;
@@ -358,16 +387,31 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
   let proposingTabId: string | undefined;
   class DesktopPluginHost extends PluginHost {
     override async invokeCommand<Result = unknown>(commandId: string, invokeOptions?: Parameters<PluginHost["invokeCommand"]>[1]): Promise<Result> {
+      return this.withInvocationFrame(() => super.invokeCommand<Result>(commandId, invokeOptions));
+    }
+
+    override async invokeAssistantTool(...args: Parameters<PluginHost["invokeAssistantTool"]>) {
+      return this.withInvocationFrame(() => super.invokeAssistantTool(...args), args[2]);
+    }
+
+    override async invokeRequestTool(...args: Parameters<PluginHost["invokeRequestTool"]>) {
+      return this.withInvocationFrame(() => super.invokeRequestTool(...args), args[4]);
+    }
+
+    private async withInvocationFrame<Result>(run: () => Promise<Result>, signal?: AbortSignal): Promise<Result> {
       const tabId = options.getActiveDocumentTab?.().id;
       if (tabId) runningTabCommands.set(tabId, (runningTabCommands.get(tabId) ?? 0) + 1);
       const tokens: symbol[] = [];
       const previousFrame = commandFrame;
       commandFrame = tokens;
+      const cancel = () => { for (const token of tokens) commandInvocations.get(token)?.stop.abort(); };
+      signal?.addEventListener("abort", cancel, { once: true });
       try {
-        const call = super.invokeCommand<Result>(commandId, invokeOptions);
-        commandFrame = previousFrame;
+        let call: Promise<Result>;
+        try { call = run(); } finally { commandFrame = previousFrame; }
         return await call;
       } finally {
+        signal?.removeEventListener("abort", cancel);
         for (const token of tokens) { commandInvocations.get(token)?.stop.abort(); commandInvocations.delete(token); }
         if (tabId) {
           const remaining = (runningTabCommands.get(tabId) ?? 1) - 1;
@@ -411,8 +455,11 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
           const invocation = invocationToken ? commandInvocations.get(invocationToken) : undefined;
           if (!invocation || invocation.pluginId !== pluginId || invocation.stop.signal.aborted) throw new Error("Structure naming is available only during this plugin command invocation.");
           const parsed = PluginStructureToNameRequestSchema.parse(request);
-          if (documentKey !== (options.getActiveDocumentKey?.() ?? documentIdentityKey(options.getActiveDocument()))) throw new Error("The active document changed during the naming command.");
-          const molecule = scopedNamingMolecule(options.getActiveDocument(), options.getSelection?.(), parsed.objectId);
+          const bound = this.commandRequestDocument(pluginId, invocationToken);
+          if (!bound && documentKey !== (options.getActiveDocumentKey?.() ?? documentIdentityKey(options.getActiveDocument()))) throw new Error("The active document changed during the naming command.");
+          const pinned = bound?.read();
+          const molecule = scopedNamingMolecule(bound ? pinned : options.getActiveDocument(),
+            bound ? pinned && buildPluginSelectionSnapshot(pinned) : options.getSelection?.(), parsed.objectId);
           const manifest = this.listPlugins().find(plugin => plugin.id === pluginId)!;
           return naming.name(manifest, molecule, invocation.stop.signal);
         };
@@ -511,8 +558,16 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
       }
     },
     getActiveDocument: options.getActiveDocument,
+    getProposalDocument: () => proposingTabId && proposingTabId !== options.getActiveDocumentTab?.().id
+      ? options.getDocumentForTab?.(proposingTabId) : options.getActiveDocument(),
     getActiveDocumentKey:
       options.getActiveDocumentKey ?? (() => documentIdentityKey(options.getActiveDocument())),
+    toolSessions,
+    requestDepiction: { ...createStructureInspection(), measure, renderRegion: createRenderRegion(), ...createFigurePlanProviders() },
+    captureRequestDocument: options.captureRequestDocument,
+    openRequestHistory: options.openRequestHistory,
+    requestPageSpace: options.requestPageSpace,
+    getRequestSelection: (document, budget) => buildPluginSelectionSnapshot(document, readingSelectionWarnings, budget),
     getSelection: readSelection ? () => readSelection(readingSelectionWarnings) : undefined,
     createStorage: options.createStorage,
     onProposedPatchesChanged: () => {
@@ -531,7 +586,8 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
       options.onProposedPatchesChanged?.();
     },
     applyDocumentPatch: options.applyDocumentPatch,
-    buildTablePatch: (spec, document, selection) => {
+    buildTablePatch: (spec, document, selection, pinnedViewport, bound) => {
+      if (bound) return buildPluginTablePatch(spec, document, selection, pinnedViewport);
       const tabId = options.getActiveDocumentTab?.().id;
       const viewport = tabId ? (options.getAssistantViewportRect ?? (id => getAssistantHistoryPort().getViewportRect?.(id)))(tabId) : undefined;
       return buildPluginTablePatch(spec, document, selection, viewport);
@@ -539,23 +595,81 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
     showPanelReport: (pluginId, panelId, report) => {
       controller?.showReport(pluginId, panelId, report);
     },
-    promptText: (plugin, request, signal) => prompts.promptText(plugin, request, signal),
+    promptText: (plugin, request, signal, context) => prompts.promptText(plugin, request, signal, context?.documentKey),
     requestImage: (plugin, request, signal) => images.requestImage(plugin, request, signal),
     recognizeStructure: (plugin, image, signal) => recognition.recognize(plugin, image, signal),
     externalTools,
     assistant,
+    computeProperties: computePropertiesForPlugin,
     ...(envelopeProvider ? { computeIsotopeEnvelope: envelopeProvider } : {}),
     ...(nameProvider ? { convertNameToStructure: nameProvider } : {}),
-    ...(structureProvider ? { buildStructureFromSmiles: structureProvider } : {}),
+    ...(structureProvider ? { buildStructureFromSmiles: (request, pinned) =>
+      pinned && !options.buildStructureFromSmiles ? structureFromSmilesForPlugin(request, pinned, structureSignal) :
+        structureProvider(request) } : {}),
     now
   });
   controller = new PluginPanelController(host, nowIso, options.defaultPanelSurface);
 
   const toolsetsByPluginId = new Map<string, DesktopToolsetDefinition[]>();
   const pluginIdByToolsetId = new Map<string, string>();
-  const registrations = new Map<string, { manifest: PluginManifest; options: RegisterPluginOptions }>();
+  interface Registration {
+    manifest: PluginManifest;
+    options: RegisterPluginOptions;
+    deliveredSequence?: number;
+    sending?: PluginActiveDocumentChanged;
+    queued: PluginActiveDocumentChanged[];
+    retry?: ReturnType<typeof setTimeout>;
+    unsubscribeDocumentReady?: () => void;
+  }
+  const registrations = new Map<string, Registration>();
+  let activeDocument: PluginActiveDocumentChanged | undefined;
+  function deliverActiveDocument(registration: Registration, event = activeDocument) {
+    const { manifest } = registration;
+    if (!event || registration.deliveredSequence === event.sequence || registrations.get(manifest.id) !== registration) return;
+    if (registration.sending) {
+      if (registration.sending.sequence === event.sequence || registration.queued.at(-1)?.sequence === event.sequence) return;
+      // Keep changes ordered up to the bridge's notification limit. Replace the tail on overflow.
+      if (registration.queued.length + 1 >= PluginRequestLimits.pendingCapabilities) registration.queued.pop();
+      registration.queued.push(event);
+      return;
+    }
+    clearTimeout(registration.retry);
+    const sending = { ...event };
+    registration.sending = sending;
+    const settled = (accepted: boolean) => {
+      if (registration.sending !== sending || registrations.get(manifest.id) !== registration) return;
+      registration.sending = undefined;
+      if (accepted) {
+        registration.deliveredSequence = event.sequence;
+        const next = registration.queued.shift();
+        if (next) deliverActiveDocument(registration, next);
+      } else {
+        registration.queued.length = 0;
+        registration.retry = setTimeout(() => deliverActiveDocument(registration), 250);
+      }
+    };
+    try {
+      const handler = host.getActiveDocumentChangedHandler(manifest.id);
+      if (!handler) {
+        registration.sending = undefined;
+        return;
+      }
+      const result = handler({ ...event });
+      if (result) void Promise.resolve(result).then(() => settled(true), () => settled(false));
+      else settled(true);
+    } catch { settled(false); }
+  }
 
   const runtime: DesktopPluginRuntime = {
+    notifyActiveDocumentChanged(documentKey) {
+      // A prompt's command can write only to the document it started on, so its answer is accepted
+      // only while that document is active; the window going away ends every document-bound prompt.
+      if (documentKey === null) prompts.cancelDocument(null);
+      else prompts.activeDocumentChanged();
+      if (activeDocument?.documentKey === documentKey) return;
+      activeDocument = { documentKey, sequence: (activeDocument?.sequence ?? 0) + 1 };
+      for (const registration of registrations.values()) deliverActiveDocument(registration);
+    },
     host,
     panels: controller,
     prompts,
@@ -591,7 +705,7 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
               throw new Error(`Plugin toolset "${toolset.id}" is already contributed by another plugin.`);
             }
           }
-          const mapped = contributed.map(pluginToolsetToDefinition);
+          const mapped = contributed.map(toolset => pluginToolsetToDefinition(toolset, registerOptions.commandHandlers));
           toolsetsByPluginId.set(manifest.id, mapped);
           mapped.forEach((toolset) => pluginIdByToolsetId.set(toolset.id, manifest.id));
         }
@@ -601,7 +715,15 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
         host.unregisterPlugin(manifest.id);
         throw error;
       }
-      registrations.set(manifest.id, { manifest, options: registerOptions });
+      const registration: Registration = { manifest, options: registerOptions, queued: [] };
+      registrations.set(manifest.id, registration);
+      registration.unsubscribeDocumentReady = registerOptions.onDocumentChangeReady?.(() => {
+        registration.deliveredSequence = undefined;
+        registration.sending = undefined;
+        registration.queued.length = 0;
+        deliverActiveDocument(registration);
+      });
+      deliverActiveDocument(registration);
       notify();
       return manifest;
     },
@@ -624,6 +746,8 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
       host.unregisterPlugin(pluginId);
       (toolsetsByPluginId.get(pluginId) ?? []).forEach((toolset) => pluginIdByToolsetId.delete(toolset.id));
       toolsetsByPluginId.delete(pluginId);
+      clearTimeout(registrations.get(pluginId)?.retry);
+      registrations.get(pluginId)?.unsubscribeDocumentReady?.();
       registrations.delete(pluginId);
       let overlayStatusesChanged = false;
       for (const overlayId of canvasOverlayStatuses.keys()) {
@@ -700,6 +824,11 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
       };
     },
     listPluginToolsets: () => [...toolsetsByPluginId.values()].flat(),
+    listPluginCommandsWithHandlers: () => host.commands.list().filter(command => {
+      const registration = command.pluginId && registrations.get(command.pluginId);
+      return command.source === "plugin" && !!registration
+        && typeof registration.options.commandHandlers?.[command.id] === "function";
+    }),
     pluginIdForToolset: (toolsetId) => pluginIdByToolsetId.get(toolsetId),
     onDidChange(listener) {
       listeners.add(listener);
@@ -721,26 +850,46 @@ export function documentIdentityKey(document: ChemDraftDocument | undefined): st
   return document === undefined ? undefined : `${document.id}\u0000${document.createdAt}`;
 }
 
-function pluginToolsetToDefinition(contribution: PluginToolsetContribution): DesktopToolsetDefinition {
+function pluginToolsetToDefinition(
+  contribution: PluginToolsetContribution,
+  commandHandlers: RegisterPluginOptions["commandHandlers"]
+): DesktopToolsetDefinition {
+  const groupIds = new Set(contribution.groups.flatMap(group => group.id === undefined ? [] : [group.id]));
   return {
     id: contribution.id,
     title: contribution.title,
     source: "plugin",
     defaultVisible: contribution.defaultVisible,
     defaultMode: "floating",
-    groups: contribution.groups.map((group) => ({
-      id: group.id,
-      title: group.title,
-      items: group.items.map((item) => ({
-        commandId: item.commandId,
-        title: item.title,
-        // Named fallback keeps the type honest; the real icon rides on iconDataUri.
-        icon: "palette",
-        iconDataUri: item.iconDataUri,
-        shortcutDisplay: item.shortcutDisplay,
-        category: "plugin"
-      }))
-    })),
+    groups: contribution.groups.map((group) => {
+      let id = group.id;
+      if (id === undefined) {
+        const content = JSON.stringify([group.title, group.items.map(item => item.commandId).sort()]);
+        let hash = 2166136261;
+        for (let offset = 0; offset < content.length; offset++) {
+          hash = Math.imul(hash ^ content.charCodeAt(offset), 16777619);
+        }
+        id = `${contribution.id}.group-content.${(hash >>> 0).toString(16)}`;
+        while (groupIds.has(id)) id += "-";
+        groupIds.add(id);
+      }
+      return {
+        id,
+        title: group.title,
+        items: group.items.map((item) => ({
+          commandId: item.commandId,
+          title: item.title,
+          // Named fallback keeps the type honest; the real icon rides on iconDataUri.
+          icon: "palette",
+          iconDataUri: item.iconDataUri,
+          shortcutDisplay: item.shortcutDisplay,
+          // The gallery omits handlerless commands. Detached palettes still receive their buttons.
+          disabledReason: typeof commandHandlers?.[item.commandId] === "function"
+            ? undefined : PLUGIN_COMMAND_WITHOUT_HANDLER,
+          category: "plugin"
+        }))
+      };
+    }),
     preferredWindowSize: contribution.preferredWindowSize
   };
 }

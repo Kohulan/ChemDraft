@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import {
   DndContext,
   KeyboardSensor,
@@ -16,6 +16,7 @@ import {
   verticalListSortingStrategy
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import type { CommandSpec } from "../../commands";
 
 export interface CustomizeItemModel {
   /** Customization id (command id or `widget.*` control id). */
@@ -23,6 +24,7 @@ export interface CustomizeItemModel {
   label: string;
   hidden: boolean;
   isWidget: boolean;
+  canRemove: boolean;
 }
 
 export interface CustomizeGroupModel {
@@ -31,31 +33,25 @@ export interface CustomizeGroupModel {
   items: CustomizeItemModel[];
 }
 
-export interface CommandOption {
-  id: string;
-  title: string;
-}
+export type CommandOption = Pick<CommandSpec, "id" | "title"> & Partial<Pick<CommandSpec, "icon" | "assetName">>;
 
 export interface CustomizeToolsetDetailProps {
   toolsetTitle: string;
-  isUser: boolean;
   groups: readonly CustomizeGroupModel[];
-  /** Commands not already in this toolset, for the "add" palette (user toolsets only). */
+  /** Commands not already in this toolset, for the "add" palette. */
   availableCommands: readonly CommandOption[];
   onReorderItems: (groupId: string, orderedItemIds: string[]) => void;
   onToggleItemHidden: (itemId: string, hidden: boolean) => void;
   onRemoveItem: (groupId: string, itemId: string) => void;
-  onAddCommand: (groupId: string, command: CommandOption) => void;
+  onAddCommand: (command: CommandOption) => void;
 }
 
 function SortableItemRow({
   item,
-  isUser,
   onToggleHidden,
   onRemove
 }: {
   item: CustomizeItemModel;
-  isUser: boolean;
   onToggleHidden: (hidden: boolean) => void;
   onRemove: () => void;
 }) {
@@ -81,7 +77,7 @@ function SortableItemRow({
         {item.label}
         {item.isWidget ? <span className="customize-item-widget-tag"> · widget</span> : null}
       </span>
-      {isUser ? (
+      {item.canRemove ? (
         <button type="button" className="customize-item-action customize-item-remove" aria-label={`Remove ${item.label}`} onClick={onRemove}>
           Remove
         </button>
@@ -92,7 +88,6 @@ function SortableItemRow({
 
 export function CustomizeToolsetDetail({
   toolsetTitle,
-  isUser,
   groups,
   availableCommands,
   onReorderItems,
@@ -101,6 +96,8 @@ export function CustomizeToolsetDetail({
   onAddCommand
 }: CustomizeToolsetDetailProps) {
   const [search, setSearch] = useState("");
+  const [showCommandPicker, setShowCommandPicker] = useState(false);
+  const commandPickerId = useId();
   const sensors = useSensors(
     // See CustomizeToolbarsDialog: a 5px activation distance separates click from drag so the native
     // WKWebView doesn't start-then-cancel drags on a plain click's micro-movement.
@@ -118,8 +115,6 @@ export function CustomizeToolsetDetail({
     return matches.slice(0, 40);
   }, [availableCommands, search]);
 
-  const addTargetGroupId = groups[0]?.id;
-
   const handleDragEnd = (groupId: string, itemIds: string[]) => (event: DragEndEvent) => {
     const { active, over } = event;
     if (!over || active.id === over.id) {
@@ -136,6 +131,44 @@ export function CustomizeToolsetDetail({
   return (
     <section className="customize-detail" aria-label={`${toolsetTitle} contents`}>
       <h3 className="customize-detail-title">{toolsetTitle}</h3>
+      <button
+        type="button"
+        className="customize-toolset-action customize-command-picker-toggle"
+        aria-expanded={showCommandPicker}
+        aria-controls={commandPickerId}
+        onClick={() => setShowCommandPicker((shown) => !shown)}
+      >
+        Add command…
+      </button>
+      <div className="customize-command-palette" id={commandPickerId} hidden={!showCommandPicker}>
+        {showCommandPicker ? (
+          <>
+            <input
+              type="text"
+              aria-label="Search commands to add"
+              placeholder="Search commands to add…"
+              autoFocus
+              value={search}
+              onChange={(event) => setSearch(event.currentTarget.value)}
+            />
+            <ul className="customize-command-results">
+              {filteredCommands.map((command) => (
+                <li key={command.id}>
+                  <button
+                    type="button"
+                    className="customize-command-add"
+                    data-command-id={command.id}
+                    onClick={() => onAddCommand(command)}
+                  >
+                    + {command.title}
+                  </button>
+                </li>
+              ))}
+              {filteredCommands.length === 0 ? <li className="customize-command-empty">No matching commands.</li> : null}
+            </ul>
+          </>
+        ) : null}
+      </div>
       {groups.length === 0 ? <p className="customize-detail-empty">This toolbar has no items yet.</p> : null}
       {groups.map((group) => {
         const itemIds = group.items.map((item) => item.id);
@@ -149,7 +182,6 @@ export function CustomizeToolsetDetail({
                     <SortableItemRow
                       key={item.id}
                       item={item}
-                      isUser={isUser}
                       onToggleHidden={(hidden) => onToggleItemHidden(item.id, hidden)}
                       onRemove={() => onRemoveItem(group.id, item.id)}
                     />
@@ -160,33 +192,6 @@ export function CustomizeToolsetDetail({
           </div>
         );
       })}
-
-      {isUser && addTargetGroupId ? (
-        <div className="customize-command-palette">
-          <input
-            type="text"
-            aria-label="Search commands to add"
-            placeholder="Search commands to add…"
-            value={search}
-            onChange={(event) => setSearch(event.currentTarget.value)}
-          />
-          <ul className="customize-command-results">
-            {filteredCommands.map((command) => (
-              <li key={command.id}>
-                <button
-                  type="button"
-                  className="customize-command-add"
-                  data-command-id={command.id}
-                  onClick={() => onAddCommand(addTargetGroupId, command)}
-                >
-                  + {command.title}
-                </button>
-              </li>
-            ))}
-            {filteredCommands.length === 0 ? <li className="customize-command-empty">No matching commands.</li> : null}
-          </ul>
-        </div>
-      ) : null}
     </section>
   );
 }

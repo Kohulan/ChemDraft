@@ -3,14 +3,28 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
+import { isDeepStrictEqual } from "node:util";
 import { PalettePopoverWindow } from "./PalettePopoverWindow";
-import type { ToolsetPopoverContentPayload } from "./window-manager";
+import { installNativeFlyoutKeyboard } from "./nativeFlyoutKeyboard";
+import type {
+  AcceptedToolsetPopoverOpening, ToolsetFlyoutKey, ToolsetFlyoutSession, ToolsetPopoverContentPayload,
+  ToolsetPopoverDismissPayload
+} from "./window-manager";
 
 const native = vi.hoisted(() => ({
-  content: undefined as undefined | ((payload: ToolsetPopoverContentPayload) => void),
+  content: new Set<(payload: ToolsetPopoverContentPayload) => void>(),
+  accepted: undefined as undefined | ((payload: AcceptedToolsetPopoverOpening) => void),
+  receiveClose: undefined as undefined | ((payload: ToolsetFlyoutSession) => void),
+  dismiss: undefined as undefined | ((payload?: ToolsetPopoverDismissPayload) => void),
+  key: undefined as undefined | ((payload: ToolsetFlyoutKey) => void),
   release: undefined as undefined | ((payload: { toolsetId: string; releasedAt: number }) => void),
   resized: undefined as undefined | (() => void),
-  show: vi.fn(async () => {}), size: vi.fn(async () => {}), invoke: vi.fn(async (_command: string, _args?: Record<string, unknown>) => {})
+  show: vi.fn<typeof import("./window-manager").showCurrentToolsetPopoverWindow>(async () => true), size: vi.fn(async () => {}),
+  invoke: vi.fn(async (_command: string, _args?: Record<string, unknown>): Promise<unknown> => undefined),
+  visible: vi.fn(async () => true),
+  command: vi.fn<typeof import("./window-manager").sendPaletteCommand>(async () => {}),
+  closed: vi.fn(async () => {}), flyoutClosed: vi.fn(async () => {}),
+  sendKey: vi.fn(async (_payload: ToolsetFlyoutKey) => {})
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: native.invoke }));
 vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ hide: async () => {}, setFocus: async () => {} }) }));
@@ -21,9 +35,23 @@ vi.mock("./plugins/pluginPanelInputFocus", async importOriginal => ({
 }));
 vi.mock("./window-manager", async importOriginal => ({
   ...await importOriginal<typeof import("./window-manager")>(),
-  listenForToolsetPopoverContent: vi.fn(async handler => { native.content = handler; return () => {}; }),
+  isToolsetPopoverVisible: native.visible,
+  listenForToolsetPopoverContent: vi.fn(async handler => {
+    native.content.add(handler);
+    return () => { native.content.delete(handler); };
+  }),
+  listenForAcceptedToolsetPopoverContent: vi.fn(async handler => {
+    native.accepted = handler;
+    return () => { native.accepted = undefined; };
+  }),
+  notifyToolsetPopoverContentAccepted: async (opening: AcceptedToolsetPopoverOpening) => native.accepted?.(opening),
   listenForToolsetPopoverRelease: vi.fn(async handler => { native.release = handler; return () => {}; }),
-  listenForToolsetPopoverDismiss: vi.fn(async () => () => {}),
+  listenForToolsetFlyoutKeys: vi.fn(async handler => { native.key = handler; return () => {}; }),
+  listenForToolsetFlyoutClosed: vi.fn(async handler => { native.receiveClose = handler; return () => {}; }),
+  sendToolsetFlyoutKey: native.sendKey,
+  notifyToolsetPopoverClosed: native.closed, notifyToolsetFlyoutClosed: native.flyoutClosed,
+  sendPaletteCommand: native.command,
+  listenForToolsetPopoverDismiss: vi.fn(async handler => { native.dismiss = handler; return () => {}; }),
   listenForBondStereoPopoverActions: vi.fn(async () => () => {}),
   listenForToolsetTextStyle: vi.fn(async () => () => {}),
   requestToolsetPopoverContent: vi.fn(async () => {}), requestToolsetTextStyle: vi.fn(async () => {}),
@@ -59,6 +87,19 @@ const rings: ToolsetPopoverContentPayload = { toolsetId: "core.main", kind: "fly
   flyout: { flyoutId: "rings", title: "Rings", columns: 3, commands: Array.from({ length: 9 }, (_, i) => ({
     id: `ring-${i}`, title: `Ring ${i}`, enabled: true, active: false
   })) } };
+const ringSession = { toolsetId: rings.toolsetId, flyoutId: rings.flyout.flyoutId, openedAt: 1 };
+function pushContent(payload: ToolsetPopoverContentPayload) {
+  native.content.forEach(listener => listener(payload));
+}
+function acceptContent(payload: ToolsetPopoverContentPayload) {
+  native.accepted?.({ toolsetId: payload.toolsetId, openedAt: payload.openedAt!, generation: payload.generation,
+    flyoutId: payload.kind === "flyout" ? payload.flyout.flyoutId : undefined });
+}
+function pressFlyoutArrow() {
+  const event = new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true });
+  window.dispatchEvent(event);
+  return event.defaultPrevented;
+}
 function elements() {
   return [document.documentElement, document.body, container,
     container.querySelector<HTMLElement>(".palette-popover-shell")!,
@@ -74,13 +115,13 @@ function records() {
 it("clears retained document/root/shell scrolling on content update, fit and reveal", async () => {
   await act(async () => root.render(createElement(PalettePopoverWindow, { toolsetId: "core.main", kind: "flyout", prewarm: true })));
   offset();
-  let finishReveal!: () => void;
-  native.show.mockImplementationOnce(() => new Promise<void>(resolve => { finishReveal = resolve; }));
-  await act(async () => native.content?.(rings));
+  let finishReveal!: (shown: boolean) => void;
+  native.show.mockImplementationOnce(() => new Promise<boolean>(resolve => { finishReveal = resolve; }));
+  await act(async () => pushContent(rings));
   expectReset();
   expect(container.querySelectorAll('[role="menuitem"]')).toHaveLength(9);
   offset();
-  await act(async () => finishReveal());
+  await act(async () => finishReveal(true));
   expectReset();
   expect(records().filter(record => record.geometry.phase === "reveal")).toEqual([
     expect.objectContaining({ event: "toolset-popover-geometry", geometry: {
@@ -94,13 +135,13 @@ it("clears retained document/root/shell scrolling on content update, fit and rev
   await act(async () => native.resized?.());
   expectReset();
   offset();
-  await act(async () => native.content?.({ ...rings, flyout: { ...rings.flyout, title: "Updated rings" } }));
+  await act(async () => pushContent({ ...rings, generation: 2, flyout: { ...rings.flyout, title: "Updated rings" } }));
   expectReset();
 });
 
 it("samples the owner's release offset before resetting it, and ignores another palette's release", async () => {
   await act(async () => root.render(createElement(PalettePopoverWindow, { toolsetId: "core.main", kind: "flyout", prewarm: true })));
-  await act(async () => native.content?.(rings));
+  await act(async () => pushContent(rings));
   offset();
   await act(async () => { native.release?.({ toolsetId: "core.art", releasedAt: 2 }); await vi.advanceTimersByTimeAsync(0); });
   expect(records()).toHaveLength(1);
@@ -121,7 +162,7 @@ it("samples the owner's release offset before resetting it, and ignores another 
 it("keeps scroll guards active but diagnostics silent in an unlabelled stable build", async () => {
   vi.stubGlobal("__WORKTREE_LABEL__", "");
   await act(async () => root.render(createElement(PalettePopoverWindow, { toolsetId: "core.main", kind: "flyout", prewarm: true })));
-  await act(async () => native.content?.(rings));
+  await act(async () => pushContent(rings));
   offset();
   document.documentElement.dispatchEvent(new Event("scroll"));
   expectReset();
@@ -132,18 +173,220 @@ it("keeps scroll guards active but diagnostics silent in an unlabelled stable bu
 it("sends the live content kind on each reveal of a prewarmed Art popover", async () => {
   await act(async () => root.render(createElement(PalettePopoverWindow, { toolsetId: "core.art", kind: "artColor", prewarm: true })));
   expect(native.show).not.toHaveBeenCalled();
-  await act(async () => native.content?.({ toolsetId: "core.art", kind: "artColor" }));
+  await act(async () => pushContent({ toolsetId: "core.art", kind: "artColor", openedAt: 0 }));
   expect(native.show).toHaveBeenLastCalledWith("focus", "artColor");
-  await act(async () => native.content?.({ ...rings, toolsetId: "core.art" }));
-  expect(native.show).toHaveBeenLastCalledWith("focus", "flyout");
-  await act(async () => native.content?.({ toolsetId: "core.art", kind: "artColor" }));
+  await act(async () => pushContent({ ...rings, toolsetId: "core.art" }));
+  // Command navigation is routed from the document; even a failed native reveal
+  // must not fall back to an activating show for this flyout.
+  expect(native.show).toHaveBeenLastCalledWith("preserve", "flyout", { ...ringSession, toolsetId: "core.art" });
+  await act(async () => pushContent({ toolsetId: "core.art", kind: "artColor", openedAt: 2 }));
   expect(native.show).toHaveBeenLastCalledWith("focus", "artColor");
+});
+
+it("closes both flyout channels and resets keyboard navigation for a newer opening at the same timestamp", async () => {
+  await act(async () => root.render(createElement(PalettePopoverWindow, { toolsetId: "core.main", kind: "flyout", prewarm: true })));
+  const first = { ...rings, generation: 1 };
+  const key = { toolsetId: "core.main", flyoutId: "rings", openedAt: 1, generation: 1, key: "ArrowDown" };
+  await act(async () => pushContent(first));
+  await act(async () => native.key?.(key));
+  expect(container.querySelector('[data-keyboard-highlighted="true"]')?.getAttribute("data-command-id")).toBe("ring-0");
+  await act(async () => {
+    native.key?.({ ...key, key: "Enter" });
+    native.key?.({ ...key, key: "Enter" });
+  });
+  expect(native.command).toHaveBeenCalledExactlyOnceWith("ring-0", { flyoutOpening: { ...ringSession, generation: 1 } });
+  expect(native.closed).toHaveBeenCalledExactlyOnceWith("core.main", 1, 1);
+  expect(native.flyoutClosed).toHaveBeenCalledExactlyOnceWith({ toolsetId: "core.main", flyoutId: "rings", openedAt: 1, generation: 1 });
+  const reveals = native.show.mock.calls.length;
+  await act(async () => pushContent(first));
+  expect(native.show).toHaveBeenCalledTimes(reveals);
+  await act(async () => pushContent({ ...first, generation: 2 }));
+  expect(native.show).toHaveBeenCalledTimes(reveals + 1);
+  expect(native.show).toHaveBeenLastCalledWith("preserve", "flyout", { ...ringSession, generation: 2 });
+  expect(container.querySelector('[data-keyboard-highlighted="true"]')).toBeNull();
+  await act(async () => native.key?.({ ...key, generation: 2 }));
+  expect(container.querySelector('[data-keyboard-highlighted="true"]')?.getAttribute("data-command-id")).toBe("ring-0");
+});
+
+it.each(["before", "after"])("routes keys to a newer same-time flyout when the old close arrives %s its opening", async order => {
+  const stop = installNativeFlyoutKeyboard();
+  const press = () => {
+    const event = new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true });
+    window.dispatchEvent(event);
+    return event.defaultPrevented;
+  };
+  try {
+    const current = { toolsetId: rings.toolsetId, flyoutId: rings.flyout.flyoutId, openedAt: 1, generation: 2 };
+    const closeOld = () => native.receiveClose?.({ ...current, generation: 1 });
+    acceptContent({ ...rings, generation: 1 });
+    if (order === "before") closeOld();
+    acceptContent({ ...rings, generation: 2 });
+    if (order === "after") closeOld();
+    await act(async () => expect(press()).toBe(true));
+    expect(native.sendKey).toHaveBeenCalledOnce();
+    native.receiveClose?.(current);
+    expect(press()).toBe(false);
+    acceptContent({ ...rings, generation: 3 });
+    expect(press()).toBe(true);
+    // A timestamp-only legacy notice cannot identify the stamped opening.
+    native.receiveClose?.({ toolsetId: current.toolsetId, flyoutId: current.flyoutId, openedAt: current.openedAt });
+    expect(press()).toBe(true);
+    native.receiveClose?.({ ...current, generation: 3 });
+    expect(press()).toBe(false);
+  } finally { stop(); }
+});
+
+it.each(["rings", "other"])("retires a superseded flyout when the newer %s close arrives before its content", flyoutId => {
+  const stop = installNativeFlyoutKeyboard();
+  const replacement = { ...rings, flyout: { ...rings.flyout, flyoutId } };
+  try {
+    acceptContent({ ...rings, generation: 1 });
+    expect(pressFlyoutArrow()).toBe(true);
+    native.receiveClose?.({ ...ringSession, flyoutId, generation: 2 });
+    const routedBeforeContent = pressFlyoutArrow();
+    acceptContent({ ...replacement, generation: 2 });
+    expect([routedBeforeContent, pressFlyoutArrow()]).toEqual([false, false]);
+    acceptContent({ ...replacement, generation: 3 });
+    expect(pressFlyoutArrow()).toBe(true);
+  } finally { stop(); }
+});
+
+it("scopes same-time opening and close generations to each toolset", async () => {
+  const { flyoutId } = ringSession;
+  const toolsetId = "core.art";
+  const stop = installNativeFlyoutKeyboard();
+  try {
+    acceptContent({ ...rings, generation: 9 });
+    const next = { ...rings, toolsetId, generation: 1, flyout: { ...rings.flyout, flyoutId } };
+    acceptContent(next);
+    await act(async () => expect(pressFlyoutArrow()).toBe(true));
+    expect(native.sendKey).toHaveBeenLastCalledWith(expect.objectContaining({ toolsetId, flyoutId }));
+    acceptContent({ ...rings, generation: 9 });
+    await act(async () => expect(pressFlyoutArrow()).toBe(true));
+    expect(native.sendKey).toHaveBeenLastCalledWith(expect.objectContaining({ toolsetId, flyoutId }));
+    native.receiveClose?.({ ...ringSession, generation: 9 });
+    acceptContent(next);
+    await act(async () => expect(pressFlyoutArrow()).toBe(true));
+    expect(native.sendKey).toHaveBeenLastCalledWith(expect.objectContaining({ toolsetId, flyoutId }));
+  } finally { stop(); }
+});
+
+it("keeps the newer menu when an older menu from the same toolset arrives late", async () => {
+  const stop = installNativeFlyoutKeyboard();
+  try {
+    acceptContent({ ...rings, generation: 2 });
+    const delayed = { ...rings, generation: 1, flyout: { ...rings.flyout, flyoutId: "other" } };
+    acceptContent(delayed);
+    await act(async () => expect(pressFlyoutArrow()).toBe(true));
+    expect(native.sendKey).toHaveBeenCalledExactlyOnceWith({ ...ringSession, generation: 2, key: "ArrowDown" });
+  } finally { stop(); }
+});
+
+it("retains the generation through a legacy replay so queued Enter cannot choose from a replacement", async () => {
+  await act(async () => root.render(createElement(PalettePopoverWindow, { toolsetId: rings.toolsetId, kind: "flyout", prewarm: true })));
+  const stop = installNativeFlyoutKeyboard();
+  try {
+    await act(async () => {
+      for (const opening of [{ ...rings, generation: 2 }, rings]) pushContent(opening);
+    });
+    await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })));
+    const [queuedEnter] = native.sendKey.mock.lastCall!;
+    await act(async () => pushContent({ ...rings, generation: 3 }));
+    await act(async () => native.key?.({ ...ringSession, generation: 3, key: "ArrowDown" }));
+    expect(container.querySelector('[data-keyboard-highlighted="true"]')?.getAttribute("data-command-id")).toBe("ring-0");
+    await act(async () => native.key?.(queuedEnter));
+    expect(native.command).not.toHaveBeenCalled();
+    expect(queuedEnter.generation).toBe(2);
+  } finally { stop(); }
+});
+
+it("forwards keys with the generation of the active flyout", async () => {
+  const stop = installNativeFlyoutKeyboard();
+  try {
+    acceptContent({ ...rings, generation: 2 });
+    await act(async () => expect(pressFlyoutArrow()).toBe(true));
+    expect(native.sendKey).toHaveBeenCalledExactlyOnceWith({ ...ringSession, generation: 2, key: "ArrowDown" });
+  } finally { stop(); }
+});
+
+it("ignores queued arrow and activation keys from a stale flyout generation", async () => {
+  await act(async () => root.render(createElement(PalettePopoverWindow, { toolsetId: rings.toolsetId, kind: "flyout", prewarm: true })));
+  await act(async () => pushContent({ ...rings, generation: 2 }));
+  await act(async () => native.key?.({ ...ringSession, generation: 1, key: "ArrowDown" }));
+  expect(container.querySelector('[data-keyboard-highlighted="true"]')).toBeNull();
+  await act(async () => native.key?.({ ...ringSession, generation: 2, key: "ArrowDown" }));
+  expect(container.querySelector('[data-keyboard-highlighted="true"]')?.getAttribute("data-command-id")).toBe("ring-0");
+  await act(async () => native.key?.({ ...ringSession, generation: 1, key: "Enter" }));
+  expect(native.command).not.toHaveBeenCalled();
+  await act(async () => native.key?.({ ...ringSession, generation: 2, key: "Enter" }));
+  expect(native.command).toHaveBeenCalledExactlyOnceWith("ring-0", { flyoutOpening: { ...ringSession, generation: 2 } });
+});
+
+it.each(["macos", "windows"] as const)("refuses Enter at native dispatch when the flyout hides during a delayed visibility reply on %s", async platform => {
+  const manager = await vi.importActual<typeof import("./window-manager")>("./window-manager");
+  let visible = false;
+  let shownOpening: unknown;
+  const delivered = vi.fn();
+  native.invoke.mockImplementation(async (command, args) => {
+    if (command === "show_toolset_popover_window") {
+      shownOpening = args?.flyoutOpening;
+      return visible = true;
+    }
+    if (command === "route_toolset_command") {
+      const opening = args?.flyoutOpening;
+      // Model the native dispatch boundary. The ordinary palette route has no opening.
+      if (!opening || (visible && isDeepStrictEqual(opening, shownOpening))) delivered(args?.commandId);
+    }
+  });
+  native.show.mockImplementationOnce(manager.showCurrentToolsetPopoverWindow);
+  native.command.mockImplementationOnce(manager.sendPaletteCommand);
+  let reply!: () => void;
+  native.visible.mockImplementationOnce(() => new Promise(resolve => {
+    const sampledVisibility = visible;
+    reply = () => resolve(sampledVisibility);
+  }));
+  try {
+    await act(async () => root.render(createElement(PalettePopoverWindow, { toolsetId: rings.toolsetId, kind: "flyout", prewarm: true, platform })));
+    await act(async () => pushContent({ ...rings, generation: 2 }));
+    await act(async () => native.key?.({ ...ringSession, generation: 2, key: "ArrowDown" }));
+    expect(container.querySelector('[data-keyboard-highlighted="true"]')?.getAttribute("data-command-id")).toBe("ring-0");
+    await act(async () => native.key?.({ ...ringSession, generation: 2, key: "Enter" }));
+    expect(visible).toBe(true);
+    visible = false;
+    await act(async () => reply());
+    expect(delivered).not.toHaveBeenCalled();
+    const flyoutOpening = { ...ringSession, generation: 2 };
+    expect(shownOpening).toEqual(flyoutOpening);
+    expect(native.invoke).toHaveBeenCalledWith("route_toolset_command", { commandId: "ring-0", flyoutOpening });
+  } finally {
+    native.invoke.mockReset();
+  }
+});
+
+it.each([1, undefined])("retains a newer same-time flyout after targeted Escape generation %s and honors broadcasts", generation => {
+  const stop = installNativeFlyoutKeyboard();
+  const target = { toolsetId: rings.toolsetId, openedAt: 1 };
+  try {
+    acceptContent({ ...rings, generation: 2 });
+    native.dismiss?.({ requestedAt: 2, reason: "escape", openings: [{ ...target, generation }] });
+    expect(pressFlyoutArrow()).toBe(true);
+    native.dismiss?.({ requestedAt: 2, reason: "escape", openings: [{ ...target, toolsetId: "core.art", generation: 2 }] });
+    expect(pressFlyoutArrow()).toBe(true);
+    native.dismiss?.({ requestedAt: 2, reason: "escape", openings: [{ ...target, generation: 2 }] });
+    expect(pressFlyoutArrow()).toBe(false);
+    acceptContent({ ...rings, generation: 2 });
+    expect(pressFlyoutArrow()).toBe(false);
+    acceptContent({ ...rings, generation: 3 });
+    expect(pressFlyoutArrow()).toBe(true);
+    native.dismiss?.({ requestedAt: 1 });
+    expect(pressFlyoutArrow()).toBe(false);
+  } finally { stop(); }
 });
 
 it("focuses keyboard flyout choices and traverses Tab without scrolling", async () => {
   const focus = vi.spyOn(HTMLElement.prototype, "focus");
   await act(async () => root.render(createElement(PalettePopoverWindow, { toolsetId: "core.bondStereo", kind: "flyout", prewarm: true })));
-  await act(async () => native.content?.({ ...rings, toolsetId: "core.bondStereo",
+  await act(async () => pushContent({ ...rings, toolsetId: "core.bondStereo",
     flyout: { ...rings.flyout, id: "stereo", variant: "bondStereo", keyboardOpen: true } }));
   expect(focus).toHaveBeenLastCalledWith({ preventScroll: true });
   await act(async () => { document.activeElement?.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true })); });

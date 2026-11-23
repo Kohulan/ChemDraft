@@ -182,7 +182,7 @@ impl LoginShellPath {
             parent,
             run_dir,
             false,
-            Duration::from_secs(5),
+            super::run::supervision_limit(Duration::from_secs(5)),
             64 * 1024,
         )
         .and_then(|output| parse_login_shell_path(&output.stdout));
@@ -266,7 +266,7 @@ pub(super) fn probe_tool(
         (parent, codex_auth),
         run_dir,
         managed,
-        Duration::from_secs(10),
+        super::run::supervision_limit(Duration::from_secs(10)),
         64 * 1024,
     )?;
     if output.code != Some(0) {
@@ -287,7 +287,7 @@ pub(super) fn probe_tool(
         (parent, codex_auth),
         run_dir,
         managed,
-        Duration::from_secs(15),
+        super::run::supervision_limit(Duration::from_secs(15)),
         64 * 1024,
     )?;
     Ok(ProbeResult {
@@ -382,7 +382,7 @@ pub(super) fn execute_in_home(
             CaptureError::OutputLimit => {
                 "External tool probe exceeded its output limit.".to_owned()
             }
-            CaptureError::Cancelled => "External tool probe was cancelled.".to_owned(),
+            CaptureError::Cancelled => "External tool probe was canceled.".to_owned(),
         })?;
     match output.status {
         RunStatus::Exited { code, .. } => Ok(ProbeOutput {

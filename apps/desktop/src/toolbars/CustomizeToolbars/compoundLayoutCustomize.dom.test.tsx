@@ -93,10 +93,12 @@ describe("compound layouts in Customize Toolbars", () => {
     render(state);
     for (const id of [...desktopToolsets.map((toolset) => toolset.id), "user.copy"]) {
       selectToolset(id);
+      click(".customize-command-picker-toggle");
       expectNoLayoutCommands();
     }
     // An empty custom toolbar exposes all eligible commands, including ones absent from its contents.
     click(".customize-toolbars-create button");
+    click(".customize-command-picker-toggle");
     expect(container.querySelector('[aria-label="Search commands to add"]')).not.toBeNull();
     expectNoLayoutCommands();
     expect(container.querySelectorAll("[data-command-id]")).toHaveLength(0);
@@ -157,6 +159,7 @@ describe("compound layouts in Customize Toolbars", () => {
     expect(container.querySelector(`[data-item-id="${arrangeId}"]`)?.textContent).toContain("Arrange Selection");
     expect(container.querySelector<HTMLInputElement>(`[data-item-id="${arrangeId}"] .customize-item-visible`)?.checked).toBe(true);
     click(".customize-toolbars-create button");
+    click(".customize-command-picker-toggle");
     expect([...container.querySelectorAll<HTMLElement>("[data-command-id]")].map((row) => row.dataset.commandId)).toEqual(layoutCommands);
   });
 });

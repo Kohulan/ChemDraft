@@ -1,3 +1,5 @@
+import type { PluginHostOptions } from "@chemdraft/plugin-host";
+import { nameToStructureForPlugin } from "./pluginChemistry";
 import type { ChemDraftDocument } from "@chemdraft/chem-core";
 import type {
   AppliedPatchReceipt,
@@ -18,7 +20,7 @@ import {
   createPluginUpdateChecker, hasOfficialInstalledPlugin, installedPluginCatalogKey,
   schedulePluginUpdateAutoCheck, type CachedPluginUpdateResults, type TimedPluginUpdateCheckResult
 } from "./pluginUpdateAutoCheck";
-import { createPluginRuntime, type DesktopPluginRuntime, type ProposalDocumentTab } from "./createPluginRuntime";
+import { createPluginRuntime, type DesktopPluginRuntime, type DesktopPluginRuntimeOptions, type ProposalDocumentTab } from "./createPluginRuntime";
 import {
   PluginInstallError,
   PluginInstallErrorCodes,
@@ -77,7 +79,11 @@ export interface PluginRuntimeProviders {
    *  `DesktopPluginRuntimeOptions.getActiveDocumentKey`). Without one, two documents created by
    *  File > New in one session are indistinguishable to the write-binding check. */
   getActiveDocumentKey?: () => string | undefined;
+  captureRequestDocument?: PluginHostOptions["captureRequestDocument"];
+  openRequestHistory?: PluginHostOptions["openRequestHistory"];
+  requestPageSpace?: PluginHostOptions["requestPageSpace"];
   getActiveDocumentTab?: () => Pick<ProposalDocumentTab, "id">;
+  getDocumentForTab?: DesktopPluginRuntimeOptions["getDocumentForTab"];
   /** MainWindow's native dialog authority, when this is a desktop document window. */
   getDialogCoordinator?: () => DialogCoordinator | undefined;
   getDocumentTabTitle?: (tabId: string) => string | undefined;
@@ -89,6 +95,8 @@ export interface PluginRuntimeProviders {
   commandRegistry?: CommandRegistry;
   /** Storage backend factory (the desktop passes the disk-backed one); defaults to in-memory. */
   createStorage?: (pluginId: string) => PluginStorage;
+  /** Names the source of a successful name conversion in the document status line. */
+  onNameResolutionStatus?: (text: string | undefined) => void;
   /** Quiet update notices use the document window status line. */
   onPluginUpdateStatus?: (text: string) => void;
   /** Fired whenever the proposed-patch queue changes (new, accepted, rejected). */
@@ -169,6 +177,14 @@ export function usePluginRuntime(providers: PluginRuntimeProviders): PluginRunti
   } | null>(null);
   if (ownerRef.current === null) {
     const runtime = createPluginRuntime({
+      convertNameToStructure: async request => {
+        const result = await nameToStructureForPlugin(request);
+        if (result.available && result.parsed) {
+          const match = result.matchedName ?? result.matchedCas;
+          providersRef.current.onNameResolutionStatus?.(`Name to Structure: ${result.source === "dictionary" ? `Wikidata dictionary (${match})` : result.engine.id === "chemdraft-templates" ? "built-in template" : "OPSIN"}.`);
+        } else providersRef.current.onNameResolutionStatus?.(`Name to Structure failed: ${result.reason}`);
+        return result;
+      },
       getActiveDocument: () => providersRef.current.getActiveDocument(),
       getActiveDocumentKey: providers.getActiveDocumentKey
         ? () => providersRef.current.getActiveDocumentKey?.()
@@ -176,7 +192,14 @@ export function usePluginRuntime(providers: PluginRuntimeProviders): PluginRunti
       getActiveDocumentTab: providers.getActiveDocumentTab
         ? () => providersRef.current.getActiveDocumentTab!()
         : undefined,
+      captureRequestDocument: providers.captureRequestDocument && (() => providersRef.current.captureRequestDocument?.()),
+      openRequestHistory: providers.openRequestHistory && ((document, label) => providersRef.current.openRequestHistory!(document, label)),
+      requestPageSpace: providers.requestPageSpace && {
+        plan: (...args) => providersRef.current.requestPageSpace!.plan(...args),
+        confirm: (signal, documentKey) => providersRef.current.requestPageSpace!.confirm(signal, documentKey)
+      },
       getDocumentTabTitle: (tabId) => providersRef.current.getDocumentTabTitle?.(tabId),
+      getDocumentForTab: (tabId) => providersRef.current.getDocumentForTab?.(tabId),
       getSelection: (warnings) => providersRef.current.getSelection(warnings),
       // Read once at creation: the registry (and the other integration options) must be stable —
       // MainWindow creates the registry in a one-time memo, matching the runtime's lifetime.

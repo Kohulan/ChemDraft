@@ -1,5 +1,9 @@
+import { isDrawingToolCommand } from "./drawingTools";
+import { installPopoverEscapeRouting } from "./window-manager/popoverEscape";
+import { listenCurrentWindowEvent } from "./window-manager/tauriEvents";
 import type { AnalysisReport } from "@chemdraft/analysis-core";
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent } from "react";
+import { observePaletteHitBoxes } from "./commandHitBoxes";
 import { DefaultNativeTextStyle, type NativeTextStyle, type TextSpan } from "@chemdraft/chem-core";
 import {
   APPENDABLE_TOOLBAR_WIDGETS,
@@ -16,13 +20,14 @@ import { createPhase4Document } from "./documentWorkflow";
 import { createDesktopShortcutRegistry, detectDesktopShortcutPlatform } from "./keyboardShortcuts";
 import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import { NATIVE_MENU_COMMAND_IDS, paletteMenuShortcut } from "./paletteMenuShortcuts";
+import { installNativeFlyoutKeyboard } from "./nativeFlyoutKeyboard";
 import { disabledControlAtPointer, installPaletteInputFocus, isPaletteInputFocusPending, paletteInputFocusControl, PALETTE_INPUT_FOCUS_COMMIT_EVENT } from "./plugins/pluginPanelInputFocus";
 import { editHistoryDirection, forceDocumentHistoryCommandId, isCleanPaletteNumberInput, isTextEditingElement } from "./editHistoryRouting";
 import { applyKeybindingSchemeToCommands } from "./keybindingScheme";
-import { isCompoundLayoutCommand } from "./compoundLayoutSettings";
-import { useCompoundLayoutTools } from "./useCompoundLayoutTools";
-import { loadKeybindingSettings, type KeybindingScheme } from "./keybindingSettings";
+import { useCompoundLayoutSettings } from "./useCompoundLayoutTools";
+import { loadKeybindingSettings } from "./keybindingSettings";
 import { TOOLBAR_SELECTION_KINDS, type ToolbarSelectionModel } from "./toolbars/toolbarSelectionKind";
+import { filterToolbarCustomizationCommands } from "./toolbars/toolbarCustomizationCommands";
 import { ToolbarCustomizeController } from "./toolbars/CustomizeMainToolbar/ToolbarCustomizeController";
 import { CustomizeBar } from "./toolbars/CustomizeMainToolbar/CustomizeBar";
 import { GalleryTray } from "./toolbars/CustomizeMainToolbar/GalleryTray";
@@ -31,21 +36,23 @@ import {
   createDesktopToolsetRegistry,
   desktopToolsetRegistry,
   compoundLayoutRegistry,
-  computePaletteGridSize,
-  getToolsetCommandSpecs,
   getToolsetPaletteGroups,
+  initialToolsetWindowSize,
   paletteCommandGroupsFromItemGroups,
   type DesktopToolsetDefinition,
   type DesktopToolsetRegistry,
   type ToolbarPaletteGroupModel
 } from "./toolsets";
-import { isCompatOnlyArtVariantCommandId, TRANSITIONAL_STUB_COMMAND_IDS } from "./drawingTools";
 import {
   DEFAULT_TOOLSET_ID,
   closeToolsetWindow,
   closeToolsetPopoverWindow,
+  isToolsetPopoverWindowVisible,
+  newToolsetPopoverOpening,
   currentWindowLogicalPosition,
   currentWindowLogicalWorkArea,
+  clampCurrentInspectorFrame,
+  isDesktopRuntime,
   fitCurrentPaletteWindow,
   dismissToolsetPopovers,
   toolsetPopoverTimestamp,
@@ -65,6 +72,8 @@ import {
   listenForToolsetPopoverContentRequests,
   listenForToolsetTextStyle,
   loadToolsetLayoutState,
+  notifyToolsetFlyoutOpening,
+  notifyToolsetPopoverClosed,
   requestToolsetCustomizeMode,
   requestToolsetCommandSpecs,
   requestToolsetDefinitions,
@@ -73,6 +82,7 @@ import {
   requestToolsetTextStyle,
   sendToolsetLayoutEdit,
   setToolsetPopoverContent,
+  setPaletteCommandHitBoxes,
   sendPaletteCommand,
   sendPaletteCommandCancel,
   sendPaletteInspectorAction,
@@ -102,7 +112,7 @@ export function createPaletteRegistryFromLayoutState(
 ): DesktopToolsetRegistry {
   return createDesktopToolsetRegistry(
     layoutState,
-    new Set([...SHELL_COMMAND_IDS, ...commandSpecs.map((command) => command.id)]),
+    new Set([...SHELL_COMMAND_IDS, ...commandSpecs.filter(command => command.source === "plugin").map(command => command.id)]),
     pluginToolsets
   );
 }
@@ -125,25 +135,29 @@ function pendingPlaceholderToolset(toolsetId: string): DesktopToolsetDefinition 
 
 export function PaletteWindow({
   toolsetId = "core.main",
+  resizable = false,
   // Interim seam so tests (and, until Phase 4's definition-push, callers) can supply a
   // registry that already includes plugin toolsets. Defaults to the core registry.
   initialRegistry,
   platform = detectDesktopShortcutPlatform()
 }: {
   toolsetId?: string;
+  resizable?: boolean;
   initialRegistry?: DesktopToolsetRegistry;
   platform?: ShortcutPlatform;
 }) {
+  useEffect(() => installNativeFlyoutKeyboard(platform), [platform]);
   const dragRef = useRef<PaletteWindowDrag | null>(null);
   const shellRef = useRef<HTMLElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const settlingBeforeForwardRef = useRef(false);
   const lastLoggedSizeRef = useRef<string>("");
   const sizeAnimationFrameRef = useRef<number | undefined>(undefined);
-  const compoundLayoutsEnabled = useCompoundLayoutTools();
+  const compoundLayoutSettings = useCompoundLayoutSettings();
+  const compoundLayoutsEnabled = compoundLayoutSettings.enabled;
   const [unfilteredToolsetRegistry, setToolsetRegistry] = useState(() => initialRegistry ?? desktopToolsetRegistry);
-  const toolsetRegistry = useMemo(() => compoundLayoutRegistry(unfilteredToolsetRegistry, compoundLayoutsEnabled),
-    [unfilteredToolsetRegistry, compoundLayoutsEnabled]);
+  const toolsetRegistry = useMemo(() => compoundLayoutRegistry(unfilteredToolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings),
+    [unfilteredToolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings]);
   const [commandSpecs, setCommandSpecs] = useState<CommandSpec[]>(() =>
     allShellCommands(createPhase4Document(), undefined, {
       registry: initialRegistry ?? desktopToolsetRegistry
@@ -151,11 +165,15 @@ export function PaletteWindow({
   );
   const commandSpecsRef = useRef(commandSpecs);
   const commandSpecsSignatureRef = useRef(toolsetCommandSpecsSignature(commandSpecs));
-  const [keybindingScheme, setKeybindingScheme] = useState<KeybindingScheme>(() => loadKeybindingSettings().scheme);
+  const [keybindingSettings, setKeybindingSettings] = useState(loadKeybindingSettings);
+  const { scheme: keybindingScheme } = keybindingSettings;
+  const shortcutOverrides = keybindingSettings.overrides?.[keybindingScheme];
+  useEffect(() => installPopoverEscapeRouting(), []);
+
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    void listenForKeybindingSettings((next) => setKeybindingScheme(next.scheme)).then((listener) => {
+    void listenForKeybindingSettings(setKeybindingSettings).then((listener) => {
       if (disposed) {
         listener();
         return;
@@ -203,35 +221,28 @@ export function PaletteWindow({
   // as-yet-unknown toolset (placeholder) isn't in the registry, so render no groups until its
   // definition lands rather than throwing on registry.require().
   const paletteGroups = useMemo(
-    () => (knownToolset ? getToolsetPaletteGroups(toolset.id, toolsetRegistry, commandOverrides, compoundLayoutsEnabled) : []),
-    [knownToolset, commandOverrides, toolset.id, toolsetRegistry, compoundLayoutsEnabled]
+    () => (knownToolset ? getToolsetPaletteGroups(toolset.id, toolsetRegistry, commandOverrides, compoundLayoutsEnabled, compoundLayoutSettings) : []),
+    [knownToolset, commandOverrides, toolset.id, toolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings]
   );
   const itemGroups = useMemo(() => paletteGroups.map((group) => group.items), [paletteGroups]);
-  const gridWindowSize = useMemo(() => computePaletteGridSize(toolset.gridLayout, itemGroups), [itemGroups, toolset.gridLayout]);
+  const { width: fallbackWidth, height: fallbackHeight } = useMemo(
+    () => initialToolsetWindowSize(toolset, itemGroups), [itemGroups, toolset]
+  );
   // The main window owns live command metadata/availability and publishes snapshots to detached
   // palettes. The state initializer above is only a first-paint fallback before that handshake.
   // Snapshots arrive already remapped for the active keybinding scheme; re-applying here covers the
   // first-paint fallback and live scheme flips (the transform is idempotent by command id).
   const allCommands = useMemo(
-    () => applyKeybindingSchemeToCommands(commandSpecs, keybindingScheme),
-    [commandSpecs, keybindingScheme]
+    () => applyKeybindingSchemeToCommands(commandSpecs, keybindingScheme, shortcutOverrides),
+    [commandSpecs, keybindingScheme, shortcutOverrides]
   );
-  // Same rule as the main window's in-place gallery: transitional stubs are not draggable onto
-  // toolbars. The declared stub set is used rather than the snapshot's enabled state.
-  const galleryCommands = useMemo(() => {
-    // The shipped manifest, not `toolsetRegistry` — see the matching note in MainWindow. Keyed off
-    // the user's customized layout, removing a tool would delete it from the list they would add it
-    // back with.
-    const shipped = new Set(getToolsetCommandSpecs(desktopToolsetRegistry).map((command) => command.id));
-    return allCommands.filter((command) =>
-      (compoundLayoutsEnabled || !isCompoundLayoutCommand(command.id)) &&
-      !TRANSITIONAL_STUB_COMMAND_IDS.has(command.id) &&
-      !isCompatOnlyArtVariantCommandId(command.id, shipped)
-    );
-  }, [allCommands, compoundLayoutsEnabled]);
+  const galleryCommands = useMemo(
+    () => filterToolbarCustomizationCommands(allCommands, compoundLayoutSettings),
+    [allCommands, compoundLayoutSettings]
+  );
   const shortcutRegistry = useMemo(
-    () => createDesktopShortcutRegistry(allCommands, { includeDisabled: true, platform }),
-    [allCommands, platform]
+    () => createDesktopShortcutRegistry(allCommands, { includeDisabled: true, platform, overrides: shortcutOverrides }),
+    [allCommands, platform, shortcutOverrides]
   );
   const shortcutRegistryRef = useRef(shortcutRegistry);
   shortcutRegistryRef.current = shortcutRegistry;
@@ -435,10 +446,51 @@ export function PaletteWindow({
   }, [platform]);
 
   useEffect(() => {
-    const preferredSize = toolset.preferredWindowSize ?? gridWindowSize;
-    if (!preferredSize) {
-      return;
-    }
+    if (!resizable || !knownToolset || !isDesktopRuntime()) return;
+
+    let disposed = false;
+    let timer: number | undefined;
+    let unlisten: (() => void) | undefined;
+    // Let a native drag cross the screen edge before bringing the full frame back into view.
+    const scheduleClamp = () => {
+      if (disposed) return;
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        void clampCurrentInspectorFrame().catch(() => undefined);
+      }, 150);
+    };
+    // Taskbar or Dock changes can shrink the work area without a move or a webview resize.
+    let lastArea: string | undefined;
+    let checking = false;
+    const checkWorkArea = async () => {
+      if (checking || document.hidden) return;
+      checking = true;
+      try {
+        const { left, top, right, bottom } = await currentWindowLogicalWorkArea();
+        const area = `${left}:${top}:${right}:${bottom}`;
+        if (lastArea !== undefined && lastArea !== area) scheduleClamp();
+        lastArea = area;
+      } finally {
+        checking = false;
+      }
+    };
+    const check = () => { void checkWorkArea().catch(() => undefined); };
+    check();
+    const areaTimer = window.setInterval(check, 1000);
+    void listenForCurrentWindowWorkAreaChanges(scheduleClamp).then(cleanup => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    });
+    return () => {
+      disposed = true;
+      window.clearTimeout(timer);
+      window.clearInterval(areaTimer);
+      unlisten?.();
+    };
+  }, [knownToolset, resizable]);
+
+  useEffect(() => {
+    if (resizable || !knownToolset) return;
 
     const shell = shellRef.current;
     let disposed = false;
@@ -466,9 +518,10 @@ export function PaletteWindow({
         const rect = shell?.getBoundingClientRect();
         const contentWidth = rect ? Math.ceil(rect.width) : 0;
         const contentHeight = rect ? Math.ceil(rect.height) : 0;
-        const width = contentWidth > 0 ? contentWidth : preferredSize.width;
+        const width = contentWidth || fallbackWidth;
         const height = Math.min(availableHeight,
-          Math.max(colorPickerOpen ? 292 : 0, contentHeight > 0 ? contentHeight : preferredSize.height));
+          Math.max(colorPickerOpen ? 292 : 0, contentHeight || fallbackHeight));
+        if (width <= 0 || height <= 0) return;
         // Dev-only size probe: open the palette window's devtools console to read exact
         // content-vs-window numbers for any palette that still looks wrong.
         if (import.meta.env.DEV) {
@@ -479,9 +532,8 @@ export function PaletteWindow({
           }
         }
         const sizeKey = `${width}x${height}`;
-        if (sizeKey !== lastSize) {
+        if (sizeKey !== lastSize && await fitCurrentPaletteWindow({ width, height }, area)) {
           lastSize = sizeKey;
-          await fitCurrentPaletteWindow({ width, height }, area);
         }
       } finally {
         sizing = false;
@@ -520,7 +572,7 @@ export function PaletteWindow({
         sizeAnimationFrameRef.current = undefined;
       }
     };
-  }, [colorPickerOpen, gridWindowSize, toolset.preferredWindowSize]);
+  }, [colorPickerOpen, fallbackHeight, fallbackWidth, knownToolset, resizable, toolset.id]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -670,6 +722,7 @@ export function PaletteWindow({
     // A's slower resolve could win). Every show candidate, hide, and teardown invalidates the
     // previous request; the token is re-checked after the await, immediately before emitting.
     let tooltipRequest = 0;
+    let tooltipOwner: string | undefined;
     const handleTooltip = (event: Event) => {
       if (customizeThisPaletteRef.current) {
         tooltipRequest += 1;
@@ -681,11 +734,15 @@ export function PaletteWindow({
         return;
       }
       if (!detail.visible || !detail.anchor || !(detail.title || detail.description)) {
+        // React can clean up A after B has announced its tooltip. Only the current owner hides it.
+        if (detail.ownerId && detail.ownerId !== tooltipOwner) return;
+        tooltipOwner = undefined;
         tooltipRequest += 1;
         void hidePaletteFloatingTooltip().catch(() => undefined);
         return;
       }
       const { title, description, shortcut, anchor } = detail;
+      tooltipOwner = detail.ownerId;
       tooltipRequest += 1;
       const request = tooltipRequest;
       void (async () => {
@@ -771,6 +828,9 @@ export function PaletteWindow({
   }, [shortcutRegistry, platform]);
 
   const invokeCommand = (commandId: string) => {
+    // A tool can be activated by keyboard or a synthesized click without a
+    // pointerdown. Selecting it also ends any previous flyout interaction.
+    if (isDrawingToolCommand(commandId)) dismissPaletteFlyouts();
     void sendPaletteCommand(commandId).catch(() => undefined);
   };
   const previewCommand = (commandId: string) => {
@@ -814,45 +874,115 @@ export function PaletteWindow({
   const lastPopoverPayloadRef = useRef<{ content: ToolsetPopoverContent; anchor: ToolsetPopoverAnchor } | undefined>(
     undefined
   );
-
-  const openPopover = (anchor: ToolbarPopoverAnchor, kind: string, content: ToolsetPopoverContent) => {
-    content = { ...content, openedAt: toolsetPopoverTimestamp() };
-    void (async () => {
-      // No silent origin fallback: a failed position read once sent the first popover
-      // open to the anchor offset from (0,0) — inches from its button — while every
-      // later open worked. Retry once, then abort; a popout that doesn't appear (and
-      // works on the next press) beats one that appears in the wrong place.
-      const windowPosition =
-        (await currentWindowLogicalPosition().catch(() => undefined)) ??
-        (await currentWindowLogicalPosition().catch(() => undefined));
-      if (!windowPosition) {
-        return;
-      }
-      const screenX = windowPosition.x + anchor.left;
-      const screenY = windowPosition.y + anchor.bottom + 4;
-      // Armed only once the open is actually going through. Priming it before the abortable read
-      // above meant a press that never opened anything still armed the replay, so the prewarmed
-      // window's mount request got answered and revealed a popover nobody asked for at (0, 0).
-      lastPopoverPayloadRef.current = { content, anchor: { x: screenX, y: screenY } };
-      await openToolsetPopoverWindow(toolset.id, kind, screenX, screenY);
-      // The anchor rides along so the popover can re-assert its position AFTER sizing to
-      // content — a bottom-anchored macOS resize otherwise shifts the first open down by
-      // the height delta (Rust positions the old-size window; the resize moves its top).
-      await setToolsetPopoverContent(toolset.id, content, { x: screenX, y: screenY });
-    })().catch(() => undefined);
+  const popoverOperationsRef = useRef(Promise.resolve());
+  const pendingPopoverOperationsRef = useRef(0);
+  // A flyout press invalidates older work immediately, even while its native open is queued.
+  // Swatch presses themselves remain ordered toggles rather than cancelling one another.
+  const popoverRequestRef = useRef(0);
+  const enqueuePopoverOperation = (operation: () => Promise<void>) => {
+    ++pendingPopoverOperationsRef.current;
+    popoverOperationsRef.current = popoverOperationsRef.current.then(operation).catch(() => undefined)
+      .finally(() => { --pendingPopoverOperationsRef.current; });
   };
 
-  // Clicking the swatch always (re)opens + repositions — deliberately NOT a toggle: the panel hides
-  // itself on app-deactivate (hidesOnDeactivate), which a local "is it open?" flag can't observe, so
-  // a toggle would go stale and eat the next click. Dismissal is Escape / click-away / app-deactivate.
-  const openArtColorPopover = (anchor: ToolbarPopoverAnchor) => {
-    openPopover(anchor, "artColor", { kind: "artColor" });
-    // Make sure the freshly shown picker reflects the current object's colour.
-    void requestToolsetTextStyle().catch(() => undefined);
+  const dismissPaletteFlyouts = () => {
+    // A native open may still be queued when this click arrives. Invalidate it
+    // immediately and clear its mount replay. Hide now, without waiting for a
+    // slow native open/content acknowledgement in popoverOperationsRef. Retain
+    // the ordered close as a barrier before the next open: pending old work may
+    // still finish, but cannot reveal or close a newer generation.
+    ++popoverRequestRef.current;
+    const opening = lastPopoverPayloadRef.current?.content;
+    lastPopoverPayloadRef.current = undefined;
+    const pendingWork = pendingPopoverOperationsRef.current > 0;
+    const hidden = closeToolsetPopoverWindow(toolset.id, opening?.openedAt, opening?.generation).catch(() => undefined);
+    enqueuePopoverOperation(async () => {
+      await hidden;
+      if (pendingWork) await closeToolsetPopoverWindow(toolset.id, opening?.openedAt, opening?.generation);
+    });
+    void dismissToolsetPopovers(toolsetPopoverTimestamp()).catch(() => undefined);
+  };
+
+  const openPopover = async (anchor: ToolbarPopoverAnchor, kind: string, content: ToolsetPopoverContent, request: number) => {
+    const isCurrent = () => popoverRequestRef.current === request;
+    if (!isCurrent()) return false;
+    // No silent origin fallback: a failed position read once sent the first popover
+    // open to the anchor offset from (0,0) — inches from its button — while every
+    // later open worked. Retry once, then abort; a popout that doesn't appear (and
+    // works on the next press) beats one that appears in the wrong place.
+    let windowPosition = await currentWindowLogicalPosition().catch(() => undefined);
+    if (!isCurrent()) return false;
+    if (!windowPosition) {
+      windowPosition = await currentWindowLogicalPosition().catch(() => undefined);
+      if (!isCurrent()) return false;
+    }
+    if (!windowPosition) {
+      return false;
+    }
+    const screenX = windowPosition.x + anchor.left;
+    const screenY = windowPosition.y + anchor.bottom + 4;
+    // Armed only once the open is actually going through. Priming it before the abortable read
+    // above meant a press that never opened anything still armed the replay, so the prewarmed
+    // window's mount request got answered and revealed a popover nobody asked for at (0, 0).
+    lastPopoverPayloadRef.current = { content, anchor: { x: screenX, y: screenY } };
+    await openToolsetPopoverWindow(toolset.id, kind, screenX, screenY);
+    if (!isCurrent() || lastPopoverPayloadRef.current?.content !== content) return false;
+    // The anchor rides along so the popover can re-assert its position AFTER sizing to
+    // content — a bottom-anchored macOS resize otherwise shifts the first open down by
+    // the height delta (Rust positions the old-size window; the resize moves its top).
+    await setToolsetPopoverContent(toolset.id, content, { x: screenX, y: screenY });
+    return isCurrent() && lastPopoverPayloadRef.current?.content === content;
+  };
+
+  // Flyout opens and swatch toggles share the entire native operation, including visibility reads.
+  // Snapshot the opening before awaiting: a late reply never authorizes closing its replacement.
+  const openColorPopover = (anchor: ToolbarPopoverAnchor, kind: "artColor" | "textColor" = "artColor") => {
+    const request = popoverRequestRef.current;
+    enqueuePopoverOperation(async () => {
+      if (popoverRequestRef.current !== request) return;
+      const opening = lastPopoverPayloadRef.current?.content;
+      const isCurrent = () => popoverRequestRef.current === request && lastPopoverPayloadRef.current?.content === opening;
+      if (opening?.kind === kind) {
+        const visible = await isToolsetPopoverWindowVisible(toolset.id);
+        if (!isCurrent()) return;
+        if (visible) {
+          const requestedAt = toolsetPopoverTimestamp();
+          await dismissToolsetPopovers(requestedAt, undefined, [{
+            toolsetId: toolset.id, openedAt: opening.openedAt, generation: opening.generation
+          }]);
+          if (!isCurrent()) return;
+          await closeToolsetPopoverWindow(toolset.id, opening.openedAt, opening.generation);
+          if (!isCurrent()) return;
+          lastPopoverPayloadRef.current = undefined;
+          return;
+        }
+      }
+      const content: ToolsetPopoverContent = { kind, ...newToolsetPopoverOpening() };
+      if (await openPopover(anchor, kind, content, request)) {
+        await requestToolsetTextStyle();
+      }
+    });
   };
 
   const openFlyoutPopover = (request: ToolbarFlyoutRequest) => {
-    openPopover(request.anchor, "flyout", { kind: "flyout", flyout: request.flyout });
+    const sequence = ++popoverRequestRef.current;
+    const opening = newToolsetPopoverOpening();
+    const content: ToolsetPopoverContent = { kind: "flyout", flyout: request.flyout, ...opening };
+    const pending = platform === "windows" && request.flyout.variant !== "bondStereo"
+      ? notifyToolsetFlyoutOpening({ toolsetId: toolset.id, flyoutId: request.flyout.flyoutId, ...opening }).catch(() => undefined)
+      : undefined;
+    enqueuePopoverOperation(async () => {
+      if (pending) await pending;
+      let opened = false;
+      try {
+        opened = await openPopover(request.anchor, "flyout", content, sequence);
+      } finally {
+        if (pending && !opened) {
+          if (lastPopoverPayloadRef.current?.content === content) lastPopoverPayloadRef.current = undefined;
+          await notifyToolsetPopoverClosed(toolset.id, opening.openedAt, opening.generation);
+        }
+      }
+    });
   };
 
   // Build this palette's popover window hidden, ahead of the first flyout/color press. The cold
@@ -874,7 +1004,11 @@ export function PaletteWindow({
   // If this palette goes away, don't leave its popover window orphaned on screen.
   useEffect(() => {
     return () => {
-      void closeToolsetPopoverWindow(toolset.id).catch(() => undefined);
+      ++popoverRequestRef.current;
+      const opening = lastPopoverPayloadRef.current?.content;
+      enqueuePopoverOperation(async () => {
+        await closeToolsetPopoverWindow(toolset.id, opening?.openedAt, opening?.generation);
+      });
     };
   }, [toolset.id]);
 
@@ -904,9 +1038,12 @@ export function PaletteWindow({
     return () => unlisten?.();
   }, [toolset.id]);
 
-  // A pointer-down anywhere in this palette that isn't a popover trigger dismisses any open popover
-  // ("click elsewhere closes it"). The colour swatch and flyout buttons are excluded so re-clicking
-  // one repositions/swaps its popover rather than close-then-reopen. The popover lives in its own
+  // A pointer-down anywhere in this palette that isn't a direct popover toggle dismisses any open
+  // popover ("click elsewhere closes it"). The colour swatch and distribute mode buttons are excluded
+  // so clicking them toggles/swaps their popovers directly. Command flyout buttons are NOT excluded:
+  // a short click executes their primary command rather than toggling a popover, so clicking them
+  // must dismiss any open stale flyout. If a user long-holds, the new popover's later opening
+  // timestamp and fresh generation protect it from this dismissal. The popover lives in its own
   // window, so its own clicks never reach this listener.
   useEffect(() => {
     const handlePointerDown = (event: globalThis.PointerEvent) => {
@@ -914,10 +1051,10 @@ export function PaletteWindow({
         return;
       }
       const target = event.target;
-      if (target instanceof Element && target.closest(".toolbar-color-trigger, .command-flyout-button, .distribute-mode-button")) {
+      if (target instanceof Element && target.closest(".toolbar-color-trigger, .distribute-mode-button")) {
         return;
       }
-      void dismissToolsetPopovers(toolsetPopoverTimestamp()).catch(() => undefined);
+      dismissPaletteFlyouts();
     };
     window.addEventListener("pointerdown", handlePointerDown, true);
     return () => window.removeEventListener("pointerdown", handlePointerDown, true);
@@ -1039,6 +1176,7 @@ export function PaletteWindow({
     const renderItemGroups = renderGroups.map((group) => group.items);
     return (
       <ToolPalette
+        platform={platform}
         groups={paletteCommandGroupsFromItemGroups(renderItemGroups)}
         itemGroups={renderItemGroups}
         gridLayout={toolset.gridLayout}
@@ -1050,6 +1188,7 @@ export function PaletteWindow({
         onInvoke={invokeCommand}
         customize={customizeThisPalette ? { groupIds: renderGroups.map((group) => group.id) } : undefined}
         widgetState={{
+          commandSpecs: allCommands,
           colorContextKey,
           currentObjectColor: currentTextStyle.color,
           currentArtStyle,
@@ -1062,7 +1201,7 @@ export function PaletteWindow({
           currentTextStyle,
           currentTextScript,
           onColorPickerOpenChange: setColorPickerOpen,
-          onRequestColorPopover: openArtColorPopover,
+          onRequestColorPopover: openColorPopover,
           onArtStylePreview: previewCommand,
           onArtStyleCommit: commitPreviewCommand,
           onArtStyleCancel: cancelPreviewCommand,
@@ -1088,12 +1227,31 @@ export function PaletteWindow({
     ? currentSelection.objectTypes.length === 1 && currentSelection.objectTypes[0] === "table"
     : !currentMoleculeInspector?.targets.moleculeObjectIds.length);
 
+  useEffect(() => {
+    if (platform !== "windows") return;
+    if (customizeThisPalette) {
+      void setPaletteCommandHitBoxes([], []).catch(() => undefined);
+      return;
+    }
+    const body = bodyRef.current;
+    if (!body) return;
+    return observePaletteHitBoxes(body, setPaletteCommandHitBoxes, refresh =>
+      listenCurrentWindowEvent("chemdraft://palette-command-hit-boxes-refresh", refresh));
+  }, [platform, toolsetId, customizeThisPalette]);
+
+  // Selection/spec broadcasts replace state objects, not this native registration.
+  // Observer cleanup never clears a live window; only teardown/customize does.
+  useEffect(() => () => {
+    if (platform === "windows") void setPaletteCommandHitBoxes([], []).catch(() => undefined);
+  }, [platform]);
+
   return (
     <main
       ref={shellRef}
       className="palette-window-shell"
       aria-label={`ChemDraft floating ${toolset.title}`}
       data-toolset-id={toolset.id}
+      data-resizable={resizable || undefined}
       data-palette-drag-surface={customizeThisPalette ? undefined : "true"}
       onPointerDown={startDragFromPaletteSurface}
       onPointerUp={stopPaletteWindowDrag}

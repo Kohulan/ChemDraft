@@ -1,5 +1,8 @@
+import { allCustomSwatchCommandIds, loadCustomSwatches, parseCustomSwatchCommandId, type CustomSwatchState } from "./customColorSwatches";
 import {
   MinimalPageSizePresetIds,
+  NativeStylePresets,
+  type NativeStylePresetId,
   findPageSizePreset,
   type ChemDraftDocument,
   type GraphicEffect,
@@ -14,13 +17,18 @@ import {
   type TextSpan
 } from "@chemdraft/chem-core";
 import {
+  waveSettingRanges,
+  type WaveSetting,
   MARKER_SIZE_MAX_PX,
   MARKER_SIZE_STEP_PX,
   SHAFT_MARK_SIZE_MAX_PX,
   SHAFT_MARK_SIZE_MIN_PX
 } from "@chemdraft/art-engine";
 import { ArrangementLayouts, ArrangementGridAlignments, type ArrangementLayout, type ArrangementGridAlignment } from "@chemdraft/layout-engine";
-import { loadCompoundLayoutSettings } from "./compoundLayoutSettings";
+import { arrowAttachmentFrame } from "@chemdraft/layout-engine";
+import { compoundLayoutCommandDisabledReason, type CompoundLayoutSettings, loadCompoundLayoutSettings } from "./compoundLayoutSettings";
+import { structureSearchCommands, structureSearchDocument } from "./structureSearch";
+import { loadStructureSearchEnabled } from "./structureSearchSettings";
 import type { CommandDefinition } from "@chemdraft/plugin-host";
 import { withStandaloneDrawingToolCommands } from "./drawingTools";
 import {
@@ -43,8 +51,12 @@ import type { ToolbarAssetName } from "./toolbarAssets";
 import { SPIN3D_DEBUGGER_COMMAND_ID } from "./conformerDebug";
 import { NO_OPEN_WARNINGS_REASON, TOGGLE_OPEN_WARNINGS_COMMAND_ID } from "./openWarnings";
 import { createTableCommands, type ActiveTableCell } from "./tableCommands";
+import { createBracketCommands } from "./bracketCommands";
 export { tableRuleWidthCommandId, parseTableRuleWidthCommandId } from "./tableCommands";
 import { templateDialogAction, templateInsertActions } from "./templateCommands";
+import { atomProblemCommands } from "./atomProblemCommands";
+import { vibeCodeStarterCommand } from "./commands/vibeCodeStarter";
+export { bondDrawingToolCommandId } from "./bondToolCommands";
 export { templateInsertCommandId } from "./templateCommands";
 
 export interface CommandAvailability {
@@ -62,10 +74,16 @@ export interface CommandAvailability {
 }
 
 export interface ShellCommandOptions {
+  structureSearchEnabled?: boolean;
+  hasSearchableStructure?: boolean;
+  customSwatches?: CustomSwatchState;
   activeTableCell?: ActiveTableCell;
   compoundLayoutsEnabled?: boolean;
+  compoundLayoutSettings?: CompoundLayoutSettings;
   availability?: CommandAvailability;
   registry?: DesktopToolsetRegistry;
+  /** The uncustomized command catalog. The live registry still supplies toolbar launchers. */
+  paletteCommands?: readonly CommandSpec[];
 }
 
 export interface CommandSpec extends CommandDefinition {
@@ -74,6 +92,33 @@ export interface CommandSpec extends CommandDefinition {
   shortcut?: string;
   shortcutLabel?: string;
   disabledReason?: string;
+}
+
+export type SelectionNudgeDirection = "left" | "right" | "up" | "down";
+
+export function selectionNudgeCommandId(direction: SelectionNudgeDirection, large = false): string {
+  return `selection.nudge.${direction}${large ? ".large" : ""}`;
+}
+
+export const selectionNudgeActions: readonly CommandSpec[] =
+  (["left", "right", "up", "down"] as const).flatMap(direction =>
+    [false, true].map(large => ({
+      id: selectionNudgeCommandId(direction, large),
+      title: `Nudge ${direction}${large ? " 10 units" : ""}`,
+      icon: "select" as const,
+      source: "core" as const,
+      shortcut: `${large ? "Shift+" : ""}Arrow${direction[0].toUpperCase()}${direction.slice(1)}`
+    })));
+
+export function isSelectionNudgeCommand(commandId: string): boolean {
+  return selectionNudgeActions.some(action => action.id === commandId);
+}
+
+export function createSelectionNudgeActions(hasSelection: boolean): CommandSpec[] {
+  return selectionNudgeActions.map(action => ({ ...action,
+    enabled: hasSelection,
+    disabledReason: hasSelection ? undefined : "Select objects or molecule parts to nudge"
+  }));
 }
 
 export function activateDocumentTabCommandId(id: string): string {
@@ -166,6 +211,20 @@ export const artToolsetId = "core.art";
 export const textToolsetId = "core.text";
 export const drawnStructureSettingsTemplateImportCommandId = "drawnStructureSettings.template.import";
 export const drawnStructureSettingsTemplateExportCommandId = "drawnStructureSettings.template.export";
+
+export function nativeStylePresetCommandId(presetId: NativeStylePresetId): string {
+  return `style.preset.apply.${presetId}`;
+}
+
+export const nativeStylePresetActions: CommandSpec[] = NativeStylePresets.map(preset => ({
+  id: nativeStylePresetCommandId(preset.id), title: preset.name,
+  icon: "style", source: "core", category: "object-style",
+  description: "Apply to selected molecules and text, or to the document and new-object defaults when nothing is selected"
+}));
+
+export function nativeStylePresetIdForCommand(commandId: string): NativeStylePresetId | undefined {
+  return NativeStylePresets.find(preset => nativeStylePresetCommandId(preset.id) === commandId)?.id;
+}
 export const artBooleanOperationCommandIds = {
   union: "art.boolean.union",
   subtract: "art.boolean.subtract",
@@ -216,6 +275,7 @@ export function fragmentSproutKindForCommand(commandId: string): FragmentSproutK
   return fragmentSproutCommands.find(([kind]) => fragmentSproutCommandId(kind) === commandId)?.[0];
 }
 
+// Hover actions take precedence over tool shortcuts while a target is under the pointer.
 // Case-sensitive keys must stay free of tool/command shortcuts in BOTH presets.
 // In particular, v selects in the default preset and j selects benzene in the alternate preset.
 export const fragmentAtomDrawingHotkeys: Readonly<Record<string, string>> = {
@@ -228,6 +288,7 @@ export const fragmentAtomDrawingHotkeys: Readonly<Record<string, string>> = {
 
 export const fragmentBondDrawingHotkeys: Readonly<Record<string, string>> = {
   g: "bond.fuseRingAtHoveredBond.cyclopropane",
+  u: "bond.fuseRingAtHoveredBond.cyclobutane",
   z: "bond.fuseDieneAtHoveredBond"
 };
 
@@ -282,7 +343,7 @@ export const editActions: CommandSpec[] = [
     icon: "ring",
     source: "core",
     category: "edit",
-    description: "Attach a benzene ring sharing the hovered atom"
+    description: "Attach a benzene ring at the hovered atom, using a phenyl bond if sharing a carbon vertex would exceed its valence"
   },
   {
     id: "atom.attachRingToHoveredAtom.cyclohexane",
@@ -330,7 +391,7 @@ export const editActions: CommandSpec[] = [
     icon: "bond",
     source: "core",
     category: "edit",
-    description: "Grow two methyl groups, or attach isopropyl when carbon has fewer than two free valences"
+    description: "Add two methyls directly with two free carbon valences, or isopropyl through one bond with one; leave fully substituted carbon unchanged"
   },
   {
     id: "atom.addCyclicBondToHoveredAtom",
@@ -338,7 +399,7 @@ export const editActions: CommandSpec[] = [
     icon: "bond",
     source: "core",
     category: "edit",
-    description: "Grow a bond that keeps turning — repeated presses trace and close a ring"
+    description: "Grow a bond that keeps turning to close a ring, or continue a terminal alkyne in a straight line"
   },
   {
     id: "bond.fuseRingAtHoveredBond.benzene",
@@ -462,6 +523,14 @@ export const editActions: CommandSpec[] = [
     description: "Place a negative charge near the hovered atom"
   },
   {
+    id: "atom.addRadicalToHoveredAtom",
+    title: "Add Radical to Hovered Atom",
+    icon: "charge",
+    source: "core",
+    category: "edit",
+    description: "Place a radical dot near the hovered atom"
+  },
+  {
     id: "edit.deleteHoveredNativeTarget",
     title: "Delete Selection or Hovered Atom/Bond",
     icon: "select",
@@ -557,6 +626,7 @@ export const atomElementActions: CommandSpec[] = nativeHotkeyElements.map((eleme
 
 /** Opens the Preferences window (Spin 3D refinement mode, future app settings). */
 export const PREFERENCES_COMMAND_ID = "view.togglePreferences";
+export const KEYBOARD_PREFERENCES_COMMAND_ID = "view.openKeyboardPreferences";
 
 export const viewActions: CommandSpec[] = [
   {
@@ -1332,6 +1402,32 @@ export function moleculeStructureBondLengthForCommand(commandId: string): { valu
   return numberCommandValue(commandId, customMoleculeStructureBondLengthCommandPrefix, moleculeStructureNumberRanges.bondLengthPx);
 }
 
+export function objectWaveCommandId(setting: WaveSetting, value: number): string {
+  return `object.wave.${setting}:${canonicalCommandNumber(value)}`;
+}
+
+export function objectWaveForCommand(commandId: string): { setting: WaveSetting; value: number } | undefined {
+  for (const setting of Object.keys(waveSettingRanges) as WaveSetting[]) {
+    const range = waveSettingRanges[setting];
+    const parsed = numberCommandValue(commandId, `object.wave.${setting}:`, range);
+    if (parsed && Number.isInteger((parsed.value - range.min) / range.step) &&
+      commandId === objectWaveCommandId(setting, parsed.value)) return { setting, value: parsed.value };
+  }
+  return undefined;
+}
+
+/** Every slider step has its own registry command; the gallery omits these exhaustive values. */
+export const objectWaveCommands = (Object.keys(waveSettingRanges) as WaveSetting[]).flatMap(setting => {
+  const { min, max, step } = waveSettingRanges[setting];
+  return Array.from({ length: (max - min) / step + 1 }, (_, index) => {
+    const value = min + index * step;
+    return {
+      id: objectWaveCommandId(setting, value),
+      title: `Wave ${setting}: ${value}${setting === "smoothness" ? "%" : " px"}`
+    };
+  });
+});
+
 export function objectMarkerSizeCommandId(value: number): string {
   return `${customObjectMarkerSizeCommandPrefix}${canonicalCommandNumber(value)}`;
 }
@@ -1844,7 +1940,27 @@ export const textToolbarActions: CommandSpec[] = [
   ...textScriptCommands.map(({ id, title }) => ({ id, title, icon: "text", source: "core", category: "text" } satisfies CommandSpec))
 ];
 
+export function electronMarkStyleCommandId(property: "size" | "thickness", percent: number): string {
+  return `object.electronMark.${property}:${Math.max(0, Math.min(100, Math.round(percent)))}`;
+}
+
+export const electronMarkStyleCommands = (["size", "thickness"] as const).flatMap(property =>
+  Array.from({ length: 101 }, (_, percent) => ({
+    id: electronMarkStyleCommandId(property, percent),
+    property,
+    value: property === "size" ? 8 + percent : 0.5 + percent * 0.05,
+    title: `Electron mark ${property} ${property === "size" ? 8 + percent : (0.5 + percent * 0.05).toFixed(2)} px`,
+    icon: "style" as const,
+    source: "core" as const,
+    category: "object-style"
+  }))
+);
+
 export const objectStyleActions: CommandSpec[] = [
+  ...objectWaveCommands.map(({ id, title }) => ({
+    id, title, icon: "style", source: "core", category: "object-style"
+  } satisfies CommandSpec)),
+  ...electronMarkStyleCommands,
   ...objectStyleTargetCommands.map(({ id, title }) => ({
     id,
     title,
@@ -2021,7 +2137,13 @@ export function createOpenWarningsAction(availability: CommandAvailability = {})
   };
 }
 
-export function createLayerActions(document: ChemDraftDocument, layoutsEnabled = loadCompoundLayoutSettings().enabled): CommandSpec[] {
+export function createLayerActions(document: ChemDraftDocument, layoutsEnabled = loadCompoundLayoutSettings().enabled,
+  settings: CompoundLayoutSettings = loadCompoundLayoutSettings()): CommandSpec[] {
+  const arrowPage = document.pages.find(page => page.id === document.selection.pageId) ?? document.pages[0];
+  const arrow = document.selection.objectIds.length === 1 ? arrowPage.objects.find(object => object.id === document.selection.objectIds[0]) : undefined;
+  const parent = arrow?.type === "text" && arrow.arrowAttachment?.kind === "conditions"
+    ? arrowPage.objects.find(object => object.id === arrow.arrowAttachment!.parentObjectId) : arrow;
+  const hasArrow = !!parent && !!arrowAttachmentFrame(arrowPage, parent);
   const hasSelection = document.selection.objectIds.length > 0;
   const hasMultiSelection = document.selection.objectIds.length >= 2;
   const hasDistributableSelection = document.selection.objectIds.length >= 3;
@@ -2029,6 +2151,9 @@ export function createLayerActions(document: ChemDraftDocument, layoutsEnabled =
   const hasArrangementSelection = selectedArrangementObjectIds(document).length >= 2;
   const hasBooleanSelection = selectedArtBooleanEligibleObjectIds(document).length >= 2;
   return [
+    { id: "arrow.conditions", title: "Reaction conditions…", icon: "export", source: "core", category: "layout",
+      enabled: hasArrow && !compoundLayoutCommandDisabledReason("arrow.conditions", { ...settings, enabled: layoutsEnabled }),
+      disabledReason: compoundLayoutCommandDisabledReason("arrow.conditions", { ...settings, enabled: layoutsEnabled }) ?? (hasArrow ? undefined : "Select one arrow") },
     { id: "layout.adjustArrangementSpacing", title: "Adjust arrangement spacing…", icon: "align", source: "core", category: "layout",
       enabled: layoutsEnabled && hasArrangementSelection, disabledReason: layoutsEnabled ? "Select at least two objects or groups" : "Enable Compound layout tools in Settings" },
     ...ArrangementLayouts.flatMap((layout) => (layout === "grid" ? ArrangementGridAlignments : ["center"] as const).map((gridAlignment): CommandSpec => ({
@@ -2257,13 +2382,13 @@ export function createLayerActions(document: ChemDraftDocument, layoutsEnabled =
     },
     {
       id: "layout.rotate90",
-      title: "Rotate 90 Degrees",
+      title: "Rotate 90° Clockwise",
       icon: "align",
       assetName: "Custom_Rotation",
       source: "core",
       category: "layout",
       enabled: hasSelection,
-      description: "Rotate the selected document objects 90 degrees around the selection center"
+      description: "Rotate the selected document objects 90 degrees clockwise around the selection center"
     },
     {
       id: "layout.duplicate",
@@ -2352,13 +2477,21 @@ export function allShellCommands(
 ): CommandSpec[] {
   const registry = options.registry ?? desktopToolsetRegistry;
   return dedupeCommands([
+    ...createSelectionNudgeActions(document.selection.objectIds.length > 0 || options.availability?.hasMoleculeFragmentSelection === true),
+    ...atomProblemCommands(document).map(command => command.spec),
+    ...createCustomSwatchActions(options.customSwatches ?? loadCustomSwatches(), document.selection.objectIds.length > 0 || options.availability?.hasMoleculeFragmentSelection === true),
     ...createTableCommands(document, options.activeTableCell),
+    ...createBracketCommands(document),
     ...createQuickActions(document, selectedMolecule, options.availability),
-    ...createLayerActions(document, options.compoundLayoutsEnabled),
+    ...createLayerActions(document, options.compoundLayoutsEnabled, options.compoundLayoutSettings),
     // Generated launchers must beat a persisted toolbar occurrence under first-wins dedupe. The
     // latter may carry the title from before a user/plugin toolbar was renamed.
     ...getToolsetToggleActions(registry),
-    ...allPaletteCommands(registry),
+    ...structureSearchCommands(
+      options.structureSearchEnabled ?? loadStructureSearchEnabled(),
+      options.hasSearchableStructure ?? structureSearchDocument(document) !== undefined
+    ),
+    ...(options.paletteCommands ?? allPaletteCommands()),
     ...copyAsActions,
     ...editActions,
     ...atomElementActions,
@@ -2371,8 +2504,23 @@ export function allShellCommands(
     ...pageOrientationActions,
     ...textToolbarActions,
     ...objectStyleActions,
-    ...toolbarCustomizationActions
+    ...nativeStylePresetActions,
+    ...toolbarCustomizationActions,
+    vibeCodeStarterCommand
   ]);
+}
+
+/** Finite value-encoded family. Only the two-slot widgets are offered by the toolbar gallery. */
+export function createCustomSwatchActions(state: CustomSwatchState, hasSelection: boolean): CommandSpec[] {
+  return allCustomSwatchCommandIds().map(id => {
+    const { swatch, slot, action } = parseCustomSwatchCommandId(id)!;
+    const color = state[swatch][`slot${slot}`];
+    const disabledReason = action === "apply" ? !color ? "Set this custom color first" : !hasSelection ? "Select an object to change its color" : undefined
+      : action === "clear" && !color ? "This custom color is empty" : undefined;
+    const verb = { apply: "Apply", edit: "Edit", clear: "Clear" }[action];
+    return { id, title: `${verb} Custom Color ${swatch}, Slot ${slot}${action === "edit" ? "…" : ""}`,
+      source: "core", icon: "style", category: "color", enabled: disabledReason === undefined, disabledReason };
+  });
 }
 
 function dedupeCommands(commands: CommandSpec[]): CommandSpec[] {

@@ -1,8 +1,11 @@
-import { ToolsetRegistry, applyToolsetLayoutState } from "@chemdraft/toolset-registry";
-import { desktopToolsets, type DesktopToolsetDefinition, type DesktopToolsetRegistry } from "../toolsets";
+import {
+  ToolsetRegistry,
+  isValidToolsetCommandId
+} from "@chemdraft/toolset-registry";
+import type { CommandDefinition } from "@chemdraft/plugin-host";
+import { allPaletteCommands, type CommandSpec } from "../commands";
+import { createDesktopToolsetRegistry, desktopToolsets, desktopToolsetRegistry, PLUGIN_COMMAND_WITHOUT_HANDLER, type DesktopToolsetDefinition, type DesktopToolsetRegistry } from "../toolsets";
 import { SHELL_COMMAND_IDS } from "../shellCommandIds";
-import type { IconName } from "../icons";
-import type { ToolbarAssetName } from "../toolbarAssets";
 
 /**
  * The data brain for toolbars: it composes the effective toolset set from three inputs —
@@ -19,7 +22,8 @@ export interface ToolbarCatalog {
   /** Core ∪ plugin toolsets BEFORE the user's layout state — what the Customize editor re-applies its
    *  draft on top of. */
   baseToolsets(): readonly DesktopToolsetDefinition[];
-  setPluginToolsets(toolsets: readonly DesktopToolsetDefinition[]): void;
+  baseCommands(): readonly CommandSpec[];
+  setPluginToolsets(toolsets: readonly DesktopToolsetDefinition[], commandsWithHandlers?: readonly CommandDefinition[]): void;
   setLayoutState(state: unknown): void;
   warnings(): readonly string[];
   onDidChange(listener: () => void): () => void;
@@ -27,46 +31,61 @@ export interface ToolbarCatalog {
 
 export function createToolbarCatalog(): ToolbarCatalog {
   let pluginToolsets: readonly DesktopToolsetDefinition[] = [];
+  let baseCommands = allPaletteCommands(desktopToolsetRegistry);
+  let additionalCommandIds = SHELL_COMMAND_IDS;
   let layoutState: unknown;
   let warningList: readonly string[] = [];
   const listeners = new Set<() => void>();
 
-  const build = (): DesktopToolsetRegistry => {
-    const combined = [...desktopToolsets, ...pluginToolsets];
-    if (layoutState === undefined || layoutState === null) {
-      warningList = [];
-      return new ToolsetRegistry<IconName, ToolbarAssetName>(combined);
-    }
-
+  const build = (state: unknown): DesktopToolsetRegistry => {
     const warnings: string[] = [];
-    const applied = applyToolsetLayoutState<IconName, ToolbarAssetName>(combined, layoutState, {
-      // In-place customize can add any shell command, not just manifest ones — treat the whole
-      // catalog as valid so those additions aren't pruned as "unknown" on render.
-      additionalCommandIds: SHELL_COMMAND_IDS,
-      onUnknownCommand: "prune",
-      onWarning: (warning) => warnings.push(warning)
+    const registry = createDesktopToolsetRegistry(state, additionalCommandIds, pluginToolsets, warning => {
+      warnings.push(warning);
+      console.warn(warning);
     });
     warningList = warnings;
-    return new ToolsetRegistry<IconName, ToolbarAssetName>(applied);
+    return registry;
   };
 
-  let snapshot = build();
+  let snapshot = build(layoutState);
 
-  const rebuild = () => {
-    snapshot = build();
+  const rebuild = (state: unknown) => {
+    snapshot = build(state);
+    layoutState = state;
     listeners.forEach((listener) => listener());
   };
 
   return {
     registry: () => snapshot,
     baseToolsets: () => [...desktopToolsets, ...pluginToolsets],
-    setPluginToolsets(toolsets) {
+    baseCommands: () => baseCommands,
+    setPluginToolsets(toolsets, commandsWithHandlers = []) {
       pluginToolsets = [...toolsets];
-      rebuild();
+      const paletteCommands = allPaletteCommands(new ToolsetRegistry([...desktopToolsets, ...pluginToolsets]));
+      const commandsById = new Map(paletteCommands.map(command => [command.id, command]));
+      const pluginCommands = commandsWithHandlers.filter(command => command.source === "plugin" && isValidToolsetCommandId(command.id));
+      const pluginCommandIds = new Set(pluginCommands.map(command => command.id));
+      for (const command of paletteCommands) {
+        if (command.source === "plugin" && !pluginCommandIds.has(command.id)) {
+          commandsById.set(command.id, { ...command, enabled: false, disabledReason: PLUGIN_COMMAND_WITHOUT_HANDLER });
+        }
+      }
+      for (const command of pluginCommands) {
+        const presentation = commandsById.get(command.id);
+        commandsById.set(command.id, {
+          ...command,
+          ...presentation,
+          icon: presentation?.icon ?? "plugin",
+          enabled: command.enabled,
+          disabledReason: command.enabled === false ? presentation?.disabledReason ?? "Plugin command unavailable" : undefined
+        });
+      }
+      baseCommands = [...commandsById.values()];
+      additionalCommandIds = new Set([...SHELL_COMMAND_IDS, ...pluginCommandIds]);
+      rebuild(layoutState);
     },
     setLayoutState(state) {
-      layoutState = state;
-      rebuild();
+      rebuild(state);
     },
     warnings: () => warningList,
     onDidChange(listener) {

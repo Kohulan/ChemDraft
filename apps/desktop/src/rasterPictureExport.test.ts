@@ -8,7 +8,8 @@ import { rasterPicturePlaceholderHref } from "./rasterPictureDecode";
 import { picturePngBase64, pictureSvg } from "./testSupport/imageFixture";
 
 const native = vi.hoisted(() => ({ invoke: vi.fn() }));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: native.invoke }));
+vi.mock("@tauri-apps/api/core", async original => ({
+  ...await original<typeof import("@tauri-apps/api/core")>(), invoke: native.invoke }));
 vi.mock("./window-manager", async original => ({
   ...await original<typeof import("./window-manager")>(), isDesktopRuntime: () => true
 }));
@@ -93,6 +94,13 @@ describe("picture page raster requests", () => {
     expect(request.pictures).toEqual([{ id: image.getAttribute("id"), refused: "decodeFailed" }]);
     expect(image.getAttribute("href")).toBe(rasterPicturePlaceholderHref(1, 1, image.getAttribute("id") ?? ""));
     expect(request.svg).not.toContain(picturePngBase64);
+  });
+
+  it("forwards the PNG byte budget to the encoder and surfaces its refusal", async () => {
+    native.invoke.mockRejectedValueOnce("PNG output exceeds the requested byte limit.");
+    await expect(rasterizeSvgNative('<svg xmlns="http://www.w3.org/2000/svg"/>', "png", { maxPngBytes: 1024 }))
+      .rejects.toThrow("PNG output exceeds the requested byte limit.");
+    expect(native.invoke).toHaveBeenLastCalledWith("rasterize_svg", { request: expect.objectContaining({ maxPngBytes: 1024 }) });
   });
 
   it("decodes pictures for every caller of the native rasterizer, including Copy as PNG and plugin renders", async () => {

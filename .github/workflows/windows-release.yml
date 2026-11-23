@@ -42,11 +42,12 @@ jobs:
       run:
         shell: pwsh
     outputs:
+      commit: ${{ steps.bundle.outputs.commit }}
       version: ${{ steps.bundle.outputs.version }}
       authenticode_signed: ${{ steps.authenticode.outputs.signed || 'false' }}
       updater_signed: ${{ steps.updater.outputs.signed || 'false' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
@@ -85,19 +86,19 @@ jobs:
           }
           Write-Host "Release source: $sha"
 
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       # rust-toolchain.toml is the same single source of truth as the CI Windows job.
       - run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: apps/desktop/src-tauri
           shared-key: windows-release
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
         with:
           distribution: temurin
           java-version: '21' # jlink --compress=zip-9 requires JDK 21+.
@@ -105,8 +106,9 @@ jobs:
         run: node scripts/build-opsin-runtime.mjs
 
       - name: Generate all-users offline installer config
+        # Outside the checkout: record-build refuses a source tree with untracked files.
         run: |
-          node scripts/windows-offline-installer.mjs config apps/desktop/src-tauri/ci-offline.conf.json
+          node scripts/windows-offline-installer.mjs config "$env:RUNNER_TEMP/ci-offline.conf.json"
           if ($LASTEXITCODE -ne 0) { throw 'Offline installer config generation failed.' }
 
       - name: Build, verify and stage stable NSIS installers without updater signing
@@ -114,15 +116,19 @@ jobs:
         env:
           CHEMDRAFT_STABLE_BUILD: '1'
           CHEMDRAFT_SKIP_UPDATER_SIGNING: '1'
+          NODE_OPTIONS: --max-old-space-size=6144  # 16 GB runner; build:web peaks near 4.8 GB (see ci.yml)
         run: |
           # Add future variants here; build/rename, signing and upload share this list.
           $variants = @(
             @{ Suffix = ''; Config = ''; Feed = 'latest.json' },
             @{ Suffix = '-allusers'; Config = 'src-tauri/tauri.allusers.conf.json'; Feed = 'latest-allusers.json' },
-            @{ Suffix = '-allusers-offline'; Config = @('src-tauri/tauri.allusers.conf.json', 'src-tauri/ci-offline.conf.json'); Feed = '' }
+            @{ Suffix = '-allusers-offline'; Config = @('src-tauri/tauri.allusers.conf.json', "$env:RUNNER_TEMP/ci-offline.conf.json"); Feed = '' }
           )
           $bundleDir = 'apps/desktop/src-tauri/target/release/bundle/nsis'
-          New-Item -ItemType Directory -Path release-assets | Out-Null
+          # record-build resolves git rev-parse HEAD in this checkout and refuses a dirty tree, so
+          # stage every installer and its record outside the checkout until all variants are built.
+          $staging = Join-Path $env:RUNNER_TEMP 'windows-installers'
+          New-Item -ItemType Directory -Path $staging -Force | Out-Null
           $artifacts = @()
           foreach ($variant in $variants) {
             # Tauri gives each variant the same original filename. Stage it before the next build.
@@ -133,6 +139,9 @@ jobs:
             }
             pnpm @buildArgs
             if ($LASTEXITCODE -ne 0) { throw "NSIS build failed for suffix '$($variant.Suffix)'." }
+            # tauri-build copies resource targets beside the release executable, which NSIS bundles.
+            node tools/release/verify-bundle-licenses.mjs apps/desktop/src-tauri/target/release
+            if ($LASTEXITCODE -ne 0) { throw 'Required bundled licences are missing from the release resource staging directory.' }
             $config = Get-Content apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
             $windows = Get-Content apps/desktop/src-tauri/tauri.windows.conf.json -Raw | ConvertFrom-Json
             $identifier = if ($windows.identifier) { $windows.identifier } else { $config.identifier }
@@ -153,24 +162,39 @@ jobs:
             if ($installers.Count -ne 1 -or $installers[0].Name -cne $original) { throw 'Expected exactly one stable x64 installer per variant.' }
             if (Get-ChildItem "$bundleDir/*.sig") { throw 'Updater signing ran before Authenticode.' }
             $expected = "ChemDraft_$($config.version)_x64$($variant.Suffix)-setup.exe"
-            Copy-Item -LiteralPath $installers[0].FullName -Destination (Join-Path release-assets $expected)
+            $staged = Join-Path $staging $expected
+            Copy-Item -LiteralPath $installers[0].FullName -Destination $staged
+            node tools/release/record-build.mjs --artifact $staged --target x86_64-pc-windows-msvc
+            if ($LASTEXITCODE -ne 0) { throw "Release build record failed for $expected." }
             $artifacts += @{ Installer = $expected; Feed = $variant.Feed }
             Write-Host "Verified identifier=$identifier; product=$product; worktree label=<empty>; frontend commit=$shortSha; installer=$expected"
           }
+          # Create the untracked release-assets staging directory only after every record is written.
+          New-Item -ItemType Directory -Path release-assets | Out-Null
+          foreach ($artifact in $artifacts) {
+            $staged = Join-Path $staging $artifact.Installer
+            Copy-Item -LiteralPath $staged -Destination (Join-Path release-assets $artifact.Installer)
+            Copy-Item -LiteralPath "$staged.build.json" -Destination release-assets
+          }
           "version=$($config.version)" >> $env:GITHUB_OUTPUT
+          "commit=$((git rev-parse HEAD).Trim())" >> $env:GITHUB_OUTPUT
           "installers=$(ConvertTo-Json -InputObject $artifacts -Compress)" >> $env:GITHUB_OUTPUT
 
       # Signing secrets are step-scoped: no setup/cache/artifact action receives them.
       - name: Check signing availability
         id: signing
         env:
+          AUTHENTICODE_SIGNING: ${{ vars.AUTHENTICODE_SIGNING }}
           SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
           SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
           SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
         run: |
-          if ($env:SIGNPATH_API_TOKEN) {
+          if ($env:AUTHENTICODE_SIGNING -eq 'off') {
+            'authenticode=false' >> $env:GITHUB_OUTPUT
+            Write-Host '::warning::AUTHENTICODE_SIGNING is off. Skipping Authenticode; the installer is unsigned.'
+          } elseif ($env:SIGNPATH_API_TOKEN) {
             if (-not $env:SIGNPATH_ORGANIZATION_ID -or -not $env:SIGNPATH_PROJECT_SLUG -or -not $env:SIGNPATH_SIGNING_POLICY_SLUG) {
               throw 'SignPath token is set but required SignPath repository variables are missing.'
             }
@@ -186,16 +210,18 @@ jobs:
 
       - name: Upload unsigned installers for SignPath provenance
         id: unsigned
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-nsis-unsigned
-          path: release-assets/*.exe
+          path: |
+            release-assets/*.exe
+            release-assets/*.exe.build.json
           if-no-files-found: error
 
       - name: Authenticode-sign and download final installers
         if: steps.signing.outputs.authenticode == 'true'
         # https://github.com/SignPath/github-action-submit-signing-request/releases/tag/v2
-        uses: signpath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627 # v2
+        uses: signpath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627 # v2.3
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
@@ -214,7 +240,8 @@ jobs:
           INSTALLERS: ${{ steps.bundle.outputs.installers }}
         run: |
           $installers = @($env:INSTALLERS | ConvertFrom-Json)
-          $signed = @(Get-ChildItem signpath-signed -Recurse -File)
+          # Keep source identity; each final-byte record is rebound after signing below.
+          $signed = @(Get-ChildItem signpath-signed -Recurse -File | Where-Object { $_.Name -notlike '*.build.json' })
           if ($signed.Count -ne $installers.Count) { throw 'SignPath must return exactly the expected installers.' }
           if ([string]::IsNullOrWhiteSpace($env:EXPECTED_AUTHENTICODE_SUBJECT)) {
             throw 'EXPECTED_AUTHENTICODE_SUBJECT repository variable is required when Authenticode signing runs. Set it to the expected signer certificate subject substring.'
@@ -276,16 +303,29 @@ jobs:
           node scripts/windows-offline-installer.mjs check release-assets
           if ($LASTEXITCODE -ne 0) { throw 'Offline updater artifact check failed.' }
 
-      - name: Print SHA-256 and sizes and write checksums
+      - name: Bind build records to final signed installer bytes
+        env:
+          INSTALLERS: ${{ steps.bundle.outputs.installers }}
         run: |
-          $checksums = @(Get-ChildItem release-assets -File | Sort-Object Name | ForEach-Object {
+          foreach ($artifact in ($env:INSTALLERS | ConvertFrom-Json)) {
+            $installer = Join-Path release-assets $artifact.Installer
+            $recordPath = "$installer.build.json"
+            $record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+            $record.sha256 = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+            $record.size = (Get-Item -LiteralPath $installer).Length
+            $record | ConvertTo-Json | Set-Content -LiteralPath $recordPath -Encoding utf8NoBOM
+          }
+
+      - name: Print SHA-256 and sizes and write LF checksums
+        run: |
+          Get-ChildItem release-assets -File | Where-Object Name -ne 'SHA256SUMS.txt' | Sort-Object Name | ForEach-Object {
             $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
             Write-Host "$hash  $($_.Length) bytes  $($_.Name)"
-            "$hash  $($_.Name)"
-          })
-          $checksums | Set-Content -Encoding utf8NoBOM release-assets/SHA256SUMS.txt
+          }
+          node tools/release/release-checksums.mjs --assets release-assets
+          if ($LASTEXITCODE -ne 0) { throw 'Release checksum generation failed.' }
       - name: Upload final release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-release
           path: release-assets/*
@@ -295,27 +335,40 @@ jobs:
     needs: build
     if: github.repository == 'jgassens/ChemDraft' && !github.event.repository.fork && inputs.upload_to_release != ''
     runs-on: windows-latest
+    concurrency:
+      group: draft-release-upload-${{ inputs.upload_to_release }}
+      cancel-in-progress: false
     permissions:
-      contents: write # Only this job can upload release assets; no source code executes here.
+      contents: write # Upload and validate draft assets here; all other jobs stay read-only.
       actions: read
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.build.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
       - name: Require verified signatures before release upload
         shell: pwsh
         env:
+          AUTHENTICODE_SIGNING: ${{ vars.AUTHENTICODE_SIGNING }}
           AUTHENTICODE_SIGNED: ${{ needs.build.outputs.authenticode_signed }}
           UPDATER_SIGNED: ${{ needs.build.outputs.updater_signed }}
           ALLOW_UNSIGNED_UPLOAD: ${{ inputs.allow_unsigned_upload }}
         run: |
-          if ($env:AUTHENTICODE_SIGNED -ne 'true' -or $env:UPDATER_SIGNED -ne 'true') {
+          if ($env:UPDATER_SIGNED -ne 'true' -or ($env:AUTHENTICODE_SIGNING -ne 'off' -and $env:AUTHENTICODE_SIGNED -ne 'true')) {
             if ($env:ALLOW_UNSIGNED_UPLOAD -ne 'true') {
-              throw 'Refusing release upload: both Authenticode and updater signatures must be verified. Use allow_unsigned_upload only for an explicit unsigned dry run.'
+              throw 'Refusing release upload: the updater signature must be verified, and Authenticode must be verified unless AUTHENTICODE_SIGNING is off. Use allow_unsigned_upload only for an explicit unsigned dry run.'
             }
             Write-Host '::warning::UNSIGNED RELEASE UPLOAD OVERRIDE: one or both signatures are missing. These artifacts must not be published as a signed production update.'
           }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: windows-release
           path: release-assets
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          token: ''
       - name: Upload only to an existing draft release
         shell: pwsh
         env:
@@ -323,12 +376,36 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.upload_to_release }}
           VERSION: ${{ needs.build.outputs.version }}
+          BUILD_COMMIT: ${{ needs.build.outputs.commit }}
         run: |
           if ($env:RELEASE_TAG -cne "v$env:VERSION") { throw 'Release tag must match the installer version.' }
+          # Fetch the destination tag immediately before upload, and peel annotated tags.
+          git fetch --no-tags origin "+refs/tags/$($env:RELEASE_TAG):refs/tags/$($env:RELEASE_TAG)"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot fetch destination release tag.' }
+          $destinationCommit = git rev-parse --verify "refs/tags/$($env:RELEASE_TAG)^{commit}"
+          if ($LASTEXITCODE -ne 0 -or $destinationCommit.Trim() -cne $env:BUILD_COMMIT) { throw 'Destination release tag does not match the built commit.' }
           $releaseJson = gh release view $env:RELEASE_TAG --json isDraft,tagName
           if ($LASTEXITCODE -ne 0) { throw 'Target release must already exist.' }
           $release = $releaseJson | ConvertFrom-Json
           if ($release.isDraft -ne $true -or $release.tagName -cne $env:RELEASE_TAG) { throw 'Refusing to upload to a published release.' }
-          $assets = @(Get-ChildItem release-assets -File | ForEach-Object { $_.FullName })
+          node tools/release/release-checksums.mjs --assets release-assets --verify
+          if ($LASTEXITCODE -ne 0) { throw 'Staged Windows checksum verification failed.' }
+          # The artifact's sums cover only Windows. Never upload them over combined release sums.
+          $assets = @(Get-ChildItem release-assets -File | Where-Object Name -ne 'SHA256SUMS.txt' | ForEach-Object { $_.FullName })
           gh release upload $env:RELEASE_TAG @assets --clobber
           if ($LASTEXITCODE -ne 0) { throw 'Release asset upload failed.' }
+
+      - name: Refresh combined checksums and check all attached release builds when complete
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.upload_to_release }}
+          BUILD_COMMIT: ${{ needs.build.outputs.commit }}
+        # Draft assets need this upload job's token. A Windows-only result is not a publishing pass.
+        run: |
+          # Recompute from every attached file so Mac-first uploads and Windows reruns retain coverage.
+          node tools/release/release-checksums.mjs --tag "$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { throw 'Combined release checksum upload failed.' }
+          node tools/release/check-release-assets.mjs --tag "$env:RELEASE_TAG" --commit "$env:BUILD_COMMIT" --allow-incomplete --skip-dmg-provenance
+          if ($LASTEXITCODE -ne 0) { throw 'Release asset validation failed.' }

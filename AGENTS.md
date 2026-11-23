@@ -7,9 +7,9 @@ agent and human contributor, on every branch. It is repo-wide: scope for one sli
 
 ## 1. Both platforms, every change
 
-**ChemDraft ships for macOS and Windows together, from the same commit, under one version number.**
-Every code change must work on both. A change that works on one platform is not finished, and "the
-other platform is a follow-up" is not an acceptable state to merge.
+**ChemDraft ships macOS Apple silicon, macOS Intel, and Windows x64 builds together, from the same commit, under one version number.**
+Every code change must work on all three. A change that works on only one build is not finished, and
+"the other builds are a follow-up" is not an acceptable state to merge.
 
 - **Shared code by default.** Branch on the platform only where the operating system forces it, and
   write both sides in the same change. Rust: every `#[cfg(target_os = "macos")]` gets its
@@ -47,10 +47,11 @@ other platform is a follow-up" is not an acceptable state to merge.
   serving, check it on both platforms. If you can run only one, the report must name the other as
   unverified and say exactly what needs checking there. Never report a platform as verified that you
   did not run.
-- **Releases** are joint: the macOS DMG and the per-user and all-users Windows NSIS installers are
-  built from the same commit, the GitHub release body has `## macOS` and `## Windows` sections, and
-  neither platform gets a version the other does not. See `docs/releasing/`. Both Windows installers
-  are built only by `.github/workflows/windows-release.yml` on a GitHub-hosted runner (owner rule,
+- **Releases** are joint: the Apple-silicon DMG, Intel DMG, and the per-user and all-users Windows NSIS
+  installers (the all-users one also as offline media carrying WebView2) are built from the same commit
+  and version. The GitHub release body has `## macOS (Apple silicon)`, `## macOS (Intel)`, and
+  `## Windows` sections. See `docs/releasing/`. The Windows installers are
+  built only by `.github/workflows/windows-release.yml` on a GitHub-hosted runner (owner rule,
   2026-10-22), never on a local machine or VM; the Windows session tests the installers CI built.
 
 ## 2. Orientation
@@ -104,7 +105,11 @@ A plugin imports **only `@chemdraft/plugin-api`** (plus ordinary npm packages), 
 menus, panels, toolbar buttons, inspectors, templates, importers, exporters, analyzers, transformers,
 and recognizers.
 
-`PluginApiVersion` is `0.1.20`. For a 0.x version the minor is the compatibility boundary, so additive
+`PluginApiVersion` is `0.1.26`. API 0.1.20 added `tableStyle.autoColumnMinEm`; 0.1.21 adds
+plugin chemistry properties and plugin assistant tools; 0.1.22 adds name-to-structure result
+source and dictionary match provenance; 0.1.23 adds native wavy single bonds;
+0.1.24 adds reaction schemes and binary CDX; 0.1.25 adds bracketed groups, and 0.1.26 adds
+request-bound tools and depiction. For a 0.x version the minor is the compatibility boundary, so additive
 methods bump the patch and a plugin declares the caret version it needs. Record each bump in the
 `plugin-api` header comment and `AUTHORING.md`.
 
@@ -147,13 +152,13 @@ Naming: commands `plugin.<pluginName>.<action>` (schema-enforced for toolset con
 
 ### 4.4 Writing to the document
 
-Plugins mutate documents only through patches. A plugin with `document.write` calls
-`documents.applyPatch` only while one of its own commands is running. It may insert objects, and may
-change or remove only objects selected when that command started plus objects it inserted during
-that command. Writes land directly, leaving what changed selected. The assistant transaction groups
-writes into one labelled undo entry per AI request; for other plugins, each `documents.applyPatch`
-call creates its own labelled undo entry (including a batch patch). Undo and redo restore recorded
-states exactly; they never re-run a plugin or an AI. **Proposal review** stays mandatory for image recognition
+Plugins mutate documents only through patches. An ordinary command with `document.write` may change
+or remove objects selected when it started and objects it inserted. Each ordinary write creates one
+labelled undo entry, including a batch patch. A request-bound write uses the document instance and
+selection captured at Send, plus objects already inserted by that request. The host verifies
+chemistry before committing and records one labelled undo entry per request with writes. The
+legacy assistant transaction keeps its existing history behavior. Writes land directly and select
+what changed. Undo and redo restore recorded states exactly. **Proposal review** stays mandatory for image recognition
 results (MolScribe); other plugin writes need no review window. Reports are for failures; success
 needs no window.
 
@@ -171,18 +176,18 @@ commit checkpoints or present a recognition as certain.
 ### 4.6 NMR claims (absolute)
 
 The shipped backend is the OCL-native provider: HOSE-fragment lookup over statistics from NMRShiftDB2
-experimental assignments. Never describe it as fixture-backed or synthetic (fixtures are test-only
-and labelled synthetic). Accuracy figures stay checksum-gated to the benchmarked corpus. ¹H
+assignments (the database does not mark which are experimental). Never describe it as fixture-backed
+or synthetic (fixtures are test-only and labelled synthetic). Accuracy figures stay checksum-gated to the benchmarked corpus. ¹H
 multiplicity and J are first-order estimates, labelled so. Stick height is equivalent nuclei, not
 integration; lineshape and field are simulation parameters. Never fabricate a shift for an unmatched
-environment; partial results carry warnings. No calibrated confidence percentages, only honest tiers.
+environment; partial results carry warnings. Rule-based estimates are allowed only when visibly labelled as estimates, per owner 2026-11-09. No calibrated confidence percentages, only honest tiers.
 
 ### 4.7 Licensing and redistribution
 
 - The core is **Apache-2.0**; example plugins and the two SDK packages are MIT. Changing either is the
   owner's call. `NOTICE` ships with every distribution; a new vendored binary adds its row there and
-  in `docs/architecture/dependency-inventory.md` in the same change (InChI 1.07.3 terms are still
-  unconfirmed and block public redistribution).
+  in `docs/architecture/dependency-inventory.md` in the same change (InChI 1.07.5 is MIT
+  (owner-approved 2026-11-10); InChI 1.07.3 is MIT, (c) 2024 InChI Project (verified 2026-11-21)).
 - **Code licence and data licence are separate claims.** A plugin bundling data declares its code
   `license` and a `dataLicenses` entry per dataset; `tools/plugin-extract/gates.ts` refuses a dataset
   covered by a code licence alone. The NMR predictor's database carries nmrshiftdb2's ODbL-derived
@@ -390,7 +395,7 @@ surface, and never replace it with a slice-scoped one.
 
 ## 15. Builds, launching, and the stable app
 
-- **Launch from this worktree.** macOS: `./run-app` (packaged build) or `./run-app --dev` (Tauri plus
+- **Launch from this worktree.** macOS Apple silicon: `./run-app` (packaged build); macOS Intel: `./run-app -t x86_64-apple-darwin`; macOS development: `./run-app --dev` (Tauri plus
   Vite hot reload). Windows: `pnpm dev`, or `pnpm --filter @chemdraft/desktop build --bundles nsis`
   for an installer. An app that was already running, or `cargo run`, is not proof. Stop other
   instances from the same checkout first, and report the exact command and the success signal

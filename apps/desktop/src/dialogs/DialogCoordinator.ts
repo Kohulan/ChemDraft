@@ -1,11 +1,19 @@
+import { aboutCommand } from "../about/aboutCommand";
+import { TOUR_TITLE, type TourAction, type TourPluginCommand } from "../tour/tourCommands";
+import type { KeybindingScheme } from "../keybindingSettings";
 import { VIBE_CODE_GUIDE } from "./vibeCodeGuideText";
-import { dialogEnvelope, parseDialogMessage, validateDialogDelivery, type DialogCloseReason, type DialogMessage, type DialogRegistration, type PageSize, type SpacingSnapshot, type ExportDialogResult, SPACING_PREVIEW_CHUNK_SIZE, SPACING_PREVIEW_MAX_CHUNKS } from "./dialogProtocol";
+import type { ConditionsSnapshot } from "./dialogProtocol";
+import type { ReactionConditionsDraft } from "@chemdraft/document-workflow-core";
+import { dialogEnvelope, parseDialogMessage, validateDialogDelivery, type DialogCloseReason, type DialogEnvelope, type DialogMessage, type DialogRegistration, type PageSize, type SpacingSnapshot, type ExportDialogResult, PAGE_ENLARGEMENT_TITLE, boundedPluginTextPromptSnapshot, type PluginTextPromptSnapshot, SPACING_PREVIEW_CHUNK_SIZE, SPACING_PREVIEW_MAX_CHUNKS } from "./dialogProtocol";
 import type { ExportOptions, ExportFrame, ExportPreviewResult } from "./exportOptions";
 import type { DialogDelivery, DialogTransport } from "./dialogTransport";
 import type { DialogKind, EngineInstallSnapshot, EngineInstallAction, ToolInstallSnapshot, ToolInstallAction } from "./dialogProtocol";
 import { perfHook, perfProbe, sendPerfCompletion } from "../perf/runtime";
 import type { InsertTableOptions } from "./dialogProtocol";
 import type { StructureTemplatesSnapshot } from "./dialogProtocol";
+import type { AtomProblemSnapshot, AtomProblemAction } from "./dialogProtocol";
+import type { CustomColorSnapshot } from "./dialogProtocol";
+import type { PageEnlargementDecision } from "../pageEnlargement";
 
 export interface EngineInstallPresenter {
   action(action: EngineInstallAction): void | Promise<void>;
@@ -15,6 +23,30 @@ export interface ToolInstallPresenter {
   action(action: ToolInstallAction): void | Promise<void>;
   closed(afterClose?: Promise<void>): void;
   failed?(error: unknown): void;
+}
+
+interface PageEnlargementQuestion {
+  signal?: AbortSignal;
+  resolve(decision: PageEnlargementDecision): void;
+  opening?: Promise<DialogRegistration>;
+  removeAbortListener?: () => void;
+}
+
+/** Mirrors the plugin API's PluginPromptTextResult without importing the plugin package here. */
+export type PluginTextPromptResult = { status: "submitted"; value: string } | { status: "cancelled" };
+/** Whether the question may be answered now, and the one line saying why not. */
+export type PluginTextPromptState = Pick<PluginTextPromptSnapshot, "statusLine" | "submitEnabled">;
+interface PluginTextPromptQuestion {
+  session?: Session;
+  signal?: AbortSignal;
+  resolve(result: PluginTextPromptResult): void;
+  value?: string;
+  opening?: Promise<DialogRegistration>;
+  removeAbortListener?: () => void;
+}
+
+function sessionKey({ documentTabId, dialogKind, sessionId }: DialogEnvelope): string {
+  return dialogKind === "pageEnlargement" || dialogKind === "pluginTextPrompt" ? `${documentTabId}:${dialogKind}:${sessionId}` : `${documentTabId}:${dialogKind}`;
 }
 
 interface Session {
@@ -34,24 +66,35 @@ interface Session {
   frameKey?: string;
   engineInstall?: EngineInstallPresenter;
   toolInstall?: ToolInstallPresenter;
+  pageEnlargement?: PageEnlargementQuestion;
+  pluginTextPrompt?: PluginTextPromptQuestion;
 }
 /** Document-owned authority. A future modal kind can acquire an input lease here; pageSize never does. */
 export class DialogCoordinator {
   private sessions = new Map<string, Session>();
   private subscription?: Promise<() => void>;
   private stopped = false;
+  private atomProblemOpening: Promise<void> = Promise.resolve();
   constructor(private transport: DialogTransport, private owner: {
     applyPageSize(tabId: string, size: PageSize): void | Promise<void>;
     insertTable?(tabId: string, options: InsertTableOptions): void | Promise<void>;
+    saveCustomColor?(snapshot: CustomColorSnapshot, hex: string): void | Promise<void>;
+    clearCustomColor?(snapshot: CustomColorSnapshot): void | Promise<void>;
     insertTemplate?(tabId: string, templateId: string): void | Promise<void>;
+    fixAtomProblem?(tabId: string, action: AtomProblemAction, targetVersion: number): void | Promise<void>;
+    applyReactionConditions?(tabId: string, arrowId: string, draft: ReactionConditionsDraft): void | Promise<void>;
+    onConditionsSettled?(tabId: string): void;
     applyArrangementSpacing?(tabId: string, percent: number): void | Promise<void>;
     previewArrangementSpacing?(tabId: string, percent: number): string | Promise<string>;
     onSpacingSettled?(tabId: string): void;
     export?(tabId: string, options: ExportOptions, live: () => boolean, progress: (notice: string) => Promise<void>): Promise<ExportDialogResult>;
     previewExport?(tabId: string, options: ExportOptions, live: () => boolean): Promise<ExportPreviewResult>;
     chooseExportDestination?(tabId: string, options: ExportOptions, live: () => boolean): Promise<ExportDialogResult>;
+    guidedTourAction?(action: TourAction): void | Promise<void>;
     vibeCodeGuideAction?(action: "saveStarter" | "openPluginManager"): void | Promise<void>;
     onError(message: string): void;
+    onPageEnlargementClosed?(tabId: string): void;
+    onPluginTextPromptClosed?(tabId: string): void;
     onSettled?(tabId: string, reason: DialogCloseReason, kind?: DialogKind): void;
   }, private options: { readyTimeoutMs?: number } = {}) {}
 
@@ -93,12 +136,86 @@ export class DialogCoordinator {
     return this.subscription ??= this.transport.subscribe(delivery => { void this.receive(delivery).catch(e => this.owner.onError(String(e))); })
       .catch(error => { this.subscription = undefined; throw error; });
   }
+  hasOpenDialog(): boolean { return this.sessions.size > 0; }
+
+  async openAbout(version: string, buildStamp: string): Promise<void> {
+    return this.open("about", "about", { title: aboutCommand.title, version, buildStamp });
+  }
+
+  /** `plugins` is the tour's plugin commands the menus offer now; the tour window has no plugin runtime of its own. */
+  async openGuidedTour(scheme: KeybindingScheme, automatic: boolean, plugins: readonly TourPluginCommand[] = []): Promise<void> {
+    return this.open("guidedTour", "guidedTour", { title: TOUR_TITLE, scheme, automatic, plugins: [...plugins] });
+  }
+
   async openVibeCodeGuide(): Promise<void> { return this.open("vibeCodeGuide", "vibeCodeGuide", { title: VIBE_CODE_GUIDE.title }); }
   async openPageSize(tabId: string, data: PageSize & { title: string }): Promise<void> {
     return this.open(tabId, "pageSize", data);
   }
+  confirmPageEnlargement(tabId: string, signal?: AbortSignal): Promise<PageEnlargementDecision> {
+    if (signal?.aborted) return Promise.resolve("keep");
+    return new Promise(resolve => {
+      void this.open(tabId, "pageEnlargement", { title: PAGE_ENLARGEMENT_TITLE }, undefined, undefined, undefined, { signal, resolve })
+        .catch(error => {
+          if (!signal?.aborted) this.owner.onError(`Page enlargement could not open: ${String(error)}`);
+          resolve(signal?.aborted ? "keep" : "unanswered");
+        });
+    });
+  }
+  /** Ask a plugin's one-line question in its own native window. Each call is an independent session;
+   * the request's signal closes the window and resolves as cancelled. `onOpen` receives the session's
+   * update function, which turns Submit on or off without touching the user's draft. */
+  promptPluginText(tabId: string, data: PluginTextPromptSnapshot, signal?: AbortSignal,
+    onOpen?: (update: (state: PluginTextPromptState) => Promise<void>) => void): Promise<PluginTextPromptResult> {
+    if (signal?.aborted) return Promise.resolve({ status: "cancelled" });
+    return new Promise(resolve => {
+      const question: PluginTextPromptQuestion = { signal, resolve };
+      onOpen?.(state => this.updatePluginTextPrompt(question, state));
+      void this.open(tabId, "pluginTextPrompt", boundedPluginTextPromptSnapshot(data), undefined, undefined, undefined, undefined, question)
+        .catch(error => {
+          if (!signal?.aborted) this.owner.onError(`${data.title} could not open: ${String(error)}`);
+          resolve({ status: "cancelled" });
+        });
+    });
+  }
+  private async updatePluginTextPrompt(question: PluginTextPromptQuestion, state: PluginTextPromptState): Promise<void> {
+    const session = question.session;
+    if (!session || session.settled || session.snapshot.dialogKind !== "pluginTextPrompt") return;
+    const { statusLine: _line, submitEnabled: _enabled, ...data } = session.snapshot.data;
+    const snapshot = { ...session.snapshot, data: boundedPluginTextPromptSnapshot({ ...data, ...state }) };
+    if (!parseDialogMessage(snapshot)) throw new Error("Invalid plugin question snapshot");
+    // Synchronously, so an answer arriving after this call is judged by the new state.
+    session.snapshot = snapshot;
+    if (session.registration) await this.transport.publish(session.registration.hostId, snapshot);
+  }
+  async openAtomProblem(tabId: string, data: AtomProblemSnapshot): Promise<void> {
+    // Serialize opens across tabs so concurrent commands cannot create two problem windows.
+    const opening = this.atomProblemOpening.then(async () => {
+      for (const session of this.sessions.values()) {
+        if (session.snapshot.dialogKind === "atomProblem" && session.snapshot.documentTabId !== tabId) await this.settle(session, "close");
+      }
+      await this.updateAtomProblem(tabId, data);
+      await this.open(tabId, "atomProblem", data);
+    });
+    this.atomProblemOpening = opening.catch(() => {});
+    return opening;
+  }
+  async updateAtomProblem(tabId: string, data: AtomProblemSnapshot): Promise<void> {
+    const session = this.sessions.get(`${tabId}:atomProblem`);
+    if (!session || session.settled || session.snapshot.dialogKind !== "atomProblem") return;
+    if (data.fixes.length === 0) { await this.settle(session, "close"); return; }
+    const snapshot = { ...session.snapshot, data };
+    if (!parseDialogMessage(snapshot)) throw new Error("Invalid atom problem snapshot");
+    session.snapshot = snapshot;
+    if (session.ready && session.registration) await this.transport.publish(session.registration.hostId, snapshot);
+  }
   async openInsertTable(tabId: string, data: InsertTableOptions & { title: string }): Promise<void> {
     return this.open(tabId, "insertTable", data);
+  }
+  async openCustomColor(tabId: string, data: CustomColorSnapshot): Promise<void> {
+    const existing = this.sessions.get(`${tabId}:customColor`);
+    if (existing?.snapshot.dialogKind === "customColor" &&
+        (existing.snapshot.data.swatch !== data.swatch || existing.snapshot.data.slot !== data.slot)) await this.settle(existing, "cancel");
+    return this.open(tabId, "customColor", data);
   }
   async openStructureTemplates(tabId: string, data: StructureTemplatesSnapshot): Promise<void> {
     return this.open(tabId, "structureTemplates", data);
@@ -140,37 +257,57 @@ export class DialogCoordinator {
     const session = this.sessions.get(`${tabId}:toolInstall`);
     if (session) await this.settle(session, "close");
   }
-  private async open(tabId: string, kind: DialogKind, data: Extract<DialogMessage, { type: "snapshot" }>["data"], engineInstall?: EngineInstallPresenter, toolInstall?: ToolInstallPresenter, afterClose?: Promise<void>): Promise<void> {
+  async openReactionConditions(tabId: string, data: ConditionsSnapshot): Promise<void> {
+    const existing = this.sessions.get(`${tabId}:reactionConditions`);
+    if (existing?.snapshot.dialogKind === "reactionConditions" && existing.snapshot.data.arrowId !== data.arrowId)
+      throw new Error("Finish the open Reaction conditions editor before editing another arrow in this drawing.");
+    return this.open(tabId, "reactionConditions", data);
+  }
+  private async open(tabId: string, kind: DialogKind, data: Extract<DialogMessage, { type: "snapshot" }>["data"], engineInstall?: EngineInstallPresenter, toolInstall?: ToolInstallPresenter, afterClose?: Promise<void>, pageEnlargement?: PageEnlargementQuestion, pluginTextPrompt?: PluginTextPromptQuestion): Promise<void> {
     if (this.stopped) throw new Error("The document window is closing");
-    const key = `${tabId}:${kind}`;
+    const snapshot: Session["snapshot"] = { protocolVersion: 1, ownerWindowId: "main", documentTabId: tabId,
+      dialogKind: kind, sessionId: crypto.randomUUID(), requestId: crypto.randomUUID(), snapshotRevision: 1, type: "snapshot", data } as Session["snapshot"];
+    const key = sessionKey(snapshot);
     const existing = this.sessions.get(key);
     if (existing) {
       // Reuse the retained snapshot and native window, preserving its local draft and position.
       const receipt = existing.terminalRequestId ? existing.receipts.get(existing.terminalRequestId) : undefined;
-      if (existing.registration && ((kind === "engineInstall" || kind === "toolInstall" || kind === "structureTemplates") || !existing.terminalRequestId || receipt?.type === "result" && receipt.data.status === "exported")) {
+      if (existing.registration && ((kind === "engineInstall" || kind === "toolInstall" || kind === "structureTemplates" || kind === "atomProblem") || !existing.terminalRequestId || receipt?.type === "result" && receipt.data.status === "exported")) {
         if (perfProbe) perfHook(() => perfProbe?.expectCompletion("dialog-open", existing.snapshot.sessionId));
         await this.transport.open(existing.snapshot);
         if (perfProbe) perfHook(() => sendPerfCompletion(existing.registration!.windowLabel, existing.snapshot.sessionId, "dialog-open"));
       }
       return;
     }
-    const snapshot: Session["snapshot"] = { protocolVersion: 1, ownerWindowId: "main", documentTabId: tabId,
-      dialogKind: kind, sessionId: crypto.randomUUID(), requestId: crypto.randomUUID(), snapshotRevision: 1, type: "snapshot", data } as Session["snapshot"];
     if (perfProbe) perfHook(() => perfProbe?.expectCompletion("dialog-open", snapshot.sessionId));
-    const title = kind === "vibeCodeGuide" ? VIBE_CODE_GUIDE.title : kind === "insertTable" ? "Insert Table" : kind === "structureTemplates" ? "Templates" : kind === "engineInstall" ? "Engine installation" : kind === "toolInstall" ? "Tool installation" : kind === "export" ? "Export" : kind === "arrangementSpacing" ? "Adjust arrangement spacing" : "Custom Page Size";
+    const title = kind === "pageEnlargement" ? PAGE_ENLARGEMENT_TITLE : kind === "pluginTextPrompt" ? "Plugin question" : kind === "about" ? aboutCommand.title : kind === "guidedTour" ? TOUR_TITLE : kind === "customColor" ? "Custom Color" : kind === "vibeCodeGuide" ? VIBE_CODE_GUIDE.title : kind === "reactionConditions" ? "Reaction conditions" : kind === "atomProblem" ? "Atom problem" : kind === "insertTable" ? "Insert Table" : kind === "structureTemplates" ? "Templates" : kind === "engineInstall" ? "Engine installation" : kind === "toolInstall" ? "Tool installation" : kind === "export" ? "Export" : kind === "arrangementSpacing" ? "Adjust arrangement spacing" : "Custom Page Size";
     if (!parseDialogMessage(snapshot)) throw new Error(`Invalid ${title} snapshot`);
-    const session: Session = { snapshot, engineInstall, toolInstall, receipts: new Map(), inFlight: new Map(), settled: false, ready: false,
+    const session: Session = { snapshot, engineInstall, toolInstall, pageEnlargement, pluginTextPrompt, receipts: new Map(), inFlight: new Map(), settled: false, ready: false,
+      frameKey: snapshot.dialogKind === "export" ? JSON.stringify(snapshot.data.frame) : undefined,
       timer: setTimeout(() => { this.owner.onError(`${title} did not become ready. Open it again to try again.`); void this.settle(session, "error"); }, this.options.readyTimeoutMs ?? 10000) };
     this.sessions.set(key, session);
+    if (pluginTextPrompt) pluginTextPrompt.session = session;
+    const question = pageEnlargement ?? pluginTextPrompt;
+    if (question?.signal) {
+      const signal = question.signal;
+      const abort = () => { void this.settle(session, "cancel"); };
+      signal.addEventListener("abort", abort, { once: true });
+      question.removeAbortListener = () => signal.removeEventListener("abort", abort);
+      if (signal.aborted) abort();
+    }
     try {
       // Track the opening before the first await so tab close/dispose can cancel it.
       await this.ensureSubscription();
       if (afterClose) await afterClose;
       if (session.settled || this.stopped) return;
-      session.registration = await this.transport.open(snapshot);
-      if (!session.settled && session.ready && (session.snapshot.dialogKind === "engineInstall" || session.snapshot.dialogKind === "toolInstall")) await this.transport.publish(session.registration.hostId, session.snapshot);
+      const opening = this.transport.open(snapshot);
+      if (question) question.opening = opening;
+      session.registration = await opening;
+      // A plugin question's state may have changed while its window was opening.
+      if (pluginTextPrompt && !session.settled && session.snapshot !== snapshot) await this.transport.publish(session.registration.hostId, session.snapshot);
+      if (!session.settled && session.ready && (session.snapshot.dialogKind === "engineInstall" || session.snapshot.dialogKind === "toolInstall" || session.snapshot.dialogKind === "atomProblem")) await this.transport.publish(session.registration.hostId, session.snapshot);
       await this.flushExportFrame(session);
-      if (session.settled) await this.transport.close(session.registration.hostId, session.settledReason ?? "error");
+      if (session.settled && !question) await this.transport.close(session.registration.hostId, session.settledReason ?? "error");
       else if (session.ready && session.previewRequest) {
         await this.preview(session, session.previewRequest.requestId, session.previewRequest.percent);
       }
@@ -183,19 +320,19 @@ export class DialogCoordinator {
   async receive(delivery: DialogDelivery): Promise<void> {
     const parsed = parseDialogMessage(delivery.message);
     if (!parsed) return;
-    const session = this.sessions.get(`${parsed.documentTabId}:${parsed.dialogKind}`);
+    const session = this.sessions.get(sessionKey(parsed));
     if (!session || session.settled) return;
     // Native callbacks can arrive before the open IPC reply. Rust supplies the registered label.
     const label = session.registration?.windowLabel ?? delivery.windowLabel;
     const message = validateDialogDelivery(parsed, delivery.senderWindowId, session.snapshot, label);
     if (!message) return;
     if (message.type === "closed") {
-      if (message.data.reason === "error") this.owner.onError(`${parsed.dialogKind === "insertTable" ? "Insert Table" : parsed.dialogKind === "structureTemplates" ? "Templates" : parsed.dialogKind === "engineInstall" ? "Engine installation" : parsed.dialogKind === "toolInstall" ? "Tool installation" : parsed.dialogKind === "export" ? "Export" : parsed.dialogKind === "arrangementSpacing" ? "Adjust arrangement spacing" : "Custom Page Size"} could not show its native window. Open it again to try again.`);
+      if (message.data.reason === "error") this.owner.onError(`${parsed.dialogKind === "pageEnlargement" ? PAGE_ENLARGEMENT_TITLE : parsed.dialogKind === "pluginTextPrompt" ? "Plugin question" : parsed.dialogKind === "about" ? aboutCommand.title : parsed.dialogKind === "guidedTour" ? TOUR_TITLE : parsed.dialogKind === "customColor" ? "Custom Color" : parsed.dialogKind === "reactionConditions" ? "Reaction conditions" : parsed.dialogKind === "atomProblem" ? "Atom problem" : parsed.dialogKind === "insertTable" ? "Insert Table" : parsed.dialogKind === "structureTemplates" ? "Templates" : parsed.dialogKind === "engineInstall" ? "Engine installation" : parsed.dialogKind === "toolInstall" ? "Tool installation" : parsed.dialogKind === "export" ? "Export" : parsed.dialogKind === "arrangementSpacing" ? "Adjust arrangement spacing" : "Custom Page Size"} could not show its native window. Open it again to try again.`);
       await this.settle(session, message.data.reason, false); return;
     }
     if (message.type === "ready") {
       clearTimeout(session.timer); session.ready = true;
-      if ((session.snapshot.dialogKind === "engineInstall" || session.snapshot.dialogKind === "toolInstall") && session.registration) await this.transport.publish(session.registration.hostId, session.snapshot);
+      if ((session.snapshot.dialogKind === "engineInstall" || session.snapshot.dialogKind === "toolInstall" || session.snapshot.dialogKind === "atomProblem") && session.registration) await this.transport.publish(session.registration.hostId, session.snapshot);
       await this.flushExportFrame(session); return;
     }
     if (message.type === "request") {
@@ -203,6 +340,20 @@ export class DialogCoordinator {
       return;
     }
     if (message.type !== "action" || !session.ready) return;
+    if (session.pageEnlargement) {
+      await this.settle(session, message.data.action === "enlarge" ? "apply" : "cancel");
+      return;
+    }
+    if (session.pluginTextPrompt) {
+      const data = message.data;
+      if (data.action === "cancel") { await this.settle(session, "cancel"); return; }
+      // While Submit is off (its drawing is not the active tab) an answer is refused and the window stays open.
+      if (data.action !== "submit" || !("value" in data) || session.snapshot.dialogKind !== "pluginTextPrompt" ||
+          session.snapshot.data.submitEnabled === false || data.value.length === 0 || data.value.length > session.snapshot.data.maxLength) return;
+      session.pluginTextPrompt.value = data.value;
+      await this.settle(session, "apply");
+      return;
+    }
     if (message.data.action === "preview" && "percent" in message.data) {
       if (!session.registration) { session.previewRequest = { requestId: message.requestId, percent: message.data.percent }; return; }
       await this.preview(session, message.requestId, message.data.percent); return;
@@ -229,8 +380,59 @@ export class DialogCoordinator {
       }
       return;
     }
+    if (session.snapshot.dialogKind === "guidedTour") {
+      const data = message.data as TourAction;
+      // The native host opens the guide link itself and never relays it; should one arrive, it is not
+      // the owner's to act on.
+      if (data.action === "openGuide") return;
+      if (session.receipts.has(message.requestId)) return;
+      const receipt: DialogMessage = { ...dialogEnvelope(message), type: "result", data: { status: "cancelled" } };
+      session.receipts.set(message.requestId, receipt);
+      const endTour = data.action === "cancel" || data.action === "finish";
+      try {
+        await this.transport.publish(session.registration.hostId, { ...dialogEnvelope(message), type: "result", data: { status: "accepted" } });
+        if (session.settled) return;
+        await this.owner.guidedTourAction?.(data);
+        if (endTour) {
+          await this.settle(session, data.action === "finish" ? "apply" : "cancel");
+          return;
+        }
+        if (data.action === "chooseShortcuts") {
+          session.snapshot = { ...session.snapshot, data: { ...session.snapshot.data, scheme: data.scheme } };
+          if (!session.settled) await this.transport.publish(session.registration.hostId, session.snapshot);
+        }
+      } catch (error) { receipt.data = { status: "error", error: String(error).slice(0, 1024) }; }
+      if (!session.settled) await this.transport.publish(session.registration.hostId, receipt);
+      return;
+    }
     // Cancellation invalidates owner work immediately, even while a receipt is pending.
     if (message.data.action === "cancel") { await this.settle(session, "cancel"); return; }
+    if (session.snapshot.dialogKind === "about") return;
+    if (session.snapshot.dialogKind === "atomProblem") {
+      const data = message.data;
+      if (!("targetVersion" in data) || data.targetVersion !== session.snapshot.data.targetVersion || !session.snapshot.data.fixes.some(f => f.action === data.action)) {
+        await this.transport.publish(session.registration.hostId, { ...dialogEnvelope(message), type: "result", data: { status: "error", error: "This atom problem changed. Use the current window actions." } });
+        return;
+      }
+      const previous = session.receipts.get(message.requestId);
+      if (previous) { await session.inFlight.get(message.requestId); if (!session.settled) await this.transport.publish(session.registration.hostId, previous); return; }
+      if (session.terminalRequestId) return;
+      session.terminalRequestId = message.requestId;
+      const receipt: DialogMessage = { ...dialogEnvelope(message), type: "result", data: { status: "applied" } };
+      session.receipts.set(message.requestId, receipt);
+      let finish!: () => void;
+      session.inFlight.set(message.requestId, new Promise<void>(resolve => { finish = resolve; }));
+      try {
+        await this.transport.publish(session.registration.hostId, { ...dialogEnvelope(message), type: "result", data: { status: "accepted" } });
+        if (session.settled) return;
+        if (session.snapshot.data.targetVersion !== data.targetVersion) throw new Error("This atom problem changed. Use the current window actions.");
+        if (!this.owner.fixAtomProblem) throw new Error("Atom fixes are unavailable.");
+        await this.owner.fixAtomProblem(message.documentTabId, data.action, data.targetVersion);
+      } catch (error) { receipt.data = { status: "error", error: String(error).slice(0, 2048) }; }
+      finally { finish(); session.inFlight.delete(message.requestId); session.terminalRequestId = undefined; }
+      if (!session.settled) await this.transport.publish(session.registration.hostId, receipt);
+      return;
+    }
     if (session.snapshot.dialogKind === "vibeCodeGuide") {
       if (message.data.action !== "saveStarter" && message.data.action !== "openPluginManager") return;
       if (session.receipts.has(message.requestId)) return;
@@ -287,7 +489,8 @@ export class DialogCoordinator {
     if (session.terminalRequestId) return;
     // Reserve the entire session before invoking the owner or awaiting the receipt.
     session.terminalRequestId = message.requestId;
-    const receipt: DialogMessage = { ...dialogEnvelope(message), type: "result", data: { status: message.data.action === "apply" ? "applied" : "cancelled" } };
+    const changesSettingsOrDocument = message.data.action === "apply" || message.data.action === "clear";
+    const receipt: DialogMessage = { ...dialogEnvelope(message), type: "result", data: { status: changesSettingsOrDocument ? "applied" : "cancelled" } };
     session.receipts.set(message.requestId, receipt);
     let finished!: () => void;
     session.inFlight.set(message.requestId, new Promise<void>(resolve => { finished = resolve; }));
@@ -297,14 +500,25 @@ export class DialogCoordinator {
         ...dialogEnvelope(message), type: "result", data: { status: "accepted" }
       });
       if (session.settled) return;
-      if (message.data.action === "apply") {
-        if ("percent" in message.data) {
+      if (session.snapshot.dialogKind === "customColor") {
+        if (message.data.action === "apply" && "hex" in message.data) {
+          if (!this.owner.saveCustomColor) throw new Error("Custom color settings are unavailable");
+          await this.owner.saveCustomColor(session.snapshot.data, message.data.hex);
+        } else if (message.data.action === "clear") {
+          if (!this.owner.clearCustomColor) throw new Error("Custom color settings are unavailable");
+          await this.owner.clearCustomColor(session.snapshot.data);
+        }
+      } else if (message.data.action === "apply") {
+        if ("draft" in message.data) {
+          if (!this.owner.applyReactionConditions || session.snapshot.dialogKind !== "reactionConditions") throw new Error("Reaction conditions are unavailable");
+          await this.owner.applyReactionConditions(message.documentTabId, session.snapshot.data.arrowId, message.data.draft);
+        } else if ("percent" in message.data) {
           if (!this.owner.applyArrangementSpacing) throw new Error("Spacing is unavailable");
           await this.owner.applyArrangementSpacing(message.documentTabId, message.data.percent);
         } else if ("rows" in message.data) {
           if (!this.owner.insertTable) throw new Error("Table insertion is unavailable");
           await this.owner.insertTable(message.documentTabId, message.data);
-        } else await this.owner.applyPageSize(message.documentTabId, message.data);
+        } else if ("width" in message.data) await this.owner.applyPageSize(message.documentTabId, message.data);
         if (perfProbe) perfHook(() => sendPerfCompletion(delivery.windowLabel, message.requestId, "document-commit"));
       } else if (message.data.action === "export" || message.data.action === "chooseDestination") {
         const callback = message.data.action === "export" ? this.owner.export : this.owner.chooseExportDestination;
@@ -314,8 +528,10 @@ export class DialogCoordinator {
             ...dialogEnvelope(message), type: "result", data: { status: "progress", notice }
           });
         });
-        if (receipt.data.status !== "exported") session.terminalRequestId = undefined;
-        else if (perfProbe) perfHook(() => sendPerfCompletion(delivery.windowLabel, message.requestId, "export-written"));
+        // Release before publishing: the host can change format and submit again as soon
+        // as it receives success. Request receipts still deduplicate repeated deliveries.
+        session.terminalRequestId = undefined;
+        if (receipt.data.status === "exported" && perfProbe) perfHook(() => sendPerfCompletion(delivery.windowLabel, message.requestId, "export-written"));
       }
     } catch (error) {
       session.terminalRequestId = undefined;
@@ -329,15 +545,14 @@ export class DialogCoordinator {
       session.inFlight.delete(message.requestId);
     }
     if (session.settled) return;
-    // Export warnings and success stay in the dialog until Close. Pickers and cancellation of
-    // a save panel are nonterminal; a completed export remains reserved against a second write.
+    // Export warnings and success stay visible until Close or the next explicit action.
     if (message.data.action === "export" || message.data.action === "chooseDestination") {
       await this.transport.publish(session.registration.hostId, receipt);
       await this.flushExportFrame(session);
       return;
     }
     try { await this.transport.publish(session.registration.hostId, receipt); }
-    finally { await this.settle(session, message.data.action === "apply" ? "apply" : "cancel"); }
+    finally { await this.settle(session, changesSettingsOrDocument ? "apply" : "cancel"); }
   }
   private async preview(session: Session, requestId: string, percent: number): Promise<void> {
     if (session.terminalRequestId || session.snapshot.dialogKind !== "arrangementSpacing") return;
@@ -374,15 +589,53 @@ export class DialogCoordinator {
     session.settled = true;
     session.settledReason = reason;
     clearTimeout(session.timer);
-    const key = `${session.snapshot.documentTabId}:${session.snapshot.dialogKind}`;
+    const key = sessionKey(session.snapshot);
     if (this.sessions.get(key) === session) this.sessions.delete(key);
+    const question = session.pageEnlargement;
+    if (question) {
+      question.removeAbortListener?.();
+      const kept = reason === "cancel" || reason === "close" || reason === "destroy";
+      let decision: PageEnlargementDecision = reason === "apply" ? "enlarge" : kept ? "keep" : "unanswered";
+      try {
+        // An abort can precede the registration reply. Close that exact window as soon as its ID is available.
+        const registration = close ? session.registration ?? await question.opening?.catch(() => undefined) : undefined;
+        if (registration) await this.transport.close(registration.hostId, reason);
+        if (session.ready && decision !== "unanswered") {
+          this.owner.onPageEnlargementClosed?.(session.snapshot.documentTabId);
+        }
+      } catch (error) {
+        decision = "unanswered";
+        this.owner.onError(`Could not close page enlargement: ${String(error)}`);
+      }
+      question.resolve(question.signal?.aborted ? "keep" : decision);
+      return;
+    }
+    const prompt = session.pluginTextPrompt;
+    if (prompt) {
+      prompt.removeAbortListener?.();
+      const result: PluginTextPromptResult = reason === "apply" && prompt.value !== undefined && !prompt.signal?.aborted
+        ? { status: "submitted", value: prompt.value } : { status: "cancelled" };
+      try {
+        // An abort can precede the registration reply. Close that exact window as soon as its ID is available.
+        const registration = close ? session.registration ?? await prompt.opening?.catch(() => undefined) : undefined;
+        if (registration) await this.transport.close(registration.hostId, reason);
+        if (session.ready && (reason === "apply" || reason === "cancel" || reason === "close" || reason === "destroy")) {
+          this.owner.onPluginTextPromptClosed?.(session.snapshot.documentTabId);
+        }
+      } catch (error) {
+        this.owner.onError(`Could not close the plugin question: ${String(error)}`);
+      }
+      prompt.resolve(result);
+      return;
+    }
     if (session.snapshot.dialogKind === "arrangementSpacing") this.owner.onSpacingSettled?.(session.snapshot.documentTabId);
+    if (session.snapshot.dialogKind === "reactionConditions") this.owner.onConditionsSettled?.(session.snapshot.documentTabId);
     // Preserve the existing Page Size callback contract.
     let finishToolClose: (() => void) | undefined;
     const toolClosed = session.toolInstall ? new Promise<void>(resolve => { finishToolClose = resolve; }) : undefined;
     if (session.snapshot.dialogKind === "engineInstall") session.engineInstall?.closed();
     else if (session.snapshot.dialogKind === "toolInstall") session.toolInstall?.closed(toolClosed);
-    else if (session.snapshot.dialogKind === "export") this.owner.onSettled?.(session.snapshot.documentTabId, reason, "export");
+    else if (session.snapshot.dialogKind === "export" || session.snapshot.dialogKind === "atomProblem" || session.snapshot.dialogKind === "guidedTour") this.owner.onSettled?.(session.snapshot.documentTabId, reason, session.snapshot.dialogKind);
     else this.owner.onSettled?.(session.snapshot.documentTabId, reason);
     if (close && session.registration) {
       try { await this.transport.close(session.registration.hostId, reason); }
@@ -394,8 +647,15 @@ export class DialogCoordinator {
     await Promise.all([...this.sessions.values()].filter(s => s.snapshot.documentTabId === tabId).map(s => this.settle(s, "ownerTabClose")));
   }
   hasArrangementSpacing(tabId: string): boolean { return this.sessions.has(`${tabId}:arrangementSpacing`); }
+  reactionConditionsArrowId(tabId: string): string | undefined {
+    const snapshot = this.sessions.get(`${tabId}:reactionConditions`)?.snapshot;
+    return snapshot?.dialogKind === "reactionConditions" ? snapshot.data.arrowId : undefined;
+  }
   async closeArrangementSpacing(): Promise<void> {
     await Promise.all([...this.sessions.values()].filter(s => s.snapshot.dialogKind === "arrangementSpacing").map(s => this.settle(s, "cancel")));
+  }
+  async closeReactionConditions(): Promise<void> {
+    await Promise.all([...this.sessions.values()].filter(s => s.snapshot.dialogKind === "reactionConditions").map(s => this.settle(s, "cancel")));
   }
   async dispose(reason: "quit" | "ownerClose" = "ownerClose"): Promise<void> {
     this.stopped = true;

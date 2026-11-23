@@ -76,8 +76,11 @@ export function unspecifiedStereoDoubleBondPairs(rdkit: RdkitMinimalModule, smil
 }
 
 /** Normalize parity against sorted neighbours, independent of bond traversal order. */
-function parity(graph: StereoGraph, center: number): number {
-  const neighbors = graph.bonds.flatMap(b => b.atoms[0] === center ? [b.atoms[1]] : b.atoms[1] === center ? [b.atoms[0]] : []);
+export function stereoNeighbors(graph: StereoGraph, center: number): number[] {
+  return graph.bonds.flatMap(b => b.atoms[0] === center ? [b.atoms[1]] : b.atoms[1] === center ? [b.atoms[0]] : []);
+}
+
+export function parity(graph: StereoGraph, center: number, neighbors = stereoNeighbors(graph, center)): number {
   let sign = graph.atoms[center]?.stereo === "cw" ? 1 : graph.atoms[center]?.stereo === "ccw" ? -1 : 0;
   for (let i = 0; i < neighbors.length; i++) for (let j = i + 1; j < neighbors.length; j++) if (neighbors[i] > neighbors[j]) sign = -sign;
   return sign;
@@ -102,7 +105,7 @@ export function assertComponentStereo(rdkit: RdkitMinimalModule, model: Plugin3D
     const actual = stereoGraph(geometry);
     for (const center of specifiedCenters(expected)) {
       if (parity(expected, center) !== parity(actual, center)) {
-        throw new Error(`Component ${index + 1}: ${phase} would change specified tetrahedral stereo at centre ${center + 1}; restore the input geometry.`);
+        throw new Error(`Component ${index + 1}: ${phase} would change specified tetrahedral stereo at center ${center + 1}; restore the input geometry.`);
       }
     }
     for (const bond of expected.bonds) {

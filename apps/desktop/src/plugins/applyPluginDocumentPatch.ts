@@ -1,28 +1,297 @@
 import {
+  adoptDerivedDocument,
   applyPatch,
-  type Anchor,
+  applyPatches,
+  isDativeBond,
   type ApplyPatchOptions,
   type ChemDraftDocument,
-  type CompatibilityWarning,
   type DocumentObject,
-  type DocumentPatch
+  type MoleculeObject
 } from "@chemdraft/chem-core";
+import { ChemistryRefusal, PLUGIN_WRITE_REFUSED, chemistryRefusalOf, refusalSentence } from "./requestWrites/chemistryRefusal";
 import {
   AppliedPatchReceiptSchema,
   type AppliedPatchReceipt,
   type NormalizedProposedDocumentPatch
 } from "@chemdraft/plugin-api";
-import { writePatchOps } from "@chemdraft/plugin-host";
+import { assertPluginDocumentWriteScope, bareIdTargetPage, objectInWriteScope, rebasePluginPatch,
+  retainedCtabCompatibility, storedCtabReference, writePatchOps, type PageObjectRef, type PluginWriteScopePages } from "@chemdraft/plugin-host";
 import { selectionBounds, translateInsertedDocumentObjects } from "../documentWorkflow";
+import { choosePlacement, objectRect, overlaps as boundsOverlap, pageContentRect, RELATIVE_GAP, unionRects } from "../assistant/placement";
+import type { ViewportRect } from "@chemdraft/viewport-engine";
+import { nativeSingleBondGraphMetadata, tryNativeSingleBondGraphSmiles } from "@chemdraft/document-workflow-core";
+import { nativeElementFromAtomLabel } from "@chemdraft/layout-engine";
+import {
+  assertChemistryClaims, assertRetainedAnnotationsKept, refreshVerifiedMoleculeChemistry, stableRecord, verifiedChemicalRecord,
+  verifyStoredSources, withoutGeometry
+} from "./requestWrites/storedChemistry";
+import { desktopWriteInspectionContext, inspectMolecule } from "./requestWrites/structureIdentity";
 
 export interface PluginPatchPlacementOptions extends ApplyPatchOptions {
   /** Page-space visible rectangle, read when the write actually commits (after gesture gating). */
   insertionTarget?: { pageId: string; bounds?: { x: number; y: number; width: number; height: number } };
+  /** Host policy for name results, whose default page-centre position is not user-authored. */
+  avoidInsertionOverlap?: boolean;
 }
 
 export interface AppliedPluginDocumentPatch {
   document: ChemDraftDocument;
   receipt: AppliedPatchReceipt;
+}
+
+/** The fields that carry a molecule's chemistry beside its editable graph, for save and export. */
+const STORED_CHEMISTRY_FIELDS = ["structure", "structureFormat", "chemistry", "compatibility", "superatoms", "rGroups"] as const;
+
+/** Match draft molecules with the graphs they had before the batch's updates.
+ * Reviewed proposals are authorized by acceptance and have no command selection scope, but their
+ * insertions are verified exactly like a scoped plugin's. */
+export function refreshPluginPatchChemistry(before: ChemDraftDocument, draft: ChemDraftDocument,
+  rebased: NormalizedProposedDocumentPatch, writeScopeObjectIds?: readonly string[], signal?: AbortSignal,
+  /** Legacy writes: a selected id is in scope only on the page its selection named. */
+  scopePages?: PluginWriteScopePages
+): Promise<ChemDraftDocument> | undefined {
+  const scope = writeScopeObjectIds && new Set(writeScopeObjectIds);
+  // Send-time pins resolve only on their own page; never a same-id object elsewhere.
+  const inserted = new Set<string>();
+  const atomUpdates = new Set<string>();
+  const storedUpdates = new Set<string>();
+  const positions = writePatchOps(rebased.patch).filter(op => {
+    if (op.op === "addObject") inserted.add(op.object.id);
+    if (op.op === "updateObject" && "atoms" in op.changes) atomUpdates.add(op.objectId);
+    if (op.op === "updateObject" && STORED_CHEMISTRY_FIELDS.some(key => key in op.changes)) storedUpdates.add(op.objectId);
+    return op.op === "addObject" || op.op === "addAnnotation" || op.op === "removeObject" ||
+      op.op === "removeAnnotation" || op.op === "reorderObject" || op.op === "setObjectOrder";
+  });
+  // Replay ordering and membership changes so molecule slots identify the same occurrence,
+  // even if a batch reordered duplicate ids or edited a molecule it had just inserted.
+  const baseline = positions.length ? applyPatches(before, positions, {
+    preserveRepeatUnitBrackets: true, deferGroupCleanup: true, now: draft.updatedAt
+  }) : before;
+  const context = desktopWriteInspectionContext(signal);
+  const edits: Promise<void>[] = [];
+  let retained = false;
+  const pages = draft.pages.map((page, pageIndex) => {
+    // Reviewed edits can also remove orphaned brackets and groups during patch application.
+    const prior = baseline.pages[pageIndex]!.objects.filter(object => object.type === "molecule");
+    let moleculeIndex = 0;
+    let objects = page.objects;
+    for (const [index, object] of page.objects.entries()) {
+      if (object.type !== "molecule") continue;
+      const previous = prior[moleculeIndex++];
+      const isInsertion = inserted.has(object.id);
+      if (previous?.id !== object.id || (scope && !isInsertion && !objectInWriteScope(scope, scopePages, page.id, object.id))) continue;
+      // Every insertion is verified, whether a scoped command wrote it or the user accepted it.
+      const verifyInsertion = isInsertion;
+      // An authored atom move can change 2D stereo, but only where geometry defines stereo, and
+      // never when every atom moved together keeping every stereo side. Host placement
+      // translates an insertion as a unit.
+      const graphChanged = object !== previous && (graphSignature(previous) !== graphSignature(object) ||
+        atomUpdates.has(object.id) && hasGeometryStereo(object) &&
+        !(movedAsUnit(previous, object) && keptStereoSides(previous, object)));
+      // A write to the stored records must agree with the graph the canvas draws, changed or not.
+      const storedChanged = object !== previous && storedUpdates.has(object.id) && storedRecord(previous) !== storedRecord(object);
+      if (!verifyInsertion && !graphChanged && !storedChanged) {
+        // The graph and its chemistry are unchanged, but a retained CTAB still holds the old atom
+        // coordinates. Keep them beside it, as a request write does, so a later edit can map its stereo.
+        if (object !== previous && atomUpdates.has(object.id)) {
+          const compatibility = retainedCtabCompatibility(previous, object);
+          if (compatibility !== previous.compatibility) {
+            if (objects === page.objects) objects = [...objects];
+            objects[index] = { ...object, compatibility };
+            retained = true;
+          }
+        }
+        continue;
+      }
+      // Records the canvas itself derives from this graph cannot disagree with it.
+      if (verifyInsertion && !graphChanged && !storedChanged && storesNativeDerivation(object)) continue;
+      // Give existing scope refusals priority over chemistry inspection of a draft that cannot commit.
+      if (!edits.length && writeScopeObjectIds) assertPluginDocumentWriteScope(before, draft, rebased, writeScopeObjectIds, scopePages);
+      if (objects === page.objects) objects = [...objects];
+      edits.push((async () => {
+        try {
+          if (!object.atoms.length) throw new ChemistryRefusal("the molecule has no drawn atoms to check against", "The molecule has no editable atoms to verify.");
+          if (verifyInsertion && !graphChanged && !storedChanged) {
+            // Verification only: an insertion that matches its graph keeps its records as authored.
+            const insertion = withoutBracketContext(object);
+            await verifiedChemicalRecord(context, insertion, await inspectMolecule(context, insertion));
+            return;
+          }
+          const original = withoutBracketContext(previous);
+          if (verifyInsertion) {
+            await verifiedChemicalRecord(context, original, await inspectMolecule(context, original));
+          } else if (previous.structure || previous.compatibility?.unknown.smiles !== undefined) {
+            const graph = await inspectMolecule(context, original);
+            await verifyStoredSources(context, previous, { graph, reference: storedCtabReference(previous) });
+          }
+          const graph = await inspectMolecule(context, withoutBracketContext(object));
+          if (storedChanged) assertRetainedAnnotationsKept(previous, object);
+          await verifyStoredSources(context, object, { graph, alreadyVerified: previous });
+          const refreshed = refreshVerifiedMoleculeChemistry(object, graph, previous.structureFormat);
+          // A supplied record is checked against the graph's, then replaced by it like every other field.
+          if (storedChanged) assertChemistryClaims(withoutBracketContext(object), withoutBracketContext(previous), refreshed);
+          if (refreshed.structureFormat === "molfile-v3000") await verifyStoredSources(context, refreshed, { graph });
+          objects[index] = refreshed;
+        } catch (error) {
+          signal?.throwIfAborted();
+          const technical = `Plugin write refused: cannot refresh stored chemistry for molecule "${object.id}". ${describePatchFailure(error)}`;
+          const refusal = chemistryRefusalOf(error);
+          if (!refusal) throw new Error(technical);
+          // The user sees the plain sentence; the full text, with the molecule id, goes to the log.
+          const detail = `Plugin write refused: cannot refresh stored chemistry for molecule "${object.id}". ${refusal.detail}`;
+          console.warn(detail);
+          throw new ChemistryRefusal(refusal.reason, detail, refusalSentence(PLUGIN_WRITE_REFUSED, refusal.reason));
+        }
+      })());
+    }
+    return objects === page.objects ? page : { ...page, objects };
+  });
+  if (edits.length) return Promise.all(edits).then(() => adoptDerivedDocument(draft, { ...draft, pages }));
+  if (retained) return Promise.resolve(adoptDerivedDocument(draft, { ...draft, pages }));
+}
+
+/** Everything a molecule stores for save and export beside its graph, without geometry. */
+function storedRecord(molecule: MoleculeObject): string {
+  const { superatoms, rGroups } = withoutGeometry(molecule);
+  return stableRecord([molecule.structure, molecule.structureFormat, withoutBracketContext(molecule).chemistry,
+    molecule.compatibility, superatoms, rGroups]);
+}
+
+function graphSignature(molecule: MoleculeObject): string {
+  return JSON.stringify([
+    molecule.atoms.map(atom => JSON.stringify([atom.id, atom.element, atom.formalCharge, atom.isotope,
+      atom.markRadicals, atom.schemeAbbreviation, atom.labelLiteral, atom.hydrogenCount,
+      atom.labelBondSide?.side, atom.labelBondSide?.atomId])).sort(),
+    molecule.bonds.map(bond => {
+      const style = bond.display?.bondStyle;
+      const stereo = bond.order === "single" && (style === "wedge" || style === "hashed" || style === "wavy") ? style : undefined;
+      const dative = isDativeBond(bond);
+      const endpoints = [bond.fromAtomId, bond.toAtomId];
+      if (!stereo && !dative) endpoints.sort();
+      return JSON.stringify([endpoints, bond.order, bond.stereo, stereo, dative]);
+    }).sort()
+  ]);
+}
+
+/** 2D coordinates define stereo only through wedges and hashes, or across a double bond whose
+ * ends both carry another substituent. Elsewhere a coordinate change cannot change chemistry. */
+function hasGeometryStereo({ bonds }: MoleculeObject): boolean {
+  const degree = new Map<string, number>();
+  for (const bond of bonds) {
+    for (const id of [bond.fromAtomId, bond.toAtomId]) degree.set(id, (degree.get(id) ?? 0) + 1);
+  }
+  return bonds.some(bond => bond.display?.bondStyle === "wedge" || bond.display?.bondStyle === "hashed" ||
+    bond.order === "double" && degree.get(bond.fromAtomId)! > 1 && degree.get(bond.toAtomId)! > 1);
+}
+
+/** True when the same atoms moved by one translation, rotation and uniform scale. Such a move
+ * keeps every wedge's handedness and every double bond's sides; a reflection or a reshaped
+ * molecule does not count. */
+function movedAsUnit(before: MoleculeObject, after: MoleculeObject): boolean {
+  const start = new Map(before.atoms.map(atom => [atom.id, atom]));
+  const pairs = after.atoms.map(atom => [start.get(atom.id), atom] as const);
+  if (pairs.length !== start.size || pairs.some(([from]) => !from)) return false;
+  if (!pairs.length) return true;
+  const centre = (points: readonly { x: number; y: number }[]) => ({
+    x: points.reduce((sum, point) => sum + point.x, 0) / points.length,
+    y: points.reduce((sum, point) => sum + point.y, 0) / points.length
+  });
+  const a = centre(pairs.map(([from]) => from!)), b = centre(pairs.map(([, to]) => to));
+  const offsets = pairs.map(([from, to]) => ({ ux: from!.x - a.x, uy: from!.y - a.y, vx: to.x - b.x, vy: to.y - b.y }));
+  // The least-squares similarity maps u to z·u, with z = Σ v·conj(u) / Σ |u|² as a complex number.
+  let spread = 0, real = 0, imaginary = 0, extent = 0;
+  for (const { ux, uy, vx, vy } of offsets) {
+    spread += ux * ux + uy * uy;
+    real += vx * ux + vy * uy;
+    imaginary += vy * ux - vx * uy;
+    extent = Math.max(extent, Math.hypot(ux, uy), Math.hypot(vx, vy));
+  }
+  const tolerance = 1e-6 * Math.max(1, extent);
+  if (!(spread > 0)) return offsets.every(({ vx, vy }) => Math.hypot(vx, vy) <= tolerance);
+  const zx = real / spread, zy = imaginary / spread;
+  if (!(Math.hypot(zx, zy) > 1e-9)) return false;
+  return offsets.every(({ ux, uy, vx, vy }) => Math.hypot(vx - (zx * ux - zy * uy), vy - (zx * uy + zy * ux)) <= tolerance);
+}
+
+/** Smallest |sin| of the angle between a stereo bond and its reference that still reads as a side.
+ * Fixed rather than scaled by the molecule's size, so a near-collinear substituent never counts as
+ * kept, however large the drawing. */
+const STEREO_SIDE_EPSILON = 1e-3;
+
+/** True when every orientation that 2D geometry gives stereo is clearly the same before and after:
+ * each substituent's side of a stereo double bond, and the turn between each pair of neighbours of
+ * a wedged or hashed bond's atoms. `movedAsUnit` alone allows a residual that grows with the
+ * molecule's extent, which can hide a substituent crossing an axis; this check cannot. */
+function keptStereoSides(before: MoleculeObject, after: MoleculeObject): boolean {
+  const start = new Map(before.atoms.map(atom => [atom.id, atom]));
+  const end = new Map(after.atoms.map(atom => [atom.id, atom]));
+  const neighbours = new Map<string, string[]>();
+  for (const bond of after.bonds) {
+    neighbours.set(bond.fromAtomId, [...neighbours.get(bond.fromAtomId) ?? [], bond.toAtomId]);
+    neighbours.set(bond.toAtomId, [...neighbours.get(bond.toAtomId) ?? [], bond.fromAtomId]);
+  }
+  // +1 or -1 for the side of `other` relative to the ray from `centre` to `reference`, 0 if degenerate.
+  const side = (atoms: typeof start, centre: string, reference: string, other: string) => {
+    const c = atoms.get(centre), r = atoms.get(reference), o = atoms.get(other);
+    if (!c || !r || !o) return 0;
+    const rx = r.x - c.x, ry = r.y - c.y, ox = o.x - c.x, oy = o.y - c.y;
+    const lengths = Math.hypot(rx, ry) * Math.hypot(ox, oy);
+    if (!(lengths > 0) || !Number.isFinite(lengths)) return 0;
+    const sine = (rx * oy - ry * ox) / lengths;
+    return Math.abs(sine) >= STEREO_SIDE_EPSILON ? Math.sign(sine) : 0;
+  };
+  const kept = (centre: string, reference: string, other: string) => {
+    const was = side(start, centre, reference, other);
+    return was !== 0 && was === side(end, centre, reference, other);
+  };
+  for (const bond of after.bonds) {
+    const ends = [bond.fromAtomId, bond.toAtomId] as const;
+    if (bond.order === "double") {
+      const substituents = ends.map((centre, index) => (neighbours.get(centre) ?? []).filter(id => id !== ends[1 - index]));
+      if (substituents.every(list => list.length) && ends.some((centre, index) =>
+        substituents[index]!.some(other => !kept(centre, ends[1 - index]!, other)))) return false;
+    }
+    if (bond.display?.bondStyle === "wedge" || bond.display?.bondStyle === "hashed") {
+      for (const centre of ends) {
+        const around = neighbours.get(centre) ?? [];
+        for (let i = 0; i < around.length; i++) {
+          for (let j = i + 1; j < around.length; j++) if (!kept(centre, around[i]!, around[j]!)) return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+/** chem-core regenerates this page-context note on every commit. It does not describe the graph:
+ * the stored chemistry of a repeat-unit member is that of the one drawn copy. */
+function withoutBracketContext(molecule: MoleculeObject): MoleculeObject {
+  const warnings = molecule.chemistry?.warnings;
+  if (!warnings?.some(warning => warning.code === "chemistry.bracket_multiplier")) return molecule;
+  return { ...molecule, chemistry: { ...molecule.chemistry!,
+    warnings: warnings.filter(warning => warning.code !== "chemistry.bracket_multiplier") } };
+}
+
+/** The structure, cached SMILES and chemistry are exactly what the canvas derives from this graph
+ * (`refreshNativeSingleBondGraph`), so they cannot be stale. Limited to plain elements with no
+ * radicals, no unusual bonds and no geometry-defined stereo, which the native writer cannot record. */
+function storesNativeDerivation(molecule: MoleculeObject): boolean {
+  const { atoms, bonds } = molecule;
+  if (!atoms.length || molecule.superatoms.length || molecule.rGroups.length || molecule.structureFormat !== "smiles") return false;
+  if (atoms.some(atom => atom.labelLiteral || atom.schemeAbbreviation || atom.markRadicals || !nativeElementFromAtomLabel(atom.element))) {
+    return false;
+  }
+  if (bonds.some(bond => bond.stereo !== undefined || bond.display?.bondStyle === "wavy" || isDativeBond(bond) ||
+      (bond.order !== "single" && bond.order !== "double" && bond.order !== "triple")) || hasGeometryStereo(molecule)) {
+    return false;
+  }
+  const native = tryNativeSingleBondGraphSmiles(atoms, bonds);
+  if (!("smiles" in native) || !native.smiles || native.smiles !== molecule.structure) return false;
+  const retained = molecule.compatibility?.unknown ?? {};
+  if (Object.keys(retained).some(key => key !== "smiles") ||
+      (retained.smiles !== undefined && retained.smiles !== molecule.structure)) return false;
+  return !molecule.chemistry ||
+    stableRecord(withoutBracketContext(molecule).chemistry) === stableRecord(nativeSingleBondGraphMetadata(atoms, bonds));
 }
 
 /**
@@ -37,13 +306,17 @@ export function applyPluginDocumentPatch(
 ): AppliedPluginDocumentPatch {
   const now = options.now ?? new Date();
   proposed = rebasePluginPatch(document, proposed, false);
-  let patched = applyPatch(document, proposed.patch, { ...options, now });
+  let patched = applyPatch(document, proposed.patch, { preserveRepeatUnitBrackets: true, deferGroupCleanup: true, ...options, now });
   const inserted = new Set(writePatchOps(proposed.patch).flatMap(op => op.op === "addObject" ? [op.object.id] :
     op.op === "addAnnotation" ? [op.annotation.id] : []));
   const existingIds = new Set(document.pages.flatMap(page => page.objects.map(object => object.id)));
   // Placement, insertion and selection are all prepared before the ONE history commit.
   // Measure the surviving inserted group after all batch edits, and preserve its relative layout.
   for (const page of patched.pages) {
+    if (options.avoidInsertionOverlap) {
+      patched = placeInsertedObjectsInFreeSpace(patched, page.id, [...inserted]);
+      continue;
+    }
     const objects = page.objects.filter(object => inserted.has(object.id));
     // Moving even one member away from an existing anchor can detach a charge or warp an
     // arrow. Preserve the entire authored group, including off-page and oversized groups.
@@ -53,7 +326,9 @@ export function applyPluginDocumentPatch(
     const outside = bounds.x < 0 || bounds.y < 0 || bounds.x + bounds.width > page.width || bounds.y + bounds.height > page.height;
     if (!outside) continue;
     if (bounds.width > page.width || bounds.height > page.height) {
-      throw new Error("Plugin insertion is larger than the page; choose a larger page or a smaller drawing before inserting.");
+      // Preserve authored geometry. The desktop's shared pre-commit question offers growth,
+      // or keeps this exact placement on the existing page, as one history entry either way.
+      continue;
     }
     const overlaps = bounds.x < page.width && bounds.y < page.height &&
       bounds.x + bounds.width > 0 && bounds.y + bounds.height > 0;
@@ -74,26 +349,32 @@ export function applyPluginDocumentPatch(
     }
     patched = translateInsertedDocumentObjects(patched, objects.map(object => object.id), x - bounds.x, y - bounds.y);
   }
+  // Record each touched object by page and id: the page an insertion names, and the page chem-core's
+  // bare-id op acted on (its first occurrence). A same-id object on another page is never "touched".
   const touched = new Set<string>();
+  const touchedRefs: PageObjectRef[] = [];
+  const touch = (pageId: string | undefined, objectId: string) => {
+    if (pageId === undefined || touched.has(`${pageId}\u0000${objectId}`)) return;
+    touched.add(`${pageId}\u0000${objectId}`);
+    touchedRefs.push({ pageId, objectId });
+  };
   for (const op of writePatchOps(proposed.patch)) {
     switch (op.op) {
-      case "addObject": touched.add(op.object.id); break;
-      case "addAnnotation": touched.add(op.annotation.id); break;
+      case "addObject": touch(op.pageId, op.object.id); break;
+      case "addAnnotation": touch(op.pageId, op.annotation.id); break;
       case "updateObject":
       case "moveObject":
-      case "reorderObject": touched.add(op.objectId); break;
-      case "setObjectOrder": op.objectIds.forEach((id) => touched.add(id)); break;
+      case "reorderObject": touch(bareIdTargetPage(patched, op.objectId), op.objectId); break;
+      case "setObjectOrder": op.objectIds.forEach((id) => touch(op.pageId, id)); break;
     }
   }
   const objectIds = patched.pages.flatMap((page) =>
-    page.objects.filter((object) => touched.has(object.id)).map((object) => object.id)
+    page.objects.filter((object) => touched.has(`${page.id}\u0000${object.id}`)).map((object) => object.id)
   );
 
   let selected = patched;
   if (objectIds.length > 0) {
-    const page = patched.pages.find((candidate) =>
-      objectIds.every((objectId) => candidate.objects.some((object) => object.id === objectId))
-    );
+    const page = patched.pages.find((candidate) => touchedRefs.every((ref) => ref.pageId === candidate.id));
     if (page) {
       selected = applyPatch(
         patched,
@@ -109,6 +390,44 @@ export function applyPluginDocumentPatch(
     document: selected,
     receipt: AppliedPatchReceiptSchema.parse({ applied: true, objectIds })
   };
+}
+
+/** Move an overlapping inserted group together, only when free space fits on this page. */
+export function placeInsertedObjectsInFreeSpace(
+  document: ChemDraftDocument,
+  pageId: string,
+  insertedIds: readonly string[],
+  options: { viewport?: ViewportRect; covered?: readonly ViewportRect[] } = {}
+): ChemDraftDocument {
+  const page = document.pages.find(candidate => candidate.id === pageId);
+  if (!page) return document;
+  const inserted = new Set(insertedIds);
+  const objects = page.objects.filter(object => inserted.has(object.id));
+  const existingIds = new Set(document.pages.flatMap(candidate =>
+    candidate.objects.filter(object => !inserted.has(object.id)).map(object => object.id)));
+  // Keep anchored groups intact rather than detach them from existing content.
+  if (objects.some(object => referencesExistingObject(object, existingIds))) return document;
+  const bounds = pluginInsertionBounds(objects);
+  if (!bounds) return document;
+  const occupied = [...page.objects.filter(object => !inserted.has(object.id)).map(objectRect), ...(options.covered ?? [])];
+  const visibleBounds = unionRects([bounds, ...objects.map(objectRect)]);
+  const content = pageContentRect(page);
+  const viewport = options.viewport;
+  const left = Math.max(content.x, viewport?.x ?? 0);
+  const top = Math.max(content.y, viewport?.y ?? 0);
+  const right = Math.min(content.x + content.width, viewport ? viewport.x + viewport.width : page.width);
+  const bottom = Math.min(content.y + content.height, viewport ? viewport.y + viewport.height : page.height);
+  if (right <= left || bottom <= top) return document;
+  const withinVisible = visibleBounds.x >= left && visibleBounds.y >= top &&
+    visibleBounds.x + visibleBounds.width <= right && visibleBounds.y + visibleBounds.height <= bottom;
+  if (!occupied.some(other => boundsOverlap(visibleBounds, other)) && (!viewport || withinVisible)) return document;
+  const placement = choosePlacement({ page: { ...page,
+    margin: { left, top, right: page.width - right, bottom: page.height - bottom } }, size: visibleBounds, occupied,
+    preferred: visibleBounds, gap: RELATIVE_GAP });
+  // Never grow the page or move the view to make room. A full/covered viewport retains the insert.
+  if (!placement.fits) return document;
+  return translateInsertedDocumentObjects(document, objects.map(object => object.id),
+    placement.rect.x - visibleBounds.x, placement.rect.y - visibleBounds.y);
 }
 
 /** Keep existing object bounds, but never trust a molecule frame to enclose its atoms. */
@@ -134,6 +453,7 @@ function pluginInsertionBounds(objects: readonly DocumentObject[]) {
 /** Native placement references only; opaque chemistry, text and plugin metadata are not anchors. */
 function referencesExistingObject(object: DocumentObject, existingIds: ReadonlySet<string>): boolean {
   const references: Array<string | undefined> = [];
+  if (object.type === "text") references.push(object.arrowAttachment?.parentObjectId);
   switch (object.type) {
     case "reaction-arrow":
       references.push(object.start.objectId, object.end.objectId, ...object.labels);
@@ -143,9 +463,12 @@ function referencesExistingObject(object: DocumentObject, existingIds: ReadonlyS
       break;
     case "electron-mark": references.push(object.anchor.objectId); break;
     case "reaction":
-      references.push(...object.components.map(component => component.objectId), ...object.conditionsTextObjectIds);
+      references.push(...object.components.map(component => component.objectId), ...object.conditionsTextObjectIds,
+        ...(object.arrowObjectIds ?? []), ...(object.plusObjectIds ?? []));
       break;
-    case "bracket": references.push(...object.containedObjectIds); break;
+    case "bracket":
+      references.push(...object.containedObjectIds, ...(object.crossingBondIds ?? []).map(ref => ref.objectId));
+      break;
     case "group": references.push(...object.childObjectIds); break;
     case "annotation": references.push(...object.targetObjectIds); break;
     case "superatom": references.push(...object.metadata.attachmentPoints.map(anchor => anchor.objectId)); break;
@@ -170,6 +493,8 @@ export function describePatchFailure(error: unknown): string {
     const detail = typeof first?.message === "string" ? first.message : "invalid value";
     return `the proposed structure is not valid (${path ? `${path}: ` : ""}${detail})`;
   }
+  const refusal = chemistryRefusalOf(error);
+  if (refusal) return refusal.reason;
   const message = error instanceof Error ? error.message : String(error);
   return message.split("\n")[0]!.replace(/\.$/, "") || "unknown error";
 }
@@ -190,7 +515,9 @@ export function applyAcceptedPluginProposal(
   proposed: NormalizedProposedDocumentPatch,
   options: ApplyPatchOptions = {}
 ): AppliedPluginDocumentPatch {
-  return applyPluginDocumentPatch(document, rebaseProposedInsertion(document, proposed), options);
+  return applyPluginDocumentPatch(document, rebaseProposedInsertion(document, proposed), {
+    preserveRepeatUnitBrackets: false, deferGroupCleanup: false, ...options
+  });
 }
 
 /** The proposal with its insertion re-targeted at `document` (see `applyAcceptedPluginProposal`). */
@@ -199,162 +526,6 @@ export function rebaseProposedInsertion(
   proposed: NormalizedProposedDocumentPatch
 ): NormalizedProposedDocumentPatch {
   return rebasePluginPatch(document, proposed, true);
-}
-
-function rebasePluginPatch(
-  document: ChemDraftDocument,
-  proposed: NormalizedProposedDocumentPatch,
-  retargetMissingPages: boolean
-): NormalizedProposedDocumentPatch {
-  const patch = proposed.patch as DocumentPatch;
-  const ops = writePatchOps(patch);
-  const existingIds = new Set(document.pages.flatMap((page) => page.objects.map((candidate) => candidate.id)));
-  // Reserve future insertion ids as well, so an allocated id cannot steal a later insertion's name.
-  const reservedIds = new Set(existingIds);
-  for (const op of ops) {
-    if (op.op === "addObject") reservedIds.add(op.object.id);
-    if (op.op === "addAnnotation") reservedIds.add(op.annotation.id);
-  }
-  // Allocate every insertion first: native references can point to the insertion itself or to a
-  // later batch member. Operation targets still follow batch order (an earlier edit targets the
-  // original object, while an edit after its colliding insertion targets the new object).
-  const insertionIds = new Map<string, string>();
-  let needsReferenceRemap = false;
-  const allocatedOps = ops.map(op => {
-    if (op.op !== "addObject" && op.op !== "addAnnotation") return op;
-    const insertion = rebaseInsertion(op);
-    const originalId = op.op === "addObject" ? op.object.id : op.annotation.id;
-    const id = insertion.op === "addObject" ? insertion.object.id : insertion.annotation.id;
-    needsReferenceRemap ||= originalId !== id;
-    if (!insertionIds.has(originalId)) insertionIds.set(originalId, id);
-    existingIds.add(id);
-    reservedIds.add(id);
-    return insertion;
-  });
-  const remappedIds = new Map<string, string>();
-  const rebasedOps = allocatedOps.map((op, index): DocumentPatch => {
-    const remap = (id: string): string => remappedIds.get(id) ?? id;
-    if (op.op !== "addObject" && op.op !== "addAnnotation") {
-      if ("objectId" in op) {
-        if (op.op !== "updateObject") return { ...op, objectId: remap(op.objectId) };
-        const changes = remapObjectReferences(op.changes, remap);
-        return { ...op, objectId: remap(op.objectId), changes: {
-          ...changes, ...(changes.id === undefined ? {} : { id: remap(changes.id) })
-        } };
-      }
-      if ("objectIds" in op) return { ...op, objectIds: op.objectIds.map(remap) };
-      if (op.op === "removeAnnotation") return { ...op, annotationId: remap(op.annotationId) };
-      const bondRef = (ref: { objectId: string; bondId: string }) => ({ ...ref, objectId: remap(ref.objectId) });
-      if (op.op === "setCrossingOverride") return { ...op, crossing: {
-        ...op.crossing, bonds: [bondRef(op.crossing.bonds[0]), bondRef(op.crossing.bonds[1])], front: bondRef(op.crossing.front)
-      } };
-      if (op.op === "clearCrossingOverride") return { ...op, bonds: [bondRef(op.bonds[0]), bondRef(op.bonds[1])] };
-      return op;
-    }
-    const original = ops[index]!;
-    if (original.op !== "addObject" && original.op !== "addAnnotation") throw new Error("Expected an allocated insertion.");
-    const originalId = original.op === "addObject" ? original.object.id : original.annotation.id;
-    const id = op.op === "addObject" ? op.object.id : op.annotation.id;
-    const referenceId = (reference: string) => reference === originalId ? id :
-      remappedIds.get(reference) ?? insertionIds.get(reference) ?? reference;
-    const insertion = !needsReferenceRemap ? op : op.op === "addObject"
-      ? { ...op, object: remapObjectReferences(op.object, referenceId) as DocumentObject }
-      : { ...op, annotation: remapObjectReferences(op.annotation, referenceId) as typeof op.annotation };
-    remappedIds.set(originalId, id);
-    return insertion;
-  });
-  if (patch.op === "batch") return { ...proposed, patch: { op: "batch", patches: rebasedOps } };
-  if (rebasedOps[0] === patch) return proposed;
-  return { ...proposed, patch: rebasedOps[0]! };
-
-  function rebaseInsertion(patch: Extract<DocumentPatch, { op: "addObject" | "addAnnotation" }>) {
-    const object: DocumentObject = patch.op === "addObject" ? patch.object : patch.annotation;
-    const fallbackPage = document.pages[0];
-    const pageExists = document.pages.some((page) => page.id === patch.pageId);
-    // Missing pages on a direct write remain an error for chem-core to report.
-    const retarget = retargetMissingPages && !pageExists && fallbackPage;
-    let rebased: DocumentObject = object;
-    if (existingIds.has(object.id)) rebased = { ...rebased, id: freshObjectId(reservedIds, object.id) };
-    const pageId = retarget ? fallbackPage.id : patch.pageId;
-    if (retarget) rebased = centredOnPage(rebased, fallbackPage);
-    if (rebased === object && pageId === patch.pageId) return patch;
-
-    return patch.op === "addObject"
-      ? { ...patch, pageId, object: rebased }
-      : { ...patch, pageId, annotation: rebased as typeof patch.annotation };
-  }
-}
-
-/**
- * All native object references in chem-core/schemas.ts, including structured warning references.
- * Atom/bond ids (anchors, bond endpoints, labelBondSide) are molecule-local and never rebased here;
- * their owning objectId changes. Provenance originalId, chemistry strings and opaque data stay intact.
- * Inspect fields rather than `type`: updateObject changes may omit the discriminant.
- */
-function remapObjectReferences(object: Partial<DocumentObject>, remap: (id: string) => string): Partial<DocumentObject> {
-  const anchor = (value: Anchor): Anchor => ({ ...value,
-    ...(value.objectId === undefined ? {} : { objectId: remap(value.objectId) })
-  });
-  const warnings = (values: CompatibilityWarning[] = []) => values.map(value => ({ ...value,
-    ...(value.objectId === undefined ? {} : { objectId: remap(value.objectId) })
-  }));
-  const attachments = <T extends { attachmentPoints: Anchor[]; warnings: CompatibilityWarning[] }>(value: T): T =>
-    ({ ...value, attachmentPoints: (value.attachmentPoints ?? []).map(anchor), warnings: warnings(value.warnings) });
-  const next = { ...object };
-  if (next.compatibility) next.compatibility = { ...next.compatibility, warnings: warnings(next.compatibility.warnings) };
-  if ("warnings" in next && next.warnings) next.warnings = warnings(next.warnings);
-  if ("chemistry" in next && next.chemistry) next.chemistry = { ...next.chemistry, warnings: warnings(next.chemistry.warnings) };
-  if ("metadata" in next && next.metadata) next.metadata = attachments(next.metadata);
-  if ("display" in next && next.display) next.display = attachments(next.display);
-  if ("superatoms" in next && next.superatoms) next.superatoms = next.superatoms.map(attachments);
-  if ("rGroups" in next && next.rGroups) next.rGroups = next.rGroups.map(attachments);
-  if ("components" in next && next.components) next.components = next.components.map((c) => ({ ...c, objectId: remap(c.objectId) }));
-  if ("conditionsTextObjectIds" in next && next.conditionsTextObjectIds) next.conditionsTextObjectIds = next.conditionsTextObjectIds.map(remap);
-  if ("containedObjectIds" in next && next.containedObjectIds) next.containedObjectIds = next.containedObjectIds.map(remap);
-  if ("childObjectIds" in next && next.childObjectIds) next.childObjectIds = next.childObjectIds.map(remap);
-  if ("targetObjectIds" in next && next.targetObjectIds) next.targetObjectIds = next.targetObjectIds.map(remap);
-  if ("labels" in next && next.labels) next.labels = next.labels.map(remap);
-  for (const key of ["start", "end", "source", "target", "anchor"] as const) {
-    if (key in next) {
-      const value = (next as Partial<Record<typeof key, Anchor>>)[key];
-      if (value) Object.assign(next, { [key]: anchor(value) });
-    }
-  }
-  return next;
-}
-
-/**
- * The first free `<prefix>_NNN` id, counting up from the document's object count — the same scheme the
- * document workflow's object-id allocator uses (`nextObjectId` in documentWorkflow.ts, not exported), so
- * an accepted structure reads like every other object in the file.
- */
-function freshObjectId(existingIds: ReadonlySet<string>, collidingId: string): string {
-  const prefix = collidingId.replace(/_\d+$/, "") || "object";
-  let index = existingIds.size + 1;
-  let id = `${prefix}_${String(index).padStart(3, "0")}`;
-  while (existingIds.has(id)) {
-    index += 1;
-    id = `${prefix}_${String(index).padStart(3, "0")}`;
-  }
-  return id;
-}
-
-/**
- * A molecule moved, as a whole, so its box is centred on `page` — the placement it was given on the page
- * it was proposed for. A molecule's atoms carry page coordinates, so they move with its box; only
- * positions change. Other objects keep their coordinates (a recognition proposal is always a molecule).
- */
-function centredOnPage(object: DocumentObject, page: ChemDraftDocument["pages"][number]): DocumentObject {
-  if (object.type !== "molecule") return object;
-  const dx = page.width / 2 - (object.x + object.width / 2);
-  const dy = page.height / 2 - (object.y + object.height / 2);
-  if (!Number.isFinite(dx) || !Number.isFinite(dy) || (dx === 0 && dy === 0)) return object;
-  return {
-    ...object,
-    x: object.x + dx,
-    y: object.y + dy,
-    atoms: object.atoms.map((atom) => ({ ...atom, x: atom.x + dx, y: atom.y + dy }))
-  };
 }
 
 /**

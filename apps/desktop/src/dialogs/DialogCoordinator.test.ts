@@ -4,11 +4,11 @@ import { DialogCoordinator } from "./DialogCoordinator";
 import { dialogEnvelope, type DialogCloseReason, type DialogMessage } from "./dialogProtocol";
 import type { DialogDelivery, DialogTransport } from "./dialogTransport";
 
-function host(options: { timeout?: number } = {}) {
+function host(options: { timeout?: number; kind?: string } = {}) {
   const calls: string[] = [];
   let handler: (delivery: DialogDelivery) => void = () => {};
   let snapshot!: Extract<DialogMessage, { type: "snapshot" }>;
-  const registration = { hostId: "opaque", windowLabel: "dialog-main-pageSize-1" };
+  const registration = { hostId: "opaque", windowLabel: `dialog-main-${options.kind ?? "pageSize"}-1` };
   const transport: DialogTransport = {
     subscribe: vi.fn(async h => { calls.push("subscribe"); handler = h; return vi.fn(); }),
     open: vi.fn(async s => { calls.push("open"); snapshot = s as typeof snapshot; return registration; }),
@@ -23,6 +23,75 @@ function host(options: { timeout?: number } = {}) {
 }
 afterEach(() => vi.useRealTimers());
 describe("DialogCoordinator", () => {
+  it("closes a ready page question on abort and ignores a late Enlarge answer", async () => {
+    const h = host({ kind: "pageEnlargement" });
+    const abort = new AbortController();
+    const returnedFocus = vi.fn();
+    const coordinator = new DialogCoordinator(h.transport, { ...h.owner, onPageEnlargementClosed: returnedFocus });
+    const decision = coordinator.confirmPageEnlargement("tab-1", abort.signal);
+    await vi.waitFor(() => expect(h.transport.open).toHaveBeenCalledOnce());
+    const deliver = (message: DialogMessage) =>
+      coordinator.receive({ message, senderWindowId: "dialog-main-pageEnlargement-1", windowLabel: "dialog-main-pageEnlargement-1" });
+    await deliver(h.message("ready", {}));
+    abort.abort();
+    await expect(decision).resolves.toBe("keep");
+    expect(h.transport.close).toHaveBeenCalledExactlyOnceWith("opaque", "cancel");
+    expect(returnedFocus).toHaveBeenCalledExactlyOnceWith("tab-1");
+    await deliver(h.message("action", { action: "enlarge" }));
+    expect(h.transport.close).toHaveBeenCalledOnce();
+    await coordinator.dispose();
+  });
+  it("closes the native window that registers after a page question is aborted", async () => {
+    const h = host();
+    let register!: (value: { hostId: string; windowLabel: string }) => void;
+    vi.mocked(h.transport.open).mockImplementation(() => new Promise(resolve => { register = resolve; }));
+    const abort = new AbortController();
+    const decision = h.coordinator.confirmPageEnlargement("tab-1", abort.signal);
+    await vi.waitFor(() => expect(h.transport.open).toHaveBeenCalledOnce());
+    abort.abort();
+    expect(h.transport.close).not.toHaveBeenCalled();
+    register({ hostId: "late", windowLabel: "dialog-main-pageEnlargement-1" });
+    await expect(decision).resolves.toBe("keep");
+    expect(h.transport.close).toHaveBeenCalledExactlyOnceWith("late", "cancel");
+    await h.coordinator.dispose();
+  });
+  it("keeps conditions tied to their original tab and arrow, deduplicates Save and refuses another arrow", async () => {
+    const h = host();
+    const apply = vi.fn(), settled = vi.fn();
+    const coordinator = new DialogCoordinator(h.transport, { applyPageSize: vi.fn(), applyReactionConditions: apply, onConditionsSettled: settled, onError: vi.fn() });
+    const draft = { side: "above" as const, spans: [{ text: "80 °C", script: "normal" as const }] };
+    await coordinator.openReactionConditions("tab-2", { title: "Other drawing", arrowId: "arrow-2", draft });
+    const snapshot = vi.mocked(h.transport.open).mock.calls[0][0];
+    const deliver = (type: string, data: unknown, requestId = "request-2", sender = "dialog-main-pageSize-1") => coordinator.receive({
+      senderWindowId: sender, windowLabel: "dialog-main-pageSize-1", message: { ...dialogEnvelope(snapshot), type, data, requestId } });
+    await deliver("ready", {});
+    await expect(coordinator.openReactionConditions("tab-2", { title: "Other", arrowId: "another-arrow", draft })).rejects.toThrow("Finish the open");
+    await deliver("action", { action: "apply", draft }, "forged", "wrong-window");
+    expect(apply).not.toHaveBeenCalled();
+    await Promise.all([deliver("action", { action: "apply", draft }), deliver("action", { action: "apply", draft })]);
+    expect(apply).toHaveBeenCalledExactlyOnceWith("tab-2", "arrow-2", draft);
+    expect(settled).toHaveBeenCalledExactlyOnceWith("tab-2");
+    await coordinator.dispose();
+  });
+  it('cancels native conditions when disabled without touching another dialog or accepting late Save',async()=>{
+    const h=host(),apply=vi.fn();
+    vi.mocked(h.transport.open).mockImplementation(async snapshot=>({hostId:snapshot.dialogKind,windowLabel:`dialog-main-${snapshot.dialogKind}-1`}));
+    const coordinator=new DialogCoordinator(h.transport,{...h.owner,applyReactionConditions:apply});
+    const draft={side:'above' as const,spans:[{text:'THF',script:'normal' as const}]};
+    await coordinator.openPageSize('tab-1',{title:'Drawing',width:8.5,height:11,unit:'inch'});
+    await coordinator.openReactionConditions('tab-1',{title:'Drawing',arrowId:'arrow-1',draft});
+    const snapshot=vi.mocked(h.transport.open).mock.calls.at(-1)![0];
+    await coordinator.closeReactionConditions();
+    expect(h.transport.close).toHaveBeenCalledExactlyOnceWith('reactionConditions','cancel');
+    expect(coordinator.reactionConditionsArrowId('tab-1')).toBeUndefined();
+    await coordinator.receive({senderWindowId:'dialog-main-reactionConditions-1',windowLabel:'dialog-main-reactionConditions-1',
+      message:{...dialogEnvelope(snapshot),requestId:'late',type:'action',data:{action:'apply',draft}}});
+    expect(apply).not.toHaveBeenCalled();
+    await coordinator.dispose();
+    expect(h.transport.close).toHaveBeenCalledWith('pageSize','ownerClose');
+    await h.coordinator.dispose();
+  });
+
   it("reopens the same guide and dispatches its save action", async () => {
     const h = host(); await h.coordinator.openVibeCodeGuide();
     const retained = vi.mocked(h.transport.open).mock.calls[0]![0];

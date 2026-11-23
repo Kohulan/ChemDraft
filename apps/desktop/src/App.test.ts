@@ -154,7 +154,6 @@ import {
   proposalWindowLifecycle,
   settleAnalysisWindowOpen,
   projectedPlaneTiltVectorFromDrag,
-  rotationDeltaDegrees,
   rotationInputHomeDraftDegrees,
   rotationInputDraftDegrees,
   rotationReadoutDegrees,
@@ -374,9 +373,9 @@ describe("ChemDraft desktop shell", () => {
   });
 
   it("opens analysis windows without focus and lends focus only to their editable controls", () => {
-    expect(desktopNativeSource).toContain("focused_on_build: false,");
-    expect(desktopNativeSource).toContain(".focused(presentation.focused_on_build)");
-    expect(desktopNativeSource).toContain("configure_analysis_window(&window)");
+    const buildPanel = desktopNativeSource.split("fn build_or_show_plugin_panel<")[1]!.split("fn reveal_plugin_panel<")[0]!;
+    expect(buildPanel).toContain(".focused(false)");
+    expect(buildPanel).toContain("reveal_plugin_panel(&target)");
     expect(desktopNativeSource).not.toContain("focus_after_show");
     expect(desktopNativeSource).toContain("validate_plugin_panel_focus_caller(window.label())?");
     expect(desktopNativeSource).toMatch(/async fn set_plugin_panel_input_focus\(/);
@@ -1776,7 +1775,7 @@ describe("ChemDraft desktop shell", () => {
     expect(commands.some((command) => command.id === "tool.atom")).toBe(true);
     expect(commands.some((command) => command.id === "tool.art.circle")).toBe(true);
     expect(commands.some((command) => command.id === "atom.setHoveredElement.O")).toBe(true);
-    expect(markup).toContain(".chemdraft,.cdxml,.xml,.json,chemical/x-cdxml,application/xml,text/xml,application/json");
+    expect(markup).toContain(".chemdraft,.cdx,.cdxml,.xml,.json,chemical/x-cdx,chemical/x-cdxml,application/xml,text/xml,application/json");
     expect(markup).not.toContain("Open Native Document");
     expect(markup).not.toContain("Validate Selected Structure");
   });
@@ -1864,7 +1863,7 @@ describe("ChemDraft desktop shell", () => {
     expect(exportFormSource).toContain("Creation program");
     expect(mainWindowSource).toContain("async function createDialogExportResult(");
     expect(mainWindowSource).toContain("async function writeNativeExportResult(");
-    expect(mainWindowSource).toContain("const result = await createDialogExportResult(source, { ...options, busy: false })");
+    expect(mainWindowSource).toContain("const result = await createDialogExportResult(source, { ...options, busy: false }, false, title)");
     expect(mainWindowSource).toContain("nativePathJoin(lastExportDirectoryRef.current, options.filename)");
     expect(mainWindowSource).toContain("await pickNativeExportPath(defaultPath, descriptor.menuLabel, descriptor.extensions, dialogCoordinatorRef.current?.exportSessionId(tabId))");
     expect(mainWindowSource).toContain("await writeNativeExportResult(path, result)");
@@ -1900,9 +1899,9 @@ describe("ChemDraft desktop shell", () => {
   });
 
   it("also offers the page-size choice when a pasted structure overflows the current page", () => {
-    // The SMILES paste path runs the same page-fit recommendation as the CDXML import path.
-    expect(mainWindowSource).toContain("recommendImportedPageFit(nextDocument)");
-    expect(mainWindowSource).toContain('displayName: "The pasted structure"');
+    // Paste now uses the shared pre-commit check and the insert's existing undo entry.
+    expect(mainWindowSource).toContain("commitWithPageFit(before, proposed");
+    expect(mainWindowSource).not.toContain("recommendImportedPageFit(nextDocument)");
   });
 
   it("passes the pressed key to the global shortcut guard", () => {
@@ -1921,10 +1920,9 @@ describe("ChemDraft desktop shell", () => {
     expect(registry.resolve({ key: "b" })).toBeUndefined();
     expect(registry.resolve({ key: "t" })).toBe("tool.text");
     expect(registry.resolve({ key: "e" })).toBe("tool.eraser");
-    expect(registry.resolve({ key: "1" })).toBe("atom.addSingleBondToHoveredAtom");
-    expect(registry.resolve({ key: "2" })).toBe("bond.setHoveredBondOrder.double");
-    expect(registry.resolve({ key: "3" })).toBe("bond.setHoveredBondOrder.triple");
-    expect(registry.resolve({ key: "k" })).toBe("atom.addCarbonylToHoveredAtom");
+    for (const key of ["1", "2", "3", "k"]) {
+      expect(registry.resolve({ key }), key).toBeUndefined();
+    }
     expect(registry.resolve({ key: "k", metaKey: true, shiftKey: true })).toBe(structureCleanupCommandId);
     expect(registry.resolve({ key: "+" })).toBe("tool.plus");
     expect(registry.resolve({ key: "-" })).toBe("tool.minus");
@@ -2054,7 +2052,7 @@ describe("ChemDraft desktop shell", () => {
 
     expect(tooltipFor("tool.select")?.shortcutLabel).toBe("Space");
     expect(tooltipFor("tool.bond")?.shortcutLabel).toBe("X");
-    expect(tooltipFor("tool.chain")?.shortcutLabel).toBe("⇧X");
+    expect(createDesktopShortcutRegistry(commands, "macos").resolve({ key: "X", shiftKey: true })).toBe("tool.chain");
     expect(tooltipFor("tool.text")?.shortcutLabel).toBe("T");
     // Unbound keys show no shortcut at all — not the stale ChemDraft key.
     expect(tooltipFor("tool.lasso")?.shortcut).toBeNull();
@@ -2070,7 +2068,7 @@ describe("ChemDraft desktop shell", () => {
     ).flat();
     const chemdraftTooltip = (id: string) => chemdraftItems.find((item) => item.id === id)?.tooltip;
     expect(chemdraftTooltip("tool.select")?.shortcutLabel).toBe("V");
-    expect(chemdraftTooltip("tool.chain")?.shortcutLabel).toBe("C");
+    expect(createDesktopShortcutRegistry(allShellCommands(createPhase4Document()), "macos").resolve({ key: "c" })).toBe("tool.chain");
     expect(chemdraftTooltip("tool.lasso")?.shortcutLabel).toBe("L");
   });
 
@@ -2433,6 +2431,11 @@ describe("ChemDraft desktop shell", () => {
     expect(hoveredNativeTargetShortcutCommand(bondTarget, "1")).toBe("bond.setHoveredBondOrder.single");
     expect(hoveredNativeTargetShortcutCommand(bondTarget, "2")).toBe("bond.setHoveredBondOrder.double");
     expect(hoveredNativeTargetShortcutCommand(bondTarget, "3")).toBe("bond.setHoveredBondOrder.triple");
+    expect(hoveredNativeTargetShortcutCommand(bondTarget, "w")).toBe("bond.setHoveredBondDisplay.wedge");
+    expect(hoveredNativeTargetShortcutCommand(bondTarget, "W")).toBe("bond.setHoveredBondDisplay.hashed");
+    expect(hoveredNativeTargetShortcutCommand(atomTarget, "w")).toBeUndefined();
+    expect(hoveredNativeTargetShortcutCommand(undefined, "w")).toBeUndefined();
+    expect(hoveredNativeTargetShortcutCommand(bondTarget, "e")).toBeUndefined();
     expect(hoveredNativeTargetShortcutCommand(atomTarget, "k")).toBe("atom.addCarbonylToHoveredAtom");
     expect(hoveredNativeTargetShortcutCommand(atomTarget, "K")).toBe("atom.addCarbonylToHoveredAtom");
     expect(hoveredNativeTargetShortcutCommand(atomTarget, "c")).toBe("atom.setHoveredElement.C");
@@ -2588,16 +2591,53 @@ describe("ChemDraft desktop shell", () => {
     // through this funnel; each must normalize the document it installs.
     // Assistant pushes/amendments share prepareDocumentCommit with ordinary edits, so they
     // record label bond sides while retaining one request entry, including in inactive tabs.
-    expect(mainWindowSource.match(/normalizeCommittedDocument\(/g)).toHaveLength(11);
-    expect(mainWindowSource).toMatch(/const prepareDocumentCommit = useCallback\([\s\S]*?const present = normalizeCommittedDocument\(nextDocument\);/);
-    expect(mainWindowSource).toContain("const present = prepareDocumentCommit(nextDocument, undoLabel);");
+    // The atom-problem fix path also normalizes commits into inactive tabs.
+    // Inactive-tab spacing keeps its original direct normalization; insertion tab commits
+    // share preparation, and plugin/proposal preflight also normalizes before checking fit.
+    // The conditions editor also commits to its original tab while it is inactive.
+    // A molecule-part drag (commitNativePartDrag) normalizes before naming its charge-aware Undo
+    // label (chargeAssociationUndoLabel), so the label describes the reconciled charge marks the
+    // committed document carries; commitDocumentHistoryFrom then normalizes it again, idempotently.
+    // The funnel now also runs the commit-time chemistry guard (commitChemistryGuard.ts) on every
+    // commit; a part drag moves atoms of a molecule, which is drawing, so it declares itself a
+    // chemistry edit (CHEMISTRY_EDIT) as the funnel's last argument.
+    expect(mainWindowSource.match(/normalizeCommittedDocument\(/g)).toHaveLength(15);
+    expect(mainWindowSource).toContain(
+      "const committed = normalizeCommittedDocument(result.document);\n    commitDocumentHistoryFrom(drag.startDocument, committed, chargeAssociationUndoLabel(drag.startDocument, committed, \"Move\"), undefined, CHEMISTRY_EDIT);"
+    );
+    const prepareDocumentCommitSource = mainWindowSource.slice(
+      mainWindowSource.indexOf("const prepareDocumentCommit = useCallback("),
+      mainWindowSource.indexOf("const pageFitPendingRef =")
+    );
+    expect(prepareDocumentCommitSource).toMatch(
+      /const normalized = normalizeCommittedDocument\(nextDocument\);\s*const present = assertFinalDocument\?\.\(normalized\) \?\? normalized;/
+    );
+    expect(prepareDocumentCommitSource).toContain("return present;");
+    const commitDocumentHistorySource = mainWindowSource.slice(
+      mainWindowSource.indexOf("const commitDocumentHistoryFrom ="),
+      mainWindowSource.indexOf("const commitInsertionHistoryWithPageFit =")
+    );
+    expect(commitDocumentHistorySource).toContain("const verified = assertFinalDocument ? prepareDocumentCommit(nextDocument, undoLabel, assertFinalDocument) : undefined;");
+    expect(commitDocumentHistorySource).toContain("const present = verified ?? prepareDocumentCommit(nextDocument, undoLabel);");
+    const commitDocumentChangeSource = mainWindowSource.slice(
+      mainWindowSource.indexOf("const commitDocumentChange ="),
+      mainWindowSource.indexOf("const commitDocumentChangeWithPageFit =")
+    );
+    // The Undo label may be a function (before, after) => string, so both guarded and unguarded
+    // paths go through one local `prepare` helper that still calls prepareDocumentCommit.
+    expect(commitDocumentChangeSource).toContain("return prepareDocumentCommit(next, undoLabel, assertFinalDocument);");
+    expect(commitDocumentChangeSource).toContain("const present = prepareDocumentCommit(next, undefined, assertFinalDocument);");
+    expect(commitDocumentChangeSource).toContain("const present = reusablePresent ?? prepare(currentHistory.present, nextDocument);");
+    const finalGuardIndex = commitDocumentChangeSource.indexOf("guardedPresent = prepare(current, next);");
+    expect(finalGuardIndex).toBeGreaterThan(-1);
+    expect(finalGuardIndex).toBeLessThan(commitDocumentChangeSource.indexOf("checkpointTextEditBeforeCommitRef.current()"));
     const assistantHistorySource = mainWindowSource.slice(
       mainWindowSource.indexOf("const assistantHistoryPort ="),
       mainWindowSource.indexOf("const assistantTransactions =")
     );
-    expect(assistantHistorySource).toContain("const present = prepareDocumentCommit(document, label);");
-    expect(assistantHistorySource).toContain("const present = labelled(after, label);");
-    expect(assistantHistorySource).toContain("present: labelled(after, label)");
+    expect(assistantHistorySource).toContain("const present = prepareDocumentCommit(document, label, assertFinalDocument);");
+    expect(assistantHistorySource).toContain("const present = labelled(after, label, assertFinalDocument);");
+    expect(assistantHistorySource.match(/const present = labelled\(after, label, assertFinalDocument\);/g)).toHaveLength(2);
     expect(mainWindowSource).not.toContain("reconcileNativeChargeMarks(");
     // A cancelled label edit, or one that ends on its starting text, puts back the record it
     // started with, not the drawing's side: at the keystroke that brings it back, at the close,
@@ -2606,13 +2646,27 @@ describe("ChemDraft desktop shell", () => {
     expect(mainWindowSource).toContain("labelBondSide: state.initialLabelBondSide");
     expect(mainWindowSource).toContain("applyNativeAtomLabelDraft(current,");
     expect(mainWindowSource).toContain("finishNativeAtomLabelEdit(baseline,");
-    expect(mainWindowSource).toContain("const clean = normalizeCommittedDocument(stripped);");
+    expect(mainWindowSource).toContain("const clean = stripped === current ? current : normalizeCommittedDocument(stripped);");
     expect(mainWindowSource).toContain("normalizeCommittedDocument(finishedAtomLabelDraft(current, edit).document)");
-    expect(mainWindowSource).toContain("const flushed = documentForFlush();");
+    const sessionFlushSource = mainWindowSource.slice(
+      mainWindowSource.indexOf("const writeDocumentSessionNow ="),
+      mainWindowSource.indexOf("const lockCommittedQuit =")
+    );
+    expect(sessionFlushSource).toMatch(
+      /const flushed = committedDraft\?\.tabId === activeDocumentTabIdRef\.current\s*\? committedDraft\.document : documentForFlush\(\);/
+    );
+    expect(sessionFlushSource).toContain("const tabDocument = draft?.document ?? (tab.id === activeDocumentTabIdRef.current ? flushed : snapshot.history.present);");
+    expect(sessionFlushSource).toContain("createNativeSavePayload(tabDocument)");
+    const quitDraftSource = mainWindowSource.slice(
+      mainWindowSource.indexOf("const lockCommittedQuit ="),
+      mainWindowSource.indexOf("const writeQuitSession =")
+    );
+    expect(quitDraftSource).toContain("const document = documentForFlush(");
+    expect(quitDraftSource).toContain("committedQuitDraftRef.current = { tabId, document, dirty, warning };");
     expect(mainWindowSource).toContain("const savedDocument = active ? documentForFlush() : savingDocument;");
-    expect(mainWindowSource).toContain("const payload = createNativeSavePayload(savedDocument);");
+    expect(mainWindowSource).toContain("createDocumentFileSave(savedDocument, finalPath)");
     expect(mainWindowSource).toContain("tabId === activeDocumentTabIdRef.current ? documentForFlush() : documentTabSnapshotsRef.current.get(tabId)?.history.present");
-    expect(mainWindowSource).toContain("createDialogExportResult(source, { ...options, busy: false })");
+    expect(mainWindowSource).toContain("createDialogExportResult(source, { ...options, busy: false }, false, title)");
     expect(mainWindowSource).not.toMatch(/createNativeSavePayload\(documentRef\.current\)/);
   });
 
@@ -2664,14 +2718,11 @@ describe("ChemDraft desktop shell", () => {
     expect(mainWindowSource).toContain("stereoPerceptionMolfile(molecule, warnings)");
   });
 
-  it("names why a charge-hotkey increment was refused: the ±9 cap, or the atom's valence", () => {
-    // A refused increment used to read "Cannot place positive charge on hovered atom" even though
-    // the mark WAS on the atom — it was the increment that was refused, past ±9 or past what the
-    // element can carry. The query itself is covered in documentWorkflow.test.ts; this guards the
-    // MainWindow wiring of both messages.
+  it("keeps the charge-hotkey format cap without a valence-refusal status", () => {
+    // The representation cap still has its own message; valence no longer vetoes charge edits.
     expect(mainWindowSource).toContain("nativeChargeStackRefusal(currentDocument, markSpec, target)");
     expect(mainWindowSource).toContain("Charge is already at the ±");
-    expect(mainWindowSource).toContain("cannot carry ${noun} at its current valence");
+    expect(mainWindowSource).not.toContain("cannot carry ${noun} at its current valence");
   });
 
   it("names the stacked magnitude in the charge status noun", () => {
@@ -2856,6 +2907,8 @@ describe("ChemDraft desktop shell", () => {
       "tool.eraser",
       "tool.text",
       "tool.bond",
+      "tool.doubleBond",
+      "tool.tripleBond",
       "tool.wedgeBond",
       "tool.hashedBond",
       "tool.dashedBond",
@@ -2901,6 +2954,7 @@ describe("ChemDraft desktop shell", () => {
       "tool.sOrbital",
       "tool.bracket",
       "tool.squareBracket",
+      "tool.roundBracket",
       "tool.chain",
       "style.formulaText",
       "layout.bringToFront",
@@ -2916,7 +2970,12 @@ describe("ChemDraft desktop shell", () => {
     ]);
     const disabledTools = paletteGroups.flat().filter((command) => !enabledToolIds.has(command.id));
 
-    expect(paletteGroups.flat().find((command) => command.id === "tool.bond")).toMatchObject({ enabled: true });
+    for (const id of ["tool.bond", "tool.doubleBond"]) {
+      expect(paletteGroups.flat().find((command) => command.id === id)).toMatchObject({ enabled: true });
+    }
+    // Triple remains enabled in the bond dropdown, without a standalone default cell.
+    expect(allPaletteCommands().find((command) => command.id === "tool.tripleBond")).toMatchObject({ enabled: true });
+    expect(paletteGroups.flat().find((command) => command.id === "tool.tripleBond")).toBeUndefined();
     expect(paletteGroups.flat().find((command) => command.id === "tool.text")).toMatchObject({ enabled: true });
     expect(paletteGroups.flat().find((command) => command.id === structureCleanupCommandId)).toMatchObject({ enabled: true });
     expect(paletteGroups.flat().find((command) => command.id === structureCleanup3dCommandId)).toMatchObject({
@@ -3003,24 +3062,13 @@ describe("ChemDraft desktop shell", () => {
     expect(toolPaletteSource).toContain("distributeModeCommandIds.spacing");
   });
 
-  it("matches rotate-handle tangential drag speed to projected-plane tilt speed", () => {
-    const center = { x: 0, y: 0 };
+  it("wraps projected-plane tilt after 360 pixels of drag", () => {
     const start = { x: 0, y: -20 };
 
-    expect(rotationDeltaDegrees(center, start, { x: 360, y: -20 })).toBe(360);
-    expect(rotationDeltaDegrees(center, start, { x: -360, y: -20 })).toBe(-360);
     expect(projectedPlaneTiltReadoutDegrees(projectedPlaneTiltRadiansFromDrag(start, { x: 0, y: -380 }))).toBe(0);
     expect(projectedPlaneTiltReadoutDegrees(projectedPlaneTiltRadiansFromDrag(start, { x: 0, y: -390 }))).toBe(10);
     expect(projectedPlaneTiltReadoutDegrees(projectedPlaneTiltRadiansFromDrag(start, { x: 0, y: 340 }))).toBe(0);
     expect(projectedPlaneTiltReadoutDegrees(projectedPlaneTiltRadiansFromDrag(start, { x: 0, y: 350 }))).toBe(10);
-  });
-
-  it("keeps short rotate-handle drags smooth instead of jumpy", () => {
-    const center = { x: 0, y: 0 };
-    const start = { x: 0, y: -20 };
-
-    expect(rotationDeltaDegrees(center, start, { x: 4, y: -20 })).toBe(4);
-    expect(rotationDeltaDegrees(center, start, { x: 8, y: -20 })).toBe(8);
   });
 
   it("uses the placement click point as the rotation origin for fresh bonds and templates", () => {
@@ -3126,14 +3174,21 @@ describe("ChemDraft desktop shell", () => {
   });
 
   it("threads Spin 3D placement through modeled typed rotation while preserving legacy X/Y tilt", () => {
-    // The numeric-rotation flatten must run the stereo read-back guard (spin3dFlattenStereoOptions),
-    // not commit geometry-only, so a typed rotation can't silently persist a different stereoisomer.
-    expect(mainWindowSource).toMatch(/flattenSpunMolecule\(\s*input\.startDocument,\s*input\.objectId,\s*coords3d,\s*quatToViewMatrix\(nextQuat\),\s*{\s*placement,\s*\.\.\.spin3dFlattenStereoOptions\(input\.startDocument,\s*input\.objectId,\s*warnings\)\s*}\s*\)/s);
+    const typedRotationSource = mainWindowSource.slice(
+      mainWindowSource.indexOf("const rotationInputDocumentFromDraft ="),
+      mainWindowSource.indexOf("const handleRotationInputChange =")
+    );
+    // The typed flatten uses the shared placement computed from the starting orientation and
+    // runs the stereo read-back guard before persisting a new projection.
+    expect(typedRotationSource).toContain("const { placement } = spinPlacementFor(object, coords3d, model.orientation);");
+    expect(typedRotationSource).toMatch(
+      /const options = spin3dFlattenStereoOptions\(input\.startDocument,\s*input\.objectId,\s*warnings\);\s*const outcome = flattenSpunMolecule\(\s*input\.startDocument,\s*input\.objectId,\s*coords3d,\s*quatToViewMatrix\(nextQuat\),\s*{\s*placement,\s*\.\.\.options\s*}\s*\)/
+    );
     expect(mainWindowSource).toContain("modeledRotationEntry ? 0");
-    expect(mainWindowSource).toMatch(/quatFromAxisAngle\(SPIN_AXIS_Z,\s*-deltaDegrees \* Math\.PI \/ 180\)/);
-    expect(mainWindowSource).toMatch(/attachSpin3dModelFromConformer\(nextDocument,\s*input\.objectId/s);
-    expect(mainWindowSource).toMatch(/tiltNativeMoleculeProjectedPlane\(\s*input\.startDocument,\s*input\.objectId/s);
-    expect(mainWindowSource).toMatch(/applyDocumentObjectProjectedPlaneTilt\(\s*input\.startDocument,\s*input\.objectId/s);
+    expect(typedRotationSource).toMatch(/quatFromAxisAngle\(SPIN_AXIS_Z,\s*-deltaDegrees \* Math\.PI \/ 180\)/);
+    expect(typedRotationSource).toMatch(/attachSpin3dModelFromConformer\(nextDocument,\s*input\.objectId/);
+    expect(typedRotationSource).toMatch(/tiltNativeMoleculeProjectedPlane\(\s*input\.startDocument,\s*input\.objectId/);
+    expect(typedRotationSource).toMatch(/applyDocumentObjectProjectedPlaneTilt\(\s*input\.startDocument,\s*input\.objectId/);
   });
 
   it("keeps a flatten's own writer warnings but drops the expected per-commit perspective-cleanup note", () => {
@@ -3246,7 +3301,7 @@ describe("ChemDraft desktop shell", () => {
     expect(mainWindowSource).toContain('data-group-tilt3d-handle="true"');
     expect(mainWindowSource).toContain("handleGroupProjectedPlaneTiltPointerDown");
     expect(mainWindowSource).toContain('"group-projected-plane-tilt"');
-    expect(mainWindowSource).toContain("center: { x: bounds.centerX, y: bounds.centerY }");
+    expect(mainWindowSource).toContain("const center = { x: bounds.centerX, y: bounds.centerY }");
     expect(mainWindowSource).toContain("tiltNativeMoleculeObjectsProjectedPlane");
   });
 
@@ -3906,7 +3961,7 @@ describe("ChemDraft desktop shell", () => {
     expect(toggles.every((command) => command.category === "view")).toBe(true);
   });
 
-  it("builds the shell catalog from the effective registry and current history availability", () => {
+  it("uses live toolbar titles and current history availability in the shell catalog", () => {
     const pluginCommands = allShellCommands(createPhase4Document(), undefined, {
       registry: buildRegistryWithFixture()
     });
@@ -4086,22 +4141,6 @@ describe("ChemDraft desktop shell", () => {
     expect(genericAt).toBeGreaterThan(cancelAt);
     // And it must restore the pre-drag document rather than keep the preview.
     expect(mainWindowSource).toContain("replacePresentDocument(drag.startDocument);");
-  });
-
-  it("filters transitional stubs and compat-only art variants out of both gallery sources", () => {
-    for (const source of [mainWindowSource, paletteWindowSource]) {
-      expect(source).toContain("!TRANSITIONAL_STUB_COMMAND_IDS.has(command.id)");
-      expect(source).toContain("!isCompatOnlyArtVariantCommandId(command.id, shipped)");
-      // From the SHIPPED manifest, never the user's customized registry. Keyed off the latter the
-      // gallery ate its own tail: remove a tool from a toolbar and it disappeared from the list you
-      // would put it back with, with no way to recover it short of resetting every layout.
-      // (Scoped to this block on purpose — elsewhere, following the customized registry is right.)
-      const filterAt = source.indexOf("!isCompatOnlyArtVariantCommandId(command.id, shipped)");
-      const galleryBlock = source.slice(Math.max(0, filterAt - 600), filterAt);
-      expect(galleryBlock).toContain("getToolsetCommandSpecs(desktopToolsetRegistry)");
-      expect(galleryBlock).not.toContain("getToolsetCommandSpecs(toolsetRegistry)");
-    }
-    expect(paletteWindowSource).toContain("commands={galleryCommands}");
   });
 
   it("treats art style presets as compat-only but keeps other unshipped art tools offered", () => {
@@ -4629,7 +4668,7 @@ describe("ChemDraft desktop shell", () => {
     );
     expect(ellipseMarkup).toContain('data-graphic-kind="ellipse"');
     expect(ellipseMarkup).not.toContain('data-graphic-corner-radius-handle="true"');
-    expect(mainWindowSource).toContain("planPageSvgRender(plannedDisplayPage)");
+    expect(mainWindowSource).toContain("planPageSvgRender(plannedDisplayPage, { directElectronMarkEditing })");
     expect(mainWindowSource).toContain('return object.type !== "molecule" || !isNativeMoleculeGraph(object);');
     expect(mainWindowSource).toContain('planNativeArtVisual(object, { coordinateSpace: "local" })');
     expect(mainWindowSource).toContain("left: pageScaledCssPx(plan.frameBounds.x)");
@@ -6043,7 +6082,7 @@ describe("ChemDraft desktop shell", () => {
     // with the graphic arrowhead marker. Its chemical identity is preserved for CDXML re-export.
     expect(markup).toContain("graphic-marker-end-");
     expect(markup).toContain("graphic-object");
-    expect(markup).toContain('data-graphic-kind="unknown"');
+    expect(markup).toContain('data-bracket-kind="round"');
     expect(markup).toContain("generic-object");
     expect(markup).toContain('data-atom-count="5"');
   });
@@ -6355,6 +6394,9 @@ describe("ChemDraft desktop shell", () => {
       expect(clearedMolecule?.atoms.find((atom) => atom.id === selectedAtomIds[index])?.warningSuppressed).toBe(true);
       expect(clearedMolecule?.atoms.find((atom) => atom.id === molecule.atoms[1].id)?.warningSuppressed).toBeUndefined();
       expect(clearedMolecule ? nativeMoleculeInvalidAtomStates(clearedMolecule).map((state) => state.atomId) : [])
+        .toEqual(molecule.atoms.map(atom => atom.id));
+      expect(clearedMolecule ? nativeMoleculeInvalidAtomStates(clearedMolecule)
+        .filter(state => !state.warningSuppressed).map(state => state.atomId) : [])
         .toEqual([molecule.atoms[1].id]);
     }
   });
@@ -7030,4 +7072,11 @@ describe("ChemDraft desktop shell", () => {
     expect(resized.pages[0].objects[0]).toEqual(moleculeBefore);
     expect(resized.selection).toEqual(document.selection);
   });
+});
+
+it("registers a customizable ordinary-arrow conditions command behind the opt-in gate",()=>{
+  const doc=createPhase4Document();
+  const command=allShellCommands(doc).find(command=>command.id==="arrow.conditions");
+  expect(command).toMatchObject({title:"Reaction conditions…",enabled:false,disabledReason:"Enable Compound layout tools in Settings"});
+  expect(isValidToolsetCommandId("arrow.conditions")).toBe(true);
 });

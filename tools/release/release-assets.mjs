@@ -1,0 +1,138 @@
+// Shared, platform-neutral checks over the final artifact bytes and source identity.
+import { spawnSync } from "node:child_process";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { artifactDigest, BUILD_TARGETS, COMMIT_PATTERN, LINUX_BUILD_TARGET } from "./record-build.mjs";
+import { loadUpdaterPublicKey, RELEASE_DOWNLOAD_BASE, verifyUpdaterSignature, WINDOWS_PLATFORM_KEY } from "./windows-updater.mjs";
+
+export { writeReleaseChecksums } from "./release-checksums.mjs";
+
+// Each updater-capable Windows installer has its own .sig and feed. Offline media has neither.
+export const WINDOWS_UPDATE_FEEDS = [
+  { suffix: "x64-setup.exe", feed: "latest.json" },
+  { suffix: "x64-allusers-setup.exe", feed: "latest-allusers.json" }
+];
+
+export function windowsUpdateFiles(version) {
+  return WINDOWS_UPDATE_FEEDS.map(({ suffix, feed }) => {
+    const installer = `ChemDraft_${version}_${suffix}`;
+    return { installer, signature: `${installer}.sig`, feed };
+  });
+}
+
+export function verifyWindowsUpdateAssets({ assets, version, allowIncomplete = false }, { updaterPublicKey } = {}) {
+  const present = new Set(readdirSync(assets));
+  const read = (name, encoding) => {
+    try { return readFileSync(join(assets, name), encoding); }
+    catch (error) { throw new Error(`${name}: ${error.code === "ENOENT" ? "missing release file" : error.message}`); }
+  };
+  for (const { installer, signature: signatureName, feed: feedName } of windowsUpdateFiles(version)) {
+    // An absent Windows build may be deferred, but a partial updater package must fail closed.
+    if (allowIncomplete && ![installer, signatureName, feedName].some((name) => present.has(name))) continue;
+    const signature = read(signatureName, "utf8").trim();
+    const manifest = read(feedName, "utf8");
+    let feed;
+    try { feed = JSON.parse(manifest); }
+    catch (error) { throw new Error(`${feedName}: ${error.message}`); }
+    if (feed?.version !== version) throw new Error(`${feedName}: version: expected ${version}, found ${feed?.version}`);
+    const platforms = feed.platforms;
+    const keys = platforms && typeof platforms === "object" && !Array.isArray(platforms) ? Object.keys(platforms) : [];
+    if (keys.length !== 1 || keys[0] !== WINDOWS_PLATFORM_KEY) {
+      throw new Error(`${feedName}: platforms: expected ${WINDOWS_PLATFORM_KEY}, found ${keys.join(", ") || JSON.stringify(platforms)}`);
+    }
+    const entry = platforms[WINDOWS_PLATFORM_KEY];
+    const expectedUrl = `${RELEASE_DOWNLOAD_BASE}/v${version}/${encodeURIComponent(installer)}`;
+    if (entry?.url !== expectedUrl) throw new Error(`${feedName}: platforms.${WINDOWS_PLATFORM_KEY}.url: expected ${expectedUrl}, found ${JSON.stringify(entry?.url)}`);
+    if (entry?.signature !== signature) {
+      throw new Error(`${feedName}: platforms.${WINDOWS_PLATFORM_KEY}.signature: expected ${JSON.stringify(signature)} from ${signatureName}, found ${JSON.stringify(entry?.signature)}`);
+    }
+    const bytes = read(installer);
+    try { verifyUpdaterSignature(bytes, signature, updaterPublicKey ?? loadUpdaterPublicKey()); }
+    catch (error) { throw new Error(`${signatureName}: ${error.message}`); }
+  }
+}
+
+export function expectedReleaseCommit({ commit, tag, rootDir }, { run = spawnSync } = {}) {
+  if (commit !== undefined && !COMMIT_PATTERN.test(commit)) throw new Error("Expected --commit to be a full 40-character SHA");
+  if (!tag && !commit) throw new Error("Expected --commit or a release --tag; an expected commit is mandatory");
+  if (!tag) return commit;
+  if (!/^v\d+\.\d+\.\d+$/.test(tag)) throw new Error("Expected release --tag vX.Y.Z");
+  const git = (args) => run("git", args, { cwd: rootDir, encoding: "utf8" });
+  // Always refresh, including an existing local tag. A conflicting local tag fails closed.
+  const fetched = git(["fetch", "origin", "tag", tag, "--no-tags"]);
+  if (fetched.status !== 0) throw new Error(`Expected --commit or a resolvable release tag: cannot fetch ${tag}: ${fetched.stderr || fetched.error?.message || "git fetch failed"}`);
+  // FETCH_HEAD is the fetched origin value, rather than a pre-existing local ref.
+  const result = git(["rev-parse", "--verify", "--quiet", "FETCH_HEAD^{commit}"]);
+  const taggedCommit = result.stdout?.trim();
+  if (result.status !== 0 || !COMMIT_PATTERN.test(taggedCommit ?? "")) throw new Error(`Cannot resolve release tag ${tag} to a full commit`);
+  if (commit && commit !== taggedCommit) throw new Error(`--commit ${commit} disagrees with tag ${tag} (${taggedCommit})`);
+  return taggedCommit;
+}
+
+export function releaseBuildFiles(version) {
+  if (!/^\d+\.\d+\.\d+$/.test(version ?? "")) throw new Error("Expected --version X.Y.Z");
+  return Object.entries(BUILD_TARGETS).flatMap(([target, suffixes]) =>
+    suffixes.map((suffix) => ({ target, name: `ChemDraft_${version}_${suffix}` })));
+}
+
+export function missingBuildFiles(assets, version) {
+  // verifyBuildAssets rejects incomplete Linux sets before the checker reports missing required files.
+  return releaseBuildFiles(version)
+    .filter(({ target }) => target !== LINUX_BUILD_TARGET)
+    .flatMap(({ name }) => [name, `${name}.build.json`])
+    .filter((name) => {
+      try { return !statSync(join(assets, name)).isFile(); } catch { return true; }
+    });
+}
+
+export function verifyBuildAssets({ assets, version, expectedCommit, allowIncomplete = false }, { checkDmgCommit, updaterPublicKey } = {}) {
+  if (!COMMIT_PATTERN.test(expectedCommit ?? "")) throw new Error("An expected full source commit is mandatory");
+  const builds = releaseBuildFiles(version);
+  const allowed = new Set(builds.flatMap(({ name }) => [name, `${name}.build.json`]));
+  for (const { signature, feed } of windowsUpdateFiles(version)) {
+    allowed.add(signature);
+    allowed.add(feed);
+  }
+  const errors = [];
+  // Feeds, checksums and notes are allowed; unexpected packages/signatures/records are not.
+  const present = new Set(readdirSync(assets));
+  const isPresent = ({ name }) => present.has(name) || present.has(`${name}.build.json`);
+  const hasLinuxAssets = builds.some((build) => build.target === LINUX_BUILD_TARGET && isPresent(build));
+  for (const name of present) {
+    if (/\.(?:dmg|exe|deb|appimage|build\.json|sig|msi|zip|pkg|tar\.gz)$/i.test(name) && !allowed.has(name)) errors.push(`Unexpected release build: ${name}`);
+  }
+  let commonCommit;
+  let commonBuild;
+  const checked = [];
+  for (const build of builds) {
+    const { target, name } = build;
+    // The optional Linux beta set must be complete once any package or record appears.
+    if (target === LINUX_BUILD_TARGET ? !hasLinuxAssets : allowIncomplete && !isPresent(build)) continue;
+    const file = join(assets, name);
+    const recordName = `${name}.build.json`;
+    checked.push(name);
+    let record;
+    try { record = JSON.parse(readFileSync(`${file}.build.json`, "utf8")); }
+    catch (error) { errors.push(`${recordName}: ${error.code === "ENOENT" ? "missing build record" : error.message}`); }
+    if (record !== undefined) {
+      if (!COMMIT_PATTERN.test(record?.commit ?? "")) errors.push(`${recordName}: expected full 40-character commit`);
+      else {
+        if (!commonCommit) { commonCommit = record.commit; commonBuild = recordName; }
+        if (record.commit !== commonCommit) errors.push(`${recordName}: commit ${record.commit} differs from ${commonBuild} (${commonCommit})`);
+        if (record.commit !== expectedCommit) errors.push(`${recordName}: commit ${record.commit} does not match expected commit (${expectedCommit})`);
+      }
+      if (record?.clean !== true) errors.push(`${recordName}: source tree must be clean (clean: true)`);
+      if (record?.version !== version) errors.push(`${recordName}: expected version ${version}, found ${record?.version}`);
+      if (record?.target !== target) errors.push(`${recordName}: expected target ${target}, found ${record?.target}`);
+    }
+    try {
+      const digest = artifactDigest(file);
+      if (!/^[0-9a-f]{64}$/.test(record?.sha256 ?? "") || digest.sha256 !== record.sha256) errors.push(`${recordName}: SHA-256 mismatch for ${name}`);
+      if (!Number.isSafeInteger(record?.size) || digest.size !== record.size) errors.push(`${recordName}: size mismatch for ${name}`);
+      if (name.endsWith(".dmg") && checkDmgCommit) checkDmgCommit(file, target, expectedCommit, record?.commit);
+    } catch (error) { errors.push(`${name}: ${error.code === "ENOENT" ? "missing release file" : error.message}`); }
+  }
+  if (errors.length) throw new Error(errors.join("\n"));
+  if (!allowIncomplete) verifyWindowsUpdateAssets({ assets, version }, { updaterPublicKey });
+  return checked;
+}

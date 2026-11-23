@@ -9,8 +9,16 @@ the bounded native grace period; it pauses only once the save dialog is actually
 Save and Discard re-arm that grace before flushing the session. Prompt controls are restricted
 to the document window. On macOS, Dock Quit also checks the preference and reveals hidden
 documents for the prompt; system logout, restart, and shutdown remain non-blocking.
+If macOS cancels logout after ChemDraft receives the committed quit notification and the app
+stays open, editing remains locked and autosave stays off until you relaunch ChemDraft.
 
 Tauri v2, Vite, React, and TypeScript desktop shell for ChemDraft.
+
+Content-fit dialogs measure intrinsic minimum width in the shared dialog host. Text styled with
+`text-overflow: ellipsis` and horizontal `overflow: hidden` or `clip` contributes its declared
+minimum width or a small 32px floor instead of its full text width. Measurement overrides are
+temporary. Width reports are capped at 4096 CSS pixels; native placement further caps both
+dimensions to the destination work area, keeping the footer accessible.
 
 Ring templates are grouped under the benzene button in Main and Structure. Long-press or
 press Arrow Down for saturated 3–8-membered rings, benzene and the two chair cyclohexanes.
@@ -37,6 +45,11 @@ macOS and Ctrl+, on Windows.
 
 While editing an existing text box, only the live formatted preview is shown. The saved drawing
 returns with the updated content when editing ends; other labels remain visible throughout.
+
+Charges have a centered move target of at least 36 CSS pixels at every page zoom, with either
+Direct electron-mark editing setting. The visible sign and saved/exported size stay the same.
+With direct editing enabled, resize corners sit outside that move target; Shift-drag still
+stretches the mark independently in each direction.
 
 Plugin catalog and local engine downloads use reqwest 0.12 with both Mozilla and OS certificate
 roots, so macOS and Windows enterprise trust stores can participate without disabling certificate
@@ -124,3 +137,27 @@ Turning the option off cannot recover an older session after new work has replac
 The preference uses the same localStorage mechanism as other boolean preferences. It is captured
 synchronously once by the document window before its asynchronous session read; no live document
 broadcast is needed for a next-launch-only option. No native command or session migration is added.
+
+## Formatted reaction conditions
+
+Enable **Compound layout tools**, then **Formatted Reaction Conditions** in Settings/Preferences;
+both start off. Right-click an ordinary arrow and choose **Reaction conditions…**. The registered
+command can also be added through toolbar customization. Double-click an existing conditions label
+to reopen its editor; a bare arrow does not open the editor on double-click.
+
+The movable native editor supports symbol insertion, normal/subscript/superscript text, a formatted
+preview, and Top / inside or Bottom / outside placement. Straight-arrow Top follows page top
+(left for an exactly vertical shaft). Save creates one Undo entry; Cancel leaves the drawing alone,
+and blank Save removes the label. Labels are editable native text, follow their arrow through
+transforms and clipboard operations, and can be dragged to adjust their placement. Disabling
+authoring keeps existing labels visible and attached. SVG and PDF use the canvas rendering plan.
+
+## Adjustable wavy lines
+
+Select a Wavy Line and open Object Settings to adjust **Wave smoothness**, **Wave height** and
+**Wave width** with sliders. Height is peak-to-trough; width is wave spacing in document pixels.
+Dragging previews the shape and release saves one Undo step. Settings survive native save/reopen
+and use the same geometry for canvas and export. Escape or cancelling a drag restores the starting
+shape. Width fits whole cycles between the endpoints, so actual spacing may differ on short lines.
+Only selected wavy art paths change, including in mixed selections; molecules and other graphics
+stay unchanged. Existing lines keep their legacy shape until a wave slider is explicitly adjusted.

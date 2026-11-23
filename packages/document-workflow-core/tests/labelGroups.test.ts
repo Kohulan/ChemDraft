@@ -8,6 +8,7 @@ import {
   type MoleculeObject
 } from "@chemdraft/chem-core";
 import type { ExportWarning } from "@chemdraft/export-engine";
+import { parseMolfileGraph } from "@chemdraft/clipboard-adapter";
 import { nativeBondOrderResolution } from "@chemdraft/layout-engine";
 import { ensureRdkit } from "../../rdkit-adapter/src/conformer";
 import { compositionFromRdkitJson, type RdkitJson } from "../../rdkit-adapter/src/composition";
@@ -16,6 +17,8 @@ import { installNodeRdkitModuleLoader } from "@chemdraft/rdkit-adapter/node";
 import { abbreviationDefinitions } from "@chemdraft/template-library";
 
 import {
+  chemicalIdentityMolfile,
+  layoutReactionScheme,
   expandNativeLabelGroups,
   expandNativeMoleculeLabelGroups,
   moleculeSmiles,
@@ -56,6 +59,49 @@ function withMol<T>(input: string, read: (mol: RdkitMol) => T): T {
 }
 
 const canonical = (input: string): string => withMol(input, (mol) => mol.get_smiles());
+
+it.each([
+  ["NaOH", [atom("na", "Na", 0, 0, { formalCharge: 1 }), atom("oh", "O", 22, 0, { formalCharge: -1 })], [], 1, 0],
+  ["MgBr", [atom("c", "C", 0, 0), atom("mg", "Mg", 22, 0), atom("br", "Br", 44, 0)],
+    [bond("cmg", "c", "mg"), bond("mgbr", "mg", "br")], 2, 1]
+] as const)("rebuilds stored graph metadata after condensing %s", async (_label, atoms, bonds, atomCount, bondCount) => {
+  const original = molecule([...atoms], [...bonds]);
+  const before = canonical(chemicalIdentityMolfile(original));
+  const scheme = layoutReactionScheme({ reactants: [{ molecule: original }], products: [], arrowKind: "forward",
+    anchor: { x: 24, y: 120 }, gutter: 24, bondLength: 22, pagePadding: 24 });
+  const condensed = scheme.document.pages[0]!.objects.find((object): object is MoleculeObject => object.type === "molecule")!;
+  expect(condensed.atoms).toHaveLength(atomCount);
+  expect(condensed.bonds).toHaveLength(bondCount);
+  expect(condensed.chemistry).toMatchObject({ atomCount, bondCount });
+  expect(condensed.structureFormat).toBe("molfile-v2000");
+  const stored = parseMolfileGraph(condensed.structure);
+  expect(stored.atoms).toHaveLength(atomCount);
+  expect(stored.bonds).toHaveLength(bondCount);
+  expect(canonical(chemicalIdentityMolfile(condensed))).toBe(before);
+  expect(canonical(await moleculeSmiles(condensed, 0, [], undefined))).toBe(before);
+});
+
+it("keeps typed NaOH as the release formula placeholder and expands only explicit scheme NaOH", async () => {
+  const typed = molecule([atom("naoh", "NaOH", 0, 0, { labelLiteral: true })], []);
+  expect(nativeAtomLabelReading("NaOH").kind).toBe("formula");
+  expect(expandNativeMoleculeLabelGroups(typed).expansions).toEqual([]);
+  expect(await moleculeSmiles(typed, 0, [], undefined)).toBe("[*]");
+  // Release 357f3ff6 writes the unexpanded formula as an R group, never an ion pair.
+  const baseline = moleculeToMolfileV2000(typed, { fromDocFrame: true, abbreviations: "rgroup", kekuleBondOrders: new Map() }).contents;
+  expect(chemicalIdentityMolfile(typed)).toBe(baseline);
+  expect(baseline).toContain("R#");
+  const salt = molecule([atom("na", "Na", 0, 0, { formalCharge: 1 }),
+    atom("oh", "O", 22, 0, { formalCharge: -1 })], []);
+  const scheme = layoutReactionScheme({ reactants: [{ molecule: salt }], products: [], arrowKind: "forward",
+    anchor: { x: 24, y: 120 }, gutter: 24, bondLength: 22, pagePadding: 24 });
+  const condensed = scheme.molecules[0]!;
+  expect(condensed.atoms[0]!.schemeAbbreviation).toBe("NaOH");
+  expect(canonical(chemicalIdentityMolfile(condensed))).toBe(canonical("[Na+].[OH-]"));
+  expect(canonical(await moleculeSmiles(condensed, 0, [], undefined))).toBe(canonical("[Na+].[OH-]"));
+  // Retyping the label must not inherit a scheme-specific expansion.
+  const retyped = { ...condensed, atoms: condensed.atoms.map(a => ({ ...a, labelLiteral: true })) };
+  expect(expandNativeMoleculeLabelGroups(retyped).expansions).toEqual([]);
+});
 const rdkitFormula = (input: string): string =>
   withMol(input, (mol) => compositionFromRdkitJson(JSON.parse(mol.get_json()) as RdkitJson).formula);
 

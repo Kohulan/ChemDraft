@@ -3,8 +3,12 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChemDraftDocument, MechanismArrowObject, MoleculeObject } from "@chemdraft/chem-core";
+import { applyPatch, moleculeToMolfileV2000 } from "@chemdraft/chem-core";
+import { insertSmilesMolecule, setReactionArrowConditions } from "@chemdraft/document-workflow-core";
 import * as layout from "@chemdraft/layout-engine";
 import type { PageSvgElementFragment, PageSvgFragment } from "@chemdraft/layout-engine";
+import { depictSmiles2D } from "@chemdraft/ocl-adapter";
+import { Molecule } from "openchemlib";
 import { MainWindow, groupedDragObjectIdsForPointer } from "./MainWindow";
 import * as workflow from "./documentWorkflow";
 import { DOM_COMMAND_EVENT } from "./window-manager";
@@ -57,10 +61,10 @@ describe("object move retained SVG preview", () => {
     for (let i = 0; i < count; i++) doc = workflow.insertNativeTemplateMolecule(doc, { x: 300, y: 300 }, "benzene");
     return workflow.selectDocumentObjects(doc, doc.pages[0].id, doc.pages[0].objects.map(object => object.id));
   }
-  async function mount(doc: ChemDraftDocument) {
+  async function mount(doc: ChemDraftDocument, shortcutPlatform?: "macos" | "windows") {
     await act(async () => root.render(createElement(MainWindow, {
       initialDocument: doc, initialActiveToolCommandId: "tool.select", initialPaletteMode: "hidden",
-      initialRulersVisible: false, initialCrosshairsVisible: false, nativePalette: false
+      initialRulersVisible: false, initialCrosshairsVisible: false, nativePalette: false, shortcutPlatform
     })));
     container.querySelector<HTMLElement>(".page")!.getBoundingClientRect = () => ({
       x: 0, y: 0, left: 0, top: 0, right: 792, bottom: 612, width: 792, height: 612, toJSON: () => ({})
@@ -70,6 +74,37 @@ describe("object move retained SVG preview", () => {
   async function command(commandId: string) {
     await act(async () => window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId } })));
   }
+
+  it.each(["macos", "windows"] as const)("labels the toolbar rotation clockwise and turns an asymmetric selection that way (%s)", async platform => {
+    const smiles = "CCO";
+    const doc = insertSmilesMolecule(workflow.createPhase4Document("Clockwise rotation"), { x: 300, y: 300 }, depictSmiles2D(smiles), smiles);
+    await mount(doc, platform);
+    await command("view.toolset.toggle.core.layout");
+    const button = container.querySelector<HTMLButtonElement>('button.icon-button[data-command-id="layout.rotate90"]')!;
+    expect(button.disabled).toBe(false);
+    expect(button.dataset.tooltip).toBe("Rotate 90° Clockwise");
+    expect(button.getAttribute("aria-label")).toBe(button.dataset.tooltip);
+    expect(button.dataset.toolbarAsset).toBe("Custom_Rotation");
+
+    const molecule = () => snapshot().pages[0].objects[0] as MoleculeObject;
+    const before = molecule();
+    await act(async () => button.click());
+    const after = molecule();
+    const [from, to] = before.atoms;
+    const rotatedFrom = after.atoms.find(atom => atom.id === from.id)!;
+    const rotatedTo = after.atoms.find(atom => atom.id === to.id)!;
+    // In page coordinates a clockwise turn maps (dx, dy) to (-dy, dx).
+    expect(rotatedTo.x - rotatedFrom.x).toBeCloseTo(from.y - to.y, 6);
+    expect(rotatedTo.y - rotatedFrom.y).toBeCloseTo(to.x - from.x, 6);
+    const exported = Molecule.fromMolfile(moleculeToMolfileV2000(after, { kekuleBondOrders: new Map() }).contents);
+    expect(exported.toSmiles()).toBe(Molecule.fromSmiles(smiles).toSmiles());
+    expect(exported.getMolecularFormula().formula).toBe("C2H6O");
+    expect(after.atoms).toHaveLength(3);
+    expect(after.bonds).toHaveLength(2);
+    await command("edit.undo");
+    expect(molecule()).toEqual(before);
+  });
+
   function pointer(target: EventTarget, type: string, point: { x: number; y: number }) {
     const event = new MouseEvent(type, { bubbles: true, cancelable: true, button: 0,
       buttons: type === "pointerup" ? 0 : 1, clientX: point.x, clientY: point.y });
@@ -146,6 +181,36 @@ describe("object move retained SVG preview", () => {
     return workflow.selectDocumentObjects(doc, doc.pages[0].id,
       allAnchorsMoved ? [left.id, right.id, arrow.id] : [right.id, arrow.id]);
   }
+
+  it.each(["macos", "windows"] as const)("moves the group frame with the display-only conditions-page preview (%s)", async platform => {
+    let doc = rings();
+    const arrow = workflow.createNativeArtLineGraphicObject(doc, { x: 100, y: 450 }, { x: 340, y: 450 }, "tool.art.reactionArrow")!;
+    doc = applyPatch(doc, { op: "addObject", pageId: doc.pages[0].id, object: arrow });
+    doc = setReactionArrowConditions(doc, arrow.id, { side: "above", spans: [{ text: "THF", script: "normal" }] });
+    doc = workflow.selectDocumentObjects(doc, doc.pages[0].id, doc.pages[0].objects.filter(object => object.type === "molecule").map(object => object.id));
+    await mount(doc, platform);
+    const drag = await start();
+    const frameBounds = () => {
+      const frame = container.querySelector<HTMLElement>("[data-group-selection]")!;
+      return [frame.style.left, frame.style.top, frame.style.width, frame.style.height]
+        .map(value => Number(value.match(/-?[\d.]+/)![0]));
+    };
+    const initialBounds = frameBounds(), initialPaint = paintedSvg();
+    for (const [dx, dy] of [[20, 15], [40, 30]]) {
+      await move(drag.target, { x: drag.point.x + dx, y: drag.point.y + dy });
+      expect(snapshot()).toEqual(drag.before);
+      expect(paintedSvg()).not.toEqual(initialPaint);
+      const bounds = frameBounds();
+      expect(bounds[0]).toBeCloseTo(initialBounds[0] + dx);
+      expect(bounds[1]).toBeCloseTo(initialBounds[1] + dy);
+      expect(bounds.slice(2)).toEqual(initialBounds.slice(2));
+    }
+    await act(async () => pointer(drag.target, "pointercancel", drag.point));
+    expect(frameBounds()).toEqual(initialBounds);
+    expect(snapshot()).toEqual(drag.before);
+    expect(paintedSvg()).toEqual(initialPaint);
+    expect(container.querySelector("main")?.getAttribute("data-can-undo")).toBe("false");
+  });
 
   it.each([false, true])("clears tab-switch previews and uses connected targets on the next drag (arrow: %s)", async arrow => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(1000);
@@ -303,6 +368,20 @@ describe("object move retained SVG preview", () => {
     expect(handles()).toEqual(previewHandles);
     expect(snapshot()).toEqual(oldMove(drag.before, drag.molecule, 40, 30));
     expectGeometry(snapshot());
+  });
+
+  it.each(["MacIntel", "Win32"])("labels a whole group move as one undo (%s)", async platform => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue(platform);
+    await mount(scenario("grouped"));
+    const drag = await start();
+    const end = { x: drag.point.x + 40, y: drag.point.y + 30 };
+    await move(drag.target, end);
+    await act(async () => pointer(drag.target, "pointerup", end));
+    expect(snapshot()).toEqual(oldMove(drag.before, drag.molecule, 40, 30));
+    await command("edit.undo");
+    expect(snapshot()).toEqual(drag.before);
+    expect(container.querySelector('[role="status"]')?.textContent).toBe("Undid Move group");
+    expect(container.querySelector("main")?.getAttribute("data-can-undo")).toBe("false");
   });
 
   it.each(["single", "molecules", "mixed", "rotated tilted", "grouped", "mixed grouped rotated tilted"])(

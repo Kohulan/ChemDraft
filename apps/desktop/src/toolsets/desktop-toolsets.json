@@ -181,6 +181,11 @@
                     "label": "Bold Bond",
                     "icon": "bond",
                     "assetName": "Custom_Bond_Bold"
+                  },
+                  {
+                    "commandId": "tool.wavyBond",
+                    "label": "Wavy bond",
+                    "icon": "wavyBond"
                   }
                 ],
                 "id": "bond-tools"
@@ -288,58 +293,6 @@
               }
             },
             {
-              "commandId": "tool.chain",
-              "title": "Chain Tool",
-              "icon": "chain",
-              "assetName": "Custom_Draw_Line",
-              "shortcutDisplay": "C",
-              "category": "structure",
-              "id": "tool.chain",
-              "kind": "button",
-              "label": "Chain Tool",
-              "primary": {
-                "type": "command",
-                "commandId": "tool.chain"
-              },
-              "submenu": {
-                "type": "command-grid",
-                "title": "Chain tools",
-                "columns": 2,
-                "items": [
-                  {
-                    "commandId": "tool.chain",
-                    "label": "Chain",
-                    "icon": "chain",
-                    "assetName": "Custom_Draw_Line",
-                    "tooltip": {
-                      "title": "Chain Tool",
-                      "shortcut": "C",
-                      "description": "Zig-zag chain along a straight drag; drag length sets the carbon count."
-                    }
-                  },
-                  {
-                    "commandId": "tool.chainFlexible",
-                    "label": "Flexible Chain",
-                    "icon": "chainFlexible",
-                    "tooltip": {
-                      "title": "Flexible Chain Tool",
-                      "description": "Chain that bends to follow the pointer path as you drag."
-                    }
-                  }
-                ],
-                "id": "chain-tools"
-              },
-              "tooltip": {
-                "title": "Chain Tool",
-                "shortcut": "C",
-                "description": "Draw a carbon chain. Long-press for chain variants."
-              },
-              "layout": {
-                "colSpan": 1,
-                "rowSpan": 1
-              }
-            },
-            {
               "commandId": "tool.benzene",
               "title": "Benzene Template",
               "icon": "ring",
@@ -413,7 +366,55 @@
               "tooltip": {
                 "title": "Benzene Template",
                 "shortcut": null,
-                "description": "Draw benzene. Long-press or press Arrow Down for 3–8-membered rings and chair cyclohexanes."
+                "description": "Draw benzene. Long-press or press Arrow Down for 3\u20138-membered rings and chair cyclohexanes."
+              },
+              "layout": {
+                "colSpan": 1,
+                "rowSpan": 1
+              }
+            },
+            {
+              "commandId": "tool.doubleBond",
+              "title": "Double Bond",
+              "icon": "doubleBond",
+              "assetName": "Custom_Bond_Double",
+              "category": "structure",
+              "id": "tool.doubleBond",
+              "kind": "button",
+              "label": "Double Bond",
+              "primary": {
+                "type": "command",
+                "commandId": "tool.doubleBond"
+              },
+              "submenu": {
+                "type": "command-grid",
+                "id": "multiple-bond-tools",
+                "title": "Multiple bond tools",
+                "columns": 3,
+                "items": [
+                  {
+                    "commandId": "tool.doubleBond",
+                    "label": "Double Bond",
+                    "icon": "doubleBond",
+                    "assetName": "Custom_Bond_Double"
+                  },
+                  {
+                    "commandId": "tool.tripleBond",
+                    "label": "Triple Bond",
+                    "icon": "tripleBond",
+                    "assetName": "Custom_Bond_Triple"
+                  },
+                  {
+                    "commandId": "tool.doubleBond:either",
+                    "label": "E/Z-unspecified Double Bond",
+                    "icon": "eitherDoubleBond"
+                  }
+                ]
+              },
+              "tooltip": {
+                "title": "Double Bond",
+                "shortcut": null,
+                "description": "Draw a double bond or click a bond to set its order."
               },
               "layout": {
                 "colSpan": 1,
@@ -631,6 +632,28 @@
               }
             },
             {
+              "commandId": "tool.roundBracket",
+              "title": "Round Bracket Tool",
+              "icon": "roundBracket",
+              "category": "annotation",
+              "id": "tool.roundBracket",
+              "kind": "button",
+              "label": "Round Bracket Tool",
+              "primary": {
+                "type": "command",
+                "commandId": "tool.roundBracket"
+              },
+              "submenu": null,
+              "tooltip": {
+                "title": "Round Bracket Tool",
+                "shortcut": null
+              },
+              "layout": {
+                "colSpan": 1,
+                "rowSpan": 1
+              }
+            },
+            {
               "commandId": "tool.dagger",
               "title": "Dagger Symbol Tool",
               "icon": "charge",
@@ -802,7 +825,7 @@
               "tooltip": {
                 "title": "Symbol Tool Group",
                 "shortcut": null,
-                "description": "Stamp a ° symbol. Long-press for other symbols."
+                "description": "Stamp a \u00b0 symbol. Long-press for other symbols."
               },
               "layout": {
                 "colSpan": 1,
@@ -1007,7 +1030,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid.left",
-                    "label": "Grid — Left",
+                    "label": "Grid \u2014 Left",
                     "icon": "arrangeGridLeft",
                     "tooltip": {
                       "title": "Arrange in a Grid (Left)",
@@ -1016,7 +1039,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid",
-                    "label": "Grid — Centered",
+                    "label": "Grid \u2014 Centered",
                     "icon": "arrangeGridCenter",
                     "tooltip": {
                       "title": "Arrange in a Grid (Centered)",
@@ -1025,7 +1048,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid.right",
-                    "label": "Grid — Right",
+                    "label": "Grid \u2014 Right",
                     "icon": "arrangeGridRight",
                     "tooltip": {
                       "title": "Arrange in a Grid (Right)",
@@ -1052,7 +1075,7 @@
                   },
                   {
                     "commandId": "layout.adjustArrangementSpacing",
-                    "label": "Adjust spacing…",
+                    "label": "Adjust spacing\u2026",
                     "icon": "align",
                     "tooltip": {
                       "title": "Adjust arrangement spacing",
@@ -1372,7 +1395,7 @@
                   },
                   {
                     "commandId": "layout.rotate90",
-                    "label": "Rotate 90 Degrees",
+                    "label": "Rotate 90° Clockwise",
                     "icon": "align",
                     "assetName": "Custom_Rotation"
                   },
@@ -1420,20 +1443,20 @@
             },
             {
               "commandId": "layout.rotate90",
-              "title": "Rotate 90 Degrees",
+              "title": "Rotate 90° Clockwise",
               "icon": "align",
               "assetName": "Custom_Rotation",
               "category": "layout",
               "id": "layout.rotate90",
               "kind": "button",
-              "label": "Rotate 90 Degrees",
+              "label": "Rotate 90° Clockwise",
               "primary": {
                 "type": "command",
                 "commandId": "layout.rotate90"
               },
               "submenu": null,
               "tooltip": {
-                "title": "Rotate 90 Degrees",
+                "title": "Rotate 90° Clockwise",
                 "shortcut": null
               },
               "layout": {
@@ -1931,6 +1954,11 @@
                     "label": "Bold Bond",
                     "icon": "bond",
                     "assetName": "Custom_Bond_Bold"
+                  },
+                  {
+                    "commandId": "tool.wavyBond",
+                    "label": "Wavy bond",
+                    "icon": "wavyBond"
                   }
                 ],
                 "id": "bond-tools"
@@ -2255,7 +2283,7 @@
               "tooltip": {
                 "title": "Benzene Template",
                 "shortcut": null,
-                "description": "Draw benzene. Long-press or press Arrow Down for 3–8-membered rings and chair cyclohexanes."
+                "description": "Draw benzene. Long-press or press Arrow Down for 3\u20138-membered rings and chair cyclohexanes."
               },
               "layout": {
                 "colSpan": 1,
@@ -2517,6 +2545,28 @@
               }
             },
             {
+              "commandId": "tool.roundBracket",
+              "title": "Round Bracket Tool",
+              "icon": "roundBracket",
+              "category": "annotation",
+              "id": "tool.roundBracket",
+              "kind": "button",
+              "label": "Round Bracket Tool",
+              "primary": {
+                "type": "command",
+                "commandId": "tool.roundBracket"
+              },
+              "submenu": null,
+              "tooltip": {
+                "title": "Round Bracket Tool",
+                "shortcut": null
+              },
+              "layout": {
+                "colSpan": 1,
+                "rowSpan": 1
+              }
+            },
+            {
               "commandId": "tool.dagger",
               "title": "Dagger Symbol Tool",
               "icon": "charge",
@@ -2688,7 +2738,7 @@
               "tooltip": {
                 "title": "Symbol Tool Group",
                 "shortcut": null,
-                "description": "Stamp a ° symbol. Long-press for other symbols."
+                "description": "Stamp a \u00b0 symbol. Long-press for other symbols."
               },
               "layout": {
                 "colSpan": 1,
@@ -3322,7 +3372,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid.left",
-                    "label": "Grid — Left",
+                    "label": "Grid \u2014 Left",
                     "icon": "arrangeGridLeft",
                     "tooltip": {
                       "title": "Arrange in a Grid (Left)",
@@ -3331,7 +3381,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid",
-                    "label": "Grid — Centered",
+                    "label": "Grid \u2014 Centered",
                     "icon": "arrangeGridCenter",
                     "tooltip": {
                       "title": "Arrange in a Grid (Centered)",
@@ -3340,7 +3390,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid.right",
-                    "label": "Grid — Right",
+                    "label": "Grid \u2014 Right",
                     "icon": "arrangeGridRight",
                     "tooltip": {
                       "title": "Arrange in a Grid (Right)",
@@ -3367,7 +3417,7 @@
                   },
                   {
                     "commandId": "layout.adjustArrangementSpacing",
-                    "label": "Adjust spacing…",
+                    "label": "Adjust spacing\u2026",
                     "icon": "align",
                     "tooltip": {
                       "title": "Adjust arrangement spacing",
@@ -3823,7 +3873,7 @@
                   },
                   {
                     "commandId": "layout.rotate90",
-                    "label": "Rotate 90 Degrees",
+                    "label": "Rotate 90° Clockwise",
                     "icon": "align",
                     "assetName": "Custom_Rotation"
                   },
@@ -3871,20 +3921,20 @@
             },
             {
               "commandId": "layout.rotate90",
-              "title": "Rotate 90 Degrees",
+              "title": "Rotate 90° Clockwise",
               "icon": "align",
               "assetName": "Custom_Rotation",
               "category": "layout",
               "id": "layout.rotate90",
               "kind": "button",
-              "label": "Rotate 90 Degrees",
+              "label": "Rotate 90° Clockwise",
               "primary": {
                 "type": "command",
                 "commandId": "layout.rotate90"
               },
               "submenu": null,
               "tooltip": {
-                "title": "Rotate 90 Degrees",
+                "title": "Rotate 90° Clockwise",
                 "shortcut": null
               },
               "layout": {
@@ -4267,7 +4317,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid.left",
-                    "label": "Grid — Left",
+                    "label": "Grid \u2014 Left",
                     "icon": "arrangeGridLeft",
                     "tooltip": {
                       "title": "Arrange in a Grid (Left)",
@@ -4276,7 +4326,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid",
-                    "label": "Grid — Centered",
+                    "label": "Grid \u2014 Centered",
                     "icon": "arrangeGridCenter",
                     "tooltip": {
                       "title": "Arrange in a Grid (Centered)",
@@ -4285,7 +4335,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid.right",
-                    "label": "Grid — Right",
+                    "label": "Grid \u2014 Right",
                     "icon": "arrangeGridRight",
                     "tooltip": {
                       "title": "Arrange in a Grid (Right)",
@@ -4312,7 +4362,7 @@
                   },
                   {
                     "commandId": "layout.adjustArrangementSpacing",
-                    "label": "Adjust spacing…",
+                    "label": "Adjust spacing\u2026",
                     "icon": "align",
                     "tooltip": {
                       "title": "Adjust arrangement spacing",
@@ -4632,7 +4682,7 @@
                   },
                   {
                     "commandId": "layout.rotate90",
-                    "label": "Rotate 90 Degrees",
+                    "label": "Rotate 90° Clockwise",
                     "icon": "align",
                     "assetName": "Custom_Rotation"
                   },
@@ -4680,20 +4730,20 @@
             },
             {
               "commandId": "layout.rotate90",
-              "title": "Rotate 90 Degrees",
+              "title": "Rotate 90° Clockwise",
               "icon": "align",
               "assetName": "Custom_Rotation",
               "category": "layout",
               "id": "layout.rotate90",
               "kind": "button",
-              "label": "Rotate 90 Degrees",
+              "label": "Rotate 90° Clockwise",
               "primary": {
                 "type": "command",
                 "commandId": "layout.rotate90"
               },
               "submenu": null,
               "tooltip": {
-                "title": "Rotate 90 Degrees",
+                "title": "Rotate 90° Clockwise",
                 "shortcut": null
               },
               "layout": {

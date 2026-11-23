@@ -12,11 +12,21 @@ describe("Sparkle macOS updates", () => {
     const buildScript = readRepositoryFile("apps/desktop/src-tauri/build.rs");
     const rust = readRepositoryFile("apps/desktop/src-tauri/src/lib.rs");
 
-    expect(cargo).toContain("tauri-plugin-sparkle-updater = \"=0.2.4\"");
+    const macosDependencies = cargo.split(/^\[/m).find(section =>
+      section.startsWith(`target.'cfg(target_os = "macos")'.dependencies]`)
+    );
+    expect(macosDependencies).toContain('tauri-plugin-sparkle-updater = "=0.2.4"');
     expect(config.bundle.macOS.frameworks).toContain("./Sparkle.framework");
     expect(buildScript).toContain("stage_sparkle_framework_for_cargo_executables");
-    expect(rust).toContain("builder.plugin(tauri_plugin_sparkle_updater::init())");
-    expect(rust).toContain('#[cfg(target_os = "macos")]');
+    const coldPrimary = rust.match(
+      /#\[cfg\(target_os = "macos"\)\]\s+let builder = if let Some\(guard\) = primary_lock \{([^}]+)\} else \{/
+    )?.[1];
+    const promotedPrimary = rust.match(
+      /#\[cfg\(target_os = "macos"\)\]\s+fn start_macos_primary\([\s\S]*?\r?\n\}/
+    )?.[0];
+    expect(coldPrimary).toContain(".plugin(tauri_plugin_sparkle_updater::init())");
+    expect(promotedPrimary).toContain("app.plugin(tauri_plugin_sparkle_updater::init())?");
+    expect(rust.match(/tauri_plugin_sparkle_updater::init\(\)/g)).toHaveLength(2);
   });
 
   it("checks automatically, offers rather than silently installs, and exposes the File command", () => {

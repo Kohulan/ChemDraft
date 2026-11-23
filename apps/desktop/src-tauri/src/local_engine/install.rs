@@ -347,7 +347,7 @@ impl<S: EngineSpec> InstallIo for SystemInstallIo<S> {
         watch: Option<RunWatch<'_>>,
     ) -> Result<(), InstallError> {
         check_cancel::<S>(cancel)?;
-        let mut command = Command::new(program);
+        let mut command = crate::child_command(program);
         scrub_environment(&mut command);
         command
             .args(args)
@@ -433,7 +433,7 @@ impl<S: EngineSpec> ProbeIo for SystemInstallIo<S> {
         cancel: &AtomicBool,
     ) -> Result<String, InstallError> {
         check_cancel::<S>(cancel)?;
-        let mut command = Command::new(program);
+        let mut command = crate::child_command(program);
         scrub_environment(&mut command);
         command
             .args(args)
@@ -671,10 +671,11 @@ pub fn install<S: EngineSpec>(
         )
         .map_err(file_ops::failed::<S>)?;
     let requirements_sha256 = pins::text_sha256(&requirements);
-    if requirements_sha256 != S::requirements().1 {
+    let expected_sha256 = S::requirements_for(platform).1;
+    if requirements_sha256 != expected_sha256 {
         return Err(InstallError::checksum(format!(
             "The bundled requirements lock does not match this build: expected SHA-256 {}, found {requirements_sha256}.",
-            S::requirements().1
+            expected_sha256
         )));
     }
     let installed_requirements = partial.join(REQUIREMENTS_FILE);

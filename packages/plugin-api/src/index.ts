@@ -3,6 +3,12 @@ import { z } from "zod";
 import { panelReportLimitIssue, PluginPanelReportLimits, snapshotPanelReport } from "./reportLimits";
 export { PluginPanelReportLimits, snapshotPanelReport } from "./reportLimits";
 export * from "./chemistry3d";
+export * from "./requestSchemas";
+export * from "./requestCapabilities";
+export { PluginRequestLimits, requestValidationCode, type PluginRequestJson, type PluginRequestJsonObject } from "./requestPayload";
+export { PluginToolDefinitionSchema, type PluginToolDefinition, type PluginToolInputSchema } from "./toolSessionSchemas";
+import type { PluginDepictionAPI, PluginRequestChemistryAPI, PluginRequestDocumentAPI, PluginRequestsAPI,
+  PluginToolSessionsAPI } from "./requestCapabilities";
 import type { PluginEmbed3DRequest, PluginEmbed3DResult, PluginMinimize3DRequest, PluginMinimize3DResult,
   PluginFlatten3DRequest, PluginFlatten3DResult } from "./chemistry3d";
 
@@ -10,7 +16,7 @@ import type { PluginEmbed3DRequest, PluginEmbed3DResult, PluginMinimize3DRequest
 // a `ChemDraftDocument`, document patch methods take a `DocumentPatch`). Surfacing them here keeps the plugin
 // boundary a single package: a plugin — and a host merging only the SDK — names these without importing
 // chem-core directly (see docs/plugin-architecture and the M33 boundary guard).
-export type { ChemDraftDocument, DocumentObject, DocumentPatch } from "@chemdraft/chem-core";
+export type { ChemDraftDocument, DocumentObject, DocumentPatch, MoleculeBond, MoleculeBondDisplay } from "@chemdraft/chem-core";
 import type { DocumentObject } from "@chemdraft/chem-core";
 
 /**
@@ -34,6 +40,12 @@ import type { DocumentObject } from "@chemdraft/chem-core";
  * 0.1.19 bounds panel report strings, arrays, aggregate counts and UTF-8 JSON size; all report numbers are finite.
  * 0.1.19 exports the parameterised detached snapshotPanelReport walk for host overlay validation.
  * 0.1.20 adds the optional table style field autoColumnMinEm (minimum auto column width in em).
+ * 0.1.21 adds chemistry.properties and session-scoped plugin assistant tools (#310).
+ * 0.1.22 adds optional name-to-structure source and dictionary match provenance (#318 offline name dictionary).
+ * 0.1.23 adds bondStyle 'wavy' (single-bond either stereo, #327).
+ * 0.1.24 adds binary CDX import/export (#316) and optional reaction arrowObjectIds/plusObjectIds (#335); shared scheme arrows and plus signs are referenced by id, never copied.
+ * 0.1.25 adds optional native bracketUsage, repeatCount and scoped crossingBondIds (#338 bracketed groups).
+ * 0.1.26 adds optional request-bound document access, tool sessions, chemistry and depiction, and document-change events.
  *
  * The MINOR stays at 1 for both. For a 0.x release `isPluginApiVersionCompatible` treats the minor as
  * the compatibility boundary, so 0.2.0 would have made every plugin declaring `^0.1.0` — the NMR
@@ -43,7 +55,7 @@ import type { DocumentObject } from "@chemdraft/chem-core";
  * local structure recognition, `^0.1.7` for structure naming, `^0.1.8` for external tools), which this host satisfies and an
  * older one correctly does not.
  */
-export const PluginApiVersion = "0.1.20" as const;
+export const PluginApiVersion = "0.1.26" as const;
 
 export const pluginPermissions = [
   "document.read",
@@ -457,14 +469,14 @@ export type PluginPanelPayload = null | boolean | number | string | PluginPanelP
 
 /** Check before serialization: JSON.stringify alone silently drops unsupported values and invokes
  * getters/toJSON. Bound traversal as well as the serialized size, including for cyclic inputs. */
-function isPanelPayload(value: unknown): value is PluginPanelPayload {
+function isPanelPayload(value: unknown, maxCharacters = 4000, maxNodes = 4000, allowPrototypeKeys = false): value is PluginPanelPayload {
   const ancestors = new Set<object>();
   const stack: { value: unknown; exit?: boolean }[] = [{ value }];
   let visited = 0;
   while (stack.length) {
     const frame = stack.pop()!;
     if (frame.exit) { ancestors.delete(frame.value as object); continue; }
-    if (++visited > 4000) return false;
+    if (++visited > maxNodes) return false;
     const entry = frame.value;
     if (entry === null || typeof entry === "string" || typeof entry === "boolean") continue;
     if (typeof entry === "number") { if (!Number.isFinite(entry)) return false; continue; }
@@ -478,19 +490,19 @@ function isPanelPayload(value: unknown): value is PluginPanelPayload {
     stack.push({ value: entry, exit: true });
     for (const key of keys) {
       if (array && key === "length") continue;
-      if (typeof key !== "string" || PROTOTYPE_POLLUTION_KEYS.has(key)) return false;
+      if (typeof key !== "string" || (!allowPrototypeKeys && PROTOTYPE_POLLUTION_KEYS.has(key))) return false;
       if (array && (!/^(0|[1-9][0-9]*)$/.test(key) || Number(key) >= entry.length)) return false;
       const descriptor = Object.getOwnPropertyDescriptor(entry, key)!;
       if (!("value" in descriptor) || !descriptor.enumerable) return false;
       stack.push({ value: descriptor.value });
     }
-    if (stack.length > 8000) return false;
+    if (stack.length > maxNodes * 2) return false;
   }
-  try { return JSON.stringify(value).length <= 4000; } catch { return false; }
+  try { return JSON.stringify(value).length <= maxCharacters; } catch { return false; }
 }
 
 export const PluginPanelPayloadSchema = z.custom<PluginPanelPayload>(isPanelPayload,
-  "Panel payload must be JSON-serialisable, at most 4000 characters, and contain no prototype-polluting keys.");
+  "Panel payload must be JSON-serializable, at most 4000 characters, and contain no prototype-polluting keys.");
 
 
 
@@ -763,7 +775,7 @@ class BoundedPanelReportSchema extends z.ZodType<z.output<typeof PanelReportObje
     return PanelReportSnapshotSchema.safeParseAsync(snapshotPanelReport(data), params);
   }
 
-  ["~validate"](data: unknown) {
+  ["~validate"](data: unknown): ReturnType<z.ZodType<this["_output"]>["~validate"]> {
     return PanelReportSnapshotSchema["~validate"](snapshotPanelReport(data));
   }
 }
@@ -1043,7 +1055,7 @@ export interface PluginTableSpec {
   style?: { preset?: "three-line" | "grid"; headerBold?: boolean; fontFamily?: string; fontSizePx?: number };
 }
 
-export interface PluginDocumentAPI {
+export interface PluginDocumentAPI extends PluginRequestDocumentAPI {
   getActiveDocument(): Promise<ChemDraftDocument | undefined>;
   proposePatch(proposal: ProposedDocumentPatch): Promise<ProposedPatchReceipt>;
   /** Present only with `document.write`; valid only during one of this plugin's command invocations.
@@ -1315,6 +1327,9 @@ export type PluginNameToStructureResult =
       parsed: true;
       /** SMILES for the named compound, from the engine. Stereodescriptors are preserved. */
       smiles: string;
+      source?: "opsin" | "dictionary";
+      matchedName?: string;
+      matchedCas?: string;
       engine: { id: string; version: string };
     }
   | {
@@ -1447,7 +1462,24 @@ export type PluginStructureFromSmilesResult =
   | { available: true; built: false; reason: string }
   | { available: false; reason: string };
 
-export interface PluginChemistryAPI {
+export const PluginChemistryPropertiesRequestSchema = z.object({
+  format: z.enum(["smiles", "molfile"]),
+  structure: z.string().min(1).max(5_000).refine(value => value.trim().length > 0, "Structure must not be blank")
+}).strict();
+export type PluginChemistryPropertiesRequest = z.infer<typeof PluginChemistryPropertiesRequestSchema>;
+export const PluginChemistryPropertiesResultSchema = z.discriminatedUnion("available", [
+  z.object({
+    available: z.literal(true), formula: z.string().min(1), averageMass: z.number().finite(),
+    monoisotopicMass: z.number().finite(), formalCharge: z.number().int(), isotopeLabelled: z.boolean(),
+    method: z.object({ engine: z.literal("RDKit"), version: z.string().min(1), conventions: z.array(z.string()) }).strict()
+  }).strict(),
+  z.object({ available: z.literal(false), reason: z.string().min(1) }).strict()
+]);
+export type PluginChemistryPropertiesResult = z.infer<typeof PluginChemistryPropertiesResultSchema>;
+
+export interface PluginChemistryAPI extends PluginRequestChemistryAPI {
+  /** API 0.1.21: source composition and masses, through the host's RDKit analysis. */
+  properties?(request: PluginChemistryPropertiesRequest): Promise<PluginChemistryPropertiesResult>;
   /** API 0.1.15: chemistry.compute only, during this plugin's own command. Explicit Hs;
    * independently embedded components start side by side. Only model.coords may be edited. */
   embed3d?(request: PluginEmbed3DRequest): Promise<PluginEmbed3DResult>;
@@ -1513,6 +1545,13 @@ export type NormalizedPluginPromptTextRequest = z.output<typeof PluginPromptText
 export type PluginPromptTextResult = z.infer<typeof PluginPromptTextResultSchema>;
 
 export interface PluginDialogsAPI {
+  /**
+   * Asks the user for one line of text. `maxLength` and `initialValue` count UTF-16 code units, but the
+   * desktop app sends the question and answer as native messages of fixed size, measured in UTF-8 after
+   * JSON string escaping (a quotation mark or backslash costs 2 bytes, a control character 2 or 6): an
+   * `initialValue` over 1,600 such bytes may be cut at a character boundary, and an answer over about
+   * 2,800 such bytes cannot be submitted. See docs/plugin-architecture/AUTHORING.md.
+   */
   promptText(request: PluginPromptTextRequest): Promise<PluginPromptTextResult>;
 }
 
@@ -1715,6 +1754,33 @@ export interface PluginAssistantToolResult {
   structuredContent?: Record<string, unknown>;
   isError?: boolean;
 }
+export const PluginMcpToolResultSchema = z.object({
+  content: z.array(z.discriminatedUnion("type", [
+    z.object({ type: z.literal("text"), text: z.string() }).strict(),
+    z.object({ type: z.literal("image"), data: z.string(), mimeType: z.literal("image/png") }).strict()
+  ])),
+  structuredContent: z.record(z.unknown()).optional(),
+  isError: z.boolean().optional()
+}).strict();
+export type PluginMcpToolResult = z.infer<typeof PluginMcpToolResultSchema>;
+export const PluginAssistantToolResultSchema = PluginMcpToolResultSchema;
+/** Session-local tool definitions; the host also refuses collisions with its own tools. */
+export const PluginAssistantExtraToolSchema = z.object({
+  name: z.string().regex(/^[a-z][a-z0-9_]{0,47}$/, "Invalid extra tool name"),
+  description: z.string().max(1_000),
+  inputSchema: z.custom<Record<string, unknown>>(value =>
+    value !== null && typeof value === "object" && !Array.isArray(value) &&
+    isPanelPayload(value, 16_384, 16_384, true) && new TextEncoder().encode(JSON.stringify(value)).byteLength <= 16_384,
+    "Extra tool inputSchema must be a JSON Schema object of at most 16 KiB")
+}).strict();
+export const PluginAssistantToolSessionRequestSchema = z.object({
+  requestId: z.string().min(1), extraTools: z.array(PluginAssistantExtraToolSchema).max(8).optional()
+}).strict();
+export type PluginAssistantToolSessionRequest = z.infer<typeof PluginAssistantToolSessionRequestSchema>;
+export interface PluginAssistantToolCall { sessionId: string; name: string; input: unknown }
+/** Runs in the owning plugin worker; abort invalidates its capability context. */
+export type PluginAssistantToolHandler = (context: PluginCommandContext, call: PluginAssistantToolCall,
+  signal: AbortSignal) => PluginAssistantToolResult | Promise<PluginAssistantToolResult>;
 export interface PluginAssistantAPI {
   listTools(): Promise<PluginAssistantToolDescriptor[]>;
   callTool(request: { name: string; input: unknown }): Promise<PluginAssistantToolResult>;
@@ -1722,7 +1788,7 @@ export interface PluginAssistantAPI {
   beginRequest(request: { prompt: string; label?: string }): Promise<{ requestId: string }>;
   /** Ends the request; previewSvg is an optional SVG data URI, capped at 256 KiB. */
   endRequest(request: { requestId: string }): Promise<{ touchedIds: string[]; summary: string; split: boolean; previewSvg?: string }>;
-  createToolSession(request: { requestId: string }): Promise<{ sessionId: string; serverName: "chemdraft"; tools: string[] }>;
+  createToolSession(request: PluginAssistantToolSessionRequest): Promise<{ sessionId: string; serverName: "chemdraft"; tools: string[] }>;
   closeToolSession(request: { sessionId: string }): Promise<void>;
 }
 
@@ -1769,6 +1835,10 @@ export interface PluginCommandContext {
   /** Present only when the plugin declares both "assistant.run" and "native.execute". */
   tools?: PluginToolsAPI;
   assistant?: PluginAssistantAPI;
+  /** Request lifecycle and page-space decisions (API 0.1.26). */
+  requests?: PluginRequestsAPI;
+  toolSessions?: PluginToolSessionsAPI;
+  depiction?: PluginDepictionAPI;
   hasPermission(permission: PluginPermission): boolean;
   requirePermission(permission: PluginPermission): void;
 }
@@ -1924,8 +1994,11 @@ export {
   PluginWorkerErrorCodes,
   isPluginApiVersionCompatible,
   supportsPluginTableInsertion,
+  supportsPluginRequestTools,
+  isPinnedRequestToolCapability,
   checkWorkerHandshake,
   type PluginWorkerCapabilityNamespace,
+  type PluginWorkerFeatures,
   type PluginWorkerErrorPayload,
   type WorkerToHostMessage,
   type HostToWorkerMessage,

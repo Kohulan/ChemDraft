@@ -4,23 +4,37 @@ import * as smilesListPaste from "./smilesListPaste";
 import * as smilesPasteIdentity from "./smilesPasteIdentity";
 import { IdentityVerificationTimeoutError } from "./depiction2d/identityWorkerClient";
 import { inspectStructureOffThread } from "./depiction2d/identityClient";
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { act, createElement, StrictMode } from "react";
 import { setNativePromptProvider, type NativePromptOptions } from "./nativePrompt";
+import { withNativeUtilitySuspension } from "./nativeUtilitySuspension";
+import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import { readFileSync } from "node:fs";
+import { posix, resolve, win32 } from "node:path";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { Molecule } from "openchemlib";
+import { dropMark, dropMolecule, electronMarkDropFixture } from "./testSupport/electronMarkDropFixture";
 import { MainWindow, documentTabPathKey } from "./MainWindow";
+import { PAN_CLICK_WINDOW_MS, TOUCH_PAN_SLOP } from "./DocumentTabList";
 import { exportPhase4Svg, applyNativeChainTool, createNativeSingleBondMolecule, arrangeSelectedDocumentObjects, createNativeSavePayload, createPhase4Document, openNativeDocument, selectDocumentObjects } from "./documentWorkflow";
 import { openChemDraftPayload } from "@chemdraft/cdx-compat";
 import { saveCompoundLayoutSettings } from "./compoundLayoutSettings";
-import { saveKeybindingSettings } from "./keybindingSettings";
+import { loadKeybindingSettings, saveKeybindingSettings } from "./keybindingSettings";
+import type { DesktopPreferences } from "./desktopPreferences";
+import type { TourMode } from "./tour/tourState";
+import { TOUR_WAITING_FOR_IDLE } from "./tour/tourState";
 import { saveAskToSaveBeforeQuit, loadAskToSaveBeforeQuit } from "./quitSettings";
+import { saveExportPreviewEnabled } from "./exportPreviewSettings";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 import { createViewportState } from "@chemdraft/viewport-engine";
-import { DOM_COMMAND_EVENT, setToolbarsMenu, type ToolsetWindowState } from "./window-manager";
-import { buildDocumentSessionEnvelope, buildDocumentTabsSession, parseDocumentSessionEnvelope } from "./documentSession";
+import { DOM_COMMAND_EVENT, broadcastExportPreviewSettings, setToolbarsMenu, type QuitFlushPhase, type ToolsetWindowState } from "./window-manager";
+import { buildDocumentSessionEnvelope, buildDocumentTabsSession, DOCUMENT_SESSION_SAVE_DEBOUNCE_MS, parseDocumentSessionEnvelope } from "./documentSession";
 import { createPluginRuntime, type DesktopPluginRuntime } from "./plugins/createPluginRuntime";
 import { applyPatches, type DocumentPatch, type MoleculeObject } from "@chemdraft/chem-core";
+import { AssistantCapabilityPermissions, type PluginCommandContext } from "@chemdraft/plugin-api";
+import { buildTableObject } from "@chemdraft/document-workflow-core";
+import { planTableLayout } from "@chemdraft/layout-engine";
 import {
   ANALYSIS_WINDOW_ACTION_EVENT, ANALYSIS_WINDOW_OWNER_ID, PATCH_REVIEW_WINDOW_ID,
   type AnalysisWindowSnapshotPayload, broadcastAnalysisWindowSnapshot,
@@ -30,6 +44,7 @@ import { createDesktopShortcutRegistry } from "./keyboardShortcuts";
 import { createDocumentTabActions } from "./commands";
 import type { ChemDraftAgentBridge } from "./agentBridge";
 import * as atomLabelDraft from "./atomLabelDraft";
+import * as workflow from "./documentWorkflow";
 import * as nativePaletteReconciliation from "./toolbars/reconcileNativePalettes";
 import type { DialogMessage } from "./dialogs/dialogProtocol";
 import { nativeDialogTransport, type DialogDelivery } from "./dialogs/dialogTransport";
@@ -44,6 +59,8 @@ vi.mock("./perf/runtime", async original => ({
 
 const native = vi.hoisted(() => ({
   desktop: true,
+  preferences: {} as DesktopPreferences,
+  savePreferences: vi.fn(),
   suspendUtilities: false,
   suspensionDepth: 0,
   visibilityChanges: [] as string[],
@@ -55,7 +72,7 @@ const native = vi.hoisted(() => ({
   session: undefined as unknown,
   load: vi.fn<() => Promise<unknown>>(),
   saveSession: vi.fn<(value: unknown) => Promise<void>>(),
-  quitFlush: undefined as undefined | (() => Promise<void>),
+  quitFlush: undefined as undefined | ((phase: QuitFlushPhase, requestId: number) => Promise<void>),
   quit: vi.fn(),
   promptQuit: undefined as undefined | ((id: number) => Promise<void>),
   quitId: 0,
@@ -68,7 +85,9 @@ const native = vi.hoisted(() => ({
   suspendPending: undefined as Promise<void> | undefined,
   clipboardPending: undefined as Promise<{ types: string[]; textItems: { type: string; text: string }[] }> | undefined,
   events: new Map<string, (payload: unknown) => void>(),
-  picker: vi.fn<() => Promise<string | null>>(),
+  picker: vi.fn<() => Promise<string | string[] | null>>(),
+  pendingOpenDocuments: [] as Array<{ path: string; displayName: string; contents: string; bytes?: number[] }>,
+  drainOpenDocuments: vi.fn<() => Promise<unknown>>(),
   savePicker: vi.fn<() => Promise<string | null>>(),
   readFile: vi.fn<(path: string) => Promise<Uint8Array>>(),
   writeFile: vi.fn<(path: string, contents: string) => Promise<void>>(),
@@ -76,6 +95,15 @@ const native = vi.hoisted(() => ({
   dialogListener: undefined as ((delivery: DialogDelivery) => void) | undefined,
   dialogClose: vi.fn(),
   dialogPublish: vi.fn()
+}));
+vi.mock("./desktopPreferences", () => ({
+  desktopPreferences: async (patch?: DesktopPreferences) => {
+    if (patch) {
+      native.savePreferences(patch);
+      native.preferences = { ...native.preferences, ...patch };
+    }
+    return { ...native.preferences };
+  }
 }));
 vi.mock("./dialogs/dialogTransport", () => ({ nativeDialogTransport: {
   subscribe: async (handler: (delivery: DialogDelivery) => void) => { native.dialogListener = handler; return () => { native.dialogListener = undefined; }; },
@@ -100,7 +128,7 @@ vi.mock("./window-manager", async (original) => ({
     return { toolsetId, open: false, focused: false };
   },
   setToolbarsMenu: vi.fn().mockResolvedValue(undefined),
-  listenForQuitFlushRequest: async (handler: () => Promise<void>) => {
+  listenForQuitFlushRequest: async (handler: NonNullable<typeof native.quitFlush>) => {
     native.quitFlush = handler;
     return () => { if (native.quitFlush === handler) native.quitFlush = undefined; };
   },
@@ -120,7 +148,14 @@ vi.mock("./window-manager", async (original) => ({
 }));
 vi.mock("./window-manager/tauriEvents", async (original) => {
   const listen = async (name: string, handler: (event: { payload: unknown }) => void) => {
-    const callback = (payload: unknown) => handler({ payload });
+    const callback = (payload: unknown) => {
+      // Model the native queue: older tests supply the OS request here, while the real event is
+      // just a notification. Only the pending-drain invoke delivers document payloads to React.
+      if (name === "chemdraft://open-document" && payload) {
+        native.pendingOpenDocuments.push(payload as typeof native.pendingOpenDocuments[number]);
+      }
+      handler({ payload });
+    };
     native.events.set(name, callback);
     return () => { if (native.events.get(name) === callback) native.events.delete(name); };
   };
@@ -130,7 +165,12 @@ vi.mock("./window-manager/tauriEvents", async (original) => {
 vi.mock("@tauri-apps/api/core", async (original) => ({
   ...await original<typeof import("@tauri-apps/api/core")>(),
   isTauri: () => native.suspendUtilities,
-  invoke: vi.fn(async (command: string, options?: { suspended?: boolean }) => {
+  invoke: vi.fn(async (command: string, options?: { suspended?: boolean; path?: string }) => {
+    if (command === "take_pending_open_document") return native.drainOpenDocuments();
+    if (command === "plugin:path|basename" && options?.path) {
+      const pathApi = /^[a-z]:|^\\\\/i.test(options.path) ? win32 : posix;
+      return pathApi.basename(options.path);
+    }
     if (command === "read_clipboard_payload") return native.clipboardPending ?? { types: [], textItems: [] };
     if (command === "suspend_toolset_windows") {
       if (native.suspendFailure && options?.suspended) throw new Error("Native utility hide refused");
@@ -151,7 +191,21 @@ vi.mock("@tauri-apps/api/core", async (original) => ({
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: native.picker, save: native.savePicker }));
 vi.mock("@tauri-apps/plugin-fs", async (original) => ({
-  ...await original<typeof import("@tauri-apps/plugin-fs")>(), readFile: native.readFile, writeTextFile: native.writeFile
+  ...await original<typeof import("@tauri-apps/plugin-fs")>(), readFile: native.readFile, writeTextFile: native.writeFile,
+  stat: async () => ({ size: 0 }),
+  open: async (path: string) => {
+    const bytes = await native.readFile(path);
+    let offset = 0;
+    return {
+      read: async (buffer: Uint8Array) => {
+        const count = Math.min(buffer.length, bytes.length - offset);
+        buffer.set(bytes.subarray(offset, offset + count));
+        offset += count;
+        return count;
+      },
+      close: async () => {}
+    };
+  }
 }));
 vi.mock("./plugins/createPluginRuntime", async (original) => {
   const actual = await original<typeof import("./plugins/createPluginRuntime")>();
@@ -188,7 +242,7 @@ describe("documents in one window", () => {
         document.querySelector('[role="dialog"][aria-modal="true"][aria-labelledby="quit-prompt-title"]') !== null).toBe(true);
       return true;
     });
-    native.cancelQuit.mockResolvedValue(true);
+    native.cancelQuit.mockResolvedValue("cancelled");
     native.prepareQuit.mockResolvedValue(true);
     native.resumeQuit.mockResolvedValue(true);
     native.quitId = 0;
@@ -200,6 +254,7 @@ describe("documents in one window", () => {
     vi.mocked(broadcastAnalysisWindowSnapshot).mockResolvedValue(undefined);
     vi.mocked(respondToProposalDecision).mockResolvedValue(undefined);
     native.desktop = true;
+    native.preferences = {};
     native.dialogSnapshot = undefined;
     native.dialogListener = undefined;
     native.dialogClose.mockReset().mockResolvedValue(undefined);
@@ -218,6 +273,8 @@ describe("documents in one window", () => {
       return { toolsetId, open: native.toolsetWindows.get(toolsetId) ?? false, focused: false };
     });
     native.session = undefined;
+    native.pendingOpenDocuments = [];
+    native.drainOpenDocuments.mockReset().mockImplementation(async () => native.pendingOpenDocuments.splice(0));
     native.events.clear();
     native.load.mockImplementation(async () => native.session);
     native.saveSession.mockImplementation(async (value) => { native.session = JSON.parse(JSON.stringify(value)); });
@@ -243,11 +300,11 @@ describe("documents in one window", () => {
     vi.useRealTimers();
   });
 
-  async function mount(initialDocument = createPhase4Document("Untitled"), strict = false) {
+  async function mount(initialDocument = createPhase4Document("Untitled"), strict = false, shortcutPlatform?: ShortcutPlatform, tourMode?: TourMode) {
     root = createRoot(container);
     await act(async () => {
       const main = createElement(MainWindow, {
-        initialDocument, initialActiveToolCommandId: "tool.select",
+        initialDocument, initialActiveToolCommandId: "tool.select", shortcutPlatform, tourMode,
         initialPaletteMode: "hidden", initialCrosshairsVisible: false, initialRulersVisible: false, nativePalette: true
       });
       root!.render(strict ? createElement(StrictMode, null, main) : main);
@@ -405,6 +462,144 @@ describe("documents in one window", () => {
     await act(async () => { native.dialogListener!({ senderWindowId: `dialog-main-${native.dialogSnapshot!.dialogKind}-1`, windowLabel: `dialog-main-${native.dialogSnapshot!.dialogKind}-1`,
       message: { ...native.dialogSnapshot!, type, data, requestId: crypto.randomUUID() } }); });
   }
+  describe.each(["macos", "windows"] as const)("native tour on %s", platform => {
+    const restart = async (mode: TourMode, drawing = createPhase4Document("My drawing")) => {
+      act(() => root!.unmount());
+      native.dialogSnapshot = undefined;
+      await mount(drawing, false, platform, mode);
+    };
+    const idle = async () => { await act(async () => vi.advanceTimersByTimeAsync(1000)); };
+
+    it.each([["new install", "chemdraft", "cancel"], ["upgrade", "chemdraw", "finish"]] as const)(
+      "shows for a %s, persists the exit, and reopens from the Help command", async (profile, scheme, action) => {
+        vi.useFakeTimers();
+        if (profile === "upgrade") saveKeybindingSettings({ scheme });
+        await restart("automatic");
+        expect(native.dialogSnapshot).toBeUndefined();
+        await idle();
+        expect(native.dialogSnapshot).toMatchObject({ dialogKind: "guidedTour", data: { automatic: true, title: "Take the Tour", scheme } });
+        await pageSizeMessage("ready", {});
+        await pageSizeMessage("action", { action });
+        expect(native.savePreferences).toHaveBeenCalledExactlyOnceWith({ guidedTourSeen: true });
+        expect(native.dialogClose).toHaveBeenCalledWith("opaque", action === "finish" ? "apply" : "cancel");
+
+        await restart("automatic");
+        await idle();
+        expect(native.dialogSnapshot).toBeUndefined();
+        await command("help.showTour");
+        expect(native.dialogSnapshot).toMatchObject({ dialogKind: "guidedTour", data: { automatic: false } });
+      }
+    );
+
+    it("waits for the startup file and another native dialog before opening", async () => {
+      vi.useFakeTimers();
+      let releaseDrain!: (payloads: unknown[]) => void;
+      native.drainOpenDocuments.mockImplementationOnce(() => new Promise(resolve => { releaseDrain = resolve; }));
+      const drawing = applyNativeChainTool(createPhase4Document("User drawing"), { x: 100, y: 100 }, { x: 180, y: 140 });
+      await restart("automatic", drawing);
+      await idle();
+      expect(native.dialogSnapshot).toBeUndefined();
+      await command("page.setSizeCustom");
+      expect(native.dialogSnapshot?.dialogKind).toBe("pageSize");
+      await pageSizeMessage("ready", {});
+      await act(async () => releaseDrain([{
+        path: "/drawings/Started.chemdraft", displayName: "Started.chemdraft",
+        contents: createNativeSavePayload(createPhase4Document("Started")).contents
+      }]));
+      await idle();
+      expect(native.dialogSnapshot?.dialogKind).toBe("pageSize");
+      await pageSizeMessage("action", { action: "cancel" });
+      await idle();
+      expect(native.dialogSnapshot?.dialogKind).toBe("guidedTour");
+      expect(bridge().snapshot().document.title).toBe("Started");
+    });
+
+    it("waits for the launch recovery prompt to close", async () => {
+      vi.useFakeTimers();
+      const session = threeTabSession();
+      native.session = { ...session, tabs: session.tabs!.map(tab => ({ ...tab, version: 99 })) };
+      await restart("automatic");
+      await idle();
+      expect(pendingPrompt?.prompt.title).toContain("didn't open");
+      expect(native.dialogSnapshot).toBeUndefined();
+      await modalButton("Cancel");
+      await idle();
+      expect(native.dialogSnapshot?.dialogKind).toBe("guidedTour");
+    });
+
+    it("retries a native idle refusal and supports forcing a seen tour", async () => {
+      vi.useFakeTimers();
+      native.preferences = { guidedTourSeen: true };
+      const open = vi.spyOn(nativeDialogTransport, "open").mockRejectedValueOnce(TOUR_WAITING_FOR_IDLE);
+      await restart("force");
+      await idle();
+      expect(native.dialogSnapshot).toBeUndefined();
+      await act(async () => vi.advanceTimersByTimeAsync(1200));
+      expect(open).toHaveBeenCalledTimes(2);
+      expect(native.dialogSnapshot?.dialogKind).toBe("guidedTour");
+    });
+
+    it("uses the shortcut preference store and creates a clean practice tab with its own undo", async () => {
+      const drawing = applyNativeChainTool(createPhase4Document("User drawing"), { x: 100, y: 100 }, { x: 180, y: 140 });
+      await restart("suppress", drawing);
+      const before = structuredClone(bridge().snapshot().document);
+      await command("help.showTour");
+      await pageSizeMessage("ready", {});
+      await pageSizeMessage("action", { action: "chooseShortcuts", scheme: "chemdraw" });
+      expect(native.preferences.shortcutScheme).toBe("chemdraw");
+      expect(loadKeybindingSettings().scheme).toBe("chemdraw");
+      expect(native.dialogPublish).toHaveBeenCalledWith("opaque", expect.objectContaining({
+        type: "snapshot", data: { title: "Take the Tour", scheme: "chemdraw", automatic: false, plugins: [] }
+      }));
+      await pageSizeMessage("action", { action: "tryTourCommand", command: "view.openKeyboardPreferences" });
+      expect(tauriInvoke).toHaveBeenCalledWith("toggle_preferences_window", { keyboard: true });
+      expect(tabs()).toHaveLength(1);
+      expect(bridge().snapshot().document).toEqual(before);
+      const trySample = { action: "tryTourCommand", command: "help.tour.openSample" };
+      await pageSizeMessage("action", trySample);
+      expect(tabs()).toHaveLength(2);
+      expect(tabs()[1].textContent).toContain("Tour");
+      const sample = bridge().snapshot();
+      expect(sample.file.dirty).toBe(false);
+      expect(sample.document.pages[0].objects).toMatchObject([{ type: "molecule" }]);
+      await command("edit.undo");
+      expect(container.querySelector('[role="status"]')?.textContent).toContain("Undid Insert 12-Crown-4");
+      expect(bridge().snapshot().document.pages[0].objects).toEqual([]);
+      await command("edit.redo");
+      expect(bridge().snapshot().document).toEqual(sample.document);
+      expect(bridge().snapshot().file.dirty).toBe(false);
+      await closeTab();
+      expect(tabs()).toHaveLength(1);
+      expect(bridge().snapshot().document).toEqual(before);
+      expect(native.dialogClose).not.toHaveBeenCalled();
+    });
+
+    it("runs the installed naming command and Inspector against the practice drawing", async () => {
+      const drawing = applyNativeChainTool(createPhase4Document("User drawing"), { x: 100, y: 100 }, { x: 180, y: 140 });
+      vi.mocked(createPluginRuntime).mockClear();
+      await restart("suppress", drawing);
+      const commandId = "plugin.opsinNameToStructure.convert";
+      const convert = vi.fn(() => {
+        expect(bridge().snapshot().document.title).toBe("Tour");
+        return { ok: true };
+      });
+      await act(async () => runtime().registerPlugin({
+        id: "org.test.tour-naming", name: "Tour naming", version: "0.0.1", apiVersion: "^0.1.25",
+        entry: "dist/plugin.js", permissions: [], contributes: { commands: [{ id: commandId, title: "Convert Name to Structure" }] }
+      }, { commandHandlers: { [commandId]: convert } }));
+      await command("help.showTour");
+      await pageSizeMessage("ready", {});
+      await pageSizeMessage("action", { action: "tryTourCommand", command: commandId });
+      expect(convert).toHaveBeenCalledOnce();
+      expect(tabs()).toHaveLength(2);
+      await pageSizeMessage("action", { action: "tryTourCommand", command: "analyze.molecularProperties" });
+      expect(broadcastAnalysisWindowSnapshot).toHaveBeenCalledWith(expect.objectContaining({
+        content: expect.objectContaining({ kind: "molecularInspector" })
+      }));
+      expect(tabs()).toHaveLength(2);
+    });
+  });
+
   async function spacingDrawing() {
     saveCompoundLayoutSettings({ enabled: true });
     let source = createPhase4Document("Spacing source");
@@ -513,7 +708,7 @@ describe("documents in one window", () => {
     expect(bridge().snapshot().document.pages[0]!.layout.presetId).toBe("custom");
     expect(container.querySelector(".cd-page-size-form")).toBeNull();
   });
-  it("the browser keeps the shared Export form and shows its download receipt", async () => {
+  it("closes a clean browser export after one download and preserves the drawing", async () => {
     native.desktop = false;
     vi.stubGlobal("URL", class extends URL { static createObjectURL = vi.fn(() => "blob:export"); static revokeObjectURL = vi.fn(); });
     const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
@@ -523,13 +718,44 @@ describe("documents in one window", () => {
     expect(dialog).not.toBeNull();
     const select = dialog.querySelector<HTMLSelectElement>("#chemdraft-export-format")!;
     await act(async () => { select.value = "svg"; select.dispatchEvent(new Event("change", { bubbles: true })); });
-    await act(async () => Array.from(dialog.querySelectorAll<HTMLButtonElement>("button")).find(b => b.textContent === "Export")!.click());
+    const drawing = bridge().snapshot().document;
+    const submit = [...dialog.querySelectorAll<HTMLButtonElement>("button")].find(b => b.textContent === "Export")!;
+    await act(async () => { submit.click(); submit.click(); });
     expect(click).toHaveBeenCalledTimes(1);
-    expect(dialog.textContent).toContain("Exported SVG");
-    expect(Array.from(dialog.querySelectorAll<HTMLButtonElement>("button")).find(b => b.textContent === "Exported")!.disabled).toBe(true);
+    expect(container.querySelector("[data-status-message]")?.textContent).toBe("Exported SVG");
+    expect(bridge().snapshot().document).toEqual(drawing);
     expect(native.savePicker).not.toHaveBeenCalled();
-    await act(async () => Array.from(dialog.querySelectorAll<HTMLButtonElement>("button")).find(b => b.textContent === "Close")!.click());
     expect(container.querySelector('[role="dialog"][aria-label="Export"]')).toBeNull();
+  });
+  it("renders the browser preview after a warning-bearing export and keeps the warning visible", async () => {
+    native.desktop = false;
+    vi.useFakeTimers();
+    vi.stubGlobal("URL", class extends URL { static createObjectURL = vi.fn(() => "blob:export"); static revokeObjectURL = vi.fn(); });
+    const download = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    const pdf = vi.spyOn(workflow, "exportPhase4Pdf");
+    let finishExport!: () => void;
+    pdf.mockImplementationOnce(() => new Promise(resolve => {
+      finishExport = () => resolve({
+        format: "pdf", kind: "binary", bytes: new Uint8Array([1]), mimeType: "application/pdf", extension: "pdf",
+        warnings: [{ code: "test-warning", message: "Some artwork was approximated." }]
+      });
+    }));
+    await act(async () => { saveExportPreviewEnabled(true); await broadcastExportPreviewSettings(true); });
+    await command("export.open");
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"][aria-label="Export"]')!;
+    const preview = () => dialog.querySelector<HTMLImageElement>('img[alt="Preview of the PDF page layout"]');
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(preview()?.src).toEqual(expect.stringMatching(/^data:image\/svg\+xml;base64,/));
+    const submit = [...dialog.querySelectorAll<HTMLButtonElement>("button")].find(b => b.textContent === "Export")!;
+    await act(async () => submit.click());
+    expect(dialog.getAttribute("aria-busy")).toBe("true");
+    await act(async () => finishExport());
+    expect(dialog.textContent).toContain("Some artwork was approximated.");
+    expect(submit.disabled).toBe(true);
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(preview()?.src).toEqual(expect.stringMatching(/^data:image\/svg\+xml;base64,/));
+    expect(download).toHaveBeenCalledTimes(1);
+    expect(pdf).toHaveBeenCalledTimes(1);
   });
   async function activate(index: number) {
     await act(async () => tabs()[index]!.click());
@@ -546,7 +772,7 @@ describe("documents in one window", () => {
     expect(bridge().snapshot().page.objectCount).toBe(0);
     expect(container.querySelector('[role="dialog"]')).toBeNull();
     expect(pendingPrompt).toBeUndefined();
-    const saved = await flush();
+    const saved = await autosave();
     expect(saved.tabs).toHaveLength(1);
     expect(saved.tabs![0]).toMatchObject({ pristine: true, blank: true, dirty: false });
     await command("edit.undo");
@@ -566,7 +792,14 @@ describe("documents in one window", () => {
   async function flush() {
     await act(async () => {
       if (loadAskToSaveBeforeQuit()) await native.promptQuit!(++native.quitId);
-      else await native.quitFlush!();
+      else await native.quitFlush!("committed", ++native.quitId);
+    });
+    return parseDocumentSessionEnvelope(native.session)!;
+  }
+  async function autosave() {
+    await act(async () => {
+      if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(DOCUMENT_SESSION_SAVE_DEBOUNCE_MS);
+      else await new Promise(resolve => setTimeout(resolve, DOCUMENT_SESSION_SAVE_DEBOUNCE_MS));
     });
     return parseDocumentSessionEnvelope(native.session)!;
   }
@@ -607,10 +840,15 @@ describe("documents in one window", () => {
   }
   const reviewSourceLabel = pluginPanelWindowLabel({ pluginId: ANALYSIS_WINDOW_OWNER_ID, panelId: PATCH_REVIEW_WINDOW_ID });
   async function decide(kind: "acceptPluginProposal" | "rejectPluginProposal", proposalId: string) {
+    const answered = vi.mocked(respondToProposalDecision).mock.calls.length;
     // Rust stamps the review window's label before forwarding the action to main.
     await act(async () => native.events.get(ANALYSIS_WINDOW_ACTION_EVENT)!({
       kind, proposalId, requestId: "review-result", sourceLabel: reviewSourceLabel
     }));
+    // An accept that changes a graph commits only after its off-thread chemistry check; the review
+    // window's answer is sent once the decision has finished either way.
+    await act(async () => { await vi.waitFor(() =>
+      expect(vi.mocked(respondToProposalDecision).mock.calls.length).toBeGreaterThan(answered), { timeout: 4_000 }); });
   }
   const reviewItems = () => {
     const snapshots = vi.mocked(broadcastAnalysisWindowSnapshot).mock.calls
@@ -647,6 +885,32 @@ describe("documents in one window", () => {
     expect(respondToProposalDecision).toHaveBeenCalledExactlyOnceWith("review-result", {
       ok: true, message: expect.any(String)
     }, reviewSourceLabel);
+  });
+
+  it("replacing a tab's document cancels its pending legacy assistant request", async () => {
+    const commandId = "plugin.tabAssistant.run";
+    let assistant!: NonNullable<PluginCommandContext["assistant"]>;
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    runtime().registerPlugin({
+      id: "org.test.tab-assistant", name: "Tab Assistant", version: "0.0.1", apiVersion: "^0.1.21",
+      entry: "dist/plugin.js", permissions: [...AssistantCapabilityPermissions],
+      contributes: { commands: [{ id: commandId, title: "Ask" }] }
+    }, { commandHandlers: { [commandId]: async context => { assistant = context.assistant!; await held; } } });
+    let invocation!: Promise<unknown>;
+    await act(async () => { invocation = runtime().invokeCommand(commandId); await vi.waitFor(() => expect(assistant).toBeDefined()); });
+    await act(async () => { await assistant.beginRequest({ prompt: "caption" }); });
+    await open("Replacement drawing");
+    expect(tabs()).toHaveLength(1);
+    const opened = bridge().snapshot().document;
+    const replaced = "Assistant request canceled: the drawing it was working on was replaced.";
+    await act(async () => {
+      await expect(assistant.callTool({ name: "insert_text", input: { text: "Late caption" } })).rejects.toThrow(replaced);
+    });
+    expect(bridge().snapshot().document).toEqual(opened);
+    expect(bridge().snapshot().file.dirty).toBe(false);
+    release();
+    await act(async () => { await invocation; });
   });
 
   async function mountHoverChain() {
@@ -733,11 +997,13 @@ describe("documents in one window", () => {
     expect(hoverMolecule().atoms[1]!.element).toBe("N");
   });
 
-  it("Escape discards the first letter even when rollback constructs document keys in a different order", async () => {
+  it("Escape keeps the first letter and its undo entry even when rollback constructs document keys in a different order", async () => {
     await mountHoverChain();
     const before = bridge().snapshot().document;
     await hoverChainAtom(1);
-    for (const key of "NMe") await labelKey(key);
+    await labelKey("N");
+    const afterFirstLetter = bridge().snapshot().document;
+    for (const key of "Me") await labelKey(key);
     const restore = atomLabelDraft.restoreAtomLabelDraft;
     vi.spyOn(atomLabelDraft, "restoreAtomLabelDraft").mockImplementation((document, state) => {
       const restored = restore(document, state);
@@ -745,8 +1011,10 @@ describe("documents in one window", () => {
     });
     await labelKey("Escape");
     expect(labelEditor()).toBeNull();
+    expect(bridge().snapshot().document).toEqual(afterFirstLetter);
+    expect(container.querySelector('[data-can-undo]')?.getAttribute("data-can-undo")).toBe("true");
+    await command("edit.undo");
     expect(bridge().snapshot().document).toEqual(before);
-    expect(container.querySelector('[data-can-undo]')?.getAttribute("data-can-undo")).toBe("false");
   });
 
   it.each(["document.save", "document.saveAs"])("Escape after %s during a hover draft keeps the saved path and marks the canvas dirty", async saveCommand => {
@@ -756,7 +1024,9 @@ describe("documents in one window", () => {
     expect(bridge().snapshot().file).toEqual({ path: "/tmp/chain.chemdraft", dirty: false });
     const before = bridge().snapshot().document;
     await hoverChainAtom(1);
-    for (const key of "NMe") await labelKey(key);
+    await labelKey("N");
+    const afterFirstLetter = bridge().snapshot().document;
+    for (const key of "Me") await labelKey(key);
     expect(labelEditor()?.value).toBe("NMe");
     const savedPath = saveCommand === "document.saveAs" ? "/tmp/renamed-chain.chemdraft" : "/tmp/chain.chemdraft";
     if (saveCommand === "document.saveAs") native.savePicker.mockResolvedValueOnce(savedPath);
@@ -769,10 +1039,12 @@ describe("documents in one window", () => {
     expect(savedMolecule.atoms[1]!.element).toBe("NMe");
     expect(bridge().snapshot().file).toEqual({ path: savedPath, dirty: false });
     await labelKey("Escape");
-    expect(bridge().snapshot().document).toEqual(before);
+    expect(bridge().snapshot().document).toEqual(afterFirstLetter);
     expect(bridge().snapshot().file).toEqual({ path: savedPath, dirty: true });
     expect(document.title).toContain(`${savedPath.split("/").at(-1)} •`);
-    expect(container.querySelector('[data-can-undo]')?.getAttribute("data-can-undo")).toBe("false");
+    expect(container.querySelector('[data-can-undo]')?.getAttribute("data-can-undo")).toBe("true");
+    await command("edit.undo");
+    expect(bridge().snapshot().document).toEqual(before);
   });
 
   it("keeps proposals across switches and activates their source tab for one selected, undoable insertion", async () => {
@@ -862,6 +1134,38 @@ describe("documents in one window", () => {
     await decide("rejectPluginProposal", proposal.id);
     expect(runtime().host.listProposedPatches("pending")).toEqual([]);
     expect(bridge().snapshot().document).toEqual(other);
+  });
+
+  it.each([
+    { platform: "macOS", first: "/tmp/Probe First.chemdraft", renamed: "/tmp/Probe A.chemdraft" },
+    { platform: "Windows", first: "C:\\Drawings\\Probe First.chemdraft", renamed: "C:\\Drawings\\Probe A.chemdraft" }
+  ])("uses the chosen file name for first Save and Save As on $platform", async ({ first, renamed }) => {
+    const expectTitle = (name: string, dirty: boolean) => {
+      const tab = tabs()[0]!;
+      expect(tab.title).toBe(name);
+      expect(Boolean(tab.querySelector('[aria-label="Unsaved changes"]'))).toBe(dirty);
+      const title = `${name}${dirty ? " •" : ""} — ChemDraft — ${__WORKTREE_LABEL__}`;
+      expect(document.title).toBe(title);
+      expect(vi.mocked(nativeInvoke).mock.calls.filter(([id]) => id === "plugin:window|set_title").at(-1))
+        .toEqual(["plugin:window|set_title", { value: title }]);
+    };
+
+    await paste("First edit");
+    expectTitle("Untitled", true);
+    native.savePicker.mockResolvedValueOnce(first);
+    await command("document.save");
+    expect(native.writeFile).toHaveBeenCalledWith(first, expect.any(String));
+    expectTitle("Probe First.chemdraft", false);
+
+    await paste("Second edit");
+    expectTitle("Probe First.chemdraft", true);
+    native.savePicker.mockResolvedValueOnce(renamed);
+    await command("document.saveAs");
+    expect(native.writeFile).toHaveBeenLastCalledWith(renamed, expect.any(String));
+    expectTitle("Probe A.chemdraft", false);
+    expect((await autosave()).tabs?.[0]).toMatchObject({
+      path: renamed, displayName: "Probe A.chemdraft", dirty: false
+    });
   });
 
   it.each([false, true])("uses the Save As title for proposal labels and the Accept refusal (multiple: %s)", async (multiple) => {
@@ -1016,6 +1320,249 @@ describe("documents in one window", () => {
     expect(bridge().snapshot().file.dirty).toBe(true);
   });
 
+  function futureFileContents(name: string) {
+    return JSON.stringify({ ...createPhase4Document(name), formatVersion: "1.10.0", minAppVersion: "1.10.2",
+      conditionsLabel: { text: "keep future content" }, styles: { drawing: { stylePresetId: "future-preset" } } });
+  }
+
+  it.each(["picker", "os/recent", "native drop", "browser drop", "browser picker"])(
+    "native compatibility: %s opens with one notice and preserves future data on save", async path => {
+      const prompts: NativePromptOptions[] = [];
+      const restore = setNativePromptProvider(async prompt => { prompts.push(prompt); return "ok"; });
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      const contents = futureFileContents("Future drawing");
+      try {
+        if (path === "picker") {
+          native.picker.mockResolvedValueOnce("C:\\Drawings\\future.chemdraft");
+          native.readFile.mockResolvedValueOnce(new TextEncoder().encode(contents));
+          await command("document.open");
+        } else if (path === "os/recent") {
+          const payload = { path: "C:\\Drawings\\future.chemdraft", displayName: "future.chemdraft", contents };
+          await act(async () => native.events.get("chemdraft://open-document")!(payload));
+          // Activating an already-open file is not another open and must not show another box.
+          await act(async () => native.events.get("chemdraft://open-document")!(payload));
+        } else if (path === "native drop") {
+          native.readFile.mockResolvedValueOnce(new TextEncoder().encode(contents));
+          await act(async () => native.events.get("tauri://drag-drop")!({ paths: ["C:\\Drawings\\future.chemdraft"] }));
+        } else {
+          native.desktop = false;
+          // Browser opening now reads bounded bytes so CDX and BOM-encoded text share a transport.
+          const bytes = new TextEncoder().encode(contents);
+          const file = { name: "future.chemdraft", size: bytes.byteLength, arrayBuffer: async () => bytes.buffer };
+          if (path === "browser drop") {
+            const event = new Event("drop", { bubbles: true, cancelable: true });
+            Object.defineProperty(event, "dataTransfer", { value: { files: [file] } });
+            await act(async () => container.querySelector('[aria-label="Document workspace"]')!.dispatchEvent(event));
+          } else {
+            const input = container.querySelector<HTMLInputElement>('input[type="file"][accept*="chemdraft"]')!;
+            Object.defineProperty(input, "files", { value: [file], configurable: true });
+            await act(async () => input.dispatchEvent(new Event("change", { bubbles: true })));
+          }
+        }
+        expect(bridge().snapshot().document.title).toBe("Future drawing");
+        expect(prompts).toHaveLength(1);
+        expect(prompts[0]).toMatchObject({ owner: "document",
+          message: "This file was made with a newer ChemDraft (1.10.2). Some features may not show. Update to keep them." });
+        // Exercise app history admission and the Save path, including edits made after opening.
+        native.desktop = true;
+        await paste("An edit");
+        native.savePicker.mockResolvedValueOnce("C:\\Drawings\\saved.chemdraft");
+        await command("document.saveAs");
+        const saved = native.writeFile.mock.calls.at(-1)![1];
+        const reopened = openNativeDocument(saved);
+        expect(reopened.nativeDocumentVersions?.minAppVersion).toBe("1.10.2");
+        expect(reopened.warnings.map(warning => warning.code)).toEqual(expect.arrayContaining([
+          "NATIVE_UNKNOWN_FIELD_PRESERVED", "NATIVE_STYLE_PRESET_FALLBACK"
+        ]));
+        expect(prompts).toHaveLength(1);
+      } finally { restore(); }
+    });
+
+  it("native compatibility: session restore shows once per installed file, including StrictMode", async () => {
+    const prompts: NativePromptOptions[] = [];
+    const restore = setNativePromptProvider(async prompt => { prompts.push(prompt); return "ok"; });
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const future = buildDocumentSessionEnvelope({ contents: futureFileContents("Restored future"), payloadHash: "future", filename: "future.chemdraft" },
+        { dirty: true }, "future.chemdraft", false);
+      native.session = future;
+      act(() => root!.unmount());
+      container.innerHTML = "";
+      await mount(createPhase4Document("Untitled"), true);
+      expect(bridge().snapshot().document.title).toBe("Restored future");
+      expect(prompts).toHaveLength(1);
+      expect(prompts[0]!.message).toContain("(1.10.2)");
+      const saved = await autosave();
+      expect(openNativeDocument(saved.tabs![0]!.contents).nativeDocumentVersions?.minAppVersion).toBe("1.10.2");
+    } finally { restore(); }
+  });
+
+  it("native compatibility: older and same-version opens and session restores remain quiet", async () => {
+    const prompts: NativePromptOptions[] = [];
+    const restore = setNativePromptProvider(async prompt => { prompts.push(prompt); return "ok"; });
+    try {
+      for (const minimum of [undefined, "1.1.1", "1.2.0"]) {
+        const contents = JSON.stringify({ ...createPhase4Document(`Minimum ${minimum}`), minAppVersion: minimum });
+        await act(async () => native.events.get("chemdraft://open-document")!({
+          contents, displayName: `${minimum}.chemdraft`, path: `/tmp/${minimum}.chemdraft`
+        }));
+      }
+      await autosave(); await remount();
+      expect(prompts).toEqual([]);
+    } finally { restore(); }
+  });
+
+  it.each([
+    { name: "distant charge in a native envelope", kind: "charge", distant: true, legacy: false },
+    { name: "distant charge in legacy JSON", kind: "charge", distant: true, legacy: true },
+    { name: "distant radical dot", kind: "radical-dot", distant: true, legacy: false },
+    { name: "in-range charge", kind: "charge", distant: false, legacy: false }
+  ] as const)("preserves a $name on open and session restore", async ({ kind, distant, legacy }) => {
+    const { document, nitrogen } = electronMarkDropFixture(kind === "charge" ? { kind, charge: 1 } : { kind });
+    const molecule = dropMolecule(document);
+    const bond = molecule.bonds.find(bond => bond.fromAtomId === nitrogen.id || bond.toAtomId === nitrogen.id)!;
+    const before = distant ? applyPatches(document, [{ op: "updateObject", objectId: dropMark(document).id, changes: {
+      x: 591, y: 491, atomAssociation: undefined,
+      anchor: { kind: "bond", objectId: molecule.id, bondId: bond.id }
+    } }]) : document;
+    const source = dropMolecule(before);
+    expect(source.atoms.find(atom => atom.id === nitrogen.id)).toMatchObject(kind === "charge"
+      ? { formalCharge: 1, markCharge: 1 } : { formalCharge: 0, markRadicals: 1 });
+    const smiles = Molecule.fromSmiles(source.structure).toIsomericSmiles();
+    const payload = createNativeSavePayload(before);
+    const contents = legacy ? JSON.stringify(before) : payload.contents;
+    const path = "/tmp/electron-mark.chemdraft";
+    const expectPreserved = () => {
+      const opened = bridge().snapshot().document;
+      expect(opened.pages[0].objects).toEqual(before.pages[0].objects);
+      expect(Molecule.fromSmiles(dropMolecule(opened).structure).toIsomericSmiles()).toBe(smiles);
+    };
+
+    await act(async () => native.events.get("chemdraft://open-document")!({ contents, path, displayName: payload.filename }));
+    expectPreserved();
+
+    native.session = buildDocumentSessionEnvelope({ ...payload, contents }, { path, dirty: false }, payload.filename, false);
+    await remount();
+    expectPreserved();
+  });
+
+  describe.each(["macos", "windows"] as const)("restored native compatibility on %s", platform => {
+    const toolsetIds = ["core.main", "core.art"];
+    const layout = {
+      version: 1, toolsetOrder: [], userToolsets: [],
+      toolsetOverrides: toolsetIds.map(toolsetId => ({ toolsetId, visible: true }))
+    };
+    const fixture = (name: string) => readFileSync(resolve(
+      "packages/chem-core/src/__fixtures__/compat", `${name}.chemdraft`), "utf8");
+    const path = (name: string) => platform === "windows" ? `C:\\Drawings\\${name}.chemdraft` : `/tmp/${name}.chemdraft`;
+    async function restart(strict = false) {
+      act(() => root!.unmount());
+      container.innerHTML = "";
+      native.toolsetWindows.clear();
+      await mount(createPhase4Document("Untitled"), strict, platform);
+    }
+
+    it("creates the native toolsets before either restored notice and never falls back while notices are open", async () => {
+      vi.useFakeTimers();
+      native.suspendUtilities = true;
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      native.session = buildDocumentTabsSession(["newer-1.3", "newer-format-only"].map(name =>
+        buildDocumentSessionEnvelope({ contents: fixture(name), payloadHash: name, filename: `${name}.chemdraft` },
+          { path: path(name), dirty: false }, `${name}.chemdraft`, false)), 0);
+      const events: string[] = [];
+      const prompts: NativePromptOptions[] = [];
+      const restore = setNativePromptProvider(prompt => withNativeUtilitySuspension(() => {
+        events.push("notice"); prompts.push(prompt);
+        return new Promise<string>(resolve => { pendingPrompt = { prompt, resolve }; });
+      }));
+      let finishLayout!: (value: unknown) => void;
+      const loadingLayout = new Promise(resolve => { finishLayout = resolve; });
+      native.loadToolsetLayout.mockImplementation(() => loadingLayout);
+      let finishArt!: () => void;
+      const openNormally = native.openToolset.getMockImplementation()!;
+      native.openToolset.mockImplementation(async id => {
+        events.push(`request:${id}`);
+        if (id === "core.art") await new Promise<void>(resolve => { finishArt = resolve; });
+        const state = await openNormally(id);
+        events.push(`created:${id}`);
+        return state;
+      });
+      native.openToolset.mockClear();
+      try {
+        await restart(true);
+        expect(tabs()).toHaveLength(2);
+        expect(native.openToolset).not.toHaveBeenCalled();
+        expect(prompts).toEqual([]);
+        await act(async () => finishLayout(layout));
+        for (const id of toolsetIds) expect(native.openToolset).toHaveBeenCalledWith(id, expect.anything());
+        expect(prompts).toEqual([]);
+        expect(native.suspensionDepth).toBe(0);
+        await act(async () => finishArt());
+        expect(events).toEqual(["request:core.main", "created:core.main", "request:core.art", "created:core.art", "notice"]);
+        expect(prompts).toHaveLength(1);
+        expect(pendingPrompt?.prompt.title).toBe("Newer ChemDraft file");
+        expect(native.suspensionDepth).toBe(1);
+        for (const id of toolsetIds) expect(native.toolsetWindows.has(id)).toBe(true);
+
+        // A late catalog update must not treat temporarily hidden toolsets as native failures.
+        native.openToolset.mockClear();
+        const runtime = vi.mocked(createPluginRuntime).mock.results.at(-1)!.value as DesktopPluginRuntime;
+        await act(async () => runtime.registerPlugin({
+          id: "org.test.newer-restore", name: "Late startup plugin", version: "0.0.1", apiVersion: "^0.1.6",
+          entry: "dist/plugin.js", permissions: [], contributes: { commands: [] }
+        }));
+        await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
+        expect(native.openToolset).not.toHaveBeenCalled();
+        expect(container.querySelector(".native-shell")).not.toBeNull();
+        expect(container.querySelector('[role="status"]')?.textContent).not.toContain("unavailable");
+        await modalButton("OK");
+        expect(prompts).toHaveLength(2);
+        expect(pendingPrompt?.prompt.title).toBe("Newer ChemDraft file");
+        await modalButton("OK");
+        expect(prompts).toHaveLength(2);
+        expect(native.suspensionDepth).toBe(0);
+        for (const id of toolsetIds) expect(native.toolsetWindows.get(id)).toBe(true);
+        expect(container.querySelector(".native-shell")).not.toBeNull();
+      } finally { restore(); }
+    });
+
+    it.each(["newer-1.3", "newer-format-only", "plain-1.2"])(
+      "gives %s identical notices through File > Open and successive autosave restores", async name => {
+        native.suspendUtilities = true;
+        native.loadToolsetLayout.mockResolvedValue(layout);
+        vi.spyOn(console, "warn").mockImplementation(() => {});
+        const prompts: NativePromptOptions[] = [];
+        const restore = setNativePromptProvider(prompt => withNativeUtilitySuspension(async () => {
+          for (const id of toolsetIds) expect(native.toolsetWindows.has(id)).toBe(true);
+          prompts.push(prompt);
+          return "ok";
+        }));
+        try {
+          await restart();
+          native.picker.mockResolvedValueOnce(path(name));
+          native.readFile.mockResolvedValueOnce(new TextEncoder().encode(fixture(name)));
+          await command("document.open");
+          const expected = [...prompts];
+          expect(expected).toHaveLength(name === "plain-1.2" ? 0 : 1);
+          if (expected.length) expect(expected[0]).toMatchObject({ title: "Newer ChemDraft file", owner: "document",
+            message: "This file was made with a newer ChemDraft (1.3.0). Some features may not show. Update to keep them." });
+          for (let relaunch = 0; relaunch < 2; relaunch++) {
+            const saved = await autosave();
+            if (name === "newer-format-only") {
+              // File > Save intentionally omits unused version headers; the session must retain them.
+              expect(openNativeDocument(saved.tabs![0]!.contents).document?.formatVersion).toBeUndefined();
+              expect(saved.tabs![0]!.nativeDocumentVersions).toEqual({ formatVersion: "1.3.0" });
+            }
+            prompts.length = 0;
+            await restart();
+            expect(prompts).toEqual(expected);
+            expect(container.querySelector(".native-shell")).not.toBeNull();
+            for (const id of toolsetIds) expect(native.toolsetWindows.get(id)).toBe(true);
+          }
+        } finally { restore(); }
+      });
+  });
+
   it("Open adds a tab for an edited Untitled, including after undo and after Save", async () => {
     await paste("Never replace this drawing");
     await command("edit.undo");
@@ -1042,11 +1589,128 @@ describe("documents in one window", () => {
     expect(drawnText()).toContain("Keep OS edits");
   });
 
+  it("opens every picker selection in selection order using deferred reads", async () => {
+    const paths = ["/drawings/first.chemdraft", "/drawings/second.chemdraft", "/drawings/third.chemdraft"];
+    native.picker.mockResolvedValueOnce(paths);
+    for (const index of paths.keys()) {
+      native.readFile.mockResolvedValueOnce(new TextEncoder().encode(fileContents(index.toString())));
+    }
+    await command("document.open");
+    expect(native.picker).toHaveBeenLastCalledWith(expect.objectContaining({ multiple: true }));
+    expect(native.readFile.mock.calls.map(([path]) => path)).toEqual(paths);
+    expect(tabs().map(tab => tab.textContent)).toEqual(["first.chemdraft", "second.chemdraft", "third.chemdraft"]);
+    for (const [index, path] of paths.entries()) {
+      await activate(index);
+      expect(bridge().snapshot().file.path).toBe(path);
+      expect(bridge().snapshot().document.title).toBe(index.toString());
+    }
+  });
+
+  it("counts zero opens when an invalid table draft refuses all three tab snapshots", async () => {
+    const source = createPhase4Document("Editing");
+    const table = buildTableObject({
+      columns: [{ widthPx: 100, formula: "off" }, { widthPx: 100, formula: "off" }],
+      rows: Array.from({ length: 100 }, () => ["x".repeat(1000), "y".repeat(1000)])
+    }, { id: "table-test", x: 80, y: 90, newId: prefix => `${prefix}-${crypto.randomUUID()}` }).object;
+    source.pages[0].objects.push(table);
+    await act(async () => root!.unmount());
+    await mount(source);
+    const box = planTableLayout(table).cells[0]!.box;
+    const page = container.querySelector<HTMLElement>(".page")!;
+    const target = container.querySelector("[data-table-hit-target]")!;
+    const scale = (bridge().snapshot().viewport as { scale: number }).scale;
+    const { left, top } = page.getBoundingClientRect();
+    await act(async () => target.dispatchEvent(new MouseEvent("dblclick", {
+      bubbles: true, cancelable: true, detail: 2,
+      clientX: left + (box.x + box.width / 2) * scale, clientY: top + (box.y + box.height / 2) * scale
+    })));
+    const editor = container.querySelector<HTMLTextAreaElement>("[data-table-cell-editor] textarea")!;
+    expect(editor).not.toBeNull();
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(editor, "x".repeat(1001));
+      editor.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const before = bridge().snapshot().document;
+    const paths = ["/drawings/first.chemdraft", "/drawings/second.chemdraft", "/drawings/third.chemdraft"];
+    native.picker.mockResolvedValueOnce(paths);
+    for (const path of paths) native.readFile.mockResolvedValueOnce(new TextEncoder().encode(fileContents(path)));
+
+    await command("document.open");
+
+    expect(native.readFile.mock.calls.map(([path]) => path)).toEqual(paths);
+    expect(tabs()).toHaveLength(1);
+    expect(bridge().snapshot().document).toEqual(before);
+    expect(editor.isConnected).toBe(true);
+    const status = container.querySelector('[role="status"]')?.textContent;
+    expect(status).toContain("Opened 0 of 3 files.");
+    expect(status).toContain("maxTableCharacters is 200000; actual value is 200001");
+  });
+
+  it.each(["picker", "pending drain"])("keeps the middle-file failure after a three-file %s finishes", async source => {
+    const payloads = [
+      { path: "/drawings/first.chemdraft", displayName: "first.chemdraft", contents: fileContents("First good drawing") },
+      { path: "/drawings/notes.txt", displayName: "notes.txt", contents: "not a document" },
+      { path: "/drawings/third.chemdraft", displayName: "third.chemdraft", contents: fileContents("Last good drawing") }
+    ];
+    if (source === "picker") {
+      native.picker.mockResolvedValueOnce(payloads.map(payload => payload.path));
+      for (const payload of payloads) native.readFile.mockResolvedValueOnce(new TextEncoder().encode(payload.contents));
+      await command("document.open");
+    } else {
+      native.drainOpenDocuments.mockResolvedValueOnce(payloads);
+      await remount();
+    }
+    expect(tabs().map(tab => tab.textContent)).toEqual(["first.chemdraft", "third.chemdraft"]);
+    expect(bridge().snapshot().document.title).toBe("Last good drawing");
+    const status = container.querySelector('[role="status"]')?.textContent;
+    expect(status).toContain("Opened 2 of 3 files. Could not open notes.txt:");
+    expect(status).toContain("not JSON");
+    expect(status).not.toContain("/drawings/");
+    // Flush later work after the last successful open; its status must not replace the summary.
+    await autosave();
+    await act(async () => { await Promise.resolve(); });
+    expect(container.querySelector('[role="status"]')?.textContent).toBe(status);
+  });
+
+  it("names the file in a single-file picker failure", async () => {
+    native.picker.mockResolvedValueOnce("C:\\Drawings\\notes.txt");
+    native.readFile.mockResolvedValueOnce(new TextEncoder().encode("not a document"));
+    await command("document.open");
+    expect(tabs()).toHaveLength(1);
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("Could not open notes.txt:");
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("not JSON");
+  });
+
+  it("drains live notifications overlapping the initial read without duplicate opens or lost files", async () => {
+    const paths = ["/drawings/cold-A.chemdraft", "/drawings/cold-B.chemdraft", "/drawings/live-C.chemdraft"];
+    const payloads = paths.map((path, index) => ({ path, displayName: path.split("/").at(-1)!, contents: fileContents(`Payload ${index}`) }));
+    let finishDrain!: (value: unknown) => void;
+    native.drainOpenDocuments.mockImplementationOnce(() => new Promise(resolve => { finishDrain = resolve; }));
+    await remount();
+    expect(native.events.has("chemdraft://open-document")).toBe(true);
+    const drainCount = native.drainOpenDocuments.mock.calls.length;
+    // A's notification can arrive after A was removed from the native queue by the initial drain.
+    await act(async () => {
+      native.events.get("chemdraft://open-document")!(null);
+      native.pendingOpenDocuments.push(payloads[2]!);
+      native.events.get("chemdraft://open-document")!(null);
+    });
+    expect(native.drainOpenDocuments).toHaveBeenCalledTimes(drainCount);
+    await act(async () => finishDrain(payloads.slice(0, 2)));
+    expect(tabs().map(tab => tab.textContent)).toEqual(["cold-A.chemdraft", "cold-B.chemdraft", "live-C.chemdraft"]);
+    expect(vi.mocked(openNativeDocument).mock.calls.map(([contents]) => contents)).toEqual(payloads.map(payload => payload.contents));
+    expect(native.pendingOpenDocuments).toEqual([]);
+    await act(async () => native.events.get("chemdraft://open-document")!(null));
+    expect(tabs()).toHaveLength(3);
+    expect(openNativeDocument).toHaveBeenCalledTimes(3);
+  });
+
   it("browser file drop reuses a pristine tab and preserves an edited one", async () => {
     native.desktop = false;
     async function drop(name: string) {
       const event = new Event("drop", { bubbles: true, cancelable: true });
-      Object.defineProperty(event, "dataTransfer", { value: { files: [{ name, text: async () => fileContents(name) }] } });
+      const bytes = new TextEncoder().encode(fileContents(name));
+      Object.defineProperty(event, "dataTransfer", { value: { files: [{ name, size: bytes.length, arrayBuffer: async () => bytes.buffer }] } });
       await act(async () => container.querySelector('[aria-label="Document workspace"]')!.dispatchEvent(event));
     }
     await drop("First.chemdraft");
@@ -1056,6 +1720,257 @@ describe("documents in one window", () => {
     await drop("First.chemdraft");
     expect(tabs()).toHaveLength(2);
     expect(active()).toBe(0);
+  });
+
+  describe("imported page-size prompt queue", () => {
+    // Real external CDXML: the second atom extends past the declared Letter page.
+    const oversized = `<?xml version="1.0"?><CDXML><page id="p1" BoundingBox="0 0 612 792">
+      <fragment id="f1"><n id="a1" p="75 75"/><n id="a2" p="975 75"/>
+      <b id="b1" B="a1" E="a2" Order="1"/></fragment></page></CDXML>`;
+    async function osOpen(path: string, contents = oversized) {
+      await act(async () => native.events.get("chemdraft://open-document")!({
+        path, displayName: path.split("/").at(-1)!, contents
+      }));
+    }
+    // Match the binary-capable browser reader, including its pre-read size check.
+    function browserFile(name: string, contents: string) {
+      const bytes = new TextEncoder().encode(contents);
+      return { name, size: bytes.length, arrayBuffer: async () => bytes.buffer };
+    }
+    async function browserDrop(files: Pick<File, "name" | "size" | "arrayBuffer">[]) {
+      const event = new Event("drop", { bubbles: true, cancelable: true });
+      Object.defineProperty(event, "dataTransfer", { value: { files } });
+      await act(async () => container.querySelector('[aria-label="Document workspace"]')!.dispatchEvent(event));
+    }
+    function expectPageFit(name: string) {
+      expect(pendingPrompt?.prompt.title).toBe("Imported Content Exceeds Page");
+      expect(pendingPrompt?.prompt.message).toMatch(new RegExp(`^${name.replaceAll(".", "\\.")} extends beyond`));
+    }
+    async function dismissPageFit(choice: "keep" | "resize") {
+      const label = pendingPrompt!.prompt.choices.find(candidate => candidate.id === choice)!.label;
+      await modalButton(label);
+    }
+
+    it("keeps one box open across tab switches and applies each queued file's own answer", async () => {
+      const shown: NativePromptOptions[] = [];
+      let visible = 0;
+      let peakVisible = 0;
+      const restore = setNativePromptProvider(prompt => {
+        shown.push(prompt);
+        peakVisible = Math.max(peakVisible, ++visible);
+        return new Promise<string>(resolve => {
+          pendingPrompt = { prompt, resolve: id => { visible--; resolve(id); } };
+        });
+      });
+      try {
+        await open("Existing");
+        await osOpen("/drawings/A.cdxml");
+        await osOpen("/drawings/B.cdxml");
+        await osOpen("/drawings/C.cdxml");
+        const stale = pendingPrompt;
+        await activate(0);
+        await activate(1);
+        expect(pendingPrompt).toBe(stale);
+        expect(shown).toHaveLength(1);
+        // The abandoned native box still exists, but its answer must be ignored.
+        await dismissPageFit("resize");
+        expectPageFit("A.cdxml");
+        expect(bridge().snapshot().document.pages[0]!.layout.presetId).toBe("letter");
+        await dismissPageFit("keep");
+        expectPageFit("B.cdxml");
+        await dismissPageFit("resize");
+        expectPageFit("C.cdxml");
+        await dismissPageFit("keep");
+        expect(pendingPrompt).toBeUndefined();
+        expect(peakVisible).toBe(1);
+        expect(visible).toBe(0);
+        for (const [index, preset] of [[1, "letter"], [2, "custom"], [3, "letter"]] as const) {
+          await activate(index);
+          expect(bridge().snapshot().document.pages[0]!.layout.presetId).toBe(preset);
+        }
+      } finally { restore(); }
+    });
+
+    it("finishes the failure summary only after the last resize prompt is canceled, counting that open as successful", async () => {
+      native.drainOpenDocuments.mockResolvedValueOnce([
+        { path: "/drawings/first.chemdraft", displayName: "first.chemdraft", contents: fileContents("First") },
+        { path: "/drawings/notes.txt", displayName: "notes.txt", contents: "not a document" },
+        { path: "/drawings/last.cdxml", displayName: "last.cdxml", contents: oversized }
+      ]);
+      await remount();
+      expectPageFit("last.cdxml");
+      expect(tabs()).toHaveLength(2);
+      expect(container.querySelector('[role="status"]')?.textContent).not.toContain("Opened 2 of 3 files.");
+      await dismissPageFit("keep");
+      expect(pendingPrompt).toBeUndefined();
+      expect(container.querySelector('[role="status"]')?.textContent).toContain("Opened 2 of 3 files. Could not open notes.txt:");
+      expect(container.querySelector('[role="status"]')?.textContent).not.toContain("Could not open last.cdxml");
+    });
+
+    it("cold-start drains three launch files in order with one prompt and per-document Enlarge, Cancel, Enlarge answers", async () => {
+      const paths = ["/drawings/launch-A.cdxml", "/drawings/launch-B.cdxml", "/drawings/launch-C.cdxml"];
+      const payloads = paths.map(path => ({ path, displayName: path.split("/").at(-1)!, contents: oversized }));
+      let activePrompts = 0;
+      let maximumPrompts = 0;
+      const shown: NativePromptOptions[] = [];
+      restorePromptProvider();
+      restorePromptProvider = setNativePromptProvider(async prompt => {
+        shown.push(prompt);
+        maximumPrompts = Math.max(maximumPrompts, ++activePrompts);
+        try {
+          return await new Promise<string>(resolve => { pendingPrompt = { prompt, resolve }; });
+        } finally { activePrompts--; }
+      });
+      // The native pending-drain invoke returns all three payloads from the cold-start queue.
+      native.drainOpenDocuments.mockResolvedValueOnce(payloads);
+      await remount();
+      expectPageFit("launch-A.cdxml");
+      expect(tabs().map(tab => tab.textContent)).toEqual(["launch-A.cdxml"]);
+      expect(shown).toHaveLength(1);
+      await dismissPageFit("resize");
+      expectPageFit("launch-B.cdxml");
+      expect(tabs().map(tab => tab.textContent)).toEqual(["launch-A.cdxml •", "launch-B.cdxml"]);
+      expect(bridge().snapshot().file.path).toBe(paths[1]);
+      expect(bridge().snapshot().document.pages[0]!.layout.presetId).toBe("letter");
+      expect(shown).toHaveLength(2);
+      await dismissPageFit("keep");
+      expectPageFit("launch-C.cdxml");
+      expect(bridge().snapshot().file.path).toBe(paths[2]);
+      expect(bridge().snapshot().document.pages[0]!.layout.presetId).toBe("letter");
+      expect(shown).toHaveLength(3);
+      await dismissPageFit("resize");
+      expect(pendingPrompt).toBeUndefined();
+      expect(activePrompts).toBe(0);
+      expect(maximumPrompts).toBe(1);
+      expect(shown.map(prompt => prompt.message.split(" extends beyond")[0])).toEqual(payloads.map(payload => payload.displayName));
+      expect(tabs().map(tab => tab.textContent)).toEqual(["launch-A.cdxml •", "launch-B.cdxml", "launch-C.cdxml •"]);
+      for (const [index, path] of paths.entries()) {
+        await activate(index);
+        expect(bridge().snapshot().file.path).toBe(path);
+        expect(bridge().snapshot().document.pages[0]!.layout.presetId).toBe(index === 1 ? "letter" : "custom");
+        expect(bridge().snapshot().file.dirty).toBe(index !== 1);
+        expect(pendingPrompt).toBeUndefined();
+      }
+      expect(shown).toHaveLength(3);
+    });
+
+    it("keeps a delayed batch read ahead of later files after cancelling a close", async () => {
+      let finishB!: (contents: Uint8Array) => void;
+      let finishC!: (contents: Uint8Array) => void;
+      const delayedB = new Promise<Uint8Array>(resolve => { finishB = resolve; });
+      const delayedC = new Promise<Uint8Array>(resolve => { finishC = resolve; });
+      native.readFile.mockResolvedValueOnce(new TextEncoder().encode(oversized))
+        .mockReturnValueOnce(delayedB)
+        .mockReturnValueOnce(delayedC);
+      await act(async () => native.events.get("tauri://drag-drop")!({
+        paths: ["/drawings/A.cdxml", "/drawings/B.cdxml", "/drawings/C.cdxml"]
+      }));
+      expectPageFit("A.cdxml");
+      await dismissPageFit("resize");
+      expect(native.readFile).toHaveBeenCalledWith("/drawings/B.cdxml");
+      await closeTab();
+      const closePrompt = pendingPrompt;
+      expect(closePrompt?.prompt.title).toContain("Save");
+      await act(async () => finishB(new TextEncoder().encode(oversized)));
+      expect(pendingPrompt).toBe(closePrompt);
+      expect(tabs()).toHaveLength(1);
+      await modalButton("Cancel");
+      // Complete C's delayed read after Cancel. If B was re-appended at the tail,
+      // C will prompt first; holding B's original slot keeps the prompt order intact.
+      await act(async () => finishC(new TextEncoder().encode(oversized)));
+      expectPageFit("B.cdxml");
+      await dismissPageFit("keep");
+      expectPageFit("C.cdxml");
+      await dismissPageFit("keep");
+      expect(pendingPrompt).toBeUndefined();
+      expect(tabs().map(tab => tab.textContent)).toEqual(["A.cdxml •", "B.cdxml", "C.cdxml"]);
+    });
+
+    it("prompts for consecutive same-basename paths and releases the queue when the second tab closes", async () => {
+      await osOpen("/first/drawing.cdxml");
+      expectPageFit("drawing.cdxml");
+      const firstPrompt = pendingPrompt;
+      await osOpen("/second/drawing.cdxml");
+      await osOpen("/third/after.chemdraft", fileContents("After closing the prompt"));
+      expect(pendingPrompt).toBe(firstPrompt);
+      expect(tabs()).toHaveLength(1);
+      await dismissPageFit("keep");
+      expectPageFit("drawing.cdxml");
+      expect(pendingPrompt).not.toBe(firstPrompt);
+      expect(bridge().snapshot().file.path).toBe("/second/drawing.cdxml");
+      const closedPrompt = pendingPrompt!;
+      pendingPrompt = undefined;
+      await closeTab();
+      expect(bridge().snapshot().file.path).toBe("/third/after.chemdraft");
+      expect(tabs()).toHaveLength(2);
+      // A late native answer for the closed tab cannot resize the newly active drawing.
+      const after = bridge().snapshot().document;
+      await act(async () => closedPrompt.resolve("resize"));
+      expect(bridge().snapshot().document).toEqual(after);
+      expect(pendingPrompt).toBeUndefined();
+    });
+
+    it.each(["keep", "resize"] as const)("does not re-ask after %s when returning to the previous tab", async choice => {
+      await osOpen("/drawings/A.cdxml");
+      expectPageFit("A.cdxml");
+      await osOpen("/drawings/B.cdxml");
+      await dismissPageFit(choice);
+      expectPageFit("B.cdxml");
+      await dismissPageFit("keep");
+      expect(pendingPrompt).toBeUndefined();
+      await activate(0);
+      expect(bridge().snapshot().file.path).toBe("/drawings/A.cdxml");
+      expect(pendingPrompt).toBeUndefined();
+      expect(bridge().snapshot().document.pages[0]!.layout.presetId).toBe(choice === "resize" ? "custom" : "letter");
+    });
+
+    it.each(["native drop", "browser drop", "startup restore", "close cancellation"])(
+      "reserves A and B before C arrives during A's prompt (%s)", async source => {
+        if (source === "native drop") {
+          native.readFile.mockRejectedValueOnce(new Error("File read refused"))
+            .mockResolvedValueOnce(new TextEncoder().encode("invalid document"))
+            .mockResolvedValueOnce(new TextEncoder().encode(oversized))
+            .mockResolvedValueOnce(new TextEncoder().encode(oversized));
+          await act(async () => native.events.get("tauri://drag-drop")!({
+            paths: ["/drawings/unreadable.cdxml", "/drawings/invalid.cdxml", "/drawings/A.cdxml", "/drawings/B.cdxml"]
+          }));
+        } else if (source === "browser drop") {
+          native.desktop = false;
+          await remount();
+          await browserDrop([
+            { ...browserFile("unreadable.cdxml", oversized), arrayBuffer: async () => { throw new Error("File read refused"); } },
+            browserFile("invalid.cdxml", "invalid document"),
+            ...["A.cdxml", "B.cdxml"].map(name => browserFile(name, oversized))
+          ]);
+        } else {
+          let finishRestore: ((value: unknown) => void) | undefined;
+          if (source === "startup restore") {
+            native.load.mockImplementationOnce(() => new Promise(resolve => { finishRestore = resolve; }));
+            await remount();
+          } else {
+            await paste("Drawing retained by Cancel");
+            await closeTab();
+          }
+          await osOpen("/drawings/A.cdxml");
+          await osOpen("/drawings/B.cdxml");
+          if (finishRestore) await act(async () => finishRestore!(undefined));
+          else await modalButton("Cancel");
+        }
+        expectPageFit("A.cdxml");
+        // A later request must follow every member of the earlier batch.
+        if (source === "browser drop") await browserDrop([browserFile("C.cdxml", oversized)]);
+        else await osOpen("/drawings/C.cdxml");
+        expectPageFit("A.cdxml");
+        await dismissPageFit("keep");
+        expectPageFit("B.cdxml");
+        await dismissPageFit("keep");
+        expectPageFit("C.cdxml");
+        await dismissPageFit("keep");
+        expect(pendingPrompt).toBeUndefined();
+        const titles = tabs().map(tab => tab.textContent);
+        expect(titles.slice(-3)).toEqual(["A.cdxml", "B.cdxml", "C.cdxml"]);
+      }
+    );
   });
 
   it("recognizes Windows file identity across separator and case differences", () => {
@@ -1076,7 +1991,7 @@ describe("documents in one window", () => {
     expect(warningButton()).toBeNull();
     await activate(0);
     expect(warningButton()?.textContent).toContain("11 warnings");
-    const saved = await flush();
+    const saved = await autosave();
     expect(saved.tabs![0]!.openWarnings?.warnings).toHaveLength(11);
     await remount();
     expect(warningButton()?.textContent).toContain("11 warnings");
@@ -1109,6 +2024,910 @@ describe("documents in one window", () => {
     await activate(0);
     await command("edit.redo");
     expect(drawnText()).toContain("First note for history");
+  });
+
+  describe("overflowing document tab strip", () => {
+    function translationX(element: HTMLElement) {
+      return Number.parseFloat(element.style.transform.replace("translateX(", "")) || 0;
+    }
+
+    async function openOverflowingTabs(clientWidthAfterClose = 230) {
+      const strip = container.querySelector<HTMLDivElement>(".document-tab-list")!;
+      const track = strip.querySelector<HTMLDivElement>(".document-tab-track")!;
+      const scrollbar = strip.querySelector<HTMLDivElement>(".document-tab-scrollbar")!;
+      const thumb = scrollbar.querySelector<HTMLDivElement>(".document-tab-scrollbar-thumb")!;
+      const tabWidth = 150;
+      const gap = 2;
+      const stripLeft = 24;
+      track.style.columnGap = `${gap}px`;
+      const stripWidth = vi.spyOn(strip, "clientWidth", "get").mockImplementation(() =>
+        track.childElementCount === 4 ? 230 : clientWidthAfterClose);
+      const trackWidth = vi.spyOn(track, "scrollWidth", "get").mockImplementation(() =>
+        Math.max(0, track.childElementCount * (tabWidth + gap) - gap));
+      vi.spyOn(strip, "getBoundingClientRect").mockImplementation(() => new DOMRect(stripLeft, 0, strip.clientWidth, 24));
+      vi.spyOn(thumb, "getBoundingClientRect").mockImplementation(() =>
+        new DOMRect(stripLeft + translationX(thumb), 24, Number.parseFloat(thumb.style.width), 8));
+      const bounds = HTMLDivElement.prototype.getBoundingClientRect;
+      vi.spyOn(HTMLDivElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLDivElement) {
+        if (this.parentElement !== track) return bounds.call(this);
+        const index = Array.from(track.children).indexOf(this);
+        return new DOMRect(stripLeft + index * (tabWidth + gap) + translationX(track), 0, tabWidth, 24);
+      });
+      for (const name of ["First drawing", "Second drawing", "Third drawing", "Fourth drawing"]) await open(name);
+      expect(tabs()).toHaveLength(4);
+      expect(active()).toBe(3);
+      for (const tab of track.children) vi.spyOn(tab as HTMLElement, "offsetWidth", "get").mockReturnValue(tabWidth);
+      return { strip, track, scrollbar, thumb, stripWidth, trackWidth };
+    }
+
+    function wheel(target: Element, deltaX: number, deltaY: number, deltaMode = 0) {
+      const event = new WheelEvent("wheel", { deltaX, deltaY, deltaMode, bubbles: true, cancelable: true });
+      target.dispatchEvent(event);
+      return event.defaultPrevented;
+    }
+
+    function pointer(target: Element, type: string, clientX: number, options: PointerEventInit = {}) {
+      const event = new PointerEvent(type, { clientX, pointerId: 7, pointerType: "mouse", button: 0,
+        bubbles: true, cancelable: true, ...options });
+      target.dispatchEvent(event);
+      return event.defaultPrevented;
+    }
+
+    it("shows an unfocusable scrollbar on overflow and follows the tab track offset", async () => {
+      const bar = container.querySelector<HTMLDivElement>(".document-tab-scrollbar")!;
+      expect(bar.style.visibility).toBe("hidden");
+      expect(bar.getAttribute("aria-hidden")).toBe("true");
+      expect(bar.tabIndex).toBe(-1);
+
+      const { scrollbar, thumb, track } = await openOverflowingTabs();
+      const thumbWidth = 230 * (230 / 606);
+      expect(scrollbar.style.visibility).toBe("visible");
+      expect(Number.parseFloat(thumb.style.width)).toBeCloseTo(thumbWidth);
+      expect(translationX(thumb)).toBeCloseTo(230 - thumbWidth);
+
+      expect(wheel(scrollbar, 0, -188)).toBe(true);
+      expect(track.style.transform).toBe("translateX(-188px)");
+      expect(translationX(thumb)).toBeCloseTo((230 - thumbWidth) / 2);
+    });
+
+    it("captures primary thumb drags, maps movement proportionally, and clamps at both edges", async () => {
+      const { scrollbar, thumb, track } = await openOverflowingTabs();
+      const thumbTravel = 230 - 230 * (230 / 606);
+      expect(wheel(track, -376, 0)).toBe(true);
+      const capture = scrollbar.setPointerCapture = vi.fn();
+
+      expect(pointer(thumb, "pointerdown", 44, { button: 2 })).toBe(false);
+      expect(capture).not.toHaveBeenCalled();
+      expect(pointer(thumb, "pointerdown", 44)).toBe(true);
+      expect(capture).toHaveBeenCalledExactlyOnceWith(7);
+      pointer(scrollbar, "pointermove", 104, { pointerId: 8 });
+      expect(translationX(track)).toBe(0);
+      pointer(scrollbar, "pointermove", 104);
+      expect(translationX(track)).toBeCloseTo(-60 / thumbTravel * 376);
+      expect(translationX(thumb)).toBeCloseTo(60);
+      pointer(scrollbar, "pointermove", 500);
+      expect(translationX(track)).toBe(-376);
+      pointer(scrollbar, "pointermove", 12);
+      expect(translationX(track)).toBe(0);
+      pointer(scrollbar, "pointerup", 12);
+      pointer(scrollbar, "pointermove", 500);
+      expect(translationX(track)).toBe(0);
+
+      pointer(thumb, "pointerdown", 44);
+      expect(capture).toHaveBeenCalledTimes(2);
+      pointer(scrollbar, "pointercancel", 44);
+      pointer(scrollbar, "pointermove", 500);
+      expect(translationX(track)).toBe(0);
+    });
+
+    it("pages one viewport toward a scrollbar track click", async () => {
+      const { strip, scrollbar, track } = await openOverflowingTabs();
+      expect(wheel(track, -376, 0)).toBe(true);
+      const bounds = strip.getBoundingClientRect();
+      pointer(scrollbar, "pointerdown", bounds.right - 1);
+      expect(track.style.transform).toBe("translateX(-230px)");
+      pointer(scrollbar, "pointerdown", bounds.left + 1);
+      expect(track.style.transform).toBe("translateX(0px)");
+    });
+
+    function touch(target: Element, type: string, clientX: number, clientY = 12, options: PointerEventInit = {}) {
+      return pointer(target, type, clientX, { pointerType: "touch", pointerId: 21, isPrimary: true, clientY, ...options });
+    }
+
+    function lostCapture(target: Element, pointerId: number, pointerType: string) {
+      target.dispatchEvent(new PointerEvent("lostpointercapture", { pointerId, pointerType, bubbles: true }));
+    }
+
+    it("drags the thumb and pages the scrollbar with a finger or a pen exactly as with the mouse", async () => {
+      const { strip, scrollbar, thumb, track } = await openOverflowingTabs();
+      const thumbTravel = 230 - 230 * (230 / 606);
+      const capture = scrollbar.setPointerCapture = vi.fn();
+      for (const [pointerType, pointerId, end] of [["touch", 11, "pointerup"], ["pen", 12, "pointercancel"]] as const) {
+        wheel(track, -1000, 0);
+        expect(translationX(track)).toBe(0);
+        const options = { pointerType, pointerId, isPrimary: true };
+        expect(pointer(thumb, "pointerdown", 44, options)).toBe(true);
+        expect(capture).toHaveBeenLastCalledWith(pointerId);
+        // Moving the implicit touch or pen capture from the thumb to the scrollbar does not end the drag.
+        lostCapture(thumb, pointerId, pointerType);
+        pointer(scrollbar, "pointermove", 104, options);
+        expect(translationX(track)).toBeCloseTo(-60 / thumbTravel * 376);
+        expect(translationX(thumb)).toBeCloseTo(60);
+        pointer(scrollbar, "pointermove", 500, options);
+        expect(translationX(track)).toBe(-376);
+        pointer(scrollbar, "pointermove", 12, options);
+        expect(translationX(track)).toBe(0);
+        pointer(scrollbar, end, 12, options);
+        pointer(scrollbar, "pointermove", 500, options);
+        expect(translationX(track)).toBe(0);
+      }
+      expect(capture).toHaveBeenCalledTimes(2);
+
+      // The scrollbar's own capture ending does end a touch drag.
+      expect(pointer(thumb, "pointerdown", 44, { pointerType: "touch", pointerId: 13, isPrimary: true })).toBe(true);
+      lostCapture(scrollbar, 13, "touch");
+      pointer(scrollbar, "pointermove", 500, { pointerType: "touch", pointerId: 13 });
+      expect(translationX(track)).toBe(0);
+
+      // A tap or pen press on the scrollbar track pages one viewport toward it.
+      const bounds = strip.getBoundingClientRect();
+      expect(pointer(scrollbar, "pointerdown", bounds.right - 1, { pointerType: "touch", pointerId: 14, isPrimary: true })).toBe(true);
+      expect(track.style.transform).toBe("translateX(-230px)");
+      pointer(scrollbar, "pointerdown", bounds.left + 1, { pointerType: "pen", pointerId: 15, isPrimary: true });
+      expect(track.style.transform).toBe("translateX(0px)");
+    });
+
+    it("pans the tabs with a touch or pen drag past the slop and never activates the tab under it", async () => {
+      const { track, thumb } = await openOverflowingTabs();
+      const thumbTravel = 230 - 230 * (230 / 606);
+      const capture = track.setPointerCapture = vi.fn();
+      const third = tabs()[2]!;
+      touch(third, "pointerdown", 60);
+      touch(third, "pointermove", 60 + TOUCH_PAN_SLOP + 1, 14);
+      expect(capture).toHaveBeenCalledExactlyOnceWith(21);
+      expect(translationX(track)).toBe(-376 + TOUCH_PAN_SLOP + 1);
+      // Taking the capture from the tab under the finger does not end the pan.
+      lostCapture(third, 21, "touch");
+      touch(track, "pointermove", 160);
+      expect(translationX(track)).toBe(-276);
+      touch(track, "pointermove", 1000);
+      expect(translationX(track)).toBe(0);
+      touch(track, "pointermove", 110);
+      expect(translationX(track)).toBe(-326);
+      expect(translationX(thumb)).toBeCloseTo(326 / 376 * thumbTravel);
+      touch(track, "pointerup", 110);
+      await act(async () => third.click());
+      expect(active()).toBe(3);
+      expect(bridge().snapshot().document.title).toBe("Fourth drawing");
+      expect(translationX(track)).toBe(-326);
+      touch(track, "pointermove", 160);
+      expect(translationX(track)).toBe(-326);
+
+      const pen = { pointerType: "pen", pointerId: 22, isPrimary: true, clientY: 12 };
+      pointer(third, "pointerdown", 60, pen);
+      pointer(third, "pointermove", 80, pen);
+      expect(translationX(track)).toBe(-306);
+      pointer(track, "pointerup", 80, pen);
+      await act(async () => third.click());
+      expect(active()).toBe(3);
+    });
+
+    it("lets a touch tap activate a tab or close it from its ×, and scopes a pan's suppression to its own click", async () => {
+      const { track } = await openOverflowingTabs();
+      track.setPointerCapture = vi.fn();
+      // A pan whose release brings no click; the next tap's press starts a new gesture.
+      touch(tabs()[3]!, "pointerdown", 150);
+      touch(tabs()[3]!, "pointermove", 200);
+      expect(translationX(track)).toBe(-326);
+      touch(track, "pointerup", 200);
+
+      const third = tabs()[2]!;
+      touch(third, "pointerdown", 80, 12);
+      touch(third, "pointermove", 80 + TOUCH_PAN_SLOP, 15);
+      expect(translationX(track)).toBe(-326);
+      touch(third, "pointerup", 80 + TOUCH_PAN_SLOP, 15);
+      await act(async () => third.click());
+      expect(active()).toBe(2);
+      expect(bridge().snapshot().document.title).toBe("Third drawing");
+
+      // After a pan's click window, a click that no press preceded (keyboard or automation) still activates.
+      vi.useFakeTimers();
+      touch(tabs()[2]!, "pointerdown", 100);
+      touch(tabs()[2]!, "pointermove", 60);
+      expect(translationX(track)).toBe(-344);
+      touch(track, "pointerup", 60);
+      await act(async () => vi.advanceTimersByTimeAsync(PAN_CLICK_WINDOW_MS));
+      await act(async () => tabs()[3]!.click());
+      expect(active()).toBe(3);
+      vi.useRealTimers();
+
+      const close = container.querySelectorAll<HTMLButtonElement>(".document-tab-close")[3]!;
+      touch(close, "pointerdown", 200);
+      touch(close, "pointerup", 200);
+      await act(async () => close.click());
+      expect(tabs()).toHaveLength(3);
+      expect(tabs().map(tab => tab.textContent)).not.toContain("Fourth drawing");
+    });
+
+    // A pan with no trailing click, as Chromium sends after a moved touch: down on a tab, past the slop, up on the track.
+    function panWithoutClick(track: HTMLElement, from: Element, pointerId: number) {
+      touch(from, "pointerdown", 150, 12, { pointerId });
+      touch(from, "pointermove", 150 - TOUCH_PAN_SLOP - 20, 12, { pointerId });
+      touch(track, "pointerup", 150 - TOUCH_PAN_SLOP - 20, 12, { pointerId });
+    }
+
+    it("activates a different tab tapped 0, 50 or 150 ms after a pan, and swallows only the pan's own release click", async () => {
+      const { track } = await openOverflowingTabs();
+      track.setPointerCapture = vi.fn();
+      vi.useFakeTimers();
+      let pointerId = 30;
+      for (const [delay, target] of [[0, 0], [50, 1], [150, 2]] as const) {
+        panWithoutClick(track, tabs()[active()]!, ++pointerId);
+        if (delay > 0) await act(async () => vi.advanceTimersByTimeAsync(delay));
+        const tap = { pointerId: ++pointerId };
+        touch(tabs()[target]!, "pointerdown", 100, 12, tap);
+        touch(tabs()[target]!, "pointerup", 100, 12, tap);
+        await act(async () => tabs()[target]!.click());
+        expect(active()).toBe(target);
+      }
+
+      // The pan's own release click, on the panned tab right after its pointerup with no press between, is swallowed.
+      panWithoutClick(track, tabs()[0]!, ++pointerId);
+      await act(async () => tabs()[0]!.click());
+      expect(active()).toBe(2);
+      // An immediate tap on that same tab is a new press, so its click activates.
+      const tap = { pointerId: ++pointerId };
+      touch(tabs()[0]!, "pointerdown", 100, 12, tap);
+      touch(tabs()[0]!, "pointerup", 100, 12, tap);
+      await act(async () => tabs()[0]!.click());
+      expect(active()).toBe(0);
+      vi.useRealTimers();
+    });
+
+    it("lets a press or a key press anywhere end a pan's release-click window", async () => {
+      const { track } = await openOverflowingTabs();
+      track.setPointerCapture = vi.fn();
+      // A press outside the tab track, here on the page body, still ends the window.
+      panWithoutClick(track, tabs()[3]!, 40);
+      pointer(document.body, "pointerdown", 4, { pointerType: "mouse", pointerId: 1 });
+      pointer(document.body, "pointerup", 4, { pointerType: "mouse", pointerId: 1 });
+      await act(async () => tabs()[1]!.click());
+      expect(active()).toBe(1);
+      // So does a key press outside the track.
+      panWithoutClick(track, tabs()[1]!, 41);
+      document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Shift", bubbles: true, cancelable: true }));
+      await act(async () => tabs()[2]!.click());
+      expect(active()).toBe(2);
+    });
+
+    it("consumes a panning finger's touch moves so the browser starts no scroll or fling of its own", async () => {
+      const { track } = await openOverflowingTabs();
+      track.setPointerCapture = vi.fn();
+      const touchMove = (target: Element) => {
+        const event = new Event("touchmove", { bubbles: true, cancelable: true });
+        target.dispatchEvent(event);
+        return event.defaultPrevented;
+      };
+      const third = tabs()[2]!;
+      touch(third, "pointerdown", 60);
+      touch(third, "pointermove", 60 + TOUCH_PAN_SLOP - 1);
+      // Still a tap: the browser keeps the touch.
+      expect(touchMove(third)).toBe(false);
+      touch(third, "pointermove", 60 + TOUCH_PAN_SLOP + 1);
+      expect(touchMove(third)).toBe(true);
+      touch(track, "pointermove", 160);
+      expect(touchMove(track)).toBe(true);
+      touch(track, "pointerup", 160);
+      expect(touchMove(track)).toBe(false);
+
+      // A vertical-dominant move is left to the browser.
+      touch(third, "pointerdown", 60, 4, { pointerId: 22 });
+      touch(third, "pointermove", 62, 4 + TOUCH_PAN_SLOP + 1, { pointerId: 22 });
+      expect(touchMove(third)).toBe(false);
+      touch(third, "pointerup", 62, 4 + TOUCH_PAN_SLOP + 1, { pointerId: 22 });
+    });
+
+    it("never default-prevents touch moves of an abandoned vertical gesture or outside the strip", async () => {
+      const { track } = await openOverflowingTabs();
+      track.setPointerCapture = vi.fn();
+      const touchMove = (target: Element) => {
+        const event = new Event("touchmove", { bubbles: true, cancelable: true });
+        target.dispatchEvent(event);
+        return event.defaultPrevented;
+      };
+      const third = tabs()[2]!;
+      touch(third, "pointerdown", 60, 4, { pointerId: 23 });
+      touch(third, "pointermove", 66, 44, { pointerId: 23 });
+      // Vertical page scroll and pinch-zoom keep working during and after the abandoned gesture.
+      expect(touchMove(third)).toBe(false);
+      expect(touchMove(track)).toBe(false);
+      expect(touchMove(document.body)).toBe(false);
+      // Turning sideways afterwards does not make it a pan.
+      touch(third, "pointermove", 160, 44, { pointerId: 23 });
+      expect(touchMove(third)).toBe(false);
+      expect(touchMove(track)).toBe(false);
+      touch(third, "pointerup", 160, 44, { pointerId: 23 });
+      expect(touchMove(third)).toBe(false);
+      expect(touchMove(track)).toBe(false);
+      expect(touchMove(document.body)).toBe(false);
+    });
+
+    it("does not pan on a vertical-dominant touch move", async () => {
+      const { track } = await openOverflowingTabs();
+      const capture = track.setPointerCapture = vi.fn();
+      const third = tabs()[2]!;
+      touch(third, "pointerdown", 60, 4);
+      touch(third, "pointermove", 63, 4 + TOUCH_PAN_SLOP + 1);
+      // Turning sideways afterwards does not make it a pan.
+      touch(third, "pointermove", 160, 14);
+      expect(translationX(track)).toBe(-376);
+      touch(third, "pointerup", 160, 14);
+      // Diagonal, more vertical than horizontal, both past the slop.
+      touch(third, "pointerdown", 60, 0);
+      touch(third, "pointermove", 60 + TOUCH_PAN_SLOP + 2, TOUCH_PAN_SLOP + 2);
+      touch(third, "pointermove", 160, TOUCH_PAN_SLOP + 2);
+      expect(translationX(track)).toBe(-376);
+      touch(third, "pointerup", 160, TOUCH_PAN_SLOP + 2);
+      expect(capture).not.toHaveBeenCalled();
+
+      // The next horizontal swipe pans.
+      touch(third, "pointerdown", 60, 4);
+      touch(third, "pointermove", 160, 6);
+      expect(translationX(track)).toBe(-276);
+    });
+
+    it("treats a touch move of slop−1 as a tap and slop+1 as a pan", async () => {
+      const { track } = await openOverflowingTabs();
+      track.setPointerCapture = vi.fn();
+      const third = tabs()[2]!;
+      touch(third, "pointerdown", 60);
+      touch(third, "pointermove", 60 + TOUCH_PAN_SLOP - 1);
+      expect(translationX(track)).toBe(-376);
+      touch(third, "pointerup", 60 + TOUCH_PAN_SLOP - 1);
+      await act(async () => third.click());
+      expect(active()).toBe(2);
+      expect(translationX(track)).toBe(-304);
+
+      const fourth = tabs()[3]!;
+      touch(fourth, "pointerdown", 200);
+      touch(fourth, "pointermove", 200 + TOUCH_PAN_SLOP + 1);
+      expect(translationX(track)).toBe(-304 + TOUCH_PAN_SLOP + 1);
+      touch(fourth, "pointerup", 200 + TOUCH_PAN_SLOP + 1);
+      await act(async () => fourth.click());
+      expect(active()).toBe(2);
+      expect(translationX(track)).toBe(-304 + TOUCH_PAN_SLOP + 1);
+    });
+
+    it("does not pan when the mouse presses and moves on a tab", async () => {
+      const { track } = await openOverflowingTabs();
+      const capture = track.setPointerCapture = vi.fn();
+      const third = tabs()[2]!;
+      pointer(third, "pointerdown", 60, { clientY: 12, isPrimary: true });
+      pointer(third, "pointermove", 160, { clientY: 12, isPrimary: true });
+      expect(translationX(track)).toBe(-376);
+      pointer(third, "pointerup", 160, { clientY: 12, isPrimary: true });
+      expect(capture).not.toHaveBeenCalled();
+      await act(async () => third.click());
+      expect(active()).toBe(2);
+    });
+
+    it("moves by horizontal and vertical wheel deltas, as a trackpad sends them, by the same amounts as before", async () => {
+      const { track } = await openOverflowingTabs();
+      expect(wheel(track, -100, 0)).toBe(true);
+      expect(translationX(track)).toBe(-276);
+      expect(wheel(track, 0, -50)).toBe(true);
+      expect(translationX(track)).toBe(-226);
+      expect(wheel(tabs()[2]!, 12.5, 40)).toBe(true);
+      expect(translationX(track)).toBe(-238.5);
+      expect(wheel(track, 0, 1, WheelEvent.DOM_DELTA_LINE)).toBe(true);
+      expect(translationX(track)).toBeLessThan(-238.5);
+    });
+
+    it("keeps new, activated and cycled tabs in view and clamps after a close widens the strip", async () => {
+      const { track } = await openOverflowingTabs(250);
+      expect(track.style.transform).toBe("translateX(-376px)");
+      const movement = vi.spyOn(track.style, "transform", "set");
+      await closeTab();
+      expect(movement.mock.calls.map(([value]) => value)).toEqual(["translateX(-224px)", "translateX(-204px)"]);
+      expect(track.style.transform).toBe("translateX(-204px)");
+      expect(active()).toBe(2);
+
+      await key();
+      expect(active()).toBe(0);
+      expect(track.style.transform).toBe("translateX(0px)");
+      await key(true);
+      expect(active()).toBe(2);
+      expect(track.style.transform).toBe("translateX(-204px)");
+      await activate(1);
+      expect(bridge().snapshot().document.title).toBe("Second drawing");
+      expect(track.style.transform).toBe("translateX(-152px)");
+      await command("document.new");
+      expect(active()).toBe(3);
+      expect(track.style.transform).toBe("translateX(-376px)");
+    });
+
+    it("uses horizontal wheel input first, accepts vertical input, and releases the wheel at either edge", async () => {
+      const { track } = await openOverflowingTabs();
+      expect(wheel(track, 1, 0)).toBe(false);
+      expect(wheel(track, -23.5, 80)).toBe(true);
+      expect(track.style.transform).toBe("translateX(-352.5px)");
+      expect(wheel(track, 0, -1000)).toBe(true);
+      expect(track.style.transform).toBe("translateX(0px)");
+      expect(wheel(track, 0, -1)).toBe(false);
+      expect(wheel(track, 0, 1, WheelEvent.DOM_DELTA_PAGE)).toBe(true);
+      expect(track.style.transform).toBe("translateX(-230px)");
+      await act(async () => tabs()[0]!.focus());
+      expect(track.style.transform).toBe("translateX(0px)");
+      expect(active()).toBe(3);
+    });
+
+    it("clamps the offset when the viewport or tab track changes width", async () => {
+      const resize = new Map<Element, () => void>();
+      vi.stubGlobal("ResizeObserver", class {
+        constructor(private readonly onResize: () => void) {}
+        observe(element: Element) { resize.set(element, this.onResize); }
+        unobserve(element: Element) { resize.delete(element); }
+        disconnect() {}
+      });
+      await remount();
+      const { strip, track, scrollbar, thumb, stripWidth, trackWidth } = await openOverflowingTabs();
+      expect(track.style.transform).toBe("translateX(-376px)");
+
+      stripWidth.mockReturnValue(80);
+      resize.get(strip)!();
+      expect(thumb.style.width).toBe("24px");
+
+      stripWidth.mockReturnValue(320);
+      resize.get(strip)!();
+      expect(track.style.transform).toBe("translateX(-286px)");
+
+      trackWidth.mockReturnValue(300);
+      resize.get(track)!();
+      expect(track.style.transform).toBe("translateX(0px)");
+      expect(scrollbar.style.visibility).toBe("hidden");
+      expect(wheel(track, 10, 0)).toBe(false);
+    });
+
+    describe("resizing the strip", () => {
+      async function openWithResize() {
+        const resize = new Map<Element, () => void>();
+        vi.stubGlobal("ResizeObserver", class {
+          constructor(private readonly onResize: () => void) {}
+          observe(element: Element) { resize.set(element, this.onResize); }
+          unobserve(element: Element) { resize.delete(element); }
+          disconnect() {}
+        });
+        await remount();
+        const opened = await openOverflowingTabs();
+        expect(opened.track.style.transform).toBe("translateX(-376px)");
+        return { ...opened, resize };
+      }
+
+      function expectActiveTabInView(strip: HTMLElement) {
+        const tab = strip.querySelector('[data-active="true"]')!.getBoundingClientRect();
+        const bounds = strip.getBoundingClientRect();
+        expect(tab.left).toBeGreaterThanOrEqual(bounds.left);
+        expect(tab.right).toBeLessThanOrEqual(bounds.right);
+      }
+
+      it("keeps a fully visible active tab in view when the strip narrows", async () => {
+        const { strip, track, stripWidth, resize } = await openWithResize();
+        stripWidth.mockReturnValue(200);
+        resize.get(strip)!();
+        expect(track.style.transform).toBe("translateX(-406px)");
+        expectActiveTabInView(strip);
+      });
+
+      it("only clamps when the user had scrolled the active tab out of view before narrowing", async () => {
+        const { strip, track, stripWidth, resize } = await openWithResize();
+        expect(wheel(track, -300, 0)).toBe(true);
+        expect(track.style.transform).toBe("translateX(-76px)");
+        stripWidth.mockReturnValue(200);
+        resize.get(strip)!();
+        expect(track.style.transform).toBe("translateX(-76px)");
+      });
+
+      it("clamps to the new maximum with no gap when the strip widens", async () => {
+        const { strip, track, stripWidth, resize } = await openWithResize();
+        stripWidth.mockReturnValue(320);
+        resize.get(strip)!();
+        expect(track.style.transform).toBe("translateX(-286px)");
+        expect(286 + 320).toBe(606);
+        expectActiveTabInView(strip);
+      });
+    });
+
+    describe("a tab that grows after it was revealed", () => {
+      const gap = 2;
+      const stripLeft = 24;
+      const stripWidth = 230;
+      const closeWidth = 30;
+
+      // Tabs have a width of their own, so one can grow after the strip has already revealed it. The width comes
+      // from the title unless a test overrides it, and only the tests fire the resize callbacks.
+      async function mountWithVariableWidths() {
+        const resize = new Map<Element, () => void>();
+        vi.stubGlobal("ResizeObserver", class {
+          constructor(private readonly onResize: () => void) {}
+          observe(element: Element) { resize.set(element, this.onResize); }
+          unobserve(element: Element) { resize.delete(element); }
+          disconnect() {}
+        });
+        await remount();
+        const strip = container.querySelector<HTMLDivElement>(".document-tab-list")!;
+        const track = strip.querySelector<HTMLDivElement>(".document-tab-track")!;
+        const widths = new Map<Element, number>();
+        const widthOf = (tab: Element) => {
+          const title = tab.querySelector('[role="tab"] span')?.textContent ?? "";
+          return widths.get(tab) ?? (title === "Untitled" ? 90 : title.startsWith("Quarterly") ? 220 : 150);
+        };
+        const trackWidth = () => {
+          const tabs = Array.from(track.children);
+          return Math.max(0, tabs.reduce((sum, tab) => sum + widthOf(tab), 0) + Math.max(0, tabs.length - 1) * gap);
+        };
+        track.style.columnGap = `${gap}px`;
+        vi.spyOn(strip, "clientWidth", "get").mockReturnValue(stripWidth);
+        vi.spyOn(strip, "getBoundingClientRect").mockImplementation(() => new DOMRect(stripLeft, 0, stripWidth, 24));
+        vi.spyOn(track, "scrollWidth", "get").mockImplementation(trackWidth);
+        vi.spyOn(track, "getBoundingClientRect").mockImplementation(() =>
+          new DOMRect(stripLeft + translationX(track), 0, trackWidth(), 24));
+        const bounds = HTMLDivElement.prototype.getBoundingClientRect;
+        vi.spyOn(HTMLDivElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLDivElement) {
+          if (this.parentElement !== track) return bounds.call(this);
+          let left = 0;
+          for (const tab of Array.from(track.children)) {
+            if (tab === this) break;
+            left += widthOf(tab) + gap;
+          }
+          return new DOMRect(stripLeft + left + translationX(track), 0, widthOf(this), 24);
+        });
+        for (const name of ["First drawing", "Second drawing", "Third drawing", "Fourth drawing"]) await open(name);
+        expect(tabs()).toHaveLength(4);
+        expect(active()).toBe(3);
+        // Four tabs of 150 px and three gaps make a 606 px track in a 230 px strip: the last tab is revealed.
+        expect(track.style.transform).toBe("translateX(-376px)");
+        return { strip, track, widths, resize, lastTab: () => track.lastElementChild as HTMLElement };
+      }
+
+      // The tab and its close button, at the tab's right end, both sit inside the strip.
+      function expectTabAndCloseInStrip(tab: HTMLElement) {
+        const box = tab.getBoundingClientRect();
+        expect(box.left).toBeGreaterThanOrEqual(stripLeft);
+        expect(box.right).toBeLessThanOrEqual(stripLeft + stripWidth);
+        expect(box.right - closeWidth).toBeGreaterThanOrEqual(stripLeft);
+      }
+
+      it("keeps the active last tab fully visible when its width grows after the reveal", async () => {
+        const { track, widths, resize, lastTab } = await mountWithVariableWidths();
+        expectTabAndCloseInStrip(lastTab());
+
+        // Only the tab's own width changes: the strip keeps its size, so just the track's observer fires.
+        widths.set(lastTab(), 200);
+        resize.get(track)!();
+
+        expect(track.style.transform).toBe("translateX(-426px)");
+        expect(426 + stripWidth).toBe(3 * 150 + 200 + 3 * gap);
+        expectTabAndCloseInStrip(lastTab());
+      });
+
+      it("reveals a file opening into a blank last tab at its final width", async () => {
+        const { track, lastTab } = await mountWithVariableWidths();
+        await command("document.new");
+        expect(tabs()).toHaveLength(5);
+        expect(active()).toBe(4);
+        expect(tabs()[4]!.textContent).toBe("Untitled");
+        expect(track.style.transform).toBe("translateX(-468px)");
+        expectTabAndCloseInStrip(lastTab());
+
+        // The pristine tab keeps its id, so only its title changes; no resize callback fires.
+        await open("Quarterly review");
+        expect(tabs()).toHaveLength(5);
+        expect(active()).toBe(4);
+        expect(tabs()[4]!.textContent).toBe("Quarterly review.chemdraft");
+        expect(track.style.transform).toBe("translateX(-598px)");
+        expectTabAndCloseInStrip(lastTab());
+      });
+
+      it("does not pull the strip back when the user scrolled away before the tab grew", async () => {
+        const { track, widths, resize, lastTab } = await mountWithVariableWidths();
+        expect(wheel(track, -300, 0)).toBe(true);
+        expect(track.style.transform).toBe("translateX(-76px)");
+
+        widths.set(lastTab(), 200);
+        resize.get(track)!();
+
+        expect(track.style.transform).toBe("translateX(-76px)");
+      });
+    });
+
+    it.each(["×", "Cmd+W", "Ctrl+W"] as const)(
+      "scrolls before removing the last active tab via %s",
+      async (route) => {
+        if (route !== "×") await mountForShortcutPlatform(route === "Cmd+W" ? "macos" : "windows");
+        const { strip, track, thumb } = await openOverflowingTabs();
+        const movement = vi.spyOn(track.style, "transform", "set");
+        if (route === "×") {
+          await closeTab();
+        } else {
+          const event = new KeyboardEvent("keydown", {
+            key: "w", metaKey: route === "Cmd+W", ctrlKey: route === "Ctrl+W",
+            bubbles: true, cancelable: true
+          });
+          await act(async () => window.dispatchEvent(event));
+          expect(event.defaultPrevented).toBe(true);
+        }
+
+        expect(tabs()).toHaveLength(3);
+        expect(active()).toBe(2);
+        expect(movement).toHaveBeenNthCalledWith(1, "translateX(-224px)");
+        expect(track.style.transform).toBe("translateX(-224px)");
+        const thumbWidth = 230 * (230 / 454);
+        expect(Number.parseFloat(thumb.style.width)).toBeCloseTo(thumbWidth);
+        expect(translationX(thumb)).toBeCloseTo(230 - thumbWidth);
+        const activeTabRect = strip.querySelector('[data-active="true"]')!.getBoundingClientRect();
+        const stripRect = strip.getBoundingClientRect();
+        expect(activeTabRect.left).toBeGreaterThanOrEqual(stripRect.left);
+        expect(activeTabRect.right).toBeLessThanOrEqual(stripRect.right);
+      }
+    );
+
+    it("accounts for both closing tabs when React batches the removals", async () => {
+      const { strip, track } = await openOverflowingTabs();
+      const movement = vi.spyOn(track.style, "transform", "set");
+      const buttons = strip.querySelectorAll<HTMLButtonElement>(".document-tab-close");
+      await act(async () => {
+        buttons[3]!.click();
+        buttons[2]!.click();
+      });
+
+      expect(tabs()).toHaveLength(2);
+      expect(movement).toHaveBeenNthCalledWith(1, "translateX(-224px)");
+      expect(movement).toHaveBeenNthCalledWith(2, "translateX(-72px)");
+      expect(track.style.transform).toBe("translateX(-72px)");
+    });
+
+    it("reveals the active tab when closing an inactive tab shrinks the strip", async () => {
+      const { track } = await openOverflowingTabs();
+      await activate(0);
+      expect(wheel(track, 1000, 0)).toBe(true);
+      const movement = vi.spyOn(track.style, "transform", "set");
+
+      await closeTab(3);
+
+      expect(active()).toBe(0);
+      expect(movement).toHaveBeenNthCalledWith(1, "translateX(-224px)");
+      expect(track.style.transform).toBe("translateX(0px)");
+    });
+
+    it("activates the clicked tab by id after closing and scrolling the strip", async () => {
+      const { track } = await openOverflowingTabs();
+      const clickedTab = tabs()[1]!;
+      const commandId = runtime().host.commands.list().find(command => command.title === "Activate Second drawing.chemdraft")!.id;
+      await closeTab();
+      expect(wheel(track, -100, 0)).toBe(true);
+      expect(track.style.transform).toBe("translateX(-124px)");
+      const invoke = vi.spyOn(runtime().host, "invokeCommand");
+
+      await act(async () => clickedTab.click());
+
+      expect(invoke).toHaveBeenCalledExactlyOnceWith(commandId);
+      expect(clickedTab.getAttribute("aria-selected")).toBe("true");
+      expect(bridge().snapshot().document.title).toBe("Second drawing");
+    });
+
+    describe("last tab close button", () => {
+      const closeWidth = 30;
+
+      // Give each close button the box it has at the right end of its tab, and put the "+" button where the
+      // layout puts it: beside the strip, two pixels past its right edge.
+      function stubCloseButtonsAndNewTab(strip: HTMLElement) {
+        for (const tab of Array.from(strip.querySelectorAll<HTMLElement>(".document-tab"))) {
+          const close = tab.querySelector<HTMLElement>(".document-tab-close")!;
+          vi.spyOn(close, "getBoundingClientRect").mockImplementation(() => {
+            const box = tab.getBoundingClientRect();
+            return new DOMRect(box.right - closeWidth, box.top, closeWidth, box.height);
+          });
+        }
+        const plus = container.querySelector<HTMLElement>(".document-tab-new")!;
+        vi.spyOn(plus, "getBoundingClientRect").mockImplementation(() =>
+          new DOMRect(strip.getBoundingClientRect().right + 2, 0, 30, 24));
+        return plus;
+      }
+
+      function expectLastTabFullyVisible(strip: HTMLElement, plus: HTMLElement) {
+        const bounds = strip.getBoundingClientRect();
+        // The visible right edge stops where a sibling begins to cover the strip.
+        const visibleRight = Math.min(bounds.right, plus.getBoundingClientRect().left);
+        const last = Array.from(strip.querySelectorAll<HTMLElement>(".document-tab")).at(-1)!;
+        const tab = last.getBoundingClientRect();
+        const close = last.querySelector<HTMLElement>(".document-tab-close")!.getBoundingClientRect();
+        const slack = 1e-6;
+        expect(tab.left).toBeGreaterThanOrEqual(bounds.left - slack);
+        expect(tab.right).toBeLessThanOrEqual(visibleRight + slack);
+        expect(close.left).toBeGreaterThanOrEqual(bounds.left - slack);
+        expect(close.right).toBeLessThanOrEqual(visibleRight + slack);
+      }
+
+      async function exerciseLastTab(strip: HTMLElement, track: HTMLElement) {
+        const plus = stubCloseButtonsAndNewTab(strip);
+        // Opening the fourth tab revealed it.
+        expectLastTabFullyVisible(strip, plus);
+
+        // Reveal it again from the far end, by activating it.
+        await activate(0);
+        expect(translationX(track)).toBe(0);
+        await activate(3);
+        expect(active()).toBe(3);
+        expectLastTabFullyVisible(strip, plus);
+
+        // Scroll to the end by wheel, and past it.
+        expect(wheel(track, -100000, 0)).toBe(true);
+        expect(translationX(track)).toBe(0);
+        expect(wheel(track, 100000, 0)).toBe(true);
+        expectLastTabFullyVisible(strip, plus);
+        expect(wheel(track, 100000, 0)).toBe(false);
+
+        // Scroll to the end by dragging the scrollbar thumb past its end.
+        expect(wheel(track, -100000, 0)).toBe(true);
+        const scrollbar = strip.querySelector<HTMLDivElement>(".document-tab-scrollbar")!;
+        const thumb = scrollbar.querySelector<HTMLDivElement>(".document-tab-scrollbar-thumb")!;
+        scrollbar.setPointerCapture = vi.fn();
+        pointer(thumb, "pointerdown", 0);
+        pointer(scrollbar, "pointermove", 100000);
+        pointer(scrollbar, "pointerup", 100000);
+        expectLastTabFullyVisible(strip, plus);
+      }
+
+      it("keeps the last tab and its close button inside the visible strip at the end and when revealed", async () => {
+        const { strip, track } = await openOverflowingTabs();
+        await exerciseLastTab(strip, track);
+        expect(translationX(track)).toBe(-376);
+      });
+
+      it("rounds a fractional overflow up so the close button is not clipped by a sub-pixel", async () => {
+        const strip = container.querySelector<HTMLDivElement>(".document-tab-list")!;
+        const track = strip.querySelector<HTMLDivElement>(".document-tab-track")!;
+        const thumb = strip.querySelector<HTMLDivElement>(".document-tab-scrollbar-thumb")!;
+        // Real text widths are fractional. The track is 606.4 px and the strip 229.6 px, but scrollWidth and
+        // clientWidth report 606 and 230, which understates the overflow (376 against 376.8).
+        const tabWidth = 150.1;
+        const gap = 2;
+        const stripLeft = 24;
+        const stripExact = 229.6;
+        const trackExact = () => Math.max(0, track.childElementCount * (tabWidth + gap) - gap);
+        track.style.columnGap = `${gap}px`;
+        vi.spyOn(strip, "clientWidth", "get").mockImplementation(() => Math.round(stripExact));
+        vi.spyOn(track, "scrollWidth", "get").mockImplementation(() => Math.round(trackExact()));
+        vi.spyOn(strip, "getBoundingClientRect").mockImplementation(() => new DOMRect(stripLeft, 0, stripExact, 24));
+        vi.spyOn(track, "getBoundingClientRect").mockImplementation(() =>
+          new DOMRect(stripLeft + translationX(track), 0, trackExact(), 24));
+        vi.spyOn(thumb, "getBoundingClientRect").mockImplementation(() =>
+          new DOMRect(stripLeft + translationX(thumb), 24, Number.parseFloat(thumb.style.width), 8));
+        const bounds = HTMLDivElement.prototype.getBoundingClientRect;
+        vi.spyOn(HTMLDivElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLDivElement) {
+          if (this.parentElement !== track) return bounds.call(this);
+          const index = Array.from(track.children).indexOf(this);
+          return new DOMRect(stripLeft + index * (tabWidth + gap) + translationX(track), 0, tabWidth, 24);
+        });
+        for (const name of ["First drawing", "Second drawing", "Third drawing", "Fourth drawing"]) await open(name);
+        expect(tabs()).toHaveLength(4);
+        expect(active()).toBe(3);
+        expect(track.scrollWidth).toBe(606);
+        expect(strip.clientWidth).toBe(230);
+
+        await exerciseLastTab(strip, track);
+        expect(translationX(track)).toBe(-377);
+      });
+    });
+
+    // Display scaling (Windows at 125%, devicePixelRatio 1.25) makes every layout width fractional, while
+    // clientWidth and scrollWidth round to whole pixels.
+    describe("fractional geometry at a display scale such as 125%", () => {
+      const gap = 2;
+      const stripLeft = 24;
+      const closeWidth = 30;
+
+      async function mountFractional(tabWidth: number, stripExact: number) {
+        const resize = new Map<Element, () => void>();
+        vi.stubGlobal("ResizeObserver", class {
+          constructor(private readonly onResize: () => void) {}
+          observe(element: Element) { resize.set(element, this.onResize); }
+          unobserve(element: Element) { resize.delete(element); }
+          disconnect() {}
+        });
+        await remount();
+        const strip = container.querySelector<HTMLDivElement>(".document-tab-list")!;
+        const track = strip.querySelector<HTMLDivElement>(".document-tab-track")!;
+        const scrollbar = strip.querySelector<HTMLDivElement>(".document-tab-scrollbar")!;
+        const thumb = scrollbar.querySelector<HTMLDivElement>(".document-tab-scrollbar-thumb")!;
+        const trackExact = () => Math.max(0, track.childElementCount * (tabWidth + gap) - gap);
+        track.style.columnGap = `${gap}px`;
+        vi.spyOn(strip, "clientWidth", "get").mockImplementation(() => Math.round(stripExact));
+        vi.spyOn(track, "scrollWidth", "get").mockImplementation(() => Math.round(trackExact()));
+        vi.spyOn(strip, "getBoundingClientRect").mockImplementation(() => new DOMRect(stripLeft, 0, stripExact, 24));
+        vi.spyOn(track, "getBoundingClientRect").mockImplementation(() =>
+          new DOMRect(stripLeft + translationX(track), 0, trackExact(), 24));
+        vi.spyOn(thumb, "getBoundingClientRect").mockImplementation(() =>
+          new DOMRect(stripLeft + translationX(thumb), 24, Number.parseFloat(thumb.style.width), 8));
+        const bounds = HTMLDivElement.prototype.getBoundingClientRect;
+        vi.spyOn(HTMLDivElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLDivElement) {
+          if (this.parentElement !== track) return bounds.call(this);
+          const index = Array.from(track.children).indexOf(this);
+          return new DOMRect(stripLeft + index * (tabWidth + gap) + translationX(track), 0, tabWidth, 24);
+        });
+        // Measure the layout as stubbed; the observers are the only trigger a lone tab has.
+        await act(async () => { resize.get(strip)?.(); resize.get(track)?.(); });
+        return { strip, track, scrollbar, thumb };
+      }
+
+      // The first file opens into the pristine blank tab, so opening `count` files leaves `count` tabs.
+      async function openTabs(count: number) {
+        for (const name of ["First drawing", "Second drawing", "Third drawing", "Fourth drawing", "Fifth drawing"].slice(0, count)) await open(name);
+        expect(tabs()).toHaveLength(count);
+      }
+
+      it.each([82, 82.33])("hides the scrollbar for one tab whose track is 82.33 px in a %s px viewport", async (stripExact) => {
+        const { scrollbar, track } = await mountFractional(82.33, stripExact);
+        expect(tabs()).toHaveLength(1);
+        expect(scrollbar.style.visibility).toBe("hidden");
+        expect(track.style.transform).toBe("translateX(0px)");
+        expect(wheel(track, 100, 0)).toBe(false);
+      });
+
+      it("hides the scrollbar for tabs that exactly fit at fractional widths", async () => {
+        // Five tabs and four gaps make 419.63 px in a 419.63 px strip, which rounds to 420 for scrollWidth and clientWidth.
+        const { strip, track, scrollbar } = await mountFractional((419.63 - 4 * gap) / 5, 419.63);
+        await openTabs(5);
+        expect(track.scrollWidth).toBe(420);
+        expect(strip.clientWidth).toBe(420);
+        expect(scrollbar.style.visibility).toBe("hidden");
+        expect(track.style.transform).toBe("translateX(0px)");
+        expect(wheel(track, 100, 0)).toBe(false);
+        await activate(0);
+        expect(scrollbar.style.visibility).toBe("hidden");
+        expect(track.style.transform).toBe("translateX(0px)");
+      });
+
+      it("scrolls a real 1.5 px overflow and keeps the last close button fully inside", async () => {
+        // Two tabs and a gap make 231.5 px in a 230 px strip.
+        const { strip, track, scrollbar, thumb } = await mountFractional((231.5 - gap) / 2, 230);
+        await openTabs(2);
+        expect(scrollbar.style.visibility).toBe("visible");
+        expect(Number.parseFloat(thumb.style.width)).toBeLessThan(230);
+        expect(active()).toBe(1);
+        // The range rounds up, so the end of the last tab clears the strip.
+        expect(translationX(track)).toBe(-2);
+        const last = Array.from(strip.querySelectorAll<HTMLElement>(".document-tab")).at(-1)!;
+        const close = last.querySelector<HTMLElement>(".document-tab-close")!;
+        vi.spyOn(close, "getBoundingClientRect").mockImplementation(() => {
+          const box = last.getBoundingClientRect();
+          return new DOMRect(box.right - closeWidth, box.top, closeWidth, box.height);
+        });
+        const bounds = strip.getBoundingClientRect();
+        expect(last.getBoundingClientRect().right).toBeLessThanOrEqual(bounds.right);
+        expect(close.getBoundingClientRect().left).toBeGreaterThanOrEqual(bounds.left);
+        expect(close.getBoundingClientRect().right).toBeLessThanOrEqual(bounds.right);
+      });
+
+      it("ends at the same offset by wheel and by revealing the last tab with Ctrl+Shift+Tab", async () => {
+        // Four 150.1 px tabs make 606.4 px in a 229.6 px strip: the range rounds up from 376.8 to 377.
+        const { track } = await mountFractional(150.1, 229.6);
+        await openTabs(4);
+        expect(translationX(track)).toBe(-377);
+
+        expect(wheel(track, -100000, 0)).toBe(true);
+        expect(translationX(track)).toBe(0);
+        expect(wheel(track, 100000, 0)).toBe(true);
+        const byWheel = translationX(track);
+        expect(byWheel).toBe(-377);
+
+        await activate(0);
+        expect(translationX(track)).toBe(0);
+        await key(true);
+        expect(active()).toBe(3);
+        expect(translationX(track)).toBe(byWheel);
+      });
+    });
   });
 
   it("dirty tab x uses the registered close command; Cancel retains it and Discard selects its neighbour", async () => {
@@ -1184,7 +3003,7 @@ describe("documents in one window", () => {
     expect(active()).toBe(1);
     expect(bridge().snapshot().file.path).toBe("/tmp/conflicted.chemdraft");
     expect(drawnText()).toContain("Externally edited note");
-    const saved = await flush();
+    const saved = await autosave();
     expect(saved.tabs!.filter((tab) => tab.path === "/tmp/conflicted.chemdraft")).toHaveLength(1);
   });
 
@@ -1332,7 +3151,7 @@ describe("documents in one window", () => {
       native.dialogListener!(delivery); native.dialogListener!(delivery);
     });
     await vi.waitFor(() => expect(native.writeFile.mock.calls.filter(([path]) => path.startsWith("/tmp/"))).toHaveLength(1));
-    expect(native.writeFile).toHaveBeenCalledWith("/tmp/granted-without-extension", exportPhase4Svg(origin, options.svg).contents);
+    expect(native.writeFile).toHaveBeenCalledWith("/tmp/granted-without-extension", (await exportPhase4Svg(origin, options.svg)).contents);
     expect(active()).toBe(1);
     expect(native.dialogPublish).toHaveBeenCalledWith("opaque", expect.objectContaining({ data: expect.objectContaining({ status: "exported" }) }));
   });
@@ -1604,14 +3423,45 @@ describe("documents in one window", () => {
     await paste("Dirty drawing");
     saveAskToSaveBeforeQuit(true);
     await flush();
-    let reply: (value: boolean) => void = () => {};
-    native.cancelQuit.mockImplementationOnce(() => new Promise<boolean>((resolve) => { reply = resolve; }));
+    let reply: (value: "cancelled") => void = () => {};
+    native.cancelQuit.mockImplementationOnce(() => new Promise<"cancelled">((resolve) => { reply = resolve; }));
     await quitButton("Cancel");
     await flush();
-    await act(async () => { reply(true); });
+    await act(async () => { reply("cancelled"); });
     expect(pendingPrompt?.prompt.title).toBe("Save changes before quitting?");
     expect(native.promptShowing).toHaveBeenLastCalledWith(2);
     expect(native.quit).not.toHaveBeenCalled();
+  });
+
+  it.each(["during", "before"])("keeps editing locked when Cancel resolves %s a committed quit flush", async (order) => {
+    await paste("Dirty drawing");
+    saveAskToSaveBeforeQuit(true);
+    await flush();
+    let reply!: (outcome: "cancelled") => void;
+    native.cancelQuit.mockImplementationOnce(() => new Promise<"cancelled">(resolve => { reply = resolve; }));
+    await quitButton("Cancel");
+    expect(native.cancelQuit).toHaveBeenCalledWith(1);
+    if (order === "before") {
+      await act(async () => { reply("cancelled"); });
+      await paste("Edit after Cancel");
+      expect(drawnText()).toContain("Edit after Cancel");
+    }
+
+    let finishWrite!: () => void;
+    native.saveSession.mockImplementationOnce(() => new Promise<void>(resolve => { finishWrite = resolve; }));
+    let flushing!: Promise<void>;
+    await act(async () => { flushing = native.quitFlush!("committed", 7); });
+    expect(native.quit).not.toHaveBeenCalled();
+    if (order === "during") await act(async () => { reply("cancelled"); });
+
+    const before = bridge().snapshot().document;
+    await command("document.new");
+    await command("edit.undo");
+    await paste("Late edit");
+    expect(tabs()).toHaveLength(1);
+    expect(bridge().snapshot().document).toEqual(before);
+    await act(async () => { finishWrite(); await flushing; });
+    expect(native.quit).toHaveBeenCalledOnce();
   });
 
   it.each(["Save", "Discard"])("re-arms native grace before a stalled %s session write", async (choice) => {
@@ -1627,6 +3477,64 @@ describe("documents in one window", () => {
     expect(native.quit).not.toHaveBeenCalled();
     await act(async () => { finish(); });
     expect(native.quit).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["refused", "rejected"])("accepts menu and palette commands after quit preparation is %s", async failure => {
+    await paste("Dirty drawing");
+    if (failure === "refused") native.prepareQuit.mockResolvedValueOnce(false);
+    else native.prepareQuit.mockRejectedValueOnce(new Error("Window unavailable"));
+    await act(async () => native.promptQuit!(++native.quitId));
+    expect(native.prepareQuit).toHaveBeenCalledWith(1);
+    expect(pendingPrompt).toBeUndefined();
+    // The native File menu and floating palette both deliver DOM_COMMAND_EVENT.
+    await command("document.new");
+    expect(tabs()).toHaveLength(2);
+    await command("tool.text");
+    expect(bridge().snapshot().activeToolCommandId).toBe("tool.text");
+  });
+
+  it("keeps a newer quit prompt guarded when an older preparation returns false", async () => {
+    await paste("Dirty drawing");
+    let finish!: (prepared: boolean) => void;
+    native.prepareQuit.mockImplementationOnce(() => new Promise<boolean>(resolve => { finish = resolve; }));
+    let older!: Promise<void>;
+    await act(async () => { older = native.promptQuit!(++native.quitId); });
+    await act(async () => native.promptQuit!(++native.quitId));
+    await act(async () => { finish(false); await older; });
+    await command("document.new");
+    expect(tabs()).toHaveLength(1);
+    await quitButton("Cancel");
+    await command("document.new");
+    expect(tabs()).toHaveLength(2);
+  });
+
+  it.each([true, false])("releases a cancelled quit after resume is refused when the document is dirty=%s", async dirty => {
+    if (dirty) await paste("Dirty drawing");
+    native.resumeQuit.mockResolvedValueOnce(false);
+    await act(async () => native.promptQuit!(++native.quitId));
+    if (dirty) await quitButton("Discard");
+    await command("document.new");
+    expect(tabs()).toHaveLength(2);
+  });
+
+  it.each([true, false])("keeps editing frozen after confirmation rejects when the document is dirty=%s", async dirty => {
+    if (dirty) await paste("Dirty drawing");
+    saveAskToSaveBeforeQuit(true);
+    native.quit.mockRejectedValueOnce(new Error("Confirmation reply lost"));
+    native.cancelQuit.mockResolvedValueOnce("committed");
+
+    await flush();
+    if (dirty) await quitButton("Discard");
+
+    expect(native.resumeQuit).toHaveBeenCalledWith(1);
+    expect(native.quit).toHaveBeenCalledWith(1);
+    expect(native.cancelQuit).toHaveBeenCalledWith(1);
+    const saved = bridge().snapshot().document;
+    await command("document.new");
+    await command("edit.undo");
+    await paste("Late edit");
+    expect(tabs()).toHaveLength(1);
+    expect(bridge().snapshot().document).toEqual(saved);
   });
 
   it("native quit modal suspension hides palettes and releases on Cancel", async () => {
@@ -1664,13 +3572,13 @@ describe("documents in one window", () => {
     await paste("Dirty drawing");
     saveAskToSaveBeforeQuit(true);
     await flush();
-    let reply: (value: boolean) => void = () => {};
-    native.cancelQuit.mockImplementationOnce(() => new Promise<boolean>((resolve) => { reply = resolve; }));
+    let reply: (value: "cancelled") => void = () => {};
+    native.cancelQuit.mockImplementationOnce(() => new Promise<"cancelled">((resolve) => { reply = resolve; }));
     await quitButton("Cancel");
     expect(pendingPrompt).toBeUndefined();
     expect(container.querySelector('[aria-labelledby="quit-prompt-title"]')).toBeNull();
     expect(native.writeFile.mock.calls.filter(([path]) => path.endsWith(".chemdraft"))).toHaveLength(0);
-    await act(async () => { reply(true); });
+    await act(async () => { reply("cancelled"); });
   });
 
   it("failed native suspension never acknowledges the prompt and cancels its request", async () => {
@@ -1769,7 +3677,7 @@ describe("documents in one window", () => {
       if (kind.includes("identity")) {
         await vi.waitFor(() => {
           expect(container.querySelector('[role="status"]')?.textContent)
-            .toBe("Paste cancelled while quitting");
+            .toBe("Paste canceled while quitting");
         }, { timeout: 15_000 });
       }
       expect(bridge().snapshot().document).toEqual(saved);
@@ -1994,17 +3902,19 @@ describe("documents in one window", () => {
       const previous = threeTabSession(); native.session = previous;
       saveStartWithFreshDocument(true); await remount();
       native.saveSession.mockClear();
-      await act(async () => { await new Promise(resolve => setTimeout(resolve, 900)); });
+      await autosave();
       await flush();
       expect(native.saveSession).not.toHaveBeenCalled();
+      expect(native.quit).toHaveBeenCalledExactlyOnceWith(1);
       expect(native.session).toEqual(previous);
+      await remount();
       await paste("New run work");
       await act(async () => { await new Promise(resolve => setTimeout(resolve, 900)); });
       expect(native.saveSession).toHaveBeenCalled();
       native.savePicker.mockResolvedValueOnce("D:\\new-run.chemdraft");
       await command("document.save");
       expect(native.writeFile).toHaveBeenCalled();
-      const saved = await flush();
+      const saved = await autosave();
       expect(saved.tabs).toHaveLength(1);
       saveStartWithFreshDocument(false); await remount();
       expect(drawnText()).toContain("New run work");
@@ -2039,7 +3949,7 @@ describe("documents in one window", () => {
       expect(tabs()).toHaveLength(count);
       expect(bridge().snapshot().document).toEqual(before.document);
       expect(bridge().snapshot().file).toEqual(before.file);
-      expect(container.querySelector('[role="status"]')?.textContent).toContain("Open failed:");
+      expect(container.querySelector('[role="status"]')?.textContent).toContain("Could not open invalid.chemdraft:");
     });
 
     it("captures opt-in before a slow read, keeps early work, and ignores a live toggle", async () => {
@@ -2062,7 +3972,7 @@ describe("documents in one window", () => {
       saveStartWithFreshDocument(enabled);
       const raw = { version: 99, contents: "recoverable bytes" }; native.session = raw;
       await remount(); native.saveSession.mockClear();
-      await paste("New work"); await flush();
+      await paste("New work"); await autosave();
       expect(native.saveSession).not.toHaveBeenCalled(); expect(native.session).toEqual(raw);
     });
 
@@ -2075,7 +3985,7 @@ describe("documents in one window", () => {
       expect(tabs()).toHaveLength(1);
       expect(pendingPrompt).toBeUndefined();
       await paste("Fresh work beside newly readable recovery");
-      expect((await flush()).unrestoredTabs).toEqual([kept]);
+      expect((await autosave()).unrestoredTabs).toEqual([kept]);
     });
 
     it("retains schema-valid envelopes with unreadable document contents in a fresh run", async () => {
@@ -2087,7 +3997,7 @@ describe("documents in one window", () => {
       expect(tabs()).toHaveLength(1);
       expect(pendingPrompt).toBeUndefined();
       await paste("Fresh work beside recovery");
-      expect((await flush()).unrestoredTabs).toEqual([corrupt]);
+      expect((await autosave()).unrestoredTabs).toEqual([corrupt]);
     });
 
     it("retains unrestored tabs while skipping readable tabs and never discards automatically", async () => {
@@ -2097,10 +4007,10 @@ describe("documents in one window", () => {
       expect(tabs()).toHaveLength(1);
       expect(bridge().snapshot().document.title).toBe("Untitled");
       expect(pendingPrompt).toBeUndefined();
-      native.saveSession.mockClear(); await flush();
+      native.saveSession.mockClear(); await autosave();
       expect(native.saveSession).not.toHaveBeenCalled();
       await paste("New run with recovery");
-      expect((await flush()).unrestoredTabs).toEqual(previous.unrestoredTabs);
+      expect((await autosave()).unrestoredTabs).toEqual(previous.unrestoredTabs);
     });
 
 
@@ -2115,7 +4025,7 @@ describe("documents in one window", () => {
         expect(pendingPrompt).toBeUndefined();
         expect(tabs()).toHaveLength(1);
         await paste("Fresh work beside recovery");
-        expect((await flush()).unrestoredTabs).toEqual(expect.arrayContaining([kept, corrupt]));
+        expect((await autosave()).unrestoredTabs).toEqual(expect.arrayContaining([kept, corrupt]));
       } else {
         expect(pendingPrompt?.prompt.title).toMatch(/didn't open/);
       }
@@ -2348,7 +4258,7 @@ describe("documents in one window", () => {
       expect(pendingPrompt?.prompt.title).toBe("3 drawings didn't open");
       for (const tab of raw.tabs) expect(pendingPrompt?.prompt.message).toContain(tab.displayName);
       expectSuspended();
-      expect((await flush()).unrestoredTabs).toEqual(raw.tabs);
+      expect((await autosave()).unrestoredTabs).toEqual(raw.tabs);
       await modalButton("Cancel");
       expectReleased();
       native.saveSession.mockClear();
@@ -2362,7 +4272,7 @@ describe("documents in one window", () => {
       await remount();
       expect(pendingPrompt?.prompt.title).toBe("3 drawings didn't open");
       expect(drawnText()).toContain("Fresh work after unreadable children");
-      expect((await flush()).unrestoredTabs).toEqual(raw.tabs);
+      expect((await autosave()).unrestoredTabs).toEqual(raw.tabs);
       await modalButton("Cancel");
       expectReleased();
     });
@@ -2382,7 +4292,7 @@ describe("documents in one window", () => {
         expect(native.writeFile).toHaveBeenNthCalledWith(index + 1, paths[index], tab.contents);
       });
       expectReleased();
-      expect((await flush()).unrestoredTabs).toBeUndefined();
+      expect((await autosave()).unrestoredTabs).toBeUndefined();
       expect(tabs()).toHaveLength(1);
       await remount();
       expect(pendingPrompt).toBeUndefined();
@@ -2399,7 +4309,7 @@ describe("documents in one window", () => {
       expect(tabs()).toHaveLength(1);
       expect(bridge().snapshot().document.title).toBe("Second");
       expect(pendingPrompt?.prompt.title).toBe("2 drawings didn't open");
-      expect((await flush()).unrestoredTabs).toEqual(unreadable);
+      expect((await autosave()).unrestoredTabs).toEqual(unreadable);
       await modalButton("Cancel");
       expectReleased();
     });
@@ -2416,7 +4326,7 @@ describe("documents in one window", () => {
       expect(pendingPrompt?.prompt.title).toBe(`${readableSibling ? 3 : 4} drawings didn't open`);
       expect(pendingPrompt?.prompt.message).toContain("Previously kept");
       const expectedKept = [alreadyKept, ...children.filter(tab => tab.version === 99)];
-      expect((await flush()).unrestoredTabs).toEqual(expectedKept);
+      expect((await autosave()).unrestoredTabs).toEqual(expectedKept);
       await modalButton("Cancel");
       expectReleased();
       await activate(readableSibling ? 1 : 0);
@@ -2430,7 +4340,7 @@ describe("documents in one window", () => {
       await remount();
       expect(tabs()).toHaveLength(1);
       expect(pendingPrompt?.prompt.title).toBe("3 drawings didn't open");
-      expect((await flush()).unrestoredTabs).toEqual(children);
+      expect((await autosave()).unrestoredTabs).toEqual(children);
       await modalButton("Cancel");
       expectReleased();
     });
@@ -2449,10 +4359,15 @@ describe("documents in one window", () => {
       expect(container.querySelector('[role="status"]')?.textContent).toContain("will not be autosaved");
       native.saveSession.mockClear();
       await paste("Drawing after unreadable outer session");
+      expect(bridge().snapshot().file.dirty).toBe(true);
       await act(async () => { await new Promise((resolve) => setTimeout(resolve, 900)); });
-      await flush();
       expect(native.saveSession).not.toHaveBeenCalled();
       expect(native.session).toEqual(raw);
+      const requestId = ++native.quitId;
+      await act(async () => { await native.quitFlush!("committed", requestId); });
+      expect(native.saveSession).not.toHaveBeenCalled();
+      expect(native.session).toEqual(raw);
+      expect(native.quit).not.toHaveBeenCalledWith(requestId);
     });
 
     it.each(["Cancel", "Escape"])("keeps raw drawings and retries next launch after %s", async (ending) => {
@@ -2484,7 +4399,7 @@ describe("documents in one window", () => {
         } else await modalButton("Cancel");
         expectReleased();
         await command("view.zoomIn");
-        expect((await flush()).unrestoredTabs).toEqual(session.unrestoredTabs);
+        expect((await autosave()).unrestoredTabs).toEqual(session.unrestoredTabs);
       }
     });
 
@@ -2500,7 +4415,7 @@ describe("documents in one window", () => {
       expect(pendingPrompt).toBeUndefined();
       await activate(3);
       expect(bridge().snapshot().document.title).toBe("Recovered");
-      expect((await flush()).unrestoredTabs).toBeUndefined();
+      expect((await autosave()).unrestoredTabs).toBeUndefined();
       await remount();
       expect(tabs()).toHaveLength(4);
     });
@@ -2516,7 +4431,7 @@ describe("documents in one window", () => {
       expect(pendingPrompt?.prompt.message).toContain("Future.chemdraft");
       expect(pendingPrompt?.prompt.message).toContain("saved by a newer ChemDraft");
       await modalButton("Cancel");
-      const saved = await flush();
+      const saved = await autosave();
       expect(saved.unrestoredTabs).toEqual([session.tabs![1]]);
       saved.unrestoredTabs = [{ ...session.tabs![1]!, contents: JSON.stringify(drawing) }];
       native.session = saved;
@@ -2525,7 +4440,7 @@ describe("documents in one window", () => {
       expect(pendingPrompt).toBeUndefined();
       await activate(2);
       expect(bridge().snapshot().document.title).toBe("Future drawing");
-      expect((await flush()).unrestoredTabs).toBeUndefined();
+      expect((await autosave()).unrestoredTabs).toBeUndefined();
     });
 
     it("saves an unsupported envelope's exact text to the chosen path unchanged", async () => {
@@ -2540,7 +4455,7 @@ describe("documents in one window", () => {
       expect(native.writeFile).toHaveBeenCalledExactlyOnceWith(
         platform === "Win32" ? "C:\\rescued\\chosen-name" : "/tmp/chosen-name", "future saved format");
       expectReleased();
-      expect((await flush()).unrestoredTabs).toBeUndefined();
+      expect((await autosave()).unrestoredTabs).toBeUndefined();
       await activate(2);
       expect(container.querySelector('[role="status"]')?.textContent).not.toContain("kept for later");
       await remount();
@@ -2566,14 +4481,14 @@ describe("documents in one window", () => {
       }));
       expect(native.writeFile).toHaveBeenNthCalledWith(1, "C:\\rescued\\First.chemdraft", "unreadable raw document 0");
       expect(native.writeFile).toHaveBeenNthCalledWith(2, "C:\\rescued\\Second.cdxml", "unreadable raw document 1");
-      expect((await flush()).unrestoredTabs).toEqual([session.unrestoredTabs![1]]);
+      expect((await autosave()).unrestoredTabs).toEqual([session.unrestoredTabs![1]]);
       expect(pendingPrompt?.prompt.message).toContain("Second.cdxml: disk full");
       expect(pendingPrompt?.prompt.title).toBe("1 drawing didn't open");
       expectSuspended();
       await modalButton("Cancel");
       expectReleased();
       await remount();
-      expect((await flush()).unrestoredTabs).toEqual([session.unrestoredTabs![1]]);
+      expect((await autosave()).unrestoredTabs).toEqual([session.unrestoredTabs![1]]);
       expect(pendingPrompt).toBeDefined();
     });
 
@@ -2589,14 +4504,14 @@ describe("documents in one window", () => {
       }
       await modalButton("Save Drawing…");
       if (saved) {
-        expect((await flush()).unrestoredTabs).toEqual(session.unrestoredTabs);
+        expect((await autosave()).unrestoredTabs).toEqual(session.unrestoredTabs);
         expectSuspended();
         await command("document.new");
         expect(tabs()).toHaveLength(3);
         await act(async () => finishWrite());
       }
       expect(native.writeFile).toHaveBeenCalledTimes(saved);
-      expect((await flush()).unrestoredTabs).toEqual(session.unrestoredTabs!.slice(saved));
+      expect((await autosave()).unrestoredTabs).toEqual(session.unrestoredTabs!.slice(saved));
       expect(pendingPrompt?.prompt.message).toContain(`Saved ${saved} ${saved === 1 ? "drawing" : "drawings"}; ${3 - saved} kept for later (save canceled)`);
       expectSuspended();
       await modalButton("Cancel");
@@ -2615,11 +4530,11 @@ describe("documents in one window", () => {
       expect(pendingPrompt?.prompt.message).toContain("This cannot be undone.");
       expect(pendingPrompt?.prompt.message).toContain("Alpha.chemdraft");
       expect(pendingPrompt?.prompt.message).toContain("Beta.chemdraft");
-      expect((await flush()).unrestoredTabs).toEqual(session.unrestoredTabs);
+      expect((await autosave()).unrestoredTabs).toEqual(session.unrestoredTabs);
       expectSuspended();
       await modalButton(ending === "Escape" ? "Cancel" : ending);
       const confirmed = ending === "Delete";
-      expect((await flush()).unrestoredTabs).toEqual(confirmed ? undefined : session.unrestoredTabs);
+      expect((await autosave()).unrestoredTabs).toEqual(confirmed ? undefined : session.unrestoredTabs);
       if (!confirmed) {
         expect(pendingPrompt?.prompt.title).toBe("2 drawings didn't open");
         expectSuspended();
@@ -2629,7 +4544,7 @@ describe("documents in one window", () => {
       await activate(2);
       expect(container.querySelector('[role="status"]')?.textContent.includes("kept for later")).toBe(!confirmed);
       await remount();
-      expect((await flush()).unrestoredTabs).toEqual(confirmed ? undefined : session.unrestoredTabs);
+      expect((await autosave()).unrestoredTabs).toEqual(confirmed ? undefined : session.unrestoredTabs);
       expect(pendingPrompt === undefined).toBe(confirmed);
     });
 
@@ -2640,7 +4555,7 @@ describe("documents in one window", () => {
       native.savePicker.mockRejectedValueOnce(new Error("panel failed"));
       await modalButton("Save Drawing…");
       expect(pendingPrompt?.prompt.message).toContain("Kept.chemdraft: panel failed");
-      expect((await flush()).unrestoredTabs).toEqual(session.unrestoredTabs);
+      expect((await autosave()).unrestoredTabs).toEqual(session.unrestoredTabs);
       expectSuspended();
       await modalButton("Cancel");
       expectReleased();
@@ -2654,7 +4569,7 @@ describe("documents in one window", () => {
         await remount();
         expectReleased();
         expect(container.querySelector('[role="dialog"]')).toBeNull();
-        expect((await flush()).unrestoredTabs).toEqual(session.unrestoredTabs);
+        expect((await autosave()).unrestoredTabs).toEqual(session.unrestoredTabs);
       } finally { restoreFailureProvider(); }
     });
 
@@ -2666,7 +4581,7 @@ describe("documents in one window", () => {
       native.saveSession.mockRejectedValueOnce(new Error("session write refused"));
       await modalButton("Delete");
       expect(pendingPrompt?.prompt.message).toContain("Delete failed; the drawings are kept for later: session write refused");
-      expect((await flush()).unrestoredTabs).toEqual(session.unrestoredTabs);
+      expect((await autosave()).unrestoredTabs).toEqual(session.unrestoredTabs);
       expectSuspended();
       await modalButton("Cancel");
       expectReleased();
@@ -2678,10 +4593,10 @@ describe("documents in one window", () => {
       await remount();
       expect(tabs()).toHaveLength(1);
       expect(pendingPrompt?.prompt.title).toBe("3 drawings didn't open");
-      expect((await flush()).unrestoredTabs).toEqual(raw.tabs);
+      expect((await autosave()).unrestoredTabs).toEqual(raw.tabs);
       await modalButton("Delete");
       await modalButton("Delete");
-      expect((await flush()).unrestoredTabs).toBeUndefined();
+      expect((await autosave()).unrestoredTabs).toBeUndefined();
       expectReleased();
     });
 
@@ -2731,13 +4646,13 @@ describe("documents in one window", () => {
     expect(tabs()).toHaveLength(2);
     expect(bridge().snapshot().document.title).toBe("First");
     expect(container.querySelector('[role="status"]')?.textContent).toContain("1 drawing is kept for later");
-    const saved = await flush();
+    const saved = await autosave();
     expect(saved.unrestoredTabs).toEqual([corrupt]);
     expect(saved.tabs!.map((tab) => tab.displayName)).toEqual(["First.chemdraft", "Third.chemdraft"]);
     await remount();
     expect(tabs()).toHaveLength(2);
     await command("view.zoomIn");
-    expect((await flush()).unrestoredTabs).toEqual([corrupt]);
+    expect((await autosave()).unrestoredTabs).toEqual([corrupt]);
   });
 
   it("never overwrites a wholly unreadable session envelope", async () => {
@@ -2747,13 +4662,13 @@ describe("documents in one window", () => {
     native.saveSession.mockClear();
     expect(container.querySelector('[role="status"]')?.textContent).toContain("will not be autosaved");
     await paste("Drawing after failed restore");
-    await flush();
+    await autosave();
     expect(native.saveSession).not.toHaveBeenCalled();
     expect(native.session).toEqual(raw);
   });
 
   it("neither restores nor announces a sole pristine blank Untitled tab", async () => {
-    const saved = await flush();
+    const saved = await autosave();
     expect(saved.tabs).toHaveLength(1);
     expect(saved.tabs![0]!.pristine).toBe(true);
     await remount();
@@ -2763,7 +4678,7 @@ describe("documents in one window", () => {
     // A clean no-restore read still permits later autosaves.
     native.saveSession.mockClear();
     await paste("Fresh drawing");
-    await flush();
+    await autosave();
     expect(native.saveSession).toHaveBeenCalledTimes(1);
   });
 
@@ -2794,7 +4709,7 @@ describe("documents in one window", () => {
   it("zoom autosave keeps views current without serializing unchanged foreground or background tabs", async () => {
     await open("Background");
     await open("Foreground");
-    await flush();
+    await autosave();
     vi.mocked(createNativeSavePayload).mockClear();
     await command("view.zoomIn");
     const view = bridge().snapshot().viewport;
@@ -2802,7 +4717,7 @@ describe("documents in one window", () => {
     expect(createNativeSavePayload).not.toHaveBeenCalled();
     expect(parseDocumentSessionEnvelope(native.session)!.tabs![1]!.view!.viewport).toEqual(view);
     await paste("Changed foreground");
-    await flush();
+    await autosave();
     expect(createNativeSavePayload).toHaveBeenCalledTimes(1);
   });
 
@@ -2916,7 +4831,7 @@ describe("documents in one window", () => {
     expect(active()).toBe(0);
     expect(bridge().snapshot().document.title).toBe("Session drawing");
     expect(bridge().snapshot().file.dirty).toBe(true);
-    expect((await flush()).tabs).toHaveLength(2);
+    expect((await autosave()).tabs).toHaveLength(2);
   });
 
   it("edits made during a slow session read remain active while the old tabs are restored", async () => {
@@ -2941,7 +4856,7 @@ describe("documents in one window", () => {
     native.saveSession.mockClear();
     await paste("Work after failed read");
     await command("document.new");
-    await flush();
+    await autosave();
     expect(native.saveSession).not.toHaveBeenCalled();
   });
 

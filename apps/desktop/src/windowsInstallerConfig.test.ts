@@ -54,24 +54,27 @@ describe("Windows installer scopes", () => {
 });
 
 describe("Windows release workflow", () => {
-  it("builds and stages both variants before either is overwritten", () => {
+  it("builds, records and stages every variant before the next build overwrites it", () => {
     const build = step("Build, verify and stage stable NSIS installers without updater signing");
     expect(build).toContain("CHEMDRAFT_STABLE_BUILD: '1'");
     expect(build).toContain("CHEMDRAFT_SKIP_UPDATER_SIGNING: '1'");
     expect(build).toContain("@{ Suffix = ''; Config = ''; Feed = 'latest.json' }");
     expect(build).toContain("@{ Suffix = '-allusers'; Config = 'src-tauri/tauri.allusers.conf.json'; Feed = 'latest-allusers.json' }");
     expect(build).toContain("foreach ($variant in $variants)");
-    expect(build).toContain("$buildArgs += @('--config', $variant.Config)");
+    expect(build).toContain("@{ Suffix = '-allusers-offline'; Config = @('src-tauri/tauri.allusers.conf.json', \"$env:RUNNER_TEMP/ci-offline.conf.json\"); Feed = '' }");
+    expect(build).toContain("foreach ($variantConfig in @($variant.Config))");
+    expect(build).toContain("$buildArgs += @('--config', $variantConfig)");
     expect(build).toContain("pnpm @buildArgs");
     expect(build).toContain('$original = "ChemDraft_$($config.version)_x64-setup.exe"');
     expect(build).toContain('$expected = "ChemDraft_$($config.version)_x64$($variant.Suffix)-setup.exe"');
-    expect(build).toContain("-Destination (Join-Path release-assets $expected)");
+    expect(build).toContain("node tools/release/record-build.mjs --artifact $staged --target x86_64-pc-windows-msvc");
+    expect(build.indexOf("record-build.mjs")).toBeLessThan(build.indexOf("New-Item -ItemType Directory -Path release-assets"));
+    expect(build).toContain("-Destination (Join-Path release-assets $artifact.Installer)");
     expect(build).toContain("$artifacts += @{ Installer = $expected; Feed = $variant.Feed }");
     expect(build).toContain("Bundle has a development identity.");
     expect(build).toContain("Native build has a worktree label.");
     expect(build).toContain("Frontend build stamp missing or labelled.");
     expect(build).toContain("Updater signing ran before Authenticode.");
-    expect(build).not.toContain("offline");
   });
 
   it("requires Authenticode and updater verification for every staged installer", () => {
@@ -94,9 +97,9 @@ describe("Windows release workflow", () => {
 
   it("retains missing-key and draft-only upload guards for the whole artifact set", () => {
     expect(step("Check signing availability")).toContain("Skipping updater .sig files, latest.json and latest-allusers.json");
-    expect(step("Upload unsigned installers for SignPath provenance")).toContain("path: release-assets/*.exe");
+    expect(step("Upload unsigned installers for SignPath provenance")).toMatch(/path: \|\n\s+release-assets\/\*\.exe\n\s+release-assets\/\*\.exe\.build\.json/);
     expect(step("Upload final release artifacts")).toContain("path: release-assets/*");
-    expect(step("Require verified signatures before release upload")).toContain("$env:AUTHENTICODE_SIGNED -ne 'true' -or $env:UPDATER_SIGNED -ne 'true'");
+    expect(step("Require verified signatures before release upload")).toContain("$env:UPDATER_SIGNED -ne 'true' -or ($env:AUTHENTICODE_SIGNING -ne 'off' -and $env:AUTHENTICODE_SIGNED -ne 'true')");
     const upload = step("Upload only to an existing draft release");
     expect(upload).toContain('$env:RELEASE_TAG -cne "v$env:VERSION"');
     expect(upload).toContain("$release.isDraft -ne $true");

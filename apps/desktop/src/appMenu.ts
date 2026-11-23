@@ -1,6 +1,9 @@
+import type { ShortcutOverrides } from "@chemdraft/shortcut-engine";
 import { detectShortcutPlatform, type ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import { REPORT_BUG_COMMAND_ID } from "./problemReports";
-import { convertTextToAtomLabelCommandId } from "./commands";
+import { structureSearchCommands } from "./structureSearch";
+import { STRUCTURE_SEARCH_DEFAULT_ENABLED } from "./structureSearchSettings";
+import { convertTextToAtomLabelCommandId, nativeStylePresetActions } from "./commands";
 import { formatShortcutLabel } from "./toolsets";
 import { VIBE_CODE_STARTER_COMMAND_ID, vibeCodeStarterCommand } from "./commands/vibeCodeStarter";
 
@@ -18,11 +21,13 @@ import { VIBE_CODE_STARTER_COMMAND_ID, vibeCodeStarterCommand } from "./commands
  * be reflected in the other.
  *
  * Deliberately omitted from the web bar (they are OS-level, not in-document actions):
- * About/Services/Hide/Quit, the Window menu (minimize/maximize), and File ▸
+ * Services/Hide/Quit, the Window menu (minimize/maximize), and File ▸
  * Close Window / Quit. File ▸ Check for Updates is also native-only because Sparkle owns its UI and
- * lifecycle rather than the frontend command registry. Help ▸ About is OS-level too; Help ▸ Report a
- * Bug… is routed like any other command.
+ * lifecycle rather than the frontend command registry.
  */
+
+import { aboutCommand } from "./about/aboutCommand";
+import { SHOW_TOUR_COMMAND, TOUR_TITLE } from "./tour/tourCommands";
 
 /** A leaf item that invokes a registry command when clicked. */
 export interface AppMenuCommand {
@@ -76,6 +81,25 @@ export interface AppMenuSection {
   items: AppMenuItem[];
 }
 
+/**
+ * Where the Preferences command sits in the menu bar, as the user reads it.
+ *
+ * macOS: the ChemDraft application menu. The native item (`preferences_menu_item` in lib.rs) is
+ * titled "Preferences…", and AppKit shows that application-menu item as "Settings…" on current
+ * macOS, so the label here is the one on screen. Windows and Linux: the File menu, "Preferences…".
+ * The web menu model and the guided tour both read this, so they cannot drift apart.
+ */
+export function preferencesMenuPlacement(platform: ShortcutPlatform): { menu: string; label: string } {
+  return platform === "macos" ? { menu: "ChemDraft", label: "Settings…" } : { menu: "File", label: "Preferences…" };
+}
+
+/** The Plugins menu and its fixed items. The same labels on every platform; the guided tour quotes them. */
+export const PLUGINS_MENU_LABELS = {
+  menu: "Plugins",
+  manager: "Add or Remove Plugins…",
+  vibeCode: vibeCodeStarterCommand.title
+} as const;
+
 /** A toolbar toggle entry for the View ▸ Toolbars submenu (mirrors the native dynamic submenu). */
 export interface AppMenuToolbarToggle {
   id: string;
@@ -90,7 +114,20 @@ export interface PluginAppMenuItem {
   command: AppMenuCommand;
 }
 
+/** Drawing styles use the existing dynamic native-menu bridge on both desktop platforms. */
+export function nativeStylePresetMenuItems(): PluginAppMenuItem[] {
+  return nativeStylePresetActions.map(action => ({
+    location: "structure",
+    command: {
+      kind: "command", id: `menu.${action.id}`, commandId: action.id,
+      label: `Drawing style: ${action.title}`, enabled: true, coreRouted: true
+    }
+  }));
+}
+
 export interface AppMenuContext {
+  structureSearchEnabled?: boolean;
+  hasSearchableStructure?: boolean;
   /** Explicit in tests so both desktop conventions can be checked from one host. */
   platform?: ShortcutPlatform;
   /** Number of installed plugins with a cached update offer. */
@@ -112,6 +149,7 @@ export interface AppMenuContext {
   pluginMenuItems?: readonly PluginAppMenuItem[];
   /** Active keybinding scheme; the ChemDraw scheme relabels the accelerators that differ. */
   keybindingScheme?: "chemdraft" | "chemdraw";
+  keybindingOverrides?: ShortcutOverrides;
 }
 
 /** Prefix of the dynamic toolset-toggle command ids (see toolset-registry `createToolsetToggleCommandId`). */
@@ -142,18 +180,7 @@ export function formatMenuShortcut(
   accelerator: string | undefined,
   platform: ShortcutPlatform = "macos"
 ): string | undefined {
-  if (!accelerator) {
-    return undefined;
-  }
-  if (platform !== "macos") {
-    return formatShortcutLabel(accelerator, platform);
-  }
-  return accelerator
-    .replace(/Cmd|Command|Mod|Meta/gi, "⌘")
-    .replace(/Shift/gi, "⇧")
-    .replace(/Alt|Option/gi, "⌥")
-    .replace(/Ctrl|Control/gi, "⌃")
-    .replace(/\s*\+\s*/g, "");
+  return formatShortcutLabel(accelerator, platform);
 }
 
 function command(
@@ -234,6 +261,7 @@ export function buildAppMenuModel(context: AppMenuContext): AppMenuSection[] {
   separatorSeq = 0;
   const chemDrawScheme = context.keybindingScheme === "chemdraw";
   const platform = context.platform ?? detectShortcutPlatform();
+  const preferences = preferencesMenuPlacement(platform);
 
   const toolbarsSubmenu: AppMenuSubmenu = {
     kind: "submenu",
@@ -257,7 +285,7 @@ export function buildAppMenuModel(context: AppMenuContext): AppMenuSection[] {
         buildPageSetupSubmenu(),
         separator(),
         command("export.open", "Export…", { accelerator: chemDrawScheme ? "Ctrl+Cmd+E" : "Shift+Cmd+E" }),
-        ...(platform === "macos" ? [] : [separator(), command("view.togglePreferences", "Preferences…", { accelerator: "Cmd+," })])
+        ...(platform === "macos" ? [] : [separator(), command("view.togglePreferences", preferences.label, { accelerator: "Cmd+," })])
       ]
     },
     {
@@ -333,6 +361,7 @@ export function buildAppMenuModel(context: AppMenuContext): AppMenuSection[] {
         command("structure.openInteractive3d", "Interactive 3D Workspace…")
       ]
     },
+    { id: "tools", label: "Tools", items: [] },
     {
       id: "analyze",
       label: "Analyze",
@@ -350,34 +379,57 @@ export function buildAppMenuModel(context: AppMenuContext): AppMenuSection[] {
     },
     {
       id: "plugins",
-      label: "Plugins",
+      label: PLUGINS_MENU_LABELS.menu,
       items: [
-        command(PLUGIN_MANAGER_COMMAND_ID, "Add or Remove Plugins…"),
+        command(PLUGIN_MANAGER_COMMAND_ID, PLUGINS_MENU_LABELS.manager),
         separator(),
-        command(VIBE_CODE_STARTER_COMMAND_ID, vibeCodeStarterCommand.title)
+        command(VIBE_CODE_STARTER_COMMAND_ID, PLUGINS_MENU_LABELS.vibeCode)
       ]
     },
     {
       id: "help",
       label: "Help",
-      items: [command(REPORT_BUG_COMMAND_ID, "Report a Bug…")]
+      items: [
+        command(SHOW_TOUR_COMMAND, TOUR_TITLE), command(REPORT_BUG_COMMAND_ID, "Report a Bug…"),
+        ...(platform === "macos" ? [] : [separator(), command(aboutCommand.id, aboutCommand.title)])
+      ]
     }
   ];
 
   if (platform === "macos") {
-    sections.unshift({ id: "app", label: "ChemDraft", items: [
-      command("view.togglePreferences", "Preferences…", { accelerator: "Cmd+," })
+    sections.unshift({ id: "app", label: preferences.menu, items: [
+      command(aboutCommand.id, aboutCommand.title),
+      separator(),
+      command("view.togglePreferences", preferences.label, { accelerator: "Cmd+," })
     ] });
   }
   for (const item of flattenAppMenuCommands(sections)) {
+    const keys = context.keybindingOverrides?.commands?.[item.commandId];
+    if (keys) item.accelerator = keys[0];
     item.shortcut = formatMenuShortcut(item.accelerator, platform);
   }
+  // Presets are core styles; keep the contributed block separated from them.
+  appendPluginMenuItems(sections, nativeStylePresetMenuItems());
   appendPluginMenuItems(sections, [
+    ...structureSearchMenuItems(
+      context.structureSearchEnabled ?? STRUCTURE_SEARCH_DEFAULT_ENABLED,
+      context.hasSearchableStructure ?? context.hasSelectedMolecule
+    ),
     ...pluginUpdatesAvailableMenuItem(context.availablePluginUpdateCount ?? 0),
     ...(context.pluginMenuItems ?? [])
   ]);
 
   return sections;
+}
+
+/** Shared dynamic native/web items: the preference controls visibility, selection controls enablement. */
+export function structureSearchMenuItems(enabled: boolean, searchable: boolean): PluginAppMenuItem[] {
+  if (!enabled) return [];
+  return structureSearchCommands(enabled, searchable).map(spec => ({
+    location: "tools",
+    command: { kind: "command", id: spec.id, commandId: spec.id, label: spec.title,
+      enabled: spec.enabled !== false, coreRouted: true }
+  }));
 }
 
 const SECTION_LABELS: Readonly<Record<string, string>> = {
@@ -401,6 +453,7 @@ function sectionLabelFor(location: string): string {
  * section. No-op when there are no plugin items, keeping the pure core menu identical.
  */
 function appendPluginMenuItems(sections: AppMenuSection[], items: readonly PluginAppMenuItem[]): void {
+  const appendedLocations = new Set<string>();
   for (const { location, command: pluginCommand } of items) {
     let section = sections.find((candidate) => candidate.id === location);
     if (!section) {
@@ -408,12 +461,10 @@ function appendPluginMenuItems(sections: AppMenuSection[], items: readonly Plugi
       sections.push(section);
     }
 
-    const alreadyHasPluginItem = section.items.some(
-      (item) => item.kind === "command" && (item.pluginContributed || item.coreRouted)
-    );
-    if (section.items.length > 0 && !alreadyHasPluginItem) {
+    if (section.items.length > 0 && !appendedLocations.has(location)) {
       section.items.push(separator());
     }
+    appendedLocations.add(location);
     section.items.push(pluginCommand.coreRouted ? pluginCommand : { ...pluginCommand, pluginContributed: true });
   }
 }

@@ -5,18 +5,28 @@ import {
   PageLayoutSchema,
   type AnnotationObject,
   type BondRef,
+  type BracketObject,
   type ChemDraftDocument,
   type CrossingOverride,
   type DocumentObject,
   type DocumentPage,
   type MoleculeBond,
   type MoleculeObject,
-  type PageLayout
+  type PageLayout,
+  type ReactionObject
 } from "./schemas";
 import { cloneDocument, toIsoTimestamp } from "./document";
 import { engineDocuments } from "./engineDocuments";
 import { pageMarginFromLayout } from "./page-layout";
 import { clearChangedAtomHydrogenHints, dropOrphanedHydrogenHints } from "./hydrogenHints";
+import { nativeDrawingStyleFromObjectStyle, nativeTextStyleFromObjectStyle,
+  type NativeDrawingStyle, type NativeTextStyle } from "./styles";
+import { bracketPairUsage } from "./bracketSemantics";
+import { bracketPairs, retainBracketIdentity, sameBracketIdentity,
+  withoutBracketPairMetadata, withBracketChemistryWarnings } from "./brackets";
+import { planImportedRepeatUnitDeletion, resolveRepeatUnitAtomMembership, type RepeatUnitMembershipOptions } from "./repeatUnitMembership";
+import { rotatePointAboutCenter } from "./pointRotation";
+import { nativeExtensionObjectScope, retainNativeExtension } from "./nativeCompatibilityState";
 
 export type ObjectReorderPlacement = "front" | "back" | "forward" | "backward";
 
@@ -32,6 +42,7 @@ export type DocumentPatch =
   | { op: "setCrossingOverride"; pageId: string; crossing: CrossingOverride }
   | { op: "clearCrossingOverride"; pageId: string; bonds: [BondRef, BondRef] }
   | { op: "setSelection"; pageId?: string; objectIds: string[] }
+  | { op: "setDrawingDefaults"; drawing: NativeDrawingStyle; text: NativeTextStyle }
   | { op: "addAnnotation"; pageId: string; annotation: AnnotationObject }
   | { op: "removeAnnotation"; annotationId: string };
 
@@ -45,6 +56,17 @@ export const BatchDocumentPatchSchema = z.object({
 
 export interface ApplyPatchOptions {
   now?: Date | string;
+  /** Trusted host preflight, before a removal run in the atomic draft. Throw to refuse the batch.
+   * The draft is borrowed for inspection only; do not mutate or retain it. */
+  beforeRemoveObjects?: (document: ChemDraftDocument, objectIds: readonly string[]) => void;
+  /** Graph transfers preserve their atoms. Scoped writes defer cleanup until the host accepts them. */
+  preserveRepeatUnitBrackets?: boolean;
+  /** Scoped writes validate the authored edit before cleaning up group membership. */
+  deferGroupCleanup?: boolean;
+  /** Reviewed edits may only remove the orphaned pairs that the host captured for review. */
+  allowOrphanedRepeatUnitRemoval?: (unit: OrphanedRepeatUnit) => boolean;
+  /** Trusted host preflight for a parsed add or update, before draft normalization can prune links. */
+  beforeObjectWrite?: (pageId: string, previous: DocumentObject | undefined, next: DocumentObject) => void;
 }
 
 export class DocumentPatchError extends Error {
@@ -105,6 +127,8 @@ export function applyPatches(
       while (end < patches.length && patches[end]!.op === "removeObject") {
         end += 1;
       }
+      options.beforeRemoveObjects?.(draft, patches.slice(index, end).map(entry =>
+        (entry as Extract<DocumentPatch, { op: "removeObject" }>).objectId));
       if (end - index > 1) {
         removeObjects(draft, patches.slice(index, end).map((entry) => (entry as { objectId: string }).objectId));
         index = end;
@@ -112,12 +136,29 @@ export function applyPatches(
       }
     }
     try {
-      applyPatchInPlace(draft, patch);
+      applyPatchInPlace(draft, patch, options.beforeObjectWrite);
     } catch (error) {
       if (error instanceof z.ZodError) throw new DocumentPatchError(error.message);
       throw error;
     }
     index += 1;
+  }
+  const removesObjects = patches.some(patch => patch.op === "removeObject" || patch.op === "removeAnnotation");
+  let orphaned: OrphanedRepeatUnit[] = [];
+  if (!options.preserveRepeatUnitBrackets && (removesObjects ||
+    patches.some(patch => patch.op === "updateObject" && "atoms" in patch.changes))) {
+    const planned = planRepeatUnitDeletion(base, draft, false);
+    orphaned = options.allowOrphanedRepeatUnitRemoval
+      ? planned.orphaned.filter(options.allowOrphanedRepeatUnitRemoval) : planned.orphaned;
+    const { importedEdits } = planned;
+    if (importedEdits.size) {
+      for (const page of draft.pages) {
+        page.objects = page.objects.map(object => importedEdits.get(object) ?? object);
+      }
+    }
+  }
+  if (orphaned.length || (removesObjects && !options.deferGroupCleanup)) {
+    pruneDeletedObjects(draft, orphaned, base);
   }
   draft.updatedAt = toIsoTimestamp(options.now ?? new Date());
   const next = validateDraft(draft);
@@ -190,7 +231,7 @@ export function admitParsedDocument(document: ChemDraftDocument): ChemDraftDocum
  *
  * Objects `next` shares with `base` were validated when `base` was produced; only the others are
  * parsed, and the document and page shells are validated as a patch result's are — including any
- * compatibility, styles, or plugin data `next` replaced, which a patch never writes. Throws, like a
+ * compatibility, styles, or plugin data `next` replaced. Throws, like a
  * patch, when a replaced object is invalid. A `base` the engine did not produce gains nothing, and
  * `next` comes back unchanged.
  */
@@ -209,7 +250,12 @@ export function adoptDerivedDocument(base: ChemDraftDocument, next: ChemDraftDoc
     selection: { ...next.selection, objectIds: [...next.selection.objectIds] },
     pages: next.pages.map((page) => ({
       ...page,
-      objects: page.objects.map((object) => (validated.has(object) ? object : DocumentObjectSchema.parse(object))),
+      objects: page.objects.map(object => {
+        if (validated.has(object)) return object;
+        const parsed = DocumentObjectSchema.parse(object);
+        retainBracketIdentity(object, parsed);
+        return parsed;
+      }),
       crossings: [...page.crossings]
     }))
   }, {
@@ -245,8 +291,27 @@ function validateDraft(
   draft: ChemDraftDocument,
   unvalidated: { compatibility?: boolean; styles?: boolean; plugins?: boolean } = {}
 ): ChemDraftDocument {
-  // No patch writes the compatibility warnings, styles, or plugin data, and the base had them
-  // validated, so they pass through by reference. Re-parsing them re-created every warning object
+  for (const page of draft.pages) {
+    if (!page.objects.some(object => object.type === "bracket")) continue;
+    const pairs = bracketPairs(page.objects);
+    const objects = new Map(page.objects.map(object => [object.id, object]));
+    page.objects = page.objects.map(object => {
+      if (object.type !== "bracket") return object;
+      if (object.pairId && !pairs.has(object.pairId)) return withoutBracketPairMetadata(object);
+      const containedObjectIds = object.containedObjectIds.filter(id => objects.has(id));
+      const crossingBondIds = object.crossingBondIds?.filter(ref => {
+        const molecule = objects.get(ref.objectId);
+        return molecule?.type === "molecule" && molecule.bonds.some(bond => bond.id === ref.bondId);
+      });
+      if (containedObjectIds.length === object.containedObjectIds.length && crossingBondIds?.length === object.crossingBondIds?.length) return object;
+      const pruned = { ...object, containedObjectIds, ...(crossingBondIds ? { crossingBondIds } : {}) };
+      retainBracketIdentity(object, pruned);
+      return pruned;
+    });
+  }
+  // Compatibility warnings and plugin data pass through by reference. Drawing-default patches
+  // replace styles with field-validated native values; other style metadata stays validated on the
+  // base. Re-parsing these fields re-created every warning object
   // on every edit — an imported page can carry thousands — and each undo step kept its own copy.
   // A derived document may have replaced them, though (`unvalidated`), and those are parsed like
   // any other shell field: a save no longer re-parses an engine document, so an invalid field
@@ -258,13 +323,13 @@ function validateDraft(
     plugins: unvalidated.plugins ? draft.plugins : {},
     pages: draft.pages.map((page) => ({ ...page, objects: [] }))
   });
-  return {
+  return withBracketChemistryWarnings({
     ...shell,
     compatibility: unvalidated.compatibility ? shell.compatibility : draft.compatibility,
     styles: unvalidated.styles ? shell.styles : draft.styles,
     plugins: unvalidated.plugins ? shell.plugins : draft.plugins,
     pages: shell.pages.map((page, index) => ({ ...page, objects: draft.pages[index]!.objects }))
-  };
+  });
 }
 
 const freezeResults =
@@ -282,18 +347,181 @@ function deepFreezeNew(value: unknown): void {
   }
 }
 
-function applyPatchInPlace(next: ChemDraftDocument, patch: DocumentPatch): void {
+export type OrphanedRepeatUnit = {
+  pageId: string;
+  bracketIds: readonly string[];
+  brackets: readonly BracketObject[];
+  deletedMoleculeIds: ReadonlySet<string>;
+};
+
+const deletionMembershipOptions: RepeatUnitMembershipOptions = {
+  atomPosition: (molecule, atom) => molecule.rotation === 0 ? atom : rotatePointAboutCenter(atom, {
+    x: molecule.x + molecule.width / 2,
+    y: molecule.y + molecule.height / 2
+  }, molecule.rotation * Math.PI / 180)
+};
+
+/** Only a loss of original members can orphan a pair. Resolve against the complete edit so
+ * a replacement can keep a member and an explicitly erased glyph still supplies its geometry. */
+export function planOrphanedRepeatUnitCleanup(before: ChemDraftDocument, after: ChemDraftDocument,
+  { wholeMoleculesOnly = false }: { wholeMoleculesOnly?: boolean } = {}): OrphanedRepeatUnit[] {
+  return planRepeatUnitDeletion(before, after, wholeMoleculesOnly).orphaned;
+}
+
+function planRepeatUnitDeletion(before: ChemDraftDocument, after: ChemDraftDocument, wholeMoleculesOnly: boolean) {
+  const orphaned: OrphanedRepeatUnit[] = [];
+  const importedEdits = new Map<DocumentObject, BracketObject>();
+  for (const originalPage of before.pages) {
+    const pairs = bracketPairs(originalPage.objects);
+    if (!pairs.size) continue;
+    const page = after.pages.find(page => page.id === originalPage.id);
+    if (!page) continue;
+    const originalIds = new Set<string>();
+    const ambiguousIds = new Set<string>();
+    for (const object of originalPage.objects) {
+      if (originalIds.has(object.id)) ambiguousIds.add(object.id);
+      originalIds.add(object.id);
+    }
+    const objectsById = new Map<string, DocumentObject[]>();
+    for (const object of page.objects) {
+      const entries = objectsById.get(object.id) ?? [];
+      entries.push(object);
+      objectsById.set(object.id, entries);
+    }
+    // Atom moves also carry an atoms patch. Skip enclosure resolution when no ids disappeared.
+    const hasDeletion = originalPage.objects.some(object => {
+      if (object.type !== "molecule") return false;
+      const surviving = objectsById.get(object.id)?.filter(candidate => candidate.type === "molecule") ?? [];
+      if (!surviving.length) return true;
+      if (wholeMoleculesOnly || !object.atoms.length || surviving.some(candidate => candidate.atoms === object.atoms)) return false;
+      const atomIds = new Set(surviving.flatMap(candidate => candidate.atoms.map(atom => atom.id)));
+      return object.atoms.some(atom => !atomIds.has(atom.id));
+    });
+    if (!hasDeletion) continue;
+    for (const pair of pairs.values()) {
+      if (bracketPairUsage(pair) !== "sru" || pair.some(bracket => ambiguousIds.has(bracket.id))) continue;
+      let survivingGlyphs = 0;
+      const finalGeometry = pair.map(bracket => {
+        const entries = objectsById.get(bracket.id);
+        if (!entries) return bracket;
+        if (entries.length !== 1 || entries[0].type !== "bracket" || !sameBracketIdentity(bracket, entries[0])) return undefined;
+        survivingGlyphs += 1;
+        return entries[0];
+      });
+      if (!finalGeometry.every(bracket => bracket !== undefined) || !survivingGlyphs ||
+        (wholeMoleculesOnly && survivingGlyphs !== pair.length) || bracketPairUsage(finalGeometry) !== "sru") continue;
+      const imported = planImportedRepeatUnitDeletion(pair, originalPage.objects, objectsById, wholeMoleculesOnly);
+      const deletedMoleculeIds = imported?.deletedMoleculeIds ?? new Set<string>();
+      if (imported) {
+        if (!wholeMoleculesOnly && imported.deletedAtoms.length && survivingGlyphs === pair.length) {
+          for (const bracket of finalGeometry) {
+            if (!bracket.compatibility) continue;
+            const edited = { ...bracket, compatibility: {
+              ...bracket.compatibility, unknown: { ...bracket.compatibility.unknown, cdxmlBracketDeletedAtoms: imported.deletedAtoms }
+            } };
+            retainBracketIdentity(bracket, edited);
+            importedEdits.set(bracket, edited);
+          }
+        }
+        if (!imported.orphaned) continue;
+      } else {
+        const { members, structureOnlyMembers } = resolveRepeatUnitAtomMembership(pair, originalPage.objects, deletionMembershipOptions);
+        if (!members.length && !structureOnlyMembers.length) continue;
+        const survivingMolecules = (molecule: MoleculeObject): MoleculeObject[] => {
+          const present = objectsById.get(molecule.id)?.filter((object): object is MoleculeObject => object.type === "molecule") ?? [];
+          if (!present.length) deletedMoleculeIds.add(molecule.id);
+          return present;
+        };
+        if (structureOnlyMembers.some(molecule => survivingMolecules(molecule).length) || members.some(({ molecule, atomIds }) =>
+          survivingMolecules(molecule).some(object => wholeMoleculesOnly || object.atoms.some(atom => atomIds.includes(atom.id))))) continue;
+      }
+      const finalMembership = resolveRepeatUnitAtomMembership(finalGeometry, page.objects, deletionMembershipOptions);
+      if (finalMembership.members.length || finalMembership.structureOnlyMembers.length) continue;
+      orphaned.push({ pageId: page.id, bracketIds: pair.map(bracket => bracket.id), brackets: pair, deletedMoleculeIds });
+    }
+  }
+  return { orphaned, importedEdits };
+}
+
+/** Remove orphaned pairs and prune deleted group members after a scoped edit passes authorization. */
+export function removeOrphanedRepeatUnitBrackets(document: ChemDraftDocument,
+  orphaned: readonly OrphanedRepeatUnit[], authoredRemovals?: ReadonlyMap<string, ReadonlySet<string>>): ChemDraftDocument {
+  if (!orphaned.length && !document.pages.some(page => {
+    const removed = authoredRemovals?.get(page.id);
+    return removed && page.objects.some(object => object.type === "group" && object.childObjectIds.some(id => removed.has(id)));
+  })) return document;
+  const draft = createDraft(document);
+  // The authored document already passed validation and scope. Only prune references to the
+  // deleted ids here. A general normalization pass could change surviving authored fields.
+  pruneDeletedObjects(draft, orphaned, undefined, authoredRemovals);
+  return admitParsedDocument(draft);
+}
+
+function pruneDeletedObjects(document: ChemDraftDocument, orphaned: readonly OrphanedRepeatUnit[],
+  before?: ChemDraftDocument, authoredRemovals?: ReadonlyMap<string, ReadonlySet<string>>): void {
+  const byPage = new Map<string, Set<string>>();
+  for (const unit of orphaned) {
+    const ids = byPage.get(unit.pageId) ?? new Set<string>();
+    unit.bracketIds.forEach(id => ids.add(id));
+    byPage.set(unit.pageId, ids);
+  }
+  const selectedPageId = document.selection.pageId ?? document.pages[0]?.id;
+  for (const page of document.pages) {
+    const originalPage = before?.pages.find(original => original.id === page.id);
+    const glyphs = byPage.get(page.id);
+    const removedHere = authoredRemovals?.get(page.id);
+    if (!glyphs && ((!originalPage && !removedHere) || !page.objects.some(object => object.type === "group"))) continue;
+    if (glyphs) page.objects = page.objects.filter(object => !glyphs.has(object.id));
+    const survivingIds = new Set(page.objects.map(object => object.id));
+    const removed = new Set(glyphs);
+    const candidates = originalPage ? originalPage.objects.map(object => object.id) : removedHere ?? [];
+    for (const id of candidates) if (!survivingIds.has(id)) removed.add(id);
+    if (!removed.size) continue;
+    pruneGroupReferences(page, removed, originalPage !== undefined);
+    if (!originalPage && !glyphs) continue;
+    if (!originalPage) {
+      page.objects = page.objects.map(object => {
+        if (object.type !== "bracket" || !object.containedObjectIds.some(id => removed.has(id))) return object;
+        const pruned = { ...object, containedObjectIds: object.containedObjectIds.filter(id => !removed.has(id)) };
+        retainBracketIdentity(object, pruned);
+        return pruned;
+      });
+    }
+    pruneObjectNativeExtensions(document, page.id, removed);
+    pruneCrossings(page, crossing => !crossing.bonds.some(ref => removed.has(ref.objectId)));
+    pruneReactionReferences(page, removed);
+    if (page.id === selectedPageId) document.selection.objectIds = document.selection.objectIds.filter(id => !removed.has(id));
+  }
+}
+
+function pruneGroupReferences(page: DocumentPage, removed: Set<string>, removeEmptyGroups: boolean): void {
+  // Groups can themselves be children. Propagate removal of newly empty groups to their parents.
+  let sizeBefore: number;
+  do {
+    sizeBefore = removed.size;
+    page.objects = page.objects.flatMap<DocumentObject>(object => {
+      if (object.type !== "group") return [object];
+      const childObjectIds = object.childObjectIds.filter(id => !removed.has(id));
+      if (childObjectIds.length === object.childObjectIds.length) return [object];
+      if (childObjectIds.length || !removeEmptyGroups) return [{ ...object, childObjectIds }];
+      removed.add(object.id);
+      return [];
+    });
+  } while (removed.size !== sizeBefore);
+}
+
+function applyPatchInPlace(next: ChemDraftDocument, patch: DocumentPatch, beforeObjectWrite: ApplyPatchOptions["beforeObjectWrite"]): void {
   switch (patch.op) {
     case "batch":
       throw new DocumentPatchError("Nested batch patches are not allowed.");
     case "addObject":
-      addObject(next, patch.pageId, patch.object);
+      addObject(next, patch.pageId, patch.object, beforeObjectWrite);
       break;
     case "removeObject":
       removeObject(next, patch.objectId);
       break;
     case "updateObject":
-      updateObject(next, patch.objectId, patch.changes);
+      updateObject(next, patch.objectId, patch.changes, beforeObjectWrite);
       break;
     case "updatePageLayout":
       updatePageLayout(next, patch.pageId, patch.layout);
@@ -316,8 +544,15 @@ function applyPatchInPlace(next: ChemDraftDocument, patch: DocumentPatch): void 
     case "setSelection":
       setSelection(next, patch.pageId, patch.objectIds);
       break;
+    case "setDrawingDefaults":
+      next.styles = {
+        ...next.styles,
+        drawing: { ...nativeDrawingStyleFromObjectStyle({ ...patch.drawing }) },
+        text: { ...nativeTextStyleFromObjectStyle({ ...patch.text }) }
+      };
+      break;
     case "addAnnotation":
-      addObject(next, patch.pageId, patch.annotation);
+      addObject(next, patch.pageId, patch.annotation, beforeObjectWrite);
       break;
     case "removeAnnotation":
       removeAnnotation(next, patch.annotationId);
@@ -327,7 +562,8 @@ function applyPatchInPlace(next: ChemDraftDocument, patch: DocumentPatch): void 
   }
 }
 
-function addObject(document: ChemDraftDocument, pageId: string, object: DocumentObject): void {
+function addObject(document: ChemDraftDocument, pageId: string, object: DocumentObject,
+  beforeObjectWrite: ApplyPatchOptions["beforeObjectWrite"]): void {
   const pageIndex = document.pages.findIndex((candidate) => candidate.id === pageId);
   const page = document.pages[pageIndex];
   if (!page) {
@@ -339,6 +575,7 @@ function addObject(document: ChemDraftDocument, pageId: string, object: Document
   }
 
   const parsed = DocumentObjectSchema.parse(object);
+  beforeObjectWrite?.(pageId, undefined, parsed);
   // Every new molecule — pasted, split off, merged, imported — enters here, so this is where a
   // stated H count that no longer sits in an aromatic ring is dropped (see dropOrphanedHydrogenHints).
   if (parsed.type === "molecule") {
@@ -354,10 +591,65 @@ function removeObject(document: ChemDraftDocument, objectId: string): void {
     throw new DocumentPatchError(`Cannot remove object: object "${objectId}" does not exist.`);
   }
 
+  pruneObjectNativeExtensions(document, location.page.id, new Set([objectId]));
   location.page.objects.splice(location.objectIndex, 1);
   forgetShiftedDuplicateLocations(document);
   document.selection.objectIds = document.selection.objectIds.filter((id) => id !== objectId);
   pruneCrossings(location.page, (crossing) => !crossing.bonds.some((ref) => ref.objectId === objectId));
+  pruneReactionReferences(location.page, new Set([objectId]));
+}
+
+function pruneObjectNativeExtensions(document: ChemDraftDocument, pageId: string, objectIds: ReadonlySet<string>, updated = false): void {
+  const extensions = document.compatibility.nativeExtensions;
+  if (!extensions?.length) return;
+  const kept = extensions.flatMap(extension => {
+    const scope = nativeExtensionObjectScope(extension);
+    if (!scope || scope.pageId !== pageId || !objectIds.has(scope.objectId)) return [extension];
+    const retained = updated && retainNativeExtension(document, extension);
+    return retained ? [retained] : [];
+  });
+  if (kept.length === extensions.length && kept.every((extension, index) => extension === extensions[index])) return;
+  // Replace the container: previous undo snapshots still own the complete original state.
+  const compatibility = { ...document.compatibility };
+  if (kept.length) compatibility.nativeExtensions = kept;
+  else delete compatibility.nativeExtensions;
+  document.compatibility = compatibility;
+}
+
+/** Replace changed reactions rather than mutating objects shared with undo snapshots. */
+function pruneReactionReferences(page: DocumentPage, removed: ReadonlySet<string>): void {
+  page.objects = page.objects.map(object => object.type === "reaction" ? pruneReactionObjectReferences(object, removed) : object);
+}
+
+/** Pure removal rule, shared with write-scope checks. Returns the original object if unchanged. */
+export function pruneReactionObjectReferences(object: ReactionObject, removed: ReadonlySet<string>): ReactionObject {
+  const components = object.components.filter(component => !removed.has(component.objectId));
+  const conditionsTextObjectIds = object.conditionsTextObjectIds.filter(id => !removed.has(id));
+  const arrowObjectIds = object.arrowObjectIds?.filter(id => !removed.has(id));
+  const plusObjectIds = object.plusObjectIds?.filter(id => !removed.has(id));
+  const sourceReferences = object.compatibility?.unknown.cdxmlStepReferences;
+  let compatibility = object.compatibility;
+  if (compatibility && sourceReferences && typeof sourceReferences === "object" && !Array.isArray(sourceReferences)) {
+    let changed = false;
+    const references = Object.fromEntries(Object.entries(sourceReferences).map(([key, value]) => {
+      if (!Array.isArray(value)) return [key, value];
+      const kept = value.filter(id => typeof id !== "string" || !removed.has(id));
+      if (kept.length !== value.length) changed = true;
+      return [key, kept];
+    }));
+    if (changed) {
+      compatibility = { ...compatibility, unknown: { ...compatibility.unknown, cdxmlStepReferences: references } };
+    }
+  }
+  if (components.length === object.components.length && conditionsTextObjectIds.length === object.conditionsTextObjectIds.length
+    && arrowObjectIds?.length === object.arrowObjectIds?.length && plusObjectIds?.length === object.plusObjectIds?.length
+    && compatibility === object.compatibility) return object;
+  return {
+    ...object, components, conditionsTextObjectIds,
+    ...(arrowObjectIds === undefined ? {} : { arrowObjectIds }),
+    ...(plusObjectIds === undefined ? {} : { plusObjectIds }),
+    ...(compatibility === undefined ? {} : { compatibility })
+  };
 }
 
 /**
@@ -409,10 +701,12 @@ function removeObjects(document: ChemDraftDocument, objectIds: readonly string[]
     if (removedHere.size === 0) {
       continue;
     }
+    pruneObjectNativeExtensions(document, page.id, removedHere);
     // The draft page owns a fresh objects array (createDraft), so it can simply be replaced; a spread
     // into splice would overflow the argument stack on a page of 100,000 objects.
     page.objects = kept;
     pruneCrossings(page, (crossing) => !crossing.bonds.some((ref) => removedHere.has(ref.objectId)));
+    pruneReactionReferences(page, removedHere);
     removedHere.forEach((id) => removed.add(id));
   }
   forgetShiftedDuplicateLocations(document);
@@ -523,7 +817,8 @@ function updatePageLayout(document: ChemDraftDocument, pageId: string, layout: P
 function updateObject(
   document: ChemDraftDocument,
   objectId: string,
-  changes: Partial<DocumentObject>
+  changes: Partial<DocumentObject>,
+  beforeObjectWrite?: ApplyPatchOptions["beforeObjectWrite"]
 ): void {
   const location = findObject(document, objectId);
   if (!location) {
@@ -539,10 +834,13 @@ function updateObject(
   }
 
   const updated = mergeObjectChanges(location.object, changes, objectId);
+  beforeObjectWrite?.(location.page.id, location.object, updated);
+  retainBracketIdentity(location.object, updated);
   if (location.object.type === "molecule" && updated.type === "molecule") {
     updated.atoms = clearChangedAtomHydrogenHints(location.object, updated.atoms, updated.bonds);
   }
   location.page.objects[location.objectIndex] = updated;
+  pruneObjectNativeExtensions(document, location.page.id, new Set([objectId]), true);
   pruneCrossingsAfterObjectUpdate(location.page, location.object, updated);
 }
 
@@ -557,6 +855,7 @@ function removeAnnotation(document: ChemDraftDocument, annotationId: string): vo
   }
 
   location.page.objects.splice(location.objectIndex, 1);
+  pruneObjectNativeExtensions(document, location.page.id, new Set([annotationId]));
   forgetShiftedDuplicateLocations(document);
 }
 

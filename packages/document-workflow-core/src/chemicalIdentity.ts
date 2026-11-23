@@ -1,6 +1,7 @@
-import type { MoleculeObject } from "@chemdraft/chem-core";
+import { moleculeToMolfileV2000, moleculeToMolfileV3000, type MoleculeObject } from "@chemdraft/chem-core";
+import { nativeBondOrderResolution } from "@chemdraft/layout-engine";
+import { expandNativeMoleculeLabelGroups, nativeSingleHeavyElementLabelValence } from "./atoms";
 import type { RdkitJsMol, RdkitJson, RdkitMinimalModule } from "@chemdraft/rdkit-adapter";
-import { stereoPerceptionMolfile } from "./molecule";
 import { markV2000UnspecifiedDoubleBonds, sourceBondSemantics } from "./sourceBondSemantics";
 
 /** With stereoReference, compare on that input's specified stereo; ignore additional output stereo. */
@@ -234,6 +235,21 @@ export class ChemicalIdentityMismatchError extends Error {
   }
 }
 
+/** Identity sees the chemical expansion of editable labels, as export and analysis do. */
+export function chemicalIdentityMolfile(drawn: MoleculeObject, warnings: string[] = []): string {
+  return chemicalIdentitySource(drawn, warnings, "v2000").molfile;
+}
+
+/** Also retain the graph in CTAB order for callers that map engine indices to drawn IDs. */
+export function chemicalIdentitySource(drawn: MoleculeObject, warnings: string[], version: "v2000" | "v3000") {
+  const { molecule, placeholderAtoms } = expandNativeMoleculeLabelGroups(drawn);
+  const write = version === "v2000" ? moleculeToMolfileV2000 : moleculeToMolfileV3000;
+  const molfile = write(molecule, { fromDocFrame: true, unknownBondOrders: "refuse", warnings,
+    abbreviations: "rgroup", placeholderAtoms, spellLabel: nativeSingleHeavyElementLabelValence,
+    kekuleBondOrders: nativeBondOrderResolution(molecule.atoms, molecule.bonds).kekuleOrders }).contents;
+  return { molfile, molecule };
+}
+
 /** Verify the actual native graph, including stereo and isotope positions, with the caller's engine. */
 export async function assertMoleculeMatchesSmiles(
   molecule: MoleculeObject,
@@ -244,7 +260,7 @@ export async function assertMoleculeMatchesSmiles(
   if (!source.valid) throw new Error(source.reason);
   if (!source.canonicalSmiles) throw new Error("RDKit did not return a canonical SMILES.");
   const warnings: string[] = [];
-  const molfile = stereoPerceptionMolfile(molecule, warnings);
+  const molfile = chemicalIdentityMolfile(molecule, warnings);
   if (warnings.length) throw new Error(warnings.join(" "));
   const output = await inspect("molfile", molfile, source.canonicalSmiles);
   if (!output.valid) throw new Error(output.reason);

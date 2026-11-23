@@ -6,12 +6,15 @@ import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AssistantCapabilityPermissions, PluginPanelReportSchema, type PluginCommandContext, type PluginAssistantToolResult } from "@chemdraft/plugin-api";
-import { applyPatch, createEmptyDocument, DocumentStylePreset, nativeDrawingStyleFromObjectStyle, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
-import { applyMoleculeTargetBondLength, createSmilesMolecule, inspectHydrogenNormalizedIdentity, pastedStructureDepictionFromMolfile, resolveStructureTemplateName } from "@chemdraft/document-workflow-core";
+import { AssistantCapabilityPermissions, PluginPanelReportSchema, ProposedDocumentPatchSchema, type PluginCommandContext, type PluginAssistantToolResult } from "@chemdraft/plugin-api";
+import { applyPatch, createEmptyDocument, DocumentStylePreset, nativeDrawingStyleFromObjectStyle, type BracketObject, type ChemDraftDocument, type DocumentObject, type ElectronMarkObject, type MoleculeObject } from "@chemdraft/chem-core";
+import { applyMoleculeTargetBondLength, createSmilesMolecule, inspectHydrogenNormalizedIdentity, pastedStructureDepictionFromMolfile, resolveStructureTemplateName, setReactionArrowConditions } from "@chemdraft/document-workflow-core";
 import { ensureRdkit, generateSmiles2DMolfile, setRdkitModuleLoader } from "../../../packages/rdkit-adapter/src/conformer";
-import { applyChargeToolAtPoint, normalizeCommittedDocument } from "./documentWorkflow";
+import { depictSmiles2D } from "@chemdraft/ocl-adapter";
+import { applyChargeToolAtPoint, createNativeArtLineGraphicObject, normalizeCommittedDocument } from "./documentWorkflow";
+import * as workflow from "./documentWorkflow";
 import { getAssistantHistoryPort } from "./assistant/historyPort";
+import { getAssistantTransactions } from "./assistant/assistantTransaction";
 import { buildMoveObjects, inspectMolecule } from "./assistant/writeBuilder";
 import { testContext } from "./assistant/tools/testContext";
 import type { AssistantToolContext } from "./assistant/AssistantToolContext";
@@ -20,6 +23,12 @@ import { MainWindow } from "./MainWindow";
 import type { DesktopPluginRuntime } from "./plugins/createPluginRuntime";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 import { DOM_COMMAND_EVENT } from "./window-manager";
+import { NATIVE_CANVAS_MENU_CLOSED_EVENT } from "./CanvasContextMenu";
+import { forceDocumentHistoryCommandId } from "./editHistoryRouting";
+import { assertPluginDocumentWriteScope } from "@chemdraft/plugin-host";
+import { expectStoredGraph, graphEditChanges, graphEditFixture, pluginGraphEdits } from "./testSupport/pluginGraphEdits";
+import { deferred } from "./testSupport/deferred";
+import * as identityClient from "./depiction2d/identityClient";
 
 vi.mock("./rdkitWasmLoader", () => ({ registerRdkitWasmLoader: vi.fn() }));
 vi.mock("./plugins/rdkitAppLoader", () => ({ loadRdkitWithAppLoader: (load: () => Promise<unknown>) => load() }));
@@ -54,6 +63,14 @@ const submit = vi.fn<(context: PluginCommandContext) => Promise<void>>();
 const select = vi.fn<(context: PluginCommandContext) => Promise<void>>();
 let root: Root;
 let container: HTMLDivElement;
+
+/** A refusal's message is the plain user sentence, exactly, and never names the molecule. */
+async function expectUserRefusal(write: Promise<unknown>, sentence: string, moleculeId: string) {
+  const error = await write.then(() => undefined, (caught: unknown) => caught);
+  expect(error).toBeInstanceOf(Error);
+  expect((error as Error).message).toBe(sentence);
+  expect((error as Error).message).not.toContain(moleculeId);
+}
 
 describe("assistant writes through mounted desktop normalization", () => {
   let chemistry: AssistantToolContext["chemistry"];
@@ -274,6 +291,1043 @@ describe("assistant writes through mounted desktop normalization", () => {
   });
 });
 
+describe("plugin direct writes through mounted desktop normalization", () => {
+  beforeEach(() => {
+    vi.stubGlobal("localStorage", new MemoryStorage());
+    vi.stubGlobal("ResizeObserver", TestResizeObserver);
+    vi.stubGlobal("CSS", { escape: (value: string) => value });
+    container = document.createElement("div"); document.body.append(container); root = createRoot(container);
+  });
+  afterEach(async () => {
+    await act(async () => root.unmount()); container.remove();
+    captured.runtime = undefined;
+    vi.restoreAllMocks(); vi.unstubAllGlobals();
+  });
+
+  async function mount(drawing: ChemDraftDocument, platform?: "macos" | "windows") {
+    await act(async () => root.render(<MainWindow initialDocument={drawing} initialPaletteMode="hidden"
+      initialRulersVisible={false} nativePalette={false} shortcutPlatform={platform} />));
+    return getAssistantHistoryPort();
+  }
+  function registerWrite(handler: (context: PluginCommandContext) => Promise<unknown>) {
+    const id = "org.chemdraft.writeScopeTest", command = "plugin.writeScopeTest.run";
+    act(() => captured.runtime!.registerPlugin({ id, name: "Write scope test", version: "0.1.0", apiVersion: "^0.1.14",
+      entry: "test.js", permissions: ["document.write"], contributes: { commands: [{ id: command, title: "Test" }] }
+    }, { commandHandlers: { [command]: handler } }));
+    return () => captured.runtime!.host.invokeCommand(command);
+  }
+  function chargeMark(molecule: MoleculeObject, charge = 1): ElectronMarkObject {
+    const atom = molecule.atoms[0]!;
+    return { id: "inserted_charge", type: "electron-mark", markKind: "charge", charge,
+      atomAssociation: "explicit", anchor: { kind: "atom", objectId: molecule.id, atomId: atom.id },
+      x: atom.x + 12, y: atom.y - 12, width: 18, height: 18, rotation: 0, style: {} };
+  }
+
+  it.each(pluginGraphEdits)("refreshes stored chemistry after a direct plugin $name edit and round-trips it in history", async edit => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const molecule = graphEditFixture(blank, edit, edit.name === "element");
+    const text = testContext(false).text;
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "addObject", pageId, object: text },
+      { op: "setSelection", pageId, objectIds: [molecule.id, text.id] }
+    ] }));
+    const before = port.read("initial")!;
+    const original = before.pages[0]!.objects[0]! as MoleculeObject;
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Edit atom graph", patch: {
+      op: "updateObject", objectId: molecule.id, changes: graphEditChanges(original, edit)
+    } }));
+    await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true, objectIds: [molecule.id] }); });
+    const after = port.read("initial")!;
+    expect(after.selection.objectIds).toEqual([molecule.id]);
+    await expectStoredGraph(after.pages[0]!.objects[0]! as MoleculeObject, edit);
+
+    async function history(commandId: "edit.undo" | "edit.redo") {
+      await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT,
+        { detail: { commandId: forceDocumentHistoryCommandId(commandId) } })); });
+    }
+    await history("edit.undo");
+    expect(port.read("initial")!.pages).toEqual(before.pages);
+    expect(container.querySelector("[role=status]")?.textContent).toContain("Undid Write scope test: Test");
+    const undone = port.read("initial");
+    await history("edit.undo");
+    expect(port.read("initial")).toBe(undone);
+    await history("edit.redo");
+    expect(port.read("initial")!.pages).toEqual(after.pages);
+  }, 20_000);
+
+  it("refreshes stored chemistry when the user accepts a graph-editing proposal", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const edit = pluginGraphEdits[0];
+    const molecule = graphEditFixture(blank, edit);
+    const port = await mount(applyPatch(blank, { op: "addObject", pageId, object: molecule }));
+    const before = port.read("initial")!;
+    const runtime = captured.runtime!;
+    const id = "org.chemdraft.proposalTest";
+    let proposalId!: string;
+    await act(async () => {
+      runtime.registerPlugin({ id, name: "Proposal test", version: "0.1.0", apiVersion: "^0.1.14",
+        entry: "test.js", permissions: ["document.proposePatch"] });
+      proposalId = runtime.host.proposePatch(id, { reason: "Edit element", patch: {
+        op: "updateObject", objectId: molecule.id, changes: graphEditChanges(molecule, edit)
+      } }).id;
+    });
+    expect(port.read("initial")).toBe(before);
+    await act(async () => { container.querySelector<HTMLButtonElement>(".patch-review-badge")!.click(); });
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>(`[data-proposal-id="${proposalId}"] button`)!.click();
+      await vi.waitFor(() => expect(runtime.host.listProposedPatches("pending")).toHaveLength(0));
+    });
+    const after = port.read("initial")!;
+    expect(after.selection.objectIds).toEqual([molecule.id]);
+    await expectStoredGraph(after.pages[0]!.objects[0]! as MoleculeObject, edit);
+    async function history(commandId: "edit.undo" | "edit.redo") {
+      await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT,
+        { detail: { commandId: forceDocumentHistoryCommandId(commandId) } })); });
+    }
+    await history("edit.undo");
+    expect(port.read("initial")).toEqual(before);
+    expect(container.querySelector("[role=status]")?.textContent).toContain("Undid Proposal test: Apply Proposal");
+    await history("edit.redo");
+    expect(port.read("initial")).toEqual(after);
+  }, 20_000);
+
+  it.each([
+    ["stale structure", "Plugin write refused: the stored structure doesn't match the drawn atoms."],
+    ["stale cached SMILES", "Plugin write refused: the stored structure doesn't match the drawn atoms."],
+    ["stale formula", /^Plugin write refused: the formula doesn't match the drawn (structure|atoms)\.$/],
+    ["an empty graph", "Plugin write refused: the molecule has no drawn atoms to check against."]
+  ] as const)("refuses a direct insertion with %s", async (mismatch, failure) => {
+    const blank = createEmptyDocument();
+    const molecule = graphEditFixture(blank, { name: "element", source: "CO" });
+    if (mismatch === "stale structure") molecule.structure = "CC";
+    if (mismatch === "stale cached SMILES") molecule.compatibility!.unknown.smiles = "CC";
+    if (mismatch === "stale formula") molecule.chemistry = { ...molecule.chemistry!, formula: "C2H6" };
+    if (mismatch === "an empty graph") { molecule.atoms = []; molecule.bonds = []; }
+    const port = await mount(blank);
+    const before = port.read("initial")!;
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Insert inconsistent molecule", patch: {
+      op: "addObject", pageId: blank.pages[0]!.id, object: molecule
+    } }));
+    await act(async () => {
+      if (typeof failure === "string") await expectUserRefusal(invoke(), failure, molecule.id);
+      else await expect(invoke()).rejects.toThrow(failure);
+    });
+    expect(port.read("initial")).toBe(before);
+  }, 20_000);
+
+  it.each([false, true])("skips inspection for unchanged or restyled atoms (restyled=%s)", async restyled => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const molecule = graphEditFixture(blank, pluginGraphEdits[0]);
+    await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const atoms = restyled ? molecule.atoms.map(atom => ({ ...atom, labelVisible: true })) : molecule.atoms;
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Update atom labels", patch: {
+      op: "updateObject", objectId: molecule.id, changes: { atoms }
+    } }));
+    await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true }); });
+    expect(inspect).not.toHaveBeenCalled();
+  });
+
+  it("skips inspection when a whole alkene is rotated and moved as one unit", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const molecule = graphEditFixture(blank, pluginGraphEdits.find(edit => edit.name === "coordinate-only E/Z")!);
+    await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const cx = molecule.atoms.reduce((sum, atom) => sum + atom.x, 0) / molecule.atoms.length;
+    const cy = molecule.atoms.reduce((sum, atom) => sum + atom.y, 0) / molecule.atoms.length;
+    const cos = Math.cos(Math.PI / 3), sin = Math.sin(Math.PI / 3);
+    // A rotation keeps both double-bond sides, so the E isomer cannot change.
+    const atoms = molecule.atoms.map(atom => ({ ...atom,
+      x: cx + 15 + (atom.x - cx) * cos - (atom.y - cy) * sin, y: cy + 10 + (atom.x - cx) * sin + (atom.y - cy) * cos }));
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Rotate molecule", patch: {
+      op: "updateObject", objectId: molecule.id, changes: { atoms }
+    } }));
+    await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true }); });
+    expect(inspect).not.toHaveBeenCalled();
+  });
+
+  /** The E-but-2-ene fixture with explicit coordinates for the alkene ends and their substituents. */
+  function alkeneAt(blank: ChemDraftDocument, place: (role: "start" | "end" | "startSubstituent" | "endSubstituent") => { x: number; y: number }) {
+    const molecule = graphEditFixture(blank, pluginGraphEdits.find(edit => edit.name === "coordinate-only E/Z")!);
+    const alkene = molecule.bonds.find(bond => bond.order === "double")!;
+    const role = (id: string) => id === alkene.fromAtomId ? "start" : id === alkene.toAtomId ? "end" :
+      molecule.bonds.some(bond => bond !== alkene && [bond.fromAtomId, bond.toAtomId].includes(id) &&
+        [bond.fromAtomId, bond.toAtomId].includes(alkene.fromAtomId)) ? "startSubstituent" : "endSubstituent";
+    molecule.atoms = molecule.atoms.map(atom => ({ ...atom, ...place(role(atom.id)) }));
+    return { molecule, role };
+  }
+
+  it("verifies a large-coordinate edit that moves one alkene substituent across the axis", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    // Extent 1e9 lets the similarity fit absorb a 2-unit move; the substituent still changes sides.
+    const { molecule, role } = alkeneAt(blank, which => ({ start: { x: 300, y: 250 }, end: { x: 300 + 1e9, y: 250 },
+      startSubstituent: { x: 299, y: 251 }, endSubstituent: { x: 301 + 1e9, y: 249 } })[which]);
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const before = port.read("initial")!;
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const atoms = molecule.atoms.map(atom => role(atom.id) === "startSubstituent" ? { ...atom, y: 249 } : atom);
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Move substituent", patch: {
+      op: "updateObject", objectId: molecule.id, changes: { atoms }
+    } }));
+    await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true, objectIds: [molecule.id] }); });
+    expect(inspect).toHaveBeenCalled();
+    expect(port.read("initial")).not.toBe(before);
+    await expectStoredGraph(port.read("initial")!.pages[0]!.objects[0]! as MoleculeObject,
+      pluginGraphEdits.find(edit => edit.name === "coordinate-only E/Z")!);
+  }, 20_000);
+
+  it("verifies a near-collinear substituent that crosses the double-bond axis", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const { molecule, role } = alkeneAt(blank, which => ({ start: { x: 300, y: 250 }, end: { x: 320, y: 250 },
+      startSubstituent: { x: 280, y: 250 + 1e-5 }, endSubstituent: { x: 330, y: 250 - 17.32 } })[which]);
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const before = port.read("initial")!;
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const atoms = molecule.atoms.map(atom => role(atom.id) === "startSubstituent" ? { ...atom, y: 250 - 1e-5 } : atom);
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Move substituent", patch: {
+      op: "updateObject", objectId: molecule.id, changes: { atoms }
+    } }));
+    // Neither drawing gives the alkene a side, so its stored E isomer cannot be confirmed.
+    await act(async () => { await expectUserRefusal(invoke(), "Plugin write refused: the stored structure doesn't match the drawn atoms.", molecule.id); });
+    expect(inspect).toHaveBeenCalled();
+    expect(port.read("initial")).toBe(before);
+  }, 20_000);
+
+  /** (R)-1-aminoethanol drawn with its nitrogen wedged up from the stereocentre, at explicit
+   * coordinates for the stereocentre's three neighbours. */
+  function stereocentreAt(blank: ChemDraftDocument, place: (element: "centre" | "C" | "N" | "O") => { x: number; y: number }) {
+    const molecule = graphEditFixture(blank, { name: "element", source: "C[C@H](N)O" });
+    const centre = molecule.bonds.find(bond => bond.display?.bondStyle === "wedge")!.fromAtomId;
+    expect(molecule.atoms.find(atom => atom.id === centre)?.element).toBe("C");
+    const role = (id: string) => id === centre ? "centre" : molecule.atoms.find(atom => atom.id === id)!.element as "C" | "N" | "O";
+    molecule.atoms = molecule.atoms.map(atom => ({ ...atom, ...place(role(atom.id)) }));
+    return { molecule, role };
+  }
+  async function storedConfiguration(molecule: MoleculeObject) {
+    const result = await identityClient.inspectStructureOffThread(molecule.structureFormat === "smiles" ? "smiles" : "molfile",
+      molecule.structure, undefined, undefined, "writeIdentity");
+    if (!result.valid) throw new Error(result.reason);
+    return result.identitySmiles;
+  }
+  async function moveStereocentreAtoms(molecule: MoleculeObject, atoms: MoleculeObject["atoms"]) {
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Move atoms", patch: {
+      op: "updateObject", objectId: molecule.id, changes: { atoms }
+    } }));
+    let result: unknown;
+    await act(async () => { result = await invoke(); });
+    return result;
+  }
+
+  it("verifies a large-coordinate edit that moves one wedge neighbour across another", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    // Extent 1e9 lets the similarity fit absorb a 2-unit move; the oxygen still crosses the methyl's ray.
+    const { molecule, role } = stereocentreAt(blank, which => ({ centre: { x: 300, y: 255.5 }, C: { x: 300 + 1e9, y: 255.5 },
+      N: { x: 300, y: 233.5 }, O: { x: 305, y: 256.5 } })[which]);
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const before = port.read("initial")!;
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const atoms = molecule.atoms.map(atom => role(atom.id) === "O" ? { ...atom, y: 254.5 } : atom);
+    await expect(moveStereocentreAtoms(molecule, atoms)).resolves.toMatchObject({ applied: true, objectIds: [molecule.id] });
+    expect(inspect).toHaveBeenCalled();
+    const after = port.read("initial")!.pages[0]!.objects[0]! as MoleculeObject;
+    expect(after).not.toBe(before.pages[0]!.objects[0]);
+    // The drawn configuration inverted, so the stored R must become S and never stay R.
+    expect(await storedConfiguration(after)).toBe(await storedConfiguration({ ...after, structure: "C[C@@H](N)O", structureFormat: "smiles" }));
+    expect(after.compatibility?.unknown.smiles).toBe("C[C@@H](N)O");
+    expect(after.chemistry?.stereochemistry.join(" ")).toMatch(/\(S\)/);
+    expect(after.chemistry?.stereochemistry.join(" ")).not.toMatch(/\(R\)/);
+  }, 20_000);
+
+  it("skips inspection when a wedged stereocentre is rotated and moved as one unit", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const molecule = graphEditFixture(blank, { name: "element", source: "C[C@H](N)O" });
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const stored = port.read("initial")!.pages[0]!.objects[0]! as MoleculeObject;
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const cx = molecule.atoms.reduce((sum, atom) => sum + atom.x, 0) / molecule.atoms.length;
+    const cy = molecule.atoms.reduce((sum, atom) => sum + atom.y, 0) / molecule.atoms.length;
+    const cos = Math.cos(Math.PI / 3), sin = Math.sin(Math.PI / 3);
+    // A rotation keeps the turn between every pair of the stereocentre's neighbours, so R cannot change.
+    const atoms = molecule.atoms.map(atom => ({ ...atom,
+      x: cx + 15 + (atom.x - cx) * cos - (atom.y - cy) * sin, y: cy + 10 + (atom.x - cx) * sin + (atom.y - cy) * cos }));
+    await expect(moveStereocentreAtoms(molecule, atoms)).resolves.toMatchObject({ applied: true });
+    expect(inspect).not.toHaveBeenCalled();
+    const after = port.read("initial")!.pages[0]!.objects[0]! as MoleculeObject;
+    expect(after.atoms.map(atom => [atom.x, atom.y])).toEqual(atoms.map(atom => [atom.x, atom.y]));
+    expect(after.structure).toBe("C[C@H](N)O");
+    expect(after.compatibility?.unknown.smiles).toBe(stored.compatibility?.unknown.smiles);
+    expect(after.chemistry?.stereochemistry).toEqual(stored.chemistry?.stereochemistry);
+  });
+
+  it("verifies a near-collinear wedge neighbour that crosses another neighbour's ray", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    // The oxygen sits within the side epsilon of the methyl's ray (|sin| about 5e-9), so neither
+    // drawing clearly keeps its turn, although the move is far inside the similarity tolerance.
+    const { molecule, role } = stereocentreAt(blank, which => ({ centre: { x: 300, y: 255.5 }, C: { x: 320, y: 255.5 },
+      N: { x: 300, y: 233.5 }, O: { x: 280, y: 255.5 + 1e-7 } })[which]);
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const before = port.read("initial")!;
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const atoms = molecule.atoms.map(atom => role(atom.id) === "O" ? { ...atom, y: 255.5 - 1e-7 } : atom);
+    // A collinear drawing gives the stereocentre no configuration, so its stored R cannot be confirmed.
+    await expectUserRefusal(moveStereocentreAtoms(molecule, atoms), "Plugin write refused: the stored structure doesn't match the drawn atoms.", molecule.id);
+    expect(inspect).toHaveBeenCalled();
+    expect(port.read("initial")).toBe(before);
+  }, 20_000);
+
+  it("inserts a molecule whose stored records are the canvas's own derivation without inspection", async () => {
+    const blank = createEmptyDocument();
+    const molecule = graphEditFixture(blank, { name: "element", source: "CO" });
+    const port = await mount(blank);
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Insert methanol", patch: {
+      op: "addObject", pageId: blank.pages[0]!.id, object: molecule
+    } }));
+    await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true, objectIds: [molecule.id] }); });
+    expect(inspect).not.toHaveBeenCalled();
+    expect(port.read("initial")!.pages[0]!.objects).toMatchObject([{ id: molecule.id, structure: "CO" }]);
+  });
+
+  it.each([
+    ["structure", (molecule: MoleculeObject): Partial<MoleculeObject> => ({ structure: "CO" }), "Plugin write refused: the stored structure doesn't match the drawn atoms."],
+    ["cached SMILES", (molecule: MoleculeObject): Partial<MoleculeObject> => ({
+      compatibility: { ...molecule.compatibility!, unknown: { ...molecule.compatibility!.unknown, smiles: "CO" } } }),
+    "Plugin write refused: the stored structure doesn't match the drawn atoms."],
+    ["structure as a molfile", (): Partial<MoleculeObject> => ({ structureFormat: "molfile-v2000",
+      structure: depictSmiles2D("CO").molfile }), "Plugin write refused: the stored structure doesn't match the drawn atoms."],
+    ["formula", (molecule: MoleculeObject): Partial<MoleculeObject> => ({ chemistry: { ...molecule.chemistry!, formula: "CH4O" } }),
+      "Plugin write refused: the formula doesn't match the drawn structure."],
+    ["superatoms", (molecule: MoleculeObject): Partial<MoleculeObject> => ({ superatoms: [{ label: "OMe",
+      atomIds: [molecule.atoms[1]!.id], attachmentPoints: [], warnings: [] }] }), "Plugin write refused: it would change an abbreviation or R-group that can't be checked."]
+  ] as const)("refuses a write to the stored %s of a selected molecule that disagrees with its graph", async (_field, changes, failure) => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const molecule = graphEditFixture(blank, { name: "element", source: "CC" });
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const before = port.read("initial")!;
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Rewrite stored chemistry", patch: {
+      op: "updateObject", objectId: molecule.id, changes: changes(before.pages[0]!.objects[0]! as MoleculeObject)
+    } }));
+    // The canvas still draws ethane; saving or exporting methanol would silently change the chemistry.
+    await act(async () => { await expectUserRefusal(invoke(), failure, molecule.id); });
+    expect(port.read("initial")).toBe(before);
+  }, 20_000);
+
+  it("accepts a stored-structure write that agrees with the graph and stores the graph's own record", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const molecule = graphEditFixture(blank, { name: "element", source: "CC" });
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Rewrite stored chemistry", patch: {
+      op: "updateObject", objectId: molecule.id, changes: { structure: "C(C)" }
+    } }));
+    await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true, objectIds: [molecule.id] }); });
+    const after = port.read("initial")!.pages[0]!.objects[0]! as MoleculeObject;
+    expect(after).toMatchObject({ structure: "CC", structureFormat: "smiles", compatibility: { unknown: { smiles: "CC" } } });
+    expect(after.chemistry?.formula).toBe("C2H6");
+  }, 20_000);
+
+  it("refuses an accepted insertion proposal whose stored structure disagrees with its graph", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const molecule = graphEditFixture(blank, { name: "element", source: "CC" });
+    molecule.structure = "CO";
+    const port = await mount(blank);
+    const before = port.read("initial")!;
+    const runtime = captured.runtime!;
+    let proposalId!: string;
+    await act(async () => {
+      runtime.registerPlugin({ id: "org.chemdraft.proposalTest", name: "Proposal test", version: "0.1.0", apiVersion: "^0.1.14",
+        entry: "test.js", permissions: ["document.proposePatch"] });
+      proposalId = runtime.host.proposePatch("org.chemdraft.proposalTest", { reason: "Insert ethane",
+        patch: { op: "addObject", pageId, object: molecule } }).id;
+    });
+    await act(async () => { container.querySelector<HTMLButtonElement>(".patch-review-badge")!.click(); });
+    await act(async () => { container.querySelector<HTMLButtonElement>(`[data-proposal-id="${proposalId}"] button`)!.click(); });
+    // Flush React between polls; the refusal lands after off-thread inspection.
+    await vi.waitFor(async () => {
+      await act(async () => {});
+      expect(container.querySelector("[role=status]")?.textContent).toMatch(/Plugin change not applied/);
+    }, { timeout: 15_000 });
+    expect(container.querySelector("[role=status]")?.textContent).toBe(
+      "Plugin change not applied: the stored structure doesn't match the drawn atoms.");
+    expect(container.querySelector("[role=status]")?.textContent).not.toContain(molecule.id);
+    expect(port.read("initial")).toBe(before);
+    expect(runtime.host.listProposedPatches("pending")).toHaveLength(1);
+  }, 20_000);
+
+  it("keeps a stored stereo molfile in step with a rigid rotation so a later element edit verifies", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const molecule = graphEditFixture(blank, { name: "element", source: "C[C@H](N)O" }, true);
+    expect(molecule.structureFormat).toBe("molfile-v2000");
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const stored = port.read("initial")!.pages[0]!.objects[0]! as MoleculeObject;
+    const cx = molecule.atoms.reduce((sum, atom) => sum + atom.x, 0) / molecule.atoms.length;
+    const cy = molecule.atoms.reduce((sum, atom) => sum + atom.y, 0) / molecule.atoms.length;
+    const cos = Math.cos(Math.PI / 3), sin = Math.sin(Math.PI / 3);
+    const atoms = stored.atoms.map(atom => ({ ...atom,
+      x: cx + 15 + (atom.x - cx) * cos - (atom.y - cy) * sin, y: cy + 10 + (atom.x - cx) * sin + (atom.y - cy) * cos }));
+    let changes: Partial<MoleculeObject> = { atoms };
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Edit molecule", patch: {
+      op: "updateObject", objectId: molecule.id, changes
+    } }));
+    await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true }); });
+    const rotated = port.read("initial")!.pages[0]!.objects[0]! as MoleculeObject;
+    expect(rotated.structure).toBe(stored.structure);
+    expect(rotated.chemistry?.stereochemistry).toEqual(stored.chemistry?.stereochemistry);
+    // Oxygen to sulfur keeps the CIP ranking (S > N > C > H as O > N > C > H), so the label must not change.
+    changes = { atoms: rotated.atoms.map(atom => atom.element === "O" ? { ...atom, element: "S" } : atom) };
+    await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true, objectIds: [molecule.id] }); });
+    const after = port.read("initial")!.pages[0]!.objects[0]! as MoleculeObject;
+    expect(await storedConfiguration(stored)).toBe(await storedConfiguration({ ...stored, structure: "C[C@H](N)O", structureFormat: "smiles" }));
+    expect(after.structureFormat).toBe("molfile-v2000");
+    const expected = await storedConfiguration({ ...after, structure: "C[C@H](N)S", structureFormat: "smiles" });
+    expect(await storedConfiguration(after)).toBe(expected);
+    expect(after.compatibility?.unknown.smiles).toBe(expected);
+    expect(after.chemistry?.stereochemistry.join(" ")).toMatch(/\(R\)/);
+    expect(after.chemistry?.stereochemistry.join(" ")).not.toMatch(/\(S\)/);
+  }, 20_000);
+
+  it("preserves a canvas edit made while a plugin graph patch awaits inspection", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const edit = pluginGraphEdits[0];
+    const molecule = graphEditFixture(blank, edit);
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const before = port.read("initial")!;
+    const moved = applyPatch(before, { op: "moveObject", objectId: molecule.id, x: molecule.x + 25, y: molecule.y });
+    const inspect = identityClient.inspectStructureOffThread;
+    const started = deferred<void>();
+    const resume = deferred<void>();
+    vi.spyOn(identityClient, "inspectStructureOffThread").mockImplementationOnce(async (...args) => {
+      started.resolve();
+      await resume.promise;
+      return inspect(...args);
+    });
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Edit element", patch: {
+      op: "updateObject", objectId: molecule.id, changes: graphEditChanges(molecule, edit)
+    } }));
+    await act(async () => {
+      const pending = invoke();
+      await Promise.race([started.promise, pending]);
+      port.push("initial", before, moved, "Move molecule");
+      resume.resolve();
+      await expect(pending).rejects.toThrow(/drawing changed while refreshing stored chemistry/i);
+    });
+    expect(port.read("initial")!.pages).toEqual(moved.pages);
+  }, 20_000);
+
+  it("refuses an indeterminate bond order without committing any part of the batch", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const molecule = graphEditFixture(blank, pluginGraphEdits[0]);
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const before = port.read("initial");
+    const bond = molecule.bonds[0]!;
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Invalid graph edit", patch: {
+      op: "batch", patches: [
+        { op: "updateObject", objectId: molecule.id, changes: graphEditChanges(molecule, pluginGraphEdits[0]) },
+        { op: "updateObject", objectId: molecule.id, changes: { bonds: [{ ...bond, order: "unknown" }] } }
+      ]
+    } }));
+    await act(async () => { await expect(invoke()).rejects.toThrow(/cannot refresh stored chemistry.*unknown bond order/i); });
+    expect(port.read("initial")).toBe(before);
+    await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "edit.undo" } })); });
+    expect(port.read("initial")).toBe(before);
+  }, 20_000);
+
+  describe.each(["macos", "windows"] as const)("plugin writes during an open text edit on %s", platform => {
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      vi.spyOn(document, "hasFocus").mockReturnValue(true);
+      HTMLElement.prototype.setPointerCapture ??= () => {};
+      HTMLElement.prototype.releasePointerCapture ??= () => {};
+      HTMLElement.prototype.hasPointerCapture ??= () => false;
+    });
+    afterEach(() => vi.useRealTimers());
+
+    const editor = () => container.querySelector<HTMLTextAreaElement>(".text-object-editor");
+    async function type(value: string) {
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(editor(), value);
+        editor()!.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+    }
+    async function history(commandId: "edit.undo" | "edit.redo") {
+      await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT,
+        { detail: { commandId: forceDocumentHistoryCommandId(commandId) } })); });
+    }
+    async function openTextEdit(textId: string) {
+      const rect = { x: 0, y: 0, left: 0, top: 0, right: 792, bottom: 612,
+        width: 792, height: 612, toJSON: () => ({}) } as DOMRect;
+      for (const element of container.querySelectorAll<HTMLElement>(".page, .canvas-region")) {
+        element.getBoundingClientRect = () => rect;
+      }
+      await act(async () => {
+        container.querySelector(`[data-page-svg-object-visual="${textId}"] text`)!
+          .dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true, detail: 2 }));
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      expect(editor()).not.toBeNull();
+    }
+
+    it.each([false, true])("keeps checkpointed typing and an allowed insertion, with separate undo steps (changed checkpoint present: %s)", async changePresent => {
+      const fixture = testContext(false);
+      const port = await mount(fixture.context.getDocument()!, platform);
+      await openTextEdit(fixture.text.id);
+      await type("First edit");
+      const before = port.read("initial")!;
+      const normalize = workflow.normalizeCommittedDocument;
+      let calls = 0;
+      let checkpointPresent: ChemDraftDocument | undefined;
+      const seen: ChemDraftDocument[] = [];
+      vi.spyOn(workflow, "normalizeCommittedDocument").mockImplementation(document => {
+        seen.push(document);
+        const normalized = normalize(document);
+        // Plugin preflight, initial final guard, then typing's checkpoint. Normalization
+        // is normally idempotent; force a new present to exercise the stale-baseline path.
+        if (++calls === 3 && changePresent) return checkpointPresent = { ...normalized };
+        return normalized;
+      });
+      const insertion = { id: "allowed_text", type: "text" as const, text: "Plugin insertion", spans: [],
+        x: 450, y: 500, width: 100, height: 20, rotation: 0, style: {} };
+      const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Insert text", patch: {
+        op: "addObject", pageId: before.pages[0]!.id, object: insertion
+      } }));
+      await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true }); });
+      expect(calls).toBe(changePresent ? 4 : 3);
+      expect(seen[2]).toBe(before);
+      if (changePresent) expect(checkpointPresent).not.toBe(before);
+      vi.restoreAllMocks();
+      const committed = port.read("initial")!;
+      expect(committed.pages[0]!.objects.find(object => object.id === fixture.text.id)).toMatchObject({ text: "First edit" });
+      expect(committed.pages[0]!.objects.find(object => object.id === insertion.id)).toEqual(insertion);
+      expect(editor()).not.toBeNull();
+      await type("Second edit");
+      await canvasPointer(container.querySelector(".page")!, "pointerdown");
+      expect(editor()).toBeNull();
+      const final = port.read("initial")!;
+      await history("edit.undo");
+      expect(port.read("initial")!.pages).toEqual(committed.pages);
+      await history("edit.undo");
+      expect(port.read("initial")!.pages).toEqual(before.pages);
+      await history("edit.undo");
+      expect(port.read("initial")!.pages[0]!.objects.find(object => object.id === fixture.text.id)).toEqual(fixture.text);
+      const undone = port.read("initial");
+      await history("edit.undo");
+      expect(port.read("initial")).toBe(undone);
+      for (let i = 0; i < 3; i++) await history("edit.redo");
+      expect(port.read("initial")!.pages).toEqual(final.pages);
+    });
+
+    it("rechecks a changed checkpoint present and refuses atomically while typing remains resumable", async () => {
+      const fixture = testContext(false);
+      const port = await mount(fixture.context.getDocument()!, platform);
+      await openTextEdit(fixture.text.id);
+      await type("First edit");
+      const before = port.read("initial")!;
+      const userEdit = vi.fn();
+      const unsubscribe = port.onUserEdit(userEdit);
+      const normalize = workflow.normalizeCommittedDocument;
+      let calls = 0;
+      let checkpointPresent: ChemDraftDocument | undefined;
+      vi.spyOn(workflow, "normalizeCommittedDocument").mockImplementation(document => {
+        const normalized = normalize(document);
+        ++calls;
+        if (calls === 3) return checkpointPresent = { ...normalized };
+        if (calls !== 4) return normalized;
+        // Only the recheck's normalization has a forbidden side effect. Reusing the
+        // initial guarded document unconditionally would miss it and report success.
+        return { ...normalized, pages: normalized.pages.map(page => ({ ...page, objects: page.objects.map(object =>
+          object.type !== "molecule" ? object : { ...object, atoms: object.atoms.map((atom, i) => i ? atom : {
+            ...atom, labelBondSide: { side: "left" as const, atomId: object.atoms[1]!.id }
+          }) }) })) };
+      });
+      const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Insert text", patch: {
+        op: "addObject", pageId: before.pages[0]!.id, object: { id: "refused_text", type: "text", text: "Refused", spans: [],
+          x: 450, y: 500, width: 70, height: 20, rotation: 0, style: {} }
+      } }));
+      await act(async () => { await expect(invoke()).rejects.toThrow(/Plugin write refused:.*atom.*label bond side/); });
+      expect(calls).toBe(4);
+      expect(checkpointPresent).not.toBe(before);
+      expect(port.read("initial")).toBe(before);
+      expect(userEdit).not.toHaveBeenCalled();
+      unsubscribe();
+      vi.restoreAllMocks();
+      expect(editor()).not.toBeNull();
+      await type("Second edit");
+      await canvasPointer(container.querySelector(".page")!, "pointerdown");
+      const final = port.read("initial")!;
+      await history("edit.undo");
+      expect(port.read("initial")!.pages[0]!.objects.find(object => object.id === fixture.text.id)).toEqual(fixture.text);
+      const undone = port.read("initial");
+      await history("edit.undo");
+      expect(port.read("initial")).toBe(undone);
+      await history("edit.redo");
+      expect(port.read("initial")!.pages).toEqual(final.pages);
+    });
+
+    describe.each(["ordinary", "assistant push", "assistant amend"] as const)("%s", mode => {
+      it.each([false, true])("keeps one typing undo entry and transaction state (refused write: %s)", async refuse => {
+        const fixture = testContext(false);
+        const drawing = fixture.context.getDocument()!;
+        const port = await mount(drawing, platform);
+        const textId = fixture.text.id;
+        const rect = { x: 0, y: 0, left: 0, top: 0, right: 792, bottom: 612,
+          width: 792, height: 612, toJSON: () => ({}) } as DOMRect;
+        for (const element of container.querySelectorAll<HTMLElement>(".page, .canvas-region")) {
+          element.getBoundingClientRect = () => rect;
+        }
+        await act(async () => {
+          container.querySelector(`[data-page-svg-object-visual="${textId}"] text`)!
+            .dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true, detail: 2 }));
+          await vi.advanceTimersByTimeAsync(100);
+        });
+        expect(editor()).not.toBeNull();
+        await type("First edit");
+        const transactions = getAssistantTransactions(port);
+        const txId = mode === "ordinary" ? undefined : transactions.beginAssistantTransaction({
+          pluginId: "org.chemdraft.writeScopeTest", runId: "typing-refusal", label: "Insert charge",
+          tabId: "initial", sendSelection: { objectIds: [] }
+        });
+        // Observe all transaction fields, including snapshot identity, without changing its state.
+        const transaction = () => (transactions as unknown as { transactions: Map<string, Record<string, unknown>> })
+          .transactions.get(txId!)!;
+        const txBefore = txId ? { ...transaction() } : undefined;
+        const userEdit = vi.fn();
+        const unsubscribe = port.onUserEdit(userEdit);
+        const before = port.read("initial")!;
+        if (refuse) {
+          const patch = { reason: "Insert charge", patch: { op: "addObject" as const,
+            pageId: before.pages[0]!.id, object: chargeMark(fixture.molecule) } };
+          if (mode === "assistant amend") {
+            // Exercise the amend boundary directly: actual typing interrupts an open assistant
+            // entry, so command routing would otherwise choose push before reaching this guard.
+            await act(async () => {
+              expect(() => port.amend("initial", applyPatch(before, patch.patch), "Insert charge",
+                final => assertPluginDocumentWriteScope(before, final, ProposedDocumentPatchSchema.parse(patch), [])))
+                .toThrow(/Plugin write refused:.*formal charge/);
+            });
+          } else {
+            const invoke = registerWrite(context => context.documents.applyPatch!(patch));
+            await act(async () => { await expect(invoke()).rejects.toThrow(/Plugin write refused:.*formal charge/); });
+          }
+        }
+        expect(port.read("initial")).toBe(before);
+        expect.soft(userEdit).not.toHaveBeenCalled();
+        if (txId) {
+          expect.soft(transaction()).toEqual(txBefore);
+          expect.soft(transaction().snapshot).toBe(txBefore!.snapshot);
+          await act(async () => { transactions.endAssistantTransaction(txId, { touchedIds: [] }); });
+        }
+        unsubscribe();
+        expect(editor()).not.toBeNull();
+        await type("Second edit");
+        await canvasPointer(container.querySelector(".page")!, "pointerdown");
+        expect(editor()).toBeNull();
+        const final = port.read("initial")!;
+        expect(final.pages[0]!.objects.find(object => object.id === textId)).toMatchObject({ text: "Second edit" });
+        await history("edit.undo");
+        expect(port.read("initial")!.pages[0]!.objects.find(object => object.id === textId)).toEqual(fixture.text);
+        const undone = port.read("initial")!;
+        await history("edit.undo");
+        expect(port.read("initial")).toBe(undone);
+        await history("edit.redo");
+        expect(port.read("initial")!.pages).toEqual(final.pages);
+        await history("edit.redo");
+        expect(port.read("initial")!.pages).toEqual(final.pages);
+      });
+    });
+  });
+
+  it.each([1, -1])("refuses an inserted explicit %s charge mark on an unselected carbon, without a receipt, document change or undo entry", async charge => {
+    const fixture = testContext(false);
+    const port = await mount(fixture.context.getDocument()!);
+    const before = port.read("initial")!;
+    const molecule = before.pages[0]!.objects.find(object => object.type === "molecule")! as MoleculeObject;
+    expect(before.selection.objectIds).toEqual([]);
+    expect(molecule.atoms[0]!.formalCharge).toBe(0);
+    const patch = { op: "addObject" as const, pageId: before.pages[0]!.id, object: chargeMark(molecule, charge) };
+    // Prove this exact insertion really changes the protected carbon during normalization.
+    const unsafe = normalizeCommittedDocument(applyPatch(before, patch));
+    expect((unsafe.pages[0]!.objects[0]! as MoleculeObject).atoms[0]!.formalCharge).toBe(charge);
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Insert charge", patch }));
+    await act(async () => {
+      await expect(invoke()).rejects.toThrow(/Plugin write refused:.*atom.*formal charge/);
+    });
+    expect(port.read("initial")).toBe(before);
+    await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "edit.undo" } })); });
+    expect(port.read("initial")).toBe(before);
+  });
+
+  it.each(["ordinary", "assistant push", "assistant amend"] as const)("refuses a selected molecule's bond deletion that removes a crossing shared with an unselected molecule in %s", async mode => {
+    const fixture = testContext();
+    const drawing = fixture.context.getDocument()!;
+    const neighbor: MoleculeObject = { ...fixture.molecule, id: "unselected_neighbor" };
+    const pageId = drawing.pages[0]!.id;
+    const left = { objectId: fixture.molecule.id, bondId: fixture.molecule.bonds[0]!.id };
+    const right = { objectId: neighbor.id, bondId: neighbor.bonds[0]!.id };
+    const withCrossing = applyPatch(drawing, { op: "batch", patches: [
+      { op: "addObject", pageId, object: neighbor },
+      { op: "setCrossingOverride", pageId, crossing: { bonds: [left, right], front: left } },
+      { op: "setSelection", objectIds: [fixture.molecule.id] }
+    ] });
+    const port = await mount(withCrossing);
+    const initial = port.read("initial")!;
+    const transactions = getAssistantTransactions(port);
+    const tx = mode === "ordinary" ? undefined : transactions.beginAssistantTransaction({
+      pluginId: "org.chemdraft.writeScopeTest", runId: "test-crossing", label: "Delete crossed bond",
+      tabId: "initial", sendSelection: { objectIds: [fixture.molecule.id] }
+    });
+    let before = initial;
+    const patch = { op: "updateObject" as const, objectId: fixture.molecule.id, changes: { bonds: [] } };
+    expect(before.pages[0]!.crossings).toHaveLength(1);
+    const unsafe = normalizeCommittedDocument(applyPatch(before, patch));
+    expect(unsafe.pages[0]!.crossings).toHaveLength(0);
+    expect(unsafe.pages[0]!.objects.find(object => object.id === neighbor.id))
+      .toEqual(before.pages[0]!.objects.find(object => object.id === neighbor.id));
+    const invoke = registerWrite(async context => {
+      if (mode === "assistant amend") {
+        await context.documents.applyPatch!({ reason: "First insertion", patch: { op: "addObject", pageId,
+          object: { ...fixture.text, id: "accepted_text", y: 450 } } });
+        before = port.read("initial")!;
+      }
+      await expect(context.documents.applyPatch!({ reason: "Delete crossed bond", patch }))
+        .rejects.toThrow(/Plugin write refused: crossing.*unselected_neighbor.*not selected/);
+    });
+    await act(async () => { await invoke(); });
+    expect(port.read("initial")).toBe(before);
+    if (tx) await act(async () => { transactions.endAssistantTransaction(tx, { touchedIds: [] }); });
+    expect(port.read("initial")).toEqual(before);
+    await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "edit.undo" } })); });
+    expect(port.read("initial")).toEqual(initial);
+    if (mode === "assistant amend") {
+      await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "edit.redo" } })); });
+      expect(port.read("initial")).toEqual(before);
+    }
+  });
+
+  it.each(["ordinary", "assistant push", "assistant amend"] as const)("refuses moving a selected charged molecule when its mark and charge transfer to an unselected neighbor in %s", async mode => {
+    const fixture = testContext();
+    const drawing = fixture.context.getDocument()!;
+    const neighbor: MoleculeObject = { ...fixture.molecule, id: "unselected_neighbor", x: fixture.molecule.x + 30,
+      atoms: fixture.molecule.atoms.map(atom => ({ ...atom, x: atom.x + 30 })) };
+    // Legacy atom anchors are sticky within the association radius. Moving just the molecule
+    // leaves its mark behind, close enough to charge the neighboring molecule instead.
+    const mark = { ...chargeMark(fixture.molecule), atomAssociation: undefined };
+    const pageId = drawing.pages[0]!.id;
+    const port = await mount(applyPatch(drawing, { op: "batch", patches: [
+      { op: "addObject", pageId, object: neighbor }, { op: "addObject", pageId, object: mark },
+      { op: "setSelection", objectIds: [fixture.molecule.id] }
+    ] }));
+    const initial = port.read("initial")!;
+    const molecule = initial.pages[0]!.objects[0]! as MoleculeObject;
+    expect(molecule.atoms[0]!.formalCharge).toBe(1);
+    expect(initial.selection.objectIds).toEqual([molecule.id]);
+    const patch = { op: "updateObject" as const, objectId: molecule.id, changes: {
+      x: molecule.x + 150, atoms: molecule.atoms.map(atom => ({ ...atom, x: atom.x + 150 }))
+    } };
+    const unsafe = normalizeCommittedDocument(applyPatch(initial, patch));
+    expect((unsafe.pages[0]!.objects[0]! as MoleculeObject).atoms[0]!.formalCharge).toBe(0);
+    expect(initial.pages[0]!.objects.find(object => object.id === neighbor.id)).toMatchObject({
+      atoms: [expect.objectContaining({ formalCharge: 0 }), expect.objectContaining({ formalCharge: 0 })]
+    });
+    expect(unsafe.pages[0]!.objects.find(object => object.id === neighbor.id)).toMatchObject({
+      atoms: [expect.objectContaining({ formalCharge: 1, markCharge: 1 }), expect.objectContaining({ formalCharge: 0 })]
+    });
+    expect(unsafe.pages[0]!.objects.find(object => object.id === mark.id)).toMatchObject({
+      anchor: { kind: "atom", objectId: neighbor.id, atomId: neighbor.atoms[0]!.id }
+    });
+    const transactions = getAssistantTransactions(port);
+    const tx = mode === "ordinary" ? undefined : transactions.beginAssistantTransaction({
+      pluginId: "org.chemdraft.writeScopeTest", runId: "test-charge-transfer", label: "Move charged molecule",
+      tabId: "initial", sendSelection: { objectIds: [molecule.id] }
+    });
+    let before = initial;
+    const invoke = registerWrite(async context => {
+      if (mode === "assistant amend") {
+        await context.documents.applyPatch!({ reason: "First insertion", patch: { op: "addObject", pageId,
+          object: { ...fixture.text, id: "accepted_text", y: 450 } } });
+        before = port.read("initial")!;
+      }
+      await expect(context.documents.applyPatch!({ reason: "Move charged molecule", patch }))
+        .rejects.toThrow(/Plugin write refused: molecule "unselected_neighbor".*formal charge.*not selected/);
+    });
+    await act(async () => { await invoke(); });
+    expect(port.read("initial")).toBe(before);
+    if (tx) await act(async () => { transactions.endAssistantTransaction(tx, { touchedIds: [] }); });
+    expect(port.read("initial")).toEqual(before);
+    await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "edit.undo" } })); });
+    expect(port.read("initial")).toEqual(initial);
+    if (mode === "assistant amend") {
+      await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "edit.redo" } })); });
+      expect(port.read("initial")).toEqual(before);
+    }
+  });
+
+  it.each(["radical-dot", "radical-ion"] as const)("refuses an inserted %s mark changing an unselected atom", async kind => {
+    const port = await mount(testContext(false).context.getDocument()!);
+    const before = port.read("initial")!;
+    const molecule = before.pages[0]!.objects[0]! as MoleculeObject;
+    const mark = { ...chargeMark(molecule), ...(kind === "radical-dot"
+      ? { markKind: "radical-dot" as const, charge: undefined } : { radical: true }) };
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Insert radical", patch: {
+      op: "addObject", pageId: before.pages[0]!.id, object: mark
+    } }));
+    await act(async () => { await expect(invoke()).rejects.toThrow(/Plugin write refused:.*atom.*mark radicals/); });
+    expect(port.read("initial")).toBe(before);
+    await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "edit.undo" } })); });
+    expect(port.read("initial")).toBe(before);
+  });
+
+  it.each(["selected", "batch insertion", "earlier insertion"] as const)("allows a charge on a molecule from %s and restores exact states with undo/redo", async mode => {
+    const fixture = testContext();
+    const drawing = mode === "selected" ? applyPatch(fixture.context.getDocument()!, {
+      op: "setSelection", objectIds: [fixture.molecule.id]
+    }) : createEmptyDocument();
+    const port = await mount(drawing);
+    const before = port.read("initial")!;
+    const molecule = mode === "selected" ? before.pages[0]!.objects[0]! as MoleculeObject : fixture.molecule;
+    const mark = chargeMark(molecule), pageId = before.pages[0]!.id;
+    const invoke = registerWrite(async context => {
+      if (mode === "earlier insertion") await context.documents.applyPatch!({ reason: "Insert structure", patch: {
+        op: "addObject", pageId, object: molecule
+      } });
+      return context.documents.applyPatch!({ reason: "Insert charge", patch: mode === "batch insertion" ? {
+        op: "batch", patches: [{ op: "addObject", pageId, object: molecule }, { op: "addObject", pageId, object: mark }]
+      } : { op: "addObject", pageId, object: mark } });
+    });
+    await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true }); });
+    const after = port.read("initial")!;
+    expect(after.pages[0]!.objects.find(object => object.id === molecule.id)).toMatchObject({
+      atoms: [expect.objectContaining({ formalCharge: 1, markCharge: 1 }), expect.objectContaining({ formalCharge: 0 })]
+    });
+    await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "edit.undo" } })); });
+    if (mode !== "earlier insertion") expect(port.read("initial")).toEqual(before);
+    else expect(port.read("initial")!.pages[0]!.objects).toEqual([molecule]);
+    await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "edit.redo" } })); });
+    expect(port.read("initial")).toEqual(after);
+  });
+
+  it.each(["charge", "radical-dot", "lone-pair"] as const)("refuses attaching an unselected floating %s mark when a selected molecule moves", async kind => {
+    const fixture = testContext();
+    const mark: ElectronMarkObject = { ...chargeMark(fixture.molecule), markKind: kind,
+      atomAssociation: undefined, anchor: { kind: "point", point: { x: 559, y: 509 } }, x: 550, y: 500 };
+    const drawing = applyPatch(fixture.context.getDocument()!, { op: "addObject", pageId: fixture.context.getDocument()!.pages[0]!.id, object: mark });
+    const port = await mount(applyPatch(drawing, { op: "setSelection", objectIds: [fixture.molecule.id] }));
+    const before = port.read("initial")!;
+    const molecule = before.pages[0]!.objects[0]! as MoleculeObject;
+    const dx = 559 - molecule.atoms[0]!.x, dy = 509 - molecule.atoms[0]!.y;
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Move structure", patch: {
+      op: "updateObject", objectId: molecule.id, changes: { x: molecule.x + dx, y: molecule.y + dy,
+        atoms: molecule.atoms.map(atom => ({ ...atom, x: atom.x + dx, y: atom.y + dy })) }
+    } }));
+    await act(async () => { await expect(invoke()).rejects.toThrow(/Plugin write refused: electron-mark.*anchor/); });
+    expect(port.read("initial")).toBe(before);
+    await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "edit.undo" } })); });
+    expect(port.read("initial")).toBe(before);
+  });
+
+  it("refuses removing a selected charge mark if it would discharge an unselected molecule", async () => {
+    const fixture = testContext();
+    const mark = chargeMark(fixture.molecule);
+    const drawing = applyPatch(fixture.context.getDocument()!, { op: "addObject", pageId: fixture.context.getDocument()!.pages[0]!.id, object: mark });
+    const port = await mount(applyPatch(drawing, { op: "setSelection", objectIds: [mark.id] }));
+    const before = port.read("initial")!;
+    expect((before.pages[0]!.objects[0]! as MoleculeObject).atoms[0]!.formalCharge).toBe(1);
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Remove charge", patch: { op: "removeObject", objectId: mark.id } }));
+    await act(async () => { await expect(invoke()).rejects.toThrow(/Plugin write refused:.*atom.*formal charge/); });
+    expect(port.read("initial")).toBe(before);
+  });
+
+  it.each(["left", "right"] as const)("checks the meaning of an SCN label with its bond on the %s", async side => {
+    const fixture = testContext();
+    const second = { ...fixture.molecule, id: "unselected_structure" };
+    const drawing = applyPatch(fixture.context.getDocument()!, { op: "addObject", pageId: fixture.context.getDocument()!.pages[0]!.id, object: second });
+    const port = await mount(applyPatch(drawing, { op: "setSelection", objectIds: [fixture.molecule.id] }));
+    const before = port.read("initial")!;
+    const molecule = before.pages[0]!.objects[0]! as MoleculeObject;
+    const index = side === "left" ? 1 : 0;
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Edit atom label", patch: {
+      op: "updateObject", objectId: molecule.id, changes: { atoms: molecule.atoms.map((atom, i) => i === index
+        ? { ...atom, element: "SCN", labelLiteral: true } : atom) }
+    } }));
+    // Right-bond SCN is a bare formula. Saving it as an R-group placeholder would lose its meaning.
+    if (side === "right") {
+      await act(async () => { await expect(invoke()).rejects.toThrow(/cannot refresh stored chemistry.*Atom label "SCN"/); });
+      expect(port.read("initial")).toBe(before);
+      return;
+    }
+    await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true }); });
+    const after = port.read("initial")!;
+    expect((after.pages[0]!.objects[0]! as MoleculeObject).atoms[index]!.labelBondSide).toEqual({ side, atomId: molecule.atoms[0]!.id });
+    expect(after.pages[0]!.objects.find(object => object.id === second.id)).toEqual(before.pages[0]!.objects.find(object => object.id === second.id));
+  });
+
+  it.each(["move", "remove"] as const)("refuses %s of a selected arrow when normalization changes its unselected conditions label", async operation => {
+    const drawing = createEmptyDocument();
+    const arrow = createNativeArtLineGraphicObject(drawing, { x: 150, y: 300 }, { x: 390, y: 300 }, "tool.art.reactionArrow")!;
+    const withArrow = applyPatch(drawing, { op: "addObject", pageId: drawing.pages[0]!.id, object: arrow });
+    const withLabel = setReactionArrowConditions(withArrow, arrow.id, { side: "above", spans: [{ text: "Heat", script: "normal" }] });
+    const port = await mount(applyPatch(withLabel, { op: "setSelection", objectIds: [arrow.id] }));
+    const before = port.read("initial")!;
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Edit arrow", patch: operation === "remove"
+      ? { op: "removeObject", objectId: arrow.id }
+      : { op: "updateObject", objectId: arrow.id, changes: { rotation: 30 } }
+    }));
+    await act(async () => { await expect(invoke()).rejects.toThrow(/Plugin write refused: text.*(arrowAttachment|x|y)/); });
+    expect(port.read("initial")).toBe(before);
+    await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "edit.undo" } })); });
+    expect(port.read("initial")).toBe(before);
+  });
+
+  it("refuses removing a selected molecule when core validation updates unselected bracket membership", async () => {
+    const fixture = testContext();
+    const bracket: BracketObject = { id: "unselected_bracket", type: "bracket", bracketKind: "square", side: "open",
+      containedObjectIds: [fixture.molecule.id], x: 200, y: 200, width: 16, height: 100, rotation: 0, style: {} };
+    const drawing = applyPatch(fixture.context.getDocument()!, { op: "addObject", pageId: fixture.context.getDocument()!.pages[0]!.id, object: bracket });
+    const port = await mount(applyPatch(drawing, { op: "setSelection", objectIds: [fixture.molecule.id] }));
+    const before = port.read("initial")!;
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Remove structure", patch: { op: "removeObject", objectId: fixture.molecule.id } }));
+    await act(async () => { await expect(invoke()).rejects.toThrow(/would change bracket "unselected_bracket"/); });
+    expect(port.read("initial")).toBe(before);
+  });
+
+  it("refuses removing selected reaction content when core validation updates an unselected reaction", async () => {
+    const fixture = testContext();
+    const reaction: DocumentObject = { id: "unselected_reaction", type: "reaction", x: 200, y: 200, width: 200, height: 100,
+      rotation: 0, style: {}, components: [{ role: "reactant", objectId: fixture.molecule.id }],
+      conditionsTextObjectIds: [], arrowObjectIds: [], plusObjectIds: [], mappingState: "absent" };
+    const drawing = applyPatch(fixture.context.getDocument()!, { op: "addObject", pageId: fixture.context.getDocument()!.pages[0]!.id, object: reaction });
+    const port = await mount(applyPatch(drawing, { op: "setSelection", objectIds: [fixture.molecule.id] }));
+    const before = port.read("initial")!;
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Remove reactant", patch: { op: "removeObject", objectId: fixture.molecule.id } }));
+    await act(async () => { await expect(invoke()).rejects.toThrow(/would change reaction unselected_reaction/); });
+    expect(port.read("initial")).toBe(before);
+  });
+
+  it.each([false, true])("checks regenerated bracket chemistry warnings at commit (molecule selected: %s)", async selected => {
+    const fixture = testContext();
+    const drawing = applyPatch(fixture.context.getDocument()!, { op: "updateObject", objectId: fixture.molecule.id,
+      changes: { chemistry: { formula: "C2H6", averageMass: 30.07, atomCount: 2, bondCount: 1, totalCharge: 0,
+        isotopeLabels: [], stereochemistry: [], warnings: [] } } });
+    const port = await mount(applyPatch(drawing, { op: "setSelection", objectIds: selected ? [fixture.molecule.id] : [] }));
+    const before = port.read("initial")!;
+    const open: BracketObject = { id: "new_open", type: "bracket", bracketKind: "square", side: "open",
+      pairId: "new_pair", repeatUnit: true, bracketUsage: "sru", containedObjectIds: [fixture.molecule.id],
+      x: 200, y: 200, width: 16, height: 100, rotation: 0, style: {} };
+    const close: BracketObject = { ...open, id: "new_close", side: "close", x: 300, label: "n" };
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Insert repeat unit", patch: {
+      op: "batch", patches: [open, close].map(object => ({ op: "addObject", pageId: before.pages[0]!.id, object }))
+    } }));
+    await act(async () => {
+      if (selected) await expect(invoke()).resolves.toMatchObject({ applied: true });
+      else await expect(invoke()).rejects.toThrow(/Plugin write refused: molecule.*chemistry/);
+    });
+    if (selected) expect((port.read("initial")!.pages[0]!.objects[0]! as MoleculeObject).chemistry!.warnings)
+      .toEqual([expect.objectContaining({ code: "chemistry.bracket_multiplier" })]);
+    else expect(port.read("initial")).toBe(before);
+    await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "edit.undo" } })); });
+    expect(port.read("initial")).toEqual(before);
+  });
+
+  it.each(["ordinary", "assistant push", "assistant amend"] as const)("guards the last normalization in %s, including label reconciliation and future side effects", async mode => {
+    const port = await mount(testContext(false).context.getDocument()!);
+    const transactions = getAssistantTransactions(port);
+    const tx = mode === "ordinary" ? undefined : transactions.beginAssistantTransaction({ pluginId: "org.chemdraft.writeScopeTest",
+      runId: "test-final-state", label: "Test final state", tabId: "initial", sendSelection: { objectIds: [] } });
+    const initial = port.read("initial")!;
+    let before = initial;
+    let guardCalls = 0;
+    const normalize = workflow.normalizeCommittedDocument;
+    const invoke = registerWrite(async context => {
+      if (mode === "assistant amend") {
+        await context.documents.applyPatch!({ reason: "First insertion", patch: { op: "addObject", pageId: initial.pages[0]!.id,
+          object: { id: "accepted_text", type: "text", text: "Accepted", spans: [], x: 450, y: 450, width: 70, height: 20, rotation: 0, style: {} } } });
+        before = port.read("initial")!;
+      }
+      vi.spyOn(workflow, "normalizeCommittedDocument").mockImplementation(document => {
+        const normalized = normalize(document);
+        // The first pass is safe; only the history boundary's SECOND pass reconciles a label.
+        if (++guardCalls === 1) return normalized;
+        return { ...normalized, pages: normalized.pages.map(page => ({ ...page, objects: page.objects.map(object =>
+          object.type !== "molecule" ? object : { ...object, atoms: object.atoms.map((atom, i) => i ? atom : {
+            ...atom, labelBondSide: { side: "left" as const, atomId: object.atoms[1]!.id }
+          }) }) })) };
+      });
+      await expect(context.documents.applyPatch!({ reason: "Refused insertion", patch: { op: "addObject", pageId: initial.pages[0]!.id,
+        object: { id: "refused_text", type: "text", text: "Refused", spans: [], x: 450, y: 500, width: 70, height: 20, rotation: 0, style: {} } }
+      })).rejects.toThrow(/Plugin write refused:.*atom.*label bond side/);
+    });
+    await act(async () => { await invoke(); });
+    expect(guardCalls).toBe(2);
+    expect(port.read("initial")).toBe(before);
+    vi.restoreAllMocks();
+    if (tx) await act(async () => {
+      const result = transactions.endAssistantTransaction(tx, { touchedIds: [] });
+      expect(result.touchedIds).toEqual(mode === "assistant amend" ? ["accepted_text"] : []);
+    });
+    await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "edit.undo" } })); });
+    expect(port.read("initial")).toEqual(initial);
+  });
+
+  it("groups selected-molecule charge marks and later edits into one assistant undo entry", async () => {
+    const fixture = testContext();
+    const port = await mount(applyPatch(fixture.context.getDocument()!, { op: "setSelection", objectIds: [fixture.molecule.id] }));
+    const before = port.read("initial")!;
+    const transactions = getAssistantTransactions(port);
+    const tx = transactions.beginAssistantTransaction({ pluginId: "org.chemdraft.writeScopeTest", runId: "test-charge",
+      label: "Charge and label", tabId: "initial", sendSelection: { objectIds: [fixture.molecule.id] } });
+    const mark = chargeMark(before.pages[0]!.objects[0]! as MoleculeObject);
+    const invoke = registerWrite(async context => {
+      await context.documents.applyPatch!({ reason: "Insert charge", patch: { op: "addObject", pageId: before.pages[0]!.id, object: mark } });
+      await context.documents.applyPatch!({ reason: "Style charge", patch: { op: "updateObject", objectId: mark.id, changes: { chargeStyle: "plain" } } });
+    });
+    await act(async () => { await invoke(); transactions.endAssistantTransaction(tx, { touchedIds: [] }); });
+    const after = port.read("initial")!;
+    expect(after.selection.objectIds).toEqual(expect.arrayContaining([fixture.molecule.id, mark.id]));
+    expect((after.pages[0]!.objects[0]! as MoleculeObject).atoms[0]!.formalCharge).toBe(1);
+    await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "edit.undo" } })); });
+    expect(port.read("initial")).toEqual(before);
+    await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "edit.redo" } })); });
+    expect(port.read("initial")).toEqual(after);
+  });
+});
+
 function input(value: string): void {
   const textarea = container.querySelector(".plugin-canvas-overlay textarea")!;
   Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, value);
@@ -305,10 +1359,10 @@ async function typeAtFocus(text: string): Promise<void> {
 /** Dispatch through the actual DOM path without supplying the focus handoff under test.
  * In particular, do not call canvas.focus(): page tools can cancel browser focus defaults. */
 async function canvasPointer(target: Element, type: "pointerdown" | "pointerup",
-  options: MouseEventInit & { pointerType?: string; isPrimary?: boolean } = {}): Promise<MouseEvent> {
+  options: MouseEventInit & { pointerType?: string; isPrimary?: boolean; pointerId?: number } = {}): Promise<MouseEvent> {
   const event = new MouseEvent(type, { bubbles: true, cancelable: true, button: 0, clientX: 500, clientY: 500, ...options });
   await act(async () => {
-    Object.defineProperties(event, { pointerId: { value: 1 }, pointerType: { value: options.pointerType ?? "mouse" },
+    Object.defineProperties(event, { pointerId: { value: options.pointerId ?? 1 }, pointerType: { value: options.pointerType ?? "mouse" },
       isPrimary: { value: options.isPrimary ?? true } });
     target.dispatchEvent(event);
   });
@@ -889,6 +1943,20 @@ describe("MainWindow canvas overlays", () => {
     await canvasPointer(canvas, "pointerup"); expect(widget.hidden).toBe(false);
     await act(async () => widget.querySelector("textarea")!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
     expect(widget.dataset.expanded).toBe("false"); expect(document.activeElement).toBe(canvas);
+  });
+
+  it("clears swallowed native popup releases and the tracked pointer IDs", async () => {
+    const widget = container.querySelector<HTMLElement>(".plugin-canvas-overlay")!;
+    const canvas = container.querySelector<HTMLElement>(".canvas-region")!;
+    await canvasPointer(canvas, "pointerdown", { button: 2, pointerId: 7 });
+    expect(widget.hidden).toBe(true);
+    // AppKit consumes the right-button release while tracking a popup.
+    await act(async () => window.dispatchEvent(new Event(NATIVE_CANVAS_MENU_CLOSED_EVENT)));
+    expect(widget.hidden).toBe(false);
+    await canvasPointer(canvas, "pointerdown", { pointerId: 8 });
+    expect(widget.hidden).toBe(true);
+    await canvasPointer(canvas, "pointerup", { pointerId: 8 });
+    expect(widget.hidden).toBe(false); // No stale right pointer remains in the set.
   });
 
   it("acknowledges a long request immediately so the next draft remains editable", async () => {

@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, expect, it, vi } from "vitest";
 import { MemoryStorage } from "../testSupport/memoryStorage";
 import { createPhase4Document } from "../documentWorkflow";
 import type { PerfProbe } from "./probe";
@@ -17,14 +17,16 @@ const native = vi.hoisted(() => ({ desktop: true, runtime: undefined as import("
   dismiss: undefined as (() => void) | undefined, showPopover: vi.fn(), hidePopover: vi.fn(),
   snapshot: undefined as import("../dialogs/dialogProtocol").DialogMessage | undefined,
   receive: undefined as ((delivery: import("../dialogs/dialogTransport").DialogDelivery) => void) | undefined,
-  publish: vi.fn(), writeText: vi.fn(), writeFile: vi.fn(), readFile: vi.fn(), pickOpen: vi.fn(), pickSave: vi.fn()
+  publish: vi.fn(), writeText: vi.fn(), writeFile: vi.fn(), stat: vi.fn(), fileOpen: vi.fn(), fileRead: vi.fn(), fileClose: vi.fn(), pickOpen: vi.fn(), pickSave: vi.fn(),
+  loadToolbarLayout: vi.fn(async (): Promise<unknown> => undefined),
+  saveToolbarLayout: vi.fn(async () => {})
 }));
 vi.mock("../dialogs/dialogTransport", () => ({ nativeDialogTransport: {
   subscribe: async (receive: typeof native.receive) => { native.receive = receive; return () => {}; },
   open: async (snapshot: NonNullable<typeof native.snapshot>) => { native.snapshot = snapshot; return { hostId: "export-host", windowLabel: "dialog-main-export-1" }; },
   publish: native.publish, close: async () => {}
 } }));
-vi.mock("@tauri-apps/plugin-fs", async original => ({ ...await original<typeof import("@tauri-apps/plugin-fs")>(), readFile: native.readFile, writeTextFile: native.writeText, writeFile: native.writeFile }));
+vi.mock("@tauri-apps/plugin-fs", async original => ({ ...await original<typeof import("@tauri-apps/plugin-fs")>(), stat: native.stat, open: native.fileOpen, writeTextFile: native.writeText, writeFile: native.writeFile }));
 vi.mock("../nativeFileDialog", () => ({ prewarmNativeFileDialogs: async () => ({}), open: native.pickOpen, save: native.pickSave }));
 vi.mock("../rdkitWasmLoader", () => ({ registerRdkitWasmLoader: vi.fn() }));
 vi.mock("@tauri-apps/api/core", async original => ({ ...await original<typeof import("@tauri-apps/api/core")>(), invoke: native.invoke, isTauri: () => false }));
@@ -36,12 +38,14 @@ vi.mock("../window-manager", async original => ({
   listenForToolsetPopoverDismiss: async (handler: typeof native.dismiss) => { native.dismiss = handler; return () => {}; },
   listenForToolsetTextStyle: async () => () => {}, requestToolsetPopoverContent: async () => {}, requestToolsetTextStyle: async () => {},
   setCurrentWindowLogicalPosition: async () => {}, setCurrentWindowLogicalSize: async () => {},
+  isToolsetPopoverVisible: async () => true,
   showCurrentToolsetPopoverWindow: native.showPopover,
   sendPaletteCommand: async (commandId: string) => {
     window.dispatchEvent(new CustomEvent("chemdraft:native-command", { detail: { commandId } }));
   },
   loadDocumentSession: async () => undefined, saveDocumentSession: async () => {},
-  loadToolsetLayoutState: async () => undefined, listToolsetWindowStates: async () => [],
+  loadToolsetLayoutState: native.loadToolbarLayout, saveToolsetLayoutState: native.saveToolbarLayout,
+  listToolsetWindowStates: async () => [],
   setToolbarsMenu: async () => {}, setQuitPromptEnabled: async () => {},
   listenForQuitFlushRequest: async () => () => {}, listenForQuitPromptRequest: async () => () => {}, listenForQuitSettings: async () => () => {}
 }));
@@ -63,10 +67,15 @@ vi.mock("../plugins/createPluginRuntime", async original => {
 });
 let root: Root | undefined, container: HTMLDivElement, paletteRoot: Root | undefined, paletteContainer: HTMLDivElement;
 let runtime: typeof import("./runtime");
+// Keep the cold MainWindow transform out of the first test's timeout. A timed-out
+// mount keeps running and can overlap the next test's act scope and shared root.
+// mount still resets modules so every test gets its own runtime and probe state.
+beforeAll(async () => { await import("../MainWindow"); });
 afterEach(() => {
   act(() => root?.unmount()); root = undefined; container?.remove();
   act(() => paletteRoot?.unmount()); paletteRoot = undefined; paletteContainer?.remove();
   runtime?.perfProbe?.stop(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals();
+  native.loadToolbarLayout.mockReset();
 });
 type Case = { action: string; method: keyof PerfProbe; hide?: boolean; forwarded?: boolean; second?: boolean; web?: boolean; inline?: boolean; failed?: boolean };
 const cases: Case[] = [
@@ -99,8 +108,9 @@ async function command(action: string, forwarded = false) {
     window.dispatchEvent(new CustomEvent("chemdraft:native-command", { detail: { commandId: action } }));
   });
 }
-async function mount(options: { web?: boolean; inline?: boolean; document?: ReturnType<typeof createPhase4Document> } = {}) {
+async function mount(options: { web?: boolean; inline?: boolean; failNativeToolbars?: boolean; document?: ReturnType<typeof createPhase4Document>; toolbarLayout?: unknown } = {}) {
   vi.resetModules(); vi.clearAllMocks(); native.windows.clear(); native.desktop = !options.web;
+  native.loadToolbarLayout.mockResolvedValue(options.toolbarLayout);
   vi.stubGlobal("localStorage", new MemoryStorage()); vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
   vi.spyOn(window, "focus").mockImplementation(() => {});
@@ -114,12 +124,13 @@ async function mount(options: { web?: boolean; inline?: boolean; document?: Retu
   });
   native.panelOpen.mockResolvedValue(undefined); native.analysisPublish.mockResolvedValue(undefined); native.reportPublish.mockResolvedValue(undefined);
   native.open.mockImplementation(async (toolsetId: string) => {
+    if (options.failNativeToolbars) throw new Error("Unable to open native toolbars");
     native.windows.add(toolsetId === "core.drawnStructureSettings" ? "settings" : toolsetId); return { toolsetId, open: true, focused: true };
   });
   native.close.mockImplementation(async (toolsetId: string) => {
     native.windows.delete(toolsetId === "core.drawnStructureSettings" ? "settings" : toolsetId); return { toolsetId, open: false, focused: false };
   });
-  native.showPopover.mockResolvedValue(undefined); native.hidePopover.mockResolvedValue(undefined);
+  native.showPopover.mockResolvedValue(true); native.hidePopover.mockResolvedValue(undefined);
   native.publish.mockResolvedValue(undefined); native.writeText.mockResolvedValue(undefined); native.writeFile.mockResolvedValue(undefined);
   window.history.replaceState(null, "", "/?agentBridge=1");
   runtime = await import("./runtime");
@@ -131,6 +142,216 @@ async function mount(options: { web?: boolean; inline?: boolean; document?: Retu
   })));
   await runtime.startPerfProbe("fault-test");
 }
+
+async function clickToolbarButton(selector: string) {
+  const button = container.querySelector<HTMLButtonElement>(selector);
+  expect(button, selector).not.toBeNull();
+  await act(async () => button!.click());
+}
+
+async function openToolbarCommandPicker(toolsetId: string, query: string) {
+  await clickToolbarButton(`[data-toolset-id="${toolsetId}"] .customize-toolset-title`);
+  const button = [...container.querySelectorAll("button")].find(button => button.textContent === "Add command…");
+  expect(button).toBeDefined();
+  await act(async () => button!.click());
+  const input = container.querySelector<HTMLInputElement>('[aria-label="Search commands to add"]')!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, query);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
+it("re-adds a hidden plugin command from Main's gallery and another toolbar's picker", async () => {
+  await mount({ web: true, inline: true });
+  const pluginId = "plugin.customizeTest.run";
+  await act(async () => {
+    native.runtime!.registerPlugin({
+      id: "org.chemdraft.customize-test", name: "Customize Test", version: "1.0.0",
+      apiVersion: "^0.1.25", entry: "test.js", permissions: ["ui.toolbar"],
+      contributes: {
+        commands: [{ id: pluginId, title: "Run Customize Test" }],
+        toolsets: [{ id: "plugin.customizeTest", title: "Customize Test Toolbar", defaultVisible: true,
+          groups: [{ id: "plugin.customizeTest.items", items: [{ commandId: pluginId, title: "Run Customize Test" }] }] }]
+      }
+    }, { commandHandlers: { [pluginId]: vi.fn() } });
+  });
+  await command("view.customizeToolbars");
+  await clickToolbarButton('[data-toolset-id="plugin.customizeTest"] .customize-toolset-title');
+  await clickToolbarButton(`[data-item-id="${pluginId}"] .customize-item-visible`);
+  await clickToolbarButton(".customize-toolbars-apply");
+  expect(container.querySelector(`.tool-palette [data-command-id="${pluginId}"]`)).toBeNull();
+
+  await command("view.customizeMainToolbar");
+  expect(container.querySelector<HTMLButtonElement>('.gallery-tile[aria-label="Run Customize Test"]')?.disabled).toBe(false);
+  const { TOOLSET_LAYOUT_EDIT_EVENT } = await import("../window-manager");
+  await act(async () => {
+    window.dispatchEvent(new CustomEvent(TOOLSET_LAYOUT_EDIT_EVENT, { detail: {
+      toolsetId: "core.main", edit: { kind: "addCommand", groupId: "core.main.items", index: 0, commandId: pluginId }
+    } }));
+  });
+  await command("view.customizeMainToolbar");
+  expect(container.querySelector(`.tool-palette [data-command-id="${pluginId}"]`)).not.toBeNull();
+
+  await act(async () => {
+    window.dispatchEvent(new CustomEvent(TOOLSET_LAYOUT_EDIT_EVENT, { detail: {
+      toolsetId: "core.main", edit: { kind: "removeItem", itemId: pluginId }
+    } }));
+  });
+  expect(container.querySelector(`.tool-palette [data-command-id="${pluginId}"]`)).toBeNull();
+  await command("view.customizeToolbars");
+  await openToolbarCommandPicker("core.layout", pluginId);
+  await clickToolbarButton(`.customize-toolbars-dialog [data-command-id="${pluginId}"]`);
+  expect(container.querySelector(`[data-item-id="${pluginId}"]`)).not.toBeNull();
+  await clickToolbarButton(".customize-toolbars-apply");
+  await command("view.toolset.toggle.core.layout");
+  expect(container.querySelectorAll(`.tool-palette [data-command-id="${pluginId}"]`)).toHaveLength(1);
+});
+
+it.each([["mol.1", "mol%2E1"], ["mol1", "mol1"]])("keeps atom problem actions for %s out of persistent toolbar customization", async (id, encoded) => {
+  const { problemDocument, problemMolecule } = await import("../testSupport/atomProblemFixtures");
+  await mount({ web: true, document: problemDocument({ ...problemMolecule("Qq"), id }) });
+  await command("view.customizeToolbars");
+  const commandId = `atom.problem.open.${encoded}.a0`;
+  await openToolbarCommandPicker("core.main", commandId);
+  expect(container.querySelector(`.customize-command-add[data-command-id="${commandId}"]`)).toBeNull();
+  expect(container.querySelector(`.native-atom-invalid-marker[data-command-id="${commandId}"]`)).not.toBeNull();
+  await clickToolbarButton(".customize-toolbars-apply");
+  await command("view.customizeMainToolbar");
+  expect(container.querySelector('.gallery-tile[aria-label="Atom problem…"]')).toBeNull();
+});
+
+it("restores a shipped Eraser hidden by dragging it away using Main's command picker", async () => {
+  await mount({ web: true, inline: true });
+  await command("view.customizeMainToolbar");
+  const { TOOLSET_LAYOUT_EDIT_EVENT } = await import("../window-manager");
+  await act(async () => {
+    window.dispatchEvent(new CustomEvent(TOOLSET_LAYOUT_EDIT_EVENT, { detail: {
+      toolsetId: "core.main", edit: { kind: "removeItem", itemId: "tool.eraser" }
+    } }));
+  });
+  await command("view.customizeToolbars");
+  expect(container.querySelector<HTMLInputElement>('[data-item-id="tool.eraser"] .customize-item-visible')?.checked).toBe(false);
+  await openToolbarCommandPicker("core.main", "Eraser");
+  await clickToolbarButton('.customize-toolbars-dialog [data-command-id="tool.eraser"]');
+  expect(container.querySelectorAll('[data-item-id="tool.eraser"]')).toHaveLength(1);
+  expect(container.querySelector<HTMLInputElement>('[data-item-id="tool.eraser"] .customize-item-visible')?.checked).toBe(true);
+  await clickToolbarButton(".customize-toolbars-apply");
+  expect(container.querySelectorAll('.web-floating-palette[data-toolset-id="core.main"] [data-command-id="tool.eraser"]')).toHaveLength(1);
+});
+
+it("offers the plugin starter in Customize and renders it on the built-in toolbar", async () => {
+  await mount({ web: true, inline: true });
+  await command("view.toolset.toggle.core.main");
+  await command("view.customizeToolbars");
+  await openToolbarCommandPicker("core.main", "Vibe Code");
+  await clickToolbarButton('.customize-toolbars-dialog [data-command-id="plugins.vibeCodeStarter"]');
+  await clickToolbarButton(".customize-toolbars-apply");
+  expect(container.querySelector('.tool-palette [data-command-id="plugins.vibeCodeStarter"]')).not.toBeNull();
+  await import("../dialogs/VibeCodeGuideForm");
+  await clickToolbarButton('.tool-palette [data-command-id="plugins.vibeCodeStarter"]');
+  await vi.waitFor(() => expect(container.querySelector("form.cd-vibe-guide")).not.toBeNull());
+});
+
+it("opens Layout with the two-column width despite a legacy preferred window size", async () => {
+  await mount({ toolbarLayout: {
+    version: 1, userToolsets: [],
+    toolsetOverrides: [{ toolsetId: "core.layout", preferredWindowSize: { width: 900, height: 317 } }]
+  } });
+  await command("view.toolset.toggle.core.layout");
+  expect(native.open).toHaveBeenCalledWith("core.layout", expect.objectContaining({ width: 60 }));
+});
+
+it.each(["native", "inline"] as const)("sizes the Main toolbar from content in the %s path despite a legacy width", async surface => {
+  await mount({ failNativeToolbars: surface === "inline", toolbarLayout: {
+    version: 1, userToolsets: [],
+    toolsetOverrides: [{ toolsetId: "core.main", preferredWindowSize: { width: 5000, height: 317 } }]
+  } });
+  const palette = '.web-floating-palette[data-toolset-id="core.main"]';
+  if (surface === "inline") {
+    await vi.waitFor(() => expect(container.querySelector(palette)).not.toBeNull(), { timeout: 1500 });
+  }
+  const width = surface === "native"
+    ? native.open.mock.calls.find(([id]) => id === "core.main")?.[1].width
+    : Number.parseInt(container.querySelector<HTMLElement>(palette)!.style.getPropertyValue("--palette-width"), 10);
+  expect(width).toBeGreaterThan(0);
+  expect(width).toBeLessThan(5000);
+});
+
+it("can toggle and cancel Customize Toolbars after loading a newer saved layout", async () => {
+  await mount({ toolbarLayout: {
+    version: 2,
+    toolsetOverrides: [{ toolsetId: "core.layout", visible: true }],
+    userToolsets: []
+  } });
+  expect(container.querySelector('.web-floating-palette[data-toolset-id="core.main"]')).not.toBeNull();
+  expect(native.saveToolbarLayout).not.toHaveBeenCalled();
+  await command("view.customizeToolbars");
+
+  const dialog = ".customize-toolbars-dialog";
+  const palette = '.web-floating-palette[data-toolset-id="core.layout"]';
+  const visibility = container.querySelector<HTMLInputElement>(`${dialog} [data-toolset-id="core.layout"] .customize-toolset-visible`)!;
+  expect(visibility.checked).toBe(false);
+  await act(async () => visibility.click());
+  expect(visibility.checked).toBe(true);
+  expect(container.querySelector(palette)).not.toBeNull();
+
+  await clickToolbarButton(".customize-toolbars-cancel");
+  expect(container.querySelector(dialog)).toBeNull();
+  expect(container.querySelector(palette)).toBeNull();
+});
+
+it.each([undefined, 3])("uses in-window fallback after a malformed saved addition (revision %s)", async revision => {
+  const malformedId = "atom.problem.open.mol%2E1.a0";
+  await mount({ toolbarLayout: {
+    version: 1,
+    mainToolbarDefaultsRevision: revision,
+    toolsetOverrides: [{
+      toolsetId: "core.layout", visible: true,
+      itemAdditions: [
+        { groupId: "core.layout.tools", item: { commandId: malformedId } },
+        { groupId: "core.layout.tools", item: { commandId: "edit.undo" } }
+      ]
+    }],
+    userToolsets: []
+  } });
+  expect(container.querySelector('.web-floating-palette[data-toolset-id="core.main"]')).not.toBeNull();
+  expect(native.open).not.toHaveBeenCalled();
+  expect(native.saveToolbarLayout).not.toHaveBeenCalled();
+});
+
+it.each([
+  new Error("Could not restore document for Preferences: unminimize failed"),
+  "Dialog owner is hidden",
+  "Document monitor unavailable"
+])("reports the native Preferences opening error in document status: %s", async error => {
+  await mount(); vi.useFakeTimers();
+  const invoke = native.invoke.getMockImplementation()!;
+  native.invoke.mockImplementation(async (name: string, args?: { label: string }) => {
+    if (name === "toggle_preferences_window") throw error;
+    return invoke(name, args);
+  });
+  try {
+    // command's awaited act flushes the fire-and-forget IPC rejection and status
+    // render, just as in the existing failed-IPC cases below; no polling escapes it.
+    await command("view.togglePreferences");
+    expect(container.querySelector("[data-status-message]")?.textContent)
+      .toBe(`Preferences unavailable: ${error instanceof Error ? error.message : error}`);
+    expect(native.invoke).toHaveBeenCalledWith("toggle_preferences_window");
+    expect(native.windows.has("toggle_preferences_window")).toBe(false);
+  } finally {
+    native.invoke.mockImplementation(invoke);
+  }
+});
+
+it("opens Preferences successfully without adding a failure status", async () => {
+  await mount(); vi.useFakeTimers();
+  const status = container.querySelector("[data-status-message]")!.textContent;
+  await command("view.togglePreferences");
+  expect(native.windows.has("toggle_preferences_window")).toBe(true);
+  expect(native.invoke).toHaveBeenCalledWith("toggle_preferences_window");
+  expect(container.querySelector("[data-status-message]")?.textContent).toBe(status);
+  expect(container.querySelector("[data-status-message]")?.textContent).not.toContain("Preferences unavailable");
+});
 
 it.each([false, true].flatMap(inline => ["throw", "reject"].map(failure => ({ inline, failure }))))
   ("ring close finishes selection cleanup and status after a failed completion hook ($failure, inline=$inline)", async ({ inline, failure }) => {
@@ -339,7 +560,7 @@ it.each([
     }
     if (surface === "popover-click" || surface === "popover-replace" || surface === "popover-dismiss") {
       // Keep the first reveal outstanding for the replacement/dismissal paths.
-      if (surface !== "popover-click") native.showPopover.mockImplementationOnce(() => new Promise<void>(() => {}));
+      if (surface !== "popover-click") native.showPopover.mockImplementationOnce(() => new Promise<boolean>(() => {}));
       await act(async () => native.content!(popoverContent));
     }
     let reject!: (error: Error) => void;
@@ -383,9 +604,10 @@ it.each([
   });
 
 it.each([
-  ["view.togglePreferences", "preferences", "toggle_preferences_window"],
-  ["view.toggle3dDebugger", "spin3d-debugger", "toggle_spin3d_debugger_window"]
-])("%s registers cold-open intent before the toggle without awaiting diagnostics", async (action, target, toggle) => {
+  { action: "view.togglePreferences", target: "preferences", toggle: "toggle_preferences_window" },
+  { action: "view.openKeyboardPreferences", target: "preferences", toggle: "toggle_preferences_window", args: { keyboard: true } },
+  { action: "view.toggle3dDebugger", target: "spin3d-debugger", toggle: "toggle_spin3d_debugger_window" }
+])("$action registers cold-open intent before the toggle without awaiting diagnostics", async ({ action, target, toggle, args }) => {
   await mount(); vi.useFakeTimers(); native.invoke.mockClear();
   let registered: import("./runtime").NativeOpen | undefined;
   native.invoke.mockImplementation((name: string, args?: { nativeOpen?: import("./runtime").NativeOpen }) => {
@@ -408,7 +630,7 @@ it.each([
   expect(native.windows.has(toggle)).toBe(true);
   expect(native.invoke.mock.calls.slice(0, 2)).toEqual([
     ["perf_log_clock", { nativeOpen: expect.objectContaining({ target, commandId: action }) }],
-    [toggle]
+    args ? [toggle, args] : [toggle]
   ]);
   expect(registered?.shownAt).toEqual(expect.any(Number));
   const at = registered!.shownAt! + 1;
@@ -446,8 +668,6 @@ it.each(["svg", "pdf"].flatMap(format => ["throw", "reject"].map(failure => ({ f
     const send = async (type: "ready" | "action", data: unknown) => act(async () => {
       native.receive!({ senderWindowId: "dialog-main-export-1", windowLabel: "dialog-main-export-1",
         message: { ...native.snapshot!, type, requestId: crypto.randomUUID(), data } });
-      // receive is an async user action callback; drain its ordinary IPC/write microtasks.
-      for (let i = 0; i < 80; i++) await Promise.resolve();
     });
     await send("ready", {});
     let reject!: (error: Error) => void;
@@ -460,9 +680,17 @@ it.each(["svg", "pdf"].flatMap(format => ["throw", "reject"].map(failure => ({ f
     const { exportFixture } = await import("../dialogs/exportTestFixtures");
     // Preload optional exporters just as the normal user path may; no probe promise is awaited.
     if (format === "pdf") await import("@chemdraft/export-engine/pdf");
-    await send("action", { action: "export", options: { ...exportFixture(), format, filename: `drawing.${format}` } });
-    // Dynamic exporter imports are allowed; native write completion must not depend on diagnostics.
-    for (let i = 0; i < 20 && !fault.mock.calls.length; i++) await act(async () => { await import("../MainWindow"); });
+    // The host emits a terminal receipt after the write and its perf hook. Wait for that
+    // event, with the diagnostic promise still pending and the fake clock untouched.
+    const receipt = new Promise<void>(resolve => {
+      native.publish.mockImplementation(async (_host: string, message: import("../dialogs/dialogProtocol").DialogMessage) => {
+        if (message.type === "result" && (message.data.status === "exported" || message.data.status === "error")) resolve();
+      });
+    });
+    await act(async () => {
+      await send("action", { action: "export", options: { ...exportFixture(), format, filename: `drawing.${format}` } });
+      await receipt;
+    });
     expect(fault).toHaveBeenCalledWith("export-written");
     if (format === "svg") expect(native.writeText).toHaveBeenCalledWith("/exports/drawing.svg", expect.stringContaining("<svg"));
     else {
@@ -478,7 +706,7 @@ it.each(["svg", "pdf"].flatMap(format => ["throw", "reject"].map(failure => ({ f
     await act(async () => { await vi.advanceTimersByTimeAsync(120_001); });
     expect(fault).toHaveBeenCalledTimes(calls);
     expect(localStorage.getItem("chemdraft.perfLog")).toBe(rows);
-  });
+  }, 30_000);
 
 it.each((["documentOpenStarted", "documentOpenCommitted", "documentOpenSkipped", "documentOpenFailed"] as const)
   .flatMap(method => ["throw", "reject"].map(failure => ({ method, failure }))))
@@ -486,9 +714,24 @@ it.each((["documentOpenStarted", "documentOpenCommitted", "documentOpenSkipped",
     await mount(); vi.useFakeTimers();
     const { createNativeSavePayload } = await import("../documentWorkflow");
     native.pickOpen.mockResolvedValue("/drawings/opened.chemdraft");
-    native.readFile.mockResolvedValue(new TextEncoder().encode(createNativeSavePayload(createPhase4Document("Opened drawing")).contents));
+    let bytes = new TextEncoder().encode(createNativeSavePayload(createPhase4Document("Opened drawing")).contents);
+    native.stat.mockImplementation(async () => ({ size: bytes.length }));
+    native.fileClose.mockResolvedValue(undefined);
+    native.fileOpen.mockImplementation(async () => {
+      let offset = 0;
+      return {
+        read: native.fileRead.mockImplementation(async (buffer: Uint8Array) => {
+          if (offset === bytes.length) return null;
+          const count = Math.min(buffer.length, bytes.length - offset);
+          buffer.set(bytes.subarray(offset, offset + count));
+          offset += count;
+          return count;
+        }),
+        close: native.fileClose
+      };
+    });
     if (method === "documentOpenSkipped") await command("document.open");
-    if (method === "documentOpenFailed") native.readFile.mockResolvedValue(new TextEncoder().encode("{ invalid document"));
+    if (method === "documentOpenFailed") bytes = new TextEncoder().encode("{ invalid document");
     let reject!: (error: Error) => void;
     const pending = new Promise<void>((_, fail) => { reject = fail; });
     const fault = vi.spyOn(runtime.perfProbe!, method).mockImplementation(() => {
@@ -497,14 +740,24 @@ it.each((["documentOpenStarted", "documentOpenCommitted", "documentOpenSkipped",
     });
     const start = Date.now();
     await command("document.open");
-    for (let i = 0; i < 20 && !fault.mock.calls.length; i++) await act(async () => { await import("../MainWindow"); });
+    // Native command delivery is fire-and-forget. Observe the completed app action,
+    // allowing imports/IO to finish without advancing diagnostics' fake clock.
+    await vi.waitFor(async () => {
+      await act(async () => {});
+      expect(fault).toHaveBeenCalled();
+      if (method === "documentOpenFailed") expect(container.textContent).toMatch(/failed|invalid|Unexpected/i);
+      else expect(container.textContent).toContain("Opened opened.chemdraft");
+    }, { interval: 0, timeout: 15_000 });
     expect(fault).toHaveBeenCalled(); expect(Date.now()).toBe(start);
     if (method === "documentOpenFailed") expect(container.textContent).toMatch(/failed|invalid|Unexpected/i);
     else {
       expect(container.textContent).toContain("Opened opened.chemdraft");
       expect((window as Window & { __CHEMDRAFT_AGENT__: import("../agentBridge").ChemDraftAgentBridge }).__CHEMDRAFT_AGENT__.snapshot().file.path).toBe("/drawings/opened.chemdraft");
-      expect(native.readFile).toHaveBeenCalledWith("/drawings/opened.chemdraft");
     }
+    expect(native.stat).toHaveBeenCalledWith("/drawings/opened.chemdraft");
+    expect(native.fileOpen).toHaveBeenCalledWith("/drawings/opened.chemdraft", { read: true });
+    expect(native.fileRead).toHaveBeenCalledWith(expect.any(Uint8Array));
+    expect(native.fileClose).toHaveBeenCalledTimes(method === "documentOpenSkipped" ? 2 : 1);
     if (failure === "reject") reject(new Error("open probe rejection"));
     await Promise.resolve(); await Promise.resolve();
     const calls = fault.mock.calls.length, rows = localStorage.getItem("chemdraft.perfLog");
@@ -512,4 +765,4 @@ it.each((["documentOpenStarted", "documentOpenCommitted", "documentOpenSkipped",
     await act(async () => { await vi.advanceTimersByTimeAsync(120_001); });
     expect(fault).toHaveBeenCalledTimes(calls);
     expect(localStorage.getItem("chemdraft.perfLog")).toBe(rows);
-  });
+  }, 30_000);

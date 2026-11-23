@@ -2,7 +2,8 @@
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { type MoleculeObject, type TextObject } from "@chemdraft/chem-core";
+import { type ChemDraftDocument, type MoleculeObject, type TextObject } from "@chemdraft/chem-core";
+import { objectFrameBoundsForPageFit, planTextObjectPlacement, transformPointForObject } from "@chemdraft/layout-engine";
 import { MainWindow } from "./MainWindow";
 import { createPhase4Document, insertNativeArtGraphicObject, insertNativeTextObject, selectDocumentObjects } from "./documentWorkflow";
 import * as workflow from "./documentWorkflow";
@@ -10,6 +11,7 @@ import { beginAssistantTransaction, endAssistantTransaction, writeAssistantTrans
 import { forceDocumentHistoryCommandId } from "./editHistoryRouting";
 import { DOM_COMMAND_EVENT, PALETTE_COMMAND_CANCEL_EVENT, PALETTE_COMMAND_COMMIT_EVENT, PALETTE_COMMAND_PREVIEW_EVENT } from "./window-manager";
 import { moleculeStructureBondColorCommandId } from "./commands";
+import { setNativePromptProvider } from "./nativePrompt";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -22,6 +24,16 @@ describe.each(["macos", "windows"] as const)("text edit history (%s)", platform 
   const captureMethods = ["setPointerCapture", "releasePointerCapture", "hasPointerCapture"] as const;
   let captureDescriptors: Array<PropertyDescriptor | undefined>;
 
+  async function renderDrawing(initialDocument: ChemDraftDocument) {
+    await act(async () => root.render(createElement(MainWindow, {
+      initialDocument, initialPaletteMode: "hidden", nativePalette: true,
+      initialRulersVisible: false, initialCrosshairsVisible: false, shortcutPlatform: platform
+    })));
+    const { width, height } = initialDocument.pages[0];
+    const rect = { x: 0, y: 0, left: 0, top: 0, right: width, bottom: height, width, height, toJSON: () => ({}) } as DOMRect;
+    for (const element of container.querySelectorAll<HTMLElement>(".page, .canvas-region")) element.getBoundingClientRect = () => rect;
+  }
+
   beforeEach(async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     vi.stubGlobal("localStorage", new MemoryStorage());
@@ -31,12 +43,7 @@ describe.each(["macos", "windows"] as const)("text edit history (%s)", platform 
     for (const name of captureMethods) Object.defineProperty(Element.prototype, name, { configurable: true, value: () => false });
     window.history.replaceState(null, "", "/?agentBridge=1");
     container = document.createElement("div"); document.body.append(container); root = createRoot(container);
-    await act(async () => root.render(createElement(MainWindow, {
-      initialDocument: createPhase4Document("Text undo"), initialPaletteMode: "hidden", nativePalette: true,
-      initialRulersVisible: false, initialCrosshairsVisible: false, shortcutPlatform: platform
-    })));
-    const rect = { x: 0, y: 0, left: 0, top: 0, right: 792, bottom: 612, width: 792, height: 612, toJSON: () => ({}) } as DOMRect;
-    for (const element of container.querySelectorAll<HTMLElement>(".page, .canvas-region")) element.getBoundingClientRect = () => rect;
+    await renderDrawing(createPhase4Document("Text undo"));
   });
   afterEach(async () => {
     await act(async () => root.unmount()); container.remove();
@@ -151,7 +158,7 @@ describe.each(["macos", "windows"] as const)("text edit history (%s)", platform 
       expect(texts()[0].width).toBe(106.44);
       if (sizingMode === "fixed-width" || sizingMode === "fixed-size") {
         const frame = editor()!.closest<HTMLElement>(".document-object-chrome")!;
-        expect(frame.style.width).toBe(`${106.44 / drawing.pages[0]!.width * 100}%`);
+        expect(frame.style.width).toBe("106.44px");
       } else assertAutomaticEditorWidth(texts()[0]);
       await type("CCCCCCCCCC"); await pagePress(); await undo();
       expect(texts()[0].width).toBe(106.44);
@@ -161,12 +168,13 @@ describe.each(["macos", "windows"] as const)("text edit history (%s)", platform 
     }
   );
 
-  async function loadText(text: string, style: TextObject["style"] = {}, storedWidth = 106.44, rotation = 0, withGraphics = false) {
-    let drawing = structuredClone(insertNativeTextObject(createPhase4Document("Width regression"), { x: 200, y: 200 }, text,
+  async function loadText(text: string, style: TextObject["style"] = {}, storedWidth = 106.44, rotation = 0, withGraphics = false, x = 200) {
+    let drawing = structuredClone(insertNativeTextObject(createPhase4Document("Width regression"), { x, y: 200 }, text,
       { fontSizePx: 18, ...style }));
     const object = drawing.pages[0]!.objects[0] as TextObject;
     object.width = storedWidth;
     object.rotation = rotation;
+    if (style.textBoxSizingMode) object.style.textBoxSizingMode = style.textBoxSizingMode;
     if (withGraphics) {
       drawing = insertNativeArtGraphicObject(drawing, { x: 400, y: 300 }, "tool.art.rect");
       drawing = insertNativeArtGraphicObject(drawing, { x: 550, y: 300 }, "tool.art.rect");
@@ -189,6 +197,94 @@ describe.each(["macos", "windows"] as const)("text edit history (%s)", platform 
     expect(texts()[0].width).toBeCloseTo(130.14 + 10 * spacing + 6);
     assertAutomaticEditorWidth(texts()[0], 130.14 + 10 * spacing);
   });
+
+  it.each([
+    ["left", 0, 0], ["center", 0.5, 0], ["right", 1, 0], ["right", 1, 30]
+  ] as const)("keeps the %s baseline anchor (%s of width) fixed at %s° while typing and deleting", async (textAlign, fraction, rotation) => {
+    const before = await loadText("CCCCCCCCC", { textAlign }, 123.13, rotation);
+    const anchor = (object: TextObject) => {
+      const radians = rotation * Math.PI / 180;
+      const dx = (fraction - 0.5) * object.width;
+      const dy = 18 - object.height / 2;
+      return {
+        x: object.x + object.width / 2 + dx * Math.cos(radians) - dy * Math.sin(radians),
+        y: object.y + object.height / 2 + dx * Math.sin(radians) + dy * Math.cos(radians)
+      };
+    };
+    const expected = anchor(before);
+    await open(before.id);
+    let previousWidth = before.width;
+    for (const [value, grows] of [["CCCCCCCCCC", true], ["CCCCCCCCCCC\nC", true], ["CCCCCCCCCC", false]] as const) {
+      await type(value);
+      expect(editor()).not.toBeNull();
+      const current = texts()[0];
+      expect(current.text).toBe(value);
+      expect(grows ? current.width > previousWidth : current.width < previousWidth).toBe(true);
+      expect(anchor(current).x).toBeCloseTo(expected.x, 8);
+      expect(anchor(current).y).toBeCloseTo(expected.y, 8);
+      previousWidth = current.width;
+    }
+    const edited = texts()[0];
+    await pagePress();
+    await undo();
+    expect(texts()[0]).toEqual(before);
+    await redo();
+    expect(texts()[0]).toEqual(edited);
+  });
+
+  it("caps right-aligned growth at the left page edge and still shrinks around the same anchor", async () => {
+    const before = await loadText("CCCCCCCCC", { textAlign: "right" });
+    const anchor = before.x + before.width;
+    await open(before.id);
+    await type("C".repeat(60));
+    expect(texts()[0].x).toBeCloseTo(0, 8);
+    expect(texts()[0].width).toBeCloseTo(anchor, 8);
+    await type("C");
+    const shortened = texts()[0];
+    expect(shortened.width).toBeLessThan(before.width);
+    expect(shortened.x + shortened.width).toBeCloseTo(anchor, 8);
+  });
+
+  it.each([["left", 735], ["center", 10], ["right", 10]] as const)(
+    "keeps a 1° %s-aligned box on the page while growing around its anchor", async (textAlign, x) => {
+      const before = await loadText("CC", { textAlign }, 44, 1, false, x);
+      const anchor = (object: TextObject) => transformPointForObject(object, planTextObjectPlacement(object));
+      await open(before.id);
+      await type("C".repeat(20));
+      const after = texts()[0];
+      const bounds = objectFrameBoundsForPageFit(after);
+      expect(after.width).toBeGreaterThan(before.width);
+      expect(bounds.x).toBeGreaterThanOrEqual(-1e-8);
+      expect(bounds.x + bounds.width).toBeLessThanOrEqual(snapshot().document.pages[0].width + 1e-8);
+      expect(bounds.y).toBeGreaterThanOrEqual(-1e-8);
+      expect(bounds.y + bounds.height).toBeLessThanOrEqual(snapshot().document.pages[0].height + 1e-8);
+      expect(anchor(after).x).toBeCloseTo(anchor(before).x, 8);
+      expect(anchor(after).y).toBeCloseTo(anchor(before).y, 8);
+    }
+  );
+
+  it("keeps the position and width of a rotated fixed-width box during reflow and deletion", async () => {
+    const before = await loadText("CCCCCCCCC", { textAlign: "right", textBoxSizingMode: "fixed-width" }, 123.13, 30);
+    const frame = { x: before.x, y: before.y, width: before.width, rotation: before.rotation };
+    await open(before.id);
+    await type("C".repeat(20));
+    expect(texts()[0]).toMatchObject(frame);
+    expect(texts()[0].height).toBeGreaterThan(before.height);
+    await type("C");
+    expect(texts()[0]).toMatchObject({ ...frame, height: before.height });
+  });
+
+  it.each([["left", "C".repeat(42)], ["right", "CCCCCCCCCC\nC"]] as const)(
+    "records no edit when typing and deleting restores a rotated %s-aligned box's content", async (textAlign, typedText) => {
+      const before = await loadText("CCCCCCCCC", { textAlign }, 123.13, 30);
+      await open(before.id);
+      await type(typedText);
+      await type(before.text);
+      await pagePress();
+      expect(texts()[0]).toEqual(before);
+      expect(container.querySelector("main")?.getAttribute("data-can-undo")).toBe("false");
+    }
+  );
 
   it("fits Georgia on old boxes and after typing, preserving the saved frame on reopen", async () => {
     const object = await loadText("HHHHHHHHH", { fontFamily: "Georgia, serif" });
@@ -248,7 +344,7 @@ describe.each(["macos", "windows"] as const)("text edit history (%s)", platform 
     expect(left).toBeCloseTo(200 - anchor * 15.186, 8);
     expect(left + originX!).toBeCloseTo(253.22, 8); // original stored rotation pivot
     expect(originY).toBeCloseTo(object.height / 2, 8);
-    expect(frame.style.top).toBe(`${200 / snapshot().document.pages[0].height * 100}%`);
+    expect(frame.style.top).toBe("200px");
     expect(frame.style.transform).toBe("rotate(30deg)");
     // Evaluate the actual CSS anchor after rotation against the old frame's anchor.
     const localAnchor = anchor * parseFloat(frame.style.width) - originX!;
@@ -381,6 +477,31 @@ describe.each(["macos", "windows"] as const)("text edit history (%s)", platform 
     await undo(); expect(texts()).toEqual([]);
   });
 
+  it.each([
+    ["b", "text.bold"], ["i", "text.italic"], ["u", "text.underline"]
+  ])("routes editor shortcut %s through %s with the button's undo behavior", async (key, id) => {
+    const alpha = await place("Alpha", 200); await place("Beta", 400);
+    const before = structuredClone(texts());
+    const select = async () => act(async () => {
+      editor()!.setSelectionRange(1, 4);
+      editor()!.dispatchEvent(new Event("select", { bubbles: true }));
+    });
+    await open(alpha); await select(); await command(id); await pagePress();
+    const buttonResult = structuredClone(texts());
+    await undo(); expect(texts()).toEqual(before);
+    await open(alpha); await select();
+    const global = vi.fn(); window.addEventListener("keydown", global);
+    const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true,
+      metaKey: platform === "macos", ctrlKey: platform === "windows" });
+    try { await act(async () => editor()!.dispatchEvent(event)); }
+    finally { window.removeEventListener("keydown", global); }
+    expect(event.defaultPrevented).toBe(true);
+    expect(global).not.toHaveBeenCalled();
+    await pagePress(); expect(texts()).toEqual(buttonResult);
+    await undo(); expect(texts()).toEqual(before);
+    await undo(); expect(texts().map(object => object.text)).toEqual(["Alpha"]);
+  });
+
   it("groups typing and selected-range bold into the same Edit Text entry", async () => {
     const alpha = await place("Alpha", 200); await place("Beta", 400);
     const before = texts()[0]; await open(alpha); await type("Alpha123");
@@ -445,6 +566,27 @@ describe.each(["macos", "windows"] as const)("text edit history (%s)", platform 
     await redo(); expect(texts()[0]).toMatchObject({ text: "Alpha", style: { fontWeight: 700 } });
   });
 
+  it("keeps overflowing first typing, text edits and font changes on the original page without asking", async () => {
+    const prompt = vi.fn(async () => "enlarge");
+    const restore = setNativePromptProvider(prompt);
+    try {
+      const before = snapshot().document;
+      const id = await place("Caption line\n".repeat(120), 200);
+      const placed = snapshot().document;
+      expect(placed.pages[0].layout).toEqual(before.pages[0].layout);
+      await undo(); expect(snapshot().document).toEqual(before);
+      await redo(); expect(snapshot().document).toEqual(placed);
+      await open(id);
+      await type("Longer caption line\n".repeat(140));
+      await command("text.size.24");
+      await pagePress();
+      const edited = snapshot().document;
+      expect(edited.pages[0].layout).toEqual(before.pages[0].layout);
+      expect(edited).not.toEqual(placed);
+      expect(prompt).not.toHaveBeenCalled();
+    } finally { restore(); }
+  });
+
   it("finishes before the close prompt, preserves undo on Cancel and drops the snapshot on Discard", async () => {
     const alpha = await place("Alpha", 200); await place("Beta", 400);
     const close = () => act(async () => container.querySelector<HTMLButtonElement>(".document-tab-close")!.click());
@@ -471,6 +613,69 @@ describe.each(["macos", "windows"] as const)("text edit history (%s)", platform 
     expect(texts().map(object => object.text)).toEqual(["N"]);
     await undo(); expect(texts().map(object => object.text)).toEqual(["Alpha"]);
     expect(container.textContent).toContain("Undid Edit Text");
+  });
+
+  it("does not retarget ethane when typing I shrinks a new right-aligned box", async () => {
+    const drawing = workflow.insertNativeSingleBondMolecule(createPhase4Document("Text near ethane"), { x: 300, y: 200 });
+    await act(async () => root.unmount()); container.innerHTML = ""; root = createRoot(container);
+    await renderDrawing(selectDocumentObjects(drawing, drawing.pages[0].id, []));
+    const ethane = snapshot().document.pages[0].objects[0] as MoleculeObject;
+    const atom = ethane.atoms.reduce((left, right) => left.x < right.x ? left : right);
+    await command("text.align.right");
+    await command("text.size.24");
+    await command("tool.text");
+    await pagePress(atom.x - 41.68, atom.y);
+    const placed = texts()[0];
+    expect(placed.style).toMatchObject({ textAlign: "right", fontSizePx: 32 });
+    await type("I");
+    const typed = texts()[0];
+    expect(Math.abs(typed.x - atom.x)).toBeLessThan(workflow.nativeAtomHitRadiusPx);
+    await pagePress();
+    const objects = snapshot().document.pages[0].objects;
+    expect(objects[0]).toEqual(ethane);
+    expect(objects[1]).toMatchObject({ type: "molecule", atoms: [{ element: "I" }] });
+    expect((objects[1] as MoleculeObject).atoms[0]!.x).toBeCloseTo(typed.x + typed.width / 2, 8);
+  });
+
+  it("keeps ethane intact when a blank-space click clamps the placeholder onto a carbon", async () => {
+    const drawing = createPhase4Document("Text at the bottom edge");
+    drawing.pages[0].height = 500;
+    drawing.pages[0].layout!.heightPx = 500;
+    const withEthane = workflow.insertNativeSingleBondMolecule(drawing, { x: 310, y: 452.1 });
+    await act(async () => root.unmount()); container.innerHTML = ""; root = createRoot(container);
+    await renderDrawing(selectDocumentObjects(withEthane, drawing.pages[0].id, []));
+    const ethane = snapshot().document.pages[0].objects[0] as MoleculeObject;
+    await command("text.size.24"); await command("tool.text");
+    await pagePress(300, 497);
+    expect(texts()[0].y).toBeCloseTo(457.6, 8);
+    expect(ethane.atoms[0].x).toBeCloseTo(300, 0);
+    expect(ethane.atoms[0].y).toBeCloseTo(457.6, 8);
+    await type("I"); await pagePress(100, 400);
+    const objects = snapshot().document.pages[0].objects;
+    expect(objects[0]).toEqual(ethane);
+    expect(objects[1]).toMatchObject({ type: "molecule", atoms: [{ element: "I" }], bonds: [] });
+  });
+
+  it("places free Mg at the center of the edited right-aligned frame inside the page", async () => {
+    const drawing = createPhase4Document("Text at the right edge");
+    drawing.pages[0].width = 600;
+    drawing.pages[0].layout!.widthPx = 600;
+    await act(async () => root.unmount()); container.innerHTML = ""; root = createRoot(container);
+    await renderDrawing(drawing);
+    await command("text.align.right"); await command("text.size.24"); await command("tool.text");
+    await pagePress(597, 200);
+    const placed = texts()[0];
+    await type("Mg");
+    const edited = texts()[0];
+    expect(edited.x + edited.width).toBeCloseTo(600, 8);
+    expect(edited.width).toBeGreaterThan(placed.width);
+    await pagePress();
+    expect(texts()).toEqual([]);
+    const molecule = snapshot().document.pages[0].objects[0] as MoleculeObject;
+    expect(molecule.atoms[0].element).toBe("Mg");
+    expect(molecule.atoms[0].x).toBeLessThan(600);
+    expect(molecule.atoms[0].x).toBeCloseTo(edited.x + edited.width / 2, 8);
+    expect(molecule.atoms[0].y).toBeCloseTo(edited.y + edited.height / 2, 8);
   });
 
   it("forced Undo of a just-placed first edit removes the placement without atom conversion", async () => {

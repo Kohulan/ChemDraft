@@ -1,12 +1,24 @@
 export { normalizeAtomIsotope } from "./isotopes";
+export { rGroupNumberFromLabel } from "./rGroups";
+export { bracketPairSemantics, bracketPairUsage, bracketUsageSemantics, importedBracketUsage } from "./bracketSemantics";
+export { bracketPairs, sameBracketIdentity, retainBracketIdentity, withoutBracketPairMetadata,
+  bracketChemistryWarnings, withBracketChemistryWarnings, moleculeBracketWarningMessages } from "./brackets";
+export { isRepeatUnitBoundaryBond, remapImportedRepeatUnitAfterMoleculeMerge, resolveRepeatUnitAtomMembership, type RepeatUnitAtomMembership, type RepeatUnitMembershipOptions } from "./repeatUnitMembership";
+export { rotatePointAboutCenter } from "./pointRotation";
 export { MAX_IMAGE_OBJECT_BYTES } from "./imageBytes";
 export { MAX_IMAGE_SIDE, MAX_IMAGE_DECODED_BYTES, imagePixelLimitError, validatePngImage, validateSvgImage, isSvgImageSource, createImageGraphicObject, readPngInfo, readSvgInfo, type CreateImageGraphicObjectOptions, type ImagePixelInfo } from "./image";
 
 export {
   AnchorSchema,
+  ArrowAttachmentSchema,
+  ArrowAttachmentFrameSchema,
+  type ArrowAttachment,
+  type ArrowAttachmentFrame,
   AnnotationObjectSchema,
   ArrowObjectSchema,
   BracketObjectSchema,
+  CdxmlBracketAtomSnapshotSchema,
+  checkChangedObjectReferences,
   ChemDraftDocumentSchema,
   ChemicalMetadataSchema,
   CompatibilityMetadataSchema,
@@ -65,6 +77,7 @@ export {
   type AnnotationObject,
   type ArrowObject,
   type BracketObject,
+  type CdxmlBracketAtomSnapshot,
   type ChemDraftDocument,
   type ChemicalMetadata,
   type CompatibilityMetadata,
@@ -156,7 +169,12 @@ export {
   migrateDocument,
   migrateLegacyTableObjects,
   parseDocument,
+  prepareNativeDocumentForSerialization,
+  prepareNativeDocumentForSerializationWithWarnings,
+  readDocument,
+  readSerializedDocument,
   serializeDocument,
+  serializeDocumentWithWarnings,
   toIsoTimestamp,
   validateDocument,
   validateDocumentObject,
@@ -164,6 +182,23 @@ export {
   type DocumentValidationIssue,
   type DocumentValidationResult
 } from "./document";
+
+export {
+  minimumAppVersionForDocument,
+  NativeDocumentBaselineAppVersion,
+  NativeDocumentFeatureVersions,
+  NativeDocumentFormatVersion,
+  NativeDocumentReaderVersion,
+  type NativeDocumentFeatureVersion
+} from "./documentFeatures";
+export {
+  NativeDocumentReadError,
+  type NativeDocumentReadResult,
+  type NativeDocumentReadWarning,
+  type NativeDocumentWarningCode
+} from "./documentRead";
+export { compareNativeVersions, type NativeDocumentWriteWarning } from "./nativeCompatibilityState";
+export { copyNativeObjectExtensions, preservedNativeChemistryValues } from "./nativeObjectExtensions";
 
 export {
   DocumentPatchError,
@@ -174,7 +209,11 @@ export {
   isEngineDocument,
   toEngineDocument,
   applyPatches,
+  pruneReactionObjectReferences,
   type ApplyPatchOptions,
+  type OrphanedRepeatUnit,
+  planOrphanedRepeatUnitCleanup,
+  removeOrphanedRepeatUnitBrackets,
   type DocumentPatch,
   type ObjectReorderPlacement
 } from "./patches";
@@ -189,6 +228,11 @@ export {
 
 export {
   ChemDraftSyntheticStylePreset,
+  Acs1996StylePreset,
+  RscJournalStylePreset,
+  NativeStylePresets,
+  SketchStylePreset,
+  type NativeStylePresetId,
   DOCUMENT_STYLE_UNITS_PER_PT,
   DocumentMoleculeSizeStyle,
   DocumentStylePreset,

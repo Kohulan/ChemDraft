@@ -9,9 +9,18 @@ import type { MoleculeInspectorModel } from "../moleculeInspectorModel";
 import type { ToolbarSelectionModel } from "../toolbars/toolbarSelectionKind";
 import { isSpin3dSettings, type Spin3dSettings } from "../spin3dSettings";
 import { isCompoundLayoutSettings, COMPOUND_LAYOUT_STORAGE_KEY, loadCompoundLayoutSettings, type CompoundLayoutSettings } from "../compoundLayoutSettings";
+import { isDrawingSettings, DRAWING_SETTINGS_STORAGE_KEY, loadDrawingSettings, type DrawingSettings } from "../drawingSettings";
+import { ELECTRON_MARK_EDITING_STORAGE_KEY, loadDirectElectronMarkEditing } from "../electronMarkEditingSettings";
 import { isKeybindingSettings, type KeybindingScheme, type KeybindingSettings } from "../keybindingSettings";
 import { migrateLegacyToolsetIds } from "../toolbars/legacyToolsetIds";
-import { listenCurrentWindowEvent, listenTauriEvent } from "./tauriEvents";
+import { listenCurrentWindowEvent, listenTauriEvent, safeTauriWindowListen } from "./tauriEvents";
+import {
+  compareToolsetPopoverOpenings, type AcceptedToolsetPopoverOpening, type ToolsetPopoverDismissPayload,
+  type ToolsetPopoverOpening, type ToolsetFlyoutClosedNotice
+} from "./flyoutOpeningRule";
+
+export { compareToolsetPopoverOpenings } from "./flyoutOpeningRule";
+export type { AcceptedToolsetPopoverOpening, ToolsetPopoverDismissPayload, ToolsetPopoverOpening } from "./flyoutOpeningRule";
 
 export const PALETTE_COMMAND_EVENT = "chemdraft://palette-command";
 export const PALETTE_COMMAND_PREVIEW_EVENT = "chemdraft://palette-command-preview";
@@ -140,6 +149,18 @@ export function isDesktopRuntime(): boolean {
   };
 
   return Boolean(candidate.__TAURI_INTERNALS__ || candidate.__TAURI__);
+}
+
+/** Atomically publish command and native-chooser bounds to this palette/popover. */
+export async function setPaletteCommandHitBoxes(
+  boxes: readonly { x: number; y: number; width: number; height: number }[],
+  chooserRects: readonly { x: number; y: number; width: number; height: number }[] = []
+): Promise<void> {
+  if (!isDesktopRuntime()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("set_palette_command_hit_boxes", {
+    boxes: [...boxes, ...chooserRects.map(rect => ({ ...rect, nativeChooser: true }))]
+  });
 }
 
 export function createPaletteCommandPayload(commandId: string): PaletteCommandPayload {
@@ -299,13 +320,94 @@ export async function prewarmToolsetTooltipWindow(): Promise<void> {
   await invoke("prewarm_toolset_tooltip").catch(() => undefined);
 }
 
-export async function closeToolsetPopoverWindow(toolsetId: string): Promise<void> {
+export async function closeToolsetPopoverWindow(toolsetId: string, openedAt: number | undefined, generation?: number): Promise<void> {
   if (!isDesktopRuntime()) {
     return;
   }
 
+  const opening = { openedAt, generation };
+  const hasNewerOpening = () => {
+    const current = latestToolsetPopoverOpenings.get(toolsetId);
+    return current !== undefined && compareToolsetPopoverOpenings(current, opening) > 0;
+  };
+  // Content registers only after native open completes. Cleanup may close its pending replacement
+  // while the previous opening is still registered, so only a strictly newer opening blocks it.
+  if (hasNewerOpening()) return;
   const { invoke } = await import("@tauri-apps/api/core");
+  // Importing is asynchronous too. Validate immediately before sending the destructive IPC.
+  if (hasNewerOpening()) return;
   await invoke("close_toolset_popover", { toolsetId }).catch(() => undefined);
+  if (openedAt !== undefined) await notifyToolsetPopoverClosed(toolsetId, openedAt, generation);
+  if (!hasNewerOpening()) latestToolsetPopoverOpenings.delete(toolsetId);
+}
+
+function toolsetPopoverWindowLabel(toolsetId: string): string {
+  return `toolset-popover-${toolsetId.replaceAll(".", "-")}`;
+}
+
+function toolsetWindowLabel(toolsetId: string): string {
+  // Match toolset_window_label in the native window manager.
+  return `toolset-${toolsetId.replace(/[^a-zA-Z0-9]/gu, "-")}`;
+}
+
+/** A DOM blur has no related target when focus crosses native webviews. */
+export async function isToolsetPopoverFocusTransfer(toolsetId: string, includeOwner: boolean): Promise<boolean> {
+  if (!isDesktopRuntime()) return false;
+  const [{ invoke }, { getCurrentWindow }] = await Promise.all([
+    import("@tauri-apps/api/core"), import("@tauri-apps/api/window")
+  ]);
+  const focused = await invoke<string | null>("list_toolset_window_states", { foregroundOnly: true });
+  return focused !== null && (focused === toolsetPopoverWindowLabel(toolsetId) ||
+    (includeOwner && (focused === getCurrentWindow().label || focused === toolsetWindowLabel(toolsetId))));
+}
+
+/** OS deactivation and native hides need not pass through the renderer's close notification. */
+export async function isToolsetPopoverVisible(toolsetId: string): Promise<boolean> {
+  if (!isDesktopRuntime()) return false;
+  const { Window } = await import("@tauri-apps/api/window");
+  const popover = await Window.getByLabel(toolsetPopoverWindowLabel(toolsetId));
+  return popover ? popover.isVisible().catch(() => false) : false;
+}
+
+/** Subscribe on the native window, not its renderer: destruction may never notify from JS.
+ * Both events are supplied by Tauri on macOS and Windows. Attach before querying visibility. */
+export async function listenForToolsetPopoverNativeClose(toolsetId: string, closed: () => void): Promise<Unlisten> {
+  if (!isDesktopRuntime()) return () => undefined;
+  const { Window } = await import("@tauri-apps/api/window");
+  const popover = await Window.getByLabel(toolsetPopoverWindowLabel(toolsetId));
+  if (!popover) { closed(); return () => undefined; }
+  const listeners = ["tauri://close-requested", "tauri://destroyed"].map(name =>
+    safeTauriWindowListen(popover, name, closed));
+  const stop = () => listeners.forEach(listener => listener.stop());
+  try {
+    await Promise.all(listeners.map(listener => listener.attached));
+    return stop;
+  } catch (error) {
+    stop();
+    throw error;
+  }
+}
+
+const TOOLSET_POPOVER_CLOSED_EVENT = "chemdraft://toolset-popover-closed";
+interface ToolsetPopoverClosedPayload { toolsetId: string; openedAt: number; generation?: number }
+
+export async function notifyToolsetPopoverClosed(toolsetId: string, openedAt: number, generation?: number): Promise<void> {
+  if (!isDesktopRuntime()) return;
+  const { emit } = await import("@tauri-apps/api/event");
+  await emit(TOOLSET_POPOVER_CLOSED_EVENT, { toolsetId, openedAt, ...(generation === undefined ? {} : { generation }) }).catch(() => undefined);
+}
+
+export async function listenForToolsetPopoverClosed(handler: (payload: ToolsetPopoverClosedPayload) => void): Promise<Unlisten> {
+  if (!isDesktopRuntime()) return () => undefined;
+  return listenTauriEvent<ToolsetPopoverClosedPayload>(TOOLSET_POPOVER_CLOSED_EVENT, event => handler(event.payload));
+}
+
+/** Query the OS: click-away and app deactivation can hide a picker outside its owner's state. */
+export async function isToolsetPopoverWindowVisible(toolsetId: string): Promise<boolean> {
+  if (!isDesktopRuntime()) return false;
+  const { Window } = await import("@tauri-apps/api/window");
+  const popover = await Window.getByLabel(toolsetPopoverWindowLabel(toolsetId));
+  return popover ? popover.isVisible() : false;
 }
 
 /** Route param identifying a palette popover webview (see App.tsx / PalettePopoverWindow). */
@@ -319,9 +421,13 @@ export function toolsetPopoverTimestamp(): number {
   return performance.timeOrigin + performance.now();
 }
 
-export interface ToolsetPopoverDismissPayload {
-  /** Captured synchronously at the originating press, before any asynchronous IPC. */
-  requestedAt: number;
+let popoverGeneration = 0;
+// Owner-local identities are recorded synchronously, before content delivery can yield to a close.
+// Replays of an older opening must not make its delayed close current again.
+const latestToolsetPopoverOpenings = new Map<string, ToolsetPopoverOpening>();
+/** Allocate once at the originating press; startup replays retain this sequence. */
+export function newToolsetPopoverOpening(): Required<ToolsetPopoverOpening> {
+  return { openedAt: toolsetPopoverTimestamp(), generation: ++popoverGeneration };
 }
 
 /**
@@ -331,13 +437,15 @@ export interface ToolsetPopoverDismissPayload {
  * closes when you click anything else" behaviour without depending on macOS key-window semantics.
  * Pass the press timestamp before starting IPC; omit it for an unconditional dismissal.
  */
-export async function dismissToolsetPopovers(requestedAt?: number): Promise<void> {
+export async function dismissToolsetPopovers(requestedAt?: number, reason?: "escape", openings?: ToolsetPopoverDismissPayload["openings"]): Promise<void> {
   if (!isDesktopRuntime()) {
     return;
   }
 
   const { emit } = await import("@tauri-apps/api/event");
-  await emit(TOOLSET_POPOVER_DISMISS_EVENT, requestedAt === undefined ? undefined : { requestedAt }).catch(() => undefined);
+  await emit(TOOLSET_POPOVER_DISMISS_EVENT, requestedAt === undefined ? undefined : {
+    requestedAt, ...(reason ? { reason } : {}), ...(openings ? { openings } : {})
+  }).catch(() => undefined);
 }
 
 export async function listenForToolsetPopoverDismiss(handler: (payload?: ToolsetPopoverDismissPayload) => void): Promise<Unlisten> {
@@ -381,12 +489,8 @@ export interface ToolsetFlyoutSnapshot {
  * so opening the colour picker vs a flyout dropdown just swaps the content in the same window —
  * no per-kind windows to keep in sync, and no way for a stale kind to coexist.
  */
-export type ToolsetPopoverContent = {
-  /** Captured by the opener before any async work, using toolsetPopoverTimestamp().
-   *  Retained on startup replays so a delayed snapshot cannot undo click-away. */
-  openedAt?: number;
-} & (
-  | { kind: "artColor" }
+export type ToolsetPopoverContent = ToolsetPopoverOpening & (
+  | { kind: "artColor" | "textColor" }
   | { kind: "flyout"; flyout: ToolsetFlyoutSnapshot }
 );
 
@@ -401,6 +505,7 @@ export interface ToolsetPopoverAnchor {
 }
 
 export type ToolsetPopoverContentPayload = { toolsetId: string; anchor?: ToolsetPopoverAnchor } & ToolsetPopoverContent;
+type ToolsetPopoverContentNotice = ToolsetPopoverContentPayload | (AcceptedToolsetPopoverOpening & { accepted: true });
 
 const TOOLSET_POPOVER_CONTENT_EVENT = "chemdraft://toolset-popover-content";
 const TOOLSET_POPOVER_CONTENT_REQUEST_EVENT = "chemdraft://toolset-popover-content-request";
@@ -416,6 +521,10 @@ export async function setToolsetPopoverContent(
     return;
   }
 
+  const previous = latestToolsetPopoverOpenings.get(toolsetId);
+  if (!previous || compareToolsetPopoverOpenings(content, previous) >= 0) {
+    latestToolsetPopoverOpenings.set(toolsetId, { openedAt: content.openedAt, generation: content.generation });
+  }
   const { emit } = await import("@tauri-apps/api/event");
   await emit<ToolsetPopoverContentPayload>(TOOLSET_POPOVER_CONTENT_EVENT, { toolsetId, anchor, ...content }).catch(
     () => undefined
@@ -428,7 +537,28 @@ export async function listenForToolsetPopoverContent(
   if (!isDesktopRuntime()) {
     return () => undefined;
   }
-  return listenTauriEvent<ToolsetPopoverContentPayload>(TOOLSET_POPOVER_CONTENT_EVENT, (event) => handler(event.payload));
+  return listenTauriEvent<ToolsetPopoverContentNotice>(TOOLSET_POPOVER_CONTENT_EVENT, ({ payload }) => {
+    if (!("accepted" in payload)) handler(payload);
+  });
+}
+
+/** Popover → keyboard router: publish the identity that the renderer actually accepted. */
+export async function notifyToolsetPopoverContentAccepted(opening: AcceptedToolsetPopoverOpening): Promise<void> {
+  if (!isDesktopRuntime()) return;
+  const { emit } = await import("@tauri-apps/api/event");
+  await emit<ToolsetPopoverContentNotice>(TOOLSET_POPOVER_CONTENT_EVENT, { ...opening, accepted: true });
+}
+
+export async function listenForAcceptedToolsetPopoverContent(
+  handler: (opening: AcceptedToolsetPopoverOpening) => void
+): Promise<Unlisten> {
+  if (!isDesktopRuntime()) return () => undefined;
+  return listenTauriEvent<ToolsetPopoverContentNotice>(TOOLSET_POPOVER_CONTENT_EVENT, ({ payload }) => {
+    if ("accepted" in payload) {
+      const { accepted, ...opening } = payload;
+      handler(opening);
+    }
+  });
 }
 
 /** Popover → palette: "I just mounted, resend my content" — closes the create-vs-emit startup race. */
@@ -452,14 +582,72 @@ export async function listenForToolsetPopoverContentRequests(
   );
 }
 
+/** Navigation stays in the focused document or palette; identify the open so delayed keys cannot
+ * activate a different flyout in the reused popover window. */
+export interface ToolsetFlyoutSession extends AcceptedToolsetPopoverOpening {
+  flyoutId: string;
+}
+export interface ToolsetFlyoutCommandOpening extends ToolsetFlyoutSession {
+  bondStereoSessionId?: string;
+}
+export interface ToolsetFlyoutKey extends ToolsetFlyoutSession {
+  key: string;
+  /** Document-owned E/Z navigation includes its exact session and reverse Tab. */
+  sessionId?: string;
+  shiftKey?: boolean;
+}
+const TOOLSET_FLYOUT_KEY_EVENT = "chemdraft://toolset-flyout-key";
+const TOOLSET_FLYOUT_CLOSED_EVENT = "chemdraft://toolset-flyout-closed";
+const TOOLSET_FLYOUT_OPENING_EVENT = "chemdraft://toolset-flyout-opening";
+
+/** Palette → keyboard router: identify the opening before native IPC can delay its content. */
+export async function notifyToolsetFlyoutOpening(opening: ToolsetFlyoutSession): Promise<void> {
+  if (!isDesktopRuntime()) return;
+  const { emit } = await import("@tauri-apps/api/event");
+  await emit(TOOLSET_FLYOUT_OPENING_EVENT, opening);
+}
+
+export async function listenForToolsetFlyoutOpening(handler: (opening: ToolsetFlyoutSession) => void): Promise<Unlisten> {
+  if (!isDesktopRuntime()) return () => undefined;
+  return listenTauriEvent<ToolsetFlyoutSession>(TOOLSET_FLYOUT_OPENING_EVENT, event => handler(event.payload));
+}
+
+export async function sendToolsetFlyoutKey(payload: ToolsetFlyoutKey): Promise<void> {
+  if (!isDesktopRuntime()) return;
+  const { emit } = await import("@tauri-apps/api/event");
+  await emit(TOOLSET_FLYOUT_KEY_EVENT, payload);
+}
+
+export async function listenForToolsetFlyoutKeys(handler: (payload: ToolsetFlyoutKey) => void): Promise<Unlisten> {
+  if (!isDesktopRuntime()) return () => undefined;
+  return listenTauriEvent<ToolsetFlyoutKey>(TOOLSET_FLYOUT_KEY_EVENT, event => handler(event.payload));
+}
+
+export async function notifyToolsetFlyoutClosed(payload: ToolsetFlyoutClosedNotice): Promise<void> {
+  if (!isDesktopRuntime()) return;
+  const { emit } = await import("@tauri-apps/api/event");
+  await emit(TOOLSET_FLYOUT_CLOSED_EVENT, payload);
+}
+
+export async function listenForToolsetFlyoutClosed(handler: (payload: ToolsetFlyoutClosedNotice) => void): Promise<Unlisten> {
+  if (!isDesktopRuntime()) return () => undefined;
+  return listenTauriEvent<ToolsetFlyoutClosedNotice>(TOOLSET_FLYOUT_CLOSED_EVENT, event => handler(event.payload));
+}
+
 export interface BondStereoPopoverAction {
   sessionId: string;
   action: "geometry" | "flipped" | "keep" | "close";
 }
 const BOND_STEREO_POPOVER_ACTION_EVENT = "chemdraft://bond-stereo-popover-action";
 
-export async function sendBondStereoPopoverAction(payload: BondStereoPopoverAction): Promise<void> {
+export async function sendBondStereoPopoverAction(payload: BondStereoPopoverAction, opening?: ToolsetFlyoutCommandOpening): Promise<void> {
   if (!isDesktopRuntime()) return;
+  if (payload.action !== "close") {
+    if (opening?.bondStereoSessionId === payload.sessionId) {
+      await routeToolsetCommand(payload.action, { flyoutOpening: opening });
+    }
+    return;
+  }
   const { emit } = await import("@tauri-apps/api/event");
   await emit(BOND_STEREO_POPOVER_ACTION_EVENT, payload);
 }
@@ -529,7 +717,7 @@ function isSpin3dSettingsPayload(payload: unknown): payload is Spin3dSettings {
 export const KEYBINDING_SETTINGS_EVENT = "chemdraft://keybinding-settings";
 
 /** Broadcast a keybinding-scheme change so every open window rebuilds its shortcut registry live.
- *  localStorage is the source of truth across reloads; this event is the live-sync channel. */
+ *  The native preference and local cache handle persistence; this event handles live updates. */
 export async function broadcastKeybindingSettings(settings: KeybindingSettings): Promise<void> {
   dispatchDomToolsetEvent(KEYBINDING_SETTINGS_EVENT, settings);
   if (!isDesktopRuntime()) {
@@ -558,14 +746,14 @@ export async function listenForKeybindingSettings(
   };
 }
 
-/** Tell the Rust side to rebuild the native menu with accelerators for the given scheme. */
-export async function pushKeybindingSchemeToNativeMenu(scheme: KeybindingScheme): Promise<void> {
+/** Keep native menu accelerators in step with the shortcut scheme. */
+export async function pushKeybindingSchemeToNativeMenu(scheme: KeybindingScheme, accelerators: Record<string, string | null> = {}): Promise<void> {
   if (!isDesktopRuntime()) {
     return;
   }
 
   const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("set_keybinding_scheme", { scheme }).catch(() => undefined);
+  await invoke("set_keybinding_scheme", { scheme, accelerators }).catch(error => console.error("Could not update menu shortcuts", error));
 }
 
 export async function listToolsetWindowStates(): Promise<ToolsetWindowState[]> {
@@ -618,6 +806,8 @@ export async function loadDocumentSession(): Promise<unknown | undefined> {
 
 /** Persist the working-document autosave envelope. JS owns the shape; Rust writes the opaque
  *  JSON. No-op off the desktop runtime. */
+let pendingDocumentSessionWrite: Promise<void> = Promise.resolve();
+
 /** Autosave ignores a failed write (the previous session stays); `strict` rejects instead, for callers
  *  that are about to end the process and must know the document reached disk. */
 export async function saveDocumentSession(state: unknown, options?: { strict?: boolean }): Promise<void> {
@@ -625,31 +815,38 @@ export async function saveDocumentSession(state: unknown, options?: { strict?: b
     return;
   }
 
-  const { invoke } = await import("@tauri-apps/api/core");
-  const write = invoke("save_document_session", { state });
+  // Native writes run off the main thread. Keep the final quit snapshot behind older autosaves.
+  const write = pendingDocumentSessionWrite.then(async () => {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("save_document_session", { state });
+  });
+  pendingDocumentSessionWrite = write.catch(() => undefined);
   await (options?.strict ? write : write.catch(() => undefined));
 }
 
-/** Emitted by Rust before application-menu Quit / Cmd+Q on macOS, or closing the document
- *  window / File ▸ Exit elsewhere. The listener flushes the pending session autosave and then
- *  calls `confirmQuitAfterFlush`; Rust quits anyway after a short grace period. */
+/** Rust sends the committed phase once quit is irreversible. The listener flushes the session
+ *  autosave and then calls `confirmQuitAfterFlush`; Rust quits anyway after a short grace period. */
 export const QUIT_FLUSH_REQUEST_EVENT = "chemdraft://flush-before-quit";
+export type QuitFlushPhase = "committed";
+type QuitFlushRequest = { phase: QuitFlushPhase; requestId: number };
 
-export async function listenForQuitFlushRequest(handler: () => Promise<void>): Promise<Unlisten> {
+export async function listenForQuitFlushRequest(handler: (phase: QuitFlushPhase, requestId: number) => Promise<void>): Promise<Unlisten> {
   if (!isDesktopRuntime()) {
     return () => undefined;
   }
-  return listenCurrentWindowEvent(QUIT_FLUSH_REQUEST_EVENT, () => {
-    void handler().catch(() => undefined);
+  return listenCurrentWindowEvent<QuitFlushRequest | null>(QUIT_FLUSH_REQUEST_EVENT, ({ payload }) => {
+    if (payload?.phase === "committed" && Number.isSafeInteger(payload.requestId) && payload.requestId > 0) {
+      void handler(payload.phase, payload.requestId).catch(() => undefined);
+    }
   });
 }
 
-export async function confirmQuitAfterFlush(): Promise<void> {
+export async function confirmQuitAfterFlush(requestId: number): Promise<void> {
   if (!isDesktopRuntime()) {
     return;
   }
   const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("quit_after_flush").catch(() => undefined);
+  await invoke("quit_after_flush", { requestId }).catch(() => undefined);
 }
 
 export const QUIT_PROMPT_REQUEST_EVENT = "chemdraft://prompt-before-quit";
@@ -715,7 +912,8 @@ export async function setQuitPromptEnabled(enabled: boolean): Promise<void> {
 }
 export const prepareQuitPrompt = (id: number): Promise<boolean> => quitPromptCommand("prepare_quit_prompt", id);
 export const reportQuitPromptShowing = (id: number): Promise<boolean> => quitPromptCommand("quit_prompt_showing", id);
-export const cancelQuit = (id: number): Promise<boolean> => quitPromptCommand("cancel_quit", id);
+export type QuitCancelOutcome = "cancelled" | "superseded" | "committed";
+export const cancelQuit = (id: number): Promise<QuitCancelOutcome> => quitPromptCommand("cancel_quit", id);
 export const resumeQuitAfterPrompt = (id: number): Promise<boolean> => quitPromptCommand("resume_quit_after_prompt", id);
 export const confirmPromptedQuit = (id: number): Promise<void> => quitPromptCommand("confirm_prompted_quit", id);
 export async function requestQuitAfterClose(): Promise<void> {
@@ -765,7 +963,12 @@ export async function setMenuChecked(commandId: string, checked: boolean): Promi
   await invoke("set_menu_checked", { commandId, checked }).catch(() => undefined);
 }
 
-export async function sendPaletteCommand(commandId: string, options?: { preserveInputFocus: boolean }): Promise<void> {
+interface PaletteCommandOptions {
+  preserveInputFocus?: boolean;
+  flyoutOpening?: ToolsetFlyoutCommandOpening;
+}
+
+export async function sendPaletteCommand(commandId: string, options?: PaletteCommandOptions): Promise<void> {
   return routeToolsetCommand(commandId, options);
 }
 
@@ -790,10 +993,11 @@ const pendingPaletteEvents = new Set<Promise<void>>();
 // resolves after Tauri enqueues the destination eval, before the subsequent invoke.
 export const PALETTE_EVENT_SETTLE_TIMEOUT_MS = 500;
 export function routeToolsetCommand(
-  commandId: string, options?: { preserveInputFocus?: boolean; commit?: boolean }
+  commandId: string, options?: PaletteCommandOptions & { commit?: boolean }
 ): Promise<void> {
   // Single delivery: the invoke routes through Rust `route_toolset_command`, which dispatches the
   // native-command DOM event into the main window (the one listener in `listenForToolsetCommands`).
+  // E/Z choices use the same guard and reach the document's bond-stereo session listener.
   // No client-side `emit` — that used to also fan out over the tauri event bus, so every command
   // arrived several times and needed `dedupeAdjacentCommands` to collapse it.
   const payload = createToolsetCommandPayload(commandId);
@@ -952,14 +1156,12 @@ export async function setCurrentWindowLogicalSize(size: ToolsetWindowSize): Prom
  * Never use this webview's height: content-fit windows would shrink their own cap on every resize. */
 export async function currentWindowLogicalWorkArea(): Promise<MonitorLogicalBounds> {
   if (isDesktopRuntime()) {
-    const { currentMonitor } = await import("@tauri-apps/api/window");
-    const monitor = await currentMonitor().catch(() => null);
-    if (monitor) {
-      const scale = monitor.scaleFactor > 0 ? monitor.scaleFactor : 1;
-      const area = monitor.workArea;
-      const left = area.position.x / scale;
-      const top = area.position.y / scale;
-      return { left, top, right: left + area.size.width / scale, bottom: top + area.size.height / scale };
+    // Native command, not `currentMonitor()`: the plugin builds monitors off the main thread, which
+    // crashes GTK/X11 builds (see monitor_query.rs).
+    const { invoke } = await import("@tauri-apps/api/core");
+    const area = await invoke<MonitorLogicalBounds | null>("current_window_logical_work_area").catch(() => null);
+    if (area) {
+      return area;
     }
   }
   const screen = window.screen as Screen & { availLeft?: number; availTop?: number };
@@ -983,40 +1185,47 @@ export async function listenForCurrentWindowWorkAreaChanges(handler: () => void)
   };
 }
 
-/** Preserve the top-left across macOS content resizes, then keep the whole palette on its monitor. */
-export async function fitCurrentPaletteWindow(size: ToolsetWindowSize, area: MonitorLogicalBounds): Promise<void> {
-  const position = await currentWindowLogicalPosition();
-  const height = Math.min(size.height, area.bottom - area.top);
-  await setCurrentWindowLogicalSize({ width: size.width, height });
-  if (!position) return;
-  const target = {
-    x: Math.max(area.left, Math.min(position.x, area.right - size.width)),
-    y: Math.max(area.top, Math.min(position.y, area.bottom - height))
-  };
-  const resizedPosition = await currentWindowLogicalPosition();
-  if (resizedPosition?.x !== target.x || resizedPosition?.y !== target.y) {
-    await setCurrentWindowLogicalPosition(target);
+/** Ask native placement to constrain the inspector's current frame on its destination monitor. */
+export async function clampCurrentInspectorFrame(): Promise<void> {
+  if (!isDesktopRuntime()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("clamp_current_inspector_frame");
+}
+
+/** Fit to content and return whether the native resize was applied. */
+export async function fitCurrentPaletteWindow(size: ToolsetWindowSize, area: MonitorLogicalBounds): Promise<boolean> {
+  if (isDesktopRuntime()) {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return invoke<boolean>("resize_toolset_window", { width: size.width, height: Math.min(size.height, area.bottom - area.top) });
   }
+  return true;
 }
 
 /**
  * Reveal the calling palette popover above the palette it belongs to. Rust shows it and then raises
  * it among the document's owned windows: the JS window `show()` alone left it underneath its palette
  * on Windows whenever the two overlapped. Falls back to that plain `show()` if the command is
- * unavailable for focusable popovers. A preserve-focus open must never fall back to an activating show.
+ * unavailable for focusable pickers. Flyouts register their identity with the native show command.
+ * Returns whether the native window became visible.
  */
-export async function showCurrentToolsetPopoverWindow(focusMode: ToolsetPopoverFocusMode = "focus", kind?: ToolsetPopoverContent["kind"]): Promise<void> {
+export async function showCurrentToolsetPopoverWindow(
+  focusMode: ToolsetPopoverFocusMode = "focus", kind?: ToolsetPopoverContent["kind"], flyoutOpening?: ToolsetFlyoutCommandOpening
+): Promise<boolean> {
   if (!isDesktopRuntime()) {
-    return;
+    return false;
   }
 
   const { invoke } = await import("@tauri-apps/api/core");
   try {
-    await invoke("show_toolset_popover_window", { focusMode, ...(kind ? { kind } : {}) });
+    return await invoke<boolean>("show_toolset_popover_window", {
+      focusMode, ...(kind ? { kind } : {}), ...(flyoutOpening ? { flyoutOpening } : {})
+    });
   } catch (error) {
-    if (focusMode === "preserve") throw error;
+    if (focusMode === "preserve" || flyoutOpening) throw error;
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
-    await getCurrentWindow().show();
+    const window = getCurrentWindow();
+    await window.show();
+    return window.isVisible();
   }
 }
 
@@ -1491,19 +1700,10 @@ export async function monitorLogicalBoundsAt(
   if (!isDesktopRuntime()) {
     return undefined;
   }
-  const { availableMonitors } = await import("@tauri-apps/api/window");
-  const monitors = await availableMonitors().catch(() => []);
-  for (const monitor of monitors) {
-    const scale = monitor.scaleFactor > 0 ? monitor.scaleFactor : 1;
-    const left = monitor.position.x / scale;
-    const top = monitor.position.y / scale;
-    const right = left + monitor.size.width / scale;
-    const bottom = top + monitor.size.height / scale;
-    if (x >= left && x < right && y >= top && y < bottom) {
-      return { left, top, right, bottom };
-    }
-  }
-  return undefined;
+  // Native command, not `availableMonitors()`: see currentWindowLogicalWorkArea.
+  const { invoke } = await import("@tauri-apps/api/core");
+  const bounds = await invoke<MonitorLogicalBounds | null>("monitor_logical_bounds_at", { x, y }).catch(() => null);
+  return bounds ?? undefined;
 }
 
 export async function hidePaletteFloatingTooltip(): Promise<void> {
@@ -1654,6 +1854,58 @@ async function invokeToolsetWindow(commandName: string, toolsetId: string): Prom
 }
 
 export const COMPOUND_LAYOUT_SETTINGS_EVENT = "chemdraft://compound-layout-settings";
+
+export const DRAWING_SETTINGS_EVENT = "chemdraft://drawing-settings";
+
+export async function broadcastDrawingSettings(settings: DrawingSettings): Promise<void> {
+  dispatchDomToolsetEvent(DRAWING_SETTINGS_EVENT, settings);
+  if (!isDesktopRuntime()) return;
+  const { emit } = await import("@tauri-apps/api/event");
+  await emit<DrawingSettings>(DRAWING_SETTINGS_EVENT, settings);
+}
+
+export async function listenForDrawingSettings(handler: (settings: DrawingSettings) => void): Promise<Unlisten> {
+  const onStorage = (event: StorageEvent) => {
+    if (event.key === DRAWING_SETTINGS_STORAGE_KEY || event.key === null) handler(loadDrawingSettings());
+  };
+  globalThis.addEventListener?.("storage", onStorage);
+  const removeStorage = () => globalThis.removeEventListener?.("storage", onStorage);
+  const unlistenDom = listenForDomToolsetEvent(DRAWING_SETTINGS_EVENT, event => {
+    if (isDrawingSettings(event.detail)) handler(event.detail);
+  });
+  if (!isDesktopRuntime()) return () => { unlistenDom(); removeStorage(); };
+  const unlistenTauri = await listenTauriEvent<DrawingSettings>(DRAWING_SETTINGS_EVENT, event => {
+    if (isDrawingSettings(event.payload)) handler(event.payload);
+  });
+  return () => { removeStorage(); unlistenDom(); unlistenTauri(); };
+}
+
+export const ELECTRON_MARK_EDITING_SETTINGS_EVENT = "chemdraft://electron-mark-editing-settings";
+
+export async function broadcastElectronMarkEditingSettings(enabled: boolean): Promise<void> {
+  dispatchDomToolsetEvent(ELECTRON_MARK_EDITING_SETTINGS_EVENT, enabled);
+  if (!isDesktopRuntime()) return;
+  const { emit } = await import("@tauri-apps/api/event");
+  await emit(ELECTRON_MARK_EDITING_SETTINGS_EVENT, enabled);
+}
+
+export async function listenForElectronMarkEditingSettings(handler: (enabled: boolean) => void): Promise<Unlisten> {
+  const onStorage = (event: StorageEvent) => {
+    if (event.key === ELECTRON_MARK_EDITING_STORAGE_KEY || event.key === null) handler(loadDirectElectronMarkEditing());
+  };
+  globalThis.addEventListener?.("storage", onStorage);
+  const unlistenDom = listenForDomToolsetEvent(ELECTRON_MARK_EDITING_SETTINGS_EVENT, event => {
+    if (typeof event.detail === "boolean") handler(event.detail);
+  });
+  const unlistenTauri = isDesktopRuntime() ? await listenTauriEvent<boolean>(ELECTRON_MARK_EDITING_SETTINGS_EVENT, event => {
+    if (typeof event.payload === "boolean") handler(event.payload);
+  }) : undefined;
+  return () => {
+    globalThis.removeEventListener?.("storage", onStorage);
+    unlistenDom();
+    unlistenTauri?.();
+  };
+}
 
 export async function broadcastCompoundLayoutSettings(settings: CompoundLayoutSettings): Promise<void> {
   dispatchDomToolsetEvent(COMPOUND_LAYOUT_SETTINGS_EVENT, settings);

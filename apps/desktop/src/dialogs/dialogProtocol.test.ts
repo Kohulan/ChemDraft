@@ -158,3 +158,33 @@ it("validates the template picker snapshot and its restricted actions", () => {
   }
   expect(parseDialogMessage({ ...message, type: "result", data: { status: "inserted" } })).toBeDefined();
 });
+
+it("validates bounded conditions drafts and rejects extra fields and mismatched actions",()=>{
+  const draft={side:"above",spans:[{text:"K",script:"normal"},{text:"2",script:"subscript"},{text:"CO3",script:"normal"}]};
+  const conditions={...snapshot(),dialogKind:"reactionConditions",data:{title:"Drawing",arrowId:"arrow",draft}};
+  expect(parseDialogMessage(conditions)).toEqual(conditions);
+  expect(parseDialogMessage({...conditions,type:"action",data:{action:"apply",draft}})).toBeDefined();
+  for(const data of [{action:"apply",width:1,height:1,unit:"inch"},{action:"apply",draft:{...draft,path:"private"}},
+    {action:"apply",draft:{side:"above",spans:[{text:"x",script:"html"}]}},
+    {action:"apply",draft:{side:"above",spans:[{text:"x".repeat(2001),script:"normal"}]}},
+    {action:"cancel",draft}])
+    expect(parseDialogMessage({...conditions,type:"action",data})).toBeUndefined();
+});
+
+describe("ready from a content-fit window", () => {
+  // Every kind whose window reports its measured size (fit_content in dialog_windows.rs, a form that
+  // hands DialogWindow its root). About and Structure Templates send an empty ready and are not here.
+  const measuring = ["pageSize", "pageEnlargement", "arrangementSpacing", "reactionConditions", "export", "engineInstall", "toolInstall",
+    "customColor", "insertTable", "atomProblem", "vibeCodeGuide", "guidedTour"] as const;
+  const ready = (dialogKind: string, data: unknown) => ({ ...snapshot(), dialogKind, type: "ready", data });
+  it.each(measuring)("%s accepts an empty ready or a valid measurement, and nothing else", dialogKind => {
+    expect(parseDialogMessage(ready(dialogKind, {}))).toBeDefined();
+    expect(parseDialogMessage(ready(dialogKind, { contentHeight: 412, contentWidth: 520, pixelRatio: 2 }))).toBeDefined();
+    expect(parseDialogMessage(ready(dialogKind, { contentHeight: 412, pixelRatio: 1 }))).toBeDefined();
+    for (const data of [{ contentHeight: 0, pixelRatio: 1 }, { contentHeight: 5000, pixelRatio: 1 }, { contentHeight: Number.NaN, pixelRatio: 1 },
+      { contentHeight: 412, pixelRatio: 9 }, { contentHeight: 412 }, { contentHeight: 412, pixelRatio: 1, extra: 1 },
+      { contentHeight: "412", pixelRatio: 1 }, { contentHeight: 412, contentWidth: 0, pixelRatio: 1 }]) {
+      expect(parseDialogMessage(ready(dialogKind, data)), JSON.stringify(data)).toBeUndefined();
+    }
+  });
+});

@@ -1,0 +1,16 @@
+# Monitor lookups go through monitor_query.rs, which runs them on the main thread on Linux.
+# Tauri builds each Monitor with GTK/Xlib calls on the caller's thread; from a worker thread that
+# aborted ChemDraft on Ubuntu 22.04 ("[xcb] Unknown request in queue while dequeuing").
+disallowed-methods = [
+  { path = "tauri::app::AppHandle::available_monitors", reason = "use monitor_query::available_monitors" },
+  { path = "tauri::app::AppHandle::primary_monitor", reason = "use monitor_query::primary_monitor" },
+  { path = "tauri::app::AppHandle::monitor_from_point", reason = "add a main-thread helper to monitor_query" },
+  { path = "tauri::window::Window::current_monitor", reason = "use monitor_query::current_monitor" },
+  { path = "tauri::window::Window::available_monitors", reason = "use monitor_query::available_monitors" },
+  { path = "tauri::window::Window::primary_monitor", reason = "use monitor_query::primary_monitor" },
+  { path = "tauri::window::Window::monitor_from_point", reason = "add a main-thread helper to monitor_query" },
+  { path = "tauri::webview::WebviewWindow::current_monitor", reason = "use monitor_query::current_monitor" },
+  { path = "tauri::webview::WebviewWindow::available_monitors", reason = "use monitor_query::available_monitors" },
+  { path = "tauri::webview::WebviewWindow::primary_monitor", reason = "use monitor_query::primary_monitor" },
+  { path = "tauri::webview::WebviewWindow::monitor_from_point", reason = "add a main-thread helper to monitor_query" },
+]

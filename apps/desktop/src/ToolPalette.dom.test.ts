@@ -2,11 +2,14 @@
 
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { ToolsetRegistry } from "@chemdraft/toolset-registry";
 import { applyPatches, createEmptyDocument, type MoleculeObject } from "@chemdraft/chem-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createPhase4Document, insertNativeArtGraphicObject } from "./documentWorkflow";
+import { applyGraphicWaveSettingToSelection, createPhase4Document, applyChargeToolAtPoint, insertNativeArtGraphicObject, selectDocumentObjects } from "./documentWorkflow";
 import { createArtInspectorModel, selectedGraphicObjectsForArtInspector } from "./artInspectorModel";
-import { ToolPalette, titleMonogram } from "./ToolPalette";
+import { ToolPalette, titleMonogram, TOOLBAR_FLYOUT_HOLD_MS } from "./ToolPalette";
 import { toolbarAsset } from "./toolbarAssets";
 import { createMoleculeInspectorModel } from "./moleculeInspectorModel";
 import {
@@ -20,10 +23,188 @@ import {
   moleculeStructureBondLengthCommandId,
   type CommandSpec
 } from "./commands";
-import { getToolsetCommandGroups, getToolsetItemGroups, type ToolbarPaletteGroupModel, type ToolbarPaletteItemModel } from "./toolsets";
+import { computePaletteGridSize, getToolsetCommandGroups, getToolsetItemGroups, initialToolsetWindowSize, type DesktopToolsetDefinition, type ToolbarPaletteGroupModel, type ToolbarPaletteItemModel } from "./toolsets";
 import { ToolbarCustomizeController } from "./toolbars/CustomizeMainToolbar/ToolbarCustomizeController";
+import { createToolbarCatalog } from "./toolbars/toolbarCatalog";
+import { filterToolbarCustomizationCommands } from "./toolbars/toolbarCustomizationCommands";
+import { cloneToolset, createCommandToolbarItem } from "./toolbars/CustomizeToolbars/layoutStateEdits";
+import { CommandRegistry } from "@chemdraft/plugin-host";
+import { createPluginRuntime } from "./plugins/createPluginRuntime";
+import { FIXTURE_PLUGIN_ID, FIXTURE_PLUGIN_PING_COMMAND_ID, FIXTURE_PLUGIN_TOOLSET_ID, createFixturePluginOptions, fixturePluginManifest } from "./plugins/fixturePlugin";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+it.each(["core.art", "core.ringInspector", "core.drawnStructureSettings", "core.molecularInspector"])(
+  "renders and invokes added commands in %s alongside its widget",
+  toolsetId => {
+    const catalog = createToolbarCatalog();
+    const groupId = catalog.registry().require(toolsetId).groups[0].id!;
+    const command: CommandSpec = { id: "edit.undo", title: "Undo", icon: "undo", enabled: true };
+    catalog.setLayoutState({ version: 1, userToolsets: [], toolsetOverrides: [{
+      toolsetId, itemAdditions: [{ groupId, item: createCommandToolbarItem(command) }]
+    }] });
+    const itemGroups = getToolsetItemGroups(toolsetId, catalog.registry(), new Map([[command.id, command]]));
+    expect(itemGroups.flat().some(item => item.id === command.id)).toBe(true);
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const onInvoke = vi.fn();
+    try {
+      act(() => root.render(createElement(ToolPalette, { itemGroups, orientation: "horizontal", mode: "floating", onInvoke })));
+      const buttons = container.querySelectorAll<HTMLButtonElement>('[data-command-id="edit.undo"]');
+      expect(buttons).toHaveLength(1);
+      act(() => buttons[0]!.click());
+      expect(onInvoke).toHaveBeenCalledExactlyOnceWith(command.id);
+    } finally {
+      act(() => root.unmount());
+      container.remove();
+    }
+  }
+);
+
+it("renders and invokes the added Undo button in a cloned Art toolbar", () => {
+  const catalog = createToolbarCatalog();
+  const toolsetId = "core.art";
+  const groupId = catalog.registry().require(toolsetId).groups[0]!.id!;
+  const command: CommandSpec = { id: "edit.undo", title: "Undo", icon: "undo", enabled: true };
+  const state = { version: 1 as const, userToolsets: [], toolsetOverrides: [{
+    toolsetId, itemAdditions: [{ groupId, item: createCommandToolbarItem(command) }]
+  }] };
+  catalog.setLayoutState(state);
+  const clone = cloneToolset(state, catalog.registry().require(toolsetId));
+  catalog.setLayoutState(clone.state);
+  const itemGroups = getToolsetItemGroups(clone.toolsetId, catalog.registry(), new Map([[command.id, command]]));
+  const container = document.createElement("div");
+  const root = createRoot(container);
+  const onInvoke = vi.fn();
+  try {
+    act(() => root.render(createElement(ToolPalette, { itemGroups, orientation: "horizontal", mode: "floating", onInvoke })));
+    const buttons = container.querySelectorAll<HTMLButtonElement>('[aria-label="Added commands"] [data-command-id="edit.undo"]');
+    expect(buttons).toHaveLength(1);
+    expect(container.querySelector("[data-art-command-grid] [data-command-id]")).not.toBeNull();
+    act(() => buttons[0]!.click());
+    expect(onInvoke).toHaveBeenCalledExactlyOnceWith(command.id);
+  } finally {
+    act(() => root.unmount());
+  }
+});
+
+it("keeps the Molecular Inspector grip beside its pane and reserves pane height with added commands", () => {
+  const catalog = createToolbarCatalog();
+  const toolsetId = "core.molecularInspector";
+  const groupId = catalog.registry().require(toolsetId).groups[0]!.id!;
+  const stylesheet = document.createElement("style");
+  stylesheet.textContent = readFileSync(fileURLToPath(import.meta.url).replace(/ToolPalette\.dom\.test\.ts$/, "App.css"), "utf8");
+  document.head.append(stylesheet);
+  const shell = document.createElement("div");
+  shell.className = "palette-window-shell";
+  shell.dataset.resizable = "";
+  document.body.append(shell);
+  const root = createRoot(shell);
+  const renderInspector = () => {
+    const itemGroups = getToolsetItemGroups(toolsetId, catalog.registry());
+    act(() => root.render(createElement(ToolPalette, { itemGroups, orientation: "horizontal", mode: "floating", onInvoke: vi.fn() })));
+    return shell.querySelector<HTMLElement>(".molecular-inspector-palette")!;
+  };
+  try {
+    const inspector = renderInspector();
+    expect(getComputedStyle(inspector).display).toBe("flex");
+    expect(getComputedStyle(inspector).flexDirection).not.toBe("column");
+
+    catalog.setLayoutState({ version: 1, toolsetOverrides: [{
+      toolsetId, itemAdditions: [{ groupId, item: { commandId: "edit.undo" } }]
+    }] });
+    renderInspector();
+    expect(getComputedStyle(inspector).display).toBe("grid");
+    expect(getComputedStyle(inspector).gridTemplateRows).toBe("minmax(34px, 1fr) auto");
+    expect(getComputedStyle(inspector.querySelector(".palette-content-drag-grip")!).gridColumn).toBe("1");
+    expect(getComputedStyle(inspector.querySelector(".molecular-inspector-pane")!).minHeight).toBe("34px");
+  } finally {
+    act(() => root.unmount());
+    shell.remove();
+    stylesheet.remove();
+  }
+});
+
+it("sizes horizontal toolbar windows from the Art clone's grid or the plugin grid", () => {
+  const catalog = createToolbarCatalog();
+  const art = catalog.registry().require("core.art");
+  const clone = cloneToolset({ version: 1, toolsetOverrides: [], userToolsets: [] }, art);
+  catalog.setLayoutState(clone.state);
+  const artCopy = catalog.registry().require(clone.toolsetId);
+  const artGroups = getToolsetItemGroups(artCopy.id, catalog.registry());
+  expect(initialToolsetWindowSize(artCopy, artGroups)).toEqual(computePaletteGridSize(artCopy.gridLayout, artGroups));
+
+  const plugin: DesktopToolsetDefinition = {
+    id: "plugin.sizing", title: "Sizing", source: "plugin", defaultVisible: true, defaultMode: "floating",
+    gridLayout: { orientation: "horizontal", columns: 6, rows: 1, cellWidth: 24, cellHeight: 24, gap: 4, padding: 4 },
+    groups: [{ items: [{ commandId: "plugin.sizing.run" }] }]
+  };
+  const registry = new ToolsetRegistry([plugin]);
+  expect(initialToolsetWindowSize(plugin, getToolsetItemGroups(plugin.id, registry))).toEqual({ width: 172, height: 32 });
+});
+
+it("fits the stock Text toolbar's style controls in its initial window width", () => {
+  const registry = createToolbarCatalog().registry();
+  const toolset = registry.require("core.text");
+  const itemGroups = getToolsetItemGroups(toolset.id, registry);
+  const gridWidth = computePaletteGridSize(toolset.gridLayout, itemGroups)!.width;
+  const { width } = initialToolsetWindowSize(toolset, itemGroups);
+
+  // The Text Tool grid sits beside the font, size and color controls, with two 4px gaps.
+  expect(width).toBeGreaterThanOrEqual(gridWidth + 170 + 70 + 82 + 2 * 4);
+});
+
+it.each(["user", "plugin"] as const)("sizes a horizontal %s toolbar for two side-by-side six-column groups", source => {
+  const toolset: DesktopToolsetDefinition = {
+    id: `${source}.sizing`, title: "Sizing", source, defaultVisible: true, defaultMode: "floating",
+    gridLayout: { orientation: "horizontal", columns: 6, rows: 1, cellWidth: 24, cellHeight: 24, gap: 4, padding: 4 },
+    groups: [
+      { items: [{ commandId: "edit.undo" }] },
+      { items: [{ commandId: "edit.redo" }] }
+    ]
+  };
+  const itemGroups = getToolsetItemGroups(toolset.id, new ToolsetRegistry([toolset]));
+  expect(initialToolsetWindowSize(toolset, itemGroups)).toEqual({ width: 350, height: 32 });
+});
+
+it.each(["macos", "windows"] as const)("disables the original and copied plugin buttons after their handler is removed on %s", platform => {
+  const runtime = createPluginRuntime({ commandRegistry: new CommandRegistry(), getActiveDocument: () => undefined });
+  runtime.registerPlugin(fixturePluginManifest, createFixturePluginOptions());
+  const catalog = createToolbarCatalog();
+  catalog.setPluginToolsets(runtime.listPluginToolsets(), runtime.listPluginCommandsWithHandlers());
+  const layoutId = "core.layout";
+  const commandId = FIXTURE_PLUGIN_PING_COMMAND_ID;
+  catalog.setLayoutState({ version: 1, toolsetOverrides: [{
+    toolsetId: layoutId, itemAdditions: [{ groupId: "core.layout.tools", item: { commandId } }]
+  }] });
+  const container = document.createElement("div");
+  const root = createRoot(container);
+  const onInvoke = vi.fn();
+  const renderButtons = () => {
+    const commandOverrides = new Map(catalog.baseCommands().map(command => [command.id, command]));
+    act(() => root.render([FIXTURE_PLUGIN_TOOLSET_ID, layoutId].map(toolsetId => createElement(ToolPalette, {
+      key: toolsetId, itemGroups: getToolsetItemGroups(toolsetId, catalog.registry(), commandOverrides),
+      mode: "floating", platform, onInvoke
+    }))));
+    return Array.from(container.querySelectorAll<HTMLButtonElement>(`[data-command-id="${commandId}"]`));
+  };
+  try {
+    expect(renderButtons().map(button => button.disabled)).toEqual([false, false]);
+    runtime.replacePlugin(FIXTURE_PLUGIN_ID, fixturePluginManifest, { commandHandlers: {} });
+    catalog.setPluginToolsets(runtime.listPluginToolsets(), runtime.listPluginCommandsWithHandlers());
+    const buttons = renderButtons();
+    expect(buttons.map(button => button.disabled)).toEqual([true, true]);
+    for (const button of buttons) {
+      expect(button.getAttribute("aria-label")).toContain("Plugin command has no registered handler");
+      act(() => button.click());
+    }
+    expect(onInvoke).not.toHaveBeenCalled();
+    expect(filterToolbarCustomizationCommands(catalog.baseCommands(), { enabled: false }).map(command => command.id)).not.toContain(commandId);
+  } finally {
+    act(() => root.unmount());
+  }
+});
 
 // Phase 5: widgets are declared as manifest `control` items and read their state from context. This
 // isolates just a toolset's widget item (no grid commands), the way the old `groups: []` +
@@ -31,6 +212,50 @@ import { ToolbarCustomizeController } from "./toolbars/CustomizeMainToolbar/Tool
 function widgetOnlyItemGroups(toolsetId: string): ToolbarPaletteItemModel[][] {
   return [getToolsetItemGroups(toolsetId).flat().filter((item) => item.primary.type === "control")];
 }
+
+describe.each(["macos", "windows"] as const)("command pointer focus on %s", platform => {
+  it("retains the 200 ms hold and invokes a subsequent short Charge press exactly once", async () => {
+    vi.useFakeTimers();
+    const container = document.createElement("div"); document.body.append(container);
+    const root = createRoot(container);
+    const onInvoke = vi.fn(), onRequestFlyout = vi.fn();
+    const editor = document.createElement("input"); document.body.append(editor); editor.focus();
+    try {
+      await act(async () => root.render(createElement(ToolPalette, {
+        itemGroups: getToolsetItemGroups("core.main"), onInvoke, onRequestFlyout, platform
+      })));
+      const button = container.querySelector<HTMLButtonElement>('[data-command-id="tool.charge"]')!;
+      expect(button).not.toBeNull();
+      const press = async (type: string) => {
+        const event = new MouseEvent(type, { bubbles: true, cancelable: true, button: 0 });
+        await act(async () => button.dispatchEvent(event));
+        return event;
+      };
+      expect((await press("pointerdown")).defaultPrevented).toBe(platform === "windows");
+      const mouseDown = await press("mousedown");
+      expect(mouseDown.defaultPrevented).toBe(platform === "windows");
+      // jsdom has no native mouse-focus default. Model that default only when
+      // permitted; real WebView2 activation remains a Windows hands-on check.
+      if (!mouseDown.defaultPrevented) await act(async () => button.focus());
+      expect(document.activeElement).toBe(platform === "windows" ? editor : button);
+      await act(async () => vi.advanceTimersByTimeAsync(TOOLBAR_FLYOUT_HOLD_MS - 1));
+      expect(onRequestFlyout).not.toHaveBeenCalled();
+      await act(async () => vi.advanceTimersByTimeAsync(1));
+      expect(onRequestFlyout).toHaveBeenCalledTimes(1);
+      await act(async () => vi.advanceTimersByTimeAsync(150));
+      await press("pointerup"); await press("click");
+      expect(onInvoke).not.toHaveBeenCalled();
+      await press("pointerdown"); await press("mousedown");
+      await act(async () => vi.advanceTimersByTimeAsync(30));
+      await press("pointerup"); await press("click");
+      expect(onInvoke).toHaveBeenCalledExactlyOnceWith("tool.charge");
+      await act(async () => vi.advanceTimersByTimeAsync(650));
+      expect(onRequestFlyout).toHaveBeenCalledTimes(1);
+    } finally {
+      await act(async () => root.unmount()); container.remove(); editor.remove(); vi.useRealTimers();
+    }
+  });
+});
 
 function artInspectorModelFor(commandId: string) {
   const document = insertNativeArtGraphicObject(
@@ -154,21 +379,25 @@ describe("ToolPalette art color popover", () => {
 
   function renderPalette({
     commandId = "tool.art.rect",
+    includeGrid = false,
     currentArtStyle = artInspectorModelFor(commandId),
     onCancel = vi.fn(),
-    onRequestColorPopover
+    onRequestColorPopover,
+    includeCommands = false
   }: {
     commandId?: string;
+    includeGrid?: boolean;
     currentArtStyle?: ReturnType<typeof createArtInspectorModel>;
     onCancel?: () => void;
     onRequestColorPopover?: (anchor: { left: number; top: number; right: number; bottom: number }) => void;
+    includeCommands?: boolean;
   } = {}) {
     const onInvoke = vi.fn();
     const onPreview = vi.fn();
     const onCommit = vi.fn();
     act(() => {
       root.render(createElement(ToolPalette, {
-        itemGroups: widgetOnlyItemGroups("core.art"),
+        itemGroups: includeGrid || includeCommands ? getToolsetItemGroups("core.art") : widgetOnlyItemGroups("core.art"),
         activeTool: "tool.select",
         orientation: "horizontal",
         onInvoke,
@@ -184,7 +413,7 @@ describe("ToolPalette art color popover", () => {
         }
       }));
     });
-    return { onCommit, onInvoke, onPreview };
+    return { onCommit, onInvoke, onPreview, onCancel };
   }
 
   function colorTrigger(): HTMLButtonElement {
@@ -229,6 +458,121 @@ describe("ToolPalette art color popover", () => {
       })
     });
   }
+
+  it("previews wave sliders, commits once on release, and supports keyboard bounds", () => {
+    const { onPreview, onCommit, onCancel } = renderPalette({ currentArtStyle: artInspectorModelFor("tool.art.lineWavy") });
+    for (const [setting, max] of [["smoothness", "100"], ["height", "48"], ["width", "120"]]) {
+      const slider = container.querySelector<HTMLInputElement>(`[aria-label="Wave ${setting}"]`)!;
+      expect(slider).not.toBeNull();
+      expect(slider.type).toBe("range");
+      expect(slider.max).toBe(max);
+      act(() => { slider.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true })); });
+      expect(onCommit).toHaveBeenLastCalledWith(`object.wave.${setting}:${max}`);
+    }
+    onCommit.mockClear();
+    const height = container.querySelector<HTMLInputElement>('[aria-label="Wave height"]')!;
+    setSliderRect(height);
+    act(() => {
+      height.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, clientX: 60, buttons: 1 }));
+      height.dispatchEvent(new MouseEvent("pointermove", { bubbles: true, clientX: 82, buttons: 1 }));
+    });
+    expect(onPreview).toHaveBeenLastCalledWith("object.wave.height:34.5");
+    expect(onCommit).not.toHaveBeenCalled();
+    act(() => { height.dispatchEvent(new MouseEvent("pointerup", { bubbles: true, clientX: 82 })); });
+    expect(onCommit).toHaveBeenCalledExactlyOnceWith("object.wave.height:34.5");
+    act(() => {
+      height.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, clientX: 60, buttons: 1 }));
+      height.dispatchEvent(new MouseEvent("pointercancel", { bubbles: true }));
+    });
+    expect(onCancel).toHaveBeenCalled();
+    expect(onCommit).toHaveBeenCalledTimes(1);
+    renderPalette({ currentArtStyle: artInspectorModelFor("tool.art.rect") });
+    expect(container.querySelector('[aria-label="Wave height"]')).toBeNull();
+  });
+
+  it("shows mixed wave values with pixel units and counts only wavy art", () => {
+    let drawing = insertNativeArtGraphicObject(createPhase4Document(), { x: 220, y: 180 }, "tool.art.lineWavy");
+    drawing = applyGraphicWaveSettingToSelection(drawing, "height", 12);
+    drawing = insertNativeArtGraphicObject(drawing, { x: 320, y: 180 }, "tool.art.lineWavy");
+    drawing = applyGraphicWaveSettingToSelection(drawing, "height", 24);
+    drawing = insertNativeArtGraphicObject(drawing, { x: 420, y: 180 }, "tool.art.rect");
+    drawing = selectDocumentObjects(drawing, drawing.pages[0].id, drawing.pages[0].objects.map(object => object.id));
+    const currentArtStyle = createArtInspectorModel({ document: drawing,
+      selectedGraphicObjects: selectedGraphicObjectsForArtInspector(drawing), requestedPaintTarget: "stroke" });
+    expect(currentArtStyle.wavy).toMatchObject({ count: 2, height: { value: null, mixed: true } });
+    renderPalette({ currentArtStyle });
+    const height = container.querySelector<HTMLInputElement>('[aria-label="Wave height"]')!;
+    expect(height.closest("label")?.textContent).toContain("Mixed");
+    const heightTooltip = height.closest("[data-tooltip-owner-id]")?.querySelector('[role="tooltip"]')?.textContent;
+    expect(heightTooltip).toBe("Wave height applies to 2 of 3 selected graphics: Mixed");
+    expect(height.step).toBe("0.5");
+    const width = container.querySelector<HTMLInputElement>('[aria-label="Wave width"]')!;
+    const widthTooltip = width.closest("[data-tooltip-owner-id]")?.querySelector('[role="tooltip"]')?.textContent;
+    expect(widthTooltip).toContain("Wave width applies to 2 of 3 selected graphics:");
+    expect(widthTooltip).toContain(" px");
+    expect(widthTooltip).not.toContain("%");
+    expect(container.querySelector('[data-toolbar-style-controls="art"] [title]')).toBeNull();
+  });
+
+  it.each(["Escape", "blur"])("cancels an active wave drag on %s and ignores the later release", ending => {
+    const { onPreview, onCommit, onCancel } = renderPalette({ currentArtStyle: artInspectorModelFor("tool.art.lineWavy") });
+    const slider = container.querySelector<HTMLInputElement>('[aria-label="Wave height"]')!;
+    setSliderRect(slider);
+    act(() => { slider.focus(); slider.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, clientX: 60, buttons: 1 })); });
+    expect(onPreview).toHaveBeenCalled();
+    act(() => {
+      if (ending === "Escape") slider.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      else slider.blur();
+      slider.dispatchEvent(new MouseEvent("pointerup", { bubbles: true, clientX: 82 }));
+    });
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    expect(onCommit).not.toHaveBeenCalled();
+  });
+
+  it("closes an inline menu on Escape before cancelling the armed wave drag", () => {
+    const { onPreview, onCommit, onCancel } = renderPalette({
+      currentArtStyle: artInspectorModelFor("tool.art.lineWavy"), includeCommands: true
+    });
+    const slider = container.querySelector<HTMLInputElement>('[aria-label="Wave height"]')!;
+    setSliderRect(slider);
+    act(() => { slider.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, clientX: 60, buttons: 1 })); });
+    expect(onPreview).toHaveBeenCalled();
+    const menu = container.querySelector<HTMLButtonElement>('[aria-haspopup="menu"]')!;
+    act(() => { menu.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true })); });
+    expect(menu.getAttribute("aria-expanded")).toBe("true");
+    act(() => { slider.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+    expect(menu.getAttribute("aria-expanded")).toBe("false");
+    expect(onCancel).not.toHaveBeenCalled();
+    const previews = onPreview.mock.calls.length;
+    act(() => { slider.dispatchEvent(new MouseEvent("pointermove", { bubbles: true, clientX: 82, buttons: 1 })); });
+    expect(onPreview).toHaveBeenCalledTimes(previews + 1);
+    act(() => { slider.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    act(() => { slider.dispatchEvent(new MouseEvent("pointerup", { bubbles: true, clientX: 82 })); });
+    expect(onCommit).not.toHaveBeenCalled();
+  });
+
+  it("lets a modal close on Escape before cancelling the armed wave drag", () => {
+    const { onPreview, onCommit, onCancel } = renderPalette({ currentArtStyle: artInspectorModelFor("tool.art.lineWavy") });
+    const slider = container.querySelector<HTMLInputElement>('[aria-label="Wave height"]')!;
+    setSliderRect(slider);
+    act(() => { slider.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, clientX: 60, buttons: 1 })); });
+    expect(onPreview).toHaveBeenCalled();
+    const modal = document.createElement("div");
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    container.append(modal);
+    const close = vi.fn((event: KeyboardEvent) => { event.preventDefault(); modal.hidden = true; });
+    modal.addEventListener("keydown", close);
+    act(() => { modal.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+    expect(close).toHaveBeenCalledOnce();
+    expect(modal.hidden).toBe(true);
+    expect(onCancel).not.toHaveBeenCalled();
+    act(() => { slider.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    act(() => { slider.dispatchEvent(new MouseEvent("pointerup", { bubbles: true, clientX: 82 })); });
+    expect(onCommit).not.toHaveBeenCalled();
+  });
 
   it("opens reliably and closes on outside pointer, Escape, blur, and selection changes", () => {
     const onCancel = vi.fn();
@@ -308,6 +652,51 @@ describe("ToolPalette art color popover", () => {
     expect(onRequestColorPopover).toHaveBeenCalledWith({ left: 12, top: 34, right: 60, bottom: 58 });
     // …and the inline (clipped) popover must NOT render — the window hosts it instead.
     expect(container.querySelector(".art-color-popover")).toBeNull();
+  });
+
+  it.each(["fill", "stroke"] as const)("toggles the inline %s picker with a full pointer and click sequence", target => {
+    renderPalette({ currentArtStyle: { ...artInspectorModelFor("tool.art.rect"), activePaintTarget: target } });
+    const click = () => act(() => {
+      colorTrigger().dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+      colorTrigger().dispatchEvent(new MouseEvent("pointerup", { bubbles: true, button: 0 }));
+      colorTrigger().dispatchEvent(new MouseEvent("click", { bubbles: true, button: 0 }));
+    });
+    click();
+    expect(container.querySelector(".art-color-popover")).not.toBeNull();
+    click();
+    expect(container.querySelector(".art-color-popover")).toBeNull();
+  });
+
+  it("uses the app tooltip on Art stroke width and paint controls, with no native titles", async () => {
+    vi.useFakeTimers();
+    const relays: Array<{ visible: boolean; title?: string }> = [];
+    const relay = (event: Event) => relays.push((event as CustomEvent).detail);
+    document.body.classList.add("palette-window-body");
+    window.addEventListener("chemdraft:palette-tooltip", relay);
+    try {
+      renderPalette({ includeGrid: true });
+      expect(container.querySelector('[data-toolbar-style-controls="art"] [title]')).toBeNull();
+      const icon = container.querySelector<HTMLElement>(".icon-button-shell[data-tooltip-owner-id]")!;
+      await act(async () => icon.dispatchEvent(new MouseEvent("pointerover", { bubbles: true })));
+      await act(async () => { vi.advanceTimersByTime(500); });
+      expect(icon.dataset.tooltipVisible).toBe("true");
+      const width = container.querySelector('[aria-label="Stroke width"]')!.closest<HTMLElement>("[data-tooltip-owner-id]")!;
+      await act(async () => {
+        icon.dispatchEvent(new MouseEvent("pointerout", { bubbles: true, relatedTarget: width }));
+        width.dispatchEvent(new MouseEvent("pointerover", { bubbles: true, relatedTarget: icon }));
+      });
+      expect(relays.at(-1)).toMatchObject({ visible: true, title: "Stroke width" });
+      const paint = container.querySelector('[aria-label="Fill paint type"]')!.closest<HTMLElement>("[data-tooltip-owner-id]")!;
+      await act(async () => {
+        width.dispatchEvent(new MouseEvent("pointerout", { bubbles: true, relatedTarget: paint }));
+        paint.dispatchEvent(new MouseEvent("pointerover", { bubbles: true, relatedTarget: width }));
+      });
+      expect(relays.at(-1)).toMatchObject({ visible: true, title: "Fill paint type" });
+    } finally {
+      document.body.classList.remove("palette-window-body");
+      window.removeEventListener("chemdraft:palette-tooltip", relay);
+      vi.useRealTimers();
+    }
   });
 
   it("uses shared color picker palettes for art colors", () => {
@@ -494,6 +883,61 @@ describe("ToolPalette art color popover", () => {
       throw new Error("Expected restored fill paint type selector.");
     }
     expect([...restoredFillSelect.options].map((option) => option.value)).toContain("object.paint.type.gloss");
+  });
+
+  it("previews and commits electron mark size and thickness sliders", () => {
+    const doc = applyChargeToolAtPoint(createPhase4Document("Mark sliders"), { kind: "lone-pair" }, { x: 200, y: 200 });
+    const model = createArtInspectorModel({ document: doc, selectedGraphicObjects: [] });
+    const onCancel = vi.fn();
+    const { onCommit, onPreview } = renderPalette({ currentArtStyle: model, onCancel });
+    for (const property of ["size", "thickness"]) {
+      const slider = container.querySelector<HTMLInputElement>(`[aria-label="Electron mark ${property}"]`)!;
+      expect(slider).not.toBeNull();
+      expect(slider.disabled).toBe(false);
+      setSliderRect(slider);
+      act(() => {
+        slider.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, clientX: 60, buttons: 1 }));
+        slider.dispatchEvent(new MouseEvent("pointerup", { bubbles: true, clientX: 60, buttons: 0 }));
+      });
+      expect(onPreview).toHaveBeenCalledWith(`object.electronMark.${property}:50`);
+      expect(onCommit).toHaveBeenCalledWith(`object.electronMark.${property}:50`);
+      act(() => slider.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true })));
+      expect(onCommit).toHaveBeenLastCalledWith(`object.electronMark.${property}:100`);
+      act(() => slider.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true })));
+      expect(onCommit).toHaveBeenLastCalledWith(`object.electronMark.${property}:0`);
+      const committedCount = onCommit.mock.calls.length;
+      act(() => {
+        slider.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, clientX: 90, buttons: 1 }));
+        slider.dispatchEvent(new MouseEvent("pointercancel", { bubbles: true }));
+      });
+      expect(onCancel).toHaveBeenCalled();
+      expect(onCommit).toHaveBeenCalledTimes(committedCount);
+    }
+  });
+
+  it("announces the displayed electron mark slider values for mixed and uniform selections", () => {
+    let doc = applyChargeToolAtPoint(createPhase4Document("Mark slider values"), 1, { x: 200, y: 200 });
+    doc = applyChargeToolAtPoint(doc, -1, { x: 300, y: 300 });
+    const page = doc.pages[0];
+    const [first, second] = page.objects;
+    const objects = [{ ...first, width: 18, height: 16, style: { strokeWidth: 1.5 } },
+      { ...second, width: 25, height: 20, style: { strokeWidth: 2 } }];
+    const draw = (selectedIds: string[]) => {
+      const document = selectDocumentObjects({ ...doc, pages: [{ ...page, objects }] }, page.id, selectedIds);
+      renderPalette({ currentArtStyle: createArtInspectorModel({ document, selectedGraphicObjects: [] }) });
+    };
+    for (const [property, uniform] of [["size", "18px"], ["thickness", "1.5px"]]) {
+      draw([first.id, second.id]);
+      const slider = container.querySelector<HTMLInputElement>(`[aria-label="Electron mark ${property}"]`)!;
+      const visibleValue = () => slider.closest("label")!.querySelector(".art-inspector-slider-value")?.textContent;
+      act(() => slider.focus());
+      expect(document.activeElement).toBe(slider);
+      expect(visibleValue()).toBe("Mixed");
+      expect(slider.getAttribute("aria-valuetext")).toBe("Mixed");
+      draw([first.id]);
+      expect(visibleValue()).toBe(uniform);
+      expect(slider.getAttribute("aria-valuetext")).toBe(uniform);
+    }
   });
 
   it("invokes native effect commands from buttons and visible effect controls", () => {

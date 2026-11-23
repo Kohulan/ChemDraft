@@ -3,7 +3,10 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, expect, it, vi } from "vitest";
 import { MemoryStorage } from "../testSupport/memoryStorage";
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn().mockResolvedValue(undefined) }));
+vi.mock("@tauri-apps/api/core", async (original) => ({
+  ...await original<typeof import("@tauri-apps/api/core")>(),
+  invoke: vi.fn().mockResolvedValue(undefined)
+}));
 let root: Root | undefined, runtime: typeof import("./runtime"), container: HTMLDivElement;
 afterEach(() => {
   act(() => root?.unmount()); root = undefined; container?.remove(); runtime?.perfProbe?.stop();
@@ -45,7 +48,7 @@ it.each(["preferences", "spin3d-debugger"].flatMap(role =>
     await Promise.resolve(); await Promise.resolve();
     const calls = fault.mock.calls.length, rows = localStorage.getItem("chemdraft.perfLog");
     if (role === "preferences") {
-      const control = container.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+      const control = container.querySelector<HTMLInputElement>('section[aria-labelledby="compound-layout-tools"] input[type="checkbox"]')!;
       await act(async () => control.click());
       expect(control.checked).toBe(true);
       expect(JSON.parse(localStorage.getItem("chemdraft.compound-layout-tools.v1")!).enabled).toBe(true);

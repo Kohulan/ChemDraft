@@ -1,17 +1,22 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { moleculeToMolfileV2000, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
+import type { RdkitJsMol } from "@chemdraft/rdkit-adapter";
 import { computeStructureIdentifiers } from "@chemdraft/rdkit-adapter/identifiers";
 import { registerRdkitWasmLoader } from "./rdkitWasmLoader";
+import { assertMolfileExportIdentity, moleculeToInteropMolfile } from "@chemdraft/document-workflow-core";
+import { molfileCoordinateScale } from "@chemdraft/layout-engine";
 import { parseMolfileGraph } from "@chemdraft/clipboard-adapter";
 import {
+  copyAsMolfile,
+  copyAsMolfileForExport as copyAsMolfileFromWorkflow,
   createPhase4Document,
   insertNativeMolfileMolecule,
   copyAsSmiles,
   insertSmilesMoleculeGrid,
   type PastedStructureDepiction
 } from "./documentWorkflow";
-import { exportStructureListSdf, exportStructureListSmi, readingOrderMolecules } from "./structureListExport";
+import { copyAsMolfileForExport, exportStructureListSdf, exportStructureListSmi, readingOrderMolecules } from "./structureListExport";
 import { preservedRadicalExportCases, radicalExportCases, readAtomStates } from "../../../packages/document-workflow-core/test/radicalExportFixtures";
 import { chargeSeparationCases } from "../../../packages/document-workflow-core/test/chargeSeparationFixtures";
 
@@ -102,7 +107,7 @@ describe.each(["engine", "fallback"])("radical list export with real RDKit: %s",
   });
 });
 
-it("imports the unsupported-order fixture, exports type 8 in SDF, and refuses its SMILES without calling the engine", async () => {
+it("imports the unsupported-order fixture, guards type 8 in SDF, and refuses its SMILES before requesting atom states", async () => {
   const input = readFileSync(new URL("../../../packages/fixtures/molfile/unsupported-bond-order.mol", import.meta.url), "utf8");
   const document = insertNativeMolfileMolecule(createPhase4Document("Unknown bond fixture"), { x: 50, y: 50 }, input, "molfile-v2000");
   const molecule = document.pages[0].objects.find((object): object is MoleculeObject => object.type === "molecule")!;
@@ -115,7 +120,268 @@ it("imports the unsupported-order fixture, exports type 8 in SDF, and refuses it
     expect.objectContaining({ code: "export.smiles_write_failed", message: `Cannot write SMILES: bond ${id} has an unknown bond order.` })
   ]);
   expect(result.contents).not.toContain("> <SMILES>");
-  expect(computeStructureIdentifiers).not.toHaveBeenCalled();
+  // The real export guard attempts both identifiers, then verifies the CTAB graph instead.
+  expect(computeStructureIdentifiers).toHaveBeenCalledTimes(2);
+  expect(vi.mocked(computeStructureIdentifiers).mock.calls.every(call => call[1] === undefined)).toBe(true);
+});
+
+function withQueryChain(molecule: MoleculeObject): MoleculeObject {
+  const chainAtoms = Array.from({ length: 5 }, (_, index) => ({
+    id: `chain-${index}`, element: "C", formalCharge: 0, x: 80 + 40 * index, y: 20
+  }));
+  const chainBonds = chainAtoms.slice(1).map((atom, index): MoleculeObject["bonds"][number] => ({
+    id: `chain-bond-${index}`, fromAtomId: chainAtoms[index]!.id, toAtomId: atom.id,
+    order: index === 0 ? "unknown" : "single"
+  }));
+  return { ...molecule, atoms: [...molecule.atoms, ...chainAtoms], bonds: [...molecule.bonds, ...chainBonds] };
+}
+
+function difluoroethene(size: number, isomer: "E" | "Z"): MoleculeObject {
+  return {
+    ...moleculeAt("difluoroethene", 0, 0),
+    atoms: [
+      { id: "f1", element: "F", formalCharge: 0, x: 0, y: size },
+      { id: "c1", element: "C", formalCharge: 0, x: size, y: 0 },
+      { id: "c2", element: "C", formalCharge: 0, x: 2 * size, y: 0 },
+      { id: "f2", element: "F", formalCharge: 0, x: 3 * size, y: isomer === "E" ? -size : size }
+    ],
+    bonds: [
+      { id: "left", fromAtomId: "f1", toAtomId: "c1", order: "single" },
+      { id: "alkene", fromAtomId: "c1", toAtomId: "c2", order: "double" },
+      { id: "right", fromAtomId: "c2", toAtomId: "f2", order: "single" }
+    ]
+  };
+}
+
+function pseudoasymmetricAlkene(methylSide: number): MoleculeObject {
+  // The short C=C loses its assignment after scaling, while both mirrored tetrahedral
+  // substituents have enough space for RDKit to retain their assignments.
+  const atom = (id: string, element: string, x: number, y: number) => ({ id, element, formalCharge: 0, x, y });
+  return {
+    ...moleculeAt("pseudoasymmetric-alkene", 0, 0),
+    atoms: [
+      atom("c1", "C", 0, 0), atom("c2", "C", 0.32, 0),
+      atom("me", "C", -0.32, methylSide * 0.32),
+      atom("upper", "C", 18, 18), atom("lower", "C", 18, -18),
+      atom("upper-f", "F", 58, 40), atom("upper-cl", "Cl", 18, 58),
+      atom("lower-f", "F", 58, -40), atom("lower-cl", "Cl", 18, -58)
+    ],
+    bonds: [
+      { id: "alkene", fromAtomId: "c1", toAtomId: "c2", order: "double" },
+      { id: "methyl", fromAtomId: "c1", toAtomId: "me", order: "single" },
+      { id: "upper-branch", fromAtomId: "c2", toAtomId: "upper", order: "single" },
+      { id: "lower-branch", fromAtomId: "c2", toAtomId: "lower", order: "single" },
+      { id: "upper-cf", fromAtomId: "upper", toAtomId: "upper-f", order: "single", display: { bondStyle: "wedge" } },
+      { id: "upper-ccl", fromAtomId: "upper", toAtomId: "upper-cl", order: "single" },
+      { id: "lower-cf", fromAtomId: "lower", toAtomId: "lower-f", order: "single", display: { bondStyle: "wedge" } },
+      { id: "lower-ccl", fromAtomId: "lower", toAtomId: "lower-cl", order: "single" }
+    ]
+  };
+}
+
+async function molfileStereoTags(molfile: string): Promise<{
+  CIP_atoms: [number, string][];
+  CIP_bonds: [number, number, string][];
+}> {
+  const { ensureRdkit } = await import("@chemdraft/rdkit-adapter");
+  const parsed = (await ensureRdkit()).get_mol(molfile)! as RdkitJsMol & { get_stereo_tags(): string };
+  try {
+    return JSON.parse(parsed.get_stereo_tags());
+  } finally {
+    parsed.delete();
+  }
+}
+
+function difluoroetheneGeometry(molfile: string): number {
+  // The fixture's C=C lies on a horizontal axis. The fluorines are on opposite sides for E.
+  const [leftF, leftC, rightC, rightF] = parseMolfileGraph(molfile).atoms;
+  return Math.sign((leftF!.y - leftC!.y) * (rightF!.y - rightC!.y));
+}
+
+async function useRealIdentifiers() {
+  const { installNodeRdkitModuleLoader } = await import("@chemdraft/rdkit-adapter/node");
+  installNodeRdkitModuleLoader();
+  const real = await vi.importActual<typeof import("@chemdraft/rdkit-adapter/identifiers")>("@chemdraft/rdkit-adapter/identifiers");
+  vi.mocked(computeStructureIdentifiers).mockImplementation(real.computeStructureIdentifiers);
+}
+
+async function fluorinatedFragmentSmiles(molfile: string): Promise<string | undefined> {
+  const { ensureRdkit } = await import("@chemdraft/rdkit-adapter");
+  const rdkit = await ensureRdkit();
+  // Canonical identifiers deliberately decline the whole query record. Inspect the reader's
+  // actual output to prove that it did or did not assign stereo in the fluorinated fragment.
+  const parsed = rdkit.get_mol(molfile)!;
+  try {
+    return parsed.get_smiles?.().split(".").find(fragment => fragment.includes("F"));
+  } finally {
+    parsed.delete();
+  }
+}
+
+const stereoExportPaths = [
+  { format: "SDF", flavor: "v2000", exportMolfile: async (document: ChemDraftDocument) => (await exportStructureListSdf(document)).contents },
+  { format: "Copy As MOL V2000", flavor: "v2000", exportMolfile: (document: ChemDraftDocument) => copyAsMolfileForExport(document, "v2000") },
+  { format: "Copy As MOL V3000", flavor: "v3000", exportMolfile: (document: ChemDraftDocument) => copyAsMolfileForExport(document, "v3000") }
+] as const;
+
+describe.each([
+  { isomer: "E", geometry: -1, smiles: "F/C=C/F" },
+  { isomer: "Z", geometry: 1, smiles: "F/C=C\\F" }
+] as const)("$isomer alkene beside a disconnected query bond", ({ isomer, geometry, smiles }) => {
+  it.each(stereoExportPaths)("$format refuses stereo loss when the alkene is scaled to 0.012", async ({ flavor, exportMolfile }) => {
+    await useRealIdentifiers();
+    const document = documentWith([withQueryChain(difluoroethene(0.32, isomer))]);
+    const raw = copyAsMolfile(document, flavor, [], { coordinateUnits: "raw" })!;
+    expect(await fluorinatedFragmentSmiles(raw)).toBe(smiles);
+    expect(await computeStructureIdentifiers(raw)).toBeUndefined();
+    expect(await fluorinatedFragmentSmiles(copyAsMolfile(document, flavor)!)).toBe("FC=CF");
+    await expect(exportMolfile(document)).rejects.toThrow("refused: exported coordinates would lose or change E/Z stereo at bond 2–3.");
+  });
+
+  it.each(stereoExportPaths)("$format exports a size-0.001 drawing whose source already has unspecified alkene stereo", async ({ flavor, exportMolfile }) => {
+    await useRealIdentifiers();
+    const document = documentWith([withQueryChain(difluoroethene(0.001, isomer))]);
+    const raw = copyAsMolfile(document, flavor, [], { coordinateUnits: "raw" })!;
+    expect(await fluorinatedFragmentSmiles(raw)).toBe("FC=CF");
+    expect(await fluorinatedFragmentSmiles((await exportMolfile(document))!)).toBe("FC=CF");
+  });
+
+  it("retains the isomer when its geometry survives scaling, with only the existing query bond warnings", async () => {
+    await useRealIdentifiers();
+    const alkene = difluoroethene(2, isomer);
+    const result = await exportStructureListSdf(documentWith([withQueryChain(alkene)]));
+    expect(difluoroetheneGeometry(result.contents)).toBe(geometry);
+    expect(await computeStructureIdentifiers(result.contents)).toBeUndefined();
+    expect(result.warnings.map(warning => warning.code)).toEqual(["export.sdf_v2000_loss", "export.smiles_write_failed"]);
+
+    const alkeneResult = await exportStructureListSdf(documentWith([alkene]));
+    expect((await computeStructureIdentifiers(alkeneResult.contents))?.smiles).toBe(smiles);
+    expect(alkeneResult.warnings).toEqual([]);
+  });
+});
+
+describe.each(stereoExportPaths)("$format fallback", ({ flavor, exportMolfile }) => {
+  it.each([{ methylSide: 1, descriptor: "(e)" }, { methylSide: -1, descriptor: "(z)" }])(
+    "refuses loss of the $descriptor pseudoasymmetric alkene isomer", async ({ methylSide, descriptor }) => {
+      await useRealIdentifiers();
+      const document = documentWith([withQueryChain(pseudoasymmetricAlkene(methylSide))]);
+      const raw = copyAsMolfile(document, flavor, [], { coordinateUnits: "raw" })!;
+      const sourceStereo = await molfileStereoTags(raw);
+      const scaledStereo = await molfileStereoTags(copyAsMolfile(document, flavor)!);
+      expect(await computeStructureIdentifiers(raw)).toBeUndefined();
+      expect(sourceStereo.CIP_bonds).toEqual([[0, 1, descriptor]]);
+      expect(scaledStereo.CIP_atoms).toEqual(sourceStereo.CIP_atoms);
+      expect(scaledStereo.CIP_bonds).toEqual([]);
+      await expect(exportMolfile(document)).rejects.toThrow("refused: exported coordinates would lose or change E/Z stereo at bond 1–2.");
+    }
+  );
+
+  it.each([
+    { bondStyle: "wedge", smiles: "F[C@@H](Cl)Br" },
+    { bondStyle: "hashed", smiles: "F[C@H](Cl)Br" }
+  ] as const)("refuses tetrahedral stereo loss despite an unchanged $bondStyle", async ({ bondStyle, smiles }) => {
+    await useRealIdentifiers();
+    const size = 0.32;
+    const molecule = withQueryChain({
+      ...moleculeAt("tetrahedral", 0, 0),
+      atoms: [
+        { id: "c", element: "C", formalCharge: 0, x: 0, y: 0 },
+        { id: "f", element: "F", formalCharge: 0, x: size, y: size },
+        { id: "cl", element: "Cl", formalCharge: 0, x: -size, y: size },
+        { id: "br", element: "Br", formalCharge: 0, x: 0, y: -size }
+      ],
+      bonds: [
+        { id: "cf", fromAtomId: "c", toAtomId: "f", order: "single", display: { bondStyle } },
+        { id: "ccl", fromAtomId: "c", toAtomId: "cl", order: "single" },
+        { id: "cbr", fromAtomId: "c", toAtomId: "br", order: "single" }
+      ]
+    });
+    const document = documentWith([molecule]);
+    const raw = copyAsMolfile(document, flavor, [], { coordinateUnits: "raw" })!;
+    expect(await fluorinatedFragmentSmiles(raw)).toBe(smiles);
+    expect(await computeStructureIdentifiers(raw)).toBeUndefined();
+    expect(await fluorinatedFragmentSmiles(copyAsMolfile(document, flavor)!)).toBe("FC(Cl)Br");
+    await expect(exportMolfile(document)).rejects.toThrow("refused: exported coordinates would lose or change tetrahedral stereo at atom 1.");
+  });
+
+  it("exports an intact E isomer at size 1.001 despite rounding", async () => {
+    await useRealIdentifiers();
+    const document = documentWith([withQueryChain(difluoroethene(1.001, "E"))]);
+    const raw = copyAsMolfile(document, flavor, [], { coordinateUnits: "raw" })!;
+    expect(await fluorinatedFragmentSmiles(raw)).toBe("F/C=C/F");
+    expect(await fluorinatedFragmentSmiles((await exportMolfile(document))!)).toBe("F/C=C/F");
+  });
+
+  it("exports fluoroketene when rounding tilts its non-stereogenic C=C=O axis", async () => {
+    await useRealIdentifiers();
+    const ketene = difluoroethene(2, "E");
+    ketene.atoms[2]!.y = 0.1234;
+    Object.assign(ketene.atoms[3]!, { element: "O", y: 0.2468 });
+    ketene.bonds[2]!.order = "double";
+    const document = documentWith([withQueryChain(ketene)]);
+    const raw = copyAsMolfile(document, flavor, [], { coordinateUnits: "raw" })!;
+    expect(await fluorinatedFragmentSmiles(raw)).toBe("O=C=CF");
+    expect(await fluorinatedFragmentSmiles((await exportMolfile(document))!)).toBe("O=C=CF");
+  });
+
+  it("keeps the source coordinates if scaling would assign previously unspecified stereo", async () => {
+    await useRealIdentifiers();
+    const molecule = withQueryChain(difluoroethene(0.001, "E"));
+    molecule.atoms.slice(4).forEach((atom, index) => {
+      atom.x = 0.02 + index * 0.002;
+      atom.y = 0.02;
+    });
+    const document = documentWith([molecule]);
+    const raw = copyAsMolfile(document, flavor, [], { coordinateUnits: "raw" })!;
+    expect(await fluorinatedFragmentSmiles(raw)).toBe("FC=CF");
+    expect(await fluorinatedFragmentSmiles(copyAsMolfile(document, flavor)!)).toBe("F/C=C/F");
+    expect(parseMolfileGraph((await exportMolfile(document))!)).toEqual(parseMolfileGraph(raw));
+  });
+});
+
+it.each(["v2000", "v3000"] as const)("keeps the source %s Copy As coordinates when stereo readback is unavailable", async flavor => {
+  await useRealIdentifiers();
+  const { resetRdkitForTesting } = await import("@chemdraft/rdkit-adapter");
+  const { installNodeRdkitModuleLoader } = await import("@chemdraft/rdkit-adapter/node");
+  const document = documentWith([withQueryChain(difluoroethene(0.3217, "E"))]);
+  const raw = copyAsMolfile(document, flavor, [], { coordinateUnits: "raw" })!;
+  const scaled = copyAsMolfile(document, flavor)!;
+  expect(await fluorinatedFragmentSmiles(raw)).toBe("F/C=C/F");
+  expect(await fluorinatedFragmentSmiles(scaled)).toBe("FC=CF");
+  expect(await computeStructureIdentifiers(raw)).toBeUndefined();
+  await expect.soft(copyAsMolfileFromWorkflow(document, flavor)).rejects.toThrow("would lose or change E/Z stereo");
+  await expect.soft(assertMolfileExportIdentity(raw, scaled, computeStructureIdentifiers, "Copy As MOL"))
+    .rejects.toThrow("no molfile stereo reader is available");
+  resetRdkitForTesting();
+  try {
+    const warnings: string[] = [];
+    expect(await copyAsMolfileFromWorkflow(document, flavor, warnings)).toBe(raw);
+    expect(warnings).toContainEqual(expect.stringContaining("kept the drawing coordinates"));
+  } finally {
+    installNodeRdkitModuleLoader();
+  }
+});
+
+it("preserves the source CTAB coordinates with a warning when the stereo reader is unavailable", async () => {
+  await useRealIdentifiers();
+  const { resetRdkitForTesting } = await import("@chemdraft/rdkit-adapter");
+  const { installNodeRdkitModuleLoader } = await import("@chemdraft/rdkit-adapter/node");
+  const document = documentWith([withQueryChain(difluoroethene(0.32, "E"))]);
+  resetRdkitForTesting();
+  try {
+    const sdf = await exportStructureListSdf(document);
+    const source = copyAsMolfile(document, "v2000", [], { coordinateUnits: "raw" })!;
+    expect(parseMolfileGraph(sdf.contents)).toEqual(parseMolfileGraph(source));
+    expect(sdf.warnings).toContainEqual(expect.objectContaining({ code: "export.mol_stereo_unverified", severity: "warning" }));
+    for (const flavor of ["v2000", "v3000"] as const) {
+      const warnings: string[] = [];
+      expect(await copyAsMolfileForExport(document, flavor, warnings))
+        .toBe(copyAsMolfile(document, flavor, [], { coordinateUnits: "raw" }));
+      expect(warnings).toContainEqual(expect.stringContaining("kept the drawing coordinates"));
+    }
+  } finally {
+    installNodeRdkitModuleLoader();
+  }
 });
 
 function moleculeAt(id: string, x: number, y: number, width = 100, height = 100): MoleculeObject {
@@ -222,24 +488,32 @@ function mockEthaneIdentifiers(smiles: string) {
 }
 
 describe("structure list export", () => {
-  it.each(exportListCases)("uses RDKit SMILES from the current wedged graph ($format)", async ({ exportList }) => {
+  it.each(exportListCases)("uses RDKit SMILES from the current wedged graph ($format)", async ({ format, exportList }) => {
     const molecule = moleculeAt("stereo", 20, 30);
     molecule.bonds[0].display = { bondStyle: "wedge" };
     const other = moleculeAt("other", 220, 30);
     const document = documentWith([other, molecule]);
     const before = structuredClone(document);
-    vi.mocked(computeStructureIdentifiers)
-      .mockResolvedValueOnce(mockEthaneIdentifiers("C[C@H](F)Cl"))
-      .mockResolvedValueOnce(mockEthaneIdentifiers("F/C=C/F"));
+    const smiles = ["C[C@H](F)Cl", "F/C=C/F"];
+    vi.mocked(computeStructureIdentifiers).mockImplementation(async (_contents, options) => {
+      // Sentinel SMILES test property wiring only; let the real guard compare the CTABs.
+      return options?.includeAtomStates ? mockEthaneIdentifiers(smiles.shift()!) : undefined;
+    });
 
     const result = await exportList(document);
     expect(result.contents).toContain("C[C@H](F)Cl");
     expect(result.contents).toContain("F/C=C/F");
     expect(result.warnings).toEqual([]);
     expect(registerRdkitWasmLoader).toHaveBeenCalledOnce();
-    expect(computeStructureIdentifiers).toHaveBeenCalledTimes(2);
-    expect(computeStructureIdentifiers).toHaveBeenNthCalledWith(1, moleculeToMolfileV2000(molecule, { kekuleBondOrders: new Map(), fromDocFrame: true }).contents, { includeAtomStates: true });
-    expect(computeStructureIdentifiers).toHaveBeenNthCalledWith(2, moleculeToMolfileV2000(other, { kekuleBondOrders: new Map(), fromDocFrame: true }).contents, { includeAtomStates: true });
+    expect(computeStructureIdentifiers).toHaveBeenCalledTimes(format === "SDF" ? 6 : 2);
+    const propertyCalls = vi.mocked(computeStructureIdentifiers).mock.calls.filter(call => call[1]?.includeAtomStates);
+    expect(propertyCalls).toHaveLength(2);
+    expect(propertyCalls[0]).toEqual([(format === "SDF"
+      ? moleculeToInteropMolfile(molecule, "v2000", 22, { kekuleBondOrders: new Map(), fromDocFrame: true })
+      : moleculeToMolfileV2000(molecule, { kekuleBondOrders: new Map(), fromDocFrame: true })).contents, { includeAtomStates: true }]);
+    expect(propertyCalls[1]).toEqual([(format === "SDF"
+      ? moleculeToInteropMolfile(other, "v2000", 22, { kekuleBondOrders: new Map(), fromDocFrame: true })
+      : moleculeToMolfileV2000(other, { kekuleBondOrders: new Map(), fromDocFrame: true })).contents, { includeAtomStates: true }]);
     expect(document).toEqual(before);
   });
 
@@ -359,7 +633,7 @@ describe("structure list export", () => {
     expect(records[1]).not.toContain("> <Name>");
   });
 
-  it("preserves the V2000 writer's document-frame coordinates, charges and wedge flags", async () => {
+  it("normalizes V2000 document-frame coordinates while preserving charges and wedge flags", async () => {
     const molecule = moleculeAt("stereo", 20, 30);
     molecule.atoms[1].element = "N";
     molecule.atoms[1].formalCharge = 1;
@@ -367,7 +641,7 @@ describe("structure list export", () => {
     const sdf = (await exportStructureListSdf(documentWith([molecule]))).contents;
     const graph = parseMolfileGraph(sdf.slice(0, sdf.indexOf("> <SMILES>")));
     expect(graph.atoms.map((atom) => ({ x: atom.x, y: atom.y, charge: atom.formalCharge }))).toEqual([
-      { x: 20, y: -30, charge: 0 }, { x: 120, y: -130, charge: 1 }
+      { x: 0.2121, y: -0.3182, charge: 0 }, { x: 1.2728, y: -1.3789, charge: 1 }
     ]);
     expect(graph.bonds[0].bondStyle).toBe("wedge");
   });
@@ -383,12 +657,13 @@ describe("structure list export", () => {
     const result = await exportStructureListSdf(document);
     for (const message of writerWarnings) {
       expect(result.warnings).toContainEqual({
-        code: "export.sdf_v2000_loss", message, severity: "warning", objectId: molecule.id
+        code: message.startsWith('Atom label "Ph"') ? "export.smiles_atom_label" : "export.sdf_v2000_loss",
+        message, severity: "warning", objectId: molecule.id
       });
     }
     const smi = await exportStructureListSmi(document);
     expect(smi.contents).toBe("C[*]\t1\n");
-    expect(smi.warnings.map((warning) => warning.code)).toEqual(["export.smiles_dative_bond", "export.smiles_atom_label"]);
+    expect(smi.warnings.map((warning) => warning.code)).toEqual(["export.invalid_structure", "export.smiles_dative_bond", "export.smiles_atom_label"]);
     expect(smi.warnings.every((warning) => warning.objectId === molecule.id)).toBe(true);
   });
 
@@ -442,8 +717,8 @@ M  END
     molecule.bonds = graph.bonds;
     const document = documentWith([molecule]);
     const native = await exportStructureListSmi(document);
-    expect(native.warnings.map((warning) => warning.code)).toEqual(["export.smiles_bond_order"]);
-    expect(native.warnings[0].message).toContain("5 aromatic bonds could not be resolved");
+    expect(native.warnings.map((warning) => warning.code)).toEqual([...Array(5).fill("export.invalid_structure"), "export.smiles_bond_order"]);
+    expect(native.warnings[5].message).toContain("5 aromatic bonds could not be resolved");
     // Type 4 now stays truthful; unresolved interpretation still has to be disclosed.
     vi.mocked(computeStructureIdentifiers).mockResolvedValueOnce({ smiles: "c1cccc1",
       smilesAtomOrder: [0, 1, 2, 3, 4],
@@ -452,7 +727,10 @@ M  END
       }))
     });
     const engine = await exportStructureListSmi(document);
-    expect(engine.warnings).toEqual([expect.objectContaining({
+    expect(engine.warnings).toEqual([
+      ...Array.from({ length: 5 }, (_, index) => expect.objectContaining({
+        code: "export.invalid_structure", message: `C${index + 1}: its aromatic bonds don't resolve into single and double bonds.`
+      })), expect.objectContaining({
       code: "export.smiles_v2000_loss", objectId: molecule.id,
       message: expect.stringContaining("no resolved Kekulé order; the structure engine interpreted them for SMILES")
     })]);
@@ -585,4 +863,17 @@ describe("SMILES export review regressions", () => {
       resetRdkitForTesting();
     }
   });
+});
+
+
+it("normalizes differently sized SDF records independently without mutating the document", async () => {
+  const document = documentWith([moleculeAt("small", 0, 0, 22, 0), moleculeAt("large", 200, 0, 56, 0)]);
+  const before = structuredClone(document);
+  const records = (await exportStructureListSdf(document)).contents.split("$$$$").filter(record => record.trim());
+  expect(records).toHaveLength(2);
+  for (const record of records) {
+    const graph = parseMolfileGraph(record.trimStart());
+    expect(molfileCoordinateScale(graph.atoms, graph.bonds, 1.5, 22).medianBondLength).toBeCloseTo(1.5, 4);
+  }
+  expect(document).toEqual(before);
 });
