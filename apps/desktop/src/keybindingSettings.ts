@@ -44,20 +44,33 @@ export function isKeybindingSettings(value: unknown): value is KeybindingSetting
   return isKeybindingScheme(settings.scheme) && (settings.overrides === undefined || isSchemeOverrides(settings.overrides));
 }
 
+let launchScheme: KeybindingScheme | undefined;
+
+/**
+ * The scheme this process falls back to when the cache holds none, in place of
+ * DEFAULT_KEYBINDING_SETTINGS. shortcutDefaultMigration.ts sets it before the document window
+ * mounts, so a launch whose scheme could not be persisted (unreadable preferences, blocked
+ * storage) still never renders with the new default on an install not proven new. In memory only.
+ */
+export function setLaunchKeybindingScheme(scheme: KeybindingScheme | undefined): void {
+  launchScheme = scheme;
+}
+
 export function loadKeybindingSettings(): KeybindingSettings {
+  const fallback = launchScheme ?? DEFAULT_KEYBINDING_SETTINGS.scheme;
   try {
     const raw = globalThis.localStorage?.getItem(KEYBINDING_STORAGE_KEY);
     const parsed = raw ? (JSON.parse(raw) as Partial<KeybindingSettings> | null) : null;
     if (parsed && typeof parsed === "object") {
       return {
-        scheme: isKeybindingScheme(parsed.scheme) ? parsed.scheme : DEFAULT_KEYBINDING_SETTINGS.scheme,
+        scheme: isKeybindingScheme(parsed.scheme) ? parsed.scheme : fallback,
         ...(isSchemeOverrides(parsed.overrides) ? { overrides: parsed.overrides } : {})
       };
     }
   } catch {
     // Corrupt/blocked storage — fall back to the default.
   }
-  return DEFAULT_KEYBINDING_SETTINGS;
+  return launchScheme ? { scheme: launchScheme } : DEFAULT_KEYBINDING_SETTINGS;
 }
 
 export function saveKeybindingSettings(settings: KeybindingSettings): void {

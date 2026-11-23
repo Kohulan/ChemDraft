@@ -5,7 +5,8 @@ import {
   isKeybindingScheme,
   isKeybindingSettings,
   loadKeybindingSettings,
-  saveKeybindingSettings
+  saveKeybindingSettings,
+  setLaunchKeybindingScheme
 } from "./keybindingSettings";
 // jsdom in this project doesn't expose localStorage, and the module reads
 // globalThis.localStorage — so stub a minimal in-memory store for these tests.
@@ -21,6 +22,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  setLaunchKeybindingScheme(undefined);
   vi.unstubAllGlobals();
 });
 
@@ -45,6 +47,20 @@ describe("keybindingSettings", () => {
     expect(loadKeybindingSettings()).toEqual(DEFAULT_KEYBINDING_SETTINGS);
     storage.setItem(STORAGE_KEY, "{not json");
     expect(loadKeybindingSettings()).toEqual(DEFAULT_KEYBINDING_SETTINGS);
+  });
+
+  // shortcutDefaultMigration.ts sets the launch scheme when it could not persist one, so the first
+  // render of an install not proven new never falls to the new default.
+  it("falls back to the launch scheme, not the new default, when the cache holds none", () => {
+    setLaunchKeybindingScheme("chemdraft");
+    expect(loadKeybindingSettings()).toEqual({ scheme: "chemdraft" });
+    storage.setItem(STORAGE_KEY, JSON.stringify({ scheme: "vim" }));
+    expect(loadKeybindingSettings()).toEqual({ scheme: "chemdraft" });
+    storage.setItem(STORAGE_KEY, "{not json");
+    expect(loadKeybindingSettings()).toEqual({ scheme: "chemdraft" });
+    // A stored scheme still wins.
+    saveKeybindingSettings({ scheme: "chemdraw" });
+    expect(loadKeybindingSettings()).toEqual({ scheme: "chemdraw" });
   });
 
   it("type-guards schemes and settings payloads", () => {

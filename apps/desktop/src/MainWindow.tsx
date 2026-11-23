@@ -1852,7 +1852,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.23.11.00-opus";
+const CURRENT_BUILD_STAMP = "11.23.17.10-opus";
 
 /**
  * The commit funnel's chemistry check (AGENTS.md section 7, `commitChemistryGuard.ts`). `before`
@@ -10387,11 +10387,17 @@ export function MainWindow({
       }
       // Undo took the sample out and nothing was drawn since: the tab is still the original blank
       // entry, so put the sample back there rather than opening another Tour tab. A tab with any
-      // other history holds the user's edits and is never reset.
-      const history = practice.tabId === activeDocumentTabIdRef.current
-        ? documentHistoryRef.current : documentTabSnapshotsRef.current.get(practice.tabId)?.history;
-      if (history && documentTabsRef.current.some(tab => tab.id === practice.tabId)
-        && history.past.length === 0 && history.present.pages.every(page => page.objects.length === 0)) {
+      // other history holds the user's edits and is never reset: that includes redo history beyond
+      // the sample itself (installing the sample clears it), and a tab saved to a file (the
+      // restored sample would be marked clean against a file that does not hold it).
+      const active = practice.tabId === activeDocumentTabIdRef.current;
+      const snapshot = active ? undefined : documentTabSnapshotsRef.current.get(practice.tabId);
+      const history = active ? documentHistoryRef.current : snapshot?.history;
+      const filePath = active ? fileStateRef.current.path : snapshot?.file.path;
+      if (history && documentTabsRef.current.some(tab => tab.id === practice.tabId) && !filePath
+        && history.past.length === 0 && history.present.pages.every(page => page.objects.length === 0)
+        && (history.future.length === 0 || (history.future.length === 1
+          && findDocumentObject(history.future[0], practice.moleculeId)?.type === "molecule"))) {
         const restored = buildTourSample(history.present);
         activateDocumentTab(practice.tabId);
         if (activeDocumentTabIdRef.current !== practice.tabId) throw new Error("Could not switch to the tour drawing.");

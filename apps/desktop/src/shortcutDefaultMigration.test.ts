@@ -1,8 +1,13 @@
 import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { keyboardShortcutActions } from "./customKeyboardShortcuts";
 import type { DesktopPreferences } from "./desktopPreferences";
-import { KEYBINDING_STORAGE_KEY, type KeybindingScheme } from "./keybindingSettings";
+import {
+  KEYBINDING_STORAGE_KEY,
+  loadKeybindingSettings,
+  setLaunchKeybindingScheme,
+  type KeybindingScheme
+} from "./keybindingSettings";
 import {
   migrateShortcutDefault,
   type ShortcutDefaultMigrationHost
@@ -57,6 +62,25 @@ function bondToolKey(scheme: KeybindingScheme, platform: ShortcutPlatform): stri
   return keyboardShortcutActions(scheme, platform).find(action => action.id === "tool.bond")?.defaults[0];
 }
 
+/** The scheme the document window's first render reads (useShortcutPreference's initial state). */
+function firstRenderScheme(storage: MemoryStorage): KeybindingScheme {
+  vi.stubGlobal("localStorage", storage);
+  try {
+    return loadKeybindingSettings().scheme;
+  } finally {
+    vi.unstubAllGlobals();
+  }
+}
+
+/** preferences.json read failures as lib.rs reports them (the rejection is its error string). */
+const IO_ERROR = "Permission denied (os error 13)";
+const PARSE_ERROR = "expected value at line 1 column 1";
+
+afterEach(() => {
+  setLaunchKeybindingScheme(undefined);
+  vi.restoreAllMocks();
+});
+
 describe.each(["macos", "windows"] as const)("shortcut default migration (%s)", platform => {
   it("gives a fresh install the industry-standard scheme and writes it", async () => {
     const fake = install();
@@ -92,7 +116,22 @@ describe.each(["macos", "windows"] as const)("shortcut default migration (%s)", 
     expect(await migrateShortcutDefault(fake.host)).toEqual({ kind: "already-set", scheme });
     expect(fake.writeScheme).not.toHaveBeenCalled();
     expect(fake.preferences().shortcutScheme).toBe(scheme);
-    expect(fake.storage.length).toBe(0);
+    // The native choice is mirrored into the webview cache, so the first render already uses it.
+    expect(fake.storage.length).toBe(1);
+    expect(fake.cachedScheme()).toBe(scheme);
+  });
+
+  it.each(["chemdraft", "chemdraw"] as const)("mirrors an explicit native %s choice over a stale or cleared cache before the first render", async scheme => {
+    const other: KeybindingScheme = scheme === "chemdraft" ? "chemdraw" : "chemdraft";
+    const overrides = { [scheme]: { commands: { "file.save": ["Mod+F9"] } } };
+    const caches: Record<string, string>[] = [{}, { [KEYBINDING_STORAGE_KEY]: JSON.stringify({ scheme: other }) }];
+    for (const local of caches) {
+      const fake = install({ toolbarLayout: true, preferences: { shortcutScheme: scheme, shortcutOverrides: overrides }, local });
+      expect(await migrateShortcutDefault(fake.host)).toEqual({ kind: "already-set", scheme });
+      expect(fake.writeScheme).not.toHaveBeenCalled();
+      expect(JSON.parse(fake.storage.getItem(KEYBINDING_STORAGE_KEY)!)).toEqual({ scheme, overrides });
+      expect(firstRenderScheme(fake.storage)).toBe(scheme);
+    }
   });
 
   it.each(["chemdraft", "chemdraw"] as const)("keeps a %s choice stored only in the webview by an older version", async scheme => {
@@ -128,12 +167,64 @@ describe.each(["macos", "windows"] as const)("shortcut default migration (%s)", 
     vi.restoreAllMocks();
   });
 
-  it("does nothing when the native preferences cannot be read", async () => {
-    const fake = install({ toolbarLayout: true });
-    fake.host.native!.readPreferences = async () => { throw new Error("Preferences are invalid"); };
-    expect(await migrateShortcutDefault(fake.host)).toEqual({ kind: "skipped", scheme: undefined });
+  // An unreadable preferences file can never prove a new install, so it never gets the new default.
+  // Nothing is written to the native file: lib.rs reads it before patching, and a write must never
+  // replace a file whose other settings could not be read.
+  it.each([
+    ["the toolbar layout", { toolbarLayout: true }],
+    ["an unreadable toolbar layout", { toolbarLayout: "unreadable" as const }],
+    ["other ChemDraft settings in the webview", { local: { "chemdraft.drawing-settings.v1": "{}" } }]
+  ])("keeps an existing install (%s) on ChemDraft's scheme when the preferences read fails", async (_label, options) => {
+    const fake = install(options);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    fake.host.native!.readPreferences = async () => { throw IO_ERROR; };
+    expect(await migrateShortcutDefault(fake.host)).toEqual({ kind: "preferences-unreadable", scheme: "chemdraft" });
+    expect(fake.writeScheme).not.toHaveBeenCalled();
+    expect(fake.cachedScheme()).toBe("chemdraft");
+    expect(firstRenderScheme(fake.storage)).toBe("chemdraft");
+    expect(bondToolKey(firstRenderScheme(fake.storage), platform)).not.toBe("X");
+  });
+
+  it("treats a preferences file that exists but cannot be parsed as an existing install, on every launch", async () => {
+    const fake = install();
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    fake.host.native!.readPreferences = async () => { throw PARSE_ERROR; };
+    expect(await migrateShortcutDefault(fake.host)).toEqual({ kind: "preferences-unreadable", scheme: "chemdraft" });
+    expect(fake.writeScheme).not.toHaveBeenCalled();
+    expect(fake.cachedScheme()).toBe("chemdraft");
+    expect(firstRenderScheme(fake.storage)).toBe("chemdraft");
+    // The file stays corrupt: the next launch keeps the same scheme.
+    setLaunchKeybindingScheme(undefined);
+    expect(await migrateShortcutDefault(fake.host)).toEqual({ kind: "preferences-unreadable", scheme: "chemdraft" });
+    expect(firstRenderScheme(fake.storage)).toBe("chemdraft");
+  });
+
+  it("uses the scheme mirrored in the webview cache when the preferences read fails", async () => {
+    const fake = install({ toolbarLayout: true, local: { [KEYBINDING_STORAGE_KEY]: JSON.stringify({ scheme: "chemdraw" }) } });
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    fake.host.native!.readPreferences = async () => { throw IO_ERROR; };
+    expect(await migrateShortcutDefault(fake.host)).toEqual({ kind: "preferences-unreadable", scheme: "chemdraw" });
+    expect(fake.writeScheme).not.toHaveBeenCalled();
+    expect(fake.cachedScheme()).toBe("chemdraw");
+  });
+
+  // Decision: a read failure with no other evidence cannot prove a new install, so this launch runs
+  // the legacy scheme. It is held in memory only (no native write, no webview cache), so the next
+  // launch that can read the file classifies the install from its real evidence.
+  it("gives a seemingly fresh install ChemDraft's scheme for this launch only when the preferences read fails", async () => {
+    const fake = install();
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const read = fake.host.native!.readPreferences;
+    fake.host.native!.readPreferences = async () => { throw new Error(IO_ERROR); };
+    expect(await migrateShortcutDefault(fake.host)).toEqual({ kind: "preferences-unreadable", scheme: "chemdraft" });
     expect(fake.writeScheme).not.toHaveBeenCalled();
     expect(fake.storage.length).toBe(0);
+    expect(firstRenderScheme(fake.storage)).toBe("chemdraft");
+    // A later launch (a new process) that reads the file classifies from scratch.
+    setLaunchKeybindingScheme(undefined);
+    fake.host.native!.readPreferences = read;
+    expect(await migrateShortcutDefault(fake.host)).toEqual({ kind: "fresh-install", scheme: "chemdraw" });
+    expect(fake.preferences().shortcutScheme).toBe("chemdraw");
   });
 });
 

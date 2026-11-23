@@ -20,7 +20,12 @@ const native = vi.hoisted(() => ({
   preferences: {} as DesktopPreferences,
   openDocumentSubscription: "ok" as "ok" | "refuse",
   dialogSnapshot: undefined as DialogMessage | undefined,
-  dialogListener: undefined as ((delivery: DialogDelivery) => void) | undefined
+  dialogListener: undefined as ((delivery: DialogDelivery) => void) | undefined,
+  writeFile: vi.fn<(path: string, contents: string) => Promise<void>>(async () => undefined)
+}));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ save: async () => "/tmp/tour-practice.chemdraft" }));
+vi.mock("@tauri-apps/plugin-fs", async original => ({
+  ...await original<typeof import("@tauri-apps/plugin-fs")>(), writeTextFile: native.writeFile
 }));
 vi.mock("./desktopPreferences", () => ({
   desktopPreferences: async (patch?: DesktopPreferences) => {
@@ -86,6 +91,7 @@ describe.each(["macos", "windows"] as const)("Guided Tour findings on %s", platf
     native.openDocumentSubscription = "ok";
     native.dialogSnapshot = undefined;
     native.dialogListener = undefined;
+    native.writeFile.mockClear();
     container = document.createElement("div");
     document.body.append(container);
   });
@@ -163,6 +169,51 @@ describe.each(["macos", "windows"] as const)("Guided Tour findings on %s", platf
     expect(tabs()).toHaveLength(3);
     await act(async () => tabs()[1].click());
     expect(bridge().snapshot().document.pages[0].objects).toEqual(drawn);
+  });
+
+  async function pasteSmiles(smiles: string) {
+    const event = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "clipboardData", { value: { types: ["text/plain"], getData: () => smiles } });
+    await act(async () => { window.dispatchEvent(event); });
+    await vi.waitFor(() => expect(objectTypes()).toEqual(["molecule"]), { timeout: 10_000 });
+  }
+
+  it("does not reset a practice tab whose redo history holds the user's drawing", async () => {
+    await openTour();
+    await openSample();
+    await command("edit.undo");
+    // The user draws in the emptied Tour tab, then undoes back to blank: the drawing is now only
+    // in redo history, and putting the sample back there would clear it.
+    await pasteSmiles("CC");
+    const drawn = bridge().snapshot().document.pages[0].objects;
+    await command("edit.undo");
+    expect(objectTypes()).toEqual([]);
+    await openSample();
+    expect(tabs()).toHaveLength(3);
+    expect(tabs()[2].getAttribute("aria-selected")).toBe("true");
+    expect(objectTypes()).toEqual(["molecule"]);
+    await act(async () => tabs()[1].click());
+    expect(objectTypes()).toEqual([]);
+    await command("edit.redo");
+    expect(bridge().snapshot().document.pages[0].objects).toEqual(drawn);
+  });
+
+  it("does not put the sample back into a practice tab saved to a file", async () => {
+    await openTour();
+    await openSample();
+    await command("edit.undo");
+    await command("document.saveAs");
+    await vi.waitFor(() => expect(native.writeFile).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(bridge().snapshot().file.dirty).toBe(false));
+    await openSample();
+    // A sample restored into the saved tab would be marked clean though the file is blank, so
+    // closing it would not offer to save. The sample opens in a new practice tab instead.
+    expect(tabs()).toHaveLength(3);
+    expect(tabs()[2].getAttribute("aria-selected")).toBe("true");
+    expect(objectTypes()).toEqual(["molecule"]);
+    await act(async () => tabs()[1].click());
+    expect(objectTypes()).toEqual([]);
+    expect(bridge().snapshot().file.dirty).toBe(false);
   });
 
   it("control: the first-run tour opens when the open-file subscription works", async () => {
