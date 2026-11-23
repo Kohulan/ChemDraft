@@ -285,6 +285,61 @@ describe("a stated count on an atom with no aromatic bond lasts until that atom 
     expect(counts(joined)).toEqual({ c1: undefined, c2: undefined, o: 0, s: undefined, m1: undefined, m2: undefined, m3: 0 });
   });
 
+  it("a one-update merge (absorbed atoms and joining bond together, as a plugin writes it) drops the same counts", () => {
+    // An imported C-C-O (C1 stated 2, O stated 0) joined onto an ethane in one updateObject: the
+    // absorbed atoms arrive on re-minted ids with the bond that joins C1 to the ethane's end.
+    const ethane = (): MoleculeObject => ({
+      ...ethoxy(),
+      id: "e",
+      atoms: [
+        { id: "e1", element: "C", x: 0, y: 0, formalCharge: 0 },
+        { id: "e2", element: "C", x: 14, y: 8, formalCharge: 0 }
+      ],
+      bonds: [{ id: "eb", fromAtomId: "e1", toAtomId: "e2", order: "single" }]
+    });
+    const absorbedAtoms: MoleculeObject["atoms"] = [
+      { id: "m1", element: "C", x: 0, y: 40, formalCharge: 0, hydrogenCount: 2 },
+      { id: "m2", element: "C", x: 14, y: 48, formalCharge: 0 },
+      { id: "m3", element: "O", x: 28, y: 40, formalCharge: 0, hydrogenCount: 0 }
+    ];
+    const absorbedBonds: MoleculeObject["bonds"] = [
+      { id: "m-b1", fromAtomId: "m1", toAtomId: "m2", order: "single" },
+      { id: "m-b2", fromAtomId: "m2", toAtomId: "m3", order: "single" }
+    ];
+    const join: MoleculeObject["bonds"][number] = { id: "join", fromAtomId: "e2", toAtomId: "m1", order: "single" };
+    const document = createEmptyDocument();
+    const added = applyPatches(document, [{ op: "addObject", pageId: document.pages[0]!.id, object: ethane() }]);
+    const host = ethane();
+    const atoms = [...host.atoms, ...absorbedAtoms];
+    const counts = (result: typeof added) => Object.fromEntries(
+      (result.pages[0]!.objects[0] as MoleculeObject).atoms.map((atom) => [atom.id, atom.hydrogenCount]));
+    const onePatch = applyPatches(added, [{ op: "updateObject", objectId: host.id, changes: {
+      atoms, bonds: [...host.bonds, ...absorbedBonds, join]
+    } }]);
+    const twoPatches = applyPatches(applyPatches(added, [{ op: "updateObject", objectId: host.id, changes: {
+      atoms, bonds: [...host.bonds, ...absorbedBonds]
+    } }]), [{ op: "updateObject", objectId: host.id, changes: { bonds: [...host.bonds, ...absorbedBonds, join] } }]);
+    expect(counts(onePatch)).toEqual({ e1: undefined, e2: undefined, m1: undefined, m2: undefined, m3: 0 });
+    expect(counts(onePatch)).toEqual(counts(twoPatches));
+  });
+
+  it("a new atom bonded only to other new atoms keeps its count; one bonded to an existing atom drops it", () => {
+    const document = createEmptyDocument();
+    const host = ethoxy();
+    const added = applyPatches(document, [{ op: "addObject", pageId: document.pages[0]!.id, object: host }]);
+    const result = applyPatches(added, [{ op: "updateObject", objectId: host.id, changes: {
+      atoms: [...host.atoms,
+        { id: "n1", element: "N", x: 60, y: 20, formalCharge: 0, hydrogenCount: 3 },
+        { id: "n2", element: "N", x: 80, y: 20, formalCharge: 0, hydrogenCount: 0 },
+        { id: "n3", element: "N", x: 100, y: 20, formalCharge: 0, hydrogenCount: 1 }],
+      bonds: [...host.bonds,
+        { id: "nb1", fromAtomId: "n1", toAtomId: "n2", order: "single" },
+        { id: "nb2", fromAtomId: "s", toAtomId: "n3", order: "single" }]
+    } }]).pages[0]!.objects[0] as MoleculeObject;
+    expect(Object.fromEntries(result.atoms.map((atom) => [atom.id, atom.hydrogenCount])))
+      .toEqual({ c1: undefined, c2: undefined, o: 0, s: undefined, n1: 3, n2: 0, n3: undefined });
+  });
+
   it("is kept when the molecule is added whole (an import, a paste or a duplicate)", () => {
     const document = createEmptyDocument();
     const added = applyPatches(document, [{ op: "addObject", pageId: document.pages[0]!.id, object: ethoxy() }])

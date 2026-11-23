@@ -344,6 +344,43 @@ describe("a CDXML atom whose stated hydrogen count disagrees, in the app", () =>
     }
   });
 
+  it("a plugin's one-patch merge keeps the same counts as the bond tool's merge", () => {
+    // The same join as above, written as a plugin writes it: one updateObject of the ethane carrying
+    // the imported atoms on re-minted ids and the joining bond together, and the import removed.
+    const document = openedDocument(statedOxygenCdxml.replace('<n id="10" p="100 100"/>', '<n id="10" p="100 100" NumHydrogens="2"/>'));
+    const [imported] = moleculesOrThrow(document);
+    const c1 = imported.atoms[0]!;
+    const withEthane = insertNativeSingleBondMolecule(document, { x: 400, y: 400 });
+    const ethane = moleculesOrThrow(withEthane).find(molecule => molecule.id !== imported.id)!;
+    const ethaneEnd = ethane.atoms[1]!;
+    const id = (atomId: string) => `p_${atomId}`;
+    const onePatch = applyPatches(withEthane, [
+      { op: "updateObject", objectId: ethane.id, changes: {
+        atoms: [...ethane.atoms, ...imported.atoms.map(atom => ({ ...atom, id: id(atom.id) }))],
+        bonds: [
+          ...ethane.bonds,
+          ...imported.bonds.map(bond => ({ ...bond, id: id(bond.id), fromAtomId: id(bond.fromAtomId), toAtomId: id(bond.toAtomId) })),
+          { id: "p_join", fromAtomId: ethaneEnd.id, toAtomId: id(c1.id), order: "single" as const }
+        ]
+      } },
+      { op: "removeObject", objectId: imported.id }
+    ]);
+    const dragged = applyFreeformSingleBondToolAtPoint(withEthane, ethane.id, ethaneEnd.id, { x: c1.x, y: c1.y });
+    const countsByPlace = (merged: ChemDraftDocument) => {
+      const molecules = moleculesOrThrow(merged);
+      expect(molecules).toHaveLength(1);
+      return Object.fromEntries(molecules[0].atoms
+        .filter(atom => imported.atoms.some(source => source.x === atom.x && source.y === atom.y))
+        .map(atom => [`${atom.element}@${atom.x},${atom.y}`, atom.hydrogenCount]));
+    };
+    const expected = Object.fromEntries(imported.atoms.map(atom =>
+      [`${atom.element}@${atom.x},${atom.y}`, atom.element === "O" ? 0 : undefined]));
+    expect(countsByPlace(onePatch)).toEqual(expected);
+    expect(countsByPlace(dragged)).toEqual(expected);
+    const molecule = moleculesOrThrow(onePatch)[0];
+    expect(molecule.atoms.find(atom => atom.id === ethaneEnd.id)!.hydrogenCount).toBeUndefined();
+  });
+
   it("the problem window's hydrogen fix uses the derived count", () => {
     const document = openedDocument();
     const [molecule] = moleculesOrThrow(document);

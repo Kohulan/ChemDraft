@@ -45,10 +45,12 @@ export function atomStatedHydrogenCount(
  * position and edits of other atoms keep it.
  *
  * An atom `previous` does not have (a pasted or sprouted atom, or one merged in from another
- * molecule on a re-minted id) has nothing to be compared with, so it keeps the count it arrives
- * with, even though every bond at it is new here. That is what keeps a merge's absorbed atoms'
- * counts: the merge re-mints them into the host and the joining bond is added afterward, so only
- * the two atoms that bond reaches drop theirs (their own diff sees it as a bond added at them).
+ * molecule on a re-minted id) has nothing of its own to be compared with, so it keeps the count it
+ * arrives with while its bonds reach only other new atoms: a merge's absorbed atoms keep their
+ * counts on their new ids. A new bond that joins it to an atom `previous` has is a bond added at
+ * it, so it drops its count, as that atom does. So a merge drops exactly the counts of the two atoms
+ * the joining bond reaches, whether it comes as one update (absorbed atoms and joining bond
+ * together, as a plugin writes it) or as two (the bond tool absorbs, then joins).
  */
 export function clearChangedAtomHydrogenHints(
   previous: Pick<MoleculeObject, "atoms" | "bonds">,
@@ -56,6 +58,9 @@ export function clearChangedAtomHydrogenHints(
   bonds: readonly MoleculeBond[]
 ): MoleculeAtom[] {
   const changed = new Set<string>();
+  // New atoms reached by a new bond from an atom `previous` has: joined onto the old graph.
+  const joined = new Set<string>();
+  const oldAtoms = new Map(previous.atoms.map((atom) => [atom.id, atom]));
   const oldBonds = new Map(previous.bonds.map((bond) => [bond.id, bond]));
   for (const bond of bonds) {
     const old = oldBonds.get(bond.id);
@@ -69,16 +74,20 @@ export function clearChangedAtomHydrogenHints(
       changed.add(bond.fromAtomId);
       changed.add(bond.toAtomId);
       if (old) { changed.add(old.fromAtomId); changed.add(old.toAtomId); }
+      if (!sameEndpoints) {
+        if (oldAtoms.has(bond.fromAtomId)) joined.add(bond.toAtomId);
+        if (oldAtoms.has(bond.toAtomId)) joined.add(bond.fromAtomId);
+      }
     }
   }
   for (const bond of oldBonds.values()) {
     changed.add(bond.fromAtomId);
     changed.add(bond.toAtomId);
   }
-  const oldAtoms = new Map(previous.atoms.map((atom) => [atom.id, atom]));
   return dropOrphanedHydrogenHints(atoms.map((atom) => {
     const old = oldAtoms.get(atom.id);
-    if (atom.hydrogenCount === undefined || !old || (!changed.has(atom.id) && sameAtomStatement(atom, old))) return atom;
+    if (atom.hydrogenCount === undefined) return atom;
+    if (!old ? !joined.has(atom.id) : !changed.has(atom.id) && sameAtomStatement(atom, old)) return atom;
     return withoutHydrogenHint(atom);
   }), bonds);
 }
@@ -116,7 +125,8 @@ function sameAtomStatement(atom: MoleculeAtom, old: MoleculeAtom): boolean {
  * with no aromatic bond keeps its count: nothing here can tell that it changed. A fragment copy is
  * rebuilt through `clearChangedAtomHydrogenHints` against its source molecule, which drops the count
  * of every atom whose bonds were cut. A merge cuts nothing: the absorbed atoms keep their counts on
- * their new ids, and the joining bond drops the counts of the two atoms it reaches.
+ * their new ids, and the joining bond drops the counts of the two atoms it reaches, in one update
+ * or two.
  * Returns `atoms` itself when nothing changes.
  */
 export function dropOrphanedHydrogenHints(
