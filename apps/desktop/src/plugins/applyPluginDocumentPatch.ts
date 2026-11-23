@@ -17,7 +17,7 @@ import {
 import { assertPluginDocumentWriteScope, bareIdTargetPage, objectInWriteScope, rebasePluginPatch,
   retainedCtabCompatibility, storedCtabReference, writePatchOps, type PageObjectRef, type PluginHost,
   type PluginWriteScopePages } from "@chemdraft/plugin-host";
-import { selectionBounds, translateInsertedDocumentObjects } from "../documentWorkflow";
+import { selectionBounds, translateInsertedDocumentObjects, withImpliedRadicalChemistryRederived } from "../documentWorkflow";
 import { choosePlacement, objectRect, overlaps as boundsOverlap, pageContentRect, RELATIVE_GAP, unionRects } from "../assistant/placement";
 import type { ViewportRect } from "@chemdraft/viewport-engine";
 import { nativeSingleBondGraphMetadata, tryNativeSingleBondGraphSmiles } from "@chemdraft/document-workflow-core";
@@ -349,6 +349,16 @@ export function applyPluginDocumentPatch(
       y = Math.max(0, Math.min(page.height - bounds.height, centerY - bounds.height / 2));
     }
     patched = translateInsertedDocumentObjects(patched, objects.map(object => object.id), x - bounds.x, y - bounds.y);
+  }
+  // An inserted molecule copied from a document saved before the H• reading carries a lone H's stale
+  // H2 cache. Re-derive the inserted molecules only (by page and id), before verification and inside
+  // this write's one history entry; atoms, bonds and placement stay as authored.
+  const insertedRefs = new Set(writePatchOps(proposed.patch).flatMap(op =>
+    op.op === "addObject" && op.object.type === "molecule" ? [`${op.pageId}\u0000${op.object.id}`] : []));
+  if (insertedRefs.size) {
+    patched = withImpliedRadicalChemistryRederived(patched, {
+      only: (pageId, objectId) => insertedRefs.has(`${pageId}\u0000${objectId}`), occasion: "on plugin insert"
+    });
   }
   // Record each touched object by page and id: the page an insertion names, and the page chem-core's
   // bare-id op acted on (its first occurrence). A same-id object on another page is never "touched".

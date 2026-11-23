@@ -8365,7 +8365,8 @@ export function normalizeCommittedDocument(
   options: CommittedDocumentNormalizationOptions & { preserveElectronMarks?: boolean } = {}
 ): ChemDraftDocument {
   document = reconcileReactionArrowAttachments(document);
-  // Open and restore (the only callers preserving stored marks) re-derive stale lone-H caches.
+  // Open and restore (the only callers preserving stored marks) re-derive stale lone-H caches. Paste
+  // and plugin inserts re-derive the molecules they bring in themselves; other commits never do.
   if (options.preserveElectronMarks) document = withImpliedRadicalChemistryRederived(document);
   const reconciled = options.preserveElectronMarks ? document : reconcileNativeChargeMarks(document, options);
   const recorded = withNativeDocumentLabelBondSides(reconciled);
@@ -8377,23 +8378,34 @@ export function normalizeCommittedDocument(
 }
 
 /**
- * Re-derives the cached chemistry (structure, formula, masses) of each molecule holding a lone
- * hydrogen atom's implied radical (`atomImpliedRadicalCount`; H•, owner decision 2026-11-23), through
- * the path every graph edit takes (`refreshNativeSingleBondGraph`). Documents saved before that
- * reading cache RDKit's old H2 ("[HH]", formula H2), which would show H2 beside a canvas drawing H•.
- * Only those molecules are touched, and only when a cached value differs from the derived one; every
- * other molecule keeps its stored chemistry (no recompute on open). Open and session restore call
- * this through `normalizeCommittedDocument`.
+ * Re-derives the cached chemistry (structure, formula, masses, radicalCount) of each molecule holding
+ * a lone hydrogen atom's implied radical (`atomImpliedRadicalCount`; H•, owner decision 2026-11-23),
+ * through the path every graph edit takes (`refreshNativeSingleBondGraph`). Documents saved before
+ * that reading cache RDKit's old H2 ("[HH]", formula H2), which would show H2 beside a canvas drawing
+ * H•. Only those molecules are touched, and only when a cached value differs from the derived one;
+ * atoms, bonds and geometry stay as stored, and every other molecule keeps its stored chemistry.
+ *
+ * The ONE implementation for every way a stored molecule object enters an open document:
+ * - open and session restore, through `normalizeCommittedDocument` (every molecule);
+ * - a native ChemDraft clipboard paste (`pasteSelectionClipboardPayload`, the pasted molecules);
+ * - a plugin `documents.applyPatch` insert or an accepted proposal (`applyPluginDocumentPatch`,
+ *   the inserted molecules).
+ * `only` limits it to the objects that operation brought in; `occasion` names it in the log.
+ *
+ * Fail safe: this is a refresh of a cache, never a reason to refuse a document or an insertion. If
+ * the recompute throws on an unusual molecule, that molecule stays exactly as stored (no chemistry
+ * is changed), the error is logged with the molecule id, and the rest proceeds.
  */
-function withImpliedRadicalChemistryRederived(document: ChemDraftDocument): ChemDraftDocument {
+export function withImpliedRadicalChemistryRederived(
+  document: ChemDraftDocument,
+  options: { only?: (pageId: string, objectId: string) => boolean; occasion?: string } = {}
+): ChemDraftDocument {
+  const occasion = options.occasion ?? "on open";
   let changed = false;
   const pages = document.pages.map((page) => {
     let pageChanged = false;
     const objects = page.objects.map((object) => {
-      if (object.type !== "molecule") return object;
-      // Fail safe: this recompute is a refresh of a cache, never a reason to refuse a document. If it
-      // throws on an unusual molecule, that molecule stays exactly as stored (no chemistry is
-      // changed), the error is logged with the molecule id, and opening continues.
+      if (object.type !== "molecule" || (options.only && !options.only(page.id, object.id))) return object;
       try {
         if (!object.atoms.some((atom) => atomImpliedRadicalCount(atom, object.bonds) > 0)) return object;
         const derived = refreshNativeSingleBondGraph(object, object.atoms, object.bonds);
@@ -8404,7 +8416,7 @@ function withImpliedRadicalChemistryRederived(document: ChemDraftDocument): Chem
         pageChanged = true;
         return refreshed;
       } catch (error) {
-        console.error(`Could not re-derive the cached chemistry of molecule ${object.id} on open; keeping it as stored`, error);
+        console.error(`Could not re-derive the cached chemistry of molecule ${object.id} ${occasion}; keeping it as stored`, error);
         return object;
       }
     });
@@ -15398,7 +15410,12 @@ export function pasteSelectionClipboardPayload(
   // No chemistry check here: MainWindow moves the pasted objects to the pointer or the repeat-paste
   // position after this returns, so only the commit funnel sees where they finally land
   // (`commitChemistryGuard.ts` refuses a paste that would change a molecule already on the page).
-  return payload.nativeSource ? copyNativeObjectExtensions(payload.nativeSource, next, idBySourceId) : next;
+  const copied = payload.nativeSource ? copyNativeObjectExtensions(payload.nativeSource, next, idBySourceId) : next;
+  // A payload copied from a document saved before the H• reading carries a lone H's stale H2 cache.
+  // Re-derive the pasted molecules only, inside this paste's own document (one undo entry).
+  return withImpliedRadicalChemistryRederived(copied, {
+    only: (pageId, objectId) => pageId === page.id && pastedMoleculeIds.has(objectId), occasion: "on paste"
+  });
 }
 
 /**
