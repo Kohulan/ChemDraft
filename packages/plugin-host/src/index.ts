@@ -2353,8 +2353,9 @@ export class PluginHost {
             const document = readDocument && "then" in readDocument ? await readDocument : readDocument;
             // Bind the ids to the page they were selected on at Send: the override's own page, never
             // the live selection's page, which may have changed since.
+            // An override that names its page keeps that pin even when the object is gone from it.
             const pins = pinSelectionPages(document, overrideIds ?? document?.selection.objectIds ?? [],
-              override ? override.pageId : document?.selection.pageId ?? document?.pages[0]?.id);
+              override ? override.pageId : document?.selection.pageId ?? document?.pages[0]?.id, override?.pageId !== undefined);
             const selectedIds = (overrideIds ?? document?.selection.objectIds ?? []).filter(id => !pins.ambiguous.includes(id));
             const ordinaryStop = new AbortController();
             this.activeCommandInvocations.set(invocationToken, {

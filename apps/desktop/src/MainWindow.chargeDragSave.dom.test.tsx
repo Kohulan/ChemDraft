@@ -113,6 +113,31 @@ describe.each(["macos", "windows"] as const)("charge drag Save (%s)", platform =
     expect(snapshot().document).toEqual(edited);
   });
 
+  it.each(["Delete", "o"] as const)("saves an edit (%s) made while an atom press is held below the drag threshold", async editKey => {
+    const { document: initialDocument, nitrogen } = ammoniumElectronMarkDropFixture();
+    await act(async () => root.render(<MainWindow initialDocument={initialDocument} initialActiveToolCommandId="tool.select"
+      initialPaletteMode="hidden" initialCrosshairsVisible={false} initialRulersVisible={false} nativePalette shortcutPlatform={platform} />));
+    const page = container.querySelector<HTMLElement>(".page")!;
+    page.getBoundingClientRect = () => ({ x: 0, y: 0, left: 0, top: 0, right: 792, bottom: 612, width: 792, height: 612, toJSON: () => ({}) });
+    await key("s");
+    expect(savedWrites()).toHaveLength(1);
+    native.writeFile.mockClear();
+    const target = container.querySelector(`.native-molecule-object[data-object-id="${dropMolecule(initialDocument).id}"]`)!;
+    await pointer(target, "pointerdown", nitrogen);
+    const pressed = snapshot().document;
+    await key(editKey);
+    const edited = snapshot().document;
+    expect(edited, "the held press must not block the ordinary edit").not.toEqual(pressed);
+    expect(snapshot().file.dirty).toBe(true);
+    await key("s");
+    expect(savedWrites()).toHaveLength(1);
+    const saved = openChemDraftPayload(savedWrites()[0][1]).document!;
+    expect(dropMolecule(saved), "Save must write the edited document, not the held press's snapshot").toEqual(dropMolecule(edited));
+    await pointer(page, "pointerup", nitrogen);
+    expect(snapshot().document).toEqual(edited);
+    expect(snapshot().file.dirty, "the file on disk matches the live document").toBe(false);
+  });
+
   describe.each(["move", "resize"] as const)("%s gesture", gesture => {
   describe.each(["Escape", "pointercancel", "pointerup", "Escape during save"] as const)("%s", ending => {
     it.each([false, true])("saves pre-drag chemistry and finishes consistently (conditions: %s)", async withConditions => {

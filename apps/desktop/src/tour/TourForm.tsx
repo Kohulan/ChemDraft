@@ -4,7 +4,7 @@ import type { KeybindingScheme } from "../keybindingSettings";
 import { detectDesktopShortcutPlatform } from "../keyboardShortcuts";
 import { DIALOG_FONTS_READY_TIMEOUT_MS } from "../dialogs/dialogContentFit";
 import { TOUR_TITLE, type TourAction, type TourPluginCommand } from "./tourCommands";
-import { tourShortcutChoices, tourSteps } from "./tourSteps";
+import { tourShortcutChoices, tourSteps, type TourBondKeys } from "./tourSteps";
 import "./TourForm.css";
 
 /** The tallest step's text area reserves at most this many CSS pixels; longer text scrolls. The host
@@ -68,7 +68,7 @@ function fontsSettledNow(): boolean {
 }
 
 export function TourForm({
-  scheme, onAction, onReady, busy, error, platform = detectDesktopShortcutPlatform(), plugins = []
+  scheme, onAction, onReady, busy, error, platform = detectDesktopShortcutPlatform(), plugins = [], bondKeys
 }: {
   scheme: KeybindingScheme;
   onAction: (action: TourAction) => void;
@@ -81,6 +81,8 @@ export function TourForm({
   /** Plugin commands the menus offered when the tour opened. Missing means none: never demo a plugin
    *  that might not be installed. */
   plugins?: readonly TourPluginCommand[];
+  /** The Add Single Bond to Hovered Atom key per scheme, after the user's overrides (`tourBondKeys`). */
+  bondKeys?: TourBondKeys;
 }) {
   const [index, setIndex] = useState(0);
   // The step list is fixed when the tour opens. Installing or removing a plugin while it is open does
@@ -101,7 +103,7 @@ export function TourForm({
   const measuredWidth = useRef<number | undefined>(undefined);
   const readied = useRef(false);
   const heading = useRef<HTMLHeadingElement>(null);
-  const steps = tourSteps(scheme, platform, openedWith);
+  const steps = tourSteps(scheme, platform, openedWith, bondKeys?.[scheme]);
   const step = steps[index];
   const tryCommand = step.tryCommand;
   const visibleError = errorStep === index ? error : undefined;
