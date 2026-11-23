@@ -62,6 +62,25 @@ export function atomImpliedRadicalCount(atom: MoleculeAtom, bonds: readonly Mole
 }
 
 /**
+ * Unpaired electrons a molecule's atoms carry: every radical mark plus every lone hydrogen atom's
+ * implied radical (`atomImpliedRadicalCount`, the one rule). A mark suppresses the implied radical,
+ * so no electron is counted twice. This is the cached `chemistry.radicalCount`, so the stored count
+ * agrees with the H• the canvas draws, the SMILES exports and RDKit reads. Each atom is judged
+ * against its own bonds only, read from one adjacency pass, so the count stays linear.
+ */
+export function moleculeRadicalCount(atoms: readonly MoleculeAtom[], bonds: readonly MoleculeBond[]): number {
+  const bondsByAtom = new Map<string, MoleculeBond[]>();
+  for (const bond of bonds) {
+    for (const id of new Set([bond.fromAtomId, bond.toAtomId])) {
+      const list = bondsByAtom.get(id);
+      if (list) list.push(bond); else bondsByAtom.set(id, [bond]);
+    }
+  }
+  return atoms.reduce((sum, atom) =>
+    sum + (atom.markRadicals ?? 0) + atomImpliedRadicalCount(atom, bondsByAtom.get(atom.id) ?? []), 0);
+}
+
+/**
  * What a stored hydrogen count is to everything that reads the atom; `atomStatedHydrogenCount` and
  * `atomIgnoresStatedHydrogenCount` are both read from here, so they cannot disagree:
  * - "none": no count is stored;

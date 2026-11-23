@@ -317,6 +317,51 @@ describe("atoms whose label draws no count of its own: a dative-only carbon, H, 
       "CDXML import: atom 10 (H) states 1 hydrogen, which a hydrogen atom cannot carry: only 0 can be kept, as a typed H, D or T label means. The stated count was not kept."
     ]);
   });
+
+  it("a lone H whose stated count is not kept opens as H•, one radical atom", () => {
+    // The dropped count leaves a lone, neutral H stating nothing: one atom with one radical electron.
+    const { molecule } = open(`<CDXML><page id="1"><fragment id="2"><n id="10" p="0 0" Element="1" NumHydrogens="1"/></fragment></page></CDXML>`);
+    const chemistry = nativeSingleBondGraphMetadata(molecule.atoms, molecule.bonds);
+    expect([molecule.atoms[0]!.hydrogenCount, chemistry.formula, chemistry.radicalCount]).toEqual([undefined, "H", 1]);
+    expect(nativeSingleBondGraphSmiles(molecule.atoms, molecule.bonds)).toBe("[H]");
+  });
+
+  // The cached radicalCount counts the lone H's implied radical (H•). CDXML writes the lone H as a
+  // bare H node with no Radical attribute, and the same rule reads it back as H•, so nothing is lost:
+  // the radical-loss check counts the implied radical too, and warns only of a real loss.
+  it.each([false, true])("exports a lone H with no radical-loss warning and reads it back as H• (payload=%s)", (embedNativePayload) => {
+    const opened = open(`<CDXML><page id="1"><fragment id="2"><n id="10" p="0 0" Element="1"/></fragment></page></CDXML>`).result;
+    const withChemistry = (radicalCount?: number, markRadicals?: number) => {
+      const document = structuredClone(opened.document!);
+      const molecule = moleculeOf({ document });
+      if (markRadicals !== undefined) molecule.atoms[0]!.markRadicals = markRadicals;
+      const chemistry = nativeSingleBondGraphMetadata(molecule.atoms, molecule.bonds);
+      molecule.chemistry = { ...chemistry, radicalCount: radicalCount ?? chemistry.radicalCount };
+      return document;
+    };
+    const payloadOnly = (document: ReturnType<typeof withChemistry>) => exportDocumentToCdxml(document, { embedNativePayload }).warnings
+      .filter((warning) => warning.code === "cdxml.molecule_metadata_payload_only");
+
+    const lone = withChemistry();
+    expect(moleculeOf({ document: lone }).chemistry?.radicalCount).toBe(1);
+    expect(payloadOnly(lone)).toEqual([]);
+    const plain = exportDocumentToCdxml(lone, { embedNativePayload: false }).contents;
+    expect(plain).not.toContain("Radical=");
+    const reread = moleculeOf(openChemDraftPayload(plain));
+    expect(reread.atoms.map(({ element, hydrogenCount, markRadicals }) => ({ element, hydrogenCount, markRadicals })))
+      .toEqual([{ element: "H", hydrogenCount: undefined, markRadicals: undefined }]);
+    const rereadChemistry = nativeSingleBondGraphMetadata(reread.atoms, reread.bonds);
+    expect([rereadChemistry.formula, rereadChemistry.radicalCount, nativeSingleBondGraphSmiles(reread.atoms, reread.bonds)]).toEqual(["H", 1, "[H]"]);
+
+    // A real radical mark suppresses the implied radical: one electron, written as a Doublet, no warning.
+    const marked = withChemistry(undefined, 1);
+    expect(moleculeOf({ document: marked }).chemistry?.radicalCount).toBe(1);
+    expect(payloadOnly(marked)).toEqual([]);
+    expect(exportDocumentToCdxml(marked, { embedNativePayload: false }).contents).toContain('Radical="Doublet"');
+
+    // A count the drawn atoms cannot account for is still reported as lost.
+    expect(payloadOnly(withChemistry(2))).toEqual([expect.objectContaining({ message: expect.stringContaining("radical count") })]);
+  });
 });
 
 /**

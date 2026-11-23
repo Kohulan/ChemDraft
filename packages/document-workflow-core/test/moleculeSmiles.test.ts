@@ -407,6 +407,26 @@ describe("a lone H, D or T: label, native formula, RDKit formula and SMILES agre
     expect(await moleculeSmiles(stated, 0, [], undefined)).toBe("[H]");
   });
 
+  // The cached chemistry.radicalCount is the count RDKit reads (1 above): radical marks plus the lone
+  // hydrogen atom's implied radical, through chem-core's one rule. A mark suppresses the implied one.
+  it("caches a lone H, D or T's radical electron in chemistry.radicalCount, and counts a real mark once", () => {
+    for (const element of ["H", "D", "T"]) {
+      expect(nativeSingleBondGraphMetadata([hydrogen(element)], []).radicalCount).toBe(1);
+      expect(nativeSingleBondGraphMetadata([hydrogen(element, { markRadicals: 1 })], []).radicalCount).toBe(1);
+      // A stated 0, a typed label, a charge or a bond leaves the bare atom: no implied radical.
+      for (const extra of [{ hydrogenCount: 0 }, { labelLiteral: true }, { formalCharge: 1 }, { formalCharge: -1 }]) {
+        expect(nativeSingleBondGraphMetadata([hydrogen(element, extra)], []).radicalCount).toBe(0);
+      }
+      const bonded = [hydrogen(element), { id: "cl", element: "Cl", x: 14, y: 0, formalCharge: 0 }];
+      expect(nativeSingleBondGraphMetadata(bonded, [{ id: "b", fromAtomId: "h", toAtomId: "cl", order: "single" }]).radicalCount).toBe(0);
+    }
+    // The unknown-bond-order record (formula declined) counts the same radicals.
+    const carbons: MoleculeAtom[] = [{ id: "c1", element: "C", x: 20, y: 0, formalCharge: 0 }, { id: "c2", element: "C", x: 34, y: 0, formalCharge: 0 }];
+    const unknown = nativeSingleBondGraphMetadata([hydrogen("H"), ...carbons], [{ id: "u", fromAtomId: "c1", toAtomId: "c2", order: "unknown" }]);
+    expect(unknown.formula).toBeUndefined();
+    expect(unknown.radicalCount).toBe(1);
+  });
+
   it("a lone H+ or H- has no room for a hydrogen", async () => {
     for (const [charge, smiles] of [[1, "[H+]"], [-1, "[H-]"]] as const) {
       expect(await readings(molecule([hydrogen("H", { formalCharge: charge })]))).toEqual({

@@ -5,6 +5,7 @@
 
 import {
   atomStatedHydrogenCount,
+  moleculeRadicalCount,
   atomIgnoresStatedHydrogenCount,
   drawnLabelBondSide,
   ignoredHydrogenCountAtomKind,
@@ -1058,7 +1059,7 @@ export function nativeSingleBondGraphMetadata(
     return {
       atomCount: atoms.length, bondCount: bonds.length,
       totalCharge: atoms.reduce((sum, atom) => sum + atom.formalCharge, 0),
-      radicalCount: atoms.reduce((sum, atom) => sum + (atom.markRadicals ?? 0), 0),
+      radicalCount: moleculeRadicalCount(atoms, bonds),
       isotopeLabels: [...new Set(atoms.flatMap(atom => atom.element === "D" ? ["2H"] :
         atom.element === "T" ? ["3H"] : atom.isotope === undefined ? [] : [`${atom.isotope}${atom.element}`]))].sort(),
       stereochemistry: [],
@@ -1071,7 +1072,9 @@ export function nativeSingleBondGraphMetadata(
   // formula's hydrogens are the ones the drawing shows.
   const drawnResolution = nativeBondOrderResolution(atoms, bonds);
   const totalCharge = atoms.reduce((sum, atom) => sum + atom.formalCharge, 0);
-  const radicalCount = atoms.reduce((sum, atom) => sum + (atom.markRadicals ?? 0), 0);
+  // Radical marks plus a lone hydrogen atom's implied radical (H•, owner decision 2026-11-23), so the
+  // cached count is the one the canvas draws, the SMILES exports and RDKit reads.
+  const radicalCount = moleculeRadicalCount(atoms, bonds);
   const warnings = nativeInvalidAtomWarnings(atoms, bonds, drawnResolution);
   // A valid group label ("OMe", "NMe2") is counted as the real atoms it stands for, through the
   // same per-atom arithmetic below — never as a formula added up by hand — so the formula is the

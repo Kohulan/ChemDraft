@@ -34,10 +34,25 @@ describe("opening a document whose lone H carries the old H2 cache", () => {
     expect(lone.chemistry?.formula).toBe("H");
     expect(lone.chemistry?.averageMass).toBeCloseTo(1.008, 3);
     expect(lone.chemistry?.exactMass).toBeCloseTo(1.00783, 4);
+    // The cache stored radicalCount 0; H• has one radical electron, as RDKit reads it.
+    expect(lone.chemistry?.radicalCount).toBe(1);
     const warnings: ExportWarning[] = [];
     expect(await moleculeSmiles(lone, 0, warnings, undefined)).toBe("[H]");
     // Idempotent: a second open normalization changes nothing.
     expect(workflow.normalizeCommittedDocument(result, { preserveElectronMarks: true })).toBe(result);
+  });
+
+  it("re-derives a lone H's stale radicalCount 0 even when its structure and formula already read H•", () => {
+    // Saved after the H• reading but before the cached count included the implied radical.
+    const saved = { ...molecule("saved", [atom("h", "H")], "[H]", "H"), chemistry: {
+      formula: "H", averageMass: 1.008, exactMass: 1.00783, atomCount: 1, bondCount: 0,
+      totalCharge: 0, radicalCount: 0, isotopeLabels: [], stereochemistry: [], warnings: []
+    } };
+    const result = opened([saved]);
+    const lone = result.pages[0]!.objects.find((object): object is MoleculeObject => object.id === "saved")!;
+    expect(lone.structure).toBe("[H]");
+    expect(lone.chemistry?.formula).toBe("H");
+    expect(lone.chemistry?.radicalCount).toBe(1);
   });
 
   it("leaves every molecule without an implied radical exactly as stored", () => {

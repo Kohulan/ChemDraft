@@ -13,6 +13,7 @@ import {
   drawnLabelBondSide,
   isDativeBond,
   isEngineDocument,
+  moleculeRadicalCount,
   moleculeToMolfileV3000,
   nativeTextStyleFromObjectStyle,
   parseDocument,
@@ -2140,7 +2141,9 @@ function exportMoleculeObject(
       const split = value.lastIndexOf(":");
       return visibleStereo.get(atomIds.get(value.slice(0, split)) ?? "") !== value.slice(split + 1);
     });
-    const visibleRadicals = molecule.atoms.reduce((total, atom) => total + (atom.markRadicals ?? 0), 0);
+    // Radical attributes, plus a lone hydrogen atom's implied radical (H•): it is written as a bare H
+    // node and read back as H• by the same rule (`atomImpliedRadicalCount`), so nothing is lost.
+    const visibleRadicals = moleculeRadicalCount(molecule.atoms, molecule.bonds);
     const missingRadicals = (molecule.chemistry?.radicalCount ?? 0) > visibleRadicals;
     if (!missingRadicals && !missingStereo) return;
     warnings.push({

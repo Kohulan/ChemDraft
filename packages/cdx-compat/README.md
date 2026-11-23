@@ -131,10 +131,14 @@ Synthetic coverage includes biphenyl/Ph, Boc-NH, OTBS, OMe and three independent
   ones (a dative bond costs its donor nothing), so a count that differs is kept, flagged and drawn as
   a typed "C" … "CH4" would be;
 - on a hydrogen atom (H, D or T) stating 0, always: that is what a typed H, D or T label means, and
-  the atom is drawn, counted and written as that typed label is (flagged where the derived count
-  differs: a lone H derives 1). Any other count on a hydrogen atom is not kept, since no typed label
-  draws a hydrogen atom carrying hydrogens of its own; `cdxml.atom_hydrogen_count_not_kept` names
-  each such atom, unless the count agrees with the derived one (a lone H stating 1);
+  the atom is drawn, counted and written as that typed label is. Every hydrogen atom derives zero
+  hydrogens (bonded, its one bond is spent; lone, bond-less and neutral, it is one atom with one
+  radical electron, H•, owner decision 2026-11-23), so a stated 0 never draws a count mismatch
+  warning; a lone H stating 0 is still flagged, as a typed literal H is, since it shows no radical.
+  Any nonzero count on a hydrogen atom, lone or bonded, is not kept, since no typed label draws a
+  hydrogen atom carrying hydrogens of its own: `cdxml.atom_hydrogen_count_not_kept` names each such
+  atom and its count. A lone H stating 1 is therefore not H2: its count is dropped and it opens as
+  H• (formula H, SMILES `[H]`);
 - on an atom whose label is not an element, always, for the file's sake; nothing counts hydrogens on it.
   On the unknown atom `*` (an `Element` naming nothing, an unlabeled nickname node, a `*` generic
   label) a count other than 0 is therefore also reported: its label draws none, the formula counts

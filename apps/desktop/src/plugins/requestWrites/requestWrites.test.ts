@@ -1657,6 +1657,35 @@ describe("verified request writes", () => {
     } finally { await f.finish(); }
   });
 
+  // A lone H is H•, one radical electron (owner decision 2026-11-23), as RDKit reads it: a plugin
+  // stating radicalCount 1 tells the truth and is accepted; 0 contradicts the drawn atom.
+  it.each([
+    { radicalCount: 1, accepted: true },
+    { radicalCount: 0, accepted: false }
+  ])("judges a lone H's claimed radical count $radicalCount against H• (accepted: $accepted)", async ({ radicalCount, accepted }) => {
+    const carbon = [{ ...ethane.atoms[0]! }];
+    const methane: MoleculeObject = { ...ethane, id: "lone", atoms: carbon, bonds: [], structure: "C",
+      chemistry: nativeSingleBondGraphMetadata(carbon, []) };
+    const f = setup([methane.id], undefined, { objects: [methane] });
+    try {
+      const atoms = [{ ...carbon[0]!, element: "H" }];
+      const derived = nativeSingleBondGraphMetadata(atoms, []);
+      expect(derived.radicalCount).toBe(1);
+      const before = f.pinned();
+      const result = await f.context.documents.applyRequestPatch!({ requestId: await f.begin(),
+        patch: { op: "updateObject", objectId: methane.id, changes: { atoms, chemistry: { ...derived, radicalCount } } },
+        expectedStructures: [{ kind: "object", pageId: f.pageId, objectId: methane.id, sourceSmiles: "[H]" }] });
+      if (accepted) {
+        expect(result).toMatchObject({ ok: true });
+        expect(f.pinned().pages[0]!.objects.find(object => object.id === methane.id))
+          .toMatchObject({ chemistry: { formula: "H", radicalCount: 1 } });
+      } else {
+        expect(result).toMatchObject({ ok: false, error: { code: "chemistry", message: expect.stringContaining("radical count") } });
+        expect(f.pinned()).toBe(before);
+      }
+    } finally { await f.finish(); }
+  });
+
   it("inserts the exact native standalone CH3 group without a molecular SMILES expectation", async () => {
     const f = setup();
     try {
