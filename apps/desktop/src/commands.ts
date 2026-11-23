@@ -2144,6 +2144,9 @@ export function createLayerActions(document: ChemDraftDocument, layoutsEnabled =
     ? arrowPage.objects.find(object => object.id === arrow.arrowAttachment!.parentObjectId) : arrow;
   const hasArrow = !!parent && !!arrowAttachmentFrame(arrowPage, parent);
   const hasSelection = document.selection.objectIds.length > 0;
+  const selectedForRotation = document.selection.objectIds.length === 1
+    ? document.pages.flatMap(page => page.objects).find(object => object.id === document.selection.objectIds[0]) : undefined;
+  const hasRotatableMolecule = selectedForRotation?.type === "molecule" && selectedForRotation.atoms.length > 0;
   const hasMultiSelection = document.selection.objectIds.length >= 2;
   const hasDistributableSelection = document.selection.objectIds.length >= 3;
   const hasSelectedGroup = selectedGroupObjectIds(document).length > 0;
@@ -2378,6 +2381,17 @@ export function createLayerActions(document: ChemDraftDocument, layoutsEnabled =
       category: "layout",
       enabled: hasSelection,
       description: "Mirror the selected document objects top to bottom"
+    },
+    {
+      id: "layout.rotateMolecule",
+      title: "Rotate Molecule…",
+      icon: "align",
+      assetName: "Custom_Rotation",
+      source: "core",
+      category: "layout",
+      enabled: hasRotatableMolecule,
+      disabledReason: hasRotatableMolecule ? undefined : "Select one whole molecule with editable atoms",
+      description: "Enter an in-plane angle while preserving molecular geometry"
     },
     {
       id: "layout.rotate90",
