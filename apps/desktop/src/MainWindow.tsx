@@ -239,7 +239,7 @@ import {
   type PluginWriteGate
 } from "./plugins/applyPluginDocumentPatch";
 import { AnalyzerNoticeBanner, type AnalyzerNotice } from "./plugins/AnalyzerNotice";
-import { PatchReviewTray, PendingProposalsBadge, proposalReviewItem } from "./plugins/PatchReviewTray";
+import { acceptedProposalMessage, PatchReviewTray, PendingProposalsBadge, proposalReviewItem } from "./plugins/PatchReviewTray";
 import type { DesktopPluginRuntime } from "./plugins/createPluginRuntime";
 import {
   ANALYSIS_WINDOW_OWNER_ID,
@@ -13823,10 +13823,7 @@ export function MainWindow({
           try { await pending; } finally { pageFitPendingRef.current -= 1; }
         }
         setSelectedNativeMoleculePart(undefined);
-        const inserted = recognized ? `${pluginName}: inserted recognized structure` : `${pluginName}: applied proposal`;
-        const message = screenCapture
-          ? `${inserted}; its screen capture stays saved (Add or Remove Plugins › Show saved screen captures)`
-          : inserted;
+        const message = acceptedProposalMessage(pluginName, proposal, { recognized, screenCapture: Boolean(screenCapture) });
         setStatus(message);
         return { ok: true, message };
       } catch (error) {

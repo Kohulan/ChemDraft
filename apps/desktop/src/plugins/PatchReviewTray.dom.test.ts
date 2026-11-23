@@ -4,20 +4,23 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type { PluginHost, QueuedProposedPatch } from "@chemdraft/plugin-host";
 import type { PluginProposalReviewItem } from "./panelBridge";
-import { PatchReviewList } from "./PatchReviewTray";
+import { acceptedProposalMessage, PatchReviewList, proposalReviewItem } from "./PatchReviewTray";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 let container: HTMLElement | undefined;
 let root: Root | undefined;
 
-afterEach(() => {
+function unmount(): void {
   act(() => root?.unmount());
   container?.remove();
   container = undefined;
   root = undefined;
-});
+}
+
+afterEach(unmount);
 
 function render(proposals: readonly PluginProposalReviewItem[]): void {
   container = document.createElement("div");
@@ -104,5 +107,55 @@ describe("PatchReviewList experimental recognition notice", () => {
     );
     act(() => acceptButton!.click());
     expect(onAccept).toHaveBeenCalledWith("proposal-1");
+  });
+});
+
+describe("A proposal stating a hydrogen count an H atom cannot carry", () => {
+  const host = { getPlugin: () => ({ manifest: { name: "Test Plugin" } }) } as unknown as PluginHost;
+
+  function queued(hydrogenCount: number | undefined, op: "addObject" | "updateObject" = "addObject"): QueuedProposedPatch {
+    const atoms = [
+      { id: "c", element: "C", x: 0, y: 0 },
+      { id: "h", element: "H", x: 20, y: 0, ...(hydrogenCount === undefined ? {} : { hydrogenCount }) }
+    ];
+    const bonds = [{ id: "b", fromAtomId: "c", toAtomId: "h", order: 1 }];
+    const patch = op === "addObject"
+      ? { op, pageId: "page-1", object: { id: "m", type: "molecule", x: 0, y: 0, width: 20, height: 1, atoms, bonds } }
+      : { op: "batch", patches: [{ op, objectId: "m", changes: { atoms, bonds } }] };
+    return {
+      id: "proposal-h", pluginId: "org.example.test", status: "pending", createdAt: "2026-11-22T00:00:00.000Z",
+      proposal: { patch, reason: "Adds a molecule.", warnings: [], requiresUserApproval: true }
+    } as QueuedProposedPatch;
+  }
+
+  const warningText = "atom h (H) states 1 hydrogen, which a hydrogen atom cannot carry: only 0 counts, as a typed H, D or T " +
+    "label means. The stated count is kept as stored but not counted, and the atom is flagged.";
+
+  it("warns in the review item, naming the atom, its element and the count", async () => {
+    for (const op of ["addObject", "updateObject"] as const) {
+      const item = await proposalReviewItem(host, queued(1, op));
+      expect(item.warnings).toEqual([{ code: "document.atom_hydrogen_count_not_counted", message: `Proposed change: ${warningText}` }]);
+      render([item]);
+      expect(document.querySelector('[data-proposal-id="proposal-h"] .patch-review-warnings')?.textContent)
+        .toBe(`Proposed change: ${warningText}`);
+      unmount();
+    }
+  });
+
+  it("says so in the accept message, and accepting stays a success", () => {
+    expect(acceptedProposalMessage("Test Plugin", queued(1), { recognized: false, screenCapture: false }))
+      .toBe(`Test Plugin: applied proposal. Accepted change: ${warningText}`);
+  });
+
+  it("shows no warning for a clean proposal, at review or accept", async () => {
+    for (const count of [undefined, 0]) {
+      const item = await proposalReviewItem(host, queued(count));
+      expect(item.warnings).toEqual([]);
+      render([item]);
+      expect(document.querySelector('[data-proposal-id="proposal-h"] .patch-review-warnings')).toBeNull();
+      unmount();
+      expect(acceptedProposalMessage("Test Plugin", queued(count), { recognized: false, screenCapture: false }))
+        .toBe("Test Plugin: applied proposal");
+    }
   });
 });

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { proposedHydrogenCountNotCountedWarnings } from "@chemdraft/document-workflow-core";
 import type { PluginHost, QueuedProposedPatch } from "@chemdraft/plugin-host";
 import type { PluginProposalReviewItem } from "./panelBridge";
 import { EXPERIMENTAL_RECOGNITION_REVIEW_NOTICE } from "./pluginUpdates";
@@ -161,8 +162,8 @@ export function PatchReviewList({
           ) : null}
           {proposal.warnings.length > 0 ? (
             <ul className="patch-review-warnings">
-              {proposal.warnings.map((warning) => (
-                <li key={warning.code}>{warning.message}</li>
+              {proposal.warnings.map((warning, index) => (
+                <li key={`${warning.code}-${index}`}>{warning.message}</li>
               ))}
             </ul>
           ) : null}
@@ -196,10 +197,29 @@ export async function proposalReviewItem(
     pluginName: host.getPlugin(proposal.pluginId)?.manifest.name ?? proposal.pluginId,
     reason: proposal.proposal.reason,
     documentName,
-    warnings,
+    // An H, D or T atom stating a count it cannot carry is accepted as written (proposals are exempt
+    // from the plugin-boundary refusal) and flagged once committed; the review says so beforehand.
+    warnings: [...warnings, ...proposedHydrogenCountNotCountedWarnings(proposal.proposal.patch)
+      .map(({ code, message }) => ({ code, message }))],
     recognition,
     structurePreview: await recognitionStructurePreview(proposal.proposal)
   };
+}
+
+/**
+ * The status line after the user accepts a proposal. A proposal is accepted as written even when an
+ * H, D or T atom states a hydrogen count it cannot carry, so the message names each such atom, as
+ * the review item did, rather than reporting a plain success.
+ */
+export function acceptedProposalMessage(
+  pluginName: string, proposal: QueuedProposedPatch, options: { recognized: boolean; screenCapture: boolean }
+): string {
+  const inserted = options.recognized ? `${pluginName}: inserted recognized structure` : `${pluginName}: applied proposal`;
+  const message = options.screenCapture
+    ? `${inserted}; its screen capture stays saved (Add or Remove Plugins › Show saved screen captures)`
+    : inserted;
+  const notCounted = proposedHydrogenCountNotCountedWarnings(proposal.proposal.patch, "Accepted change");
+  return notCounted.length ? `${message}. ${notCounted.map((warning) => warning.message).join(" ")}` : message;
 }
 
 function capitalize(value: string): string {
