@@ -203,8 +203,13 @@ describe.each(["macos", "windows"] as const)("Guided Tour findings on %s", platf
     await openSample();
     await command("edit.undo");
     await command("document.saveAs");
-    await vi.waitFor(() => expect(native.writeFile).toHaveBeenCalledTimes(1));
+    // Count only writes of the document: the app also writes its runtime-build.json stamp.
+    const savedWrites = () => native.writeFile.mock.calls.filter(([path]) => path === "/tmp/tour-practice.chemdraft");
+    await vi.waitFor(() => expect(savedWrites()).toHaveLength(1));
+    // The tab was saved blank, after Undo removed the sample.
+    expect(savedWrites()[0][1]).not.toContain("<fragment");
     await vi.waitFor(() => expect(bridge().snapshot().file.dirty).toBe(false));
+    expect(bridge().snapshot().file.path).toBe("/tmp/tour-practice.chemdraft");
     await openSample();
     // A sample restored into the saved tab would be marked clean though the file is blank, so
     // closing it would not offer to save. The sample opens in a new practice tab instead.
@@ -213,7 +218,8 @@ describe.each(["macos", "windows"] as const)("Guided Tour findings on %s", platf
     expect(objectTypes()).toEqual(["molecule"]);
     await act(async () => tabs()[1].click());
     expect(objectTypes()).toEqual([]);
-    expect(bridge().snapshot().file.dirty).toBe(false);
+    expect(bridge().snapshot().file).toEqual({ dirty: false, path: "/tmp/tour-practice.chemdraft" });
+    expect(savedWrites()).toHaveLength(1);
   });
 
   it("control: the first-run tour opens when the open-file subscription works", async () => {
