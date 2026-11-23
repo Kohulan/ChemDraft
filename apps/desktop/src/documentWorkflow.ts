@@ -103,6 +103,7 @@ import {
   DEFAULT_MIN_PROJECTED_BOND_LENGTH_FRACTION,
   pageLayoutSourceUnit,
   flattenPerspectiveFrom3D,
+  atomImpliedRadicalCount,
   isDativeBond,
   isEngineDocument,
   isMetalSymbol,
@@ -8364,6 +8365,8 @@ export function normalizeCommittedDocument(
   options: CommittedDocumentNormalizationOptions & { preserveElectronMarks?: boolean } = {}
 ): ChemDraftDocument {
   document = reconcileReactionArrowAttachments(document);
+  // Open and restore (the only callers preserving stored marks) re-derive stale lone-H caches.
+  if (options.preserveElectronMarks) document = withImpliedRadicalChemistryRederived(document);
   const reconciled = options.preserveElectronMarks ? document : reconcileNativeChargeMarks(document, options);
   const recorded = withNativeDocumentLabelBondSides(reconciled);
   // Re-admitted to the patch engine's sharing, as `reconcileNativeChargeMarks` does.
@@ -8371,6 +8374,36 @@ export function normalizeCommittedDocument(
   // Idempotent: a document the default normalization produced is its own committed normal form.
   if (Object.keys(options).length === 0) committedNormalForms.set(normalized, normalized);
   return normalized;
+}
+
+/**
+ * Re-derives the cached chemistry (structure, formula, masses) of each molecule holding a lone
+ * hydrogen atom's implied radical (`atomImpliedRadicalCount`; H•, owner decision 2026-11-23), through
+ * the path every graph edit takes (`refreshNativeSingleBondGraph`). Documents saved before that
+ * reading cache RDKit's old H2 ("[HH]", formula H2), which would show H2 beside a canvas drawing H•.
+ * Only those molecules are touched, and only when a cached value differs from the derived one; every
+ * other molecule keeps its stored chemistry (no recompute on open). Open and session restore call
+ * this through `normalizeCommittedDocument`.
+ */
+function withImpliedRadicalChemistryRederived(document: ChemDraftDocument): ChemDraftDocument {
+  let changed = false;
+  const pages = document.pages.map((page) => {
+    let pageChanged = false;
+    const objects = page.objects.map((object) => {
+      if (object.type !== "molecule" ||
+          !object.atoms.some((atom) => atomImpliedRadicalCount(atom, object.bonds) > 0)) return object;
+      const derived = refreshNativeSingleBondGraph(object, object.atoms, object.bonds);
+      if (derived.structure === object.structure && derived.structureFormat === object.structureFormat &&
+          JSON.stringify(derived.chemistry) === JSON.stringify(object.chemistry)) return object;
+      pageChanged = true;
+      // Only the cached chemistry is replaced: atoms, bonds and geometry stay as stored.
+      return { ...object, structureFormat: derived.structureFormat, structure: derived.structure, chemistry: derived.chemistry };
+    });
+    if (!pageChanged) return page;
+    changed = true;
+    return { ...page, objects };
+  });
+  return changed ? adoptDerivedDocument(document, { ...document, pages }) : document;
 }
 
 /**

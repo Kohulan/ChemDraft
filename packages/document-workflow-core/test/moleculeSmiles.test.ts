@@ -371,6 +371,19 @@ describe("a lone H, D or T: label, native formula, RDKit formula and SMILES agre
     }
   });
 
+  // Documents saved before the radical reading carry RDKit's old "[HH]" as the stored structure.
+  // Without RDKit the stored string must not be trusted for a lone H: it would export H2 while the
+  // canvas draws H•. The current graph is written instead.
+  it("never exports a stale stored [HH] for a lone H when RDKit is unavailable", async () => {
+    const stale = { ...molecule([hydrogen("H")]), structure: "[HH]" };
+    const warnings: ExportWarning[] = [];
+    expect(await moleculeSmiles(stale, 0, warnings, undefined)).toBe("[H]");
+    expect(warnings).toEqual([]);
+    // A lone H stating its count keeps the stored-string route (no implied radical): unchanged.
+    const stated = { ...molecule([hydrogen("H", { labelLiteral: true })]), structure: "[H]" };
+    expect(await moleculeSmiles(stated, 0, [], undefined)).toBe("[H]");
+  });
+
   it("a lone H+ or H- has no room for a hydrogen", async () => {
     for (const [charge, smiles] of [[1, "[H+]"], [-1, "[H-]"]] as const) {
       expect(await readings(molecule([hydrogen("H", { formalCharge: charge })]))).toEqual({

@@ -223,6 +223,9 @@ async function writeMoleculeSmiles(
   // label written as a dummy atom — a placeholder ("R"), unrecognized text ("Ome"), a flagged group,
   // a bonded "Ar". Otherwise it may say something else entirely (a stored "CO" for a C–R drawing,
   // "[Ar]O" for aryl alcohol) while the warnings above promise [*]; write the current graph instead.
+  // Nor is it trusted for a lone hydrogen atom's implied radical (`atomImpliedRadicalCount`):
+  // documents saved before that reading store RDKit's old "[HH]", which says H2 where the canvas
+  // draws H•. The current graph spells the drawn radical ([H]), so it is written instead.
   if (
     engineUnavailable && !requireEngineAtomStates &&
     invalidWarnings.length === 0 &&
@@ -230,7 +233,8 @@ async function writeMoleculeSmiles(
     expanded.placeholderAtoms.size === 0 &&
     nativeMoleculeUnspellableLabels(molecule).length === 0 &&
     !molecule.atoms.some((atom) => (atom.markRadicals ?? 0) > 0 ||
-      atom.isotope !== undefined || atom.element === "D" || atom.element === "T") &&
+      atom.isotope !== undefined || atom.element === "D" || atom.element === "T" ||
+      atomImpliedRadicalCount(atom, molecule.bonds) > 0) &&
     !molecule.bonds.some((bond) => bond.stereo === "either" || bond.display?.bondStyle === "wavy") &&
     molecule.structureFormat === "smiles" &&
     molecule.structure
