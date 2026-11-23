@@ -393,13 +393,14 @@ export const MoleculeAtomSchema = z
      */
     labelLiteral: z.boolean().optional(),
     /**
-     * The hydrogen count the source file stated for this atom (CDXML `NumHydrogens`), kept only for
-     * atoms on aromatic bonds. Aromatic bonds alone cannot say whether a ring N is pyridine-type
-     * (no H) or pyrrole-type (N–H); this settles it when the bonds are resolved into a Kekulé
-     * pattern. The drawn label and formula still follow the valence model, which agrees with it
-     * whenever the ring honours it. This is an import-time hint: editing the atom's element,
-     * charge or incident bonds (including dative bonds) drops it before revalidation, and adding
-     * or updating a molecule drops it from any atom left with no aromatic bond in a ring.
+     * The hydrogen count the source file stated for this atom (CDXML `NumHydrogens`). On an atom of
+     * an aromatic ring it settles whether a ring N is pyridine-type (no H) or pyrrole-type (N–H)
+     * when the bonds are resolved into a Kekulé pattern. On any other atom it is kept only where it
+     * disagrees with the derived count (owner ruling 1.2.3): it is then the atom's count everywhere
+     * (`atomStatedHydrogenCount`) and the atom is badged. This is an import-time hint: a chemical edit
+     * of the atom (element, charge, isotope, radicals, a bond added, removed or changed at it) drops
+     * it before revalidation (`clearChangedAtomHydrogenHints`), and adding or updating a molecule
+     * drops it from an atom whose aromatic bonds no longer sit in a ring.
      */
     hydrogenCount: z.number().int().nonnegative().optional(),
     /**

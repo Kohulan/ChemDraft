@@ -33,7 +33,9 @@ describe("imported hydrogen hints expire on chemical edits", () => {
     ["change order", (m: MoleculeObject) => { m.bonds[0]!.order = "double"; }],
     ["change dative meaning", (m: MoleculeObject) => { m.bonds[5]!.display = { bondStyle: "dashed" }; }],
     ["change element", (m: MoleculeObject) => { m.atoms[0]!.element = "C"; }],
-    ["change charge", (m: MoleculeObject) => { m.atoms[0]!.formalCharge = 1; }]
+    ["change charge", (m: MoleculeObject) => { m.atoms[0]!.formalCharge = 1; }],
+    ["add radical", (m: MoleculeObject) => { m.atoms[0]!.markRadicals = 1; }],
+    ["set isotope", (m: MoleculeObject) => { m.atoms[0]!.isotope = 15; }]
   ] as const)("%s clears the affected atom's hint through document patches", (_name, edit) => {
     const document = createEmptyDocument();
     const before = imported();
@@ -191,9 +193,34 @@ describe("a stated count on an atom with no aromatic bond lasts until that atom 
       m.bonds.push({ id: "b3", fromAtomId: "o", toAtomId: "s", order: "single", display: { bondStyle: "dashed" } });
     }],
     ["its bond made dative", (m: MoleculeObject) => { m.bonds[1]!.display = { bondStyle: "dashed" }; }],
-    ["its bond removed", (m: MoleculeObject) => { m.bonds.pop(); }]
+    ["its bond removed", (m: MoleculeObject) => { m.bonds.pop(); }],
+    ["a radical added to it", (m: MoleculeObject) => { m.atoms[2]!.markRadicals = 1; }],
+    ["an isotope set on it", (m: MoleculeObject) => { m.atoms[2]!.isotope = 18; }]
   ] as const)("drops it on %s", (_name, edit) => {
     expect(oxygen(update(edit)).hydrogenCount).toBeUndefined();
+  });
+
+  it.each([
+    ["a radical removed from it", { markRadicals: 1 }, { markRadicals: 2 }],
+    ["its isotope cleared", { isotope: 18 }, { isotope: 17 }]
+  ] as const)("drops it on %s, or changed", (_name, marked, changed) => {
+    const document = createEmptyDocument();
+    const before = ethoxy();
+    before.atoms[2] = { ...before.atoms[2]!, hydrogenCount: 1, ...marked };
+    const { markRadicals: _radicals, isotope: _isotope, ...cleared } = before.atoms[2]!;
+    for (const atom of [cleared, { ...before.atoms[2]!, ...changed }]) {
+      const result = applyPatches(document, [
+        { op: "addObject", pageId: document.pages[0]!.id, object: before },
+        { op: "updateObject", objectId: before.id, changes: { atoms: before.atoms.map((candidate) => candidate.id === "o" ? atom : candidate) } }
+      ]).pages[0]!.objects[0] as MoleculeObject;
+      expect(oxygen(result).hydrogenCount).toBeUndefined();
+    }
+  });
+
+  it("keeps it through a dismissed warning, a hidden label and a label bond side recorded on it", () => {
+    expect(oxygen(update((m) => {
+      m.atoms[2] = { ...m.atoms[2]!, warningSuppressed: true, labelVisible: false, labelBondSide: { side: "left", atomId: "c2" } };
+    })).hydrogenCount).toBe(0);
   });
 
   it("a merge keeps the absorbed atoms' counts on their new ids; the joining bond drops its two ends'", () => {

@@ -15,7 +15,10 @@ import { createCoreCommandRegistrar } from "./commands/coreCommandRegistrar";
 import { atomProblemCommandId, atomProblemCommands } from "./atomProblemCommands";
 import {
   analysisFacingStructure,
+  applyChargeToolAtNativeAtom,
   applyFreeformSingleBondToolAtPoint,
+  applyMoleculeAtomLabelStylePatch,
+  applyMoleculeObjectColorToSelection,
   applyNativeAtomElementTarget,
   applyNativeAtomProblemFix,
   commitNativeAtomLabelTarget,
@@ -30,9 +33,10 @@ import {
   normalizeCommittedDocument,
   openNativeDocument,
   pasteSelectionClipboardPayload,
+  reconcileNativeChargeMarks,
   rotateSelectedDocumentObjects90
 } from "./documentWorkflow";
-import { nativeDrawingStyleFromObjectStyle, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
+import { applyPatches, nativeDrawingStyleFromObjectStyle, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
 import { problemDocument, problemMolecule } from "./testSupport/atomProblemFixtures";
 import { DialogCoordinator } from "./dialogs/DialogCoordinator";
 import { dialogEnvelope, parseDialogMessage, type AtomProblemSnapshot, type DialogMessage } from "./dialogs/dialogProtocol";
@@ -275,6 +279,38 @@ describe("a CDXML atom whose stated hydrogen count disagrees, in the app", () =>
     expect(atomProblem(carbonyl, oxygen.id)).toBeUndefined();
     const ethene = moleculesOrThrow(applyNativeMoleculeBondOrderValueTarget(document, bondTarget(molecule, otherBond.id), "double"))[0];
     expect(oxygenOf(ethene).hydrogenCount).toBe(0);
+  });
+
+  it("drops it when a radical is put on or taken off the O, or a write changes its isotope; keeps it through style", () => {
+    const document = openedDocument();
+    const [molecule] = moleculesOrThrow(document);
+    const oxygen = oxygenOf(molecule);
+    const target = { objectId: molecule.id, kind: "atom" as const, atomId: oxygen.id, distanceToPointer: 0 };
+    const marksOf = (next: ChemDraftDocument) => next.pages[0]!.objects.filter(object => object.type === "electron-mark");
+    // The radical tool: the mark's electron reaches the O through the charge-mark reconciliation.
+    const radical = reconcileNativeChargeMarks(applyChargeToolAtNativeAtom(document, { kind: "radical-dot" }, target));
+    expect(oxygenOf(moleculesOrThrow(radical)[0])).toMatchObject({ markRadicals: 1 });
+    expect(oxygenOf(moleculesOrThrow(radical)[0]).hydrogenCount).toBeUndefined();
+    // Taking a radical off: a file whose O carries a radical and states 1 H (it derives 0).
+    const radicalFile = openedDocument(statedOxygenCdxml.replace('NumHydrogens="0"', 'Radical="Doublet" NumHydrogens="1"'));
+    const radicalOxygen = oxygenOf(moleculesOrThrow(radicalFile)[0]);
+    expect(radicalOxygen).toMatchObject({ markRadicals: 1, hydrogenCount: 1 });
+    expect(marksOf(radicalFile)).toHaveLength(1);
+    const unmarked = reconcileNativeChargeMarks(applyPatches(radicalFile, [{ op: "removeObject", objectId: marksOf(radicalFile)[0]!.id }]));
+    expect(oxygenOf(moleculesOrThrow(unmarked)[0]).markRadicals).toBeUndefined();
+    expect(oxygenOf(moleculesOrThrow(unmarked)[0]).hydrogenCount).toBeUndefined();
+    // An isotope reaches an existing atom only through a write (a plugin's or the assistant's).
+    const isotope = applyPatches(document, [{ op: "updateObject", objectId: molecule.id, changes: {
+      atoms: molecule.atoms.map(atom => atom.id === oxygen.id ? { ...atom, isotope: 18 } : atom) } }]);
+    expect(oxygenOf(moleculesOrThrow(isotope)[0])).toMatchObject({ isotope: 18 });
+    expect(oxygenOf(moleculesOrThrow(isotope)[0]).hydrogenCount).toBeUndefined();
+    // Style, label placement and a label nudged by a write are not chemistry.
+    const styled = applyMoleculeAtomLabelStylePatch(applyMoleculeObjectColorToSelection(document, "stroke", "#336699", [molecule.id]),
+      [{ objectId: molecule.id, atomId: oxygen.id }], { atomLabelColor: "#cc0000", atomLabelPlacement: "above" });
+    const nudged = applyPatches(styled, [{ op: "updateObject", objectId: molecule.id, changes: {
+      atoms: moleculesOrThrow(styled)[0].atoms.map(atom => atom.id === oxygen.id ? { ...atom, labelOffset: { x: 3, y: -2 } } : atom) } }]);
+    expect(moleculesOrThrow(nudged)[0].style).not.toEqual(molecule.style);
+    expect(oxygenOf(moleculesOrThrow(nudged)[0])).toMatchObject({ hydrogenCount: 0, labelOffset: { x: 3, y: -2 } });
   });
 
   it("bonding another molecule to it keeps the O's count; the carbon the new bond reaches drops its own", () => {

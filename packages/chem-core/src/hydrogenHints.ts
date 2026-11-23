@@ -39,9 +39,10 @@ export function atomStatedHydrogenCount(
 
 /**
  * An imported H count describes the imported graph, not subsequent chemical edits. A chemical edit
- * of an atom — its element or charge, the order or dative meaning of a bond at it, a bond added or
- * removed at it — drops that atom's count; moves, rotations, alignment, bond direction, wedges,
- * styles and edits of other atoms keep it.
+ * of an atom — its element, charge, isotope, radicals or scheme abbreviation (`sameAtomChemistry`),
+ * the order or dative meaning of a bond at it, a bond added or removed at it — drops that atom's
+ * count; moves, rotations, alignment, bond direction, wedges, styles, label position and edits of
+ * other atoms keep it.
  *
  * An atom `previous` does not have (a pasted or sprouted atom, or one merged in from another
  * molecule on a re-minted id) has nothing to be compared with, so it keeps the count it arrives
@@ -77,10 +78,26 @@ export function clearChangedAtomHydrogenHints(
   const oldAtoms = new Map(previous.atoms.map((atom) => [atom.id, atom]));
   return dropOrphanedHydrogenHints(atoms.map((atom) => {
     const old = oldAtoms.get(atom.id);
-    if (atom.hydrogenCount === undefined || !old ||
-      (!changed.has(atom.id) && atom.element === old.element && atom.formalCharge === old.formalCharge)) return atom;
+    if (atom.hydrogenCount === undefined || !old || (!changed.has(atom.id) && sameAtomChemistry(atom, old))) return atom;
     return withoutHydrogenHint(atom);
   }), bonds);
+}
+
+/**
+ * Whether an atom's own chemistry is unchanged: every per-atom field that changes its identity or
+ * the hydrogens it has room for. `formalCharge` already includes a charge mark's share (`markCharge`
+ * only records which part came from a mark), and `markRadicals` is each radical mark's unpaired
+ * electron, which costs the atom one hydrogen. Label position, color, visibility, a dismissed warning
+ * and the recorded label bond side are not chemistry. Nor, by the 1.2.3 ruling's first round, is
+ * retyping the same element as a typed literal label (`labelLiteral`): that atom is still the one
+ * its count was stated for, and while its label is literal the label speaks for itself.
+ */
+function sameAtomChemistry(atom: MoleculeAtom, old: MoleculeAtom): boolean {
+  return atom.element === old.element &&
+    atom.formalCharge === old.formalCharge &&
+    atom.isotope === old.isotope &&
+    (atom.markRadicals ?? 0) === (old.markRadicals ?? 0) &&
+    atom.schemeAbbreviation === old.schemeAbbreviation;
 }
 
 /**
