@@ -1852,7 +1852,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.23.11.30-opus";
+const CURRENT_BUILD_STAMP = "11.23.12.30-opus";
 
 /**
  * The commit funnel's chemistry check (AGENTS.md section 7, `commitChemistryGuard.ts`). `before`
@@ -8202,8 +8202,10 @@ export function MainWindow({
   const documentForFlush = useCallback((onDroppedDraft?: (kind: string, error: unknown) => void): ChemDraftDocument => {
     // Resizing and part drags replace the live page during the preview.
     // A Save/autosave/export during the held gesture must match what Escape restores.
+    // Only while a preview is installed: below the drag threshold the live document is the
+    // truth, and an edit made during a held press (Delete, a relabel hotkey) must be saved.
     const gesture = objectResizeDragRef.current ?? nativePartDragRef.current;
-    if (gesture) return gesture.startDocument;
+    if (gesture?.dragging) return gesture.startDocument;
     let current = documentRef.current;
     const includeDraft = (kind: string, apply: () => ChemDraftDocument, rollback?: () => ChemDraftDocument) => {
       if (!onDroppedDraft) return apply();
@@ -12164,6 +12166,7 @@ export function MainWindow({
       && !activeAtomLabelEditRef.current && !activeTextEditObjectIdRef.current
       && !tableCellEditorRef.current && !bracketLabelEditorRef.current,
     scheme: keybindingScheme,
+    shortcutOverrides: shortcutSettings.overrides,
     platform: shortcutPlatform,
     plugins: () => tourPluginCommandsRef.current,
     mode: tourMode,
@@ -15290,6 +15293,15 @@ export function MainWindow({
         key: event.key, code: event.code, ctrlKey: event.ctrlKey, metaKey: event.metaKey,
         altKey: event.altKey, shiftKey: event.shiftKey
       });
+      // A Save or Save As the user assigned to a formatting chord (Preferences > Keyboard) wins.
+      if (commandId === "document.save" || commandId === "document.saveAs") {
+        // Cancel the browser/native accelerator fallback as well, so macOS cannot save twice.
+        // Cmd+Q remains the native app.quit accelerator, which requests the shared draft flush;
+        // Windows registers no Quit accelerator. Neither needs a second JS command binding.
+        event.preventDefault();
+        void invokeCommandRef.current(commandId);
+        return;
+      }
       // The text textarea stops bubbling keys, just like the table editor. Route its
       // formatting chords through the same registered commands as the toolbar buttons.
       const commandKey = (shortcutPlatform ?? detectDesktopShortcutPlatform()) === "macos" ? event.metaKey : event.ctrlKey;
@@ -15300,14 +15312,7 @@ export function MainWindow({
         event.preventDefault();
         event.stopPropagation();
         void invokeCommandRef.current(textFormatCommand);
-        return;
       }
-      if (commandId !== "document.save" && commandId !== "document.saveAs") return;
-      // Cancel the browser/native accelerator fallback as well, so macOS cannot save twice.
-      // Cmd+Q remains the native app.quit accelerator, which requests the shared draft flush;
-      // Windows registers no Quit accelerator. Neither needs a second JS command binding.
-      event.preventDefault();
-      void invokeCommandRef.current(commandId);
     };
     window.addEventListener("keydown", commandFromInlineEditor, true);
     return () => window.removeEventListener("keydown", commandFromInlineEditor, true);
