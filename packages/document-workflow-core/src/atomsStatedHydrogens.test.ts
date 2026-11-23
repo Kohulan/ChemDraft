@@ -110,6 +110,35 @@ describe("a stated hydrogen count on an atom with no aromatic bond", () => {
         "The stated count is kept as stored but not counted, and the atom is flagged. The label, formula and SMILES count 1." });
   });
 
+  // The unknown atom "*": nothing counts hydrogens on it (label, formula, molfile valence, RDKit), so
+  // a stated count other than 0 is flagged by the same rule as a hydrogen atom's, and dropping it is
+  // the fix; a stated 0 is what it counts anyway.
+  it("flags an unknown atom (*) stating a count other than 0, which nothing counts, and fixes it by dropping the count", () => {
+    const star = (extra: Partial<MoleculeAtom> = {}) => molecule([
+      { id: "x", element: "*", x: 0, y: 0, formalCharge: 0, ...extra },
+      { id: "c", element: "C", x: 14, y: 0, formalCharge: 0 }
+    ], [{ id: "b", fromAtomId: "x", toAtomId: "c", order: "single" }]);
+    const plain = state(star(), "x");
+    expect(plain.valid).toBe(true);
+    for (const labelLiteral of [undefined, true] as const) {
+      const flagged = star({ hydrogenCount: 2, ...(labelLiteral ? { labelLiteral } : {}) });
+      expect(state(flagged, "x")).toEqual({ ...plain, valid: false, hydrogenCountNotCounted: true,
+        statedHydrogens: { stated: 2, derived: 0 }, invalidReason: "* states 2 H, which an unknown atom cannot carry; only 0 counts.",
+        invalidDetail: "atom x (*) states 2 hydrogens, which an unknown atom cannot carry: only 0 counts, as a typed * label means. " +
+          "The stated count is kept as stored but not counted, and the atom is flagged. The label, formula and SMILES count 0." });
+      expect(atomProblem(flagged, "x")!.fixes.map((fix) => fix.label)).toEqual(["Use the derived hydrogen count (0)", "Ignore warning"]);
+      expect(nativeMoleculeExportWarnings(flagged).map((warning) => warning.message))
+        .toEqual(["*1 states 2 H, which an unknown atom cannot carry; only 0 counts."]);
+      // Not counted: the formula and SMILES of the same * stating nothing.
+      const metadata = nativeSingleBondGraphMetadata(flagged.atoms, flagged.bonds);
+      const plainMetadata = nativeSingleBondGraphMetadata(star().atoms, star().bonds);
+      expect([metadata.formula, metadata.exactMass]).toEqual([plainMetadata.formula, plainMetadata.exactMass]);
+      expect(nativeSingleBondGraphSmiles(flagged.atoms, flagged.bonds)).toBe(nativeSingleBondGraphSmiles(star().atoms, star().bonds));
+    }
+    expect(state(star({ hydrogenCount: 0 }), "x")).toEqual(plain);
+    expect(atomProblem(star({ hydrogenCount: 0 }), "x")).toBeUndefined();
+  });
+
   it("leaves a typed literal label to its own check", () => {
     const literal = ethanol({ labelLiteral: true, hydrogenCount: 1 });
     expect(state(literal, "o")).toEqual(state(ethanol({ labelLiteral: true }), "o"));

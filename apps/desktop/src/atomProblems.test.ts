@@ -757,6 +757,86 @@ describe("an H atom a native document stores a hydrogen count on, in the app", (
   });
 });
 
+// The unknown atom "*" stating a hydrogen count (a CDXML node whose Element names nothing, stating
+// NumHydrogens="2"). Checked against RDKit: the molfile writes the dummy atom "*" with no valence and
+// RDKit gives a dummy atom no hydrogens, so formula and SMILES are those of the same * stating nothing.
+// The count is not honored, so it is kept for the round trip and flagged, by the rule H, D and T use.
+describe("an unknown atom (*) stating a hydrogen count, in the app", () => {
+  beforeAll(() => { installRealRdkitModuleLoader(); });
+  afterAll(() => { resetRdkitForTesting(); });
+  const starCdxml = (numHydrogens = ' NumHydrogens="2"') => `<CDXML><page id="1"><fragment id="2">
+    <n id="10" p="100 100" Element="250"${numHydrogens}/><n id="11" p="114 108"/><n id="12" p="128 100" Element="8"/>
+    <b id="20" B="10" E="11"/><b id="21" B="11" E="12"/>
+  </fragment></page></CDXML>`;
+  const reason = "* states 2 H, which an unknown atom cannot carry; only 0 counts.";
+  const notCountedText = "states 2 hydrogens, which an unknown atom cannot carry: only 0 counts, as a typed * label means. " +
+    "The stated count is kept as stored but not counted, and the atom is flagged.";
+  const starOf = (molecule: MoleculeObject) => molecule.atoms.find(atom => atom.element === "*")!;
+  const countWarnings = (warnings: readonly { code: string }[]) => warnings.filter(warning => warning.code.endsWith("atom_hydrogen_count_not_counted"));
+  const expectFlagged = (molecule: MoleculeObject) => {
+    expect(starOf(molecule).hydrogenCount).toBe(2);
+    expect(nativeMoleculeInvalidAtomStates(molecule).map(state => state.atomId)).toEqual([starOf(molecule).id]);
+    const problem = atomProblem(molecule, starOf(molecule).id)!;
+    expect(problem.state).toMatchObject({ valid: false, hydrogenCountNotCounted: true, statedHydrogens: { stated: 2, derived: 0 }, invalidReason: reason });
+    expect(problem.fixes.map(fix => fix.label)).toEqual(["Use the derived hydrogen count (0)", "Ignore warning"]);
+  };
+
+  it("opens with the import warning, the count kept and the badge; Save As writes it back and reopens it flagged, warned once", () => {
+    const opened = openNativeDocument(starCdxml());
+    const [molecule] = moleculesOrThrow(normalizeCommittedDocument(opened.document!));
+    expect(countWarnings(opened.warnings)).toEqual([{ code: "cdxml.atom_hydrogen_count_not_counted",
+      message: `CDXML import: atom 10 (*) ${notCountedText}`, sourceObjectId: molecule.id, atomIds: [starOf(molecule).id] }]);
+    expectFlagged(molecule);
+    const saved = createNativeSavePayload(normalizeCommittedDocument(opened.document!));
+    expect(saved.contents).toMatch(/<n [^>]*Element="\*"[^>]*NumHydrogens="2"/);
+    expect(saved.warnings.map(warning => warning.message)).toContain(`*1 states 2 H, which an unknown atom cannot carry; only 0 counts.`);
+    const reopened = openNativeDocument(saved.contents);
+    expect(countWarnings(reopened.warnings)).toHaveLength(1);
+    expectFlagged(moleculesOrThrow(normalizeCommittedDocument(reopened.document!))[0]);
+  });
+
+  it("a .chemdraft holding it opens with the native warning and the badge, and saves and reopens it unchanged", () => {
+    const document = normalizeCommittedDocument(openNativeDocument(starCdxml()).document!);
+    const [molecule] = moleculesOrThrow(document);
+    const opened = openNativeDocument(serializeDocument(document));
+    expect(countWarnings(opened.warnings)).toEqual([{ code: "document.atom_hydrogen_count_not_counted",
+      message: `ChemDraft document: atom ${starOf(molecule).id} (*) ${notCountedText}`, sourceObjectId: molecule.id, atomIds: [starOf(molecule).id] }]);
+    const [reopened] = moleculesOrThrow(normalizeCommittedDocument(opened.document!));
+    expectFlagged(reopened);
+    expect(starOf(reopened)).toEqual(starOf(molecule));
+  });
+
+  it("is not counted: RDKit's formula and SMILES are those of the same * stating nothing", async () => {
+    const reading = async (contents: string) => {
+      const [molecule] = moleculesOrThrow(openedDocument(contents));
+      const { structureFormat, structure } = analysisFacingStructure(molecule);
+      const run = await analyzeStructure({ format: structureFormat as AnalysisInputFormat, value: structure,
+        runId: `star-${contents.length}`, startedAt: "2026-11-22T12:00:00.000Z" });
+      const composition = run.results.find((entry) => entry.id === "rdkit.composition");
+      const warnings: ExportWarning[] = [];
+      const smiles = await moleculeSmiles(molecule, 0, warnings, computeStructureIdentifiers);
+      return { formula: composition?.kind === "composition" ? composition.formula : undefined, smiles, molfile: copyAsMolfile(openedDocument(contents), "v2000", []),
+        storedFormula: nativeSingleBondGraphMetadata(molecule.atoms, molecule.bonds).formula, warnings: warnings.map(warning => warning.code) };
+    };
+    const stated = await reading(starCdxml());
+    const plain = await reading(starCdxml(""));
+    expect({ ...stated, warnings: [] }).toEqual({ ...plain, warnings: [] });
+    expect(stated).toMatchObject({ smiles: "*CO", storedFormula: "CH3O" });
+    expect(stated.molfile).toMatch(/^ {4}[-\d. ]+ \* {3}0 {2}0 {2}0 {2}0 {2}0 {2}0 /m);
+    // The SMILES export already says the drawn 2 H do not survive.
+    expect(stated.warnings).toContain("export.smiles_hydrogen_loss");
+    expect(plain.warnings).not.toContain("export.smiles_hydrogen_loss");
+  });
+
+  it("a * with no NumHydrogens opens as before: nothing stored, no warning, no badge", () => {
+    const opened = openNativeDocument(starCdxml(""));
+    const [molecule] = moleculesOrThrow(normalizeCommittedDocument(opened.document!));
+    expect(starOf(molecule).hydrogenCount).toBeUndefined();
+    expect(countWarnings(opened.warnings)).toEqual([]);
+    expect(nativeMoleculeInvalidAtomStates(molecule)).toEqual([]);
+  });
+});
+
 function moleculesOrThrow(document: ChemDraftDocument): [MoleculeObject, ...MoleculeObject[]] {
   const molecules = moleculesOf(document);
   if (molecules.length === 0) throw new Error("Expected a molecule");

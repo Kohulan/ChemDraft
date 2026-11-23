@@ -5,9 +5,11 @@
 
 import {
   atomStatedHydrogenCount,
+  atomIgnoresStatedHydrogenCount,
   drawnLabelBondSide,
-  hydrogenAtomIgnoresStatedCount,
+  ignoredHydrogenCountAtomKind,
   normalizeAtomIsotope,
+  statedHydrogenCountNotCountedText,
   UnknownBondOrderError,
   type ChemDraftDocument,
   type ChemicalMetadata,
@@ -108,9 +110,10 @@ export interface NativeAtomValidationState {
    */
   statedHydrogens?: { stated: number; derived: number };
   /**
-   * Set, with `statedHydrogens`, when the stated count is on an H, D or T atom and is not 0: a count
-   * no typed label can state, so nothing counts it (`atomStatedHydrogenCount`). The document keeps it
-   * as stored; the badge says it is not counted, and dropping it is the fix.
+   * Set, with `statedHydrogens`, when the stated count is not 0 on an H, D or T atom (a count no typed
+   * label can state) or on the unknown atom "*" (whose label, formula, molfile and RDKit SMILES count
+   * no hydrogens): nothing counts it (chem-core `atomIgnoresStatedHydrogenCount`). The document keeps
+   * it as stored; the badge says it is not counted, and dropping it is the fix.
    */
   hydrogenCountNotCounted?: true;
 }
@@ -338,8 +341,8 @@ function nativeStatedHydrogenDiagnostic(
   atoms: readonly MoleculeAtom[],
   resolution: NativeBondOrderResolution
 ): NativeAtomValidationState | undefined {
-  if (hydrogenAtomIgnoresStatedCount(atom)) {
-    const element = nativeElementFromAtomLabel(atom.element) ?? "H";
+  if (atomIgnoresStatedHydrogenCount(atom)) {
+    const element = nativeElementFromAtomLabel(atom.element) ?? (atom.element === "*" ? "*" : "H");
     const derived = atomDerivedHydrogenCount({ ...atom, formalCharge: effectiveFormalCharge }, bonds, atoms, resolution) ?? 0;
     const count = atom.hydrogenCount!;
     return {
@@ -350,7 +353,7 @@ function nativeStatedHydrogenDiagnostic(
       valid: false,
       statedHydrogens: { stated: count, derived },
       hydrogenCountNotCounted: true,
-      invalidReason: `${atom.element} states ${count} H, which a hydrogen atom cannot carry; only 0 counts.`,
+      invalidReason: `${atom.element} states ${count} H, which ${ignoredHydrogenCountAtomKind(atom)} cannot carry; only 0 counts.`,
       invalidDetail: `${hydrogenCountNotCountedText([atom])} The label, formula and SMILES count ${derived}.`
     };
   }
@@ -374,19 +377,13 @@ function nativeStatedHydrogenDiagnostic(
 }
 
 /**
- * The native twin of the CDXML importer's `cdxml.atom_hydrogen_count_not_kept` wording, for H, D or T
- * atoms a document already stores a count other than 0 on (`hydrogenAtomIgnoresStatedCount`). The
- * importer drops such a count; a native document keeps it as stored, so this says it is not counted.
+ * The native report for atoms a document stores a hydrogen count on that nothing counts (chem-core
+ * `atomIgnoresStatedHydrogenCount`: an H, D or T atom, or the unknown atom "*", stating a count other
+ * than 0): chem-core's `statedHydrogenCountNotCountedText`, the one wording the CDXML importer also
+ * uses. The document keeps the count as stored, so this says it is not counted.
  */
 export function hydrogenCountNotCountedText(atoms: readonly MoleculeAtom[]): string {
-  const hydrogens = (count: number) => `${count} hydrogen${count === 1 ? "" : "s"}`;
-  const [only] = atoms;
-  return atoms.length === 1
-    ? `atom ${only!.id} (${only!.element}) states ${hydrogens(only!.hydrogenCount!)}, which a hydrogen atom cannot carry: ` +
-      "only 0 counts, as a typed H, D or T label means. The stated count is kept as stored but not counted, and the atom is flagged."
-    : `${atoms.length} hydrogen atoms state hydrogen counts a hydrogen atom cannot carry: ` +
-      `${atoms.map((atom) => `atom ${atom.id} (${atom.element}) states ${atom.hydrogenCount}`).join("; ")}. ` +
-      "Only 0 counts, as a typed H, D or T label means. The stated counts are kept as stored but not counted, and the atoms are flagged.";
+  return statedHydrogenCountNotCountedText(atoms);
 }
 
 function nativeAtomDiagnostic(

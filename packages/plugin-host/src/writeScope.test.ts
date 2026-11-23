@@ -509,11 +509,12 @@ describe("direct-write invocation scope", () => {
     expect(f.document().pages[0]!.objects).toHaveLength(2);
   });
   it.each(["addObject", "updateObject"] as const)(
-    "refuses a %s that would store a hydrogen count other than 0 on an H, D or T atom, with its reason and atom, and accepts 0",
+    "refuses a %s that would store a hydrogen count other than 0 on an H, D, T or unknown (*) atom, with its reason and atom, and accepts 0",
     async op => {
       // An updateObject sets the count on an H, D or T atom the molecule already has (a new one bonded
       // to an existing atom would drop it as a joined end); an addObject brings the atom with it.
-      const withHydrogen = (element: "H" | "D" | "T", hydrogenCount?: number): MoleculeObject => {
+      // The unknown atom "*" reuses the reason: nothing counts hydrogens on it either (details.element says which).
+      const withHydrogen = (element: "H" | "D" | "T" | "*", hydrogenCount?: number): MoleculeObject => {
         const molecule = cachedMolecule();
         return { ...molecule, id: op === "addObject" && hydrogenCount !== undefined ? "mol_new" : molecule.id,
           atoms: [...molecule.atoms, { id: "h", element, x: 160, y: 120, formalCharge: 0,
@@ -523,29 +524,35 @@ describe("direct-write invocation scope", () => {
       const patchFor = (molecule: MoleculeObject): DocumentPatch => op === "addObject"
         ? { op, pageId: "page_001", object: molecule }
         : { op, objectId: molecule.id, changes: { atoms: molecule.atoms } };
-      const existing = (element: "H" | "D" | "T") => op === "addObject" ? [cachedMolecule()] : [withHydrogen(element)];
+      const existing = (element: "H" | "D" | "T" | "*") => op === "addObject" ? [cachedMolecule()] : [withHydrogen(element)];
       const moleculeId = op === "addObject" ? "mol_new" : "mol_3";
-      for (const element of ["H", "D", "T"] as const) {
+      for (const element of ["H", "D", "T", "*"] as const) {
         const f = fixture(["mol_3"], ctx => ctx.documents.applyPatch!({ reason: "stated count", patch: patchFor(withHydrogen(element, 1)) }),
           undefined, existing(element));
         const before = f.document();
         const refused = await f.host.invokeCommand("plugin.scope.run").then(() => undefined, (error: unknown) => error);
         expect(refused).toBeInstanceOf(PluginHostError);
         expect(refused).toMatchObject({
-          message: `Plugin write refused: atom "h" of molecule "${moleculeId}" is ${element} with hydrogenCount 1, which a hydrogen ` +
-            "atom cannot carry. Only 0 is allowed on an H, D or T atom, as a typed H, D or T label means; omit hydrogenCount or " +
-            "set it to 0. Nothing was changed.",
+          message: element === "*"
+            ? `Plugin write refused: atom "h" of molecule "${moleculeId}" is * with hydrogenCount 1, which an unknown ` +
+              "atom cannot carry. Only 0 is allowed on an unknown atom (*), as a typed * label means; omit hydrogenCount or " +
+              "set it to 0. Nothing was changed."
+            : `Plugin write refused: atom "h" of molecule "${moleculeId}" is ${element} with hydrogenCount 1, which a hydrogen ` +
+              "atom cannot carry. Only 0 is allowed on an H, D or T atom, as a typed H, D or T label means; omit hydrogenCount or " +
+              "set it to 0. Nothing was changed.",
           reason: "hydrogen_count_unrepresentable",
           details: { moleculeId, atomId: "h", element, hydrogenCount: 1 }
         });
         expect(f.applyDocumentPatch).not.toHaveBeenCalled();
         expect(f.document()).toBe(before);
       }
-      const accepted = fixture(["mol_3"], ctx => ctx.documents.applyPatch!({ reason: "stated 0", patch: patchFor(withHydrogen("D", 0)) }),
-        undefined, existing("D"));
-      await expect(accepted.host.invokeCommand("plugin.scope.run")).resolves.toMatchObject({ applied: true });
-      const written = accepted.document().pages[0]!.objects.find(object => object.id === moleculeId);
-      expect(written?.type === "molecule" && written.atoms.find(atom => atom.id === "h")?.hydrogenCount).toBe(0);
+      for (const element of ["D", "*"] as const) {
+        const accepted = fixture(["mol_3"], ctx => ctx.documents.applyPatch!({ reason: "stated 0", patch: patchFor(withHydrogen(element, 0)) }),
+          undefined, existing(element));
+        await expect(accepted.host.invokeCommand("plugin.scope.run")).resolves.toMatchObject({ applied: true });
+        const written = accepted.document().pages[0]!.objects.find(object => object.id === moleculeId);
+        expect(written?.type === "molecule" && written.atoms.find(atom => atom.id === "h")?.hydrogenCount).toBe(0);
+      }
     }
   );
 

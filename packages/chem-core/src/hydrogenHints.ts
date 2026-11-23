@@ -18,11 +18,13 @@ import type { MoleculeAtom, MoleculeBond, MoleculeObject } from "./schemas";
  * - no count, or a typed literal label (its own text says what hydrogens it has);
  * - an atom on an aromatic bond, where the count settles which ring atom carries the H and the
  *   Kekulé resolution carries it;
- * - a label that is not a plain element symbol (D and T aside);
+ * - a label that is not a plain element symbol (D and T aside). Of these, the unknown atom "*"
+ *   stating any count but 0 is flagged (`atomIgnoresStatedHydrogenCount`): nothing counts hydrogens
+ *   on it (the molfile writes the dummy atom "*" with no valence, and RDKit gives a dummy atom none);
  * - an H, D or T atom stating any count but 0: no typed label draws a hydrogen atom carrying
- *   hydrogens of its own (`hydrogenAtomIgnoresStatedCount`). The CDXML importer warns and does not
+ *   hydrogens of its own (`atomIgnoresStatedHydrogenCount`). The CDXML importer warns and does not
  *   keep such a count; a plugin or assistant write that would store one is refused at the plugin
- *   host (`hydrogenAtomWithIgnoredCount`); a document that already holds one (an older file, a
+ *   host (`atomWithIgnoredHydrogenCount`); a document that already holds one (an older file, a
  *   session, a paste) keeps it as stored, and the atom is flagged.
  * No valence model here: the count is passed through as stated, never re-derived.
  */
@@ -41,32 +43,76 @@ export function atomStatedHydrogenCount(
 }
 
 /**
- * True for an H, D or T atom that stores a hydrogen count other than 0: a count
- * `atomStatedHydrogenCount` ignores, because no typed label draws a hydrogen atom carrying hydrogens
- * of its own. Patches store it as written (chem-core never refuses it, so opening, restoring,
- * pasting or undoing a document that holds one always works); the atom validator flags it and an
- * open reports it, as the CDXML importer's `cdxml.atom_hydrogen_count_not_kept` does.
+ * True for an atom that stores a hydrogen count other than 0 that nothing counts, while 0 is exactly
+ * what the atom already counts:
+ * - an H, D or T atom: no typed label draws a hydrogen atom carrying hydrogens of its own
+ *   (`atomStatedHydrogenCount` ignores the count);
+ * - the unknown atom "*" (an unknown or unlabeled CDXML node, a pasted dummy atom, a typed "*"): its
+ *   label draws none, the formula counts none, the molfile writes the dummy atom "*" with no valence
+ *   field and RDKit gives a dummy atom no hydrogens, so its SMILES is "*" whatever it states.
+ * Patches store it as written (chem-core never refuses it, so opening, restoring, pasting or undoing
+ * a document that holds one always works); the atom validator flags it and an open reports it
+ * (`statedHydrogenCountNotCountedText`). The CDXML importer does not keep such a count on a hydrogen
+ * atom (`cdxml.atom_hydrogen_count_not_kept`); on an unknown atom it keeps it for the file's round
+ * trip and reports it as not counted (`cdxml.atom_hydrogen_count_not_counted`).
  */
-export function hydrogenAtomIgnoresStatedCount(atom: MoleculeAtom): boolean {
-  return (atom.element === "H" || atom.element === "D" || atom.element === "T") &&
-    atom.hydrogenCount !== undefined && atom.hydrogenCount !== 0;
+export function atomIgnoresStatedHydrogenCount(atom: MoleculeAtom): boolean {
+  return statedCountCarrier(atom) !== undefined && atom.hydrogenCount !== undefined && atom.hydrogenCount !== 0;
+}
+
+/** Which kind of atom `atomIgnoresStatedHydrogenCount` judges: hydrogen atoms, and the unknown atom. */
+function statedCountCarrier(atom: MoleculeAtom): "hydrogen" | "unknown" | undefined {
+  if (atom.element === "H" || atom.element === "D" || atom.element === "T") return "hydrogen";
+  return atom.element === "*" ? "unknown" : undefined;
+}
+
+/** "a hydrogen atom" or "an unknown atom": the atom kind a refusal or warning names. */
+export function ignoredHydrogenCountAtomKind(atom: MoleculeAtom): string {
+  return statedCountCarrier(atom) === "unknown" ? "an unknown atom" : "a hydrogen atom";
 }
 
 /**
- * The first atom of `atoms` that would store a hydrogen count `atomStatedHydrogenCount` ignores
- * (`hydrogenAtomIgnoresStatedCount`) and that this write sets, not one `previous` already held
- * unchanged (an older document's atom is not refused for edits elsewhere). The plugin host refuses
- * a plugin or assistant write that sets one, so its writer is told rather than having a count
- * stored that nothing reads (AGENTS.md §7). chem-core's patches do not refuse it: they also replay
- * paste, duplicate, undo and session restore, which must never refuse a user's own document.
+ * The one wording for atoms whose stored hydrogen count is kept but not counted
+ * (`atomIgnoresStatedHydrogenCount`), shared by the native open report, the atom badge's detail and
+ * the CDXML importer, so they cannot drift apart. `name` gives each atom's id as the reader knows it
+ * (the CDXML importer names the file's node id). The text for hydrogen atoms alone is the wording
+ * these warnings already used for them.
  */
-export function hydrogenAtomWithIgnoredCount(
+export function statedHydrogenCountNotCountedText(
+  atoms: readonly MoleculeAtom[],
+  name: (atom: MoleculeAtom) => string = (atom) => atom.id
+): string {
+  const hydrogens = (count: number) => `${count} hydrogen${count === 1 ? "" : "s"}`;
+  const kinds = new Set(atoms.map(statedCountCarrier));
+  const uniform = kinds.size === 1 ? [...kinds][0] : undefined;
+  const typed = uniform === "unknown" ? "*" : uniform === "hydrogen" ? "H, D or T" : "H, D, T or *";
+  const [only] = atoms;
+  if (atoms.length === 1) {
+    return `atom ${name(only!)} (${only!.element}) states ${hydrogens(only!.hydrogenCount!)}, which ${ignoredHydrogenCountAtomKind(only!)} cannot carry: ` +
+      `only 0 counts, as a typed ${typed} label means. The stated count is kept as stored but not counted, and the atom is flagged.`;
+  }
+  const listed = atoms.map((atom) => `atom ${name(atom)} (${atom.element}) states ${atom.hydrogenCount}`).join("; ");
+  const head = uniform === undefined
+    ? `${atoms.length} atoms state hydrogen counts they cannot carry: ${listed}. Only 0 counts on a hydrogen or unknown atom`
+    : `${atoms.length} ${uniform} atoms state hydrogen counts ${uniform === "unknown" ? "an unknown" : "a hydrogen"} atom cannot carry: ${listed}. Only 0 counts`;
+  return `${head}, as a typed ${typed} label means. The stated counts are kept as stored but not counted, and the atoms are flagged.`;
+}
+
+/**
+ * The first atom of `atoms` that would store a hydrogen count `atomIgnoresStatedHydrogenCount`
+ * flags and that this write sets, not one `previous` already held unchanged (an older document's
+ * atom is not refused for edits elsewhere). The plugin host refuses a plugin or assistant write that
+ * sets one, so its writer is told rather than having a count stored that nothing reads (AGENTS.md
+ * §7). chem-core's patches do not refuse it: they also replay paste, duplicate, undo and session
+ * restore, which must never refuse a user's own document.
+ */
+export function atomWithIgnoredHydrogenCount(
   atoms: readonly MoleculeAtom[],
   previous?: readonly MoleculeAtom[]
 ): MoleculeAtom | undefined {
   const before = new Map(previous?.map((atom) => [atom.id, atom]));
   return atoms.find((atom) => {
-    if (!hydrogenAtomIgnoresStatedCount(atom)) return false;
+    if (!atomIgnoresStatedHydrogenCount(atom)) return false;
     const old = before.get(atom.id);
     return !old || old.element !== atom.element || old.hydrogenCount !== atom.hydrogenCount;
   });

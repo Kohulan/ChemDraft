@@ -319,19 +319,101 @@ describe("atoms whose label draws no count of its own: a dative-only carbon, H, 
   });
 });
 
-describe("atoms with no element keep what the file states, unflagged", () => {
-  it("an atom with no element (an unknown atom) keeps its stated count", () => {
-    const unknown = `<CDXML><page id="1"><fragment id="2">
-      <n id="10" p="0 0" Element="250" NumHydrogens="2"/><n id="11" p="14 0"/>
-      <b id="20" B="10" E="11"/>
+/**
+ * The unknown atom "*" (an Element naming nothing, an unlabeled nickname node, a "*" generic label).
+ * Nothing counts hydrogens on it: its label draws none, the formula counts none, the molfile writes
+ * the dummy atom "*" with no valence and RDKit gives a dummy atom none, so its SMILES is "*" whether
+ * the file states 2, 0 or nothing. A stated count other than 0 is therefore kept for the file's round
+ * trip, reported as not counted on import and badged (chem-core `atomIgnoresStatedHydrogenCount`,
+ * the rule the native open report and the plugin host share); a stated 0 is what it counts anyway.
+ */
+describe("an unknown atom (*) keeps what the file states, and a count it cannot carry is flagged", () => {
+  const starCdxml = (star: string) => `<CDXML><page id="1"><fragment id="2">
+      <n id="10" p="0 0" ${star}/><n id="11" p="14 0"/><n id="12" p="28 0" Element="8"/>
+      <b id="20" B="10" E="11"/><b id="21" B="11" E="12"/>
     </fragment></page></CDXML>`;
-    const { result, molecule } = open(unknown);
+  const notCountedWarnings = (result: ReturnType<typeof openChemDraftPayload>) =>
+    result.warnings.filter((warning) => warning.code === "cdxml.atom_hydrogen_count_not_counted");
+  const reading = (molecule: MoleculeObject) => {
+    const metadata = nativeSingleBondGraphMetadata(molecule.atoms, molecule.bonds);
+    return { labels: labels(molecule), formula: metadata.formula, exactMass: metadata.exactMass,
+      smiles: nativeSingleBondGraphSmiles(molecule.atoms, molecule.bonds) };
+  };
+  const starNodes = {
+    "Element naming nothing": 'Element="250"',
+    "unlabeled nickname node": 'NodeType="Nickname"',
+    "\"*\" generic label": 'NodeType="GenericNickname" GenericNickname="*"'
+  } as const;
+
+  it.each(Object.entries(starNodes))("a * (%s) stating 2 keeps the count, warns that it is not counted, and is badged", (_name, star) => {
+    const { result, molecule } = open(starCdxml(`${star} NumHydrogens="2"`));
     expect(molecule.atoms[0]).toMatchObject({ element: "*", hydrogenCount: 2 });
     expect(hydrogenWarnings(result)).toEqual([]);
-    const plain = exportDocumentToCdxml(result.document!, { embedNativePayload: false }).contents;
-    expect(plain).toContain('NumHydrogens="2"');
+    expect(notCountedWarnings(result)).toEqual([{
+      code: "cdxml.atom_hydrogen_count_not_counted",
+      message: "CDXML import: atom 10 (*) states 2 hydrogens, which an unknown atom cannot carry: only 0 counts, as a typed * label means. " +
+        "The stated count is kept as stored but not counted, and the atom is flagged.",
+      sourceObjectId: molecule.id,
+      atomIds: [molecule.atoms[0]!.id]
+    }]);
+    expect(badges(molecule)).toEqual([[molecule.atoms[0]!.id, "* states 2 H, which an unknown atom cannot carry; only 0 counts."]]);
+    expect(nativeMoleculeExportWarnings(molecule).map((warning) => warning.message))
+      .toEqual(["*1 states 2 H, which an unknown atom cannot carry; only 0 counts."]);
+    // What it is not counted as: the label, formula, mass and SMILES of the same * stating nothing.
+    expect(reading(molecule)).toEqual(reading(open(starCdxml(star)).molecule));
+    expect(reading(molecule)).toMatchObject({ labels: ["*", undefined, "OH"], formula: "CH3O", smiles: "[*]CO" });
   });
 
+  it("names every such atom of a fragment in one warning", () => {
+    const { result, molecule } = open(`<CDXML><page id="1"><fragment id="2">
+      <n id="10" p="0 0" Element="250" NumHydrogens="2"/><n id="11" p="14 0"/><n id="12" p="28 0" NodeType="Nickname" NumHydrogens="1"/>
+      <b id="20" B="10" E="11"/><b id="21" B="11" E="12"/>
+    </fragment></page></CDXML>`);
+    expect(notCountedWarnings(result).map((warning) => [warning.message, warning.atomIds])).toEqual([[
+      "CDXML import: 2 unknown atoms state hydrogen counts an unknown atom cannot carry: atom 10 (*) states 2; atom 12 (*) states 1. " +
+        "Only 0 counts, as a typed * label means. The stated counts are kept as stored but not counted, and the atoms are flagged.",
+      [molecule.atoms[0]!.id, molecule.atoms[2]!.id]
+    ]]);
+  });
+
+  it("round-trips the stated count through Save As, the visible layer, plain export and binary CDX", () => {
+    const document = open(starCdxml('Element="250" NumHydrogens="2"')).result.document!;
+    const saved = exportDocumentToCdxml(document, { embedNativePayload: true });
+    expect(saved.contents).toMatch(/<n [^>]*Element="\*"[^>]*NumHydrogens="2"/);
+    expect(moleculeOf(openChemDraftPayload(saved.contents)).atoms[0]).toMatchObject({ element: "*", hydrogenCount: 2 });
+    const visibleOnly = openChemDraftPayload(saved.contents.replace(/<objecttag Name="org\.chemdraft\/[^>]*\/>/g, ""));
+    expect(visibleOnly.source).toBe("external-cdxml");
+    expect(moleculeOf(visibleOnly).atoms[0]).toMatchObject({ element: "*", hydrogenCount: 2 });
+    expect(notCountedWarnings(visibleOnly)).toHaveLength(1);
+    const plain = exportDocumentToCdxml(document, { embedNativePayload: false }).contents;
+    expect(plain).toContain('NumHydrogens="2"');
+    const reopened = open(plain);
+    expect(reopened.molecule.atoms[0]).toMatchObject({ element: "*", hydrogenCount: 2 });
+    expect(notCountedWarnings(reopened.result)).toHaveLength(1);
+    expect(moleculeOf(importCdx(exportDocumentToCdx(document).bytes)).atoms[0]).toMatchObject({ element: "*", hydrogenCount: 2 });
+  });
+
+  it("a * stating 0 keeps it unflagged: 0 is what a * counts", () => {
+    const { result, molecule } = open(starCdxml('Element="250" NumHydrogens="0"'));
+    expect(molecule.atoms[0]).toMatchObject({ element: "*", hydrogenCount: 0 });
+    expect(notCountedWarnings(result)).toEqual([]);
+    expect(badges(molecule)).toEqual([]);
+    expect(exportDocumentToCdxml(result.document!, { embedNativePayload: false }).contents).toContain('NumHydrogens="0"');
+  });
+
+  it("a * with no NumHydrogens opens as before: nothing stored, no warning, no badge", () => {
+    for (const star of Object.values(starNodes)) {
+      const { result, molecule } = open(starCdxml(star));
+      expect(molecule.atoms[0]!.element).toBe("*");
+      expect(molecule.atoms[0]!.hydrogenCount).toBeUndefined();
+      expect(notCountedWarnings(result)).toEqual([]);
+      expect(badges(molecule)).toEqual([]);
+      expect(exportDocumentToCdxml(result.document!, { embedNativePayload: false }).contents).not.toContain("NumHydrogens");
+    }
+  });
+});
+
+describe("a NumHydrogens that is not a count", () => {
   it("warns, rather than dropping it silently, when NumHydrogens is not a hydrogen count", () => {
     for (const [value, element] of [["-1", ""], ["1.5", ' Element="8"'], ["two", ""]] as const) {
       const { result, molecule } = open(`<CDXML><page id="1"><fragment id="2">

@@ -6,7 +6,7 @@ import { sameDocumentValue } from "./documentValue";
 import type { ApplyPatchOptions, DocumentObject, DocumentPatch, DocumentPage, OrphanedRepeatUnit } from "@chemdraft/chem-core";
 import { bareIdTargetPage, duplicateIdRefusalMessage, objectInWriteScope, pinnedObjectMissingMessage, pinSelectionPages, resolveObjectOnPage,
   scopedObjectRefs, type PageObjectRef, type PluginWriteScopePages } from "./pageObjects";
-import { applyPatch, hydrogenAtomWithIgnoredCount, planOrphanedRepeatUnitCleanup, pruneReactionObjectReferences, removeOrphanedRepeatUnitBrackets,
+import { applyPatch, atomWithIgnoredHydrogenCount, ignoredHydrogenCountAtomKind, planOrphanedRepeatUnitCleanup, pruneReactionObjectReferences, removeOrphanedRepeatUnitBrackets,
   sameBracketIdentity } from "@chemdraft/chem-core";
 import {
   commitRequestPatch, containsBounds, pageContainsBounds, RequestWriteError, type BoundRequestWrite, type RequestDocument, type RequestHistory,
@@ -215,13 +215,15 @@ export function assertPluginPatchWriteScope(
 }
 
 /** The refusal reason (API 0.1.27 `PluginRefusalFields.reason`) for a write that would store a
- * hydrogen count other than 0 on an H, D or T atom. */
+ * hydrogen count other than 0 on an H, D or T atom, or on the unknown atom "*" (`details.element`
+ * says which). */
 export const HydrogenCountUnrepresentableReason = "hydrogen_count_unrepresentable";
 
 /**
  * Refuse a plugin or assistant write that would store a hydrogen count other than 0 on an H, D or T
- * atom: no label, formula or export reads it (chem-core `atomStatedHydrogenCount`), so storing it
- * would silently lose what the writer said (AGENTS.md §7). This is the only place such a count is
+ * atom or on the unknown atom "*": no label, formula or export reads it (chem-core
+ * `atomIgnoresStatedHydrogenCount`), so storing it would silently lose what the writer said
+ * (AGENTS.md §7). This is the only place such a count is
  * refused. chem-core's patches keep it, because they also replay opening, restoring, pasting,
  * duplicating and undoing a user's own document, which must never be refused; the atom validator
  * flags it there instead. A count the molecule already held unchanged is let be, so an edit
@@ -234,12 +236,13 @@ function assertRepresentableHydrogenCounts(before: ChemDraftDocument, after: Che
       if (object.type !== "molecule") continue;
       const previous = previousPage?.objects.find(candidate => candidate.id === object.id);
       if (previous === object) continue;
-      const atom = hydrogenAtomWithIgnoredCount(object.atoms, previous?.type === "molecule" ? previous.atoms : undefined);
+      const atom = atomWithIgnoredHydrogenCount(object.atoms, previous?.type === "molecule" ? previous.atoms : undefined);
       if (!atom) continue;
+      const allowed = atom.element === "*" ? "an unknown atom (*), as a typed * label means" : "an H, D or T atom, as a typed H, D or T label means";
       throw new PluginHostError(
         `Plugin write refused: atom "${atom.id}" of molecule "${object.id}" is ${atom.element} with hydrogenCount ` +
-        `${atom.hydrogenCount}, which a hydrogen atom cannot carry. Only 0 is allowed on an H, D or T atom, as a typed ` +
-        "H, D or T label means; omit hydrogenCount or set it to 0. Nothing was changed.",
+        `${atom.hydrogenCount}, which ${ignoredHydrogenCountAtomKind(atom)} cannot carry. Only 0 is allowed on ${allowed}; ` +
+        "omit hydrogenCount or set it to 0. Nothing was changed.",
         { reason: HydrogenCountUnrepresentableReason,
           details: { moleculeId: object.id, atomId: atom.id, element: atom.element, hydrogenCount: atom.hydrogenCount! } }
       );

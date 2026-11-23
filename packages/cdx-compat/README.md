@@ -136,6 +136,14 @@ Synthetic coverage includes biphenyl/Ph, Boc-NH, OTBS, OMe and three independent
   draws a hydrogen atom carrying hydrogens of its own; `cdxml.atom_hydrogen_count_not_kept` names
   each such atom, unless the count agrees with the derived one (a lone H stating 1);
 - on an atom whose label is not an element, always, for the file's sake; nothing counts hydrogens on it.
+  On the unknown atom `*` (an `Element` naming nothing, an unlabeled nickname node, a `*` generic
+  label) a count other than 0 is therefore also reported: its label draws none, the formula counts
+  none, the molfile writes the dummy atom `*` with no valence field and RDKit gives a dummy atom no
+  hydrogens, so its SMILES is `*` whatever the file states. `cdxml.atom_hydrogen_count_not_counted`
+  names each such atom ("kept as stored but not counted"), the atom is badged, and the count still
+  round-trips. A stated 0 is what a `*` counts anyway and is not reported. This is chem-core's
+  `atomIgnoresStatedHydrogenCount`, the one rule the badge, the native open report
+  (`document.atom_hydrogen_count_not_counted`) and the plugin-host refusal share.
 
 A value that is not a non-negative integer is not imported and is reported as
 `cdxml.atom_hydrogen_count_invalid`. Every kept count is written back as `NumHydrogens` on CDXML and

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { applyPatches, applyPatchWithHistory, atomStatedHydrogenCount, createDocumentHistory, createEmptyDocument, dropOrphanedHydrogenHints,
-  hydrogenAtomIgnoresStatedCount, hydrogenAtomWithIgnoredCount, redo, serializeDocument, deserializeDocument, undo, type MoleculeObject } from "./index";
+  atomIgnoresStatedHydrogenCount, atomWithIgnoredHydrogenCount, statedHydrogenCountNotCountedText, redo, serializeDocument, deserializeDocument, undo, type MoleculeObject } from "./index";
 
 // A pyrrole as CDXML imports it (aromatic ring bonds, the N's NumHydrogens and one carbon's kept),
 // with a single N–Zn bond whose dative meaning an edit can toggle.
@@ -413,15 +413,40 @@ describe("a hydrogen count an H, D or T atom cannot carry is stored as written, 
 
   it("names the atom a write sets such a count on, not one an earlier state already held unchanged", () => {
     const held = withHydrogen("H", 1).atoms;
-    expect(hydrogenAtomIgnoresStatedCount(held.at(-1)!)).toBe(true);
-    expect(["H", "D", "T"].map((element) => hydrogenAtomIgnoresStatedCount({ id: "h", element, x: 0, y: 0, formalCharge: 0, hydrogenCount: 0 })))
+    expect(atomIgnoresStatedHydrogenCount(held.at(-1)!)).toBe(true);
+    expect(["H", "D", "T"].map((element) => atomIgnoresStatedHydrogenCount({ id: "h", element, x: 0, y: 0, formalCharge: 0, hydrogenCount: 0 })))
       .toEqual([false, false, false]);
-    expect(hydrogenAtomIgnoresStatedCount({ id: "c", element: "C", x: 0, y: 0, formalCharge: 0, hydrogenCount: 2 })).toBe(false);
-    expect(hydrogenAtomWithIgnoredCount(held)?.id).toBe("h");
-    expect(hydrogenAtomWithIgnoredCount(held, held)).toBeUndefined();
-    expect(hydrogenAtomWithIgnoredCount(withHydrogen("H", 2).atoms, held)?.id).toBe("h");
-    expect(hydrogenAtomWithIgnoredCount(withHydrogen("D", 1).atoms, held)?.id).toBe("h");
-    expect(hydrogenAtomWithIgnoredCount(withHydrogen("D", 0).atoms, held)).toBeUndefined();
+    expect(atomIgnoresStatedHydrogenCount({ id: "c", element: "C", x: 0, y: 0, formalCharge: 0, hydrogenCount: 2 })).toBe(false);
+    expect(atomWithIgnoredHydrogenCount(held)?.id).toBe("h");
+    expect(atomWithIgnoredHydrogenCount(held, held)).toBeUndefined();
+    expect(atomWithIgnoredHydrogenCount(withHydrogen("H", 2).atoms, held)?.id).toBe("h");
+    expect(atomWithIgnoredHydrogenCount(withHydrogen("D", 1).atoms, held)?.id).toBe("h");
+    expect(atomWithIgnoredHydrogenCount(withHydrogen("D", 0).atoms, held)).toBeUndefined();
+  });
+
+  it("flags the unknown atom * stating a count other than 0, which nothing counts, and no other label", () => {
+    const atom = (element: string, hydrogenCount?: number, labelLiteral?: true) =>
+      ({ id: "x", element, x: 0, y: 0, formalCharge: 0, ...(hydrogenCount === undefined ? {} : { hydrogenCount }), ...(labelLiteral ? { labelLiteral } : {}) });
+    expect([atom("*", 2), atom("*", 1, true)].map(atomIgnoresStatedHydrogenCount)).toEqual([true, true]);
+    expect([atom("*", 0), atom("*"), atom("A", 2, true), atom("R1", 2, true), atom("O", 0)].map(atomIgnoresStatedHydrogenCount))
+      .toEqual([false, false, false, false, false]);
+    expect(atomWithIgnoredHydrogenCount([atom("*", 2)])?.id).toBe("x");
+    expect(atomWithIgnoredHydrogenCount([atom("*", 2)], [atom("*", 2)])).toBeUndefined();
+    expect(atomWithIgnoredHydrogenCount([atom("*", 0)])).toBeUndefined();
+  });
+
+  it("words the kept-but-not-counted report for hydrogen atoms, unknown atoms, or both", () => {
+    const atom = (id: string, element: string, hydrogenCount: number) => ({ id, element, x: 0, y: 0, formalCharge: 0, hydrogenCount });
+    expect(statedHydrogenCountNotCountedText([atom("h", "H", 1)])).toBe("atom h (H) states 1 hydrogen, which a hydrogen atom cannot carry: " +
+      "only 0 counts, as a typed H, D or T label means. The stated count is kept as stored but not counted, and the atom is flagged.");
+    expect(statedHydrogenCountNotCountedText([atom("x", "*", 2)], (item) => `n${item.id}`)).toBe("atom nx (*) states 2 hydrogens, which an unknown " +
+      "atom cannot carry: only 0 counts, as a typed * label means. The stated count is kept as stored but not counted, and the atom is flagged.");
+    expect(statedHydrogenCountNotCountedText([atom("x", "*", 2), atom("y", "*", 1)])).toBe("2 unknown atoms state hydrogen counts an unknown " +
+      "atom cannot carry: atom x (*) states 2; atom y (*) states 1. Only 0 counts, as a typed * label means. The stated counts are kept as " +
+      "stored but not counted, and the atoms are flagged.");
+    expect(statedHydrogenCountNotCountedText([atom("h", "H", 1), atom("x", "*", 2)])).toBe("2 atoms state hydrogen counts they cannot carry: " +
+      "atom h (H) states 1; atom x (*) states 2. Only 0 counts on a hydrogen or unknown atom, as a typed H, D, T or * label means. The stated " +
+      "counts are kept as stored but not counted, and the atoms are flagged.");
   });
 });
 

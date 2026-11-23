@@ -2,6 +2,7 @@ import { XMLParser, XMLValidator } from "fast-xml-parser";
 import {
   ChemDraftDocumentSchema,
   DocumentSchemaVersion,
+  atomIgnoresStatedHydrogenCount,
   atomicNumberForElementSymbol,
   bracketPairs,
   bracketPairSemantics,
@@ -42,7 +43,8 @@ import {
   type ReactionObject,
   type TextObject,
   type TableObject,
-  type UnknownCompatibilityObject
+  type UnknownCompatibilityObject,
+  statedHydrogenCountNotCountedText
 } from "@chemdraft/chem-core";
 import { measureTextRun, planTableLayout, textObjectSpansForRendering, transformPointForObject } from "@chemdraft/layout-engine";
 import { bondedElementLabelMeaning, isGenericAtomLabel } from "@chemdraft/template-library";
@@ -4700,6 +4702,7 @@ function importFragment(
   }
   warnings.push(...keepStatedHydrogens(ordinaryStatedAtoms, atoms, normalizedBonds,
     statedHydrogensByAtomId, atomIdByCdxmlId, context.sourceFormat, objectId));
+  warnings.push(...notCountedStatedHydrogens(atoms, atomIdByCdxmlId, context.sourceFormat, objectId));
   const atomStereochemistry = Object.entries(cdxmlAtomStereochemistryByAtomId).map(
     ([atomId, stereo]) => `${atomId}:${stereo.assignment}`
   );
@@ -6626,7 +6629,8 @@ function cdxmlBondDisplayForBondStyle(display: MoleculeBond["display"]): string 
  * Any other count on a hydrogen atom cannot be kept, since no typed label draws a hydrogen atom
  * carrying hydrogens of its own: it is not stored, and a second warning says so, unless it agrees
  * (a lone H stating 1). An atom whose label is not an element (an unknown atom, a generic label)
- * keeps what the file states, for the file's sake; nothing counts hydrogens on it.
+ * keeps what the file states, for the file's sake; nothing counts hydrogens on it, and on an unknown
+ * atom "*" a count other than 0 is reported and badged (`notCountedStatedHydrogens`).
  * Mutates `candidates`; returns the warnings.
  */
 function keepStatedHydrogens(
@@ -6693,6 +6697,35 @@ function keepStatedHydrogens(
     });
   }
   return warnings;
+}
+
+/**
+ * One warning per fragment naming each atom that now stores a hydrogen count nothing counts
+ * (chem-core `atomIgnoresStatedHydrogenCount`, the rule the atom validator, the native open report
+ * and the plugin host share). In practice that is an unknown atom "*" (an Element naming nothing, an
+ * unlabeled nickname node, a "*" generic label) stating a count other than 0: its label draws none,
+ * the formula counts none, the molfile writes the dummy atom "*" with no valence and RDKit gives a
+ * dummy atom no hydrogens, so its SMILES is "*" whatever the file states. The count is kept for the
+ * file's round trip (CDXML and CDX write it back), the atom is badged, and this says it is not
+ * counted, in chem-core's `statedHydrogenCountNotCountedText` wording (AGENTS.md §7). A stated 0 is
+ * what such an atom counts anyway, and is not reported. A hydrogen atom's count other than 0 is not
+ * kept on an ordinary atom (`keepStatedHydrogens` reports it); one a literal label kept is named here.
+ */
+function notCountedStatedHydrogens(
+  atoms: readonly MoleculeAtom[],
+  atomIdByCdxmlId: ReadonlyMap<string, string>,
+  sourceFormat: string,
+  objectId: string
+): CompatibilityConversionWarning[] {
+  const notCounted = atoms.filter(atomIgnoresStatedHydrogenCount);
+  if (notCounted.length === 0) return [];
+  const cdxmlIdByAtomId = new Map([...atomIdByCdxmlId].map(([cdxmlId, atomId]) => [atomId, cdxmlId]));
+  return [{
+    code: "cdxml.atom_hydrogen_count_not_counted",
+    message: `${sourceFormat} import: ${statedHydrogenCountNotCountedText(notCounted, (atom) => cdxmlIdByAtomId.get(atom.id) ?? atom.id)}`,
+    sourceObjectId: objectId,
+    atomIds: notCounted.map((atom) => atom.id)
+  }];
 }
 
 function cdxmlAtomStereoAssignment(value: string | undefined): "R" | "S" | undefined {
