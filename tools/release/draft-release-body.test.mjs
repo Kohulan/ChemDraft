@@ -4,7 +4,8 @@ import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { draftReleaseBody } from "./draft-release-body.mjs";
+import { draftReleaseBody, windowsInstallerLines } from "./draft-release-body.mjs";
+import { BUILD_TARGETS } from "./record-build.mjs";
 import { releaseBuildFiles } from "./release-assets.mjs";
 import { allusersInstaller, appImage, arm, commit, deb, fakeReleaseRunner, installer, intel, offlineInstaller, releaseFixture, updaterPublicKey, version, windowsInstallers, windowsUpdates } from "./release-test-fixtures.mjs";
 
@@ -46,6 +47,19 @@ test("Windows section lists all three installers, the offline one labelled for I
   assert.ok(windows.startsWith(`Windows\n\nWindows notes\n\nInstallers:\n\n${list}\n\nNot in this build: Feature B: reason`), windows);
   assert.ok(windows.includes(`- \`${offlineInstaller}\`: offline, for IT-managed machines\n`));
   assert.equal(windows.match(/^- `ChemDraft_.*\.exe`: /gm).length, 3);
+});
+
+test("an installer built without a release-page label fails the Windows section", () => {
+  const suffixes = BUILD_TARGETS["x86_64-pc-windows-msvc"];
+  const original = [...suffixes];
+  try {
+    suffixes.push("x64-unlabelled-setup.exe");
+    assert.throws(() => windowsInstallerLines(version), /No release-page label for Windows installer x64-unlabelled-setup\.exe/);
+  } finally {
+    suffixes.splice(0, suffixes.length, ...original);
+  }
+  assert.deepEqual(suffixes, original);
+  assert.equal(windowsInstallerLines(version).length, 3);
 });
 
 test("five-build release includes a Linux beta section and accepts Linux gaps", (t) => {

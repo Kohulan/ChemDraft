@@ -92,51 +92,88 @@ just before `NSIS_HOOK_POSTINSTALL` runs. The post-install hook reads that value
 command under it, and records it as `ChemDraftAssociationProgId` in this build's uninstall key
 (`${UNINSTKEY}`, named after the product name, so stable and dev builds never share it). The
 pre-uninstall hook reads it back before Tauri deletes that key. A dev install therefore never
-rewrites the stable class's command, and neither build's uninstaller touches the other's class.
+rewrites the stable class's command, and neither build's uninstaller deletes the other's class.
 
-## File association uninstall cleanup: every installer
+The hooks also need the ProgID where nothing recorded it: before `APP_ASSOCIATE` runs on an install,
+and on uninstall after an install that stopped before its post-install hook or was made before these
+hooks. On Windows, `scripts/desktop-tauri.mjs` sets `CHEMDRAFT_ASSOCIATION_PROGID` to the same
+association name it gives Tauri (the dev names for a branch build, otherwise the Windows config's),
+and makensis substitutes that environment variable into the hook at compile time. The hook stops the
+build with `!error` when the variable is unset or empty, so every installer carries its ProgID. The
+recorded value is used when present, and the built-in one otherwise.
 
-Tauri CLI 2.11.2 supports `NSIS_HOOK_PREUNINSTALL` and `NSIS_HOOK_POSTUNINSTALL`
-(`installer-tauri-cli-v2.11.2.nsi:772`–`774`, `:880`–`882`). At install, `APP_ASSOCIATE` saves
-`.chemdraft`'s previous default as `<ProgID>_backup`. At uninstall, `APP_UNASSOCIATE` writes that
-backup back as the default, even if another program has claimed the extension since, and deletes the
-ProgID key, but leaves the extension key and backup value behind
-(`FileAssociation-tauri-cli-v2.11.2.nsh:108`–`114`). A reinstall saves the build's own ProgID as the
-backup, so uninstall would restore a default pointing to the removed program.
+## File association owners across installs and uninstalls
 
-The hook removes only what this installer registered:
+Tauri CLI 2.11.2 supports all four hooks: `NSIS_HOOK_PREINSTALL` before any file is copied,
+`NSIS_HOOK_POSTINSTALL` after associations and shortcuts, and `NSIS_HOOK_PREUNINSTALL` and
+`NSIS_HOOK_POSTUNINSTALL` around the uninstall section (`installer-tauri-cli-v2.11.2.nsi:772`–`774`,
+`:880`–`882`). At install, `APP_ASSOCIATE` saves `.chemdraft`'s previous default as
+`<ProgID>_backup`. At uninstall, `APP_UNASSOCIATE` writes that backup back as the default, even if
+another program has claimed the extension since, and deletes the ProgID key, but leaves the extension
+key and backup value behind (`FileAssociation-tauri-cli-v2.11.2.nsh:108`–`114`). A reinstall, and an
+update with `/UPDATE` (which installs over the existing copy without uninstalling it), runs
+`APP_ASSOCIATE` again while this build owns `.chemdraft`, so Tauri alone would back the build up as its
+own predecessor and lose the owner from before ChemDraft was installed.
 
-- The pre-uninstall hook records this build's ProgID and the current default, including whether it
-  exists. The post-uninstall hook first restores the install scope with `SetContext`, since optional
-  app-data deletion switches the shell context to the current user. All registry operations use
-  `SHCTX`: HKCU for per-user installs, HKLM for all-users installs.
+Ownership of `.chemdraft` is treated as a stack, linked by those `<ProgID>_backup` values. All
+registry operations use `SHCTX` (HKCU for per-user installs, HKLM for all-users installs), and every
+ProgID comparison is case-insensitive, as registry key names are.
+
+- **Before install**, the pre-install hook works out the owner this build replaces: the current
+  default, or, when that is already this build (a reinstall or `/UPDATE`), the owner it replaced
+  before, read from its `<ProgID>_backup` or, if that names the build itself, from the copy in its
+  uninstall key. Nothing is written yet, so a cancelled install leaves no trace.
+- **After install**, the post-install hook writes that owner back over `APP_ASSOCIATE`'s backup and
+  saves a copy as `ChemDraftAssociationPreviousOwner` in this build's uninstall key, so an interrupted
+  reinstall that leaves a self-backup still has it. It never saves this build's own ProgID. If another
+  owner held `.chemdraft` (for example the other ChemDraft build, which had replaced this one), this
+  build has moved above it: the backup that named this build is pointed at the owner this build used
+  to follow.
+- **Before uninstall**, the pre-uninstall hook records this build's ProgID, the current default
+  (including whether it exists) and the owner this build replaced. After uninstall, the hook first
+  restores the install scope with `SetContext`, since optional app-data deletion switches the shell
+  context to the current user, then deletes this build's class.
+- If this build **was** the owner, `.chemdraft` goes back to the owner it replaced: the program that
+  owned it before ChemDraft, or the other ChemDraft build. If that class no longer has a
+  `shell\open\command` in `HKCR` (it was uninstalled since), or nothing owned `.chemdraft` before,
+  the default is removed instead.
 - If the default before uninstall was **not** this build's ProgID (another program, or the other
-  ChemDraft build, claimed `.chemdraft` later), that owner is put back over Tauri's restored backup;
-  a missing default stays missing.
-- If this build **was** the owner, the owner Tauri restored from the backup is kept: the program that
-  owned `.chemdraft` before ChemDraft was installed, or the other ChemDraft build. The default is
-  removed instead only when it is this build's own ProgID (a reinstall's self-backup), empty
-  (nothing owned it before), or a class that no longer exists in `HKCR` (an owner uninstalled since).
-  The ownership comparisons are case-sensitive.
+  ChemDraft build, claimed `.chemdraft` later), that owner is put back over Tauri's restored backup
+  while its class still has an open command; otherwise the default is removed. A missing default
+  stays missing. The owner that replaced this build, found by following backups down from the current
+  owner, has its backup pointed at the owner this build replaced, so a later uninstall of it restores
+  a live class rather than this build's deleted one. That backup is the only value of another owner
+  the hook changes, and only when it names this build.
 - It deletes this build's ProgID tree, its own `<ProgID>_backup` value, and only its own value
-  under `.chemdraft\OpenWithProgids`. Another program's or the other build's ProgID, backup value
-  and OpenWith entries are never touched.
+  under `.chemdraft\OpenWithProgids`. Another program's or the other build's ProgID and OpenWith
+  entries are never touched.
 - It never deletes `.chemdraft` or `OpenWithProgids` wholesale. Each is removed only when it is then
   empty: no default value, no other values and no subkeys (checked explicitly, then
-  `DeleteRegKey /ifempty`). No other extension is touched.
+  `DeleteRegKey /ifempty`). No other extension is touched, and `.cdxml` is never registered.
 - Finally, Tauri's `UPDATEFILEASSOC` macro calls
   `SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_FLUSH, 0, 0)` to refresh the shell.
 
+An install that a release without these hooks has already reinstalled or updated over itself has lost
+its predecessor to a self-backup, so its uninstall removes the default rather than guess. One installed
+only once by such a release still has Tauri's backup, and the first update under these hooks keeps it.
+
 `apps/desktop/src/windowsAssociationQuoting.test.ts` runs the hook's own text through a small
-interpreter for the NSIS commands it uses, over an in-memory registry, with Tauri's association
-macros modeled after the saved template. It covers stable and dev builds installed in the same
-scope and uninstalled in either order, a reinstall, a program that owned `.chemdraft` before install
-or claimed it afterward, another program's OpenWith entry, a missing default, and a case-only
-mismatch. It does not execute NSIS. The cleanup still requires real Windows tests of the CI-built
-installers. Check silent `/S` uninstall after a clean install and reinstall, a stable and a dev build
-side by side, a changed or missing default, another program's OpenWith entry, and uninstall with
-app-data removal selected. Confirm cleanup in the correct registry hive and preservation of
-associations owned by another program.
+interpreter for the NSIS commands it uses (including LogicLib's `If` and `Do` blocks), over an
+in-memory registry, with Tauri's association macros and the install and uninstall sections around the
+hooks modeled after the saved template. It covers a program that owned `.chemdraft` before install
+surviving a reinstall and `/UPDATE` and being restored on uninstall, an interrupted reinstall, an
+upgrade that runs the old uninstaller first, stable and dev builds installed in either order (with
+and without an earlier owner, with reinstalls between) and uninstalled in either order, a missing
+recorded ProgID with a ChemDraft-owned or a foreign default, an interrupted first install, a program
+that claimed `.chemdraft` afterward, a later owner or saved owner whose class is gone, another
+program's OpenWith entry, a missing default, and case-only ProgID changes (checking that the restored
+class still has its open command). Every uninstall also checks that nothing the build registered
+remains. It does not execute NSIS, and the compile-time `!error` guard is checked only as text. The
+cleanup still requires real Windows tests of the CI-built installers. Check silent `/S` uninstall after
+a clean install, a reinstall and an `/UPDATE`, a stable and a dev build side by side in both orders
+with another program owning `.chemdraft` first, a changed or missing default, another program's
+OpenWith entry, and uninstall with app-data removal selected. Confirm cleanup in the correct registry
+hive and preservation of associations owned by another program.
 
 ## Updates require administrator rights for the machine install
 
@@ -169,8 +206,10 @@ cancellation, session restoration to the original account, no duplicate per-user
 No macOS native build is needed for these Windows-only packaging changes; macOS runtime was not run.
 The recommended next task is this CI-built Windows installer and update pass.
 
-Before a signed CI run, update any existing single-installer SignPath artifact configuration to
-select both installers, as documented in `docs/releasing/windows-signing.md`. The workflow verifies
-the exact returned filename set and requires a valid Authenticode signature on each installer.
+Before a signed CI run, update any existing SignPath artifact configuration to select all three
+installers: `ChemDraft_<ver>_x64-setup.exe`, `ChemDraft_<ver>_x64-allusers-setup.exe` and the offline
+`ChemDraft_<ver>_x64-allusers-offline-setup.exe`, as documented in `docs/releasing/windows-signing.md`.
+The workflow verifies the exact returned filename set and requires a valid Authenticode signature on
+each installer, so a configuration that omits the offline installer fails the signed run.
 
 The build stamp in `apps/desktop/src/MainWindow.tsx` is bumped so the build is identifiable; `scripts/ci/require-build-stamp-bump.sh` alone would not require it, since the only other change under `apps/desktop/src` is a test file.

@@ -29,7 +29,8 @@ In addition to those two update targets, the workflow builds
 same shared build, Authenticode signing, certificate verification and upload path, but has no
 updater `.sig` or separate feed. It inherits the all-users overlay's `latest-allusers.json` endpoint,
 so it downloads the normal all-users installer for updates once internet access is available.
-The workflow rejects offline updater signatures and any mention of `offline` in either feed.
+The workflow rejects offline updater signatures and any platform download URL in either feed that
+names the offline installer; release notes in a feed may still mention it.
 
 ## Owner setup for SignPath Foundation
 
