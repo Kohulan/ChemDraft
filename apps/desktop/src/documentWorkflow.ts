@@ -9765,8 +9765,11 @@ export function commitNativeAtomLabelTarget(
   const relabel = (reason?: string) => {
     const refusal = atomLabelIsotopeRefusal(beforeAtom, normalized, beforeMolecule, options.literal === true);
     if (refusal) return { document, target, message: refusal, refusal };
+    const relabeled = applyNativeAtomElementTarget(document, target, label, options);
+    const ringRefusal = typedLabelRingRefusal(normalized, relabeled, document, target, beforeAtom, beforeMolecule, options);
+    if (ringRefusal) return { document, target, message: ringRefusal, refusal: ringRefusal };
     return {
-      document: applyNativeAtomElementTarget(document, target, label, options), target,
+      document: relabeled, target,
       ...(reason ? { message: `Relabeled ${normalized}: ${reason}` } : {})
     };
   };
@@ -9820,6 +9823,51 @@ export function commitNativeAtomLabelTarget(
     target: { ...target, kind: "atom", atomId: newAtom.id },
     message: `Attached ${normalized} as a substituent: ${normalized} ${decision.reason === "generic" ? "is a one-bond placeholder" : "takes one bond"} and this atom already has ${decision.bondCount}`
   };
+}
+
+/**
+ * Why a typed relabel of a ring atom must be refused, or undefined when it may be committed. It is
+ * refused when it would leave an aromatic system with no Kekulé pattern ("N" over a pyrrole or
+ * indole NH) or move a tautomeric hydrogen onto another atom ("N" over an imidazole NH, which would
+ * have the H guessed onto the other N). Both are read from the bond-order resolution the validator
+ * badges from (`nativeBondOrderResolution`): an atom unresolved after the edit that was not before,
+ * or another atom whose H count is guessed after the edit and was not before. Only problems the
+ * edit introduces count, so a ring already broken before it does not block an unrelated retype.
+ * The message names the label that keeps the ring valid when the drawn label is the typed element
+ * with its hydrogens ("NH") and committing that is clean. Master decision 2026-11-22.
+ */
+function typedLabelRingRefusal(
+  normalized: string,
+  relabeled: ChemDraftDocument,
+  document: ChemDraftDocument,
+  target: NativeMoleculeDeleteTarget,
+  beforeAtom: MoleculeAtom,
+  beforeMolecule: MoleculeObject,
+  options: { literal?: boolean }
+): string | undefined {
+  if (target.kind !== "atom") return undefined;
+  const before = nativeBondOrderResolution(beforeMolecule.atoms, beforeMolecule.bonds);
+  const breaks = (next: ChemDraftDocument) => {
+    const molecule = firstPage(next).objects.find((object): object is MoleculeObject =>
+      object.id === target.objectId && object.type === "molecule");
+    if (!molecule) return false;
+    const after = nativeBondOrderResolution(molecule.atoms, molecule.bonds);
+    return [...after.unresolvedAtomIds].some(id => !before.unresolvedAtomIds.has(id)) ||
+      [...after.inferredHydrogenAtomIds].some(id => id !== target.atomId && !before.inferredHydrogenAtomIds.has(id));
+  };
+  if (!breaks(relabeled)) return undefined;
+  const drawn = atomDisplayLabel(beforeAtom, beforeMolecule.bonds, nativeDrawingStyleFromObjectStyle(beforeMolecule.style), beforeMolecule.atoms);
+  const hydrogensOnly = (part: string) => /^H\d*$/.test(part);
+  const suggestion = drawn !== undefined && drawn !== normalized &&
+    ((drawn.startsWith(normalized) && hydrogensOnly(drawn.slice(normalized.length))) ||
+      (drawn.endsWith(normalized) && hydrogensOnly(drawn.slice(0, drawn.length - normalized.length))))
+    ? drawn
+    : undefined;
+  // The drawn label typed back is no edit at all when the atom states its count (`typedLabelIsDrawnLabel`).
+  const suggestionKeepsRing = suggestion !== undefined &&
+    ((options.literal === true && typedLabelIsDrawnLabel(suggestion, beforeAtom, beforeMolecule)) ||
+      !breaks(applyNativeAtomElementTarget(document, target, suggestion, options)));
+  return `Typing ${normalized} here would leave this ring with no valid structure; ${suggestionKeepsRing ? `type ${suggestion}, or ` : ""}edit the ring first.`;
 }
 
 /**

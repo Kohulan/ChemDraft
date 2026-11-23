@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyPatches, createDocumentHistory, moleculeToMolfileV2000, undo, type ChemDraftDocument, type DocumentHistory, type MoleculeObject } from "@chemdraft/chem-core";
+import { applyPatches, createDocumentHistory, moleculeToMolfileV2000, type ChemDraftDocument, type DocumentHistory, type MoleculeObject } from "@chemdraft/chem-core";
 import { atomDisplayLabel } from "@chemdraft/layout-engine";
 import { testMoleculeFromSmiles } from "@chemdraft/layout-engine/testing";
 import { nativeBondOrderResolution, nativeSingleBondGraphMetadata, normalizeNativeMoleculeGeometry, tryNativeSingleBondGraphSmiles } from "@chemdraft/document-workflow-core";
@@ -206,31 +206,57 @@ describe("committing a typed label over the label drawn for an aromatic NH", () 
     expect(molecule(result.document).atoms.find(atom => atom.id === nitrogen.id)).toEqual(nitrogen);
   });
 
-  it.each(rings)("\"N\" typed over the drawn NH of %s is never silent: the ring is badged, and undo restores it exactly", (name, smiles) => {
+  // Master decision 2026-11-22: a retype that would leave the aromatic system with no Kekule pattern
+  // (pyrrole, indole) or move the tautomeric H to another atom (imidazole) is refused through the
+  // label commit's refusal, so nothing is committed: the document, its selection and the undo stack
+  // stay as they were, and every H stays where it was drawn.
+  it.each(rings)("\"N\" typed over the drawn NH of %s is refused: nothing changes and no H moves", (_name, smiles) => {
     const { document, nitrogen, target } = ring(smiles);
-    const committed = commitNativeAtomLabelTarget(document, target, "N", { literal: true, replaceElement: true }).document;
-    const retyped = molecule(committed).atoms.find(atom => atom.id === nitrogen.id)!;
-    expect(retyped).toMatchObject({ element: "N", labelLiteral: true });
-    expect(retyped.hydrogenCount).toBeUndefined();
-    const shown = badges(committed);
-    if (name === "imidazole") {
-      // The ring still kekulizes, but only with the H guessed onto the other N: that N is badged.
-      const other = molecule(committed).atoms.find(atom => atom.element === "N" && atom.id !== nitrogen.id)!;
-      expect(drawn(committed, other.id)).toBe("NH");
-      expect(shown).toEqual([expect.objectContaining({ atomId: other.id, tautomerGuessed: true,
-        invalidReason: "N: hydrogen count guessed from the aromatic bonds. Draw the H to settle it." })]);
-    } else {
-      // Without its H the ring has no Kekule pattern: every ring atom is badged, the typed N included.
-      expect(shown).toContainEqual(expect.objectContaining({ atomId: nitrogen.id, unresolvedAromatic: true,
-        invalidReason: "N: its aromatic bonds don't resolve into single and double bonds." }));
-      expect(shown.every(state => state.unresolvedAromatic === true)).toBe(true);
-    }
-    // The app's history keeps whole committed documents; undo puts the one before the retype back.
-    const history: DocumentHistory = { ...createDocumentHistory(document), past: [document], present: committed };
-    const undone = undo(history);
-    expect(undone.present).toBe(document);
-    expect(molecule(undone.present).atoms.find(atom => atom.id === nitrogen.id)).toEqual(nitrogen);
-    expect(badges(undone.present)).toEqual([]);
+    const before = molecule(document);
+    const result = commitNativeAtomLabelTarget(document, target, "N", { literal: true, replaceElement: true });
+    const message = "Typing N here would leave this ring with no valid structure; type NH, or edit the ring first.";
+    expect(result.refusal).toBe(message);
+    expect(result.message).toBe(message);
+    expect(result.document).toBe(document);
+    expect(result.target).toEqual(target);
+    expect(molecule(result.document).atoms.find(atom => atom.id === nitrogen.id)).toEqual(nitrogen);
+    expect(molecule(result.document).atoms.map(atom => [atom.id, atom.hydrogenCount])).toEqual(before.atoms.map(atom => [atom.id, atom.hydrogenCount]));
+    expect(before.atoms.filter(atom => drawn(document, atom.id) === "NH").map(atom => atom.id)).toEqual([nitrogen.id]);
+    expect(badges(result.document)).toEqual([]);
+    // The app records an undo entry only for a changed document: the history is the one it was.
+    const history: DocumentHistory = createDocumentHistory(document);
+    const after: DocumentHistory = result.document === history.present ? history : { ...history, past: [...history.past, history.present], present: result.document };
+    expect(after).toBe(history);
+  });
+
+  it("the same refusal comes through a label-editor commit that started from a draft", () => {
+    const { document, nitrogen, target } = ring("c1c[nH]cn1");
+    const draftDocument = applyNativeAtomElementTarget(document, target, "N", { literal: true });
+    expect(molecule(draftDocument)).not.toEqual(molecule(document));
+    // The check reads the atom as it was before the session, not the draft already in the document.
+    const result = commitNativeAtomLabelTarget(draftDocument, target, "N", { literal: true, replaceElement: true,
+      beforeAtom: nitrogen, beforeMolecule: molecule(document) });
+    expect(result.refusal).toBe("Typing N here would leave this ring with no valid structure; type NH, or edit the ring first.");
+    expect(result.document).toBe(draftDocument);
+  });
+
+  it("\"N\" typed over a pyridine N still commits as before", () => {
+    const graph = testMoleculeFromSmiles("c1ccncc1");
+    const object: MoleculeObject = { id: "m", type: "molecule", x: 0, y: 0, width: 100, height: 100, rotation: 0, style: {},
+      structureFormat: "molfile-v2000", structure: "", superatoms: [], rGroups: [],
+      atoms: graph.atoms.map(atom => ({ ...atom, x: 200 + atom.x * 3, y: 200 + atom.y * 3 })), bonds: [...graph.bonds] };
+    const base = createPhase4Document("Retype");
+    const document = applyPatches(base, [{ op: "addObject", pageId: base.pages[0]!.id, object }]);
+    const nitrogen = molecule(document).atoms.find(atom => atom.element === "N")!;
+    const target = { objectId: object.id, kind: "atom" as const, atomId: nitrogen.id, distanceToPointer: 0 };
+    const result = commitNativeAtomLabelTarget(document, target, "N", { literal: true, replaceElement: true });
+    expect(result.refusal).toBeUndefined();
+    expect(result.message).toBeUndefined();
+    // Committed as today: the typed literal N, and the ring still kekulizes with no H anywhere.
+    expect(result.document).not.toBe(document);
+    expect(molecule(result.document).atoms.find(atom => atom.id === nitrogen.id)).toMatchObject({ element: "N", labelLiteral: true });
+    expect(badges(result.document)).toEqual([]);
+    expect(tryNativeSingleBondGraphSmiles(molecule(result.document).atoms, molecule(result.document).bonds)?.smiles).toBe("C1=CC=[N]C=C1");
   });
 });
 
