@@ -8,6 +8,15 @@ in progress rather than a changelog.
 
 # In flight
 
+## Main document zoom controls (`resubmit/document-zoom`)
+
+Rebuild #188 on current main. Add the customizable Main widget with Zoom Out/In and exact
+25/50/75/100/200/400% presets. Step buttons through 25/50/75/100/125/150/200/300/400/600/850%;
+keep wheel/pinch smooth. Anchor toolbar/keyboard zoom at the measured visible workspace center,
+accounting for rulers and scrollbars, and guard queued work when documents change. Broadcast only
+validated small view state to palettes. Preserve document geometry/history and current clipboard,
+assistant, text/color and menu infrastructure. Native Windows and both macOS checks remain pending.
+
 # ChemDraft Assistant plugin (active, branches claude/assistant-*)
 
 ## Objective

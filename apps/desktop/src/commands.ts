@@ -31,6 +31,7 @@ import { structureSearchCommands, structureSearchDocument } from "./structureSea
 import { loadStructureSearchEnabled } from "./structureSearchSettings";
 import type { CommandDefinition } from "@chemdraft/plugin-host";
 import { withStandaloneDrawingToolCommands } from "./drawingTools";
+import { documentZoomActions } from "./documentZoom";
 import {
   nativeHotkeyElements,
   selectedTextToAtomLabelDisabledReason,
@@ -171,6 +172,7 @@ export function createQuickActions(
     { id: "clipboard.paste", title: "Paste", icon: "paste", shortcut: "Cmd+V", source: "core" },
     { id: "view.zoomOut", title: "Zoom Out", icon: "zoomOut", shortcut: "Cmd+-", source: "core" },
     { id: "view.zoomIn", title: "Zoom In", icon: "zoomIn", shortcut: "Cmd++", source: "core" },
+    ...documentZoomActions,
     { id: "view.toggleToolPalette", title: "Toggle Tool Palette", icon: "palette", source: "core" },
     { id: "export.open", title: "Export...", icon: "export", shortcut: "Shift+Cmd+E", source: "core" },
     templateDialogAction,

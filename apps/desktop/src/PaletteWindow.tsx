@@ -2,6 +2,8 @@ import { isDrawingToolCommand } from "./drawingTools";
 import { installPopoverEscapeRouting } from "./window-manager/popoverEscape";
 import { listenCurrentWindowEvent } from "./window-manager/tauriEvents";
 import type { AnalysisReport } from "@chemdraft/analysis-core";
+import type { DocumentZoomState } from "./documentZoom";
+import { listenForToolsetZoom, requestToolsetZoom } from "./window-manager";
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent } from "react";
 import { observePaletteHitBoxes } from "./commandHitBoxes";
 import { DefaultNativeTextStyle, type NativeTextStyle, type TextSpan } from "@chemdraft/chem-core";
@@ -190,6 +192,17 @@ export function PaletteWindow({
   const pluginToolsetsRef = useRef<readonly DesktopToolsetDefinition[]>([]);
   commandSpecsRef.current = commandSpecs;
   const [activeTool, setActiveTool] = useState("tool.select");
+  const [currentZoom, setCurrentZoom] = useState<DocumentZoomState>();
+  useEffect(() => {
+    let disposed = false;
+    let stop: (() => void) | undefined;
+    void listenForToolsetZoom(state => { if (!disposed) setCurrentZoom(state); }).then(cleanup => {
+      if (disposed) { cleanup(); return; }
+      stop = cleanup;
+      void requestToolsetZoom().catch(() => undefined);
+    }).catch(() => undefined);
+    return () => { disposed = true; stop?.(); };
+  }, []);
   const [colorPickerOpen, setColorPickerOpen] = useState(false);
   const [currentTextStyle, setCurrentTextStyle] = useState<NativeTextStyle>(DefaultNativeTextStyle);
   const [currentTextScript, setCurrentTextScript] = useState<TextSpan["script"]>("normal");
@@ -1188,6 +1201,7 @@ export function PaletteWindow({
         widgetState={{
           commandSpecs: allCommands,
           colorContextKey,
+          currentZoom,
           currentObjectColor: currentTextStyle.color,
           currentArtStyle,
           currentArtStyleTarget,

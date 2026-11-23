@@ -1,5 +1,11 @@
 # Manual stress checklist
 
+Document zoom controls: use Main's Zoom Out/In and each preset, check 100→125→150→200 and reverse,
+then smooth wheel/pinch and tab switching. The displayed percentage must follow the active view.
+Check center anchoring after scrolling, rulers on/off and scrollbar appearance, custom toolbar
+layouts, old-session restore and display scaling. Molecules, undo history and exported page size
+must stay unchanged. Repeat with native palettes on Windows and both macOS builds.
+
 The standing hands-on checklist for interactive surfaces. It moved here from `AGENTS.md` §20 when that
 file was consolidated (2026-10-04); `AGENTS.md` §14 still requires it. Run every item on **macOS and
 Windows** unless the item names one platform. `docs/windows-port-stress-test.md` records the Windows
