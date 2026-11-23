@@ -32,6 +32,7 @@ import { ToolbarCustomizeController } from "./toolbars/CustomizeMainToolbar/Tool
 import { CustomizeBar } from "./toolbars/CustomizeMainToolbar/CustomizeBar";
 import { GalleryTray } from "./toolbars/CustomizeMainToolbar/GalleryTray";
 import { SHELL_COMMAND_IDS } from "./shellCommandIds";
+import type { ArtInspectorEffectKind } from "./artInspectorModel";
 import {
   createDesktopToolsetRegistry,
   desktopToolsetRegistry,
@@ -934,13 +935,13 @@ export function PaletteWindow({
 
   // Flyout opens and swatch toggles share the entire native operation, including visibility reads.
   // Snapshot the opening before awaiting: a late reply never authorizes closing its replacement.
-  const openColorPopover = (anchor: ToolbarPopoverAnchor, kind: "artColor" | "textColor" = "artColor") => {
+  const openColorPopover = (anchor: ToolbarPopoverAnchor, kind: "artColor" | "textColor" = "artColor", effectKind?: ArtInspectorEffectKind) => {
     const request = popoverRequestRef.current;
     enqueuePopoverOperation(async () => {
       if (popoverRequestRef.current !== request) return;
       const opening = lastPopoverPayloadRef.current?.content;
       const isCurrent = () => popoverRequestRef.current === request && lastPopoverPayloadRef.current?.content === opening;
-      if (opening?.kind === kind) {
+      if (opening?.kind === kind && (opening.kind !== "artColor" || opening.effectKind === effectKind)) {
         const visible = await isToolsetPopoverWindowVisible(toolset.id);
         if (!isCurrent()) return;
         if (visible) {
@@ -955,7 +956,7 @@ export function PaletteWindow({
           return;
         }
       }
-      const content: ToolsetPopoverContent = { kind, ...newToolsetPopoverOpening() };
+      const content: ToolsetPopoverContent = { kind, ...(kind === "artColor" ? { effectKind } : {}), ...newToolsetPopoverOpening() };
       if (await openPopover(anchor, kind, content, request)) {
         await requestToolsetTextStyle();
       }

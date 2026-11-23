@@ -1,5 +1,10 @@
 # Manual stress checklist
 
+Effect color popovers: select art or a molecule, enable Glow/Shadow/Sketch in Color Controls, then
+open Effect. The entire picker must fit in its owned window. Preview, commit, cancel and switch
+between effects, fill and text colors; only the intended target should change. Repeat at mixed
+display scales and monitor edges on Windows and both macOS builds.
+
 The standing hands-on checklist for interactive surfaces. It moved here from `AGENTS.md` §20 when that
 file was consolidated (2026-10-04); `AGENTS.md` §14 still requires it. Run every item on **macOS and
 Windows** unless the item names one platform. `docs/windows-port-stress-test.md` records the Windows

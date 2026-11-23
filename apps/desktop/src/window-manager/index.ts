@@ -3,7 +3,7 @@ import type { AnalysisReport } from "@chemdraft/analysis-core";
 import type { NativeTextStyle, TextSpan } from "@chemdraft/chem-core";
 import type { tableInspectorSnapshot } from "../tableCommands";
 import type { ToolsetDefinition } from "@chemdraft/toolset-registry";
-import type { ArtInspectorModel, ArtInspectorPaintTarget } from "../artInspectorModel";
+import type { ArtInspectorEffectKind, ArtInspectorModel, ArtInspectorPaintTarget } from "../artInspectorModel";
 import type { CommandSpec } from "../commands";
 import type { MoleculeInspectorModel } from "../moleculeInspectorModel";
 import type { ToolbarSelectionModel } from "../toolbars/toolbarSelectionKind";
@@ -490,7 +490,7 @@ export interface ToolsetFlyoutSnapshot {
  * no per-kind windows to keep in sync, and no way for a stale kind to coexist.
  */
 export type ToolsetPopoverContent = ToolsetPopoverOpening & (
-  | { kind: "artColor" | "textColor" }
+  | { kind: "artColor" | "textColor"; effectKind?: ArtInspectorEffectKind }
   | { kind: "flyout"; flyout: ToolsetFlyoutSnapshot }
 );
 
