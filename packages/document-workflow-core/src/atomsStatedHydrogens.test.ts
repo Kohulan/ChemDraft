@@ -96,8 +96,10 @@ describe("a stated hydrogen count on an atom with no aromatic bond", () => {
   it("badges a lone H stated with 0 as a typed H is badged, and judges no count on D", () => {
     const lone = (element: string, extra: Partial<MoleculeAtom> = {}) =>
       molecule([{ id: "h", element, x: 0, y: 0, formalCharge: 0, ...extra }], []);
-    expect(state(lone("H", { hydrogenCount: 0 }), "h")).toMatchObject({ valid: false, statedHydrogens: { stated: 0, derived: 1 } });
-    expect(state(lone("H", { labelLiteral: true }), "h").valid).toBe(false);
+    // A lone H derives no hydrogen (one atom, a radical: owner decision 2026-11-23), so a stated 0
+    // agrees with the count; it is judged as the typed literal H it means, which shows no radical.
+    expect(state(lone("H", { hydrogenCount: 0 }), "h")).toEqual(state(lone("H", { labelLiteral: true }), "h"));
+    expect(state(lone("H", { labelLiteral: true }), "h")).toMatchObject({ valid: false, invalidReason: "H has 0 of 1 bonds." });
     expect(state(lone("D", { hydrogenCount: 0 }), "h")).toEqual(state(lone("D", { labelLiteral: true }), "h"));
     expect(state(lone("D", { hydrogenCount: 0 }), "h").valid).toBe(true);
     // A count a hydrogen atom cannot carry is not counted (the derived count stands), but it is
@@ -105,9 +107,9 @@ describe("a stated hydrogen count on an atom with no aromatic bond", () => {
     const { expectedFormalCharge: _expected, ...plain } = state(lone("H"), "h");
     expect(plain.valid).toBe(true);
     expect(state(lone("H", { hydrogenCount: 2 }), "h")).toEqual({ ...plain, valid: false, hydrogenCountNotCounted: true,
-      statedHydrogens: { stated: 2, derived: 1 }, invalidReason: "H states 2 H, which a hydrogen atom cannot carry; only 0 counts.",
+      statedHydrogens: { stated: 2, derived: 0 }, invalidReason: "H states 2 H, which a hydrogen atom cannot carry; only 0 counts.",
       invalidDetail: "atom h (H) states 2 hydrogens, which a hydrogen atom cannot carry: only 0 counts, as a typed H, D or T label means. " +
-        "The stated count is kept as stored but not counted, and the atom is flagged. The label, formula and SMILES count 1." });
+        "The stated count is kept as stored but not counted, and the atom is flagged. The label, formula and SMILES count 0." });
   });
 
   // The unknown atom "*": nothing counts hydrogens on it (label, formula, molfile valence, RDKit), so

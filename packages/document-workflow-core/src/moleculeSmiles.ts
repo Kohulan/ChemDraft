@@ -2,7 +2,7 @@
 // native graph writer otherwise, with every approximation reported as an export warning.
 // Callers own engine loading; this shared writer also serves headless exports.
 
-import { atomStatedHydrogenCount, isDativeBond, moleculeToMolfileV2000, moleculeBracketWarningMessages, rGroupNumberFromLabel, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
+import { atomImpliedRadicalCount, atomStatedHydrogenCount, isDativeBond, moleculeToMolfileV2000, moleculeBracketWarningMessages, rGroupNumberFromLabel, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
 import type { ExportWarning } from "@chemdraft/export-engine";
 import {
   atomDrawnHydrogenCount,
@@ -31,7 +31,8 @@ export function nativeSmilesRadicalWarnings(molecule: MoleculeObject, evidence?:
   const aromaticAtomIds = new Set(expanded.bonds.flatMap((bond) =>
     bond.order === "aromatic" ? [bond.fromAtomId, bond.toAtomId] : []));
   return expanded.atoms.flatMap((atom): ExportWarning[] => {
-    const radicals = atom.markRadicals ?? 0;
+    // A lone hydrogen atom's implied radical (`atomImpliedRadicalCount`) is drawn, as a mark's is.
+    const radicals = (atom.markRadicals ?? 0) + atomImpliedRadicalCount(atom, resolution.bondsByAtom.get(atom.id) ?? []);
     const used = resolution.bondOrderUsage.get(atom.id) ?? 0;
     const directElement = nativeElementFromAtomLabel(atom.element);
     const spelled = directElement ? undefined : nativeSingleHeavyElementLabelValence(atom.element);
@@ -42,9 +43,10 @@ export function nativeSmilesRadicalWarnings(molecule: MoleculeObject, evidence?:
         nativeAtomChargeIsExpressible(element, atom.formalCharge)) {
       const valence = nativeAtomValenceForCharge(element, atom.formalCharge);
       const stated = aromaticAtomIds.has(atom.id) ? atom.hydrogenCount : atomStatedHydrogenCount(atom, expanded.bonds);
-      // An H, D or T atom counts like any element: a lone one carries the one hydrogen its label draws
-      // and the writer spells ([HH], [2HH]), a bonded or typed one none.
+      // An H, D or T atom has the hydrogens its label draws (`atomDrawnHydrogenCount`): none, as the
+      // writer spells it ([H], [2H]); a lone one is a radical, a bonded one (dative included) spent.
       const hydrogens = atom.labelLiteral ? (spelled?.hydrogens ?? 0) :
+        element === "H" ? atomDrawnHydrogenCount(atom, expanded.bonds, expanded.atoms, resolution) ?? 0 :
         stated ?? spelled?.hydrogens ?? Math.max(0, valence - used - radicals);
       implied = Math.max(0, valence - used - hydrogens);
     } else if (element && nativeAtomValence[element] === undefined) {
@@ -294,14 +296,15 @@ export function engineSmilesAtomWarnings(
     const element = isotopeHydrogen ? "H" : direct ?? spelled?.element;
     // Unspellable labels already have an explicit placeholder warning; still check their marks.
     const expectedElement = placeholderAtoms.has(atom.id) || !element ? "*" : element;
-    const radicals = atom.markRadicals ?? 0;
+    // A lone hydrogen atom's implied radical (`atomImpliedRadicalCount`) is drawn, as a mark's is.
+    const radicals = (atom.markRadicals ?? 0) + atomImpliedRadicalCount(atom, resolution.bondsByAtom.get(atom.id) ?? []);
     const isotope = atom.element === "D" ? 2 : atom.element === "T" ? 3 : atom.isotope ?? 0;
     const bondedHydrogens = (resolution.bondsByAtom.get(atom.id) ?? []).filter((bond) => {
       const neighbor = atomsById.get(bond.fromAtomId === atom.id ? bond.toAtomId : bond.fromAtomId);
       return neighbor && ["H", "D", "T"].includes(neighbor.element);
     }).length;
-    // An H, D or T atom has the hydrogens its label draws (`atomDrawnHydrogenCount`): one on a lone
-    // one, as RDKit reads it from the molfile ([HH], [2HH]); none when bonded or typed.
+    // An H, D or T atom has the hydrogens its label draws (`atomDrawnHydrogenCount`): none, stated or
+    // not, as RDKit reads it from the molfile ([H], [2H]: a lone one is a radical, a bonded one spent).
     const hydrogens = bondedHydrogens + (element === "H" ? (atom.labelLiteral ? 0 :
       atomDrawnHydrogenCount(atom, expanded.bonds, expanded.atoms, resolution) ?? 0) :
       atom.labelLiteral ? spelled?.hydrogens ?? 0 :

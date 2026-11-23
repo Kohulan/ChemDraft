@@ -6624,11 +6624,10 @@ function cdxmlBondDisplayForBondStyle(display: MoleculeBond["display"]): string 
  *
  * A carbon bonded only datively is no exception: its label draws no H, but its formula counts the
  * derived ones, so a count that differs is kept and shown as a typed "C" … "CH4" would be. A
- * hydrogen atom (H, D or T) keeps a stated 0, which is what a typed H, D or T label means (agreeing
- * or not, as before: the formula counts no H on a hydrogen atom while a lone H's label does).
- * Any other count on a hydrogen atom cannot be kept, since no typed label draws a hydrogen atom
- * carrying hydrogens of its own: it is not stored, and a second warning says so, unless it agrees
- * (a lone H stating 1). An atom whose label is not an element (an unknown atom, a generic label)
+ * hydrogen atom (H, D or T) keeps a stated 0, which is what a typed H, D or T label means (it agrees:
+ * a hydrogen atom derives no hydrogen, a lone one being one atom, a radical, owner decision
+ * 2026-11-23). Any other count on a hydrogen atom cannot be kept, since no typed label draws a
+ * hydrogen atom carrying hydrogens of its own: it is not stored, and a second warning says so. An atom whose label is not an element (an unknown atom, a generic label)
  * keeps what the file states, for the file's sake; on a label naming no element (the unknown atom
  * "*", a generic label such as A or R1) nothing counts it, so a count other than 0 is reported and
  * badged (`notCountedStatedHydrogens`).

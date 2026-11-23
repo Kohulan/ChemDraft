@@ -457,19 +457,49 @@ describe("molfile element symbols", () => {
     expect(warnings).toEqual([]);
   });
 
-  // The structure engine decides a lone hydrogen atom's hydrogens from this line (AGENTS.md §8): with
-  // no valence field RDKit reads a lone H as H2, D as HD and T as HT, which the label, the native
-  // formula and SMILES then count; a stated 0 or a typed label writes the zero-valence sentinel (15),
-  // which RDKit reads as the bare atom.
-  it.each(["H", "D", "T"])("writes a lone %s with no valence field, and stated 0 or typed with the zero-valence sentinel", (element) => {
-    const vvv = (atom: Partial<MoleculeAtom>) => {
-      const graph = molecule([{ id: "a", element, x: 0, y: 0 }], []);
+  // A lone hydrogen atom is one hydrogen atom, a radical (owner decision 2026-11-23): H•, D•, T•.
+  // The structure engine decides its hydrogens from this line (AGENTS.md §8), and with no valence
+  // field RDKit would read a lone H as H2, so a lone, neutral H, D or T with no stated count writes
+  // the zero-valence sentinel (15), as a stated 0 or a typed label does: RDKit reads the bare atom
+  // with one radical electron. A charged one (H+, H-), a bonded one (dative bonds included) and one
+  // already carrying a radical mark keep no valence field.
+  it.each(["H", "D", "T"])("writes a lone neutral %s with the zero-valence sentinel, and a charged, bonded or radical one without", (element) => {
+    const vvv = (atom: Partial<MoleculeAtom>, neighbor?: { style?: "dashed" }) => {
+      const graph = molecule([{ id: "a", element, x: 0, y: 0 }, ...(neighbor ? [{ id: "m", element: "Fe", x: 1, y: 0 }] : [])],
+        neighbor ? [{ id: "b", from: "a", to: "m", ...(neighbor.style ? { style: neighbor.style } : {}) }] : []);
       graph.atoms[0] = { ...graph.atoms[0]!, ...atom };
       return atomLines(moleculeToMolfileV2000(graph, { kekuleBondOrders: new Map() }).contents)[0].slice(48, 51);
     };
-    expect(vvv({})).toBe("  0");
+    expect(vvv({})).toBe(" 15");
     expect(vvv({ hydrogenCount: 0 })).toBe(" 15");
     expect(vvv({ labelLiteral: true })).toBe(" 15");
+    expect(vvv({ formalCharge: 1 })).toBe("  0");
+    expect(vvv({ formalCharge: -1 })).toBe("  0");
+    expect(vvv({ markRadicals: 1 })).toBe("  0");
+    expect(vvv({}, {})).toBe("  0");
+    expect(vvv({}, { style: "dashed" })).toBe("  0");
+  });
+
+  it("RDKit reads a lone neutral H, D or T as the bare atom with one radical electron, in either format", async () => {
+    installRealRdkitModuleLoader();
+    try {
+      const rdkit = await ensureRdkit();
+      for (const [element, smiles] of [["H", "[H]"], ["D", "[2H]"], ["T", "[3H]"]] as const) {
+        for (const write of [moleculeToMolfileV2000, moleculeToMolfileV3000]) {
+          const parsed = rdkit.get_mol(write(molecule([{ id: "a", element, x: 0, y: 0 }], []), { kekuleBondOrders: new Map() }).contents)!;
+          try {
+            const json = JSON.parse(parsed.get_json!()) as { defaults: { atom: Record<string, number> }; molecules: { atoms: Record<string, number>[] }[] };
+            const atom = { ...json.defaults.atom, ...json.molecules[0]!.atoms[0]! };
+            expect({ smiles: parsed.get_smiles?.(), implicitHydrogens: atom.impHs, radicals: atom.nRad }, `${element} ${write.name}`)
+              .toEqual({ smiles, implicitHydrogens: 0, radicals: 1 });
+          } finally {
+            parsed.delete();
+          }
+        }
+      }
+    } finally {
+      resetRdkitForTesting();
+    }
   });
 
   it("recognizes metal families without treating metalloids or other non-metals as metals", () => {
@@ -1117,8 +1147,11 @@ describe("a stated hydrogen count rides the literal label's explicit valence", (
     const methyl = write(graph((id) => id === "c" ? { hydrogenCount: 3 } : {}), { kekuleBondOrders: new Map(), spellLabel });
     const typedMethyl = write(graph((id) => id === "c" ? { element: "CH3", labelLiteral: true } : {}), { kekuleBondOrders: new Map(), spellLabel });
     expect(methyl.contents).toBe(typedMethyl.contents);
-    // A count a hydrogen atom cannot carry is not one this writer is given a valence for.
-    expect(valences(write, graph((id) => id === "h" ? { hydrogenCount: 1 } : {}))).toEqual(["0", "0", "0", "0"]);
+    // A count a hydrogen atom cannot carry is not counted: the lone H reads as an unstated one, one
+    // atom with one radical electron (owner decision 2026-11-23), and takes the zero-valence sentinel
+    // as the unstated lone D does, so RDKit adds neither a hydrogen.
+    expect(valences(write, graph((id) => id === "h" ? { hydrogenCount: 1 } : {})))
+      .toEqual(write === moleculeToMolfileV2000 ? ["0", "0", "15", "15"] : ["0", "0", "-1", "-1"]);
   });
 
   it.each(writers)("%s warns, never drops the count silently, when an unknown-order bond leaves no valence to carry it", (write) => {

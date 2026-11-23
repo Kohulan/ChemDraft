@@ -16628,9 +16628,9 @@ describe("dative donors and their hydrogens", () => {
 });
 
 describe("clipboard and chemistry review regressions", () => {
-  // A lone neutral D or T carries the one hydrogen RDKit gives it from the molfile (HD, HT), as its
-  // label "DH"/"TH" draws; a charged one has no room for it.
-  it.each([["D", 0, "[2HH]"], ["T", 0, "[3HH]"], ["D", 1, "[2H+]"], ["T", -1, "[3H-]"]] as const)(
+  // A lone neutral D or T is one atom, a radical (D•, T•; owner decision 2026-11-23): the bare
+  // isotope, as RDKit reads the molfile's zero-valence D/T; a charged one is the bare ion.
+  it.each([["D", 0, "[2H]"], ["T", 0, "[3H]"], ["D", 1, "[2H+]"], ["T", -1, "[3H-]"]] as const)(
     "spells isotope label %s with charge %s as %s", (element, formalCharge, expected) => {
       const molecule = createNativeSingleBondMolecule(createPhase4Document("Isotope"), { x: 200, y: 200 });
       molecule.atoms = [{ ...molecule.atoms[0], element, formalCharge }];

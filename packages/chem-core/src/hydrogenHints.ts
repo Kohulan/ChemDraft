@@ -41,6 +41,27 @@ export function atomStatedHydrogenCount(
 }
 
 /**
+ * Unpaired electrons an atom has that no radical mark draws: one on a lone hydrogen atom, else none.
+ * A lone hydrogen atom is ONE hydrogen atom, a radical (owner decision 2026-11-23): an H, D or T with
+ * no bonds at all, neutral, carrying no radical mark, not a typed literal and stating no count of
+ * its own (`atomStatedHydrogenCount`; a count nothing counts reads as none) is H•, D• or T•. The
+ * molfile writes it with the zero-valence sentinel, so RDKit reads exactly that bare atom with one
+ * radical electron (AGENTS.md §8); the label draws no hydrogen on it, layout-engine draws the
+ * radical with the dot a radical mark draws, and the SMILES checks count it as drawn. It is derived
+ * from the atom, never stored: bonding, charging or marking the atom removes it.
+ *
+ * A bonded hydrogen atom (a dative bond included, which V2000 writes as a plain single bond), a
+ * charged one (H+, H-) or one with a radical mark has none. A stated 0 or a typed literal H keeps
+ * its stated reading: the bare atom, with no drawn radical.
+ */
+export function atomImpliedRadicalCount(atom: MoleculeAtom, bonds: readonly MoleculeBond[]): number {
+  if (atom.element !== "H" && atom.element !== "D" && atom.element !== "T") return 0;
+  if (atom.labelLiteral === true || atom.formalCharge !== 0 || (atom.markRadicals ?? 0) !== 0) return 0;
+  if (atomStatedHydrogenCount(atom, bonds) !== undefined) return 0;
+  return bonds.some((bond) => bond.fromAtomId === atom.id || bond.toAtomId === atom.id) ? 0 : 1;
+}
+
+/**
  * What a stored hydrogen count is to everything that reads the atom; `atomStatedHydrogenCount` and
  * `atomIgnoresStatedHydrogenCount` are both read from here, so they cannot disagree:
  * - "none": no count is stored;

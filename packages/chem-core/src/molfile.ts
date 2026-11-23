@@ -49,7 +49,7 @@
 
 import { bridgeBondIndices, isDativeBond } from "./bondGraph";
 import { elementSymbols, isMetalSymbol } from "./elements";
-import { atomStatedHydrogenCount } from "./hydrogenHints";
+import { atomImpliedRadicalCount, atomStatedHydrogenCount } from "./hydrogenHints";
 import type { ChemDraftDocument, MoleculeAtom, MoleculeBond, MoleculeObject } from "./schemas";
 import { moleculeBracketWarningMessages } from "./brackets";
 import { isRepeatUnitBoundaryBond } from "./repeatUnitMembership";
@@ -452,6 +452,11 @@ function molfileAtomSymbols(
               : "written without a valence field, so a reader may add hydrogens.")
           );
         }
+      } else if (atomImpliedRadicalCount(atom, bonds) > 0) {
+        // A lone hydrogen atom is one atom, a radical (owner decision 2026-11-23): the zero-valence
+        // sentinel, as a stated 0 takes, so a reader adds no hydrogen and gives it one radical
+        // electron. With no valence field RDKit would read a lone H as H2.
+        spelledHydrogens.set(atom.id, 0);
       }
       return atom.element;
     }

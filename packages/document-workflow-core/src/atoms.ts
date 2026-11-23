@@ -597,8 +597,12 @@ function nativeAtomDiagnostic(
   // remainder, so its drawn bonds (plus radicals) must land on a complete valence state by
   // themselves — a lone typed "N" is a flagged hypovalent atom until three bonds arrive.
   // This is the ONLY path that can produce a hypovalent atom: drawn atoms and hotkey
-  // relabels keep the skeletal implicit-hydrogen convention and never trip it.
-  if (atom.labelLiteral === true && !nativeLiteralAtomValenceComplete(element, valenceUsed, effectiveFormalCharge)) {
+  // relabels keep the skeletal implicit-hydrogen convention and never trip it. An H atom stating
+  // 0 is the typed literal "H" (chem-core's `atomStatedHydrogenCount`) and is judged as one: a
+  // lone one shows no radical, so it is flagged, where an unstated lone H is one atom whose
+  // radical is drawn (`atomImpliedRadicalCount`, owner decision 2026-11-23) and is not.
+  const judgedAsLiteral = atom.labelLiteral === true || (element === "H" && atomStatedHydrogenCount(atom, bonds) === 0);
+  if (judgedAsLiteral && !nativeLiteralAtomValenceComplete(element, valenceUsed, effectiveFormalCharge)) {
     return {
       atomId: atom.id,
       element,
@@ -1085,9 +1089,9 @@ export function nativeSingleBondGraphMetadata(
   const placeholders = nativeElementLabelPlaceholders(atoms, bonds);
 
   // An H, D or T atom that is not a typed literal counts the hydrogens its label draws: a stated 0,
-  // else the derived count (layout-engine's `atomDerivedHydrogenCount`, the one the label draws). A
-  // lone one carries one, as RDKit reads the molfile's lone H as H2, D as HD and T as HT; a bonded
-  // one carries none.
+  // else the derived count (layout-engine's `atomDerivedHydrogenCount`, the one the label draws),
+  // which is none: a lone one is one atom, a radical (owner decision 2026-11-23), and RDKit reads
+  // the molfile's zero-valence lone H as [H]; a bonded one is spent.
   const addHydrogenAtomHydrogens = (sourceAtom: MoleculeAtom, atom: MoleculeAtom) => {
     if (atom.labelLiteral === true) return;
     const hydrogens = atomStatedHydrogenCount(sourceAtom, countedBonds) ??

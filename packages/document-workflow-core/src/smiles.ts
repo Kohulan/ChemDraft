@@ -518,7 +518,8 @@ function nativeAtomSmiles(atom: MoleculeAtom | undefined, implicitHydrogens = 0,
   }
 
   if (element === "H") {
-    // A lone H carries the hydrogen RDKit gives it: [HH], as the label draws "H2".
+    // A hydrogen atom spells the hydrogens its label draws: none, so a lone H is [H] (a radical,
+    // as RDKit reads the molfile's zero-valence lone H) and a bonded one [H].
     const hydrogens = implicitHydrogens > 0 ? `H${implicitHydrogens === 1 ? "" : implicitHydrogens}` : "";
     return `[H${hydrogens}]`;
   }
@@ -564,8 +565,8 @@ function nativeAtomSmilesById(
       return [atom.id, `[*${smilesChargeSuffix(atom.formalCharge)}]`] as const;
     }
     // The element the count is derived from: H for a D or T atom (`hydrogenCountElement`). An H, D
-    // or T atom spells the hydrogen a lone one carries ([HH], [2HH]), as RDKit reads it from the
-    // molfile and the label draws it; a bonded one has none.
+    // or T atom spells the hydrogens its label draws, which is none (a lone one is a radical, [H],
+    // [2H], as RDKit reads it from the molfile; a bonded one is spent).
     const element = hydrogenCountElement(atom);
     const needsSpelledHydrogens = element !== undefined &&
       atom.labelLiteral !== true &&
@@ -575,14 +576,18 @@ function nativeAtomSmilesById(
     // this spelling: it applies only to a neutral nitrogen, which is organic-subset and written
     // bare, and the dative bond itself is written as a single bond, so a parser already gives
     // that nitrogen no hydrogen.
-    const implicitHydrogens = needsSpelledHydrogens
-      ? nativeImplicitHydrogenCount(
+    // A hydrogen atom spells the hydrogens its label draws (layout-engine's `atomImplicitHydrogenCount`),
+    // which is none: its valence is not left for hydrogens, a lone one being a radical.
+    const implicitHydrogens = !needsSpelledHydrogens
+      ? 0
+      : element === "H"
+        ? atomImplicitHydrogenCount(atom, sourceBonds, atoms, sourceResolution ??= nativeBondOrderResolution(atoms, sourceBonds)) ?? 0
+        : nativeImplicitHydrogenCount(
           element,
           valenceUsage.get(atom.id) ?? 0,
           atom.formalCharge,
           atom.markRadicals ?? 0
-        )
-      : 0;
+        );
     return [atom.id, nativeAtomSmiles(atom, implicitHydrogens, writtenStatedCount(atom))] as const;
   }));
 }

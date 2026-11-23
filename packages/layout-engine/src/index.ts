@@ -32,6 +32,7 @@ import {
   DocumentStylePreset,
   Acs1996StylePreset,
   RscJournalStylePreset,
+  atomImpliedRadicalCount,
   atomStatedHydrogenCount,
   drawnLabelBondSide,
   isDativeBond,
@@ -2193,6 +2194,7 @@ function planNativeMoleculeGraphSvg(
       moleculeStrokeOpacity
     ),
     ...labelFragments,
+    ...impliedRadicalFragments(object),
     ...indicatorFragments,
     ...svgSketchEffectFragmentsForEffects(effects, object.id, {
       className: "native-molecule-sketch",
@@ -4772,6 +4774,18 @@ function electronMarkStrokeWidth(object: ElectronMarkObject): number {
 }
 
 function electronDotMarkFragment(object: ElectronMarkObject, layerIndex: number, scaled: boolean): PageSvgElementFragment {
+  return elementFragment("g", `object-${object.id}`, objectAttributes(object, layerIndex, {
+    "data-mark-kind": object.markKind,
+    transform: rotationTransform(object)
+  }), electronDotFragments(object, scaled));
+}
+
+/**
+ * The dots of a lone-pair or radical-dot mark, centered in its frame: the one glyph both a stored mark
+ * (`electronDotMarkFragment`) and a lone hydrogen atom's implied radical (`impliedRadicalFragments`)
+ * draw.
+ */
+function electronDotFragments(object: ElectronMarkObject, scaled: boolean): PageSvgElementFragment[] {
   const centerX = object.x + object.width / 2;
   const centerY = object.y + object.height / 2;
   const sizeScale = Math.min(object.width, object.height) / 18;
@@ -4780,18 +4794,47 @@ function electronDotMarkFragment(object: ElectronMarkObject, layerIndex: number,
   const dots = object.markKind === "lone-pair"
     ? [centerX - spacing, centerX + spacing]
     : [centerX];
-
-  return elementFragment("g", `object-${object.id}`, objectAttributes(object, layerIndex, {
-    "data-mark-kind": object.markKind,
-    transform: rotationTransform(object)
-  }), dots.map((dotX, index) =>
+  return dots.map((dotX, index) =>
     elementFragment("circle", `electron-dot-${object.id}-${index}`, {
       cx: dotX,
       cy: centerY,
       r: dotRadius,
       fill: "#111111"
     })
-  ));
+  );
+}
+
+/**
+ * The radical a lone hydrogen atom implies (chem-core's `atomImpliedRadicalCount`: a lone, neutral H,
+ * D or T is one atom with one unpaired electron, owner decision 2026-11-23), drawn with the default
+ * radical-dot mark's own glyph (`electronDotFragments`). It is derived from the atom and never
+ * stored, so it is drawn inside the molecule's own object, in the molecule's frame: it moves,
+ * rotates and is selected with the molecule, and bonding, charging or marking the atom removes it.
+ * The spot is the radical tool's (`electronMarkPlacementPointForAtom`), started at the atom and
+ * cleared from its label, so the dot sits just beyond the label's upper right.
+ */
+function impliedRadicalFragments(object: MoleculeObject): PageSvgElementFragment[] {
+  const bonded = new Set(object.bonds.flatMap((bond) => [bond.fromAtomId, bond.toAtomId]));
+  return object.atoms.flatMap((atom) => {
+    if (bonded.has(atom.id) || atomImpliedRadicalCount(atom, []) === 0) return [];
+    const unbounded = Number.POSITIVE_INFINITY;
+    const beside = electronMarkPlacementPointForAtom(object, atom.id, [], unbounded, unbounded, { growthPoint: { x: atom.x, y: atom.y } });
+    // A label that draws nothing leaves the atom's own point: take the tool's open-angle spot instead.
+    const center = beside && distance(beside, atom) > 1
+      ? beside
+      : electronMarkPlacementPointForAtom(object, atom.id, [], unbounded, unbounded);
+    if (!center) return [];
+    const mark: ElectronMarkObject = {
+      id: `${object.id}-implied-radical-${atom.id}`, type: "electron-mark", markKind: "radical-dot",
+      x: center.x - 9, y: center.y - 9, width: 18, height: 18, rotation: 0, style: {},
+      anchor: { kind: "atom", objectId: object.id, atomId: atom.id }
+    };
+    return [elementFragment("g", `implied-radical-${object.id}-${atom.id}`, {
+      class: "native-implied-radical",
+      "data-mark-kind": "radical-dot",
+      "data-implied-radical-atom-id": atom.id
+    }, electronDotFragments(mark, false))];
+  });
 }
 
 function graphicObjectFragment(
@@ -7485,9 +7528,9 @@ export function atomDisplayLabelPlacement(
   // (chem-core's `atomStatedHydrogenCount`, a kept CDXML NumHydrogens) is drawn in place of the
   // derived one, as the formula, SMILES and the engine's molfile count it (owner ruling 1.2.3), so
   // an O stated with 0 H reads "O", a lone H stated with 0 reads "H", and a carbon bonded only
-  // datively stated with 3 reads "CH3", exactly like the typed labels. A lone H, D or T with no
-  // stated count carries the one hydrogen the structure engine gives it (RDKit reads the molfile's
-  // lone H as H2, D as HD, T as HT), so it reads "H2", "DH" and "TH".
+  // datively stated with 3 reads "CH3", exactly like the typed labels. A hydrogen atom carries no
+  // hydrogen of its own (`atomDerivedHydrogenCount`): a lone H, D or T is one atom, a radical (owner
+  // decision 2026-11-23), and reads "H", "D" or "T"; its radical is drawn as a radical dot.
   const incidentBonds = resolution.bondsByAtom.get(atom.id) ?? [];
   const drawnHydrogens = atomDrawnHydrogenCount(atom, bonds, atoms, resolution);
   const implicitHydrogens = drawingStyle.atomLabelHideImplicitHydrogens || atom.labelLiteral === true
@@ -7524,16 +7567,10 @@ export function atomDisplayLabelPlacement(
     hydrogenCountElement(atom) !== "H" &&
     singleHeavyNeighbor !== undefined &&
     drawnLabelBondSide(atom, [singleHeavyNeighbor]) === "right";
-  // An H atom with hydrogens of its own is one element: "H2", never "HH".
-  const ownHydrogens = element === "H" && atom.isotope === undefined && implicitHydrogens !== ""
-    ? `H${(drawnHydrogens ?? 0) + 1}`
-    : undefined;
   return {
     label: hydrogenBeforeElement
       ? `${implicitHydrogens}${symbol}${chargeLabelSuffix(labelCharge)}`
-      : ownHydrogens !== undefined
-        ? `${ownHydrogens}${chargeLabelSuffix(labelCharge)}`
-        : `${atom.isotope ?? ""}${symbol}${implicitHydrogens}${chargeLabelSuffix(labelCharge)}`
+      : `${atom.isotope ?? ""}${symbol}${implicitHydrogens}${chargeLabelSuffix(labelCharge)}`
   };
 }
 
@@ -7590,6 +7627,12 @@ export function atomImplicitHydrogenCount(
  * reads count these (a dative bond costs its donor nothing), so this is the count that carbon has.
  * Undefined only for a label that is not an element symbol (D and T count as hydrogen,
  * `hydrogenCountElement`).
+ *
+ * A hydrogen atom (H, D or T) carries no hydrogens of its own, whatever its bonds: bonded, its one
+ * valence is spent (a dative bond too: V2000 writes it as a plain single bond, so RDKit reads the
+ * hydrogen as spent); charged (H+, H-) it has none; lone and neutral it is one hydrogen atom, a
+ * radical (owner decision 2026-11-23, chem-core's `atomImpliedRadicalCount`), which the molfile
+ * writes with the zero-valence sentinel so RDKit reads [H] with no hydrogen and one radical electron.
  */
 export function atomDerivedHydrogenCount(
   atom: MoleculeAtom,
@@ -7599,6 +7642,7 @@ export function atomDerivedHydrogenCount(
 ): number | undefined {
   const element = hydrogenCountElement(atom);
   if (!element) return undefined;
+  if (element === "H") return 0;
   return Math.max(
     0,
     nativeAtomValenceForCharge(element, atom.formalCharge) - (resolution.bondOrderUsage.get(atom.id) ?? 0)
@@ -7614,8 +7658,8 @@ function heavyHydrogenSymbol(label: string): "D" | "T" | undefined {
 /**
  * The element whose valence an atom's hydrogen count is derived from: its element symbol, or H for a
  * D or T atom. The molfile writes D and T as their CTfile symbols, and RDKit reads each as an
- * isotope of hydrogen with hydrogen's valence: with no valence field a lone D is HD ([2HH]), exactly
- * as a lone H is H2 ([HH]). Undefined for a label that is not an element symbol.
+ * isotope of hydrogen with hydrogen's valence, so a D or T counts exactly as an H does (no hydrogens
+ * of its own; a lone one is a radical). Undefined for a label that is not an element symbol.
  */
 export function hydrogenCountElement(atom: Pick<MoleculeAtom, "element">): NativeElementSymbol | undefined {
   return nativeElementFromAtomLabel(atom.element) ?? (heavyHydrogenSymbol(atom.element) ? "H" : undefined);

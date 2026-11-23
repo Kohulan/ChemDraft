@@ -270,8 +270,8 @@ describe("atoms whose label draws no count of its own: a dative-only carbon, H, 
   });
 
   it("a hydrogen atom keeps a stated 0, agreeing or not, drawn as a typed H, and is flagged where it disagrees", () => {
-    // A stated 0 is what a typed H label means. An agreeing one is kept as before: the formula counts
-    // no H on a hydrogen atom while a lone H's label does, so there was no single count to drop it against.
+    // A stated 0 is what a typed H label means, so it is kept, agreeing or not. A lone H derives no
+    // hydrogen (one atom, a radical: owner decision 2026-11-23), so here both agree.
     const hydrogens = `<CDXML><page id="1"><fragment id="2">
       <n id="10" p="0 0" Element="1" NumHydrogens="0"/><n id="11" p="14 0"/>
       <b id="20" B="10" E="11"/>
@@ -280,17 +280,17 @@ describe("atoms whose label draws no count of its own: a dative-only carbon, H, 
     const { result, molecule } = open(hydrogens);
     expect(molecule.atoms.map((atom) => atom.element)).toEqual(["H", "C", "H"]);
     expect(hydrogenCounts(molecule)).toEqual([0, undefined, 0]);
-    // The lone H's label counts one more H than the file states; the bonded H agrees.
-    expect(hydrogenWarnings(result).map((warning) => warning.message)).toEqual([
-      "CDXML import: atom 12 (H) states 0 hydrogens; ChemDraft derives 1. The stated count is kept, and the atom is flagged."
-    ]);
+    // Both agree with the count, so nothing warns of a mismatch; the lone H stated with 0 is still
+    // flagged, as the typed literal H it means is: it shows no radical.
+    expect(hydrogenWarnings(result)).toEqual([]);
     expect(badges(molecule).map(([id]) => id)).toEqual([molecule.atoms[2]!.id]);
     expect(labels(molecule)).toEqual(["H", undefined, "H"]);
   });
 
   it("does not keep a count a hydrogen atom cannot carry, and says so", () => {
-    // An H bonded to C stating 1, a lone H stating 2 and a lone D stating 1: no typed H, D or T label
-    // carries hydrogens of its own. A lone H stating 1 (H2) agrees with what it already counts.
+    // An H bonded to C stating 1, a lone H stating 2, a lone D stating 1 and a lone H stating 1: no
+    // typed H, D or T label carries hydrogens of its own. A lone H is one atom, a radical (owner
+    // decision 2026-11-23), so a lone H stating 1 (H2) no longer agrees with what it counts.
     const { result, molecule } = open(`<CDXML><page id="1"><fragment id="2">
       <n id="10" p="0 0" Element="1" NumHydrogens="1"/><n id="11" p="14 0"/><b id="20" B="10" E="11"/>
       <n id="12" p="40 0" Element="1" NumHydrogens="2"/>
@@ -302,11 +302,11 @@ describe("atoms whose label draws no count of its own: a dative-only carbon, H, 
     expect(hydrogenWarnings(result)).toEqual([]);
     expect(result.warnings.filter((warning) => warning.code === "cdxml.atom_hydrogen_count_not_kept")).toEqual([{
       code: "cdxml.atom_hydrogen_count_not_kept",
-      message: "CDXML import: 3 hydrogen atoms state hydrogen counts a hydrogen atom cannot carry: " +
-        "atom 10 (H) states 1; atom 12 (H) states 2; atom 13 (D) states 1. " +
+      message: "CDXML import: 4 hydrogen atoms state hydrogen counts a hydrogen atom cannot carry: " +
+        "atom 10 (H) states 1; atom 12 (H) states 2; atom 13 (D) states 1; atom 14 (H) states 1. " +
         "Only 0 can be kept, as a typed H, D or T label means. The stated counts were not kept.",
       sourceObjectId: molecule.id,
-      atomIds: [molecule.atoms[0]!.id, molecule.atoms[2]!.id, molecule.atoms[3]!.id]
+      atomIds: [molecule.atoms[0]!.id, molecule.atoms[2]!.id, molecule.atoms[3]!.id, molecule.atoms[4]!.id]
     }]);
     const plain = exportDocumentToCdxml(result.document!, { embedNativePayload: false }).contents;
     expect(plain).not.toContain("NumHydrogens");
