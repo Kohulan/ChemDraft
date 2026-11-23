@@ -18,7 +18,7 @@ import {
 import { cloneDocument, toIsoTimestamp } from "./document";
 import { engineDocuments } from "./engineDocuments";
 import { pageMarginFromLayout } from "./page-layout";
-import { clearChangedAtomHydrogenHints, dropOrphanedHydrogenHints } from "./hydrogenHints";
+import { clearChangedAtomHydrogenHints, dropOrphanedHydrogenHints, hydrogenAtomWithIgnoredCount } from "./hydrogenHints";
 import { nativeDrawingStyleFromObjectStyle, nativeTextStyleFromObjectStyle,
   type NativeDrawingStyle, type NativeTextStyle } from "./styles";
 import { bracketPairUsage } from "./bracketSemantics";
@@ -590,6 +590,7 @@ function addObject(document: ChemDraftDocument, pageId: string, object: Document
   //   each part that way too, or a cut atom keeps a count stated for its old bonds.
   if (parsed.type === "molecule") {
     parsed.atoms = dropOrphanedHydrogenHints(parsed.atoms, parsed.bonds);
+    assertNoIgnoredHydrogenCount("add", parsed);
   }
   page.objects.push(parsed);
   recordAppendedObject(document, pageIndex, parsed.id);
@@ -848,10 +849,27 @@ function updateObject(
   retainBracketIdentity(location.object, updated);
   if (location.object.type === "molecule" && updated.type === "molecule") {
     updated.atoms = clearChangedAtomHydrogenHints(location.object, updated.atoms, updated.bonds);
+    assertNoIgnoredHydrogenCount("update", updated, location.object);
   }
   location.page.objects[location.objectIndex] = updated;
   pruneObjectNativeExtensions(document, location.page.id, new Set([objectId]), true);
   pruneCrossingsAfterObjectUpdate(location.page, location.object, updated);
+}
+
+/**
+ * Refuse a molecule write that would store a hydrogen count on an H, D or T atom other than 0: no
+ * label, formula or export reads it (`atomStatedHydrogenCount`), so storing it would be a silent
+ * loss of what the writer said (AGENTS.md §7). The CDXML importer warns and drops such a count; a
+ * patch's writer is told instead. A count an earlier document already held unchanged is let be.
+ */
+function assertNoIgnoredHydrogenCount(action: "add" | "update", molecule: MoleculeObject, previous?: MoleculeObject): void {
+  const atom = hydrogenAtomWithIgnoredCount(molecule.atoms, previous?.atoms);
+  if (!atom) return;
+  throw new DocumentPatchError(
+    `Cannot ${action} object: atom "${atom.id}" of molecule "${molecule.id}" is ${atom.element} with hydrogenCount ` +
+    `${atom.hydrogenCount}, which a hydrogen atom cannot carry. Only 0 is allowed on an H, D or T atom, as a typed ` +
+    "H, D or T label means; omit hydrogenCount or set it to 0."
+  );
 }
 
 function removeAnnotation(document: ChemDraftDocument, annotationId: string): void {
