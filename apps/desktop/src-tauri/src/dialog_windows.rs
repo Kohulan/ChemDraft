@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Condvar, LazyLock, Mutex},
     time::{Duration, Instant},
 };
@@ -214,6 +214,9 @@ struct GuidedTourSnapshot {
     /// Plugin commands the menus offered when the tour opened. Absent in older payloads.
     #[serde(default)]
     plugins: Vec<GuidedTourPluginCommand>,
+    /// An optional map of schemes to single-character keys, or null for cleared bindings.
+    #[serde(default, rename = "bondKeys")]
+    _bond_keys: BTreeMap<super::KeybindingScheme, Option<char>>,
 }
 
 impl GuidedTourSnapshot {
@@ -5789,6 +5792,42 @@ mod tests {
             message.data = tour(Some(plugins.clone()));
             assert!(message.validate().is_err(), "{plugins}");
         }
+    }
+
+    #[test]
+    fn guided_tour_snapshot_accepts_only_known_schemes_and_single_character_keys() {
+        let mut message = snapshot();
+        message.dialog_kind = "guidedTour".into();
+        message.data = json!({"title":"Take the Tour", "scheme":"chemdraft", "automatic":false});
+        assert_eq!(message.validate(), Ok(()));
+        for bond_keys in [
+            json!({"chemdraft":"1", "chemdraw":null}),
+            json!({"chemdraft":null, "chemdraw":"😀"}),
+            json!({"chemdraw":"j"}),
+            json!({}),
+        ] {
+            message.data["bondKeys"] = bond_keys;
+            assert_eq!(message.validate(), Ok(()), "{}", message.data);
+        }
+        for bond_keys in [
+            json!({"unknown":"1"}),
+            json!({"ChemDraft":"1"}),
+            json!({"chemdraft":"12"}),
+            json!({"chemdraft":""}),
+            json!({"chemdraw":1}),
+            json!([]),
+            json!(null),
+        ] {
+            message.data["bondKeys"] = bond_keys;
+            assert!(message.validate().is_err(), "{}", message.data);
+        }
+    }
+
+    #[test]
+    fn guided_tour_snapshot_from_typescript_validates() {
+        let message: Message =
+            serde_json::from_str(include_str!("../tests/fixtures/guided-tour-open.json")).unwrap();
+        assert_eq!(message.validate(), Ok(()));
     }
 
     #[test]

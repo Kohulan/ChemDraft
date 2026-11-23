@@ -549,7 +549,7 @@ describe("documents in one window", () => {
       expect(native.preferences.shortcutScheme).toBe("chemdraw");
       expect(loadKeybindingSettings().scheme).toBe("chemdraw");
       expect(native.dialogPublish).toHaveBeenCalledWith("opaque", expect.objectContaining({
-        type: "snapshot", data: { title: "Take the Tour", scheme: "chemdraw", automatic: false, plugins: [] }
+        type: "snapshot", data: { title: "Take the Tour", scheme: "chemdraw", automatic: false, plugins: [], bondKeys: { chemdraft: "1", chemdraw: "1" } }
       }));
       await pageSizeMessage("action", { action: "tryTourCommand", command: "view.openKeyboardPreferences" });
       expect(tauriInvoke).toHaveBeenCalledWith("toggle_preferences_window", { keyboard: true });
