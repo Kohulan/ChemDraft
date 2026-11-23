@@ -9,8 +9,12 @@ import {
 import { installSecondaryWindowEditHistory } from "./editHistoryRouting";
 import { installBrowserReloadGuard } from "./browserReloadGuard";
 import { acknowledgeFirstPaintOnce } from "./paletteFirstPaint";
+import { runShortcutDefaultMigration } from "./shortcutDefaultMigration";
 
-const MainWindow = lazy(() => import("./MainWindow").then(m => ({ default: m.MainWindow })));
+// The document window mounts only after the one-time shortcut-default migration has written the
+// scheme, so neither it nor any window it opens reads the new default on an existing install.
+const MainWindow = lazy(() => Promise.all([import("./MainWindow"), runShortcutDefaultMigration()])
+  .then(([m]) => ({ default: m.MainWindow })));
 const PaletteWindow = lazy(() => import("./PaletteWindow").then(m => ({ default: m.PaletteWindow })));
 const PalettePopoverWindow = lazy(() => import("./PalettePopoverWindow").then(m => ({ default: m.PalettePopoverWindow })));
 const PaletteTooltipWindow = lazy(() => import("./PaletteTooltipWindow").then(m => ({ default: m.PaletteTooltipWindow })));

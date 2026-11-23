@@ -3,10 +3,14 @@ import type { ShortcutOverrides } from "@chemdraft/shortcut-engine";
 /**
  * User setting for which keyboard-shortcut scheme the app uses.
  *
- *   chemdraft — the native ChemDraft bindings (default).
- *   chemdraw  — bindings that mirror ChemDraw's defaults, for users migrating
- *               from ChemDraw. Covers tool hotkeys, hovered atom/bond hotkeys,
- *               and the menu chords that differ between the two apps.
+ *   chemdraft — the native ChemDraft bindings (the default before 1.2.3).
+ *   chemdraw  — the industry-standard bindings (default for new installs).
+ *               Covers tool hotkeys, hovered atom/bond hotkeys, and the menu
+ *               chords that differ between the two schemes.
+ *
+ * Existing installs keep the old default: shortcutDefaultMigration.ts writes
+ * LEGACY_DEFAULT_KEYBINDING_SCHEME explicitly on their first launch of 1.2.3,
+ * before any window reads DEFAULT_KEYBINDING_SETTINGS.
  */
 
 export type KeybindingScheme = "chemdraft" | "chemdraw";
@@ -22,8 +26,11 @@ export interface KeybindingSettings {
 }
 
 export const DEFAULT_KEYBINDING_SETTINGS: KeybindingSettings = {
-  scheme: "chemdraft"
+  scheme: "chemdraw"
 };
+
+/** The default every install before 1.2.3 ran under when it never chose a scheme. */
+export const LEGACY_DEFAULT_KEYBINDING_SCHEME: KeybindingScheme = "chemdraft";
 
 export const KEYBINDING_STORAGE_KEY = "chemdraft.keybindings.v1";
 

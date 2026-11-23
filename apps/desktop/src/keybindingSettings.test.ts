@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_KEYBINDING_SETTINGS,
+  LEGACY_DEFAULT_KEYBINDING_SCHEME,
   isKeybindingScheme,
   isKeybindingSettings,
   loadKeybindingSettings,
@@ -24,8 +25,11 @@ afterEach(() => {
 });
 
 describe("keybindingSettings", () => {
-  it("defaults to the native ChemDraft scheme", () => {
-    expect(DEFAULT_KEYBINDING_SETTINGS).toEqual({ scheme: "chemdraft" });
+  // New installs get the industry-standard scheme; existing installs are pinned to the old default
+  // by shortcutDefaultMigration.ts before anything reads this fallback.
+  it("defaults new installs to the industry-standard scheme and keeps the old default named", () => {
+    expect(DEFAULT_KEYBINDING_SETTINGS).toEqual({ scheme: "chemdraw" });
+    expect(LEGACY_DEFAULT_KEYBINDING_SCHEME).toBe("chemdraft");
     expect(loadKeybindingSettings()).toEqual(DEFAULT_KEYBINDING_SETTINGS);
   });
 
