@@ -190,7 +190,8 @@ describe.each([["macos", "MacIntel"], ["windows", "Win32"]] as const)("the nativ
     await settle();
     expect(tour.querySelector("[role=alert]")).toBeNull();
     const request = host.sent.find(message => message.type === "action" && message.data.action === "tryTourCommand")!;
-    const results = host.published.filter(message => message.type === "result" && message.requestId === request.requestId);
+    const results = host.published.filter((message): message is Extract<DialogMessage, { type: "result" }> =>
+      message.type === "result" && message.requestId === request.requestId);
     // Rust keeps the action's reservation through `accepted` and releases it on the closing receipt
     // (`releases_action_reservation`: cancelled, error, ...). Both cross IPC as JSON, so each passes the real parser.
     expect(results.map(message => message.data.status)).toEqual(["accepted", "cancelled"]);

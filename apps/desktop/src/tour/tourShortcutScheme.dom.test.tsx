@@ -48,7 +48,7 @@ import { DialogWindow } from "../dialogs/DialogWindow";
 import { DialogCoordinator } from "../dialogs/DialogCoordinator";
 import { PreferencesWindow } from "../PreferencesWindow";
 import { useShortcutPreference } from "../useShortcutPreference";
-import { loadKeybindingSettings } from "../keybindingSettings";
+import { loadKeybindingSettings, saveKeybindingSettings } from "../keybindingSettings";
 import { buildAppMenuModel, flattenAppMenuCommands } from "../appMenu";
 import { createMainWindowShortcutCommands } from "../keyboardShortcuts";
 import { createQuickActions } from "../commands";
@@ -137,6 +137,10 @@ afterEach(() => {
 });
 
 it.each(["macos", "windows"] as const)("applies Classic from tour step 2 through the Preferences setting on %s", async platform => {
+  // Start from ChemDraft's scheme, as an existing install has it after shortcutDefaultMigration.ts,
+  // so choosing Classic is a real switch.
+  host.native = { shortcutScheme: "chemdraft" };
+  saveKeybindingSettings({ scheme: "chemdraft" });
   const preferences = await mount(createElement(PreferencesWindow));
   const tour = await mount(createElement(DialogWindow, { hostId: "tour" }));
   await mount(createElement(DocumentWindow));
