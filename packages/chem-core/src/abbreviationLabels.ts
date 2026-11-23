@@ -1,13 +1,12 @@
 // Whether a stored atom label is a table abbreviation, read straight from the one abbreviation table.
 //
-// The table is template-library's (AGENTS.md §6: it owns the abbreviations), and its lookup module
-// imports nothing, so chem-core reads it by source path rather than through the package name:
-// declaring `@chemdraft/template-library` as a chem-core dependency would need a lockfile change,
-// and every bundle that carries chem-core (the app, the CLI, the published plugin-host SDK, whose
-// esbuild build aliases chem-core to its source) follows a relative import on its own. Nothing is
-// installed at load time and nothing depends on which other package a process happened to load, so
-// a standalone plugin-host reads OMe exactly as the app does.
-import { abbreviationForLabel } from "../../template-library/src/abbreviations";
+// The table is template-library's (AGENTS.md §6: it owns the abbreviations). chem-core declares
+// `@chemdraft/template-library` as a dependency and imports ONLY the `./abbreviations` subpath, never
+// the package root (the root re-exports structure templates, which could import chem-core and make a
+// cycle); that module imports nothing. Every bundle that carries chem-core (the app, the CLI, the
+// published plugin-host SDK) aliases the subpath to source, so a standalone plugin-host reads OMe
+// exactly as the app does and the SDK inlines the table.
+import { abbreviationForLabel } from "@chemdraft/template-library/abbreviations";
 import { atomicNumberForElementSymbol } from "./elements";
 
 /**
