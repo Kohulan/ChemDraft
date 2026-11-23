@@ -9838,9 +9838,11 @@ export function commitNativeAtomLabelTarget(
  * Both breakages are read from the bond-order resolution the validator badges from
  * (`nativeBondOrderResolution`): an atom unresolved after the edit that was not before, or another
  * atom whose H count is guessed after the edit and was not before. Only problems the edit introduces
- * count, so a ring already broken before it does not block an unrelated retype. The message names
- * the label that keeps the ring valid when the drawn label is the typed element with its hydrogens
- * ("NH") and committing that is clean. Master decision 2026-11-22, narrowed the same day.
+ * count, so a ring already broken before it does not block an unrelated retype. The message says
+ * which of the two the edit would do ("no valid structure", or the hydrogen moved to another atom),
+ * and names the label that keeps the ring valid when the drawn label is the typed element with its
+ * hydrogens ("NH") and committing that is clean. The text-box conversion shows the same message
+ * after "Text kept: ". Master decision 2026-11-22, narrowed the same day.
  */
 function typedLabelRingRefusal(
   normalized: string,
@@ -9857,15 +9859,19 @@ function typedLabelRingRefusal(
     ?.atoms.find(atom => atom.id === target.atomId);
   if (relabeledAtom?.hydrogenCount !== undefined) return undefined;
   const before = nativeBondOrderResolution(beforeMolecule.atoms, beforeMolecule.bonds);
-  const breaks = (next: ChemDraftDocument) => {
+  // What the edit breaks: the ring's Kekulé pattern ("unresolved"), else its hydrogen moved onto
+  // another atom ("hydrogen"), else nothing.
+  const breaks = (next: ChemDraftDocument): "unresolved" | "hydrogen" | undefined => {
     const molecule = firstPage(next).objects.find((object): object is MoleculeObject =>
       object.id === target.objectId && object.type === "molecule");
-    if (!molecule) return false;
+    if (!molecule) return undefined;
     const after = nativeBondOrderResolution(molecule.atoms, molecule.bonds);
-    return [...after.unresolvedAtomIds].some(id => !before.unresolvedAtomIds.has(id)) ||
-      [...after.inferredHydrogenAtomIds].some(id => id !== target.atomId && !before.inferredHydrogenAtomIds.has(id));
+    if ([...after.unresolvedAtomIds].some(id => !before.unresolvedAtomIds.has(id))) return "unresolved";
+    if ([...after.inferredHydrogenAtomIds].some(id => id !== target.atomId && !before.inferredHydrogenAtomIds.has(id))) return "hydrogen";
+    return undefined;
   };
-  if (!breaks(relabeled)) return undefined;
+  const broken = breaks(relabeled);
+  if (!broken) return undefined;
   const drawn = atomDisplayLabel(beforeAtom, beforeMolecule.bonds, nativeDrawingStyleFromObjectStyle(beforeMolecule.style), beforeMolecule.atoms);
   const hydrogensOnly = (part: string) => /^H\d*$/.test(part);
   const suggestion = drawn !== undefined && drawn !== normalized &&
@@ -9877,7 +9883,10 @@ function typedLabelRingRefusal(
   const suggestionKeepsRing = suggestion !== undefined &&
     ((options.literal === true && typedLabelIsDrawnLabel(suggestion, beforeAtom, beforeMolecule)) ||
       !breaks(applyNativeAtomElementTarget(document, target, suggestion, options)));
-  return `Typing ${normalized} here would leave this ring with no valid structure; ${suggestionKeepsRing ? `type ${suggestion}, or ` : ""}edit the ring first.`;
+  const consequence = broken === "unresolved"
+    ? "would leave this ring with no valid structure"
+    : "would move this ring's hydrogen to another atom";
+  return `Typing ${normalized} here ${consequence}; ${suggestionKeepsRing ? `type ${suggestion}, or ` : ""}edit the ring first.`;
 }
 
 /**

@@ -4,7 +4,7 @@ import { atomDisplayLabel } from "@chemdraft/layout-engine";
 import { testMoleculeFromSmiles } from "@chemdraft/layout-engine/testing";
 import { nativeBondOrderResolution, nativeSingleBondGraphMetadata, normalizeNativeMoleculeGeometry, tryNativeSingleBondGraphSmiles } from "@chemdraft/document-workflow-core";
 import { atomLabelDraftDocumentUnchanged, createAtomLabelDraftRollback, recordAtomLabelDraftRollback, restoreAtomLabelDraft, type AtomLabelDraftState } from "./atomLabelDraft";
-import { applyColorToNativeMoleculePart, applyNativeAtomElementTarget, commitNativeAtomLabelTarget, createPhase4Document, insertNativeTemplateMolecule, moveNativeMoleculeParts, nativeMoleculeInvalidAtomStates } from "./documentWorkflow";
+import { applyColorToNativeMoleculePart, applyNativeAtomElementTarget, commitNativeAtomLabelTarget, convertNativeTextObjectToAtomLabel, createPhase4Document, insertNativeTemplateMolecule, insertNativeTextObject, moveNativeMoleculeParts, nativeMoleculeInvalidAtomStates } from "./documentWorkflow";
 
 function molecule(document: ChemDraftDocument): MoleculeObject {
   return document.pages[0].objects[0] as MoleculeObject;
@@ -197,6 +197,13 @@ describe("committing a typed label over the label drawn for an aromatic NH", () 
   const badges = (document: ChemDraftDocument) =>
     nativeMoleculeInvalidAtomStates(molecule(document)).filter(state => !state.warningSuppressed);
   const rings = [["pyrrole", "c1cc[nH]c1"], ["indole", "c1ccc2[nH]ccc2c1"], ["imidazole", "c1c[nH]cn1"]] as const;
+  // Pyrrole and indole have no Kekule pattern without the NH; imidazole keeps one, with the H moved
+  // onto the other N. The refusal says which.
+  const refusals: Record<(typeof rings)[number][0], string> = {
+    pyrrole: "Typing N here would leave this ring with no valid structure; type NH, or edit the ring first.",
+    indole: "Typing N here would leave this ring with no valid structure; type NH, or edit the ring first.",
+    imidazole: "Typing N here would move this ring's hydrogen to another atom; type NH, or edit the ring first."
+  };
 
   it.each(rings)("\"NH\" typed over the drawn NH of %s changes nothing: the stated count and the Kekule hint stay", (_name, smiles) => {
     const { document, nitrogen, target } = ring(smiles);
@@ -212,11 +219,11 @@ describe("committing a typed label over the label drawn for an aromatic NH", () 
   // (pyrrole, indole) or move the tautomeric H to another atom (imidazole) is refused through the
   // label commit's refusal, so nothing is committed: the document, its selection and the undo stack
   // stay as they were, and every H stays where it was drawn.
-  it.each(rings)("\"N\" typed over the drawn NH of %s is refused: nothing changes and no H moves", (_name, smiles) => {
+  it.each(rings)("\"N\" typed over the drawn NH of %s is refused: nothing changes and no H moves", (name, smiles) => {
     const { document, nitrogen, target } = ring(smiles);
     const before = molecule(document);
     const result = commitNativeAtomLabelTarget(document, target, "N", { literal: true, replaceElement: true });
-    const message = "Typing N here would leave this ring with no valid structure; type NH, or edit the ring first.";
+    const message = refusals[name];
     expect(result.refusal).toBe(message);
     expect(result.message).toBe(message);
     expect(result.document).toBe(document);
@@ -238,8 +245,19 @@ describe("committing a typed label over the label drawn for an aromatic NH", () 
     // The check reads the atom as it was before the session, not the draft already in the document.
     const result = commitNativeAtomLabelTarget(draftDocument, target, "N", { literal: true, replaceElement: true,
       beforeAtom: nitrogen, beforeMolecule: molecule(document) });
-    expect(result.refusal).toBe("Typing N here would leave this ring with no valid structure; type NH, or edit the ring first.");
+    expect(result.refusal).toBe(refusals.imidazole);
     expect(result.document).toBe(draftDocument);
+  });
+
+  it.each(rings)("a text box \"N\" converted onto the drawn NH of %s is kept as text, with the same refusal", (name, smiles) => {
+    const { document, nitrogen } = ring(smiles);
+    const text = insertNativeTextObject(document, nitrogen, "N");
+    const textId = text.selection.objectIds[0]!;
+    const converted = convertNativeTextObjectToAtomLabel(text, textId);
+    expect(converted.document).toBe(text);
+    expect(converted.disabledReason).toBe(refusals[name]);
+    expect(converted.message).toBe(`Text kept: ${refusals[name]}`);
+    expect(converted.document.pages[0]!.objects.find(object => object.id === textId)).toMatchObject({ type: "text", text: "N" });
   });
 
   it("\"N\" typed over a pyridine N still commits as before", () => {
