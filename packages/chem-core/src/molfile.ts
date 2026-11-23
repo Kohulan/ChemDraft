@@ -39,7 +39,8 @@
  *   - A literal (text-typed) atom on an unknown-order or unresolved aromatic bond gets no explicit
  *     valence field, with a warning; resolved aromatic bonds count at the caller's Kekulé orders.
  *   - An element atom's own stated hydrogen count (`atomStatedHydrogenCount`: a CDXML NumHydrogens
- *     kept on an atom with no aromatic bond) is written through the same explicit valence as a
+ *     kept on an atom with no aromatic bond, including a carbon bonded only datively and an H, D or T
+ *     atom stating 0) is written through the same explicit valence as a
  *     literal atom's, bond-order sum plus the count, so every reader counts the stated hydrogens.
  *     Where that field cannot hold it (an unknown-order bond, a sum past 14) the writer warns.
  *   - Coordinates ≥1e6 / counts >999 cannot fit V2000's fixed columns; the writer trims

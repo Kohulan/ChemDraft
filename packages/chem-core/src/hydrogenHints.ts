@@ -10,13 +10,17 @@ import type { MoleculeAtom, MoleculeBond, MoleculeObject } from "./schemas";
  * where it takes the same explicit-valence field as a typed literal label's hydrogens. So an O stated
  * with 0 H and a typed literal "O" are the same atom to the label, the formula, the mass and RDKit.
  *
- * Undefined where the count means something else, or where there is no derived count to stand in for:
+ * The same holds where the drawn atom shows no count of its own: a carbon bonded only datively (its
+ * label draws no H) states its count as a typed "C", "CH" … "CH4" spells it, and an H, D or T atom
+ * states 0 as a typed literal "H", "D" or "T" means it.
+ *
+ * Undefined where the count means something else, or where no typed label could state it:
  * - no count, or a typed literal label (its own text says what hydrogens it has);
  * - an atom on an aromatic bond, where the count settles which ring atom carries the H and the
  *   Kekulé resolution carries it;
- * - a label that is not a plain element symbol, and hydrogen itself (H, D, T);
- * - a carbon bonded only datively, which has no single derived count (layout-engine's
- *   `atomImplicitHydrogenCount` gives none).
+ * - a label that is not a plain element symbol (D and T aside);
+ * - an H, D or T atom stating any count but 0: no typed label draws a hydrogen atom carrying
+ *   hydrogens of its own (the CDXML importer warns and does not keep such a count).
  * No valence model here: the count is passed through as stated, never re-derived.
  */
 export function atomStatedHydrogenCount(
@@ -25,16 +29,11 @@ export function atomStatedHydrogenCount(
 ): number | undefined {
   const stated = atom.hydrogenCount;
   if (stated === undefined || atom.labelLiteral === true) return undefined;
-  if (atomicNumberForElementSymbol(atom.element) === undefined || atom.element === "H") return undefined;
-  let incident = 0;
-  let dative = 0;
+  const hydrogen = atom.element === "H" || atom.element === "D" || atom.element === "T";
+  if (hydrogen ? stated !== 0 : atomicNumberForElementSymbol(atom.element) === undefined) return undefined;
   for (const bond of bonds) {
-    if (bond.fromAtomId !== atom.id && bond.toAtomId !== atom.id) continue;
-    if (bond.order === "aromatic") return undefined;
-    incident += 1;
-    if (isDativeBond(bond)) dative += 1;
+    if (bond.order === "aromatic" && (bond.fromAtomId === atom.id || bond.toAtomId === atom.id)) return undefined;
   }
-  if (atom.element === "C" && incident > 0 && dative === incident) return undefined;
   return stated;
 }
 

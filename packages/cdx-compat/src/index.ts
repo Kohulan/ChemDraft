@@ -47,7 +47,7 @@ import {
 import { measureTextRun, planTableLayout, textObjectSpansForRendering, transformPointForObject } from "@chemdraft/layout-engine";
 import { bondedElementLabelMeaning, isGenericAtomLabel } from "@chemdraft/template-library";
 import { planMoleculeAtomLabels } from "@chemdraft/layout-engine";
-import { atomImplicitHydrogenCount, nativeBondOrderResolution, nativeElementFromAtomLabel } from "@chemdraft/layout-engine";
+import { atomDerivedHydrogenCount, nativeBondOrderResolution, nativeElementFromAtomLabel } from "@chemdraft/layout-engine";
 import { sha256Hex, utf8Bytes, utf8String } from "./sha256";
 import { PROPS } from "./cdxTags";
 import { equalPrintMargins, fitPageSetup, importPageSetup, pagePrintMargins, type VisiblePageSetup } from "./pageSetup";
@@ -4698,9 +4698,8 @@ function importFragment(
       ordinaryStatedAtoms.push(atom);
     }
   }
-  const hydrogenCountWarning = keepStatedHydrogens(ordinaryStatedAtoms, atoms, normalizedBonds,
-    statedHydrogensByAtomId, atomIdByCdxmlId, context.sourceFormat, objectId);
-  if (hydrogenCountWarning) warnings.push(hydrogenCountWarning);
+  warnings.push(...keepStatedHydrogens(ordinaryStatedAtoms, atoms, normalizedBonds,
+    statedHydrogensByAtomId, atomIdByCdxmlId, context.sourceFormat, objectId));
   const atomStereochemistry = Object.entries(cdxmlAtomStereochemistryByAtomId).map(
     ([atomId, stereo]) => `${atomId}:${stereo.assignment}`
   );
@@ -6614,16 +6613,21 @@ function cdxmlBondDisplayForBondStyle(display: MoleculeBond["display"]): string 
 /**
  * An ordinary atom's NumHydrogens, by the owner's ruling for 1.2.3: where it disagrees with the
  * count ChemDraft derives from the atom's bonds, charge and radicals — layout-engine's
- * `atomImplicitHydrogenCount`, the one copy of that calculation, which the drawn label, the formula
+ * `atomDerivedHydrogenCount`, the one copy of that calculation, which the drawn label, the formula
  * and `nativeAtomValidationState` share (AGENTS.md §9) — it is kept exactly as written
- * (`hydrogenCount`), the atom is badged, and one warning per fragment names each such atom and both
- * counts (AGENTS.md §7). A count that agrees is not stored: the atom already counts it.
+ * (`hydrogenCount`), counted as a typed label spelling it would be (chem-core's
+ * `atomStatedHydrogenCount`), the atom is badged, and one warning per fragment names each such atom
+ * and both counts (AGENTS.md §7). A count that agrees is not stored: the atom already counts it.
  *
- * Atoms with no single derived count keep what the file states, since nothing could replace it:
- * an atom whose label is not an element (an unknown atom, a generic label) and a carbon bonded only
- * datively (its label shows no H while the formula counts them). A hydrogen atom keeps its count
- * too (the formula never counts H on a hydrogen atom, while its label does) and is named where the
- * file's count differs from its label's. Mutates `candidates`; returns the warning, if any.
+ * A carbon bonded only datively is no exception: its label draws no H, but its formula counts the
+ * derived ones, so a count that differs is kept and shown as a typed "C" … "CH4" would be. A
+ * hydrogen atom (H, D or T) keeps a stated 0, which is what a typed H, D or T label means (agreeing
+ * or not, as before: the formula counts no H on a hydrogen atom while a lone H's label does).
+ * Any other count on a hydrogen atom cannot be kept, since no typed label draws a hydrogen atom
+ * carrying hydrogens of its own: it is not stored, and a second warning says so, unless it agrees
+ * (a lone H stating 1). An atom whose label is not an element (an unknown atom, a generic label)
+ * keeps what the file states, for the file's sake; nothing counts hydrogens on it.
+ * Mutates `candidates`; returns the warnings.
  */
 function keepStatedHydrogens(
   candidates: readonly MoleculeAtom[],
@@ -6633,38 +6637,62 @@ function keepStatedHydrogens(
   atomIdByCdxmlId: ReadonlyMap<string, string>,
   sourceFormat: string,
   objectId: string
-): CompatibilityConversionWarning | undefined {
-  if (candidates.length === 0) return undefined;
+): CompatibilityConversionWarning[] {
+  if (candidates.length === 0) return [];
   const cdxmlIdByAtomId = new Map([...atomIdByCdxmlId].map(([cdxmlId, atomId]) => [atomId, cdxmlId]));
   const resolution = nativeBondOrderResolution(atoms, bonds);
   // Every count is derived before any is stored: a stored count is part of the resolution's key.
   const decisions = candidates.map((atom) => {
     const stated = statedHydrogensByAtomId.get(atom.id)!;
     const element = nativeElementFromAtomLabel(atom.element);
-    const derived = element ? atomImplicitHydrogenCount(atom, bonds, atoms, resolution) : undefined;
+    const derived = element ? atomDerivedHydrogenCount(atom, bonds, atoms, resolution) : undefined;
     return { atom, element, stated, derived };
   });
-  const mismatches: { atomId: string; label: string; stated: number; derived: number }[] = [];
+  type Named = { atomId: string; label: string; stated: number };
+  const mismatches: (Named & { derived: number })[] = [];
+  const notKept: Named[] = [];
   for (const { atom, element, stated, derived } of decisions) {
-    if (derived === stated && element !== "H") continue;
+    const hydrogenAtom = atom.element === "H" || atom.element === "D" || atom.element === "T";
+    const label = `atom ${cdxmlIdByAtomId.get(atom.id) ?? atom.id} (${element ?? atom.element})`;
+    if (derived === stated && !(hydrogenAtom && stated === 0)) continue;
+    if (hydrogenAtom && stated !== 0) {
+      notKept.push({ atomId: atom.id, label, stated });
+      continue;
+    }
     atom.hydrogenCount = stated;
     if (!element || derived === undefined || derived === stated) continue;
-    mismatches.push({ atomId: atom.id, label: `atom ${cdxmlIdByAtomId.get(atom.id) ?? atom.id} (${element})`, stated, derived });
+    mismatches.push({ atomId: atom.id, label, stated, derived });
   }
-  if (mismatches.length === 0) return undefined;
   const hydrogens = (count: number) => `${count} hydrogen${count === 1 ? "" : "s"}`;
-  const [only] = mismatches;
-  const message = mismatches.length === 1
-    ? `${sourceFormat} import: ${only.label} states ${hydrogens(only.stated)}; ChemDraft derives ${only.derived}. The stated count is kept, and the atom is flagged.`
-    : `${sourceFormat} import: ${mismatches.length} atoms state hydrogen counts ChemDraft derives differently: ` +
-      `${mismatches.map((item) => `${item.label} states ${item.stated}, derives ${item.derived}`).join("; ")}. ` +
-      "The stated counts are kept, and the atoms are flagged.";
-  return {
-    code: "cdxml.atom_hydrogen_count_kept",
-    message,
-    sourceObjectId: objectId,
-    atomIds: mismatches.map((item) => item.atomId)
-  };
+  const warnings: CompatibilityConversionWarning[] = [];
+  if (mismatches.length > 0) {
+    const [only] = mismatches;
+    warnings.push({
+      code: "cdxml.atom_hydrogen_count_kept",
+      message: mismatches.length === 1
+        ? `${sourceFormat} import: ${only!.label} states ${hydrogens(only!.stated)}; ChemDraft derives ${only!.derived}. The stated count is kept, and the atom is flagged.`
+        : `${sourceFormat} import: ${mismatches.length} atoms state hydrogen counts ChemDraft derives differently: ` +
+          `${mismatches.map((item) => `${item.label} states ${item.stated}, derives ${item.derived}`).join("; ")}. ` +
+          "The stated counts are kept, and the atoms are flagged.",
+      sourceObjectId: objectId,
+      atomIds: mismatches.map((item) => item.atomId)
+    });
+  }
+  if (notKept.length > 0) {
+    const [only] = notKept;
+    warnings.push({
+      code: "cdxml.atom_hydrogen_count_not_kept",
+      message: notKept.length === 1
+        ? `${sourceFormat} import: ${only!.label} states ${hydrogens(only!.stated)}, which a hydrogen atom cannot carry: ` +
+          "only 0 can be kept, as a typed H, D or T label means. The stated count was not kept."
+        : `${sourceFormat} import: ${notKept.length} hydrogen atoms state hydrogen counts a hydrogen atom cannot carry: ` +
+          `${notKept.map((item) => `${item.label} states ${item.stated}`).join("; ")}. ` +
+          "Only 0 can be kept, as a typed H, D or T label means. The stated counts were not kept.",
+      sourceObjectId: objectId,
+      atomIds: notKept.map((item) => item.atomId)
+    });
+  }
+  return warnings;
 }
 
 function cdxmlAtomStereoAssignment(value: string | undefined): "R" | "S" | undefined {

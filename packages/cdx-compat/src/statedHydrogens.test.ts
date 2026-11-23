@@ -236,29 +236,42 @@ describe("the NumHydrogens check uses layout-engine's own count (AGENTS.md §9)"
   it("keeps no copy of the hydrogen-count calculation in cdx-compat", async () => {
     const { readFileSync } = await import("node:fs");
     const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
-    expect(source).toMatch(/\batomImplicitHydrogenCount\b/);
+    expect(source).toMatch(/\batomDerivedHydrogenCount\b/);
     expect(source).not.toMatch(/\bnativeAtomValenceForCharge\b/);
     expect(source).not.toMatch(/\bdativeDeprotonationCount\b/);
   });
 });
 
-describe("atoms with no single derived count keep what the file states, unflagged", () => {
-  it("a carbon bonded only datively (a CO ligand's C) keeps its stated count", () => {
-    const carbonyl = `<CDXML><page id="1"><fragment id="2">
-      <n id="10" p="0 0" NumHydrogens="0"/><n id="11" p="14 0" Element="26"/>
+describe("atoms whose label draws no count of its own: a dative-only carbon, H, D and T", () => {
+  const formula = (molecule: MoleculeObject) => nativeSingleBondGraphMetadata(molecule.atoms, molecule.bonds).formula;
+  const carbonyl = (numHydrogens: string) => `<CDXML><page id="1"><fragment id="2">
+      <n id="10" p="14 0" ${numHydrogens}/><n id="11" p="0 0" Element="26"/>
       <b id="20" B="10" E="11" Order="dative"/>
     </fragment></page></CDXML>`;
-    const { result, molecule } = open(carbonyl);
+
+  it("a carbon bonded only datively keeps a count its formula does not have, flagged, drawn as a typed C … CH4", () => {
+    // Bare, the carbon draws no H, but its formula counts 4: a dative bond costs its donor nothing.
+    expect(formula(open(carbonyl("")).molecule)).toBe("CH4Fe");
+    const { result, molecule } = open(carbonyl('NumHydrogens="0"'));
     expect(hydrogenCounts(molecule)).toEqual([0, undefined]);
-    expect(hydrogenWarnings(result)).toEqual([]);
-    expect(badges(molecule)).toEqual([]);
+    expect(hydrogenWarnings(result).map((warning) => warning.message)).toEqual([
+      "CDXML import: atom 10 (C) states 0 hydrogens; ChemDraft derives 4. The stated count is kept, and the atom is flagged."
+    ]);
+    expect(badges(molecule)).toEqual([[molecule.atoms[0]!.id, "C states 0 H, but its bonds and charge give 4."]]);
+    expect(labels(molecule)).toEqual(["C", "Fe"]);
+    expect(formula(molecule)).toBe("CFe");
     const plain = exportDocumentToCdxml(result.document!, { embedNativePayload: false }).contents;
     expect(/<n [^>]*id="\d+"[^>]*NumHydrogens="0"/.test(plain)).toBe(true);
+    const methyl = open(carbonyl('NumHydrogens="3"')).molecule;
+    expect([hydrogenCounts(methyl), labels(methyl), formula(methyl)]).toEqual([[3, undefined], ["CH3", "Fe"], "CH3Fe"]);
+    // Four agrees with the formula: nothing to keep, nothing to flag.
+    const { result: agreeing, molecule: methane } = open(carbonyl('NumHydrogens="4"'));
+    expect([hydrogenCounts(methane), hydrogenWarnings(agreeing), badges(methane), formula(methane)]).toEqual([[undefined, undefined], [], [], "CH4Fe"]);
   });
 
-  it("a hydrogen atom keeps its stated count, agreeing or not, and is flagged where it disagrees with its label", () => {
-    // The formula never counts hydrogens on a hydrogen atom while its label does, so there is no
-    // single count to drop an agreeing one against: the file's count is kept as written.
+  it("a hydrogen atom keeps a stated 0, agreeing or not, drawn as a typed H, and is flagged where it disagrees", () => {
+    // A stated 0 is what a typed H label means. An agreeing one is kept as before: the formula counts
+    // no H on a hydrogen atom while a lone H's label does, so there was no single count to drop it against.
     const hydrogens = `<CDXML><page id="1"><fragment id="2">
       <n id="10" p="0 0" Element="1" NumHydrogens="0"/><n id="11" p="14 0"/>
       <b id="20" B="10" E="11"/>
@@ -272,8 +285,41 @@ describe("atoms with no single derived count keep what the file states, unflagge
       "CDXML import: atom 12 (H) states 0 hydrogens; ChemDraft derives 1. The stated count is kept, and the atom is flagged."
     ]);
     expect(badges(molecule).map(([id]) => id)).toEqual([molecule.atoms[2]!.id]);
+    expect(labels(molecule)).toEqual(["H", undefined, "H"]);
   });
 
+  it("does not keep a count a hydrogen atom cannot carry, and says so", () => {
+    // An H bonded to C stating 1, a lone H stating 2 and a lone D stating 1: no typed H, D or T label
+    // carries hydrogens of its own. A lone H stating 1 (H2) agrees with what it already counts.
+    const { result, molecule } = open(`<CDXML><page id="1"><fragment id="2">
+      <n id="10" p="0 0" Element="1" NumHydrogens="1"/><n id="11" p="14 0"/><b id="20" B="10" E="11"/>
+      <n id="12" p="40 0" Element="1" NumHydrogens="2"/>
+      <n id="13" p="60 0" Element="1" Isotope="2" NumHydrogens="1"/>
+      <n id="14" p="80 0" Element="1" NumHydrogens="1"/>
+    </fragment></page></CDXML>`);
+    expect(molecule.atoms.map((atom) => atom.element)).toEqual(["H", "C", "H", "D", "H"]);
+    expect(hydrogenCounts(molecule)).toEqual([undefined, undefined, undefined, undefined, undefined]);
+    expect(hydrogenWarnings(result)).toEqual([]);
+    expect(result.warnings.filter((warning) => warning.code === "cdxml.atom_hydrogen_count_not_kept")).toEqual([{
+      code: "cdxml.atom_hydrogen_count_not_kept",
+      message: "CDXML import: 3 hydrogen atoms state hydrogen counts a hydrogen atom cannot carry: " +
+        "atom 10 (H) states 1; atom 12 (H) states 2; atom 13 (D) states 1. " +
+        "Only 0 can be kept, as a typed H, D or T label means. The stated counts were not kept.",
+      sourceObjectId: molecule.id,
+      atomIds: [molecule.atoms[0]!.id, molecule.atoms[2]!.id, molecule.atoms[3]!.id]
+    }]);
+    const plain = exportDocumentToCdxml(result.document!, { embedNativePayload: false }).contents;
+    expect(plain).not.toContain("NumHydrogens");
+    const single = open(`<CDXML><page id="1"><fragment id="2">
+      <n id="10" p="0 0" Element="1" NumHydrogens="1"/><n id="11" p="14 0"/><b id="20" B="10" E="11"/>
+    </fragment></page></CDXML>`).result;
+    expect(single.warnings.filter((warning) => warning.code === "cdxml.atom_hydrogen_count_not_kept").map((warning) => warning.message)).toEqual([
+      "CDXML import: atom 10 (H) states 1 hydrogen, which a hydrogen atom cannot carry: only 0 can be kept, as a typed H, D or T label means. The stated count was not kept."
+    ]);
+  });
+});
+
+describe("atoms with no element keep what the file states, unflagged", () => {
   it("an atom with no element (an unknown atom) keeps its stated count", () => {
     const unknown = `<CDXML><page id="1"><fragment id="2">
       <n id="10" p="0 0" Element="250" NumHydrogens="2"/><n id="11" p="14 0"/>

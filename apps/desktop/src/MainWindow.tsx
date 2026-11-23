@@ -34977,7 +34977,7 @@ function atomHasImplicitHydrogen(molecule: MoleculeObject, atom: MoleculeAtom): 
   const element = nativeElementFromAtomLabel(atom.element);
   if (!element || element === "H" || atom.labelLiteral === true) return false;
   // The hydrogens the drawn label shows (layout-engine, AGENTS.md §9): a stated count where the atom
-  // has one; none for a carbon bonded only datively.
+  // has one; else none for a carbon bonded only datively.
   return (atomDrawnHydrogenCount(atom, molecule.bonds, molecule.atoms) ?? 0) > 0;
 }
 

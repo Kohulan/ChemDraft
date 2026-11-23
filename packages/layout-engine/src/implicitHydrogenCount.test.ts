@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { DefaultNativeDrawingStyle, type MoleculeAtom, type MoleculeBond } from "@chemdraft/chem-core";
 
-import { atomDisplayLabel, atomDrawnHydrogenCount, atomImplicitHydrogenCount } from "./index";
+import { atomDerivedHydrogenCount, atomDisplayLabel, atomDrawnHydrogenCount, atomImplicitHydrogenCount } from "./index";
 import { nativeBondOrderResolution } from "./valence";
 
 /**
@@ -151,11 +151,41 @@ describe("a stated hydrogen count draws in the label", () => {
     expect(label("k0", pyridine)).toBe("N");
   });
 
-  it("a hydrogen atom and a carbon bonded only datively keep their labels as before", () => {
-    expect(label("h", { atoms: [atom("h", "H", 0, 0, { hydrogenCount: 0 })], bonds: [] }))
+  it("a lone H or D stated with 0 reads as the typed literal H or D", () => {
+    for (const element of ["H", "D"]) {
+      expect(label("h", { atoms: [atom("h", element, 0, 0, { hydrogenCount: 0 })], bonds: [] }))
+        .toBe(label("h", { atoms: [atom("h", element, 0, 0, { labelLiteral: true })], bonds: [] }));
+    }
+    expect(label("h", { atoms: [atom("h", "H", 0, 0, { hydrogenCount: 0 })], bonds: [] })).toBe("H");
+    // A count a hydrogen atom cannot carry is not drawn (the importer does not keep one).
+    expect(label("h", { atoms: [atom("h", "H", 0, 0, { hydrogenCount: 2 })], bonds: [] }))
       .toBe(label("h", { atoms: [atom("h", "H", 0, 0)], bonds: [] }));
-    const carbonyl = { atoms: [atom("c", "C", 0, 0, { labelVisible: true, hydrogenCount: 2 }), atom("fe", "Fe", 14)], bonds: [bond("d", "c", "fe", "single", true)] };
-    expect(label("c", carbonyl)).toBe("C");
+  });
+
+  it("a carbon bonded only datively draws a stated count as the typed C … CH4 there reads", () => {
+    // The metal on the left, so the hydrogens follow the element as in the typed text.
+    const carbonyl = (extra: Partial<MoleculeAtom>) =>
+      ({ atoms: [atom("c", "C", 0, 0, extra), atom("fe", "Fe", -14)], bonds: [bond("d", "c", "fe", "single", true)] });
+    expect(label("c", carbonyl({}))).toBeUndefined();
+    expect(label("c", carbonyl({ hydrogenCount: 0 }))).toBe("C");
+    expect(label("c", carbonyl({ hydrogenCount: 2 }))).toBe("CH2");
+    expect(label("c", carbonyl({ hydrogenCount: 3 }))).toBe(label("c", carbonyl({ element: "CH3", labelLiteral: true })));
+    expect(label("c", carbonyl({ labelVisible: false, hydrogenCount: 2 }))).toBeUndefined();
+  });
+
+  it("atomDerivedHydrogenCount is atomImplicitHydrogenCount, and a dative-only carbon's formula count", () => {
+    const derived = (target: string, { atoms, bonds }: { atoms: MoleculeAtom[]; bonds: MoleculeBond[] }) => {
+      const subject = atoms.find((candidate) => candidate.id === target)!;
+      return [atomDerivedHydrogenCount(subject, bonds, atoms), atomImplicitHydrogenCount(subject, bonds, atoms)];
+    };
+    expect(derived("o", ethanol())).toEqual([1, 1]);
+    expect(derived("c1", ethanol())).toEqual([3, 3]);
+    expect(derived("h", { atoms: [atom("h", "H", 0)], bonds: [] })).toEqual([1, 1]);
+    expect(derived("d", { atoms: [atom("d", "D", 0)], bonds: [] })).toEqual([undefined, undefined]);
+    const carbonyl = { atoms: [atom("c", "C", 0), atom("fe", "Fe", 14)], bonds: [bond("d", "c", "fe", "single", true)] };
+    expect(derived("c", carbonyl)).toEqual([4, undefined]);
+    const cation = { atoms: [atom("c", "C", 0, 0, { formalCharge: 1 }), atom("fe", "Fe", 14)], bonds: [bond("d", "c", "fe", "single", true)] };
+    expect(derived("c", cation)).toEqual([3, undefined]);
   });
 
   it("atomDrawnHydrogenCount is the count the label draws: the stated one where the atom has it", () => {
@@ -168,8 +198,10 @@ describe("a stated hydrogen count draws in the label", () => {
     const pyrrole = ringOf(["N", "C", "C", "C", "C"], ["aromatic"]);
     pyrrole.atoms[0] = { ...pyrrole.atoms[0]!, hydrogenCount: 1 };
     expect(drawn("k0", pyrrole)).toBe(1);
-    const carbonyl = { atoms: [atom("c", "C", 0, 0, { hydrogenCount: 2 }), atom("fe", "Fe", 14)], bonds: [bond("d", "c", "fe", "single", true)] };
-    expect(drawn("c", carbonyl)).toBeUndefined();
+    const carbonyl = (extra: Partial<MoleculeAtom>) =>
+      ({ atoms: [atom("c", "C", 0, 0, extra), atom("fe", "Fe", 14)], bonds: [bond("d", "c", "fe", "single", true)] });
+    expect(drawn("c", carbonyl({}))).toBeUndefined();
+    expect(drawn("c", carbonyl({ hydrogenCount: 2 }))).toBe(2);
   });
 
   it("the hidden-hydrogen style hides a stated count as it hides a derived one", () => {

@@ -395,6 +395,46 @@ describe("a stated hydrogen count shows everywhere, as a hand-drawn under-filled
     expect(typed.badged).toEqual([oxygenOf(typedMolecule).id]);
   });
 
+  // The atoms whose label draws no count of its own get the same treatment: a lone H or D stated
+  // with 0 is a typed literal "H" or "D", and a carbon bonded only datively stated with n is the typed
+  // "C" … "CH4" (the iron on its left, so the typed text and the drawn label put the H on the same
+  // side). The badge's wording differs (stated count against typed label); whether it shows does not.
+  const fragmentCdxml = (body: string) => `<CDXML><page id="1"><fragment id="2">${body}</fragment></page></CDXML>`;
+  const typedAt = (contents: string, atomIndex: number, label: string) => {
+    const document = openedDocument(contents);
+    const [molecule] = moleculesOrThrow(document);
+    return normalizeCommittedDocument(commitNativeAtomLabelTarget(document,
+      { objectId: molecule.id, kind: "atom", atomId: molecule.atoms[atomIndex]!.id, distanceToPointer: 0 },
+      label, { literal: true, replaceElement: true }).document);
+  };
+  const badgeWordingAside = (read: Awaited<ReturnType<typeof reading>>) => ({ ...read,
+    smilesWarnings: read.smilesWarnings.map(([code, message]) => code === "export.invalid_structure" ? [code] : [code, message]) });
+  it.each([
+    ["a lone H stated with 0", '<n id="10" p="100 100" Element="1"/>', "H", { labels: ["H"], formula: "H", smiles: "[H]", badged: true }],
+    ["a lone D stated with 0", '<n id="10" p="100 100" Element="1" Isotope="2"/>', "D", { labels: ["D"], formula: "D", smiles: "[2H]", badged: false }],
+    ["a dative-only C stated with 0", '<n id="10" p="114 100"/><n id="11" p="100 100" Element="26"/><b id="20" B="10" E="11" Order="dative"/>', "C",
+      { labels: ["C", "Fe"], formula: "CFe", smiles: "[C][Fe]", badged: true }],
+    ["a dative-only C stated with 3", '<n id="10" p="114 100"/><n id="11" p="100 100" Element="26"/><b id="20" B="10" E="11" Order="dative"/>', "CH3",
+      { labels: ["CH3", "Fe"], formula: "CH3Fe", smiles: "[CH3][Fe]", badged: true }]
+  ] as const)("%s is identical to the same atom typed by hand", async (_name, body, typedLabel, expected) => {
+    const statedCount = typedLabel === "CH3" ? 3 : 0;
+    const statedBody = body.replace('<n id="10" p', `<n id="10" NumHydrogens="${statedCount}" p`);
+    const statedDocument = openedDocument(fragmentCdxml(statedBody));
+    expect(moleculesOrThrow(statedDocument)[0].atoms[0]!.hydrogenCount).toBe(statedCount);
+    const typedDocument = typedAt(fragmentCdxml(body), 0, typedLabel);
+    const stated = await reading(statedDocument);
+    const typed = await reading(typedDocument);
+    expect(badgeWordingAside(stated)).toEqual(badgeWordingAside(typed));
+    expect(stated).toMatchObject({ labels: expected.labels, formula: expected.formula, storedFormula: expected.formula, smiles: expected.smiles });
+    expect(stated.badged).toEqual(expected.badged ? [moleculesOrThrow(statedDocument)[0].atoms[0]!.id] : []);
+    // Plain, the same atoms count what their bonds give: H2, HD and CH4Fe.
+    expect((await reading(openedDocument(fragmentCdxml(body)))).formula).toBe({ H: "H2", D: "HD", C: "CH4Fe", CH3: "CH4Fe" }[typedLabel]);
+    if (typedLabel === "CH3") return; // Copy As MOL writes a typed "CH3" as a dummy atom; the engine spells it.
+    for (const flavor of ["v2000", "v3000"] as const) {
+      expect(copyAsMolfile(statedDocument, flavor, [])).toBe(copyAsMolfile(typedDocument, flavor, []));
+    }
+  });
+
   it("\"Use the derived hydrogen count\" gives OH, C2H6O and CCO", async () => {
     const document = openedDocument();
     const [molecule] = moleculesOrThrow(document);

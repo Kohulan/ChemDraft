@@ -118,7 +118,7 @@ Synthetic coverage includes biphenyl/Ph, Boc-NH, OTBS, OMe and three independent
 - on an atom of an `Order="1.5"` bond, a literal label, or a snapshotted abbreviation atom, always
   (it settles a ring N–H or stands for the source constraint);
 - on an ordinary atom, when it disagrees with the count ChemDraft derives from the atom's bonds,
-  charge and radicals (layout-engine's `atomImplicitHydrogenCount`). Owner ruling, 1.2.3: the
+  charge and radicals (layout-engine's `atomDerivedHydrogenCount`). Owner ruling, 1.2.3: the
   file's count is kept exactly as written, the atom shows the red (!) badge (document-workflow-core's
   `nativeAtomValidationState`, `statedHydrogens`), and `cdxml.atom_hydrogen_count_kept` names each
   such atom and both counts. A count that agrees is not stored. The kept count is the one the atom
@@ -126,9 +126,16 @@ Synthetic coverage includes biphenyl/Ph, Boc-NH, OTBS, OMe and three independent
   the drawn label ("O", not "OH"), the formula, the mass and SMILES count the stated hydrogens, and
   RDKit receives them through the typed label's own route, the molfile's explicit valence (chem-core's
   `atomStatedHydrogenCount`). The badge says how the stated count differs from the derived one, and
-  the atom-problem fix is "Use the derived hydrogen count", which drops the stated one;
-- on an atom with no single derived count, always: a label that is not an element, a hydrogen atom
-  (named in the warning where its label counts differently), and a carbon bonded only datively.
+  the atom-problem fix is "Use the derived hydrogen count", which drops the stated one. A carbon
+  bonded only datively is such an atom too: its label draws no H, but its formula counts the derived
+  ones (a dative bond costs its donor nothing), so a count that differs is kept, flagged and drawn as
+  a typed "C" … "CH4" would be;
+- on a hydrogen atom (H, D or T) stating 0, always: that is what a typed H, D or T label means, and
+  the atom is drawn, counted and written as that typed label is (flagged where the derived count
+  differs: a lone H derives 1). Any other count on a hydrogen atom is not kept, since no typed label
+  draws a hydrogen atom carrying hydrogens of its own; `cdxml.atom_hydrogen_count_not_kept` names
+  each such atom, unless the count agrees with the derived one (a lone H stating 1);
+- on an atom whose label is not an element, always, for the file's sake; nothing counts hydrogens on it.
 
 A value that is not a non-negative integer is not imported and is reported as
 `cdxml.atom_hydrogen_count_invalid`. Every kept count is written back as `NumHydrogens` on CDXML and

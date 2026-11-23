@@ -7482,7 +7482,8 @@ export function atomDisplayLabelPlacement(
   // carbon bonded only datively has no count and draws none. A count the atom states for itself
   // (chem-core's `atomStatedHydrogenCount`, a kept CDXML NumHydrogens) is drawn in place of the
   // derived one, as the formula, SMILES and the engine's molfile count it (owner ruling 1.2.3), so
-  // an O stated with 0 H reads "O", exactly like a typed one.
+  // an O stated with 0 H reads "O", a lone H stated with 0 reads "H", and a carbon bonded only
+  // datively stated with 3 reads "CH3", exactly like the typed labels.
   const incidentBonds = resolution.bondsByAtom.get(atom.id) ?? [];
   const drawnHydrogens = atomDrawnHydrogenCount(atom, bonds, atoms, resolution);
   const implicitHydrogens = drawingStyle.atomLabelHideImplicitHydrogens || atom.labelLiteral === true
@@ -7496,7 +7497,8 @@ export function atomDisplayLabelPlacement(
     // every dashed bond as CH4 instead of drawing a plain stick.
     const bonded = incidentBonds.length > 0;
     // A carbon whose stated count disagrees with the derived one is drawn with its label, as a
-    // typed carbon is: a skeletal vertex cannot show that it carries fewer or more hydrogens.
+    // typed carbon is: a skeletal vertex cannot show that it carries fewer or more hydrogens. A
+    // carbon bonded only datively draws no count, so any count it states shows.
     const statedHydrogens = atomStatedHydrogenCount(atom, bonds);
     const statedCountShows = statedHydrogens !== undefined &&
       statedHydrogens !== atomImplicitHydrogenCount(atom, bonds, atoms, resolution);
@@ -7549,10 +7551,9 @@ export function atomDrawnHydrogenCount(
  * single count: a label that is not an element symbol, and a carbon bonded only datively, whose
  * label shows no H while the formula counts them. Display choices (a literal label, the
  * hidden-hydrogen style) are the planner's and do not change the count. This is always the DERIVED
- * count: the CDXML importer and the validator compare a stated NumHydrogens against it, so the
- * warning, the badge and the drawing cannot disagree. Where an atom states its own count
- * (chem-core's `atomStatedHydrogenCount`), the label draws that count instead, as the formula,
- * SMILES and the engine's molfile do.
+ * count (`atomDerivedHydrogenCount`, less that carbon), so the drawing and the badge cannot
+ * disagree. Where an atom states its own count (chem-core's `atomStatedHydrogenCount`), the label
+ * draws that count instead, as the formula, SMILES and the engine's molfile do.
  */
 export function atomImplicitHydrogenCount(
   atom: MoleculeAtom,
@@ -7566,6 +7567,26 @@ export function atomImplicitHydrogenCount(
   // A carbon whose only bonds are dative (a CO ligand's C drawn as a bare atom) cannot carry
   // four hydrogens as well: under the terminal-carbon style it reads "C", never "CH4".
   if (element === "C" && incidentBonds.length > 0 && incidentBonds.every(isDativeBond)) return undefined;
+  return atomDerivedHydrogenCount(atom, bonds, atoms, resolution);
+}
+
+/**
+ * The hydrogens an element atom's bonds, charge and radicals leave room for: valence for the FULL
+ * formal charge, less the bond orders (aromatic bonds at their Kekulé orders), each radical's unpaired
+ * electron, and any dative deprotonation. The count a stated NumHydrogens is compared with (the CDXML
+ * importer, the validator's badge and its fix). It is `atomImplicitHydrogenCount` everywhere except a
+ * carbon bonded only datively: its label draws no H, but the formula and the structure an engine
+ * reads count these (a dative bond costs its donor nothing), so this is the count that carbon has.
+ * Undefined only for a label that is not an element symbol.
+ */
+export function atomDerivedHydrogenCount(
+  atom: MoleculeAtom,
+  bonds: readonly CoreMoleculeBond[],
+  atoms: readonly MoleculeAtom[],
+  resolution: NativeBondOrderResolution = nativeBondOrderResolution(atoms, bonds)
+): number | undefined {
+  const element = nativeElementFromAtomLabel(atom.element);
+  if (!element) return undefined;
   return Math.max(
     0,
     nativeAtomValenceForCharge(element, atom.formalCharge) - (resolution.bondOrderUsage.get(atom.id) ?? 0)

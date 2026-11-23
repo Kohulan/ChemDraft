@@ -73,12 +73,36 @@ describe("a stated hydrogen count on an atom with no aromatic bond", () => {
     expect(state(ethanol({ hydrogenCount: 2, formalCharge: 1 }), "o").valid).toBe(true);
   });
 
-  it("leaves a carbon bonded only datively alone: it has no single derived count", () => {
-    const carbonyl = (hydrogenCount?: number) => molecule([
-      { id: "c", element: "C", x: 0, y: 0, formalCharge: 0, ...(hydrogenCount === undefined ? {} : { hydrogenCount }) },
+  it("judges a carbon bonded only datively against the count its formula has, as a typed CH3 there is judged", () => {
+    const carbonyl = (carbon: Partial<MoleculeAtom> = {}) => molecule([
+      { id: "c", element: "C", x: 0, y: 0, formalCharge: 0, ...carbon },
       { id: "fe", element: "Fe", x: 14, y: 0, formalCharge: 0 }
     ], [{ id: "b", fromAtomId: "c", toAtomId: "fe", order: "single", display: { bondStyle: "dashed" } }]);
-    expect(state(carbonyl(0), "c")).toEqual(state(carbonyl(), "c"));
+    // The bare carbon draws no H but its formula counts 4: a dative bond costs its donor nothing.
+    expect(nativeSingleBondGraphMetadata(carbonyl().atoms, carbonyl().bonds).formula).toBe("CH4Fe");
+    expect(state(carbonyl(), "c").valid).toBe(true);
+    for (const stated of [0, 3]) {
+      expect(state(carbonyl({ hydrogenCount: stated }), "c")).toMatchObject({
+        valid: false, statedHydrogens: { stated, derived: 4 }, invalidReason: `C states ${stated} H, but its bonds and charge give 4.`
+      });
+      expect(nativeSingleBondGraphMetadata(carbonyl({ hydrogenCount: stated }).atoms, carbonyl().bonds).formula).toBe(stated ? `CH${stated}Fe` : "CFe");
+    }
+    expect(state(carbonyl({ element: "CH3", labelLiteral: true }), "c").valid).toBe(false);
+    expect(state(carbonyl({ hydrogenCount: 4 }), "c").valid).toBe(true);
+    expect(atomProblem(carbonyl({ hydrogenCount: 3 }), "c")!.fixes.map((fix) => fix.label))
+      .toEqual(["Use the derived hydrogen count (4)", "Ignore warning"]);
+  });
+
+  it("badges a lone H stated with 0 as a typed H is badged, and judges no count on D", () => {
+    const lone = (element: string, extra: Partial<MoleculeAtom> = {}) =>
+      molecule([{ id: "h", element, x: 0, y: 0, formalCharge: 0, ...extra }], []);
+    expect(state(lone("H", { hydrogenCount: 0 }), "h")).toMatchObject({ valid: false, statedHydrogens: { stated: 0, derived: 1 } });
+    expect(state(lone("H", { labelLiteral: true }), "h").valid).toBe(false);
+    expect(state(lone("D", { hydrogenCount: 0 }), "h")).toEqual(state(lone("D", { labelLiteral: true }), "h"));
+    expect(state(lone("D", { hydrogenCount: 0 }), "h").valid).toBe(true);
+    // A count a hydrogen atom cannot carry is not counted, so it is not judged as if it were.
+    expect(state(lone("H", { hydrogenCount: 2 }), "h")).toEqual(state(lone("H"), "h"));
+    expect(state(lone("H"), "h").valid).toBe(true);
   });
 
   it("leaves a typed literal label to its own check", () => {

@@ -16,7 +16,7 @@ import {
   type MoleculeObject
 } from "@chemdraft/chem-core";
 import {
-  atomImplicitHydrogenCount,
+  atomDerivedHydrogenCount,
   dativeDeprotonationCount,
   nativeAtomChargeIsExpressible,
   nativeAtomLabelReading,
@@ -315,12 +315,14 @@ export function nativeAtomValidationState(
 /**
  * A stated count on an atom with no aromatic bond is the source's count for that atom, not a
  * Kekulé constraint. Owner ruling (1.2.3): where it disagrees with the count derived from the bonds,
- * charge and radicals (layout-engine's `atomImplicitHydrogenCount`) it is kept, counted everywhere
+ * charge and radicals (layout-engine's `atomDerivedHydrogenCount`) it is kept, counted everywhere
  * (label, formula, SMILES, the engine's molfile: chem-core's `atomStatedHydrogenCount`) and badged,
  * like any under- or over-filled atom. Checked only once the atom is otherwise valid, so a valence
- * or charge problem is reported (and fixed) first. A typed literal label spells its own hydrogens
- * and has its own check; a carbon bonded only datively has no single derived count, so neither is
- * judged here.
+ * or charge problem is reported (and fixed) first. Judged are exactly the counts that are counted
+ * (`atomStatedHydrogenCount`): a typed literal label spells its own hydrogens and has its own check,
+ * and an atom on an aromatic bond is judged by the Kekulé check in `nativeAtomDiagnostic`. A carbon
+ * bonded only datively is judged against the count its formula has, as a typed "CH3" there is
+ * judged against carbon's four bonds; a D or T atom, like a typed one, is not judged.
  */
 function nativeStatedHydrogenDiagnostic(
   atom: MoleculeAtom,
@@ -329,15 +331,11 @@ function nativeStatedHydrogenDiagnostic(
   atoms: readonly MoleculeAtom[],
   resolution: NativeBondOrderResolution
 ): NativeAtomValidationState | undefined {
-  const stated = atom.hydrogenCount;
-  if (stated === undefined || atom.labelLiteral === true) return undefined;
+  const stated = atomStatedHydrogenCount(atom, bonds);
+  if (stated === undefined) return undefined;
   const element = nativeElementFromAtomLabel(atom.element);
   if (!element) return undefined;
-  // An atom on an aromatic bond is judged by the Kekulé check in `nativeAtomDiagnostic`.
-  if (bonds.some((bond) => bond.order === "aromatic" && (bond.fromAtomId === atom.id || bond.toAtomId === atom.id))) {
-    return undefined;
-  }
-  const derived = atomImplicitHydrogenCount({ ...atom, formalCharge: effectiveFormalCharge }, bonds, atoms, resolution);
+  const derived = atomDerivedHydrogenCount({ ...atom, formalCharge: effectiveFormalCharge }, bonds, atoms, resolution);
   if (derived === undefined || derived === stated) return undefined;
   return {
     atomId: atom.id,

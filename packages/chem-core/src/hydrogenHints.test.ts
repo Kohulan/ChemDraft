@@ -265,10 +265,21 @@ describe("atomStatedHydrogenCount: the count an atom states for itself", () => {
     expect(pyrrole.atoms.map((atom) => atomStatedHydrogenCount(atom, pyrrole.bonds))).toEqual(pyrrole.atoms.map(() => undefined));
   });
 
-  it("is undefined on hydrogen, a label that is not an element, and a carbon bonded only datively", () => {
-    for (const element of ["H", "D", "T", "*", "R1", "OMe", "o"]) expect(stated({ hydrogenCount: 0, element })).toBeUndefined();
-    expect(stated({ hydrogenCount: 0, element: "C" }, "single", true)).toBeUndefined();
-    // Only carbon lacks a single derived count on a dative bond alone; a dative N donor has one.
+  it("is 0 on an H, D or T atom stating 0, as a typed H, D or T label means, and undefined for any other count", () => {
+    for (const element of ["H", "D", "T"]) {
+      expect(stated({ hydrogenCount: 0, element })).toBe(0);
+      expect(stated({ hydrogenCount: 0, element }, "single", true)).toBe(0);
+      expect(stated({ hydrogenCount: 1, element })).toBeUndefined();
+      expect(stated({ hydrogenCount: 2, element })).toBeUndefined();
+    }
+  });
+
+  it("is undefined on a label that is not an element", () => {
+    for (const element of ["*", "R1", "OMe", "o"]) expect(stated({ hydrogenCount: 0, element })).toBeUndefined();
+  });
+
+  it("is the stated count on a carbon bonded only datively, as a typed C … CH4 there spells it", () => {
+    for (const hydrogenCount of [0, 2, 3, 4]) expect(stated({ hydrogenCount, element: "C" }, "single", true)).toBe(hydrogenCount);
     expect(stated({ hydrogenCount: 0, element: "N" }, "single", true)).toBe(0);
   });
 });

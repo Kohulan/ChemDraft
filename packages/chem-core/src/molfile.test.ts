@@ -1078,13 +1078,32 @@ describe("a stated hydrogen count rides the literal label's explicit valence", (
     expect(valences(write, pyrrole, { kekuleBondOrders })).toEqual(Array(5).fill("0"));
   });
 
-  it.each(writers)("%s gives no valence to a hydrogen atom or a carbon bonded only datively", (write) => {
-    const graph = molecule(
-      [{ id: "c", element: "C", x: 0, y: 0 }, { id: "fe", element: "Fe", x: 1.5, y: 0 }, { id: "h", element: "H", x: 3, y: 0 }],
-      [{ id: "d", from: "c", to: "fe", style: "dashed" }]
-    );
-    graph.atoms = graph.atoms.map((atom) => atom.id === "fe" ? atom : { ...atom, hydrogenCount: 0 });
-    expect(valences(write, graph)).toEqual(["0", "0", "0"]);
+  it.each(writers)("%s writes a dative-only carbon's count and an H, D or T atom's stated 0 as the typed labels", (write) => {
+    // A C bonded to Fe only by a dative bond, a lone H and a lone D, each stating 0, against the same
+    // atoms typed as literal "C", "H" and "D"; then the C stating 3 against a typed "CH3".
+    const graph = (atom: (id: string) => Partial<MoleculeAtom>) => {
+      const built = molecule(
+        [{ id: "c", element: "C", x: 0, y: 0 }, { id: "fe", element: "Fe", x: 1.5, y: 0 },
+          { id: "h", element: "H", x: 3, y: 0 }, { id: "d", element: "D", x: 4.5, y: 0 }],
+        [{ id: "dc", from: "c", to: "fe", style: "dashed" }]
+      );
+      built.atoms = built.atoms.map((candidate) => candidate.id === "fe" ? candidate : { ...candidate, ...atom(candidate.id) });
+      return built;
+    };
+    const stated = write(graph(() => ({ hydrogenCount: 0 })), { kekuleBondOrders: new Map() });
+    const typed = write(graph(() => ({ labelLiteral: true })), { kekuleBondOrders: new Map() });
+    expect(stated.contents).toBe(typed.contents);
+    expect(stated.warnings).toEqual(typed.warnings);
+    // V2000 writes the dative bond as single, so the C's valence counts it; V3000 gives its donor none.
+    // A valence of 0 is the field's zero sentinel (V2000 15, V3000 -1), as for the typed labels.
+    expect(valences(write, graph(() => ({ hydrogenCount: 0 }))))
+      .toEqual(write === moleculeToMolfileV2000 ? ["1", "0", "15", "15"] : ["-1", "0", "-1", "-1"]);
+    const spellLabel = (label: string) => label === "CH3" ? { element: "C", hydrogens: 3 } : undefined;
+    const methyl = write(graph((id) => id === "c" ? { hydrogenCount: 3 } : {}), { kekuleBondOrders: new Map(), spellLabel });
+    const typedMethyl = write(graph((id) => id === "c" ? { element: "CH3", labelLiteral: true } : {}), { kekuleBondOrders: new Map(), spellLabel });
+    expect(methyl.contents).toBe(typedMethyl.contents);
+    // A count a hydrogen atom cannot carry is not one this writer is given a valence for.
+    expect(valences(write, graph((id) => id === "h" ? { hydrogenCount: 1 } : {}))).toEqual(["0", "0", "0", "0"]);
   });
 
   it.each(writers)("%s warns, never drops the count silently, when an unknown-order bond leaves no valence to carry it", (write) => {
