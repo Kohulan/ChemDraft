@@ -713,6 +713,19 @@ describe("an H atom a native document stores a hydrogen count on, in the app", (
     expectFlagged(moleculesOrThrow(normalizeCommittedDocument(restored.document!))[0]);
   });
 
+  it("session restore shows it beside an unrelated warning the session's saved open report holds", () => {
+    const document = normalizeCommittedDocument(openNativeDocument(serializeDocument(stored())).document!);
+    const unrelated = { code: "cdxml.unsupported_object", message: "Skipped an unsupported object.", sourceObjectId: "other" };
+    const envelope = { ...buildDocumentSessionEnvelope(createNativeSavePayload(document), { dirty: true }, "Stored H", false),
+      openWarnings: { displayName: "Stored H", sourceLabel: "external CDXML subset", warnings: [unrelated] } };
+    const session = parseDocumentSessionEnvelope(JSON.parse(JSON.stringify(envelope)), true)!;
+    // As the restore does: read the autosaved contents, then restore the reports with what that read found.
+    const reread = openNativeDocument(session.contents);
+    const { warnings } = restoreSessionWarningReports(session, { displayName: "Stored H", sourceLabel: "ChemDraft", warnings: reread.warnings });
+    expect(warnings).toMatchObject({ displayName: "Stored H", sourceLabel: "external CDXML subset" });
+    expect(warnings?.warnings).toEqual([unrelated, notCounted]);
+  });
+
   it("paste and duplicate keep it and flag each copy", () => {
     const document = normalizeCommittedDocument(openNativeDocument(serializeDocument(stored())).document!);
     const payload = createSelectionClipboardPayload(selecting(document, ["mol_h"]))!;

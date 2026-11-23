@@ -11080,7 +11080,10 @@ export function MainWindow({
               const history = createDocumentHistory(normalizeCommittedDocument(
                 admitParsedDocument(resolved.document), { preserveElectronMarks: true }
               ));
-              const reports = restoreSessionWarningReports(session);
+              const reports = restoreSessionWarningReports(session, {
+                displayName: session.displayName, sourceLabel: openSourceLabel(resolved.source, resolved.statusSourceLabel),
+                warnings: opened.warnings
+              });
               restored.push({ session, opened, resolved, history, reports, candidateIndex, id: crypto.randomUUID() });
             } catch {
               skipped.push(rawTab);
@@ -11119,17 +11122,14 @@ export function MainWindow({
             documentTabSnapshotsRef.current.clear();
             nonPristineTabsRef.current.clear();
           }
-          for (const { id, session, resolved, opened, history, reports } of restored) {
+          for (const { id, session, history, reports } of restored) {
             if (session.pristine !== true || session.path || session.dirty || !session.blank) nonPristineTabsRef.current.add(id);
             const savePathNotice = restoredSavePathNotice(session);
             documentTabSnapshotsRef.current.set(id, {
               history, file: restoredDocumentFileState(session),
               viewport: session.view?.viewport ?? createViewportState(),
               scrollLeft: session.view?.scrollLeft ?? 0, scrollTop: session.view?.scrollTop ?? 0, parts: [],
-              warnings: reports.warnings ?? (reports.saveWarnings ? undefined : {
-                displayName: session.displayName, sourceLabel: openSourceLabel(resolved.source, resolved.statusSourceLabel),
-                warnings: opened.warnings
-              }),
+              warnings: reports.warnings,
               saveWarnings: reports.saveWarnings,
               status: `${shellOpenFailure ? `${shellOpenFailure} — ` : ""}Restored last session — ${session.displayName}${session.dirty ? " (unsaved changes)" : ""}${restoreNotice}${savePathNotice ? `. ${savePathNotice}` : ""}`
             });
