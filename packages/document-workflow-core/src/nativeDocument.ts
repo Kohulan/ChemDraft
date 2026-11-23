@@ -1,4 +1,4 @@
-import { hydrogenAtomIgnoresStatedCount, type ChemDraftDocument, type MoleculeAtom } from "@chemdraft/chem-core";
+import { hydrogenAtomIgnoresStatedCount, type ChemDraftDocument } from "@chemdraft/chem-core";
 import { hydrogenCountNotCountedText, withNativeDocumentLabelBondSides } from "./atoms";
 
 /** An open warning, shaped like the CDXML importer's (`sourceObjectId` and `atomIds` let Show select it). */
@@ -22,42 +22,50 @@ export const NativeHydrogenCountNotCountedCode = "document.atom_hydrogen_count_n
  * One warning per molecule holding an H, D or T atom that stores a hydrogen count other than 0. The
  * document opens with the count as stored (it round-trips unchanged); the atom validator flags the
  * atom, and this names it in the open report, as the CDXML importer names a count it did not keep.
+ * `source` heads the message; `objectIds`, when given, limits the report to those molecules.
  */
-export function nativeHydrogenCountNotCountedWarnings(document: ChemDraftDocument): NativeDocumentOpenWarning[] {
-  return document.pages.flatMap((page) => page.objects.flatMap((object) =>
-    object.type === "molecule" ? moleculeHydrogenCountNotCountedWarnings(object.id, object.atoms, "ChemDraft document") : []));
+export function nativeHydrogenCountNotCountedWarnings(
+  document: ChemDraftDocument, source = "ChemDraft document", objectIds?: ReadonlySet<string>
+): NativeDocumentOpenWarning[] {
+  return document.pages.flatMap((page) => page.objects.flatMap((object) => {
+    if (object.type !== "molecule" || (objectIds && !objectIds.has(object.id))) return [];
+    const notCounted = object.atoms.filter(hydrogenAtomIgnoresStatedCount);
+    return notCounted.length ? [{ code: NativeHydrogenCountNotCountedCode, message: `${source}: ${hydrogenCountNotCountedText(notCounted)}`,
+      sourceObjectId: object.id, atomIds: notCounted.map((atom) => atom.id) }] : [];
+  }));
 }
 
 /**
- * The same warning for a plugin proposal the user reviews (`proposePatch`): one per molecule the
- * proposed patch adds or updates whose atoms include an H, D or T atom stating a count other than
- * 0. Accepting stays allowed (proposals are exempt from the plugin-boundary refusal), so the review
- * and the accept say what the document will hold. `source` heads the message ("Proposed change",
- * "Accepted change"). The patch is read defensively: a queued proposal's patch is only validated
- * when it is applied, and anything that is not a molecule's atom list is skipped.
+ * The same warning for a plugin proposal the user reviews (`proposePatch`). Accepting stays allowed
+ * (proposals are exempt from the plugin-boundary refusal), so the review and the accept say what
+ * the document will hold. That is read from `after`, the document the proposal produces from
+ * `before` through the accept path's own patch pipeline (a dry run at review, the committed
+ * document at accept), never from the raw patch: applying an update clears a count whose atom,
+ * element, charge or incident bonds changed (`clearChangedAtomHydrogenHints`), and a count that is
+ * gone must not be reported as kept. `after` is undefined when the dry run failed; the accept then
+ * reports that failure itself, so there is no warning here.
+ *
+ * Only molecules the proposal writes atoms into are reported: an object `after` holds that `before`
+ * did not (an insertion, under whatever id it was given), and an existing molecule an `updateObject`
+ * in `patch` (batch included, read defensively) writes an atom list to. A count already stored
+ * elsewhere in the document is the open report's, not the proposal's. `source` heads the message
+ * ("Proposed change", "Accepted change").
  */
-export function proposedHydrogenCountNotCountedWarnings(patch: unknown, source = "Proposed change"): NativeDocumentOpenWarning[] {
-  return proposedMoleculeAtoms(patch).flatMap(({ id, atoms }) => moleculeHydrogenCountNotCountedWarnings(id, atoms, source));
-}
-
-function moleculeHydrogenCountNotCountedWarnings(
-  moleculeId: string, atoms: readonly MoleculeAtom[], source: string
+export function proposedHydrogenCountNotCountedWarnings(
+  before: ChemDraftDocument, after: ChemDraftDocument | undefined, patch: unknown, source = "Proposed change"
 ): NativeDocumentOpenWarning[] {
-  const notCounted = atoms.filter(hydrogenAtomIgnoresStatedCount);
-  return notCounted.length ? [{ code: NativeHydrogenCountNotCountedCode, message: `${source}: ${hydrogenCountNotCountedText(notCounted)}`,
-    sourceObjectId: moleculeId, atomIds: notCounted.map((atom) => atom.id) }] : [];
+  if (!after) return [];
+  const existing = new Set(before.pages.flatMap((page) => page.objects.map((object) => object.id)));
+  const written = new Set(after.pages.flatMap((page) => page.objects.flatMap((object) => existing.has(object.id) ? [] : [object.id])));
+  for (const id of atomWritingUpdateTargets(patch)) written.add(id);
+  return written.size ? nativeHydrogenCountNotCountedWarnings(after, source, written) : [];
 }
 
-function proposedMoleculeAtoms(patch: unknown): { id: string; atoms: MoleculeAtom[] }[] {
+function atomWritingUpdateTargets(patch: unknown): string[] {
   if (!isRecord(patch)) return [];
-  if (patch.op === "batch") return Array.isArray(patch.patches) ? patch.patches.flatMap(proposedMoleculeAtoms) : [];
-  const [id, written] = patch.op === "addObject" && isRecord(patch.object) && patch.object.type === "molecule"
-    ? [patch.object.id, patch.object.atoms]
-    : patch.op === "updateObject" && isRecord(patch.changes) ? [patch.objectId, patch.changes.atoms] : [undefined, undefined];
-  if (typeof id !== "string" || !Array.isArray(written)) return [];
-  const atoms = written.filter((atom): atom is MoleculeAtom =>
-    isRecord(atom) && typeof atom.id === "string" && typeof atom.element === "string");
-  return atoms.length ? [{ id, atoms }] : [];
+  if (patch.op === "batch") return Array.isArray(patch.patches) ? patch.patches.flatMap(atomWritingUpdateTargets) : [];
+  return patch.op === "updateObject" && typeof patch.objectId === "string" && isRecord(patch.changes) &&
+    Array.isArray(patch.changes.atoms) ? [patch.objectId] : [];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

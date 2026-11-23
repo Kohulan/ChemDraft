@@ -15,7 +15,8 @@ import {
   type NormalizedProposedDocumentPatch
 } from "@chemdraft/plugin-api";
 import { assertPluginDocumentWriteScope, bareIdTargetPage, objectInWriteScope, rebasePluginPatch,
-  retainedCtabCompatibility, storedCtabReference, writePatchOps, type PageObjectRef, type PluginWriteScopePages } from "@chemdraft/plugin-host";
+  retainedCtabCompatibility, storedCtabReference, writePatchOps, type PageObjectRef, type PluginHost,
+  type PluginWriteScopePages } from "@chemdraft/plugin-host";
 import { selectionBounds, translateInsertedDocumentObjects } from "../documentWorkflow";
 import { choosePlacement, objectRect, overlaps as boundsOverlap, pageContentRect, RELATIVE_GAP, unionRects } from "../assistant/placement";
 import type { ViewportRect } from "@chemdraft/viewport-engine";
@@ -517,6 +518,20 @@ export function applyAcceptedPluginProposal(
 ): AppliedPluginDocumentPatch {
   return applyPluginDocumentPatch(document, rebaseProposedInsertion(document, proposed), {
     preserveRepeatUnitBrackets: false, deferGroupCleanup: false, ...options
+  });
+}
+
+/**
+ * The document a pending proposal produces when the user accepts it into `document`: the host's own
+ * accept application (`previewProposedPatch`, with its orphaned-bracket allowance) through
+ * `applyAcceptedPluginProposal`, exactly as the accept begins. Nothing is committed and `document`
+ * is not changed, so the review can dry-run it; it throws where the accept would.
+ */
+export function previewAcceptedPluginProposal(
+  host: Pick<PluginHost, "previewProposedPatch">, proposalId: string, document: ChemDraftDocument
+): ChemDraftDocument {
+  return host.previewProposedPatch(proposalId, document, {
+    apply: (current, proposed, options) => applyAcceptedPluginProposal(current, proposed, options).document
   });
 }
 

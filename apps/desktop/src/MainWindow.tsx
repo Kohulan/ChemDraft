@@ -230,7 +230,7 @@ import {
 } from "./documentSession";
 import { createPersistentPluginStorage } from "./plugins/pluginStorage";
 import {
-  applyAcceptedPluginProposal,
+  previewAcceptedPluginProposal,
   applyPluginDocumentPatch,
   refreshPluginPatchChemistry,
   placeInsertedObjectsInFreeSpace,
@@ -13787,9 +13787,8 @@ export function MainWindow({
         }
         const before = documentRef.current;
         const documentIdentity = documentIdentityRef.current;
-        let prepared = host.previewProposedPatch(proposal.id, before, {
-          apply: (document, proposed, options) => applyAcceptedPluginProposal(document, proposed, options).document
-        });
+        // The same application the review dry-runs for its warnings (`proposalReviewItem`).
+        let prepared = previewAcceptedPluginProposal(host, proposal.id, before);
         if (recognized) {
           const visible = assistantHistoryPort.getViewportRect?.(tab.id);
           const pageRect = pageRef.current?.getBoundingClientRect();
@@ -13823,7 +13822,8 @@ export function MainWindow({
           try { await pending; } finally { pageFitPendingRef.current -= 1; }
         }
         setSelectedNativeMoleculePart(undefined);
-        const message = acceptedProposalMessage(pluginName, proposal, { recognized, screenCapture: Boolean(screenCapture) });
+        const message = acceptedProposalMessage(pluginName, proposal,
+          { recognized, screenCapture: Boolean(screenCapture), before, committed: prepared });
         setStatus(message);
         return { ok: true, message };
       } catch (error) {
@@ -13886,6 +13886,13 @@ export function MainWindow({
     if (!tab) return `${owner.title} (closed)`;
     return documentTabs.length < 2 ? undefined : tab.title;
   }, [documentTabs, pluginRuntime.runtime]);
+  // The document a proposal would be accepted into (its own tab's), for the review's dry run.
+  const proposalSourceDocument = useCallback((proposal: QueuedProposedPatch): ChemDraftDocument | undefined => {
+    const owner = pluginRuntime.runtime.proposalDocumentTab(proposal.id);
+    if (!owner) return undefined;
+    return owner.id === activeDocumentTabIdRef.current
+      ? documentRef.current : documentTabSnapshotsRef.current.get(owner.id)?.history.present;
+  }, [pluginRuntime.runtime]);
   const publishProposalReview = useCallback(
     async (open: boolean, focus: boolean): Promise<boolean> => {
       const pending = pluginRuntime.runtime.host.listProposedPatches("pending");
@@ -13895,12 +13902,12 @@ export function MainWindow({
         {
           kind: "patchReview",
           proposals: await Promise.all(pending.map((proposal) =>
-            proposalReviewItem(pluginRuntime.runtime.host, proposal, proposalDocumentName(proposal))))
+            proposalReviewItem(pluginRuntime.runtime.host, proposal, proposalDocumentName(proposal), proposalSourceDocument(proposal))))
         },
         { open, focus, width: 420, height: 420 }
       );
     },
-    [pluginRuntime.runtime, proposalDocumentName, publishAnalysisWindow]
+    [pluginRuntime.runtime, proposalDocumentName, proposalSourceDocument, publishAnalysisWindow]
   );
   /** Open the review window, and only once the native open has succeeded mark it open: on a
    *  failure the badge must stay, or the pending proposals have no way back on desktop. */
@@ -24077,6 +24084,7 @@ export function MainWindow({
             host={pluginRuntime.runtime.host}
             queueVersion={patchQueueVersion}
             getDocumentName={proposalDocumentName}
+            getSourceDocument={proposalSourceDocument}
             onAccept={acceptPluginProposal}
             onReject={rejectPluginProposal}
           />
