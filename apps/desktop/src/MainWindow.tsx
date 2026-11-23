@@ -10385,6 +10385,26 @@ export function MainWindow({
         }
         return;
       }
+      // Undo took the sample out and nothing was drawn since: the tab is still the original blank
+      // entry, so put the sample back there rather than opening another Tour tab. A tab with any
+      // other history holds the user's edits and is never reset.
+      const history = practice.tabId === activeDocumentTabIdRef.current
+        ? documentHistoryRef.current : documentTabSnapshotsRef.current.get(practice.tabId)?.history;
+      if (history && documentTabsRef.current.some(tab => tab.id === practice.tabId)
+        && history.past.length === 0 && history.present.pages.every(page => page.objects.length === 0)) {
+        const restored = buildTourSample(history.present);
+        activateDocumentTab(practice.tabId);
+        if (activeDocumentTabIdRef.current !== practice.tabId) throw new Error("Could not switch to the tour drawing.");
+        const present = prepareDocumentCommit(restored.document, restored.label);
+        installDocumentHistory({ past: [documentRef.current], present, future: [] });
+        savedDocumentsRef.current.set(practice.tabId, present);
+        // Undo marked the tab dirty; with the sample back it matches its baseline again.
+        fileStateRef.current = { ...fileStateRef.current, dirty: false };
+        setFileState(fileStateRef.current);
+        tourSampleRef.current = { tabId: practice.tabId, moleculeId: present.selection.objectIds[0] };
+        setStatus("Tour drawing opened");
+        return;
+      }
     }
     const blank = createPhase4Document("Tour");
     const sample = buildTourSample(blank);
@@ -11031,7 +11051,12 @@ export function MainWindow({
     };
 
     return listenAndDrainNativeOpenQueue({
-      subscribe: listenForNativeOpenDocuments,
+      // A refused subscription never reaches a drain, so nothing else would clear the startup gate
+      // that holds the first-run tour back; release it and let onError report the failure.
+      subscribe: changed => listenForNativeOpenDocuments(changed).catch(error => {
+        nativeOpenDrainBusyRef.current = false;
+        throw error;
+      }),
       drain: takePendingNativeOpenDocuments,
       consumeBatch: openNativePayloads,
       onDrainActivity: busy => { nativeOpenDrainBusyRef.current = busy; },
