@@ -1,8 +1,8 @@
 import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import { createEmptyDocument } from "@chemdraft/chem-core";
 import { createQuickActions, numericAtomDrawingHotkeys, KEYBOARD_PREFERENCES_COMMAND_ID, PREFERENCES_COMMAND_ID, viewActions } from "../commands";
-import { chemDrawHoveredTargetHotkeyCommand } from "../keybindingScheme";
-import { KEYBINDING_SCHEME_LABELS, type KeybindingScheme } from "../keybindingSettings";
+import { chemDrawHoveredTargetHotkeyCommand, createHoverShortcutTables } from "../keybindingScheme";
+import { KEYBINDING_SCHEME_LABELS, type KeybindingScheme, type KeybindingSettings } from "../keybindingSettings";
 import { createMainWindowShortcutCommands, detectDesktopShortcutPlatform } from "../keyboardShortcuts";
 import { PLUGINS_MENU_LABELS, preferencesMenuPlacement } from "../appMenu";
 import { formatShortcutLabel, getToolsetCommandSpecs } from "../toolsets";
@@ -38,6 +38,29 @@ export function tourShortcutChoices(platform: ShortcutPlatform = detectDesktopSh
   });
 }
 
+const SINGLE_BOND_HOVER_COMMAND = "atom.addSingleBondToHoveredAtom";
+
+function defaultTourBondKey(scheme: KeybindingScheme): string | undefined {
+  return Object.keys(numericAtomDrawingHotkeys).find(key => (
+    scheme === "chemdraw" ? chemDrawHoveredTargetHotkeyCommand("atom", key) : numericAtomDrawingHotkeys[key]
+  ) === SINGLE_BOND_HOVER_COMMAND);
+}
+
+/** Per scheme, the hover key the canvas uses for Add Single Bond to Hovered Atom, or null when the
+ *  user cleared it in Preferences > Keyboard. Every scheme is listed, so choosing another scheme in
+ *  the tour shows that scheme's key. */
+export type TourBondKeys = Partial<Record<KeybindingScheme, string | null>>;
+
+export function tourBondKeys(overrides?: KeybindingSettings["overrides"]): TourBondKeys {
+  return Object.fromEntries((Object.keys(KEYBINDING_SCHEME_LABELS) as KeybindingScheme[]).map(scheme => {
+    // The same table the canvas reads (createHoverShortcutTables), so the tour never names a dead key.
+    const keys = [...createHoverShortcutTables(scheme, overrides?.[scheme]).atom]
+      .filter(([, id]) => id === SINGLE_BOND_HOVER_COMMAND).map(([key]) => key);
+    const preferred = defaultTourBondKey(scheme);
+    return [scheme, preferred && keys.includes(preferred) ? preferred : keys[0] ?? null] as const;
+  }));
+}
+
 interface TourStep {
   title: string;
   text: string;
@@ -61,11 +84,11 @@ interface TourStep {
 export function tourSteps(
   scheme: KeybindingScheme,
   platform: ShortcutPlatform = detectDesktopShortcutPlatform(),
-  plugins: readonly TourPluginCommand[] = []
+  plugins: readonly TourPluginCommand[] = [],
+  /** The effective hover key (`tourBondKeys`): null names no key; undefined uses the scheme default. */
+  singleBondKey?: string | null
 ): readonly TourStep[] {
-  const bondKey = Object.keys(numericAtomDrawingHotkeys).find(key => (
-    scheme === "chemdraw" ? chemDrawHoveredTargetHotkeyCommand("atom", key) : numericAtomDrawingHotkeys[key]
-  ) === "atom.addSingleBondToHoveredAtom");
+  const bondKey = singleBondKey === undefined ? defaultTourBondKey(scheme) : singleBondKey;
   const preferencesShortcut = formatShortcutLabel(viewActions.find(command => command.id === PREFERENCES_COMMAND_ID)?.shortcut, platform);
   const preferences = preferencesMenuPlacement(platform);
   const menu = PLUGINS_MENU_LABELS;
@@ -82,7 +105,7 @@ export function tourSteps(
     },
     {
       title: "Draw a structure",
-      text: `Click and drag with the bond tool, or pick a ring from Ring Templates on the toolbar. Hover over an atom and type a label or press ${bondKey} to add a single bond.`,
+      text: `Click and drag with the bond tool, or pick a ring from Ring Templates on the toolbar. Hover over an atom and type a label${bondKey ? ` or press ${bondKey} to add a single bond` : ""}.`,
       tryCommand: TOUR_SAMPLE_COMMAND
     },
     {

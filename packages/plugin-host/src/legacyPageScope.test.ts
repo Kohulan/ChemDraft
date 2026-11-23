@@ -154,6 +154,18 @@ describe("legacy page binding follows the Send-time selection", () => {
     expect(f.document().pages[0]!.objects[0]).toEqual(original.pages[0]!.objects[0]);
   });
 
+  it("keeps an explicit override's page pin when its object is gone from that page, and refuses the write", async () => {
+    // Send selected page A's "X"; since then only page B has an "X". No cross-page following (1.2.2).
+    const base = twoPageDocument();
+    const original = { ...base, pages: [{ ...base.pages[0]!, objects: [] }, { ...base.pages[1]!, objects: [molecule("X", 0)] }],
+      selection: { pageId: "page-b", objectIds: ["X"] } };
+    const f = legacyHost(original);
+    await expect(f.host.invokeCommand("plugin.pages.run", { writeSelection: { objectIds: ["X"], molecules: [], pageId: "page-a" } }))
+      .rejects.toThrow("Plugin write refused: the change was not applied. The object you selected on page 1 is no longer there; reselect it and try again.");
+    expect(f.applyDocumentPatch).not.toHaveBeenCalled();
+    expect(f.document().pages[1]!.objects[0]).toEqual(original.pages[1]!.objects[0]);
+  });
+
   it("leaves an override id out of write scope when it names objects on several pages and no page was given", async () => {
     const original = { ...twoPageDocument(), selection: { pageId: "page-a", objectIds: ["X"] } };
     const f = legacyHost(original);

@@ -1,5 +1,6 @@
 import { aboutCommand } from "../about/aboutCommand";
 import { TOUR_TITLE, type TourAction, type TourPluginCommand } from "../tour/tourCommands";
+import type { TourBondKeys } from "../tour/tourSteps";
 import type { KeybindingScheme } from "../keybindingSettings";
 import { VIBE_CODE_GUIDE } from "./vibeCodeGuideText";
 import type { ConditionsSnapshot } from "./dialogProtocol";
@@ -143,8 +144,8 @@ export class DialogCoordinator {
   }
 
   /** `plugins` is the tour's plugin commands the menus offer now; the tour window has no plugin runtime of its own. */
-  async openGuidedTour(scheme: KeybindingScheme, automatic: boolean, plugins: readonly TourPluginCommand[] = []): Promise<void> {
-    return this.open("guidedTour", "guidedTour", { title: TOUR_TITLE, scheme, automatic, plugins: [...plugins] });
+  async openGuidedTour(scheme: KeybindingScheme, automatic: boolean, plugins: readonly TourPluginCommand[] = [], bondKeys?: TourBondKeys): Promise<void> {
+    return this.open("guidedTour", "guidedTour", { title: TOUR_TITLE, scheme, automatic, plugins: [...plugins], ...(bondKeys ? { bondKeys: { ...bondKeys } } : {}) });
   }
 
   async openVibeCodeGuide(): Promise<void> { return this.open("vibeCodeGuide", "vibeCodeGuide", { title: VIBE_CODE_GUIDE.title }); }
