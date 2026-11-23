@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ChemDraftDocument } from "@chemdraft/chem-core";
 import { proposedHydrogenCountNotCountedWarnings } from "@chemdraft/document-workflow-core";
 import type { PluginHost, QueuedProposedPatch } from "@chemdraft/plugin-host";
@@ -39,13 +39,24 @@ export function PatchReviewTray({
   );
 
   const [items, setItems] = useState<PluginProposalReviewItem[]>([]);
+  // Review items are memoized per proposal on its source document's identity. The check runs after
+  // every render (the owner re-renders when a document changes), but only a proposal whose document,
+  // name, or queue entry changed is rebuilt; an unrelated render rebuilds nothing.
+  const cache = useMemo(() => new ProposalReviewItemCache(), []);
+  const request = useRef(0);
+  const mounted = useRef(false);
   useEffect(() => {
-    let cancelled = false;
-    void Promise.all(pending.map(proposal =>
-      proposalReviewItem(host, proposal, getDocumentName?.(proposal), getSourceDocument?.(proposal))))
-      .then(items => { if (!cancelled) setItems(items); });
-    return () => { cancelled = true; };
-  }, [pending, host, getDocumentName, getSourceDocument]);
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+  useEffect(() => {
+    const inputs = (proposal: QueuedProposedPatch) =>
+      ({ documentName: getDocumentName?.(proposal), sourceDocument: getSourceDocument?.(proposal) });
+    if (!cache.isStale(host, pending, inputs)) return;
+    // Only the latest build lands: an earlier one still rendering a preview must not overwrite it.
+    const current = ++request.current;
+    void cache.items(host, pending, inputs).then(items => { if (mounted.current && current === request.current) setItems(items); });
+  });
 
   if (pending.length === 0) {
     return null;
@@ -198,9 +209,19 @@ export function PatchReviewList({
  * `proposalHydrogenCountWarnings`), and without one there is nothing to dry-run, so no such warning.
  */
 export async function proposalReviewItem(
-  host: Pick<PluginHost, "getPlugin" | "previewProposedPatch">, proposal: QueuedProposedPatch, documentName?: string,
+  host: ProposalReviewHost, proposal: QueuedProposedPatch, documentName?: string,
   sourceDocument?: ChemDraftDocument
 ): Promise<PluginProposalReviewItem> {
+  return reviewItem(await proposalReviewBase(host, proposal), documentName,
+    proposalHydrogenCountWarnings(host, proposal, sourceDocument));
+}
+
+type ProposalReviewHost = Pick<PluginHost, "getPlugin" | "previewProposedPatch">;
+type ReviewWarning = { code: string; message: string };
+/** The parts of a review item that depend on the proposal alone, not on the document it targets. */
+type ProposalReviewBase = Omit<PluginProposalReviewItem, "documentName">;
+
+async function proposalReviewBase(host: ProposalReviewHost, proposal: QueuedProposedPatch): Promise<ProposalReviewBase> {
   // The plugin host already attached its own record of a recognition (tier, image, warnings) on queueing.
   const { recognition, warnings } = reviewedRecognition(proposal.proposal.recognition, proposal.proposal.warnings);
   return {
@@ -208,13 +229,97 @@ export async function proposalReviewItem(
     pluginId: proposal.pluginId,
     pluginName: host.getPlugin(proposal.pluginId)?.manifest.name ?? proposal.pluginId,
     reason: proposal.proposal.reason,
-    documentName,
-    // An H, D or T atom stating a count it cannot carry is accepted as written (proposals are exempt
-    // from the plugin-boundary refusal) and flagged once committed; the review says so beforehand.
-    warnings: [...warnings, ...proposalHydrogenCountWarnings(host, proposal, sourceDocument)],
+    warnings,
     recognition,
     structurePreview: await recognitionStructurePreview(proposal.proposal)
   };
+}
+
+function reviewItem(base: ProposalReviewBase, documentName: string | undefined, hydrogen: readonly ReviewWarning[]): PluginProposalReviewItem {
+  return {
+    ...base,
+    documentName,
+    // An H, D or T atom stating a count it cannot carry is accepted as written (proposals are exempt
+    // from the plugin-boundary refusal) and flagged once committed; the review says so beforehand.
+    warnings: [...base.warnings, ...hydrogen]
+  };
+}
+
+/** What a pending proposal's review item is built against: its tab's name and document. */
+export type ProposalReviewInputs = { documentName?: string; sourceDocument?: ChemDraftDocument };
+
+type CachedReviewItem = {
+  base: Promise<ProposalReviewBase>;
+  documentName: string | undefined;
+  sourceDocument: ChemDraftDocument | undefined;
+  hydrogen: readonly ReviewWarning[];
+};
+
+/**
+ * Review items for the pending proposals, memoized so that the review follows edits to the document
+ * a proposal would be accepted into without redoing work on renders that changed nothing. A
+ * proposal's recognition preview is built once; its hydrogen-count dry run is redone only when its
+ * source document is a different object (documents are immutable, so identity is the version) and
+ * otherwise reused. The browser tray and the desktop Plugin Proposals window each hold one.
+ */
+export class ProposalReviewItemCache {
+  private host: ProposalReviewHost | undefined;
+  private entries = new Map<string, CachedReviewItem>();
+  private lastPending: readonly QueuedProposedPatch[] = [];
+
+  /** Forgets every item, for when the queue empties. */
+  clear(): void {
+    this.entries.clear();
+    this.lastPending = [];
+  }
+
+  /** The pending proposals the last `items` call built items for. */
+  get pending(): readonly QueuedProposedPatch[] {
+    return this.lastPending;
+  }
+
+  /**
+   * Whether `items` would rebuild anything: a different host, a proposal added or gone, or a
+   * proposal whose document name or source document (by identity) differs from its last build.
+   * Cheap: no dry run, no copy of the queue.
+   */
+  isStale(host: ProposalReviewHost, pending: readonly QueuedProposedPatch[], inputs: (proposal: QueuedProposedPatch) => ProposalReviewInputs): boolean {
+    if (host !== this.host || pending.length !== this.entries.size) return true;
+    return pending.some((proposal) => {
+      const entry = this.entries.get(proposal.id);
+      if (!entry) return true;
+      const { documentName, sourceDocument } = inputs(proposal);
+      return entry.documentName !== documentName || entry.sourceDocument !== sourceDocument;
+    });
+  }
+
+  /**
+   * The review items for `pending`, in order. Records what each was built against before returning,
+   * so `isStale` with the same inputs is false straight away even while previews are still rendering.
+   */
+  items(host: ProposalReviewHost, pending: readonly QueuedProposedPatch[], inputs: (proposal: QueuedProposedPatch) => ProposalReviewInputs): Promise<PluginProposalReviewItem[]> {
+    if (host !== this.host) {
+      this.host = host;
+      this.entries.clear();
+    }
+    const entries = new Map<string, CachedReviewItem>();
+    const items = pending.map((proposal) => {
+      const { documentName, sourceDocument } = inputs(proposal);
+      const prior = this.entries.get(proposal.id);
+      const entry: CachedReviewItem = {
+        base: prior?.base ?? proposalReviewBase(host, proposal),
+        documentName,
+        sourceDocument,
+        hydrogen: prior && prior.sourceDocument === sourceDocument
+          ? prior.hydrogen : proposalHydrogenCountWarnings(host, proposal, sourceDocument)
+      };
+      entries.set(proposal.id, entry);
+      return entry.base.then((base) => reviewItem(base, documentName, entry.hydrogen));
+    });
+    this.entries = entries;
+    this.lastPending = pending;
+    return Promise.all(items);
+  }
 }
 
 /**
@@ -224,7 +329,7 @@ export async function proposalReviewItem(
  */
 function proposalHydrogenCountWarnings(
   host: Pick<PluginHost, "previewProposedPatch">, proposal: QueuedProposedPatch, sourceDocument: ChemDraftDocument | undefined
-): { code: string; message: string }[] {
+): ReviewWarning[] {
   if (!sourceDocument) return [];
   let produced: ChemDraftDocument;
   try {

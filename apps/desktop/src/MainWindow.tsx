@@ -239,7 +239,7 @@ import {
   type PluginWriteGate
 } from "./plugins/applyPluginDocumentPatch";
 import { AnalyzerNoticeBanner, type AnalyzerNotice } from "./plugins/AnalyzerNotice";
-import { acceptedProposalMessage, PatchReviewTray, PendingProposalsBadge, proposalReviewItem } from "./plugins/PatchReviewTray";
+import { acceptedProposalMessage, PatchReviewTray, PendingProposalsBadge, ProposalReviewItemCache } from "./plugins/PatchReviewTray";
 import type { DesktopPluginRuntime } from "./plugins/createPluginRuntime";
 import {
   ANALYSIS_WINDOW_OWNER_ID,
@@ -13813,8 +13813,10 @@ export function MainWindow({
           }
         }
         // Keep the proposal pending until the page question and stale-document check succeed.
+        let committed = prepared;
         const pending = commitWithPageFit(before, prepared, document => {
           const updated = host.acceptProposedPatch(proposal.id, documentRef.current, { apply: () => document });
+          committed = updated;
           commitDocumentChange(updated, `${pluginName}: ${recognized ? "Insert Recognized Structure" : "Apply Proposal"}`, false, undefined, PLUGIN_WRITE);
         }, { consent: new PageEnlargementConsent(shortcutPlatform), isCurrent });
         if (pending) {
@@ -13823,7 +13825,7 @@ export function MainWindow({
         }
         setSelectedNativeMoleculePart(undefined);
         const message = acceptedProposalMessage(pluginName, proposal,
-          { recognized, screenCapture: Boolean(screenCapture), before, committed: prepared });
+          { recognized, screenCapture: Boolean(screenCapture), before, committed });
         setStatus(message);
         return { ok: true, message };
       } catch (error) {
@@ -13893,21 +13895,28 @@ export function MainWindow({
     return owner.id === activeDocumentTabIdRef.current
       ? documentRef.current : documentTabSnapshotsRef.current.get(owner.id)?.history.present;
   }, [pluginRuntime.runtime]);
+  const proposalReviewInputs = useCallback((proposal: QueuedProposedPatch) => ({
+    documentName: proposalDocumentName(proposal), sourceDocument: proposalSourceDocument(proposal)
+  }), [proposalDocumentName, proposalSourceDocument]);
+  // The window's review items, memoized per proposal on the document it would be accepted into, so an
+  // edit to that document re-runs only its proposals' dry runs (see the effect after the queue's).
+  const [proposalReviewCache] = useState(() => new ProposalReviewItemCache());
   const publishProposalReview = useCallback(
-    async (open: boolean, focus: boolean): Promise<boolean> => {
-      const pending = pluginRuntime.runtime.host.listProposedPatches("pending");
+    async (
+      open: boolean, focus: boolean,
+      pending: readonly QueuedProposedPatch[] = pluginRuntime.runtime.host.listProposedPatches("pending")
+    ): Promise<boolean> => {
       return publishAnalysisWindow(
         PATCH_REVIEW_WINDOW_ID,
         "Plugin Proposals",
         {
           kind: "patchReview",
-          proposals: await Promise.all(pending.map((proposal) =>
-            proposalReviewItem(pluginRuntime.runtime.host, proposal, proposalDocumentName(proposal), proposalSourceDocument(proposal))))
+          proposals: await proposalReviewCache.items(pluginRuntime.runtime.host, pending, proposalReviewInputs)
         },
         { open, focus, width: 420, height: 420 }
       );
     },
-    [pluginRuntime.runtime, proposalDocumentName, proposalSourceDocument, publishAnalysisWindow]
+    [pluginRuntime.runtime, proposalReviewCache, proposalReviewInputs, publishAnalysisWindow]
   );
   /** Open the review window, and only once the native open has succeeded mark it open: on a
    *  failure the badge must stay, or the pending proposals have no way back on desktop. */
@@ -13933,6 +13942,7 @@ export function MainWindow({
         pluginPanelIdentityKey(ANALYSIS_WINDOW_OWNER_ID, PATCH_REVIEW_WINDOW_ID)
       );
       void hidePluginPanelWindow(ANALYSIS_WINDOW_OWNER_ID, PATCH_REVIEW_WINDOW_ID).catch(() => undefined);
+      proposalReviewCache.clear();
       setProposalReview({ pending: 0, windowOpen: false });
       return;
     }
@@ -13944,7 +13954,19 @@ export function MainWindow({
     } else {
       void publishProposalReview(false, false);
     }
-  }, [patchQueueVersion, pluginRuntime.runtime, publishProposalReview, showProposalReview]);
+  }, [patchQueueVersion, pluginRuntime.runtime, proposalReviewCache, publishProposalReview, showProposalReview]);
+  // The window follows edits to the documents its proposals would be accepted into: a proposal's
+  // hydrogen-count warning is a dry run on that document, so an edit can add or remove it. Only a
+  // changed document (by identity) or tab name republishes, and only its proposals are re-run; the
+  // queue itself is not re-read. Declared after the queue effect above, which runs first in a render
+  // that changed both (an accept bumps the queue and commits its document in one batch), so the
+  // proposals checked here are the ones still pending.
+  useEffect(() => {
+    if (!isDesktopRuntime()) return;
+    const pending = proposalReviewCache.pending;
+    if (pending.length === 0 || !proposalReviewCache.isStale(pluginRuntime.runtime.host, pending, proposalReviewInputs)) return;
+    void publishProposalReview(false, false, pending);
+  }, [document, documentTabs, pluginRuntime.runtime, proposalReviewCache, proposalReviewInputs, publishProposalReview]);
 
   // The action listener is registered ONCE. Its handlers close over live state and are redefined
   // on every document change, so they are read through this ref: re-registering per render meant

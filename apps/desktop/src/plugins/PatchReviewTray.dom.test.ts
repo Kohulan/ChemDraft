@@ -8,7 +8,7 @@ import { applyPatch, createEmptyDocument, DocumentObjectSchema, type ChemDraftDo
 import type { AcceptProposedPatchOptions, PluginHost, QueuedProposedPatch } from "@chemdraft/plugin-host";
 import { previewAcceptedPluginProposal } from "./applyPluginDocumentPatch";
 import type { PluginProposalReviewItem } from "./panelBridge";
-import { acceptedProposalMessage, PatchReviewList, proposalReviewItem } from "./PatchReviewTray";
+import { acceptedProposalMessage, PatchReviewList, PatchReviewTray, ProposalReviewItemCache, proposalReviewItem } from "./PatchReviewTray";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -211,6 +211,103 @@ describe("A proposal stating a hydrogen count an H atom cannot carry", () => {
       unmount();
       expect(accept(proposal)).toEqual({ message: "Test Plugin: applied proposal", committedCount: count });
     }
+  });
+
+  // The document after an edit to m: its H moved from the C onto a new O (bonds c-o and o-h).
+  const rebonded = applyPatch(blank, { op: "addObject", pageId: blank.pages[0]!.id, object: DocumentObjectSchema.parse(molecule(
+    [carbon, hydrogen, { id: "o", element: "O", x: 10, y: 10 }],
+    [{ id: "co", fromAtomId: "c", toAtomId: "o", order: "single" }, { id: "oh", fromAtomId: "o", toAtomId: "h", order: "single" }])) });
+  const warned = [{ code: "document.atom_hydrogen_count_not_counted", message: `Proposed change: ${warningText}` }];
+
+  describe("when the document is edited between review and accept", () => {
+    it("drops the warning once the edit means accepting clears the count, and the accept agrees", async () => {
+      const { proposal } = statedOnly(false);
+      const host = hostFor(proposal);
+      const cache = new ProposalReviewItemCache();
+      let source = withMolecule;
+      const inputs = () => ({ sourceDocument: source });
+      expect((await cache.items(host, [proposal], inputs))[0]!.warnings).toEqual(warned);
+      // The H is rebonded in the document: the proposal's bonds now differ from the H's, so applying it clears the count.
+      source = rebonded;
+      expect(cache.isStale(host, [proposal], inputs)).toBe(true);
+      expect((await cache.items(host, [proposal], inputs))[0]!.warnings).toEqual([]);
+      expect(accept({ source, proposal })).toEqual({ message: "Test Plugin: applied proposal", committedCount: undefined });
+    });
+
+    it("shows the warning once the edit means accepting keeps the count, and the accept agrees", async () => {
+      const { proposal } = statedAndRebonded();
+      const host = hostFor(proposal);
+      const cache = new ProposalReviewItemCache();
+      let source = withMolecule;
+      const inputs = () => ({ sourceDocument: source });
+      expect((await cache.items(host, [proposal], inputs))[0]!.warnings).toEqual([]);
+      // The document already holds the proposal's bonds: applying it now only states the count, which is kept.
+      source = rebonded;
+      expect(cache.isStale(host, [proposal], inputs)).toBe(true);
+      expect((await cache.items(host, [proposal], inputs))[0]!.warnings).toEqual(warned);
+      expect(accept({ source, proposal }))
+        .toEqual({ message: `Test Plugin: applied proposal. Accepted change: ${warningText}`, committedCount: 1 });
+    });
+
+    it("reads the accept message from the document the accept commits, not the one reviewed", () => {
+      // Reviewed against withMolecule (it would warn), accepted into rebonded: no warning, no count.
+      expect(accept({ source: rebonded, proposal: statedOnly(false).proposal }))
+        .toEqual({ message: "Test Plugin: applied proposal", committedCount: undefined });
+      // Reviewed against withMolecule (no warning), accepted into rebonded: the warning, and the count kept.
+      expect(accept({ source: rebonded, proposal: statedAndRebonded().proposal }))
+        .toEqual({ message: `Test Plugin: applied proposal. Accepted change: ${warningText}`, committedCount: 1 });
+    });
+
+    it("re-runs the dry run only when a proposal's own source document changes identity", async () => {
+      const first = statedOnly(false).proposal;
+      const second = { ...statedOnly(false).proposal, id: "proposal-h2" } as QueuedProposedPatch;
+      const host = hostFor(first);
+      const dryRuns = vi.spyOn(host, "previewProposedPatch");
+      const cache = new ProposalReviewItemCache();
+      const sources: Record<string, ChemDraftDocument> = { [first.id]: withMolecule, [second.id]: withMolecule };
+      const inputs = (proposal: QueuedProposedPatch) => ({ sourceDocument: sources[proposal.id] });
+      await cache.items(host, [first, second], inputs);
+      expect(dryRuns).toHaveBeenCalledTimes(2);
+      // Nothing changed (an unrelated render): not stale, and nothing re-runs.
+      expect(cache.isStale(host, [first, second], inputs)).toBe(false);
+      // A copy of the queue (as listProposedPatches returns) is not a change either.
+      expect(cache.isStale(host, [{ ...first }, { ...second }], inputs)).toBe(false);
+      // Only the second proposal's document is edited: only its dry run re-runs.
+      sources[second.id] = rebonded;
+      expect(cache.isStale(host, [first, second], inputs)).toBe(true);
+      const items = await cache.items(host, [first, second], inputs);
+      expect(dryRuns).toHaveBeenCalledTimes(3);
+      expect(dryRuns.mock.calls[2]![1]).toBe(rebonded);
+      expect(items.map(item => item.warnings)).toEqual([warned, []]);
+    });
+
+    it("updates the open tray when the source document changes, and not on a render that changes nothing", async () => {
+      const { proposal } = statedOnly(false);
+      const host = { ...hostFor(proposal), listProposedPatches: () => [proposal] } as unknown as PluginHost;
+      const dryRuns = vi.spyOn(host, "previewProposedPatch");
+      let source = withMolecule;
+      const getSourceDocument = () => source;
+      const props = { host, queueVersion: 0, getSourceDocument, onAccept: vi.fn(), onReject: vi.fn() };
+      container = document.createElement("div");
+      document.body.append(container);
+      root = createRoot(container);
+      const settle = () => act(async () => { await Promise.resolve(); });
+      act(() => root!.render(createElement(PatchReviewTray, props)));
+      await settle();
+      act(() => (container!.querySelector(".patch-review-badge") as HTMLButtonElement).click());
+      await settle();
+      const warnings = () => container!.querySelector('[data-proposal-id="proposal-h"] .patch-review-warnings')?.textContent;
+      expect(warnings()).toBe(`Proposed change: ${warningText}`);
+      const before = dryRuns.mock.calls.length;
+      act(() => root!.render(createElement(PatchReviewTray, { ...props })));
+      await settle();
+      expect(dryRuns).toHaveBeenCalledTimes(before);
+      source = rebonded;
+      act(() => root!.render(createElement(PatchReviewTray, { ...props })));
+      await settle();
+      expect(dryRuns).toHaveBeenCalledTimes(before + 1);
+      expect(warnings()).toBeUndefined();
+    });
   });
 
   it("shows no hydrogen warning when the proposal would fail to apply, or there is no document to dry-run", async () => {
