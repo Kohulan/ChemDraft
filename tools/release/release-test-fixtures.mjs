@@ -14,6 +14,12 @@ export const intel = `ChemDraft_${version}_x86_64.dmg`;
 export const installer = `ChemDraft_${version}_x64-setup.exe`;
 export const allusersInstaller = `ChemDraft_${version}_x64-allusers-setup.exe`;
 export const offlineInstaller = `ChemDraft_${version}_x64-allusers-offline-setup.exe`;
+// The three Windows downloads in release-page order, with their labels.
+export const windowsInstallers = [
+  { name: installer, label: "per-user, no admin required" },
+  { name: allusersInstaller, label: "all-users, for managed or shared machines" },
+  { name: offlineInstaller, label: "offline, for IT-managed machines" }
+];
 // Updater-capable Windows installers and their feeds; offline media has no .sig or feed.
 export const windowsUpdates = [
   { installer, feed: "latest.json" },

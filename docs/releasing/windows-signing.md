@@ -112,12 +112,9 @@ builds. The release body includes `## macOS (Apple silicon)`, `## macOS (Intel)`
 plus `## Linux` when the Linux packages are included. The Platform differences note names each feature
 gap and its reason or says there are none. This workflow supplies the Windows artifacts only.
 
-Include this line in the release-body template's Windows section:
-
-```text
-## Windows
-All-users offline installer (includes the WebView2 runtime, about 180 MB larger; for PCs without internet access)
-```
+The generated `## Windows` section lists all three installers as release-page downloads: per-user,
+all-users, and `ChemDraft_<ver>_x64-allusers-offline-setup.exe`, labeled "offline, for IT-managed
+machines", which the asset check requires to be attached.
 
 1. Set the app version before tagging, and prepare tracked Windows release notes if needed. Create
    the release tag and an **existing draft** GitHub release, for example `vX.Y.Z`.

@@ -52,6 +52,18 @@ for (const name of [...buildNames, ...buildNames.map((name) => `${name}.build.js
   });
 }
 
+test("a release missing only the offline installer fails, and an offline .sig is still refused", (t) => {
+  const args = releaseFixture(t, { withLinux: false });
+  unlinkSync(join(args.assets, offlineInstaller));
+  unlinkSync(join(args.assets, `${offlineInstaller}.build.json`));
+  writeReleaseChecksums(args.assets);
+  assert.deepEqual(check({ ...args, allowIncomplete: true }), { complete: false, missing: [offlineInstaller, `${offlineInstaller}.build.json`] });
+  assert.throws(() => check(args), ({ message }) => message.includes(`${offlineInstaller}.build.json: missing build record`));
+  const signed = releaseFixture(t, { withLinux: false });
+  writeFileSync(join(signed.assets, `${offlineInstaller}.sig`), "offline signature");
+  assert.throws(() => check(signed), ({ message }) => message.includes(`Unexpected release build: ${offlineInstaller}.sig`));
+});
+
 for (const extra of ["ChemDraft_1.2.2_aarch64.dmg", "ChemDraft_1.2.3_x64.dmg", "unexpected.exe", `${offlineInstaller}.sig`, "ChemDraft_1.2.2_x64-allusers-setup.exe", "other.dmg.build.json", "other.sig", "old.exe.sig", "other.msi", "other.zip", "other.pkg", "other.tar.gz", "OTHER.TAR.GZ"]) {
   test(`extra build ${extra} is refused`, (t) => {
     const args = releaseFixture(t);

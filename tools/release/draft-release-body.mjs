@@ -6,10 +6,26 @@ import { parseArgs } from "node:util";
 import { spawnSync } from "node:child_process";
 import { dmgArchitecture, parseAppcast } from "./macos-appcast.mjs";
 import { expectedReleaseCommit, releaseBuildFiles, verifyBuildAssets, windowsUpdateFiles } from "./release-assets.mjs";
-import { LINUX_BUILD_TARGET } from "./record-build.mjs";
+import { BUILD_TARGETS, LINUX_BUILD_TARGET } from "./record-build.mjs";
 import { verifyDmgCommit } from "./verify-macos-feed.mjs";
 
 const ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+const WINDOWS_BUILD_TARGET = "x86_64-pc-windows-msvc";
+
+// The release page's label for each Windows installer, in download order.
+export const WINDOWS_INSTALLER_LABELS = {
+  "x64-setup.exe": "per-user, no admin required",
+  "x64-allusers-setup.exe": "all-users, for managed or shared machines",
+  "x64-allusers-offline-setup.exe": "offline, for IT-managed machines"
+};
+
+export function windowsInstallerLines(version) {
+  return BUILD_TARGETS[WINDOWS_BUILD_TARGET].map((suffix) => {
+    const label = WINDOWS_INSTALLER_LABELS[suffix];
+    if (!label) throw new Error(`No release-page label for Windows installer ${suffix}`);
+    return `- \`ChemDraft_${version}_${suffix}\`: ${label}`;
+  });
+}
 
 export function draftReleaseBody({ version, commit, tag = `v${version}`, assets = process.cwd(), rootDir = ROOT, gaps = [], noGaps = false, includeLinux = false }, {
   run = spawnSync, checkDmgCommit = (dmg, target, expected) => verifyDmgCommit(dmg, target, expected, { run }),
@@ -23,7 +39,7 @@ export function draftReleaseBody({ version, commit, tag = `v${version}`, assets 
   const platforms = [
     { key: "macos", heading: "macOS (Apple silicon)", dmg: `ChemDraft_${version}_aarch64.dmg`, feed: "appcast.xml", arch: "arm64", notes: join("release-notes", "macos", `ChemDraft_${version}_aarch64.md`) },
     { key: "macos-intel", heading: "macOS (Intel)", dmg: `ChemDraft_${version}_x86_64.dmg`, feed: "appcast-intel.xml", arch: "x86_64", notes: join("release-notes", "macos-intel", `ChemDraft_${version}_x86_64.md`) },
-    { key: "windows", heading: "Windows", notes: join("release-notes", `windows-${version}.md`) }
+    { key: "windows", heading: "Windows", notes: join("release-notes", `windows-${version}.md`), downloads: windowsInstallerLines(version) }
   ];
   const errors = [];
   let builds = [];
@@ -68,7 +84,8 @@ export function draftReleaseBody({ version, commit, tag = `v${version}`, assets 
   }
   const sections = platforms.map((platform) => {
     const lines = gapMap.get(platform.key).map((gap) => `Not in this build: ${gap}`);
-    return [`## ${platform.heading}`, platform.content, ...lines].join("\n\n");
+    const downloads = platform.downloads ? [`Installers:\n\n${platform.downloads.join("\n")}`] : [];
+    return [`## ${platform.heading}`, platform.content, ...downloads, ...lines].join("\n\n");
   });
   return `${sections.join("\n\n")}\n\nPlatform differences: ${gaps.length ? "See the feature gaps and reasons above." : "None."}\n`;
 }

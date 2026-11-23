@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { draftReleaseBody } from "./draft-release-body.mjs";
 import { releaseBuildFiles } from "./release-assets.mjs";
-import { allusersInstaller, appImage, arm, commit, deb, fakeReleaseRunner, installer, intel, offlineInstaller, releaseFixture, updaterPublicKey, version, windowsUpdates } from "./release-test-fixtures.mjs";
+import { allusersInstaller, appImage, arm, commit, deb, fakeReleaseRunner, installer, intel, offlineInstaller, releaseFixture, updaterPublicKey, version, windowsInstallers, windowsUpdates } from "./release-test-fixtures.mjs";
 
 const feed = (name) => `<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel><item><sparkle:version>${version}</sparkle:version><enclosure url="https://example.com/${name}"/></item></channel></rss>`;
 
@@ -37,6 +37,15 @@ test("three-build release produces ordered sections with explicit gaps or explic
   assert.match(sections[3], /^Windows\n\nWindows notes/);
   assert.match(sections[3], /Not in this build: Feature B: reason/);
   assert.match(draft(args), /Platform differences: None\./);
+});
+
+test("Windows section lists all three installers, the offline one labelled for IT-managed machines", (t) => {
+  const args = fixture(t, { withLinux: false });
+  const windows = draft({ ...args, noGaps: false, gaps: ["windows:Feature B: reason"] }).split(/^## /m)[3];
+  const list = windowsInstallers.map(({ name, label }) => `- \`${name}\`: ${label}`).join("\n");
+  assert.ok(windows.startsWith(`Windows\n\nWindows notes\n\nInstallers:\n\n${list}\n\nNot in this build: Feature B: reason`), windows);
+  assert.ok(windows.includes(`- \`${offlineInstaller}\`: offline, for IT-managed machines\n`));
+  assert.equal(windows.match(/^- `ChemDraft_.*\.exe`: /gm).length, 3);
 });
 
 test("five-build release includes a Linux beta section and accepts Linux gaps", (t) => {
