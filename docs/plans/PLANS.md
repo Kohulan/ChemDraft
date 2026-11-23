@@ -8,6 +8,12 @@ in progress rather than a changelog.
 
 # In flight
 
+## Curly pair usage hint (`resubmit/curly-bracket-pair`)
+
+Current main already implements curly/square/round pairs and editable repeat labels, superseding
+the implementation proposed in #185. Correct the remaining stale single-glyph hint on the curly
+tool and characterize click/drag pair placement. No duplicate tool or document/schema changes.
+
 # ChemDraft Assistant plugin (active, branches claude/assistant-*)
 
 ## Objective
