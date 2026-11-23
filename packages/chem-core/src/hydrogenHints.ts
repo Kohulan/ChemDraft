@@ -88,10 +88,12 @@ export function clearChangedAtomHydrogenHints(
  * changes its identity or the hydrogens it has room for. `formalCharge` already includes a charge
  * mark's share (`markCharge` only records which part came from a mark), and `markRadicals` is each
  * radical mark's unpaired electron, which costs the atom one hydrogen. A retyped label counts too,
- * even as the same element (`labelLiteral` set or cleared, as typing "O" over an imported O sets
- * it): retyping is an explicit statement by the user, so the typed label wins and the chemistry
- * follows it (master decision 2026-11-22). Label position, color, visibility, a dismissed warning
- * and the recorded label bond side are not chemistry.
+ * even as the same element (`labelLiteral` set or cleared, as typing "O" over an O drawn "OH"
+ * sets it): retyping is an explicit statement by the user, so the typed label wins and the chemistry
+ * follows it (master decision 2026-11-22). A typed label that equals the label already drawn for
+ * the atom never reaches here: the label commit treats it as no edit at all, so the count stays
+ * (`commitNativeAtomLabelTarget` in the desktop app). Label position, color, visibility, a dismissed
+ * warning and the recorded label bond side are not chemistry.
  */
 function sameAtomStatement(atom: MoleculeAtom, old: MoleculeAtom): boolean {
   return atom.element === old.element &&

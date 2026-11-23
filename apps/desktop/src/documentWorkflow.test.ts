@@ -17128,11 +17128,22 @@ describe("aromatic bond orders: one count for the formula, the label and the val
       (next.pages[0]!.objects.find((object) => object.id === molecule.id) as MoleculeObject).atoms
         .find((atom) => atom.id === "a2")!;
     expect(atomAfter(applyNativeAtomElementTarget(document, target, "C")).hydrogenCount).toBeUndefined();
-    // The same element typed as a literal label drops it too: retyping is an explicit statement by
-    // the user, so the typed label wins (master decision 2026-11-22).
-    const retyped = atomAfter(applyNativeAtomElementTarget(document, target, "N", { literal: true }));
+    // Typing the label drawn for it ("NH", its stated H included) says nothing new: still the atom
+    // the count was stated for, so the commit changes nothing (master decision 2026-11-22, refined).
+    expect(atomDisplayLabel(molecule.atoms[2]!, molecule.bonds, undefined, molecule.atoms)).toBe("NH");
+    const same = commitNativeAtomLabelTarget(document, target, "NH", { literal: true, replaceElement: true });
+    expect(same.document).toBe(document);
+    expect(atomAfter(same.document)).toMatchObject({ element: "N", hydrogenCount: 1 });
+    expect(atomAfter(same.document).labelLiteral).toBeUndefined();
+    // Typed text that differs from the drawn label wins, even as the same element: a literal "N" drops
+    // the count. The ring then kekulizes only with the H guessed onto the other N, which is badged.
+    const typedN = applyNativeAtomElementTarget(document, target, "N", { literal: true });
+    const retyped = atomAfter(typedN);
     expect(retyped).toMatchObject({ element: "N", labelLiteral: true });
     expect(retyped.hydrogenCount).toBeUndefined();
+    const typedMolecule = typedN.pages[0]!.objects.find((object) => object.id === molecule.id) as MoleculeObject;
+    const otherNitrogen = typedMolecule.atoms.find((atom) => atom.element === "N" && atom.id !== "a2")!;
+    expect(nativeMoleculeInvalidAtomStates(typedMolecule)).toEqual([expect.objectContaining({ atomId: otherNitrogen.id, tautomerGuessed: true })]);
   });
 
   it("allows a bond-order edit on an imported CH3 and validates the new H count", () => {

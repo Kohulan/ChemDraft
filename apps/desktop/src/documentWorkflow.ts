@@ -197,6 +197,7 @@ import {
   findNearestBondHit,
   moleculeFillCycleKey,
   moleculeFillCycleKeyBondIds,
+  atomDisplayLabel,
   nativeMoleculeRings,
   planBondExtension,
   ringAttachmentAngleMetrics,
@@ -9759,6 +9760,7 @@ export function commitNativeAtomLabelTarget(
   const beforeAtom = options.beforeAtom ?? atom;
   const beforeMolecule = options.beforeMolecule ?? molecule;
   const normalized = normalizeNativeAtomElementLabel(label);
+  if (options.literal === true && typedLabelIsDrawnLabel(normalized, beforeAtom, beforeMolecule)) return { document, target };
   const decision = labelOnBondedAtom(normalized, beforeAtom, beforeMolecule, options.replaceElement);
   const relabel = (reason?: string) => {
     const refusal = atomLabelIsotopeRefusal(beforeAtom, normalized, beforeMolecule, options.literal === true);
@@ -9818,6 +9820,21 @@ export function commitNativeAtomLabelTarget(
     target: { ...target, kind: "atom", atomId: newAtom.id },
     message: `Attached ${normalized} as a substituent: ${normalized} ${decision.reason === "generic" ? "is a one-bond placeholder" : "takes one bond"} and this atom already has ${decision.bondCount}`
   };
+}
+
+/**
+ * Whether typed label text, on an atom with a stated H count, is exactly the label drawn for that
+ * atom before the edit, its hydrogens included: "O" over an O stated with 0 H, "NH" over a
+ * pyrrole-type N. Such a retype says nothing the drawing did not already say, so committing it
+ * changes nothing: the atom keeps its stated count and an aromatic ring keeps its Kekulé hint.
+ * Typed text that differs from the drawn label is a new statement and wins; its relabel drops the
+ * stated count (`clearChangedAtomHydrogenHints`). Master decision 2026-11-22, refined. An atom with
+ * no stated count has none to keep, and its retype keeps the ordinary typed-label rule.
+ */
+function typedLabelIsDrawnLabel(normalized: string, atom: MoleculeAtom, molecule: MoleculeObject): boolean {
+  if (normalized.length === 0 || atom.hydrogenCount === undefined) return false;
+  const drawn = atomDisplayLabel(atom, molecule.bonds, nativeDrawingStyleFromObjectStyle(molecule.style), molecule.atoms);
+  return drawn !== undefined && drawn === normalized;
 }
 
 /**
