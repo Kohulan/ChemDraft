@@ -8,6 +8,14 @@ in progress rather than a changelog.
 
 # In flight
 
+## Fixed-width text wrapping (`resubmit/text-box-wrap`)
+
+Rebuild #216 with current font/script metrics, shared SVG live editing, conditions text and page-fit
+bounds. Wrap resized fixed-width/fixed-size ordinary text without rewriting its source. Share
+word wrapping and line metrics with sizing; distinguish paragraphs from soft wraps. Keep authored
+reaction conditions and auto text unchanged. Test drag/release/blur, Undo/Redo, formatted text,
+Unicode and Windows paragraphs. Native Windows and both macOS builds remain pending.
+
 # ChemDraft Assistant plugin (active, branches claude/assistant-*)
 
 ## Objective

@@ -1,5 +1,10 @@
 # Manual stress checklist
 
+Text box resize: narrow/widen a typed box, release, blur and reselect. Live preview and saved SVG
+must retain the same wrapping. Check Undo/Redo, save/reopen, SVG/PDF/PNG, scripts, font overrides,
+blank paragraphs, alignment/rotation and page-fit prompts. Attached reaction conditions must retain
+authored lines. Repeat at different zoom/display scales on Windows and both macOS builds.
+
 The standing hands-on checklist for interactive surfaces. It moved here from `AGENTS.md` §20 when that
 file was consolidated (2026-10-04); `AGENTS.md` §14 still requires it. Run every item on **macOS and
 Windows** unless the item names one platform. `docs/windows-port-stress-test.md` records the Windows

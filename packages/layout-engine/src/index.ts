@@ -106,6 +106,8 @@ import { planTableObjectSvg, tableVisualBoundsForArrangement } from "./table";
 import { textAdvanceEm, measureTextRun, measureNativeTextSpanLineWidth, nativeTextMetrics, isPatrickHandFont, patrickHandTextAdvanceEm, patrickHandTextInkBoundsEm } from "./textMetrics";
 import { planTextObjectPlacement } from "./textPlacement";
 import { formatNumber } from "./formatNumber";
+import { nativeTextSpanLayout } from "./textLayout";
+export { nativeTextSpanLayout } from "./textLayout";
 import { nativeTextScriptFontScale, nativeTextSubscriptOffsetEm, nativeTextSuperscriptOffsetEm } from "./textMetrics";
 import { nativeGroupLabelDisplay, type AtomLabelAnchor } from "./labelGrammar";
 import { moleculeSketchTickPath, type MoleculeSketchTick } from "./sketchTicks";
@@ -4068,13 +4070,17 @@ export function planTextObjectSvg(object: TextObject, layerIndex: number): PageS
     return planConditionsTextObjectSvg(object, layerIndex);
   }
   const { style: textStyle, textAnchor, x, y, lineAdvance } = planTextObjectPlacement(object);
-  const lines = textObjectSpanLines(object);
+  const layout = textObjectSpanLayout(object);
+  const lines = layout.map(line => line.spans);
+  const wrapped = isFixedWidthTextObject(object);
+  const metrics = wrapped ? nativeTextObjectLineMetrics(object) : undefined;
   // Preserve the established markup for wholly unscripted text. With scripts, reset each
   // line's baseline, then move relatively within it to keep one text-anchor chunk per line.
   const hasScripts = lines.some(line => line.some(span => span.script !== "normal"));
   const lineFragments = lines.length > 0
     ? lines.flatMap((line, lineIndex) => textSpanLineFragments(
-      line, lineIndex, x, lineAdvance, textStyle.fontSizePx, hasScripts ? y + lineIndex * lineAdvance : undefined
+      line, lineIndex, x, lineAdvance, textStyle.fontSizePx,
+      wrapped ? object.y + metrics!.lines[lineIndex]!.baseline : hasScripts ? y + lineIndex * lineAdvance : undefined
     ))
     : [elementFragment("tspan", `text-empty-${object.id}`, { x }, [])];
 
@@ -4146,37 +4152,36 @@ export function nativeTextSpanMetrics(span: TextSpan, objectStyle: TextObject['s
   const offset=Number((span.script==='subscript'?size*.22:span.script==='superscript'?-size*.4:0).toFixed(6));
   return {fontSize,offset,ascent:fontSize*.8-offset,descent:fontSize*.2+offset};
 }
-export function nativeTextObjectLineMetrics(object: Pick<TextObject,'text'|'spans'|'style'>): {
+export function nativeTextObjectLineMetrics(object: Pick<TextObject,'text'|'spans'|'style'> & Partial<Pick<TextObject,'width'|'arrowAttachment'>>): {
   lines:{spans:TextSpan[];baseline:number;ascent:number;descent:number}[];height:number
 } {
-  const style=nativeTextStyleFromObjectStyle(object.style),lines=textObjectSpanLines(object);
+  const style=nativeTextStyleFromObjectStyle(object.style),layout=textObjectSpanLayout(object);
   let previousBaseline=0,previousDescent=0;
-  const measured=lines.map((spans,index)=>{
+  const measured=layout.map(({spans,paragraphIndex},index)=>{
     const metrics=spans.map(span=>nativeTextSpanMetrics(span,object.style));
     const ascent=Math.max(style.fontSizePx*.8,...metrics.map(m=>m.ascent));
     const descent=Math.max(style.fontSizePx*.2,...metrics.map(m=>m.descent));
     const baseline=index===0?Math.max(style.fontSizePx,ascent+2):previousBaseline+
-      Math.max(style.fontSizePx*style.lineHeight,previousDescent+ascent+style.fontSizePx*.18)+style.paragraphSpacingPx;
+      Math.max(style.fontSizePx*style.lineHeight,previousDescent+ascent+style.fontSizePx*.18)+
+        (paragraphIndex!==layout[index-1]!.paragraphIndex?style.paragraphSpacingPx:0);
     previousBaseline=baseline;previousDescent=descent;
     return {spans,baseline,ascent,descent};
   });
   return {lines:measured,height:previousBaseline+previousDescent+2};
 }
 
-export function textObjectSpanLines(object: Pick<TextObject, "text" | "spans">): TextSpan[][] {
-  const spans = textObjectSpansForRendering(object);
-  return spans.reduce<TextSpan[][]>((lines, span) => {
-    const parts = span.text.split(/\r?\n/);
-    parts.forEach((part, index) => {
-      if (index > 0) {
-        lines.push([]);
-      }
-      if (part.length > 0) {
-        lines[lines.length - 1].push({ ...span, text: part });
-      }
-    });
-    return lines;
-  }, [[]]);
+type TextLayoutObject = Pick<TextObject, "text" | "spans"> & Partial<Pick<TextObject, "style" | "width" | "arrowAttachment">>;
+function isFixedWidthTextObject(object: TextLayoutObject): boolean {
+  return typeof object.width === "number" &&
+    (object.style?.textBoxSizingMode === "fixed-width" || object.style?.textBoxSizingMode === "fixed-size") &&
+    object.arrowAttachment?.kind !== "conditions" && !(object.text === "+" && object.style?.reactionPlus === true);
+}
+function textObjectSpanLayout(object: TextLayoutObject) {
+  return nativeTextSpanLayout(textObjectSpansForRendering(object), nativeTextStyleFromObjectStyle(object.style ?? {}),
+    isFixedWidthTextObject(object) ? Math.max(1, object.width! - 6) : undefined);
+}
+export function textObjectSpanLines(object: TextLayoutObject): TextSpan[][] {
+  return textObjectSpanLayout(object).map(line => line.spans);
 }
 
 export function textObjectSpansForRendering(object: Pick<TextObject, "text" | "spans">): TextSpan[] {
@@ -6624,6 +6629,7 @@ export function textContentFrame(object: TextObject): LayoutBounds {
   let left = object.x, right = object.x + object.width;
   let top = object.y, bottom = object.y + object.height;
   const advance = style.fontSizePx * style.lineHeight + style.paragraphSpacingPx;
+  const wrappedMetrics = isFixedWidthTextObject(object) ? nativeTextObjectLineMetrics(object) : undefined;
   lines.forEach((line, index) => {
     const width = measureNativeTextSpanLineWidth(line, style);
     const x = style.textAlign === "center" ? anchor - width / 2
@@ -6635,7 +6641,7 @@ export function textContentFrame(object: TextObject): LayoutBounds {
         ? metadataNumber(span.style.fontSizePx) ?? style.fontSizePx : style.fontSizePx * nativeTextScriptFontScale;
       const shift = span.script === "subscript" ? style.fontSizePx * nativeTextSubscriptOffsetEm
         : span.script === "superscript" ? -style.fontSizePx * nativeTextSuperscriptOffsetEm : 0;
-      const baseline = object.y + style.fontSizePx + index * advance + shift;
+      const baseline = object.y + (wrappedMetrics?.lines[index]?.baseline ?? style.fontSizePx + index * advance) + shift;
       top = Math.min(top, baseline - size);
       bottom = Math.max(bottom, baseline + size * nativeTextMetrics.descentEm);
     }
@@ -6711,11 +6717,13 @@ function rotateInkBounds(object: DocumentObject, box: LayoutBounds): LayoutBound
 function textInkBounds(object: TextObject): LayoutBounds | null {
   const conditions = object.arrowAttachment?.kind === "conditions" ? conditionsTextPlacement(object) : undefined;
   const { x, y, style, alignment, lineAdvance } = conditions ?? planTextObjectPlacement(object);
+  const wrappedMetrics = isFixedWidthTextObject(object) ? nativeTextObjectLineMetrics(object) : undefined;
   const boxes = textObjectSpanLines(object).flatMap((line, index) => {
     if (!line.some(span => span.text.trim())) return [];
     const width = measureNativeTextSpanLineWidth(line, style,
       conditions?.scripted ? span => nativeTextSpanMetrics(span, object.style).fontSize : undefined);
-    const baseline = conditions?.scripted ? object.y + conditions.layout.lines[index]!.baseline : y + index * lineAdvance;
+    const baseline = conditions?.scripted ? object.y + conditions.layout.lines[index]!.baseline
+      : wrappedMetrics ? object.y + wrappedMetrics.lines[index]!.baseline : y + index * lineAdvance;
     let top = Infinity, bottom = -Infinity;
     for (const span of line) {
       if (!span.text.trim()) continue;
