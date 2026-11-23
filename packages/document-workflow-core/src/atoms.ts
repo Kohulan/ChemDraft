@@ -342,7 +342,7 @@ function nativeStatedHydrogenDiagnostic(
   resolution: NativeBondOrderResolution
 ): NativeAtomValidationState | undefined {
   if (atomIgnoresStatedHydrogenCount(atom)) {
-    const element = nativeElementFromAtomLabel(atom.element) ?? (atom.element === "*" ? "*" : "H");
+    const element = nativeElementFromAtomLabel(atom.element) ?? (atom.element === "D" || atom.element === "T" ? "H" : atom.element);
     const derived = atomDerivedHydrogenCount({ ...atom, formalCharge: effectiveFormalCharge }, bonds, atoms, resolution) ?? 0;
     const count = atom.hydrogenCount!;
     return {
@@ -378,8 +378,8 @@ function nativeStatedHydrogenDiagnostic(
 
 /**
  * The native report for atoms a document stores a hydrogen count on that nothing counts (chem-core
- * `atomIgnoresStatedHydrogenCount`: an H, D or T atom, or the unknown atom "*", stating a count other
- * than 0): chem-core's `statedHydrogenCountNotCountedText`, the one wording the CDXML importer also
+ * `atomIgnoresStatedHydrogenCount`: an H, D or T atom, or a label naming no element — the unknown
+ * atom "*", a generic label such as A or R1 — stating a count other than 0): chem-core's `statedHydrogenCountNotCountedText`, the one wording the CDXML importer also
  * uses. The document keeps the count as stored, so this says it is not counted.
  */
 export function hydrogenCountNotCountedText(atoms: readonly MoleculeAtom[]): string {

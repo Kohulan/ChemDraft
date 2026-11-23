@@ -837,6 +837,70 @@ describe("an unknown atom (*) stating a hydrogen count, in the app", () => {
   });
 });
 
+// Generic placeholder labels (A, R1) stating NumHydrogens="2": nothing counts hydrogens on a label
+// that names no element, so, like "*", the count is kept for the round trip and flagged. Decided by
+// the one rule (stored, but not used by chem-core's atomStatedHydrogenCount), not by a label list.
+describe("generic labels (A, R1) stating a hydrogen count, in the app", () => {
+  const genericCdxml = (numHydrogens = ' NumHydrogens="2"') => `<CDXML><page id="1"><fragment id="2">
+    <n id="10" p="100 100" NodeType="GenericNickname" GenericNickname="A"${numHydrogens}/><n id="11" p="114 108"/>
+    <n id="12" p="128 100" NodeType="GenericNickname" GenericNickname="R1"${numHydrogens}/>
+    <b id="20" B="10" E="11"/><b id="21" B="11" E="12"/>
+  </fragment></page></CDXML>`;
+  const countWarnings = (warnings: readonly { code: string }[]) => warnings.filter(warning => warning.code.endsWith("atom_hydrogen_count_not_counted"));
+  const genericsOf = (molecule: MoleculeObject) => molecule.atoms.filter(atom => atom.element === "A" || atom.element === "R1");
+  const listing = (ids: readonly string[]) => "2 atoms with labels naming no element state hydrogen counts a label naming no element cannot carry: " +
+    `atom ${ids[0]} (A) states 2; atom ${ids[1]} (R1) states 2. Only 0 counts, as a typed A or R1 label means. ` +
+    "The stated counts are kept as stored but not counted, and the atoms are flagged.";
+  const expectFlagged = (molecule: MoleculeObject) => {
+    const generics = genericsOf(molecule);
+    expect(generics.map(atom => [atom.element, atom.hydrogenCount])).toEqual([["A", 2], ["R1", 2]]);
+    expect(nativeMoleculeInvalidAtomStates(molecule).map(state => state.atomId)).toEqual(generics.map(atom => atom.id));
+    for (const atom of generics) {
+      const problem = atomProblem(molecule, atom.id)!;
+      expect(problem.state).toMatchObject({ valid: false, hydrogenCountNotCounted: true, statedHydrogens: { stated: 2 },
+        invalidReason: `${atom.element} states 2 H, which a label naming no element cannot carry; only 0 counts.` });
+    }
+  };
+
+  it("opens with the import warning, the counts kept and the badges; Save As writes them back and reopens them flagged, warned once", () => {
+    const opened = openNativeDocument(genericCdxml());
+    const [molecule] = moleculesOrThrow(normalizeCommittedDocument(opened.document!));
+    expect(countWarnings(opened.warnings)).toEqual([{ code: "cdxml.atom_hydrogen_count_not_counted",
+      message: `CDXML import: ${listing(["10", "12"])}`, sourceObjectId: molecule.id, atomIds: genericsOf(molecule).map(atom => atom.id) }]);
+    expectFlagged(molecule);
+    const saved = createNativeSavePayload(normalizeCommittedDocument(opened.document!));
+    expect(saved.contents.match(/NumHydrogens="2"/g)?.length).toBeGreaterThanOrEqual(2);
+    expect(saved.warnings.map(warning => warning.message).filter(message => message.includes("which a label naming no element cannot carry"))).toEqual([
+      "A1 states 2 H, which a label naming no element cannot carry; only 0 counts.",
+      "R13 states 2 H, which a label naming no element cannot carry; only 0 counts."
+    ]);
+    const reopened = openNativeDocument(saved.contents);
+    expect(countWarnings(reopened.warnings)).toHaveLength(1);
+    expectFlagged(moleculesOrThrow(normalizeCommittedDocument(reopened.document!))[0]);
+  });
+
+  it("a .chemdraft holding them opens with the native warning and the badges, and saves and reopens them unchanged", () => {
+    const document = normalizeCommittedDocument(openNativeDocument(genericCdxml()).document!);
+    const [molecule] = moleculesOrThrow(document);
+    const ids = genericsOf(molecule).map(atom => atom.id);
+    const opened = openNativeDocument(serializeDocument(document));
+    expect(countWarnings(opened.warnings)).toEqual([{ code: "document.atom_hydrogen_count_not_counted",
+      message: `ChemDraft document: ${listing(ids)}`, sourceObjectId: molecule.id, atomIds: ids }]);
+    const [reopened] = moleculesOrThrow(normalizeCommittedDocument(opened.document!));
+    expectFlagged(reopened);
+    expect(genericsOf(reopened)).toEqual(genericsOf(molecule));
+  });
+
+  it("generic labels with no NumHydrogens, or stating 0, open as before: no warning, no badge", () => {
+    for (const numHydrogens of ["", ' NumHydrogens="0"']) {
+      const opened = openNativeDocument(genericCdxml(numHydrogens));
+      const [molecule] = moleculesOrThrow(normalizeCommittedDocument(opened.document!));
+      expect(countWarnings(opened.warnings)).toEqual([]);
+      expect(nativeMoleculeInvalidAtomStates(molecule).filter(state => state.hydrogenCountNotCounted)).toEqual([]);
+    }
+  });
+});
+
 function moleculesOrThrow(document: ChemDraftDocument): [MoleculeObject, ...MoleculeObject[]] {
   const molecules = moleculesOf(document);
   if (molecules.length === 0) throw new Error("Expected a molecule");

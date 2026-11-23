@@ -6629,8 +6629,9 @@ function cdxmlBondDisplayForBondStyle(display: MoleculeBond["display"]): string 
  * Any other count on a hydrogen atom cannot be kept, since no typed label draws a hydrogen atom
  * carrying hydrogens of its own: it is not stored, and a second warning says so, unless it agrees
  * (a lone H stating 1). An atom whose label is not an element (an unknown atom, a generic label)
- * keeps what the file states, for the file's sake; nothing counts hydrogens on it, and on an unknown
- * atom "*" a count other than 0 is reported and badged (`notCountedStatedHydrogens`).
+ * keeps what the file states, for the file's sake; on a label naming no element (the unknown atom
+ * "*", a generic label such as A or R1) nothing counts it, so a count other than 0 is reported and
+ * badged (`notCountedStatedHydrogens`).
  * Mutates `candidates`; returns the warnings.
  */
 function keepStatedHydrogens(
@@ -6702,10 +6703,11 @@ function keepStatedHydrogens(
 /**
  * One warning per fragment naming each atom that now stores a hydrogen count nothing counts
  * (chem-core `atomIgnoresStatedHydrogenCount`, the rule the atom validator, the native open report
- * and the plugin host share). In practice that is an unknown atom "*" (an Element naming nothing, an
- * unlabeled nickname node, a "*" generic label) stating a count other than 0: its label draws none,
- * the formula counts none, the molfile writes the dummy atom "*" with no valence and RDKit gives a
- * dummy atom no hydrogens, so its SMILES is "*" whatever the file states. The count is kept for the
+ * and the plugin host share). In practice that is a label naming no element stating a count other
+ * than 0: an unknown atom "*" (an Element naming nothing, an unlabeled nickname node, a "*" generic
+ * label) or another generic label (A, Q, M, X, an R-group such as R1). Its label draws none, the
+ * formula counts none, the molfile writes a placeholder with no valence and RDKit gives a
+ * placeholder no hydrogens, so its SMILES is the same whatever the file states. The count is kept for the
  * file's round trip (CDXML and CDX write it back), the atom is badged, and this says it is not
  * counted, in chem-core's `statedHydrogenCountNotCountedText` wording (AGENTS.md §7). A stated 0 is
  * what such an atom counts anyway, and is not reported. A hydrogen atom's count other than 0 is not

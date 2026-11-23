@@ -424,15 +424,43 @@ describe("a hydrogen count an H, D or T atom cannot carry is stored as written, 
     expect(atomWithIgnoredHydrogenCount(withHydrogen("D", 0).atoms, held)).toBeUndefined();
   });
 
-  it("flags the unknown atom * stating a count other than 0, which nothing counts, and no other label", () => {
+  it("flags the unknown atom * stating a count other than 0, which nothing counts", () => {
     const atom = (element: string, hydrogenCount?: number, labelLiteral?: true) =>
       ({ id: "x", element, x: 0, y: 0, formalCharge: 0, ...(hydrogenCount === undefined ? {} : { hydrogenCount }), ...(labelLiteral ? { labelLiteral } : {}) });
     expect([atom("*", 2), atom("*", 1, true)].map(atomIgnoresStatedHydrogenCount)).toEqual([true, true]);
-    expect([atom("*", 0), atom("*"), atom("A", 2, true), atom("R1", 2, true), atom("O", 0)].map(atomIgnoresStatedHydrogenCount))
-      .toEqual([false, false, false, false, false]);
+    expect([atom("*", 0), atom("*"), atom("O", 0)].map(atomIgnoresStatedHydrogenCount)).toEqual([false, false, false]);
     expect(atomWithIgnoredHydrogenCount([atom("*", 2)])?.id).toBe("x");
     expect(atomWithIgnoredHydrogenCount([atom("*", 2)], [atom("*", 2)])).toBeUndefined();
     expect(atomWithIgnoredHydrogenCount([atom("*", 0)])).toBeUndefined();
+  });
+
+  it("flags exactly the stored counts atomStatedHydrogenCount does not use: generic labels too, read from the element table, no list", () => {
+    const atom = (element: string, hydrogenCount?: number, labelLiteral?: true) =>
+      ({ id: "x", element, x: 0, y: 0, formalCharge: 0, ...(hydrogenCount === undefined ? {} : { hydrogenCount }), ...(labelLiteral ? { labelLiteral } : {}) });
+    // Generic placeholder labels (as CDXML imports them: literal): no element symbol starts them.
+    const generic = ["A", "Q", "M", "X", "R", "R1", "R'", "G", "L"];
+    for (const element of generic) {
+      for (const subject of [atom(element, 2, true), atom(element, 1)]) {
+        expect(atomIgnoresStatedHydrogenCount(subject)).toBe(true);
+        expect(atomStatedHydrogenCount(subject, [])).toBeUndefined();
+      }
+      // 0 is what such a label counts anyway, and no count is nothing to flag.
+      expect([atom(element, 0, true), atom(element, 0), atom(element)].map(atomIgnoresStatedHydrogenCount)).toEqual([false, false, false]);
+    }
+    expect(atomWithIgnoredHydrogenCount([atom("R1", 2, true)])?.id).toBe("x");
+    expect(atomWithIgnoredHydrogenCount([atom("A", 2, true)], [atom("A", 2, true)])).toBeUndefined();
+    expect(atomWithIgnoredHydrogenCount([atom("A", 0, true)])).toBeUndefined();
+    // Honored, unchanged: an ordinary element stating a count it disagrees with (counted by
+    // atomStatedHydrogenCount), and a literal element label (its own text, and the Kekulé check, read it).
+    expect(atomIgnoresStatedHydrogenCount(atom("C", 2))).toBe(false);
+    expect(atomStatedHydrogenCount(atom("C", 2), [])).toBe(2);
+    expect([atom("N", 1, true), atom("O", 2, true), atom("Ar", 1, true)].map(atomIgnoresStatedHydrogenCount)).toEqual([false, false, false]);
+    // A label an element symbol starts names that element and spells its own hydrogens, as the atom
+    // problem fix "Set explicit hydrogens" writes it (a literal "NH2" storing 2): not flagged.
+    for (const subject of [atom("NH2", 2, true), atom("CH3", 3, true), atom("NHMe", 1, true), atom("H2N", 2, true), atom("NH2", 2)]) {
+      expect(atomIgnoresStatedHydrogenCount(subject)).toBe(false);
+      expect(atomStatedHydrogenCount(subject, [])).toBeUndefined();
+    }
   });
 
   it("words the kept-but-not-counted report for hydrogen atoms, unknown atoms, or both", () => {
@@ -447,6 +475,19 @@ describe("a hydrogen count an H, D or T atom cannot carry is stored as written, 
     expect(statedHydrogenCountNotCountedText([atom("h", "H", 1), atom("x", "*", 2)])).toBe("2 atoms state hydrogen counts they cannot carry: " +
       "atom h (H) states 1; atom x (*) states 2. Only 0 counts on a hydrogen or unknown atom, as a typed H, D, T or * label means. The stated " +
       "counts are kept as stored but not counted, and the atoms are flagged.");
+  });
+
+  it("words it for a label naming no element with the label's own text, by the same pattern", () => {
+    const atom = (id: string, element: string, hydrogenCount: number) => ({ id, element, x: 0, y: 0, formalCharge: 0, hydrogenCount, labelLiteral: true });
+    expect(statedHydrogenCountNotCountedText([atom("a", "A", 2)], (item) => `n${item.id}`)).toBe("atom na (A) states 2 hydrogens, which a " +
+      "label naming no element cannot carry: only 0 counts, as a typed A label means. The stated count is kept as stored but not counted, and the atom is flagged.");
+    expect(statedHydrogenCountNotCountedText([atom("a", "A", 2), atom("r", "R1", 1)])).toBe("2 atoms with labels naming no element state hydrogen " +
+      "counts a label naming no element cannot carry: atom a (A) states 2; atom r (R1) states 1. Only 0 counts, as a typed A or R1 label means. " +
+      "The stated counts are kept as stored but not counted, and the atoms are flagged.");
+    expect(statedHydrogenCountNotCountedText([atom("a", "A", 2), atom("b", "A", 1)])).toContain("Only 0 counts, as a typed A label means.");
+    expect(statedHydrogenCountNotCountedText([atom("h", "H", 1), atom("x", "*", 2), atom("a", "A", 2)])).toBe("3 atoms state hydrogen counts " +
+      "they cannot carry: atom h (H) states 1; atom x (*) states 2; atom a (A) states 2. Only 0 counts on a hydrogen atom, an unknown atom or a " +
+      "label naming no element, as a typed H, D, T, * or A label means. The stated counts are kept as stored but not counted, and the atoms are flagged.");
   });
 });
 

@@ -14,87 +14,153 @@ import type { MoleculeAtom, MoleculeBond, MoleculeObject } from "./schemas";
  * label draws no H) states its count as a typed "C", "CH" … "CH4" spells it, and an H, D or T atom
  * states 0 as a typed literal "H", "D" or "T" means it.
  *
- * Undefined where the count means something else, or where no typed label could state it:
- * - no count, or a typed literal label (its own text says what hydrogens it has);
+ * Undefined where the count means something else, or where nothing counts it
+ * (`statedHydrogenCountUse` decides both, and is the one place that does):
+ * - no count;
+ * - a typed literal label, or a label that is not an element symbol but names one ("NH2", "OMe"):
+ *   its own text says what hydrogens it has (a stored count on a typed literal is a source
+ *   constraint the Kekulé check reads);
  * - an atom on an aromatic bond, where the count settles which ring atom carries the H and the
  *   Kekulé resolution carries it;
- * - a label that is not a plain element symbol (D and T aside). Of these, the unknown atom "*"
- *   stating any count but 0 is flagged (`atomIgnoresStatedHydrogenCount`): nothing counts hydrogens
- *   on it (the molfile writes the dummy atom "*" with no valence, and RDKit gives a dummy atom none);
- * - an H, D or T atom stating any count but 0: no typed label draws a hydrogen atom carrying
- *   hydrogens of its own (`atomIgnoresStatedHydrogenCount`). The CDXML importer warns and does not
- *   keep such a count; a plugin or assistant write that would store one is refused at the plugin
- *   host (`atomWithIgnoredHydrogenCount`); a document that already holds one (an older file, a
- *   session, a paste) keeps it as stored, and the atom is flagged.
+ * - a count nothing counts (`atomIgnoresStatedHydrogenCount`): an H, D or T atom stating any count
+ *   but 0 (no typed label draws a hydrogen atom carrying hydrogens of its own), or a label naming no
+ *   element — the unknown atom "*", a generic label such as A, Q, M, X or R1 — stating any count but
+ *   0 (the molfile writes it as a placeholder with no valence, and RDKit gives a placeholder no
+ *   hydrogens). A stated 0 on a label naming no element is what it counts anyway, so nothing is
+ *   lost. The CDXML importer does not keep such a count on an ordinary hydrogen atom and warns; a
+ *   plugin or assistant write that would store one is refused at the plugin host
+ *   (`atomWithIgnoredHydrogenCount`); a document that already holds one (an older file, a session,
+ *   a paste, a kept count on a generic label) keeps it as stored, and the atom is flagged.
  * No valence model here: the count is passed through as stated, never re-derived.
  */
 export function atomStatedHydrogenCount(
   atom: MoleculeAtom,
   bonds: readonly MoleculeBond[]
 ): number | undefined {
-  const stated = atom.hydrogenCount;
-  if (stated === undefined || atom.labelLiteral === true) return undefined;
-  const hydrogen = atom.element === "H" || atom.element === "D" || atom.element === "T";
-  if (hydrogen ? stated !== 0 : atomicNumberForElementSymbol(atom.element) === undefined) return undefined;
-  for (const bond of bonds) {
-    if (bond.order === "aromatic" && (bond.fromAtomId === atom.id || bond.toAtomId === atom.id)) return undefined;
-  }
-  return stated;
+  return statedHydrogenCountUse(atom, bonds) === "counted" ? atom.hydrogenCount : undefined;
 }
 
 /**
- * True for an atom that stores a hydrogen count other than 0 that nothing counts, while 0 is exactly
- * what the atom already counts:
- * - an H, D or T atom: no typed label draws a hydrogen atom carrying hydrogens of its own
- *   (`atomStatedHydrogenCount` ignores the count);
- * - the unknown atom "*" (an unknown or unlabeled CDXML node, a pasted dummy atom, a typed "*"): its
- *   label draws none, the formula counts none, the molfile writes the dummy atom "*" with no valence
- *   field and RDKit gives a dummy atom no hydrogens, so its SMILES is "*" whatever it states.
+ * What a stored hydrogen count is to everything that reads the atom; `atomStatedHydrogenCount` and
+ * `atomIgnoresStatedHydrogenCount` are both read from here, so they cannot disagree:
+ * - "none": no count is stored;
+ * - "counted": `atomStatedHydrogenCount` uses it as the atom's count;
+ * - "label": a typed literal label, or a label that is not an element symbol but names one ("NH2",
+ *   "OMe"), whose own text says its hydrogens (on a typed literal, the count is a source
+ *   constraint the Kekulé check reads);
+ * - "aromatic": the count settles the Kekulé resolution of an aromatic bond;
+ * - "agrees": 0 on a label naming no element, which is exactly what it counts;
+ * - "ignored": stored, and nothing counts it — an H, D or T atom, or a label naming no element,
+ *   stating a count other than 0. Decided before the label's literalness and its bonds, so it is a
+ *   property of the atom alone.
+ * "Naming no element" is read from chem-core's own element table (`statedCountCarrier`), not from a
+ * list of placeholder labels.
+ */
+function statedHydrogenCountUse(
+  atom: MoleculeAtom,
+  bonds: readonly MoleculeBond[]
+): "none" | "counted" | "label" | "aromatic" | "agrees" | "ignored" {
+  const stated = atom.hydrogenCount;
+  if (stated === undefined) return "none";
+  const carrier = statedCountCarrier(atom);
+  if (carrier !== undefined) {
+    if (stated !== 0) return "ignored";
+    if (carrier !== "hydrogen") return "agrees";
+  }
+  if (atom.labelLiteral === true || (carrier === undefined && atomicNumberForElementSymbol(atom.element) === undefined)) return "label";
+  for (const bond of bonds) {
+    if (bond.order === "aromatic" && (bond.fromAtomId === atom.id || bond.toAtomId === atom.id)) return "aromatic";
+  }
+  return "counted";
+}
+
+/**
+ * True for an atom that stores a hydrogen count nothing counts (`statedHydrogenCountUse`: stored,
+ * but `atomStatedHydrogenCount` does not use it and nothing else reads it), while 0 is exactly what
+ * the atom already counts:
+ * - an H, D or T atom: no typed label draws a hydrogen atom carrying hydrogens of its own;
+ * - a label naming no element: the unknown atom "*" (an unknown or unlabeled CDXML node, a pasted
+ *   dummy atom, a typed "*") or a generic label (A, Q, M, X, an R-group …). Its label draws no
+ *   stated hydrogens, the formula counts none, the molfile writes a placeholder with no valence
+ *   field and RDKit gives a placeholder no hydrogens.
  * Patches store it as written (chem-core never refuses it, so opening, restoring, pasting or undoing
  * a document that holds one always works); the atom validator flags it and an open reports it
- * (`statedHydrogenCountNotCountedText`). The CDXML importer does not keep such a count on a hydrogen
- * atom (`cdxml.atom_hydrogen_count_not_kept`); on an unknown atom it keeps it for the file's round
- * trip and reports it as not counted (`cdxml.atom_hydrogen_count_not_counted`).
+ * (`statedHydrogenCountNotCountedText`). The CDXML importer does not keep such a count on an
+ * ordinary hydrogen atom (`cdxml.atom_hydrogen_count_not_kept`); on any other atom it keeps it for
+ * the file's round trip and reports it as not counted (`cdxml.atom_hydrogen_count_not_counted`).
  */
 export function atomIgnoresStatedHydrogenCount(atom: MoleculeAtom): boolean {
-  return statedCountCarrier(atom) !== undefined && atom.hydrogenCount !== undefined && atom.hydrogenCount !== 0;
+  return statedHydrogenCountUse(atom, []) === "ignored";
 }
 
-/** Which kind of atom `atomIgnoresStatedHydrogenCount` judges: hydrogen atoms, and the unknown atom. */
-function statedCountCarrier(atom: MoleculeAtom): "hydrogen" | "unknown" | undefined {
+/**
+ * Which kind of atom counts no stated hydrogens of its own: hydrogen atoms, the unknown atom "*",
+ * and any other label naming no element — no element symbol of chem-core's table starts it (A, Q,
+ * M, X, R1). A label an element symbol starts ("NH2", "CH3", "OMe") names that element, and its own
+ * text says what hydrogens it has, as a typed label does; it is no carrier.
+ */
+function statedCountCarrier(atom: MoleculeAtom): "hydrogen" | "unknown" | "generic" | undefined {
   if (atom.element === "H" || atom.element === "D" || atom.element === "T") return "hydrogen";
-  return atom.element === "*" ? "unknown" : undefined;
+  if (atom.element === "*") return "unknown";
+  const label = atom.element.trim();
+  const namesElement = atomicNumberForElementSymbol(label.slice(0, 2)) !== undefined ||
+    atomicNumberForElementSymbol(label.slice(0, 1)) !== undefined;
+  return namesElement ? undefined : "generic";
 }
 
-/** "a hydrogen atom" or "an unknown atom": the atom kind a refusal or warning names. */
+/** "a hydrogen atom", "an unknown atom" or "a label naming no element": the atom kind a refusal or warning names. */
 export function ignoredHydrogenCountAtomKind(atom: MoleculeAtom): string {
-  return statedCountCarrier(atom) === "unknown" ? "an unknown atom" : "a hydrogen atom";
+  const carrier = statedCountCarrier(atom);
+  return carrier === "unknown" ? "an unknown atom" : carrier === "generic" ? "a label naming no element" : "a hydrogen atom";
+}
+
+/** "x", "x or y", "x, y or z". */
+function alternatives(items: readonly string[]): string {
+  return items.length < 2 ? items.join("") : `${items.slice(0, -1).join(", ")} or ${items.at(-1)}`;
 }
 
 /**
  * The one wording for atoms whose stored hydrogen count is kept but not counted
  * (`atomIgnoresStatedHydrogenCount`), shared by the native open report, the atom badge's detail and
  * the CDXML importer, so they cannot drift apart. `name` gives each atom's id as the reader knows it
- * (the CDXML importer names the file's node id). The text for hydrogen atoms alone is the wording
- * these warnings already used for them.
+ * (the CDXML importer names the file's node id). The text for hydrogen atoms and unknown atoms is
+ * the wording these warnings already used for them; a label naming no element is named by its own
+ * text ("as a typed A label means").
  */
 export function statedHydrogenCountNotCountedText(
   atoms: readonly MoleculeAtom[],
   name: (atom: MoleculeAtom) => string = (atom) => atom.id
 ): string {
   const hydrogens = (count: number) => `${count} hydrogen${count === 1 ? "" : "s"}`;
-  const kinds = new Set(atoms.map(statedCountCarrier));
+  const carriers = atoms.map(statedCountCarrier);
+  const kinds = new Set(carriers);
   const uniform = kinds.size === 1 ? [...kinds][0] : undefined;
-  const typed = uniform === "unknown" ? "*" : uniform === "hydrogen" ? "H, D or T" : "H, D, T or *";
+  const typed = alternatives([
+    ...(kinds.has("hydrogen") ? ["H", "D", "T"] : []),
+    ...(kinds.has("unknown") ? ["*"] : []),
+    ...new Set(atoms.filter((_atom, index) => carriers[index] === "generic").map((atom) => atom.element))
+  ]);
   const [only] = atoms;
   if (atoms.length === 1) {
     return `atom ${name(only!)} (${only!.element}) states ${hydrogens(only!.hydrogenCount!)}, which ${ignoredHydrogenCountAtomKind(only!)} cannot carry: ` +
       `only 0 counts, as a typed ${typed} label means. The stated count is kept as stored but not counted, and the atom is flagged.`;
   }
   const listed = atoms.map((atom) => `atom ${name(atom)} (${atom.element}) states ${atom.hydrogenCount}`).join("; ");
-  const head = uniform === undefined
-    ? `${atoms.length} atoms state hydrogen counts they cannot carry: ${listed}. Only 0 counts on a hydrogen or unknown atom`
-    : `${atoms.length} ${uniform} atoms state hydrogen counts ${uniform === "unknown" ? "an unknown" : "a hydrogen"} atom cannot carry: ${listed}. Only 0 counts`;
+  let head: string;
+  if (uniform === undefined) {
+    const on = kinds.has("generic")
+      ? alternatives([
+        ...(kinds.has("hydrogen") ? ["a hydrogen atom"] : []),
+        ...(kinds.has("unknown") ? ["an unknown atom"] : []),
+        "a label naming no element"
+      ])
+      : "a hydrogen or unknown atom";
+    head = `${atoms.length} atoms state hydrogen counts they cannot carry: ${listed}. Only 0 counts on ${on}`;
+  } else {
+    const plural = uniform === "generic" ? "atoms with labels naming no element" : `${uniform} atoms`;
+    const singular = uniform === "generic" ? "a label naming no element" : uniform === "unknown" ? "an unknown atom" : "a hydrogen atom";
+    head = `${atoms.length} ${plural} state hydrogen counts ${singular} cannot carry: ${listed}. Only 0 counts`;
+  }
   return `${head}, as a typed ${typed} label means. The stated counts are kept as stored but not counted, and the atoms are flagged.`;
 }
 

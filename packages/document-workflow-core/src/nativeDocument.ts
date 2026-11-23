@@ -19,13 +19,13 @@ interface NativeDocumentPayload {
  * an H, D or T atom, or an unknown atom "*", whose stored count is not counted. */
 export const NativeHydrogenCountNotCountedCode = "document.atom_hydrogen_count_not_counted";
 
-/** The CDXML importer's report of an unknown atom's count it kept but does not count (cdx-compat). */
+/** The CDXML importer's report of a count it kept but does not count, on an unknown atom or other label naming no element (cdx-compat). */
 const CdxmlHydrogenCountNotCountedCode = "cdxml.atom_hydrogen_count_not_counted";
 
 /**
  * One warning per molecule holding an atom that stores a hydrogen count nothing counts (chem-core
- * `atomIgnoresStatedHydrogenCount`: an H, D or T atom, or an unknown atom "*", stating a count other
- * than 0). The document opens with the count as stored (it round-trips unchanged); the atom
+ * `atomIgnoresStatedHydrogenCount`: an H, D or T atom, or a label naming no element — an unknown
+ * atom "*", a generic label such as A or R1 — stating a count other than 0). The document opens with the count as stored (it round-trips unchanged); the atom
  * validator flags the atom, and this names it in the open report, as the CDXML importer names a
  * count it did not keep or does not count. `source` heads the message; `objectIds`, when given,
  * limits the report to those molecules.

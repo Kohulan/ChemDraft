@@ -215,13 +215,14 @@ export function assertPluginPatchWriteScope(
 }
 
 /** The refusal reason (API 0.1.27 `PluginRefusalFields.reason`) for a write that would store a
- * hydrogen count other than 0 on an H, D or T atom, or on the unknown atom "*" (`details.element`
- * says which). */
+ * hydrogen count other than 0 on an H, D or T atom, or on a label naming no element: the unknown
+ * atom "*" or a generic label such as A, Q, M, X or R1 (`details.element` gives the label). */
 export const HydrogenCountUnrepresentableReason = "hydrogen_count_unrepresentable";
 
 /**
  * Refuse a plugin or assistant write that would store a hydrogen count other than 0 on an H, D or T
- * atom or on the unknown atom "*": no label, formula or export reads it (chem-core
+ * atom or on a label naming no element (the unknown atom "*", a generic label such as A or R1):
+ * no label, formula or export reads it (chem-core
  * `atomIgnoresStatedHydrogenCount`), so storing it would silently lose what the writer said
  * (AGENTS.md §7). This is the only place such a count is
  * refused. chem-core's patches keep it, because they also replay opening, restoring, pasting,
@@ -238,10 +239,13 @@ function assertRepresentableHydrogenCounts(before: ChemDraftDocument, after: Che
       if (previous === object) continue;
       const atom = atomWithIgnoredHydrogenCount(object.atoms, previous?.type === "molecule" ? previous.atoms : undefined);
       if (!atom) continue;
-      const allowed = atom.element === "*" ? "an unknown atom (*), as a typed * label means" : "an H, D or T atom, as a typed H, D or T label means";
+      const kind = ignoredHydrogenCountAtomKind(atom);
+      const allowed = kind === "an unknown atom" ? "an unknown atom (*), as a typed * label means"
+        : kind === "a hydrogen atom" ? "an H, D or T atom, as a typed H, D or T label means"
+        : `a label naming no element (${atom.element}), as a typed ${atom.element} label means`;
       throw new PluginHostError(
         `Plugin write refused: atom "${atom.id}" of molecule "${object.id}" is ${atom.element} with hydrogenCount ` +
-        `${atom.hydrogenCount}, which ${ignoredHydrogenCountAtomKind(atom)} cannot carry. Only 0 is allowed on ${allowed}; ` +
+        `${atom.hydrogenCount}, which ${kind} cannot carry. Only 0 is allowed on ${allowed}; ` +
         "omit hydrogenCount or set it to 0. Nothing was changed.",
         { reason: HydrogenCountUnrepresentableReason,
           details: { moleculeId: object.id, atomId: atom.id, element: atom.element, hydrogenCount: atom.hydrogenCount! } }

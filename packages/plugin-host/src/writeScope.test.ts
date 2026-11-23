@@ -556,6 +556,48 @@ describe("direct-write invocation scope", () => {
     }
   );
 
+  it.each(["addObject", "updateObject"] as const)(
+    "refuses a %s that would store a hydrogen count other than 0 on a generic label (A, R1), naming the label, and accepts 0 and a spelled NH2",
+    async op => {
+      // A label naming no element (no element symbol starts it) is read by the same rule as "*", no label list.
+      const withLabel = (element: string, hydrogenCount?: number): MoleculeObject => {
+        const molecule = cachedMolecule();
+        return { ...molecule, id: op === "addObject" && hydrogenCount !== undefined ? "mol_new" : molecule.id,
+          atoms: [...molecule.atoms, { id: "g", element, x: 160, y: 120, formalCharge: 0, labelLiteral: true,
+            ...(hydrogenCount === undefined ? {} : { hydrogenCount }) }],
+          bonds: [...molecule.bonds, { id: "bg", fromAtomId: "a2", toAtomId: "g", order: "single" }] };
+      };
+      const patchFor = (molecule: MoleculeObject): DocumentPatch => op === "addObject"
+        ? { op, pageId: "page_001", object: molecule }
+        : { op, objectId: molecule.id, changes: { atoms: molecule.atoms } };
+      const existing = (element: string) => op === "addObject" ? [cachedMolecule()] : [withLabel(element)];
+      const moleculeId = op === "addObject" ? "mol_new" : "mol_3";
+      for (const element of ["A", "R1"]) {
+        const f = fixture(["mol_3"], ctx => ctx.documents.applyPatch!({ reason: "stated count", patch: patchFor(withLabel(element, 2)) }),
+          undefined, existing(element));
+        const before = f.document();
+        const refused = await f.host.invokeCommand("plugin.scope.run").then(() => undefined, (error: unknown) => error);
+        expect(refused).toBeInstanceOf(PluginHostError);
+        expect(refused).toMatchObject({
+          message: `Plugin write refused: atom "g" of molecule "${moleculeId}" is ${element} with hydrogenCount 2, which a label naming no ` +
+            `element cannot carry. Only 0 is allowed on a label naming no element (${element}), as a typed ${element} label means; ` +
+            "omit hydrogenCount or set it to 0. Nothing was changed.",
+          reason: "hydrogen_count_unrepresentable",
+          details: { moleculeId, atomId: "g", element, hydrogenCount: 2 }
+        });
+        expect(f.applyDocumentPatch).not.toHaveBeenCalled();
+        expect(f.document()).toBe(before);
+      }
+      for (const [element, hydrogenCount] of [["A", 0], ["NH2", 2]] as const) {
+        const accepted = fixture(["mol_3"], ctx => ctx.documents.applyPatch!({ reason: "honored", patch: patchFor(withLabel(element, hydrogenCount)) }),
+          undefined, existing(element));
+        await expect(accepted.host.invokeCommand("plugin.scope.run")).resolves.toMatchObject({ applied: true });
+        const written = accepted.document().pages[0]!.objects.find(object => object.id === moleculeId);
+        expect(written?.type === "molecule" && written.atoms.find(atom => atom.id === "g")?.hydrogenCount).toBe(hydrogenCount);
+      }
+    }
+  );
+
   it("refuses setting hydrogenCount 1 on an H atom before the host writes, leaving the document and its undo history as they were", async () => {
     // The embedding host records one undo entry per applied write, as the app does; nothing may reach it.
     const molecule: MoleculeObject = { ...cachedMolecule(), atoms: [...cachedMolecule().atoms, { id: "h", element: "H", x: 160, y: 120, formalCharge: 0 }],

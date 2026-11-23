@@ -413,6 +413,94 @@ describe("an unknown atom (*) keeps what the file states, and a count it cannot 
   });
 });
 
+/**
+ * Generic placeholder labels (A, Q, M, X, R-groups) and any other label naming no element are
+ * read by the same rule as "*": chem-core `atomIgnoresStatedHydrogenCount` is exactly "stored, but
+ * not used by `atomStatedHydrogenCount`", so no list of labels decides it. Nothing counts a
+ * NumHydrogens on such a node: it is kept for the round trip, reported as not counted and badged.
+ */
+describe("a generic label (A, R1) keeps what the file states, and a count it cannot carry is flagged", () => {
+  const genericCdxml = (numHydrogens = ' NumHydrogens="2"') => `<CDXML><page id="1"><fragment id="2">
+      <n id="10" p="0 0" NodeType="GenericNickname" GenericNickname="A"${numHydrogens}/><n id="11" p="14 0"/>
+      <n id="12" p="28 0" NodeType="GenericNickname" GenericNickname="R1"${numHydrogens}/>
+      <b id="20" B="10" E="11"/><b id="21" B="11" E="12"/>
+    </fragment></page></CDXML>`;
+  const notCountedWarnings = (result: ReturnType<typeof openChemDraftPayload>) =>
+    result.warnings.filter((warning) => warning.code === "cdxml.atom_hydrogen_count_not_counted");
+
+  it("an A and an R1 stating 2 keep the count, warn that it is not counted, and are badged", () => {
+    const { result, molecule } = open(genericCdxml());
+    const [a, , r1] = molecule.atoms;
+    expect([a, r1]).toMatchObject([{ element: "A", hydrogenCount: 2 }, { element: "R1", hydrogenCount: 2 }]);
+    expect(hydrogenWarnings(result)).toEqual([]);
+    expect(notCountedWarnings(result)).toEqual([{
+      code: "cdxml.atom_hydrogen_count_not_counted",
+      message: "CDXML import: 2 atoms with labels naming no element state hydrogen counts a label naming no element cannot carry: atom 10 (A) states 2; " +
+        "atom 12 (R1) states 2. Only 0 counts, as a typed A or R1 label means. The stated counts are kept as stored but not counted, and the atoms are flagged.",
+      sourceObjectId: molecule.id,
+      atomIds: [a!.id, r1!.id]
+    }]);
+    expect(badges(molecule)).toEqual([
+      [a!.id, "A states 2 H, which a label naming no element cannot carry; only 0 counts."],
+      [r1!.id, "R1 states 2 H, which a label naming no element cannot carry; only 0 counts."]
+    ]);
+    // The export warning names each atom as label + drawn index ("A1", and "R1" + 3), then the badge's reason.
+    expect(nativeMoleculeExportWarnings(molecule).map((warning) => warning.message)).toEqual([
+      "A1 states 2 H, which a label naming no element cannot carry; only 0 counts.",
+      "R13 states 2 H, which a label naming no element cannot carry; only 0 counts."
+    ]);
+    // What it is not counted as: the formula and SMILES of the same labels stating nothing.
+    const plain = open(genericCdxml("")).molecule;
+    expect(nativeSingleBondGraphMetadata(molecule.atoms, molecule.bonds).formula).toBe(nativeSingleBondGraphMetadata(plain.atoms, plain.bonds).formula);
+    expect(nativeSingleBondGraphSmiles(molecule.atoms, molecule.bonds)).toBe(nativeSingleBondGraphSmiles(plain.atoms, plain.bonds));
+  });
+
+  it("one generic label alone is named with its own label text", () => {
+    const { result } = open(`<CDXML><page id="1"><fragment id="2">
+      <n id="10" p="0 0" NodeType="GenericNickname" GenericNickname="A" NumHydrogens="2"/><n id="11" p="14 0"/><b id="20" B="10" E="11"/>
+    </fragment></page></CDXML>`);
+    expect(notCountedWarnings(result).map((warning) => warning.message)).toEqual([
+      "CDXML import: atom 10 (A) states 2 hydrogens, which a label naming no element cannot carry: only 0 counts, as a typed A label means. " +
+        "The stated count is kept as stored but not counted, and the atom is flagged."
+    ]);
+  });
+
+  it("round-trips the stated counts through Save As, the visible layer, plain export and binary CDX", () => {
+    const document = open(genericCdxml()).result.document!;
+    const stated = (molecule: MoleculeObject) => [molecule.atoms[0], molecule.atoms[2]].map((atom) => [atom!.element, atom!.hydrogenCount]);
+    const expected = [["A", 2], ["R1", 2]];
+    const saved = exportDocumentToCdxml(document, { embedNativePayload: true });
+    expect(stated(moleculeOf(openChemDraftPayload(saved.contents)))).toEqual(expected);
+    const visibleOnly = openChemDraftPayload(saved.contents.replace(/<objecttag Name="org\.chemdraft\/[^>]*\/>/g, ""));
+    expect(visibleOnly.source).toBe("external-cdxml");
+    expect(stated(moleculeOf(visibleOnly))).toEqual(expected);
+    expect(notCountedWarnings(visibleOnly)).toHaveLength(1);
+    const plain = exportDocumentToCdxml(document, { embedNativePayload: false }).contents;
+    expect(plain.match(/NumHydrogens="2"/g)).toHaveLength(2);
+    const reopened = open(plain);
+    expect(stated(reopened.molecule)).toEqual(expected);
+    expect(notCountedWarnings(reopened.result)).toHaveLength(1);
+    expect(stated(moleculeOf(importCdx(exportDocumentToCdx(document).bytes)))).toEqual(expected);
+  });
+
+  it("stating 0, or nothing, is not flagged: 0 is what such a label counts", () => {
+    for (const numHydrogens of [' NumHydrogens="0"', ""]) {
+      const { result, molecule } = open(genericCdxml(numHydrogens));
+      expect(notCountedWarnings(result)).toEqual([]);
+      expect(badges(molecule)).toEqual([]);
+    }
+  });
+
+  it("an ordinary C stating a count it disagrees with is still honored, not reported as not counted", () => {
+    const { result, molecule } = open(ethanolCdxml({ c1: 'NumHydrogens="2"' }));
+    expect(molecule.atoms[0]!.hydrogenCount).toBe(2);
+    expect(notCountedWarnings(result)).toEqual([]);
+    expect(hydrogenWarnings(result)).toHaveLength(1);
+    expect(labels(molecule)[0]).toBe("H2C");
+    expect(nativeSingleBondGraphMetadata(molecule.atoms, molecule.bonds).formula).toBe("C2H5O");
+  });
+});
+
 describe("a NumHydrogens that is not a count", () => {
   it("warns, rather than dropping it silently, when NumHydrogens is not a hydrogen count", () => {
     for (const [value, element] of [["-1", ""], ["1.5", ' Element="8"'], ["two", ""]] as const) {
