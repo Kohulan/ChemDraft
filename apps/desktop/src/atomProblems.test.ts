@@ -503,8 +503,8 @@ describe("a stated hydrogen count shows everywhere, as a hand-drawn under-filled
     expect(badgeWordingAside(stated)).toEqual(badgeWordingAside(typed));
     expect(stated).toMatchObject({ labels: expected.labels, formula: expected.formula, storedFormula: expected.formula, smiles: expected.smiles });
     expect(stated.badged).toEqual(expected.badged ? [moleculesOrThrow(statedDocument)[0].atoms[0]!.id] : []);
-    // Plain, the same atoms count what their bonds give: H2, HD and CH4Fe.
-    expect((await reading(openedDocument(fragmentCdxml(body)))).formula).toBe({ H: "H2", D: "HD", C: "CH4Fe", CH3: "CH4Fe" }[typedLabel]);
+    // Plain, the same atoms count what their bonds give: a lone H or D is one radical atom (H•, D; owner decision 2026-11-23), and CH4Fe.
+    expect((await reading(openedDocument(fragmentCdxml(body)))).formula).toBe({ H: "H", D: "D", C: "CH4Fe", CH3: "CH4Fe" }[typedLabel]);
     if (typedLabel === "CH3") return; // Copy As MOL writes a typed "CH3" as a dummy atom; the engine spells it.
     for (const flavor of ["v2000", "v3000"] as const) {
       expect(copyAsMolfile(statedDocument, flavor, [])).toBe(copyAsMolfile(typedDocument, flavor, []));
