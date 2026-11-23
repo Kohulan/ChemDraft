@@ -21504,7 +21504,7 @@ export function findForeignNativeMoleculeBondTarget(
  * atom_001, so ids collide), and every per-atom, per-bond and per-ring style override the
  * absorbed molecule carries follows its parts onto their new ids. So does a stated hydrogen count:
  * a re-minted atom is new to the host's diff (`clearChangedAtomHydrogenHints`) and keeps the count
- * it carries, and the joining bond, added afterwards, drops only the counts of the atoms it reaches.
+ * it carries, and the joining bond, added afterward, drops only the counts of the atoms it reaches.
  */
 function mergeNativeMoleculeObjects(
   host: MoleculeObject,

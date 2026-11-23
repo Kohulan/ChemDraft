@@ -253,12 +253,12 @@ describe("a CDXML atom whose stated hydrogen count disagrees, in the app", () =>
     const [molecule] = moleculesOrThrow(document);
     const oxygen = oxygenOf(molecule);
     const oxygenBond = molecule.bonds.find(bond => bond.fromAtomId === oxygen.id || bond.toAtomId === oxygen.id)!;
-    const neighbour = oxygenBond.fromAtomId === oxygen.id ? oxygenBond.toAtomId : oxygenBond.fromAtomId;
+    const neighbor = oxygenBond.fromAtomId === oxygen.id ? oxygenBond.toAtomId : oxygenBond.fromAtomId;
     const paste = (atomIds: string[], bondIds: string[]) => {
       const payload = createSelectionClipboardPayload(document, [{ objectId: molecule.id, atomIds, bondIds }])!;
       return moleculesOrThrow(pasteSelectionClipboardPayload(document, payload, { x: 300, y: 300 })).at(-1)!;
     };
-    expect(oxygenOf(paste([oxygen.id, neighbour], [oxygenBond.id])).hydrogenCount).toBe(0);
+    expect(oxygenOf(paste([oxygen.id, neighbor], [oxygenBond.id])).hydrogenCount).toBe(0);
     const lone = paste([oxygen.id], []);
     expect(lone.atoms).toHaveLength(1);
     expect(oxygenOf(lone).hydrogenCount).toBeUndefined();

@@ -47,7 +47,7 @@ export function atomStatedHydrogenCount(
  * An atom `previous` does not have (a pasted or sprouted atom, or one merged in from another
  * molecule on a re-minted id) has nothing to be compared with, so it keeps the count it arrives
  * with, even though every bond at it is new here. That is what keeps a merge's absorbed atoms'
- * counts: the merge re-mints them into the host and the joining bond is added afterwards, so only
+ * counts: the merge re-mints them into the host and the joining bond is added afterward, so only
  * the two atoms that bond reaches drop theirs (their own diff sees it as a bond added at them).
  */
 export function clearChangedAtomHydrogenHints(
