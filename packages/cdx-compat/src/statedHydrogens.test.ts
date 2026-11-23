@@ -546,6 +546,115 @@ describe("a generic label (A, R1) keeps what the file states, and a count it can
   });
 });
 
+/**
+ * An abbreviation (OMe, Ph, as layout-engine's label grammar reads it) draws, counts and exports the
+ * hydrogens of what it stands for, so a NumHydrogens on its node is read by nothing: it is kept for
+ * the round trip, reported as not counted and badged, by the same chem-core rule as A or R1
+ * (`atomIgnoresStatedHydrogenCount`). A label naming an element and spelling its hydrogens (NH2,
+ * CH3) states its own count and is not reported.
+ */
+describe("an abbreviation (OMe, Ph) keeps what the file states, and reports that nothing counts it", () => {
+  const abbreviationCdxml = (numHydrogens = ' NumHydrogens="2"') => `<CDXML><page id="1"><fragment id="2">
+      <n id="10" p="0 0" Element="OMe"${numHydrogens}/><n id="11" p="14 0"/>
+      <n id="12" p="28 0" Element="Ph"${numHydrogens}/>
+      <b id="20" B="10" E="11"/><b id="21" B="11" E="12"/>
+    </fragment></page></CDXML>`;
+  const notCountedWarnings = (result: ReturnType<typeof openChemDraftPayload>) =>
+    result.warnings.filter((warning) => warning.code === "cdxml.atom_hydrogen_count_not_counted");
+
+  it("an OMe and a Ph stating 2 keep the count, warn that it is not counted, and are badged", () => {
+    const { result, molecule } = open(abbreviationCdxml());
+    const [ome, , ph] = molecule.atoms;
+    expect([ome, ph]).toMatchObject([{ element: "OMe", hydrogenCount: 2 }, { element: "Ph", hydrogenCount: 2 }]);
+    expect(hydrogenWarnings(result)).toEqual([]);
+    expect(notCountedWarnings(result)).toEqual([{
+      code: "cdxml.atom_hydrogen_count_not_counted",
+      message: "CDXML import: 2 abbreviations state hydrogen counts: atom 10 (OMe) states 2; atom 12 (Ph) states 2. " +
+        "An abbreviation's hydrogens come from what it stands for. The stated counts are kept as stored but not counted, and the atoms are flagged.",
+      sourceObjectId: molecule.id,
+      atomIds: [ome!.id, ph!.id]
+    }]);
+    expect(badges(molecule)).toEqual([
+      [ome!.id, "OMe states 2 H, which is not counted: an abbreviation's hydrogens come from what it stands for."],
+      [ph!.id, "Ph states 2 H, which is not counted: an abbreviation's hydrogens come from what it stands for."]
+    ]);
+    const detail = nativeAtomValidationState(ome!, molecule.bonds, 0, molecule.atoms).invalidDetail;
+    expect(detail).toBe("atom " + ome!.id + " (OMe) states 2 hydrogens, but an abbreviation's hydrogens come from what it stands for, so the " +
+      "stated count is kept as stored but not counted, and the atom is flagged. The label, formula and SMILES count what OMe stands for.");
+    // The export warning names each atom as label + drawn index, then the badge's reason.
+    expect(nativeMoleculeExportWarnings(molecule).map((warning) => warning.message)).toEqual([
+      "OMe1 states 2 H, which is not counted: an abbreviation's hydrogens come from what it stands for.",
+      "Ph3 states 2 H, which is not counted: an abbreviation's hydrogens come from what it stands for."
+    ]);
+    // What it is counted as: the formula, SMILES and labels of the same abbreviations stating nothing.
+    const plain = open(abbreviationCdxml("")).molecule;
+    expect(nativeSingleBondGraphMetadata(molecule.atoms, molecule.bonds).formula).toBe(nativeSingleBondGraphMetadata(plain.atoms, plain.bonds).formula);
+    expect(nativeSingleBondGraphSmiles(molecule.atoms, molecule.bonds)).toBe(nativeSingleBondGraphSmiles(plain.atoms, plain.bonds));
+    expect(labels(molecule)).toEqual(labels(plain));
+  });
+
+  it("one abbreviation alone is named with its own label text", () => {
+    const { result } = open(`<CDXML><page id="1"><fragment id="2">
+      <n id="10" p="0 0" Element="OMe" NumHydrogens="1"/><n id="11" p="14 0"/><b id="20" B="10" E="11"/>
+    </fragment></page></CDXML>`);
+    expect(notCountedWarnings(result).map((warning) => warning.message)).toEqual([
+      "CDXML import: atom 10 (OMe) states 1 hydrogen, but an abbreviation's hydrogens come from what it stands for, " +
+        "so the stated count is kept as stored but not counted, and the atom is flagged."
+    ]);
+  });
+
+  it("an abbreviation beside a generic label is worded for both", () => {
+    const { result } = open(`<CDXML><page id="1"><fragment id="2">
+      <n id="10" p="0 0" Element="OMe" NumHydrogens="2"/><n id="11" p="14 0"/>
+      <n id="12" p="28 0" NodeType="GenericNickname" GenericNickname="A" NumHydrogens="1"/>
+      <b id="20" B="10" E="11"/><b id="21" B="11" E="12"/>
+    </fragment></page></CDXML>`);
+    expect(notCountedWarnings(result).map((warning) => warning.message)).toEqual([
+      "CDXML import: 2 atoms state hydrogen counts that are not counted: atom 10 (OMe) states 2; atom 12 (A) states 1. " +
+        "Only 0 counts on a label naming no element, as a typed A label means, and an abbreviation's hydrogens come from what it stands for. " +
+        "The stated counts are kept as stored but not counted, and the atoms are flagged."
+    ]);
+  });
+
+  it("round-trips the stated counts through Save As, the visible layer, plain export and binary CDX", () => {
+    const document = open(abbreviationCdxml()).result.document!;
+    const stated = (molecule: MoleculeObject) => [molecule.atoms[0], molecule.atoms[2]].map((atom) => [atom!.element, atom!.hydrogenCount]);
+    const expected = [["OMe", 2], ["Ph", 2]];
+    const saved = exportDocumentToCdxml(document, { embedNativePayload: true });
+    expect(stated(moleculeOf(openChemDraftPayload(saved.contents)))).toEqual(expected);
+    const visibleOnly = openChemDraftPayload(saved.contents.replace(/<objecttag Name="org\.chemdraft\/[^>]*\/>/g, ""));
+    expect(visibleOnly.source).toBe("external-cdxml");
+    expect(stated(moleculeOf(visibleOnly))).toEqual(expected);
+    expect(notCountedWarnings(visibleOnly)).toHaveLength(1);
+    const plain = exportDocumentToCdxml(document, { embedNativePayload: false }).contents;
+    expect(plain.match(/NumHydrogens="2"/g)).toHaveLength(2);
+    const reopened = open(plain);
+    expect(stated(reopened.molecule)).toEqual(expected);
+    expect(notCountedWarnings(reopened.result)).toHaveLength(1);
+    expect(stated(moleculeOf(importCdx(exportDocumentToCdx(document).bytes)))).toEqual(expected);
+  });
+
+  it("stating 0, or nothing, is not flagged", () => {
+    for (const numHydrogens of [' NumHydrogens="0"', ""]) {
+      const { result, molecule } = open(abbreviationCdxml(numHydrogens));
+      expect(notCountedWarnings(result)).toEqual([]);
+      expect(badges(molecule)).toEqual([]);
+    }
+  });
+
+  it("an NH2 or CH3 label spelling its element's hydrogens, with an agreeing count, is not reported", () => {
+    const { result, molecule } = open(`<CDXML><page id="1"><fragment id="2">
+      <n id="10" p="0 0" Element="NH2" NumHydrogens="2"/><n id="11" p="14 0"/>
+      <n id="12" p="28 0" Element="CH3" NumHydrogens="3"/>
+      <b id="20" B="10" E="11"/><b id="21" B="11" E="12"/>
+    </fragment></page></CDXML>`);
+    expect(molecule.atoms.map((atom) => [atom.element, atom.hydrogenCount])).toEqual([["NH2", 2], ["C", undefined], ["CH3", 3]]);
+    expect(notCountedWarnings(result)).toEqual([]);
+    expect(hydrogenWarnings(result)).toEqual([]);
+    expect(badges(molecule)).toEqual([]);
+  });
+});
+
 describe("a NumHydrogens that is not a count", () => {
   it("warns, rather than dropping it silently, when NumHydrogens is not a hydrogen count", () => {
     for (const [value, element] of [["-1", ""], ["1.5", ' Element="8"'], ["two", ""]] as const) {

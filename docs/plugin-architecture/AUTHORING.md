@@ -979,7 +979,7 @@ carries neither, since most do not.
 
 | `reason` | Refused when | `details` |
 | --- | --- | --- |
-| `hydrogen_count_unrepresentable` | A write would store `hydrogenCount` other than 0 on an atom that cannot carry hydrogens of its own: an `H`, `D` or `T` atom, the unknown atom `*`, or another label naming no element (no element symbol starts it), such as the generic labels `A`, `Q`, `M`, `X` and R-groups like `R1`. `details.element` gives the label. No label, formula or export reads such a count, so it would be lost silently. A label that names an element and spells its hydrogens (`NH2`, `CH3`) is not refused. Omit `hydrogenCount` or set it to 0 (a request write fails with code `invalid`). A count the molecule already held unchanged is not refused. | `{ moleculeId, atomId, element, hydrogenCount }` |
+| `hydrogen_count_unrepresentable` | A write would store `hydrogenCount` other than 0 on an atom that cannot carry hydrogens of its own: an `H`, `D` or `T` atom, the unknown atom `*`, another label naming no element (no element symbol starts it), such as the generic labels `A`, `Q`, `M`, `X` and R-groups like `R1`, or an abbreviation such as `OMe`, `Ph` or `CF3`, whose hydrogens come from what it stands for. `details.element` gives the label. No label, formula or export reads such a count, so it would be lost silently. A label that names an element and spells its hydrogens (`NH2`, `CH3`, `NHMe`) is not refused. Omit `hydrogenCount` or set it to 0 (a request write fails with code `invalid`). A count the molecule already held unchanged is not refused. | `{ moleculeId, atomId, element, hydrogenCount }` |
 
 ```ts
 try {

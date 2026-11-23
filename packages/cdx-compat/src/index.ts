@@ -6632,8 +6632,8 @@ function cdxmlBondDisplayForBondStyle(display: MoleculeBond["display"]): string 
  * 2026-11-23). Any other count on a hydrogen atom cannot be kept, since no typed label draws a
  * hydrogen atom carrying hydrogens of its own: it is not stored, and a second warning says so. An atom whose label is not an element (an unknown atom, a generic label)
  * keeps what the file states, for the file's sake; on a label naming no element (the unknown atom
- * "*", a generic label such as A or R1) nothing counts it, so a count other than 0 is reported and
- * badged (`notCountedStatedHydrogens`).
+ * "*", a generic label such as A or R1) or an abbreviation (OMe, Ph) nothing counts it, so a count
+ * other than 0 is reported and badged (`notCountedStatedHydrogens`).
  * Mutates `candidates`; returns the warnings.
  */
 function keepStatedHydrogens(
@@ -6709,7 +6709,9 @@ function keepStatedHydrogens(
  * than 0: an unknown atom "*" (an Element naming nothing, an unlabeled nickname node, a "*" generic
  * label) or another generic label (A, Q, M, X, an R-group such as R1). Its label draws none, the
  * formula counts none, the molfile writes a placeholder with no valence and RDKit gives a
- * placeholder no hydrogens, so its SMILES is the same whatever the file states. The count is kept for the
+ * placeholder no hydrogens, so its SMILES is the same whatever the file states. An abbreviation
+ * (OMe, Ph, CF3, as the label grammar reads it) is reported too: its hydrogens come from what it
+ * stands for, never from a count stated on the atom. The count is kept for the
  * file's round trip (CDXML and CDX write it back), the atom is badged, and this says it is not
  * counted, in chem-core's `statedHydrogenCountNotCountedText` wording (AGENTS.md §7). A stated 0 is
  * what such an atom counts anyway, and is not reported. A hydrogen atom's count other than 0 is not

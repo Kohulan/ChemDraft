@@ -2,6 +2,9 @@ import { applyPatch, applyPatchWithHistory, createDocumentHistory, createEmptyDo
   type DocumentHistory, type DocumentPatch, type DocumentObject, type MoleculeObject, type ReactionObject } from "@chemdraft/chem-core";
 import type { PluginCommandContext, PluginSelectionSnapshot } from "@chemdraft/plugin-api";
 import { describe, expect, it, vi } from "vitest";
+// The app loads layout-engine, whose label grammar tells chem-core which labels are abbreviations
+// (chem-core `installAbbreviationLabelReader`); the plugin host reads it through chem-core.
+import "@chemdraft/layout-engine";
 import { HydrogenCountUnrepresentableReason, PluginHost, PluginHostError, writePatchOps, type PluginPatchApplicationRequest, type RequestHistory } from "./index";
 
 const now = "2026-10-22T00:00:00.000Z";
@@ -623,6 +626,53 @@ describe("direct-write invocation scope", () => {
     expect(history).toBe(original);
     expect(history.past).toHaveLength(0);
     expect(history.future).toHaveLength(0);
+  });
+
+  it("refuses setting hydrogenCount 1 on an OMe abbreviation, naming it, leaving the document and its undo history as they were", async () => {
+    // "An abbreviation" is the label grammar's reading (layout-engine, loaded by the app and imported
+    // above), not a list here. An abbreviation's hydrogens come from what it stands for.
+    const molecule: MoleculeObject = { ...cachedMolecule(), atoms: [...cachedMolecule().atoms, { id: "g", element: "OMe", x: 160, y: 120, formalCharge: 0 }],
+      bonds: [...cachedMolecule().bonds, { id: "bg", fromAtomId: "a2", toAtomId: "g", order: "single" }] };
+    let history: DocumentHistory = createDocumentHistory(applyPatch(createEmptyDocument({ now }),
+      { op: "addObject", pageId: "page_001", object: molecule }, { now }));
+    history = { ...history, present: { ...history.present, selection: { pageId: "page_001", objectIds: [molecule.id] } } };
+    const original = history;
+    const applyDocumentPatch = vi.fn((request: PluginPatchApplicationRequest) => {
+      history = applyPatchWithHistory(history, request.patch.patch as DocumentPatch);
+      return { applied: true as const, objectIds: [] };
+    });
+    const host = new PluginHost({ getActiveDocument: () => history.present, getSelection: () => snapshot([molecule.id]), applyDocumentPatch });
+    const atoms = molecule.atoms.map(atom => atom.id === "g" ? { ...atom, hydrogenCount: 1 } : atom);
+    host.registerPlugin({ id: "org.test.ome", name: "OMe count", version: "0.0.1", apiVersion: "^0.1.8", entry: "plugin.js",
+      permissions: ["document.write"], contributes: { commands: [{ id: "plugin.ome.run", title: "Run" }] }
+    }, { commandHandlers: { "plugin.ome.run": ctx => ctx.documents.applyPatch!({ reason: "OMe count",
+      patch: { op: "updateObject", objectId: molecule.id, changes: { atoms } } }) } });
+    const refused = await host.invokeCommand("plugin.ome.run").then(() => undefined, (error: unknown) => error);
+    expect(refused).toBeInstanceOf(PluginHostError);
+    expect(refused).toMatchObject({
+      message: 'Plugin write refused: atom "g" of molecule "mol_3" is OMe with hydrogenCount 1, which nothing would count: an abbreviation\'s ' +
+        "hydrogens come from what it stands for. Only 0 is allowed on an abbreviation (OMe); omit hydrogenCount or set it to 0. Nothing was changed.",
+      reason: HydrogenCountUnrepresentableReason,
+      details: { moleculeId: "mol_3", atomId: "g", element: "OMe", hydrogenCount: 1 }
+    });
+    expect(applyDocumentPatch).not.toHaveBeenCalled();
+    expect(history).toBe(original);
+    expect(history.past).toHaveLength(0);
+    expect(history.future).toHaveLength(0);
+  });
+
+  it("accepts a stated count on a label spelling its element's hydrogens (NHMe storing 1, CH3 storing 3), and 0 on an abbreviation", async () => {
+    for (const [element, hydrogenCount] of [["NHMe", 1], ["CH3", 3], ["OMe", 0]] as const) {
+      const molecule: MoleculeObject = { ...cachedMolecule(), atoms: [...cachedMolecule().atoms,
+        { id: "g", element, x: 160, y: 120, formalCharge: 0, labelLiteral: true }],
+        bonds: [...cachedMolecule().bonds, { id: "bg", fromAtomId: "a2", toAtomId: "g", order: "single" }] };
+      const atoms = molecule.atoms.map(atom => atom.id === "g" ? { ...atom, hydrogenCount } : atom);
+      const f = fixture(["mol_3"], ctx => ctx.documents.applyPatch!({ reason: "spelled", patch: { op: "updateObject", objectId: "mol_3", changes: { atoms } } }),
+        undefined, [molecule]);
+      await expect(f.host.invokeCommand("plugin.scope.run")).resolves.toMatchObject({ applied: true });
+      const written = f.document().pages[0]!.objects.find(object => object.id === "mol_3");
+      expect(written?.type === "molecule" && written.atoms.find(atom => atom.id === "g")?.hydrogenCount).toBe(hydrogenCount);
+    }
   });
 
   it("lets a plugin edit elsewhere in a molecule that already holds such a count, which it keeps", async () => {

@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { applyPatches, applyPatchWithHistory, atomStatedHydrogenCount, createDocumentHistory, createEmptyDocument, dropOrphanedHydrogenHints,
-  atomIgnoresStatedHydrogenCount, atomWithIgnoredHydrogenCount, statedHydrogenCountNotCountedText, redo, serializeDocument, deserializeDocument, undo, type MoleculeObject } from "./index";
+  atomIgnoresStatedHydrogenCount, atomWithIgnoredHydrogenCount, ignoredHydrogenCountAtomKind, installAbbreviationLabelReader,
+  statedHydrogenCountNotCountedReason, statedHydrogenCountNotCountedText, redo, serializeDocument, deserializeDocument, undo, type MoleculeObject } from "./index";
 
 // A pyrrole as CDXML imports it (aromatic ring bonds, the N's NumHydrogens and one carbon's kept),
 // with a single N–Zn bond whose dative meaning an edit can toggle.
@@ -488,6 +489,67 @@ describe("a hydrogen count an H, D or T atom cannot carry is stored as written, 
     expect(statedHydrogenCountNotCountedText([atom("h", "H", 1), atom("x", "*", 2), atom("a", "A", 2)])).toBe("3 atoms state hydrogen counts " +
       "they cannot carry: atom h (H) states 1; atom x (*) states 2; atom a (A) states 2. Only 0 counts on a hydrogen atom, an unknown atom or a " +
       "label naming no element, as a typed H, D, T, * or A label means. The stated counts are kept as stored but not counted, and the atoms are flagged.");
+  });
+});
+
+/**
+ * Which labels are abbreviations is layout-engine's label grammar's decision, which chem-core cannot
+ * import; the grammar installs it (`installAbbreviationLabelReader`). A stand-in reader here pins
+ * chem-core's side of that contract; cdx-compat statedHydrogens and plugin-host writeScope run the
+ * real grammar.
+ */
+describe("a hydrogen count stated on an abbreviation (OMe, Ph): read by the installed label grammar", () => {
+  const atom = (element: string, hydrogenCount?: number, labelLiteral?: true, id = "x") =>
+    ({ id, element, x: 0, y: 0, formalCharge: 0, ...(hydrogenCount === undefined ? {} : { hydrogenCount }), ...(labelLiteral ? { labelLiteral } : {}) });
+  const grammarStandIn = (label: string) => ["OMe", "Ph", "Me", "CF3"].includes(label);
+  afterEach(() => installAbbreviationLabelReader(undefined));
+
+  it("with no grammar installed (chem-core alone), an abbreviation reads by the element table, as before", () => {
+    expect([atom("OMe", 2), atom("Ph", 2, true), atom("CF3", 1)].map(atomIgnoresStatedHydrogenCount)).toEqual([false, false, false]);
+    expect(atomIgnoresStatedHydrogenCount(atom("Me", 2))).toBe(true);
+    expect(ignoredHydrogenCountAtomKind(atom("Me", 2))).toBe("a label naming no element");
+  });
+
+  it("flags an abbreviation stating a count other than 0, and nothing else the grammar does not call one", () => {
+    installAbbreviationLabelReader(grammarStandIn);
+    for (const subject of [atom("OMe", 2), atom("Ph", 2, true), atom("CF3", 1), atom("Me", 3, true)]) {
+      expect(atomIgnoresStatedHydrogenCount(subject)).toBe(true);
+      expect(atomStatedHydrogenCount(subject, [])).toBeUndefined();
+      expect(ignoredHydrogenCountAtomKind(subject)).toBe("an abbreviation");
+    }
+    // 0 and no count are not flagged; a held count is not a new write.
+    expect([atom("OMe", 0), atom("OMe"), atom("Ph", 0, true)].map(atomIgnoresStatedHydrogenCount)).toEqual([false, false, false]);
+    expect(atomWithIgnoredHydrogenCount([atom("OMe", 1)])?.id).toBe("x");
+    expect(atomWithIgnoredHydrogenCount([atom("OMe", 1)], [atom("OMe", 1)])).toBeUndefined();
+    // Unchanged: labels spelling an element's hydrogens, element atoms, generic labels, H and *.
+    for (const subject of [atom("NH2", 2, true), atom("CH3", 3, true), atom("NHMe", 1, true), atom("H2N", 2, true), atom("OH", 1, true)]) {
+      expect(atomIgnoresStatedHydrogenCount(subject)).toBe(false);
+    }
+    expect(atomStatedHydrogenCount(atom("C", 2), [])).toBe(2);
+    expect([atom("A", 2, true), atom("*", 2), atom("H", 1)].map(ignoredHydrogenCountAtomKind))
+      .toEqual(["a label naming no element", "an unknown atom", "a hydrogen atom"]);
+    // An element symbol is never asked: the grammar reads elements first.
+    installAbbreviationLabelReader(() => true);
+    expect(atomStatedHydrogenCount(atom("C", 2), [])).toBe(2);
+    expect(atomIgnoresStatedHydrogenCount(atom("N", 1, true))).toBe(false);
+  });
+
+  it("words it as an abbreviation's hydrogens coming from what it stands for, alone, together and beside other kinds", () => {
+    installAbbreviationLabelReader(grammarStandIn);
+    expect(statedHydrogenCountNotCountedReason(atom("OMe", 2))).toBe("OMe states 2 H, which is not counted: an abbreviation's hydrogens come from what it stands for.");
+    expect(statedHydrogenCountNotCountedReason(atom("A", 2, true))).toBe("A states 2 H, which a label naming no element cannot carry; only 0 counts.");
+    expect(statedHydrogenCountNotCountedText([atom("OMe", 1, undefined, "o")])).toBe("atom o (OMe) states 1 hydrogen, but an abbreviation's " +
+      "hydrogens come from what it stands for, so the stated count is kept as stored but not counted, and the atom is flagged.");
+    expect(statedHydrogenCountNotCountedText([atom("OMe", 2, undefined, "o"), atom("Ph", 1, undefined, "p")])).toBe("2 abbreviations state " +
+      "hydrogen counts: atom o (OMe) states 2; atom p (Ph) states 1. An abbreviation's hydrogens come from what it stands for. " +
+      "The stated counts are kept as stored but not counted, and the atoms are flagged.");
+    expect(statedHydrogenCountNotCountedText([atom("H", 1, undefined, "h"), atom("*", 2, undefined, "s"), atom("OMe", 2, undefined, "o")])).toBe("3 atoms state hydrogen counts that are not counted: " +
+      "atom h (H) states 1; atom s (*) states 2; atom o (OMe) states 2. Only 0 counts on a hydrogen or unknown atom, as a typed H, D, T or * label " +
+      "means, and an abbreviation's hydrogens come from what it stands for. The stated counts are kept as stored but not counted, and the atoms are flagged.");
+    // With no abbreviation among them, the wording is the generic one, byte for byte.
+    expect(statedHydrogenCountNotCountedText([atom("A", 2, true, "a"), atom("R1", 1, true, "r")])).toBe("2 atoms with labels naming no element " +
+      "state hydrogen counts a label naming no element cannot carry: atom a (A) states 2; atom r (R1) states 1. Only 0 counts, as a typed A or R1 " +
+      "label means. The stated counts are kept as stored but not counted, and the atoms are flagged.");
   });
 });
 

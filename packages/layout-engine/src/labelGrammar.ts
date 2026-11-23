@@ -17,6 +17,7 @@ import {
   type AbbreviationDefinition
 } from "@chemdraft/template-library";
 
+import { installAbbreviationLabelReader } from "@chemdraft/chem-core";
 import { nativeElementFromAtomLabel, nativeElementSymbols, type NativeElementSymbol } from "./valence";
 
 export const nativeAtomValence: Partial<Record<NativeElementSymbol, number>> = {
@@ -600,3 +601,19 @@ function substituentTokenFacing(token: string, headAt: "start" | "end"): string 
   const turned = turnedAbbreviationSpelling(spelling, definition, headAt);
   return turned === undefined ? undefined : `${turned}${count}`;
 }
+
+/**
+ * Whether a stored atom's label reads as a table abbreviation (OMe, Ph, Bu, CF3, TMS …): this
+ * grammar's own reading, with no bond context (so an "Ac" stays actinium, as a stored atom's
+ * label is judged on its own). A composite ("NMe2", "NHMe") and an element spelling its hydrogens
+ * ("NH2", "CH3") are not abbreviations: their own text says what hydrogens the head carries.
+ */
+function nativeLabelReadsAsAbbreviation(label: string): boolean {
+  const reading = nativeAtomLabelReading(label);
+  return reading.kind === "group" && reading.group.kind === "abbreviation";
+}
+
+// chem-core decides which stored hydrogen counts nothing counts (`atomIgnoresStatedHydrogenCount`)
+// and cannot import this package, so the grammar hands it the abbreviation reading when it loads:
+// one decision of what a label means, never a second label list in chem-core (AGENTS.md §6, §7).
+installAbbreviationLabelReader(nativeLabelReadsAsAbbreviation);
