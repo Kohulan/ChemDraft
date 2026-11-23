@@ -258,7 +258,9 @@ describe("committing a typed label over the label drawn for an aromatic NH", () 
     expect(result.document).not.toBe(document);
     expect(molecule(result.document).atoms.find(atom => atom.id === nitrogen.id)).toMatchObject({ element: "N", labelLiteral: true });
     expect(badges(result.document)).toEqual([]);
-    expect(tryNativeSingleBondGraphSmiles(molecule(result.document).atoms, molecule(result.document).bonds)?.smiles).toBe("C1=CC=[N]C=C1");
+    const kekule = tryNativeSingleBondGraphSmiles(molecule(result.document).atoms, molecule(result.document).bonds);
+    if (kekule && "refused" in kekule) throw new Error(`unexpected SMILES refusal: ${kekule.refused}`);
+    expect(kekule?.smiles).toBe("C1=CC=[N]C=C1");
   });
 
   // The refusal is narrowed to what stated counts introduced: a typed label that drops an atom's
