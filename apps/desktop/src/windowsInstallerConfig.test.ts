@@ -42,7 +42,8 @@ describe("Windows installer scopes", () => {
     expect(allusers.bundle.windows.nsis).not.toHaveProperty("installerHooks");
     const hook = read(`../src-tauri/${windows.bundle.windows.nsis.installerHooks}`);
     expect(hook).toContain("!macro NSIS_HOOK_POSTINSTALL");
-    expect(hook).toContain('WriteRegStr SHCTX "Software\\Classes\\ChemDraft Document\\shell\\open\\command" ""');
+    // The hook writes the class the installer just registered: "ChemDraft Document", or its (dev) twin.
+    expect(hook).toContain('WriteRegStr SHCTX "Software\\Classes\\$ChemDraftAssociationOwnProgId\\shell\\open\\command" ""');
     const command = hook.match(/"" '([^']+)'/)?.[1];
     expect(command).toBe('$\\"$INSTDIR\\${MAINBINARYNAME}.exe$\\" $\\"%1$\\"');
     expect(command?.replaceAll('$\\"', '"')

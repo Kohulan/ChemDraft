@@ -77,36 +77,66 @@ quoted, using `SHCTX` (HKCU per-user, HKLM all-users):
 ```
 
 The template calls `NSIS_HOOK_POSTINSTALL` after associations and shortcuts (`:727`–`729`). The
-post-install hook is wired by the Windows config for both installers and changes only the
-`ChemDraft Document` class's open command. No `.cdxml` association is added. The config test checks
-the hook wiring and resulting command with spaces in both paths.
+post-install hook is wired by the Windows config for every installer and changes only the open
+command of the class this installer just registered. No `.cdxml` association is added. The config
+test checks the hook wiring and resulting command with spaces in both paths.
 
-## File association uninstall cleanup: both installers
+## Which ProgID belongs to this build
+
+The association's ProgID is the file association's `name`: `ChemDraft Document` for stable builds
+and `ChemDraft Document (dev)` for branch builds, which `scripts/desktop-tauri.mjs` gives their own
+product name and suffixed association names. Both share this hook. The template passes the name to
+`APP_ASSOCIATE` and `APP_UNASSOCIATE` (`:660`) but defines no symbol for it, so the hook never
+hard-codes either name. `APP_ASSOCIATE` always sets `.chemdraft`'s default to this build's ProgID
+just before `NSIS_HOOK_POSTINSTALL` runs. The post-install hook reads that value, quotes the open
+command under it, and records it as `ChemDraftAssociationProgId` in this build's uninstall key
+(`${UNINSTKEY}`, named after the product name, so stable and dev builds never share it). The
+pre-uninstall hook reads it back before Tauri deletes that key. A dev install therefore never
+rewrites the stable class's command, and neither build's uninstaller touches the other's class.
+
+## File association uninstall cleanup: every installer
 
 Tauri CLI 2.11.2 supports `NSIS_HOOK_PREUNINSTALL` and `NSIS_HOOK_POSTUNINSTALL`
-(`installer-tauri-cli-v2.11.2.nsi:772`–`774`, `:880`–`882`). Its `APP_UNASSOCIATE`
-macro restores `.chemdraft`'s default from `ChemDraft Document_backup` and deletes the
-`ChemDraft Document` ProgID key, but leaves the extension key and backup value behind
-(`FileAssociation-tauri-cli-v2.11.2.nsh:108`–`114`). A reinstall can save ChemDraft's own
-ProgID as the backup, so uninstall restores a default pointing to the removed program.
-The macro also restores the backup even if another program has since claimed the extension.
+(`installer-tauri-cli-v2.11.2.nsi:772`–`774`, `:880`–`882`). At install, `APP_ASSOCIATE` saves
+`.chemdraft`'s previous default as `<ProgID>_backup`. At uninstall, `APP_UNASSOCIATE` writes that
+backup back as the default, even if another program has claimed the extension since, and deletes the
+ProgID key, but leaves the extension key and backup value behind
+(`FileAssociation-tauri-cli-v2.11.2.nsh:108`–`114`). A reinstall saves the build's own ProgID as the
+backup, so uninstall would restore a default pointing to the removed program.
 
-The shared pre-uninstall hook records the current default and whether it exists. After Tauri's
-cleanup, the post-uninstall hook restores that state before checking ownership. It resets Tauri's
-shell context with `SetContext`, since optional app-data deletion switches it to the current user.
-All registry operations use `SHCTX`: HKCU for per-user installs, HKLM for all-users installs.
-The hook deletes the `ChemDraft Document` ProgID tree, its backup value, and only its named
-`OpenWithProgids` value. It deletes the `.chemdraft` key only when its default still matches
-`ChemDraft Document` exactly, using case-sensitive `StrCmpS`. A different program's default and
-OpenWith entries survive; a missing default stays missing. No other extension is touched.
-Finally, Tauri's `UPDATEFILEASSOC` macro calls
-`SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_FLUSH, 0, 0)` to refresh the shell.
+The hook removes only what this installer registered:
 
-Source-text tests cover these guards; they do not execute NSIS. The uninstall fix still requires
-Vitest verification by the integrator and real Windows tests of both CI-built installers. Check
-silent `/S` uninstall after a clean install and reinstall, a changed or missing default, another
-program's OpenWith entry, and uninstall with app-data removal selected. Confirm cleanup in the
-correct registry hive and preservation of associations owned by another program.
+- The pre-uninstall hook records this build's ProgID and the current default, including whether it
+  exists. The post-uninstall hook first restores the install scope with `SetContext`, since optional
+  app-data deletion switches the shell context to the current user. All registry operations use
+  `SHCTX`: HKCU for per-user installs, HKLM for all-users installs.
+- If the default before uninstall was **not** this build's ProgID (another program, or the other
+  ChemDraft build, claimed `.chemdraft` later), that owner is put back over Tauri's restored backup;
+  a missing default stays missing.
+- If this build **was** the owner, the owner Tauri restored from the backup is kept: the program that
+  owned `.chemdraft` before ChemDraft was installed, or the other ChemDraft build. The default is
+  removed instead only when it is this build's own ProgID (a reinstall's self-backup), empty
+  (nothing owned it before), or a class that no longer exists in `HKCR` (an owner uninstalled since).
+  The ownership comparisons are case-sensitive.
+- It deletes this build's ProgID tree, its own `<ProgID>_backup` value, and only its own value
+  under `.chemdraft\OpenWithProgids`. Another program's or the other build's ProgID, backup value
+  and OpenWith entries are never touched.
+- It never deletes `.chemdraft` or `OpenWithProgids` wholesale. Each is removed only when it is then
+  empty: no default value, no other values and no subkeys (checked explicitly, then
+  `DeleteRegKey /ifempty`). No other extension is touched.
+- Finally, Tauri's `UPDATEFILEASSOC` macro calls
+  `SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_FLUSH, 0, 0)` to refresh the shell.
+
+`apps/desktop/src/windowsAssociationQuoting.test.ts` runs the hook's own text through a small
+interpreter for the NSIS commands it uses, over an in-memory registry, with Tauri's association
+macros modeled after the saved template. It covers stable and dev builds installed in the same
+scope and uninstalled in either order, a reinstall, a program that owned `.chemdraft` before install
+or claimed it afterward, another program's OpenWith entry, a missing default, and a case-only
+mismatch. It does not execute NSIS. The cleanup still requires real Windows tests of the CI-built
+installers. Check silent `/S` uninstall after a clean install and reinstall, a stable and a dev build
+side by side, a changed or missing default, another program's OpenWith entry, and uninstall with
+app-data removal selected. Confirm cleanup in the correct registry hive and preservation of
+associations owned by another program.
 
 ## Updates require administrator rights for the machine install
 

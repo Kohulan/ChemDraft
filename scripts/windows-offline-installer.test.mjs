@@ -51,22 +51,33 @@ test('allows normal feeds and missing feeds for unsigned dry runs', () => withDi
 }));
 
 for (const feed of ['latest.json', 'latest-allusers.json']) {
-  test(`rejects offline references and malformed JSON in ${feed}`, () => withDirectory((directory) => {
+  test(`rejects offline installer URLs and malformed JSON in ${feed}`, () => withDirectory((directory) => {
     const path = join(directory, feed);
-    for (const content of [
-      { platforms: { 'windows-x86_64': { url: 'https://example.com/ChemDraft_1.0.0_x64-allusers-OFFLINE-setup.exe' } } },
-      { notes: 'offline' },
+    for (const url of [
+      'https://example.com/ChemDraft_1.0.0_x64-allusers-offline-setup.exe',
+      'https://example.com/ChemDraft_1.0.0_x64-allusers-OFFLINE-setup.exe',
+      'https://example.com/ChemDraft_1.0.0_x64-allusers-%6Fffline-setup.exe?download=1',
     ]) {
-      writeFileSync(path, JSON.stringify(content));
-      assert.throws(() => checkUpdaterArtifacts(directory), { message: `${feed} must not mention offline installers.` });
+      writeFileSync(path, JSON.stringify({ notes: 'ChemDraft 1.0.0', platforms: { 'windows-x86_64': { url } } }));
+      assert.throws(() => checkUpdaterArtifacts(directory), { message: `${feed} must not point at offline installers.` });
     }
-    writeFileSync(path, '{"url":"https://example.com/allusers-\\u006fffline-setup.exe"}');
-    assert.throws(() => checkUpdaterArtifacts(directory), /must not mention offline installers/);
     const result = spawnSync(process.execPath, [script, 'check', directory], { encoding: 'utf8' });
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /must not mention offline installers/);
+    assert.match(result.stderr, /must not point at offline installers/);
     writeFileSync(path, '{ malformed');
     assert.throws(() => checkUpdaterArtifacts(directory), { message: `${feed} contains invalid JSON.` });
+  }));
+
+  test(`allows release notes in ${feed} that mention the offline installer`, () => withDirectory((directory) => {
+    const suffix = feed === 'latest.json' ? '' : '-allusers';
+    writeFileSync(join(directory, feed), JSON.stringify({
+      version: '1.0.0',
+      notes: 'New: an offline all-users installer (ChemDraft_1.0.0_x64-allusers-offline-setup.exe) for machines without internet access.',
+      platforms: { 'windows-x86_64': { url: `https://example.com/ChemDraft_1.0.0_x64${suffix}-setup.exe` } },
+    }));
+    checkUpdaterArtifacts(directory);
+    const result = spawnSync(process.execPath, [script, 'check', directory], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
   }));
 }
 

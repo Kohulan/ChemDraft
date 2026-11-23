@@ -10,6 +10,18 @@ export const offlineConfig = {
   },
 };
 
+// The offline variant is staged as ChemDraft_<ver>_x64-allusers-offline-setup.exe
+// (`tools/release/record-build.mjs` BUILD_TARGETS). Check the file name a URL downloads.
+function urlFileName(url) {
+  const path = url.split(/[?#]/)[0];
+  const name = path.slice(path.lastIndexOf('/') + 1);
+  try {
+    return decodeURIComponent(name);
+  } catch {
+    return name;
+  }
+}
+
 export function checkUpdaterArtifacts(directory) {
   const files = readdirSync(directory);
   if (files.some((name) => /offline.*\.sig$/i.test(name))) {
@@ -25,8 +37,13 @@ export function checkUpdaterArtifacts(directory) {
     } catch (error) {
       throw new Error(`${feed} contains invalid JSON.`, { cause: error });
     }
-    if (/offline/i.test(content) || /offline/i.test(JSON.stringify(manifest))) {
-      throw new Error(`${feed} must not mention offline installers.`);
+    // Release notes may talk about the offline installer; a download URL must never deliver it.
+    const platforms = manifest && typeof manifest === 'object' ? manifest.platforms : undefined;
+    for (const entry of Object.values(platforms && typeof platforms === 'object' ? platforms : {})) {
+      const url = entry && typeof entry === 'object' ? entry.url : undefined;
+      if (typeof url === 'string' && /offline/i.test(urlFileName(url))) {
+        throw new Error(`${feed} must not point at offline installers.`);
+      }
     }
   }
 }

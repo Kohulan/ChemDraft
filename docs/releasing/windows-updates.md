@@ -40,8 +40,8 @@ All-users offline installer (includes the WebView2 runtime, about 180 MB larger;
 
 `ChemDraft_<ver>_x64-allusers-offline-setup.exe` uses the same all-users overlay, installation scope,
 file associations and `latest-allusers.json` endpoint. Once internet access is available, it updates
-by downloading the normal all-users installer. It has no separate feed or updater `.sig`; neither
-feed may mention offline installers. It receives the same Authenticode signing and verification as
+by downloading the normal all-users installer. It has no separate feed or updater `.sig`; no
+feed entry may point at the offline installer. It receives the same Authenticode signing and verification as
 the other installers, and is included in the `windows-release` workflow artifact on dispatch dry
 runs and uploaded beside them when `upload_to_release` is supplied.
 
@@ -150,8 +150,8 @@ directory, outside the checkout) after the all-users overlay. The
 generator, `scripts/windows-offline-installer.mjs`, sets `offlineInstaller` with `silent: true` for
 WebView2 and disables updater artifacts without changing file associations. This variant skips
 updater signing and feed generation while retaining Authenticode signing, its build record and upload. The workflow
-assertion rejects offline updater signatures and any mention of `offline` in either generated feed,
-and the asset checker refuses an offline `.exe.sig`.
+assertion rejects offline updater signatures and any generated feed whose platform download URL names
+the offline installer (release notes may mention it), and the asset checker refuses an offline `.exe.sig`.
 
 To regenerate the all-users feed from its already signed CI artifact:
 
@@ -204,14 +204,26 @@ CI builds; submitting a VM-built installer through the workflow is not supported
 ## Verification
 
 An end-to-end test needs two signed stable CI builds with increasing versions and a local feed.
-Run it separately for each installer scope; do not install both copies at once:
+Run it separately for each installer scope; do not install both copies at once.
 
-1. Build the older version with an extra `--config` that points `plugins.updater.endpoints` at
-   `http://127.0.0.1:<port>/latest.json` and sets `dangerousInsecureTransportProtocol: true`.
-   Test builds only.
-2. Build the newer version the same way, adding a `--config` that raises `version`.
-3. Serve the newer installer, plus a `latest.json` from step 3 above whose URL points at the local
-   server.
+**How the test installers are produced.** Installers are built only by CI, never on a local machine
+or in a VM. The `windows-release` workflow's dispatch inputs (`ref`, `upload_to_release`,
+`allow_unsigned_upload`, `notes_file`) cannot add a `--config` or change the version, and the
+workflow has no other way to take them. So each test installer is a CI build of a throwaway test
+branch whose checked-in configuration already carries the test settings: commit them on the branch,
+dispatch `windows-release` from that branch with `ref` set to its full commit SHA (the workflow
+requires the two to match), leave `upload_to_release` empty, and download the installers from the
+run's `windows-release` artifact. Never merge such a branch or attach its installers to a release.
+
+1. For the older build, the test branch sets `dangerousInsecureTransportProtocol: true` and points
+   `plugins.updater.endpoints` at `http://127.0.0.1:<port>/latest.json` in `tauri.windows.conf.json`.
+   For the all-users installer it also points the endpoint in `tauri.allusers.conf.json`, which
+   replaces the Windows one, at `http://127.0.0.1:<port>/latest-allusers.json`. Test builds only.
+2. For the newer build, a second commit on the test branch also raises `version` in
+   `apps/desktop/src-tauri/tauri.conf.json`; dispatch the workflow again with that commit's SHA.
+3. Serve the newer installer, plus a feed generated from it as in step 3 of the release steps above
+   (`pnpm release:windows-manifest`, which only writes the feed and builds nothing), whose URL points
+   at the local server.
 4. Install the older build and launch it. Success means:
    - the automatic check (or the menu item) offers the newer version;
    - accepting it downloads, saves the session, shows the passive installer, and reopens ChemDraft
@@ -219,9 +231,13 @@ Run it separately for each installer scope; do not install both copies at once:
    - a drawing made before the update is still there after the relaunch.
 5. Uninstall the test build. The NSIS installer remembers the folder it last installed to, so a
    silent install (`/S`) without `/D=<folder>` reuses that remembered folder instead of the default
-   per-user location. After installing a test build into a separate folder with `/D=...`, pass
-   `/D=%LOCALAPPDATA%\ChemDraft` explicitly when reinstalling the stable release (or it lands in the
-   test folder); `/D` must be the last argument and must not be quoted.
+   location. After installing a test build into a separate folder with `/D=...`, pass the scope's
+   default folder explicitly when reinstalling the stable release (or it lands in the test folder):
+   - per-user: `ChemDraft_<ver>_x64-setup.exe /S /D=%LOCALAPPDATA%\ChemDraft`;
+   - all-users, from an **elevated** prompt:
+     `ChemDraft_<ver>_x64-allusers-setup.exe /S /D=C:\Program Files\ChemDraft`.
+
+   `/D` must be the last argument and must not be quoted, even when the path contains spaces.
 
 For all-users verification, retain the all-users overlay on both CI builds and override its endpoint
 with the local `latest-allusers.json` feed. Check Program Files and the all-users Start Menu shortcut,
