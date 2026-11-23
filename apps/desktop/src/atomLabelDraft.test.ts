@@ -175,8 +175,10 @@ describe("atom-label draft rollback", () => {
 // Master decision 2026-11-22 (refined): a typed label that equals the label drawn for the atom, its
 // implicit H included, says nothing new, so committing it changes nothing: the stated count and the
 // aromatic ring's Kekule hint stay. Typed text that differs from the drawn label wins and drops the
-// count. A retype that leaves the aromatic system without a Kekule pattern is never silent: the
-// ring's atoms are badged, as for any other label edit (AGENTS.md section 7).
+// count. A typed retype that drops the stated count and leaves the aromatic system without a Kekule
+// pattern, or moves its H, is refused. Everything else a label commit does is as it was before stated
+// counts were kept: a hover hotkey, or a typed label on an atom with no stated count, commits and the
+// validator badges what it leaves unresolved (AGENTS.md section 7).
 describe("committing a typed label over the label drawn for an aromatic NH", () => {
   const ring = (smiles: string) => {
     const graph = testMoleculeFromSmiles(smiles);
@@ -257,6 +259,82 @@ describe("committing a typed label over the label drawn for an aromatic NH", () 
     expect(molecule(result.document).atoms.find(atom => atom.id === nitrogen.id)).toMatchObject({ element: "N", labelLiteral: true });
     expect(badges(result.document)).toEqual([]);
     expect(tryNativeSingleBondGraphSmiles(molecule(result.document).atoms, molecule(result.document).bonds)?.smiles).toBe("C1=CC=[N]C=C1");
+  });
+
+  // The refusal is narrowed to what stated counts introduced: a typed label that drops an atom's
+  // stated count or Kekule hint. The cases below are pinned to what base 3940d5cd3 (before stated
+  // counts were kept on edit) does with the same input.
+  const placed = (smiles: string, keepHints: boolean) => {
+    const graph = testMoleculeFromSmiles(smiles);
+    const object: MoleculeObject = { id: "m", type: "molecule", x: 0, y: 0, width: 100, height: 100, rotation: 0, style: {},
+      structureFormat: "molfile-v2000", structure: "", superatoms: [], rGroups: [],
+      atoms: graph.atoms.map(({ hydrogenCount, ...atom }) => ({ ...atom, ...(keepHints && hydrogenCount !== undefined ? { hydrogenCount } : {}),
+        x: 200 + atom.x * 3, y: 200 + atom.y * 3 })), bonds: [...graph.bonds] };
+    const base = createPhase4Document("Retype");
+    return applyPatches(base, [{ op: "addObject", pageId: base.pages[0]!.id, object }]);
+  };
+  const unresolvedEverywhere = (document: ChemDraftDocument) => {
+    const shown = badges(document);
+    expect(shown.map(state => state.atomId).sort()).toEqual(molecule(document).atoms.map(atom => atom.id).sort());
+    expect(shown.every(state => state.unresolvedAromatic === true)).toBe(true);
+  };
+
+  it("\"O\" by hotkey over a benzene carbon commits with its badge, as before", () => {
+    const document = placed("c1ccccc1", true);
+    const carbon = molecule(document).atoms[0]!;
+    const result = commitNativeAtomLabelTarget(document, { objectId: "m", kind: "atom", atomId: carbon.id, distanceToPointer: 0 }, "O");
+    expect(result.refusal).toBeUndefined();
+    expect(result.message).toBeUndefined();
+    expect(result.target).toMatchObject({ kind: "atom", atomId: carbon.id });
+    const relabeled = molecule(result.document).atoms.find(atom => atom.id === carbon.id)!;
+    expect(relabeled.element).toBe("O");
+    expect(relabeled.labelLiteral).toBeUndefined();
+    // The ring has no Kekule pattern with O in it: every ring atom is badged, the O included.
+    unresolvedEverywhere(result.document);
+    expect(badges(result.document)).toContainEqual(expect.objectContaining({ atomId: carbon.id,
+      invalidReason: "O: its aromatic bonds don't resolve into single and double bonds." }));
+  });
+
+  it.each(rings)("\"N\" by hotkey over the drawn NH of %s is no edit at all, as before", (_name, smiles) => {
+    const { document, nitrogen, target } = ring(smiles);
+    // The hotkey neither types a literal label nor changes the element, so nothing changes: the
+    // stated count and the Kekule hint stay, and the app reports it could not set the atom.
+    const result = commitNativeAtomLabelTarget(document, target, "N");
+    expect(result.document).toBe(document);
+    expect(result.refusal).toBeUndefined();
+    expect(result.message).toBeUndefined();
+    expect(molecule(result.document).atoms.find(atom => atom.id === nitrogen.id)).toEqual(nitrogen);
+  });
+
+  it("\"O\" typed over a benzene carbon, which states no count, commits with its badge, as before", () => {
+    const document = placed("c1ccccc1", true);
+    const carbon = molecule(document).atoms[0]!;
+    expect(carbon.hydrogenCount).toBeUndefined();
+    const result = commitNativeAtomLabelTarget(document, { objectId: "m", kind: "atom", atomId: carbon.id, distanceToPointer: 0 }, "O",
+      { literal: true, replaceElement: true });
+    expect(result.refusal).toBeUndefined();
+    expect(result.message).toBeUndefined();
+    expect(molecule(result.document).atoms.find(atom => atom.id === carbon.id)).toMatchObject({ element: "O", labelLiteral: true });
+    unresolvedEverywhere(result.document);
+  });
+
+  it.each(rings)("\"N\" typed over the N of %s drawn with no stated count commits with its badge, as before", (name, smiles) => {
+    const document = placed(smiles, false);
+    const nitrogen = molecule(document).atoms.find(atom => atom.element === "N")!;
+    expect(molecule(document).atoms.every(atom => atom.hydrogenCount === undefined)).toBe(true);
+    const result = commitNativeAtomLabelTarget(document, { objectId: "m", kind: "atom", atomId: nitrogen.id, distanceToPointer: 0 }, "N",
+      { literal: true, replaceElement: true });
+    expect(result.refusal).toBeUndefined();
+    expect(result.message).toBeUndefined();
+    expect(molecule(result.document).atoms.find(atom => atom.id === nitrogen.id)).toMatchObject({ element: "N", labelLiteral: true });
+    if (name === "imidazole") {
+      // The ring still kekulizes, with the H guessed onto the other N: that N is badged.
+      const other = molecule(result.document).atoms.find(atom => atom.element === "N" && atom.id !== nitrogen.id)!;
+      expect(badges(result.document)).toEqual([expect.objectContaining({ atomId: other.id, tautomerGuessed: true,
+        invalidReason: "N: hydrogen count guessed from the aromatic bonds. Draw the H to settle it." })]);
+    } else {
+      unresolvedEverywhere(result.document);
+    }
   });
 });
 

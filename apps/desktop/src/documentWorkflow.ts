@@ -9826,15 +9826,21 @@ export function commitNativeAtomLabelTarget(
 }
 
 /**
- * Why a typed relabel of a ring atom must be refused, or undefined when it may be committed. It is
- * refused when it would leave an aromatic system with no Kekulé pattern ("N" over a pyrrole or
- * indole NH) or move a tautomeric hydrogen onto another atom ("N" over an imidazole NH, which would
- * have the H guessed onto the other N). Both are read from the bond-order resolution the validator
- * badges from (`nativeBondOrderResolution`): an atom unresolved after the edit that was not before,
- * or another atom whose H count is guessed after the edit and was not before. Only problems the
- * edit introduces count, so a ring already broken before it does not block an unrelated retype.
- * The message names the label that keeps the ring valid when the drawn label is the typed element
- * with its hydrogens ("NH") and committing that is clean. Master decision 2026-11-22.
+ * Why a typed relabel must be refused, or undefined when it may be committed. It is refused only
+ * when all of these hold: the label was typed (`literal`; hover hotkeys are not), the atom stated a
+ * hydrogen count before the edit (a kept CDXML count, or an aromatic ring's Kekulé hint), the relabel
+ * drops that count, and dropping it leaves an aromatic system with no Kekulé pattern ("N" over a
+ * pyrrole or indole NH) or moves a tautomeric hydrogen onto another atom ("N" over an imidazole NH,
+ * which would have the H guessed onto the other N). Anything else — a hotkey, an atom with no stated
+ * count, a substituent attachment — commits as it did before stated counts were kept, and the
+ * validator badges whatever it leaves unresolved ("O" by hotkey over a benzene carbon).
+ *
+ * Both breakages are read from the bond-order resolution the validator badges from
+ * (`nativeBondOrderResolution`): an atom unresolved after the edit that was not before, or another
+ * atom whose H count is guessed after the edit and was not before. Only problems the edit introduces
+ * count, so a ring already broken before it does not block an unrelated retype. The message names
+ * the label that keeps the ring valid when the drawn label is the typed element with its hydrogens
+ * ("NH") and committing that is clean. Master decision 2026-11-22, narrowed the same day.
  */
 function typedLabelRingRefusal(
   normalized: string,
@@ -9845,7 +9851,11 @@ function typedLabelRingRefusal(
   beforeMolecule: MoleculeObject,
   options: { literal?: boolean }
 ): string | undefined {
-  if (target.kind !== "atom") return undefined;
+  if (target.kind !== "atom" || options.literal !== true || beforeAtom.hydrogenCount === undefined) return undefined;
+  const relabeledAtom = firstPage(relabeled).objects
+    .find((object): object is MoleculeObject => object.id === target.objectId && object.type === "molecule")
+    ?.atoms.find(atom => atom.id === target.atomId);
+  if (relabeledAtom?.hydrogenCount !== undefined) return undefined;
   const before = nativeBondOrderResolution(beforeMolecule.atoms, beforeMolecule.bonds);
   const breaks = (next: ChemDraftDocument) => {
     const molecule = firstPage(next).objects.find((object): object is MoleculeObject =>
