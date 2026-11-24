@@ -1,7 +1,6 @@
 import { z } from "zod";
 import { ChemDraftDocumentSchema, type ChemDraftDocument } from "./schemas";
 import { normalizeBracketPairs } from "./brackets";
-import { duplicateIdRenumberingMessage, renumberDuplicateIds } from "./duplicateIds";
 import { nativeSchemaInventory, NativeDocumentBaselineAppVersion, NativeDocumentFeatureVersions, NativeDocumentFormatVersion, NativeDocumentReaderVersion } from "./documentFeatures";
 import { NativeFieldPatternSchema, nativeFieldPatternMatches, nativeFieldPatternsOverlap } from "./nativeFieldPatterns";
 import { DefaultNativeDrawingStyle, NativeStylePresets } from "./styles";
@@ -16,8 +15,7 @@ export type NativeDocumentWarningCode =
   | "NATIVE_STYLE_PRESET_FALLBACK"
   | "NATIVE_CHEMISTRY_ENUM_FALLBACK"
   | "NATIVE_BRACKET_USAGE_PRESERVED"
-  | "NATIVE_VISUAL_ENUM_FALLBACK"
-  | "NATIVE_DUPLICATE_IDS_RENUMBERED";
+  | "NATIVE_VISUAL_ENUM_FALLBACK";
 
 export interface NativeDocumentReadWarning {
   code: NativeDocumentWarningCode;
@@ -113,10 +111,6 @@ export function readNativeDocument(
   if (newer) normalizeStylePresetIds(working, preserve);
   const finish = (document: ChemDraftDocument): NativeDocumentReadResult => {
     preserveOmittedJsonKeys(working, document, [], preserve);
-    // Before extension paths are made stable: they name objects, atoms and bonds by unique id.
-    const renumbered = renumberDuplicateIds(document);
-    if (renumbered.length) warnings.push({ code: "NATIVE_DUPLICATE_IDS_RENUMBERED", path: ["pages"],
-      originalValue: renumbered, message: duplicateIdRenumberingMessage(renumbered) });
     // Orphan cleanup removes the active usage marker along with the pair's known semantics.
     // Keep an unrecognized source usage even in that case; it remains uninterpreted file data.
     for (const extension of extensions) {
