@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { Acs1996StylePreset, NativeStylePresets, createEmptyDocument, applyPatches,
   type CompatibilityWarning, type ElectronMarkObject, type MoleculeObject } from "@chemdraft/chem-core";
 import { createSmilesMolecule } from "@chemdraft/document-workflow-core";
+import { moleculeLayoutLabelBoxes } from "@chemdraft/layout-engine";
 import { allShellCommands, nativeStylePresetActions, nativeStylePresetCommandId, nativeStylePresetIdForCommand } from "./commands";
 import { buildAppMenuModel, flattenAppMenuCommands, nativeStylePresetMenuItems } from "./appMenu";
 import { pluginItemsForNativeMenu } from "./plugins/nativePluginMenu";
@@ -53,9 +54,46 @@ describe("native style presets through commit normalization", () => {
     expect(styledMark).toMatchObject({ anchor: mark.anchor, charge: -1 });
     expect(styledMark.atomAssociation).toBe(mark.atomAssociation);
     const offset = kind === "explicit far" ? 400 : -20;
-    expect(styledMark.x + styledMark.width / 2 - styled.atoms[0]!.x)
-      .toBeCloseTo(offset * Acs1996StylePreset.drawing.bondLengthPx / 40, 9);
+    const scaled = offset * Acs1996StylePreset.drawing.bondLengthPx / 40;
+    // CodeRabbit #422 follow-up O: a scaled mark that would overlap its atom's label is pushed out
+    // along its direction to sit 1 px clear of the label box. The far mark stays at its scaled offset;
+    // the over-valent O⁻'s scaled -11 px would overlap the O label, so it moves just clear of it.
+    const label = moleculeLayoutLabelBoxes(styled).find(box => box.atom === 0);
+    const expected = kind === "explicit far" ? scaled : label!.x - styledMark.width / 2 - 1 - styled.atoms[0]!.x;
+    if (kind !== "explicit far") expect(scaled + styledMark.width / 2).toBeGreaterThan(label!.x - styled.atoms[0]!.x);
+    expect(styledMark.y + styledMark.height / 2).toBeCloseTo(mark.y + mark.height / 2, 9);
+    expect(styledMark.x + styledMark.width / 2 - styled.atoms[0]!.x).toBeCloseTo(expected, 9);
     expect(normalizeCommittedDocument(result)).toBe(result);
+  });
+
+  it("clears each page's mark against its own page's atom when ids repeat across pages", () => {
+    // Object ids are unique only within a page. Page 2 repeats page 1's molecule and mark ids, at
+    // another position and with its mark already clear of a C label; the preset styles page 1 only.
+    const { document, molecule, mark } = markedPresetFixture();
+    molecule.atoms[0]!.element = "O";
+    molecule.bonds[0]!.order = "double";
+    const shift = (x: number, y: number) => ({ x: x + 300, y: y + 250 });
+    const other: MoleculeObject = { ...molecule, ...shift(molecule.x, molecule.y),
+      atoms: molecule.atoms.map(atom => ({ ...atom, ...shift(atom.x, atom.y), element: "C" })),
+      bonds: molecule.bonds.map(bond => ({ ...bond, order: "single" as const })) };
+    const otherMark: ElectronMarkObject = { ...mark, ...shift(mark.x - 30, mark.y) };
+    document.pages.push({ ...document.pages[0]!, id: "page-2", objects: [other, otherMark] });
+    const before = normalizeCommittedDocument(document);
+    const warnings: CompatibilityWarning[] = [];
+    const patch = nativeStylePresetPatchForSelection(before, Acs1996StylePreset.id, [], warnings);
+    expect(warnings).toEqual([]);
+    const result = normalizeCommittedDocument(applyPatches(before, patch.patches));
+    const styled = result.pages[0]!.objects.find(object => object.id === molecule.id) as MoleculeObject;
+    const styledMark = result.pages[0]!.objects.find(object => object.id === mark.id) as ElectronMarkObject;
+    expect(styled.style.stylePresetId).toBe(Acs1996StylePreset.id);
+    // Page 1's mark is pushed just clear of page 1's O label, exactly as on a single page.
+    const label = moleculeLayoutLabelBoxes(styled).find(box => box.atom === 0)!;
+    expect(styledMark.x + styledMark.width / 2 - styled.atoms[0]!.x)
+      .toBeCloseTo(label.x - styledMark.width / 2 - 1 - styled.atoms[0]!.x, 9);
+    expect(styledMark.y + styledMark.height / 2).toBeCloseTo(mark.y + mark.height / 2, 9);
+    expect(styledMark).toMatchObject({ anchor: mark.anchor, charge: -1 });
+    // Page 2 is outside the selection's page and keeps its own molecule and mark untouched.
+    expect(result.pages[1]!.objects).toEqual(before.pages[1]!.objects);
   });
 
   it.each(["charge", "radical-dot"] as const)("still refuses a preset that would lose a real %s contribution", markKind => {

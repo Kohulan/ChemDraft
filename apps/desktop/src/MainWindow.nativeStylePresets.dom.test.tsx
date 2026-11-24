@@ -57,8 +57,12 @@ describe.each(["macos", "windows"] as const)("MainWindow native style presets (%
     const committed = normalizeCommittedDocument(applyPatches(initial, patch.patches));
     const styled = committed.pages[0]!.objects[0] as MoleculeObject;
     expect(styled.atoms[0]).toMatchObject({ x: 145, y: 100, formalCharge: -1, markCharge: -1 });
-    expect(committed.pages[0]!.objects[1]).toMatchObject({ x: 128, y: 94,
-      anchor: { kind: "atom", objectId: "chain", atomId: "a0" } });
+    // CodeRabbit #422 follow-up O: the scaled mark (x 128) would sit on the wide H₂C label, so it is
+    // pushed out along its direction, but never past 0.95 of the association radius, where this
+    // legacy (non-explicit) mark would stop counting for a0 and the style would change chemistry.
+    const mark = committed.pages[0]!.objects[1]!;
+    expect(mark).toMatchObject({ y: 94, anchor: { kind: "atom", objectId: "chain", atomId: "a0" } });
+    expect(mark.x).toBeCloseTo(145 - 0.95 * 22 * 1.15 - 6, 9);
   });
 
   it("shows the chemistry refusal and leaves the molecule and mark unchanged", async () => {

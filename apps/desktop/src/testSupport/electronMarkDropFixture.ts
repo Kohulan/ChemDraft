@@ -82,3 +82,26 @@ export function electronMarkDropFixture(spec: NativeElectronMarkSpec = { kind: "
     { kind: "atom", objectId: molecule.id, atomId: sourceAtom.id, distanceToPointer: 0 }));
   return { document, nitrogen, carbonylOxygen, hydroxylOxygen, saturatedCarbon, sourceAtom };
 }
+
+/**
+ * A three-atom zigzag chain (C–C–N ethylamine, C–C–C propane, ...) drawn at one bond length (22 px),
+ * with the charge tool's mark on `markedIndex`: the small molecules where any three atoms fit an
+ * exact affine map, so a mark's offset must never be read from such a fit (1.2.3 hands-on).
+ */
+export function threeAtomChainElectronMarkFixture(smiles: string, markedIndex: number,
+  spec: NativeElectronMarkSpec | 1 = 1) {
+  let document = createPhase4Document("Three-atom chain");
+  const graph = testMoleculeFromSmiles(smiles);
+  const dx = 22 * Math.cos(Math.PI / 6), dy = 22 * Math.sin(Math.PI / 6);
+  const points = [{ x: 206, y: 261 }, { x: 206 + dx, y: 261 - dy }, { x: 206 + 2 * dx, y: 261 }];
+  const atoms = graph.atoms.map((atom, index) => ({ ...atom, ...points[index] }));
+  const molecule: MoleculeObject = { id: "three_atom_chain", type: "molecule", x: 206, y: 261 - dy, width: 2 * dx, height: dy,
+    rotation: 0, style: {}, atoms, bonds: graph.bonds, structureFormat: "smiles",
+    structure: nativeSingleBondGraphSmiles(atoms, graph.bonds), chemistry: nativeSingleBondGraphMetadata(atoms, graph.bonds),
+    superatoms: [], rGroups: [] };
+  document = applyPatches(document, [{ op: "addObject", pageId: document.pages[0].id, object: molecule }], { now: phase4Timestamp });
+  document = normalizeCommittedDocument(applyChargeToolAtNativeAtom(document, spec,
+    { kind: "atom", objectId: molecule.id, atomId: atoms[markedIndex].id, distanceToPointer: 0 }));
+  return { document, moleculeId: molecule.id, atomIds: atoms.map(atom => atom.id), bondIds: graph.bonds.map(bond => bond.id),
+    markedAtomId: atoms[markedIndex].id };
+}

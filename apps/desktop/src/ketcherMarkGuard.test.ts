@@ -158,6 +158,9 @@ describe("Ketcher Apply status", () => {
     expect(start).toBeGreaterThan(-1);
     const body = source.slice(start, source.indexOf("}, [commitDocumentChangeWithPageFit]);", start));
     expect(body).toMatch(/const committed = commitDocumentChangeWithPageFit\(applied\.document,/);
+    // 1.2.3 (charge always follows): the commit may change only the edited molecule, and does not run
+    // the follow rule on its rebuilt atom ids (`structureEditorChemistry`).
+    expect(body).toContain("structureEditorChemistry(result.object.id)");
     expect(body).toMatch(/if \(!committed\) return false;/);
     expect(body.indexOf("if (!committed) return false;")).toBeLessThan(body.lastIndexOf("return true;"));
   });

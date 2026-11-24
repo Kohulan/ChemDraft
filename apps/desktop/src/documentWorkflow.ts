@@ -32,7 +32,7 @@ import { doubleBondStereoState, perceivedSpecifiedDoubleBondIds } from "./intera
 import { separateProjectedStereoLigands, serializeSpin3dMolfile, type Spin3dStereoIssue, type Spin3dStereoReference } from "./interaction/spin3dStereo";
 import { projectPoint } from "./interaction/rotation3d";
 import { loadDrawingSettings } from "./drawingSettings";
-import { moleculeAtomChemistryChanges } from "./commitChemistryGuard";
+import { marksFollowAtoms, moleculeAtomChemistryChanges, type CommitChemistryPolicy } from "./commitChemistryGuard";
 import type { storedCoordinatesMatchStereo } from "@chemdraft/ocl-adapter";
 import type { DoubleBondStereoReader } from "./interaction/doubleBondStereo";
 import { nativeDocumentExportWarnings, nativeMoleculeExportWarnings } from "@chemdraft/document-workflow-core";
@@ -8364,6 +8364,29 @@ export function committedElectronMarkAssignments(page: DocumentPage, options: Na
   if (!legacyMarks.length) return assignments;
 
   const objects = objectByIdIndex(page.objects);
+  // What each atom's stored contribution leaves for its legacy marks: `markCharge`/`markRadicals`
+  // less what the atom's other (atom- or point-anchored) assigned marks contribute. Only that
+  // remainder can be a legacy mark's own stored contribution; an explicit + on the same atom is
+  // not evidence that a different, legacy + was ever attributed to it.
+  const legacyMarkIds = new Set(legacyMarks.map(mark => mark.id));
+  const storedForLegacy = new Map<string, { charge: number; radicals: number }>();
+  const storedRemainder = (objectId: string, atom: MoleculeAtom) => {
+    const key = nativeElectronMarkAtomKey(objectId, atom.id);
+    let remainder = storedForLegacy.get(key);
+    if (!remainder) {
+      remainder = { charge: atom.markCharge ?? 0, radicals: atom.markRadicals ?? 0 };
+      for (const [markId, other] of assignments.anchorByMarkId) {
+        if (legacyMarkIds.has(markId) || other?.objectId !== objectId || other.atomId !== atom.id) continue;
+        const otherMark = objects.get(markId);
+        if (otherMark?.type !== "electron-mark") continue;
+        const contribution = electronMarkAtomContribution(otherMark);
+        remainder.charge -= contribution.charge;
+        remainder.radicals -= contribution.radicals;
+      }
+      storedForLegacy.set(key, remainder);
+    }
+    return remainder;
+  };
   for (const mark of legacyMarks) {
     const owner = assignments.anchorByMarkId.get(mark.id);
     const molecule = owner && objects.get(owner.objectId);
@@ -8371,10 +8394,20 @@ export function committedElectronMarkAssignments(page: DocumentPage, options: Na
     const atom = molecule.atoms.find(candidate => candidate.id === owner.atomId);
     if (!atom) continue;
     const { charge, radicals } = electronMarkAtomContribution(mark);
-    // Honor stored contributions attributed by the legacy raw-coordinate matcher. A new
-    // association also has to reach the drawn atom, including after a rotated part drag.
-    if ((charge !== 0 && Math.sign(atom.markCharge ?? 0) === Math.sign(charge)) ||
-        (radicals !== 0 && (atom.markRadicals ?? 0) >= radicals)) continue;
+    // Honor stored contributions attributed by the legacy raw-coordinate matcher, each legacy mark
+    // consuming its own share of what the atom stores for them. Every nonzero component is proven on
+    // its own: a radical-ion mark (+1 and a radical) is kept only when the atom stores both its
+    // charge and its radical, so a stored radical never admits an unproven charge, nor the reverse.
+    // An unproven mark has to reach the drawn atom, including after a rotated part drag.
+    const remainder = storedRemainder(owner.objectId, atom);
+    const chargeProven = charge === 0 || (Math.sign(remainder.charge) === Math.sign(charge) &&
+      Math.abs(remainder.charge) >= Math.abs(charge));
+    const radicalsProven = radicals === 0 || remainder.radicals >= radicals;
+    if ((charge !== 0 || radicals !== 0) && chargeProven && radicalsProven) {
+      remainder.charge -= charge;
+      remainder.radicals -= radicals;
+      continue;
+    }
     const radius = Math.max(nativeChargeAssociationRadiusPx,
       nativeDrawingStyleFromObjectStyle(molecule.style).bondLengthPx * 1.15);
     if (distance(nativeChargeMarkCenter(mark), transformPointForObject(molecule, atom)) <= radius) continue;
@@ -8625,12 +8658,15 @@ export interface ElectronMarkMoveAssociationResult {
 }
 
 /**
- * The general move/transform association policy. Direct drops have their own explicit policy.
- * This deliberately preserves origin/main behaviour:
- * charges lose sticky anchors on direct moves/group transforms; radicals and lone pairs keep
- * theirs until normal distance-based reconciliation releases them. Point anchors on the latter
- * keep their old coordinates. The editing preference never changes chemistry policy.
- * Chemistry is reported separately from the actual reconciled commit, never a predicted move.
+ * The association policy for a mark an operation moves. Direct drops have their own explicit
+ * policy. A mark carried with its atom (`operation: "carry"`: a molecule transform, or any move
+ * that `followElectronMarksWithMovedAtoms` follows) keeps its anchor, so its charge stays with its
+ * atom (owner ruling 2026-11-21, charge always follows). Only a mark moved or transformed WITHOUT
+ * its atom (`"move"`, `"transform"`: selected without its molecule) follows the mark-move policy:
+ * a charge loses its sticky anchor; radicals and lone pairs keep theirs until normal
+ * distance-based reconciliation releases them. Point anchors on the latter keep their old
+ * coordinates. The editing preference never changes chemistry policy. Chemistry is reported
+ * separately from the actual reconciled commit, never a predicted move.
  */
 export function electronMarkMoveAssociation(
   _document: ChemDraftDocument | DocumentPage,
@@ -9303,9 +9339,16 @@ function applyFlippedMoleculeBondStereo(
       ? { ...edge, display: { ...edge.display, bondStyle: style === "wedge" ? "hashed" as const : "wedge" as const } } : edge;
   });
   const changes = withStoredBondStereoMolfile(normalizeNativeMoleculeGeometry({ ...molecule, atoms, bonds }));
+  // The end's double-bond atom lies on the mirror line and does not move: its marks stay exactly
+  // as they were (owner ruling 2026-11-21), so only the marks of atoms the reflection moves are carried.
+  const movedEnd = new Set(molecule.atoms.filter(atom => {
+    if (!end.has(atom.id)) return false;
+    const image = reflect(atom);
+    return Math.hypot(image.x - atom.x, image.y - atom.y) > 1e-6;
+  }).map(atom => atom.id));
   return applyPatches(document, [
     { op: "updateObject", objectId: molecule.id, changes },
-    ...anchoredElectronMarkTransformPatches(page, molecule.id, end, reflect, {
+    ...anchoredElectronMarkTransformPatches(page, molecule.id, movedEnd, reflect, {
       reflectionAxisDegrees: radiansToDegrees(Math.atan2(dy, dx))
     })
   ], { now: phase4Timestamp });
@@ -12022,18 +12065,33 @@ export function reorderNativeMoleculeParts(
   return document;
 }
 
+/**
+ * Moves the target atoms so their drawn positions shift by the page-space `delta`. On a rotated
+ * molecule the delta is turned into the molecule's own frame, and the stored frame is re-anchored
+ * after its bounds are recomputed so the rotation pivot moving with the bounds does not shift any
+ * drawn atom (CodeRabbit #422 item I). Pass `frame: "molecule"` when the delta is already in the
+ * molecule's raw frame (the part-drag snap works there).
+ */
 export function moveNativeMoleculeParts(
   document: ChemDraftDocument,
   target: NativeMoleculePartMoveTarget,
-  delta: PagePoint
+  delta: PagePoint,
+  frame: "page" | "molecule" = "page"
 ): ChemDraftDocument {
-  return moveNativeMoleculePartsWithPositions(document, target, delta).document;
+  return moveNativeMoleculePartsWithPositions(document, target, delta, frame).document;
+}
+
+/** Turns a page-space displacement into `molecule`'s unrotated frame, or back with `toPage`. */
+export function moleculeFrameDelta(molecule: MoleculeObject, delta: PagePoint, toPage = false): PagePoint {
+  if (!molecule.rotation) return delta;
+  return rotateVector(delta, (toPage ? 1 : -1) * molecule.rotation * Math.PI / 180);
 }
 
 function moveNativeMoleculePartsWithPositions(
   document: ChemDraftDocument,
   target: NativeMoleculePartMoveTarget,
-  delta: PagePoint
+  pageOrFrameDelta: PagePoint,
+  frame: "page" | "molecule" = "page"
 ): { document: ChemDraftDocument; positions: readonly number[] } {
   const page = document.pages.find((candidate) => candidate.objects.some((object) => object.id === target.objectId));
   const molecule = page?.objects.find((object): object is MoleculeObject =>
@@ -12048,6 +12106,7 @@ function moveNativeMoleculePartsWithPositions(
     return { document, positions: [] };
   }
 
+  const delta = frame === "page" ? moleculeFrameDelta(molecule, pageOrFrameDelta) : pageOrFrameDelta;
   const targetAtoms = molecule.atoms.filter((atom) => targetAtomIds.has(atom.id));
   const minX = Math.min(...targetAtoms.map((atom) => atom.x));
   const maxX = Math.max(...targetAtoms.map((atom) => atom.x));
@@ -12060,7 +12119,7 @@ function moveNativeMoleculePartsWithPositions(
   }
 
   const positions: number[] = [];
-  const moved = refreshNativeCyclicDoubleBondSides(molecule, normalizeNativeMoleculeGeometry({
+  let moved = refreshNativeCyclicDoubleBondSides(molecule, normalizeNativeMoleculeGeometry({
     ...molecule,
     atoms: molecule.atoms.map((atom, index) => {
       if (!targetAtomIds.has(atom.id)) return atom;
@@ -12068,6 +12127,21 @@ function moveNativeMoleculePartsWithPositions(
       return { ...atom, x: atom.x + dx, y: atom.y + dy };
     })
   }));
+  if (molecule.rotation) {
+    // The pivot is the frame centre, so recomputed bounds would rotate every atom about a new
+    // point. Translating the raw frame translates the drawing by the same vector, so shift it by
+    // the drawn error of one atom (the error is the same for all of them).
+    const reference = molecule.atoms[0];
+    const pageDelta = moleculeFrameDelta(molecule, { x: dx, y: dy }, true);
+    const was = transformPointForObject(molecule, reference);
+    const intended = targetAtomIds.has(reference.id) ? { x: was.x + pageDelta.x, y: was.y + pageDelta.y } : was;
+    const drawn = transformPointForObject(moved, moved.atoms[0]);
+    const sx = intended.x - drawn.x, sy = intended.y - drawn.y;
+    if (Math.abs(sx) > 1e-9 || Math.abs(sy) > 1e-9) {
+      moved = { ...moved, x: moved.x + sx, y: moved.y + sy,
+        atoms: moved.atoms.map(atom => ({ ...atom, x: atom.x + sx, y: atom.y + sy })) };
+    }
+  }
   return { positions, document: applyPatch(
     document,
     {
@@ -13822,24 +13896,59 @@ function translateDocumentObjectByPatches(
  * moves a molecule without its marks strands them and the next reconciliation strips the
  * chemistry they carried. The Set result also dedupes marks the caller already selected.
  */
-/** Atom-anchored electron marks by the molecule they sit on, in page order, built once per array. */
+/**
+ * An electron mark that belongs to an atom. `resolved` marks are not atom-anchored: a legacy bond,
+ * object or loose (point) charge or radical mark that the committed assignment resolver attributes
+ * to the atom, which is where normalization takes its charge or unpaired electron from.
+ */
+interface AtomOwnedMark {
+  markId: string;
+  atomId: string;
+  resolved: boolean;
+}
+
+/**
+ * Every electron mark that belongs to an atom, by the atom's molecule, in page order, built once
+ * per array. Owner ruling 2026-11-21 (charge always follows): the marks a molecule transform
+ * carries are ALL the marks associated with its atoms, not only atom-anchored ones, so a legacy
+ * mark's chemistry can never stay behind when its atom moves. A charge or radical mark that is not
+ * explicitly atom-anchored belongs to the atom the committed resolver gives it: the ONE owner rule
+ * for drag, every molecule transform and copy (`electronMarksCarriedWithMolecules`).
+ */
 const anchoredMarkIndexes = new WeakMap<
   readonly DocumentObject[],
-  { length: number; last: DocumentObject | undefined; byMoleculeId: ReadonlyMap<string, readonly string[]> }
+  { length: number; last: DocumentObject | undefined; byMoleculeId: ReadonlyMap<string, readonly AtomOwnedMark[]> }
 >();
 
-function anchoredMarkIdsByMoleculeId(pageObjects: readonly DocumentObject[]): ReadonlyMap<string, readonly string[]> {
+function atomOwnedMarksByMoleculeId(pageObjects: readonly DocumentObject[]): ReadonlyMap<string, readonly AtomOwnedMark[]> {
   let index = anchoredMarkIndexes.get(pageObjects);
   if (!index || index.length !== pageObjects.length || index.last !== pageObjects[pageObjects.length - 1]) {
-    const byMoleculeId = new Map<string, string[]>();
+    const byMoleculeId = new Map<string, AtomOwnedMark[]>();
+    let assignments: ReturnType<typeof committedElectronMarkAssignments>["anchorByMarkId"] | undefined;
     for (const object of pageObjects) {
-      if (object.type === "electron-mark" && object.anchor.kind === "atom" && object.anchor.objectId !== undefined) {
-        const list = byMoleculeId.get(object.anchor.objectId);
-        if (list) {
-          list.push(object.id);
-        } else {
-          byMoleculeId.set(object.anchor.objectId, [object.id]);
-        }
+      if (object.type !== "electron-mark") continue;
+      let owner: { objectId?: string; atomId?: string } | undefined;
+      let resolved = false;
+      const chargeOrRadical = object.markKind === "charge" || object.markKind === "radical-dot";
+      if (object.anchor.kind === "atom" && (!chargeOrRadical || object.atomAssociation === "explicit")) {
+        owner = object.anchor;
+      } else if (chargeOrRadical) {
+        // A legacy bond, object or loose mark, or a non-explicit atom-anchored one, belongs to the
+        // atom the committed resolver gives it (`committedElectronMarkAssignments`), never to a stale
+        // stored anchor: the owner copy uses, so drag and copy agree. `resolved` when that owner is
+        // not the stored anchor, so carrying it re-anchors it to its owner explicitly.
+        assignments ??= committedElectronMarkAssignments({ objects: pageObjects } as DocumentPage).anchorByMarkId;
+        owner = assignments.get(object.id);
+        const anchor = object.anchor as { objectId?: string; atomId?: string };
+        resolved = object.anchor.kind !== "atom" || anchor.objectId !== owner?.objectId || anchor.atomId !== owner?.atomId;
+      }
+      if (owner?.objectId === undefined || owner.atomId === undefined) continue;
+      const entry = { markId: object.id, atomId: owner.atomId, resolved };
+      const list = byMoleculeId.get(owner.objectId);
+      if (list) {
+        list.push(entry);
+      } else {
+        byMoleculeId.set(owner.objectId, [entry]);
       }
     }
     index = { length: pageObjects.length, last: pageObjects[pageObjects.length - 1], byMoleculeId };
@@ -13854,12 +13963,12 @@ function expandWithAnchoredMarkIds(
 ): Set<string> {
   const expanded = new Set(ids);
   const objectById = objectByIdIndex(pageObjects);
-  const marksByMoleculeId = anchoredMarkIdsByMoleculeId(pageObjects);
+  const marksByMoleculeId = atomOwnedMarksByMoleculeId(pageObjects);
   for (const id of ids) {
     if (objectById.get(id)?.type !== "molecule") {
       continue;
     }
-    for (const markId of marksByMoleculeId.get(id) ?? []) {
+    for (const { markId } of marksByMoleculeId.get(id) ?? []) {
       expanded.add(markId);
     }
   }
@@ -13867,28 +13976,31 @@ function expandWithAnchoredMarkIds(
 }
 
 /**
- * The electron-marks a molecule transform's cascade carries along: anchored to one of THIS
- * molecule's live atoms. This filter is the single source of truth for "does the cascade move
- * this mark" — the group dispatchers' skip-sets are built from it too, so a mark the cascade
- * won't patch (stale/missing atomId) is never also skipped and left frozen.
+ * The electron-marks a molecule transform's cascade carries along: associated with one of THIS
+ * molecule's live atoms (`atomOwnedMarksByMoleculeId`). This filter is the single source of truth
+ * for "does the cascade move this mark" — the group dispatchers' skip-sets are built from it too,
+ * so a mark the cascade won't patch (stale/missing atomId) is never also skipped and left frozen.
  */
+function atomOwnedMarksForTransform(
+  pageObjects: readonly DocumentObject[],
+  moleculeId: string,
+  atomIds: ReadonlySet<string>
+): { mark: ElectronMarkObject; atomId: string; resolved: boolean }[] {
+  // Through the per-page mark index (page order preserved) rather than a scan of every
+  // object per molecule, which made transforming a large selection quadratic.
+  const objectById = objectByIdIndex(pageObjects);
+  return (atomOwnedMarksByMoleculeId(pageObjects).get(moleculeId) ?? []).flatMap(({ markId, atomId, resolved }) => {
+    const candidate = objectById.get(markId);
+    return candidate?.type === "electron-mark" && atomIds.has(atomId) ? [{ mark: candidate, atomId, resolved }] : [];
+  });
+}
+
 function anchoredElectronMarksForTransform(
   pageObjects: readonly DocumentObject[],
   moleculeId: string,
   atomIds: ReadonlySet<string>
 ): ElectronMarkObject[] {
-  // Through the per-page anchored-mark index (page order preserved) rather than a scan of every
-  // object per molecule, which made transforming a large selection quadratic.
-  const objectById = objectByIdIndex(pageObjects);
-  return (anchoredMarkIdsByMoleculeId(pageObjects).get(moleculeId) ?? []).flatMap((markId) => {
-    const candidate = objectById.get(markId);
-    return candidate?.type === "electron-mark" &&
-      candidate.anchor.kind === "atom" &&
-      candidate.anchor.atomId !== undefined &&
-      atomIds.has(candidate.anchor.atomId)
-      ? [candidate]
-      : [];
-  });
+  return atomOwnedMarksForTransform(pageObjects, moleculeId, atomIds).map(({ mark }) => mark);
 }
 
 /** The mark ids the per-molecule cascades will carry for every molecule in `ids` (group dedup). */
@@ -13923,12 +14035,13 @@ interface CarriedElectronMark {
  * lasso fragments). `molecules` are the molecules as they will be copied (a fragment passes its
  * pruned molecule, which keeps its id), so a mark belongs only when the atom it sits on is copied.
  *
- * It starts from `anchoredElectronMarksForTransform`, the atom-anchored rule every molecule
- * transform uses, and adds the marks whose anchor is not an atom (a bond or object anchor, or a
- * legacy loose point) but which the committed assignment resolver attributes to one of the copied
- * atoms: normalization derives markCharge and markRadicals from exactly that attribution, so a copy
- * that left such a mark behind would be recomputed to a different charge. No second association
- * rule: the resolver is the one the commit funnel runs.
+ * It is `atomOwnedMarksForTransform`, the owner rule every molecule transform (drag included)
+ * uses: an explicitly atom-anchored mark (and any lone pair) by its anchor, and every other charge
+ * or radical mark (a bond or object anchor, a legacy loose point, or a non-explicit atom anchor) by
+ * the atom the committed assignment resolver attributes it to, never by a stored anchor alone, so a
+ * stale anchor cannot give the copy a charge its source lacks: normalization derives markCharge and
+ * markRadicals from exactly that attribution. No second association rule: the resolver is the one
+ * the commit funnel runs.
  *
  * Bond, object and point anchors resolve by distance to the nearest atom of ANY molecule, so a copy
  * placed near its original could be attributed to the original's atoms instead of the copy's. Their
@@ -13940,24 +14053,15 @@ function electronMarksCarriedWithMolecules(
   page: DocumentPage,
   molecules: readonly MoleculeObject[]
 ): CarriedElectronMark[] {
+  // The same owner rule as every molecule transform (`atomOwnedMarksForTransform`): a charge or
+  // radical mark that is not explicitly atom-anchored follows the committed resolver, so a copy has
+  // exactly the chemistry its source has, and a mark the resolver gives to no copied atom stays with
+  // its source, uncopied. A mark whose owner is not its stored anchor is copied re-anchored to it.
   const ownerByMarkId = new Map<string, { moleculeId: string; atomId?: string }>();
   for (const molecule of molecules) {
     const atomIds = new Set(molecule.atoms.map((atom) => atom.id));
-    for (const mark of anchoredElectronMarksForTransform(page.objects, molecule.id, atomIds)) {
-      if (!ownerByMarkId.has(mark.id)) ownerByMarkId.set(mark.id, { moleculeId: molecule.id });
-    }
-  }
-  if (page.objects.some((object) => object.type === "electron-mark" && object.anchor.kind !== "atom")) {
-    const moleculeById = new Map(molecules.map((molecule) => [molecule.id, molecule] as const));
-    const objectById = objectByIdIndex(page.objects);
-    for (const [markId, owner] of committedElectronMarkAssignments(page).anchorByMarkId) {
-      if (!owner || ownerByMarkId.has(markId)) continue;
-      const molecule = moleculeById.get(owner.objectId);
-      if (!molecule?.atoms.some((atom) => atom.id === owner.atomId)) continue;
-      const mark = objectById.get(markId);
-      if (mark?.type === "electron-mark" && mark.anchor.kind !== "atom") {
-        ownerByMarkId.set(markId, { moleculeId: owner.objectId, atomId: owner.atomId });
-      }
+    for (const { mark, atomId, resolved } of atomOwnedMarksForTransform(page.objects, molecule.id, atomIds)) {
+      if (!ownerByMarkId.has(mark.id)) ownerByMarkId.set(mark.id, resolved ? { moleculeId: molecule.id, atomId } : { moleculeId: molecule.id });
     }
   }
   return page.objects.flatMap((object) => {
@@ -13969,13 +14073,355 @@ function electronMarksCarriedWithMolecules(
   });
 }
 
+/** A 2×2 linear map, applied to a mark's offset from its atom. */
+interface OffsetMap { a: number; b: number; c: number; d: number }
+const IDENTITY_OFFSET_MAP: OffsetMap = { a: 1, b: 0, c: 0, d: 1 };
+const MARK_FOLLOW_EPSILON_PX = 1e-6;
+
+/**
+ * What a caller knows of the move it asks `followElectronMarksWithMovedAtoms` to follow: a turn
+ * (rotation, with any uniform scale) or a mirror.
+ */
+export type AtomMotion = "turn" | "mirror";
+
+export interface ElectronMarkFollowOptions {
+  /**
+   * The operation's own transform, where the caller knows it (a part turn, a flip). Consulted only
+   * where the atoms cannot tell: two atoms, or atoms on one line, fit a turn and a mirror equally.
+   * Without it such a move translates the mark with its atom and never guesses a turn or a mirror.
+   */
+  motion?: AtomMotion;
+  /**
+   * Marks the operation itself moved, independently of their atoms (a mark dragged or transformed
+   * as its own selected object, without the molecule it belongs to). Only these may move while
+   * their atom stays put; they are left to the mark-move policy. Every other mark of an atom that
+   * did not move is kept exactly as it was.
+   */
+  independentlyMovedMarkIds?: ReadonlySet<string>;
+}
+
+/**
+ * The turn or mirror that takes `from` onto `to` (same length, paired by index), as the map a
+ * moved atom's mark offset is turned or mirrored by: a least-squares similarity fit (rotation or
+ * reflection with uniform scale, plus translation), accepted only when it reproduces every pair
+ * within a negligible residual, i.e. only when the atoms moved as one rigid piece. A shear, an
+ * uneven stretch or a relayout fits no similarity: `undefined`, and the caller translates the mark
+ * with its atom. The fit's scale is dropped: a mark is a label-like glyph, so a bond-length change,
+ * a part resize or any other uniform scale of the atoms keeps its offset from its atom (a
+ * whole-object resize scales its marks itself, as part of the object, before this rule runs).
+ * Two points, or points on one line, fit a turn and a mirror equally: the caller's `motion` picks
+ * one, and without it the map is the identity (the offset is translated only, never guessed) as
+ * long as either fits.
+ */
+function fittedOffsetMap(from: readonly PagePoint[], to: readonly PagePoint[], motion?: AtomMotion): OffsetMap | undefined {
+  const count = from.length;
+  if (count === 0) return undefined;
+  const mean = (points: readonly PagePoint[]) => ({
+    x: points.reduce((sum, point) => sum + point.x, 0) / count,
+    y: points.reduce((sum, point) => sum + point.y, 0) / count
+  });
+  const p0 = mean(from), q0 = mean(to);
+  let sxx = 0, sxy = 0, syy = 0, uxx = 0, uxy = 0, uyx = 0, uyy = 0;
+  for (let i = 0; i < count; i++) {
+    const px = from[i].x - p0.x, py = from[i].y - p0.y, qx = to[i].x - q0.x, qy = to[i].y - q0.y;
+    sxx += px * px; sxy += px * py; syy += py * py;
+    uxx += qx * px; uxy += qx * py; uyx += qy * px; uyy += qy * py;
+  }
+  const scale = Math.max(sxx + syy, 1e-12);
+  const tolerance = 1e-3 * Math.max(1, Math.sqrt(scale / count));
+  const fits = (map: OffsetMap) => {
+    for (let i = 0; i < count; i++) {
+      const px = from[i].x - p0.x, py = from[i].y - p0.y;
+      const x = q0.x + map.a * px + map.b * py, y = q0.y + map.c * px + map.d * py;
+      if (Math.hypot(x - to[i].x, y - to[i].y) > tolerance) return false;
+    }
+    return true;
+  };
+  if (sxx + syy <= 1e-9) return fits(IDENTITY_OFFSET_MAP) ? IDENTITY_OFFSET_MAP : undefined;
+  // Least-squares similarity fits: a turn [[c, -s], [s, c]] and a mirror [[m, n], [n, -m]], each
+  // with its uniform scale. Only these are rigid (up to scale); a general affine fit would turn
+  // any three atoms' relayout into an exact "map" that shears the mark's offset.
+  const norm = sxx + syy;
+  const cos = (uxx + uyy) / norm, sin = (uyx - uxy) / norm;
+  const turn: OffsetMap = { a: cos, b: -sin, c: sin, d: cos };
+  const m = (uxx - uyy) / norm, n = (uxy + uyx) / norm;
+  const mirror: OffsetMap = { a: m, b: n, c: n, d: -m };
+  /** The map without its scale: the mark's offset is turned or mirrored, never stretched. */
+  const unscaled = (map: OffsetMap): OffsetMap | undefined => {
+    const size = Math.sqrt(Math.abs(map.a * map.d - map.b * map.c));
+    return size > 1e-9 ? { a: map.a / size, b: map.b / size, c: map.c / size, d: map.d / size } : undefined;
+  };
+  const det = sxx * syy - sxy * sxy;
+  if (count >= 3 && det > 1e-9 * scale * scale) {
+    // Points spread in two dimensions tell a turn from a mirror by themselves.
+    if (fits(turn)) return unscaled(turn);
+    if (fits(mirror)) return unscaled(mirror);
+    return undefined;
+  }
+  if (motion) {
+    const map = motion === "turn" ? turn : mirror;
+    return fits(map) ? unscaled(map) : undefined;
+  }
+  return fits(turn) || fits(mirror) ? IDENTITY_OFFSET_MAP : undefined;
+}
+
+/**
+ * How a molecule's atoms moved: the offset map a moved atom's marks are turned or mirrored by.
+ * Fitted to every atom when they all moved as one rigid piece (a whole-molecule translate, rotate,
+ * flip or uniform scale), else to the atoms the edit displaced when those moved rigidly (a part
+ * move or turn). A relayout (Clean Up, 3D flatten), a shear, an uneven stretch, or a move of one
+ * atom against the rest fits no turn or mirror, and translates each mark with its own atom,
+ * keeping its offset exactly. The map applies only to marks of atoms that moved: whether an atom
+ * moved is read from its own page position, never from the fit (an atom a turn leaves in place
+ * keeps its marks exactly where they were, even when every atom fits the turn).
+ */
+function moleculeOffsetMap(before: MoleculeObject, after: MoleculeObject, motion?: AtomMotion): OffsetMap {
+  const afterAtoms = new Map(after.atoms.map((atom) => [atom.id, atom]));
+  const from: PagePoint[] = [], to: PagePoint[] = [], movedFrom: PagePoint[] = [], movedTo: PagePoint[] = [];
+  for (const atom of before.atoms) {
+    const next = afterAtoms.get(atom.id);
+    if (!next) continue;
+    const p = transformPointForObject(before, atom), q = transformPointForObject(after, next);
+    from.push(p); to.push(q);
+    if (Math.hypot(q.x - p.x, q.y - p.y) > MARK_FOLLOW_EPSILON_PX) { movedFrom.push(p); movedTo.push(q); }
+  }
+  const whole = fittedOffsetMap(from, to, motion);
+  if (whole) return whole;
+  // Two displaced atoms define a turn (rotation, scale, translation) as well as three do; whether
+  // it was a turn or a mirror is for the caller's `motion` to say.
+  const part = movedFrom.length >= 2 ? fittedOffsetMap(movedFrom, movedTo, motion) : undefined;
+  return part ?? IDENTITY_OFFSET_MAP;
+}
+
+/**
+ * Every electron mark associated with an atom, by mark id: the atom it is anchored to, or for a
+ * legacy bond, object or loose charge or radical mark, the atom the committed assignment resolver
+ * gives it (`atomOwnedMarksByMoleculeId`).
+ */
+function electronMarkAtomOwners(page: DocumentPage): Map<string, { objectId: string; atomId: string; resolved: boolean }> {
+  const owners = new Map<string, { objectId: string; atomId: string; resolved: boolean }>();
+  for (const [objectId, marks] of atomOwnedMarksByMoleculeId(page.objects)) {
+    for (const { markId, atomId, resolved } of marks) owners.set(markId, { objectId, atomId, resolved });
+  }
+  return owners;
+}
+
+/** Whether a molecule's stored frame (rotation, transform scale, turn or tilt) changed; absent is the identity. */
+function moleculeFrameTransformChanged(before: MoleculeObject, after: MoleculeObject): boolean {
+  const state = (molecule: MoleculeObject) => [molecule.rotation ?? 0, molecule.transform?.scaleX ?? 1, molecule.transform?.scaleY ?? 1,
+    molecule.transform?.rotationDegrees ?? 0, molecule.transform?.tiltXDegrees ?? 0, molecule.transform?.tiltYDegrees ?? 0];
+  const a = state(before), b = state(after);
+  return a.some((value, index) => Math.abs(value - b[index]) > 1e-9);
+}
+
+/**
+ * The changes that put `next` back where `mark` was: its position, size, angle and atom
+ * association, and nothing else (a style the operation applied stands). `undefined` when none of
+ * them changed.
+ */
+function electronMarkRestoreChanges(mark: ElectronMarkObject, next: ElectronMarkObject): Partial<ElectronMarkObject> | undefined {
+  if (next === mark) return undefined;
+  const changes: Partial<ElectronMarkObject> = {};
+  for (const key of ["x", "y", "width", "height", "rotation"] as const) {
+    if (next[key] !== mark[key]) changes[key] = mark[key];
+  }
+  if (JSON.stringify(next.anchor) !== JSON.stringify(mark.anchor)) changes.anchor = mark.anchor;
+  if (next.atomAssociation !== mark.atomAssociation) changes.atomAssociation = mark.atomAssociation;
+  return Object.keys(changes).length ? changes : undefined;
+}
+
+export interface ElectronMarkFollowResult {
+  document: ChemDraftDocument;
+  /** Marks whose atom moved: they moved with it and keep their association. */
+  followedMarkIds: ReadonlySet<string>;
+}
+
+/**
+ * THE charge-follows rule (owner ruling 2026-11-21): every electron mark associated with an atom
+ * moves with that atom on any move of the atom, and a move never changes chemistry.
+ *
+ * Given a document before and after any atom move (translate, rotate, flip, scale, part drag,
+ * relayout), every mark associated in `before` with an atom that moved is placed by its atom's
+ * transform: its offset from the atom is mapped by the molecule's fitted offset map (translated
+ * with the atom, turned or mirrored for a turn or flip). A mark the operation already moved or resized itself
+ * (a whole-object transform carries its marks) keeps the operation's placement. A legacy bond,
+ * object or loose mark that followed is re-anchored explicitly to its atom, as Duplicate does.
+ *
+ * A mark whose atom did not move does not move: a mark of an atom the operation left in place (a
+ * turn's pivot, an atom on a mirror line, a lone atom turned or scaled about itself) that the
+ * operation's own transform patched is put back exactly as it was, position, size and angle.
+ *
+ * Then no stationary mark may change association because atoms moved: a charge or radical mark the
+ * operation did not move keeps the atom commit normalization gave it before (or stays free), made
+ * explicit where normalization of the moved geometry would decide otherwise.
+ *
+ * Marks the operation moved by itself, as the caller declares them
+ * (`independentlyMovedMarkIds`: a mark dragged, or transformed in a selection without its
+ * molecule), are left to the mark-move policy when their atom stayed put; so is a mark of a
+ * molecule the operation did not change. Nothing here guesses that a mark moved by itself.
+ */
+export function followElectronMarksWithMovedAtoms(
+  before: ChemDraftDocument,
+  after: ChemDraftDocument,
+  options: ElectronMarkFollowOptions = {}
+): ElectronMarkFollowResult {
+  const followedMarkIds = new Set<string>();
+  if (before === after || before.pages === after.pages) return { document: after, followedMarkIds };
+  const patches: DocumentPatch[] = [];
+  const pinnedPages: { pageId: string; owners: ReadonlyMap<string, { objectId: string; atomId: string } | undefined>; stationary: Set<string> }[] = [];
+  for (const page of before.pages) {
+    const nextPage = after.pages.find((candidate) => candidate.id === page.id);
+    if (!nextPage || nextPage.objects === page.objects) continue;
+    if (!page.objects.some((object) => object.type === "electron-mark")) continue;
+    const nextObjects = objectByIdIndex(nextPage.objects);
+    // Only molecules whose drawn atoms moved matter; most edits move none.
+    const movedMolecules = new Map<string, { before: MoleculeObject; after: MoleculeObject; fit?: OffsetMap }>();
+    const changedMoleculeIds = new Set<string>();
+    // Molecules the operation moved or transformed: an atom moved, or the stored frame turned,
+    // scaled or tilted (a lone atom turned or scaled about itself moves no atom).
+    const transformedMoleculeIds = new Set<string>();
+    for (const object of page.objects) {
+      if (object.type !== "molecule") continue;
+      const next = nextObjects.get(object.id);
+      if (next?.type !== "molecule" || next === object) continue;
+      changedMoleculeIds.add(object.id);
+      const nextAtoms = new Map(next.atoms.map((atom) => [atom.id, atom]));
+      const moved = object.atoms.some((atom) => {
+        const nextAtom = nextAtoms.get(atom.id);
+        if (!nextAtom) return false;
+        const p = transformPointForObject(object, atom), q = transformPointForObject(next, nextAtom);
+        return Math.hypot(q.x - p.x, q.y - p.y) > MARK_FOLLOW_EPSILON_PX;
+      });
+      if (moved) movedMolecules.set(object.id, { before: object, after: next });
+      if (moved || moleculeFrameTransformChanged(object, next)) transformedMoleculeIds.add(object.id);
+    }
+    const owners = electronMarkAtomOwners(page);
+    const independent = options.independentlyMovedMarkIds;
+    const stationary = new Set<string>();
+    let carriedInPlace = false;
+    for (const mark of page.objects) {
+      if (mark.type !== "electron-mark") continue;
+      const next = nextObjects.get(mark.id);
+      if (next?.type !== "electron-mark") continue;
+      const center = nativeChargeMarkCenter(mark), nextCenter = nativeChargeMarkCenter(next);
+      const markMoved = next !== mark && Math.hypot(nextCenter.x - center.x, nextCenter.y - center.y) > MARK_FOLLOW_EPSILON_PX;
+      // A mark the operation resized was transformed by it, even when its center stayed put (a
+      // whole-object resize pivoted on the mark's own center): its placement is the operation's.
+      const markResized = next !== mark && (next.width !== mark.width || next.height !== mark.height);
+      const owner = owners.get(mark.id);
+      const ownerMolecule = owner && changedMoleculeIds.has(owner.objectId) ? page.objects.find((object) => object.id === owner.objectId) : undefined;
+      const nextOwnerMolecule = ownerMolecule && nextObjects.get(owner!.objectId);
+      const atom = ownerMolecule?.type === "molecule" ? ownerMolecule.atoms.find((candidate) => candidate.id === owner!.atomId) : undefined;
+      const nextAtom = nextOwnerMolecule?.type === "molecule" ? nextOwnerMolecule.atoms.find((candidate) => candidate.id === owner!.atomId) : undefined;
+      if (!owner || !atom || !nextAtom || ownerMolecule?.type !== "molecule" || nextOwnerMolecule?.type !== "molecule") {
+        // No atom of a molecule the operation changed: a stationary mark keeps its association; a
+        // mark the operation moved itself is the mark-move policy's.
+        if (!markMoved) stationary.add(mark.id);
+        continue;
+      }
+      const from = transformPointForObject(ownerMolecule, atom), to = transformPointForObject(nextOwnerMolecule, nextAtom);
+      // Whether THIS atom moved is read from its own page position (coordinates under the
+      // molecule's frame rotation), whatever map the molecule's atoms fit: an atom the operation
+      // left in place (a turn's pivot, a point on a mirror line, a lone atom turned or scaled about
+      // itself) keeps its marks exactly as they were, offset, size and angle (owner ruling
+      // 2026-11-21). A transform that patched such a mark directly is undone here; only a mark the
+      // operation moved by itself (`independentlyMovedMarkIds`) is left to the mark-move policy.
+      const atomMoved = Math.hypot(to.x - from.x, to.y - from.y) > MARK_FOLLOW_EPSILON_PX;
+      if (!atomMoved) {
+        if (independent?.has(mark.id)) continue;
+        if (!transformedMoleculeIds.has(owner.objectId)) {
+          // An edit that moved no atom of the molecule (a label, charge or substituent edit) may
+          // place its atom's marks itself; its placement stands.
+          if (!markMoved) stationary.add(mark.id);
+          else if (next.anchor.kind === "atom" && next.anchor.objectId === owner.objectId && next.anchor.atomId === owner.atomId) {
+            followedMarkIds.add(mark.id);
+            carriedInPlace = true;
+          }
+          continue;
+        }
+        const restore = electronMarkRestoreChanges(mark, next);
+        if (restore) patches.push({ op: "updateObject", objectId: mark.id, changes: restore });
+        stationary.add(mark.id);
+        continue;
+      }
+      followedMarkIds.add(mark.id);
+      const molecules = movedMolecules.get(owner.objectId)!;
+      const map = molecules.fit ??= moleculeOffsetMap(molecules.before, molecules.after, options.motion);
+      const changes: Partial<ElectronMarkObject> = {};
+      if (!markMoved && !markResized) {
+        const ox = center.x - from.x, oy = center.y - from.y;
+        const target = { x: to.x + map.a * ox + map.b * oy, y: to.y + map.c * ox + map.d * oy };
+        if (Math.hypot(target.x - nextCenter.x, target.y - nextCenter.y) > MARK_FOLLOW_EPSILON_PX) {
+          changes.x = target.x - next.width / 2;
+          changes.y = target.y - next.height / 2;
+          const det = map.a * map.d - map.b * map.c;
+          const turn = det > 0 ? radiansToDegrees(Math.atan2(map.c, map.a)) : 0;
+          if (Math.abs(turn) >= 0.05) changes.rotation = normalizeDegrees(next.rotation + turn);
+        }
+      }
+      const anchored = next.anchor.kind === "atom" && next.anchor.objectId === owner.objectId && next.anchor.atomId === owner.atomId;
+      if (!anchored || (owner.resolved && next.atomAssociation !== "explicit")) {
+        changes.anchor = { kind: "atom", objectId: owner.objectId, atomId: owner.atomId };
+        changes.atomAssociation = "explicit";
+      }
+      if (Object.keys(changes).length) patches.push({ op: "updateObject", objectId: mark.id, changes });
+    }
+    // An edit that moved or transformed no molecule pins only the marks it placed on their atoms.
+    const transformed = transformedMoleculeIds.size > 0;
+    if (!transformed && !carriedInPlace) continue;
+    pinnedPages.push({ pageId: page.id, owners: committedElectronMarkAssignments(page).anchorByMarkId,
+      stationary: transformed ? stationary : new Set() });
+  }
+  let document = patches.length ? applyPatches(after, patches, { now: phase4Timestamp }) : after;
+  // Moved atoms must neither take a stationary mark nor lose one that followed: pin every
+  // association commit normalization would change in the moved geometry.
+  const pins: DocumentPatch[] = [];
+  for (const { pageId, owners, stationary } of pinnedPages) {
+    const page = document.pages.find((candidate) => candidate.id === pageId);
+    if (!page) continue;
+    const nextOwners = committedElectronMarkAssignments(page).anchorByMarkId;
+    for (const mark of page.objects) {
+      if (mark.type !== "electron-mark" || (mark.markKind !== "charge" && mark.markKind !== "radical-dot")) continue;
+      if (!stationary.has(mark.id) && !followedMarkIds.has(mark.id)) continue;
+      const owner = owners.get(mark.id), nextOwner = nextOwners.get(mark.id);
+      if (owner?.objectId === nextOwner?.objectId && owner?.atomId === nextOwner?.atomId) continue;
+      // An atom the edit removed is not a move; its mark is the edit's business.
+      const ownerMolecule = owner && page.objects.find((object) => object.id === owner.objectId);
+      if (owner && (ownerMolecule?.type !== "molecule" || !ownerMolecule.atoms.some((atom) => atom.id === owner.atomId))) continue;
+      pins.push({ op: "updateObject", objectId: mark.id, changes: owner
+        ? { anchor: { kind: "atom", objectId: owner.objectId, atomId: owner.atomId }, atomAssociation: "explicit" }
+        : { anchor: { kind: "point", point: nativeChargeMarkCenter(mark) }, atomAssociation: "explicit" } });
+    }
+  }
+  if (pins.length) document = applyPatches(document, pins, { now: phase4Timestamp });
+  return { document, followedMarkIds };
+}
+
+/**
+ * `followElectronMarksWithMovedAtoms` as the commit funnel applies it, for callers that need only
+ * the document. Under a commit policy that rebuilt atoms under new ids (a structure-editor save,
+ * `marksFollowAtoms`), an atom id does not name the same atom before and after, so the rule is not
+ * run: marks stay where they are and normal mark association applies. The policy's
+ * `independentlyMovedMarkIds` are the marks the operation moved by itself.
+ */
+export function carryElectronMarksWithMovedAtoms(
+  before: ChemDraftDocument,
+  after: ChemDraftDocument,
+  policy?: CommitChemistryPolicy
+): ChemDraftDocument {
+  if (!marksFollowAtoms(policy)) return after;
+  return followElectronMarksWithMovedAtoms(before, after,
+    { independentlyMovedMarkIds: policy?.independentlyMovedMarkIds }).document;
+}
+
 /**
  * Patches that carry a molecule's anchored electron-marks along with a transform of the molecule
  * (translate/rotate/scale/flip). Marks render from their own stored x/y rather than resolving
  * live from their anchor atom, so transforming just the molecule strands them outside the
  * association radius and the next reconciliation silently strips the formalCharge/markCharge
- * they carried. The mark's anchor is left untouched (still `{ kind: "atom", ... }`) since it
- * never stopped pointing at that atom. `frame` mirrors what the direct object transforms do to a
+ * they carried. An atom-anchored mark keeps its anchor, since it never stopped pointing at that
+ * atom; a legacy bond, object or loose mark the molecule carries (`atomOwnedMarksForTransform`) is
+ * re-anchored to its atom explicitly (owner ruling 2026-11-21: charge always follows). `frame` mirrors what the direct object transforms do to a
  * mark's own box: scale resizes it, rotate turns it, and a flip mirrors its angle — which is
  * visible on lone-pair dot pairs, whose renderer draws them under `rotationTransform(object)`.
  */
@@ -13988,14 +14434,19 @@ function anchoredElectronMarkTransformPatches(
 ): DocumentPatch[] {
   const scaleX = frame.scaleX ?? 1;
   const scaleY = frame.scaleY ?? 1;
-  return anchoredElectronMarksForTransform(page.objects, moleculeId, atomIds).map((mark) => {
+  return atomOwnedMarksForTransform(page.objects, moleculeId, atomIds).map(({ mark, atomId, resolved }) => {
     const nextWidth = mark.width * scaleX;
     const nextHeight = mark.height * scaleY;
     const nextCenter = transformPoint(nativeChargeMarkCenter(mark));
-    const changes: { x: number; y: number; width?: number; height?: number; rotation?: number; anchor: Anchor } = {
-      anchor: electronMarkMoveAssociation(page, mark, nativeChargeMarkCenter(mark), nextCenter, {
-        operation: "carry"
-      }).anchor,
+    const changes: { x: number; y: number; width?: number; height?: number; rotation?: number; anchor: Anchor;
+      atomAssociation?: ElectronMarkObject["atomAssociation"] } = {
+      // A legacy bond, object or loose mark is re-anchored to the atom it belongs to, explicitly,
+      // so normalization can never attribute it to another atom afterwards.
+      ...(resolved
+        ? { anchor: { kind: "atom", objectId: moleculeId, atomId }, atomAssociation: "explicit" as const }
+        : { anchor: electronMarkMoveAssociation(page, mark, nativeChargeMarkCenter(mark), nextCenter, {
+          operation: "carry"
+        }).anchor }),
       x: nextCenter.x - nextWidth / 2,
       y: nextCenter.y - nextHeight / 2
     };
@@ -14622,6 +15073,31 @@ export function duplicateSelectedDocumentObjects(
   offset: PagePoint = { x: 24, y: 24 },
   warningsOut?: string[]
 ): ChemDraftDocument {
+  // Without `warningsOut`, a copy that cannot keep its marks throws, as before.
+  let warnings: string[] | undefined = warningsOut && [];
+  let attempt = duplicateSelectedDocumentObjectsOnce(document, offset, warnings, false);
+  if (attempt.chemistryChanges.length > 0) {
+    // A legacy bond, object or loose mark of a duplicated molecule belongs to its atom only by
+    // proximity, and the copy lands beside the original, so the original's mark can be attributed
+    // to the copy's atom. Anchor the original explicitly to the atom it belongs to, as its copy is
+    // (owner ruling 2026-11-21: a mark stays with its atom); its chemistry is unchanged.
+    warnings = warningsOut && [];
+    attempt = duplicateSelectedDocumentObjectsOnce(document, offset, warnings, true);
+  }
+  if (warnings) warningsOut?.push(...warnings);
+  if (attempt.chemistryChanges.length === 0) return attempt.result;
+  // Refuse the duplicate rather than commit a copy whose chemistry differs from its original.
+  if (!warningsOut) throw new Error(attempt.chemistryChanges[0]);
+  warningsOut.push(...attempt.chemistryChanges);
+  return document;
+}
+
+function duplicateSelectedDocumentObjectsOnce(
+  document: ChemDraftDocument,
+  offset: PagePoint,
+  warningsOut: string[] | undefined,
+  anchorOriginalMarks: boolean
+): { result: ChemDraftDocument; chemistryChanges: string[] } {
   const page = firstPage(document);
   const directlySelected = new Set(document.selection.objectIds);
   const selectedGroups = page.objects.filter((object): object is GroupObject =>
@@ -14636,7 +15112,7 @@ export function duplicateSelectedDocumentObjects(
     .map((carried) => [carried.mark.id, carried] as const));
   const selectedObjects = page.objects.filter((object) => selectedIds.has(object.id) || carriedMarkById.has(object.id));
   if (selectedObjects.length === 0) {
-    return document;
+    return { result: document, chemistryChanges: [] };
   }
   // What each copy is cloned from: a carried mark in the form its molecule's copy keeps (anchored to
   // its atom, so the copy cannot be attributed to the original's atoms).
@@ -14666,6 +15142,10 @@ export function duplicateSelectedDocumentObjects(
   }
   remapCopiedElectronMarkAssociations(copySources,
     new Map(copySources.map((object, index) => [object.id, duplicates[index]])), warningsOut);
+  for (const { mark, copySource } of anchorOriginalMarks ? carriedMarkById.values() : []) {
+    if (copySource === mark) continue;
+    patches.push({ op: "updateObject", objectId: mark.id, changes: { anchor: copySource.anchor, atomAssociation: "explicit" } });
+  }
   // A copied charge or radical that does not belong to a copied molecule stays loose: normalization
   // would otherwise attribute it to whatever molecule it lands near, an unselected one included.
   const copiedMoleculeIds = new Set(duplicates.flatMap((duplicate) => duplicate.type === "molecule" ? [duplicate.id] : []));
@@ -14758,12 +15238,7 @@ export function duplicateSelectedDocumentObjects(
   const next = applyPatches(document, patches, { now: phase4Timestamp });
   const moved = moveDocumentObjects(next, selectionIds, offset.x, offset.y);
   const result = copyNativeObjectExtensions(document, reconcileReactionArrowAttachments(moved), duplicateIdByOriginalId);
-  const chemistryChanges = duplicatedChemistryChanges(document, result, page.id, selectedObjects, duplicateIdByOriginalId);
-  if (chemistryChanges.length === 0) return result;
-  // Refuse the duplicate rather than commit a copy whose chemistry differs from its original.
-  if (!warningsOut) throw new Error(chemistryChanges[0]);
-  warningsOut.push(...chemistryChanges);
-  return document;
+  return { result, chemistryChanges: duplicatedChemistryChanges(document, result, page.id, selectedObjects, duplicateIdByOriginalId) };
 }
 
 /**
@@ -18921,17 +19396,13 @@ export function flattenSpunMolecule(
   // associations explicit so a crowded projection cannot reassign them.
   const oldAtoms = new Map(molecule.atoms.map(atom => [atom.id, atom]));
   const newAtoms = new Map(flattened.atoms.map(atom => [atom.id, atom]));
-  const assignments = nativeElectronMarkAssignments(page).anchorByMarkId;
-  for (const mark of page.objects) {
-    if (mark.type !== "electron-mark") continue;
-    const owner = spin3dElectronMarkOwner(mark, assignments);
-    if (owner?.objectId !== objectId) continue;
-    const before = oldAtoms.get(owner.atomId);
-    const after = newAtoms.get(owner.atomId);
+  for (const { mark, atomId } of spin3dCarriedElectronMarks(page, objectId)) {
+    const before = oldAtoms.get(atomId);
+    const after = newAtoms.get(atomId);
     if (!before || !after) continue;
     patches.push({ op: "updateObject", objectId: mark.id, changes: {
       x: mark.x + after.x - before.x, y: mark.y + after.y - before.y, atomAssociation: "explicit",
-      anchor: { kind: "atom", objectId, atomId: owner.atomId }
+      anchor: { kind: "atom", objectId, atomId }
     } });
   }
   const pageId = page.id;
@@ -18983,6 +19454,22 @@ export function flattenSpunMolecule(
 
 function isSpin3dStereoMarker(bond: MoleculeBond): boolean {
   return bond.display?.bondStyle === "wedge" || bond.display?.bondStyle === "hashed";
+}
+
+/**
+ * The charge/radical marks a Spin 3D session carries with molecule `objectId`, each with the atom it
+ * follows. Flatten moves each by its atom's (flattened − drawn) offset, and the live overlay paints
+ * each at the same offset from the projected atom, so the mark never lags the spin.
+ */
+export function spin3dCarriedElectronMarks(
+  page: DocumentPage, objectId: string
+): Array<{ mark: ElectronMarkObject; atomId: string }> {
+  const assignments = nativeElectronMarkAssignments(page).anchorByMarkId;
+  return page.objects.flatMap(mark => {
+    if (mark.type !== "electron-mark") return [];
+    const owner = spin3dElectronMarkOwner(mark, assignments);
+    return owner?.objectId === objectId ? [{ mark, atomId: owner.atomId }] : [];
+  });
 }
 
 function spin3dElectronMarkOwner(
@@ -20123,6 +20610,9 @@ export function moleculeHasElectronMarks(page: DocumentPage, molecule: MoleculeO
 export const EDITOR_SAVE_MARK_SHIFT_REFUSAL =
   "Ketcher can't keep this molecule's charge and radical marks on the right atoms when atoms are added or removed. Remove the marks first, or edit on the canvas.";
 
+export const EDITOR_SAVE_TAKES_MARK_REFUSAL =
+  "The edited structure would place an atom on a charge or radical mark that is not this molecule's. Move the mark or the molecule apart on the canvas first, then use the structure editor.";
+
 /** The refusal for a Ketcher save whose charge on an atom contradicts the charge marks still on it. */
 export function editorSaveChargeContradictsMarkRefusal(element: string, atomNumber: number): string {
   return `Ketcher changed the charge on ${element} atom ${atomNumber} but its charge mark is still on the canvas. Remove or move the charge mark on the canvas first.`;
@@ -20210,7 +20700,10 @@ function editorSaveMayShiftElectronMarks(
  *    (`committedElectronMarkAssignments`). Normalization's sum then returns the editor's CHG.
  *
  * 3. An atom whose charge the editor changed so that it contradicts the charge marks still on it
- *    is refused (see below). An unchanged charge always commits.
+ *    is refused (see below). An unchanged charge always commits. A save that would attribute to the
+ *    molecule a charge or radical mark it did not own before (a loose mark, or another molecule's,
+ *    reached by a re-placed atom) is refused: only the molecule's own marks count, and no
+ *    countercharge is ever recorded for a mark it picked up.
  *
  * A mark that associates with no atom after the save (its atom was deleted in the editor, or it is
  * a loose mark now out of radius) contributes nothing: the editor's CHG stays the atom's whole
@@ -20245,8 +20738,15 @@ function applyEditorV3000SaveKeepingElectronMarks(
   // RAD back) or be taken by a neighbour the save moved closer. A mark that resolves to no atom
   // (an explicit floating drop, or a loose mark out of radius) stays where it is.
   const objectById = objectByIdIndex(page.objects);
+  const isChargeOrRadical = (object: DocumentObject | undefined): object is ElectronMarkObject =>
+    object?.type === "electron-mark" && (object.markKind === "charge" || object.markKind === "radical-dot");
+  // The charge and radical marks the molecule owns before the save: anchored to it, or attributed
+  // to one of its atoms by the resolver commit normalization runs.
+  const ownedMarkIds = new Set(page.objects.flatMap((object) => isChargeOrRadical(object) &&
+    (object.anchor as { objectId?: string }).objectId === previous.id ? [object.id] : []));
   for (const [markId, owner] of committedElectronMarkAssignments(page).anchorByMarkId) {
     if (owner?.objectId !== previous.id) continue;
+    if (isChargeOrRadical(objectById.get(markId))) ownedMarkIds.add(markId);
     const mark = objectById.get(markId);
     if (mark?.type !== "electron-mark" || mark.anchor.kind === "atom" ||
       (mark.markKind !== "charge" && mark.markKind !== "radical-dot")) continue;
@@ -20262,8 +20762,19 @@ function applyEditorV3000SaveKeepingElectronMarks(
 
   // 2. Record each atom's mark contribution on the page exactly as it will be committed. The parsed
   // atoms carry no mark fields yet, which is also what normalization's legacy-anchor rule sees.
-  const { assignedChargeByAtomKey, assignedRadicalsByAtomKey } =
-    committedElectronMarkAssignments(selectionPage(apply(carried, molecule)));
+  const savedPage = selectionPage(apply(carried, molecule));
+  const { anchorByMarkId: savedOwners, assignedChargeByAtomKey, assignedRadicalsByAtomKey } =
+    committedElectronMarkAssignments(savedPage);
+  // Only the molecule's own marks count. A rebuilt atom placed onto a loose mark, or onto another
+  // molecule's mark, would take that mark's charge or radical: chemistry changed by a move, and
+  // recording it as the atom's mark contribution would hide a countercharge under the mark (the
+  // editor's CHG has no such charge). The mark is not the molecule's to take: refuse.
+  const savedObjectById = objectByIdIndex(savedPage.objects);
+  for (const [markId, owner] of savedOwners) {
+    if (owner?.objectId === molecule.id && !ownedMarkIds.has(markId) && isChargeOrRadical(savedObjectById.get(markId))) {
+      return { refusal: EDITOR_SAVE_TAKES_MARK_REFUSAL };
+    }
+  }
   if (assignedChargeByAtomKey.size === 0 && assignedRadicalsByAtomKey.size === 0) {
     return { document: apply(carried, molecule) };
   }
