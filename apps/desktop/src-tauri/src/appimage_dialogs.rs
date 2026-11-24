@@ -196,12 +196,19 @@ fn gtk_buttons(buttons: MessageDialogButtons) -> MessageDialogButtons {
 /// (a menu, the canvas) buried "Save changes before closing?" behind it, while the palettes stayed
 /// hidden for the prompt and the menus stayed blocked, so ChemDraft looked frozen with its
 /// toolbars gone. The box is created after this is queued, so poll for it on GTK's main thread
-/// (nested `gtk_dialog_run` loops still dispatch timeouts) and give up after five seconds.
+/// (nested `gtk_dialog_run` loops still dispatch timeouts) and give up after five seconds, or a
+/// minute while there is no owner yet. A prompt answered before it could be parented ends the poll
+/// at once.
 ///
 /// Only this prompt's dialog is parented: one that did not exist when the prompt started, still
 /// has no parent, and shows this prompt's title and message ([`is_this_prompt`]). Another
 /// parentless message box that was already open (or opened by someone else meanwhile) is left
 /// alone, and the poll does not stop on it.
+///
+/// The owner is looked up on every poll. A prompt raised while the document window is still
+/// hidden, such as "ChemDraft Could Not Open a Document" for a launch argument (setup runs before
+/// the document window's first paint shows it), waits for that window instead of staying
+/// parentless, where one click on the document buried it ([`parent_poll_step`]).
 fn parent_message_dialog<R: Runtime>(
     app: &AppHandle<R>,
     caller: Option<Window<R>>,
@@ -212,13 +219,12 @@ fn parent_message_dialog<R: Runtime>(
         use gtk::prelude::{Cast, GtkWindowExt, MessageDialogExt, WidgetExt};
 
         // Prefer the document window: palettes are hidden while a prompt is up.
-        let owner = handle
-            .get_webview_window(super::MAIN_WINDOW_LABEL)
-            .and_then(|main| main.gtk_window().ok())
-            .filter(|main| main.is_visible())
-            .or_else(|| caller.and_then(|caller| caller.gtk_window().ok()));
-        let Some(owner) = owner else {
-            return;
+        let owner = move || {
+            handle
+                .get_webview_window(super::MAIN_WINDOW_LABEL)
+                .and_then(|main| main.gtk_window().ok())
+                .filter(|main| main.is_visible())
+                .or_else(|| caller.as_ref().and_then(|caller| caller.gtk_window().ok()))
         };
         let message_dialogs = || {
             gtk::Window::list_toplevels()
@@ -226,10 +232,9 @@ fn parent_message_dialog<R: Runtime>(
                 .filter_map(|widget| widget.downcast::<gtk::MessageDialog>().ok())
         };
         let earlier = message_dialogs().collect::<Vec<_>>();
-        let mut attempts = 0_u32;
-        let _ = gtk::glib::timeout_add_local(std::time::Duration::from_millis(25), move || {
-            attempts += 1;
-            let owner: &gtk::Window = owner.upcast_ref();
+        let started = std::time::Instant::now();
+        let mut seen = false;
+        let _ = gtk::glib::timeout_add_local(PARENT_POLL_INTERVAL, move || {
             let ours = message_dialogs().find(|dialog| {
                 is_this_prompt(
                     earlier.contains(dialog),
@@ -239,17 +244,66 @@ fn parent_message_dialog<R: Runtime>(
                     &shown,
                 )
             });
-            if let Some(dialog) = ours {
-                dialog.set_transient_for(Some(owner));
-                return gtk::glib::ControlFlow::Break;
-            }
-            if attempts < 200 {
-                gtk::glib::ControlFlow::Continue
-            } else {
-                gtk::glib::ControlFlow::Break
+            let parent = owner();
+            // Answered: destroyed (no longer found), or only hidden once it had been shown.
+            let showing = ours.as_ref().is_some_and(|dialog| dialog.is_visible());
+            let found = ours.is_some() && (showing || !seen);
+            let step = parent_poll_step(found, parent.is_some(), seen, started.elapsed());
+            seen |= showing;
+            match step {
+                PollStep::Parent => {
+                    if let (Some(dialog), Some(parent)) = (ours, parent) {
+                        dialog.set_transient_for(Some(parent.upcast_ref::<gtk::Window>()));
+                    }
+                    gtk::glib::ControlFlow::Break
+                }
+                PollStep::Wait => gtk::glib::ControlFlow::Continue,
+                PollStep::GiveUp => gtk::glib::ControlFlow::Break,
             }
         });
     });
+}
+
+/// How often [`parent_message_dialog`] looks for its dialog and owner.
+const PARENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+/// Five seconds for the dialog to appear while an owner is there to take it.
+const DIALOG_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// A minute for the document window to appear: a slow first launch still shows it in time.
+const OWNER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What one poll of [`parent_message_dialog`] does.
+#[derive(Debug, PartialEq, Eq)]
+enum PollStep {
+    /// Make the dialog transient for the owner, and stop.
+    Parent,
+    Wait,
+    /// Stop without parenting: the time is up, or the prompt was answered before it could be.
+    GiveUp,
+}
+
+/// Parent as soon as both this prompt's dialog and a visible owner exist. A dialog that was shown
+/// on an earlier poll (`seen`) and is gone now was answered: stop. Otherwise waiting on the dialog
+/// alone stops [`DIALOG_WAIT`] after the poll started; while there is no owner yet the poll waits up
+/// to [`OWNER_WAIT`], so a prompt from setup still ends up above the document window. Bounded by
+/// time, not by callbacks, which a busy main loop delivers late.
+fn parent_poll_step(
+    found: bool,
+    owner: bool,
+    seen: bool,
+    elapsed: std::time::Duration,
+) -> PollStep {
+    if found && owner {
+        return PollStep::Parent;
+    }
+    if seen && !found {
+        return PollStep::GiveUp;
+    }
+    let limit = if owner { DIALOG_WAIT } else { OWNER_WAIT };
+    if elapsed < limit {
+        PollStep::Wait
+    } else {
+        PollStep::GiveUp
+    }
 }
 
 #[derive(Deserialize)]
@@ -448,6 +502,57 @@ mod tests {
         };
         assert!(is_this_prompt(false, false, None, Some("x"), &untitled));
         assert!(is_this_prompt(false, false, Some(""), Some("x"), &untitled));
+    }
+
+    #[test]
+    fn a_startup_prompt_waits_for_the_document_window_before_parenting() {
+        let ms = std::time::Duration::from_millis;
+        // The usual case: the document is up and the box appears within a few polls.
+        assert_eq!(parent_poll_step(false, true, false, ms(25)), PollStep::Wait);
+        assert_eq!(
+            parent_poll_step(true, true, false, ms(75)),
+            PollStep::Parent
+        );
+        // A launch-argument error: setup raises it before the document window is shown. The box
+        // is found but must wait, well past the five seconds a missing box is given.
+        assert_eq!(parent_poll_step(true, false, false, ms(25)), PollStep::Wait);
+        assert_eq!(
+            parent_poll_step(true, false, true, DIALOG_WAIT + ms(25)),
+            PollStep::Wait
+        );
+        assert_eq!(
+            parent_poll_step(true, true, true, DIALOG_WAIT + ms(25)),
+            PollStep::Parent
+        );
+        assert_eq!(
+            parent_poll_step(true, false, true, OWNER_WAIT),
+            PollStep::GiveUp
+        );
+        // A box that never appears is given up after five seconds once the owner is there.
+        assert_eq!(
+            parent_poll_step(false, true, false, DIALOG_WAIT),
+            PollStep::GiveUp
+        );
+        assert_eq!(
+            parent_poll_step(false, false, false, DIALOG_WAIT),
+            PollStep::Wait
+        );
+    }
+
+    #[test]
+    fn a_startup_prompt_answered_before_its_owner_appears_ends_the_poll() {
+        let ms = std::time::Duration::from_millis;
+        // Found, no owner yet: wait.
+        assert_eq!(parent_poll_step(true, false, false, ms(25)), PollStep::Wait);
+        // The user answered it: the dialog is gone, so stop at once, owner or not.
+        assert_eq!(
+            parent_poll_step(false, false, true, ms(50)),
+            PollStep::GiveUp
+        );
+        assert_eq!(
+            parent_poll_step(false, true, true, ms(50)),
+            PollStep::GiveUp
+        );
     }
 
     #[test]

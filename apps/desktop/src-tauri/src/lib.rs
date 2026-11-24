@@ -36,6 +36,7 @@ mod network_test_http;
 mod ocsr_engine;
 mod opsin;
 mod palette_first_paint;
+mod palette_map_pin;
 mod panel_full_size;
 mod panel_window;
 mod panel_window_controls;
@@ -1766,6 +1767,16 @@ pub fn run() {
                 return;
             };
 
+            // Linux X11: a window manager placing a palette it just mapped again is undone, and
+            // never saved, even while a restore keeps the suspension active.
+            if matches!(event, WindowEvent::Moved(_)) && palette_moved_by_map(window) {
+                return;
+            }
+            // A destroyed palette's pin must not outlive it, suspended or not.
+            if matches!(event, WindowEvent::Destroyed) {
+                palette_map_pin::with_pins(|pins| pins.forget(window.label()));
+            }
+
             if utility_windows_suspended() {
                 return;
             }
@@ -3079,6 +3090,22 @@ async fn suspend_toolset_windows(
                 }
                 panel_window::end_for_hide(window.app_handle(), window.label());
                 panel_full_size::before_hide(&window);
+                // The restore decides from this frame, never from the hidden window's. A palette
+                // still pinned through an earlier map (palette_map_pin) records its pin: its live
+                // frame may be the window manager's clamp, with the move back still on its way.
+                let live = window
+                    .outer_position()
+                    .ok()
+                    .map(|position| (position.x, position.y));
+                let hidden_at = palette_map_pin::with_pins(|pins| {
+                    pins.position_to_keep(window.label(), live, std::time::Instant::now())
+                });
+                if let Some(position) = hidden_at {
+                    UTILITY_SUSPENSION
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .hiding_at(window.label(), position);
+                }
                 if let Err(error) = window.hide() {
                     // A failed acquisition must undo its own temporary hides; JS will not release
                     // an acquisition that rejected and will use the in-app fallback instead.
@@ -3225,14 +3252,37 @@ fn restore_utility_labels<R: Runtime>(
             // returns it to the user's frame once there is room (B9). Resizable inspectors
             // (Molecular Inspector, Drawn Structure Settings) keep the full-frame fit they always
             // had: their whole content must stay usable, not just their title.
-            let refit = restore_refits_toolset(
-                resizable,
-                toolset_fit::with_memory(|memory| memory.is_fitted(&label)),
-                || toolset_title_reachable(app, &window),
-            );
-            if refit {
-                recover_offscreen_toolset_window(app, &window, resizable);
+            //
+            // The title test uses the frame recorded just before the hide, not the hidden window's.
+            let hidden_at = UTILITY_SUSPENSION
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .hidden_position(&label);
+            let fitted = toolset_fit::with_memory(|memory| memory.is_fitted(&label));
+            let mut title_reachable = None;
+            let refit = restore_refits_toolset(resizable, fitted, || {
+                let reachable = toolset_title_reachable(app, &window, hidden_at);
+                title_reachable = Some(reachable);
+                reachable
+            });
+            if palette_frame_log_enabled() {
+                palette_frame_log(format_args!(
+                    "restore label={label} path=dialog-end hidden_at={hidden_at:?} live={:?} \
+                     resizable={resizable} fitted={fitted} title_reachable={title_reachable:?} \
+                     refit={refit}",
+                    window
+                        .outer_position()
+                        .ok()
+                        .map(|position| (position.x, position.y)),
+                ));
             }
+            let moved_to = if refit {
+                recover_offscreen_toolset_window(app, &window, resizable, "dialog-end restore")
+            } else {
+                None
+            };
+            // X11: the show below maps the palette again, and the window manager may place it anew.
+            pin_palette_for_map(app, &window, resizable, moved_to, hidden_at, "dialog-end");
         }
         if dialog_windows::is_dialog_label(&label) {
             dialog_windows::mark_transient(&label);
@@ -3679,7 +3729,19 @@ fn close_toolset_window(
         .is_some_and(|window| toolset_fit::with_memory(|memory| memory.is_fitted(window.label())));
     if let Some(window) = window.as_ref().filter(|_| !fitted) {
         let webview: &tauri::Webview = window.as_ref();
-        if let Some(position) = visible_toolset_physical_position(&webview.window()) {
+        // A palette still pinned through a map (palette_map_pin) saves its pin: its live frame may
+        // be the window manager's clamp, closed before the move back landed.
+        let position = visible_toolset_physical_position(&webview.window()).and_then(|live| {
+            palette_map_pin::with_pins(|pins| {
+                pins.position_to_keep(
+                    window.label(),
+                    Some((live.x, live.y)),
+                    std::time::Instant::now(),
+                )
+            })
+        });
+        if let Some((x, y)) = position {
+            let position = tauri::PhysicalPosition::new(x, y);
             // Best-effort, exactly like the `Moved` handler. Remembering where the palette was is
             // housekeeping; it must never be able to veto the close the user asked for. Once
             // `update_toolset_layout_state` began propagating read errors instead of swallowing
@@ -3701,6 +3763,8 @@ fn close_toolset_window(
     let state = mark_toolset_window_closed(&app, &toolset_id)?;
 
     if let Some(window) = window {
+        // The pin held this map only; a reopen pins the palette again.
+        palette_map_pin::with_pins(|pins| pins.forget(window.label()));
         panel_window::end_for_hide(window.app_handle(), window.label());
         window.hide().map_err(|error| error.to_string())?;
     }
@@ -7484,7 +7548,7 @@ fn clamp_current_inspector_frame(window: tauri::WebviewWindow) {
         && window.is_visible().unwrap_or(false)
         && !utility_windows_suspended()
     {
-        recover_offscreen_toolset_window(app, &window, true);
+        recover_offscreen_toolset_window(app, &window, true, "inspector clamp");
     }
 }
 
@@ -7612,6 +7676,17 @@ fn resize_toolset_window(
             },
         ),
     });
+    if placement.position != origin {
+        palette_frame_log(format_args!(
+            "content-fit label={label} path=content-fit {origin:?} -> {:?} source={source:?} \
+             fitted={fitted} size->{:?}",
+            placement.position, placement.size
+        ));
+        // A palette pinned through a map (palette_map_pin) is held where this fit puts it.
+        palette_map_pin::with_pins(|pins| {
+            pins.moved_by_chemdraft(label, placement.position, std::time::Instant::now())
+        });
+    }
     // X11/XWayland: pin the GtkWindow to the new size before resizing it. GTK clamps a resize to
     // the window's current hints, which still hold the previous content size.
     #[cfg(target_os = "linux")]
@@ -7633,7 +7708,6 @@ fn resize_toolset_window(
     Ok(true)
 }
 
-#[cfg(any(not(target_os = "macos"), test))]
 fn toolset_title_in_physical_work_area(
     position: (i32, i32),
     width: f64,
@@ -8895,16 +8969,38 @@ fn palette_focus_log(message: std::fmt::Arguments<'_>) {
     }
 }
 
-// Opt-in switch for the one `linux-acquire` line per field click. CI's Linux smoke and tester
-// reports need that line without the agent bridge, which would change what the smoke tests.
-#[cfg(target_os = "linux")]
+// Opt-in switch for the one `linux-acquire` line per field click, and for the palette placement
+// lines (`palette_frame_log`). CI's Linux smoke and tester reports need them without the agent
+// bridge, which would change what the smoke tests. Read at run time, so release builds honor it.
 const PALETTE_FOCUS_LOG_ENV_VAR: &str = "CHEMDRAFT_PALETTE_FOCUS_LOG";
+
+fn palette_focus_env_log_enabled() -> bool {
+    palette_focus_log_value_enabled(std::env::var(PALETTE_FOCUS_LOG_ENV_VAR).ok().as_deref())
+}
+
+fn palette_focus_log_value_enabled(value: Option<&str>) -> bool {
+    value == Some("1")
+}
 
 #[cfg(target_os = "linux")]
 fn palette_focus_acquire_log(message: std::fmt::Arguments<'_>) {
-    let env_enabled = std::env::var(PALETTE_FOCUS_LOG_ENV_VAR).is_ok_and(|value| value == "1");
-    if agent_bridge_status().enabled || env_enabled {
+    if agent_bridge_status().enabled || palette_focus_env_log_enabled() {
         eprintln!("[palette-focus] {message}");
+    }
+}
+
+/// Whether `palette_frame_log` writes: only with CHEMDRAFT_PALETTE_FOCUS_LOG=1. Callers that must
+/// measure something extra for a line check this first, so the measurement costs nothing when off.
+fn palette_frame_log_enabled() -> bool {
+    palette_focus_env_log_enabled()
+}
+
+/// One line per palette move on a restore or re-show (a dialog ending, View ▸ Toolbars, a window
+/// manager placement): which path, the frame it read, the fit memory, whether the title strip was
+/// reachable, and the old and new position. Off by default.
+fn palette_frame_log(message: std::fmt::Arguments<'_>) {
+    if palette_frame_log_enabled() {
+        eprintln!("[palette-frame] {message}");
     }
 }
 
@@ -11570,11 +11666,17 @@ fn ensure_toolset_window<R: Runtime>(
     if let Some(window) = app.get_webview_window(&label) {
         // Already built — but it may have been created (or dragged) offscreen earlier, or the
         // display it lived on may have been unplugged while it was hidden. Re-clamp on the way in,
-        // so re-opening from View ▸ Toolbars is always enough to recover a lost palette.
-        recover_offscreen_toolset_window(app, &window, resizable);
+        // so re-opening from View ▸ Toolbars is always enough to recover a lost palette. The clamp
+        // moves a toolbar only when its title strip is unreachable.
+        let hidden = !window.is_visible().unwrap_or(false);
+        let moved_to = recover_offscreen_toolset_window(app, &window, resizable, "reopen");
         // Its page has painted, so show it now — unless it is still waiting for its first paint
         // (Windows, palette_first_paint.rs), whose reveal will show it.
         if !palette_first_paint::reopened(&label) {
+            // X11: showing a hidden palette maps it again, and the window manager may place it.
+            if hidden {
+                pin_palette_for_map(app, &window, resizable, moved_to, None, "reopen");
+            }
             window.show().map_err(|error| error.to_string())?;
         }
         configure_toolset_utility_window(&window, true)?;
@@ -11764,6 +11866,20 @@ fn ensure_toolset_window<R: Runtime>(
     configure_toolset_utility_window(&window, true)?;
     install_toolset_input_focus(&window)?;
     install_toolset_pointer_leave(&window, toolset_id)?;
+    // X11: the first map is a placement too. Keep the position chosen above (a saved one whose
+    // title strip is reachable stays as the user left it).
+    #[cfg(target_os = "linux")]
+    if !resizable && !native_wayland {
+        let built = tauri::LogicalPosition::new(position.x, position.y)
+            .to_physical::<i32>(window.scale_factor().unwrap_or(1.0));
+        palette_frame_log(format_args!(
+            "pin label={label} path=creation pin={:?}",
+            (built.x, built.y)
+        ));
+        palette_map_pin::with_pins(|pins| {
+            pins.pin(&label, (built.x, built.y), std::time::Instant::now())
+        });
+    }
     #[cfg(target_os = "linux")]
     utility_window::set_visible(&window, true)?;
     #[cfg(windows)]
@@ -12658,27 +12774,36 @@ fn clamp_windows_toolset_frame<R: Runtime>(
 
 /// Move an already-built palette back onscreen if its current spot is unreachable. Best-effort: a
 /// window we can't measure or move is left exactly as it is rather than teleported on a guess.
+/// `path` names the caller for the diagnostic (`palette_frame_log`). Returns the physical outer
+/// position it moved the palette to, if it moved it.
 #[cfg(not(windows))]
 fn recover_offscreen_toolset_window<R: Runtime>(
     app: &tauri::AppHandle<R>,
     window: &tauri::WebviewWindow<R>,
     resizable: bool,
-) {
+    path: &'static str,
+) -> Option<(i32, i32)> {
+    let label = window.label();
     if utility_window::uses_native_wayland(app).unwrap_or(true) {
-        return;
+        palette_frame_log(format_args!(
+            "recover label={label} path={path} skipped=native-wayland-or-unknown"
+        ));
+        return None;
     }
     let Some(position) = current_toolset_window_position(window) else {
-        return;
+        palette_frame_log(format_args!(
+            "recover label={label} path={path} skipped=no-position"
+        ));
+        return None;
     };
     let Ok(scale) = window.scale_factor() else {
-        return;
+        return None;
     };
     let (Ok(size), Ok(inner)) = (window.outer_size(), window.inner_size()) else {
-        return;
+        return None;
     };
     let size = size.to_logical::<f64>(scale);
     let live_size = (size.width, size.height);
-    let label = window.label();
     // A palette ChemDraft fitted to a smaller work area is re-placed from the user's saved frame,
     // so it returns there once the work area can hold it again (B9).
     let fitted = toolset_fit::with_memory(|memory| memory.is_fitted(label));
@@ -12719,14 +12844,31 @@ fn recover_offscreen_toolset_window<R: Runtime>(
             );
         }
     });
+    if palette_frame_log_enabled() {
+        palette_frame_log(format_args!(
+            "recover label={label} path={path} read=({:.1},{:.1}) size=({:.1},{:.1}) \
+             fitted={fitted} title_reachable={} source=({:.1},{:.1}) -> ({:.1},{:.1}) \
+             size->({width:.1},{height:.1}) apply={} move={reposition} resize={resize}",
+            position.x,
+            position.y,
+            size.width,
+            size.height,
+            toolset_title_reachable(app, window, None),
+            source.x,
+            source.y,
+            clamped.x,
+            clamped.y,
+            plan.apply,
+        ));
+    }
     if !plan.apply {
-        return;
+        return None;
     }
     if resize {
         let _ = window.set_size(tauri::LogicalSize::new(width, height));
     }
     if !reposition {
-        return;
+        return None;
     }
 
     windows_activation_log::frame_set(
@@ -12736,29 +12878,40 @@ fn recover_offscreen_toolset_window<R: Runtime>(
         || ((clamped.x, clamped.y), (width, height)),
     );
     let _ = window.set_position(tauri::LogicalPosition::new(clamped.x, clamped.y));
+    let to = tauri::LogicalPosition::new(clamped.x, clamped.y).to_physical::<i32>(scale);
+    palette_map_pin::with_pins(|pins| {
+        pins.moved_by_chemdraft(label, (to.x, to.y), std::time::Instant::now())
+    });
+    Some((to.x, to.y))
 }
 
-/// Recover a Windows palette in virtual-desktop pixels.
+/// Recover a Windows palette in virtual-desktop pixels. `path` and the result are as on the other
+/// platforms: the caller, for the diagnostic, and the physical position it moved the palette to.
 #[cfg(windows)]
 fn recover_offscreen_toolset_window<R: Runtime>(
     app: &tauri::AppHandle<R>,
     window: &tauri::WebviewWindow<R>,
     resizable: bool,
-) {
+    path: &'static str,
+) -> Option<(i32, i32)> {
     let target = window.clone();
     let app = app.clone();
-    let _ = run_on_main_thread_blocking(window, move || {
+    run_on_main_thread_blocking(window, move || {
         let webview: &tauri::Webview<R> = target.as_ref();
         let window = webview.window();
         if toolset_frame_is_transient(&app, &window) {
-            return;
+            palette_frame_log(format_args!(
+                "recover label={} path={path} skipped=minimized",
+                window.label()
+            ));
+            return None;
         }
         let (Ok(position), Ok(size), Ok(scale)) = (
             window.outer_position(),
             window.inner_size(),
             window.scale_factor(),
         ) else {
-            return;
+            return None;
         };
         let physical = (position.x, position.y);
         let logical_size = size.to_logical::<f64>(scale);
@@ -12778,11 +12931,8 @@ fn recover_offscreen_toolset_window<R: Runtime>(
                 ))
             })
             .unwrap_or((ToolsetFrameOrigin::Physical(physical, scale), live_size));
-        let Some((placement, adjusted)) =
-            clamp_windows_toolset_frame(&app, label, origin, source_size, resizable)
-        else {
-            return;
-        };
+        let (placement, adjusted) =
+            clamp_windows_toolset_frame(&app, label, origin, source_size, resizable)?;
         let live_size = (size.width, size.height);
         let plan = toolset_fit::plan_fit(
             placement.position == physical && placement.size == live_size,
@@ -12803,15 +12953,25 @@ fn recover_offscreen_toolset_window<R: Runtime>(
                 },
             ),
         });
+        if palette_frame_log_enabled() {
+            palette_frame_log(format_args!(
+                "recover label={label} path={path} read={physical:?} size={live_size:?} \
+                 fitted={fitted} title_reachable={} -> {:?} size->{:?} apply={}",
+                toolset_title_reachable(&app, &target, Some(physical)),
+                placement.position,
+                placement.size,
+                plan.apply,
+            ));
+        }
         if !plan.apply {
-            return;
+            return None;
         }
         if placement.position == physical {
             if placement.size != (size.width, size.height) {
                 let _ =
                     window.set_size(tauri::PhysicalSize::new(placement.size.0, placement.size.1));
             }
-            return;
+            return None;
         }
         if utility_windows_suspended() {
             // Register before SetWindowPos: Windows may buffer Moved until after finish_restore.
@@ -12820,8 +12980,15 @@ fn recover_offscreen_toolset_window<R: Runtime>(
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .recovery_move(window.label(), placement.position);
         }
+        let moved_to = placement.position;
         let _ = panel_full_size::apply(&window, placement, "recover offscreen toolbar");
-    });
+        palette_map_pin::with_pins(|pins| {
+            pins.moved_by_chemdraft(label, moved_to, std::time::Instant::now())
+        });
+        Some(moved_to)
+    })
+    .ok()
+    .flatten()
 }
 
 fn persisted_toolset_position<R: Runtime>(
@@ -12877,18 +13044,156 @@ fn restore_refits_toolset(
     resizable || fitted || !title_reachable()
 }
 
+/// X11/XWayland: hold a palette that is about to be mapped again at the position it must keep
+/// (palette_map_pin), so the window manager's placement on the map is undone and never saved. That
+/// is where a recovery just moved it, or else where it was before it was hidden, as long as its
+/// title strip is reachable there: a palette whose title is unreachable is left to the window
+/// manager, which pulls it onto the screen. Resizable inspectors are always fitted whole, which the
+/// window manager leaves alone. A no-op on macOS, Windows and native Wayland.
+fn pin_palette_for_map<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    window: &tauri::WebviewWindow<R>,
+    resizable: bool,
+    moved_to: Option<(i32, i32)>,
+    hidden_at: Option<(i32, i32)>,
+    path: &str,
+) {
+    if resizable || !utility_window::map_replaces_position(app) {
+        return;
+    }
+    let label = window.label();
+    let target = moved_to.or_else(|| {
+        let position = hidden_at.or_else(|| {
+            window
+                .outer_position()
+                .ok()
+                .map(|position| (position.x, position.y))
+        })?;
+        toolset_title_reachable(app, window, Some(position)).then_some(position)
+    });
+    palette_frame_log(format_args!(
+        "pin label={label} path={path} moved_to={moved_to:?} hidden_at={hidden_at:?} \
+         pin={target:?}"
+    ));
+    palette_map_pin::with_pins(|pins| match target {
+        Some(target) => pins.pin(label, target, std::time::Instant::now()),
+        None => pins.forget(label),
+    });
+}
+
+/// Whether this Moved event of a palette is the window manager placing it as it was mapped again
+/// (palette_map_pin). If so the palette is moved back to its pin, and the caller must not save the
+/// position. Only a position where the window manager's clamp would put the pinned frame counts;
+/// anywhere else is a real move (a drag, or a window-manager move the user asked for), which ends
+/// the pin and is saved as usual. A pin whose title strip can no longer be grabbed on the current
+/// monitors is dropped rather than restored, so the usual handling keeps the palette reachable.
+/// Unpinned palettes, and every palette off Linux X11, report false.
+fn palette_moved_by_map<R: Runtime>(window: &tauri::Window<R>) -> bool {
+    let label = window.label();
+    let now = std::time::Instant::now();
+    if palette_map_pin::with_pins(|pins| pins.target(label, now)).is_none() {
+        return false;
+    }
+    let Some(position) = visible_toolset_physical_position(window) else {
+        return false;
+    };
+    let position = (position.x, position.y);
+    let (Ok(size), Ok(scale)) = (window.outer_size(), window.scale_factor()) else {
+        return false;
+    };
+    let width = size.to_logical::<f64>(scale).width;
+    let monitor_areas = monitor_query::available_monitors(window.app_handle())
+        .unwrap_or_default()
+        .iter()
+        .map(|monitor| *monitor.work_area())
+        .collect::<Vec<_>>();
+    let work_areas = monitor_areas
+        .iter()
+        .map(|area| palette_map_pin::WorkArea {
+            x: area.position.x,
+            y: area.position.y,
+            width: i32::try_from(area.size.width).unwrap_or(i32::MAX),
+            height: i32::try_from(area.size.height).unwrap_or(i32::MAX),
+        })
+        .collect::<Vec<_>>();
+    // The restore's title test (toolset_title_reachable) on the monitors as they are now. Pins exist
+    // only on Linux X11, which reports physical pixels.
+    let title_reachable = |target: (i32, i32)| {
+        monitor_areas
+            .iter()
+            .any(|area| toolset_title_in_physical_work_area(target, width, scale, area))
+    };
+    let layout = palette_map_pin::Layout {
+        size: (
+            i32::try_from(size.width).unwrap_or(i32::MAX),
+            i32::try_from(size.height).unwrap_or(i32::MAX),
+        ),
+        work_areas: &work_areas,
+        title_reachable: &title_reachable,
+    };
+    let decision = palette_map_pin::with_pins(|pins| pins.moved(label, position, &layout, now));
+    match decision {
+        palette_map_pin::MovedDecision::Unpinned => false,
+        palette_map_pin::MovedDecision::AtPin => {
+            palette_frame_log(format_args!(
+                "map label={label} path=window-manager at={position:?} at-pin"
+            ));
+            false
+        }
+        palette_map_pin::MovedDecision::Reassert(pin) => {
+            let sent = utility_window::move_mapped(window, pin);
+            palette_frame_log(format_args!(
+                "map label={label} path=window-manager moved={position:?} -> {pin:?} \
+                 not-saved move-back={sent:?}"
+            ));
+            true
+        }
+        palette_map_pin::MovedDecision::Hold(pin) => {
+            palette_frame_log(format_args!(
+                "map label={label} path=window-manager moved={position:?} pin={pin:?} \
+                 not-saved move-back-exhausted"
+            ));
+            true
+        }
+        palette_map_pin::MovedDecision::Superseded => {
+            palette_frame_log(format_args!(
+                "map label={label} path=superseded moved={position:?} not-saved"
+            ));
+            true
+        }
+        palette_map_pin::MovedDecision::Moved => {
+            palette_frame_log(format_args!(
+                "map label={label} path=user-move moved={position:?} pin-ended"
+            ));
+            false
+        }
+        palette_map_pin::MovedDecision::Unreachable(pin) => {
+            palette_frame_log(format_args!(
+                "map label={label} path=window-manager moved={position:?} pin={pin:?} \
+                 pin-dropped=title-unreachable"
+            ));
+            false
+        }
+    }
+}
+
 /// Whether enough of a palette's title strip lies on a monitor's work area for the user to grab it.
 /// Uses the same per-platform test as the content fit: points on macOS, virtual-desktop pixels
-/// elsewhere (Windows mixes monitor scales; Linux X11 reports pixels).
+/// elsewhere (Windows mixes monitor scales; Linux X11 reports pixels). `position` is the physical
+/// outer position to test, such as the one recorded before a hide; `None` reads the window's own.
 fn toolset_title_reachable<R: Runtime>(
     app: &tauri::AppHandle<R>,
     window: &tauri::WebviewWindow<R>,
+    position: Option<(i32, i32)>,
 ) -> bool {
-    let (Ok(position), Ok(size), Ok(scale)) = (
-        window.outer_position(),
-        window.outer_size(),
-        window.scale_factor(),
-    ) else {
+    let position = match position {
+        Some(position) => position,
+        None => match window.outer_position() {
+            Ok(position) => (position.x, position.y),
+            Err(_) => return false,
+        },
+    };
+    let (Ok(size), Ok(scale)) = (window.outer_size(), window.scale_factor()) else {
         return false;
     };
     let width = size.to_logical::<f64>(scale).width;
@@ -12899,20 +13204,15 @@ fn toolset_title_reachable<R: Runtime>(
             #[cfg(target_os = "macos")]
             {
                 monitor_logical_work_area(monitor).contains_title_strip(
-                    f64::from(position.x) / scale,
-                    f64::from(position.y) / scale,
+                    f64::from(position.0) / scale,
+                    f64::from(position.1) / scale,
                     width,
                     TOOLSET_TITLE_HEIGHT,
                 )
             }
             #[cfg(not(target_os = "macos"))]
             {
-                toolset_title_in_physical_work_area(
-                    (position.x, position.y),
-                    width,
-                    scale,
-                    monitor.work_area(),
-                )
+                toolset_title_in_physical_work_area(position, width, scale, monitor.work_area())
             }
         })
 }
@@ -17500,6 +17800,72 @@ mod tests {
         // A frame ChemDraft fitted earlier still recovers.
         expect_true(restore_refits_toolset(false, true, || true));
         expect_true(toolset_is_resizable("core.molecularInspector"));
+    }
+
+    #[test]
+    fn palette_diagnostics_need_the_switch_set_to_one() {
+        expect_true(palette_focus_log_value_enabled(Some("1")));
+        for value in [None, Some(""), Some("0"), Some("true"), Some(" 1")] {
+            expect_false(palette_focus_log_value_enabled(value));
+        }
+        // Read at run time, on every platform, so a release build honors it.
+        let source = include_str!("lib.rs");
+        let start = source.find("const PALETTE_FOCUS_LOG_ENV_VAR").unwrap();
+        let start = source[..start].rfind("\n\n").unwrap();
+        let end = source.find("fn palette_focus_log_value_enabled(").unwrap();
+        let gate = &source[start..end];
+        expect_true(gate.contains("fn palette_focus_env_log_enabled()"));
+        expect_false(gate.contains("#[cfg("));
+        expect_false(gate.contains("debug_assertions"));
+    }
+
+    #[test]
+    fn a_palette_is_pinned_before_every_show_that_maps_it_again() {
+        let source = include_str!("lib.rs");
+        let body = |signature: &str| {
+            let start = source.find(signature).unwrap();
+            let rest = &source[start..];
+            &rest[..rest.find("\n}\n").unwrap()]
+        };
+        // After a dialog: decided from the frame recorded before the hide, pinned before the show.
+        let restore = body("fn restore_utility_labels<");
+        let hidden = restore.find(".hidden_position(&label)").unwrap();
+        let pin = restore.find("pin_palette_for_map(").unwrap();
+        let show = restore
+            .find("restore_utility_in_document_group(&window)")
+            .unwrap();
+        expect_true(hidden < restore.find("toolset_title_reachable(").unwrap());
+        expect_true(pin < show);
+        let suspend = body("async fn suspend_toolset_windows(");
+        expect_true(suspend.find(".hiding_at(").unwrap() < suspend.find("window.hide()").unwrap());
+        // A palette still pinned is remembered, and saved on close, at its pin, not at the clamp.
+        expect_true(
+            suspend.find(".position_to_keep(").unwrap() < suspend.find(".hiding_at(").unwrap(),
+        );
+        let close = body("fn close_toolset_window(");
+        expect_true(
+            close.find(".position_to_keep(").unwrap()
+                < close.find("persist_toolset_position(").unwrap(),
+        );
+        // Re-opened from View ▸ Toolbars.
+        let ensure = body("fn ensure_toolset_window<");
+        let reopen = &ensure[..ensure.find("builder.build()").unwrap()];
+        expect_true(
+            reopen.find("pin_palette_for_map(").unwrap() < reopen.find("window.show()").unwrap(),
+        );
+        // The window manager's placement is caught before the suspension gate drops the event.
+        let handler = &source[source
+            .find("// Linux X11: a window manager placing")
+            .unwrap()..];
+        expect_true(
+            handler.find("palette_moved_by_map(window)").unwrap()
+                < handler.find("if utility_windows_suspended()").unwrap(),
+        );
+        // A destroyed palette's pin goes with it, even while a dialog suspends the palettes.
+        expect_true(
+            handler.find("pins.forget(window.label())").unwrap()
+                < handler.find("if utility_windows_suspended()").unwrap(),
+        );
     }
 
     #[test]
