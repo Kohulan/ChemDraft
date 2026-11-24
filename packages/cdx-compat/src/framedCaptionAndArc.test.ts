@@ -332,3 +332,115 @@ it("saves an opened file past the document-wide run cap with its capped captions
   expect(textsOf(again).map(text => text.text)).toEqual(texts.map(text => text.text));
   expect(textsOf(again).map(text => text.style.fontFamily)).toEqual(["Font2", "Font2", "Font2", "Font2", undefined, undefined]);
 });
+
+// Codex security finding (#442): import capped the number of fonts and caption runs but not a font
+// name's length, and every caption stored its font's name again (its style, its source state and
+// its copy of the font table), so a small crafted file of many captions over one long name saved
+// tens of megabytes of native JSON right after opening (autosave). A font name over 256 characters
+// (or an entry over 512) is not used, with one warning naming the font id; shared whole-table
+// copies are budgeted in characters as well as entries. Sizes are measured, not timed.
+const manyCaptions = (count: number, name: string) =>
+  `<CDXML><fonttable><font id="7" charset="iso-8859-1" name="${name}"/></fonttable><page>` +
+  `${Array.from({ length: count }, (_, i) => caption(i + 10, 1, 7, 72 + i)).join("")}</page></CDXML>`;
+const nativeJsonChars = (source: string) => {
+  const opened = openChemDraftPayload(source);
+  return { opened, chars: JSON.stringify(opened.document).length };
+};
+
+it("does not use a font whose name is too long, with one warning naming its id, and saves linearly", () => {
+  const name = "N".repeat(10_000);
+  const small = nativeJsonChars(manyCaptions(1_000, name));
+  const large = nativeJsonChars(manyCaptions(4_000, name));
+  for (const { opened } of [small, large]) {
+    const warnings = opened.warnings.filter(w => w.code === "cdxml.font_entry_too_long");
+    expect(warnings.map(w => w.message)).toEqual([
+      "CDXML import: font 7 has a name longer than 256 characters, or more than 512 characters of font attributes, far beyond any real font; it was not used, and text set in it keeps the default font."
+    ]);
+    expect(warnings[0].message).not.toContain(name);
+    const texts = textsOf(opened);
+    // The caption falls back to plain styled text in the default font; its text is kept.
+    expect(texts.every(text => text.text === "x" && text.style.fontFamily === undefined)).toBe(true);
+    expect(JSON.stringify(opened.document)).not.toContain("N".repeat(257));
+  }
+  // Before the cap the name was stored about three times per caption (~120 MB for 4,000 captions).
+  expect(large.chars).toBeLessThan(4_000 * 2_000);
+  // Linear: four times the captions cost about four times the bytes, never sixteen.
+  expect(large.chars / small.chars).toBeLessThan(4.5);
+});
+
+it("keeps a 256-character font name and saves many captions in it linearly", () => {
+  const name = "N".repeat(256);
+  const sizes = [2_000, 4_000, 8_000].map(count => {
+    const source = manyCaptions(count, name);
+    const { opened, chars } = nativeJsonChars(source);
+    expect(opened.warnings.map(w => w.code)).not.toContain("cdxml.font_entry_too_long");
+    const texts = textsOf(opened);
+    expect(texts).toHaveLength(count);
+    expect(texts.every(text => text.style.fontFamily === name)).toBe(true);
+    // Each caption stores its name a bounded number of times: under 25 characters per source character.
+    expect(chars).toBeLessThan(25 * source.length);
+    return chars;
+  });
+  // Equal steps in captions add (about) equal bytes once shared copies are spent: linear growth.
+  const [a, b, c] = sizes;
+  expect((c - b) / (b - a)).toBeGreaterThan(1.9);
+  expect((c - b) / (b - a)).toBeLessThan(2.1);
+  // And the saved font table still names the font once, under its id.
+  const opened = openChemDraftPayload(manyCaptions(2_000, name));
+  const saved = exportDocumentToCdxml(opened.document!, plain);
+  expect([...saved.contents.matchAll(/<font [^>]*\/>/g)].map(match => match[0])).toEqual([
+    `<font id="7" charset="iso-8859-1" name="${name}"/>`
+  ]);
+});
+
+// CodeRabbit (#442): export gave new fonts ids past CDX's 16-bit limit (65535, 65536, ...), with no
+// warning; on reopen the table was cut to 65,535 entries and a caption in the last font lost its
+// font and frame. Ids stop below 65535; a font that does not fit is not registered, with one warning,
+// and its caption is written as plain styled text.
+it("never gives a font an id past the CDX limit, and writes captions whose font does not fit as plain text", { timeout: 60_000 }, () => {
+  const document = createEmptyDocument();
+  const retained = Array.from({ length: 65_533 }, (_, i) => ({ id: String(i + 1), charset: "iso-8859-1", name: `Font${i + 1}` }));
+  const holder: TextObject = { type: "text", id: "holder", x: 10, y: 10, width: 40, height: 22, rotation: 0, text: "h", spans: [],
+    style: {}, compatibility: { warnings: [], unknown: { cdxmlTextFontTable: retained } } };
+  const captions = ["NewA", "NewB", "NewC"].map((font, i): TextObject => ({
+    type: "text", id: `caption${i}`, x: 36, y: 80 + 30 * i, width: 40, height: 22, rotation: 0, text: font,
+    style: { fontFamily: font, fontSizePx: 16 }, spans: [{ text: font, script: "normal", style: {} }],
+    compatibility: { warnings: [], unknown: { sourceCdxmlAttributes: { p: `30 ${72 + 30 * i}`, Justification: "Left" } } }
+  }));
+  document.pages[0].objects = [holder, ...captions];
+  const saved = exportDocumentToCdxml(document, plain);
+  const ids = [...saved.contents.matchAll(/<font id="(\d+)"[^>]*name="([^"]+)"/g)].map(match => [Number(match[1]), match[2]] as const);
+  expect(ids).toHaveLength(65_534);
+  expect(Math.max(...ids.map(([id]) => id))).toBe(65_534);
+  expect(ids.at(-1)).toEqual([65_534, "NewA"]);
+  expect(saved.warnings.filter(w => w.code === "cdxml.font_table_full").map(w => w.message)).toEqual([
+    "CDXML export: the font table is full (font ids below 65535); from text caption1 on, fonts not already in it were not written, and text set in them was written without its caption frame and run fonts, or in the default font."
+  ]);
+  // The captions that did not fit are written as plain styled text through the existing fallback, which warns too.
+  expect(saved.warnings.filter(w => w.code === "cdxml.text_format_native_only").map(w => w.sourceObjectId)).toEqual(["caption1", "caption2"]);
+  expect(saved.contents).toContain('<s font="65534" ');
+  const again = openChemDraftPayload(saved.contents);
+  expect(again.warnings.map(w => w.code)).not.toContain("cdxml.font_table_truncated");
+  const texts = textsOf(again);
+  expect(texts.map(text => text.text)).toEqual(["h", "NewA", "NewB", "NewC"]);
+  expect(texts.map(text => text.style.fontFamily)).toEqual([undefined, "NewA", undefined, undefined]);
+});
+
+// CodeRabbit (#442): when the exact writer declines a stored arc (here, its only head was removed),
+// the fallback clamped every radius to at least 1, so a valid 0.5 radius was saved doubled.
+it("keeps a stored arc's sub-1 radius when it saves without its head", () => {
+  const source = '<CDXML><page><arrow id="8" AngularSize="-90" Center3D="60 60 0" MajorAxisEnd3D="90 60 0" MinorAxisEnd3D="60 60.375 0" ' +
+    'Tail3D="90 60 0" Head3D="60 59.625 0" BoundingBox="30 59.625 90 60.375" HeadSize="900" ArrowheadHead="Full" ArrowheadType="Solid"/></page></CDXML>';
+  const document = openChemDraftPayload(source).document!;
+  const g = document.pages[0].objects[0] as GraphicObject;
+  expect(g.data.arcRadiusX).toBeCloseTo(40, 9);
+  expect(g.data.arcRadiusY).toBeCloseTo(0.5, 9);
+  g.data.markerEnd = undefined; g.data.markerStart = undefined;
+  const output = exportDocumentToCdxml(document, plain);
+  expect(output.contents).toContain('MinorAxisEnd3D="60 60.375 0"');
+  const again = openChemDraftPayload(output.contents).document!.pages[0].objects[0] as GraphicObject;
+  expect(again.data.artPathKind).toBe("arc");
+  expect(again.data.arcRadiusX).toBeCloseTo(40, 6);
+  expect(again.data.arcRadiusY).toBeCloseTo(0.5, 6);
+  expect(again.data.arcSweepRadians).toBeCloseTo(-Math.PI / 2, 6);
+});

@@ -356,6 +356,21 @@ interface CdxmlColorTable {
  * import (AGENTS.md §13).
  */
 const CDXML_FONT_TABLE_LIMIT = 65_535;
+/** Font ids export may write are below this (CDX font ids are 16-bit; 65535 is reserved). */
+const CDXML_FONT_ID_LIMIT = 65_535;
+/**
+ * Import cap on one font entry. Every caption keeps the fonts its runs name (and its own style
+ * names its font again), so an unbounded font name was copied into every caption's saved state:
+ * a 331 KB crafted file of 4,000 captions over one long name saved ~48.7 MB of native JSON
+ * (Codex security finding). Real font names are short (a Windows face name fits in 32 characters,
+ * LF_FACESIZE), so 256 characters is far above any real font yet keeps each caption's copy small.
+ * The whole entry (id, charset, name and any other attribute, keys included) is capped too, since
+ * the entry is what each caption stores. A font over either cap is
+ * not used: text set in it keeps the default font, with one warning naming the font ids. A name is
+ * never truncated, which would silently set the text in a different font.
+ */
+const CDXML_FONT_NAME_LIMIT = 256;
+const CDXML_FONT_ENTRY_LIMIT = 512;
 const CDXML_CAPTION_RUN_LIMIT = 65_535;
 /**
  * Document-wide cap on the caption runs whose fonts are resolved on import and on export (2^18).
@@ -375,13 +390,28 @@ const CDXML_DOCUMENT_CAPTION_RUN_LIMIT = 262_144;
  * save is unchanged.
  */
 const CDXML_TEXT_FONT_TABLE_COPY_LIMIT = 16_384;
+/**
+ * The same budget in characters (2^20), since entries differ in size: sharing stops at whichever
+ * runs out first, so shared copies add at most ~1 MB to the native payload whatever the table
+ * holds. An ordinary document (a few fonts of ~50 characters over a few hundred captions) uses
+ * under a tenth of it.
+ */
+const CDXML_TEXT_FONT_TABLE_COPY_CHAR_LIMIT = 1_048_576;
 
 /** The imported font table, indexed by id (the first entry wins, as a linear search did). */
 interface CdxmlImportFonts {
   table: readonly CdxmlFont[];
   byId: ReadonlyMap<string | undefined, CdxmlFont>;
   /** Document-wide budgets, shared by every page's import. */
-  usage: { captionRuns: number; captionRunLimitReached: boolean; fontTableEntries: number };
+  usage: { captionRuns: number; captionRunLimitReached: boolean; fontTableEntries: number; fontTableChars: number };
+  /** Characters in `table` (keys and values), what one shared copy adds to the budget. */
+  tableChars: number;
+}
+
+function cdxmlFontEntryChars(font: CdxmlFont): number {
+  let chars = 0;
+  for (const [key, value] of Object.entries(font)) chars += key.length + String(value).length;
+  return chars;
 }
 
 function importCdxmlFonts(tree: OrderedXmlTree, sourceFormat: string, warnings: CompatibilityConversionWarning[]): CdxmlImportFonts {
@@ -391,9 +421,28 @@ function importCdxmlFonts(tree: OrderedXmlTree, sourceFormat: string, warnings: 
       `more than the ${CDXML_FONT_TABLE_LIMIT} supported; only the first ${CDXML_FONT_TABLE_LIMIT} were imported, ` +
       "and text set in a later font keeps the default font."));
   }
-  const table = trackCdxmlFontTable(listed.slice(0, CDXML_FONT_TABLE_LIMIT));
-  return { table, byId: indexCdxmlFonts(table, font => font.id),
-    usage: { captionRuns: 0, captionRunLimitReached: false, fontTableEntries: 0 } };
+  const usable: CdxmlFont[] = [];
+  const oversized: string[] = [];
+  let tableChars = 0;
+  for (const font of listed.slice(0, CDXML_FONT_TABLE_LIMIT)) {
+    const chars = cdxmlFontEntryChars(font);
+    if ((font.name?.length ?? 0) > CDXML_FONT_NAME_LIMIT || chars > CDXML_FONT_ENTRY_LIMIT) {
+      oversized.push(font.id ?? "<unnamed>");
+      continue;
+    }
+    tableChars += chars;
+    usable.push(font);
+  }
+  if (oversized.length) {
+    const named = oversized.slice(0, 10).join(", ") + (oversized.length > 10 ? ` and ${oversized.length - 10} more` : "");
+    warnings.push(warning("cdxml.font_entry_too_long", `${sourceFormat} import: font ${named} ` +
+      `${oversized.length === 1 ? "has" : "have"} a name longer than ${CDXML_FONT_NAME_LIMIT} characters, or more than ` +
+      `${CDXML_FONT_ENTRY_LIMIT} characters of font attributes, far beyond any real font; ` +
+      `${oversized.length === 1 ? "it was" : "they were"} not used, and text set in ${oversized.length === 1 ? "it" : "them"} keeps the default font.`));
+  }
+  const table = trackCdxmlFontTable(usable);
+  return { table, byId: indexCdxmlFonts(table, font => font.id), tableChars,
+    usage: { captionRuns: 0, captionRunLimitReached: false, fontTableEntries: 0, fontTableChars: 0 } };
 }
 
 /** The fonts a CDXML export writes, indexed by name (the first entry wins, as a linear search did). */
@@ -938,7 +987,7 @@ function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityCo
     countCdxmlFontEntries(source.length);
     for (const entry of source) {
       const font = preservedCurveAttributes(entry);
-      if (!/^\d+$/.test(font.id ?? "") || Number(font.id) >= 65535) continue;
+      if (!/^\d+$/.test(font.id ?? "") || Number(font.id) >= CDXML_FONT_ID_LIMIT) continue;
       const previous = fonts.get(font.id);
       if (previous && (previous.name !== font.name || previous.charset !== font.charset)) {
         warnings.push({ code: "cdxml.text_font_table_conflict", sourceObjectId: object.id,
@@ -949,7 +998,7 @@ function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityCo
   }
   const byName = indexCdxmlFonts<string | undefined>(fonts.values(), font => font.name);
   const plainCaptionIds = new Set<string>();
-  let nextId = 1, captionRuns = 0, captionRunLimitReached = false;
+  let nextId = 1, captionRuns = 0, captionRunLimitReached = false, tableFullWarned = false;
   for (const page of document.pages) for (const object of page.objects) {
     let names: unknown[] = [];
     if (object.type === "table") names = [nativeTextStyleFromObjectStyle(object.style).fontFamily];
@@ -969,7 +1018,19 @@ function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityCo
     }
     for (const name of names) {
       if (typeof name !== "string" || !name || lookupCdxmlFont(byName, name)) continue;
-      while (fonts.has(String(nextId))) nextId++;
+      while (nextId < CDXML_FONT_ID_LIMIT && fonts.has(String(nextId))) nextId++;
+      // No supported id left: the font is not registered, so a caption set in it is written as
+      // plain styled text (exportTextObject's fallback, with its own warning) and a table falls
+      // back to the default font. Writing an id past the limit would lose the font on reopen.
+      if (nextId >= CDXML_FONT_ID_LIMIT || fonts.size >= CDXML_FONT_TABLE_LIMIT) {
+        if (!tableFullWarned) {
+          tableFullWarned = true;
+          warnings.push({ code: "cdxml.font_table_full", sourceObjectId: object.id,
+            message: `CDXML export: the font table is full (font ids below ${CDXML_FONT_ID_LIMIT}); from ${object.type} ${object.id} on, ` +
+              "fonts not already in it were not written, and text set in them was written without its caption frame and run fonts, or in the default font." });
+        }
+        continue;
+      }
       const id = String(nextId++);
       const font = { id, charset: "iso-8859-1", name };
       fonts.set(id, font);
@@ -3035,8 +3096,11 @@ function storedArcForCdxml(graphic: GraphicObject, warnings: CompatibilityConver
   if (d.arcCenter === undefined && d.arcRadiusX === undefined && d.arcRadiusY === undefined) return undefined;
   const finite = (v: unknown) => typeof v === "number" && Number.isFinite(v) ? v : undefined;
   const center = pointMetadata(d.arcCenter) ?? objectCenter(graphic);
-  const rx = Math.max(finite(d.arcRadiusX) ?? graphic.width / 2 - 4, 1);
-  const ry = Math.max(finite(d.arcRadiusY) ?? graphic.height / 2 - 4, 1);
+  // A valid stored radius (the reader keeps any positive one) is written as stored, the same as the
+  // exact writer; only a missing or invalid radius takes the frame-based fallback and its minimum.
+  const radius = (v: unknown) => { const r = finite(v); return r !== undefined && r > 0 ? r : undefined; };
+  const rx = radius(d.arcRadiusX) ?? Math.max(graphic.width / 2 - 4, 1);
+  const ry = radius(d.arcRadiusY) ?? Math.max(graphic.height / 2 - 4, 1);
   // A valid stored sweep (the reader accepts 0 < |sweep| <= 360 degrees) is written as stored, the
   // same as the exact writer; only a missing or out-of-range sweep takes the legacy clamp.
   const storedSweep = finite(d.arcSweepRadians);
@@ -5290,9 +5354,11 @@ function importText(textElement: XmlElementView, pageIndex: number, objectIndex:
 // then only the fonts this text's own runs name: export needs no more to write every font the
 // source runs refer to, and the first text still lists the rest.
 function textFontTable(element: XmlElementView, context: ImportPageContext): readonly CdxmlFont[] {
-  const { table, byId, usage } = context.fonts;
-  if (!usage.fontTableEntries || usage.fontTableEntries + table.length <= CDXML_TEXT_FONT_TABLE_COPY_LIMIT) {
+  const { table, byId, usage, tableChars } = context.fonts;
+  if (!usage.fontTableEntries || (usage.fontTableEntries + table.length <= CDXML_TEXT_FONT_TABLE_COPY_LIMIT &&
+      usage.fontTableChars + tableChars <= CDXML_TEXT_FONT_TABLE_COPY_CHAR_LIMIT)) {
     usage.fontTableEntries += table.length;
+    usage.fontTableChars += tableChars;
     return table;
   }
   const own = new Map<string, CdxmlFont>();
