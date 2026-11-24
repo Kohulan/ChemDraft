@@ -1,5 +1,6 @@
 import { isDrawingToolCommand } from "./drawingTools";
 import { installPopoverEscapeRouting } from "./window-manager/popoverEscape";
+import { isScrollOwnerPress } from "./window-manager/scrollOwnerPress";
 import { listenCurrentWindowEvent } from "./window-manager/tauriEvents";
 import type { AnalysisReport } from "@chemdraft/analysis-core";
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent } from "react";
@@ -1175,9 +1176,11 @@ export function PaletteWindow({
       return;
     }
 
-    // The scroll container itself receives presses on its scrollbar. Leave those to the webview;
-    // descendants such as the existing content drag grip can still start a palette drag.
-    if (event.target === bodyRef.current) return;
+    // Scrollbar presses target their scroll owner: the content scroller or a nested inspector
+    // panel. Leave those to the webview. Every other background press must still drag: on
+    // Windows the input-focus lease (isPaletteWindowDragPress) defers its keyboard hand-back
+    // to the end of that drag.
+    if (isScrollOwnerPress(event.target)) return;
 
     if ((event.target as HTMLElement).closest("button, select, input, textarea, [data-palette-control]") ||
       (shellRef.current && disabledControlAtPointer(shellRef.current, event.nativeEvent))) {
@@ -1194,7 +1197,7 @@ export function PaletteWindow({
       return;
     }
 
-    if (event.target === bodyRef.current) return;
+    if (isScrollOwnerPress(event.target)) return;
 
     if ((event.target as HTMLElement).closest("button, select, input, textarea, [data-palette-control]") ||
       (shellRef.current && disabledControlAtPointer(shellRef.current, event.nativeEvent))) {

@@ -132,6 +132,14 @@ it("keeps native and page pending editing-key lists in agreement", () => {
   expect([...new Set(nativeDeletes)].sort()).toEqual(pageDeletes.sort());
 });
 
+/** jsdom has no layout: report content overflowing `element` vertically. */
+function overflowVertically(element: HTMLElement): void {
+  Object.defineProperties(element, {
+    clientHeight: { configurable: true, value: 100 },
+    scrollHeight: { configurable: true, value: 300 }
+  });
+}
+
 describe.each(["macos", "windows"] as const)("palette input focus (%s)", (platform) => {
   let container: HTMLDivElement;
   let root: Root;
@@ -563,6 +571,55 @@ describe.each(["macos", "windows"] as const)("palette input focus (%s)", (platfo
     expect(leases()).toHaveLength(1);
     // macOS has no end-of-drag hand-back, even when the palette has no input lease.
     expect(leases()[0]![1]).toMatchObject({ editing: false, returnFocus: platform === "macos" });
+  });
+
+  it("ends a lease on a nested scrollbar press without dragging, handing the keyboard back at pointerdown", async () => {
+    // jsdom computes overflow only from loaded rules; the drag handler reads scroll ownership from them.
+    const styles = document.createElement("style");
+    styles.textContent = readFileSync(resolve("apps/desktop/src/App.css"), "utf8");
+    document.head.append(styles);
+    try {
+      const input = await mountSettings();
+      await clickControl(input);
+      // A native scrollbar press targets its scroll owner, here the Object Settings panel body.
+      const scroller = container.querySelector<HTMLElement>(".molecule-inspector-panel-body")!;
+      expect(scroller.contains(input)).toBe(true);
+      overflowVertically(scroller);
+      await act(async () => pointer(scroller, "pointerdown"));
+      await flush();
+      expect(leases().map(([, args]) => args.editing)).toEqual([true, false]);
+      // A scrollbar press is not a drag press, so Windows hands the keyboard back now, as macOS does.
+      expect(leases().at(-1)![1]).toMatchObject({ editing: false, returnFocus: true });
+      expect(document.activeElement).not.toBe(input);
+      expect(startPaletteWindowDrag).not.toHaveBeenCalled();
+      await act(async () => pointer(scroller, "pointerup"));
+      await flush();
+      // No drag means no WM_EXITSIZEMOVE: by release, both platforms have handed the keyboard back.
+      expect(leases().at(-1)![1]).toMatchObject({ editing: false, returnFocus: true });
+      expect(startPaletteWindowDrag).not.toHaveBeenCalled();
+    } finally {
+      styles.remove();
+    }
+  });
+
+  it("drags from the blank background of a floating tool palette whose scrollbars App.css hides", async () => {
+    const styles = document.createElement("style");
+    styles.textContent = readFileSync(resolve("apps/desktop/src/App.css"), "utf8");
+    document.head.append(styles);
+    try {
+      await mountSettings("core.structure");
+      const palette = container.querySelector<HTMLElement>(".tool-palette.floating.vertical")!;
+      expect(getComputedStyle(palette).overflowY).toBe("auto");
+      // It really scrolls, but with no visible scrollbar its own box is all background.
+      overflowVertically(palette);
+      await act(async () => pointer(palette, "pointerdown"));
+      await flush();
+      expect(leases()).toHaveLength(1);
+      expect(leases()[0]![1]).toMatchObject({ editing: false, returnFocus: platform === "macos" });
+      expect(startPaletteWindowDrag).toHaveBeenCalledExactlyOnceWith(expect.any(Number), expect.any(Number));
+    } finally {
+      styles.remove();
+    }
   });
 
   it("uses the document capture guard during a pending palette click, allowing Save and keyup", async () => {

@@ -10,6 +10,7 @@ import { PluginPanelWindow } from "../plugins/PluginPanelWindow";
 import { pluginPanelWindowId } from "../plugins/panelBridge";
 import { createDesktopToolsetRegistry } from "../toolsets";
 import { fitCurrentPaletteWindow } from "./index";
+import { isScrollOwnerPress } from "./scrollOwnerPress";
 
 const native = vi.hoisted(() => ({
   invoke: vi.fn(async (_command: string, _args?: Record<string, unknown>, _options?: unknown): Promise<unknown> => undefined),
@@ -29,6 +30,7 @@ vi.mock("@tauri-apps/api/window", () => ({
 describe.each(["macos", "windows"] as const)("native title dragging (%s)", platform => {
   let container: HTMLDivElement;
   let root: Root;
+  let appCss: HTMLStyleElement | undefined;
 
   beforeEach(() => {
     native.invoke.mockReset();
@@ -43,6 +45,8 @@ describe.each(["macos", "windows"] as const)("native title dragging (%s)", platf
   afterEach(() => {
     act(() => root.unmount());
     container.remove();
+    appCss?.remove();
+    appCss = undefined;
     clearMocks();
     delete (window as typeof window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
     vi.restoreAllMocks();
@@ -149,6 +153,79 @@ describe.each(["macos", "windows"] as const)("native title dragging (%s)", platf
     await dispatch(window, new Event("resize"));
     expect(container.querySelector("main")?.dataset.resizable).toBe("true");
     expect(native.invoke.mock.calls.some(([command]) => command === "resize_toolset_window")).toBe(false);
+  });
+
+  function loadAppCss(): void {
+    // jsdom computes overflow only from loaded rules, and scroll ownership is read from the cascade.
+    appCss = document.createElement("style");
+    appCss.textContent = readFileSync("apps/desktop/src/App.css", "utf8");
+    document.head.append(appCss);
+  }
+
+  // A native scrollbar press targets its scroll owner: the palette's content scroller or a nested
+  // Object Settings panel body.
+  const scrollOwners = [".molecule-inspector-panel-body", ".palette-window-content"] as const;
+
+  it.each(scrollOwners.flatMap(selector => [true, false].map(pointer => [selector, pointer] as const)))(
+    "leaves %s scrollbar presses to the webview (pointer: %s)", async (selector, pointer) => {
+    loadAppCss();
+    await mount("palette", false, { toolsetId: "core.drawnStructureSettings" });
+    const scroller = container.querySelector<HTMLElement>(selector)!;
+    expect(scroller).not.toBeNull();
+    overflow(scroller);
+    const down = pointerEvent("pointerdown", 7);
+    const mouseDown = new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 });
+    await dispatch(scroller, ...(pointer ? [down, mouseDown] : [mouseDown]));
+    expect(down.defaultPrevented).toBe(false);
+    expect(mouseDown.defaultPrevented).toBe(false);
+    expect(container.querySelector<HTMLElement>("main")!.setPointerCapture).not.toHaveBeenCalled();
+    expect(native.invoke.mock.calls.filter(([command]) => command === "start_window_drag")).toEqual([]);
+    await press(container.querySelector<HTMLElement>(".palette-title-label")!);
+    expectOneCompensatedDrag();
+  });
+
+  // The palette background stays a drag surface: the input-focus lease classifies these presses as
+  // drags (isPaletteWindowDragPress) and, on Windows, leaves the keyboard hand-back to the drag's end.
+  const backgrounds = [".palette-window-shell", ".molecule-inspector-target-row"] as const;
+
+  it.each(backgrounds.flatMap(selector => [true, false].map(pointer => [selector, pointer] as const)))(
+    "still drags from the %s background inside Object Settings (pointer: %s)", async (selector, pointer) => {
+    loadAppCss();
+    await mount("palette", false, { toolsetId: "core.drawnStructureSettings" });
+    const background = container.querySelector<HTMLElement>(selector)!;
+    expect(background).not.toBeNull();
+    // Inside the nested scroller, but not a scroll owner itself.
+    if (selector !== ".palette-window-shell") {
+      expect(background.closest(".molecule-inspector-panel-body")).not.toBeNull();
+    }
+    await press(background, pointer);
+    expectOneCompensatedDrag();
+  });
+
+  // A floating tool palette scrolls (overflow-y: auto) with its scrollbars hidden by App.css, so
+  // nothing on its own box is a scrollbar: a blank-area press there must still drag the window.
+  it.each([true, false])("still drags from the blank background of a floating tool palette with hidden scrollbars (pointer: %s)", async (pointer) => {
+    loadAppCss();
+    await mount("palette", false, { toolsetId: "core.structure" });
+    const palette = container.querySelector<HTMLElement>(".tool-palette.floating.vertical")!;
+    expect(palette).not.toBeNull();
+    const style = getComputedStyle(palette);
+    expect(style.overflowY).toBe("auto");
+    expect(style.getPropertyValue("scrollbar-width")).toBe("none");
+    // Really overflowing: only the hidden scrollbar keeps this from being a scroll owner.
+    overflow(palette);
+    expect(isScrollOwnerPress(palette)).toBe(false);
+    await press(palette, pointer);
+    expectOneCompensatedDrag();
+  });
+
+  it("still drags from a scroller whose content fits, since it shows no scrollbar", async () => {
+    loadAppCss();
+    await mount("palette", false, { toolsetId: "core.drawnStructureSettings" });
+    const scroller = container.querySelector<HTMLElement>(".molecule-inspector-panel-body")!;
+    expect(getComputedStyle(scroller).overflow).toMatch(/auto|scroll/);
+    await press(scroller);
+    expectOneCompensatedDrag();
   });
 
   function pointerEvent(type: string, pointerId: number, isPrimary = true): MouseEvent {
@@ -320,5 +397,87 @@ describe.each(["macos", "windows"] as const)("native title dragging (%s)", platf
     await press(container.querySelector<HTMLElement>(".palette-close-button")!);
     expect(native.invoke.mock.calls.filter(([command]) => command === "start_window_drag")).toEqual([]);
     expect(native.drag).not.toHaveBeenCalled();
+  });
+});
+
+/** Make jsdom report content overflowing `element` on the given axes (jsdom has no layout). */
+function overflow(element: HTMLElement, axes: { x?: boolean; y?: boolean } = { y: true }): void {
+  Object.defineProperties(element, {
+    clientWidth: { configurable: true, value: 100 },
+    clientHeight: { configurable: true, value: 100 },
+    scrollWidth: { configurable: true, value: axes.x ? 300 : 100 },
+    scrollHeight: { configurable: true, value: axes.y ? 300 : 100 }
+  });
+}
+
+describe("scroll owner presses", () => {
+  const both = { x: true, y: true };
+  it.each([
+    ["overflow: auto", both, true],
+    ["overflow: scroll", both, true],
+    ["overflow-y: auto", { y: true }, true],
+    ["overflow: hidden auto", { y: true }, true],
+    ["overflow: auto hidden", { y: true }, false],
+    ["overflow-x: scroll; overflow-y: hidden", { x: true }, true],
+    ["overflow-x: scroll; overflow-y: hidden", { y: true }, false],
+    ["overflow-y: scroll; overflow-x: hidden", { y: true }, true],
+    // Scrolls, but the content fits: no scrollbar to press.
+    ["overflow: auto", {}, false],
+    ["overflow: scroll", {}, false],
+    // Scrolls with the scrollbar hidden, as App.css does for .tool-palette.floating.
+    ["overflow-y: auto; scrollbar-width: none", both, false],
+    ["overflow-y: auto; scrollbar-width: thin", both, true],
+    ["overflow: hidden", both, false],
+    ["overflow: clip", both, false],
+    ["overflow: visible", both, false],
+    ["", both, false]
+  ] as const)("classifies a press on an element with %j overflowing %j as scroll owner: %s", (style, axes, owner) => {
+    const element = document.createElement("div");
+    element.setAttribute("style", style);
+    overflow(element, axes);
+    document.body.append(element);
+    try {
+      expect(isScrollOwnerPress(element)).toBe(owner);
+      // A scrollbar press never targets a child; the owner's descendants are background.
+      const child = element.appendChild(document.createElement("span"));
+      expect(isScrollOwnerPress(child)).toBe(false);
+    } finally {
+      element.remove();
+    }
+  });
+
+  // Older WebKit (before Safari 18.2) has no scrollbar-width; App.css hides the floating palette's
+  // scrollbars there through ::-webkit-scrollbar { width: 0; height: 0 }. jsdom lacks both `CSS` and
+  // pseudo-element styles, so stand them in.
+  it.each([
+    [{ width: "0px", height: "0px" }, both, false],
+    [{ width: "0px", height: "auto" }, { y: true }, false],
+    [{ width: "0px", height: "auto" }, { x: true }, true],
+    [{ display: "none" }, both, false],
+    [{ width: "8px", height: "8px" }, both, true]
+  ] as const)("reads a ::-webkit-scrollbar style %j on a scroller overflowing %j as scroll owner: %s", (bar, axes, owner) => {
+    const element = document.createElement("div");
+    element.setAttribute("style", "overflow: auto");
+    overflow(element, axes);
+    document.body.append(element);
+    vi.stubGlobal("CSS", { supports: () => false });
+    const computed = window.getComputedStyle.bind(window);
+    vi.spyOn(window, "getComputedStyle").mockImplementation((target, pseudo) =>
+      pseudo === "::-webkit-scrollbar"
+        ? ({ display: "block", width: "auto", height: "auto", ...bar } as unknown as CSSStyleDeclaration)
+        : computed(target));
+    try {
+      expect(isScrollOwnerPress(element)).toBe(owner);
+    } finally {
+      element.remove();
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("ignores non-element targets", () => {
+    expect(isScrollOwnerPress(null)).toBe(false);
+    expect(isScrollOwnerPress(window)).toBe(false);
+    expect(isScrollOwnerPress(document.createTextNode("x"))).toBe(false);
   });
 });
