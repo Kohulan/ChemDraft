@@ -3,6 +3,7 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MainWindow } from "./MainWindow";
+import { MemoryStorage } from "./testSupport/memoryStorage";
 import { PaletteWindow } from "./PaletteWindow";
 import { createPhase4Document } from "./documentWorkflow";
 import { DocumentZoomControls } from "./toolbars/DocumentZoomControls";
@@ -15,13 +16,13 @@ vi.mock("@scena/react-ruler", () => ({ default: () => null }));
 describe("document zoom toolbar", () => {
   let container: HTMLDivElement, root: Root;
   beforeEach(() => {
-    localStorage.clear(); window.history.replaceState(null, "", "/?agentBridge=1");
+    vi.stubGlobal("localStorage", new MemoryStorage()); window.history.replaceState(null, "", "/?agentBridge=1");
     vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
     container = document.createElement("div"); document.body.append(container); root = createRoot(container);
   });
   afterEach(async () => {
     await act(async () => root.unmount()); container.remove(); delete window.__CHEMDRAFT_AGENT__;
-    window.history.replaceState(null, "", "/"); vi.restoreAllMocks(); vi.unstubAllGlobals(); localStorage.clear();
+    window.history.replaceState(null, "", "/"); vi.restoreAllMocks(); vi.unstubAllGlobals();
   });
   const select = () => container.querySelector<HTMLSelectElement>('[aria-label="Document zoom percentage"]')!;
   const button = (label: string) => container.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`)!;
