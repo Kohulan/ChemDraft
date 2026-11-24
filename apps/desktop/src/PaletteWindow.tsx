@@ -1352,6 +1352,8 @@ export function PaletteWindow({
     if (platform === "windows") void setPaletteCommandHitBoxes([], []).catch(() => undefined);
   }, [platform]);
 
+  const paletteName = toolset.title.replace(/ Toolbar$/, "");
+
   return (
     <main
       ref={shellRef}
@@ -1369,6 +1371,7 @@ export function PaletteWindow({
     >
       <div
         className="palette-title"
+        data-platform={platform}
         data-palette-title-drag-surface="true"
         onPointerDown={startDragFromTitle}
         onPointerUp={stopPaletteWindowDrag}
@@ -1377,17 +1380,32 @@ export function PaletteWindow({
         onMouseDown={startMouseDragFromTitle}
         onMouseUp={stopPaletteWindowMouseDrag}
       >
-        <button
-          className="palette-close-button"
-          type="button"
-          title={`Hide ${toolset.title}`}
-          aria-label={`Hide ${toolset.title}`}
-          onPointerDown={hidePaletteWindow}
-          onMouseDown={(event) => event.stopPropagation()}
-          onClick={hidePaletteWindow}
-        >
-        </button>
-        <span className="palette-title-label">{toolset.title.replace(/ Toolbar$/, "")}</span>
+        {platform === "windows" ? (
+          // Windows convention: a visible "×" at the top right that closes on release, so pressing
+          // and dragging off cancels. The press only stops propagation so it never starts a drag.
+          <button
+            className="palette-close-button palette-close-button--end"
+            type="button"
+            title="Close"
+            aria-label={`Close ${paletteName}`}
+            onPointerDown={(event) => event.stopPropagation()}
+            onMouseDown={(event) => event.stopPropagation()}
+            onClick={hidePaletteWindow}
+          >
+            <span aria-hidden="true">×</span>
+          </button>
+        ) : (
+          <button
+            className="palette-close-button"
+            type="button"
+            title={`Hide ${toolset.title}`}
+            aria-label={`Hide ${toolset.title}`}
+            onPointerDown={hidePaletteWindow}
+            onMouseDown={(event) => event.stopPropagation()}
+            onClick={hidePaletteWindow}
+          />
+        )}
+        <span className="palette-title-label">{paletteName}</span>
       </div>
       <div className="palette-window-content" ref={bodyRef}>
         {customizeThisPalette ? (
