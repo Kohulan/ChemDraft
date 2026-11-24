@@ -60,6 +60,17 @@ export const cdxmlLimits = {
    * under a tenth of it.
    */
   textFontTableCopyChars: 1_048_576,
+  /**
+   * Document-wide budget, in characters (names and values, 2^20), for the copies of the root page
+   * setup (Header, Footer, MacPrintInfo, WinPrintInfo, ...) imported pages store
+   * (cdxmlRootPageAttributes). Every page used to store all of it, so a crafted file of many pages
+   * and one long attribute saved (pages x length) of native JSON on autosave. The first page always
+   * stores the whole set (export writes it from the first page), and so does every later page while
+   * the budget lasts; past it a page keeps only the short attributes its page grid is checked
+   * against (PrintMargins, WidthPages, HeightPages) and lists the names it left out. Real files
+   * (a few KB of print info over a few pages) stay far below it, so what they save is unchanged.
+   */
+  rootPageAttributeCopyChars: 1_048_576,
 };
 
 export type CdxmlLimits = typeof cdxmlLimits;

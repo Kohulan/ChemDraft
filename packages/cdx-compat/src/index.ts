@@ -640,6 +640,16 @@ function exportCdxml(
   }
   const embedded = embedNativePayload;
   const rootPageSetup = { ...fittedPages[0]?.setup.rootAttributes };
+  // The first page is now one that stored only its grid attributes (past the import's copy budget):
+  // the pages that stored the whole root setup were deleted or moved after it.
+  const omittedRootSetup = parsedDocument.pages[0]?.compatibility?.unknown.cdxmlRootPageAttributesOmitted;
+  if (Array.isArray(omittedRootSetup) && omittedRootSetup.length) {
+    const names = omittedRootSetup.filter((name): name is string => typeof name === "string" && /^[A-Za-z]{1,32}$/.test(name)).slice(0, 16);
+    warnings.push({ code: "cdxml.page_setup_not_kept", sourceObjectId: parsedDocument.pages[0].id,
+      message: `${format.toUpperCase()} export: the source file's document page settings${names.length ? ` (${names.join(", ")})` : ""} ` +
+        `were stored only with its first pages, since a copy on every page would have exceeded ${cdxmlLimits.rootPageAttributeCopyChars} ` +
+        `characters, and page ${parsedDocument.pages[0].id} is now the first page; they are not written.` });
+  }
   if (fittedPages.some(({ setup }) => setup.attributes.WidthPages !== undefined || setup.attributes.HeightPages !== undefined
       || setup.attributes.PrintMargins !== undefined
       || setup.rootAttributes.WidthPages !== undefined || setup.rootAttributes.HeightPages !== undefined)
@@ -3798,9 +3808,11 @@ function importVisibleCdxmlFromTree(tree: OrderedXmlTree, sourceFormat: "CDXML" 
   const curveLineDefaults = cdxmlCurveLineDefaults(root?.attributes ?? {});
   const base = createEmptyDocument({ title: `Imported ${sourceFormat}.chemdraft`, now: nativeImportTimestamp });
   let importedPages: DocumentPage[];
+  // One budget for the root page setup every page stores (cdxmlLimits.rootPageAttributeCopyChars).
+  const rootPageBudget = { chars: 0 };
   try {
     importedPages = pageElements.map((pageElement, pageIndex) => {
-      const pageTemplate = importPageSetup(base.pages[0], pageElement.attributes, root?.attributes ?? {});
+      const pageTemplate = importPageSetup(base.pages[0], pageElement.attributes, root?.attributes ?? {}, rootPageBudget);
       restorePageOffset(pageElement, warnings, sourceFormat);
       const importedPage = applyImportTransformToPageObjects(
         importPageObjects(pageElement, pageIndex, warnings, colorTable, fonts, curveLineDefaults, sourceFormat, isChemDraftSource),
