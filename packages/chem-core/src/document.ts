@@ -9,6 +9,7 @@ import {
 } from "./schemas";
 import { engineDocuments } from "./engineDocuments";
 import { normalizeBracketPairs, retainBracketIdentity } from "./brackets";
+import { parseWithoutIdentityTransfers, retainObjectIdentity } from "./objectIdentity";
 import { DefaultPageLayout, createPageLayout, pageMarginFromLayout } from "./page-layout";
 import { ignorableFieldsForNativeFeatures, minimumAppVersionForDocument, NativeDocumentBaselineAppVersion, NativeDocumentFormatVersion } from "./documentFeatures";
 import { compareNativeVersions, restoreNativeExtensions, type NativeDocumentWriteWarning } from "./nativeCompatibilityState";
@@ -185,9 +186,17 @@ export function migrateLegacyTableObjects(candidate: unknown): unknown {
 }
 
 export function cloneDocument(document: ChemDraftDocument): ChemDraftDocument {
-  const clone = parseDocument(JSON.parse(JSON.stringify(document)) as unknown);
+  // A copy of the same document: each object keeps its host identity (objectIdentity.ts), whatever
+  // that identity is, so an original that was given a selected object's identity while outside every
+  // document passes it on (the retain residual: a trusted caller is needed to submit such a document).
+  // The parse gives the copies none of their own, so each can take its original's. The copy is not an
+  // engine document, but every copied object holds its original's identity (minted on the original if
+  // necessary); `toEngineDocument` and `applyPatches` subsequently adopt the copy.
+  const clone = parseWithoutIdentityTransfers(() => parseDocument(JSON.parse(JSON.stringify(document)) as unknown));
   document.pages.forEach((page, pageIndex) => page.objects.forEach((object, objectIndex) => {
-    if (object.type === "bracket") retainBracketIdentity(object, clone.pages[pageIndex]!.objects[objectIndex]!);
+    const copy = clone.pages[pageIndex]!.objects[objectIndex]!;
+    retainObjectIdentity(object, copy);
+    if (object.type === "bracket") retainBracketIdentity(object, copy);
   }));
   return clone;
 }

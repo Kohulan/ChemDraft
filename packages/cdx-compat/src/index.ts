@@ -2,6 +2,7 @@ import { XMLParser, XMLValidator } from "fast-xml-parser";
 import {
   ChemDraftDocumentSchema,
   DocumentSchemaVersion,
+  atomIgnoresStatedHydrogenCount,
   atomicNumberForElementSymbol,
   bracketPairs,
   bracketPairSemantics,
@@ -12,6 +13,7 @@ import {
   drawnLabelBondSide,
   isDativeBond,
   isEngineDocument,
+  moleculeRadicalCount,
   moleculeToMolfileV3000,
   nativeTextStyleFromObjectStyle,
   parseDocument,
@@ -42,13 +44,14 @@ import {
   type ReactionObject,
   type TextObject,
   type TableObject,
-  type UnknownCompatibilityObject
+  type UnknownCompatibilityObject,
+  statedHydrogenCountNotCountedText
 } from "@chemdraft/chem-core";
 import { importedRingDoubleBondPlacements, measureTextRun, offsetDoubleBondSideTowardPoint, planTableLayout,
   textObjectSpansForRendering, transformPointForObject } from "@chemdraft/layout-engine";
 import { bondedElementLabelMeaning, isGenericAtomLabel } from "@chemdraft/template-library";
 import { planMoleculeAtomLabels } from "@chemdraft/layout-engine";
-import { atomImplicitHydrogenCount, nativeBondOrderResolution, nativeElementFromAtomLabel } from "@chemdraft/layout-engine";
+import { atomDerivedHydrogenCount, nativeBondOrderResolution, nativeElementFromAtomLabel } from "@chemdraft/layout-engine";
 import { sha256Hex, utf8Bytes, utf8String } from "./sha256";
 import { PROPS } from "./cdxTags";
 import { cdxmlLimits } from "./cdxmlLimits";
@@ -2283,7 +2286,8 @@ function exportMoleculeObject(
     }
     // NumHydrogens is the standard CDXML atom constraint, understood without ChemDraft's native
     // payload. Keep aromatic display (Order=1.5) while preserving the source's chosen N–H site.
-    // In particular, zero is a constraint too; omitting it reopens the tautomer choice.
+    // In particular, zero is a constraint too; omitting it reopens the tautomer choice, and on an
+    // ordinary atom (a kept count that disagrees with the derived one) adds the implicit H back.
     if (atom.hydrogenCount !== undefined) {
       attributes.push(`NumHydrogens="${atom.hydrogenCount}"`);
     }
@@ -2317,7 +2321,9 @@ function exportMoleculeObject(
       const split = value.lastIndexOf(":");
       return visibleStereo.get(atomIds.get(value.slice(0, split)) ?? "") !== value.slice(split + 1);
     });
-    const visibleRadicals = molecule.atoms.reduce((total, atom) => total + (atom.markRadicals ?? 0), 0);
+    // Radical attributes, plus a lone hydrogen atom's implied radical (H•): it is written as a bare H
+    // node and read back as H• by the same rule (`atomImpliedRadicalCount`), so nothing is lost.
+    const visibleRadicals = moleculeRadicalCount(molecule.atoms, molecule.bonds);
     const missingRadicals = (molecule.chemistry?.radicalCount ?? 0) > visibleRadicals;
     if (!missingRadicals && !missingStereo) return;
     warnings.push({
@@ -2511,10 +2517,11 @@ function textSourceState(text: TextObject): string {
 
 // CDXML stores the baseline independently of the editable text frame. Keep the source
 // inset when placing the current runs, including after the user translates a caption.
-function exportFramedCaption(text: TextObject, id: string, fonts: CdxmlExportFonts, colors: ExportColorTable): string | undefined {
+function exportFramedCaption(text: TextObject, id: string, fonts: CdxmlExportFonts, colors: ExportColorTable,
+  warnings: CompatibilityConversionWarning[], format: string): string | undefined {
   const a = preservedCurveAttributes(text.compatibility?.unknown.sourceCdxmlAttributes);
-  const box = parseCdxmlXyBoundingBox(a.BoundingBox);
-  const baseline = parseCdxmlXyPoint(a.p);
+  const box = parseCaptionBoundingBox(a.BoundingBox);
+  const baseline = parseCaptionPoint(a.p);
   if (!baseline || (!box && a.BoundingBox !== undefined) || text.rotation ||
       Object.keys(a).some(key => !["id", "p", "BoundingBox", "Justification", "color"].includes(key))) return undefined;
   const alignments: Record<string, string> = { left: "Left", center: "Center", right: "Right", justify: "Full" };
@@ -2553,8 +2560,19 @@ function exportFramedCaption(text: TextObject, id: string, fonts: CdxmlExportFon
   }
   const factor = a.Justification === "Center" ? 0.5 : a.Justification === "Right" ? 1 : 0;
   const saved = text.compatibility?.unknown.cdxmlTextFrameSize;
-  const width = isRecord(saved) && typeof saved.width === "number" ? Math.max(0, box.width + text.width - saved.width) : Math.min(box.width, text.width);
-  const height = isRecord(saved) && typeof saved.height === "number" ? Math.max(0, box.height + text.height - saved.height) : Math.min(box.height, text.height);
+  // A non-finite saved size (compatibility data is not schema-checked) is ignored, so BoundingBox never takes a NaN.
+  const savedSize = (key: "width" | "height") => isRecord(saved) && typeof saved[key] === "number" && Number.isFinite(saved[key]) ? saved[key] : undefined;
+  const unusable = saved === undefined ? [] : !isRecord(saved) ? ["width", "height"]
+    : (["width", "height"] as const).filter(key => saved[key] !== undefined && savedSize(key) === undefined);
+  if (unusable.length) {
+    warnings.push({ code: "cdxml.text_frame_size_invalid", sourceObjectId: text.id,
+      message: `${format} export: text ${text.id} has a saved caption frame ${unusable.join(" and ")} that is not a finite number; ` +
+        `it was ignored, and the caption's BoundingBox ${unusable.join(" and ")} was recomputed from its source frame and current size.` });
+  }
+  const resized = (source: number, current: number, before: number | undefined) =>
+    before !== undefined ? Math.max(0, source + current - before) : Math.min(source, current);
+  const width = resized(box.width, text.width, savedSize("width"));
+  const height = resized(box.height, text.height, savedSize("height"));
   const x = text.x + factor * (text.width - width), y = text.y;
   return `<t ${xmlAttributes({ id, p: formatPoint({ x: x + baseline.x - box.x, y: y + baseline.y - box.y }),
     BoundingBox: [formatPoint({ x, y }), formatPoint({ x: x + width, y: y + height })].join(" "),
@@ -2566,7 +2584,7 @@ function exportTextObject(text: TextObject, context: VisibleExportContext, alloc
   const textId = idFor(ids, text.id, allocator);
   const source = text.compatibility?.unknown.cdxmlTextElement;
   const framedCaption = () => {
-    if (!fonts.plainCaptionIds.has(text.id)) return exportFramedCaption(text, textId, fonts, colors);
+    if (!fonts.plainCaptionIds.has(text.id)) return exportFramedCaption(text, textId, fonts, colors, warnings, format);
     if (!fonts.captionRunLimitWarned) {
       fonts.captionRunLimitWarned = true;
       warnings.push({ code: "cdxml.document_caption_runs_limited", sourceObjectId: text.id,
@@ -2601,7 +2619,9 @@ function exportTextObject(text: TextObject, context: VisibleExportContext, alloc
                 "text and styles, its fonts under ids that can be written." });
           }
         }
-        if (node && element && !fontNotWritten) {
+        // Older documents kept a malformed or non-finite p or BoundingBox verbatim; never copy one back out.
+        const malformedGeometry = node !== undefined && hasMalformedCaptionCoordinates([node]);
+        if (node && element && !fontNotWritten && !malformedGeometry) {
           node[":@"] = { ...element.attributes, id: textId };
           const point = pointMetadata(text.compatibility?.unknown.cdxmlTextFrameOrigin) ?? parseCdxmlPoint(element.attributes.p);
           const dx = cssPxToCdxml(text.x - point.x), dy = cssPxToCdxml(text.y - point.y);
@@ -3071,11 +3091,18 @@ function exportGraphicAsCdxmlGraphic(
     return "";
   }
   const rectangle = type === "Rectangle" ? cdxmlRectangleStyle(graphic, pageBackgroundColor, warnings, format) : undefined;
+  // A CDXML reader takes a Graphic Arc's ellipse from its BoundingBox (center and inset half-size),
+  // so the box is the stored ellipse's frame. It is the object's own frame for an arc never edited.
+  const arcFrame = type === "Arc" ? cdxmlGraphicArcFrame(graphic) : undefined;
+  const boundingBox = arcFrame ? formatXyBoundingBox(objectCornerPoints(arcFrame))
+    : cdxmlBoundingBoxForGraphic(graphic, objectCornerPoints(graphic));
+  if (type === "Arc" && graphic.rotation) warnings.push({ code: "cdxml.arc_rotation_payload_only", sourceObjectId: graphic.id,
+    message: `${format} export: arc ${graphic.id} is written unrotated; a ${format} arc cannot carry its ${formatNumber(graphic.rotation)} degree rotation, which is kept only in the native document.` });
   const attrs = [
     `id="${graphicId}"`,
     ...(rectangle ? cdxmlColorAttribute(rectangle.color, colors) : cdxmlGraphicColorAttribute(graphic, warnings, colors)),
     `GraphicType="${type}"`,
-    `BoundingBox="${escapeXmlAttribute(cdxmlBoundingBoxForGraphic(graphic, objectCornerPoints(graphic)))}"`,
+    `BoundingBox="${escapeXmlAttribute(boundingBox)}"`,
     ...(type === "Line" || type === "Arc" ? cdxmlLineTypeAttributes(graphic) : []),
     ...(rectangle?.attributes ?? []),
     ...cdxmlShapeSubtypeAttributes(graphic)
@@ -3727,7 +3754,7 @@ function cdxmlAngularSizeForGraphic(graphic: GraphicObject): string {
   if (graphic.data.arcSweepRadians === undefined && typeof imported === "string" && imported.trim().length > 0) {
     return imported;
   }
-  return formatNumber(radiansToDegrees(clampArcSweepRadians(graphic.data.arcSweepRadians ?? Math.PI)));
+  return formatNumber(radiansToDegrees(clampArcSweepRadians(finiteArcSweepRadians(graphic) ?? Math.PI)));
 }
 
 function cdxmlLineAxisAttributes(start: Point, end: Point): string[] {
@@ -3760,17 +3787,49 @@ function graphicLineEndpointsForCdxml(graphic: GraphicObject): { start: Point; e
 
 function circularGraphicArcEndpoints(graphic: GraphicObject): { start: Point; end: Point } {
   const angles = nativeGraphicArcAngles(graphic);
-  const center = objectCenter(graphic);
-  const rx = Math.max(graphic.width / 2 - 4, 1);
-  const ry = Math.max(graphic.height / 2 - 4, 1);
+  const { center, rx, ry } = nativeGraphicArcEllipse(graphic);
   return {
     start: ellipsePointAtRadians(center, rx, ry, angles.startRadians),
     end: ellipsePointAtRadians(center, rx, ry, angles.endRadians)
   };
 }
 
+/**
+ * The ellipse a native arc is drawn on, with the renderer's own fallbacks (art-engine
+ * circularGraphicArcGeometry): the stored center and radii when they are valid, else the frame's
+ * center and its inset half-size, every radius at least 1. A handle-edited arc stores its ellipse and
+ * shrinks its frame to the drawn arc, so the frame alone no longer describes it.
+ */
+function nativeGraphicArcEllipse(graphic: GraphicObject): { center: Point; rx: number; ry: number } {
+  const finite = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  return {
+    center: pointMetadata(graphic.data.arcCenter) ?? objectCenter(graphic),
+    rx: Math.max(finite(graphic.data.arcRadiusX) ?? graphic.width / 2 - 4, 1),
+    ry: Math.max(finite(graphic.data.arcRadiusY) ?? graphic.height / 2 - 4, 1)
+  };
+}
+
+/**
+ * The frame to write for a Graphic Arc. A reader takes the ellipse from it (its center, and its
+ * half-size less a 4 px inset, at least 1), so it is the stored ellipse plus that inset; an arc whose
+ * own frame already gives that ellipse (one never handle-edited) keeps its frame.
+ */
+function cdxmlGraphicArcFrame(graphic: GraphicObject): { x: number; y: number; width: number; height: number } | undefined {
+  const { center, rx, ry } = nativeGraphicArcEllipse(graphic);
+  const frameCenter = objectCenter(graphic), tolerance = 0.005;
+  if (Math.abs(frameCenter.x - center.x) <= tolerance && Math.abs(frameCenter.y - center.y) <= tolerance &&
+      Math.abs(Math.max(graphic.width / 2 - 4, 1) - rx) <= tolerance &&
+      Math.abs(Math.max(graphic.height / 2 - 4, 1) - ry) <= tolerance) return undefined;
+  return { x: center.x - rx - 4, y: center.y - ry - 4, width: 2 * rx + 8, height: 2 * ry + 8 };
+}
+
+function finiteArcSweepRadians(graphic: GraphicObject): number | undefined {
+  const sweep = graphic.data.arcSweepRadians;
+  return typeof sweep === "number" && Number.isFinite(sweep) ? sweep : undefined;
+}
+
 function nativeGraphicArcAngles(graphic: GraphicObject): { startRadians: number; sweepRadians: number; endRadians: number } {
-  const sweepRadians = clampArcSweepRadians(graphic.data.arcSweepRadians ?? Math.PI);
+  const sweepRadians = clampArcSweepRadians(finiteArcSweepRadians(graphic) ?? Math.PI);
   const startRadians = typeof graphic.data.arcStartRadians === "number" && Number.isFinite(graphic.data.arcStartRadians)
     ? graphic.data.arcStartRadians
     : -Math.PI / 2 - sweepRadians / 2;
@@ -4025,6 +4084,9 @@ function importPageObjects(
   collectStandaloneSteps(pageElement);
   const rootsBySourceId = new Map<string, string[]>();
   const supersededBySourceId = new Map<string, string>();
+  // A caption lifted out of a fragment, keyed by its element: that fragment's frame places a caption
+  // whose own position and BoundingBox are both missing or malformed.
+  const fragmentFrameForCaption = new Map<XmlElementView, { x: number; y: number; width: number; height: number }>();
   context.preserveReactionIds ||= findElements(pageElement.children, "bracketedgroup").length > 0 ||
     findElements(pageElement.children, "represent").some(ref => ref.attributes.attribute === "Radical");
   if (context.preserveReactionIds) {
@@ -4075,7 +4137,9 @@ function importPageObjects(
         })
       });
       const molecule = single(importFragment(separateDisplayChildren(element), pageIndex, objectIndex, warnings, context));
+      const fragmentFrame = parseCdxmlXyBoundingBox(element.attributes.BoundingBox) ?? finiteFrame(molecule.objects[0]);
       for (const child of displayChildren) {
+        if (child.name === "t" && fragmentFrame) fragmentFrameForCaption.set(child, fragmentFrame);
         const imported = importElement(child);
         molecule.objects.push(...imported.objects);
         molecule.rootIds.push(...imported.rootIds);
@@ -4083,7 +4147,7 @@ function importPageObjects(
       return molecule;
     }
     if (element.name === "t") {
-      return single(importText(element, pageIndex, objectIndex, context));
+      return single(importText(element, pageIndex, objectIndex, context, fragmentFrameForCaption.get(element)));
     }
     if (element.name === "graphic") {
       const mark = importLonePair(element, `cdxml_lone_pair_${pageIndex + 1}_${objectIndex}`, colorTable);
@@ -4641,9 +4705,14 @@ function importFragment(
     const color = colorForCdxmlIndex(labelRun?.attributes.color ?? label?.attributes.color ?? atomElement.attributes.color ?? fragment.attributes.color, context.colorTable);
     if (color) atomLabelColors[atomId] = color;
     atomIdByCdxmlId.set(cdxmlId, atomId);
-    const statedHydrogens = parseInteger(atomElement.attributes.NumHydrogens);
+    const statedHydrogensText = atomElement.attributes.NumHydrogens;
+    const statedHydrogens = statedHydrogensText?.trim() ? parseInteger(statedHydrogensText) : undefined;
     if (statedHydrogens !== undefined && statedHydrogens >= 0) {
       statedHydrogensByAtomId.set(atomId, statedHydrogens);
+    } else if (statedHydrogensText !== undefined) {
+      // Never dropped silently (AGENTS.md §7): a value that is no count cannot be kept, so say so.
+      warnings.push({ code: "cdxml.atom_hydrogen_count_invalid", sourceObjectId: objectId, atomIds: [atomId],
+        message: `${context.sourceFormat} atom ${cdxmlId} has NumHydrogens="${statedHydrogensText}", which is not a hydrogen count; it was not imported.` });
     }
     const xyz = atomElement.attributes.xyz?.trim().split(/\s+/).map(Number);
     const spatial = xyz?.length === 3 && xyz.every(Number.isFinite) ? xyz : undefined;
@@ -4869,23 +4938,24 @@ function importFragment(
   // can, so it is kept for the Kekulé resolution to honour. Literal labels also retain an explicit
   // count: their text supplies no implicit hydrogens and cannot replace the source constraint.
   // Snapshot atoms use the same policy even when nonliteral: only a source-fixed count becomes
-  // a constraint. An absent attribute never freezes an ordinary atom's engine-derived H count.
+  // a constraint. An absent attribute never freezes an ordinary atom's engine-derived H count; an
+  // ordinary atom's stated count is decided by `keepStatedHydrogens` once those are in place.
   const aromaticAtomIds = new Set(normalizedBonds.flatMap((bond) =>
     bond.order === "aromatic" ? [bond.fromAtomId, bond.toAtomId] : []));
   const snapshotAtomIds = new Set(expansion.abbreviations.filter(item => !item.expanded)
     .flatMap(item => item.atomCdxmlIds.map(id => atomIdByCdxmlId.get(id))));
-  const droppedHydrogenAtoms: MoleculeAtom[] = [];
+  const ordinaryStatedAtoms: MoleculeAtom[] = [];
   for (const atom of atoms) {
     const stated = statedHydrogensByAtomId.get(atom.id);
     if (stated !== undefined && (atom.labelLiteral || aromaticAtomIds.has(atom.id) || snapshotAtomIds.has(atom.id))) {
       atom.hydrogenCount = stated;
     } else if (stated !== undefined) {
-      droppedHydrogenAtoms.push(atom);
+      ordinaryStatedAtoms.push(atom);
     }
   }
-  const hydrogenCountWarning = droppedStatedHydrogensWarning(droppedHydrogenAtoms, atoms, normalizedBonds,
-    statedHydrogensByAtomId, atomIdByCdxmlId, context.sourceFormat, objectId);
-  if (hydrogenCountWarning) warnings.push(hydrogenCountWarning);
+  warnings.push(...keepStatedHydrogens(ordinaryStatedAtoms, atoms, normalizedBonds,
+    statedHydrogensByAtomId, atomIdByCdxmlId, context.sourceFormat, objectId));
+  warnings.push(...notCountedStatedHydrogens(atoms, atomIdByCdxmlId, context.sourceFormat, objectId));
   const atomStereochemistry = Object.entries(cdxmlAtomStereochemistryByAtomId).map(
     ([atomId, stereo]) => `${atomId}:${stereo.assignment}`
   );
@@ -5277,7 +5347,78 @@ function frontBondRefFromCdxmlDepth(left: BondRef, right: BondRef, context: Impo
   return bondRefKey(left).localeCompare(bondRefKey(right)) >= 0 ? left : right;
 }
 
-function importText(textElement: XmlElementView, pageIndex: number, objectIndex: number, context: ImportPageContext): TextObject {
+function finiteFrame(object: { x: number; y: number; width: number; height: number } | undefined):
+  { x: number; y: number; width: number; height: number } | undefined {
+  return object && [object.x, object.y, object.width, object.height].every(Number.isFinite)
+    ? { x: object.x, y: object.y, width: object.width, height: object.height } : undefined;
+}
+
+/**
+ * A caption's p and BoundingBox, made usable before anything reads or keeps them. A malformed or
+ * non-finite value (`p="40 NaN"`) is treated as missing, so it is never copied back out on export
+ * and a later move shifts p and BoundingBox together. A missing or malformed p is derived from the
+ * valid BoundingBox (the alignment edge, one ascent below its top), else from the fragment the
+ * caption belongs to (below its frame), else the page origin; any finite coordinate of a malformed
+ * p is kept. One warning names what was ignored or where an unplaceable caption went. An element
+ * with neither problem is returned as is.
+ */
+function sanitizeCaptionGeometry(
+  element: XmlElementView,
+  objectId: string,
+  context: ImportPageContext,
+  fragmentFrame: { x: number; y: number; width: number; height: number } | undefined
+): XmlElementView {
+  const a = element.attributes;
+  const point = parseCaptionPoint(a.p);
+  const box = parseCaptionBoundingBox(a.BoundingBox);
+  const badPoint = a.p !== undefined && !point, badBox = a.BoundingBox !== undefined && !box;
+  if (point && !badBox) return element;
+  const attributes = { ...a };
+  if (badBox) delete attributes.BoundingBox;
+  let placedBy = "it was placed by its p";
+  if (!point) {
+    const size = parseNumber(childElements(element, "s")[0]?.attributes.size);
+    const ascent = cdxmlToCssPx(size !== undefined && size > 0 && Number.isFinite(size) ? size : 10) * 0.8;
+    let derived: Point, keptCoordinate = false;
+    if (box) {
+      const factor = a.Justification === "Center" ? 0.5 : a.Justification === "Right" ? 1 : 0;
+      derived = { x: box.x + factor * box.width, y: box.y + Math.min(box.height, ascent) };
+    } else if (fragmentFrame) {
+      derived = { x: fragmentFrame.x, y: fragmentFrame.y + fragmentFrame.height + ascent };
+    } else {
+      derived = { x: 0, y: 0 };
+    }
+    // A malformed p may still state one coordinate; keep it.
+    const [x, y] = (a.p?.trim().split(/\s+/) ?? []).map(token => token ? Number(token) : Number.NaN);
+    if (Number.isFinite(x)) { derived.x = cdxmlToCssPx(x); keptCoordinate = true; }
+    if (Number.isFinite(y)) { derived.y = cdxmlToCssPx(y); keptCoordinate = true; }
+    attributes.p = formatPoint(derived);
+    placedBy = (box ? "it was placed from its BoundingBox" : fragmentFrame ? "it was placed below the fragment it belongs to"
+      : "it was placed at the page origin") + (keptCoordinate ? ", keeping the finite coordinate of its p" : "");
+  }
+  // A missing p placed from a valid BoundingBox is an ordinary file, not a defect.
+  if (badPoint || badBox) {
+    const quote = (value: string) => JSON.stringify(value.length > 40 ? `${value.slice(0, 40)}…` : value);
+    const ignored = [badPoint ? `p=${quote(a.p!)}` : "", badBox ? `BoundingBox=${quote(a.BoundingBox!)}` : ""].filter(Boolean);
+    context.warnings.push({ code: "cdxml.text_position_invalid", sourceObjectId: objectId,
+      message: `${context.sourceFormat} import: text ${a.id ?? objectId} has a malformed ${ignored.join(" and ")} ` +
+        `(p takes exactly 2 finite numbers, BoundingBox exactly 4), which was ignored; ${placedBy}.` });
+  } else if (a.p === undefined && a.BoundingBox === undefined) {
+    // Neither attribute is present: its position is a guess, even below its own fragment.
+    context.warnings.push({ code: "cdxml.text_position_missing", sourceObjectId: objectId,
+      message: `${context.sourceFormat} import: text ${a.id ?? objectId} has neither a p nor a BoundingBox; ${placedBy}.` });
+  }
+  return { ...element, attributes };
+}
+
+function importText(
+  sourceElement: XmlElementView,
+  pageIndex: number,
+  objectIndex: number,
+  context: ImportPageContext,
+  fragmentFrame?: { x: number; y: number; width: number; height: number }
+): TextObject {
+  const textElement = sanitizeCaptionGeometry(sourceElement, `cdxml_text_${pageIndex + 1}_${objectIndex}`, context, fragmentFrame);
   const point = parseCdxmlPoint(textElement.attributes.p);
   const text = textContent(textElement.children);
   const color = colorForCdxmlIndex(textElement.attributes.color, context.colorTable);
@@ -5356,7 +5497,7 @@ function textFontTable(element: XmlElementView, context: ImportPageContext): rea
 // Only adopt the single-line layout when every visible run has an exact mapping.
 function restoreFramedCaption(object: TextObject, element: XmlElementView, context: ImportPageContext): void {
   const a = element.attributes;
-  const box = parseCdxmlXyBoundingBox(a.BoundingBox);
+  const box = parseCaptionBoundingBox(a.BoundingBox);
   const alignments: Record<string, string> = { Center: "center", Right: "right", Left: "left", Full: "justify" };
   const align = alignments[a.Justification ?? "Left"];
   const runs = childElements(element, "s");
@@ -5366,7 +5507,7 @@ function restoreFramedCaption(object: TextObject, element: XmlElementView, conte
         `${cdxmlLimits.captionRuns} supported; its caption frame and run fonts were not restored, and it was imported as plain styled text.` });
     return;
   }
-  if ((!box && a.BoundingBox !== undefined) || !parseCdxmlXyPoint(a.p) || !align || !runs.length || runs.length !== object.spans.length ||
+  if ((!box && a.BoundingBox !== undefined) || !parseCaptionPoint(a.p) || !align || !runs.length || runs.length !== object.spans.length ||
       Object.keys(a).some(k => !["id", "p", "BoundingBox", "Justification", "color"].includes(k))) return;
   const usage = context.fonts.usage;
   if (usage.captionRunLimitReached || usage.captionRuns + runs.length > cdxmlLimits.documentCaptionRuns) {
@@ -6652,48 +6793,121 @@ function cdxmlBondDisplayForBondStyle(display: MoleculeBond["display"]): string 
 }
 
 /**
- * An ordinary atom's NumHydrogens is not kept: ChemDraft derives the count from valence, exactly as
- * the drawn label and the formula do (layout-engine's label planner and document-workflow-core's
- * `nativeAtomDiagnostic`), by layout-engine's `atomImplicitHydrogenCount`, the one copy of that
- * calculation (AGENTS.md §9). Where the file stated a different count, the opened chemistry is not the file's,
- * so one warning per fragment names each such atom and both counts (AGENTS.md §7). Atoms with no
- * single derived count (no element, hydrogen itself, a carbon bonded only datively, whose label
- * shows no H while the formula counts them) are left alone rather than described wrongly.
+ * An ordinary atom's NumHydrogens, by the owner's ruling for 1.2.3: where it disagrees with the
+ * count ChemDraft derives from the atom's bonds, charge and radicals — layout-engine's
+ * `atomDerivedHydrogenCount`, the one copy of that calculation, which the drawn label, the formula
+ * and `nativeAtomValidationState` share (AGENTS.md §9) — it is kept exactly as written
+ * (`hydrogenCount`), counted as a typed label spelling it would be (chem-core's
+ * `atomStatedHydrogenCount`), the atom is badged, and one warning per fragment names each such atom
+ * and both counts (AGENTS.md §7). A count that agrees is not stored: the atom already counts it.
+ *
+ * A carbon bonded only datively is no exception: its label draws no H, but its formula counts the
+ * derived ones, so a count that differs is kept and shown as a typed "C" … "CH4" would be. A
+ * hydrogen atom (H, D or T) keeps a stated 0, which is what a typed H, D or T label means (it agrees:
+ * a hydrogen atom derives no hydrogen, a lone one being one atom, a radical, owner decision
+ * 2026-11-23). Any other count on a hydrogen atom cannot be kept, since no typed label draws a
+ * hydrogen atom carrying hydrogens of its own: it is not stored, and a second warning says so. An atom whose label is not an element (an unknown atom, a generic label)
+ * keeps what the file states, for the file's sake; on a label naming no element (the unknown atom
+ * "*", a generic label such as A or R1) or an abbreviation (OMe, Ph) nothing counts it, so a count
+ * other than 0 is reported and badged (`notCountedStatedHydrogens`).
+ * Mutates `candidates`; returns the warnings.
  */
-function droppedStatedHydrogensWarning(
-  droppedAtoms: readonly MoleculeAtom[],
+function keepStatedHydrogens(
+  candidates: readonly MoleculeAtom[],
   atoms: readonly MoleculeAtom[],
   bonds: readonly MoleculeBond[],
   statedHydrogensByAtomId: ReadonlyMap<string, number>,
   atomIdByCdxmlId: ReadonlyMap<string, string>,
   sourceFormat: string,
   objectId: string
-): CompatibilityConversionWarning | undefined {
-  if (droppedAtoms.length === 0) return undefined;
+): CompatibilityConversionWarning[] {
+  if (candidates.length === 0) return [];
   const cdxmlIdByAtomId = new Map([...atomIdByCdxmlId].map(([cdxmlId, atomId]) => [atomId, cdxmlId]));
   const resolution = nativeBondOrderResolution(atoms, bonds);
-  const mismatches: { atomId: string; label: string; stated: number; derived: number }[] = [];
-  for (const atom of droppedAtoms) {
+  // Every count is derived before any is stored: a stored count is part of the resolution's key.
+  const decisions = candidates.map((atom) => {
+    const stated = statedHydrogensByAtomId.get(atom.id)!;
     const element = nativeElementFromAtomLabel(atom.element);
-    const stated = statedHydrogensByAtomId.get(atom.id);
-    if (!element || element === "H" || stated === undefined) continue;
-    const derived = atomImplicitHydrogenCount(atom, bonds, atoms, resolution);
-    if (derived === undefined || derived === stated) continue;
-    mismatches.push({ atomId: atom.id, label: `atom ${cdxmlIdByAtomId.get(atom.id) ?? atom.id} (${element})`, stated, derived });
+    const derived = element ? atomDerivedHydrogenCount(atom, bonds, atoms, resolution) : undefined;
+    return { atom, element, stated, derived };
+  });
+  type Named = { atomId: string; label: string; stated: number };
+  const mismatches: (Named & { derived: number })[] = [];
+  const notKept: Named[] = [];
+  for (const { atom, element, stated, derived } of decisions) {
+    const hydrogenAtom = atom.element === "H" || atom.element === "D" || atom.element === "T";
+    const label = `atom ${cdxmlIdByAtomId.get(atom.id) ?? atom.id} (${element ?? atom.element})`;
+    if (derived === stated && !(hydrogenAtom && stated === 0)) continue;
+    if (hydrogenAtom && stated !== 0) {
+      notKept.push({ atomId: atom.id, label, stated });
+      continue;
+    }
+    atom.hydrogenCount = stated;
+    if (!element || derived === undefined || derived === stated) continue;
+    mismatches.push({ atomId: atom.id, label, stated, derived });
   }
-  if (mismatches.length === 0) return undefined;
   const hydrogens = (count: number) => `${count} hydrogen${count === 1 ? "" : "s"}`;
-  const [only] = mismatches;
-  const message = mismatches.length === 1
-    ? `${sourceFormat} import: ${only.label} states ${hydrogens(only.stated)}; ChemDraft derives ${only.derived}. The derived count is used.`
-    : `${sourceFormat} import: ${mismatches.length} atoms state hydrogen counts ChemDraft derives differently: ` +
-      `${mismatches.map((item) => `${item.label} states ${item.stated}, derives ${item.derived}`).join("; ")}. The derived counts are used.`;
-  return {
-    code: "cdxml.atom_hydrogen_count_derived",
-    message,
+  const warnings: CompatibilityConversionWarning[] = [];
+  if (mismatches.length > 0) {
+    const [only] = mismatches;
+    warnings.push({
+      code: "cdxml.atom_hydrogen_count_kept",
+      message: mismatches.length === 1
+        ? `${sourceFormat} import: ${only!.label} states ${hydrogens(only!.stated)}; ChemDraft derives ${only!.derived}. The stated count is kept, and the atom is flagged.`
+        : `${sourceFormat} import: ${mismatches.length} atoms state hydrogen counts ChemDraft derives differently: ` +
+          `${mismatches.map((item) => `${item.label} states ${item.stated}, derives ${item.derived}`).join("; ")}. ` +
+          "The stated counts are kept, and the atoms are flagged.",
+      sourceObjectId: objectId,
+      atomIds: mismatches.map((item) => item.atomId)
+    });
+  }
+  if (notKept.length > 0) {
+    const [only] = notKept;
+    warnings.push({
+      code: "cdxml.atom_hydrogen_count_not_kept",
+      message: notKept.length === 1
+        ? `${sourceFormat} import: ${only!.label} states ${hydrogens(only!.stated)}, which a hydrogen atom cannot carry: ` +
+          "only 0 can be kept, as a typed H, D or T label means. The stated count was not kept."
+        : `${sourceFormat} import: ${notKept.length} hydrogen atoms state hydrogen counts a hydrogen atom cannot carry: ` +
+          `${notKept.map((item) => `${item.label} states ${item.stated}`).join("; ")}. ` +
+          "Only 0 can be kept, as a typed H, D or T label means. The stated counts were not kept.",
+      sourceObjectId: objectId,
+      atomIds: notKept.map((item) => item.atomId)
+    });
+  }
+  return warnings;
+}
+
+/**
+ * One warning per fragment naming each atom that now stores a hydrogen count nothing counts
+ * (chem-core `atomIgnoresStatedHydrogenCount`, the rule the atom validator, the native open report
+ * and the plugin host share). In practice that is a label naming no element stating a count other
+ * than 0: an unknown atom "*" (an Element naming nothing, an unlabeled nickname node, a "*" generic
+ * label) or another generic label (A, Q, M, X, an R-group such as R1). Its label draws none, the
+ * formula counts none, the molfile writes a placeholder with no valence and RDKit gives a
+ * placeholder no hydrogens, so its SMILES is the same whatever the file states. An abbreviation
+ * (OMe, Ph, CF3, as the label grammar reads it) is reported too: its hydrogens come from what it
+ * stands for, never from a count stated on the atom. The count is kept for the
+ * file's round trip (CDXML and CDX write it back), the atom is badged, and this says it is not
+ * counted, in chem-core's `statedHydrogenCountNotCountedText` wording (AGENTS.md §7). A stated 0 is
+ * what such an atom counts anyway, and is not reported. A hydrogen atom's count other than 0 is not
+ * kept on an ordinary atom (`keepStatedHydrogens` reports it); one a literal label kept is named here.
+ */
+function notCountedStatedHydrogens(
+  atoms: readonly MoleculeAtom[],
+  atomIdByCdxmlId: ReadonlyMap<string, string>,
+  sourceFormat: string,
+  objectId: string
+): CompatibilityConversionWarning[] {
+  const notCounted = atoms.filter(atomIgnoresStatedHydrogenCount);
+  if (notCounted.length === 0) return [];
+  const cdxmlIdByAtomId = new Map([...atomIdByCdxmlId].map(([cdxmlId, atomId]) => [atomId, cdxmlId]));
+  return [{
+    code: "cdxml.atom_hydrogen_count_not_counted",
+    message: `${sourceFormat} import: ${statedHydrogenCountNotCountedText(notCounted, (atom) => cdxmlIdByAtomId.get(atom.id) ?? atom.id)}`,
     sourceObjectId: objectId,
-    atomIds: mismatches.map((item) => item.atomId)
-  };
+    atomIds: notCounted.map((atom) => atom.id)
+  }];
 }
 
 function cdxmlAtomStereoAssignment(value: string | undefined): "R" | "S" | undefined {
@@ -6842,6 +7056,40 @@ function parseCdxmlXyPoint(point: string | undefined): Point | undefined {
     x: cdxmlToCssPx(x),
     y: cdxmlToCssPx(y)
   };
+}
+
+/** Exactly `count` finite numbers, else undefined: a trailing token (`"40 38 80 52 NaN"`) makes the value malformed. */
+function exactFiniteNumbers(value: string | undefined, count: number): number[] | undefined {
+  const tokens = value?.trim().split(/\s+/);
+  const numbers = tokens?.length === count ? tokens.map(Number) : undefined;
+  return numbers?.every(Number.isFinite) ? numbers : undefined;
+}
+
+/** A caption's p: exactly "x y", both finite. The lenient reader also serves Point3D attributes. */
+function parseCaptionPoint(point: string | undefined): Point | undefined {
+  return exactFiniteNumbers(point, 2) ? parseCdxmlXyPoint(point) : undefined;
+}
+
+/** A caption's BoundingBox: exactly "left top right bottom", all finite. */
+function parseCaptionBoundingBox(box: string | undefined): { x: number; y: number; width: number; height: number } | undefined {
+  return exactFiniteNumbers(box, 4) ? parseCdxmlXyBoundingBox(box) : undefined;
+}
+
+/** A coordinate attribute anywhere in the tree that is not a whole number of finite pairs (or triples),
+ *  or a caption p or BoundingBox without exactly its 2 or 4 finite numbers. */
+function hasMalformedCaptionCoordinates(tree: OrderedXmlTree): boolean {
+  return tree.some(node => {
+    const element = elementView(node);
+    if (!element) return false;
+    return Object.entries(element.attributes).some(([name, text]) => {
+      if (element.name === "t" && name === "p") return !parseCaptionPoint(text);
+      if (element.name === "t" && name === "BoundingBox") return !parseCaptionBoundingBox(text);
+      const stride = visibleCoordinatePairs.has(name) ? 2 : visibleCoordinateTriples.has(name) ? 3 : 0;
+      if (!stride) return false;
+      const values = text.trim().split(/\s+/).map(Number);
+      return values.length % stride !== 0 || values.some(value => !Number.isFinite(value));
+    }) || hasMalformedCaptionCoordinates(element.children);
+  });
 }
 
 /** Spec-order 2D position: "x y", falling back to the origin when absent or malformed. */

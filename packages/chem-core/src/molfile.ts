@@ -38,12 +38,18 @@
  *     expansion as a `SUP` S-group carrying its label.
  *   - A literal (text-typed) atom on an unknown-order or unresolved aromatic bond gets no explicit
  *     valence field, with a warning; resolved aromatic bonds count at the caller's Kekulé orders.
+ *   - An element atom's own stated hydrogen count (`atomStatedHydrogenCount`: a CDXML NumHydrogens
+ *     kept on an atom with no aromatic bond, including a carbon bonded only datively and an H, D or T
+ *     atom stating 0) is written through the same explicit valence as a
+ *     literal atom's, bond-order sum plus the count, so every reader counts the stated hydrogens.
+ *     Where that field cannot hold it (an unknown-order bond, a sum past 14) the writer warns.
  *   - Coordinates ≥1e6 / counts >999 cannot fit V2000's fixed columns; the writer trims
  *     coordinate precision to preserve alignment and throws on >999 atoms/bonds.
  */
 
-import { bridgeBondIndices } from "./bondGraph";
+import { bridgeBondIndices, isDativeBond } from "./bondGraph";
 import { elementSymbols, isMetalSymbol } from "./elements";
+import { atomImpliedRadicalCount, atomStatedHydrogenCount } from "./hydrogenHints";
 import type { ChemDraftDocument, MoleculeAtom, MoleculeBond, MoleculeObject } from "./schemas";
 import { moleculeBracketWarningMessages } from "./brackets";
 import { isRepeatUnitBoundaryBond } from "./repeatUnitMembership";
@@ -158,15 +164,8 @@ function handleUnknownBondOrders(mol: MoleculeObject, options: MolfileWriteOptio
     "; written as bond type 8 (any), which readers treat as a query bond with no chemical order.");
 }
 
-/**
- * A dashed single bond depicts a dative/coordination interaction (zero covalent valence on either
- * atom). V3000 spells it as bond type 9, the CTfile coordination type, so the file round-trips;
- * V2000 has no coordination type, so there it degrades to a plain single bond and the writer warns.
- * Requiring single order prevents display styling on a multiple bond from deleting its bond order.
- */
-export function isDativeBond(bond: MoleculeBond): boolean {
-  return bond.order === "single" && bond.display?.bondStyle === "dashed";
-}
+// Defined beside the bond-graph helpers so hydrogenHints can use it without importing this writer.
+export { isDativeBond };
 
 export interface MolfileWriteResult {
   contents: string;
@@ -375,7 +374,10 @@ function molfileAtomSymbols(
 ): {
   symbols: string[];
   rgroups: { atomNumber: number; rgroup: number }[];
-  /** Hydrogens stated by each atom `spellLabel` spelled, keyed by atom id. */
+  /**
+   * Hydrogens stated by each atom `spellLabel` spelled, or by an element atom's own stated count
+   * (`atomStatedHydrogenCount`), keyed by atom id. Each is carried by the explicit valence.
+   */
   spelledHydrogens: Map<string, number>;
 } {
   const rgroupByLabel = new Map<string, number>();
@@ -428,6 +430,34 @@ function molfileAtomSymbols(
       MOLFILE_ATOM_SYMBOLS.has(atom.element) &&
       !(options.abbreviations === "rgroup" && atom.element === "*")
     ) {
+      // A count the atom states for itself (`atomStatedHydrogenCount`) takes the explicit valence a
+      // typed literal label's hydrogens take, so a reader counts exactly those hydrogens: an O
+      // stated with 0 H is written as a typed "O" is. When the valence cannot say it exactly, the
+      // element is still written and the writer says the count may be lost.
+      const stated = atomStatedHydrogenCount(atom, bonds);
+      if (stated !== undefined) {
+        const { sum, unresolvedAromatic, unknownOrder } = bondValenceOf(atom.id);
+        const lost = unknownOrder ? "it has an unknown-order bond"
+          : unresolvedAromatic ? "it has an aromatic bond with no resolved Kekulé order"
+          : sum + stated > MAX_EXPLICIT_VALENCE
+            ? `its bond orders and stated hydrogens sum to ${sum + stated}, past the ${format} valence field's limit of ${MAX_EXPLICIT_VALENCE}`
+            : undefined;
+        if (lost === undefined) {
+          spelledHydrogens.set(atom.id, stated);
+        } else {
+          options.warnings?.push(
+            `Atom ${atom.id} (${atom.element}) states ${stated} hydrogen${stated === 1 ? "" : "s"}, which cannot be carried by an explicit valence because ${lost}; ` +
+            (options.messageFormat
+              ? "the structure engine may add hydrogens."
+              : "written without a valence field, so a reader may add hydrogens.")
+          );
+        }
+      } else if (atomImpliedRadicalCount(atom, bonds) > 0) {
+        // A lone hydrogen atom is one atom, a radical (owner decision 2026-11-23): the zero-valence
+        // sentinel, as a stated 0 takes, so a reader adds no hydrogen and gives it one radical
+        // electron. With no valence field RDKit would read a lone H as H2.
+        spelledHydrogens.set(atom.id, 0);
+      }
       return atom.element;
     }
     const spelled = placeholderReason === undefined ? options.spellLabel?.(atom.element) : undefined;

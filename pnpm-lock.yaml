@@ -257,6 +257,9 @@ importers:
 
   packages/chem-core:
     dependencies:
+      '@chemdraft/template-library':
+        specifier: workspace:*
+        version: link:../template-library
       zod:
         specifier: ^3.25.76
         version: 3.25.76
@@ -316,6 +319,9 @@ importers:
 
   packages/document-workflow-core:
     dependencies:
+      '@chemdraft/analysis-core':
+        specifier: workspace:*
+        version: link:../analysis-core
       '@chemdraft/chem-core':
         specifier: workspace:*
         version: link:../chem-core

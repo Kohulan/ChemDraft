@@ -16628,6 +16628,8 @@ describe("dative donors and their hydrogens", () => {
 });
 
 describe("clipboard and chemistry review regressions", () => {
+  // A lone neutral D or T is one atom, a radical (D•, T•; owner decision 2026-11-23): the bare
+  // isotope, as RDKit reads the molfile's zero-valence D/T; a charged one is the bare ion.
   it.each([["D", 0, "[2H]"], ["T", 0, "[3H]"], ["D", 1, "[2H+]"], ["T", -1, "[3H-]"]] as const)(
     "spells isotope label %s with charge %s as %s", (element, formalCharge, expected) => {
       const molecule = createNativeSingleBondMolecule(createPhase4Document("Isotope"), { x: 200, y: 200 });
@@ -17103,12 +17105,18 @@ describe("aromatic bond orders: one count for the formula, the label and the val
     }
   });
 
-  it("the stated-count check ignores a hint left on an atom with no aromatic bond", () => {
+  it("the stated-count check badges a disagreeing count on an atom with no aromatic bond", () => {
+    // Owner ruling (1.2.3): such a count is the source's count for the atom, kept and badged.
     const graph = testMoleculeFromSmiles("CN");
-    // Bypasses every patch: a stale count on a molecule read straight from storage.
     const atoms = graph.atoms.map((atom) => (atom.element === "N" ? { ...atom, hydrogenCount: 1 } : atom));
-    const molecule = { ...fixtureMolecule(graph, graph.bonds, "mol_stale_hint"), atoms };
-    expect(nativeMoleculeInvalidAtomStates(molecule)).toEqual([]);
+    const molecule = { ...fixtureMolecule(graph, graph.bonds, "mol_stated_hint"), atoms };
+    const nitrogen = atoms.find((atom) => atom.element === "N")!;
+    expect(nativeMoleculeInvalidAtomStates(molecule)).toEqual([expect.objectContaining({
+      atomId: nitrogen.id, statedHydrogens: { stated: 1, derived: 2 }, invalidReason: "N states 1 H, but its bonds and charge give 2."
+    })]);
+    // An agreeing count is no problem at all.
+    const agreeing = { ...molecule, atoms: graph.atoms.map((atom) => (atom.element === "N" ? { ...atom, hydrogenCount: 2 } : atom)) };
+    expect(nativeMoleculeInvalidAtomStates(agreeing)).toEqual([]);
   });
 
   it("relabeling an atom to another element drops a hydrogen count stated for the old one", () => {
@@ -17122,9 +17130,22 @@ describe("aromatic bond orders: one count for the formula, the label and the val
       (next.pages[0]!.objects.find((object) => object.id === molecule.id) as MoleculeObject).atoms
         .find((atom) => atom.id === "a2")!;
     expect(atomAfter(applyNativeAtomElementTarget(document, target, "C")).hydrogenCount).toBeUndefined();
-    // Same element under the typed rule: still the atom the count was stated for.
-    expect(atomAfter(applyNativeAtomElementTarget(document, target, "N", { literal: true })))
-      .toMatchObject({ element: "N", labelLiteral: true, hydrogenCount: 1 });
+    // Typing the label drawn for it ("NH", its stated H included) says nothing new: still the atom
+    // the count was stated for, so the commit changes nothing (master decision 2026-11-22, refined).
+    expect(atomDisplayLabel(molecule.atoms[2]!, molecule.bonds, undefined, molecule.atoms)).toBe("NH");
+    const same = commitNativeAtomLabelTarget(document, target, "NH", { literal: true, replaceElement: true });
+    expect(same.document).toBe(document);
+    expect(atomAfter(same.document)).toMatchObject({ element: "N", hydrogenCount: 1 });
+    expect(atomAfter(same.document).labelLiteral).toBeUndefined();
+    // Typed text that differs from the drawn label wins, even as the same element: a literal "N" drops
+    // the count. The ring then kekulizes only with the H guessed onto the other N, which is badged.
+    const typedN = applyNativeAtomElementTarget(document, target, "N", { literal: true });
+    const retyped = atomAfter(typedN);
+    expect(retyped).toMatchObject({ element: "N", labelLiteral: true });
+    expect(retyped.hydrogenCount).toBeUndefined();
+    const typedMolecule = typedN.pages[0]!.objects.find((object) => object.id === molecule.id) as MoleculeObject;
+    const otherNitrogen = typedMolecule.atoms.find((atom) => atom.element === "N" && atom.id !== "a2")!;
+    expect(nativeMoleculeInvalidAtomStates(typedMolecule)).toEqual([expect.objectContaining({ atomId: otherNitrogen.id, tautomerGuessed: true })]);
   });
 
   it("allows a bond-order edit on an imported CH3 and validates the new H count", () => {
