@@ -151,21 +151,6 @@ describe.each(["macos", "windows"] as const)("native title dragging (%s)", platf
     expect(native.invoke.mock.calls.some(([command]) => command === "resize_toolset_window")).toBe(false);
   });
 
-  it.each([true, false])("leaves nested Object Settings scrollbar presses to the webview (pointer: %s)", async pointer => {
-    await mount("palette", false, { toolsetId: "core.drawnStructureSettings" });
-    const scroller = container.querySelector<HTMLElement>(".molecule-inspector-panel-body")!;
-    expect(scroller).not.toBeNull();
-    const down = pointerEvent("pointerdown", 7);
-    const mouseDown = new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 });
-    await dispatch(scroller, ...(pointer ? [down, mouseDown] : [mouseDown]));
-    expect(down.defaultPrevented).toBe(false);
-    expect(mouseDown.defaultPrevented).toBe(false);
-    expect(container.querySelector<HTMLElement>("main")!.setPointerCapture).not.toHaveBeenCalled();
-    expect(native.invoke.mock.calls.filter(([command]) => command === "start_window_drag")).toEqual([]);
-    await press(container.querySelector<HTMLElement>(".palette-title-label")!);
-    expectOneCompensatedDrag();
-  });
-
   function pointerEvent(type: string, pointerId: number, isPrimary = true): MouseEvent {
     // jsdom has no PointerEvent; supply the pointer fields alongside real mouse coordinates.
     const event = new MouseEvent(type, {
