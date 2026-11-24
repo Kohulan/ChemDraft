@@ -122,14 +122,16 @@ export function objectInWriteScope(scope: ReadonlySet<string>, scopePages: Plugi
  * Bind selected ids to a page at Send. Ids on `pageId` bind to it. Ids elsewhere bind to their only
  * page; an id found on several other pages cannot be bound and is returned in `ambiguous` (or bound
  * to `pageId`, when one is given, so that nothing on another page is in scope).
+ * With `explicitPage` (a Send-time override that names its page), every id binds to `pageId`, even
+ * one missing from it: that pin is then refused ("reselect it"), never moved to the id's other page.
  */
 export function pinSelectionPages(document: ChemDraftDocument | undefined, objectIds: readonly string[],
-  pageId: string | undefined): { pages: Map<string, string>; ambiguous: string[] } {
+  pageId: string | undefined, explicitPage = false): { pages: Map<string, string>; ambiguous: string[] } {
   const pages = new Map<string, string>();
   const ambiguous: string[] = [];
   if (!document) return { pages, ambiguous };
   for (const objectId of new Set(objectIds)) {
-    if (pageId !== undefined && resolveObjectOnPage(document, pageId, objectId)) {
+    if (pageId !== undefined && (explicitPage || resolveObjectOnPage(document, pageId, objectId))) {
       pages.set(objectId, pageId);
       continue;
     }

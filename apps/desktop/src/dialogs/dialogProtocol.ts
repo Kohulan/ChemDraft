@@ -12,6 +12,7 @@ import { validDialogContentFit, type DialogContentFit } from "./dialogContentFit
 export type { DialogContentFit } from "./dialogContentFit";
 import { isKeybindingScheme, type KeybindingScheme } from "../keybindingSettings";
 import { TOUR_INSPECTOR_COMMAND, TOUR_NAME_COMMAND, TOUR_PLUGIN_COMMANDS, TOUR_SAMPLE_COMMAND, type TourAction, type TourPluginCommand } from "../tour/tourCommands";
+import type { TourBondKeys } from "../tour/tourSteps";
 
 export const DIALOG_PROTOCOL_VERSION = 1;
 export const DIALOG_MAX_BYTES = 16 * 1024;
@@ -176,7 +177,7 @@ export type DialogSnapshot = DialogEnvelope & (
   | { dialogKind: "structureTemplates"; type: "snapshot"; data: StructureTemplatesSnapshot }
   | { dialogKind: "vibeCodeGuide"; type: "snapshot"; data: { title: string } }
   | { dialogKind: "about"; type: "snapshot"; data: AboutSnapshot }
-  | { dialogKind: "guidedTour"; type: "snapshot"; data: { title: string; scheme: KeybindingScheme; automatic: boolean; plugins?: TourPluginCommand[] } }
+  | { dialogKind: "guidedTour"; type: "snapshot"; data: { title: string; scheme: KeybindingScheme; automatic: boolean; plugins?: TourPluginCommand[]; bondKeys?: TourBondKeys } }
 );
 export interface AboutSnapshot { title: string; version: string; buildStamp: string }
 export type DialogMessage = DialogSnapshot | (DialogEnvelope & (
@@ -261,12 +262,16 @@ export function parseDialogMessage(value: unknown): DialogMessage | undefined {
     }
     if (value.dialogKind === "guidedTour") {
       switch (value.type) {
-        case "snapshot": valid = keys(d, ["title", "scheme", "automatic"], ["plugins"]) && typeof d.title === "string" &&
+        case "snapshot": valid = keys(d, ["title", "scheme", "automatic"], ["plugins", "bondKeys"]) && typeof d.title === "string" &&
           d.title.length > 0 && d.title.length <= 256 && !d.title.includes("\0") &&
           isKeybindingScheme(d.scheme) && typeof d.automatic === "boolean" &&
           // Plugin commands the menus offered when the tour opened: known tour plugin commands, each once.
           (d.plugins === undefined || Array.isArray(d.plugins) && new Set(d.plugins).size === d.plugins.length &&
-            d.plugins.every(command => TOUR_PLUGIN_COMMANDS.some(known => known === command))); break;
+            d.plugins.every(command => TOUR_PLUGIN_COMMANDS.some(known => known === command))) &&
+          // The drawing lesson's hover key per scheme: one character, or null when the user cleared it.
+          (d.bondKeys === undefined || typeof d.bondKeys === "object" && d.bondKeys !== null && !Array.isArray(d.bondKeys) &&
+            Object.entries(d.bondKeys).every(([scheme, key]) => isKeybindingScheme(scheme) &&
+              (key === null || typeof key === "string" && [...key].length === 1))); break;
         case "action": valid = d.action === "cancel" || d.action === "finish" ? keys(d, ["action"])
           : d.action === "chooseShortcuts" ? keys(d, ["action", "scheme"]) && isKeybindingScheme(d.scheme)
           // The plugins card's link, sent by the tour window to the native host, which opens it only when

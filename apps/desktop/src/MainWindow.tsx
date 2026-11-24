@@ -1,4 +1,5 @@
 import { basename } from "@tauri-apps/api/path";
+import { interactive3dWorkspaceStatusText, Interactive3dWorkspaceStatus } from "./Interactive3dWorkspaceStatus";
 import { CanvasContextMenu, NATIVE_CANVAS_MENU_CLOSED_EVENT } from "./CanvasContextMenu";
 import { PLUGIN_CHANGE_REFUSED, RECOGNITION_REFUSED, chemistryRefusalOf, refusalSentence } from "./plugins/requestWrites/chemistryRefusal";
 import { buildObjectCanvasMenu, pageCanvasMenu, SET_DEFAULT_ARROW_STYLE_COMMAND_ID } from "./canvasContextMenuModel";
@@ -1852,7 +1853,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.23.20.00-opus";
+const CURRENT_BUILD_STAMP = "11.23.23.05-opus";
 
 /**
  * The commit funnel's chemistry check (AGENTS.md section 7, `commitChemistryGuard.ts`). `before`
@@ -2297,19 +2298,62 @@ export function MainWindow({
       if (event.buttons === 0) releaseFocus();
       else renewFocus();
     };
+    const blockComposingCanvasPress = (event: Event): boolean => {
+      const canvas = canvasRegionRef.current;
+      if (!(event.target instanceof Element) || !canvas?.contains(event.target)
+        || event.target.closest(".plugin-canvas-overlay")) return false;
+      const overlay = canvasOverlayLayerRef.current?.querySelector('.plugin-canvas-overlay[data-composing="true"]');
+      if (!overlay) return false;
+      // Stop before native focus defaults and tool listeners, including other window
+      // capture listeners. IME ownership must not depend on a transient activeElement.
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      overlay.dispatchEvent(new Event("chemdraft:composition-blocked"));
+      return true;
+    };
+    const overlayLayer = canvasOverlayLayerRef.current;
+    // Guard independent canvas activation paths as well as pointer/mouse presses.
+    // Move/release phases do not open editors and must remain available to overlay resizes.
+    const composingEvents = ["touchstart", "contextmenu", "auxclick", "click", "dblclick"] as const;
+    let composingListenersAttached = false;
+    const removeComposingListeners = () => {
+      for (const type of composingEvents) window.removeEventListener(type, blockComposingCanvasPress, true);
+      composingListenersAttached = false;
+    };
+    const syncComposingListeners = () => {
+      const composing = !!overlayLayer?.querySelector('.plugin-canvas-overlay[data-composing="true"]');
+      if (composing === composingListenersAttached) return;
+      if (!composing) { removeComposingListeners(); return; }
+      for (const type of composingEvents) {
+        window.addEventListener(type, blockComposingCanvasPress, { capture: true, passive: false });
+      }
+      composingListenersAttached = true;
+    };
+    // React's overlay handlers set/clear data-composing at the root before these
+    // window bubble listeners run, even for consecutive synthetic events.
+    const compositionSignals = ["compositionstart", "compositionupdate", "compositionend", "compositioncancel",
+      "input", "keydown", "focusin", "focusout"] as const;
+    for (const type of compositionSignals) window.addEventListener(type, syncComposingListeners, { passive: true });
+    // Also cover expiry, overlay removal and any other clear path without keeping a
+    // non-passive touch listener on the window between compositions.
+    const compositionObserver = new MutationObserver(syncComposingListeners);
+    if (overlayLayer) compositionObserver.observe(overlayLayer, {
+      subtree: true, childList: true, attributes: true, attributeFilter: ["data-composing"]
+    });
+    syncComposingListeners();
     const preserveOverlayFocus = (event: globalThis.MouseEvent) => {
+      if (blockComposingCanvasPress(event)) return;
       releaseFocus();
       const canvas = canvasRegionRef.current;
       const active = globalThis.document.activeElement;
       const overlay = active?.closest<HTMLElement>(".plugin-canvas-overlay");
       if (!canvas || !(event.target instanceof Element) || !canvas.contains(event.target) || !overlay) return;
-      if (!isCanvasDrawingPress(canvas, event) || overlay.dataset.composing === "true"
+      if (!isCanvasDrawingPress(canvas, event)
         || (event.button !== 0 && event.button !== 2) || ("isPrimary" in event && event.isPrimary === false)) {
         preservedFocus = active instanceof HTMLElement ? active : null;
         preservedOverlay = overlay;
         overlay.dataset.preservingFocus = "true";
         renewFocus();
-        if (overlay.dataset.composing === "true") event.preventDefault();
       }
     };
     const restoreOverlayFocus = (event: FocusEvent) => {
@@ -2320,6 +2364,7 @@ export function MainWindow({
       }
     };
     const down = (event: globalThis.PointerEvent) => {
+      if (blockComposingCanvasPress(event)) return;
       preserveOverlayFocus(event);
       if (!canvasOverlaysPresentRef.current || !(event.target instanceof Element) || !canvasRegionRef.current?.contains(event.target)
         || !isCanvasDrawingPress(canvasRegionRef.current, event) || preservedFocus) return;
@@ -2335,7 +2380,7 @@ export function MainWindow({
     globalThis.document.addEventListener("focusin", restoreOverlayFocus, true);
     window.addEventListener("mousedown", preserveOverlayFocus, true);
     window.addEventListener("mouseup", releaseFocus, true);
-    window.addEventListener("keydown", releaseFocus, true);
+    window.addEventListener("keydown", releaseFocus, { capture: true, passive: true });
     window.addEventListener("pointerdown", down, true);
     window.addEventListener("pointermove", move, true);
     window.addEventListener("pointerup", up, true);
@@ -2347,6 +2392,9 @@ export function MainWindow({
       releaseFocus();
       globalThis.document.removeEventListener("focusin", restoreOverlayFocus, true);
       window.removeEventListener("mousedown", preserveOverlayFocus, true);
+      compositionObserver.disconnect();
+      for (const type of compositionSignals) window.removeEventListener(type, syncComposingListeners);
+      removeComposingListeners();
       window.removeEventListener("mouseup", releaseFocus, true);
       window.removeEventListener("keydown", releaseFocus, true);
       window.removeEventListener("pointerdown", down, true);
@@ -8204,8 +8252,10 @@ export function MainWindow({
   const documentForFlush = useCallback((onDroppedDraft?: (kind: string, error: unknown) => void): ChemDraftDocument => {
     // Resizing and part drags replace the live page during the preview.
     // A Save/autosave/export during the held gesture must match what Escape restores.
+    // Only while a preview is installed: below the drag threshold the live document is the
+    // truth, and an edit made during a held press (Delete, a relabel hotkey) must be saved.
     const gesture = objectResizeDragRef.current ?? nativePartDragRef.current;
-    if (gesture) return gesture.startDocument;
+    if (gesture?.dragging) return gesture.startDocument;
     let current = documentRef.current;
     const includeDraft = (kind: string, apply: () => ChemDraftDocument, rollback?: () => ChemDraftDocument) => {
       if (!onDroppedDraft) return apply();
@@ -12201,6 +12251,7 @@ export function MainWindow({
       && !activeAtomLabelEditRef.current && !activeTextEditObjectIdRef.current
       && !tableCellEditorRef.current && !bracketLabelEditorRef.current,
     scheme: keybindingScheme,
+    shortcutOverrides: shortcutSettings.overrides,
     platform: shortcutPlatform,
     plugins: () => tourPluginCommandsRef.current,
     mode: tourMode,
@@ -15327,6 +15378,15 @@ export function MainWindow({
         key: event.key, code: event.code, ctrlKey: event.ctrlKey, metaKey: event.metaKey,
         altKey: event.altKey, shiftKey: event.shiftKey
       });
+      // A Save or Save As the user assigned to a formatting chord (Preferences > Keyboard) wins.
+      if (commandId === "document.save" || commandId === "document.saveAs") {
+        // Cancel the browser/native accelerator fallback as well, so macOS cannot save twice.
+        // Cmd+Q remains the native app.quit accelerator, which requests the shared draft flush;
+        // Windows registers no Quit accelerator. Neither needs a second JS command binding.
+        event.preventDefault();
+        void invokeCommandRef.current(commandId);
+        return;
+      }
       // The text textarea stops bubbling keys, just like the table editor. Route its
       // formatting chords through the same registered commands as the toolbar buttons.
       const commandKey = (shortcutPlatform ?? detectDesktopShortcutPlatform()) === "macos" ? event.metaKey : event.ctrlKey;
@@ -15337,14 +15397,7 @@ export function MainWindow({
         event.preventDefault();
         event.stopPropagation();
         void invokeCommandRef.current(textFormatCommand);
-        return;
       }
-      if (commandId !== "document.save" && commandId !== "document.saveAs") return;
-      // Cancel the browser/native accelerator fallback as well, so macOS cannot save twice.
-      // Cmd+Q remains the native app.quit accelerator, which requests the shared draft flush;
-      // Windows registers no Quit accelerator. Neither needs a second JS command binding.
-      event.preventDefault();
-      void invokeCommandRef.current(commandId);
     };
     window.addEventListener("keydown", commandFromInlineEditor, true);
     return () => window.removeEventListener("keydown", commandFromInlineEditor, true);
@@ -24187,14 +24240,13 @@ export function MainWindow({
         <div ref={statusRowRef} className="status-row" data-status-row>
           <div className="status-row-main">
             <span data-status-message role="status" aria-live="polite" className="status-message"
-              title={spin3dErrorMessage ?? fileWarningsTooltip(warningReports)}>
+              title={spin3dErrorMessage ?? (interactive3dWorkspace ? interactive3dWorkspaceStatusText({
+                status: interactive3dWorkspace.status, energyLabel: interactive3dWorkspace.energyLabel,
+                warnings: interactive3dWorkspace.session?.warnings ?? []
+              }) : fileWarningsTooltip(warningReports))}>
               {spin3dErrorMessage ?? (interactive3dWorkspace
-                ? [
-                    interactive3dWorkspace.status,
-                    interactive3dWorkspace.energyLabel,
-                    ...new Set(interactive3dWorkspace.session?.warnings ?? []),
-                    "Esc to close"
-                  ].filter(Boolean).join(" · ")
+                ? <Interactive3dWorkspaceStatus status={interactive3dWorkspace.status}
+                    energyLabel={interactive3dWorkspace.energyLabel} warnings={interactive3dWorkspace.session?.warnings ?? []} />
                 : hoveredNativeWarning ?? status)}
             </span>
             {openWarnings ? (
