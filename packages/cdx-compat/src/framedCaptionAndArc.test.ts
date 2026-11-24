@@ -1,11 +1,18 @@
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { createEmptyDocument, type GraphicObject, type TextObject } from "@chemdraft/chem-core";
 import { exportDocumentToCdxml, openChemDraftPayload } from "./index";
 import {
   cdxmlFontOperationsForTesting, resetCdxmlFontOperationsForTesting,
   startCdxmlFontTableTrackingForTesting, stopCdxmlFontTableTrackingForTesting
 } from "./cdxmlFontIndex";
-import { defaultCdxmlLimits, withCdxmlLimitsForTesting } from "./cdxmlLimits";
+import { withCdxmlLimitsForTesting } from "./testSupport/lowerCdxmlLimits";
+
+// Lowered caps come from a test-local mutable copy of the module; the frozen production object is
+// never touched (its real values are pinned in cdxmlLimits.test.ts).
+vi.mock("./cdxmlLimits", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./cdxmlLimits")>();
+  return { ...actual, cdxmlLimits: { ...actual.cdxmlLimits } };
+});
 
 const plain = { embedNativePayload: false };
 
@@ -220,12 +227,6 @@ it("saves an edited N-run caption against N fonts with linear work", () => {
   const [again] = textsOf(openChemDraftPayload(saved.result.contents));
   expect(again?.text).toBe(text.text);
   expect(again?.spans[0]?.style.fontFamily ?? again?.style.fontFamily).toBe(`Font${N}`);
-});
-
-// The production caps the lowered-cap tests below stand in for.
-it("pins the production caption and font caps", () => {
-  expect(defaultCdxmlLimits).toMatchObject({ fontTable: 65_535, fontId: 65_535, captionRuns: 65_535,
-    documentCaptionRuns: 262_144, textFontTableCopies: 16_384, textFontTableCopyChars: 1_048_576 });
 });
 
 it("resolves a duplicated font id to its first entry, as before", () => {

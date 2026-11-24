@@ -1,7 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { DocumentPage } from "@chemdraft/chem-core";
 import { exportDocumentToCdxml, openChemDraftPayload } from "./index";
-import { defaultCdxmlLimits, withCdxmlLimitsForTesting } from "./cdxmlLimits";
+import { withCdxmlLimitsForTesting } from "./testSupport/lowerCdxmlLimits";
+
+// Lowered caps come from a test-local mutable copy of the module; the frozen production object is
+// never touched (its real values are pinned in cdxmlLimits.test.ts).
+vi.mock("./cdxmlLimits", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./cdxmlLimits")>();
+  return { ...actual, cdxmlLimits: { ...actual.cdxmlLimits } };
+});
 
 // Kimi (#442, pre-existing): every imported page stored its own copy of the root page setup
 // (cdxmlRootPageAttributes), whose Header, Footer, MacPrintInfo and WinPrintInfo have no length
@@ -22,10 +29,6 @@ const storedRootChars = (pages: readonly DocumentPage[]) => pages.reduce((sum, p
 const budget = { rootPageAttributeCopyChars: 10_000 };
 
 describe("root page setup copies (#442)", () => {
-  it("pins the production budget", () => {
-    expect(defaultCdxmlLimits.rootPageAttributeCopyChars).toBe(1_048_576);
-  });
-
   it("stores the root page setup within a document-wide budget, so native JSON grows linearly with pages", () => withCdxmlLimitsForTesting(budget, () => {
     const [small, large] = [10, 20].map(count => {
       const opened = openChemDraftPayload(source(count));

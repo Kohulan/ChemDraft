@@ -1,11 +1,12 @@
 /**
- * Import and export caps for CDXML/CDX, in one record. Production code only reads it. Tests that
- * must cross a cap lower it for the duration of one call (`withCdxmlLimitsForTesting`) instead of
- * building inputs of hundreds of thousands of elements: those long synchronous loops blocked the
- * vitest worker (Windows CI: "Timeout calling onTaskUpdate"). `defaultCdxmlLimits` is what
- * production uses, and tests pin those values too.
+ * Import and export caps for CDXML/CDX, in one frozen record. Production code only reads it; there
+ * is no setter or override, so nothing outside a test can lower, raise or disable a cap. Tests that
+ * must cross a cap replace this whole module with `vi.mock("./cdxmlLimits", ...)` (see
+ * `testSupport/lowerCdxmlLimits.ts`) instead of building inputs of hundreds of thousands of
+ * elements: those long synchronous loops blocked the vitest worker (Windows CI: "Timeout calling
+ * onTaskUpdate"). The real values are pinned, unmocked, in `cdxmlLimits.test.ts`.
  */
-export const cdxmlLimits = {
+export const cdxmlLimits = Object.freeze({
   /**
    * Import cap on the color table. CDX color indices are 16-bit and the table starts at index 2, so
    * nothing ChemDraw writes lists more than 65,534 colors, and export writes no index past 65535; a
@@ -71,20 +72,6 @@ export const cdxmlLimits = {
    * (a few KB of print info over a few pages) stay far below it, so what they save is unchanged.
    */
   rootPageAttributeCopyChars: 1_048_576,
-};
+});
 
 export type CdxmlLimits = typeof cdxmlLimits;
-
-/** The production values, for tests that pin them. */
-export const defaultCdxmlLimits: Readonly<CdxmlLimits> = Object.freeze({ ...cdxmlLimits });
-
-/** Runs `run` with some caps lowered (tests only); the production values are restored afterwards. */
-export function withCdxmlLimitsForTesting<T>(overrides: Partial<CdxmlLimits>, run: () => T): T {
-  const saved = { ...cdxmlLimits };
-  Object.assign(cdxmlLimits, overrides);
-  try {
-    return run();
-  } finally {
-    Object.assign(cdxmlLimits, saved);
-  }
-}

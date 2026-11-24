@@ -1,7 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createEmptyDocument, serializeDocument, type TextObject } from "@chemdraft/chem-core";
 import { exportDocumentToCdxml, openChemDraftPayload } from "./index";
-import { defaultCdxmlLimits, withCdxmlLimitsForTesting } from "./cdxmlLimits";
+import { withCdxmlLimitsForTesting } from "./testSupport/lowerCdxmlLimits";
+
+// Lowered caps come from a test-local mutable copy of the module; the frozen production object is
+// never touched (its real values are pinned in cdxmlLimits.test.ts).
+vi.mock("./cdxmlLimits", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./cdxmlLimits")>();
+  return { ...actual, cdxmlLimits: { ...actual.cdxmlLimits } };
+});
 
 // Codex security finding (#442), follow-up to the caption font-byte cap: every imported text and
 // graphic stored its own copy of the file's whole color table (cdxmlTextColorTable /
@@ -35,10 +42,6 @@ const storedColorEntries = (objects: readonly { compatibility?: { unknown: Recor
     object.compatibility?.unknown.cdxmlGraphicColorTable ?? {}) as object).length, 0);
 
 describe("CDXML color table bytes (#442)", () => {
-  it("pins the production color caps", () => {
-    expect(defaultCdxmlLimits).toMatchObject({ colorTable: 65_534, objectColorTableCopies: 65_536 });
-  });
-
   it("bounds the whole-table copies of a crafted file of many colors and many texts, so native JSON grows linearly", () => {
     // 200 colors: the 2,048-entry budget holds 10 whole copies, as 65,536 held 16 of a 4,000-color table.
     const colors = 200;
