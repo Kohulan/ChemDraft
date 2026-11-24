@@ -22,6 +22,8 @@ import {
   PALETTE_CLICK_TIMEOUT_MS, type PaletteClickPendingEvent
 } from "./palettePendingKeys";
 import { forceDocumentHistoryCommandId, installSecondaryWindowEditHistory } from "./editHistoryRouting";
+import { saveKeybindingSettings } from "./keybindingSettings";
+import { MemoryStorage } from "./testSupport/memoryStorage";
 
 const native = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -140,6 +142,9 @@ describe.each(["macos", "windows"] as const)("palette input focus (%s)", (platfo
     windowListeners = vi.spyOn(window, "addEventListener");
     native.platform = platform;
     native.failPointerSubscription = false;
+    // The chords and tool hotkeys below are ChemDraft's scheme; pin it rather than rely on the default.
+    vi.stubGlobal("localStorage", new MemoryStorage());
+    saveKeybindingSettings({ scheme: "chemdraft" });
     native.invoke.mockReset().mockImplementation(async (command: string, args?: { editing: boolean }) =>
       command === "register_plugin_panel_input_focus" ? "palette-page" : args?.editing);
     vi.mocked(sendPaletteCommand).mockClear();
