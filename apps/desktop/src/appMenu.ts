@@ -81,6 +81,25 @@ export interface AppMenuSection {
   items: AppMenuItem[];
 }
 
+/**
+ * Where the Preferences command sits in the menu bar, as the user reads it.
+ *
+ * macOS: the ChemDraft application menu. The native item (`preferences_menu_item` in lib.rs) is
+ * titled "Preferences…", and AppKit shows that application-menu item as "Settings…" on current
+ * macOS, so the label here is the one on screen. Windows and Linux: the File menu, "Preferences…".
+ * The web menu model and the guided tour both read this, so they cannot drift apart.
+ */
+export function preferencesMenuPlacement(platform: ShortcutPlatform): { menu: string; label: string } {
+  return platform === "macos" ? { menu: "ChemDraft", label: "Settings…" } : { menu: "File", label: "Preferences…" };
+}
+
+/** The Plugins menu and its fixed items. The same labels on every platform; the guided tour quotes them. */
+export const PLUGINS_MENU_LABELS = {
+  menu: "Plugins",
+  manager: "Add or Remove Plugins…",
+  vibeCode: vibeCodeStarterCommand.title
+} as const;
+
 /** A toolbar toggle entry for the View ▸ Toolbars submenu (mirrors the native dynamic submenu). */
 export interface AppMenuToolbarToggle {
   id: string;
@@ -242,6 +261,7 @@ export function buildAppMenuModel(context: AppMenuContext): AppMenuSection[] {
   separatorSeq = 0;
   const chemDrawScheme = context.keybindingScheme === "chemdraw";
   const platform = context.platform ?? detectShortcutPlatform();
+  const preferences = preferencesMenuPlacement(platform);
 
   const toolbarsSubmenu: AppMenuSubmenu = {
     kind: "submenu",
@@ -265,7 +285,7 @@ export function buildAppMenuModel(context: AppMenuContext): AppMenuSection[] {
         buildPageSetupSubmenu(),
         separator(),
         command("export.open", "Export…", { accelerator: chemDrawScheme ? "Ctrl+Cmd+E" : "Shift+Cmd+E" }),
-        ...(platform === "macos" ? [] : [separator(), command("view.togglePreferences", "Preferences…", { accelerator: "Cmd+," })])
+        ...(platform === "macos" ? [] : [separator(), command("view.togglePreferences", preferences.label, { accelerator: "Cmd+," })])
       ]
     },
     {
@@ -359,11 +379,11 @@ export function buildAppMenuModel(context: AppMenuContext): AppMenuSection[] {
     },
     {
       id: "plugins",
-      label: "Plugins",
+      label: PLUGINS_MENU_LABELS.menu,
       items: [
-        command(PLUGIN_MANAGER_COMMAND_ID, "Add or Remove Plugins…"),
+        command(PLUGIN_MANAGER_COMMAND_ID, PLUGINS_MENU_LABELS.manager),
         separator(),
-        command(VIBE_CODE_STARTER_COMMAND_ID, vibeCodeStarterCommand.title)
+        command(VIBE_CODE_STARTER_COMMAND_ID, PLUGINS_MENU_LABELS.vibeCode)
       ]
     },
     {
@@ -377,10 +397,10 @@ export function buildAppMenuModel(context: AppMenuContext): AppMenuSection[] {
   ];
 
   if (platform === "macos") {
-    sections.unshift({ id: "app", label: "ChemDraft", items: [
+    sections.unshift({ id: "app", label: preferences.menu, items: [
       command(aboutCommand.id, aboutCommand.title),
       separator(),
-      command("view.togglePreferences", "Preferences…", { accelerator: "Cmd+," })
+      command("view.togglePreferences", preferences.label, { accelerator: "Cmd+," })
     ] });
   }
   for (const item of flattenAppMenuCommands(sections)) {

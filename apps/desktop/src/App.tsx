@@ -8,8 +8,15 @@ import {
 } from "./window-manager";
 import { installSecondaryWindowEditHistory } from "./editHistoryRouting";
 import { installBrowserReloadGuard } from "./browserReloadGuard";
+import { acknowledgeFirstPaintOnce } from "./paletteFirstPaint";
+import { runShortcutDefaultMigration } from "./shortcutDefaultMigration";
 
-const MainWindow = lazy(() => import("./MainWindow").then(m => ({ default: m.MainWindow })));
+// The document window mounts only after the one-time shortcut-default migration has resolved the
+// scheme and put it in the webview cache (or, where it must not persist, in memory for this launch),
+// so its first render already uses it, and neither it nor any window it opens reads the new default
+// on an install not proven new.
+const MainWindow = lazy(() => Promise.all([import("./MainWindow"), runShortcutDefaultMigration()])
+  .then(([m]) => ({ default: m.MainWindow })));
 const PaletteWindow = lazy(() => import("./PaletteWindow").then(m => ({ default: m.PaletteWindow })));
 const PalettePopoverWindow = lazy(() => import("./PalettePopoverWindow").then(m => ({ default: m.PalettePopoverWindow })));
 const PaletteTooltipWindow = lazy(() => import("./PaletteTooltipWindow").then(m => ({ default: m.PaletteTooltipWindow })));
@@ -67,6 +74,15 @@ function SecondaryWindowEditHistory({ dialog = false }: { dialog?: boolean }): n
   return null;
 }
 
+/**
+ * Rendered beside a palette, popover or tooltip window, inside the same Suspense boundary, so its
+ * effect runs once that window's first render has committed.
+ */
+function FirstPaintAcknowledgement(): null {
+  useEffect(() => acknowledgeFirstPaintOnce(), []);
+  return null;
+}
+
 export function dialogRoute(): string | undefined {
   if (typeof window === "undefined") return undefined;
   const params = new URLSearchParams(window.location.search);
@@ -85,21 +101,24 @@ function secondaryWindowContent(): ReactElement | undefined {
   const popoverRoute = toolsetPopoverRoute();
   if (popoverRoute) {
     return (
-      <PalettePopoverWindow
-        toolsetId={popoverRoute.toolsetId}
-        kind={popoverRoute.kind}
-        prewarm={popoverRoute.prewarm}
-      />
+      <>
+        <PalettePopoverWindow
+          toolsetId={popoverRoute.toolsetId}
+          kind={popoverRoute.kind}
+          prewarm={popoverRoute.prewarm}
+        />
+        <FirstPaintAcknowledgement />
+      </>
     );
   }
 
   if (isToolsetTooltipRoute()) {
-    return <PaletteTooltipWindow />;
+    return <><PaletteTooltipWindow /><FirstPaintAcknowledgement /></>;
   }
 
   const toolset = toolsetRoute();
   if (toolset) {
-    return <PaletteWindow {...toolset} />;
+    return <><PaletteWindow {...toolset} /><FirstPaintAcknowledgement /></>;
   }
 
   const pluginPanelId = pluginPanelRouteId();

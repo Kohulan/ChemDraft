@@ -61,3 +61,43 @@ it("renders release metadata, sourced credits and licenses and copies the versio
     vi.unstubAllGlobals();
   }
 });
+
+it("lists only the components the chosen platform ships, from one test host", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const component = (name: string, platforms?: "all" | Array<"macos" | "windows" | "linux">) => ({
+    name, version: "1.0.0", license: "MIT", holders: ["see license"], purpose: "Test package",
+    sourceUrl: "https://example.com/" + name, ...(platforms ? { platforms } : {})
+  });
+  vi.stubGlobal("__ABOUT_PROVENANCE__", {
+    components: [
+      component("shared-crate", "all"), component("untagged-crate"), component("zbus", ["linux"]), component("webkit2gtk", ["linux"]),
+      component("windows-sys", ["windows"]), component("objc2", ["macos"]), component("single-instance", ["windows", "linux"])
+    ],
+    licenseTexts: { LICENSE: "Apache License" }
+  });
+  const render = async (platform: "macos" | "windows" | "linux") => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    await act(async () => root.render(<AboutWindow version="1.2.2" buildStamp="test" platform={platform} onCopy={async () => {}} />));
+    const names = [...container.querySelectorAll(".about-credits h3")].map(heading => heading.textContent);
+    const summary = [...container.querySelectorAll("summary")].find(element => element.textContent?.startsWith("Packages, versions"))!.textContent;
+    act(() => root.unmount());
+    container.remove();
+    return { names, summary };
+  };
+  try {
+    const macos = await render("macos");
+    expect(macos.names).toEqual(expect.arrayContaining(["shared-crate", "untagged-crate", "objc2"]));
+    for (const hidden of ["zbus", "webkit2gtk", "windows-sys", "single-instance"]) expect(macos.names).not.toContain(hidden);
+    expect(macos.summary).toContain("(3)");
+    const windows = await render("windows");
+    expect(windows.names).toEqual(["shared-crate", "untagged-crate", "windows-sys", "single-instance"]);
+    expect(windows.summary).toContain("(4)");
+    const linux = await render("linux");
+    expect(linux.names).toEqual(["shared-crate", "untagged-crate", "zbus", "webkit2gtk", "single-instance"]);
+    expect(linux.summary).toContain("(5)");
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});

@@ -14,7 +14,7 @@ import {
   type AppliedPatchReceipt,
   type NormalizedProposedDocumentPatch
 } from "@chemdraft/plugin-api";
-import { assertPluginDocumentWriteScope, bareIdTargetPage, effectiveScopePages, objectInWriteScope, rebasePluginPatch,
+import { assertPluginDocumentWriteScope, bareIdTargetPage, objectInWriteScope, rebasePluginPatch,
   retainedCtabCompatibility, storedCtabReference, writePatchOps, type PageObjectRef, type PluginWriteScopePages } from "@chemdraft/plugin-host";
 import { selectionBounds, translateInsertedDocumentObjects } from "../documentWorkflow";
 import { choosePlacement, objectRect, overlaps as boundsOverlap, pageContentRect, RELATIVE_GAP, unionRects } from "../assistant/placement";
@@ -48,11 +48,10 @@ const STORED_CHEMISTRY_FIELDS = ["structure", "structureFormat", "chemistry", "c
 export function refreshPluginPatchChemistry(before: ChemDraftDocument, draft: ChemDraftDocument,
   rebased: NormalizedProposedDocumentPatch, writeScopeObjectIds?: readonly string[], signal?: AbortSignal,
   /** Legacy writes: a selected id is in scope only on the page its selection named. */
-  writeScopePages?: PluginWriteScopePages
+  scopePages?: PluginWriteScopePages
 ): Promise<ChemDraftDocument> | undefined {
   const scope = writeScopeObjectIds && new Set(writeScopeObjectIds);
-  // Follow a uniquely identified selected object that moved pages; never a same-id object elsewhere.
-  const scopePages = effectiveScopePages(before, writeScopePages);
+  // Send-time pins resolve only on their own page; never a same-id object elsewhere.
   const inserted = new Set<string>();
   const atomUpdates = new Set<string>();
   const storedUpdates = new Set<string>();
@@ -107,7 +106,7 @@ export function refreshPluginPatchChemistry(before: ChemDraftDocument, draft: Ch
       // Records the canvas itself derives from this graph cannot disagree with it.
       if (verifyInsertion && !graphChanged && !storedChanged && storesNativeDerivation(object)) continue;
       // Give existing scope refusals priority over chemistry inspection of a draft that cannot commit.
-      if (!edits.length && writeScopeObjectIds) assertPluginDocumentWriteScope(before, draft, rebased, writeScopeObjectIds, writeScopePages);
+      if (!edits.length && writeScopeObjectIds) assertPluginDocumentWriteScope(before, draft, rebased, writeScopeObjectIds, scopePages);
       if (objects === page.objects) objects = [...objects];
       edits.push((async () => {
         try {

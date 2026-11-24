@@ -277,6 +277,19 @@ avogadro3d-sidecar executable shipped beside the app on macOS and Windows)
   416651ddaef33a4e20392392e7c0b505d446491b. Built without Open Babel, GPL plugins,
   or Python (guarded by pnpm audit:engine3d-sidecar).
   Full licence text: native/avogadro3d-sidecar/licenses/avogadrolibs-LICENSE.txt
+  Installed license (macOS and Windows): licenses/avogadrolibs-LICENSE.txt
+
+CppNumericalSolvers (cppoptlib)
+  Header-only L-BFGS minimizer and More-Thuente line search, compiled through
+  Avogadro Calc into the avogadro3d-sidecar executable shipped beside the app on
+  macOS and Windows.
+  MIT. Copyright (c) 2014-2015 Patrick Wieschollek;
+  Copyright (c) 2015- Patrick Wieschollek+Contributors.
+  Source: https://github.com/PatWie/CppNumericalSolvers, as vendored by avogadrolibs
+  commit 416651ddaef33a4e20392392e7c0b505d446491b in thirdparty/cppoptlib/ (license:
+  thirdparty/cppoptlib/LICENSE) and compiled as vendored there.
+  Full license text: native/avogadro3d-sidecar/licenses/cppoptlib-LICENSE.txt
+  Installed license (macOS and Windows): licenses/cppoptlib-LICENSE.txt
 
 Eigen 3.4.0 (header-only, compiled into the avogadro3d-sidecar executable)
   MPL-2.0. Source: https://gitlab.com/libeigen/eigen, tag 3.4.0. Unmodified.
@@ -285,6 +298,7 @@ Eigen 3.4.0 (header-only, compiled into the avogadro3d-sidecar executable)
   including any of them a compile error, so the shipped Windows and macOS arm64
   binaries, both built with the flag, contain none.
   Full licence text: native/avogadro3d-sidecar/licenses/Eigen-COPYING.MPL2.txt
+  Installed license (macOS and Windows): licenses/Eigen-COPYING.MPL2.txt
 
 --------------------------------------------------------------------------------
 Optional components downloaded only at the user's request

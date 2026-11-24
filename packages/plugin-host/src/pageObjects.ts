@@ -10,7 +10,8 @@ import type { ChemDraftDocument } from "@chemdraft/plugin-api";
  * Write code resolves objects only through these helpers, with the Send-time selection's page.
  */
 
-/** Host-only legacy scope: object id -> the page the command's selection named it on at Send. */
+/** Host-only legacy scope: object id -> the page the command's selection named it on at Send. A pin
+ * resolves only on that page; it never follows an id to another page (see {@link scopedObjectPage}). */
 export type PluginWriteScopePages = ReadonlyMap<string, string>;
 
 export interface PageObjectLocation<Object extends DocumentObject = DocumentObject> {
@@ -47,15 +48,16 @@ function joinLabels(labels: string[]): string {
  * the same-id objects the write would have reached. `selectedPageId` is where the selection named the object.
  */
 export function duplicateIdRefusalMessage(document: ChemDraftDocument, objectId: string, selectedPageId: string,
-  others: readonly string[], stillOnSelectedPage = true): string {
+  others: readonly string[]): string {
   console.warn(`Plugin write refused: object "${objectId}" selected on page id "${selectedPageId}"; same id on page ids ${others.map(id => `"${id}"`).join(", ")}.`);
-  const otherLabels = others.map(id => pageNumberLabel(document, id));
-  const where = joinLabels(otherLabels);
-  const fix = "To edit it, make the change by hand, or copy the object and paste it as a new object, then try again.";
-  if (!stillOnSelectedPage) {
-    return `Plugin write refused: the change was not applied. The object you selected on ${pageNumberLabel(document, selectedPageId)} is no longer there, and its internal ID now matches objects on ${where}, so ChemDraft can't tell which one to change safely. ${fix}`;
-  }
-  return `Plugin write refused: the change was not applied. The object you selected on ${pageNumberLabel(document, selectedPageId)} shares its internal ID with an object on ${where}, so ChemDraft can't tell which one to change safely. ${fix}`;
+  const where = joinLabels(others.map(id => pageNumberLabel(document, id)));
+  return `Plugin write refused: the change was not applied. The object you selected on ${pageNumberLabel(document, selectedPageId)} shares its internal ID with an object on ${where}, so ChemDraft can't tell which one to change safely. To edit it, make the change by hand, or copy the object and paste it as a new object, then try again.`;
+}
+
+/** The user-facing reason a pinned id no longer resolves: the selected object is gone from the page it
+ * was selected on (deleted, or moved to another page). Reads and writes both refuse with it. */
+export function pinnedObjectMissingMessage(document: ChemDraftDocument, selectedPageId: string): string {
+  return `The object you selected on ${pageNumberLabel(document, selectedPageId)} is no longer there; reselect it and try again.`;
 }
 
 /** The object named `objectId` on page `pageId`, or undefined. */
@@ -73,14 +75,17 @@ export function bareIdTargetPage(document: ChemDraftDocument, objectId: string):
 
 /**
  * The page `objectId` resolves to in `document`:
- * - its Send-time page while the object is still there, even when the id also exists elsewhere;
- * - otherwise (unpinned, or a uniquely identified object that moved to another page) its only page;
- * - undefined when the id is gone or is ambiguous (on several pages, none of them the pinned one).
+ * - a pinned id: its Send-time page while the object is still there, even when the id also exists
+ *   elsewhere; otherwise nothing. A pin never follows its id to another page: an object found there
+ *   under the same id may be an unrelated object inserted after Send, so it is never in scope;
+ * - an unpinned id: its only page;
+ * - undefined when the id is gone, or unpinned and on several pages.
  */
 export function scopedObjectPage(document: ChemDraftDocument, objectId: string,
   scopePages?: PluginWriteScopePages): string | undefined {
   const pinned = scopePages?.get(objectId);
-  if (pinned !== undefined && resolveObjectOnPage(document, pinned, objectId)) return pinned;
+  // TODO(plugin-host): same-page id reuse needs host-owned object identity (1.2.3)
+  if (pinned !== undefined) return resolveObjectOnPage(document, pinned, objectId) ? pinned : undefined;
   const locations = objectLocations(document, objectId);
   return locations.length === 1 ? locations[0]!.page.id : undefined;
 }
@@ -95,35 +100,21 @@ export function resolveScopedObject(document: ChemDraftDocument, objectId: strin
   const pageId = scopedObjectPage(document, objectId, scopePages);
   const resolved = pageId === undefined ? undefined : resolveObjectOnPage(document, pageId, objectId);
   if (resolved) return resolved;
+  const pinned = scopePages?.get(objectId);
+  if (pinned !== undefined) throw new Error(pinnedObjectMissingMessage(document, pinned));
   const locations = objectLocations(document, objectId);
   if (!locations.length) throw new Error(`Object "${objectId}" does not exist in ${where}.`);
-  const pinned = scopePages?.get(objectId);
-  throw new Error(pinned !== undefined
-    ? `Object "${objectId}" was selected on page "${pinned}", but it is no longer there and the id now names objects on pages ${pageList(locations)}; select it again and retry.`
-    : `Object id "${objectId}" names objects on pages ${pageList(locations)}; select the one you mean and retry.`);
+  throw new Error(`Object id "${objectId}" names objects on pages ${pageList(locations)}; select the one you mean and retry.`);
 }
 
-/** Rebind Send-time pins to `document`. A pinned object still on its page keeps the pin; a uniquely
- * identified object that moved to another page follows it. An ambiguous or missing one keeps its
- * original pin, so no same-id object elsewhere is ever in scope. */
-export function effectiveScopePages(document: ChemDraftDocument,
-  scopePages: PluginWriteScopePages | undefined): PluginWriteScopePages | undefined {
-  if (!scopePages?.size) return scopePages;
-  let rebound: Map<string, string> | undefined;
-  for (const [objectId, pinned] of scopePages) {
-    const pageId = scopedObjectPage(document, objectId, scopePages);
-    if (pageId !== undefined && pageId !== pinned) (rebound ??= new Map(scopePages)).set(objectId, pageId);
-  }
-  return rebound ?? scopePages;
-}
-
-/** True when the object `objectId` on page `pageId` is in write scope. Pass pins already rebound
- * with {@link effectiveScopePages} for the document the page belongs to. Unpinned ids (insertions,
- * request-bound refs checked elsewhere) keep bare-id scope. */
+/** True when the object `objectId` on page `pageId` is in write scope: a pinned id only on its
+ * Send-time page (the same rule as {@link scopedObjectPage}). Unpinned ids (insertions, request-bound
+ * refs checked elsewhere) keep bare-id scope. */
 export function objectInWriteScope(scope: ReadonlySet<string>, scopePages: PluginWriteScopePages | undefined,
   pageId: string, objectId: string): boolean {
   if (!scope.has(objectId)) return false;
   const pinned = scopePages?.get(objectId);
+  // TODO(plugin-host): same-page id reuse needs host-owned object identity (1.2.3)
   return pinned === undefined || pinned === pageId;
 }
 
@@ -131,14 +122,16 @@ export function objectInWriteScope(scope: ReadonlySet<string>, scopePages: Plugi
  * Bind selected ids to a page at Send. Ids on `pageId` bind to it. Ids elsewhere bind to their only
  * page; an id found on several other pages cannot be bound and is returned in `ambiguous` (or bound
  * to `pageId`, when one is given, so that nothing on another page is in scope).
+ * With `explicitPage` (a Send-time override that names its page), every id binds to `pageId`, even
+ * one missing from it: that pin is then refused ("reselect it"), never moved to the id's other page.
  */
 export function pinSelectionPages(document: ChemDraftDocument | undefined, objectIds: readonly string[],
-  pageId: string | undefined): { pages: Map<string, string>; ambiguous: string[] } {
+  pageId: string | undefined, explicitPage = false): { pages: Map<string, string>; ambiguous: string[] } {
   const pages = new Map<string, string>();
   const ambiguous: string[] = [];
   if (!document) return { pages, ambiguous };
   for (const objectId of new Set(objectIds)) {
-    if (pageId !== undefined && resolveObjectOnPage(document, pageId, objectId)) {
+    if (pageId !== undefined && (explicitPage || resolveObjectOnPage(document, pageId, objectId))) {
       pages.set(objectId, pageId);
       continue;
     }

@@ -14,6 +14,7 @@ mod download_diagnosis;
 mod export;
 mod external_tools;
 mod file_warnings_window;
+mod first_paint;
 mod fonts;
 mod installed_plugins;
 #[cfg(target_os = "linux")]
@@ -34,6 +35,7 @@ mod network_error;
 mod network_test_http;
 mod ocsr_engine;
 mod opsin;
+mod palette_first_paint;
 mod panel_full_size;
 mod panel_window;
 mod panel_window_controls;
@@ -173,6 +175,17 @@ const CHECK_FOR_UPDATES_COMMAND_ID: &str = "app.checkForUpdates";
 const CLOSE_WINDOW_FILE_MENU_ID: &str = "app.closeWindow.file";
 #[cfg(target_os = "macos")]
 const CLOSE_WINDOW_WINDOW_MENU_ID: &str = "app.closeWindow.window";
+/// Linux: muda's predefined Minimize, Maximize and Close Window are unsupported in GTK menus, so
+/// Linux builds ordinary items with these ids, acting on the document window. Two Close ids, one
+/// per menu, because muda item ids are meant to be unique.
+#[cfg(any(target_os = "linux", test))]
+const LINUX_MINIMIZE_MENU_ID: &str = "app.window.minimize";
+#[cfg(any(target_os = "linux", test))]
+const LINUX_TOGGLE_MAXIMIZE_MENU_ID: &str = "app.window.toggleMaximize";
+#[cfg(any(target_os = "linux", test))]
+const LINUX_CLOSE_WINDOW_FILE_MENU_ID: &str = "app.window.close.file";
+#[cfg(any(target_os = "linux", test))]
+const LINUX_CLOSE_WINDOW_WINDOW_MENU_ID: &str = "app.window.close.window";
 const DOM_COMMAND_EVENT: &str = "chemdraft:native-command";
 #[cfg(target_os = "macos")]
 const PALETTE_POINTER_EVENT: &str = "chemdraft://palette-pointer";
@@ -1091,8 +1104,10 @@ struct NativeMenuNeedsRebuild(AtomicBool);
 )]
 #[serde(rename_all = "lowercase")]
 enum KeybindingScheme {
-    #[default]
     ChemDraft,
+    /// The industry-standard scheme, the default for new installs since 1.2.3. The native menu is
+    /// built with it until the document window pushes the stored scheme (`set_keybinding_scheme`).
+    #[default]
     ChemDraw,
 }
 
@@ -1551,6 +1566,11 @@ pub fn run() {
                 close_key_window(app);
                 return;
             }
+            #[cfg(target_os = "linux")]
+            if let Some(action) = linux_window_menu_action(command_id) {
+                run_linux_window_menu_action(app, action);
+                return;
+            }
             if (is_routed_menu_command(command_id)
                 || (is_clipboard_edit_menu_command(command_id)
                     && custom_menu_shortcut(app, command_id).is_some()))
@@ -1573,6 +1593,7 @@ pub fn run() {
                     // Windows sends Resized when the owner is restored from the taskbar;
                     // macOS also reports its restored frame. Never release a prompt here.
                     schedule_suspended_utility_restore(window.app_handle());
+                    palette_first_paint::release_held(window.app_handle());
                     if let Err(error) = persist_main_window_geometry(window) {
                         eprintln!("Could not persist ChemDraft main window frame: {error}");
                     }
@@ -1619,6 +1640,7 @@ pub fn run() {
                         #[cfg(target_os = "macos")]
                         reattach_visible_plugin_panels(window.app_handle());
                         schedule_suspended_utility_restore(window.app_handle());
+                        palette_first_paint::release_held(window.app_handle());
                     }
                     _ => {}
                 }
@@ -1788,6 +1810,7 @@ pub fn run() {
             setup_primary_app(app.handle())
         })
         .invoke_handler(tauri::generate_handler![
+            first_paint::window_first_paint,
             canvas_context_menu::popup_canvas_context_menu,
             file_warnings_window::file_warnings_open,
             file_warnings_window::file_warnings_request,
@@ -2982,7 +3005,10 @@ async fn suspend_toolset_windows(
             }
             Ok(())
         } else {
-            restore_suspended_utility_windows(&app)?;
+            let restored = restore_suspended_utility_windows(&app);
+            // A palette whose first paint arrived during the suspension was held; show it now.
+            palette_first_paint::release_held(&app);
+            restored?;
             if let Some(session_id) = focus_export_session_id {
                 dialog_windows::focus_export_after_picker(&app, &session_id)?;
             }
@@ -3026,7 +3052,12 @@ fn schedule_suspended_utility_restore<R: Runtime>(app: &tauri::AppHandle<R>) {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .pending_restore();
-            restore_utility_labels(&app, labels)
+            let restored = restore_utility_labels(&app, labels);
+            // This restoration is what clears a suspension whose prompt ended while the document
+            // was minimized; the restore event's own retry ran while it was still active. Retry
+            // the held first-paint reveals now that it may have cleared.
+            palette_first_paint::release_held(&app);
+            restored
         });
         if let Err(error) = result
             .and_then(|result| result)
@@ -3510,14 +3541,23 @@ async fn open_toolset_window(
     toolset_id: String,
     window: Option<ToolsetWindowGeometry>,
 ) -> Result<ToolsetWindowState, String> {
+    // Windows: recorded before waiting for the creation lock, so a close that arrives while this
+    // open waits, builds or arms wins over it (palette_first_paint.rs). No-op elsewhere.
+    palette_first_paint::requested(&toolset_window_label(&toolset_id));
     let _creation = lock_window_creation()?;
     if utility_windows_suspended() {
         return toolset_state(&app, &toolset_id);
     }
     ensure_toolset_window(&app, &toolset_id, window.as_ref())?;
-    set_toolset_menu_checked(&app, &toolset_id, true)?;
 
     let state = toolset_state(&app, &toolset_id)?;
+    // Windows: a palette closed while this open was in flight stays closed, menu item included.
+    // macOS and Linux check it as before.
+    set_toolset_menu_checked(
+        &app,
+        &toolset_id,
+        state.open || !palette_first_paint::tracks_palettes(),
+    )?;
     let _ = emit_toolset_window_state_to_main(&app, &state);
     Ok(state)
 }
@@ -3530,6 +3570,9 @@ fn close_toolset_window(
     if utility_windows_suspended() {
         return toolset_state(&app, &toolset_id);
     }
+    // Windows: before anything else, and whether or not the window exists yet, so an open still
+    // waiting for, building or arming its window does not show it afterwards (a later open does).
+    palette_first_paint::closed(&toolset_window_label(&toolset_id));
     let window = app.get_webview_window(&toolset_window_label(&toolset_id));
     if let Some(window) = window.as_ref() {
         let webview: &tauri::Webview = window.as_ref();
@@ -6704,6 +6747,9 @@ fn build_toolset_popover_window(
     config.resizable |= native_wayland;
     let builder =
         WebviewWindowBuilder::from_config(app, &config).map_err(|error| error.to_string())?;
+    // Windows: the palette background as its first frame. Still shown only by its own reveal.
+    let builder =
+        palette_first_paint::builder_step(builder, palette_first_paint::PaletteWindowKind::Popover);
     let builder = if native_wayland {
         builder
     } else {
@@ -7210,11 +7256,14 @@ fn resize_toolset_window(
         .map_err(|error| error.to_string())?
         .or_else(|| monitor_query::primary_monitor(app).ok().flatten())
         .ok_or("The tool palette's monitor is unavailable.")?;
+    let area = monitor_logical_work_area(&monitor);
+    // Only Linux builds use native Wayland (uses_native_wayland is false elsewhere). The compositor
+    // places the window, so cap both sides to the work area and leave the position alone.
     if utility_window::uses_native_wayland(app)? {
         window
             .set_size(tauri::LogicalSize::new(
-                width,
-                height.min(monitor_logical_work_area(&monitor).height),
+                width.min(area.width),
+                height.min(area.height),
             ))
             .map_err(|error| error.to_string())?;
         return Ok(true);
@@ -7224,14 +7273,16 @@ fn resize_toolset_window(
     let window_scale = window.scale_factor().unwrap_or(scale);
     let position = window.outer_position().map_err(|error| error.to_string())?;
     let origin = (position.x, position.y);
-    let mut placement = toolset_content_placement(
-        origin,
-        (width, height),
-        scale,
-        monitor_logical_work_area(&monitor),
-    );
+    let mut placement = toolset_content_placement(origin, (width, height), scale, area);
+    // Linux: a palette wider than its work area is capped to it and moved to the area's left edge,
+    // the one place it fits (toolset_content_placement). Keep that move rather than the old origin.
+    #[cfg(target_os = "linux")]
+    let keep_fitted_position = width > area.width;
+    #[cfg(not(target_os = "linux"))]
+    let keep_fitted_position = false;
     // The monitor under most of the palette can differ from the one under its title.
     if placement.position != origin
+        && !keep_fitted_position
         && monitor_query::available_monitors(app)
             .unwrap_or_default()
             .iter()
@@ -7261,6 +7312,13 @@ fn resize_toolset_window(
     {
         placement.position = origin;
     }
+    // X11/XWayland: pin the GtkWindow to the new size before resizing it. GTK clamps a resize to
+    // the window's current hints, which still hold the previous content size.
+    #[cfg(target_os = "linux")]
+    utility_window::pin_content_fit_frame(
+        &window,
+        tauri::PhysicalSize::new(placement.size.0, placement.size.1).into(),
+    )?;
     #[cfg(not(target_os = "macos"))]
     if placement.position == origin {
         windows_activation_log::frame_set(window.label(), "toolbar content fit", "pixels", || {
@@ -7305,7 +7363,24 @@ fn toolset_content_placement(
 ) -> panel_window_frame::Placement {
     let position =
         logical_toolset_position_from_physical(f64::from(position.0), f64::from(position.1), scale);
-    let (width, height) = (size.0, size.1.min(area.height));
+    let height = size.1.min(area.height);
+    // Linux: also cap the width (a 1311-px Main toolbar ran off a 1280-px screen), and start a
+    // capped palette at the work area's left edge, the only place a frame that wide fits. A palette
+    // that already fits keeps its width and position. macOS and Windows keep the measured width.
+    #[cfg(target_os = "linux")]
+    let (width, position) = if size.0 > area.width {
+        (
+            area.width,
+            ToolsetWindowPosition {
+                x: area.x,
+                ..position
+            },
+        )
+    } else {
+        (size.0, position)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let width = size.0;
     let position = toolset_position_in_work_area(position, width, height, area);
     let position = tauri::LogicalPosition::new(position.x, position.y).to_physical::<i32>(scale);
     let size = tauri::LogicalSize::new(width, height).to_physical::<u32>(scale);
@@ -7333,7 +7408,7 @@ fn build_toolset_tooltip_window(app: &tauri::AppHandle) -> Result<(), String> {
     }
 
     let native_wayland = utility_window::uses_native_wayland(app)?;
-    let window = utility_window_builder(
+    let builder = utility_window_builder(
         WebviewWindowBuilder::new(
             app,
             TOOLSET_TOOLTIP_WINDOW_LABEL,
@@ -7350,9 +7425,12 @@ fn build_toolset_tooltip_window(app: &tauri::AppHandle) -> Result<(), String> {
     .resizable(native_wayland)
     .decorations(false)
     .skip_taskbar(true)
-    .visible(false)
-    .build()
-    .map_err(|error| error.to_string())?;
+    .visible(false);
+    // Windows: the tooltip background as its first frame. Still shown only by its own reveal.
+    let window =
+        palette_first_paint::builder_step(builder, palette_first_paint::PaletteWindowKind::Tooltip)
+            .build()
+            .map_err(|error| error.to_string())?;
 
     disable_default_context_menus(&window);
     utility_window::prepare(&window, utility_window::Kind::Tooltip, native_wayland)?;
@@ -10326,8 +10404,10 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                         CLOSE_WINDOW_FILE_MENU_ID,
                         view_state.has_multiple_document_tabs,
                     )?,
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(windows)]
                     &PredefinedMenuItem::close_window(app, None)?,
+                    #[cfg(target_os = "linux")]
+                    &linux_window_menu_item(app, LINUX_CLOSE_WINDOW_FILE_MENU_ID)?,
                     // A routed item, not PredefinedMenuItem::quit: on Windows muda's predefined Quit
                     // is a bare PostQuitMessage, which ends the event loop before the document
                     // window can flush its pending session autosave (see request_quit).
@@ -10461,8 +10541,16 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                 "Window",
                 true,
                 &[
+                    // muda leaves these predefined items out of GTK menus, which left Linux with
+                    // an empty Window menu. Linux uses ordinary items (linux_window_menu_item).
+                    #[cfg(not(target_os = "linux"))]
                     &PredefinedMenuItem::minimize(app, None)?,
+                    #[cfg(not(target_os = "linux"))]
                     &PredefinedMenuItem::maximize(app, None)?,
+                    #[cfg(target_os = "linux")]
+                    &linux_window_menu_item(app, LINUX_MINIMIZE_MENU_ID)?,
+                    #[cfg(target_os = "linux")]
+                    &linux_window_menu_item(app, LINUX_TOGGLE_MAXIMIZE_MENU_ID)?,
                     &PredefinedMenuItem::separator(app)?,
                     #[cfg(target_os = "macos")]
                     &close_window_menu_item(
@@ -10470,8 +10558,10 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                         CLOSE_WINDOW_WINDOW_MENU_ID,
                         view_state.has_multiple_document_tabs,
                     )?,
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(windows)]
                     &PredefinedMenuItem::close_window(app, None)?,
+                    #[cfg(target_os = "linux")]
+                    &linux_window_menu_item(app, LINUX_CLOSE_WINDOW_WINDOW_MENU_ID)?,
                 ],
             )?,
             // macOS keeps About in the application menu; elsewhere Help is its home.
@@ -10518,6 +10608,71 @@ fn close_window_menu_item<R: Runtime>(
         true,
         Some("CmdOrCtrl+W"),
     )
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinuxWindowMenuAction {
+    Minimize,
+    ToggleMaximize,
+    Close,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_window_menu_action(command_id: &str) -> Option<LinuxWindowMenuAction> {
+    match command_id {
+        LINUX_MINIMIZE_MENU_ID => Some(LinuxWindowMenuAction::Minimize),
+        LINUX_TOGGLE_MAXIMIZE_MENU_ID => Some(LinuxWindowMenuAction::ToggleMaximize),
+        LINUX_CLOSE_WINDOW_FILE_MENU_ID | LINUX_CLOSE_WINDOW_WINDOW_MENU_ID => {
+            Some(LinuxWindowMenuAction::Close)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_window_menu_title(command_id: &str) -> &'static str {
+    match linux_window_menu_action(command_id) {
+        Some(LinuxWindowMenuAction::Minimize) => "Minimize",
+        Some(LinuxWindowMenuAction::ToggleMaximize) => "Maximize / Restore",
+        Some(LinuxWindowMenuAction::Close) | None => "Close Window",
+    }
+}
+
+/// No accelerator: a GTK menu accelerator would take Ctrl+W (document.closeTab) and others from the
+/// webview, which owns those shortcuts on Linux.
+#[cfg(target_os = "linux")]
+fn linux_window_menu_item<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    id: &str,
+) -> tauri::Result<MenuItem<R>> {
+    MenuItem::with_id(app, id, linux_window_menu_title(id), true, None::<&str>)
+}
+
+/// The GTK menu bar belongs to the document window, so these act on it. Close goes through
+/// CloseRequested, the same path as the title bar's close button (it flushes autosave and quits).
+#[cfg(target_os = "linux")]
+fn run_linux_window_menu_action<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    action: LinuxWindowMenuAction,
+) {
+    let Some(main) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+        return;
+    };
+    let result = match action {
+        LinuxWindowMenuAction::Minimize => main.minimize(),
+        LinuxWindowMenuAction::ToggleMaximize => {
+            if main.is_maximized().unwrap_or(false) {
+                main.unmaximize()
+            } else {
+                main.maximize()
+            }
+        }
+        LinuxWindowMenuAction::Close => main.close(),
+    };
+    if let Err(error) = result {
+        eprintln!("Could not apply the ChemDraft Window menu action {action:?}: {error}");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -10880,7 +11035,7 @@ fn create_toolbars_menu<R: Runtime>(
 fn toolset_is_resizable(toolset_id: &str) -> bool {
     matches!(
         toolset_id,
-        "core.molecularInspector" | "core.drawnStructureSettings" | "core.ringInspector"
+        "core.molecularInspector" | "core.drawnStructureSettings"
     )
 }
 
@@ -10897,7 +11052,11 @@ fn ensure_toolset_window<R: Runtime>(
         // display it lived on may have been unplugged while it was hidden. Re-clamp on the way in,
         // so re-opening from View ▸ Toolbars is always enough to recover a lost palette.
         recover_offscreen_toolset_window(app, &window, resizable);
-        window.show().map_err(|error| error.to_string())?;
+        // Its page has painted, so show it now — unless it is still waiting for its first paint
+        // (Windows, palette_first_paint.rs), whose reveal will show it.
+        if !palette_first_paint::reopened(&label) {
+            window.show().map_err(|error| error.to_string())?;
+        }
         configure_toolset_utility_window(&window, true)?;
         return Ok(());
     }
@@ -10943,16 +11102,14 @@ fn ensure_toolset_window<R: Runtime>(
         resizable,
     );
 
-    // A non-resizable GtkWindow publishes fixed size hints. On native Wayland these
-    // can conflict with the compositor's configure, such as Weston's kiosk fullscreen.
-    // Keep GTK resizable there while the toolbar still uses content-fit sizing.
+    // Keep every palette GtkWindow resizable on Linux. On native Wayland, a non-resizable
+    // GtkWindow's fixed size hints can conflict with the compositor's configure (Weston's kiosk
+    // fullscreen). On X11/XWayland, GTK 3 never shrinks a non-resizable window below 200x200, so
+    // every smaller palette gained an empty grey band (Main: 1311x200 for 85 px of content). X11
+    // content-fit palettes are pinned with min = max size hints instead
+    // (utility_window::pin_content_fit_frame), so the user still cannot resize them.
     #[cfg(target_os = "linux")]
-    let native_resizable = resizable
-        || run_on_main_thread_blocking(app, || {
-            use gtk::gdk::prelude::DisplayExtManual;
-
-            gtk::gdk::Display::default().is_some_and(|display| display.backend().is_wayland())
-        })?;
+    let native_resizable = true;
     #[cfg(not(target_os = "linux"))]
     let native_resizable = resizable;
     let native_wayland = utility_window::uses_native_wayland(app)?;
@@ -10986,13 +11143,16 @@ fn ensure_toolset_window<R: Runtime>(
     } else {
         builder.position(position.x, position.y)
     };
+    // Windows: hidden with the palette's background as its first frame, until its page paints.
+    let builder =
+        palette_first_paint::builder_step(builder, palette_first_paint::PaletteWindowKind::Toolbar);
     #[cfg(windows)]
     let builder = if placement.is_some() {
         // Tao's builder accepts logical positions only. Set the physical frame before showing
         // the window so it does not flash at an ambiguous logical position on another display.
-        builder.visible(false)
+        builder
     } else {
-        builder.visible(false).position(position.x, position.y)
+        builder.position(position.x, position.y)
     };
     // Only scrolling inspectors need a floor for manual resize. A toolbar's frame is fixed
     // at the DOM's measured size until the next fit. A floor here would leave narrow grids padded.
@@ -11020,6 +11180,19 @@ fn ensure_toolset_window<R: Runtime>(
     };
 
     disable_default_context_menus(&window);
+    // Before the first map: the size hints replace GTK's 200x200 floor, and the position hint
+    // keeps the window manager from re-placing the palette whenever it is shown again.
+    #[cfg(target_os = "linux")]
+    if !resizable && !native_wayland {
+        let webview: &tauri::Webview<R> = window.as_ref();
+        let pinned = utility_window::pin_content_fit_frame(
+            &webview.window(),
+            tauri::LogicalSize::new(width, height).into(),
+        );
+        panel_window::finish_installation(pinned, || {
+            window.destroy().map_err(|error| error.to_string())
+        })?;
+    }
     utility_window::prepare(&window, utility_window::Kind::Toolbar, native_wayland)?;
     configure_toolset_utility_window(&window, true)?;
     install_toolset_input_focus(&window)?;
@@ -11033,7 +11206,10 @@ fn ensure_toolset_window<R: Runtime>(
                 let webview: &tauri::Webview<R> = target.as_ref();
                 panel_full_size::apply(&webview.window(), placement, "initial toolbar placement")?;
             }
-            target.show().map_err(|error| error.to_string())
+            // Stays hidden until its page reports its first paint, or the fallback fires; a
+            // palette closed or minimized meanwhile is not shown by either (palette_first_paint.rs).
+            palette_first_paint::arm_toolbar(&target);
+            Ok::<(), String>(())
         })
         .and_then(|result| result);
         panel_window::finish_installation(placed, || {
@@ -11364,7 +11540,9 @@ fn toolset_state<R: Runtime>(
 ) -> Result<ToolsetWindowState, String> {
     match app.get_webview_window(&toolset_window_label(toolset_id)) {
         Some(window) => {
-            let actual_visible = window.is_visible().unwrap_or(false);
+            // A palette still hidden until its first paint (Windows) is open, not closed.
+            let actual_visible = window.is_visible().unwrap_or(false)
+                || palette_first_paint::opening(window.label());
             let visible = UTILITY_SUSPENSION
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -12408,6 +12586,20 @@ fn find_menu_item_by_id<R: Runtime>(
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn keybinding_scheme_defaults_to_the_industry_standard_scheme() {
+        assert_eq!(KeybindingScheme::default(), KeybindingScheme::ChemDraw);
+        let state = KeybindingSchemeState::default();
+        assert_eq!(*state.0.lock().unwrap(), KeybindingScheme::ChemDraw);
+        assert_eq!(KeybindingScheme::default().rulers(), "CmdOrCtrl+;");
+        // An explicit scheme in the preferences file still wins, and none stored stays None.
+        let stored: DesktopPreferences =
+            serde_json::from_value(serde_json::json!({ "shortcutScheme": "chemdraft" })).unwrap();
+        assert_eq!(stored.shortcut_scheme, Some(KeybindingScheme::ChemDraft));
+        let empty: DesktopPreferences = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(empty.shortcut_scheme, None);
+    }
 
     #[test]
     fn desktop_preferences_persist_shortcut_schemes_independently() {
@@ -15136,11 +15328,7 @@ mod tests {
 
     #[test]
     fn only_scrolling_toolsets_allow_user_resize() {
-        for id in [
-            "core.molecularInspector",
-            "core.drawnStructureSettings",
-            "core.ringInspector",
-        ] {
+        for id in ["core.molecularInspector", "core.drawnStructureSettings"] {
             assert!(toolset_is_resizable(id), "{id}");
         }
         for id in [
@@ -15153,6 +15341,7 @@ mod tests {
             "core.layout",
             "core.style",
             "core.text",
+            "core.ringInspector",
             "plugin.fixture",
             "user.fixture",
         ] {
@@ -15166,7 +15355,9 @@ mod tests {
             serde_json::from_str(r#"{"x":-125.0,"y":275.0,"width":413.0,"height":317.0}"#).unwrap();
         for (id, expected) in [
             ("core.layout", None),
+            ("core.ringInspector", None),
             ("core.molecularInspector", Some((413.0, 317.0))),
+            ("core.drawnStructureSettings", Some((413.0, 317.0))),
         ] {
             let position = state.position().unwrap();
             assert_eq!((position.x, position.y), (-125.0, 275.0));
@@ -15186,6 +15377,98 @@ mod tests {
             assert_eq!(fit.position, origin);
             assert_eq!(fit.size, ((60.0 * scale) as u32, (54.0 * scale) as u32));
         }
+    }
+
+    #[test]
+    fn palette_wider_than_the_work_area_is_capped_only_on_linux() {
+        // Linux VM report B3: a 1311-px Main toolbar on a 1280-px screen ran off the right edge.
+        let area = ScreenRect::new(0.0, 32.0, 1280.0, 768.0);
+        for scale in [1.0, 2.0] {
+            let physical = |(x, y): (f64, f64)| ((x * scale) as i32, (y * scale) as i32);
+            let origin = physical((88.0, 154.0));
+            let fit = toolset_content_placement(origin, (1311.0, 85.0), scale, area);
+            let size = ((1311.0 * scale) as u32, (85.0 * scale) as u32);
+            if cfg!(target_os = "linux") {
+                assert_eq!(fit.size, ((1280.0 * scale) as u32, size.1));
+                assert_eq!(fit.position, physical((0.0, 154.0)));
+            } else {
+                assert_eq!(fit.size, size);
+                assert_eq!(fit.position, origin);
+            }
+            // A palette that fits keeps its frame on every platform.
+            let fit = toolset_content_placement(origin, (1180.0, 85.0), scale, area);
+            assert_eq!(fit.size, ((1180.0 * scale) as u32, size.1));
+            assert_eq!(fit.position, origin);
+        }
+    }
+
+    #[test]
+    fn linux_window_menu_items_act_on_the_document_window() {
+        let ids = [
+            LINUX_MINIMIZE_MENU_ID,
+            LINUX_TOGGLE_MAXIMIZE_MENU_ID,
+            LINUX_CLOSE_WINDOW_FILE_MENU_ID,
+            LINUX_CLOSE_WINDOW_WINDOW_MENU_ID,
+        ];
+        assert_eq!(
+            ids.map(linux_window_menu_action),
+            [
+                Some(LinuxWindowMenuAction::Minimize),
+                Some(LinuxWindowMenuAction::ToggleMaximize),
+                Some(LinuxWindowMenuAction::Close),
+                Some(LinuxWindowMenuAction::Close),
+            ]
+        );
+        assert_eq!(
+            ids.map(linux_window_menu_title),
+            [
+                "Minimize",
+                "Maximize / Restore",
+                "Close Window",
+                "Close Window"
+            ]
+        );
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            ids.len()
+        );
+        for id in ids {
+            // Handled natively, never sent to the webview's command dispatcher.
+            assert!(!is_routed_menu_command(id));
+        }
+        assert_eq!(linux_window_menu_action("document.closeTab"), None);
+
+        // muda drops the predefined items from GTK menus, so Linux must build its own.
+        let source = include_str!("lib.rs");
+        let menu = source
+            .split("tauri::menu::WINDOW_SUBMENU_ID,")
+            .nth(1)
+            .unwrap()
+            .split("// macOS keeps About in the application menu")
+            .next()
+            .unwrap();
+        for item in [
+            "#[cfg(not(target_os = \"linux\"))]\n                    &PredefinedMenuItem::minimize",
+            "#[cfg(not(target_os = \"linux\"))]\n                    &PredefinedMenuItem::maximize",
+            "#[cfg(windows)]\n                    &PredefinedMenuItem::close_window",
+            "&linux_window_menu_item(app, LINUX_MINIMIZE_MENU_ID)?",
+            "&linux_window_menu_item(app, LINUX_TOGGLE_MAXIMIZE_MENU_ID)?",
+            "&linux_window_menu_item(app, LINUX_CLOSE_WINDOW_WINDOW_MENU_ID)?",
+        ] {
+            assert!(menu.contains(item), "Window menu lacks {item}");
+        }
+        assert!(source.contains("&linux_window_menu_item(app, LINUX_CLOSE_WINDOW_FILE_MENU_ID)?"));
+        let dispatch = source
+            .split(".on_menu_event(|app, event| {")
+            .nth(1)
+            .unwrap()
+            .split(".on_window_event(")
+            .next()
+            .unwrap();
+        assert!(dispatch.contains(
+            "if let Some(action) = linux_window_menu_action(command_id) {\n                \
+             run_linux_window_menu_action(app, action);\n                return;"
+        ));
     }
 
     #[test]

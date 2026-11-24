@@ -1,5 +1,5 @@
 import type { ChemDraftDocument, DocumentObject, MoleculeObject } from "@chemdraft/chem-core";
-import { duplicateIdRefusalMessage, effectiveScopePages, objectInWriteScope, type PluginWriteScopePages } from "@chemdraft/plugin-host";
+import { duplicateIdRefusalMessage, objectInWriteScope, type PluginWriteScopePages } from "@chemdraft/plugin-host";
 import { normalizeCommittedDocument } from "../documentWorkflow";
 import type { AssistantToolContext } from "./AssistantToolContext";
 import { assertCanonical, inspectMolecule } from "../plugins/requestWrites/structureIdentity";
@@ -20,9 +20,8 @@ const equalEntry = (a: ObjectEntry | undefined, b: ObjectEntry | undefined) =>
  * the patch: charge/radical reconciliation can also mutate unselected neighbouring objects.
  * The caller rechecks the authored result inside the synchronous gesture gate before host cleanup. */
 function normalizeScopedWrite(before: ChemDraftDocument, patched: ChemDraftDocument, scope: ReadonlySet<string>,
-  sendScopePages?: PluginWriteScopePages): ChemDraftDocument {
-  // Follow a uniquely identified selected object that moved pages; never a same-id object elsewhere.
-  const scopePages = effectiveScopePages(before, sendScopePages);
+  scopePages?: PluginWriteScopePages): ChemDraftDocument {
+  // Send-time pins resolve only on their own page; never a same-id object elsewhere.
   const normalized = normalizeCommittedDocument(patched);
   assertOffPageDuplicatesUnchanged(before, normalized, scopePages);
   const previous = objectsById(before), proposed = objectsById(patched), committed = objectsById(normalized);

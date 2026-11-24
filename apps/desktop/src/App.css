@@ -107,6 +107,18 @@ body {
   overflow: hidden;
 }
 
+/* A palette, popover or tooltip page before React has mounted it: index.html sets the attribute
+   synchronously from ?window=, so the page paints its window's own token from its first frame
+   (an early or fallback reveal reads as an empty panel, not as --cd-bg-app). The app has only
+   these light tokens, whatever the system appearance; the document window is not matched. */
+html[data-cd-first-frame="panel"] {
+  background: var(--cd-bg-panel);
+}
+
+html[data-cd-first-frame="tooltip"] {
+  background: var(--cd-bg-control-opaque);
+}
+
 html.palette-window-html {
   min-width: 0;
   background: var(--cd-bg-panel);
@@ -806,10 +818,43 @@ textarea:focus-visible,
 
 .document-tab-list {
   display: flex;
+  flex-direction: column;
   flex: 0 1 auto;
-  gap: 2px;
   min-width: 0;
-  overflow-x: auto;
+  overflow: hidden;
+}
+
+.document-tab-clip {
+  /* Give focus navigation no native scroll range inside the hidden viewport. */
+  min-width: 0;
+  overflow: clip;
+}
+
+.document-tab-track {
+  display: flex;
+  gap: 2px;
+  width: max-content;
+  /* DocumentTabList pans horizontal touch and pen drags itself; the browser keeps only vertical panning, so it
+     neither scrolls nor zooms sideways underneath, and taps still click. */
+  touch-action: pan-y;
+}
+
+.document-tab-scrollbar {
+  position: relative;
+  /* A finger or pen on the thumb drags it; the browser takes no gesture from it. */
+  touch-action: none;
+  flex: 0 0 8px;
+  visibility: hidden;
+  background: var(--cd-border-subtle);
+  border-radius: 4px;
+}
+
+.document-tab-scrollbar-thumb {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-block: 1px solid transparent;
+  border-radius: 4px;
+  background: var(--cd-text-muted) padding-box;
 }
 
 .document-tab-new {
@@ -914,6 +959,11 @@ textarea:focus-visible,
 
 .web-floating-palette[data-toolset-id="core.main"] {
   max-width: calc(100vw - var(--palette-x) - 8px);
+}
+
+.web-floating-palette:has(> .ring-inspector-palette) {
+  /* Rings hides the command grid, so the widget determines the browser frame width. */
+  width: max-content;
 }
 
 .document-viewport {
@@ -1168,7 +1218,12 @@ textarea:focus-visible,
 
 .ring-inspector-controls {
   grid-template-columns: minmax(0, 1fr);
-  max-height: 320px;
+  max-height: none;
+}
+
+.ring-inspector-controls .molecule-inspector-target-key {
+  /* The controls set the palette width. Long ring keys still ellipsize in the target row. */
+  contain: inline-size;
 }
 
 .molecule-inspector-tab-rail {
@@ -8164,3 +8219,10 @@ body.file-warnings-window {
 
 .cd-page-size-web-fallback .cd-dialog-fit { height: auto; max-height: calc(100dvh - 32px); min-height: 0; }
 .plugin-prompt-backdrop > .arrangement-spacing-dialog.cd-dialog-fit { height: auto; }
+
+/* A plugin's one-line text question in its own native dialog window (dialogs.promptText). The
+   browser build's in-page fallback keeps the .plugin-prompt-dialog card above. */
+.plugin-text-prompt-native { box-sizing: border-box; background: var(--cd-bg-panel-raised); color: var(--cd-text-primary); font-size: 12px; }
+.plugin-text-prompt-native > .cd-dialog-fit-body { margin: 0; padding: 0; overflow-wrap: anywhere; }
+.plugin-text-prompt-form .plugin-prompt-body p { margin: 0; color: var(--cd-text-secondary); }
+.plugin-text-prompt-form .plugin-prompt-body p[role="alert"] { color: var(--cd-danger); }

@@ -102,6 +102,19 @@ cover the toolbars. Hover for a tooltip, open and reopen a palette popover, and 
 Check that each opens after prewarming or reuse and that mouse-opened utilities leave the document
 focused. On native Wayland, the compositor places these windows.
 
+Palette first paint (Windows): quit ChemDraft, then cold-launch it. The Main toolbar and the other
+open palettes appear with their content in the palette's light grey, with no black frame and no
+blank light frames first. Press and hold a flyout button and open a color picker: each popover, and
+the first hovered tooltip, appears with its content and no black or blank frame. Focus stays on the
+document throughout (its title bar stays active and M switches tools). Close a palette from
+View ▸ Toolbars right after launch: it stays closed. Minimize the document right after launch,
+before the palettes appear: no palette shows until the document is restored, and then they all do.
+If a palette appears before its content, it shows only an empty panel in the palette's own grey,
+never the darker document-window grey. With the agent bridge diagnostics on, the
+`[windows-activation]` log has one `palette reveal label=... ms=... trigger=ack|fallback|release
+result=...` line per palette; on a cold launch `trigger=ack` is expected, since the fallback waits
+5 s.
+
 Palette field input (macOS and Windows): in Drawn Structure Settings, click Target bond length,
 type 30 and press Return; the value changes, the canvas does not, and no hotkey fires. Switch to
 another app and back, then click the field again; Customize gallery search still types.
@@ -1658,6 +1671,25 @@ whole-molecule cleanup with the existing behavior, and check save/reopen and exp
   Drawing style: Sketch. Sketch shows uneven strokes and Patrick Hand labels. Undo and Redo, then
   save and reopen: the applied style remains without changing the chemistry.
 
+### Plugin text prompt (Name to Structure) (macOS and Windows)
+
+- With the OPSIN plugin installed, choose Structure ▸ Convert Name to Structure…. The **Structure from
+  Name** question opens as its own native window owned by the document window: no Windows taskbar
+  entry, centered over the document the first time, nothing dimmed or drawn inside the drawing, and
+  the floating toolbars stay usable beside it. It names Name to Structure (OPSIN) as the requester.
+- Type a name and press Return/Enter: the structure is inserted and focus returns to the drawing.
+  Move the window, ask again: it reopens where it was left. Repeat with Cancel, Escape (hold it: the
+  window closes only on release, and nothing in the drawing reacts), Cmd+. on macOS (no effect on
+  Windows), and the title-bar close: nothing is inserted and focus returns to the drawing each time.
+- Type with an IME (Japanese or Chinese input): the Enter that confirms the composition does not submit.
+- Type a name, then switch to another tab: the question stays open with the typed name, **Insert** is
+  disabled, one line reads "Switch back to <tab name> to insert.", and Return/Enter does nothing.
+  Switch back: the line disappears, **Insert** works, and the structure lands only in the tab that
+  asked (the other tab is unchanged; one Undo there removes nothing).
+- With the question open, switch to another tab and close the tab that asked: the question closes
+  and nothing is inserted. Repeat with File ▸ Open into the tab that asked (its document replaced):
+  the question closes too.
+
 ### Page-enlarge question
 
 - Paste a list of SMILES large enough to overflow the page. In the native question choose Enlarge:
@@ -1730,3 +1762,25 @@ whole-molecule cleanup with the existing behavior, and check save/reopen and exp
 - Start a native Wayland session with XWayland disabled. With `DISPLAY` and `GDK_BACKEND` unset,
   launch both packages and verify that the document window and drawing canvas appear. Repeat
   on Wayland with XWayland enabled and check the default and an explicit Wayland override.
+
+## Linux floating palettes and the Window menu (1.2.2)
+
+Run under KDE Plasma (Wayland session, so the app uses XWayland) and on GNOME.
+
+- Palette sizes: launch with the default toolbars. Each palette fits its content with no empty
+  grey band: Main is about 85 px tall (not 200), and Arrows, Orbitals and Style are about
+  60x93 (not 200x200). `xprop WM_NORMAL_HINTS` on a palette shows min = max = its content size.
+  Change the Main toolbar's contents (Customize Toolbars) and check that it grows and shrinks to
+  fit. Palettes still cannot be resized by dragging an edge. `<select>` dropdowns inside a palette
+  open at their normal size.
+- Window menu: it lists Minimize, Maximize / Restore and Close Window. Minimize iconifies the
+  document window; Maximize / Restore toggles it; Close Window closes it the same way as the
+  title bar button (Save on Quit prompt for unsaved edits, then ChemDraft quits). File ▸ Close
+  Window does the same. Ctrl+W still closes the current document tab.
+- 1280-wide screen: set the display to 1280x800 and relaunch. The Main toolbar is no wider than
+  the screen and starts at its left edge; nothing runs off the right edge of the screen. At
+  1680x1050 the Main toolbar keeps its full width and saved position.
+- Palette positions after Save/Open: place Main and Art somewhere distinctive, then press
+  Shift+Ctrl+S and Esc, and Ctrl+O and Esc, several times. Every palette comes back exactly where
+  it was, and after quitting and relaunching it opens at that same spot (toolbar-state.json is
+  unchanged by the dialogs).

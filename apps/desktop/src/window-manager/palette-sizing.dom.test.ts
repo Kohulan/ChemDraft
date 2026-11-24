@@ -132,7 +132,10 @@ describe("palette work-area sizing", () => {
   it("uses the calling palette's live position and native work area for title-strip recovery", () => {
     const nativeSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../src-tauri/src/lib.rs"), "utf8");
     const resize = nativeSource.split("fn resize_toolset_window(")[1]!.split("/// Pre-build")[0]!;
-    expect(resize).toMatch(/window\.outer_position\(\)[\s\S]*toolset_content_placement\([\s\S]*monitor_logical_work_area\(&monitor\)/);
+    expect(resize).toMatch(
+      /let area = monitor_logical_work_area\(&monitor\);[\s\S]*let position = window\.outer_position\(\)[^\n]*\n\s*let origin = \(position\.x, position\.y\);\s*let mut placement = toolset_content_placement\(origin, \(width, height\), scale, area\);/,
+    );
+    expect(resize.match(/let area = /g)).toHaveLength(1);
     expect(resize).toContain("toolset_position_in_work_area(position, width, height, area)");
     const recover = nativeSource.split("fn toolset_position_in_work_area(")[1]!.split("/// Pull a palette")[0]!;
     expect(recover).toContain("area.contains_title_strip(position.x, position.y, width, TOOLSET_TITLE_HEIGHT)");
@@ -165,9 +168,22 @@ describe("palette work-area sizing", () => {
   it("fits a restored inspector frame to the work area before creating or showing the window", () => {
     const nativeSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../src-tauri/src/lib.rs"), "utf8");
     const open = nativeSource.split("fn ensure_toolset_window<")[1]!.split("fn install_toolset_input_focus<")[0]!;
-    expect(open).toMatch(/recover_offscreen_toolset_window\(app, &window, resizable\);\s*window\.show\(/);
+    expect(open).toMatch(
+      /recover_offscreen_toolset_window\(app, &window, resizable\);(?:\s*\/\/[^\n]*)*\s*if !palette_first_paint::reopened\(&label\) \{\s*window\.show\(/,
+    );
     expect(open).toMatch(/let \(position, width, height\) = clamp_toolset_frame\([\s\S]*?\.inner_size\(width, height\)/);
-    expect(open).toMatch(/clamp_windows_toolset_frame\([\s\S]*?\.visible\(false\)[\s\S]*?panel_full_size::apply\([\s\S]*?target\.show\(/);
+    // Windows: clamp, build hidden through palette_first_paint, place, then the reveal is armed.
+    expect(open).toMatch(
+      /clamp_windows_toolset_frame\([\s\S]*?palette_first_paint::builder_step\([\s\S]*?builder\.build\(\)[\s\S]*?panel_full_size::apply\([\s\S]*?palette_first_paint::arm_toolbar\(&target\)/,
+    );
+    // The new window is never shown directly: only palette_first_paint reveals it. The creation path
+    // (everything from the builder on) has no `.show(` call on any receiver.
+    const creationStart = open.indexOf("let builder = utility_window_builder(");
+    expect(creationStart).toBeGreaterThan(open.indexOf("palette_first_paint::reopened(&label)"));
+    const creation = open.slice(creationStart);
+    expect(creation).toContain("builder.build()");
+    expect(creation).not.toMatch(/\.show\s*\(/);
+    expect(creation).not.toMatch(/\bshow\s*\(\s*&?(?:window|target)\b/);
   });
 
   it("sends the requested size unchanged when it fits within the work area", async () => {

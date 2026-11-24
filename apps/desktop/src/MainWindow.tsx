@@ -1,4 +1,5 @@
 import { basename } from "@tauri-apps/api/path";
+import { interactive3dWorkspaceStatusText, Interactive3dWorkspaceStatus } from "./Interactive3dWorkspaceStatus";
 import { CanvasContextMenu, NATIVE_CANVAS_MENU_CLOSED_EVENT } from "./CanvasContextMenu";
 import { PLUGIN_CHANGE_REFUSED, RECOGNITION_REFUSED, chemistryRefusalOf, refusalSentence } from "./plugins/requestWrites/chemistryRefusal";
 import { buildObjectCanvasMenu, pageCanvasMenu, SET_DEFAULT_ARROW_STYLE_COMMAND_ID } from "./canvasContextMenuModel";
@@ -96,6 +97,7 @@ import {
   type OpenWarningsReport
 } from "./openWarnings";
 import { modifierHint, type HeldModifiers, type ModifierHintContext, type ModifierHintInteraction } from "./modifierHints";
+import { DocumentTabList, type DocumentTabListHandle } from "./DocumentTabList";
 import { modifierLabels } from "./modifierLabels";
 import {
   Fragment,
@@ -909,6 +911,7 @@ import {
 import { PluginManagerDialog } from "./plugins/PluginManagerDialog";
 import { revealRecognitionScreenCaptures } from "./plugins/recognitionScreenCaptures";
 import { PluginPromptTextDialog } from "./plugins/PluginPromptTextDialog";
+import { pluginTextPromptTabState, presentPluginTextPromptsNatively } from "./plugins/nativePluginTextPrompts";
 import { PluginImageRequestDialog } from "./plugins/PluginImageRequestDialog";
 import { StructureRecognitionInstallDialog } from "./plugins/StructureRecognitionInstallDialog";
 import { RecognitionProgressIndicator } from "./plugins/RecognitionProgressIndicator";
@@ -983,7 +986,7 @@ import type { KeybindingScheme } from "./keybindingSettings";
 import { nativeMenuShortcutOverrides } from "./customKeyboardShortcuts";
 import { useShortcutPreference } from "./useShortcutPreference";
 import { aboutCommand, openAbout } from "./about/aboutCommand";
-import { SHOW_TOUR_COMMAND, TOUR_NAME_COMMAND, TOUR_SAMPLE_COMMAND, TOUR_TITLE, type TourAction } from "./tour/tourCommands";
+import { availableTourPluginCommands, SHOW_TOUR_COMMAND, TOUR_NAME_COMMAND, TOUR_SAMPLE_COMMAND, TOUR_TITLE, type TourAction, type TourPluginCommand } from "./tour/tourCommands";
 import type { TourMode } from "./tour/tourState";
 import { buildTourSample } from "./tour/tourSample";
 import { useGuidedTour } from "./tour/useGuidedTour";
@@ -1855,7 +1858,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.22.07.30-opus";
+const CURRENT_BUILD_STAMP = "11.24.07.00-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -2309,19 +2312,62 @@ export function MainWindow({
       if (event.buttons === 0) releaseFocus();
       else renewFocus();
     };
+    const blockComposingCanvasPress = (event: Event): boolean => {
+      const canvas = canvasRegionRef.current;
+      if (!(event.target instanceof Element) || !canvas?.contains(event.target)
+        || event.target.closest(".plugin-canvas-overlay")) return false;
+      const overlay = canvasOverlayLayerRef.current?.querySelector('.plugin-canvas-overlay[data-composing="true"]');
+      if (!overlay) return false;
+      // Stop before native focus defaults and tool listeners, including other window
+      // capture listeners. IME ownership must not depend on a transient activeElement.
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      overlay.dispatchEvent(new Event("chemdraft:composition-blocked"));
+      return true;
+    };
+    const overlayLayer = canvasOverlayLayerRef.current;
+    // Guard independent canvas activation paths as well as pointer/mouse presses.
+    // Move/release phases do not open editors and must remain available to overlay resizes.
+    const composingEvents = ["touchstart", "contextmenu", "auxclick", "click", "dblclick"] as const;
+    let composingListenersAttached = false;
+    const removeComposingListeners = () => {
+      for (const type of composingEvents) window.removeEventListener(type, blockComposingCanvasPress, true);
+      composingListenersAttached = false;
+    };
+    const syncComposingListeners = () => {
+      const composing = !!overlayLayer?.querySelector('.plugin-canvas-overlay[data-composing="true"]');
+      if (composing === composingListenersAttached) return;
+      if (!composing) { removeComposingListeners(); return; }
+      for (const type of composingEvents) {
+        window.addEventListener(type, blockComposingCanvasPress, { capture: true, passive: false });
+      }
+      composingListenersAttached = true;
+    };
+    // React's overlay handlers set/clear data-composing at the root before these
+    // window bubble listeners run, even for consecutive synthetic events.
+    const compositionSignals = ["compositionstart", "compositionupdate", "compositionend", "compositioncancel",
+      "input", "keydown", "focusin", "focusout"] as const;
+    for (const type of compositionSignals) window.addEventListener(type, syncComposingListeners, { passive: true });
+    // Also cover expiry, overlay removal and any other clear path without keeping a
+    // non-passive touch listener on the window between compositions.
+    const compositionObserver = new MutationObserver(syncComposingListeners);
+    if (overlayLayer) compositionObserver.observe(overlayLayer, {
+      subtree: true, childList: true, attributes: true, attributeFilter: ["data-composing"]
+    });
+    syncComposingListeners();
     const preserveOverlayFocus = (event: globalThis.MouseEvent) => {
+      if (blockComposingCanvasPress(event)) return;
       releaseFocus();
       const canvas = canvasRegionRef.current;
       const active = globalThis.document.activeElement;
       const overlay = active?.closest<HTMLElement>(".plugin-canvas-overlay");
       if (!canvas || !(event.target instanceof Element) || !canvas.contains(event.target) || !overlay) return;
-      if (!isCanvasDrawingPress(canvas, event) || overlay.dataset.composing === "true"
+      if (!isCanvasDrawingPress(canvas, event)
         || (event.button !== 0 && event.button !== 2) || ("isPrimary" in event && event.isPrimary === false)) {
         preservedFocus = active instanceof HTMLElement ? active : null;
         preservedOverlay = overlay;
         overlay.dataset.preservingFocus = "true";
         renewFocus();
-        if (overlay.dataset.composing === "true") event.preventDefault();
       }
     };
     const restoreOverlayFocus = (event: FocusEvent) => {
@@ -2332,6 +2378,7 @@ export function MainWindow({
       }
     };
     const down = (event: globalThis.PointerEvent) => {
+      if (blockComposingCanvasPress(event)) return;
       preserveOverlayFocus(event);
       if (!canvasOverlaysPresentRef.current || !(event.target instanceof Element) || !canvasRegionRef.current?.contains(event.target)
         || !isCanvasDrawingPress(canvasRegionRef.current, event) || preservedFocus) return;
@@ -2347,7 +2394,7 @@ export function MainWindow({
     globalThis.document.addEventListener("focusin", restoreOverlayFocus, true);
     window.addEventListener("mousedown", preserveOverlayFocus, true);
     window.addEventListener("mouseup", releaseFocus, true);
-    window.addEventListener("keydown", releaseFocus, true);
+    window.addEventListener("keydown", releaseFocus, { capture: true, passive: true });
     window.addEventListener("pointerdown", down, true);
     window.addEventListener("pointermove", move, true);
     window.addEventListener("pointerup", up, true);
@@ -2359,6 +2406,9 @@ export function MainWindow({
       releaseFocus();
       globalThis.document.removeEventListener("focusin", restoreOverlayFocus, true);
       window.removeEventListener("mousedown", preserveOverlayFocus, true);
+      compositionObserver.disconnect();
+      for (const type of compositionSignals) window.removeEventListener(type, syncComposingListeners);
+      removeComposingListeners();
       window.removeEventListener("mouseup", releaseFocus, true);
       window.removeEventListener("keydown", releaseFocus, true);
       window.removeEventListener("pointerdown", down, true);
@@ -2616,11 +2666,13 @@ export function MainWindow({
   const [fileState, setFileState] = useState<NativeFileState>({ dirty: false });
   const [documentTabs, setDocumentTabs] = useState([{ id: "initial", title: initialDocument?.title ?? "Untitled" }]);
   const [activeDocumentTabId, setActiveDocumentTabId] = useState("initial");
+  const documentTabListRef = useRef<DocumentTabListHandle>(null);
   const documentTabsRef = useRef(documentTabs);
   documentTabsRef.current = documentTabs;
   const pluginRuntimeRef = useRef<DesktopPluginRuntime | undefined>(undefined);
   const dialogCoordinatorRef = useRef<DialogCoordinator | undefined>(undefined);
   const tourActionRef = useRef<(action: TourAction) => Promise<void>>(async () => {});
+  const tourPluginCommandsRef = useRef<readonly TourPluginCommand[]>([]);
   const deferTourRef = useRef<() => void>(() => {});
   const tourSampleRef = useRef<{ tabId: string; moleculeId: string } | undefined>(undefined);
   const atomProblemTargetRef = useRef<{ tabId: string; target: AtomProblemTarget; source: ChemDraftDocument; version: number } | undefined>(undefined);
@@ -3042,6 +3094,14 @@ export function MainWindow({
     const key = requestDocumentKeysRef.current.get(tabId);
     requestDocumentKeysRef.current.delete(tabId);
     if (key) pluginRuntimeRef.current?.host.closeRequestsForDocument(key);
+    // The tab closed or its document was replaced: a plugin text prompt asked from it ends as cancelled.
+    if (key) pluginRuntimeRef.current?.prompts.cancelDocument(key);
+  }, []);
+  // The open tab whose document has this key (the active tab for no key); undefined once it closed or was replaced.
+  const documentTabForKey = useCallback((key: string | undefined) => {
+    const tabId = key === undefined ? activeDocumentTabIdRef.current
+      : [...requestDocumentKeysRef.current].find(([, candidate]) => candidate === key)?.[0];
+    return documentTabsRef.current.find(tab => tab.id === tabId);
   }, []);
   // Counts undo and redo steps. A label-edit session closed by one must not write into the history
   // state it landed on (see the atom-label close effect).
@@ -3052,6 +3112,8 @@ export function MainWindow({
   const fileStateRef = useRef<NativeFileState>(fileState);
   // Successful explicit saves, per tab, including a save completed while its label editor is open.
   const documentSaveRevisionsRef = useRef(new Map<string, number>());
+  // Tabs saved at least once, to a desktop path or as a browser download (which leaves no path).
+  const savedOnceTabsRef = useRef(new Set<string>());
   // Keep the actual saved contents: open drafts can be saved without ending their history session.
   const savedDocumentsRef = useRef(new Map<string, ChemDraftDocument>());
   // Capture once: Preferences changes affect the next launch, never this run.
@@ -8218,8 +8280,10 @@ export function MainWindow({
   const documentForFlush = useCallback((onDroppedDraft?: (kind: string, error: unknown) => void): ChemDraftDocument => {
     // Resizing and part drags replace the live page during the preview.
     // A Save/autosave/export during the held gesture must match what Escape restores.
+    // Only while a preview is installed: below the drag threshold the live document is the
+    // truth, and an edit made during a held press (Delete, a relabel hotkey) must be saved.
     const gesture = objectResizeDragRef.current ?? nativePartDragRef.current;
-    if (gesture) return gesture.startDocument;
+    if (gesture?.dragging) return gesture.startDocument;
     let current = documentRef.current;
     const includeDraft = (kind: string, apply: () => ChemDraftDocument, rollback?: () => ChemDraftDocument) => {
       if (!onDroppedDraft) return apply();
@@ -10401,6 +10465,34 @@ export function MainWindow({
         }
         return;
       }
+      // Undo took the sample out and nothing was drawn since: the tab is still the original blank
+      // entry, so put the sample back there rather than opening another Tour tab. A tab with any
+      // other history holds the user's edits and is never reset: that includes redo history beyond
+      // the sample itself (installing the sample clears it), and a tab ever saved, to a file or as a
+      // browser download (the restored sample would be marked clean against a copy that does not
+      // hold it). A browser download leaves no path, so saves are tracked per tab, not by path.
+      const active = practice.tabId === activeDocumentTabIdRef.current;
+      const snapshot = active ? undefined : documentTabSnapshotsRef.current.get(practice.tabId);
+      const history = active ? documentHistoryRef.current : snapshot?.history;
+      const filePath = active ? fileStateRef.current.path : snapshot?.file.path;
+      if (history && documentTabsRef.current.some(tab => tab.id === practice.tabId)
+        && !savedOnceTabsRef.current.has(practice.tabId) && !filePath
+        && history.past.length === 0 && history.present.pages.every(page => page.objects.length === 0)
+        && (history.future.length === 0 || (history.future.length === 1
+          && findDocumentObject(history.future[0], practice.moleculeId)?.type === "molecule"))) {
+        const restored = buildTourSample(history.present);
+        activateDocumentTab(practice.tabId);
+        if (activeDocumentTabIdRef.current !== practice.tabId) throw new Error("Could not switch to the tour drawing.");
+        const present = prepareDocumentCommit(restored.document, restored.label);
+        installDocumentHistory({ past: [documentRef.current], present, future: [] });
+        savedDocumentsRef.current.set(practice.tabId, present);
+        // Undo marked the tab dirty; with the sample back it matches its baseline again.
+        fileStateRef.current = { ...fileStateRef.current, dirty: false };
+        setFileState(fileStateRef.current);
+        tourSampleRef.current = { tabId: practice.tabId, moleculeId: present.selection.objectIds[0] };
+        setStatus("Tour drawing opened");
+        return;
+      }
     }
     const blank = createPhase4Document("Tour");
     const sample = buildTourSample(blank);
@@ -10422,9 +10514,7 @@ export function MainWindow({
     let tabs = documentTabsRef.current;
     const index = tabs.findIndex((tab) => tab.id === id);
     if (index < 0) return;
-    invalidateRequestDocument(id);
     pluginRuntimeRef.current?.closeProposalDocumentTab(id, tabs[index]!.title);
-    void dialogCoordinatorRef.current?.closeTab(id);
     setBrowserTemplates(current => current?.tabId === id ? undefined : current);
     exportGrantsRef.current.delete(id);
     if (browserExportTabRef.current === id) { browserExportTabRef.current = undefined; browserExportSessionRef.current = undefined; setExportDialog(undefined); }
@@ -10438,11 +10528,17 @@ export function MainWindow({
       if (!snapshotDocumentTab()) return;
       installDocumentTab(remaining[Math.min(index, remaining.length - 1)]!.id);
     }
+    // The tab is now really going away (a refused snapshot above leaves it open): only here do a
+    // plugin text prompt bound to it, its request and its dialog windows end as cancelled.
+    invalidateRequestDocument(id);
+    void dialogCoordinatorRef.current?.closeTab(id);
     importedPageFitGateRef.current.dismiss(id);
     documentTabSnapshotsRef.current.delete(id);
     savedDocumentsRef.current.delete(id);
+    savedOnceTabsRef.current.delete(id);
     nonPristineTabsRef.current.delete(id);
     browserFileKeysRef.current.delete(id);
+    documentTabListRef.current?.beforeRemove(remaining);
     documentTabsRef.current = remaining;
     setDocumentTabs(remaining);
     setCloseTabPrompt(undefined);
@@ -10469,6 +10565,9 @@ export function MainWindow({
     activateDocumentTab(tabs[(index + direction + tabs.length) % tabs.length]!.id);
   }, [activateDocumentTab]);
 
+  const documentTabOrder = documentTabs.map((tab) => tab.id).join(",");
+  // The strip re-reveals the active tab when its title changes; the title is the tab's own, as drawn.
+  const activeDocumentTabTitle = documentTabs.find((candidate) => candidate.id === activeDocumentTabId)?.title ?? "";
   useLayoutEffect(() => {
     const scroll = pendingTabScrollRef.current;
     const canvas = canvasRegionRef.current;
@@ -10943,6 +11042,9 @@ export function MainWindow({
       onPageEnlargementClosed: tabId => {
         if (activeDocumentTabIdRef.current === tabId) canvasRegionRef.current?.focus({ preventScroll: true });
       },
+      onPluginTextPromptClosed: tabId => {
+        if (activeDocumentTabIdRef.current === tabId) canvasRegionRef.current?.focus({ preventScroll: true });
+      },
       export: (tabId, options, live, progress) => exportToTabRef.current(tabId, options, live, progress),
       previewExport: (tabId, options, live) => previewExportRef.current(tabId, options, live),
       chooseExportDestination: (tabId, options, live) => chooseExportDestinationRef.current(tabId, options, live),
@@ -11039,7 +11141,12 @@ export function MainWindow({
     };
 
     return listenAndDrainNativeOpenQueue({
-      subscribe: listenForNativeOpenDocuments,
+      // A refused subscription never reaches a drain, so nothing else would clear the startup gate
+      // that holds the first-run tour back; release it and let onError report the failure.
+      subscribe: changed => listenForNativeOpenDocuments(changed).catch(error => {
+        nativeOpenDrainBusyRef.current = false;
+        throw error;
+      }),
       drain: takePendingNativeOpenDocuments,
       consumeBatch: openNativePayloads,
       onDrainActivity: busy => { nativeOpenDrainBusyRef.current = busy; },
@@ -11682,6 +11789,7 @@ export function MainWindow({
     const finishSave = (destination?: { path: string; displayName: string }) => {
       savedDocumentsRef.current.set(savingTabId, savedDocument);
       documentSaveRevisionsRef.current.set(savingTabId, (documentSaveRevisionsRef.current.get(savingTabId) ?? 0) + 1);
+      savedOnceTabsRef.current.add(savingTabId);
       nonPristineTabsRef.current.add(savingTabId);
       const currentDocument = savingTabId === activeDocumentTabIdRef.current ? documentForFlush() :
         documentTabSnapshotsRef.current.get(savingTabId)?.history.present;
@@ -12172,7 +12280,9 @@ export function MainWindow({
       && !activeAtomLabelEditRef.current && !activeTextEditObjectIdRef.current
       && !tableCellEditorRef.current && !bracketLabelEditorRef.current,
     scheme: keybindingScheme,
+    shortcutOverrides: shortcutSettings.overrides,
     platform: shortcutPlatform,
+    plugins: () => tourPluginCommandsRef.current,
     mode: tourMode,
     setStatus
   });
@@ -13359,7 +13469,9 @@ export function MainWindow({
       if (text) setStatus(text);
     },
     getActiveDocument: () => documentRef.current,
-    getActiveDocumentKey: () => String(documentIdentityRef.current),
+    // Stable per tab and rotated when its document is replaced or the tab closes, so a command's writes
+    // land only in the tab it started on, also after the user switches away and back.
+    getActiveDocumentKey: () => requestDocumentKey(activeDocumentTabIdRef.current),
     captureRequestDocument: () => {
       const tabId = activeDocumentTabIdRef.current;
       const key = requestDocumentKey(tabId);
@@ -13514,6 +13626,8 @@ export function MainWindow({
     }
   });
   const { isPluginCommand: pluginCommandExists, invokePluginCommand } = pluginRuntime;
+  // The tour shows a plugin's step only when the menus show that plugin's item.
+  tourPluginCommandsRef.current = availableTourPluginCommands(pluginRuntime.pluginMenuItems);
   tourActionRef.current = action => tour.completeOrRun(action, {
     has: id => registry.get(id)?.enabled === true,
     invoke: async id => {
@@ -13526,6 +13640,25 @@ export function MainWindow({
   });
   canvasOverlaysPresentRef.current = pluginRuntime.canvasOverlays.length > 0;
   pluginRuntimeRef.current = pluginRuntime.runtime;
+  // dialogs.promptText asks in its own native window, owned by this document window (AGENTS.md §12),
+  // one prompt at a time in queue order. The browser build renders the in-page fallback below. The
+  // prompt is modeless, but a command can write only to the document it started on: while another
+  // tab is active it stays open with Submit off, and closing its tab (or replacing its document)
+  // ends it as cancelled; see `invalidateRequestDocument` and `pluginTextPromptTabState`.
+  useEffect(() => {
+    if (!isDesktopRuntime()) return;
+    return presentPluginTextPromptsNatively(pluginRuntime.runtime.prompts, {
+      coordinator: () => dialogCoordinatorRef.current,
+      documentTab: documentTabForKey,
+      activeTabId: () => activeDocumentTabIdRef.current,
+      tabs: () => documentTabsRef.current,
+      onError: setStatus
+    });
+  }, [documentTabForKey, pluginRuntime.runtime]);
+  // Opening, closing or moving a tab can change which "(tab N)" an open prompt's status line names.
+  useEffect(() => {
+    pluginRuntime.runtime.prompts.activeDocumentChanged();
+  }, [documentTabs, pluginRuntime.runtime]);
   useEffect(() => {
     const runtime = pluginRuntime.runtime;
     runtime.notifyActiveDocumentChanged(requestDocumentKey(activeDocumentTabIdRef.current));
@@ -15282,6 +15415,15 @@ export function MainWindow({
         key: event.key, code: event.code, ctrlKey: event.ctrlKey, metaKey: event.metaKey,
         altKey: event.altKey, shiftKey: event.shiftKey
       });
+      // A Save or Save As the user assigned to a formatting chord (Preferences > Keyboard) wins.
+      if (commandId === "document.save" || commandId === "document.saveAs") {
+        // Cancel the browser/native accelerator fallback as well, so macOS cannot save twice.
+        // Cmd+Q remains the native app.quit accelerator, which requests the shared draft flush;
+        // Windows registers no Quit accelerator. Neither needs a second JS command binding.
+        event.preventDefault();
+        void invokeCommandRef.current(commandId);
+        return;
+      }
       // The text textarea stops bubbling keys, just like the table editor. Route its
       // formatting chords through the same registered commands as the toolbar buttons.
       const commandKey = (shortcutPlatform ?? detectDesktopShortcutPlatform()) === "macos" ? event.metaKey : event.ctrlKey;
@@ -15292,14 +15434,7 @@ export function MainWindow({
         event.preventDefault();
         event.stopPropagation();
         void invokeCommandRef.current(textFormatCommand);
-        return;
       }
-      if (commandId !== "document.save" && commandId !== "document.saveAs") return;
-      // Cancel the browser/native accelerator fallback as well, so macOS cannot save twice.
-      // Cmd+Q remains the native app.quit accelerator, which requests the shared draft flush;
-      // Windows registers no Quit accelerator. Neither needs a second JS command binding.
-      event.preventDefault();
-      void invokeCommandRef.current(commandId);
     };
     window.addEventListener("keydown", commandFromInlineEditor, true);
     return () => window.removeEventListener("keydown", commandFromInlineEditor, true);
@@ -19946,9 +20081,13 @@ export function MainWindow({
       clearGraphicGradientDrag(event);
     }
 
+    // Clear on every cancel, previewed or not: documentForFlush saves a live part drag's startDocument,
+    // so a press canceled before the threshold would otherwise keep supplying a stale snapshot to Save.
     const nativePartDrag = nativePartDragRef.current;
-    if (nativePartDrag?.pointerId === event.pointerId && nativePartDrag.dragging) {
-      replacePresentDocument(nativePartDrag.startDocument);
+    if (nativePartDrag?.pointerId === event.pointerId) {
+      if (nativePartDrag.dragging) {
+        replacePresentDocument(nativePartDrag.startDocument);
+      }
       clearNativePartDrag(event);
     }
 
@@ -23290,10 +23429,13 @@ export function MainWindow({
         />
       ) : null}
 
-      {pluginRuntime.openTextPrompt ? (
+      {/* Browser build only: the desktop app asks in its own native dialog window (see below). */}
+      {!isDesktopRuntime() && pluginRuntime.openTextPrompt ? (
         <PluginPromptTextDialog
           key={pluginRuntime.openTextPrompt.id}
           prompt={pluginRuntime.openTextPrompt}
+          state={(tab => tab ? pluginTextPromptTabState(tab, activeDocumentTabId, documentTabs) : { submitEnabled: false })(
+            documentTabForKey(pluginRuntime.openTextPrompt.documentKey))}
           onSubmit={pluginRuntime.submitTextPrompt}
           onCancel={pluginRuntime.cancelTextPrompt}
         />
@@ -23499,13 +23641,14 @@ export function MainWindow({
       ) : null}
       <section className="workspace workspace-with-tabs">
         <div className="document-tab-strip">
-          <div className="document-tab-list" role="tablist" aria-label="Open documents">
+          <DocumentTabList ref={documentTabListRef} activeId={activeDocumentTabId} order={documentTabOrder}
+            activeTitle={activeDocumentTabTitle}>
             {documentTabs.map((tab) => {
               const active = tab.id === activeDocumentTabId;
               const file = active ? fileState : documentTabSnapshotsRef.current.get(tab.id)?.file;
               const title = tab.title;
               return (
-                <div className="document-tab" key={tab.id} data-active={active}>
+                <div className="document-tab" key={tab.id} data-document-tab-id={tab.id} data-active={active}>
                   <button type="button" role="tab" aria-selected={active}
                     title={title} onClick={() => void invoke(activateDocumentTabCommandId(tab.id))}>
                     <span>{title}</span>{file?.dirty ? <span aria-label="Unsaved changes"> •</span> : null}
@@ -23515,7 +23658,7 @@ export function MainWindow({
                 </div>
               );
             })}
-          </div>
+          </DocumentTabList>
           <button type="button" className="document-tab-new" aria-label="New tab" title="New tab"
             onClick={() => void invoke("document.new")}><span aria-hidden="true">+</span></button>
         </div>
@@ -24163,14 +24306,13 @@ export function MainWindow({
         <div ref={statusRowRef} className="status-row" data-status-row>
           <div className="status-row-main">
             <span data-status-message role="status" aria-live="polite" className="status-message"
-              title={spin3dErrorMessage ?? fileWarningsTooltip(warningReports)}>
+              title={spin3dErrorMessage ?? (interactive3dWorkspace ? interactive3dWorkspaceStatusText({
+                status: interactive3dWorkspace.status, energyLabel: interactive3dWorkspace.energyLabel,
+                warnings: interactive3dWorkspace.session?.warnings ?? []
+              }) : fileWarningsTooltip(warningReports))}>
               {spin3dErrorMessage ?? (interactive3dWorkspace
-                ? [
-                    interactive3dWorkspace.status,
-                    interactive3dWorkspace.energyLabel,
-                    ...new Set(interactive3dWorkspace.session?.warnings ?? []),
-                    "Esc to close"
-                  ].filter(Boolean).join(" · ")
+                ? <Interactive3dWorkspaceStatus status={interactive3dWorkspace.status}
+                    energyLabel={interactive3dWorkspace.energyLabel} warnings={interactive3dWorkspace.session?.warnings ?? []} />
                 : hoveredNativeWarning ?? status)}
             </span>
             {openWarnings ? (
