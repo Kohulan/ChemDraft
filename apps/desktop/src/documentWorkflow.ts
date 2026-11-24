@@ -5518,10 +5518,19 @@ export function updateNativeTextObjectStyle(
     ...nativeTextStyleFromObjectStyle(object.style),
     ...style
   });
+  // Formatting the whole object must be visible: a run that states the same property (an
+  // imported caption's explicit regular run, say) would override the object's new value, so
+  // that property is cleared from every run. Each run keeps its other properties and its script.
+  const changedKeys = Object.keys(style);
+  const spans = object.spans.some((span) => changedKeys.some((key) => Object.hasOwn(span.style, key)))
+    ? object.spans.map((span) => changedKeys.some((key) => Object.hasOwn(span.style, key))
+      ? { ...span, style: Object.fromEntries(Object.entries(span.style).filter(([key]) => !changedKeys.includes(key))) }
+      : span)
+    : undefined;
   const fixedWidth = object.style.textBoxSizingMode === "fixed-width" || object.style.textBoxSizingMode === "fixed-size";
   const fixedSize = object.style.textBoxSizingMode === "fixed-size";
   const size = nativeTextObjectSizeForText(object.text, nextStyle, {
-    spans: object.spans,
+    spans: spans ?? object.spans,
     width: fixedWidth ? object.width : undefined,
     height: fixedSize ? object.height : undefined,
     maxWidth: Math.max(nativeTextObjectMinimumDimensions.width, page.width - object.x),
@@ -5539,7 +5548,8 @@ export function updateNativeTextObjectStyle(
         style: {
           ...object.style,
           ...textStyleToObjectStyle(nextStyle)
-        }
+        },
+        ...(spans ? { spans } : {})
       }
     },
     { now: phase4Timestamp }
