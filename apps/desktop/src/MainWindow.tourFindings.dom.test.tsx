@@ -17,6 +17,7 @@ import type { DialogMessage } from "./dialogs/dialogProtocol";
 import type { DialogDelivery } from "./dialogs/dialogTransport";
 
 const native = vi.hoisted(() => ({
+  desktop: true,
   preferences: {} as DesktopPreferences,
   openDocumentSubscription: "ok" as "ok" | "refuse",
   dialogSnapshot: undefined as DialogMessage | undefined,
@@ -41,7 +42,7 @@ vi.mock("./dialogs/dialogTransport", () => ({ nativeDialogTransport: {
 vi.mock("./rdkitWasmLoader", () => ({ registerRdkitWasmLoader: vi.fn() }));
 vi.mock("./window-manager", async original => ({
   ...await original<typeof import("./window-manager")>(),
-  isDesktopRuntime: () => true,
+  isDesktopRuntime: () => native.desktop,
   loadDocumentSession: async () => undefined,
   saveDocumentSession: async () => undefined,
   loadToolsetLayoutState: async () => undefined,
@@ -87,6 +88,7 @@ describe.each(["macos", "windows"] as const)("Guided Tour findings on %s", platf
     vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
     vi.spyOn(window, "focus").mockImplementation(() => {});
     window.history.replaceState(null, "", "/?agentBridge=1");
+    native.desktop = true;
     native.preferences = {};
     native.openDocumentSubscription = "ok";
     native.dialogSnapshot = undefined;
@@ -220,6 +222,41 @@ describe.each(["macos", "windows"] as const)("Guided Tour findings on %s", platf
     expect(objectTypes()).toEqual([]);
     expect(bridge().snapshot().file).toEqual({ dirty: false, path: "/tmp/tour-practice.chemdraft" });
     expect(savedWrites()).toHaveLength(1);
+  });
+
+  it("does not put the sample back into a practice tab saved as a browser download", async () => {
+    await openTour();
+    await openSample();
+    await command("edit.undo");
+    // Save As in the browser build downloads the file and leaves the tab with no path.
+    const downloads: string[] = [];
+    vi.stubGlobal("URL", Object.assign(class extends URL {}, {
+      createObjectURL: (blob: Blob) => { downloads.push(blob.type); return "blob:tour-practice"; },
+      revokeObjectURL: () => undefined
+    }));
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    native.desktop = false;
+    try {
+      await command("document.saveAs");
+      await vi.waitFor(() => expect(downloads).toHaveLength(1));
+      await vi.waitFor(() => expect(bridge().snapshot().file.dirty).toBe(false));
+    } finally {
+      native.desktop = true;
+    }
+    expect(bridge().snapshot().file.path).toBeUndefined();
+    await openSample();
+    // The download holds the blank drawing: restoring the sample here would clear redo and mark the
+    // tab clean against a file that does not hold it. The sample opens in a new practice tab.
+    expect(tabs()).toHaveLength(3);
+    expect(tabs()[2].getAttribute("aria-selected")).toBe("true");
+    expect(objectTypes()).toEqual(["molecule"]);
+    await act(async () => tabs()[1].click());
+    expect(objectTypes()).toEqual([]);
+    expect(bridge().snapshot().file.dirty).toBe(false);
+    // Its redo history is untouched.
+    await command("edit.redo");
+    expect(objectTypes()).toEqual(["molecule"]);
+    expect(downloads).toHaveLength(1);
   });
 
   it("control: the first-run tour opens when the open-file subscription works", async () => {

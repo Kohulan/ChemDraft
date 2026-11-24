@@ -10,6 +10,7 @@ import {
 } from "./keybindingSettings";
 import {
   migrateShortcutDefault,
+  PENDING_FRESH_INSTALL_KEY,
   type ShortcutDefaultMigrationHost
 } from "./shortcutDefaultMigration";
 import { MemoryStorage } from "./testSupport/memoryStorage";
@@ -29,6 +30,7 @@ function install(options: {
   const storage = new MemoryStorage();
   for (const [key, value] of Object.entries(options.local ?? {})) storage.setItem(key, value);
   let preferences: DesktopPreferences = { ...options.preferences };
+  let toolbarLayout = options.toolbarLayout;
   const writeScheme = vi.fn(async (scheme: KeybindingScheme) => {
     if (options.failNativeWrite) throw new Error("disk full");
     preferences = { ...preferences, shortcutScheme: scheme };
@@ -40,8 +42,8 @@ function install(options: {
       readPreferences: async () => ({ ...preferences }),
       writeScheme,
       hasToolbarLayout: async () => {
-        if (options.toolbarLayout === "unreadable") throw new Error("Toolbar layout is invalid");
-        return options.toolbarLayout === true;
+        if (toolbarLayout === "unreadable") throw new Error("Toolbar layout is invalid");
+        return toolbarLayout === true;
       }
     }
   };
@@ -50,6 +52,16 @@ function install(options: {
     storage,
     writeScheme,
     preferences: () => preferences,
+    /**
+     * What a launch writes once the document window has mounted: MainWindow's startup layout save
+     * (toolbar-state.json), and settings the user changes along the way (the tour's "seen" flag in
+     * the native file, a webview setting). Shortcut settings are left alone.
+     */
+    runLaunch: () => {
+      toolbarLayout = true;
+      preferences = { ...preferences, guidedTourSeen: true };
+      storage.setItem("chemdraft.quit.ask-to-save.v1", "false");
+    },
     cachedScheme: () => {
       const raw = storage.getItem(KEYBINDING_STORAGE_KEY);
       return raw ? (JSON.parse(raw) as { scheme?: unknown }).scheme : undefined;
@@ -209,8 +221,10 @@ describe.each(["macos", "windows"] as const)("shortcut default migration (%s)", 
   });
 
   // Decision: a read failure with no other evidence cannot prove a new install, so this launch runs
-  // the legacy scheme. It is held in memory only (no native write, no webview cache), so the next
-  // launch that can read the file classifies the install from its real evidence.
+  // the legacy scheme, in memory only (no native write, no scheme in the webview cache). The launch
+  // still runs the app, which writes toolbar-state.json at startup and whatever settings the user
+  // changes; a marker in the webview cache keeps those from reading as an existing install, so the
+  // next launch that can read the file classifies the install as the new one it is.
   it("gives a seemingly fresh install ChemDraft's scheme for this launch only when the preferences read fails", async () => {
     const fake = install();
     vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -218,13 +232,58 @@ describe.each(["macos", "windows"] as const)("shortcut default migration (%s)", 
     fake.host.native!.readPreferences = async () => { throw new Error(IO_ERROR); };
     expect(await migrateShortcutDefault(fake.host)).toEqual({ kind: "preferences-unreadable", scheme: "chemdraft" });
     expect(fake.writeScheme).not.toHaveBeenCalled();
-    expect(fake.storage.length).toBe(0);
+    expect(fake.cachedScheme()).toBeUndefined();
+    expect(fake.storage.getItem(PENDING_FRESH_INSTALL_KEY)).not.toBeNull();
     expect(firstRenderScheme(fake.storage)).toBe("chemdraft");
-    // A later launch (a new process) that reads the file classifies from scratch.
+    // The document window mounts and the launch runs, writing what every launch writes.
+    fake.runLaunch();
+    // A later launch (a new process) reads the file: what the fallback launch wrote is no evidence.
+    setLaunchKeybindingScheme(undefined);
+    fake.host.native!.readPreferences = read;
+    expect(await migrateShortcutDefault(fake.host)).toEqual({ kind: "fresh-install", scheme: "chemdraw" });
+    expect(fake.preferences()).toEqual({ guidedTourSeen: true, shortcutScheme: "chemdraw" });
+    expect(fake.cachedScheme()).toBe("chemdraw");
+    expect(fake.storage.getItem(PENDING_FRESH_INSTALL_KEY)).toBeNull();
+    expect(firstRenderScheme(fake.storage)).toBe("chemdraw");
+    // From then on the written scheme decides.
+    setLaunchKeybindingScheme(undefined);
+    fake.runLaunch();
+    expect(await migrateShortcutDefault(fake.host)).toEqual({ kind: "already-set", scheme: "chemdraw" });
+  });
+
+  it("keeps a fresh install pending across several launches that cannot read the preferences", async () => {
+    const fake = install();
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const read = fake.host.native!.readPreferences;
+    fake.host.native!.readPreferences = async () => { throw new Error(IO_ERROR); };
+    for (let launch = 0; launch < 2; launch += 1) {
+      setLaunchKeybindingScheme(undefined);
+      expect(await migrateShortcutDefault(fake.host)).toEqual({ kind: "preferences-unreadable", scheme: "chemdraft" });
+      expect(fake.cachedScheme()).toBeUndefined();
+      expect(firstRenderScheme(fake.storage)).toBe("chemdraft");
+      fake.runLaunch();
+    }
+    expect(fake.writeScheme).not.toHaveBeenCalled();
     setLaunchKeybindingScheme(undefined);
     fake.host.native!.readPreferences = read;
     expect(await migrateShortcutDefault(fake.host)).toEqual({ kind: "fresh-install", scheme: "chemdraw" });
     expect(fake.preferences().shortcutScheme).toBe("chemdraw");
+  });
+
+  it("keeps a scheme chosen during a fallback launch", async () => {
+    const fake = install();
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const read = fake.host.native!.readPreferences;
+    fake.host.native!.readPreferences = async () => { throw new Error(IO_ERROR); };
+    expect(await migrateShortcutDefault(fake.host)).toEqual({ kind: "preferences-unreadable", scheme: "chemdraft" });
+    fake.runLaunch();
+    // updateShortcutPreference: the native write fails with the read, the webview cache keeps it.
+    fake.storage.setItem(KEYBINDING_STORAGE_KEY, JSON.stringify({ scheme: "chemdraft" }));
+    setLaunchKeybindingScheme(undefined);
+    fake.host.native!.readPreferences = read;
+    expect(await migrateShortcutDefault(fake.host)).toEqual({ kind: "kept-stored-choice", scheme: "chemdraft" });
+    expect(fake.preferences().shortcutScheme).toBe("chemdraft");
+    expect(fake.storage.getItem(PENDING_FRESH_INSTALL_KEY)).toBeNull();
   });
 });
 

@@ -25,7 +25,13 @@
  *   - otherwise LEGACY_DEFAULT_KEYBINDING_SCHEME is used for this launch. It goes into the webview
  *     cache only when other evidence shows an existing install (a preferences file that exists but
  *     cannot be parsed is such evidence); with no evidence at all it is kept in memory only, so a
- *     later launch that can read the file classifies the install from scratch.
+ *     later launch that can read the file classifies the install from scratch. That launch still
+ *     runs the app, which writes toolbar-state.json and other settings that would otherwise read as
+ *     existing-install evidence, so it also leaves PENDING_FRESH_INSTALL_KEY in the webview cache:
+ *     while that marker is present, no existing-install evidence counts (only an explicit scheme in
+ *     the native file or the cache does), and the first launch that can read the file classifies
+ *     the install as new and removes the marker. The marker is written only when nothing showed an
+ *     existing install, so everything found after it was written by such fallback launches.
  *   Nothing is written to the native file: lib.rs reads it before applying a patch, so the write
  *   would fail the same way, and it must never replace a file whose other settings it cannot see.
  *
@@ -51,9 +57,15 @@ import {
   type KeybindingSettings
 } from "./keybindingSettings";
 
+/**
+ * Left in the webview cache by a launch that could not read the native preferences and found no
+ * existing-install evidence (see the header). Not itself existing-install evidence.
+ */
+export const PENDING_FRESH_INSTALL_KEY = "chemdraft.shortcutDefault.pendingFresh";
+
 export interface ShortcutDefaultMigrationHost {
   /** The webview's localStorage, or undefined where it is unavailable. */
-  storage: Pick<Storage, "getItem" | "setItem" | "key" | "length"> | undefined;
+  storage: Pick<Storage, "getItem" | "setItem" | "removeItem" | "key" | "length"> | undefined;
   /** The desktop runtime's native stores; undefined in the browser build. */
   native?: {
     /**
@@ -91,24 +103,30 @@ async function resolveShortcutDefault(host: ShortcutDefaultMigrationHost): Promi
     }
     if (isKeybindingScheme(preferences.shortcutScheme)) {
       mirrorCache(host.storage, preferences.shortcutScheme, preferences);
+      clearPendingFreshInstall(host.storage);
       return { kind: "already-set", scheme: preferences.shortcutScheme };
     }
   }
 
   const cached = readCache(host.storage);
   if (cached.scheme) {
+    clearPendingFreshInstall(host.storage);
     if (!host.native) return { kind: "already-set", scheme: cached.scheme };
     await writeNative(host, cached.scheme);
     return { kind: "kept-stored-choice", scheme: cached.scheme };
   }
 
-  const existing = cached.present || hasChemDraftStorage(host.storage) || Object.keys(preferences).length > 0
-    || await hasToolbarLayout(host);
+  // Only fallback launches have run since nothing showed an existing install: what they wrote
+  // (toolbar layout, other settings) is not evidence of one.
+  const existing = !hasPendingFreshInstall(host.storage) && (cached.present || hasChemDraftStorage(host.storage)
+    || Object.keys(preferences).length > 0 || await hasToolbarLayout(host));
   const scheme = existing ? LEGACY_DEFAULT_KEYBINDING_SCHEME : DEFAULT_KEYBINDING_SETTINGS.scheme;
-  if (host.native) await writeNative(host, scheme);
+  const written = host.native ? await writeNative(host, scheme) : false;
   // Mirror into the webview cache the way updateShortcutPreference does, so every window's first
   // render agrees, and so a failed native write is finished from the cache on the next launch.
   mirrorCache(host.storage, scheme, preferences, cached);
+  // The marker goes once the scheme is stored somewhere a later launch reads first.
+  if (written || readCache(host.storage).scheme === scheme) clearPendingFreshInstall(host.storage);
   return { kind: existing ? "existing-install" : "fresh-install", scheme };
 }
 
@@ -121,13 +139,41 @@ async function unreadablePreferences(host: ShortcutDefaultMigrationHost, error: 
   // The cache mirrors the native file (or holds an older version's choice): the best evidence left.
   if (cached.scheme) return { kind: "preferences-unreadable", scheme: cached.scheme };
   const scheme = LEGACY_DEFAULT_KEYBINDING_SCHEME;
-  const existing = isUnparsablePreferences(error) || cached.present || hasChemDraftStorage(host.storage)
-    || await hasToolbarLayout(host);
+  // An earlier fallback launch found no evidence; whatever exists now, it wrote.
+  const pendingFresh = hasPendingFreshInstall(host.storage);
+  const existing = !pendingFresh && (isUnparsablePreferences(error) || cached.present || hasChemDraftStorage(host.storage)
+    || await hasToolbarLayout(host));
   // Proven existing: keep the legacy scheme in the cache, where the next launch that can read the
   // file copies it over (as for an older version's choice). Not proven either way: this launch
-  // only, so the next launch classifies the install from its real evidence.
+  // only, and the marker tells the next launch that what this one writes is no evidence.
   if (existing) mirrorCache(host.storage, scheme, {}, cached);
+  else if (!pendingFresh) markPendingFreshInstall(host.storage);
   return { kind: "preferences-unreadable", scheme };
+}
+
+function hasPendingFreshInstall(storage: ShortcutDefaultMigrationHost["storage"]): boolean {
+  try {
+    return storage?.getItem(PENDING_FRESH_INSTALL_KEY) != null;
+  } catch {
+    return false;
+  }
+}
+
+function markPendingFreshInstall(storage: ShortcutDefaultMigrationHost["storage"]): void {
+  try {
+    storage?.setItem(PENDING_FRESH_INSTALL_KEY, "1");
+  } catch {
+    // Without the marker the next launch counts this one's writes as an existing install: the
+    // old scheme, the safe side.
+  }
+}
+
+function clearPendingFreshInstall(storage: ShortcutDefaultMigrationHost["storage"]): void {
+  try {
+    if (storage?.getItem(PENDING_FRESH_INSTALL_KEY) != null) storage?.removeItem(PENDING_FRESH_INSTALL_KEY);
+  } catch {
+    // A marker left behind only matters while no scheme is stored; one is stored by now.
+  }
 }
 
 /** serde_json's Display for a parse error ends in "at line L column C"; I/O errors never do. */
@@ -178,11 +224,13 @@ async function defaultHost(): Promise<ShortcutDefaultMigrationHost> {
   };
 }
 
-async function writeNative(host: ShortcutDefaultMigrationHost, scheme: KeybindingScheme): Promise<void> {
+async function writeNative(host: ShortcutDefaultMigrationHost, scheme: KeybindingScheme): Promise<boolean> {
   try {
     await host.native?.writeScheme(scheme);
+    return true;
   } catch (error) {
     console.error("Could not save the shortcut scheme", error);
+    return false;
   }
 }
 
@@ -234,7 +282,8 @@ function mirrorCache(
 function hasChemDraftStorage(storage: ShortcutDefaultMigrationHost["storage"]): boolean {
   try {
     for (let index = 0; index < (storage?.length ?? 0); index += 1) {
-      if (storage?.key(index)?.startsWith("chemdraft.")) return true;
+      const key = storage?.key(index);
+      if (key?.startsWith("chemdraft.") && key !== PENDING_FRESH_INSTALL_KEY) return true;
     }
   } catch {
     // Unreadable storage is no evidence either way.

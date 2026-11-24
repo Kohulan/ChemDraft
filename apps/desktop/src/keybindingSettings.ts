@@ -56,8 +56,31 @@ export function setLaunchKeybindingScheme(scheme: KeybindingScheme | undefined):
   launchScheme = scheme;
 }
 
+/**
+ * The scheme this webview uses when the cache holds none. Every reader goes through it.
+ *
+ * Only the document window runs shortcutDefaultMigration.ts, so only it may pick the new default,
+ * and only for a proven fresh install, which it then writes to the native file and mirrors into
+ * the cache. Every other window (palettes, popovers, Preferences, dialogs: the ?window= routes
+ * App.tsx and main.tsx tell apart) loads on its own, without the document window's in-memory
+ * launch scheme, and must never pick the new default by itself: finding no scheme in the cache
+ * (storage unavailable, a write that failed), it uses the old default, the conservative choice.
+ */
+export function fallbackKeybindingScheme(): KeybindingScheme {
+  if (launchScheme) return launchScheme;
+  return isDocumentWindow() ? DEFAULT_KEYBINDING_SETTINGS.scheme : LEGACY_DEFAULT_KEYBINDING_SCHEME;
+}
+
+function isDocumentWindow(): boolean {
+  try {
+    return !new URLSearchParams(globalThis.location?.search ?? "").has("window");
+  } catch {
+    return false;
+  }
+}
+
 export function loadKeybindingSettings(): KeybindingSettings {
-  const fallback = launchScheme ?? DEFAULT_KEYBINDING_SETTINGS.scheme;
+  const fallback = fallbackKeybindingScheme();
   try {
     const raw = globalThis.localStorage?.getItem(KEYBINDING_STORAGE_KEY);
     const parsed = raw ? (JSON.parse(raw) as Partial<KeybindingSettings> | null) : null;
@@ -70,7 +93,7 @@ export function loadKeybindingSettings(): KeybindingSettings {
   } catch {
     // Corrupt/blocked storage — fall back to the default.
   }
-  return launchScheme ? { scheme: launchScheme } : DEFAULT_KEYBINDING_SETTINGS;
+  return fallback === DEFAULT_KEYBINDING_SETTINGS.scheme ? DEFAULT_KEYBINDING_SETTINGS : { scheme: fallback };
 }
 
 export function saveKeybindingSettings(settings: KeybindingSettings): void {
