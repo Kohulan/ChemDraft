@@ -50,6 +50,7 @@ import { planMoleculeAtomLabels } from "@chemdraft/layout-engine";
 import { atomImplicitHydrogenCount, nativeBondOrderResolution, nativeElementFromAtomLabel } from "@chemdraft/layout-engine";
 import { sha256Hex, utf8Bytes, utf8String } from "./sha256";
 import { PROPS } from "./cdxTags";
+import { cdxmlLimits } from "./cdxmlLimits";
 import { equalPrintMargins, fitPageSetup, importPageSetup, pagePrintMargins, type VisiblePageSetup } from "./pageSetup";
 import {
   CDX_NATIVE_ENVELOPE_ATTRIBUTE,
@@ -352,34 +353,6 @@ interface CdxmlColorTable {
 }
 
 /**
- * Import cap on the color table. CDX color indices are 16-bit and the table starts at index 2, so
- * nothing ChemDraw writes lists more than 65,534 colors, and export writes no index past 65535; a
- * crafted file that does is cut to the cap with one warning. Every entry is an index and a
- * normalized "#rrggbb" color, at most 18 characters of native JSON, so this also caps characters.
- */
-const CDXML_COLOR_TABLE_LIMIT = 65_534;
-/**
- * Document-wide budget, in entries, for the whole color-table copies imported texts and graphics
- * store (cdxmlTextColorTable / cdxmlGraphicColorTable). Each such object used to store the whole
- * table, so a crafted file of many colors and many texts saved (colors x texts) of native JSON on
- * autosave. The first object always stores the whole table, and so does every later one while the
- * budget lasts (about 1.2 MB of native JSON at most); past it an object stores only the colors its
- * own attributes and runs refer to. Export merges every object's table by index, so the first
- * object still supplies the rest and the saved color table is unchanged. An ordinary document (8 to
- * a few dozen colors) shares whole copies across thousands of objects, as before.
- */
-const CDXML_OBJECT_COLOR_TABLE_COPY_LIMIT = 65_536;
-
-/**
- * Import caps for the font table and for one caption's runs. CDX font ids and styled-text run
- * offsets are 16-bit (export writes no font id at or above 65535), so nothing ChemDraw writes
- * exceeds these; a crafted file that does is cut to the cap with a warning rather than hanging the
- * import (AGENTS.md §13).
- */
-const CDXML_FONT_TABLE_LIMIT = 65_535;
-/** Font ids export may write are below this (CDX font ids are 16-bit; 65535 is reserved). */
-const CDXML_FONT_ID_LIMIT = 65_535;
-/**
  * Import cap on one font entry. Every caption keeps the fonts its runs name (and its own style
  * names its font again), so an unbounded font name was copied into every caption's saved state:
  * a 331 KB crafted file of 4,000 captions over one long name saved ~48.7 MB of native JSON
@@ -392,32 +365,6 @@ const CDXML_FONT_ID_LIMIT = 65_535;
  */
 const CDXML_FONT_NAME_LIMIT = 256;
 const CDXML_FONT_ENTRY_LIMIT = 512;
-const CDXML_CAPTION_RUN_LIMIT = 65_535;
-/**
- * Document-wide cap on the caption runs whose fonts are resolved on import and on export (2^18).
- * The per-caption cap alone still let a crafted file stack thousands of capped captions. Real
- * documents stay far below it: the largest local CDXML documents (up to ~1 MB) hold under 1,000
- * styled runs in total, so this is over 250 times that and four maximal captions' worth. Captions
- * past it keep their text and run styles as plain styled text, with one warning.
- */
-const CDXML_DOCUMENT_CAPTION_RUN_LIMIT = 262_144;
-/**
- * Every imported caption carries the font table its runs were written against, so a later save
- * can rebuild the CDXML font table. Saving a copy of the whole table on every caption is
- * quadratic in a crafted file's size (1,000 captions over 1,000 fonts, 160 KB, saved as a 70 MB
- * payload), so after the first caption the whole table is shared only while the copies total at
- * most this many entries (2^14); later captions keep just the fonts their own runs name. Real
- * documents (at most a few fonts across a few hundred captions) stay far below it, so what they
- * save is unchanged.
- */
-const CDXML_TEXT_FONT_TABLE_COPY_LIMIT = 16_384;
-/**
- * The same budget in characters (2^20), since entries differ in size: sharing stops at whichever
- * runs out first, so shared copies add at most ~1 MB to the native payload whatever the table
- * holds. An ordinary document (a few fonts of ~50 characters over a few hundred captions) uses
- * under a tenth of it.
- */
-const CDXML_TEXT_FONT_TABLE_COPY_CHAR_LIMIT = 1_048_576;
 
 /** The imported font table, indexed by id (the first entry wins, as a linear search did). */
 interface CdxmlImportFonts {
@@ -490,15 +437,15 @@ function cdxmlFontEntryTooLongWarning(prefix: string, noun: string, labels: read
 
 function importCdxmlFonts(tree: OrderedXmlTree, sourceFormat: string, warnings: CompatibilityConversionWarning[]): CdxmlImportFonts {
   const listed = findElements(tree, "fonttable").flatMap(table => childElements(table, "font").map(font => font.attributes));
-  if (listed.length > CDXML_FONT_TABLE_LIMIT) {
+  if (listed.length > cdxmlLimits.fontTable) {
     warnings.push(warning("cdxml.font_table_truncated", `${sourceFormat} import: the font table lists ${listed.length} fonts, ` +
-      `more than the ${CDXML_FONT_TABLE_LIMIT} supported; only the first ${CDXML_FONT_TABLE_LIMIT} were imported, ` +
+      `more than the ${cdxmlLimits.fontTable} supported; only the first ${cdxmlLimits.fontTable} were imported, ` +
       "and text set in a later font keeps the default font."));
   }
   const usable: CdxmlFont[] = [];
   const oversized: string[] = [];
   let tableChars = 0;
-  for (const font of listed.slice(0, CDXML_FONT_TABLE_LIMIT)) {
+  for (const font of listed.slice(0, cdxmlLimits.fontTable)) {
     const chars = cdxmlFontEntryChars(font);
     if (cdxmlFontEntryTooLong(font, chars)) {
       oversized.push(cdxmlFontIdLabel(font.id));
@@ -1066,7 +1013,7 @@ function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityCo
     countCdxmlFontEntries(source.length);
     for (const entry of source) {
       const font = preservedCurveAttributes(entry);
-      if (!/^\d+$/.test(font.id ?? "") || Number(font.id) >= CDXML_FONT_ID_LIMIT) continue;
+      if (!/^\d+$/.test(font.id ?? "") || Number(font.id) >= cdxmlLimits.fontId) continue;
       if (cdxmlFontEntryTooLong(font)) {
         if (!tooLongIds.has(font.id)) { tooLongIds.add(font.id); tooLong.push(`font ${font.id}`); }
         continue;
@@ -1091,7 +1038,7 @@ function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityCo
     } else if (object.type === "text" && object.compatibility?.unknown.sourceCdxmlAttributes) {
       const spans = textObjectSpansForRendering(object);
       // Past the document-wide cap a caption is written as plain styled text (exportTextObject).
-      if (captionRunLimitReached || captionRuns + spans.length > CDXML_DOCUMENT_CAPTION_RUN_LIMIT) {
+      if (captionRunLimitReached || captionRuns + spans.length > cdxmlLimits.documentCaptionRuns) {
         captionRunLimitReached = true;
         plainCaptionIds.add(object.id);
         continue;
@@ -1107,15 +1054,15 @@ function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityCo
         if (!nameTooLong) { nameTooLong = true; tooLong.push(`the font of ${object.type} ${object.id}`); }
         continue;
       }
-      while (nextId < CDXML_FONT_ID_LIMIT && (fonts.has(String(nextId)) || tooLongIds.has(String(nextId)))) nextId++;
+      while (nextId < cdxmlLimits.fontId && (fonts.has(String(nextId)) || tooLongIds.has(String(nextId)))) nextId++;
       // No supported id left: the font is not registered, so a caption set in it is written as
       // plain styled text (exportTextObject's fallback, with its own warning) and a table falls
       // back to the default font. Writing an id past the limit would lose the font on reopen.
-      if (nextId >= CDXML_FONT_ID_LIMIT || fonts.size >= CDXML_FONT_TABLE_LIMIT) {
+      if (nextId >= cdxmlLimits.fontId || fonts.size >= cdxmlLimits.fontTable) {
         if (!tableFullWarned) {
           tableFullWarned = true;
           warnings.push({ code: "cdxml.font_table_full", sourceObjectId: object.id,
-            message: `CDXML export: the font table is full (font ids below ${CDXML_FONT_ID_LIMIT}); from ${object.type} ${object.id} on, ` +
+            message: `CDXML export: the font table is full (font ids below ${cdxmlLimits.fontId}); from ${object.type} ${object.id} on, ` +
               "fonts not already in it were not written, and text set in them was written without its caption frame and run fonts, or in the default font." });
         }
         continue;
@@ -2544,7 +2491,7 @@ function exportTextObject(text: TextObject, context: VisibleExportContext, alloc
     if (!fonts.captionRunLimitWarned) {
       fonts.captionRunLimitWarned = true;
       warnings.push({ code: "cdxml.document_caption_runs_limited", sourceObjectId: text.id,
-        message: `${format} export: the captions in this document have more than ${CDXML_DOCUMENT_CAPTION_RUN_LIMIT} styled runs ` +
+        message: `${format} export: the captions in this document have more than ${cdxmlLimits.documentCaptionRuns} styled runs ` +
           `in total; from text ${text.id} on, captions past that total were written as plain styled text, without their caption frame and run fonts.` });
     }
     return undefined;
@@ -5448,8 +5395,8 @@ function importText(textElement: XmlElementView, pageIndex: number, objectIndex:
 // source runs refer to, and the first text still lists the rest.
 function textFontTable(element: XmlElementView, context: ImportPageContext): readonly CdxmlFont[] {
   const { table, byId, usage, tableChars } = context.fonts;
-  if (!usage.fontTableEntries || (usage.fontTableEntries + table.length <= CDXML_TEXT_FONT_TABLE_COPY_LIMIT &&
-      usage.fontTableChars + tableChars <= CDXML_TEXT_FONT_TABLE_COPY_CHAR_LIMIT)) {
+  if (!usage.fontTableEntries || (usage.fontTableEntries + table.length <= cdxmlLimits.textFontTableCopies &&
+      usage.fontTableChars + tableChars <= cdxmlLimits.textFontTableCopyChars)) {
     usage.fontTableEntries += table.length;
     usage.fontTableChars += tableChars;
     return table;
@@ -5472,20 +5419,20 @@ function restoreFramedCaption(object: TextObject, element: XmlElementView, conte
   const alignments: Record<string, string> = { Center: "center", Right: "right", Left: "left", Full: "justify" };
   const align = alignments[a.Justification ?? "Left"];
   const runs = childElements(element, "s");
-  if (runs.length > CDXML_CAPTION_RUN_LIMIT) {
+  if (runs.length > cdxmlLimits.captionRuns) {
     context.warnings.push({ code: "cdxml.text_runs_truncated", sourceObjectId: object.id,
       message: `${context.sourceFormat} import: text ${a.id ?? object.id} has ${runs.length} styled runs, more than the ` +
-        `${CDXML_CAPTION_RUN_LIMIT} supported; its caption frame and run fonts were not restored, and it was imported as plain styled text.` });
+        `${cdxmlLimits.captionRuns} supported; its caption frame and run fonts were not restored, and it was imported as plain styled text.` });
     return;
   }
   if ((!box && a.BoundingBox !== undefined) || !parseCdxmlXyPoint(a.p) || !align || !runs.length || runs.length !== object.spans.length ||
       Object.keys(a).some(k => !["id", "p", "BoundingBox", "Justification", "color"].includes(k))) return;
   const usage = context.fonts.usage;
-  if (usage.captionRunLimitReached || usage.captionRuns + runs.length > CDXML_DOCUMENT_CAPTION_RUN_LIMIT) {
+  if (usage.captionRunLimitReached || usage.captionRuns + runs.length > cdxmlLimits.documentCaptionRuns) {
     if (!usage.captionRunLimitReached) {
       usage.captionRunLimitReached = true;
       context.warnings.push({ code: "cdxml.document_caption_runs_limited", sourceObjectId: object.id,
-        message: `${context.sourceFormat} import: the captions in this document have more than ${CDXML_DOCUMENT_CAPTION_RUN_LIMIT} styled runs ` +
+        message: `${context.sourceFormat} import: the captions in this document have more than ${cdxmlLimits.documentCaptionRuns} styled runs ` +
           `in total; from text ${a.id ?? object.id} on, captions past that total were imported as plain styled text, without their caption frame and run fonts.` });
     }
     // Saving writes it as plain styled text too, not its unchanged source frame and fonts.
@@ -6833,13 +6780,13 @@ function importCdxmlColorTable(tree: OrderedXmlTree, sourceFormat: string, warni
     [1, "#ffffff"]
   ]);
   const colorElements = childElements(findElements(tree, "colortable")[0] ?? { name: "colortable", attributes: {}, children: [] }, "color");
-  if (colorElements.length > CDXML_COLOR_TABLE_LIMIT) {
+  if (colorElements.length > cdxmlLimits.colorTable) {
     warnings.push(warning("cdxml.color_table_truncated", `${sourceFormat} import: the color table lists ${colorElements.length} colors, ` +
-      `more than the ${CDXML_COLOR_TABLE_LIMIT} supported (color indices are 16-bit); only the first ${CDXML_COLOR_TABLE_LIMIT} were imported, ` +
+      `more than the ${cdxmlLimits.colorTable} supported (color indices are 16-bit); only the first ${cdxmlLimits.colorTable} were imported, ` +
       "and an object colored by a later index takes the default or inherited color."));
   }
   const colors = colorElements.length > 0
-    ? colorElements.slice(0, CDXML_COLOR_TABLE_LIMIT).map((element) => rgbToHexColor(
+    ? colorElements.slice(0, cdxmlLimits.colorTable).map((element) => rgbToHexColor(
         colorComponentFromCdxml(element.attributes.r),
         colorComponentFromCdxml(element.attributes.g),
         colorComponentFromCdxml(element.attributes.b)
@@ -6853,11 +6800,11 @@ function importCdxmlColorTable(tree: OrderedXmlTree, sourceFormat: string, warni
 
 // The color table an imported text or graphic stores: the whole table (one shared record) for the
 // first object and while the document's copy budget lasts, then only the colors this element's own
-// attributes (and its runs' attributes) refer to. See CDXML_OBJECT_COLOR_TABLE_COPY_LIMIT.
+// attributes (and its runs' attributes) refer to. See cdxmlLimits.objectColorTableCopies.
 function objectCdxmlColorTable(element: XmlElementView, colorTable: CdxmlColorTable): Readonly<Record<string, string>> {
   const copies = colorTable.copies ??= { entries: 0 };
   const size = colorTable.colorByIndex.size;
-  if (!copies.entries || copies.entries + size <= CDXML_OBJECT_COLOR_TABLE_COPY_LIMIT) {
+  if (!copies.entries || copies.entries + size <= cdxmlLimits.objectColorTableCopies) {
     copies.entries += size;
     return copies.shared ??= Object.fromEntries(colorTable.colorByIndex);
   }

@@ -1,12 +1,20 @@
 import { describe, expect, it } from "vitest";
 import { createEmptyDocument, serializeDocument, type TextObject } from "@chemdraft/chem-core";
 import { exportDocumentToCdxml, openChemDraftPayload } from "./index";
+import { defaultCdxmlLimits, withCdxmlLimitsForTesting } from "./cdxmlLimits";
 
 // Codex security finding (#442), follow-up to the caption font-byte cap: every imported text and
 // graphic stored its own copy of the file's whole color table (cdxmlTextColorTable /
 // cdxmlGraphicColorTable), and the table had no size limit, so a crafted file of many colors and
 // many texts saved (colors x texts) of native JSON on autosave. Sizes are measured in characters
 // and entries, never timed.
+//
+// Fixtures are small: the copy budget is lowered from 65,536 to 2,048 entries (and the table cap
+// from 65,534 to 100 colors where a test must cross it), so a few hundred texts exercise what
+// thousands did at the production values, which are pinned below. Long synchronous loops over
+// 8,000-text fixtures blocked the vitest worker on Windows CI ("Timeout calling onTaskUpdate").
+const BUDGET = 2_048;
+const lowBudget = <T>(run: () => T) => withCdxmlLimitsForTesting({ objectColorTableCopies: BUDGET }, run);
 
 const plain = { embedNativePayload: false };
 const textsOf = (opened: ReturnType<typeof openChemDraftPayload>) =>
@@ -27,22 +35,32 @@ const storedColorEntries = (objects: readonly { compatibility?: { unknown: Recor
     object.compatibility?.unknown.cdxmlGraphicColorTable ?? {}) as object).length, 0);
 
 describe("CDXML color table bytes (#442)", () => {
+  it("pins the production color caps", () => {
+    expect(defaultCdxmlLimits).toMatchObject({ colorTable: 65_534, objectColorTableCopies: 65_536 });
+  });
+
   it("bounds the whole-table copies of a crafted file of many colors and many texts, so native JSON grows linearly", () => {
-    const colors = 4_000;
-    const sizes = [2_000, 4_000, 8_000].map(texts => {
+    // 200 colors: the 2,048-entry budget holds 10 whole copies, as 65,536 held 16 of a 4,000-color table.
+    const colors = 200;
+    const sizes = [250, 500, 1_000].map(texts => {
       const source = crafted(colors, texts);
-      const { opened, chars } = nativeJsonChars(source);
+      const { opened, chars } = lowBudget(() => nativeJsonChars(source));
       const texts_ = textsOf(opened);
       expect(texts_).toHaveLength(texts);
-      // Before the budget every text stored all 4,002 entries: 8,000 texts held 32 million entries (~580 MB of JSON).
+      // Without the budget every text stored all 202 entries (at production sizes, 8,000 texts held 32 million entries, ~580 MB of JSON).
       const entries = storedColorEntries(texts_);
-      // Whole copies stop at the 65,536-entry budget; every later text stores the one color its run uses.
-      expect(entries).toBeLessThanOrEqual(65_536 + colors + texts);
+      // Whole copies stop at the budget; every later text stores the one color its run uses.
+      expect(entries).toBeLessThanOrEqual(BUDGET + colors + texts);
       // The first text still stores the whole table, so export can restore every source index.
       expect(Object.keys(texts_[0].compatibility!.unknown.cdxmlTextColorTable as object)).toHaveLength(colors + 2);
       expect(texts_.at(-1)!.compatibility!.unknown.cdxmlTextColorTable).toEqual({ [2 + ((texts - 1) % colors)]: expect.any(String) });
-      // Stated linear bound: at most 1.3 MB of shared whole-table copies plus 10 characters of native JSON per source character.
-      expect(chars).toBeLessThan(1_300_000 + 10 * source.length);
+      // Stated linear bound: shared whole-table copies of at most 20 characters per budgeted entry
+      // (1.3 MB at the production budget) plus 15 characters of native JSON per source character.
+      // (At production sizes the bound was 10 per source character, but there the 4,000-color source
+      // table itself added ~140 KB of source; with this 200-color table a one-run text costs about
+      // 12 native characters per source character, so 15 is the same bound without that slack. Without
+      // the budget, 1,000 texts store ~4.5 MB here, far past it.)
+      expect(chars).toBeLessThan(20 * BUDGET + 15 * source.length);
       // Colors are kept: each text's run takes its source color.
       expect(texts_[5].spans[0].style.color).toBe("#050080");
       return chars;
@@ -54,13 +72,14 @@ describe("CDXML color table bytes (#442)", () => {
   });
 
   it("saves a crafted file's source colors at their indices once, even after the budget runs out", () => {
-    const source = crafted(4_000, 4_000);
-    const opened = openChemDraftPayload(source);
+    const source = crafted(200, 500);
+    const opened = lowBudget(() => openChemDraftPayload(source));
+    expect(Object.keys(textsOf(opened).at(-1)!.compatibility!.unknown.cdxmlTextColorTable as object)).toHaveLength(1);
     const saved = exportDocumentToCdxml(opened.document!, plain);
     const written = saved.contents.match(/<colortable>([\s\S]*?)<\/colortable>/)![1].match(/<color /g)!;
-    // The source table (4,000 entries) is written once, not grown, plus the eight standard colors export
+    // The source table (200 entries) is written once, not grown, plus the eight standard colors export
     // always appends when the source table lacks them; no color-table conflicts are reported.
-    expect(written.length).toBe(4_008);
+    expect(written.length).toBe(208);
     expect(saved.warnings.map(w => w.code)).not.toContain("cdxml.text_color_table_conflict");
     // The last text (past the budget, storing only its own color) keeps its color index and color on reopen.
     const again = openChemDraftPayload(saved.contents);
@@ -68,19 +87,21 @@ describe("CDXML color table bytes (#442)", () => {
     expect(textsOf(again).map(text => text.spans[0].style.color)).toEqual(textsOf(opened).map(text => text.spans[0].style.color));
   });
 
-  it("cuts a color table past the 16-bit index limit to 65,534 colors, with one warning", () => {
-    const source = `<CDXML><colortable>${"<color/>".repeat(70_000)}</colortable><page>` +
+  // The cap (65,534 colors, from 16-bit indices) is lowered to 100, and the copy budget to 102 entries,
+  // exactly one whole table, as 65,536 is at the production cap.
+  it("cuts a color table past the 16-bit index limit to the cap, with one warning", () => {
+    const source = `<CDXML><colortable>${"<color/>".repeat(110)}</colortable><page>` +
       `${Array.from({ length: 200 }, (_, i) => `<t id="${i + 10}" p="30 ${72 + i}"><s size="10" face="0" color="3">x</s></t>`).join("")}</page></CDXML>`;
-    const { opened, chars } = nativeJsonChars(source);
+    const { opened, chars } = withCdxmlLimitsForTesting({ colorTable: 100, objectColorTableCopies: 102 }, () => nativeJsonChars(source));
     expect(opened.warnings.filter(w => w.code === "cdxml.color_table_truncated").map(w => w.message)).toEqual([
-      "CDXML import: the color table lists 70000 colors, more than the 65534 supported (color indices are 16-bit); only the first 65534 were imported, and an object colored by a later index takes the default or inherited color."
+      "CDXML import: the color table lists 110 colors, more than the 100 supported (color indices are 16-bit); only the first 100 were imported, and an object colored by a later index takes the default or inherited color."
     ]);
     const texts = textsOf(opened);
     expect(texts).toHaveLength(200);
-    expect(Object.keys(texts[0].compatibility!.unknown.cdxmlTextColorTable as object)).toHaveLength(65_536);
-    // One whole copy (65,536 entries), then the one color each later text uses: under 1.3 MB plus 2 KB per text.
-    expect(storedColorEntries(texts)).toBe(65_536 + 199);
-    expect(chars).toBeLessThan(1_300_000 + 200 * 2_000);
+    expect(Object.keys(texts[0].compatibility!.unknown.cdxmlTextColorTable as object)).toHaveLength(102);
+    // One whole copy (102 entries), then the one color each later text uses: 20 characters per entry plus 2 KB per text.
+    expect(storedColorEntries(texts)).toBe(102 + 199);
+    expect(chars).toBeLessThan(20 * 102 + 200 * 2_000);
   });
 
   // A real-looking document (a ChemDraw-style 10-color table, a few colored texts and a colored
@@ -122,10 +143,11 @@ describe("CDXML color table bytes (#442)", () => {
   });
 
   it("writes the same CDXML whether later objects store the whole table or only the colors they use", () => {
-    // 7,000 texts over a 12-entry table spend the 65,536-entry budget at text 5,462; the rest store only their own colors.
-    const body = Array.from({ length: 7_000 }, (_, i) => coloredText(i + 10, 2 + (i % 10), 72 + i)).join("");
+    // 300 texts over a 12-entry table spend the 2,048-entry budget at text 171 (at the production budget,
+    // 7,000 texts spent it at text 5,462); the rest store only their own colors.
+    const body = Array.from({ length: 300 }, (_, i) => coloredText(i + 10, 2 + (i % 10), 72 + i)).join("");
     const source = realLooking.replace("</page>", `${body}</page>`);
-    const opened = openChemDraftPayload(source);
+    const opened = lowBudget(() => openChemDraftPayload(source));
     const texts = textsOf(opened);
     expect(Object.keys(texts.at(-1)!.compatibility!.unknown.cdxmlTextColorTable as object)).toHaveLength(1);
     const saved = exportDocumentToCdxml(opened.document!, plain).contents;
