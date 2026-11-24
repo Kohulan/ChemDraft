@@ -1104,8 +1104,10 @@ struct NativeMenuNeedsRebuild(AtomicBool);
 )]
 #[serde(rename_all = "lowercase")]
 enum KeybindingScheme {
-    #[default]
     ChemDraft,
+    /// The industry-standard scheme, the default for new installs since 1.2.3. The native menu is
+    /// built with it until the document window pushes the stored scheme (`set_keybinding_scheme`).
+    #[default]
     ChemDraw,
 }
 
@@ -12584,6 +12586,20 @@ fn find_menu_item_by_id<R: Runtime>(
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn keybinding_scheme_defaults_to_the_industry_standard_scheme() {
+        assert_eq!(KeybindingScheme::default(), KeybindingScheme::ChemDraw);
+        let state = KeybindingSchemeState::default();
+        assert_eq!(*state.0.lock().unwrap(), KeybindingScheme::ChemDraw);
+        assert_eq!(KeybindingScheme::default().rulers(), "CmdOrCtrl+;");
+        // An explicit scheme in the preferences file still wins, and none stored stays None.
+        let stored: DesktopPreferences =
+            serde_json::from_value(serde_json::json!({ "shortcutScheme": "chemdraft" })).unwrap();
+        assert_eq!(stored.shortcut_scheme, Some(KeybindingScheme::ChemDraft));
+        let empty: DesktopPreferences = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(empty.shortcut_scheme, None);
+    }
 
     #[test]
     fn desktop_preferences_persist_shortcut_schemes_independently() {

@@ -1853,7 +1853,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.23.23.06-opus";
+const CURRENT_BUILD_STAMP = "11.24.07.02-opus";
 
 /**
  * The commit funnel's chemistry check (AGENTS.md section 7, `commitChemistryGuard.ts`). `before`
@@ -3094,6 +3094,8 @@ export function MainWindow({
   const fileStateRef = useRef<NativeFileState>(fileState);
   // Successful explicit saves, per tab, including a save completed while its label editor is open.
   const documentSaveRevisionsRef = useRef(new Map<string, number>());
+  // Tabs saved at least once, to a desktop path or as a browser download (which leaves no path).
+  const savedOnceTabsRef = useRef(new Set<string>());
   // Keep the actual saved contents: open drafts can be saved without ending their history session.
   const savedDocumentsRef = useRef(new Map<string, ChemDraftDocument>());
   // Capture once: Preferences changes affect the next launch, never this run.
@@ -10435,6 +10437,34 @@ export function MainWindow({
         }
         return;
       }
+      // Undo took the sample out and nothing was drawn since: the tab is still the original blank
+      // entry, so put the sample back there rather than opening another Tour tab. A tab with any
+      // other history holds the user's edits and is never reset: that includes redo history beyond
+      // the sample itself (installing the sample clears it), and a tab ever saved, to a file or as a
+      // browser download (the restored sample would be marked clean against a copy that does not
+      // hold it). A browser download leaves no path, so saves are tracked per tab, not by path.
+      const active = practice.tabId === activeDocumentTabIdRef.current;
+      const snapshot = active ? undefined : documentTabSnapshotsRef.current.get(practice.tabId);
+      const history = active ? documentHistoryRef.current : snapshot?.history;
+      const filePath = active ? fileStateRef.current.path : snapshot?.file.path;
+      if (history && documentTabsRef.current.some(tab => tab.id === practice.tabId)
+        && !savedOnceTabsRef.current.has(practice.tabId) && !filePath
+        && history.past.length === 0 && history.present.pages.every(page => page.objects.length === 0)
+        && (history.future.length === 0 || (history.future.length === 1
+          && findDocumentObject(history.future[0], practice.moleculeId)?.type === "molecule"))) {
+        const restored = buildTourSample(history.present);
+        activateDocumentTab(practice.tabId);
+        if (activeDocumentTabIdRef.current !== practice.tabId) throw new Error("Could not switch to the tour drawing.");
+        const present = prepareDocumentCommit(restored.document, restored.label);
+        installDocumentHistory({ past: [documentRef.current], present, future: [] });
+        savedDocumentsRef.current.set(practice.tabId, present);
+        // Undo marked the tab dirty; with the sample back it matches its baseline again.
+        fileStateRef.current = { ...fileStateRef.current, dirty: false };
+        setFileState(fileStateRef.current);
+        tourSampleRef.current = { tabId: practice.tabId, moleculeId: present.selection.objectIds[0] };
+        setStatus("Tour drawing opened");
+        return;
+      }
     }
     const blank = createPhase4Document("Tour");
     const sample = buildTourSample(blank);
@@ -10477,6 +10507,7 @@ export function MainWindow({
     importedPageFitGateRef.current.dismiss(id);
     documentTabSnapshotsRef.current.delete(id);
     savedDocumentsRef.current.delete(id);
+    savedOnceTabsRef.current.delete(id);
     nonPristineTabsRef.current.delete(id);
     browserFileKeysRef.current.delete(id);
     documentTabListRef.current?.beforeRemove(remaining);
@@ -11081,7 +11112,12 @@ export function MainWindow({
     };
 
     return listenAndDrainNativeOpenQueue({
-      subscribe: listenForNativeOpenDocuments,
+      // A refused subscription never reaches a drain, so nothing else would clear the startup gate
+      // that holds the first-run tour back; release it and let onError report the failure.
+      subscribe: changed => listenForNativeOpenDocuments(changed).catch(error => {
+        nativeOpenDrainBusyRef.current = false;
+        throw error;
+      }),
       drain: takePendingNativeOpenDocuments,
       consumeBatch: openNativePayloads,
       onDrainActivity: busy => { nativeOpenDrainBusyRef.current = busy; },
@@ -11724,6 +11760,7 @@ export function MainWindow({
     const finishSave = (destination?: { path: string; displayName: string }) => {
       savedDocumentsRef.current.set(savingTabId, savedDocument);
       documentSaveRevisionsRef.current.set(savingTabId, (documentSaveRevisionsRef.current.get(savingTabId) ?? 0) + 1);
+      savedOnceTabsRef.current.add(savingTabId);
       nonPristineTabsRef.current.add(savingTabId);
       const currentDocument = savingTabId === activeDocumentTabIdRef.current ? documentForFlush() :
         documentTabSnapshotsRef.current.get(savingTabId)?.history.present;

@@ -6,6 +6,7 @@ import { createPhase4Document } from "./documentWorkflow";
 import { withStandaloneDrawingToolCommands } from "./drawingTools";
 import { keyboardShortcutActions, nativeMenuShortcutOverrides } from "./customKeyboardShortcuts";
 import { applyKeybindingSchemeToCommands, createHoverShortcutTables } from "./keybindingScheme";
+import { DEFAULT_KEYBINDING_SETTINGS, LEGACY_DEFAULT_KEYBINDING_SCHEME } from "./keybindingSettings";
 import {
   createDesktopShortcutRegistry,
   createMainWindowShortcutCommands,
@@ -71,6 +72,33 @@ describe("document window shortcuts", () => {
     expect(unbound).toEqual([]);
     expect(registry.resolve({ key: ",", ...(platform === "macos" ? { metaKey: true } : { ctrlKey: true }) }))
       .toBe("view.togglePreferences");
+  });
+});
+
+describe.each(["windows", "macos"] as const)("default scheme for new installs (%s)", platform => {
+  // The default only reaches new installs: shortcutDefaultMigration.ts pins existing ones to
+  // LEGACY_DEFAULT_KEYBINDING_SCHEME first. What the default resolves to must hold on both platforms.
+  it("binds the industry-standard keys in the document window", () => {
+    const document = createPhase4Document("Default scheme");
+    const scheme = DEFAULT_KEYBINDING_SETTINGS.scheme;
+    const commands = createMainWindowShortcutCommands({
+      quickActions: createQuickActions(document, undefined, { canUndo: true, canRedo: true }),
+      layerActions: createLayerActions(document),
+      toolCommandSpecs: applyKeybindingSchemeToCommands(
+        withStandaloneDrawingToolCommands(getToolsetCommandSpecs(desktopToolsetRegistry)), scheme)
+    }, scheme, undefined, platform);
+    const registry = createDesktopShortcutRegistry(commands, { platform, includeDisabled: true });
+    expect(registry.resolve({ key: "x" })).toBe("tool.bond");
+    expect(registry.resolve({ key: " " })).toBe("tool.select");
+    expect(registry.resolve({ key: ";", ...(platform === "macos" ? { metaKey: true } : { ctrlKey: true }) }))
+      .toBe("view.toggleRulers");
+    expect(createHoverShortcutTables(scheme).atom.get("b")).toBe("atom.setHoveredElement.Br");
+  });
+
+  it("leaves the old default on ChemDraft's own keys", () => {
+    const legacy = keyboardShortcutActions(LEGACY_DEFAULT_KEYBINDING_SCHEME, platform);
+    expect(legacy.find(action => action.id === "tool.bond")?.defaults).not.toContain("X");
+    expect(createHoverShortcutTables(LEGACY_DEFAULT_KEYBINDING_SCHEME).atom.get("b")).toBe("atom.setHoveredElement.B");
   });
 });
 
