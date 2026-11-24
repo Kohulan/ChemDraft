@@ -320,6 +320,12 @@ check that all three fragments open apart in their drawn arrangement, stay spati
 rotating, and remain apart after flatten, save/reopen and Spin again; Copy As SMILES and formula
 must stay unchanged.
 
+On macOS, Windows and Linux, open Spin 3D on a molecule, then click Clean Up Structure 2D on the
+Main toolbar while the overlay is still up. Click outside the molecule: the status bar says the
+drawing changed, the 3D overlay closes, and the cleaned-up drawing stays. Do it again, but this time
+click Spin 3D a second time instead of clicking outside: Spin 3D starts over on the cleaned-up
+molecule (no "already active" message), and a click outside flattens it.
+
 ## Automatic plugin update notices (macOS and Windows)
 
 On both platforms, launch with an installed official plugin and a check due (no successful plugin

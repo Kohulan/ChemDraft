@@ -1816,6 +1816,8 @@ function interactive3dPostOpenPollingComplete(session: Engine3dWorkspaceSessionS
 let cachedOclAdapter: typeof import("@chemdraft/ocl-adapter") | undefined;
 let spin3dRdkit: RdkitMinimalModule | undefined;
 const spin3dStereoReferences = new WeakMap<MoleculeObject, Spin3dStereoReference>();
+const spin3dDrawingChangedMessage =
+  "Couldn't flatten: the drawing changed while Spin 3D was open. Reopen Spin 3D and try again.";
 
 async function loadSpin3dRdkit(): Promise<RdkitMinimalModule> {
   if (spin3dRdkit) return spin3dRdkit;
@@ -5672,7 +5674,10 @@ export function MainWindow({
   }, [applySpin, document, spin3dState]);
 
   // Flatten the current spin orientation into the document as ONE undo step. On
-  // refusal the document is untouched and the overlay stays so the user can re-spin.
+  // refusal the document is untouched and the overlay stays so the user can re-spin,
+  // except when the molecule itself changed under the session (Clean Up, a style edit,
+  // a plugin write): no orientation of the stale overlay can ever flatten then, so the
+  // session ends and the user reopens Spin 3D on the molecule as it is drawn now.
   const commitSpinFlatten = useCallback(async () => {
     let state = spin3dStateRef.current;
     if (!state) return;
@@ -5703,7 +5708,7 @@ export function MainWindow({
     }
     if (flattenTarget) {
       if (flattenTarget !== state.sourceMolecule) {
-        reportSpin3dError("Couldn't flatten: the drawing changed while Spin 3D was open. Reopen Spin 3D and try again.");
+        cancelSpin3dSession(spin3dDrawingChangedMessage);
         return;
       }
       try {
@@ -5739,7 +5744,7 @@ export function MainWindow({
       // (ended, switched molecule, or cancelled-and-restarted) while we awaited OCL.
       if (spin3dSessionGenerationRef.current !== sessionGeneration) return;
       if (findDocumentObject(documentRef.current, state.objectId) !== flattenTarget) {
-        reportSpin3dError("Couldn't flatten: the drawing changed while Spin 3D was open. Reopen Spin 3D and try again.");
+        cancelSpin3dSession(spin3dDrawingChangedMessage);
         return;
       }
     }
@@ -5828,7 +5833,7 @@ export function MainWindow({
     } catch (error) {
       reportSpin3dError(error instanceof Error ? error.message : String(error));
     }
-  }, [applySpin, commitDocumentChangeWithPageFit, reportSpin3dError]);
+  }, [applySpin, cancelSpin3dSession, commitDocumentChangeWithPageFit, reportSpin3dError]);
 
   // Preload the OCL stereo perceiver once so the synchronous rotate-commit paths can run the
   // read-back guard. Perception depends only on the molecule graph, so a single load serves every
@@ -6018,12 +6023,19 @@ export function MainWindow({
       setStatus(`3D spin unavailable: ${error.message}`);
       return;
     }
-    if (spin3dStateRef.current?.objectId === objectId) {
-      // Button mashed while the overlay is already up — keep the live session.
-      traceInfo("spin.duplicate", { message: "overlay already active" });
-      commandSpan.complete({ message: "already spinning" });
-      setStatus("Spin 3D already active: drag the molecule to rotate · Esc to cancel");
-      return;
+    const activeSpin = spin3dStateRef.current;
+    if (activeSpin?.objectId === objectId) {
+      if (activeSpin.sourceMolecule === molecule) {
+        // Button mashed while the overlay is already up — keep the live session.
+        traceInfo("spin.duplicate", { message: "overlay already active" });
+        commandSpan.complete({ message: "already spinning" });
+        setStatus("Spin 3D already active: drag the molecule to rotate · Esc to cancel");
+        return;
+      }
+      // The molecule changed under the open session, so its overlay shows the old drawing
+      // and can never flatten. Start over on the molecule as it is drawn now.
+      traceInfo("spin.stale", { message: "molecule changed under the open overlay; restarting" });
+      cancelSpin3dSession();
     }
     // A coordination centre has no honest 3D answer here: MMFF refuses metals outright and UFF
     // returns coordination geometry that is not worth having (see the note on
@@ -6372,7 +6384,7 @@ export function MainWindow({
       return;
     }
     await runInPage();
-  }, [applySpin, selectedNativeMoleculePart, spinPlacementFor]);
+  }, [applySpin, cancelSpin3dSession, selectedNativeMoleculePart, spinPlacementFor]);
 
   // Opt-in console mirror of the spin3d trace stream (localStorage flag / ?spin3dlog=1),
   // so the prefetch → cache → embed → overlay timeline is capturable without the debugger
