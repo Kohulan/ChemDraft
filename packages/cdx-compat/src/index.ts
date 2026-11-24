@@ -404,10 +404,16 @@ function cdxmlFontIdLabel(id: unknown): string {
  * crafted or damaged document could carry a font no import would accept. Opening it drops such
  * entries, under the same per-font caps and with the same one warning; the text itself (its style
  * and runs) is untouched, and export applies the caps again (exportCdxmlFonts).
+ *
+ * Once an entry is gone, export no longer knows its id is not written, so an unchanged source text
+ * whose runs name it would be copied out naming a font the saved table does not list (or one a new
+ * font later takes). Such a text is marked cdxmlTextFontOmitted, as import marks a text naming a font
+ * it left out, so export writes it as plain styled text and names it in its one font warning.
  */
 function limitStoredCdxmlFontTables(document: ChemDraftDocument): CompatibilityConversionWarning[] {
   const labels: string[] = [];
   const seen = new Set<string>();
+  const droppedIds = new Set<string>();
   for (const page of document.pages) {
     let changed = false;
     const objects = page.objects.map(object => {
@@ -419,14 +425,35 @@ function limitStoredCdxmlFontTables(document: ChemDraftDocument): CompatibilityC
         if (!isRecord(entry) || !cdxmlFontEntryTooLong(entry)) return true;
         const label = cdxmlFontIdLabel(entry.id);
         if (!seen.has(label)) { seen.add(label); labels.push(label); }
+        if (typeof entry.id === "string") droppedIds.add(entry.id);
         return false;
       });
       return { ...object, compatibility: { ...object.compatibility!, unknown: { ...unknown, cdxmlTextFontTable: kept } } };
     });
     if (changed) page.objects = objects;
   }
+  // Any text's runs may name a dropped id (later texts keep only part of the table and rely on the
+  // first one's), so every text with source XML is checked, as export checks notWrittenIds.
+  if (droppedIds.size) for (const page of document.pages) {
+    page.objects = page.objects.map(object => {
+      const unknown = object.compatibility?.unknown;
+      if (object.type !== "text" || !unknown || unknown.cdxmlTextFontOmitted === true || typeof unknown.cdxmlTextElement !== "string" ||
+          !sourceTextNamesFont(unknown.cdxmlTextElement, droppedIds)) return object;
+      return { ...object, compatibility: { ...object.compatibility!, unknown: { ...unknown, cdxmlTextFontOmitted: true } } };
+    });
+  }
   return labels.length ? [cdxmlFontEntryTooLongWarning("ChemDraft document", "font ", labels,
     "dropped from the text font tables stored in this document, and saving to CDXML or CDX does not write {it}.")] : [];
+}
+
+/** Whether a text's stored source XML has a run naming one of `ids` (export never copies unparsable source). */
+function sourceTextNamesFont(source: string, ids: ReadonlySet<string>): boolean {
+  try {
+    const node = parseCdxml(source).find(node => elementView(node)?.name === "t");
+    return node !== undefined && findElements([node], "s").some(run => run.attributes.font !== undefined && ids.has(run.attributes.font));
+  } catch {
+    return false;
+  }
 }
 
 /**

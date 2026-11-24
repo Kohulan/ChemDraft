@@ -1,5 +1,5 @@
 import { expect, it, vi } from "vitest";
-import { createEmptyDocument, type GraphicObject, type TextObject } from "@chemdraft/chem-core";
+import { createEmptyDocument, serializeDocument, type GraphicObject, type TextObject } from "@chemdraft/chem-core";
 import { exportDocumentToCdxml, openChemDraftPayload } from "./index";
 import {
   cdxmlFontOperationsForTesting, resetCdxmlFontOperationsForTesting,
@@ -439,6 +439,41 @@ it("does not copy an unchanged source text naming a stored font that is too long
   expect(named.every(id => listed.has(id))).toBe(true);
   expect(saved.warnings.filter(w => w.code === "cdxml.font_entry_too_long")).toHaveLength(1);
   expect(textsOf(openChemDraftPayload(saved.contents)).map(text => text.text)).toEqual(["x", "x"]);
+});
+
+// CodeRabbit (#442): opening a native document dropped a stored over-long font entry but left an
+// unchanged source text naming it eligible for copying; the next Save As no longer knew the id was
+// not written, so it copied runs naming a font absent from the table, or one a new font took.
+it("does not copy an unchanged source text whose stored font was dropped on open, with a warning", () => {
+  const source = `<CDXML>${fontTable(7)}<page>${caption(9, 1, 7)}${caption(10, 1, 3, 120)}</page></CDXML>`;
+  const crafted = openChemDraftPayload(source).document!;
+  for (const text of crafted.pages[0].objects.filter((object): object is TextObject => object.type === "text")) {
+    text.compatibility!.unknown.cdxmlTextFontTable = (text.compatibility!.unknown.cdxmlTextFontTable as { id: string }[])
+      .map(font => font.id === "7" ? { ...font, name: "N".repeat(1_000) } : font);
+  }
+  for (const opened of [openChemDraftPayload(serializeDocument(crafted)), openChemDraftPayload(exportDocumentToCdxml(crafted).contents)]) {
+    expect(["legacy-json", "native-payload"]).toContain(opened.source);
+    const [dropped, kept] = textsOf(opened);
+    expect(dropped.compatibility?.unknown.cdxmlTextFontOmitted).toBe(true);
+    expect(kept.compatibility?.unknown.cdxmlTextFontOmitted).toBeUndefined();
+    // A new caption in a new font, ahead of the source texts, takes the first free id: 7, now that nothing reserves it.
+    opened.document!.pages[0].objects.unshift({ type: "text", id: "added", x: 36, y: 200, width: 40, height: 22, rotation: 0, text: "y",
+      style: { fontFamily: "Helvetica", fontSizePx: 16 }, spans: [{ text: "y", script: "normal", style: {} }],
+      compatibility: { warnings: [], unknown: { sourceCdxmlAttributes: { p: "30 192", Justification: "Left" } } } });
+    const saved = exportDocumentToCdxml(opened.document!, plain);
+    const { listed, named } = fontIdsOf(saved.contents);
+    expect(named.every(id => listed.has(id))).toBe(true);
+    expect(saved.contents).not.toContain("N".repeat(257));
+    expect(saved.warnings.filter(w => w.code === "cdxml.font_entry_too_long").map(w => w.message)).toEqual([
+      `CDXML export: the source font of text ${dropped.id} has a name longer than 256 characters, or more than 512 characters of font attributes, far beyond any real font; ` +
+      "it was not written, and text set in it was written without its caption frame and run fonts, or in the default font."
+    ]);
+    // Copied unchanged, the first source text's run would name id 7, which is now Helvetica.
+    const again = textsOf(openChemDraftPayload(saved.contents));
+    expect(again.map(text => text.text)).toEqual(["y", "x", "x"]);
+    expect(again.map(text => text.style.fontFamily)).toEqual(["Helvetica", dropped.style.fontFamily, "Font3"]);
+    expect(dropped.style.fontFamily).toBe("Font7");
+  }
 });
 
 it("keeps a 256-character font name and saves many captions in it linearly", () => {
