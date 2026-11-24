@@ -165,8 +165,9 @@ Settings scroll bars both automatic/overlay and always shown), at mixed display 
 content grip and palette background still move the window. The one exception is the own box of an
 element that is showing a scrollbar (it scrolls and its content overflows): a press anywhere on it,
 including its blank area beside or below the contents, stays with the webview and does not drag,
-since a macOS overlay scrollbar cannot be told apart from that area. Presses on the controls and
-rows inside it, and on a scroller whose content fits, still drag. A tall vertical floating tool
+since a macOS overlay scrollbar cannot be told apart from that area. Presses on non-interactive
+descendants and rows inside it, and on a scroller whose content fits, still drag; buttons, inputs,
+selects and links never drag. A tall vertical floating tool
 palette (e.g. Structure) on a short display scrolls with hidden scrollbars, so pressing its blank
 background still drags the window on both platforms. With Target bond length holding the keyboard,
 press the panel's scrollbar: the lease ends without a drag, and after release M reaches the
