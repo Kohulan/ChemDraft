@@ -8,9 +8,10 @@ import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { applyPatch, applyPatchWithHistory, createDocumentHistory, createEmptyDocument,
   type DocumentHistory, type DocumentPatch, type MoleculeObject } from "@chemdraft/chem-core";
-import type { PluginSelectionSnapshot } from "@chemdraft/plugin-api";
+import { ProposedDocumentPatchSchema, type PluginSelectionSnapshot } from "@chemdraft/plugin-api";
 import { describe, expect, it, vi } from "vitest";
-import { HydrogenCountUnrepresentableReason, PluginHost, PluginHostError, type PluginPatchApplicationRequest } from "./index";
+import { assertPluginPatchWriteScope, HydrogenCountUnrepresentableReason, PluginHost, PluginHostError,
+  type PluginPatchApplicationRequest } from "./index";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
@@ -197,10 +198,9 @@ describe("the plugin host without layout-engine (the published SDK)", () => {
     expect(history()).toBe(original);
   });
 
-  // 0 or no count on the group is what it counts anyway; a count on an element atom it bonds is not
-  // this check's business (the engine's drop of a re-bonded atom's count is unchanged for it).
+  // 0 or no count on the group is what it counts anyway.
   it.each([
-    ["Ac", 0], ["Pr", undefined], ["Ts", 0], ["C", 2]
+    ["Ac", 0], ["Pr", undefined], ["Ts", 0]
   ] as const)("accepts bonding a typed %s stating %s", async (element, hydrogenCount) => {
     const { host, applyDocumentPatch, history } = hostSettingCount(element, hydrogenCount, { typed: true, bondInPatch: "same" });
     await expect(host.invokeCommand("plugin.standalone.run")).resolves.toMatchObject({ applied: true });
@@ -208,6 +208,89 @@ describe("the plugin host without layout-engine (the published SDK)", () => {
     const written = history().present.pages[0]!.objects.find(object => object.id === "mol_1");
     expect(written?.type === "molecule" && written.bonds.map(bond => bond.id)).toEqual(["b1", "bg"]);
   });
+
+  // A count stated on an element atom the same write bonds is dropped by the patch engine too, so the
+  // stated count would be lost without a word: refused, wherever in the batch the bond comes.
+  it.each([["same"], ["next"]] as const)("refuses bonding a typed C stating 2 (bond in the %s update)", async bondInPatch => {
+    const { host, applyDocumentPatch, original, history } = hostSettingCount("C", 2, { typed: true, bondInPatch });
+    await expect(host.invokeCommand("plugin.standalone.run")).rejects.toMatchObject({
+      reason: HydrogenCountUnrepresentableReason, details: { moleculeId: "mol_1", atomId: "g", element: "C", hydrogenCount: 2 },
+      message: 'Plugin write refused: atom "g" of molecule "mol_1" is C with hydrogenCount 2, which the written molecule would not ' +
+        "keep: a change to an atom's bonds, or to what the atom is, drops its stated count. State the count in a later update, once " +
+        "that change is made, or omit hydrogenCount. Nothing was changed."
+    });
+    expect(applyDocumentPatch).not.toHaveBeenCalled();
+    expect(history()).toBe(original);
+  });
+
+  // As the refusal says: the count stated in an update after the one that bonds the atom is kept.
+  it("accepts a count on an element atom stated in an update after the one that bonds it", async () => {
+    const subject = molecule("C", { typed: true, bonded: false });
+    const bonded = molecule("C", { typed: true, bonded: true });
+    const atoms = bonded.atoms.map(atom => atom.id === "g" ? { ...atom, hydrogenCount: 2 } : atom);
+    const { host, history } = hostOver([[subject]], [subject.id], { op: "batch", patches: [
+      { op: "updateObject", objectId: subject.id, changes: { bonds: bonded.bonds } },
+      { op: "updateObject", objectId: subject.id, changes: { atoms } }] });
+    await expect(host.invokeCommand("plugin.over.run")).resolves.toMatchObject({ applied: true });
+    const written = history().present.pages[0]!.objects[0];
+    expect(written?.type === "molecule" && written.atoms.find(atom => atom.id === "g")?.hydrogenCount).toBe(2);
+  });
+
+  // A count a molecule already held, which nothing reads (typed Ac on a bond: acetyl), is let be for
+  // edits elsewhere, but never stands in for a count the write states again and the engine drops: here
+  // the write moves g's bond from a2 to a1, which clears g's count, while restating 2.
+  it("refuses restating a held count on a bonded typed Ac whose bond the same write moves", async () => {
+    const held = withCount(molecule("Ac", { typed: true }), 2);
+    const moved = held.bonds.map(bond => bond.id === "bg" ? { ...bond, fromAtomId: "a1" } : bond);
+    const { host, applyDocumentPatch, original, history } = hostOver([[held]], [held.id],
+      { op: "updateObject", objectId: held.id, changes: { atoms: held.atoms, bonds: moved } });
+    await expect(host.invokeCommand("plugin.over.run")).rejects.toMatchObject({
+      reason: HydrogenCountUnrepresentableReason, details: { moleculeId: "mol_1", atomId: "g", element: "Ac", hydrogenCount: 2 },
+      message: expect.stringContaining("Only 0 is allowed on an abbreviation (Ac)")
+    });
+    expect(applyDocumentPatch).not.toHaveBeenCalled();
+    expect(history()).toBe(original);
+  });
+
+  // Two pages may share an id, each holding an object "mol_1". The write removes the first (a bonded
+  // typed Ac holding 2), then bonds the second (an unbonded typed Ac) while stating 2, which the
+  // engine drops. The removed molecule's held count must not excuse the second's lost one. (A plugin
+  // command's pins already refuse this batch as ambiguous; the preflight itself must refuse it too,
+  // as an unpinned caller of it relies on.)
+  it("refuses a dropped count on a molecule whose page id and object id a removed molecule shared", () => {
+    const removed = withCount(molecule("Ac", { typed: true }), 2);
+    const subject = molecule("Ac", { typed: true, bonded: false });
+    const atoms = subject.atoms.map(atom => atom.id === "g" ? { ...atom, hydrogenCount: 2 } : atom);
+    const empty = createEmptyDocument({ now });
+    const document = { ...empty, pages: [{ ...empty.pages[0]!, objects: [removed] }, { ...empty.pages[0]!, objects: [subject] }] };
+    const proposed = ProposedDocumentPatchSchema.parse({ reason: "count", patch: { op: "batch", patches: [
+      { op: "removeObject", objectId: subject.id },
+      { op: "updateObject", objectId: subject.id, changes: { atoms, bonds: molecule("Ac").bonds } }] } });
+    let refused: unknown;
+    try {
+      assertPluginPatchWriteScope(document, proposed, [subject.id]);
+    } catch (error) {
+      refused = error;
+    }
+    expect(refused).toBeInstanceOf(PluginHostError);
+    expect(refused).toMatchObject({
+      reason: HydrogenCountUnrepresentableReason, details: { moleculeId: "mol_1", atomId: "g", element: "Ac", hydrogenCount: 2 }
+    });
+  });
+
+  // Restating a count the atom keeps (no bond or label change) is accepted, held before or not.
+  it.each([["held before", 2], ["not held before", undefined]] as const)(
+    "accepts restating hydrogenCount 2 on an untouched bonded element C (%s)", async (_case, before) => {
+      const subject = before === undefined ? molecule("C") : withCount(molecule("C"), before);
+      const atoms = subject.atoms.map(atom => atom.id === "g" ? { ...atom, hydrogenCount: 2 } : atom.id === "a1" ? { ...atom, x: atom.x - 5 } : atom);
+      const { host, applyDocumentPatch, history } = hostOver([[subject]], [subject.id],
+        { op: "updateObject", objectId: subject.id, changes: { atoms } });
+      await expect(host.invokeCommand("plugin.over.run")).resolves.toMatchObject({ applied: true });
+      expect(applyDocumentPatch).toHaveBeenCalledTimes(1);
+      const written = history().present.pages[0]!.objects[0];
+      expect(written?.type === "molecule" && written.atoms.map(atom => [atom.id, atom.x, atom.hydrogenCount]))
+        .toEqual([["a1", 105, undefined], ["a2", 140, undefined], ["g", 160, 2]]);
+    });
 
   // A document may repeat an object id. A count asked for is checked on the object the write reached
   // (chem-core updates an id's first occurrence), never on an untouched molecule that shares its id
@@ -239,6 +322,28 @@ describe("the plugin host without layout-engine (the published SDK)", () => {
     expect(written?.type === "molecule" && written.atoms.find(atom => atom.id === "g")?.hydrogenCount).toBe(hydrogenCount);
   });
 });
+
+const withCount = (subject: MoleculeObject, hydrogenCount: number): MoleculeObject =>
+  ({ ...subject, atoms: subject.atoms.map(atom => atom.id === "g" ? { ...atom, hydrogenCount } : atom) });
+
+/** A host over a document whose pages (all with the id "page_001") hold `pages`' objects, with undo
+ * history, `selected` selected on the first page, and a command ("plugin.over.run") writing `patch`. */
+function hostOver(pages: MoleculeObject[][], selected: string[], patch: DocumentPatch) {
+  const empty = createEmptyDocument({ now });
+  const document = { ...empty, pages: pages.map(objects => ({ ...empty.pages[0]!, objects })),
+    selection: { pageId: empty.pages[0]!.id, objectIds: selected } };
+  let history: DocumentHistory = createDocumentHistory(document);
+  const original = history;
+  const applyDocumentPatch = vi.fn((request: PluginPatchApplicationRequest) => {
+    history = applyPatchWithHistory(history, request.patch.patch as DocumentPatch);
+    return { applied: true as const, objectIds: [] };
+  });
+  const host = new PluginHost({ getActiveDocument: () => history.present, getSelection: () => snapshot(selected), applyDocumentPatch });
+  host.registerPlugin({ id: "org.test.over", name: "Count over a document", version: "0.0.1", apiVersion: "^0.1.8", entry: "plugin.js",
+    permissions: ["document.write"], contributes: { commands: [{ id: "plugin.over.run", title: "Run" }] }
+  }, { commandHandlers: { "plugin.over.run": ctx => ctx.documents.applyPatch!({ reason: "count", patch }) } });
+  return { host, applyDocumentPatch, original, history: () => history };
+}
 
 /** A host over a document holding two molecules with the same id ("mol_1") and the same atom ids, both
  * bonded at "g": one an elemental Ac (not typed), one a typed acetyl. `order` says which comes first,
