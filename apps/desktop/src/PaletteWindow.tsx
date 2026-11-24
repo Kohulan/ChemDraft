@@ -1,5 +1,6 @@
 import { isDrawingToolCommand } from "./drawingTools";
 import { installPopoverEscapeRouting } from "./window-manager/popoverEscape";
+import { isScrollOwnerPress } from "./window-manager/scrollOwnerPress";
 import { listenCurrentWindowEvent } from "./window-manager/tauriEvents";
 import type { AnalysisReport } from "@chemdraft/analysis-core";
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent } from "react";
@@ -1176,9 +1177,11 @@ export function PaletteWindow({
       return;
     }
 
-    // The scroll container itself receives presses on its scrollbar. Leave those to the webview;
-    // descendants such as the existing content drag grip can still start a palette drag.
-    if (event.target === bodyRef.current) return;
+    // Scrollbar presses target their scroll owner: the content scroller or a nested inspector
+    // panel. Leave those to the webview. Every other background press must still drag: on
+    // Windows the input-focus lease (isPaletteWindowDragPress) defers its keyboard hand-back
+    // to the end of that drag.
+    if (isScrollOwnerPress(event.target)) return;
 
     if ((event.target as HTMLElement).closest("button, select, input, textarea, [data-palette-control]") ||
       (shellRef.current && disabledControlAtPointer(shellRef.current, event.nativeEvent))) {
@@ -1195,7 +1198,7 @@ export function PaletteWindow({
       return;
     }
 
-    if (event.target === bodyRef.current) return;
+    if (isScrollOwnerPress(event.target)) return;
 
     if ((event.target as HTMLElement).closest("button, select, input, textarea, [data-palette-control]") ||
       (shellRef.current && disabledControlAtPointer(shellRef.current, event.nativeEvent))) {
@@ -1350,6 +1353,8 @@ export function PaletteWindow({
     if (platform === "windows") void setPaletteCommandHitBoxes([], []).catch(() => undefined);
   }, [platform]);
 
+  const paletteName = toolset.title.replace(/ Toolbar$/, "");
+
   return (
     <main
       ref={shellRef}
@@ -1367,6 +1372,7 @@ export function PaletteWindow({
     >
       <div
         className="palette-title"
+        data-platform={platform}
         data-palette-title-drag-surface="true"
         onPointerDown={startDragFromTitle}
         onPointerUp={stopPaletteWindowDrag}
@@ -1375,17 +1381,32 @@ export function PaletteWindow({
         onMouseDown={startMouseDragFromTitle}
         onMouseUp={stopPaletteWindowMouseDrag}
       >
-        <button
-          className="palette-close-button"
-          type="button"
-          title={`Hide ${toolset.title}`}
-          aria-label={`Hide ${toolset.title}`}
-          onPointerDown={hidePaletteWindow}
-          onMouseDown={(event) => event.stopPropagation()}
-          onClick={hidePaletteWindow}
-        >
-        </button>
-        <span className="palette-title-label">{toolset.title.replace(/ Toolbar$/, "")}</span>
+        {platform === "windows" ? (
+          // Windows convention: a visible "×" at the top right that closes on release, so pressing
+          // and dragging off cancels. The press only stops propagation so it never starts a drag.
+          <button
+            className="palette-close-button palette-close-button--end"
+            type="button"
+            title="Close"
+            aria-label={`Close ${paletteName}`}
+            onPointerDown={(event) => event.stopPropagation()}
+            onMouseDown={(event) => event.stopPropagation()}
+            onClick={hidePaletteWindow}
+          >
+            <span aria-hidden="true">×</span>
+          </button>
+        ) : (
+          <button
+            className="palette-close-button"
+            type="button"
+            title={`Hide ${toolset.title}`}
+            aria-label={`Hide ${toolset.title}`}
+            onPointerDown={hidePaletteWindow}
+            onMouseDown={(event) => event.stopPropagation()}
+            onClick={hidePaletteWindow}
+          />
+        )}
+        <span className="palette-title-label">{paletteName}</span>
       </div>
       <div className="palette-window-content" ref={bodyRef}>
         {customizeThisPalette ? (

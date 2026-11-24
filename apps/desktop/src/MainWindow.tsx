@@ -3,6 +3,7 @@ import { interactive3dWorkspaceStatusText, Interactive3dWorkspaceStatus } from "
 import { CanvasContextMenu, NATIVE_CANVAS_MENU_CLOSED_EVENT } from "./CanvasContextMenu";
 import { PLUGIN_CHANGE_REFUSED, RECOGNITION_REFUSED, chemistryRefusalOf, refusalSentence } from "./plugins/requestWrites/chemistryRefusal";
 import { buildObjectCanvasMenu, pageCanvasMenu, SET_DEFAULT_ARROW_STYLE_COMMAND_ID } from "./canvasContextMenuModel";
+import { loadStereoEngine, stereoReadoutRequest } from "./stereoReadout";
 import { RequestWriteError } from "@chemdraft/plugin-host";
 import { createRequestHistory } from "./plugins/requestWrites/requestHistory";
 import { electronMarkInteractionFrames } from "./electronMarkInteraction";
@@ -34,6 +35,7 @@ import type { ActiveTableText } from "./tableCommands";
 import { tableValidationMessage } from "./tableCommands";
 import { tableCellElementId } from "@chemdraft/layout-engine";
 import { insertTableIntoDocument } from "./documentWorkflow";
+import { doubleBondGestureCycle } from "./doubleBondCycle";
 import { clearCustomSwatchSlot, customSwatchCommandId, loadCustomSwatches, parseCustomSwatchCommandId, setCustomSwatchSlot, type CustomSwatchNumber, type CustomSwatchSlot } from "./customColorSwatches";
 import { persistCustomSwatches, useCustomSwatches } from "./toolbars/customSwatchSettings";
 import { createCustomSwatchActions, textCustomColorCommandId } from "./commands";
@@ -1664,9 +1666,16 @@ type ObjectContextMenuState = {
   bondDepthContext?: BondDepthContext;
   /** Present when the right-clicked scope carries (or has dismissed) valence warnings. */
   atomWarning?: { scope: readonly NativeWarningSuppressionScope[]; suppressed: boolean; count: number; problemCommandId?: string };
+  /** The single atom or bond the menu was opened on, for the read-only R/S or E/Z row. */
+  stereoPart?: ObjectContextMenuStereoPart;
   x: number;
   y: number;
 };
+type ObjectContextMenuStereoPart = Extract<NativeMoleculeSelectionPart, { kind: "atom" | "bond" }>;
+/** The part a stereo readout can describe: exactly one atom or one bond, nothing broader. */
+function objectContextMenuStereoPart(part: NativeMoleculeSelectionPart | undefined): ObjectContextMenuStereoPart | undefined {
+  return part?.kind === "atom" || part?.kind === "bond" ? part : undefined;
+}
 type BondDepthMenuCrossing = Pick<ResolvedBondCrossing, "key" | "bonds" | "front" | "back" | "hasOverride">;
 export type BondDepthCommandId = "bondDepth.bringInFront" | "bondDepth.sendBehind" | "bondDepth.useDefault";
 export interface BondDepthContext {
@@ -1876,7 +1885,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.24.15.15-opus";
+const CURRENT_BUILD_STAMP = "11.24.15.55-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -3033,6 +3042,10 @@ export function MainWindow({
   const [pageContextMenu, setPageContextMenu] = useState<ClientPoint | undefined>();
   const [freeformNativeBond, setFreeformNativeBond] = useState<FreeformNativeBondPreview | undefined>();
   const [nativeDoubleBondSidePreview, setNativeDoubleBondSidePreview] = useState<NativeDoubleBondSidePreview | undefined>();
+  const nativeDoubleBondSidePreviewRef = useRef(nativeDoubleBondSidePreview);
+  nativeDoubleBondSidePreviewRef.current = nativeDoubleBondSidePreview;
+  // A hover-2 cycle's committed side, shown in place of the pointer's preview until the pointer moves.
+  const cycledDoubleBondSidePreviewRef = useRef<NativeDoubleBondSidePreview | undefined>(undefined);
   const [graphicCornerRadiusReadout, setGraphicCornerRadiusReadout] = useState<GraphicCornerRadiusReadoutState | undefined>();
   const [objectRotateReadout, setObjectRotateReadout] = useState<ObjectRotateReadoutState | undefined>();
   const [projectedPlaneTiltReadout, setProjectedPlaneTiltReadout] = useState<ProjectedPlaneTiltReadoutState | undefined>();
@@ -5151,6 +5164,23 @@ export function MainWindow({
     const madePlain = order === "single" && object?.type === "molecule" &&
       nativeBondCanBeMadePlain(object.bonds.find(bond => bond.id === target.bondId));
     const selectedDocument = selectDocumentObject(currentDocument, target.objectId);
+    // The Bond tool's hover preview draws over the stored side: cycle from what is on screen.
+    const preview = nativeDoubleBondSidePreviewRef.current;
+    const previewed = preview?.objectId === target.objectId && preview.bondId === target.bondId ? preview : undefined;
+    const drawnSide = previewed?.side === "automatic" ? undefined : previewed?.side;
+    const cycled = doubleBondGestureCycle(selectedDocument, target, order, undefined, drawnSide);
+    if (cycled) {
+      // Display-only (PRESERVE_CHEMISTRY). The hover stays, so pressing 2 again keeps cycling.
+      if (commitDocumentChange(cycled.document, cycled.undoLabel)) {
+        // Keep the preview on the committed side so the canvas shows it without a pointer move.
+        if (previewed) {
+          cycledDoubleBondSidePreviewRef.current = { ...previewed, side: cycled.position };
+          setNativeDoubleBondSidePreview(cycledDoubleBondSidePreviewRef.current);
+        }
+        setStatus(cycled.undoLabel);
+      }
+      return;
+    }
     const nextDocument = applyNativeMoleculeBondOrderValueTarget(selectedDocument, target, order);
     if (nextDocument === selectedDocument) {
       setStatus(`Cannot set hovered bond to ${order}`);
@@ -5883,6 +5913,11 @@ export function MainWindow({
       .catch(() => {
         /* best-effort: rotate commits fall back to legacy geometry-only flatten */
       });
+    // Warm the canvas menu's stereo readout too: the native popup (macOS and Windows) waits only
+    // NATIVE_STEREO_READOUT_BUDGET_MS for its R/S or E/Z row before opening without it.
+    void loadStereoEngine().catch(() => {
+      /* best-effort: the menu retries the load and omits the row meanwhile */
+    });
     return () => {
       cancelled = true;
     };
@@ -17067,9 +17102,18 @@ export function MainWindow({
 
     if (activeToolState.activeCommandId === "tool.bond" && target) {
       const object = findDocumentObject(sourceDocument, target.objectId);
-      setNativeDoubleBondSidePreview(object?.type === "molecule"
+      const preview = object?.type === "molecule"
         ? nativeDoubleBondSidePreviewFromHit(target.objectId, object, target, point, hitToleranceForScale(viewportRef.current.scale))
-        : undefined);
+        : undefined;
+      // The re-hit after a hover-2 cycle keeps showing the side it just committed (until an undo).
+      const cycled = cycledDoubleBondSidePreviewRef.current;
+      const stillCycled = preview && object?.type === "molecule" && cycled?.objectId === preview.objectId &&
+        cycled.bondId === preview.bondId &&
+        object.bonds.find(bond => bond.id === cycled.bondId)?.display?.doubleBondSide === cycled.side;
+      // A failed validation (e.g. undo restored another side) drops the retained preview, so a redo
+      // without a pointer move cannot make the stale side valid again.
+      if (cycled && !stillCycled) cycledDoubleBondSidePreviewRef.current = undefined;
+      setNativeDoubleBondSidePreview(stillCycled ? cycled : preview);
     } else {
       setNativeDoubleBondSidePreview(undefined);
     }
@@ -17126,6 +17170,7 @@ export function MainWindow({
       lastCanvasPointerClientPointRef.current = undefined;
     };
     const handleWindowPointerMove = (event: globalThis.MouseEvent) => {
+      cycledDoubleBondSidePreviewRef.current = undefined;
       const clientPoint = { x: event.clientX, y: event.clientY };
       const canvas = canvasRegionRef.current;
       pointerInsideCanvasRef.current = Boolean(canvas && clientPointIsInsideRect(clientPoint, canvas.getBoundingClientRect()));
@@ -21102,6 +21147,12 @@ export function MainWindow({
       event.stopPropagation();
       const target = { objectId, ...nativeMoleculeHit };
       const selectedDocument = selectDocumentObject(document, objectId);
+      const cycled = doubleBondGestureCycle(selectedDocument, target, activeNativeBondOrder, activeNativeBondStereo);
+      if (cycled) {
+        // Display-only: the default PRESERVE_CHEMISTRY policy refuses any chemistry change.
+        if (commitDocumentChange(cycled.document, cycled.undoLabel)) setStatus(cycled.undoLabel);
+        return;
+      }
       const nextDocument = applyNativeMoleculeBondOrderValueTarget(selectedDocument, target, activeNativeBondOrder, activeNativeBondStereo);
       if (nextDocument === selectedDocument) {
         setStatus(nativeBondOrderTargetRefusal(selectedDocument, target, activeNativeBondOrder) ?? "Bond order not changed");
@@ -22334,6 +22385,10 @@ export function MainWindow({
       targetKind,
       bondDepthContext: bondDepthContextFromNativeSelection(nextSelectedNativePart, pageSvgRenderPlan.crossings, currentDocument),
       ...(atomWarning ? { atomWarning } : {}),
+      // The readout describes what was right-clicked, not the (possibly broader or different)
+      // preserved selection: a selected bond or whole fragment must not hijack an atom's R/S.
+      stereoPart: object?.type === "molecule" && nativeMoleculeHit
+        ? objectContextMenuStereoPart(nativeSelectionFromHit(objectId, nativeMoleculeHit)) : undefined,
       x: event.clientX,
       y: event.clientY
     });
@@ -23464,7 +23519,11 @@ export function MainWindow({
       });
       lastCanvasPointerClientPointRef.current = anchor;
       setPageContextMenu(undefined);
-      setObjectContextMenu({ objectId: object.id, targetKind: part && selection.length === 0 ? "parts" : "object", ...anchor });
+      // A clicked atom or bond is the selected part even while its molecule is the selected object.
+      const stereoPart = selection.length <= 1 && selectedNativeMoleculePartsRef.current.length === 1 &&
+        part?.objectId === object.id ? objectContextMenuStereoPart(part) : undefined;
+      setObjectContextMenu({ objectId: object.id, targetKind: part && selection.length === 0 ? "parts" : "object",
+        stereoPart, ...anchor });
       return;
     }
     page.dispatchEvent(new MouseEvent("contextmenu", {
@@ -24521,6 +24580,10 @@ export function MainWindow({
           targetKind={objectContextMenu.targetKind}
           bondDepthContext={objectContextMenu.bondDepthContext}
           atomWarning={objectContextMenu.atomWarning}
+          loadStereoReadout={(() => {
+            const menuObject = findDocumentObject(document, objectContextMenu.objectId);
+            return menuObject?.type === "molecule" ? stereoReadoutRequest(menuObject, objectContextMenu.stereoPart) : undefined;
+          })()}
           arrowStyleSource={(() => {
             const menuObject = findDocumentObject(document, objectContextMenu.objectId);
             return menuObject ? nativeArrowStyleDefaultFromGraphic(menuObject) : undefined;
@@ -27704,6 +27767,8 @@ export function ObjectLayerContextMenu(props: {
   bondDepthContext?: ObjectContextMenuState["bondDepthContext"];
   atomWarning?: ObjectContextMenuState["atomWarning"];
   arrowStyleSource?: { title: string };
+  /** Read-only R/S or E/Z row for the right-clicked atom or bond (see `stereoReadoutRequest`). */
+  loadStereoReadout?: () => Promise<string | undefined>;
   position: ClientPoint;
   onInvoke(commandId: string): void;
   onFocusReturn?(): void;

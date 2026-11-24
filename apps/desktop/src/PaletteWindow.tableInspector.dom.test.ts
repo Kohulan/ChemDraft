@@ -236,6 +236,11 @@ describe("PaletteWindow table inspector", () => {
     await mount("core.drawnStructureSettings");
     await broadcast(tableSnapshot());
     const body = container.querySelector(".palette-window-content")!;
+    // jsdom does no layout, so every scroll size is 0 and nothing overflows. A press counts as a
+    // scrollbar press only on an element whose content really overflows, so give the content
+    // scroller (overflow-y: auto in App.css) an overflowing box, as a tall table inspector has.
+    Object.defineProperty(body, "clientHeight", { configurable: true, value: 200 });
+    Object.defineProperty(body, "scrollHeight", { configurable: true, value: 600 });
     for (const type of ["pointerdown", "mousedown"]) {
       const event = new MouseEvent(type, { bubbles: true, cancelable: true, button: 0 });
       await act(async () => { body.dispatchEvent(event); });

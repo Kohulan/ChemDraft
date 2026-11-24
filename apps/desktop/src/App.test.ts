@@ -666,8 +666,26 @@ describe("ChemDraft desktop shell", () => {
     )).toEqual({ x: 220, y: 220 });
   });
 
+  it.each(["windows", "macos", "linux"] as const)("renders the floating toolbar close button on %s", (platform) => {
+    const markup = renderToStaticMarkup(createElement(PaletteWindow, { platform }));
+    const button = markup.match(/<button\b[^>]*class="palette-close-button[^"]*"[^>]*>.*?<\/button>/)?.[0] ?? "";
+
+    expect(markup).toContain(`class="palette-title" data-platform="${platform}"`);
+    if (platform === "windows") {
+      expect(button).toContain('class="palette-close-button palette-close-button--end"');
+      expect(button).toContain('aria-label="Close Main"');
+      expect(button).toContain('title="Close"');
+      expect(button).toContain('<span aria-hidden="true">×</span>');
+    } else {
+      expect(button).toContain('class="palette-close-button"');
+      expect(button).not.toContain("palette-close-button--end");
+      expect(button).toContain('aria-label="Hide Main Toolbar"');
+      expect(button).not.toContain("×");
+    }
+  });
+
   it("renders the native palette route as an independent palette-only surface", () => {
-    const markup = renderToStaticMarkup(createElement(PaletteWindow));
+    const markup = renderToStaticMarkup(createElement(PaletteWindow, { platform: "macos" }));
 
     expect(markup).toContain("palette-window-shell");
     expect(markup).toContain("data-palette-drag-surface");

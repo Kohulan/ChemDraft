@@ -140,14 +140,16 @@ describe.each(["macos", "windows"] as const)("placement pointer handlers on %s",
     expect(status()).toMatch(/dashed \(dative\) bond stays single/);
   });
 
+  // Triple, not double: a Double Bond tool click on a plain double now cycles its second stroke
+  // (MainWindow.doubleBondCycle.dom.test.tsx), so "already double" no longer applies there.
   it("says a click on a bond already of that order is already that order", async () => {
-    await mount("tool.doubleBond", applySingleBondToolAtPoint(createPhase4Document("Same"), { x: 240, y: 240 }, { bondOrder: "double" }));
+    await mount("tool.tripleBond", applySingleBondToolAtPoint(createPhase4Document("Same"), { x: 240, y: 240 }, { bondOrder: "triple" }));
     const molecule = molecules(current())[0];
     const midpoint = { x: (molecule.atoms[0].x + molecule.atoms[1].x) / 2, y: (molecule.atoms[0].y + molecule.atoms[1].y) / 2 };
     const wrapper = container.querySelector<HTMLElement>(`[data-object-id="${molecule.id}"]`)!;
     await pointer("pointerdown", midpoint, wrapper);
     await pointer("pointerup", midpoint, wrapper);
-    expect(status()).toBe("Bond is already double");
+    expect(status()).toBe("Bond is already triple");
   });
 
   it.each(["tool.doubleBond", "tool.tripleBond"])("connects two atoms with %s past valence with a warning and one Undo entry", async (tool) => {
