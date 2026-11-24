@@ -12,6 +12,8 @@ restoring future fields and avoiding a second schema pass. Export warnings inclu
 `NATIVE_EXTENSION_DATA_DROPPED` when edits invalidate preservation of identity-free arrays. See
 [the native compatibility contract](../../docs/architecture/native-document-compatibility.md).
 
+Plain CDXML and CDX carry standard lone pairs as Symbol graphics. An atom attachment uses the exported node ID in a represent child. Import resolves the attachment after reading the page, including when the symbol comes first. A free pair stays at its drawn position. Independently styled or non-square native marks still receive the appearance warning when their dimensions cannot be expressed by a symbol's single size handle.
+
 Legacy unknown chemistry enum strings survive exactly in the embedded native payload; the visible
 CDXML layer reports `cdxml.native_enum_payload_only` when it cannot represent them. Unknown-order
 bonds write `Order="any"` with `cdxml.unknown_bond_order`, never a single-bond guess. Binary CDX uses the same native compatibility contract.
