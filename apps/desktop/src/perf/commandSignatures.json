@@ -588,7 +588,7 @@
     "name": "show_toolset_tooltip_window",
     "async": false,
     "generics": "",
-    "parameters": "app: tauri::AppHandle, x: Option<f64>, y: Option<f64>,",
+    "parameters": "app: tauri::AppHandle, x: Option<f64>, y: Option<f64>, width: Option<f64>, height: Option<f64>,",
     "returnType": "Result<(), String>"
   },
   {
@@ -748,7 +748,7 @@
     "name": "engine3d_sidecar_status",
     "async": false,
     "generics": "",
-    "parameters": "",
+    "parameters": "diagnostic: Option<String>",
     "returnType": "Engine3dSidecarStatus"
   },
   {
