@@ -3,7 +3,7 @@ import { detectShortcutPlatform, type ShortcutPlatform } from "@chemdraft/shortc
 import { REPORT_BUG_COMMAND_ID } from "./problemReports";
 import { structureSearchCommands } from "./structureSearch";
 import { STRUCTURE_SEARCH_DEFAULT_ENABLED } from "./structureSearchSettings";
-import { convertTextToAtomLabelCommandId, nativeStylePresetActions } from "./commands";
+import { convertTextToAtomLabelCommandId, nativeStylePresetActions, structureInteractive3dCommandId } from "./commands";
 import { formatShortcutLabel } from "./toolsets";
 import { VIBE_CODE_STARTER_COMMAND_ID, vibeCodeStarterCommand } from "./commands/vibeCodeStarter";
 
@@ -22,7 +22,8 @@ import { VIBE_CODE_STARTER_COMMAND_ID, vibeCodeStarterCommand } from "./commands
  *
  * Deliberately omitted from the web bar (they are OS-level, not in-document actions):
  * Services/Hide/Quit, the Window menu (minimize/maximize), and File ▸
- * Close Window / Quit. File ▸ Check for Updates is also native-only because Sparkle owns its UI and
+ * Close Window / Quit. The Linux native menu builds its Window items from the registry commands in
+ * `windowCommands.ts` (`LINUX_WINDOW_COMMAND_IDS` in lib.rs), routed apart from `MENU_COMMAND_IDS`. File ▸ Check for Updates is also native-only because Sparkle owns its UI and
  * lifecycle rather than the frontend command registry.
  */
 
@@ -150,6 +151,11 @@ export interface AppMenuContext {
   /** Active keybinding scheme; the ChemDraw scheme relabels the accelerators that differ. */
   keybindingScheme?: "chemdraft" | "chemdraw";
   keybindingOverrides?: ShortcutOverrides;
+  /**
+   * Commands this build cannot run for the whole session (`sessionUnavailableCommandIds`). Their
+   * items are left out, as the native menu leaves them out, rather than shown disabled.
+   */
+  unavailableCommandIds?: ReadonlySet<string>;
 }
 
 /** Prefix of the dynamic toolset-toggle command ids (see toolset-registry `createToolsetToggleCommandId`). */
@@ -357,8 +363,10 @@ export function buildAppMenuModel(context: AppMenuContext): AppMenuSection[] {
             enabled: context.canConvertTextToAtomLabel
           })
         ]),
-        separator(),
-        command("structure.openInteractive3d", "Interactive 3D Workspace…")
+        ...(context.unavailableCommandIds?.has(structureInteractive3dCommandId) ? [] : [
+          separator(),
+          command(structureInteractive3dCommandId, "Interactive 3D Workspace…")
+        ])
       ]
     },
     { id: "tools", label: "Tools", items: [] },

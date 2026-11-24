@@ -73,6 +73,19 @@ jobs:
           echo "commit=$sha" >> "$GITHUB_OUTPUT"
           echo "Release source: $sha (version $version)"
 
+      # The 3D sidecar is committed, as on macOS and Windows: .github/workflows/linux-sidecar-build.yml
+      # builds it from the pinned sources and a maintainer commits it. Packaging never builds it or
+      # writes over it; it checks that the committed file is that build (SHA-256 pinned in
+      # scripts/engine3d-sidecar-linux.json), a native x86-64 ELF needing at most glibc 2.35, and
+      # completes the protocol handshake. It fails while the pin is still pending. The sidecars in the
+      # finished .deb and AppImage are checked against the same pin below.
+      - name: Verify the committed x86_64 Linux 3D sidecar
+        run: |
+          set -euo pipefail
+          node --version
+          node scripts/audit-avogadro3d-sidecar.mjs
+          node scripts/verify-committed-linux-sidecar.mjs
+
       # The Tauri Linux build set: WebKitGTK 4.1 for the webview, librsvg for icons, patchelf and
       # file for linuxdeploy (AppImage), xdg-utils so the bundled app can open links and mail.
       - name: Install Linux build dependencies
@@ -102,6 +115,18 @@ jobs:
       - name: Build host-native OPSIN runtime and smoke test benzene
         run: node scripts/build-opsin-runtime.mjs
 
+      # vite.config.ts stamps the footer "+dirty" from `git status --porcelain` while bundling, so a
+      # release must start bundling from a clean tree. No earlier step writes to tracked files: the
+      # sidecar is verified in place, pnpm installs from the frozen lockfile, and the OPSIN runtime
+      # goes to the ignored resources/opsin/jre. Cargo.lock must already be current, or cargo would
+      # rewrite it during the bundle build.
+      - name: Check the source tree is clean before the bundle build
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 --manifest-path apps/desktop/src-tauri/Cargo.toml > /dev/null
+          dirty=$(git status --porcelain --untracked-files=normal)
+          [ -z "$dirty" ] || { printf '::error::The source tree is dirty before the bundle build:\n%s\n' "$dirty"; exit 1; }
+
       - name: Build stable .deb and AppImage
         env:
           CHEMDRAFT_STABLE_BUILD: '1'
@@ -117,6 +142,13 @@ jobs:
         run: |
           export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/apps/desktop/src-tauri/resources/opsin/jre/lib/server"
           pnpm --filter @chemdraft/desktop build --bundles deb,appimage
+
+      # The release record refuses a dirty tree; the bundle build must not have written to it.
+      - name: Check the source tree is still clean after the bundle build
+        run: |
+          set -euo pipefail
+          dirty=$(git status --porcelain --untracked-files=normal)
+          [ -z "$dirty" ] || { printf '::error::The source tree is dirty after the bundle build:\n%s\n' "$dirty"; exit 1; }
 
       - name: Verify stable bundle identity
         id: bundle
@@ -141,13 +173,29 @@ jobs:
           [ -f "$appimage" ] || { echo "::error::Missing $appimage"; exit 1; }
           # The .deb must carry the 3D sidecar, the OPSIN runtime and the bundled licences, as the
           # other platforms do.
-          # (The Linux sidecar is still the placeholder from binaries/README.md; the app reports 3D
-          # as unavailable until a real Linux build replaces it.)
-          contents=$(dpkg-deb -c "$deb" | awk '{print $NF}' | sed 's|^\./||')
+          # "mode path" per archive entry. dpkg-deb -c may or may not prefix paths with "./" (the
+          # Tauri .deb does not), so strip it; a symlink or hard link line ends in "-> target" or
+          # "link to target", so take the entry's own path, never the target.
+          deb_listing() {
+            dpkg-deb -c "$1" | awk '{ p = $NF; if ($(NF-1) == "->") p = $(NF-2); else if ($(NF-2) == "link" && $(NF-1) == "to") p = $(NF-3); sub(/^\.\//, "", p); print $1, p }'
+          }
+          listing=$(deb_listing "$deb")
+          contents=$(awk '{ print $2 }' <<<"$listing")
           licences=$(node --input-type=module -e "import { requiredLicenseFiles } from './tools/release/required-license-files.mjs'; for (const { target } of requiredLicenseFiles) console.log('usr/lib/ChemDraft/' + target);")
           for path in usr/bin/chemdraft usr/bin/avogadro3d-sidecar usr/lib/ChemDraft/resources/opsin/jre/bin/java $licences; do
             grep -qxF "$path" <<<"$contents" || { echo "::error::$deb lacks $path"; exit 1; }
           done
+          # Its sidecar must be the pinned build (scripts/engine3d-sidecar-linux.json) byte for byte,
+          # never a placeholder, a regular file with mode 0755 (in the archive itself, before any
+          # umask applies on extraction), and complete the handshake.
+          # Exactly one entry at that path, and its mode string exactly -rwxr-xr-x: a symlink (l...),
+          # a missing entry or a duplicate all fail.
+          sidecar_entry=$(awk '$2 == "usr/bin/avogadro3d-sidecar" { print $1 }' <<<"$listing")
+          [ "$sidecar_entry" = -rwxr-xr-x ] || { echo "::error::$deb holds usr/bin/avogadro3d-sidecar as '$sidecar_entry', not a regular file with mode 0755."; exit 1; }
+          payload=$(mktemp -d)
+          dpkg-deb -x "$deb" "$payload"
+          node scripts/verify-committed-linux-sidecar.mjs --packaged "$payload/usr/bin/avogadro3d-sidecar" || { echo "::error::$deb does not carry the pinned 3D sidecar."; exit 1; }
+          rm -rf -- "$payload"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "deb=$deb" >> "$GITHUB_OUTPUT"
           echo "appimage=$appimage" >> "$GITHUB_OUTPUT"
@@ -207,6 +255,12 @@ jobs:
           fi
           bash -n "$gtk_hook"
 
+          # Ship the committed sidecar verified against the pin, not linuxdeploy's copy, which may have
+          # had its RUNPATH rewritten (the sidecar needs no bundled library). Tauri put it here.
+          sidecar="$appdir/usr/bin/avogadro3d-sidecar"
+          test -f "$sidecar" || { echo '::error::The AppImage has no usr/bin/avogadro3d-sidecar.'; exit 1; }
+          install -m 0755 -- "$GITHUB_WORKSPACE/apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu" "$sidecar"
+
           # The AppImage runtime reads only zlib or zstd.
           mksquashfs squashfs-root app.squashfs -noappend -all-root -comp zstd -no-progress
           head -c "$offset" "$image" > repacked.AppImage
@@ -217,6 +271,8 @@ jobs:
           cd verify
           ../repacked.AppImage --appimage-extract > repacked-extraction.log
           test -x squashfs-root/AppRun
+          # The shipped payload's sidecar must be the pinned build byte for byte and complete the handshake.
+          node "$GITHUB_WORKSPACE/scripts/verify-committed-linux-sidecar.mjs" --packaged squashfs-root/usr/bin/avogadro3d-sidecar || { echo "::error::$APPIMAGE does not carry the pinned 3D sidecar."; exit 1; }
           echo 'Shared libraries under usr/lib in the repacked AppImage:'
           find squashfs-root/usr/lib \( -type f -o -type l \) \( -name '*.so' -o -name '*.so.*' \) -print | LC_ALL=C sort
           leftovers=$(find squashfs-root \( "${host_libs[@]}" \) -print)

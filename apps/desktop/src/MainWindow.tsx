@@ -483,12 +483,19 @@ import {
   endEngine3dWorkspaceDrag,
   engine3dCoordsInAtomOrder,
   engine3dDragStereoBlocked,
+  engine3dSidecarDisabledReason,
+  logEngine3dDiagnostic,
   openEngine3dWorkspaceSession,
   pollEngine3dWorkspaceSessionState,
   readEngine3dSidecarStatus,
   updateEngine3dWorkspaceDrag,
   type Engine3dWorkspaceSessionState
 } from "./engine3dSidecar";
+import {
+  interactive3dPhaseLabel,
+  interactive3dSessionStatus,
+  type Interactive3dPhase
+} from "./interactive3dStatus";
 import type { Engine3DCoordinate } from "@chemdraft/engine3d-api";
 import type { RdkitMinimalModule } from "@chemdraft/rdkit-adapter";
 import {
@@ -884,6 +891,7 @@ import {
   defaultVisibleToolsetIds,
   desktopToolsetRegistry,
   compoundLayoutRegistry,
+  sessionAvailableRegistry,
   getToolbarsMenuModel,
   getToolsetCommandSpecs,
   getToolsetItemGroups,
@@ -959,6 +967,8 @@ import {
   runtimeProblemReportDeps,
   watchForCrashes
 } from "./problemReports";
+import { requestWindowAction, windowCommands } from "./windowCommands";
+import { useSessionUnavailableCommandIds } from "./sessionUnavailableCommands";
 import {
   APP_CHECK_FOR_UPDATES_COMMAND_ID,
   AUTO_CHECK_DELAY_MS,
@@ -1858,7 +1868,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.24.10.15-opus";
+const CURRENT_BUILD_STAMP = "11.24.12.10-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -2538,6 +2548,8 @@ export function MainWindow({
   // rAF renders once and stops. Zero frames fired when the scene isn't changing.
   const spinDirtyRef = useRef(false);
   const spinRafRef = useRef<number | null>(null);
+  // Pointer moves applied to the current rotate grab, for the CHEMDRAFT_ENGINE3D_LOG release line.
+  const spinRotateMovesRef = useRef(0);
   const groupTransformMachineRef = useRef<InteractionState>(initialInteractionState());
   const gestureStartScaleRef = useRef(1);
   const lastCanvasPointerClientPointRef = useRef<ClientPoint | undefined>(undefined);
@@ -2844,6 +2856,10 @@ export function MainWindow({
   const compoundLayoutSettings = useCompoundLayoutSettings();
   const compoundLayoutsEnabled = compoundLayoutSettings.enabled;
   const structureSearchEnabled = useStructureSearchEnabled();
+  // The bundled 3D sidecar is fixed for the life of the process: its status is read once. A build
+  // without a runnable sidecar leaves Interactive 3D out of every toolbar, menu and gallery
+  // (AGENTS.md §10) instead of listing it disabled for the whole session.
+  const unavailableCommandIds = useSessionUnavailableCommandIds();
   const structureSearchEnabledRef = useRef(structureSearchEnabled);
   structureSearchEnabledRef.current = structureSearchEnabled;
   const structureSearchController = useRef<ReturnType<typeof createStructureSearchController> | undefined>(undefined);
@@ -2852,8 +2868,10 @@ export function MainWindow({
   }
   const directElectronMarkEditing = useDirectElectronMarkEditing();
   const [unfilteredToolsetRegistry, setToolsetRegistry] = useState<DesktopToolsetRegistry>(() => desktopToolsetRegistry);
-  const toolsetRegistry = useMemo(() => compoundLayoutRegistry(unfilteredToolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, isDesktopRuntime()),
-    [unfilteredToolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings]);
+  const toolsetRegistry = useMemo(() => sessionAvailableRegistry(
+    compoundLayoutRegistry(unfilteredToolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, isDesktopRuntime()),
+    unavailableCommandIds
+  ), [unfilteredToolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, unavailableCommandIds]);
 
   // The toolbar catalog is the single data brain: it composes the core manifest with live
   // plugin toolsets and the user's saved layout, and hands out immutable registry snapshots.
@@ -3693,11 +3711,12 @@ export function MainWindow({
         paletteCommands: baseToolbarCommands,
         compoundLayoutsEnabled, compoundLayoutSettings,
         structureSearchEnabled,
-        hasSearchableStructure
+        hasSearchableStructure,
+        unavailableCommandIds
       }).map(command => customSwatchActions.find(action => action.id === command.id) ?? command).filter(command => command.id !== "arrow.conditions" || isDesktopRuntime()),
       keybindingScheme, shortcutOverrides, shortcutPlatform
     ),
-    [shortcutOverrides, shortcutPlatform, baseToolbarCommands, customSwatches, customSwatchActions, activeTableCell?.tableId, activeTableCell?.rowId, activeTableCell?.columnId, canRedo, canUndo, document, documentTabs.length, keybindingScheme, openWarnings, selectedMolecule, selectedNativeMoleculeParts, toolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, structureSearchEnabled, hasSearchableStructure]
+    [shortcutOverrides, shortcutPlatform, baseToolbarCommands, customSwatches, customSwatchActions, activeTableCell?.tableId, activeTableCell?.rowId, activeTableCell?.columnId, canRedo, canUndo, document, documentTabs.length, keybindingScheme, openWarnings, selectedMolecule, selectedNativeMoleculeParts, toolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, structureSearchEnabled, hasSearchableStructure, unavailableCommandIds]
   );
   const shellCommandsById = useMemo(
     () => createShellCommandMap(shellCommandSpecs),
@@ -6465,6 +6484,7 @@ export function MainWindow({
         startPageY: pageY,
         startModel: [state.coords3d[base], state.coords3d[base + 1], state.coords3d[base + 2]]
       };
+      logEngine3dDiagnostic(`press ${event.pointerId} at ${pageX.toFixed(1)}, ${pageY.toFixed(1)}: pull atom ${hit.atomId}`);
       sendInteractive3dDragCommandRef.current("beginDrag", hit.atomId);
       return;
     }
@@ -6478,6 +6498,7 @@ export function MainWindow({
     if (!insideBox) {
       // Click outside the selection box commits the current orientation. A queued
       // click waits for this asynchronous flatten before replaying another gesture.
+      logEngine3dDiagnostic(`press ${event.pointerId} at ${pageX.toFixed(1)}, ${pageY.toFixed(1)}: flatten (outside the selection box)`);
       return commitSpinFlatten();
     }
     // Inside the box: grab to rotate. Capture is best-effort.
@@ -6486,6 +6507,8 @@ export function MainWindow({
     } catch {
       /* ignore — pointer capture is an enhancement, not a requirement */
     }
+    logEngine3dDiagnostic(`press ${event.pointerId} at ${pageX.toFixed(1)}, ${pageY.toFixed(1)}: rotate`);
+    spinRotateMovesRef.current = 0;
     applySpin({ ...state, dragging: true, lastClient: { x: event.clientX, y: event.clientY } });
   }, [applySpin, captureGesturePointer, commitSpinFlatten, spinOverlayTugHit]);
 
@@ -6531,6 +6554,7 @@ export function MainWindow({
     };
     const current = { x: event.clientX, y: event.clientY };
     const quat = applyTrackballDrag(state.quat, state.lastClient, current, trackball);
+    spinRotateMovesRef.current += 1;
     // Update ref synchronously so the next event has fresh state; schedule a single
     // rAF to push to React. If one is already pending it will pick up this latest
     // state — no need to schedule another.
@@ -6563,12 +6587,14 @@ export function MainWindow({
     const tug = spin3dTugDragRef.current;
     if (tug && tug.pointerId === event.pointerId) {
       spin3dTugDragRef.current = undefined;
+      logEngine3dDiagnostic(`release ${event.pointerId}: pull of atom ${tug.atomId} ended`);
       sendInteractive3dDragCommandRef.current("endDrag", tug.atomId);
       return;
     }
     // Releasing ends the rotation but STAYS in spin mode — grab inside the box again
     // to keep rotating, or click outside to flatten (handled in pointer-down). Esc cancels.
     if (state.dragging) {
+      logEngine3dDiagnostic(`release ${event.pointerId}: rotate ended after ${spinRotateMovesRef.current} moves`);
       applySpin({ ...state, dragging: false, lastClient: undefined });
     }
   }, [applySpin]);
@@ -6578,7 +6604,11 @@ export function MainWindow({
     event.stopPropagation();
     const gestures = deferredSpinGesturesRef.current;
     const pending = gestures.at(-1);
-    if (spin3dTugDragRef.current || (pending && !pending.up)) return;
+    if (spin3dTugDragRef.current || (pending && !pending.up)) {
+      logEngine3dDiagnostic(`press ${event.pointerId} ignored: ${spin3dTugDragRef.current
+        ? `atom ${spin3dTugDragRef.current.atomId} is still being pulled` : "a queued press is still down"}`);
+      return;
+    }
     const release = interactive3dReleaseRef.current;
     if (!release && !pending) {
       void startSpinOverlayPointer(event);
@@ -6589,6 +6619,7 @@ export function MainWindow({
     const point = spinOverlayPagePoint(event, documentRef.current.pages[0]);
     // Classify the queued grab against the geometry visible at pointer-down.
     const tugOpenId = spinOverlayTugHit(state, point.x, point.y, state.previewCoords3d)?.openId;
+    logEngine3dDiagnostic(`press ${event.pointerId} queued until the last pull settles`);
     gestures.push({ down: snapshotSpinOverlayPointer(event), tugOpenId });
     try {
       captureGesturePointer(event.currentTarget, event.pointerId);
@@ -6714,18 +6745,19 @@ export function MainWindow({
   const updateInteractive3dWorkspaceSession = useCallback((
     openId: number,
     session: Engine3dWorkspaceSessionState,
-    options: { clearDragVisualTarget?: boolean; status?: string } = {}
+    options: { clearDragVisualTarget?: boolean; status?: string; phase?: Interactive3dPhase } = {}
   ) => {
     const detached = session.closed || session.exited;
     if (detached && interactive3dWorkspaceRef.current?.openId === openId) {
       interactive3dArmRef.current = undefined;
     }
+    logEngine3dDiagnostic(`session ${describeEngine3dWorkspaceSession(session)}${detached ? " · detached" : ""}`);
     const updateWorkspace = (currentWorkspace: Interactive3dWorkspaceState | undefined) => currentWorkspace?.openId === openId
       ? {
           ...currentWorkspace,
           session: detached ? undefined : session,
           selectedAtomIds: session.selectedAtomIds.length > 0 ? session.selectedAtomIds : currentWorkspace.selectedAtomIds,
-          status: options.status ?? describeEngine3dWorkspaceSession(session),
+          status: options.status ?? interactive3dSessionStatus(session, options.phase),
           energyLabel: interactive3dEnergyLabel(session) ?? currentWorkspace.energyLabel,
           dragVisualTarget: detached || options.clearDragVisualTarget || session.stereo?.needsReseed
             ? undefined : currentWorkspace.dragVisualTarget
@@ -6783,7 +6815,7 @@ export function MainWindow({
           return;
         }
         scheduler.session = session;
-        updateInteractive3dWorkspaceSession(scheduler.openId, session);
+        updateInteractive3dWorkspaceSession(scheduler.openId, session, { phase: scheduler.ending ? "settling" : "pulling" });
       })
       .catch((error) => {
         if (interactive3dDragSchedulerRef.current !== scheduler) {
@@ -6907,11 +6939,9 @@ export function MainWindow({
 
     const status = await readEngine3dSidecarStatus();
     if (!status?.available) {
-      setStatus(
-        status
-          ? `Interactive 3D unavailable; sidecar not configured: ${status.bundledBinaryName}`
-          : "Interactive 3D unavailable; Tauri bridge not present"
-      );
+      // Unreachable from toolbars and menus once the status is known (they omit the command), but a
+      // click made before it arrived still lands here.
+      setStatus(engine3dSidecarDisabledReason(status) ?? "Interactive 3D unavailable; Tauri bridge not present");
       return;
     }
 
@@ -6943,7 +6973,7 @@ export function MainWindow({
       return;
     }
     const existing = interactive3dWorkspaceRef.current;
-    if (existing?.objectId === arm.objectId && (existing.session || existing.status === "attaching")) {
+    if (existing?.objectId === arm.objectId && (existing.session || existing.status === interactive3dPhaseLabel("attaching"))) {
       return; // already attaching/attached for this molecule
     }
     const molecule = findDocumentObject(documentRef.current, arm.objectId);
@@ -6977,12 +7007,13 @@ export function MainWindow({
 
     const status = await readEngine3dSidecarStatus();
     if (!stillOpening()) return;
+    logEngine3dDiagnostic(`phase attaching: ${molecule.atoms.length} atoms, sidecar ${status?.source ?? "unknown"}`);
     setInteractive3dWorkspace({
       openId,
       objectId: arm.objectId,
       source: status?.source ?? "unknown",
       bridgeAvailable: true,
-      status: "attaching",
+      status: interactive3dPhaseLabel("attaching"),
       selectedAtomIds: [],
       atoms: interactive3dAtomsForMolecule(molecule),
       bonds: interactive3dBondsForMolecule(molecule)
@@ -7003,12 +7034,14 @@ export function MainWindow({
         queueInteractive3dSessionClose(session);
         return;
       }
+      logEngine3dDiagnostic(`phase ready: ${describeEngine3dWorkspaceSession(session)}`);
       setInteractive3dWorkspace((current) => current?.openId === openId
-        ? { ...current, session, status: "tug-ready" }
+        ? { ...current, session, status: interactive3dPhaseLabel("ready") }
         : current);
       pollInteractive3dSessionAfterOpen(openId, session);
       setStatus("Interactive 3D: drag an atom to tug · drag empty space to rotate · click outside to flatten · Esc to cancel" + (warnings.length ? ` — ${warnings.join(" ")}` : ""));
     } catch (error) {
+      logEngine3dDiagnostic(`phase failed: ${error instanceof Error ? error.message : String(error)}`);
       setInteractive3dWorkspace((current) => current?.openId === openId ? undefined : current);
       if (stillOpening()) setStatus(`Interactive 3D sidecar session failed: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -7123,7 +7156,7 @@ export function MainWindow({
       setInteractive3dWorkspace((workspace) => workspace?.openId === current.openId
         ? {
             ...workspace,
-            status: `beginDrag · ${atomId}`,
+            status: interactive3dPhaseLabel("pulling"),
             dragVisualTarget: undefined
           }
         : workspace);
@@ -7140,7 +7173,7 @@ export function MainWindow({
           }
           scheduler.session = session;
           scheduler.beginPending = false;
-          updateInteractive3dWorkspaceSession(scheduler.openId, session);
+          updateInteractive3dWorkspaceSession(scheduler.openId, session, { phase: scheduler.ending ? "settling" : "pulling" });
         })
         .catch((error) => {
           if (interactive3dDragSchedulerRef.current === scheduler) {
@@ -7173,7 +7206,7 @@ export function MainWindow({
       setInteractive3dWorkspace((workspace) => workspace?.openId === scheduler.openId
         ? {
             ...workspace,
-            status: `${phase} · ${atomId} → ${latestTarget.x.toFixed(2)}, ${latestTarget.y.toFixed(2)}, ${latestTarget.z.toFixed(2)}`,
+            status: interactive3dPhaseLabel("pulling"),
             dragVisualTarget: {
               generation: scheduler.generation,
               atomId,
@@ -7193,7 +7226,7 @@ export function MainWindow({
     setInteractive3dWorkspace((workspace) => workspace?.openId === scheduler.openId
       ? {
           ...workspace,
-          status: `endDrag · ${atomId}`
+          status: interactive3dPhaseLabel("settling")
         }
       : workspace);
     const publishRelease = (session: Engine3dWorkspaceSessionState, status?: string) => {
@@ -12570,6 +12603,14 @@ export function MainWindow({
         },
         () => runAppUpdateCheckRef.current("manual")
       );
+    }
+
+    // Window ▸ Minimize, Maximize / Restore and Close Window on Linux, whose GTK menu lacks the
+    // predefined OS items. macOS and Windows keep those, so the commands exist only on Linux.
+    for (const command of windowCommands({ isDesktop: isDesktopRuntime(), platform: detectDesktopShortcutPlatform() })) {
+      register(command, () => requestWindowAction(command.id).catch(error => {
+        setStatus(`Could not ${command.title.toLowerCase()} the window: ${describeError(error).brief}`);
+      }));
     }
 
     documentTabs.forEach((tab) => {
@@ -23144,7 +23185,8 @@ export function MainWindow({
         availablePluginUpdateCount,
         keybindingScheme,
         keybindingOverrides: shortcutOverrides,
-        platform: shortcutPlatform
+        platform: shortcutPlatform,
+        unavailableCommandIds
       }),
     [
       rulersVisible,
@@ -23163,7 +23205,8 @@ export function MainWindow({
       availablePluginUpdateCount,
       structureSearchEnabled,
       hasSearchableStructure,
-      bracketMenuItems
+      bracketMenuItems,
+      unavailableCommandIds
     ]
   );
 
@@ -24294,7 +24337,7 @@ export function MainWindow({
             baseToolsets={toolbarCatalog.baseToolsets()}
             layoutState={layoutStateRef.current ?? emptyLayoutState()}
             availableCommands={galleryCommands}
-            isCommandHidden={id => isCompoundLayoutCommandHidden(id, compoundLayoutSettings)}
+            isCommandHidden={id => isCompoundLayoutCommandHidden(id, compoundLayoutSettings) || unavailableCommandIds.has(id)}
             onApply={applyCustomizeToolbars}
             onLiveApply={liveApplyCustomizeToolbars}
             onClose={() => setCustomizeToolbarsOpen(false)}

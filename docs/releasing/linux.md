@@ -33,12 +33,31 @@ The workflow:
 
 1. Checks that `ref` is a tag (or full SHA) and that `upload_to_release` is `v<app version>`.
    For uploads, the build ref must also match the workflow commit.
-2. Builds the OPSIN Java runtime on the runner and smoke-tests it (benzene).
-3. Builds a stable `.deb` and AppImage (`CHEMDRAFT_STABLE_BUILD=1`, no worktree label).
+2. Verifies the committed x86_64 3D sidecar before anything else: runs the sidecar audit, then
+   `scripts/verify-committed-linux-sidecar.mjs`, which fails unless
+   `scripts/engine3d-sidecar-linux.json` is filled in, the committed file is not a placeholder, its
+   SHA-256 equals the pinned one, and `scripts/check-engine3d-sidecar.mjs` passes it (a native
+   x86-64 ELF that needs only glibc libraries, at most glibc 2.35, and completes the protocol
+   handshake). Packaging never builds the sidecar or writes over it; see
+   [The x86_64 3D sidecar](#the-x86_64-3d-sidecar). Until a maintainer commits it, the pin reads
+   `PENDING-MAINTAINER-COMMIT` and every Linux package build fails here, on purpose.
+3. Builds the OPSIN Java runtime on the runner and smoke-tests it (benzene). Then, right before
+   bundling, it fails unless `Cargo.lock` is current (`cargo metadata --locked`) and
+   `git status --porcelain --untracked-files=normal` is empty, printing any dirty paths: the
+   footer's build stamp says `+dirty` otherwise. It builds a stable `.deb` and AppImage
+   (`CHEMDRAFT_STABLE_BUILD=1`, no worktree label) and fails if the bundle build left the tree
+   dirty. Any failure fails the job.
 4. Checks the bundle identity and that the `.deb` carries `chemdraft`, the 3D sidecar and the
-   OPSIN runtime.
-5. Repacks the AppImage after Tauri bundles it. It uses the host's Wayland and compiler runtime
-   libraries and the host's `libgpg-error.so.0`. It also removes the bundled copies of libraries
+   OPSIN runtime. The `.deb`'s sidecar must have the SHA-256 pinned in
+   `scripts/engine3d-sidecar-linux.json`, pass the same checks as the committed file
+   (`scripts/verify-committed-linux-sidecar.mjs --packaged`), and be a regular file with mode
+   exactly 0755, both in the archive listing and once extracted, so every user can run it after a
+   root-owned install.
+5. Repacks the AppImage after Tauri bundles it. It replaces linuxdeploy's copy of the sidecar
+   (whose RUNPATH linuxdeploy may rewrite) with the committed file verified in step 2, and after
+   repacking re-extracts the AppImage and checks that copy against the pin and for mode 0755 the
+   same way. It uses
+   the host's Wayland and compiler runtime libraries and the host's `libgpg-error.so.0`. It also removes the bundled copies of libraries
    that host Mesa (`libEGL_mesa`, `libgallium`, `libgbm`, the DRI drivers) depends on, so the
    Ubuntu 22.04 copies never shadow the host's newer ones: `libzstd.so*`, `libelf.so*` and
    `libelf-*.so`, `libffi.so*`, `libXau.so*`, `libXdmcp.so*`, `libxcb-randr.so*`,
@@ -67,6 +86,34 @@ The workflow:
 The [release body generator](three-builds.md#draft-the-body-on-macos) adds `## Linux` when both
 packages and their records are present and verified. Passing `--include-linux` requires that complete
 verified set in the assets directory.
+
+## The x86_64 3D sidecar
+
+`apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu` is a committed
+binary, pinned by SHA-256 in `scripts/engine3d-sidecar-linux.json`, the one place packaging reads
+its hash. Once the file is no longer the placeholder, `scripts/verify-committed-linux-sidecar.test.ts`
+checks the bytes on disk against the pin, and the dependency inventory against both pinned values.
+`.github/workflows/linux-sidecar-build.yml` builds it from the pinned avogadrolibs and Eigen
+commits on Ubuntu 22.04, as `native/avogadro3d-sidecar/README.md` describes, runs the audit, the
+handshake check and the three `smoke:engine3d-*` smokes, and uploads the artifact
+`engine3d-sidecar-linux-x86_64` (the binary and its `.sha256`). To land or replace it:
+
+1. `gh workflow run linux-sidecar-build.yml --ref <branch or tag>` once the file is on `main`
+   (GitHub dispatches only workflows on the default branch), or push the commit to build to the
+   branch `ci/linux-sidecar-build` (`git push -f origin <commit>:refs/heads/ci/linux-sidecar-build`),
+   which triggers it. It has no inputs and builds that ref's sources.
+2. From the run's summary, note the run id and the SHA-256. Download the artifact
+   (`gh run download <run id> -n engine3d-sidecar-linux-x86_64 -D <dir>`) and check it with
+   `sha256sum --check avogadro3d-sidecar-x86_64-unknown-linux-gnu.sha256` in that folder.
+3. `install -m 0755 <dir>/avogadro3d-sidecar-x86_64-unknown-linux-gnu
+   apps/desktop/src-tauri/binaries/` (git must record mode 100755).
+4. In `scripts/engine3d-sidecar-linux.json`, replace both `PENDING-MAINTAINER-COMMIT` values:
+   `buildRunId` with the run id, `sha256` with the SHA-256.
+5. In `docs/architecture/dependency-inventory.md`, fill in the same `run id:` and `SHA-256:`
+   in the `avogadrolibs` row.
+6. Commit all three files together. Any change to the avogadrolibs commit pinned in
+   `native/avogadro3d-sidecar/CMakeLists.txt` needs a rebuilt, recommitted sidecar: the handshake
+   check requires the binary to report that commit.
 
 ## Ubuntu smoke diagnostics
 
@@ -271,8 +318,13 @@ repository on GitHub Pages, or a Flathub listing.
 - Menus: on the document window, as on Windows (`install_app_menu`). Edit ▸ Cut / Copy / Paste
   invoke WebKitGTK's native editing commands in the focused window. The webview receives
   Ctrl+X / C / V directly and uses the same clipboard events for menu clicks and shortcuts.
-- 3D: the `avogadro3d-sidecar` for Linux is still the placeholder (`binaries/README.md`), so 3D
-  reports itself unavailable until a real Linux sidecar is built.
+- 3D: the x86_64 `avogadro3d-sidecar` is committed like the macOS and Windows ones, built by
+  `linux-sidecar-build.yml` (see [The x86_64 3D sidecar](#the-x86_64-3d-sidecar)); the aarch64
+  Linux file stays a placeholder (`binaries/README.md`). The container smoke checks that the
+  installed sidecar from the `.deb` and from the AppImage is a real ELF that completes its
+  handshake on each distro. A build that bundles a placeholder omits Interactive 3D from the
+  toolbars, menus, palettes and Customize gallery for the whole session (AGENTS.md §10) rather
+  than showing it disabled; Spin 3D does not use the sidecar and always stays.
 - Clipboard: `linux_clipboard.rs`, GTK's clipboard (X11 and Wayland). Targets are MIME types, so
   the editor's payload types are written unchanged; plain text is also offered as `UTF8_STRING`,
   `STRING` and `TEXT` for older X11 applications.

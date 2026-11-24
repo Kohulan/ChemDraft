@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import ts from "typescript";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { open, save } from "./nativeFileDialog";
+import { filtersMatchingDefaultPathFirst, open, save, saveDialogOptionsForPlatform } from "./nativeFileDialog";
 import { nativePrompt } from "./nativePrompt";
 
 const native = vi.hoisted(() => ({ invoke: vi.fn(), open: vi.fn(), save: vi.fn(), message: vi.fn() }));
@@ -100,5 +100,59 @@ describe("native file panels", () => {
       }
     };
     visit(root);
+  });
+});
+
+describe("Linux save filter order (blank GTK file-type list)", () => {
+  const documentFilters = [
+    { name: "ChemDraft", extensions: ["chemdraft"] },
+    { name: "CDXML", extensions: ["cdxml"] },
+    { name: "CDX (*.cdx)", extensions: ["cdx"] }
+  ];
+
+  it("offers the filter matching the suggested file first, keeping the others in order", () => {
+    expect(filtersMatchingDefaultPathFirst(documentFilters, "/tmp/drawing.cdxml").map(filter => filter.name))
+      .toEqual(["CDXML", "ChemDraft", "CDX (*.cdx)"]);
+    expect(filtersMatchingDefaultPathFirst(documentFilters, "C:\\Users\\a\\Drawing.CDX").map(filter => filter.name))
+      .toEqual(["CDX (*.cdx)", "ChemDraft", "CDXML"]);
+  });
+
+  it.each([
+    ["the first filter already matches", "/tmp/drawing.chemdraft"],
+    ["no filter matches", "/tmp/drawing.mol"],
+    ["the name has no extension", "/tmp/cdxml"]
+  ])("returns the same list when %s", (_case, defaultPath) => {
+    expect(filtersMatchingDefaultPathFirst(documentFilters, defaultPath)).toBe(documentFilters);
+  });
+
+  it("treats a \"*\" filter as matching any name", () => {
+    const filters = [{ name: "PNG", extensions: ["png"] }, { name: "All files", extensions: ["*"] }];
+    expect(filtersMatchingDefaultPathFirst(filters, "notes.txt").map(filter => filter.name)).toEqual(["All files", "PNG"]);
+  });
+
+  it("reorders only on Linux and only when there is a suggested path and filters", () => {
+    const options = { title: "Save", defaultPath: "/tmp/drawing.cdxml", filters: documentFilters };
+    expect(saveDialogOptionsForPlatform(options, "linux")).toEqual({
+      title: "Save", defaultPath: "/tmp/drawing.cdxml", filters: [documentFilters[1], documentFilters[0], documentFilters[2]]
+    });
+    // The caller's options are not mutated.
+    expect(options.filters).toBe(documentFilters);
+    for (const platform of ["macos", "windows"] as const) {
+      expect(saveDialogOptionsForPlatform(options, platform)).toBe(options);
+    }
+    const noPath = { title: "Save", filters: documentFilters };
+    expect(saveDialogOptionsForPlatform(noPath, "linux")).toBe(noPath);
+    const noFilters = { title: "Save", defaultPath: "/tmp/drawing.cdxml" };
+    expect(saveDialogOptionsForPlatform(noFilters, "linux")).toBe(noFilters);
+    expect(saveDialogOptionsForPlatform(undefined, "linux")).toBeUndefined();
+  });
+
+  it.each(["linux", "macos", "windows"] as const)("hands the %s panel the platform's filter order", async platform => {
+    native.invoke.mockResolvedValue(undefined);
+    native.save.mockResolvedValue(null);
+    await save({ defaultPath: "/tmp/drawing.cdxml", filters: documentFilters }, undefined, platform);
+    expect(native.save.mock.calls[0]![0].filters.map((filter: { name: string }) => filter.name)).toEqual(
+      platform === "linux" ? ["CDXML", "ChemDraft", "CDX (*.cdx)"] : ["ChemDraft", "CDXML", "CDX (*.cdx)"]
+    );
   });
 });
