@@ -2,11 +2,12 @@ import { KEYBOARD_PREFERENCES_COMMAND_ID } from "../commands";
 import { lazy, Suspense, useRef, useState } from "react";
 import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import type { DialogCoordinator } from "../dialogs/DialogCoordinator";
-import type { KeybindingScheme } from "../keybindingSettings";
+import type { KeybindingScheme, KeybindingSettings } from "../keybindingSettings";
 import { updateShortcutPreference } from "../useShortcutPreference";
 import { isDesktopRuntime } from "../window-manager";
-import { TOUR_NAME_COMMAND, TOUR_SAMPLE_COMMAND, type TourAction, type TourPluginCommand } from "./tourCommands";
+import { PLUGIN_AUTHORING_GUIDE_URL, TOUR_NAME_COMMAND, TOUR_SAMPLE_COMMAND, type TourAction, type TourPluginCommand } from "./tourCommands";
 import { saveTourSeen, useAutomaticTour, type TourMode } from "./tourState";
+import { tourBondKeys } from "./tourSteps";
 
 const TourForm = lazy(() => import("./TourForm").then(module => ({ default: module.TourForm })));
 
@@ -14,6 +15,8 @@ export function useGuidedTour(options: {
   coordinator: () => DialogCoordinator | undefined;
   readyAndIdle: () => boolean;
   scheme: KeybindingScheme;
+  /** The user's shortcut overrides, so the drawing lesson names the key the canvas actually uses. */
+  shortcutOverrides?: KeybindingSettings["overrides"];
   platform?: ShortcutPlatform;
   /** Plugin commands the menus offer now (`availableTourPluginCommands`); read once per open. */
   plugins?: () => readonly TourPluginCommand[];
@@ -32,7 +35,7 @@ export function useGuidedTour(options: {
     if (isDesktopRuntime()) {
       const coordinator = options.coordinator();
       if (!coordinator) throw new Error("The dialog host is unavailable.");
-      await coordinator.openGuidedTour(options.scheme, automatic, options.plugins?.() ?? []);
+      await coordinator.openGuidedTour(options.scheme, automatic, options.plugins?.() ?? [], tourBondKeys(options.shortcutOverrides));
     } else {
       setBrowserError(undefined);
       setBrowserPlugins(options.plugins?.() ?? []);
@@ -73,6 +76,12 @@ export function useGuidedTour(options: {
         }
         await commands.invoke(action.command);
         break;
+      case "openGuide":
+        // On the desktop the native tour window opens the guide itself (Rust checks the address); the
+        // owner never receives this. In the browser build the tour is part of this page.
+        if (isDesktopRuntime() || action.url !== PLUGIN_AUTHORING_GUIDE_URL) throw new Error("The tour could not open the plugin authoring guide.");
+        window.open(PLUGIN_AUTHORING_GUIDE_URL, "_blank", "noopener,noreferrer");
+        break;
     }
   };
 
@@ -84,6 +93,7 @@ export function useGuidedTour(options: {
       <div className="guided-tour-preview">
         <Suspense fallback={<p>Opening tour…</p>}>
           <TourForm scheme={options.scheme} platform={options.platform} plugins={browserPlugins} busy={browserBusy} error={browserError}
+            bondKeys={tourBondKeys(options.shortcutOverrides)}
             onAction={action => {
               setBrowserError(undefined);
               setBrowserBusy(true);
