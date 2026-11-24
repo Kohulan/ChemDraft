@@ -8,6 +8,7 @@ import {
   compareNativeVersions, isNativeRecord, NativeVersionSchema, ownNativeValue,
   setNativeValue, stableExtensionPath, type NativeExtension
 } from "./nativeCompatibilityState";
+import { describeRenumberedId, duplicateObjectIdsMessage, renumberDuplicatePageObjectIds } from "./objectIds";
 
 export type NativeDocumentWarningCode =
   | "NATIVE_UNKNOWN_FIELD_PRESERVED"
@@ -15,7 +16,8 @@ export type NativeDocumentWarningCode =
   | "NATIVE_STYLE_PRESET_FALLBACK"
   | "NATIVE_CHEMISTRY_ENUM_FALLBACK"
   | "NATIVE_BRACKET_USAGE_PRESERVED"
-  | "NATIVE_VISUAL_ENUM_FALLBACK";
+  | "NATIVE_VISUAL_ENUM_FALLBACK"
+  | "NATIVE_DUPLICATE_OBJECT_IDS_RENUMBERED";
 
 export interface NativeDocumentReadWarning {
   code: NativeDocumentWarningCode;
@@ -80,6 +82,18 @@ export function readNativeDocument(
   })) as unknown;
   const warnings: NativeDocumentReadWarning[] = [];
   const extensions: NativeExtension[] = [];
+
+  // The schema has no id-uniqueness rule, so a hand-made or third-party file can hold two objects
+  // with one id on a page, or two atoms (or bonds) with one id in a molecule, which no write can then
+  // address safely. Renumber the later copies before anything else reads the ids (bracket pairing,
+  // preserved-extension paths). Ids only, never chemistry.
+  const renumbered = renumberDuplicatePageObjectIds(working);
+  if (renumbered.length) {
+    const message = duplicateObjectIdsMessage(renumbered);
+    console.warn("Native document open: renumbered duplicate same-page object ids and repeated atom/bond ids", message,
+      renumbered.map(describeRenumberedId).join("; "));
+    warnings.push({ code: "NATIVE_DUPLICATE_OBJECT_IDS_RENUMBERED", path: ["pages"], originalValue: renumbered, message });
+  }
 
   const preserve = (
     path: (string | number)[],

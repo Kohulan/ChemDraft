@@ -260,7 +260,10 @@ describe("hover label typing over a long chain (stress)", () => {
     await press("N");
     const committed = snapshot().document;
     for (const key of "Me") await press(key);
-    expect(molecule().atoms.every(atom => atom.hydrogenCount === undefined)).toBe(true);
+    // The relabel is a chemical edit of atom 1 alone: its stated count goes, every other atom keeps
+    // the count stated for it (owner ruling 1.2.3), and the history still rolls back exactly.
+    expect(molecule().atoms.map(atom => atom.hydrogenCount))
+      .toEqual(molecule().atoms.map((_, index) => index === 1 ? undefined : 0));
     await press("Escape");
     expect(snapshot().document).toEqual(committed);
     expect(snapshot().file.dirty).toBe(true);

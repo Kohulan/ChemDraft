@@ -117,7 +117,8 @@ export function compatibilityTools(createContext: AssistantToolsControllerOption
                 if (!receipt.ok) {
                   stop.throwIfAborted();
                   if (pageSpaceUnanswered && receipt.error.code === "cancelled") return { objectIds: [], pageSpaceUnanswered: true };
-                  throw new RequestWriteError(receipt.error.code, receipt.error.message);
+                  throw new RequestWriteError(receipt.error.code, receipt.error.message,
+                    receipt.error.reason !== undefined ? { reason: receipt.error.reason, details: receipt.error.details } : undefined);
                 }
                 return { objectIds: receipt.value.touched.map(ref => ref.objectId) };
               }

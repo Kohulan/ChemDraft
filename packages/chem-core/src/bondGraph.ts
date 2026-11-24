@@ -1,6 +1,16 @@
 import type { MoleculeBond } from "./schemas";
 
 /**
+ * A dashed single bond depicts a dative/coordination interaction (zero covalent valence on either
+ * atom). V3000 spells it as bond type 9, the CTfile coordination type, so the file round-trips;
+ * V2000 has no coordination type, so there it degrades to a plain single bond and the writer warns.
+ * Requiring single order prevents display styling on a multiple bond from deleting its bond order.
+ */
+export function isDativeBond(bond: MoleculeBond): boolean {
+  return bond.order === "single" && bond.display?.bondStyle === "dashed";
+}
+
+/**
  * Bonds (by index) whose removal disconnects the graph of included bonds — the bonds in no ring.
  * Tarjan's low-link walk, iterative so a long chain cannot overflow the stack.
  */

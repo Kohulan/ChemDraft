@@ -24,6 +24,12 @@ function substanceGroupRefusal(molecules: readonly InspectionMolecule[]): string
   }
 }
 
+/** Centres RDKit tagged "(?)": both inspection paths pass this count to `stereochemistryLabels`. */
+function unassignedCentres(tags: StereoTags): number {
+  return (tags.CIP_atoms ?? []).filter(([, descriptor]) => descriptor === "(?)").length +
+    (tags.CIP_bonds ?? []).filter(([, , descriptor]) => descriptor === "(?)").length;
+}
+
 /** Worker-only inspection. The comparison itself belongs to document-workflow-core. */
 export function inspectStructureInWorker(
   module: Pick<RdkitMinimalModule, "get_mol">, value: string, stereoReference?: string, details?: StructureInspectionDetails
@@ -78,7 +84,7 @@ export function inspectStructureInWorker(
       if (!withStereo.get_stereo_tags) return { valid: false, code: "unavailable", reason: "RDKit stereo inspection is unavailable." };
       const tags = withStereo.get_stereo_tags();
       result.stereoTags = JSON.parse(tags) as StereoTags;
-      result.stereochemistry = stereochemistryLabels(tags, 0);
+      result.stereochemistry = stereochemistryLabels(tags, unassignedCentres(result.stereoTags));
       result.formalCharge = composition.formalCharge;
       // Native CTAB order is stable across placements. Keep RDKit's atom-local charges,
       // isotopes, radical electrons and stereo, and its bond stereo and group memberships.
@@ -90,10 +96,7 @@ export function inspectStructureInWorker(
     if (details === "stereochemistry") {
       if (!withStereo.get_stereo_tags) return { valid: false, code: "unavailable", reason: "RDKit stereo inspection is unavailable." };
       const tags = withStereo.get_stereo_tags();
-      const cip = JSON.parse(tags) as StereoTags;
-      const unassigned = (cip.CIP_atoms ?? []).filter(([, descriptor]) => descriptor === "(?)").length +
-        (cip.CIP_bonds ?? []).filter(([, , descriptor]) => descriptor === "(?)").length;
-      result.stereochemistry = stereochemistryLabels(tags, unassigned);
+      result.stereochemistry = stereochemistryLabels(tags, unassignedCentres(JSON.parse(tags) as StereoTags));
     } else if (details === "topology") {
       const mol = graph.molecules[0];
       if (!mol || graph.molecules.length !== 1) return { valid: false, reason: "RDKit did not return one CTAB graph." };

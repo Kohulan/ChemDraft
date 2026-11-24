@@ -34,17 +34,47 @@ export interface OpenWarningsReport {
   warnings: readonly OpenWarning[];
 }
 
-/** Independent optional session metadata: a malformed report must not discard its sibling or tab. */
-export function restoreSessionWarningReports(session: Pick<DocumentSessionEnvelope, "openWarnings" | "saveWarnings">): {
+/**
+ * Independent optional session metadata: a malformed report must not discard its sibling or tab.
+ *
+ * `reread` is what the restore's own read of the autosaved contents reported. A saved open report
+ * keeps every warning it had (it describes the original file, which the session no longer holds),
+ * and gains each reread warning it does not already name, so a warning about what the document
+ * holds now (an H atom stating a count it cannot carry) is never hidden behind an older report.
+ * Without a saved open report the reread one stands, unless a save report took its place.
+ */
+export function restoreSessionWarningReports(
+  session: Pick<DocumentSessionEnvelope, "openWarnings" | "saveWarnings">,
+  reread?: OpenWarningsReport
+): {
   warnings?: OpenWarningsReport;
   saveWarnings?: OpenWarningsReport;
 } {
-  const open = session.openWarnings;
-  const save = session.saveWarnings;
+  const open = session.openWarnings?.operation === "save" ? undefined : session.openWarnings;
+  const save = session.saveWarnings ?? (session.openWarnings?.operation === "save" ? session.openWarnings : undefined);
   return {
-    warnings: open?.operation === "save" ? undefined : open,
-    saveWarnings: save ?? (open?.operation === "save" ? open : undefined)
+    warnings: open ? mergeOpenWarnings(open, reread?.warnings ?? []) : save ? undefined : reread,
+    saveWarnings: save
   };
+}
+
+/** The same warning: its code and what it names (molecule, atoms, bonds), or its words when it names nothing. */
+function openWarningKey(warning: OpenWarning): string {
+  const ids = (list: readonly string[] | undefined) => [...list ?? []].sort().join(",");
+  return warning.sourceObjectId === undefined && !warning.atomIds?.length && !warning.bondIds?.length
+    ? JSON.stringify([warning.code, warning.message])
+    : JSON.stringify([warning.code, warning.sourceObjectId ?? "", ids(warning.atomIds), ids(warning.bondIds)]);
+}
+
+function mergeOpenWarnings(report: OpenWarningsReport, added: readonly OpenWarning[]): OpenWarningsReport {
+  const known = new Set(report.warnings.map(openWarningKey));
+  const fresh = added.filter((warning) => {
+    const key = openWarningKey(warning);
+    if (known.has(key)) return false;
+    known.add(key);
+    return true;
+  });
+  return fresh.length ? { ...report, warnings: [...report.warnings, ...fresh] } : report;
 }
 
 /** What a warning's Show button selects: an object, and the atoms or bonds of it the warning names. */

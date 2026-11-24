@@ -44,6 +44,7 @@
       "@chemdraft/document-workflow-core/testing": ["packages/document-workflow-core/src/testing.ts"],
       "@chemdraft/shortcut-engine": ["packages/shortcut-engine/src/index.ts"],
       "@chemdraft/mechanism-tools": ["packages/mechanism-tools/src/index.ts"],
+      "@chemdraft/template-library/abbreviations": ["packages/template-library/src/abbreviations.ts"],
       "@chemdraft/template-library": ["packages/template-library/src/index.ts"],
       "@chemdraft/plugin-api": ["packages/plugin-api/src/index.ts"],
       "@chemdraft/plugin-host": ["packages/plugin-host/src/index.ts"],

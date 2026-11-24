@@ -1,28 +1,36 @@
 # Windows installer signing in CI
 
-`.github/workflows/windows-release.yml` builds ChemDraft's x64 NSIS installer on a GitHub-hosted
-Windows runner. SignPath Foundation can Authenticode-sign that CI artifact after the owner completes
+`.github/workflows/windows-release.yml` builds ChemDraft's per-user and all-users x64 NSIS installers
+on a GitHub-hosted Windows runner. SignPath Foundation can Authenticode-sign those CI artifacts after the owner completes
 the account setup below. This workflow is the only Windows release path; the
 [Windows VM path](windows-updates.md#windows-vm-path-retired) is retired for releases.
 
 There are two independent signatures, in this order:
 
-1. Build the stable installer with `CHEMDRAFT_STABLE_BUILD=1` and
+1. Build both stable installers with `CHEMDRAFT_STABLE_BUILD=1` and
    `CHEMDRAFT_SKIP_UPDATER_SIGNING=1`.
-2. Upload the unsigned installer as `windows-nsis-unsigned`, submit its artifact ID to SignPath,
-   wait for approval/completion, and download the signed installer. Require
+2. Upload both unsigned installers as `windows-nsis-unsigned`, submit its artifact ID to SignPath,
+   wait for approval/completion, and download both signed installers. Require each
    `Get-AuthenticodeSignature` to report `Valid` and the signer certificate subject to contain
    `EXPECTED_AUTHENTICODE_SUBJECT` before replacing the unsigned copy.
-3. Use `tauri signer sign` to create the updater `.exe.sig` over that **final** installer.
+3. Use `tauri signer sign` to create an updater `.exe.sig` over each **final** installer.
 4. Verify the updater signature against `plugins.updater.pubkey` in
-   `apps/desktop/src-tauri/tauri.windows.conf.json`, then generate `latest.json` with
-   `pnpm -s release:windows-manifest` and the optional Windows notes.
-5. Update the adjacent build record's `sha256` and `size` to cover the final signed installer,
-   preserving the clean-checkout source commit, version and target, then write checksums.
+   `apps/desktop/src-tauri/tauri.windows.conf.json`, then generate `latest.json` and
+   `latest-allusers.json` with `pnpm -s release:windows-manifest` and the optional Windows notes.
+5. Update each installer's adjacent build record's `sha256` and `size` to cover the final signed
+   installer, preserving the clean-checkout source commit, version and target, then write checksums.
 
 Authenticode changes the installer's bytes. Never Authenticode-sign, rebuild, or otherwise modify the
 installer after creating its updater `.sig`; recreate and verify the `.sig` and manifest if it changes.
 The opt-out is explicit: without it, VM builds retain their existing automatic updater signing.
+
+In addition to those two update targets, the workflow builds
+`ChemDraft_<ver>_x64-allusers-offline-setup.exe` with the WebView2 runtime included. It follows the
+same shared build, Authenticode signing, certificate verification and upload path, but has no
+updater `.sig` or separate feed. It inherits the all-users overlay's `latest-allusers.json` endpoint,
+so it downloads the normal all-users installer for updates once internet access is available.
+The workflow rejects offline updater signatures and any platform download URL in either feed that
+names the offline installer; release notes in a feed may still mention it.
 
 ## Owner setup for SignPath Foundation
 
@@ -49,13 +57,20 @@ certificate, or approval is supplied by the workflow.
    Foundation signing verifies the artifact's CI origin in the public repository: uploading a
    manually built VM executable to CI does not substitute for building it there.
 4. Create the project's default artifact configuration for the ZIP produced by
-   `actions/upload-artifact@v4`: a ZIP containing exactly `ChemDraft_*_x64-setup.exe` at its root,
-   with that installer selected for Authenticode signing. Set the required ChemDraft product/version
+   `actions/upload-artifact@v4`: a ZIP containing `ChemDraft_<ver>_x64-setup.exe` and
+   `ChemDraft_<ver>_x64-allusers-setup.exe` at its root, with both installers selected for
+   Authenticode signing (patterns `ChemDraft_*_x64-setup.exe` and
+   `ChemDraft_*_x64-allusers-setup.exe`). Update an existing single-installer artifact configuration
+   before the first two-installer signing run; the workflow refuses missing or extra returned files.
+   Set the required ChemDraft product/version
    metadata restrictions. The requested scope is the installer; do not configure signing of bundled
    third-party binaries. Use the Foundation-approved certificate and create a signing policy linked
    to the trusted GitHub build system, the repository and reviewed release refs. Require the
    Foundation's manual release approval. The workflow waits up to one hour for completion; failures
    fail the run rather than falling back to an unsigned installer.
+   Also include `ChemDraft_<ver>_x64-allusers-offline-setup.exe` at the ZIP root and select it for
+   Authenticode signing with `ChemDraft_*_x64-allusers-offline-setup.exe`. Update the SignPath
+   artifact configuration to cover all three installers before the first offline signing run.
 5. Create a restricted submitter API token for that project/policy. Under GitHub **Settings → Secrets
    and variables → Actions**, add:
 
@@ -98,6 +113,10 @@ builds. The release body includes `## macOS (Apple silicon)`, `## macOS (Intel)`
 plus `## Linux` when the Linux packages are included. The Platform differences note names each feature
 gap and its reason or says there are none. This workflow supplies the Windows artifacts only.
 
+The generated `## Windows` section lists all three installers as release-page downloads: per-user,
+all-users, and `ChemDraft_<ver>_x64-allusers-offline-setup.exe`, labeled "offline, for IT-managed
+machines", which the asset check requires to be attached.
+
 1. Set the app version before tagging, and prepare tracked Windows release notes if needed. Create
    the release tag and an **existing draft** GitHub release, for example `vX.Y.Z`.
 2. In **Actions → Windows release → Run workflow**, select that tag as the workflow ref, enter the
@@ -121,15 +140,17 @@ gap and its reason or says there are none. This workflow supplies the Windows ar
    verification, and final SHA-256 hashes and byte sizes. Build-time label checks inspect the native
    build output and built frontend assets. Install and launch the artifact on Windows to confirm its
    actual title and app identity and complete the update/session-preservation checks in [windows-updates.md](windows-updates.md#verification).
-5. Download **`windows-release`**, which contains the final installer, its `.exe.build.json`,
-   `.exe.sig`, `latest.json`, and `SHA256SUMS.txt`. The build record uses `git rev-parse HEAD`
+5. Download **`windows-release`**, which contains all three final installers, each with its
+   `.exe.build.json`, the per-user and all-users `.exe.sig` files, `latest.json`,
+   `latest-allusers.json`, and `SHA256SUMS.txt`. Each build record uses `git rev-parse HEAD`
    from the checked-out source and refuses a dirty tree; its SHA-256 and byte size cover the
    final installer. Keep it beside the installer.
-   **`windows-nsis-unsigned` is input to SignPath, not the release installer.**
+   **`windows-nsis-unsigned` is input to SignPath, not the release installers.**
    For a local updater signature check, from the repository root run:
 
    ```text
    pnpm exec tsx tools/release/verify-windows-updater.ts path/to/ChemDraft_X.Y.Z_x64-setup.exe
+   pnpm exec tsx tools/release/verify-windows-updater.ts path/to/ChemDraft_X.Y.Z_x64-allusers-setup.exe
    ```
 
 6. If `upload_to_release` was supplied, a separate job downloads the final artifact and uses
@@ -153,7 +174,7 @@ gap and its reason or says there are none. This workflow supplies the Windows ar
    pairs and rejects partial pairs or an incomplete Linux set. The Windows-only
    result is INCOMPLETE, not a publishing pass. Windows passes `--skip-dmg-provenance` explicitly
    because it cannot mount DMGs; the final Mac gate must check their embedded commits.
-8. Collect both DMGs and the installer with their adjacent `.build.json` files. If you are including
+8. Collect both DMGs and the three Windows installers with their adjacent `.build.json` files. If you are including
    Linux, also collect `ChemDraft_X.Y.Z_amd64.deb`, `ChemDraft_X.Y.Z_amd64.AppImage`, and their
    records. The [Linux workflow](linux.md#releasing) builds and records both packages and uploads
    them to the existing draft after smoke tests pass when `upload_to_release` is supplied. For a manual
@@ -176,15 +197,16 @@ gap and its reason or says there are none. This workflow supplies the Windows ar
    `verify-macos-app.mjs --release --dmg` checks and
    `node tools/release/check-release-assets.mjs --tag vX.Y.Z --commit <full-sha>` against GitHub,
    as listed in [the final checklist](three-builds.md#last-step-before-un-drafting).
-   It must report PASS without skip or incomplete flags; then publish the joint release. Only **after** the installer
-   URL is publicly downloadable, commit the generated `latest.json` to `main` through the normal PR
-   path. This workflow neither publishes the release nor updates the feed on `main`.
+   It must report PASS without skip or incomplete flags; then publish the joint release. Only **after** both installer
+   URLs are publicly downloadable, commit the generated `latest.json` and `latest-allusers.json`
+   together to `main` through the normal PR path. This workflow neither publishes the release nor
+   updates either feed on `main`.
 
 ## Dry runs before credentials exist
 
 - Missing `SIGNPATH_API_TOKEN`: a loud workflow warning, Authenticode skipped, installer retained.
   If the updater key is available it still signs those final unsigned bytes and generates the feed.
-- Missing `TAURI_SIGNING_PRIVATE_KEY`: a loud warning, no `.sig` or `latest.json`; the installer and
+- Missing `TAURI_SIGNING_PRIVATE_KEY`: a loud warning, no `.sig`, `latest.json` or `latest-allusers.json`; both installers and
   checksums are still uploaded. Authenticode can run independently.
 - A SignPath token with missing organization/project/policy variables is an error. A configured
   signing operation or verification that fails is an error, never a silent dry run.

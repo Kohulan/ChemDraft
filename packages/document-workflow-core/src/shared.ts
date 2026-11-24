@@ -8,19 +8,9 @@ export const phase4Timestamp = "2026-05-29T00:00:00.000Z";
 
 export type PagePoint = LayoutPoint;
 
-export function nextObjectId(document: ChemDraftDocument, prefix: string, reserved?: ReadonlySet<string>): string {
-  const existingIds = new Set(document.pages.flatMap((page) => page.objects.map((object) => object.id)));
-  let index = existingIds.size + 1;
-  let id = `${prefix}_${String(index).padStart(3, "0")}`;
-
-  // `reserved` covers ids issued but not yet applied — see SmilesMoleculeSource.reservedObjectIds.
-  while (existingIds.has(id) || reserved?.has(id)) {
-    index += 1;
-    id = `${prefix}_${String(index).padStart(3, "0")}`;
-  }
-
-  return id;
-}
+// The object-id allocator lives in chem-core, which the native file reader also uses to renumber
+// duplicate same-page ids on open; re-exported here so every builder keeps importing it from this module.
+export { nextObjectId } from "@chemdraft/chem-core";
 
 export function firstPage(document: ChemDraftDocument): ChemDraftDocument["pages"][number] {
   const page = document.pages[0];

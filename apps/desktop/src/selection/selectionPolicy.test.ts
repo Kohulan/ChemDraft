@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   applySelection,
   fromSelectionItems,
+  selectionAfterElectronMarkPlacement,
   selectionItemFromHit,
   selectionItemsEqual,
   selectionModeFromEvent,
@@ -215,5 +216,29 @@ describe("selectionItemFromHit", () => {
     expect(selectionItemFromHit({ objectId: "m", kind: "ring", ringKey: "r1", atomIds: ["a1"], bondIds: ["b1"] })).toEqual(
       ring("m", "r1", ["a1"], ["b1"])
     );
+  });
+});
+
+describe("selectionAfterElectronMarkPlacement", () => {
+  const owner = { objectId: "mol" };
+  it("adds the placed mark to a whole-selected owner molecule's selection", () => {
+    expect(selectionAfterElectronMarkPlacement([obj("mol")], owner, ["charge"])).toEqual([obj("mol"), obj("charge")]);
+    expect(selectionAfterElectronMarkPlacement([obj("text"), obj("mol")], owner, ["charge"]))
+      .toEqual([obj("text"), obj("mol"), obj("charge")]);
+  });
+  it("counts the owner as selected whole through its selectable group", () => {
+    expect(selectionAfterElectronMarkPlacement([obj("group")], { objectId: "mol", selectedAs: "group" }, ["charge"]))
+      .toEqual([obj("group"), obj("charge")]);
+  });
+  it("does not duplicate a bumped mark that is already selected", () => {
+    expect(selectionAfterElectronMarkPlacement([obj("mol"), obj("charge")], owner, ["charge"]))
+      .toEqual([obj("mol"), obj("charge")]);
+  });
+  it("selects the mark alone when the owner is unselected or only partly selected", () => {
+    expect(selectionAfterElectronMarkPlacement([], owner, ["charge"])).toEqual([obj("charge")]);
+    expect(selectionAfterElectronMarkPlacement([obj("other")], owner, ["charge"])).toEqual([obj("charge")]);
+    expect(selectionAfterElectronMarkPlacement([obj("charge")], owner, ["charge"])).toEqual([obj("charge")]);
+    expect(selectionAfterElectronMarkPlacement([atom("mol", "a1")], owner, ["charge"])).toEqual([obj("charge")]);
+    expect(selectionAfterElectronMarkPlacement([obj("mol"), bond("mol", "b1")], owner, ["charge"])).toEqual([obj("charge")]);
   });
 });

@@ -8,7 +8,9 @@
 // chem-core is never a runtime dependency of either published package: for `plugin-api` its use is
 // type-only (esbuild erases it; the dts inlines it), and for `plugin-host` its runtime (`applyPatch`) is
 // bundled in via an esbuild alias while the shared `ChemDraftDocument` type is kept canonical by taking
-// it from `@chemdraft/plugin-api` (external) rather than re-inlining a second copy.
+// it from `@chemdraft/plugin-api` (external) rather than re-inlining a second copy. The bundled copy
+// shares chem-core's object-identity runtime with every other chem-core copy in the realm (published on
+// globalThis, see chem-core/src/objectIdentity.ts), so a host's own chem-core keeps the SDK's pins.
 //
 // Usage: node scripts/build-sdk.mjs <plugin-api|plugin-host>
 import { build as esbuild } from "esbuild";
@@ -20,6 +22,10 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const chemCoreSrc = join(root, "packages/chem-core/src/index.ts");
+// chem-core's declared dependency, the abbreviation table (imports nothing). Inlined into the
+// bundle so the published SDK never depends on the private template-library package.
+const abbreviationsSrc = join(root, "packages/template-library/src/abbreviations.ts");
+const abbreviationsSpecifier = "@chemdraft/template-library/abbreviations";
 
 const CONFIGS = {
   "plugin-api": {
@@ -29,16 +35,16 @@ const CONFIGS = {
     // The dts must INLINE chem-core's ChemDraftDocument/DocumentPatch → resolve it via paths, keep it
     // non-external. zod stays external.
     dtsExternal: ["zod"],
-    dtsPaths: { "@chemdraft/chem-core": [chemCoreSrc] }
+    dtsPaths: { "@chemdraft/chem-core": [chemCoreSrc], [abbreviationsSpecifier]: [abbreviationsSrc] }
   },
   "plugin-host": {
     // Bundle the chem-core runtime (aliased to source); keep the SDK peer and zod external.
     jsExternal: ["@chemdraft/plugin-api", "zod"],
-    jsAlias: { "@chemdraft/chem-core": chemCoreSrc },
+    jsAlias: { "@chemdraft/chem-core": chemCoreSrc, [abbreviationsSpecifier]: abbreviationsSrc },
     // Inline chem-core's ApplyPatchOptions; @chemdraft/plugin-api (incl. the canonical ChemDraftDocument)
     // and zod remain external imports.
     dtsExternal: ["@chemdraft/plugin-api", "zod"],
-    dtsPaths: { "@chemdraft/chem-core": [chemCoreSrc] }
+    dtsPaths: { "@chemdraft/chem-core": [chemCoreSrc], [abbreviationsSpecifier]: [abbreviationsSrc] }
   }
 };
 
