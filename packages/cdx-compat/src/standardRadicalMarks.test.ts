@@ -125,4 +125,26 @@ describe("standard radical dots on Save As (#442 follow-up)", () => {
     expect(reads(80, "reference") / reads(40, "reference")).toBeGreaterThan(3.2);
     expect(reads(80, "indexed") / reads(40, "indexed")).toBeLessThan(2.5);
   });
+
+  it("looks atoms up by id: one molecule of N atoms that each carry a dot costs linear atom reads", () => {
+    const reads = (count: number, check: "indexed" | "reference") => {
+      const atoms = Array.from({ length: count }, (_, index) =>
+        `<n id="${1000 + index}" Element="8" p="${40 + (index % 20) * 30} ${40 + Math.floor(index / 20) * 30}" Radical="Doublet"/>`).join("");
+      const opened = structuredClone(openChemDraftPayload(`<CDXML><page><fragment id="5000">${atoms}</fragment></page></CDXML>`).document!.pages[0]);
+      const molecules = opened.objects.filter(object => object.type === "molecule");
+      expect(molecules).toHaveLength(1);
+      let gets = 0;
+      const molecule = molecules[0];
+      molecule.atoms = new Proxy(molecule.atoms, {
+        get(target, key, receiver) { gets++; return Reflect.get(target, key, receiver) as unknown; }
+      });
+      const dots = opened.objects.filter(object => object.type === "electron-mark" && object.markKind === "radical-dot");
+      expect(dots).toHaveLength(count);
+      const result = decisions(opened, check);
+      expect(result.every(Boolean)).toBe(true);
+      return gets;
+    };
+    expect(reads(80, "reference") / reads(40, "reference")).toBeGreaterThan(3.2);
+    expect(reads(80, "indexed") / reads(40, "indexed")).toBeLessThan(2.5);
+  });
 });

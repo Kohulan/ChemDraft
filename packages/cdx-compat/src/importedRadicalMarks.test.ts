@@ -99,4 +99,25 @@ describe("imported radical marks (Codex security finding on #442)", () => {
     // Linear: doubling the input roughly doubles the reads (a quadratic pass would quadruple them).
     expect(large / small).toBeLessThan(2.5);
   });
+
+  it("warns once when more than 256 marks crowd one atom, and not on a normal page", () => {
+    const normal = pageWithoutGeneratedDots(cdxml([{ radical: "Doublet" }, { radical: "Triplet" }, {}]));
+    const normalWarnings: { code: string; message: string }[] = [];
+    addImportedRadicalMarks(normal, normalWarnings);
+    expect(normalWarnings).toEqual([]);
+
+    const crowded = pageWithoutGeneratedDots(cdxml([{ radical: "Doublet" }]));
+    const molecule = crowded.objects.find((object): object is MoleculeObject => object.type === "molecule")!;
+    const near = transformPointForObject(molecule, molecule.atoms[0]);
+    // Charges on the atom itself make its free slot occupied, so placement scores candidates against the crowd.
+    for (let index = 0; index < 300; index++) crowded.objects.push({
+      id: `stack${index}`, type: "electron-mark", markKind: "charge", charge: 1, x: near.x + 20, y: near.y,
+      width: nativeChargeMarkSizePx, height: nativeChargeMarkSizePx, rotation: 0, style: { source: "chemdraft-native-charge" },
+      anchor: { kind: "atom", objectId: molecule.id, atomId: molecule.atoms[0].id }, atomAssociation: "explicit"
+    } as ElectronMarkObject);
+    const warnings: { code: string; message: string }[] = [];
+    addImportedRadicalMarks(crowded, warnings);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].message).toContain("more than 256 marks crowd one atom");
+  });
 });

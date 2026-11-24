@@ -13,7 +13,7 @@ import { ElectronMarkPlacementIndex, nativeChargeMarkSizePx, nativeRadicalPlacem
  * crafted file of many atoms carrying marks cost (atoms x marks) before validation (Codex security
  * finding on #442). The index places every dot exactly where the whole page would.
  */
-export function addImportedRadicalMarks(page: DocumentPage): void {
+export function addImportedRadicalMarks(page: DocumentPage, warnings?: { code: string; message: string }[]): void {
   const marks = ElectronMarkPlacementIndex.of(page.objects);
   const ids = new Set<string>();
   const molecules: MoleculeObject[] = [];
@@ -53,4 +53,6 @@ export function addImportedRadicalMarks(page: DocumentPage): void {
       }
     }
   }
+  if (marks.scoreCapHits > 0) warnings?.push({ code: "cdxml.radical_mark_placement_approximate",
+    message: `${marks.scoreCapHits} electron mark placement${marks.scoreCapHits === 1 ? " was" : "s were"} approximate: more than 256 marks crowd one atom, so only the first 256 were scored by distance.` });
 }

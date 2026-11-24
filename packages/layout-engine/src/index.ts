@@ -4354,6 +4354,8 @@ interface ElectronMarkPlacementIndexData {
   ungriddedRadicals: IndexedScoringMark[];
   cellSize: number;
   maxScoredMarks: number;
+  /** How many candidate scores hit maxScoredMarks (nearby marks past it counted as far). */
+  capHits: number;
 }
 
 /**
@@ -4391,7 +4393,7 @@ export class ElectronMarkPlacementIndex {
       chargeCells: new Map(), radicalCells: new Map(), ungriddedCharges: [], ungriddedRadicals: [],
       // Wider than the score's reach (1.5 bond lengths) by a pixel of rounding slack.
       cellSize: ChemDraftSyntheticStylePreset.drawing.bondLengthPx * 1.5 + 1,
-      maxScoredMarks: options.maxScoredMarks ?? 256
+      maxScoredMarks: options.maxScoredMarks ?? 256, capHits: 0
     }, Infinity);
     for (const object of objects) index.add(object);
     return index;
@@ -4428,6 +4430,9 @@ export class ElectronMarkPlacementIndex {
       else cells.set(key, [entry]);
     }
   }
+
+  /** How many candidate scores so far were approximated because more than `maxScoredMarks` marks crowded the candidate. */
+  get scoreCapHits(): number { return this.data.capHits; }
 
   /** This index as if built from only the first `count` objects (`objects.slice(0, count)`). */
   before(count: number): ElectronMarkPlacementIndex {
@@ -4471,6 +4476,7 @@ export class ElectronMarkPlacementIndex {
       const counts = lists.map(list => countBelow(list, limit, entry => entry.position));
       const nearby = counts.reduce((sum, count) => sum + count, 0);
       const take = Math.min(nearby, data.maxScoredMarks);
+      if (nearby > take) data.capHits++;
       const scored = lists.flatMap((list, index) => list.slice(0, Math.min(counts[index], take)))
         .sort((left, right) => left.position - right.position).slice(0, take);
       let sum = 0, next = 0;

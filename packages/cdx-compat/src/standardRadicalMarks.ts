@@ -1,4 +1,4 @@
-import type { DocumentObject, DocumentPage, ElectronMarkObject } from "@chemdraft/chem-core";
+import type { DocumentObject, DocumentPage, ElectronMarkObject, MoleculeObject } from "@chemdraft/chem-core";
 import {
   ElectronMarkPlacementIndex, nativeChargeMarkSizePx, nativeChargePlacementPointForAtom, nativeRadicalPlacementPointForAtom,
   transformPointForObject
@@ -19,6 +19,8 @@ export interface StandardRadicalMarkPageIndex {
   positions: ReadonlyMap<DocumentObject, number>;
   /** Radical dots and radical-ion charges anchored to each atom, by molecule id then atom id. */
   carried: ReadonlyMap<string, ReadonlyMap<string, number>>;
+  /** The atom with an id in a molecule (the first, as `find` returned), its id map built once per molecule on first use. */
+  atomOf(molecule: MoleculeObject, atomId: string | undefined): MoleculeObject["atoms"][number] | undefined;
 }
 
 /** Built once per page per export, on the page's first radical dot that needs it. */
@@ -33,7 +35,16 @@ export function standardRadicalMarkPageIndex(page: DocumentPage): StandardRadica
     if (!byAtom) carried.set(object.anchor.objectId, byAtom = new Map());
     byAtom.set(object.anchor.atomId, (byAtom.get(object.anchor.atomId) ?? 0) + 1);
   });
+  const atomMaps = new Map<MoleculeObject, Map<string, MoleculeObject["atoms"][number]>>();
   return {
+    atomOf(molecule, atomId) {
+      let atoms = atomMaps.get(molecule);
+      if (!atoms) {
+        atomMaps.set(molecule, atoms = new Map());
+        for (const atom of molecule.atoms) if (!atoms.has(atom.id)) atoms.set(atom.id, atom);
+      }
+      return atomId === undefined ? undefined : atoms.get(atomId);
+    },
     marks: ElectronMarkPlacementIndex.of(page.objects),
     charges: ElectronMarkPlacementIndex.of(page.objects.filter(object => object.type !== "electron-mark" || object.markKind === "charge")),
     positions,
@@ -58,7 +69,8 @@ export function isStandardAtomRadicalMark(
   const { objectId, atomId } = mark.anchor;
   const molecule = objectId && objectsById.get(objectId);
   if (!molecule || molecule.type !== "molecule") return false;
-  const atom = molecule.atoms.find(atom => atom.id === atomId);
+  const index = pageIndex();
+  const atom = index.atomOf(molecule, atomId);
   if (!atom) return false;
   // Source handles follow direct edits to the atom's radical state, including its removal.
   // Compare the current atom-relative frame: a stationary dot must not stay exempt when
@@ -74,7 +86,6 @@ export function isStandardAtomRadicalMark(
     // Older native payloads lack relative coordinates: require the current default below.
   }
   if (!isRecord(imported) && atom.markRadicals !== 1 && atom.markRadicals !== 2) return false;
-  const index = pageIndex();
   const carried = index.carried.get(molecule.id)?.get(atom.id) ?? 0;
   if (!isRecord(imported) && carried !== atom.markRadicals) return false;
   // Legacy imports placed both triplet dots in the charge-tool slot. Keep those untouched

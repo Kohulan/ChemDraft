@@ -3912,7 +3912,7 @@ function importVisibleCdxmlFromTree(tree: OrderedXmlTree, sourceFormat: "CDXML" 
         objects: importedPage.objects,
         crossings: importedPage.crossings
       };
-      addImportedRadicalMarks(page);
+      addImportedRadicalMarks(page, warnings);
       return page;
     });
   } catch (error) {
