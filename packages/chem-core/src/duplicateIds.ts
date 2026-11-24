@@ -1,4 +1,4 @@
-import type { ChemDraftDocument, DocumentObject, MoleculeObject } from "./schemas";
+import type { ChemDraftDocument, DocumentObject } from "./schemas";
 
 /** One id the reader gave a fresh value. `kind` says which id space it belongs to. */
 export interface DuplicateIdRenumbering {
@@ -30,11 +30,17 @@ export interface DuplicateIdRenumbering {
 export function renumberDuplicateIds(document: ChemDraftDocument): DuplicateIdRenumbering[] {
   if (!hasDuplicateIds(document)) return [];
   const taken = documentStrings(document);
+  // The search for a base resumes where its last one stopped: `taken` only grows, so every lower
+  // suffix is still taken, and the result is the one a search from 2 would find. A taken string
+  // `${base}_${n}` belongs to exactly one base (the text before its last "_"), so across the whole
+  // repair each taken string is stepped over at most once and the searches stay linear.
+  const nextSuffix = new Map<string, number>();
   const fresh = (id: string) => {
-    let suffix = 2;
+    let suffix = nextSuffix.get(id) ?? 2;
     while (taken.has(`${id}_${suffix}`)) suffix += 1;
     const next = `${id}_${suffix}`;
     taken.add(next);
+    nextSuffix.set(id, suffix + 1);
     return next;
   };
   const renumbered: DuplicateIdRenumbering[] = [];
@@ -113,14 +119,39 @@ function documentStrings(document: ChemDraftDocument): Set<string> {
 type Page = ChemDraftDocument["pages"][number];
 type Reference = { objectId: string; atomId?: unknown; bondId?: unknown };
 
+/** Atom and bond ids of one molecule, indexed once so each reference costs one lookup. */
+interface MemberIds { atoms: ReadonlySet<string>; bonds: ReadonlySet<string> }
+/** For one repeated object id: which renumbered copies hold each atom or bond id, in page order. */
+interface CopiesByMember { atoms: Map<string, DocumentObject[]>; bonds: Map<string, DocumentObject[]> }
+
 function relinkReferences(
   page: Page,
   firstById: ReadonlyMap<string, DocumentObject>,
   copies: readonly { object: DocumentObject; from: string }[]
 ): void {
   const renamedFrom = new Map(copies.map(({ object, from }) => [object, from]));
-  const copiesByOriginal = new Map<string, DocumentObject[]>();
-  for (const { object, from } of copies) copiesByOriginal.set(from, [...(copiesByOriginal.get(from) ?? []), object]);
+  const copiesByOriginal = new Map<string, CopiesByMember>();
+  for (const { object, from } of copies) {
+    let index = copiesByOriginal.get(from);
+    if (!index) copiesByOriginal.set(from, index = { atoms: new Map(), bonds: new Map() });
+    if (object.type !== "molecule") continue;
+    for (const key of ["atoms", "bonds"] as const) {
+      for (const item of object[key]) {
+        const holders = index[key].get(item.id);
+        // A copy can repeat an atom or bond id; list it once.
+        if (!holders) index[key].set(item.id, [object]);
+        else if (holders[holders.length - 1] !== object) holders.push(object);
+      }
+    }
+  }
+  // Only the first copies of repeated ids are ever asked about.
+  const firstMembers = new Map<string, MemberIds>();
+  for (const from of copiesByOriginal.keys()) {
+    const first = firstById.get(from);
+    if (first?.type === "molecule") {
+      firstMembers.set(from, { atoms: new Set(first.atoms.map((atom) => atom.id)), bonds: new Set(first.bonds.map((bond) => bond.id)) });
+    }
+  }
 
   const relink = (reference: Reference, owner: DocumentObject | undefined) => {
     const ownFrom = owner && renamedFrom.get(owner);
@@ -128,22 +159,23 @@ function relinkReferences(
       reference.objectId = owner!.id;
       return;
     }
-    const candidates = copiesByOriginal.get(reference.objectId);
-    if (!candidates) return;
-    const holds = (object: DocumentObject | undefined) => object?.type === "molecule" && (
-      (typeof reference.atomId === "string" && moleculeHas(object, "atoms", reference.atomId))
-      || (typeof reference.bondId === "string" && moleculeHas(object, "bonds", reference.bondId)));
-    if (holds(firstById.get(reference.objectId))) return;
-    const matches = candidates.filter(holds);
-    if (matches.length === 1) reference.objectId = matches[0]!.id;
+    const index = copiesByOriginal.get(reference.objectId);
+    if (!index) return;
+    const atomId = typeof reference.atomId === "string" ? reference.atomId : undefined;
+    const bondId = typeof reference.bondId === "string" ? reference.bondId : undefined;
+    const first = firstMembers.get(reference.objectId);
+    if (first && ((atomId !== undefined && first.atoms.has(atomId)) || (bondId !== undefined && first.bonds.has(bondId)))) return;
+    // The copies holding the atom or the bond; the reference follows only when that is exactly one.
+    const byAtom = atomId === undefined ? undefined : index.atoms.get(atomId);
+    const byBond = bondId === undefined ? undefined : index.bonds.get(bondId);
+    if ((byAtom?.length ?? 0) > 1 || (byBond?.length ?? 0) > 1) return;
+    const match = byAtom?.[0] ?? byBond?.[0];
+    if (!match || (byAtom && byBond && byAtom[0] !== byBond[0])) return;
+    reference.objectId = match.id;
   };
 
   for (const object of page.objects) visitReferences(object, (reference) => relink(reference, object));
   visitReferences(page.crossings, (reference) => relink(reference, undefined));
-}
-
-function moleculeHas(molecule: MoleculeObject, key: "atoms" | "bonds", id: string): boolean {
-  return molecule[key].some((item) => item.id === id);
 }
 
 /** Live references are records carrying a string `objectId` (anchors, bond references, reaction
