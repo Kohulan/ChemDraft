@@ -243,9 +243,10 @@ export function assertPluginPatchWriteScope(
   const sequential = scopePages && sequentialTargetHooks(document, scopePages, scope, beforeObjectWrite);
   const draftInScope = (pageId: string, object: DocumentObject) =>
     sequential ? sequential.inScope(object) : objectInWriteScope(scope, pinned, pageId, object.id);
+  const requested = requestedHydrogenCountRecorder(sequential?.beforeObjectWrite ?? beforeObjectWrite, sequential?.beforeObjectTargets);
   // Inspect one atomic draft, without normalizing partial pairs or forward references between ops.
   const validated = applyPatch(document, preflight.patch, { preserveRepeatUnitBrackets: true, deferGroupCleanup: true,
-    beforeObjectWrite: sequential?.beforeObjectWrite ?? beforeObjectWrite, beforeObjectTargets: sequential?.beforeObjectTargets,
+    beforeObjectWrite: requested.beforeObjectWrite, beforeObjectTargets: requested.beforeObjectTargets,
     beforeRemoveObjects: (draft, objectIds) => {
       const removed = new Set(objectIds);
       for (const page of draft.pages) {
@@ -307,7 +308,7 @@ export function assertPluginPatchWriteScope(
     throw new PluginHostError(`Patch would change object "${object.id}", which is not selected`);
   }
   assertPluginPageWriteScope(document, validated, scope, pinned, inserted);
-  assertRepresentableHydrogenCounts(document, validated, requestedHydrogenCounts(preflight.patch));
+  assertRepresentableHydrogenCounts(document, validated, requested.counts);
   return validated;
 }
 
@@ -342,11 +343,15 @@ function assertRepresentableHydrogenCounts(before: ChemDraftDocument, after: Che
     const previousPage = before.pages.find(candidate => candidate.id === page.id);
     for (const object of page.objects) {
       if (object.type !== "molecule") continue;
-      const previous = previousPage?.objects.find(candidate => candidate.id === object.id);
-      if (previous === object) continue;
+      // An untouched object is the same value; ids may repeat, so an edited one is matched to the
+      // object it continues by host identity, and only failing that to its id's first occurrence.
+      if (previousPage?.objects.includes(object)) continue;
+      const previous = previousPage?.objects.find(candidate => hasObjectIdentity(object, objectIdentity(candidate)))
+        ?? previousPage?.objects.find(candidate => candidate.id === object.id);
       // The bonds decide whether a typed "Ac", "Pr" or "Ts" is acetyl, n-propyl or tosyl (bonded) or the element.
       const previousMolecule = previous?.type === "molecule" ? previous : undefined;
-      const asked = requested.get(object.id);
+      let asked: ReadonlyMap<string, number> | undefined;
+      for (const [identity, counts] of requested) if (hasObjectIdentity(object, identity)) asked = counts;
       const atoms = asked ? object.atoms.map(atom => {
         const count = asked.get(atom.id);
         return count === undefined || count === atom.hydrogenCount ? atom : { ...atom, hydrogenCount: count };
@@ -372,28 +377,42 @@ function assertRepresentableHydrogenCounts(before: ChemDraftDocument, after: Che
   }
 }
 
-/** Per molecule id, the hydrogen count each atom was given by the last op in the patch that wrote
- * that molecule's atoms (an addObject of it, or an updateObject supplying `atoms`). */
-type RequestedHydrogenCounts = Map<string, Map<string, number>>;
+/** Per molecule, by host identity (chem-core objectIdentity.ts), the hydrogen count each atom was
+ * given by the last op in the patch that wrote that molecule's atoms (an addObject of it, or an
+ * updateObject supplying `atoms`). Not by id: a document may repeat an id, and a request must only
+ * ever apply to the object the op actually reached. */
+type RequestedHydrogenCounts = Map<ObjectIdentity, Map<string, number>>;
 
-function requestedHydrogenCounts(patch: DocumentPatch): RequestedHydrogenCounts {
-  const requested: RequestedHydrogenCounts = new Map();
-  const record = (objectId: string, atoms: unknown) => {
-    if (!Array.isArray(atoms)) return;
-    const counts = new Map<string, number>();
-    for (const atom of atoms as unknown[]) {
-      if (!atom || typeof atom !== "object") continue;
-      const { id, hydrogenCount } = atom as { id?: unknown; hydrogenCount?: unknown };
-      if (typeof id === "string" && typeof hydrogenCount === "number") counts.set(id, hydrogenCount);
+/**
+ * Patch hooks recording the hydrogen counts each write asked for, against the object the patch engine
+ * actually applies the op to: chem-core resolves an updateObject to its id's first occurrence in the
+ * draft as it stands at that op, and calls `beforeObjectWrite` with that object as `previous`; the
+ * updated value carries its identity (`retainObjectIdentity`), as does the validated result. An
+ * insertion is a new value with a fresh identity. `beforeObjectTargets` runs before every operation,
+ * so it names the op a write belongs to. The given hooks still run, after the recording.
+ */
+function requestedHydrogenCountRecorder(beforeObjectWrite?: ApplyPatchOptions["beforeObjectWrite"],
+  beforeObjectTargets?: ApplyPatchOptions["beforeObjectTargets"]) {
+  const counts: RequestedHydrogenCounts = new Map();
+  let current: DocumentPatch | undefined;
+  return {
+    counts,
+    beforeObjectTargets: (draft: ChemDraftDocument, patch: DocumentPatch, targets: readonly { pageId: string; object: DocumentObject }[]) => {
+      current = patch;
+      beforeObjectTargets?.(draft, patch, targets);
+    },
+    beforeObjectWrite: (pageId: string, previous: DocumentObject | undefined, next: DocumentObject) => {
+      // Read before chem-core replaces an update's atoms (clearChangedAtomHydrogenHints), after this hook.
+      const writesAtoms = previous ? current?.op === "updateObject" && "atoms" in current.changes : current?.op === "addObject";
+      if (writesAtoms && next.type === "molecule") {
+        const atoms = new Map<string, number>();
+        for (const atom of next.atoms) if (typeof atom.hydrogenCount === "number") atoms.set(atom.id, atom.hydrogenCount);
+        // Never mint an identity on `next` of an update: it must inherit `previous`'s.
+        counts.set(objectIdentity(previous ?? next), atoms);
+      }
+      beforeObjectWrite?.(pageId, previous, next);
     }
-    requested.set(objectId, counts);
   };
-  for (const op of writePatchOps(patch)) {
-    if (op.op === "addObject" && op.object.type === "molecule") record(op.object.id, op.object.atoms);
-    else if (op.op === "updateObject" && op.changes && "atoms" in op.changes) record(op.objectId, op.changes.atoms);
-    else if (op.op === "removeObject") requested.delete(op.objectId);
-  }
-  return requested;
 }
 
 export interface ScopedRepeatUnitCleanup {

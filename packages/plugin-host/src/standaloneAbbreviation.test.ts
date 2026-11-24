@@ -209,6 +209,28 @@ describe("the plugin host without layout-engine (the published SDK)", () => {
     expect(written?.type === "molecule" && written.bonds.map(bond => bond.id)).toEqual(["b1", "bg"]);
   });
 
+  // A document may repeat an object id. A count asked for is checked on the object the write reached
+  // (chem-core updates an id's first occurrence), never on an untouched molecule that shares its id
+  // and atom ids.
+  it("accepts hydrogenCount 2 on a bonded elemental Ac whose id a typed acetyl molecule also has", async () => {
+    const { host, applyDocumentPatch, history } = hostWithRepeatedId("elemental first");
+    await expect(host.invokeCommand("plugin.repeated.run")).resolves.toMatchObject({ applied: true });
+    expect(applyDocumentPatch).toHaveBeenCalledTimes(1);
+    const [written, untouched] = history().present.pages[0]!.objects;
+    expect(written?.type === "molecule" && written.atoms.find(atom => atom.id === "g")).toMatchObject({ element: "Ac", hydrogenCount: 2 });
+    expect(untouched?.type === "molecule" && untouched.atoms.find(atom => atom.id === "g")).toMatchObject({ element: "Ac", labelLiteral: true });
+    expect(untouched?.type === "molecule" && untouched.atoms.find(atom => atom.id === "g")?.hydrogenCount).toBeUndefined();
+  });
+
+  it("refuses hydrogenCount 2 on a bonded typed acetyl whose id an elemental Ac molecule also has", async () => {
+    const { host, applyDocumentPatch, original, history } = hostWithRepeatedId("typed first");
+    await expect(host.invokeCommand("plugin.repeated.run")).rejects.toMatchObject({
+      reason: HydrogenCountUnrepresentableReason, details: { moleculeId: "mol_1", atomId: "g", element: "Ac", hydrogenCount: 2 }
+    });
+    expect(applyDocumentPatch).not.toHaveBeenCalled();
+    expect(history()).toBe(original);
+  });
+
   it.each([["OMe", 0], ["NHMe", 1], ["CH3", 3], ["O", 1]] as const)("accepts %s stating %i", async (element, hydrogenCount) => {
     const { host, applyDocumentPatch, history } = hostSettingCount(element, hydrogenCount);
     await expect(host.invokeCommand("plugin.standalone.run")).resolves.toMatchObject({ applied: true });
@@ -217,3 +239,28 @@ describe("the plugin host without layout-engine (the published SDK)", () => {
     expect(written?.type === "molecule" && written.atoms.find(atom => atom.id === "g")?.hydrogenCount).toBe(hydrogenCount);
   });
 });
+
+/** A host over a document holding two molecules with the same id ("mol_1") and the same atom ids, both
+ * bonded at "g": one an elemental Ac (not typed), one a typed acetyl. `order` says which comes first,
+ * the one an updateObject of "mol_1" reaches. The command writes hydrogenCount 2 on "g" of the first. */
+function hostWithRepeatedId(order: "elemental first" | "typed first") {
+  const elemental = molecule("Ac");
+  const typed = molecule("Ac", { typed: true });
+  const [first, second] = order === "elemental first" ? [elemental, typed] : [typed, elemental];
+  const empty = createEmptyDocument({ now });
+  const document = { ...empty, pages: [{ ...empty.pages[0]!, objects: [first, second] }],
+    selection: { pageId: empty.pages[0]!.id, objectIds: [first.id] } };
+  let history: DocumentHistory = createDocumentHistory(document);
+  const original = history;
+  const applyDocumentPatch = vi.fn((request: PluginPatchApplicationRequest) => {
+    history = applyPatchWithHistory(history, request.patch.patch as DocumentPatch);
+    return { applied: true as const, objectIds: [] };
+  });
+  const host = new PluginHost({ getActiveDocument: () => history.present, getSelection: () => snapshot([first.id]), applyDocumentPatch });
+  const atoms = first.atoms.map(atom => atom.id === "g" ? { ...atom, hydrogenCount: 2 } : atom);
+  const patch = { op: "updateObject" as const, objectId: first.id, changes: { atoms } };
+  host.registerPlugin({ id: "org.test.repeated", name: "Repeated id count", version: "0.0.1", apiVersion: "^0.1.8", entry: "plugin.js",
+    permissions: ["document.write"], contributes: { commands: [{ id: "plugin.repeated.run", title: "Run" }] }
+  }, { commandHandlers: { "plugin.repeated.run": ctx => ctx.documents.applyPatch!({ reason: "count", patch }) } });
+  return { host, applyDocumentPatch, original, history: () => history };
+}
