@@ -33,6 +33,7 @@ import type { ActiveTableText } from "./tableCommands";
 import { tableValidationMessage } from "./tableCommands";
 import { tableCellElementId } from "@chemdraft/layout-engine";
 import { insertTableIntoDocument } from "./documentWorkflow";
+import { doubleBondGestureCycle } from "./doubleBondCycle";
 import { clearCustomSwatchSlot, customSwatchCommandId, loadCustomSwatches, parseCustomSwatchCommandId, setCustomSwatchSlot, type CustomSwatchNumber, type CustomSwatchSlot } from "./customColorSwatches";
 import { persistCustomSwatches, useCustomSwatches } from "./toolbars/customSwatchSettings";
 import { createCustomSwatchActions, textCustomColorCommandId } from "./commands";
@@ -5096,6 +5097,12 @@ export function MainWindow({
     const madePlain = order === "single" && object?.type === "molecule" &&
       nativeBondCanBeMadePlain(object.bonds.find(bond => bond.id === target.bondId));
     const selectedDocument = selectDocumentObject(currentDocument, target.objectId);
+    const cycled = doubleBondGestureCycle(selectedDocument, target, order);
+    if (cycled) {
+      // Display-only (PRESERVE_CHEMISTRY). The hover stays, so pressing 2 again keeps cycling.
+      if (commitDocumentChange(cycled.document, cycled.undoLabel)) setStatus(cycled.undoLabel);
+      return;
+    }
     const nextDocument = applyNativeMoleculeBondOrderValueTarget(selectedDocument, target, order);
     if (nextDocument === selectedDocument) {
       setStatus(`Cannot set hovered bond to ${order}`);
@@ -20935,6 +20942,12 @@ export function MainWindow({
       event.stopPropagation();
       const target = { objectId, ...nativeMoleculeHit };
       const selectedDocument = selectDocumentObject(document, objectId);
+      const cycled = doubleBondGestureCycle(selectedDocument, target, activeNativeBondOrder, activeNativeBondStereo);
+      if (cycled) {
+        // Display-only: the default PRESERVE_CHEMISTRY policy refuses any chemistry change.
+        if (commitDocumentChange(cycled.document, cycled.undoLabel)) setStatus(cycled.undoLabel);
+        return;
+      }
       const nextDocument = applyNativeMoleculeBondOrderValueTarget(selectedDocument, target, activeNativeBondOrder, activeNativeBondStereo);
       if (nextDocument === selectedDocument) {
         setStatus(nativeBondOrderTargetRefusal(selectedDocument, target, activeNativeBondOrder) ?? "Bond order not changed");

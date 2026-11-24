@@ -44,11 +44,13 @@ function butene(): ChemDraftDocument {
   }, "C/C=C/C");
 }
 
-/** Cyclohexene: a ring double bond whose default stroke sits inside the ring. */
+/** Cyclohexene: a ring double bond whose default stroke sits inside the ring. The sp3 carbons are
+ * pulled out of the regular hexagon so Clean Up really moves atoms and the side reconciliation runs. */
 function cyclohexene(): ChemDraftDocument {
-  const atoms = Array.from({ length: 6 }, (_, index) => ({
-    element: "C", x: Math.cos(index * Math.PI / 3), y: Math.sin(index * Math.PI / 3), charge: 0
-  }));
+  const atoms = Array.from({ length: 6 }, (_, index) => {
+    const stretch = index < 2 ? 1 : 1.3 + index * 0.1;
+    return { element: "C", x: stretch * Math.cos(index * Math.PI / 3), y: 1.4 * Math.sin(index * Math.PI / 3), charge: 0 };
+  });
   const bonds = atoms.map((_, index) => ({
     from: index, to: (index + 1) % 6, order: index === 0 ? "double" : "single", wedge: null
   }));
@@ -133,6 +135,11 @@ describe("double-bond position cycle", () => {
       const insideNow = ringInteriorDoubleBondSides(molecule(result.document)).get(bondId);
       const cleaned = cleanUpSelectedNativeMolecule2d(result.document);
       const cleanedGraph = molecule(cleaned);
+      const before = molecule(result.document);
+      expect(cleanedGraph.atoms.some(atom => {
+        const old = before.atoms.find(candidate => candidate.id === atom.id)!;
+        return Math.hypot(atom.x - old.x, atom.y - old.y) > 1;
+      })).toBe(true);
       const cleanedBond = cleanedGraph.bonds.find(candidate => candidate.id === bondId)!;
       expect(cleanedBond.order).toBe("double");
       const cleanedShown = renderedDoubleBondSide(cleanedGraph, cleanedBond);
