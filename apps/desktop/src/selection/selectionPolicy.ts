@@ -141,6 +141,27 @@ export function applySelection(
   }
 }
 
+/**
+ * The selection after a charge, radical or lone-pair mark is placed on (or bumped at) an atom of
+ * molecule `owner.objectId`. A mark always follows its atom, so when that molecule is selected whole
+ * — directly, or through the selectable group `owner.selectedAs` that contains it — the mark joins
+ * the selection rather than replacing it: the molecule stays selected, and the next click or drag
+ * on it acts exactly as it would have without the mark. Otherwise (the molecule unselected, or only
+ * some of its parts selected) the placed marks alone are selected, as before.
+ */
+export function selectionAfterElectronMarkPlacement(
+  current: readonly SelectionItem[],
+  owner: { objectId: string; selectedAs?: string },
+  markIds: readonly string[]
+): SelectionItem[] {
+  const marks: SelectionItem[] = markIds.map((objectId) => ({ kind: "object", objectId }));
+  const ownerIds = new Set([owner.objectId, owner.selectedAs ?? owner.objectId]);
+  const ownerSelectedWhole =
+    current.some((item) => item.kind === "object" && ownerIds.has(item.objectId)) &&
+    !current.some((item) => item.kind !== "object" && item.objectId === owner.objectId);
+  return applySelection(ownerSelectedWhole ? current : [], marks, "add");
+}
+
 /** Build a selection item from a resolved molecule-part hit (Phase 3 click path). */
 export function selectionItemFromHit(hit: SelectionPartHit): SelectionItem {
   switch (hit.kind) {

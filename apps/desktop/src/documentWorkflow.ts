@@ -19472,6 +19472,54 @@ export function spin3dCarriedElectronMarks(
   });
 }
 
+/** The selection as single-molecule commands (Spin 3D, 3D cleanup, Interactive 3D) read it. */
+export interface SingleMoleculeSelection {
+  /**
+   * The selected object ids, plus each host of a selected molecule part. When the selection is one
+   * molecule plus only marks that molecule carries, the marks fold into it and this is just the
+   * molecule's id.
+   */
+  objectIds: string[];
+  /**
+   * Selected marks that the one selected molecule does not carry: floating, or bound to an atom of a
+   * molecule that is not selected. A command on the molecule could not keep them on an atom, so it
+   * refuses by name instead of dropping or moving them. Empty unless the rest of the selection is
+   * exactly one molecule.
+   */
+  uncarriedMarkIds: string[];
+}
+
+/**
+ * One shared reading of "is a single molecule selected?". A charge, radical or lone-pair mark
+ * follows its atom, so selecting a molecule together with its own marks (as a marquee around a
+ * charged molecule does) still counts as that one molecule; the marks travel with their atoms
+ * through whatever the command does (see `spin3dCarriedElectronMarks`).
+ */
+export function singleMoleculeSelection(
+  document: ChemDraftDocument,
+  nativePartHostObjectIds: readonly string[] = []
+): SingleMoleculeSelection {
+  const objectIds = [...new Set([...document.selection.objectIds, ...nativePartHostObjectIds])];
+  const page = document.pages.find(candidate => candidate.id === document.selection.pageId) ?? document.pages[0];
+  const unchanged = { objectIds, uncarriedMarkIds: [] };
+  if (!page || objectIds.length < 2) return unchanged;
+  const objectById = new Map(page.objects.map(object => [object.id, object] as const));
+  const markIds = objectIds.filter(id => objectById.get(id)?.type === "electron-mark");
+  const others = objectIds.filter(id => !markIds.includes(id));
+  if (markIds.length === 0 || others.length !== 1 || objectById.get(others[0]!)?.type !== "molecule") return unchanged;
+  const moleculeId = others[0]!;
+  const carried = new Set(spin3dCarriedElectronMarks(page, moleculeId).map(({ mark }) => mark.id));
+  const uncarriedMarkIds = markIds.filter(id => !carried.has(id));
+  return uncarriedMarkIds.length > 0 ? { objectIds, uncarriedMarkIds } : { objectIds: [moleculeId], uncarriedMarkIds: [] };
+}
+
+/** Status text for a single-molecule command refused because of marks its molecule cannot carry. */
+export function uncarriedMarksRefusal(command: string, markCount: number): string {
+  return markCount === 1
+    ? `${command} cannot keep the selected mark on an atom of this molecule. Deselect the mark, or move it onto one of the molecule's atoms.`
+    : `${command} cannot keep ${markCount} selected marks on atoms of this molecule. Deselect those marks, or move them onto the molecule's atoms.`;
+}
+
 function spin3dElectronMarkOwner(
   mark: ElectronMarkObject,
   assignments: ReturnType<typeof nativeElectronMarkAssignments>["anchorByMarkId"]

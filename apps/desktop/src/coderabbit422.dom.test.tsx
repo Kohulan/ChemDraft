@@ -163,6 +163,94 @@ describe.each(["macos", "windows"] as const)("CodeRabbit #422 gesture items on %
       expect(Math.hypot(now.x - was.x, now.y - was.y)).toBeLessThan(0.5);
     }
   });
+
+  // -------------------------------------------------------------------------------------------
+  // 1.2.3 stress run: on a freshly placed (selected) benzene, hovering atom_001 and typing + selected
+  // only the new charge, so a plain click on ring bond bond_001 selected that bond part and a drag
+  // from bond_002 acted on the one-bond fragment. A placed mark follows its atom, so it now joins a
+  // whole-selected molecule's selection: the click and drag behave as on the uncharged ring, and the
+  // drag carries the charge. On an unselected ring both behave alike too (a bond click selects it).
+  // -------------------------------------------------------------------------------------------
+  const ringPoint = (document: ChemDraftDocument, moleculeId: string, atomId: string) => {
+    const owner = document.pages[0].objects.find(object => object.id === moleculeId) as ReturnType<typeof dropMolecule>;
+    return transformPointForObject(owner, owner.atoms.find(atom => atom.id === atomId)!);
+  };
+  const bondMidpoint = (document: ChemDraftDocument, moleculeId: string, bondId: string) => {
+    const owner = document.pages[0].objects.find(object => object.id === moleculeId) as ReturnType<typeof dropMolecule>;
+    const bond = owner.bonds.find(candidate => candidate.id === bondId)!;
+    const from = ringPoint(document, moleculeId, bond.fromAtomId), to = ringPoint(document, moleculeId, bond.toAtomId);
+    return { x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 };
+  };
+  /** Place benzene, optionally type + over atom_001, click bond_001, then drag from bond_002. */
+  async function clickBondThenDragNeighbour(charged: boolean, ringSelected: boolean) {
+    const inserted = workflow.insertNativeTemplateMolecule(workflow.createPhase4Document("Charged benzene"), { x: 300, y: 300 }, "benzene");
+    const moleculeId = inserted.selection.objectIds[0]!;
+    await mount(ringSelected ? inserted : workflow.selectDocumentObjects(inserted, inserted.pages[0].id, []));
+    let markId: string | undefined;
+    if (charged) {
+      await move(page(), ringPoint(snapshot(), moleculeId, "atom_001"));
+      await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "+", bubbles: true, cancelable: true })));
+      const marks = snapshot().pages[0].objects.filter(object => object.type === "electron-mark");
+      expect(marks).toHaveLength(1);
+      markId = marks[0]!.id;
+      expect(status()).toBe("Placed positive charge on hovered atom");
+      // The mark is selected; a whole-selected ring stays selected with it.
+      expect(snapshot().selection.objectIds).toEqual(ringSelected ? [moleculeId, markId] : [markId]);
+    }
+    const click = bondMidpoint(snapshot(), moleculeId, "bond_001");
+    await move(page(), click);
+    const target = container.querySelector(`.native-molecule-object[data-object-id="${moleculeId}"]`)!;
+    await act(async () => pointer(target, "pointerdown", click));
+    await act(async () => pointer(target, "pointerup", click));
+    const clicked = window.__CHEMDRAFT_AGENT__!.snapshot();
+    const from = bondMidpoint(snapshot(), moleculeId, "bond_002");
+    await move(page(), from);
+    const before = await drag(moleculeId, from, { x: from.x + 60, y: from.y + 40 }, true);
+    const result = { moleculeId, markId, clicked, before, after: snapshot(), status: status() };
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    return result;
+  }
+  /** Each atom's page-space shift across the drag. */
+  const shifts = (before: ChemDraftDocument, after: ChemDraftDocument, moleculeId: string) =>
+    dropMolecule(after).atoms.map(atom => {
+      const was = ringPoint(before, moleculeId, atom.id), now = ringPoint(after, moleculeId, atom.id);
+      return { x: now.x - was.x, y: now.y - was.y };
+    });
+
+  it.each([true, false])("a bond click after typing + selects as on the uncharged ring (ring selected first: %s)", async ringSelected => {
+    const plain = await clickBondThenDragNeighbour(false, ringSelected);
+    const charged = await clickBondThenDragNeighbour(true, ringSelected);
+    const moleculeOnly = (ids: readonly string[]) => ids.filter(id => id === charged.moleculeId);
+    expect({ objects: moleculeOnly(charged.clicked.selection.objectIds), part: charged.clicked.selectedNativeMoleculePart })
+      .toEqual({ objects: plain.clicked.selection.objectIds, part: plain.clicked.selectedNativeMoleculePart });
+    // Anything else still selected is the ring's own charge, never a part of the ring.
+    expect(charged.clicked.selection.objectIds.filter(id => id !== charged.moleculeId)).toEqual(
+      charged.clicked.selection.objectIds.length > 1 ? [charged.markId] : []);
+    expect(charged.status).not.toMatch(/Resized/);
+    expect(plain.status).not.toMatch(/Resized/);
+    if (!ringSelected) {
+      expect(charged.clicked.selectedNativeMoleculePart).toMatchObject({ kind: "bond", bondId: "bond_001" });
+      return;
+    }
+    // A whole-selected ring: the click keeps it whole, and the drag moves it rigidly with its charge.
+    expect(charged.clicked.selectedNativeMoleculePart).toBeUndefined();
+    const moved = shifts(charged.before, charged.after, charged.moleculeId), delta = moved[0]!;
+    expect(Math.hypot(delta.x, delta.y)).toBeGreaterThan(10);
+    for (const shift of moved) {
+      expect(shift.x).toBeCloseTo(delta.x, 6);
+      expect(shift.y).toBeCloseTo(delta.y, 6);
+    }
+    const markBefore = dropMark(charged.before), markAfter = dropMark(charged.after);
+    expect(markAfter.anchor).toMatchObject({ kind: "atom", objectId: charged.moleculeId, atomId: "atom_001" });
+    expect(workflow.nativeChargeMarkCenter(markAfter).x - workflow.nativeChargeMarkCenter(markBefore).x).toBeCloseTo(delta.x, 6);
+    expect(workflow.nativeChargeMarkCenter(markAfter).y - workflow.nativeChargeMarkCenter(markBefore).y).toBeCloseTo(delta.y, 6);
+    expect(dropMolecule(charged.after).atoms.find(atom => atom.id === "atom_001")).toMatchObject({ formalCharge: 1 });
+    // The control: the same drag moves the uncharged ring rigidly by the same amount.
+    const plainMoved = shifts(plain.before, plain.after, plain.moleculeId);
+    expect(plainMoved[0]!.x).toBeCloseTo(delta.x, 6);
+    expect(plainMoved[0]!.y).toBeCloseTo(delta.y, 6);
+  });
 });
 
 // -------------------------------------------------------------------------------------------
@@ -236,5 +324,92 @@ describe("S: Spin 3D live overlay carries a charge mark with its atom", () => {
     // A spin never changes chemistry.
     expect(dropMolecule(after).atoms.find(atom => atom.id === nitrogen.id)).toMatchObject({ formalCharge: 1 });
     expect(container.querySelector(`[data-page-svg-object-visual="${mark.id}"]`)?.getAttribute("visibility")).not.toBe("hidden");
+  });
+
+  // 1.2.3 stress run: a marquee around a charged molecule selects [molecule, charge], and Spin 3D
+  // refused that as "Select a single molecule to spin in 3D". The molecule's own marks fold into it.
+  async function mountSpinnable(document: ChemDraftDocument, platform: "macos" | "windows") {
+    const { width, height } = document.pages[0];
+    const rect = { x: 0, y: 0, left: 0, top: 0, width, height, right: width, bottom: height, toJSON: () => ({}) };
+    await act(async () => root.render(createElement(MainWindow, { initialDocument: document,
+      initialActiveToolCommandId: "tool.select", initialPaletteMode: "hidden", nativePalette: true,
+      initialRulersVisible: false, initialCrosshairsVisible: false, shortcutPlatform: platform })));
+    container.querySelector<HTMLElement>(".page")!.getBoundingClientRect = () => rect;
+    return rect;
+  }
+  const spinOverlay = () => container.querySelector<SVGSVGElement>("[data-spin3d-overlay]");
+  const spinStatus = () => container.querySelector("[data-status-message]")?.textContent;
+
+  it.each(["macos", "windows"] as const)("S2: Spin 3D accepts a marquee of a molecule and its own +, and the + follows N (%s)", async platform => {
+    const { document: fixture, nitrogen } = electronMarkDropFixture();
+    const drawing = workflow.selectDocumentObjects(fixture, fixture.pages[0].id, []);
+    const molecule = dropMolecule(drawing), mark = dropMark(drawing);
+    const rect = await mountSpinnable(drawing, platform);
+    const captures = new Map<number, Element>();
+    const saved = { set: Element.prototype.setPointerCapture, release: Element.prototype.releasePointerCapture,
+      has: Element.prototype.hasPointerCapture };
+    Element.prototype.setPointerCapture = function (id: number) { captures.set(id, this); };
+    Element.prototype.releasePointerCapture = function (id: number) { captures.delete(id); };
+    Element.prototype.hasPointerCapture = function (id: number) { return captures.get(id) === this; };
+    try {
+      const marquee = async (type: string, x: number, y: number) => act(async () => {
+        const event = new MouseEvent(type, { bubbles: true, cancelable: true, button: 0,
+          buttons: type === "pointerup" ? 0 : 1, clientX: x, clientY: y });
+        Object.defineProperties(event, { pointerId: { value: 1 }, isPrimary: { value: true }, pointerType: { value: "mouse" } });
+        (captures.get(1) ?? container.querySelector(".page")!).dispatchEvent(event);
+        if (type === "pointerup") captures.delete(1);
+      });
+      // Real drag on empty canvas around the whole drawing: the marquee takes the molecule and its +.
+      await marquee("pointerdown", 110, 190);
+      await marquee("pointermove", 200, 250);
+      await marquee("pointermove", 330, 310);
+      await marquee("pointerup", 330, 310);
+    } finally {
+      Element.prototype.setPointerCapture = saved.set;
+      Element.prototype.releasePointerCapture = saved.release;
+      Element.prototype.hasPointerCapture = saved.has;
+    }
+    const selected = window.__CHEMDRAFT_AGENT__!.snapshot();
+    expect([...selected.document.selection.objectIds].sort()).toEqual([molecule.id, mark.id].sort());
+    expect(selected.selectedNativeMoleculePart).toBeUndefined();
+    const before = selected.document;
+    await act(async () => window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "structure.spin3d" } })));
+    await vi.waitFor(() => expect(spinOverlay()).toBeTruthy());
+    expect(spinStatus()).not.toBe("Select a single molecule to spin in 3D");
+    // The + rides with N in the live overlay, and flatten commits it exactly there.
+    const live = spinOverlay()!.querySelector(`[data-spin3d-electron-mark="${mark.id}"]`);
+    expect(live).not.toBeNull();
+    const [dx, dy] = live!.getAttribute("data-spin3d-mark-offset")!.split(" ").map(Number);
+    const svg = spinOverlay()!;
+    svg.getBoundingClientRect = () => rect;
+    await act(async () => {
+      const down = new MouseEvent("pointerdown", { bubbles: true, cancelable: true, button: 0, buttons: 1, clientX: 20, clientY: 20 });
+      Object.defineProperties(down, { pointerId: { value: 1 }, isPrimary: { value: true }, pointerType: { value: "mouse" } });
+      svg.dispatchEvent(down);
+    });
+    await vi.waitFor(() => expect(spinOverlay()).toBeNull());
+    const after = window.__CHEMDRAFT_AGENT__!.snapshot().document;
+    expect(after).not.toEqual(before);
+    const flattened = dropMark(after);
+    expect(flattened.anchor).toMatchObject({ kind: "atom", objectId: molecule.id, atomId: nitrogen.id });
+    expect(flattened.x - mark.x).toBeCloseTo(dx, 6);
+    expect(flattened.y - mark.y).toBeCloseTo(dy, 6);
+    expect(dropMolecule(after).atoms.find(atom => atom.id === nitrogen.id)).toMatchObject({ formalCharge: 1 });
+  });
+
+  it.each(["macos", "windows"] as const)("S3: Spin 3D names a selected mark the molecule cannot carry instead of dropping it (%s)", async platform => {
+    const { document: fixture } = electronMarkDropFixture();
+    const molecule = dropMolecule(fixture), mark = dropMark(fixture);
+    // The + left floating far from every atom (an explicit point drop), selected with the molecule.
+    const floating = workflow.normalizeCommittedDocument(applyPatch(fixture, { op: "updateObject", objectId: mark.id,
+      changes: { anchor: { kind: "point", point: { x: 600, y: 500 } }, atomAssociation: "explicit",
+        x: 600 - mark.width / 2, y: 500 - mark.height / 2 } }, { now: phase4Timestamp }));
+    const drawing = workflow.selectDocumentObjects(floating, floating.pages[0].id, [molecule.id, mark.id]);
+    await mountSpinnable(drawing, platform);
+    const before = window.__CHEMDRAFT_AGENT__!.snapshot().document;
+    await act(async () => window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "structure.spin3d" } })));
+    expect(spinStatus()).toBe(workflow.uncarriedMarksRefusal("Spin 3D", 1));
+    expect(spinOverlay()).toBeNull();
+    expect(window.__CHEMDRAFT_AGENT__!.snapshot().document).toEqual(before);
   });
 });
