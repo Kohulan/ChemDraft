@@ -251,6 +251,38 @@ describe.each(["macos", "windows"] as const)("CodeRabbit #422 gesture items on %
     expect(plainMoved[0]!.x).toBeCloseTo(delta.x, 6);
     expect(plainMoved[0]!.y).toBeCloseTo(delta.y, 6);
   });
+
+  // Review of 6670f1f5e: a charge press that REMOVES a mark (− over an atom whose ⊕ it cancels) ran
+  // the placement selection policy on every other selected mark, so it deselected a selected text
+  // box and reported an unrelated selected 2+ as "Placed positive charge 2+". A removal leaves the
+  // rest of the selection alone and reports what it removed.
+  it("typing − over an unselected molecule's ⊕ removes it and leaves a selected text and other mark alone", async () => {
+    let drawing = workflow.insertNativeTemplateMolecule(workflow.createPhase4Document("Removal"), { x: 250, y: 250 }, "benzene");
+    const cancelledOn = drawing.selection.objectIds[0]!;
+    drawing = workflow.insertNativeTemplateMolecule(drawing, { x: 550, y: 400 }, "benzene");
+    const otherMolecule = drawing.selection.objectIds[0]!;
+    const atom = (objectId: string) => ({ kind: "atom" as const, objectId, atomId: "atom_001", distanceToPointer: 0 });
+    drawing = workflow.applyChargeToolAtNativeAtom(drawing, 1, atom(cancelledOn));
+    const cancelledMarkId = drawing.selection.objectIds[0]!;
+    drawing = workflow.applyChargeToolAtNativeAtom(drawing, 1, atom(otherMolecule));
+    drawing = workflow.applyChargeToolAtNativeAtom(drawing, 1, atom(otherMolecule));
+    const otherMarkId = drawing.selection.objectIds[0]!;
+    const text = workflow.createNativeTextObject(drawing, { x: 100, y: 500 }, "Note");
+    drawing = workflow.normalizeCommittedDocument(applyPatch(drawing,
+      { op: "addObject", pageId: drawing.pages[0].id, object: text }, { now: phase4Timestamp }));
+    expect(drawing.pages[0].objects.find(object => object.id === otherMarkId)).toMatchObject({ charge: 2 });
+    await mount(workflow.selectDocumentObjects(drawing, drawing.pages[0].id, [text.id, otherMarkId]));
+
+    await move(page(), ringPoint(snapshot(), cancelledOn, "atom_001"));
+    await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "-", bubbles: true, cancelable: true })));
+
+    const after = snapshot();
+    expect(after.pages[0].objects.some(object => object.id === cancelledMarkId)).toBe(false);
+    const cancelled = after.pages[0].objects.find(object => object.id === cancelledOn) as ReturnType<typeof dropMolecule>;
+    expect(cancelled.atoms.find(candidate => candidate.id === "atom_001")!.formalCharge ?? 0).toBe(0);
+    expect([...after.selection.objectIds].sort()).toEqual([text.id, otherMarkId].sort());
+    expect(status()).toBe("Removed positive charge from hovered atom");
+  });
 });
 
 // -------------------------------------------------------------------------------------------

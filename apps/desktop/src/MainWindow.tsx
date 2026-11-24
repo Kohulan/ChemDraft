@@ -161,6 +161,7 @@ import {
   type DocumentObject,
   type DocumentPage,
   type DocumentPatch,
+  type ElectronMarkObject,
   type FlattenWarning,
   type GraphicFreehandPoint,
   type GraphicObject,
@@ -1861,7 +1862,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.24.11.00-opus";
+const CURRENT_BUILD_STAMP = "11.24.11.30-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -5393,9 +5394,16 @@ export function MainWindow({
 
     const currentDocument = documentRef.current;
     const placedDocument = applyChargeToolAtNativeAtom(currentDocument, markSpec, target);
-    // The workflow selects the mark it placed or bumped; the selection policy decides whether that
-    // replaces the selection or joins a whole-selected owner molecule (a mark follows its atom).
-    const placedMarkIds = placedDocument.selection.objectIds.filter(id =>
+    // A press that cancels a charge (− on ⊕) REMOVES the mark and leaves the rest of the selection
+    // as it was, so there is no placed mark to select and nothing to report but the removal.
+    const placedPageObjectIds = placedDocument === currentDocument ? undefined
+      : new Set(placedDocument.pages.flatMap(candidate => candidate.objects.map(object => object.id)));
+    const removedMark = placedPageObjectIds && currentDocument.pages.flatMap(candidate => candidate.objects)
+      .find((object): object is ElectronMarkObject => object.type === "electron-mark" && !placedPageObjectIds.has(object.id));
+    // Otherwise the workflow selects the mark it placed, bumped or converted; the selection policy
+    // decides whether that replaces the selection or joins a whole-selected owner molecule (a mark
+    // follows its atom).
+    const placedMarkIds = removedMark ? [] : placedDocument.selection.objectIds.filter(id =>
       findDocumentObject(placedDocument, id)?.type === "electron-mark");
     const placedSelection = placedDocument !== currentDocument && placedMarkIds.length > 0
       ? fromSelectionItems(selectionAfterElectronMarkPlacement(
@@ -5431,6 +5439,13 @@ export function MainWindow({
     // between presses — so re-derive the hover from the last canvas pointer position through the
     // same path pointermove uses, rather than clearing it and leaving the next press dead.
     rederiveNativeCanvasHoverRef.current(nextDocument);
+    if (removedMark) {
+      // Only a charge press removes a mark, and only the one it cancels: the opposite sign of the press.
+      const removedCharge = typeof removedMark.charge === "number" ? removedMark.charge : markSpec.kind === "charge" ? -markSpec.charge : 1;
+      setStatus(`Removed ${electronMarkSpecStatusNoun({ kind: "charge", charge: removedCharge > 0 ? 1 : -1,
+        radical: removedMark.radical, chargeStyle: removedMark.chargeStyle }, removedCharge)} from hovered atom`);
+      return;
+    }
     // Both placement paths select the mark they placed/bumped, so the committed document names
     // the stacked magnitude ("Placed positive charge 2+ on hovered atom").
     const committedDocument = documentRef.current;

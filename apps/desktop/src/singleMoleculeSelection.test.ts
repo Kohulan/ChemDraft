@@ -34,15 +34,34 @@ describe("singleMoleculeSelection", () => {
     expect(workflow.singleMoleculeSelection(select(document, [molecule.id, mark.id])).objectIds).toEqual([molecule.id]);
   });
 
-  it("counts a legacy loose charge that belongs to one of the molecule's atoms", () => {
+  // A mark without an atom anchor is assigned to an atom by proximity. Opening a file keeps stored
+  // marks as they are (`preserveElectronMarks`, as MainWindow's open path does), so a legacy loose
+  // charge is still point-anchored when Spin 3D reads the selection; a bond- or object-anchored mark
+  // keeps that anchor even through full commit normalization.
+  it("counts a legacy loose charge, as an opened file keeps it, that belongs to one of the molecule's atoms", () => {
     const { document, nitrogen } = electronMarkDropFixture();
     const molecule = dropMolecule(document), mark = dropMark(document);
     // A point-anchored mark one bond length below N: N is the only atom within the association radius.
     const center = { x: nitrogen.x, y: nitrogen.y + 22 };
-    const legacy = workflow.normalizeCommittedDocument(applyPatch(document, { op: "updateObject", objectId: mark.id,
+    const opened = workflow.normalizeCommittedDocument(applyPatch(document, { op: "updateObject", objectId: mark.id,
       changes: { anchor: { kind: "point", point: center }, atomAssociation: undefined,
-        x: center.x - mark.width / 2, y: center.y - mark.height / 2 } }, { now: phase4Timestamp }));
-    expect(workflow.singleMoleculeSelection(select(legacy, [molecule.id, mark.id])).objectIds).toEqual([molecule.id]);
+        x: center.x - mark.width / 2, y: center.y - mark.height / 2 } }, { now: phase4Timestamp }),
+      { preserveElectronMarks: true });
+    expect(dropMark(opened).anchor.kind).toBe("point");
+    expect(workflow.singleMoleculeSelection(select(opened, [molecule.id, mark.id])))
+      .toEqual({ objectIds: [molecule.id], uncarriedMarkIds: [] });
+  });
+
+  it("counts a legacy bond-anchored charge on one of the molecule's atoms after commit normalization", () => {
+    const { document, nitrogen } = electronMarkDropFixture();
+    const molecule = dropMolecule(document), mark = dropMark(document);
+    const bond = molecule.bonds.find(candidate => candidate.fromAtomId === nitrogen.id || candidate.toAtomId === nitrogen.id)!;
+    const legacy = workflow.normalizeCommittedDocument(applyPatch(document, { op: "updateObject", objectId: mark.id,
+      changes: { anchor: { kind: "bond", objectId: molecule.id, bondId: bond.id }, atomAssociation: undefined,
+        x: nitrogen.x - mark.width / 2, y: nitrogen.y - mark.height / 2 } }, { now: phase4Timestamp }));
+    expect(dropMark(legacy).anchor.kind).toBe("bond");
+    expect(workflow.singleMoleculeSelection(select(legacy, [molecule.id, mark.id])))
+      .toEqual({ objectIds: [molecule.id], uncarriedMarkIds: [] });
   });
 
   it("keeps the original reading for a plain molecule, an empty selection, a lone mark and two molecules", () => {
