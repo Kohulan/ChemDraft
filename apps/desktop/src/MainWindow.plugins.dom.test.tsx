@@ -10,6 +10,7 @@ import { AssistantCapabilityPermissions, PluginPanelReportSchema, ProposedDocume
 import { applyPatch, createEmptyDocument, DocumentStylePreset, nativeDrawingStyleFromObjectStyle, type BracketObject, type ChemDraftDocument, type DocumentObject, type ElectronMarkObject, type MoleculeObject } from "@chemdraft/chem-core";
 import { applyMoleculeTargetBondLength, createSmilesMolecule, inspectHydrogenNormalizedIdentity, pastedStructureDepictionFromMolfile, resolveStructureTemplateName, setReactionArrowConditions } from "@chemdraft/document-workflow-core";
 import { ensureRdkit, generateSmiles2DMolfile, setRdkitModuleLoader } from "../../../packages/rdkit-adapter/src/conformer";
+import { depictSmiles2D } from "@chemdraft/ocl-adapter";
 import { applyChargeToolAtPoint, createNativeArtLineGraphicObject, normalizeCommittedDocument } from "./documentWorkflow";
 import * as workflow from "./documentWorkflow";
 import { getAssistantHistoryPort } from "./assistant/historyPort";
@@ -22,9 +23,13 @@ import { MainWindow } from "./MainWindow";
 import type { DesktopPluginRuntime } from "./plugins/createPluginRuntime";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 import { DOM_COMMAND_EVENT } from "./window-manager";
+import { isBrowserReloadChord, wasBrowserReloadPrevented } from "./browserReloadGuard";
 import { NATIVE_CANVAS_MENU_CLOSED_EVENT } from "./CanvasContextMenu";
 import { forceDocumentHistoryCommandId } from "./editHistoryRouting";
 import { assertPluginDocumentWriteScope } from "@chemdraft/plugin-host";
+import { expectStoredGraph, graphEditChanges, graphEditFixture, pluginGraphEdits } from "./testSupport/pluginGraphEdits";
+import { deferred } from "./testSupport/deferred";
+import * as identityClient from "./depiction2d/identityClient";
 
 vi.mock("./rdkitWasmLoader", () => ({ registerRdkitWasmLoader: vi.fn() }));
 vi.mock("./plugins/rdkitAppLoader", () => ({ loadRdkitWithAppLoader: (load: () => Promise<unknown>) => load() }));
@@ -59,6 +64,14 @@ const submit = vi.fn<(context: PluginCommandContext) => Promise<void>>();
 const select = vi.fn<(context: PluginCommandContext) => Promise<void>>();
 let root: Root;
 let container: HTMLDivElement;
+
+/** A refusal's message is the plain user sentence, exactly, and never names the molecule. */
+async function expectUserRefusal(write: Promise<unknown>, sentence: string, moleculeId: string) {
+  const error = await write.then(() => undefined, (caught: unknown) => caught);
+  expect(error).toBeInstanceOf(Error);
+  expect((error as Error).message).toBe(sentence);
+  expect((error as Error).message).not.toContain(moleculeId);
+}
 
 describe("assistant writes through mounted desktop normalization", () => {
   let chemistry: AssistantToolContext["chemistry"];
@@ -310,6 +323,453 @@ describe("plugin direct writes through mounted desktop normalization", () => {
       atomAssociation: "explicit", anchor: { kind: "atom", objectId: molecule.id, atomId: atom.id },
       x: atom.x + 12, y: atom.y - 12, width: 18, height: 18, rotation: 0, style: {} };
   }
+
+  it.each(pluginGraphEdits)("refreshes stored chemistry after a direct plugin $name edit and round-trips it in history", async edit => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const molecule = graphEditFixture(blank, edit, edit.name === "element");
+    const text = testContext(false).text;
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "addObject", pageId, object: text },
+      { op: "setSelection", pageId, objectIds: [molecule.id, text.id] }
+    ] }));
+    const before = port.read("initial")!;
+    const original = before.pages[0]!.objects[0]! as MoleculeObject;
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Edit atom graph", patch: {
+      op: "updateObject", objectId: molecule.id, changes: graphEditChanges(original, edit)
+    } }));
+    await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true, objectIds: [molecule.id] }); });
+    const after = port.read("initial")!;
+    expect(after.selection.objectIds).toEqual([molecule.id]);
+    await expectStoredGraph(after.pages[0]!.objects[0]! as MoleculeObject, edit);
+
+    async function history(commandId: "edit.undo" | "edit.redo") {
+      await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT,
+        { detail: { commandId: forceDocumentHistoryCommandId(commandId) } })); });
+    }
+    await history("edit.undo");
+    expect(port.read("initial")!.pages).toEqual(before.pages);
+    expect(container.querySelector("[role=status]")?.textContent).toContain("Undid Write scope test: Test");
+    const undone = port.read("initial");
+    await history("edit.undo");
+    expect(port.read("initial")).toBe(undone);
+    await history("edit.redo");
+    expect(port.read("initial")!.pages).toEqual(after.pages);
+  }, 20_000);
+
+  it("refreshes stored chemistry when the user accepts a graph-editing proposal", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const edit = pluginGraphEdits[0];
+    const molecule = graphEditFixture(blank, edit);
+    const port = await mount(applyPatch(blank, { op: "addObject", pageId, object: molecule }));
+    const before = port.read("initial")!;
+    const runtime = captured.runtime!;
+    const id = "org.chemdraft.proposalTest";
+    let proposalId!: string;
+    await act(async () => {
+      runtime.registerPlugin({ id, name: "Proposal test", version: "0.1.0", apiVersion: "^0.1.14",
+        entry: "test.js", permissions: ["document.proposePatch"] });
+      proposalId = runtime.host.proposePatch(id, { reason: "Edit element", patch: {
+        op: "updateObject", objectId: molecule.id, changes: graphEditChanges(molecule, edit)
+      } }).id;
+    });
+    expect(port.read("initial")).toBe(before);
+    await act(async () => { container.querySelector<HTMLButtonElement>(".patch-review-badge")!.click(); });
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>(`[data-proposal-id="${proposalId}"] button`)!.click();
+      await vi.waitFor(() => expect(runtime.host.listProposedPatches("pending")).toHaveLength(0));
+    });
+    const after = port.read("initial")!;
+    expect(after.selection.objectIds).toEqual([molecule.id]);
+    await expectStoredGraph(after.pages[0]!.objects[0]! as MoleculeObject, edit);
+    async function history(commandId: "edit.undo" | "edit.redo") {
+      await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT,
+        { detail: { commandId: forceDocumentHistoryCommandId(commandId) } })); });
+    }
+    await history("edit.undo");
+    expect(port.read("initial")).toEqual(before);
+    expect(container.querySelector("[role=status]")?.textContent).toContain("Undid Proposal test: Apply Proposal");
+    await history("edit.redo");
+    expect(port.read("initial")).toEqual(after);
+  }, 20_000);
+
+  it.each([
+    ["stale structure", "Plugin write refused: the stored structure doesn't match the drawn atoms."],
+    ["stale cached SMILES", "Plugin write refused: the stored structure doesn't match the drawn atoms."],
+    ["stale formula", /^Plugin write refused: the formula doesn't match the drawn (structure|atoms)\.$/],
+    ["an empty graph", "Plugin write refused: the molecule has no drawn atoms to check against."]
+  ] as const)("refuses a direct insertion with %s", async (mismatch, failure) => {
+    const blank = createEmptyDocument();
+    const molecule = graphEditFixture(blank, { name: "element", source: "CO" });
+    if (mismatch === "stale structure") molecule.structure = "CC";
+    if (mismatch === "stale cached SMILES") molecule.compatibility!.unknown.smiles = "CC";
+    if (mismatch === "stale formula") molecule.chemistry = { ...molecule.chemistry!, formula: "C2H6" };
+    if (mismatch === "an empty graph") { molecule.atoms = []; molecule.bonds = []; }
+    const port = await mount(blank);
+    const before = port.read("initial")!;
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Insert inconsistent molecule", patch: {
+      op: "addObject", pageId: blank.pages[0]!.id, object: molecule
+    } }));
+    await act(async () => {
+      if (typeof failure === "string") await expectUserRefusal(invoke(), failure, molecule.id);
+      else await expect(invoke()).rejects.toThrow(failure);
+    });
+    expect(port.read("initial")).toBe(before);
+  }, 20_000);
+
+  it.each([false, true])("skips inspection for unchanged or restyled atoms (restyled=%s)", async restyled => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const molecule = graphEditFixture(blank, pluginGraphEdits[0]);
+    await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const atoms = restyled ? molecule.atoms.map(atom => ({ ...atom, labelVisible: true })) : molecule.atoms;
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Update atom labels", patch: {
+      op: "updateObject", objectId: molecule.id, changes: { atoms }
+    } }));
+    await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true }); });
+    expect(inspect).not.toHaveBeenCalled();
+  });
+
+  it("skips inspection when a whole alkene is rotated and moved as one unit", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const molecule = graphEditFixture(blank, pluginGraphEdits.find(edit => edit.name === "coordinate-only E/Z")!);
+    await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const cx = molecule.atoms.reduce((sum, atom) => sum + atom.x, 0) / molecule.atoms.length;
+    const cy = molecule.atoms.reduce((sum, atom) => sum + atom.y, 0) / molecule.atoms.length;
+    const cos = Math.cos(Math.PI / 3), sin = Math.sin(Math.PI / 3);
+    // A rotation keeps both double-bond sides, so the E isomer cannot change.
+    const atoms = molecule.atoms.map(atom => ({ ...atom,
+      x: cx + 15 + (atom.x - cx) * cos - (atom.y - cy) * sin, y: cy + 10 + (atom.x - cx) * sin + (atom.y - cy) * cos }));
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Rotate molecule", patch: {
+      op: "updateObject", objectId: molecule.id, changes: { atoms }
+    } }));
+    await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true }); });
+    expect(inspect).not.toHaveBeenCalled();
+  });
+
+  /** The E-but-2-ene fixture with explicit coordinates for the alkene ends and their substituents. */
+  function alkeneAt(blank: ChemDraftDocument, place: (role: "start" | "end" | "startSubstituent" | "endSubstituent") => { x: number; y: number }) {
+    const molecule = graphEditFixture(blank, pluginGraphEdits.find(edit => edit.name === "coordinate-only E/Z")!);
+    const alkene = molecule.bonds.find(bond => bond.order === "double")!;
+    const role = (id: string) => id === alkene.fromAtomId ? "start" : id === alkene.toAtomId ? "end" :
+      molecule.bonds.some(bond => bond !== alkene && [bond.fromAtomId, bond.toAtomId].includes(id) &&
+        [bond.fromAtomId, bond.toAtomId].includes(alkene.fromAtomId)) ? "startSubstituent" : "endSubstituent";
+    molecule.atoms = molecule.atoms.map(atom => ({ ...atom, ...place(role(atom.id)) }));
+    return { molecule, role };
+  }
+
+  it("verifies a large-coordinate edit that moves one alkene substituent across the axis", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    // Extent 1e9 lets the similarity fit absorb a 2-unit move; the substituent still changes sides.
+    const { molecule, role } = alkeneAt(blank, which => ({ start: { x: 300, y: 250 }, end: { x: 300 + 1e9, y: 250 },
+      startSubstituent: { x: 299, y: 251 }, endSubstituent: { x: 301 + 1e9, y: 249 } })[which]);
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const before = port.read("initial")!;
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const atoms = molecule.atoms.map(atom => role(atom.id) === "startSubstituent" ? { ...atom, y: 249 } : atom);
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Move substituent", patch: {
+      op: "updateObject", objectId: molecule.id, changes: { atoms }
+    } }));
+    await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true, objectIds: [molecule.id] }); });
+    expect(inspect).toHaveBeenCalled();
+    expect(port.read("initial")).not.toBe(before);
+    await expectStoredGraph(port.read("initial")!.pages[0]!.objects[0]! as MoleculeObject,
+      pluginGraphEdits.find(edit => edit.name === "coordinate-only E/Z")!);
+  }, 20_000);
+
+  it("verifies a near-collinear substituent that crosses the double-bond axis", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const { molecule, role } = alkeneAt(blank, which => ({ start: { x: 300, y: 250 }, end: { x: 320, y: 250 },
+      startSubstituent: { x: 280, y: 250 + 1e-5 }, endSubstituent: { x: 330, y: 250 - 17.32 } })[which]);
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const before = port.read("initial")!;
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const atoms = molecule.atoms.map(atom => role(atom.id) === "startSubstituent" ? { ...atom, y: 250 - 1e-5 } : atom);
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Move substituent", patch: {
+      op: "updateObject", objectId: molecule.id, changes: { atoms }
+    } }));
+    // Neither drawing gives the alkene a side, so its stored E isomer cannot be confirmed.
+    await act(async () => { await expectUserRefusal(invoke(), "Plugin write refused: the stored structure doesn't match the drawn atoms.", molecule.id); });
+    expect(inspect).toHaveBeenCalled();
+    expect(port.read("initial")).toBe(before);
+  }, 20_000);
+
+  /** (R)-1-aminoethanol drawn with its nitrogen wedged up from the stereocentre, at explicit
+   * coordinates for the stereocentre's three neighbours. */
+  function stereocentreAt(blank: ChemDraftDocument, place: (element: "centre" | "C" | "N" | "O") => { x: number; y: number }) {
+    const molecule = graphEditFixture(blank, { name: "element", source: "C[C@H](N)O" });
+    const centre = molecule.bonds.find(bond => bond.display?.bondStyle === "wedge")!.fromAtomId;
+    expect(molecule.atoms.find(atom => atom.id === centre)?.element).toBe("C");
+    const role = (id: string) => id === centre ? "centre" : molecule.atoms.find(atom => atom.id === id)!.element as "C" | "N" | "O";
+    molecule.atoms = molecule.atoms.map(atom => ({ ...atom, ...place(role(atom.id)) }));
+    return { molecule, role };
+  }
+  async function storedConfiguration(molecule: MoleculeObject) {
+    const result = await identityClient.inspectStructureOffThread(molecule.structureFormat === "smiles" ? "smiles" : "molfile",
+      molecule.structure, undefined, undefined, "writeIdentity");
+    if (!result.valid) throw new Error(result.reason);
+    return result.identitySmiles;
+  }
+  async function moveStereocentreAtoms(molecule: MoleculeObject, atoms: MoleculeObject["atoms"]) {
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Move atoms", patch: {
+      op: "updateObject", objectId: molecule.id, changes: { atoms }
+    } }));
+    let result: unknown;
+    await act(async () => { result = await invoke(); });
+    return result;
+  }
+
+  it("verifies a large-coordinate edit that moves one wedge neighbour across another", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    // Extent 1e9 lets the similarity fit absorb a 2-unit move; the oxygen still crosses the methyl's ray.
+    const { molecule, role } = stereocentreAt(blank, which => ({ centre: { x: 300, y: 255.5 }, C: { x: 300 + 1e9, y: 255.5 },
+      N: { x: 300, y: 233.5 }, O: { x: 305, y: 256.5 } })[which]);
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const before = port.read("initial")!;
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const atoms = molecule.atoms.map(atom => role(atom.id) === "O" ? { ...atom, y: 254.5 } : atom);
+    await expect(moveStereocentreAtoms(molecule, atoms)).resolves.toMatchObject({ applied: true, objectIds: [molecule.id] });
+    expect(inspect).toHaveBeenCalled();
+    const after = port.read("initial")!.pages[0]!.objects[0]! as MoleculeObject;
+    expect(after).not.toBe(before.pages[0]!.objects[0]);
+    // The drawn configuration inverted, so the stored R must become S and never stay R.
+    expect(await storedConfiguration(after)).toBe(await storedConfiguration({ ...after, structure: "C[C@@H](N)O", structureFormat: "smiles" }));
+    expect(after.compatibility?.unknown.smiles).toBe("C[C@@H](N)O");
+    expect(after.chemistry?.stereochemistry.join(" ")).toMatch(/\(S\)/);
+    expect(after.chemistry?.stereochemistry.join(" ")).not.toMatch(/\(R\)/);
+  }, 20_000);
+
+  it("skips inspection when a wedged stereocentre is rotated and moved as one unit", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const molecule = graphEditFixture(blank, { name: "element", source: "C[C@H](N)O" });
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const stored = port.read("initial")!.pages[0]!.objects[0]! as MoleculeObject;
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const cx = molecule.atoms.reduce((sum, atom) => sum + atom.x, 0) / molecule.atoms.length;
+    const cy = molecule.atoms.reduce((sum, atom) => sum + atom.y, 0) / molecule.atoms.length;
+    const cos = Math.cos(Math.PI / 3), sin = Math.sin(Math.PI / 3);
+    // A rotation keeps the turn between every pair of the stereocentre's neighbours, so R cannot change.
+    const atoms = molecule.atoms.map(atom => ({ ...atom,
+      x: cx + 15 + (atom.x - cx) * cos - (atom.y - cy) * sin, y: cy + 10 + (atom.x - cx) * sin + (atom.y - cy) * cos }));
+    await expect(moveStereocentreAtoms(molecule, atoms)).resolves.toMatchObject({ applied: true });
+    expect(inspect).not.toHaveBeenCalled();
+    const after = port.read("initial")!.pages[0]!.objects[0]! as MoleculeObject;
+    expect(after.atoms.map(atom => [atom.x, atom.y])).toEqual(atoms.map(atom => [atom.x, atom.y]));
+    expect(after.structure).toBe("C[C@H](N)O");
+    expect(after.compatibility?.unknown.smiles).toBe(stored.compatibility?.unknown.smiles);
+    expect(after.chemistry?.stereochemistry).toEqual(stored.chemistry?.stereochemistry);
+  });
+
+  it("verifies a near-collinear wedge neighbour that crosses another neighbour's ray", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    // The oxygen sits within the side epsilon of the methyl's ray (|sin| about 5e-9), so neither
+    // drawing clearly keeps its turn, although the move is far inside the similarity tolerance.
+    const { molecule, role } = stereocentreAt(blank, which => ({ centre: { x: 300, y: 255.5 }, C: { x: 320, y: 255.5 },
+      N: { x: 300, y: 233.5 }, O: { x: 280, y: 255.5 + 1e-7 } })[which]);
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const before = port.read("initial")!;
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const atoms = molecule.atoms.map(atom => role(atom.id) === "O" ? { ...atom, y: 255.5 - 1e-7 } : atom);
+    // A collinear drawing gives the stereocentre no configuration, so its stored R cannot be confirmed.
+    await expectUserRefusal(moveStereocentreAtoms(molecule, atoms), "Plugin write refused: the stored structure doesn't match the drawn atoms.", molecule.id);
+    expect(inspect).toHaveBeenCalled();
+    expect(port.read("initial")).toBe(before);
+  }, 20_000);
+
+  it("inserts a molecule whose stored records are the canvas's own derivation without inspection", async () => {
+    const blank = createEmptyDocument();
+    const molecule = graphEditFixture(blank, { name: "element", source: "CO" });
+    const port = await mount(blank);
+    const inspect = vi.spyOn(identityClient, "inspectStructureOffThread");
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Insert methanol", patch: {
+      op: "addObject", pageId: blank.pages[0]!.id, object: molecule
+    } }));
+    await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true, objectIds: [molecule.id] }); });
+    expect(inspect).not.toHaveBeenCalled();
+    expect(port.read("initial")!.pages[0]!.objects).toMatchObject([{ id: molecule.id, structure: "CO" }]);
+  });
+
+  it.each([
+    ["structure", (molecule: MoleculeObject): Partial<MoleculeObject> => ({ structure: "CO" }), "Plugin write refused: the stored structure doesn't match the drawn atoms."],
+    ["cached SMILES", (molecule: MoleculeObject): Partial<MoleculeObject> => ({
+      compatibility: { ...molecule.compatibility!, unknown: { ...molecule.compatibility!.unknown, smiles: "CO" } } }),
+    "Plugin write refused: the stored structure doesn't match the drawn atoms."],
+    ["structure as a molfile", (): Partial<MoleculeObject> => ({ structureFormat: "molfile-v2000",
+      structure: depictSmiles2D("CO").molfile }), "Plugin write refused: the stored structure doesn't match the drawn atoms."],
+    ["formula", (molecule: MoleculeObject): Partial<MoleculeObject> => ({ chemistry: { ...molecule.chemistry!, formula: "CH4O" } }),
+      "Plugin write refused: the formula doesn't match the drawn structure."],
+    ["superatoms", (molecule: MoleculeObject): Partial<MoleculeObject> => ({ superatoms: [{ label: "OMe",
+      atomIds: [molecule.atoms[1]!.id], attachmentPoints: [], warnings: [] }] }), "Plugin write refused: it would change an abbreviation or R-group that can't be checked."]
+  ] as const)("refuses a write to the stored %s of a selected molecule that disagrees with its graph", async (_field, changes, failure) => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const molecule = graphEditFixture(blank, { name: "element", source: "CC" });
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const before = port.read("initial")!;
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Rewrite stored chemistry", patch: {
+      op: "updateObject", objectId: molecule.id, changes: changes(before.pages[0]!.objects[0]! as MoleculeObject)
+    } }));
+    // The canvas still draws ethane; saving or exporting methanol would silently change the chemistry.
+    await act(async () => { await expectUserRefusal(invoke(), failure, molecule.id); });
+    expect(port.read("initial")).toBe(before);
+  }, 20_000);
+
+  it("accepts a stored-structure write that agrees with the graph and stores the graph's own record", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const molecule = graphEditFixture(blank, { name: "element", source: "CC" });
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Rewrite stored chemistry", patch: {
+      op: "updateObject", objectId: molecule.id, changes: { structure: "C(C)" }
+    } }));
+    await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true, objectIds: [molecule.id] }); });
+    const after = port.read("initial")!.pages[0]!.objects[0]! as MoleculeObject;
+    expect(after).toMatchObject({ structure: "CC", structureFormat: "smiles", compatibility: { unknown: { smiles: "CC" } } });
+    expect(after.chemistry?.formula).toBe("C2H6");
+  }, 20_000);
+
+  it("refuses an accepted insertion proposal whose stored structure disagrees with its graph", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const molecule = graphEditFixture(blank, { name: "element", source: "CC" });
+    molecule.structure = "CO";
+    const port = await mount(blank);
+    const before = port.read("initial")!;
+    const runtime = captured.runtime!;
+    let proposalId!: string;
+    await act(async () => {
+      runtime.registerPlugin({ id: "org.chemdraft.proposalTest", name: "Proposal test", version: "0.1.0", apiVersion: "^0.1.14",
+        entry: "test.js", permissions: ["document.proposePatch"] });
+      proposalId = runtime.host.proposePatch("org.chemdraft.proposalTest", { reason: "Insert ethane",
+        patch: { op: "addObject", pageId, object: molecule } }).id;
+    });
+    await act(async () => { container.querySelector<HTMLButtonElement>(".patch-review-badge")!.click(); });
+    await act(async () => { container.querySelector<HTMLButtonElement>(`[data-proposal-id="${proposalId}"] button`)!.click(); });
+    // Flush React between polls; the refusal lands after off-thread inspection.
+    await vi.waitFor(async () => {
+      await act(async () => {});
+      expect(container.querySelector("[role=status]")?.textContent).toMatch(/Plugin change not applied/);
+    }, { timeout: 15_000 });
+    expect(container.querySelector("[role=status]")?.textContent).toBe(
+      "Plugin change not applied: the stored structure doesn't match the drawn atoms.");
+    expect(container.querySelector("[role=status]")?.textContent).not.toContain(molecule.id);
+    expect(port.read("initial")).toBe(before);
+    expect(runtime.host.listProposedPatches("pending")).toHaveLength(1);
+  }, 20_000);
+
+  it("keeps a stored stereo molfile in step with a rigid rotation so a later element edit verifies", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const molecule = graphEditFixture(blank, { name: "element", source: "C[C@H](N)O" }, true);
+    expect(molecule.structureFormat).toBe("molfile-v2000");
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const stored = port.read("initial")!.pages[0]!.objects[0]! as MoleculeObject;
+    const cx = molecule.atoms.reduce((sum, atom) => sum + atom.x, 0) / molecule.atoms.length;
+    const cy = molecule.atoms.reduce((sum, atom) => sum + atom.y, 0) / molecule.atoms.length;
+    const cos = Math.cos(Math.PI / 3), sin = Math.sin(Math.PI / 3);
+    const atoms = stored.atoms.map(atom => ({ ...atom,
+      x: cx + 15 + (atom.x - cx) * cos - (atom.y - cy) * sin, y: cy + 10 + (atom.x - cx) * sin + (atom.y - cy) * cos }));
+    let changes: Partial<MoleculeObject> = { atoms };
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Edit molecule", patch: {
+      op: "updateObject", objectId: molecule.id, changes
+    } }));
+    await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true }); });
+    const rotated = port.read("initial")!.pages[0]!.objects[0]! as MoleculeObject;
+    expect(rotated.structure).toBe(stored.structure);
+    expect(rotated.chemistry?.stereochemistry).toEqual(stored.chemistry?.stereochemistry);
+    // Oxygen to sulfur keeps the CIP ranking (S > N > C > H as O > N > C > H), so the label must not change.
+    changes = { atoms: rotated.atoms.map(atom => atom.element === "O" ? { ...atom, element: "S" } : atom) };
+    await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true, objectIds: [molecule.id] }); });
+    const after = port.read("initial")!.pages[0]!.objects[0]! as MoleculeObject;
+    expect(await storedConfiguration(stored)).toBe(await storedConfiguration({ ...stored, structure: "C[C@H](N)O", structureFormat: "smiles" }));
+    expect(after.structureFormat).toBe("molfile-v2000");
+    const expected = await storedConfiguration({ ...after, structure: "C[C@H](N)S", structureFormat: "smiles" });
+    expect(await storedConfiguration(after)).toBe(expected);
+    expect(after.compatibility?.unknown.smiles).toBe(expected);
+    expect(after.chemistry?.stereochemistry.join(" ")).toMatch(/\(R\)/);
+    expect(after.chemistry?.stereochemistry.join(" ")).not.toMatch(/\(S\)/);
+  }, 20_000);
+
+  it("preserves a canvas edit made while a plugin graph patch awaits inspection", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const edit = pluginGraphEdits[0];
+    const molecule = graphEditFixture(blank, edit);
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const before = port.read("initial")!;
+    const moved = applyPatch(before, { op: "moveObject", objectId: molecule.id, x: molecule.x + 25, y: molecule.y });
+    const inspect = identityClient.inspectStructureOffThread;
+    const started = deferred<void>();
+    const resume = deferred<void>();
+    vi.spyOn(identityClient, "inspectStructureOffThread").mockImplementationOnce(async (...args) => {
+      started.resolve();
+      await resume.promise;
+      return inspect(...args);
+    });
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Edit element", patch: {
+      op: "updateObject", objectId: molecule.id, changes: graphEditChanges(molecule, edit)
+    } }));
+    await act(async () => {
+      const pending = invoke();
+      await Promise.race([started.promise, pending]);
+      port.push("initial", before, moved, "Move molecule");
+      resume.resolve();
+      await expect(pending).rejects.toThrow(/drawing changed while refreshing stored chemistry/i);
+    });
+    expect(port.read("initial")!.pages).toEqual(moved.pages);
+  }, 20_000);
+
+  it("refuses an indeterminate bond order without committing any part of the batch", async () => {
+    const blank = createEmptyDocument();
+    const pageId = blank.pages[0]!.id;
+    const molecule = graphEditFixture(blank, pluginGraphEdits[0]);
+    const port = await mount(applyPatch(blank, { op: "batch", patches: [
+      { op: "addObject", pageId, object: molecule }, { op: "setSelection", pageId, objectIds: [molecule.id] }
+    ] }));
+    const before = port.read("initial");
+    const bond = molecule.bonds[0]!;
+    const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Invalid graph edit", patch: {
+      op: "batch", patches: [
+        { op: "updateObject", objectId: molecule.id, changes: graphEditChanges(molecule, pluginGraphEdits[0]) },
+        { op: "updateObject", objectId: molecule.id, changes: { bonds: [{ ...bond, order: "unknown" }] } }
+      ]
+    } }));
+    await act(async () => { await expect(invoke()).rejects.toThrow(/cannot refresh stored chemistry.*unknown bond order/i); });
+    expect(port.read("initial")).toBe(before);
+    await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "edit.undo" } })); });
+    expect(port.read("initial")).toBe(before);
+  }, 20_000);
 
   describe.each(["macos", "windows"] as const)("plugin writes during an open text edit on %s", platform => {
     beforeEach(() => {
@@ -715,19 +1175,27 @@ describe("plugin direct writes through mounted desktop normalization", () => {
     expect(port.read("initial")).toBe(before);
   });
 
-  it("records a selected atom's label bond side while preserving an unselected molecule", async () => {
+  it.each(["left", "right"] as const)("checks the meaning of an SCN label with its bond on the %s", async side => {
     const fixture = testContext();
     const second = { ...fixture.molecule, id: "unselected_structure" };
     const drawing = applyPatch(fixture.context.getDocument()!, { op: "addObject", pageId: fixture.context.getDocument()!.pages[0]!.id, object: second });
     const port = await mount(applyPatch(drawing, { op: "setSelection", objectIds: [fixture.molecule.id] }));
     const before = port.read("initial")!;
     const molecule = before.pages[0]!.objects[0]! as MoleculeObject;
+    const index = side === "left" ? 1 : 0;
     const invoke = registerWrite(context => context.documents.applyPatch!({ reason: "Edit atom label", patch: {
-      op: "updateObject", objectId: molecule.id, changes: { atoms: molecule.atoms.map((atom, i) => i ? atom : { ...atom, element: "SCN", labelLiteral: true }) }
+      op: "updateObject", objectId: molecule.id, changes: { atoms: molecule.atoms.map((atom, i) => i === index
+        ? { ...atom, element: "SCN", labelLiteral: true } : atom) }
     } }));
+    // Right-bond SCN is a bare formula. Saving it as an R-group placeholder would lose its meaning.
+    if (side === "right") {
+      await act(async () => { await expect(invoke()).rejects.toThrow(/cannot refresh stored chemistry.*Atom label "SCN"/); });
+      expect(port.read("initial")).toBe(before);
+      return;
+    }
     await act(async () => { await expect(invoke()).resolves.toMatchObject({ applied: true }); });
     const after = port.read("initial")!;
-    expect((after.pages[0]!.objects[0]! as MoleculeObject).atoms[0]!.labelBondSide).toEqual({ side: "right", atomId: molecule.atoms[1]!.id });
+    expect((after.pages[0]!.objects[0]! as MoleculeObject).atoms[index]!.labelBondSide).toEqual({ side, atomId: molecule.atoms[0]!.id });
     expect(after.pages[0]!.objects.find(object => object.id === second.id)).toEqual(before.pages[0]!.objects.find(object => object.id === second.id));
   });
 
@@ -861,10 +1329,10 @@ describe("plugin direct writes through mounted desktop normalization", () => {
   });
 });
 
-function input(value: string): void {
+function input(value: string, isComposing = false): void {
   const textarea = container.querySelector(".plugin-canvas-overlay textarea")!;
   Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, value);
-  textarea.dispatchEvent(new Event("input", { bubbles: true }));
+  textarea.dispatchEvent(new InputEvent("input", { bubbles: true, isComposing }));
 }
 async function send(): Promise<void> {
   await act(async () => container.querySelector(".plugin-canvas-overlay textarea")!
@@ -891,7 +1359,7 @@ async function typeAtFocus(text: string): Promise<void> {
 
 /** Dispatch through the actual DOM path without supplying the focus handoff under test.
  * In particular, do not call canvas.focus(): page tools can cancel browser focus defaults. */
-async function canvasPointer(target: Element, type: "pointerdown" | "pointerup",
+async function canvasPointer(target: Element, type: "pointerdown" | "pointermove" | "pointerup",
   options: MouseEventInit & { pointerType?: string; isPrimary?: boolean; pointerId?: number } = {}): Promise<MouseEvent> {
   const event = new MouseEvent(type, { bubbles: true, cancelable: true, button: 0, clientX: 500, clientY: 500, ...options });
   await act(async () => {
@@ -929,6 +1397,8 @@ async function undoAtFocus(platform: "macos" | "windows"): Promise<void> {
 
 describe("MainWindow canvas overlays", () => {
   beforeEach(async () => {
+    vi.spyOn(window, "addEventListener");
+    vi.spyOn(window, "removeEventListener");
     vi.stubGlobal("localStorage", new MemoryStorage()); vi.stubGlobal("ResizeObserver", TestResizeObserver); vi.stubGlobal("CSS", { escape: (value: string) => value });
     HTMLElement.prototype.setPointerCapture ??= () => {};
     HTMLElement.prototype.releasePointerCapture ??= () => {};
@@ -1003,6 +1473,80 @@ describe("MainWindow canvas overlays", () => {
       expect(document.activeElement).toBe(canvas);
       expect(focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
       await canvasPointer(canvas, "pointerup");
+    });
+
+    it("leaves all IME events untouched through the textarea and window, then sends and collapses on ordinary keys", async () => {
+      const textarea = container.querySelector<HTMLTextAreaElement>(".plugin-canvas-overlay textarea")!;
+      const widget = container.querySelector<HTMLElement>(".plugin-canvas-overlay")!;
+      await act(async () => input("あ"));
+      const events: Event[] = [new CompositionEvent("compositionstart", { bubbles: true, cancelable: true })];
+      for (const key of ["Enter", " ", "Escape", "Process", "F5"]) {
+        for (const flags of [{ isComposing: true, keyCode: 13 }, { isComposing: false, keyCode: 229 }]) {
+          for (const type of ["keydown", "keyup"]) events.push(new KeyboardEvent(type, { key, ...flags, bubbles: true, cancelable: true }));
+        }
+      }
+      events.push(
+        new InputEvent("beforeinput", { bubbles: true, cancelable: true, isComposing: true, inputType: "insertCompositionText", data: "あ" }),
+        new InputEvent("input", { bubbles: true, cancelable: true, isComposing: true, inputType: "insertCompositionText", data: "あ" }),
+        new CompositionEvent("compositionupdate", { bubbles: true, cancelable: true, data: "あ" }),
+        new CompositionEvent("compositionend", { bubbles: true, cancelable: true, data: "あ" }),
+        new CompositionEvent("compositioncancel", { bubbles: true, cancelable: true })
+      );
+      for (const event of events) {
+        // The window-wide reload guard cancels F5's default on Windows whatever the IME
+        // state (a reload discards the document). That is its cancel, not the composition guard's.
+        const reloadGuarded = event instanceof KeyboardEvent && event.type === "keydown"
+          && isBrowserReloadChord(event, platform);
+        const reached = vi.fn((observed: Event) => {
+          expect(observed).toBe(event);
+          expect(observed.defaultPrevented).toBe(reloadGuarded);
+          expect(observed.cancelBubble).toBe(false);
+        });
+        const prevent = vi.spyOn(event, "preventDefault");
+        const stop = vi.spyOn(event, "stopPropagation");
+        const stopImmediate = vi.spyOn(event, "stopImmediatePropagation");
+        textarea.addEventListener(event.type, reached);
+        document.addEventListener(event.type, reached);
+        window.addEventListener(event.type, reached);
+        const last = vi.fn();
+        window.addEventListener(event.type, last);
+        try {
+          await act(async () => { expect(textarea.dispatchEvent(event)).toBe(!reloadGuarded); });
+          expect(reached).toHaveBeenCalledTimes(3);
+          expect(last).toHaveBeenCalledOnce();
+          if (reloadGuarded) {
+            expect(prevent).toHaveBeenCalledOnce();
+            expect(wasBrowserReloadPrevented(event as KeyboardEvent)).toBe(true);
+          } else expect(prevent).not.toHaveBeenCalled();
+          expect(stop).not.toHaveBeenCalled();
+          expect(stopImmediate).not.toHaveBeenCalled();
+          expect(event.defaultPrevented).toBe(reloadGuarded);
+        } finally {
+          textarea.removeEventListener(event.type, reached);
+          document.removeEventListener(event.type, reached);
+          window.removeEventListener(event.type, reached);
+          window.removeEventListener(event.type, last);
+        }
+        expect(submit).not.toHaveBeenCalled();
+        expect(widget.dataset.expanded).toBe("true");
+        expect(document.activeElement).toBe(textarea);
+      }
+      expect(widget.dataset.composing).toBeUndefined();
+      await send();
+      expect(submit).toHaveBeenCalledOnce();
+      expect(submit.mock.calls[0]![0].input?.text).toBe("あ");
+      // A missing compositionend must also leave the next plain Escape free to collapse.
+      await act(async () => textarea.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true })));
+      const escape = new KeyboardEvent("keydown", { key: "Escape", keyCode: 27, bubbles: true, cancelable: true });
+      const reached = vi.fn();
+      window.addEventListener("keydown", reached);
+      try { await act(async () => textarea.dispatchEvent(escape)); }
+      finally { window.removeEventListener("keydown", reached); }
+      expect(reached).toHaveBeenCalledOnce();
+      expect(escape.defaultPrevented).toBe(false);
+      expect(widget.dataset.composing).toBeUndefined();
+      expect(widget.dataset.expanded).toBe("false");
+      expect(document.activeElement).toBe(container.querySelector(".canvas-region"));
     });
 
     it("keeps the prompt focused for a press inside the overlay", async () => {
@@ -1190,7 +1734,7 @@ describe("MainWindow canvas overlays", () => {
         if (start === "compositionstart") textarea.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
         else if (start === "input.isComposing") textarea.dispatchEvent(new InputEvent("input", { bubbles: true, isComposing: true }));
         else textarea.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Process", isComposing: true }));
-        input("あ");
+        input("あ", true);
       });
       expect(canvas.hasAttribute("tabindex")).toBe(false);
       for (const { target, clientX, clientY } of [
@@ -1231,28 +1775,333 @@ describe("MainWindow canvas overlays", () => {
       expect(submit.mock.calls[0]![0].input?.text).toBe("あ");
     });
 
-    it.each(["compositionstart", "input.isComposing", "keydown.isComposing"])("allows canvas focus and Escape after an orphaned %s expires", async start => {
+    it.each(["normal keydown", "normal input", "prompt blur", "Escape"])("releases a focused orphan on %s and the next bond press works", async terminal => {
+      await act(async () => window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "tool.bond" } })));
       const textarea = container.querySelector<HTMLTextAreaElement>(".plugin-canvas-overlay textarea")!;
       const canvas = container.querySelector<HTMLElement>(".canvas-region")!;
+      const page = container.querySelector<HTMLElement>(".page")!;
+      const widget = container.querySelector<HTMLElement>(".plugin-canvas-overlay")!;
+      vi.spyOn(page, "getBoundingClientRect").mockReturnValue({ x: 200, y: 200, left: 200, top: 200,
+        width: 600, height: 800, right: 800, bottom: 1000, toJSON: () => ({}) });
+      const before = getAssistantHistoryPort().read("initial")!;
       vi.useFakeTimers();
       try {
         await act(async () => {
-          if (start === "compositionstart") textarea.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
-          else if (start === "input.isComposing") textarea.dispatchEvent(new InputEvent("input", { bubbles: true, isComposing: true }));
-          else textarea.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Process", isComposing: true }));
+          textarea.focus();
+          textarea.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+          input("あ", true);
+          vi.advanceTimersByTime(12000);
         });
-        expect((await canvasPointer(canvas, "pointerdown")).defaultPrevented).toBe(true);
-        await canvasPointer(canvas, "pointerup");
-        await act(async () => vi.advanceTimersByTime(12000));
+        expect((await canvasPointer(page, "pointerdown")).defaultPrevented).toBe(true);
+        await canvasPointer(page, "pointerup");
+        expect(widget.dataset.composing).toBe("true");
+        expect(widget.querySelector('[role="status"]')?.textContent).toBe("Finishing input…");
+        expect(widget.hidden).toBe(false);
+        expect(document.activeElement).toBe(textarea);
+        expect(getAssistantHistoryPort().read("initial")).toBe(before);
+        await act(async () => {
+          if (terminal === "prompt blur") textarea.blur();
+          else if (terminal === "normal input") input("あb");
+          else textarea.dispatchEvent(new KeyboardEvent("keydown", {
+            bubbles: true, cancelable: true, key: terminal === "Escape" ? "Escape" : "b", isComposing: false, keyCode: 0
+          }));
+        });
+        expect(widget.dataset.composing).toBeUndefined();
+        expect(widget.querySelector('[role="status"]')?.textContent).not.toContain("Finishing input…");
         expect(canvas.getAttribute("tabindex")).toBe("-1");
-        await canvasPointer(canvas, "pointerdown");
-        expect(document.activeElement).toBe(canvas);
-        await canvasPointer(canvas, "pointerup");
-        await act(async () => textarea.focus());
-        await act(async () => textarea.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Escape" })));
-        expect(container.querySelector<HTMLElement>(".plugin-canvas-overlay")!.dataset.expanded).toBe("false");
-        expect(document.activeElement).toBe(canvas);
+        expect(widget.dataset.expanded).toBe(terminal === "Escape" ? "false" : "true");
+        await canvasPointer(page, "pointerdown");
+        await canvasPointer(page, "pointerup");
+        const after = getAssistantHistoryPort().read("initial")!;
+        expect(after).not.toBe(before);
+        expect(after.pages[0]!.objects.some(object => object.type === "molecule")).toBe(true);
       } finally { vi.useRealTimers(); }
+    });
+
+    it("does not arm on a 229 mode key and allows the very next canvas press", async () => {
+      const textarea = container.querySelector<HTMLTextAreaElement>(".plugin-canvas-overlay textarea")!;
+      await act(async () => textarea.dispatchEvent(new KeyboardEvent("keydown", {
+        bubbles: true, key: "Process", keyCode: 229, isComposing: false
+      })));
+      expect(container.querySelector<HTMLElement>(".plugin-canvas-overlay")!.dataset.composing).toBeUndefined();
+      const canvas = container.querySelector<HTMLElement>(".canvas-region")!;
+      expect((await canvasPointer(canvas, "pointerdown")).defaultPrevented).toBe(false);
+      expect(document.activeElement).toBe(canvas);
+      await canvasPointer(canvas, "pointerup");
+    });
+
+    it("leaves main-window chrome and overlay controls usable during composition", async () => {
+      const textarea = container.querySelector<HTMLTextAreaElement>(".plugin-canvas-overlay textarea")!;
+      const widget = container.querySelector<HTMLElement>(".plugin-canvas-overlay")!;
+      const canvas = container.querySelector<HTMLElement>(".canvas-region")!;
+      vi.spyOn(container.querySelector<HTMLElement>(".plugin-canvas-overlay-layer")!, "getBoundingClientRect")
+        .mockImplementation(() => canvas.getBoundingClientRect());
+      await act(async () => window.dispatchEvent(new Event("resize")));
+      const chrome = container.querySelector(".document-tab-strip")!;
+      expect(chrome).not.toBeNull();
+      const provider = widget.querySelector("select")!;
+      const collapse = widget.querySelector<HTMLButtonElement>('button[aria-label="Collapse Assistant overlay"]')!;
+      const grip = widget.querySelector<HTMLElement>(".plugin-canvas-overlay-resize")!;
+      const clicked = vi.fn();
+      chrome.addEventListener("click", clicked);
+      await act(async () => textarea.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true })));
+      for (const target of [chrome, provider, collapse]) {
+        expect((await canvasPointer(target, "pointerdown")).defaultPrevented).toBe(false);
+        expect(widget.dataset.composing).toBe("true");
+        await canvasPointer(target, "pointerup");
+      }
+      await act(async () => {
+        expect(chrome.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }))).toBe(true);
+      });
+      expect(clicked).toHaveBeenCalledOnce();
+      expect(widget.dataset.composing).toBe("true");
+      await act(async () => {
+        expect(provider.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }))).toBe(true);
+        provider.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      expect(select).toHaveBeenCalledOnce();
+      expect(widget.dataset.composing).toBe("true");
+      // The grip intentionally prevents the browser's selection default; verify
+      // its own resize handler runs and canvas-targeted captured moves can finish.
+      const heightBefore = widget.style.height;
+      await canvasPointer(grip, "pointerdown", { clientY: 300, buttons: 1 });
+      await canvasPointer(container.querySelector(".page")!, "pointermove", { clientY: 250, buttons: 1 });
+      await canvasPointer(container.querySelector(".page")!, "pointerup", { clientY: 250 });
+      expect(widget.style.height).not.toBe(heightBefore);
+      expect(widget.dataset.composing).toBe("true");
+      await act(async () => collapse.click());
+      expect(widget.dataset.expanded).toBe("false");
+      expect(document.activeElement).toBe(container.querySelector(".canvas-region"));
+    });
+
+    it.each(["tool.bond", "tool.text"])("blocks real %s gestures throughout composition", async commandId => {
+      await act(async () => window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId } })));
+      expect(container.querySelector("[data-active-tool]")?.getAttribute("data-active-tool")).toBe(commandId);
+      const textarea = container.querySelector<HTMLTextAreaElement>(".plugin-canvas-overlay textarea")!;
+      const widget = container.querySelector<HTMLElement>(".plugin-canvas-overlay")!;
+      const page = container.querySelector<HTMLElement>(".page")!;
+      vi.spyOn(page, "getBoundingClientRect").mockReturnValue({ x: 200, y: 200, left: 200, top: 200,
+        width: 600, height: 800, right: 800, bottom: 1000, toJSON: () => ({}) });
+      const capture = vi.spyOn(page, "setPointerCapture");
+      const before = getAssistantHistoryPort().read("initial")!;
+      await act(async () => {
+        textarea.focus();
+        textarea.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+        input("あ", true);
+      });
+      const reacted = vi.fn();
+      window.addEventListener("pointerdown", reacted, true);
+      try {
+        // Model a transient activeElement while the native IME still owns the
+        // prompt. Exercise the real tools without the React focus guard.
+        const activeElement = vi.spyOn(document, "activeElement", "get");
+        try {
+          activeElement.mockReturnValue(document.body);
+          await canvasPointer(page, "pointerdown");
+          expect(getAssistantHistoryPort().read("initial")).toBe(before);
+          expect(capture).not.toHaveBeenCalled();
+          expect(container.querySelector(".text-object-editor")).toBeNull();
+          await canvasPointer(page, "pointerup");
+        } finally { activeElement.mockRestore(); }
+        for (const target of [page, container.querySelector(".page-svg-surface")!, container.querySelector(".page-interaction-layer")!]) {
+          for (const pointerType of ["mouse", "pen", "touch"]) for (const button of [0, 1, 2, 3, 4]) {
+            const options = { pointerType, button };
+            expect((await canvasPointer(target, "pointerdown", options)).defaultPrevented).toBe(true);
+            expect(getAssistantHistoryPort().read("initial")).toBe(before);
+            expect(widget.hidden).toBe(false);
+            expect(document.activeElement).toBe(textarea);
+            await canvasPointer(target, "pointerup", options);
+          }
+        }
+      } finally { window.removeEventListener("pointerdown", reacted, true); }
+      expect(reacted).not.toHaveBeenCalled();
+      expect(capture).not.toHaveBeenCalled();
+      expect(container.querySelector(".text-object-editor")).toBeNull();
+      expect(getAssistantHistoryPort().read("initial")).toBe(before);
+      expect(widget.dataset.composing).toBe("true");
+      expect(textarea.value).toBe("あ");
+      expect(submit).not.toHaveBeenCalled();
+      expect(select).not.toHaveBeenCalled();
+
+      // The same real tool must work as soon as composition ends.
+      await act(async () => textarea.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "あ" })));
+      await canvasPointer(page, "pointerdown");
+      expect(widget.hidden).toBe(true);
+      expect(getAssistantHistoryPort().read("initial")).not.toBe(before);
+      if (commandId === "tool.bond") {
+        expect(capture).toHaveBeenCalled();
+        expect(getAssistantHistoryPort().read("initial")!.pages[0]!.objects.some(object => object.type === "molecule")).toBe(true);
+      } else expect(container.querySelector(".text-object-editor")).not.toBeNull();
+      await canvasPointer(page, "pointerup");
+      expect(widget.hidden).toBe(false);
+    });
+
+    it.each(["tool.text", "tool.select"])("blocks text-object double-click editing with %s after a focused candidate pause exceeds the old expiry", async commandId => {
+      vi.useFakeTimers();
+      try {
+        const port = getAssistantHistoryPort();
+        const initial = port.read("initial")!;
+        const text = testContext().text;
+        await act(async () => {
+          port.push("initial", initial, applyPatch(initial, { op: "addObject", pageId: initial.pages[0]!.id, object: text }), "Test text");
+          window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId } }));
+        });
+        expect(container.querySelector("[data-active-tool]")?.getAttribute("data-active-tool")).toBe(commandId);
+        const textarea = container.querySelector<HTMLTextAreaElement>(".plugin-canvas-overlay textarea")!;
+        const widget = container.querySelector<HTMLElement>(".plugin-canvas-overlay")!;
+        const target = container.querySelector(`[data-page-svg-object-visual="${text.id}"]`)!;
+        expect(target).not.toBeNull();
+        const before = port.read("initial")!;
+        await act(async () => {
+          textarea.focus();
+          textarea.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+          input("あ", true);
+        });
+        await act(async () => vi.advanceTimersByTime(12000));
+        expect(document.activeElement).toBe(textarea);
+        // Text opens on the first pointerdown, whereas Select waits for dblclick.
+        // Exercise both SVG glyphs and the separate interaction chrome, with every
+        // native phase: a lone dblclick never tested the Text-tool edit path.
+        const chrome = container.querySelector(`.text-object[data-object-id="${text.id}"]`)!;
+        expect(chrome).not.toBeNull();
+        for (const hit of [target, chrome]) {
+          for (const detail of [1, 2]) {
+            await canvasPointer(hit, "pointerdown", { detail, buttons: 1 });
+            expect(container.querySelector(".text-object-editor")).toBeNull();
+            await canvasMouseDefault(hit as HTMLElement, { detail, buttons: 1 });
+            await canvasPointer(hit, "pointermove", { detail, buttons: 1 });
+            await canvasPointer(hit, "pointerup", { detail });
+            await act(async () => {
+              for (const type of ["click", ...(detail === 2 ? ["dblclick"] : [])]) {
+                expect(hit.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, detail }))).toBe(false);
+              }
+            });
+            expect(container.querySelector(".text-object-editor")).toBeNull();
+            expect(container.textContent).not.toContain("Editing text");
+            expect(widget.hidden).toBe(false);
+            expect(document.activeElement).toBe(textarea);
+            expect(widget.dataset.composing).toBe("true");
+          }
+        }
+        expect(container.querySelector(".text-object-editor")).toBeNull();
+        expect(port.read("initial")).toBe(before);
+        expect(document.activeElement).toBe(textarea);
+        expect(widget.dataset.composing).toBe("true");
+        expect(textarea.value).toBe("あ");
+        await act(async () => {
+          textarea.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "あ" }));
+          target.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true, detail: 2 }));
+        });
+        const editor = container.querySelector(".text-object-editor");
+        expect(editor).not.toBeNull();
+        expect(document.activeElement).toBe(editor);
+        expect(port.read("initial")!.selection.objectIds).toEqual([text.id]);
+      } finally { vi.useRealTimers(); }
+    });
+
+    it.each(["keydown before end", "keydown after end", "keydown after input"])("draws on the very next bond press after WebKit commit (%s)", async order => {
+      await act(async () => window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "tool.bond" } })));
+      const textarea = container.querySelector<HTMLTextAreaElement>(".plugin-canvas-overlay textarea")!;
+      const widget = container.querySelector<HTMLElement>(".plugin-canvas-overlay")!;
+      const page = container.querySelector<HTMLElement>(".page")!;
+      vi.spyOn(page, "getBoundingClientRect").mockReturnValue({ x: 200, y: 200, left: 200, top: 200,
+        width: 600, height: 800, right: 800, bottom: 1000, toJSON: () => ({}) });
+      const before = getAssistantHistoryPort().read("initial")!;
+      await act(async () => {
+        textarea.focus();
+        textarea.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+        input("あ", true);
+        const commitKey = () => textarea.dispatchEvent(new KeyboardEvent("keydown", {
+          key: "Enter", keyCode: 229, isComposing: true, bubbles: true, cancelable: true
+        }));
+        if (order === "keydown before end") commitKey();
+        textarea.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "あ" }));
+        if (order === "keydown after end") commitKey();
+        textarea.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "あ" }));
+        if (order === "keydown after input") commitKey();
+        textarea.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", keyCode: 13, bubbles: true }));
+      });
+      expect(widget.dataset.composing).toBeUndefined();
+      expect(document.activeElement).toBe(textarea);
+      expect(submit).not.toHaveBeenCalled();
+      await canvasPointer(page, "pointerdown", { buttons: 1 });
+      await canvasPointer(page, "pointerup");
+      const after = getAssistantHistoryPort().read("initial")!;
+      expect(after).not.toBe(before);
+      expect(after.pages[0]!.objects.some(object => object.type === "molecule")).toBe(true);
+      expect(widget.hidden).toBe(false);
+    });
+
+    it.each(["compositionend", "compositioncancel", "prompt blur", "normal keydown", "overlay removal", "unmount"])("removes non-passive composition listeners on %s", async terminal => {
+      const guards = () => vi.mocked(window.addEventListener).mock.calls.filter(([type, , options]) =>
+        type === "touchstart" && typeof options === "object" && options.capture && options.passive === false);
+      const attached = () => guards().length - vi.mocked(window.removeEventListener).mock.calls.filter(([type, listener, options]) =>
+        type === "touchstart" && (options === true || typeof options === "object" && options.capture)
+          && guards().some(([, guard]) => listener === guard)).length;
+      const textarea = container.querySelector<HTMLTextAreaElement>(".plugin-canvas-overlay textarea")!;
+      expect(guards()).toHaveLength(0);
+      vi.useFakeTimers();
+      try {
+        // Repeat to catch duplicate registration or a listener left after a clear.
+        for (let cycle = 0; cycle < 2; cycle++) {
+          await act(async () => {
+            textarea.focus();
+            textarea.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+            expect(attached()).toBe(1);
+            textarea.dispatchEvent(new CompositionEvent("compositionupdate", { bubbles: true }));
+            expect(attached()).toBe(1);
+          });
+          await act(async () => {
+            if (terminal === "normal keydown") textarea.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "b" }));
+            else if (terminal === "prompt blur") textarea.blur();
+            else if (terminal === "overlay removal") captured.runtime!.unregisterPlugin(pluginId);
+            else if (terminal === "unmount") root.unmount();
+            else textarea.dispatchEvent(new CompositionEvent(terminal, { bubbles: true }));
+          });
+          expect(attached()).toBe(0);
+          if (terminal === "overlay removal" || terminal === "unmount") break;
+        }
+      } finally { vi.useRealTimers(); }
+    });
+
+    it.each(["pointerdown", "mousedown", "touchstart", "contextmenu", "auxclick", "click", "dblclick"])("cancels composing canvas %s before any other listener reacts", async type => {
+      const textarea = container.querySelector<HTMLTextAreaElement>(".plugin-canvas-overlay textarea")!;
+      const widget = container.querySelector<HTMLElement>(".plugin-canvas-overlay")!;
+      const page = container.querySelector<HTMLElement>(".page")!;
+      const before = getAssistantHistoryPort().read("initial")!;
+      await act(async () => {
+        textarea.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+        input("あ", true);
+      });
+      const reacted = vi.fn();
+      window.addEventListener(type, reacted, true);
+      page.addEventListener(type, reacted);
+      try {
+        for (const button of [0, 1, 2]) {
+          const event = type.startsWith("touch") ? new TouchEvent(type, { bubbles: true, cancelable: true })
+            : new MouseEvent(type, { bubbles: true, cancelable: true, button, buttons: 1, clientX: 500, clientY: 500 });
+          await act(async () => { expect(page.dispatchEvent(event)).toBe(false); });
+          expect(event.defaultPrevented).toBe(true);
+          expect(reacted).not.toHaveBeenCalled();
+          expect(document.activeElement).toBe(textarea);
+          expect(widget.hidden).toBe(false);
+          expect(widget.dataset.composing).toBe("true");
+          expect(textarea.value).toBe("あ");
+          expect(getAssistantHistoryPort().read("initial")).toBe(before);
+          expect(container.querySelector('[data-context-target-kind="page"]')).toBeNull();
+        }
+        await act(async () => textarea.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "あ" })));
+        if (type === "pointermove" || type === "pointerup" || type === "pointerdown") {
+          await canvasPointer(page, type, { button: 2 });
+        } else await act(async () => page.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, button: 2 })));
+        expect(reacted).toHaveBeenCalled();
+        if (type === "contextmenu") expect(container.querySelector('[data-context-target-kind="page"]')).not.toBeNull();
+      } finally {
+        window.removeEventListener(type, reacted, true);
+        page.removeEventListener(type, reacted);
+      }
+      expect(submit).not.toHaveBeenCalled();
+      expect(select).not.toHaveBeenCalled();
     });
 
     it.each([
