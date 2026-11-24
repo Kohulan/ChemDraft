@@ -993,7 +993,10 @@ mod tests {
             decode_text(&utf16le(text, true), utf16be).as_deref(),
             Some(text)
         );
-        assert_eq!(decode_text(&be(text, true), little_endian).as_deref(), Some(text));
+        assert_eq!(
+            decode_text(&be(text, true), little_endian).as_deref(),
+            Some(text)
+        );
 
         let mut budget = clipboard_limits::ClipboardReadBudget::default();
         let mut items = Vec::new();
@@ -1126,7 +1129,9 @@ mod tests {
         ));
         assert!(!refused_as_chemistry(b"CCO"));
 
-        assert!(head_is_structure_file(b"\xef\xbb\xbf<CDXML\n  Version=\"1\">"));
+        assert!(head_is_structure_file(
+            b"\xef\xbb\xbf<CDXML\n  Version=\"1\">"
+        ));
         assert!(head_is_structure_file(b"<!-- saved -->\n<CDXML/>"));
         assert!(!head_is_structure_file(b"<CDXMLish/>"));
         assert!(!head_is_structure_file(b"<?xml version=\"1.0\"?><html/>"));
