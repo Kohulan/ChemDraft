@@ -15,8 +15,9 @@ import {
   type NormalizedProposedDocumentPatch
 } from "@chemdraft/plugin-api";
 import { assertPluginDocumentWriteScope, bareIdTargetPage, objectInWriteScope, rebasePluginPatch,
-  retainedCtabCompatibility, storedCtabReference, writePatchOps, type PageObjectRef, type PluginWriteScopePages } from "@chemdraft/plugin-host";
-import { selectionBounds, translateInsertedDocumentObjects } from "../documentWorkflow";
+  retainedCtabCompatibility, storedCtabReference, writePatchOps, type PageObjectRef, type PluginHost,
+  type PluginWriteScopePages } from "@chemdraft/plugin-host";
+import { selectionBounds, translateInsertedDocumentObjects, withImpliedRadicalChemistryRederived } from "../documentWorkflow";
 import { choosePlacement, objectRect, overlaps as boundsOverlap, pageContentRect, RELATIVE_GAP, unionRects } from "../assistant/placement";
 import type { ViewportRect } from "@chemdraft/viewport-engine";
 import { nativeSingleBondGraphMetadata, tryNativeSingleBondGraphSmiles } from "@chemdraft/document-workflow-core";
@@ -349,6 +350,16 @@ export function applyPluginDocumentPatch(
     }
     patched = translateInsertedDocumentObjects(patched, objects.map(object => object.id), x - bounds.x, y - bounds.y);
   }
+  // An inserted molecule copied from a document saved before the H• reading carries a lone H's stale
+  // H2 cache. Re-derive the inserted molecules only (by page and id), before verification and inside
+  // this write's one history entry; atoms, bonds and placement stay as authored.
+  const insertedRefs = new Set(writePatchOps(proposed.patch).flatMap(op =>
+    op.op === "addObject" && op.object.type === "molecule" ? [`${op.pageId}\u0000${op.object.id}`] : []));
+  if (insertedRefs.size) {
+    patched = withImpliedRadicalChemistryRederived(patched, {
+      only: (pageId, objectId) => insertedRefs.has(`${pageId}\u0000${objectId}`), occasion: "on plugin insert"
+    });
+  }
   // Record each touched object by page and id: the page an insertion names, and the page chem-core's
   // bare-id op acted on (its first occurrence). A same-id object on another page is never "touched".
   const touched = new Set<string>();
@@ -517,6 +528,20 @@ export function applyAcceptedPluginProposal(
 ): AppliedPluginDocumentPatch {
   return applyPluginDocumentPatch(document, rebaseProposedInsertion(document, proposed), {
     preserveRepeatUnitBrackets: false, deferGroupCleanup: false, ...options
+  });
+}
+
+/**
+ * The document a pending proposal produces when the user accepts it into `document`: the host's own
+ * accept application (`previewProposedPatch`, with its orphaned-bracket allowance) through
+ * `applyAcceptedPluginProposal`, exactly as the accept begins. Nothing is committed and `document`
+ * is not changed, so the review can dry-run it; it throws where the accept would.
+ */
+export function previewAcceptedPluginProposal(
+  host: Pick<PluginHost, "previewProposedPatch">, proposalId: string, document: ChemDraftDocument
+): ChemDraftDocument {
+  return host.previewProposedPatch(proposalId, document, {
+    apply: (current, proposed, options) => applyAcceptedPluginProposal(current, proposed, options).document
   });
 }
 

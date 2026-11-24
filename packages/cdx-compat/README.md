@@ -111,6 +111,58 @@ label and original source expansion instead of silently flattening it. Original 
 cannot be collapsed safely exports its live graph with `cdxml.superatom_not_collapsed`.
 Synthetic coverage includes biphenyl/Ph, Boc-NH, OTBS, OMe and three independent Me groups.
 
+### Stated hydrogen counts (`NumHydrogens`)
+
+`NumHydrogens` is kept as the atom field `hydrogenCount` where it carries information:
+
+- on an atom of an `Order="1.5"` bond, a literal label, or a snapshotted abbreviation atom, always
+  (it settles a ring N–H or stands for the source constraint);
+- on an ordinary atom, when it disagrees with the count ChemDraft derives from the atom's bonds,
+  charge and radicals (layout-engine's `atomDerivedHydrogenCount`). Owner ruling, 1.2.3: the
+  file's count is kept exactly as written, the atom shows the red (!) badge (document-workflow-core's
+  `nativeAtomValidationState`, `statedHydrogens`), and `cdxml.atom_hydrogen_count_kept` names each
+  such atom and both counts. A count that agrees is not stored. The kept count is the one the atom
+  has everywhere, exactly as if the atom had been made under-filled by hand (a typed literal "O"):
+  the drawn label ("O", not "OH"), the formula, the mass and SMILES count the stated hydrogens, and
+  RDKit receives them through the typed label's own route, the molfile's explicit valence (chem-core's
+  `atomStatedHydrogenCount`). The badge says how the stated count differs from the derived one, and
+  the atom-problem fix is "Use the derived hydrogen count", which drops the stated one. A carbon
+  bonded only datively is such an atom too: its label draws no H, but its formula counts the derived
+  ones (a dative bond costs its donor nothing), so a count that differs is kept, flagged and drawn as
+  a typed "C" … "CH4" would be;
+- on a hydrogen atom (H, D or T) stating 0, always: that is what a typed H, D or T label means, and
+  the atom is drawn, counted and written as that typed label is. Every hydrogen atom derives zero
+  hydrogens (bonded, its one bond is spent; lone, bond-less and neutral, it is one atom with one
+  radical electron, H•, owner decision 2026-11-23), so a stated 0 never draws a count mismatch
+  warning; a lone H stating 0 is still flagged, as a typed literal H is, since it shows no radical.
+  Any nonzero count on a hydrogen atom, lone or bonded, is not kept, since no typed label draws a
+  hydrogen atom carrying hydrogens of its own: `cdxml.atom_hydrogen_count_not_kept` names each such
+  atom and its count. A lone H stating 1 is therefore not H2: its count is dropped and it opens as
+  H• (formula H, SMILES `[H]`);
+- on an atom whose label is not an element, always, for the file's sake; nothing counts hydrogens on it.
+  On the unknown atom `*` (an `Element` naming nothing, an unlabeled nickname node, a `*` generic
+  label) a count other than 0 is therefore also reported: its label draws none, the formula counts
+  none, the molfile writes the dummy atom `*` with no valence field and RDKit gives a dummy atom no
+  hydrogens, so its SMILES is `*` whatever the file states. The same holds for any other label naming
+  no element (no element symbol starts it): the generic labels `A`, `Q`, `M`, `X` and R-groups such
+  as `R1`. And it holds for an abbreviation (`OMe`, `Ph`, `Bu`, `CF3`, `TMS`), whose hydrogens come
+  from what it stands for: its label, formula and SMILES read the expansion, never the stated count.
+  `cdxml.atom_hydrogen_count_not_counted` names each such atom with its label ("kept as
+  stored but not counted"), the atom is badged, and the count still round-trips. A stated 0 is what
+  such an atom counts anyway and is not reported. This is chem-core's
+  `atomIgnoresStatedHydrogenCount`, read from the same decision as `atomStatedHydrogenCount` (stored,
+  but not counted), so no label list decides it: "naming no element" is read from chem-core's element
+  table, and "an abbreviation" from template-library's abbreviation table, which chem-core reads
+  itself (`isTableAbbreviationLabel`, the table the label grammar reads). The badge, the native open
+  report (`document.atom_hydrogen_count_not_counted`) and the plugin-host refusal share it. A label that names an element and spells its hydrogens (`NH2`,
+  `CH3`, `NHMe`) states its own count and is not reported.
+
+A value that is not a non-negative integer is not imported and is reported as
+`cdxml.atom_hydrogen_count_invalid`. Every kept count is written back as `NumHydrogens` on CDXML and
+CDX export, with or without the embedded native document, so a reopened atom keeps it. The count
+lasts until a chemical edit of that atom (element, charge, a bond added or removed at it, a bond
+order or dative change at it); moves, rotations, alignment and edits of other atoms keep it.
+
 ### Merging source atom snapshots
 
 Visible CDXML and CDX export starts from the imported atom node. An unchanged snapshot keeps its

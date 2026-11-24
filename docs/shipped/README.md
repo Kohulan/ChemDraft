@@ -501,7 +501,11 @@ Owner rules, as shipped:
 The molfile writer now requires the resolved orders, writes resolved bonds as 1/2, keeps anything
 unresolved as type 4, and always returns its warnings. `hydrogenCount` is an import-time hint: any
 edit to the atom's bonds, charge or element drops it, and it survives only on atoms that still have
-an aromatic ring bond. The badge's reason shows in the status bar on hover.
+an aromatic ring bond. The badge's reason shows in the status bar on hover. (Changed in 1.2.3 by
+owner ruling: a CDXML `NumHydrogens` on an ordinary atom that disagrees with the derived count is
+kept as written and badged, and survives moves and edits of other atoms; only an atom whose
+aromatic bonds no longer sit in a ring loses its count without a chemical edit. See
+`packages/cdx-compat/README.md`, "Stated hydrogen counts".)
 
 Compatibility: a document carrying `hydrogenCount` does not open in older builds (strict atom
 schema), the same as `labelLiteral`. Reviewed across five rounds by Fable and Astra.

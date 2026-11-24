@@ -4,6 +4,7 @@ import {
   boundedRequestJson, PluginRequestLimits as limits, type PluginRequestJson, type RequestCollectionBounds
 } from "./requestPayload";
 import { PluginToolDefinitionSchema, PluginToolInputValueSchema, PluginToolNameSchema, toolDefinitionBounds } from "./toolSessionSchemas";
+import { PluginRefusalLimits, pluginRefusalFields, type PluginRefusalFields } from "./refusal";
 
 const maxIdLength = 256;
 const id = z.string().min(1).max(maxIdLength);
@@ -25,14 +26,23 @@ const request = <S extends z.ZodTypeAny>(schema: S, bounds?: RequestCollectionBo
 export const PluginRequestErrorSchema = z.object({
   code: z.enum(["unsupported", "invalid", "permission", "missingHandler", "failed",
     "stale", "scope", "chemistry", "cancelled", "limit", "interrupted", "busy", "unavailable"]),
-  message: z.string().min(1).max(1_000)
+  message: z.string().min(1).max(1_000),
+  /** API 0.1.27: stable snake_case reason for a refusal, e.g. `hydrogen_count_unrepresentable`. */
+  reason: z.string().regex(PluginRefusalLimits.reasonPattern).optional(),
+  /** API 0.1.27: what the refusal is about, e.g. `{ moleculeId, atomId, element, hydrogenCount }`. */
+  details: z.record(z.string().min(1).max(PluginRefusalLimits.detailKeyLength),
+    z.union([z.string().max(PluginRefusalLimits.detailStringLength), finite, z.boolean()]))
+    .refine(details => Object.keys(details).length <= PluginRefusalLimits.detailKeys,
+      `At most ${PluginRefusalLimits.detailKeys} refusal details.`).optional()
 }).strict();
 export type PluginRequestError = z.infer<typeof PluginRequestErrorSchema>;
 export type PluginRequestFailure = { ok: false; error: PluginRequestError };
 export type PluginRequestResult<T> = { ok: true; value: T } | PluginRequestFailure;
 
-export function pluginRequestFailure(code: PluginRequestError["code"], message: string): PluginRequestFailure {
-  return { ok: false, error: { code, message } };
+/** `refusal` (API 0.1.27) adds the optional machine-readable reason and details; invalid ones are dropped. */
+export function pluginRequestFailure(code: PluginRequestError["code"], message: string,
+  refusal?: PluginRefusalFields): PluginRequestFailure {
+  return { ok: false, error: { code, message, ...(refusal ? pluginRefusalFields(refusal) : {}) } };
 }
 
 export function pluginRequestResultSchema<S extends z.ZodTypeAny>(value: S, bounds?: RequestCollectionBounds, omitUndefined = false) {

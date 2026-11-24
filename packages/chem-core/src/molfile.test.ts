@@ -457,6 +457,51 @@ describe("molfile element symbols", () => {
     expect(warnings).toEqual([]);
   });
 
+  // A lone hydrogen atom is one hydrogen atom, a radical (owner decision 2026-11-23): H•, D•, T•.
+  // The structure engine decides its hydrogens from this line (AGENTS.md §8), and with no valence
+  // field RDKit would read a lone H as H2, so a lone, neutral H, D or T with no stated count writes
+  // the zero-valence sentinel (15), as a stated 0 or a typed label does: RDKit reads the bare atom
+  // with one radical electron. A charged one (H+, H-), a bonded one (dative bonds included) and one
+  // already carrying a radical mark keep no valence field.
+  it.each(["H", "D", "T"])("writes a lone neutral %s with the zero-valence sentinel, and a charged, bonded or radical one without", (element) => {
+    const vvv = (atom: Partial<MoleculeAtom>, neighbor?: { style?: "dashed" }) => {
+      const graph = molecule([{ id: "a", element, x: 0, y: 0 }, ...(neighbor ? [{ id: "m", element: "Fe", x: 1, y: 0 }] : [])],
+        neighbor ? [{ id: "b", from: "a", to: "m", ...(neighbor.style ? { style: neighbor.style } : {}) }] : []);
+      graph.atoms[0] = { ...graph.atoms[0]!, ...atom };
+      return atomLines(moleculeToMolfileV2000(graph, { kekuleBondOrders: new Map() }).contents)[0].slice(48, 51);
+    };
+    expect(vvv({})).toBe(" 15");
+    expect(vvv({ hydrogenCount: 0 })).toBe(" 15");
+    expect(vvv({ labelLiteral: true })).toBe(" 15");
+    expect(vvv({ formalCharge: 1 })).toBe("  0");
+    expect(vvv({ formalCharge: -1 })).toBe("  0");
+    expect(vvv({ markRadicals: 1 })).toBe("  0");
+    expect(vvv({}, {})).toBe("  0");
+    expect(vvv({}, { style: "dashed" })).toBe("  0");
+  });
+
+  it("RDKit reads a lone neutral H, D or T as the bare atom with one radical electron, in either format", async () => {
+    installRealRdkitModuleLoader();
+    try {
+      const rdkit = await ensureRdkit();
+      for (const [element, smiles] of [["H", "[H]"], ["D", "[2H]"], ["T", "[3H]"]] as const) {
+        for (const write of [moleculeToMolfileV2000, moleculeToMolfileV3000]) {
+          const parsed = rdkit.get_mol(write(molecule([{ id: "a", element, x: 0, y: 0 }], []), { kekuleBondOrders: new Map() }).contents)!;
+          try {
+            const json = JSON.parse(parsed.get_json!()) as { defaults: { atom: Record<string, number> }; molecules: { atoms: Record<string, number>[] }[] };
+            const atom = { ...json.defaults.atom, ...json.molecules[0]!.atoms[0]! };
+            expect({ smiles: parsed.get_smiles?.(), implicitHydrogens: atom.impHs, radicals: atom.nRad }, `${element} ${write.name}`)
+              .toEqual({ smiles, implicitHydrogens: 0, radicals: 1 });
+          } finally {
+            parsed.delete();
+          }
+        }
+      }
+    } finally {
+      resetRdkitForTesting();
+    }
+  });
+
   it("recognizes metal families without treating metalloids or other non-metals as metals", () => {
     for (const symbol of ["Li", "Cs", "Be", "Ra", "Sc", "Zn", "Cn", "La", "Lu", "Ac", "Lr", "Al", "Ga", "In", "Sn", "Tl", "Pb", "Bi", "Po"]) {
       expect(isMetalSymbol(symbol), symbol).toBe(true);
@@ -1024,5 +1069,117 @@ describe("placeholder atoms", () => {
     expect(rgroup).toContain("M  V30 1 R# 0 0 0 0 RGROUPS=(1 1)");
     // Without the map, "Ar" is the element.
     expect(moleculeToMolfileV2000(aryl, { kekuleBondOrders: new Map() }).contents.split("\n")[4]!.slice(31, 34)).toBe("Ar ");
+  });
+});
+
+// Owner ruling (1.2.3): a stated hydrogen count kept on an atom (a CDXML NumHydrogens that
+// disagrees with the derived count) shows everywhere, exactly like a hand-drawn under-filled atom.
+// A typed literal label reaches every reader through the explicit valence (bond-order sum plus the
+// hydrogens it spells); a stated count takes that same field, so the two are the same molfile.
+describe("a stated hydrogen count rides the literal label's explicit valence", () => {
+  const ethanol = (oxygen: Partial<MoleculeAtom>, bondOrder: MoleculeBond["order"] = "single"): MoleculeObject => {
+    const graph = molecule(
+      [{ id: "c1", element: "C", x: 0, y: 0 }, { id: "c2", element: "C", x: 1.5, y: 0 }, { id: "o", element: "O", x: 3, y: 0 }],
+      [{ id: "b1", from: "c1", to: "c2" }, { id: "b2", from: "c2", to: "o", order: bondOrder }]
+    );
+    graph.atoms[2] = { ...graph.atoms[2]!, ...oxygen };
+    return graph;
+  };
+  const writers = [moleculeToMolfileV2000, moleculeToMolfileV3000] as const;
+  // V2000 valence (vvv, columns 49-51) of every atom line, and every V3000 atom's VAL= or "".
+  const valences = (write: typeof writers[number], graph: MoleculeObject, options: Parameters<typeof moleculeToMolfileV2000>[1] = { kekuleBondOrders: new Map() }) => {
+    const lines = write(graph, options).contents.split("\n");
+    if (write === moleculeToMolfileV2000) {
+      const counts = lines.findIndex((line) => line.includes("V2000"));
+      return lines.slice(counts + 1, counts + 1 + graph.atoms.length).map((line) => line.slice(48, 51).trim());
+    }
+    const begin = lines.indexOf("M  V30 BEGIN ATOM");
+    return lines.slice(begin + 1, begin + 1 + graph.atoms.length).map((line) => /VAL=(-?\d+)/.exec(line)?.[1] ?? "0");
+  };
+
+  it.each(writers)("%s writes an O stated with 0 H exactly as a typed literal O", (write) => {
+    const stated = write(ethanol({ hydrogenCount: 0 }), { kekuleBondOrders: new Map() });
+    const typed = write(ethanol({ labelLiteral: true }), { kekuleBondOrders: new Map() });
+    expect(stated.contents).toBe(typed.contents);
+    expect(stated.warnings).toEqual(typed.warnings);
+    expect(valences(write, ethanol({ hydrogenCount: 0 }))).toEqual(["0", "0", "1"]);
+  });
+
+  it.each(writers)("%s writes a stated count above zero exactly as the spelled label that names it", (write) => {
+    // N stated with 1 H on one bond (derived 2) is the typed "NH": valence 2 in both.
+    const spellLabel = (label: string) => label === "NH" ? { element: "N", hydrogens: 1 } : undefined;
+    const stated = write(ethanol({ element: "N", hydrogenCount: 1 }), { kekuleBondOrders: new Map(), spellLabel });
+    const typed = write(ethanol({ element: "NH", labelLiteral: true }), { kekuleBondOrders: new Map(), spellLabel });
+    expect(stated.contents).toBe(typed.contents);
+    expect(valences(write, ethanol({ element: "N", hydrogenCount: 1 }), { kekuleBondOrders: new Map(), spellLabel })).toEqual(["0", "0", "2"]);
+  });
+
+  it.each(writers)("%s leaves an atom with no stated count, and an aromatic atom's count, to the reader as before", (write) => {
+    expect(valences(write, ethanol({}))).toEqual(["0", "0", "0"]);
+    // A ring atom's count settles its ring's Kekulé pattern, which the bond orders carry.
+    const pyrrole = { ...molecule([], []), ...testMoleculeFromSmiles("c1cc[nH]c1") };
+    const kekuleBondOrders = nativeBondOrderResolution(pyrrole.atoms, pyrrole.bonds).kekuleOrders;
+    expect(pyrrole.atoms.some((atom) => atom.hydrogenCount !== undefined)).toBe(true);
+    expect(valences(write, pyrrole, { kekuleBondOrders })).toEqual(Array(5).fill("0"));
+  });
+
+  it.each(writers)("%s writes a dative-only carbon's count and an H, D or T atom's stated 0 as the typed labels", (write) => {
+    // A C bonded to Fe only by a dative bond, a lone H and a lone D, each stating 0, against the same
+    // atoms typed as literal "C", "H" and "D"; then the C stating 3 against a typed "CH3".
+    const graph = (atom: (id: string) => Partial<MoleculeAtom>) => {
+      const built = molecule(
+        [{ id: "c", element: "C", x: 0, y: 0 }, { id: "fe", element: "Fe", x: 1.5, y: 0 },
+          { id: "h", element: "H", x: 3, y: 0 }, { id: "d", element: "D", x: 4.5, y: 0 }],
+        [{ id: "dc", from: "c", to: "fe", style: "dashed" }]
+      );
+      built.atoms = built.atoms.map((candidate) => candidate.id === "fe" ? candidate : { ...candidate, ...atom(candidate.id) });
+      return built;
+    };
+    const stated = write(graph(() => ({ hydrogenCount: 0 })), { kekuleBondOrders: new Map() });
+    const typed = write(graph(() => ({ labelLiteral: true })), { kekuleBondOrders: new Map() });
+    expect(stated.contents).toBe(typed.contents);
+    expect(stated.warnings).toEqual(typed.warnings);
+    // V2000 writes the dative bond as single, so the C's valence counts it; V3000 gives its donor none.
+    // A valence of 0 is the field's zero sentinel (V2000 15, V3000 -1), as for the typed labels.
+    expect(valences(write, graph(() => ({ hydrogenCount: 0 }))))
+      .toEqual(write === moleculeToMolfileV2000 ? ["1", "0", "15", "15"] : ["-1", "0", "-1", "-1"]);
+    const spellLabel = (label: string) => label === "CH3" ? { element: "C", hydrogens: 3 } : undefined;
+    const methyl = write(graph((id) => id === "c" ? { hydrogenCount: 3 } : {}), { kekuleBondOrders: new Map(), spellLabel });
+    const typedMethyl = write(graph((id) => id === "c" ? { element: "CH3", labelLiteral: true } : {}), { kekuleBondOrders: new Map(), spellLabel });
+    expect(methyl.contents).toBe(typedMethyl.contents);
+    // A count a hydrogen atom cannot carry is not counted: the lone H reads as an unstated one, one
+    // atom with one radical electron (owner decision 2026-11-23), and takes the zero-valence sentinel
+    // as the unstated lone D does, so RDKit adds neither a hydrogen.
+    expect(valences(write, graph((id) => id === "h" ? { hydrogenCount: 1 } : {})))
+      .toEqual(write === moleculeToMolfileV2000 ? ["0", "0", "15", "15"] : ["0", "0", "-1", "-1"]);
+  });
+
+  it.each(writers)("%s warns, never drops the count silently, when an unknown-order bond leaves no valence to carry it", (write) => {
+    const warnings: string[] = [];
+    const contents = write(ethanol({ hydrogenCount: 0 }, "unknown"), { kekuleBondOrders: new Map(), warnings }).contents;
+    expect(contents).not.toContain("VAL=");
+    expect(warnings).toContain(
+      "Atom o (O) states 0 hydrogens, which cannot be carried by an explicit valence because it has an unknown-order bond; written without a valence field, so a reader may add hydrogens."
+    );
+  });
+
+  it("RDKit reads the stated O exactly as the typed one: no H on the O", async () => {
+    installRealRdkitModuleLoader();
+    try {
+      const rdkit = await ensureRdkit();
+      for (const write of writers) {
+        const smiles = [ethanol({ hydrogenCount: 0 }), ethanol({ labelLiteral: true }), ethanol({})].map((graph) => {
+          const parsed = rdkit.get_mol(write(graph, { kekuleBondOrders: new Map() }).contents);
+          try {
+            return parsed!.get_smiles!();
+          } finally {
+            parsed?.delete();
+          }
+        });
+        expect(smiles).toEqual(["CC[O]", "CC[O]", "CCO"]);
+      }
+    } finally {
+      resetRdkitForTesting();
+    }
   });
 });

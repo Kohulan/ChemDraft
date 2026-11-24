@@ -8,6 +8,11 @@ API 0.1.26 defines request-bound document access, tool sessions, chemistry and d
 and active-document notifications. See the [authoring guide](../../docs/plugin-architecture/AUTHORING.md#request-bound-plugin-tools)
 for the contracts, permissions, and transport limits.
 
+API 0.1.27 adds optional machine-readable refusal fields, `reason` and `details`, on
+`PluginWorkerErrorPayload`, `PluginWorkerCapabilityError` and `PluginRequestError`, with
+`pluginRefusalFields`, `PluginRefusalLimits` and `supportsPluginRefusalFields`. The first reason is
+`hydrogen_count_unrepresentable`; see [Refusal reasons and details](../../docs/plugin-architecture/AUTHORING.md#refusal-reasons-and-details).
+
 API 0.1.23 adds bondStyle 'wavy' (single-bond either stereo), exposed through the public
 `MoleculeBond` / `MoleculeBondDisplay` types. Set `display.bondStyle: "wavy"` only on a single bond;
 its `fromAtomId` is the explicitly unknown stereocentre. Preserve its direction when copying.

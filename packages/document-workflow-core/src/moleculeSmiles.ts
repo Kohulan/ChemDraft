@@ -2,9 +2,10 @@
 // native graph writer otherwise, with every approximation reported as an export warning.
 // Callers own engine loading; this shared writer also serves headless exports.
 
-import { isDativeBond, moleculeToMolfileV2000, moleculeBracketWarningMessages, rGroupNumberFromLabel, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
+import { atomImpliedRadicalCount, atomStatedHydrogenCount, isDativeBond, moleculeToMolfileV2000, moleculeBracketWarningMessages, rGroupNumberFromLabel, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
 import type { ExportWarning } from "@chemdraft/export-engine";
 import {
+  atomDrawnHydrogenCount,
   nativeAtomChargeIsExpressible,
   nativeAtomValence,
   nativeAtomValenceForCharge,
@@ -24,8 +25,14 @@ export type ComputeStructureIdentifiers = typeof import("@chemdraft/rdkit-adapte
 export function nativeSmilesRadicalWarnings(molecule: MoleculeObject, evidence?: ExportProblemEvidence): ExportWarning[] {
   const { molecule: expanded } = expandNativeMoleculeLabelGroups(molecule);
   const resolution = nativeBondOrderResolution(expanded.atoms, expanded.bonds);
+  // The writer carries a stated count through an aromatic ring's Kekulé resolution, and writes a
+  // count an atom states for itself elsewhere (`atomStatedHydrogenCount`) as a bracket atom with
+  // exactly that many H, as it writes a typed label. Any other stated count it does not write.
+  const aromaticAtomIds = new Set(expanded.bonds.flatMap((bond) =>
+    bond.order === "aromatic" ? [bond.fromAtomId, bond.toAtomId] : []));
   return expanded.atoms.flatMap((atom): ExportWarning[] => {
-    const radicals = atom.markRadicals ?? 0;
+    // A lone hydrogen atom's implied radical (`atomImpliedRadicalCount`) is drawn, as a mark's is.
+    const radicals = (atom.markRadicals ?? 0) + atomImpliedRadicalCount(atom, resolution.bondsByAtom.get(atom.id) ?? []);
     const used = resolution.bondOrderUsage.get(atom.id) ?? 0;
     const directElement = nativeElementFromAtomLabel(atom.element);
     const spelled = directElement ? undefined : nativeSingleHeavyElementLabelValence(atom.element);
@@ -35,8 +42,12 @@ export function nativeSmilesRadicalWarnings(molecule: MoleculeObject, evidence?:
     if (element && nativeAtomValence[element] !== undefined &&
         nativeAtomChargeIsExpressible(element, atom.formalCharge)) {
       const valence = nativeAtomValenceForCharge(element, atom.formalCharge);
-      const hydrogens = element === "H" ? 0 : atom.labelLiteral ? (spelled?.hydrogens ?? 0) :
-        atom.hydrogenCount ?? spelled?.hydrogens ?? Math.max(0, valence - used - radicals);
+      const stated = aromaticAtomIds.has(atom.id) ? atom.hydrogenCount : atomStatedHydrogenCount(atom, expanded.bonds);
+      // An H, D or T atom has the hydrogens its label draws (`atomDrawnHydrogenCount`): none, as the
+      // writer spells it ([H], [2H]); a lone one is a radical, a bonded one (dative included) spent.
+      const hydrogens = atom.labelLiteral ? (spelled?.hydrogens ?? 0) :
+        element === "H" ? atomDrawnHydrogenCount(atom, expanded.bonds, expanded.atoms, resolution) ?? 0 :
+        stated ?? spelled?.hydrogens ?? Math.max(0, valence - used - radicals);
       implied = Math.max(0, valence - used - hydrogens);
     } else if (element && nativeAtomValence[element] === undefined) {
       // The drawing's covalent valence table says nothing about the parser's metal valence.
@@ -45,13 +56,9 @@ export function nativeSmilesRadicalWarnings(molecule: MoleculeObject, evidence?:
     if (implied === radicals) return [];
     if (implied !== undefined) evidence?.inferredRadicals?.set(atom.id, implied);
     const drawn = `Atom ${atom.id} (${atom.element}) is drawn with ${radicals} radical electron${radicals === 1 ? "" : "s"}`;
-    const addedIsotopeHydrogen = isotopeHydrogen && used === 0 && radicals === 0 &&
-      atom.formalCharge === 0 && !atom.labelLiteral;
     return [{
       code: "export.smiles_radical_loss",
-      message: addedIsotopeHydrogen
-        ? `${drawn}; SMILES cannot preserve its hydrogen count: the engine adds 1 hydrogen; the native writer instead implies 1 radical electron.`
-        : implied === undefined
+      message: implied === undefined
           ? `${drawn}; SMILES' implied radical count cannot be reliably determined without the structure engine for this element and charge.`
           : `${drawn}; SMILES would imply ${implied} radical electron${implied === 1 ? "" : "s"} with its hydrogen count and formal charge.`,
       severity: "warning",
@@ -216,6 +223,9 @@ async function writeMoleculeSmiles(
   // label written as a dummy atom — a placeholder ("R"), unrecognized text ("Ome"), a flagged group,
   // a bonded "Ar". Otherwise it may say something else entirely (a stored "CO" for a C–R drawing,
   // "[Ar]O" for aryl alcohol) while the warnings above promise [*]; write the current graph instead.
+  // Nor is it trusted for a lone hydrogen atom's implied radical (`atomImpliedRadicalCount`):
+  // documents saved before that reading store RDKit's old "[HH]", which says H2 where the canvas
+  // draws H•. The current graph spells the drawn radical ([H]), so it is written instead.
   if (
     engineUnavailable && !requireEngineAtomStates &&
     invalidWarnings.length === 0 &&
@@ -223,7 +233,8 @@ async function writeMoleculeSmiles(
     expanded.placeholderAtoms.size === 0 &&
     nativeMoleculeUnspellableLabels(molecule).length === 0 &&
     !molecule.atoms.some((atom) => (atom.markRadicals ?? 0) > 0 ||
-      atom.isotope !== undefined || atom.element === "D" || atom.element === "T") &&
+      atom.isotope !== undefined || atom.element === "D" || atom.element === "T" ||
+      atomImpliedRadicalCount(atom, molecule.bonds) > 0) &&
     !molecule.bonds.some((bond) => bond.stereo === "either" || bond.display?.bondStyle === "wavy") &&
     molecule.structureFormat === "smiles" &&
     molecule.structure
@@ -289,13 +300,17 @@ export function engineSmilesAtomWarnings(
     const element = isotopeHydrogen ? "H" : direct ?? spelled?.element;
     // Unspellable labels already have an explicit placeholder warning; still check their marks.
     const expectedElement = placeholderAtoms.has(atom.id) || !element ? "*" : element;
-    const radicals = atom.markRadicals ?? 0;
+    // A lone hydrogen atom's implied radical (`atomImpliedRadicalCount`) is drawn, as a mark's is.
+    const radicals = (atom.markRadicals ?? 0) + atomImpliedRadicalCount(atom, resolution.bondsByAtom.get(atom.id) ?? []);
     const isotope = atom.element === "D" ? 2 : atom.element === "T" ? 3 : atom.isotope ?? 0;
     const bondedHydrogens = (resolution.bondsByAtom.get(atom.id) ?? []).filter((bond) => {
       const neighbor = atomsById.get(bond.fromAtomId === atom.id ? bond.toAtomId : bond.fromAtomId);
       return neighbor && ["H", "D", "T"].includes(neighbor.element);
     }).length;
-    const hydrogens = bondedHydrogens + (isotopeHydrogen || element === "H" ? 0 :
+    // An H, D or T atom has the hydrogens its label draws (`atomDrawnHydrogenCount`): none, stated or
+    // not, as RDKit reads it from the molfile ([H], [2H]: a lone one is a radical, a bonded one spent).
+    const hydrogens = bondedHydrogens + (element === "H" ? (atom.labelLiteral ? 0 :
+      atomDrawnHydrogenCount(atom, expanded.bonds, expanded.atoms, resolution) ?? 0) :
       atom.labelLiteral ? spelled?.hydrogens ?? 0 :
       atom.hydrogenCount ?? spelled?.hydrogens ?? (direct
         ? nativeImplicitHydrogenCount(direct, resolution.bondOrderUsage.get(atom.id) ?? 0, atom.formalCharge, radicals)

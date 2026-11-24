@@ -6,7 +6,8 @@ import { sameDocumentValue } from "./documentValue";
 import type { ApplyPatchOptions, DocumentObject, DocumentPatch, DocumentPage, OrphanedRepeatUnit } from "@chemdraft/chem-core";
 import { bareIdTargetPage, duplicateIdRefusalMessage, objectInWriteScope, pinnedObjectMissingMessage, pinSelectionPages, resolveObjectOnPage,
   scopedObjectRefs, type PageObjectRef, type PluginWriteScopePages } from "./pageObjects";
-import { applyPatch, planOrphanedRepeatUnitCleanup, pruneReactionObjectReferences, removeOrphanedRepeatUnitBrackets, sameBracketIdentity } from "@chemdraft/chem-core";
+import { applyPatch, atomWithIgnoredHydrogenCount, ignoredHydrogenCountAtomKind, planOrphanedRepeatUnitCleanup, pruneReactionObjectReferences, removeOrphanedRepeatUnitBrackets,
+  sameBracketIdentity } from "@chemdraft/chem-core";
 import {
   commitRequestPatch, containsBounds, pageContainsBounds, RequestWriteError, type BoundRequestWrite, type RequestDocument, type RequestHistory,
   type RequestWriteCommit, type RequestObjectRef, type RequestViewport, type RequestPageSpaceProvider
@@ -33,7 +34,8 @@ import {
   requestValidationCode, supportsPluginRequestTools, type PluginActiveDocumentChangedHandler,
   PluginBoundWritePayloadSchema, PluginRequestLimits, PluginRequestPatchSchema, type PluginRequestPatch,
   type PluginRequestPrecondition, type PluginRequestArguments,
-  type PluginRequestNamespace, type PluginToolCall, type PluginToolCallResult, type PluginToolHandler
+  type PluginRequestNamespace, type PluginToolCall, type PluginToolCallResult, type PluginToolHandler,
+  type PluginRefusalDetails, type PluginRefusalFields, supportsPluginRefusalFields
 } from "@chemdraft/plugin-api";
 import type { ChemDraftDocument } from "@chemdraft/plugin-api";
 
@@ -208,7 +210,54 @@ export function assertPluginPatchWriteScope(
     throw new PluginHostError(`Patch would change object "${object.id}", which is not selected`);
   }
   assertPluginPageWriteScope(document, validated, scope, scopePages);
+  assertRepresentableHydrogenCounts(document, validated);
   return validated;
+}
+
+/** The refusal reason (API 0.1.27 `PluginRefusalFields.reason`) for a write that would store a
+ * hydrogen count other than 0 on an H, D or T atom, on a label naming no element (the unknown atom
+ * "*" or a generic label such as A, Q, M, X or R1), or on an abbreviation such as OMe or Ph
+ * (`details.element` gives the label). */
+export const HydrogenCountUnrepresentableReason = "hydrogen_count_unrepresentable";
+
+/**
+ * Refuse a plugin or assistant write that would store a hydrogen count other than 0 on an H, D or T
+ * atom, on a label naming no element (the unknown atom "*", a generic label such as A or R1), or on
+ * an abbreviation such as OMe or Ph (its hydrogens come from what it stands for; chem-core reads the
+ * abbreviation table itself, so the published SDK refuses it too): no label, formula or export reads it (chem-core
+ * `atomIgnoresStatedHydrogenCount`), so storing it would silently lose what the writer said
+ * (AGENTS.md §7). This is the only place such a count is
+ * refused. chem-core's patches keep it, because they also replay opening, restoring, pasting,
+ * duplicating and undoing a user's own document, which must never be refused; the atom validator
+ * flags it there instead. A count the molecule already held unchanged is let be, so an edit
+ * elsewhere in an older document's molecule is not blocked.
+ */
+function assertRepresentableHydrogenCounts(before: ChemDraftDocument, after: ChemDraftDocument): void {
+  for (const page of after.pages) {
+    const previousPage = before.pages.find(candidate => candidate.id === page.id);
+    for (const object of page.objects) {
+      if (object.type !== "molecule") continue;
+      const previous = previousPage?.objects.find(candidate => candidate.id === object.id);
+      if (previous === object) continue;
+      const atom = atomWithIgnoredHydrogenCount(object.atoms, previous?.type === "molecule" ? previous.atoms : undefined);
+      if (!atom) continue;
+      const kind = ignoredHydrogenCountAtomKind(atom);
+      const allowed = kind === "an unknown atom" ? "an unknown atom (*), as a typed * label means"
+        : kind === "a hydrogen atom" ? "an H, D or T atom, as a typed H, D or T label means"
+        : kind === "an abbreviation" ? `an abbreviation (${atom.element})`
+        : `a label naming no element (${atom.element}), as a typed ${atom.element} label means`;
+      const why = kind === "an abbreviation"
+        ? "which nothing would count: an abbreviation's hydrogens come from what it stands for"
+        : `which ${kind} cannot carry`;
+      throw new PluginHostError(
+        `Plugin write refused: atom "${atom.id}" of molecule "${object.id}" is ${atom.element} with hydrogenCount ` +
+        `${atom.hydrogenCount}, ${why}. Only 0 is allowed on ${allowed}; ` +
+        "omit hydrogenCount or set it to 0. Nothing was changed.",
+        { reason: HydrogenCountUnrepresentableReason,
+          details: { moleculeId: object.id, atomId: atom.id, element: atom.element, hydrogenCount: atom.hydrogenCount! } }
+      );
+    }
+  }
 }
 
 export interface ScopedRepeatUnitCleanup {
@@ -506,9 +555,16 @@ export class PluginPermissionError extends Error {
 }
 
 export class PluginHostError extends Error {
-  constructor(message: string) {
+  /** API 0.1.27: a stable reason the plugin receives beside the message, when the refusal has one. */
+  declare readonly reason?: string;
+  /** API 0.1.27: what the refusal is about, forwarded with `reason`. */
+  declare readonly details?: PluginRefusalDetails;
+
+  constructor(message: string, refusal?: PluginRefusalFields) {
     super(message);
     this.name = "PluginHostError";
+    if (refusal?.reason !== undefined) this.reason = refusal.reason;
+    if (refusal?.details !== undefined) this.details = refusal.details;
   }
 }
 
@@ -1518,8 +1574,12 @@ export class PluginHost {
           };
           return await (isRequestDepictionMethod(label) ? this.runRequestToolCapability(pluginId, run) : withCapabilitySlot(run));
         } catch (error) {
+          // Refusal fields only for a plugin whose SDK's strict request error schema accepts them;
+          // an older one would reject the whole failure and lose its message.
+          const refusal = error instanceof RequestWriteError && error.refusal &&
+            supportsPluginRefusalFields(this.plugins.get(pluginId)?.manifest.apiVersion ?? "") ? error.refusal : undefined;
           return pluginRequestFailure(error instanceof RequestWriteError ? error.code : "failed",
-            ((error as Error).message || "The request failed.").slice(0, 1_000));
+            ((error as Error).message || "The request failed.").slice(0, 1_000), refusal);
         }
       });
     const assistantCall = <K extends keyof PluginAssistantAPI>(method: K, args: Parameters<PluginAssistantAPI[K]>): ReturnType<PluginAssistantAPI[K]> => {

@@ -16,7 +16,7 @@ import { documentDrawingDefaults } from "@chemdraft/document-workflow-core";
 import { nativeStylePresetPatchForSelection } from "./nativeStylePresetCommand";
 import { AtomProblemMarker } from "./AtomProblemMarker";
 import { atomProblemCommandId, atomProblemCommands, atomProblemSnapshot, type AtomProblemTarget } from "./atomProblemCommands";
-import { atomProblem, nativeImplicitHydrogenCount, type AtomProblemAction } from "@chemdraft/document-workflow-core";
+import { atomProblem, type AtomProblemAction } from "@chemdraft/document-workflow-core";
 import { applyNativeAtomProblemFix } from "./documentWorkflow";
 import { dropElectronMark, dropElectronMarksInSelection, electronMarkDropTarget, electronMarkName,
   resolveElectronMarksAfterMoleculePartMove, resolveElectronMarksInSelectionTransform } from "./electronMarkDrop";
@@ -232,7 +232,7 @@ import {
 } from "./documentSession";
 import { createPersistentPluginStorage } from "./plugins/pluginStorage";
 import {
-  applyAcceptedPluginProposal,
+  previewAcceptedPluginProposal,
   applyPluginDocumentPatch,
   refreshPluginPatchChemistry,
   placeInsertedObjectsInFreeSpace,
@@ -241,7 +241,7 @@ import {
   type PluginWriteGate
 } from "./plugins/applyPluginDocumentPatch";
 import { AnalyzerNoticeBanner, type AnalyzerNotice } from "./plugins/AnalyzerNotice";
-import { PatchReviewTray, PendingProposalsBadge, proposalReviewItem } from "./plugins/PatchReviewTray";
+import { acceptedProposalMessage, PatchReviewTray, PendingProposalsBadge, ProposalReviewItemCache } from "./plugins/PatchReviewTray";
 import type { DesktopPluginRuntime } from "./plugins/createPluginRuntime";
 import {
   ANALYSIS_WINDOW_OWNER_ID,
@@ -289,11 +289,11 @@ import {
   atomLabelHaloWidthPx,
   atomLabelLayout,
   atomLabelRunFontSize,
+  atomDrawnHydrogenCount,
   averageDefinedDepthWeights,
   bondRefKey,
   depthCuedLabelColor,
   depthCuedLabelScale,
-  dativeDeprotonationCount,
   nativeAtomLabelReading,
   nativeBondOrderResolution,
   nativeElementFromAtomLabel,
@@ -11242,7 +11242,10 @@ export function MainWindow({
               const history = createDocumentHistory(normalizeCommittedDocument(
                 admitParsedDocument(resolved.document), { preserveElectronMarks: true }
               ));
-              const reports = restoreSessionWarningReports(session);
+              const reports = restoreSessionWarningReports(session, {
+                displayName: session.displayName, sourceLabel: openSourceLabel(resolved.source, resolved.statusSourceLabel),
+                warnings: opened.warnings
+              });
               restored.push({ session, opened, resolved, history, reports, candidateIndex, id: crypto.randomUUID() });
             } catch {
               skipped.push(rawTab);
@@ -11281,17 +11284,14 @@ export function MainWindow({
             documentTabSnapshotsRef.current.clear();
             nonPristineTabsRef.current.clear();
           }
-          for (const { id, session, resolved, opened, history, reports } of restored) {
+          for (const { id, session, history, reports } of restored) {
             if (session.pristine !== true || session.path || session.dirty || !session.blank) nonPristineTabsRef.current.add(id);
             const savePathNotice = restoredSavePathNotice(session);
             documentTabSnapshotsRef.current.set(id, {
               history, file: restoredDocumentFileState(session),
               viewport: session.view?.viewport ?? createViewportState(),
               scrollLeft: session.view?.scrollLeft ?? 0, scrollTop: session.view?.scrollTop ?? 0, parts: [],
-              warnings: reports.warnings ?? (reports.saveWarnings ? undefined : {
-                displayName: session.displayName, sourceLabel: openSourceLabel(resolved.source, resolved.statusSourceLabel),
-                warnings: opened.warnings
-              }),
+              warnings: reports.warnings,
               saveWarnings: reports.saveWarnings,
               status: `${shellOpenFailure ? `${shellOpenFailure} — ` : ""}Restored last session — ${session.displayName}${session.dirty ? " (unsaved changes)" : ""}${restoreNotice}${savePathNotice ? `. ${savePathNotice}` : ""}`
             });
@@ -13988,9 +13988,8 @@ export function MainWindow({
         }
         const before = documentRef.current;
         const documentIdentity = documentIdentityRef.current;
-        let prepared = host.previewProposedPatch(proposal.id, before, {
-          apply: (document, proposed, options) => applyAcceptedPluginProposal(document, proposed, options).document
-        });
+        // The same application the review dry-runs for its warnings (`proposalReviewItem`).
+        let prepared = previewAcceptedPluginProposal(host, proposal.id, before);
         if (recognized) {
           const visible = assistantHistoryPort.getViewportRect?.(tab.id);
           const pageRect = pageRef.current?.getBoundingClientRect();
@@ -14015,8 +14014,10 @@ export function MainWindow({
           }
         }
         // Keep the proposal pending until the page question and stale-document check succeed.
+        let committed = prepared;
         const pending = commitWithPageFit(before, prepared, document => {
           const updated = host.acceptProposedPatch(proposal.id, documentRef.current, { apply: () => document });
+          committed = updated;
           commitDocumentChange(updated, `${pluginName}: ${recognized ? "Insert Recognized Structure" : "Apply Proposal"}`, false, undefined, PLUGIN_WRITE);
         }, { consent: new PageEnlargementConsent(shortcutPlatform), isCurrent });
         if (pending) {
@@ -14024,10 +14025,8 @@ export function MainWindow({
           try { await pending; } finally { pageFitPendingRef.current -= 1; }
         }
         setSelectedNativeMoleculePart(undefined);
-        const inserted = recognized ? `${pluginName}: inserted recognized structure` : `${pluginName}: applied proposal`;
-        const message = screenCapture
-          ? `${inserted}; its screen capture stays saved (Add or Remove Plugins › Show saved screen captures)`
-          : inserted;
+        const message = acceptedProposalMessage(pluginName, proposal,
+          { recognized, screenCapture: Boolean(screenCapture), before, committed });
         setStatus(message);
         return { ok: true, message };
       } catch (error) {
@@ -14090,21 +14089,35 @@ export function MainWindow({
     if (!tab) return `${owner.title} (closed)`;
     return documentTabs.length < 2 ? undefined : tab.title;
   }, [documentTabs, pluginRuntime.runtime]);
+  // The document a proposal would be accepted into (its own tab's), for the review's dry run.
+  const proposalSourceDocument = useCallback((proposal: QueuedProposedPatch): ChemDraftDocument | undefined => {
+    const owner = pluginRuntime.runtime.proposalDocumentTab(proposal.id);
+    if (!owner) return undefined;
+    return owner.id === activeDocumentTabIdRef.current
+      ? documentRef.current : documentTabSnapshotsRef.current.get(owner.id)?.history.present;
+  }, [pluginRuntime.runtime]);
+  const proposalReviewInputs = useCallback((proposal: QueuedProposedPatch) => ({
+    documentName: proposalDocumentName(proposal), sourceDocument: proposalSourceDocument(proposal)
+  }), [proposalDocumentName, proposalSourceDocument]);
+  // The window's review items, memoized per proposal on the document it would be accepted into, so an
+  // edit to that document re-runs only its proposals' dry runs (see the effect after the queue's).
+  const [proposalReviewCache] = useState(() => new ProposalReviewItemCache());
   const publishProposalReview = useCallback(
-    async (open: boolean, focus: boolean): Promise<boolean> => {
-      const pending = pluginRuntime.runtime.host.listProposedPatches("pending");
+    async (
+      open: boolean, focus: boolean,
+      pending: readonly QueuedProposedPatch[] = pluginRuntime.runtime.host.listProposedPatches("pending")
+    ): Promise<boolean> => {
       return publishAnalysisWindow(
         PATCH_REVIEW_WINDOW_ID,
         "Plugin Proposals",
         {
           kind: "patchReview",
-          proposals: await Promise.all(pending.map((proposal) =>
-            proposalReviewItem(pluginRuntime.runtime.host, proposal, proposalDocumentName(proposal))))
+          proposals: await proposalReviewCache.items(pluginRuntime.runtime.host, pending, proposalReviewInputs)
         },
         { open, focus, width: 420, height: 420 }
       );
     },
-    [pluginRuntime.runtime, proposalDocumentName, publishAnalysisWindow]
+    [pluginRuntime.runtime, proposalReviewCache, proposalReviewInputs, publishAnalysisWindow]
   );
   /** Open the review window, and only once the native open has succeeded mark it open: on a
    *  failure the badge must stay, or the pending proposals have no way back on desktop. */
@@ -14130,6 +14143,7 @@ export function MainWindow({
         pluginPanelIdentityKey(ANALYSIS_WINDOW_OWNER_ID, PATCH_REVIEW_WINDOW_ID)
       );
       void hidePluginPanelWindow(ANALYSIS_WINDOW_OWNER_ID, PATCH_REVIEW_WINDOW_ID).catch(() => undefined);
+      proposalReviewCache.clear();
       setProposalReview({ pending: 0, windowOpen: false });
       return;
     }
@@ -14141,7 +14155,19 @@ export function MainWindow({
     } else {
       void publishProposalReview(false, false);
     }
-  }, [patchQueueVersion, pluginRuntime.runtime, publishProposalReview, showProposalReview]);
+  }, [patchQueueVersion, pluginRuntime.runtime, proposalReviewCache, publishProposalReview, showProposalReview]);
+  // The window follows edits to the documents its proposals would be accepted into: a proposal's
+  // hydrogen-count warning is a dry run on that document, so an edit can add or remove it. Only a
+  // changed document (by identity) or tab name republishes, and only its proposals are re-run; the
+  // queue itself is not re-read. Declared after the queue effect above, which runs first in a render
+  // that changed both (an accept bumps the queue and commits its document in one batch), so the
+  // proposals checked here are the ones still pending.
+  useEffect(() => {
+    if (!isDesktopRuntime()) return;
+    const pending = proposalReviewCache.pending;
+    if (pending.length === 0 || !proposalReviewCache.isStale(pluginRuntime.runtime.host, pending, proposalReviewInputs)) return;
+    void publishProposalReview(false, false, pending);
+  }, [document, documentTabs, pluginRuntime.runtime, proposalReviewCache, proposalReviewInputs, publishProposalReview]);
 
   // The action listener is registered ONCE. Its handlers close over live state and are redefined
   // on every document change, so they are read through this ref: re-registering per render meant
@@ -24321,6 +24347,7 @@ export function MainWindow({
             host={pluginRuntime.runtime.host}
             queueVersion={patchQueueVersion}
             getDocumentName={proposalDocumentName}
+            getSourceDocument={proposalSourceDocument}
             onAccept={acceptPluginProposal}
             onReject={rejectPluginProposal}
           />
@@ -35263,14 +35290,9 @@ export function electronMarkSpecStatusNoun(spec: NativeElectronMarkSpec, placedC
 function atomHasImplicitHydrogen(molecule: MoleculeObject, atom: MoleculeAtom): boolean {
   const element = nativeElementFromAtomLabel(atom.element);
   if (!element || element === "H" || atom.labelLiteral === true) return false;
-  const { atoms, bonds } = molecule;
-  const resolution = nativeBondOrderResolution(atoms, bonds);
-  const incidentBonds = resolution.bondsByAtom.get(atom.id) ?? [];
-  if (element === "C" && incidentBonds.length > 0 && incidentBonds.every(isDativeBond)) return false;
-  const count = nativeImplicitHydrogenCount(
-    element, resolution.bondOrderUsage.get(atom.id) ?? 0, atom.formalCharge, atom.markRadicals ?? 0
-  );
-  return count > dativeDeprotonationCount(atom, bonds, atoms, resolution);
+  // The hydrogens the drawn label shows (layout-engine, AGENTS.md §9): a stated count where the atom
+  // has one; else none for a carbon bonded only datively.
+  return (atomDrawnHydrogenCount(atom, molecule.bonds, molecule.atoms) ?? 0) > 0;
 }
 
 function moleculeAriaLabel(object: MoleculeObject): string {

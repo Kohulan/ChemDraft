@@ -20,6 +20,10 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const chemCoreSrc = join(root, "packages/chem-core/src/index.ts");
+// chem-core's declared dependency, the abbreviation table (imports nothing). Inlined into the
+// bundle so the published SDK never depends on the private template-library package.
+const abbreviationsSrc = join(root, "packages/template-library/src/abbreviations.ts");
+const abbreviationsSpecifier = "@chemdraft/template-library/abbreviations";
 
 const CONFIGS = {
   "plugin-api": {
@@ -29,16 +33,16 @@ const CONFIGS = {
     // The dts must INLINE chem-core's ChemDraftDocument/DocumentPatch → resolve it via paths, keep it
     // non-external. zod stays external.
     dtsExternal: ["zod"],
-    dtsPaths: { "@chemdraft/chem-core": [chemCoreSrc] }
+    dtsPaths: { "@chemdraft/chem-core": [chemCoreSrc], [abbreviationsSpecifier]: [abbreviationsSrc] }
   },
   "plugin-host": {
     // Bundle the chem-core runtime (aliased to source); keep the SDK peer and zod external.
     jsExternal: ["@chemdraft/plugin-api", "zod"],
-    jsAlias: { "@chemdraft/chem-core": chemCoreSrc },
+    jsAlias: { "@chemdraft/chem-core": chemCoreSrc, [abbreviationsSpecifier]: abbreviationsSrc },
     // Inline chem-core's ApplyPatchOptions; @chemdraft/plugin-api (incl. the canonical ChemDraftDocument)
     // and zod remain external imports.
     dtsExternal: ["@chemdraft/plugin-api", "zod"],
-    dtsPaths: { "@chemdraft/chem-core": [chemCoreSrc] }
+    dtsPaths: { "@chemdraft/chem-core": [chemCoreSrc], [abbreviationsSpecifier]: [abbreviationsSrc] }
   }
 };
 

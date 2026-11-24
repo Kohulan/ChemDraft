@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from "vitest";
-import { moleculeToMolfileV2000 } from "@chemdraft/chem-core";
+import { moleculeToMolfileV2000, type MoleculeAtom, type MoleculeObject } from "@chemdraft/chem-core";
 import { ensureRdkit } from "../../rdkit-adapter/src/conformer";
 import { compositionFromRdkitJson } from "../../rdkit-adapter/src/composition";
 import { chargeSeparationCases } from "./chargeSeparationFixtures";
@@ -7,6 +7,9 @@ import type { ExportWarning } from "@chemdraft/export-engine";
 import { computeStructureIdentifiers } from "@chemdraft/rdkit-adapter/identifiers";
 import { installNodeRdkitModuleLoader } from "@chemdraft/rdkit-adapter/node";
 import { engineSmilesAtomWarnings, moleculeSmiles } from "../src/moleculeSmiles";
+import { nativeSingleBondGraphMetadata } from "../src/atoms";
+import { atomDisplayLabel, nativeBondOrderResolution } from "@chemdraft/layout-engine";
+import { DefaultNativeDrawingStyle } from "@chemdraft/chem-core";
 import { metalCounterionCases, metalHydrogenLossCases, preservedRadicalExportCases, radicalExportCases, readAtomStates } from "./radicalExportFixtures";
 
 beforeAll(() => { installNodeRdkitModuleLoader(); });
@@ -124,12 +127,60 @@ it("reparses native radical spelling with a branched traversal in a different at
   const smiles = await moleculeSmiles(molecule, 0, warnings, computeStructureIdentifiers);
   expect(warnings).toEqual([]);
   expect((await readAtomStates(smiles)).map(({ radicals }) => radicals).sort()).toEqual([0, 0, 0, 3]);
-  // A stated hydrogen count that the native writer cannot carry must also be checked here.
+  // A stated hydrogen count on the native route is checked here too. The count disagrees with the
+  // derived one on an atom with no aromatic bond, so the atom is badged, and the badge is an export
+  // warning of its own (owner ruling 1.2.3). The native writer now writes the stated count ([CH2],
+  // as it writes a typed "CH2"), so SMILES keeps the 2 H and the engine reads the open valence as a
+  // radical, which is reported instead of the hydrogen loss the derived count used to cause.
   molecule.atoms[0]!.hydrogenCount = 2;
   const changedWarnings: ExportWarning[] = [];
-  await moleculeSmiles(molecule, 0, changedWarnings, computeStructureIdentifiers);
-  expect(changedWarnings).toEqual([expect.objectContaining({ code: "export.smiles_hydrogen_loss",
-    message: "Atom a0 (C) is drawn with 2 total hydrogens; SMILES reparses with 3 total hydrogens." })]);
+  const changed = await moleculeSmiles(molecule, 0, changedWarnings, computeStructureIdentifiers);
+  expect(changedWarnings).toEqual([
+    expect.objectContaining({ code: "export.invalid_structure", message: "C1 states 2 H, but its bonds and charge give 3." }),
+    expect.objectContaining({ code: "export.smiles_radical_loss",
+      message: "Atom a0 (C) is drawn with 0 radical electrons; SMILES reparses with 1 radical electron." })
+  ]);
+  expect((await readAtomStates(changed)).map(({ radicals }) => radicals).sort()).toEqual([0, 0, 1, 3]);
+});
+
+// Owner ruling (1.2.3): a stated hydrogen count kept on an atom shows everywhere, exactly like a
+// hand-drawn under-filled atom. RDKit receives it through the typed label's own route, the molfile's
+// explicit valence, so SMILES and every warning match the typed atom's.
+describe("SMILES of a stated hydrogen count through the structure engine", () => {
+  const ethanol = (oxygen: Partial<MoleculeAtom>): MoleculeObject => ({
+    id: "m", type: "molecule", x: 0, y: 0, width: 60, height: 20, rotation: 0, style: {},
+    structureFormat: "smiles", structure: "", superatoms: [], rGroups: [],
+    atoms: [
+      { id: "c1", element: "C", x: 0, y: 0, formalCharge: 0 },
+      { id: "c2", element: "C", x: 14, y: 8, formalCharge: 0 },
+      { id: "o", element: "O", x: 28, y: 0, formalCharge: 0, ...oxygen }
+    ],
+    bonds: [
+      { id: "b1", fromAtomId: "c1", toAtomId: "c2", order: "single" },
+      { id: "b2", fromAtomId: "c2", toAtomId: "o", order: "single" }
+    ]
+  });
+
+  it("writes an O stated with 0 H exactly as a typed literal O, with the same warnings", async () => {
+    const stated: ExportWarning[] = [];
+    const typed: ExportWarning[] = [];
+    const smiles = await moleculeSmiles(ethanol({ hydrogenCount: 0 }), 0, stated, computeStructureIdentifiers);
+    expect(smiles).toBe(await moleculeSmiles(ethanol({ labelLiteral: true }), 0, typed, computeStructureIdentifiers));
+    expect(smiles).toBe("CC[O]");
+    expect(stated).toEqual(typed);
+    expect(stated.map((warning) => warning.code)).toEqual(["export.smiles_radical_loss"]);
+  });
+
+  it("writes an N stated with 1 H as the typed NH, and changes nothing without a count or with an agreeing one", async () => {
+    const amine = await moleculeSmiles({ ...ethanol({ element: "N", hydrogenCount: 1 }) }, 0, [], computeStructureIdentifiers);
+    expect(amine).toBe(await moleculeSmiles(ethanol({ element: "NH", labelLiteral: true }), 0, [], computeStructureIdentifiers));
+    expect(amine).toBe("CC[NH]");
+    for (const oxygen of [{}, { hydrogenCount: 1 }]) {
+      const warnings: ExportWarning[] = [];
+      expect(await moleculeSmiles(ethanol(oxygen), 0, warnings, computeStructureIdentifiers)).toBe("CCO");
+      expect(warnings).toEqual([]);
+    }
+  });
 });
 
 describe.each([
@@ -199,19 +250,18 @@ describe.each([
     expect((await readAtomStates(smiles))[1]).toMatchObject({ radicals: 2, hydrogens: 0, charge: 0 });
   });
 
-  it.each(["D", "T"])("describes the actual hydrogen/radical change for lone %s", async (element) => {
+  // A lone D or T is one atom with one radical electron (D•, T•; owner decision 2026-11-23): the
+  // drawing shows that radical, both writers write the bare atom, and SMILES reparses with exactly
+  // that radical, so nothing is lost and nothing is warned.
+  it.each(["D", "T"])("writes a lone %s as the bare radical atom it draws, and warns of nothing", async (element) => {
     const molecule = structuredClone(radicalExportCases.find(({ name }) => name === "D / 2")!.molecule);
     Object.assign(molecule.atoms[0]!, { element, markRadicals: 0 });
     const warnings: ExportWarning[] = [];
     const smiles = await moleculeSmiles(molecule, 0, warnings, compute);
-    expect(warnings).toEqual([expect.objectContaining({
-      code: compute ? "export.smiles_hydrogen_loss" : "export.smiles_radical_loss",
-      message: compute
-        ? `Atom a (${element}) is drawn with 0 total hydrogens; SMILES reparses with 1 total hydrogen.`
-        : `Atom a (${element}) is drawn with 0 radical electrons; SMILES cannot preserve its hydrogen count: the engine adds 1 hydrogen; the native writer instead implies 1 radical electron.`
-    })]);
+    expect(smiles).toBe(`[${element === "D" ? 2 : 3}H]`);
+    expect(warnings).toEqual([]);
     expect(await readAtomStates(smiles)).toEqual([{
-      radicals: compute ? 0 : 1, hydrogens: compute ? 1 : 0, charge: 0, isotope: element === "D" ? 2 : 3
+      radicals: 1, hydrogens: 0, charge: 0, isotope: element === "D" ? 2 : 3
     }]);
   });
 
@@ -234,4 +284,155 @@ it("explains why preserving three radicals requires the stereo-limited native wr
     code: "export.smiles_stereo_dropped",
     message: expect.stringContaining("the native writer required to preserve its radical count does not support stereochemistry")
   })]);
+});
+
+// A lone hydrogen atom is ONE hydrogen atom, a radical (owner decision 2026-11-23). The molfile the
+// app writes gives a lone, neutral H, D or T with no stated count the zero-valence sentinel, so RDKit
+// reads the bare atom with one radical electron ([H], [2H], [3H]; AGENTS.md §8), and the drawn label,
+// the native formula, the native SMILES fallback and the drawn radical agree with it.
+describe("a lone H, D or T: label, native formula, RDKit formula and SMILES agree", () => {
+  const molecule = (atoms: MoleculeAtom[], bonds: MoleculeObject["bonds"] = []): MoleculeObject => ({
+    id: "m", type: "molecule", x: 0, y: 0, width: 20, height: 20, rotation: 0, style: {},
+    structureFormat: "smiles", structure: "", superatoms: [], rGroups: [], atoms, bonds
+  });
+  const hydrogen = (element: string, extra: Partial<MoleculeAtom> = {}): MoleculeAtom =>
+    ({ id: "h", element, x: 0, y: 0, formalCharge: 0, ...extra });
+  async function readings(subject: MoleculeObject) {
+    const rdkit = await ensureRdkit();
+    const molfile = moleculeToMolfileV2000(subject, { fromDocFrame: true, kekuleBondOrders: new Map() }).contents;
+    const parsed = rdkit.get_mol(molfile)!;
+    let rdkitFormula: string;
+    try {
+      rdkitFormula = compositionFromRdkitJson(JSON.parse(parsed.get_json())).formula;
+    } finally { parsed.delete(); }
+    const resolution = nativeBondOrderResolution(subject.atoms, subject.bonds);
+    const warnings: ExportWarning[] = [];
+    const { radicals, hydrogens } = (await readAtomStates(molfile))[0]!;
+    return {
+      label: atomDisplayLabel(subject.atoms[0]!, subject.bonds, DefaultNativeDrawingStyle, subject.atoms, resolution),
+      nativeFormula: nativeSingleBondGraphMetadata(subject.atoms, subject.bonds).formula,
+      rdkitFormula,
+      rdkitAtom: { radicals, hydrogens },
+      smiles: await moleculeSmiles(subject, 0, warnings, computeStructureIdentifiers),
+      nativeSmiles: await moleculeSmiles(subject, 0, warnings, undefined),
+      warnings: warnings.map((warning) => warning.code)
+    };
+  }
+
+  it.each([
+    ["H", "H", "[H]"],
+    ["D", "D", "[2H]"],
+    ["T", "T", "[3H]"]
+  ])("a lone %s is one radical atom: it draws %s, counts it and writes %s everywhere", async (element, formula, smiles) => {
+    expect(await readings(molecule([hydrogen(element)]))).toEqual({
+      label: element, nativeFormula: formula, rdkitFormula: formula, rdkitAtom: { radicals: 1, hydrogens: 0 },
+      smiles, nativeSmiles: smiles, warnings: []
+    });
+  });
+
+  // A dative (dashed) bond is written as a plain single bond in V2000, so RDKit reads the D or T as
+  // spent: a single D or T, no hydrogen, no radical, exactly as before this branch. An H the same.
+  it.each([
+    ["H", "FeH", "[H][Fe]"],
+    ["D", "DFe", "[2H][Fe]"],
+    ["T", "TFe", "[3H][Fe]"]
+  ])("a %s bonded only datively stays the single atom", async (element, formula, smiles) => {
+    const dative = molecule([hydrogen(element), { id: "fe", element: "Fe", x: 14, y: 0, formalCharge: 0 }],
+      [{ id: "b", fromAtomId: "h", toAtomId: "fe", order: "single", display: { bondStyle: "dashed" } }]);
+    const read = await readings(dative);
+    expect({ label: read.label, nativeFormula: read.nativeFormula, rdkitFormula: read.rdkitFormula, rdkitAtom: read.rdkitAtom, smiles: read.smiles })
+      .toEqual({ label: element, nativeFormula: formula, rdkitFormula: formula, rdkitAtom: { radicals: 0, hydrogens: 0 }, smiles });
+  });
+
+  // Master ruling 2026-11-23: an H held only by a dative bond is a single H exactly like D. Every
+  // reading (label, native and RDKit formula, SMILES, RDKit's radical count, the stored chemistry's
+  // radicalCount, warnings) must agree between H and D apart from the isotope itself.
+  it("a dative-only H reads exactly as a dative-only D: no radical anywhere", async () => {
+    const dativeReading = async (element: string) => {
+      const dative = molecule([hydrogen(element), { id: "fe", element: "Fe", x: 14, y: 0, formalCharge: 0 }],
+        [{ id: "b", fromAtomId: "h", toAtomId: "fe", order: "single", display: { bondStyle: "dashed" } }]);
+      return { read: await readings(dative), radicalCount: nativeSingleBondGraphMetadata(dative.atoms, dative.bonds).radicalCount };
+    };
+    const h = await dativeReading("H");
+    const d = await dativeReading("D");
+    // The exported SMILES (RDKit route) and the labels, formulas and RDKit atom states pin the H reading.
+    expect({ label: h.read.label, nativeFormula: h.read.nativeFormula, rdkitFormula: h.read.rdkitFormula, rdkitAtom: h.read.rdkitAtom, smiles: h.read.smiles })
+      .toEqual({ label: "H", nativeFormula: "FeH", rdkitFormula: "FeH", rdkitAtom: { radicals: 0, hydrogens: 0 }, smiles: "[H][Fe]" });
+    expect({ label: d.read.label, nativeFormula: d.read.nativeFormula, rdkitFormula: d.read.rdkitFormula, rdkitAtom: d.read.rdkitAtom, smiles: d.read.smiles })
+      .toEqual({ label: "D", nativeFormula: "DFe", rdkitFormula: "DFe", rdkitAtom: { radicals: 0, hydrogens: 0 }, smiles: "[2H][Fe]" });
+    // Whatever warnings the dative export raises (the dative bond, the metal's own radical), H raises exactly D's.
+    expect(h.read.warnings).toEqual(d.read.warnings);
+    expect(h.read.nativeSmiles.replace("[H]", "[2H]")).toBe(d.read.nativeSmiles);
+    expect(h.radicalCount).toBe(0);
+    expect(d.radicalCount).toBe(0);
+  });
+
+  it.each([
+    ["H", "ClH", "[H]Cl"],
+    ["D", "DCl", "[2H]Cl"],
+    ["T", "TCl", "[3H]Cl"]
+  ])("a bonded %s keeps its single atom", async (element, formula, smiles) => {
+    const bonded = molecule([hydrogen(element), { id: "cl", element: "Cl", x: 14, y: 0, formalCharge: 0 }],
+      [{ id: "b", fromAtomId: "h", toAtomId: "cl", order: "single" }]);
+    const read = await readings(bonded);
+    expect({ label: read.label, nativeFormula: read.nativeFormula, rdkitFormula: read.rdkitFormula, rdkitAtom: read.rdkitAtom, smiles: read.smiles })
+      .toEqual({ label: element, nativeFormula: formula, rdkitFormula: formula, rdkitAtom: { radicals: 0, hydrogens: 0 }, smiles });
+  });
+
+  it.each([
+    ["H", "H", "[H]"],
+    ["D", "D", "[2H]"],
+    ["T", "T", "[3H]"]
+  ])("a lone %s stated with 0 H, or typed, is the single atom", async (element, formula, smiles) => {
+    for (const extra of [{ hydrogenCount: 0 }, { labelLiteral: true }]) {
+      // A stated or typed hydrogen atom keeps its stated reading (no drawn radical), so each writer
+      // says SMILES gives it the radical a bare hydrogen atom has, as before.
+      expect(await readings(molecule([hydrogen(element, extra)]))).toEqual({
+        label: element, nativeFormula: formula, rdkitFormula: formula, rdkitAtom: { radicals: 1, hydrogens: 0 },
+        smiles, nativeSmiles: smiles, warnings: ["export.smiles_radical_loss", "export.smiles_radical_loss"]
+      });
+    }
+  });
+
+  // Documents saved before the radical reading carry RDKit's old "[HH]" as the stored structure.
+  // Without RDKit the stored string must not be trusted for a lone H: it would export H2 while the
+  // canvas draws H•. The current graph is written instead.
+  it("never exports a stale stored [HH] for a lone H when RDKit is unavailable", async () => {
+    const stale = { ...molecule([hydrogen("H")]), structure: "[HH]" };
+    const warnings: ExportWarning[] = [];
+    expect(await moleculeSmiles(stale, 0, warnings, undefined)).toBe("[H]");
+    expect(warnings).toEqual([]);
+    // A lone H stating its count keeps the stored-string route (no implied radical): unchanged.
+    const stated = { ...molecule([hydrogen("H", { labelLiteral: true })]), structure: "[H]" };
+    expect(await moleculeSmiles(stated, 0, [], undefined)).toBe("[H]");
+  });
+
+  // The cached chemistry.radicalCount is the count RDKit reads (1 above): radical marks plus the lone
+  // hydrogen atom's implied radical, through chem-core's one rule. A mark suppresses the implied one.
+  it("caches a lone H, D or T's radical electron in chemistry.radicalCount, and counts a real mark once", () => {
+    for (const element of ["H", "D", "T"]) {
+      expect(nativeSingleBondGraphMetadata([hydrogen(element)], []).radicalCount).toBe(1);
+      expect(nativeSingleBondGraphMetadata([hydrogen(element, { markRadicals: 1 })], []).radicalCount).toBe(1);
+      // A stated 0, a typed label, a charge or a bond leaves the bare atom: no implied radical.
+      for (const extra of [{ hydrogenCount: 0 }, { labelLiteral: true }, { formalCharge: 1 }, { formalCharge: -1 }]) {
+        expect(nativeSingleBondGraphMetadata([hydrogen(element, extra)], []).radicalCount).toBe(0);
+      }
+      const bonded = [hydrogen(element), { id: "cl", element: "Cl", x: 14, y: 0, formalCharge: 0 }];
+      expect(nativeSingleBondGraphMetadata(bonded, [{ id: "b", fromAtomId: "h", toAtomId: "cl", order: "single" }]).radicalCount).toBe(0);
+    }
+    // The unknown-bond-order record (formula declined) counts the same radicals.
+    const carbons: MoleculeAtom[] = [{ id: "c1", element: "C", x: 20, y: 0, formalCharge: 0 }, { id: "c2", element: "C", x: 34, y: 0, formalCharge: 0 }];
+    const unknown = nativeSingleBondGraphMetadata([hydrogen("H"), ...carbons], [{ id: "u", fromAtomId: "c1", toAtomId: "c2", order: "unknown" }]);
+    expect(unknown.formula).toBeUndefined();
+    expect(unknown.radicalCount).toBe(1);
+  });
+
+  it("a lone H+ or H- has no room for a hydrogen", async () => {
+    for (const [charge, smiles] of [[1, "[H+]"], [-1, "[H-]"]] as const) {
+      expect(await readings(molecule([hydrogen("H", { formalCharge: charge })]))).toEqual({
+        label: `H${charge > 0 ? "+" : "-"}`, nativeFormula: "H", rdkitFormula: "H", rdkitAtom: { radicals: 0, hydrogens: 0 },
+        smiles, nativeSmiles: smiles, warnings: []
+      });
+    }
+  });
 });
