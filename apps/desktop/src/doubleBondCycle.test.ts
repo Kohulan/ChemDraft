@@ -9,7 +9,7 @@ import {
   getSelectedMolecule, type NativeBondOrderTarget
 } from "./documentWorkflow";
 import {
-  cycleNativeDoubleBondPosition, doubleBondCycleOrder, doubleBondGestureCycle, isDoubleBondCycleTarget,
+  cycleNativeDoubleBondPosition, doubleBondCycleOrder, doubleBondGestureCycle,
   nextDoubleBondCyclePosition
 } from "./doubleBondCycle";
 import { MemoryStorage } from "./testSupport/memoryStorage";
@@ -110,7 +110,7 @@ describe("double-bond position cycle", () => {
     expect(doubleBondGestureCycle(document, target, "triple")).toBeUndefined();
   });
 
-  it("undo restores the previous side: each step leaves its input document untouched", () => {
+  it("cycling never mutates its input document: each step returns a new one", () => {
     const document = butene();
     const original = JSON.stringify(document);
     const first = press(document)!;
@@ -158,7 +158,6 @@ describe("double-bond position cycle", () => {
     const document = butene();
     const graph = molecule(document);
     const single = graph.bonds.find(bond => bond.order === "single")!;
-    expect(isDoubleBondCycleTarget(document, bondTarget(graph, single))).toBe(false);
     expect(doubleBondGestureCycle(document, bondTarget(graph, single), "double")).toBeUndefined();
     const doubled = applyNativeMoleculeBondOrderValueTarget(document, bondTarget(graph, single), "double");
     expect(molecule(doubled).bonds.find(bond => bond.id === single.id)?.order).toBe("double");

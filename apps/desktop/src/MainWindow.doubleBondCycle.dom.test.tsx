@@ -155,7 +155,6 @@ describe("MainWindow double-bond position cycle", () => {
       expectSide(first);
       const afterFirst = molecule();
       // The hover survives the commit, so 2 can be pressed again without moving the pointer.
-      await hoverDoubleBond();
       await press2();
       expectSide(second);
       expect(chemistry(molecule())).toEqual(chemistry(original));

@@ -30,14 +30,6 @@ function cycleTargetBond(document: ChemDraftDocument, target: Pick<NativeBondOrd
   return isEditableNativeMoleculeGraph(molecule) ? { molecule, bond } : undefined;
 }
 
-/** Whether pressing 2 / clicking with the Double Bond tool should cycle this bond's stroke
- * position instead of changing its order. Only plain native double bonds cycle. */
-export function isDoubleBondCycleTarget(
-  document: ChemDraftDocument, target: Pick<NativeBondOrderTarget, "objectId" | "bondId">
-): boolean {
-  return cycleTargetBond(document, target) !== undefined;
-}
-
 /**
  * Move a double bond's second stroke to the next position after the one currently drawn.
  * Display-only: order, atoms, coordinates and stereo are untouched. A ring offset is stored as
