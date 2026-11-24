@@ -2349,33 +2349,30 @@ const maxMoleculeFillCycles = 256;
 
 type MoleculeRingGraph = Pick<MoleculeObject, "atoms" | "bonds">;
 
+function moleculeRingAdjacency(object: MoleculeRingGraph): Map<string, MoleculeFillAdjacencyEdge[]> {
+  const sortedAtomIds = object.atoms.map((atom) => atom.id).sort();
+  const adjacency = new Map<string, MoleculeFillAdjacencyEdge[]>(
+    sortedAtomIds.map((atomId) => [atomId, []])
+  );
+
+  object.bonds.forEach((bond) => {
+    const from = adjacency.get(bond.fromAtomId);
+    const to = adjacency.get(bond.toAtomId);
+    if (!from || !to || from === to) return;
+    from.push({ atomId: bond.toAtomId, bondId: bond.id });
+    to.push({ atomId: bond.fromAtomId, bondId: bond.id });
+  });
+  adjacency.forEach((edges) => edges.sort((left, right) => left.atomId.localeCompare(right.atomId)));
+  return adjacency;
+}
+
 function moleculeFillRingCycles(object: MoleculeRingGraph): MoleculeFillRingCycle[] {
   if (object.atoms.length < 3 || object.bonds.length < 3) {
     return [];
   }
 
-  const atomIds = object.atoms.map((atom) => atom.id);
-  const atomIdSet = new Set(atomIds);
-  const sortedAtomIds = [...atomIds].sort();
-  const adjacency = new Map<string, MoleculeFillAdjacencyEdge[]>(
-    sortedAtomIds.map((atomId) => [atomId, []])
-  );
-  const bondedPairs = new Map<string, string>();
-
-  object.bonds.forEach((bond) => {
-    if (
-      !atomIdSet.has(bond.fromAtomId) ||
-      !atomIdSet.has(bond.toAtomId) ||
-      bond.fromAtomId === bond.toAtomId
-    ) {
-      return;
-    }
-
-    adjacency.get(bond.fromAtomId)?.push({ atomId: bond.toAtomId, bondId: bond.id });
-    adjacency.get(bond.toAtomId)?.push({ atomId: bond.fromAtomId, bondId: bond.id });
-    bondedPairs.set(moleculeFillBondPairKey(bond.fromAtomId, bond.toAtomId), bond.id);
-  });
-  adjacency.forEach((edges) => edges.sort((left, right) => left.atomId.localeCompare(right.atomId)));
+  const adjacency = moleculeRingAdjacency(object);
+  const bondedPairs = new Set(object.bonds.map(bond => moleculeFillBondPairKey(bond.fromAtomId, bond.toAtomId)));
 
   // A bridge (a bond whose removal disconnects the graph) lies on no cycle, so its shortest-path
   // search below could only come back empty. Skipping bridges leaves the result unchanged and stops
@@ -2389,8 +2386,8 @@ function moleculeFillRingCycles(object: MoleculeRingGraph): MoleculeFillRingCycl
     }
 
     if (
-      !atomIdSet.has(bond.fromAtomId) ||
-      !atomIdSet.has(bond.toAtomId) ||
+      !adjacency.has(bond.fromAtomId) ||
+      !adjacency.has(bond.toAtomId) ||
       bond.fromAtomId === bond.toAtomId ||
       bridges.has(bond.id)
     ) {
@@ -2581,7 +2578,7 @@ export function ringInteriorDoubleBondSides(
   return new Map([...ringInteriorBondSides(object, rings)].filter(([id]) => doubles.has(id)));
 }
 
-/** Import normalizes offsets in five- and six-membered rings. In fused systems an offset that
+/** Import normalizes offsets in five- and six-membered rings. An offset that
  * already points into an owning ring retains that placement. Ring membership is also returned
  * for recording the source of explicit positions on any ring. */
 export function importedRingDoubleBondPlacements(object: MoleculeRingGraph): {
@@ -2607,6 +2604,17 @@ export function importedRingDoubleBondPlacements(object: MoleculeRingGraph): {
         interiorSides.set(id, inside);
       }
     }
+  }
+  let adjacency: ReturnType<typeof moleculeOwningRingAdjacency> | undefined;
+  for (const [id, inside] of interiorSides) {
+    const bond = doubles.get(id)!;
+    const side = bond.display?.doubleBondSide;
+    if ((side !== "left" && side !== "right") || side === inside) continue;
+    const from = atoms.get(bond.fromAtomId)!, to = atoms.get(bond.toAtomId)!;
+    const result = visitMoleculeOwningRings(adjacency ??= moleculeOwningRingAdjacency(object), bond,
+      ring => doubleBondSideTowardRingInterior(from, to, ring, atoms) === side);
+    if (result === "matched") interiorSides.set(id, side);
+    if (result === "limit") interiorSides.delete(id);
   }
   return { ringBondIds, interiorSides };
 }
@@ -2659,7 +2667,7 @@ export function reconcileRingDoubleBondSides(
   if (!movedAtoms.size && !options.repairStationaryOffsets) return after.bonds;
 
   let bonds = after.bonds;
-  let cycles: readonly MoleculeFillRingCycle[] | undefined;
+  let adjacency: ReturnType<typeof moleculeOwningRingAdjacency> | undefined;
   after.bonds.forEach((bond, index) => {
     const side = bond.display?.doubleBondSide;
     if (bond.order !== "double" || side === undefined || side === "automatic") return;
@@ -2673,15 +2681,16 @@ export function reconcileRingDoubleBondSides(
     let inside = doubleBondSideTowardRingInterior(from, to, ring, nextAtoms);
     if (source !== "user" && side !== "center") {
       if (inside === side) return;
-      // A fused bond can have an inward stroke on either side. Check every owning ring.
+      // Fused and bridged bonds can have an inward stroke on either side.
       let owningRingMoved = ringMoved;
-      for (const cycle of (cycles ??= moleculeFillRingCycles(after))) {
-        if (!cycle.bondIds.includes(bond.id)) continue;
-        const cycleInside = doubleBondSideTowardRingInterior(from, to, cycle.atomIds, nextAtoms);
-        if (cycleInside === side) return;
+      const result = visitMoleculeOwningRings(adjacency ??= moleculeOwningRingAdjacency(after), bond, atomIds => {
+        const cycleInside = doubleBondSideTowardRingInterior(from, to, atomIds, nextAtoms);
         inside ??= cycleInside;
-        owningRingMoved ||= cycle.atomIds.some(id => movedAtoms.has(id));
-      }
+        owningRingMoved ||= atomIds.some(id => movedAtoms.has(id));
+        return cycleInside === side;
+      });
+      // Repair only after exhausting the search without finding an owning ring on this side.
+      if (result !== "complete") return;
       // Full Clean Up also repairs old outward offsets on stationary rings.
       if (!owningRingMoved && !options.repairStationaryOffsets) return;
     } else if (!ringMoved) {
@@ -2707,6 +2716,56 @@ export function reconcileRingDoubleBondSides(
     bonds[index] = { ...bond, display };
   });
   return bonds;
+}
+
+function moleculeOwningRingAdjacency(object: MoleculeRingGraph): Map<string, MoleculeFillAdjacencyEdge[]> {
+  const adjacency = moleculeRingAdjacency(object);
+  const bridges = moleculeBridgeBondIds(adjacency);
+  for (const [id, edges] of adjacency) {
+    adjacency.set(id, edges.filter(edge => !bridges.has(edge.bondId)));
+  }
+  return adjacency;
+}
+
+/** Walk chordless cycles starting with the directed bond. The visitor may stop at the first
+ * match. Cap the extra search at 4,096 edge and cycle-atom inspections per bond to bound work in
+ * dense ring systems without imposing a ring-size cutoff on ordinary macrocycles. */
+function visitMoleculeOwningRings(
+  adjacency: ReadonlyMap<string, readonly MoleculeFillAdjacencyEdge[]>,
+  { fromAtomId, toAtomId }: CoreMoleculeBond,
+  visit: (atomIds: readonly string[]) => boolean
+): "complete" | "matched" | "limit" {
+  const closingNeighbors = new Set(adjacency.get(toAtomId)?.map(edge => edge.atomId));
+  const path = new Set([toAtomId, fromAtomId]);
+  const stack = [{ atomId: fromAtomId, edgeIndex: 0 }];
+  let remaining = 4096;
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1]!;
+    const edge = adjacency.get(frame.atomId)?.[frame.edgeIndex++];
+    if (!edge) {
+      stack.pop();
+      path.delete(frame.atomId);
+      continue;
+    }
+    if (--remaining < 0) return "limit";
+    const next = edge.atomId;
+    if (path.has(next)) continue;
+
+    const neighbors = adjacency.get(next)!;
+    remaining -= neighbors.length;
+    if (remaining < 0) return "limit";
+    // Only the predecessor and the starting atom may connect to this extension of the path.
+    if (neighbors.some(({ atomId }) => atomId !== frame.atomId && atomId !== toAtomId && path.has(atomId))) continue;
+    if (closingNeighbors.has(next)) {
+      remaining -= path.size + 1;
+      if (remaining < 0) return "limit";
+      if (visit([...path, next])) return "matched";
+      continue;
+    }
+    path.add(next);
+    stack.push({ atomId: next, edgeIndex: 0 });
+  }
+  return "complete";
 }
 
 function doubleBondSideTowardRingInterior(
@@ -2818,7 +2877,7 @@ function moleculeFillCanonicalCycle(cycle: MoleculeFillRingCycle): MoleculeFillR
 
 function moleculeFillCycleIsChordless(
   cycle: MoleculeFillRingCycle,
-  bondedPairs: ReadonlyMap<string, string>
+  bondedPairs: ReadonlySet<string>
 ): boolean {
   const atomCount = cycle.atomIds.length;
   const cycleBondPairs = new Set<string>();

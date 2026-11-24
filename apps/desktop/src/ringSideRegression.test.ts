@@ -76,6 +76,21 @@ function importedFusedHexagons() {
   return document;
 }
 
+function importedBicycloOctadiene(position: "Left" | "Right") {
+  const opened = openChemDraftPayload(`<CDXML><page id="1"><fragment id="2">
+    <n id="11" p="100 90"/><n id="12" p="100 150"/>
+    <n id="13" p="72 110"/><n id="14" p="72 130"/>
+    <n id="15" p="100 110"/><n id="16" p="100 130"/>
+    <n id="17" p="128 110"/><n id="18" p="128 130"/>
+    <b id="21" B="15" E="16" Order="2" DoublePosition="${position}"/>
+    <b id="22" B="11" E="13"/><b id="23" B="13" E="14" Order="2"/><b id="24" B="14" E="12"/>
+    <b id="25" B="11" E="15"/><b id="26" B="16" E="12"/>
+    <b id="27" B="11" E="17"/><b id="28" B="17" E="18"/><b id="29" B="18" E="12"/>
+  </fragment></page></CDXML>`);
+  expect(opened.source).toBe("external-cdxml");
+  return opened.document!;
+}
+
 function molecule(document: ChemDraftDocument): MoleculeObject {
   const object = document.pages[0]!.objects[0];
   if (object?.type !== "molecule") throw new Error("Expected imported molecule");
@@ -277,6 +292,31 @@ describe("imported ring double-bond strokes", () => {
     const folded = applyPatch(document, { op: "updateObject", objectId: object.id, changes: { atoms } });
     const cleaned = molecule(cleanUp(folded));
 
+    expect(cleaned.atoms).toEqual(atoms);
+    expect(cleaned.bonds[0]!.display?.doubleBondSide).toBe("left");
+    expect(chemistry(cleaned)).toEqual(chemistry(object));
+  });
+
+  it.each(["Left", "Right"] as const)("keeps a bicyclo[2.2.2]octadiene bridge offset into the %s ring", position => {
+    const document = importedBicycloOctadiene(position);
+    const object = molecule(document);
+    const cleaned = molecule(cleanUp(document));
+
+    expect(object.bonds[0]!.display).toMatchObject({ doubleBondSide: position.toLowerCase(), doubleBondSideSource: "imported" });
+    expect(cleaned.atoms).toEqual(object.atoms);
+    expect(cleaned.bonds[0]!.display).toEqual(object.bonds[0]!.display);
+    expect(chemistry(cleaned)).toEqual(chemistry(object));
+  });
+
+  it("repairs an imported bicyclo[2.2.2]octadiene bridge offset outside its owning rings", () => {
+    const document = importedBicycloOctadiene("Right");
+    const object = molecule(document);
+    const bridgeX = object.atoms[0]!.x;
+    const atoms = object.atoms.map(atom => atom.x > bridgeX ? { ...atom, x: 2 * bridgeX - atom.x, y: atom.y + 4 } : atom);
+    const folded = applyPatch(document, { op: "updateObject", objectId: object.id, changes: { atoms } });
+    const cleaned = molecule(cleanUp(folded));
+
+    expect(object.bonds[0]!.display?.doubleBondSide).toBe("right");
     expect(cleaned.atoms).toEqual(atoms);
     expect(cleaned.bonds[0]!.display?.doubleBondSide).toBe("left");
     expect(chemistry(cleaned)).toEqual(chemistry(object));
