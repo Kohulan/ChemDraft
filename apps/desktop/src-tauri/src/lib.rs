@@ -1476,12 +1476,13 @@ pub fn run() {
         // state (localStorage, IndexedDB) is disturbed. See `installed_plugins` for the full rationale.
         .register_uri_scheme_protocol("tauri", installed_plugins::handle_tauri_request);
     let dialogs = tauri_plugin_dialog::init();
+    // Every Linux build wraps the dialog plugin: message prompts need a parent (rfd drops it), and
+    // AppImage builds also take over the file pickers.
     #[cfg(target_os = "linux")]
-    let builder = if is_appimage {
-        builder.plugin(appimage_dialogs::AppImageDialogs(dialogs))
-    } else {
-        builder.plugin(dialogs)
-    };
+    let builder = builder.plugin(appimage_dialogs::AppImageDialogs {
+        inner: dialogs,
+        appimage: is_appimage,
+    });
     #[cfg(not(target_os = "linux"))]
     let builder = builder.plugin(dialogs);
     let builder = builder
