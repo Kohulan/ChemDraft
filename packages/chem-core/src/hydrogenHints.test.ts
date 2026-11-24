@@ -525,12 +525,51 @@ describe("a hydrogen count stated on an abbreviation (OMe, Ph): read from the ab
       expect(atomIgnoresStatedHydrogenCount(subject)).toBe(false);
     }
     expect(atomStatedHydrogenCount(atom("C", 2), [])).toBe(2);
-    expect([atom("A", 2, true), atom("*", 2), atom("H", 1)].map(ignoredHydrogenCountAtomKind))
+    expect([atom("A", 2, true), atom("*", 2), atom("H", 1)].map((subject) => ignoredHydrogenCountAtomKind(subject)))
       .toEqual(["a label naming no element", "an unknown atom", "a hydrogen atom"]);
     // An element symbol is never an abbreviation, as the grammar reads elements first: a stored "Ac"
     // stays actinium.
     expect(atomIgnoresStatedHydrogenCount(atom("N", 1, true))).toBe(false);
     expect(atomIgnoresStatedHydrogenCount(atom("Ac", 1))).toBe(false);
+  });
+
+  /**
+   * The label grammar (layout-engine `nativeAtomLabelReading`) reads a typed "Ac", "Pr" or "Ts" on an
+   * atom with bonds as acetyl, n-propyl or tosyl, and document-workflow-core writes the group out with
+   * its definition's hydrogens. A count stated on it is counted by nothing, exactly as on "OMe", so it
+   * is flagged and a write setting it is refused. Unbonded, or not typed, it is the element.
+   */
+  it("reads a typed Ac, Pr or Ts on a bond as the abbreviation the grammar reads, and as its element otherwise", () => {
+    const carbon = { id: "c", element: "C", x: 0, y: 0, formalCharge: 0 };
+    const bond = { id: "b", fromAtomId: "c", toAtomId: "x", order: "single" as const };
+    for (const label of ["Ac", "Pr", "Ts"]) {
+      const bonded = atom(label, 2, true);
+      expect(atomIgnoresStatedHydrogenCount(bonded, [bond])).toBe(true);
+      expect(atomStatedHydrogenCount(bonded, [bond])).toBeUndefined();
+      expect(ignoredHydrogenCountAtomKind(bonded, [bond])).toBe("an abbreviation");
+      expect(statedHydrogenCountNotCountedReason(bonded, [bond]))
+        .toBe(`${label} states 2 H, which is not counted: an abbreviation's hydrogens come from what it stands for.`);
+      expect(statedHydrogenCountNotCountedText([bonded], undefined, [bond])).toBe(`atom x (${label}) states 2 hydrogens, but an ` +
+        "abbreviation's hydrogens come from what it stands for, so the stated count is kept as stored but not counted, and the atom is flagged.");
+      // A write that sets it is refused; one that leaves the molecule's held count alone is not.
+      expect(atomWithIgnoredHydrogenCount([carbon, bonded], undefined, [bond])?.id).toBe("x");
+      expect(atomWithIgnoredHydrogenCount([carbon, bonded], [carbon, bonded], [bond], [bond])).toBeUndefined();
+      // Held while unbonded (the element, so not flagged) and bonded by this write: now uncounted, refused.
+      expect(atomWithIgnoredHydrogenCount([carbon, bonded], [carbon, bonded], [bond], [])?.id).toBe("x");
+      // 0 is what the group counts anyway.
+      expect(atomIgnoresStatedHydrogenCount(atom(label, 0, true), [bond])).toBe(false);
+      // Unbonded, it is the element, as before: a typed literal whose own text says its hydrogens.
+      expect(atomIgnoresStatedHydrogenCount(bonded)).toBe(false);
+      expect(atomIgnoresStatedHydrogenCount(bonded, [])).toBe(false);
+      expect(atomWithIgnoredHydrogenCount([bonded])).toBeUndefined();
+      // Bonds elsewhere in the molecule do not bond it.
+      expect(atomIgnoresStatedHydrogenCount(bonded, [{ ...bond, toAtomId: "y" }])).toBe(false);
+      // Not typed (an element read from a structure file), it is the element even on a bond.
+      expect(atomIgnoresStatedHydrogenCount(atom(label, 2), [bond])).toBe(false);
+      expect(atomStatedHydrogenCount(atom(label, 2), [bond])).toBe(2);
+    }
+    // A plain filter still reads the one-argument form: the index it passes is not taken for bonds.
+    expect([atom("Ac", 2, true), atom("OMe", 2)].filter(atomIgnoresStatedHydrogenCount).map((subject) => subject.element)).toEqual(["OMe"]);
   });
 
   it("words it as an abbreviation's hydrogens coming from what it stands for, alone, together and beside other kinds", () => {

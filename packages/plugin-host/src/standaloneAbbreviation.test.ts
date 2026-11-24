@@ -64,20 +64,21 @@ function moduleGraph(entry: string): { files: Set<string>; bare: Set<string> } {
 
 const now = "2026-11-23T00:00:00.000Z";
 const snapshot = (objectIds: string[]): PluginSelectionSnapshot => ({ objectIds, molecules: [] });
-const molecule = (element: string): MoleculeObject => ({
+/** Atom "g" is typed (`labelLiteral`) when `typed`, and bonded to a2 unless `bonded` is false. */
+const molecule = (element: string, { typed = false, bonded = true } = {}): MoleculeObject => ({
   id: "mol_1", type: "molecule", x: 110, y: 120, width: 30, height: 20, rotation: 0, style: {},
   structureFormat: "smiles", structure: "CC",
   atoms: [{ id: "a1", element: "C", x: 110, y: 120, formalCharge: 0 },
     { id: "a2", element: "C", x: 140, y: 120, formalCharge: 0 },
-    { id: "g", element, x: 160, y: 120, formalCharge: 0 }],
+    { id: "g", element, x: 160, y: 120, formalCharge: 0, ...(typed ? { labelLiteral: true } : {}) }],
   bonds: [{ id: "b1", fromAtomId: "a1", toAtomId: "a2", order: "single" },
-    { id: "bg", fromAtomId: "a2", toAtomId: "g", order: "single" }],
+    ...(bonded ? [{ id: "bg", fromAtomId: "a2", toAtomId: "g", order: "single" as const }] : [])],
   superatoms: [], rGroups: []
 });
 
 /** A host over a one-molecule document with undo history, and a command writing `hydrogenCount` on atom "g". */
-function hostSettingCount(element: string, hydrogenCount: number) {
-  const subject = molecule(element);
+function hostSettingCount(element: string, hydrogenCount: number, options?: { typed?: boolean; bonded?: boolean }) {
+  const subject = molecule(element, options);
   let history: DocumentHistory = createDocumentHistory(applyPatch(createEmptyDocument({ now }),
     { op: "addObject", pageId: "page_001", object: subject }, { now }));
   history = { ...history, present: { ...history.present, selection: { pageId: "page_001", objectIds: [subject.id] } } };
@@ -141,6 +142,34 @@ describe("the plugin host without layout-engine (the published SDK)", () => {
     });
     expect(applyDocumentPatch).not.toHaveBeenCalled();
     expect(history()).toBe(original);
+  });
+
+  // A typed "Ac", "Pr" or "Ts" on a bond is acetyl, n-propyl or tosyl to the label grammar, and its
+  // hydrogens come from the group, so a stated count is refused as on OMe. chem-core reads the
+  // table's bonded spellings itself, so the SDK (no layout-engine) refuses it too.
+  it.each([["Ac", 2], ["Pr", 1], ["Ts", 3]] as const)("refuses a typed %s on a bond stating %i as an abbreviation", async (element, hydrogenCount) => {
+    const { host, applyDocumentPatch, original, history } = hostSettingCount(element, hydrogenCount, { typed: true });
+    await expect(host.invokeCommand("plugin.standalone.run")).rejects.toMatchObject({
+      reason: HydrogenCountUnrepresentableReason, details: { moleculeId: "mol_1", atomId: "g", element, hydrogenCount },
+      message: `Plugin write refused: atom "g" of molecule "mol_1" is ${element} with hydrogenCount ${hydrogenCount}, which nothing would ` +
+        `count: an abbreviation's hydrogens come from what it stands for. Only 0 is allowed on an abbreviation (${element}); omit ` +
+        "hydrogenCount or set it to 0. Nothing was changed."
+    });
+    expect(applyDocumentPatch).not.toHaveBeenCalled();
+    expect(history()).toBe(original);
+  });
+
+  // Unbonded, or not typed (read from a structure file), it is actinium, praseodymium or tennessine,
+  // as before; 0 on the bonded group is what it counts anyway.
+  it.each([
+    ["Ac", 2, { typed: true, bonded: false }], ["Pr", 1, { typed: true, bonded: false }], ["Ts", 3, { typed: true, bonded: false }],
+    ["Ac", 2, { typed: false, bonded: true }], ["Ts", 0, { typed: true, bonded: true }]
+  ] as const)("accepts %s stating %i when %o", async (element, hydrogenCount, options) => {
+    const { host, applyDocumentPatch, history } = hostSettingCount(element, hydrogenCount, options);
+    await expect(host.invokeCommand("plugin.standalone.run")).resolves.toMatchObject({ applied: true });
+    expect(applyDocumentPatch).toHaveBeenCalledTimes(1);
+    const written = history().present.pages[0]!.objects.find(object => object.id === "mol_1");
+    expect(written?.type === "molecule" && written.atoms.find(atom => atom.id === "g")?.hydrogenCount).toBe(hydrogenCount);
   });
 
   it.each([["OMe", 0], ["NHMe", 1], ["CH3", 3], ["O", 1]] as const)("accepts %s stating %i", async (element, hydrogenCount) => {

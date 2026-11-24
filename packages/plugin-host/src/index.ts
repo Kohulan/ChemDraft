@@ -313,14 +313,16 @@ export function assertPluginPatchWriteScope(
 
 /** The refusal reason (API 0.1.27 `PluginRefusalFields.reason`) for a write that would store a
  * hydrogen count other than 0 on an H, D or T atom, on a label naming no element (the unknown atom
- * "*" or a generic label such as A, Q, M, X or R1), or on an abbreviation such as OMe or Ph
+ * "*" or a generic label such as A, Q, M, X or R1), or on an abbreviation such as OMe or Ph, or a
+ * typed Ac, Pr or Ts on a bond, which the label grammar reads as acetyl, n-propyl or tosyl
  * (`details.element` gives the label). */
 export const HydrogenCountUnrepresentableReason = "hydrogen_count_unrepresentable";
 
 /**
  * Refuse a plugin or assistant write that would store a hydrogen count other than 0 on an H, D or T
  * atom, on a label naming no element (the unknown atom "*", a generic label such as A or R1), or on
- * an abbreviation such as OMe or Ph (its hydrogens come from what it stands for; chem-core reads the
+ * an abbreviation such as OMe or Ph, or a typed Ac, Pr or Ts on a bond (acetyl, n-propyl, tosyl)
+ * (its hydrogens come from what it stands for; chem-core reads the
  * abbreviation table itself, so the published SDK refuses it too): no label, formula or export reads it (chem-core
  * `atomIgnoresStatedHydrogenCount`), so storing it would silently lose what the writer said
  * (AGENTS.md §7). This is the only place such a count is
@@ -336,9 +338,11 @@ function assertRepresentableHydrogenCounts(before: ChemDraftDocument, after: Che
       if (object.type !== "molecule") continue;
       const previous = previousPage?.objects.find(candidate => candidate.id === object.id);
       if (previous === object) continue;
-      const atom = atomWithIgnoredHydrogenCount(object.atoms, previous?.type === "molecule" ? previous.atoms : undefined);
+      // The bonds decide whether a typed "Ac", "Pr" or "Ts" is acetyl, n-propyl or tosyl (bonded) or the element.
+      const previousMolecule = previous?.type === "molecule" ? previous : undefined;
+      const atom = atomWithIgnoredHydrogenCount(object.atoms, previousMolecule?.atoms, object.bonds, previousMolecule?.bonds);
       if (!atom) continue;
-      const kind = ignoredHydrogenCountAtomKind(atom);
+      const kind = ignoredHydrogenCountAtomKind(atom, object.bonds);
       const allowed = kind === "an unknown atom" ? "an unknown atom (*), as a typed * label means"
         : kind === "a hydrogen atom" ? "an H, D or T atom, as a typed H, D or T label means"
         : kind === "an abbreviation" ? `an abbreviation (${atom.element})`

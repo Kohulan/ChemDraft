@@ -1,6 +1,7 @@
 import { bridgeBondIndices, isDativeBond } from "./bondGraph";
 import { atomicNumberForElementSymbol } from "./elements";
 import { isTableAbbreviationLabel } from "./abbreviationLabels";
+import { abbreviationForBondedElementLabel } from "@chemdraft/template-library/abbreviations";
 import type { MoleculeAtom, MoleculeBond, MoleculeObject } from "./schemas";
 
 /**
@@ -93,11 +94,13 @@ export function moleculeRadicalCount(atoms: readonly MoleculeAtom[], bonds: read
  * - "aromatic": the count settles the Kekulé resolution of an aromatic bond;
  * - "agrees": 0 on a label naming no element or an abbreviation, which is exactly what it counts;
  * - "ignored": stored, and nothing counts it — an H, D or T atom, a label naming no element, or an
- *   abbreviation, stating a count other than 0. Decided before the label's literalness and its bonds, so it is a
- *   property of the atom alone.
+ *   abbreviation, stating a count other than 0. Decided before "label" and "aromatic"; the label's
+ *   literalness and bonds take part only where the label grammar reads them, deciding whether "Ac",
+ *   "Pr" or "Ts" is the element or the group it names when typed on a bond (`statedCountCarrier`).
  * "Naming no element" is read from chem-core's own element table (`statedCountCarrier`), not from a
  * list of placeholder labels; "an abbreviation" from template-library's abbreviation table, the one
- * the label grammar reads (`isTableAbbreviationLabel`), not from a second list.
+ * the label grammar reads (`isTableAbbreviationLabel`, `readsAsBondedAbbreviation`), not from a
+ * second list.
  */
 function statedHydrogenCountUse(
   atom: MoleculeAtom,
@@ -105,7 +108,7 @@ function statedHydrogenCountUse(
 ): "none" | "counted" | "label" | "aromatic" | "agrees" | "ignored" {
   const stated = atom.hydrogenCount;
   if (stated === undefined) return "none";
-  const carrier = statedCountCarrier(atom);
+  const carrier = statedCountCarrier(atom, bonds);
   if (carrier !== undefined) {
     if (stated !== 0) return "ignored";
     if (carrier !== "hydrogen") return "agrees";
@@ -126,41 +129,70 @@ function statedHydrogenCountUse(
  *   dummy atom, a typed "*") or a generic label (A, Q, M, X, an R-group …). Its label draws no
  *   stated hydrogens, the formula counts none, the molfile writes a placeholder with no valence
  *   field and RDKit gives a placeholder no hydrogens;
- * - an abbreviation (OMe, Ph, Bu, CF3 …: `isTableAbbreviationLabel`): its label, formula and
- *   SMILES read the hydrogens of what it stands for, never a count stated on the atom.
+ * - an abbreviation (OMe, Ph, Bu, CF3 …: `isTableAbbreviationLabel`), or a typed "Ac", "Pr" or "Ts"
+ *   on an atom with bonds (acetyl, n-propyl, tosyl: `readsAsBondedAbbreviation`): its label,
+ *   formula and SMILES read the hydrogens of what it stands for, never a count stated on the atom.
+ *
+ * `bonds` are the molecule's bonds (or at least the atom's own): they decide whether a typed "Ac",
+ * "Pr" or "Ts" is the group or the element. Left out, the atom is read as unbonded, so such a label
+ * is its element; every caller that has the molecule passes them. The one-argument form is its own
+ * overload, so `atoms.filter(atomIgnoresStatedHydrogenCount)` still type-checks, and the array
+ * method's index it then receives is not read as bonds.
  * Patches store it as written (chem-core never refuses it, so opening, restoring, pasting or undoing
  * a document that holds one always works); the atom validator flags it and an open reports it
  * (`statedHydrogenCountNotCountedText`). The CDXML importer does not keep such a count on an
  * ordinary hydrogen atom (`cdxml.atom_hydrogen_count_not_kept`); on any other atom it keeps it for
  * the file's round trip and reports it as not counted (`cdxml.atom_hydrogen_count_not_counted`).
  */
-export function atomIgnoresStatedHydrogenCount(atom: MoleculeAtom): boolean {
-  return statedHydrogenCountUse(atom, []) === "ignored";
+export function atomIgnoresStatedHydrogenCount(atom: MoleculeAtom): boolean;
+export function atomIgnoresStatedHydrogenCount(atom: MoleculeAtom, bonds: readonly MoleculeBond[]): boolean;
+export function atomIgnoresStatedHydrogenCount(atom: MoleculeAtom, bonds?: unknown): boolean {
+  return statedHydrogenCountUse(atom, Array.isArray(bonds) ? bonds as readonly MoleculeBond[] : []) === "ignored";
 }
 
 /**
  * Which kind of atom counts no stated hydrogens of its own: hydrogen atoms, the unknown atom "*",
- * an abbreviation (its hydrogens come from what it stands for: `isTableAbbreviationLabel`), and any
- * other label naming no element — no element symbol of chem-core's table starts it (A, Q, M, X,
- * R1). A label an element symbol starts that is no abbreviation ("NH2", "CH3", "NHMe") names that
- * element, and its own text says what hydrogens it has, as a typed label does; it is no carrier.
+ * an abbreviation (its hydrogens come from what it stands for: `isTableAbbreviationLabel`, or a
+ * typed "Ac", "Pr" or "Ts" on a bond: `readsAsBondedAbbreviation`), and any other label naming no
+ * element — no element symbol of chem-core's table starts it (A, Q, M, X, R1). A label an element
+ * symbol starts that is no abbreviation ("NH2", "CH3", "NHMe") names that element, and its own text
+ * says what hydrogens it has, as a typed label does; it is no carrier.
  */
-function statedCountCarrier(atom: MoleculeAtom): "hydrogen" | "unknown" | "abbreviation" | "generic" | undefined {
+function statedCountCarrier(
+  atom: MoleculeAtom,
+  bonds: readonly MoleculeBond[]
+): "hydrogen" | "unknown" | "abbreviation" | "generic" | undefined {
   if (atom.element === "H" || atom.element === "D" || atom.element === "T") return "hydrogen";
   if (atom.element === "*") return "unknown";
   const label = atom.element.trim();
-  if (isTableAbbreviationLabel(label)) return "abbreviation";
+  if (isTableAbbreviationLabel(label) || readsAsBondedAbbreviation(atom, bonds)) return "abbreviation";
   const namesElement = atomicNumberForElementSymbol(label.slice(0, 2)) !== undefined ||
     atomicNumberForElementSymbol(label.slice(0, 1)) !== undefined;
   return namesElement ? undefined : "generic";
 }
 
 /**
- * "a hydrogen atom", "an unknown atom", "an abbreviation" or "a label naming no element": the atom
- * kind a refusal or warning names.
+ * True for a typed "Ac", "Pr" or "Ts" on an atom with bonds: acetyl, n-propyl and tosyl, whose
+ * hydrogens come from the group (document-workflow-core writes the group out with the hydrogens of
+ * its definition), never actinium, praseodymium or tennessine. This mirrors the label grammar's own
+ * decision, layout-engine `nativeAtomLabelReading` (bonded, and typed — a stored atom's
+ * `labelLiteral` — reads template-library's `bondedSpellings` as the group). chem-core may not import
+ * layout-engine (layout-engine depends on chem-core), so it reads the same table through
+ * `abbreviationForBondedElementLabel`, not a list of its own. Unbonded, or not typed (an element read
+ * from a molfile, a SMILES or a numeric CDXML `Element`), the label is its element.
  */
-export function ignoredHydrogenCountAtomKind(atom: MoleculeAtom): string {
-  const carrier = statedCountCarrier(atom);
+function readsAsBondedAbbreviation(atom: MoleculeAtom, bonds: readonly MoleculeBond[]): boolean {
+  return atom.labelLiteral === true &&
+    abbreviationForBondedElementLabel(atom.element) !== undefined &&
+    bonds.some((bond) => bond.fromAtomId === atom.id || bond.toAtomId === atom.id);
+}
+
+/**
+ * "a hydrogen atom", "an unknown atom", "an abbreviation" or "a label naming no element": the atom
+ * kind a refusal or warning names. `bonds` as for `atomIgnoresStatedHydrogenCount`.
+ */
+export function ignoredHydrogenCountAtomKind(atom: MoleculeAtom, bonds: readonly MoleculeBond[] = []): string {
+  const carrier = statedCountCarrier(atom, bonds);
   return carrier === "unknown" ? "an unknown atom" : carrier === "generic" ? "a label naming no element"
     : carrier === "abbreviation" ? "an abbreviation" : "a hydrogen atom";
 }
@@ -172,13 +204,14 @@ const abbreviationHydrogensClause = "an abbreviation's hydrogens come from what 
  * The atom badge's short reason for a stored count nothing counts (`atomIgnoresStatedHydrogenCount`),
  * in the same words as `statedHydrogenCountNotCountedText`: "A states 2 H, which a label naming no
  * element cannot carry; only 0 counts.", or for an abbreviation "OMe states 2 H, which is not
- * counted: an abbreviation's hydrogens come from what it stands for."
+ * counted: an abbreviation's hydrogens come from what it stands for." `bonds` as for
+ * `atomIgnoresStatedHydrogenCount`.
  */
-export function statedHydrogenCountNotCountedReason(atom: MoleculeAtom): string {
+export function statedHydrogenCountNotCountedReason(atom: MoleculeAtom, bonds: readonly MoleculeBond[] = []): string {
   const head = `${atom.element} states ${atom.hydrogenCount} H`;
-  return statedCountCarrier(atom) === "abbreviation"
+  return statedCountCarrier(atom, bonds) === "abbreviation"
     ? `${head}, which is not counted: ${abbreviationHydrogensClause}.`
-    : `${head}, which ${ignoredHydrogenCountAtomKind(atom)} cannot carry; only 0 counts.`;
+    : `${head}, which ${ignoredHydrogenCountAtomKind(atom, bonds)} cannot carry; only 0 counts.`;
 }
 
 /** "x", "x or y", "x, y or z". */
@@ -193,17 +226,19 @@ function alternatives(items: readonly string[]): string {
  * (the CDXML importer names the file's node id). The text for hydrogen atoms and unknown atoms is
  * the wording these warnings already used for them; a label naming no element is named by its own
  * text ("as a typed A label means"); an abbreviation says its hydrogens come from what it stands
- * for (`abbreviationHydrogensClause`), since a stated 0 is not what it counts either.
+ * for (`abbreviationHydrogensClause`), since a stated 0 is not what it counts either. `bonds` as for
+ * `atomIgnoresStatedHydrogenCount` (a typed "Ac" on a bond is named as an abbreviation).
  */
 export function statedHydrogenCountNotCountedText(
   atoms: readonly MoleculeAtom[],
-  name: (atom: MoleculeAtom) => string = (atom) => atom.id
+  name: (atom: MoleculeAtom) => string = (atom) => atom.id,
+  bonds: readonly MoleculeBond[] = []
 ): string {
   const hydrogens = (count: number) => `${count} hydrogen${count === 1 ? "" : "s"}`;
-  const carriers = atoms.map(statedCountCarrier);
+  const carriers = atoms.map((atom) => statedCountCarrier(atom, bonds));
   const placeholders = atoms.filter((_atom, index) => carriers[index] !== "abbreviation");
   const abbreviations = placeholders.length < atoms.length;
-  const kinds = new Set(placeholders.map(statedCountCarrier));
+  const kinds = new Set(placeholders.map((atom) => statedCountCarrier(atom, bonds)));
   const uniform = kinds.size === 1 ? [...kinds][0] : undefined;
   const typed = alternatives([
     ...(kinds.has("hydrogen") ? ["H", "D", "T"] : []),
@@ -215,7 +250,7 @@ export function statedHydrogenCountNotCountedText(
     return abbreviations
       ? `atom ${name(only!)} (${only!.element}) states ${hydrogens(only!.hydrogenCount!)}, but ${abbreviationHydrogensClause}, ` +
         "so the stated count is kept as stored but not counted, and the atom is flagged."
-      : `atom ${name(only!)} (${only!.element}) states ${hydrogens(only!.hydrogenCount!)}, which ${ignoredHydrogenCountAtomKind(only!)} cannot carry: ` +
+      : `atom ${name(only!)} (${only!.element}) states ${hydrogens(only!.hydrogenCount!)}, which ${ignoredHydrogenCountAtomKind(only!, bonds)} cannot carry: ` +
         `only 0 counts, as a typed ${typed} label means. The stated count is kept as stored but not counted, and the atom is flagged.`;
   }
   const listed = atoms.map((atom) => `atom ${name(atom)} (${atom.element}) states ${atom.hydrogenCount}`).join("; ");
@@ -253,16 +288,24 @@ function placeholderKinds(kinds: ReadonlySet<string | undefined>): string {
  * sets one, so its writer is told rather than having a count stored that nothing reads (AGENTS.md
  * §7). chem-core's patches do not refuse it: they also replay paste, duplicate, undo and session
  * restore, which must never refuse a user's own document.
+ *
+ * `bonds` and `previousBonds` are the molecule's bonds after and before the write (`bonds` as for
+ * `atomIgnoresStatedHydrogenCount`). An atom that held the same label and count, already uncounted,
+ * before the write is let be; one whose count only becomes uncounted with this write (a typed "Ac"
+ * that had no bonds before, so it was actinium) is refused like a newly written one.
  */
 export function atomWithIgnoredHydrogenCount(
   atoms: readonly MoleculeAtom[],
-  previous?: readonly MoleculeAtom[]
+  previous?: readonly MoleculeAtom[],
+  bonds: readonly MoleculeBond[] = [],
+  previousBonds: readonly MoleculeBond[] = []
 ): MoleculeAtom | undefined {
   const before = new Map(previous?.map((atom) => [atom.id, atom]));
   return atoms.find((atom) => {
-    if (!atomIgnoresStatedHydrogenCount(atom)) return false;
+    if (!atomIgnoresStatedHydrogenCount(atom, bonds)) return false;
     const old = before.get(atom.id);
-    return !old || old.element !== atom.element || old.hydrogenCount !== atom.hydrogenCount;
+    return !old || old.element !== atom.element || old.hydrogenCount !== atom.hydrogenCount ||
+      !atomIgnoresStatedHydrogenCount(old, previousBonds);
   });
 }
 
