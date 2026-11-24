@@ -91,4 +91,3 @@ export function scanPieces(line: string, conditions: boolean): { pieces: WrapPie
   }
   return { pieces, steps };
 }
-
