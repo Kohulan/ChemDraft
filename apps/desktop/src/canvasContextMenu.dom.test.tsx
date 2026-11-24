@@ -209,7 +209,11 @@ describe("stereo readout row", () => {
   it("native menu (macOS and Windows share one command) carries the row first", async () => {
     vi.stubGlobal("__TAURI_INTERNALS__", {});
     const calls: Array<{ command: string; args: { items: Array<{ label?: string; enabled?: boolean }> } }> = [];
-    tauri.handler = (command, args) => { calls.push({ command, args: args as never }); return null; };
+    // Only the popup is under test; a MainWindow from an earlier test may still be issuing its own invokes.
+    tauri.handler = (command, args) => {
+      if (command === "popup_canvas_context_menu") calls.push({ command, args: args as never });
+      return null;
+    };
     const onDismiss = vi.fn();
     await act(async () => root.render(<CanvasContextMenu items={items} position={{ x: 10, y: 10 }} label="Object layer options"
       targetKind="bond" onInvoke={() => {}} onDismiss={onDismiss} loadStereoReadout={async () => "Double bond: E"} />));
