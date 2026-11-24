@@ -7,6 +7,7 @@ import { desktopExportFormatDescriptors } from "../desktopExportFormats";
 import { updateExportDialogFormat } from "./ExportForm";
 import { applyNativeChainTool, createPhase4Document, selectDocumentObjects } from "../documentWorkflow";
 import { saveExportPreviewEnabled } from "../exportPreviewSettings";
+import { saveKeybindingSettings } from "../keybindingSettings";
 import { MemoryStorage } from "../testSupport/memoryStorage";
 import { DOM_COMMAND_EVENT, broadcastExportPreviewSettings } from "../window-manager";
 import type { ChemDraftAgentBridge } from "../agentBridge";
@@ -60,6 +61,8 @@ beforeEach(async () => {
   native.save.mockReset(); native.writeTextFile.mockReset();
   vi.clearAllMocks(); native.publish.mockResolvedValue(undefined); native.invoke.mockResolvedValue(null); native.events.clear();
   vi.stubGlobal("localStorage", new MemoryStorage()); vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  // Typing N on a hovered atom opens its label editor in ChemDraft's scheme; pin it rather than rely on the default.
+  saveKeybindingSettings({ scheme: "chemdraft" });
   vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
   vi.stubGlobal("MessageChannel", class {
     port1 = { onmessage: () => {}, close() {} };
