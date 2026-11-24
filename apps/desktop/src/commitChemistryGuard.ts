@@ -60,7 +60,7 @@ export type CommitChemistryPolicy =
      * template placed beside B must not take B's legacy loose "+".
      */
     readonly structureEdit?: boolean;
-    /** Molecules (by id, on any page) the operation is meant to change: `chemistryEditOf`. */
+    /** Molecules (by id, each on the first page holding it: `namedMoleculeKeys`) the operation is meant to change: `chemistryEditOf`. */
     readonly editedMoleculeIds?: readonly string[];
     /**
      * Molecules whose atoms the operation rebuilt with ids that do not name the same atoms as
@@ -211,7 +211,10 @@ const moleculesById = (page: DocumentPage | undefined) => new Map((page?.objects
  * every destination with at most one source: first pairs where the destination IS the source, then
  * pairs with the same structure and chemistry, each in document order. Nothing else pairs: a same-id
  * arrival that differs in structure or chemistry cannot be told from an unrelated molecule (drawn or
- * pasted elsewhere) and never masks a deletion. A source left unpaired has no match and so is
+ * pasted elsewhere) and never masks a deletion. That includes geometry: a move that also translates
+ * or rotates the molecule gives, by value, the very document that deleting it and drawing a same-id,
+ * same-chemistry molecule elsewhere gives, so it is reported removed (the safe side; a scoped edit
+ * naming the molecule still exempts that). A source left unpaired has no match and so is
  * reported removed (pages A and B both held "m"; only page C holds it now: one of them moved, the
  * other is gone); a destination left unpaired is an addition and matches nothing. Built lazily.
  */
@@ -352,7 +355,7 @@ export interface CommitChemistryCheck {
   independentlyMovedMarkIds?: IndependentMarkMoves;
   /** A scoped structure edit: the molecules it structurally edited may change (`structurallyEditedMoleculeKeys`). */
   structureEdit?: boolean;
-  /** Molecules (by id, on any page) the operation is meant to change. */
+  /** Molecules (by id, each on the first page holding it: `namedMoleculeKeys`) the operation is meant to change. */
   editedMoleculeIds?: readonly string[];
 }
 
@@ -381,8 +384,8 @@ export function commitChemistryRefusals(check: CommitChemistryCheck): string[] {
   // joins B into A removes B); nothing else is.
   if (check.structureEdit || check.editedMoleculeIds?.length) {
     const edited = check.structureEdit ? structurallyEditedMoleculeKeys(check.before, check.next) : new Set<string>();
-    const named = new Set(check.editedMoleculeIds ?? []);
-    changes = changes.filter((change) => !named.has(change.moleculeId) && !edited.has(moleculeKey(change.pageId, change.moleculeId)));
+    for (const key of namedMoleculeKeys(check.before, check.editedMoleculeIds)) edited.add(key);
+    changes = changes.filter((change) => !edited.has(moleculeKey(change.pageId, change.moleculeId)));
     if (changes.length === 0) return [];
   }
   const exempt = independentlyMovedMarkAtomKeys(check.before, check.next, [baseline, check.after],
@@ -395,6 +398,23 @@ export function commitChemistryRefusals(check: CommitChemistryCheck): string[] {
 
 /** A molecule on a page, as `structurallyEditedMoleculeKeys` keys it: a JSON tuple, so no id can alias another pair. */
 export const moleculeKey = (pageId: string, moleculeId: string) => JSON.stringify([pageId, moleculeId]);
+
+/**
+ * The molecules a scoped edit names (`editedMoleculeIds`), as `moleculeKey`s. Object ids are unique
+ * only within a page, so a bare id names the molecule on the FIRST page of `before` that holds it, as
+ * a patch resolves a bare object id (first occurrence wins) and as the callers find their target; a
+ * same-id molecule on any later page stays guarded. Changes are reported under the page a molecule
+ * was on before, so an edit that also moves its molecule to another page is still keyed, and exempt,
+ * under the page it left, removal included.
+ */
+function namedMoleculeKeys(before: ChemDraftDocument, moleculeIds: readonly string[] | undefined): Set<string> {
+  const keys = new Set<string>();
+  for (const id of moleculeIds ?? []) {
+    const page = before.pages.find((candidate) => candidate.objects.some((object) => object.type === "molecule" && object.id === id));
+    if (page) keys.add(moleculeKey(page.id, id));
+  }
+  return keys;
+}
 
 function sameAtomStructure(a: MoleculeAtom, b: MoleculeAtom): boolean {
   return a.element === b.element && a.isotope === b.isotope && a.x === b.x && a.y === b.y;

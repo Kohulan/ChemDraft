@@ -8,8 +8,9 @@ import { testMoleculeFromSmiles } from "@chemdraft/layout-engine/testing";
 import { moleculeLayoutLabelBoxes, transformPointForObject } from "@chemdraft/layout-engine";
 import { nativeSingleBondGraphMetadata, nativeSingleBondGraphSmiles, phase4Timestamp } from "@chemdraft/document-workflow-core";
 import { moleculeToMolfileV3000 } from "@chemdraft/chem-core";
-import { commitChemistryRefusals, moleculeAtomChemistryChanges, policyChemistryRefusals, preexistingMoleculeChemistryChanges,
-  selectionTransformChemistry } from "./commitChemistryGuard";
+import { chemistryEditOf, commitChemistryRefusals, moleculeAtomChemistryChanges, policyChemistryRefusals,
+  preexistingMoleculeChemistryChanges, selectionTransformChemistry, structureEditChemistry, structureEditorChemistry,
+  type CommitChemistryPolicy } from "./commitChemistryGuard";
 import * as workflow from "./documentWorkflow";
 import { resolveElectronMarksAfterMoleculePartMove, resolveElectronMarksInSelectionTransform } from "./electronMarkDrop";
 import { nativeStylePresetPatchForSelection } from "./nativeStylePresetCommand";
@@ -138,6 +139,89 @@ describe("A: cross-page same-id molecule match", () => {
       { ...before.pages[1], objects: [unrelated] }, before.pages[2]] };
     expect(preexistingMoleculeChemistryChanges(before, after)).toEqual([{ pageId: pageA.id, moleculeId: "m" }]);
     expect(commitChemistryRefusals({ before, next: after, after, normalize: identity, markAtoms })).toHaveLength(1);
+  });
+
+  /** `before` with m gone from page A and `arrived` on page B. */
+  const movedToB = (before: ChemDraftDocument, arrived: MoleculeObject): ChemDraftDocument => ({ ...before, pages: [
+    { ...before.pages[0], objects: before.pages[0].objects.filter(object => object.id !== "m") },
+    { ...before.pages[1], objects: [arrived] }, before.pages[2]] });
+
+  it("A (geometry) control: a cross-page move whose molecule is a deep clone at the same coordinates is a move", () => {
+    const { before, m } = threePagesWithEthane();
+    const after = movedToB(before, structuredClone(m));
+    expect(preexistingMoleculeChemistryChanges(before, after)).toEqual([]);
+    expect(commitChemistryRefusals({ before, next: after, after, normalize: identity, markAtoms })).toEqual([]);
+  });
+
+  it("A (geometry): moving m to page B and translating it is, by value, the deletion case above, so it is refused too", () => {
+    const { before, pageA, m } = threePagesWithEthane();
+    const after = movedToB(before, structuredClone({ ...m, ...translated(m, -320, -300) }));
+    // The very document that deleting m and drawing an unrelated ethane "m" at (100, 100) on B gives:
+    // the guard reads values, so no rule can accept this move and still report that deletion.
+    expect(after).toEqual(movedToB(before, ethane("m", { x: 100, y: 100 })));
+    expect(preexistingMoleculeChemistryChanges(before, after)).toEqual([{ pageId: pageA.id, moleculeId: "m" }]);
+    expect(commitChemistryRefusals({ before, next: after, after, normalize: identity, markAtoms }))
+      .toEqual([expect.stringContaining('molecule "m": it would be removed')]);
+  });
+
+  it("A (geometry): moving m to page B and rotating it (the turn baked into its atoms) is refused for the same reason", () => {
+    const { before, pageA, m } = threePagesWithEthane();
+    const pivot = m.atoms[0];
+    const turned = (atom: MoleculeAtom) => ({ ...atom, x: pivot.x - (atom.y - pivot.y), y: pivot.y + (atom.x - pivot.x) });
+    const after = movedToB(before, structuredClone({ ...m, atoms: m.atoms.map(turned) }));
+    expect(moleculeOn(after, "page_b", "m").atoms.map(atom => atom.x)).toEqual([pivot.x, pivot.x]);
+    expect(preexistingMoleculeChemistryChanges(before, after)).toEqual([{ pageId: pageA.id, moleculeId: "m" }]);
+    expect(commitChemistryRefusals({ before, next: after, after, normalize: identity, markAtoms }))
+      .toEqual([expect.stringContaining('molecule "m": it would be removed')]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// R5: commitChemistryGuard.ts:382-385 — a scoped edit exempted its molecule id on every page
+// ---------------------------------------------------------------------------------------------
+describe("R5: a scoped edit names one molecule, on one page", () => {
+  /** Pages A and B each hold their own ethane "m" (same id, same atom ids); page C starts empty. */
+  function mOnPagesAAndB() {
+    const base = electronMarkDropFixture().document;
+    const onA = ethane("m", { x: 100, y: 100 }), onB = ethane("m", { x: 300, y: 300 });
+    const before: ChemDraftDocument = { ...base, pages: [{ ...base.pages[0], id: "page_a", objects: [onA] },
+      { ...base.pages[0], id: "page_b", objects: [onB] }, { ...base.pages[0], id: "page_c", objects: [] }] };
+    return { before, onA, onB };
+  }
+  const charged = (molecule: MoleculeObject, index: number): MoleculeObject =>
+    ({ ...molecule, atoms: molecule.atoms.map((atom, at) => at === index ? { ...atom, formalCharge: 1 } : atom) });
+  const refusals = (policy: CommitChemistryPolicy, before: ChemDraftDocument, after: ChemDraftDocument) =>
+    policyChemistryRefusals(policy, { before, next: after, after, normalize: identity, markAtoms });
+
+  it.each([
+    ["chemistryEditOf", chemistryEditOf(["m"])],
+    ["structureEditorChemistry", structureEditorChemistry("m")],
+    ["structureEditChemistry", structureEditChemistry("place this template", ["m"])]
+  ] as const)("R5: %s naming \"m\" covers page A's m, never page B's", (_, policy) => {
+    const { before, onA, onB } = mOnPagesAAndB();
+    const pages = (a: MoleculeObject, b: MoleculeObject): ChemDraftDocument => ({ ...before, pages: [
+      { ...before.pages[0], objects: [a] }, { ...before.pages[1], objects: [b] }, before.pages[2]] });
+    // A bare id names the molecule on the first page that holds it, as a patch resolves a bare object id.
+    expect(refusals(policy, before, pages(charged(onA, 0), onB))).toEqual([]);
+    // A collateral change to B's m (its second atom) is refused while A's own change stays exempt.
+    expect(refusals(policy, before, pages(charged(onA, 0), charged(onB, 1))))
+      .toEqual([expect.stringContaining(`molecule "m": its atom "${onB.atoms[1].id}"`)]);
+    expect(refusals(policy, before, pages(onA, charged(onB, 1)))).toHaveLength(1);
+  });
+
+  it("R5: a named edit that also moves its molecule to another page stays exempt; B's m stays guarded", () => {
+    const { before, onA, onB } = mOnPagesAAndB();
+    // A's m takes a charge and moves, translated, to page C: reported under page A, the page it left.
+    const edited = charged(onA, 0);
+    const moved: MoleculeObject = { ...edited, ...translated(edited, 40, 0) };
+    const after = (b: MoleculeObject): ChemDraftDocument => ({ ...before, pages: [{ ...before.pages[0], objects: [] },
+      { ...before.pages[1], objects: [b] }, { ...before.pages[2], objects: [moved] }] });
+    expect(refusals(chemistryEditOf(["m"]), before, after(onB))).toEqual([]);
+    expect(refusals(chemistryEditOf(["m"]), before, after(charged(onB, 1))))
+      .toEqual([expect.stringContaining(`molecule "m": its atom "${onB.atoms[1].id}"`)]);
+    // Unnamed, the same commit is refused: m is gone from page A.
+    expect(refusals(selectionTransformChemistry("move"), before, after(onB)))
+      .toEqual([expect.stringContaining('molecule "m": it would be removed')]);
   });
 });
 
