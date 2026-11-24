@@ -3609,11 +3609,13 @@ export function MainWindow({
   const layerActions = useMemo(() => {
     // Conditions authoring requires the shared native dialog host (§12).
     const actions = createLayerActions(document, compoundLayoutsEnabled, compoundLayoutSettings)
-      .filter(action => action.id !== "arrow.conditions" || isDesktopRuntime());
+      .filter(action => action.id !== "arrow.conditions" || isDesktopRuntime())
+      .map(action => action.id === "layout.rotateMolecule" && selectedNativeMoleculePart
+        ? { ...action, enabled: false, disabledReason: "Select one whole molecule to rotate" } : action);
     const object = objectContextMenu && activePage.objects.find(object => object.id === objectContextMenu.objectId);
     return object && arrowAttachmentFrame(activePage, object) && !compoundLayoutCommandDisabledReason("arrow.conditions", compoundLayoutSettings)
       ? actions.map(action => action.id === "arrow.conditions" ? { ...action, enabled: true, disabledReason: undefined } : action) : actions;
-  }, [document, compoundLayoutsEnabled, compoundLayoutSettings, objectContextMenu, activePage]);
+  }, [document, compoundLayoutsEnabled, compoundLayoutSettings, objectContextMenu, activePage, selectedNativeMoleculePart]);
   useEffect(() => {
     if (compoundLayoutCommandDisabledReason("arrow.conditions", compoundLayoutSettings)) {
       conditionsSourcesRef.current.clear();
@@ -12264,6 +12266,58 @@ export function MainWindow({
     commitInsertionToTabWithPageFit(tabId, source, next, "Insert table", "Inserted table");
   };
 
+  const openObjectRotateInput = useCallback((objectId: string, activateSelection = false): boolean => {
+    if (activeToolState.activeKind !== "selection" && !activateSelection) {
+      return false;
+    }
+
+    const currentDocument = documentRef.current;
+    const object = findDocumentObject(currentDocument, objectId);
+    const selectedFragmentTarget = object?.type === "molecule" && selectedNativeMoleculePart?.objectId === objectId
+      ? nativeTransformableSelectionPart(selectedNativeMoleculePart)
+      : undefined;
+    const selectedFragmentBounds = object?.type === "molecule" && selectedFragmentTarget
+      ? nativeMoleculePartBounds(object, selectedFragmentTarget)
+      : undefined;
+    const canOpenRotationEntry = object && (
+      object.type !== "molecule"
+        ? documentObjectSupportsArtTransform(object, directElectronMarkEditing) && currentDocument.selection.objectIds.includes(objectId)
+        : isNativeMoleculeGraph(object) && (
+            isWholeNativeMoleculeSelected(currentDocument, objectId, selectedNativeMoleculePart) ||
+            selectedFragmentBounds !== undefined
+          )
+    );
+    if (!canOpenRotationEntry) {
+      setStatus("Select an object for rotation entry");
+      return false;
+    }
+    if (selectedFragmentTarget) {
+      setStatus("Double-click entry is available for whole molecules only");
+      return false;
+    }
+
+    const targetLabel = selectedFragmentTarget
+      ? "selected molecule fragment"
+      : object.type === "molecule" ? "selected molecule" : "selected art object";
+    const homeZDegrees = rotationInputDraftDegrees(
+      object.type === "molecule" ? nativeMoleculeTransformState(object).rotationDegrees : object.rotation
+    );
+    setObjectRotateReadout(undefined);
+    setProjectedPlaneTiltReadout(undefined);
+    updateObjectResizeInput(undefined);
+    updateRotationInput({
+      kind: "z",
+      objectId,
+      target: selectedFragmentTarget,
+      targetLabel,
+      startDocument: currentDocument,
+      draftZDegrees: homeZDegrees,
+      homeZDegrees
+    });
+    setStatus("Z rotation entry");
+    return true;
+  }, [directElectronMarkEditing, activeToolState.activeKind, selectedNativeMoleculePart, updateObjectResizeInput, updateRotationInput]);
+
   const coreCommandBindingsRef = useRef<Map<string, { spec: CommandSpec; run: () => Promise<void> }>>(
     new Map()
   );
@@ -12962,6 +13016,19 @@ export function MainWindow({
           return;
         }
 
+        if (action.id === "layout.rotateMolecule") {
+          const current = documentRef.current;
+          const objectId = current.selection.objectIds[0];
+          const object = objectId ? findDocumentObject(current, objectId) : undefined;
+          if (current.selection.objectIds.length !== 1 || object?.type !== "molecule" ||
+            !isNativeMoleculeGraph(object) || selectedNativeMoleculePart) {
+            setStatus("Select one whole molecule to rotate");
+            return;
+          }
+          if (!rotationInputRef.current) openObjectRotateInput(object.id, true);
+          return;
+        }
+
         if (action.id === "layout.rotate90") {
           commitSelectionTransform(rotateSelectedDocumentObjects90, "No selected object", "turn");
           return;
@@ -13380,6 +13447,7 @@ export function MainWindow({
     document,
     flashArtPaintTargetControls,
     layerActions,
+    openObjectRotateInput,
     compoundLayoutsEnabled,
     nativePalette,
     openExportDialog,
@@ -18194,10 +18262,12 @@ export function MainWindow({
       return false;
     }
 
+    const rotatedType = findDocumentObject(session.startDocument, session.objectId)?.type;
+    const rotateLabel = rotatedType === "electron-mark" ? "Rotate electron mark" : rotatedType === "molecule" ? "Rotate molecule" : "Rotate art object";
     const changed = !session.rotationRefusal &&
-      commitLiveInputPreview(session.startDocument, findDocumentObject(session.startDocument, session.objectId)?.type === "electron-mark" ? "Rotate electron mark" : undefined);
-    if (changed && findDocumentObject(session.startDocument, session.objectId)?.type !== "molecule") {
-      documentUndoLabelsRef.current.set(documentHistoryRef.current.present, findDocumentObject(session.startDocument, session.objectId)?.type === "electron-mark" ? "Rotate electron mark" : "Rotate art object");
+      commitLiveInputPreview(session.startDocument, rotatedType === "electron-mark" ? "Rotate electron mark" : undefined);
+    if (changed) {
+      documentUndoLabelsRef.current.set(documentHistoryRef.current.present, rotateLabel);
     }
     updateRotationInput(undefined);
     setObjectRotateReadout(undefined);
@@ -21199,57 +21269,7 @@ export function MainWindow({
     return isDouble;
   }
 
-  const openObjectRotateInput = useCallback((objectId: string): boolean => {
-    if (activeToolState.activeKind !== "selection") {
-      return false;
-    }
 
-    const currentDocument = documentRef.current;
-    const object = findDocumentObject(currentDocument, objectId);
-    const selectedFragmentTarget = object?.type === "molecule" && selectedNativeMoleculePart?.objectId === objectId
-      ? nativeTransformableSelectionPart(selectedNativeMoleculePart)
-      : undefined;
-    const selectedFragmentBounds = object?.type === "molecule" && selectedFragmentTarget
-      ? nativeMoleculePartBounds(object, selectedFragmentTarget)
-      : undefined;
-    const canOpenRotationEntry = object && (
-      object.type !== "molecule"
-        ? documentObjectSupportsArtTransform(object, directElectronMarkEditing) && currentDocument.selection.objectIds.includes(objectId)
-        : isNativeMoleculeGraph(object) && (
-            isWholeNativeMoleculeSelected(currentDocument, objectId, selectedNativeMoleculePart) ||
-            selectedFragmentBounds !== undefined
-          )
-    );
-    if (!canOpenRotationEntry) {
-      setStatus("Select an object for rotation entry");
-      return false;
-    }
-    if (selectedFragmentTarget) {
-      setStatus("Double-click entry is available for whole molecules only");
-      return false;
-    }
-
-    const targetLabel = selectedFragmentTarget
-      ? "selected molecule fragment"
-      : object.type === "molecule" ? "selected molecule" : "selected art object";
-    const homeZDegrees = rotationInputDraftDegrees(
-      object.type === "molecule" ? nativeMoleculeTransformState(object).rotationDegrees : object.rotation
-    );
-    setObjectRotateReadout(undefined);
-    setProjectedPlaneTiltReadout(undefined);
-    updateObjectResizeInput(undefined);
-    updateRotationInput({
-      kind: "z",
-      objectId,
-      target: selectedFragmentTarget,
-      targetLabel,
-      startDocument: currentDocument,
-      draftZDegrees: homeZDegrees,
-      homeZDegrees
-    });
-    setStatus("Z rotation entry");
-    return true;
-  }, [directElectronMarkEditing, activeToolState.activeKind, selectedNativeMoleculePart, updateObjectResizeInput, updateRotationInput]);
 
   const selectMoleculePartThroughTransformHandle = useCallback((object: MoleculeObject, event: PointerEvent<HTMLButtonElement>): boolean => {
     if (event.button !== 0 || activeToolState.activeKind !== "selection" || selectionModeFromEvent(event, {
@@ -24414,6 +24434,8 @@ export function MainWindow({
         }} /> : null}
       {objectContextMenu ? (
         <ObjectLayerContextMenu
+          rotateMoleculeAction={objectContextMenu.targetKind === "object" && selectedNativeMoleculeParts.length === 0
+            ? layerActions.find(action => action.id === "layout.rotateMolecule") : undefined}
           bracketActions={findDocumentObject(document, objectContextMenu.objectId)?.type === "bracket" ? bracketActions
             : selectedNativeMoleculeParts.some(part => part.objectId === objectContextMenu.objectId)
               ? bracketActions.filter(action => action.id === "bracket.repeatUnit.toggle") : []}
@@ -26544,6 +26566,7 @@ function isLayerCommandId(commandId: string): boolean {
     commandId === distributeModeCommandIds.spacing ||
     commandId === "layout.flipHorizontal" ||
     commandId === "layout.flipVertical" ||
+    commandId === "layout.rotateMolecule" ||
     commandId === "layout.rotate90" ||
     commandId === "layout.duplicate" ||
     commandId === "layout.group" ||
@@ -27611,6 +27634,7 @@ function ArtStyleQaLayer({
 }
 
 export function ObjectLayerContextMenu(props: {
+  rotateMoleculeAction?: CommandSpec;
   arrowActions?: readonly CommandSpec[];
   layoutActions?: readonly CommandSpec[];
   tableActions?: readonly CommandSpec[];

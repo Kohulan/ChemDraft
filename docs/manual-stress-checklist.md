@@ -1,5 +1,10 @@
 # Manual stress checklist
 
+Molecule angle entry: select one whole native molecule, right-click, choose Rotate molecule, and
+enter positive/negative/fractional angles and a full 360 degrees. Accept/cancel and Undo/Redo must
+preserve charge, isotopes, stereochemistry, bond lengths and internal angles. Partial selections
+must not offer whole-molecule rotation. Check native menus and input focus on Windows and both macOS builds.
+
 The standing hands-on checklist for interactive surfaces. It moved here from `AGENTS.md` §20 when that
 file was consolidated (2026-10-04); `AGENTS.md` §14 still requires it. Run every item on **macOS and
 Windows** unless the item names one platform. `docs/windows-port-stress-test.md` records the Windows

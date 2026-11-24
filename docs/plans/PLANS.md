@@ -8,6 +8,14 @@ in progress rather than a changelog.
 
 # In flight
 
+## Molecule angle entry (`resubmit/molecule-rotation`)
+
+Adapt the requested numeric context-menu option from #183 to current main's shared canvas-menu
+model and current rigid rotation engine. Offer Rotate Molecule only for a whole native molecule;
+reuse angle entry, preview, cancel and Undo/Redo. Keep current pointer rotation and Shift/tilt
+behavior. Cover both platform settings, arbitrary angles, isotope/charge/stereo and geometry.
+Native Windows and both macOS builds remain unverified.
+
 # ChemDraft Assistant plugin (active, branches claude/assistant-*)
 
 ## Objective
