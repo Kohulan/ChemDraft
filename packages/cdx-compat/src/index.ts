@@ -53,6 +53,7 @@ import { planMoleculeAtomLabels } from "@chemdraft/layout-engine";
 import { atomDerivedHydrogenCount, nativeBondOrderResolution, nativeElementFromAtomLabel } from "@chemdraft/layout-engine";
 import { sha256Hex, utf8Bytes, utf8String } from "./sha256";
 import { PROPS } from "./cdxTags";
+import { cdxmlLimits } from "./cdxmlLimits";
 import { equalPrintMargins, fitPageSetup, importPageSetup, pagePrintMargins, type VisiblePageSetup } from "./pageSetup";
 import {
   CDX_NATIVE_ENVELOPE_ATTRIBUTE,
@@ -323,7 +324,10 @@ interface IdAllocator {
 }
 
 // Entries retain source indices (including duplicate colors); new colors append in first-use order.
-type ExportColorTable = string[];
+// The table holds at most `cdxmlLimits.colorTable` entries (indices 2..65535, 16-bit): a color that
+// would need a later index is not added but recorded in `unplaced`, written without its own color,
+// and reported once per export (cdxml.color_table_full).
+type ExportColorTable = string[] & { unplaced?: Set<string> };
 
 interface VisibleExportContext {
   page: DocumentPage;
@@ -350,53 +354,124 @@ interface UnknownObjectExportDiagnostics {
 interface CdxmlColorTable {
   warnings: CompatibilityConversionWarning[];
   colorByIndex: Map<number, string>;
+  /** Import only: the document-wide budget of whole-table copies stored on texts and graphics. */
+  /** `partial`: some object past the budget stored only the colors it uses (see attachDocumentColorTable). */
+  copies?: { entries: number; shared?: Readonly<Record<string, string>>; partial?: boolean };
 }
 
 /**
- * Import caps for the font table and for one caption's runs. CDX font ids and styled-text run
- * offsets are 16-bit (export writes no font id at or above 65535), so nothing ChemDraw writes
- * exceeds these; a crafted file that does is cut to the cap with a warning rather than hanging the
- * import (AGENTS.md §13).
+ * Import cap on one font entry. Every caption keeps the fonts its runs name (and its own style
+ * names its font again), so an unbounded font name was copied into every caption's saved state:
+ * a 331 KB crafted file of 4,000 captions over one long name saved ~48.7 MB of native JSON
+ * (Codex security finding). Real font names are short (a Windows face name fits in 32 characters,
+ * LF_FACESIZE), so 256 characters is far above any real font yet keeps each caption's copy small.
+ * The whole entry (id, charset, name and any other attribute, keys included) is capped too, since
+ * the entry is what each caption stores. A font over either cap is
+ * not used: text set in it keeps the default font, with one warning naming the font ids. A name is
+ * never truncated, which would silently set the text in a different font.
  */
-const CDXML_FONT_TABLE_LIMIT = 65_535;
-const CDXML_CAPTION_RUN_LIMIT = 65_535;
-/**
- * Document-wide cap on the caption runs whose fonts are resolved on import and on export (2^18).
- * The per-caption cap alone still let a crafted file stack thousands of capped captions. Real
- * documents stay far below it: the largest local CDXML documents (up to ~1 MB) hold under 1,000
- * styled runs in total, so this is over 250 times that and four maximal captions' worth. Captions
- * past it keep their text and run styles as plain styled text, with one warning.
- */
-const CDXML_DOCUMENT_CAPTION_RUN_LIMIT = 262_144;
-/**
- * Every imported caption carries the font table its runs were written against, so a later save
- * can rebuild the CDXML font table. Saving a copy of the whole table on every caption is
- * quadratic in a crafted file's size (1,000 captions over 1,000 fonts, 160 KB, saved as a 70 MB
- * payload), so after the first caption the whole table is shared only while the copies total at
- * most this many entries (2^14); later captions keep just the fonts their own runs name. Real
- * documents (at most a few fonts across a few hundred captions) stay far below it, so what they
- * save is unchanged.
- */
-const CDXML_TEXT_FONT_TABLE_COPY_LIMIT = 16_384;
+const CDXML_FONT_NAME_LIMIT = 256;
+const CDXML_FONT_ENTRY_LIMIT = 512;
 
 /** The imported font table, indexed by id (the first entry wins, as a linear search did). */
 interface CdxmlImportFonts {
   table: readonly CdxmlFont[];
   byId: ReadonlyMap<string | undefined, CdxmlFont>;
   /** Document-wide budgets, shared by every page's import. */
-  usage: { captionRuns: number; captionRunLimitReached: boolean; fontTableEntries: number };
+  usage: { captionRuns: number; captionRunLimitReached: boolean; fontTableEntries: number; fontTableChars: number };
+  /** Characters in `table` (keys and values), what one shared copy adds to the budget. */
+  tableChars: number;
+  /** Ids of fonts left out for being over the per-font caps (a text naming one is marked). */
+  omittedIds: ReadonlySet<string>;
+}
+
+function cdxmlFontEntryChars(font: Readonly<Record<string, unknown>>): number {
+  let chars = 0;
+  for (const [key, value] of Object.entries(font)) chars += key.length + String(value).length;
+  return chars;
+}
+
+/** Over either per-font cap (CDXML_FONT_NAME_LIMIT, CDXML_FONT_ENTRY_LIMIT): the font is not used. */
+function cdxmlFontEntryTooLong(font: Readonly<Record<string, unknown>>, chars = cdxmlFontEntryChars(font)): boolean {
+  return String(font.name ?? "").length > CDXML_FONT_NAME_LIMIT || chars > CDXML_FONT_ENTRY_LIMIT;
+}
+
+/** A font id as a warning names it: an oversized entry's id may itself be long, so only a short number is quoted. */
+function cdxmlFontIdLabel(id: unknown): string {
+  return id === undefined ? "<unnamed>" : typeof id === "string" && /^\d{1,10}$/.test(id) ? id : "<invalid id>";
+}
+
+/**
+ * A saved native payload's text font tables (cdxmlTextFontTable) are not read by CDXML import, so a
+ * crafted or damaged document could carry a font no import would accept. Opening it drops such
+ * entries, under the same per-font caps and with the same one warning; the text itself (its style
+ * and runs) is untouched, and export applies the caps again (exportCdxmlFonts).
+ */
+function limitStoredCdxmlFontTables(document: ChemDraftDocument): CompatibilityConversionWarning[] {
+  const labels: string[] = [];
+  const seen = new Set<string>();
+  for (const page of document.pages) {
+    let changed = false;
+    const objects = page.objects.map(object => {
+      const unknown = object.compatibility?.unknown;
+      const table = unknown?.cdxmlTextFontTable;
+      if (!unknown || !Array.isArray(table) || !table.some(entry => isRecord(entry) && cdxmlFontEntryTooLong(entry))) return object;
+      changed = true;
+      const kept = table.filter(entry => {
+        if (!isRecord(entry) || !cdxmlFontEntryTooLong(entry)) return true;
+        const label = cdxmlFontIdLabel(entry.id);
+        if (!seen.has(label)) { seen.add(label); labels.push(label); }
+        return false;
+      });
+      return { ...object, compatibility: { ...object.compatibility!, unknown: { ...unknown, cdxmlTextFontTable: kept } } };
+    });
+    if (changed) page.objects = objects;
+  }
+  return labels.length ? [cdxmlFontEntryTooLongWarning("ChemDraft document", "font ", labels,
+    "dropped from the text font tables stored in this document, and saving to CDXML or CDX does not write {it}.")] : [];
+}
+
+/**
+ * The one cdxml.font_entry_too_long warning of an import, open or export. It names fonts by id (or
+ * by the text that uses them), never by the name itself.
+ */
+function cdxmlFontEntryTooLongWarning(prefix: string, noun: string, labels: readonly string[], outcome: string): CompatibilityConversionWarning {
+  const named = labels.slice(0, 10).join(", ") + (labels.length > 10 ? ` and ${labels.length - 10} more` : "");
+  const one = labels.length === 1;
+  return warning("cdxml.font_entry_too_long", `${prefix}: ${noun}${named} ` +
+    `${one ? "has" : "have"} a name longer than ${CDXML_FONT_NAME_LIMIT} characters, or more than ` +
+    `${CDXML_FONT_ENTRY_LIMIT} characters of font attributes, far beyond any real font; ` +
+    `${one ? "it was" : "they were"} ${outcome.split("{it}").join(one ? "it" : "them")}`);
 }
 
 function importCdxmlFonts(tree: OrderedXmlTree, sourceFormat: string, warnings: CompatibilityConversionWarning[]): CdxmlImportFonts {
   const listed = findElements(tree, "fonttable").flatMap(table => childElements(table, "font").map(font => font.attributes));
-  if (listed.length > CDXML_FONT_TABLE_LIMIT) {
+  if (listed.length > cdxmlLimits.fontTable) {
     warnings.push(warning("cdxml.font_table_truncated", `${sourceFormat} import: the font table lists ${listed.length} fonts, ` +
-      `more than the ${CDXML_FONT_TABLE_LIMIT} supported; only the first ${CDXML_FONT_TABLE_LIMIT} were imported, ` +
+      `more than the ${cdxmlLimits.fontTable} supported; only the first ${cdxmlLimits.fontTable} were imported, ` +
       "and text set in a later font keeps the default font."));
   }
-  const table = trackCdxmlFontTable(listed.slice(0, CDXML_FONT_TABLE_LIMIT));
-  return { table, byId: indexCdxmlFonts(table, font => font.id),
-    usage: { captionRuns: 0, captionRunLimitReached: false, fontTableEntries: 0 } };
+  const usable: CdxmlFont[] = [];
+  const oversized: string[] = [];
+  const omittedIds = new Set<string>();
+  let tableChars = 0;
+  for (const font of listed.slice(0, cdxmlLimits.fontTable)) {
+    const chars = cdxmlFontEntryChars(font);
+    if (cdxmlFontEntryTooLong(font, chars)) {
+      oversized.push(cdxmlFontIdLabel(font.id));
+      if (font.id !== undefined) omittedIds.add(font.id);
+      continue;
+    }
+    tableChars += chars;
+    usable.push(font);
+  }
+  if (oversized.length) {
+    warnings.push(cdxmlFontEntryTooLongWarning(`${sourceFormat} import`, "font ", oversized,
+      "not used, and text set in {it} keeps the default font."));
+  }
+  const table = trackCdxmlFontTable(usable);
+  return { table, byId: indexCdxmlFonts(table, font => font.id), tableChars, omittedIds,
+    usage: { captionRuns: 0, captionRunLimitReached: false, fontTableEntries: 0, fontTableChars: 0 } };
 }
 
 /** The fonts a CDXML export writes, indexed by name (the first entry wins, as a linear search did). */
@@ -410,6 +485,12 @@ interface CdxmlExportFonts {
   plainCaptionIds: ReadonlySet<string>;
   /** Set once the export has reported the cap (one warning per document). */
   captionRunLimitWarned: boolean;
+  /**
+   * Stored font ids over the per-font caps, which the font table does not write. An unchanged
+   * source text naming one (or marked cdxmlTextFontOmitted on import) is not copied back out, which
+   * would leave its runs naming a font the file does not list; it is written as plain styled text.
+   */
+  notWrittenIds: ReadonlySet<string>;
 }
 
 interface CdxmlCrossingImportHint {
@@ -490,12 +571,27 @@ function exportCdxml(
   const nativePayloadHash = sha256Utf8Hex(nativeJson);
   const fonts = exportCdxmlFonts(parsedDocument, warnings);
   // Source compatibility graphics retain their color indices as well as their other attributes.
-  const colors: string[] = [...standardCdxmlColorTable];
+  const colors: ExportColorTable = [...standardCdxmlColorTable];
   const sourceColors = new Map<number, string>();
+  // The document's one whole copy (attachDocumentColorTable) goes first, so the objects' own tables
+  // still decide any index they disagree on, as they did before it existed.
+  let sourceTableSize = 0;
+  for (const page of parsedDocument.pages) {
+    const unknown = page.compatibility?.unknown;
+    if (Number.isSafeInteger(unknown?.cdxmlColorTableSize)) sourceTableSize = Math.max(sourceTableSize, Math.min(unknown!.cdxmlColorTableSize as number, cdxmlLimits.colorTable));
+    const table = unknown?.cdxmlColorTable;
+    if (isRecord(table)) for (const [index, color] of Object.entries(table)) {
+      if (/^\d+$/.test(index) && Number(index) >= 2 && Number(index) < cdxmlLimits.colorTable + 2 && typeof color === "string" && normalizeHexColor(color)) {
+        sourceColors.set(Number(index), color);
+        while (colors.length <= Number(index) - 2) colors.push("#000000");
+        colors[Number(index) - 2] = color;
+      }
+    }
+  }
   for (const page of parsedDocument.pages) for (const object of page.objects) {
     const table = object.compatibility?.unknown.cdxmlGraphicColorTable ?? object.compatibility?.unknown.cdxmlTextColorTable;
     if (isRecord(table)) for (const [index, color] of Object.entries(table)) {
-      if (/^\d+$/.test(index) && Number(index) >= 2 && Number(index) < 65536 && typeof color === "string" && normalizeHexColor(color)) {
+      if (/^\d+$/.test(index) && Number(index) >= 2 && Number(index) < cdxmlLimits.colorTable + 2 && typeof color === "string" && normalizeHexColor(color)) {
         const previous = sourceColors.get(Number(index));
         if (previous && previous !== color) warnings.push({ code: object.type === "text" ? "cdxml.text_color_table_conflict" : "cdxml.graphic_color_table_conflict", sourceObjectId: object.id,
           message: `Source ${object.type === "text" ? "text" : "graphic"} color index ${index} refers to different colors in this document; its attribute is retained, but the shared CDXML color table uses ${color}.` });
@@ -505,7 +601,17 @@ function exportCdxml(
       }
     }
   }
-  for (const color of standardCdxmlColorTable) if (!colors.includes(color)) colors.push(color);
+  // The page that stored the whole source table is gone and no object holds the entries it alone had.
+  if (sourceTableSize) {
+    const missing: number[] = [];
+    for (let index = 2; index < sourceTableSize + 2; index++) if (!sourceColors.has(index)) missing.push(index);
+    if (missing.length) warnings.push(warning("cdxml.color_table_entries_not_kept", `${format.toUpperCase()} export: ` +
+      `${missing.length} of the ${sourceTableSize} colors in the source file's color table (${missing.length === 1 ? "index" : "indices"} ` +
+      `${missing.slice(0, 10).join(", ")}${missing.length > 10 ? ` and ${missing.length - 10} more` : ""}) are used by nothing left in the document, ` +
+      "and the page that kept the whole table was deleted; they are not written, and the table holds black in their place where later colors follow."));
+  }
+  // The standard colors fill free entries only: a source table at the 16-bit limit stays within it.
+  for (const color of standardCdxmlColorTable) if (colors.length < cdxmlLimits.colorTable && !colors.includes(color)) colors.push(color);
   // Source reaction lists use document-wide ids. Reserve them before allocating any new ids,
   // including atom/bond ids carried by opaque atom-mapping attributes.
   // Retained source atom/bond ids (a lone pair's atom reference, say) are document-wide too: a
@@ -559,6 +665,7 @@ function exportCdxml(
     }
     return fitted;
   });
+  if (colors.unplaced?.size) warnings.push(cdxmlColorTableFullWarning(colors.unplaced, format, embedNativePayload));
   const droppedIds = unknownObjects.droppedOriginalIds;
   if (droppedIds.length) {
     const uniqueIds = [...new Set(droppedIds)];
@@ -571,6 +678,16 @@ function exportCdxml(
   }
   const embedded = embedNativePayload;
   const rootPageSetup = { ...fittedPages[0]?.setup.rootAttributes };
+  // The first page is now one that stored only its grid attributes (past the import's copy budget):
+  // the pages that stored the whole root setup were deleted or moved after it.
+  const omittedRootSetup = parsedDocument.pages[0]?.compatibility?.unknown.cdxmlRootPageAttributesOmitted;
+  if (Array.isArray(omittedRootSetup) && omittedRootSetup.length) {
+    const names = omittedRootSetup.filter((name): name is string => typeof name === "string" && /^[A-Za-z]{1,32}$/.test(name)).slice(0, 16);
+    warnings.push({ code: "cdxml.page_setup_not_kept", sourceObjectId: parsedDocument.pages[0].id,
+      message: `${format.toUpperCase()} export: the source file's document page settings${names.length ? ` (${names.join(", ")})` : ""} ` +
+        `were stored only with its first pages, since a copy on every page would have exceeded ${cdxmlLimits.rootPageAttributeCopyChars} ` +
+        `characters, and page ${parsedDocument.pages[0].id} is now the first page; they are not written.` });
+  }
   if (fittedPages.some(({ setup }) => setup.attributes.WidthPages !== undefined || setup.attributes.HeightPages !== undefined
       || setup.attributes.PrintMargins !== undefined
       || setup.rootAttributes.WidthPages !== undefined || setup.rootAttributes.HeightPages !== undefined)
@@ -775,6 +892,7 @@ export function openChemDraftPayload(contents: string, sourceFormat: "CDXML" | "
     };
   }
   const embeddedDocument = nativeRead.document;
+  const storedFontWarnings = limitStoredCdxmlFontTables(embeddedDocument);
   const nativeVersions = nativeRead.formatVersion !== undefined || embeddedDocument.minAppVersion !== undefined
     ? { nativeDocumentVersions: { formatVersion: nativeRead.formatVersion, minAppVersion: nativeRead.minAppVersion } }
     : {};
@@ -809,7 +927,8 @@ export function openChemDraftPayload(contents: string, sourceFormat: "CDXML" | "
           `The visible ${sourceFormat} layer was modified outside ChemDraft; choose whether to trust the embedded native payload or import the edited visible subset.`
         ),
         ...visibleImport.warnings,
-        ...nativeRead.warnings
+        ...nativeRead.warnings,
+        ...storedFontWarnings
       ],
       conflict: {
         kind: "visible-layer-modified",
@@ -822,7 +941,7 @@ export function openChemDraftPayload(contents: string, sourceFormat: "CDXML" | "
   return {
     document: embeddedDocument,
     source: "native-payload",
-    warnings: [...nativeRead.warnings, ...embeddedDocument.compatibility.warnings
+    warnings: [...nativeRead.warnings, ...storedFontWarnings, ...embeddedDocument.compatibility.warnings
       .filter(item => item.code === "document.bracket_partner_missing")
       .map(item => ({ code: item.code, message: item.message, sourceObjectId: item.objectId }))],
     ...nativeVersions
@@ -890,10 +1009,11 @@ export function decodeBase64UrlUtf8(value: string): string {
 function openLegacyJsonDocument(contents: string): ChemDraftOpenResult {
   try {
     const nativeRead = readSerializedDocument(contents);
+    const storedFontWarnings = limitStoredCdxmlFontTables(nativeRead.document);
     return {
       document: nativeRead.document,
       source: "legacy-json",
-      warnings: [...nativeRead.warnings, ...nativeRead.document.compatibility.warnings
+      warnings: [...nativeRead.warnings, ...storedFontWarnings, ...nativeRead.document.compatibility.warnings
         .filter(item => item.code === "document.bracket_partner_missing")
         .map(item => ({ code: item.code, message: item.message, sourceObjectId: item.objectId }))],
       ...(nativeRead.formatVersion !== undefined || nativeRead.document.minAppVersion !== undefined
@@ -935,13 +1055,23 @@ function unsupportedSchemaWarningFromJson(contents: string): CompatibilityConver
 // this right after a file opens, and a crafted 1.5 MB file cost ~400 million comparisons).
 function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityConversionWarning[]): CdxmlExportFonts {
   const fonts = new Map<string, CdxmlFont>();
+  // A stored font over the per-font caps (a native payload's table is not checked by import) is not
+  // written, and its id stays reserved so that no new font takes it. An unchanged source text that
+  // names it is written as plain styled text (exportTextObject), never copied back out naming a font
+  // the file does not list. One warning names every font not written.
+  const tooLong: string[] = [];
+  const tooLongIds = new Set<string>();
   for (const page of document.pages) for (const object of page.objects) {
     const source = object.compatibility?.unknown.cdxmlTextFontTable;
     if (!Array.isArray(source)) continue;
     countCdxmlFontEntries(source.length);
     for (const entry of source) {
       const font = preservedCurveAttributes(entry);
-      if (!/^\d+$/.test(font.id ?? "") || Number(font.id) >= 65535) continue;
+      if (!/^\d+$/.test(font.id ?? "") || Number(font.id) >= cdxmlLimits.fontId) continue;
+      if (cdxmlFontEntryTooLong(font)) {
+        if (!tooLongIds.has(font.id)) { tooLongIds.add(font.id); tooLong.push(`font ${font.id}`); }
+        continue;
+      }
       const previous = fonts.get(font.id);
       if (previous && (previous.name !== font.name || previous.charset !== font.charset)) {
         warnings.push({ code: "cdxml.text_font_table_conflict", sourceObjectId: object.id,
@@ -950,9 +1080,14 @@ function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityCo
       fonts.set(font.id, font);
     }
   }
+  // A text whose source runs named a font import left out (over the caps) has no font to write for
+  // them; it is written as plain styled text, reported in the one warning below.
+  for (const page of document.pages) for (const object of page.objects) {
+    if (object.type === "text" && object.compatibility?.unknown.cdxmlTextFontOmitted === true) tooLong.push(`the source font of text ${object.id}`);
+  }
   const byName = indexCdxmlFonts<string | undefined>(fonts.values(), font => font.name);
   const plainCaptionIds = new Set<string>();
-  let nextId = 1, captionRuns = 0, captionRunLimitReached = false;
+  let nextId = 1, captionRuns = 0, captionRunLimitReached = false, tableFullWarned = false;
   for (const page of document.pages) for (const object of page.objects) {
     let names: unknown[] = [];
     if (object.type === "table") names = [nativeTextStyleFromObjectStyle(object.style).fontFamily];
@@ -962,7 +1097,7 @@ function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityCo
     } else if (object.type === "text" && object.compatibility?.unknown.sourceCdxmlAttributes) {
       const spans = textObjectSpansForRendering(object);
       // Past the document-wide cap a caption is written as plain styled text (exportTextObject).
-      if (captionRunLimitReached || captionRuns + spans.length > CDXML_DOCUMENT_CAPTION_RUN_LIMIT) {
+      if (captionRunLimitReached || captionRuns + spans.length > cdxmlLimits.documentCaptionRuns) {
         captionRunLimitReached = true;
         plainCaptionIds.add(object.id);
         continue;
@@ -970,16 +1105,38 @@ function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityCo
       captionRuns += spans.length;
       names = spans.map(span => span.style.fontFamily ?? object.style.fontFamily);
     }
+    let nameTooLong = false;
     for (const name of names) {
       if (typeof name !== "string" || !name || lookupCdxmlFont(byName, name)) continue;
-      while (fonts.has(String(nextId))) nextId++;
+      // Not registered: a caption set in it is written as plain styled text, a table in the default font.
+      if (name.length > CDXML_FONT_NAME_LIMIT) {
+        if (!nameTooLong) { nameTooLong = true; tooLong.push(`the font of ${object.type} ${object.id}`); }
+        continue;
+      }
+      while (nextId < cdxmlLimits.fontId && (fonts.has(String(nextId)) || tooLongIds.has(String(nextId)))) nextId++;
+      // No supported id left: the font is not registered, so a caption set in it is written as
+      // plain styled text (exportTextObject's fallback, with its own warning) and a table falls
+      // back to the default font. Writing an id past the limit would lose the font on reopen.
+      if (nextId >= cdxmlLimits.fontId || fonts.size >= cdxmlLimits.fontTable) {
+        if (!tableFullWarned) {
+          tableFullWarned = true;
+          warnings.push({ code: "cdxml.font_table_full", sourceObjectId: object.id,
+            message: `CDXML export: the font table is full (font ids below ${cdxmlLimits.fontId}); from ${object.type} ${object.id} on, ` +
+              "fonts not already in it were not written, and text set in them was written without its caption frame and run fonts, or in the default font." });
+        }
+        continue;
+      }
       const id = String(nextId++);
       const font = { id, charset: "iso-8859-1", name };
       fonts.set(id, font);
       byName.set(name, font);
     }
   }
-  return { table: trackCdxmlFontTable([...fonts.values()]), byName, plainCaptionIds, captionRunLimitWarned: false };
+  if (tooLong.length) {
+    warnings.push(cdxmlFontEntryTooLongWarning("CDXML export", "", tooLong,
+      "not written, and text set in {it} was written without its caption frame and run fonts, or in the default font."));
+  }
+  return { table: trackCdxmlFontTable([...fonts.values()]), byName, plainCaptionIds, captionRunLimitWarned: false, notWrittenIds: tooLongIds };
 }
 
 function buildCdxmlEnvelope(creationProgram: string, pages: readonly string[], fonts: readonly CdxmlFont[], colors: ExportColorTable, embedded = true, pageSetup: Record<string, string> = {}): string {
@@ -2396,21 +2553,25 @@ function exportTextObject(text: TextObject, context: VisibleExportContext, alloc
     if (!fonts.captionRunLimitWarned) {
       fonts.captionRunLimitWarned = true;
       warnings.push({ code: "cdxml.document_caption_runs_limited", sourceObjectId: text.id,
-        message: `${format} export: the captions in this document have more than ${CDXML_DOCUMENT_CAPTION_RUN_LIMIT} styled runs ` +
+        message: `${format} export: the captions in this document have more than ${cdxmlLimits.documentCaptionRuns} styled runs ` +
           `in total; from text ${text.id} on, captions past that total were written as plain styled text, without their caption frame and run fonts.` });
     }
     return undefined;
   };
   const plainCaption = fonts.plainCaptionIds.has(text.id);
+  // Its source runs name a font that is not written (exportCdxmlFonts reports it once).
+  let fontNotWritten = text.compatibility?.unknown.cdxmlTextFontOmitted === true;
   if (typeof source === "string") {
     // A caption past the cap skips the unchanged-source copy too, which would write its frame and run fonts.
-    if (!plainCaption && text.compatibility?.unknown.cdxmlTextNativeState === textSourceState(text)) {
+    if (!plainCaption && !fontNotWritten && text.compatibility?.unknown.cdxmlTextNativeState === textSourceState(text)) {
       // Reparse our serialized source rather than injecting compatibility data as unchecked XML.
       try {
         const tree = parseCdxml(source);
         const node = tree.find(node => elementView(node)?.name === "t");
         const element = node && elementView(node);
-        if (node && element) {
+        fontNotWritten = fonts.notWrittenIds.size > 0 && Boolean(element) &&
+          findElements([node!], "s").some(run => run.attributes.font !== undefined && fonts.notWrittenIds.has(run.attributes.font));
+        if (node && element && !fontNotWritten) {
           node[":@"] = { ...element.attributes, id: textId };
           const point = pointMetadata(text.compatibility?.unknown.cdxmlTextFrameOrigin) ?? parseCdxmlPoint(element.attributes.p);
           const dx = cssPxToCdxml(text.x - point.x), dy = cssPxToCdxml(text.y - point.y);
@@ -2426,8 +2587,8 @@ function exportTextObject(text: TextObject, context: VisibleExportContext, alloc
     }
     const edited = framedCaption();
     if (edited) return edited;
-    // The document's one cap warning already says why a capped caption lost its source formatting.
-    if (!plainCaption) warnings.push({ code: "cdxml.text_source_formatting_not_kept", sourceObjectId: text.id,
+    // The document's one cap warning (or font warning) already says why this caption lost its source formatting.
+    if (!plainCaption && !fontNotWritten) warnings.push({ code: "cdxml.text_source_formatting_not_kept", sourceObjectId: text.id,
       message: `Text ${text.id} (source ${text.compatibility?.originalId ?? "<unnamed>"}) was edited or its source text is unavailable; source formatting was not kept. The current native text is written.` });
   }
   if (typeof source !== "string") {
@@ -3041,8 +3202,11 @@ function storedArcForCdxml(graphic: GraphicObject, warnings: CompatibilityConver
   if (d.arcCenter === undefined && d.arcRadiusX === undefined && d.arcRadiusY === undefined) return undefined;
   const finite = (v: unknown) => typeof v === "number" && Number.isFinite(v) ? v : undefined;
   const center = pointMetadata(d.arcCenter) ?? objectCenter(graphic);
-  const rx = Math.max(finite(d.arcRadiusX) ?? graphic.width / 2 - 4, 1);
-  const ry = Math.max(finite(d.arcRadiusY) ?? graphic.height / 2 - 4, 1);
+  // A valid stored radius (the reader keeps any positive one) is written as stored, the same as the
+  // exact writer; only a missing or invalid radius takes the frame-based fallback and its minimum.
+  const radius = (v: unknown) => { const r = finite(v); return r !== undefined && r > 0 ? r : undefined; };
+  const rx = radius(d.arcRadiusX) ?? Math.max(graphic.width / 2 - 4, 1);
+  const ry = radius(d.arcRadiusY) ?? Math.max(graphic.height / 2 - 4, 1);
   // A valid stored sweep (the reader accepts 0 < |sweep| <= 360 degrees) is written as stored, the
   // same as the exact writer; only a missing or out-of-range sweep takes the legacy clamp.
   const storedSweep = finite(d.arcSweepRadians);
@@ -3150,7 +3314,8 @@ function exportGraphicAsCdxmlCurve(
   if (colorIndex !== undefined) attributes.color = String(colorIndex);
   else {
     delete attributes.color;
-    warnings.push({ code: "cdxml.graphic_color_approximation",
+    // A valid color left out of a full table is reported once for the document (cdxml.color_table_full).
+    if (!color) warnings.push({ code: "cdxml.graphic_color_approximation",
       message: `Curve color "${graphic.style.strokeColor}" cannot be represented in the CDXML color table.`, sourceObjectId: graphic.id });
   }
   const sourceStyle = graphicStyleFromCdxmlCurve({ name: "curve", attributes, children: [] }, { colorByIndex: new Map(), warnings: [] });
@@ -3441,18 +3606,42 @@ function moleculePartColor(colors: unknown, id: string): unknown {
 function cdxmlColorAttribute(color: unknown, colors: ExportColorTable, inherited = defaultCdxmlStrokeColor): string[] {
   const normalized = normalizeHexColorValue(color);
   if (!normalized || normalized === inherited) return [];
-  return [`color="${cdxmlColorIndexForHex(normalized, colors)}"`];
+  const index = cdxmlColorIndexForHex(normalized, colors);
+  return index === undefined ? [] : [`color="${index}"`];
 }
 
+/**
+ * The color's index, adding it to the table if needed. Undefined when the color is invalid, or when
+ * the table is full (16-bit indices: no index past 65535): the color is then recorded as unplaced,
+ * and its object or run is written without a color attribute, so it shows the default (or its
+ * caption's) color, with the export's one cdxml.color_table_full warning. Not the nearest color in
+ * the table: finding it costs a scan of up to 65,534 entries per color, and a crafted palette's
+ * "nearest" entry can still be far off, where the default is predictable and the warning names
+ * every color that was not written.
+ */
 function cdxmlColorIndexForHex(color: string, colors: ExportColorTable): number | undefined {
   const normalized = normalizeHexColor(color);
   if (!normalized) return undefined;
   let index = colors.indexOf(normalized);
   if (index < 0) {
+    if (colors.length >= cdxmlLimits.colorTable) {
+      (colors.unplaced ??= new Set()).add(normalized);
+      return undefined;
+    }
     index = colors.length;
     colors.push(normalized);
   }
   return index + 2;
+}
+
+function cdxmlColorTableFullWarning(unplaced: ReadonlySet<string>, format: "cdxml" | "cdx", embedded: boolean): CompatibilityConversionWarning {
+  const list = [...unplaced];
+  const named = list.slice(0, 10).join(", ") + (list.length > 10 ? ` and ${list.length - 10} more` : "");
+  const one = list.length === 1;
+  return warning("cdxml.color_table_full", `${format.toUpperCase()} export: the color table is full ` +
+    `(${cdxmlLimits.colorTable} colors, the most its 16-bit color indices allow); ${one ? "color" : "colors"} ${named} ` +
+    `could not be added, so text and objects in ${one ? "it are" : "them are"} written without their own color and show the default or inherited color` +
+    `${embedded ? " in other apps (the embedded ChemDraft document keeps them)" : ""}.`);
 }
 
 function normalizeHexColor(color: string): string | undefined {
@@ -3663,16 +3852,18 @@ function importVisibleCdxmlFromTree(tree: OrderedXmlTree, sourceFormat: "CDXML" 
   }
 
   const importTransform = importTransformForTree(tree);
-  const colorTable = importCdxmlColorTable(tree, warnings);
+  const colorTable = importCdxmlColorTable(tree, sourceFormat, warnings);
   const fonts = importCdxmlFonts(tree, sourceFormat, warnings);
   const root = tree.map(elementView).find(element => element?.name.toLowerCase() === "cdxml");
   const isChemDraftSource = root?.attributes.CreationProgram === chemDraftCreationProgram;
   const curveLineDefaults = cdxmlCurveLineDefaults(root?.attributes ?? {});
   const base = createEmptyDocument({ title: `Imported ${sourceFormat}.chemdraft`, now: nativeImportTimestamp });
   let importedPages: DocumentPage[];
+  // One budget for the root page setup every page stores (cdxmlLimits.rootPageAttributeCopyChars).
+  const rootPageBudget = { chars: 0 };
   try {
     importedPages = pageElements.map((pageElement, pageIndex) => {
-      const pageTemplate = importPageSetup(base.pages[0], pageElement.attributes, root?.attributes ?? {});
+      const pageTemplate = importPageSetup(base.pages[0], pageElement.attributes, root?.attributes ?? {}, rootPageBudget);
       restorePageOffset(pageElement, warnings, sourceFormat);
       const importedPage = applyImportTransformToPageObjects(
         importPageObjects(pageElement, pageIndex, warnings, colorTable, fonts, curveLineDefaults, sourceFormat, isChemDraftSource),
@@ -3700,6 +3891,7 @@ function importVisibleCdxmlFromTree(tree: OrderedXmlTree, sourceFormat: "CDXML" 
       warnings: [warning("cdxml.values_out_of_range", `${sourceFormat} import failed: ${errorMessage(error)}`)]
     };
   }
+  attachDocumentColorTable(importedPages, colorTable);
   const objectCount = importedPages.reduce((count, page) => count + page.objects.length, 0);
   if (objectCount === 0) {
     return {
@@ -5289,7 +5481,10 @@ function importText(textElement: XmlElementView, pageIndex: number, objectIndex:
       unknown: {
         cdxmlTextElement: serializeVisibleTree([{ t: textElement.children, ":@": textElement.attributes }]),
         cdxmlTextFontTable: textFontTable(textElement, context),
-        cdxmlTextColorTable: Object.fromEntries(context.colorTable.colorByIndex)
+        cdxmlTextColorTable: objectCdxmlColorTable(textElement, context.colorTable),
+        // A run names a font left out for its size: an unchanged save must not copy that id back out.
+        ...(context.fonts.omittedIds.size && findElements(textElement.children, "s").some(run =>
+          run.attributes.font !== undefined && context.fonts.omittedIds.has(run.attributes.font)) ? { cdxmlTextFontOmitted: true } : {})
       }
     }
   };
@@ -5302,9 +5497,11 @@ function importText(textElement: XmlElementView, pageIndex: number, objectIndex:
 // then only the fonts this text's own runs name: export needs no more to write every font the
 // source runs refer to, and the first text still lists the rest.
 function textFontTable(element: XmlElementView, context: ImportPageContext): readonly CdxmlFont[] {
-  const { table, byId, usage } = context.fonts;
-  if (!usage.fontTableEntries || usage.fontTableEntries + table.length <= CDXML_TEXT_FONT_TABLE_COPY_LIMIT) {
+  const { table, byId, usage, tableChars } = context.fonts;
+  if (!usage.fontTableEntries || (usage.fontTableEntries + table.length <= cdxmlLimits.textFontTableCopies &&
+      usage.fontTableChars + tableChars <= cdxmlLimits.textFontTableCopyChars)) {
     usage.fontTableEntries += table.length;
+    usage.fontTableChars += tableChars;
     return table;
   }
   const own = new Map<string, CdxmlFont>();
@@ -5325,20 +5522,20 @@ function restoreFramedCaption(object: TextObject, element: XmlElementView, conte
   const alignments: Record<string, string> = { Center: "center", Right: "right", Left: "left", Full: "justify" };
   const align = alignments[a.Justification ?? "Left"];
   const runs = childElements(element, "s");
-  if (runs.length > CDXML_CAPTION_RUN_LIMIT) {
+  if (runs.length > cdxmlLimits.captionRuns) {
     context.warnings.push({ code: "cdxml.text_runs_truncated", sourceObjectId: object.id,
       message: `${context.sourceFormat} import: text ${a.id ?? object.id} has ${runs.length} styled runs, more than the ` +
-        `${CDXML_CAPTION_RUN_LIMIT} supported; its caption frame and run fonts were not restored, and it was imported as plain styled text.` });
+        `${cdxmlLimits.captionRuns} supported; its caption frame and run fonts were not restored, and it was imported as plain styled text.` });
     return;
   }
   if ((!box && a.BoundingBox !== undefined) || !parseCdxmlXyPoint(a.p) || !align || !runs.length || runs.length !== object.spans.length ||
       Object.keys(a).some(k => !["id", "p", "BoundingBox", "Justification", "color"].includes(k))) return;
   const usage = context.fonts.usage;
-  if (usage.captionRunLimitReached || usage.captionRuns + runs.length > CDXML_DOCUMENT_CAPTION_RUN_LIMIT) {
+  if (usage.captionRunLimitReached || usage.captionRuns + runs.length > cdxmlLimits.documentCaptionRuns) {
     if (!usage.captionRunLimitReached) {
       usage.captionRunLimitReached = true;
       context.warnings.push({ code: "cdxml.document_caption_runs_limited", sourceObjectId: object.id,
-        message: `${context.sourceFormat} import: the captions in this document have more than ${CDXML_DOCUMENT_CAPTION_RUN_LIMIT} styled runs ` +
+        message: `${context.sourceFormat} import: the captions in this document have more than ${cdxmlLimits.documentCaptionRuns} styled runs ` +
           `in total; from text ${a.id ?? object.id} on, captions past that total were imported as plain styled text, without their caption frame and run fonts.` });
     }
     // Saving writes it as plain styled text too, not its unchanged source frame and fonts.
@@ -5832,7 +6029,7 @@ function importShapeGraphic(
         ...(elementName === "graphic" && type === "Line" && element.attributes.ArrowType !== undefined && isCdxmlNoHead(element.attributes.ArrowType)
           ? { cdxmlArrowType: element.attributes.ArrowType } : {}),
         ...((graphicKind === "unknown" || graphicKind === "ellipse") && elementName === "graphic" ? { cdxmlGraphicAttributes: { ...element.attributes },
-          cdxmlGraphicColorTable: Object.fromEntries(context.colorTable.colorByIndex),
+          cdxmlGraphicColorTable: objectCdxmlColorTable(element, context.colorTable),
           ...(graphicKind === "ellipse" ? { cdxmlGraphicStyle: { ...style } } : {}) } : {}),
         ...(element.attributes.OvalType ? { cdxmlOvalType: element.attributes.OvalType } : {}),
         ...(element.attributes.RectangleType ? { cdxmlRectangleType: element.attributes.RectangleType } : {}),
@@ -6753,14 +6950,19 @@ function importTransformForTree(tree: OrderedXmlTree): CdxmlImportTransform {
     : "none";
 }
 
-function importCdxmlColorTable(tree: OrderedXmlTree, warnings: CompatibilityConversionWarning[]): CdxmlColorTable {
+function importCdxmlColorTable(tree: OrderedXmlTree, sourceFormat: string, warnings: CompatibilityConversionWarning[]): CdxmlColorTable {
   const colorByIndex = new Map<number, string>([
     [0, "#000000"],
     [1, "#ffffff"]
   ]);
   const colorElements = childElements(findElements(tree, "colortable")[0] ?? { name: "colortable", attributes: {}, children: [] }, "color");
+  if (colorElements.length > cdxmlLimits.colorTable) {
+    warnings.push(warning("cdxml.color_table_truncated", `${sourceFormat} import: the color table lists ${colorElements.length} colors, ` +
+      `more than the ${cdxmlLimits.colorTable} supported (color indices are 16-bit); only the first ${cdxmlLimits.colorTable} were imported, ` +
+      "and an object colored by a later index takes the default or inherited color."));
+  }
   const colors = colorElements.length > 0
-    ? colorElements.map((element) => rgbToHexColor(
+    ? colorElements.slice(0, cdxmlLimits.colorTable).map((element) => rgbToHexColor(
         colorComponentFromCdxml(element.attributes.r),
         colorComponentFromCdxml(element.attributes.g),
         colorComponentFromCdxml(element.attributes.b)
@@ -6769,7 +6971,58 @@ function importCdxmlColorTable(tree: OrderedXmlTree, warnings: CompatibilityConv
   colors.forEach((color, index) => {
     colorByIndex.set(index + 2, color);
   });
-  return { colorByIndex, warnings };
+  return { colorByIndex, warnings, copies: { entries: 0 } };
+}
+
+// The color table an imported text or graphic stores: the whole table (one shared record) for the
+// first object and while the document's copy budget lasts, then only the colors this element's own
+// attributes (and its runs' attributes) refer to. See cdxmlLimits.objectColorTableCopies.
+function objectCdxmlColorTable(element: XmlElementView, colorTable: CdxmlColorTable): Readonly<Record<string, string>> {
+  const copies = colorTable.copies ??= { entries: 0 };
+  const size = colorTable.colorByIndex.size;
+  if (!copies.entries || copies.entries + size <= cdxmlLimits.objectColorTableCopies) {
+    copies.entries += size;
+    return copies.shared ??= Object.fromEntries(colorTable.colorByIndex);
+  }
+  const own: Record<string, string> = {};
+  const visit = (view: XmlElementView) => {
+    for (const [name, value] of Object.entries(view.attributes)) {
+      if (!/color$/i.test(name) || !/^\d+$/.test(value.trim())) continue;
+      const index = Number(value);
+      const color = colorTable.colorByIndex.get(index);
+      if (color !== undefined) own[index] = color;
+    }
+    for (const child of view.children) {
+      const childView = elementView(child);
+      if (childView) visit(childView);
+    }
+  };
+  visit(element);
+  copies.entries += Object.keys(own).length;
+  copies.partial = true;
+  return own;
+}
+
+/**
+ * Past the copy budget, later objects store only the colors they use, so deleting the objects that
+ * hold whole copies would drop the palette's unused entries on the next save. Then (and only then:
+ * an ordinary document's state is unchanged) the first page stores ONE whole copy of the source
+ * table (cdxmlColorTable, at most 65,536 entries, ~1.2 MB of JSON once), which export merges before
+ * the objects' tables, and every page records the source table's size (cdxmlColorTableSize), so a
+ * save after that page is deleted can name the entries it no longer has instead of dropping them
+ * silently.
+ */
+function attachDocumentColorTable(pages: DocumentPage[], colorTable: CdxmlColorTable): void {
+  const copies = colorTable.copies;
+  if (!copies?.partial || !pages.length) return;
+  const whole = copies.shared ??= Object.fromEntries(colorTable.colorByIndex);
+  const size = [...colorTable.colorByIndex.keys()].filter(index => index >= 2).length;
+  pages.forEach((page, pageIndex) => {
+    const unknown = page.compatibility?.unknown;
+    if (!unknown) return;
+    unknown.cdxmlColorTableSize = size;
+    if (pageIndex === 0) unknown.cdxmlColorTable = whole;
+  });
 }
 
 function colorForCdxmlIndex(value: string | undefined, colorTable: CdxmlColorTable): string | undefined {

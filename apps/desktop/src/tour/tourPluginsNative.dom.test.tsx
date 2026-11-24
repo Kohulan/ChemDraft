@@ -15,6 +15,8 @@ const host = vi.hoisted(() => ({
   opened: [] as DialogMessage[],
   /** Every message the dialog window sent to the native host. */
   sent: [] as DialogMessage[],
+  /** Every message the owner published to the native host (receipts and snapshots). */
+  published: [] as DialogMessage[],
   toDialog: undefined as ((message: DialogMessage) => void) | undefined,
   toOwner: undefined as ((message: DialogMessage) => void) | undefined
 }));
@@ -76,7 +78,7 @@ function DocumentWindow({ nameToStructure }: { nameToStructure: boolean }) {
         setTimeout(() => host.toDialog!(snapshot), 0);
         return { hostId: "tour", windowLabel: DIALOG_LABEL };
       },
-      publish: async (_hostId, message) => { setTimeout(() => host.toDialog!(message), 0); },
+      publish: async (_hostId, message) => { host.published.push(message); setTimeout(() => host.toDialog!(message), 0); },
       close: async () => {}
     }, { guidedTourAction: next => action.current(next), applyPageSize: () => {}, onError: message => { throw new Error(message); } });
     void tour.open();
@@ -114,6 +116,7 @@ beforeEach(() => {
   vi.stubGlobal("localStorage", new MemoryStorage());
   host.opened = [];
   host.sent = [];
+  host.published = [];
   host.invoke.mockReset().mockImplementation(async (command: string, args?: unknown) => dialogSend(command, args));
   invokeCommand.mockClear();
 });
@@ -177,6 +180,22 @@ describe.each([["macos", "MacIntel"], ["windows", "Win32"]] as const)("the nativ
     // The dialog window used this platform's own wording on the last step.
     for (let step = 6; step < 9; step++) await act(async () => { button("Next")!.click(); });
     expect(tour.textContent).toContain(platform === "macos" ? "Choose ChemDraft > Settings… (⌘,)" : "Choose File > Preferences… (Ctrl+,)");
+  });
+
+  it("closes a Try it with a releasing receipt after accepting it, so the next tour action is not held (#422 review)", async () => {
+    const { tour, button } = await openToNameStep(true);
+    host.published = [];
+    host.sent = [];
+    await act(async () => { button("Try it")!.click(); });
+    await settle();
+    expect(tour.querySelector("[role=alert]")).toBeNull();
+    const request = host.sent.find(message => message.type === "action" && message.data.action === "tryTourCommand")!;
+    const results = host.published.filter((message): message is Extract<DialogMessage, { type: "result" }> =>
+      message.type === "result" && message.requestId === request.requestId);
+    // Rust keeps the action's reservation through `accepted` and releases it on the closing receipt
+    // (`releases_action_reservation`: cancelled, error, ...). Both cross IPC as JSON, so each passes the real parser.
+    expect(results.map(message => message.data.status)).toEqual(["accepted", "cancelled"]);
+    for (const message of results) expect(parseDialogMessage(JSON.parse(JSON.stringify(message)))).toEqual(message);
   });
 
   it("sends the guide link to the native host once per click, Enter or middle-click, never to the document window", async () => {

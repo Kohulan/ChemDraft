@@ -7,6 +7,7 @@ import {
   type PageMargin
 } from "@chemdraft/chem-core";
 import { utf8String } from "./sha256";
+import { cdxmlLimits } from "./cdxmlLimits";
 
 type Attributes = Record<string, string>;
 // The visible writer rounds coordinates to four decimal places in points.
@@ -63,9 +64,40 @@ function paperPreset(width: number, height: number) {
     && Math.abs(preset.heightPx * 0.75 - Math.max(width, height)) < 0.02);
 }
 
-/** Preserve source spelling before origin restoration touches any visible coordinate attributes. */
-export function importPageSetup(page: DocumentPage, source: Attributes, root: Attributes): DocumentPage {
+// What a page past the copy budget keeps of the root setup: only what fitPageSetup checks its own
+// page grid against, and only short values (real ones are a few numbers).
+const pageGridRootAttributes = new Set(["PrintMargins", "WidthPages", "HeightPages"]);
+const pageGridRootValueLimit = 256;
+
+/**
+ * The root page setup a page stores. Export writes the root setup from the first page only, so
+ * a document-wide character budget (`cdxmlLimits.rootPageAttributeCopyChars`) bounds the copies:
+ * the first page always stores everything, later pages too while the budget lasts; past it a page
+ * keeps only its grid attributes and names what it left out (cdxmlRootPageAttributesOmitted), so
+ * that a save after the earlier pages are deleted can say so instead of dropping it silently.
+ */
+function storedRootPageAttributes(root: Attributes, budget?: { chars: number }): { stored: Attributes; omitted: string[] } {
   const rootAttributes = Object.fromEntries(Object.entries(root).filter(([name]) => rootPageAttributes.has(name)));
+  if (!budget) return { stored: rootAttributes, omitted: [] };
+  let chars = 0;
+  for (const [name, value] of Object.entries(rootAttributes)) chars += name.length + value.length;
+  if (!budget.chars || budget.chars + chars <= cdxmlLimits.rootPageAttributeCopyChars) {
+    budget.chars += Math.max(chars, 1);
+    return { stored: rootAttributes, omitted: [] };
+  }
+  const stored: Attributes = {};
+  const omitted: string[] = [];
+  for (const [name, value] of Object.entries(rootAttributes)) {
+    if (pageGridRootAttributes.has(name) && value.length <= pageGridRootValueLimit) stored[name] = value;
+    else omitted.push(name);
+  }
+  return { stored, omitted };
+}
+
+/** Preserve source spelling before origin restoration touches any visible coordinate attributes.
+ * `rootBudget` is shared by every page of one import (see storedRootPageAttributes). */
+export function importPageSetup(page: DocumentPage, source: Attributes, root: Attributes, rootBudget?: { chars: number }): DocumentPage {
+  const { stored: rootAttributes, omitted } = storedRootPageAttributes(root, rootBudget);
   const box = tuple(source.BoundingBox, 4);
   // PrintMargins is top/left/bottom/right, unlike the left/top/right/bottom BoundingBox.
   const margins = tuple(source.PrintMargins ?? root.PrintMargins, 4);
@@ -114,6 +146,7 @@ export function importPageSetup(page: DocumentPage, source: Attributes, root: At
   }
   return { ...mapped, compatibility: { sourceFormat: "cdxml", originalId: source.id, warnings: [], unknown: {
     cdxmlPageAttributes: { ...source }, cdxmlRootPageAttributes: rootAttributes,
+    ...(omitted.length ? { cdxmlRootPageAttributesOmitted: omitted } : {}),
     cdxmlPageNativeSetup: nativeSetup(mapped)
   } } };
 }
