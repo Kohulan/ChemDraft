@@ -1,0 +1,151 @@
+name: Linux 3D sidecar build
+
+# Builds the x86_64 Linux 3D sidecar from the pinned sources for a maintainer to commit, as the macOS
+# and Windows sidecars are committed. Linux packaging (linux-build.yml) never builds it: it verifies
+# the committed binary against the SHA-256 pinned in scripts/engine3d-sidecar-linux.json.
+#
+#   gh workflow run linux-sidecar-build.yml --ref <branch or tag to build>
+#       (works once this file is on the default branch; GitHub dispatches only such files), or
+#   git push origin <commit to build>:refs/heads/ci/linux-sidecar-build
+#       (a push to the branch ci/linux-sidecar-build, and only that branch, runs it).
+#
+# The artifact holds the binary and its .sha256; the job summary prints the SHA-256 and the run id
+# that go into scripts/engine3d-sidecar-linux.json and docs/architecture/dependency-inventory.md.
+# See native/avogadro3d-sidecar/README.md.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci/linux-sidecar-build
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # No fork runs, and no credentials persisted in the checkout.
+    if: github.repository == 'jgassens/ChemDraft' && !github.event.repository.fork
+    # Ubuntu 22.04, the oldest supported host: the sidecar may need at most its glibc 2.35.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      NEEDRESTART_MODE: a
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install the sidecar build tools
+        run: |
+          sudo apt-get update
+          sudo -E apt-get install -y --no-install-recommends build-essential file
+          cmake --version
+
+      # The same Avogadro Core/Calc subset and commit define as the macOS and Windows sidecars
+      # (native/avogadro3d-sidecar/README.md). A failed fetch or a moved pin fails the job.
+      # Both sources are fetched by commit alone, with no tags: avogadrolibs' CMake runs
+      # `git describe`, and upstream tags are movable input. With no tag it falls back to its
+      # fixed version (2.0.0, set in its CMakeLists.txt); that string feeds only
+      # Avogadro::version(), which the sidecar never links, so the binary does not change.
+      - name: Fetch the pinned 3D sidecar sources
+        id: sources
+        working-directory: native/avogadro3d-sidecar
+        run: |
+          set -euo pipefail
+          commit=$(grep -oE '[0-9a-f]{40}' CMakeLists.txt | sort -u)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::CMakeLists.txt must pin exactly one avogadrolibs commit.'; exit 1; }
+          rm -rf _deps
+          git init -q _deps/avogadrolibs
+          git -C _deps/avogadrolibs remote add origin https://github.com/OpenChemistry/avogadrolibs.git
+          git -C _deps/avogadrolibs fetch --no-tags --depth 1 origin "$commit"
+          git -C _deps/avogadrolibs -c advice.detachedHead=false checkout FETCH_HEAD
+          # Eigen 3.4.0 by its commit, not by the tag name, which upstream could move.
+          eigen=3147391d946bb4b6c68edd901f2add6ac1f31f8c
+          git init -q _deps/eigen
+          git -C _deps/eigen remote add origin https://gitlab.com/libeigen/eigen.git
+          git -C _deps/eigen fetch --no-tags --depth 1 origin "$eigen"
+          git -C _deps/eigen -c advice.detachedHead=false checkout FETCH_HEAD
+          [ "$(git -C _deps/avogadrolibs rev-parse HEAD)" = "$commit" ] || { echo "::error::avogadrolibs is not at $commit."; exit 1; }
+          [ -z "$(git -C _deps/avogadrolibs tag)" ] || { echo '::error::The avogadrolibs checkout has tags; git describe must not see any.'; exit 1; }
+          [ "$(git -C _deps/eigen rev-parse HEAD)" = "$eigen" ] || { echo "::error::Eigen is not at $eigen (3.4.0)."; exit 1; }
+          test -f _deps/eigen/Eigen/Core || { echo '::error::Eigen 3.4.0 checkout has no Eigen/Core.'; exit 1; }
+          echo "avogadrolibs $commit; Eigen 3.4.0 $(git -C _deps/eigen rev-parse HEAD)"
+          echo "avogadrolibs=$commit" >> "$GITHUB_OUTPUT"
+          echo "eigen=$eigen" >> "$GITHUB_OUTPUT"
+
+      # Release build with libstdc++ and libgcc linked statically, so the sidecar needs only glibc.
+      - name: Build the x86_64 Linux 3D sidecar
+        working-directory: native/avogadro3d-sidecar
+        run: |
+          set -euo pipefail
+          cmake --preset linux-x86_64
+          cmake --build --preset linux-x86_64 --parallel "$(nproc)"
+          bin=build/linux-x86_64/avogadro3d-sidecar
+          file "$bin"
+          # A native x86-64 ELF, not a placeholder; only glibc libraries (NEEDED), at most glibc
+          # 2.35; and a complete protocol handshake. The runner's preinstalled Node runs it.
+          node --version
+          node "$GITHUB_WORKSPACE/scripts/check-engine3d-sidecar.mjs" "$bin"
+
+      # The smokes load the desktop app's engine code, so they need the workspace installed.
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # The same audit and smokes the Intel macOS job runs on its sidecar.
+      - name: Audit and smoke test the x86_64 Linux 3D sidecar
+        env:
+          CHEMDRAFT_ENGINE3D_SIDECAR: native/avogadro3d-sidecar/build/linux-x86_64/avogadro3d-sidecar
+        run: |
+          set -euo pipefail
+          pnpm run audit:engine3d-sidecar
+          pnpm smoke:engine3d-real-structure
+          pnpm smoke:engine3d-hold-steady
+          pnpm smoke:engine3d-anneal-energy
+
+      - name: Stage the sidecar and its SHA-256
+        id: stage
+        run: |
+          set -euo pipefail
+          name=avogadro3d-sidecar-x86_64-unknown-linux-gnu
+          mkdir -p sidecar-artifact
+          install -m 0755 native/avogadro3d-sidecar/build/linux-x86_64/avogadro3d-sidecar "sidecar-artifact/$name"
+          (cd sidecar-artifact && sha256sum -- "$name" > "$name.sha256" && sha256sum --check "$name.sha256")
+          sha=$(cut -d' ' -f1 "sidecar-artifact/$name.sha256")
+          [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo '::error::Could not read the sidecar SHA-256.'; exit 1; }
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          ls -l sidecar-artifact
+
+      - name: Upload the sidecar
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: engine3d-sidecar-linux-x86_64
+          path: sidecar-artifact/*
+          if-no-files-found: error
+
+      - name: Summarize the build for the maintainer
+        env:
+          SHA256: ${{ steps.stage.outputs.sha256 }}
+          AVOGADROLIBS: ${{ steps.sources.outputs.avogadrolibs }}
+          EIGEN: ${{ steps.sources.outputs.eigen }}
+        run: |
+          set -euo pipefail
+          {
+            echo '## x86_64 Linux 3D sidecar'
+            echo
+            echo "- run id: \`$GITHUB_RUN_ID\`"
+            echo "- SHA-256: \`$SHA256\`"
+            echo "- source commit: \`$GITHUB_SHA\` ($GITHUB_REF)"
+            echo "- avogadrolibs: \`$AVOGADROLIBS\`; Eigen 3.4.0: \`$EIGEN\`"
+            echo
+            echo 'Commit the artifact `engine3d-sidecar-linux-x86_64` as'
+            echo '`apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu` (mode 0755), set'
+            echo "\`buildRunId\` to \`$GITHUB_RUN_ID\` and \`sha256\` to \`$SHA256\` in \`scripts/engine3d-sidecar-linux.json\`,"
+            echo 'and fill in the same two values in `docs/architecture/dependency-inventory.md`.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "run id $GITHUB_RUN_ID; SHA-256 $SHA256"

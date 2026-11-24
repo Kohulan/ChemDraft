@@ -115,6 +115,56 @@ def keys(*shortcuts):
     run("xdotool", "key", "--clearmodifiers", "--delay", "100", *shortcuts)
 
 
+# Runs in a child process (input_focus_window): prints the focus window's number, or exits 1.
+INPUT_FOCUS_QUERY = r"""
+import ctypes
+import ctypes.util
+import os
+import sys
+library = ctypes.util.find_library("X11")
+if not library:
+    sys.exit("libX11 not found")
+xlib = ctypes.CDLL(library)
+xlib.XOpenDisplay.restype = ctypes.c_void_p
+xlib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+xlib.XGetInputFocus.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong),
+                                ctypes.POINTER(ctypes.c_int)]
+xlib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+display = xlib.XOpenDisplay(os.environ.get("DISPLAY", "").encode() or None)
+if not display:
+    sys.exit(f"cannot open X display {os.environ.get('DISPLAY')!r}")
+window = ctypes.c_ulong()
+revert = ctypes.c_int()
+xlib.XGetInputFocus(display, ctypes.byref(window), ctypes.byref(revert))
+xlib.XCloseDisplay(display)
+print(window.value)
+"""
+
+
+def input_focus_window():
+    """The X window that has input focus, or None when no window does.
+
+    XGetInputFocus answers None (0) or PointerRoot (1) when no window is focused. Querying
+    either as a window is a BadWindow error (xdotool getwindowfocus does exactly that), so
+    those answers are mapped to "no window focused" here. Returns the window number as a
+    string, or None; raises OSError if libX11 or the display cannot be opened, or the query
+    does not answer.
+
+    The query runs in a child process: if the X server goes away during it, Xlib's default
+    I/O error handler exits the process, which here would skip explain_failure and the
+    Session cleanup."""
+    try:
+        result = subprocess.run([sys.executable, "-c", INPUT_FOCUS_QUERY],
+                                capture_output=True, timeout=10)
+    except subprocess.TimeoutExpired as error:
+        raise OSError(f"the X focus query did not answer within {error.timeout} s") from error
+    answer = result.stdout.decode(errors="replace").strip()
+    if result.returncode or not answer.isdigit():
+        message = result.stderr.decode(errors="replace").strip()
+        raise OSError(message or f"the X focus query exited with status {result.returncode}")
+    return None if int(answer) in (0, 1) else answer
+
+
 def xclip(target):
     return ["xclip", "-selection", "clipboard", "-target", target]
 
@@ -552,10 +602,14 @@ def active_windows(Atspi, pid):
 
 
 def report_focus(Atspi, pid, moment):
-    focus = run("xdotool", "getwindowfocus", check=False)
-    window = focus.stdout.decode().strip() or focus.stderr.decode(errors="replace").strip()
+    try:
+        window = input_focus_window()
+    except OSError as error:
+        window = f"unknown ({error})"
     name = ""
-    if focus.returncode == 0 and window.isdigit():
+    if window is None:
+        window = "none (no window focused)"
+    elif window.isdigit():
         name = run("xdotool", "getwindowname", window, check=False).stdout.decode(
             errors="replace").strip()
     try:
@@ -877,9 +931,10 @@ def log_x_state(moment, point=None, settings=None):
         describe_x_ancestry("under pointer", fields.get("WINDOW"))
         if settings:
             describe_x_ancestry("palette", settings)
-        focus = (diag("xdotool", "getwindowfocus") or "").strip()
-        print(f"  X focus window {focus!r}", flush=True)
-        describe_x_ancestry("focus", focus)
+        focus = input_focus_window()
+        print(f"  X focus window {focus if focus else 'none (no window focused)'!r}", flush=True)
+        if focus:
+            describe_x_ancestry("focus", focus)
     except Exception as error:  # diagnostics must never fail the run
         print(f"  X diagnostics failed: {error}", flush=True)
 
@@ -963,38 +1018,105 @@ def type_into_field(session, Atspi, settings):
     return after is not None
 
 
+def x_server_reachable():
+    """(reachable, detail): whether an X connection to $DISPLAY works (xdpyinfo, as action.yml).
+
+    reachable is None when xdpyinfo itself could not be started (not every install list has
+    it), which says nothing about the X server."""
+    try:
+        result = subprocess.run(["xdpyinfo"], capture_output=True, timeout=10)
+    except subprocess.TimeoutExpired as error:
+        return False, f"xdpyinfo did not answer: {error}"
+    except OSError as error:
+        return None, f"xdpyinfo could not run: {error}"
+    if result.returncode:
+        return False, result.stderr.decode(errors="replace").strip() or f"exit {result.returncode}"
+    return True, ""
+
+
+def explain_failure(session):
+    """Print whether XWayland survived and the tail of the compositor's display.log.
+
+    Diagnostics only: the caller re-raises the original failure, so the job still fails."""
+    try:
+        if not os.environ.get("DISPLAY"):
+            print("No X display was ever set up, so XWayland's health cannot be judged.",
+                  flush=True)
+            reachable, detail = True, ""
+        else:
+            reachable, detail = x_server_reachable()
+        log = ""
+        try:
+            log = (session.logs / "display.log").read_text(errors="replace")
+        except OSError as error:
+            print(f"Cannot read display.log: {error}", flush=True)
+        dropped = ("failed to read Wayland events" in log or "unmapped surface or view" in log)
+        compositor_gone = session.server is not None and session.server.poll() is not None
+        if reachable is None:
+            print("Cannot tell whether XWayland is still alive on "
+                  f"DISPLAY={os.environ.get('DISPLAY')}: {detail}.", flush=True)
+        elif not reachable:
+            who = "Weston" if session.compositor == "weston" else "KWin"
+            if session.compositor == "weston" and not compositor_gone:
+                print("Weston dropped XWayland: the X server on "
+                      f"DISPLAY={os.environ.get('DISPLAY')} no longer answers ({detail}) "
+                      "while Weston itself is still running.", flush=True)
+            elif session.compositor == "weston":
+                print("Weston dropped XWayland: Weston exited with status "
+                      f"{session.server.returncode} and the X server no longer answers "
+                      f"({detail}).", flush=True)
+            else:
+                print(f"{who} lost XWayland: the X server on "
+                      f"DISPLAY={os.environ.get('DISPLAY')} no longer answers ({detail}).",
+                      flush=True)
+        elif os.environ.get("DISPLAY"):
+            print(f"XWayland is still alive on DISPLAY={os.environ.get('DISPLAY')}.", flush=True)
+            if dropped:
+                print("display.log reports a dropped Wayland connection even though X still "
+                      "answers.", flush=True)
+        tail = "\n".join(log.splitlines()[-40:])
+        print(f"--- last 40 lines of {session.logs / 'display.log'} ---\n{tail}\n--- end ---",
+              flush=True)
+    except Exception as error:  # diagnostics must never hide the real failure
+        print(f"Could not diagnose the X server: {error}", flush=True)
+
+
 def main(bundle, package, logs, compositor):
     logs.mkdir(parents=True, exist_ok=True)
     with Session(bundle, package, logs, compositor) as session:
-        session.start_display()
-        session.launch()
-        document = wait_for(lambda: session.document_window(),
-                            "No ChemDraft document window appeared", seconds=60, interval=1)
-        wait_for(lambda: session.window("ChemDraft Main Toolbar"),
-                 "The Main Toolbar window did not appear", seconds=30, interval=1)
-        Atspi = atspi()
-        report_focus(Atspi, session.main_pid, "after startup")
-        session.report_input_path("after startup")
-        before = paste_propane(session, Atspi, document)
-        print(f"Document before typing: {before[0].decode()} {before[1]}", flush=True)
+        try:
+            session.start_display()
+            session.launch()
+            document = wait_for(lambda: session.document_window(),
+                                "No ChemDraft document window appeared", seconds=60, interval=1)
+            wait_for(lambda: session.window("ChemDraft Main Toolbar"),
+                     "The Main Toolbar window did not appear", seconds=30, interval=1)
+            Atspi = atspi()
+            report_focus(Atspi, session.main_pid, "after startup")
+            session.report_input_path("after startup")
+            before = paste_propane(session, Atspi, document)
+            print(f"Document before typing: {before[0].decode()} {before[1]}", flush=True)
 
-        open_settings_toolbar(Atspi, session.main_pid)
-        settings = wait_for(lambda: session.window(SETTINGS_TITLE),
-                            f"The {SETTINGS_TITLE} window did not appear", seconds=30)
-        if session.tests_focus:
-            # Bring ChemDraft to the front first, as a user would: a field click while no
-            # ChemDraft window has focus leaves the keys with the other application.
-            click_document(session, Atspi, document)
-        typed = type_into_field(session, Atspi, settings)
+            open_settings_toolbar(Atspi, session.main_pid)
+            settings = wait_for(lambda: session.window(SETTINGS_TITLE),
+                                f"The {SETTINGS_TITLE} window did not appear", seconds=30)
+            if session.tests_focus:
+                # Bring ChemDraft to the front first, as a user would: a field click while no
+                # ChemDraft window has focus leaves the keys with the other application.
+                click_document(session, Atspi, document)
+            typed = type_into_field(session, Atspi, settings)
 
-        session.alive()
-        time.sleep(0.5)
-        require_document_focus(session, Atspi, document)
-        after = chemistry(Atspi, session.main_pid)
-        print(f"Document after typing: {after[0].decode()} {after[1]}", flush=True)
-        if after != before:
-            raise SmokeFailure(f"the document's chemistry changed from {before} to {after}")
-        session.alive()
+            session.alive()
+            time.sleep(0.5)
+            require_document_focus(session, Atspi, document)
+            after = chemistry(Atspi, session.main_pid)
+            print(f"Document after typing: {after[0].decode()} {after[1]}", flush=True)
+            if after != before:
+                raise SmokeFailure(f"the document's chemistry changed from {before} to {after}")
+            session.alive()
+        except Exception:
+            explain_failure(session)
+            raise
     if typed:
         print(f"Under {compositor}, typing into a toolbar number field changed the field and left "
               "the chemistry alone.", flush=True)
