@@ -11033,7 +11033,7 @@ fn create_toolbars_menu<R: Runtime>(
 fn toolset_is_resizable(toolset_id: &str) -> bool {
     matches!(
         toolset_id,
-        "core.molecularInspector" | "core.drawnStructureSettings" | "core.ringInspector"
+        "core.molecularInspector" | "core.drawnStructureSettings"
     )
 }
 
@@ -15312,11 +15312,7 @@ mod tests {
 
     #[test]
     fn only_scrolling_toolsets_allow_user_resize() {
-        for id in [
-            "core.molecularInspector",
-            "core.drawnStructureSettings",
-            "core.ringInspector",
-        ] {
+        for id in ["core.molecularInspector", "core.drawnStructureSettings"] {
             assert!(toolset_is_resizable(id), "{id}");
         }
         for id in [
@@ -15329,6 +15325,7 @@ mod tests {
             "core.layout",
             "core.style",
             "core.text",
+            "core.ringInspector",
             "plugin.fixture",
             "user.fixture",
         ] {
@@ -15342,7 +15339,9 @@ mod tests {
             serde_json::from_str(r#"{"x":-125.0,"y":275.0,"width":413.0,"height":317.0}"#).unwrap();
         for (id, expected) in [
             ("core.layout", None),
+            ("core.ringInspector", None),
             ("core.molecularInspector", Some((413.0, 317.0))),
+            ("core.drawnStructureSettings", Some((413.0, 317.0))),
         ] {
             let position = state.position().unwrap();
             assert_eq!((position.x, position.y), (-125.0, 275.0));
