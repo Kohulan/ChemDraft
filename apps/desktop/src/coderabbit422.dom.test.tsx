@@ -124,23 +124,44 @@ describe.each(["macos", "windows"] as const)("CodeRabbit #422 gesture items on %
   // -------------------------------------------------------------------------------------------
   // I: electronMarkDrop.dom.test.ts:886 — a part drag on a rotated molecule does not follow the pointer
   // -------------------------------------------------------------------------------------------
-  it("I: an atom dragged on a 90°-rotated molecule is drawn at the release point", async () => {
+  // Several rotations, sub-pixel tolerance. The dragged O must be drawn where the (snapped) drop
+  // puts it, and every stationary atom must stay exactly where it was drawn. (Molecule objects have
+  // no mirror transform: scaleX/scaleY are positive-only, and a flip rewrites atom coordinates.)
+  it.each([30, 90, 135, 250])("I: an atom dragged on a %d°-rotated molecule is drawn at the release point", async rotation => {
     const { document, hydroxylOxygen } = electronMarkDropFixture();
     const molecule = dropMolecule(document);
     const rotated = applyPatches(document, [
       { op: "removeObject", objectId: dropMark(document).id },
-      { op: "updateObject", objectId: molecule.id, changes: { rotation: 90 } }
+      { op: "updateObject", objectId: molecule.id, changes: { rotation } }
     ], { now: phase4Timestamp });
+    const startMolecule = dropMolecule(rotated);
     await mount(workflow.selectDocumentObjects(rotated, rotated.pages[0].id, []));
-    const start = transformPointForObject(dropMolecule(rotated), hydroxylOxygen);
-    const end = { x: start.x + 60, y: start.y };
+    const start = transformPointForObject(startMolecule, hydroxylOxygen);
+    const end = { x: start.x + 40, y: start.y + 25 };
     await drag(molecule.id, start, end);
     const moved = dropMolecule(snapshot());
+    expect(moved.rotation).toBe(rotation);
+    // The drop the app intends: the release delta, snapped in the molecule's own frame, back on the page.
+    const frameDelta = workflow.moleculeFrameDelta(startMolecule, { x: end.x - start.x, y: end.y - start.y });
+    const snapped = workflow.snapNativeMoleculePartDragDelta(startMolecule,
+      { kind: "atom", objectId: molecule.id, atomId: hydroxylOxygen.id }, frameDelta);
+    const pageDelta = workflow.moleculeFrameDelta(startMolecule, snapped, true);
+    const intended = { x: start.x + pageDelta.x, y: start.y + pageDelta.y };
     const oxygen = moved.atoms.find(atom => atom.id === hydroxylOxygen.id)!;
-    expect(oxygen).not.toEqual(hydroxylOxygen);
     const drawn = transformPointForObject(moved, oxygen);
-    // The drag snap may adjust the drop by a few px; a raw-frame delta misses by ~85 px at 90°.
-    expect(Math.hypot(drawn.x - end.x, drawn.y - end.y)).toBeLessThan(12);
+    expect(Math.hypot(drawn.x - start.x, drawn.y - start.y)).toBeGreaterThan(10);
+    expect(Math.hypot(drawn.x - intended.x, drawn.y - intended.y)).toBeLessThan(0.5);
+    // Without a snap adjustment, the intended drop is the release point itself.
+    if (Math.hypot(snapped.x - frameDelta.x, snapped.y - frameDelta.y) < 1e-9) {
+      expect(Math.hypot(drawn.x - end.x, drawn.y - end.y)).toBeLessThan(0.5);
+    }
+    // Stationary atoms are drawn exactly where they were.
+    for (const atom of startMolecule.atoms) {
+      if (atom.id === hydroxylOxygen.id) continue;
+      const was = transformPointForObject(startMolecule, atom);
+      const now = transformPointForObject(moved, moved.atoms.find(candidate => candidate.id === atom.id)!);
+      expect(Math.hypot(now.x - was.x, now.y - was.y)).toBeLessThan(0.5);
+    }
   });
 });
 
