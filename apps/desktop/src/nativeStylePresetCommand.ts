@@ -37,18 +37,22 @@ export function clearScaledElectronMarksOfLabels(
     leaf.op === "updateObject" && (leaf.changes as Partial<ElectronMarkObject>).anchor?.kind === "atom");
   if (!movedMarkPatches.length) return patches;
   const proposed = applyPatches(document, patches);
-  const objects = new Map(proposed.pages.flatMap(page => page.objects.map(object => [object.id, object] as const)));
+  // Ids are unique only within a page. An updateObject lands on the first page holding its id, so
+  // resolve the mark there and its molecule, label boxes and owner on that same page.
   const corrections = new Map<DocumentPatch, DocumentPatch>();
   const labelBoxesByMolecule = new Map<string, ReturnType<typeof moleculeLayoutLabelBoxes>>();
   for (const leaf of movedMarkPatches) {
-    const mark = objects.get(leaf.objectId);
-    if (mark?.type !== "electron-mark" || mark.anchor.kind !== "atom" || !mark.anchor.objectId) continue;
-    const molecule = objects.get(mark.anchor.objectId);
+    const page = proposed.pages.find(candidate => candidate.objects.some(object => object.id === leaf.objectId));
+    const mark = page?.objects.find(object => object.id === leaf.objectId);
+    if (!page || mark?.type !== "electron-mark" || mark.anchor.kind !== "atom" || !mark.anchor.objectId) continue;
+    const moleculeId = mark.anchor.objectId;
+    const molecule = page.objects.find(object => object.id === moleculeId);
     if (molecule?.type !== "molecule") continue;
     const atomId = (mark.anchor as { atomId?: string }).atomId;
     if (!atomId || !molecule.atoms.some(atom => atom.id === atomId)) continue;
-    let boxes = labelBoxesByMolecule.get(molecule.id);
-    if (!boxes) labelBoxesByMolecule.set(molecule.id, boxes = moleculeLayoutLabelBoxes(molecule));
+    const boxesKey = JSON.stringify([page.id, molecule.id]);
+    let boxes = labelBoxesByMolecule.get(boxesKey);
+    if (!boxes) labelBoxesByMolecule.set(boxesKey, boxes = moleculeLayoutLabelBoxes(molecule));
     const radius = Math.max(nativeChargeAssociationRadiusPx,
       nativeDrawingStyleFromObjectStyle(molecule.style).bondLengthPx * 1.15) * 0.95;
     const cleared = electronMarkCentreClearOfAtomLabel(molecule, atomId, mark, radius, { labelBoxes: boxes });
@@ -57,12 +61,14 @@ export function clearScaledElectronMarksOfLabels(
       x: cleared.x - mark.width / 2, y: cleared.y - mark.height / 2 } });
   }
   if (!corrections.size) return patches;
-  // Owners as the scaled document assigns them; a correction must leave every one in place.
+  // Owners as the scaled document assigns them, keyed by page and mark; a correction must leave
+  // every one in place.
   const owners = (candidate: ChemDraftDocument) => new Map(candidate.pages.flatMap(page =>
-    [...nativeElectronMarkAssignments(page).anchorByMarkId].map(([id, owner]) => [id, JSON.stringify(owner ?? null)] as const)));
+    [...nativeElectronMarkAssignments(page).anchorByMarkId].map(([id, owner]) =>
+      [JSON.stringify([page.id, id]), JSON.stringify(owner ?? null)] as const)));
   const expected = owners(proposed);
   const corrected = patches.map(leaf => corrections.get(leaf) ?? leaf);
   const actual = owners(applyPatches(document, corrected));
-  const unchanged = [...expected].every(([id, owner]) => actual.get(id) === owner);
+  const unchanged = [...expected].every(([key, owner]) => actual.get(key) === owner);
   return unchanged ? corrected : patches;
 }
