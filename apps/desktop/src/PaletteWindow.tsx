@@ -1262,6 +1262,7 @@ export function PaletteWindow({
     >
       <div
         className="palette-title"
+        data-platform={platform}
         data-palette-title-drag-surface="true"
         onPointerDown={startDragFromTitle}
         onPointerUp={stopPaletteWindowDrag}
@@ -1279,6 +1280,7 @@ export function PaletteWindow({
           onMouseDown={(event) => event.stopPropagation()}
           onClick={hidePaletteWindow}
         >
+          {platform === "windows" && <span aria-hidden="true">×</span>}
         </button>
         <span className="palette-title-label">{toolset.title.replace(/ Toolbar$/, "")}</span>
       </div>
