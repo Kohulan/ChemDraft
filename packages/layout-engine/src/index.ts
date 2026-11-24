@@ -4328,12 +4328,253 @@ export function lonePairPlacementPlanForAtom(
   return undefined;
 }
 
+/**
+ * What electron-mark placement reads from a page: its whole object list, or an
+ * ElectronMarkPlacementIndex built from that list. Both give the same point, bit for bit.
+ */
+export type ElectronMarkPlacementSource = readonly DocumentObject[] | ElectronMarkPlacementIndex;
+
+interface IndexedScoringMark {
+  mark: ElectronMarkObject;
+  /** Index in the indexed object list (page order). */
+  position: number;
+  /** Rank among the indexed charge marks, and among charge and radical-dot marks together. */
+  chargeRank: number;
+  scoringRank: number;
+}
+
+interface ElectronMarkPlacementIndexData {
+  objectCount: number;
+  /** Marks anchored to an atom, by molecule id then atom id, in page order. */
+  byAtom: Map<string, Map<string, { mark: ElectronMarkObject; position: number }[]>>;
+  chargePositions: number[];
+  scoringPositions: number[];
+  /** Charge marks and radical dots by grid cell of their page-coordinate centre, in page order. */
+  chargeCells: Map<string, IndexedScoringMark[]>;
+  radicalCells: Map<string, IndexedScoringMark[]>;
+  /** Marks whose centre cannot be gridded (not finite, or beyond the grid bound): every query reads them. */
+  ungriddedCharges: IndexedScoringMark[];
+  ungriddedRadicals: IndexedScoringMark[];
+  cellSize: number;
+  maxScoredMarks: number;
+  /** How many candidate scores hit maxScoredMarks (nearby marks past it counted as far). */
+  capHits: number;
+}
+
+/**
+ * Coordinates up to 2^40 px keep each rotation's rounding error far below the one-pixel slack of
+ * the grid cell, so no mark that can score below 1 falls outside the 3 x 3 cells read. Real pages
+ * are a few thousand pixels wide. A mark centre beyond the bound is read by every query; a
+ * candidate beyond it (only on a crafted page) is scored against those marks alone.
+ */
+const electronMarkGridBound = 2 ** 40;
+
+/**
+ * Electron-mark placement scores each candidate against every charge mark on the page (and every
+ * radical dot, when the atom already carries a mark), so placing marks on many atoms one call at
+ * a time cost (atoms x page marks). This index is built once per page: marks by the atom they are
+ * anchored to, and charge and radical-dot centres in a grid, so each candidate reads only the
+ * marks near it.
+ *
+ * The score is unchanged, bit for bit. A mark scores min(1, distance / (1.5 bond lengths)); one
+ * outside the 3 x 3 cells around a candidate is provably at least that far, so it scores exactly
+ * 1, and the running sum's `+ 1` steps for such marks are replayed exactly in page order
+ * (addOnesExactly) rather than one by one.
+ *
+ * Bound: when more than `maxScoredMarks` (256) charge or radical marks sit in the cells around one
+ * candidate (about 100 px square, where at most ~30 18-px marks fit without overlapping), only the
+ * first 256 in page order are scored by distance and the rest count as far. Only a crafted page
+ * reaches it; it keeps each candidate's cost bounded where marks are stacked on one spot.
+ */
+export class ElectronMarkPlacementIndex {
+  private constructor(private readonly data: ElectronMarkPlacementIndexData, private readonly limit: number) {}
+
+  /** Index a page's objects, in page order. `maxScoredMarks` is lowered only by tests. */
+  static of(objects: readonly DocumentObject[], options: { maxScoredMarks?: number } = {}): ElectronMarkPlacementIndex {
+    const index = new ElectronMarkPlacementIndex({
+      objectCount: 0, byAtom: new Map(), chargePositions: [], scoringPositions: [],
+      chargeCells: new Map(), radicalCells: new Map(), ungriddedCharges: [], ungriddedRadicals: [],
+      // Wider than the score's reach (1.5 bond lengths) by a pixel of rounding slack.
+      cellSize: ChemDraftSyntheticStylePreset.drawing.bondLengthPx * 1.5 + 1,
+      maxScoredMarks: options.maxScoredMarks ?? 256, capHits: 0
+    }, Infinity);
+    for (const object of objects) index.add(object);
+    return index;
+  }
+
+  /** Index an object pushed onto the end of the page. */
+  add(object: DocumentObject): void {
+    if (this.limit !== Infinity) throw new Error("ElectronMarkPlacementIndex.add: a prefix view cannot grow.");
+    const data = this.data;
+    const position = data.objectCount++;
+    if (object.type !== "electron-mark") return;
+    const { anchor } = object;
+    // An atom anchor missing either id matches no atom, as in the whole-page filters.
+    if (anchor.kind === "atom" && anchor.objectId !== undefined && anchor.atomId !== undefined) {
+      let byAtom = data.byAtom.get(anchor.objectId);
+      if (!byAtom) data.byAtom.set(anchor.objectId, byAtom = new Map());
+      const list = byAtom.get(anchor.atomId);
+      if (list) list.push({ mark: object, position });
+      else byAtom.set(anchor.atomId, [{ mark: object, position }]);
+    }
+    const charge = object.markKind === "charge";
+    if (!charge && object.markKind !== "radical-dot") return;
+    const entry: IndexedScoringMark = { mark: object, position,
+      chargeRank: data.chargePositions.length, scoringRank: data.scoringPositions.length };
+    if (charge) data.chargePositions.push(position);
+    data.scoringPositions.push(position);
+    const center = electronMarkCenter(object);
+    const key = electronMarkGridKey(center, data.cellSize, 0, 0);
+    if (key === undefined) (charge ? data.ungriddedCharges : data.ungriddedRadicals).push(entry);
+    else {
+      const cells = charge ? data.chargeCells : data.radicalCells;
+      const list = cells.get(key);
+      if (list) list.push(entry);
+      else cells.set(key, [entry]);
+    }
+  }
+
+  /** How many candidate scores so far were approximated because more than `maxScoredMarks` marks crowded the candidate. */
+  get scoreCapHits(): number { return this.data.capHits; }
+
+  /** This index as if built from only the first `count` objects (`objects.slice(0, count)`). */
+  before(count: number): ElectronMarkPlacementIndex {
+    return new ElectronMarkPlacementIndex(this.data, Math.max(0, Math.min(this.limit, count)));
+  }
+
+  /** The marks anchored to the atom, in page order. */
+  marksOnAtom(moleculeId: string, atomId: string): ElectronMarkObject[] {
+    const marks: ElectronMarkObject[] = [];
+    for (const entry of this.data.byAtom.get(moleculeId)?.get(atomId) ?? []) {
+      if (entry.position >= this.limit) break;
+      marks.push(entry.mark);
+    }
+    return marks;
+  }
+
+  /** @internal The charge-distance score of electron-mark placement (see electronMarkChargeScorer). */
+  chargeScorer(molecule: MoleculeObject, radicalDotsToo: boolean): (placed: LayoutPoint) => number {
+    const data = this.data, limit = this.limit;
+    const total = countBelow(radicalDotsToo ? data.scoringPositions : data.chargePositions, limit);
+    const rank = (entry: IndexedScoringMark) => radicalDotsToo ? entry.scoringRank : entry.chargeRank;
+    const bondLength = ChemDraftSyntheticStylePreset.drawing.bondLengthPx;
+    const pivot = objectRotationCenter(molecule);
+    const pivotInBounds = Math.abs(pivot.x) < electronMarkGridBound && Math.abs(pivot.y) < electronMarkGridBound;
+    const ungridded = radicalDotsToo ? [data.ungriddedCharges, data.ungriddedRadicals] : [data.ungriddedCharges];
+    const cellMaps = radicalDotsToo ? [data.chargeCells, data.radicalCells] : [data.chargeCells];
+    return placed => {
+      // The candidate's page point: mark centres are gridded in page coordinates.
+      const page = transformPointForObject(molecule, placed);
+      const lists = [...ungridded];
+      const queryInBounds = pivotInBounds && Math.abs(placed.x) < electronMarkGridBound && Math.abs(placed.y) < electronMarkGridBound;
+      if (queryInBounds) for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
+        const key = electronMarkGridKey(page, data.cellSize, dx, dy);
+        if (key === undefined) continue;
+        for (const cells of cellMaps) {
+          const list = cells.get(key);
+          if (list) lists.push(list);
+        }
+      }
+      // A query point that cannot be gridded reads no cells: only the ungridded marks are scored.
+      const counts = lists.map(list => countBelow(list, limit, entry => entry.position));
+      const nearby = counts.reduce((sum, count) => sum + count, 0);
+      const take = Math.min(nearby, data.maxScoredMarks);
+      if (nearby > take) data.capHits++;
+      const scored = lists.flatMap((list, index) => list.slice(0, Math.min(counts[index], take)))
+        .sort((left, right) => left.position - right.position).slice(0, take);
+      let sum = 0, next = 0;
+      for (const entry of scored) {
+        sum = addOnesExactly(sum, rank(entry) - next);
+        sum += Math.min(1, distance(placed, inverseTransformPointForObject(molecule, electronMarkCenter(entry.mark))) / (bondLength * 1.5));
+        next = rank(entry) + 1;
+      }
+      return addOnesExactly(sum, total - next);
+    };
+  }
+}
+
+function electronMarkCenter(mark: ElectronMarkObject): LayoutPoint {
+  return { x: mark.x + mark.width / 2, y: mark.y + mark.height / 2 };
+}
+
+function electronMarkGridKey(point: LayoutPoint, cellSize: number, dx: number, dy: number): string | undefined {
+  if (!(Math.abs(point.x) < electronMarkGridBound && Math.abs(point.y) < electronMarkGridBound)) return undefined;
+  return `${Math.floor(point.x / cellSize) + dx},${Math.floor(point.y / cellSize) + dy}`;
+}
+
+/** How many leading items (ascending by `key`) are below `limit`. */
+function countBelow<T>(items: readonly T[], limit: number, key: (item: T) => number = item => item as number): number {
+  let low = 0, high = items.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (key(items[middle]!) < limit) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+/**
+ * `count` successive `sum += 1` steps, bit for bit, in O(log sum) steps. For 0 <= sum < 2^52 every
+ * `+ 1` that stays inside sum's binade [2^k, 2^(k+1)) is exact (1 is a multiple of the binade's ulp),
+ * so those steps add as one exact `+ j`; only the step crossing into the next binade can round,
+ * and it is taken as an ordinary `+ 1`.
+ * @internal Exported for its own test.
+ */
+export function addOnesExactly(sum: number, count: number): number {
+  while (count > 0) {
+    if (!(sum >= 0 && sum < 2 ** 52)) {
+      // Not reached by any page (sums of fewer than 2^52 marks); kept exact anyway.
+      if (Number.isNaN(sum)) return sum;
+      for (; count > 0; count--) sum += 1;
+      return sum;
+    }
+    let boundary = 1;
+    while (boundary <= sum) boundary *= 2;
+    // sum < boundary <= 2 sum (or sum < 1), so boundary - sum is exact and sum + exact stays in the binade.
+    const exact = Math.min(count, Math.ceil(boundary - sum) - 1);
+    sum += exact;
+    count -= exact;
+    if (count > 0) {
+      sum += 1;
+      count--;
+    }
+  }
+  return sum;
+}
+
+/** The marks anchored to the atom, in page order. */
+function electronMarksOnAtom(source: ElectronMarkPlacementSource, moleculeId: string, atomId: string): ElectronMarkObject[] {
+  if (source instanceof ElectronMarkPlacementIndex) return source.marksOnAtom(moleculeId, atomId);
+  return source.filter((object): object is ElectronMarkObject => object.type === "electron-mark"
+    && object.anchor.kind === "atom" && object.anchor.objectId === moleculeId && object.anchor.atomId === atomId);
+}
+
+/**
+ * Placement's charge-distance score: the sum, in page order, of min(1, distance / (1.5 bond
+ * lengths)) from the candidate (in the molecule's frame) to the centre of every charge mark, and
+ * of every radical dot too when `radicalDotsToo`. The list form is the reference the index matches.
+ */
+function electronMarkChargeScorer(
+  source: ElectronMarkPlacementSource,
+  molecule: MoleculeObject,
+  radicalDotsToo: boolean
+): (placed: LayoutPoint) => number {
+  if (source instanceof ElectronMarkPlacementIndex) return source.chargeScorer(molecule, radicalDotsToo);
+  const bondLength = ChemDraftSyntheticStylePreset.drawing.bondLengthPx;
+  const chargeCenters = source
+    .filter((object): object is ElectronMarkObject => object.type === "electron-mark"
+      && (object.markKind === "charge" || radicalDotsToo && object.markKind === "radical-dot"))
+    .map(mark => inverseTransformPointForObject(molecule, electronMarkCenter(mark)));
+  return placed => chargeCenters.reduce((sum, center) => sum + Math.min(1, distance(placed, center) / (bondLength * 1.5)), 0);
+}
+
 /** The atom tool and import use the same open bond-growth slot and label-placement policy.
- * Keep this module independent of container decoders so importers can reuse it directly. */
+ * Keep this module independent of container decoders so importers can reuse it directly.
+ * `objects` is the page's object list, or an index of it (the same point, read in less time). */
 export function nativeChargePlacementPointForAtom(
   molecule: MoleculeObject,
   atomId: string,
-  objects: readonly DocumentObject[],
+  objects: ElectronMarkPlacementSource,
   pageWidth: number,
   pageHeight: number,
   mark?: ElectronMarkObject
@@ -4353,11 +4594,10 @@ export function nativeChargePlacementPointForAtom(
   // A charge shares its original placement policy with existing charges (the tool updates
   // their value), but a separate radical/lone pair must not be covered by the new charge.
   // Exclude a mark being repositioned: its old frame must not obstruct its own drop.
-  const occupiedMarks = objects.filter((object): object is ElectronMarkObject =>
-    object.type === "electron-mark" && object.markKind !== "charge" && object.id !== mark?.id
-      && object.anchor.kind === "atom" && object.anchor.objectId === molecule.id && object.anchor.atomId === atomId);
+  const occupiedMarks = electronMarksOnAtom(objects, molecule.id, atomId)
+    .filter(object => object.markKind !== "charge" && object.id !== mark?.id);
   // Direct drops also clear their whole frame from labels.
-  const localPoint = electronMarkPlacementPointForAtom(molecule, atomId, objects, pageWidth, pageHeight, {
+  const localPoint = placeElectronMarkForAtom(molecule, atomId, () => electronMarkChargeScorer(objects, molecule, false), pageWidth, pageHeight, {
     growthPoint: growth && growth.sourceAtomId === atomId && !growth.targetAtomId ? growth.newAtomPoint : undefined,
     mark,
     avoidLabelOverlap: mark !== undefined,
@@ -4366,24 +4606,22 @@ export function nativeChargePlacementPointForAtom(
   return localPoint && transformPointForObject(molecule, localPoint);
 }
 
-/** A radical keeps the open-angle preference, but must clear any existing mark on its atom. */
+/** A radical keeps the open-angle preference, but must clear any existing mark on its atom.
+ * `objects` is the page's object list, or an index of it (the same point, read in less time). */
 export function nativeRadicalPlacementPointForAtom(
   molecule: MoleculeObject,
   atomId: string,
-  objects: readonly DocumentObject[],
+  objects: ElectronMarkPlacementSource,
   pageWidth: number,
   pageHeight: number
 ): LayoutPoint | undefined {
-  const occupied = objects.some(object => object.type === "electron-mark"
-    && object.anchor.kind === "atom" && object.anchor.objectId === molecule.id && object.anchor.atomId === atomId);
-  if (!occupied) return nativeChargePlacementPointForAtom(molecule, atomId, objects, pageWidth, pageHeight);
-  // Retain the existing distance score as a preference among unoccupied candidates.
-  const obstacles = objects.map(object => object.type === "electron-mark" && object.markKind === "radical-dot"
-    ? { ...object, markKind: "charge" as const } : object);
-  const localPoint = electronMarkPlacementPointForAtom(molecule, atomId, obstacles, pageWidth, pageHeight, {
+  const onAtom = electronMarksOnAtom(objects, molecule.id, atomId);
+  if (!onAtom.length) return nativeChargePlacementPointForAtom(molecule, atomId, objects, pageWidth, pageHeight);
+  // Retain the existing distance score as a preference among unoccupied candidates; radical
+  // dots score as charges here.
+  const localPoint = placeElectronMarkForAtom(molecule, atomId, () => electronMarkChargeScorer(objects, molecule, true), pageWidth, pageHeight, {
     avoidLabelOverlap: false,
-    occupiedMarks: objects.filter((object): object is ElectronMarkObject => object.type === "electron-mark"
-      && object.anchor.kind === "atom" && object.anchor.objectId === molecule.id && object.anchor.atomId === atomId)
+    occupiedMarks: onAtom
   });
   return localPoint && transformPointForObject(molecule, localPoint);
 }
@@ -4401,13 +4639,26 @@ export function electronMarkPlacementPointForAtom(
   objects: readonly DocumentObject[],
   pageWidth: number,
   pageHeight: number,
-  options: {
-    growthPoint?: LayoutPoint;
-    mark?: Pick<ElectronMarkObject, "width" | "height" | "rotation">;
-    avoidLabelOverlap?: boolean;
-    /** Page-coordinate frames that must remain clear, including after placement is clamped. */
-    occupiedMarks?: readonly Pick<ElectronMarkObject, "x" | "y" | "width" | "height" | "rotation">[];
-  } = {}
+  options: ElectronMarkPlacementOptions = {}
+): LayoutPoint | undefined {
+  return placeElectronMarkForAtom(molecule, atomId, () => electronMarkChargeScorer(objects, molecule, false), pageWidth, pageHeight, options);
+}
+
+interface ElectronMarkPlacementOptions {
+  growthPoint?: LayoutPoint;
+  mark?: Pick<ElectronMarkObject, "width" | "height" | "rotation">;
+  avoidLabelOverlap?: boolean;
+  /** Page-coordinate frames that must remain clear, including after placement is clamped. */
+  occupiedMarks?: readonly Pick<ElectronMarkObject, "x" | "y" | "width" | "height" | "rotation">[];
+}
+
+function placeElectronMarkForAtom(
+  molecule: MoleculeObject,
+  atomId: string,
+  chargeScorer: () => (placed: LayoutPoint) => number,
+  pageWidth: number,
+  pageHeight: number,
+  options: ElectronMarkPlacementOptions
 ): LayoutPoint | undefined {
   const atom = molecule.atoms.find(candidate => candidate.id === atomId);
   if (!atom) return undefined;
@@ -4466,9 +4717,7 @@ export function electronMarkPlacementPointForAtom(
     return { gap, midpoint: normalizePlacementAngle(angle + gap / 2) };
   }).sort((left, right) => right.gap - left.gap || left.midpoint - right.midpoint)[0]?.midpoint ?? -Math.PI / 4;
   const otherAtoms = molecule.atoms.filter(candidate => candidate.id !== atomId);
-  const chargeCenters = objects
-    .filter((object): object is ElectronMarkObject => object.type === "electron-mark" && object.markKind === "charge")
-    .map(mark => inverseTransformPointForObject(molecule, { x: mark.x + mark.width / 2, y: mark.y + mark.height / 2 }));
+  const chargeDistanceScore = chargeScorer();
   const ringStep = Math.max(mark.width, mark.height) + clearance;
   const ringCount = occupiedFrames.length ? 1 + Math.ceil(Math.hypot(pageWidth, pageHeight) / ringStep) : 1;
   for (let ring = 0; ring < ringCount; ring++) {
@@ -4482,10 +4731,9 @@ export function electronMarkPlacementPointForAtom(
       const bondSeparation = neighborAngles.length === 0 ? Math.PI
         : Math.min(...neighborAngles.map(neighborAngle => placementAngularDistance(angle, neighborAngle)));
       const atomDistanceScore = otherAtoms.reduce((sum, otherAtom) => sum + Math.min(1, distance(placed, otherAtom) / (bondLength * 1.5)), 0);
-      const chargeDistanceScore = chargeCenters.reduce((sum, center) => sum + Math.min(1, distance(placed, center) / (bondLength * 1.5)), 0);
       const preferredScore = 1 - placementAngularDistance(angle, preferredOpenAngle) / Math.PI;
       return [{ point: placed,
-        score: bondSeparation * 1000 + atomDistanceScore * 20 + chargeDistanceScore * 10 + preferredScore - boundaryPenalty * 10 }];
+        score: bondSeparation * 1000 + atomDistanceScore * 20 + chargeDistanceScore(placed) * 10 + preferredScore - boundaryPenalty * 10 }];
     }).flat();
     const point = candidates.sort((left, right) => right.score - left.score || left.point.y - right.point.y || left.point.x - right.point.x)[0]?.point;
     if (point) return point;
