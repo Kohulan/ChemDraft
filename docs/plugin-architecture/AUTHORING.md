@@ -457,6 +457,16 @@ first — an invalid request, another of the plugin's prompts still open, or a h
 leaves it, so a corrected retry in the same invocation still works. Submit is disabled for an empty field; cancellation returns `{ status: "cancelled" }`.
 Disabling, unregistering, or terminating the plugin while its prompt is open also cancels it.
 
+`maxLength` (1–2,000, default 500) and `initialValue` count UTF-16 code units, but the desktop app
+carries the question and its answer in native messages of fixed size, so the effective limits can be
+smaller. The desktop byte limits count the text as it is sent: UTF-8 after JSON string escaping, so
+most characters cost their UTF-8 size (1 byte for ASCII, 3 for most CJK), a quotation mark or
+backslash costs 2 bytes, and a control character costs 2 (a tab or newline) or 6. An `initialValue` of at
+most 1,600 such bytes (for example 533 CJK characters) is always shown whole, except that NUL (U+0000) characters are removed (no other character is stripped); a longer one may be cut
+at a character boundary. An answer is limited to `maxLength` and to about 2,800 such bytes (for
+example 933 CJK characters): the window keeps Submit off for a longer one. The browser build has
+neither byte limit.
+
 ## External tools (0.1.8)
 
 `context.tools` lets a plugin use host-managed AI command-line tools (`claude` and `codex`). Declare
@@ -495,6 +505,25 @@ base64: typed arrays cross the worker transport through structured clone without
 The host rejects images larger than 25 MB or 8192 pixels on either side. Supported media types are
 PNG, JPEG, TIFF, and WebP. A plugin receives bytes only after the user explicitly chooses a file or
 screen region; this permission does not grant arbitrary filesystem or whole-screen access.
+
+## Bundled models in the CLI and MCP server
+
+The headless NMR command and `predict_nmr` MCP tool load a source checkout only when its plugin ID
+and directory are listed in the owner's [trust file](../../packages/chemdraft-cli/README.md#plugin-trust-file).
+`CHEMDRAFT_NMR_PLUGIN_DIR` selects a checkout. Declare `model.load` to let the CLI pass a
+scoped asset reader into the NMR runtime's existing `fetchAsset` option. In the installed desktop
+package, the runtime reads those assets through the same-origin package mechanism.
+
+The headless adapter converts the runtime's module-relative `file:` asset references to filesystem
+paths and refuses remote URLs. The host reader follows symlinks when resolving the path and checks
+that the result is inside the trusted checkout. It opens the resolved file once, checks that the
+path still resolves to the same location, and reads through the handle only if it is a regular file
+with matching bigint device and inode IDs from path stats before and after opening. It refuses a
+zero inode ID and files that exceed 256 MiB at open or during reading. These checks use separate
+filesystem calls and rely on Node's file IDs, which some Windows filesystems may report without
+guaranteeing uniqueness. Repeated concurrent path changes or nonunique IDs can defeat verification.
+The CLI and MCP server refuse `model.download` at manifest validation. Headless plugins execute as
+trusted Node code. The scope applies to the host reader.
 
 ## Host-owned structure recognition
 

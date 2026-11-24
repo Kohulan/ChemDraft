@@ -40,6 +40,8 @@ import type {
 } from "@chemdraft/plugin-api";
 import {
   PluginHost,
+  resolveObjectOnPage,
+  resolveScopedObject,
   validateTrustedPluginManifest,
   type CommandDefinition,
   type CommandRegistry,
@@ -297,7 +299,8 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
   // controller, and the controller reads manifests back off the host. Close the loop with a
   // late-bound reference so neither construction depends on the other existing first.
   let controller: PluginPanelController | undefined;
-  const prompts = new PluginPromptTextController();
+  const activeDocumentKey = () => options.getActiveDocumentKey?.() ?? documentIdentityKey(options.getActiveDocument());
+  const prompts = new PluginPromptTextController(activeDocumentKey);
   const images = new PluginImageRequestController(
     options.imageSourceRegistry ?? createDefaultImageSourceRegistry()
   );
@@ -334,12 +337,15 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
         Promise.resolve({ available: false, reason: "Structure layout engine unavailable." }) :
         options.buildStructureFromSmiles ? options.buildStructureFromSmiles(request) : structureFromSmilesForPlugin(request, getDocument),
       inspectStructure: inspectStructureOffThread,
-      structureToName: async request => {
+      structureToName: async (request, pageId) => {
         const engine = options.structureNamingEngine ?? new TauriStructureNamingEngine();
         const status = await engine.status();
         if (status.state === "unsupported") return { status: "unsupported", reason: status.detail ?? "This computer cannot run the naming engine." };
         if (status.state !== "installed") return { status: "engineNotInstalled" };
-        const molecule = getDocument()?.pages.flatMap(page => page.objects).find(object => object.id === request.objectId);
+        const document = getDocument();
+        // By page and id: an id that also names an object on another page never resolves to it.
+        const molecule = !document ? undefined : pageId !== undefined ? resolveObjectOnPage(document, pageId, request.objectId)?.object
+          : resolveScopedObject(document, request.objectId).object;
         if (!molecule || molecule.type !== "molecule") throw new Error("The requested molecule is unavailable.");
         return nameStructureForPlugin(molecule, engine, status, options.namingCanonicalizer);
       }
@@ -360,6 +366,9 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
       return port.runWrite(apply);
     }),
     readDocument: options.getAssistantDocument ?? (tabId => getAssistantHistoryPort().read(tabId)),
+    // The same per-tab document identity public requests use, so a legacy request never follows its
+    // tab into a replaced document.
+    captureDocument: options.captureRequestDocument,
     transactions: options.assistantTransactions,
   });
   const commandInvocations = new Map<symbol, { pluginId: string; stop: AbortController }>();
@@ -586,7 +595,7 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
     showPanelReport: (pluginId, panelId, report) => {
       controller?.showReport(pluginId, panelId, report);
     },
-    promptText: (plugin, request, signal) => prompts.promptText(plugin, request, signal),
+    promptText: (plugin, request, signal, context) => prompts.promptText(plugin, request, signal, context?.documentKey),
     requestImage: (plugin, request, signal) => images.requestImage(plugin, request, signal),
     recognizeStructure: (plugin, image, signal) => recognition.recognize(plugin, image, signal),
     externalTools,
@@ -653,6 +662,10 @@ export function createPluginRuntime(options: DesktopPluginRuntimeOptions): Deskt
 
   const runtime: DesktopPluginRuntime = {
     notifyActiveDocumentChanged(documentKey) {
+      // A prompt's command can write only to the document it started on, so its answer is accepted
+      // only while that document is active; the window going away ends every document-bound prompt.
+      if (documentKey === null) prompts.cancelDocument(null);
+      else prompts.activeDocumentChanged();
       if (activeDocument?.documentKey === documentKey) return;
       activeDocument = { documentKey, sequence: (activeDocument?.sequence ?? 0) + 1 };
       for (const registration of registrations.values()) deliverActiveDocument(registration);
