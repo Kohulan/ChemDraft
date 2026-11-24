@@ -12,6 +12,7 @@ import {
 } from "@chemdraft/layout-engine";
 import { formulaSpansForReactionCondition } from "./formulaText";
 import { estimateNativeTextSpanLineWidth, nativeTextObjectSizeForSpanLines } from "./textObjects";
+import { wrapPieces } from "./reactionLabelWrap";
 
 export interface ReactionLabelsOptions {
   above: readonly string[];
@@ -40,7 +41,8 @@ export interface ReactionLabelsPlan {
 }
 
 // Journal-scheme policy, in bond lengths or em so it follows the caller's drawing scale.
-const labelWidthInBonds = 10;
+/** Reagent and condition lines wrap at this width; the arrow is then sized to the widest line. */
+export const reactionLabelWrapWidthInBonds = 8.5;
 const minimumArrowInBonds = 3;
 const arrowHeadClearanceEm = 0.25;
 const arrowClearanceEm = 0.3;
@@ -67,20 +69,29 @@ function explicitLines(entries: readonly string[]): string[] {
     .map((line) => line.replace(/^[ \t]+|[ \t]+$/g, "")).filter(Boolean);
 }
 
+/** Wraps greedily, but when a conditions line must break it breaks after the last fitting piece that ends in a
+ * comma outside parentheses. A piece wider than the limit sits alone on its line and overflows; it is never split.
+ * Each break drops the spaces/tabs it falls on and the lines are joined with "\n", as before this policy. */
 function wrapLines(authoredLines: readonly string[], style: NativeTextStyle, maxWidth: number, caption: boolean): string[] {
+  const fits = (text: string) => estimateNativeTextSpanLineWidth(lineSpans(text, caption), style) <= maxWidth;
+  const trimEnd = (text: string) => text.replace(/[ \t]+$/, "");
   return authoredLines.flatMap((line) => {
-    if (estimateNativeTextSpanLineWidth(lineSpans(line, caption), style) <= maxWidth) return [line];
+    if (fits(line)) return [line];
+    const pieces = wrapPieces(line, !caption);
     const lines: string[] = [];
-    let current = "";
-    // Break only at spaces/tabs; NBSP and narrow NBSP stay inside indivisible tokens.
-    for (const match of line.matchAll(/[^ \t]+[ \t]*/g)) {
-      const candidate = current + match[0];
-      if (current && estimateNativeTextSpanLineWidth(lineSpans(candidate.replace(/[ \t]+$/, ""), caption), style) > maxWidth) {
-        lines.push(current.replace(/[ \t]+$/, ""));
-        current = match[0];
-      } else current = candidate;
+    let start = 0;
+    while (start < pieces.length) {
+      // The longest run from `start` that fits, always at least one piece.
+      let end = start + 1;
+      while (end < pieces.length && fits(trimEnd(pieces.slice(start, end + 1).map((piece) => piece.text).join("")))) end++;
+      if (end < pieces.length && !caption) {
+        for (let breakAt = end; breakAt > start; breakAt--) {
+          if (pieces[breakAt - 1]!.commaBreak) { end = breakAt; break; }
+        }
+      }
+      lines.push(trimEnd(pieces.slice(start, end).map((piece) => piece.text).join("")));
+      start = end;
     }
-    if (current) lines.push(current.replace(/[ \t]+$/, ""));
     return lines;
   });
 }
@@ -123,7 +134,7 @@ function measureBlock(entries: readonly string[], style: NativeTextStyle, maxWid
 /** Plans explicit lines and measures each block once, before molecule placement needs its arrow. */
 export function planReactionLabels(options: ReactionLabelsOptions): ReactionLabelsPlan {
   const textStyle = nativeTextStyleFromObjectStyle({ ...defaultLabelStyle, ...options.textStyle });
-  const maxWidth = labelWidthInBonds * options.bondLength;
+  const maxWidth = reactionLabelWrapWidthInBonds * options.bondLength;
   const above = measureBlock(options.above, textStyle, maxWidth);
   const below = measureBlock(options.below, textStyle, maxWidth);
   return {
