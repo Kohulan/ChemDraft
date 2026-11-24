@@ -1,10 +1,12 @@
-import { normalizeShortcut, parseShortcutDisplay } from "@chemdraft/shortcut-engine";
+import { editShortcut, normalizeShortcut, parseShortcutDisplay } from "@chemdraft/shortcut-engine";
 import { describe, expect, it } from "vitest";
 import { buildAppMenuModel, flattenAppMenuCommands } from "./appMenu";
 import { createLayerActions, createQuickActions } from "./commands";
 import { createPhase4Document } from "./documentWorkflow";
 import { withStandaloneDrawingToolCommands } from "./drawingTools";
-import { applyKeybindingSchemeToCommands } from "./keybindingScheme";
+import { keyboardShortcutActions, nativeMenuShortcutOverrides } from "./customKeyboardShortcuts";
+import { applyKeybindingSchemeToCommands, createHoverShortcutTables } from "./keybindingScheme";
+import { DEFAULT_KEYBINDING_SETTINGS, LEGACY_DEFAULT_KEYBINDING_SCHEME } from "./keybindingSettings";
 import {
   createDesktopShortcutRegistry,
   createMainWindowShortcutCommands,
@@ -73,6 +75,33 @@ describe("document window shortcuts", () => {
   });
 });
 
+describe.each(["windows", "macos"] as const)("default scheme for new installs (%s)", platform => {
+  // The default only reaches new installs: shortcutDefaultMigration.ts pins existing ones to
+  // LEGACY_DEFAULT_KEYBINDING_SCHEME first. What the default resolves to must hold on both platforms.
+  it("binds the industry-standard keys in the document window", () => {
+    const document = createPhase4Document("Default scheme");
+    const scheme = DEFAULT_KEYBINDING_SETTINGS.scheme;
+    const commands = createMainWindowShortcutCommands({
+      quickActions: createQuickActions(document, undefined, { canUndo: true, canRedo: true }),
+      layerActions: createLayerActions(document),
+      toolCommandSpecs: applyKeybindingSchemeToCommands(
+        withStandaloneDrawingToolCommands(getToolsetCommandSpecs(desktopToolsetRegistry)), scheme)
+    }, scheme, undefined, platform);
+    const registry = createDesktopShortcutRegistry(commands, { platform, includeDisabled: true });
+    expect(registry.resolve({ key: "x" })).toBe("tool.bond");
+    expect(registry.resolve({ key: " " })).toBe("tool.select");
+    expect(registry.resolve({ key: ";", ...(platform === "macos" ? { metaKey: true } : { ctrlKey: true }) }))
+      .toBe("view.toggleRulers");
+    expect(createHoverShortcutTables(scheme).atom.get("b")).toBe("atom.setHoveredElement.Br");
+  });
+
+  it("leaves the old default on ChemDraft's own keys", () => {
+    const legacy = keyboardShortcutActions(LEGACY_DEFAULT_KEYBINDING_SCHEME, platform);
+    expect(legacy.find(action => action.id === "tool.bond")?.defaults).not.toContain("X");
+    expect(createHoverShortcutTables(LEGACY_DEFAULT_KEYBINDING_SCHEME).atom.get("b")).toBe("atom.setHoveredElement.B");
+  });
+});
+
 describe("isBrowserReloadChord", () => {
   it("recognises WebView2's reload accelerators off macOS", () => {
     for (const platform of ["windows", "linux"] as const) {
@@ -113,5 +142,59 @@ describe("last document close command", () => {
     const macos = enableWindowsLastDocumentCloseAction(actions, "macos");
     expect(createDesktopShortcutRegistry(macos, "macos").resolve({ key: "w", metaKey: true })).toBeUndefined();
     expect(macos.find((action) => action.id === "document.closeTab")).toMatchObject({ enabled: false });
+  });
+});
+
+describe.each(["windows", "macos"] as const)("custom keyboard shortcuts (%s)", platform => {
+  it("applies overrides to the window registry, menus, and hovered targets", () => {
+    const scheme = "chemdraw";
+    const actions = keyboardShortcutActions(scheme, platform);
+    const save = actions.find(action => action.id === "document.save")!;
+    const bond = actions.find(action => action.id === "tool.bond")!;
+    const bromine = actions.find(action => action.id === "atom.setHoveredElement.Br")!;
+    const boron = actions.find(action => action.id === "atom.setHoveredElement.B")!;
+    expect(bromine.defaults).toEqual(["b"]);
+    expect(boron.defaults).toEqual(["B"]);
+    expect(actions.every(action => !action.title.startsWith("atom.") && !action.title.startsWith("bond."))).toBe(true);
+    const overrides = { commands: { [save.id]: ["Mod+F9"], [bond.id]: ["F10"] }, atom: { [bromine.id]: ["D"] } };
+    const document = createPhase4Document("Custom shortcuts");
+    const commands = createMainWindowShortcutCommands({
+      quickActions: createQuickActions(document, undefined),
+      layerActions: createLayerActions(document),
+      toolCommandSpecs: withStandaloneDrawingToolCommands(getToolsetCommandSpecs())
+    }, scheme, overrides, platform);
+    const registry = createDesktopShortcutRegistry(commands, { platform, overrides });
+    const mod = platform === "macos" ? { metaKey: true } : { ctrlKey: true };
+    expect(registry.resolve({ key: "F9", ...mod })).toBe(save.id);
+    expect(registry.resolve({ key: "s", ...mod })).toBeUndefined();
+    expect(registry.resolve({ key: "F10" })).toBe(bond.id);
+    expect(registry.resolve({ key: "x" })).not.toBe(bond.id);
+    const menu = buildAppMenuModel({
+      rulersVisible: true, crosshairsVisible: true, canUndo: true, canRedo: true,
+      hasSelection: true, hasSelectedMolecule: true, toolbars: [], platform,
+      keybindingScheme: scheme, keybindingOverrides: overrides
+    });
+    expect(flattenAppMenuCommands(menu).find(item => item.commandId === save.id)).toMatchObject({
+      accelerator: "Mod+F9", shortcut: platform === "macos" ? "⌘F9" : "Ctrl+F9"
+    });
+    expect(nativeMenuShortcutOverrides(overrides, platform)).toEqual({
+      [save.id]: platform === "macos" ? "Cmd+f9" : "Ctrl+f9"
+    });
+    const hover = createHoverShortcutTables(scheme, overrides);
+    expect(hover.atom.get("D")).toBe(bromine.id);
+    expect(hover.atom.get("b")).toBeUndefined();
+    expect(hover.atom.get("B")).toBe(boron.id);
+    const cleared = editShortcut(actions, overrides, save, { kind: "clear" }, platform);
+    expect(cleared.kind === "updated" && nativeMenuShortcutOverrides(cleared.overrides, platform)).toEqual({ [save.id]: null });
+  });
+
+  it("includes and clears the Windows redo alternate with its action", () => {
+    const redo = keyboardShortcutActions("chemdraft", platform).find(action => action.id === "edit.redo");
+    expect(redo?.defaults.includes("Ctrl+Y")).toBe(platform === "windows");
+    const overrides = { commands: { "edit.redo": [] } };
+    const commands = applyKeybindingSchemeToCommands([
+      { id: "edit.redo", title: "Redo", icon: "redo", source: "core", shortcut: "Mod+Shift+Z" }
+    ], "chemdraft", overrides, platform);
+    expect(createDesktopShortcutRegistry(commands, { platform, overrides }).resolve({ key: "y", ctrlKey: true })).toBeUndefined();
   });
 });

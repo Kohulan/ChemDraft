@@ -53,6 +53,8 @@ import {
   placementAimDegrees,
   planReactionArrowGeometry,
   bracketGlyphPathD,
+  importedRingDoubleBondPlacements,
+  reconcileRingDoubleBondSides,
   ringInteriorDoubleBondSides,
   type ResolvedBondCrossing,
   type BondExtensionPlanningInput,
@@ -5198,6 +5200,79 @@ describe("ring-interior double bond side", () => {
       ]
     });
     expect(ringInteriorDoubleBondSides(molecule).size).toBe(0);
+  });
+
+  it.each([false, true])("keeps a theta-graph offset into the omitted ring (longer third path: %s)", longerPath => {
+    const points = {
+      u: [0, 0], v: [0, 6], a1: [-3, 2], a2: [-3, 4], b1: [0, 2], b2: [0, 4], c1: [3, 2], c2: [3, 4],
+      ...(longerPath ? { c3: [4, 3] } : {})
+    };
+    const paths = [["u", "a1", "a2", "v"], ["u", "b1", "b2", "v"],
+      longerPath ? ["u", "c1", "c3", "c2", "v"] : ["u", "c1", "c2", "v"]];
+    const molecule = moleculeObject({
+      atoms: Object.entries(points).map(([id, [x, y]]) => ({ id, element: "C", x, y, formalCharge: 0 })),
+      bonds: paths.flatMap(path => path.slice(1).map((toAtomId, i) => {
+        const fromAtomId = path[i]!;
+        const id = `${fromAtomId}-${toAtomId}`;
+        return id === "b1-b2"
+          ? { id, fromAtomId, toAtomId, order: "double", display: { doubleBondSide: "right", doubleBondSideSource: "imported" } }
+          : { id, fromAtomId, toAtomId, order: "single" };
+      }))
+    });
+
+    expect(ringInteriorDoubleBondSides(molecule).get("b1-b2")).toBe("left");
+    expect(importedRingDoubleBondPlacements(molecule).interiorSides.get("b1-b2")).toBe("right");
+    const bonds = reconcileRingDoubleBondSides(molecule, molecule, undefined, { repairStationaryOffsets: true });
+    expect(bonds.find(bond => bond.id === "b1-b2")?.display)
+      .toEqual({ doubleBondSide: "right", doubleBondSideSource: "imported" });
+  });
+
+  it("repairs an offset that faces a chorded perimeter and lies outside its owning ring", () => {
+    const molecule = moleculeObject({
+      atoms: [
+        { id: "b1", element: "C", x: 0, y: 0, formalCharge: 0 },
+        { id: "b2", element: "C", x: 0, y: 6, formalCharge: 0 },
+        { id: "a", element: "C", x: -1, y: 3, formalCharge: 0 },
+        { id: "c", element: "C", x: 4, y: 3, formalCharge: 0 }
+      ],
+      bonds: [
+        { id: "b1-b2", fromAtomId: "b1", toAtomId: "b2", order: "double",
+          display: { doubleBondSide: "right", doubleBondSideSource: "imported" } },
+        { id: "b2-a", fromAtomId: "b2", toAtomId: "a", order: "single" },
+        { id: "a-b1", fromAtomId: "a", toAtomId: "b1", order: "single" },
+        { id: "a-c", fromAtomId: "a", toAtomId: "c", order: "single" },
+        { id: "c-b1", fromAtomId: "c", toAtomId: "b1", order: "single" }
+      ]
+    });
+
+    const [bond] = reconcileRingDoubleBondSides(molecule, molecule, undefined, { repairStationaryOffsets: true });
+    expect(bond?.display?.doubleBondSide).toBe("left");
+  });
+
+  it("preserves the imported offset when a diamond chain exhausts the owning-ring search", () => {
+    // Each diamond doubles the number of chordless paths between the double bond's endpoints.
+    const count = 12;
+    const atoms: MoleculeObject["atoms"] = Array.from({ length: count + 1 }, (_, i) => ({
+      id: `join-${i}`, element: "C", x: 2 * i, y: 0, formalCharge: 0
+    }));
+    const bonds: MoleculeObject["bonds"] = [{
+      id: "double", fromAtomId: "join-0", toAtomId: `join-${count}`, order: "double",
+      display: { doubleBondSide: "right", doubleBondSideSource: "imported" }
+    }];
+    for (let i = 0; i < count; i++) {
+      for (const y of [1, 2]) {
+        const id = `branch-${i}-${y}`;
+        atoms.push({ id, element: "C", x: 2 * i + 1, y, formalCharge: 0 });
+        bonds.push(
+          { id: `${id}-start`, fromAtomId: `join-${i}`, toAtomId: id, order: "single" },
+          { id: `${id}-end`, fromAtomId: id, toAtomId: `join-${i + 1}`, order: "single" }
+        );
+      }
+    }
+    const molecule = moleculeObject({ atoms, bonds });
+
+    expect(ringInteriorDoubleBondSides(molecule).get("double")).toBe("left");
+    expect(reconcileRingDoubleBondSides(molecule, molecule, undefined, { repairStationaryOffsets: true })).toBe(bonds);
   });
 });
 
