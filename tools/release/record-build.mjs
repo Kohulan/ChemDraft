@@ -15,7 +15,8 @@ export const LINUX_BUILD_TARGET = "x86_64-unknown-linux-gnu";
 export const BUILD_TARGETS = {
   "aarch64-apple-darwin": ["aarch64.dmg"],
   "x86_64-apple-darwin": ["x86_64.dmg"],
-  "x86_64-pc-windows-msvc": ["x64-setup.exe"],
+  // Per-user, all-users, and all-users offline (WebView2 bundled) NSIS installers.
+  "x86_64-pc-windows-msvc": ["x64-setup.exe", "x64-allusers-setup.exe", "x64-allusers-offline-setup.exe"],
   [LINUX_BUILD_TARGET]: ["amd64.deb", "amd64.AppImage"]
 };
 

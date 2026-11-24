@@ -4,9 +4,10 @@ import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { draftReleaseBody } from "./draft-release-body.mjs";
+import { draftReleaseBody, windowsInstallerLines } from "./draft-release-body.mjs";
+import { BUILD_TARGETS } from "./record-build.mjs";
 import { releaseBuildFiles } from "./release-assets.mjs";
-import { appImage, arm, commit, deb, fakeReleaseRunner, installer, intel, releaseFixture, updaterPublicKey, version } from "./release-test-fixtures.mjs";
+import { allusersInstaller, appImage, arm, commit, deb, fakeReleaseRunner, installer, intel, offlineInstaller, releaseFixture, updaterPublicKey, version, windowsInstallers, windowsUpdates } from "./release-test-fixtures.mjs";
 
 const feed = (name) => `<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel><item><sparkle:version>${version}</sparkle:version><enclosure url="https://example.com/${name}"/></item></channel></rss>`;
 
@@ -37,6 +38,28 @@ test("three-build release produces ordered sections with explicit gaps or explic
   assert.match(sections[3], /^Windows\n\nWindows notes/);
   assert.match(sections[3], /Not in this build: Feature B: reason/);
   assert.match(draft(args), /Platform differences: None\./);
+});
+
+test("Windows section lists all three installers, the offline one labelled for IT-managed machines", (t) => {
+  const args = fixture(t, { withLinux: false });
+  const windows = draft({ ...args, noGaps: false, gaps: ["windows:Feature B: reason"] }).split(/^## /m)[3];
+  const list = windowsInstallers.map(({ name, label }) => `- \`${name}\`: ${label}`).join("\n");
+  assert.ok(windows.startsWith(`Windows\n\nWindows notes\n\nInstallers:\n\n${list}\n\nNot in this build: Feature B: reason`), windows);
+  assert.ok(windows.includes(`- \`${offlineInstaller}\`: offline, for IT-managed machines\n`));
+  assert.equal(windows.match(/^- `ChemDraft_.*\.exe`: /gm).length, 3);
+});
+
+test("an installer built without a release-page label fails the Windows section", () => {
+  const suffixes = BUILD_TARGETS["x86_64-pc-windows-msvc"];
+  const original = [...suffixes];
+  try {
+    suffixes.push("x64-unlabelled-setup.exe");
+    assert.throws(() => windowsInstallerLines(version), /No release-page label for Windows installer x64-unlabelled-setup\.exe/);
+  } finally {
+    suffixes.splice(0, suffixes.length, ...original);
+  }
+  assert.deepEqual(suffixes, original);
+  assert.equal(windowsInstallerLines(version).length, 3);
 });
 
 test("five-build release includes a Linux beta section and accepts Linux gaps", (t) => {
@@ -72,8 +95,9 @@ test("neither gap choice is refused, including by the CLI", (t) => {
   assert.match(result.stderr, /--gap.*--no-gaps/);
 });
 
-const buildNames = [arm, intel, installer, deb, appImage];
-for (const name of [...buildNames, `${installer}.sig`, "latest.json", "appcast.xml", "appcast-intel.xml", ...buildNames.map((name) => `${name}.build.json`)]) {
+const buildNames = [arm, intel, installer, allusersInstaller, offlineInstaller, deb, appImage];
+const windowsUpdateNames = windowsUpdates.flatMap(({ installer: name, feed }) => [`${name}.sig`, feed]);
+for (const name of [...buildNames, ...windowsUpdateNames, "appcast.xml", "appcast-intel.xml", ...buildNames.map((name) => `${name}.build.json`)]) {
   test(`missing ${name} is named`, (t) => {
     const args = fixture(t);
     unlinkSync(join(args.assets, name));
@@ -87,7 +111,7 @@ test("feed pointing to the wrong architecture fails", (t) => {
   assert.throws(() => draft(args), /appcast-intel\.xml:.*x86_64/);
 });
 
-for (const [name, garbage] of [[`${installer}.sig`, "not a signature"], ["latest.json", "not JSON"]]) {
+for (const [name, garbage] of windowsUpdates.flatMap(({ installer: file, feed }) => [[`${file}.sig`, "not a signature"], [feed, "not JSON"]])) {
   for (const state of ["absent", "garbage"]) {
     test(`release body refuses ${state} Windows updater ${name} with valid build/record pairs`, (t) => {
       const args = fixture(t);

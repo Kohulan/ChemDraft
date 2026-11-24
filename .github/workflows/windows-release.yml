@@ -74,7 +74,7 @@ jobs:
           }
           $config = Get-Content apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
           if ($env:RELEASE_TAG -and $env:RELEASE_TAG -cne "v$($config.version)") {
-            throw 'upload_to_release must be v<app version>, matching latest.json download URLs.'
+            throw 'upload_to_release must be v<app version>, matching both update feeds.'
           }
           if ($env:NOTES_FILE) {
             $root = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE) + [IO.Path]::DirectorySeparatorChar
@@ -105,50 +105,80 @@ jobs:
       - name: Build host-native OPSIN runtime and smoke test benzene
         run: node scripts/build-opsin-runtime.mjs
 
-      - name: Build stable NSIS installer without updater signing
+      - name: Generate all-users offline installer config
+        # Outside the checkout: record-build refuses a source tree with untracked files.
+        run: |
+          node scripts/windows-offline-installer.mjs config "$env:RUNNER_TEMP/ci-offline.conf.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Offline installer config generation failed.' }
+
+      - name: Build, verify and stage stable NSIS installers without updater signing
+        id: bundle
         env:
           CHEMDRAFT_STABLE_BUILD: '1'
           CHEMDRAFT_SKIP_UPDATER_SIGNING: '1'
           NODE_OPTIONS: --max-old-space-size=6144  # 16 GB runner; build:web peaks near 4.8 GB (see ci.yml)
-        run: pnpm --filter @chemdraft/desktop build --bundles nsis
-
-      - name: Verify stable bundle identity and stage unsigned installer
-        id: bundle
         run: |
-          # tauri-build copies resource targets beside the release executable, which NSIS bundles.
-          node tools/release/verify-bundle-licenses.mjs apps/desktop/src-tauri/target/release
-          if ($LASTEXITCODE -ne 0) { throw 'Required bundled licences are missing from the release resource staging directory.' }
-          $config = Get-Content apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
-          $windows = Get-Content apps/desktop/src-tauri/tauri.windows.conf.json -Raw | ConvertFrom-Json
-          $identifier = if ($windows.identifier) { $windows.identifier } else { $config.identifier }
-          $product = if ($windows.productName) { $windows.productName } else { $config.productName }
-          if ($identifier -cne 'org.chemdraft.desktop' -or $product -cne 'ChemDraft') { throw 'Bundle has a development identity.' }
-          # build.rs re-emits the label into the compiled native title. Inspect the latest build output.
-          $output = Get-ChildItem apps/desktop/src-tauri/target/release/build/chemdraft-*/output |
-            Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
-          if (-not $output) { throw 'No native build output to verify.' }
-          $labels = @(Get-Content $output.FullName | Where-Object { $_ -like 'cargo:rustc-env=CHEMDRAFT_WORKTREE_LABEL=*' })
-          if ($labels.Count -ne 1 -or $labels[0] -cne 'cargo:rustc-env=CHEMDRAFT_WORKTREE_LABEL=') { throw 'Native build has a worktree label.' }
-          $shortSha = (git rev-parse --short HEAD).Trim()
-          $assets = (Get-ChildItem apps/desktop/dist/assets/*.js | Get-Content -Raw) -join "`n"
-          if ($assets -notmatch "\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} $shortSha" -or
-              $assets -match '\[[^\]\r\n]+\] (?:·|\\x[bB]7|\\u00[bB]7) \d{4}-\d{2}-\d{2}') { throw 'Frontend build stamp missing or labelled.' }
+          # Add future variants here; build/rename, signing and upload share this list.
+          $variants = @(
+            @{ Suffix = ''; Config = ''; Feed = 'latest.json' },
+            @{ Suffix = '-allusers'; Config = 'src-tauri/tauri.allusers.conf.json'; Feed = 'latest-allusers.json' },
+            @{ Suffix = '-allusers-offline'; Config = @('src-tauri/tauri.allusers.conf.json', "$env:RUNNER_TEMP/ci-offline.conf.json"); Feed = '' }
+          )
           $bundleDir = 'apps/desktop/src-tauri/target/release/bundle/nsis'
-          $installers = @(Get-ChildItem "$bundleDir/*.exe")
-          $expected = "ChemDraft_$($config.version)_x64-setup.exe"
-          if ($installers.Count -ne 1 -or $installers[0].Name -cne $expected) { throw 'Expected exactly one stable x64 installer.' }
-          if (Get-ChildItem "$bundleDir/*.sig") { throw 'Updater signing ran before Authenticode.' }
-          # record-build resolves git rev-parse HEAD in this checkout and refuses a dirty tree.
-          # Do this before creating the untracked release-assets staging directory.
-          node tools/release/record-build.mjs --artifact $installers[0].FullName --target x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { throw 'Release build record failed.' }
+          # record-build resolves git rev-parse HEAD in this checkout and refuses a dirty tree, so
+          # stage every installer and its record outside the checkout until all variants are built.
+          $staging = Join-Path $env:RUNNER_TEMP 'windows-installers'
+          New-Item -ItemType Directory -Path $staging -Force | Out-Null
+          $artifacts = @()
+          foreach ($variant in $variants) {
+            # Tauri gives each variant the same original filename. Stage it before the next build.
+            if (Test-Path -LiteralPath $bundleDir) { Remove-Item -LiteralPath $bundleDir -Recurse -Force }
+            $buildArgs = @('--filter', '@chemdraft/desktop', 'build', '--bundles', 'nsis')
+            foreach ($variantConfig in @($variant.Config)) {
+              if ($variantConfig) { $buildArgs += @('--config', $variantConfig) }
+            }
+            pnpm @buildArgs
+            if ($LASTEXITCODE -ne 0) { throw "NSIS build failed for suffix '$($variant.Suffix)'." }
+            # tauri-build copies resource targets beside the release executable, which NSIS bundles.
+            node tools/release/verify-bundle-licenses.mjs apps/desktop/src-tauri/target/release
+            if ($LASTEXITCODE -ne 0) { throw 'Required bundled licences are missing from the release resource staging directory.' }
+            $config = Get-Content apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+            $windows = Get-Content apps/desktop/src-tauri/tauri.windows.conf.json -Raw | ConvertFrom-Json
+            $identifier = if ($windows.identifier) { $windows.identifier } else { $config.identifier }
+            $product = if ($windows.productName) { $windows.productName } else { $config.productName }
+            if ($identifier -cne 'org.chemdraft.desktop' -or $product -cne 'ChemDraft') { throw 'Bundle has a development identity.' }
+            # build.rs re-emits the label into the compiled native title. Inspect the latest build output.
+            $output = Get-ChildItem apps/desktop/src-tauri/target/release/build/chemdraft-*/output |
+              Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+            if (-not $output) { throw 'No native build output to verify.' }
+            $labels = @(Get-Content $output.FullName | Where-Object { $_ -like 'cargo:rustc-env=CHEMDRAFT_WORKTREE_LABEL=*' })
+            if ($labels.Count -ne 1 -or $labels[0] -cne 'cargo:rustc-env=CHEMDRAFT_WORKTREE_LABEL=') { throw 'Native build has a worktree label.' }
+            $shortSha = (git rev-parse --short HEAD).Trim()
+            $assets = (Get-ChildItem apps/desktop/dist/assets/*.js | Get-Content -Raw) -join "`n"
+            if ($assets -notmatch "\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} $shortSha" -or
+                $assets -match '\[[^\]\r\n]+\] (?:·|\\x[bB]7|\\u00[bB]7) \d{4}-\d{2}-\d{2}') { throw 'Frontend build stamp missing or labelled.' }
+            $installers = @(Get-ChildItem "$bundleDir/*.exe")
+            $original = "ChemDraft_$($config.version)_x64-setup.exe"
+            if ($installers.Count -ne 1 -or $installers[0].Name -cne $original) { throw 'Expected exactly one stable x64 installer per variant.' }
+            if (Get-ChildItem "$bundleDir/*.sig") { throw 'Updater signing ran before Authenticode.' }
+            $expected = "ChemDraft_$($config.version)_x64$($variant.Suffix)-setup.exe"
+            $staged = Join-Path $staging $expected
+            Copy-Item -LiteralPath $installers[0].FullName -Destination $staged
+            node tools/release/record-build.mjs --artifact $staged --target x86_64-pc-windows-msvc
+            if ($LASTEXITCODE -ne 0) { throw "Release build record failed for $expected." }
+            $artifacts += @{ Installer = $expected; Feed = $variant.Feed }
+            Write-Host "Verified identifier=$identifier; product=$product; worktree label=<empty>; frontend commit=$shortSha; installer=$expected"
+          }
+          # Create the untracked release-assets staging directory only after every record is written.
           New-Item -ItemType Directory -Path release-assets | Out-Null
-          Copy-Item -LiteralPath $installers[0].FullName -Destination release-assets
-          Copy-Item -LiteralPath "$($installers[0].FullName).build.json" -Destination release-assets
+          foreach ($artifact in $artifacts) {
+            $staged = Join-Path $staging $artifact.Installer
+            Copy-Item -LiteralPath $staged -Destination (Join-Path release-assets $artifact.Installer)
+            Copy-Item -LiteralPath "$staged.build.json" -Destination release-assets
+          }
           "version=$($config.version)" >> $env:GITHUB_OUTPUT
           "commit=$((git rev-parse HEAD).Trim())" >> $env:GITHUB_OUTPUT
-          "installer=$expected" >> $env:GITHUB_OUTPUT
-          Write-Host "Verified identifier=$identifier; product=$product; worktree label=<empty>; frontend commit=$shortSha"
+          "installers=$(ConvertTo-Json -InputObject $artifacts -Compress)" >> $env:GITHUB_OUTPUT
 
       # Signing secrets are step-scoped: no setup/cache/artifact action receives them.
       - name: Check signing availability
@@ -175,10 +205,10 @@ jobs:
           if ($env:TAURI_SIGNING_PRIVATE_KEY) {
             'updater=true' >> $env:GITHUB_OUTPUT
           } else {
-            Write-Host '::warning::TAURI_SIGNING_PRIVATE_KEY is missing. Skipping updater .sig and latest.json; installer cannot be published as an update.'
+            Write-Host '::warning::TAURI_SIGNING_PRIVATE_KEY is missing. Skipping updater .sig files, latest.json and latest-allusers.json; neither installer can be published as an update.'
           }
 
-      - name: Upload unsigned installer for SignPath provenance
+      - name: Upload unsigned installers for SignPath provenance
         id: unsigned
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -188,7 +218,7 @@ jobs:
             release-assets/*.exe.build.json
           if-no-files-found: error
 
-      - name: Authenticode-sign and download final installer
+      - name: Authenticode-sign and download final installers
         if: steps.signing.outputs.authenticode == 'true'
         # https://github.com/SignPath/github-action-submit-signing-request/releases/tag/v2
         uses: signpath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627 # v2.3
@@ -202,68 +232,89 @@ jobs:
           wait-for-completion-timeout-in-seconds: 3600
           output-artifact-directory: signpath-signed
 
-      - name: Verify Authenticode and replace unsigned installer
+      - name: Verify Authenticode and replace unsigned installers
         id: authenticode
         if: steps.signing.outputs.authenticode == 'true'
         env:
           EXPECTED_AUTHENTICODE_SUBJECT: ${{ vars.EXPECTED_AUTHENTICODE_SUBJECT }}
-          INSTALLER: ${{ steps.bundle.outputs.installer }}
+          INSTALLERS: ${{ steps.bundle.outputs.installers }}
         run: |
-          # Keep source identity; the final-byte record is rebound after signing below.
-          $signed = @(Get-ChildItem signpath-signed -Recurse -File | Where-Object { $_.Name -cne "$env:INSTALLER.build.json" })
-          if ($signed.Count -ne 1 -or $signed[0].Name -cne $env:INSTALLER) { throw 'SignPath must return exactly the expected installer.' }
-          $signature = Get-AuthenticodeSignature -LiteralPath $signed[0].FullName
-          if ($signature.Status -ne 'Valid') { throw "Authenticode verification failed: $($signature.Status)" }
-          Write-Host "Authenticode: Valid; publisher=$($signature.SignerCertificate.Subject)"
+          $installers = @($env:INSTALLERS | ConvertFrom-Json)
+          # Keep source identity; each final-byte record is rebound after signing below.
+          $signed = @(Get-ChildItem signpath-signed -Recurse -File | Where-Object { $_.Name -notlike '*.build.json' })
+          if ($signed.Count -ne $installers.Count) { throw 'SignPath must return exactly the expected installers.' }
           if ([string]::IsNullOrWhiteSpace($env:EXPECTED_AUTHENTICODE_SUBJECT)) {
             throw 'EXPECTED_AUTHENTICODE_SUBJECT repository variable is required when Authenticode signing runs. Set it to the expected signer certificate subject substring.'
           }
-          if (-not $signature.SignerCertificate.Subject.Contains($env:EXPECTED_AUTHENTICODE_SUBJECT)) {
-            throw "Authenticode signer subject does not contain EXPECTED_AUTHENTICODE_SUBJECT: $($signature.SignerCertificate.Subject)"
+          foreach ($installer in $installers) {
+            $match = @($signed | Where-Object { $_.Name -ceq $installer.Installer })
+            if ($match.Count -ne 1) { throw "SignPath did not return exactly one $($installer.Installer)." }
+            $signature = Get-AuthenticodeSignature -LiteralPath $match[0].FullName
+            if ($signature.Status -ne 'Valid') { throw "Authenticode verification failed for $($installer.Installer): $($signature.Status)" }
+            Write-Host "Authenticode: Valid; installer=$($installer.Installer); publisher=$($signature.SignerCertificate.Subject)"
+            if (-not $signature.SignerCertificate.Subject.Contains($env:EXPECTED_AUTHENTICODE_SUBJECT)) {
+              throw "Authenticode signer subject does not contain EXPECTED_AUTHENTICODE_SUBJECT: $($signature.SignerCertificate.Subject)"
+            }
+            Copy-Item -LiteralPath $match[0].FullName -Destination (Join-Path release-assets $installer.Installer) -Force
           }
-          Copy-Item -LiteralPath $signed[0].FullName -Destination (Join-Path release-assets $env:INSTALLER) -Force
           'signed=true' >> $env:GITHUB_OUTPUT
 
-      # No operation may change the .exe after this point. Minisign covers the FINAL installer.
-      - name: Sign final installer for the Tauri updater
+      # No operation may change any .exe after this point. Minisign covers the FINAL installers.
+      - name: Sign final installers for the Tauri updater
         if: steps.signing.outputs.updater == 'true'
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          INSTALLER: ${{ steps.bundle.outputs.installer }}
+          INSTALLERS: ${{ steps.bundle.outputs.installers }}
         run: |
           $env:TAURI_SIGNING_PRIVATE_KEY = $env:TAURI_SIGNING_PRIVATE_KEY.Trim()
-          $installer = Join-Path release-assets $env:INSTALLER
-          # Call Node directly so cmd.exe/pnpm.cmd cannot discard the empty password argument.
-          node apps/desktop/node_modules/@tauri-apps/cli/tauri.js signer sign --password '' $installer
-          if ($LASTEXITCODE -ne 0) { throw 'Tauri updater signing failed.' }
+          foreach ($artifact in ($env:INSTALLERS | ConvertFrom-Json)) {
+            if (-not $artifact.Feed) { continue } # Offline media has no updater signature.
+            $installer = Join-Path release-assets $artifact.Installer
+            # Call Node directly so cmd.exe/pnpm.cmd cannot discard the empty password argument.
+            node apps/desktop/node_modules/@tauri-apps/cli/tauri.js signer sign --password '' $installer
+            if ($LASTEXITCODE -ne 0) { throw "Tauri updater signing failed for $installer." }
+          }
 
-      - name: Verify updater signature and generate latest.json
+      - name: Verify updater signatures and generate latest.json and latest-allusers.json
         id: updater
         if: steps.signing.outputs.updater == 'true'
         env:
-          INSTALLER: ${{ steps.bundle.outputs.installer }}
+          INSTALLERS: ${{ steps.bundle.outputs.installers }}
           VERSION: ${{ steps.bundle.outputs.version }}
           NOTES_FILE: ${{ inputs.notes_file }}
         run: |
-          $installer = Join-Path release-assets $env:INSTALLER
-          pnpm exec tsx tools/release/verify-windows-updater.ts $installer
-          if ($LASTEXITCODE -ne 0) { throw 'Updater signature verification failed.' }
-          $manifestArgs = @('--version', $env:VERSION, '--installer', $installer, '--out', 'release-assets/latest.json')
-          if ($env:NOTES_FILE) { $manifestArgs += @('--notes', $env:NOTES_FILE) }
-          pnpm -s release:windows-manifest @manifestArgs
-          if ($LASTEXITCODE -ne 0) { throw 'Windows update manifest generation failed.' }
+          foreach ($artifact in ($env:INSTALLERS | ConvertFrom-Json)) {
+            if (-not $artifact.Feed) { continue } # Offline media has no updater feed.
+            $installer = Join-Path release-assets $artifact.Installer
+            pnpm exec tsx tools/release/verify-windows-updater.ts $installer
+            if ($LASTEXITCODE -ne 0) { throw "Updater signature verification failed for $installer." }
+            # A variant without a feed still gets signed and uploaded.
+            if ($artifact.Feed) {
+              $manifestArgs = @('--version', $env:VERSION, '--installer', $installer, '--out', (Join-Path release-assets $artifact.Feed))
+              if ($env:NOTES_FILE) { $manifestArgs += @('--notes', $env:NOTES_FILE) }
+              pnpm -s release:windows-manifest @manifestArgs
+              if ($LASTEXITCODE -ne 0) { throw "Windows update manifest generation failed for $($artifact.Feed)." }
+            }
+          }
           'signed=true' >> $env:GITHUB_OUTPUT
 
-      - name: Bind build record to final signed installer bytes
-        env:
-          INSTALLER: ${{ steps.bundle.outputs.installer }}
+      - name: Check offline installer is excluded from updater artifacts
         run: |
-          $installer = Join-Path release-assets $env:INSTALLER
-          $recordPath = "$installer.build.json"
-          $record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
-          $record.sha256 = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
-          $record.size = (Get-Item -LiteralPath $installer).Length
-          $record | ConvertTo-Json | Set-Content -LiteralPath $recordPath -Encoding utf8NoBOM
+          node scripts/windows-offline-installer.mjs check release-assets
+          if ($LASTEXITCODE -ne 0) { throw 'Offline updater artifact check failed.' }
+
+      - name: Bind build records to final signed installer bytes
+        env:
+          INSTALLERS: ${{ steps.bundle.outputs.installers }}
+        run: |
+          foreach ($artifact in ($env:INSTALLERS | ConvertFrom-Json)) {
+            $installer = Join-Path release-assets $artifact.Installer
+            $recordPath = "$installer.build.json"
+            $record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+            $record.sha256 = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+            $record.size = (Get-Item -LiteralPath $installer).Length
+            $record | ConvertTo-Json | Set-Content -LiteralPath $recordPath -Encoding utf8NoBOM
+          }
 
       - name: Print SHA-256 and sizes and write LF checksums
         run: |
