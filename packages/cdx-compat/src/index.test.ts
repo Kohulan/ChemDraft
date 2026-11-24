@@ -6,6 +6,7 @@ import {
   createEmptyDocument,
   createImageGraphicObject,
   elementSymbols,
+  deserializeDocument,
   parseDocument,
   serializeDocument,
   type ArrowObject,
@@ -26,7 +27,9 @@ import {
   decodeBase64UrlUtf8,
   encodeBase64UrlBytes,
   encodeBase64UrlUtf8,
+  exportDocumentToCdx,
   exportDocumentToCdxml,
+  importCdx,
   legacyVisibleCdxmlHash,
   openChemDraftPayload,
   sha256Utf8Hex,
@@ -51,16 +54,71 @@ it("omits empty preserved id lists without changing nonempty source lists", () =
   });
 });
 
-it("warns when a picture is omitted from visible CDXML and retains the native payload", () => {
+it("warns that a picture is kept for ChemDraft only, and retains the native payload", () => {
   const picture = createImageGraphicObject({ id: "g12", mimeType: "image/svg+xml", center: { x: 30, y: 40 },
     dataBase64: btoa('<svg xmlns="http://www.w3.org/2000/svg" width="4" height="3"/>') });
   const document = createEmptyDocument();
   document.pages[0].objects = [picture];
   const exported = exportDocumentToCdxml(document);
   expect(exported.warnings).toContainEqual({ code: "cdxml.picture_not_saved", sourceObjectId: "g12",
-    message: "CDXML export: picture g12 is not saved in CDXML" });
+    message: "CDXML export: picture g12 is kept for ChemDraft in this file's embedded ChemDraft data; other programs that open this CDXML will not show it" });
   expect(exported.contents).not.toContain("<graphic");
   expect(openChemDraftPayload(exported.contents).document?.pages[0].objects).toEqual([picture]);
+});
+
+it("says a picture is lost when no ChemDraft data is embedded, in CDXML and CDX", () => {
+  const picture = createImageGraphicObject({ id: "g12", mimeType: "image/svg+xml", center: { x: 30, y: 40 },
+    dataBase64: btoa('<svg xmlns="http://www.w3.org/2000/svg" width="4" height="3"/>') });
+  const document = createEmptyDocument();
+  document.pages[0].objects = [picture];
+  expect(exportDocumentToCdxml(document, { embedNativePayload: false }).warnings).toContainEqual({ code: "cdxml.picture_not_saved", sourceObjectId: "g12",
+    message: "CDXML export: picture g12 is not saved in this CDXML (no ChemDraft data is embedded), so it is lost when the file is reopened" });
+  expect(exportDocumentToCdx(document).warnings).toContainEqual({ code: "cdxml.picture_not_saved", sourceObjectId: "g12",
+    message: "CDX export: picture g12 is not saved in this CDX (no ChemDraft data is embedded), so it is lost when the file is reopened" });
+  expect(exportDocumentToCdx(document, { embedNativePayload: true }).warnings).toContainEqual({ code: "cdxml.picture_not_saved", sourceObjectId: "g12",
+    message: "CDX export: picture g12 is kept for ChemDraft in this file's embedded ChemDraft data; other programs that open this CDX will not show it" });
+});
+
+describe("pictures through every save format", () => {
+  const png = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAAEklEQVR4nGP8z8Dwn4GBgYEBAA8GAgGDGUQvAAAAAElFTkSuQmCC";
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20" viewBox="0 0 40 20" preserveAspectRatio="xMinYMid slice"><rect width="40" height="20" fill="#d00"/></svg>';
+  /** Two pictures, rotated, resized and opacity-styled, with a text object between them: z-order is array order. */
+  function pictureDocument(): ChemDraftDocument {
+    const png1 = { ...createImageGraphicObject({ id: "png-picture", mimeType: "image/png", center: { x: 0, y: 0 }, dataBase64: png }),
+      x: 120.5, y: 80.25, width: 150, height: 75.5, rotation: 33.5 };
+    const svg1 = { ...createImageGraphicObject({ id: "svg-picture", mimeType: "image/svg+xml", center: { x: 0, y: 0 }, dataBase64: btoa(svg) }),
+      x: 60, y: 70, width: 210, height: 90, rotation: 300, style: { opacity: 0.6 } };
+    const text: TextObject = { id: "between", type: "text", x: 40, y: 300, width: 100, height: 20, rotation: 0, text: "between", spans: [], style: {} };
+    const document = createEmptyDocument();
+    document.pages[0].objects = [svg1, text, png1];
+    return document;
+  }
+  const pictures = (document: ChemDraftDocument) => document.pages[0].objects.filter((object) => object.type === "graphic");
+
+  it("keeps both pictures, their frames and their order through CDXML export and reopen", () => {
+    const document = pictureDocument();
+    const reopened = openChemDraftPayload(exportDocumentToCdxml(document).contents);
+    expect(reopened.source).toBe("native-payload");
+    expect(reopened.document?.pages[0].objects.map((object) => object.id)).toEqual(["svg-picture", "between", "png-picture"]);
+    expect(pictures(reopened.document!)).toEqual(pictures(document));
+    expect(reopened.document?.pages[0].objects).toEqual(document.pages[0].objects);
+  });
+
+  it("keeps both pictures through binary CDX when the ChemDraft data is embedded, and drops them when it is not", () => {
+    const document = pictureDocument();
+    const embedded = importCdx(exportDocumentToCdx(document, { embedNativePayload: true }).bytes);
+    expect(embedded.source).toBe("native-payload");
+    expect(embedded.document?.pages[0].objects).toEqual(document.pages[0].objects);
+    // Without the embedded data (the default) the CDX is interchange only: the pictures are not in it.
+    const plain = importCdx(exportDocumentToCdx(document).bytes);
+    expect(plain.document ? pictures(plain.document) : []).toEqual([]);
+  });
+
+  it("keeps both pictures exactly through the native JSON", () => {
+    const document = pictureDocument();
+    const reopened = deserializeDocument(serializeDocument(document));
+    expect(reopened.pages[0].objects).toEqual(document.pages[0].objects);
+  });
 });
 
 describe("files that are not CDXML", () => {

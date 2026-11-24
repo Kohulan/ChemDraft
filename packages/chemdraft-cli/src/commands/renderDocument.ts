@@ -14,6 +14,7 @@ import { installNodeEngines } from "../engine";
 import { installNodeRendering } from "../nodeRendering";
 import { CliUsageError, cliExitCode, defaultCliIo, handleCliError, writeJsonLine,
   writeProgress, type CliIo } from "../output";
+import { rasterizeSvgPictureWithResvg } from "../svgPictureRaster";
 import { withPdfDom } from "./export";
 import { perceiveDoubleBondStereo } from "./stereo";
 
@@ -142,7 +143,7 @@ export async function runRenderDocumentCommand(argv: readonly string[], io: CliI
         await save(extension === format ? out : `${out}.${format}`, saved.contents);
       } else if (format === "pdf") {
         const { exportDocumentToPdf } = await import("@chemdraft/export-engine/pdf");
-        const pdf = await withPdfDom((domParser) => exportDocumentToPdf(document, { domParser }));
+        const pdf = await withPdfDom((domParser) => exportDocumentToPdf(document, { domParser, rasterizeSvgPicture: rasterizeSvgPictureWithResvg }));
         warnings.push(...pdf.warnings);
         await save(extension === format ? out : `${out}.${format}`, pdf.bytes);
       } else {

@@ -1,6 +1,7 @@
 import {
   CSS_PX_PER_INCH,
   GraphicObjectSchema,
+  validatePngImage,
   type ChemDraftDocument,
   type GraphicObject
 } from "@chemdraft/chem-core";
@@ -17,6 +18,25 @@ import { ensureHandwritingFontLoaded, handwritingFontFaceCss } from "./handwriti
 const svg2pdf = resolveSvg2pdf(svg2pdfModule);
 const SVG_MARKUP_LIMIT_BYTES = 256 * 1024 * 1024;
 
+/** SVG pictures are drawn at 300 dpi of their drawn size, bounded per picture and per document. */
+export const SVG_PICTURE_RASTER_DPI = 300;
+export const SVG_PICTURE_MAX_RASTER_SIDE = 4096;
+export const SVG_PICTURE_MAX_RASTER_PIXELS = 96 * 1024 * 1024;
+const SVG_PICTURE_MIN_RASTER_SIDE = 64;
+
+/** One SVG picture to rasterise: the source markup, its frame in page units, and the PNG size to produce. */
+export interface SvgPictureRasterRequest {
+  svg: string;
+  /** Frame size in page units (96 per inch); the picture is stretched to it, as on the canvas. */
+  width: number;
+  height: number;
+  pixelWidth: number;
+  pixelHeight: number;
+}
+
+/** Rasterises one SVG picture to PNG bytes, or throws with the reason. Injected: this package has no rasteriser. */
+export type SvgPictureRasterizer = (picture: SvgPictureRasterRequest) => Promise<Uint8Array>;
+
 export interface PdfExportOptions {
   directElectronMarkEditing?: boolean;
   pageIndex?: number;
@@ -25,6 +45,8 @@ export interface PdfExportOptions {
   includePageGuides?: boolean;
   outputWidth?: number;
   outputHeight?: number;
+  /** Draws SVG pictures; without it (or when it throws) each one is skipped with a warning. */
+  rasterizeSvgPicture?: SvgPictureRasterizer;
 }
 
 export interface SvgToPdfOptions {
@@ -35,6 +57,7 @@ export interface SvgToPdfOptions {
   pictures?: ReadonlyMap<string, GraphicObject>;
   /** Source page dimensions, required when pictures need physical-size placement. */
   pageSize?: { width: number; height: number };
+  rasterizeSvgPicture?: SvgPictureRasterizer;
 }
 
 export async function exportDocumentToPdf(
@@ -69,7 +92,8 @@ export async function exportDocumentToPdf(
     domParser: options.domParser,
     compress: options.compress,
     pictures,
-    pageSize: page
+    pageSize: page,
+    rasterizeSvgPicture: options.rasterizeSvgPicture
   });
   const warnings = svgResult.warnings.map((warning) => warning.code === "export.svg.picture_missing_data"
     ? { ...warning, code: "export.pdf.picture_missing_data", message: `PDF export: picture ${warning.objectId} has no picture data and was not drawn` }
@@ -131,6 +155,8 @@ export async function exportSvgToPdf(
       // svg2pdf's raster image loader relies on a browser Image and silently skips load failures;
       // jsPDF can embed the PNG bytes directly, including in headless exports.
       const children = [...svgElement.children];
+      const rasterCache = new Map<string, Promise<Uint8Array>>();
+      const rasterBudget = { pixels: 0 };
       let run: Element[] = [];
       const flush = async () => {
         if (!run.length) return;
@@ -146,10 +172,11 @@ export async function exportSvgToPdf(
           continue;
         }
         await flush();
+        let png: Uint8Array | string = `data:image/png;base64,${picture.data.image.dataBase64}`;
         if (picture.data.image.mimeType === "image/svg+xml") {
-          warnings.push({ code: "export.pdf.svg_picture_not_drawn", severity: "warning", objectId: picture.id,
-            message: `PDF export: SVG picture ${picture.id} was not drawn; paste it as PNG or export SVG` });
-          continue;
+          const raster = await rasterizeSvgPicture(picture, options.rasterizeSvgPicture, rasterCache, rasterBudget);
+          if ("warning" in raster) { warnings.push(raster.warning); continue; }
+          png = raster.png;
         }
         const scale = Math.min(widthPt / page.width, heightPt / page.height);
         const offsetX = (widthPt - page.width * scale) / 2;
@@ -166,8 +193,14 @@ export async function exportSvgToPdf(
         if (opacity !== 1) pdf.setGState(new GState({ opacity }));
         pdf.setCurrentTransformationMatrix(pdf.Matrix(scale * cos, scale * sin, -scale * sin, scale * cos,
           offsetX + scale * (cx - cos * cx + sin * cy), offsetY + scale * (cy - sin * cx - cos * cy)));
-        pdf.addImage(`data:image/png;base64,${picture.data.image.dataBase64}`, "PNG",
-          picture.x + (picture.width - width) / 2, picture.y + (picture.height - height) / 2, width, height);
+        try {
+          pdf.addImage(png, "PNG",
+            picture.x + (picture.width - width) / 2, picture.y + (picture.height - height) / 2, width, height);
+        } catch (error) {
+          // A bad rasteriser result costs one picture; a bad native PNG still fails the export as before.
+          if (typeof png === "string") throw error;
+          warnings.push(svgPictureNotDrawn(picture.id, `the rasterised PNG could not be embedded (${errorReason(error)})`));
+        }
         pdf.restoreGraphicsState();
         pdf.compatAPI();
       }
@@ -179,6 +212,81 @@ export async function exportSvgToPdf(
   }
 
   return { bytes: new Uint8Array(pdf.output("arraybuffer")), warnings };
+}
+
+type SvgPictureRaster = { png: Uint8Array } | { warning: ExportWarning };
+
+function svgPictureNotDrawn(id: string, reason: string): ExportWarning {
+  return { code: "export.pdf.svg_picture_not_drawn", severity: "warning", objectId: id,
+    message: `PDF export: SVG picture ${id} was not drawn: ${reason}` };
+}
+
+function errorReason(error: unknown): string {
+  return error instanceof Error && error.message ? error.message : String(error);
+}
+
+/**
+ * Pixel size for an SVG picture: 300 dpi of its drawn size, never below the picture's own pixel size,
+ * at most 4096 on the long side. Aspect follows the frame, which is how the canvas stretches it.
+ */
+export function svgPictureRasterSize(picture: { width: number; height: number }, own: { pixelWidth: number; pixelHeight: number }):
+  { pixelWidth: number; pixelHeight: number } {
+  const perUnit = SVG_PICTURE_RASTER_DPI / CSS_PX_PER_INCH;
+  let width = Math.max(picture.width * perUnit, own.pixelWidth);
+  let height = Math.max(picture.height * perUnit, own.pixelHeight);
+  const shrink = Math.min(1, SVG_PICTURE_MAX_RASTER_SIDE / Math.max(width, height));
+  width *= shrink;
+  height *= shrink;
+  return { pixelWidth: Math.max(1, Math.round(width)), pixelHeight: Math.max(1, Math.round(height)) };
+}
+
+async function rasterizeSvgPicture(
+  picture: GraphicObject,
+  rasterize: SvgPictureRasterizer | undefined,
+  cache: Map<string, Promise<Uint8Array>>,
+  budget: { pixels: number }
+): Promise<SvgPictureRaster> {
+  const image = picture.data.image!;
+  if (!rasterize) {
+    return { warning: svgPictureNotDrawn(picture.id, "no SVG rasteriser is available in this export; export SVG or PNG to keep the picture") };
+  }
+  let { pixelWidth, pixelHeight } = svgPictureRasterSize(picture, image);
+  // Identical pictures at the same size share one raster and one PDF image.
+  const key = `${picture.width}x${picture.height}@${pixelWidth}x${pixelHeight}:${image.dataBase64}`;
+  let pending = cache.get(key);
+  if (!pending) {
+    // A document of many pictures shares one pixel budget; later pictures get fewer pixels, not an error.
+    const remaining = SVG_PICTURE_MAX_RASTER_PIXELS - budget.pixels;
+    const wanted = pixelWidth * pixelHeight;
+    if (wanted > remaining) {
+      const shrink = Math.sqrt(Math.max(remaining, 0) / wanted);
+      if (Math.max(pixelWidth, pixelHeight) * shrink < SVG_PICTURE_MIN_RASTER_SIDE) {
+        return { warning: svgPictureNotDrawn(picture.id, "the document has too many SVG pictures to rasterise within the memory limit") };
+      }
+      pixelWidth = Math.max(1, Math.floor(pixelWidth * shrink));
+      pixelHeight = Math.max(1, Math.floor(pixelHeight * shrink));
+    }
+    budget.pixels += pixelWidth * pixelHeight;
+    const size = { pixelWidth, pixelHeight };
+    pending = (async () => {
+      const bytes = Uint8Array.from(atob(image.dataBase64), (char) => char.charCodeAt(0));
+      const result = await rasterize({ svg: new TextDecoder().decode(bytes), width: picture.width, height: picture.height, ...size });
+      if (!ArrayBuffer.isView(result)) throw new Error("the rasteriser did not return PNG bytes");
+      const png = new Uint8Array(result.buffer, result.byteOffset, result.byteLength);
+      const { info, error } = validatePngImage(png);
+      if (error) throw new Error(`the rasteriser returned an invalid PNG (${error.replace(/^Couldn't paste the picture: /, "")})`);
+      if (Math.max(info!.pixelWidth, info!.pixelHeight) > SVG_PICTURE_MAX_RASTER_SIDE) {
+        throw new Error(`the rasteriser returned a ${info!.pixelWidth} x ${info!.pixelHeight} PNG; the limit is ${SVG_PICTURE_MAX_RASTER_SIDE} pixels on a side`);
+      }
+      return png;
+    })();
+    cache.set(key, pending);
+  }
+  try {
+    return { png: await pending };
+  } catch (error) {
+    return { warning: svgPictureNotDrawn(picture.id, errorReason(error)) };
+  }
 }
 
 function cssPxToPdfPt(value: number): number {

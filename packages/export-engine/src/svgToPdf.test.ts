@@ -82,7 +82,7 @@ describe("exportSvgToPdf", () => {
     expect(pdf.indexOf("(Between)")).toBeGreaterThan(imagePosition);
     expect(pdf.indexOf("(After)")).toBeGreaterThan(pdf.indexOf("(Between)"));
     expect(result.warnings).toEqual([{ code: "export.pdf.svg_picture_not_drawn", severity: "warning",
-      objectId: "svg-picture", message: "PDF export: SVG picture svg-picture was not drawn; paste it as PNG or export SVG" }]);
+      objectId: "svg-picture", message: "PDF export: SVG picture svg-picture was not drawn: no SVG rasteriser is available in this export; export SVG or PNG to keep the picture" }]);
     await expect(exportSvgToPdf(markup, { outputWidth: 192, outputHeight: 96, pictures }))
       .rejects.toThrow("source page dimensions");
     await expect(exportSvgToPdf(markup, { outputWidth: 192, outputHeight: 96, pictures,

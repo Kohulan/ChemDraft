@@ -61,6 +61,21 @@ describe("native document agent commands", () => {
       }
     } finally { rmSync(directory, { recursive: true, force: true }); }
   }, 20_000);
+  it("draws an SVG picture in the PDF from render-document through the headless rasteriser", async () => {
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="40" height="20" fill="#d00"/></svg>';
+    const document = createEmptyDocument();
+    document.pages[0]!.objects = [createImageGraphicObject({ id: "svg-picture", mimeType: "image/svg+xml",
+      dataBase64: Buffer.from(svg).toString("base64"), center: { x: 400, y: 300 } })];
+    const input = join(directory, "svg-picture.chemdraft");
+    await writeFile(input, serializeDocument(document));
+    const output = join(directory, "svg-picture.pdf");
+    const result = await run(["render-document", "--document", input, "--out", output]);
+    expect(result.code, JSON.stringify(result)).toBe(0);
+    expect(JSON.stringify(result.result)).not.toContain("svg_picture_not_drawn");
+    expect(JSON.stringify(result.result)).not.toContain("was not drawn");
+    // Without the hook the picture is skipped with a warning and the PDF has no image.
+    expect((await readFile(output)).toString("latin1")).toMatch(/\/Subtype \/Image/);
+  }, 20_000);
   it.each([
     { smiles: "CC=CC", open: [1], stereo: [{ bondIndex: 1, descriptor: "unspecified" }] },
     { smiles: "C/C=C/C", open: [], stereo: [{ bondIndex: 1, descriptor: "E" }] },
