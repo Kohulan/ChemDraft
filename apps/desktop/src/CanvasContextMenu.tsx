@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
-import type { CanvasMenuItem } from "./canvasContextMenuModel";
+import { withStereoReadout, type CanvasMenuItem } from "./canvasContextMenuModel";
 import { popupNativeCanvasMenu } from "./nativeCanvasContextMenu";
 import { isDesktopRuntime } from "./window-manager";
 
@@ -15,6 +15,9 @@ export interface CanvasContextMenuProps {
   onInvoke(commandId: string): void;
   onDismiss(): void;
   onFocusReturn?(): void;
+  /** Read-only stereo row ("Stereocentre: R"), resolved lazily; must not reject. The menu opens
+   * without waiting for it and omits the row when it resolves to undefined. */
+  loadStereoReadout?: () => Promise<string | undefined>;
 }
 
 /** Mounted once per opening. No HTML menu is exposed while the native popup is tracking. */
@@ -22,13 +25,18 @@ export function CanvasContextMenu(props: CanvasContextMenuProps) {
   const [fallback, setFallback] = useState(() => !isDesktopRuntime());
   const latest = useRef(props);
   latest.current = props;
-  useEffect(() => {
+  // A layout effect, so `active` clears while React commits the unmount. A passive cleanup runs
+  // later; a readout settling in between would still present the popup after the menu is gone.
+  useLayoutEffect(() => {
     if (!isDesktopRuntime()) return;
     let active = true;
     // Deferring the invoke lets React StrictMode discard its first effect without opening twice.
     void Promise.resolve().then(async () => {
       if (!active) return;
-      const result = await popupNativeCanvasMenu(props.items, props.position);
+      const result = await popupNativeCanvasMenu(props.items, props.position,
+        { loadStereoReadout: props.loadStereoReadout, isActive: () => active });
+      // Dismissed before the popup opened: nothing tracked, so there is no release to report.
+      if (result === null) return;
       // Native tracking can consume the right-button release, even on cancellation.
       window.dispatchEvent(new Event(NATIVE_CANVAS_MENU_CLOSED_EVENT));
       if (!active) return;
@@ -45,6 +53,13 @@ export function CanvasContextMenu(props: CanvasContextMenuProps) {
 function HtmlCanvasContextMenu(props: CanvasContextMenuProps) {
   const root = useRef<HTMLDivElement>(null);
   const [position, setPosition] = useState(props.position);
+  const [stereoReadout, setStereoReadout] = useState<string>();
+  useEffect(() => {
+    let active = true;
+    void props.loadStereoReadout?.().then(label => { if (active) setStereoReadout(label); }, () => {});
+    return () => { active = false; };
+    // One readout per opening; the owner remounts this menu for a new target.
+  }, []);
   const [open, setOpen] = useState<string>();
   const pendingFocus = useRef(false);
   const latest = useRef(props);
@@ -66,6 +81,14 @@ function HtmlCanvasContextMenu(props: CanvasContextMenuProps) {
     };
   }, [props.position.x, props.position.y]);
   useLayoutEffect(() => {
+    // The readout row arrives after opening; keep the taller menu inside the window without
+    // moving focus away from wherever the user has already navigated.
+    const menu = root.current;
+    if (!stereoReadout || !menu) return;
+    const rect = menu.getBoundingClientRect();
+    setPosition(current => ({ x: current.x, y: Math.max(8, Math.min(current.y, window.innerHeight - rect.height - 8)) }));
+  }, [stereoReadout]);
+  useLayoutEffect(() => {
     for (const button of root.current?.querySelectorAll<HTMLButtonElement>('button[role^="menuitem"]') ?? []) {
       button.tabIndex = button === document.activeElement ? 0 : -1;
     }
@@ -75,6 +98,9 @@ function HtmlCanvasContextMenu(props: CanvasContextMenuProps) {
       pendingFocus.current = false;
     }
   });
+  // Flyouts re-measure when the late row shifts them and again once the root clamp has moved the
+  // menu (child layout effects run before the root's, so the position term catches the clamp).
+  const layout = `${stereoReadout ?? ""}@${position.x},${position.y}`;
   return <div className="object-context-menu" role="menu" ref={root} aria-label={props.label}
     data-context-object-id={props.objectId} data-context-target-kind={props.targetKind}
     data-context-layer-index={props.objectIndex !== undefined && props.objectIndex >= 0 ? props.objectIndex : undefined}
@@ -127,15 +153,18 @@ function HtmlCanvasContextMenu(props: CanvasContextMenuProps) {
           button.click(); break;
       }
     }}>
-    <HtmlMenuItems items={props.items} open={open} setOpen={setOpen} onInvoke={props.onInvoke} />
+    {/* Its own slot, so the late row never shifts the index keys (and focus) of the items. */}
+    <HtmlMenuItems items={withStereoReadout([], stereoReadout)} open={open} setOpen={setOpen} onInvoke={props.onInvoke} layout={layout} />
+    <HtmlMenuItems items={props.items} open={open} setOpen={setOpen} onInvoke={props.onInvoke} layout={layout} />
   </div>;
 }
 
-function HtmlMenuItems({ items, open, setOpen, onInvoke }: {
+function HtmlMenuItems({ items, open, setOpen, onInvoke, layout }: {
   items: readonly CanvasMenuItem[];
   open?: string;
   setOpen(id: string | undefined): void;
   onInvoke(commandId: string): void;
+  layout: string;
 }) {
   return items.map((item, index) => {
     if (item.kind === "separator") return <div key={index} className="object-context-menu-separator" role="separator" />;
@@ -144,16 +173,17 @@ function HtmlMenuItems({ items, open, setOpen, onInvoke }: {
       aria-checked={item.checked} className="object-context-menu-item" data-command-id={item.commandId}
       disabled={!item.enabled} title={item.disabledReason} onClick={() => onInvoke(item.commandId)}>{item.label}</button>;
     const expanded = open === item.id;
-    return <HtmlSubmenu key={item.id} item={item} expanded={expanded} setOpen={setOpen}>
-      <HtmlMenuItems items={item.items} open={open} setOpen={setOpen} onInvoke={onInvoke} />
+    return <HtmlSubmenu key={item.id} item={item} expanded={expanded} setOpen={setOpen} layout={layout}>
+      <HtmlMenuItems items={item.items} open={open} setOpen={setOpen} onInvoke={onInvoke} layout={layout} />
     </HtmlSubmenu>;
   });
 }
 
-function HtmlSubmenu({ item, expanded, setOpen, children }: {
+function HtmlSubmenu({ item, expanded, setOpen, layout, children }: {
   item: Extract<CanvasMenuItem, { kind: "submenu" }>;
   expanded: boolean;
   setOpen(id: string | undefined): void;
+  layout: string;
   children: React.ReactNode;
 }) {
   const parent = useRef<HTMLDivElement>(null), flyout = useRef<HTMLDivElement>(null);
@@ -163,7 +193,7 @@ function HtmlSubmenu({ item, expanded, setOpen, children }: {
     const rect = parent.current.getBoundingClientRect(), menu = flyout.current.getBoundingClientRect();
     setStyle({ ...(rect.right + menu.width + 8 > window.innerWidth ? { right: "100%" } : { left: "100%" }),
       top: `${-Math.max(0, rect.top + menu.height + 8 - window.innerHeight)}px` });
-  }, [expanded]);
+  }, [expanded, layout]);
   const id = `canvas-${item.id}-menu`;
   return <div className="object-context-menu-submenu" ref={parent}
     onPointerEnter={() => { if (item.enabled) setOpen(item.id); }} onPointerLeave={() => setOpen(undefined)}>

@@ -33,6 +33,17 @@ describe("native canvas menu transport", () => {
     vi.mocked(invoke).mockRejectedValue(new Error("Native popup unavailable"));
     expect(await popupNativeCanvasMenu(pageCanvasMenu, { x: 0, y: 0 })).toBeUndefined();
   });
+  it("never presents once the caller turns inactive during the readout wait", async () => {
+    let active = true;
+    let finish!: (label: string | undefined) => void;
+    const pending = popupNativeCanvasMenu(pageCanvasMenu, { x: 0, y: 0 }, {
+      loadStereoReadout: () => new Promise(resolve => { finish = resolve; }), isActive: () => active
+    });
+    active = false;
+    finish("Stereocentre: R");
+    expect(await pending).toBeNull();
+    expect(invoke).not.toHaveBeenCalled();
+  });
 });
 
 describe("native menu document ownership guards", () => {
