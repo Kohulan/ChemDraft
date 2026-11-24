@@ -8,13 +8,6 @@ in progress rather than a changelog.
 
 # In flight
 
-## Nested inspector scrollbar drag (`resubmit/palette-scrollbar`)
-
-Resubmit #178 against current main. Restrict content-window dragging to its explicit grip so
-nested Object Settings scroll owners keep pointer/mouse presses. Preserve native title dragging,
-disabled-control exclusion, click compensation and the mouse fallback. Test both platform routes;
-actual Windows/macOS scrollbar dragging and mixed-DPI native checks remain pending.
-
 # ChemDraft Assistant plugin (active, branches claude/assistant-*)
 
 ## Objective
