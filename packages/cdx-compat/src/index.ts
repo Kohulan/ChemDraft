@@ -2552,8 +2552,12 @@ function exportFramedCaption(text: TextObject, id: string, fonts: CdxmlExportFon
   }
   const factor = a.Justification === "Center" ? 0.5 : a.Justification === "Right" ? 1 : 0;
   const saved = text.compatibility?.unknown.cdxmlTextFrameSize;
-  const width = isRecord(saved) && typeof saved.width === "number" ? Math.max(0, box.width + text.width - saved.width) : Math.min(box.width, text.width);
-  const height = isRecord(saved) && typeof saved.height === "number" ? Math.max(0, box.height + text.height - saved.height) : Math.min(box.height, text.height);
+  // A non-finite saved size (compatibility data is not schema-checked) is ignored, so BoundingBox never takes a NaN.
+  const savedSize = (key: "width" | "height") => isRecord(saved) && typeof saved[key] === "number" && Number.isFinite(saved[key]) ? saved[key] : undefined;
+  const resized = (source: number, current: number, before: number | undefined) =>
+    before !== undefined ? Math.max(0, source + current - before) : Math.min(source, current);
+  const width = resized(box.width, text.width, savedSize("width"));
+  const height = resized(box.height, text.height, savedSize("height"));
   const x = text.x + factor * (text.width - width), y = text.y;
   return `<t ${xmlAttributes({ id, p: formatPoint({ x: x + baseline.x - box.x, y: y + baseline.y - box.y }),
     BoundingBox: [formatPoint({ x, y }), formatPoint({ x: x + width, y: y + height })].join(" "),
@@ -2600,7 +2604,11 @@ function exportTextObject(text: TextObject, context: VisibleExportContext, alloc
                 "text and styles, its fonts under ids that can be written." });
           }
         }
-        if (node && element && !fontNotWritten) {
+        // Older documents kept a malformed p or BoundingBox verbatim; never copy one back out.
+        const malformedGeometry = element !== undefined && (
+          element.attributes.p !== undefined && !parseCdxmlXyPoint(element.attributes.p) ||
+          element.attributes.BoundingBox !== undefined && !parseCdxmlXyBoundingBox(element.attributes.BoundingBox));
+        if (node && element && !fontNotWritten && !malformedGeometry) {
           node[":@"] = { ...element.attributes, id: textId };
           const point = pointMetadata(text.compatibility?.unknown.cdxmlTextFrameOrigin) ?? parseCdxmlPoint(element.attributes.p);
           const dx = cssPxToCdxml(text.x - point.x), dy = cssPxToCdxml(text.y - point.y);
@@ -3070,11 +3078,18 @@ function exportGraphicAsCdxmlGraphic(
     return "";
   }
   const rectangle = type === "Rectangle" ? cdxmlRectangleStyle(graphic, pageBackgroundColor, warnings, format) : undefined;
+  // A CDXML reader takes a Graphic Arc's ellipse from its BoundingBox (center and inset half-size),
+  // so the box is the stored ellipse's frame. It is the object's own frame for an arc never edited.
+  const arcFrame = type === "Arc" ? cdxmlGraphicArcFrame(graphic) : undefined;
+  const boundingBox = arcFrame ? formatXyBoundingBox(objectCornerPoints(arcFrame))
+    : cdxmlBoundingBoxForGraphic(graphic, objectCornerPoints(graphic));
+  if (type === "Arc" && graphic.rotation) warnings.push({ code: "cdxml.arc_rotation_payload_only", sourceObjectId: graphic.id,
+    message: `${format} export: arc ${graphic.id} is written unrotated; a ${format} arc cannot carry its ${formatNumber(graphic.rotation)} degree rotation, which is kept only in the native document.` });
   const attrs = [
     `id="${graphicId}"`,
     ...(rectangle ? cdxmlColorAttribute(rectangle.color, colors) : cdxmlGraphicColorAttribute(graphic, warnings, colors)),
     `GraphicType="${type}"`,
-    `BoundingBox="${escapeXmlAttribute(cdxmlBoundingBoxForGraphic(graphic, objectCornerPoints(graphic)))}"`,
+    `BoundingBox="${escapeXmlAttribute(boundingBox)}"`,
     ...(type === "Line" || type === "Arc" ? cdxmlLineTypeAttributes(graphic) : []),
     ...(rectangle?.attributes ?? []),
     ...cdxmlShapeSubtypeAttributes(graphic)
@@ -3726,7 +3741,7 @@ function cdxmlAngularSizeForGraphic(graphic: GraphicObject): string {
   if (graphic.data.arcSweepRadians === undefined && typeof imported === "string" && imported.trim().length > 0) {
     return imported;
   }
-  return formatNumber(radiansToDegrees(clampArcSweepRadians(graphic.data.arcSweepRadians ?? Math.PI)));
+  return formatNumber(radiansToDegrees(clampArcSweepRadians(finiteArcSweepRadians(graphic) ?? Math.PI)));
 }
 
 function cdxmlLineAxisAttributes(start: Point, end: Point): string[] {
@@ -3759,17 +3774,49 @@ function graphicLineEndpointsForCdxml(graphic: GraphicObject): { start: Point; e
 
 function circularGraphicArcEndpoints(graphic: GraphicObject): { start: Point; end: Point } {
   const angles = nativeGraphicArcAngles(graphic);
-  const center = objectCenter(graphic);
-  const rx = Math.max(graphic.width / 2 - 4, 1);
-  const ry = Math.max(graphic.height / 2 - 4, 1);
+  const { center, rx, ry } = nativeGraphicArcEllipse(graphic);
   return {
     start: ellipsePointAtRadians(center, rx, ry, angles.startRadians),
     end: ellipsePointAtRadians(center, rx, ry, angles.endRadians)
   };
 }
 
+/**
+ * The ellipse a native arc is drawn on, with the renderer's own fallbacks (art-engine
+ * circularGraphicArcGeometry): the stored center and radii when they are valid, else the frame's
+ * center and its inset half-size, every radius at least 1. A handle-edited arc stores its ellipse and
+ * shrinks its frame to the drawn arc, so the frame alone no longer describes it.
+ */
+function nativeGraphicArcEllipse(graphic: GraphicObject): { center: Point; rx: number; ry: number } {
+  const finite = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  return {
+    center: pointMetadata(graphic.data.arcCenter) ?? objectCenter(graphic),
+    rx: Math.max(finite(graphic.data.arcRadiusX) ?? graphic.width / 2 - 4, 1),
+    ry: Math.max(finite(graphic.data.arcRadiusY) ?? graphic.height / 2 - 4, 1)
+  };
+}
+
+/**
+ * The frame to write for a Graphic Arc. A reader takes the ellipse from it (its center, and its
+ * half-size less a 4 px inset, at least 1), so it is the stored ellipse plus that inset; an arc whose
+ * own frame already gives that ellipse (one never handle-edited) keeps its frame.
+ */
+function cdxmlGraphicArcFrame(graphic: GraphicObject): { x: number; y: number; width: number; height: number } | undefined {
+  const { center, rx, ry } = nativeGraphicArcEllipse(graphic);
+  const frameCenter = objectCenter(graphic), tolerance = 0.005;
+  if (Math.abs(frameCenter.x - center.x) <= tolerance && Math.abs(frameCenter.y - center.y) <= tolerance &&
+      Math.abs(Math.max(graphic.width / 2 - 4, 1) - rx) <= tolerance &&
+      Math.abs(Math.max(graphic.height / 2 - 4, 1) - ry) <= tolerance) return undefined;
+  return { x: center.x - rx - 4, y: center.y - ry - 4, width: 2 * rx + 8, height: 2 * ry + 8 };
+}
+
+function finiteArcSweepRadians(graphic: GraphicObject): number | undefined {
+  const sweep = graphic.data.arcSweepRadians;
+  return typeof sweep === "number" && Number.isFinite(sweep) ? sweep : undefined;
+}
+
 function nativeGraphicArcAngles(graphic: GraphicObject): { startRadians: number; sweepRadians: number; endRadians: number } {
-  const sweepRadians = clampArcSweepRadians(graphic.data.arcSweepRadians ?? Math.PI);
+  const sweepRadians = clampArcSweepRadians(finiteArcSweepRadians(graphic) ?? Math.PI);
   const startRadians = typeof graphic.data.arcStartRadians === "number" && Number.isFinite(graphic.data.arcStartRadians)
     ? graphic.data.arcStartRadians
     : -Math.PI / 2 - sweepRadians / 2;
@@ -4024,6 +4071,9 @@ function importPageObjects(
   collectStandaloneSteps(pageElement);
   const rootsBySourceId = new Map<string, string[]>();
   const supersededBySourceId = new Map<string, string>();
+  // A caption lifted out of a fragment, keyed by its element: that fragment's frame places a caption
+  // whose own position and BoundingBox are both missing or malformed.
+  const fragmentFrameForCaption = new Map<XmlElementView, { x: number; y: number; width: number; height: number }>();
   context.preserveReactionIds ||= findElements(pageElement.children, "bracketedgroup").length > 0 ||
     findElements(pageElement.children, "represent").some(ref => ref.attributes.attribute === "Radical");
   if (context.preserveReactionIds) {
@@ -4074,7 +4124,9 @@ function importPageObjects(
         })
       });
       const molecule = single(importFragment(separateDisplayChildren(element), pageIndex, objectIndex, warnings, context));
+      const fragmentFrame = parseCdxmlXyBoundingBox(element.attributes.BoundingBox) ?? finiteFrame(molecule.objects[0]);
       for (const child of displayChildren) {
+        if (child.name === "t" && fragmentFrame) fragmentFrameForCaption.set(child, fragmentFrame);
         const imported = importElement(child);
         molecule.objects.push(...imported.objects);
         molecule.rootIds.push(...imported.rootIds);
@@ -4082,7 +4134,7 @@ function importPageObjects(
       return molecule;
     }
     if (element.name === "t") {
-      return single(importText(element, pageIndex, objectIndex, context));
+      return single(importText(element, pageIndex, objectIndex, context, fragmentFrameForCaption.get(element)));
     }
     if (element.name === "graphic") {
       const mark = importLonePair(element, `cdxml_lone_pair_${pageIndex + 1}_${objectIndex}`, colorTable);
@@ -5424,7 +5476,74 @@ function frontBondRefFromCdxmlDepth(left: BondRef, right: BondRef, context: Impo
   return bondRefKey(left).localeCompare(bondRefKey(right)) >= 0 ? left : right;
 }
 
-function importText(textElement: XmlElementView, pageIndex: number, objectIndex: number, context: ImportPageContext): TextObject {
+function finiteFrame(object: { x: number; y: number; width: number; height: number } | undefined):
+  { x: number; y: number; width: number; height: number } | undefined {
+  return object && [object.x, object.y, object.width, object.height].every(Number.isFinite)
+    ? { x: object.x, y: object.y, width: object.width, height: object.height } : undefined;
+}
+
+/**
+ * A caption's p and BoundingBox, made usable before anything reads or keeps them. A malformed or
+ * non-finite value (`p="40 NaN"`) is treated as missing, so it is never copied back out on export
+ * and a later move shifts p and BoundingBox together. A missing or malformed p is derived from the
+ * valid BoundingBox (the alignment edge, one ascent below its top), else from the fragment the
+ * caption belongs to (below its frame), else the page origin; any finite coordinate of a malformed
+ * p is kept. One warning names what was ignored or where an unplaceable caption went. An element
+ * with neither problem is returned as is.
+ */
+function sanitizeCaptionGeometry(
+  element: XmlElementView,
+  objectId: string,
+  context: ImportPageContext,
+  fragmentFrame: { x: number; y: number; width: number; height: number } | undefined
+): XmlElementView {
+  const a = element.attributes;
+  const point = parseCdxmlXyPoint(a.p);
+  const box = parseCdxmlXyBoundingBox(a.BoundingBox);
+  const badPoint = a.p !== undefined && !point, badBox = a.BoundingBox !== undefined && !box;
+  if (point && !badBox) return element;
+  const attributes = { ...a };
+  if (badBox) delete attributes.BoundingBox;
+  let placedBy = "it was placed by its p";
+  if (!point) {
+    const size = parseNumber(childElements(element, "s")[0]?.attributes.size);
+    const ascent = cdxmlToCssPx(size !== undefined && size > 0 && Number.isFinite(size) ? size : 10) * 0.8;
+    let derived: Point, keptCoordinate = false;
+    if (box) {
+      const factor = a.Justification === "Center" ? 0.5 : a.Justification === "Right" ? 1 : 0;
+      derived = { x: box.x + factor * box.width, y: box.y + Math.min(box.height, ascent) };
+    } else if (fragmentFrame) {
+      derived = { x: fragmentFrame.x, y: fragmentFrame.y + fragmentFrame.height + ascent };
+    } else {
+      derived = { x: 0, y: 0 };
+    }
+    // A malformed p may still state one coordinate; keep it.
+    const [x, y] = (a.p?.trim().split(/\s+/) ?? []).map(token => token ? Number(token) : Number.NaN);
+    if (Number.isFinite(x)) { derived.x = cdxmlToCssPx(x); keptCoordinate = true; }
+    if (Number.isFinite(y)) { derived.y = cdxmlToCssPx(y); keptCoordinate = true; }
+    attributes.p = formatPoint(derived);
+    placedBy = (box ? "it was placed from its BoundingBox" : fragmentFrame ? "it was placed below the fragment it belongs to"
+      : "it was placed at the page origin") + (keptCoordinate ? ", keeping the finite coordinate of its p" : "");
+  }
+  // A missing p placed from a valid BoundingBox or a fragment is an ordinary file, not a defect.
+  if (badPoint || badBox || (!point && !box && !fragmentFrame)) {
+    const quote = (value: string) => JSON.stringify(value.length > 40 ? `${value.slice(0, 40)}…` : value);
+    const ignored = [badPoint ? `p=${quote(a.p!)}` : "", badBox ? `BoundingBox=${quote(a.BoundingBox!)}` : ""].filter(Boolean);
+    context.warnings.push({ code: "cdxml.text_position_invalid", sourceObjectId: objectId,
+      message: `${context.sourceFormat} import: text ${a.id ?? objectId} ` + (ignored.length
+        ? `has a malformed ${ignored.join(" and ")}, which was ignored` : "has no p or BoundingBox") + `; ${placedBy}.` });
+  }
+  return { ...element, attributes };
+}
+
+function importText(
+  sourceElement: XmlElementView,
+  pageIndex: number,
+  objectIndex: number,
+  context: ImportPageContext,
+  fragmentFrame?: { x: number; y: number; width: number; height: number }
+): TextObject {
+  const textElement = sanitizeCaptionGeometry(sourceElement, `cdxml_text_${pageIndex + 1}_${objectIndex}`, context, fragmentFrame);
   const point = parseCdxmlPoint(textElement.attributes.p);
   const text = textContent(textElement.children);
   const color = colorForCdxmlIndex(textElement.attributes.color, context.colorTable);
