@@ -1,4 +1,9 @@
 import { moleculeToMolfileV2000, type MoleculeObject } from "@chemdraft/chem-core";
+// One static import. Each function here used to run its own `import("@tauri-apps/api/core")`, and
+// the fire-and-forget one in logEngine3dDiagnostic overlapped the session start's; under Vitest's
+// module mocker the overlapping import resolved to the real module, not the test's mock. The browser
+// build loads this module too: `invoke` throws only when called, and every caller here handles that.
+import { invoke } from "@tauri-apps/api/core";
 import { nativeBondOrderResolution } from "@chemdraft/layout-engine";
 import {
   Engine3DProtocolVersion,
@@ -30,6 +35,8 @@ export interface Engine3dSidecarStatus {
   resolvedPath?: string;
   bundledBinaryName: string;
   targetTriple: string;
+  /** The shell was started with CHEMDRAFT_ENGINE3D_LOG=1 (see `logEngine3dDiagnostic`). */
+  logEnabled?: boolean;
 }
 
 export interface Engine3dSidecarSessionOutput {
@@ -89,17 +96,53 @@ const Engine3dWorkspaceReadyPollMs = 80;
 const Engine3dWorkspaceSettleTimeoutMs = 2_000;
 const WorkspaceSeedRefinementWarning = "Could not refine the 3D starting shape. The structure may look bent.";
 
+let engine3dDiagnosticsEnabled = false;
+
 export async function readEngine3dSidecarStatus(): Promise<Engine3dSidecarStatus | undefined> {
   try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    return await invoke<Engine3dSidecarStatus>("engine3d_sidecar_status");
+    const status = await invoke<Engine3dSidecarStatus>("engine3d_sidecar_status");
+    engine3dDiagnosticsEnabled = status?.logEnabled === true;
+    return status;
   } catch {
     return undefined;
   }
 }
 
+/**
+ * The webview's half of the opt-in Interactive 3D diagnostic (CHEMDRAFT_ENGINE3D_LOG=1, read by the
+ * shell): session phases and how each press on the 3D view was routed (rotate, pull, flatten or
+ * ignored), so a tester's stderr shows whether input reached the view at all next to the shell's
+ * protocol lines. A no-op unless the last status read reported the log enabled. The line travels on
+ * the status command because the app's command set is fixed by its ACL (build.rs, capabilities).
+ */
+export function logEngine3dDiagnostic(line: string): void {
+  if (!engine3dDiagnosticsEnabled) return;
+  void (async () => {
+    await invoke("engine3d_sidecar_status", { diagnostic: line });
+  })().catch(() => undefined);
+}
+
+/**
+ * Why Interactive 3D cannot start, or `undefined` when it can (or when there is no desktop shell to
+ * ask). The shell reports `available: false` when the bundled sidecar is missing or is one of the
+ * `binaries/` placeholders (the files carrying "avogadro3d-sidecar placeholder"), on every platform.
+ * Toolbars and menus then leave Interactive 3D out (`sessionUnavailableCommandIds`); this reason is
+ * the status line for a click that arrives before the status did.
+ */
+export function engine3dSidecarDisabledReason(status: Engine3dSidecarStatus | undefined): string | undefined {
+  if (!status || status.available) return undefined;
+  if (status.envOverridePath?.trim()) {
+    return `Interactive 3D isn't available: ${status.envVar} doesn't point to a runnable 3D engine`;
+  }
+  const triple = status.targetTriple ?? "";
+  const platform = triple.includes("linux") ? "Linux "
+    : triple.includes("apple-darwin") ? "macOS "
+      : triple.includes("windows") ? "Windows "
+        : "";
+  return `Interactive 3D isn't available in this ${platform}build yet`;
+}
+
 export async function startEngine3dSidecarSession(lines: string[] = []): Promise<Engine3dSidecarSessionOutput> {
-  const { invoke } = await import("@tauri-apps/api/core");
   return await invoke<Engine3dSidecarSessionOutput>("engine3d_sidecar_start_session", { lines });
 }
 
@@ -107,17 +150,14 @@ export async function sendEngine3dSidecarSession(
   processSessionId: string,
   lines: string[]
 ): Promise<Engine3dSidecarSessionOutput> {
-  const { invoke } = await import("@tauri-apps/api/core");
   return await invoke<Engine3dSidecarSessionOutput>("engine3d_sidecar_send_session", { processSessionId, lines });
 }
 
 export async function pollEngine3dSidecarSession(processSessionId: string): Promise<Engine3dSidecarSessionOutput> {
-  const { invoke } = await import("@tauri-apps/api/core");
   return await invoke<Engine3dSidecarSessionOutput>("engine3d_sidecar_poll_session", { processSessionId });
 }
 
 export async function stopEngine3dSidecarSession(processSessionId: string): Promise<Engine3dSidecarSessionOutput> {
-  const { invoke } = await import("@tauri-apps/api/core");
   return await invoke<Engine3dSidecarSessionOutput>("engine3d_sidecar_stop_session", { processSessionId });
 }
 

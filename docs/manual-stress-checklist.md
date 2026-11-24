@@ -102,6 +102,29 @@ cover the toolbars. Hover for a tooltip, open and reopen a palette popover, and 
 Check that each opens after prewarming or reuse and that mouse-opened utilities leave the document
 focused. On native Wayland, the compositor places these windows.
 
+Toolbar flyout stacking (Linux, B7): on KDE Plasma under XWayland, with the default palette layout
+(include 1280x800, where the Arrows palette overlaps Main), long-press Single Bond on the Main
+toolbar. The "ChemDraft tools" flyout shows in full above the Main toolbar and above every other
+palette, not just a strip. Repeat with Reaction Arrow on Main, then with a flyout on another
+palette and the Art color picker. `xprop -root _NET_CLIENT_LIST_STACKING` lists the flyout after
+its palette, and `xprop` on the flyout shows WM_TRANSIENT_FOR set to that palette, not the
+document. The document keeps focus (its title stays active and M still switches tools). Close and
+reopen the palette from View ▸ Toolbars, then long-press again: the flyout still opens above it.
+
+New flyouts do not demand attention (Linux, B7 follow-up): on KDE Plasma under XWayland, quit and
+relaunch ChemDraft so every popover is new, then long-press a flyout button on a palette whose
+flyout has not opened yet. While it is open, `xprop _NET_WM_STATE _NET_WM_USER_TIME` on the
+"ChemDraft tools" window shows no `_NET_WM_STATE_DEMANDS_ATTENTION` and a nonzero user time, and the
+taskbar and task switcher show no attention highlight for ChemDraft. The document keeps focus (its
+title stays active and M still switches tools), and `xprop -root _NET_ACTIVE_WINDOW` still names the
+document window, not the flyout. Do the same for a never-opened color picker and for the E/Z
+popover from a canvas double bond. Reopen each: still no attention state and no focus change. On
+GNOME (X11 or XWayland), a new flyout opens above its palette and leaves the document focused.
+Cold open with later input: after a fresh relaunch, long-press a never-opened flyout and, before it
+appears, click once on an empty part of another palette. The flyout's `_NET_WM_USER_TIME` is the
+long-press's time, not the later click's (`xev -root` or `xinput test-xi2 --root` shows both), and
+it still opens without an attention state.
+
 Palette first paint (Windows): quit ChemDraft, then cold-launch it. The Main toolbar and the other
 open palettes appear with their content in the palette's light grey, with no black frame and no
 blank light frames first. Press and hold a flyout button and open a color picker: each popover, and
@@ -291,6 +314,18 @@ may appear or act; an older create/reveal finishing late must not hide it. Chang
 switch tabs while it opens and verify that a late action cannot affect the new selection/document.
 Ring bonds refuse the flip with a reason. If retained isotope/radical properties cannot be mapped
 through a label expansion, both geometry choices refuse rather than discarding those properties.
+
+## Interactive 3D availability (macOS, Windows and Linux)
+
+- In a build whose 3D sidecar is a placeholder (a Linux package built without the engine, or a
+  dev build with the `binaries/` placeholder): Interactive 3D Workspace is absent from the
+  Structure menu, from every toolbar (Main and Structure), from Customize Toolbars and the Main
+  toolbar's Customize gallery, and from the palette flyouts. There is no greyed-out copy anywhere,
+  and no empty separator at the end of the Structure menu. Spin 3D is still on its toolbar and works.
+  A saved toolbar layout that holds Interactive 3D keeps it: in a build with a real sidecar the
+  button is back in the same spot.
+- In a build with a real sidecar, Interactive 3D shows in the Structure menu and on its toolbar,
+  enabled, and opens on a selected molecule.
 
 ## Spin 3D (macOS and Windows)
 
@@ -1790,11 +1825,108 @@ Run under KDE Plasma (Wayland session, so the app uses XWayland) and on GNOME.
 - Window menu: it lists Minimize, Maximize / Restore and Close Window. Minimize iconifies the
   document window; Maximize / Restore toggles it; Close Window closes it the same way as the
   title bar button (Save on Quit prompt for unsaved edits, then ChemDraft quits). File ▸ Close
-  Window does the same. Ctrl+W still closes the current document tab.
+  Window does the same. Ctrl+W still closes the current document tab. These items are registry
+  commands (`window.minimize`, `window.toggleMaximize`, `window.close`) routed like every other
+  menu item: run each with a palette focused (click a tool in Main first) and check that it still
+  acts on the document window, never on the palette. With the document window minimized from the
+  menu, restore it from the taskbar and check the palettes come back with it.
+- Window menu on macOS and Windows (regression): it still shows the operating system's own
+  Minimize and Zoom/Maximize items with their usual shortcuts (Cmd+M on macOS), and no
+  "Maximize / Restore" item or disabled copy of the Linux items appears in any menu, toolbar or
+  the Customize gallery.
 - 1280-wide screen: set the display to 1280x800 and relaunch. The Main toolbar is no wider than
   the screen and starts at its left edge; nothing runs off the right edge of the screen. At
   1680x1050 the Main toolbar keeps its full width and saved position.
+- 1024-wide screen: set the display to 1024x768 and relaunch. The Main toolbar is as wide as the
+  screen and scrolls sideways: drag its horizontal scrollbar (or Shift+wheel over it) to the right
+  end and every tool, up to the last one, is reachable and clickable. The scrollbar is fully
+  visible below the tool row, not cut off by the palette's bottom edge, and the row above it is
+  not clipped either. Palettes that fit the screen (Arrows, Orbitals, Style) show no scrollbar.
+  Relaunched at 1680x1050, the Main toolbar shows no scrollbar.
+- Moving between screens without relaunching (a 1024x768 and a 1680x1050 monitor side by side):
+  drag the scrolling Main toolbar onto the wide monitor. It widens to its full width, the
+  horizontal scrollbar disappears and the palette loses the scrollbar's height. Drag it back to
+  the narrow monitor: it is capped at that screen's width again and scrolls sideways with the bar
+  fully visible. Neither move leaves the palette flickering or resizing on its own.
 - Palette positions after Save/Open: place Main and Art somewhere distinctive, then press
   Shift+Ctrl+S and Esc, and Ctrl+O and Esc, several times. Every palette comes back exactly where
   it was, and after quitting and relaunching it opens at that same spot (toolbar-state.json is
   unchanged by the dialogs).
+- Work-area fits are not saved (B9, all three builds; on Linux run under XWayland): open Drawn
+  Structure Settings at 1680x1050 and drag it to the right half, top edge about 160 px down.
+  Switch the display live to 1024x768. It is pulled onto the smaller screen, and its title strip
+  is below the Main toolbar, never under it: drag it by the title to prove it. Without touching it,
+  switch back to 1680x1050: within about a second it returns to the exact spot and size it had
+  before (toolbar-state.json still holds that frame throughout). Repeat, but this time drag it a
+  little while at 1024x768: back at 1680x1050 it stays where you dropped it. The same holds for
+  the Main toolbar on Linux: at 1024 it starts at the left edge, and back at 1680 it returns to
+  its saved position. Quit at 1024x768 and relaunch at 1680x1050: palettes open at their 1680
+  positions, not the squeezed ones.
+- Document menu bar stays clickable (Linux and Windows; macOS has the global menu bar and is
+  unchanged): start from a fresh profile (delete toolbar-state.json) so every palette takes its
+  first-ever position. With the document window unmaximized at its default size, the Main toolbar
+  and the other palettes sit below the document's menu bar, never over it or the title bar: open
+  each menu by clicking it. On Linux, check at 1680x1050 and 1280x800; on Windows, check at
+  1920x1200 (or 2560x1440 at 125%), where the old default covered the menu bar, and at 1920x1080,
+  where Main keeps its old spot. Then move Main elsewhere, quit and relaunch: it opens where you
+  left it, not at the default.
+
+## Linux Interactive 3D (1.2.2)
+
+Run under KDE Plasma (Wayland session, so the app uses XWayland) from a terminal, with
+`CHEMDRAFT_ENGINE3D_LOG=1` set, using the x86_64 package that bundles the real sidecar.
+
+- Paste `CCO` (ethanol), select it and open Interactive 3D from the Main toolbar's 3D button and
+  again from Structure ▸ Interactive 3D Workspace…. The status line reads "Drag empty space to
+  rotate · click outside to flatten · Drag an atom to change the shape. On release, it relaxes to
+  a realistic shape, so atoms may move back. · Esc to close" (a force-field readout may follow
+  the ready label). It never shows a raw name such as `tug-ready`,
+  `attaching`, `beginDrag`, `updateDrag`, `endDrag` or "3 atoms · coord rev 2".
+- Drag in empty space inside the selection box, away from the atoms: the molecule
+  rotates with the drag and stays rotated after release; drag again to keep rotating. stderr shows
+  `[engine3d] webview: press 1 at …: rotate` and `release 1: rotate ended after N moves` with N
+  above 0. If the view does not turn, keep that log: `press` lines missing means the press never
+  reached the 3D view; `rotate ended after 0 moves` means no pointer moves arrived during the drag.
+- Drag an atom: while dragging, the status reads "Pulling the atom · release to let the structure
+  settle" and the atom follows the cursor; after release it reads the instructions again. stderr
+  shows `press … pull atom …`, then the sidecar lines `-> beginDrag`, `-> updateDrag`,
+  `<- event coordinatesChanged reason=drag`, `-> endDrag` and
+  `<- event coordinatesChanged reason=settle`, each answered by `<- response ok`.
+- Arrow keys and typing a number (for example "90" then Enter) with the canvas focused do not
+  rotate the 3D view: Interactive 3D has no keyboard rotation on any platform. They must not
+  change the drawing either; Esc still closes the view with "Spin canceled" and the original 2D
+  drawing.
+- Click outside the selection box: the view flattens to the rotated perspective as one undo step.
+  Repeat with `C[C@H](O)CC` ((S)-butan-2-ol, one wedged stereocenter): rotate, pull and flatten,
+  and the Molecular Inspector still reports (S) afterwards.
+- Without `CHEMDRAFT_ENGINE3D_LOG`, the same session writes no `[engine3d]` lines.
+
+## Linux palette tooltips, work-area changes and the Save dialog (1.2.3)
+
+Run under KDE Plasma (Wayland session, so the app uses XWayland) and on GNOME.
+
+- Tooltip hides when the pointer leaves (B5): hover several palette buttons about 1-2 s apart,
+  then move the pointer straight onto the canvas. The last tooltip disappears at once. Repeat,
+  moving the pointer quickly off a button at the palette's edge, onto another application's
+  window, and onto the desktop. Hover a button, then open a window over the palette without moving
+  the pointer (for example Alt+Tab to another app, or a dialog opened from the keyboard): the
+  tooltip goes away. Move back over the palette: hovering a button shows its tooltip again after
+  the usual delay.
+  As a last resort, a tooltip left with the pointer resting still on its button hides after about
+  8 s; moving the pointer within the palette keeps it up.
+- Tooltip size follows its text: hover a long tooltip that wraps (Single Bond), then a short one
+  (Orbital Lobe Tool, Eraser Tool, Formula Text Style). Each tooltip window hugs its text with no
+  blank band below or beside it; `xwininfo` on "ChemDraft tooltip" shows a size close to its
+  text box, and `xprop WM_NORMAL_HINTS` shows min = max = that size. Then hover short, long,
+  short again: the window shrinks as well as grows.
+- Work-area change with no window event: with the 1024x768 display from the 1.2.2 section (Main
+  capped and scrolling), remove or auto-hide the bottom panel without touching the palette. Within
+  about a second Main is re-fitted to the new work area; put the panel back and it is capped
+  again. On a wide display, add a vertical panel on the left or right that narrows the work area
+  below Main's width: Main is capped and scrolls without being moved. No palette flickers or keeps
+  resizing afterwards (watch for a few seconds).
+- GTK Save dialog file types: open a `.cdxml` file and press Shift+Ctrl+S. The file-type dropdown
+  at the bottom of the dialog is not blank: it reads CDXML, the existing file is selected in the
+  list, and the dropdown also offers ChemDraft and CDX. Repeat with a `.chemdraft` and a `.cdx`
+  file, and with a new untitled document. Export (File ▸ Export) dialogs show their format name.
+  macOS and Windows Save dialogs list their file types in the same order as before.

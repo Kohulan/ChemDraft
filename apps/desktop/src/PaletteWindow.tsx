@@ -22,6 +22,8 @@ import { createDesktopShortcutRegistry, detectDesktopShortcutPlatform } from "./
 import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import { NATIVE_MENU_COMMAND_IDS, paletteMenuShortcut } from "./paletteMenuShortcuts";
 import { installNativeFlyoutKeyboard } from "./nativeFlyoutKeyboard";
+import { createPaletteTooltipDismissal, dispatchPaletteTooltipDismiss } from "./paletteTooltipDismissal";
+import { pollWorkAreaChanges } from "./window-manager/workAreaPoll";
 import { disabledControlAtPointer, installPaletteInputFocus, isPaletteInputFocusPending, paletteInputFocusControl, PALETTE_INPUT_FOCUS_COMMIT_EVENT } from "./plugins/pluginPanelInputFocus";
 import { editHistoryDirection, forceDocumentHistoryCommandId, isCleanPaletteNumberInput, isTextEditingElement } from "./editHistoryRouting";
 import { applyKeybindingSchemeToCommands } from "./keybindingScheme";
@@ -33,10 +35,12 @@ import { ToolbarCustomizeController } from "./toolbars/CustomizeMainToolbar/Tool
 import { CustomizeBar } from "./toolbars/CustomizeMainToolbar/CustomizeBar";
 import { GalleryTray } from "./toolbars/CustomizeMainToolbar/GalleryTray";
 import { SHELL_COMMAND_IDS } from "./shellCommandIds";
+import { useSessionUnavailableCommandIds, withoutSessionUnavailableCommands } from "./sessionUnavailableCommands";
 import {
   createDesktopToolsetRegistry,
   desktopToolsetRegistry,
   compoundLayoutRegistry,
+  sessionAvailableRegistry,
   getToolsetPaletteGroups,
   initialToolsetWindowSize,
   paletteCommandGroupsFromItemGroups,
@@ -134,6 +138,57 @@ function pendingPlaceholderToolset(toolsetId: string): DesktopToolsetDefinition 
   };
 }
 
+/** Rounding slack between the reported content width and the window's integer viewport width. */
+const LINUX_PALETTE_OVERFLOW_TOLERANCE_PX = 1;
+
+/**
+ * Linux only (B3 follow-up). Rust caps a palette window's width at the monitor work area, but the
+ * shell is width:max-content with a nowrap row, so on a narrow screen the right end of the Main
+ * toolbar (natural 1311 px) was clipped and unreachable. Once the window we were given is narrower
+ * than the natural width we reported, cap the content body at the viewport and let it scroll
+ * sideways. Returns the size to report:
+ * - width stays the NATURAL content width in both modes (the capped body's hidden part is added back
+ *   from scrollWidth - clientWidth), so turning the scroller on or off never changes the width
+ *   request and cannot change the window width that decides the mode;
+ * - height gains the horizontal scrollbar's measured thickness (offsetHeight - clientHeight of the
+ *   scroller; 0 for an overlay scrollbar), so the X11 min = max pin (B1) shows the row and the bar.
+ * `fittedWidth` is the width Rust last accepted. The scroller turns on only after Rust has been given
+ * this natural width (so a window that has not been fitted yet never flashes a scrollbar) and stays
+ * on while the natural width still exceeds the viewport.
+ */
+function fitLinuxPaletteHorizontalOverflow(
+  shell: HTMLElement,
+  body: HTMLElement,
+  measured: DOMRect,
+  fittedWidth: number | undefined,
+  viewportWidth: number
+): { width: number; height: number } {
+  const wasOverflowing = body.dataset.paletteHorizontalOverflow === "true";
+  let width = Math.ceil(wasOverflowing ? measured.width + body.scrollWidth - body.clientWidth : measured.width);
+  // A capped body's scrollWidth is rounded to whole pixels; keep the accepted width across that
+  // rounding so the size key does not jitter by a pixel between the two modes.
+  if (wasOverflowing && fittedWidth !== undefined
+    && Math.abs(width - fittedWidth) <= LINUX_PALETTE_OVERFLOW_TOLERANCE_PX) {
+    width = fittedWidth;
+  }
+  const overflow = (wasOverflowing || width === fittedWidth)
+    && width - viewportWidth > LINUX_PALETTE_OVERFLOW_TOLERANCE_PX;
+  const maxWidth = overflow ? `${Math.max(0, Math.floor(viewportWidth))}px` : "";
+  let rect = measured;
+  if (overflow !== wasOverflowing || body.style.maxWidth !== maxWidth) {
+    if (overflow) body.dataset.paletteHorizontalOverflow = "true";
+    else delete body.dataset.paletteHorizontalOverflow;
+    body.style.overflowX = overflow ? "auto" : "";
+    body.style.maxWidth = maxWidth;
+    rect = shell.getBoundingClientRect();
+  }
+  if (!overflow) return { width, height: Math.ceil(rect.height) };
+  const scrollbar = Math.max(0, body.offsetHeight - body.clientHeight);
+  // Everything but the scroller's box, plus the scroller's full content and its scrollbar. Correct
+  // whether the engine adds the bar to the auto height or takes it out of the content area.
+  return { width, height: Math.ceil(rect.height - body.offsetHeight + body.scrollHeight + scrollbar) };
+}
+
 export function PaletteWindow({
   toolsetId = "core.main",
   resizable = false,
@@ -154,11 +209,18 @@ export function PaletteWindow({
   const settlingBeforeForwardRef = useRef(false);
   const lastLoggedSizeRef = useRef<string>("");
   const sizeAnimationFrameRef = useRef<number | undefined>(undefined);
+  // Linux: the content width Rust last accepted, kept across size-effect reruns.
+  const fittedPaletteWidthRef = useRef<number | undefined>(undefined);
   const compoundLayoutSettings = useCompoundLayoutSettings();
   const compoundLayoutsEnabled = compoundLayoutSettings.enabled;
   const [unfilteredToolsetRegistry, setToolsetRegistry] = useState(() => initialRegistry ?? desktopToolsetRegistry);
-  const toolsetRegistry = useMemo(() => compoundLayoutRegistry(unfilteredToolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings),
-    [unfilteredToolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings]);
+  // Same session rule as the document window: a build without a runnable 3D sidecar omits
+  // Interactive 3D from this palette rather than showing it disabled.
+  const unavailableCommandIds = useSessionUnavailableCommandIds();
+  const toolsetRegistry = useMemo(() => sessionAvailableRegistry(
+    compoundLayoutRegistry(unfilteredToolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings),
+    unavailableCommandIds
+  ), [unfilteredToolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, unavailableCommandIds]);
   const [commandSpecs, setCommandSpecs] = useState<CommandSpec[]>(() =>
     allShellCommands(createPhase4Document(), undefined, {
       registry: initialRegistry ?? desktopToolsetRegistry
@@ -233,9 +295,13 @@ export function PaletteWindow({
   // palettes. The state initializer above is only a first-paint fallback before that handshake.
   // Snapshots arrive already remapped for the active keybinding scheme; re-applying here covers the
   // first-paint fallback and live scheme flips (the transform is idempotent by command id).
+  // The fallback specs are built before the sidecar status is known: filter them too, so the
+  // Customize gallery and shortcuts never offer what the palette leaves out.
   const allCommands = useMemo(
-    () => applyKeybindingSchemeToCommands(commandSpecs, keybindingScheme, shortcutOverrides),
-    [commandSpecs, keybindingScheme, shortcutOverrides]
+    () => applyKeybindingSchemeToCommands(
+      withoutSessionUnavailableCommands(commandSpecs, unavailableCommandIds), keybindingScheme, shortcutOverrides
+    ),
+    [commandSpecs, keybindingScheme, shortcutOverrides, unavailableCommandIds]
   );
   const galleryCommands = useMemo(
     () => filterToolbarCustomizationCommands(allCommands, compoundLayoutSettings),
@@ -461,23 +527,7 @@ export function PaletteWindow({
       }, 150);
     };
     // Taskbar or Dock changes can shrink the work area without a move or a webview resize.
-    let lastArea: string | undefined;
-    let checking = false;
-    const checkWorkArea = async () => {
-      if (checking || document.hidden) return;
-      checking = true;
-      try {
-        const { left, top, right, bottom } = await currentWindowLogicalWorkArea();
-        const area = `${left}:${top}:${right}:${bottom}`;
-        if (lastArea !== undefined && lastArea !== area) scheduleClamp();
-        lastArea = area;
-      } finally {
-        checking = false;
-      }
-    };
-    const check = () => { void checkWorkArea().catch(() => undefined); };
-    check();
-    const areaTimer = window.setInterval(check, 1000);
+    const stopAreaPoll = pollWorkAreaChanges(scheduleClamp, currentWindowLogicalWorkArea);
     void listenForCurrentWindowWorkAreaChanges(scheduleClamp).then(cleanup => {
       if (disposed) cleanup();
       else unlisten = cleanup;
@@ -485,7 +535,7 @@ export function PaletteWindow({
     return () => {
       disposed = true;
       window.clearTimeout(timer);
-      window.clearInterval(areaTimer);
+      stopAreaPoll();
       unlisten?.();
     };
   }, [knownToolset, resizable]);
@@ -498,6 +548,9 @@ export function PaletteWindow({
     let sizing = false;
     let pending = false;
     let lastSize = "";
+    // Linux: the work area + scale and the window's inner width at the last accepted fit (below).
+    let fittedPlacementKey: string | undefined;
+    let fittedViewportWidth: number | undefined;
     const applySize = async () => {
       if (disposed) return;
       if (sizing) {
@@ -517,8 +570,16 @@ export function PaletteWindow({
         // the window shrinks when the manifest size is too big (blank gaps) and grows when
         // content is larger (crowded rows). colorPickerOpen reserves room for the open swatch.
         const rect = shell?.getBoundingClientRect();
-        const contentWidth = rect ? Math.ceil(rect.width) : 0;
-        const contentHeight = rect ? Math.ceil(rect.height) : 0;
+        let contentWidth = rect ? Math.ceil(rect.width) : 0;
+        let contentHeight = rect ? Math.ceil(rect.height) : 0;
+        // The window's live inner width: the overflow decision and the re-send check below both use it.
+        const viewportWidth = window.innerWidth;
+        // Linux: when the capped window is narrower than the content, scroll sideways (width stays
+        // natural; height gains the scrollbar). macOS and Windows never take this branch.
+        if (platform === "linux" && shell && bodyRef.current && rect && contentWidth > 0) {
+          ({ width: contentWidth, height: contentHeight } = fitLinuxPaletteHorizontalOverflow(
+            shell, bodyRef.current, rect, fittedPaletteWidthRef.current, viewportWidth));
+        }
         const width = contentWidth || fallbackWidth;
         const height = Math.min(availableHeight,
           Math.max(colorPickerOpen ? 292 : 0, contentHeight || fallbackHeight));
@@ -533,8 +594,26 @@ export function PaletteWindow({
           }
         }
         const sizeKey = `${width}x${height}`;
-        if (sizeKey !== lastSize && await fitCurrentPaletteWindow({ width, height }, area)) {
+        // Linux: Rust caps a palette's width at its monitor's work area (toolset_content_placement),
+        // so one natural size needs a different window on another monitor. Re-send an unchanged size
+        // when what Rust caps against changed since the last accepted fit: the work area or scale (a
+        // move to another monitor, a resolution or panel change), or the window's inner width when it
+        // is not simply the width we asked for. Rust then widens a capped palette on a wide monitor
+        // or caps it on a narrow one, and the resize that follows re-runs the overflow decision
+        // against the new width. Both values are recorded on every accepted fit, so a re-run with
+        // nothing changed (including the resize after our own height change, which leaves the inner
+        // width alone) never re-sends; an identical request on an unchanged monitor gives the same
+        // frame, so a forced re-send settles after at most one more fit. macOS and Windows keep the
+        // plain size dedupe.
+        const placementKey = `${area.left}:${area.top}:${area.right}:${area.bottom}@${window.devicePixelRatio || 1}`;
+        const placementChanged = platform === "linux" && fittedPlacementKey !== undefined && (
+          placementKey !== fittedPlacementKey
+          || (viewportWidth !== fittedViewportWidth && viewportWidth !== fittedPaletteWidthRef.current));
+        if ((sizeKey !== lastSize || placementChanged) && await fitCurrentPaletteWindow({ width, height }, area)) {
           lastSize = sizeKey;
+          fittedPaletteWidthRef.current = width;
+          fittedPlacementKey = placementKey;
+          fittedViewportWidth = viewportWidth;
         }
       } finally {
         sizing = false;
@@ -563,17 +642,26 @@ export function PaletteWindow({
       if (disposed) cleanup();
       else unlisten = cleanup;
     });
+    // Linux: a panel added, removed or resized changes the work area with no move, resize or scale
+    // event, and the palette stayed capped (or uncapped) until its next move. Poll it like the
+    // inspector does. A change only schedules the same fit; applySize re-sends only when the work
+    // area differs from the last accepted fit's (placementChanged), so this cannot loop. macOS and
+    // Windows keep the plain size dedupe and do not poll.
+    const stopAreaPoll = platform === "linux"
+      ? pollWorkAreaChanges(scheduleSize, currentWindowLogicalWorkArea)
+      : undefined;
 
     return () => {
       disposed = true;
       observer?.disconnect();
+      stopAreaPoll?.();
       unlisten?.();
       if (sizeAnimationFrameRef.current !== undefined) {
         window.cancelAnimationFrame(sizeAnimationFrameRef.current);
         sizeAnimationFrameRef.current = undefined;
       }
     };
-  }, [colorPickerOpen, fallbackHeight, fallbackWidth, knownToolset, resizable, toolset.id]);
+  }, [colorPickerOpen, fallbackHeight, fallbackWidth, knownToolset, platform, resizable, toolset.id]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -724,9 +812,22 @@ export function PaletteWindow({
     // previous request; the token is re-checked after the await, immediately before emitting.
     let tooltipRequest = 0;
     let tooltipOwner: string | undefined;
+    // Linux (B5): also hide when the pointer leaves the palette without a DOM pointerleave (native
+    // leave, page hidden, idle last resort). Inert on macOS and Windows.
+    const dismissal = createPaletteTooltipDismissal({
+      platform,
+      dismiss: () => {
+        tooltipOwner = undefined;
+        tooltipRequest += 1;
+        dispatchPaletteTooltipDismiss();
+        void hidePaletteFloatingTooltip().catch(() => undefined);
+      },
+      subscribePointerLeave: handler => listenForPalettePointerLeave(toolset.id, handler)
+    });
     const handleTooltip = (event: Event) => {
       if (customizeThisPaletteRef.current) {
         tooltipRequest += 1;
+        dismissal.hidden();
         void hidePaletteFloatingTooltip().catch(() => undefined);
         return;
       }
@@ -739,12 +840,14 @@ export function PaletteWindow({
         if (detail.ownerId && detail.ownerId !== tooltipOwner) return;
         tooltipOwner = undefined;
         tooltipRequest += 1;
+        dismissal.hidden();
         void hidePaletteFloatingTooltip().catch(() => undefined);
         return;
       }
       const { title, description, shortcut, anchor } = detail;
       tooltipOwner = detail.ownerId;
       tooltipRequest += 1;
+      dismissal.shown();
       const request = tooltipRequest;
       void (async () => {
         const windowPosition = await currentWindowLogicalPosition().catch(() => undefined);
@@ -764,10 +867,11 @@ export function PaletteWindow({
     window.addEventListener(PALETTE_TOOLTIP_DOM_EVENT, handleTooltip);
     return () => {
       tooltipRequest += 1;
+      dismissal.dispose();
       window.removeEventListener(PALETTE_TOOLTIP_DOM_EVENT, handleTooltip);
       void hidePaletteFloatingTooltip().catch(() => undefined);
     };
-  }, []);
+  }, [platform, toolset.id]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {

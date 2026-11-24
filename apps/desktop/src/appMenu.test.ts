@@ -18,6 +18,7 @@ import {
 import { pluginItemsForNativeMenu } from "./plugins/nativePluginMenu";
 import { VIBE_CODE_STARTER_COMMAND_ID } from "./commands/vibeCodeStarter";
 import { nativeStylePresetCommandId } from "./commands";
+import { WINDOW_ACTION_EVENT, windowCommandIds } from "./windowCommands";
 
 const EMPTY_CONTEXT: AppMenuContext = {
   rulersVisible: true,
@@ -59,6 +60,60 @@ function parseNativeMenuCommandIds(): string[] {
   }
   return [...ids];
 }
+
+/** The Linux Window menu's routed command ids (`LINUX_WINDOW_COMMAND_IDS` in lib.rs), resolved. */
+function parseLinuxWindowCommandIds(): string[] {
+  const source = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+  const block = source.match(/const LINUX_WINDOW_COMMAND_IDS:\s*&\[&str\]\s*=\s*&\[([\s\S]*?)\];/);
+  if (!block) throw new Error("Could not find LINUX_WINDOW_COMMAND_IDS in lib.rs");
+  return [...block[1].matchAll(/\b([A-Z][A-Z0-9_]+)\b/g)].map(([, name]) => {
+    const value = source.match(new RegExp(`const ${name}:\\s*&str\\s*=\\s*"([^"]+)"`));
+    if (!value) throw new Error(`Could not resolve LINUX_WINDOW_COMMAND_IDS constant ${name}`);
+    return value[1];
+  });
+}
+
+describe("Linux Window menu", () => {
+  it("routes each native Linux Window item to a registry window command", () => {
+    expect(parseLinuxWindowCommandIds()).toEqual(windowCommandIds);
+    expect(windowCommandIds).toEqual(["window.minimize", "window.toggleMaximize", "window.close"]);
+    const native = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+    expect(native).toContain(`const WINDOW_ACTION_EVENT: &str = "${WINDOW_ACTION_EVENT}";`);
+    // Routed through the same click path as every other menu item, after the Close-id mapping.
+    const click = native.split(".on_menu_event(")[1]!.split(".on_window_event(")[0]!;
+    expect(click).toMatch(/let command_id = linux_menu_command_id\(command_id\);\s*if \(is_routed_menu_command\(command_id\)/);
+    expect(native.split("fn is_routed_menu_command")[1]!.split("\n}\n")[0])
+      .toContain('(cfg!(target_os = "linux") && LINUX_WINDOW_COMMAND_IDS.contains(&command_id))');
+    const main = readFileSync(new URL("./MainWindow.tsx", import.meta.url), "utf8");
+    expect(main).toContain("for (const command of windowCommands({ isDesktop: isDesktopRuntime(), platform: detectDesktopShortcutPlatform() })) {");
+  });
+
+  it.each(["macos", "windows", "linux"] as const)("keeps the window commands out of the shared menu model on %s", platform => {
+    // The web bar has no Window menu, and macOS/Windows show the OS's own predefined items.
+    const model = buildAppMenuModel({ ...EMPTY_CONTEXT, platform });
+    const ids = flattenAppMenuCommands(model).map(item => item.commandId);
+    for (const id of windowCommandIds) {
+      expect(ids).not.toContain(id);
+      expect(parseNativeMenuCommandIds()).not.toContain(id);
+    }
+  });
+});
+
+describe("Interactive 3D in the app menu", () => {
+  it.each(["macos", "windows", "linux"] as const)("is left out, not disabled, when the build cannot run it on %s", platform => {
+    const ids = (unavailableCommandIds?: ReadonlySet<string>) =>
+      flattenAppMenuCommands(buildAppMenuModel({ ...EMPTY_CONTEXT, platform, unavailableCommandIds })).map(item => item.commandId);
+    expect(ids()).toContain("structure.openInteractive3d");
+    expect(ids(new Set())).toEqual(ids());
+    const without = ids(new Set(["structure.openInteractive3d"]));
+    expect(without).not.toContain("structure.openInteractive3d");
+    expect(without).toContain("structure.cleanup2d");
+    const structure = buildAppMenuModel({ ...EMPTY_CONTEXT, platform, unavailableCommandIds: new Set(["structure.openInteractive3d"]) })
+      .find(section => section.id === "structure")!;
+    // No dangling separator where the item was (the drawing-style block brings its own).
+    expect(structure.items.filter((item, index, items) => item.kind === "separator" && items[index + 1]?.kind === "separator")).toEqual([]);
+  });
+});
 
 describe("app menu model", () => {
   it.each([["macos", "app"], ["windows", "help"]] as const)("places About ChemDraft in the %s menu", (platform, sectionId) => {
@@ -418,9 +473,9 @@ describe("native Window and full-screen menus", () => {
     expect(windowMenu).toMatch(/#\[cfg\(windows\)\]\s*&PredefinedMenuItem::close_window\(app, None\)/);
     expect(windowMenu.match(/PredefinedMenuItem::(?:minimize|maximize|close_window)\(/g)).toHaveLength(3);
     // muda leaves the predefined items out of GTK menus, so Linux builds ordinary items instead.
-    expect(windowMenu).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*&linux_window_menu_item\(app, LINUX_MINIMIZE_MENU_ID\)\?/);
-    expect(windowMenu).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*&linux_window_menu_item\(app, LINUX_TOGGLE_MAXIMIZE_MENU_ID\)\?/);
-    expect(windowMenu).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*&linux_window_menu_item\(app, LINUX_CLOSE_WINDOW_WINDOW_MENU_ID\)\?/);
+    expect(windowMenu).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*&linux_window_menu_item\(app, WINDOW_MINIMIZE_COMMAND_ID\)\?/);
+    expect(windowMenu).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*&linux_window_menu_item\(app, WINDOW_TOGGLE_MAXIMIZE_COMMAND_ID\)\?/);
+    expect(windowMenu).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*&linux_window_menu_item\(app, WINDOW_CLOSE_COMMAND_ID\)\?/);
   });
 
   it("builds one native full-screen item in View with the current document state on macOS", () => {
