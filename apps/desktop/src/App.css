@@ -2726,28 +2726,37 @@ textarea:focus-visible,
   background: var(--cd-stoplight-fill-hover);
 }
 
+/* Windows: a visible "×" close control at the top right of the title strip (Windows caption
+   convention: red on hover, deeper red while pressed). macOS keeps the stoplight dot above. */
 .palette-title[data-platform="windows"] {
-  padding-inline: 4px 20px;
+  padding-inline: 4px 28px;
 }
 
-.palette-title[data-platform="windows"] .palette-close-button {
+.palette-title[data-platform="windows"] .palette-close-button--end {
   inset: 0 0 0 auto;
-  width: 20px;
+  width: 28px;
   height: auto;
+  min-height: 20px;
   border: 0;
   border-radius: 0;
   background: transparent;
   color: var(--cd-text-primary);
   box-shadow: none;
-  font: 16px/1 system-ui, sans-serif;
+  font: 14px/1 "Segoe UI", system-ui, sans-serif;
   transform: none;
 }
 
-.palette-title[data-platform="windows"] .palette-close-button:hover {
-  background: var(--cd-bg-hover);
+.palette-title[data-platform="windows"] .palette-close-button--end:hover {
+  background: #c42b1c;
+  color: #fff;
 }
 
-.palette-title[data-platform="windows"] .palette-close-button:focus-visible {
+.palette-title[data-platform="windows"] .palette-close-button--end:active {
+  background: rgb(196 43 28 / 85%);
+  color: rgb(255 255 255 / 85%);
+}
+
+.palette-title[data-platform="windows"] .palette-close-button--end:focus-visible {
   outline-offset: -2px;
 }
 
