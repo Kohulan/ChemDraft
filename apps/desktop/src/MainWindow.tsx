@@ -11225,7 +11225,7 @@ export function MainWindow({
             documentTabSnapshotsRef.current.clear();
             nonPristineTabsRef.current.clear();
           }
-          for (const { id, session, history, reports } of restored) {
+          for (const { id, session, opened, resolved, history, reports } of restored) {
             if (session.pristine !== true || session.path || session.dirty || !session.blank) nonPristineTabsRef.current.add(id);
             const savePathNotice = restoredSavePathNotice(session);
             documentTabSnapshotsRef.current.set(id, {
