@@ -161,6 +161,7 @@ import {
   type DocumentObject,
   type DocumentPage,
   type DocumentPatch,
+  type ElectronMarkObject,
   type FlattenWarning,
   type GraphicFreehandPoint,
   type GraphicObject,
@@ -728,7 +729,9 @@ import {
   ungroupSelectedDocumentObjects,
   moveNativeMoleculeParts,
   moleculeFrameDelta,
+  singleMoleculeSelection,
   spin3dCarriedElectronMarks,
+  uncarriedMarksRefusal,
   findForeignNativeMoleculeBondTarget,
   openNativeDocument,
   openedDocumentRenumberedObjectIds,
@@ -1066,6 +1069,7 @@ import {
   applySelection,
   fromSelectionItems,
   selectionModeFromEvent,
+  selectionAfterElectronMarkPlacement,
   toSelectionItems,
   toSelectionItemsMulti,
   type SelectionItem
@@ -5409,7 +5413,28 @@ export function MainWindow({
     }
 
     const currentDocument = documentRef.current;
-    const nextDocument = applyChargeToolAtNativeAtom(currentDocument, markSpec, target);
+    const placedDocument = applyChargeToolAtNativeAtom(currentDocument, markSpec, target);
+    // A press that cancels a charge (− on ⊕) REMOVES the mark and leaves the rest of the selection
+    // as it was, so there is no placed mark to select and nothing to report but the removal.
+    const placedPageObjectIds = placedDocument === currentDocument ? undefined
+      : new Set(placedDocument.pages.flatMap(candidate => candidate.objects.map(object => object.id)));
+    const removedMark = placedPageObjectIds && currentDocument.pages.flatMap(candidate => candidate.objects)
+      .find((object): object is ElectronMarkObject => object.type === "electron-mark" && !placedPageObjectIds.has(object.id));
+    // Otherwise the workflow selects the mark it placed, bumped or converted; the selection policy
+    // decides whether that replaces the selection or joins a whole-selected owner molecule (a mark
+    // follows its atom).
+    const placedMarkIds = removedMark ? [] : placedDocument.selection.objectIds.filter(id =>
+      findDocumentObject(placedDocument, id)?.type === "electron-mark");
+    const placedSelection = placedDocument !== currentDocument && placedMarkIds.length > 0
+      ? fromSelectionItems(selectionAfterElectronMarkPlacement(
+          toSelectionItemsMulti(currentDocument.selection.objectIds, selectedNativeMoleculePartsRef.current),
+          { objectId: target.objectId, selectedAs: selectableDocumentObjectIdForPointer(currentDocument, target.objectId) },
+          placedMarkIds
+        ), { scope: "multi" }).objectIds
+      : undefined;
+    const nextDocument = placedSelection && placedSelection.join("\n") !== placedDocument.selection.objectIds.join("\n")
+      ? selectDocumentObjects(placedDocument, placedDocument.selection.pageId ?? placedDocument.pages[0].id, placedSelection)
+      : placedDocument;
     if (nextDocument === currentDocument) {
       // A refused INCREMENT is not a refused mark: the mark is already on the atom, so name
       // what stopped the press — the ±9 representation cap — instead
@@ -5434,10 +5459,17 @@ export function MainWindow({
     // between presses — so re-derive the hover from the last canvas pointer position through the
     // same path pointermove uses, rather than clearing it and leaving the next press dead.
     rederiveNativeCanvasHoverRef.current(nextDocument);
+    if (removedMark) {
+      // Only a charge press removes a mark, and only the one it cancels: the opposite sign of the press.
+      const removedCharge = typeof removedMark.charge === "number" ? removedMark.charge : markSpec.kind === "charge" ? -markSpec.charge : 1;
+      setStatus(`Removed ${electronMarkSpecStatusNoun({ kind: "charge", charge: removedCharge > 0 ? 1 : -1,
+        radical: removedMark.radical, chargeStyle: removedMark.chargeStyle }, removedCharge)} from hovered atom`);
+      return;
+    }
     // Both placement paths select the mark they placed/bumped, so the committed document names
     // the stacked magnitude ("Placed positive charge 2+ on hovered atom").
     const committedDocument = documentRef.current;
-    const placedMarkId = committedDocument.selection.objectIds[0];
+    const placedMarkId = placedMarkIds[0];
     const placedMark = placedMarkId ? findDocumentObject(committedDocument, placedMarkId) : undefined;
     const placedNoun = placedMark?.type === "electron-mark" && placedMark.markKind === "radical-dot"
       ? electronMarkSpecStatusNoun({ kind: "radical-dot" })
@@ -5880,7 +5912,7 @@ export function MainWindow({
   // on selection so the synchronous rotate commit can run the same verification.
   useEffect(() => {
     if (spin3dRdkit) return;
-    const ids = selectedNativeMoleculePart ? [selectedNativeMoleculePart.objectId] : document.selection.objectIds;
+    const ids = selectedNativeMoleculePart ? [selectedNativeMoleculePart.objectId] : singleMoleculeSelection(document).objectIds;
     if (ids.length !== 1) return;
     const object = findDocumentObject(document, ids[0]);
     if (object?.type === "molecule" && validSpin3dModelFor(object)) {
@@ -5990,12 +6022,15 @@ export function MainWindow({
       stage: "spin.command",
     }, emitTrace);
     const currentDocument = documentRef.current;
-    const selectedIds = [
-      ...new Set([
-        ...currentDocument.selection.objectIds,
-        ...(selectedNativeMoleculePart ? [selectedNativeMoleculePart.objectId] : [])
-      ])
-    ];
+    const selection = singleMoleculeSelection(currentDocument,
+      selectedNativeMoleculePart ? [selectedNativeMoleculePart.objectId] : []);
+    const selectedIds = selection.objectIds;
+    if (selection.uncarriedMarkIds.length > 0) {
+      traceInfo("spin.selection", { message: `${selection.uncarriedMarkIds.length} selected marks not carried` });
+      commandSpan.complete({ message: "selection rejected" });
+      setStatus(uncarriedMarksRefusal("Spin 3D", selection.uncarriedMarkIds.length));
+      return;
+    }
     if (selectedIds.length !== 1) {
       traceInfo("spin.selection", { message: `selected ${selectedIds.length}` });
       commandSpan.complete({ message: "selection rejected" });
@@ -6402,12 +6437,8 @@ export function MainWindow({
   // by the time the user reaches the Spin 3D button the result is usually cached.
   useEffect(() => {
     if (spin3dState) return;
-    const selectedIds = [
-      ...new Set([
-        ...document.selection.objectIds,
-        ...(selectedNativeMoleculePart ? [selectedNativeMoleculePart.objectId] : [])
-      ])
-    ];
+    const selectedIds = singleMoleculeSelection(document,
+      selectedNativeMoleculePart ? [selectedNativeMoleculePart.objectId] : []).objectIds;
     if (selectedIds.length !== 1) return;
     const molecule = document.pages[0]?.objects.find(
       (object): object is MoleculeObject => object.id === selectedIds[0] && object.type === "molecule"
@@ -6679,15 +6710,17 @@ export function MainWindow({
 
   const cleanUpSelectedStructure3d = useCallback(() => {
     const currentDocument = documentRef.current;
-    const selectedObjectIds = [
-      ...new Set([
-        ...currentDocument.selection.objectIds,
-        ...(selectedNativeMoleculePart ? [selectedNativeMoleculePart.objectId] : [])
-      ])
-    ];
+    const selection = singleMoleculeSelection(currentDocument,
+      selectedNativeMoleculePart ? [selectedNativeMoleculePart.objectId] : []);
+    const selectedObjectIds = selection.objectIds;
 
     if (selectedObjectIds.length === 0) {
       setStatus("No selected structure for 3D cleanup");
+      return;
+    }
+
+    if (selection.uncarriedMarkIds.length > 0) {
+      setStatus(uncarriedMarksRefusal("3D cleanup", selection.uncarriedMarkIds.length));
       return;
     }
 
@@ -6906,15 +6939,16 @@ export function MainWindow({
   // separate window or WebGL stage — the molecule the user manipulates IS the drawing.
   const openInteractive3dWorkspace = useCallback(async () => {
     const currentDocument = documentRef.current;
-    const selectedObjectIds = [
-      ...new Set([
-        ...currentDocument.selection.objectIds,
-        ...(selectedNativeMoleculePart ? [selectedNativeMoleculePart.objectId] : [])
-      ])
-    ];
+    const selection = singleMoleculeSelection(currentDocument,
+      selectedNativeMoleculePart ? [selectedNativeMoleculePart.objectId] : []);
+    const selectedObjectIds = selection.objectIds;
 
     if (selectedObjectIds.length === 0) {
       setStatus("Select a structure before opening Interactive 3D");
+      return;
+    }
+    if (selection.uncarriedMarkIds.length > 0) {
+      setStatus(uncarriedMarksRefusal("Interactive 3D", selection.uncarriedMarkIds.length));
       return;
     }
     if (selectedObjectIds.length !== 1) {
