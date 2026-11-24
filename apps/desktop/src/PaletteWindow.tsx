@@ -1071,9 +1071,9 @@ export function PaletteWindow({
       return;
     }
 
-    // Native scrollbar thumbs target their scroll owner, including nested inspector panels.
-    // Only the explicit grip may drag from content; the title has a separate handler.
-    if (!(event.target instanceof Element) || !event.target.closest("[data-palette-content-drag-grip]")) return;
+    // The scroll container itself receives presses on its scrollbar. Leave those to the webview;
+    // descendants such as the existing content drag grip can still start a palette drag.
+    if (event.target === bodyRef.current) return;
 
     if ((event.target as HTMLElement).closest("button, select, input, textarea, [data-palette-control]") ||
       (shellRef.current && disabledControlAtPointer(shellRef.current, event.nativeEvent))) {
@@ -1090,7 +1090,7 @@ export function PaletteWindow({
       return;
     }
 
-    if (!(event.target instanceof Element) || !event.target.closest("[data-palette-content-drag-grip]")) return;
+    if (event.target === bodyRef.current) return;
 
     if ((event.target as HTMLElement).closest("button, select, input, textarea, [data-palette-control]") ||
       (shellRef.current && disabledControlAtPointer(shellRef.current, event.nativeEvent))) {
