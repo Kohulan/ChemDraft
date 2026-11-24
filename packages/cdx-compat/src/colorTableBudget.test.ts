@@ -162,6 +162,61 @@ describe("CDXML color table bytes (#442)", () => {
   });
 });
 
+// Kimi (#442): export merged a full source table and then still appended the standard colors it
+// lacked, and gave a newly used color the next index with no limit, so a valid 65,534-color file
+// saved indices past 65535; reopening cut the table and those colors were lost silently. The table
+// now stays within the cap: standard colors fill free entries only, and a color with no index left
+// is written without its own color, with one warning naming it. The cap is lowered from 65,534 to
+// 20 so the fixture stays small (the production value is pinned above).
+describe("export color indices stay within the 16-bit table (#442)", () => {
+  const cap = { colorTable: 20 };
+  const full = `<CDXML><fonttable><font id="3" charset="iso-8859-1" name="Arial"/></fonttable>${colorTable(20)}<page>` +
+    `${coloredText(10, 21, 72)}${coloredText(11, 2, 100)}</page></CDXML>`;
+  const newText = (id: string, color: string, y: number): TextObject => ({ type: "text", id, x: 30, y, width: 40, height: 22,
+    rotation: 0, text: id, spans: [], style: { color } });
+  const indices = (contents: string) => [...contents.matchAll(/ color="(\d+)"/g)].map(match => Number(match[1]));
+  const tableSize = (contents: string) => contents.match(/<colortable>([\s\S]*?)<\/colortable>/)![1].match(/<color /g)!.length;
+
+  it("writes no index past the table limit, and warns once naming the colors that did not fit", () => withCdxmlLimitsForTesting(cap, () => {
+    const opened = openChemDraftPayload(full);
+    const document = opened.document!;
+    const sourceColors = textsOf(opened).map(text => text.spans[0].style.color);
+    document.pages[0].objects.push(newText("new1", "#123456", 140), newText("new2", "#654321", 180), newText("new3", "#123456", 220));
+    const saved = exportDocumentToCdxml(document, plain);
+    // The full source table is written as it was: no standard colors appended past it.
+    expect(tableSize(saved.contents)).toBe(20);
+    expect(Math.max(...indices(saved.contents))).toBe(21);
+    expect(saved.warnings.filter(w => w.code === "cdxml.color_table_full").map(w => w.message)).toEqual([
+      "CDXML export: the color table is full (20 colors, the most its 16-bit color indices allow); colors #123456, #654321 could not be added, " +
+      "so text and objects in them are written without their own color and show the default or inherited color."
+    ]);
+    const again = openChemDraftPayload(saved.contents);
+    expect(again.warnings.map(w => w.code)).not.toContain("cdxml.color_table_truncated");
+    const texts = textsOf(again);
+    // Source colors keep their indices; the new texts show the default color, as the warning says.
+    expect(texts.slice(0, 2).map(text => text.spans[0].style.color)).toEqual(sourceColors);
+    expect(texts.slice(2).map(text => text.style.color)).toEqual([undefined, undefined, undefined]);
+    // With the embedded payload, ChemDraft keeps the colors, and the warning says so.
+    const embedded = exportDocumentToCdxml(document);
+    expect(embedded.warnings.find(w => w.code === "cdxml.color_table_full")?.message).toContain("(the embedded ChemDraft document keeps them)");
+    const reopened = openChemDraftPayload(embedded.contents);
+    expect(reopened.source).toBe("native-payload");
+    expect(textsOf(reopened).slice(2).map(text => text.style.color)).toEqual(["#123456", "#654321", "#123456"]);
+  }));
+
+  it("fills free entries with new colors up to the limit, without a warning", () => withCdxmlLimitsForTesting(cap, () => {
+    const source = full.replace(colorTable(20), colorTable(10)).replace('color="21"', 'color="11"');
+    const opened = openChemDraftPayload(source);
+    const document = opened.document!;
+    document.pages[0].objects.push(newText("new1", "#123456", 140));
+    const saved = exportDocumentToCdxml(document, plain);
+    // 10 source colors, the 8 standard colors, then the new color: 19 entries, all below the cap.
+    expect(tableSize(saved.contents)).toBe(19);
+    expect(saved.warnings.map(w => w.code)).not.toContain("cdxml.color_table_full");
+    expect(textsOf(openChemDraftPayload(saved.contents)).at(-1)!.style.color).toBe("#123456");
+  }));
+});
+
 describe("fonts stored in a saved native payload (#442)", () => {
   const longName = "N".repeat(1_000);
   const stored = Array.from({ length: 6 }, (_, i) => ({ id: String(i + 1), charset: "iso-8859-1", name: `Font${i + 1}` }));

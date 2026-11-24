@@ -321,7 +321,10 @@ interface IdAllocator {
 }
 
 // Entries retain source indices (including duplicate colors); new colors append in first-use order.
-type ExportColorTable = string[];
+// The table holds at most `cdxmlLimits.colorTable` entries (indices 2..65535, 16-bit): a color that
+// would need a later index is not added but recorded in `unplaced`, written without its own color,
+// and reported once per export (cdxml.color_table_full).
+type ExportColorTable = string[] & { unplaced?: Set<string> };
 
 interface VisibleExportContext {
   page: DocumentPage;
@@ -554,12 +557,12 @@ function exportCdxml(
   const nativePayloadHash = sha256Utf8Hex(nativeJson);
   const fonts = exportCdxmlFonts(parsedDocument, warnings);
   // Source compatibility graphics retain their color indices as well as their other attributes.
-  const colors: string[] = [...standardCdxmlColorTable];
+  const colors: ExportColorTable = [...standardCdxmlColorTable];
   const sourceColors = new Map<number, string>();
   for (const page of parsedDocument.pages) for (const object of page.objects) {
     const table = object.compatibility?.unknown.cdxmlGraphicColorTable ?? object.compatibility?.unknown.cdxmlTextColorTable;
     if (isRecord(table)) for (const [index, color] of Object.entries(table)) {
-      if (/^\d+$/.test(index) && Number(index) >= 2 && Number(index) < 65536 && typeof color === "string" && normalizeHexColor(color)) {
+      if (/^\d+$/.test(index) && Number(index) >= 2 && Number(index) < cdxmlLimits.colorTable + 2 && typeof color === "string" && normalizeHexColor(color)) {
         const previous = sourceColors.get(Number(index));
         if (previous && previous !== color) warnings.push({ code: object.type === "text" ? "cdxml.text_color_table_conflict" : "cdxml.graphic_color_table_conflict", sourceObjectId: object.id,
           message: `Source ${object.type === "text" ? "text" : "graphic"} color index ${index} refers to different colors in this document; its attribute is retained, but the shared CDXML color table uses ${color}.` });
@@ -569,7 +572,8 @@ function exportCdxml(
       }
     }
   }
-  for (const color of standardCdxmlColorTable) if (!colors.includes(color)) colors.push(color);
+  // The standard colors fill free entries only: a source table at the 16-bit limit stays within it.
+  for (const color of standardCdxmlColorTable) if (colors.length < cdxmlLimits.colorTable && !colors.includes(color)) colors.push(color);
   // Source reaction lists use document-wide ids. Reserve them before allocating any new ids,
   // including atom/bond ids carried by opaque atom-mapping attributes.
   // Retained source atom/bond ids (a lone pair's atom reference, say) are document-wide too: a
@@ -623,6 +627,7 @@ function exportCdxml(
     }
     return fitted;
   });
+  if (colors.unplaced?.size) warnings.push(cdxmlColorTableFullWarning(colors.unplaced, format, embedNativePayload));
   const droppedIds = unknownObjects.droppedOriginalIds;
   if (droppedIds.length) {
     const uniqueIds = [...new Set(droppedIds)];
@@ -3248,7 +3253,8 @@ function exportGraphicAsCdxmlCurve(
   if (colorIndex !== undefined) attributes.color = String(colorIndex);
   else {
     delete attributes.color;
-    warnings.push({ code: "cdxml.graphic_color_approximation",
+    // A valid color left out of a full table is reported once for the document (cdxml.color_table_full).
+    if (!color) warnings.push({ code: "cdxml.graphic_color_approximation",
       message: `Curve color "${graphic.style.strokeColor}" cannot be represented in the CDXML color table.`, sourceObjectId: graphic.id });
   }
   const sourceStyle = graphicStyleFromCdxmlCurve({ name: "curve", attributes, children: [] }, { colorByIndex: new Map(), warnings: [] });
@@ -3539,18 +3545,42 @@ function moleculePartColor(colors: unknown, id: string): unknown {
 function cdxmlColorAttribute(color: unknown, colors: ExportColorTable, inherited = defaultCdxmlStrokeColor): string[] {
   const normalized = normalizeHexColorValue(color);
   if (!normalized || normalized === inherited) return [];
-  return [`color="${cdxmlColorIndexForHex(normalized, colors)}"`];
+  const index = cdxmlColorIndexForHex(normalized, colors);
+  return index === undefined ? [] : [`color="${index}"`];
 }
 
+/**
+ * The color's index, adding it to the table if needed. Undefined when the color is invalid, or when
+ * the table is full (16-bit indices: no index past 65535): the color is then recorded as unplaced,
+ * and its object or run is written without a color attribute, so it shows the default (or its
+ * caption's) color, with the export's one cdxml.color_table_full warning. Not the nearest color in
+ * the table: finding it costs a scan of up to 65,534 entries per color, and a crafted palette's
+ * "nearest" entry can still be far off, where the default is predictable and the warning names
+ * every color that was not written.
+ */
 function cdxmlColorIndexForHex(color: string, colors: ExportColorTable): number | undefined {
   const normalized = normalizeHexColor(color);
   if (!normalized) return undefined;
   let index = colors.indexOf(normalized);
   if (index < 0) {
+    if (colors.length >= cdxmlLimits.colorTable) {
+      (colors.unplaced ??= new Set()).add(normalized);
+      return undefined;
+    }
     index = colors.length;
     colors.push(normalized);
   }
   return index + 2;
+}
+
+function cdxmlColorTableFullWarning(unplaced: ReadonlySet<string>, format: "cdxml" | "cdx", embedded: boolean): CompatibilityConversionWarning {
+  const list = [...unplaced];
+  const named = list.slice(0, 10).join(", ") + (list.length > 10 ? ` and ${list.length - 10} more` : "");
+  const one = list.length === 1;
+  return warning("cdxml.color_table_full", `${format.toUpperCase()} export: the color table is full ` +
+    `(${cdxmlLimits.colorTable} colors, the most its 16-bit color indices allow); ${one ? "color" : "colors"} ${named} ` +
+    `could not be added, so text and objects in ${one ? "it are" : "them are"} written without their own color and show the default or inherited color` +
+    `${embedded ? " in other apps (the embedded ChemDraft document keeps them)" : ""}.`);
 }
 
 function normalizeHexColor(color: string): string | undefined {
