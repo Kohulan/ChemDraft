@@ -1,7 +1,8 @@
-import { applyPatch, createEmptyDocument, toEngineDocument, type BracketObject, type DocumentPatch, type DocumentObject, type MoleculeObject, type ReactionObject } from "@chemdraft/chem-core";
+import { applyPatch, applyPatchWithHistory, createDocumentHistory, createEmptyDocument, toEngineDocument, type BracketObject, type ChemDraftDocument,
+  type DocumentHistory, type DocumentPatch, type DocumentObject, type MoleculeObject, type ReactionObject } from "@chemdraft/chem-core";
 import type { PluginCommandContext, PluginSelectionSnapshot } from "@chemdraft/plugin-api";
 import { describe, expect, it, vi } from "vitest";
-import { PluginHost, writePatchOps, type PluginPatchApplicationRequest } from "./index";
+import { HydrogenCountUnrepresentableReason, PluginHost, PluginHostError, writePatchOps, type PluginPatchApplicationRequest, type RequestHistory } from "./index";
 
 const now = "2026-10-22T00:00:00.000Z";
 const text = (id: string): DocumentObject => ({
@@ -507,6 +508,222 @@ describe("direct-write invocation scope", () => {
     expect(f.applyDocumentPatch).not.toHaveBeenCalled();
     expect(f.document().pages[0]!.objects).toHaveLength(2);
   });
+  it.each(["addObject", "updateObject"] as const)(
+    "refuses a %s that would store a hydrogen count other than 0 on an H, D, T or unknown (*) atom, with its reason and atom, and accepts 0",
+    async op => {
+      // An updateObject sets the count on an H, D or T atom the molecule already has (a new one bonded
+      // to an existing atom would drop it as a joined end); an addObject brings the atom with it.
+      // The unknown atom "*" reuses the reason: nothing counts hydrogens on it either (details.element says which).
+      const withHydrogen = (element: "H" | "D" | "T" | "*", hydrogenCount?: number): MoleculeObject => {
+        const molecule = cachedMolecule();
+        return { ...molecule, id: op === "addObject" && hydrogenCount !== undefined ? "mol_new" : molecule.id,
+          atoms: [...molecule.atoms, { id: "h", element, x: 160, y: 120, formalCharge: 0,
+            ...(hydrogenCount === undefined ? {} : { hydrogenCount }) }],
+          bonds: [...molecule.bonds, { id: "bh", fromAtomId: "a2", toAtomId: "h", order: "single" }] };
+      };
+      const patchFor = (molecule: MoleculeObject): DocumentPatch => op === "addObject"
+        ? { op, pageId: "page_001", object: molecule }
+        : { op, objectId: molecule.id, changes: { atoms: molecule.atoms } };
+      const existing = (element: "H" | "D" | "T" | "*") => op === "addObject" ? [cachedMolecule()] : [withHydrogen(element)];
+      const moleculeId = op === "addObject" ? "mol_new" : "mol_3";
+      for (const element of ["H", "D", "T", "*"] as const) {
+        const f = fixture(["mol_3"], ctx => ctx.documents.applyPatch!({ reason: "stated count", patch: patchFor(withHydrogen(element, 1)) }),
+          undefined, existing(element));
+        const before = f.document();
+        const refused = await f.host.invokeCommand("plugin.scope.run").then(() => undefined, (error: unknown) => error);
+        expect(refused).toBeInstanceOf(PluginHostError);
+        expect(refused).toMatchObject({
+          message: element === "*"
+            ? `Plugin write refused: atom "h" of molecule "${moleculeId}" is * with hydrogenCount 1, which an unknown ` +
+              "atom cannot carry. Only 0 is allowed on an unknown atom (*), as a typed * label means; omit hydrogenCount or " +
+              "set it to 0. Nothing was changed."
+            : `Plugin write refused: atom "h" of molecule "${moleculeId}" is ${element} with hydrogenCount 1, which a hydrogen ` +
+              "atom cannot carry. Only 0 is allowed on an H, D or T atom, as a typed H, D or T label means; omit hydrogenCount or " +
+              "set it to 0. Nothing was changed.",
+          reason: "hydrogen_count_unrepresentable",
+          details: { moleculeId, atomId: "h", element, hydrogenCount: 1 }
+        });
+        expect(f.applyDocumentPatch).not.toHaveBeenCalled();
+        expect(f.document()).toBe(before);
+      }
+      for (const element of ["D", "*"] as const) {
+        const accepted = fixture(["mol_3"], ctx => ctx.documents.applyPatch!({ reason: "stated 0", patch: patchFor(withHydrogen(element, 0)) }),
+          undefined, existing(element));
+        await expect(accepted.host.invokeCommand("plugin.scope.run")).resolves.toMatchObject({ applied: true });
+        const written = accepted.document().pages[0]!.objects.find(object => object.id === moleculeId);
+        expect(written?.type === "molecule" && written.atoms.find(atom => atom.id === "h")?.hydrogenCount).toBe(0);
+      }
+    }
+  );
+
+  it.each(["addObject", "updateObject"] as const)(
+    "refuses a %s that would store a hydrogen count other than 0 on a generic label (A, R1), naming the label, and accepts 0 and a spelled NH2",
+    async op => {
+      // A label naming no element (no element symbol starts it) is read by the same rule as "*", no label list.
+      const withLabel = (element: string, hydrogenCount?: number): MoleculeObject => {
+        const molecule = cachedMolecule();
+        return { ...molecule, id: op === "addObject" && hydrogenCount !== undefined ? "mol_new" : molecule.id,
+          atoms: [...molecule.atoms, { id: "g", element, x: 160, y: 120, formalCharge: 0, labelLiteral: true,
+            ...(hydrogenCount === undefined ? {} : { hydrogenCount }) }],
+          bonds: [...molecule.bonds, { id: "bg", fromAtomId: "a2", toAtomId: "g", order: "single" }] };
+      };
+      const patchFor = (molecule: MoleculeObject): DocumentPatch => op === "addObject"
+        ? { op, pageId: "page_001", object: molecule }
+        : { op, objectId: molecule.id, changes: { atoms: molecule.atoms } };
+      const existing = (element: string) => op === "addObject" ? [cachedMolecule()] : [withLabel(element)];
+      const moleculeId = op === "addObject" ? "mol_new" : "mol_3";
+      for (const element of ["A", "R1"]) {
+        const f = fixture(["mol_3"], ctx => ctx.documents.applyPatch!({ reason: "stated count", patch: patchFor(withLabel(element, 2)) }),
+          undefined, existing(element));
+        const before = f.document();
+        const refused = await f.host.invokeCommand("plugin.scope.run").then(() => undefined, (error: unknown) => error);
+        expect(refused).toBeInstanceOf(PluginHostError);
+        expect(refused).toMatchObject({
+          message: `Plugin write refused: atom "g" of molecule "${moleculeId}" is ${element} with hydrogenCount 2, which a label naming no ` +
+            `element cannot carry. Only 0 is allowed on a label naming no element (${element}), as a typed ${element} label means; ` +
+            "omit hydrogenCount or set it to 0. Nothing was changed.",
+          reason: "hydrogen_count_unrepresentable",
+          details: { moleculeId, atomId: "g", element, hydrogenCount: 2 }
+        });
+        expect(f.applyDocumentPatch).not.toHaveBeenCalled();
+        expect(f.document()).toBe(before);
+      }
+      for (const [element, hydrogenCount] of [["A", 0], ["NH2", 2]] as const) {
+        const accepted = fixture(["mol_3"], ctx => ctx.documents.applyPatch!({ reason: "honored", patch: patchFor(withLabel(element, hydrogenCount)) }),
+          undefined, existing(element));
+        await expect(accepted.host.invokeCommand("plugin.scope.run")).resolves.toMatchObject({ applied: true });
+        const written = accepted.document().pages[0]!.objects.find(object => object.id === moleculeId);
+        expect(written?.type === "molecule" && written.atoms.find(atom => atom.id === "g")?.hydrogenCount).toBe(hydrogenCount);
+      }
+    }
+  );
+
+  it("refuses setting hydrogenCount 1 on an H atom before the host writes, leaving the document and its undo history as they were", async () => {
+    // The embedding host records one undo entry per applied write, as the app does; nothing may reach it.
+    const molecule: MoleculeObject = { ...cachedMolecule(), atoms: [...cachedMolecule().atoms, { id: "h", element: "H", x: 160, y: 120, formalCharge: 0 }],
+      bonds: [...cachedMolecule().bonds, { id: "bh", fromAtomId: "a2", toAtomId: "h", order: "single" }] };
+    let history: DocumentHistory = createDocumentHistory(applyPatch(createEmptyDocument({ now }),
+      { op: "addObject", pageId: "page_001", object: molecule }, { now }));
+    history = { ...history, present: { ...history.present, selection: { pageId: "page_001", objectIds: [molecule.id] } } };
+    const original = history;
+    const applyDocumentPatch = vi.fn((request: PluginPatchApplicationRequest) => {
+      history = applyPatchWithHistory(history, request.patch.patch as DocumentPatch);
+      return { applied: true as const, objectIds: [] };
+    });
+    const host = new PluginHost({ getActiveDocument: () => history.present, getSelection: () => snapshot([molecule.id]), applyDocumentPatch });
+    const atoms = molecule.atoms.map(atom => atom.id === "h" ? { ...atom, hydrogenCount: 1 } : atom);
+    host.registerPlugin({ id: "org.test.hcount", name: "H count", version: "0.0.1", apiVersion: "^0.1.8", entry: "plugin.js",
+      permissions: ["document.write"], contributes: { commands: [{ id: "plugin.hcount.run", title: "Run" }] }
+    }, { commandHandlers: { "plugin.hcount.run": ctx => ctx.documents.applyPatch!({ reason: "H count",
+      patch: { op: "updateObject", objectId: molecule.id, changes: { atoms } } }) } });
+    await expect(host.invokeCommand("plugin.hcount.run")).rejects.toMatchObject({
+      reason: HydrogenCountUnrepresentableReason, details: { moleculeId: "mol_3", atomId: "h", element: "H", hydrogenCount: 1 }
+    });
+    expect(applyDocumentPatch).not.toHaveBeenCalled();
+    expect(history).toBe(original);
+    expect(history.past).toHaveLength(0);
+    expect(history.future).toHaveLength(0);
+  });
+
+  it("refuses setting hydrogenCount 1 on an OMe abbreviation, naming it, leaving the document and its undo history as they were", async () => {
+    // "An abbreviation" is read by chem-core from the abbreviation table (`isTableAbbreviationLabel`),
+    // not a list here, and with no layout-engine loaded. Its hydrogens come from what it stands for.
+    const molecule: MoleculeObject = { ...cachedMolecule(), atoms: [...cachedMolecule().atoms, { id: "g", element: "OMe", x: 160, y: 120, formalCharge: 0 }],
+      bonds: [...cachedMolecule().bonds, { id: "bg", fromAtomId: "a2", toAtomId: "g", order: "single" }] };
+    let history: DocumentHistory = createDocumentHistory(applyPatch(createEmptyDocument({ now }),
+      { op: "addObject", pageId: "page_001", object: molecule }, { now }));
+    history = { ...history, present: { ...history.present, selection: { pageId: "page_001", objectIds: [molecule.id] } } };
+    const original = history;
+    const applyDocumentPatch = vi.fn((request: PluginPatchApplicationRequest) => {
+      history = applyPatchWithHistory(history, request.patch.patch as DocumentPatch);
+      return { applied: true as const, objectIds: [] };
+    });
+    const host = new PluginHost({ getActiveDocument: () => history.present, getSelection: () => snapshot([molecule.id]), applyDocumentPatch });
+    const atoms = molecule.atoms.map(atom => atom.id === "g" ? { ...atom, hydrogenCount: 1 } : atom);
+    host.registerPlugin({ id: "org.test.ome", name: "OMe count", version: "0.0.1", apiVersion: "^0.1.8", entry: "plugin.js",
+      permissions: ["document.write"], contributes: { commands: [{ id: "plugin.ome.run", title: "Run" }] }
+    }, { commandHandlers: { "plugin.ome.run": ctx => ctx.documents.applyPatch!({ reason: "OMe count",
+      patch: { op: "updateObject", objectId: molecule.id, changes: { atoms } } }) } });
+    const refused = await host.invokeCommand("plugin.ome.run").then(() => undefined, (error: unknown) => error);
+    expect(refused).toBeInstanceOf(PluginHostError);
+    expect(refused).toMatchObject({
+      message: 'Plugin write refused: atom "g" of molecule "mol_3" is OMe with hydrogenCount 1, which nothing would count: an abbreviation\'s ' +
+        "hydrogens come from what it stands for. Only 0 is allowed on an abbreviation (OMe); omit hydrogenCount or set it to 0. Nothing was changed.",
+      reason: HydrogenCountUnrepresentableReason,
+      details: { moleculeId: "mol_3", atomId: "g", element: "OMe", hydrogenCount: 1 }
+    });
+    expect(applyDocumentPatch).not.toHaveBeenCalled();
+    expect(history).toBe(original);
+    expect(history.past).toHaveLength(0);
+    expect(history.future).toHaveLength(0);
+  });
+
+  it("accepts a stated count on a label spelling its element's hydrogens (NHMe storing 1, CH3 storing 3), and 0 on an abbreviation", async () => {
+    for (const [element, hydrogenCount] of [["NHMe", 1], ["CH3", 3], ["OMe", 0]] as const) {
+      const molecule: MoleculeObject = { ...cachedMolecule(), atoms: [...cachedMolecule().atoms,
+        { id: "g", element, x: 160, y: 120, formalCharge: 0, labelLiteral: true }],
+        bonds: [...cachedMolecule().bonds, { id: "bg", fromAtomId: "a2", toAtomId: "g", order: "single" }] };
+      const atoms = molecule.atoms.map(atom => atom.id === "g" ? { ...atom, hydrogenCount } : atom);
+      const f = fixture(["mol_3"], ctx => ctx.documents.applyPatch!({ reason: "spelled", patch: { op: "updateObject", objectId: "mol_3", changes: { atoms } } }),
+        undefined, [molecule]);
+      await expect(f.host.invokeCommand("plugin.scope.run")).resolves.toMatchObject({ applied: true });
+      const written = f.document().pages[0]!.objects.find(object => object.id === "mol_3");
+      expect(written?.type === "molecule" && written.atoms.find(atom => atom.id === "g")?.hydrogenCount).toBe(hydrogenCount);
+    }
+  });
+
+  it("lets a plugin edit elsewhere in a molecule that already holds such a count, which it keeps", async () => {
+    const held: MoleculeObject = { ...cachedMolecule(), atoms: [...cachedMolecule().atoms,
+      { id: "h", element: "H", x: 160, y: 120, formalCharge: 0, hydrogenCount: 1 }],
+      bonds: [...cachedMolecule().bonds, { id: "bh", fromAtomId: "a2", toAtomId: "h", order: "single" }] };
+    const atoms = held.atoms.map(atom => atom.id === "a1" ? { ...atom, x: atom.x - 5 } : atom);
+    const f = fixture(["mol_3"], ctx => ctx.documents.applyPatch!({ reason: "move", patch: { op: "updateObject", objectId: "mol_3", changes: { atoms } } }),
+      undefined, [held]);
+    await expect(f.host.invokeCommand("plugin.scope.run")).resolves.toMatchObject({ applied: true });
+    const written = f.document().pages[0]!.objects.find(object => object.id === "mol_3");
+    expect(written?.type === "molecule" && written.atoms.map(atom => [atom.id, atom.x, atom.hydrogenCount]))
+      .toEqual([["a1", 105, undefined], ["a2", 140, undefined], ["h", 160, 1]]);
+  });
+
+  it.each([["^0.1.27", true], ["^0.1.26", false]] as const)(
+    "refuses the same write through a request (the assistant's path) with code invalid; a plugin declaring %s gets the reason and atom: %s",
+    async (apiVersion, structured) => {
+      const molecule: MoleculeObject = { ...cachedMolecule(), atoms: [...cachedMolecule().atoms, { id: "h", element: "H", x: 160, y: 120, formalCharge: 0 }],
+        bonds: [...cachedMolecule().bonds, { id: "bh", fromAtomId: "a2", toAtomId: "h", order: "single" }] };
+      const pinned: ChemDraftDocument = { ...applyPatch(createEmptyDocument({ now, title: "Pinned" }),
+        { op: "addObject", pageId: "page_001", object: molecule }, { now }), selection: { pageId: "page_001", objectIds: [molecule.id] } };
+      const written: ChemDraftDocument[] = [];
+      const verify = vi.fn(async (_before: ChemDraftDocument, draft: ChemDraftDocument) => draft);
+      const requestHistory: RequestHistory = { verify, run: <T>(apply: () => T) => Promise.resolve(apply()) as Promise<T>,
+        write: after => { written.push(after); } };
+      const selection = () => snapshot([molecule.id]);
+      const host = new PluginHost({
+        getActiveDocument: () => pinned, getActiveDocumentKey: () => pinned.title, getSelection: selection, getRequestSelection: selection,
+        captureRequestDocument: () => ({ key: pinned.title, read: () => pinned }),
+        openRequestHistory: () => requestHistory
+      });
+      const atoms = molecule.atoms.map(atom => atom.id === "h" ? { ...atom, hydrogenCount: 1 } : atom);
+      let result: unknown;
+      host.registerPlugin({ id: "org.test.request-hcount", name: "Request H count", version: "0.0.1", apiVersion, entry: "plugin.js",
+        permissions: ["document.read", "selection.read", "document.write", "chemistry.compute"],
+        contributes: { commands: [{ id: "plugin.request-hcount.run", title: "Run" }] }
+      }, { commandHandlers: { "plugin.request-hcount.run": async ctx => {
+        const request = await ctx.requests!.begin({ label: "H count" });
+        if (!request.ok) throw new Error(request.error.message);
+        result = await ctx.documents.applyRequestPatch!({ requestId: request.value.requestId,
+          patch: { op: "updateObject", objectId: molecule.id, changes: { atoms } } });
+        await ctx.requests!.end({ requestId: request.value.requestId });
+      } } });
+      await host.invokeCommand("plugin.request-hcount.run");
+      const message = 'Plugin write refused: atom "h" of molecule "mol_3" is H with hydrogenCount 1, which a hydrogen atom cannot carry. ' +
+        "Only 0 is allowed on an H, D or T atom, as a typed H, D or T label means; omit hydrogenCount or set it to 0. Nothing was changed.";
+      expect(result).toEqual({ ok: false, error: { code: "invalid", message,
+        ...(structured ? { reason: "hydrogen_count_unrepresentable", details: { moleculeId: "mol_3", atomId: "h", element: "H", hydrogenCount: 1 } } : {}) } });
+      expect(verify).not.toHaveBeenCalled();
+      expect(written).toEqual([]);
+    }
+  );
+
   const operations: DocumentPatch[] = [
     { op: "updateObject", objectId: "mol_7", changes: { text: "changed" } },
     { op: "removeObject", objectId: "mol_7" },

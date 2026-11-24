@@ -30,6 +30,19 @@ async function draw(smiles: string) {
     pastedStructureDepictionFromMolfile(molfile), smiles);
 }
 
+describe("CR422 item 2: writeIdentity stereochemistry labels", () => {
+  it("states the unspecified-centre note for an unassigned centre, as the stereochemistry details path does", async () => {
+    const rdkit = await ensureRdkit();
+    for (const smiles of ["CC(F)Cl", "C[C@H](F)C(F)Cl"]) {
+      const details = inspectStructureInWorker(rdkit, smiles, undefined, "stereochemistry");
+      const write = inspectStructureInWorker(rdkit, smiles, undefined, "writeIdentity");
+      if (!details.valid || !write.valid) throw new Error("expected both inspections to be valid");
+      expect(details.stereochemistry).toContain("1 unspecified stereocenter");
+      expect(write.stereochemistry).toEqual(details.stereochemistry);
+    }
+  });
+});
+
 describe("request structure inspection", () => {
   it("reports RDKit composition and preserves isotope, tetrahedral and alkene stereo in both source formats", async () => {
     const smiles = "[13CH3][C@H](F)/C=C/Br";

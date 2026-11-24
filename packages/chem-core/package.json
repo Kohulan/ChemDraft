@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
+    "@chemdraft/template-library": "workspace:*",
     "zod": "^3.25.76"
   },
   "exports": {

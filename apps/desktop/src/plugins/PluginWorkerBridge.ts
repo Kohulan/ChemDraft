@@ -37,6 +37,7 @@ import {
   checkWorkerHandshake,
   getPluginRequestCapability,
   isPinnedRequestToolCapability,
+  pluginRefusalFields,
   pluginRequestFailure,
   pluginRequestPermissions,
   requestValidationCode,
@@ -845,7 +846,8 @@ export class PluginWorkerBridgeError extends Error {
 function toErrorPayload(error: unknown): PluginWorkerErrorPayload {
   if (error instanceof Error) {
     const code = (error as { code?: unknown }).code;
-    return { code: typeof code === "string" ? code : error.name, message: error.message };
+    // A host refusal's reason and details (API 0.1.27) cross beside the message; an older worker drops them.
+    return { code: typeof code === "string" ? code : error.name, message: error.message, ...pluginRefusalFields(error) };
   }
   return { code: "PLUGIN_WORKER_ERROR", message: String(error) };
 }

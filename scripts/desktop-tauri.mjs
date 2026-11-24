@@ -18,6 +18,7 @@
 // `pnpm tauri build` never did, so `--package-build` rather than a `build` argument selects it.
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,6 +29,18 @@ import { isStableDmgBuild, macosReleasePlist } from "../tools/release/macos-buil
 
 const ROOT_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 const APP_DIR = join(ROOT_DIR, "apps", "desktop");
+const requireConfig = createRequire(import.meta.url);
+
+// The `name` of the `.chemdraft` association, which the Windows installer uses as its registry ProgID.
+export function chemdraftAssociationName(associations) {
+  return associations?.find((association) => association.ext?.includes("chemdraft"))?.name;
+}
+
+// The association list Tauri reads on Windows: the platform override when it has one, else the base.
+function windowsFileAssociations() {
+  const read = (file) => requireConfig(join(APP_DIR, "src-tauri", file));
+  return read("tauri.windows.conf.json").bundle?.fileAssociations ?? read("tauri.conf.json").bundle?.fileAssociations ?? [];
+}
 
 export function buildMacosDesktop(args, { env, stable, isPackageBuild }, {
   run = spawnSync, preflight = preflightReleaseOpsinRuntime, preparePlist = macosReleasePlist, warn = console.warn
@@ -98,14 +111,25 @@ function main() {
   // build replaced the stable install and a running stable app swallowed the branch build's launch.
   // CHEMDRAFT_STABLE_BUILD=1 opts out, for release automation building a tagged commit.
   const isBranchBuild = args[0] === "build" && !isStableBuild({ command: args[0], branch: identity.branch, env });
+  const devAssociations = isBranchBuild ? devFileAssociations() : undefined;
   if (isBranchBuild) {
     const devConfig = JSON.stringify({
       identifier: identity.devBundleId,
       productName: DEV_PRODUCT_NAME,
-      bundle: { fileAssociations: devFileAssociations() }
+      bundle: { fileAssociations: devAssociations }
     });
     args.splice(1, 0, "--config", devConfig);
     console.log(`Branch build (${identity.label}): ${DEV_PRODUCT_NAME}, ${identity.devBundleId}`);
+  }
+
+  // The installer hook (apps/desktop/src-tauri/windows/installer-hooks.nsh) needs this build's `.chemdraft`
+  // ProgID before APP_ASSOCIATE writes it, and on uninstall when no install recorded it. makensis reads it
+  // from the environment at compile time, and the hook fails the build without it. It is the association
+  // name Tauri gets: the dev names above for a branch build, else the Windows config's.
+  if (process.platform === "win32") {
+    const progId = chemdraftAssociationName(devAssociations ?? windowsFileAssociations());
+    if (progId) env.CHEMDRAFT_ASSOCIATION_PROGID = progId;
+    else delete env.CHEMDRAFT_ASSOCIATION_PROGID;
   }
 
   // A stable Windows build also signs its installer for the in-app updater (`<installer>.sig`, the

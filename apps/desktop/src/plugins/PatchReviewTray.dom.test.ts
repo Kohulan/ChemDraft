@@ -4,20 +4,25 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { applyPatch, createEmptyDocument, DocumentObjectSchema, type ChemDraftDocument } from "@chemdraft/chem-core";
+import type { AcceptProposedPatchOptions, PluginHost, QueuedProposedPatch } from "@chemdraft/plugin-host";
+import { previewAcceptedPluginProposal } from "./applyPluginDocumentPatch";
 import type { PluginProposalReviewItem } from "./panelBridge";
-import { PatchReviewList } from "./PatchReviewTray";
+import { acceptedProposalMessage, PatchReviewList, PatchReviewTray, ProposalReviewItemCache, proposalReviewItem } from "./PatchReviewTray";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 let container: HTMLElement | undefined;
 let root: Root | undefined;
 
-afterEach(() => {
+function unmount(): void {
   act(() => root?.unmount());
   container?.remove();
   container = undefined;
   root = undefined;
-});
+}
+
+afterEach(unmount);
 
 function render(proposals: readonly PluginProposalReviewItem[]): void {
   container = document.createElement("div");
@@ -104,5 +109,211 @@ describe("PatchReviewList experimental recognition notice", () => {
     );
     act(() => acceptButton!.click());
     expect(onAccept).toHaveBeenCalledWith("proposal-1");
+  });
+});
+
+describe("A proposal stating a hydrogen count an H atom cannot carry", () => {
+  type Atom = { id: string; element: string; x: number; y: number; hydrogenCount?: number };
+  type Bond = { id: string; fromAtomId: string; toAtomId: string; order: "single" };
+  const carbon: Atom = { id: "c", element: "C", x: 0, y: 0 };
+  const hydrogen: Atom = { id: "h", element: "H", x: 20, y: 0 };
+  const carbonHydrogen: Bond = { id: "b", fromAtomId: "c", toAtomId: "h", order: "single" };
+  const molecule = (atoms: Atom[], bonds: Bond[]) => ({ id: "m", type: "molecule", x: 0, y: 0, width: 20, height: 1, rotation: 0, style: {},
+    structureFormat: "smiles", structure: "", superatoms: [], rGroups: [], atoms, bonds });
+
+  const blank = createEmptyDocument();
+  // The document an update proposal is accepted into: molecule m, a C bonded to an H stating nothing.
+  const withMolecule = applyPatch(blank, { op: "addObject", pageId: blank.pages[0]!.id,
+    object: DocumentObjectSchema.parse(molecule([carbon, hydrogen], [carbonHydrogen])) });
+
+  const stated = (hydrogenCount: number | undefined): Atom =>
+    ({ ...hydrogen, ...(hydrogenCount === undefined ? {} : { hydrogenCount }) });
+
+  function queued(patch: unknown): QueuedProposedPatch {
+    return {
+      id: "proposal-h", pluginId: "org.example.test", status: "pending", createdAt: "2026-11-22T00:00:00.000Z",
+      proposal: { patch, reason: "Edits a molecule.", warnings: [], requiresUserApproval: true }
+    } as QueuedProposedPatch;
+  }
+  /** Inserts molecule m (into the blank document) whose H states `hydrogenCount`. */
+  const added = (hydrogenCount: number | undefined) => ({
+    source: blank,
+    proposal: queued({ op: "addObject", pageId: "page-1", object: molecule([carbon, stated(hydrogenCount)], [carbonHydrogen]) })
+  });
+  /** Updates m so its H states 1 and nothing else changes (alone, or in a batch). */
+  const statedOnly = (batched: boolean) => {
+    const update = { op: "updateObject", objectId: "m", changes: { atoms: [carbon, stated(1)], bonds: [carbonHydrogen] } };
+    return { source: withMolecule, proposal: queued(batched ? { op: "batch", patches: [update] } : update) };
+  };
+  /** Updates m so its H states 1 AND is rebonded from the C to a new O: applying it clears the count. */
+  const statedAndRebonded = () => ({
+    source: withMolecule,
+    proposal: queued({ op: "updateObject", objectId: "m", changes: {
+      atoms: [carbon, stated(1), { id: "o", element: "O", x: 10, y: 10 }],
+      bonds: [{ id: "co", fromAtomId: "c", toAtomId: "o", order: "single" }, { id: "oh", fromAtomId: "o", toAtomId: "h", order: "single" }]
+    } })
+  });
+
+  // Mirrors PluginHost.previewProposedPatch for the one proposal it holds.
+  const hostFor = (proposal: QueuedProposedPatch) => ({
+    getPlugin: () => ({ manifest: { name: "Test Plugin" } }),
+    previewProposedPatch: (_id: string, source: ChemDraftDocument, options: AcceptProposedPatchOptions = {}) =>
+      options.apply!(source, proposal.proposal, {})
+  }) as unknown as PluginHost;
+
+  /** Accepts as MainWindow does: the same application, then the message read from what it committed. */
+  function accept({ source, proposal }: { source: ChemDraftDocument; proposal: QueuedProposedPatch }) {
+    const committed = previewAcceptedPluginProposal(hostFor(proposal), proposal.id, source);
+    const message = acceptedProposalMessage("Test Plugin", proposal,
+      { recognized: false, screenCapture: false, before: source, committed });
+    const committedHydrogen = committed.pages.flatMap(page => page.objects)
+      .flatMap(object => object.type === "molecule" ? object.atoms : []).find(atom => atom.id === "h");
+    return { message, committedCount: committedHydrogen?.hydrogenCount };
+  }
+
+  const warningText = "atom h (H) states 1 hydrogen, which a hydrogen atom cannot carry: only 0 counts, as a typed H, D or T " +
+    "label means. The stated count is kept as stored but not counted, and the atom is flagged.";
+
+  it("warns in the review item when the count would be kept, naming the atom, its element and the count", async () => {
+    for (const { source, proposal } of [added(1), statedOnly(false), statedOnly(true)]) {
+      const item = await proposalReviewItem(hostFor(proposal), proposal, undefined, source);
+      expect(item.warnings).toEqual([{ code: "document.atom_hydrogen_count_not_counted", message: `Proposed change: ${warningText}` }]);
+      render([item]);
+      expect(document.querySelector('[data-proposal-id="proposal-h"] .patch-review-warnings')?.textContent)
+        .toBe(`Proposed change: ${warningText}`);
+      unmount();
+    }
+  });
+
+  it("says so in the accept message, which matches the committed document, and accepting stays a success", () => {
+    for (const proposal of [added(1), statedOnly(false), statedOnly(true)]) {
+      expect(accept(proposal)).toEqual({ message: `Test Plugin: applied proposal. Accepted change: ${warningText}`, committedCount: 1 });
+    }
+  });
+
+  it("does not claim a count is kept when applying the update clears it (its bonds changed)", async () => {
+    const proposal = statedAndRebonded();
+    const item = await proposalReviewItem(hostFor(proposal.proposal), proposal.proposal, undefined, proposal.source);
+    expect(item.warnings).toEqual([]);
+    render([item]);
+    expect(document.querySelector('[data-proposal-id="proposal-h"] .patch-review-warnings')).toBeNull();
+    unmount();
+    expect(accept(proposal)).toEqual({ message: "Test Plugin: applied proposal", committedCount: undefined });
+  });
+
+  it("shows no warning for a clean proposal, at review or accept", async () => {
+    for (const count of [undefined, 0]) {
+      const proposal = added(count);
+      const item = await proposalReviewItem(hostFor(proposal.proposal), proposal.proposal, undefined, proposal.source);
+      expect(item.warnings).toEqual([]);
+      render([item]);
+      expect(document.querySelector('[data-proposal-id="proposal-h"] .patch-review-warnings')).toBeNull();
+      unmount();
+      expect(accept(proposal)).toEqual({ message: "Test Plugin: applied proposal", committedCount: count });
+    }
+  });
+
+  // The document after an edit to m: its H moved from the C onto a new O (bonds c-o and o-h).
+  const rebonded = applyPatch(blank, { op: "addObject", pageId: blank.pages[0]!.id, object: DocumentObjectSchema.parse(molecule(
+    [carbon, hydrogen, { id: "o", element: "O", x: 10, y: 10 }],
+    [{ id: "co", fromAtomId: "c", toAtomId: "o", order: "single" }, { id: "oh", fromAtomId: "o", toAtomId: "h", order: "single" }])) });
+  const warned = [{ code: "document.atom_hydrogen_count_not_counted", message: `Proposed change: ${warningText}` }];
+
+  describe("when the document is edited between review and accept", () => {
+    it("drops the warning once the edit means accepting clears the count, and the accept agrees", async () => {
+      const { proposal } = statedOnly(false);
+      const host = hostFor(proposal);
+      const cache = new ProposalReviewItemCache();
+      let source = withMolecule;
+      const inputs = () => ({ sourceDocument: source });
+      expect((await cache.items(host, [proposal], inputs))[0]!.warnings).toEqual(warned);
+      // The H is rebonded in the document: the proposal's bonds now differ from the H's, so applying it clears the count.
+      source = rebonded;
+      expect(cache.isStale(host, [proposal], inputs)).toBe(true);
+      expect((await cache.items(host, [proposal], inputs))[0]!.warnings).toEqual([]);
+      expect(accept({ source, proposal })).toEqual({ message: "Test Plugin: applied proposal", committedCount: undefined });
+    });
+
+    it("shows the warning once the edit means accepting keeps the count, and the accept agrees", async () => {
+      const { proposal } = statedAndRebonded();
+      const host = hostFor(proposal);
+      const cache = new ProposalReviewItemCache();
+      let source = withMolecule;
+      const inputs = () => ({ sourceDocument: source });
+      expect((await cache.items(host, [proposal], inputs))[0]!.warnings).toEqual([]);
+      // The document already holds the proposal's bonds: applying it now only states the count, which is kept.
+      source = rebonded;
+      expect(cache.isStale(host, [proposal], inputs)).toBe(true);
+      expect((await cache.items(host, [proposal], inputs))[0]!.warnings).toEqual(warned);
+      expect(accept({ source, proposal }))
+        .toEqual({ message: `Test Plugin: applied proposal. Accepted change: ${warningText}`, committedCount: 1 });
+    });
+
+    it("reads the accept message from the document the accept commits, not the one reviewed", () => {
+      // Reviewed against withMolecule (it would warn), accepted into rebonded: no warning, no count.
+      expect(accept({ source: rebonded, proposal: statedOnly(false).proposal }))
+        .toEqual({ message: "Test Plugin: applied proposal", committedCount: undefined });
+      // Reviewed against withMolecule (no warning), accepted into rebonded: the warning, and the count kept.
+      expect(accept({ source: rebonded, proposal: statedAndRebonded().proposal }))
+        .toEqual({ message: `Test Plugin: applied proposal. Accepted change: ${warningText}`, committedCount: 1 });
+    });
+
+    it("re-runs the dry run only when a proposal's own source document changes identity", async () => {
+      const first = statedOnly(false).proposal;
+      const second = { ...statedOnly(false).proposal, id: "proposal-h2" } as QueuedProposedPatch;
+      const host = hostFor(first);
+      const dryRuns = vi.spyOn(host, "previewProposedPatch");
+      const cache = new ProposalReviewItemCache();
+      const sources: Record<string, ChemDraftDocument> = { [first.id]: withMolecule, [second.id]: withMolecule };
+      const inputs = (proposal: QueuedProposedPatch) => ({ sourceDocument: sources[proposal.id] });
+      await cache.items(host, [first, second], inputs);
+      expect(dryRuns).toHaveBeenCalledTimes(2);
+      // Nothing changed (an unrelated render): not stale, and nothing re-runs.
+      expect(cache.isStale(host, [first, second], inputs)).toBe(false);
+      // A copy of the queue (as listProposedPatches returns) is not a change either.
+      expect(cache.isStale(host, [{ ...first }, { ...second }], inputs)).toBe(false);
+      // Only the second proposal's document is edited: only its dry run re-runs.
+      sources[second.id] = rebonded;
+      expect(cache.isStale(host, [first, second], inputs)).toBe(true);
+      const items = await cache.items(host, [first, second], inputs);
+      expect(dryRuns).toHaveBeenCalledTimes(3);
+      expect(dryRuns.mock.calls[2]![1]).toBe(rebonded);
+      expect(items.map(item => item.warnings)).toEqual([warned, []]);
+    });
+
+    it("updates the open tray when the source document changes, and not on a render that changes nothing", async () => {
+      const { proposal } = statedOnly(false);
+      const host = { ...hostFor(proposal), listProposedPatches: () => [proposal] } as unknown as PluginHost;
+      const dryRuns = vi.spyOn(host, "previewProposedPatch");
+      let source = withMolecule;
+      const getSourceDocument = () => source;
+      const props = { host, queueVersion: 0, getSourceDocument, onAccept: vi.fn(), onReject: vi.fn() };
+      container = document.createElement("div");
+      document.body.append(container);
+      root = createRoot(container);
+      const settle = () => act(async () => { await Promise.resolve(); });
+      act(() => root!.render(createElement(PatchReviewTray, props)));
+      await settle();
+      act(() => (container!.querySelector(".patch-review-badge") as HTMLButtonElement).click());
+      await settle();
+      const warnings = () => container!.querySelector('[data-proposal-id="proposal-h"] .patch-review-warnings')?.textContent;
+      expect(warnings()).toBe(`Proposed change: ${warningText}`);
+      const before = dryRuns.mock.calls.length;
+      act(() => root!.render(createElement(PatchReviewTray, { ...props })));
+      await settle();
+      expect(dryRuns).toHaveBeenCalledTimes(before);
+      source = rebonded;
+      act(() => root!.render(createElement(PatchReviewTray, { ...props })));
+      await settle();
+      expect(dryRuns).toHaveBeenCalledTimes(before + 1);
+      expect(warnings()).toBeUndefined();
+    });
+  });
+
+  it("shows no hydrogen warning when the proposal would fail to apply, or there is no document to dry-run", async () => {
+    const missing = queued({ op: "updateObject", objectId: "absent", changes: { atoms: [carbon, stated(1)], bonds: [carbonHydrogen] } });
+    expect((await proposalReviewItem(hostFor(missing), missing, undefined, withMolecule)).warnings).toEqual([]);
+    const proposal = added(1).proposal;
+    expect((await proposalReviewItem(hostFor(proposal), proposal)).warnings).toEqual([]);
   });
 });

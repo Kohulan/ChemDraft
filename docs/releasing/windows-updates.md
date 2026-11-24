@@ -27,20 +27,64 @@ skips the normal quit path. If the save fails, the update stops and the app stay
 - A branch build ("ChemDraft (dev)", with its own identifier) and a `pnpm dev` session never check.
   Choosing File > Check for Updates… in one says so in the status bar.
 
+## Choose an installer
+
+Both NSIS installers ship the same ChemDraft version from the same commit:
+
+| Installer | Use | Default program location | Update feed |
+| --- | --- | --- | --- |
+| `ChemDraft_<ver>_x64-setup.exe` | Personal installation, no admin required | `%LOCALAPPDATA%\ChemDraft` | `latest.json` |
+| `ChemDraft_<ver>_x64-allusers-setup.exe` | Managed or shared machines; available to every account | `C:\Program Files\ChemDraft` | `latest-allusers.json` |
+
+All-users offline installer (includes the WebView2 runtime, about 180 MB larger; for PCs without internet access)
+
+`ChemDraft_<ver>_x64-allusers-offline-setup.exe` uses the same all-users overlay, installation scope,
+file associations and `latest-allusers.json` endpoint. Once internet access is available, it updates
+by downloading the normal all-users installer. It has no separate feed or updater `.sig`; no
+feed entry may point at the offline installer. It receives the same Authenticode signing and verification as
+the other installers, and is included in the `windows-release` workflow artifact on dispatch dry
+runs and uploaded beside them when `upload_to_release` is supplied.
+
+The all-users installer creates an all-users Start Menu shortcut and requires administrator rights
+for installation, uninstallation, and **every update**, including updates accepted inside ChemDraft.
+On a normal unelevated launch it requests UAC elevation; a standard user sees an **admin-credentials
+UAC prompt** and needs an administrator to supply credentials. Passive mode does not suppress UAC.
+If credentials are unavailable, choose Later and ask the machine administrator to deploy the update.
+
+For silent deployment, run this from an **elevated prompt**:
+
+```text
+ChemDraft_<ver>_x64-allusers-setup.exe /S
+```
+
+The all-users build reads its own feed, which always points at the all-users installer. The existing
+per-user installer, filename and `latest.json` channel are unchanged. Installing both on one machine
+gives **two copies**; uninstall one first before switching scope. The installers do not migrate or
+remove the other copy. Both register `.chemdraft` only; a retained per-user association can override
+the machine association. See the [scope audit](../architecture/windows-installer-scope.md).
+
 ## Why installed plugins and settings survive
 
-The installer replaces the program files in `%LOCALAPPDATA%\ChemDraft`. Plugins, settings, and the
+The installer replaces the program files in `%LOCALAPPDATA%\ChemDraft` (per-user) or
+`C:\Program Files\ChemDraft` (all-users). Plugins, settings, and the
 document session live in the app data directory, which is keyed by the identifier and never touched
-by the installer. They are there on the next launch, as on macOS.
+by a normal update. These remain per Windows account even when program files are shared. They are
+there on the next launch, as on macOS.
 
 ## Checked-in configuration
 
-The NSIS installer hook quotes both the executable path and `.chemdraft` document argument so per-user installs remain openable from paths containing spaces.
+The shared NSIS installer hook quotes both the executable path and `.chemdraft` document argument
+for both installation scopes, so paths containing spaces remain openable.
 
 - **Crate:** `tauri-plugin-updater` 2.12.0, `cfg(windows)` only (Apache-2.0 OR MIT).
 - **Frontend package:** `@tauri-apps/plugin-updater` 2.12.0 (Apache-2.0 OR MIT).
-- **Feed:** `https://raw.githubusercontent.com/jgassens/ChemDraft/main/latest.json`. It sits next to
-  the macOS `appcast.xml` and `appcast-intel.xml`; joint releases use the same commit and version for all three builds.
+- **Per-user feed:** `https://raw.githubusercontent.com/jgassens/ChemDraft/main/latest.json`.
+- **All-users feed:** `https://raw.githubusercontent.com/jgassens/ChemDraft/main/latest-allusers.json`.
+  Both sit next to the macOS `appcast.xml` and `appcast-intel.xml`; joint releases use the same commit and version for all three builds.
+- **All-users overlay:** `apps/desktop/src-tauri/tauri.allusers.conf.json`, passed with `--config`
+  in the release workflow. It sets NSIS `installMode: "perMachine"` and the separate feed. Both
+  installers use the association quoting hook at `windows/installer-hooks.nsh` from the Windows
+  config, along with its updater public key and passive update mode.
 - **Public key:** `plugins.updater.pubkey` in `apps/desktop/src-tauri/tauri.windows.conf.json`.
 - **Private key:** `%USERPROFILE%\.tauri\chemdraft-updater.key`.
   - It is outside the repository. Never commit it, and never print it.
@@ -68,16 +112,18 @@ published version.
 ### GitHub Actions path
 
 This is the only release path (owner rule, 2026-10-22). The manual-dispatch [Windows release workflow](../../.github/workflows/windows-release.yml) builds
-the installer on `windows-latest`, optionally Authenticode-signs the CI artifact through SignPath
-Foundation, then signs the **final installer bytes** for the Tauri updater and generates `latest.json`.
+both installers on `windows-latest`, optionally Authenticode-signs the CI artifacts through SignPath
+Foundation, then signs each installer's **final bytes** for the Tauri updater and generates
+`latest.json` and `latest-allusers.json` with the existing `release:windows-manifest` generator.
 The [signing guide](windows-signing.md) covers the owner's SignPath application, trusted build setup,
 repository secrets/variables, workflow inputs and release checks.
 
 Dispatch on the release tag with the same tag in `ref`; optionally provide a tracked Windows notes
 file and an existing draft release tag in `upload_to_release`. The final `windows-release` artifact
-contains the installer, `.exe.build.json`, `.exe.sig`, `latest.json`, and checksums. Missing signing secrets produce
+contains all three installers, each `.exe.build.json`, the two updater `.exe.sig` files, both feeds, and checksums. Missing signing secrets produce
 explicit warnings and dry-run output. Optional uploads refuse published releases; the workflow never
-publishes a release or commits the feed. Collect all three artifacts and their `.build.json` records
+publishes a release or commits the feeds. Collect all three platform builds (both DMGs and all three
+Windows installers) and their `.build.json` records
 and run the [joint release body check](three-builds.md) against the release tag, declaring gaps or
 `--no-gaps`. As the last step before un-drafting on a Mac, run both DMG verifiers with
 `--release --dmg` as listed in [the final checklist](three-builds.md#last-step-before-un-drafting), and require
@@ -85,15 +131,44 @@ and run the [joint release body check](three-builds.md) against the release tag,
 over the attached GitHub assets without skip or incomplete flags. The workflow runs the asset
 checker after upload inside the same draft-visible job, explicitly skipping mounted DMG provenance
 on Windows. Wholly missing build pairs produce INCOMPLETE; every supplied build is still checked.
-A Windows-only upload is not a publishing pass.
-Publish the joint release only after the strict gate passes, then commit the generated feed to
-`main` only after its installer URL works. Build records bind SHA-256 and size to the final signed bytes.
+The checker verifies both `latest.json` and `latest-allusers.json` against their own installer's
+`.exe.sig`. A Windows-only upload is not a publishing pass.
+Publish the joint release only after the strict gate passes, then **commit `latest-allusers.json`
+together with `latest.json` to `main` at each release**, only after both installer URLs work. Never
+point an all-users feed entry at the per-user installer. Build records bind SHA-256 and size to the
+final signed bytes.
+
+The workflow's variant list shares build/rename, identity checks, build records, signing,
+verification and upload. Tauri initially names each installer `ChemDraft_<ver>_x64-setup.exe`; the
+workflow stages it with the variant suffix outside the checkout, records it, and only then builds the
+next variant, which overwrites that output. Adding a future variant with no feed requires a variant
+entry and config, plus its suffix in `BUILD_TARGETS` (`tools/release/record-build.mjs`) so the asset
+checker accepts it; it still goes through signing and upload.
+
+The offline variant adds the generated `ci-offline.conf.json` (written to the runner's temporary
+directory, outside the checkout) after the all-users overlay. The
+generator, `scripts/windows-offline-installer.mjs`, sets `offlineInstaller` with `silent: true` for
+WebView2 and disables updater artifacts without changing file associations. This variant skips
+updater signing and feed generation while retaining Authenticode signing, its build record and upload. The workflow
+assertion rejects offline updater signatures and any generated feed whose platform download URL names
+the offline installer (release notes may mention it), and the asset checker refuses an offline `.exe.sig`.
+
+To regenerate the all-users feed from its already signed CI artifact:
+
+```text
+pnpm -s release:windows-manifest --version X.Y.Z --installer "release-assets/ChemDraft_X.Y.Z_x64-allusers-setup.exe" --out release-assets/latest-allusers.json --notes release-notes.md
+```
+
+The same version, branch-build, and missing/empty-signature guards apply to both installers. The
+signature is verified against the inherited updater public key before either generated feed is
+included in the signed workflow output.
 
 ### Windows VM path (retired)
 
-Retired for releases (owner rule, 2026-10-22): publish only installers built by the GitHub Actions
-path above. These steps remain for reference and for local test installers; never publish a
-VM-built installer. Its updater signature does not provide Authenticode signing. If Authenticode
+Retired for all installer builds (owner rule, 2026-10-22): use only installers built by the GitHub
+Actions path above, including for Windows testing. The historical commands below explain the
+per-user artifact and feed; do not run installer builds locally or in a VM. An updater signature
+does not provide Authenticode signing. If Authenticode
 is applied separately, do it **before** the final `tauri signer sign` and manifest generation: an
 existing `.sig` is invalid once any installer bytes change. SignPath Foundation requires verifiable
 CI builds; submitting a VM-built installer through the workflow is not supported.
@@ -122,20 +197,33 @@ CI builds; submitting a VM-built installer through the workflow is not supported
    The script refuses a version with a leading `v`, an installer from a different version, a branch
    ("dev") installer, and a missing or empty signature.
 
-4. Commit `latest.json` to `main` **only after** the release asset is downloadable. An app that sees
+4. Commit `latest.json` and `latest-allusers.json` together to `main` **only after** both release assets are downloadable. An app that sees
    the feed first would fail its download. Do not hand-edit a generated entry: the signature covers
    the installer bytes, not the file name.
 
 ## Verification
 
-An end-to-end test needs two signed stable builds with increasing versions and a local feed:
+An end-to-end test needs two signed stable CI builds with increasing versions and a local feed.
+Run it separately for each installer scope; do not install both copies at once.
 
-1. Build the older version with an extra `--config` that points `plugins.updater.endpoints` at
-   `http://127.0.0.1:<port>/latest.json` and sets `dangerousInsecureTransportProtocol: true`.
-   Test builds only.
-2. Build the newer version the same way, adding a `--config` that raises `version`.
-3. Serve the newer installer, plus a `latest.json` from step 3 above whose URL points at the local
-   server.
+**How the test installers are produced.** Installers are built only by CI, never on a local machine
+or in a VM. The `windows-release` workflow's dispatch inputs (`ref`, `upload_to_release`,
+`allow_unsigned_upload`, `notes_file`) cannot add a `--config` or change the version, and the
+workflow has no other way to take them. So each test installer is a CI build of a throwaway test
+branch whose checked-in configuration already carries the test settings: commit them on the branch,
+dispatch `windows-release` from that branch with `ref` set to its full commit SHA (the workflow
+requires the two to match), leave `upload_to_release` empty, and download the installers from the
+run's `windows-release` artifact. Never merge such a branch or attach its installers to a release.
+
+1. For the older build, the test branch sets `dangerousInsecureTransportProtocol: true` and points
+   `plugins.updater.endpoints` at `http://127.0.0.1:<port>/latest.json` in `tauri.windows.conf.json`.
+   For the all-users installer it also points the endpoint in `tauri.allusers.conf.json`, which
+   replaces the Windows one, at `http://127.0.0.1:<port>/latest-allusers.json`. Test builds only.
+2. For the newer build, a second commit on the test branch also raises `version` in
+   `apps/desktop/src-tauri/tauri.conf.json`; dispatch the workflow again with that commit's SHA.
+3. Serve the newer installer, plus a feed generated from it as in step 3 of the release steps above
+   (`pnpm release:windows-manifest`, which only writes the feed and builds nothing), whose URL points
+   at the local server.
 4. Install the older build and launch it. Success means:
    - the automatic check (or the menu item) offers the newer version;
    - accepting it downloads, saves the session, shows the passive installer, and reopens ChemDraft
@@ -143,9 +231,23 @@ An end-to-end test needs two signed stable builds with increasing versions and a
    - a drawing made before the update is still there after the relaunch.
 5. Uninstall the test build. The NSIS installer remembers the folder it last installed to, so a
    silent install (`/S`) without `/D=<folder>` reuses that remembered folder instead of the default
-   per-user location. After installing a test build into a separate folder with `/D=...`, pass
-   `/D=%LOCALAPPDATA%\ChemDraft` explicitly when reinstalling the stable release (or it lands in the
-   test folder); `/D` must be the last argument and must not be quoted.
+   location. After installing a test build into a separate folder with `/D=...`, pass the scope's
+   default folder explicitly when reinstalling the stable release (or it lands in the test folder):
+   - per-user: `ChemDraft_<ver>_x64-setup.exe /S /D=%LOCALAPPDATA%\ChemDraft`;
+   - all-users, from an **elevated** prompt:
+     `ChemDraft_<ver>_x64-allusers-setup.exe /S /D=C:\Program Files\ChemDraft`.
+
+   `/D` must be the last argument and must not be quoted, even when the path contains spaces.
+
+For all-users verification, retain the all-users overlay on both CI builds and override its endpoint
+with the local `latest-allusers.json` feed. Check Program Files and the all-users Start Menu shortcut,
+then run ChemDraft as a standard user. Verify the quoted HKLM `.chemdraft` command with spaces in the
+document path, and use OPSIN, the naming engine, installed plugins and the 3D sidecar without writes
+to Program Files. Accept an update with administrator credentials and confirm it replaces the machine
+copy, restores the drawing in the original account, and creates no `%LOCALAPPDATA%\ChemDraft` copy.
+Also check an administrator's UAC consent, cancellation, silent deployment from an elevated prompt,
+and uninstall. These all-users runtime checks remain unverified; the historical run below covered
+only the per-user updater.
 
 To drive the prompt from a script: it is a Windows task dialog, and on Windows 11 its buttons are
 exposed to UI Automation as bare panes with no Invoke pattern. Find the window instead

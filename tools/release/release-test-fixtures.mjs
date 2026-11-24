@@ -12,6 +12,23 @@ export const commit = "a".repeat(40);
 export const arm = `ChemDraft_${version}_aarch64.dmg`;
 export const intel = `ChemDraft_${version}_x86_64.dmg`;
 export const installer = `ChemDraft_${version}_x64-setup.exe`;
+export const allusersInstaller = `ChemDraft_${version}_x64-allusers-setup.exe`;
+export const offlineInstaller = `ChemDraft_${version}_x64-allusers-offline-setup.exe`;
+// The three Windows downloads in release-page order, with their labels.
+export const windowsInstallers = [
+  { name: installer, label: "per-user, no admin required" },
+  { name: allusersInstaller, label: "all-users, for managed or shared machines" },
+  { name: offlineInstaller, label: "offline, for IT-managed machines" }
+];
+// Updater-capable Windows installers and their feeds; offline media has no .sig or feed.
+export const windowsUpdates = [
+  { installer, feed: "latest.json" },
+  { installer: allusersInstaller, feed: "latest-allusers.json" }
+];
+export const windowsFiles = [
+  ...windowsUpdates.flatMap(({ installer: name, feed }) => [name, `${name}.sig`, `${name}.build.json`, feed]),
+  offlineInstaller, `${offlineInstaller}.build.json`
+];
 export const deb = `ChemDraft_${version}_amd64.deb`;
 export const appImage = `ChemDraft_${version}_amd64.AppImage`;
 
@@ -23,9 +40,9 @@ export const updaterPublicKey = Buffer.from(`untrusted comment: ephemeral test k
 export const windowsPlatformKey = "windows-x86_64-nsis";
 export const installerUrl = `https://github.com/jgassens/ChemDraft/releases/download/v${version}/${installer}`;
 
-export function updaterSignature(bytes) {
+export function updaterSignature(bytes, file = installer) {
   const signature = sign(null, createHash("blake2b512").update(bytes).digest(), privateKey);
-  const comment = `timestamp:1792540800\tfile:${installer}`;
+  const comment = `timestamp:1792540800\tfile:${file}`;
   const packet = Buffer.concat([Buffer.from("ED"), keyId, signature]);
   const global = sign(null, Buffer.concat([signature, Buffer.from(comment)]), privateKey);
   return Buffer.from(`untrusted comment: ephemeral test signature\n${packet.toString("base64")}\ntrusted comment: ${comment}\n${global.toString("base64")}\n`).toString("base64");
@@ -42,11 +59,13 @@ export function releaseFixture(t, { withLinux = true } = {}) {
     writeFileSync(file, `synthetic ${name}`);
     writeFileSync(`${file}.build.json`, JSON.stringify({ commit, version, target, clean: true, ...artifactDigest(file) }));
   }
-  const signature = updaterSignature(readFileSync(join(assets, installer)));
-  writeFileSync(join(assets, `${installer}.sig`), `${signature}\n`);
-  writeFileSync(join(assets, "latest.json"), JSON.stringify({
-    version, platforms: { [windowsPlatformKey]: { url: installerUrl, signature } }
-  }));
+  for (const { installer: name, feed } of windowsUpdates) {
+    const signature = updaterSignature(readFileSync(join(assets, name)), name);
+    writeFileSync(join(assets, `${name}.sig`), `${signature}\n`);
+    writeFileSync(join(assets, feed), JSON.stringify({
+      version, platforms: { [windowsPlatformKey]: { url: `https://github.com/jgassens/ChemDraft/releases/download/v${version}/${name}`, signature } }
+    }));
+  }
   writeReleaseChecksums(assets);
   return { rootDir, assets, version };
 }

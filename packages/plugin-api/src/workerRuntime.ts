@@ -44,6 +44,7 @@ import {
   type PluginRequestResult
 } from "./requestSchemas";
 import { PluginRequestLimits, requestValidationCode } from "./requestPayload";
+import type { PluginRefusalDetails } from "./refusal";
 import {
   PLUGIN_WORKER_PROTOCOL_VERSION,
   supportsPluginTableInsertion,
@@ -76,6 +77,10 @@ export interface PluginWorkerRegistration {
  *  the plugin handler with the same `code`/`message` the host method would have thrown in-process. */
 export class PluginWorkerCapabilityError extends Error {
   readonly code: string;
+  /** API 0.1.27: the host's stable reason for a refusal, when it has one (`hydrogen_count_unrepresentable`). */
+  declare readonly reason?: string;
+  /** API 0.1.27: what the refusal is about, e.g. `{ moleculeId, atomId, element, hydrogenCount }`. */
+  declare readonly details?: PluginRefusalDetails;
 
   constructor(payload: PluginWorkerErrorPayload | unknown) {
     // Normalized rather than destructured: a malformed failure frame must not throw here, because
@@ -84,6 +89,8 @@ export class PluginWorkerCapabilityError extends Error {
     super(normalized.message);
     this.name = "PluginWorkerCapabilityError";
     this.code = normalized.code;
+    if (normalized.reason !== undefined) this.reason = normalized.reason;
+    if (normalized.details !== undefined) this.details = normalized.details;
   }
 }
 

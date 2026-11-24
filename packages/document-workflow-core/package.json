@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
+    "@chemdraft/analysis-core": "workspace:*",
     "@chemdraft/chem-core": "workspace:*",
     "@chemdraft/clipboard-adapter": "workspace:*",
     "@chemdraft/export-engine": "workspace:*",

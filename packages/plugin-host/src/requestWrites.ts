@@ -1,18 +1,20 @@
 import { retainedCtabCompatibility } from "./storedCtabGeometry";
-import { adoptDerivedDocument, DocumentPatchError, type ChemDraftDocument, type DocumentObject, type DocumentPage, type DocumentPatch, type MoleculeObject } from "@chemdraft/chem-core";
+import { adoptDerivedDocument, DocumentPatchError, hasObjectIdentity, type ChemDraftDocument, type DocumentObject, type DocumentPage, type DocumentPatch, type MoleculeObject } from "@chemdraft/chem-core";
 import {
   PluginRequestLimits, type NormalizedProposedDocumentPatch, type PluginExpectedStructure,
-  type PluginRequestError, type PluginRequestPrecondition
+  type PluginRefusalFields, type PluginRequestError, type PluginRequestPrecondition
 } from "@chemdraft/plugin-api";
 import {
-  assertPluginDocumentWriteScope, assertPluginPatchWriteScope, DirectWritePatchOps, writePatchOps
+  assertPluginDocumentWriteScope, assertPluginPatchWriteScope, DirectWritePatchOps, PluginHostError, writePatchOps
 } from "./index";
 import { sameDocumentValue } from "./documentValue";
 import { rebasePluginPatch } from "./rebasePluginPatch";
+import type { PluginWriteScopePages } from "./pageObjects";
 import { assertAuthoredBracketReferences, assertRequestReferences, requestReferenceScope } from "./requestReferences";
 
 export class RequestWriteError extends Error {
-  constructor(readonly code: PluginRequestError["code"], message: string) { super(message); }
+  /** API 0.1.27 refusal fields, forwarded to plugins whose SDK accepts them. */
+  constructor(readonly code: PluginRequestError["code"], message: string, readonly refusal?: PluginRefusalFields) { super(message); }
 }
 
 export interface RequestObjectRef { pageId: string; objectId: string }
@@ -71,6 +73,10 @@ export interface BoundRequestWrite {
   document: RequestDocument;
   history: RequestHistory;
   selection: readonly RequestObjectRef[];
+  /** Host-only pins of the selection refs, Send-time and insertion (pageObjects.ts): a ref grants only the
+   * object holding its pin's identity, never a different object that reuses its id; a ref without a pin
+   * grants nothing. Hosts always pass them; only a write with no pins at all is scoped by ref. */
+  selectionPins?: PluginWriteScopePages;
   signal: AbortSignal;
   authorize(): void;
   enterGestureWait?(): (() => void) | undefined;
@@ -185,6 +191,8 @@ export class RequestRevisions {
 
 interface WriteOptions {
   useInsertionSource?: boolean;
+  /** See BoundRequestWrite.selectionPins. */
+  selectionPins?: PluginWriteScopePages;
   revisions?: RequestRevisions;
   preconditions?: readonly PluginRequestPrecondition[];
   expected?: readonly PluginExpectedStructure[];
@@ -220,7 +228,16 @@ export async function preflightRequestPatch(before: ChemDraftDocument, proposal:
     if (new Set(before.pages.map(page => page.id)).size !== before.pages.length) {
       throw new RequestWriteError("invalid", "The document contains an ambiguous page or object ID.");
     }
-    const scope = selection.filter(ref => byId.get(ref.objectId)?.pageId === ref.pageId).map(ref => ref.objectId);
+    // With pins, a ref grants only the object holding its pin's identity: a same-id object that does not
+    // (a paste, undo, or insert reusing the id after Send or after the request's own insertion) is never
+    // in scope, and neither is a ref without a pin. Only a caller with no pins at all (a figure-plan
+    // preview of a detached draft) grants by ref.
+    const pins = options.selectionPins;
+    const scope = selection.filter(ref => {
+      const entry = byId.get(ref.objectId);
+      const pin = pins?.get(ref.objectId);
+      return entry?.pageId === ref.pageId && (!pins || !!pin && hasObjectIdentity(entry.object, pin.identity));
+    }).map(ref => ref.objectId);
     const targets = new Set<string>();
     const ordered = new Set<string>();
     const granted = new Set(scope);
@@ -257,11 +274,17 @@ export async function preflightRequestPatch(before: ChemDraftDocument, proposal:
 
     // This preflight applies the whole draft atomically and detects implicit bracket, reaction
     // and crossing changes. Its original proposal is kept so commit-time rebasing uses live IDs.
+    // `scope` already holds only refs whose object carries its pin, in a document whose ids are
+    // unique (refused above otherwise), so these checks may compare by id; the final guard reruns
+    // prepare on the live document inside the same history step.
     let draft: ChemDraftDocument;
     try { draft = assertPluginPatchWriteScope(before, proposal, scope, rebased, checkReferenceScope); }
     catch (error) {
       if (error instanceof RequestWriteError) throw error;
-      throw new RequestWriteError(error instanceof DocumentPatchError ? "invalid" : "scope", (error as Error).message);
+      // A host refusal with a reason is about the written value (an unrepresentable hydrogen count), not scope.
+      const refusal = error instanceof PluginHostError && error.reason !== undefined
+        ? { reason: error.reason, ...(error.details ? { details: error.details } : {}) } : undefined;
+      throw new RequestWriteError(error instanceof DocumentPatchError || refusal ? "invalid" : "scope", (error as Error).message, refusal);
     }
     const nextEntries = entries(draft);
     const after = new Map(nextEntries.map(entry => [entry.objectId, entry]));
@@ -333,7 +356,8 @@ export async function commitRequestPatch(binding: BoundRequestWrite, proposal: N
   }
   const before = read();
   const { prepare, planned, verified, inspectedFinal } = await preflightRequestPatch(before, proposal, binding.selection,
-    (...args) => binding.history.verify(...args), binding.signal, options).catch(error => {
+    (...args) => binding.history.verify(...args), binding.signal,
+    binding.selectionPins ? { ...options, selectionPins: binding.selectionPins } : options).catch(error => {
       read(); // Cancellation and lost authorization take priority over verification failures.
       throw error;
     });
