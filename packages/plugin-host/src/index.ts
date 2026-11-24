@@ -307,7 +307,7 @@ export function assertPluginPatchWriteScope(
     throw new PluginHostError(`Patch would change object "${object.id}", which is not selected`);
   }
   assertPluginPageWriteScope(document, validated, scope, pinned, inserted);
-  assertRepresentableHydrogenCounts(document, validated);
+  assertRepresentableHydrogenCounts(document, validated, requestedHydrogenCounts(preflight.patch));
   return validated;
 }
 
@@ -330,8 +330,14 @@ export const HydrogenCountUnrepresentableReason = "hydrogen_count_unrepresentabl
  * duplicating and undoing a user's own document, which must never be refused; the atom validator
  * flags it there instead. A count the molecule already held unchanged is let be, so an edit
  * elsewhere in an older document's molecule is not blocked.
+ *
+ * The count checked is the one the patch asked for (`requested`), not only the one that survived it:
+ * the patch engine drops the count of an atom whose bonds change (`clearChangedAtomHydrogenHints`),
+ * so an updateObject that bonds an unbonded typed Ac (actinium, which may carry a count) and states
+ * hydrogenCount 2 on it would otherwise commit acetyl with the stated 2 silently discarded.
  */
-function assertRepresentableHydrogenCounts(before: ChemDraftDocument, after: ChemDraftDocument): void {
+function assertRepresentableHydrogenCounts(before: ChemDraftDocument, after: ChemDraftDocument,
+  requested: RequestedHydrogenCounts = new Map()): void {
   for (const page of after.pages) {
     const previousPage = before.pages.find(candidate => candidate.id === page.id);
     for (const object of page.objects) {
@@ -340,7 +346,12 @@ function assertRepresentableHydrogenCounts(before: ChemDraftDocument, after: Che
       if (previous === object) continue;
       // The bonds decide whether a typed "Ac", "Pr" or "Ts" is acetyl, n-propyl or tosyl (bonded) or the element.
       const previousMolecule = previous?.type === "molecule" ? previous : undefined;
-      const atom = atomWithIgnoredHydrogenCount(object.atoms, previousMolecule?.atoms, object.bonds, previousMolecule?.bonds);
+      const asked = requested.get(object.id);
+      const atoms = asked ? object.atoms.map(atom => {
+        const count = asked.get(atom.id);
+        return count === undefined || count === atom.hydrogenCount ? atom : { ...atom, hydrogenCount: count };
+      }) : object.atoms;
+      const atom = atomWithIgnoredHydrogenCount(atoms, previousMolecule?.atoms, object.bonds, previousMolecule?.bonds);
       if (!atom) continue;
       const kind = ignoredHydrogenCountAtomKind(atom, object.bonds);
       const allowed = kind === "an unknown atom" ? "an unknown atom (*), as a typed * label means"
@@ -359,6 +370,30 @@ function assertRepresentableHydrogenCounts(before: ChemDraftDocument, after: Che
       );
     }
   }
+}
+
+/** Per molecule id, the hydrogen count each atom was given by the last op in the patch that wrote
+ * that molecule's atoms (an addObject of it, or an updateObject supplying `atoms`). */
+type RequestedHydrogenCounts = Map<string, Map<string, number>>;
+
+function requestedHydrogenCounts(patch: DocumentPatch): RequestedHydrogenCounts {
+  const requested: RequestedHydrogenCounts = new Map();
+  const record = (objectId: string, atoms: unknown) => {
+    if (!Array.isArray(atoms)) return;
+    const counts = new Map<string, number>();
+    for (const atom of atoms as unknown[]) {
+      if (!atom || typeof atom !== "object") continue;
+      const { id, hydrogenCount } = atom as { id?: unknown; hydrogenCount?: unknown };
+      if (typeof id === "string" && typeof hydrogenCount === "number") counts.set(id, hydrogenCount);
+    }
+    requested.set(objectId, counts);
+  };
+  for (const op of writePatchOps(patch)) {
+    if (op.op === "addObject" && op.object.type === "molecule") record(op.object.id, op.object.atoms);
+    else if (op.op === "updateObject" && op.changes && "atoms" in op.changes) record(op.objectId, op.changes.atoms);
+    else if (op.op === "removeObject") requested.delete(op.objectId);
+  }
+  return requested;
 }
 
 export interface ScopedRepeatUnitCleanup {
