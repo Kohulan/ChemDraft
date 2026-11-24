@@ -9,7 +9,7 @@ import { moleculeInkBounds, planPageSvgRender, planReactionArrowGeometry, reacti
   reactionSchemeDrawingMetrics, representativeMoleculeBondLength, atomLabelHaloWidthPx, planMoleculeAtomLabels } from "@chemdraft/layout-engine";
 import { ensureRdkit, resetRdkitForTesting } from "@chemdraft/rdkit-adapter";
 import * as rdkitAdapter from "@chemdraft/rdkit-adapter";
-import { chemicalIdentityMolfile, planReactionLabels, stereoPerceptionMolfile } from "@chemdraft/document-workflow-core";
+import { chemicalIdentityMolfile, planReactionLabels, reactionLabelWrapWidthInBonds, stereoPerceptionMolfile } from "@chemdraft/document-workflow-core";
 import { buildSmilesDocument, canonicalSmiles } from "../document";
 
 import {
@@ -227,6 +227,42 @@ describe("chemdraft reaction", () => {
     stderr.length = 0;
     expect(await runReactionCommand(["--batch", jobs, "--out-dir", outputDirectory, ...args], io)).toBe(2);
     expect(stderr).toContain('Error: Batch job "combined" above + Batch job "combined" below + Batch job "combined" caption + Batch job "combined" conditions exceeds the 2000 character combined limit.');
+  });
+  it("wraps labels at the shared 8.5-bond width without splitting a quantity from its unit", async () => {
+    const above = "Pd(OAc)2 (5 mol %), SPhos, K3PO4, toluene, 0.25 M, then 80 °C, 12 h";
+    const below = "CH2Cl2 then 1.2 equiv NaBH4 in MeOH at 0 °C for 30 min";
+    const rendered = await renderReactionScheme("CCO>>CCO", { above: [above], below: [below] });
+    const objects = rendered.document.pages[0]!.objects;
+    const bondLength = representativeMoleculeBondLength(objects.find(object => object.type === "molecule")!)!;
+    // The stored text is exactly the wrapped lines joined by "\n"; each break drops the single space it fell on,
+    // as release 1.2.2 already did. Compare the exact stored strings, not a newline-to-space round trip.
+    const storedAbove = "Pd(OAc)2 (5 mol %), SPhos, K3PO4,\ntoluene, 0.25 M, then 80 °C, 12 h";
+    const storedBelow = "CH2Cl2 then 1.2 equiv NaBH4 in\nMeOH at 0 °C for 30 min";
+    const texts = objects.filter(object => object.type === "text");
+    expect(texts.filter(object => object.text === storedAbove)).toHaveLength(1);
+    expect(texts.filter(object => object.text === storedBelow)).toHaveLength(1);
+    const [aboveLabel, belowLabel] = [storedAbove, storedBelow].map(stored => texts.find(object => object.text === stored)!);
+    if (aboveLabel?.type !== "text" || belowLabel?.type !== "text") return;
+    const textStyle = nativeTextStyleFromObjectStyle(aboveLabel.style);
+    const plan = (width: number) => planReactionLabels({ above: [above], below: [below], textStyle,
+      bondLength: bondLength * width / reactionLabelWrapWidthInBonds, arrowKind: "forward" });
+    // The CLI writes exactly what document-workflow-core plans.
+    expect([aboveLabel.text, belowLabel.text]).toEqual([plan(8.5).above!.text, plan(8.5).below!.text]);
+    // The former 10-bond width kept "MeOH at" on the first line.
+    expect(plan(10).below!.text).toBe("CH2Cl2 then 1.2 equiv NaBH4 in MeOH at\n0 °C for 30 min");
+    for (const label of [aboveLabel, belowLabel]) {
+      const lines = label.text.split("\n");
+      expect(lines.length).toBeGreaterThan(1);
+      for (const line of lines) {
+        const width = planReactionLabels({ above: [line], below: [], textStyle, bondLength: 1e6, arrowKind: "forward" })
+          .above!.size.contentWidth;
+        expect(width).toBeLessThanOrEqual(reactionLabelWrapWidthInBonds * bondLength + 0.001);
+      }
+    }
+    for (const unit of ["5 mol %", "0.25 M", "80 °C", "12 h", "1.2 equiv", "0 °C", "30 min"]) {
+      expect(`${aboveLabel.text}\n${belowLabel.text}`).toContain(unit);
+    }
+    expectSchemeInsideViewBox(rendered);
   });
   it("crops the SVG around above, below and caption blocks", async () => {
     const rendered = await renderReactionScheme("CCO>>CCO", {
