@@ -25,7 +25,9 @@ export function CanvasContextMenu(props: CanvasContextMenuProps) {
   const [fallback, setFallback] = useState(() => !isDesktopRuntime());
   const latest = useRef(props);
   latest.current = props;
-  useEffect(() => {
+  // A layout effect, so `active` clears while React commits the unmount. A passive cleanup runs
+  // later; a readout settling in between would still present the popup after the menu is gone.
+  useLayoutEffect(() => {
     if (!isDesktopRuntime()) return;
     let active = true;
     // Deferring the invoke lets React StrictMode discard its first effect without opening twice.

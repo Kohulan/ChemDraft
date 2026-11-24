@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act } from "react";
+import { act, useEffect, useLayoutEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { applyPatches } from "@chemdraft/chem-core";
@@ -252,6 +252,41 @@ describe("stereo readout row", () => {
       expect(calls).toEqual([]);
       expect(closed).not.toHaveBeenCalled();
     } finally {
+      window.removeEventListener("chemdraft:native-canvas-menu-closed", closed);
+    }
+  });
+
+  it("native popup is never presented when the readout settles between the unmount commit and passive cleanup", async () => {
+    vi.stubGlobal("__TAURI_INTERNALS__", {});
+    const calls: string[] = [];
+    tauri.handler = command => { if (command === "popup_canvas_context_menu") calls.push(command); return null; };
+    const closed = vi.fn();
+    window.addEventListener("chemdraft:native-canvas-menu-closed", closed);
+    const readout = deferred();
+    const order: string[] = [];
+    void readout.promise.then(() => order.push("readout settled"));
+    // Replaces the menu in one commit: its layout effect runs after the menu's deletion is committed,
+    // and its passive effect runs in the same flush as the menu's passive cleanup.
+    function ResolveDuringCommit() {
+      useLayoutEffect(() => { order.push("commit"); readout.resolve("Stereocentre: R"); }, []);
+      useEffect(() => { order.push("passive"); }, []);
+      return null;
+    }
+    const env = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+    try {
+      await act(async () => root.render(<CanvasContextMenu items={items} position={{ x: 10, y: 10 }} label="Object layer options"
+        targetKind="atom" onInvoke={() => {}} onDismiss={() => {}} loadStereoReadout={() => readout.promise} />));
+      // Outside act, React commits in a Scheduler task, requests a paint, and flushes passive effects
+      // in a later task, so microtasks (the readout continuation) run in between, as in the app.
+      env.IS_REACT_ACT_ENVIRONMENT = false;
+      root.render(<ResolveDuringCommit />);
+      await vi.waitFor(() => expect(order).toContain("passive"));
+      for (let i = 0; i < 5; i++) await new Promise(resolve => setTimeout(resolve, 10));
+      expect(order).toEqual(["commit", "readout settled", "passive"]);
+      expect(calls).toEqual([]);
+      expect(closed).not.toHaveBeenCalled();
+    } finally {
+      env.IS_REACT_ACT_ENVIRONMENT = true;
       window.removeEventListener("chemdraft:native-canvas-menu-closed", closed);
     }
   });
