@@ -516,6 +516,15 @@ interface CdxmlExportFonts {
    * would leave its runs naming a font the file does not list; it is written as plain styled text.
    */
   notWrittenIds: ReadonlySet<string>;
+  /**
+   * Stored font ids export cannot write: not a number, or at or past cdxmlLimits.fontId (import
+   * accepts them). The font's name is registered under a new id when a caption uses it, but an
+   * unchanged source text naming the old id is not copied back out, which would leave its runs naming
+   * a font the file does not list; it is written from its native state, with one warning.
+   */
+  unwritableIds: ReadonlySet<string>;
+  /** Set once the export has reported an unwritable id (one warning per document). */
+  unwritableIdWarned: boolean;
 }
 
 interface CdxmlCrossingImportHint {
@@ -1086,13 +1095,17 @@ function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityCo
   // the file does not list. One warning names every font not written.
   const tooLong: string[] = [];
   const tooLongIds = new Set<string>();
+  const unwritableIds = new Set<string>();
   for (const page of document.pages) for (const object of page.objects) {
     const source = object.compatibility?.unknown.cdxmlTextFontTable;
     if (!Array.isArray(source)) continue;
     countCdxmlFontEntries(source.length);
     for (const entry of source) {
       const font = preservedCurveAttributes(entry);
-      if (!/^\d+$/.test(font.id ?? "") || Number(font.id) >= cdxmlLimits.fontId) continue;
+      if (!/^\d+$/.test(font.id ?? "") || Number(font.id) >= cdxmlLimits.fontId) {
+        if (font.id !== undefined) unwritableIds.add(font.id);
+        continue;
+      }
       if (cdxmlFontEntryTooLong(font)) {
         if (!tooLongIds.has(font.id)) { tooLongIds.add(font.id); tooLong.push(`font ${font.id}`); }
         continue;
@@ -1161,7 +1174,8 @@ function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityCo
     warnings.push(cdxmlFontEntryTooLongWarning("CDXML export", "", tooLong,
       "not written, and text set in {it} was written without its caption frame and run fonts, or in the default font."));
   }
-  return { table: trackCdxmlFontTable([...fonts.values()]), byName, plainCaptionIds, captionRunLimitWarned: false, notWrittenIds: tooLongIds };
+  return { table: trackCdxmlFontTable([...fonts.values()]), byName, plainCaptionIds, captionRunLimitWarned: false, notWrittenIds: tooLongIds,
+    unwritableIds, unwritableIdWarned: false };
 }
 
 function buildCdxmlEnvelope(creationProgram: string, pages: readonly string[], fonts: readonly CdxmlFont[], colors: ExportColorTable, embedded = true, pageSetup: Record<string, string> = {}): string {
@@ -2591,8 +2605,21 @@ function exportTextObject(text: TextObject, context: VisibleExportContext, alloc
         const tree = parseCdxml(source);
         const node = tree.find(node => elementView(node)?.name === "t");
         const element = node && elementView(node);
-        fontNotWritten = fonts.notWrittenIds.size > 0 && Boolean(element) &&
-          findElements([node!], "s").some(run => run.attributes.font !== undefined && fonts.notWrittenIds.has(run.attributes.font));
+        const runFonts = element ? findElements([node!], "s").flatMap(run => run.attributes.font === undefined ? [] : [run.attributes.font]) : [];
+        fontNotWritten = runFonts.some(id => fonts.notWrittenIds.has(id));
+        // Not in the font warning: say once why such a text was not copied.
+        if (!fontNotWritten && runFonts.some(id => fonts.unwritableIds.has(id))) {
+          fontNotWritten = true;
+          if (!fonts.unwritableIdWarned) {
+            fonts.unwritableIdWarned = true;
+            const labels = [...new Set([...fonts.unwritableIds].map(cdxmlFontIdLabel))];
+            const named = labels.slice(0, 10).join(" or ") + (labels.length > 10 ? ` and ${labels.length - 10} more` : "");
+            warnings.push({ code: "cdxml.font_id_out_of_range", sourceObjectId: text.id,
+              message: `${format} export: from text ${text.id} on, unchanged text whose source runs name font ${named} ` +
+                `(font ids are numbers below ${cdxmlLimits.fontId}) was not copied from its source; it was written from its current ` +
+                "text and styles, its fonts under ids that can be written." });
+          }
+        }
         if (node && element && !fontNotWritten) {
           node[":@"] = { ...element.attributes, id: textId };
           const point = pointMetadata(text.compatibility?.unknown.cdxmlTextFrameOrigin) ?? parseCdxmlPoint(element.attributes.p);

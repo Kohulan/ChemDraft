@@ -538,6 +538,33 @@ it("never gives a font an id past the CDX limit, and writes captions whose font 
   });
 });
 
+// CodeRabbit (#442): import accepts a source font id at or past the CDX limit (65535), or one that
+// is not a number; export does not write such an id and registers the caption's font under a new
+// one, but an unchanged caption was still copied with runs naming the id the table does not list.
+it("does not copy an unchanged caption naming a source font id export cannot write, with one warning", () => {
+  const source = `<CDXML><fonttable><font id="3" charset="iso-8859-1" name="Arial"/><font id="65535" charset="iso-8859-1" name="Times"/>` +
+    `<font id="x7" charset="iso-8859-1" name="Courier"/></fonttable><page>${caption(9, 2, 65535)}${caption(10, 1, 3, 120)}` +
+    `${caption(11, 1, 3, 150).split('font="3"').join('font="x7"')}</page></CDXML>`;
+  const opened = openChemDraftPayload(source);
+  expect(textsOf(opened).map(text => text.style.fontFamily)).toEqual(["Times", "Arial", "Courier"]);
+  const saved = exportDocumentToCdxml(opened.document!, plain);
+  const listed = new Set([...saved.contents.matchAll(/<font id="([^"]+)"/g)].map(match => match[1]));
+  const named = [...saved.contents.matchAll(/<s [^>]*font="([^"]+)"/g)].map(match => match[1]);
+  expect(named.length).toBeGreaterThan(0);
+  expect(named.every(id => listed.has(id))).toBe(true);
+  expect(listed.has("65535")).toBe(false);
+  expect(saved.warnings.filter(w => w.code === "cdxml.font_id_out_of_range").map(w => w.message)).toEqual([
+    `CDXML export: from text ${textsOf(opened)[0].id} on, unchanged text whose source runs name font 65535 or <invalid id> (font ids are numbers below 65535) ` +
+    "was not copied from its source; it was written from its current text and styles, its fonts under ids that can be written."
+  ]);
+  expect(saved.warnings.filter(w => w.code === "cdxml.font_id_out_of_range")[0].sourceObjectId).toBe(textsOf(opened)[0].id);
+  // The unaffected caption keeps its unchanged source form, so it adds no warning of its own.
+  expect(saved.warnings.map(w => w.code)).not.toContain("cdxml.text_source_formatting_not_kept");
+  const again = textsOf(openChemDraftPayload(saved.contents));
+  expect(again.map(text => text.text)).toEqual(["xx", "x", "x"]);
+  expect(again.map(text => text.style.fontFamily)).toEqual(["Times", "Arial", "Courier"]);
+});
+
 // CodeRabbit (#442): when the exact writer declines a stored arc (here, its only head was removed),
 // the fallback clamped every radius to at least 1, so a valid 0.5 radius was saved doubled.
 it("keeps a stored arc's sub-1 radius when it saves without its head", () => {
