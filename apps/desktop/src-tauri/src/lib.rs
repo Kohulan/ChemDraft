@@ -8840,7 +8840,11 @@ fn create_or_raise_preferences_window<R: Runtime>(
 #[tauri::command]
 fn agent_bridge_status() -> AgentBridgeStatus {
     let env_value = std::env::var(AGENT_BRIDGE_ENV_VAR).ok();
-    agent_bridge_status_from(env_value.as_deref(), std::env::args())
+    // `args_os`, not `args`: `std::env::args()` panics on an argument that is not valid Unicode,
+    // and this runs first in `run()`, so opening a Linux file whose name is not UTF-8 killed the
+    // launch ("called `Result::unwrap()` on an `Err` value") before the startup code could refuse
+    // that path with its message.
+    agent_bridge_status_from(env_value.as_deref(), std::env::args_os())
 }
 
 #[tauri::command]
@@ -8884,13 +8888,13 @@ fn palette_focus_acquire_log(message: std::fmt::Arguments<'_>) {
 fn agent_bridge_status_from<I, S>(env_value: Option<&str>, args: I) -> AgentBridgeStatus
 where
     I: IntoIterator<Item = S>,
-    S: AsRef<str>,
+    S: AsRef<std::ffi::OsStr>,
 {
     let source = if agent_bridge_flag_enabled(env_value) {
         "environment"
     } else if args
         .into_iter()
-        .any(|arg| arg.as_ref() == AGENT_BRIDGE_CLI_ARG)
+        .any(|arg| arg.as_ref() == std::ffi::OsStr::new(AGENT_BRIDGE_CLI_ARG))
     {
         "argument"
     } else {
@@ -17443,6 +17447,33 @@ mod tests {
     fn agent_bridge_can_be_enabled_by_launch_argument() {
         let status = agent_bridge_status_from(None, ["ChemDraft", AGENT_BRIDGE_CLI_ARG]);
 
+        expect_true(status.enabled);
+        expect_eq("argument", status.source.as_str());
+    }
+
+    #[test]
+    fn agent_bridge_check_survives_an_argument_that_is_not_unicode() {
+        // A Linux file name is bytes; Windows command lines can hold an unpaired surrogate.
+        // Neither may panic the launch, and the flag is still found beside them.
+        #[cfg(unix)]
+        let odd = {
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::OsStr::from_bytes(b"/tmp/caf\xe9.cdxml").to_os_string()
+        };
+        #[cfg(windows)]
+        let odd = {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[0x63, 0xD800, 0x2E])
+        };
+        let flag = std::ffi::OsString::from(AGENT_BRIDGE_CLI_ARG);
+
+        let status = agent_bridge_status_from(
+            None,
+            [std::ffi::OsString::from("ChemDraft"), odd.clone()],
+        );
+        expect_false(status.enabled);
+
+        let status = agent_bridge_status_from(None, [odd, flag]);
         expect_true(status.enabled);
         expect_eq("argument", status.source.as_str());
     }
