@@ -4,7 +4,7 @@
 // the SDK's: its first test walks it and fails if anything in it reaches layout-engine, so the refusal
 // below cannot pass because some import loaded the grammar.
 import { readFileSync, statSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { applyPatch, applyPatchWithHistory, createDocumentHistory, createEmptyDocument,
   type DocumentHistory, type DocumentPatch, type MoleculeObject } from "@chemdraft/chem-core";
@@ -13,6 +13,23 @@ import { describe, expect, it, vi } from "vitest";
 import { HydrogenCountUnrepresentableReason, PluginHost, PluginHostError, type PluginPatchApplicationRequest } from "./index";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+
+/** `file` as a repo-relative, forward-slash path. `pathSep` is passed in so Windows forms can be checked on any host. */
+function toRepoRelative(file: string, root: string, pathSep: string): string {
+  const forward = (value: string): string => {
+    let out = value.replace(/^file:\/\/\/?(?=[A-Za-z]:|\/)/i, "");
+    if (/^file:\/\//i.test(value) && /^[A-Za-z]:/.test(out) === false && out.startsWith("/") === false) out = `/${out}`;
+    if (pathSep === "\\" || /^[A-Za-z]:[\\/]/.test(out)) out = out.split("\\").join("/");
+    return out.replace(/\/+$/, "");
+  };
+  const f = forward(file);
+  const r = forward(root);
+  const windows = /^[A-Za-z]:/.test(r);
+  const lower = (value: string): string => (windows ? value.toLowerCase() : value);
+  if (lower(f) === lower(r)) return "";
+  if (lower(f).startsWith(`${lower(r)}/`)) return f.slice(r.length + 1);
+  return f;
+}
 
 /** Every source file reachable from `entry` by any import (type-only included), and every bare specifier. */
 function moduleGraph(entry: string): { files: Set<string>; bare: Set<string> } {
@@ -35,11 +52,11 @@ function moduleGraph(entry: string): { files: Set<string>; bare: Set<string> } {
         bare.add(specifier);
         const [, name, ...subpath] = specifier.split("/");
         target = resolveFile(join(repoRoot, "packages", name!, "src", subpath.length > 0 ? subpath.join("/") : "index"));
-        expect(target, `${specifier} (imported by ${relative(repoRoot, file)}) resolves to a source file`).toBeDefined();
+        expect(target, `${specifier} (imported by ${toRepoRelative(file, repoRoot, sep)}) resolves to a source file`).toBeDefined();
       } else {
         bare.add(specifier);
       }
-      if (target !== undefined && !target.includes("/node_modules/")) pending.push(target);
+      if (target !== undefined && !toRepoRelative(target, repoRoot, sep).split("/").includes("node_modules")) pending.push(target);
     }
   }
   return { files, bare };
@@ -78,10 +95,21 @@ function hostSettingCount(element: string, hydrogenCount: number) {
   return { host, applyDocumentPatch, original, history: () => history };
 }
 
+describe("toRepoRelative", () => {
+  it.each([
+    ["D:\\a\\repo\\packages\\layout-engine\\src\\index.ts", "D:\\a\\repo", "\\"],
+    ["d:\\a\\repo\\packages\\layout-engine\\src\\index.ts", "D:\\a\\repo\\", "\\"],
+    ["file:///D:/a/repo/packages/layout-engine/src/index.ts", "D:\\a\\repo", "\\"],
+    ["/home/r/repo/packages/layout-engine/src/index.ts", "/home/r/repo", "/"]
+  ])("turns %s into a repo-relative forward-slash path", (file, root, pathSep) => {
+    expect(toRepoRelative(file, root, pathSep)).toBe("packages/layout-engine/src/index.ts");
+  });
+});
+
 describe("the plugin host without layout-engine (the published SDK)", () => {
   it("loads no layout-engine anywhere in this test's module graph, and does reach the abbreviation table", () => {
     const { files, bare } = moduleGraph(fileURLToPath(import.meta.url));
-    const reached = [...files].map(file => relative(repoRoot, file));
+    const reached = [...files].map(file => toRepoRelative(file, repoRoot, sep));
     expect(reached.filter(file => file.startsWith("packages/layout-engine/"))).toEqual([]);
     expect([...bare].filter(specifier => specifier.startsWith("@chemdraft/layout-engine"))).toEqual([]);
     expect(reached).toContain("packages/plugin-host/src/index.ts");
