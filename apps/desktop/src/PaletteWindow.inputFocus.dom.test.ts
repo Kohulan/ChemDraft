@@ -132,6 +132,14 @@ it("keeps native and page pending editing-key lists in agreement", () => {
   expect([...new Set(nativeDeletes)].sort()).toEqual(pageDeletes.sort());
 });
 
+/** jsdom has no layout: report content overflowing `element` vertically. */
+function overflowVertically(element: HTMLElement): void {
+  Object.defineProperties(element, {
+    clientHeight: { configurable: true, value: 100 },
+    scrollHeight: { configurable: true, value: 300 }
+  });
+}
+
 describe.each(["macos", "windows"] as const)("palette input focus (%s)", (platform) => {
   let container: HTMLDivElement;
   let root: Root;
@@ -576,6 +584,7 @@ describe.each(["macos", "windows"] as const)("palette input focus (%s)", (platfo
       // A native scrollbar press targets its scroll owner, here the Object Settings panel body.
       const scroller = container.querySelector<HTMLElement>(".molecule-inspector-panel-body")!;
       expect(scroller.contains(input)).toBe(true);
+      overflowVertically(scroller);
       await act(async () => pointer(scroller, "pointerdown"));
       await flush();
       expect(leases().map(([, args]) => args.editing)).toEqual([true, false]);
@@ -588,6 +597,26 @@ describe.each(["macos", "windows"] as const)("palette input focus (%s)", (platfo
       // No drag means no WM_EXITSIZEMOVE: by release, both platforms have handed the keyboard back.
       expect(leases().at(-1)![1]).toMatchObject({ editing: false, returnFocus: true });
       expect(startPaletteWindowDrag).not.toHaveBeenCalled();
+    } finally {
+      styles.remove();
+    }
+  });
+
+  it("drags from the blank background of a floating tool palette whose scrollbars App.css hides", async () => {
+    const styles = document.createElement("style");
+    styles.textContent = readFileSync(resolve("apps/desktop/src/App.css"), "utf8");
+    document.head.append(styles);
+    try {
+      await mountSettings("core.structure");
+      const palette = container.querySelector<HTMLElement>(".tool-palette.floating.vertical")!;
+      expect(getComputedStyle(palette).overflowY).toBe("auto");
+      // It really scrolls, but with no visible scrollbar its own box is all background.
+      overflowVertically(palette);
+      await act(async () => pointer(palette, "pointerdown"));
+      await flush();
+      expect(leases()).toHaveLength(1);
+      expect(leases()[0]![1]).toMatchObject({ editing: false, returnFocus: platform === "macos" });
+      expect(startPaletteWindowDrag).toHaveBeenCalledExactlyOnceWith(expect.any(Number), expect.any(Number));
     } finally {
       styles.remove();
     }

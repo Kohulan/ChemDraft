@@ -10,11 +10,14 @@ in progress rather than a changelog.
 
 ## Nested inspector scrollbar drag (`resubmit/palette-scrollbar`)
 
-Resubmit #178 against current main. Palettes drag from their background again; only scrollbar
-presses are excluded, so nested Object Settings scroll owners keep pointer/mouse presses (a press
-whose target owns a scrollbar stays with the webview, on both the drag and the Windows
-text-input-lease hand-back paths). Preserve native title dragging, disabled-control exclusion,
-click compensation and the mouse fallback. Test both platform routes; actual Windows/macOS
+Resubmit #178 against current main. Palettes drag from their background again; only presses that
+may be scrollbar presses are excluded. A press whose target is a scroll owner showing a scrollbar
+(overflow auto/scroll/overlay on an axis where its content overflows, and the scrollbar not hidden
+by `scrollbar-width: none` or a zero-size `::-webkit-scrollbar`) stays with the webview, on both
+the drag and the Windows text-input-lease hand-back paths. That includes the owner's own blank
+area, since overlay scrollbars draw inside it; its descendants, scrollers whose content fits, and
+the hidden-scrollbar floating tool palette background still drag. Preserve native title dragging,
+disabled-control exclusion, click compensation and the mouse fallback. Test both platform routes; actual Windows/macOS
 scrollbar dragging and mixed-DPI native checks remain pending.
 
 # ChemDraft Assistant plugin (active, branches claude/assistant-*)

@@ -172,6 +172,7 @@ describe.each(["macos", "windows"] as const)("native title dragging (%s)", platf
     await mount("palette", false, { toolsetId: "core.drawnStructureSettings" });
     const scroller = container.querySelector<HTMLElement>(selector)!;
     expect(scroller).not.toBeNull();
+    overflow(scroller);
     const down = pointerEvent("pointerdown", 7);
     const mouseDown = new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 });
     await dispatch(scroller, ...(pointer ? [down, mouseDown] : [mouseDown]));
@@ -198,6 +199,32 @@ describe.each(["macos", "windows"] as const)("native title dragging (%s)", platf
       expect(background.closest(".molecule-inspector-panel-body")).not.toBeNull();
     }
     await press(background, pointer);
+    expectOneCompensatedDrag();
+  });
+
+  // A floating tool palette scrolls (overflow-y: auto) with its scrollbars hidden by App.css, so
+  // nothing on its own box is a scrollbar: a blank-area press there must still drag the window.
+  it.each([true, false])("still drags from the blank background of a floating tool palette with hidden scrollbars (pointer: %s)", async (pointer) => {
+    loadAppCss();
+    await mount("palette", false, { toolsetId: "core.structure" });
+    const palette = container.querySelector<HTMLElement>(".tool-palette.floating.vertical")!;
+    expect(palette).not.toBeNull();
+    const style = getComputedStyle(palette);
+    expect(style.overflowY).toBe("auto");
+    expect(style.getPropertyValue("scrollbar-width")).toBe("none");
+    // Really overflowing: only the hidden scrollbar keeps this from being a scroll owner.
+    overflow(palette);
+    expect(isScrollOwnerPress(palette)).toBe(false);
+    await press(palette, pointer);
+    expectOneCompensatedDrag();
+  });
+
+  it("still drags from a scroller whose content fits, since it shows no scrollbar", async () => {
+    loadAppCss();
+    await mount("palette", false, { toolsetId: "core.drawnStructureSettings" });
+    const scroller = container.querySelector<HTMLElement>(".molecule-inspector-panel-body")!;
+    expect(getComputedStyle(scroller).overflow).toMatch(/auto|scroll/);
+    await press(scroller);
     expectOneCompensatedDrag();
   });
 
@@ -373,20 +400,41 @@ describe.each(["macos", "windows"] as const)("native title dragging (%s)", platf
   });
 });
 
+/** Make jsdom report content overflowing `element` on the given axes (jsdom has no layout). */
+function overflow(element: HTMLElement, axes: { x?: boolean; y?: boolean } = { y: true }): void {
+  Object.defineProperties(element, {
+    clientWidth: { configurable: true, value: 100 },
+    clientHeight: { configurable: true, value: 100 },
+    scrollWidth: { configurable: true, value: axes.x ? 300 : 100 },
+    scrollHeight: { configurable: true, value: axes.y ? 300 : 100 }
+  });
+}
+
 describe("scroll owner presses", () => {
+  const both = { x: true, y: true };
   it.each([
-    ["overflow: auto", true],
-    ["overflow: scroll", true],
-    ["overflow-y: auto", true],
-    ["overflow-x: scroll; overflow-y: hidden", true],
-    ["overflow-y: scroll; overflow-x: hidden", true],
-    ["overflow: hidden", false],
-    ["overflow: clip", false],
-    ["overflow: visible", false],
-    ["", false]
-  ] as const)("classifies a press on an element with %j as scroll owner: %s", (style, owner) => {
+    ["overflow: auto", both, true],
+    ["overflow: scroll", both, true],
+    ["overflow-y: auto", { y: true }, true],
+    ["overflow: hidden auto", { y: true }, true],
+    ["overflow: auto hidden", { y: true }, false],
+    ["overflow-x: scroll; overflow-y: hidden", { x: true }, true],
+    ["overflow-x: scroll; overflow-y: hidden", { y: true }, false],
+    ["overflow-y: scroll; overflow-x: hidden", { y: true }, true],
+    // Scrolls, but the content fits: no scrollbar to press.
+    ["overflow: auto", {}, false],
+    ["overflow: scroll", {}, false],
+    // Scrolls with the scrollbar hidden, as App.css does for .tool-palette.floating.
+    ["overflow-y: auto; scrollbar-width: none", both, false],
+    ["overflow-y: auto; scrollbar-width: thin", both, true],
+    ["overflow: hidden", both, false],
+    ["overflow: clip", both, false],
+    ["overflow: visible", both, false],
+    ["", both, false]
+  ] as const)("classifies a press on an element with %j overflowing %j as scroll owner: %s", (style, axes, owner) => {
     const element = document.createElement("div");
     element.setAttribute("style", style);
+    overflow(element, axes);
     document.body.append(element);
     try {
       expect(isScrollOwnerPress(element)).toBe(owner);
@@ -395,6 +443,35 @@ describe("scroll owner presses", () => {
       expect(isScrollOwnerPress(child)).toBe(false);
     } finally {
       element.remove();
+    }
+  });
+
+  // Older WebKit (before Safari 18.2) has no scrollbar-width; App.css hides the floating palette's
+  // scrollbars there through ::-webkit-scrollbar { width: 0; height: 0 }. jsdom lacks both `CSS` and
+  // pseudo-element styles, so stand them in.
+  it.each([
+    [{ width: "0px", height: "0px" }, both, false],
+    [{ width: "0px", height: "auto" }, { y: true }, false],
+    [{ width: "0px", height: "auto" }, { x: true }, true],
+    [{ display: "none" }, both, false],
+    [{ width: "8px", height: "8px" }, both, true]
+  ] as const)("reads a ::-webkit-scrollbar style %j on a scroller overflowing %j as scroll owner: %s", (bar, axes, owner) => {
+    const element = document.createElement("div");
+    element.setAttribute("style", "overflow: auto");
+    overflow(element, axes);
+    document.body.append(element);
+    vi.stubGlobal("CSS", { supports: () => false });
+    const computed = window.getComputedStyle.bind(window);
+    vi.spyOn(window, "getComputedStyle").mockImplementation((target, pseudo) =>
+      pseudo === "::-webkit-scrollbar"
+        ? ({ display: "block", width: "auto", height: "auto", ...bar } as unknown as CSSStyleDeclaration)
+        : computed(target));
+    try {
+      expect(isScrollOwnerPress(element)).toBe(owner);
+    } finally {
+      element.remove();
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
     }
   });
 
