@@ -141,7 +141,7 @@ into core — e.g. `import type { ChemDraftDocument, DocumentPatch } from "@chem
 ```
 
 `apiVersion` in your manifest declares the SDK contract you target (`PluginApiVersion`, currently
-`0.1.26`). API 0.1.21 adds plugin chemistry properties and plugin assistant tools (#310).
+`0.1.27`). API 0.1.21 adds plugin chemistry properties and plugin assistant tools (#310).
 API 0.1.22 adds optional name-to-structure `source`, `matchedName` and `matchedCas` provenance for the offline name dictionary (#318).
 API 0.1.23 adds native wavy single bonds (#327).
 Set `MoleculeBond.display.bondStyle: "wavy"` only with `order: "single"`; the schema rejects other orders.
@@ -151,6 +151,8 @@ should declare `^0.1.23`.
 API 0.1.24 adds reaction `arrowObjectIds`/`plusObjectIds` for shared scheme arrows and plus signs (#335),
 and binary CDX import/export (#316). API 0.1.25 adds optional bracketUsage, repeatCount and scoped crossingBondIds (#338 bracketed groups).
 API 0.1.26 adds [request-bound plugin tools](#request-bound-plugin-tools), depiction, and document-change notifications.
+API 0.1.27 adds optional machine-readable [refusal fields](#refusal-reasons-and-details), `reason` and
+`details`, beside a refused call's code and message.
 API 0.1.20 adds optional `tableStyle.autoColumnMinEm`, the minimum auto column width in em. API 0.1.19 bounds panel reports: strings, collection sizes, aggregate work and UTF-8 JSON
 size are validated before a report is forwarded to the renderer (see [Panel report limits](#panel-report-limits)).
 API 0.1.17 adds optional `MoleculeBond.stereo: "either"` for an E/Z-unspecified double bond.
@@ -172,11 +174,12 @@ API 0.1.7 adds host-owned `context.chemistry.structureToName`; plugins that use 
 use it should declare `^0.1.6`. API 0.1.5 added command-scoped `context.images.requestImage`, 0.1.4 added
 `context.documents.applyPatch`, and 0.1.3 added the host-owned `context.dialogs.promptText`
 capability. API 0.1.9 adds `context.assistant` for request-scoped tools and MCP sessions.
-Existing `^0.1.0` through `^0.1.25` packages remain compatible, each on a host at or above the version
+Existing `^0.1.0` through `^0.1.26` packages remain compatible, each on a host at or above the version
 it declares.
 
 | API version | Additive capability | Permission |
 | --- | --- | --- |
+| 0.1.27 | Optional refusal `reason` and `details` on `PluginWorkerCapabilityError` and request failures (first reason: `hydrogen_count_unrepresentable`) | No new permission |
 | 0.1.26 | Request lifecycle, pinned document reads and patches, session-local tools, chemistry and depiction, and document-change notifications | Existing permissions, listed below |
 | 0.1.25 | Optional bracketUsage, repeatCount and crossingBondIds (scoped objectId/bondId references); legacy repeatUnit remains supported | No new permission |
 | 0.1.24 | Binary CDX import/export (#316) and optional reaction `arrowObjectIds`/`plusObjectIds` (#335); shared scheme arrows and plus signs are referenced by id, never copied | No new permission |
@@ -232,7 +235,9 @@ selection and committed insertions. Chemical expectations pair `sourceSmiles` wi
 `{ kind: "insertion", opIndex }` for an inserted molecule. `opIndex` is the zero-based position
 in the flat patch or zero for a single operation. Each insertion receipt maps that index to the
 final page ID, object ID and revision. Failures include `stale`, `scope`, `chemistry`,
-`cancelled`, `limit` and `interrupted`. A refused patch yields no receipt or undo entry.
+`cancelled`, `limit` and `interrupted`. A refused patch yields no receipt or undo entry. A plugin
+declaring `^0.1.27` or later may also find a [`reason` and `details`](#refusal-reasons-and-details)
+on the failure; an older one receives the same code and message without them.
 
 Successful writes through `applyRequestPatch`, `applyPatch` or `insertTable` during the bound
 invocation share a single labelled Undo entry. The host verifies the final normalized chemistry and
@@ -991,6 +996,105 @@ repeat unit that had members at command start and lost its last member through t
 accepted deletions. Cleanup drops references to the glyphs and the command's deleted objects in
 the same undo entry. The host checks again against the commit-time document after any
 canvas gesture wait. Writes are refused when no active document is available to validate the scope.
+
+### Refusal reasons and details
+
+Beside its code and message, a refused `applyPatch`, `insertTable` or request write may carry two
+optional fields (API 0.1.27): `reason`, a stable snake_case identifier, and `details`, a flat record
+of what was refused. On `applyPatch` and `insertTable` they appear on the rejected
+`PluginWorkerCapabilityError` (`error.reason`, `error.details`); on `applyRequestPatch` on the
+failure's `error` object, sent only to a plugin declaring `^0.1.27` or later. Handle a refusal that
+carries neither, since most do not.
+
+| `reason` | Refused when | `details` |
+| --- | --- | --- |
+| `hydrogen_count_unrepresentable` | A write would store `hydrogenCount` other than 0 on an atom that cannot carry hydrogens of its own: an `H`, `D` or `T` atom, the unknown atom `*`, another label naming no element (no element symbol starts it), such as the generic labels `A`, `Q`, `M`, `X` and R-groups like `R1`, or an abbreviation such as `OMe`, `Ph` or `CF3`, whose hydrogens come from what it stands for. `details.element` gives the label. No label, formula or export reads such a count, so it would be lost silently. A label that names an element and spells its hydrogens (`NH2`, `CH3`, `NHMe`) is not refused. Omit `hydrogenCount` or set it to 0 (a request write fails with code `invalid`). A count the molecule already held unchanged is not refused. | `{ moleculeId, atomId, element, hydrogenCount }` |
+
+```ts
+try {
+  await context.documents.applyPatch?.({ reason: "Add hydrogens", patch });
+} catch (error) {
+  const { reason, details } = error as { reason?: string; details?: Record<string, string | number | boolean> };
+  if (reason === "hydrogen_count_unrepresentable") {
+    // details.atomId names the atom; write it again without hydrogenCount.
+  }
+}
+```
+
+Only plugin and assistant writes are refused this way. A document that already stores such a count
+(an older file, a restored session, a paste) opens and edits as stored, and the app flags the atom.
+
+### Embedding hosts: object identity (1.2.3)
+
+The host binds each object selected when a command or request started, and each object it inserts,
+to that object's in-memory identity, never to its id alone: an id freed by a deletion and reused by a
+paste, an undo or another insert names a different object, and writes to it are refused. The identity
+lives in chem-core beside the document, never in it. It is not serialized or structured-cloned, a
+plugin never receives one, and everything a plugin writes is parsed into a new value. chem-core's own
+edits (`applyPatch`, `adoptDerivedDocument`) carry it to the edited value.
+
+`@chemdraft/plugin-host` bundles its own chem-core runtime. Compatible copies that successfully adopt the published runtime share it; copies finding another
+version, an untrusted runtime, or an unpublishable global keep private runtimes. The identity runtime is published on `globalThis` under
+`Symbol.for("chemdraft.chem-core.objectIdentity")` and versioned, so an embedder that commits plugin
+writes through its own `@chemdraft/chem-core` keeps the identities the SDK pinned, and a command's
+second write to the same object still resolves. For that, the embedder:
+
+- commits in the same realm as its `PluginHost` (not in another Worker or iframe);
+- uses a chem-core with the same identity-runtime version, currently 2 (a copy that finds another
+  version keeps its identities private, so pins stop resolving and writes are refused: fail closed,
+  never a wrong match);
+- loads every chem-core copy it will use (its own, the host's, the `@chemdraft/plugin-host` SDK
+  bundle's) before any script it does not trust runs in that realm, not only the first copy: each
+  copy captures the built-ins it relies on (`Object.isFrozen`, the `WeakMap.prototype` methods and
+  so on) when it loads, so a copy that loads after untrusted code replaced one rejects the genuine
+  runtime, makes a private one and calls the replaced methods;
+- calls `retainObjectIdentity(before, after)` from `@chemdraft/chem-core` for each object value it
+  edits itself instead of through chem-core's patches (only a same-id, same-type value continues an
+  object);
+- reports the document each write committed through the request's `onCommitted`, so the write's
+  insertions are granted by the identity of the objects actually inserted.
+
+The first copy publishes only if the global property can be defined: it publishes the runtime as a
+fixed, hidden property that cannot be replaced. It exposes only what chem-core already exports: read an object's identity, test one, and
+continue an object onto its edited copy. Nothing in it can replace an identity an object already
+holds. The engine gives every object of every document it adopts (a patch result, `toEngineDocument`,
+`admitParsedDocument`, an adopted derived document) an identity, so once a document is adopted,
+nothing can move another object's identity onto any of its objects. This applies to documents the
+engine adopts. Two early returns hand back their input unchanged: `applyPatches` with no patches, and
+`adoptDerivedDocument` when `next` is `base`, is already an engine document, or comes with a `base`
+that is not an engine document. These returns perform no cloning, adoption, or identity minting. A
+non-engine input is returned unadopted and is not newly pre-identified; an already-engine input
+remains adopted and pre-identified. The runtime calls
+only built-ins captured when each chem-core copy loads, so replacing `WeakMap.prototype` methods,
+`Function.prototype.call` or `Symbol` later changes nothing. A later copy adopts a published runtime
+only if it has exactly the runtime's shape and behaves as chem-core's on fresh probe objects. A
+runtime that answers every identity check with "yes" is not adopted. A copy that finds anything else
+under that key keeps its identities private: silently for a runtime of another version, otherwise
+with one console warning.
+
+Run untrusted plugins in a Worker, as the app does: code in the host's own realm can always reach
+the host's globals. The accepted trust boundary is this: code that runs in the page before
+ChemDraft's chem-core copies load is outside what the page can defend, and a fake runtime that
+behaves correctly except for a targeted object cannot be detected from inside the realm. Two limits
+follow. First, a script that runs in the realm before a chem-core copy loads can publish a forgery
+that passes the adoption check: it behaves exactly like chem-core until it is asked about an object it
+targets. No check made from inside the realm can tell the two apart, and a script that runs first
+controls the realm anyway. Such scripts are out of scope. Second, carrying only fills a missing identity, so an object in an engine-adopted document cannot be
+handed another object's identity; an unidentified value, including one already in a non-engine
+document, still can, through the runtime's `retain` (chem-core's
+`retainObjectIdentity`), as an edited copy does. A patch parses anything it inserts into a new value,
+so ordinary patch insertion is not a bypass. Such a value reaches a document only if a trusted caller
+gives the engine a document that contains it. Each of these paths takes such a document, and each
+needs a trusted caller to submit it:
+
+- `adoptDerivedDocument`, when it adopts (a `next` whose objects were pre-retained);
+- `admitParsedDocument`, which admits the document as it is and keeps any identity an object holds;
+- `toEngineDocument` and `cloneDocument`, which copy each object's identity onto its copy;
+- `applyPatches` on an input that is not an engine document, which starts with `cloneDocument` only
+  when `patches.length > 0`. With no patches it returns the supplied document unchanged, without
+  cloning, adopting or pre-identifying it, so an identity retained beforehand survives.
+
+Code the host trusts that far can change the document without any pin.
 
 ### Native tables (0.1.18)
 

@@ -3,7 +3,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ColorPickerPopoverBody, symbolToolGlyph, toolbarCommandFlyoutGridStyle } from "./ToolPalette";
 import { Icon, ToolbarAssetIcon, type IconName } from "./icons";
 import { toolbarAsset, type ToolbarAssetName } from "./toolbarAssets";
-import { normalizeHexColor, objectCustomColorCommandId, textCustomColorCommandId } from "./commands";
+import { normalizeHexColor, objectCustomColorCommandId, textCustomColorCommandId, objectEffectColorCommandId } from "./commands";
 import { installPaletteInputFocus } from "./plugins/pluginPanelInputFocus";
 import { detectDesktopShortcutPlatform } from "./keyboardShortcuts";
 import { preventPaletteCommandPointerFocus } from "./paletteCommandPointerFocus";
@@ -155,7 +155,8 @@ export function PalettePopoverWindow({
   const [draft, setDraft] = useState<string | undefined>();
 
   const effectiveTarget: ToolsetArtPaintTarget = artStyle?.activePaintTarget ?? artStyleTarget ?? "fill";
-  const activeColor = effectiveTarget === "fill"
+  const effectKind = content.kind === "artColor" ? content.effectKind : undefined;
+  const activeColor = effectKind ? artStyle?.effectControls[effectKind]?.color.value ?? "#52616b" : effectiveTarget === "fill"
     ? artStyle?.values.fillColor.value
     : artStyle?.values.strokeColor.value;
   const currentColor = normalizeHexColor(content.kind === "textColor" ? fallbackColor : activeColor ?? fallbackColor) ?? "#111111";
@@ -263,8 +264,13 @@ export function PalettePopoverWindow({
       if (payload.anchor && typeof payload.anchor.x === "number" && typeof payload.anchor.y === "number") {
         anchorRef.current = payload.anchor;
       }
-      if (payload.kind === "textColor") setDraft(undefined);
-      const next: ToolsetPopoverContent = { ...payload, ...opening };
+      if (payload.kind === "textColor" || payload.kind === "artColor") setDraft(undefined);
+      const next: ToolsetPopoverContent = { ...payload, ...opening,
+        ...(payload.kind === "artColor" || payload.kind === "textColor" ? {
+          effectKind: payload.kind === "artColor" &&
+            (payload.effectKind === "glow" || payload.effectKind === "shadow" || payload.effectKind === "sketch")
+            ? payload.effectKind : undefined
+        } : {}) };
       contentRef.current = next;
       setContent(next);
     })
@@ -556,7 +562,7 @@ export function PalettePopoverWindow({
       return;
     }
     setDraft(normalized);
-    void sendPaletteCommandPreview(objectCustomColorCommandId(normalized)).catch(() => undefined);
+    void sendPaletteCommandPreview(effectKind ? objectEffectColorCommandId(effectKind, normalized) : objectCustomColorCommandId(normalized)).catch(() => undefined);
   };
 
   const commitColor = (color: string) => {
@@ -565,7 +571,7 @@ export function PalettePopoverWindow({
       return;
     }
     setDraft(normalized);
-    void sendPaletteCommandCommit(objectCustomColorCommandId(normalized)).catch(() => undefined);
+    void sendPaletteCommandCommit(effectKind ? objectEffectColorCommandId(effectKind, normalized) : objectCustomColorCommandId(normalized)).catch(() => undefined);
   };
 
   const chooseFlyoutCommand = async (command: ToolsetFlyoutCommandSnapshot) => {
@@ -714,9 +720,9 @@ export function PalettePopoverWindow({
           ))}
         </div>
       ) : (
-        <div className="art-color-popover" role="dialog" aria-label={content.kind === "textColor" ? "Text color picker" : "Art color picker"}>
+        <div className="art-color-popover" role="dialog" aria-label={content.kind === "textColor" ? "Text color picker" : effectKind ? `${effectKind} effect color picker` : "Art color picker"}>
           <ColorPickerPopoverBody
-            key={content.kind === "textColor" ? content.openedAt : undefined}
+            key={content.kind === "textColor" ? content.openedAt : effectKind ?? "paint"}
             contextKey={colorContextKey}
             activeColor={currentColor}
             value={value}

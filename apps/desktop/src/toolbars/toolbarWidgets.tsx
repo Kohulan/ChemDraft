@@ -1,6 +1,7 @@
 import { createContext, useContext } from "react";
 import type { CommandSpec } from "../commands";
 import type { DocumentZoomState } from "../documentZoom";
+import type { ArtInspectorEffectKind } from "../artInspectorModel";
 import type { AnalysisReport } from "@chemdraft/analysis-core";
 import type { NativeTextStyle, TextSpan } from "@chemdraft/chem-core";
 import type {
@@ -46,7 +47,7 @@ export interface ToolbarWidgetState {
   molecularInspectorStale?: boolean;
   onInvoke: (commandId: string) => void;
   onColorPickerOpenChange?: (open: boolean) => void;
-  onRequestColorPopover?: (anchor: ToolbarPopoverAnchor, kind?: "artColor" | "textColor") => void;
+  onRequestColorPopover?: (anchor: ToolbarPopoverAnchor, kind?: "artColor" | "textColor", effectKind?: ArtInspectorEffectKind) => void;
   onArtStylePreview?: (commandId: string) => void;
   onArtStyleCommit?: (commandId: string) => void;
   onArtStyleCancel?: () => void;

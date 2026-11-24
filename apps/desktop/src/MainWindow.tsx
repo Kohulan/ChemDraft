@@ -3,6 +3,7 @@ import { interactive3dWorkspaceStatusText, Interactive3dWorkspaceStatus } from "
 import { CanvasContextMenu, NATIVE_CANVAS_MENU_CLOSED_EVENT } from "./CanvasContextMenu";
 import { PLUGIN_CHANGE_REFUSED, RECOGNITION_REFUSED, chemistryRefusalOf, refusalSentence } from "./plugins/requestWrites/chemistryRefusal";
 import { buildObjectCanvasMenu, pageCanvasMenu, SET_DEFAULT_ARROW_STYLE_COMMAND_ID } from "./canvasContextMenuModel";
+import { loadStereoEngine, stereoReadoutRequest } from "./stereoReadout";
 import { RequestWriteError } from "@chemdraft/plugin-host";
 import { createRequestHistory } from "./plugins/requestWrites/requestHistory";
 import { electronMarkInteractionFrames } from "./electronMarkInteraction";
@@ -16,7 +17,7 @@ import { documentDrawingDefaults } from "@chemdraft/document-workflow-core";
 import { nativeStylePresetPatchForSelection } from "./nativeStylePresetCommand";
 import { AtomProblemMarker } from "./AtomProblemMarker";
 import { atomProblemCommandId, atomProblemCommands, atomProblemSnapshot, type AtomProblemTarget } from "./atomProblemCommands";
-import { atomProblem, nativeImplicitHydrogenCount, type AtomProblemAction } from "@chemdraft/document-workflow-core";
+import { atomProblem, type AtomProblemAction } from "@chemdraft/document-workflow-core";
 import { applyNativeAtomProblemFix } from "./documentWorkflow";
 import { dropElectronMark, dropElectronMarksInSelection, electronMarkDropTarget, electronMarkName,
   resolveElectronMarksAfterMoleculePartMove, resolveElectronMarksInSelectionTransform } from "./electronMarkDrop";
@@ -34,6 +35,7 @@ import type { ActiveTableText } from "./tableCommands";
 import { tableValidationMessage } from "./tableCommands";
 import { tableCellElementId } from "@chemdraft/layout-engine";
 import { insertTableIntoDocument } from "./documentWorkflow";
+import { doubleBondGestureCycle } from "./doubleBondCycle";
 import { clearCustomSwatchSlot, customSwatchCommandId, loadCustomSwatches, parseCustomSwatchCommandId, setCustomSwatchSlot, type CustomSwatchNumber, type CustomSwatchSlot } from "./customColorSwatches";
 import { persistCustomSwatches, useCustomSwatches } from "./toolbars/customSwatchSettings";
 import { createCustomSwatchActions, textCustomColorCommandId } from "./commands";
@@ -163,6 +165,7 @@ import {
   type DocumentObject,
   type DocumentPage,
   type DocumentPatch,
+  type ElectronMarkObject,
   type FlattenWarning,
   type GraphicFreehandPoint,
   type GraphicObject,
@@ -233,7 +236,7 @@ import {
 } from "./documentSession";
 import { createPersistentPluginStorage } from "./plugins/pluginStorage";
 import {
-  applyAcceptedPluginProposal,
+  previewAcceptedPluginProposal,
   applyPluginDocumentPatch,
   refreshPluginPatchChemistry,
   placeInsertedObjectsInFreeSpace,
@@ -242,7 +245,7 @@ import {
   type PluginWriteGate
 } from "./plugins/applyPluginDocumentPatch";
 import { AnalyzerNoticeBanner, type AnalyzerNotice } from "./plugins/AnalyzerNotice";
-import { PatchReviewTray, PendingProposalsBadge, proposalReviewItem } from "./plugins/PatchReviewTray";
+import { acceptedProposalMessage, PatchReviewTray, PendingProposalsBadge, ProposalReviewItemCache } from "./plugins/PatchReviewTray";
 import type { DesktopPluginRuntime } from "./plugins/createPluginRuntime";
 import {
   ANALYSIS_WINDOW_OWNER_ID,
@@ -290,11 +293,11 @@ import {
   atomLabelHaloWidthPx,
   atomLabelLayout,
   atomLabelRunFontSize,
+  atomDrawnHydrogenCount,
   averageDefinedDepthWeights,
   bondRefKey,
   depthCuedLabelColor,
   depthCuedLabelScale,
-  dativeDeprotonationCount,
   nativeAtomLabelReading,
   nativeBondOrderResolution,
   nativeElementFromAtomLabel,
@@ -729,9 +732,12 @@ import {
   ungroupSelectedDocumentObjects,
   moveNativeMoleculeParts,
   moleculeFrameDelta,
+  singleMoleculeSelection,
   spin3dCarriedElectronMarks,
+  uncarriedMarksRefusal,
   findForeignNativeMoleculeBondTarget,
   openNativeDocument,
+  openedDocumentRenumberedObjectIds,
   previewNativeMoleculeBondGrowth,
   nativeBondDragSourceAtomId,
   previewNativeMoleculeFreeformBondGrowth,
@@ -948,6 +954,7 @@ import { exportDefaultPath, stripExportFileExtension } from "./exportFilename";
 import { boundedHistoryPast } from "./documentHistoryBudget";
 import { ExportForm, rasterExportFormatForDialogFormat } from "./dialogs/ExportForm";
 import type { ExportDialogState, ExportOptions, ExportPreviewResult, ExportFrame } from "./dialogs/exportOptions";
+import { supportsTransparentRasterBackground } from "./dialogs/exportOptions";
 import { exportOptions } from "./dialogs/exportOptionsValidation";
 import type { ExportDialogResult } from "./dialogs/dialogProtocol";
 import { exportDialogHeight, exportDialogSizeError } from "./dialogs/exportPresentation";
@@ -1066,6 +1073,7 @@ import {
   applySelection,
   fromSelectionItems,
   selectionModeFromEvent,
+  selectionAfterElectronMarkPlacement,
   toSelectionItems,
   toSelectionItemsMulti,
   type SelectionItem
@@ -1659,9 +1667,16 @@ type ObjectContextMenuState = {
   bondDepthContext?: BondDepthContext;
   /** Present when the right-clicked scope carries (or has dismissed) valence warnings. */
   atomWarning?: { scope: readonly NativeWarningSuppressionScope[]; suppressed: boolean; count: number; problemCommandId?: string };
+  /** The single atom or bond the menu was opened on, for the read-only R/S or E/Z row. */
+  stereoPart?: ObjectContextMenuStereoPart;
   x: number;
   y: number;
 };
+type ObjectContextMenuStereoPart = Extract<NativeMoleculeSelectionPart, { kind: "atom" | "bond" }>;
+/** The part a stereo readout can describe: exactly one atom or one bond, nothing broader. */
+function objectContextMenuStereoPart(part: NativeMoleculeSelectionPart | undefined): ObjectContextMenuStereoPart | undefined {
+  return part?.kind === "atom" || part?.kind === "bond" ? part : undefined;
+}
 type BondDepthMenuCrossing = Pick<ResolvedBondCrossing, "key" | "bonds" | "front" | "back" | "hasOverride">;
 export type BondDepthCommandId = "bondDepth.bringInFront" | "bondDepth.sendBehind" | "bondDepth.useDefault";
 export interface BondDepthContext {
@@ -1817,6 +1832,8 @@ function interactive3dPostOpenPollingComplete(session: Engine3dWorkspaceSessionS
 let cachedOclAdapter: typeof import("@chemdraft/ocl-adapter") | undefined;
 let spin3dRdkit: RdkitMinimalModule | undefined;
 const spin3dStereoReferences = new WeakMap<MoleculeObject, Spin3dStereoReference>();
+const spin3dDrawingChangedMessage =
+  "Couldn't flatten: the drawing changed while Spin 3D was open. Reopen Spin 3D and try again.";
 
 async function loadSpin3dRdkit(): Promise<RdkitMinimalModule> {
   if (spin3dRdkit) return spin3dRdkit;
@@ -1868,7 +1885,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.24.13.15-opus";
+const CURRENT_BUILD_STAMP = "11.24.17.45-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -3025,6 +3042,10 @@ export function MainWindow({
   const [pageContextMenu, setPageContextMenu] = useState<ClientPoint | undefined>();
   const [freeformNativeBond, setFreeformNativeBond] = useState<FreeformNativeBondPreview | undefined>();
   const [nativeDoubleBondSidePreview, setNativeDoubleBondSidePreview] = useState<NativeDoubleBondSidePreview | undefined>();
+  const nativeDoubleBondSidePreviewRef = useRef(nativeDoubleBondSidePreview);
+  nativeDoubleBondSidePreviewRef.current = nativeDoubleBondSidePreview;
+  // A hover-2 cycle's committed side, shown in place of the pointer's preview until the pointer moves.
+  const cycledDoubleBondSidePreviewRef = useRef<NativeDoubleBondSidePreview | undefined>(undefined);
   const [graphicCornerRadiusReadout, setGraphicCornerRadiusReadout] = useState<GraphicCornerRadiusReadoutState | undefined>();
   const [objectRotateReadout, setObjectRotateReadout] = useState<ObjectRotateReadoutState | undefined>();
   const [projectedPlaneTiltReadout, setProjectedPlaneTiltReadout] = useState<ProjectedPlaneTiltReadoutState | undefined>();
@@ -5171,6 +5192,23 @@ export function MainWindow({
     const madePlain = order === "single" && object?.type === "molecule" &&
       nativeBondCanBeMadePlain(object.bonds.find(bond => bond.id === target.bondId));
     const selectedDocument = selectDocumentObject(currentDocument, target.objectId);
+    // The Bond tool's hover preview draws over the stored side: cycle from what is on screen.
+    const preview = nativeDoubleBondSidePreviewRef.current;
+    const previewed = preview?.objectId === target.objectId && preview.bondId === target.bondId ? preview : undefined;
+    const drawnSide = previewed?.side === "automatic" ? undefined : previewed?.side;
+    const cycled = doubleBondGestureCycle(selectedDocument, target, order, undefined, drawnSide);
+    if (cycled) {
+      // Display-only (PRESERVE_CHEMISTRY). The hover stays, so pressing 2 again keeps cycling.
+      if (commitDocumentChange(cycled.document, cycled.undoLabel)) {
+        // Keep the preview on the committed side so the canvas shows it without a pointer move.
+        if (previewed) {
+          cycledDoubleBondSidePreviewRef.current = { ...previewed, side: cycled.position };
+          setNativeDoubleBondSidePreview(cycledDoubleBondSidePreviewRef.current);
+        }
+        setStatus(cycled.undoLabel);
+      }
+      return;
+    }
     const nextDocument = applyNativeMoleculeBondOrderValueTarget(selectedDocument, target, order);
     if (nextDocument === selectedDocument) {
       setStatus(`Cannot set hovered bond to ${order}`);
@@ -5436,7 +5474,28 @@ export function MainWindow({
     }
 
     const currentDocument = documentRef.current;
-    const nextDocument = applyChargeToolAtNativeAtom(currentDocument, markSpec, target);
+    const placedDocument = applyChargeToolAtNativeAtom(currentDocument, markSpec, target);
+    // A press that cancels a charge (− on ⊕) REMOVES the mark and leaves the rest of the selection
+    // as it was, so there is no placed mark to select and nothing to report but the removal.
+    const placedPageObjectIds = placedDocument === currentDocument ? undefined
+      : new Set(placedDocument.pages.flatMap(candidate => candidate.objects.map(object => object.id)));
+    const removedMark = placedPageObjectIds && currentDocument.pages.flatMap(candidate => candidate.objects)
+      .find((object): object is ElectronMarkObject => object.type === "electron-mark" && !placedPageObjectIds.has(object.id));
+    // Otherwise the workflow selects the mark it placed, bumped or converted; the selection policy
+    // decides whether that replaces the selection or joins a whole-selected owner molecule (a mark
+    // follows its atom).
+    const placedMarkIds = removedMark ? [] : placedDocument.selection.objectIds.filter(id =>
+      findDocumentObject(placedDocument, id)?.type === "electron-mark");
+    const placedSelection = placedDocument !== currentDocument && placedMarkIds.length > 0
+      ? fromSelectionItems(selectionAfterElectronMarkPlacement(
+          toSelectionItemsMulti(currentDocument.selection.objectIds, selectedNativeMoleculePartsRef.current),
+          { objectId: target.objectId, selectedAs: selectableDocumentObjectIdForPointer(currentDocument, target.objectId) },
+          placedMarkIds
+        ), { scope: "multi" }).objectIds
+      : undefined;
+    const nextDocument = placedSelection && placedSelection.join("\n") !== placedDocument.selection.objectIds.join("\n")
+      ? selectDocumentObjects(placedDocument, placedDocument.selection.pageId ?? placedDocument.pages[0].id, placedSelection)
+      : placedDocument;
     if (nextDocument === currentDocument) {
       // A refused INCREMENT is not a refused mark: the mark is already on the atom, so name
       // what stopped the press — the ±9 representation cap — instead
@@ -5461,10 +5520,17 @@ export function MainWindow({
     // between presses — so re-derive the hover from the last canvas pointer position through the
     // same path pointermove uses, rather than clearing it and leaving the next press dead.
     rederiveNativeCanvasHoverRef.current(nextDocument);
+    if (removedMark) {
+      // Only a charge press removes a mark, and only the one it cancels: the opposite sign of the press.
+      const removedCharge = typeof removedMark.charge === "number" ? removedMark.charge : markSpec.kind === "charge" ? -markSpec.charge : 1;
+      setStatus(`Removed ${electronMarkSpecStatusNoun({ kind: "charge", charge: removedCharge > 0 ? 1 : -1,
+        radical: removedMark.radical, chargeStyle: removedMark.chargeStyle }, removedCharge)} from hovered atom`);
+      return;
+    }
     // Both placement paths select the mark they placed/bumped, so the committed document names
     // the stacked magnitude ("Placed positive charge 2+ on hovered atom").
     const committedDocument = documentRef.current;
-    const placedMarkId = committedDocument.selection.objectIds[0];
+    const placedMarkId = placedMarkIds[0];
     const placedMark = placedMarkId ? findDocumentObject(committedDocument, placedMarkId) : undefined;
     const placedNoun = placedMark?.type === "electron-mark" && placedMark.markKind === "radical-dot"
       ? electronMarkSpecStatusNoun({ kind: "radical-dot" })
@@ -5700,7 +5766,10 @@ export function MainWindow({
   }, [applySpin, document, spin3dState]);
 
   // Flatten the current spin orientation into the document as ONE undo step. On
-  // refusal the document is untouched and the overlay stays so the user can re-spin.
+  // refusal the document is untouched and the overlay stays so the user can re-spin,
+  // except when the molecule itself changed under the session (Clean Up, a style edit,
+  // a plugin write): no orientation of the stale overlay can ever flatten then, so the
+  // session ends and the user reopens Spin 3D on the molecule as it is drawn now.
   const commitSpinFlatten = useCallback(async () => {
     let state = spin3dStateRef.current;
     if (!state) return;
@@ -5731,7 +5800,7 @@ export function MainWindow({
     }
     if (flattenTarget) {
       if (flattenTarget !== state.sourceMolecule) {
-        reportSpin3dError("Couldn't flatten: the drawing changed while Spin 3D was open. Reopen Spin 3D and try again.");
+        cancelSpin3dSession(spin3dDrawingChangedMessage);
         return;
       }
       try {
@@ -5767,7 +5836,7 @@ export function MainWindow({
       // (ended, switched molecule, or cancelled-and-restarted) while we awaited OCL.
       if (spin3dSessionGenerationRef.current !== sessionGeneration) return;
       if (findDocumentObject(documentRef.current, state.objectId) !== flattenTarget) {
-        reportSpin3dError("Couldn't flatten: the drawing changed while Spin 3D was open. Reopen Spin 3D and try again.");
+        cancelSpin3dSession(spin3dDrawingChangedMessage);
         return;
       }
     }
@@ -5856,7 +5925,7 @@ export function MainWindow({
     } catch (error) {
       reportSpin3dError(error instanceof Error ? error.message : String(error));
     }
-  }, [applySpin, commitDocumentChangeWithPageFit, reportSpin3dError]);
+  }, [applySpin, cancelSpin3dSession, commitDocumentChangeWithPageFit, reportSpin3dError]);
 
   // Preload the OCL stereo perceiver once so the synchronous rotate-commit paths can run the
   // read-back guard. Perception depends only on the molecule graph, so a single load serves every
@@ -5872,6 +5941,11 @@ export function MainWindow({
       .catch(() => {
         /* best-effort: rotate commits fall back to legacy geometry-only flatten */
       });
+    // Warm the canvas menu's stereo readout too: the native popup (macOS and Windows) waits only
+    // NATIVE_STEREO_READOUT_BUDGET_MS for its R/S or E/Z row before opening without it.
+    void loadStereoEngine().catch(() => {
+      /* best-effort: the menu retries the load and omits the row meanwhile */
+    });
     return () => {
       cancelled = true;
     };
@@ -5907,7 +5981,7 @@ export function MainWindow({
   // on selection so the synchronous rotate commit can run the same verification.
   useEffect(() => {
     if (spin3dRdkit) return;
-    const ids = selectedNativeMoleculePart ? [selectedNativeMoleculePart.objectId] : document.selection.objectIds;
+    const ids = selectedNativeMoleculePart ? [selectedNativeMoleculePart.objectId] : singleMoleculeSelection(document).objectIds;
     if (ids.length !== 1) return;
     const object = findDocumentObject(document, ids[0]);
     if (object?.type === "molecule" && validSpin3dModelFor(object)) {
@@ -6017,12 +6091,15 @@ export function MainWindow({
       stage: "spin.command",
     }, emitTrace);
     const currentDocument = documentRef.current;
-    const selectedIds = [
-      ...new Set([
-        ...currentDocument.selection.objectIds,
-        ...(selectedNativeMoleculePart ? [selectedNativeMoleculePart.objectId] : [])
-      ])
-    ];
+    const selection = singleMoleculeSelection(currentDocument,
+      selectedNativeMoleculePart ? [selectedNativeMoleculePart.objectId] : []);
+    const selectedIds = selection.objectIds;
+    if (selection.uncarriedMarkIds.length > 0) {
+      traceInfo("spin.selection", { message: `${selection.uncarriedMarkIds.length} selected marks not carried` });
+      commandSpan.complete({ message: "selection rejected" });
+      setStatus(uncarriedMarksRefusal("Spin 3D", selection.uncarriedMarkIds.length));
+      return;
+    }
     if (selectedIds.length !== 1) {
       traceInfo("spin.selection", { message: `selected ${selectedIds.length}` });
       commandSpan.complete({ message: "selection rejected" });
@@ -6046,12 +6123,19 @@ export function MainWindow({
       setStatus(`3D spin unavailable: ${error.message}`);
       return;
     }
-    if (spin3dStateRef.current?.objectId === objectId) {
-      // Button mashed while the overlay is already up — keep the live session.
-      traceInfo("spin.duplicate", { message: "overlay already active" });
-      commandSpan.complete({ message: "already spinning" });
-      setStatus("Spin 3D already active: drag the molecule to rotate · Esc to cancel");
-      return;
+    const activeSpin = spin3dStateRef.current;
+    if (activeSpin?.objectId === objectId) {
+      if (activeSpin.sourceMolecule === molecule) {
+        // Button mashed while the overlay is already up — keep the live session.
+        traceInfo("spin.duplicate", { message: "overlay already active" });
+        commandSpan.complete({ message: "already spinning" });
+        setStatus("Spin 3D already active: drag the molecule to rotate · Esc to cancel");
+        return;
+      }
+      // The molecule changed under the open session, so its overlay shows the old drawing
+      // and can never flatten. Start over on the molecule as it is drawn now.
+      traceInfo("spin.stale", { message: "molecule changed under the open overlay; restarting" });
+      cancelSpin3dSession();
     }
     // A coordination centre has no honest 3D answer here: MMFF refuses metals outright and UFF
     // returns coordination geometry that is not worth having (see the note on
@@ -6400,7 +6484,7 @@ export function MainWindow({
       return;
     }
     await runInPage();
-  }, [applySpin, selectedNativeMoleculePart, spinPlacementFor]);
+  }, [applySpin, cancelSpin3dSession, selectedNativeMoleculePart, spinPlacementFor]);
 
   // Opt-in console mirror of the spin3d trace stream (localStorage flag / ?spin3dlog=1),
   // so the prefetch → cache → embed → overlay timeline is capturable without the debugger
@@ -6429,12 +6513,8 @@ export function MainWindow({
   // by the time the user reaches the Spin 3D button the result is usually cached.
   useEffect(() => {
     if (spin3dState) return;
-    const selectedIds = [
-      ...new Set([
-        ...document.selection.objectIds,
-        ...(selectedNativeMoleculePart ? [selectedNativeMoleculePart.objectId] : [])
-      ])
-    ];
+    const selectedIds = singleMoleculeSelection(document,
+      selectedNativeMoleculePart ? [selectedNativeMoleculePart.objectId] : []).objectIds;
     if (selectedIds.length !== 1) return;
     const molecule = document.pages[0]?.objects.find(
       (object): object is MoleculeObject => object.id === selectedIds[0] && object.type === "molecule"
@@ -6706,15 +6786,17 @@ export function MainWindow({
 
   const cleanUpSelectedStructure3d = useCallback(() => {
     const currentDocument = documentRef.current;
-    const selectedObjectIds = [
-      ...new Set([
-        ...currentDocument.selection.objectIds,
-        ...(selectedNativeMoleculePart ? [selectedNativeMoleculePart.objectId] : [])
-      ])
-    ];
+    const selection = singleMoleculeSelection(currentDocument,
+      selectedNativeMoleculePart ? [selectedNativeMoleculePart.objectId] : []);
+    const selectedObjectIds = selection.objectIds;
 
     if (selectedObjectIds.length === 0) {
       setStatus("No selected structure for 3D cleanup");
+      return;
+    }
+
+    if (selection.uncarriedMarkIds.length > 0) {
+      setStatus(uncarriedMarksRefusal("3D cleanup", selection.uncarriedMarkIds.length));
       return;
     }
 
@@ -6933,15 +7015,16 @@ export function MainWindow({
   // separate window or WebGL stage — the molecule the user manipulates IS the drawing.
   const openInteractive3dWorkspace = useCallback(async () => {
     const currentDocument = documentRef.current;
-    const selectedObjectIds = [
-      ...new Set([
-        ...currentDocument.selection.objectIds,
-        ...(selectedNativeMoleculePart ? [selectedNativeMoleculePart.objectId] : [])
-      ])
-    ];
+    const selection = singleMoleculeSelection(currentDocument,
+      selectedNativeMoleculePart ? [selectedNativeMoleculePart.objectId] : []);
+    const selectedObjectIds = selection.objectIds;
 
     if (selectedObjectIds.length === 0) {
       setStatus("Select a structure before opening Interactive 3D");
+      return;
+    }
+    if (selection.uncarriedMarkIds.length > 0) {
+      setStatus(uncarriedMarksRefusal("Interactive 3D", selection.uncarriedMarkIds.length));
       return;
     }
     if (selectedObjectIds.length !== 1) {
@@ -10680,7 +10763,9 @@ export function MainWindow({
     const fitRecommendation = resolvedOpen.source === "external-cdxml"
       ? recommendImportedPageFit(resolvedOpen.document)
       : undefined;
-    const dirty = options?.dirty ?? false;
+    // Renumbered duplicate ids make the opened document differ from its file: it opens with unsaved
+    // changes so Save writes the fix. The renumbering is part of opening, never an undo entry.
+    const dirty = (options?.dirty ?? false) || openedDocumentRenumberedObjectIds(opened, resolvedOpen.document);
     if (!snapshotDocumentTab(true, options?.onRefused)) return;
     if (nonPristineTabsRef.current.has(activeDocumentTabIdRef.current) && !addDocumentTab(displayName, options?.onRefused)) return;
     const id = activeDocumentTabIdRef.current;
@@ -11270,7 +11355,10 @@ export function MainWindow({
               const history = createDocumentHistory(normalizeCommittedDocument(
                 admitParsedDocument(resolved.document), { preserveElectronMarks: true }
               ));
-              const reports = restoreSessionWarningReports(session);
+              const reports = restoreSessionWarningReports(session, {
+                displayName: session.displayName, sourceLabel: openSourceLabel(resolved.source, resolved.statusSourceLabel),
+                warnings: opened.warnings
+              });
               restored.push({ session, opened, resolved, history, reports, candidateIndex, id: crypto.randomUUID() });
             } catch {
               skipped.push(rawTab);
@@ -11309,17 +11397,15 @@ export function MainWindow({
             documentTabSnapshotsRef.current.clear();
             nonPristineTabsRef.current.clear();
           }
-          for (const { id, session, resolved, opened, history, reports } of restored) {
+          for (const { id, session, opened, resolved, history, reports } of restored) {
             if (session.pristine !== true || session.path || session.dirty || !session.blank) nonPristineTabsRef.current.add(id);
             const savePathNotice = restoredSavePathNotice(session);
             documentTabSnapshotsRef.current.set(id, {
-              history, file: restoredDocumentFileState(session),
+              history, file: openedDocumentRenumberedObjectIds(opened, resolved.document)
+                ? { ...restoredDocumentFileState(session), dirty: true } : restoredDocumentFileState(session),
               viewport: session.view?.viewport ?? createViewportState(),
               scrollLeft: session.view?.scrollLeft ?? 0, scrollTop: session.view?.scrollTop ?? 0, parts: [],
-              warnings: reports.warnings ?? (reports.saveWarnings ? undefined : {
-                displayName: session.displayName, sourceLabel: openSourceLabel(resolved.source, resolved.statusSourceLabel),
-                warnings: opened.warnings
-              }),
+              warnings: reports.warnings,
               saveWarnings: reports.saveWarnings,
               status: `${shellOpenFailure ? `${shellOpenFailure} — ` : ""}Restored last session — ${session.displayName}${session.dirty ? " (unsaved changes)" : ""}${restoreNotice}${savePathNotice ? `. ${savePathNotice}` : ""}`
             });
@@ -13660,7 +13746,7 @@ export function MainWindow({
     commandRegistry: registry,
     createStorage: createPersistentPluginStorage,
     onProposedPatchesChanged: () => setPatchQueueVersion((version) => version + 1),
-    applyDocumentPatch: async ({ plugin, command, patch, undoLabel, signal, writeScopeObjectIds, writeScopePages, repeatUnitCleanup }) => {
+    applyDocumentPatch: async ({ plugin, command, patch, undoLabel, signal, writeScopeObjectIds, writeScopePages, repeatUnitCleanup, onCommitted }) => {
       if (quitInteractionRef.current) throw new Error("Quit is waiting for a choice; nothing was inserted.");
       const gate = pluginWriteGateRef.current;
       if (!gate) throw new Error("The document window is closing; nothing was inserted.");
@@ -13731,9 +13817,12 @@ export function MainWindow({
             return committed;
           };
           // Both history paths normalize again; check their actual final state, after page fit too.
+          let installed = true;
           if (assistantTxId) assistantTransactions.writeAssistantTransaction(assistantTxId, document, applied.receipt.objectIds, prepared, assertFinalDocument);
-          else commitDocumentChange(document, undoLabel, false, assertFinalDocument, PLUGIN_WRITE);
+          else installed = commitDocumentChange(document, undoLabel, false, assertFinalDocument, PLUGIN_WRITE);
           cleanup?.record();
+          // The host grants this write's insertions by the identity of the objects committed here.
+          if (installed) onCommitted?.(committed);
         }, { // Allocate request consent only if page fitting actually needs a question.
           get consent() { return assistantTxId ? assistantTransactions.pageEnlargementConsent(assistantTxId, shortcutPlatform) : consent; }, signal,
           isCurrent });
@@ -14087,9 +14176,8 @@ export function MainWindow({
         }
         const before = documentRef.current;
         const documentIdentity = documentIdentityRef.current;
-        let prepared = host.previewProposedPatch(proposal.id, before, {
-          apply: (document, proposed, options) => applyAcceptedPluginProposal(document, proposed, options).document
-        });
+        // The same application the review dry-runs for its warnings (`proposalReviewItem`).
+        let prepared = previewAcceptedPluginProposal(host, proposal.id, before);
         if (recognized) {
           const visible = assistantHistoryPort.getViewportRect?.(tab.id);
           const pageRect = pageRef.current?.getBoundingClientRect();
@@ -14114,8 +14202,10 @@ export function MainWindow({
           }
         }
         // Keep the proposal pending until the page question and stale-document check succeed.
+        let committed = prepared;
         const pending = commitWithPageFit(before, prepared, document => {
           const updated = host.acceptProposedPatch(proposal.id, documentRef.current, { apply: () => document });
+          committed = updated;
           commitDocumentChange(updated, `${pluginName}: ${recognized ? "Insert Recognized Structure" : "Apply Proposal"}`, false, undefined, PLUGIN_WRITE);
         }, { consent: new PageEnlargementConsent(shortcutPlatform), isCurrent });
         if (pending) {
@@ -14123,10 +14213,8 @@ export function MainWindow({
           try { await pending; } finally { pageFitPendingRef.current -= 1; }
         }
         setSelectedNativeMoleculePart(undefined);
-        const inserted = recognized ? `${pluginName}: inserted recognized structure` : `${pluginName}: applied proposal`;
-        const message = screenCapture
-          ? `${inserted}; its screen capture stays saved (Add or Remove Plugins › Show saved screen captures)`
-          : inserted;
+        const message = acceptedProposalMessage(pluginName, proposal,
+          { recognized, screenCapture: Boolean(screenCapture), before, committed });
         setStatus(message);
         return { ok: true, message };
       } catch (error) {
@@ -14189,21 +14277,35 @@ export function MainWindow({
     if (!tab) return `${owner.title} (closed)`;
     return documentTabs.length < 2 ? undefined : tab.title;
   }, [documentTabs, pluginRuntime.runtime]);
+  // The document a proposal would be accepted into (its own tab's), for the review's dry run.
+  const proposalSourceDocument = useCallback((proposal: QueuedProposedPatch): ChemDraftDocument | undefined => {
+    const owner = pluginRuntime.runtime.proposalDocumentTab(proposal.id);
+    if (!owner) return undefined;
+    return owner.id === activeDocumentTabIdRef.current
+      ? documentRef.current : documentTabSnapshotsRef.current.get(owner.id)?.history.present;
+  }, [pluginRuntime.runtime]);
+  const proposalReviewInputs = useCallback((proposal: QueuedProposedPatch) => ({
+    documentName: proposalDocumentName(proposal), sourceDocument: proposalSourceDocument(proposal)
+  }), [proposalDocumentName, proposalSourceDocument]);
+  // The window's review items, memoized per proposal on the document it would be accepted into, so an
+  // edit to that document re-runs only its proposals' dry runs (see the effect after the queue's).
+  const [proposalReviewCache] = useState(() => new ProposalReviewItemCache());
   const publishProposalReview = useCallback(
-    async (open: boolean, focus: boolean): Promise<boolean> => {
-      const pending = pluginRuntime.runtime.host.listProposedPatches("pending");
+    async (
+      open: boolean, focus: boolean,
+      pending: readonly QueuedProposedPatch[] = pluginRuntime.runtime.host.listProposedPatches("pending")
+    ): Promise<boolean> => {
       return publishAnalysisWindow(
         PATCH_REVIEW_WINDOW_ID,
         "Plugin Proposals",
         {
           kind: "patchReview",
-          proposals: await Promise.all(pending.map((proposal) =>
-            proposalReviewItem(pluginRuntime.runtime.host, proposal, proposalDocumentName(proposal))))
+          proposals: await proposalReviewCache.items(pluginRuntime.runtime.host, pending, proposalReviewInputs)
         },
         { open, focus, width: 420, height: 420 }
       );
     },
-    [pluginRuntime.runtime, proposalDocumentName, publishAnalysisWindow]
+    [pluginRuntime.runtime, proposalReviewCache, proposalReviewInputs, publishAnalysisWindow]
   );
   /** Open the review window, and only once the native open has succeeded mark it open: on a
    *  failure the badge must stay, or the pending proposals have no way back on desktop. */
@@ -14229,6 +14331,7 @@ export function MainWindow({
         pluginPanelIdentityKey(ANALYSIS_WINDOW_OWNER_ID, PATCH_REVIEW_WINDOW_ID)
       );
       void hidePluginPanelWindow(ANALYSIS_WINDOW_OWNER_ID, PATCH_REVIEW_WINDOW_ID).catch(() => undefined);
+      proposalReviewCache.clear();
       setProposalReview({ pending: 0, windowOpen: false });
       return;
     }
@@ -14240,7 +14343,19 @@ export function MainWindow({
     } else {
       void publishProposalReview(false, false);
     }
-  }, [patchQueueVersion, pluginRuntime.runtime, publishProposalReview, showProposalReview]);
+  }, [patchQueueVersion, pluginRuntime.runtime, proposalReviewCache, publishProposalReview, showProposalReview]);
+  // The window follows edits to the documents its proposals would be accepted into: a proposal's
+  // hydrogen-count warning is a dry run on that document, so an edit can add or remove it. Only a
+  // changed document (by identity) or tab name republishes, and only its proposals are re-run; the
+  // queue itself is not re-read. Declared after the queue effect above, which runs first in a render
+  // that changed both (an accept bumps the queue and commits its document in one batch), so the
+  // proposals checked here are the ones still pending.
+  useEffect(() => {
+    if (!isDesktopRuntime()) return;
+    const pending = proposalReviewCache.pending;
+    if (pending.length === 0 || !proposalReviewCache.isStale(pluginRuntime.runtime.host, pending, proposalReviewInputs)) return;
+    void publishProposalReview(false, false, pending);
+  }, [document, documentTabs, pluginRuntime.runtime, proposalReviewCache, proposalReviewInputs, publishProposalReview]);
 
   // The action listener is registered ONCE. Its handlers close over live state and are redefined
   // on every document change, so they are read through this ref: re-registering per render meant
@@ -17086,9 +17201,18 @@ export function MainWindow({
 
     if (activeToolState.activeCommandId === "tool.bond" && target) {
       const object = findDocumentObject(sourceDocument, target.objectId);
-      setNativeDoubleBondSidePreview(object?.type === "molecule"
+      const preview = object?.type === "molecule"
         ? nativeDoubleBondSidePreviewFromHit(target.objectId, object, target, point, hitToleranceForScale(viewportRef.current.scale))
-        : undefined);
+        : undefined;
+      // The re-hit after a hover-2 cycle keeps showing the side it just committed (until an undo).
+      const cycled = cycledDoubleBondSidePreviewRef.current;
+      const stillCycled = preview && object?.type === "molecule" && cycled?.objectId === preview.objectId &&
+        cycled.bondId === preview.bondId &&
+        object.bonds.find(bond => bond.id === cycled.bondId)?.display?.doubleBondSide === cycled.side;
+      // A failed validation (e.g. undo restored another side) drops the retained preview, so a redo
+      // without a pointer move cannot make the stale side valid again.
+      if (cycled && !stillCycled) cycledDoubleBondSidePreviewRef.current = undefined;
+      setNativeDoubleBondSidePreview(stillCycled ? cycled : preview);
     } else {
       setNativeDoubleBondSidePreview(undefined);
     }
@@ -17145,6 +17269,7 @@ export function MainWindow({
       lastCanvasPointerClientPointRef.current = undefined;
     };
     const handleWindowPointerMove = (event: globalThis.MouseEvent) => {
+      cycledDoubleBondSidePreviewRef.current = undefined;
       const clientPoint = { x: event.clientX, y: event.clientY };
       const canvas = canvasRegionRef.current;
       pointerInsideCanvasRef.current = Boolean(canvas && clientPointIsInsideRect(clientPoint, canvas.getBoundingClientRect()));
@@ -21123,6 +21248,12 @@ export function MainWindow({
       event.stopPropagation();
       const target = { objectId, ...nativeMoleculeHit };
       const selectedDocument = selectDocumentObject(document, objectId);
+      const cycled = doubleBondGestureCycle(selectedDocument, target, activeNativeBondOrder, activeNativeBondStereo);
+      if (cycled) {
+        // Display-only: the default PRESERVE_CHEMISTRY policy refuses any chemistry change.
+        if (commitDocumentChange(cycled.document, cycled.undoLabel)) setStatus(cycled.undoLabel);
+        return;
+      }
       const nextDocument = applyNativeMoleculeBondOrderValueTarget(selectedDocument, target, activeNativeBondOrder, activeNativeBondStereo);
       if (nextDocument === selectedDocument) {
         setStatus(nativeBondOrderTargetRefusal(selectedDocument, target, activeNativeBondOrder) ?? "Bond order not changed");
@@ -22305,6 +22436,10 @@ export function MainWindow({
       targetKind,
       bondDepthContext: bondDepthContextFromNativeSelection(nextSelectedNativePart, pageSvgRenderPlan.crossings, currentDocument),
       ...(atomWarning ? { atomWarning } : {}),
+      // The readout describes what was right-clicked, not the (possibly broader or different)
+      // preserved selection: a selected bond or whole fragment must not hijack an atom's R/S.
+      stereoPart: object?.type === "molecule" && nativeMoleculeHit
+        ? objectContextMenuStereoPart(nativeSelectionFromHit(objectId, nativeMoleculeHit)) : undefined,
       x: event.clientX,
       y: event.clientY
     });
@@ -23435,7 +23570,11 @@ export function MainWindow({
       });
       lastCanvasPointerClientPointRef.current = anchor;
       setPageContextMenu(undefined);
-      setObjectContextMenu({ objectId: object.id, targetKind: part && selection.length === 0 ? "parts" : "object", ...anchor });
+      // A clicked atom or bond is the selected part even while its molecule is the selected object.
+      const stereoPart = selection.length <= 1 && selectedNativeMoleculePartsRef.current.length === 1 &&
+        part?.objectId === object.id ? objectContextMenuStereoPart(part) : undefined;
+      setObjectContextMenu({ objectId: object.id, targetKind: part && selection.length === 0 ? "parts" : "object",
+        stereoPart, ...anchor });
       return;
     }
     page.dispatchEvent(new MouseEvent("contextmenu", {
@@ -24373,6 +24512,7 @@ export function MainWindow({
             host={pluginRuntime.runtime.host}
             queueVersion={patchQueueVersion}
             getDocumentName={proposalDocumentName}
+            getSourceDocument={proposalSourceDocument}
             onAccept={acceptPluginProposal}
             onReject={rejectPluginProposal}
           />
@@ -24494,6 +24634,10 @@ export function MainWindow({
           targetKind={objectContextMenu.targetKind}
           bondDepthContext={objectContextMenu.bondDepthContext}
           atomWarning={objectContextMenu.atomWarning}
+          loadStereoReadout={(() => {
+            const menuObject = findDocumentObject(document, objectContextMenu.objectId);
+            return menuObject?.type === "molecule" ? stereoReadoutRequest(menuObject, objectContextMenu.stereoPart) : undefined;
+          })()}
           arrowStyleSource={(() => {
             const menuObject = findDocumentObject(document, objectContextMenu.objectId);
             return menuObject ? nativeArrowStyleDefaultFromGraphic(menuObject) : undefined;
@@ -27669,6 +27813,8 @@ export function ObjectLayerContextMenu(props: {
   bondDepthContext?: ObjectContextMenuState["bondDepthContext"];
   atomWarning?: ObjectContextMenuState["atomWarning"];
   arrowStyleSource?: { title: string };
+  /** Read-only R/S or E/Z row for the right-clicked atom or bond (see `stereoReadoutRequest`). */
+  loadStereoReadout?: () => Promise<string | undefined>;
   position: ClientPoint;
   onInvoke(commandId: string): void;
   onFocusReturn?(): void;
@@ -34645,12 +34791,13 @@ export async function createDialogExportPreview(document: ChemDraftDocument, opt
   if (!live()) throw new Error("Preview was superseded.");
   // Webviews cannot reliably embed PDFs. Show the SVG page layout used by the PDF
   // writer, with PDF guides and its white background, without generating PDF bytes.
-  // Preview less portable raster formats through the same native renderer as opaque PNG.
+  // Preview less portable raster formats through PNG, keeping the TIFF background.
   const state: ExportDialogState = options.format === "pdf"
     ? { ...options, busy: false, format: "svg", svg: { includeWarnings: true, includePageGuides: options.pdf.includePageGuides },
       presentation: options.presentation ? { ...options.presentation, background: "white" } : undefined }
     : options.format === "tiff" || options.format === "bmp" || options.format === "gif"
-    ? { ...options, busy: false, format: "png", raster: { ...options.raster, background: "white" } }
+    ? { ...options, busy: false, format: "png", raster: { ...options.raster,
+      background: supportsTransparentRasterBackground(options.format) ? options.raster.background : "white" } }
     : { ...options, busy: false };
   const result = await createDialogExportResult(document, state, true);
   // Native rasterization already in flight cannot be interrupted. Avoid
@@ -34750,9 +34897,9 @@ export async function createDialogExportResult(
     if (!isDesktopRuntime()) {
       throw new Error(`${descriptor.menuLabel} export requires the ChemDraft desktop app.`);
     }
-    const transparent = rasterFormat === "png" && state.raster.background === "transparent";
+    const transparent = supportsTransparentRasterBackground(rasterFormat) && state.raster.background === "transparent";
     // The SVG must omit its white page rect for a transparent request, otherwise resvg
-    // paints it over the (intentionally unfilled) pixmap and the PNG comes out opaque white.
+    // paints it over the intentionally unfilled pixmap and the image comes out opaque white.
     const svgResult = (await exportPhase4Svg(document, {
       ...(sized || preview ? { outputWidth: width, outputHeight: height } : {}),
       includeWarnings: true,
@@ -35309,14 +35456,9 @@ export function electronMarkSpecStatusNoun(spec: NativeElectronMarkSpec, placedC
 function atomHasImplicitHydrogen(molecule: MoleculeObject, atom: MoleculeAtom): boolean {
   const element = nativeElementFromAtomLabel(atom.element);
   if (!element || element === "H" || atom.labelLiteral === true) return false;
-  const { atoms, bonds } = molecule;
-  const resolution = nativeBondOrderResolution(atoms, bonds);
-  const incidentBonds = resolution.bondsByAtom.get(atom.id) ?? [];
-  if (element === "C" && incidentBonds.length > 0 && incidentBonds.every(isDativeBond)) return false;
-  const count = nativeImplicitHydrogenCount(
-    element, resolution.bondOrderUsage.get(atom.id) ?? 0, atom.formalCharge, atom.markRadicals ?? 0
-  );
-  return count > dativeDeprotonationCount(atom, bonds, atoms, resolution);
+  // The hydrogens the drawn label shows (layout-engine, AGENTS.md §9): a stated count where the atom
+  // has one; else none for a carbon bonded only datively.
+  return (atomDrawnHydrogenCount(atom, molecule.bonds, molecule.atoms) ?? 0) > 0;
 }
 
 function moleculeAriaLabel(object: MoleculeObject): string {

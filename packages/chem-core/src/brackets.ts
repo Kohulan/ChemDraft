@@ -1,6 +1,7 @@
 import type { BracketObject, ChemDraftDocument, DocumentObject, MoleculeObject } from "./schemas";
 import { bracketPairSemantics } from "./bracketSemantics";
 import { resolveRepeatUnitAtomMembership, type RepeatUnitMembershipOptions } from "./repeatUnitMembership";
+import { retainObjectIdentity } from "./objectIdentity";
 
 // Bracket ids can be reused after deletion. Keep creation identity in memory across edits and undo,
 // without adding metadata to the document or granting an identity to a newly inserted glyph.
@@ -98,7 +99,9 @@ export function withBracketChemistryWarnings(document: ChemDraftDocument): ChemD
           .map(warning => ({ code: "chemistry.bracket_multiplier", objectId: object.id, message: warning.message }))];
       if (JSON.stringify(previous) === JSON.stringify(warnings)) return object;
       changed = pageChanged = true;
-      return { ...object, chemistry: { ...object.chemistry, warnings } };
+      const warned = { ...object, chemistry: { ...object.chemistry, warnings } };
+      retainObjectIdentity(object, warned);
+      return warned;
     });
     return pageChanged ? { ...page, objects } : page;
   });

@@ -1,5 +1,6 @@
 import { isDrawingToolCommand } from "./drawingTools";
 import { installPopoverEscapeRouting } from "./window-manager/popoverEscape";
+import { isScrollOwnerPress } from "./window-manager/scrollOwnerPress";
 import { listenCurrentWindowEvent } from "./window-manager/tauriEvents";
 import type { AnalysisReport } from "@chemdraft/analysis-core";
 import type { DocumentZoomState } from "./documentZoom";
@@ -37,6 +38,7 @@ import { CustomizeBar } from "./toolbars/CustomizeMainToolbar/CustomizeBar";
 import { GalleryTray } from "./toolbars/CustomizeMainToolbar/GalleryTray";
 import { SHELL_COMMAND_IDS } from "./shellCommandIds";
 import { useSessionUnavailableCommandIds, withoutSessionUnavailableCommands } from "./sessionUnavailableCommands";
+import type { ArtInspectorEffectKind } from "./artInspectorModel";
 import {
   createDesktopToolsetRegistry,
   desktopToolsetRegistry,
@@ -1053,13 +1055,13 @@ export function PaletteWindow({
 
   // Flyout opens and swatch toggles share the entire native operation, including visibility reads.
   // Snapshot the opening before awaiting: a late reply never authorizes closing its replacement.
-  const openColorPopover = (anchor: ToolbarPopoverAnchor, kind: "artColor" | "textColor" = "artColor") => {
+  const openColorPopover = (anchor: ToolbarPopoverAnchor, kind: "artColor" | "textColor" = "artColor", effectKind?: ArtInspectorEffectKind) => {
     const request = popoverRequestRef.current;
     enqueuePopoverOperation(async () => {
       if (popoverRequestRef.current !== request) return;
       const opening = lastPopoverPayloadRef.current?.content;
       const isCurrent = () => popoverRequestRef.current === request && lastPopoverPayloadRef.current?.content === opening;
-      if (opening?.kind === kind) {
+      if (opening?.kind === kind && (opening.kind !== "artColor" || opening.effectKind === effectKind)) {
         const visible = await isToolsetPopoverWindowVisible(toolset.id);
         if (!isCurrent()) return;
         if (visible) {
@@ -1074,7 +1076,7 @@ export function PaletteWindow({
           return;
         }
       }
-      const content: ToolsetPopoverContent = { kind, ...newToolsetPopoverOpening() };
+      const content: ToolsetPopoverContent = { kind, ...(kind === "artColor" ? { effectKind } : {}), ...newToolsetPopoverOpening() };
       if (await openPopover(anchor, kind, content, request)) {
         await requestToolsetTextStyle();
       }
@@ -1188,9 +1190,11 @@ export function PaletteWindow({
       return;
     }
 
-    // The scroll container itself receives presses on its scrollbar. Leave those to the webview;
-    // descendants such as the existing content drag grip can still start a palette drag.
-    if (event.target === bodyRef.current) return;
+    // Scrollbar presses target their scroll owner: the content scroller or a nested inspector
+    // panel. Leave those to the webview. Every other background press must still drag: on
+    // Windows the input-focus lease (isPaletteWindowDragPress) defers its keyboard hand-back
+    // to the end of that drag.
+    if (isScrollOwnerPress(event.target)) return;
 
     if ((event.target as HTMLElement).closest("button, select, input, textarea, [data-palette-control]") ||
       (shellRef.current && disabledControlAtPointer(shellRef.current, event.nativeEvent))) {
@@ -1207,7 +1211,7 @@ export function PaletteWindow({
       return;
     }
 
-    if (event.target === bodyRef.current) return;
+    if (isScrollOwnerPress(event.target)) return;
 
     if ((event.target as HTMLElement).closest("button, select, input, textarea, [data-palette-control]") ||
       (shellRef.current && disabledControlAtPointer(shellRef.current, event.nativeEvent))) {
@@ -1363,6 +1367,8 @@ export function PaletteWindow({
     if (platform === "windows") void setPaletteCommandHitBoxes([], []).catch(() => undefined);
   }, [platform]);
 
+  const paletteName = toolset.title.replace(/ Toolbar$/, "");
+
   return (
     <main
       ref={shellRef}
@@ -1380,6 +1386,7 @@ export function PaletteWindow({
     >
       <div
         className="palette-title"
+        data-platform={platform}
         data-palette-title-drag-surface="true"
         onPointerDown={startDragFromTitle}
         onPointerUp={stopPaletteWindowDrag}
@@ -1388,17 +1395,32 @@ export function PaletteWindow({
         onMouseDown={startMouseDragFromTitle}
         onMouseUp={stopPaletteWindowMouseDrag}
       >
-        <button
-          className="palette-close-button"
-          type="button"
-          title={`Hide ${toolset.title}`}
-          aria-label={`Hide ${toolset.title}`}
-          onPointerDown={hidePaletteWindow}
-          onMouseDown={(event) => event.stopPropagation()}
-          onClick={hidePaletteWindow}
-        >
-        </button>
-        <span className="palette-title-label">{toolset.title.replace(/ Toolbar$/, "")}</span>
+        {platform === "windows" ? (
+          // Windows convention: a visible "×" at the top right that closes on release, so pressing
+          // and dragging off cancels. The press only stops propagation so it never starts a drag.
+          <button
+            className="palette-close-button palette-close-button--end"
+            type="button"
+            title="Close"
+            aria-label={`Close ${paletteName}`}
+            onPointerDown={(event) => event.stopPropagation()}
+            onMouseDown={(event) => event.stopPropagation()}
+            onClick={hidePaletteWindow}
+          >
+            <span aria-hidden="true">×</span>
+          </button>
+        ) : (
+          <button
+            className="palette-close-button"
+            type="button"
+            title={`Hide ${toolset.title}`}
+            aria-label={`Hide ${toolset.title}`}
+            onPointerDown={hidePaletteWindow}
+            onMouseDown={(event) => event.stopPropagation()}
+            onClick={hidePaletteWindow}
+          />
+        )}
+        <span className="palette-title-label">{paletteName}</span>
       </div>
       <div className="palette-window-content" ref={bodyRef}>
         {customizeThisPalette ? (

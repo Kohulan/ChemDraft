@@ -82,7 +82,8 @@ test("Windows release resource staging requires every licence file at its instal
 
 test("Windows release workflow verifies staged licences after NSIS packaging and before signing", () => {
   const workflow = readFileSync(join(root, ".github", "workflows", "windows-release.yml"), "utf8");
-  const build = workflow.indexOf("run: pnpm --filter @chemdraft/desktop build --bundles nsis");
+  // Each installer variant is built by "pnpm @buildArgs" and checked before it is staged.
+  const build = workflow.indexOf("pnpm @buildArgs");
   const check = workflow.indexOf("node tools/release/verify-bundle-licenses.mjs apps/desktop/src-tauri/target/release");
   const signing = workflow.indexOf("- name: Check signing availability");
   assert.ok(build !== -1 && check > build && signing > check);

@@ -32,6 +32,8 @@ import {
   DocumentStylePreset,
   Acs1996StylePreset,
   RscJournalStylePreset,
+  atomImpliedRadicalCount,
+  atomStatedHydrogenCount,
   drawnLabelBondSide,
   isDativeBond,
   isMetalSymbol,
@@ -106,6 +108,8 @@ import { planTableObjectSvg, tableVisualBoundsForArrangement } from "./table";
 import { textAdvanceEm, measureTextRun, measureNativeTextSpanLineWidth, nativeTextMetrics, isPatrickHandFont, patrickHandTextAdvanceEm, patrickHandTextInkBoundsEm } from "./textMetrics";
 import { planTextObjectPlacement } from "./textPlacement";
 import { formatNumber } from "./formatNumber";
+import { nativeTextSpanLayout } from "./textLayout";
+export { nativeTextSpanLayout } from "./textLayout";
 import { nativeTextScriptFontScale, nativeTextSubscriptOffsetEm, nativeTextSuperscriptOffsetEm } from "./textMetrics";
 import { nativeGroupLabelDisplay, type AtomLabelAnchor } from "./labelGrammar";
 import { moleculeSketchTickPath, type MoleculeSketchTick } from "./sketchTicks";
@@ -2192,6 +2196,7 @@ function planNativeMoleculeGraphSvg(
       moleculeStrokeOpacity
     ),
     ...labelFragments,
+    ...impliedRadicalFragments(object),
     ...indicatorFragments,
     ...svgSketchEffectFragmentsForEffects(effects, object.id, {
       className: "native-molecule-sketch",
@@ -4230,13 +4235,17 @@ export function planTextObjectSvg(object: TextObject, layerIndex: number): PageS
     return planConditionsTextObjectSvg(object, layerIndex);
   }
   const { style: textStyle, textAnchor, x, y, lineAdvance } = planTextObjectPlacement(object);
-  const lines = textObjectSpanLines(object);
+  const layout = textObjectSpanLayout(object);
+  const lines = layout.map(line => line.spans);
+  const wrapped = isFixedWidthTextObject(object);
+  const metrics = wrapped ? nativeTextObjectLineMetrics(object) : undefined;
   // Preserve the established markup for wholly unscripted text. With scripts, reset each
   // line's baseline, then move relatively within it to keep one text-anchor chunk per line.
   const hasScripts = lines.some(line => line.some(span => span.script !== "normal"));
   const lineFragments = lines.length > 0
     ? lines.flatMap((line, lineIndex) => textSpanLineFragments(
-      line, lineIndex, x, lineAdvance, textStyle.fontSizePx, hasScripts ? y + lineIndex * lineAdvance : undefined
+      line, lineIndex, x, lineAdvance, textStyle.fontSizePx,
+      wrapped ? object.y + metrics!.lines[lineIndex]!.baseline : hasScripts ? y + lineIndex * lineAdvance : undefined
     ))
     : [elementFragment("tspan", `text-empty-${object.id}`, { x }, [])];
 
@@ -4308,37 +4317,36 @@ export function nativeTextSpanMetrics(span: TextSpan, objectStyle: TextObject['s
   const offset=Number((span.script==='subscript'?size*.22:span.script==='superscript'?-size*.4:0).toFixed(6));
   return {fontSize,offset,ascent:fontSize*.8-offset,descent:fontSize*.2+offset};
 }
-export function nativeTextObjectLineMetrics(object: Pick<TextObject,'text'|'spans'|'style'>): {
+export function nativeTextObjectLineMetrics(object: Pick<TextObject,'text'|'spans'|'style'> & Partial<Pick<TextObject,'width'|'arrowAttachment'>>): {
   lines:{spans:TextSpan[];baseline:number;ascent:number;descent:number}[];height:number
 } {
-  const style=nativeTextStyleFromObjectStyle(object.style),lines=textObjectSpanLines(object);
+  const style=nativeTextStyleFromObjectStyle(object.style),layout=textObjectSpanLayout(object);
   let previousBaseline=0,previousDescent=0;
-  const measured=lines.map((spans,index)=>{
+  const measured=layout.map(({spans,paragraphIndex},index)=>{
     const metrics=spans.map(span=>nativeTextSpanMetrics(span,object.style));
     const ascent=Math.max(style.fontSizePx*.8,...metrics.map(m=>m.ascent));
     const descent=Math.max(style.fontSizePx*.2,...metrics.map(m=>m.descent));
     const baseline=index===0?Math.max(style.fontSizePx,ascent+2):previousBaseline+
-      Math.max(style.fontSizePx*style.lineHeight,previousDescent+ascent+style.fontSizePx*.18)+style.paragraphSpacingPx;
+      Math.max(style.fontSizePx*style.lineHeight,previousDescent+ascent+style.fontSizePx*.18)+
+        (paragraphIndex!==layout[index-1]!.paragraphIndex?style.paragraphSpacingPx:0);
     previousBaseline=baseline;previousDescent=descent;
     return {spans,baseline,ascent,descent};
   });
   return {lines:measured,height:previousBaseline+previousDescent+2};
 }
 
-export function textObjectSpanLines(object: Pick<TextObject, "text" | "spans">): TextSpan[][] {
-  const spans = textObjectSpansForRendering(object);
-  return spans.reduce<TextSpan[][]>((lines, span) => {
-    const parts = span.text.split(/\r?\n/);
-    parts.forEach((part, index) => {
-      if (index > 0) {
-        lines.push([]);
-      }
-      if (part.length > 0) {
-        lines[lines.length - 1].push({ ...span, text: part });
-      }
-    });
-    return lines;
-  }, [[]]);
+type TextLayoutObject = Pick<TextObject, "text" | "spans"> & Partial<Pick<TextObject, "style" | "width" | "arrowAttachment">>;
+function isFixedWidthTextObject(object: TextLayoutObject): boolean {
+  return typeof object.width === "number" &&
+    (object.style?.textBoxSizingMode === "fixed-width" || object.style?.textBoxSizingMode === "fixed-size") &&
+    object.arrowAttachment?.kind !== "conditions" && !(object.text === "+" && object.style?.reactionPlus === true);
+}
+function textObjectSpanLayout(object: TextLayoutObject) {
+  return nativeTextSpanLayout(textObjectSpansForRendering(object), nativeTextStyleFromObjectStyle(object.style ?? {}),
+    isFixedWidthTextObject(object) ? Math.max(1, object.width! - 6) : undefined);
+}
+export function textObjectSpanLines(object: TextLayoutObject): TextSpan[][] {
+  return textObjectSpanLayout(object).map(line => line.spans);
 }
 
 export function textObjectSpansForRendering(object: Pick<TextObject, "text" | "spans">): TextSpan[] {
@@ -5214,6 +5222,18 @@ function electronMarkStrokeWidth(object: ElectronMarkObject): number {
 }
 
 function electronDotMarkFragment(object: ElectronMarkObject, layerIndex: number, scaled: boolean): PageSvgElementFragment {
+  return elementFragment("g", `object-${object.id}`, objectAttributes(object, layerIndex, {
+    "data-mark-kind": object.markKind,
+    transform: rotationTransform(object)
+  }), electronDotFragments(object, scaled));
+}
+
+/**
+ * The dots of a lone-pair or radical-dot mark, centered in its frame: the one glyph both a stored mark
+ * (`electronDotMarkFragment`) and a lone hydrogen atom's implied radical (`impliedRadicalFragments`)
+ * draw.
+ */
+function electronDotFragments(object: ElectronMarkObject, scaled: boolean): PageSvgElementFragment[] {
   const centerX = object.x + object.width / 2;
   const centerY = object.y + object.height / 2;
   const sizeScale = Math.min(object.width, object.height) / 18;
@@ -5222,18 +5242,47 @@ function electronDotMarkFragment(object: ElectronMarkObject, layerIndex: number,
   const dots = object.markKind === "lone-pair"
     ? [centerX - spacing, centerX + spacing]
     : [centerX];
-
-  return elementFragment("g", `object-${object.id}`, objectAttributes(object, layerIndex, {
-    "data-mark-kind": object.markKind,
-    transform: rotationTransform(object)
-  }), dots.map((dotX, index) =>
+  return dots.map((dotX, index) =>
     elementFragment("circle", `electron-dot-${object.id}-${index}`, {
       cx: dotX,
       cy: centerY,
       r: dotRadius,
       fill: "#111111"
     })
-  ));
+  );
+}
+
+/**
+ * The radical a lone hydrogen atom implies (chem-core's `atomImpliedRadicalCount`: a lone, neutral H,
+ * D or T is one atom with one unpaired electron, owner decision 2026-11-23), drawn with the default
+ * radical-dot mark's own glyph (`electronDotFragments`). It is derived from the atom and never
+ * stored, so it is drawn inside the molecule's own object, in the molecule's frame: it moves,
+ * rotates and is selected with the molecule, and bonding, charging or marking the atom removes it.
+ * The spot is the radical tool's (`electronMarkPlacementPointForAtom`), started at the atom and
+ * cleared from its label, so the dot sits just beyond the label's upper right.
+ */
+function impliedRadicalFragments(object: MoleculeObject): PageSvgElementFragment[] {
+  const bonded = new Set(object.bonds.flatMap((bond) => [bond.fromAtomId, bond.toAtomId]));
+  return object.atoms.flatMap((atom) => {
+    if (bonded.has(atom.id) || atomImpliedRadicalCount(atom, []) === 0) return [];
+    const unbounded = Number.POSITIVE_INFINITY;
+    const beside = electronMarkPlacementPointForAtom(object, atom.id, [], unbounded, unbounded, { growthPoint: { x: atom.x, y: atom.y } });
+    // A label that draws nothing leaves the atom's own point: take the tool's open-angle spot instead.
+    const center = beside && distance(beside, atom) > 1
+      ? beside
+      : electronMarkPlacementPointForAtom(object, atom.id, [], unbounded, unbounded);
+    if (!center) return [];
+    const mark: ElectronMarkObject = {
+      id: `${object.id}-implied-radical-${atom.id}`, type: "electron-mark", markKind: "radical-dot",
+      x: center.x - 9, y: center.y - 9, width: 18, height: 18, rotation: 0, style: {},
+      anchor: { kind: "atom", objectId: object.id, atomId: atom.id }
+    };
+    return [elementFragment("g", `implied-radical-${object.id}-${atom.id}`, {
+      class: "native-implied-radical",
+      "data-mark-kind": "radical-dot",
+      "data-implied-radical-atom-id": atom.id
+    }, electronDotFragments(mark, false))];
+  });
 }
 
 function graphicObjectFragment(
@@ -7107,6 +7156,7 @@ export function textContentFrame(object: TextObject): LayoutBounds {
   let left = object.x, right = object.x + object.width;
   let top = object.y, bottom = object.y + object.height;
   const advance = style.fontSizePx * style.lineHeight + style.paragraphSpacingPx;
+  const wrappedMetrics = isFixedWidthTextObject(object) ? nativeTextObjectLineMetrics(object) : undefined;
   lines.forEach((line, index) => {
     const width = measureNativeTextSpanLineWidth(line, style);
     const x = style.textAlign === "center" ? anchor - width / 2
@@ -7118,7 +7168,7 @@ export function textContentFrame(object: TextObject): LayoutBounds {
         ? metadataNumber(span.style.fontSizePx) ?? style.fontSizePx : style.fontSizePx * nativeTextScriptFontScale;
       const shift = span.script === "subscript" ? style.fontSizePx * nativeTextSubscriptOffsetEm
         : span.script === "superscript" ? -style.fontSizePx * nativeTextSuperscriptOffsetEm : 0;
-      const baseline = object.y + style.fontSizePx + index * advance + shift;
+      const baseline = object.y + (wrappedMetrics?.lines[index]?.baseline ?? style.fontSizePx + index * advance) + shift;
       top = Math.min(top, baseline - size);
       bottom = Math.max(bottom, baseline + size * nativeTextMetrics.descentEm);
     }
@@ -7194,11 +7244,13 @@ function rotateInkBounds(object: DocumentObject, box: LayoutBounds): LayoutBound
 function textInkBounds(object: TextObject): LayoutBounds | null {
   const conditions = object.arrowAttachment?.kind === "conditions" ? conditionsTextPlacement(object) : undefined;
   const { x, y, style, alignment, lineAdvance } = conditions ?? planTextObjectPlacement(object);
+  const wrappedMetrics = isFixedWidthTextObject(object) ? nativeTextObjectLineMetrics(object) : undefined;
   const boxes = textObjectSpanLines(object).flatMap((line, index) => {
     if (!line.some(span => span.text.trim())) return [];
     const width = measureNativeTextSpanLineWidth(line, style,
       conditions?.scripted ? span => nativeTextSpanMetrics(span, object.style).fontSize : undefined);
-    const baseline = conditions?.scripted ? object.y + conditions.layout.lines[index]!.baseline : y + index * lineAdvance;
+    const baseline = conditions?.scripted ? object.y + conditions.layout.lines[index]!.baseline
+      : wrappedMetrics ? object.y + wrappedMetrics.lines[index]!.baseline : y + index * lineAdvance;
     let top = Infinity, bottom = -Infinity;
     for (const span of line) {
       if (!span.text.trim()) continue;
@@ -7951,7 +8003,9 @@ export function atomDisplayLabelPlacement(
   // charge, because the deprotonation is real regardless of which object displays the sign.
   const labelCharge = atom.formalCharge - (atom.markCharge ?? 0);
   const element = nativeElementFromAtomLabel(atom.element);
-  if (!element) {
+  // A D or T atom is hydrogen to its count (`hydrogenCountElement`) and draws its own symbol.
+  const symbol = element ?? heavyHydrogenSymbol(atom.element);
+  if (!symbol) {
     const neighbors = heavyAtomNeighbors(atom.id, resolution);
     return nonElementAtomLabelPlacement(atom, neighbors, drawingStyle, recordedLabelBondSide(atom, neighbors.map((neighbor) => neighbor.id)))!;
   }
@@ -7960,11 +8014,18 @@ export function atomDisplayLabelPlacement(
   // hydrogen count ever. Everything else follows the classic skeletal convention: the
   // remaining valence (`atomImplicitHydrogenCount`, the one count the formula, the valence check
   // and the CDXML importer share) is drawn as implicit hydrogens unless the style hides them. A
-  // carbon bonded only datively has no count and draws none.
+  // carbon bonded only datively has no count and draws none. A count the atom states for itself
+  // (chem-core's `atomStatedHydrogenCount`, a kept CDXML NumHydrogens) is drawn in place of the
+  // derived one, as the formula, SMILES and the engine's molfile count it (owner ruling 1.2.3), so
+  // an O stated with 0 H reads "O", a lone H stated with 0 reads "H", and a carbon bonded only
+  // datively stated with 3 reads "CH3", exactly like the typed labels. A hydrogen atom carries no
+  // hydrogen of its own (`atomDerivedHydrogenCount`): a lone H, D or T is one atom, a radical (owner
+  // decision 2026-11-23), and reads "H", "D" or "T"; its radical is drawn as a radical dot.
   const incidentBonds = resolution.bondsByAtom.get(atom.id) ?? [];
+  const drawnHydrogens = atomDrawnHydrogenCount(atom, bonds, atoms, resolution);
   const implicitHydrogens = drawingStyle.atomLabelHideImplicitHydrogens || atom.labelLiteral === true
     ? ""
-    : implicitHydrogenLabel(atomImplicitHydrogenCount(atom, bonds, atoms, resolution) ?? 0);
+    : implicitHydrogenLabel(drawnHydrogens ?? 0);
 
   if (element === "C" && formalCharge === 0 && atom.isotope === undefined) {
     const terminalCarbon = atoms.length > 0 && heavyAtomNeighborCount(atom.id, resolution) === 1;
@@ -7972,10 +8033,16 @@ export function atomDisplayLabelPlacement(
     // contributes no valence, so testing valenceUsed here labeled the carbon at the end of
     // every dashed bond as CH4 instead of drawing a plain stick.
     const bonded = incidentBonds.length > 0;
+    // A carbon whose stated count disagrees with the derived one is drawn with its label, as a
+    // typed carbon is: a skeletal vertex cannot show that it carries fewer or more hydrogens. A
+    // carbon bonded only datively draws no count, so any count it states shows.
+    const statedHydrogens = atomStatedHydrogenCount(atom, bonds);
+    const statedCountShows = statedHydrogens !== undefined &&
+      statedHydrogens !== atomImplicitHydrogenCount(atom, bonds, atoms, resolution);
     const shouldShowCarbon =
       atom.labelVisible === true ||
       !bonded ||
-      (atom.labelVisible !== false && drawingStyle.atomLabelShowTerminalCarbons && terminalCarbon);
+      (atom.labelVisible !== false && (statedCountShows || (drawingStyle.atomLabelShowTerminalCarbons && terminalCarbon)));
     if (!shouldShowCarbon) {
       return undefined;
     }
@@ -7987,14 +8054,30 @@ export function atomDisplayLabelPlacement(
   const hydrogenBeforeElement =
     atom.isotope === undefined &&
     implicitHydrogens !== "" &&
-    element !== "H" &&
+    hydrogenCountElement(atom) !== "H" &&
     singleHeavyNeighbor !== undefined &&
     drawnLabelBondSide(atom, [singleHeavyNeighbor]) === "right";
   return {
     label: hydrogenBeforeElement
-      ? `${implicitHydrogens}${element}${chargeLabelSuffix(labelCharge)}`
-      : `${atom.isotope ?? ""}${element}${implicitHydrogens}${chargeLabelSuffix(labelCharge)}`
+      ? `${implicitHydrogens}${symbol}${chargeLabelSuffix(labelCharge)}`
+      : `${atom.isotope ?? ""}${symbol}${implicitHydrogens}${chargeLabelSuffix(labelCharge)}`
   };
+}
+
+/**
+ * The hydrogens an element atom's label draws when its style shows them, for a label that is not a
+ * typed literal: the count the atom states for itself (chem-core's `atomStatedHydrogenCount`, a kept
+ * CDXML NumHydrogens) where it has one, else the derived `atomImplicitHydrogenCount`. The formula,
+ * SMILES and the engine's molfile count the same hydrogens (owner ruling 1.2.3). Undefined where
+ * there is no single count. App code that needs "the hydrogens this atom shows" asks here.
+ */
+export function atomDrawnHydrogenCount(
+  atom: MoleculeAtom,
+  bonds: readonly CoreMoleculeBond[],
+  atoms: readonly MoleculeAtom[],
+  resolution: NativeBondOrderResolution = nativeBondOrderResolution(atoms, bonds)
+): number | undefined {
+  return atomStatedHydrogenCount(atom, bonds) ?? atomImplicitHydrogenCount(atom, bonds, atoms, resolution);
 }
 
 /**
@@ -8004,8 +8087,11 @@ export function atomDisplayLabelPlacement(
  * electron, and any dative deprotonation (`dativeDeprotonationCount`). Undefined where there is no
  * single count: a label that is not an element symbol, and a carbon bonded only datively, whose
  * label shows no H while the formula counts them. Display choices (a literal label, the
- * hidden-hydrogen style) are the planner's and do not change the count. The CDXML importer compares
- * a stated NumHydrogens against this same function, so the warning and the drawing cannot disagree.
+ * hidden-hydrogen style) are the planner's and do not change the count. This is always the DERIVED
+ * count (`atomDerivedHydrogenCount`, less that carbon), so the drawing and the badge cannot
+ * disagree. Where an atom states its own count (chem-core's `atomStatedHydrogenCount`), the label
+ * draws that count instead, as the formula, SMILES and the engine's molfile do. A D or T atom is
+ * counted as the hydrogen it is (`hydrogenCountElement`).
  */
 export function atomImplicitHydrogenCount(
   atom: MoleculeAtom,
@@ -8013,17 +8099,60 @@ export function atomImplicitHydrogenCount(
   atoms: readonly MoleculeAtom[],
   resolution: NativeBondOrderResolution = nativeBondOrderResolution(atoms, bonds)
 ): number | undefined {
-  const element = nativeElementFromAtomLabel(atom.element);
+  const element = hydrogenCountElement(atom);
   if (!element) return undefined;
   const incidentBonds = resolution.bondsByAtom.get(atom.id) ?? [];
   // A carbon whose only bonds are dative (a CO ligand's C drawn as a bare atom) cannot carry
   // four hydrogens as well: under the terminal-carbon style it reads "C", never "CH4".
   if (element === "C" && incidentBonds.length > 0 && incidentBonds.every(isDativeBond)) return undefined;
+  return atomDerivedHydrogenCount(atom, bonds, atoms, resolution);
+}
+
+/**
+ * The hydrogens an element atom's bonds, charge and radicals leave room for: valence for the FULL
+ * formal charge, less the bond orders (aromatic bonds at their Kekulé orders), each radical's unpaired
+ * electron, and any dative deprotonation. The count a stated NumHydrogens is compared with (the CDXML
+ * importer, the validator's badge and its fix). It is `atomImplicitHydrogenCount` everywhere except a
+ * carbon bonded only datively: its label draws no H, but the formula and the structure an engine
+ * reads count these (a dative bond costs its donor nothing), so this is the count that carbon has.
+ * Undefined only for a label that is not an element symbol (D and T count as hydrogen,
+ * `hydrogenCountElement`).
+ *
+ * A hydrogen atom (H, D or T) carries no hydrogens of its own, whatever its bonds: bonded, its one
+ * valence is spent (a dative bond too: V2000 writes it as a plain single bond, so RDKit reads the
+ * hydrogen as spent); charged (H+, H-) it has none; lone and neutral it is one hydrogen atom, a
+ * radical (owner decision 2026-11-23, chem-core's `atomImpliedRadicalCount`), which the molfile
+ * writes with the zero-valence sentinel so RDKit reads [H] with no hydrogen and one radical electron.
+ */
+export function atomDerivedHydrogenCount(
+  atom: MoleculeAtom,
+  bonds: readonly CoreMoleculeBond[],
+  atoms: readonly MoleculeAtom[],
+  resolution: NativeBondOrderResolution = nativeBondOrderResolution(atoms, bonds)
+): number | undefined {
+  const element = hydrogenCountElement(atom);
+  if (!element) return undefined;
+  if (element === "H") return 0;
   return Math.max(
     0,
     nativeAtomValenceForCharge(element, atom.formalCharge) - (resolution.bondOrderUsage.get(atom.id) ?? 0)
       - (atom.markRadicals ?? 0) - dativeDeprotonationCount(atom, bonds, atoms, resolution)
   );
+}
+
+/** "D" or "T": the CTfile symbol a deuterium or tritium atom is stored and drawn with. */
+function heavyHydrogenSymbol(label: string): "D" | "T" | undefined {
+  return label === "D" || label === "T" ? label : undefined;
+}
+
+/**
+ * The element whose valence an atom's hydrogen count is derived from: its element symbol, or H for a
+ * D or T atom. The molfile writes D and T as their CTfile symbols, and RDKit reads each as an
+ * isotope of hydrogen with hydrogen's valence, so a D or T counts exactly as an H does (no hydrogens
+ * of its own; a lone one is a radical). Undefined for a label that is not an element symbol.
+ */
+export function hydrogenCountElement(atom: Pick<MoleculeAtom, "element">): NativeElementSymbol | undefined {
+  return nativeElementFromAtomLabel(atom.element) ?? (heavyHydrogenSymbol(atom.element) ? "H" : undefined);
 }
 
 /**
@@ -9227,6 +9356,25 @@ export function doubleBondRendersSymmetric(
     (bond.display?.doubleBondSide === undefined || bond.display.doubleBondSide === "automatic") &&
     isDefaultCenteredDoubleBond(object, bond)
   ));
+}
+
+/** Where the canvas draws a double bond's second stroke, resolving Automatic exactly as
+ * `bondLineSegments` does: "left" is the bond's +normal side, as stored in
+ * `display.doubleBondSide`. Undefined for a bond that is not a drawable double bond. */
+export function renderedDoubleBondSide(
+  object: MoleculeObject,
+  bond: CoreMoleculeBond
+): "left" | "center" | "right" | undefined {
+  if (bond.order !== "double") return undefined;
+  const fromAtom = object.atoms.find(atom => atom.id === bond.fromAtomId);
+  const toAtom = object.atoms.find(atom => atom.id === bond.toAtomId);
+  if (!fromAtom || !toAtom) return undefined;
+  if (bond.stereo === "either") return "center";
+  const ringInteriorSide = ringInteriorBondSides(object).get(bond.id);
+  if (doubleBondRendersSymmetric(fromAtom, toAtom, object, bond, ringInteriorSide)) return "center";
+  const explicit = bond.display?.doubleBondSide === "automatic" ? undefined : bond.display?.doubleBondSide;
+  const side = explicit ?? ringInteriorSide ?? terminalHeteroatomDoubleBondInnerSide(fromAtom, toAtom, object, bond) ?? "left";
+  return side === "automatic" ? "left" : side;
 }
 
 export function isTerminalHeteroatomDoubleBond(

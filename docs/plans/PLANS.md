@@ -25,6 +25,39 @@ accounting for rulers and scrollbars, and guard queued work when documents chang
 validated small view state to palettes. Preserve document geometry/history and current clipboard,
 assistant, text/color and menu infrastructure. Native Windows and both macOS checks remain pending.
 
+## Native effect color picker (`resubmit/effect-color-picker`)
+
+Rebuild #180 on current main's art/text color and opening-session protocol. Route effect colors
+through the existing owned popover, preserve target-specific preview/commit/cancel and opening
+identity, and keep the inline web fallback. Cover target changes, ordinary paint and dismissal.
+Native Windows and both macOS builds, display scaling and monitor checks remain pending.
+
+## Fixed-width text wrapping (`resubmit/text-box-wrap`)
+
+Rebuild #216 with current font/script metrics, shared SVG live editing, conditions text and page-fit
+bounds. Wrap resized fixed-width/fixed-size ordinary text without rewriting its source. Share
+word wrapping and line metrics with sizing; distinguish paragraphs from soft wraps. Keep authored
+reaction conditions and auto text unchanged. Test drag/release/blur, Undo/Redo, formatted text,
+Unicode and Windows paragraphs. Native Windows and both macOS builds remain pending.
+
+## Curly pair usage hint (`resubmit/curly-bracket-pair`)
+
+Current main already implements curly/square/round pairs and editable repeat labels, superseding
+the implementation proposed in #185. Correct the remaining stale single-glyph hint on the curly
+tool and characterize click/drag pair placement. No duplicate tool or document/schema changes.
+
+## Nested inspector scrollbar drag (`resubmit/palette-scrollbar`)
+
+Resubmit #178 against current main. Palettes drag from their background again; only presses that
+may be scrollbar presses are excluded. A press whose target is a scroll owner showing a scrollbar
+(overflow auto/scroll/overlay on an axis where its content overflows, and the scrollbar not hidden
+by `scrollbar-width: none` or a zero-size `::-webkit-scrollbar`) stays with the webview, on both
+the drag and the Windows text-input-lease hand-back paths. That includes the owner's own blank
+area, since overlay scrollbars draw inside it; its descendants, scrollers whose content fits, and
+the hidden-scrollbar floating tool palette background still drag. Preserve native title dragging,
+disabled-control exclusion, click compensation and the mouse fallback. Test both platform routes; actual Windows/macOS
+scrollbar dragging and mixed-DPI native checks remain pending.
+
 # ChemDraft Assistant plugin (active, branches claude/assistant-*)
 
 ## Objective
