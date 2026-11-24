@@ -11,7 +11,7 @@ export type Interactive3dPhase = "attaching" | "ready" | "pulling" | "settling";
 
 const INTERACTIVE_3D_PHASE_LABELS: Readonly<Record<Interactive3dPhase, string>> = {
   attaching: "Starting Interactive 3D…",
-  ready: "Drag empty space to rotate · drag an atom to pull it · click outside to flatten",
+  ready: "Drag empty space to rotate · click outside to flatten",
   pulling: "Pulling the atom · release to let the structure settle",
   settling: "Settling the structure…"
 };
@@ -29,15 +29,4 @@ export function interactive3dSessionStatus(
   phase: Interactive3dPhase = "ready"
 ): string {
   return session.errors.at(-1) ?? INTERACTIVE_3D_PHASE_LABELS[phase];
-}
-
-/** The status row while the workspace is open: status, force-field readout, warnings, then Esc. */
-export function interactive3dStatusLine(parts: {
-  status: string;
-  energyLabel?: string;
-  warnings?: readonly string[];
-}): string {
-  return [parts.status, parts.energyLabel, ...new Set(parts.warnings ?? []), "Esc to close"]
-    .filter(Boolean)
-    .join(" · ");
 }

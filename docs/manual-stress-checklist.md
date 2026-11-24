@@ -1864,8 +1864,9 @@ Run under KDE Plasma (Wayland session, so the app uses XWayland) from a terminal
 
 - Paste `CCO` (ethanol), select it and open Interactive 3D from the Main toolbar's 3D button and
   again from Structure ▸ Interactive 3D Workspace…. The status line reads "Drag empty space to
-  rotate · drag an atom to pull it · click outside to flatten · Esc to close" (a force-field
-  readout may follow the instructions). It never shows a raw name such as `tug-ready`,
+  rotate · click outside to flatten · Drag an atom to change the shape. On release, it relaxes to
+  a realistic shape, so atoms may move back. · Esc to close" (a force-field readout may follow
+  the ready label). It never shows a raw name such as `tug-ready`,
   `attaching`, `beginDrag`, `updateDrag`, `endDrag` or "3 atoms · coord rev 2".
 - Drag in empty space inside the selection box, away from the atoms: the molecule
   rotates with the drag and stays rotated after release; drag again to keep rotating. stderr shows

@@ -12,7 +12,7 @@ import {
   readEngine3dSidecarStatus,
   updateEngine3dWorkspaceDrag
 } from "./engine3dSidecar";
-import { interactive3dPhaseLabel, interactive3dSessionStatus, interactive3dStatusLine } from "./interactive3dStatus";
+import { interactive3dPhaseLabel, interactive3dSessionStatus } from "./interactive3dStatus";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -102,10 +102,7 @@ describe("Interactive 3D status line", () => {
     const requests = fakeSidecar();
     let session = await openEthanol();
     expect(interactive3dSessionStatus(session)).toBe(ready);
-    expect(interactive3dStatusLine({ status: interactive3dSessionStatus(session), warnings: session.warnings }))
-      .toBe(`${ready} · Esc to close`);
     expect(ready).toContain("Drag empty space to rotate");
-    expect(ready).toContain("drag an atom to pull it");
     expect(ready).toContain("click outside to flatten");
 
     session = await beginEngine3dWorkspaceDrag(session, "o3");
@@ -117,9 +114,9 @@ describe("Interactive 3D status line", () => {
 
     // What the status line used to show after a release; it now goes only to the diagnostic log.
     expect(describeEngine3dWorkspaceSession(session)).toBe("3 atoms · coord rev 3 · settle");
-    const line = interactive3dStatusLine({ status: interactive3dSessionStatus(session), warnings: session.warnings });
-    expect(line).toBe(`${ready} · Esc to close`);
-    expect(line).not.toMatch(rawStatus);
+    const status = interactive3dSessionStatus(session);
+    expect(status).toBe(ready);
+    expect(status).not.toMatch(rawStatus);
   });
 
   it("shows the sidecar's error instead of the instructions", async () => {
@@ -128,12 +125,6 @@ describe("Interactive 3D status line", () => {
     session = await beginEngine3dWorkspaceDrag(session, "o3");
     session = await updateEngine3dWorkspaceDrag(session, "o3", { x: 1.6, y: 0.3, z: 0.4 });
     expect(interactive3dSessionStatus(session, "pulling")).toBe("Unknown dragged atom id.");
-  });
-
-  it("joins the force-field readout and each warning once, then Esc", () => {
-    expect(interactive3dStatusLine({
-      status: ready, energyLabel: "UFF converged · -1.20 kJ/mol", warnings: ["Hydrogens are implicit.", "Hydrogens are implicit."]
-    })).toBe(`${ready} · UFF converged · -1.20 kJ/mol · Hydrogens are implicit. · Esc to close`);
   });
 });
 
