@@ -209,6 +209,18 @@ describe("MainWindow double-bond position cycle", () => {
       }
       expect(new Set(drawn.slice(1))).toEqual(new Set(["left", "center", "right"]));
       expect(snapshot().hoveredNativeTarget).toMatchObject({ kind: "bond", bondId: doubleBond().id });
+
+      // A keyboard undo re-hits the hover too: it must not keep drawing the undone side.
+      await press2();
+      const undone = renderedSide();
+      await act(async () => {
+        document.body.dispatchEvent(new KeyboardEvent("keydown", {
+          key: "z", code: "KeyZ", metaKey: platform === "macos", ctrlKey: platform === "windows", bubbles: true, cancelable: true
+        }));
+      });
+      expect(status()).toBe(`Undid Double-bond position: ${undone}`);
+      expect(doubleBond().display?.doubleBondSide).toBe(drawn.at(-1));
+      expect(renderedSide()).not.toBe(undone);
     }, 20_000);
 
     it(`keeps a ring double bond's user side outside the ring through Clean Up (${platform})`, async () => {

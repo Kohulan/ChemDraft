@@ -16934,10 +16934,12 @@ export function MainWindow({
       const preview = object?.type === "molecule"
         ? nativeDoubleBondSidePreviewFromHit(target.objectId, object, target, point, hitToleranceForScale(viewportRef.current.scale))
         : undefined;
-      // The re-hit after a hover-2 cycle keeps showing the side it just committed.
+      // The re-hit after a hover-2 cycle keeps showing the side it just committed (until an undo).
       const cycled = cycledDoubleBondSidePreviewRef.current;
-      setNativeDoubleBondSidePreview(preview && cycled?.objectId === preview.objectId && cycled.bondId === preview.bondId
-        ? cycled : preview);
+      const stillCycled = preview && object?.type === "molecule" && cycled?.objectId === preview.objectId &&
+        cycled.bondId === preview.bondId &&
+        object.bonds.find(bond => bond.id === cycled.bondId)?.display?.doubleBondSide === cycled.side;
+      setNativeDoubleBondSidePreview(stillCycled ? cycled : preview);
     } else {
       setNativeDoubleBondSidePreview(undefined);
     }
