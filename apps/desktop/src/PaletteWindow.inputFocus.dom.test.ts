@@ -565,6 +565,32 @@ describe.each(["macos", "windows"] as const)("palette input focus (%s)", (platfo
     expect(leases()[0]![1]).toMatchObject({ editing: false, returnFocus: platform === "macos" });
   });
 
+  it("ends a lease on a nested scrollbar press without dragging, handing the keyboard back by release", async () => {
+    // jsdom computes overflow only from loaded rules; the drag handler reads scroll ownership from them.
+    const styles = document.createElement("style");
+    styles.textContent = readFileSync(resolve("apps/desktop/src/App.css"), "utf8");
+    document.head.append(styles);
+    try {
+      const input = await mountSettings();
+      await clickControl(input);
+      // A native scrollbar press targets its scroll owner, here the Object Settings panel body.
+      const scroller = container.querySelector<HTMLElement>(".molecule-inspector-panel-body")!;
+      expect(scroller.contains(input)).toBe(true);
+      await act(async () => pointer(scroller, "pointerdown"));
+      await flush();
+      expect(leases().map(([, args]) => args.editing)).toEqual([true, false]);
+      expect(document.activeElement).not.toBe(input);
+      expect(startPaletteWindowDrag).not.toHaveBeenCalled();
+      await act(async () => pointer(scroller, "pointerup"));
+      await flush();
+      // No drag means no WM_EXITSIZEMOVE: by release, both platforms have handed the keyboard back.
+      expect(leases().at(-1)![1]).toMatchObject({ editing: false, returnFocus: true });
+      expect(startPaletteWindowDrag).not.toHaveBeenCalled();
+    } finally {
+      styles.remove();
+    }
+  });
+
   it("uses the document capture guard during a pending palette click, allowing Save and keyup", async () => {
     let notify!: (event: PaletteClickPendingEvent) => void;
     const stop = installMainWindowPalettePendingKeys(async (listener) => {

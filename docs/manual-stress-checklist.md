@@ -1,9 +1,5 @@
 # Manual stress checklist
 
-Nested palette scrollbars: in Object Settings, drag the vertical thumb and track; contents must
-scroll without moving the palette. Repeat with pointer and mouse input on Windows/WebView2 and
-both macOS builds, at mixed display scales. Confirm the title and content grip still move the window.
-
 The standing hands-on checklist for interactive surfaces. It moved here from `AGENTS.md` §20 when that
 file was consolidated (2026-10-04); `AGENTS.md` §14 still requires it. Run every item on **macOS and
 Windows** unless the item names one platform. `docs/windows-port-stress-test.md` records the Windows
@@ -162,6 +158,13 @@ then immediately press M. The document receives it and the toolbar stays where d
 a press with no movement and a drag while a keyboard lease is held: dragging ends any lease,
 and the document has the keyboard afterwards. Switching apps during the gesture must not steal
 focus. On macOS verify dragging still leaves the document key.
+Nested palette scrollbars: in Object Settings, drag the panel's vertical thumb and press its track,
+then on a tall palette that scrolls as a whole on a short display; contents scroll without moving the
+palette. Repeat with pointer and mouse input on Windows/WebView2 and both macOS builds (System
+Settings scroll bars both automatic/overlay and always shown), at mixed display scales. The title,
+content grip and palette background outside a scrollbar still move the window. With Target bond
+length holding the keyboard, press the panel's scrollbar: the lease ends without a drag, and after
+release M reaches the document.
 Drag the palette background (including a press without movement), close it on pointerdown, switch
 apps, and click the canvas or another window: no guard may remain. With a loading/unresponsive
 palette page, editing hotkeys must recover after about one second. Rapidly click a button then a

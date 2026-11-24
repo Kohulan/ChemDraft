@@ -10,6 +10,7 @@ import { PluginPanelWindow } from "../plugins/PluginPanelWindow";
 import { pluginPanelWindowId } from "../plugins/panelBridge";
 import { createDesktopToolsetRegistry } from "../toolsets";
 import { fitCurrentPaletteWindow } from "./index";
+import { isScrollOwnerPress } from "./scrollOwnerPress";
 
 const native = vi.hoisted(() => ({
   invoke: vi.fn(async (_command: string, _args?: Record<string, unknown>, _options?: unknown): Promise<unknown> => undefined),
@@ -29,6 +30,7 @@ vi.mock("@tauri-apps/api/window", () => ({
 describe.each(["macos", "windows"] as const)("native title dragging (%s)", platform => {
   let container: HTMLDivElement;
   let root: Root;
+  let appCss: HTMLStyleElement | undefined;
 
   beforeEach(() => {
     native.invoke.mockReset();
@@ -43,6 +45,8 @@ describe.each(["macos", "windows"] as const)("native title dragging (%s)", platf
   afterEach(() => {
     act(() => root.unmount());
     container.remove();
+    appCss?.remove();
+    appCss = undefined;
     clearMocks();
     delete (window as typeof window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
     vi.restoreAllMocks();
@@ -151,9 +155,22 @@ describe.each(["macos", "windows"] as const)("native title dragging (%s)", platf
     expect(native.invoke.mock.calls.some(([command]) => command === "resize_toolset_window")).toBe(false);
   });
 
-  it.each([true, false])("leaves nested Object Settings scrollbar presses to the webview (pointer: %s)", async pointer => {
+  function loadAppCss(): void {
+    // jsdom computes overflow only from loaded rules, and scroll ownership is read from the cascade.
+    appCss = document.createElement("style");
+    appCss.textContent = readFileSync("apps/desktop/src/App.css", "utf8");
+    document.head.append(appCss);
+  }
+
+  // A native scrollbar press targets its scroll owner: the palette's content scroller or a nested
+  // Object Settings panel body.
+  const scrollOwners = [".molecule-inspector-panel-body", ".palette-window-content"] as const;
+
+  it.each(scrollOwners.flatMap(selector => [true, false].map(pointer => [selector, pointer] as const)))(
+    "leaves %s scrollbar presses to the webview (pointer: %s)", async (selector, pointer) => {
+    loadAppCss();
     await mount("palette", false, { toolsetId: "core.drawnStructureSettings" });
-    const scroller = container.querySelector<HTMLElement>(".molecule-inspector-panel-body")!;
+    const scroller = container.querySelector<HTMLElement>(selector)!;
     expect(scroller).not.toBeNull();
     const down = pointerEvent("pointerdown", 7);
     const mouseDown = new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 });
@@ -163,6 +180,24 @@ describe.each(["macos", "windows"] as const)("native title dragging (%s)", platf
     expect(container.querySelector<HTMLElement>("main")!.setPointerCapture).not.toHaveBeenCalled();
     expect(native.invoke.mock.calls.filter(([command]) => command === "start_window_drag")).toEqual([]);
     await press(container.querySelector<HTMLElement>(".palette-title-label")!);
+    expectOneCompensatedDrag();
+  });
+
+  // The palette background stays a drag surface: the input-focus lease classifies these presses as
+  // drags (isPaletteWindowDragPress) and, on Windows, leaves the keyboard hand-back to the drag's end.
+  const backgrounds = [".palette-window-shell", ".molecule-inspector-target-row"] as const;
+
+  it.each(backgrounds.flatMap(selector => [true, false].map(pointer => [selector, pointer] as const)))(
+    "still drags from the %s background inside Object Settings (pointer: %s)", async (selector, pointer) => {
+    loadAppCss();
+    await mount("palette", false, { toolsetId: "core.drawnStructureSettings" });
+    const background = container.querySelector<HTMLElement>(selector)!;
+    expect(background).not.toBeNull();
+    // Inside the nested scroller, but not a scroll owner itself.
+    if (selector !== ".palette-window-shell") {
+      expect(background.closest(".molecule-inspector-panel-body")).not.toBeNull();
+    }
+    await press(background, pointer);
     expectOneCompensatedDrag();
   });
 
@@ -335,5 +370,37 @@ describe.each(["macos", "windows"] as const)("native title dragging (%s)", platf
     await press(container.querySelector<HTMLElement>(".palette-close-button")!);
     expect(native.invoke.mock.calls.filter(([command]) => command === "start_window_drag")).toEqual([]);
     expect(native.drag).not.toHaveBeenCalled();
+  });
+});
+
+describe("scroll owner presses", () => {
+  it.each([
+    ["overflow: auto", true],
+    ["overflow: scroll", true],
+    ["overflow-y: auto", true],
+    ["overflow-x: scroll; overflow-y: hidden", true],
+    ["overflow-y: scroll; overflow-x: hidden", true],
+    ["overflow: hidden", false],
+    ["overflow: clip", false],
+    ["overflow: visible", false],
+    ["", false]
+  ] as const)("classifies a press on an element with %j as scroll owner: %s", (style, owner) => {
+    const element = document.createElement("div");
+    element.setAttribute("style", style);
+    document.body.append(element);
+    try {
+      expect(isScrollOwnerPress(element)).toBe(owner);
+      // A scrollbar press never targets a child; the owner's descendants are background.
+      const child = element.appendChild(document.createElement("span"));
+      expect(isScrollOwnerPress(child)).toBe(false);
+    } finally {
+      element.remove();
+    }
+  });
+
+  it("ignores non-element targets", () => {
+    expect(isScrollOwnerPress(null)).toBe(false);
+    expect(isScrollOwnerPress(window)).toBe(false);
+    expect(isScrollOwnerPress(document.createTextNode("x"))).toBe(false);
   });
 });
