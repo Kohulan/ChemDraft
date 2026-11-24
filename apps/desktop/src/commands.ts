@@ -326,7 +326,7 @@ export const editActions: CommandSpec[] = [
     source: "core",
     shortcut: "2",
     category: "edit",
-    description: "Set the hovered native bond to a double bond"
+    description: "Set the hovered native bond to a double bond; on a double bond, step its second line left, center, right"
   },
   {
     id: "bond.setHoveredBondOrder.triple",

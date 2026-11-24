@@ -9157,6 +9157,25 @@ export function doubleBondRendersSymmetric(
   ));
 }
 
+/** Where the canvas draws a double bond's second stroke, resolving Automatic exactly as
+ * `bondLineSegments` does: "left" is the bond's +normal side, as stored in
+ * `display.doubleBondSide`. Undefined for a bond that is not a drawable double bond. */
+export function renderedDoubleBondSide(
+  object: MoleculeObject,
+  bond: CoreMoleculeBond
+): "left" | "center" | "right" | undefined {
+  if (bond.order !== "double") return undefined;
+  const fromAtom = object.atoms.find(atom => atom.id === bond.fromAtomId);
+  const toAtom = object.atoms.find(atom => atom.id === bond.toAtomId);
+  if (!fromAtom || !toAtom) return undefined;
+  if (bond.stereo === "either") return "center";
+  const ringInteriorSide = ringInteriorBondSides(object).get(bond.id);
+  if (doubleBondRendersSymmetric(fromAtom, toAtom, object, bond, ringInteriorSide)) return "center";
+  const explicit = bond.display?.doubleBondSide === "automatic" ? undefined : bond.display?.doubleBondSide;
+  const side = explicit ?? ringInteriorSide ?? terminalHeteroatomDoubleBondInnerSide(fromAtom, toAtom, object, bond) ?? "left";
+  return side === "automatic" ? "left" : side;
+}
+
 export function isTerminalHeteroatomDoubleBond(
   fromAtom: MoleculeAtom,
   toAtom: MoleculeAtom,
