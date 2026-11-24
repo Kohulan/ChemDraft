@@ -1,5 +1,9 @@
 # Manual stress checklist
 
+Nested palette scrollbars: in Object Settings, drag the vertical thumb and track; contents must
+scroll without moving the palette. Repeat with pointer and mouse input on Windows/WebView2 and
+both macOS builds, at mixed display scales. Confirm the title and content grip still move the window.
+
 The standing hands-on checklist for interactive surfaces. It moved here from `AGENTS.md` §20 when that
 file was consolidated (2026-10-04); `AGENTS.md` §14 still requires it. Run every item on **macOS and
 Windows** unless the item names one platform. `docs/windows-port-stress-test.md` records the Windows
