@@ -8,6 +8,13 @@ in progress rather than a changelog.
 
 # In flight
 
+## Native effect color picker (`resubmit/effect-color-picker`)
+
+Rebuild #180 on current main's art/text color and opening-session protocol. Route effect colors
+through the existing owned popover, preserve target-specific preview/commit/cancel and opening
+identity, and keep the inline web fallback. Cover target changes, ordinary paint and dismissal.
+Native Windows and both macOS builds, display scaling and monitor checks remain pending.
+
 # ChemDraft Assistant plugin (active, branches claude/assistant-*)
 
 ## Objective

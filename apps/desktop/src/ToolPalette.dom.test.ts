@@ -654,6 +654,17 @@ describe("ToolPalette art color popover", () => {
     expect(container.querySelector(".art-color-popover")).toBeNull();
   });
 
+  it("routes effect colors into the native popover instead of clipping them inline", () => {
+    const onRequestColorPopover = vi.fn();
+    renderPalette({ onRequestColorPopover, currentArtStyle: effectArtInspectorModel() });
+    const trigger = container.querySelector<HTMLButtonElement>("[data-art-effect-color-trigger]")!;
+    expect(trigger).not.toBeNull();
+    act(() => trigger.click());
+    expect(onRequestColorPopover).toHaveBeenCalledExactlyOnceWith(
+      { left: 0, top: 0, right: 0, bottom: 0 }, "artColor", trigger.dataset.artEffectColorTrigger);
+    expect(container.querySelector(".art-effect-color-popover")).toBeNull();
+  });
+
   it.each(["fill", "stroke"] as const)("toggles the inline %s picker with a full pointer and click sequence", target => {
     renderPalette({ currentArtStyle: { ...artInspectorModelFor("tool.art.rect"), activePaintTarget: target } });
     const click = () => act(() => {
