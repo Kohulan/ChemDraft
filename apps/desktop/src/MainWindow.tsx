@@ -3,6 +3,7 @@ import { interactive3dWorkspaceStatusText, Interactive3dWorkspaceStatus } from "
 import { CanvasContextMenu, NATIVE_CANVAS_MENU_CLOSED_EVENT } from "./CanvasContextMenu";
 import { PLUGIN_CHANGE_REFUSED, RECOGNITION_REFUSED, chemistryRefusalOf, refusalSentence } from "./plugins/requestWrites/chemistryRefusal";
 import { buildObjectCanvasMenu, pageCanvasMenu, SET_DEFAULT_ARROW_STYLE_COMMAND_ID } from "./canvasContextMenuModel";
+import { loadStereoEngine, stereoReadoutRequest } from "./stereoReadout";
 import { RequestWriteError } from "@chemdraft/plugin-host";
 import { createRequestHistory } from "./plugins/requestWrites/requestHistory";
 import { electronMarkInteractionFrames } from "./electronMarkInteraction";
@@ -1658,9 +1659,16 @@ type ObjectContextMenuState = {
   bondDepthContext?: BondDepthContext;
   /** Present when the right-clicked scope carries (or has dismissed) valence warnings. */
   atomWarning?: { scope: readonly NativeWarningSuppressionScope[]; suppressed: boolean; count: number; problemCommandId?: string };
+  /** The single atom or bond the menu was opened on, for the read-only R/S or E/Z row. */
+  stereoPart?: ObjectContextMenuStereoPart;
   x: number;
   y: number;
 };
+type ObjectContextMenuStereoPart = Extract<NativeMoleculeSelectionPart, { kind: "atom" | "bond" }>;
+/** The part a stereo readout can describe: exactly one atom or one bond, nothing broader. */
+function objectContextMenuStereoPart(part: NativeMoleculeSelectionPart | undefined): ObjectContextMenuStereoPart | undefined {
+  return part?.kind === "atom" || part?.kind === "bond" ? part : undefined;
+}
 type BondDepthMenuCrossing = Pick<ResolvedBondCrossing, "key" | "bonds" | "front" | "back" | "hasOverride">;
 export type BondDepthCommandId = "bondDepth.bringInFront" | "bondDepth.sendBehind" | "bondDepth.useDefault";
 export interface BondDepthContext {
@@ -5844,6 +5852,11 @@ export function MainWindow({
       .catch(() => {
         /* best-effort: rotate commits fall back to legacy geometry-only flatten */
       });
+    // Warm the canvas menu's stereo readout too: the native popup (macOS and Windows) waits only
+    // NATIVE_STEREO_READOUT_BUDGET_MS for its R/S or E/Z row before opening without it.
+    void loadStereoEngine().catch(() => {
+      /* best-effort: the menu retries the load and omits the row meanwhile */
+    });
     return () => {
       cancelled = true;
     };
@@ -22254,6 +22267,10 @@ export function MainWindow({
       targetKind,
       bondDepthContext: bondDepthContextFromNativeSelection(nextSelectedNativePart, pageSvgRenderPlan.crossings, currentDocument),
       ...(atomWarning ? { atomWarning } : {}),
+      // The readout describes what was right-clicked, not the (possibly broader or different)
+      // preserved selection: a selected bond or whole fragment must not hijack an atom's R/S.
+      stereoPart: object?.type === "molecule" && nativeMoleculeHit
+        ? objectContextMenuStereoPart(nativeSelectionFromHit(objectId, nativeMoleculeHit)) : undefined,
       x: event.clientX,
       y: event.clientY
     });
@@ -23384,7 +23401,11 @@ export function MainWindow({
       });
       lastCanvasPointerClientPointRef.current = anchor;
       setPageContextMenu(undefined);
-      setObjectContextMenu({ objectId: object.id, targetKind: part && selection.length === 0 ? "parts" : "object", ...anchor });
+      // A clicked atom or bond is the selected part even while its molecule is the selected object.
+      const stereoPart = selection.length <= 1 && selectedNativeMoleculePartsRef.current.length === 1 &&
+        part?.objectId === object.id ? objectContextMenuStereoPart(part) : undefined;
+      setObjectContextMenu({ objectId: object.id, targetKind: part && selection.length === 0 ? "parts" : "object",
+        stereoPart, ...anchor });
       return;
     }
     page.dispatchEvent(new MouseEvent("contextmenu", {
@@ -24440,6 +24461,10 @@ export function MainWindow({
           targetKind={objectContextMenu.targetKind}
           bondDepthContext={objectContextMenu.bondDepthContext}
           atomWarning={objectContextMenu.atomWarning}
+          loadStereoReadout={(() => {
+            const menuObject = findDocumentObject(document, objectContextMenu.objectId);
+            return menuObject?.type === "molecule" ? stereoReadoutRequest(menuObject, objectContextMenu.stereoPart) : undefined;
+          })()}
           arrowStyleSource={(() => {
             const menuObject = findDocumentObject(document, objectContextMenu.objectId);
             return menuObject ? nativeArrowStyleDefaultFromGraphic(menuObject) : undefined;
@@ -27623,6 +27648,8 @@ export function ObjectLayerContextMenu(props: {
   bondDepthContext?: ObjectContextMenuState["bondDepthContext"];
   atomWarning?: ObjectContextMenuState["atomWarning"];
   arrowStyleSource?: { title: string };
+  /** Read-only R/S or E/Z row for the right-clicked atom or bond (see `stereoReadoutRequest`). */
+  loadStereoReadout?: () => Promise<string | undefined>;
   position: ClientPoint;
   onInvoke(commandId: string): void;
   onFocusReturn?(): void;

@@ -8,6 +8,16 @@ import { createNativeSingleBondMolecule, createPhase4Document, selectDocumentObj
 import { saveCompoundLayoutSettings } from "./compoundLayoutSettings";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 import { DOM_COMMAND_EVENT } from "./window-manager";
+import { CanvasContextMenu } from "./CanvasContextMenu";
+import { buildObjectCanvasMenu } from "./canvasContextMenuModel";
+
+// Transparent unless a test installs a handler, so the MainWindow tests keep the real module.
+const tauri = vi.hoisted(() => ({ handler: undefined as undefined | ((command: string, args: unknown) => unknown) }));
+vi.mock("@tauri-apps/api/core", async importOriginal => {
+  const actual = await importOriginal<typeof import("@tauri-apps/api/core")>();
+  return { ...actual, invoke: (command: string, args?: never, options?: never) =>
+    tauri.handler ? Promise.resolve(tauri.handler(command, args)) : actual.invoke(command, args, options) };
+});
 
 vi.mock("./rdkitWasmLoader", () => ({ registerRdkitWasmLoader: vi.fn() }));
 vi.mock("@scena/react-ruler", () => ({ default: () => <canvas /> }));
@@ -154,5 +164,65 @@ describe("MainWindow canvas context menu keyboard", () => {
     await act(async () => window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "edit.deleteHoveredNativeTarget" } })));
     expect(container.querySelector('[aria-label="Object layer options"]')).toBeNull();
     expect(document.activeElement).toBe(canvas);
+  });
+});
+
+describe("stereo readout row", () => {
+  const items = buildObjectCanvasMenu({ objectIndex: 0, objectCount: 1, targetKind: "atom" });
+  const deferred = () => {
+    let resolve!: (label: string | undefined) => void;
+    const promise = new Promise<string | undefined>(done => { resolve = done; });
+    return { promise, resolve };
+  };
+  afterEach(() => { tauri.handler = undefined; });
+
+  it("inline menu opens at once, then fills the read-only row without moving focus", async () => {
+    const readout = deferred();
+    const onInvoke = vi.fn();
+    await act(async () => root.render(<CanvasContextMenu items={items} position={{ x: 10, y: 10 }} label="Object layer options"
+      targetKind="atom" onInvoke={onInvoke} onDismiss={() => {}} loadStereoReadout={() => readout.promise} />));
+    const menu = container.querySelector('[aria-label="Object layer options"]')!;
+    expect(menu).not.toBeNull();
+    expect(menu.querySelector(".object-context-menu-title")?.textContent).not.toBe("Stereocentre: R");
+    expect(document.activeElement?.getAttribute("data-command-id")).toBe("clipboard.cut");
+    await key("ArrowDown");
+    expect(document.activeElement?.getAttribute("data-command-id")).toBe("clipboard.copy");
+    await act(async () => readout.resolve("Stereocentre: R"));
+    const first = menu.firstElementChild!;
+    expect(first.className).toBe("object-context-menu-title");
+    expect(first.textContent).toBe("Stereocentre: R");
+    expect(first.tagName).toBe("DIV");
+    expect(first.nextElementSibling?.getAttribute("role")).toBe("separator");
+    expect(document.activeElement?.getAttribute("data-command-id")).toBe("clipboard.copy");
+    await act(async () => (first as HTMLElement).click());
+    expect(onInvoke).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, "unavailable"])("inline menu omits the row when the readout is %s", async outcome => {
+    await act(async () => root.render(<CanvasContextMenu items={items} position={{ x: 10, y: 10 }} label="Object layer options"
+      targetKind="atom" onInvoke={() => {}} onDismiss={() => {}}
+      loadStereoReadout={() => outcome ? Promise.reject(new Error(outcome)) : Promise.resolve(undefined)} />));
+    const menu = container.querySelector('[aria-label="Object layer options"]')!;
+    expect(menu.firstElementChild?.getAttribute("data-command-id")).toBe("clipboard.cut");
+  });
+
+  it("native menu (macOS and Windows share one command) carries the row first", async () => {
+    vi.stubGlobal("__TAURI_INTERNALS__", {});
+    const calls: Array<{ command: string; args: { items: Array<{ label?: string; enabled?: boolean }> } }> = [];
+    // Only the popup is under test; a MainWindow from an earlier test may still be issuing its own invokes.
+    tauri.handler = (command, args) => {
+      if (command === "popup_canvas_context_menu") calls.push({ command, args: args as never });
+      return null;
+    };
+    const onDismiss = vi.fn();
+    await act(async () => root.render(<CanvasContextMenu items={items} position={{ x: 10, y: 10 }} label="Object layer options"
+      targetKind="bond" onInvoke={() => {}} onDismiss={onDismiss} loadStereoReadout={async () => "Double bond: E"} />));
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.command).toBe("popup_canvas_context_menu");
+    expect(calls[0]!.args.items[0]).toMatchObject({ label: "Double bond: E", enabled: false });
+    expect(calls[0]!.args.items[2]).toMatchObject({ label: "Cut" });
+    expect(container.querySelector('[aria-label="Object layer options"]')).toBeNull();
+    expect(onDismiss).toHaveBeenCalledOnce();
   });
 });

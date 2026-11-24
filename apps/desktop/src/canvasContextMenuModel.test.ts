@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { buildObjectCanvasMenu, pageCanvasMenu, toNativeCanvasMenu, type CanvasMenuItem } from "./canvasContextMenuModel";
+import { buildObjectCanvasMenu, pageCanvasMenu, toNativeCanvasMenu, withStereoReadout, type CanvasMenuItem } from "./canvasContextMenuModel";
 import type { CommandSpec } from "./commands";
 
 const action = (id: string, title: string, extra: Partial<CommandSpec> = {}): CommandSpec =>
@@ -37,6 +37,24 @@ describe("canvas context-menu presentation model", () => {
     expect(labels).toEqual(["Cut", "Copy", "Paste", "Atom problem…", "Restore Warnings", "Arrow style",
       "Set as Default Arrow Style", "Bond depth", "Bring Selected Bonds In Front", "Send Selected Bonds Behind",
       "Use Default Bond Depth", "Layer 1 of 3", "Move Object Forward", "Move Object to Front", "Move Object Backward", "Move Object to Back"]);
+  });
+
+  it.each(["Stereocentre: S", "Double bond: Z"])("puts the read-only %s readout at the top of the atom/bond menu", label => {
+    const items = buildObjectCanvasMenu({ objectIndex: 0, objectCount: 1, targetKind: "atom", stereoReadout: label });
+    expect(items.slice(0, 3)).toEqual([{ kind: "title", label }, { kind: "separator" },
+      { kind: "command", commandId: "clipboard.cut", label: "Cut", enabled: true, disabledReason: undefined, checked: undefined }]);
+    const native = toNativeCanvasMenu(items, "stereo");
+    expect(native.items[0]).toEqual({ kind: "item", id: "canvas-context:stereo:0", label, enabled: false });
+    const invoke = vi.fn();
+    expect(native.select("canvas-context:stereo:0", invoke)).toBe(false);
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("adds no readout row without an engine descriptor", () => {
+    const plain = buildObjectCanvasMenu({ objectIndex: 0, objectCount: 1, targetKind: "atom" });
+    expect(plain[0]).toMatchObject({ kind: "command", label: "Cut" });
+    expect(buildObjectCanvasMenu({ objectIndex: 0, objectCount: 1, targetKind: "atom", stereoReadout: "" })).toEqual(plain);
+    expect(withStereoReadout(plain, undefined)).toBe(plain);
   });
 
   it("routes one selected popup ID to the same command exactly once", () => {
