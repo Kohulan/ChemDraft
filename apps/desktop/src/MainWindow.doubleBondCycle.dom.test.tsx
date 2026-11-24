@@ -223,6 +223,27 @@ describe("MainWindow double-bond position cycle", () => {
       expect(renderedSide()).not.toBe(undone);
     }, 20_000);
 
+    it(`with the Bond tool, undo then redo without a pointer move redraws the pointer-derived hover preview (${platform})`, async () => {
+      await render(butene(), platform, "tool.bond");
+      const original = doubleBond().display?.doubleBondSide;
+      await hoverDoubleBond();
+      const hoverPreview = renderedSide();
+      await press2();
+      const committed = doubleBond().display?.doubleBondSide;
+      expect(committed).not.toBe(original);
+      expect(renderedSide()).toBe(committed);
+
+      await command("edit.undo");
+      expect(doubleBond().display?.doubleBondSide).toBe(original);
+      // Redo without moving the pointer: the retained post-cycle preview must not revive, so the
+      // Bond tool draws its ordinary pointer-derived hover preview, exactly as at the first hover.
+      await command("edit.redo");
+      expect(status()).toBe(`Redid Double-bond position: ${committed}`);
+      expect(doubleBond().display?.doubleBondSide).toBe(committed);
+      expect(renderedSide()).toBe(hoverPreview);
+      expect(renderedSide()).not.toBe(committed);
+    }, 20_000);
+
     it(`keeps a ring double bond's user side outside the ring through Clean Up (${platform})`, async () => {
       await render(distortedCyclohexene(), platform);
       const bondId = doubleBond().id;

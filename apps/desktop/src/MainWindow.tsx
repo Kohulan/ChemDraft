@@ -16939,6 +16939,9 @@ export function MainWindow({
       const stillCycled = preview && object?.type === "molecule" && cycled?.objectId === preview.objectId &&
         cycled.bondId === preview.bondId &&
         object.bonds.find(bond => bond.id === cycled.bondId)?.display?.doubleBondSide === cycled.side;
+      // A failed validation (e.g. undo restored another side) drops the retained preview, so a redo
+      // without a pointer move cannot make the stale side valid again.
+      if (cycled && !stillCycled) cycledDoubleBondSidePreviewRef.current = undefined;
       setNativeDoubleBondSidePreview(stillCycled ? cycled : preview);
     } else {
       setNativeDoubleBondSidePreview(undefined);
