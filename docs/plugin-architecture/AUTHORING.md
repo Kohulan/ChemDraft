@@ -511,6 +511,25 @@ The host rejects images larger than 25 MB or 8192 pixels on either side. Support
 PNG, JPEG, TIFF, and WebP. A plugin receives bytes only after the user explicitly chooses a file or
 screen region; this permission does not grant arbitrary filesystem or whole-screen access.
 
+## Bundled models in the CLI and MCP server
+
+The headless NMR command and `predict_nmr` MCP tool load a source checkout only when its plugin ID
+and directory are listed in the owner's [trust file](../../packages/chemdraft-cli/README.md#plugin-trust-file).
+`CHEMDRAFT_NMR_PLUGIN_DIR` selects a checkout. Declare `model.load` to let the CLI pass a
+scoped asset reader into the NMR runtime's existing `fetchAsset` option. In the installed desktop
+package, the runtime reads those assets through the same-origin package mechanism.
+
+The headless adapter converts the runtime's module-relative `file:` asset references to filesystem
+paths and refuses remote URLs. The host reader follows symlinks when resolving the path and checks
+that the result is inside the trusted checkout. It opens the resolved file once, checks that the
+path still resolves to the same location, and reads through the handle only if it is a regular file
+with matching bigint device and inode IDs from path stats before and after opening. It refuses a
+zero inode ID and files that exceed 256 MiB at open or during reading. These checks use separate
+filesystem calls and rely on Node's file IDs, which some Windows filesystems may report without
+guaranteeing uniqueness. Repeated concurrent path changes or nonunique IDs can defeat verification.
+The CLI and MCP server refuse `model.download` at manifest validation. Headless plugins execute as
+trusted Node code. The scope applies to the host reader.
+
 ## Host-owned structure recognition
 
 API 0.1.6 exposes local image recognition without giving a plugin model installation or native-call
