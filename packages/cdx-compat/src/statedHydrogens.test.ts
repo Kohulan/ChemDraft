@@ -655,6 +655,73 @@ describe("an abbreviation (OMe, Ph) keeps what the file states, and reports that
   });
 });
 
+/**
+ * A typed "Ac", "Pr" or "Ts" on a bond (a CDXML Element label, which the importer keeps as a typed
+ * label) is what the label grammar reads it as: acetyl, n-propyl, tosyl, an abbreviation whose
+ * hydrogens come from the group. A NumHydrogens on it is kept for the round trip and reported as not
+ * counted, as for OMe; the importer passes the fragment's bonds to chem-core's rule, so the report
+ * agrees with the badge. Unbonded, or given as an atomic number, the label is the element, as before.
+ */
+describe("a typed Ac, Pr or Ts on a bond is an abbreviation, and a count stated on it is reported", () => {
+  const bondedCdxml = (label: string, numHydrogens = ' NumHydrogens="2"') => `<CDXML><page id="1"><fragment id="2">
+      <n id="10" p="0 0" Element="${label}"${numHydrogens}/><n id="11" p="14 0"/><b id="20" B="10" E="11"/>
+    </fragment></page></CDXML>`;
+  const notCountedWarnings = (result: ReturnType<typeof openChemDraftPayload>) =>
+    result.warnings.filter((warning) => warning.code === "cdxml.atom_hydrogen_count_not_counted");
+
+  it.each(["Ac", "Pr", "Ts"])("a bonded typed %s stating 2 keeps the count and is named in the import report", (label) => {
+    const { result, molecule } = open(bondedCdxml(label));
+    expect(molecule.atoms[0]).toMatchObject({ element: label, labelLiteral: true, hydrogenCount: 2 });
+    expect(hydrogenWarnings(result)).toEqual([]);
+    expect(notCountedWarnings(result)).toEqual([{
+      code: "cdxml.atom_hydrogen_count_not_counted",
+      message: `CDXML import: atom 10 (${label}) states 2 hydrogens, but an abbreviation's hydrogens come from what it stands for, ` +
+        "so the stated count is kept as stored but not counted, and the atom is flagged.",
+      sourceObjectId: molecule.id,
+      atomIds: [molecule.atoms[0]!.id]
+    }]);
+    expect(badges(molecule)).toEqual([[molecule.atoms[0]!.id,
+      `${label} states 2 H, which is not counted: an abbreviation's hydrogens come from what it stands for.`]]);
+  });
+
+  it("is named beside another atom the same fragment reports, in the fragment's one warning", () => {
+    const { result, molecule } = open(`<CDXML><page id="1"><fragment id="2">
+      <n id="10" p="0 0" Element="Ac" NumHydrogens="2"/><n id="11" p="14 0"/>
+      <n id="12" p="28 0" NodeType="GenericNickname" GenericNickname="A" NumHydrogens="1"/>
+      <b id="20" B="10" E="11"/><b id="21" B="11" E="12"/>
+    </fragment></page></CDXML>`);
+    expect(notCountedWarnings(result).map((warning) => [warning.message, warning.atomIds])).toEqual([[
+      "CDXML import: 2 atoms state hydrogen counts that are not counted: atom 10 (Ac) states 2; atom 12 (A) states 1. " +
+        "Only 0 counts on a label naming no element, as a typed A label means, and an abbreviation's hydrogens come from what it stands for. " +
+        "The stated counts are kept as stored but not counted, and the atoms are flagged.",
+      [molecule.atoms[0]!.id, molecule.atoms[2]!.id]
+    ]]);
+  });
+
+  it("stating 0, or nothing, is not reported", () => {
+    for (const numHydrogens of [' NumHydrogens="0"', ""]) {
+      expect(notCountedWarnings(open(bondedCdxml("Ac", numHydrogens)).result)).toEqual([]);
+    }
+  });
+
+  it("an unbonded typed Ac, or a bonded Ac given as atomic number 89, is the element and is not reported as not counted", () => {
+    const unbonded = open(`<CDXML><page id="1"><fragment id="2">
+      <n id="10" p="0 0" Element="Ac" NumHydrogens="2"/>
+    </fragment></page></CDXML>`);
+    expect(unbonded.molecule.atoms[0]).toMatchObject({ element: "Ac", labelLiteral: true, hydrogenCount: 2 });
+    expect(notCountedWarnings(unbonded.result)).toEqual([]);
+    expect(hydrogenWarnings(unbonded.result)).toEqual([]);
+
+    const actinium = open(bondedCdxml("89"));
+    expect(actinium.molecule.atoms[0]!.labelLiteral).toBeUndefined();
+    expect(actinium.molecule.atoms[0]).toMatchObject({ element: "Ac", hydrogenCount: 2 });
+    expect(notCountedWarnings(actinium.result)).toEqual([]);
+    expect(hydrogenWarnings(actinium.result).map((warning) => warning.message)).toEqual([
+      "CDXML import: atom 10 (Ac) states 2 hydrogens; ChemDraft derives 0. The stated count is kept, and the atom is flagged."
+    ]);
+  });
+});
+
 describe("a NumHydrogens that is not a count", () => {
   it("warns, rather than dropping it silently, when NumHydrogens is not a hydrogen count", () => {
     for (const [value, element] of [["-1", ""], ["1.5", ' Element="8"'], ["two", ""]] as const) {
