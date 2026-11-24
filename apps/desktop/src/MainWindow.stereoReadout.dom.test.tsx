@@ -187,6 +187,28 @@ describe.each<ShortcutPlatform>(["macos", "windows"])("canvas stereo readout in 
     expect(await readout(path)).toBe("Stereocentre: S");
   });
 
+  it.each<Path>(["inline", "native"])("right-clicking a stereocentre inside a kept selection shows its R/S (%s menu)", async path => {
+    const { doc, ibuprofen } = drawing();
+    const centre = ibuprofen.atoms[10]!;
+    const incident = ibuprofen.bonds.find(bond => bond.fromAtomId === centre.id || bond.toAtomId === centre.id)!;
+    await mount(doc, platform);
+    runtime.desktop = path === "native";
+
+    // A selected bond that ends at the centre is kept, but the readout still describes the atom.
+    runtime.desktop = false;
+    await select(ibuprofen, bondPoint(ibuprofen, incident));
+    runtime.desktop = path === "native";
+    await rightClick(ibuprofen, atomPoint(ibuprofen, 10));
+    expect(await readout(path)).toBe("Stereocentre: S");
+
+    // The whole molecule selected: right-clicking the centre still shows its R/S.
+    runtime.desktop = false;
+    await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "edit.selectAll" } })); });
+    runtime.desktop = path === "native";
+    await rightClick(ibuprofen, atomPoint(ibuprofen, 10));
+    expect(await readout(path)).toBe("Stereocentre: S");
+  });
+
   it("the keyboard menu shows the row for one selected atom or bond, and not for a whole object", async () => {
     const { doc, ibuprofen, butene } = drawing();
     await mount(doc, platform);

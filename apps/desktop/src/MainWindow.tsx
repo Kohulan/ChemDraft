@@ -22180,7 +22180,10 @@ export function MainWindow({
       targetKind,
       bondDepthContext: bondDepthContextFromNativeSelection(nextSelectedNativePart, pageSvgRenderPlan.crossings, currentDocument),
       ...(atomWarning ? { atomWarning } : {}),
-      stereoPart: objectContextMenuStereoPart(nextSelectedNativePart),
+      // The readout describes what was right-clicked, not the (possibly broader or different)
+      // preserved selection: a selected bond or whole fragment must not hijack an atom's R/S.
+      stereoPart: object?.type === "molecule" && nativeMoleculeHit
+        ? objectContextMenuStereoPart(nativeSelectionFromHit(objectId, nativeMoleculeHit)) : undefined,
       x: event.clientX,
       y: event.clientY
     });
