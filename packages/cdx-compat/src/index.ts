@@ -47,7 +47,8 @@ import {
   type UnknownCompatibilityObject,
   statedHydrogenCountNotCountedText
 } from "@chemdraft/chem-core";
-import { measureTextRun, planTableLayout, textObjectSpansForRendering, transformPointForObject } from "@chemdraft/layout-engine";
+import { importedRingDoubleBondPlacements, measureTextRun, offsetDoubleBondSideTowardPoint, planTableLayout,
+  textObjectSpansForRendering, transformPointForObject } from "@chemdraft/layout-engine";
 import { bondedElementLabelMeaning, isGenericAtomLabel } from "@chemdraft/template-library";
 import { planMoleculeAtomLabels } from "@chemdraft/layout-engine";
 import { atomDerivedHydrogenCount, nativeBondOrderResolution, nativeElementFromAtomLabel } from "@chemdraft/layout-engine";
@@ -2516,10 +2517,11 @@ function textSourceState(text: TextObject): string {
 
 // CDXML stores the baseline independently of the editable text frame. Keep the source
 // inset when placing the current runs, including after the user translates a caption.
-function exportFramedCaption(text: TextObject, id: string, fonts: CdxmlExportFonts, colors: ExportColorTable): string | undefined {
+function exportFramedCaption(text: TextObject, id: string, fonts: CdxmlExportFonts, colors: ExportColorTable,
+  warnings: CompatibilityConversionWarning[], format: string): string | undefined {
   const a = preservedCurveAttributes(text.compatibility?.unknown.sourceCdxmlAttributes);
-  const box = parseCdxmlXyBoundingBox(a.BoundingBox);
-  const baseline = parseCdxmlXyPoint(a.p);
+  const box = parseCaptionBoundingBox(a.BoundingBox);
+  const baseline = parseCaptionPoint(a.p);
   if (!baseline || (!box && a.BoundingBox !== undefined) || text.rotation ||
       Object.keys(a).some(key => !["id", "p", "BoundingBox", "Justification", "color"].includes(key))) return undefined;
   const alignments: Record<string, string> = { left: "Left", center: "Center", right: "Right", justify: "Full" };
@@ -2558,8 +2560,19 @@ function exportFramedCaption(text: TextObject, id: string, fonts: CdxmlExportFon
   }
   const factor = a.Justification === "Center" ? 0.5 : a.Justification === "Right" ? 1 : 0;
   const saved = text.compatibility?.unknown.cdxmlTextFrameSize;
-  const width = isRecord(saved) && typeof saved.width === "number" ? Math.max(0, box.width + text.width - saved.width) : Math.min(box.width, text.width);
-  const height = isRecord(saved) && typeof saved.height === "number" ? Math.max(0, box.height + text.height - saved.height) : Math.min(box.height, text.height);
+  // A non-finite saved size (compatibility data is not schema-checked) is ignored, so BoundingBox never takes a NaN.
+  const savedSize = (key: "width" | "height") => isRecord(saved) && typeof saved[key] === "number" && Number.isFinite(saved[key]) ? saved[key] : undefined;
+  const unusable = saved === undefined ? [] : !isRecord(saved) ? ["width", "height"]
+    : (["width", "height"] as const).filter(key => saved[key] !== undefined && savedSize(key) === undefined);
+  if (unusable.length) {
+    warnings.push({ code: "cdxml.text_frame_size_invalid", sourceObjectId: text.id,
+      message: `${format} export: text ${text.id} has a saved caption frame ${unusable.join(" and ")} that is not a finite number; ` +
+        `it was ignored, and the caption's BoundingBox ${unusable.join(" and ")} was recomputed from its source frame and current size.` });
+  }
+  const resized = (source: number, current: number, before: number | undefined) =>
+    before !== undefined ? Math.max(0, source + current - before) : Math.min(source, current);
+  const width = resized(box.width, text.width, savedSize("width"));
+  const height = resized(box.height, text.height, savedSize("height"));
   const x = text.x + factor * (text.width - width), y = text.y;
   return `<t ${xmlAttributes({ id, p: formatPoint({ x: x + baseline.x - box.x, y: y + baseline.y - box.y }),
     BoundingBox: [formatPoint({ x, y }), formatPoint({ x: x + width, y: y + height })].join(" "),
@@ -2571,7 +2584,7 @@ function exportTextObject(text: TextObject, context: VisibleExportContext, alloc
   const textId = idFor(ids, text.id, allocator);
   const source = text.compatibility?.unknown.cdxmlTextElement;
   const framedCaption = () => {
-    if (!fonts.plainCaptionIds.has(text.id)) return exportFramedCaption(text, textId, fonts, colors);
+    if (!fonts.plainCaptionIds.has(text.id)) return exportFramedCaption(text, textId, fonts, colors, warnings, format);
     if (!fonts.captionRunLimitWarned) {
       fonts.captionRunLimitWarned = true;
       warnings.push({ code: "cdxml.document_caption_runs_limited", sourceObjectId: text.id,
@@ -2606,7 +2619,9 @@ function exportTextObject(text: TextObject, context: VisibleExportContext, alloc
                 "text and styles, its fonts under ids that can be written." });
           }
         }
-        if (node && element && !fontNotWritten) {
+        // Older documents kept a malformed or non-finite p or BoundingBox verbatim; never copy one back out.
+        const malformedGeometry = node !== undefined && hasMalformedCaptionCoordinates([node]);
+        if (node && element && !fontNotWritten && !malformedGeometry) {
           node[":@"] = { ...element.attributes, id: textId };
           const point = pointMetadata(text.compatibility?.unknown.cdxmlTextFrameOrigin) ?? parseCdxmlPoint(element.attributes.p);
           const dx = cssPxToCdxml(text.x - point.x), dy = cssPxToCdxml(text.y - point.y);
@@ -3076,11 +3091,18 @@ function exportGraphicAsCdxmlGraphic(
     return "";
   }
   const rectangle = type === "Rectangle" ? cdxmlRectangleStyle(graphic, pageBackgroundColor, warnings, format) : undefined;
+  // A CDXML reader takes a Graphic Arc's ellipse from its BoundingBox (center and inset half-size),
+  // so the box is the stored ellipse's frame. It is the object's own frame for an arc never edited.
+  const arcFrame = type === "Arc" ? cdxmlGraphicArcFrame(graphic) : undefined;
+  const boundingBox = arcFrame ? formatXyBoundingBox(objectCornerPoints(arcFrame))
+    : cdxmlBoundingBoxForGraphic(graphic, objectCornerPoints(graphic));
+  if (type === "Arc" && graphic.rotation) warnings.push({ code: "cdxml.arc_rotation_payload_only", sourceObjectId: graphic.id,
+    message: `${format} export: arc ${graphic.id} is written unrotated; a ${format} arc cannot carry its ${formatNumber(graphic.rotation)} degree rotation, which is kept only in the native document.` });
   const attrs = [
     `id="${graphicId}"`,
     ...(rectangle ? cdxmlColorAttribute(rectangle.color, colors) : cdxmlGraphicColorAttribute(graphic, warnings, colors)),
     `GraphicType="${type}"`,
-    `BoundingBox="${escapeXmlAttribute(cdxmlBoundingBoxForGraphic(graphic, objectCornerPoints(graphic)))}"`,
+    `BoundingBox="${escapeXmlAttribute(boundingBox)}"`,
     ...(type === "Line" || type === "Arc" ? cdxmlLineTypeAttributes(graphic) : []),
     ...(rectangle?.attributes ?? []),
     ...cdxmlShapeSubtypeAttributes(graphic)
@@ -3732,7 +3754,7 @@ function cdxmlAngularSizeForGraphic(graphic: GraphicObject): string {
   if (graphic.data.arcSweepRadians === undefined && typeof imported === "string" && imported.trim().length > 0) {
     return imported;
   }
-  return formatNumber(radiansToDegrees(clampArcSweepRadians(graphic.data.arcSweepRadians ?? Math.PI)));
+  return formatNumber(radiansToDegrees(clampArcSweepRadians(finiteArcSweepRadians(graphic) ?? Math.PI)));
 }
 
 function cdxmlLineAxisAttributes(start: Point, end: Point): string[] {
@@ -3765,17 +3787,49 @@ function graphicLineEndpointsForCdxml(graphic: GraphicObject): { start: Point; e
 
 function circularGraphicArcEndpoints(graphic: GraphicObject): { start: Point; end: Point } {
   const angles = nativeGraphicArcAngles(graphic);
-  const center = objectCenter(graphic);
-  const rx = Math.max(graphic.width / 2 - 4, 1);
-  const ry = Math.max(graphic.height / 2 - 4, 1);
+  const { center, rx, ry } = nativeGraphicArcEllipse(graphic);
   return {
     start: ellipsePointAtRadians(center, rx, ry, angles.startRadians),
     end: ellipsePointAtRadians(center, rx, ry, angles.endRadians)
   };
 }
 
+/**
+ * The ellipse a native arc is drawn on, with the renderer's own fallbacks (art-engine
+ * circularGraphicArcGeometry): the stored center and radii when they are valid, else the frame's
+ * center and its inset half-size, every radius at least 1. A handle-edited arc stores its ellipse and
+ * shrinks its frame to the drawn arc, so the frame alone no longer describes it.
+ */
+function nativeGraphicArcEllipse(graphic: GraphicObject): { center: Point; rx: number; ry: number } {
+  const finite = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  return {
+    center: pointMetadata(graphic.data.arcCenter) ?? objectCenter(graphic),
+    rx: Math.max(finite(graphic.data.arcRadiusX) ?? graphic.width / 2 - 4, 1),
+    ry: Math.max(finite(graphic.data.arcRadiusY) ?? graphic.height / 2 - 4, 1)
+  };
+}
+
+/**
+ * The frame to write for a Graphic Arc. A reader takes the ellipse from it (its center, and its
+ * half-size less a 4 px inset, at least 1), so it is the stored ellipse plus that inset; an arc whose
+ * own frame already gives that ellipse (one never handle-edited) keeps its frame.
+ */
+function cdxmlGraphicArcFrame(graphic: GraphicObject): { x: number; y: number; width: number; height: number } | undefined {
+  const { center, rx, ry } = nativeGraphicArcEllipse(graphic);
+  const frameCenter = objectCenter(graphic), tolerance = 0.005;
+  if (Math.abs(frameCenter.x - center.x) <= tolerance && Math.abs(frameCenter.y - center.y) <= tolerance &&
+      Math.abs(Math.max(graphic.width / 2 - 4, 1) - rx) <= tolerance &&
+      Math.abs(Math.max(graphic.height / 2 - 4, 1) - ry) <= tolerance) return undefined;
+  return { x: center.x - rx - 4, y: center.y - ry - 4, width: 2 * rx + 8, height: 2 * ry + 8 };
+}
+
+function finiteArcSweepRadians(graphic: GraphicObject): number | undefined {
+  const sweep = graphic.data.arcSweepRadians;
+  return typeof sweep === "number" && Number.isFinite(sweep) ? sweep : undefined;
+}
+
 function nativeGraphicArcAngles(graphic: GraphicObject): { startRadians: number; sweepRadians: number; endRadians: number } {
-  const sweepRadians = clampArcSweepRadians(graphic.data.arcSweepRadians ?? Math.PI);
+  const sweepRadians = clampArcSweepRadians(finiteArcSweepRadians(graphic) ?? Math.PI);
   const startRadians = typeof graphic.data.arcStartRadians === "number" && Number.isFinite(graphic.data.arcStartRadians)
     ? graphic.data.arcStartRadians
     : -Math.PI / 2 - sweepRadians / 2;
@@ -4030,6 +4084,9 @@ function importPageObjects(
   collectStandaloneSteps(pageElement);
   const rootsBySourceId = new Map<string, string[]>();
   const supersededBySourceId = new Map<string, string>();
+  // A caption lifted out of a fragment, keyed by its element: that fragment's frame places a caption
+  // whose own position and BoundingBox are both missing or malformed.
+  const fragmentFrameForCaption = new Map<XmlElementView, { x: number; y: number; width: number; height: number }>();
   context.preserveReactionIds ||= findElements(pageElement.children, "bracketedgroup").length > 0 ||
     findElements(pageElement.children, "represent").some(ref => ref.attributes.attribute === "Radical");
   if (context.preserveReactionIds) {
@@ -4080,7 +4137,9 @@ function importPageObjects(
         })
       });
       const molecule = single(importFragment(separateDisplayChildren(element), pageIndex, objectIndex, warnings, context));
+      const fragmentFrame = parseCdxmlXyBoundingBox(element.attributes.BoundingBox) ?? finiteFrame(molecule.objects[0]);
       for (const child of displayChildren) {
+        if (child.name === "t" && fragmentFrame) fragmentFrameForCaption.set(child, fragmentFrame);
         const imported = importElement(child);
         molecule.objects.push(...imported.objects);
         molecule.rootIds.push(...imported.rootIds);
@@ -4088,7 +4147,7 @@ function importPageObjects(
       return molecule;
     }
     if (element.name === "t") {
-      return single(importText(element, pageIndex, objectIndex, context));
+      return single(importText(element, pageIndex, objectIndex, context, fragmentFrameForCaption.get(element)));
     }
     if (element.name === "graphic") {
       const mark = importLonePair(element, `cdxml_lone_pair_${pageIndex + 1}_${objectIndex}`, colorTable);
@@ -4729,6 +4788,7 @@ function importFragment(
   const cdxmlIdByBondId = new Map<string, string>();
   const cdxmlUnknownBondOrdersByBondId: Record<string, string> = {};
   const dashedSingleBondIds: string[] = [];
+  const explicitPositionIds = new Set<string>();
   const bonds: MoleculeBond[] = bondElements.map((bondElement, bondIndex) => {
     const bondId = `bond_${String(bondIndex + 1).padStart(3, "0")}`;
     const color = colorForCdxmlIndex(bondElement.attributes.color ?? fragment.attributes.color, context.colorTable);
@@ -4762,8 +4822,9 @@ function importFragment(
     if (crossingPartnerIds.length > 0) {
       context.crossingHints.push({ sourceBondId: cdxmlBondId, partnerBondIds: crossingPartnerIds });
     }
-    const doubleBondSide =
-      doubleBondSideFromCdxmlDoublePosition(bondElement.attributes.DoublePosition)
+    const explicitSide = doubleBondSideFromCdxmlDoublePosition(bondElement.attributes.DoublePosition);
+    if (order === "double" && explicitSide) explicitPositionIds.add(bondId);
+    const doubleBondSide = explicitSide
       ?? (order === "double" ? doubleBondSideFromCircularOrdering(bondElement, bondElements, atomByCdxmlId) : undefined);
     if (doubleBondSide) {
       bond.display = { ...(bond.display ?? {}), doubleBondSide };
@@ -4872,7 +4933,7 @@ function importFragment(
       sourceObjectId: objectId
     });
   }
-  const normalizedBonds = refreshImportedCyclicDoubleBondSides(atoms, joinedBonds);
+  const normalizedBonds = refreshImportedCyclicDoubleBondSides(atoms, joinedBonds, explicitPositionIds);
   // Order=1.5 bonds cannot say whether a ring N is pyridine-type or an N–H; the file's NumHydrogens
   // can, so it is kept for the Kekulé resolution to honour. Literal labels also retain an explicit
   // count: their text supplies no implicit hydrogens and cannot replace the source constraint.
@@ -5036,160 +5097,23 @@ function importFragment(
   };
 }
 
-interface ImportedRingCycle {
-  atomIds: string[];
-  bondIds: string[];
-  center: Point;
-}
-
 function refreshImportedCyclicDoubleBondSides(
-  atoms: readonly MoleculeAtom[],
-  bonds: readonly MoleculeBond[]
+  atoms: MoleculeAtom[],
+  bonds: MoleculeBond[],
+  explicitPositionIds: ReadonlySet<string>
 ): MoleculeBond[] {
-  const cycles = findImportedRingCycles(atoms, bonds, new Set([5, 6]));
-  if (cycles.length === 0) {
-    return [...bonds];
-  }
-
-  const atomById = new Map(atoms.map((atom) => [atom.id, atom]));
-  const cyclesByBondId = new Map<string, ImportedRingCycle[]>();
-  cycles.forEach((cycle) => {
-    cycle.bondIds.forEach((bondId) => {
-      cyclesByBondId.set(bondId, [...(cyclesByBondId.get(bondId) ?? []), cycle]);
-    });
-  });
-
-  return bonds.map((bond) => {
-    if (bond.order !== "double") {
-      return bond;
-    }
-
-    const owningCycles = cyclesByBondId.get(bond.id) ?? [];
-    const fromAtom = atomById.get(bond.fromAtomId);
-    const toAtom = atomById.get(bond.toAtomId);
-    if (owningCycles.length === 0 || !fromAtom || !toAtom) {
-      return bond;
-    }
-
-    const currentSide = bond.display?.doubleBondSide;
-    // An explicit centered position is a display choice, not a ring-interior hint.
-    if (currentSide === "center") {
-      return bond;
-    }
-    // Prefer the ring whose centroid already matches the current side; otherwise place the
-    // secondary line in the smallest owning ring (the conventional choice for fused systems),
-    // with a stable secondary key so the result is deterministic regardless of traversal order.
-    const cycle =
-      owningCycles.find((candidate) => sideForPointRelativeToBond(fromAtom, toAtom, candidate.center) === currentSide)
-      ?? [...owningCycles].sort(
-        (left, right) =>
-          left.atomIds.length - right.atomIds.length ||
-          canonicalImportedRingCycleKey(left.bondIds).localeCompare(canonicalImportedRingCycleKey(right.bondIds))
-      )[0];
-    const side = cycle ? sideForPointRelativeToBond(fromAtom, toAtom, cycle.center) : undefined;
-    if (!side || currentSide === side) {
-      return bond;
-    }
-
-    return {
-      ...bond,
-      display: { ...(bond.display ?? {}), doubleBondSide: side }
-    };
+  const { ringBondIds, interiorSides } = importedRingDoubleBondPlacements({ atoms, bonds });
+  if (!ringBondIds.size) return bonds;
+  return bonds.map(bond => {
+    if (!ringBondIds.has(bond.id)) return bond;
+    const inside = interiorSides.get(bond.id);
+    const display = { ...bond.display };
+    if (display.doubleBondSide !== "center" && inside) display.doubleBondSide = inside;
+    if (explicitPositionIds.has(bond.id)) display.doubleBondSideSource = "imported";
+    return Object.keys(display).length ? { ...bond, display } : bond;
   });
 }
 
-const IMPORTED_RING_CYCLE_VISIT_LIMIT = 250_000;
-
-function findImportedRingCycles(
-  atoms: readonly MoleculeAtom[],
-  bonds: readonly MoleculeBond[],
-  ringSizes: ReadonlySet<number>
-): ImportedRingCycle[] {
-  const targetSizes = [...ringSizes].filter((size) => Number.isInteger(size) && size >= 3).sort((a, b) => a - b);
-  const maxRingSize = targetSizes[targetSizes.length - 1];
-  if (maxRingSize === undefined) {
-    return [];
-  }
-
-  const atomById = new Map(atoms.map((atom) => [atom.id, atom]));
-  const adjacency = new Map<string, { atomId: string; bondId: string }[]>();
-  bonds.forEach((bond) => {
-    if (!atomById.has(bond.fromAtomId) || !atomById.has(bond.toAtomId)) {
-      return;
-    }
-
-    adjacency.set(bond.fromAtomId, [
-      ...(adjacency.get(bond.fromAtomId) ?? []),
-      { atomId: bond.toAtomId, bondId: bond.id }
-    ]);
-    adjacency.set(bond.toAtomId, [
-      ...(adjacency.get(bond.toAtomId) ?? []),
-      { atomId: bond.fromAtomId, bondId: bond.id }
-    ]);
-  });
-
-  const cycles = new Map<string, ImportedRingCycle>();
-  // Bound the path enumeration: dense polycyclic graphs (e.g. metal-organic cages) can make
-  // the DFS combinatorial. Normal organic structures never approach this budget; pathological
-  // inputs degrade gracefully (some cyclic double-bond sides left un-normalized) instead of hanging.
-  let visitBudget = IMPORTED_RING_CYCLE_VISIT_LIMIT;
-  const visit = (startAtomId: string, atomId: string, atomIds: string[], bondIds: string[]) => {
-    if (visitBudget <= 0) {
-      return;
-    }
-    visitBudget -= 1;
-    if (ringSizes.has(atomIds.length)) {
-      const closingBond = (adjacency.get(atomId) ?? []).find((edge) => edge.atomId === startAtomId);
-      if (closingBond) {
-        const cycleBondIds = [...bondIds, closingBond.bondId];
-        const key = canonicalImportedRingCycleKey(cycleBondIds);
-        if (!cycles.has(key)) {
-          const cycleAtomIds = [...atomIds];
-          cycles.set(key, {
-            atomIds: cycleAtomIds,
-            bondIds: cycleBondIds,
-            center: centroidOfImportedAtoms(cycleAtomIds.map((id) => atomById.get(id)).filter((atom): atom is MoleculeAtom => Boolean(atom)))
-          });
-        }
-      }
-    }
-
-    if (atomIds.length >= maxRingSize) {
-      return;
-    }
-
-    (adjacency.get(atomId) ?? []).forEach((edge) => {
-      if (edge.atomId === startAtomId || atomIds.includes(edge.atomId)) {
-        return;
-      }
-
-      visit(startAtomId, edge.atomId, [...atomIds, edge.atomId], [...bondIds, edge.bondId]);
-    });
-  };
-
-  atoms.forEach((atom) => {
-    visit(atom.id, atom.id, [atom.id], []);
-  });
-
-  return [...cycles.values()];
-}
-
-function canonicalImportedRingCycleKey(bondIds: readonly string[]): string {
-  return [...bondIds].sort().join("|");
-}
-
-function centroidOfImportedAtoms(atoms: readonly MoleculeAtom[]): Point {
-  if (atoms.length === 0) {
-    return { x: 0, y: 0 };
-  }
-
-  return atoms.reduce<Point>(
-    (sum, atom) => ({ x: sum.x + atom.x / atoms.length, y: sum.y + atom.y / atoms.length }),
-    { x: 0, y: 0 }
-  );
-}
-
-/** Keep source runs and the baseline-to-bounds relationship, while following the live label anchor. */
 function positionRetainedAtomLabel(source: CdxElement, atom: MoleculeAtom): void {
   const text = source.kids.find(child => child.name === "t");
   if (!text) return;
@@ -5303,7 +5227,7 @@ function sideForAttachedCdxmlBond(
       ? attachedBeginId
       : undefined;
   const otherAtom = otherAtomId ? atomByCdxmlId.get(otherAtomId) : undefined;
-  return otherAtom ? sideForPointRelativeToBond(fromAtom, toAtom, otherAtom) : undefined;
+  return otherAtom ? offsetDoubleBondSideTowardPoint(fromAtom, toAtom, otherAtom) : undefined;
 }
 
 function cdxmlBondIsInCycle(bondElement: XmlElementView, bondElements: readonly XmlElementView[]): boolean {
@@ -5348,19 +5272,6 @@ function appendAdjacency(map: Map<string, Set<string>>, fromId: string, toId: st
   const neighbors = map.get(fromId) ?? new Set<string>();
   neighbors.add(toId);
   map.set(fromId, neighbors);
-}
-
-function sideForPointRelativeToBond(fromAtom: MoleculeAtom, toAtom: MoleculeAtom, point: Point): DoubleBondSide | undefined {
-  const dx = toAtom.x - fromAtom.x;
-  const dy = toAtom.y - fromAtom.y;
-  const length = Math.hypot(dx, dy);
-  if (length === 0) {
-    return undefined;
-  }
-  const normal = { x: -dy / length, y: dx / length };
-  const midpoint = { x: (fromAtom.x + toAtom.x) / 2, y: (fromAtom.y + toAtom.y) / 2 };
-  const score = (point.x - midpoint.x) * normal.x + (point.y - midpoint.y) * normal.y;
-  return score >= 0 ? "left" : "right";
 }
 
 function cdxmlDoublePositionName(side: DoubleBondSide): "Left" | "Right" | "Center" {
@@ -5436,7 +5347,78 @@ function frontBondRefFromCdxmlDepth(left: BondRef, right: BondRef, context: Impo
   return bondRefKey(left).localeCompare(bondRefKey(right)) >= 0 ? left : right;
 }
 
-function importText(textElement: XmlElementView, pageIndex: number, objectIndex: number, context: ImportPageContext): TextObject {
+function finiteFrame(object: { x: number; y: number; width: number; height: number } | undefined):
+  { x: number; y: number; width: number; height: number } | undefined {
+  return object && [object.x, object.y, object.width, object.height].every(Number.isFinite)
+    ? { x: object.x, y: object.y, width: object.width, height: object.height } : undefined;
+}
+
+/**
+ * A caption's p and BoundingBox, made usable before anything reads or keeps them. A malformed or
+ * non-finite value (`p="40 NaN"`) is treated as missing, so it is never copied back out on export
+ * and a later move shifts p and BoundingBox together. A missing or malformed p is derived from the
+ * valid BoundingBox (the alignment edge, one ascent below its top), else from the fragment the
+ * caption belongs to (below its frame), else the page origin; any finite coordinate of a malformed
+ * p is kept. One warning names what was ignored or where an unplaceable caption went. An element
+ * with neither problem is returned as is.
+ */
+function sanitizeCaptionGeometry(
+  element: XmlElementView,
+  objectId: string,
+  context: ImportPageContext,
+  fragmentFrame: { x: number; y: number; width: number; height: number } | undefined
+): XmlElementView {
+  const a = element.attributes;
+  const point = parseCaptionPoint(a.p);
+  const box = parseCaptionBoundingBox(a.BoundingBox);
+  const badPoint = a.p !== undefined && !point, badBox = a.BoundingBox !== undefined && !box;
+  if (point && !badBox) return element;
+  const attributes = { ...a };
+  if (badBox) delete attributes.BoundingBox;
+  let placedBy = "it was placed by its p";
+  if (!point) {
+    const size = parseNumber(childElements(element, "s")[0]?.attributes.size);
+    const ascent = cdxmlToCssPx(size !== undefined && size > 0 && Number.isFinite(size) ? size : 10) * 0.8;
+    let derived: Point, keptCoordinate = false;
+    if (box) {
+      const factor = a.Justification === "Center" ? 0.5 : a.Justification === "Right" ? 1 : 0;
+      derived = { x: box.x + factor * box.width, y: box.y + Math.min(box.height, ascent) };
+    } else if (fragmentFrame) {
+      derived = { x: fragmentFrame.x, y: fragmentFrame.y + fragmentFrame.height + ascent };
+    } else {
+      derived = { x: 0, y: 0 };
+    }
+    // A malformed p may still state one coordinate; keep it.
+    const [x, y] = (a.p?.trim().split(/\s+/) ?? []).map(token => token ? Number(token) : Number.NaN);
+    if (Number.isFinite(x)) { derived.x = cdxmlToCssPx(x); keptCoordinate = true; }
+    if (Number.isFinite(y)) { derived.y = cdxmlToCssPx(y); keptCoordinate = true; }
+    attributes.p = formatPoint(derived);
+    placedBy = (box ? "it was placed from its BoundingBox" : fragmentFrame ? "it was placed below the fragment it belongs to"
+      : "it was placed at the page origin") + (keptCoordinate ? ", keeping the finite coordinate of its p" : "");
+  }
+  // A missing p placed from a valid BoundingBox is an ordinary file, not a defect.
+  if (badPoint || badBox) {
+    const quote = (value: string) => JSON.stringify(value.length > 40 ? `${value.slice(0, 40)}…` : value);
+    const ignored = [badPoint ? `p=${quote(a.p!)}` : "", badBox ? `BoundingBox=${quote(a.BoundingBox!)}` : ""].filter(Boolean);
+    context.warnings.push({ code: "cdxml.text_position_invalid", sourceObjectId: objectId,
+      message: `${context.sourceFormat} import: text ${a.id ?? objectId} has a malformed ${ignored.join(" and ")} ` +
+        `(p takes exactly 2 finite numbers, BoundingBox exactly 4), which was ignored; ${placedBy}.` });
+  } else if (a.p === undefined && a.BoundingBox === undefined) {
+    // Neither attribute is present: its position is a guess, even below its own fragment.
+    context.warnings.push({ code: "cdxml.text_position_missing", sourceObjectId: objectId,
+      message: `${context.sourceFormat} import: text ${a.id ?? objectId} has neither a p nor a BoundingBox; ${placedBy}.` });
+  }
+  return { ...element, attributes };
+}
+
+function importText(
+  sourceElement: XmlElementView,
+  pageIndex: number,
+  objectIndex: number,
+  context: ImportPageContext,
+  fragmentFrame?: { x: number; y: number; width: number; height: number }
+): TextObject {
+  const textElement = sanitizeCaptionGeometry(sourceElement, `cdxml_text_${pageIndex + 1}_${objectIndex}`, context, fragmentFrame);
   const point = parseCdxmlPoint(textElement.attributes.p);
   const text = textContent(textElement.children);
   const color = colorForCdxmlIndex(textElement.attributes.color, context.colorTable);
@@ -5515,7 +5497,7 @@ function textFontTable(element: XmlElementView, context: ImportPageContext): rea
 // Only adopt the single-line layout when every visible run has an exact mapping.
 function restoreFramedCaption(object: TextObject, element: XmlElementView, context: ImportPageContext): void {
   const a = element.attributes;
-  const box = parseCdxmlXyBoundingBox(a.BoundingBox);
+  const box = parseCaptionBoundingBox(a.BoundingBox);
   const alignments: Record<string, string> = { Center: "center", Right: "right", Left: "left", Full: "justify" };
   const align = alignments[a.Justification ?? "Left"];
   const runs = childElements(element, "s");
@@ -5525,7 +5507,7 @@ function restoreFramedCaption(object: TextObject, element: XmlElementView, conte
         `${cdxmlLimits.captionRuns} supported; its caption frame and run fonts were not restored, and it was imported as plain styled text.` });
     return;
   }
-  if ((!box && a.BoundingBox !== undefined) || !parseCdxmlXyPoint(a.p) || !align || !runs.length || runs.length !== object.spans.length ||
+  if ((!box && a.BoundingBox !== undefined) || !parseCaptionPoint(a.p) || !align || !runs.length || runs.length !== object.spans.length ||
       Object.keys(a).some(k => !["id", "p", "BoundingBox", "Justification", "color"].includes(k))) return;
   const usage = context.fonts.usage;
   if (usage.captionRunLimitReached || usage.captionRuns + runs.length > cdxmlLimits.documentCaptionRuns) {
@@ -7074,6 +7056,40 @@ function parseCdxmlXyPoint(point: string | undefined): Point | undefined {
     x: cdxmlToCssPx(x),
     y: cdxmlToCssPx(y)
   };
+}
+
+/** Exactly `count` finite numbers, else undefined: a trailing token (`"40 38 80 52 NaN"`) makes the value malformed. */
+function exactFiniteNumbers(value: string | undefined, count: number): number[] | undefined {
+  const tokens = value?.trim().split(/\s+/);
+  const numbers = tokens?.length === count ? tokens.map(Number) : undefined;
+  return numbers?.every(Number.isFinite) ? numbers : undefined;
+}
+
+/** A caption's p: exactly "x y", both finite. The lenient reader also serves Point3D attributes. */
+function parseCaptionPoint(point: string | undefined): Point | undefined {
+  return exactFiniteNumbers(point, 2) ? parseCdxmlXyPoint(point) : undefined;
+}
+
+/** A caption's BoundingBox: exactly "left top right bottom", all finite. */
+function parseCaptionBoundingBox(box: string | undefined): { x: number; y: number; width: number; height: number } | undefined {
+  return exactFiniteNumbers(box, 4) ? parseCdxmlXyBoundingBox(box) : undefined;
+}
+
+/** A coordinate attribute anywhere in the tree that is not a whole number of finite pairs (or triples),
+ *  or a caption p or BoundingBox without exactly its 2 or 4 finite numbers. */
+function hasMalformedCaptionCoordinates(tree: OrderedXmlTree): boolean {
+  return tree.some(node => {
+    const element = elementView(node);
+    if (!element) return false;
+    return Object.entries(element.attributes).some(([name, text]) => {
+      if (element.name === "t" && name === "p") return !parseCaptionPoint(text);
+      if (element.name === "t" && name === "BoundingBox") return !parseCaptionBoundingBox(text);
+      const stride = visibleCoordinatePairs.has(name) ? 2 : visibleCoordinateTriples.has(name) ? 3 : 0;
+      if (!stride) return false;
+      const values = text.trim().split(/\s+/).map(Number);
+      return values.length % stride !== 0 || values.some(value => !Number.isFinite(value));
+    }) || hasMalformedCaptionCoordinates(element.children);
+  });
 }
 
 /** Spec-order 2D position: "x y", falling back to the origin when absent or malformed. */
