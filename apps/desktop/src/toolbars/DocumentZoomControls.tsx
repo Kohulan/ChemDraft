@@ -16,7 +16,7 @@ export function DocumentZoomControls() {
       disabled={outDisabled} {...zoomOut}>
       <Icon name="zoomOut" />
     </button>
-    <select aria-label="Document zoom percentage" title="Document zoom percentage" disabled={!zoom}
+    <select className="toolbar-select" aria-label="Document zoom percentage" title="Document zoom percentage" disabled={!zoom}
       value={preset === undefined ? "current" : String(preset)}
       onChange={event => {
         const value = DOCUMENT_ZOOM_PRESETS.find(percent => String(percent) === event.target.value);
