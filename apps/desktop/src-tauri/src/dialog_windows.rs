@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Condvar, LazyLock, Mutex},
     time::{Duration, Instant},
 };
@@ -63,9 +63,11 @@ fn kind_spec(kind: &str) -> Result<DialogKindSpec, String> {
             maximizable: false,
             resizable: true,
             title: "Take the Tour",
+            // Height before ready, and the fallback without a measurement. TourForm reserves its
+            // tallest step, so ready's height fits every step and Try it never falls below the fold.
             size: (520.0, 375.0),
             min_size: (360.0, 260.0),
-            fit_content: false,
+            fit_content: true,
             preserve_user_frame: false,
         }),
         "vibeCodeGuide" => Ok(DialogKindSpec {
@@ -101,6 +103,15 @@ fn kind_spec(kind: &str) -> Result<DialogKindSpec, String> {
             title: "Enlarge Page",
             size: (420.0, 150.0),
             min_size: (320.0, 100.0),
+            fit_content: true,
+            preserve_user_frame: false,
+        }),
+        "pluginTextPrompt" => Ok(DialogKindSpec {
+            maximizable: false,
+            resizable: true,
+            title: "Plugin question",
+            size: (440.0, 190.0),
+            min_size: (340.0, 140.0),
             fit_content: true,
             preserve_user_frame: false,
         }),
@@ -181,6 +192,7 @@ fn native_window_title(kind: &str, spec_title: &str, snapshot_title: &str) -> St
             | "guidedTour"
             | "about"
             | "pageEnlargement"
+            | "pluginTextPrompt"
     ) {
         snapshot_title.to_string()
     } else {
@@ -212,6 +224,9 @@ struct GuidedTourSnapshot {
     /// Plugin commands the menus offered when the tour opened. Absent in older payloads.
     #[serde(default)]
     plugins: Vec<GuidedTourPluginCommand>,
+    /// An optional map of schemes to single-character keys, or null for cleared bindings.
+    #[serde(default, rename = "bondKeys")]
+    _bond_keys: BTreeMap<super::KeybindingScheme, Option<char>>,
 }
 
 impl GuidedTourSnapshot {
@@ -246,6 +261,72 @@ enum GuidedTourAction {
         #[serde(rename = "command")]
         _command: GuidedTourCommand,
     },
+    /// The plugins card's link. Handled here, never relayed to the owner, and opened only when
+    /// `url` is exactly `GUIDED_TOUR_GUIDE_URL` (`open_guided_tour_guide`).
+    OpenGuide {
+        url: String,
+    },
+}
+
+/// The one web address the guided tour may open: the plugin authoring guide its plugins card
+/// shows. Keep it equal to `PLUGIN_AUTHORING_GUIDE_URL` in `tour/tourCommands.ts` (a TypeScript test
+/// compares them).
+const GUIDED_TOUR_GUIDE_URL: &str =
+    "https://github.com/jgassens/ChemDraft/blob/main/docs/plugin-architecture/AUTHORING.md";
+
+/// Opens the plugin authoring guide in the system browser through `open`, never in the tour's
+/// webview. Any address other than exactly `GUIDED_TOUR_GUIDE_URL` is refused and logged.
+fn open_guided_tour_guide(
+    url: &str,
+    open: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    if url != GUIDED_TOUR_GUIDE_URL {
+        eprintln!("Refused a guided tour link that is not the plugin authoring guide: {url:?}");
+        return Err("The tour can open only the plugin authoring guide.".into());
+    }
+    open(GUIDED_TOUR_GUIDE_URL).map_err(|error| {
+        eprintln!("Could not open the plugin authoring guide: {error}");
+        format!("Could not open the plugin authoring guide in your browser: {error}")
+    })
+}
+
+/// The scheme and host the app document is served from, as `installed_plugins::APP_ORIGIN`: the
+/// custom scheme on macOS and Linux, and `http://tauri.localhost` on Windows (WebView2).
+#[cfg(not(windows))]
+const APP_DOCUMENT_ORIGIN: (&str, &str) = ("tauri", "localhost");
+#[cfg(windows)]
+const APP_DOCUMENT_ORIGIN: (&str, &str) = ("http", "tauri.localhost");
+
+/// Whether the guided tour's webview may load `target`: only the app's own document, on
+/// `app_origin` (scheme, host) or, in a development build, on the dev server's origin `dev_url`.
+/// Every other address, the plugin authoring guide included, is refused: the guide opens only in
+/// the system browser through `open_guided_tour_guide`, never by navigating the tour (a dropped or
+/// otherwise followed link).
+fn guided_tour_navigation_allowed(
+    target: &tauri::Url,
+    app_origin: (&str, &str),
+    dev_url: Option<&tauri::Url>,
+) -> bool {
+    if !target.username().is_empty() || target.password().is_some() {
+        return false;
+    }
+    let app = target.scheme() == app_origin.0
+        && target.host_str() == Some(app_origin.1)
+        && target.port().is_none();
+    let dev = dev_url.is_some_and(|dev| {
+        target.scheme() == dev.scheme()
+            && target.host_str().is_some()
+            && target.host_str() == dev.host_str()
+            && target.port_or_known_default() == dev.port_or_known_default()
+    });
+    app || dev
+}
+
+/// The guided tour's answer to a request for a new window (a middle-click, modified click or
+/// `target` link): never a new webview. Only the exact plugin authoring guide address opens, in the
+/// system browser through `open_guided_tour_guide`; anything else is refused and logged there.
+fn guided_tour_new_window(target: &tauri::Url, open: impl FnOnce(&str) -> Result<(), String>) {
+    let _ = open_guided_tour_guide(target.as_str(), open);
 }
 
 #[derive(Deserialize)]
@@ -290,6 +371,54 @@ enum VibeGuideAction {
 #[serde(tag = "action", rename_all = "camelCase", deny_unknown_fields)]
 enum PageEnlargementAction {
     Enlarge {},
+    Cancel {},
+}
+/// A plugin's dialogs.promptText question. Limits mirror PluginPromptTextRequestSchema (UTF-16 units).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginTextPromptSnapshot {
+    title: String,
+    label: String,
+    placeholder: String,
+    initial_value: String,
+    submit_label: String,
+    max_length: u32,
+    plugin_name: String,
+    plugin_id: String,
+    /// Why Submit is off, e.g. "Switch back to <tab> to insert."; absent when it is on.
+    #[serde(default)]
+    status_line: Option<String>,
+    /// Absent means on. While false, Rust refuses the window's submit (see `reserve_action`, which
+    /// reads it from the retained JSON; here it is only type-checked).
+    #[serde(default)]
+    #[allow(dead_code)]
+    submit_enabled: Option<bool>,
+}
+const PLUGIN_TEXT_PROMPT_MAX_LENGTH: u32 = 2000;
+fn prompt_text(text: &str, min: usize, max: usize) -> bool {
+    let units = text.encode_utf16().count();
+    (min..=max).contains(&units) && !text.contains('\0')
+}
+impl PluginTextPromptSnapshot {
+    fn valid(&self) -> bool {
+        (1..=PLUGIN_TEXT_PROMPT_MAX_LENGTH).contains(&self.max_length)
+            && prompt_text(&self.title, 1, 200)
+            && prompt_text(&self.label, 1, 200)
+            && prompt_text(&self.placeholder, 0, 200)
+            && prompt_text(&self.submit_label, 1, 200)
+            && prompt_text(&self.initial_value, 0, self.max_length as usize)
+            && prompt_text(&self.plugin_name, 1, 128)
+            && prompt_text(&self.plugin_id, 1, 256)
+            && self
+                .status_line
+                .as_deref()
+                .is_none_or(|line| prompt_text(line, 1, 200))
+    }
+}
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "camelCase", deny_unknown_fields)]
+enum PluginTextPromptAction {
+    Submit { value: String },
     Cancel {},
 }
 #[derive(Deserialize)]
@@ -1069,7 +1198,8 @@ impl Message {
             || self.snapshot_revision > 9_007_199_254_740_991
             || ((self.dialog_kind == "engineInstall"
                 || self.dialog_kind == "toolInstall"
-                || self.dialog_kind == "atomProblem")
+                || self.dialog_kind == "atomProblem"
+                || self.dialog_kind == "pluginTextPrompt")
                 && serde_json::to_vec(self).map_err(|e| e.to_string())?.len() > 3400)
         {
             return Err("Invalid dialog envelope or payload limit exceeded".into());
@@ -1083,6 +1213,24 @@ impl Message {
                 serde_json::from_value::<PageEnlargementAction>(self.data.clone()).is_ok()
             }
             "result" if self.dialog_kind == "pageEnlargement" => false,
+            "snapshot" if self.dialog_kind == "pluginTextPrompt" => {
+                // An explicit null is not "absent": the optional fields are a string and a boolean.
+                serde_json::from_value::<PluginTextPromptSnapshot>(self.data.clone())
+                    .is_ok_and(|s| s.valid())
+                    && ["statusLine", "submitEnabled"]
+                        .iter()
+                        .all(|field| !self.data.get(*field).is_some_and(Value::is_null))
+            }
+            "action" if self.dialog_kind == "pluginTextPrompt" => serde_json::from_value::<
+                PluginTextPromptAction,
+            >(self.data.clone())
+            .is_ok_and(|a| match a {
+                PluginTextPromptAction::Submit { value } => {
+                    prompt_text(&value, 1, PLUGIN_TEXT_PROMPT_MAX_LENGTH as usize)
+                }
+                PluginTextPromptAction::Cancel {} => true,
+            }),
+            "result" if self.dialog_kind == "pluginTextPrompt" => false,
             "snapshot" if self.dialog_kind == "atomProblem" => {
                 serde_json::from_value::<AtomProblemSnapshot>(self.data.clone()).is_ok_and(|s| {
                     valid_title(&s.title)
@@ -1616,6 +1764,23 @@ fn reserve_action(session: &mut Session, message: &Message) -> Result<bool, Stri
     {
         return Err("This atom problem changed; use the current window actions".into());
     }
+    if message.dialog_kind == "pluginTextPrompt"
+        && message.data["action"] == "submit"
+        && !message.data["value"].as_str().is_some_and(|value| {
+            session.snapshot.data["maxLength"]
+                .as_u64()
+                .is_some_and(|max| value.encode_utf16().count() as u64 <= max)
+        })
+    {
+        return Err("The answer is longer than this plugin question allows".into());
+    }
+    // Submit is off while the question's drawing is not the active tab; the answer could not be inserted.
+    if message.dialog_kind == "pluginTextPrompt"
+        && message.data["action"] == "submit"
+        && session.snapshot.data["submitEnabled"] == false
+    {
+        return Err("Switch back to this question's drawing to insert".into());
+    }
     if message.dialog_kind == "structureTemplates"
         && message.data["action"] == "insert"
         && !session.snapshot.data["templateIds"]
@@ -1688,6 +1853,18 @@ fn update_snapshot(session: &mut Session, message: &Message) {
     {
         session.terminal_request = None;
     }
+    // Turning a plugin question's Submit off makes the owner refuse a submit already in flight, so
+    // its reservation ends here; the user can submit again once Submit is back on.
+    if message.dialog_kind == "pluginTextPrompt"
+        && message.data["submitEnabled"] == false
+        && session
+            .terminal_request
+            .as_ref()
+            .and_then(|id| session.actions.get(id))
+            .is_some_and(|action| action.data["action"] == "submit")
+    {
+        session.terminal_request = None;
+    }
     session.snapshot = message.clone();
 }
 fn releases_action_reservation(message: &Message) -> bool {
@@ -1734,12 +1911,13 @@ fn register(
         return Err("Too many dialog windows are open".into());
     }
     // Independent questions must never share consent, even for the same drawing.
-    if message.dialog_kind != "pageEnlargement"
-        && registry.sessions.values().any(|s| {
-            s.snapshot.document_tab_id == message.document_tab_id
-                && s.snapshot.dialog_kind == message.dialog_kind
-        })
-    {
+    if !matches!(
+        message.dialog_kind.as_str(),
+        "pageEnlargement" | "pluginTextPrompt"
+    ) && registry.sessions.values().any(|s| {
+        s.snapshot.document_tab_id == message.document_tab_id
+            && s.snapshot.dialog_kind == message.dialog_kind
+    }) {
         return Err("A dialog for this drawing is already open".into());
     }
     registry.next_slot += 1;
@@ -1904,6 +2082,28 @@ pub(crate) async fn dialog_open(
             }
             tauri::webview::NewWindowResponse::Deny
         })
+    } else if message.dialog_kind == "guidedTour" {
+        // The tour shows only the app's own document. Its guide link opens through `dialog_send`
+        // (`open_guided_tour_guide`); dragging, middle-clicking or modified-clicking the link must
+        // not load the guide, or anything else, in this window or in a new one.
+        let dev_url = if tauri::is_dev() {
+            app.config().build.dev_url.clone()
+        } else {
+            None
+        };
+        builder
+            .on_navigation(move |url| {
+                let allowed =
+                    guided_tour_navigation_allowed(url, APP_DOCUMENT_ORIGIN, dev_url.as_ref());
+                if !allowed {
+                    eprintln!("Refused a guided tour navigation away from the app: {url}");
+                }
+                allowed
+            })
+            .on_new_window(|url, _| {
+                guided_tour_new_window(&url, super::problem_reports::open_external_address);
+                tauri::webview::NewWindowResponse::Deny
+            })
     } else {
         builder
     };
@@ -2036,6 +2236,20 @@ pub(crate) async fn dialog_send(
                         required: true,
                     }],
                 )?);
+            }
+            if message.dialog_kind == "guidedTour" {
+                if let Ok(GuidedTourAction::OpenGuide { url }) =
+                    serde_json::from_value::<GuidedTourAction>(message.data.clone())
+                {
+                    // The link opens in the system browser and is not a terminal action: it
+                    // reserves nothing and never reaches the owner.
+                    drop(registry);
+                    drop(creation);
+                    return open_guided_tour_guide(
+                        &url,
+                        super::problem_reports::open_external_address,
+                    );
+                }
             }
             if let Some(receipt) = session.receipts.get(&message.request_id) {
                 return send_host(session, receipt);
@@ -2216,7 +2430,7 @@ fn close_session<R: Runtime>(app: &tauri::AppHandle<R>, host_id: &str, reason: &
         .remove(host_id);
     if let Some(mut session) = session {
         flush_position(app, &mut session);
-        if session.snapshot.dialog_kind == "pageEnlargement" {
+        if is_question_kind(&session.snapshot.dialog_kind) {
             if let Some(window) = app.get_webview_window(&session.registration.window_label) {
                 let restore_focus = matches!(reason, "apply" | "cancel" | "close");
                 let target = window.clone();
@@ -2225,7 +2439,7 @@ fn close_session<R: Runtime>(app: &tauri::AppHandle<R>, host_id: &str, reason: &
                 })
                 .and_then(|result| result)
                 {
-                    eprintln!("Could not close page enlargement window: {error}");
+                    eprintln!("Could not close question window: {error}");
                     let _ = window.destroy();
                 }
             }
@@ -2237,6 +2451,10 @@ fn close_session<R: Runtime>(app: &tauri::AppHandle<R>, host_id: &str, reason: &
             let _ = window.destroy();
         }
     }
+}
+/// Request-bound questions: closing one returns focus to the document when it held focus.
+fn is_question_kind(kind: &str) -> bool {
+    matches!(kind, "pageEnlargement" | "pluginTextPrompt")
 }
 fn close_page_enlargement_on_main<R: Runtime>(
     window: &tauri::WebviewWindow<R>,
@@ -4522,7 +4740,8 @@ pub(crate) fn on_window_event<R: Runtime>(window: &tauri::Window<R>, event: &Win
             flush_preferences(window.app_handle(), PreferencesClose::Destroyed);
         }
         WindowEvent::CloseRequested { api, .. }
-            if window.label().starts_with("dialog-main-pageEnlargement-") =>
+            if window.label().starts_with("dialog-main-pageEnlargement-")
+                || window.label().starts_with("dialog-main-pluginTextPrompt-") =>
         {
             let host_id = REGISTRY
                 .lock()
@@ -5629,6 +5848,8 @@ mod tests {
     fn guided_tour_is_a_resizable_modeless_kind_with_typed_actions() {
         let spec = kind_spec("guidedTour").unwrap();
         assert!(spec.resizable && !spec.maximizable);
+        // Sized to the tallest step's measured content, clamped to the work area.
+        assert!(spec.fit_content && !spec.preserve_user_frame);
         assert_eq!(
             native_window_title("guidedTour", spec.title, spec.title),
             "Take the Tour"
@@ -5686,6 +5907,42 @@ mod tests {
     }
 
     #[test]
+    fn guided_tour_snapshot_accepts_only_known_schemes_and_single_character_keys() {
+        let mut message = snapshot();
+        message.dialog_kind = "guidedTour".into();
+        message.data = json!({"title":"Take the Tour", "scheme":"chemdraft", "automatic":false});
+        assert_eq!(message.validate(), Ok(()));
+        for bond_keys in [
+            json!({"chemdraft":"1", "chemdraw":null}),
+            json!({"chemdraft":null, "chemdraw":"😀"}),
+            json!({"chemdraw":"j"}),
+            json!({}),
+        ] {
+            message.data["bondKeys"] = bond_keys;
+            assert_eq!(message.validate(), Ok(()), "{}", message.data);
+        }
+        for bond_keys in [
+            json!({"unknown":"1"}),
+            json!({"ChemDraft":"1"}),
+            json!({"chemdraft":"12"}),
+            json!({"chemdraft":""}),
+            json!({"chemdraw":1}),
+            json!([]),
+            json!(null),
+        ] {
+            message.data["bondKeys"] = bond_keys;
+            assert!(message.validate().is_err(), "{}", message.data);
+        }
+    }
+
+    #[test]
+    fn guided_tour_snapshot_from_typescript_validates() {
+        let message: Message =
+            serde_json::from_str(include_str!("../tests/fixtures/guided-tour-open.json")).unwrap();
+        assert_eq!(message.validate(), Ok(()));
+    }
+
+    #[test]
     fn guided_tour_accepts_all_try_it_commands() {
         let mut message = snapshot();
         message.dialog_kind = "guidedTour".into();
@@ -5701,6 +5958,216 @@ mod tests {
         }
         message.data = json!({"action":"tryTourCommand","command":"document.save"});
         assert!(message.validate().is_err());
+    }
+
+    /// Finding on #422: a Guided Tour action that keeps the tour open reserves the terminal slot,
+    /// and the owner's `accepted` receipt does not clear it. The owner's closing receipt (what
+    /// `DialogCoordinator.ts` publishes once the action ran) does, so the next action goes through;
+    /// only an action still running holds the slot, as for every other dialog kind.
+    #[test]
+    fn guided_tour_actions_that_keep_the_tour_open_release_the_slot_on_the_owner_receipt() {
+        let mut registry = Registry::default();
+        let mut tour = snapshot();
+        tour.dialog_kind = "guidedTour".into();
+        tour.data = json!({"title":"Take the Tour", "scheme":"chemdraft", "automatic":false});
+        let (registration, _) = register(&mut registry, tour.clone(), false).unwrap();
+        let session = registry.sessions.get_mut(&registration.host_id).unwrap();
+        // Messages are built from the JSON the dialog window sends, then checked as `dialog_send` does.
+        let message = |request_id: &str, message_type: &str, data: Value| {
+            let mut message = tour.clone();
+            message.request_id = request_id.into();
+            message.message_type = message_type.into();
+            message.data = data;
+            let wire = serde_json::to_string(&message).unwrap();
+            let message: Message = serde_json::from_str(&wire).unwrap();
+            assert_eq!(message.validate(), Ok(()), "{wire}");
+            message
+        };
+        for (index, data) in [
+            json!({"action":"chooseShortcuts","scheme":"chemdraw"}),
+            json!({"action":"tryTourCommand","command":"help.tour.openSample"}),
+            json!({"action":"tryTourCommand","command":"analyze.molecularProperties"}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("keep-open-{index}");
+            let action = message(&id, "action", data);
+            assert!(reserve_action(session, &action).unwrap(), "{id}");
+            // While the owner is still running it, a second action waits (cancel never does).
+            let finish = message("finish-early", "action", json!({"action":"finish"}));
+            assert!(reserve_action(session, &finish).is_err(), "{id}");
+            // `accepted` keeps the reservation; the closing receipt releases it.
+            let accepted = message(&id, "result", json!({"status":"accepted"}));
+            assert_eq!(accepted.data["status"], "accepted");
+            assert_eq!(session.terminal_request.as_ref(), Some(&id));
+            complete_action(
+                session,
+                &message(&id, "result", json!({"status":"cancelled"})),
+            );
+            assert!(session.terminal_request.is_none(), "{id}");
+        }
+        let finish = message("finish", "action", json!({"action":"finish"}));
+        assert!(reserve_action(session, &finish).unwrap());
+    }
+
+    #[test]
+    fn guided_tour_opens_only_the_plugin_authoring_guide() {
+        let mut message = snapshot();
+        message.dialog_kind = "guidedTour".into();
+        message.message_type = "action".into();
+        message.data = json!({"action":"openGuide","url":GUIDED_TOUR_GUIDE_URL});
+        assert_eq!(message.validate(), Ok(()));
+        for data in [
+            json!({"action":"openGuide"}),
+            json!({"action":"openGuide","url":1}),
+            json!({"action":"openGuide","url":GUIDED_TOUR_GUIDE_URL,"extra":true}),
+        ] {
+            message.data = data.clone();
+            assert!(message.validate().is_err(), "{data}");
+        }
+
+        let mut opened = Vec::new();
+        assert_eq!(
+            open_guided_tour_guide(GUIDED_TOUR_GUIDE_URL, |url| {
+                opened.push(url.to_string());
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(opened, [GUIDED_TOUR_GUIDE_URL]);
+        assert!(
+            open_guided_tour_guide(GUIDED_TOUR_GUIDE_URL, |_| Err("no opener".into()))
+                .is_err_and(|error| error.contains("no opener"))
+        );
+
+        let lookalikes = [
+            format!("{GUIDED_TOUR_GUIDE_URL}/extra"),
+            format!("{GUIDED_TOUR_GUIDE_URL}?x=1"),
+            format!("{GUIDED_TOUR_GUIDE_URL}#top"),
+            format!("{GUIDED_TOUR_GUIDE_URL} "),
+            GUIDED_TOUR_GUIDE_URL.replace("https://", "http://"),
+            GUIDED_TOUR_GUIDE_URL.replace("github.com", "github.com.example.net"),
+            GUIDED_TOUR_GUIDE_URL.replace("github.com", "evil.example"),
+            GUIDED_TOUR_GUIDE_URL.replace("https://github.com", "https://user@github.com"),
+            GUIDED_TOUR_GUIDE_URL.to_uppercase(),
+            "file:///etc/passwd".to_string(),
+            String::new(),
+        ];
+        for url in lookalikes {
+            let mut called = false;
+            assert!(
+                open_guided_tour_guide(&url, |_| {
+                    called = true;
+                    Ok(())
+                })
+                .is_err(),
+                "{url}"
+            );
+            assert!(!called, "{url}");
+        }
+    }
+
+    #[test]
+    fn guided_tour_window_stays_on_the_app_document_on_every_platform() {
+        let url = |text: &str| tauri::Url::parse(text).expect(text);
+        let dev = url("http://127.0.0.1:5174");
+        // macOS and Linux serve the app from its custom scheme; Windows (WebView2) from http.
+        for (origin, own, other) in [
+            (
+                ("tauri", "localhost"),
+                "tauri://localhost/?window=dialog&hostId=h",
+                "http://tauri.localhost/?window=dialog&hostId=h",
+            ),
+            (
+                ("http", "tauri.localhost"),
+                "http://tauri.localhost/?window=dialog&hostId=h",
+                "tauri://localhost/?window=dialog&hostId=h",
+            ),
+        ] {
+            assert!(
+                guided_tour_navigation_allowed(&url(own), origin, None),
+                "{own}"
+            );
+            assert!(
+                guided_tour_navigation_allowed(&url(own), origin, Some(&dev)),
+                "{own}"
+            );
+            assert!(
+                !guided_tour_navigation_allowed(&url(other), origin, None),
+                "{other}"
+            );
+            // The dev server's own origin is allowed only when this is a development build.
+            let served = "http://127.0.0.1:5174/?window=dialog&hostId=h";
+            assert!(guided_tour_navigation_allowed(
+                &url(served),
+                origin,
+                Some(&dev)
+            ));
+            assert!(!guided_tour_navigation_allowed(&url(served), origin, None));
+            for refused in [
+                GUIDED_TOUR_GUIDE_URL,
+                "https://github.com/",
+                "http://example.com/",
+                "https://tauri.localhost/",
+                "tauri://localhost.example/",
+                "tauri://localhost:8080/",
+                "http://tauri.localhost:8080/",
+                "tauri://user@localhost/",
+                "http://user:pw@tauri.localhost/",
+                "http://127.0.0.1:5173/",
+                "http://localhost:5174/",
+                "https://127.0.0.1:5174/",
+                "file:///etc/passwd",
+                "about:blank",
+                "data:text/html,hi",
+                "javascript:alert(1)",
+            ] {
+                assert!(
+                    !guided_tour_navigation_allowed(&url(refused), origin, Some(&dev)),
+                    "{refused}"
+                );
+            }
+        }
+        // The platform's own constant agrees with the origin installed plugins are served from.
+        let own = format!("{}://{}/", APP_DOCUMENT_ORIGIN.0, APP_DOCUMENT_ORIGIN.1);
+        assert!(guided_tour_navigation_allowed(
+            &url(&own),
+            APP_DOCUMENT_ORIGIN,
+            None
+        ));
+        #[cfg(windows)]
+        assert_eq!(own, "http://tauri.localhost/");
+        #[cfg(not(windows))]
+        assert_eq!(own, "tauri://localhost/");
+    }
+
+    #[test]
+    fn guided_tour_new_windows_open_only_the_guide_in_the_system_browser() {
+        let url = |text: &str| tauri::Url::parse(text).expect(text);
+        let mut opened = Vec::new();
+        guided_tour_new_window(&url(GUIDED_TOUR_GUIDE_URL), |address| {
+            opened.push(address.to_string());
+            Ok(())
+        });
+        assert_eq!(opened, [GUIDED_TOUR_GUIDE_URL]);
+        // A failing opener is logged, never a panic.
+        guided_tour_new_window(&url(GUIDED_TOUR_GUIDE_URL), |_| Err("no opener".into()));
+        for refused in [
+            format!("{GUIDED_TOUR_GUIDE_URL}?x=1"),
+            format!("{GUIDED_TOUR_GUIDE_URL}#top"),
+            GUIDED_TOUR_GUIDE_URL.replace("https://", "http://"),
+            "https://example.com/".to_string(),
+            "tauri://localhost/".to_string(),
+            "file:///etc/passwd".to_string(),
+        ] {
+            let mut called = false;
+            guided_tour_new_window(&url(&refused), |_| {
+                called = true;
+                Ok(())
+            });
+            assert!(!called, "{refused}");
+        }
     }
 
     #[test]
@@ -9859,6 +10326,202 @@ mod tests {
         message.message_type = "result".into();
         message.data = json!({"status": "accepted"});
         assert!(message.validate().is_err());
+    }
+
+    fn plugin_text_prompt() -> Message {
+        let mut message = snapshot();
+        message.dialog_kind = "pluginTextPrompt".into();
+        message.data = json!({"title": "Structure from Name", "label": "Chemical name",
+            "placeholder": "e.g. aspirin", "initialValue": "", "submitLabel": "Insert", "maxLength": 500,
+            "pluginName": "Name to Structure (OPSIN)", "pluginId": "org.chemdraft.opsin"});
+        message
+    }
+    #[test]
+    fn plugin_text_prompt_registers_owned_question_windows_with_document_focus_return() {
+        let spec = kind_spec("pluginTextPrompt").unwrap();
+        assert!(!spec.maximizable && spec.resizable && spec.fit_content);
+        assert!(include_str!("../capabilities/dialog-host.json")
+            .contains("dialog-main-pluginTextPrompt-*"));
+        assert!(is_dialog_label("dialog-main-pluginTextPrompt-12"));
+        assert!(!is_dialog_label("dialog-main-pluginTextPrompt-../main"));
+        assert!(!is_dialog_label("dialog-main-pluginTextPrompt-"));
+        assert!(is_question_kind("pluginTextPrompt") && is_question_kind("pageEnlargement"));
+        assert!(!is_question_kind("pageSize"));
+        // The window is titled by the plugin's own question, not a generic kind prefix.
+        assert_eq!(
+            native_window_title("pluginTextPrompt", spec.title, "Structure from Name"),
+            "Structure from Name"
+        );
+        let message = plugin_text_prompt();
+        assert!(message.validate().is_ok());
+        let mut registry = Registry::default();
+        let (first, _) = register(&mut registry, message.clone(), false).unwrap();
+        assert!(is_dialog_label(&first.window_label));
+        assert!(first
+            .window_label
+            .starts_with("dialog-main-pluginTextPrompt-"));
+        // The next queued prompt may register while the previous window is still closing.
+        let mut next = message.clone();
+        next.session_id = "next-prompt".into();
+        let (second, _) = register(&mut registry, next, false).unwrap();
+        assert_ne!(first.window_label, second.window_label);
+    }
+    #[test]
+    fn plugin_text_prompt_snapshot_caps_match_the_plugin_api_and_deny_unknown_fields() {
+        let valid = plugin_text_prompt();
+        let with = |field: &str, value: Value| {
+            let mut message = valid.clone();
+            message.data[field] = value;
+            message.validate()
+        };
+        // Boundaries accepted (UTF-16 units, like the plugin API's zod limits).
+        assert!(with("title", json!("x".repeat(200))).is_ok());
+        assert!(with("title", json!("😀".repeat(100))).is_ok());
+        assert!(with("label", json!("x".repeat(200))).is_ok());
+        assert!(with("placeholder", json!("")).is_ok());
+        assert!(with("placeholder", json!("x".repeat(200))).is_ok());
+        assert!(with("submitLabel", json!("x".repeat(200))).is_ok());
+        assert!(with("maxLength", json!(1)).is_ok());
+        assert!(with("maxLength", json!(2000)).is_ok());
+        assert!(with("pluginName", json!("x".repeat(128))).is_ok());
+        // Out of range, wrong type, or NUL.
+        for (field, value) in [
+            ("title", json!("")),
+            ("title", json!("x".repeat(201))),
+            ("title", json!("😀".repeat(101))),
+            ("label", json!("")),
+            ("label", json!("x".repeat(201))),
+            ("placeholder", json!("x".repeat(201))),
+            ("placeholder", json!(null)),
+            ("submitLabel", json!("")),
+            ("submitLabel", json!("x".repeat(201))),
+            ("maxLength", json!(0)),
+            ("maxLength", json!(2001)),
+            ("maxLength", json!(1.5)),
+            ("maxLength", json!("500")),
+            ("pluginName", json!("")),
+            ("pluginName", json!("x".repeat(129))),
+            ("pluginId", json!("")),
+            ("pluginId", json!("x".repeat(257))),
+            ("title", json!("a\u{0}b")),
+            ("initialValue", json!("x".repeat(501))),
+        ] {
+            assert!(with(field, value).is_err(), "{field} should be rejected");
+        }
+        // The optional Submit state: a bounded one-line reason and a boolean, never null.
+        assert!(with("statusLine", json!("Switch back to Untitled to insert.")).is_ok());
+        assert!(with("statusLine", json!("x".repeat(200))).is_ok());
+        assert!(with("submitEnabled", json!(false)).is_ok());
+        assert!(with("submitEnabled", json!(true)).is_ok());
+        for (field, value) in [
+            ("statusLine", json!("")),
+            ("statusLine", json!("x".repeat(201))),
+            ("statusLine", json!("a\u{0}b")),
+            ("statusLine", json!(null)),
+            ("statusLine", json!(3)),
+            ("submitEnabled", json!(null)),
+            ("submitEnabled", json!("false")),
+            ("submitEnabled", json!(0)),
+        ] {
+            assert!(with(field, value).is_err(), "{field} should be rejected");
+        }
+        let mut message = valid.clone();
+        message.data["path"] = json!("/private/drawing.cdxml");
+        assert!(message.validate().is_err());
+        let mut message = valid.clone();
+        message.data.as_object_mut().unwrap().remove("placeholder");
+        assert!(message.validate().is_err());
+        // The serialized message stays inside the small-dialog budget below the channel limit.
+        let mut message = valid.clone();
+        message.data["maxLength"] = json!(2000);
+        message.data["initialValue"] = json!("語".repeat(1200));
+        assert!(message.validate().is_err());
+        message.data["initialValue"] = json!("a".repeat(2000));
+        assert!(message.validate().is_ok());
+        let mut registry = Registry::default();
+        let (registration, _) = register(&mut registry, message.clone(), false).unwrap();
+        let session = registry.sessions.get(&registration.host_id).unwrap();
+        assert!(delivery(session, "main", &message).is_ok());
+    }
+    #[test]
+    fn plugin_text_prompt_accepts_only_submit_and_cancel_within_the_requested_length() {
+        let mut registry = Registry::default();
+        let mut snapshot = plugin_text_prompt();
+        snapshot.data["maxLength"] = json!(5);
+        let (registration, _) = register(&mut registry, snapshot.clone(), false).unwrap();
+        let session = registry.sessions.get_mut(&registration.host_id).unwrap();
+        let mut action = snapshot.clone();
+        action.message_type = "action".into();
+        for data in [
+            json!({"action": "submit", "value": "a".repeat(2000)}),
+            json!({"action": "cancel"}),
+        ] {
+            action.data = data;
+            assert!(action.validate().is_ok());
+        }
+        for data in [
+            json!({"action": "submit", "value": ""}),
+            json!({"action": "submit", "value": "a".repeat(2001)}),
+            json!({"action": "submit"}),
+            json!({"action": "submit", "value": 5}),
+            json!({"action": "submit", "value": "ok", "extra": true}),
+            json!({"action": "cancel", "value": "ok"}),
+            json!({"action": "apply", "value": "ok"}),
+            json!({"action": "enlarge"}),
+            json!({"action": "submit", "value": "a\u{0}"}),
+            json!({"action": "submit", "value": "語".repeat(1500)}),
+        ] {
+            action.data = data;
+            assert!(action.validate().is_err());
+        }
+        // Rust holds the retained snapshot's own limit, not just the API maximum.
+        action.data = json!({"action": "submit", "value": "toolong"});
+        assert!(reserve_action(session, &action).is_err());
+        action.request_id = "answer".into();
+        action.data = json!({"action": "submit", "value": "short"});
+        assert!(reserve_action(session, &action).unwrap());
+        action.request_id = "second-answer".into();
+        assert!(reserve_action(session, &action).is_err());
+        action.message_type = "result".into();
+        action.data = json!({"status": "accepted"});
+        assert!(action.validate().is_err());
+    }
+    #[test]
+    fn plugin_text_prompt_refuses_submit_while_off_and_releases_an_in_flight_submit() {
+        let mut registry = Registry::default();
+        let snapshot = plugin_text_prompt();
+        let (registration, _) = register(&mut registry, snapshot.clone(), false).unwrap();
+        let session = registry.sessions.get_mut(&registration.host_id).unwrap();
+        let mut off = snapshot.clone();
+        off.data["submitEnabled"] = json!(false);
+        off.data["statusLine"] = json!("Switch back to Untitled to insert.");
+        assert!(off.validate().is_ok());
+        let mut submit = snapshot.clone();
+        submit.message_type = "action".into();
+        submit.request_id = "in-flight".into();
+        submit.data = json!({"action": "submit", "value": "benzene"});
+        // A submit sent while Submit was on is reserved; turning Submit off releases it.
+        assert!(reserve_action(session, &submit).unwrap());
+        update_snapshot(session, &off);
+        assert!(session.terminal_request.is_none());
+        // While off, a new submit is refused and reserves nothing; cancel still works.
+        submit.request_id = "while-off".into();
+        assert!(reserve_action(session, &submit).is_err());
+        assert!(session.terminal_request.is_none());
+        // Back on: the user can submit again.
+        update_snapshot(session, &snapshot);
+        submit.request_id = "back-on".into();
+        assert!(reserve_action(session, &submit).unwrap());
+        // A cancel reservation is never released by a state change.
+        let mut registry = Registry::default();
+        let (registration, _) = register(&mut registry, snapshot.clone(), false).unwrap();
+        let session = registry.sessions.get_mut(&registration.host_id).unwrap();
+        let mut cancel = submit.clone();
+        cancel.request_id = "cancel".into();
+        cancel.data = json!({"action": "cancel"});
+        assert!(reserve_action(session, &cancel).unwrap());
+        update_snapshot(session, &off);
+        assert_eq!(session.terminal_request.as_deref(), Some("cancel"));
     }
 
     #[test]

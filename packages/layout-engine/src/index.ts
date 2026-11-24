@@ -7473,27 +7473,16 @@ export function atomDisplayLabelPlacement(
     const neighbors = heavyAtomNeighbors(atom.id, resolution);
     return nonElementAtomLabelPlacement(atom, neighbors, drawingStyle, recordedLabelBondSide(atom, neighbors.map((neighbor) => neighbor.id)))!;
   }
-  // Aromatic bonds count at their Kekulé orders, resolved once per molecule — the same bonds the
-  // formula and the valence check count, so the drawn H count and the formula agree. A molecule
-  // with no aromatic bond gets its own array back.
-  const valenceUsed = resolution.bondOrderUsage.get(atom.id) ?? 0;
   const formalCharge = atom.formalCharge;
   // A literal label (typed with the text tool) means exactly what it says — no auto-drawn
   // hydrogen count ever. Everything else follows the classic skeletal convention: the
-  // remaining valence is drawn as implicit hydrogens unless the style hides them. Each
-  // unpaired electron from an associated radical mark occupies a bonding slot, and a dative
-  // bond from a pyrrole-type N–H costs that proton (see `dativeDeprotonationCount`).
+  // remaining valence (`atomImplicitHydrogenCount`, the one count the formula, the valence check
+  // and the CDXML importer share) is drawn as implicit hydrogens unless the style hides them. A
+  // carbon bonded only datively has no count and draws none.
   const incidentBonds = resolution.bondsByAtom.get(atom.id) ?? [];
-  // A carbon whose only bonds are dative (a CO ligand's C drawn as a bare atom) cannot carry
-  // four hydrogens as well: under the terminal-carbon style it reads "C", never "CH4".
-  const dativeOnlyCarbon = element === "C" && incidentBonds.length > 0 && incidentBonds.every(isDativeBond);
-  const implicitHydrogens = drawingStyle.atomLabelHideImplicitHydrogens || atom.labelLiteral === true || dativeOnlyCarbon
+  const implicitHydrogens = drawingStyle.atomLabelHideImplicitHydrogens || atom.labelLiteral === true
     ? ""
-    : implicitHydrogenLabel(Math.max(
-        0,
-        nativeAtomValenceForCharge(element, formalCharge) - valenceUsed - (atom.markRadicals ?? 0)
-          - dativeDeprotonationCount(atom, bonds, atoms, resolution)
-      ));
+    : implicitHydrogenLabel(atomImplicitHydrogenCount(atom, bonds, atoms, resolution) ?? 0);
 
   if (element === "C" && formalCharge === 0 && atom.isotope === undefined) {
     const terminalCarbon = atoms.length > 0 && heavyAtomNeighborCount(atom.id, resolution) === 1;
@@ -7524,6 +7513,35 @@ export function atomDisplayLabelPlacement(
       ? `${implicitHydrogens}${element}${chargeLabelSuffix(labelCharge)}`
       : `${atom.isotope ?? ""}${element}${implicitHydrogens}${chargeLabelSuffix(labelCharge)}`
   };
+}
+
+/**
+ * The implicit hydrogens an element atom carries, exactly as `atomDisplayLabelPlacement` draws them
+ * when its style shows hydrogens: valence for the FULL formal charge (a floating mark's charge
+ * included), less the bond orders (aromatic bonds at their Kekulé orders), each radical's unpaired
+ * electron, and any dative deprotonation (`dativeDeprotonationCount`). Undefined where there is no
+ * single count: a label that is not an element symbol, and a carbon bonded only datively, whose
+ * label shows no H while the formula counts them. Display choices (a literal label, the
+ * hidden-hydrogen style) are the planner's and do not change the count. The CDXML importer compares
+ * a stated NumHydrogens against this same function, so the warning and the drawing cannot disagree.
+ */
+export function atomImplicitHydrogenCount(
+  atom: MoleculeAtom,
+  bonds: readonly CoreMoleculeBond[],
+  atoms: readonly MoleculeAtom[],
+  resolution: NativeBondOrderResolution = nativeBondOrderResolution(atoms, bonds)
+): number | undefined {
+  const element = nativeElementFromAtomLabel(atom.element);
+  if (!element) return undefined;
+  const incidentBonds = resolution.bondsByAtom.get(atom.id) ?? [];
+  // A carbon whose only bonds are dative (a CO ligand's C drawn as a bare atom) cannot carry
+  // four hydrogens as well: under the terminal-carbon style it reads "C", never "CH4".
+  if (element === "C" && incidentBonds.length > 0 && incidentBonds.every(isDativeBond)) return undefined;
+  return Math.max(
+    0,
+    nativeAtomValenceForCharge(element, atom.formalCharge) - (resolution.bondOrderUsage.get(atom.id) ?? 0)
+      - (atom.markRadicals ?? 0) - dativeDeprotonationCount(atom, bonds, atoms, resolution)
+  );
 }
 
 /**

@@ -1120,8 +1120,10 @@ struct NativeMenuNeedsRebuild(AtomicBool);
 )]
 #[serde(rename_all = "lowercase")]
 enum KeybindingScheme {
-    #[default]
     ChemDraft,
+    /// The industry-standard scheme, the default for new installs since 1.2.3. The native menu is
+    /// built with it until the document window pushes the stored scheme (`set_keybinding_scheme`).
+    #[default]
     ChemDraw,
 }
 
@@ -11504,7 +11506,7 @@ fn create_toolbars_menu<R: Runtime>(
 fn toolset_is_resizable(toolset_id: &str) -> bool {
     matches!(
         toolset_id,
-        "core.molecularInspector" | "core.drawnStructureSettings" | "core.ringInspector"
+        "core.molecularInspector" | "core.drawnStructureSettings"
     )
 }
 
@@ -13404,6 +13406,20 @@ fn find_menu_item_by_id<R: Runtime>(
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn keybinding_scheme_defaults_to_the_industry_standard_scheme() {
+        assert_eq!(KeybindingScheme::default(), KeybindingScheme::ChemDraw);
+        let state = KeybindingSchemeState::default();
+        assert_eq!(*state.0.lock().unwrap(), KeybindingScheme::ChemDraw);
+        assert_eq!(KeybindingScheme::default().rulers(), "CmdOrCtrl+;");
+        // An explicit scheme in the preferences file still wins, and none stored stays None.
+        let stored: DesktopPreferences =
+            serde_json::from_value(serde_json::json!({ "shortcutScheme": "chemdraft" })).unwrap();
+        assert_eq!(stored.shortcut_scheme, Some(KeybindingScheme::ChemDraft));
+        let empty: DesktopPreferences = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(empty.shortcut_scheme, None);
+    }
 
     #[test]
     fn desktop_preferences_persist_shortcut_schemes_independently() {
@@ -16216,11 +16232,7 @@ mod tests {
 
     #[test]
     fn only_scrolling_toolsets_allow_user_resize() {
-        for id in [
-            "core.molecularInspector",
-            "core.drawnStructureSettings",
-            "core.ringInspector",
-        ] {
+        for id in ["core.molecularInspector", "core.drawnStructureSettings"] {
             assert!(toolset_is_resizable(id), "{id}");
         }
         for id in [
@@ -16233,6 +16245,7 @@ mod tests {
             "core.layout",
             "core.style",
             "core.text",
+            "core.ringInspector",
             "plugin.fixture",
             "user.fixture",
         ] {
@@ -16246,7 +16259,9 @@ mod tests {
             serde_json::from_str(r#"{"x":-125.0,"y":275.0,"width":413.0,"height":317.0}"#).unwrap();
         for (id, expected) in [
             ("core.layout", None),
+            ("core.ringInspector", None),
             ("core.molecularInspector", Some((413.0, 317.0))),
+            ("core.drawnStructureSettings", Some((413.0, 317.0))),
         ] {
             let position = state.position().unwrap();
             assert_eq!((position.x, position.y), (-125.0, 275.0));

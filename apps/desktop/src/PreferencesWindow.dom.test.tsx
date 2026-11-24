@@ -116,6 +116,8 @@ describe.each(["macos", "windows"] as const)("Keyboard Preferences (%s)", platfo
   };
 
   it("searches, assigns, cancels and replaces conflicts, clears, resets and keeps separate schemes", async () => {
+    // The walk starts in ChemDraft's scheme (where Save and Open have menu chords) and switches away and back.
+    saveKeybindingSettings({ scheme: "chemdraft" });
     await mountKeyboard();
     const search = container.querySelector<HTMLInputElement>('input[aria-label="Search shortcuts"]')!;
     const searchFor = async (query: string) => {

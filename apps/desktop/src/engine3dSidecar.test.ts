@@ -1,24 +1,38 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { invoke } from "@tauri-apps/api/core";
 import type { MoleculeObject } from "@chemdraft/chem-core";
 import { parseMolfileGraph } from "@chemdraft/clipboard-adapter";
 import { unresolvableAromaticRing } from "@chemdraft/layout-engine/testing";
 import { depictSmiles2D } from "@chemdraft/ocl-adapter";
+import { ensureRdkit, resetRdkitForTesting } from "@chemdraft/rdkit-adapter";
+import { installNodeRdkitModuleLoader } from "@chemdraft/rdkit-adapter/node";
 import {
   Engine3DProtocolVersion,
   formatEngine3DMessage,
+  type Engine3DCreateSessionRequest,
   type Engine3DEvent,
-  type Engine3DResponse
+  type Engine3DResponse,
+  type Engine3DSessionInput
 } from "@chemdraft/engine3d-api";
+import * as conformerClient from "./conformerClient";
+import type { ConformerWorkRequest, ConformerWorkResponse } from "./conformerWorkerShared";
+import { Spin3dStereoReference } from "./interaction/spin3dStereo";
 import {
   createEngine3dSessionInputFromMolecule,
   describeEngine3dWorkspaceSession,
+  engine3dCoordsInAtomOrder,
   engine3dSidecarDisabledReason,
   initialEngine3dCoordsFromMolecule2d,
+  openEngine3dWorkspaceSession,
   reduceEngine3dSidecarOutput,
   type Engine3dSidecarSessionOutput,
   type Engine3dSidecarStatus,
   type Engine3dWorkspaceSessionState
 } from "./engine3dSidecar";
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("./rdkitWasmLoader", () => ({ registerRdkitWasmLoader: vi.fn() }));
+vi.mock("./chemistry3d/protocol", () => ({ handleChemistry3dRequest: vi.fn() }));
 
 const molecule: MoleculeObject = {
   id: "mol_1",
@@ -327,3 +341,171 @@ describe("engine3d sidecar disabled reason", () => {
     expect(engine3dSidecarDisabledReason(undefined)).toBeUndefined();
   });
 });
+
+describe("3D Workspace seeding", () => {
+  it.each(["worker error", "timeout"])("opens with the original seed and a warning after %s", async (failure) => {
+    vi.useFakeTimers();
+    const workerPort = new EventTarget();
+    const postMessage = vi.fn<(request: ConformerWorkRequest) => void>();
+    const worker = conformerClient.createConformerWorkerClient(() =>
+      Object.assign(workerPort, { postMessage }) as unknown as Worker
+    )!;
+    const refineSeed = vi.spyOn(conformerClient, "refineWorkspaceSeed").mockImplementation(worker.refineWorkspaceSeed);
+    const received = mockWorkspaceSeedEcho();
+    try {
+      const input = createEngine3dSessionInputFromMolecule({
+        ...molecule,
+        atoms: [{ ...molecule.atoms[0], isotope: 13 }, { ...molecule.atoms[1], formalCharge: -1 }]
+      }, {
+        selectedAtomIds: ["a2"],
+        coords3dByAtomId: { a1: { x: 0, y: 0, z: 0.2 }, a2: { x: 1.4, y: 0, z: -0.1 } }
+      });
+      const warnings = ["Existing warning"];
+      const opening = openEngine3dWorkspaceSession({ input, warnings });
+      const [request] = postMessage.mock.calls[0];
+      expect(request.kind).toBe("refine-workspace-seed");
+      if (failure === "timeout") {
+        await vi.advanceTimersByTimeAsync(2_999);
+        expect(invoke).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(postMessage).toHaveBeenLastCalledWith({ kind: "cancel", id: request.id });
+      } else {
+        workerPort.dispatchEvent(new MessageEvent<ConformerWorkResponse>("message", {
+          data: { id: request.id, stage: "error" }
+        }));
+      }
+
+      const session = await opening;
+      expect(received).toEqual([input]);
+      expect(session.coords3dByAtomId).toEqual(input.coords3dByAtomId);
+      expect(session.warnings).toEqual([
+        "Existing warning", "Could not refine the 3D starting shape. The structure may look bent."
+      ]);
+      expect(warnings).toEqual(["Existing warning"]);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      refineSeed.mockRestore();
+      vi.mocked(invoke).mockReset();
+      vi.useRealTimers();
+    }
+  });
+
+  it("opens porphine with a planar 24-atom macrocycle and preserves an edited seed", async () => {
+    installNodeRdkitModuleLoader();
+    const scope = new EventTarget();
+    const workerPort = new EventTarget();
+    const worker = conformerClient.createConformerWorkerClient(() => Object.assign(workerPort, {
+      postMessage: (data: ConformerWorkRequest) => {
+        queueMicrotask(() => scope.dispatchEvent(new MessageEvent("message", { data })));
+      }
+    }) as unknown as Worker)!;
+    vi.stubGlobal("addEventListener", scope.addEventListener.bind(scope));
+    vi.stubGlobal("postMessage", (data: ConformerWorkResponse) => {
+      queueMicrotask(() => workerPort.dispatchEvent(new MessageEvent("message", { data })));
+    });
+    const refineSeed = vi.spyOn(conformerClient, "refineWorkspaceSeed").mockImplementation(worker.refineWorkspaceSeed);
+
+    try {
+      const { startConformerWorker } = await import("./conformerWorkerRuntime");
+      startConformerWorker();
+      const molecule = moleculeFromSmiles(PORPHINE);
+      const ids = molecule.atoms.map(atom => atom.id);
+      expect(ids).toHaveLength(24);
+      const { molfile } = createEngine3dSessionInputFromMolecule(molecule);
+      const stereo = new Spin3dStereoReference(await ensureRdkit(), molecule);
+      // Fast Spin publishes only the raw embed. Workspace still needs quality geometry.
+      const seed = await new Promise<Float64Array>((resolve, reject) => {
+        worker.generate(molfile, ids.length, { optimize: "none", seed: 42 }, "rdkit", {
+          onEmbedded: (result) => result.embed.status === "ok"
+            ? resolve(result.mapping.coords3dByOriginalAtom)
+            : reject(new Error(result.embed.failureReason)),
+          onRefined: () => undefined,
+          onError: (message) => reject(new Error(message))
+        });
+      });
+
+      const received = mockWorkspaceSeedEcho();
+      const open = (coords: Float64Array) => openEngine3dWorkspaceSession({
+        input: createEngine3dSessionInputFromMolecule(molecule, {
+          coords3dByAtomId: Object.fromEntries(ids.map((id, i) => [id, {
+            x: coords[3 * i], y: coords[3 * i + 1], z: coords[3 * i + 2]
+          }]))
+        }),
+        checkStereo: (positions) => stereo.checkGeometry(engine3dCoordsInAtomOrder(ids, positions)!, true)
+      });
+
+      const session = await open(seed);
+      expect(session.warnings).toEqual([]);
+      expect(received[0].molfile).toBe(molfile);
+      expect(received[0].atomIdByMolfileIndex).toEqual(ids);
+      const result = engine3dCoordsInAtomOrder(ids, session.coords3dByAtomId!);
+      expect(bestFitPlaneRms(result!)).toBeLessThan(0.3);
+
+      const edited = seed.slice();
+      edited[2] += 0.5;
+      const editedSession = await open(edited);
+      expect(editedSession.warnings).toEqual([]);
+      expect(engine3dCoordsInAtomOrder(ids, editedSession.coords3dByAtomId!)).toEqual(edited);
+    } finally {
+      vi.unstubAllGlobals();
+      refineSeed.mockRestore();
+      vi.mocked(invoke).mockReset();
+      resetRdkitForTesting();
+    }
+  }, 20_000);
+});
+
+/** Echo the startup request through the protocol without a platform-specific binary. */
+function mockWorkspaceSeedEcho(): Engine3DSessionInput[] {
+  const received: Engine3DSessionInput[] = [];
+  vi.mocked(invoke).mockImplementation(async (command, args) => {
+    expect(command).toBe("engine3d_sidecar_start_session");
+    const request = JSON.parse((args as { lines: string[] }).lines[0]) as Engine3DCreateSessionRequest;
+    received.push(request.input);
+    const frame: Engine3DEvent = {
+      protocolVersion: Engine3DProtocolVersion,
+      requestId: request.requestId,
+      sessionId: "session_1",
+      type: "event",
+      eventType: "coordinatesChanged",
+      reason: "initial-relax",
+      coords3dByAtomId: request.input.coords3dByAtomId
+    };
+    return output([formatEngine3DMessage(frame)]);
+  });
+  return received;
+}
+
+const PORPHINE = "C1=CC2=NC1=CC3=CC=C(N3)C=C4C=CC(=N4)C=C5C=CC(=C2)N5";
+
+/** The smallest principal variance is the mean squared distance to the best-fit plane. */
+function bestFitPlaneRms(coords: Float64Array): number {
+  const count = coords.length / 3;
+  const axes = [0, 1, 2].map((axis) => {
+    const values = Array.from({ length: count }, (_, index) => coords[3 * index + axis]);
+    const mean = values.reduce((sum, value) => sum + value, 0) / count;
+    return values.map((value) => value - mean);
+  });
+  const covariance = axes.map((a) => axes.map((b) =>
+    a.reduce((sum, value, index) => sum + value * b[index], 0) / count
+  ));
+  // Cyclic Jacobi rotations diagonalize the symmetric 3 × 3 covariance matrix.
+  for (let sweep = 0; sweep < 12; sweep += 1) {
+    for (const [p, q] of [[0, 1], [0, 2], [1, 2]]) {
+      if (Math.abs(covariance[p][q]) < 1e-14) continue;
+      const angle = Math.atan2(2 * covariance[p][q], covariance[q][q] - covariance[p][p]) / 2;
+      const c = Math.cos(angle);
+      const s = Math.sin(angle);
+      for (const row of covariance) {
+        [row[p], row[q]] = [c * row[p] - s * row[q], s * row[p] + c * row[q]];
+      }
+      for (let column = 0; column < 3; column += 1) {
+        const a = covariance[p][column];
+        const b = covariance[q][column];
+        covariance[p][column] = c * a - s * b;
+        covariance[q][column] = s * a + c * b;
+      }
+    }
+  }
+  return Math.sqrt(Math.max(0, Math.min(...covariance.map((row, index) => row[index]))));
+}

@@ -24,6 +24,7 @@ import {
   type Engine3DSessionRequest,
   type Engine3DUpdateDragRequest
 } from "@chemdraft/engine3d-api";
+import { refineWorkspaceSeed } from "./conformerClient";
 
 export interface Engine3dSidecarStatus {
   available: boolean;
@@ -93,6 +94,7 @@ export interface Engine3dMoleculeSessionOptions {
 const Engine3dWorkspaceReadyTimeoutMs = 12_000;
 const Engine3dWorkspaceReadyPollMs = 80;
 const Engine3dWorkspaceSettleTimeoutMs = 2_000;
+const WorkspaceSeedRefinementWarning = "Could not refine the 3D starting shape. The structure may look bent.";
 
 let engine3dDiagnosticsEnabled = false;
 
@@ -196,18 +198,20 @@ export function createEngine3dSessionInputFromMolecule(
 export async function openEngine3dWorkspaceSession(
   options: Engine3dWorkspaceStartOptions
 ): Promise<Engine3dWorkspaceSessionState> {
+  const warnings = [...(options.warnings ?? [])];
+  const input = await prepareEngine3dWorkspaceInput(options, warnings);
   const createRequest: Engine3DCreateSessionRequest = {
     protocolVersion: Engine3DProtocolVersion,
     type: "createSession",
     requestId: "engine3d-1",
-    input: options.input
+    input
   };
   const started = await startEngine3dSidecarSession([engine3dProtocolLine(createRequest)]);
   let state = reduceEngine3dSidecarOutput({
     ...createInitialEngine3dWorkspaceSessionState(started.processSessionId),
-    warnings: [...(options.warnings ?? [])],
+    warnings,
     stereo: options.checkStereo ? {
-      input: options.input, check: options.checkStereo, rejected: 0, needsReseed: false,
+      input, check: options.checkStereo, rejected: 0, needsReseed: false,
       failedSeeds: []
     } : undefined
   }, started);
@@ -230,6 +234,30 @@ export async function openEngine3dWorkspaceSession(
     // The session may have exited while the renderer was waiting for startup output.
   }
   throw new Error(`Interactive 3D sidecar did not become ready within ${Engine3dWorkspaceReadyTimeoutMs / 1000} seconds.`);
+}
+
+async function prepareEngine3dWorkspaceInput(
+  { input, checkStereo }: Engine3dWorkspaceStartOptions,
+  warnings: string[]
+): Promise<Engine3DSessionInput> {
+  const { atomIdByMolfileIndex, coords3dByAtomId, molfile } = input;
+  const seed = coords3dByAtomId && engine3dCoordsInAtomOrder(atomIdByMolfileIndex, coords3dByAtomId);
+  if (!seed?.length) return input;
+
+  // The sidecar's short UFF startup pass cannot repair some warped ETKDG
+  // macrocycles. Reuse the worker's refinement of this exact embed before UFF.
+  const outcome = await refineWorkspaceSeed(molfile, seed);
+  if (!outcome || outcome.status === "skipped") return input;
+
+  if (outcome.status === "refined" && outcome.coords.length === seed.length && outcome.coords.every(Number.isFinite)) {
+    const refined = outcome.coords;
+    const positions = Object.fromEntries(atomIdByMolfileIndex.map((id, i) => [id, {
+      x: refined[3 * i], y: refined[3 * i + 1], z: refined[3 * i + 2]
+    }]));
+    if (!checkStereo?.(positions)) return { ...input, coords3dByAtomId: positions };
+  }
+  warnings.push(WorkspaceSeedRefinementWarning);
+  return input;
 }
 
 export async function pollEngine3dWorkspaceSessionState(
