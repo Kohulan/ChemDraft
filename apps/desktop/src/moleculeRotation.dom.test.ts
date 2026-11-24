@@ -124,8 +124,10 @@ describe.each(["macos", "windows"] as const)("whole-molecule angle entry (%s)", 
       expect(after.atoms).not.toEqual(before.atoms);
       await command("edit.undo");
       expect(molecule()).toEqual(before);
+      expect(container.querySelector('[role="status"]')?.textContent).toBe("Undid Rotate molecule");
       await command("edit.redo");
       expect(molecule()).toEqual(after);
+      expect(container.querySelector('[role="status"]')?.textContent).toBe("Redid Rotate molecule");
     }
     expect(snapshot().selection.objectIds).toEqual([before.id]);
   });

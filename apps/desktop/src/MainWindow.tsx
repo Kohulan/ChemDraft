@@ -17746,10 +17746,12 @@ export function MainWindow({
       return false;
     }
 
+    const rotatedType = findDocumentObject(session.startDocument, session.objectId)?.type;
+    const rotateLabel = rotatedType === "electron-mark" ? "Rotate electron mark" : rotatedType === "molecule" ? "Rotate molecule" : "Rotate art object";
     const changed = !session.rotationRefusal &&
-      commitLiveInputPreview(session.startDocument, findDocumentObject(session.startDocument, session.objectId)?.type === "electron-mark" ? "Rotate electron mark" : undefined);
-    if (changed && findDocumentObject(session.startDocument, session.objectId)?.type !== "molecule") {
-      documentUndoLabelsRef.current.set(documentHistoryRef.current.present, findDocumentObject(session.startDocument, session.objectId)?.type === "electron-mark" ? "Rotate electron mark" : "Rotate art object");
+      commitLiveInputPreview(session.startDocument, rotatedType === "electron-mark" ? "Rotate electron mark" : undefined);
+    if (changed) {
+      documentUndoLabelsRef.current.set(documentHistoryRef.current.present, rotateLabel);
     }
     updateRotationInput(undefined);
     setObjectRotateReadout(undefined);
