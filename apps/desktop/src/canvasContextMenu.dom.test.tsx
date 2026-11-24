@@ -198,6 +198,64 @@ describe("stereo readout row", () => {
     expect(onInvoke).not.toHaveBeenCalled();
   });
 
+  it("re-measures an open flyout once the late row arrives and the root clamp has applied", async () => {
+    const readout = deferred();
+    // jsdom has no layout: the root is 100px tall without the row and 140px with it; the Copy As
+    // trigger sits 100px below the root's top (plus the row); its flyout is 300px tall.
+    const hasRow = (menu: Element) => menu.firstElementChild?.textContent === "Stereocentre: R";
+    const rect = (top: number, height: number) => ({ top, height, bottom: top + height, left: 0, right: 100, width: 100, x: 0, y: top, toJSON() {} }) as DOMRect;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      const rootMenu = this.closest<HTMLElement>('[aria-label="Object layer options"]');
+      if (!rootMenu) return rect(0, 0);
+      if (this === rootMenu) return rect(parseFloat(rootMenu.style.top), hasRow(rootMenu) ? 140 : 100);
+      if (this.classList.contains("object-context-menu-flyout")) return rect(0, 300);
+      if (this.classList.contains("object-context-menu-submenu"))
+        return rect(parseFloat(rootMenu.style.top) + (hasRow(rootMenu) ? 140 : 100), 24);
+      return rect(0, 0);
+    });
+    try {
+      // Window 768 tall. The 100px root fits at y=640, so it is not clamped until the row makes it 140px.
+      expect(window.innerHeight).toBe(768);
+      await act(async () => root.render(<CanvasContextMenu items={items} position={{ x: 10, y: 640 }} label="Object layer options"
+        targetKind="atom" onInvoke={() => {}} onDismiss={() => {}} loadStereoReadout={() => readout.promise} />));
+      const menu = container.querySelector<HTMLElement>('[aria-label="Object layer options"]')!;
+      expect(menu.style.top).toBe("640px");
+      const trigger = menu.querySelector<HTMLButtonElement>('[data-context-submenu="copy-as"]')!;
+      await act(async () => trigger.click());
+      const flyout = () => menu.querySelector<HTMLElement>(".object-context-menu-flyout")!;
+      // Trigger top 740: 740 + 300 + 8 - 768 = 280.
+      expect(flyout().style.top).toBe("-280px");
+      trigger.focus();
+      await act(async () => readout.resolve("Stereocentre: R"));
+      // The root clamps to 768 - 140 - 8 = 620, the trigger to 760: 760 + 308 - 768 = 300. A stale
+      // offset stays -280; one measured before the clamp (trigger at 780) would be -320.
+      expect(menu.style.top).toBe("620px");
+      expect(flyout().style.top).toBe("-300px");
+      expect(document.activeElement).toBe(trigger);
+    } finally {
+      vi.mocked(HTMLElement.prototype.getBoundingClientRect).mockRestore();
+    }
+  });
+
+  it("native popup is never presented when the menu unmounts during the readout wait", async () => {
+    vi.stubGlobal("__TAURI_INTERNALS__", {});
+    const calls: string[] = [];
+    tauri.handler = command => { if (command === "popup_canvas_context_menu") calls.push(command); return null; };
+    const closed = vi.fn();
+    window.addEventListener("chemdraft:native-canvas-menu-closed", closed);
+    const readout = deferred();
+    try {
+      await act(async () => root.render(<CanvasContextMenu items={items} position={{ x: 10, y: 10 }} label="Object layer options"
+        targetKind="atom" onInvoke={() => {}} onDismiss={() => {}} loadStereoReadout={() => readout.promise} />));
+      await act(async () => root.render(<></>));
+      await act(async () => { readout.resolve("Stereocentre: R"); await new Promise(resolve => setTimeout(resolve, 0)); });
+      expect(calls).toEqual([]);
+      expect(closed).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener("chemdraft:native-canvas-menu-closed", closed);
+    }
+  });
+
   it.each([undefined, "unavailable"])("inline menu omits the row when the readout is %s", async outcome => {
     await act(async () => root.render(<CanvasContextMenu items={items} position={{ x: 10, y: 10 }} label="Object layer options"
       targetKind="atom" onInvoke={() => {}} onDismiss={() => {}}

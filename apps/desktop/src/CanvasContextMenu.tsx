@@ -32,7 +32,9 @@ export function CanvasContextMenu(props: CanvasContextMenuProps) {
     void Promise.resolve().then(async () => {
       if (!active) return;
       const result = await popupNativeCanvasMenu(props.items, props.position,
-        { loadStereoReadout: props.loadStereoReadout });
+        { loadStereoReadout: props.loadStereoReadout, isActive: () => active });
+      // Dismissed before the popup opened: nothing tracked, so there is no release to report.
+      if (result === null) return;
       // Native tracking can consume the right-button release, even on cancellation.
       window.dispatchEvent(new Event(NATIVE_CANVAS_MENU_CLOSED_EVENT));
       if (!active) return;
@@ -94,6 +96,9 @@ function HtmlCanvasContextMenu(props: CanvasContextMenuProps) {
       pendingFocus.current = false;
     }
   });
+  // Flyouts re-measure when the late row shifts them and again once the root clamp has moved the
+  // menu (child layout effects run before the root's, so the position term catches the clamp).
+  const layout = `${stereoReadout ?? ""}@${position.x},${position.y}`;
   return <div className="object-context-menu" role="menu" ref={root} aria-label={props.label}
     data-context-object-id={props.objectId} data-context-target-kind={props.targetKind}
     data-context-layer-index={props.objectIndex !== undefined && props.objectIndex >= 0 ? props.objectIndex : undefined}
@@ -147,16 +152,17 @@ function HtmlCanvasContextMenu(props: CanvasContextMenuProps) {
       }
     }}>
     {/* Its own slot, so the late row never shifts the index keys (and focus) of the items. */}
-    <HtmlMenuItems items={withStereoReadout([], stereoReadout)} open={open} setOpen={setOpen} onInvoke={props.onInvoke} />
-    <HtmlMenuItems items={props.items} open={open} setOpen={setOpen} onInvoke={props.onInvoke} />
+    <HtmlMenuItems items={withStereoReadout([], stereoReadout)} open={open} setOpen={setOpen} onInvoke={props.onInvoke} layout={layout} />
+    <HtmlMenuItems items={props.items} open={open} setOpen={setOpen} onInvoke={props.onInvoke} layout={layout} />
   </div>;
 }
 
-function HtmlMenuItems({ items, open, setOpen, onInvoke }: {
+function HtmlMenuItems({ items, open, setOpen, onInvoke, layout }: {
   items: readonly CanvasMenuItem[];
   open?: string;
   setOpen(id: string | undefined): void;
   onInvoke(commandId: string): void;
+  layout: string;
 }) {
   return items.map((item, index) => {
     if (item.kind === "separator") return <div key={index} className="object-context-menu-separator" role="separator" />;
@@ -165,16 +171,17 @@ function HtmlMenuItems({ items, open, setOpen, onInvoke }: {
       aria-checked={item.checked} className="object-context-menu-item" data-command-id={item.commandId}
       disabled={!item.enabled} title={item.disabledReason} onClick={() => onInvoke(item.commandId)}>{item.label}</button>;
     const expanded = open === item.id;
-    return <HtmlSubmenu key={item.id} item={item} expanded={expanded} setOpen={setOpen}>
-      <HtmlMenuItems items={item.items} open={open} setOpen={setOpen} onInvoke={onInvoke} />
+    return <HtmlSubmenu key={item.id} item={item} expanded={expanded} setOpen={setOpen} layout={layout}>
+      <HtmlMenuItems items={item.items} open={open} setOpen={setOpen} onInvoke={onInvoke} layout={layout} />
     </HtmlSubmenu>;
   });
 }
 
-function HtmlSubmenu({ item, expanded, setOpen, children }: {
+function HtmlSubmenu({ item, expanded, setOpen, layout, children }: {
   item: Extract<CanvasMenuItem, { kind: "submenu" }>;
   expanded: boolean;
   setOpen(id: string | undefined): void;
+  layout: string;
   children: React.ReactNode;
 }) {
   const parent = useRef<HTMLDivElement>(null), flyout = useRef<HTMLDivElement>(null);
@@ -184,7 +191,7 @@ function HtmlSubmenu({ item, expanded, setOpen, children }: {
     const rect = parent.current.getBoundingClientRect(), menu = flyout.current.getBoundingClientRect();
     setStyle({ ...(rect.right + menu.width + 8 > window.innerWidth ? { right: "100%" } : { left: "100%" }),
       top: `${-Math.max(0, rect.top + menu.height + 8 - window.innerHeight)}px` });
-  }, [expanded]);
+  }, [expanded, layout]);
   const id = `canvas-${item.id}-menu`;
   return <div className="object-context-menu-submenu" ref={parent}
     onPointerEnter={() => { if (item.enabled) setOpen(item.id); }} onPointerLeave={() => setOpen(undefined)}>
