@@ -27,7 +27,7 @@ beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("localStorage", new MemoryStorage());
   container = document.createElement("div"); document.body.append(container); root = createRoot(container);
-  state.show.mockReset().mockResolvedValue(undefined);
+  state.show.mockReset().mockResolvedValue(true);
 });
 afterEach(() => {
   act(() => root.unmount()); state.probe?.stop(); state.probe = undefined;
@@ -73,13 +73,13 @@ it("waits for the popover reveal, records its destination frame and settles the 
   palette.instance.popoverRequested("arrows");
   expect([...palette.timers.values()].some(timer => timer.delay === 1500)).toBe(false);
   const popover = probe("palette-popover"); state.probe = popover.instance;
-  let reveal!: () => void;
-  state.show.mockImplementation(() => new Promise<void>(resolve => { reveal = resolve; }));
+  let reveal!: (shown: boolean) => void;
+  state.show.mockImplementation(() => new Promise<boolean>(resolve => { reveal = resolve; }));
   await act(async () => root.render(createElement(PalettePopoverWindow, { toolsetId: "core.main", kind: "flyout", prewarm: true })));
   expect(state.show).not.toHaveBeenCalled();
   await act(async () => state.content!(content));
   popover.instance.rendered(); popover.paint(); expect(popover.rows).toEqual([]);
-  popover.setTime(1500); await act(async () => reveal()); popover.setTime(1520); popover.paint();
+  popover.setTime(1500); await act(async () => reveal(true)); popover.setTime(1520); popover.paint();
   expect(popover.rows[0]).toMatchObject({ kind: "window-shown", window: "palette-popover", doneSignal: "popover-shown", doneMs: 500, firstFrameMs: 520 });
   palette.instance.popoverShown("wrong-flyout", 1500, 1520, "toolset-popover-core-main");
   expect(palette.rows).toEqual([]);

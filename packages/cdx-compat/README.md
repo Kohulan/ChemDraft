@@ -12,6 +12,8 @@ restoring future fields and avoiding a second schema pass. Export warnings inclu
 `NATIVE_EXTENSION_DATA_DROPPED` when edits invalidate preservation of identity-free arrays. See
 [the native compatibility contract](../../docs/architecture/native-document-compatibility.md).
 
+Plain CDXML and CDX carry standard lone pairs as Symbol graphics. An atom attachment uses the exported node ID in a represent child. Import resolves the attachment after reading the page, including when the symbol comes first. A free pair stays at its drawn position. Independently styled or non-square native marks still receive the appearance warning when their dimensions cannot be expressed by a symbol's single size handle.
+
 Legacy unknown chemistry enum strings survive exactly in the embedded native payload; the visible
 CDXML layer reports `cdxml.native_enum_payload_only` when it cannot represent them. Unknown-order
 bonds write `Order="any"` with `cdxml.unknown_bond_order`, never a single-bond guess. Binary CDX uses the same native compatibility contract.
@@ -27,6 +29,34 @@ produce compatibility warnings. Export defaults to omitting native metadata.
 CDXML embeds native metadata by default; `{ embedNativePayload: false }` omits it, including the
 root hash-version attribute `attrib4345`. Warnings about
 unsupported data say explicitly when that data is not written because no payload is embedded.
+
+Straight native reaction arrows and semantic art arrows export as real `<arrow>` elements in
+CDXML and Arrow objects (`0x8021`) in binary CDX. `Tail3D` is the native start; `Head3D` is the
+native end. Direction comes from these endpoints, independently of the normalized `BoundingBox`.
+All forms carry `FillType="None"`, stroke color, line style and representable line width.
+
+| Native form | `ArrowheadHead` | `ArrowheadTail` | `ArrowheadType` | `ArrowShaftSpacing` |
+| --- | --- | --- | --- | --- |
+| Forward, including bold/dashed variants | Full | omitted | Solid | omitted |
+| Resonance / double-headed | Full | Full | Solid | omitted |
+| Fishhook / half-head | HalfLeft | omitted | Solid | omitted |
+| Equilibrium | HalfLeft | HalfLeft | Solid | 300 |
+| Retrosynthesis | Full | omitted | Angle | 600 |
+| Open full head | Full | omitted | Angle | omitted |
+| Imported hollow full head | Full | omitted | Hollow | omitted |
+
+Art-arrow markers override the defaults in this table, preserving edited head sides and removed
+heads. Retrosynthesis uses its native parallel-shaft path head. The dual-shaft attribute conventions
+also appear in the independent [Indigo exporter](https://github.com/epam/Indigo/blob/master/core/indigo-core/molecule/src/molecule_cdxml_saver.cpp).
+Their exact head dimensions and shaft gaps remain appearance approximations. Half heads are not
+handed in the native model; export uses HalfLeft. Imported Hollow heads display with the native
+open marker and a named approximation warning; unchanged marker kinds retain Hollow on export.
+Mixed solid/open end types and decorative markers retain the existing named export warnings.
+
+Legacy Graphic Line + ArrowType input remains supported. No recognized semantic arrow kind needs
+a legacy Graphic export exception. An unknown reaction-arrow kind still writes an unheaded
+Graphic line with its existing warning rather than inventing chemistry. Curved arrows retain the
+existing curve export path.
 
 Native multi-atom labels are encoded as standard `GenericNickname` nodes with label text on the
 existing atom; its bond endpoints stay unchanged. Import also accepts unexpanded nickname, formula,

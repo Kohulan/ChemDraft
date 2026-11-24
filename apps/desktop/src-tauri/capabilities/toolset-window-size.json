@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "toolset-window-size",
+  "description": "Allow native tool palettes to fit the calling window to their content.",
+  "windows": ["toolset-*"],
+  "permissions": ["allow-resize-toolset-window"]
+}

@@ -2,7 +2,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { moleculeToMolfileV2000, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
+import { applyPatch, moleculeToMolfileV2000, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
 import * as OCL from "openchemlib";
 import { planTableLayout } from "@chemdraft/layout-engine";
 import { MainWindow } from "./MainWindow";
@@ -10,6 +10,7 @@ import { createPhase4Document, insertNativeSingleBondMolecule, insertNativeTextO
   insertTableIntoDocument } from "./documentWorkflow";
 import { getAssistantHistoryPort } from "./assistant/historyPort";
 import { MemoryStorage } from "./testSupport/memoryStorage";
+import { ammoniumElectronMarkDropFixture, dropMark } from "./testSupport/electronMarkDropFixture";
 import { DOM_COMMAND_EVENT } from "./window-manager";
 
 vi.mock("./rdkitWasmLoader", () => ({ registerRdkitWasmLoader: vi.fn() }));
@@ -116,6 +117,34 @@ describe.each(["macos", "windows"] as const)("canvas arrow nudge (%s)", platform
     expect(container.querySelector('[role="status"]')?.textContent).toBe("Moved selection down by 10 px");
     expectTranslation(before, 0, 10);
     await undo(); expect(current().pages).toEqual(before.pages);
+  });
+  it("labels the whole arrow nudge burst when the second press removes a charge", async () => {
+    const { document, nitrogen } = ammoniumElectronMarkDropFixture();
+    const mark = dropMark(document);
+    const nearEdge = applyPatch(document, { op: "updateObject", objectId: mark.id, changes: {
+      x: nitrogen.x + 24 - mark.width / 2, y: nitrogen.y - mark.height / 2
+    } });
+    await mountDocument(selectDocumentObjects(nearEdge, nearEdge.pages[0].id, [mark.id]));
+    vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    const before = current();
+    const status = () => container.querySelector("[data-status-message]")?.textContent;
+    await key("ArrowRight");
+    expect(dropMark(current()).anchor).toEqual(mark.anchor);
+    expect(molecule().atoms[0].formalCharge).toBe(1);
+    await key("ArrowRight", { repeat: true });
+    const after = current();
+    expect(dropMark(after).anchor.kind).toBe("point");
+    expect(molecule().atoms[0].formalCharge).toBe(0);
+    expect(status()).toBe("Charge removed from N (N now NH3)");
+    await key("ArrowRight", { repeat: true });
+    const final = current();
+    expect(dropMark(final).x).toBe(dropMark(after).x + 1);
+    await undo();
+    expect(status()).toBe("Undid Move and Remove Charge");
+    expect(current()).toEqual(before);
+    await redo();
+    expect(status()).toBe("Redid Move and Remove Charge");
+    expect(current()).toEqual(final);
   });
   function twoPageDrawing() {
     let initial = insertNativeSingleBondMolecule(createPhase4Document("Page 2 nudge"), { x: 200, y: 200 });
@@ -257,10 +286,54 @@ describe.each(["macos", "windows"] as const)("canvas arrow nudge (%s)", platform
     await pointer(target(), "pointerup", atom, true);
     const before = current();
     await key("ArrowRight", {}, canvas); await key("ArrowRight", { repeat: true }, canvas);
+    expect(container.querySelector('[role="status"]')?.textContent).toBe("Moved selection right by 1 px");
     expect(molecule().atoms).toEqual(molecule(before).atoms.map(candidate => candidate.id === atom.id
       ? { ...candidate, x: candidate.x + 2 } : candidate));
     expect(canonical()).toBe(canonical(before));
     await undo(); expect(current().pages).toEqual(before.pages);
+  });
+  it("reports movement of another object after Undo and an edge-clamped atom nudge", async () => {
+    const initial = structuredClone(insertNativeTextObject(
+      insertNativeSingleBondMolecule(createPhase4Document("Nudge after undo"), { x: 200, y: 200 }),
+      { x: 350, y: 250 }, "Conditions"));
+    const item = molecule(initial);
+    item.atoms[1].x = initial.pages[0].width;
+    const text = initial.pages[0].objects.find(object => object.type === "text")!;
+    await mountDocument(selectDocumentObjects(initial, initial.pages[0].id, [text.id]));
+    const selectAtom = async (index: number) => {
+      const target = container.querySelector(`[data-object-id="${item.id}"]`)!;
+      const atom = molecule().atoms[index];
+      await pointer(target, "pointerdown", atom, true);
+      await pointer(target, "pointerup", atom, true);
+    };
+    await selectAtom(0);
+    await key("ArrowRight", {}, canvas);
+    await undo();
+    await selectAtom(0);
+    await selectAtom(1);
+    const before = current();
+    await key("ArrowRight", {}, canvas);
+    expect(molecule().atoms[1].x).toBe(before.pages[0].width);
+    expect(current().pages[0].objects.find(object => object.id === text.id)!.x).toBe(text.x + 1);
+    expect(container.querySelector('[role="status"]')?.textContent).toBe("Moved selection right by 1 px");
+  });
+  it("breaks equal opposing nudge distances in page object order", async () => {
+    const initial = structuredClone(insertNativeTextObject(
+      insertNativeSingleBondMolecule(createPhase4Document("Nudge tie"), { x: 200, y: 200 }),
+      { x: 350, y: 250 }, "Conditions"));
+    const page = initial.pages[0];
+    const text = page.objects.find(object => object.type === "text")!;
+    text.x = page.width - text.width + 1;
+    await mountDocument(selectDocumentObjects(initial, page.id, [text.id]));
+    const atom = molecule().atoms[0];
+    const target = container.querySelector(`[data-object-id="${molecule().id}"]`)!;
+    await pointer(target, "pointerdown", atom, true);
+    await pointer(target, "pointerup", atom, true);
+    const before = current();
+    await key("ArrowRight", {}, canvas);
+    expect(molecule().atoms[0].x - molecule(before).atoms[0].x).toBe(1);
+    expect(current().pages[0].objects.find(object => object.id === text.id)!.x - text.x).toBe(-1);
+    expect(container.querySelector('[role="status"]')?.textContent).toBe("Moved selection right by 1 px");
   });
   it("leaves empty selections unchanged and adds no undo entry", async () => {
     await mount(false); const before = current();

@@ -3,7 +3,8 @@ import { arrowFrameFromPoints, arrowPathSamplePoints, graphicArrowAttachmentFram
   graphicOpenStrokePageSamplePoints } from "@chemdraft/art-engine";
 // These renderer helpers remain in the entry point because they are widely used there.
 import { mechanismArrowGeometry, resolvePageAnchorPoint, nativeTextObjectLineMetrics,
-  moleculeOutlineForArrangement, textVisualBoundsForArrangement } from "./index";
+  moleculeOutlineForArrangement, textVisualBoundsForArrangement, projectedPlaneMatrixForObject,
+  projectPointInObjectPlane } from "./index";
 export { nativeTextObjectLineMetrics, moleculeOutlineForArrangement, textVisualBoundsForArrangement };
 export { arrowAttachmentPoint } from "@chemdraft/art-engine";
 
@@ -17,7 +18,9 @@ export function arrowShaftSamplePoints(page:DocumentPage,object:DocumentObject):
   };
   if (object.type === "reaction-arrow") {
     const start = resolvePageAnchorPoint(page, object.start), end = resolvePageAnchorPoint(page, object.end);
-    return start && end ? [rotate(start), rotate(end)] : [];
+    const projection = projectedPlaneMatrixForObject(object);
+    return start && end ? [start, end].map(point => projection
+      ? projectPointInObjectPlane(object, point, projection) : rotate(point)) : [];
   }
   if (object.type === "mechanism-arrow") {
     const geometry = mechanismArrowGeometry(page, object);

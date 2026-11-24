@@ -57,6 +57,28 @@ for (const [tag, name, kind, list, idReference] of PROPS) {
   if (name && !byName.has(name)) byName.set(name, p);
 }
 for (const [tag, name] of Object.entries(OBJECTS)) objectTag.set(name, Number(tag));
+
+function namedEnumValue(property: Prop, text: string): number | undefined {
+  const values = property.values!;
+  return values.get(text) ?? [...values].find(([name]) => name.toLowerCase() === text.toLowerCase())?.[1]
+    ?? (/^-?\d+$/.test(text) ? Number(text) : undefined);
+}
+
+function binaryEnumValue(property: Prop, text: string): number | undefined {
+  const value = namedEnumValue(property, text.trim());
+  const small = property.kind === "e8";
+  return value === undefined || value < (small ? -128 : -32768) || value > (small ? 255 : 65535) ? undefined : value;
+}
+
+/** The BracketUsage spelling that a binary round trip produces. */
+export function cdxBracketUsageName(text: string): string | undefined {
+  const property = byName.get("BracketUsage")!;
+  const value = binaryEnumValue(property, text);
+  if (value === undefined) return undefined;
+  const unsigned = value & 0xffff;
+  return property.names!.get(unsigned) ?? String(unsigned);
+}
+
 const charsets = new Map(CHARSETS.split(",").map((pair) => { const k = pair.indexOf("="); return [Number(pair.slice(0, k)), pair.slice(k + 1)] as const; }));
 const charsetCode = new Map([...charsets].map(([code, name]) => [name, code]));
 // The style records' four parts, as CDXML splits them (LabelFont, LabelFace, LabelSize, LabelColor).
@@ -82,14 +104,14 @@ function prepareTextColors(root: CdxElement): void {
       if (explicitIndex === undefined) {
         // Without a table, CDXML's standard slot 3 is black. Reserved slot 0 keeps
         // explicit black distinct from the uncoloured foreground run.
-        if (!definition || ["r", "g", "b"].every(channel => Number(definition.attrs[channel] ?? 0) === 0)) explicitIndex = 0;
+        if (textForegroundIsBlack(root)) explicitIndex = 0;
         else {
           // Preserve the source palette for other objects; move explicit text using
           // slot 3 to an unambiguous palette entry before the table is serialized.
           const existing = palette.findIndex((color, index) => index + 2 !== TEXT_FOREGROUND
-            && ["r", "g", "b"].every(channel => Number(color.attrs[channel] ?? 0) === Number(definition.attrs[channel] ?? 0)));
+            && ["r", "g", "b"].every(channel => Number(color.attrs[channel] ?? 0) === Number(definition!.attrs[channel] ?? 0)));
           explicitIndex = existing >= 0 ? existing + 2 : palette.length + 2;
-          if (existing < 0) table!.kids.push({ ...definition, attrs: { ...definition.attrs }, kids: [] });
+          if (existing < 0) table!.kids.push({ ...definition!, attrs: { ...definition!.attrs }, kids: [] });
         }
       }
       element.attrs.color = String(explicitIndex);
@@ -663,6 +685,8 @@ const f64 = (v: number) => { const b = new Uint8Array(8); new DataView(b.buffer)
 const enc = new TextEncoder();
 const NUMBER = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d{1,3})?$/;
 const real = (s?: string) => { const t = s?.trim(); return t && NUMBER.test(t) && Math.abs(Number(t)) < 1e9 ? Number(t) : undefined; };
+export const isValidLongTagValue = (value: string): boolean => /^[-+]?\d+$/.test(value.trim())
+  && Number(value) >= -2147483648 && Number(value) <= 2147483647;
 const reals = (s: string) => s.trim().split(/\s+/).map(real);
 // Whole numbers in a list (ids reach 2^31).
 const ints = (s: string) => (s.trim() ? s.trim().split(/\s+/) : []).map((v) => (/^-?\d{1,10}$/.test(v) && Math.abs(Number(v)) < 2 ** 32 ? Number(v) : undefined));
@@ -719,16 +743,18 @@ export function writeCdx(root: CdxElement, warnings: CdxWarning[] = []): Uint8Ar
     if (range && (!isInteger || i < range[0] || i > range[1])) return undefined;
     if (["coord", "p2", "p3", "rect", "angle", "curve"].includes(p.kind) && list.some((x) => x !== undefined && (fixed(x) < -2147483648 || fixed(x) > 2147483647))) return undefined;
     if (p.kind === "charge" && r !== undefined && (r < -128 || r >= 128)) return undefined;
-    const named = (s: string) => p.values!.get(s) ?? [...p.values!].find(([nm]) => nm.toLowerCase() === s.toLowerCase())?.[1] ?? (/^-?\d+$/.test(s) ? Number(s) : undefined);
     switch (p.kind) {
       case "flag": return /^(yes|true)$/.test(v) ? new Uint8Array(0) : undefined;
       case "bool": return le(1, /^(yes|true)$/.test(v) ? 1 : 0);
       case "i8": return Number.isFinite(i) ? le(1, i) : undefined;
       case "i16": case "u16": return Number.isFinite(i) ? le(2, i) : undefined;
       case "i32": return Number.isFinite(i) ? le(4, i) : undefined;
-      case "e8": case "e16": { const x = named(v.trim()), small = p.kind === "e8"; return x === undefined || x < (small ? -128 : -32768) || x > (small ? 255 : 65535) ? undefined : le(small ? 1 : 2, x); }
+      case "e8": case "e16": {
+        const code = binaryEnumValue(p, v);
+        return code === undefined ? undefined : le(p.kind === "e8" ? 1 : 2, code);
+      }
       case "b8": case "b16": {
-        const bits = v.trim().split(/\s+/).map(named);
+        const bits = v.trim().split(/\s+/).map(text => namedEnumValue(p, text));
         return bits.some((x) => x === undefined) ? undefined : le(p.kind === "b8" ? 1 : 2, bits.reduce((s: number, x) => s | x!, 0));
       }
       case "order": {
@@ -770,7 +796,7 @@ export function writeCdx(root: CdxElement, warnings: CdxWarning[] = []): Uint8Ar
       }
       case "tagvalue": {
         const t = el.attrs.TagType;
-        return t === "Double" && r !== undefined ? f64(r) : t === "Long" && Number.isFinite(i) ? le(4, i) : t === "String" ? plainString(v, el) : undefined;
+        return t === "Double" && r !== undefined ? f64(r) : t === "Long" && isValidLongTagValue(v) ? le(4, Number(v)) : t === "String" ? plainString(v, el) : undefined;
       }
       case "sgvalue": return el.attrs.SGDataType === "4" ? enc.encode(v) : r === undefined ? undefined : f64(r);
       default: return undefined;
@@ -821,7 +847,7 @@ export function writeCdx(root: CdxElement, warnings: CdxWarning[] = []): Uint8Ar
       const p = plainName(x, byName.get(k));
       if (!p) { warn(x, "unknown attribute " + k); continue; }
       if (p.kind === "style") { style[k] = v; continue; }
-      if (p.kind === "raw" || p.kind === "glist" || ["tagvalue", "sgvalue"].includes(p.kind) && v.startsWith("|x|")) {
+      if (p.kind === "raw" || p.kind === "glist" || (p.kind === "sgvalue" || p.kind === "tagvalue" && x.attrs.TagType !== "Long") && v.startsWith("|x|")) {
         const b = rawValue(v);
         if (b) put(p.tag, b); else warn(x, `unencodable attribute ${k}`);
         continue;
@@ -830,6 +856,7 @@ export function writeCdx(root: CdxElement, warnings: CdxWarning[] = []): Uint8Ar
       const kind = x.name === "tlcspot" && (k === "Width" || k === "Height") ? { ...p, kind: "i32" } : p;
       const b = value(x, kind, v);
       if (b) put(p.tag, b);
+      else if (p.kind === "tagvalue" && x.attrs.TagType === "Long") warn(x, `invalid signed 32-bit Long value ${JSON.stringify(v)} for tag ${JSON.stringify(x.attrs.Name ?? x.attrs.id ?? "(unnamed)")}`);
       else if (!(p.kind === "flag" && /^(no|false)$/.test(v))) warn(x, "unencodable attribute " + k + "=" + JSON.stringify(v));
     }
     // Label and caption styles: CDXML's four attributes as one 8-byte record, the document's filling any part left out.

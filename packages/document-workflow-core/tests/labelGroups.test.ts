@@ -8,6 +8,7 @@ import {
   type MoleculeObject
 } from "@chemdraft/chem-core";
 import type { ExportWarning } from "@chemdraft/export-engine";
+import { parseMolfileGraph } from "@chemdraft/clipboard-adapter";
 import { nativeBondOrderResolution } from "@chemdraft/layout-engine";
 import { ensureRdkit } from "../../rdkit-adapter/src/conformer";
 import { compositionFromRdkitJson, type RdkitJson } from "../../rdkit-adapter/src/composition";
@@ -58,6 +59,27 @@ function withMol<T>(input: string, read: (mol: RdkitMol) => T): T {
 }
 
 const canonical = (input: string): string => withMol(input, (mol) => mol.get_smiles());
+
+it.each([
+  ["NaOH", [atom("na", "Na", 0, 0, { formalCharge: 1 }), atom("oh", "O", 22, 0, { formalCharge: -1 })], [], 1, 0],
+  ["MgBr", [atom("c", "C", 0, 0), atom("mg", "Mg", 22, 0), atom("br", "Br", 44, 0)],
+    [bond("cmg", "c", "mg"), bond("mgbr", "mg", "br")], 2, 1]
+] as const)("rebuilds stored graph metadata after condensing %s", async (_label, atoms, bonds, atomCount, bondCount) => {
+  const original = molecule([...atoms], [...bonds]);
+  const before = canonical(chemicalIdentityMolfile(original));
+  const scheme = layoutReactionScheme({ reactants: [{ molecule: original }], products: [], arrowKind: "forward",
+    anchor: { x: 24, y: 120 }, gutter: 24, bondLength: 22, pagePadding: 24 });
+  const condensed = scheme.document.pages[0]!.objects.find((object): object is MoleculeObject => object.type === "molecule")!;
+  expect(condensed.atoms).toHaveLength(atomCount);
+  expect(condensed.bonds).toHaveLength(bondCount);
+  expect(condensed.chemistry).toMatchObject({ atomCount, bondCount });
+  expect(condensed.structureFormat).toBe("molfile-v2000");
+  const stored = parseMolfileGraph(condensed.structure);
+  expect(stored.atoms).toHaveLength(atomCount);
+  expect(stored.bonds).toHaveLength(bondCount);
+  expect(canonical(chemicalIdentityMolfile(condensed))).toBe(before);
+  expect(canonical(await moleculeSmiles(condensed, 0, [], undefined))).toBe(before);
+});
 
 it("keeps typed NaOH as the release formula placeholder and expands only explicit scheme NaOH", async () => {
   const typed = molecule([atom("naoh", "NaOH", 0, 0, { labelLiteral: true })], []);

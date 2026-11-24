@@ -1,23 +1,49 @@
 import { lazy, Suspense, useEffect, type ReactElement } from "react";
 import {
   PREFERENCES_WINDOW_KIND,
+  isDesktopRuntime,
   routeToolsetCommand,
   TOOLSET_POPOVER_WINDOW_KIND,
   TOOLSET_TOOLTIP_WINDOW_KIND
 } from "./window-manager";
 import { installSecondaryWindowEditHistory } from "./editHistoryRouting";
 import { installBrowserReloadGuard } from "./browserReloadGuard";
+import { acknowledgeFirstPaintOnce } from "./paletteFirstPaint";
+import { runShortcutDefaultMigration } from "./shortcutDefaultMigration";
 
-const MainWindow = lazy(() => import("./MainWindow").then(m => ({ default: m.MainWindow })));
+// The document window mounts only after the one-time shortcut-default migration has resolved the
+// scheme and put it in the webview cache (or, where it must not persist, in memory for this launch),
+// so its first render already uses it, and neither it nor any window it opens reads the new default
+// on an install not proven new.
+const MainWindow = lazy(() => Promise.all([import("./MainWindow"), runShortcutDefaultMigration()])
+  .then(([m]) => ({ default: m.MainWindow })));
 const PaletteWindow = lazy(() => import("./PaletteWindow").then(m => ({ default: m.PaletteWindow })));
 const PalettePopoverWindow = lazy(() => import("./PalettePopoverWindow").then(m => ({ default: m.PalettePopoverWindow })));
 const PaletteTooltipWindow = lazy(() => import("./PaletteTooltipWindow").then(m => ({ default: m.PaletteTooltipWindow })));
 const PluginPanelWindow = lazy(() => import("./plugins/PluginPanelWindow").then(m => ({ default: m.PluginPanelWindow })));
 const Spin3dDebuggerWindow = lazy(() => import("./Spin3dDebuggerWindow").then(m => ({ default: m.Spin3dDebuggerWindow })));
 const PreferencesWindow = lazy(() => import("./PreferencesWindow").then(m => ({ default: m.PreferencesWindow })));
+const BrowserAboutWindow = lazy(() => import("./about/AboutWindow").then(m => ({ default: m.BrowserAboutWindow })));
 const DialogWindow = lazy(() => import("./dialogs/DialogWindow").then(m => ({ default: m.DialogWindow })));
+const FileWarningsWindow = lazy(() => import("./FileWarningsWindow").then(m => ({ default: m.FileWarningsWindow })));
 
 export function App() {
+  useEffect(() => {
+    if (!isDesktopRuntime()) return;
+    const kind = new URLSearchParams(window.location.search).get("window");
+    // Main handles its own outside press, excluding the toggle. Other native app
+    // windows have a dismissal-only capability; warning-row clicks stay inside.
+    if (!kind || kind === "fileWarnings") return;
+    const dismiss = () => { void import("@tauri-apps/api/core").then(({ invoke }) => invoke("file_warnings_dismiss")).catch(() => undefined); };
+    window.addEventListener("pointerdown", dismiss, true);
+    return () => window.removeEventListener("pointerdown", dismiss, true);
+  }, []);
+  if (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("window") === "fileWarnings") {
+    return <Suspense fallback={null}><FileWarningsWindow /></Suspense>;
+  }
+  if (typeof window !== "undefined" && !isDesktopRuntime() && new URLSearchParams(window.location.search).get("window") === "about") {
+    return <Suspense fallback={<p role="status">Opening About ChemDraft…</p>}><BrowserAboutWindow /></Suspense>;
+  }
   const dialog = dialogRoute();
   if (dialog !== undefined) {
     return <Suspense fallback={<p role="status">Opening dialog…</p>}>
@@ -48,6 +74,15 @@ function SecondaryWindowEditHistory({ dialog = false }: { dialog?: boolean }): n
   return null;
 }
 
+/**
+ * Rendered beside a palette, popover or tooltip window, inside the same Suspense boundary, so its
+ * effect runs once that window's first render has committed.
+ */
+function FirstPaintAcknowledgement(): null {
+  useEffect(() => acknowledgeFirstPaintOnce(), []);
+  return null;
+}
+
 export function dialogRoute(): string | undefined {
   if (typeof window === "undefined") return undefined;
   const params = new URLSearchParams(window.location.search);
@@ -66,21 +101,24 @@ function secondaryWindowContent(): ReactElement | undefined {
   const popoverRoute = toolsetPopoverRoute();
   if (popoverRoute) {
     return (
-      <PalettePopoverWindow
-        toolsetId={popoverRoute.toolsetId}
-        kind={popoverRoute.kind}
-        prewarm={popoverRoute.prewarm}
-      />
+      <>
+        <PalettePopoverWindow
+          toolsetId={popoverRoute.toolsetId}
+          kind={popoverRoute.kind}
+          prewarm={popoverRoute.prewarm}
+        />
+        <FirstPaintAcknowledgement />
+      </>
     );
   }
 
   if (isToolsetTooltipRoute()) {
-    return <PaletteTooltipWindow />;
+    return <><PaletteTooltipWindow /><FirstPaintAcknowledgement /></>;
   }
 
-  const toolsetId = toolsetRouteId();
-  if (toolsetId) {
-    return <PaletteWindow toolsetId={toolsetId} />;
+  const toolset = toolsetRoute();
+  if (toolset) {
+    return <><PaletteWindow {...toolset} /><FirstPaintAcknowledgement /></>;
   }
 
   const pluginPanelId = pluginPanelRouteId();
@@ -150,7 +188,7 @@ function toolsetPopoverRoute(): { toolsetId: string; kind: string; prewarm: bool
   };
 }
 
-function toolsetRouteId(): string | undefined {
+function toolsetRoute(): { toolsetId: string; resizable: boolean } | undefined {
   if (typeof window === "undefined") {
     return undefined;
   }
@@ -158,11 +196,14 @@ function toolsetRouteId(): string | undefined {
   const params = new URLSearchParams(window.location.search);
   const windowKind = params.get("window");
   if (windowKind === "toolset") {
-    return params.get("toolsetId") ?? "core.main";
+    return {
+      toolsetId: params.get("toolsetId") ?? "core.main",
+      resizable: params.get("resizable") === "true"
+    };
   }
 
   if (windowKind === "tool-palette") {
-    return "core.main";
+    return { toolsetId: "core.main", resizable: false };
   }
 
   return undefined;

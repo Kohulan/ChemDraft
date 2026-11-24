@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { ChemistryRefusal } from "./requestWrites/chemistryRefusal";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -9,6 +10,7 @@ import { createEmptyDocument, type ChemDraftDocument, type MoleculeObject } from
 import { createPhase4Document, insertNativeTemplateMolecule } from "../documentWorkflow";
 import { getAssistantHistoryPort } from "../assistant/historyPort";
 import { objectRect, overlaps } from "../assistant/placement";
+import * as canvasOcclusion from "../window-manager/canvasOcclusion";
 import { MainWindow } from "../MainWindow";
 import {
   RECOGNITION_FIXTURE_COMMAND_ID,
@@ -183,6 +185,13 @@ async function sendAction(action: AnalysisWindowAction): Promise<void> {
     window.dispatchEvent(new CustomEvent(ANALYSIS_WINDOW_ACTION_EVENT, { detail: action }));
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
+  if (action.kind !== "acceptPluginProposal") return;
+  // Accepting verifies the inserted chemistry off-thread before it commits; wait for it to land or be refused.
+  await vi.waitFor(async () => {
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    const pending = harness.runtime!.host.listProposedPatches("pending").some((proposal) => proposal.id === action.proposalId);
+    expect(!pending || /Could not|already resolved|Finish|not inserted|not applied/.test(statusText())).toBe(true);
+  }, { timeout: 15_000 });
 }
 
 function statusText(): string {
@@ -212,6 +221,45 @@ function moleculeIds(bridge: Bridge): string[] {
 }
 
 describe("accepting a recognition proposal from the review window", () => {
+  it.each(["macos", "windows"] as const)("avoids a covering review panel on %s only after acceptance", async platform => {
+    const blank = createEmptyDocument();
+    const page = blank.pages[0]!;
+    const bridge = await renderMainWindow({ initialDocument: blank, shortcutPlatform: platform });
+    const rect = { x: 0, y: 0, left: 0, top: 0, right: page.width, bottom: page.height,
+      width: page.width, height: page.height, toJSON: () => ({}) } as DOMRect;
+    for (const element of container!.querySelectorAll<HTMLElement>(".page, .canvas-region")) {
+      element.getBoundingClientRect = () => rect;
+      Object.defineProperties(element, { clientWidth: { configurable: true, value: page.width },
+        clientHeight: { configurable: true, value: page.height } });
+    }
+    const covered = { x: page.width / 2 - 100, y: page.height / 2 - 180, width: 200, height: 360 };
+    vi.spyOn(canvasOcclusion, "readCanvasOcclusion").mockResolvedValue({
+      documentFrame: { x: 0, y: 0, width: page.width, height: page.height + 30 },
+      webviewOffset: [0, 30], screenUnitsPerCssPixel: 1, coveringRects: [{ ...covered, y: covered.y + 30 }]
+    });
+    const port = getAssistantHistoryPort();
+    const before = port.read("initial")!;
+    const proposal = await recognizeIntoProposal(bridge);
+    expect(port.read("initial")!.pages).toEqual(before.pages);
+    await sendAction({ kind: "acceptPluginProposal", proposalId: proposal.id });
+    const after = port.read("initial")!;
+    const inserted = after.pages[0]!.objects[0]! as MoleculeObject;
+    const bounds = objectRect(inserted);
+    expect(overlaps(bounds, covered)).toBe(false);
+    expect(bounds.x).toBeGreaterThanOrEqual(0);
+    expect(bounds.y).toBeGreaterThanOrEqual(0);
+    expect(bounds.x + bounds.width).toBeLessThanOrEqual(page.width);
+    expect(bounds.y + bounds.height).toBeLessThanOrEqual(page.height);
+    expect(inserted.atoms.map(atom => atom.element)).toEqual(["C", "O"]);
+    expect(inserted.bonds[0]!.order).toBe("double");
+    expect(after.selection.objectIds).toEqual([inserted.id]);
+    await act(async () => { await bridge.command("edit.undo"); });
+    expect(port.read("initial")!.pages).toEqual(before.pages);
+    expect(statusText()).toBe("Undid Recognition Fixture: Insert Recognized Structure");
+    await act(async () => { await bridge.command("edit.redo"); });
+    expect(port.read("initial")!.pages).toEqual(after.pages);
+  });
+
   it.each(["macos", "windows"] as const)("places mocked recognition beside benzene on %s only after review, selected in one undo", async platform => {
     const blank = createEmptyDocument();
     const page = blank.pages[0]!;
@@ -332,6 +380,22 @@ describe("accepting a recognition proposal from the review window", () => {
     expect(statusText()).toContain("Could not insert the proposal: page page_1 does not exist");
   });
 
+  it("tells the user, in plain words, when a recognition's stereo annotations cannot be verified", async () => {
+    const bridge = await renderMainWindow();
+    const proposal = await recognizeIntoProposal(bridge);
+    vi.spyOn(harness.runtime!.host, "acceptProposedPatch").mockImplementation(() => {
+      throw new ChemistryRefusal("its stereo annotations can't be matched to the drawn structure",
+        'Plugin write refused: cannot refresh stored chemistry for molecule "mol-3f2a9c". The stored atom or double-bond stereo differs from the editable graph');
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await sendAction({ kind: "acceptPluginProposal", proposalId: proposal.id });
+
+    expect(statusText()).toBe("Recognition not inserted: its stereo annotations can't be matched to the drawn structure.");
+    expect(statusText()).not.toContain("mol-3f2a9c");
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("mol-3f2a9c"));
+  });
+
   it("reports an Accept for a proposal that is no longer pending", async () => {
     await renderMainWindow();
     await sendAction({ kind: "acceptPluginProposal", proposalId: "proposal_404" });
@@ -423,8 +487,10 @@ function registerDirectWritePlugin(pageId: string, resolveName = false): { relea
                 style: {},
                 structureFormat: "smiles",
                 structure: "C=O",
-                atoms: [],
-                bonds: [],
+                // Match the supplied SMILES so insertion verification can check the fixture.
+                atoms: [{ id: "a1", element: "C", x: 410, y: 310, formalCharge: 0 },
+                  { id: "a2", element: "O", x: 430, y: 310, formalCharge: 0 }],
+                bonds: [{ id: "b1", fromAtomId: "a1", toAtomId: "a2", order: "double" }],
                 superatoms: [],
                 rGroups: []
               }

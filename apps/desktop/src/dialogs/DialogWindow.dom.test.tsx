@@ -66,6 +66,40 @@ it.each(["macos", "windows"] as const)("requests a new content fit after Choose 
     expect(fits()).toHaveLength(2);
   } finally { layout.mockRestore(); }
 });
+it.each(["macos", "windows"] as const)("sends smaller fits for PDF → CDXML/CDX and deduplicates only the latest size on %s", async platform => {
+  vi.stubGlobal("navigator", { platform: platform === "macos" ? "MacIntel" : "Win32" });
+  const layout = vi.spyOn(HTMLFormElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLFormElement) {
+    // Intrinsic height changes with the actual rendered options; the native viewport is
+    // still PDF-sized until it receives the next ready report. jsdom has no layout engine.
+    const intrinsic = this.textContent?.includes("Compress PDF") ? 620 : 300;
+    return { top: 0, height: this.style.height === "auto" ? intrinsic : 620 } as DOMRect;
+  });
+  try {
+    act(() => root.unmount()); root = createRoot(container);
+    host.send.mockClear();
+    await act(async () => root.render(createElement(DialogWindow, { hostId: "export-host" })));
+    await act(async () => {
+      host.receive!({ ...snapshot, dialogKind: "export", data: { title: "Origin", options: exportFixture() } });
+      await import("./ExportForm");
+    });
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    const heights = () => host.send.mock.calls.map(([, message]) => message as DialogMessage)
+      .filter(message => message.type === "ready").map(message => message.data.contentHeight);
+    expect(heights()).toEqual([620]);
+    const body = container.querySelector<HTMLElement>(".cd-dialog-fit-body")!;
+    expect(body.style.alignContent).toBe("start");
+    expect(body.style.gridAutoRows).toBe("max-content");
+    const format = container.querySelector<HTMLSelectElement>("#chemdraft-export-format")!;
+    for (const value of ["cdxml", "pdf", "cdx"]) {
+      await act(async () => { format.value = value; format.dispatchEvent(new Event("change", { bubbles: true })); });
+      // MutationObserver alone must notice removed options even if no box resizes yet.
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    }
+    expect(heights()).toEqual([620, 300, 620, 300]);
+    await act(async () => { window.dispatchEvent(new Event("resize")); await vi.advanceTimersByTimeAsync(0); });
+    expect(heights()).toEqual([620, 300, 620, 300]);
+  } finally { layout.mockRestore(); }
+});
 it("suppresses browser context menus except on editable fields", () => {
   const menu = (target: Element) => {
     const event = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
@@ -218,6 +252,7 @@ it("renders Export failures and picker results in its form; success stays reserv
   expect(container.textContent).toContain("Preparing export…"); expect(button("Exporting...").disabled).toBe(true);
   await act(async () => host.receive!({ ...exportedSnapshot, type: "result", requestId: action.requestId, data: { status: "error", error: "Disk full" } }));
   expect(container.querySelector('[role="alert"]')?.textContent).toBe("Disk full"); expect(button("Export").disabled).toBe(false);
+  expect(host.send.mock.calls.filter(([, m]) => m.type === "action" && m.data.action === "cancel")).toHaveLength(0);
   await act(async () => button("Choose...").click());
   action = host.send.mock.calls.at(-1)![1] as DialogMessage;
   await act(async () => host.receive!({ ...exportedSnapshot, type: "result", requestId: action.requestId, data: { status: "picked", destinationPath: "C:\\Granted.pdf", filename: "Granted.pdf" } }));
@@ -226,6 +261,7 @@ it("renders Export failures and picker results in its form; success stays reserv
   expect(action.type === "action" && "options" in action.data && action.data.options.destinationPath).toBe("C:\\Granted.pdf");
   await act(async () => host.receive!({ ...exportedSnapshot, type: "result", requestId: action.requestId, data: { status: "exported", notice: "Exported PDF with 1 warning(s)\nUnsupported artwork preserved approximately" } }));
   expect(container.textContent).toContain("Unsupported artwork"); expect(button("Exported").disabled).toBe(true); expect(button("Close").disabled).toBe(false);
+  expect(host.send.mock.calls.filter(([, m]) => m.type === "action" && m.data.action === "cancel")).toHaveLength(0);
   await act(async () => button("Close").click());
   expect(host.send).toHaveBeenLastCalledWith("export-host", expect.objectContaining({ data: { action: "cancel" } }));
 });
@@ -269,4 +305,85 @@ it("refreshes preview on frame revision while preserving the user's export draft
   expect(container.querySelector<HTMLInputElement>("#chemdraft-export-filename")!.value).toBe("My custom name.pdf");
   await act(async () => host.receive!({ ...exportedSnapshot, type: "result", requestId: first.requestId, data: { status: "preview", preview: { url: "data:image/png;base64,AAAA", kind: "image", width: 100, height: 100, warnings: [] } } }));
   expect(container.querySelector('img[alt="Export preview"]')).toBeNull();
+});
+
+
+it("renders the native preview after an export with warnings when the same frame arrives again", async () => {
+  saveExportPreviewEnabled(true);
+  act(() => root.unmount()); root = createRoot(container);
+  await act(async () => root.render(createElement(DialogWindow, { hostId: "export-host" })));
+  const frame = { page: { width: 100, height: 100 }, content: { width: 80, height: 80 }, revision: 1 };
+  const exportSnapshot: Extract<DialogMessage, { type: "snapshot" }> = { ...snapshot, dialogKind: "export", sessionId: "export-preview", data: { title: "Origin", options: { ...exportFixture(), format: "svg" }, frame } };
+  await act(async () => { host.receive!(exportSnapshot); await import("./ExportForm"); });
+  const actions = (action: string) => host.send.mock.calls.map(([, m]) => m as DialogMessage).filter(m => m.type === "action" && m.data.action === action);
+  const image = () => container.querySelector('img[alt="Export preview"]')?.getAttribute("src");
+  const deliverPreview = async (requestId: string, url: string) => {
+    await act(async () => host.receive!({ ...exportSnapshot, type: "result", requestId, data: { status: "preview", preview: { url, kind: "image", width: 100, height: 100, warnings: [] } } }));
+  };
+  const original = "data:image/png;base64,AAAA";
+  const refreshed = "data:image/png;base64,AQAA";
+  await act(async () => vi.advanceTimersByTimeAsync(250));
+  await deliverPreview(actions("preview")[0]!.requestId, original);
+  expect(image()).toBe(original);
+  const submit = [...container.querySelectorAll<HTMLButtonElement>("button")].find(b => b.textContent === "Export")!;
+  await act(async () => submit.click());
+  await act(async () => host.receive!({ ...exportSnapshot, type: "result", requestId: actions("export")[0]!.requestId,
+    data: { status: "exported", notice: "Some artwork was approximated." } }));
+  await act(async () => vi.advanceTimersByTimeAsync(250));
+  expect(actions("preview")).toHaveLength(2);
+  await act(async () => host.receive!({ ...exportSnapshot, type: "result", data: { status: "frame", frame: structuredClone(frame) } }));
+  await deliverPreview(actions("preview")[1]!.requestId, refreshed);
+  expect(image()).toBe(refreshed);
+  expect(container.textContent).toContain("Some artwork was approximated.");
+  expect(actions("export")).toHaveLength(1);
+  expect(actions("cancel")).toHaveLength(0);
+});
+
+it.each(["macos", "windows"] as const)("closes a clean export through the dialog host on %s", async platform => {
+  vi.stubGlobal("navigator", { platform: platform === "macos" ? "MacIntel" : "Win32" });
+  act(() => root.unmount()); root = createRoot(container);
+  await act(async () => root.render(createElement(DialogWindow, { hostId: "export-host" })));
+  const exportSnapshot: Extract<DialogMessage, { type: "snapshot" }> = { ...snapshot, dialogKind: "export", sessionId: "export-again",
+    data: { title: "Export again", options: exportFixture() } };
+  await act(async () => { host.receive!(exportSnapshot); await import("./ExportForm"); });
+  const button = (text: string) => [...container.querySelectorAll<HTMLButtonElement>("button")].find(b => b.textContent === text)!;
+  await act(async () => button("Export").click());
+  const action = host.send.mock.calls.at(-1)![1] as DialogMessage;
+  const receipt: DialogMessage = { ...exportSnapshot, type: "result", requestId: action.requestId, data: { status: "exported" } };
+  await act(async () => { host.receive!(receipt); host.receive!(receipt); });
+  expect(host.send).toHaveBeenLastCalledWith("export-host", expect.objectContaining({ type: "action", data: { action: "cancel" } }));
+  const actions = host.send.mock.calls.map(([, message]) => message as DialogMessage).filter(message => message.type === "action");
+  expect(actions.map(message => message.data.action)).toEqual(["export", "cancel"]);
+});
+
+it("keeps a clean export completed when automatic close fails", async () => {
+  act(() => root.unmount()); root = createRoot(container);
+  await act(async () => root.render(createElement(DialogWindow, { hostId: "export-host" })));
+  const exportSnapshot: Extract<DialogMessage, { type: "snapshot" }> = { ...snapshot, dialogKind: "export", sessionId: "export-close-failure", data: { title: "Origin", options: exportFixture() } };
+  await act(async () => { host.receive!(exportSnapshot); await import("./ExportForm"); });
+  const button = (text: string) => [...container.querySelectorAll<HTMLButtonElement>("button")].find(b => b.textContent === text)!;
+  await act(async () => button("Export").click());
+  const action = host.send.mock.calls.at(-1)![1] as DialogMessage;
+  host.send.mockRejectedValueOnce(new Error("Close failed"));
+  await act(async () => host.receive!({ ...exportSnapshot, type: "result", requestId: action.requestId, data: { status: "exported" } }));
+  expect(container.querySelector('[role="alert"]')?.textContent).toContain("Close failed");
+  expect(button("Exported").disabled).toBe(true);
+  await act(async () => button("Exported").click());
+  expect(host.send.mock.calls.filter(([, m]) => m.type === "action" && m.data.action === "export")).toHaveLength(1);
+  await act(async () => button("Close").click());
+  expect(host.send).toHaveBeenLastCalledWith("export-host", expect.objectContaining({ data: { action: "cancel" } }));
+});
+
+it("keeps Export open when the save panel is canceled", async () => {
+  act(() => root.unmount()); root = createRoot(container);
+  await act(async () => root.render(createElement(DialogWindow, { hostId: "export-host" })));
+  const exportSnapshot: Extract<DialogMessage, { type: "snapshot" }> = { ...snapshot, dialogKind: "export", sessionId: "export-cancel", data: { title: "Origin", options: exportFixture() } };
+  await act(async () => { host.receive!(exportSnapshot); await import("./ExportForm"); });
+  const button = [...container.querySelectorAll<HTMLButtonElement>("button")].find(b => b.textContent === "Export")!;
+  await act(async () => button.click());
+  const action = host.send.mock.calls.at(-1)![1] as DialogMessage;
+  await act(async () => host.receive!({ ...exportSnapshot, type: "result", requestId: action.requestId, data: { status: "cancelled", notice: "PDF export canceled" } }));
+  expect(container.textContent).toContain("PDF export canceled");
+  expect(button.disabled).toBe(false);
+  expect(host.send.mock.calls.filter(([, m]) => m.type === "action" && m.data.action === "cancel")).toHaveLength(0);
 });

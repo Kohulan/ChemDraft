@@ -350,7 +350,8 @@ describe("synthetic CDXML reaction schemes", () => {
     const linkedArrow = objects(document).find(object => object.id === reaction.arrowObjectIds?.[0]);
     expect(linkedArrow).toMatchObject({ type: "graphic", data: { artToolId: "equilibriumArrow" } });
     const exported = exportDocumentToCdxml(document);
-    expect(exported.contents).toContain('ArrowType="Equilibrium"');
+    // Equilibrium now uses opposed half heads on a spaced Arrow object, retaining its step id.
+    expect(exported.contents).toContain('ArrowheadHead="HalfLeft" ArrowheadTail="HalfLeft" ArrowheadType="Solid" ArrowShaftSpacing="300"');
     expect(summary(importFixture(visibleOnly(exported.contents)).document)).toEqual(summary(document));
   });
 

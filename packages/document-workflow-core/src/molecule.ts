@@ -15,7 +15,8 @@ import {
   type MoleculeTransformState
 } from "@chemdraft/chem-core";
 import { type ParsedMolfileGraph, parseMolfileGraph } from "@chemdraft/clipboard-adapter";
-import { isDefaultCenteredDoubleBond, nativeBondOrderResolution, ringInteriorDoubleBondSides } from "@chemdraft/layout-engine";
+import { molfileCoordinateScale, isDefaultCenteredDoubleBond, nativeBondOrderResolution, objectRotationCenter,
+  ringInteriorDoubleBondSides } from "@chemdraft/layout-engine";
 import { nativeElementFromAtomLabel, nativeSingleBondGraphMetadata } from "./atoms";
 import {
   distance,
@@ -239,8 +240,11 @@ export function createSmilesMolecule(
       : { ...bond, display: { ...bond.display, doubleBondSide } };
   });
 
-  // Stored-structure spelling: molecule.structure is a standard molfile of the graph as built (a
-  // pasted structure has element atoms only). It is a record of the depiction, not what the app
+  // Stored-structure spelling: normally a standard molfile of the graph as built (a pasted
+  // structure has element atoms only). Atom maps have no native atom field, so retain mapped
+  // SMILES verbatim instead: rebuilding a molfile would silently erase them and hide them from
+  // guards on source-only properties. Neither the native depiction nor its stereo flags change.
+  // This is a record of the source/depiction, not what the app
   // analyses or exports: Copy As, SMILES export, Validate and the Molecular Inspector all write the
   // live graph afresh, with group labels expanded (expandNativeMoleculeLabelGroups). CIP perception
   // never reads this field either — it spells its own molfile (stereoPerceptionMolfile, R-groups).
@@ -250,6 +254,7 @@ export function createSmilesMolecule(
     warnings: structureWarnings,
     kekuleBondOrders: nativeBondOrderResolution(atoms, bonds).kekuleOrders
   }).contents;
+  const hasAtomMapping = /\[[^\]]*:\d+\]/.test(smilesText);
 
   return normalizeNativeMoleculeGeometry({
     id: nextObjectId(document, source.objectIdPrefix, source.reservedObjectIds),
@@ -274,8 +279,8 @@ export function createSmilesMolecule(
       ],
       unknown: { smiles: smilesText }
     },
-    structureFormat: "molfile-v2000",
-    structure,
+    structureFormat: hasAtomMapping ? "smiles" : "molfile-v2000",
+    structure: hasAtomMapping ? smilesText : structure,
     chemistry: nativeSingleBondGraphMetadata(atoms, bonds),
     atoms,
     bonds,
@@ -336,7 +341,7 @@ export function applyMoleculeTargetBondLength(
 
 /** Plan the existing centre-preserving resize without applying a document patch. */
 export function moleculeTargetBondLengthChanges(
-  object: MoleculeObject, targetBondLengthPx: number
+  object: MoleculeObject, targetBondLengthPx: number, options: { preserveFrameCenter?: boolean } = {}
 ): Partial<MoleculeObject> {
   if (!Number.isFinite(targetBondLengthPx) || targetBondLengthPx <= 0) return {};
   const representative = representativeNativeMoleculeBondLength(object);
@@ -358,6 +363,16 @@ export function moleculeTargetBondLengthChanges(
   const scaled = representative
     ? scaledMoleculeToTargetBondLength(object, targetBondLengthPx, representative, nextStyle)
     : normalizeNativeMoleculeGeometry({ ...object, style: nextStyle });
+  if (options.preserveFrameCenter && representative) {
+    // The minimum storage frame can be asymmetric around short bonds. Keep its old pivot
+    // while enclosing the resized graph, so rotating about that pivot cannot shift the drawing.
+    const center = objectRotationCenter(object);
+    const halfWidth = Math.max(center.x - scaled.x, scaled.x + scaled.width - center.x);
+    const halfHeight = Math.max(center.y - scaled.y, scaled.y + scaled.height - center.y);
+    return moleculeObjectChanges(object, {
+      ...scaled, x: center.x - halfWidth, y: center.y - halfHeight, width: 2 * halfWidth, height: 2 * halfHeight
+    });
+  }
   return moleculeObjectChanges(object, scaled);
 }
 
@@ -495,10 +510,15 @@ export function scaleParsedMolfileAtoms(
   point: PagePoint,
   page: ChemDraftDocument["pages"][number],
   targetBondLengthPx: number = nativeBondLengthPx,
-  constrainToPage = true
+  constrainToPage = true,
+  bondStatistic: "mean" | "median" = "mean"
 ): ParsedMolfileGraph["atoms"] {
-  const averageBondLength = averageParsedMolfileBondLength(graph);
-  const scale = averageBondLength > 0 ? targetBondLengthPx / averageBondLength : targetBondLengthPx / 1.5;
+  // Generated depictions and authored templates retain their established mean sizing.
+  // External MOL/RXN and recognition input explicitly opt into the shared median scaler.
+  const averageBondLength = bondStatistic === "mean" ? averageParsedMolfileBondLength(graph) : 0;
+  const scale = bondStatistic === "median"
+    ? molfileCoordinateScale(graph.atoms, graph.bonds, targetBondLengthPx, 1.5).scale
+    : targetBondLengthPx / (averageBondLength > 0 ? averageBondLength : 1.5);
   const scaledAtoms = graph.atoms.map((atom) => ({
     ...atom,
     x: atom.x * scale,

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-clamp-current-inspector-frame"
+description = "Enables the clamp_current_inspector_frame command without any pre-configured scope."
+commands.allow = ["clamp_current_inspector_frame"]
+
+[[permission]]
+identifier = "deny-clamp-current-inspector-frame"
+description = "Denies the clamp_current_inspector_frame command without any pre-configured scope."
+commands.deny = ["clamp_current_inspector_frame"]

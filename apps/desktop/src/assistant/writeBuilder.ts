@@ -1,18 +1,21 @@
+import { objectAnchors, resolveScopedObject, type PageObjectLocation } from "@chemdraft/plugin-host";
 import {
   applyPatch, DocumentObjectSchema, type Anchor, type ChemDraftDocument,
   type DocumentObject, type DocumentPatch, type MoleculeObject, type NativeTextStyle
 } from "@chemdraft/chem-core";
 import {
-  assertMoleculeMatchesSmiles, chemicalIdentityMolfile, buildTableObject, createNativeTextObject, layoutReactionSchemeAsync, nextObjectId,
+  buildTableObject, createNativeTextObject, layoutReactionSchemeAsync, nextObjectId,
   nativeTextObjectSizeForText, documentDrawingDefaults,
   nativeAtomLabelReading, nativeSingleBondGraphMetadata, nativeSingleBondGraphSmiles,
   normalizeNativeMoleculeGeometry, defaultNativeMoleculeTransform, type ReactionAlignmentWarning
 } from "@chemdraft/document-workflow-core";
 import { nativeMoleculeRings } from "@chemdraft/layout-engine";
 import { assistantDocumentContentUnchanged } from "./historyPort";
+import { assertCanonical, inspectSmiles } from "../plugins/requestWrites/structureIdentity";
+export { assertCanonical, inspectMolecule, inspectSmiles } from "../plugins/requestWrites/structureIdentity";
 import { RESERVED_PLUGIN_OBJECT_IDS } from "../plugins/reservedObjectIds";
 import {
-  assistantScope, recordAssistantInsertions, requireDocument,
+  assistantScope, recordAssistantInsertions, requireDocument, PAGE_GROWTH_UNANSWERED,
   type AssistantToolContext, type AssistantPageGrowth
 } from "./AssistantToolContext";
 import {
@@ -54,42 +57,13 @@ export function scopeRefusal(context: AssistantToolContext, ids: readonly string
   const id = ids.find(id => !scope.has(id));
   return id ? { refused: true as const, reason: `${id} was not selected when you sent the request` } : undefined;
 }
-export function findObject(document: ChemDraftDocument, id: string) {
-  for (const page of document.pages) {
-    const object = page.objects.find(object => object.id === id);
-    if (object) return { object, page };
-  }
-  throw new Error(`Object "${id}" does not exist in the assistant's document.`);
+/** The one object lookup for assistant tools: by the Send-time selection page, never the first
+ * same-id object in page order (AGENTS.md section 7). An id that is not selected resolves only when
+ * it is unique in the document; an ambiguous one is refused with the pages it names. */
+export function findObject(context: AssistantToolContext, document: ChemDraftDocument, id: string): PageObjectLocation {
+  return resolveScopedObject(document, id, context.getSelectionPagesAtSend?.(), "the assistant's document");
 }
 
-export async function inspectSmiles(context: AssistantToolContext, smiles: string) {
-  const result = await context.chemistry.inspectStructure("smiles", smiles);
-  if (!result.valid) throw new Error(result.reason);
-  if (!Number.isInteger(result.heavyAtoms) || result.heavyAtoms < 0 || result.heavyAtoms > 500) {
-    throw new Error(`Structure exceeds the 500 heavy atom limit (${result.heavyAtoms}).`);
-  }
-  if (!result.canonicalSmiles) throw new Error("RDKit did not return a canonical SMILES.");
-  return result;
-}
-export async function inspectMolecule(context: AssistantToolContext, molecule: MoleculeObject) {
-  const warnings: string[] = [];
-  const molfile = chemicalIdentityMolfile(molecule, warnings);
-  if (warnings.length) throw new Error(warnings.join(" "));
-  const result = await context.chemistry.inspectStructure("molfile", molfile);
-  if (!result.valid) throw new Error(result.reason);
-  if (!result.canonicalSmiles) throw new Error("RDKit did not return a canonical SMILES.");
-  return { ...result, molfile };
-}
-export async function assertCanonical(
-  context: AssistantToolContext, molecule: MoleculeObject, input: string
-) {
-  await assertMoleculeMatchesSmiles(molecule, input, async (format, value, stereoReference) => {
-    const result = format === "smiles" ? await inspectSmiles(context, value)
-      : await context.chemistry.inspectStructure(format, value, stereoReference);
-    return result.valid
-      ? { valid: true, canonicalSmiles: result.identitySmiles, facts: result.identityFacts } : result;
-  });
-}
 async function buildMolecule(context: AssistantToolContext, smiles: string): Promise<MoleculeObject> {
   await inspectSmiles(context, smiles); // cap before expensive depiction
   const result = await context.chemistry.structureFromSmiles({ smiles, origin: context.plugin.name });
@@ -133,7 +107,7 @@ export async function applyAssistantWrite(context: AssistantToolContext, built: 
     if (growth) built = { ...built, pageGrowth: { ...growth, pages, description: "This content", itemCount: 1, items: [] } };
   }
   for (const [id, smiles] of built.expectedSmiles ?? []) {
-    const { object } = findObject(validated, id);
+    const { object } = findObject(context, validated, id);
     if (object.type !== "molecule") throw new Error(`Expected molecule ${id}.`);
     await assertCanonical(context, object, smiles);
   }
@@ -152,7 +126,6 @@ export async function applyAssistantWrite(context: AssistantToolContext, built: 
       const ids = new Set(built.pageGrowth.items.flatMap(item => item.objectIds));
       patch = { op: "batch", patches: built.pageGrowth.items.length
         ? patch.patches.filter(op => op.op !== "addObject" || !ids.has(op.object.id)) : [] };
-      summary = `Inserted ${patch.patches.length} fitting objects; ${declineReason}: ${declined.join(", ")}.`;
     }
   }
   // The pinned tab may close or a user may edit while chemistry is awaited. Never apply a stale plan.
@@ -162,13 +135,21 @@ export async function applyAssistantWrite(context: AssistantToolContext, built: 
     throw new Error("The document changed while the assistant prepared this write; read it again and retry.");
   }
   const result = patch.patches.length ? await context.write(patch, context.signal, built.checkPreconditions, built.expectedSmiles) : { objectIds: [] };
+  if (result.pageSpaceUnanswered) {
+    declined = ["This content"];
+    declineReason = PAGE_GROWTH_UNANSWERED;
+  }
+  if (declined.length) {
+    const count = result.pageSpaceUnanswered ? 0 : patch.patches.length;
+    summary = `Inserted ${count} fitting objects; ${declineReason}: ${declined.join(", ")}.`;
+  }
   const inserted = patch.patches.filter(patch => patch.op === "addObject" || patch.op === "addAnnotation");
   if (inserted.length) {
     const insertedIds = new Set(inserted.map(patch => patch.op === "addObject" ? patch.object.id : patch.annotation.id));
     // The host may rebase ids. Its returned ids are authoritative; update-only calls never widen scope.
     recordAssistantInsertions(context, result.objectIds.filter(id => insertedIds.has(id) || !document.pages.some(page => page.objects.some(object => object.id === id))));
   }
-  return { ...result, summary, warnings: built.warnings,
+  return { objectIds: result.objectIds, summary, warnings: built.warnings,
     ...(built.alignmentWarnings ? { alignmentWarnings: built.alignmentWarnings } : {}),
     ...(declined.length ? { declined, reason: declineReason } : {}) };
 }
@@ -220,12 +201,13 @@ function assistantText(document: ChemDraftDocument, text: string, style: Partial
   // Text measurement rounds to hundredths; a fractional paper width must remain the ceiling.
   return { ...object, ...size, width: Math.min(size.width, maxWidth) };
 }
+/** `relative.anchor` is already resolved on `pageId` by findObject; it is never looked up again by id. */
 function placement(context: AssistantToolContext, objects: readonly DocumentObject[], pageId?: string,
-  relative?: { objectId: string; side: RelativeSide }, exclude: readonly string[] = []) {
+  relative?: { anchor: DocumentObject; side: RelativeSide }, exclude: readonly string[] = []) {
   const document = requireDocument(context);
   const page = pageId ? document.pages.find(page => page.id === pageId)! : document.pages[0]!;
   const bounds = unionRects(objects.map(objectRect));
-  const preferred = relative ? relativeRect(bounds, objectRect(findObject(document, relative.objectId).object), relative.side) : undefined;
+  const preferred = relative ? relativeRect(bounds, objectRect(relative.anchor), relative.side) : undefined;
   const placed = choosePagePlacements({ page, sizes: [bounds], occupied: page.objects.filter(object => !exclude.includes(object.id)).map(objectRect),
     viewport: context.getViewportRect?.(context.tabId), preferred, ...(relative ? { gap: RELATIVE_GAP } : {}) });
   return { page, plan: placed,
@@ -359,10 +341,11 @@ export async function buildInsertReaction(context: AssistantToolContext, raw: un
 export function buildInsertText(context: AssistantToolContext, raw: unknown): AssistantWrite {
   const input = toolSchemas.insert_text.parse(raw);
   const document = requireDocument(context);
-  const pageId = input.relativeTo ? findObject(document, input.relativeTo.objectId).page.id : undefined;
-  const textDocument = pageId ? { ...document, pages: [document.pages.find(page => page.id === pageId)!] } : document;
+  const anchor = input.relativeTo ? findObject(context, document, input.relativeTo.objectId) : undefined;
+  const pageId = anchor?.page.id;
+  const textDocument = anchor ? { ...document, pages: [anchor.page] } : document;
   const object = freshObjects(document, [assistantText(textDocument, input.text, nativeTextStyle(input.style))]);
-  const placed = placement(context, object, pageId, input.relativeTo);
+  const placed = placement(context, object, pageId, anchor && { anchor: anchor.object, side: input.relativeTo!.side });
   return insertionPlan(context, document, insertWrite(placed.page.id, placed.objects, "Inserted text", []),
     placed.plan, placed.page.id, [object], [input.text.slice(0, 80)], "This text");
 }
@@ -379,16 +362,15 @@ export function buildInsertTable(context: AssistantToolContext, raw: unknown): A
   let column = 0;
   const localId = (prefix: string) => prefix === "row" ? `${id}-r${++row}` : `${id}-c${++column}`;
   const { object } = buildTableObject(spec, { id, x: 0, y: 0, newId: localId });
-  const relative = besideObjectId ? { objectId: besideObjectId, side: "right" as const } : undefined;
-  const pageId = besideObjectId ? findObject(document, besideObjectId).page.id : undefined;
-  const placed = placement(context, [object], pageId, relative);
+  const anchor = besideObjectId ? findObject(context, document, besideObjectId) : undefined;
+  const placed = placement(context, [object], anchor?.page.id, anchor && { anchor: anchor.object, side: "right" });
   return insertionPlan(context, document, insertWrite(placed.page.id, placed.objects, "Inserted table", []),
     placed.plan, placed.page.id, [[object]], ["table"], "This table");
 }
 export async function buildEditStructure(context: AssistantToolContext, raw: unknown): Promise<AssistantWrite> {
   const input = toolSchemas.edit_structure.parse(raw);
   const document = requireDocument(context);
-  const { object: old, page } = findObject(document, input.objectId);
+  const { object: old, page } = findObject(context, document, input.objectId);
   if (old.type !== "molecule") throw new Error(`${old.id} is not a molecule.`);
   const checkPreconditions = captureWritePreconditions(document, [old.id], "edit");
   let object = (freshObjects(document, [await buildMolecule(context, input.smiles)])[0]!) as MoleculeObject;
@@ -411,7 +393,7 @@ export function buildStyleObjects(context: AssistantToolContext, input: ToolInpu
     throw new Error("Bond display is stored on bonds and can encode stereochemistry; style_objects can change only object style. Use edit_structure for a chemical edit.");
   }
   const patches: DocumentPatch[] = [...new Set(input.objectIds)].map(objectId => {
-    const { object } = findObject(document, objectId);
+    const { object } = findObject(context, document, objectId);
     const { ringStyles, bondDisplay: _bondDisplay, ...requested } = input.style;
     const style: Record<string, unknown> = { ...object.style, ...requested };
     if (object.type === "molecule") {
@@ -437,7 +419,7 @@ export function buildMoveObjects(context: AssistantToolContext, input: ToolInput
   const document = requireDocument(context);
   const checkPreconditions = captureWritePreconditions(document, input.objectIds, "move",
     "relativeTo" in input.to ? [input.to.relativeTo] : []);
-  const entries = [...new Set(input.objectIds)].map(id => findObject(document, id));
+  const entries = [...new Set(input.objectIds)].map(id => findObject(context, document, id));
   if (entries.some(entry => entry.page.id !== entries[0]!.page.id)) throw new Error("Move objects must be on one page.");
   for (const { object } of entries) {
     // Moving an independently anchored mark can alter the molecule's charge during reconciliation.
@@ -452,15 +434,19 @@ export function buildMoveObjects(context: AssistantToolContext, input: ToolInput
     }
   }
   const originals = entries.map(entry => entry.object);
-  const relative = "relativeTo" in input.to ? { objectId: input.to.relativeTo, side: input.to.side } : undefined;
-  if (relative && input.objectIds.includes(relative.objectId)) throw new Error("A move cannot be relative to an object being moved.");
-  if (relative && findObject(document, relative.objectId).page.id !== entries[0]!.page.id) throw new Error("The relative object must be on the same page.");
+  const to = input.to;
+  if ("relativeTo" in to && input.objectIds.includes(to.relativeTo)) throw new Error("A move cannot be relative to an object being moved.");
+  const anchor = "relativeTo" in to ? findObject(context, document, to.relativeTo) : undefined;
+  if (anchor && anchor.page.id !== entries[0]!.page.id) throw new Error("The relative object must be on the same page.");
+  const relative = anchor && "side" in to ? { anchor: anchor.object, side: to.side } : undefined;
   const cells = arrangementCells(originals);
   const placed = "arrange" in input.to
     ? arrangeCells(context, cells, entries[0]!.page.id, input.to.arrange === "row" ? cells.length : Math.ceil(Math.sqrt(cells.length)), input.objectIds)
     : placement(context, originals, entries[0]!.page.id, relative, input.objectIds);
+  // The moved objects were resolved on their page above; never look them up again by bare id.
+  const originalById = new Map(originals.map(object => [object.id, object]));
   const patches: DocumentPatch[] = placed.objects.map(object => {
-    const original = findObject(document, object.id).object;
+    const original = originalById.get(object.id)!;
     const changes: Partial<DocumentObject> = {};
     for (const key of Object.keys(object) as (keyof DocumentObject)[]) {
       if (JSON.stringify(object[key]) !== JSON.stringify(original[key])) Object.assign(changes, { [key]: object[key] });
@@ -468,19 +454,6 @@ export function buildMoveObjects(context: AssistantToolContext, input: ToolInput
     return { op: "updateObject", objectId: object.id, changes };
   });
   return { patch: { op: "batch", patches }, summary: `Moved ${patches.length} objects`, warnings: [], checkPreconditions };
-}
-
-/** All AnchorSchema fields in chem-core, including molecule attachment metadata. */
-function objectAnchors(object: DocumentObject): readonly Anchor[] {
-  switch (object.type) {
-    case "electron-mark": return [object.anchor];
-    case "mechanism-arrow": return [object.source, object.target];
-    case "reaction-arrow": return [object.start, object.end];
-    case "superatom": return object.metadata.attachmentPoints;
-    case "r-group-label": return object.display.attachmentPoints;
-    case "molecule": return [...object.superatoms, ...object.rGroups].flatMap(item => item.attachmentPoints);
-    default: return [];
-  }
 }
 
 /** Refuse rather than leave mechanism annotations or attachment points referencing removed geometry. */

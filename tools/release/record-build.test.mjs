@@ -4,9 +4,9 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { artifactDigest, BUILD_TARGETS, recordBuild } from "./record-build.mjs";
+import { artifactDigest, recordBuild } from "./record-build.mjs";
 import { macosReleasePlist } from "./macos-build-plist.mjs";
-import { fakeReleaseRunner } from "./release-test-fixtures.mjs";
+import { appImage, arm, deb, fakeReleaseRunner, installer, intel } from "./release-test-fixtures.mjs";
 
 const recordRunner = (options) => {
   const native = fakeReleaseRunner(options);
@@ -35,10 +35,14 @@ function fixture(t) {
   return { rootDir, tauriDir, commit: git("rev-parse", "HEAD") };
 }
 
-test("all three release artifacts record the checked-out full commit, version, target and cleanliness", (t) => {
+test("all five release artifacts record the checked-out full commit, version, target and cleanliness", (t) => {
   const { rootDir, commit } = fixture(t);
-  for (const [target, suffix] of Object.entries(BUILD_TARGETS)) {
-    const artifact = join(rootDir, "assets", `ChemDraft_1.2.3_${suffix}`);
+  for (const [target, name] of [
+    ["aarch64-apple-darwin", arm], ["x86_64-apple-darwin", intel],
+    ["x86_64-pc-windows-msvc", installer],
+    ["x86_64-unknown-linux-gnu", deb], ["x86_64-unknown-linux-gnu", appImage]
+  ]) {
+    const artifact = join(rootDir, "assets", name);
     writeFileSync(artifact, "fixture");
     const calls = [];
     recordBuild({ artifact, target, rootDir }, { run: recordRunner({ embeddedCommit: commit, calls }) });
@@ -47,10 +51,21 @@ test("all three release artifacts record the checked-out full commit, version, t
   }
 });
 
-for (const target of ["aarch64-apple-darwin", "x86_64-apple-darwin"]) {
+test("Linux records require an exact package name for the checked-out version", (t) => {
+  const { rootDir } = fixture(t);
+  for (const name of ["ChemDraft_1.2.2_amd64.deb", "ChemDraft_1.2.3_arm64.deb", "ChemDraft_1.2.3_amd64.appimage"]) {
+    const artifact = join(rootDir, "assets", name);
+    writeFileSync(artifact, "fixture");
+    assert.throws(() => recordBuild({ artifact, target: "x86_64-unknown-linux-gnu", rootDir }),
+      { message: `Expected release artifact ${deb} or ${appImage}` });
+    assert.equal(existsSync(`${artifact}.build.json`), false);
+  }
+});
+
+for (const [target, name] of [["aarch64-apple-darwin", arm], ["x86_64-apple-darwin", intel]]) {
   test(`recording ${target} refuses an unsigned-stamped app even with the correct source commit`, (t) => {
     const { rootDir, commit } = fixture(t);
-    const artifact = join(rootDir, "assets", `ChemDraft_1.2.3_${BUILD_TARGETS[target]}`);
+    const artifact = join(rootDir, "assets", name);
     writeFileSync(artifact, "synthetic unsigned DMG");
     const calls = [];
     assert.throws(() => recordBuild({ artifact, target, rootDir }, {
@@ -62,7 +77,7 @@ for (const target of ["aarch64-apple-darwin", "x86_64-apple-darwin"]) {
 
   test(`recording ${target} checks the DMG's embedded commit before writing a record`, (t) => {
     const { rootDir, commit } = fixture(t);
-    const artifact = join(rootDir, "assets", `ChemDraft_1.2.3_${BUILD_TARGETS[target]}`);
+    const artifact = join(rootDir, "assets", name);
     writeFileSync(artifact, "synthetic DMG");
     for (const embeddedCommit of [undefined, "short", "b".repeat(40)]) {
       const calls = [];
@@ -137,7 +152,7 @@ test("Windows records before staging and carries the record through installer up
   assert.match(workflow, /Get-ChildItem release-assets -File[\s\S]+gh release upload \$env:RELEASE_TAG @assets/);
   const finalRecord = workflow.indexOf("name: Bind build record to final signed installer bytes");
   assert.ok(finalRecord > workflow.indexOf("name: Verify Authenticode and replace unsigned installer"));
-  assert.ok(finalRecord < workflow.indexOf("name: Print SHA-256 and sizes and write checksums"));
+  assert.ok(finalRecord < workflow.indexOf("node tools/release/release-checksums.mjs --assets release-assets"));
   assert.match(workflow, /\$record\.sha256 = \(Get-FileHash -LiteralPath \$installer -Algorithm SHA256\)/);
   assert.match(workflow, /\$record\.size = \(Get-Item -LiteralPath \$installer\)\.Length/);
 });

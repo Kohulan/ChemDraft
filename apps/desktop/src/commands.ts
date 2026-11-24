@@ -55,6 +55,7 @@ import { createBracketCommands } from "./bracketCommands";
 export { tableRuleWidthCommandId, parseTableRuleWidthCommandId } from "./tableCommands";
 import { templateDialogAction, templateInsertActions } from "./templateCommands";
 import { atomProblemCommands } from "./atomProblemCommands";
+import { vibeCodeStarterCommand } from "./commands/vibeCodeStarter";
 export { bondDrawingToolCommandId } from "./bondToolCommands";
 export { templateInsertCommandId } from "./templateCommands";
 
@@ -81,6 +82,8 @@ export interface ShellCommandOptions {
   compoundLayoutSettings?: CompoundLayoutSettings;
   availability?: CommandAvailability;
   registry?: DesktopToolsetRegistry;
+  /** The uncustomized command catalog. The live registry still supplies toolbar launchers. */
+  paletteCommands?: readonly CommandSpec[];
 }
 
 export interface CommandSpec extends CommandDefinition {
@@ -272,6 +275,7 @@ export function fragmentSproutKindForCommand(commandId: string): FragmentSproutK
   return fragmentSproutCommands.find(([kind]) => fragmentSproutCommandId(kind) === commandId)?.[0];
 }
 
+// Hover actions take precedence over tool shortcuts while a target is under the pointer.
 // Case-sensitive keys must stay free of tool/command shortcuts in BOTH presets.
 // In particular, v selects in the default preset and j selects benzene in the alternate preset.
 export const fragmentAtomDrawingHotkeys: Readonly<Record<string, string>> = {
@@ -284,6 +288,7 @@ export const fragmentAtomDrawingHotkeys: Readonly<Record<string, string>> = {
 
 export const fragmentBondDrawingHotkeys: Readonly<Record<string, string>> = {
   g: "bond.fuseRingAtHoveredBond.cyclopropane",
+  u: "bond.fuseRingAtHoveredBond.cyclobutane",
   z: "bond.fuseDieneAtHoveredBond"
 };
 
@@ -338,7 +343,7 @@ export const editActions: CommandSpec[] = [
     icon: "ring",
     source: "core",
     category: "edit",
-    description: "Attach a benzene ring sharing the hovered atom"
+    description: "Attach a benzene ring at the hovered atom, using a phenyl bond if sharing a carbon vertex would exceed its valence"
   },
   {
     id: "atom.attachRingToHoveredAtom.cyclohexane",
@@ -394,7 +399,7 @@ export const editActions: CommandSpec[] = [
     icon: "bond",
     source: "core",
     category: "edit",
-    description: "Grow a bond that keeps turning — repeated presses trace and close a ring"
+    description: "Grow a bond that keeps turning to close a ring, or continue a terminal alkyne in a straight line"
   },
   {
     id: "bond.fuseRingAtHoveredBond.benzene",
@@ -518,6 +523,14 @@ export const editActions: CommandSpec[] = [
     description: "Place a negative charge near the hovered atom"
   },
   {
+    id: "atom.addRadicalToHoveredAtom",
+    title: "Add Radical to Hovered Atom",
+    icon: "charge",
+    source: "core",
+    category: "edit",
+    description: "Place a radical dot near the hovered atom"
+  },
+  {
     id: "edit.deleteHoveredNativeTarget",
     title: "Delete Selection or Hovered Atom/Bond",
     icon: "select",
@@ -613,6 +626,7 @@ export const atomElementActions: CommandSpec[] = nativeHotkeyElements.map((eleme
 
 /** Opens the Preferences window (Spin 3D refinement mode, future app settings). */
 export const PREFERENCES_COMMAND_ID = "view.togglePreferences";
+export const KEYBOARD_PREFERENCES_COMMAND_ID = "view.openKeyboardPreferences";
 
 export const viewActions: CommandSpec[] = [
   {
@@ -2368,13 +2382,13 @@ export function createLayerActions(document: ChemDraftDocument, layoutsEnabled =
     },
     {
       id: "layout.rotate90",
-      title: "Rotate 90 Degrees",
+      title: "Rotate 90° Clockwise",
       icon: "align",
       assetName: "Custom_Rotation",
       source: "core",
       category: "layout",
       enabled: hasSelection,
-      description: "Rotate the selected document objects 90 degrees around the selection center"
+      description: "Rotate the selected document objects 90 degrees clockwise around the selection center"
     },
     {
       id: "layout.duplicate",
@@ -2477,7 +2491,7 @@ export function allShellCommands(
       options.structureSearchEnabled ?? loadStructureSearchEnabled(),
       options.hasSearchableStructure ?? structureSearchDocument(document) !== undefined
     ),
-    ...allPaletteCommands(registry),
+    ...(options.paletteCommands ?? allPaletteCommands()),
     ...copyAsActions,
     ...editActions,
     ...atomElementActions,
@@ -2491,7 +2505,8 @@ export function allShellCommands(
     ...textToolbarActions,
     ...objectStyleActions,
     ...nativeStylePresetActions,
-    ...toolbarCustomizationActions
+    ...toolbarCustomizationActions,
+    vibeCodeStarterCommand
   ]);
 }
 

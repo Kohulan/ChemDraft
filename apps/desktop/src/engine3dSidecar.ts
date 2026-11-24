@@ -19,6 +19,7 @@ import {
   type Engine3DSessionRequest,
   type Engine3DUpdateDragRequest
 } from "@chemdraft/engine3d-api";
+import { refineWorkspaceSeed } from "./conformerClient";
 
 export interface Engine3dSidecarStatus {
   available: boolean;
@@ -56,12 +57,26 @@ export interface Engine3dWorkspaceSessionState {
   selectedAtomIds: readonly string[];
   warnings: string[];
   errors: string[];
+  stereo?: Engine3dSessionStereoGuard;
 }
 
 export interface Engine3dWorkspaceStartOptions {
   input: Engine3DSessionInput;
   warnings?: readonly string[];
+  checkStereo?: (coords: Readonly<Record<string, Engine3DCoordinate>>) => string | undefined;
 }
+
+interface Engine3dSessionStereoGuard {
+  input: Engine3DSessionInput;
+  check: NonNullable<Engine3dWorkspaceStartOptions["checkStereo"]>;
+  rejected: number;
+  needsReseed: boolean;
+  previousValidCoords?: Engine3dCoords;
+  failedSeeds: { coords: Engine3dCoords; reason: string }[];
+  warning?: { reason: string };
+}
+
+type Engine3dCoords = NonNullable<Engine3dWorkspaceSessionState["coords3dByAtomId"]>;
 
 export interface Engine3dMoleculeSessionOptions {
   warnings?: string[];
@@ -71,6 +86,8 @@ export interface Engine3dMoleculeSessionOptions {
 
 const Engine3dWorkspaceReadyTimeoutMs = 12_000;
 const Engine3dWorkspaceReadyPollMs = 80;
+const Engine3dWorkspaceSettleTimeoutMs = 2_000;
+const WorkspaceSeedRefinementWarning = "Could not refine the 3D starting shape. The structure may look bent.";
 
 export async function readEngine3dSidecarStatus(): Promise<Engine3dSidecarStatus | undefined> {
   try {
@@ -141,14 +158,23 @@ export function createEngine3dSessionInputFromMolecule(
 export async function openEngine3dWorkspaceSession(
   options: Engine3dWorkspaceStartOptions
 ): Promise<Engine3dWorkspaceSessionState> {
+  const warnings = [...(options.warnings ?? [])];
+  const input = await prepareEngine3dWorkspaceInput(options, warnings);
   const createRequest: Engine3DCreateSessionRequest = {
     protocolVersion: Engine3DProtocolVersion,
     type: "createSession",
     requestId: "engine3d-1",
-    input: options.input
+    input
   };
   const started = await startEngine3dSidecarSession([engine3dProtocolLine(createRequest)]);
-  let state = reduceEngine3dSidecarOutput({ ...createInitialEngine3dWorkspaceSessionState(started.processSessionId), warnings: [...(options.warnings ?? [])] }, started);
+  let state = reduceEngine3dSidecarOutput({
+    ...createInitialEngine3dWorkspaceSessionState(started.processSessionId),
+    warnings,
+    stereo: options.checkStereo ? {
+      input, check: options.checkStereo, rejected: 0, needsReseed: false,
+      failedSeeds: []
+    } : undefined
+  }, started);
   if (engine3dWorkspaceSessionSettled(state)) {
     return finalizeEngine3dWorkspaceSession(state);
   }
@@ -170,6 +196,30 @@ export async function openEngine3dWorkspaceSession(
   throw new Error(`Interactive 3D sidecar did not become ready within ${Engine3dWorkspaceReadyTimeoutMs / 1000} seconds.`);
 }
 
+async function prepareEngine3dWorkspaceInput(
+  { input, checkStereo }: Engine3dWorkspaceStartOptions,
+  warnings: string[]
+): Promise<Engine3DSessionInput> {
+  const { atomIdByMolfileIndex, coords3dByAtomId, molfile } = input;
+  const seed = coords3dByAtomId && engine3dCoordsInAtomOrder(atomIdByMolfileIndex, coords3dByAtomId);
+  if (!seed?.length) return input;
+
+  // The sidecar's short UFF startup pass cannot repair some warped ETKDG
+  // macrocycles. Reuse the worker's refinement of this exact embed before UFF.
+  const outcome = await refineWorkspaceSeed(molfile, seed);
+  if (!outcome || outcome.status === "skipped") return input;
+
+  if (outcome.status === "refined" && outcome.coords.length === seed.length && outcome.coords.every(Number.isFinite)) {
+    const refined = outcome.coords;
+    const positions = Object.fromEntries(atomIdByMolfileIndex.map((id, i) => [id, {
+      x: refined[3 * i], y: refined[3 * i + 1], z: refined[3 * i + 2]
+    }]));
+    if (!checkStereo?.(positions)) return { ...input, coords3dByAtomId: positions };
+  }
+  warnings.push(WorkspaceSeedRefinementWarning);
+  return input;
+}
+
 export async function pollEngine3dWorkspaceSessionState(
   state: Engine3dWorkspaceSessionState
 ): Promise<Engine3dWorkspaceSessionState> {
@@ -181,11 +231,23 @@ export async function pollEngine3dWorkspaceSessionState(
 
 export async function beginEngine3dWorkspaceDrag(
   state: Engine3dWorkspaceSessionState,
-  atomId: string
+  atomId: string,
+  reseed = false
 ): Promise<Engine3dWorkspaceSessionState> {
   if (!state.sessionId || state.closed || state.exited) {
     return state;
   }
+  if (state.stereo) state = {
+    ...state, stereo: { ...state.stereo, rejected: 0, warning: undefined, needsReseed: reseed || state.stereo.needsReseed }
+  };
+  state = await reseedEngine3dWorkspaceIfNeeded(state);
+  return beginEngine3dWorkspaceDragFromState(state, atomId);
+}
+
+async function beginEngine3dWorkspaceDragFromState(
+  state: Engine3dWorkspaceSessionState, atomId: string
+): Promise<Engine3dWorkspaceSessionState> {
+  if (!state.sessionId || state.closed || state.exited || state.stereo?.needsReseed || engine3dDragStereoBlocked(state)) return state;
   const request: Engine3DBeginDragRequest = {
     protocolVersion: Engine3DProtocolVersion,
     type: "beginDrag",
@@ -201,9 +263,11 @@ export async function updateEngine3dWorkspaceDrag(
   atomId: string,
   target: Engine3DCoordinate
 ): Promise<Engine3dWorkspaceSessionState> {
-  if (!state.sessionId || state.closed || state.exited) {
+  if (!state.sessionId || state.closed || state.exited || engine3dDragStereoBlocked(state)) {
     return state;
   }
+  state = await reseedEngine3dWorkspaceIfNeeded(state, atomId);
+  if (!state.sessionId || state.closed || state.exited || state.stereo?.needsReseed || engine3dDragStereoBlocked(state)) return state;
   const request: Engine3DUpdateDragRequest = {
     protocolVersion: Engine3DProtocolVersion,
     type: "updateDrag",
@@ -220,9 +284,11 @@ export async function endEngine3dWorkspaceDrag(
   atomId: string,
   cancelled = false
 ): Promise<Engine3dWorkspaceSessionState> {
-  if (!state.sessionId || state.closed || state.exited) {
+  if (!state.sessionId || state.closed || state.exited || engine3dDragStereoBlocked(state)) {
     return state;
   }
+  state = await reseedEngine3dWorkspaceIfNeeded(state, atomId);
+  if (!state.sessionId || state.closed || state.exited || state.stereo?.needsReseed || engine3dDragStereoBlocked(state)) return state;
   const request: Engine3DEndDragRequest = {
     protocolVersion: Engine3DProtocolVersion,
     type: "endDrag",
@@ -231,7 +297,115 @@ export async function endEngine3dWorkspaceDrag(
     atomId,
     cancelled
   };
-  return sendEngine3dWorkspaceRequest(state, request);
+  let next = await sendEngine3dWorkspaceRequest(state, request);
+  const deadline = Date.now() + Engine3dWorkspaceSettleTimeoutMs;
+  // A long settle can finish after the native send's output window. Drain it
+  // under the same gesture's guard, before the next beginDrag resets its budget.
+  const awaitingSettle = () => next.stereo && !next.closed && !next.exited && next.errors.length === state.errors.length &&
+    !(next.coordinateRevision > state.coordinateRevision && next.lastCoordinateReason === "settle");
+  while (awaitingSettle() && Date.now() < deadline) {
+    await sleepEngine3dWorkspaceReadyPoll();
+    next = await pollEngine3dWorkspaceSessionState(next);
+  }
+  if (awaitingSettle()) {
+    // Retire this session before allowing the next action to consume coordinates.
+    // Keep the validated frame at the deadline, even if shutdown delivers a late reply.
+    const retired = await closeEngine3dWorkspaceSession(next);
+    next = { ...next, closed: true, exited: retired.exited, errors: retired.errors, stereo: {
+      ...next.stereo!, warning: { reason: "the sidecar timed out settling the tug" }
+    } };
+  }
+  return next;
+}
+
+export function engine3dDragStereoBlocked(state: Engine3dWorkspaceSessionState): boolean {
+  return (state.stereo?.rejected ?? 0) >= 2;
+}
+
+async function reseedEngine3dWorkspaceIfNeeded(
+  state: Engine3dWorkspaceSessionState, draggedAtomId?: string
+): Promise<Engine3dWorkspaceSessionState> {
+  if (!state.stereo?.needsReseed) return state;
+  const lastValid = state.coords3dByAtomId;
+  let next = state;
+  let reason = state.stereo.warning?.reason ?? "the solver couldn't preserve stereochemistry";
+  // A rejected UFF initial relaxation is deterministic for the same seed.
+  // Try the most recent distinct validated frame when the current one fails.
+  for (const seed of [lastValid, state.stereo.previousValidCoords]) {
+    const stereo = next.stereo!;
+    if (!seed) continue;
+    const failed = stereo.failedSeeds.find(failure => sameEngine3dCoords(failure.coords, seed));
+    if (failed) {
+      reason = failed.reason;
+      continue;
+    }
+    next = await restartEngine3dWorkspace(next, seed);
+    if (next.closed || next.exited || next.errors.length !== state.errors.length) break;
+    if (!next.stereo?.needsReseed) {
+      next = { ...next, stereo: { ...next.stereo!, rejected: state.stereo.rejected, warning: state.stereo.warning } };
+      return draggedAtomId ? beginEngine3dWorkspaceDragFromState(next, draggedAtomId) : next;
+    }
+    reason = next.stereo.warning?.reason ?? reason;
+    next = { ...next, stereo: {
+      ...next.stereo, failedSeeds: [...next.stereo.failedSeeds.slice(-1), { coords: seed, reason }]
+    } };
+  }
+  return {
+    ...next, coords3dByAtomId: lastValid, stereo: {
+      ...next.stereo!, rejected: 2, needsReseed: true,
+      previousValidCoords: state.stereo.previousValidCoords,
+      warning: { reason: `the solver could not restart the tug without changing stereochemistry (${reason})` }
+    }
+  };
+}
+
+async function restartEngine3dWorkspace(state: Engine3dWorkspaceSessionState, seed: Engine3dCoords) {
+  // createSession resets the solver (including its drag reference) in the existing
+  // process. The protocol has no command for overwriting coordinates mid-session.
+  const request: Engine3DCreateSessionRequest = {
+    protocolVersion: Engine3DProtocolVersion,
+    type: "createSession",
+    requestId: nextEngine3dRequestId(state),
+    sessionId: state.sessionId,
+    input: { ...state.stereo!.input, coords3dByAtomId: seed }
+  };
+  let next = await sendEngine3dWorkspaceRequest({
+    ...state, lastCoordinateReason: undefined, forceField: undefined,
+    stereo: { ...state.stereo!, rejected: 0, warning: undefined, needsReseed: true }
+  }, request);
+  const deadline = Date.now() + Engine3dWorkspaceSettleTimeoutMs;
+  while (waitingForEngine3dInitialRelax(next) && next.errors.length === state.errors.length &&
+         !next.closed && !next.exited && Date.now() < deadline) {
+    await sleepEngine3dWorkspaceReadyPoll();
+    next = await pollEngine3dWorkspaceSessionState(next);
+  }
+  if (waitingForEngine3dInitialRelax(next)) {
+    return { ...next, stereo: { ...next.stereo!, needsReseed: true, warning: { reason: "initial relaxation did not finish" } } };
+  }
+  return next;
+}
+
+function waitingForEngine3dInitialRelax(state: Engine3dWorkspaceSessionState): boolean {
+  return state.capabilities?.forceField === "UFF" && state.lastCoordinateReason !== "initial-relax" && !state.forceField;
+}
+
+function sameEngine3dCoords(a: Engine3dCoords, b: Engine3dCoords): boolean {
+  return a === b || Object.entries(a).every(([id, point]) => {
+    const other = b[id];
+    return other && point.x === other.x && point.y === other.y && point.z === other.z;
+  });
+}
+
+export function engine3dCoordsInAtomOrder(
+  ids: readonly string[], coords: Readonly<Record<string, Engine3DCoordinate>>
+): Float64Array | undefined {
+  const result = new Float64Array(ids.length * 3);
+  for (const [i, id] of ids.entries()) {
+    const point = coords[id];
+    if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y) || !Number.isFinite(point.z)) return undefined;
+    result.set([point.x, point.y, point.z], i * 3);
+  }
+  return result;
 }
 
 export async function closeEngine3dWorkspaceSession(
@@ -355,18 +529,11 @@ function reduceEngine3dMessage(
   switch (message.eventType) {
     case "ready":
       return {
-        ...state,
-        capabilities: message.capabilities ?? state.capabilities,
-        coords3dByAtomId: message.coords3dByAtomId ?? state.coords3dByAtomId,
-        coordinateRevision: message.coordinateRevision ?? state.coordinateRevision
+        ...reduceEngine3dCoordinates(state, message),
+        capabilities: message.capabilities ?? state.capabilities
       };
     case "coordinatesChanged":
-      return {
-        ...state,
-        coords3dByAtomId: message.coords3dByAtomId ?? state.coords3dByAtomId,
-        coordinateRevision: message.coordinateRevision ?? state.coordinateRevision,
-        lastCoordinateReason: message.reason ?? state.lastCoordinateReason
-      };
+      return reduceEngine3dCoordinates(state, message);
     case "energyChanged":
       return {
         ...state,
@@ -401,6 +568,42 @@ function reduceEngine3dMessage(
   }
 }
 
+function reduceEngine3dCoordinates(state: Engine3dWorkspaceSessionState, message: Engine3DEvent): Engine3dWorkspaceSessionState {
+  const coords = message.coords3dByAtomId;
+  const revision = message.coordinateRevision ?? state.coordinateRevision;
+  const stereo = state.stereo;
+  const next = {
+    ...state,
+    coordinateRevision: revision,
+    lastCoordinateReason: message.reason ?? state.lastCoordinateReason
+  };
+  if (!coords) return next;
+  if (!stereo) return { ...next, coords3dByAtomId: coords };
+  if (engine3dDragStereoBlocked(state)) return next;
+  const reason = stereo.check(coords);
+  if (!reason) {
+    const prior = state.coords3dByAtomId;
+    const previousValidCoords = prior && !sameEngine3dCoords(prior, coords) ? prior : stereo.previousValidCoords;
+    return { ...next, coords3dByAtomId: coords, stereo: { ...stereo, previousValidCoords, needsReseed: false } };
+  }
+  // ready and embed carry the same first snapshot. Count coordinate revisions
+  // so that duplicate delivery cannot stop a gesture.
+  const duplicateEmbed = stereo.needsReseed && message.reason === "embed" && revision === state.coordinateRevision;
+  const rejected = stereo.rejected + (duplicateEmbed ? 0 : 1);
+  const reportRejection = rejected >= 2 || message.reason === "settle" || message.reason === "initial-relax";
+  const seed = stereo.input.coords3dByAtomId;
+  return {
+    ...next,
+    coords3dByAtomId: state.coords3dByAtomId ?? (seed && !stereo.check(seed) ? seed : undefined),
+    stereo: {
+      ...stereo,
+      rejected,
+      needsReseed: true,
+      warning: stereo.warning ?? (reportRejection ? { reason } : undefined)
+    }
+  };
+}
+
 function createInitialEngine3dWorkspaceSessionState(processSessionId: string): Engine3dWorkspaceSessionState {
   return {
     processSessionId,
@@ -421,7 +624,7 @@ function createInitialEngine3dWorkspaceSessionState(processSessionId: string): E
  */
 function engine3dWorkspaceSessionSettled(state: Engine3dWorkspaceSessionState): boolean {
   return Boolean(
-    state.coords3dByAtomId ||
+    (state.coords3dByAtomId && (!state.stereo || !waitingForEngine3dInitialRelax(state))) ||
     state.errors.length > 0 ||
     state.closed ||
     state.exited

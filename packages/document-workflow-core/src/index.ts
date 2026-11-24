@@ -7,6 +7,7 @@ export * from "./atoms";
 export * from "./documentInventory";
 export * from "./nativeDocument";
 export * from "./gridLayout";
+export * from "./figurePlans";
 // Named, not `export *`: graph.ts also exports a test-only work counter, served from ./testing.
 export {
   atomPairKey,
@@ -41,3 +42,6 @@ export { nativeChargePlacementPointForAtom, nativeChargeMarkSizePx, nativeAtomHi
 export * from "./tables";
 
 export * from "./nameDictionary";
+
+export * from "./molfileInterop";
+export * from "./molfileExportIdentity";

@@ -48,11 +48,15 @@ describe("floating frame depth and document tabs", () => {
       const start = nativeSource.indexOf(`fn ${name}<`);
       expect(start).toBeGreaterThan(-1);
       const body = nativeSource.slice(start, nativeSource.indexOf("\nfn ", start + 1));
-      const builder = body.slice(body.indexOf("WebviewWindowBuilder::new"), body.indexOf(".build()"));
-      expect(builder).toContain(".decorations(false)");
-      expect(builder).toContain(".shadow(true)");
-      expect(builder).not.toContain(".shadow(false)");
-      expect(builder).not.toMatch(/#\[cfg/);
+      const builder = body.slice(0, body.indexOf(".build()"));
+      const shared = builder.match(
+        /^(?:    #\[[^\r\n]+\]\r?\n)*    let (?:mut )?builder = (?:utility_window_builder\(\s*)?WebviewWindowBuilder::new\([\s\S]*?;\r?$/m
+      )?.[0];
+      expect(shared).toContain(".decorations(false)");
+      expect(shared).toContain(".shadow(true)");
+      expect(shared).not.toMatch(/#\[cfg/);
+      // Platform-specific placement may extend the builder without overriding its shadow.
+      expect(builder.match(/\.shadow\s*\([^)]*\)/g)).toEqual([".shadow(true)"]);
     }
   );
 });

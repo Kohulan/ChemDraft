@@ -1,22 +1,34 @@
-import { CdxmlBracketAtomSnapshotSchema, type BracketObject, type DocumentObject, type MoleculeObject, type MoleculeAtom, type Point } from "./schemas";
+import { CdxmlBracketAtomSnapshotSchema, type BracketObject, type DocumentObject, type MoleculeObject, type MoleculeAtom, type MoleculeBond, type Point } from "./schemas";
+import { bracketPairUsage } from "./bracketSemantics";
 import { rotatePointAboutCenter } from "./pointRotation";
 
 export type RepeatUnitMembershipOptions = {
   /** Rendering transforms stay in layout-engine. Unrotated native atoms already use page coordinates. */
   atomPosition?: (molecule: MoleculeObject, atom: MoleculeAtom) => Point;
+  /** Cached chemistry warnings are compared by the authored-write scope checks. */
+  useLegacyDiagnostics?: boolean;
 };
 
 export type RepeatUnitAtomMembership = {
   members: { molecule: MoleculeObject; atomIds: string[] }[];
+  /** Explicit object members with a stored structure but no native atoms to export. */
+  structureOnlyMembers: MoleculeObject[];
   /** References may touch a graph even when imported member ids cannot resolve (#379). */
   crossingAtomIds: Map<string, Set<string>>;
   referencedObjectIds: Set<string>;
   imported: boolean;
+  /** Some imported source ids could not be resolved to explicit objects or native atoms. */
+  unresolvedMemberReferences: boolean;
   /** True for every invalid membership; reason supplies the shared diagnostic for all consumers. */
   unresolved: boolean;
   connectivity?: "eu" | "ht" | "hh";
   reason?: string;
 };
+
+/** The crossing bonds of a drawn SRU have one member atom and one nonmember atom. */
+export function isRepeatUnitBoundaryBond(bond: MoleculeBond, atomIds: ReadonlySet<string>): boolean {
+  return atomIds.has(bond.fromAtomId) !== atomIds.has(bond.toAtomId);
+}
 
 /** Resolve atoms once for UI counts, interchange, analysis and search. Imported source ids are
  * authoritative and scoped through native records: never replace unresolved imports with geometry.
@@ -49,7 +61,7 @@ export function resolveRepeatUnitAtomMembership(
       typeof entry.innerAtomId === "string" && molecule.atoms.some(atom => atom.id === entry.innerAtomId)) atoms.add(entry.innerAtomId);
     crossingAtomIds.set(molecule.id, atoms);
   }
-  const imported = importedMembership(pair, objects, options.atomPosition);
+  const imported = importedMembership(pair, objects, options);
   imported?.referencedObjectIds.forEach(id => referencedObjectIds.add(id));
   const left = Math.min(...pair.map(object => object.x));
   const top = Math.min(...pair.map(object => object.y));
@@ -57,8 +69,10 @@ export function resolveRepeatUnitAtomMembership(
   const bottom = Math.max(...pair.map(object => object.y + object.height));
   const enclosure = bracketPairEnclosure(pair);
   let reason = imported ? imported.reason : enclosure.reason;
+  const structureOnlyMembers: MoleculeObject[] = [];
   const members = objects.flatMap(molecule => {
     if (molecule.type !== "molecule") return [];
+    if (!molecule.atoms.length && molecule.structure.trim() && explicit.has(molecule.id)) structureOnlyMembers.push(molecule);
     const atomIds = new Set(imported?.members.get(molecule.id));
     if (!imported) {
       for (const atom of molecule.atoms) {
@@ -95,10 +109,14 @@ export function resolveRepeatUnitAtomMembership(
       reason ??= "its membership includes missing or non-molecular objects";
     }
   }
+  if (!options.useLegacyDiagnostics && structureOnlyMembers.length && members.length) {
+    reason ??= "its explicitly contained structure has no native atoms";
+  }
   reason ??= !members.length ? "its atom membership is empty" :
     crossingReason(pair, members, objects.filter((object): object is MoleculeObject => object.type === "molecule"),
-      !imported && pair.some(object => object.bracketUsage === "multiple") ? explicit : new Set<string>());
-  return { members, crossingAtomIds, referencedObjectIds, imported: imported !== undefined,
+      !imported && bracketPairUsage(pair) === "multiple" ? explicit : new Set<string>());
+  return { members, structureOnlyMembers, crossingAtomIds, referencedObjectIds, imported: imported !== undefined,
+    unresolvedMemberReferences: imported?.unresolvedMemberReferences ?? false,
     unresolved: reason !== undefined, connectivity: imported?.connectivity, reason };
 }
 
@@ -129,31 +147,203 @@ function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** Source ids are opaque: only the importer's scoped native references can resolve them. */
-function importedMembership(pair: readonly BracketObject[], objects: readonly DocumentObject[], atomPosition: RepeatUnitMembershipOptions["atomPosition"]) {
-  const source = pair.find(object => {
-    const group = object.compatibility?.unknown.bracketedGroup;
-    return record(group) && record(group.attributes);
+/** Retarget imported atom-level records by the merge's graph mapping. Preserve unprovable
+ * records and the source attributes so the normal membership diagnostic can explain the loss. */
+export function remapImportedRepeatUnitAfterMoleculeMerge(bracket: BracketObject, absorbedObjectId: string,
+  hostObjectId: string, atomIds: ReadonlyMap<string, string>, bondIds: ReadonlyMap<string, string>): BracketObject["compatibility"] {
+  const compatibility = bracket.compatibility;
+  if (!compatibility) return undefined;
+  const unknown = { ...compatibility.unknown };
+  const members = unknown.cdxmlBracketMembers;
+  const absorbedMembers = Array.isArray(members) ? members.filter(entry => record(entry) && entry.objectId === absorbedObjectId) : [];
+  const remappedSources = new Set<string>();
+  if (absorbedMembers.length && Array.isArray(members)) {
+    unknown.cdxmlBracketMembers = members.map(entry => {
+      if (!record(entry) || entry.objectId !== absorbedObjectId ||
+        typeof entry.atomId !== "string" || typeof entry.sourceId !== "string") return entry;
+      const atomId = atomIds.get(entry.atomId);
+      if (!atomId) return entry;
+      remappedSources.add(entry.sourceId);
+      return { ...entry, objectId: hostObjectId, atomId };
+    });
+    if (unknown.cdxmlBracketAtomSnapshots) {
+      unknown.cdxmlBracketAtomSnapshots = unknown.cdxmlBracketAtomSnapshots.map(snapshot => {
+        if (!remappedSources.has(snapshot.sourceId)) return snapshot;
+        const atomId = atomIds.get(snapshot.atomId);
+        if (!atomId) return snapshot;
+        // Keep proof of absent bonds for export diagnostics, independent of the surviving atom's identity.
+        const incidentBonds = snapshot.incidentBonds.map(bond => {
+          const id = bondIds.get(bond.id), fromAtomId = atomIds.get(bond.fromAtomId), toAtomId = atomIds.get(bond.toAtomId);
+          return id && fromAtomId && toAtomId ? { ...bond, id, fromAtomId, toAtomId } : bond;
+        });
+        return { ...snapshot, atomId, incidentBonds };
+      });
+    }
+  }
+  const memberObjects = unknown.cdxmlBracketMemberObjectIds;
+  if (absorbedMembers.length || (Array.isArray(memberObjects) && memberObjects.includes(absorbedObjectId))) {
+    const originalIds = Array.isArray(memberObjects) ? memberObjects : [];
+    const fullyMapped = absorbedMembers.length > 0 && absorbedMembers.every(entry =>
+      typeof entry.atomId === "string" && atomIds.has(entry.atomId));
+    unknown.cdxmlBracketMemberObjectIds = [...new Set([
+      ...originalIds.filter(id => !fullyMapped || id !== absorbedObjectId), hostObjectId
+    ])];
+  }
+  const crossings = unknown.cdxmlBracketCrossings;
+  if (Array.isArray(crossings)) {
+    unknown.cdxmlBracketCrossings = crossings.map(entry => {
+      if (!record(entry) || !record(entry.ref) || entry.ref.objectId !== absorbedObjectId || typeof entry.ref.bondId !== "string") return entry;
+      const bondId = bondIds.get(entry.ref.bondId);
+      const innerAtomId = typeof entry.innerAtomId === "string" ? atomIds.get(entry.innerAtomId) : undefined;
+      if (!bondId || (entry.innerAtomId !== undefined && !innerAtomId)) return entry;
+      let bondIdentity = entry.bondIdentity;
+      if (typeof bondIdentity === "string") {
+        try {
+          const endpoints: unknown = JSON.parse(bondIdentity);
+          if (Array.isArray(endpoints) && endpoints.length === 2 &&
+            endpoints.every(id => typeof id === "string" && atomIds.has(id))) {
+            bondIdentity = JSON.stringify(endpoints.map(id => atomIds.get(id)));
+          }
+        } catch { /* Keep the malformed source identity for the diagnostic. */ }
+      }
+      return { ...entry, ref: { objectId: hostObjectId, bondId },
+        ...(bondIdentity !== undefined && { bondIdentity }), ...(innerAtomId && { innerAtomId }) };
+    });
+  }
+  return absorbedMembers.length || (Array.isArray(memberObjects) && memberObjects.includes(absorbedObjectId)) ||
+    (Array.isArray(crossings) && crossings.some((entry, i) => entry !== (unknown.cdxmlBracketCrossings as unknown[])[i]))
+    ? { ...compatibility, unknown } : compatibility;
+}
+
+function importedBracketAttributes(pair: readonly BracketObject[]): Record<string, unknown> | undefined {
+  for (const bracket of pair) {
+    const group = bracket.compatibility?.unknown.bracketedGroup;
+    if (record(group) && record(group.attributes)) return group.attributes;
+  }
+}
+
+function importedSourceIds(attributes: Record<string, unknown>): string[] {
+  const ids = attributes.BracketedObjectIDs;
+  return typeof ids === "string" ? [...new Set(ids.trim().split(/\s+/).filter(Boolean))] : [];
+}
+
+function importedMemberRecords(pair: readonly BracketObject[]): Record<string, unknown>[] {
+  return pair.flatMap(object => {
+    const entries = object.compatibility?.unknown.cdxmlBracketMembers;
+    return Array.isArray(entries) ? entries.filter(record) : [];
   });
-  if (!source) {
+}
+
+function importedMemberRecord(records: Record<string, unknown>[], sourceId: string): Record<string, unknown> | undefined {
+  const unique = new Map(records.filter(entry => entry.sourceId === sourceId).map(entry => [JSON.stringify(entry), entry]));
+  if (unique.size === 1) return unique.values().next().value;
+}
+
+type DeletedImportedAtom = [sourceId: string, atomId: string];
+
+function recordedImportedDeletions(pair: readonly BracketObject[]): DeletedImportedAtom[] | undefined {
+  const previous = pair.map(bracket => bracket.compatibility?.unknown.cdxmlBracketDeletedAtoms ?? []);
+  return JSON.stringify(previous[0]) === JSON.stringify(previous[1]) ? previous[0] : undefined;
+}
+
+/** Deletion needs atom provenance, independent of whether the remaining graph can be exported
+ * as an SRU. For example, a prior member deletion also removes a surviving member's bond. */
+export function planImportedRepeatUnitDeletion(pair: readonly BracketObject[], objects: readonly DocumentObject[],
+  after: ReadonlyMap<string, readonly DocumentObject[]>, wholeMoleculesOnly: boolean) {
+  const attributes = importedBracketAttributes(pair);
+  const records = importedMemberRecords(pair);
+  const retained = { orphaned: false, deletedMoleculeIds: new Set<string>(), deletedAtoms: [] };
+  if (!attributes) {
+    const hasRecords = records.length || pair.some(bracket => {
+      const ids = bracket.compatibility?.unknown.cdxmlBracketMemberObjectIds;
+      return Array.isArray(ids) && ids.length > 0;
+    });
+    return hasRecords ? retained : undefined;
+  }
+  const sourceIds = importedSourceIds(attributes);
+  const previous = recordedImportedDeletions(pair);
+  if (!sourceIds.length || !previous) return retained;
+  let unresolved = false;
+  const knownDeleted = new Set(previous.map(entry => JSON.stringify(entry)));
+  const deletedAtoms: DeletedImportedAtom[] = [];
+  const deletedMoleculeIds = new Set<string>();
+  const previouslyDeletedObjects = new Set<string>();
+  let survives = false;
+  for (const sourceId of sourceIds) {
+    const member = importedMemberRecord(records, sourceId);
+    const snapshots = pair.map(bracket => bracket.compatibility?.unknown.cdxmlBracketAtomSnapshots
+      ?.filter(snapshot => snapshot.sourceId === sourceId));
+    const originals = snapshots[0];
+    if (!member || typeof member.objectId !== "string" || !originals?.length ||
+      JSON.stringify(originals) !== JSON.stringify(snapshots[1]) ||
+      (member.atomId !== undefined && (originals.length !== 1 || originals[0].atomId !== member.atomId))) {
+      unresolved = true;
+      continue;
+    }
+    const candidates = objects.filter(object => object.id === member.objectId);
+    const molecule = candidates.length === 1 && candidates[0].type === "molecule" ? candidates[0] : undefined;
+    if (candidates.length && !molecule) {
+      unresolved = true;
+      continue;
+    }
+    if (molecule && new Set(molecule.atoms.map(atom => atom.id)).size !== molecule.atoms.length) {
+      unresolved = true;
+      continue;
+    }
+    const remaining = (after.get(member.objectId) ?? []).filter((object): object is MoleculeObject => object.type === "molecule");
+    const sourceAtoms = molecule?.compatibility?.unknown.cdxmlAtomIdsByAtomId;
+    const atoms = new Map(molecule?.atoms.map(atom => [atom.id, atom]));
+    const deletedBefore = originals.every(({ atomId }) => knownDeleted.has(JSON.stringify([sourceId, atomId])));
+    if (member.atomId === undefined && !molecule && deletedBefore) previouslyDeletedObjects.add(member.objectId);
+    for (const { atomId, element } of originals) {
+      const atom = atoms.get(atomId);
+      const sourceAtomId = member.atomId !== undefined ? sourceId : record(sourceAtoms) ? sourceAtoms[atomId] : undefined;
+      if (!atom) {
+        if (!knownDeleted.has(JSON.stringify([sourceId, atomId]))) unresolved = true;
+      } else if (typeof sourceAtomId !== "string" || atom.cdxmlSourceId !== sourceAtomId || atom.element !== element) {
+        unresolved = true;
+      } else if (remaining.some(object => wholeMoleculesOnly ||
+        object.atoms.some(atom => atom.id === atomId || atom.cdxmlSourceId === sourceAtomId))) {
+        survives = true;
+      } else {
+        deletedAtoms.push([sourceId, atomId]);
+        if (!remaining.length) deletedMoleculeIds.add(member.objectId);
+      }
+    }
+  }
+  // A native membership edit is not evidence that the import's members were deleted.
+  for (const bracket of pair) {
+    const snapshot = bracket.compatibility?.unknown.cdxmlBracketMembership;
+    if (snapshot === JSON.stringify(bracket.containedObjectIds)) continue;
+    try {
+      const ids: unknown = typeof snapshot === "string" ? JSON.parse(snapshot) : undefined;
+      if (Array.isArray(ids) &&
+        JSON.stringify(ids.filter(id => !previouslyDeletedObjects.has(id))) === JSON.stringify(bracket.containedObjectIds)) continue;
+    } catch { /* An invalid import snapshot cannot prove membership. */ }
+    return retained;
+  }
+  return { orphaned: !unresolved && !survives && deletedAtoms.length > 0, deletedMoleculeIds,
+    deletedAtoms: deletedAtoms.length ? [...previous, ...deletedAtoms] : [] };
+}
+
+/** Source ids are opaque: only the importer's scoped native references can resolve them. */
+function importedMembership(pair: readonly BracketObject[], objects: readonly DocumentObject[],
+  { atomPosition, useLegacyDiagnostics }: RepeatUnitMembershipOptions) {
+  const attributes = importedBracketAttributes(pair);
+  const memberRecords = importedMemberRecords(pair);
+  if (!attributes) {
     const ids = pair.flatMap(object => {
       const value = object.compatibility?.unknown.cdxmlBracketMemberObjectIds;
       return Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : [];
     });
-    const records = pair.flatMap(object => {
-      const value = object.compatibility?.unknown.cdxmlBracketMembers;
-      return Array.isArray(value) ? value.filter(record) : [];
-    });
-    if (!ids.length && !records.length) return undefined;
+    if (!ids.length && !memberRecords.length) return undefined;
     return { members: new Map<string, Set<string>>(), referencedObjectIds: new Set([
-      ...ids, ...records.flatMap(entry => typeof entry.objectId === "string" ? [entry.objectId] : [])
-    ]), connectivity: undefined,
+      ...ids, ...memberRecords.flatMap(entry => typeof entry.objectId === "string" ? [entry.objectId] : [])
+    ]), connectivity: undefined, unresolvedMemberReferences: true,
       reason: "its preserved CDXML atom membership has no source BracketedObjectIDs group to resolve" };
   }
-  const group = source.compatibility!.unknown.bracketedGroup as { attributes: Record<string, unknown> };
-  const value = group.attributes.BracketedObjectIDs;
-  const sourceIds = typeof value === "string" ? [...new Set(value.trim().split(/\s+/).filter(Boolean))] : [];
-  const pattern = group.attributes.PolymerRepeatPattern;
+  const sourceIds = importedSourceIds(attributes);
+  const pattern = attributes.PolymerRepeatPattern;
   // CDX/CDXML defaults to HeadToTail; native brackets still use the MOL writer's default.
   const connectivity: RepeatUnitAtomMembership["connectivity"] = pattern === undefined || pattern === "HeadToTail" ? "ht"
     : pattern === "HeadToHead" ? "hh" : pattern === "EitherUnknown" ? "eu" : undefined;
@@ -165,10 +355,6 @@ function importedMembership(pair: readonly BracketObject[], objects: readonly Do
     return [...object.containedObjectIds, ...(object.crossingBondIds ?? []).map(ref => ref.objectId),
       ...(Array.isArray(atomMemberObjects) ? atomMemberObjects.filter((id): id is string => typeof id === "string") : [])];
   }));
-  const memberRecords = pair.flatMap(object => {
-    const entries = object.compatibility?.unknown.cdxmlBracketMembers;
-    return Array.isArray(entries) ? entries.filter(record) : [];
-  });
   memberRecords.forEach(entry => { if (typeof entry.objectId === "string") referencedObjectIds.add(entry.objectId); });
   const membershipUnchanged = pair.every(object =>
     object.compatibility?.unknown.cdxmlBracketMembership === JSON.stringify(object.containedObjectIds));
@@ -193,26 +379,37 @@ function importedMembership(pair: readonly BracketObject[], objects: readonly Do
       }
     }
     reason ??= "its imported whole-molecule membership changed after an edit and no longer resolves to the original member molecules";
-    return { members, reason, referencedObjectIds, connectivity };
+    return { members, reason, referencedObjectIds, connectivity, unresolvedMemberReferences: true };
   }
+  let unresolvedMemberReferences = !sourceIds.length;
   let reason = sourceIds.length ? undefined : "its imported BracketedObjectIDs membership is empty or invalid";
+  let deletedReason: string | undefined;
+  const recordedDeletions = useLegacyDiagnostics ? undefined : recordedImportedDeletions(pair);
   for (const sourceId of sourceIds) {
-    const records = memberRecords.filter(entry => entry.sourceId === sourceId);
-    const unique = [...new Map(records.map(entry => [JSON.stringify(entry), entry])).values()];
-    const member = unique.length === 1 && record(unique[0]) ? unique[0] : undefined;
+    const member = importedMemberRecord(memberRecords, sourceId);
     const molecule = member && objects.find(object => object.id === member.objectId);
     const atoms = molecule?.type === "molecule" ? molecule.atoms.filter(atom => member!.atomId === undefined || atom.id === member!.atomId) : [];
     if (!atoms.length) {
-      reason ??= `its imported BracketedObjectIDs member "${sourceId}" does not resolve unambiguously to atoms in the export scope`;
+      if (molecule?.type !== "molecule" || molecule.atoms.length || !molecule.structure.trim() ||
+        member?.atomId !== undefined || !pair.some(bracket => bracket.containedObjectIds.includes(molecule.id))) {
+        unresolvedMemberReferences = true;
+      }
+      const missing = `its imported BracketedObjectIDs member "${sourceId}" does not resolve unambiguously to atoms in the export scope`;
+      if (recordedDeletions?.some(([id, atomId]) => id === sourceId && atomId === member?.atomId)) deletedReason ??= missing;
+      else reason ??= missing;
       continue;
     }
     const ids = members.get(molecule!.id) ?? new Set<string>();
     atoms.forEach(atom => ids.add(atom.id));
     members.set(molecule!.id, ids);
   }
+  reason ??= deletedReason;
   reason ??= importedBoundaryReason(pair, members, objects, atomPosition);
-  reason ??= importedIdentityReason(pair, memberRecords, members, objects);
-  return { members, reason: reason ?? connectivityReason, referencedObjectIds, connectivity };
+  if (!reason) {
+    reason = importedIdentityReason(pair, memberRecords, members, objects);
+    unresolvedMemberReferences ||= reason !== undefined;
+  }
+  return { members, reason: reason ?? connectivityReason, referencedObjectIds, connectivity, unresolvedMemberReferences };
 }
 
 /** Keep the specific diagnostics for plainly new ids; map presence alone proves no identity. */
@@ -224,7 +421,7 @@ function importedBoundaryReason(pair: readonly BracketObject[], members: Map<str
     const importedBonds = molecule.compatibility?.unknown.cdxmlBondIdsByBondId;
     const importedAtoms = molecule.compatibility?.unknown.cdxmlAtomIdsByAtomId;
     for (const bond of molecule.bonds) {
-      if (atomIds.has(bond.fromAtomId) === atomIds.has(bond.toAtomId)) continue;
+      if (!isRepeatUnitBoundaryBond(bond, atomIds)) continue;
       if (!record(importedBonds) || typeof importedBonds[bond.id] !== "string") {
         return `its imported atom-level membership has a new boundary bond "${bond.id}" between member and non-member atoms`;
       }
@@ -289,7 +486,7 @@ function importedIdentityReason(pair: readonly BracketObject[], records: Record<
         const original = snapshot.incidentBonds.find(entry => entry.id === bond.id);
         if (!original) {
           const atomIds = members.get(member.objectId)!;
-          return atomIds.has(bond.fromAtomId) !== atomIds.has(bond.toAtomId)
+          return isRepeatUnitBoundaryBond(bond, atomIds)
             ? `${description} has a new boundary bond "${bond.id}" between member and non-member atoms`
             : `${description} has a new bond "${bond.id}" touching a member atom`;
         }
@@ -348,7 +545,7 @@ function crossingReason(pair: readonly BracketObject[], members: RepeatUnitAtomM
   const boundary = members.flatMap(member => {
     const atoms = new Set(member.atomIds);
     return molecules.find(molecule => molecule.id === member.molecule.id)?.bonds.flatMap(bond =>
-      atoms.has(bond.fromAtomId) !== atoms.has(bond.toAtomId) ? [{ objectId: member.molecule.id, bondId: bond.id }] : []) ?? [];
+      isRepeatUnitBoundaryBond(bond, atoms) ? [{ objectId: member.molecule.id, bondId: bond.id }] : []) ?? [];
   });
   const wholeMultipleCrossing = (ref: { objectId: string; bondId: string }) => {
     if (!nativeMultipleObjectIds.has(ref.objectId)) return false;

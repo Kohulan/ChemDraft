@@ -1,10 +1,14 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { createEmptyDocument, deserializeDocument, serializeDocument, moleculeToMolfileV3000, type ElectronMarkObject, type MoleculeObject } from "@chemdraft/chem-core";
 import { cleanUpMoleculeSelection2d, cleanUpMoleculeSelections2d, cleanupSelectionAtomIds, createSmilesMolecule,
   type CleanupMoleculeSelection } from "@chemdraft/document-workflow-core";
+import { exportDocumentToSvg } from "@chemdraft/export-engine";
 import { assertConstrainedLayoutIdentity, depictSmiles2D, relayoutMolfile2D } from "@chemdraft/ocl-adapter";
-import { nativeBondOrderResolution, transformPointForObject } from "@chemdraft/layout-engine";
+import { nativeBondOrderResolution, ringInteriorDoubleBondSides, transformPointForObject } from "@chemdraft/layout-engine";
 import { compositionFromRdkitJson, ensureRdkit, type RdkitJson } from "@chemdraft/rdkit-adapter";
+import { MainWindow } from "./MainWindow";
 import { applyChargeToolAtNativeAtom, cleanUpNativeMolecules2d, normalizeCommittedDocument } from "./documentWorkflow";
 import { installDomRdkitLoader } from "./testSupport/rdkitIdentity";
 
@@ -109,6 +113,87 @@ describe("constrained 2D cleanup", () => {
     const { molecule } = fixture("C1CCCCC1");
     const before = distorted(molecule, [0, 1, 2]), selection = selected(before, [0, 1, 2]);
     expectContract(before, cleanUpMoleculeSelection2d(before, selection, engines), selection);
+  });
+
+  it.each([
+    { smiles: "CC1=CC=CC=C1", fused: false },
+    { smiles: "CC1=CC=CC2=CC=CC=C12", fused: true }
+  ])("preserves the ring-relative double strokes after reflecting $smiles", ({ smiles, fused }) => {
+    const { document, molecule } = fixture(smiles);
+    const beforeSides = ringInteriorDoubleBondSides(molecule);
+    expect(beforeSides.size).toBe(fused ? 5 : 3);
+    const [centerId, outsideId, automaticId] = fused ? [...beforeSides.keys()] : [];
+    if (fused) molecule.bonds = molecule.bonds.map(bond => {
+      const inside = beforeSides.get(bond.id);
+      if (!inside) return bond;
+      const doubleBondSide = bond.id === centerId ? "center" : bond.id === automaticId ? "automatic" :
+        bond.id === outsideId ? (inside === "left" ? "right" : "left") : inside;
+      return { ...bond, display: { ...bond.display, doubleBondSide } };
+    });
+    const before = structuredClone(molecule);
+    const depiction = depictSmiles2D(smiles);
+    const afterDocument = cleanUpMoleculeSelections2d(document,
+      [{ objectId: molecule.id, atomIds: molecule.atoms.slice(1).map(atom => atom.id), bondIds: [] }], {
+        ...engines, relayout: () => ({ ...depiction, atoms: depiction.atoms.map(atom => ({ ...atom, y: -atom.y })) })
+      });
+    const after = afterDocument.pages[0]!.objects[0] as MoleculeObject;
+    expect(molecule).toEqual(before);
+    expect(after.atoms[0]).toEqual(before.atoms[0]);
+    expect(identity(after)).toEqual(identity(before));
+    const afterSides = ringInteriorDoubleBondSides(after);
+    const canvas = renderToStaticMarkup(createElement(MainWindow, { initialDocument: afterDocument, initialPaletteMode: "hidden" }));
+    const svg = exportDocumentToSvg(afterDocument).contents;
+    for (const bond of after.bonds) {
+      const previousInside = beforeSides.get(bond.id);
+      if (!previousInside) continue;
+      const inside = afterSides.get(bond.id);
+      expect(inside).toBe(previousInside === "left" ? "right" : "left");
+      const renderedSide = bond.id === centerId ? "center" : bond.id === outsideId ? previousInside : inside;
+      expect(bond.display?.doubleBondSide).toBe(bond.id === automaticId ? "automatic" : renderedSide);
+      for (const markup of [canvas, svg]) {
+        const stroke = (markup.match(/<line\b[^>]*>/g) ?? []).filter(line =>
+          line.includes('data-bond-order="double"') && line.includes(`data-bond-id="${bond.id}"`) &&
+          line.includes('data-bond-segment="secondary"'));
+        expect(stroke).toHaveLength(1);
+        expect(stroke[0]).toContain(`data-double-bond-side="${renderedSide}"`);
+      }
+    }
+  });
+
+  it.each([311, 333])("checks the fitted OCL coordinates against a fixed atom at x=%i", fixedX => {
+    const { document, molecule } = fixture("CC.[He]");
+    molecule.atoms = molecule.atoms.map((atom, i) => ({ ...atom, x: [267, 333, fixedX][i]!, y: 250 }));
+    const selection = selected(molecule, [0, 1]);
+    if (fixedX === 311) {
+      const before = structuredClone(document);
+      expect(() => cleanUpMoleculeSelections2d(document, [{ objectId: molecule.id, ...selection }], engines))
+        .toThrow(/would create overlapping atoms/);
+      expect(document).toEqual(before);
+    } else {
+      expect(molecule.atoms[1]!.x).toBe(molecule.atoms[2]!.x);
+      const after = cleanUpMoleculeSelection2d(molecule, selection, engines);
+      expectContract(molecule, after, selection);
+      expect(after.atoms[1]!.x).toBeCloseTo(311, 8);
+      expect(after.atoms[1]!.y).toBeCloseTo(250, 8);
+    }
+  });
+
+  it.each([311, 333])("checks the fitted coordinates against a separate molecule at x=%i", fixedX => {
+    const { document, molecule } = fixture("CC.[He]");
+    molecule.atoms = molecule.atoms.map((atom, i) => ({ ...atom, x: [267, 333, 350][i]!, y: 250 }));
+    const fixed = createSmilesMolecule(document, { x: fixedX, y: 250 }, depictSmiles2D("C"), "C");
+    document.pages[0]!.objects.push(fixed);
+    expect(fixed.atoms[0]).toMatchObject({ x: fixedX, y: 250 });
+    const before = structuredClone(document);
+    const clean = () => cleanUpMoleculeSelections2d(document, [{ objectId: molecule.id, ...selected(molecule, [0, 1]) }], engines);
+    if (fixedX === 311) {
+      expect(clean).toThrow(/would create overlapping atoms/);
+    } else {
+      const after = clean().pages[0]!.objects;
+      expect((after[0] as MoleculeObject).atoms[1]!.x).toBeCloseTo(311, 8);
+      expect(after[1]).toEqual(fixed);
+    }
+    expect(document).toEqual(before);
   });
 
   it("keeps a standard angle at the fixed middle carbon between selected pentane fragments", () => {

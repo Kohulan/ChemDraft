@@ -118,13 +118,15 @@ const stereoBondCodes = (molfile: string): Array<{ from: number; to: number; ste
 };
 
 describe("reconcileFlattenedStereo — repair algorithm", () => {
-  it.each([false, true])("preserves an adjacent directed wave through reconciliation (repeated markers: %s)", repeated => {
+  it.each([
+    ["wavy", false], ["wavy", true], ["dashed", false], ["dashed", true]
+  ] as const)("preserves an adjacent directed %s bond through reconciliation (repeated markers: %s)", (bondStyle, repeated) => {
     const { template, atoms, bonds } = stubMolecule("wedge");
-    // a0 is specified, adjacent a1 explicitly unknown. The connecting wave points
-    // from a1 to a0, making a stolen relocation also reverse the unknown end.
+    // The protected bond points toward the specified center, so moving its marker
+    // onto that bond would overwrite its style and reverse its direction.
     atoms[1]!.element = "C";
     bonds[0]!.toAtomId = "a2";
-    bonds[1] = { ...bonds[1]!, fromAtomId: "a1", toAtomId: "a0", display: { bondStyle: "wavy" } };
+    bonds[1] = { ...bonds[1]!, fromAtomId: "a1", toAtomId: "a0", display: { bondStyle } };
     if (repeated) bonds[2]!.display = { bondStyle: "wedge" };
     atoms.push({ id: "a4", element: "Cl", x: 0, y: -1, formalCharge: 0 });
     bonds.push({ id: "b3", fromAtomId: "a0", toAtomId: "a4", order: "single" });
@@ -132,7 +134,7 @@ describe("reconcileFlattenedStereo — repair algorithm", () => {
       atoms.push({ id: `u${index}`, element, x: 2, y: index - 1, formalCharge: 0 });
       bonds.push({ id: `ub${index}`, fromAtomId: "a1", toAtomId: `u${index}`, order: "single" });
     }
-    const wave = structuredClone(bonds[1]!);
+    const protectedBond = structuredClone(bonds[1]!);
     let calls = 0;
     const perceive: StereoPerceiver = () => {
       calls++;
@@ -141,13 +143,13 @@ describe("reconcileFlattenedStereo — repair algorithm", () => {
       }));
     };
     const result = reconcileFlattenedStereo(template, atoms, bonds, new Map([[0, "R"]]), perceive, {
-      // The unknown centre would be the overwhelmingly preferred depth candidate.
+      // The adjacent atom would be the overwhelmingly preferred depth candidate.
       depthByAtomId: new Map(atoms.map(atom => [atom.id, atom.id === "a1" ? 10 : 0]))
     });
     expect(result.ok).toBe(true);
     expect(calls).toBeGreaterThan(1);
-    expect(result.bonds.find(bond => bond.id === wave.id)).toEqual(wave);
-    expect(result.bonds.filter(bond => bond.display?.bondStyle === "wavy")).toHaveLength(1);
+    expect(result.bonds.find(bond => bond.id === protectedBond.id)).toEqual(protectedBond);
+    expect(result.bonds.filter(bond => bond.display?.bondStyle === bondStyle)).toHaveLength(1);
   });
 
   it("leaves a depiction that already reads correctly untouched", () => {

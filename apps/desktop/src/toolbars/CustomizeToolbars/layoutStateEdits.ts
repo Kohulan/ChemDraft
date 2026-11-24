@@ -152,11 +152,36 @@ export function setItemHidden<I extends string, A extends string>(
       current.delete(itemId);
     }
     draft.hiddenCommandIds = current.size > 0 ? [...current] : undefined;
+    if (draft.itemOverrides?.some(override => override.commandId === itemId && override.hidden !== undefined)) {
+      const overrides = draft.itemOverrides.flatMap(override => {
+        if (override.commandId !== itemId) return [override];
+        const { hidden: _, ...placementOverride } = override;
+        return placementOverride.placement || placementOverride.layout ? [placementOverride] : [];
+      });
+      draft.itemOverrides = overrides.length > 0 ? overrides : undefined;
+    }
   });
 }
 
 const SPACER_ID_PREFIX = "user.spacer.";
 const SEPARATOR_ID_PREFIX = "user.separator.";
+
+export function createCommandToolbarItem<I extends string, A extends string>({
+  id,
+  title,
+  icon,
+  assetName
+}: { id: string; title: string; icon?: I; assetName?: A }): ToolsetItemDefinition<I, A> {
+  return {
+    id,
+    kind: "button",
+    label: title,
+    icon,
+    assetName,
+    primary: { type: "command", commandId: id },
+    submenu: null
+  };
+}
 
 /** Add a new item (a gallery command, or a spacer) to ANY toolset — the one add-only structural
  *  edit permitted on core/plugin toolsets, persisted as `toolsetOverrides[].itemAdditions`. No-op
@@ -337,8 +362,8 @@ export function cloneToolset<I extends string, A extends string>(
   const takenIds = new Set([...state.userToolsets.map((toolset) => toolset.id)]);
   const id = userToolsetId(title, takenIds);
   const clonedGroups: ToolsetGroupDefinition<I, A>[] = source.groups.map((group, index) => ({
-    ...group,
     id: group.id ?? `${id}.group.${index}`,
+    title: group.title,
     items: group.items.map((item) => ({ ...item }))
   }));
   // A user toolset must have >=1 group (UserToolsetDefinitionSchema). Cloning a fully-emptied toolset
@@ -353,7 +378,8 @@ export function cloneToolset<I extends string, A extends string>(
     preferredWindowSize: source.preferredWindowSize,
     gridLayout: source.gridLayout,
     category: source.category,
-    clonedFromToolsetId: source.id,
+    // Keep the original definition available for rendering copies of a customized copy.
+    clonedFromToolsetId: source.clonedFromToolsetId ?? source.id,
     groups
   };
   return { state: { ...state, userToolsets: [...state.userToolsets, toolset] }, toolsetId: id };

@@ -160,14 +160,23 @@ describe("online structure search", () => {
 
   it.each(["SRU", "MultipleGroup"] as const)("searches the remaining molecule after deleting an imported %s bracket's member", async usage => {
     const { document, member, neighbor } = importedBracketAndNeighbor(usage);
+    expect(repeatUnits(document)).toMatchObject([{
+      usage: usage === "SRU" ? "sru" : "multiple",
+      members: [{ molecule: { id: member.id }, atomIds: member.atoms.map(atom => atom.id) }]
+    }]);
     const removed = deleteSelectedDocumentObjects(document, [member.id]);
     const brackets = removed.pages[0]!.objects.filter(object => object.type === "bracket");
-    expect(brackets).toHaveLength(2);
-    expect(brackets.every(bracket => bracket.containedObjectIds.length === 0 &&
-      bracket.compatibility?.unknown.bracketedGroup !== undefined)).toBe(true);
-    expect(repeatUnits(removed, [neighbor])).toMatchObject([{
-      usage: usage === "SRU" ? "sru" : "multiple", members: []
-    }]);
+    if (usage === "SRU") {
+      expect(brackets).toEqual([]);
+      expect(repeatUnits(removed)).toEqual([]);
+    } else {
+      expect(brackets).toHaveLength(2);
+      for (const bracket of brackets) {
+        expect(bracket.containedObjectIds).toEqual([]);
+        expect(bracket.compatibility?.unknown.bracketedGroup).toBeDefined();
+      }
+      expect(repeatUnits(removed, [neighbor])).toMatchObject([{ usage: "multiple", members: [] }]);
+    }
     const selected = applyPatch(removed, { op: "setSelection", objectIds: [neighbor.id] });
     const search = createStructureSearchController({ enabled: () => true, storage, prompt: async () => "continue" });
 

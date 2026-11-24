@@ -63,6 +63,12 @@ fn ordered_restore_then_hide(
 fn hide<R: Runtime>(window: &tauri::Window<R>) -> Result<(), String> {
     // Retain the existing close order: restore the normal frame before hiding the live webview.
     super::panel_full_size::set(window, false, 0.0, 0.0)?;
+    if let Err(error) = super::persist_plugin_panel_geometry(window) {
+        eprintln!(
+            "Could not persist panel {} before hiding: {error}",
+            window.label()
+        );
+    }
     window.hide().map_err(|error| error.to_string())
 }
 

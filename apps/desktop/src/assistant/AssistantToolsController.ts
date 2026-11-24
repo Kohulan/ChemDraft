@@ -3,10 +3,11 @@ import {
   PluginAssistantToolResultSchema, PluginAssistantToolSessionRequestSchema, AssistantCapabilityPermissions,
   type PluginAssistantToolDescriptor, type PluginAssistantAPI, type PluginAssistantToolResult, type PluginManifest
 } from "@chemdraft/plugin-api";
-import { writePatchOps, type PluginHost, type PluginHostAssistant } from "@chemdraft/plugin-host";
+import { assertLegacyWritePages, beginScopedRepeatUnitCleanup, finishScopedRepeatUnitCleanup, legacyWriteScopePages, writePatchOps,
+  type PluginHost, type PluginHostAssistant, type PluginWriteScopePages, type ScopedRepeatUnitCleanup } from "@chemdraft/plugin-host";
 import { PluginWriteGateTimeoutError, type PluginWriteGate } from "../plugins/applyPluginDocumentPatch";
 import { runThumbnail } from "./runThumbnail";
-import type { AssistantToolContext, AssistantPageGrowth } from "./AssistantToolContext";
+import { PAGE_GROWTH_UNANSWERED, type AssistantToolContext, type AssistantPageGrowth } from "./AssistantToolContext";
 import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import { applyPageFitDecision, planDocumentPageFit } from "../pageEnlargement";
 import { callAssistantTool, listAssistantTools } from "./assistantTools";
@@ -15,23 +16,37 @@ import { assistantDocumentContentUnchanged, getAssistantHistoryPort } from "./hi
 import type { AssistantMcpEngine, McpBridgeRequest, McpBridgeResponse } from "./assistantMcpEngine";
 import { recheckNormalizedAssistantWrite, verifyNormalizedAssistantWrite } from "./normalizedWrite";
 import { loadRdkitWithAppLoader } from "../plugins/rdkitAppLoader";
+import { DesktopToolCalls } from "../plugins/toolSessions/transport";
+import { compatibilityDeadline, placementDependencies } from "./compatibilityToolCatalog";
 
-type Plugin = { id: string; name: string };
+type Plugin = { id: string; name: string; requestOwner?: AbortSignal };
+/** The specific refusal for a legacy request whose tab's document was replaced (File > Open, New, restore). */
+export const ASSISTANT_DOCUMENT_REPLACED = "Assistant request canceled: the drawing it was working on was replaced.";
+/** Identity of the document a request started on: `read()` answers nothing once that document is replaced. */
+export interface AssistantDocumentBinding { key: string; read(): ChemDraftDocument | undefined }
 const assistantToolDeadlineMs = (name: string): number =>
   name === "name_to_structure" || name === "structure_to_name" ? 45_000 : name === "render" ? 60_000 : 120_000;
 interface Request {
   pluginId: string;
   tabId: string;
   selection: string[];
+  /** Send-time selection bound to its page, so a duplicate id elsewhere is never in scope. */
+  selectionPages: PluginWriteScopePages | undefined;
+  /** The document identity captured at Send, when the host provides one. */
+  binding: AssistantDocumentBinding | undefined;
+  repeatUnitCleanup: ScopedRepeatUnitCleanup | undefined;
   inserted: Set<string>;
   touched: Set<string>;
   transactions: AssistantTransactions;
   context: AssistantToolContext;
   ended: boolean;
+  requestOwner?: AbortSignal;
+  releaseOwner?: () => void;
   cancellations: Map<string, AbortController>;
   opening: number;
 }
 export interface AssistantToolsControllerOptions {
+  calls?: DesktopToolCalls;
   platform?: ShortcutPlatform;
   host(): PluginHost;
   engine: AssistantMcpEngine;
@@ -40,6 +55,8 @@ export interface AssistantToolsControllerOptions {
   getSelectionIds(): readonly string[];
   runWrite: PluginWriteGate["run"];
   readDocument?(tabId: string): ChemDraftDocument | undefined;
+  /** Capture the active tab's current document identity; a request never follows its tab into a replacement. */
+  captureDocument?(): AssistantDocumentBinding | undefined;
   transactions?(): AssistantTransactions;
   createContext(request: { plugin: PluginManifest; tabId: string; getDocument(): ChemDraftDocument | undefined }): Pick<AssistantToolContext, "chemistry" | "render" | "getViewportRect" | "now">;
 }
@@ -48,8 +65,12 @@ export interface AssistantToolsControllerOptions {
 export class AssistantToolsController implements PluginHostAssistant {
   private readonly requests = new Map<string, Request>();
   private readonly sessions = new Map<string, { pluginId: string; requestId: string; extraTools: PluginAssistantToolDescriptor[] }>();
-  private activeCalls = 0;
-  constructor(private readonly options: AssistantToolsControllerOptions) {}
+  private readonly calls: DesktopToolCalls;
+  /** Requests canceled because their document was replaced, so late calls get the specific reason. */
+  private readonly replacedRequests = new Map<string, string>();
+  constructor(private readonly options: AssistantToolsControllerOptions) {
+    this.calls = options.calls ?? new DesktopToolCalls();
+  }
 
   private plugin(plugin: Plugin): PluginManifest {
     const host = this.options.host();
@@ -58,19 +79,46 @@ export class AssistantToolsController implements PluginHostAssistant {
   }
   private running(plugin: Plugin, requestId: string): Request {
     const request = this.ownedRequest(plugin, requestId);
+    if (this.documentReplaced(request)) {
+      this.cancelReplaced(requestId, request);
+      throw new Error(ASSISTANT_DOCUMENT_REPLACED);
+    }
     if (!request.context.getDocument()) throw new Error("The assistant's document tab has closed.");
     return request;
   }
   private ownedRequest(plugin: Plugin, requestId: string): Request {
     this.plugin(plugin);
     const request = this.requests.get(requestId);
+    if (!request && this.replacedRequests.has(requestId)) throw new Error(ASSISTANT_DOCUMENT_REPLACED);
     if (!request || request.ended || request.pluginId !== plugin.id) throw new Error("The assistant request has ended or does not belong to this plugin.");
     return request;
   }
+  private readTab(tabId: string): ChemDraftDocument | undefined {
+    return this.options.readDocument ? this.options.readDocument(tabId) : getAssistantHistoryPort().read(tabId);
+  }
+  /** The tab still holds a document, but not the one the request started on. */
+  private documentReplaced(request: Request): boolean {
+    return !!request.binding && !request.binding.read() && !!this.readTab(request.tabId);
+  }
+  private cancelReplaced(id: string, request: Request): void {
+    this.replacedRequests.set(id, request.pluginId);
+    this.abandonRequest(id, request, new Error(ASSISTANT_DOCUMENT_REPLACED));
+  }
+  /** Host hook: the tab's document is being replaced. Cancel its legacy requests before anything lands. */
+  cancelForReplacedDocument(tabId: string): void {
+    for (const [id, request] of this.requests) if (request.tabId === tabId) this.cancelReplaced(id, request);
+  }
   async listTools(plugin: Plugin) { this.plugin(plugin); return listAssistantTools(); }
+
+  hasRequestConflict(owner: AbortSignal): boolean {
+    const tabId = this.options.getActiveTabId();
+    return [...this.requests.values()].some(request =>
+      !request.ended && (request.tabId === tabId || request.requestOwner === owner));
+  }
 
   async beginRequest(plugin: Plugin, input: Parameters<PluginAssistantAPI["beginRequest"]>[0]) {
     const manifest = this.plugin(plugin);
+    plugin.requestOwner?.throwIfAborted();
     if (typeof input?.prompt !== "string" || !input.prompt.trim() || input.prompt.length > 20_000 ||
       (input.label !== undefined && (typeof input.label !== "string" || input.label.length > 200))) throw new Error("Invalid assistant request prompt or label.");
     if ([...this.requests.values()].some(r => r.pluginId === plugin.id && !r.ended)) throw new Error("This plugin already has an assistant request running.");
@@ -78,13 +126,19 @@ export class AssistantToolsController implements PluginHostAssistant {
     if (!tabId) throw new Error("No document tab is open.");
     const selection = [...this.options.getSelectionIds()];
     const transactions = this.options.transactions?.() ?? getAssistantTransactions();
-    const getDocument = () => this.options.readDocument ? this.options.readDocument(tabId) : getAssistantHistoryPort().read(tabId);
+    // Bind to the document present at Send: after a replacement the request reads nothing.
+    const binding = this.options.captureDocument?.();
+    const getDocument = () => binding && !binding.read() ? undefined : this.readTab(tabId);
+    const sendDocument = getDocument();
+    const selectionPages = legacyWriteScopePages(sendDocument, selection);
+    const repeatUnitCleanup = beginScopedRepeatUnitCleanup(sendDocument);
     const services = this.options.createContext({ plugin: manifest, tabId, getDocument });
     const requestId = transactions.beginAssistantTransaction({ pluginId: plugin.id, runId: crypto.randomUUID(), tabId,
       label: input.label ?? input.prompt, sendSelection: { objectIds: selection } });
-    const request: Request = { pluginId: plugin.id, tabId, selection, inserted: new Set(), touched: new Set(), transactions,
+    const request: Request = { pluginId: plugin.id, tabId, selection, selectionPages, binding, repeatUnitCleanup, inserted: new Set(), touched: new Set(), transactions,
       ended: false, cancellations: new Map(), opening: 0,
       context: { ...services, plugin: manifest, tabId, getDocument, getSelectionAtSend: () => selection,
+        getSelectionPagesAtSend: () => selectionPages,
         chemistry: { ...services.chemistry, reactionProductAligner: async () => {
           const adapter = await loadRdkitWithAppLoader(() => import("@chemdraft/rdkit-adapter/depiction"));
           return adapter.createReactionProductAligner();
@@ -93,31 +147,44 @@ export class AssistantToolsController implements PluginHostAssistant {
         planPageGrowth: (before, proposed) => planDocumentPageFit(before, proposed).growth,
         confirmPageGrowth: async () => { throw new Error("No tool call is running."); },
         write: async () => { throw new Error("No tool call is running."); } } };
+    if (plugin.requestOwner) {
+      const owner = plugin.requestOwner;
+      const abandon = () => this.abandonRequest(requestId, request);
+      request.requestOwner = owner;
+      request.releaseOwner = () => owner.removeEventListener("abort", abandon);
+      owner.addEventListener("abort", abandon, { once: true });
+    }
+    for (const [id, pluginId] of this.replacedRequests) if (pluginId === plugin.id) this.replacedRequests.delete(id);
     this.requests.set(requestId, request);
     return { requestId };
   }
 
   async callTool(plugin: Plugin, input: Parameters<PluginAssistantAPI["callTool"]>[0]): Promise<PluginAssistantToolResult> {
     const entry = [...this.requests].find(([, r]) => r.pluginId === plugin.id && !r.ended);
-    if (!entry) throw new Error("No assistant request is running.");
+    if (!entry) {
+      if ([...this.replacedRequests.values()].includes(plugin.id)) throw new Error(ASSISTANT_DOCUMENT_REPLACED);
+      throw new Error("No assistant request is running.");
+    }
     return this.call(plugin, entry[0], input);
   }
 
   private async call(plugin: Plugin, requestId: string, input: { name: string; input: unknown }, callId: string = crypto.randomUUID()): Promise<PluginAssistantToolResult> {
     const request = this.running(plugin, requestId);
-    if (this.activeCalls >= 4) throw new Error("At most four assistant tool calls may run concurrently.");
-    if (typeof input?.name !== "string") throw new Error("An assistant tool name is required.");
+    if (!this.calls.acquire()) throw new Error("At most four assistant tool calls may run concurrently.");
+    if (typeof input?.name !== "string") {
+      this.calls.release();
+      throw new Error("An assistant tool name is required.");
+    }
     const abort = new AbortController();
     request.cancellations.set(callId, abort);
-    this.activeCalls++;
     const timeoutMs = assistantToolDeadlineMs(input.name);
     const startDeadline = () => setTimeout(() => abort.abort(new Error("Assistant tool deadline exceeded.")), timeoutMs);
     let deadline = startDeadline();
     let approvedGrowth: { growth: AssistantPageGrowth; document: ChemDraftDocument } | undefined;
     let prompted = false;
-    let work: Promise<PluginAssistantToolResult> | undefined;
+    let underlyingWork: Promise<unknown> | undefined;
     try {
-      work = callAssistantTool({ ...request.context,
+      const response = callAssistantTool({ ...request.context,
         plugin: this.plugin(plugin),
         signal: abort.signal,
         getDocument: () => request.ended || abort.signal.aborted ? undefined : request.context.getDocument(),
@@ -140,7 +207,7 @@ export class AssistantToolsController implements PluginHostAssistant {
             this.running(plugin, requestId);
             abort.signal.throwIfAborted();
             signal?.throwIfAborted();
-            if (accepted === "unanswered") return { reason: "declined: no answer to the enlarge-page question within 5 minutes" };
+            if (accepted === "unanswered") return { reason: PAGE_GROWTH_UNANSWERED };
             if (accepted === "keep") return false;
             approvedGrowth = { growth, document };
             return true;
@@ -157,7 +224,9 @@ export class AssistantToolsController implements PluginHostAssistant {
           const growth = approvedGrowth?.growth;
           // Verify the plugin's scoped patch before the host-owned page translation. Consent
           // never widens the assistant's write scope to unrelated page content.
-          const patchDocument = (document: ChemDraftDocument) => applyPatch(document, patch);
+          const patchDocument = (document: ChemDraftDocument) => applyPatch(document, patch, {
+            preserveRepeatUnitBrackets: true, deferGroupCleanup: true
+          });
           const fitDocument = (document: ChemDraftDocument, patched: ChemDraftDocument) => {
             if (!growth) return patched;
             const plan = planDocumentPageFit(document, patched);
@@ -178,14 +247,14 @@ export class AssistantToolsController implements PluginHostAssistant {
             if (op.op === "addObject" || op.op === "addAnnotation") scope.add(op.op === "addObject" ? op.object.id : op.annotation.id);
           }
           const dependencies = new Set(writePatchOps(patch).flatMap(op => "objectId" in op ? [op.objectId] : []));
-          // Relative placement also depends on the anchor, even though the patch never edits it.
-          const toolInput = input.input as { relativeTo?: { objectId: string }; to?: { relativeTo?: string } };
-          const anchor = toolInput?.relativeTo?.objectId ?? toolInput?.to?.relativeTo;
-          if (anchor) dependencies.add(anchor);
+          for (const anchor of placementDependencies(input.input)) dependencies.add(anchor);
           const dependencyContent = (document: ChemDraftDocument) => document.pages.flatMap(page =>
             page.objects.filter(object => dependencies.has(object.id)).map(object => ({ pageId: page.id, object })));
           const plannedContent = JSON.stringify(dependencyContent(plannedDocument));
-          const verified = await verifyNormalizedAssistantWrite(request.context, plannedDocument, patchDocument(plannedDocument), scope, expectedSmiles);
+          // Send-time ids are bound to their selection page: never resolve one to a same-id object elsewhere.
+          assertLegacyWritePages(plannedDocument, patch, request.selectionPages);
+          const verified = await verifyNormalizedAssistantWrite(request.context, plannedDocument, patchDocument(plannedDocument), scope,
+            expectedSmiles, request.selectionPages);
           const apply = () => {
             this.running(plugin, requestId);
             if (abort.signal.aborted || signal?.aborted) throw new Error("Assistant tool call was canceled.");
@@ -200,6 +269,7 @@ export class AssistantToolsController implements PluginHostAssistant {
             return this.options.host().applyPatchForPlugin(plugin.id, undefined,
               { patch, reason: `Assistant: ${input.name}`, warnings: [], requiresUserApproval: true }, {
                 objectIds: [...request.selection, ...request.inserted],
+                ...(request.selectionPages?.size ? { scopePages: request.selectionPages } : {}),
                 getDocument: request.context.getDocument,
                 apply: application => {
                   this.running(plugin, requestId);
@@ -209,8 +279,16 @@ export class AssistantToolsController implements PluginHostAssistant {
                     op.op === "addAnnotation" ? [op.annotation.id] : "objectId" in op ? [op.objectId] : op.op === "setObjectOrder" ? op.objectIds : []);
                   // Recompute after a gesture or concurrent tool call, including every nearby
                   // mark. No await separates this scope/chemistry recheck and the history commit.
-                  const after = recheckNormalizedAssistantWrite(before, patchDocument(before), scope, verified, plannedDocument);
-                  request.transactions.writeAssistantTransaction(requestId, fitDocument(before, after), touched, after);
+                  assertLegacyWritePages(before, patch, request.selectionPages);
+                  const authored = recheckNormalizedAssistantWrite(before, patchDocument(before), scope, verified, plannedDocument,
+                    request.selectionPages);
+                  const fitted = fitDocument(before, authored);
+                  let cleanup: ReturnType<typeof finishScopedRepeatUnitCleanup>;
+                  request.transactions.writeAssistantTransaction(requestId, fitted, touched, authored, document => {
+                    cleanup = finishScopedRepeatUnitCleanup(request.repeatUnitCleanup, before, document, patch);
+                    return cleanup?.document;
+                  });
+                  cleanup?.record();
                   const existing = new Set(before.pages.flatMap(page => page.objects.map(object => object.id)));
                   for (const id of touched) { request.touched.add(id); if (!existing.has(id)) request.inserted.add(id); }
                   return { applied: true as const, objectIds: touched };
@@ -225,15 +303,15 @@ export class AssistantToolsController implements PluginHostAssistant {
             throw error;
           }
         }
-      }, input.name, input.input);
-      // Cancelling a caller blocks its writes immediately, but does not make native work disappear.
-      // Keep its concurrency slot until the bounded tool invocation actually settles.
-      void work.then(() => { this.activeCalls--; }, () => { this.activeCalls--; });
-      return await Promise.race([work, new Promise<never>((_, reject) => {
+      }, input.name, input.input, work => { underlyingWork = work; });
+      return await Promise.race([response, new Promise<never>((_, reject) => {
         abort.signal.addEventListener("abort", () => reject(abort.signal.reason ?? new Error("Assistant tool call was canceled.")), { once: true });
       })]);
     } finally {
-      if (!work) this.activeCalls--;
+      const release = () => this.calls.release();
+      // A timeout can answer the caller while the tool is still awaiting native work.
+      if (underlyingWork) void underlyingWork.then(release, release);
+      else release();
       clearTimeout(deadline);
       request.cancellations.delete(callId);
     }
@@ -241,6 +319,7 @@ export class AssistantToolsController implements PluginHostAssistant {
 
   async endRequest(plugin: Plugin, { requestId }: { requestId: string }) {
     const request = this.ownedRequest(plugin, requestId);
+    request.releaseOwner?.();
     request.ended = true;
     request.cancellations.forEach(stop => stop.abort());
     // Mark ended before awaiting IPC, so a queued bridge call cannot write meanwhile.
@@ -274,7 +353,10 @@ export class AssistantToolsController implements PluginHostAssistant {
     if (count >= 2) throw new Error("At most two MCP sessions per plugin are allowed.");
     request.opening++;
     try {
-      const session = await this.options.engine.open(plugin, message => { void this.bridge(plugin, requestId, message); });
+      const session = await this.options.engine.open(plugin, message => { void this.bridge(plugin, requestId, message); }, {
+        legacy: true, tools: [...listAssistantTools().map(tool => ({ name: tool.name, deadline: compatibilityDeadline(tool) })),
+          ...extraTools.map(tool => ({ name: tool.name, deadline: "readCompute" as const }))]
+      });
       if (request.ended || !request.context.getDocument()) {
         await this.options.engine.close(session.sessionId);
         throw new Error("The assistant request ended while opening its MCP session.");
@@ -297,6 +379,7 @@ export class AssistantToolsController implements PluginHostAssistant {
     }));
   }
   closeAllForPlugin(pluginId: string): void {
+    for (const [id, owner] of this.replacedRequests) if (owner === pluginId) this.replacedRequests.delete(id);
     for (const [id, request] of this.requests) {
       if (request.pluginId !== pluginId) continue;
       this.abandonRequest(id, request);
@@ -305,9 +388,10 @@ export class AssistantToolsController implements PluginHostAssistant {
   closeAllForTab(tabId: string): void {
     for (const [id, request] of this.requests) if (request.tabId === tabId) this.abandonRequest(id, request);
   }
-  private abandonRequest(id: string, request: Request): void {
+  private abandonRequest(id: string, request: Request, reason?: Error): void {
+    request.releaseOwner?.();
     request.ended = true;
-    request.cancellations.forEach(stop => stop.abort());
+    request.cancellations.forEach(stop => stop.abort(reason));
     try { request.transactions.endAssistantTransaction(id, { touchedIds: [...request.touched] }); } catch { /* Tab already closed. */ }
     this.requests.delete(id);
     void this.closeRequestSessions(id).catch(() => {});
@@ -320,8 +404,8 @@ export class AssistantToolsController implements PluginHostAssistant {
     let started = false;
     let work: Promise<PluginAssistantToolResult> | undefined;
     try {
-      if (this.activeCalls >= 4) throw new Error("At most four assistant tool calls may run concurrently.");
-      this.activeCalls++; started = true;
+      if (!this.calls.acquire()) throw new Error("At most four assistant tool calls may run concurrently.");
+      started = true;
       request.cancellations.set(callId, abort);
       const cancelled = new Promise<never>((_, reject) => {
         abort.signal.addEventListener("abort", () => reject(abort.signal.reason ?? new Error("Assistant tool call was canceled.")), { once: true });
@@ -334,9 +418,9 @@ export class AssistantToolsController implements PluginHostAssistant {
             request.touched.add(id);
             if (!request.selection.includes(id)) request.inserted.add(id);
           }
-        });
+        }, request.repeatUnitCleanup, request.selectionPages);
       // A timeout responds immediately, but an abort-ignoring handler still occupies its slot.
-      void work.then(() => { this.activeCalls--; }, () => { this.activeCalls--; });
+      void work.then(() => { this.calls.release(); }, () => { this.calls.release(); });
       const result = structuredClone(await Promise.race([work, cancelled]));
       // Match the Rust host-tool result ceiling, including UTF-8 encoding and JSON envelope.
       if (!result || !Array.isArray(result.content) ||
@@ -349,7 +433,7 @@ export class AssistantToolsController implements PluginHostAssistant {
       if (deadline) clearTimeout(deadline);
       abort.abort();
       if (started) {
-        if (!work) this.activeCalls--;
+        if (!work) this.calls.release();
         request.cancellations.delete(callId);
       }
     }

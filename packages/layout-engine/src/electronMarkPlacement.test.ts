@@ -1,8 +1,24 @@
 import { describe, expect, it } from "vitest";
 import type { DocumentObject, ElectronMarkObject, MoleculeObject } from "@chemdraft/chem-core";
-import { electronMarkPlacementPointForAtom, moleculeLayoutLabelBoxes, nativeChargePlacementPointForAtom,
-  nativeRadicalPlacementPointForAtom, transformPointForObject } from "./index";
+import { electronMarkPlacementPointForAtom, lonePairDragDirection, lonePairPlacementPlanForAtom, moleculeLayoutLabelBoxes, nativeChargePlacementPointForAtom, nativeRadicalPlacementPointForAtom, transformPointForObject } from "./index";
 
+describe("lone-pair drag direction", () => {
+  const atom = { x: 210, y: 175 };
+  const pointer = (degrees: number) => ({ x: atom.x + 40 * Math.cos(degrees * Math.PI / 180),
+    y: atom.y + 40 * Math.sin(degrees * Math.PI / 180) });
+  it.each([[100, 105], [-100, -105], [179, 180], [-179, -180], [0, 0], [7, 0], [8, 15]])(
+    "snaps %s° to %s° about the atom", (degrees, snapped) => {
+    expect(lonePairDragDirection(atom, pointer(degrees))).toBeCloseTo(snapped * Math.PI / 180, 10);
+  });
+  it.each([100, -100, 7])("retains the free %s° angle with Alt", degrees => {
+    expect(lonePairDragDirection(atom, pointer(degrees), true)).toBeCloseTo(degrees * Math.PI / 180, 10);
+  });
+  it("has no direction at the center or for non-finite coordinates", () => {
+    expect(lonePairDragDirection(atom, atom)).toBeUndefined();
+    expect(lonePairDragDirection(atom, { x: NaN, y: 1 })).toBeUndefined();
+    expect(lonePairDragDirection({ x: Infinity, y: 1 }, pointer(100))).toBeUndefined();
+  });
+});
 describe("repeated radical placement", () => {
   it.each([
     { name: "bonded repro", element: "C", neighbors: [[189, 181], [189, 219]] },
@@ -86,9 +102,8 @@ describe("repeated radical placement", () => {
       x: first.x - 9, y: first.y - 9, width: 18, height: 18, rotation: 0, style: {},
       anchor: { kind: "atom", objectId: molecule.id, atomId: "atom" } };
     const second = nativeRadicalPlacementPointForAtom(molecule, "atom", [molecule, mark], 792, 612)!;
-    const localCenter = transformPointForObject({ ...molecule, rotation: -rotation }, first);
     const existingSearch = electronMarkPlacementPointForAtom(molecule, "atom", [molecule, {
-      ...mark, markKind: "charge", x: localCenter.x - 9, y: localCenter.y - 9
+      ...mark, markKind: "charge"
     }],
       792, 612, { avoidLabelOverlap: false })!;
     expect(second).toEqual(transformPointForObject(molecule, existingSearch));
@@ -120,6 +135,162 @@ describe.each(["growth slot", "open angle"])("electron-mark placement via %s", r
       expect(point!.x - half < label.x + label.width && point!.x + half > label.x &&
         point!.y - half < label.y + label.height && point!.y + half > label.y).toBe(false);
     }
+  });
+});
+
+function oxygen(bondAngles: number[], element = "O", fontSize = 15): MoleculeObject {
+  return {
+    id: "molecule", type: "molecule", x: 150, y: 150, width: 100, height: 100, rotation: 0,
+    style: { atomLabelFontSizePx: fontSize }, structureFormat: "smiles", structure: "",
+    atoms: [{ id: "oxygen", element, formalCharge: 0, x: 200, y: 200 },
+      ...bondAngles.map((angle, index) => ({ id: `neighbor-${index}`, element: "C", formalCharge: 0,
+        x: 200 + 22 * Math.cos(angle), y: 200 + 22 * Math.sin(angle) }))],
+    bonds: bondAngles.map((_, index) => ({ id: `bond-${index}`, fromAtomId: "oxygen",
+      toAtomId: `neighbor-${index}`, order: bondAngles.length === 1 ? "double" : "single" })),
+    superatoms: [], rGroups: []
+  };
+}
+
+function anchoredMark(angle: number, markKind: ElectronMarkObject["markKind"] = "lone-pair"): ElectronMarkObject {
+  return { id: `mark-${angle}`, type: "electron-mark", markKind, charge: markKind === "charge" ? 1 : undefined,
+    x: 200 + 35 * Math.cos(angle) - 9, y: 200 + 35 * Math.sin(angle) - 9,
+    width: 18, height: 18, rotation: 0, style: {},
+    anchor: { kind: "atom", objectId: "molecule", atomId: "oxygen" } };
+}
+
+function expectDirection(plan: ReturnType<typeof lonePairPlacementPlanForAtom>, angle: number,
+  atom = { x: 200, y: 200 }) {
+  expect(plan).toBeDefined();
+  const dx = plan!.center.x - atom.x, dy = plan!.center.y - atom.y;
+  const radius = Math.hypot(dx, dy);
+  expect(dx / radius).toBeCloseTo(Math.cos(angle), 10);
+  expect(dy / radius).toBeCloseTo(Math.sin(angle), 10);
+  const rotation = plan!.rotation * Math.PI / 180;
+  expect(Math.cos(rotation) * dx / radius + Math.sin(rotation) * dy / radius).toBeCloseTo(0, 10);
+  expect(plan!.rotation).toBeGreaterThanOrEqual(0);
+  expect(plan!.rotation).toBeLessThan(360);
+}
+
+describe("lone-pair placement plans", () => {
+  it.each([0, 90, 45, 180])("places a page-right pair on an off-center atom and clears its label at %s°", rotation => {
+    const molecule = oxygen([], "OH", 72);
+    molecule.atoms[0].y = 150;
+    const rotated = { ...molecule, rotation };
+    const atom = transformPointForObject(rotated, molecule.atoms[0]);
+    const plan = lonePairPlacementPlanForAtom(rotated, "oxygen", [rotated], 792, 612, 0);
+    expectDirection(plan, 0, atom);
+
+    // A common rotation of the mark and label preserves the required clearance.
+    const local = lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule], 792, 612, -rotation * Math.PI / 180)!;
+    const expected = transformPointForObject(rotated, local.center);
+    expect(plan!.center.x).toBeCloseTo(expected.x, 10);
+    expect(plan!.center.y).toBeCloseTo(expected.y, 10);
+    expect(plan!.center.x - atom.x).toBeGreaterThan(24.3);
+  });
+
+  it.each([0, 90, 45, 180])("finds gaps between a rotated bond and a page-space mark at %s°", rotation => {
+    const molecule = { ...oxygen([Math.PI]), rotation };
+    for (const atom of molecule.atoms) atom.y -= 50;
+    const atom = transformPointForObject(molecule, molecule.atoms[0]);
+    const turn = rotation * Math.PI / 180;
+    const first = lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule], 792, 612);
+    expectDirection(first, turn, atom);
+
+    const occupied = turn - Math.PI / 2;
+    const mark = { ...anchoredMark(occupied, "radical-dot"),
+      x: atom.x + 35 * Math.cos(occupied) - 9, y: atom.y + 35 * Math.sin(occupied) - 9 };
+    const second = lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule, mark], 792, 612);
+    expectDirection(second, turn + Math.PI / 4, atom);
+  });
+
+  it("checks the page edge after rotation", () => {
+    const molecule = { ...oxygen([Math.PI / 2]), rotation: 90 };
+    for (const atom of molecule.atoms) atom.y -= 50;
+    expect(lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule], 271, 612, 0)).toBeUndefined();
+    expectDirection(lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule], 271, 612, Math.PI),
+      Math.PI, { x: 250, y: 200 });
+  });
+
+  it.each([0, Math.PI / 7, -Math.PI / 2])("places the first ketone pair opposite its bond after rotation %s", turn => {
+    const molecule = oxygen([Math.PI + turn]);
+    const plan = lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule], 792, 612);
+    expectDirection(plan, turn);
+    expect(plan!.rotation).toBeCloseTo(((turn * 180 / Math.PI + 90) % 360 + 360) % 360, 10);
+  });
+
+  it("places the second ketone pair in a remaining gap, breaking equal-gap ties by smallest positive bisector", () => {
+    const molecule = oxygen([Math.PI]);
+    const first = lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule], 792, 612)!;
+    const existing = { ...anchoredMark(0), x: first.center.x - 9, y: first.center.y - 9, rotation: first.rotation };
+    expectDirection(lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule, existing], 792, 612), Math.PI / 2);
+  });
+
+  it("fills the largest gaps on a two-bond ether oxygen", () => {
+    const molecule = oxygen([-Math.PI / 4, Math.PI / 4]);
+    expectDirection(lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule], 792, 612), Math.PI);
+    expectDirection(lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule, anchoredMark(Math.PI)], 792, 612), 5 * Math.PI / 8);
+  });
+
+  it("counts both radical and charge marks, ignoring anchors on other atoms or molecules", () => {
+    const molecule = oxygen([Math.PI]);
+    const unrelated = { ...anchoredMark(-Math.PI / 2), anchor: { kind: "atom" as const, objectId: "other", atomId: "oxygen" } };
+    const otherAtom = { ...anchoredMark(-Math.PI / 2), anchor: { kind: "atom" as const, objectId: "molecule", atomId: "neighbor-0" } };
+    const objects = [molecule, anchoredMark(0, "charge"), anchoredMark(Math.PI / 2, "radical-dot"), unrelated, otherAtom];
+    expectDirection(lonePairPlacementPlanForAtom(molecule, "oxygen", objects, 792, 612), -Math.PI / 2);
+    expect(lonePairPlacementPlanForAtom(molecule, "oxygen", [...objects].reverse(), 792, 612))
+      .toEqual(lonePairPlacementPlanForAtom(molecule, "oxygen", objects, 792, 612));
+  });
+
+  it("defaults an unbonded, unmarked atom to page-up and places the next pair opposite it", () => {
+    const molecule = oxygen([]);
+    expectDirection(lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule], 792, 612), -Math.PI / 2);
+    expectDirection(lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule, anchoredMark(-Math.PI / 2)], 792, 612), Math.PI / 2);
+  });
+
+  it.each([0, Math.PI / 6, Math.PI, -7 * Math.PI / 2])("honors explicit direction %s with tangent rotation and asymmetric OH label clearance", direction => {
+    const molecule = oxygen([], "OH", 48);
+    const plan = lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule, anchoredMark(direction)], 792, 612, direction)!;
+    expectDirection(plan, direction);
+    const label = moleculeLayoutLabelBoxes(molecule).find(label => label.atom === 0)!;
+    const radians = plan.rotation * Math.PI / 180;
+    const half = 9 * (Math.abs(Math.cos(radians)) + Math.abs(Math.sin(radians)));
+    expect(plan.center.x - half < label.x + label.width && plan.center.x + half > label.x &&
+      plan.center.y - half < label.y + label.height && plan.center.y + half > label.y).toBe(false);
+    expect(Math.hypot(plan.center.x - 200, plan.center.y - 200)).toBeGreaterThan(24.3);
+  });
+
+  it("clears enlarged labels during gap search as well as explicit placement", () => {
+    const molecule = oxygen([Math.PI], "O", 48);
+    const plan = lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule], 792, 612)!;
+    expectDirection(plan, 0);
+    const label = moleculeLayoutLabelBoxes(molecule)[0];
+    expect(plan.center.x - 9).toBeGreaterThan(label.x + label.width);
+  });
+
+  it("tries the next-largest gap when the largest bisector cannot clear the label inside the page", () => {
+    const molecule = oxygen([3 * Math.PI / 4, 5 * Math.PI / 4], "O", 48);
+    expectDirection(lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule], 210, 612), Math.PI);
+    // The same off-page ray is refused when the user explicitly chooses it.
+    expect(lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule], 210, 612, 0)).toBeUndefined();
+  });
+
+  it("preserves smallest-positive-bisector tie order when falling back at a page edge", () => {
+    const molecule = oxygen([0, 2 * Math.PI / 3, 4 * Math.PI / 3]);
+    expectDirection(lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule], 210, 612), Math.PI);
+  });
+
+  it("refuses automatic placement when none of the gap bisectors fits inside the page", () => {
+    const molecule = oxygen([-Math.PI / 4, Math.PI / 4]);
+    expect(lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule], 200, 200)).toBeUndefined();
+  });
+
+  it("refuses a missing atom, non-finite direction or a ray that cannot clear the label inside the page", () => {
+    const molecule = oxygen([]);
+    expect(lonePairPlacementPlanForAtom(molecule, "missing", [molecule], 792, 612)).toBeUndefined();
+    expect(lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule], 792, 612, NaN)).toBeUndefined();
+    expect(lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule], 792, 612, Infinity)).toBeUndefined();
+    molecule.atoms[0].x = 5;
+    expect(lonePairPlacementPlanForAtom(molecule, "oxygen", [molecule], 792, 612, Math.PI)).toBeUndefined();
   });
 });
 

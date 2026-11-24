@@ -3,13 +3,13 @@ import { readFileSync } from "node:fs";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { deserializeDocument, type ChemDraftDocument, type TableObject } from "@chemdraft/chem-core";
+import { deserializeDocument, TABLE_LIMITS, type ChemDraftDocument, type TableObject } from "@chemdraft/chem-core";
 import { importCdx, openChemDraftPayload } from "@chemdraft/cdx-compat";
 import { planTableLayout } from "@chemdraft/layout-engine";
 import { MainWindow } from "./MainWindow";
-import { DOM_COMMAND_EVENT } from "./window-manager";
-import { buildDocumentSessionEnvelope, DOCUMENT_SESSION_SAVE_DEBOUNCE_MS, type DocumentSessionEnvelope } from "./documentSession";
-import { createNativeSavePayload, createPhase4Document } from "./documentWorkflow";
+import { DOM_COMMAND_EVENT, type QuitFlushPhase } from "./window-manager";
+import { buildDocumentSessionEnvelope, buildDocumentTabsSession, DOCUMENT_SESSION_SAVE_DEBOUNCE_MS, type DocumentSessionEnvelope } from "./documentSession";
+import { createNativeSavePayload, createPhase4Document, insertNativeTextObject } from "./documentWorkflow";
 import { writeClipboardTextItems, writeClipboardImage } from "./clipboard";
 import { rasterizeSvgNative } from "./nativeRasterExport";
 import { setNativePromptProvider, type NativePromptOptions } from "./nativePrompt";
@@ -18,12 +18,13 @@ import { MemoryStorage } from "./testSupport/memoryStorage";
 
 const native = vi.hoisted(() => ({
   loadSession: vi.fn<() => Promise<unknown>>(),
-  open: undefined as undefined | ((payload: { path: string; displayName: string; contents: string }) => void),
+  pendingOpen: [] as { path: string; displayName: string; contents: string }[],
+  open: undefined as undefined | (() => void),
   saveSession: vi.fn<(value: DocumentSessionEnvelope) => Promise<void>>(),
   savePath: vi.fn<() => Promise<string>>(),
   writeFile: vi.fn<(path: string, contents: string) => Promise<void>>(),
   writeBytes: vi.fn<(path: string, bytes: Uint8Array) => Promise<void>>(),
-  quitFlush: undefined as undefined | (() => Promise<void>),
+  quitFlush: undefined as undefined | ((phase: QuitFlushPhase, requestId: number) => Promise<void>),
   promptQuit: undefined as undefined | ((id: number) => Promise<void>),
   quit: vi.fn()
 }));
@@ -37,7 +38,7 @@ vi.mock("./window-manager", async original => ({
   loadToolsetLayoutState: async () => undefined,
   listToolsetWindowStates: async () => [],
   setToolbarsMenu: async () => {},
-  listenForQuitFlushRequest: async (handler: () => Promise<void>) => {
+  listenForQuitFlushRequest: async (handler: NonNullable<typeof native.quitFlush>) => {
     native.quitFlush = handler; return () => { native.quitFlush = undefined; };
   },
   listenForQuitPromptRequest: async (handler: (id: number) => Promise<void>) => {
@@ -48,17 +49,21 @@ vi.mock("./window-manager", async original => ({
   prepareQuitPrompt: async () => true,
   resumeQuitAfterPrompt: async () => true,
   reportQuitPromptShowing: async () => true,
-  cancelQuit: async () => true,
+  cancelQuit: async () => "cancelled",
   confirmQuitAfterFlush: native.quit,
   confirmPromptedQuit: native.quit
 }));
 vi.mock("./window-manager/tauriEvents", async original => ({
   ...await original<typeof import("./window-manager/tauriEvents")>(),
-  listenTauriEvent: async (name: string, handler: (event: { payload: Parameters<NonNullable<typeof native.open>>[0] }) => void) => {
+  listenTauriEvent: async (name: string, handler: (event: { payload: null }) => void) => {
     if (name !== "chemdraft://open-document") return () => {};
-    native.open = payload => handler({ payload });
+    native.open = () => handler({ payload: null });
     return () => { native.open = undefined; };
   }
+}));
+vi.mock("@tauri-apps/api/core", async original => ({
+  ...await original<typeof import("@tauri-apps/api/core")>(),
+  invoke: vi.fn(async (command: string) => command === "take_pending_open_document" ? native.pendingOpen.splice(0) : undefined)
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ save: native.savePath }));
 vi.mock("@tauri-apps/plugin-fs", async original => ({
@@ -85,6 +90,9 @@ describe.each(["macos", "windows"] as const)("open table draft persistence (%s)"
     : target === "caption" ? table.caption! : table.footnotes[0];
   async function command(commandId: string) {
     await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId } })); });
+  }
+  async function autosave() {
+    await act(async () => vi.advanceTimersByTimeAsync(DOCUMENT_SESSION_SAVE_DEBOUNCE_MS + 100));
   }
   async function type(text: string) {
     await act(async () => {
@@ -123,6 +131,7 @@ describe.each(["macos", "windows"] as const)("open table draft persistence (%s)"
   }
   beforeEach(async () => {
     vi.clearAllMocks();
+    native.pendingOpen.length = 0;
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "requestAnimationFrame", "cancelAnimationFrame"] });
     vi.stubGlobal("localStorage", new MemoryStorage());
     vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
@@ -183,9 +192,15 @@ describe.each(["macos", "windows"] as const)("open table draft persistence (%s)"
       if (source !== "opened") native.loadSession.mockResolvedValueOnce(
         buildDocumentSessionEnvelope(payload, { path: "/tmp/opened-table.chemdraft", dirty: source === "restored dirty" }, "opened-table.chemdraft", false));
       await remount(createPhase4Document());
-      if (source === "opened") await act(async () => { native.open!({
-        path: "/tmp/opened-table.chemdraft", displayName: "opened-table.chemdraft", contents: payload.contents
-      }); });
+      if (source === "opened") {
+        await act(async () => {
+          native.pendingOpen.push({ path: "/tmp/opened-table.chemdraft", displayName: "opened-table.chemdraft", contents: payload.contents });
+          native.open!();
+        });
+        await act(async () => {
+          await vi.waitFor(() => expect(snapshot().file.path).toBe("/tmp/opened-table.chemdraft"));
+        });
+      }
       native.writeFile.mockClear();
       const original = value(currentTable(), target).text;
       expect(snapshot().file.dirty).toBe(source === "restored dirty");
@@ -307,7 +322,7 @@ describe.each(["macos", "windows"] as const)("open table draft persistence (%s)"
         expect(editor()).toBeNull();
         const firstTab = container.querySelectorAll('[role="tab"]')[0];
         expect(firstTab.querySelector('[aria-label="Unsaved changes"]') !== null).toBe(!saved);
-        await act(async () => { await native.quitFlush!(); });
+        await autosave();
         const session = native.saveSession.mock.calls.at(-1)![0].tabs![0];
         expect(value(persistedTable(session.contents), target).text).toBe("Hello");
         expect(session.dirty).toBe(!saved);
@@ -329,7 +344,7 @@ describe.each(["macos", "windows"] as const)("open table draft persistence (%s)"
       await open(target);
       await startComposition();
       await command("document.nextTab");
-      await act(async () => { await native.quitFlush!(); });
+      await autosave();
       const session = native.saveSession.mock.calls.at(-1)![0].tabs![0];
       expect(value(persistedTable(session.contents), target).text).toBe("Hello");
       expect(session.dirty).toBe(true);
@@ -386,7 +401,7 @@ describe.each(["macos", "windows"] as const)("open table draft persistence (%s)"
     });
     it("includes open typing in the debounced session autosave", async () => {
       await open(target);
-      await act(async () => vi.advanceTimersByTimeAsync(DOCUMENT_SESSION_SAVE_DEBOUNCE_MS + 100));
+      await autosave();
       expect(native.saveSession).toHaveBeenCalled();
       expect(value(persistedTable(native.saveSession.mock.calls.at(-1)![0].contents), target).text,
         "autosaved session contains the open draft").toBe("Hello");
@@ -394,9 +409,44 @@ describe.each(["macos", "windows"] as const)("open table draft persistence (%s)"
     });
     it("includes open typing in the quit session flush", async () => {
       await open(target);
-      await act(async () => { await native.quitFlush!(); });
+      await act(async () => { await native.quitFlush!("committed", 7); });
       expect(value(persistedTable(native.saveSession.mock.calls.at(-1)![0].contents), target).text,
         "quit session contains the open draft").toBe("Hello");
+      expect(native.quit).toHaveBeenCalledExactlyOnceWith(7);
+    });
+
+    it("restores clean after typing back to the saved value in the open editor", async () => {
+      await open(target);
+      await command("document.save");
+      await type("Hello changed");
+      await type("Hello");
+      expect(editor()).not.toBeNull();
+      expect(snapshot().file.dirty).toBe(true);
+      await act(async () => { await native.quitFlush!("committed", 7); });
+      const session = native.saveSession.mock.lastCall![0];
+      expect(session.tabs![0].dirty).toBe(false);
+      expect(value(persistedTable(session.contents), target).text).toBe("Hello");
+      native.loadSession.mockResolvedValueOnce(session);
+      await remount(createPhase4Document());
+      expect(snapshot().file.dirty).toBe(false);
+    });
+    it("freezes the open draft during a committed quit write", async () => {
+      await open(target);
+      let finishWrite!: () => void;
+      native.saveSession.mockImplementationOnce(() => new Promise<void>(resolve => { finishWrite = resolve; }));
+      let flushing!: Promise<void>;
+      await act(async () => { flushing = native.quitFlush!("committed", 7); });
+      const field = editor();
+      expect.soft(field.readOnly).toBe(true);
+      await type("Late typing");
+      const paste = new Event("paste", { bubbles: true, cancelable: true });
+      Object.defineProperty(paste, "clipboardData", { value: { getData: () => "Late paste" } });
+      await act(async () => { field.dispatchEvent(paste); });
+      expect.soft(field.value).toBe("Hello");
+      expect(value(persistedTable(native.saveSession.mock.calls.at(-1)![0].contents), target).text).toBe("Hello");
+      expect(native.quit).not.toHaveBeenCalled();
+      await act(async () => { finishWrite(); await flushing; });
+      expect(native.quit).toHaveBeenCalledOnce();
     });
     it("keeps one labelled undo step at edit completion, including formatting saved while open", async () => {
       const original = value(currentTable(), target).text;
@@ -430,7 +480,7 @@ describe.each(["macos", "windows"] as const)("open table draft persistence (%s)"
       expect(value(persistedTable(native.writeFile.mock.calls.at(-1)![1]), target).text).toBe("Hello");
       expect(editor()).toBe(textarea); expect(document.activeElement).toBe(textarea);
       expect(textarea.value).toBe("Hello未"); expect(textarea.selectionStart).toBe(6);
-      await act(async () => { await native.quitFlush!(); });
+      await autosave();
       expect(value(persistedTable(native.saveSession.mock.calls.at(-1)![0].contents), target).text).toBe("Hello");
       await act(async () => { textarea.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "完" })); });
       await type("Hello完");
@@ -452,6 +502,71 @@ describe.each(["macos", "windows"] as const)("open table draft persistence (%s)"
       expect(value(persistedTable(native.saveSession.mock.calls.at(-1)![0].contents), target).text).toBe("Hello again!");
     });
   });
+  it.each([false, true])("warns once for an oversized draft and clears the report on save (save: %s)", async save => {
+    const source = insertNativeTextObject(drawing(), { x: 50, y: 50 }, "Keep the rest of this tab");
+    const table = source.pages[0].objects[0] as TableObject;
+    const emptyCell = { text: "", spans: [] };
+    const { maxCellCharacters, maxTableCharacters } = TABLE_LIMITS;
+    const fullCell = { ...emptyCell, text: " ".repeat(maxCellCharacters) };
+    const fullTable: TableObject = {
+      ...table, columns: [table.columns[0]], headerRowCount: 0, caption: undefined, footnotes: [],
+      rows: Array.from({ length: 2 + maxTableCharacters / maxCellCharacters }, (_, index) => ({
+        id: `row-${index}`, cells: [index < 2 ? emptyCell : fullCell]
+      }))
+    };
+    const first = { ...source, pages: [{ ...source.pages[0], objects: [fullTable, source.pages[0].objects[1]] }] };
+    const second = insertNativeTextObject(createPhase4Document("Second tab"), { x: 60, y: 60 }, "Keep the other tab");
+    native.loadSession.mockResolvedValueOnce(buildDocumentTabsSession([first, second].map(document =>
+      buildDocumentSessionEnvelope(createNativeSavePayload(document), { dirty: true }, document.title, false)), 0));
+    await remount(createPhase4Document());
+    await open("cell", "x");
+    native.saveSession.mockClear();
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await act(async () => { await native.quitFlush!("committed", 42); });
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining("table draft"),
+      expect.objectContaining({ message: expect.stringContaining("maxTableCharacters") }));
+    expect(native.saveSession).toHaveBeenCalledOnce();
+    const session = native.saveSession.mock.lastCall![0];
+    const { tabs } = session;
+    expect(tabs).toHaveLength(2);
+    const persisted = openChemDraftPayload(tabs![0].contents).document!.pages[0].objects;
+    expect(value(persisted[0] as TableObject, "cell").text).toBe("");
+    expect(persisted[1]).toMatchObject({ text: "Keep the rest of this tab" });
+    expect(openChemDraftPayload(tabs![1].contents).document!.pages[0].objects[0])
+      .toMatchObject({ text: "Keep the other tab" });
+    expect(native.quit).toHaveBeenCalledExactlyOnceWith(42);
+    const recoveryMessage = `The last table edit was not saved. The table exceeds the ${maxTableCharacters}-character limit.`;
+    expect(tabs![0].openWarnings?.warnings).toContainEqual(expect.objectContaining({
+      sourceObjectId: fullTable.id, message: recoveryMessage
+    }));
+    expect(tabs![1].openWarnings?.warnings ?? []).toEqual([]);
+    native.loadSession.mockResolvedValueOnce(session);
+    await remount(createPhase4Document());
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(recoveryMessage);
+    expect(container.querySelector('[data-open-warnings-button]')?.textContent).toContain("1 warning");
+    await command("document.nextTab");
+    expect(container.querySelector('[role="status"]')?.textContent).not.toContain(recoveryMessage);
+    await command("document.previousTab");
+    expect(container.querySelector('[role="status"]')?.textContent).not.toContain(recoveryMessage);
+    expect(container.querySelector('[data-open-warnings-button]')?.textContent).toContain("1 warning");
+    if (save) {
+      await command("document.save");
+      expect(snapshot().file.dirty).toBe(false);
+      expect(container.querySelector('[data-open-warnings-button]')?.getAttribute("title"))
+        .toBe("Show the warnings from saving this document");
+    }
+    native.saveSession.mockClear();
+    await autosave();
+    const nextSession = native.saveSession.mock.lastCall![0];
+    expect(nextSession.tabs![0].openWarnings?.warnings.some(w => w.message === recoveryMessage) ?? false).toBe(!save);
+    native.loadSession.mockResolvedValueOnce(nextSession);
+    await remount(createPhase4Document());
+    expect(container.querySelector('[role="status"]')?.textContent).not.toContain(recoveryMessage);
+    if (save) expect(container.querySelector('[data-open-warnings-button]')?.getAttribute("title"))
+      .toBe("Show the warnings from saving this document");
+    else expect(container.querySelector('[data-open-warnings-button]')?.textContent).toContain("1 warning");
+  });
+
   it.each(["save", "quit"] as const)("writes the open table draft as CDX bytes on %s", async route => {
     native.savePath.mockResolvedValueOnce("/tmp/table.cdx");
     await command("document.saveAs");

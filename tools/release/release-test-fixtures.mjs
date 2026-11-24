@@ -3,13 +3,17 @@ import { createHash, generateKeyPairSync, randomBytes, sign } from "node:crypto"
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { artifactDigest, BUILD_TARGETS } from "./record-build.mjs";
+import { artifactDigest, LINUX_BUILD_TARGET } from "./record-build.mjs";
+import { releaseBuildFiles } from "./release-assets.mjs";
+import { writeReleaseChecksums } from "./release-checksums.mjs";
 
 export const version = "1.2.3";
 export const commit = "a".repeat(40);
 export const arm = `ChemDraft_${version}_aarch64.dmg`;
 export const intel = `ChemDraft_${version}_x86_64.dmg`;
 export const installer = `ChemDraft_${version}_x64-setup.exe`;
+export const deb = `ChemDraft_${version}_amd64.deb`;
+export const appImage = `ChemDraft_${version}_amd64.AppImage`;
 
 // Private keys exist only in memory for this test process.
 const { publicKey, privateKey } = generateKeyPairSync("ed25519");
@@ -27,14 +31,15 @@ export function updaterSignature(bytes) {
   return Buffer.from(`untrusted comment: ephemeral test signature\n${packet.toString("base64")}\ntrusted comment: ${comment}\n${global.toString("base64")}\n`).toString("base64");
 }
 
-export function releaseFixture(t) {
+export function releaseFixture(t, { withLinux = true } = {}) {
   const rootDir = mkdtempSync(join(dirname(fileURLToPath(import.meta.url)), ".release-test-"));
   t.after(() => rmSync(rootDir, { recursive: true, force: true }));
   const assets = join(rootDir, "assets");
   mkdirSync(assets);
-  for (const [target, suffix] of Object.entries(BUILD_TARGETS)) {
-    const file = join(assets, `ChemDraft_${version}_${suffix}`);
-    writeFileSync(file, `synthetic ${target}`);
+  for (const { target, name } of releaseBuildFiles(version)) {
+    if (!withLinux && target === LINUX_BUILD_TARGET) continue;
+    const file = join(assets, name);
+    writeFileSync(file, `synthetic ${name}`);
     writeFileSync(`${file}.build.json`, JSON.stringify({ commit, version, target, clean: true, ...artifactDigest(file) }));
   }
   const signature = updaterSignature(readFileSync(join(assets, installer)));
@@ -42,6 +47,7 @@ export function releaseFixture(t) {
   writeFileSync(join(assets, "latest.json"), JSON.stringify({
     version, platforms: { [windowsPlatformKey]: { url: installerUrl, signature } }
   }));
+  writeReleaseChecksums(assets);
   return { rootDir, assets, version };
 }
 

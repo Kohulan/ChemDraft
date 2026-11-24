@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { XMLParser } from "fast-xml-parser";
 import { CDX_POINT3D_ORDER_ATTRIBUTE, MAGIC, cdxElementFromOrderedTree, cdxElementToCdxml, readCdx, writeCdx, type CdxElement, type CdxWarning } from "./cdxBinary";
 import { OBJECTS, PROPS } from "./cdxTags";
-import { exportDocumentToCdx, importCdx } from "./index";
+import { exportDocumentToCdx, importCdx, openChemDraftPayload } from "./index";
 
 const u16 = (v: number) => [v & 255, v >>> 8 & 255];
 const u32 = (v: number) => [...u16(v), ...u16(v >>> 16)];
@@ -19,6 +19,58 @@ const styled = (text: string) => [...u16(1), ...[0, 3, 1, 240, 3].flatMap(u16), 
 const element = (name: string, attrs: Record<string, string> = {}, kids: CdxElement[] = [], text = ""): CdxElement => ({ name, attrs, kids, text });
 
 describe("binary CDX headers and reference codec cases", () => {
+  it.each(["-2147483648", "2147483647", "0"])("round trips signed Long boundary %s", value => {
+    const warnings: CdxWarning[] = [];
+    const bytes = writeCdx(element("CDXML", {}, [element("objecttag", { id: "2", Name: "count", TagType: "Long", Value: value })]), warnings);
+    expect(warnings).toEqual([]);
+    expect(readCdx(bytes).kids[0].attrs.Value).toBe(value);
+  });
+
+  it.each(["2147483648", "-2147483649", "1.5", "1junk", ""]) ("preserves and warns on invalid imported Long %j and refuses its binary export", value => {
+    const xml = `<CDXML><page id="1"><objecttag id="2" Name="count" TagType="Long" Value="${value}"/></page></CDXML>`;
+    const imported = openChemDraftPayload(xml);
+    expect(imported.warnings).toContainEqual(expect.objectContaining({ code: "cdxml.invalid_long_tag", message: expect.stringContaining("count") }));
+    expect(imported.document?.pages[0].objects[0]).toMatchObject({ type: "unknown-compatibility-object", raw: { attributes: { Value: value } } });
+    const warnings: CdxWarning[] = [];
+    const bytes = writeCdx(element("CDXML", {}, [element("objecttag", { id: "2", Name: "count", TagType: "Long", Value: value })]), warnings);
+    expect(warnings).toContainEqual(expect.objectContaining({ message: expect.stringContaining('tag "count"') }));
+    expect(readCdx(bytes).kids[0].attrs.Value).toBeUndefined();
+  });
+
+  it("retains invalid nested and root Long tag text in compatibility objects", () => {
+    const imported = openChemDraftPayload('<CDXML><objecttag Name="root" TagType="Long" Value="1.5"/><page id="1"><group id="2"><objecttag Name="nested" TagType="Long" Value="2147483648"/></group></page></CDXML>');
+    const tags = imported.document?.pages[0].objects.filter(object => object.type === "unknown-compatibility-object");
+    expect(tags).toHaveLength(2);
+    expect(tags).toEqual(expect.arrayContaining([
+      expect.objectContaining({ raw: expect.objectContaining({ attributes: expect.objectContaining({ Name: "root", Value: "1.5" }) }) }),
+      expect.objectContaining({ raw: expect.objectContaining({ attributes: expect.objectContaining({ Name: "nested", Value: "2147483648" }) }) })
+    ]));
+  });
+
+  it("keeps invalid Long tags on their source pages and root tags on the first page", () => {
+    // The value precedes its type, so the reader retains it as raw text before seeing Long.
+    const tag = (id: number) => object(0x8011, id, property(0x0d05, [1, 2, 3]), property(0x0d00, u16(2)));
+    const imported = importCdx(file(tag(10), object(0x8001, 1, tag(11)), object(0x8001, 2, object(0x8002, 3, tag(12)))));
+    expect(imported.document, JSON.stringify(imported.warnings)).toBeDefined();
+    const pages = imported.document!.pages;
+    expect(pages).toHaveLength(2);
+    const tagIds = (page: typeof pages[number]) => page.objects
+      .filter(object => object.type === "unknown-compatibility-object" && object.sourceObjectType === "objecttag")
+      .map(object => object.compatibility?.originalId);
+    expect(tagIds(pages[0])).toEqual(["10", "11"]);
+    expect(tagIds(pages[1])).toEqual(["12"]);
+    expect(imported.warnings.filter(warning => warning.code === "cdxml.invalid_long_tag")).toHaveLength(3);
+    const afterPageDeletion = { ...imported.document!, pages: pages.filter(page => page.id !== pages[1].id) };
+    expect(afterPageDeletion.pages.flatMap(tagIds)).toEqual(["10", "11"]);
+  });
+
+  it.each([false, true])("preserves explicit foreground colour when slot 3 is %s", colored => {
+    const palette = element("colortable", {}, [element("color", { r: "1", g: "1", b: "1" }), element("color", { r: colored ? "1" : "0", g: "0", b: "0" })]);
+    const decoded = readCdx(writeCdx(element("CDXML", {}, [palette, element("t", { id: "2" }, [element("s", { color: "3" }, [], "text")])])));
+    const run = decoded.kids.find(child => child.name === "t")!.kids[0];
+    expect(run.attrs.color).toBe(colored ? "4" : "0");
+  });
+
   it("keeps interleaved text and elements at every XML depth", () => {
     const parser = new XMLParser({ preserveOrder: true, ignoreAttributes: false, attributeNamePrefix: "", trimValues: false });
     const xml = '<CDXML>before<page id="1">A<group id="2">B<t id="3">C<s face="1">D</s>E</t>F</group>G</page>after</CDXML>';

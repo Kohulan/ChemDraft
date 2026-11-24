@@ -38,11 +38,16 @@ describe.each([false, true])("main's mark association policy with direct editing
   // the atom the user clicked." Valence warnings must never reassign duplicated radical ions.
   // The fixture captures raw anchors separately and checks every atom's charge/radical fields.
   it.each(specs)("matches main's stored anchors and resulting chemistry for %j", spec => {
-    for (const { name, before, patched } of mainAssociationCases(workflow, spec)) {
+    for (const { name, before, patched, warnings } of mainAssociationCases(workflow, spec)) {
       const beforeJson = JSON.stringify(before), patchedJson = JSON.stringify(patched);
       const result = normalizeDocumentEdit(before, patched);
       const expected = (mainOracle.cases as Record<string, unknown>)[`${JSON.stringify(spec)}: ${name}`];
       expect(expected, name).toBeDefined();
+      // fa5c8c137 makes new lone pairs explicit. a2537ded6 requires stale explicit
+      // copies to warn or fail, whereas main's legacy geometric fixture needed neither.
+      expect(warnings, name).toEqual(spec.kind === "lone-pair" && name === "stale paste missing atom"
+        ? ['Cannot preserve explicit electron mark "charge_003" association: copied atom "atom_001" in molecule "mol_bond_001" is missing.']
+        : []);
       if (["alignment", "crowded alignment", "crowded multi molecule group alignment"].includes(name)) {
         // Ordinary marks keep their anchors whenever carried with the molecule, selected or not.
         const state = associationState(patched, result.document);
@@ -78,6 +83,13 @@ describe.each([false, true])("main's mark association policy with direct editing
         const positions = (state: ReturnType<typeof associationState>) => state.molecules.map(([id, atoms]) =>
           [id, (atoms as { x: number; y: number }[]).map(({ x, y }) => ({ x, y }))]);
         expect(positions(associationState(patched, result.document)), name).toEqual(positions(expected as ReturnType<typeof associationState>));
+      } else if (name === "duplicate mark only" && spec.kind !== "lone-pair") {
+        // Duplicate no longer attaches a copied loose charge/radical mark by proximity to a molecule
+        // already on the page (AGENTS.md section 7), so main's oracle (which linked and doubled the
+        // original's charge) no longer applies. The copy is an explicit point and the original is untouched.
+        const copy = result.document.pages[0].objects.find(o => o.type === "electron-mark" && !before.pages[0].objects.some(old => old.id === o.id))!;
+        expect(copy, name).toMatchObject({ anchor: { kind: "point" }, atomAssociation: "explicit" });
+        expect(moleculesIn(result.document), name).toEqual(moleculesIn(before));
       } else expect(associationState(patched, result.document), name).toEqual(expected);
       expect(result.chemistryChanges).toEqual(electronMarkChemistryChanges(before, result.document));
       expect(JSON.stringify(before)).toBe(beforeJson);
@@ -117,8 +129,10 @@ describe.each([false, true])("main's mark association policy with direct editing
     });
     const existing = { ...added("charge_003", "mol_bond_001"),
       objectIdBefore: "mol_bond_001", atomIdBefore: "atom_001" };
-    // Co-selected pairs copy their chemistry to the copied molecule. Mark-only duplication
-    // retains its existing policy, including the original-atom radical contribution.
+    // Co-selected pairs copy their chemistry to the copied molecule. The "duplicate mark only" row
+    // is the former behaviour (the copied mark attached to the original atom, adding to its
+    // charge and radical contribution); it is replaced right after this table, because mark-only
+    // duplication now changes no chemistry.
     const expected = {
       "duplicate small offset": [added(`${prefix}_copy_005`, "mol_copy_004")],
       "duplicate large offset": [added(`${prefix}_copy_005`, "mol_copy_004")],
@@ -127,16 +141,27 @@ describe.each([false, true])("main's mark association policy with direct editing
       "stale paste missing atom": [added(`${prefix}_copy_001`, "mol_copy_002", "atom_002")],
       "stale paste missing molecule": []
     };
+    // Duplicate no longer attaches a copied loose mark by proximity (section 7), so mark-only
+    // duplication changes no chemistry for charge and radical specs.
+    if (spec.kind !== "lone-pair") expected["duplicate mark only"] = [];
     for (const [name, changes] of Object.entries(expected)) {
       const { before, patched } = mainAssociationCases(workflow, spec).find(c => c.name === name)!;
       expect(normalizeDocumentEdit(before, patched).chemistryChanges, name).toEqual(spec.kind === "lone-pair" ? [] : changes);
     }
   });
 
-  it.each(specs)("keeps main's stale point anchors for floating moves of %j", spec => {
+  it.each(specs)("keeps legacy stale point anchors and moves explicit floating anchors for %j", spec => {
     const { document, mark } = fixture(spec);
     const floating = { ...mark, anchor: { kind: "point" as const, point: { x: 600, y: 600 } }, x: 591, y: 591 };
     expect(electronMarkMoveAssociation(document, floating, { x: 600, y: 600 }, { x: 620, y: 620 })).toEqual({
+      // fa5c8c137 makes lone pairs explicit; 2942e07d0 moves explicit floating anchors
+      // with the mark so later normalization cannot silently attach them to an atom.
+      anchor: spec.kind === "charge" || spec.kind === "lone-pair"
+        ? { kind: "point", point: { x: 620, y: 620 } } : floating.anchor
+    });
+    // 2942e07d0 intentionally leaves files without the explicit flag on their legacy policy.
+    expect(electronMarkMoveAssociation(document, { ...floating, atomAssociation: undefined },
+      { x: 600, y: 600 }, { x: 620, y: 620 })).toEqual({
       anchor: spec.kind === "charge" ? { kind: "point", point: { x: 620, y: 620 } } : floating.anchor
     });
   });
