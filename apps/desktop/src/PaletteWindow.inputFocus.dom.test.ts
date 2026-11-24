@@ -565,7 +565,7 @@ describe.each(["macos", "windows"] as const)("palette input focus (%s)", (platfo
     expect(leases()[0]![1]).toMatchObject({ editing: false, returnFocus: platform === "macos" });
   });
 
-  it("ends a lease on a nested scrollbar press without dragging, handing the keyboard back by release", async () => {
+  it("ends a lease on a nested scrollbar press without dragging, handing the keyboard back at pointerdown", async () => {
     // jsdom computes overflow only from loaded rules; the drag handler reads scroll ownership from them.
     const styles = document.createElement("style");
     styles.textContent = readFileSync(resolve("apps/desktop/src/App.css"), "utf8");
@@ -579,6 +579,8 @@ describe.each(["macos", "windows"] as const)("palette input focus (%s)", (platfo
       await act(async () => pointer(scroller, "pointerdown"));
       await flush();
       expect(leases().map(([, args]) => args.editing)).toEqual([true, false]);
+      // A scrollbar press is not a drag press, so Windows hands the keyboard back now, as macOS does.
+      expect(leases().at(-1)![1]).toMatchObject({ editing: false, returnFocus: true });
       expect(document.activeElement).not.toBe(input);
       expect(startPaletteWindowDrag).not.toHaveBeenCalled();
       await act(async () => pointer(scroller, "pointerup"));

@@ -1,5 +1,6 @@
 import { isDesktopRuntime, listenForToolsetCommandSpecs, TOOLSET_COMMAND_SPECS_REQUEST_EVENT } from "../window-manager";
 import { listenCurrentWindowEvent } from "../window-manager/tauriEvents";
+import { isScrollOwnerPress } from "../window-manager/scrollOwnerPress";
 import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import { createDesktopShortcutRegistry, detectDesktopShortcutPlatform } from "../keyboardShortcuts";
 import { isTextEditingElement } from "../editHistoryRouting";
@@ -52,14 +53,15 @@ export function disabledControlAtPointer(
   return child instanceof HTMLElement && child.matches(selector) ? child : undefined;
 }
 
-/** Match the palette's native drag surfaces, including customize mode and disabled fields. */
+/** Match the palette's native drag surfaces, including customize mode and disabled fields.
+ * A press on a scroll owner is a scrollbar press: the webview keeps it and the window never drags. */
 export function isPaletteWindowDragPress(
   shell: HTMLElement, event: Pick<PointerEvent, "target" | "clientX" | "clientY" | "button" | "isPrimary">
 ): boolean {
   const target = event.target instanceof Element ? event.target : null;
   return event.button === 0 && event.isPrimary !== false && !!target && shell.contains(target) &&
     !target.closest("button, select, input, textarea, [data-palette-control]") &&
-    !disabledControlAtPointer(shell, event) &&
+    !isScrollOwnerPress(target) && !disabledControlAtPointer(shell, event) &&
     !!target.closest('[data-palette-title-drag-surface="true"], [data-palette-drag-surface="true"]');
 }
 
