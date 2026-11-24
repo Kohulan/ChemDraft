@@ -50,4 +50,23 @@ describe("current resized text layout", () => {
     expect(layout.filter(line => line.paragraphIndex === 0).length).toBeGreaterThan(1);
     expect(layout.filter(line => line.paragraphIndex === 1)).toHaveLength(1);
   });
+  it("wraps long whitespace runs within the limit without losing characters", () => {
+    const style = nativeTextStyleFromObjectStyle({ fontSizePx: 18 });
+    for (const value of ["alpha" + " ".repeat(40) + "beta", " ".repeat(60), "\t".repeat(30), "word" + " ".repeat(30)]) {
+      const lines = nativeTextSpanLayout([normal(value)], style, 60).map(line => line.spans);
+      expect(text(lines).join("")).toBe(value);
+      const trimmed = (line: TextSpan[]) => {
+        const last = line[line.length - 1]!;
+        return /\s$/.test(last.text) ? [...line.slice(0, -1), { ...last, text: last.text.slice(0, -1) }] : line;
+      };
+      expect(lines.every(line => measureNativeTextSpanLineWidth(trimmed(line), style) <= 60)).toBe(true);
+    }
+  });
+  it("keeps a single wrap-point space at the end of the line", () => {
+    const style = nativeTextStyleFromObjectStyle({ fontSizePx: 18 });
+    const width = measureNativeTextSpanLineWidth([normal("alpha")], style);
+    const lines = text(nativeTextSpanLayout([normal("alpha beta")], style, width).map(line => line.spans));
+    expect(lines).toEqual(["alpha ", "beta"]);
+    expect(lines.join("")).toBe("alpha beta");
+  });
 });

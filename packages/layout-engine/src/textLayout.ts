@@ -41,10 +41,14 @@ export function nativeTextSpanLayout(spans: readonly TextSpan[], style: NativeTe
       while (end < paragraph.length && breakSpace(paragraph[end]!.text) === whitespace) end++;
       const token = paragraph.slice(index, end);
       if (!whitespace && line.length && measure([...line, ...token]) > limit) flush();
-      if (whitespace || measure(token) <= limit) line.push(...token);
-      else for (const glyph of token) {
-        if (line.length && measure([...line, glyph]) > limit) flush();
-        line.push(glyph);
+      if (measure([...line, ...token]) <= limit || (!whitespace && !line.length && measure(token) <= limit)) line.push(...token);
+      else {
+        let rest = token;
+        if (whitespace && line.length) { line.push(token[0]!); flush(); rest = token.slice(1); }
+        for (const glyph of rest) {
+          if (line.length && measure([...line, glyph]) > limit) flush();
+          line.push(glyph);
+        }
       }
       index = end;
     }
