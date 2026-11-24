@@ -336,6 +336,53 @@ body.preferences-window-body #root {
   color: var(--cd-text-secondary);
 }
 
+.preferences-header > a {
+  color: inherit;
+  font-size: 0.85em;
+}
+
+.preferences-shortcut-controls,
+.preferences-shortcut-list li {
+  display: grid;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.preferences-shortcut-controls {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.preferences-shortcut-controls input {
+  min-width: 0;
+  width: 100%;
+}
+
+.preferences-shortcut-feedback p {
+  margin: 0.4rem 0;
+}
+
+.preferences-shortcut-feedback button + button {
+  margin-left: 0.4rem;
+}
+
+.preferences-shortcut-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 19rem;
+  overflow: auto;
+}
+
+.preferences-shortcut-list li {
+  grid-template-columns: minmax(0, 1fr) minmax(5rem, 28%) auto auto;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--cd-border-subtle);
+}
+
+.preferences-shortcut-list small {
+  display: block;
+}
+
 button,
 select,
 input,
@@ -914,6 +961,11 @@ textarea:focus-visible,
   max-width: calc(100vw - var(--palette-x) - 8px);
 }
 
+.web-floating-palette:has(> .ring-inspector-palette) {
+  /* Rings hides the command grid, so the widget determines the browser frame width. */
+  width: max-content;
+}
+
 .document-viewport {
   position: relative;
   display: grid;
@@ -1166,7 +1218,12 @@ textarea:focus-visible,
 
 .ring-inspector-controls {
   grid-template-columns: minmax(0, 1fr);
-  max-height: 320px;
+  max-height: none;
+}
+
+.ring-inspector-controls .molecule-inspector-target-key {
+  /* The controls set the palette width. Long ring keys still ellipsize in the target row. */
+  contain: inline-size;
 }
 
 .molecule-inspector-tab-rail {

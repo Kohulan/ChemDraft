@@ -9,8 +9,10 @@ import {
 } from "@chemdraft/layout-engine";
 import {
   estimateNativeTextLineWidth, estimateNativeTextSpanLineWidth,
-  layoutReactionLabels, layoutReactionScheme, planReactionLabels, type ReactionLabelsOptions
+  layoutReactionLabels, layoutReactionScheme, planReactionLabels, reactionLabelWrapWidthInBonds,
+  type ReactionLabelsOptions
 } from "../src/index";
+import { wrapPiecesWorkForTesting } from "../src/testing";
 
 const above = ["Ti(OiPr)4 (5 mol%)", "(+)-DET (6 mol%)", "t-BuOOH"];
 const below = ["CH2Cl2, −20 °C, 4 h"];
@@ -316,14 +318,183 @@ describe("reaction label policy", () => {
     const token = "CH2".repeat(40);
     const result = labels({ above: [`CH2Cl2 CH2Cl2 CH2Cl2 CH2Cl2 CH2Cl2 CH2Cl2 ${token} heat`], below: [] });
     const lines = result.above!.text.split("\n");
-    expect(lines).toEqual(["CH2Cl2 CH2Cl2 CH2Cl2 CH2Cl2", "CH2Cl2 CH2Cl2", token, "heat"]);
+    expect(lines).toEqual(["CH2Cl2 CH2Cl2 CH2Cl2", "CH2Cl2 CH2Cl2 CH2Cl2", token, "heat"]);
     const style = nativeTextStyleFromObjectStyle(result.above!.style);
     for (const line of lines.filter((line) => line !== token)) {
       const spans = planReactionLabels({ ...defaults, above: [line], below: [] }).above!.spans;
-      expect(estimateNativeTextSpanLineWidth(spans, style)).toBeLessThanOrEqual(220);
+      expect(estimateNativeTextSpanLineWidth(spans, style)).toBeLessThanOrEqual(reactionLabelWrapWidthInBonds * 22);
     }
     expect(result.above!.width).toBeGreaterThan(240);
     expect(result.plan.arrowLength).toBeCloseTo(result.plan.above!.size.contentWidth + 2 * (reactionArrowHeadLengthPx + 0.25 * 15));
+  });
+
+  describe("wrap width and unit grouping", () => {
+    // Width of one unwrapped line at the defaults' 15 px text, in bond lengths of 22 px.
+    const bonds = (line: string) => planReactionLabels({ ...defaults, above: [line], below: [], bondLength: 1000 })
+      .above!.size.contentWidth / 22;
+
+    it("wraps at 8.5 bond lengths a line that fit within the former 10", () => {
+      expect(reactionLabelWrapWidthInBonds).toBe(8.5);
+      const line = "NaBH4, MeOH, then aqueous";
+      expect(bonds(line)).toBeGreaterThan(8.5);
+      expect(bonds(line)).toBeLessThan(10);
+      const result = labels({ above: [line], below: [] });
+      // Changed: the break now falls after the last fitting comma, not after "then".
+      expect(result.above!.text.split("\n")).toEqual(["NaBH4, MeOH,", "then aqueous"]);
+      // The arrow still follows the widest wrapped line, not the wrap width.
+      expect(result.plan.arrowLength).toBeCloseTo(result.plan.above!.size.contentWidth
+        + 2 * (reactionArrowHeadLengthPx + 0.25 * 15));
+    });
+
+    it.each([
+      // A break by width alone would fall between the quantity and its unit.
+      // Changed: "then" now follows the comma break to the second line.
+      { line: "LiAlH4 in THF, then 0.25 M", fits: "LiAlH4 in THF, then 0.25",
+        expected: ["LiAlH4 in THF,", "then 0.25 M"] },
+      { line: "Pd(OAc)2, K3PO4, THF, 5 mol %", fits: "Pd(OAc)2, K3PO4, THF, 5",
+        expected: ["Pd(OAc)2, K3PO4, THF,", "5 mol %"] },
+      // ...or inside the multi-word unit "mol %".
+      { line: "Pd/C, H2, MeOH, rt, 5 mol %", fits: "Pd/C, H2, MeOH, rt, 5 mol",
+        expected: ["Pd/C, H2, MeOH, rt,", "5 mol %"] }
+    ])("keeps $expected.1 on one line in $line", ({ line, fits, expected }) => {
+      // The prefix ending at the quantity (or at "mol") fits; adding the next word does not.
+      expect(bonds(fits)).toBeLessThanOrEqual(8.5);
+      expect(bonds(`${fits} ${line.slice(fits.length + 1).split(" ")[0]}`)).toBeGreaterThan(8.5);
+      const result = labels({ above: [line], below: [line] });
+      expect(result.above!.text.split("\n")).toEqual(expected);
+      expect(result.below!.text.split("\n")).toEqual(expected);
+      // Only the break itself changes the authored text; the unit keeps its plain space.
+      expect(result.above!.text.replace("\n", " ")).toBe(line);
+      expect(result.above!.spans.map((span) => span.text).join("")).toBe(result.above!.text);
+    });
+
+    it("keeps each quantity whole and the authored spacing verbatim when every word overflows", () => {
+      const line = "K2CO3 (2.0 equiv), 80 °C, 12 h, 10 mol%, 5 mol %, 0.25 M, −78\t°C";
+      const result = labels({ above: [line], below: [], bondLength: 1 });
+      // Changed: "K2CO3 (2.0 equiv)," is now one piece, a reagent with its parenthesised amount.
+      expect(result.above!.text.split("\n")).toEqual([
+        "K2CO3 (2.0 equiv),", "80 °C,", "12 h,", "10 mol%,", "5 mol %,", "0.25 M,", "−78\t°C"
+      ]);
+    });
+  });
+
+  describe("comma breaks and parenthesised amounts", () => {
+    const bonds = (line: string) => planReactionLabels({ ...defaults, above: [line], below: [], bondLength: 1000 })
+      .above!.size.contentWidth / 22;
+
+    it.each([22, 24])("breaks after the comma, never inside a reagent's amount, at bond length %s", (bondLength) => {
+      const line = "Pd(PPh3)4 (5 mol %), K2CO3 (2.0 equiv)";
+      expect(bonds(line)).toBeGreaterThan(8.5 * bondLength / 22);
+      const result = labels({ above: [line], below: [line], bondLength });
+      expect(result.above!.text.split("\n")).toEqual(["Pd(PPh3)4 (5 mol %),", "K2CO3 (2.0 equiv)"]);
+      expect(result.below!.text).toBe(result.above!.text);
+      expect(result.above!.text.replace("\n", " ")).toBe(line);
+    });
+
+    it("splits two reagents with amounts only at the comma between them", () => {
+      const line = "HATU (1.2 equiv), DIPEA (3.0 equiv)";
+      // A break by width alone would leave "DIPEA" on the first line and "(3.0 equiv)" alone.
+      expect(bonds("HATU (1.2 equiv), DIPEA")).toBeLessThanOrEqual(8.5);
+      expect(bonds(line)).toBeGreaterThan(8.5);
+      const expected = ["HATU (1.2 equiv),", "DIPEA (3.0 equiv)"];
+      expect(labels({ above: [line], below: [] }).above!.text.split("\n")).toEqual(expected);
+      // Even when each piece overflows, neither amount leaves its reagent.
+      expect(labels({ above: [line], below: [], bondLength: 1 }).above!.text.split("\n")).toEqual(expected);
+    });
+
+    it("puts a reagent and amount wider than the limit on its own line and lets it overflow", () => {
+      const piece = "toluene/H2O (4:1, 0.25 M)";
+      expect(bonds(piece)).toBeGreaterThan(8.5);
+      const result = labels({ above: [`Pd2(dba)3, XPhos, ${piece}, 80 °C`], below: [] });
+      expect(result.above!.text.split("\n")).toEqual(["Pd2(dba)3, XPhos,", `${piece},`, "80 °C"]);
+      expect(result.plan.above!.size.contentWidth).toBeGreaterThan(reactionLabelWrapWidthInBonds * 22);
+    });
+
+    it("does not break at a comma inside parentheses", () => {
+      const line = "XPhos, toluene/H2O (4:1, 0.25 M)";
+      // At bond length 23 the parenthesised comma fits and the whole group fits on its own.
+      const limit = 8.5 * 23 / 22;
+      expect(bonds("XPhos, toluene/H2O (4:1,")).toBeLessThanOrEqual(limit);
+      expect(bonds("toluene/H2O (4:1, 0.25 M)")).toBeLessThanOrEqual(limit);
+      expect(bonds(line)).toBeGreaterThan(limit);
+      const result = labels({ above: [line], below: [], bondLength: 23 });
+      expect(result.above!.text.split("\n")).toEqual(["XPhos,", "toluene/H2O (4:1, 0.25 M)"]);
+    });
+
+    it("keeps an unclosed parenthesis as ordinary words", () => {
+      const result = labels({ above: ["K2CO3 (2.0 equiv, MeOH, then aqueous workup and filtration"], below: [] });
+      expect(result.above!.text.replace(/\n/g, " ")).toBe("K2CO3 (2.0 equiv, MeOH, then aqueous workup and filtration");
+      expect(result.above!.text.split("\n").length).toBeGreaterThan(1);
+    });
+
+    it("keeps a weight or volume percentage and a leading-decimal quantity whole", () => {
+      const line = "5 wt %, 10 vol %, .5 M, −.25 M, 5 vol";
+      // Every piece overflows, so each line is exactly one unbreakable piece.
+      const result = labels({ above: [line], below: [], bondLength: 1 });
+      expect(result.above!.text.split("\n")).toEqual(["5 wt %,", "10 vol %,", ".5 M,", "−.25 M,", "5 vol"]);
+    });
+
+    it.each([
+      { line: "Pd(OAc)2, THF/H2O(4:1, 0.25 M), 80 °C", expected: ["Pd(OAc)2,", "THF/H2O(4:1, 0.25 M),", "80 °C"] },
+      // A nested group opened mid-word, and one opened mid-word inside a word-initial group.
+      { line: "K2CO3(aq(sat., 2 M)), MeOH", expected: ["K2CO3(aq(sat., 2 M)),", "MeOH"] },
+      { line: "NaOH (aq(1 M, 2 equiv)), MeOH", expected: ["NaOH (aq(1 M, 2 equiv)),", "MeOH"] }
+    ])("never splits a parenthesised group opened mid-word at its inner comma: $line", ({ line, expected }) => {
+      expect(labels({ above: [line], below: [], bondLength: 1 }).above!.text.split("\n")).toEqual(expected);
+    });
+
+    it("does not prefer a comma inside a group opened mid-word, or after an unclosed parenthesis", () => {
+      // "THF/H2O(4:1, 0.25 M) at" fits 8.5 bonds; a comma break would leave "(4:1," split from its group.
+      expect(bonds("THF/H2O(4:1, 0.25 M) at")).toBeLessThanOrEqual(8.5);
+      expect(labels({ above: ["THF/H2O(4:1, 0.25 M) at reflux"], below: [] }).above!.text.split("\n"))
+        .toEqual(["THF/H2O(4:1, 0.25 M) at", "reflux"]);
+      // An unclosed group stays breakable by width, but its commas are not preferred breaks.
+      const unclosed = "K2CO3 (aq, MeOH then aqueous workup";
+      expect(bonds("K2CO3 (aq, MeOH then")).toBeLessThanOrEqual(8.5);
+      expect(labels({ above: [unclosed], below: [] }).above!.text.split("\n"))
+        .toEqual(["K2CO3 (aq, MeOH then", "aqueous workup"]);
+    });
+
+    it.each([
+      { line: "add (R)-BINAP (5 mol %)", expected: ["add", "(R)-BINAP (5 mol %)"] },
+      { line: "with (+)-DET (6 mol%).", expected: ["with", "(+)-DET (6 mol%)."] },
+      { line: "then (S)-proline", expected: ["then", "(S)-proline"] },
+      // An amount followed by punctuation ending the piece still attaches.
+      { line: "NaBH4 (2 equiv); MeOH", expected: ["NaBH4 (2 equiv);", "MeOH"] }
+    ])("attaches a parenthesised group only when it is an amount, not a name prefix: $line", ({ line, expected }) => {
+      expect(labels({ above: [line], below: [], bondLength: 1 }).above!.text.split("\n")).toEqual(expected);
+    });
+
+    it("groups a line of many unclosed parentheses in one linear pass", () => {
+      const words = 12000;
+      const line = Array.from({ length: words }, () => "(a").join(" ");
+      const result = labels({ above: [line], below: [], bondLength: 1 });
+      // Deterministic linear bound: the scan takes at most 4 steps per character; rescanning per "(" would be quadratic.
+      expect(wrapPiecesWorkForTesting(line, true).steps).toBeLessThanOrEqual(4 * line.length);
+      expect(result.above!.text.split("\n")).toHaveLength(words);
+    });
+
+    it("groups deeply nested parentheses in linear work", () => {
+      const depth = 6000;
+      const line = "(x ".repeat(depth) + ")".repeat(depth);
+      const { pieces, steps } = wrapPiecesWorkForTesting(line, true);
+      // Each closing parenthesis checks a once-per-word trailing boundary; none rescans the closers behind it.
+      expect(steps).toBeLessThanOrEqual(4 * line.length);
+      expect(pieces).toHaveLength(1);
+      expect(labels({ above: [line], below: [], bondLength: 1 }).above!.text.split("\n")).toHaveLength(1);
+    });
+
+    it.each([
+      { above: ["N".repeat(120)], expected: ["N".repeat(120)] },
+      { above: [`heat ${"N".repeat(120)} 0.25 M`], expected: ["heat", "N".repeat(120), "0.25 M"] },
+      { above: [`${"N".repeat(120)}  \t `], expected: ["N".repeat(120)] }
+    ])("places an oversized single token on its own line without empty lines: $#", ({ above, expected }) => {
+      const result = labels({ above, below: [] });
+      const lines = result.above!.text.split("\n");
+      expect(lines).toEqual(expected);
+      expect(lines.every((line) => line.length > 0)).toBe(true);
+      expect(result.plan.above!.size.contentWidth).toBeGreaterThan(reactionLabelWrapWidthInBonds * 22);
+    });
   });
 
   it.each(["forward", "equilibrium", "resonance", "retrosynthesis", "unknown"] as const)("clears the visible %s arrow geometry", (arrowKind) => {
@@ -442,6 +613,36 @@ describe("reaction label policy", () => {
     ]);
     expect(result.caption!.x + result.caption!.width / 2).toBe(100);
     expect(scripts(result.caption!)).toEqual([]);
+  });
+
+  it.each([1, 100, 150, 200])("wraps a caption exactly as release 1.2.2 did, by width alone, at %s px", (width) => {
+    // No quantity grouping, no comma preference, no parenthesis grouping: break at any space or tab.
+    const text = "Pd (5 mol %), then 0.25 M LiAlH4 (2.0 equiv), THF/H2O(4:1, 5 wt %) at 80 °C, 12 h";
+    const plan = planReactionLabels({ ...defaults, above: [], below: [], caption: text, bondLength: 1 });
+    const result = layoutReactionLabels(plan, {
+      arrowMidpoint: { x: 0, y: 0 }, schemeBounds: { minX: 0, minY: 0, maxX: width, maxY: 10 }, idPrefix: "caption"
+    });
+    // The release 1.2.2 algorithm, on plain caption spans.
+    const fits = (line: string) => estimateNativeTextSpanLineWidth([{ text: line, script: "normal", style: {} }],
+      plan.textStyle) <= width;
+    const base: string[] = [];
+    let current = "";
+    for (const [word] of text.matchAll(/[^ \t]+[ \t]*/g)) {
+      if (current && !fits((current + word).replace(/[ \t]+$/, ""))) {
+        base.push(current.replace(/[ \t]+$/, ""));
+        current = word;
+      } else current += word;
+    }
+    base.push(current.replace(/[ \t]+$/, ""));
+    const expected = {
+      1: ["Pd", "(5", "mol", "%),", "then", "0.25", "M", "LiAlH4", "(2.0", "equiv),", "THF/H2O(4:1,", "5", "wt", "%)",
+        "at", "80", "°C,", "12", "h"],
+      100: ["Pd (5 mol %),", "then 0.25 M", "LiAlH4 (2.0", "equiv),", "THF/H2O(4:1,", "5 wt %) at", "80 °C, 12 h"],
+      150: ["Pd (5 mol %), then", "0.25 M LiAlH4 (2.0", "equiv),", "THF/H2O(4:1, 5 wt", "%) at 80 °C, 12 h"],
+      200: ["Pd (5 mol %), then 0.25 M", "LiAlH4 (2.0 equiv),", "THF/H2O(4:1, 5 wt %) at", "80 °C, 12 h"]
+    }[width]!;
+    expect(base).toEqual(expected);
+    expect(result.caption!.text.split("\n")).toEqual(expected);
   });
 
   it("renders the planned lines and script spans through the canvas/export page renderer", () => {
