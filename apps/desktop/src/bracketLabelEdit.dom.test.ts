@@ -13,6 +13,7 @@ import { MemoryStorage } from "./testSupport/memoryStorage";
 import { DOCUMENT_SESSION_SAVE_DEBOUNCE_MS, type DocumentSessionEnvelope } from "./documentSession";
 import { setNativePromptProvider, type NativePromptOptions } from "./nativePrompt";
 import { saveAskToSaveBeforeQuit } from "./quitSettings";
+import { saveKeybindingSettings } from "./keybindingSettings";
 
 const native = vi.hoisted(() => ({
   writeFile: vi.fn<(path: string, contents: string) => Promise<void>>(),
@@ -68,6 +69,8 @@ describe.each(["macos", "windows"] as const)("repeat label editing (%s)", platfo
     native.writeFile.mockReset().mockResolvedValue();
     native.saveSession.mockResolvedValue();
     vi.stubGlobal("localStorage", new MemoryStorage());
+    // Cmd/Ctrl+R is Show Rulers in ChemDraft's scheme; pin it rather than rely on the default.
+    saveKeybindingSettings({ scheme: "chemdraft" });
     pendingPrompt = undefined;
     restorePrompt = setNativePromptProvider(prompt => new Promise(resolve => { pendingPrompt = { prompt, resolve }; }));
     saveAskToSaveBeforeQuit(true);

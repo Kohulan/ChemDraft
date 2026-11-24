@@ -7,7 +7,8 @@ import { depictSmiles2D, perceiveDoubleBondStereoFromMolfile } from "@chemdraft/
 import {
   applyMoleculeBondStereo, applyMoleculeDoubleBondPosition, applyNativeMoleculeBondOrderTarget,
   applyNativeMoleculeBondOrderValueTarget, createPhase4Document, getSelectedMolecule,
-  insertNativeMolfileMolecule, moveNativeMoleculeParts, nativeBondStereoAvailability,
+  insertNativeMolfileMolecule, insertSmilesMolecule, moveNativeMoleculeParts, nativeBondStereoAvailability,
+  pastedStructureDepictionFromMolfile,
   rotateDocumentObject, nativeBondStereoFlipDisabledReason, openNativeDocument, type NativeBondOrderTarget
 } from "./documentWorkflow";
 import { createBondStereoActions, moleculeBondStereoCommandId, moleculeBondStereoForCommand } from "./commands";
@@ -149,6 +150,39 @@ describe("bond stereo commands", () => {
         expect(applyMoleculeBondStereo(mapped, [target], value, perceiveDoubleBondStereoFromMolfile)).toBe(mapped);
       }
       expect(mapped).toEqual(before);
+    }
+  });
+
+  it.each([undefined, false, true])("retains pasted SMILES atom maps and disables every E/Z action (open: %s)", openUnspecifiedDoubleBonds => {
+    const smiles = "[CH3:1]/[CH:2]=[CH:3]/[CH3:4]";
+    const depiction = pastedStructureDepictionFromMolfile(depictSmiles2D(smiles, { openUnspecifiedDoubleBonds: true }).molfile);
+    const base = createPhase4Document();
+    const document = insertSmilesMolecule(base, { x: 220, y: 220 }, depiction, smiles, { openUnspecifiedDoubleBonds });
+    const molecule = getSelectedMolecule(document)!;
+    expect(molecule.structureFormat).toBe("smiles");
+    expect(molecule.structure).toBe(smiles);
+    expect([...molecule.structure.matchAll(/:(\d+)\]/g)].map(match => Number(match[1]))).toEqual([1, 2, 3, 4]);
+    // Keeping the source must not alter the depiction, placed coordinates or native chemistry.
+    const unmapped = getSelectedMolecule(insertSmilesMolecule(base, { x: 220, y: 220 }, depiction,
+      smiles.replace(/:\d+/g, ""), { openUnspecifiedDoubleBonds }))!;
+    expect(molecule.atoms).toEqual(unmapped.atoms);
+    expect(molecule.bonds).toEqual(unmapped.bonds);
+    expect(molecule.chemistry).toEqual(unmapped.chemistry);
+    const bond = molecule.bonds.find(b => b.order === "double")!;
+    const target: NativeBondOrderTarget = { objectId: molecule.id, kind: "bond", bondId: bond.id,
+      fromAtomId: bond.fromAtomId, toAtomId: bond.toAtomId, distanceToPointer: 0 };
+    const reason = "Atom mapping must be removed before changing E/Z";
+    const state = nativeBondStereoAvailability(document, [target], perceiveDoubleBondStereoFromMolfile);
+    expect(state).toEqual({ eitherDisabledReason: reason, geometryDisabledReason: reason });
+    expect(nativeBondStereoFlipDisabledReason(document, [target], perceiveDoubleBondStereoFromMolfile)).toBe(reason);
+    const inspector = createMoleculeInspectorModel(document, { selectedObjectIds: [], selectedPart: target }, perceiveDoubleBondStereoFromMolfile);
+    expect(inspector.structure.bondStereo).toEqual(state);
+    expect(createBondStereoActions(inspector.structure.bondStereo!)).toEqual([
+      expect.objectContaining({ enabled: false, disabledReason: reason }),
+      expect.objectContaining({ enabled: false, disabledReason: reason })
+    ]);
+    for (const value of ["either", "geometry", "flipped"] as const) {
+      expect(applyMoleculeBondStereo(document, [target], value, perceiveDoubleBondStereoFromMolfile)).toBe(document);
     }
   });
 

@@ -76,7 +76,10 @@ describe("PreferencesWindow", () => {
   });
   it("renders the keybinding, refinement, engine, and force-field sections with their options", () => {
     const markup = renderToStaticMarkup(createElement(PreferencesWindow));
-    for (const heading of ["Keyboard shortcuts", "3D refinement", "Embedding engine", "Force field"]) {
+    expect(markup).toContain('<h2 id="preferences-keyboard">Keyboard</h2>');
+    expect(markup).toContain('<h2 id="pref-keybinding-scheme">Shortcut scheme</h2>');
+    expect(markup).toMatch(/<input[^>]*type="search"[^>]*aria-label="Search shortcuts"/);
+    for (const heading of ["3D refinement", "Embedding engine", "Force field"]) {
       expect(markup).toContain(heading);
     }
     for (const title of ["ChemDraft", "Classic desktop-compatible", "Fast", "Balanced", "Quality", "Automatic", "RDKit ETKDG", "OpenChemLib (legacy)", "MMFF94s", "MMFF94", "UFF"]) {
@@ -112,13 +115,22 @@ describe("PreferencesWindow", () => {
     expect(visibleText).not.toMatch(/chemdraw/i);
   });
 
-  it("defaults to chemdraft / quality / auto / mmff94s when nothing is stored", () => {
+  it("defaults to the industry-standard scheme / quality / auto / mmff94s when nothing is stored", () => {
     const markup = renderToStaticMarkup(createElement(PreferencesWindow));
     expect(markup.match(/data-selected="true"/g)).toHaveLength(5);
     expect(markup).toMatch(selected("default-double-bond", "offset"));
-    expect(markup).toMatch(selected("keybinding-scheme", "chemdraft"));
+    expect(markup).toMatch(selected("keybinding-scheme", "chemdraw"));
     expect(markup).toMatch(selected("spin3d-refinement-mode", "quality"));
     expect(markup).toMatch(selected("spin3d-engine", "auto"));
     expect(markup).toMatch(selected("spin3d-force-field", "mmff94s"));
+  });
+
+  it("keeps ChemDraft's scheme selected for an existing install that has it stored", () => {
+    // shortcutDefaultMigration.ts writes this on an existing install's first launch of 1.2.3.
+    storage.setItem(KEYBINDINGS_STORAGE_KEY, JSON.stringify({ scheme: "chemdraft" }));
+    const markup = renderToStaticMarkup(createElement(PreferencesWindow));
+    expect(markup.match(/data-selected="true"/g)).toHaveLength(5);
+    expect(markup).toMatch(selected("keybinding-scheme", "chemdraft"));
+    expect(markup).not.toMatch(selected("keybinding-scheme", "chemdraw"));
   });
 });

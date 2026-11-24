@@ -9,14 +9,21 @@ import {
 import { installSecondaryWindowEditHistory } from "./editHistoryRouting";
 import { installBrowserReloadGuard } from "./browserReloadGuard";
 import { acknowledgeFirstPaintOnce } from "./paletteFirstPaint";
+import { runShortcutDefaultMigration } from "./shortcutDefaultMigration";
 
-const MainWindow = lazy(() => import("./MainWindow").then(m => ({ default: m.MainWindow })));
+// The document window mounts only after the one-time shortcut-default migration has resolved the
+// scheme and put it in the webview cache (or, where it must not persist, in memory for this launch),
+// so its first render already uses it, and neither it nor any window it opens reads the new default
+// on an install not proven new.
+const MainWindow = lazy(() => Promise.all([import("./MainWindow"), runShortcutDefaultMigration()])
+  .then(([m]) => ({ default: m.MainWindow })));
 const PaletteWindow = lazy(() => import("./PaletteWindow").then(m => ({ default: m.PaletteWindow })));
 const PalettePopoverWindow = lazy(() => import("./PalettePopoverWindow").then(m => ({ default: m.PalettePopoverWindow })));
 const PaletteTooltipWindow = lazy(() => import("./PaletteTooltipWindow").then(m => ({ default: m.PaletteTooltipWindow })));
 const PluginPanelWindow = lazy(() => import("./plugins/PluginPanelWindow").then(m => ({ default: m.PluginPanelWindow })));
 const Spin3dDebuggerWindow = lazy(() => import("./Spin3dDebuggerWindow").then(m => ({ default: m.Spin3dDebuggerWindow })));
 const PreferencesWindow = lazy(() => import("./PreferencesWindow").then(m => ({ default: m.PreferencesWindow })));
+const BrowserAboutWindow = lazy(() => import("./about/AboutWindow").then(m => ({ default: m.BrowserAboutWindow })));
 const DialogWindow = lazy(() => import("./dialogs/DialogWindow").then(m => ({ default: m.DialogWindow })));
 const FileWarningsWindow = lazy(() => import("./FileWarningsWindow").then(m => ({ default: m.FileWarningsWindow })));
 
@@ -33,6 +40,9 @@ export function App() {
   }, []);
   if (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("window") === "fileWarnings") {
     return <Suspense fallback={null}><FileWarningsWindow /></Suspense>;
+  }
+  if (typeof window !== "undefined" && !isDesktopRuntime() && new URLSearchParams(window.location.search).get("window") === "about") {
+    return <Suspense fallback={<p role="status">Opening About ChemDraft…</p>}><BrowserAboutWindow /></Suspense>;
   }
   const dialog = dialogRoute();
   if (dialog !== undefined) {
