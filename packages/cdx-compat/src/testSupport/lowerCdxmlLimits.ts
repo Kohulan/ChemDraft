@@ -4,7 +4,7 @@
 import { cdxmlLimits, type CdxmlLimits } from "../cdxmlLimits";
 
 /** Runs `run` with some caps lowered; the previous values are restored afterwards. */
-export function withCdxmlLimitsForTesting<T>(overrides: Partial<CdxmlLimits>, run: () => T): T {
+export function withCdxmlLimitsForTesting<T>(overrides: Partial<{ -readonly [K in keyof CdxmlLimits]: number }>, run: () => T): T {
   const target = cdxmlLimits as { -readonly [K in keyof CdxmlLimits]: number };
   const saved = { ...target };
   Object.assign(target, overrides);

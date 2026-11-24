@@ -6,7 +6,7 @@
  * elements: those long synchronous loops blocked the vitest worker (Windows CI: "Timeout calling
  * onTaskUpdate"). The real values are pinned, unmocked, in `cdxmlLimits.test.ts`.
  */
-export const cdxmlLimits = Object.freeze({
+const frozenLimits = Object.freeze({
   /**
    * Import cap on the color table. CDX color indices are 16-bit and the table starts at index 2, so
    * nothing ChemDraw writes lists more than 65,534 colors, and export writes no index past 65535; a
@@ -74,4 +74,7 @@ export const cdxmlLimits = Object.freeze({
   rootPageAttributeCopyChars: 1_048_576,
 });
 
-export type CdxmlLimits = typeof cdxmlLimits;
+/** The caps with plain `number` fields, so tests can name lowered values; still read-only. */
+export type CdxmlLimits = { readonly [K in keyof typeof frozenLimits]: number };
+
+export const cdxmlLimits: CdxmlLimits = frozenLimits;
