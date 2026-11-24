@@ -2,6 +2,10 @@
 
 Owns page and object layout operations such as align, distribute, group, rotate, flip, z-order, guides, and page sizing.
 
+`textLayout.ts` wraps resized fixed-width text using the shared font/script metrics. Canvas, live
+SVG edit preview, export, text sizing and page-fit bounds share the resulting lines. Automatic text
+and attached reaction conditions keep authored newlines. Source text and span formatting are preserved.
+
 `textVisualBoundsForPageFit` measures both a text object's stored frame and the explicit lines SVG
 paints beyond that frame, using the shared font/script metrics, alignment and original rotation
 pivot. The desktop uses it before a page-enlargement question. The existing arrangement helper
