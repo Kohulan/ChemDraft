@@ -5960,6 +5960,57 @@ mod tests {
         assert!(message.validate().is_err());
     }
 
+    /// Finding on #422: a Guided Tour action that keeps the tour open reserves the terminal slot,
+    /// and the owner's `accepted` receipt does not clear it. The owner's closing receipt (what
+    /// `DialogCoordinator.ts` publishes once the action ran) does, so the next action goes through;
+    /// only an action still running holds the slot, as for every other dialog kind.
+    #[test]
+    fn guided_tour_actions_that_keep_the_tour_open_release_the_slot_on_the_owner_receipt() {
+        let mut registry = Registry::default();
+        let mut tour = snapshot();
+        tour.dialog_kind = "guidedTour".into();
+        tour.data = json!({"title":"Take the Tour", "scheme":"chemdraft", "automatic":false});
+        let (registration, _) = register(&mut registry, tour.clone(), false).unwrap();
+        let session = registry.sessions.get_mut(&registration.host_id).unwrap();
+        // Messages are built from the JSON the dialog window sends, then checked as `dialog_send` does.
+        let message = |request_id: &str, message_type: &str, data: Value| {
+            let mut message = tour.clone();
+            message.request_id = request_id.into();
+            message.message_type = message_type.into();
+            message.data = data;
+            let wire = serde_json::to_string(&message).unwrap();
+            let message: Message = serde_json::from_str(&wire).unwrap();
+            assert_eq!(message.validate(), Ok(()), "{wire}");
+            message
+        };
+        for (index, data) in [
+            json!({"action":"chooseShortcuts","scheme":"chemdraw"}),
+            json!({"action":"tryTourCommand","command":"help.tour.openSample"}),
+            json!({"action":"tryTourCommand","command":"analyze.molecularProperties"}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("keep-open-{index}");
+            let action = message(&id, "action", data);
+            assert!(reserve_action(session, &action).unwrap(), "{id}");
+            // While the owner is still running it, a second action waits (cancel never does).
+            let finish = message("finish-early", "action", json!({"action":"finish"}));
+            assert!(reserve_action(session, &finish).is_err(), "{id}");
+            // `accepted` keeps the reservation; the closing receipt releases it.
+            let accepted = message(&id, "result", json!({"status":"accepted"}));
+            assert_eq!(accepted.data["status"], "accepted");
+            assert_eq!(session.terminal_request.as_ref(), Some(&id));
+            complete_action(
+                session,
+                &message(&id, "result", json!({"status":"cancelled"})),
+            );
+            assert!(session.terminal_request.is_none(), "{id}");
+        }
+        let finish = message("finish", "action", json!({"action":"finish"}));
+        assert!(reserve_action(session, &finish).unwrap());
+    }
+
     #[test]
     fn guided_tour_opens_only_the_plugin_authoring_guide() {
         let mut message = snapshot();
