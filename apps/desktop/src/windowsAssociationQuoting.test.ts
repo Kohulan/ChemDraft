@@ -26,16 +26,18 @@ const pre = macroBody("NSIS_HOOK_PREUNINSTALL");
 const post = macroBody("NSIS_HOOK_POSTUNINSTALL");
 
 // ---------------------------------------------------------------------------------------------
-// A small interpreter for the NSIS subset the hook uses, over an in-memory registry for SHCTX.
-// It runs the hook's own text, so the scenarios below exercise the real logic. Macro parameters and
-// defines are substituted as text, as makensis does; LogicLib's If and Do blocks are parsed into a
-// tree. Tauri's APP_ASSOCIATE and APP_UNASSOCIATE (FileAssociation.nsh, Tauri CLI 2.11.2) and the
+// A small interpreter for the NSIS subset the hook uses, over an in-memory registry with separate
+// HKCU and HKLM hives. HKCR is their merged view (a key in HKCU shadows the same key in HKLM), and
+// SHCTX is HKLM for an all-users install and HKCU for a per-user one. It runs the hook's own text, so
+// the scenarios below exercise the real logic. Macro parameters and defines are substituted as text,
+// as makensis does, and the !if/!else/!endif lines in a macro are then resolved against them;
+// LogicLib's If and Do blocks are parsed into a tree. Tauri's APP_ASSOCIATE and APP_UNASSOCIATE (FileAssociation.nsh, Tauri CLI 2.11.2) and the
 // install and uninstall sections around the hooks are modeled in JS.
 // ---------------------------------------------------------------------------------------------
 
 type RegKey = { name: string; values: Map<string, { name: string; data: string }> };
 
-class Registry {
+class Hive {
   keys = new Map<string, RegKey>();
 
   private norm(path: string) {
@@ -83,6 +85,61 @@ class Registry {
       if (name === this.norm(path) || name.startsWith(prefix)) this.keys.delete(name);
     }
   }
+}
+
+// The template's INSTALLMODE; `both` adds MultiUser.nsh's runtime choice.
+type InstallMode = "currentUser" | "perMachine" | "both:AllUsers" | "both:CurrentUser";
+
+const CLASSES = "Software\\Classes\\";
+
+// One machine as seen by the account running the installer. Its own methods address SHCTX.
+class Registry {
+  hkcu = new Hive();
+  hklm = new Hive();
+
+  constructor(readonly mode: InstallMode = "currentUser") {}
+
+  get allUsers() {
+    return this.mode === "perMachine" || this.mode === "both:AllUsers";
+  }
+
+  get shctx() {
+    return this.allUsers ? this.hklm : this.hkcu;
+  }
+
+  hive(root: string) {
+    if (root === "SHCTX") return this.shctx;
+    if (root === "HKCU") return this.hkcu;
+    if (root === "HKLM") return this.hklm;
+    throw new Error(`Unexpected registry root ${root}`);
+  }
+
+  // HKCR: a key this user has in HKCU\Software\Classes shadows the machine's; subkeys are merged.
+  classesKey(path: string) {
+    return this.hkcu.key(CLASSES + path) ?? this.hklm.key(CLASSES + path);
+  }
+
+  classesSubkeys(path: string) {
+    const names = new Map<string, string>();
+    for (const name of [...this.hkcu.subkeys(CLASSES + path), ...this.hklm.subkeys(CLASSES + path)]) {
+      if (!names.has(name.toLowerCase())) names.set(name.toLowerCase(), name);
+    }
+    return [...names.values()];
+  }
+
+  // The open command .chemdraft's owner has for everyone this scope serves: the machine's class for
+  // an all-users install, the class this user sees (HKCR) for a per-user one.
+  openCommand(progId: string) {
+    const path = `${progId}\\shell\\open\\command`;
+    return this.allUsers ? this.hklm.read(CLASSES + path, "") : this.classesKey(path)?.values.get("")?.data;
+  }
+
+  key(path: string) { return this.shctx.key(path); }
+  ensure(path: string) { return this.shctx.ensure(path); }
+  read(path: string, name: string) { return this.shctx.read(path, name); }
+  write(path: string, name: string, data: string) { this.shctx.write(path, name, data); }
+  deleteValue(path: string, name: string) { this.shctx.deleteValue(path, name); }
+  deleteKey(path: string, ifEmpty = false) { this.shctx.deleteKey(path, ifEmpty); }
 }
 
 function tokenize(line: string) {
@@ -194,6 +251,8 @@ class Nsis {
     for (const match of hook.matchAll(/^Var\s+(\S+)/gm)) this.vars.set(match[1]!, "");
     for (const name of ["0", "1", "INSTDIR"]) this.vars.set(name, "");
     this.vars.set("INSTDIR", build.instDir);
+    // MultiUser.nsh declares this only in `both` mode.
+    if (reg.mode.startsWith("both:")) this.vars.set("MultiUser.InstallMode", reg.mode === "both:AllUsers" ? "AllUsers" : "CurrentUser");
     const macroDefs = hook.matchAll(/^!macro\s+(\S+)([^\n]*)\n([\s\S]*?)^!macroend/gm);
     for (const [, name, params, body] of macroDefs) {
       this.macros.set(name!, { params: params!.trim().split(/\s+/).filter(Boolean), body: body!.split("\n") });
@@ -231,10 +290,44 @@ class Nsis {
     this.vars.set(name, value);
   }
 
-  regPath(root: string, key: string) {
-    if (root === "SHCTX") return key;
-    if (root === "HKCR") return `Software\\Classes\\${key}`;
-    throw new Error(`Unexpected registry root ${root}`);
+  get installMode() {
+    return this.reg.mode.startsWith("both:") ? "both" : this.reg.mode;
+  }
+
+  // makensis's !if, !else [if] and !endif inside a macro body, after defines are substituted.
+  preprocess(lines: string[]) {
+    const out: string[] = [];
+    const open: Array<{ parent: boolean; taken: boolean; active: boolean }> = [];
+    const active = () => open.length === 0 || open[open.length - 1]!.active;
+    const test = (tokens: string[], raw: string) => {
+      if (tokens.length !== 3) throw new Error(`Unsupported directive ${raw}`);
+      const [a, op, b] = tokens;
+      if (op === "==") return a!.toLowerCase() === b!.toLowerCase();
+      if (op === "!=") return a!.toLowerCase() !== b!.toLowerCase();
+      throw new Error(`Unsupported directive ${raw}`);
+    };
+    for (const raw of lines) {
+      const [cmd, ...rest] = tokenize(raw.trim());
+      if (cmd === "!if") {
+        const parent = active();
+        const value = parent && test(rest, raw);
+        open.push({ parent, taken: value, active: value });
+      } else if (cmd === "!else") {
+        const entry = open[open.length - 1];
+        if (!entry) throw new Error(`Unbalanced ${raw}`);
+        const value = rest[0] === "if" ? test(rest.slice(1), raw) : true;
+        entry.active = entry.parent && !entry.taken && value;
+        entry.taken ||= entry.active;
+      } else if (cmd === "!endif") {
+        if (!open.pop()) throw new Error(`Unbalanced ${raw}`);
+      } else if (cmd?.startsWith("!") && cmd !== "!insertmacro") {
+        throw new Error(`Unsupported directive ${raw}`);
+      } else if (active()) {
+        out.push(raw);
+      }
+    }
+    if (open.length > 0) throw new Error("Unclosed !if");
+    return out;
   }
 
   cond(tokens: string[]) {
@@ -278,12 +371,13 @@ class Nsis {
     if (args.length !== def.params.length) throw new Error(`${macro} expects ${def.params.length} arguments`);
     const defines: Record<string, string> = {
       MAINBINARYNAME: "chemdraft",
+      INSTALLMODE: this.installMode,
       UNINSTKEY: this.uninstKey,
       CHEMDRAFT_ASSOCIATION_PROGID: this.build.progId,
       ...Object.fromEntries(def.params.map((param, index) => [param, args[index]!])),
     };
     const lines = def.body.map((line) => line.replace(/\$\{([A-Za-z_]\w*)\}/g, (whole, name: string) => defines[name] ?? whole));
-    if (this.exec(parse(lines)) === "exit") throw new Error(`\${ExitDo} outside a loop in ${macro}`);
+    if (this.exec(parse(this.preprocess(lines))) === "exit") throw new Error(`\${ExitDo} outside a loop in ${macro}`);
   }
 
   exec(nodes: Node[]): "exit" | undefined {
@@ -312,31 +406,37 @@ class Nsis {
       case "${ExitDo}":
         return "exit";
       case "ReadRegStr": {
-        const value = this.reg.read(this.regPath(rest[1]!, x(2)), x(3));
+        const value = rest[1] === "HKCR"
+          ? this.reg.classesKey(x(2))?.values.get(x(3).toLowerCase())?.data
+          : this.reg.hive(rest[1]!).read(x(2), x(3));
         if (value === undefined) this.error = true;
         this.setVar(rest[0]!, value ?? "");
         break;
       }
       case "WriteRegStr":
-        this.reg.write(this.regPath(rest[0]!, x(1)), x(2), x(3));
+        this.reg.hive(rest[0]!).write(x(1), x(2), x(3));
         break;
       case "DeleteRegValue":
-        this.reg.deleteValue(this.regPath(rest[0]!, x(1)), x(2));
+        this.reg.hive(rest[0]!).deleteValue(x(1), x(2));
         break;
       case "DeleteRegKey": {
         const ifEmpty = rest[0] === "/ifempty";
         const args = ifEmpty ? rest.slice(1) : rest;
         const path = this.expand(args[1]!);
         if (/\\$/.test(path) || path.toLowerCase() === "software\\classes") throw new Error(`Refusing to delete ${path}`);
-        this.reg.deleteKey(this.regPath(args[0]!, path), ifEmpty);
+        this.reg.hive(args[0]!).deleteKey(path, ifEmpty);
         break;
       }
       case "EnumRegKey":
       case "EnumRegValue": {
-        const path = this.regPath(rest[1]!, x(2));
-        const key = this.reg.key(path);
+        const hkcr = rest[1] === "HKCR";
+        const hive = hkcr ? undefined : this.reg.hive(rest[1]!);
+        const path = x(2);
+        const key = hive ? hive.key(path) : this.reg.classesKey(path);
         if (!key) { this.error = true; this.setVar(rest[0]!, ""); break; }
-        const names = cmd === "EnumRegKey" ? this.reg.subkeys(path) : [...key.values.values()].map((v) => v.name);
+        const names = cmd === "EnumRegValue"
+          ? [...key.values.values()].map((v) => v.name)
+          : hive ? hive.subkeys(path) : this.reg.classesSubkeys(path);
         this.setVar(rest[0]!, names[Number(x(3))] ?? "");
         break;
       }
@@ -388,7 +488,8 @@ function uninstKey(build: Build) {
 const classKey = (progId: string) => `Software\\Classes\\${progId}`;
 const command = (reg: Registry, build: Build) => reg.read(`${classKey(build.progId)}\\shell\\open\\command`, "");
 const quoted = (build: Build) => `"${build.instDir}\\chemdraft.exe" "%1"`;
-const opens = (reg: Registry, progId: string) => reg.key(`${classKey(progId)}\\shell\\open\\command`) !== undefined;
+// A class opens .chemdraft only when its open command has a value, in the scope .chemdraft is in.
+const opens = (reg: Registry, progId: string) => (reg.openCommand(progId) ?? "") !== "";
 
 function registerProgram(reg: Registry, progId: string) {
   reg.write(`${classKey(progId)}\\shell\\open\\command`, "", `${progId}.exe "%1"`);
@@ -471,7 +572,14 @@ describe("Windows file association quoting", () => {
 
   it("never hard-codes either build's ProgID", () => {
     expect(hook).not.toMatch(/^[^;\n]*"[^"\n]*ChemDraft Document/m);
-    expect(hook).not.toMatch(/^\s*(?:ReadRegStr|WriteRegStr|DeleteRegKey|DeleteRegValue)\s+(?:\/ifempty\s+)?(?:HKCU|HKLM|HKCR)\b/m);
+    // Everything is written in the install's own scope.
+    expect(hook).not.toMatch(/^\s*(?:WriteRegStr|WriteRegExpandStr|DeleteRegKey|DeleteRegValue)\s+(?:\/ifempty\s+)?(?:HKCU|HKLM|HKCR)\b/m);
+    // Fixed hives are only read, to check an owner's open command, and HKCR is never used.
+    expect(hook).not.toMatch(/^[^;\n]*\bHKCR\b/m);
+    const fixed = (text: string) => text.match(/^\s*\S+\s+\S+\s+(?:HKCU|HKLM)\b/gm) ?? [];
+    const validation = macroBody("ChemDraftUserOpenCommand") + macroBody("ChemDraftHasOpenCommand");
+    expect(fixed(hook)).toEqual(fixed(validation));
+    expect(fixed(validation).length).toBeGreaterThan(0);
   });
 });
 
@@ -675,15 +783,16 @@ describe("Windows file association owner across reinstalls and updates", () => {
   });
 
   const orders = [[stable, dev], [dev, stable]] as const;
+  for (const mode of ["currentUser", "perMachine"] as const)
   for (const foreign of [true, false]) {
     for (const [first, second] of orders) {
       for (const reinstallFirst of [false, true]) {
         for (const uninstallFirst of [first, second]) {
           const other = uninstallFirst === first ? second : first;
-          const name = `${foreign ? "with" : "without"} an original owner: install ${first.productName}, then ${second.productName}` +
+          const name = `${mode}, ${foreign ? "with" : "without"} an original owner: install ${first.productName}, then ${second.productName}` +
             `${reinstallFirst ? `, reinstall ${first.productName}` : ""}; uninstall ${uninstallFirst.productName} first`;
           it(name, () => {
-            const reg = new Registry();
+            const reg = new Registry(mode);
             if (foreign) {
               registerProgram(reg, "Notepad.Doc");
               reg.write(EXT, "", "Notepad.Doc");
@@ -815,4 +924,117 @@ describe("Windows file association ownership ignores ProgID case", () => {
     expect(reg.read(`${classKey("Notepad.Doc")}\\shell\\open\\command`, "")).toBe("Notepad.Doc.exe \"%1\"");
     expectGone(reg, stable);
   });
+});
+
+describe("Windows file association owner validation", () => {
+  const COMMAND = (progId: string) => `${classKey(progId)}\\shell\\open\\command`;
+
+  // An owner whose class has an open command key, but one that opens nothing.
+  const hollow = {
+    "with no default value": (hive: Hive, progId: string) => { hive.ensure(COMMAND(progId)); },
+    "with an empty default value": (hive: Hive, progId: string) => { hive.write(COMMAND(progId), "", ""); },
+  };
+
+  for (const [what, leave] of Object.entries(hollow)) {
+    it(`does not restore the owner this build replaced when its open command key is left ${what}`, () => {
+      for (const mode of ["currentUser", "perMachine"] as const) {
+        const reg = new Registry(mode);
+        registerProgram(reg, "Notepad.Doc");
+        reg.write(EXT, "", "Notepad.Doc");
+        install(reg, stable);
+        reg.deleteKey(classKey("Notepad.Doc"));
+        leave(reg.shctx, "Notepad.Doc");
+        uninstall(reg, stable);
+        expect(reg.read(EXT, "")).toBeUndefined();
+        expect(reg.key(EXT)).toBeUndefined();
+        expectGone(reg, stable);
+      }
+    });
+
+    it(`does not write back a later owner whose open command key is left ${what}`, () => {
+      for (const mode of ["currentUser", "perMachine"] as const) {
+        const reg = new Registry(mode);
+        install(reg, stable);
+        leave(reg.shctx, "Later.Editor");
+        reg.write(EXT, "", "Later.Editor");
+        uninstall(reg, stable);
+        expect(reg.read(EXT, "")).toBeUndefined();
+        expect(reg.key(EXT)).toBeUndefined();
+        expectGone(reg, stable);
+      }
+    });
+  }
+
+  for (const mode of ["perMachine", "both:AllUsers"] as const) {
+    it(`${mode}: does not restore into HKLM an owner whose class only the uninstalling administrator has`, () => {
+      const reg = new Registry(mode);
+      registerProgram(reg, "Admin.Viewer");
+      reg.write(EXT, "", "Admin.Viewer");
+      install(reg, stable);
+      // The administrator's own class: HKCR shows it to them, but no other user has it.
+      reg.hklm.deleteKey(classKey("Admin.Viewer"));
+      reg.hkcu.write(COMMAND("Admin.Viewer"), "", "Admin.Viewer.exe \"%1\"");
+      uninstall(reg, stable);
+      expect(reg.hklm.read(EXT, "")).toBeUndefined();
+      expect(reg.hklm.key(EXT)).toBeUndefined();
+      expect(reg.hkcu.read(COMMAND("Admin.Viewer"), "")).toBe("Admin.Viewer.exe \"%1\"");
+      expectGone(reg, stable);
+    });
+
+    it(`${mode}: does not write back a later owner whose class only the uninstalling administrator has`, () => {
+      const reg = new Registry(mode);
+      install(reg, stable);
+      reg.hkcu.write(COMMAND("Later.Editor"), "", "Later.Editor.exe \"%1\"");
+      reg.hklm.write(EXT, "", "Later.Editor");
+      uninstall(reg, stable);
+      expect(reg.hklm.key(EXT)).toBeUndefined();
+      expectGone(reg, stable);
+    });
+
+    it(`${mode}: restores an owner whose class is registered for the machine`, () => {
+      const reg = new Registry(mode);
+      reg.hklm.write(COMMAND("Machine.Viewer"), "", "Machine.Viewer.exe \"%1\"");
+      reg.hklm.write(EXT, "", "Machine.Viewer");
+      install(reg, stable);
+      install(reg, stable);
+      uninstall(reg, stable);
+      expectOwner(reg, "Machine.Viewer");
+      expect(reg.hkcu.key(EXT)).toBeUndefined();
+      expectGone(reg, stable);
+    });
+  }
+
+  for (const mode of ["currentUser", "both:CurrentUser"] as const) {
+    it(`${mode}: restores an owner whose class is registered only for the machine`, () => {
+      const reg = new Registry(mode);
+      reg.hklm.write(COMMAND("Machine.Viewer"), "", "Machine.Viewer.exe \"%1\"");
+      reg.hkcu.write(EXT, "", "Machine.Viewer");
+      install(reg, stable);
+      uninstall(reg, stable);
+      expect(reg.hkcu.read(EXT, "")).toBe("Machine.Viewer");
+      expectOwner(reg, "Machine.Viewer");
+      expectGone(reg, stable);
+    });
+
+    it(`${mode}: keeps a later owner whose class is registered only for the machine`, () => {
+      const reg = new Registry(mode);
+      install(reg, stable);
+      reg.hklm.write(COMMAND("Later.Editor"), "", "Later.Editor.exe \"%1\"");
+      reg.hkcu.write(EXT, "", "Later.Editor");
+      uninstall(reg, stable);
+      expectOwner(reg, "Later.Editor");
+      expectGone(reg, stable);
+    });
+
+    it(`${mode}: does not restore an owner whose empty class of this user's shadows the machine's`, () => {
+      const reg = new Registry(mode);
+      reg.hklm.write(COMMAND("Machine.Viewer"), "", "Machine.Viewer.exe \"%1\"");
+      reg.hkcu.write(EXT, "", "Machine.Viewer");
+      install(reg, stable);
+      reg.hkcu.write(COMMAND("Machine.Viewer"), "", "");
+      uninstall(reg, stable);
+      expect(reg.hkcu.key(EXT)).toBeUndefined();
+      expectGone(reg, stable);
+    });
+  }
 });

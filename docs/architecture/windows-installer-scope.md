@@ -134,9 +134,9 @@ ProgID comparison is case-insensitive, as registry key names are.
   restores the install scope with `SetContext`, since optional app-data deletion switches the shell
   context to the current user, then deletes this build's class.
 - If this build **was** the owner, `.chemdraft` goes back to the owner it replaced: the program that
-  owned it before ChemDraft, or the other ChemDraft build. If that class no longer has a
-  `shell\open\command` in `HKCR` (it was uninstalled since), or nothing owned `.chemdraft` before,
-  the default is removed instead.
+  owned it before ChemDraft, or the other ChemDraft build. If that class no longer has a usable open
+  command (it was uninstalled since; see below), or nothing owned `.chemdraft` before, the default is
+  removed instead.
 - If the default before uninstall was **not** this build's ProgID (another program, or the other
   ChemDraft build, claimed `.chemdraft` later), that owner is put back over Tauri's restored backup
   while its class still has an open command; otherwise the default is removed. A missing default
@@ -144,6 +144,17 @@ ProgID comparison is case-insensitive, as registry key names are.
   owner, has its backup pointed at the owner this build replaced, so a later uninstall of it restores
   a live class rather than this build's deleted one. That backup is the only value of another owner
   the hook changes, and only when it names this build.
+- An owner's class is usable only when its `shell\open\command` key has a non-empty default value;
+  a command key that another program's uninstaller left empty, or without a default value, opens
+  nothing and is treated as gone. The check reads the same scope the association is written to, not
+  `HKCR`. An all-users uninstall checks `HKLM\Software\Classes` only: `HKCR` would also show the
+  uninstalling administrator's own `HKCU` classes, which no other user has, so a class registered only
+  there would be written into `HKLM` and be broken for everyone else. A per-user uninstall checks the
+  class this user sees, as `HKCR` merges it: `HKCU\Software\Classes` when it has the command key
+  (which then shadows the machine's), otherwise `HKLM\Software\Classes`. The scope comes from the
+  template's `INSTALLMODE` define at compile time, and from `$MultiUser.InstallMode` at run time in
+  `both` mode, which ChemDraft does not build. These reads of `HKCU` and `HKLM` are the hook's only
+  use of a fixed hive; everything it writes or deletes goes through `SHCTX`.
 - It deletes this build's ProgID tree, its own `<ProgID>_backup` value, and only its own value
   under `.chemdraft\OpenWithProgids`. Another program's or the other build's ProgID and OpenWith
   entries are never touched.
@@ -158,22 +169,30 @@ its predecessor to a self-backup, so its uninstall removes the default rather th
 only once by such a release still has Tauri's backup, and the first update under these hooks keeps it.
 
 `apps/desktop/src/windowsAssociationQuoting.test.ts` runs the hook's own text through a small
-interpreter for the NSIS commands it uses (including LogicLib's `If` and `Do` blocks), over an
-in-memory registry, with Tauri's association macros and the install and uninstall sections around the
-hooks modeled after the saved template. It covers a program that owned `.chemdraft` before install
-surviving a reinstall and `/UPDATE` and being restored on uninstall, an interrupted reinstall, an
-upgrade that runs the old uninstaller first, stable and dev builds installed in either order (with
-and without an earlier owner, with reinstalls between) and uninstalled in either order, a missing
-recorded ProgID with a ChemDraft-owned or a foreign default, an interrupted first install, a program
-that claimed `.chemdraft` afterward, a later owner or saved owner whose class is gone, another
-program's OpenWith entry, a missing default, and case-only ProgID changes (checking that the restored
-class still has its open command). Every uninstall also checks that nothing the build registered
-remains. It does not execute NSIS, and the compile-time `!error` guard is checked only as text. The
-cleanup still requires real Windows tests of the CI-built installers. Check silent `/S` uninstall after
-a clean install, a reinstall and an `/UPDATE`, a stable and a dev build side by side in both orders
-with another program owning `.chemdraft` first, a changed or missing default, another program's
-OpenWith entry, and uninstall with app-data removal selected. Confirm cleanup in the correct registry
-hive and preservation of associations owned by another program.
+interpreter for the NSIS commands it uses (including LogicLib's `If` and `Do` blocks and the
+compile-time `!if` on `INSTALLMODE`), over an in-memory registry with separate `HKCU` and `HKLM`
+hives, `HKCR` as their merged view (`HKCU` wins) and `SHCTX` mapped to `HKLM` for all-users and
+`HKCU` for per-user installs, with Tauri's association macros and the install and uninstall sections
+around the hooks modeled after the saved template. It covers a program that owned `.chemdraft`
+before install surviving a reinstall and `/UPDATE` and being restored on uninstall, an interrupted
+reinstall, an upgrade that runs the old uninstaller first, stable and dev builds installed in either
+order (with and without an earlier owner, with reinstalls between) and uninstalled in either order,
+a missing recorded ProgID with a ChemDraft-owned or a foreign default, an interrupted first install,
+a program that claimed `.chemdraft` afterward, a later owner or saved owner whose class is gone,
+another program's OpenWith entry, a missing default, and case-only ProgID changes (checking that the
+restored class still has its open command). The stable and dev matrix runs in both scopes. Owner
+validation is covered by an open command key left empty or without a default value (never restored),
+an all-users uninstall whose owner's class exists only in the administrator's `HKCU` (never written
+into `HKLM`), a per-user uninstall whose owner's class exists only in `HKLM` (restored), and a
+user's empty class shadowing a valid machine class (not restored), in `both` mode as well. Every
+uninstall also checks that nothing the build registered remains. It does not execute NSIS, and the
+compile-time `!error` guard is checked only as text. The cleanup still requires real Windows tests
+of the CI-built installers. Check silent `/S` uninstall after a clean install, a reinstall and an
+`/UPDATE`, a stable and a dev build side by side in both orders with another program owning
+`.chemdraft` first, a changed or missing default, another program's OpenWith entry, an earlier owner
+whose class an administrator has only in their own `HKCU` during an all-users uninstall, and
+uninstall with app-data removal selected. Confirm cleanup in the correct registry hive and
+preservation of associations owned by another program.
 
 ## Updates require administrator rights for the machine install
 

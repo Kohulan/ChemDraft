@@ -17,8 +17,8 @@
 ; keep the owner this build really replaced in `<ProgID>_backup`, with a copy in the uninstall key,
 ; and on uninstall hand .chemdraft (or, if another owner has replaced this build since, that owner's
 ; backup) to it. Every ProgID comparison is case-insensitive, as registry key names are (LogicLib's
-; == and != use StrCmp), and a ProgID is only ever made the default when its class still has an open
-; command.
+; == and != use StrCmp), and a ProgID is only ever made the default when its class still has a
+; non-empty open command in the scope being written (see ChemDraftHasOpenCommand).
 
 !define CHEMDRAFT_ASSOCIATION_PROGID "$%CHEMDRAFT_ASSOCIATION_PROGID%"
 ; An unset variable is left as written, so the name would still contain itself.
@@ -56,14 +56,40 @@ Var ChemDraftAssociationScratch
   ${EndIf}
 !macroend
 
-; Sets OUT to 1 when PROGID names a class with an open command in HKCR (this user's classes over the
-; machine's); otherwise 0.
+; Sets OUT to the open command PROGID has for the user running this uninstaller: this user's class
+; (HKCU) when it has an open command key, which shadows the machine's, otherwise the machine's (HKLM).
+; This is the merged view HKCR gives that user. Empty when neither has a command value.
+!macro ChemDraftUserOpenCommand OUT PROGID
+  ClearErrors
+  EnumRegKey ${OUT} HKCU "Software\Classes\${PROGID}\shell\open\command" 0
+  ${If} ${Errors}
+    ReadRegStr ${OUT} HKLM "Software\Classes\${PROGID}\shell\open\command" ""
+  ${Else}
+    ReadRegStr ${OUT} HKCU "Software\Classes\${PROGID}\shell\open\command" ""
+  ${EndIf}
+!macroend
+
+; Sets OUT to 1 when PROGID names a class whose open command has a non-empty value in the scope
+; SHCTX writes .chemdraft to; otherwise 0. A command key left without a value opens nothing. An
+; all-users uninstall checks HKLM only: HKCR would also show the uninstalling administrator's own
+; HKCU classes, which no other user has. A per-user uninstall checks the class this user sees.
+; INSTALLMODE is the template's define (perMachine, currentUser or both); MultiUser.nsh sets
+; $MultiUser.InstallMode only in `both` mode.
 !macro ChemDraftHasOpenCommand OUT PROGID
   StrCpy ${OUT} 0
   ${If} "${PROGID}" != ""
-    ClearErrors
-    EnumRegKey $ChemDraftAssociationScratch HKCR "${PROGID}\shell\open\command" 0
-    ${IfNot} ${Errors}
+    !if "${INSTALLMODE}" == "perMachine"
+      ReadRegStr $ChemDraftAssociationScratch HKLM "Software\Classes\${PROGID}\shell\open\command" ""
+    !else if "${INSTALLMODE}" == "both"
+      ${If} $MultiUser.InstallMode == "AllUsers"
+        ReadRegStr $ChemDraftAssociationScratch HKLM "Software\Classes\${PROGID}\shell\open\command" ""
+      ${Else}
+        !insertmacro ChemDraftUserOpenCommand $ChemDraftAssociationScratch "${PROGID}"
+      ${EndIf}
+    !else
+      !insertmacro ChemDraftUserOpenCommand $ChemDraftAssociationScratch "${PROGID}"
+    !endif
+    ${If} $ChemDraftAssociationScratch != ""
       StrCpy ${OUT} 1
     ${EndIf}
   ${EndIf}
