@@ -1202,6 +1202,35 @@ describe("clipboard-adapter", () => {
     expect(isMarkupType("chemical/x-mdl-molfile")).toBe(false);
   });
 
+  it("classifies markup exactly as the Linux reader's is_markup_type", () => {
+    // Keep in step with markup_types_match_the_clipboard_adapter in
+    // apps/desktop/src-tauri/src/linux_clipboard.rs.
+    for (const type of [
+      "text/html",
+      "public.html",
+      "text/rtf",
+      "public.rtf",
+      "text/richtext",
+      "text/enriched",
+      "com.apple.webarchive",
+      "application/x-webarchive",
+      "application/x-web-archive",
+      "Apple Web Archive pasteboard type",
+      "  TEXT/HTML  "
+    ]) {
+      expect(isMarkupType(type), type).toBe(true);
+    }
+    for (const type of [
+      "text/plain",
+      "chemical/x-mdl-molfile",
+      "application/x-web",
+      "web/archived-not",
+      "image/svg+xml"
+    ]) {
+      expect(isMarkupType(type), type).toBe(false);
+    }
+  });
+
   it("reports vector-only pasteboards instead of pretending they are chemistry", () => {
     expect(isVectorArtworkType("public.pdf")).toBe(true);
 
@@ -1327,6 +1356,18 @@ describe("markup flavors are never pasted as text", () => {
         { type: "text/markdown", text: "Yield 92**%** after 2 h" },
         { type: "text/plain;charset=utf-16", text: "Yield 92% after 2 h" }
       ]
+    });
+
+    expect(detected).toMatchObject({ kind: "plain-text", text: "Yield 92% after 2 h" });
+  });
+
+  it("pastes the plain text the Linux reader keeps when text/enriched repeats it", () => {
+    // An owner offering text/enriched and byte-identical plain text at the same priority: the
+    // Linux reader keeps the plain-text copy (as `text/plain`) and drops the enriched repeat,
+    // because an enriched item alone is markup and would leave nothing to paste.
+    const detected = inspectClipboardPayload({
+      types: ["text/enriched", "text/plain"],
+      textItems: [{ type: "text/plain", text: "Yield 92% after 2 h" }]
     });
 
     expect(detected).toMatchObject({ kind: "plain-text", text: "Yield 92% after 2 h" });

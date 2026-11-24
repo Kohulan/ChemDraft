@@ -249,11 +249,27 @@ fn looks_like_chemistry_text(text: &str) -> bool {
                 .all(|byte| br"BCNOFPSIHbcnops0123456789@+[]().=#$*%-/\".contains(&byte)))
 }
 
+/// Whether a reader should preview a flavor's bytes for chemistry before it plans admission.
+/// Every plain-text flavor is previewed, and so is `text/richtext`: it is read after plain text as
+/// prose (priority 3), but a molfile or SMILES carried under that name must still be admitted
+/// ahead of pictures, as it was before that demotion. The chemistry sniff does not follow the
+/// prose priority. RTF and HTML documents are never previewed.
+pub(crate) fn previews_text_for_chemistry(kind: &str, priority: Option<u8>) -> bool {
+    match priority {
+        Some(2) => true,
+        Some(3) => {
+            let lower = kind.to_ascii_lowercase();
+            lower.contains("richtext") && !lower.contains("rtf") && !lower.contains("html")
+        }
+        _ => false,
+    }
+}
+
 /// Sniff only bounded text to place chemistry carried in plain text before pictures.
 /// This affects admission order, never the returned text order or format resolution.
 pub(crate) fn text_priority_with_preview(kind: &str, bytes: &[u8]) -> Option<u8> {
     let priority = text_read_priority(kind)?;
-    if priority == 2 {
+    if previews_text_for_chemistry(kind, Some(priority)) {
         let preview = &bytes[..bytes.len().min(8192)];
         if crate::decode_clipboard_text_bytes(preview)
             .is_some_and(|text| looks_like_chemistry_text(&text))
@@ -675,6 +691,40 @@ mod tests {
             Some(3)
         );
         assert_eq!(text_priority_with_preview("public.pdf", b"%PDF"), None);
+    }
+
+    #[test]
+    fn richtext_keeps_its_chemistry_preview_after_the_prose_demotion() {
+        // `text/richtext` reads after plain text as prose, but chemistry carried under that name
+        // is still admitted ahead of pictures, on every platform.
+        for kind in ["text/richtext", "Text/RichText"] {
+            assert!(
+                previews_text_for_chemistry(kind, text_read_priority(kind)),
+                "{kind}"
+            );
+            assert_eq!(text_priority_with_preview(kind, b"CCO"), Some(0), "{kind}");
+            assert_eq!(
+                text_priority_with_preview(kind, b"<CDXML>"),
+                Some(0),
+                "{kind}"
+            );
+            assert_eq!(
+                text_priority_with_preview(kind, b"{\\rtf1\\ansi Yield 92%}"),
+                Some(3),
+                "{kind}"
+            );
+        }
+        // RTF and HTML documents keep their unpreviewed place after plain text.
+        for kind in ["text/rtf", "public.rtf", "text/html", "public.html"] {
+            assert!(
+                !previews_text_for_chemistry(kind, text_read_priority(kind)),
+                "{kind}"
+            );
+            assert_eq!(text_priority_with_preview(kind, b"CCO"), Some(3), "{kind}");
+        }
+        assert!(previews_text_for_chemistry("text/plain", Some(2)));
+        assert!(!previews_text_for_chemistry("text/richtext", None));
+        assert!(!previews_text_for_chemistry("chemical/x-cdxml", Some(0)));
     }
 
     #[test]

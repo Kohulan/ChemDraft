@@ -91,6 +91,8 @@ use tauri::{
     webview::PageLoadEvent,
     Emitter, Listener, Manager, RunEvent, Runtime, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
+// Linux builds every message prompt through `appimage_dialogs::prompt`.
+#[cfg(not(target_os = "linux"))]
 use tauri_plugin_dialog::DialogExt;
 use webview_context_menus::disable_default_context_menus;
 
@@ -2246,13 +2248,26 @@ fn check_for_updates<R: Runtime>(app: &tauri::AppHandle<R>) {
     if update_check_route(&app.config().identifier, feed_url.as_deref())
         == UpdateCheckRoute::DevelopmentNotice
     {
-        let mut message = app
-            .dialog()
-            .message(DEVELOPMENT_UPDATES_MESSAGE)
-            .title("ChemDraft Update");
-        if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-            message = message.parent(&window);
-        }
+        // Linux shows every prompt through the GTK-safe path, which also keeps it above the
+        // document window.
+        #[cfg(target_os = "linux")]
+        let message = appimage_dialogs::prompt(
+            app,
+            None,
+            Some("ChemDraft Update"),
+            DEVELOPMENT_UPDATES_MESSAGE,
+        );
+        #[cfg(not(target_os = "linux"))]
+        let message = {
+            let mut message = app
+                .dialog()
+                .message(DEVELOPMENT_UPDATES_MESSAGE)
+                .title("ChemDraft Update");
+            if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+                message = message.parent(&window);
+            }
+            message
+        };
         message.show(|_| {});
         return;
     }
@@ -3202,14 +3217,21 @@ fn restore_utility_labels<R: Runtime>(
         }
         if let Some(toolset_id) = toolset_id_for_window_label(app, &label) {
             buffer_utility_recovery_position(&window);
+            let resizable = toolset_is_resizable(&toolset_id);
             // A dialog must not move palettes (B6). A palette the user left partly off-screen keeps
             // its place; only one whose title can no longer be grabbed is pulled back. Clamping
             // every palette here made Main jump after any prompt when it overhung the screen edge
             // (GitHub #304). A frame ChemDraft fitted to a smaller work area still recovers, which
-            // returns it to the user's frame once there is room (B9).
-            let fitted = toolset_fit::with_memory(|memory| memory.is_fitted(&label));
-            if fitted || !toolset_title_reachable(app, &window) {
-                recover_offscreen_toolset_window(app, &window, toolset_is_resizable(&toolset_id));
+            // returns it to the user's frame once there is room (B9). Resizable inspectors
+            // (Molecular Inspector, Drawn Structure Settings) keep the full-frame fit they always
+            // had: their whole content must stay usable, not just their title.
+            let refit = restore_refits_toolset(
+                resizable,
+                toolset_fit::with_memory(|memory| memory.is_fitted(&label)),
+                || toolset_title_reachable(app, &window),
+            );
+            if refit {
+                recover_offscreen_toolset_window(app, &window, resizable);
             }
         }
         if dialog_windows::is_dialog_label(&label) {
@@ -8021,7 +8043,7 @@ fn read_clipboard_payload_impl() -> Result<ClipboardReadPayload, String> {
         .iter()
         .map(|source| {
             let priority = clipboard_limits::text_read_priority(source);
-            let priority = if priority == Some(2) {
+            let priority = if clipboard_limits::previews_text_for_chemistry(source, priority) {
                 pasteboard
                     .dataForType(&NSString::from_str(source))
                     .as_ref()
@@ -10013,15 +10035,15 @@ fn unsavable_document_path_message(path: &Path) -> String {
 /// Off macOS a failed shell open is otherwise reported only on stderr.
 #[cfg(target_os = "linux")]
 fn show_open_document_error<R: Runtime>(app: &tauri::AppHandle<R>, error: &str) {
-    let mut message = app
-        .dialog()
-        .message(error)
-        .title("ChemDraft Could Not Open a Document")
-        .kind(tauri_plugin_dialog::MessageDialogKind::Error);
-    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-        message = message.parent(&window);
-    }
-    message.show(|_| {});
+    // The message quotes the file name, which may hold a '%': it goes through the GTK-safe path.
+    appimage_dialogs::prompt(
+        app,
+        None,
+        Some("ChemDraft Could Not Open a Document"),
+        error,
+    )
+    .kind(tauri_plugin_dialog::MessageDialogKind::Error)
+    .show(|_| {});
 }
 
 fn open_document_payload_from_path(path: &Path) -> Result<NativeOpenDocumentPayload, String> {
@@ -12842,6 +12864,17 @@ fn visible_toolset_physical_position<R: Runtime>(
         return None;
     }
     window.outer_position().ok()
+}
+
+/// Whether restoring utilities after a dialog runs the full-frame fit on a toolset window.
+/// Resizable inspectors always do, as they did before palettes got the title-only test; a palette
+/// does only when ChemDraft fitted its frame earlier or its title can no longer be grabbed.
+fn restore_refits_toolset(
+    resizable: bool,
+    fitted: bool,
+    title_reachable: impl FnOnce() -> bool,
+) -> bool {
+    resizable || fitted || !title_reachable()
 }
 
 /// Whether enough of a palette's title strip lies on a monitor's work area for the user to grab it.
@@ -17453,6 +17486,23 @@ mod tests {
     }
 
     #[test]
+    fn restoring_after_a_dialog_keeps_the_inspector_full_frame_fit() {
+        // Resizable inspectors are fitted whole, whatever their title strip does; the title is
+        // not even measured.
+        for fitted in [false, true] {
+            expect_true(restore_refits_toolset(true, fitted, || {
+                panic!("an inspector's title strip is never measured")
+            }));
+        }
+        // A palette the user left partly off-screen keeps its place while its title is reachable.
+        expect_false(restore_refits_toolset(false, false, || true));
+        expect_true(restore_refits_toolset(false, false, || false));
+        // A frame ChemDraft fitted earlier still recovers.
+        expect_true(restore_refits_toolset(false, true, || true));
+        expect_true(toolset_is_resizable("core.molecularInspector"));
+    }
+
+    #[test]
     fn agent_bridge_check_survives_an_argument_that_is_not_unicode() {
         // A Linux file name is bytes; Windows command lines can hold an unpaired surrogate.
         // Neither may panic the launch, and the flag is still found beside them.
@@ -17468,10 +17518,8 @@ mod tests {
         };
         let flag = std::ffi::OsString::from(AGENT_BRIDGE_CLI_ARG);
 
-        let status = agent_bridge_status_from(
-            None,
-            [std::ffi::OsString::from("ChemDraft"), odd.clone()],
-        );
+        let status =
+            agent_bridge_status_from(None, [std::ffi::OsString::from("ChemDraft"), odd.clone()]);
         expect_false(status.enabled);
 
         let status = agent_bridge_status_from(None, [odd, flag]);

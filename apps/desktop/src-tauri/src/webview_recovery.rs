@@ -71,7 +71,7 @@ pub(super) fn plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
 fn install<R: tauri::Runtime>(webview: tauri::Webview<R>) {
     use std::cell::RefCell;
     use tauri::Manager;
-    use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+    use tauri_plugin_dialog::MessageDialogKind;
     use webkit2gtk::{BackForwardListExt, WebProcessTerminationReason, WebViewExt};
 
     let document = webview.clone();
@@ -93,33 +93,33 @@ fn install<R: tauri::Runtime>(webview: tauri::Webview<R>) {
             // Leave the on-disk snapshot in place for normal session restore after a reload.
             let document = document.clone();
             let startup_uri = startup_uri.as_ref().map(ToString::to_string);
-            document
-                .app_handle()
-                .dialog()
-                .message(message)
-                .title("ChemDraft Drawing View Stopped")
-                .kind(MessageDialogKind::Error)
-                .parent(&document.window())
-                .show(move |_| {
-                    if !reload {
-                        return;
-                    }
-                    if let Err(error) = document.with_webview(move |platform| {
-                        let view = platform.inner();
-                        // A crash during startup can leave WebKit with no page to reload.
-                        if let Some(uri) = startup_uri.filter(|_| {
-                            view.back_forward_list()
-                                .and_then(|history| history.current_item())
-                                .is_none()
-                        }) {
-                            view.load_uri(&uri);
-                        } else {
-                            view.reload();
-                        }
+            // Through the GTK-safe prompt, which also keeps the box above the document window.
+            let prompt = crate::appimage_dialogs::prompt(
+                document.app_handle(),
+                Some(&document.window()),
+                Some("ChemDraft Drawing View Stopped"),
+                &message,
+            );
+            prompt.kind(MessageDialogKind::Error).show(move |_| {
+                if !reload {
+                    return;
+                }
+                if let Err(error) = document.with_webview(move |platform| {
+                    let view = platform.inner();
+                    // A crash during startup can leave WebKit with no page to reload.
+                    if let Some(uri) = startup_uri.filter(|_| {
+                        view.back_forward_list()
+                            .and_then(|history| history.current_item())
+                            .is_none()
                     }) {
-                        eprintln!("ChemDraft: could not reload the drawing view: {error}");
+                        view.load_uri(&uri);
+                    } else {
+                        view.reload();
                     }
-                });
+                }) {
+                    eprintln!("ChemDraft: could not reload the drawing view: {error}");
+                }
+            });
         });
     }) {
         eprintln!("ChemDraft: could not observe the document web process: {error}");

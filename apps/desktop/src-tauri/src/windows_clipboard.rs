@@ -684,7 +684,7 @@ pub(crate) mod native {
 
     fn text_read_priority(id: u32, kind: &str, name: Option<&str>) -> Option<u8> {
         let priority = windows_text_read_priority(kind, name);
-        if priority != Some(2) {
+        if !crate::clipboard_limits::previews_text_for_chemistry(kind, priority) {
             return priority;
         }
         // SAFETY: read_payload holds the clipboard open. Preview at most 8 KiB,
