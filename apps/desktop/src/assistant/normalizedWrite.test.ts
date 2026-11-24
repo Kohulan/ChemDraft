@@ -1,5 +1,6 @@
 import { applyPatch, type MoleculeObject } from "@chemdraft/chem-core";
 import { describe, expect, it, vi } from "vitest";
+import { legacyWriteScopePages } from "@chemdraft/plugin-host";
 import { invalidCarbonMolecule } from "../../../../packages/document-workflow-core/test/invalidStructureFixtures";
 import { testContext } from "./tools/testContext";
 import { verifyNormalizedAssistantWrite, recheckNormalizedAssistantWrite } from "./normalizedWrite";
@@ -58,7 +59,8 @@ describe("normalized assistant writes bind selected ids to their selection page"
     const pageA = document.pages[0]!;
     const pageB = { ...pageA, id: "page_b", objects: [structuredClone(fixture.molecule)] };
     document.pages = [pageA, pageB];
-    return { ...fixture, document, pageA, pageB, scopePages: new Map([[fixture.molecule.id, pageB.id]]) };
+    // Send-time pins: the selection names page B's copy.
+    return { ...fixture, document, pageA, pageB, scopePages: legacyWriteScopePages(document, [fixture.molecule.id], pageB.id) };
   }
   const refusal = (_id: string, pinned: string, target: string) => {
     const number = (id: string) => (id === "page_b" ? 2 : 1);

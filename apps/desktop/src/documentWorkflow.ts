@@ -122,6 +122,7 @@ import {
   type ArrowObject,
   type BracketObject,
   type ChemDraftDocument,
+  type NativeDocumentWarningCode,
   type ChemicalMetadata,
   type CompatibilityWarning,
   remapImportedRepeatUnitAfterMoleculeMerge,
@@ -21008,6 +21009,21 @@ export function openNativeDocument(contents: string | Uint8Array): ChemDraftOpen
   return typeof contents === "string"
     ? readNativeDocumentContents(contents, openChemDraftPayload)
     : readNativeDocumentContents("", () => importCdx(contents));
+}
+
+const duplicateObjectIdsRenumberedCode: NativeDocumentWarningCode = "NATIVE_DUPLICATE_OBJECT_IDS_RENUMBERED";
+
+/**
+ * Whether the document an open installs differs from its file because the native reader gave
+ * duplicate same-page object ids new ids (chem-core `renumberDuplicatePageObjectIds`, reported by its
+ * structured `NATIVE_DUPLICATE_OBJECT_IDS_RENUMBERED` warning code). Such a document opens with
+ * unsaved changes, so Save writes the fix. The renumbering is part of opening, never an undo step.
+ * A visible-layer conflict resolved to the edited visible CDXML installs a document that read never
+ * touched, so it does not count.
+ */
+export function openedDocumentRenumberedObjectIds(result: ChemDraftOpenResult, installed: ChemDraftDocument): boolean {
+  if (result.conflict?.visibleDocument !== undefined && installed === result.conflict.visibleDocument) return false;
+  return result.warnings.some((warning) => warning.code === duplicateObjectIdsRenumberedCode);
 }
 
 const importedPageFitPaddingPx = 24;

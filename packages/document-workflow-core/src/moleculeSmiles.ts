@@ -2,6 +2,7 @@
 // native graph writer otherwise, with every approximation reported as an export warning.
 // Callers own engine loading; this shared writer also serves headless exports.
 
+import { isAssignedStereochemistryLabel } from "@chemdraft/analysis-core";
 import { atomImpliedRadicalCount, atomStatedHydrogenCount, isDativeBond, moleculeToMolfileV2000, moleculeBracketWarningMessages, rGroupNumberFromLabel, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
 import type { ExportWarning } from "@chemdraft/export-engine";
 import {
@@ -207,8 +208,9 @@ async function writeMoleculeSmiles(
     }
   }
   // A verified record can carry RDKit stereo that the fallback's drawing heuristic cannot see,
-  // such as an alkene whose substituent is isotopic hydrogen.
-  if (molecule.chemistry?.stereochemistry.length || moleculeHasSmilesStereo(molecule)) {
+  // such as an alkene whose substituent is isotopic hydrogen. Its note for an unassigned centre is
+  // not such stereo: plain SMILES leaves that centre unassigned too.
+  if (molecule.chemistry?.stereochemistry.some(isAssignedStereochemistryLabel) || moleculeHasSmilesStereo(molecule)) {
     warnings.push({
       code: "export.smiles_stereo_dropped",
       message: `Stereochemistry could not be written to SMILES for molecule ${index + 1}; ${needsNativeRadicals

@@ -731,6 +731,7 @@ import {
   spin3dCarriedElectronMarks,
   findForeignNativeMoleculeBondTarget,
   openNativeDocument,
+  openedDocumentRenumberedObjectIds,
   previewNativeMoleculeBondGrowth,
   nativeBondDragSourceAtomId,
   previewNativeMoleculeFreeformBondGrowth,
@@ -10652,7 +10653,9 @@ export function MainWindow({
     const fitRecommendation = resolvedOpen.source === "external-cdxml"
       ? recommendImportedPageFit(resolvedOpen.document)
       : undefined;
-    const dirty = options?.dirty ?? false;
+    // Renumbered duplicate ids make the opened document differ from its file: it opens with unsaved
+    // changes so Save writes the fix. The renumbering is part of opening, never an undo entry.
+    const dirty = (options?.dirty ?? false) || openedDocumentRenumberedObjectIds(opened, resolvedOpen.document);
     if (!snapshotDocumentTab(true, options?.onRefused)) return;
     if (nonPristineTabsRef.current.has(activeDocumentTabIdRef.current) && !addDocumentTab(displayName, options?.onRefused)) return;
     const id = activeDocumentTabIdRef.current;
@@ -11284,11 +11287,12 @@ export function MainWindow({
             documentTabSnapshotsRef.current.clear();
             nonPristineTabsRef.current.clear();
           }
-          for (const { id, session, history, reports } of restored) {
+          for (const { id, session, opened, resolved, history, reports } of restored) {
             if (session.pristine !== true || session.path || session.dirty || !session.blank) nonPristineTabsRef.current.add(id);
             const savePathNotice = restoredSavePathNotice(session);
             documentTabSnapshotsRef.current.set(id, {
-              history, file: restoredDocumentFileState(session),
+              history, file: openedDocumentRenumberedObjectIds(opened, resolved.document)
+                ? { ...restoredDocumentFileState(session), dirty: true } : restoredDocumentFileState(session),
               viewport: session.view?.viewport ?? createViewportState(),
               scrollLeft: session.view?.scrollLeft ?? 0, scrollTop: session.view?.scrollTop ?? 0, parts: [],
               warnings: reports.warnings,
@@ -13561,7 +13565,7 @@ export function MainWindow({
     commandRegistry: registry,
     createStorage: createPersistentPluginStorage,
     onProposedPatchesChanged: () => setPatchQueueVersion((version) => version + 1),
-    applyDocumentPatch: async ({ plugin, command, patch, undoLabel, signal, writeScopeObjectIds, writeScopePages, repeatUnitCleanup }) => {
+    applyDocumentPatch: async ({ plugin, command, patch, undoLabel, signal, writeScopeObjectIds, writeScopePages, repeatUnitCleanup, onCommitted }) => {
       if (quitInteractionRef.current) throw new Error("Quit is waiting for a choice; nothing was inserted.");
       const gate = pluginWriteGateRef.current;
       if (!gate) throw new Error("The document window is closing; nothing was inserted.");
@@ -13632,9 +13636,12 @@ export function MainWindow({
             return committed;
           };
           // Both history paths normalize again; check their actual final state, after page fit too.
+          let installed = true;
           if (assistantTxId) assistantTransactions.writeAssistantTransaction(assistantTxId, document, applied.receipt.objectIds, prepared, assertFinalDocument);
-          else commitDocumentChange(document, undoLabel, false, assertFinalDocument, PLUGIN_WRITE);
+          else installed = commitDocumentChange(document, undoLabel, false, assertFinalDocument, PLUGIN_WRITE);
           cleanup?.record();
+          // The host grants this write's insertions by the identity of the objects committed here.
+          if (installed) onCommitted?.(committed);
         }, { // Allocate request consent only if page fitting actually needs a question.
           get consent() { return assistantTxId ? assistantTransactions.pageEnlargementConsent(assistantTxId, shortcutPlatform) : consent; }, signal,
           isCurrent });

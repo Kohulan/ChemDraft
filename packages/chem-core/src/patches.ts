@@ -27,6 +27,7 @@ import { bracketPairs, retainBracketIdentity, sameBracketIdentity,
 import { planImportedRepeatUnitDeletion, resolveRepeatUnitAtomMembership, type RepeatUnitMembershipOptions } from "./repeatUnitMembership";
 import { rotatePointAboutCenter } from "./pointRotation";
 import { nativeExtensionObjectScope, retainNativeExtension } from "./nativeCompatibilityState";
+import { holdObjectIdentities, retainObjectIdentity } from "./objectIdentity";
 
 export type ObjectReorderPlacement = "front" | "back" | "forward" | "backward";
 
@@ -67,6 +68,21 @@ export interface ApplyPatchOptions {
   allowOrphanedRepeatUnitRemoval?: (unit: OrphanedRepeatUnit) => boolean;
   /** Trusted host preflight for a parsed add or update, before draft normalization can prune links. */
   beforeObjectWrite?: (pageId: string, previous: DocumentObject | undefined, next: DocumentObject) => void;
+  /**
+   * Trusted host preflight, called before each operation that acts on objects already in the draft
+   * (remove, update, move, reorder, set order, remove annotation) with the objects it is about to act
+   * on, resolved in the draft as it stands at that moment. A bare id names its first occurrence in
+   * page order then, so an earlier operation of the same batch can change which object a later one
+   * reaches. An operation whose target does not exist gets no targets (it fails afterwards). Throw to
+   * refuse the batch. The draft and targets are borrowed for inspection only.
+   */
+  beforeObjectTargets?: (document: ChemDraftDocument, patch: DocumentPatch, targets: readonly PatchObjectTarget[]) => void;
+}
+
+/** An object a patch operation is about to act on, and the page it is on (`beforeObjectTargets`). */
+export interface PatchObjectTarget {
+  pageId: string;
+  object: DocumentObject;
 }
 
 export class DocumentPatchError extends Error {
@@ -98,6 +114,9 @@ export function applyPatch(
  * `DocumentObjectSchema` as before, and every page's shell (layout, margins, crossings) and the
  * document's own fields through the full schemas.
  *
+ * A `document` that is not an engine document is first copied with `cloneDocument` (each copy keeps its
+ * original's identity), so with patches the result is always an adopted, pre-identified document.
+ *
  * Sharing makes in-place mutation of a returned document unsafe: it would reach every snapshot that
  * shares the object. Under test, results are therefore deep-frozen, so any such mutation throws.
  */
@@ -107,6 +126,10 @@ export function applyPatches(
   options: ApplyPatchOptions = {}
 ): ChemDraftDocument {
   if (patches.length === 0) {
+    // Nothing to apply: `document` comes back as it is, whether or not it is an engine document. This
+    // return performs no cloning, adoption, or identity minting. A non-engine input is returned unadopted
+    // and is not newly pre-identified; an already-engine input remains adopted and pre-identified
+    // (objectIdentity.ts, `holdObjectIdentities`).
     return document;
   }
   // Validate batches before creating a draft, then use the existing atomic engine.
@@ -127,6 +150,17 @@ export function applyPatches(
       while (end < patches.length && patches[end]!.op === "removeObject") {
         end += 1;
       }
+      if (options.beforeObjectTargets) {
+        // As removeObjects applies the run: each removal takes the next remaining occurrence of its id.
+        const taken = new Map<string, number>();
+        for (const entry of patches.slice(index, end)) {
+          const objectId = (entry as Extract<DocumentPatch, { op: "removeObject" }>).objectId;
+          const occurrence = taken.get(objectId) ?? 0;
+          taken.set(objectId, occurrence + 1);
+          const target = nthObjectWithId(draft, objectId, occurrence);
+          options.beforeObjectTargets(draft, entry, target ? [target] : []);
+        }
+      }
       options.beforeRemoveObjects?.(draft, patches.slice(index, end).map(entry =>
         (entry as Extract<DocumentPatch, { op: "removeObject" }>).objectId));
       if (end - index > 1) {
@@ -134,6 +168,8 @@ export function applyPatches(
         index = end;
         continue;
       }
+    } else if (options.beforeObjectTargets) {
+      options.beforeObjectTargets(draft, patch, patchObjectTargets(draft, patch));
     }
     try {
       applyPatchInPlace(draft, patch, options.beforeObjectWrite);
@@ -162,6 +198,7 @@ export function applyPatches(
   }
   draft.updatedAt = toIsoTimestamp(options.now ?? new Date());
   const next = validateDraft(draft);
+  holdObjectIdentities(next);
   engineDocuments.add(next);
   if (freezeResults) {
     deepFreezeNew(next);
@@ -170,8 +207,8 @@ export function applyPatches(
 }
 
 /**
- * Whether the patch engine produced `document` (as a patch result or through
- * `adoptDerivedDocument`). Such a document is already validated and normalized, so a consumer that
+ * Whether the document has been admitted to the engine, including as a patch result or through
+ * `toEngineDocument`, `admitParsedDocument`, or `adoptDerivedDocument`. Such a document is already validated and normalized, so a consumer that
  * would otherwise re-parse it — a save, run after every pause in editing — can use it as it is.
  */
 export function isEngineDocument(document: ChemDraftDocument): boolean {
@@ -182,14 +219,17 @@ export function isEngineDocument(document: ChemDraftDocument): boolean {
  * `document` as an engine document: validated and normalized once, now, as a patch would on its
  * first edit. For a document that enters from outside — opened, restored, created — so that saves
  * before the first edit skip re-validation and the first edit shares its unchanged objects rather
- * than deep-copying the whole page. The result is an independent copy; the input is never adopted,
- * since its caller may still hold and mutate it.
+ * than deep-copying the whole page. For a non-engine input, the result is an independent copy and the input is not adopted,
+ * since its caller may still hold and mutate it. An already-engine input is returned unchanged. The copy is pre-identified, and each copied object
+ * keeps the identity of its original, including one the original was given with `retainObjectIdentity`
+ * while outside every document: a trusted caller is needed to submit such a document.
  */
 export function toEngineDocument(document: ChemDraftDocument): ChemDraftDocument {
   if (engineDocuments.has(document)) {
     return document;
   }
   const admitted = cloneDocument(document);
+  holdObjectIdentities(admitted);
   engineDocuments.add(admitted);
   if (freezeResults) {
     deepFreezeNew(admitted);
@@ -209,12 +249,15 @@ export function toEngineDocument(document: ChemDraftDocument): ChemDraftDocument
  * not retain, mutate, or share it afterwards: the engine will share its objects with every later
  * patch result and undo snapshot, so a later mutation would reach all of them. Under test it is
  * deep-frozen, like every engine document, so such a mutation throws. When in doubt, use
- * `toEngineDocument`.
+ * `toEngineDocument`. The document is pre-identified in place: an object that already holds an
+ * identity keeps it, so the caller must be trusted not to have given one to an object that was
+ * outside every document (objectIdentity.ts, `holdObjectIdentities`).
  */
 export function admitParsedDocument(document: ChemDraftDocument): ChemDraftDocument {
   if (engineDocuments.has(document)) {
     return document;
   }
+  holdObjectIdentities(document);
   engineDocuments.add(document);
   if (freezeResults) {
     deepFreezeNew(document);
@@ -226,14 +269,18 @@ export function admitParsedDocument(document: ChemDraftDocument): ChemDraftDocum
  * `next`, re-admitted to the engine's structural sharing. For a document the app derived from an
  * engine result by replacing whole objects — a normalization pass such as charge-mark reconciliation
  * — without going through a patch. A derived document is otherwise unknown to the engine, so the
- * next patch deep-copied and re-parsed all of it and gave every object a new identity: the undo
- * history stopped sharing, and every per-object render cache missed at once.
+ * next patch deep-copied and re-parsed all of it into new values: the undo history stopped sharing,
+ * and every per-object render cache missed at once.
  *
  * Objects `next` shares with `base` were validated when `base` was produced; only the others are
  * parsed, and the document and page shells are validated as a patch result's are — including any
  * compatibility, styles, or plugin data `next` replaced. Throws, like a
- * patch, when a replaced object is invalid. A `base` the engine did not produce gains nothing, and
- * `next` comes back unchanged.
+ * patch, when a replaced object is invalid. `next` comes back unchanged when `next` is `base` itself, when
+ * `next` is already an engine document, or when `base` is not an engine document. These returns perform
+ * no cloning, adoption, or identity minting. A non-engine input is returned unadopted and is not newly
+ * pre-identified; an already-engine input remains adopted and pre-identified. Otherwise the result is pre-identified, and an
+ * object of `next` that holds an identity keeps it, so the caller must be trusted not to have given
+ * one to a value outside every document (objectIdentity.ts, `holdObjectIdentities`).
  */
 export function adoptDerivedDocument(base: ChemDraftDocument, next: ChemDraftDocument): ChemDraftDocument {
   if (next === base || !engineDocuments.has(base) || engineDocuments.has(next)) {
@@ -245,30 +292,90 @@ export function adoptDerivedDocument(base: ChemDraftDocument, next: ChemDraftDoc
       validated.add(object);
     }
   }
+  let replaced: Map<DocumentObject, DocumentObject> | undefined;
   const adopted = validateDraft({
     ...next,
     selection: { ...next.selection, objectIds: [...next.selection.objectIds] },
-    pages: next.pages.map((page) => ({
-      ...page,
-      objects: page.objects.map(object => {
-        if (validated.has(object)) return object;
-        const parsed = DocumentObjectSchema.parse(object);
-        retainBracketIdentity(object, parsed);
-        return parsed;
-      }),
-      crossings: [...page.crossings]
-    }))
+    pages: next.pages.map((page) => {
+      return {
+        ...page,
+        objects: page.objects.map(object => {
+          if (validated.has(object)) return object;
+          const parsed = DocumentObjectSchema.parse(object);
+          retainBracketIdentity(object, parsed);
+          // A derived value continues the base object it replaced, unless it has an identity of its own.
+          replaced ??= replacedObjects(base, next, validated);
+          const predecessor = replaced.get(object);
+          if (predecessor) retainObjectIdentity(predecessor, object);
+          retainObjectIdentity(object, parsed);
+          return parsed;
+        }),
+        crossings: [...page.crossings]
+      };
+    })
   }, {
     // Shell fields `next` still shares with `base` were validated with it; replaced ones were not.
     compatibility: next.compatibility !== base.compatibility,
     styles: next.styles !== base.styles,
     plugins: next.plugins !== base.plugins
   });
+  holdObjectIdentities(adopted);
   engineDocuments.add(adopted);
   if (freezeResults) {
     deepFreezeNew(adopted);
   }
   return adopted;
+}
+
+/**
+ * Each derived value that replaced a base object in place, mapped to that base object.
+ * adoptDerivedDocument is for normalization passes that swap an object for an edited copy of itself,
+ * so such a copy continues the object's host identity. A value can only be told to continue a base
+ * object when nothing else could be that object's copy: across the WHOLE document, the id names exactly
+ * one base object that is gone from `next` and exactly one new value (one `base` does not hold), both on
+ * the same page, of the same type, and the id is unique on that page in both documents.
+ *
+ * Anything else carries nothing (objectIdentity.ts: fail closed). In particular an edited copy moved to
+ * another page while an unrelated same-id object took the original page leaves two new values with
+ * the id, so neither inherits: a newcomer must never receive the selected object's identity, and which
+ * value is the moved copy cannot be read from the values themselves.
+ */
+function replacedObjects(base: ChemDraftDocument, next: ChemDraftDocument,
+  validated: ReadonlySet<DocumentObject>): Map<DocumentObject, DocumentObject> {
+  type Located = { pageId: string; object: DocumentObject };
+  const kept = new Set(next.pages.flatMap(page => page.objects));
+  const gone = new Map<string, Located[]>(), fresh = new Map<string, Located[]>();
+  const add = (map: Map<string, Located[]>, pageId: string, object: DocumentObject) => {
+    const list = map.get(object.id);
+    if (list) list.push({ pageId, object });
+    else map.set(object.id, [{ pageId, object }]);
+  };
+  for (const page of base.pages) {
+    for (const object of page.objects) if (!kept.has(object)) add(gone, page.id, object);
+  }
+  for (const page of next.pages) {
+    for (const object of page.objects) if (!validated.has(object)) add(fresh, page.id, object);
+  }
+  const replaced = new Map<DocumentObject, DocumentObject>();
+  for (const [id, successors] of fresh) {
+    const predecessors = gone.get(id);
+    if (successors.length !== 1 || predecessors?.length !== 1) continue;
+    const [successor] = successors as [Located], [predecessor] = predecessors as [Located];
+    if (successor.pageId !== predecessor.pageId || successor.object.type !== predecessor.object.type) continue;
+    const basePage = base.pages.find(page => page.id === predecessor.pageId);
+    const nextPage = next.pages.find(page => page.id === successor.pageId);
+    if (!basePage || !nextPage || uniqueObjectsById(basePage.objects).get(id) !== predecessor.object ||
+      uniqueObjectsById(nextPage.objects).get(id) !== successor.object) continue;
+    replaced.set(successor.object, predecessor.object);
+  }
+  return replaced;
+}
+
+/** Each id's object, or undefined for an id that names several objects. */
+function uniqueObjectsById(objects: readonly DocumentObject[]): Map<string, DocumentObject | undefined> {
+  const byId = new Map<string, DocumentObject | undefined>();
+  for (const object of objects) byId.set(object.id, byId.has(object.id) ? undefined : object);
+  return byId;
 }
 
 /** Fresh containers for everything a patch can write: the document, its selection, each page, and
@@ -297,7 +404,12 @@ function validateDraft(
     const objects = new Map(page.objects.map(object => [object.id, object]));
     page.objects = page.objects.map(object => {
       if (object.type !== "bracket") return object;
-      if (object.pairId && !pairs.has(object.pairId)) return withoutBracketPairMetadata(object);
+      if (object.pairId && !pairs.has(object.pairId)) {
+        // An orphaned bracket loses its pair metadata, not its host identity (objectIdentity.ts).
+        const plain = withoutBracketPairMetadata(object);
+        retainObjectIdentity(object, plain);
+        return plain;
+      }
       const containedObjectIds = object.containedObjectIds.filter(id => objects.has(id));
       const crossingBondIds = object.crossingBondIds?.filter(ref => {
         const molecule = objects.get(ref.objectId);
@@ -306,6 +418,7 @@ function validateDraft(
       if (containedObjectIds.length === object.containedObjectIds.length && crossingBondIds?.length === object.crossingBondIds?.length) return object;
       const pruned = { ...object, containedObjectIds, ...(crossingBondIds ? { crossingBondIds } : {}) };
       retainBracketIdentity(object, pruned);
+      retainObjectIdentity(object, pruned);
       return pruned;
     });
   }
@@ -420,6 +533,7 @@ function planRepeatUnitDeletion(before: ChemDraftDocument, after: ChemDraftDocum
               ...bracket.compatibility, unknown: { ...bracket.compatibility.unknown, cdxmlBracketDeletedAtoms: imported.deletedAtoms }
             } };
             retainBracketIdentity(bracket, edited);
+            retainObjectIdentity(bracket, edited);
             importedEdits.set(bracket, edited);
           }
         }
@@ -484,6 +598,7 @@ function pruneDeletedObjects(document: ChemDraftDocument, orphaned: readonly Orp
         if (object.type !== "bracket" || !object.containedObjectIds.some(id => removed.has(id))) return object;
         const pruned = { ...object, containedObjectIds: object.containedObjectIds.filter(id => !removed.has(id)) };
         retainBracketIdentity(object, pruned);
+        retainObjectIdentity(object, pruned);
         return pruned;
       });
     }
@@ -503,7 +618,11 @@ function pruneGroupReferences(page: DocumentPage, removed: Set<string>, removeEm
       if (object.type !== "group") return [object];
       const childObjectIds = object.childObjectIds.filter(id => !removed.has(id));
       if (childObjectIds.length === object.childObjectIds.length) return [object];
-      if (childObjectIds.length || !removeEmptyGroups) return [{ ...object, childObjectIds }];
+      if (childObjectIds.length || !removeEmptyGroups) {
+        const pruned = { ...object, childObjectIds };
+        retainObjectIdentity(object, pruned);
+        return [pruned];
+      }
       removed.add(object.id);
       return [];
     });
@@ -628,7 +747,12 @@ function pruneObjectNativeExtensions(document: ChemDraftDocument, pageId: string
 
 /** Replace changed reactions rather than mutating objects shared with undo snapshots. */
 function pruneReactionReferences(page: DocumentPage, removed: ReadonlySet<string>): void {
-  page.objects = page.objects.map(object => object.type === "reaction" ? pruneReactionObjectReferences(object, removed) : object);
+  page.objects = page.objects.map(object => {
+    if (object.type !== "reaction") return object;
+    const pruned = pruneReactionObjectReferences(object, removed);
+    retainObjectIdentity(object, pruned);
+    return pruned;
+  });
 }
 
 /** Pure removal rule, shared with write-scope checks. Returns the original object if unchanged. */
@@ -846,6 +970,8 @@ function updateObject(
   const updated = mergeObjectChanges(location.object, changes, objectId);
   beforeObjectWrite?.(location.page.id, location.object, updated);
   retainBracketIdentity(location.object, updated);
+  // An edit, restyle, or move keeps the object's host identity (objectIdentity.ts).
+  retainObjectIdentity(location.object, updated);
   if (location.object.type === "molecule" && updated.type === "molecule") {
     updated.atoms = clearChangedAtomHydrogenHints(location.object, updated.atoms, updated.bonds);
   }
@@ -1085,6 +1211,42 @@ function buildObjectLocationIndex(document: ChemDraftDocument): Map<string, { pa
 function forgetShiftedDuplicateLocations(document: ChemDraftDocument): void {
   if (documentsWithDuplicateIds.has(document)) {
     objectLocationIndexes.delete(document);
+  }
+}
+
+/** The `occurrence`-th object (0-based) with id `objectId`, searching pages in order, as removeObjects takes them. */
+function nthObjectWithId(document: ChemDraftDocument, objectId: string, occurrence: number): PatchObjectTarget | undefined {
+  let remaining = occurrence;
+  for (const page of document.pages) {
+    for (const object of page.objects) {
+      if (object.id !== objectId) continue;
+      if (remaining === 0) return { pageId: page.id, object };
+      remaining -= 1;
+    }
+  }
+  return undefined;
+}
+
+/** The existing objects a single operation acts on, resolved exactly as applyPatchInPlace will resolve them. */
+function patchObjectTargets(document: ChemDraftDocument, patch: DocumentPatch): PatchObjectTarget[] {
+  const located = (objectId: string): PatchObjectTarget[] => {
+    const location = findObject(document, objectId);
+    return location ? [{ pageId: location.page.id, object: location.object }] : [];
+  };
+  switch (patch.op) {
+    case "removeObject":
+    case "updateObject":
+    case "moveObject":
+    case "reorderObject":
+      return located(patch.objectId);
+    case "removeAnnotation":
+      return located(patch.annotationId);
+    case "setObjectOrder": {
+      const page = document.pages.find(candidate => candidate.id === patch.pageId);
+      return page ? page.objects.map(object => ({ pageId: page.id, object })) : [];
+    }
+    default:
+      return [];
   }
 }
 
