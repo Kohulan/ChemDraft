@@ -159,11 +159,16 @@ newlines and formula spans, measured once without implicit wrapping. Captions ar
 Entirely numbered authored blocks
 align left with their visible text centred on the arrow, including wrapped steps; other blocks and captions align centre.
 
-Reaction-label design numbers live together in `src/reactionLabels.ts`: line wrap at **10 bond
-lengths**, minimum arrow **3 bond lengths**, arrow padding beyond the widest estimated content
+Reaction-label design numbers live together in `src/reactionLabels.ts`: line wrap at **8.5 bond
+lengths** (`reactionLabelWrapWidthInBonds`), minimum arrow **3 bond lengths**, arrow padding beyond the widest estimated content
 width **2 × (actual head/chevron depth + 0.25 em)**, label ink clearance from the outer shaft stroke **0.3 em**, caption top clearance
 **0.8 em**, caption wrap width at least **8 bond lengths**, and default label font **14 px** centred.
-Spaces and tabs are the only wrap points; NBSP/narrow NBSP and oversized tokens stay whole. Captions wrap to the greater of
+Spaces and tabs are the only wrap points; NBSP/narrow NBSP and oversized tokens stay whole. In above/below labels a
+quantity never breaks from its unit ("0.25 M", ".5 M", "80 °C", "1.2 equiv") nor inside "mol %"/"wt %"/"vol %", a
+matched parenthesised group is never split (wherever it opens), a group that is an amount stays with the word before it
+("K2CO3 (2.0 equiv)", but not "add" with "(R)-BINAP"), and a break prefers the last fitting comma outside parentheses;
+those words are only grouped for wrapping, and the authored spaces are written unchanged. Captions keep plain greedy
+wrapping at any space or tab, and wrap to the greater of
 scheme width and that minimum. A line box includes authored paragraph spacing to match rendering.
 Every block has a **1.2** line-height floor and keeps a larger authored line height. Each adjacent
 pair raises that block-wide line height as needed to leave at least **0.12 em** from the earlier
