@@ -174,6 +174,75 @@ describe("captions with malformed geometry", () => {
     expectFiniteCaption(exportDocumentToCdxml(opened.document!, plain).contents);
   });
 
+  it("warns once when a fragment's caption has neither p nor BoundingBox", () => {
+    const opened = openChemDraftPayload(page('<fragment id="1" BoundingBox="100 100 140 120"><n id="2" p="100 110"/><n id="3" p="140 110"/>' +
+      '<b id="4" B="2" E="3"/><t id="9"><s font="2" size="10">cap</s></t></fragment>'));
+    const missing = opened.warnings.filter(w => w.code === "cdxml.text_position_missing");
+    expect(missing).toHaveLength(1);
+    expect(missing[0].message).toContain("neither a p nor a BoundingBox");
+    expect(missing[0].message).toContain("below the fragment");
+    expect(opened.warnings.map(w => w.code)).not.toContain("cdxml.text_position_invalid");
+    const text = opened.document!.pages[0].objects.find(o => o.type === "text") as TextObject;
+    expect(text.x).toBeCloseTo(px(100), 6);
+    expect(text.y).toBeGreaterThan(px(120));
+    expectFiniteCaption(exportDocumentToCdxml(opened.document!, plain).contents);
+  });
+
+  it("warns once when a page caption has neither p nor BoundingBox", () => {
+    const opened = openChemDraftPayload(page(caption("")));
+    const missing = opened.warnings.filter(w => w.code === "cdxml.text_position_missing");
+    expect(missing).toHaveLength(1);
+    expect(missing[0].message).toContain("page origin");
+    expectFiniteCaption(exportDocumentToCdxml(opened.document!, plain).contents);
+  });
+
+  it("treats a p or BoundingBox with a trailing token as malformed", () => {
+    const boxed = openChemDraftPayload(page(caption('p="40 50" BoundingBox="40 38 80 52 NaN"')));
+    const warning = boxed.warnings.filter(w => w.code === "cdxml.text_position_invalid");
+    expect(warning).toHaveLength(1);
+    expect(warning[0].message).toContain('BoundingBox="40 38 80 52 NaN"');
+    const unchanged = exportDocumentToCdxml(boxed.document!, plain).contents;
+    expectFiniteCaption(unchanged);
+    expect(captionGeometry(unchanged).p).toEqual([40, 50]);
+
+    const pointed = openChemDraftPayload(page(caption('p="40 50 7" BoundingBox="40 38 80 52"')));
+    expect(pointed.warnings.find(w => w.code === "cdxml.text_position_invalid")?.message).toContain('p="40 50 7"');
+    const exported = captionGeometry(exportDocumentToCdxml(pointed.document!, plain).contents);
+    expect(exported.p).toEqual([40, 50]);
+    expect(exported.box).toEqual([40, 38, 80, 52]);
+  });
+
+  it("never copies a trailing-token or non-finite p or BoundingBox kept by an older import", () => {
+    for (const [from, to] of [['p="40 50"', 'p="40 50 NaN"'], ['BoundingBox="40 38 80 52"', 'BoundingBox="40 38 80 52 NaN"'],
+      ['BoundingBox="40 38 80 52"', 'BoundingBox="40 38 80 Infinity"']]) {
+      const opened = openChemDraftPayload(page(caption('p="40 50" BoundingBox="40 38 80 52"')));
+      const text = opened.document!.pages[0].objects[0] as TextObject;
+      const source = String(text.compatibility!.unknown.cdxmlTextElement);
+      expect(source).toContain(from);
+      text.compatibility!.unknown.cdxmlTextElement = source.replace(from, to);
+      const exported = exportDocumentToCdxml(opened.document!, plain).contents;
+      expectFiniteCaption(exported);
+      expect(exported, to).not.toContain(to);
+      expect(captionGeometry(exported).p).toEqual([40, 50]);
+    }
+  });
+
+  it("warns when a saved caption frame size is not finite, and recomputes BoundingBox", () => {
+    const opened = openChemDraftPayload(page(caption('p="40 50" BoundingBox="40 38 80 52"')));
+    expect(opened.warnings.map(w => w.code)).not.toContain("cdxml.text_frame_size_invalid");
+    const text = opened.document!.pages[0].objects[0] as TextObject;
+    text.compatibility!.unknown.cdxmlTextFrameSize = { width: Number.NaN, height: text.height };
+    // An edited caption is written from its runs and its saved frame.
+    text.text = "Et"; text.spans[0].text = "Et";
+    const exported = exportDocumentToCdxml(opened.document!, plain);
+    const warnings = exported.warnings.filter(w => w.code === "cdxml.text_frame_size_invalid");
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].message).toContain("frame width");
+    expect(warnings[0].message).not.toContain("height");
+    expectFiniteCaption(exported.contents);
+    expect(captionGeometry(exported.contents).box).toBeDefined();
+  });
+
   it("warns when a caption has no position at all", () => {
     const opened = openChemDraftPayload(page(caption('p="NaN Infinity"')));
     expect(opened.warnings.find(w => w.code === "cdxml.text_position_invalid")?.message).toContain("page origin");

@@ -2510,10 +2510,11 @@ function textSourceState(text: TextObject): string {
 
 // CDXML stores the baseline independently of the editable text frame. Keep the source
 // inset when placing the current runs, including after the user translates a caption.
-function exportFramedCaption(text: TextObject, id: string, fonts: CdxmlExportFonts, colors: ExportColorTable): string | undefined {
+function exportFramedCaption(text: TextObject, id: string, fonts: CdxmlExportFonts, colors: ExportColorTable,
+  warnings: CompatibilityConversionWarning[], format: string): string | undefined {
   const a = preservedCurveAttributes(text.compatibility?.unknown.sourceCdxmlAttributes);
-  const box = parseCdxmlXyBoundingBox(a.BoundingBox);
-  const baseline = parseCdxmlXyPoint(a.p);
+  const box = parseCaptionBoundingBox(a.BoundingBox);
+  const baseline = parseCaptionPoint(a.p);
   if (!baseline || (!box && a.BoundingBox !== undefined) || text.rotation ||
       Object.keys(a).some(key => !["id", "p", "BoundingBox", "Justification", "color"].includes(key))) return undefined;
   const alignments: Record<string, string> = { left: "Left", center: "Center", right: "Right", justify: "Full" };
@@ -2554,6 +2555,13 @@ function exportFramedCaption(text: TextObject, id: string, fonts: CdxmlExportFon
   const saved = text.compatibility?.unknown.cdxmlTextFrameSize;
   // A non-finite saved size (compatibility data is not schema-checked) is ignored, so BoundingBox never takes a NaN.
   const savedSize = (key: "width" | "height") => isRecord(saved) && typeof saved[key] === "number" && Number.isFinite(saved[key]) ? saved[key] : undefined;
+  const unusable = saved === undefined ? [] : !isRecord(saved) ? ["width", "height"]
+    : (["width", "height"] as const).filter(key => saved[key] !== undefined && savedSize(key) === undefined);
+  if (unusable.length) {
+    warnings.push({ code: "cdxml.text_frame_size_invalid", sourceObjectId: text.id,
+      message: `${format} export: text ${text.id} has a saved caption frame ${unusable.join(" and ")} that is not a finite number; ` +
+        `it was ignored, and the caption's BoundingBox ${unusable.join(" and ")} was recomputed from its source frame and current size.` });
+  }
   const resized = (source: number, current: number, before: number | undefined) =>
     before !== undefined ? Math.max(0, source + current - before) : Math.min(source, current);
   const width = resized(box.width, text.width, savedSize("width"));
@@ -2569,7 +2577,7 @@ function exportTextObject(text: TextObject, context: VisibleExportContext, alloc
   const textId = idFor(ids, text.id, allocator);
   const source = text.compatibility?.unknown.cdxmlTextElement;
   const framedCaption = () => {
-    if (!fonts.plainCaptionIds.has(text.id)) return exportFramedCaption(text, textId, fonts, colors);
+    if (!fonts.plainCaptionIds.has(text.id)) return exportFramedCaption(text, textId, fonts, colors, warnings, format);
     if (!fonts.captionRunLimitWarned) {
       fonts.captionRunLimitWarned = true;
       warnings.push({ code: "cdxml.document_caption_runs_limited", sourceObjectId: text.id,
@@ -2604,10 +2612,8 @@ function exportTextObject(text: TextObject, context: VisibleExportContext, alloc
                 "text and styles, its fonts under ids that can be written." });
           }
         }
-        // Older documents kept a malformed p or BoundingBox verbatim; never copy one back out.
-        const malformedGeometry = element !== undefined && (
-          element.attributes.p !== undefined && !parseCdxmlXyPoint(element.attributes.p) ||
-          element.attributes.BoundingBox !== undefined && !parseCdxmlXyBoundingBox(element.attributes.BoundingBox));
+        // Older documents kept a malformed or non-finite p or BoundingBox verbatim; never copy one back out.
+        const malformedGeometry = node !== undefined && hasMalformedCaptionCoordinates([node]);
         if (node && element && !fontNotWritten && !malformedGeometry) {
           node[":@"] = { ...element.attributes, id: textId };
           const point = pointMetadata(text.compatibility?.unknown.cdxmlTextFrameOrigin) ?? parseCdxmlPoint(element.attributes.p);
@@ -5498,8 +5504,8 @@ function sanitizeCaptionGeometry(
   fragmentFrame: { x: number; y: number; width: number; height: number } | undefined
 ): XmlElementView {
   const a = element.attributes;
-  const point = parseCdxmlXyPoint(a.p);
-  const box = parseCdxmlXyBoundingBox(a.BoundingBox);
+  const point = parseCaptionPoint(a.p);
+  const box = parseCaptionBoundingBox(a.BoundingBox);
   const badPoint = a.p !== undefined && !point, badBox = a.BoundingBox !== undefined && !box;
   if (point && !badBox) return element;
   const attributes = { ...a };
@@ -5525,13 +5531,17 @@ function sanitizeCaptionGeometry(
     placedBy = (box ? "it was placed from its BoundingBox" : fragmentFrame ? "it was placed below the fragment it belongs to"
       : "it was placed at the page origin") + (keptCoordinate ? ", keeping the finite coordinate of its p" : "");
   }
-  // A missing p placed from a valid BoundingBox or a fragment is an ordinary file, not a defect.
-  if (badPoint || badBox || (!point && !box && !fragmentFrame)) {
+  // A missing p placed from a valid BoundingBox is an ordinary file, not a defect.
+  if (badPoint || badBox) {
     const quote = (value: string) => JSON.stringify(value.length > 40 ? `${value.slice(0, 40)}…` : value);
     const ignored = [badPoint ? `p=${quote(a.p!)}` : "", badBox ? `BoundingBox=${quote(a.BoundingBox!)}` : ""].filter(Boolean);
     context.warnings.push({ code: "cdxml.text_position_invalid", sourceObjectId: objectId,
-      message: `${context.sourceFormat} import: text ${a.id ?? objectId} ` + (ignored.length
-        ? `has a malformed ${ignored.join(" and ")}, which was ignored` : "has no p or BoundingBox") + `; ${placedBy}.` });
+      message: `${context.sourceFormat} import: text ${a.id ?? objectId} has a malformed ${ignored.join(" and ")} ` +
+        `(p takes exactly 2 finite numbers, BoundingBox exactly 4), which was ignored; ${placedBy}.` });
+  } else if (a.p === undefined && a.BoundingBox === undefined) {
+    // Neither attribute is present: its position is a guess, even below its own fragment.
+    context.warnings.push({ code: "cdxml.text_position_missing", sourceObjectId: objectId,
+      message: `${context.sourceFormat} import: text ${a.id ?? objectId} has neither a p nor a BoundingBox; ${placedBy}.` });
   }
   return { ...element, attributes };
 }
@@ -5622,7 +5632,7 @@ function textFontTable(element: XmlElementView, context: ImportPageContext): rea
 // Only adopt the single-line layout when every visible run has an exact mapping.
 function restoreFramedCaption(object: TextObject, element: XmlElementView, context: ImportPageContext): void {
   const a = element.attributes;
-  const box = parseCdxmlXyBoundingBox(a.BoundingBox);
+  const box = parseCaptionBoundingBox(a.BoundingBox);
   const alignments: Record<string, string> = { Center: "center", Right: "right", Left: "left", Full: "justify" };
   const align = alignments[a.Justification ?? "Left"];
   const runs = childElements(element, "s");
@@ -5632,7 +5642,7 @@ function restoreFramedCaption(object: TextObject, element: XmlElementView, conte
         `${cdxmlLimits.captionRuns} supported; its caption frame and run fonts were not restored, and it was imported as plain styled text.` });
     return;
   }
-  if ((!box && a.BoundingBox !== undefined) || !parseCdxmlXyPoint(a.p) || !align || !runs.length || runs.length !== object.spans.length ||
+  if ((!box && a.BoundingBox !== undefined) || !parseCaptionPoint(a.p) || !align || !runs.length || runs.length !== object.spans.length ||
       Object.keys(a).some(k => !["id", "p", "BoundingBox", "Justification", "color"].includes(k))) return;
   const usage = context.fonts.usage;
   if (usage.captionRunLimitReached || usage.captionRuns + runs.length > cdxmlLimits.documentCaptionRuns) {
@@ -7108,6 +7118,40 @@ function parseCdxmlXyPoint(point: string | undefined): Point | undefined {
     x: cdxmlToCssPx(x),
     y: cdxmlToCssPx(y)
   };
+}
+
+/** Exactly `count` finite numbers, else undefined: a trailing token (`"40 38 80 52 NaN"`) makes the value malformed. */
+function exactFiniteNumbers(value: string | undefined, count: number): number[] | undefined {
+  const tokens = value?.trim().split(/\s+/);
+  const numbers = tokens?.length === count ? tokens.map(Number) : undefined;
+  return numbers?.every(Number.isFinite) ? numbers : undefined;
+}
+
+/** A caption's p: exactly "x y", both finite. The lenient reader also serves Point3D attributes. */
+function parseCaptionPoint(point: string | undefined): Point | undefined {
+  return exactFiniteNumbers(point, 2) ? parseCdxmlXyPoint(point) : undefined;
+}
+
+/** A caption's BoundingBox: exactly "left top right bottom", all finite. */
+function parseCaptionBoundingBox(box: string | undefined): { x: number; y: number; width: number; height: number } | undefined {
+  return exactFiniteNumbers(box, 4) ? parseCdxmlXyBoundingBox(box) : undefined;
+}
+
+/** A coordinate attribute anywhere in the tree that is not a whole number of finite pairs (or triples),
+ *  or a caption p or BoundingBox without exactly its 2 or 4 finite numbers. */
+function hasMalformedCaptionCoordinates(tree: OrderedXmlTree): boolean {
+  return tree.some(node => {
+    const element = elementView(node);
+    if (!element) return false;
+    return Object.entries(element.attributes).some(([name, text]) => {
+      if (element.name === "t" && name === "p") return !parseCaptionPoint(text);
+      if (element.name === "t" && name === "BoundingBox") return !parseCaptionBoundingBox(text);
+      const stride = visibleCoordinatePairs.has(name) ? 2 : visibleCoordinateTriples.has(name) ? 3 : 0;
+      if (!stride) return false;
+      const values = text.trim().split(/\s+/).map(Number);
+      return values.length % stride !== 0 || values.some(value => !Number.isFinite(value));
+    }) || hasMalformedCaptionCoordinates(element.children);
+  });
 }
 
 /** Spec-order 2D position: "x y", falling back to the origin when absent or malformed. */
