@@ -2659,6 +2659,7 @@ export function reconcileRingDoubleBondSides(
   if (!movedAtoms.size && !options.repairStationaryOffsets) return after.bonds;
 
   let bonds = after.bonds;
+  let cycles: readonly MoleculeFillRingCycle[] | undefined;
   after.bonds.forEach((bond, index) => {
     const side = bond.display?.doubleBondSide;
     if (bond.order !== "double" || side === undefined || side === "automatic") return;
@@ -2668,10 +2669,24 @@ export function reconcileRingDoubleBondSides(
     const ring = rings.get(bond.id);
     const from = nextAtoms.get(bond.fromAtomId), to = nextAtoms.get(bond.toAtomId);
     if (!ring || !from || !to) return;
-    // Full Clean Up can also repair old outward offsets on rings whose geometry is already tidy.
-    const repairOffset = options.repairStationaryOffsets && source !== "user" && side !== "center";
-    if (!repairOffset && !ring.some(id => movedAtoms.has(id))) return;
-    const inside = doubleBondSideTowardRingInterior(from, to, ring, nextAtoms);
+    const ringMoved = ring.some(id => movedAtoms.has(id));
+    let inside = doubleBondSideTowardRingInterior(from, to, ring, nextAtoms);
+    if (source !== "user" && side !== "center") {
+      if (inside === side) return;
+      // A fused bond can have an inward stroke on either side. Check every owning ring.
+      let owningRingMoved = ringMoved;
+      for (const cycle of (cycles ??= moleculeFillRingCycles(after))) {
+        if (!cycle.bondIds.includes(bond.id)) continue;
+        const cycleInside = doubleBondSideTowardRingInterior(from, to, cycle.atomIds, nextAtoms);
+        if (cycleInside === side) return;
+        inside ??= cycleInside;
+        owningRingMoved ||= cycle.atomIds.some(id => movedAtoms.has(id));
+      }
+      // Full Clean Up also repairs old outward offsets on stationary rings.
+      if (!owningRingMoved && !options.repairStationaryOffsets) return;
+    } else if (!ringMoved) {
+      return;
+    }
     if (!inside) return;
 
     let nextSide = inside;

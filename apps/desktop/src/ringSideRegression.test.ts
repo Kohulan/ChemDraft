@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { exportDocumentToCdx, importCdx, openChemDraftPayload } from "@chemdraft/cdx-compat";
 import { applyPatch, deserializeDocument, serializeDocument, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
-import { cleanUpMoleculeSelections2d } from "@chemdraft/document-workflow-core";
+import { cleanUpMoleculeSelections2d, pastedStructureDepictionFromMolfile } from "@chemdraft/document-workflow-core";
 import * as layoutEngine from "@chemdraft/layout-engine";
 import { planPageSvgRender, type PageSvgElementFragment } from "@chemdraft/layout-engine";
 import { assertConstrainedLayoutIdentity, relayoutMolfile2D } from "@chemdraft/ocl-adapter";
@@ -11,7 +11,9 @@ import {
   cleanUpNativeMolecules2d,
   doubleBondSideForPoint,
   flattenSpunMolecule,
-  moveNativeMoleculeParts
+  moveNativeMoleculeParts,
+  prepareNativeMoleculeEngineRelayout,
+  rotateDocumentObject
 } from "./documentWorkflow";
 import { quatFromAxisAngle, quatToViewMatrix } from "./interaction/rotation3d";
 import { projectSpin, spinJoinedBondFragments } from "./interaction/spinOverlay";
@@ -51,6 +53,27 @@ function importedCyclopropene() {
   </fragment></page></CDXML>`);
   expect(opened.source).toBe("external-cdxml");
   return opened.document!;
+}
+
+function importedFusedHexagons() {
+  const opened = openChemDraftPayload(`<CDXML><page id="1"><fragment id="2">
+    <n id="11" p="100 100"/><n id="12" p="100 120"/>
+    <n id="13" p="82.68 130"/><n id="14" p="65.36 120"/>
+    <n id="15" p="65.36 100"/><n id="16" p="82.68 90"/>
+    <n id="17" p="117.32 130"/><n id="18" p="134.64 120"/>
+    <n id="19" p="134.64 100"/><n id="20" p="117.32 90"/>
+    <b id="31" B="11" E="12" Order="2" DoublePosition="Right"/>
+    <b id="32" B="12" E="13"/><b id="33" B="13" E="14" Order="2"/>
+    <b id="34" B="14" E="15"/><b id="35" B="15" E="16" Order="2"/><b id="36" B="16" E="11"/>
+    <b id="37" B="12" E="17"/><b id="38" B="17" E="18" Order="2"/>
+    <b id="39" B="18" E="19"/><b id="40" B="19" E="20" Order="2"/><b id="41" B="20" E="11"/>
+  </fragment></page></CDXML>`);
+  expect(opened.source).toBe("external-cdxml");
+  const document = opened.document!;
+  const object = molecule(document);
+  expect(layoutEngine.ringInteriorDoubleBondSides(object).get(object.bonds[0]!.id)).toBe("left");
+  expect(object.bonds[0]!.display).toMatchObject({ doubleBondSide: "right", doubleBondSideSource: "imported" });
+  return document;
 }
 
 function molecule(document: ChemDraftDocument): MoleculeObject {
@@ -193,6 +216,70 @@ describe("imported ring double-bond strokes", () => {
     expect(result.atoms[2]!.y).toBeLessThan(from!.y);
     expect(result.bonds[0]!.display?.doubleBondSide).toBe("right");
     expect(chemistry(result)).toEqual(chemistry(object));
+  });
+
+  it("keeps a shared double bond pointing into its imported ring after rotation", () => {
+    const document = importedFusedHexagons();
+    const object = molecule(document);
+    const rotated = molecule(rotateDocumentObject(document, object.id, 37));
+
+    expect(rotated.atoms).not.toEqual(object.atoms);
+    expect(rotated.bonds[0]!.display).toEqual(object.bonds[0]!.display);
+    expect(chemistry(rotated)).toEqual(chemistry(object));
+  });
+
+  it("keeps a shared double bond pointing into its imported ring after an atom drag", () => {
+    const document = importedFusedHexagons();
+    const object = molecule(document);
+    const atom = object.atoms[2]!;
+    const dragged = molecule(moveNativeMoleculeParts(document, {
+      objectId: object.id, kind: "atom", atomId: atom.id
+    }, { x: -4, y: 6 }));
+
+    expect(dragged.atoms[2]!.x).toBeCloseTo(atom.x - 4);
+    expect(dragged.bonds[0]!.display).toEqual(object.bonds[0]!.display);
+    expect(chemistry(dragged)).toEqual(chemistry(object));
+  });
+
+  it("keeps a shared double bond pointing into its imported ring on stationary Clean Up", () => {
+    const document = importedFusedHexagons();
+    const object = molecule(document);
+    const cleaned = molecule(cleanUp(document));
+
+    expect(cleaned.atoms).toEqual(object.atoms);
+    expect(cleaned.bonds[0]!.display).toEqual(object.bonds[0]!.display);
+    expect(chemistry(cleaned)).toEqual(chemistry(object));
+  });
+
+  it("keeps the shared offset when the full Clean Up engine returns the drawn layout", async () => {
+    const document = importedFusedHexagons();
+    const object = molecule(document);
+    const loadAlternates = vi.fn(async () => []);
+    const cleaned = molecule(await prepareNativeMoleculeEngineRelayout(
+      document, object.id, pastedStructureDepictionFromMolfile, loadAlternates
+    ));
+
+    expect(loadAlternates).not.toHaveBeenCalled();
+    for (const [index, atom] of cleaned.atoms.entries()) {
+      expect(atom.x).toBeCloseTo(object.atoms[index]!.x, 2);
+      expect(atom.y).toBeCloseTo(object.atoms[index]!.y, 2);
+    }
+    expect(cleaned.bonds[0]!.display).toEqual(object.bonds[0]!.display);
+    expect(chemistry(cleaned)).toEqual(chemistry(object));
+  });
+
+  it("repairs a shared double bond pointing outside both owning rings", () => {
+    const document = importedFusedHexagons();
+    const object = molecule(document);
+    const sharedX = object.atoms[0]!.x;
+    // Fold the second ring across the shared bond without changing the stored offset.
+    const atoms = object.atoms.map(atom => atom.x > sharedX ? { ...atom, x: 2 * sharedX - atom.x, y: atom.y + 4 } : atom);
+    const folded = applyPatch(document, { op: "updateObject", objectId: object.id, changes: { atoms } });
+    const cleaned = molecule(cleanUp(folded));
+
+    expect(cleaned.atoms).toEqual(atoms);
+    expect(cleaned.bonds[0]!.display?.doubleBondSide).toBe("left");
+    expect(chemistry(cleaned)).toEqual(chemistry(object));
   });
 
   it("delegates offset hit geometry to layout-engine with the desktop Center radius", () => {
