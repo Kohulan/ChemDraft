@@ -59,7 +59,10 @@ describe("double-bond position commands", () => {
     expect(createDoubleBondPositionActions(0).every((action) => !action.enabled && action.disabledReason === "Select a double bond")).toBe(true);
   });
 });
-import { allShellCommands, convertTextToAtomLabelCommandId } from "./commands";
+import { allShellCommands, convertTextToAtomLabelCommandId, structureInteractive3dCommandId, structureSpin3dCommandId } from "./commands";
+import type { Engine3dSidecarStatus } from "./engine3dSidecar";
+import { sessionUnavailableCommandIds, withoutSessionUnavailableCommands } from "./sessionUnavailableCommands";
+import { filterToolbarCustomizationCommands } from "./toolbars/toolbarCustomizationCommands";
 import { editActions, fragmentAtomDrawingHotkeys, fragmentBondDrawingHotkeys, fragmentSproutCommandId, fragmentSproutCommands, fragmentSproutKindForCommand } from "./commands";
 import { createPhase4Document, insertNativeSingleBondMolecule, insertNativeTextObject, getSelectedMolecule, selectDocumentObjects } from "./documentWorkflow";
 import { buildAppMenuModel, flattenAppMenuCommands } from "./appMenu";
@@ -67,7 +70,7 @@ import { normalizeShortcut, parseShortcutDisplay } from "@chemdraft/shortcut-eng
 import { createLayerActions, createQuickActions } from "./commands";
 import { withStandaloneDrawingToolCommands } from "./drawingTools";
 import { createMainWindowShortcutCommands } from "./keyboardShortcuts";
-import { desktopToolsetRegistry, getToolsetCommandSpecs } from "./toolsets";
+import { desktopToolsetRegistry, getToolsetCommandSpecs, sessionAvailableRegistry } from "./toolsets";
 import { elementSymbols } from "@chemdraft/chem-core";
 import { chemDrawHoveredTargetHotkeyCommand } from "./keybindingScheme";
 
@@ -297,5 +300,72 @@ describe("Molecule Inspector commands", () => {
       value: false
     });
     expect(moleculeAtomLabelHideImplicitHydrogensForCommand("molecule.atomLabel.hideImplicitHydrogens:toggle")).toBeUndefined();
+  });
+});
+
+describe("Interactive 3D availability", () => {
+  const commands = (sidecar?: Engine3dSidecarStatus, desktop = true) =>
+    allShellCommands(createPhase4Document(), undefined, { unavailableCommandIds: sessionUnavailableCommandIds(sidecar, desktop) });
+  const sidecar = (available: boolean): Engine3dSidecarStatus => ({
+    available, protocolVersion: 2, source: available ? "bundled" : "missing", envVar: "CHEMDRAFT_ENGINE3D_SIDECAR",
+    bundledBinaryName: "avogadro3d-sidecar", targetTriple: "x86_64-unknown-linux-gnu"
+  });
+
+  it("stays enabled when the sidecar can run, or while the desktop shell has not answered yet", () => {
+    for (const status of [sidecar(true), undefined]) {
+      const spec = commands(status).find((command) => command.id === structureInteractive3dCommandId)!;
+      expect(spec).toMatchObject({ title: "Interactive 3D Workspace" });
+      expect(spec.enabled).not.toBe(false);
+      expect(spec.disabledReason).toBeUndefined();
+    }
+  });
+
+  // Changed from "is disabled with the sidecar's reason": AGENTS.md §10 removes a tool the build
+  // cannot provide for the whole session; disabledReason is only for transient state.
+  it("is left out, not disabled, when this build has no runnable sidecar; Spin 3D stays", () => {
+    const ids = commands(sidecar(false)).map((command) => command.id);
+    expect(ids).not.toContain(structureInteractive3dCommandId);
+    expect(ids).toContain(structureSpin3dCommandId);
+    expect(sessionUnavailableCommandIds(sidecar(false), true)).toEqual(new Set([structureInteractive3dCommandId]));
+    expect(sessionUnavailableCommandIds(sidecar(true), true).size).toBe(0);
+    expect(sessionUnavailableCommandIds(undefined, true).size).toBe(0);
+  });
+
+  it("is left out of the browser build, which has no desktop bridge and so no sidecar", () => {
+    const ids = commands(undefined, false).map((command) => command.id);
+    expect(ids).not.toContain(structureInteractive3dCommandId);
+    expect(ids).toContain(structureSpin3dCommandId);
+    expect(sessionUnavailableCommandIds(undefined, false)).toEqual(new Set([structureInteractive3dCommandId]));
+    // With no Tauri globals (this test host), detection reports the browser build.
+    expect(sessionUnavailableCommandIds(undefined)).toEqual(new Set([structureInteractive3dCommandId]));
+  });
+
+  it("is left out of the displayed toolbars without touching the shipped registry", () => {
+    const unavailable = sessionUnavailableCommandIds(sidecar(false), true);
+    const shown = sessionAvailableRegistry(desktopToolsetRegistry, unavailable);
+    const commandIds = (registry: typeof desktopToolsetRegistry) => registry.listToolsets().flatMap(toolset =>
+      toolset.groups.flatMap(group => group.items.flatMap(item => [
+        ...(item.primary?.type === "command" ? [item.primary.commandId] : []),
+        ...(item.submenu?.items.map(entry => entry.commandId) ?? [])
+      ])));
+    expect(commandIds(desktopToolsetRegistry)).toContain(structureInteractive3dCommandId);
+    expect(commandIds(shown)).not.toContain(structureInteractive3dCommandId);
+    expect(commandIds(shown)).toContain(structureSpin3dCommandId);
+    expect(sessionAvailableRegistry(desktopToolsetRegistry, new Set())).toBe(desktopToolsetRegistry);
+    // Customize gallery: built from the shell commands, so it never offers the tool either.
+    expect(filterToolbarCustomizationCommands(commands(sidecar(false)), { enabled: true }).map(command => command.id))
+      .not.toContain(structureInteractive3dCommandId);
+  });
+
+  it("is filtered out of command lists built before the sidecar status was known", () => {
+    // A palette's fallback specs come from allShellCommands with no session filter.
+    const fallback = commands(sidecar(true));
+    expect(fallback.map(command => command.id)).toContain(structureInteractive3dCommandId);
+    const shown = withoutSessionUnavailableCommands(fallback, sessionUnavailableCommandIds(sidecar(false), true));
+    expect(shown.map(command => command.id)).not.toContain(structureInteractive3dCommandId);
+    expect(shown.map(command => command.id)).toContain(structureSpin3dCommandId);
+    expect(filterToolbarCustomizationCommands(shown, { enabled: true }).map(command => command.id))
+      .not.toContain(structureInteractive3dCommandId);
+    expect(withoutSessionUnavailableCommands(fallback, new Set())).toBe(fallback);
   });
 });

@@ -60,6 +60,7 @@ import {
   toolbarCustomizationActions,
   viewActions
 } from "./commands";
+import { sessionUnavailableCommandIds } from "./sessionUnavailableCommands";
 import {
   applyAnalysisToSelectedMolecule,
   applyChargeToolAtNativeAtom,
@@ -3026,8 +3027,18 @@ describe("ChemDraft desktop shell", () => {
 
   it("keeps palette buttons backed by command ids", () => {
     const markup = renderToStaticMarkup(createElement(PaletteWindow));
+    // paletteGroups is the shipped registry. The palette leaves out the commands this session
+    // cannot provide (AGENTS.md §10): this test host has no desktop bridge, so, like the browser
+    // build, it has no 3D sidecar and omits Interactive 3D. commands.test.ts ("Interactive 3D
+    // availability") covers the desktop build with a runnable sidecar keeping it.
+    const unavailable = sessionUnavailableCommandIds(undefined);
+    expect(unavailable).toEqual(new Set([structureInteractive3dCommandId]));
 
     for (const command of paletteGroups.flat()) {
+      if (unavailable.has(command.id)) {
+        expect(markup).not.toContain(`data-command-id="${command.id}"`);
+        continue;
+      }
       expect(markup).toContain(`data-command-id="${command.id}"`);
       expect(markup).toContain(command.title);
     }

@@ -1,5 +1,20 @@
 import { describe, expect, it } from "vitest";
-import { placePaletteTooltip } from "./PaletteTooltipWindow";
+import { paletteTooltipShowArgs, placePaletteTooltip } from "./PaletteTooltipWindow";
+
+describe("paletteTooltipShowArgs", () => {
+  const position = { x: 147, y: 100 };
+  const size = { width: 105, height: 22 };
+
+  it("passes the measured size with the position on Linux", () => {
+    expect(paletteTooltipShowArgs(position, size, "linux")).toEqual({ x: 147, y: 100, width: 105, height: 22 });
+  });
+
+  it("passes only the position on macOS and Windows, which resize from the webview first", () => {
+    for (const platform of ["macos", "windows"] as const) {
+      expect(paletteTooltipShowArgs(position, size, platform)).toEqual({ x: 147, y: 100 });
+    }
+  });
+});
 
 // The palette tooltip window positions itself in GLOBAL logical coordinates. The clamp
 // must use the bounds of the monitor the anchor lives on — the old implementation

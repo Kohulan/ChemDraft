@@ -15,6 +15,11 @@ export const TOOLTIP_RESHOW_WINDOW_MS = 300;
 
 export type ClearTooltipOptions = { onlyMatchingPending?: boolean };
 
+/** Window event that clears every palette tooltip in this webview, as a window blur does. Only the
+ *  Linux palette windows send it, when the pointer has left the palette without a DOM pointerleave
+ *  (paletteTooltipDismissal.ts). */
+export const PALETTE_TOOLTIP_DISMISS_DOM_EVENT = "chemdraft:palette-tooltip-dismiss";
+
 export function usePaletteTooltipState() {
   const [visibleTooltipId, setVisibleTooltipId] = useState<string | undefined>();
   const visibleTooltipIdRef = useRef<string | undefined>(undefined);
@@ -118,10 +123,12 @@ export function usePaletteTooltipState() {
     };
 
     window.addEventListener("blur", dismissTooltip);
+    window.addEventListener(PALETTE_TOOLTIP_DISMISS_DOM_EVENT, dismissTooltip);
     document.addEventListener("pointerdown", dismissTooltip, true);
     document.addEventListener("scroll", dismissTooltip, true);
     return () => {
       window.removeEventListener("blur", dismissTooltip);
+      window.removeEventListener(PALETTE_TOOLTIP_DISMISS_DOM_EVENT, dismissTooltip);
       document.removeEventListener("pointerdown", dismissTooltip, true);
       document.removeEventListener("scroll", dismissTooltip, true);
     };

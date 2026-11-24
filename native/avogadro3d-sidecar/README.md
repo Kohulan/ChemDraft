@@ -33,9 +33,17 @@ Milestone 1 native build rules:
 Fetch local source dependencies into the ignored `_deps` directory:
 
 ```bash
-git clone https://github.com/OpenChemistry/avogadrolibs.git native/avogadro3d-sidecar/_deps/avogadrolibs
-git -C native/avogadro3d-sidecar/_deps/avogadrolibs checkout 416651ddaef33a4e20392392e7c0b505d446491b
-git clone --depth 1 --branch 3.4.0 https://gitlab.com/libeigen/eigen.git native/avogadro3d-sidecar/_deps/eigen
+# By commit alone, with no tags: avogadrolibs' CMake reads `git describe`, which then falls
+# back to its fixed version (only Avogadro::version() uses it, and the sidecar never links that).
+git init -q native/avogadro3d-sidecar/_deps/avogadrolibs
+git -C native/avogadro3d-sidecar/_deps/avogadrolibs remote add origin https://github.com/OpenChemistry/avogadrolibs.git
+git -C native/avogadro3d-sidecar/_deps/avogadrolibs fetch --no-tags --depth 1 origin 416651ddaef33a4e20392392e7c0b505d446491b
+git -C native/avogadro3d-sidecar/_deps/avogadrolibs -c advice.detachedHead=false checkout FETCH_HEAD
+# Eigen 3.4.0 by its commit, not by the tag name, which upstream could move.
+git init -q native/avogadro3d-sidecar/_deps/eigen
+git -C native/avogadro3d-sidecar/_deps/eigen remote add origin https://gitlab.com/libeigen/eigen.git
+git -C native/avogadro3d-sidecar/_deps/eigen fetch --no-tags --depth 1 origin 3147391d946bb4b6c68edd901f2add6ac1f31f8c
+git -C native/avogadro3d-sidecar/_deps/eigen -c advice.detachedHead=false checkout FETCH_HEAD
 ```
 
 Build the Avogadro-backed protocol scout:
@@ -77,6 +85,50 @@ That path contains the committed Intel x86_64 Mach-O sidecar, built for macOS
 11.0. Its binary details are documented in
 `apps/desktop/src-tauri/binaries/README.md`.
 The Intel smoke workflow runs only the committed artifact, never a local build.
+
+### x86_64 Linux sidecar (built in CI, committed by a maintainer)
+
+The Linux packages ship the committed
+`apps/desktop/src-tauri/binaries/avogadro3d-sidecar-x86_64-unknown-linux-gnu`, like the
+macOS and Windows sidecars. It is built by `.github/workflows/linux-sidecar-build.yml`
+(run with `gh workflow run linux-sidecar-build.yml --ref <ref>` once the file is on `main`, or by
+pushing the commit to build to the branch `ci/linux-sidecar-build`; Ubuntu 22.04, the oldest supported host), which fetches the same
+pinned dependencies with the commands above, then:
+
+```bash
+cd native/avogadro3d-sidecar
+cmake --preset linux-x86_64
+cmake --build --preset linux-x86_64
+cd ../..
+```
+
+The `linux-x86_64` preset inherits `protocol-scout` (the same Avogadro Core/Calc
+subset and commit define), builds Release, and links libstdc++ and libgcc
+statically, so the executable needs only glibc (2.35 or newer, from the build host).
+The job fails unless `scripts/check-engine3d-sidecar.mjs` (an ELF, glibc and
+handshake check that needs only Node, no binutils) finds a real x86-64 ELF whose
+`DT_NEEDED` entries are only glibc libraries, with no symbol version newer than glibc
+2.35, that completes the protocol handshake: every stdout line must parse as a
+protocol message for the check's session, and the commit result must report
+Avogadro-backed UFF and the pinned commit. A sidecar that hangs is killed (SIGTERM,
+then SIGKILL) and fails the check. It then runs `pnpm audit:engine3d-sidecar`
+and all three smokes below with `CHEMDRAFT_ENGINE3D_SIDECAR` set to
+`native/avogadro3d-sidecar/build/linux-x86_64/avogadro3d-sidecar` (the examples below name the
+`protocol-scout` build), and uploads the artifact `engine3d-sidecar-linux-x86_64`
+(the binary and its `.sha256`), printing the SHA-256 and the run id in the job summary.
+
+A maintainer commits that binary (mode 0755) and puts the run id and SHA-256 into
+`scripts/engine3d-sidecar-linux.json` and `docs/architecture/dependency-inventory.md`;
+`docs/releasing/linux.md` ("The x86_64 3D sidecar") lists the steps. Linux packaging
+(`.github/workflows/linux-build.yml`) never builds the sidecar or writes over the
+committed file: `scripts/verify-committed-linux-sidecar.mjs` checks its SHA-256
+against the pin and repeats the handshake check, and fails while the pin still reads
+`PENDING-MAINTAINER-COMMIT`. The sidecars inside the finished `.deb` and AppImage are
+checked against the same pin and must be regular files with mode 0755 (`--packaged`). The
+container smoke repeats the mode and handshake checks on the sidecar installed from the
+`.deb` and the AppImage on each distro. Changing the avogadrolibs
+commit pinned in `CMakeLists.txt` requires a rebuilt, recommitted Linux sidecar, as
+for the other platforms. aarch64 Linux has no build and stays a placeholder.
 
 Without the local `_deps` checkout, the CMake preset intentionally fails rather
 than falling back to placeholder mechanics. A no-Avogadro fallback build can be
