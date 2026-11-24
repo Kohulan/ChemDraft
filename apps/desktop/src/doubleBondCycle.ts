@@ -35,15 +35,19 @@ function cycleTargetBond(document: ChemDraftDocument, target: Pick<NativeBondOrd
  * Display-only: order, atoms, coordinates and stereo are untouched. A ring offset is stored as
  * the user's choice (`doubleBondSideSource: "user"`), so Clean Up and ring redraws keep it.
  * Returns undefined when the bond does not cycle, leaving callers' existing behaviour in place.
+ * `drawnSide` is the side on screen when a hover preview stands in for the stored one: the cycle
+ * steps from what the user sees, skipping the stored side so every step visibly changes the bond.
  */
 export function cycleNativeDoubleBondPosition(
-  document: ChemDraftDocument, target: Pick<NativeBondOrderTarget, "objectId" | "bondId">
+  document: ChemDraftDocument, target: Pick<NativeBondOrderTarget, "objectId" | "bondId">,
+  drawnSide?: DoubleBondCyclePosition
 ): DoubleBondCycleResult | undefined {
   const found = cycleTargetBond(document, target);
   if (!found) return undefined;
-  const current = renderedDoubleBondSide(found.molecule, found.bond);
-  if (!current) return undefined;
-  const position = nextDoubleBondCyclePosition(current);
+  const stored = renderedDoubleBondSide(found.molecule, found.bond);
+  if (!stored) return undefined;
+  let position = nextDoubleBondCyclePosition(drawnSide ?? stored);
+  if (position === stored) position = nextDoubleBondCyclePosition(position);
   const next = applyMoleculeDoubleBondPosition(document, [{ objectId: target.objectId, bondId: target.bondId }], position);
   if (next === document) return undefined;
   return { document: next, position, undoLabel: `Double-bond position: ${position}` };
@@ -60,8 +64,9 @@ export function doubleBondGestureCycle(
   document: ChemDraftDocument,
   target: Pick<NativeBondOrderTarget, "objectId" | "bondId">,
   order: MoleculeBond["order"],
-  stereo?: "either"
+  stereo?: "either",
+  drawnSide?: DoubleBondCyclePosition
 ): DoubleBondCycleResult | undefined {
   if (order !== "double" || stereo !== undefined) return undefined;
-  return cycleNativeDoubleBondPosition(document, target);
+  return cycleNativeDoubleBondPosition(document, target, drawnSide);
 }

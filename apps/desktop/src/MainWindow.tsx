@@ -2990,6 +2990,10 @@ export function MainWindow({
   const [pageContextMenu, setPageContextMenu] = useState<ClientPoint | undefined>();
   const [freeformNativeBond, setFreeformNativeBond] = useState<FreeformNativeBondPreview | undefined>();
   const [nativeDoubleBondSidePreview, setNativeDoubleBondSidePreview] = useState<NativeDoubleBondSidePreview | undefined>();
+  const nativeDoubleBondSidePreviewRef = useRef(nativeDoubleBondSidePreview);
+  nativeDoubleBondSidePreviewRef.current = nativeDoubleBondSidePreview;
+  // A hover-2 cycle's committed side, shown in place of the pointer's preview until the pointer moves.
+  const cycledDoubleBondSidePreviewRef = useRef<NativeDoubleBondSidePreview | undefined>(undefined);
   const [graphicCornerRadiusReadout, setGraphicCornerRadiusReadout] = useState<GraphicCornerRadiusReadoutState | undefined>();
   const [objectRotateReadout, setObjectRotateReadout] = useState<ObjectRotateReadoutState | undefined>();
   const [projectedPlaneTiltReadout, setProjectedPlaneTiltReadout] = useState<ProjectedPlaneTiltReadoutState | undefined>();
@@ -5097,10 +5101,21 @@ export function MainWindow({
     const madePlain = order === "single" && object?.type === "molecule" &&
       nativeBondCanBeMadePlain(object.bonds.find(bond => bond.id === target.bondId));
     const selectedDocument = selectDocumentObject(currentDocument, target.objectId);
-    const cycled = doubleBondGestureCycle(selectedDocument, target, order);
+    // The Bond tool's hover preview draws over the stored side: cycle from what is on screen.
+    const preview = nativeDoubleBondSidePreviewRef.current;
+    const previewed = preview?.objectId === target.objectId && preview.bondId === target.bondId ? preview : undefined;
+    const drawnSide = previewed?.side === "automatic" ? undefined : previewed?.side;
+    const cycled = doubleBondGestureCycle(selectedDocument, target, order, undefined, drawnSide);
     if (cycled) {
       // Display-only (PRESERVE_CHEMISTRY). The hover stays, so pressing 2 again keeps cycling.
-      if (commitDocumentChange(cycled.document, cycled.undoLabel)) setStatus(cycled.undoLabel);
+      if (commitDocumentChange(cycled.document, cycled.undoLabel)) {
+        // Keep the preview on the committed side so the canvas shows it without a pointer move.
+        if (previewed) {
+          cycledDoubleBondSidePreviewRef.current = { ...previewed, side: cycled.position };
+          setNativeDoubleBondSidePreview(cycledDoubleBondSidePreviewRef.current);
+        }
+        setStatus(cycled.undoLabel);
+      }
       return;
     }
     const nextDocument = applyNativeMoleculeBondOrderValueTarget(selectedDocument, target, order);
@@ -16916,9 +16931,13 @@ export function MainWindow({
 
     if (activeToolState.activeCommandId === "tool.bond" && target) {
       const object = findDocumentObject(sourceDocument, target.objectId);
-      setNativeDoubleBondSidePreview(object?.type === "molecule"
+      const preview = object?.type === "molecule"
         ? nativeDoubleBondSidePreviewFromHit(target.objectId, object, target, point, hitToleranceForScale(viewportRef.current.scale))
-        : undefined);
+        : undefined;
+      // The re-hit after a hover-2 cycle keeps showing the side it just committed.
+      const cycled = cycledDoubleBondSidePreviewRef.current;
+      setNativeDoubleBondSidePreview(preview && cycled?.objectId === preview.objectId && cycled.bondId === preview.bondId
+        ? cycled : preview);
     } else {
       setNativeDoubleBondSidePreview(undefined);
     }
@@ -16975,6 +16994,7 @@ export function MainWindow({
       lastCanvasPointerClientPointRef.current = undefined;
     };
     const handleWindowPointerMove = (event: globalThis.MouseEvent) => {
+      cycledDoubleBondSidePreviewRef.current = undefined;
       const clientPoint = { x: event.clientX, y: event.clientY };
       const canvas = canvasRegionRef.current;
       pointerInsideCanvasRef.current = Boolean(canvas && clientPointIsInsideRect(clientPoint, canvas.getBoundingClientRect()));

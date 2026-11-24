@@ -72,6 +72,23 @@ async function expectSameChemistry(before: ChemDraftDocument, after: ChemDraftDo
 }
 
 describe("double-bond position cycle", () => {
+  it("steps from a drawn hover-preview side, skipping the stored side so each step shows", () => {
+    const document = butene();
+    const graph = molecule(document), target = bondTarget(graph, doubleBond(graph));
+    const stored = shown(document)!;
+    const drawn = nextDoubleBondCyclePosition(stored);
+    // The step after the drawn side is the next one round.
+    const after = nextDoubleBondCyclePosition(drawn);
+    expect(after).not.toBe(stored);
+    expect(shown(cycleNativeDoubleBondPosition(document, target, drawn)!.document)).toBe(after);
+    // A drawn side whose next step is the stored one skips past it.
+    const beforeStored = nextDoubleBondCyclePosition(nextDoubleBondCyclePosition(stored));
+    const skipped = doubleBondGestureCycle(document, target, "double", undefined, beforeStored)!;
+    expect(skipped.position).toBe(nextDoubleBondCyclePosition(stored));
+    expect(shown(skipped.document)).toBe(skipped.position);
+    expect(skipped.position).not.toBe(beforeStored);
+  });
+
   it("steps left -> center -> right -> left", () => {
     expect(doubleBondCycleOrder).toEqual(["left", "center", "right"]);
     expect(nextDoubleBondCyclePosition("left")).toBe("center");

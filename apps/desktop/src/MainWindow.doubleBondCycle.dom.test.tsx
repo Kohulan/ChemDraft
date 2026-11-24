@@ -189,6 +189,28 @@ describe("MainWindow double-bond position cycle", () => {
       expect(renderedSide()).toBe(start);
     }, 20_000);
 
+    it(`with the Bond tool, each hover 2 redraws the bond on its committed side without a pointer move (${platform})`, async () => {
+      await render(butene(), platform, "tool.bond");
+      const stored = renderedSide();
+      await hoverDoubleBond();
+      // The Bond tool's hover preview draws over the stored side.
+      const previewed = renderedSide();
+      expect(previewed).not.toBe(stored);
+
+      const drawn = [previewed];
+      for (let press = 0; press < 3; press += 1) {
+        await press2();
+        const committed = doubleBond().display?.doubleBondSide;
+        expect(status()).toBe(`Double-bond position: ${committed}`);
+        // The canvas shows the side just committed: never the pre-press preview or side.
+        expect(renderedSide()).toBe(committed);
+        expect(renderedSide()).not.toBe(drawn.at(-1));
+        drawn.push(renderedSide());
+      }
+      expect(new Set(drawn.slice(1))).toEqual(new Set(["left", "center", "right"]));
+      expect(snapshot().hoveredNativeTarget).toMatchObject({ kind: "bond", bondId: doubleBond().id });
+    }, 20_000);
+
     it(`keeps a ring double bond's user side outside the ring through Clean Up (${platform})`, async () => {
       await render(distortedCyclohexene(), platform);
       const bondId = doubleBond().id;
