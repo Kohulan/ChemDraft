@@ -3201,7 +3201,15 @@ fn restore_utility_labels<R: Runtime>(
         }
         if let Some(toolset_id) = toolset_id_for_window_label(app, &label) {
             buffer_utility_recovery_position(&window);
-            recover_offscreen_toolset_window(app, &window, toolset_is_resizable(&toolset_id));
+            // A dialog must not move palettes (B6). A palette the user left partly off-screen keeps
+            // its place; only one whose title can no longer be grabbed is pulled back. Clamping
+            // every palette here made Main jump after any prompt when it overhung the screen edge
+            // (GitHub #304). A frame ChemDraft fitted to a smaller work area still recovers, which
+            // returns it to the user's frame once there is room (B9).
+            let fitted = toolset_fit::with_memory(|memory| memory.is_fitted(&label));
+            if fitted || !toolset_title_reachable(app, &window) {
+                recover_offscreen_toolset_window(app, &window, toolset_is_resizable(&toolset_id));
+            }
         }
         if dialog_windows::is_dialog_label(&label) {
             dialog_windows::mark_transient(&label);
@@ -12829,6 +12837,46 @@ fn visible_toolset_physical_position<R: Runtime>(
         return None;
     }
     window.outer_position().ok()
+}
+
+/// Whether enough of a palette's title strip lies on a monitor's work area for the user to grab it.
+/// Uses the same per-platform test as the content fit: points on macOS, virtual-desktop pixels
+/// elsewhere (Windows mixes monitor scales; Linux X11 reports pixels).
+fn toolset_title_reachable<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    window: &tauri::WebviewWindow<R>,
+) -> bool {
+    let (Ok(position), Ok(size), Ok(scale)) = (
+        window.outer_position(),
+        window.outer_size(),
+        window.scale_factor(),
+    ) else {
+        return false;
+    };
+    let width = size.to_logical::<f64>(scale).width;
+    monitor_query::available_monitors(app)
+        .unwrap_or_default()
+        .iter()
+        .any(|monitor| {
+            #[cfg(target_os = "macos")]
+            {
+                monitor_logical_work_area(monitor).contains_title_strip(
+                    f64::from(position.x) / scale,
+                    f64::from(position.y) / scale,
+                    width,
+                    TOOLSET_TITLE_HEIGHT,
+                )
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                toolset_title_in_physical_work_area(
+                    (position.x, position.y),
+                    width,
+                    scale,
+                    monitor.work_area(),
+                )
+            }
+        })
 }
 
 fn current_toolset_window_position<R: Runtime>(
