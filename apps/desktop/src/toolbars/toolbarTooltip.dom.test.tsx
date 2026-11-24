@@ -5,7 +5,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ToolPalette } from "../ToolPalette";
 import type { CommandSpec } from "../commands";
 import type { ToolbarPaletteItemModel } from "../toolsets";
-import { PaletteControlTooltip, PaletteControlTooltipContext, TOOLTIP_DELAY_MS, TOOLTIP_RESHOW_WINDOW_MS, usePaletteTooltipState } from "./toolbarTooltip";
+import {
+  PALETTE_TOOLTIP_DISMISS_DOM_EVENT, PaletteControlTooltip, PaletteControlTooltipContext, TOOLTIP_DELAY_MS,
+  TOOLTIP_RESHOW_WINDOW_MS, usePaletteTooltipState
+} from "./toolbarTooltip";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -104,14 +107,26 @@ describe("palette tooltip handoff", () => {
     expect(visible("b")).toBe(true);
   });
 
-  it("cancels pending and visible tooltips on blur", () => {
+  it.each(["blur", PALETTE_TOOLTIP_DISMISS_DOM_EVENT])("cancels pending and visible tooltips on %s", (type) => {
     showA();
-    act(() => window.dispatchEvent(new Event("blur")));
+    act(() => window.dispatchEvent(new Event(type)));
     expect(visible("a")).toBe(false);
     act(() => pointer("b", "pointerover"));
-    act(() => window.dispatchEvent(new Event("blur")));
+    act(() => window.dispatchEvent(new Event(type)));
     act(() => vi.advanceTimersByTime(TOOLTIP_DELAY_MS));
     expect(visible("b")).toBe(false);
+  });
+
+  it("shows A again after a Linux dismissal when the pointer comes back, with the full delay", () => {
+    showA();
+    act(() => window.dispatchEvent(new Event(PALETTE_TOOLTIP_DISMISS_DOM_EVENT)));
+    expect(visible("a")).toBe(false);
+    act(() => pointer("a", "pointerout"));
+    act(() => pointer("a", "pointerover"));
+    act(() => vi.advanceTimersByTime(TOOLTIP_DELAY_MS - 1));
+    expect(visible("a")).toBe(false);
+    act(() => vi.advanceTimersByTime(1));
+    expect(visible("a")).toBe(true);
   });
 });
 

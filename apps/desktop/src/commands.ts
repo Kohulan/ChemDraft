@@ -84,6 +84,11 @@ export interface ShellCommandOptions {
   registry?: DesktopToolsetRegistry;
   /** The uncustomized command catalog. The live registry still supplies toolbar launchers. */
   paletteCommands?: readonly CommandSpec[];
+  /**
+   * Commands this build cannot run for the whole session (`sessionUnavailableCommandIds`, e.g.
+   * Interactive 3D without a runnable 3D sidecar). They are left out, never listed disabled.
+   */
+  unavailableCommandIds?: ReadonlySet<string>;
 }
 
 export interface CommandSpec extends CommandDefinition {
@@ -2476,6 +2481,8 @@ export function allShellCommands(
   options: ShellCommandOptions = {}
 ): CommandSpec[] {
   const registry = options.registry ?? desktopToolsetRegistry;
+  const paletteCommands = options.paletteCommands ?? allPaletteCommands();
+  const unavailable = options.unavailableCommandIds;
   return dedupeCommands([
     ...createSelectionNudgeActions(document.selection.objectIds.length > 0 || options.availability?.hasMoleculeFragmentSelection === true),
     ...atomProblemCommands(document).map(command => command.spec),
@@ -2491,7 +2498,7 @@ export function allShellCommands(
       options.structureSearchEnabled ?? loadStructureSearchEnabled(),
       options.hasSearchableStructure ?? structureSearchDocument(document) !== undefined
     ),
-    ...(options.paletteCommands ?? allPaletteCommands()),
+    ...paletteCommands,
     ...copyAsActions,
     ...editActions,
     ...atomElementActions,
@@ -2507,7 +2514,7 @@ export function allShellCommands(
     ...nativeStylePresetActions,
     ...toolbarCustomizationActions,
     vibeCodeStarterCommand
-  ]);
+  ]).filter(command => !unavailable?.has(command.id));
 }
 
 /** Finite value-encoded family. Only the two-slot widgets are offered by the toolbar gallery. */
