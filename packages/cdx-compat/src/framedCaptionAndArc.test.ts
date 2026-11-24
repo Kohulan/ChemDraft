@@ -392,6 +392,54 @@ it("does not use a font whose name is too long, with one warning naming its id, 
   expect(large.chars / small.chars).toBeLessThan(4.5);
 });
 
+// Kimi (#442): import left out the over-long font and declined the caption frame, but kept the
+// text's source XML and native-state snapshot, so saving the unchanged file copied runs naming the
+// left-out font id: the saved file named a font its table did not list, with no warning. Such a
+// text is now written as plain styled text, and the save says why.
+const fontIdsOf = (contents: string) => ({
+  listed: new Set([...contents.matchAll(/<font id="(\d+)"/g)].map(match => match[1])),
+  named: [...contents.matchAll(/<s [^>]*font="(\d+)"/g)].map(match => match[1])
+});
+
+it("saves an unchanged caption whose font was left out as plain styled text, naming no missing font, with a warning", () => {
+  const source = `<CDXML><fonttable><font id="3" charset="iso-8859-1" name="Arial"/><font id="7" charset="iso-8859-1" name="${"N".repeat(10_000)}"/></fonttable>` +
+    `<page>${caption(9, 2, 7)}${caption(10, 1, 3, 120)}</page></CDXML>`;
+  const opened = openChemDraftPayload(source);
+  const [omitted, kept] = textsOf(opened);
+  expect(omitted.compatibility?.unknown.cdxmlTextFontOmitted).toBe(true);
+  expect(kept.compatibility?.unknown.cdxmlTextFontOmitted).toBeUndefined();
+  const saved = exportDocumentToCdxml(opened.document!, plain);
+  const { listed, named } = fontIdsOf(saved.contents);
+  expect(named.every(id => listed.has(id))).toBe(true);
+  expect(named).toEqual(["3"]);
+  expect(saved.warnings.filter(w => w.code === "cdxml.font_entry_too_long").map(w => w.message)).toEqual([
+    `CDXML export: the source font of text ${omitted.id} has a name longer than 256 characters, or more than 512 characters of font attributes, far beyond any real font; ` +
+    "it was not written, and text set in it was written without its caption frame and run fonts, or in the default font."
+  ]);
+  // The text itself is kept, and the other caption keeps its unchanged source form.
+  expect(saved.warnings.map(w => w.code)).not.toContain("cdxml.text_source_formatting_not_kept");
+  const again = textsOf(openChemDraftPayload(saved.contents));
+  expect(again.map(text => text.text)).toEqual(["xx", "x"]);
+  expect(again[1].style.fontFamily).toBe("Arial");
+  // Saved again, nothing refers to the left-out font, so there is nothing left to warn about.
+  expect(again[0].compatibility?.unknown.cdxmlTextFontOmitted).toBeUndefined();
+});
+
+it("does not copy an unchanged source text naming a stored font that is too long to write", () => {
+  const opened = openChemDraftPayload(`<CDXML><fonttable><font id="3" charset="iso-8859-1" name="Arial"/><font id="7" charset="iso-8859-1" name="Times"/></fonttable>` +
+    `<page>${caption(9, 1, 7)}${caption(10, 1, 3, 120)}</page></CDXML>`);
+  // A crafted native document: the stored entry for font 7 is over the caps (opening native JSON drops it; a document built in memory still has it).
+  for (const text of textsOf(opened)) {
+    text.compatibility!.unknown.cdxmlTextFontTable = (text.compatibility!.unknown.cdxmlTextFontTable as { id: string }[])
+      .map(font => font.id === "7" ? { ...font, name: "N".repeat(1_000) } : font);
+  }
+  const saved = exportDocumentToCdxml(opened.document!, plain);
+  const { listed, named } = fontIdsOf(saved.contents);
+  expect(named.every(id => listed.has(id))).toBe(true);
+  expect(saved.warnings.filter(w => w.code === "cdxml.font_entry_too_long")).toHaveLength(1);
+  expect(textsOf(openChemDraftPayload(saved.contents)).map(text => text.text)).toEqual(["x", "x"]);
+});
+
 it("keeps a 256-character font name and saves many captions in it linearly", () => {
   const name = "N".repeat(256);
   const sizes = [250, 500, 1_000].map(count => {

@@ -377,6 +377,8 @@ interface CdxmlImportFonts {
   usage: { captionRuns: number; captionRunLimitReached: boolean; fontTableEntries: number; fontTableChars: number };
   /** Characters in `table` (keys and values), what one shared copy adds to the budget. */
   tableChars: number;
+  /** Ids of fonts left out for being over the per-font caps (a text naming one is marked). */
+  omittedIds: ReadonlySet<string>;
 }
 
 function cdxmlFontEntryChars(font: Readonly<Record<string, unknown>>): number {
@@ -447,11 +449,13 @@ function importCdxmlFonts(tree: OrderedXmlTree, sourceFormat: string, warnings: 
   }
   const usable: CdxmlFont[] = [];
   const oversized: string[] = [];
+  const omittedIds = new Set<string>();
   let tableChars = 0;
   for (const font of listed.slice(0, cdxmlLimits.fontTable)) {
     const chars = cdxmlFontEntryChars(font);
     if (cdxmlFontEntryTooLong(font, chars)) {
       oversized.push(cdxmlFontIdLabel(font.id));
+      if (font.id !== undefined) omittedIds.add(font.id);
       continue;
     }
     tableChars += chars;
@@ -462,7 +466,7 @@ function importCdxmlFonts(tree: OrderedXmlTree, sourceFormat: string, warnings: 
       "not used, and text set in {it} keeps the default font."));
   }
   const table = trackCdxmlFontTable(usable);
-  return { table, byId: indexCdxmlFonts(table, font => font.id), tableChars,
+  return { table, byId: indexCdxmlFonts(table, font => font.id), tableChars, omittedIds,
     usage: { captionRuns: 0, captionRunLimitReached: false, fontTableEntries: 0, fontTableChars: 0 } };
 }
 
@@ -477,6 +481,12 @@ interface CdxmlExportFonts {
   plainCaptionIds: ReadonlySet<string>;
   /** Set once the export has reported the cap (one warning per document). */
   captionRunLimitWarned: boolean;
+  /**
+   * Stored font ids over the per-font caps, which the font table does not write. An unchanged
+   * source text naming one (or marked cdxmlTextFontOmitted on import) is not copied back out, which
+   * would leave its runs naming a font the file does not list; it is written as plain styled text.
+   */
+  notWrittenIds: ReadonlySet<string>;
 }
 
 interface CdxmlCrossingImportHint {
@@ -1018,8 +1028,9 @@ function unsupportedSchemaWarningFromJson(contents: string): CompatibilityConver
 function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityConversionWarning[]): CdxmlExportFonts {
   const fonts = new Map<string, CdxmlFont>();
   // A stored font over the per-font caps (a native payload's table is not checked by import) is not
-  // written, but its id stays reserved: an unchanged source text still names it, and must not end
-  // up naming a different font. One warning names every font not written.
+  // written, and its id stays reserved so that no new font takes it. An unchanged source text that
+  // names it is written as plain styled text (exportTextObject), never copied back out naming a font
+  // the file does not list. One warning names every font not written.
   const tooLong: string[] = [];
   const tooLongIds = new Set<string>();
   for (const page of document.pages) for (const object of page.objects) {
@@ -1040,6 +1051,11 @@ function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityCo
       }
       fonts.set(font.id, font);
     }
+  }
+  // A text whose source runs named a font import left out (over the caps) has no font to write for
+  // them; it is written as plain styled text, reported in the one warning below.
+  for (const page of document.pages) for (const object of page.objects) {
+    if (object.type === "text" && object.compatibility?.unknown.cdxmlTextFontOmitted === true) tooLong.push(`the source font of text ${object.id}`);
   }
   const byName = indexCdxmlFonts<string | undefined>(fonts.values(), font => font.name);
   const plainCaptionIds = new Set<string>();
@@ -1092,7 +1108,7 @@ function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityCo
     warnings.push(cdxmlFontEntryTooLongWarning("CDXML export", "", tooLong,
       "not written, and text set in {it} was written without its caption frame and run fonts, or in the default font."));
   }
-  return { table: trackCdxmlFontTable([...fonts.values()]), byName, plainCaptionIds, captionRunLimitWarned: false };
+  return { table: trackCdxmlFontTable([...fonts.values()]), byName, plainCaptionIds, captionRunLimitWarned: false, notWrittenIds: tooLongIds };
 }
 
 function buildCdxmlEnvelope(creationProgram: string, pages: readonly string[], fonts: readonly CdxmlFont[], colors: ExportColorTable, embedded = true, pageSetup: Record<string, string> = {}): string {
@@ -2512,15 +2528,19 @@ function exportTextObject(text: TextObject, context: VisibleExportContext, alloc
     return undefined;
   };
   const plainCaption = fonts.plainCaptionIds.has(text.id);
+  // Its source runs name a font that is not written (exportCdxmlFonts reports it once).
+  let fontNotWritten = text.compatibility?.unknown.cdxmlTextFontOmitted === true;
   if (typeof source === "string") {
     // A caption past the cap skips the unchanged-source copy too, which would write its frame and run fonts.
-    if (!plainCaption && text.compatibility?.unknown.cdxmlTextNativeState === textSourceState(text)) {
+    if (!plainCaption && !fontNotWritten && text.compatibility?.unknown.cdxmlTextNativeState === textSourceState(text)) {
       // Reparse our serialized source rather than injecting compatibility data as unchecked XML.
       try {
         const tree = parseCdxml(source);
         const node = tree.find(node => elementView(node)?.name === "t");
         const element = node && elementView(node);
-        if (node && element) {
+        fontNotWritten = fonts.notWrittenIds.size > 0 && Boolean(element) &&
+          findElements([node!], "s").some(run => run.attributes.font !== undefined && fonts.notWrittenIds.has(run.attributes.font));
+        if (node && element && !fontNotWritten) {
           node[":@"] = { ...element.attributes, id: textId };
           const point = pointMetadata(text.compatibility?.unknown.cdxmlTextFrameOrigin) ?? parseCdxmlPoint(element.attributes.p);
           const dx = cssPxToCdxml(text.x - point.x), dy = cssPxToCdxml(text.y - point.y);
@@ -2536,8 +2556,8 @@ function exportTextObject(text: TextObject, context: VisibleExportContext, alloc
     }
     const edited = framedCaption();
     if (edited) return edited;
-    // The document's one cap warning already says why a capped caption lost its source formatting.
-    if (!plainCaption) warnings.push({ code: "cdxml.text_source_formatting_not_kept", sourceObjectId: text.id,
+    // The document's one cap warning (or font warning) already says why this caption lost its source formatting.
+    if (!plainCaption && !fontNotWritten) warnings.push({ code: "cdxml.text_source_formatting_not_kept", sourceObjectId: text.id,
       message: `Text ${text.id} (source ${text.compatibility?.originalId ?? "<unnamed>"}) was edited or its source text is unavailable; source formatting was not kept. The current native text is written.` });
   }
   if (typeof source !== "string") {
@@ -5423,7 +5443,10 @@ function importText(textElement: XmlElementView, pageIndex: number, objectIndex:
       unknown: {
         cdxmlTextElement: serializeVisibleTree([{ t: textElement.children, ":@": textElement.attributes }]),
         cdxmlTextFontTable: textFontTable(textElement, context),
-        cdxmlTextColorTable: objectCdxmlColorTable(textElement, context.colorTable)
+        cdxmlTextColorTable: objectCdxmlColorTable(textElement, context.colorTable),
+        // A run names a font left out for its size: an unchanged save must not copy that id back out.
+        ...(context.fonts.omittedIds.size && findElements(textElement.children, "s").some(run =>
+          run.attributes.font !== undefined && context.fonts.omittedIds.has(run.attributes.font)) ? { cdxmlTextFontOmitted: true } : {})
       }
     }
   };
