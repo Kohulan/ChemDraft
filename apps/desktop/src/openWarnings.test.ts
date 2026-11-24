@@ -41,12 +41,12 @@ function replaceMolecule(document: ChemDraftDocument, molecule: MoleculeObject):
   return { ...document, pages: document.pages.map((page) => ({ ...page, objects: page.objects.map((object) => (object.id === molecule.id ? molecule : object)) })) };
 }
 
-function restoreSessionWarningReports(metadata: unknown) {
+function restoreSessionWarningReports(metadata: unknown, reread?: Parameters<typeof restoreParsedSessionWarningReports>[1]) {
   const envelope = buildDocumentSessionEnvelope(
     { contents: "document", payloadHash: "hash", filename: "drawing.chemdraft" },
     { dirty: false }, "drawing.chemdraft", false
   );
-  return restoreParsedSessionWarningReports(parseDocumentSessionEnvelope({ ...envelope, ...metadata as object }, true)!);
+  return restoreParsedSessionWarningReports(parseDocumentSessionEnvelope({ ...envelope, ...metadata as object }, true)!, reread);
 }
 
 describe("open warnings model", () => {
@@ -64,6 +64,27 @@ describe("open warnings model", () => {
     expect(restoreSessionWarningReports({ openWarnings: { ...sessionOpen, operation: "legacy-other" } }))
       .toEqual({ warnings: sessionOpen, saveWarnings: undefined });
     expect(restoreSessionWarningReports(undefined)).toEqual({ warnings: undefined, saveWarnings: undefined });
+  });
+
+  it("merges what the restore's own read reports into a saved open report, keeping every saved warning", () => {
+    const notCounted = { code: "document.atom_hydrogen_count_not_counted", message: "ChemDraft document: atom h (H) states 1 hydrogen.",
+      sourceObjectId: "mol_h", atomIds: ["h"] };
+    const reread = { displayName: "drawing.chemdraft", sourceLabel: "ChemDraft", warnings: [
+      { ...sessionOpen.warnings[0]!, message: "Reworded, same import warning." }, notCounted, { ...notCounted }
+    ] };
+    expect(restoreSessionWarningReports({ openWarnings: sessionOpen }, reread))
+      .toEqual({ warnings: { ...sessionOpen, warnings: [...sessionOpen.warnings, notCounted] }, saveWarnings: undefined });
+    // Nothing new: the saved report is kept as it was.
+    expect(restoreSessionWarningReports({ openWarnings: sessionOpen }, { ...reread, warnings: [sessionOpen.warnings[0]!] }).warnings)
+      .toEqual(sessionOpen);
+    // A warning naming nothing is the same warning only with the same words.
+    const wholeFile = { code: "version", message: "Written by a newer ChemDraft." };
+    expect(restoreSessionWarningReports({ openWarnings: { ...sessionOpen, warnings: [wholeFile] } },
+      { ...reread, warnings: [wholeFile, { ...wholeFile, message: "Another notice." }] }).warnings?.warnings)
+      .toEqual([wholeFile, { ...wholeFile, message: "Another notice." }]);
+    // No saved open report: the reread one stands, unless a save report took its place.
+    expect(restoreSessionWarningReports(undefined, reread).warnings).toEqual(reread);
+    expect(restoreSessionWarningReports({ saveWarnings: sessionSave }, reread)).toEqual({ warnings: undefined, saveWarnings: sessionSave });
   });
 
   it.each([

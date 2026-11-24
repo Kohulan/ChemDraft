@@ -1,5 +1,15 @@
 # Manual stress checklist
 
+Effect color popovers: select art or a molecule, enable Glow/Shadow/Sketch in Color Controls, then
+open Effect. The entire picker must fit in its owned window. Preview, commit, cancel and switch
+between effects, fill and text colors; only the intended target should change. Repeat at mixed
+display scales and monitor edges on Windows and both macOS builds.
+
+Text box resize: narrow/widen a typed box, release, blur and reselect. Live preview and saved SVG
+must retain the same wrapping. Check Undo/Redo, save/reopen, SVG/PDF/PNG, scripts, font overrides,
+blank paragraphs, alignment/rotation and page-fit prompts. Attached reaction conditions must retain
+authored lines. Repeat at different zoom/display scales on Windows and both macOS builds.
+
 The standing hands-on checklist for interactive surfaces. It moved here from `AGENTS.md` §20 when that
 file was consolidated (2026-10-04); `AGENTS.md` §14 still requires it. Run every item on **macOS and
 Windows** unless the item names one platform. `docs/windows-port-stress-test.md` records the Windows
@@ -333,6 +343,12 @@ Paste `c1ccccc1.CC(C)(C)C.OCCO` as one native molecule object; with RDKit and th
 check that all three fragments open apart in their drawn arrangement, stay spatially separate while
 rotating, and remain apart after flatten, save/reopen and Spin again; Copy As SMILES and formula
 must stay unchanged.
+
+On macOS, Windows and Linux, open Spin 3D on a molecule, then click Clean Up Structure 2D on the
+Main toolbar while the overlay is still up. Click outside the molecule: the status bar says the
+drawing changed, the 3D overlay closes, and the cleaned-up drawing stays. Do it again, but this time
+click Spin 3D a second time instead of clicking outside: Spin 3D starts over on the cleaned-up
+molecule (no "already active" message), and a click outside flattens it.
 
 ## Automatic plugin update notices (macOS and Windows)
 
@@ -670,6 +686,18 @@ CDXML `Order="1.5"` — formulas right, pyrrole-type N drawn NH, the tautomer ba
 N–H was inferred, and its reason in the status bar on hover; ring picking and atom clicks still work
 over a badge; a CDXML pyrrole with `NumHydrogens` N-methylated leaves no stale badge; Copy As MOL and
 CDXML of a pasted aromatic reopen with the same tautomer; and Spin 3D on a pasted aromatic.
+
+Stated hydrogen counts (1.2.3): open a CDXML ethanol whose O has `NumHydrogens="0"` — the import
+warning names the O, the O shows the red (!) badge, and hovering it says it states 0 H but its bonds
+give 1; move, rotate and duplicate it and the badge stays; Save As, close and reopen and it is still
+there; the problem window offers "Use the derived hydrogen count (1)", which clears the badge;
+changing the O to S, or its bond to double, clears it too. The same file without `NumHydrogens`
+opens with no warning and no badge.
+
+Stated hydrogen counts shown everywhere (1.2.3, `cdxml.atom_hydrogen_count_kept`): open a CDXML C–C–O
+whose singly bonded O has `NumHydrogens="0"` — the label reads "O" (not "OH"), the red (!) badge shows,
+and the formula reads C2H5O; Copy As SMILES gives `CC[O]` and the mass matches C2H5O. Move and paste
+it and the label stays "O"; apply "Use the derived hydrogen count" and it becomes "OH" (C2H6O).
 
 Abbreviation surfaces added since: every table abbreviation (`packages/template-library/README.md`)
 placed by hotkey and by typing on a chain end, where it is valid, and on a ring carbon, where it is
@@ -1140,7 +1168,10 @@ with a preview/flyout open: it closes, controls disappear and direct commands re
   failures must show inside the dialog. Check rounded SVG units. With a ring and arrow, PDF
   must show both in the image labeled “Preview of the PDF page layout”, with no embedded
   PDF viewer or extra tab stop. Toggle PDF page guides and compare with the exported PDF.
-  Repeat previews for BMP, GIF and TIFF. Keep Export open while editing its source drawing,
+  Repeat previews for BMP, GIF and TIFF. For TIFF, place both a White page and a Transparent
+  export over a colored background in an image editor; the color should show only through
+  the transparent TIFF. Check that both TIFFs report the requested DPI.
+  Keep Export open while editing its source drawing,
   including edits that preserve its bounds: the preview must refresh and keep the filename and
   size settings. Repeat while another drawing is active and while Choose is pending, then cancel
   Choose. The refreshed preview and final file must describe the originating drawing.

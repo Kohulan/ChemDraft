@@ -3,6 +3,8 @@
 // coverage (every table entry, composites, valence verdicts) is in document-workflow-core's
 // labelReading and abbreviationTable tests, which read the same functions through its re-exports.
 
+import { atomicNumberForElementSymbol, elementSymbols, isTableAbbreviationLabel } from "@chemdraft/chem-core";
+import { abbreviationBondedSpellings, abbreviationSpellings } from "@chemdraft/template-library";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -14,6 +16,7 @@ import {
   nativeSingleHeavyElementLabelValence,
   parseCondensedLabelFormula
 } from "./index";
+import { nativeElementSymbols } from "./valence";
 
 it("requires explicit scheme metadata to read NaOH as an ion-pair group", () => {
   expect(nativeAtomLabelReading("NaOH").kind).toBe("formula");
@@ -104,5 +107,27 @@ describe("the atom-label grammar", () => {
     expect(nativeSingleHeavyElementLabelValence("OH")).toEqual({ element: "O", hydrogens: 1 });
     expect(nativeSingleHeavyElementLabelValence("CH2OH")).toBeUndefined();
     expect(Object.fromEntries(parseCondensedLabelFormula("CO2H")!)).toEqual({ C: 1, O: 2, H: 1 });
+  });
+});
+
+describe("chem-core's abbreviation reading (isTableAbbreviationLabel) is this grammar's", () => {
+  // chem-core flags a hydrogen count stated on an abbreviation (OMe, Ph) without importing this
+  // grammar, by reading the abbreviation table the grammar reads. It must answer exactly as the
+  // grammar's own reading of a stored label (no bond context) does, behind chem-core's element
+  // guard, for every label: every table spelling, alias and bonded-only spelling, every element,
+  // each of those in folded case, and spelled, composite, generic and blank labels.
+  const grammarReadsAsAbbreviation = (label: string) => {
+    const reading = nativeAtomLabelReading(label.trim());
+    return atomicNumberForElementSymbol(label.trim()) === undefined && reading.kind === "group" && reading.group.kind === "abbreviation";
+  };
+  const labels = [...new Set([...abbreviationSpellings, ...abbreviationBondedSpellings, ...nativeElementSymbols, ...elementSymbols,
+    "NH2", "CH3", "NHMe", "NMe2", "H2N", "OH", "CH2OH", "CO2H", "NaOH", "A", "Q", "M", "X", "R", "R1", "*", "", " ", " OMe ", "Ome", "D", "T"]
+    .flatMap(label => [label, label.toLowerCase(), label.toUpperCase()]))];
+
+  it("agrees on every label", () => {
+    expect(labels.filter(label => isTableAbbreviationLabel(label) !== grammarReadsAsAbbreviation(label))).toEqual([]);
+    // Not vacuous: the table's spellings are abbreviations, elements are not.
+    expect(abbreviationSpellings.every(isTableAbbreviationLabel)).toBe(true);
+    expect(["Ac", "Pr", "Ts", "C", "O"].some(isTableAbbreviationLabel)).toBe(false);
   });
 });

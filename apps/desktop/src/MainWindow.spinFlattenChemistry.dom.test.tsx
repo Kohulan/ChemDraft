@@ -224,6 +224,69 @@ describe("Spin 3D flatten chemistry refusals", () => {
     expect(after.pages[0].objects.slice(1)).toEqual(before.pages[0].objects.slice(1));
   });
 
+  describe("when the drawing changes while Spin 3D is open", () => {
+    const changedRefusal = "Couldn't flatten: the drawing changed while Spin 3D was open. Reopen Spin 3D and try again.";
+
+    // A bent butane that Clean Up redraws, as in a Linux beta tester's video (#304): Spin 3D was open,
+    // Clean Up ran, and every later click outside refused while the stale overlay stayed on screen.
+    async function mountSpinThenCleanUp() {
+      const source = insertNativeMolfileMolecule(createPhase4Document(), { x: 300, y: 300 },
+        depictSmiles2D("CCCC").molfile, "molfile-v2000");
+      const molecule = getSelectedMolecule(source)!;
+      const x = [260, 300, 302, 345];
+      const y = [300, 300, 340, 338];
+      const bent = applyPatch(source, { op: "updateObject", objectId: molecule.id,
+        changes: { atoms: molecule.atoms.map((atom, index) => ({ ...atom, x: x[index], y: y[index] })) } });
+      const coords3d = Float64Array.from(x.flatMap((value, index) => [(value - 300) / 20, (300 - y[index]) / 20, 0]));
+      await mount(bent, coords3d, [0, 0, 1], 0);
+      await command("structure.spin3d");
+      expect(overlay(), status()).not.toBeNull();
+      const beforeCleanUp = getSelectedMolecule(snapshot())!;
+      await command("structure.cleanup2d");
+      await act(async () => vi.waitFor(() => expect(status()).toMatch(/^Cleaned up/)));
+      const cleaned = snapshot();
+      expect(getSelectedMolecule(cleaned)!.atoms).not.toEqual(beforeCleanUp.atoms);
+      return cleaned;
+    }
+
+    async function clickOutsideSpin() {
+      const spin = overlay()!;
+      const { width, height } = snapshot().pages[0];
+      spin.getBoundingClientRect = () => new DOMRect(0, 0, width, height);
+      const before = status();
+      await act(async () => {
+        spin.dispatchEvent(new MouseEvent("pointerdown", {
+          bubbles: true, cancelable: true, button: 0, buttons: 1, clientX: 20, clientY: 20
+        }));
+      });
+      await act(async () => vi.waitFor(() => expect(status()).not.toBe(before)));
+    }
+
+    it("closes the stale overlay when a click outside refuses, keeping the changed drawing", async () => {
+      const cleaned = await mountSpinThenCleanUp();
+
+      await clickOutsideSpin();
+
+      expect(status()).toBe(changedRefusal);
+      expect(overlay()).toBeNull();
+      expect(snapshot()).toEqual(cleaned);
+    });
+
+    it("reopens Spin 3D on the changed molecule instead of keeping the stale session", async () => {
+      const cleaned = await mountSpinThenCleanUp();
+
+      await command("structure.spin3d");
+      await act(async () => vi.waitFor(() => expect(overlay(), status()).not.toBeNull()));
+      expect(status()).not.toMatch(/already active/);
+
+      await clickOutsideSpin();
+
+      expect(status()).toMatch(/^Flattened /);
+      expect(overlay()).toBeNull();
+      expect(getSelectedMolecule(snapshot())!.id).toBe(getSelectedMolecule(cleaned)!.id);
+    });
+  });
+
   it.each(views)("guards the directed P→B bond in view $view", async ({ axis, degrees, refused }) => {
     const source = insertNativeMolfileMolecule(createPhase4Document(), { x: 300, y: 300 }, phosphineBoraneMolfile, "molfile-v3000");
     await mount(source, phosphineBoraneCoords, axis, degrees);

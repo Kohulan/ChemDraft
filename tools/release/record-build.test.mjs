@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { artifactDigest, recordBuild } from "./record-build.mjs";
 import { macosReleasePlist } from "./macos-build-plist.mjs";
-import { appImage, arm, deb, fakeReleaseRunner, installer, intel } from "./release-test-fixtures.mjs";
+import { allusersInstaller, appImage, arm, deb, fakeReleaseRunner, installer, intel, offlineInstaller } from "./release-test-fixtures.mjs";
 
 const recordRunner = (options) => {
   const native = fakeReleaseRunner(options);
@@ -35,11 +35,11 @@ function fixture(t) {
   return { rootDir, tauriDir, commit: git("rev-parse", "HEAD") };
 }
 
-test("all five release artifacts record the checked-out full commit, version, target and cleanliness", (t) => {
+test("every release artifact records the checked-out full commit, version, target and cleanliness", (t) => {
   const { rootDir, commit } = fixture(t);
   for (const [target, name] of [
     ["aarch64-apple-darwin", arm], ["x86_64-apple-darwin", intel],
-    ["x86_64-pc-windows-msvc", installer],
+    ["x86_64-pc-windows-msvc", installer], ["x86_64-pc-windows-msvc", allusersInstaller], ["x86_64-pc-windows-msvc", offlineInstaller],
     ["x86_64-unknown-linux-gnu", deb], ["x86_64-unknown-linux-gnu", appImage]
   ]) {
     const artifact = join(rootDir, "assets", name);
@@ -143,14 +143,18 @@ test("unsigned stable DMGs merge a boolean unsigned stamp alongside the commit f
 
 test("Windows records before staging and carries the record through installer uploads", () => {
   const workflow = readFileSync(new URL("../../.github/workflows/windows-release.yml", import.meta.url), "utf8");
-  const recording = workflow.indexOf("node tools/release/record-build.mjs --artifact $installers[0].FullName --target x86_64-pc-windows-msvc");
+  // Every installer variant is recorded outside the checkout before the untracked release-assets folder exists.
+  const recording = workflow.indexOf("node tools/release/record-build.mjs --artifact $staged --target x86_64-pc-windows-msvc");
   assert.ok(recording > workflow.indexOf("ref: ${{ inputs.ref }}"));
+  assert.ok(recording > workflow.indexOf("foreach ($variant in $variants)"));
   assert.ok(recording < workflow.indexOf("New-Item -ItemType Directory -Path release-assets"));
-  assert.ok(workflow.includes('Copy-Item -LiteralPath "$($installers[0].FullName).build.json" -Destination release-assets'));
+  assert.match(workflow, /\$staging = Join-Path \$env:RUNNER_TEMP 'windows-installers'/);
+  assert.ok(workflow.includes('Copy-Item -LiteralPath "$staged.build.json" -Destination release-assets'));
   assert.match(workflow, /name: windows-nsis-unsigned\n\s+path: \|\n\s+release-assets\/\*\.exe\n\s+release-assets\/\*\.exe\.build\.json/);
   assert.match(workflow, /name: windows-release\n\s+path: release-assets\/\*/);
   assert.match(workflow, /Get-ChildItem release-assets -File[\s\S]+gh release upload \$env:RELEASE_TAG @assets/);
-  const finalRecord = workflow.indexOf("name: Bind build record to final signed installer bytes");
+  const finalRecord = workflow.indexOf("name: Bind build records to final signed installer bytes");
+  assert.match(workflow.slice(finalRecord), /^name: Bind build records[^\n]*\n\s+env:\n\s+INSTALLERS: \$\{\{ steps\.bundle\.outputs\.installers \}\}\n\s+run: \|\n\s+foreach \(\$artifact in/);
   assert.ok(finalRecord > workflow.indexOf("name: Verify Authenticode and replace unsigned installer"));
   assert.ok(finalRecord < workflow.indexOf("node tools/release/release-checksums.mjs --assets release-assets"));
   assert.match(workflow, /\$record\.sha256 = \(Get-FileHash -LiteralPath \$installer -Algorithm SHA256\)/);

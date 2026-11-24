@@ -1,6 +1,8 @@
 # Check and publish three required builds and optional Linux beta packages
 
-Every release ships an Apple-silicon DMG, an Intel DMG, and a Windows x64 NSIS installer.
+Every release ships an Apple-silicon DMG, an Intel DMG, and a Windows x64 NSIS installer. The
+Windows build comes as three installers from the same workflow run: per-user, all-users, and
+all-users offline (WebView2 bundled); all three are required.
 Linux is an optional, community-tested beta indefinitely; macOS and Windows releases never wait on
 Linux. Its `.deb` and AppImage may be attached when available. If either package or build record is
 attached, the release must include both Linux packages and both records. Every supplied build is
@@ -10,11 +12,15 @@ verification. Both the release body check and the final attached-asset gate belo
 ## Record the final bytes
 
 After signing, notarization and stapling have finished, collect the three required packages and their
-records, the Windows `.exe.sig`, `latest.json`, and both generated appcasts in one staging directory.
+records, the Windows `.exe.sig` files, `latest.json`, `latest-allusers.json`, and both generated
+appcasts in one staging directory.
 
 - `ChemDraft_X.Y.Z_aarch64.dmg` and `ChemDraft_X.Y.Z_aarch64.dmg.build.json`
 - `ChemDraft_X.Y.Z_x86_64.dmg` and `ChemDraft_X.Y.Z_x86_64.dmg.build.json`
 - `ChemDraft_X.Y.Z_x64-setup.exe` and `ChemDraft_X.Y.Z_x64-setup.exe.build.json`
+- `ChemDraft_X.Y.Z_x64-allusers-setup.exe` and `ChemDraft_X.Y.Z_x64-allusers-setup.exe.build.json`
+- `ChemDraft_X.Y.Z_x64-allusers-offline-setup.exe` and
+  `ChemDraft_X.Y.Z_x64-allusers-offline-setup.exe.build.json` (no `.exe.sig` and no feed)
 
 For a release that includes Linux beta builds, add both pairs.
 
@@ -125,13 +131,15 @@ record can substitute for an expected commit. Complete the production signature 
    checker downloads it. The two release verifiers mount the downloaded DMGs read-only, verify the
    apps inside, and check each DMG's staple and Gatekeeper assessment. The process staples only the DMG, never requiring
    an app staple. The final asset command downloads all assets again to a temporary directory and cleans it up.
-   It requires both DMGs, the Windows installer, and their records. It validates the optional Linux
+   It requires both DMGs, the three Windows installers, and their records. It validates the optional Linux
    packages when present and rejects partial Linux sets and extra builds or records, including
-   unexpected `.deb`, `.AppImage`, `.sig`, `.msi`, `.zip`, `.pkg` and `.tar.gz` files (only the expected Windows
-   `.exe.sig` and `latest.json` are allowed updater assets). It requires both Windows updater files,
-   checks the manifest version, exact `windows-x86_64-nsis` platform key and release download URL,
-   and requires the manifest signature to match the `.exe.sig`. It verifies that signature against
-   the final installer bytes, including the Minisign key ID and authenticated comment, using
+   unexpected `.deb`, `.AppImage`, `.sig`, `.msi`, `.zip`, `.pkg` and `.tar.gz` files (only the
+   per-user and all-users `.exe.sig` files, `latest.json` and `latest-allusers.json` are allowed
+   updater assets; an offline `.exe.sig` is refused). For each of the two updater installers it
+   requires its `.exe.sig` and feed (`latest.json` per-user, `latest-allusers.json` all-users),
+   checks the manifest version, exact `windows-x86_64-nsis` platform key and that installer's release
+   download URL, and requires the manifest signature to match its `.exe.sig`. It verifies that
+   signature against the final installer bytes, including the Minisign key ID and authenticated comment, using
    `plugins.updater.pubkey` from the checked-in `apps/desktop/src-tauri/tauri.windows.conf.json`.
    These updater checks run offline on both platforms. It recomputes hashes and sizes, mounts
    every DMG to compare its embedded commit with its record and the expected commit, and checks common
@@ -145,9 +153,9 @@ record can substitute for an expected commit. Complete the production signature 
 The Windows workflow runs this checker **inside the upload job after uploading**, with its existing
 `contents: write` token so draft assets are visible. Other jobs retain read access. Its
 `--allow-incomplete` mode permits wholly missing macOS or Windows artifact/record pairs and lists
-their missing filenames, while fully checking every supplied build. A supplied Windows installer still
-requires its verified `.exe.sig` and matching `latest.json`. The checker can defer Windows when its
-installer, record and updater assets are all absent.
+their missing filenames, while fully checking every supplied build. A supplied per-user or all-users installer
+still requires its verified `.exe.sig` and matching `latest.json` or `latest-allusers.json`. The
+checker can defer Windows when its installers, records and updater assets are all absent.
 Partial pairs, invalid records, hashes, sizes, extra builds
 and tag mismatches fail even in incomplete mode. INCOMPLETE is **not permission to un-draft**.
 

@@ -3,8 +3,8 @@ import {
   PluginAssistantToolResultSchema, PluginAssistantToolSessionRequestSchema, AssistantCapabilityPermissions,
   type PluginAssistantToolDescriptor, type PluginAssistantAPI, type PluginAssistantToolResult, type PluginManifest
 } from "@chemdraft/plugin-api";
-import { assertLegacyWritePages, beginScopedRepeatUnitCleanup, finishScopedRepeatUnitCleanup, legacyWriteScopePages, writePatchOps,
-  type PluginHost, type PluginHostAssistant, type PluginWriteScopePages, type ScopedRepeatUnitCleanup } from "@chemdraft/plugin-host";
+import { assertLegacyWritePages, beginScopedRepeatUnitCleanup, finishScopedRepeatUnitCleanup, insertionPins, legacyWriteScopePages, withPins,
+  writePatchOps, type PagePin, type PluginHost, type PluginHostAssistant, type PluginWriteScopePages, type ScopedRepeatUnitCleanup } from "@chemdraft/plugin-host";
 import { PluginWriteGateTimeoutError, type PluginWriteGate } from "../plugins/applyPluginDocumentPatch";
 import { runThumbnail } from "./runThumbnail";
 import { PAGE_GROWTH_UNANSWERED, type AssistantToolContext, type AssistantPageGrowth } from "./AssistantToolContext";
@@ -30,8 +30,10 @@ interface Request {
   pluginId: string;
   tabId: string;
   selection: string[];
-  /** Send-time selection bound to its page, so a duplicate id elsewhere is never in scope. */
-  selectionPages: PluginWriteScopePages | undefined;
+  /** Pins of everything the request may write, by host identity: the Send-time selection's, and each
+   * insertion's, taken from the document its write committed. An id the request inserts under pins that
+   * insertion instead. Every scope check runs pinned, so an id without a pin grants nothing. */
+  selectionPages: PluginWriteScopePages;
   /** The document identity captured at Send, when the host provides one. */
   binding: AssistantDocumentBinding | undefined;
   repeatUnitCleanup: ScopedRepeatUnitCleanup | undefined;
@@ -130,7 +132,8 @@ export class AssistantToolsController implements PluginHostAssistant {
     const binding = this.options.captureDocument?.();
     const getDocument = () => binding && !binding.read() ? undefined : this.readTab(tabId);
     const sendDocument = getDocument();
-    const selectionPages = legacyWriteScopePages(sendDocument, selection);
+    // No readable selection page pins nothing, and then the selection grants nothing (fail closed).
+    const selectionPages = legacyWriteScopePages(sendDocument, selection) ?? new Map<string, PagePin>();
     const repeatUnitCleanup = beginScopedRepeatUnitCleanup(sendDocument);
     const services = this.options.createContext({ plugin: manifest, tabId, getDocument });
     const requestId = transactions.beginAssistantTransaction({ pluginId: plugin.id, runId: crypto.randomUUID(), tabId,
@@ -138,7 +141,7 @@ export class AssistantToolsController implements PluginHostAssistant {
     const request: Request = { pluginId: plugin.id, tabId, selection, selectionPages, binding, repeatUnitCleanup, inserted: new Set(), touched: new Set(), transactions,
       ended: false, cancellations: new Map(), opening: 0,
       context: { ...services, plugin: manifest, tabId, getDocument, getSelectionAtSend: () => selection,
-        getSelectionPagesAtSend: () => selectionPages,
+        getSelectionPagesAtSend: () => request.selectionPages,
         chemistry: { ...services.chemistry, reactionProductAligner: async () => {
           const adapter = await loadRdkitWithAppLoader(() => import("@chemdraft/rdkit-adapter/depiction"));
           return adapter.createReactionProductAligner();
@@ -269,7 +272,7 @@ export class AssistantToolsController implements PluginHostAssistant {
             return this.options.host().applyPatchForPlugin(plugin.id, undefined,
               { patch, reason: `Assistant: ${input.name}`, warnings: [], requiresUserApproval: true }, {
                 objectIds: [...request.selection, ...request.inserted],
-                ...(request.selectionPages?.size ? { scopePages: request.selectionPages } : {}),
+                scopePages: request.selectionPages,
                 getDocument: request.context.getDocument,
                 apply: application => {
                   this.running(plugin, requestId);
@@ -289,8 +292,16 @@ export class AssistantToolsController implements PluginHostAssistant {
                     return cleanup?.document;
                   });
                   cleanup?.record();
-                  const existing = new Set(before.pages.flatMap(page => page.objects.map(object => object.id)));
-                  for (const id of touched) { request.touched.add(id); if (!existing.has(id)) request.inserted.add(id); }
+                  for (const id of touched) request.touched.add(id);
+                  // Grant each insertion by the identity of the new object this write committed under its id
+                  // (read synchronously, before anything else can edit), never by bare id, and whether or not
+                  // the id existed before: a batch that deletes the selected X and inserts its replacement X
+                  // inserts X. A pin of a selected object that is gone is replaced by the insertion's.
+                  const insertedIds = writePatchOps(patch).flatMap(op => op.op === "addObject" ? [op.object.id] :
+                    op.op === "addAnnotation" ? [op.annotation.id] : []);
+                  const pins = insertionPins(before, request.context.getDocument(), insertedIds);
+                  for (const id of pins.keys()) request.inserted.add(id);
+                  request.selectionPages = withPins(request.selectionPages, pins);
                   return { applied: true as const, objectIds: touched };
                 }
               });
@@ -412,12 +423,12 @@ export class AssistantToolsController implements PluginHostAssistant {
       });
       deadline = setTimeout(() => abort.abort(new Error("Assistant tool deadline exceeded (120 s).")), assistantToolDeadlineMs(input.name));
       work = this.options.host().invokeAssistantTool(plugin.id, { sessionId, ...input }, abort.signal,
-        [...request.selection, ...request.inserted], receipt => {
+        [...request.selection, ...request.inserted], (receipt, insertions) => {
           if (request.ended || abort.signal.aborted) return;
-          for (const id of receipt.objectIds) {
-            request.touched.add(id);
-            if (!request.selection.includes(id)) request.inserted.add(id);
-          }
+          for (const id of receipt.objectIds) request.touched.add(id);
+          // The host pinned each insertion by the identity of the object it committed: grant exactly that.
+          for (const id of insertions.keys()) request.inserted.add(id);
+          request.selectionPages = withPins(request.selectionPages, insertions);
         }, request.repeatUnitCleanup, request.selectionPages);
       // A timeout responds immediately, but an abort-ignoring handler still occupies its slot.
       void work.then(() => { this.calls.release(); }, () => { this.calls.release(); });

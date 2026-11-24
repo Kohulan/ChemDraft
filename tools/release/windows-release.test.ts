@@ -41,11 +41,11 @@ function Get-AuthenticodeSignature {
   [PSCustomObject]@{ Status = $env:TEST_STATUS; SignerCertificate = [PSCustomObject]@{ Subject = $env:TEST_SUBJECT } }
 }
 function Copy-Item { }
-${stepScript("Verify Authenticode and replace unsigned installer")}`, {
+${stepScript("Verify Authenticode and replace unsigned installers")}`, {
         TEST_STATUS: status,
         TEST_SUBJECT: subject,
         EXPECTED_AUTHENTICODE_SUBJECT: expected,
-        INSTALLER: "test.exe",
+        INSTALLERS: JSON.stringify([{ Installer: "test.exe", Feed: "latest.json" }]),
         GITHUB_OUTPUT: output
       });
       expect(result.status === 0, result.stderr).toBe(accepted);

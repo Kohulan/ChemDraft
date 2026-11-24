@@ -103,6 +103,7 @@ import {
   DEFAULT_MIN_PROJECTED_BOND_LENGTH_FRACTION,
   pageLayoutSourceUnit,
   flattenPerspectiveFrom3D,
+  atomImpliedRadicalCount,
   isDativeBond,
   isEngineDocument,
   isMetalSymbol,
@@ -121,6 +122,7 @@ import {
   type ArrowObject,
   type BracketObject,
   type ChemDraftDocument,
+  type NativeDocumentWarningCode,
   type ChemicalMetadata,
   type CompatibilityWarning,
   remapImportedRepeatUnitAfterMoleculeMerge,
@@ -197,6 +199,7 @@ import {
   findNearestBondHit,
   moleculeFillCycleKey,
   moleculeFillCycleKeyBondIds,
+  atomDisplayLabel,
   nativeMoleculeRings,
   planBondExtension,
   ringAttachmentAngleMetrics,
@@ -8316,6 +8319,9 @@ export function normalizeCommittedDocument(
   options: CommittedDocumentNormalizationOptions & { preserveElectronMarks?: boolean } = {}
 ): ChemDraftDocument {
   document = reconcileReactionArrowAttachments(document);
+  // Open and restore (the only callers preserving stored marks) re-derive stale lone-H caches. Paste
+  // and plugin inserts re-derive the molecules they bring in themselves; other commits never do.
+  if (options.preserveElectronMarks) document = withImpliedRadicalChemistryRederived(document);
   const reconciled = options.preserveElectronMarks ? document : reconcileNativeChargeMarks(document, options);
   const recorded = withNativeDocumentLabelBondSides(reconciled);
   // Re-admitted to the patch engine's sharing, as `reconcileNativeChargeMarks` does.
@@ -8323,6 +8329,56 @@ export function normalizeCommittedDocument(
   // Idempotent: a document the default normalization produced is its own committed normal form.
   if (Object.keys(options).length === 0) committedNormalForms.set(normalized, normalized);
   return normalized;
+}
+
+/**
+ * Re-derives the cached chemistry (structure, formula, masses, radicalCount) of each molecule holding
+ * a lone hydrogen atom's implied radical (`atomImpliedRadicalCount`; H•, owner decision 2026-11-23),
+ * through the path every graph edit takes (`refreshNativeSingleBondGraph`). Documents saved before
+ * that reading cache RDKit's old H2 ("[HH]", formula H2), which would show H2 beside a canvas drawing
+ * H•. Only those molecules are touched, and only when a cached value differs from the derived one;
+ * atoms, bonds and geometry stay as stored, and every other molecule keeps its stored chemistry.
+ *
+ * The ONE implementation for every way a stored molecule object enters an open document:
+ * - open and session restore, through `normalizeCommittedDocument` (every molecule);
+ * - a native ChemDraft clipboard paste (`pasteSelectionClipboardPayload`, the pasted molecules);
+ * - a plugin `documents.applyPatch` insert or an accepted proposal (`applyPluginDocumentPatch`,
+ *   the inserted molecules).
+ * `only` limits it to the objects that operation brought in; `occasion` names it in the log.
+ *
+ * Fail safe: this is a refresh of a cache, never a reason to refuse a document or an insertion. If
+ * the recompute throws on an unusual molecule, that molecule stays exactly as stored (no chemistry
+ * is changed), the error is logged with the molecule id, and the rest proceeds.
+ */
+export function withImpliedRadicalChemistryRederived(
+  document: ChemDraftDocument,
+  options: { only?: (pageId: string, objectId: string) => boolean; occasion?: string } = {}
+): ChemDraftDocument {
+  const occasion = options.occasion ?? "on open";
+  let changed = false;
+  const pages = document.pages.map((page) => {
+    let pageChanged = false;
+    const objects = page.objects.map((object) => {
+      if (object.type !== "molecule" || (options.only && !options.only(page.id, object.id))) return object;
+      try {
+        if (!object.atoms.some((atom) => atomImpliedRadicalCount(atom, object.bonds) > 0)) return object;
+        const derived = refreshNativeSingleBondGraph(object, object.atoms, object.bonds);
+        if (derived.structure === object.structure && derived.structureFormat === object.structureFormat &&
+            JSON.stringify(derived.chemistry) === JSON.stringify(object.chemistry)) return object;
+        // Only the cached chemistry is replaced: atoms, bonds and geometry stay as stored.
+        const refreshed = { ...object, structureFormat: derived.structureFormat, structure: derived.structure, chemistry: derived.chemistry };
+        pageChanged = true;
+        return refreshed;
+      } catch (error) {
+        console.error(`Could not re-derive the cached chemistry of molecule ${object.id} ${occasion}; keeping it as stored`, error);
+        return object;
+      }
+    });
+    if (!pageChanged) return page;
+    changed = true;
+    return { ...page, objects };
+  });
+  return changed ? adoptDerivedDocument(document, { ...document, pages }) : document;
 }
 
 /**
@@ -9517,13 +9573,17 @@ export function applyNativeAtomProblemFix(
 ): { document: ChemDraftDocument; label: string; status: string } | undefined {
   const molecule = document.pages.flatMap(page => page.objects).find(object => object.id === objectId);
   if (molecule?.type !== "molecule" || !isEditableNativeMoleculeGraph(molecule)) return undefined;
-  const fix = atomProblem(molecule, atomId)?.fixes.find(fix => fix.action === action);
-  if (!fix) return undefined;
+  const problem = atomProblem(molecule, atomId);
+  const fix = problem?.fixes.find(fix => fix.action === action);
+  if (!problem || !fix) return undefined;
   const atom = molecule.atoms.find(atom => atom.id === atomId)!;
   const name = JSON.stringify(atom.element || "atom");
+  // A stated count that disagreed is fixed by dropping it: the atom then counts what its bonds give.
+  const derivedHydrogens = fix.atom.hydrogenCount === undefined ? problem.state.statedHydrogens?.derived : undefined;
   const status = action === "ignore" ? `Warning ignored for ${name}`
     : action === "restore" ? `Warning restored for ${name}`
     : action === "charge" ? `Formal charge set to ${fix.atom.formalCharge > 0 ? "+" : ""}${fix.atom.formalCharge} for ${name}`
+    : derivedHydrogens !== undefined ? `Hydrogen count set to the derived ${derivedHydrogens} for ${name}`
     : `Explicit hydrogens set to ${fix.atom.hydrogenCount} for ${name}`;
   const atoms = molecule.atoms.map(atom => atom.id === atomId ? fix.atom : atom);
   const updated = refreshNativeSingleBondGraph(molecule, atoms, molecule.bonds);
@@ -9758,12 +9818,16 @@ export function commitNativeAtomLabelTarget(
   const beforeAtom = options.beforeAtom ?? atom;
   const beforeMolecule = options.beforeMolecule ?? molecule;
   const normalized = normalizeNativeAtomElementLabel(label);
+  if (options.literal === true && typedLabelIsDrawnLabel(normalized, beforeAtom, beforeMolecule)) return { document, target };
   const decision = labelOnBondedAtom(normalized, beforeAtom, beforeMolecule, options.replaceElement);
   const relabel = (reason?: string) => {
     const refusal = atomLabelIsotopeRefusal(beforeAtom, normalized, beforeMolecule, options.literal === true);
     if (refusal) return { document, target, message: refusal, refusal };
+    const relabeled = applyNativeAtomElementTarget(document, target, label, options);
+    const ringRefusal = typedLabelRingRefusal(normalized, relabeled, document, target, beforeAtom, beforeMolecule, options);
+    if (ringRefusal) return { document, target, message: ringRefusal, refusal: ringRefusal };
     return {
-      document: applyNativeAtomElementTarget(document, target, label, options), target,
+      document: relabeled, target,
       ...(reason ? { message: `Relabeled ${normalized}: ${reason}` } : {})
     };
   };
@@ -9817,6 +9881,85 @@ export function commitNativeAtomLabelTarget(
     target: { ...target, kind: "atom", atomId: newAtom.id },
     message: `Attached ${normalized} as a substituent: ${normalized} ${decision.reason === "generic" ? "is a one-bond placeholder" : "takes one bond"} and this atom already has ${decision.bondCount}`
   };
+}
+
+/**
+ * Why a typed relabel must be refused, or undefined when it may be committed. It is refused only
+ * when all of these hold: the label was typed (`literal`; hover hotkeys are not), the atom stated a
+ * hydrogen count before the edit (a kept CDXML count, or an aromatic ring's Kekulé hint), the relabel
+ * drops that count, and dropping it leaves an aromatic system with no Kekulé pattern ("N" over a
+ * pyrrole or indole NH) or moves a tautomeric hydrogen onto another atom ("N" over an imidazole NH,
+ * which would have the H guessed onto the other N). Anything else — a hotkey, an atom with no stated
+ * count, a substituent attachment — commits as it did before stated counts were kept, and the
+ * validator badges whatever it leaves unresolved ("O" by hotkey over a benzene carbon).
+ *
+ * Both breakages are read from the bond-order resolution the validator badges from
+ * (`nativeBondOrderResolution`): an atom unresolved after the edit that was not before, or another
+ * atom whose H count is guessed after the edit and was not before. Only problems the edit introduces
+ * count, so a ring already broken before it does not block an unrelated retype. The message says
+ * which of the two the edit would do ("no valid structure", or the hydrogen moved to another atom),
+ * and names the label that keeps the ring valid when the drawn label is the typed element with its
+ * hydrogens ("NH") and committing that is clean. The text-box conversion shows the same message
+ * after "Text kept: ". Master decision 2026-11-22, narrowed the same day.
+ */
+function typedLabelRingRefusal(
+  normalized: string,
+  relabeled: ChemDraftDocument,
+  document: ChemDraftDocument,
+  target: NativeMoleculeDeleteTarget,
+  beforeAtom: MoleculeAtom,
+  beforeMolecule: MoleculeObject,
+  options: { literal?: boolean }
+): string | undefined {
+  if (target.kind !== "atom" || options.literal !== true || beforeAtom.hydrogenCount === undefined) return undefined;
+  const relabeledAtom = firstPage(relabeled).objects
+    .find((object): object is MoleculeObject => object.id === target.objectId && object.type === "molecule")
+    ?.atoms.find(atom => atom.id === target.atomId);
+  if (relabeledAtom?.hydrogenCount !== undefined) return undefined;
+  const before = nativeBondOrderResolution(beforeMolecule.atoms, beforeMolecule.bonds);
+  // What the edit breaks: the ring's Kekulé pattern ("unresolved"), else its hydrogen moved onto
+  // another atom ("hydrogen"), else nothing.
+  const breaks = (next: ChemDraftDocument): "unresolved" | "hydrogen" | undefined => {
+    const molecule = firstPage(next).objects.find((object): object is MoleculeObject =>
+      object.id === target.objectId && object.type === "molecule");
+    if (!molecule) return undefined;
+    const after = nativeBondOrderResolution(molecule.atoms, molecule.bonds);
+    if ([...after.unresolvedAtomIds].some(id => !before.unresolvedAtomIds.has(id))) return "unresolved";
+    if ([...after.inferredHydrogenAtomIds].some(id => id !== target.atomId && !before.inferredHydrogenAtomIds.has(id))) return "hydrogen";
+    return undefined;
+  };
+  const broken = breaks(relabeled);
+  if (!broken) return undefined;
+  const drawn = atomDisplayLabel(beforeAtom, beforeMolecule.bonds, nativeDrawingStyleFromObjectStyle(beforeMolecule.style), beforeMolecule.atoms);
+  const hydrogensOnly = (part: string) => /^H\d*$/.test(part);
+  const suggestion = drawn !== undefined && drawn !== normalized &&
+    ((drawn.startsWith(normalized) && hydrogensOnly(drawn.slice(normalized.length))) ||
+      (drawn.endsWith(normalized) && hydrogensOnly(drawn.slice(0, drawn.length - normalized.length))))
+    ? drawn
+    : undefined;
+  // The drawn label typed back is no edit at all when the atom states its count (`typedLabelIsDrawnLabel`).
+  const suggestionKeepsRing = suggestion !== undefined &&
+    ((options.literal === true && typedLabelIsDrawnLabel(suggestion, beforeAtom, beforeMolecule)) ||
+      !breaks(applyNativeAtomElementTarget(document, target, suggestion, options)));
+  const consequence = broken === "unresolved"
+    ? "would leave this ring with no valid structure"
+    : "would move this ring's hydrogen to another atom";
+  return `Typing ${normalized} here ${consequence}; ${suggestionKeepsRing ? `type ${suggestion}, or ` : ""}edit the ring first.`;
+}
+
+/**
+ * Whether typed label text, on an atom with a stated H count, is exactly the label drawn for that
+ * atom before the edit, its hydrogens included: "O" over an O stated with 0 H, "NH" over a
+ * pyrrole-type N. Such a retype says nothing the drawing did not already say, so committing it
+ * changes nothing: the atom keeps its stated count and an aromatic ring keeps its Kekulé hint.
+ * Typed text that differs from the drawn label is a new statement and wins; its relabel drops the
+ * stated count (`clearChangedAtomHydrogenHints`). Master decision 2026-11-22, refined. An atom with
+ * no stated count has none to keep, and its retype keeps the ordinary typed-label rule.
+ */
+function typedLabelIsDrawnLabel(normalized: string, atom: MoleculeAtom, molecule: MoleculeObject): boolean {
+  if (normalized.length === 0 || atom.hydrogenCount === undefined) return false;
+  const drawn = atomDisplayLabel(atom, molecule.bonds, nativeDrawingStyleFromObjectStyle(molecule.style), molecule.atoms);
+  return drawn !== undefined && drawn === normalized;
 }
 
 /**
@@ -15704,7 +15847,12 @@ export function pasteSelectionClipboardPayload(
   // No chemistry check here: MainWindow moves the pasted objects to the pointer or the repeat-paste
   // position after this returns, so only the commit funnel sees where they finally land
   // (`commitChemistryGuard.ts` refuses a paste that would change a molecule already on the page).
-  return payload.nativeSource ? copyNativeObjectExtensions(payload.nativeSource, next, idBySourceId) : next;
+  const copied = payload.nativeSource ? copyNativeObjectExtensions(payload.nativeSource, next, idBySourceId) : next;
+  // A payload copied from a document saved before the H• reading carries a lone H's stale H2 cache.
+  // Re-derive the pasted molecules only, inside this paste's own document (one undo entry).
+  return withImpliedRadicalChemistryRederived(copied, {
+    only: (pageId, objectId) => pageId === page.id && pastedMoleculeIds.has(objectId), occasion: "on paste"
+  });
 }
 
 /**
@@ -19472,6 +19620,54 @@ export function spin3dCarriedElectronMarks(
   });
 }
 
+/** The selection as single-molecule commands (Spin 3D, 3D cleanup, Interactive 3D) read it. */
+export interface SingleMoleculeSelection {
+  /**
+   * The selected object ids, plus each host of a selected molecule part. When the selection is one
+   * molecule plus only marks that molecule carries, the marks fold into it and this is just the
+   * molecule's id.
+   */
+  objectIds: string[];
+  /**
+   * Selected marks that the one selected molecule does not carry: floating, or bound to an atom of a
+   * molecule that is not selected. A command on the molecule could not keep them on an atom, so it
+   * refuses by name instead of dropping or moving them. Empty unless the rest of the selection is
+   * exactly one molecule.
+   */
+  uncarriedMarkIds: string[];
+}
+
+/**
+ * One shared reading of "is a single molecule selected?". A charge, radical or lone-pair mark
+ * follows its atom, so selecting a molecule together with its own marks (as a marquee around a
+ * charged molecule does) still counts as that one molecule; the marks travel with their atoms
+ * through whatever the command does (see `spin3dCarriedElectronMarks`).
+ */
+export function singleMoleculeSelection(
+  document: ChemDraftDocument,
+  nativePartHostObjectIds: readonly string[] = []
+): SingleMoleculeSelection {
+  const objectIds = [...new Set([...document.selection.objectIds, ...nativePartHostObjectIds])];
+  const page = document.pages.find(candidate => candidate.id === document.selection.pageId) ?? document.pages[0];
+  const unchanged = { objectIds, uncarriedMarkIds: [] };
+  if (!page || objectIds.length < 2) return unchanged;
+  const objectById = new Map(page.objects.map(object => [object.id, object] as const));
+  const markIds = objectIds.filter(id => objectById.get(id)?.type === "electron-mark");
+  const others = objectIds.filter(id => !markIds.includes(id));
+  if (markIds.length === 0 || others.length !== 1 || objectById.get(others[0]!)?.type !== "molecule") return unchanged;
+  const moleculeId = others[0]!;
+  const carried = new Set(spin3dCarriedElectronMarks(page, moleculeId).map(({ mark }) => mark.id));
+  const uncarriedMarkIds = markIds.filter(id => !carried.has(id));
+  return uncarriedMarkIds.length > 0 ? { objectIds, uncarriedMarkIds } : { objectIds: [moleculeId], uncarriedMarkIds: [] };
+}
+
+/** Status text for a single-molecule command refused because of marks its molecule cannot carry. */
+export function uncarriedMarksRefusal(command: string, markCount: number): string {
+  return markCount === 1
+    ? `${command} cannot keep the selected mark on an atom of this molecule. Deselect the mark, or move it onto one of the molecule's atoms.`
+    : `${command} cannot keep ${markCount} selected marks on atoms of this molecule. Deselect those marks, or move them onto the molecule's atoms.`;
+}
+
 function spin3dElectronMarkOwner(
   mark: ElectronMarkObject,
   assignments: ReturnType<typeof nativeElectronMarkAssignments>["anchorByMarkId"]
@@ -20863,6 +21059,21 @@ export function openNativeDocument(contents: string | Uint8Array): ChemDraftOpen
     : readNativeDocumentContents("", () => importCdx(contents));
 }
 
+const duplicateObjectIdsRenumberedCode: NativeDocumentWarningCode = "NATIVE_DUPLICATE_OBJECT_IDS_RENUMBERED";
+
+/**
+ * Whether the document an open installs differs from its file because the native reader gave
+ * duplicate same-page object ids new ids (chem-core `renumberDuplicatePageObjectIds`, reported by its
+ * structured `NATIVE_DUPLICATE_OBJECT_IDS_RENUMBERED` warning code). Such a document opens with
+ * unsaved changes, so Save writes the fix. The renumbering is part of opening, never an undo step.
+ * A visible-layer conflict resolved to the edited visible CDXML installs a document that read never
+ * touched, so it does not count.
+ */
+export function openedDocumentRenumberedObjectIds(result: ChemDraftOpenResult, installed: ChemDraftDocument): boolean {
+  if (result.conflict?.visibleDocument !== undefined && installed === result.conflict.visibleDocument) return false;
+  return result.warnings.some((warning) => warning.code === duplicateObjectIdsRenumberedCode);
+}
+
 const importedPageFitPaddingPx = 24;
 // A10's 26 mm short edge is the smallest built-in paper dimension; it also leaves room for
 // this fit's 48 px total padding, unlike the sub-inch slivers a flat drawing could otherwise make.
@@ -21965,7 +22176,9 @@ export function findForeignNativeMoleculeBondTarget(
  * Absorb one molecule object into another so a bond can join them: the absorbed atoms and
  * bonds are re-minted onto fresh ids in the host's id space (every molecule starts at
  * atom_001, so ids collide), and every per-atom, per-bond and per-ring style override the
- * absorbed molecule carries follows its parts onto their new ids.
+ * absorbed molecule carries follows its parts onto their new ids. So does a stated hydrogen count:
+ * a re-minted atom is new to the host's diff (`clearChangedAtomHydrogenHints`) and keeps the count
+ * it carries, and the joining bond, added afterward, drops only the counts of the atoms it reaches.
  */
 function mergeNativeMoleculeObjects(
   host: MoleculeObject,

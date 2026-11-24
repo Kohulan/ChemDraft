@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { applyPatches, createEmptyDocument, dropOrphanedHydrogenHints, type MoleculeObject } from "./index";
+import { applyPatches, applyPatchWithHistory, atomStatedHydrogenCount, createDocumentHistory, createEmptyDocument, dropOrphanedHydrogenHints,
+  atomIgnoresStatedHydrogenCount, atomWithIgnoredHydrogenCount, ignoredHydrogenCountAtomKind, isTableAbbreviationLabel,
+  statedHydrogenCountNotCountedReason, statedHydrogenCountNotCountedText, redo, serializeDocument, deserializeDocument, undo, type MoleculeObject } from "./index";
 
 // A pyrrole as CDXML imports it (aromatic ring bonds, the N's NumHydrogens and one carbon's kept),
 // with a single N–Zn bond whose dative meaning an edit can toggle.
@@ -33,7 +35,9 @@ describe("imported hydrogen hints expire on chemical edits", () => {
     ["change order", (m: MoleculeObject) => { m.bonds[0]!.order = "double"; }],
     ["change dative meaning", (m: MoleculeObject) => { m.bonds[5]!.display = { bondStyle: "dashed" }; }],
     ["change element", (m: MoleculeObject) => { m.atoms[0]!.element = "C"; }],
-    ["change charge", (m: MoleculeObject) => { m.atoms[0]!.formalCharge = 1; }]
+    ["change charge", (m: MoleculeObject) => { m.atoms[0]!.formalCharge = 1; }],
+    ["add radical", (m: MoleculeObject) => { m.atoms[0]!.markRadicals = 1; }],
+    ["set isotope", (m: MoleculeObject) => { m.atoms[0]!.isotope = 15; }]
   ] as const)("%s clears the affected atom's hint through document patches", (_name, edit) => {
     const document = createEmptyDocument();
     const before = imported();
@@ -64,7 +68,7 @@ describe("imported hydrogen hints expire on chemical edits", () => {
   });
 });
 
-describe("a hint only survives on an atom with an aromatic bond in a ring", () => {
+describe("a new molecule drops only a hint orphaned from its aromatic ring", () => {
   const add = (molecule: MoleculeObject): MoleculeObject => {
     const document = createEmptyDocument();
     return applyPatches(document, [{ op: "addObject", pageId: document.pages[0]!.id, object: molecule }])
@@ -91,7 +95,10 @@ describe("a hint only survives on an atom with an aromatic bond in a ring", () =
     expect(fragment.atoms[0]!.hydrogenCount).toBe(1);
   });
 
-  it("drops a hint on an atom with no aromatic bond at all", () => {
+  it("keeps a stated count on an atom with no aromatic bond at all: it describes the atom itself", () => {
+    // Owner ruling (1.2.3): a CDXML NumHydrogens that disagrees with the derived count is kept as
+    // written and badged, so a molecule entering the document (an import, a whole-molecule paste or
+    // duplicate) keeps it. Only an atom whose aromatic bonds no longer sit in a ring loses its count.
     const molecule: MoleculeObject = {
       ...imported(),
       atoms: [
@@ -100,7 +107,17 @@ describe("a hint only survives on an atom with an aromatic bond in a ring", () =
       ],
       bonds: [{ id: "b", fromAtomId: "n", toAtomId: "c", order: "single" }]
     };
-    expect(add(molecule).atoms.map((atom) => atom.hydrogenCount)).toEqual([undefined, undefined]);
+    expect(add(molecule).atoms.map((atom) => atom.hydrogenCount)).toEqual([2, 3]);
+    expect(dropOrphanedHydrogenHints(molecule.atoms, molecule.bonds)).toBe(molecule.atoms);
+  });
+
+  it("keeps a lone atom's stated count (no bonds, so no ring that could have been cut)", () => {
+    const molecule: MoleculeObject = {
+      ...imported(),
+      atoms: [{ id: "o", element: "O", x: 0, y: 0, formalCharge: 0, hydrogenCount: 0 }],
+      bonds: []
+    };
+    expect(add(molecule).atoms[0]!.hydrogenCount).toBe(0);
   });
 
   it("drops the hint through an update that cuts the ring down to an acyclic aromatic bond", () => {
@@ -119,5 +136,467 @@ describe("a hint only survives on an atom with an aromatic bond in a ring", () =
   it("returns the same array when there is nothing to drop", () => {
     const { atoms, bonds } = imported();
     expect(dropOrphanedHydrogenHints(atoms, bonds)).toBe(atoms);
+  });
+});
+
+// Ethanol as a CDXML file with NumHydrogens="0" on the O imports it: the O's stated count disagrees
+// with the derived one and is kept on the atom (owner ruling, 1.2.3).
+const ethoxy = (): MoleculeObject => ({
+  id: "m", type: "molecule", x: 0, y: 0, width: 40, height: 20, rotation: 0, style: {},
+  structureFormat: "molfile-v2000", structure: "", superatoms: [], rGroups: [],
+  atoms: [
+    { id: "c1", element: "C", x: 0, y: 0, formalCharge: 0 },
+    { id: "c2", element: "C", x: 14, y: 8, formalCharge: 0 },
+    { id: "o", element: "O", x: 28, y: 0, formalCharge: 0, hydrogenCount: 0 },
+    { id: "s", element: "S", x: 60, y: 0, formalCharge: 0 }
+  ],
+  bonds: [
+    { id: "b1", fromAtomId: "c1", toAtomId: "c2", order: "single" },
+    { id: "b2", fromAtomId: "c2", toAtomId: "o", order: "single" }
+  ]
+});
+
+describe("a stated count on an atom with no aromatic bond lasts until that atom is edited chemically", () => {
+  const update = (edit: (molecule: MoleculeObject) => void): MoleculeObject => {
+    const document = createEmptyDocument();
+    const before = ethoxy();
+    const after = structuredClone(before);
+    edit(after);
+    return applyPatches(document, [
+      { op: "addObject", pageId: document.pages[0]!.id, object: before },
+      { op: "updateObject", objectId: before.id, changes: after }
+    ]).pages[0]!.objects[0] as MoleculeObject;
+  };
+  const oxygen = (molecule: MoleculeObject) => molecule.atoms.find((atom) => atom.id === "o")!;
+
+  it.each([
+    ["a move", (m: MoleculeObject) => { m.atoms.forEach((atom) => { atom.x += 50; atom.y -= 20; }); }],
+    ["a rotation", (m: MoleculeObject) => { m.atoms.forEach((atom) => { [atom.x, atom.y] = [-atom.y, atom.x]; }); }],
+    ["an alignment of one atom", (m: MoleculeObject) => { m.atoms[2]!.y = m.atoms[0]!.y; }],
+    ["a reversed bond with a new style", (m: MoleculeObject) => {
+      m.bonds[1] = { ...m.bonds[1]!, fromAtomId: "o", toAtomId: "c2", display: { bondStyle: "bold" } };
+    }],
+    ["a label offset and color", (m: MoleculeObject) => {
+      m.atoms[2]!.labelOffset = { x: 2, y: 1 };
+      m.style = { atomLabelColors: { o: "#123456" } };
+    }],
+    ["a chemical edit of another atom", (m: MoleculeObject) => { m.atoms[0]!.element = "N"; m.atoms[0]!.formalCharge = 1; }],
+    ["a bond added elsewhere", (m: MoleculeObject) => { m.bonds.push({ id: "b3", fromAtomId: "c1", toAtomId: "s", order: "single" }); }]
+  ] as const)("keeps it through %s", (_name, edit) => {
+    expect(oxygen(update(edit)).hydrogenCount).toBe(0);
+  });
+
+  it.each([
+    ["an element change", (m: MoleculeObject) => { m.atoms[2]!.element = "S"; }],
+    ["a charge change", (m: MoleculeObject) => { m.atoms[2]!.formalCharge = -1; }],
+    ["a bond order change at it", (m: MoleculeObject) => { m.bonds[1]!.order = "double"; }],
+    ["a bond added at it", (m: MoleculeObject) => { m.bonds.push({ id: "b3", fromAtomId: "o", toAtomId: "s", order: "single" }); }],
+    ["a dative bond added at it", (m: MoleculeObject) => {
+      m.bonds.push({ id: "b3", fromAtomId: "o", toAtomId: "s", order: "single", display: { bondStyle: "dashed" } });
+    }],
+    ["its bond made dative", (m: MoleculeObject) => { m.bonds[1]!.display = { bondStyle: "dashed" }; }],
+    ["its bond removed", (m: MoleculeObject) => { m.bonds.pop(); }],
+    ["a radical added to it", (m: MoleculeObject) => { m.atoms[2]!.markRadicals = 1; }],
+    ["an isotope set on it", (m: MoleculeObject) => { m.atoms[2]!.isotope = 18; }],
+    // Master decision 2026-11-22: retyping is an explicit user statement; the typed label wins.
+    ["its label retyped as the same element (a typed literal O)", (m: MoleculeObject) => { m.atoms[2]!.labelLiteral = true; }],
+    ["its label retyped with its hydrogens spelled (a typed literal OH)", (m: MoleculeObject) => {
+      m.atoms[2] = { ...m.atoms[2]!, element: "OH", labelLiteral: true };
+    }]
+  ] as const)("drops it on %s", (_name, edit) => {
+    expect(oxygen(update(edit)).hydrogenCount).toBeUndefined();
+  });
+
+  it.each([
+    ["a radical removed from it", { markRadicals: 1 }, { markRadicals: 2 }],
+    ["its isotope cleared", { isotope: 18 }, { isotope: 17 }]
+  ] as const)("drops it on %s, or changed", (_name, marked, changed) => {
+    const document = createEmptyDocument();
+    const before = ethoxy();
+    before.atoms[2] = { ...before.atoms[2]!, hydrogenCount: 1, ...marked };
+    const { markRadicals: _radicals, isotope: _isotope, ...cleared } = before.atoms[2]!;
+    for (const atom of [cleared, { ...before.atoms[2]!, ...changed }]) {
+      const result = applyPatches(document, [
+        { op: "addObject", pageId: document.pages[0]!.id, object: before },
+        { op: "updateObject", objectId: before.id, changes: { atoms: before.atoms.map((candidate) => candidate.id === "o" ? atom : candidate) } }
+      ]).pages[0]!.objects[0] as MoleculeObject;
+      expect(oxygen(result).hydrogenCount).toBeUndefined();
+    }
+  });
+
+  it("drops it when a typed literal label is made a plain one again (the label was retyped)", () => {
+    const document = createEmptyDocument();
+    const before = ethoxy();
+    before.atoms[2] = { ...before.atoms[2]!, labelLiteral: true };
+    const { labelLiteral: _literal, ...plain } = before.atoms[2]!;
+    const result = applyPatches(document, [
+      { op: "addObject", pageId: document.pages[0]!.id, object: before },
+      { op: "updateObject", objectId: before.id, changes: { atoms: before.atoms.map((atom) => atom.id === "o" ? plain : atom) } }
+    ]).pages[0]!.objects[0] as MoleculeObject;
+    expect(oxygen(result)).toMatchObject({ element: "O" });
+    expect(oxygen(result).hydrogenCount).toBeUndefined();
+  });
+
+  it("undo of a retype restores the stated count exactly", () => {
+    const document = createEmptyDocument();
+    const before = ethoxy();
+    const added = applyPatchWithHistory(createDocumentHistory(document),
+      { op: "addObject", pageId: document.pages[0]!.id, object: before });
+    const retyped = applyPatchWithHistory(added, { op: "updateObject", objectId: before.id, changes: {
+      atoms: before.atoms.map((atom) => atom.id === "o" ? { ...atom, labelLiteral: true } : atom) } });
+    expect(oxygen(retyped.present.pages[0]!.objects[0] as MoleculeObject)).toMatchObject({ labelLiteral: true });
+    expect(oxygen(retyped.present.pages[0]!.objects[0] as MoleculeObject).hydrogenCount).toBeUndefined();
+    const undone = undo(retyped);
+    expect(undone.present).toBe(added.present);
+    expect(oxygen(undone.present.pages[0]!.objects[0] as MoleculeObject)).toEqual(before.atoms[2]);
+  });
+
+  it("keeps it through a dismissed warning, a hidden label and a label bond side recorded on it", () => {
+    expect(oxygen(update((m) => {
+      m.atoms[2] = { ...m.atoms[2]!, warningSuppressed: true, labelVisible: false, labelBondSide: { side: "left", atomId: "c2" } };
+    })).hydrogenCount).toBe(0);
+  });
+
+  it("a merge keeps the absorbed atoms' counts on their new ids; the joining bond drops its two ends'", () => {
+    // As the bond tool merges two molecules: the absorbed atoms and bonds are re-minted onto ids the
+    // host does not have (one update), then one bond joins the host's S to the absorbed C1 (another).
+    const host = ethoxy();
+    host.atoms[3] = { ...host.atoms[3]!, hydrogenCount: 1 };
+    const absorbedAtoms: MoleculeObject["atoms"] = [
+      { id: "m1", element: "C", x: 0, y: 40, formalCharge: 0, hydrogenCount: 2 },
+      { id: "m2", element: "C", x: 14, y: 48, formalCharge: 0 },
+      { id: "m3", element: "O", x: 28, y: 40, formalCharge: 0, hydrogenCount: 0 }
+    ];
+    const absorbedBonds: MoleculeObject["bonds"] = [
+      { id: "m-b1", fromAtomId: "m1", toAtomId: "m2", order: "single" },
+      { id: "m-b2", fromAtomId: "m2", toAtomId: "m3", order: "single" }
+    ];
+    const atoms = [...host.atoms, ...absorbedAtoms];
+    const bonds = [...host.bonds, ...absorbedBonds];
+    const document = createEmptyDocument();
+    const merged = applyPatches(document, [
+      { op: "addObject", pageId: document.pages[0]!.id, object: host },
+      { op: "updateObject", objectId: host.id, changes: { atoms, bonds } }
+    ]);
+    const counts = (result: typeof merged) => Object.fromEntries(
+      (result.pages[0]!.objects[0] as MoleculeObject).atoms.map((atom) => [atom.id, atom.hydrogenCount]));
+    expect(counts(merged)).toEqual({ c1: undefined, c2: undefined, o: 0, s: 1, m1: 2, m2: undefined, m3: 0 });
+    const joined = applyPatches(merged, [{ op: "updateObject", objectId: host.id, changes: {
+      bonds: [...bonds, { id: "join", fromAtomId: "s", toAtomId: "m1", order: "single" }]
+    } }]);
+    expect(counts(joined)).toEqual({ c1: undefined, c2: undefined, o: 0, s: undefined, m1: undefined, m2: undefined, m3: 0 });
+  });
+
+  it("a one-update merge (absorbed atoms and joining bond together, as a plugin writes it) drops the same counts", () => {
+    // An imported C-C-O (C1 stated 2, O stated 0) joined onto an ethane in one updateObject: the
+    // absorbed atoms arrive on re-minted ids with the bond that joins C1 to the ethane's end.
+    const ethane = (): MoleculeObject => ({
+      ...ethoxy(),
+      id: "e",
+      atoms: [
+        { id: "e1", element: "C", x: 0, y: 0, formalCharge: 0 },
+        { id: "e2", element: "C", x: 14, y: 8, formalCharge: 0 }
+      ],
+      bonds: [{ id: "eb", fromAtomId: "e1", toAtomId: "e2", order: "single" }]
+    });
+    const absorbedAtoms: MoleculeObject["atoms"] = [
+      { id: "m1", element: "C", x: 0, y: 40, formalCharge: 0, hydrogenCount: 2 },
+      { id: "m2", element: "C", x: 14, y: 48, formalCharge: 0 },
+      { id: "m3", element: "O", x: 28, y: 40, formalCharge: 0, hydrogenCount: 0 }
+    ];
+    const absorbedBonds: MoleculeObject["bonds"] = [
+      { id: "m-b1", fromAtomId: "m1", toAtomId: "m2", order: "single" },
+      { id: "m-b2", fromAtomId: "m2", toAtomId: "m3", order: "single" }
+    ];
+    const join: MoleculeObject["bonds"][number] = { id: "join", fromAtomId: "e2", toAtomId: "m1", order: "single" };
+    const document = createEmptyDocument();
+    const added = applyPatches(document, [{ op: "addObject", pageId: document.pages[0]!.id, object: ethane() }]);
+    const host = ethane();
+    const atoms = [...host.atoms, ...absorbedAtoms];
+    const counts = (result: typeof added) => Object.fromEntries(
+      (result.pages[0]!.objects[0] as MoleculeObject).atoms.map((atom) => [atom.id, atom.hydrogenCount]));
+    const onePatch = applyPatches(added, [{ op: "updateObject", objectId: host.id, changes: {
+      atoms, bonds: [...host.bonds, ...absorbedBonds, join]
+    } }]);
+    const twoPatches = applyPatches(applyPatches(added, [{ op: "updateObject", objectId: host.id, changes: {
+      atoms, bonds: [...host.bonds, ...absorbedBonds]
+    } }]), [{ op: "updateObject", objectId: host.id, changes: { bonds: [...host.bonds, ...absorbedBonds, join] } }]);
+    expect(counts(onePatch)).toEqual({ e1: undefined, e2: undefined, m1: undefined, m2: undefined, m3: 0 });
+    expect(counts(onePatch)).toEqual(counts(twoPatches));
+  });
+
+  it("a new atom bonded only to other new atoms keeps its count; one bonded to an existing atom drops it", () => {
+    const document = createEmptyDocument();
+    const host = ethoxy();
+    const added = applyPatches(document, [{ op: "addObject", pageId: document.pages[0]!.id, object: host }]);
+    const result = applyPatches(added, [{ op: "updateObject", objectId: host.id, changes: {
+      atoms: [...host.atoms,
+        { id: "n1", element: "N", x: 60, y: 20, formalCharge: 0, hydrogenCount: 3 },
+        { id: "n2", element: "N", x: 80, y: 20, formalCharge: 0, hydrogenCount: 0 },
+        { id: "n3", element: "N", x: 100, y: 20, formalCharge: 0, hydrogenCount: 1 }],
+      bonds: [...host.bonds,
+        { id: "nb1", fromAtomId: "n1", toAtomId: "n2", order: "single" },
+        { id: "nb2", fromAtomId: "s", toAtomId: "n3", order: "single" }]
+    } }]).pages[0]!.objects[0] as MoleculeObject;
+    expect(Object.fromEntries(result.atoms.map((atom) => [atom.id, atom.hydrogenCount])))
+      .toEqual({ c1: undefined, c2: undefined, o: 0, s: undefined, n1: 3, n2: 0, n3: undefined });
+  });
+
+  it("is kept when the molecule is added whole (an import, a paste or a duplicate)", () => {
+    const document = createEmptyDocument();
+    const added = applyPatches(document, [{ op: "addObject", pageId: document.pages[0]!.id, object: ethoxy() }])
+      .pages[0]!.objects[0] as MoleculeObject;
+    expect(oxygen(added).hydrogenCount).toBe(0);
+  });
+});
+
+// chem-core's patches never refuse such a count: they also replay paste, duplicate, undo and session
+// restore, and refusing a user's own document there is worse than the ignored count. The plugin host
+// refuses a plugin or assistant write that sets one (plugin-host writeScope.test.ts); the atom
+// validator flags a stored one (apps/desktop atomProblems.test.ts).
+describe("a hydrogen count an H, D or T atom cannot carry is stored as written, never refused", () => {
+  const withHydrogen = (element: string, hydrogenCount?: number): MoleculeObject => {
+    const molecule = ethoxy();
+    return { ...molecule,
+      atoms: [...molecule.atoms, { id: "h", element, x: 40, y: 10, formalCharge: 0, ...(hydrogenCount === undefined ? {} : { hydrogenCount }) }],
+      bonds: [...molecule.bonds, { id: "bh", fromAtomId: "s", toAtomId: "h", order: "single" }] };
+  };
+  const pageId = () => createEmptyDocument().pages[0]!.id;
+  const hydrogenOf = (document: ReturnType<typeof createEmptyDocument>) =>
+    (document.pages[0]!.objects[0] as MoleculeObject).atoms.find((atom) => atom.id === "h")!;
+
+  it("adds a molecule whose H, D or T atom states 2 or 0, keeping the count as written", () => {
+    for (const element of ["H", "D", "T"]) {
+      for (const count of [2, 0]) {
+        const added = applyPatches(createEmptyDocument(), [{ op: "addObject", pageId: pageId(), object: withHydrogen(element, count) }]);
+        expect(hydrogenOf(added).hydrogenCount).toBe(count);
+      }
+    }
+  });
+
+  it("an update setting 1 on an existing H stores it, and the native file round-trips it unchanged", () => {
+    const document = applyPatches(createEmptyDocument(), [{ op: "addObject", pageId: pageId(), object: withHydrogen("H") }]);
+    const updated = applyPatches(document, [{ op: "updateObject", objectId: "m", changes: { atoms: withHydrogen("H", 1).atoms } }]);
+    expect(hydrogenOf(updated).hydrogenCount).toBe(1);
+    expect(hydrogenOf(document).hydrogenCount).toBeUndefined();
+    expect(hydrogenOf(deserializeDocument(serializeDocument(updated)))).toEqual(hydrogenOf(updated));
+  });
+
+  it("an edit elsewhere in a molecule that holds such a count keeps it", () => {
+    const document = createEmptyDocument();
+    document.pages[0]!.objects.push(withHydrogen("H", 1));
+    const moved = applyPatches(document, [{ op: "updateObject", objectId: "m", changes: {
+      atoms: withHydrogen("H", 1).atoms.map((atom) => ({ ...atom, x: atom.x + 5 }))
+    } }]);
+    expect(hydrogenOf(moved).hydrogenCount).toBe(1);
+  });
+
+  it("undo and redo across an edit of a document holding such a count restore each state exactly", () => {
+    const document = createEmptyDocument();
+    document.pages[0]!.objects.push(withHydrogen("H", 1));
+    const edited = applyPatchWithHistory(createDocumentHistory(document), { op: "updateObject", objectId: "m", changes: {
+      atoms: withHydrogen("H", 1).atoms.map((atom) => atom.id === "c1" ? { ...atom, x: atom.x + 7 } : atom)
+    } });
+    expect(hydrogenOf(edited.present).hydrogenCount).toBe(1);
+    const undone = undo(edited);
+    expect(undone.present).toBe(document);
+    expect(hydrogenOf(undone.present)).toEqual({ id: "h", element: "H", x: 40, y: 10, formalCharge: 0, hydrogenCount: 1 });
+    const redone = redo(undone);
+    expect(redone.present).toBe(edited.present);
+    expect(hydrogenOf(redone.present).hydrogenCount).toBe(1);
+  });
+
+  it("lets an element change drop the count as any element change does", () => {
+    const document = applyPatches(createEmptyDocument(), [{ op: "addObject", pageId: pageId(), object: withHydrogen("C", 2) }]);
+    const result = applyPatches(document, [{ op: "updateObject", objectId: "m", changes: { atoms: withHydrogen("H", 2).atoms } }]);
+    expect(hydrogenOf(result).hydrogenCount).toBeUndefined();
+  });
+
+  it("names the atom a write sets such a count on, not one an earlier state already held unchanged", () => {
+    const held = withHydrogen("H", 1).atoms;
+    expect(atomIgnoresStatedHydrogenCount(held.at(-1)!)).toBe(true);
+    expect(["H", "D", "T"].map((element) => atomIgnoresStatedHydrogenCount({ id: "h", element, x: 0, y: 0, formalCharge: 0, hydrogenCount: 0 })))
+      .toEqual([false, false, false]);
+    expect(atomIgnoresStatedHydrogenCount({ id: "c", element: "C", x: 0, y: 0, formalCharge: 0, hydrogenCount: 2 })).toBe(false);
+    expect(atomWithIgnoredHydrogenCount(held)?.id).toBe("h");
+    expect(atomWithIgnoredHydrogenCount(held, held)).toBeUndefined();
+    expect(atomWithIgnoredHydrogenCount(withHydrogen("H", 2).atoms, held)?.id).toBe("h");
+    expect(atomWithIgnoredHydrogenCount(withHydrogen("D", 1).atoms, held)?.id).toBe("h");
+    expect(atomWithIgnoredHydrogenCount(withHydrogen("D", 0).atoms, held)).toBeUndefined();
+  });
+
+  it("flags the unknown atom * stating a count other than 0, which nothing counts", () => {
+    const atom = (element: string, hydrogenCount?: number, labelLiteral?: true) =>
+      ({ id: "x", element, x: 0, y: 0, formalCharge: 0, ...(hydrogenCount === undefined ? {} : { hydrogenCount }), ...(labelLiteral ? { labelLiteral } : {}) });
+    expect([atom("*", 2), atom("*", 1, true)].map(atomIgnoresStatedHydrogenCount)).toEqual([true, true]);
+    expect([atom("*", 0), atom("*"), atom("O", 0)].map(atomIgnoresStatedHydrogenCount)).toEqual([false, false, false]);
+    expect(atomWithIgnoredHydrogenCount([atom("*", 2)])?.id).toBe("x");
+    expect(atomWithIgnoredHydrogenCount([atom("*", 2)], [atom("*", 2)])).toBeUndefined();
+    expect(atomWithIgnoredHydrogenCount([atom("*", 0)])).toBeUndefined();
+  });
+
+  it("flags exactly the stored counts atomStatedHydrogenCount does not use: generic labels too, read from the element table, no list", () => {
+    const atom = (element: string, hydrogenCount?: number, labelLiteral?: true) =>
+      ({ id: "x", element, x: 0, y: 0, formalCharge: 0, ...(hydrogenCount === undefined ? {} : { hydrogenCount }), ...(labelLiteral ? { labelLiteral } : {}) });
+    // Generic placeholder labels (as CDXML imports them: literal): no element symbol starts them.
+    const generic = ["A", "Q", "M", "X", "R", "R1", "R'", "G", "L"];
+    for (const element of generic) {
+      for (const subject of [atom(element, 2, true), atom(element, 1)]) {
+        expect(atomIgnoresStatedHydrogenCount(subject)).toBe(true);
+        expect(atomStatedHydrogenCount(subject, [])).toBeUndefined();
+      }
+      // 0 is what such a label counts anyway, and no count is nothing to flag.
+      expect([atom(element, 0, true), atom(element, 0), atom(element)].map(atomIgnoresStatedHydrogenCount)).toEqual([false, false, false]);
+    }
+    expect(atomWithIgnoredHydrogenCount([atom("R1", 2, true)])?.id).toBe("x");
+    expect(atomWithIgnoredHydrogenCount([atom("A", 2, true)], [atom("A", 2, true)])).toBeUndefined();
+    expect(atomWithIgnoredHydrogenCount([atom("A", 0, true)])).toBeUndefined();
+    // Honored, unchanged: an ordinary element stating a count it disagrees with (counted by
+    // atomStatedHydrogenCount), and a literal element label (its own text, and the Kekulé check, read it).
+    expect(atomIgnoresStatedHydrogenCount(atom("C", 2))).toBe(false);
+    expect(atomStatedHydrogenCount(atom("C", 2), [])).toBe(2);
+    expect([atom("N", 1, true), atom("O", 2, true), atom("Ar", 1, true)].map(atomIgnoresStatedHydrogenCount)).toEqual([false, false, false]);
+    // A label an element symbol starts names that element and spells its own hydrogens, as the atom
+    // problem fix "Set explicit hydrogens" writes it (a literal "NH2" storing 2): not flagged.
+    for (const subject of [atom("NH2", 2, true), atom("CH3", 3, true), atom("NHMe", 1, true), atom("H2N", 2, true), atom("NH2", 2)]) {
+      expect(atomIgnoresStatedHydrogenCount(subject)).toBe(false);
+      expect(atomStatedHydrogenCount(subject, [])).toBeUndefined();
+    }
+  });
+
+  it("words the kept-but-not-counted report for hydrogen atoms, unknown atoms, or both", () => {
+    const atom = (id: string, element: string, hydrogenCount: number) => ({ id, element, x: 0, y: 0, formalCharge: 0, hydrogenCount });
+    expect(statedHydrogenCountNotCountedText([atom("h", "H", 1)])).toBe("atom h (H) states 1 hydrogen, which a hydrogen atom cannot carry: " +
+      "only 0 counts, as a typed H, D or T label means. The stated count is kept as stored but not counted, and the atom is flagged.");
+    expect(statedHydrogenCountNotCountedText([atom("x", "*", 2)], (item) => `n${item.id}`)).toBe("atom nx (*) states 2 hydrogens, which an unknown " +
+      "atom cannot carry: only 0 counts, as a typed * label means. The stated count is kept as stored but not counted, and the atom is flagged.");
+    expect(statedHydrogenCountNotCountedText([atom("x", "*", 2), atom("y", "*", 1)])).toBe("2 unknown atoms state hydrogen counts an unknown " +
+      "atom cannot carry: atom x (*) states 2; atom y (*) states 1. Only 0 counts, as a typed * label means. The stated counts are kept as " +
+      "stored but not counted, and the atoms are flagged.");
+    expect(statedHydrogenCountNotCountedText([atom("h", "H", 1), atom("x", "*", 2)])).toBe("2 atoms state hydrogen counts they cannot carry: " +
+      "atom h (H) states 1; atom x (*) states 2. Only 0 counts on a hydrogen or unknown atom, as a typed H, D, T or * label means. The stated " +
+      "counts are kept as stored but not counted, and the atoms are flagged.");
+  });
+
+  it("words it for a label naming no element with the label's own text, by the same pattern", () => {
+    const atom = (id: string, element: string, hydrogenCount: number) => ({ id, element, x: 0, y: 0, formalCharge: 0, hydrogenCount, labelLiteral: true });
+    expect(statedHydrogenCountNotCountedText([atom("a", "A", 2)], (item) => `n${item.id}`)).toBe("atom na (A) states 2 hydrogens, which a " +
+      "label naming no element cannot carry: only 0 counts, as a typed A label means. The stated count is kept as stored but not counted, and the atom is flagged.");
+    expect(statedHydrogenCountNotCountedText([atom("a", "A", 2), atom("r", "R1", 1)])).toBe("2 atoms with labels naming no element state hydrogen " +
+      "counts a label naming no element cannot carry: atom a (A) states 2; atom r (R1) states 1. Only 0 counts, as a typed A or R1 label means. " +
+      "The stated counts are kept as stored but not counted, and the atoms are flagged.");
+    expect(statedHydrogenCountNotCountedText([atom("a", "A", 2), atom("b", "A", 1)])).toContain("Only 0 counts, as a typed A label means.");
+    expect(statedHydrogenCountNotCountedText([atom("h", "H", 1), atom("x", "*", 2), atom("a", "A", 2)])).toBe("3 atoms state hydrogen counts " +
+      "they cannot carry: atom h (H) states 1; atom x (*) states 2; atom a (A) states 2. Only 0 counts on a hydrogen atom, an unknown atom or a " +
+      "label naming no element, as a typed H, D, T, * or A label means. The stated counts are kept as stored but not counted, and the atoms are flagged.");
+  });
+});
+
+/**
+ * Which labels are abbreviations chem-core reads from the abbreviation table itself
+ * (`isTableAbbreviationLabel`), the table the label grammar reads, so chem-core alone (this file
+ * loads no layout-engine) decides exactly as the app does; layout-engine labelGrammar pins the two
+ * readings to each other for every spelling.
+ */
+describe("a hydrogen count stated on an abbreviation (OMe, Ph): read from the abbreviation table", () => {
+  const atom = (element: string, hydrogenCount?: number, labelLiteral?: true, id = "x") =>
+    ({ id, element, x: 0, y: 0, formalCharge: 0, ...(hydrogenCount === undefined ? {} : { hydrogenCount }), ...(labelLiteral ? { labelLiteral } : {}) });
+
+  it("reads a table spelling (or alias) that is no element symbol as an abbreviation, and nothing else", () => {
+    expect(["OMe", "MeO", "Ph", "Me", "CF3", "TMS", " OMe "].map(isTableAbbreviationLabel)).toEqual([true, true, true, true, true, true, true]);
+    // Elements (a bonded-only spelling such as "Ac" stays actinium on a stored atom), spelled and
+    // composite labels, generic labels and case-folded misspellings are not.
+    expect(["C", "O", "Ac", "Pr", "Ts", "NH2", "CH3", "NHMe", "OH", "A", "R1", "*", "H", "D", "", "Ome"].map(isTableAbbreviationLabel))
+      .toEqual(new Array(16).fill(false));
+  });
+
+  it("flags an abbreviation stating a count other than 0, and nothing else the table does not call one", () => {
+    for (const subject of [atom("OMe", 2), atom("Ph", 2, true), atom("CF3", 1), atom("Me", 3, true)]) {
+      expect(atomIgnoresStatedHydrogenCount(subject)).toBe(true);
+      expect(atomStatedHydrogenCount(subject, [])).toBeUndefined();
+      expect(ignoredHydrogenCountAtomKind(subject)).toBe("an abbreviation");
+    }
+    // 0 and no count are not flagged; a held count is not a new write.
+    expect([atom("OMe", 0), atom("OMe"), atom("Ph", 0, true)].map(atomIgnoresStatedHydrogenCount)).toEqual([false, false, false]);
+    expect(atomWithIgnoredHydrogenCount([atom("OMe", 1)])?.id).toBe("x");
+    expect(atomWithIgnoredHydrogenCount([atom("OMe", 1)], [atom("OMe", 1)])).toBeUndefined();
+    // Unchanged: labels spelling an element's hydrogens, element atoms, generic labels, H and *.
+    for (const subject of [atom("NH2", 2, true), atom("CH3", 3, true), atom("NHMe", 1, true), atom("H2N", 2, true), atom("OH", 1, true)]) {
+      expect(atomIgnoresStatedHydrogenCount(subject)).toBe(false);
+    }
+    expect(atomStatedHydrogenCount(atom("C", 2), [])).toBe(2);
+    expect([atom("A", 2, true), atom("*", 2), atom("H", 1)].map(ignoredHydrogenCountAtomKind))
+      .toEqual(["a label naming no element", "an unknown atom", "a hydrogen atom"]);
+    // An element symbol is never an abbreviation, as the grammar reads elements first: a stored "Ac"
+    // stays actinium.
+    expect(atomIgnoresStatedHydrogenCount(atom("N", 1, true))).toBe(false);
+    expect(atomIgnoresStatedHydrogenCount(atom("Ac", 1))).toBe(false);
+  });
+
+  it("words it as an abbreviation's hydrogens coming from what it stands for, alone, together and beside other kinds", () => {
+    expect(statedHydrogenCountNotCountedReason(atom("OMe", 2))).toBe("OMe states 2 H, which is not counted: an abbreviation's hydrogens come from what it stands for.");
+    expect(statedHydrogenCountNotCountedReason(atom("A", 2, true))).toBe("A states 2 H, which a label naming no element cannot carry; only 0 counts.");
+    expect(statedHydrogenCountNotCountedText([atom("OMe", 1, undefined, "o")])).toBe("atom o (OMe) states 1 hydrogen, but an abbreviation's " +
+      "hydrogens come from what it stands for, so the stated count is kept as stored but not counted, and the atom is flagged.");
+    expect(statedHydrogenCountNotCountedText([atom("OMe", 2, undefined, "o"), atom("Ph", 1, undefined, "p")])).toBe("2 abbreviations state " +
+      "hydrogen counts: atom o (OMe) states 2; atom p (Ph) states 1. An abbreviation's hydrogens come from what it stands for. " +
+      "The stated counts are kept as stored but not counted, and the atoms are flagged.");
+    expect(statedHydrogenCountNotCountedText([atom("H", 1, undefined, "h"), atom("*", 2, undefined, "s"), atom("OMe", 2, undefined, "o")])).toBe("3 atoms state hydrogen counts that are not counted: " +
+      "atom h (H) states 1; atom s (*) states 2; atom o (OMe) states 2. Only 0 counts on a hydrogen or unknown atom, as a typed H, D, T or * label " +
+      "means, and an abbreviation's hydrogens come from what it stands for. The stated counts are kept as stored but not counted, and the atoms are flagged.");
+    // With no abbreviation among them, the wording is the generic one, byte for byte.
+    expect(statedHydrogenCountNotCountedText([atom("A", 2, true, "a"), atom("R1", 1, true, "r")])).toBe("2 atoms with labels naming no element " +
+      "state hydrogen counts a label naming no element cannot carry: atom a (A) states 2; atom r (R1) states 1. Only 0 counts, as a typed A or R1 " +
+      "label means. The stated counts are kept as stored but not counted, and the atoms are flagged.");
+  });
+});
+
+describe("atomStatedHydrogenCount: the count an atom states for itself", () => {
+  const chain = (atom: Partial<MoleculeObject["atoms"][number]>, order: MoleculeObject["bonds"][number]["order"] = "single", dashed = false) => {
+    const atoms: MoleculeObject["atoms"] = [
+      { id: "c", element: "C", x: 0, y: 0, formalCharge: 0 },
+      { id: "x", element: "O", x: 20, y: 0, formalCharge: 0, ...atom }
+    ];
+    const bonds: MoleculeObject["bonds"] = [
+      { id: "b", fromAtomId: "c", toAtomId: "x", order, ...(dashed ? { display: { bondStyle: "dashed" as const } } : {}) }
+    ];
+    return { atom: atoms[1]!, bonds };
+  };
+  const stated = (atom: Partial<MoleculeObject["atoms"][number]>, order?: MoleculeObject["bonds"][number]["order"], dashed?: boolean) => {
+    const subject = chain(atom, order, dashed);
+    return atomStatedHydrogenCount(subject.atom, subject.bonds);
+  };
+
+  it("is the stated count on an ordinary element atom, zero included", () => {
+    expect(stated({ hydrogenCount: 0 })).toBe(0);
+    expect(stated({ hydrogenCount: 2, element: "N" })).toBe(2);
+    expect(stated({ hydrogenCount: 0 }, "double")).toBe(0);
+    expect(stated({ hydrogenCount: 3, element: "C" })).toBe(3);
+  });
+
+  it("is undefined with no count, on a typed literal label, and on an aromatic bond", () => {
+    expect(stated({})).toBeUndefined();
+    expect(stated({ hydrogenCount: 0, labelLiteral: true })).toBeUndefined();
+    expect(stated({ hydrogenCount: 0 }, "aromatic")).toBeUndefined();
+    const pyrrole = imported();
+    expect(pyrrole.atoms.map((atom) => atomStatedHydrogenCount(atom, pyrrole.bonds))).toEqual(pyrrole.atoms.map(() => undefined));
+  });
+
+  it("is 0 on an H, D or T atom stating 0, as a typed H, D or T label means, and undefined for any other count", () => {
+    for (const element of ["H", "D", "T"]) {
+      expect(stated({ hydrogenCount: 0, element })).toBe(0);
+      expect(stated({ hydrogenCount: 0, element }, "single", true)).toBe(0);
+      expect(stated({ hydrogenCount: 1, element })).toBeUndefined();
+      expect(stated({ hydrogenCount: 2, element })).toBeUndefined();
+    }
+  });
+
+  it("is undefined on a label that is not an element", () => {
+    for (const element of ["*", "R1", "OMe", "o"]) expect(stated({ hydrogenCount: 0, element })).toBeUndefined();
+  });
+
+  it("is the stated count on a carbon bonded only datively, as a typed C … CH4 there spells it", () => {
+    for (const hydrogenCount of [0, 2, 3, 4]) expect(stated({ hydrogenCount, element: "C" }, "single", true)).toBe(hydrogenCount);
+    expect(stated({ hydrogenCount: 0, element: "N" }, "single", true)).toBe(0);
   });
 });

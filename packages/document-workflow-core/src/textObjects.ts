@@ -10,7 +10,7 @@ import {
   type TextSpan,
   textStyleToObjectStyle
 } from "@chemdraft/chem-core";
-import { measureNativeTextSpanLineWidth, textObjectSpanLines } from "@chemdraft/layout-engine";
+import { measureNativeTextSpanLineWidth, textObjectSpanLines, textObjectSpansForRendering, nativeTextSpanLayout } from "@chemdraft/layout-engine";
 import { nativeTextObjectLineMetrics, nativeTextSpanMetrics } from "@chemdraft/layout-engine";
 import { clamp, firstPage, nextObjectId, type PagePoint, phase4Timestamp } from "./shared";
 import { documentDrawingDefaults } from "./drawingDefaults";
@@ -54,12 +54,16 @@ export function nativeTextObjectSizeForText(
     nativeTextObjectMinimumDimensions.width,
     Math.max(nativeTextObjectMinimumDimensions.width, maxWidth)
   );
-  const wrappedLineCount = lineWidths.reduce((count, lineWidth) => (
+  const wrappedLines = options.width === undefined ? undefined : nativeTextSpanLayout(
+    textObjectSpansForRendering({ text, spans: options.spans ?? [] }), textStyle, Math.max(1, width - nativeTextBoxHorizontalPadding));
+  const wrappedLineCount = wrappedLines?.length ?? lineWidths.reduce((count, lineWidth) => (
     count + Math.max(1, Math.ceil(lineWidth / Math.max(1, width - nativeTextBoxHorizontalPadding)))
   ), 0);
   const paragraphSpacing = Math.max(0, paragraphs.length - 1) * textStyle.paragraphSpacingPx;
   const naturalHeight = clamp(
-    wrappedLineCount * lineHeightPx + paragraphSpacing + nativeTextBoxVerticalPadding,
+    Math.max(wrappedLineCount * lineHeightPx + paragraphSpacing + nativeTextBoxVerticalPadding,
+      wrappedLines ? nativeTextObjectLineMetrics({ text, spans: options.spans ?? [], width,
+        style: { ...textStyle, textBoxSizingMode: "fixed-width" } }).height : 0),
     nativeTextObjectMinimumDimensions.height,
     Number.MAX_SAFE_INTEGER
   );

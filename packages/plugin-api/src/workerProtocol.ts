@@ -16,6 +16,7 @@
 import { PluginApiVersion, PluginCommandInputSchema, type PluginCommandInput } from "./index";
 import { pluginRequestMethods, type PluginActiveDocumentChanged, type PluginToolCall, type PluginToolCallResult } from "./requestCapabilities";
 import type { PluginRequestResult } from "./requestSchemas";
+import { pluginRefusalFields, type PluginRefusalDetails } from "./refusal";
 
 /**
  * Protocol wire version. Bumped only on a breaking change to the message shapes below. The worker
@@ -101,10 +102,15 @@ export type CapabilityMethodOf<N extends PluginWorkerCapabilityNamespace> =
   (typeof PLUGIN_WORKER_CAPABILITY_METHODS)[N][number];
 
 /** A serializable error crossing the boundary in either direction. Errors never travel as `Error`
- *  instances (not reliably cloneable); they are normalized to `{ code, message }`. */
+ *  instances (not reliably cloneable); they are normalized to `{ code, message }`, plus the optional
+ *  refusal fields below when the host refused for a specific reason. */
 export interface PluginWorkerErrorPayload {
   code: string;
   message: string;
+  /** API 0.1.27: stable snake_case reason, e.g. `hydrogen_count_unrepresentable` (see `PluginRefusalFields`). */
+  reason?: string;
+  /** API 0.1.27: what the refusal is about, e.g. `{ moleculeId, atomId, element, hydrogenCount }`. */
+  details?: PluginRefusalDetails;
 }
 
 export interface PluginWorkerFeatures {
@@ -187,7 +193,7 @@ export function toPluginWorkerErrorPayload(value: unknown): PluginWorkerErrorPay
     typeof candidate?.message === "string" && candidate.message.length > 0
       ? candidate.message
       : "The plugin worker boundary reported a failure with no usable message.";
-  return { code, message };
+  return { code, message, ...pluginRefusalFields(candidate) };
 }
 
 /**
@@ -283,6 +289,14 @@ export function supportsPluginTableInsertion(declaredRange: string): boolean {
 export function supportsPluginRequestTools(declaredRange: string): boolean {
   const minimum = parseSemver(declaredRange.trim().replace(/^[~^]/, ""));
   return minimum !== undefined && compareSemver(minimum, { major: 0, minor: 1, patch: 26 }) >= 0;
+}
+
+/** The first SDK release whose request error schema accepts the optional `reason` and `details`
+ * refusal fields. An older worker validates request results strictly, so a host sends them only to
+ * a plugin whose declared range starts here. */
+export function supportsPluginRefusalFields(declaredRange: string): boolean {
+  const minimum = parseSemver(declaredRange.trim().replace(/^[~^]/, ""));
+  return minimum !== undefined && compareSemver(minimum, { major: 0, minor: 1, patch: 27 }) >= 0;
 }
 
 /**

@@ -31,7 +31,7 @@ import {
   type PluginToolCall
 } from "@chemdraft/plugin-api";
 import { createMassRegistration, massAnalyzeCommandId, massFragmentManifest } from "@chemdraft/plugin-mass-fragment";
-import { PluginHost, type RegisterPluginOptions } from "@chemdraft/plugin-host";
+import { PluginHost, PluginHostError, type RegisterPluginOptions } from "@chemdraft/plugin-host";
 import { describe, expect, it, vi } from "vitest";
 import { AssistantCapabilityPermissions } from "@chemdraft/plugin-api";
 
@@ -432,6 +432,37 @@ describe("PluginWorkerBridge — M34 isolation boundary", () => {
     expect(viaWorker.host.listAnalysis()).toHaveLength(0); // no record written for the cancelled run
     // The pending report crossed the boundary, but the aborted run never pushed a final report.
     expect(viaWorker.reports).toHaveLength(1);
+    bridge.terminate();
+  });
+
+  it("forwards a host refusal's reason and details to the worker beside its code and message", async () => {
+    const { mainSide, workerSide } = linkedEndpoints();
+    const sentToWorker: HostToWorkerMessage[] = [];
+    workerSide.addEventListener("message", (event: { data: unknown }) => sentToWorker.push(event.data as HostToWorkerMessage));
+    const bridge = new PluginWorkerBridge({ pluginId: "org.test.refusal", createWorker: () => asHandle(mainSide), hostApiVersion: PluginApiVersion });
+    const ready = bridge.whenReady();
+    workerSide.postMessage({ kind: "ready", protocolVersion: PLUGIN_WORKER_PROTOCOL_VERSION, apiVersion: "^0.1.0" });
+    await ready;
+    const details = { moleculeId: "mol_3", atomId: "h", element: "H", hydrogenCount: 1 };
+    const context = {
+      plugin: { id: "org.test.refusal", name: "Refusal", version: "0", permissions: ["document.write"] },
+      documents: {
+        getActiveDocument: async () => undefined, proposePatch: async () => ({}) as never,
+        applyPatch: async () => { throw new PluginHostError("Plugin write refused.", { reason: "hydrogen_count_unrepresentable", details }); }
+      },
+      hasPermission: (permission: string) => permission === "document.write",
+      requirePermission: () => undefined
+    } as unknown as PluginCommandContext;
+    const invocation = bridge.invokeCommand("cmd", context);
+    await flush();
+    const { commandRequestId } = sentToWorker.find((m): m is Extract<HostToWorkerMessage, { kind: "invokeCommand" }> => m.kind === "invokeCommand")!;
+    workerSide.postMessage({ kind: "capabilityRequest", requestId: 201, commandRequestId, namespace: "documents", method: "applyPatch",
+      args: [{ reason: "H count", patch: { op: "updateObject", objectId: "mol_3", changes: {} } }] });
+    await flush();
+    expect(sentToWorker.find(m => m.kind === "capabilityResult" && m.requestId === 201)).toEqual({ kind: "capabilityResult", requestId: 201,
+      ok: false, error: { code: "PluginHostError", message: "Plugin write refused.", reason: "hydrogen_count_unrepresentable", details } });
+    workerSide.postMessage({ kind: "commandSettled", commandRequestId, ok: true, value: null });
+    await expect(invocation).resolves.toBeNull();
     bridge.terminate();
   });
 
