@@ -18,6 +18,8 @@ export interface ObjectCanvasMenuInput {
   bondDepthContext?: { relevantCrossings: readonly unknown[]; targetBondRefs: readonly unknown[]; hasOverrides: boolean };
   atomWarning?: { suppressed: boolean; count: number; problemCommandId?: string };
   arrowStyleSource?: { title: string };
+  /** Engine-reported CIP readout ("Stereocentre: R", "Double bond: E"); read-only, shown first. */
+  stereoReadout?: string;
 }
 
 export const SET_DEFAULT_ARROW_STYLE_COMMAND_ID = "arrow.setDefaultStyle";
@@ -30,6 +32,11 @@ const actionItem = (action: CommandSpec, label = action.title, enabled = action.
 const submenu = (id: string, label: string, ariaLabel: string, items: readonly CanvasMenuItem[],
   enabled = items.some(item => item.kind === "command" && item.enabled)): CanvasMenuItem =>
   ({ kind: "submenu", id, label, ariaLabel, enabled, items });
+
+/** Prepends the read-only stereo readout row (a title, never a command) and its separator. */
+export function withStereoReadout(items: readonly CanvasMenuItem[], label: string | undefined): readonly CanvasMenuItem[] {
+  return label ? [{ kind: "title", label }, separator, ...items] : items;
+}
 
 /** The sole presentation model for both native desktop and HTML canvas menus. */
 export function buildObjectCanvasMenu(input: ObjectCanvasMenuInput): readonly CanvasMenuItem[] {
@@ -75,7 +82,7 @@ export function buildObjectCanvasMenu(input: ObjectCanvasMenuInput): readonly Ca
     : input.objectIndex >= 0 ? `Layer ${input.objectIndex + 1} of ${input.objectCount}` : "Layer options" },
   command("layout.bringForward", "Move Object Forward"), command("layout.bringToFront", "Move Object to Front"),
   command("layout.sendBackward", "Move Object Backward"), command("layout.sendToBack", "Move Object to Back"));
-  return items;
+  return withStereoReadout(items, input.stereoReadout);
 }
 
 export const pageCanvasMenu: readonly CanvasMenuItem[] = [command("clipboard.paste", "Paste"), command("edit.selectAll", "Select All")];

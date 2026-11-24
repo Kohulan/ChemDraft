@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
-import type { CanvasMenuItem } from "./canvasContextMenuModel";
+import { withStereoReadout, type CanvasMenuItem } from "./canvasContextMenuModel";
 import { popupNativeCanvasMenu } from "./nativeCanvasContextMenu";
 import { isDesktopRuntime } from "./window-manager";
 
@@ -15,6 +15,9 @@ export interface CanvasContextMenuProps {
   onInvoke(commandId: string): void;
   onDismiss(): void;
   onFocusReturn?(): void;
+  /** Read-only stereo row ("Stereocentre: R"), resolved lazily; must not reject. The menu opens
+   * without waiting for it and omits the row when it resolves to undefined. */
+  loadStereoReadout?: () => Promise<string | undefined>;
 }
 
 /** Mounted once per opening. No HTML menu is exposed while the native popup is tracking. */
@@ -28,7 +31,8 @@ export function CanvasContextMenu(props: CanvasContextMenuProps) {
     // Deferring the invoke lets React StrictMode discard its first effect without opening twice.
     void Promise.resolve().then(async () => {
       if (!active) return;
-      const result = await popupNativeCanvasMenu(props.items, props.position);
+      const result = await popupNativeCanvasMenu(props.items, props.position,
+        { loadStereoReadout: props.loadStereoReadout });
       // Native tracking can consume the right-button release, even on cancellation.
       window.dispatchEvent(new Event(NATIVE_CANVAS_MENU_CLOSED_EVENT));
       if (!active) return;
@@ -45,6 +49,13 @@ export function CanvasContextMenu(props: CanvasContextMenuProps) {
 function HtmlCanvasContextMenu(props: CanvasContextMenuProps) {
   const root = useRef<HTMLDivElement>(null);
   const [position, setPosition] = useState(props.position);
+  const [stereoReadout, setStereoReadout] = useState<string>();
+  useEffect(() => {
+    let active = true;
+    void props.loadStereoReadout?.().then(label => { if (active) setStereoReadout(label); }, () => {});
+    return () => { active = false; };
+    // One readout per opening; the owner remounts this menu for a new target.
+  }, []);
   const [open, setOpen] = useState<string>();
   const pendingFocus = useRef(false);
   const latest = useRef(props);
@@ -65,6 +76,14 @@ function HtmlCanvasContextMenu(props: CanvasContextMenuProps) {
       if (menu.contains(document.activeElement) && document.hasFocus()) latest.current.onFocusReturn?.();
     };
   }, [props.position.x, props.position.y]);
+  useLayoutEffect(() => {
+    // The readout row arrives after opening; keep the taller menu inside the window without
+    // moving focus away from wherever the user has already navigated.
+    const menu = root.current;
+    if (!stereoReadout || !menu) return;
+    const rect = menu.getBoundingClientRect();
+    setPosition(current => ({ x: current.x, y: Math.max(8, Math.min(current.y, window.innerHeight - rect.height - 8)) }));
+  }, [stereoReadout]);
   useLayoutEffect(() => {
     for (const button of root.current?.querySelectorAll<HTMLButtonElement>('button[role^="menuitem"]') ?? []) {
       button.tabIndex = button === document.activeElement ? 0 : -1;
@@ -127,6 +146,8 @@ function HtmlCanvasContextMenu(props: CanvasContextMenuProps) {
           button.click(); break;
       }
     }}>
+    {/* Its own slot, so the late row never shifts the index keys (and focus) of the items. */}
+    <HtmlMenuItems items={withStereoReadout([], stereoReadout)} open={open} setOpen={setOpen} onInvoke={props.onInvoke} />
     <HtmlMenuItems items={props.items} open={open} setOpen={setOpen} onInvoke={props.onInvoke} />
   </div>;
 }

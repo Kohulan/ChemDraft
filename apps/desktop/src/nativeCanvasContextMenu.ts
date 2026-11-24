@@ -1,10 +1,39 @@
-import { toNativeCanvasMenu, type CanvasMenuItem } from "./canvasContextMenuModel";
+import { toNativeCanvasMenu, withStereoReadout, type CanvasMenuItem } from "./canvasContextMenuModel";
 
 let nextRequest = 0;
 
-/** Returns undefined only when native presentation is unavailable; cancellation is a result. */
-export async function popupNativeCanvasMenu(items: readonly CanvasMenuItem[], position: { x: number; y: number }) {
-  const route = toNativeCanvasMenu(items, String(++nextRequest));
+/** A native popup cannot change once it is tracking, so the stereo readout gets this long to
+ * resolve before the menu opens without it. With the stereo engine already loaded (the document
+ * window preloads it) the readout resolves well inside this; a cold load is not waited for. */
+export const NATIVE_STEREO_READOUT_BUDGET_MS = 120;
+
+export interface NativeCanvasMenuOptions {
+  /** Resolves the read-only stereo row; must not reject (see `resolveStereoReadout`). */
+  loadStereoReadout?: () => Promise<string | undefined>;
+  stereoReadoutBudgetMs?: number;
+}
+
+async function readoutWithinBudget(load: () => Promise<string | undefined>, budgetMs: number) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      load().catch(() => undefined),
+      new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), budgetMs); })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Returns undefined only when native presentation is unavailable; cancellation is a result.
+ * The same Tauri command serves macOS (app-wide menu host) and Windows (document window). */
+export async function popupNativeCanvasMenu(
+  items: readonly CanvasMenuItem[], position: { x: number; y: number }, options: NativeCanvasMenuOptions = {}
+) {
+  const readout = options.loadStereoReadout
+    ? await readoutWithinBudget(options.loadStereoReadout, options.stereoReadoutBudgetMs ?? NATIVE_STEREO_READOUT_BUDGET_MS)
+    : undefined;
+  const route = toNativeCanvasMenu(withStereoReadout(items, readout), String(++nextRequest));
   try {
     const { invoke } = await import("@tauri-apps/api/core");
     const selected = await invoke<string | null>("popup_canvas_context_menu", { items: route.items, position });
