@@ -352,7 +352,8 @@ interface CdxmlColorTable {
   warnings: CompatibilityConversionWarning[];
   colorByIndex: Map<number, string>;
   /** Import only: the document-wide budget of whole-table copies stored on texts and graphics. */
-  copies?: { entries: number; shared?: Readonly<Record<string, string>> };
+  /** `partial`: some object past the budget stored only the colors it uses (see attachDocumentColorTable). */
+  copies?: { entries: number; shared?: Readonly<Record<string, string>>; partial?: boolean };
 }
 
 /**
@@ -569,6 +570,21 @@ function exportCdxml(
   // Source compatibility graphics retain their color indices as well as their other attributes.
   const colors: ExportColorTable = [...standardCdxmlColorTable];
   const sourceColors = new Map<number, string>();
+  // The document's one whole copy (attachDocumentColorTable) goes first, so the objects' own tables
+  // still decide any index they disagree on, as they did before it existed.
+  let sourceTableSize = 0;
+  for (const page of parsedDocument.pages) {
+    const unknown = page.compatibility?.unknown;
+    if (Number.isSafeInteger(unknown?.cdxmlColorTableSize)) sourceTableSize = Math.max(sourceTableSize, Math.min(unknown!.cdxmlColorTableSize as number, cdxmlLimits.colorTable));
+    const table = unknown?.cdxmlColorTable;
+    if (isRecord(table)) for (const [index, color] of Object.entries(table)) {
+      if (/^\d+$/.test(index) && Number(index) >= 2 && Number(index) < cdxmlLimits.colorTable + 2 && typeof color === "string" && normalizeHexColor(color)) {
+        sourceColors.set(Number(index), color);
+        while (colors.length <= Number(index) - 2) colors.push("#000000");
+        colors[Number(index) - 2] = color;
+      }
+    }
+  }
   for (const page of parsedDocument.pages) for (const object of page.objects) {
     const table = object.compatibility?.unknown.cdxmlGraphicColorTable ?? object.compatibility?.unknown.cdxmlTextColorTable;
     if (isRecord(table)) for (const [index, color] of Object.entries(table)) {
@@ -581,6 +597,15 @@ function exportCdxml(
         colors[Number(index) - 2] = color;
       }
     }
+  }
+  // The page that stored the whole source table is gone and no object holds the entries it alone had.
+  if (sourceTableSize) {
+    const missing: number[] = [];
+    for (let index = 2; index < sourceTableSize + 2; index++) if (!sourceColors.has(index)) missing.push(index);
+    if (missing.length) warnings.push(warning("cdxml.color_table_entries_not_kept", `${format.toUpperCase()} export: ` +
+      `${missing.length} of the ${sourceTableSize} colors in the source file's color table (${missing.length === 1 ? "index" : "indices"} ` +
+      `${missing.slice(0, 10).join(", ")}${missing.length > 10 ? ` and ${missing.length - 10} more` : ""}) are used by nothing left in the document, ` +
+      "and the page that kept the whole table was deleted; they are not written, and the table holds black in their place where later colors follow."));
   }
   // The standard colors fill free entries only: a source table at the 16-bit limit stays within it.
   for (const color of standardCdxmlColorTable) if (colors.length < cdxmlLimits.colorTable && !colors.includes(color)) colors.push(color);
@@ -3860,6 +3885,7 @@ function importVisibleCdxmlFromTree(tree: OrderedXmlTree, sourceFormat: "CDXML" 
       warnings: [warning("cdxml.values_out_of_range", `${sourceFormat} import failed: ${errorMessage(error)}`)]
     };
   }
+  attachDocumentColorTable(importedPages, colorTable);
   const objectCount = importedPages.reduce((count, page) => count + page.objects.length, 0);
   if (objectCount === 0) {
     return {
@@ -6888,7 +6914,30 @@ function objectCdxmlColorTable(element: XmlElementView, colorTable: CdxmlColorTa
   };
   visit(element);
   copies.entries += Object.keys(own).length;
+  copies.partial = true;
   return own;
+}
+
+/**
+ * Past the copy budget, later objects store only the colors they use, so deleting the objects that
+ * hold whole copies would drop the palette's unused entries on the next save. Then (and only then:
+ * an ordinary document's state is unchanged) the first page stores ONE whole copy of the source
+ * table (cdxmlColorTable, at most 65,536 entries, ~1.2 MB of JSON once), which export merges before
+ * the objects' tables, and every page records the source table's size (cdxmlColorTableSize), so a
+ * save after that page is deleted can name the entries it no longer has instead of dropping them
+ * silently.
+ */
+function attachDocumentColorTable(pages: DocumentPage[], colorTable: CdxmlColorTable): void {
+  const copies = colorTable.copies;
+  if (!copies?.partial || !pages.length) return;
+  const whole = copies.shared ??= Object.fromEntries(colorTable.colorByIndex);
+  const size = [...colorTable.colorByIndex.keys()].filter(index => index >= 2).length;
+  pages.forEach((page, pageIndex) => {
+    const unknown = page.compatibility?.unknown;
+    if (!unknown) return;
+    unknown.cdxmlColorTableSize = size;
+    if (pageIndex === 0) unknown.cdxmlColorTable = whole;
+  });
 }
 
 function colorForCdxmlIndex(value: string | undefined, colorTable: CdxmlColorTable): string | undefined {

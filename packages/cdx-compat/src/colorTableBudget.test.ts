@@ -128,6 +128,9 @@ describe("CDXML color table bytes (#442)", () => {
     expect(tables.length).toBe(4);
     // Every text and the ellipse store the whole table (indices 0 and 1 plus ten colors), as before.
     for (const table of tables) expect(Object.keys(table as object)).toHaveLength(12);
+    // Within the budget the page stores no copy of its own (that is only for documents past it).
+    expect(opened.document!.pages[0].compatibility!.unknown.cdxmlColorTable).toBeUndefined();
+    expect(opened.document!.pages[0].compatibility!.unknown.cdxmlColorTableSize).toBeUndefined();
     expect(tables[0]).toEqual(Object.fromEntries([[0, "#000000"], [1, "#ffffff"], [2, "#ffffff"], [3, "#000000"], [4, "#ff0000"],
       [5, "#ffff00"], [6, "#00ff00"], [7, "#00ffff"], [8, "#0000ff"], [9, "#ff00ff"], [10, "#336699"], [11, "#804000"]]));
     const saved = exportDocumentToCdxml(opened.document!, plain);
@@ -159,6 +162,51 @@ describe("CDXML color table bytes (#442)", () => {
       if (unknown?.cdxmlGraphicColorTable) unknown.cdxmlGraphicColorTable = { ...(whole as object) };
     }
     expect(exportDocumentToCdxml(opened.document!, plain).contents).toBe(saved);
+  });
+});
+
+// Kimi (#442, P3): past the copy budget later objects store only the colors they use, so deleting
+// the objects that held whole copies dropped the palette's unused entries on the next save, with no
+// warning. In that case the first page now keeps one whole copy, and if that page is deleted too the
+// save names the entries it no longer has.
+describe("the source palette past the color copy budget (#442)", () => {
+  const paletteText = (id: number, y: number) => coloredText(id, 2 + (id % 10), y);
+  const page = (first: number, count: number) =>
+    `<page>${Array.from({ length: count }, (_, i) => paletteText(first + i, 72 + i)).join("")}</page>`;
+  // 200 colors, of which the texts use only indices 2..11; 2,048 entries hold 10 whole copies.
+  const source = (pages: string) => `<CDXML><fonttable><font id="3" charset="iso-8859-1" name="Arial"/></fonttable>${colorTable(200)}${pages}</CDXML>`;
+  const writtenTable = (contents: string) => contents.match(/<colortable>([\s\S]*?)<\/colortable>/)![1].match(/<color [^>]*\/>/g)!;
+  const whole = (object: { compatibility?: { unknown: Record<string, unknown> } }) =>
+    Object.keys((object.compatibility?.unknown.cdxmlTextColorTable ?? {}) as object).length > 1;
+
+  it("keeps one whole copy on the first page, so deleting the whole-table holders keeps the palette", () => {
+    const opened = lowBudget(() => openChemDraftPayload(source(page(10, 30))));
+    const first = opened.document!.pages[0];
+    expect(Object.keys(first.compatibility!.unknown.cdxmlColorTable as object)).toHaveLength(202);
+    expect(first.compatibility!.unknown.cdxmlColorTableSize).toBe(200);
+    const before = writtenTable(exportDocumentToCdxml(opened.document!, plain).contents);
+    expect(before).toHaveLength(208);
+    expect(first.objects.filter(whole)).toHaveLength(10);
+    first.objects = first.objects.filter(object => !whole(object));
+    const saved = exportDocumentToCdxml(opened.document!, plain);
+    expect(writtenTable(saved.contents)).toEqual(before);
+    expect(saved.warnings.map(w => w.code)).not.toContain("cdxml.color_table_entries_not_kept");
+  });
+
+  it("warns once, naming the entries, when the page that kept the whole table is deleted too", () => {
+    const opened = lowBudget(() => openChemDraftPayload(source(page(10, 20) + page(30, 20))));
+    const document = opened.document!;
+    expect(document.pages[1].compatibility!.unknown.cdxmlColorTable).toBeUndefined();
+    expect(document.pages[1].compatibility!.unknown.cdxmlColorTableSize).toBe(200);
+    document.pages = document.pages.slice(1);
+    const saved = exportDocumentToCdxml(document, plain);
+    expect(saved.warnings.filter(w => w.code === "cdxml.color_table_entries_not_kept").map(w => w.message)).toEqual([
+      "CDXML export: 190 of the 200 colors in the source file's color table (indices 12, 13, 14, 15, 16, 17, 18, 19, 20, 21 and 180 more) " +
+      "are used by nothing left in the document, and the page that kept the whole table was deleted; they are not written, and the table holds black in their place where later colors follow."
+    ]);
+    // The colors still in use keep their indices and colors.
+    expect(textsOf(openChemDraftPayload(saved.contents)).map(text => text.spans[0].style.color))
+      .toEqual(document.pages[0].objects.map(object => (object as TextObject).spans[0].style.color));
   });
 });
 
