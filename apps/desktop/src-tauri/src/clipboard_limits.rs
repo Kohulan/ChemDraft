@@ -340,7 +340,7 @@ pub(crate) fn text_read_priority(kind: &str) -> Option<u8> {
     }
     if is_chemistry_type(kind) {
         Some(0)
-    } else if lower.contains("rtf") || lower.contains("html") {
+    } else if lower.contains("rtf") || lower.contains("richtext") || lower.contains("html") {
         Some(3)
     } else {
         Some(2)
@@ -723,8 +723,9 @@ mod tests {
         ] {
             assert_eq!(text_read_priority(kind), None, "{kind}");
         }
-        for kind in ["text/rtf", "public.rtf", "text/html"] {
-            assert_eq!(text_read_priority(kind), Some(3));
+        // `text/richtext` is LibreOffice's second RTF flavor on Linux: formatted text, read last.
+        for kind in ["text/rtf", "public.rtf", "text/html", "text/richtext"] {
+            assert_eq!(text_read_priority(kind), Some(3), "{kind}");
         }
         for kind in [
             "chemical/x-cdxml",

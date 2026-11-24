@@ -9,6 +9,7 @@ import {
   inspectClipboardPayload,
   isCdxType,
   isMarkupType,
+  isTextLikeType,
   isVectorArtworkType,
   looksLikeInchi,
   looksLikeSmiles,
@@ -1307,6 +1308,48 @@ describe("markup flavors are never pasted as text", () => {
     });
 
     expect(detected).toMatchObject({ kind: "plain-text", text: "catalyst A" });
+  });
+
+  it("pastes a LibreOffice Writer copy as its text, not its RTF source (Linux)", () => {
+    // Writer on Linux publishes text/rtf AND text/richtext (the same RTF), then plain text under
+    // `text/plain;charset=utf-16` and the UTF-8 aliases. The Linux reader drops the UTF-8 copy as
+    // a duplicate of the UTF-16 one, so only the parameterised plain-text name reaches here. Both
+    // misses together pasted "{\rtf1\ansi…" into the drawing as a text box (GitHub #304).
+    const rtf = "{\\rtf1\\ansi\\deff3\\adeflang1025\n{\\fonttbl{\\f0\\froman Times New Roman;}}\n" +
+      "Yield 92}{\\rtlch\\ab\\ltrch\\b\n%}{\n after 2 h}\n}";
+    const detected = inspectClipboardPayload({
+      types: [
+        "text/rtf", "text/richtext", "text/html", "text/markdown", "text/plain;charset=utf-16"
+      ],
+      textItems: [
+        { type: "text/rtf", text: rtf },
+        { type: "text/richtext", text: rtf },
+        { type: "text/markdown", text: "Yield 92**%** after 2 h" },
+        { type: "text/plain;charset=utf-16", text: "Yield 92% after 2 h" }
+      ]
+    });
+
+    expect(detected).toMatchObject({ kind: "plain-text", text: "Yield 92% after 2 h" });
+  });
+
+  it("treats text/richtext and text/enriched as markup, and parameterised text/plain as text", () => {
+    expect(isMarkupType("text/richtext")).toBe(true);
+    expect(isMarkupType("text/enriched")).toBe(true);
+    expect(isTextLikeType("text/plain;charset=utf-8")).toBe(true);
+    expect(isTextLikeType("TEXT/PLAIN; charset=UTF-16")).toBe(true);
+    expect(isTextLikeType("text/plainish")).toBe(false);
+  });
+
+  it("never falls back to a payload that is RTF or an HTML document under an unknown name", () => {
+    const detected = inspectClipboardPayload({
+      types: ["application/x-vendor-rich", "application/x-vendor-note"],
+      textItems: [
+        { type: "application/x-vendor-rich", text: "  {\\rtf1\\ansi Yield}" },
+        { type: "application/x-vendor-note", text: "Yield" }
+      ]
+    });
+
+    expect(detected).toMatchObject({ kind: "plain-text", text: "Yield" });
   });
 
   it("still reads a molfile that arrives in a rich-text flavor", () => {

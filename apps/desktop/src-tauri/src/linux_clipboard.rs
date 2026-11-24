@@ -203,8 +203,13 @@ fn normalize_text_types(types: Vec<String>) -> Vec<String> {
     let mut out = Vec::new();
     let mut plain_seen = false;
     for name in types {
-        let is_plain = name == "text/plain"
-            || name.eq_ignore_ascii_case("text/plain;charset=utf-8")
+        // Any parameterised `text/plain` (LibreOffice also offers `;charset=utf-16`) is the same
+        // text again; it is read once, as UTF-8, through the collapsed entry. Kept separate, the
+        // UTF-16 copy was admitted first and the UTF-8 one dropped as its duplicate, leaving a
+        // name the resolver does not treat as plain text (GitHub #304, raw RTF pasted).
+        let lower = name.to_ascii_lowercase();
+        let is_plain = lower == "text/plain"
+            || lower.starts_with("text/plain;")
             || PLAIN_TEXT_ALIASES.contains(&name.as_str());
         if is_plain {
             if !plain_seen {
@@ -309,6 +314,22 @@ mod tests {
             "text/html".into(),
         ]);
         assert_eq!(types, ["text/plain", "chemical/x-cdxml", "text/html"]);
+    }
+
+    #[test]
+    fn parameterised_plain_text_collapses_too() {
+        // The target list LibreOffice Writer offers for a text selection.
+        let types = normalize_text_types(vec![
+            "text/rtf".into(),
+            "text/richtext".into(),
+            "text/html".into(),
+            "text/plain;charset=utf-16".into(),
+            "text/plain;charset=utf-8".into(),
+            "text/plain".into(),
+            "UTF8_STRING".into(),
+            "Text/Plain; charset=UTF-8".into(),
+        ]);
+        assert_eq!(types, ["text/rtf", "text/richtext", "text/html", "text/plain"]);
     }
 
     #[test]
