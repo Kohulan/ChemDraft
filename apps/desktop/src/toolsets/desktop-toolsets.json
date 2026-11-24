@@ -24,6 +24,20 @@
           "id": "core.main.items",
           "items": [
             {
+              "id": "widget.core.documentZoom",
+              "kind": "control",
+              "label": "Document Zoom",
+              "primary": {
+                "type": "control",
+                "controlId": "widget.core.documentZoom"
+              },
+              "submenu": null,
+              "layout": {
+                "colSpan": 6,
+                "rowSpan": 1
+              }
+            },
+            {
               "commandId": "tool.select",
               "title": "Selection Tool",
               "icon": "select",
@@ -366,7 +380,7 @@
               "tooltip": {
                 "title": "Benzene Template",
                 "shortcut": null,
-                "description": "Draw benzene. Long-press or press Arrow Down for 3\u20138-membered rings and chair cyclohexanes."
+                "description": "Draw benzene. Long-press or press Arrow Down for 3–8-membered rings and chair cyclohexanes."
               },
               "layout": {
                 "colSpan": 1,
@@ -825,7 +839,7 @@
               "tooltip": {
                 "title": "Symbol Tool Group",
                 "shortcut": null,
-                "description": "Stamp a \u00b0 symbol. Long-press for other symbols."
+                "description": "Stamp a ° symbol. Long-press for other symbols."
               },
               "layout": {
                 "colSpan": 1,
@@ -1030,7 +1044,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid.left",
-                    "label": "Grid \u2014 Left",
+                    "label": "Grid — Left",
                     "icon": "arrangeGridLeft",
                     "tooltip": {
                       "title": "Arrange in a Grid (Left)",
@@ -1039,7 +1053,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid",
-                    "label": "Grid \u2014 Centered",
+                    "label": "Grid — Centered",
                     "icon": "arrangeGridCenter",
                     "tooltip": {
                       "title": "Arrange in a Grid (Centered)",
@@ -1048,7 +1062,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid.right",
-                    "label": "Grid \u2014 Right",
+                    "label": "Grid — Right",
                     "icon": "arrangeGridRight",
                     "tooltip": {
                       "title": "Arrange in a Grid (Right)",
@@ -1075,7 +1089,7 @@
                   },
                   {
                     "commandId": "layout.adjustArrangementSpacing",
-                    "label": "Adjust spacing\u2026",
+                    "label": "Adjust spacing…",
                     "icon": "align",
                     "tooltip": {
                       "title": "Adjust arrangement spacing",
@@ -2283,7 +2297,7 @@
               "tooltip": {
                 "title": "Benzene Template",
                 "shortcut": null,
-                "description": "Draw benzene. Long-press or press Arrow Down for 3\u20138-membered rings and chair cyclohexanes."
+                "description": "Draw benzene. Long-press or press Arrow Down for 3–8-membered rings and chair cyclohexanes."
               },
               "layout": {
                 "colSpan": 1,
@@ -2738,7 +2752,7 @@
               "tooltip": {
                 "title": "Symbol Tool Group",
                 "shortcut": null,
-                "description": "Stamp a \u00b0 symbol. Long-press for other symbols."
+                "description": "Stamp a ° symbol. Long-press for other symbols."
               },
               "layout": {
                 "colSpan": 1,
@@ -3372,7 +3386,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid.left",
-                    "label": "Grid \u2014 Left",
+                    "label": "Grid — Left",
                     "icon": "arrangeGridLeft",
                     "tooltip": {
                       "title": "Arrange in a Grid (Left)",
@@ -3381,7 +3395,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid",
-                    "label": "Grid \u2014 Centered",
+                    "label": "Grid — Centered",
                     "icon": "arrangeGridCenter",
                     "tooltip": {
                       "title": "Arrange in a Grid (Centered)",
@@ -3390,7 +3404,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid.right",
-                    "label": "Grid \u2014 Right",
+                    "label": "Grid — Right",
                     "icon": "arrangeGridRight",
                     "tooltip": {
                       "title": "Arrange in a Grid (Right)",
@@ -3417,7 +3431,7 @@
                   },
                   {
                     "commandId": "layout.adjustArrangementSpacing",
-                    "label": "Adjust spacing\u2026",
+                    "label": "Adjust spacing…",
                     "icon": "align",
                     "tooltip": {
                       "title": "Adjust arrangement spacing",
@@ -4317,7 +4331,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid.left",
-                    "label": "Grid \u2014 Left",
+                    "label": "Grid — Left",
                     "icon": "arrangeGridLeft",
                     "tooltip": {
                       "title": "Arrange in a Grid (Left)",
@@ -4326,7 +4340,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid",
-                    "label": "Grid \u2014 Centered",
+                    "label": "Grid — Centered",
                     "icon": "arrangeGridCenter",
                     "tooltip": {
                       "title": "Arrange in a Grid (Centered)",
@@ -4335,7 +4349,7 @@
                   },
                   {
                     "commandId": "layout.arrange.grid.right",
-                    "label": "Grid \u2014 Right",
+                    "label": "Grid — Right",
                     "icon": "arrangeGridRight",
                     "tooltip": {
                       "title": "Arrange in a Grid (Right)",
@@ -4362,7 +4376,7 @@
                   },
                   {
                     "commandId": "layout.adjustArrangementSpacing",
-                    "label": "Adjust spacing\u2026",
+                    "label": "Adjust spacing…",
                     "icon": "align",
                     "tooltip": {
                       "title": "Adjust arrangement spacing",

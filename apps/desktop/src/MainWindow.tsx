@@ -56,6 +56,8 @@ import { useExportPreviewEnabled } from "./dialogs/useExportPreviewEnabled";
 import { onPerfStarted, perfCanvasReady, perfHook, perfProbe, startPerfProbe, nativeWindowOpening, nativeWindowShown, perfToggleResolved } from "./perf/runtime";
 import { assistantDocumentContentUnchanged, registerAssistantHistoryPort, type AssistantHistoryPort } from "./assistant/historyPort";
 import { getAssistantTransactions } from "./assistant/assistantTransaction";
+import { documentZoomClientCenter, documentZoomScaleForCommand, documentZoomStepScale, normalizeDocumentZoomRange } from "./documentZoom";
+import { broadcastToolsetZoom, listenForToolsetZoomRequests } from "./window-manager";
 import { acquireNativeUtilitySuspension } from "./nativeUtilitySuspension";
 import { loadAskToSaveBeforeQuit } from "./quitSettings";
 import { loadStartWithFreshDocument } from "./startupSettings";
@@ -195,7 +197,6 @@ import {
   setViewportScale,
   viewportCssVars,
   wheelDeltaToZoomFactor,
-  zoomViewportAtPoint,
   type RulerUnitState,
   type ViewportState
 } from "@chemdraft/viewport-engine";
@@ -1837,7 +1838,6 @@ const INTERACTIVE_3D_POST_OPEN_POLL_COUNT = 8;
 const INTERACTIVE_3D_POST_OPEN_POLL_MS = 90;
 const FREEFORM_BOND_DRAG_THRESHOLD = 6;
 const DOUBLE_BOND_SIDE_DRAG_THRESHOLD = 4;
-const VIEW_ZOOM_COMMAND_FACTOR = 1.25;
 const PROJECTED_PLANE_TILT_DRAG_PX = 360;
 const OBJECT_DRAG_THRESHOLD = 4;
 const GRAPHIC_HANDLE_DRAG_THRESHOLD = 1;
@@ -3258,6 +3258,20 @@ export function MainWindow({
   const activeTextSelectionRef = useRef<{ objectId: string; range: NativeTextSelectionRange } | undefined>(undefined);
   const toolbarStyleTargetRef = useRef<ToolbarStyleTargetSnapshot | undefined>(undefined);
   const viewportRef = useRef(viewport);
+
+  useEffect(() => {
+    const { scale, minZoom, maxZoom } = viewport;
+    void broadcastToolsetZoom({ scale, minZoom, maxZoom }).catch(() => undefined);
+  }, [viewport.scale, viewport.minZoom, viewport.maxZoom]);
+  useEffect(() => {
+    let disposed = false;
+    let stop: (() => void) | undefined;
+    void listenForToolsetZoomRequests(() => {
+      const { scale, minZoom, maxZoom } = viewportRef.current;
+      void broadcastToolsetZoom({ scale, minZoom, maxZoom }).catch(() => undefined);
+    }).then(cleanup => { if (disposed) cleanup(); else stop = cleanup; }).catch(() => undefined);
+    return () => { disposed = true; stop?.(); };
+  }, []);
   // Shared across the page and object selection handlers so a whole-molecule double-click is
   // detected regardless of which handler each of the two presses routes to (see
   // isSelectionDoublePress).
@@ -4685,7 +4699,7 @@ export function MainWindow({
     };
   }, [rulersVisible, updateRulerFrame, viewport.scale]);
 
-  const zoomCanvasAtClientPoint = useCallback((nextScale: number, clientPoint: ClientPoint) => {
+  const zoomCanvasAtClientPoint = useCallback((nextScale: number, clientPoint: ClientPoint, centerRulerInset?: number) => {
     const canvas = canvasRegionRef.current;
     const page = pageRef.current;
     const currentScale = viewportRef.current.scale;
@@ -4701,6 +4715,7 @@ export function MainWindow({
 
     const pageRect = page.getBoundingClientRect();
     const focalPagePoint = clientToPage(clientPoint, { pageRect, scale: currentScale });
+    const documentIdentity = documentIdentityRef.current;
 
     setViewport((current) => {
       const next = setViewportScale(current, nextScale);
@@ -4711,7 +4726,7 @@ export function MainWindow({
     window.requestAnimationFrame(() => {
       const nextCanvas = canvasRegionRef.current;
       const nextPage = pageRef.current;
-      if (!nextCanvas || !nextPage) {
+      if (!nextCanvas || !nextPage || documentIdentityRef.current !== documentIdentity) {
         return;
       }
 
@@ -4720,11 +4735,22 @@ export function MainWindow({
         pageRect: nextPageRect,
         scale: viewportRef.current.scale
       });
-
-      nextCanvas.scrollLeft += nextClientPoint.x - clientPoint.x;
-      nextCanvas.scrollTop += nextClientPoint.y - clientPoint.y;
+      // Toolbar zoom follows the *new* visible center if a scrollbar appeared/disappeared.
+      // Wheel/pinch keeps its original pointer anchor instead.
+      const targetClientPoint = centerRulerInset === undefined ? clientPoint
+        : documentZoomClientCenter(nextCanvas.getBoundingClientRect(), nextCanvas, centerRulerInset);
+      nextCanvas.scrollLeft += nextClientPoint.x - targetClientPoint.x;
+      nextCanvas.scrollTop += nextClientPoint.y - targetClientPoint.y;
     });
   }, []);
+
+  const zoomCanvasAtVisibleCenter = useCallback((nextScale: number) => {
+    const canvas = canvasRegionRef.current;
+    const center = canvas
+      ? documentZoomClientCenter(canvas.getBoundingClientRect(), canvas, rulersVisible ? RULER_THICKNESS : 0)
+      : { x: 0, y: 0 };
+    zoomCanvasAtClientPoint(nextScale, center, rulersVisible ? RULER_THICKNESS : 0);
+  }, [rulersVisible, zoomCanvasAtClientPoint]);
 
   const zoomCanvasFromWheelEvent = useCallback((event: Pick<globalThis.WheelEvent, "clientX" | "clientY" | "ctrlKey" | "deltaY" | "metaKey">) => {
     if (!shouldUseViewportWheelZoom(event)) {
@@ -10416,8 +10442,8 @@ export function MainWindow({
     installDocumentHistory(snapshot.history, true);
     fileStateRef.current = snapshot.file;
     setFileState(snapshot.file);
-    viewportRef.current = snapshot.viewport;
-    setViewport(snapshot.viewport);
+    viewportRef.current = normalizeDocumentZoomRange(snapshot.viewport);
+    setViewport(viewportRef.current);
     pendingTabScrollRef.current = { left: snapshot.scrollLeft, top: snapshot.scrollTop };
     selectedNativeMoleculePartsRef.current = snapshot.parts;
     selectedNativeMoleculePartRef.current = snapshot.parts.at(-1);
@@ -12730,10 +12756,14 @@ export function MainWindow({
           await pasteClipboard();
         }
         if (action.id === "view.zoomOut") {
-          setViewport((current) => zoomViewportAtPoint(current, current.scale / VIEW_ZOOM_COMMAND_FACTOR, pageCenterPoint(current, activePage)));
+          zoomCanvasAtVisibleCenter(documentZoomStepScale(viewportRef.current, -1));
         }
         if (action.id === "view.zoomIn") {
-          setViewport((current) => zoomViewportAtPoint(current, current.scale * VIEW_ZOOM_COMMAND_FACTOR, pageCenterPoint(current, activePage)));
+          zoomCanvasAtVisibleCenter(documentZoomStepScale(viewportRef.current, 1));
+        }
+        const presetScale = documentZoomScaleForCommand(action.id);
+        if (presetScale !== undefined) {
+          zoomCanvasAtVisibleCenter(presetScale);
         }
         if (action.id === "view.toggleToolPalette") {
           await toggleToolset(DEFAULT_TOOLSET_ID);
@@ -13461,6 +13491,7 @@ export function MainWindow({
     pluginManagerOpen,
     publishAnalysisWindow,
     quickActions,
+    zoomCanvasAtVisibleCenter,
     resetDocumentHistory,
     restoreDocumentHistory,
     restoreToolAfterEyedropper,
@@ -23566,6 +23597,7 @@ export function MainWindow({
                 widgetState={{
                   commandSpecs: shellCommandSpecs,
                   colorContextKey,
+                  currentZoom: viewport,
                   currentObjectColor: currentToolbarObjectColor,
                   currentArtStyle,
                   currentArtStyleTarget: activeArtPaintTarget,
@@ -26670,16 +26702,6 @@ function clientPointIsInsideRect(
   rect: Pick<DOMRect, "bottom" | "left" | "right" | "top">
 ): boolean {
   return point.x >= rect.left && point.x <= rect.right && point.y >= rect.top && point.y <= rect.bottom;
-}
-
-function pageCenterPoint(
-  viewport: ViewportState,
-  page: ChemDraftDocument["pages"][number]
-): { x: number; y: number } {
-  return {
-    x: viewport.pageOriginX + viewport.translateX + (page.width / 2) * viewport.scale,
-    y: viewport.pageOriginY + viewport.translateY + (page.height / 2) * viewport.scale
-  };
 }
 
 function rulerUnitForDocument(document: ChemDraftDocument | undefined): RulerUnitState {
