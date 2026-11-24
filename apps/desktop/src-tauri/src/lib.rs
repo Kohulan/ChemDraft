@@ -3097,9 +3097,8 @@ async fn suspend_toolset_windows(
                     .outer_position()
                     .ok()
                     .map(|position| (position.x, position.y));
-                let hidden_at = palette_map_pin::with_pins(|pins| {
-                    pins.position_to_keep(window.label(), live, std::time::Instant::now())
-                });
+                let webview: &tauri::Webview<_> = window.as_ref();
+                let hidden_at = palette_position_to_keep(&webview.window(), live);
                 if let Some(position) = hidden_at {
                     UTILITY_SUSPENSION
                         .lock()
@@ -3294,6 +3293,8 @@ fn restore_utility_labels<R: Runtime>(
         } else {
             if toolset_id_for_window_label(app, &label).is_some() {
                 buffer_utility_recovery_position(&window);
+                // X11: a palette mapped again at the clamp of its pin may get no Moved event.
+                correct_pinned_palette_after_map(&window, "dialog-end");
             }
             if dialog_windows::is_dialog_label(&label) {
                 buffer_utility_recovery_position(&window);
@@ -3727,19 +3728,25 @@ fn close_toolset_window(
     let fitted = window
         .as_ref()
         .is_some_and(|window| toolset_fit::with_memory(|memory| memory.is_fitted(window.label())));
+    // One look at the pin (palette_map_pin) for the whole close: whether the palette is pinned
+    // decides both the position saved and whether a reopen starts from it, even if the pin
+    // expires while the close runs.
+    let now = std::time::Instant::now();
+    let pinned = window.as_ref().is_some_and(|window| {
+        palette_map_pin::with_pins(|pins| pins.target(window.label(), now)).is_some()
+    });
+    let mut closed_at = None;
     if let Some(window) = window.as_ref().filter(|_| !fitted) {
         let webview: &tauri::Webview = window.as_ref();
         // A palette still pinned through a map (palette_map_pin) saves its pin: its live frame may
         // be the window manager's clamp, closed before the move back landed.
-        let position = visible_toolset_physical_position(&webview.window()).and_then(|live| {
-            palette_map_pin::with_pins(|pins| {
-                pins.position_to_keep(
-                    window.label(),
-                    Some((live.x, live.y)),
-                    std::time::Instant::now(),
-                )
-            })
+        // A palette closed this way and reopened starts from that pin too, not from the clamp
+        // its hidden window may still sit at (palette_map_pin::MapPins::reopen_position).
+        let native = webview.window();
+        let position = visible_toolset_physical_position(&native).and_then(|live| {
+            palette_position_to_keep_at(&native, Some((live.x, live.y)), pinned, now)
         });
+        closed_at = position;
         if let Some((x, y)) = position {
             let position = tauri::PhysicalPosition::new(x, y);
             // Best-effort, exactly like the `Moved` handler. Remembering where the palette was is
@@ -3763,8 +3770,10 @@ fn close_toolset_window(
     let state = mark_toolset_window_closed(&app, &toolset_id)?;
 
     if let Some(window) = window {
-        // The pin held this map only; a reopen pins the palette again.
-        palette_map_pin::with_pins(|pins| pins.forget(window.label()));
+        // The pin held this map only; a reopen pins the palette again, from the position saved
+        // here when a pin was live.
+        let kept = closed_at.filter(|_| pinned);
+        palette_map_pin::with_pins(|pins| pins.close(window.label(), kept));
         panel_window::end_for_hide(window.app_handle(), window.label());
         window.hide().map_err(|error| error.to_string())?;
     }
@@ -7676,15 +7685,33 @@ fn resize_toolset_window(
             },
         ),
     });
+    // A palette pinned through a map (palette_map_pin) is held where this fit puts it, with the
+    // outer frame the fit gives it. A fit in place keeps the pin's target but still records the
+    // new frame, so a later retarget archives the target with the size it really had.
+    let fitted_outer = window.outer_size().ok().map(|outer| {
+        palette_map_pin::outer_size_for_inner(
+            (outer.width, outer.height),
+            (live_size.width, live_size.height),
+            placement.size,
+        )
+    });
     if placement.position != origin {
         palette_frame_log(format_args!(
             "content-fit label={label} path=content-fit {origin:?} -> {:?} source={source:?} \
              fitted={fitted} size->{:?}",
             placement.position, placement.size
         ));
-        // A palette pinned through a map (palette_map_pin) is held where this fit puts it.
         palette_map_pin::with_pins(|pins| {
-            pins.moved_by_chemdraft(label, placement.position, std::time::Instant::now())
+            pins.moved_by_chemdraft(
+                label,
+                placement.position,
+                fitted_outer,
+                std::time::Instant::now(),
+            )
+        });
+    } else if let Some(fitted_outer) = fitted_outer {
+        palette_map_pin::with_pins(|pins| {
+            pins.resized_by_chemdraft(label, fitted_outer, std::time::Instant::now())
         });
     }
     // X11/XWayland: pin the GtkWindow to the new size before resizing it. GTK clamps a resize to
@@ -11669,15 +11696,26 @@ fn ensure_toolset_window<R: Runtime>(
         // so re-opening from View ▸ Toolbars is always enough to recover a lost palette. The clamp
         // moves a toolbar only when its title strip is unreachable.
         let hidden = !window.is_visible().unwrap_or(false);
+        // A palette closed while pinned (palette_map_pin) may still sit at the window manager's
+        // clamp; it reopens from the position saved at the close, as long as nothing moved it
+        // since. Read before the recovery, which judges that same frame.
+        let closed_at = if hidden {
+            reopen_position_for_map(&window)
+        } else {
+            None
+        };
         let moved_to = recover_offscreen_toolset_window(app, &window, resizable, "reopen");
         // Its page has painted, so show it now — unless it is still waiting for its first paint
         // (Windows, palette_first_paint.rs), whose reveal will show it.
         if !palette_first_paint::reopened(&label) {
             // X11: showing a hidden palette maps it again, and the window manager may place it.
             if hidden {
-                pin_palette_for_map(app, &window, resizable, moved_to, None, "reopen");
+                pin_palette_for_map(app, &window, resizable, moved_to, closed_at, "reopen");
             }
             window.show().map_err(|error| error.to_string())?;
+            if hidden {
+                correct_pinned_palette_after_map(&window, "reopen");
+            }
         }
         configure_toolset_utility_window(&window, true)?;
         return Ok(());
@@ -11876,8 +11914,14 @@ fn ensure_toolset_window<R: Runtime>(
             "pin label={label} path=creation pin={:?}",
             (built.x, built.y)
         ));
+        let size = window.outer_size().ok().map(|size| {
+            (
+                i32::try_from(size.width).unwrap_or(i32::MAX),
+                i32::try_from(size.height).unwrap_or(i32::MAX),
+            )
+        });
         palette_map_pin::with_pins(|pins| {
-            pins.pin(&label, (built.x, built.y), std::time::Instant::now())
+            pins.pin(&label, (built.x, built.y), size, std::time::Instant::now())
         });
     }
     #[cfg(target_os = "linux")]
@@ -12799,10 +12843,10 @@ fn recover_offscreen_toolset_window<R: Runtime>(
     let Ok(scale) = window.scale_factor() else {
         return None;
     };
-    let (Ok(size), Ok(inner)) = (window.outer_size(), window.inner_size()) else {
+    let (Ok(outer), Ok(inner)) = (window.outer_size(), window.inner_size()) else {
         return None;
     };
-    let size = size.to_logical::<f64>(scale);
+    let size = outer.to_logical::<f64>(scale);
     let live_size = (size.width, size.height);
     // A palette ChemDraft fitted to a smaller work area is re-placed from the user's saved frame,
     // so it returns there once the work area can hold it again (B9).
@@ -12879,8 +12923,24 @@ fn recover_offscreen_toolset_window<R: Runtime>(
     );
     let _ = window.set_position(tauri::LogicalPosition::new(clamped.x, clamped.y));
     let to = tauri::LogicalPosition::new(clamped.x, clamped.y).to_physical::<i32>(scale);
+    // The outer frame the palette has at its new position, for its pin (palette_map_pin).
+    let new_inner = if resize {
+        tauri::LogicalSize::new(width, height).to_physical::<u32>(scale)
+    } else {
+        inner
+    };
+    let moved_outer = palette_map_pin::outer_size_for_inner(
+        (outer.width, outer.height),
+        (inner.width, inner.height),
+        (new_inner.width, new_inner.height),
+    );
     palette_map_pin::with_pins(|pins| {
-        pins.moved_by_chemdraft(label, (to.x, to.y), std::time::Instant::now())
+        pins.moved_by_chemdraft(
+            label,
+            (to.x, to.y),
+            Some(moved_outer),
+            std::time::Instant::now(),
+        )
     });
     Some((to.x, to.y))
 }
@@ -12982,8 +13042,9 @@ fn recover_offscreen_toolset_window<R: Runtime>(
         }
         let moved_to = placement.position;
         let _ = panel_full_size::apply(&window, placement, "recover offscreen toolbar");
+        // Windows has no pins (palette_map_pin); this keeps the call the same on every platform.
         palette_map_pin::with_pins(|pins| {
-            pins.moved_by_chemdraft(label, moved_to, std::time::Instant::now())
+            pins.moved_by_chemdraft(label, moved_to, None, std::time::Instant::now())
         });
         Some(moved_to)
     })
@@ -13044,6 +13105,194 @@ fn restore_refits_toolset(
     resizable || fitted || !title_reachable()
 }
 
+/// What a pinned palette's positions are judged against (palette_map_pin::Layout): its outer frame,
+/// the monitors' work areas as they are now, and what the title test needs.
+struct PalettePinFrame {
+    size: (i32, i32),
+    /// The outer width in logical pixels, for the title test.
+    width: f64,
+    scale: f64,
+    monitor_areas: Vec<tauri::PhysicalRect<i32, u32>>,
+    work_areas: Vec<palette_map_pin::WorkArea>,
+}
+
+impl PalettePinFrame {
+    fn read<R: Runtime>(window: &tauri::Window<R>) -> Option<Self> {
+        let (Ok(size), Ok(scale)) = (window.outer_size(), window.scale_factor()) else {
+            return None;
+        };
+        let monitor_areas = monitor_query::available_monitors(window.app_handle())
+            .unwrap_or_default()
+            .iter()
+            .map(|monitor| *monitor.work_area())
+            .collect::<Vec<_>>();
+        let work_areas = monitor_areas
+            .iter()
+            .map(|area| palette_map_pin::WorkArea {
+                x: area.position.x,
+                y: area.position.y,
+                width: i32::try_from(area.size.width).unwrap_or(i32::MAX),
+                height: i32::try_from(area.size.height).unwrap_or(i32::MAX),
+            })
+            .collect::<Vec<_>>();
+        Some(Self {
+            size: (
+                i32::try_from(size.width).unwrap_or(i32::MAX),
+                i32::try_from(size.height).unwrap_or(i32::MAX),
+            ),
+            width: size.to_logical::<f64>(scale).width,
+            scale,
+            monitor_areas,
+            work_areas,
+        })
+    }
+
+    /// The restore's title test (toolset_title_reachable) on the monitors as they are now. Pins
+    /// exist only on Linux X11, which reports physical pixels.
+    fn title_reachable(&self, target: (i32, i32)) -> bool {
+        self.monitor_areas
+            .iter()
+            .any(|area| toolset_title_in_physical_work_area(target, self.width, self.scale, area))
+    }
+
+    fn judge<T>(&self, task: impl FnOnce(&palette_map_pin::Layout<'_>) -> T) -> T {
+        let title_reachable = |target: (i32, i32)| self.title_reachable(target);
+        task(&palette_map_pin::Layout {
+            size: self.size,
+            work_areas: &self.work_areas,
+            title_reachable: &title_reachable,
+        })
+    }
+}
+
+/// Where a hidden palette that was closed while pinned should be pinned as it reopens
+/// (palette_map_pin::MapPins::reopen_position), or `None` to use its live frame as before. Only a
+/// palette with such a record reads the monitors, so this is `None` off Linux X11.
+fn reopen_position_for_map<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Option<(i32, i32)> {
+    let label = window.label();
+    if !palette_map_pin::with_pins(|pins| pins.was_closed_while_pinned(label)) {
+        return None;
+    }
+    let webview: &tauri::Webview<R> = window.as_ref();
+    let live = window
+        .outer_position()
+        .ok()
+        .map(|position| (position.x, position.y));
+    match PalettePinFrame::read(&webview.window()) {
+        Some(frame) => frame.judge(|layout| {
+            palette_map_pin::with_pins(|pins| pins.reopen_position(label, live, layout))
+        }),
+        None => {
+            palette_map_pin::with_pins(|pins| pins.forget(label));
+            None
+        }
+    }
+}
+
+/// The position to save or remember for a palette whose live frame is `live` (palette_map_pin):
+/// its pin while one is live, since the live frame may be the window manager's clamp, unless the
+/// live frame is a real move whose Moved event has yet to run. Only a pinned palette reads the
+/// monitors, so every palette off Linux X11 simply keeps `live`.
+fn palette_position_to_keep<R: Runtime>(
+    window: &tauri::Window<R>,
+    live: Option<(i32, i32)>,
+) -> Option<(i32, i32)> {
+    let now = std::time::Instant::now();
+    let pinned = palette_map_pin::with_pins(|pins| pins.target(window.label(), now)).is_some();
+    palette_position_to_keep_at(window, live, pinned, now)
+}
+
+/// [`palette_position_to_keep`] for a caller that has already looked at the pin: `pinned` is
+/// whether it was live at `now`.
+fn palette_position_to_keep_at<R: Runtime>(
+    window: &tauri::Window<R>,
+    live: Option<(i32, i32)>,
+    pinned: bool,
+    now: std::time::Instant,
+) -> Option<(i32, i32)> {
+    let label = window.label();
+    if !pinned {
+        return live;
+    }
+    match PalettePinFrame::read(window) {
+        Some(frame) => frame.judge(|layout| {
+            palette_map_pin::with_pins(|pins| pins.position_to_keep(label, live, Some(layout), now))
+        }),
+        None => palette_map_pin::with_pins(|pins| pins.position_to_keep(label, live, None, now)),
+    }
+}
+
+/// A pinned palette was just shown again. If its frame already sits where the window manager's
+/// clamp puts its pin, the map may report no move (the frame was clamped by an earlier map and the
+/// move back was lost when it was hidden): move it back instead of waiting for a Moved event. The
+/// show is queued on the GTK main loop, so on Linux the frame is judged from that loop once the
+/// palette is mapped (palette_map_pin::after_map_step), not before the map has happened. A no-op
+/// for an unpinned palette, and so on macOS, Windows and native Wayland.
+fn correct_pinned_palette_after_map<R: Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    path: &'static str,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        let target = window.clone();
+        let _ = window.run_on_main_thread(move || {
+            let started = std::time::Instant::now();
+            let _ = gtk::glib::timeout_add_local(palette_map_pin::AFTER_MAP_INTERVAL, move || {
+                use gtk::prelude::WidgetExt;
+
+                let mapped = target
+                    .gtk_window()
+                    .is_ok_and(|native| native.is_mapped() && native.is_visible());
+                if look_at_pinned_palette_after_map(&target, mapped, started.elapsed(), path) {
+                    gtk::glib::ControlFlow::Continue
+                } else {
+                    gtk::glib::ControlFlow::Break
+                }
+            });
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mapped = window.is_visible().unwrap_or(false);
+        let _ = look_at_pinned_palette_after_map(window, mapped, std::time::Duration::ZERO, path);
+    }
+}
+
+/// One look at a pinned palette just shown again ([`correct_pinned_palette_after_map`]): moves it
+/// back when it is mapped at its pin's clamp. Returns whether to look again later.
+fn look_at_pinned_palette_after_map<R: Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    mapped: bool,
+    elapsed: std::time::Duration,
+    path: &str,
+) -> bool {
+    let label = window.label();
+    let now = std::time::Instant::now();
+    let pinned = palette_map_pin::with_pins(|pins| pins.target(label, now)).is_some();
+    match palette_map_pin::after_map_step(pinned, mapped, elapsed) {
+        palette_map_pin::AfterMapStep::Wait => return true,
+        palette_map_pin::AfterMapStep::Stop => return false,
+        palette_map_pin::AfterMapStep::Check => {}
+    }
+    let webview: &tauri::Webview<R> = window.as_ref();
+    let native = webview.window();
+    let (Ok(live), Some(frame)) = (window.outer_position(), PalettePinFrame::read(&native)) else {
+        return false;
+    };
+    let live = (live.x, live.y);
+    let due = frame.judge(|layout| {
+        palette_map_pin::with_pins(|pins| pins.correction_due(label, live, layout, now))
+    });
+    if let Some(pin) = due {
+        let sent = utility_window::move_mapped(&native, pin);
+        palette_frame_log(format_args!(
+            "map label={label} path={path} live={live:?} -> {pin:?} at-clamp move-back={sent:?} \
+             after={elapsed:?}"
+        ));
+    }
+    false
+}
+
 /// X11/XWayland: hold a palette that is about to be mapped again at the position it must keep
 /// (palette_map_pin), so the window manager's placement on the map is undone and never saved. That
 /// is where a recovery just moved it, or else where it was before it was hidden, as long as its
@@ -13075,8 +13324,14 @@ fn pin_palette_for_map<R: Runtime>(
         "pin label={label} path={path} moved_to={moved_to:?} hidden_at={hidden_at:?} \
          pin={target:?}"
     ));
+    let size = window.outer_size().ok().map(|size| {
+        (
+            i32::try_from(size.width).unwrap_or(i32::MAX),
+            i32::try_from(size.height).unwrap_or(i32::MAX),
+        )
+    });
     palette_map_pin::with_pins(|pins| match target {
-        Some(target) => pins.pin(label, target, std::time::Instant::now()),
+        Some(target) => pins.pin(label, target, size, std::time::Instant::now()),
         None => pins.forget(label),
     });
 }
@@ -13098,40 +13353,12 @@ fn palette_moved_by_map<R: Runtime>(window: &tauri::Window<R>) -> bool {
         return false;
     };
     let position = (position.x, position.y);
-    let (Ok(size), Ok(scale)) = (window.outer_size(), window.scale_factor()) else {
+    let Some(frame) = PalettePinFrame::read(window) else {
         return false;
     };
-    let width = size.to_logical::<f64>(scale).width;
-    let monitor_areas = monitor_query::available_monitors(window.app_handle())
-        .unwrap_or_default()
-        .iter()
-        .map(|monitor| *monitor.work_area())
-        .collect::<Vec<_>>();
-    let work_areas = monitor_areas
-        .iter()
-        .map(|area| palette_map_pin::WorkArea {
-            x: area.position.x,
-            y: area.position.y,
-            width: i32::try_from(area.size.width).unwrap_or(i32::MAX),
-            height: i32::try_from(area.size.height).unwrap_or(i32::MAX),
-        })
-        .collect::<Vec<_>>();
-    // The restore's title test (toolset_title_reachable) on the monitors as they are now. Pins exist
-    // only on Linux X11, which reports physical pixels.
-    let title_reachable = |target: (i32, i32)| {
-        monitor_areas
-            .iter()
-            .any(|area| toolset_title_in_physical_work_area(target, width, scale, area))
-    };
-    let layout = palette_map_pin::Layout {
-        size: (
-            i32::try_from(size.width).unwrap_or(i32::MAX),
-            i32::try_from(size.height).unwrap_or(i32::MAX),
-        ),
-        work_areas: &work_areas,
-        title_reachable: &title_reachable,
-    };
-    let decision = palette_map_pin::with_pins(|pins| pins.moved(label, position, &layout, now));
+    let decision = frame.judge(|layout| {
+        palette_map_pin::with_pins(|pins| pins.moved(label, position, layout, now))
+    });
     match decision {
         palette_map_pin::MovedDecision::Unpinned => false,
         palette_map_pin::MovedDecision::AtPin => {
@@ -17836,22 +18063,43 @@ mod tests {
             .unwrap();
         expect_true(hidden < restore.find("toolset_title_reachable(").unwrap());
         expect_true(pin < show);
+        // A palette shown again at its pin's clamp is moved back without waiting for a Moved event.
+        expect_true(
+            show < restore
+                .find("correct_pinned_palette_after_map(&window")
+                .unwrap(),
+        );
         let suspend = body("async fn suspend_toolset_windows(");
         expect_true(suspend.find(".hiding_at(").unwrap() < suspend.find("window.hide()").unwrap());
         // A palette still pinned is remembered, and saved on close, at its pin, not at the clamp.
         expect_true(
-            suspend.find(".position_to_keep(").unwrap() < suspend.find(".hiding_at(").unwrap(),
+            suspend.find("palette_position_to_keep(").unwrap()
+                < suspend.find(".hiding_at(").unwrap(),
         );
         let close = body("fn close_toolset_window(");
         expect_true(
-            close.find(".position_to_keep(").unwrap()
+            close.find("palette_position_to_keep_at(").unwrap()
                 < close.find("persist_toolset_position(").unwrap(),
         );
-        // Re-opened from View ▸ Toolbars.
+        // The close hands the saved position to the pins for a reopen of the same window.
+        expect_true(
+            close.find("persist_toolset_position(").unwrap() < close.find("pins.close(").unwrap(),
+        );
+        // Re-opened from View ▸ Toolbars: pinned from the position saved at a pinned close (read
+        // before the recovery moves the frame), and moved back at once if shown at its clamp.
         let ensure = body("fn ensure_toolset_window<");
         let reopen = &ensure[..ensure.find("builder.build()").unwrap()];
+        let reopen_at = reopen.find("reopen_position_for_map(&window)").unwrap();
+        let reopen_pin = reopen.find("pin_palette_for_map(").unwrap();
+        let reopen_show = reopen.find("window.show()").unwrap();
+        expect_true(reopen_at < reopen.find("recover_offscreen_toolset_window(").unwrap());
+        expect_true(reopen_at < reopen_pin);
+        expect_true(reopen_pin < reopen_show);
         expect_true(
-            reopen.find("pin_palette_for_map(").unwrap() < reopen.find("window.show()").unwrap(),
+            reopen_show
+                < reopen
+                    .find("correct_pinned_palette_after_map(&window")
+                    .unwrap(),
         );
         // The window manager's placement is caught before the suspension gate drops the event.
         let handler = &source[source

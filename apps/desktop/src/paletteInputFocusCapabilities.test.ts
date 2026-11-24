@@ -91,8 +91,12 @@ it("gates every palette-focus diagnostic on the existing native agent bridge swi
   expect(logger).toContain('eprintln!("[palette-focus] {message}")');
   const acquire = source.split("fn palette_focus_acquire_log(")[1]!.split("\nfn ")[0]!;
   expect(acquire).toContain("agent_bridge_status().enabled");
-  expect(acquire).toContain("std::env::var(PALETTE_FOCUS_LOG_ENV_VAR)");
-  expect(acquire).toContain('value == "1"');
+  expect(acquire).toContain("palette_focus_env_log_enabled()");
+  // The env lookup lives in one helper: the log is off unless the variable is exactly "1".
+  const envHelper = source.split("fn palette_focus_env_log_enabled(")[1]!.split("\nfn ")[0]!;
+  expect(envHelper).toContain("std::env::var(PALETTE_FOCUS_LOG_ENV_VAR)");
+  const valueCheck = source.split("fn palette_focus_log_value_enabled(")[1]!.split("\n}")[0]!;
+  expect(valueCheck).toContain('value == Some("1")');
   expect(source).toContain('const PALETTE_FOCUS_LOG_ENV_VAR: &str = "CHEMDRAFT_PALETTE_FOCUS_LOG";');
   const gate = source.split("fn agent_bridge_status()")[1]!.split("\n}")[0]!;
   expect(gate).toContain("std::env::var(AGENT_BRIDGE_ENV_VAR)");

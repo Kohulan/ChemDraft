@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tauri::{
     ipc::Invoke,
     plugin::{Plugin, TauriPlugin},
@@ -63,19 +67,53 @@ async fn message<R: Runtime>(
     kind: Option<MessageDialogKind>,
     buttons: Option<MessageDialogButtons>,
 ) -> MessageDialogResult {
-    let mut builder = prompt(
+    let mut dialog = prompt(
         window.app_handle(),
         Some(&window),
         title.as_deref(),
         &message,
     );
     if let Some(buttons) = buttons {
-        builder = builder.buttons(gtk_buttons(buttons));
+        dialog = dialog.buttons(gtk_buttons(buttons));
     }
     if let Some(kind) = kind {
-        builder = builder.kind(kind);
+        dialog = dialog.kind(kind);
     }
-    builder.blocking_show_with_result()
+    dialog.blocking_show_with_result()
+}
+
+/// A message prompt from [`prompt`]. Showing it through here tells the parenting poll when it was
+/// answered, so a prompt answered before any poll saw it does not keep the poll running.
+pub(super) struct Prompt<R: Runtime> {
+    builder: MessageDialogBuilder<R>,
+    answered: Arc<AtomicBool>,
+}
+
+impl<R: Runtime> Prompt<R> {
+    pub(super) fn kind(mut self, kind: MessageDialogKind) -> Self {
+        self.builder = self.builder.kind(kind);
+        self
+    }
+
+    fn buttons(mut self, buttons: MessageDialogButtons) -> Self {
+        self.builder = self.builder.buttons(buttons);
+        self
+    }
+
+    /// Show the prompt without waiting for it; `on_answer` gets the plugin's result.
+    pub(super) fn show(self, on_answer: impl FnOnce(bool) + Send + 'static) {
+        let answered = self.answered;
+        self.builder.show(move |result| {
+            answered.store(true, Ordering::Release);
+            on_answer(result);
+        });
+    }
+
+    fn blocking_show_with_result(self) -> MessageDialogResult {
+        let result = self.builder.blocking_show_with_result();
+        self.answered.store(true, Ordering::Release);
+        result
+    }
 }
 
 /// A message prompt that is safe to hand to rfd's GTK backend, made transient for the document
@@ -91,7 +129,7 @@ pub(super) fn prompt<R: Runtime>(
     caller: Option<&Window<R>>,
     title: Option<&str>,
     message: &str,
-) -> MessageDialogBuilder<R> {
+) -> Prompt<R> {
     let text = PromptText::new(title, message);
     // tauri-plugin-dialog titles an untitled prompt with the package name, and rfd sets it as the
     // GTK window title.
@@ -114,8 +152,9 @@ pub(super) fn prompt<R: Runtime>(
             }
         }
     }
-    parent_message_dialog(app, caller.cloned(), shown);
-    builder
+    let answered = Arc::new(AtomicBool::new(false));
+    parent_message_dialog(app, caller.cloned(), shown, Arc::clone(&answered));
+    Prompt { builder, answered }
 }
 
 /// The text of one prompt as rfd's GTK backend needs it.
@@ -198,7 +237,7 @@ fn gtk_buttons(buttons: MessageDialogButtons) -> MessageDialogButtons {
 /// toolbars gone. The box is created after this is queued, so poll for it on GTK's main thread
 /// (nested `gtk_dialog_run` loops still dispatch timeouts) and give up after five seconds, or a
 /// minute while there is no owner yet. A prompt answered before it could be parented ends the poll
-/// at once.
+/// at once, whether or not a poll ever saw it (`answered`, set when its response arrives).
 ///
 /// Only this prompt's dialog is parented: one that did not exist when the prompt started, still
 /// has no parent, and shows this prompt's title and message ([`is_this_prompt`]). Another
@@ -213,6 +252,7 @@ fn parent_message_dialog<R: Runtime>(
     app: &AppHandle<R>,
     caller: Option<Window<R>>,
     shown: ShownPrompt,
+    answered: Arc<AtomicBool>,
 ) {
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
@@ -248,7 +288,13 @@ fn parent_message_dialog<R: Runtime>(
             // Answered: destroyed (no longer found), or only hidden once it had been shown.
             let showing = ours.as_ref().is_some_and(|dialog| dialog.is_visible());
             let found = ours.is_some() && (showing || !seen);
-            let step = parent_poll_step(found, parent.is_some(), seen, started.elapsed());
+            let step = parent_poll_step(
+                found,
+                parent.is_some(),
+                seen,
+                answered.load(Ordering::Acquire),
+                started.elapsed(),
+            );
             seen |= showing;
             match step {
                 PollStep::Parent => {
@@ -281,8 +327,10 @@ enum PollStep {
     GiveUp,
 }
 
-/// Parent as soon as both this prompt's dialog and a visible owner exist. A dialog that was shown
-/// on an earlier poll (`seen`) and is gone now was answered: stop. Otherwise waiting on the dialog
+/// A prompt whose response has arrived (`answered`) is done: stop, even if no poll ever saw its
+/// dialog (answered within the first interval). Otherwise parent as soon as both this prompt's
+/// dialog and a visible owner exist. A dialog that was shown on an earlier poll (`seen`) and is
+/// gone now was answered: stop. Otherwise waiting on the dialog
 /// alone stops [`DIALOG_WAIT`] after the poll started; while there is no owner yet the poll waits up
 /// to [`OWNER_WAIT`], so a prompt from setup still ends up above the document window. Bounded by
 /// time, not by callbacks, which a busy main loop delivers late.
@@ -290,8 +338,12 @@ fn parent_poll_step(
     found: bool,
     owner: bool,
     seen: bool,
+    answered: bool,
     elapsed: std::time::Duration,
 ) -> PollStep {
+    if answered {
+        return PollStep::GiveUp;
+    }
     if found && owner {
         return PollStep::Parent;
     }
@@ -508,33 +560,39 @@ mod tests {
     fn a_startup_prompt_waits_for_the_document_window_before_parenting() {
         let ms = std::time::Duration::from_millis;
         // The usual case: the document is up and the box appears within a few polls.
-        assert_eq!(parent_poll_step(false, true, false, ms(25)), PollStep::Wait);
         assert_eq!(
-            parent_poll_step(true, true, false, ms(75)),
+            parent_poll_step(false, true, false, false, ms(25)),
+            PollStep::Wait
+        );
+        assert_eq!(
+            parent_poll_step(true, true, false, false, ms(75)),
             PollStep::Parent
         );
         // A launch-argument error: setup raises it before the document window is shown. The box
         // is found but must wait, well past the five seconds a missing box is given.
-        assert_eq!(parent_poll_step(true, false, false, ms(25)), PollStep::Wait);
         assert_eq!(
-            parent_poll_step(true, false, true, DIALOG_WAIT + ms(25)),
+            parent_poll_step(true, false, false, false, ms(25)),
             PollStep::Wait
         );
         assert_eq!(
-            parent_poll_step(true, true, true, DIALOG_WAIT + ms(25)),
+            parent_poll_step(true, false, true, false, DIALOG_WAIT + ms(25)),
+            PollStep::Wait
+        );
+        assert_eq!(
+            parent_poll_step(true, true, true, false, DIALOG_WAIT + ms(25)),
             PollStep::Parent
         );
         assert_eq!(
-            parent_poll_step(true, false, true, OWNER_WAIT),
+            parent_poll_step(true, false, true, false, OWNER_WAIT),
             PollStep::GiveUp
         );
         // A box that never appears is given up after five seconds once the owner is there.
         assert_eq!(
-            parent_poll_step(false, true, false, DIALOG_WAIT),
+            parent_poll_step(false, true, false, false, DIALOG_WAIT),
             PollStep::GiveUp
         );
         assert_eq!(
-            parent_poll_step(false, false, false, DIALOG_WAIT),
+            parent_poll_step(false, false, false, false, DIALOG_WAIT),
             PollStep::Wait
         );
     }
@@ -543,14 +601,41 @@ mod tests {
     fn a_startup_prompt_answered_before_its_owner_appears_ends_the_poll() {
         let ms = std::time::Duration::from_millis;
         // Found, no owner yet: wait.
-        assert_eq!(parent_poll_step(true, false, false, ms(25)), PollStep::Wait);
+        assert_eq!(
+            parent_poll_step(true, false, false, false, ms(25)),
+            PollStep::Wait
+        );
         // The user answered it: the dialog is gone, so stop at once, owner or not.
         assert_eq!(
-            parent_poll_step(false, false, true, ms(50)),
+            parent_poll_step(false, false, true, false, ms(50)),
             PollStep::GiveUp
         );
         assert_eq!(
-            parent_poll_step(false, true, true, ms(50)),
+            parent_poll_step(false, true, true, false, ms(50)),
+            PollStep::GiveUp
+        );
+    }
+
+    #[test]
+    fn a_prompt_answered_before_any_poll_saw_it_ends_the_poll() {
+        let ms = std::time::Duration::from_millis;
+        // Answered within the first 25 ms: never seen, no owner yet. Without the answer the poll
+        // would wait for the owner for a minute.
+        assert_eq!(
+            parent_poll_step(false, false, false, false, ms(25)),
+            PollStep::Wait
+        );
+        assert_eq!(
+            parent_poll_step(false, false, false, true, ms(25)),
+            PollStep::GiveUp
+        );
+        // Still listed while GTK tears it down, owner or not: nothing left to parent.
+        assert_eq!(
+            parent_poll_step(true, true, false, true, ms(25)),
+            PollStep::GiveUp
+        );
+        assert_eq!(
+            parent_poll_step(true, false, true, true, ms(25)),
             PollStep::GiveUp
         );
     }
