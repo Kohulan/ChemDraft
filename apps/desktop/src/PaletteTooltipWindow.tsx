@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { detectShortcutPlatform, type ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import {
   listenForPaletteTooltipHide,
   listenForPaletteTooltipShow,
@@ -28,12 +29,32 @@ function hideTooltipWindow(isCurrent: () => boolean) {
     .catch(() => undefined);
 }
 
-function showTooltipWindow(position: { x: number; y: number }, isCurrent: () => boolean) {
+/**
+ * Linux sizes the tooltip inside the show command, not with a separate window resize first: Rust
+ * pins the GtkWindow to this content size (min = max hints) and resizes it on the main thread
+ * before placing and mapping it, so a short tooltip after a long one shrinks instead of keeping
+ * the previous frame (a one-line tooltip in a 220x64 window). macOS and Windows keep resizing from
+ * the webview first and pass only the position.
+ */
+export function paletteTooltipShowArgs(
+  position: { x: number; y: number },
+  size: { width: number; height: number },
+  platform: ShortcutPlatform
+): { x: number; y: number; width?: number; height?: number } {
+  return platform === "linux"
+    ? { x: position.x, y: position.y, width: size.width, height: size.height }
+    : { x: position.x, y: position.y };
+}
+
+function showTooltipWindow(
+  args: ReturnType<typeof paletteTooltipShowArgs>,
+  isCurrent: () => boolean
+) {
   // Rust places (in global logical coordinates, converted with the anchor monitor's scale) and
   // orders the panel front in one call — the same path that displays the palettes. Tauri's JS
   // show() resolved without error here but never actually displayed this focusable(false) panel.
   void import("@tauri-apps/api/core")
-    .then(({ invoke }) => isCurrent() ? invoke("show_toolset_tooltip_window", { x: position.x, y: position.y }) : undefined)
+    .then(({ invoke }) => isCurrent() ? invoke("show_toolset_tooltip_window", args) : undefined)
     .catch(() => undefined);
 }
 
@@ -67,7 +88,13 @@ export function placePaletteTooltip(input: {
   return { x, y };
 }
 
-export function PaletteTooltipWindow() {
+export interface PaletteTooltipWindowProps {
+  platform?: ShortcutPlatform;
+}
+
+export function PaletteTooltipWindow({
+  platform = detectShortcutPlatform()
+}: PaletteTooltipWindowProps) {
   const shellRef = useRef<HTMLDivElement | null>(null);
   const [payload, setPayload] = useState<PaletteTooltipPayload | undefined>();
   // Bumped SYNCHRONOUSLY by every show/hide broadcast. The layout effect's `cancelled` flag only
@@ -133,10 +160,11 @@ export function PaletteTooltipWindow() {
       // whichever display this floating window is currently on — see placePaletteTooltip.
       // The monitor query and the resize are independent, so they run together; placement and
       // reveal are then one command (see show_toolset_tooltip_window).
+      // Linux applies the size in the show command instead (paletteTooltipShowArgs).
       const anchorProbeY = (payload.aboveY + payload.belowY) / 2;
       const [bounds] = await Promise.all([
         monitorLogicalBoundsAt(payload.anchorCenterX, anchorProbeY),
-        setCurrentWindowLogicalSize({ width, height })
+        platform === "linux" ? undefined : setCurrentWindowLogicalSize({ width, height })
       ]);
       // Superseded while awaiting: placing now would drag the (already re-placed, visible) window
       // back to the previous button's anchor, or re-show a tooltip the pointer already left.
@@ -151,12 +179,12 @@ export function PaletteTooltipWindow() {
         height,
         bounds
       });
-      showTooltipWindow({ x, y }, () => !superseded());
+      showTooltipWindow(paletteTooltipShowArgs({ x, y }, { width, height }, platform), () => !superseded());
     })().catch(() => undefined);
     return () => {
       cancelled = true;
     };
-  }, [payload]);
+  }, [payload, platform]);
 
   return (
     <div ref={shellRef} className="palette-floating-tooltip" role="tooltip">

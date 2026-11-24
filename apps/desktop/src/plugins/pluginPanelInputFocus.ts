@@ -3,6 +3,7 @@ import { listenCurrentWindowEvent } from "../window-manager/tauriEvents";
 import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import { createDesktopShortcutRegistry, detectDesktopShortcutPlatform } from "../keyboardShortcuts";
 import { isTextEditingElement } from "../editHistoryRouting";
+import { isDocumentWindowCommandId } from "../windowCommands";
 import { isDisabledPaletteTypingKey, isPendingPaletteEditingKey, listenPaletteClickPending } from "../palettePendingKeys";
 
 /** Form controls borrow the keyboard; command buttons never do. Labels count as their control. */
@@ -632,8 +633,9 @@ export function installPluginPanelInputFocus(
   if (!shortcuts && isDesktopRuntime()) {
     // Reuse the document's live, scheme-mapped command catalog, including enabled state.
     void listenForToolsetCommandSpecs((commands) => {
+      // Never a tab or document-window command: the native bridge refuses those too.
       registry = createDesktopShortcutRegistry(commands.filter((command) =>
-        command.id !== "document.closeTab" && !command.id.startsWith("document.closeTab.")), platform);
+        !isDocumentWindowCommandId(command.id)), platform);
     }).then(async (unsubscribe) => {
       if (disposed) { unsubscribe(); return; }
       unsubscribeCommands = unsubscribe;

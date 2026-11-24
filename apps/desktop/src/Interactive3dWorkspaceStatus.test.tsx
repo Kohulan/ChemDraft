@@ -1,5 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
+import { interactive3dPhaseLabel } from "./interactive3dStatus";
 import { INTERACTIVE_3D_WORKSPACE_HINT, interactive3dWorkspaceStatusText, Interactive3dWorkspaceStatus } from "./Interactive3dWorkspaceStatus";
 
 describe("Interactive 3D Workspace status", () => {
@@ -14,5 +15,18 @@ describe("Interactive 3D Workspace status", () => {
   it("puts an error status before the hint", () => {
     const rendered = renderToStaticMarkup(<Interactive3dWorkspaceStatus status="Could not update the shape." warnings={[]} />);
     expect(rendered).toBe(`Could not update the shape. · ${INTERACTIVE_3D_WORKSPACE_HINT} · Esc to close`);
+  });
+
+  it("joins the force-field readout and each warning once, in order, with Esc last", () => {
+    const text = interactive3dWorkspaceStatusText({
+      status: "Ready", energyLabel: "UFF converged · -1.20 kJ/mol", warnings: ["Hydrogens are implicit.", "Hydrogens are implicit."]
+    });
+    expect(text).toBe(`Ready · UFF converged · -1.20 kJ/mol · Hydrogens are implicit. · ${INTERACTIVE_3D_WORKSPACE_HINT} · Esc to close`);
+  });
+
+  it("names dragging an atom exactly once in the ready state", () => {
+    const rendered = renderToStaticMarkup(<Interactive3dWorkspaceStatus status={interactive3dPhaseLabel("ready")} warnings={[]} />);
+    expect(rendered).toContain("Drag empty space to rotate · click outside to flatten");
+    expect(rendered.match(/drag an atom/gi)).toHaveLength(1);
   });
 });
