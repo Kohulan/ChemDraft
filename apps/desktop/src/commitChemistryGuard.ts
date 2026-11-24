@@ -209,10 +209,11 @@ const moleculesById = (page: DocumentPage | undefined) => new Map((page?.objects
  * already on its page in `before` is that page's own and never stands in for a same-id molecule
  * removed from another page). For each id, every source is paired with at most one destination and
  * every destination with at most one source: first pairs where the destination IS the source, then
- * pairs with the same structure and chemistry, then any remaining pairs, each in document order. A
- * source left unpaired has no match and so is reported removed (pages A and B both held "m"; only
- * page C holds it now: one of them moved, the other is gone); a destination left unpaired is an
- * addition and matches nothing. Built lazily.
+ * pairs with the same structure and chemistry, each in document order. Nothing else pairs: a same-id
+ * arrival that differs in structure or chemistry cannot be told from an unrelated molecule (drawn or
+ * pasted elsewhere) and never masks a deletion. A source left unpaired has no match and so is
+ * reported removed (pages A and B both held "m"; only page C holds it now: one of them moved, the
+ * other is gone); a destination left unpaired is an addition and matches nothing. Built lazily.
  */
 function movedPageMatcher(before: ChemDraftDocument, after: ChemDraftDocument): (pageId: string, id: string) => MoleculeObject | undefined {
   let matched: Map<string, MoleculeObject> | undefined;
@@ -244,8 +245,7 @@ function movedPageMatcher(before: ChemDraftDocument, after: ChemDraftDocument): 
       const tiers: ((source: MoleculeObject, destination: MoleculeObject) => boolean)[] = [
         (source, destination) => source === destination,
         (source, destination) => sameMoleculeStructure(source, destination) &&
-          moleculeAtomChemistryChanges(source, destination).length === 0,
-        () => true
+          moleculeAtomChemistryChanges(source, destination).length === 0
       ];
       for (const [moleculeId, candidates] of sources) {
         // By position, not identity: one molecule object can sit on several pages.

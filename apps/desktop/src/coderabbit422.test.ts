@@ -127,6 +127,18 @@ describe("A: cross-page same-id molecule match", () => {
     expect(changes.length).toBeGreaterThan(0);
     expect(changes.every(change => change.pageId === pageA.id && change.moleculeId === "m")).toBe(true);
   });
+
+  it("A (multiple arrivals): deleting m is reported when an unrelated m with the same atom ids and chemistry arrives elsewhere", () => {
+    const { before, pageA, m } = threePagesWithEthane();
+    // Drawn or pasted at another place: same id, same atom ids, same chemistry, but not m moved.
+    const unrelated = ethane("m", { x: 100, y: 100 });
+    expect(unrelated.atoms.map(atom => atom.id)).toEqual(m.atoms.map(atom => atom.id));
+    expect(moleculeAtomChemistryChanges(m, unrelated)).toEqual([]);
+    const after: ChemDraftDocument = { ...before, pages: [{ ...pageA, objects: pageA.objects.filter(object => object.id !== "m") },
+      { ...before.pages[1], objects: [unrelated] }, before.pages[2]] };
+    expect(preexistingMoleculeChemistryChanges(before, after)).toEqual([{ pageId: pageA.id, moleculeId: "m" }]);
+    expect(commitChemistryRefusals({ before, next: after, after, normalize: identity, markAtoms })).toHaveLength(1);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------
