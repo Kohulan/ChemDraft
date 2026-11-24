@@ -51,6 +51,7 @@ import { atomImplicitHydrogenCount, nativeBondOrderResolution, nativeElementFrom
 import { sha256Hex, utf8Bytes, utf8String } from "./sha256";
 import { PROPS } from "./cdxTags";
 import { cdxmlLimits } from "./cdxmlLimits";
+import { addImportedRadicalMarks } from "./importedRadicalMarks";
 import { equalPrintMargins, fitPageSetup, importPageSetup, pagePrintMargins, type VisiblePageSetup } from "./pageSetup";
 import {
   CDX_NATIVE_ENVELOPE_ATTRIBUTE,
@@ -3921,44 +3922,6 @@ function importVisibleCdxmlFromTree(tree: OrderedXmlTree, sourceFormat: "CDXML" 
     };
   }
   return { document: withBracketChemistryWarnings(parsed.data), warnings };
-}
-
-/** `markRadicals` is a mark contribution, never an intrinsic atom radical. Supply the same
- * editable handle the atom tool creates, or the desktop commit normalizer must remove it.
- * Run after source coordinate transforms so placement sees the final page and atom positions. */
-function addImportedRadicalMarks(page: DocumentPage): void {
-  const marks = page.objects.filter((object): object is ElectronMarkObject => object.type === "electron-mark");
-  const ids = new Set(page.objects.map(object => object.id));
-  for (const molecule of page.objects.filter((object): object is MoleculeObject => object.type === "molecule")) {
-    for (const atom of molecule.atoms) {
-      const carried = marks.filter(mark => mark.anchor.kind === "atom" && mark.anchor.objectId === molecule.id && mark.anchor.atomId === atom.id)
-        .reduce((sum, mark) => sum + (mark.markKind === "radical-dot" || mark.markKind === "charge" && mark.radical ? 1 : 0), 0);
-      const missing = (atom.markRadicals ?? 0) - carried;
-      for (let index = 0; index < missing; index++) {
-        const point = nativeRadicalPlacementPointForAtom(molecule, atom.id, page.objects, page.width, page.height)!;
-        const size = nativeChargeMarkSizePx;
-        const baseId = `${molecule.id}_${atom.id}_radical_${index + 1}`;
-        let id = baseId;
-        while (ids.has(id)) id += "_";
-        ids.add(id);
-        const mark: ElectronMarkObject = {
-          id, type: "electron-mark", markKind: "radical-dot",
-          x: Math.max(0, Math.min(point.x - size / 2, page.width - size)),
-          y: Math.max(0, Math.min(point.y - size / 2, page.height - size)),
-          width: size, height: size, rotation: 0, style: { source: "chemdraft-native-charge" },
-          anchor: { kind: "atom", objectId: molecule.id, atomId: atom.id },
-          atomAssociation: "explicit"
-        };
-        const atomPoint = transformPointForObject(molecule, atom);
-        mark.compatibility = { warnings: [], unknown: { cdxmlRadicalMarkPlacement: {
-          x: mark.x, y: mark.y, offsetX: mark.x - atomPoint.x, offsetY: mark.y - atomPoint.y,
-          objectId: molecule.id, atomId: atom.id
-        } } };
-        page.objects.push(mark);
-        marks.push(mark);
-      }
-    }
-  }
 }
 
 // Symbol endpoints are directional, unlike the normalized corners used for ordinary graphics.
