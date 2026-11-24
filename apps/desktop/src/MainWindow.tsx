@@ -23,7 +23,8 @@ import { dropElectronMark, dropElectronMarksInSelection, electronMarkDropTarget,
 import { chargeAssociationUndoLabel, electronMarkUndoLabel } from "./electronMarkUndoLabel";
 import {
   CHEMISTRY_EDIT, PLUGIN_WRITE, PRESERVE_CHEMISTRY, TEXT_EDIT, chemistryEditOf, chemistryRefusalStatus, policyChemistryRefusals,
-  preserveChemistry, selectionTransformChemistry, structureEditChemistry, type CommitChemistryPolicy
+  preserveChemistry, selectionTransformChemistry, structureEditChemistry, structureEditorChemistry, withIndependentlyMovedMarks,
+  type CommitChemistryPolicy, type IndependentMarkMoves
 } from "./commitChemistryGuard";
 import { nativeBenzeneHotkeyAtAtomTarget, nativeFragmentSproutTarget, nativeDieneFuseTarget, nativeOxoHotkeyTarget, nativeBranchedHotkeyTarget, type FragmentSproutKind } from "./sproutHotkeys";
 import { applyTableCommand, applyTableFontCommand, applyTableObjectEdit, createTableCommands, createTableInsertAction, parseTableInsertCommandId, resolveActiveTableCell, selectedTable, tableInsertCommandId, tableInspectorSnapshot, type ActiveTableCell, type TableInsertDimensions } from "./tableCommands";
@@ -482,12 +483,19 @@ import {
   endEngine3dWorkspaceDrag,
   engine3dCoordsInAtomOrder,
   engine3dDragStereoBlocked,
+  engine3dSidecarDisabledReason,
+  logEngine3dDiagnostic,
   openEngine3dWorkspaceSession,
   pollEngine3dWorkspaceSessionState,
   readEngine3dSidecarStatus,
   updateEngine3dWorkspaceDrag,
   type Engine3dWorkspaceSessionState
 } from "./engine3dSidecar";
+import {
+  interactive3dPhaseLabel,
+  interactive3dSessionStatus,
+  type Interactive3dPhase
+} from "./interactive3dStatus";
 import type { Engine3DCoordinate } from "@chemdraft/engine3d-api";
 import type { RdkitMinimalModule } from "@chemdraft/rdkit-adapter";
 import {
@@ -613,6 +621,8 @@ import {
   prepareNativeMoleculeEngineRelayout,
   cleanUpStructureStatus,
   type NativeMoleculeRelayoutEngine,
+  carryElectronMarksWithMovedAtoms,
+  type AtomMotion,
   cleanUpNativeMolecules2d,
   moleculeHasFusedRingSystem,
   attachSpin3dModelFromConformer,
@@ -717,6 +727,8 @@ import {
   scaleDocumentObjectsAroundPoint,
   ungroupSelectedDocumentObjects,
   moveNativeMoleculeParts,
+  moleculeFrameDelta,
+  spin3dCarriedElectronMarks,
   findForeignNativeMoleculeBondTarget,
   openNativeDocument,
   previewNativeMoleculeBondGrowth,
@@ -879,6 +891,7 @@ import {
   defaultVisibleToolsetIds,
   desktopToolsetRegistry,
   compoundLayoutRegistry,
+  sessionAvailableRegistry,
   getToolbarsMenuModel,
   getToolsetCommandSpecs,
   getToolsetItemGroups,
@@ -954,6 +967,8 @@ import {
   runtimeProblemReportDeps,
   watchForCrashes
 } from "./problemReports";
+import { requestWindowAction, windowCommands } from "./windowCommands";
+import { useSessionUnavailableCommandIds } from "./sessionUnavailableCommands";
 import {
   APP_CHECK_FOR_UPDATES_COMMAND_ID,
   AUTO_CHECK_DELAY_MS,
@@ -1853,7 +1868,16 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.23.23.05-opus";
+const CURRENT_BUILD_STAMP = "11.24.12.50-opus";
+
+/**
+ * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
+ * the funnel builds the policy before the updater runs, and reads the set after each run.
+ */
+function replaceMarkIds(target: Set<string>, markIds: ReadonlySet<string>): void {
+  target.clear();
+  for (const id of markIds) target.add(id);
+}
 
 /**
  * The commit funnel's chemistry check (AGENTS.md section 7, `commitChemistryGuard.ts`). `before`
@@ -2524,6 +2548,8 @@ export function MainWindow({
   // rAF renders once and stops. Zero frames fired when the scene isn't changing.
   const spinDirtyRef = useRef(false);
   const spinRafRef = useRef<number | null>(null);
+  // Pointer moves applied to the current rotate grab, for the CHEMDRAFT_ENGINE3D_LOG release line.
+  const spinRotateMovesRef = useRef(0);
   const groupTransformMachineRef = useRef<InteractionState>(initialInteractionState());
   const gestureStartScaleRef = useRef(1);
   const lastCanvasPointerClientPointRef = useRef<ClientPoint | undefined>(undefined);
@@ -2830,6 +2856,10 @@ export function MainWindow({
   const compoundLayoutSettings = useCompoundLayoutSettings();
   const compoundLayoutsEnabled = compoundLayoutSettings.enabled;
   const structureSearchEnabled = useStructureSearchEnabled();
+  // The bundled 3D sidecar is fixed for the life of the process: its status is read once. A build
+  // without a runnable sidecar leaves Interactive 3D out of every toolbar, menu and gallery
+  // (AGENTS.md §10) instead of listing it disabled for the whole session.
+  const unavailableCommandIds = useSessionUnavailableCommandIds();
   const structureSearchEnabledRef = useRef(structureSearchEnabled);
   structureSearchEnabledRef.current = structureSearchEnabled;
   const structureSearchController = useRef<ReturnType<typeof createStructureSearchController> | undefined>(undefined);
@@ -2838,8 +2868,10 @@ export function MainWindow({
   }
   const directElectronMarkEditing = useDirectElectronMarkEditing();
   const [unfilteredToolsetRegistry, setToolsetRegistry] = useState<DesktopToolsetRegistry>(() => desktopToolsetRegistry);
-  const toolsetRegistry = useMemo(() => compoundLayoutRegistry(unfilteredToolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, isDesktopRuntime()),
-    [unfilteredToolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings]);
+  const toolsetRegistry = useMemo(() => sessionAvailableRegistry(
+    compoundLayoutRegistry(unfilteredToolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, isDesktopRuntime()),
+    unavailableCommandIds
+  ), [unfilteredToolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, unavailableCommandIds]);
 
   // The toolbar catalog is the single data brain: it composes the core manifest with live
   // plugin toolsets and the user's saved layout, and hands out immutable registry snapshots.
@@ -2933,7 +2965,11 @@ export function MainWindow({
   // single-molecule operation — drag, spin, delete, the inspector, dependency arrays — unchanged.
   const [selectedNativeMoleculeParts, setSelectedNativeMoleculeParts] = useState<NativeMoleculeSelectionPart[]>([]);
   const bracketActions = useMemo(() => createBracketCommands(document, selectedNativeMoleculeParts), [document, selectedNativeMoleculeParts]);
-  const arrowNudgeBurstRef = useRef<{ history: DocumentHistory; lastPress: number } | undefined>(undefined);
+  // A burst's one history entry is checked against the document before the burst, so it carries
+  // every mark any of its presses moved by itself (`IndependentMarkMoves`).
+  const arrowNudgeBurstRef = useRef<{ history: DocumentHistory; lastPress: number; markIds: ReadonlySet<string> } | undefined>(undefined);
+  // The marks the typed rotation or stretch preview moved by itself, for `commitLiveInputPreview`.
+  const liveInputMarkMovesRef = useRef<{ startDocument: ChemDraftDocument; markIds: IndependentMarkMoves } | undefined>(undefined);
   useLayoutEffect(() => { arrowNudgeBurstRef.current = undefined; }, [selectedNativeMoleculeParts]);
   useEffect(() => {
     const endBurst = () => { arrowNudgeBurstRef.current = undefined; };
@@ -3094,6 +3130,8 @@ export function MainWindow({
   const fileStateRef = useRef<NativeFileState>(fileState);
   // Successful explicit saves, per tab, including a save completed while its label editor is open.
   const documentSaveRevisionsRef = useRef(new Map<string, number>());
+  // Tabs saved at least once, to a desktop path or as a browser download (which leaves no path).
+  const savedOnceTabsRef = useRef(new Set<string>());
   // Keep the actual saved contents: open drafts can be saved without ending their history session.
   const savedDocumentsRef = useRef(new Map<string, ChemDraftDocument>());
   // Capture once: Preferences changes affect the next launch, never this run.
@@ -3673,11 +3711,12 @@ export function MainWindow({
         paletteCommands: baseToolbarCommands,
         compoundLayoutsEnabled, compoundLayoutSettings,
         structureSearchEnabled,
-        hasSearchableStructure
+        hasSearchableStructure,
+        unavailableCommandIds
       }).map(command => customSwatchActions.find(action => action.id === command.id) ?? command).filter(command => command.id !== "arrow.conditions" || isDesktopRuntime()),
       keybindingScheme, shortcutOverrides, shortcutPlatform
     ),
-    [shortcutOverrides, shortcutPlatform, baseToolbarCommands, customSwatches, customSwatchActions, activeTableCell?.tableId, activeTableCell?.rowId, activeTableCell?.columnId, canRedo, canUndo, document, documentTabs.length, keybindingScheme, openWarnings, selectedMolecule, selectedNativeMoleculeParts, toolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, structureSearchEnabled, hasSearchableStructure]
+    [shortcutOverrides, shortcutPlatform, baseToolbarCommands, customSwatches, customSwatchActions, activeTableCell?.tableId, activeTableCell?.rowId, activeTableCell?.columnId, canRedo, canUndo, document, documentTabs.length, keybindingScheme, openWarnings, selectedMolecule, selectedNativeMoleculeParts, toolsetRegistry, compoundLayoutsEnabled, compoundLayoutSettings, structureSearchEnabled, hasSearchableStructure, unavailableCommandIds]
   );
   const shellCommandsById = useMemo(
     () => createShellCommandMap(shellCommandSpecs),
@@ -3911,9 +3950,15 @@ export function MainWindow({
     queueMicrotask(() => setStatus(message));
   }, []);
   // Ordinary edits and assistant history pushes/amendments share commit preparation.
+  // Given the document the edit started from, every mark associated with an atom the edit moved
+  // follows it first (owner ruling 2026-11-21, charge always follows): Clean Up, relayout, Spin 3D
+  // flatten, bond-length scaling and any other edit that moves atoms commit with marks kept. A
+  // commit whose policy rebuilt atoms under new ids (a structure-editor save) is not followed:
+  // its ids do not name the same atoms (`marksFollowAtoms`).
   const prepareDocumentCommit = useCallback((nextDocument: ChemDraftDocument, undoLabel?: string,
-    assertFinalDocument?: (document: ChemDraftDocument) => ChemDraftDocument | void) => {
-    const normalized = normalizeCommittedDocument(nextDocument);
+    assertFinalDocument?: (document: ChemDraftDocument) => ChemDraftDocument | void, before?: ChemDraftDocument,
+    chemistry?: CommitChemistryPolicy) => {
+    const normalized = normalizeCommittedDocument(before ? carryElectronMarksWithMovedAtoms(before, nextDocument, chemistry) : nextDocument);
     const present = assertFinalDocument?.(normalized) ?? normalized;
     const label = undoLabel ?? documentUndoLabelsRef.current.get(nextDocument);
     if (label) documentUndoLabelsRef.current.set(present, label);
@@ -3934,8 +3979,8 @@ export function MainWindow({
   ): boolean => {
     if (quitMutationFrozenRef.current) throw new Error("Quit is completing; the pending edit was not applied.");
     const prepare = (before: ChemDraftDocument, next: ChemDraftDocument) => {
-      if (typeof undoLabel !== "function") return prepareDocumentCommit(next, undoLabel, assertFinalDocument);
-      const present = prepareDocumentCommit(next, undefined, assertFinalDocument);
+      if (typeof undoLabel !== "function") return prepareDocumentCommit(next, undoLabel, assertFinalDocument, before, chemistry);
+      const present = prepareDocumentCommit(next, undefined, assertFinalDocument, before, chemistry);
       documentUndoLabelsRef.current.set(present, undoLabel(before, present));
       return present;
     };
@@ -4017,7 +4062,7 @@ export function MainWindow({
     const uncheckedNext = typeof update === "function" ? update(unchecked) : update;
     if (uncheckedNext !== unchecked) {
       let finalDocument: ChemDraftDocument | undefined;
-      try { finalDocument = prepareDocumentCommit(uncheckedNext, label, assertFinalDocument); } catch { finalDocument = undefined; }
+      try { finalDocument = prepareDocumentCommit(uncheckedNext, label, assertFinalDocument, unchecked, chemistry); } catch { finalDocument = undefined; }
       const earlyRefusal = finalDocument && commitChemistryRefusal(unchecked, uncheckedNext, finalDocument, chemistry, label);
       if (earlyRefusal) {
         reportChemistryRefusal(earlyRefusal);
@@ -4031,7 +4076,7 @@ export function MainWindow({
       // Reuse the checked result while the checkpoint left the document as it was.
       const next = before === unchecked ? uncheckedNext : typeof update === "function" ? update(before) : update;
       if (next === before) return false;
-      const proposed = prepareDocumentCommit(next, label);
+      const proposed = prepareDocumentCommit(next, label, undefined, before, chemistry);
       // Refuse before asking about the page size; the final commit checks again. A caller's own
       // final-document assertion (Clean Up) runs first there, keeping its more specific refusal.
       const refusal = assertFinalDocument ? undefined : commitChemistryRefusal(before, next, proposed, chemistry, label);
@@ -4240,8 +4285,8 @@ export function MainWindow({
     chemistry: CommitChemistryPolicy = PRESERVE_CHEMISTRY
   ): boolean => {
     if (quitMutationFrozenRef.current) throw new Error("Quit is completing; the pending edit was not applied.");
-    const verified = assertFinalDocument ? prepareDocumentCommit(nextDocument, undoLabel, assertFinalDocument) : undefined;
-    const present = verified ?? prepareDocumentCommit(nextDocument, undoLabel);
+    const verified = assertFinalDocument ? prepareDocumentCommit(nextDocument, undoLabel, assertFinalDocument, startDocument, chemistry) : undefined;
+    const present = verified ?? prepareDocumentCommit(nextDocument, undoLabel, undefined, startDocument, chemistry);
     // The gesture's final document must not change a molecule that existed before it. On refusal the
     // pre-gesture document is put back (a drag leaves its last preview frame as the present) and
     // nothing is recorded.
@@ -4272,7 +4317,7 @@ export function MainWindow({
   const commitInsertionHistoryWithPageFit = useCallback((start: ChemDraftDocument, proposed: ChemDraftDocument, undoLabel?: string,
     chemistry: CommitChemistryPolicy = PRESERVE_CHEMISTRY) => {
     const placed = proposed;
-    proposed = prepareDocumentCommit(proposed);
+    proposed = prepareDocumentCommit(proposed, undefined, undefined, start, chemistry);
     // Refused before the page-size question; commitDocumentHistoryFrom puts `start` back.
     if (commitChemistryRefusal(start, placed, proposed, chemistry, undoLabel)) {
       commitDocumentHistoryFrom(start, placed, undoLabel, undefined, chemistry);
@@ -4354,7 +4399,11 @@ export function MainWindow({
   // chemistry, so a refused preview is withdrawn (the start document comes back) and not recorded.
   const commitLiveInputPreview = useCallback((startDocument: ChemDraftDocument, undoLabel?: string): boolean => {
     const previewDocument = documentRef.current;
-    const refusal = commitChemistryRefusal(startDocument, previewDocument, previewDocument, selectionTransformChemistry(), undoLabel);
+    // The marks the last preview moved by itself (`IndependentMarkMoves`), when it is this preview.
+    const independent = liveInputMarkMovesRef.current?.startDocument === startDocument ? liveInputMarkMovesRef.current.markIds : undefined;
+    liveInputMarkMovesRef.current = undefined;
+    const refusal = commitChemistryRefusal(startDocument, previewDocument, previewDocument,
+      selectionTransformChemistry(undefined, independent), undoLabel);
     if (refusal) {
       installDocumentHistory((history) => history.present === startDocument ? history : { ...history, present: startDocument });
       reportChemistryRefusal(refusal);
@@ -6435,6 +6484,7 @@ export function MainWindow({
         startPageY: pageY,
         startModel: [state.coords3d[base], state.coords3d[base + 1], state.coords3d[base + 2]]
       };
+      logEngine3dDiagnostic(`press ${event.pointerId} at ${pageX.toFixed(1)}, ${pageY.toFixed(1)}: pull atom ${hit.atomId}`);
       sendInteractive3dDragCommandRef.current("beginDrag", hit.atomId);
       return;
     }
@@ -6448,6 +6498,7 @@ export function MainWindow({
     if (!insideBox) {
       // Click outside the selection box commits the current orientation. A queued
       // click waits for this asynchronous flatten before replaying another gesture.
+      logEngine3dDiagnostic(`press ${event.pointerId} at ${pageX.toFixed(1)}, ${pageY.toFixed(1)}: flatten (outside the selection box)`);
       return commitSpinFlatten();
     }
     // Inside the box: grab to rotate. Capture is best-effort.
@@ -6456,6 +6507,8 @@ export function MainWindow({
     } catch {
       /* ignore — pointer capture is an enhancement, not a requirement */
     }
+    logEngine3dDiagnostic(`press ${event.pointerId} at ${pageX.toFixed(1)}, ${pageY.toFixed(1)}: rotate`);
+    spinRotateMovesRef.current = 0;
     applySpin({ ...state, dragging: true, lastClient: { x: event.clientX, y: event.clientY } });
   }, [applySpin, captureGesturePointer, commitSpinFlatten, spinOverlayTugHit]);
 
@@ -6501,6 +6554,7 @@ export function MainWindow({
     };
     const current = { x: event.clientX, y: event.clientY };
     const quat = applyTrackballDrag(state.quat, state.lastClient, current, trackball);
+    spinRotateMovesRef.current += 1;
     // Update ref synchronously so the next event has fresh state; schedule a single
     // rAF to push to React. If one is already pending it will pick up this latest
     // state — no need to schedule another.
@@ -6533,12 +6587,14 @@ export function MainWindow({
     const tug = spin3dTugDragRef.current;
     if (tug && tug.pointerId === event.pointerId) {
       spin3dTugDragRef.current = undefined;
+      logEngine3dDiagnostic(`release ${event.pointerId}: pull of atom ${tug.atomId} ended`);
       sendInteractive3dDragCommandRef.current("endDrag", tug.atomId);
       return;
     }
     // Releasing ends the rotation but STAYS in spin mode — grab inside the box again
     // to keep rotating, or click outside to flatten (handled in pointer-down). Esc cancels.
     if (state.dragging) {
+      logEngine3dDiagnostic(`release ${event.pointerId}: rotate ended after ${spinRotateMovesRef.current} moves`);
       applySpin({ ...state, dragging: false, lastClient: undefined });
     }
   }, [applySpin]);
@@ -6548,7 +6604,11 @@ export function MainWindow({
     event.stopPropagation();
     const gestures = deferredSpinGesturesRef.current;
     const pending = gestures.at(-1);
-    if (spin3dTugDragRef.current || (pending && !pending.up)) return;
+    if (spin3dTugDragRef.current || (pending && !pending.up)) {
+      logEngine3dDiagnostic(`press ${event.pointerId} ignored: ${spin3dTugDragRef.current
+        ? `atom ${spin3dTugDragRef.current.atomId} is still being pulled` : "a queued press is still down"}`);
+      return;
+    }
     const release = interactive3dReleaseRef.current;
     if (!release && !pending) {
       void startSpinOverlayPointer(event);
@@ -6559,6 +6619,7 @@ export function MainWindow({
     const point = spinOverlayPagePoint(event, documentRef.current.pages[0]);
     // Classify the queued grab against the geometry visible at pointer-down.
     const tugOpenId = spinOverlayTugHit(state, point.x, point.y, state.previewCoords3d)?.openId;
+    logEngine3dDiagnostic(`press ${event.pointerId} queued until the last pull settles`);
     gestures.push({ down: snapshotSpinOverlayPointer(event), tugOpenId });
     try {
       captureGesturePointer(event.currentTarget, event.pointerId);
@@ -6684,18 +6745,19 @@ export function MainWindow({
   const updateInteractive3dWorkspaceSession = useCallback((
     openId: number,
     session: Engine3dWorkspaceSessionState,
-    options: { clearDragVisualTarget?: boolean; status?: string } = {}
+    options: { clearDragVisualTarget?: boolean; status?: string; phase?: Interactive3dPhase } = {}
   ) => {
     const detached = session.closed || session.exited;
     if (detached && interactive3dWorkspaceRef.current?.openId === openId) {
       interactive3dArmRef.current = undefined;
     }
+    logEngine3dDiagnostic(`session ${describeEngine3dWorkspaceSession(session)}${detached ? " · detached" : ""}`);
     const updateWorkspace = (currentWorkspace: Interactive3dWorkspaceState | undefined) => currentWorkspace?.openId === openId
       ? {
           ...currentWorkspace,
           session: detached ? undefined : session,
           selectedAtomIds: session.selectedAtomIds.length > 0 ? session.selectedAtomIds : currentWorkspace.selectedAtomIds,
-          status: options.status ?? describeEngine3dWorkspaceSession(session),
+          status: options.status ?? interactive3dSessionStatus(session, options.phase),
           energyLabel: interactive3dEnergyLabel(session) ?? currentWorkspace.energyLabel,
           dragVisualTarget: detached || options.clearDragVisualTarget || session.stereo?.needsReseed
             ? undefined : currentWorkspace.dragVisualTarget
@@ -6753,7 +6815,7 @@ export function MainWindow({
           return;
         }
         scheduler.session = session;
-        updateInteractive3dWorkspaceSession(scheduler.openId, session);
+        updateInteractive3dWorkspaceSession(scheduler.openId, session, { phase: scheduler.ending ? "settling" : "pulling" });
       })
       .catch((error) => {
         if (interactive3dDragSchedulerRef.current !== scheduler) {
@@ -6877,11 +6939,9 @@ export function MainWindow({
 
     const status = await readEngine3dSidecarStatus();
     if (!status?.available) {
-      setStatus(
-        status
-          ? `Interactive 3D unavailable; sidecar not configured: ${status.bundledBinaryName}`
-          : "Interactive 3D unavailable; Tauri bridge not present"
-      );
+      // Unreachable from toolbars and menus once the status is known (they omit the command), but a
+      // click made before it arrived still lands here.
+      setStatus(engine3dSidecarDisabledReason(status) ?? "Interactive 3D unavailable; Tauri bridge not present");
       return;
     }
 
@@ -6913,7 +6973,7 @@ export function MainWindow({
       return;
     }
     const existing = interactive3dWorkspaceRef.current;
-    if (existing?.objectId === arm.objectId && (existing.session || existing.status === "attaching")) {
+    if (existing?.objectId === arm.objectId && (existing.session || existing.status === interactive3dPhaseLabel("attaching"))) {
       return; // already attaching/attached for this molecule
     }
     const molecule = findDocumentObject(documentRef.current, arm.objectId);
@@ -6947,12 +7007,13 @@ export function MainWindow({
 
     const status = await readEngine3dSidecarStatus();
     if (!stillOpening()) return;
+    logEngine3dDiagnostic(`phase attaching: ${molecule.atoms.length} atoms, sidecar ${status?.source ?? "unknown"}`);
     setInteractive3dWorkspace({
       openId,
       objectId: arm.objectId,
       source: status?.source ?? "unknown",
       bridgeAvailable: true,
-      status: "attaching",
+      status: interactive3dPhaseLabel("attaching"),
       selectedAtomIds: [],
       atoms: interactive3dAtomsForMolecule(molecule),
       bonds: interactive3dBondsForMolecule(molecule)
@@ -6973,12 +7034,14 @@ export function MainWindow({
         queueInteractive3dSessionClose(session);
         return;
       }
+      logEngine3dDiagnostic(`phase ready: ${describeEngine3dWorkspaceSession(session)}`);
       setInteractive3dWorkspace((current) => current?.openId === openId
-        ? { ...current, session, status: "tug-ready" }
+        ? { ...current, session, status: interactive3dPhaseLabel("ready") }
         : current);
       pollInteractive3dSessionAfterOpen(openId, session);
       setStatus("Interactive 3D: drag an atom to tug · drag empty space to rotate · click outside to flatten · Esc to cancel" + (warnings.length ? ` — ${warnings.join(" ")}` : ""));
     } catch (error) {
+      logEngine3dDiagnostic(`phase failed: ${error instanceof Error ? error.message : String(error)}`);
       setInteractive3dWorkspace((current) => current?.openId === openId ? undefined : current);
       if (stillOpening()) setStatus(`Interactive 3D sidecar session failed: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -7093,7 +7156,7 @@ export function MainWindow({
       setInteractive3dWorkspace((workspace) => workspace?.openId === current.openId
         ? {
             ...workspace,
-            status: `beginDrag · ${atomId}`,
+            status: interactive3dPhaseLabel("pulling"),
             dragVisualTarget: undefined
           }
         : workspace);
@@ -7110,7 +7173,7 @@ export function MainWindow({
           }
           scheduler.session = session;
           scheduler.beginPending = false;
-          updateInteractive3dWorkspaceSession(scheduler.openId, session);
+          updateInteractive3dWorkspaceSession(scheduler.openId, session, { phase: scheduler.ending ? "settling" : "pulling" });
         })
         .catch((error) => {
           if (interactive3dDragSchedulerRef.current === scheduler) {
@@ -7143,7 +7206,7 @@ export function MainWindow({
       setInteractive3dWorkspace((workspace) => workspace?.openId === scheduler.openId
         ? {
             ...workspace,
-            status: `${phase} · ${atomId} → ${latestTarget.x.toFixed(2)}, ${latestTarget.y.toFixed(2)}, ${latestTarget.z.toFixed(2)}`,
+            status: interactive3dPhaseLabel("pulling"),
             dragVisualTarget: {
               generation: scheduler.generation,
               atomId,
@@ -7163,7 +7226,7 @@ export function MainWindow({
     setInteractive3dWorkspace((workspace) => workspace?.openId === scheduler.openId
       ? {
           ...workspace,
-          status: `endDrag · ${atomId}`
+          status: interactive3dPhaseLabel("settling")
         }
       : workspace);
     const publishRelease = (session: Engine3dWorkspaceSessionState, status?: string) => {
@@ -10435,6 +10498,34 @@ export function MainWindow({
         }
         return;
       }
+      // Undo took the sample out and nothing was drawn since: the tab is still the original blank
+      // entry, so put the sample back there rather than opening another Tour tab. A tab with any
+      // other history holds the user's edits and is never reset: that includes redo history beyond
+      // the sample itself (installing the sample clears it), and a tab ever saved, to a file or as a
+      // browser download (the restored sample would be marked clean against a copy that does not
+      // hold it). A browser download leaves no path, so saves are tracked per tab, not by path.
+      const active = practice.tabId === activeDocumentTabIdRef.current;
+      const snapshot = active ? undefined : documentTabSnapshotsRef.current.get(practice.tabId);
+      const history = active ? documentHistoryRef.current : snapshot?.history;
+      const filePath = active ? fileStateRef.current.path : snapshot?.file.path;
+      if (history && documentTabsRef.current.some(tab => tab.id === practice.tabId)
+        && !savedOnceTabsRef.current.has(practice.tabId) && !filePath
+        && history.past.length === 0 && history.present.pages.every(page => page.objects.length === 0)
+        && (history.future.length === 0 || (history.future.length === 1
+          && findDocumentObject(history.future[0], practice.moleculeId)?.type === "molecule"))) {
+        const restored = buildTourSample(history.present);
+        activateDocumentTab(practice.tabId);
+        if (activeDocumentTabIdRef.current !== practice.tabId) throw new Error("Could not switch to the tour drawing.");
+        const present = prepareDocumentCommit(restored.document, restored.label);
+        installDocumentHistory({ past: [documentRef.current], present, future: [] });
+        savedDocumentsRef.current.set(practice.tabId, present);
+        // Undo marked the tab dirty; with the sample back it matches its baseline again.
+        fileStateRef.current = { ...fileStateRef.current, dirty: false };
+        setFileState(fileStateRef.current);
+        tourSampleRef.current = { tabId: practice.tabId, moleculeId: present.selection.objectIds[0] };
+        setStatus("Tour drawing opened");
+        return;
+      }
     }
     const blank = createPhase4Document("Tour");
     const sample = buildTourSample(blank);
@@ -10477,6 +10568,7 @@ export function MainWindow({
     importedPageFitGateRef.current.dismiss(id);
     documentTabSnapshotsRef.current.delete(id);
     savedDocumentsRef.current.delete(id);
+    savedOnceTabsRef.current.delete(id);
     nonPristineTabsRef.current.delete(id);
     browserFileKeysRef.current.delete(id);
     documentTabListRef.current?.beforeRemove(remaining);
@@ -10850,7 +10942,7 @@ export function MainWindow({
     if (!result.ok) throw new Error(result.status);
     if (tabId === activeDocumentTabIdRef.current) {
       commitDocumentChange(result.document, (before, after) => chargeAssociationUndoLabel(before, after, "Adjust arrangement spacing"),
-        false, undefined, selectionTransformChemistry());
+        false, undefined, selectionTransformChemistry(undefined, result.independentlyMovedMarkIds));
       setStatus(result.status);
       return;
     }
@@ -10858,7 +10950,8 @@ export function MainWindow({
     if (result.document === source) return;
     const present = normalizeCommittedDocument(result.document);
     // The same commit-time chemistry guard as the active tab's funnel; the dialog shows the refusal.
-    const refusal = commitChemistryRefusal(source, result.document, present, selectionTransformChemistry("adjust arrangement spacing"));
+    const refusal = commitChemistryRefusal(source, result.document, present,
+      selectionTransformChemistry("adjust arrangement spacing", result.independentlyMovedMarkIds));
     if (refusal) throw new Error(refusal);
     documentUndoLabelsRef.current.set(present, chargeAssociationUndoLabel(source, present, "Adjust arrangement spacing"));
     for (const listener of assistantUserEditListenersRef.current) listener(tabId);
@@ -11081,7 +11174,12 @@ export function MainWindow({
     };
 
     return listenAndDrainNativeOpenQueue({
-      subscribe: listenForNativeOpenDocuments,
+      // A refused subscription never reaches a drain, so nothing else would clear the startup gate
+      // that holds the first-run tour back; release it and let onError report the failure.
+      subscribe: changed => listenForNativeOpenDocuments(changed).catch(error => {
+        nativeOpenDrainBusyRef.current = false;
+        throw error;
+      }),
       drain: takePendingNativeOpenDocuments,
       consumeBatch: openNativePayloads,
       onDrainActivity: busy => { nativeOpenDrainBusyRef.current = busy; },
@@ -11724,6 +11822,7 @@ export function MainWindow({
     const finishSave = (destination?: { path: string; displayName: string }) => {
       savedDocumentsRef.current.set(savingTabId, savedDocument);
       documentSaveRevisionsRef.current.set(savingTabId, (documentSaveRevisionsRef.current.get(savingTabId) ?? 0) + 1);
+      savedOnceTabsRef.current.add(savingTabId);
       nonPristineTabsRef.current.add(savingTabId);
       const currentDocument = savingTabId === activeDocumentTabIdRef.current ? documentForFlush() :
         documentTabSnapshotsRef.current.get(savingTabId)?.history.present;
@@ -12255,16 +12354,17 @@ export function MainWindow({
       const moved = result.document;
       if (moved === current) {
         // Repeats against a page edge are still presses, so they renew an existing burst.
-        arrowNudgeBurstRef.current = continuesBurst ? { history: documentHistoryRef.current, lastPress: now } : undefined;
+        arrowNudgeBurstRef.current = continuesBurst ? { history: documentHistoryRef.current, lastPress: now, markIds: burst!.markIds } : undefined;
         setStatus(result.status ?? "Selection is already at the page edge");
         return;
       }
       // Like assistant-history amendments, retain the first before-snapshot and replace only
       // the current snapshot. History identity also ends a burst after any intervening edit,
       // selection change, tab switch or Undo/Redo, even when it arrived outside keyboard routing.
-      // Nudging selected atoms within a molecule moves them as a part drag does: a chemistry edit.
-      // Nudging whole objects must leave every molecule's chemistry as it was.
-      const chemistry = fragments.length > 0 ? CHEMISTRY_EDIT : selectionTransformChemistry("move");
+      // Owner ruling 2026-11-21 (charge always follows): nudging atoms or whole objects carries
+      // their marks, so no nudge may change any molecule's chemistry.
+      const markIds = continuesBurst ? new Set([...burst!.markIds, ...result.independentlyMovedMarkIds]) : result.independentlyMovedMarkIds;
+      const chemistry = selectionTransformChemistry("move", markIds);
       if (continuesBurst) {
         const before = documentHistoryRef.current.past.at(-1) ?? current;
         // A burst amends its one entry, so it is checked against the document before the burst.
@@ -12281,7 +12381,7 @@ export function MainWindow({
         arrowNudgeBurstRef.current = undefined;
         return;
       }
-      arrowNudgeBurstRef.current = { history: documentHistoryRef.current, lastPress: now };
+      arrowNudgeBurstRef.current = { history: documentHistoryRef.current, lastPress: now, markIds };
       if (result.status) {
         setStatus(result.status);
         return;
@@ -12503,6 +12603,14 @@ export function MainWindow({
         },
         () => runAppUpdateCheckRef.current("manual")
       );
+    }
+
+    // Window ▸ Minimize, Maximize / Restore and Close Window on Linux, whose GTK menu lacks the
+    // predefined OS items. macOS and Windows keep those, so the commands exist only on Linux.
+    for (const command of windowCommands({ isDesktop: isDesktopRuntime(), platform: detectDesktopShortcutPlatform() })) {
+      register(command, () => requestWindowAction(command.id).catch(error => {
+        setStatus(`Could not ${command.title.toLowerCase()} the window: ${describeError(error).brief}`);
+      }));
     }
 
     documentTabs.forEach((tab) => {
@@ -12788,12 +12896,15 @@ export function MainWindow({
           if (action.id === "layout.adjustArrangementSpacing") { openArrangementSpacingRef.current(); return; }
           const layout = arrangementLayoutForCommand(action.id)!;
           let operationStatus = "";
+          // Filled by the updater (`IndependentMarkMoves`); the funnel reads it after each run.
+          const markIds = new Set<string>();
           commitDocumentChange(current => {
             const result = arrangeSelectedDocumentObjects(current, layout, { gridAlignment: arrangementGridAlignmentForCommand(action.id) });
             const edit = resolveElectronMarksInSelectionTransform(current, result.document);
             operationStatus = edit.status ?? result.status;
+            replaceMarkIds(markIds, edit.independentlyMovedMarkIds);
             return edit.document;
-          }, layoutUndoLabel, false, undefined, selectionTransformChemistry());
+          }, layoutUndoLabel, false, undefined, selectionTransformChemistry(undefined, markIds));
           setStatus(operationStatus); return;
         }
         if (action.id === distributeModeCommandIds.centers || action.id === distributeModeCommandIds.spacing) {
@@ -12817,19 +12928,23 @@ export function MainWindow({
           return;
         }
 
-        const commitSelectionTransform = (transform: (current: ChemDraftDocument) => ChemDraftDocument, emptyStatus: string) => {
+        // `motion` names a turn or flip, which two atoms (or atoms on one line) cannot tell apart.
+        const commitSelectionTransform = (transform: (current: ChemDraftDocument) => ChemDraftDocument, emptyStatus: string,
+          motion?: AtomMotion) => {
           let markStatus: string | undefined;
+          const markIds = new Set<string>();
           const changed = commitDocumentChange(current => {
-            const result = resolveElectronMarksInSelectionTransform(current, transform(current));
+            const result = resolveElectronMarksInSelectionTransform(current, transform(current), { motion });
             markStatus = result.status;
+            replaceMarkIds(markIds, result.independentlyMovedMarkIds);
             return result.document;
-          }, layoutUndoLabel, false, undefined, selectionTransformChemistry());
+          }, layoutUndoLabel, false, undefined, selectionTransformChemistry(undefined, markIds));
           setStatus(markStatus ?? (changed ? action.title : emptyStatus));
         };
 
         if (action.id === "layout.flipHorizontal" || action.id === "layout.flipVertical") {
           const axis = action.id === "layout.flipHorizontal" ? "horizontal" : "vertical";
-          commitSelectionTransform(current => flipSelectedDocumentObjects(current, axis), "No selected object");
+          commitSelectionTransform(current => flipSelectedDocumentObjects(current, axis), "No selected object", "mirror");
           return;
         }
 
@@ -12848,7 +12963,7 @@ export function MainWindow({
         }
 
         if (action.id === "layout.rotate90") {
-          commitSelectionTransform(rotateSelectedDocumentObjects90, "No selected object");
+          commitSelectionTransform(rotateSelectedDocumentObjects90, "No selected object", "turn");
           return;
         }
 
@@ -17481,11 +17596,11 @@ export function MainWindow({
       : snapRotationDegrees(degrees, { shiftKey: drag.shiftKey });
   }, []);
 
-  const objectRotateDocumentFromDrag = useCallback((drag: ObjectRotateDragState, degrees: number): ChemDraftDocument => {
+  const objectRotateDocumentFromDrag = useCallback((drag: ObjectRotateDragState, degrees: number) => {
     const rotated = drag.target
       ? rotateNativeMoleculeParts(drag.startDocument, drag.target, degrees)
       : rotateDocumentObject(drag.startDocument, drag.objectId, degrees);
-    return resolveElectronMarksInSelectionTransform(drag.startDocument, rotated).document;
+    return resolveElectronMarksInSelectionTransform(drag.startDocument, rotated, { motion: "turn" });
   }, []);
 
   // Snapshot the molecule's persisted Spin 3D model for a whole-molecule rotate drag.
@@ -17646,7 +17761,7 @@ export function MainWindow({
       }
 
       clearObjectTransformPreview(drag.pointerId);
-      replacePresentDocument(objectRotateDocumentFromDrag(drag, degrees));
+      replacePresentDocument(objectRotateDocumentFromDrag(drag, degrees).document);
     });
   }, [clearObjectTransformPreview, objectRotateDocumentFromDrag, objectRotateDragDegrees, replacePresentDocument, scheduleObjectTransformPreview]);
 
@@ -17726,8 +17841,10 @@ export function MainWindow({
         replacePresentDocument(drag.startDocument);
         return false;
       }
-      // Dropping a mark onto an atom, or dragging it off one, is a chemistry edit.
-      commitDocumentHistoryFrom(drag.startDocument, result.document, result.undoLabel, undefined, CHEMISTRY_EDIT);
+      // Dropping a mark onto an atom, or dragging it off one, is a chemistry edit. The mark moved by
+      // itself: the charge-follows rule leaves it where the drop put it.
+      commitDocumentHistoryFrom(drag.startDocument, result.document, result.undoLabel, undefined,
+        withIndependentlyMovedMarks(CHEMISTRY_EDIT, result.independentlyMovedMarkIds));
       return true;
     }
     const selectionDrop = drag.groupObjectIds && drag.groupObjectIds.length > 1
@@ -17755,7 +17872,7 @@ export function MainWindow({
       : object?.type === "text" && object.arrowAttachment?.kind === "conditions" ? "Move Reaction Conditions" : undefined;
     return commitDocumentHistoryFrom(drag.startDocument, moved,
       selectionDrop?.status ? chargeAssociationUndoLabel(drag.startDocument, moved, label ?? "Move") : label,
-      undefined, selectionTransformChemistry("move"));
+      undefined, selectionTransformChemistry("move", selectionDrop?.independentlyMovedMarkIds));
   }, [assignHoveredNativeDeleteTarget, clearObjectTransformPreview, commitDocumentHistoryFrom, objectDragDelta, objectDragDocument, replacePresentDocument]);
 
   const commitGraphicCornerRadius = useCallback((drag: GraphicCornerRadiusDragState, point: ClientPoint): boolean => {
@@ -17784,7 +17901,7 @@ export function MainWindow({
 
   const commitObjectRotateDrag = useCallback((drag: ObjectRotateDragState): boolean => {
     const degrees = objectRotateDragDegrees(drag);
-    const rotated = objectRotateDocumentFromDrag(drag, degrees);
+    const { document: rotated, independentlyMovedMarkIds } = objectRotateDocumentFromDrag(drag, degrees);
     clearObjectTransformPreview(drag.pointerId);
     if (rotated === drag.startDocument) {
       replacePresentDocument(drag.startDocument);
@@ -17814,7 +17931,7 @@ export function MainWindow({
     }
 
     return commitDocumentHistoryFrom(drag.startDocument, committed, findDocumentObject(drag.startDocument, drag.objectId)?.type === "electron-mark" ? "Rotate electron mark" : undefined,
-      undefined, selectionTransformChemistry("rotate"));
+      undefined, selectionTransformChemistry("rotate", independentlyMovedMarkIds));
   }, [clearObjectTransformPreview, commitDocumentHistoryFrom, objectRotateDocumentFromDrag, objectRotateDragDegrees, replacePresentDocument]);
 
   const commitProjectedPlaneTilt = useCallback((drag: ProjectedPlaneTiltDragState, point: ClientPoint): boolean => {
@@ -18034,8 +18151,10 @@ export function MainWindow({
       return;
     }
 
-    replacePresentDocument(result.kind === "xy" && result.verifiedSpin3d
-      ? result.document : resolveElectronMarksInSelectionTransform(nextInput.startDocument, result.document).document);
+    const edit = result.kind === "xy" && result.verifiedSpin3d ? undefined
+      : resolveElectronMarksInSelectionTransform(nextInput.startDocument, result.document, result.kind === "z" ? { motion: "turn" } : {});
+    liveInputMarkMovesRef.current = edit ? { startDocument: nextInput.startDocument, markIds: edit.independentlyMovedMarkIds } : undefined;
+    replacePresentDocument(edit?.document ?? result.document);
     if (result.kind === "xy") {
       showProjectedPlaneTiltReadout(nextInput.objectId, result.tiltXRad, result.tiltYRad, result.clamped, false);
     } else {
@@ -18163,7 +18282,9 @@ export function MainWindow({
       return;
     }
 
-    replacePresentDocument(resolveElectronMarksInSelectionTransform(nextInput.startDocument, result.document).document);
+    const edit = resolveElectronMarksInSelectionTransform(nextInput.startDocument, result.document);
+    liveInputMarkMovesRef.current = { startDocument: nextInput.startDocument, markIds: edit.independentlyMovedMarkIds };
+    replacePresentDocument(edit.document);
     showObjectResizeReadout(nextInput.objectId, result.targetScale, false);
   }, [objectResizeInputDocumentFromDraft, replacePresentDocument, showObjectResizeReadout, updateObjectResizeInput]);
 
@@ -18235,14 +18356,14 @@ export function MainWindow({
     drag: ObjectResizeDragState,
     point: ClientPoint,
     stretching: boolean
-  ): ChemDraftDocument => {
+  ) => {
     const scale = objectResizeScaleFromDrag(drag.centerPoint, drag.startPoint, point, stretching);
     const object = findDocumentObject(drag.startDocument, drag.objectId);
     const resized = drag.target
       ? resizeNativeMoleculeParts(drag.startDocument, drag.target, scale)
       : object?.type === "molecule" ? resizeNativeMoleculeObject(drag.startDocument, drag.objectId, scale)
         : scaleDocumentObjectsAroundPoint(drag.startDocument, [drag.objectId], drag.centerPoint, scale.x, scale.y);
-    return resolveElectronMarksInSelectionTransform(drag.startDocument, resized).document;
+    return resolveElectronMarksInSelectionTransform(drag.startDocument, resized);
   }, []);
 
   const previewObjectResize = useCallback((drag: ObjectResizeDragState, point: ClientPoint, stretching: boolean) => {
@@ -18253,14 +18374,14 @@ export function MainWindow({
       drag.latestCumulativeScale = cumulativeObjectResizeScale(drag.startCumulativeScale, drag.latestScale);
       showObjectResizeReadout(drag.objectId, drag.latestCumulativeScale);
       clearObjectTransformPreview(drag.pointerId);
-      replacePresentDocument(objectResizeDocumentFromDrag(drag, point, stretching));
+      replacePresentDocument(objectResizeDocumentFromDrag(drag, point, stretching).document);
     });
   }, [clearObjectTransformPreview, objectResizeDocumentFromDrag, replacePresentDocument, showObjectResizeReadout]);
 
   const commitObjectResize = useCallback((drag: ObjectResizeDragState, point: ClientPoint): boolean => {
     drag.latestScale = objectResizeScaleFromDrag(drag.centerPoint, drag.startPoint, point, drag.stretching);
     drag.latestCumulativeScale = cumulativeObjectResizeScale(drag.startCumulativeScale, drag.latestScale);
-    const resized = objectResizeDocumentFromDrag(drag, point, drag.stretching);
+    const { document: resized, independentlyMovedMarkIds } = objectResizeDocumentFromDrag(drag, point, drag.stretching);
     showObjectResizeReadout(drag.objectId, drag.latestCumulativeScale, true);
     clearObjectTransformPreview(drag.pointerId);
     if (resized === drag.startDocument) {
@@ -18269,7 +18390,7 @@ export function MainWindow({
     }
 
     return commitDocumentHistoryFrom(drag.startDocument, resized, findDocumentObject(drag.startDocument, drag.objectId)?.type === "electron-mark" ? "Resize electron mark" : undefined,
-      undefined, selectionTransformChemistry("resize"));
+      undefined, selectionTransformChemistry("resize", independentlyMovedMarkIds));
   }, [clearObjectTransformPreview, commitDocumentHistoryFrom, objectResizeDocumentFromDrag, replacePresentDocument, showObjectResizeReadout]);
 
   const nativePartDocumentFromDrag = useCallback((drag: NativePartDragState, point: ClientPoint): ChemDraftDocument => {
@@ -18279,11 +18400,12 @@ export function MainWindow({
     };
     // Magnetic canonical-geometry snap: the drop clicks onto exact bond length / canonical
     // angles when the drag comes close, so hand-placed geometry lands "correct".
+    // The snap and the move both work in the molecule's own (unrotated) frame, so a rotated
+    // molecule's part lands where the pointer drops it (CodeRabbit #422 item I).
     const molecule = findDocumentObject(drag.startDocument, drag.objectId);
-    const delta = molecule?.type === "molecule"
-      ? snapNativeMoleculePartDragDelta(molecule, drag.target, rawDelta)
-      : rawDelta;
-    return moveNativeMoleculeParts(drag.startDocument, drag.target, delta);
+    if (molecule?.type !== "molecule") return moveNativeMoleculeParts(drag.startDocument, drag.target, rawDelta);
+    const delta = snapNativeMoleculePartDragDelta(molecule, drag.target, moleculeFrameDelta(molecule, rawDelta));
+    return moveNativeMoleculeParts(drag.startDocument, drag.target, delta, "molecule");
   }, []);
 
   const previewNativePartDrag = useCallback((drag: NativePartDragState, point: ClientPoint) => {
@@ -18300,10 +18422,11 @@ export function MainWindow({
       return;
     }
 
-    // Dragging atoms and bonds of a molecule is drawing: a chemistry edit, which reports a charge it
-    // moves or removes itself.
+    // Owner ruling 2026-11-21 (charge always follows): every mark associated with a dragged atom
+    // moves with it, so a part drag never changes chemistry and the commit guard checks that it
+    // did not.
     const committed = normalizeCommittedDocument(result.document);
-    commitDocumentHistoryFrom(drag.startDocument, committed, chargeAssociationUndoLabel(drag.startDocument, committed, "Move"), undefined, CHEMISTRY_EDIT);
+    if (!commitDocumentHistoryFrom(drag.startDocument, committed, "Move", undefined, preserveChemistry("move"))) return;
     setStatus(result.status ?? "Moved selected molecule part");
   }, [commitDocumentHistoryFrom, nativePartDocumentFromDrag, replacePresentDocument]);
 
@@ -19069,7 +19192,8 @@ export function MainWindow({
           setStatus(`3D rotate: ${projectedPlaneTiltReadoutLabel(result.tiltXRad, result.tiltYRad)}`);
         } else {
           const before = groupTransform.startDocument;
-          const preview = resolveElectronMarksInSelectionTransform(before, groupTransformDocument(groupTransform, point, event.shiftKey));
+          const preview = resolveElectronMarksInSelectionTransform(before, groupTransformDocument(groupTransform, point, event.shiftKey),
+            groupTransform.mode === "rotate" ? { motion: "turn" } : {});
           replacePresentDocument(preview.document);
         }
       }
@@ -19488,12 +19612,12 @@ export function MainWindow({
           : undefined;
         const before = groupTransform.startDocument;
         const transformed = result?.document ?? groupTransformDocument(groupTransform, point, event.shiftKey);
-        const edit = resolveElectronMarksInSelectionTransform(before, transformed);
+        const edit = resolveElectronMarksInSelectionTransform(before, transformed, groupTransform.mode === "rotate" ? { motion: "turn" } : {});
         if (edit.document !== before) {
           const label = groupTransform.mode === "rotate" ? "Rotate selection"
             : groupTransform.mode === "resize" ? "Resize selection" : "3D rotate";
           commitDocumentHistoryFrom(before, edit.document, chargeAssociationUndoLabel(before, edit.document, label), undefined,
-            selectionTransformChemistry());
+            selectionTransformChemistry(undefined, edit.independentlyMovedMarkIds));
         } else {
           replacePresentDocument(before);
         }
@@ -22838,16 +22962,19 @@ export function MainWindow({
     // A side-dependent label the save could not carry is read again from its drawing: say so (short
     // on the status line, each atom named in the log) rather than let the save change it silently.
     const applied = applyEditorSaveResultWithLabelWarnings(documentRef.current, result);
-    // A save that would move a charge or radical mark onto another atom, or whose charge contradicts
-    // a mark still on the atom, is refused before commit: the document and undo stack are unchanged,
-    // and the host keeps this message on the status line (it reports success only for `true`).
+    // A molecule with charge or radical marks is refused before commit (1.2.2 fallback: every
+    // structure-editor Apply on it), as is a save whose charge contradicts a mark: the document and
+    // undo stack are unchanged, and the host keeps this message on the status line (it reports
+    // success only for `true`).
     if (applied.refusal) {
       setStatus(applied.refusal);
       return false;
     }
-    // The commit can still decline (a page-size question already open, a chemistry refusal): it has
-    // set its own status then, which an "Applied" from the host must not overwrite.
-    const committed = commitDocumentChangeWithPageFit(applied.document, undefined, undefined, undefined, CHEMISTRY_EDIT);
+    // Only the edited molecule may change. The save reuses atom ids by index, so its marks are not
+    // carried by the charge-follows rule: they stay put and normal association applies. The commit
+    // can still decline (a page-size question already open, a chemistry refusal): it has set its own
+    // status then, which an "Applied" from the host must not overwrite.
+    const committed = commitDocumentChangeWithPageFit(applied.document, undefined, undefined, undefined, structureEditorChemistry(result.object.id));
     if (!committed) return false;
     const labelStatus = editorSaveLabelWarningsStatus(applied.labelWarnings);
     if (labelStatus) {
@@ -23022,6 +23149,21 @@ export function MainWindow({
   const activeSpin3dState = spin3dState && findDocumentObject(document, spin3dState.objectId)?.type === "molecule"
     ? spin3dState
     : undefined;
+  // Charge/radical marks follow their atom through the live spin (owner ruling 2026-11-21): the
+  // overlay paints each at its atom's projected position, offset exactly as flatten will commit it,
+  // and the page hides the stationary copy until the spin ends.
+  const spinObjectId = activeSpin3dState?.objectId;
+  const spinCarriedMarks = useMemo((): readonly SpinCarriedMark[] => {
+    if (!spinObjectId) return [];
+    const spinAtoms = activeSpin3dState?.atoms ?? [];
+    return spin3dCarriedElectronMarks(activePage, spinObjectId).flatMap(({ mark, atomId }) => {
+      const atomIndex = spinAtoms.findIndex(atom => atom.id === atomId);
+      const fragments = objectOverlayFragments.get(mark.id);
+      return atomIndex >= 0 && fragments?.length ? [{ markId: mark.id, atomIndex, fragments }] : [];
+    });
+  }, [activePage, objectOverlayFragments, spinObjectId, activeSpin3dState?.atoms]);
+  const spinCarriedMarkIds = useMemo(() => spinCarriedMarks.length > 0
+    ? new Set(spinCarriedMarks.map(mark => mark.markId)) : undefined, [spinCarriedMarks]);
 
   // The browser build has no native OS menu, so it renders the shared app-menu model in-viewport.
   // On the Tauri desktop build the native menu owns this, so the in-window bar stays hidden.
@@ -23043,7 +23185,8 @@ export function MainWindow({
         availablePluginUpdateCount,
         keybindingScheme,
         keybindingOverrides: shortcutOverrides,
-        platform: shortcutPlatform
+        platform: shortcutPlatform,
+        unavailableCommandIds
       }),
     [
       rulersVisible,
@@ -23062,7 +23205,8 @@ export function MainWindow({
       availablePluginUpdateCount,
       structureSearchEnabled,
       hasSearchableStructure,
-      bracketMenuItems
+      bracketMenuItems,
+      unavailableCommandIds
     ]
   );
 
@@ -23737,6 +23881,7 @@ export function MainWindow({
                   objectOverlayFragments={objectOverlayFragments}
                   objectTransformPreview={objectTransformPreview}
                   spinningObjectId={activeSpin3dState?.objectId}
+                  spinCarriedMarkIds={spinCarriedMarkIds}
                   editingTextObjectId={activeTextEditObjectId}
                   editingTableCell={tableCellEdit && !("kind" in tableCellEdit) ? tableCellEdit : undefined}
                 />
@@ -24040,6 +24185,7 @@ export function MainWindow({
                   return (
                     <SpinOverlay
                       state={activeSpin3dState}
+                      carriedMarks={spinCarriedMarks}
                       pageWidth={activePage.width}
                       pageHeight={activePage.height}
                       drawingStyle={spinStyle}
@@ -24191,7 +24337,7 @@ export function MainWindow({
             baseToolsets={toolbarCatalog.baseToolsets()}
             layoutState={layoutStateRef.current ?? emptyLayoutState()}
             availableCommands={galleryCommands}
-            isCommandHidden={id => isCompoundLayoutCommandHidden(id, compoundLayoutSettings)}
+            isCommandHidden={id => isCompoundLayoutCommandHidden(id, compoundLayoutSettings) || unavailableCommandIds.has(id)}
             onApply={applyCustomizeToolbars}
             onLiveApply={liveApplyCustomizeToolbars}
             onClose={() => setCustomizeToolbarsOpen(false)}
@@ -24259,9 +24405,11 @@ export function MainWindow({
             setSpacingSource(undefined); setStatus("Drawing changed. Reopen Adjust spacing to preview the current selection."); return;
           }
           let ok = false, operationStatus = "";
+          const markIds = new Set<string>();
           commitDocumentChange(current => { const result = checkedArrangementSpacing(current, factor);
-            ok = result.ok; operationStatus = result.status; return result.document;
-          }, (before, after) => chargeAssociationUndoLabel(before, after, "Adjust arrangement spacing"), false, undefined, selectionTransformChemistry());
+            ok = result.ok; operationStatus = result.status; replaceMarkIds(markIds, result.independentlyMovedMarkIds); return result.document;
+          }, (before, after) => chargeAssociationUndoLabel(before, after, "Adjust arrangement spacing"), false, undefined,
+          selectionTransformChemistry(undefined, markIds));
           if (ok) setSpacingSource(undefined); setStatus(operationStatus);
         }} /> : null}
       {objectContextMenu ? (
@@ -26821,8 +26969,17 @@ function Spin3dGeneratingCue({ box, atomCount, pageWidth, pageHeight }: {
  * drag — so it needs no changes to the existing page/object pointer handlers. It
  * never mutates the document; the flatten-on-release commit is Phase 5.
  */
+interface SpinCarriedMark {
+  markId: string;
+  /** Index of the mark's atom in `Spin3dState.atoms` (and so in the projection). */
+  atomIndex: number;
+  /** The mark's page paint, drawn where it stands now; the overlay translates it with its atom. */
+  fragments: readonly PageSvgElementFragment[];
+}
+
 function SpinOverlay({
   state,
+  carriedMarks = [],
   pageWidth,
   pageHeight,
   drawingStyle,
@@ -26832,6 +26989,8 @@ function SpinOverlay({
   onPointerCancel
 }: {
   state: Spin3dState;
+  /** Charge/radical marks that follow their atoms through the spin. */
+  carriedMarks?: readonly SpinCarriedMark[];
   pageWidth: number;
   pageHeight: number;
   /** The molecule's own 2D drawing style — the overlay renders with the SAME colors,
@@ -26970,6 +27129,21 @@ function SpinOverlay({
           ))}
         </g>
       ))}
+      {/* Each mark keeps the offset from its atom that flatten commits (the ScreenPlacement
+          contract): translated by its atom's projected minus drawn position. */}
+      {carriedMarks.map(({ markId, atomIndex, fragments }) => {
+        const projected = projectedByIndex.get(atomIndex);
+        const source = state.atoms[atomIndex];
+        if (!projected || !source) return null;
+        return (
+          <g key={`mark-${markId}`} data-spin3d-electron-mark={markId}
+            data-spin3d-mark-offset={`${projected.sx - source.x} ${projected.sy - source.y}`}
+            transform={`translate(${projected.sx - source.x} ${projected.sy - source.y})`}
+            style={{ pointerEvents: "none" }}>
+            {fragments.map(renderStaticPageSvgFragment)}
+          </g>
+        );
+      })}
       <text
         x={pageWidth / 2}
         y={24}
@@ -28285,6 +28459,11 @@ function nativeRingSelectionFromItems(
   return { objectId, kind: "rings", rings: unique };
 }
 
+/** Whether two id lists hold the same ids in the same order. */
+function sameIds(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((id, index) => id === b[index]);
+}
+
 /**
  * Validate one molecule's selected part against the current document (atoms/bonds/rings may have
  * been deleted, or the Rings toolbar closed) and return the still-valid part, or undefined to drop it.
@@ -28316,7 +28495,10 @@ export function pruneNativeMoleculePart(
 
   if (part.kind === "ring") {
     const ring = nativeMoleculeRings(object).find((candidate) => candidate.ringKey === part.ringKey);
-    return ring ? { ...part, atomIds: ring.atomIds, bondIds: ring.bondIds } : undefined;
+    if (!ring) return undefined;
+    // Same ring, same atoms and bonds: keep the identity (see the parts case below).
+    if (sameIds(ring.atomIds, part.atomIds) && sameIds(ring.bondIds, part.bondIds)) return part;
+    return { ...part, atomIds: ring.atomIds, bondIds: ring.bondIds };
   }
 
   if (part.kind === "rings") {
@@ -28325,11 +28507,19 @@ export function pruneNativeMoleculePart(
       const ring = objectRings.find((candidate) => candidate.ringKey === selectedRing.ringKey);
       return ring ? [{ ringKey: ring.ringKey, atomIds: ring.atomIds, bondIds: ring.bondIds }] : [];
     });
-    return nativeRingSelectionFromItems(part.objectId, rings);
+    const next = nativeRingSelectionFromItems(part.objectId, rings);
+    // The same rings with the same atoms and bonds: keep the identity (see the parts case below).
+    if (next?.kind === "rings" && next.rings.length === part.rings.length && next.rings.every((ring, index) =>
+      ring.ringKey === part.rings[index].ringKey && sameIds(ring.atomIds, part.rings[index].atomIds) &&
+      sameIds(ring.bondIds, part.rings[index].bondIds))) return part;
+    return next;
   }
 
   const atomIds = part.atomIds.filter((atomId) => object.atoms.some((atom) => atom.id === atomId));
   const bondIds = part.bondIds.filter((bondId) => object.bonds.some((bond) => bond.id === bondId));
+  // Nothing pruned: keep the identity, so an edit that keeps every atom (an arrow-key nudge) does not
+  // churn the part selection, which would end the nudge burst and split it into one Undo per press.
+  if (atomIds.length === part.atomIds.length && bondIds.length === part.bondIds.length) return part;
   return atomIds.length > 0 || bondIds.length > 0 ? { ...part, atomIds, bondIds } : undefined;
 }
 
@@ -29244,6 +29434,7 @@ function PageSvgSurfaceContent({
   objectOverlayFragments,
   objectTransformPreview,
   spinningObjectId,
+  spinCarriedMarkIds,
   editingTextObjectId,
   editingTableCell,
   ...handlers
@@ -29259,6 +29450,8 @@ function PageSvgSurfaceContent({
   objectTransformPreview?: ObjectTransformPreviewState;
   /** The id of the molecule being spun in 3D; its drawn structure fades to a faint ghost. */
   spinningObjectId?: string;
+  /** Marks the Spin 3D overlay paints at their spun atoms; hidden here so they are not drawn twice. */
+  spinCarriedMarkIds?: ReadonlySet<string>;
   /** The SVG editing preview owns this text's paint until its edit ends. */
   editingTextObjectId?: string;
   editingTableCell?: ActiveTableCell;
@@ -29322,9 +29515,9 @@ function PageSvgSurfaceContent({
                   data-object-type={object.type}
                   data-layer-index={Number(fragments[0]!.attrs["data-layer-index"])}
                   opacity={object.id === spinningObjectId ? 0.1 : undefined}
-                  visibility={editingText ? "hidden" : undefined}
+                  visibility={editingText || spinCarriedMarkIds?.has(object.id) ? "hidden" : undefined}
                   transform={preview ? objectTransformPreviewSvgTransform(preview) : undefined}
-                  style={{ pointerEvents: object.id === spinningObjectId || editingText ? "none" : "auto" }}
+                  style={{ pointerEvents: object.id === spinningObjectId || editingText || spinCarriedMarkIds?.has(object.id) ? "none" : "auto" }}
                   onPointerDown={event => handlers.onPointerDown(object.id, event)}
                   onPointerMove={event => handlers.onPointerMove(object.id, event)}
                   onPointerUp={event => handlers.onPointerUp(object.id, event)}

@@ -283,7 +283,7 @@ describe("fonts stored in a saved native payload (#442)", () => {
     return document;
   };
   const exportMessage = "CDXML export: font 7 has a name longer than 256 characters, or more than 512 characters of font attributes, far beyond any real font; " +
-    "it was not written, and text set in it was written without its caption frame and run fonts, or in the default font.";
+    "it was not written, and text whose source runs name it was written from its current text and styles instead of being copied from its source.";
   const openMessage = "ChemDraft document: font 7 has a name longer than 256 characters, or more than 512 characters of font attributes, far beyond any real font; " +
     "it was dropped from the text font tables stored in this document, and saving to CDXML or CDX does not write it.";
 
@@ -327,7 +327,7 @@ describe("fonts stored in a saved native payload (#442)", () => {
     const saved = exportDocumentToCdxml(document, plain);
     expect(saved.warnings.filter(w => w.code === "cdxml.font_entry_too_long").map(w => w.message)).toEqual([
       "CDXML export: the font of text caption has a name longer than 256 characters, or more than 512 characters of font attributes, far beyond any real font; " +
-      "it was not written, and text set in it was written without its caption frame and run fonts, or in the default font."
+      "it was not written, and a caption set in it was written as plain styled text, without its caption frame and run fonts."
     ]);
     expect(saved.contents).not.toContain(longName.slice(0, 257));
     expect(saved.warnings.map(w => w.code)).toContain("cdxml.text_format_native_only");

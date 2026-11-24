@@ -240,8 +240,11 @@ export function createSmilesMolecule(
       : { ...bond, display: { ...bond.display, doubleBondSide } };
   });
 
-  // Stored-structure spelling: molecule.structure is a standard molfile of the graph as built (a
-  // pasted structure has element atoms only). It is a record of the depiction, not what the app
+  // Stored-structure spelling: normally a standard molfile of the graph as built (a pasted
+  // structure has element atoms only). Atom maps have no native atom field, so retain mapped
+  // SMILES verbatim instead: rebuilding a molfile would silently erase them and hide them from
+  // guards on source-only properties. Neither the native depiction nor its stereo flags change.
+  // This is a record of the source/depiction, not what the app
   // analyses or exports: Copy As, SMILES export, Validate and the Molecular Inspector all write the
   // live graph afresh, with group labels expanded (expandNativeMoleculeLabelGroups). CIP perception
   // never reads this field either — it spells its own molfile (stereoPerceptionMolfile, R-groups).
@@ -251,6 +254,7 @@ export function createSmilesMolecule(
     warnings: structureWarnings,
     kekuleBondOrders: nativeBondOrderResolution(atoms, bonds).kekuleOrders
   }).contents;
+  const hasAtomMapping = /\[[^\]]*:\d+\]/.test(smilesText);
 
   return normalizeNativeMoleculeGeometry({
     id: nextObjectId(document, source.objectIdPrefix, source.reservedObjectIds),
@@ -275,8 +279,8 @@ export function createSmilesMolecule(
       ],
       unknown: { smiles: smilesText }
     },
-    structureFormat: "molfile-v2000",
-    structure,
+    structureFormat: hasAtomMapping ? "smiles" : "molfile-v2000",
+    structure: hasAtomMapping ? smilesText : structure,
     chemistry: nativeSingleBondGraphMetadata(atoms, bonds),
     atoms,
     bonds,

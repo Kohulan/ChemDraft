@@ -73,6 +73,18 @@ describe("PluginPanelController", () => {
     expect(controller.getOpenPanel()?.commandId).toBe("cmd.proton");
   });
 
+  it("never lets a report's Run again reach a tab or document-window command", () => {
+    const { host } = hostWithPanels();
+    for (const defaultSurface of ["inApp", "window"] as const) {
+      const controller = new PluginPanelController(host, () => "t", defaultSurface);
+      for (const rerunCommandId of ["window.close", "window.minimize", "window.toggleMaximize", "document.closeTab"]) {
+        controller.showReport("plugin.a", "panel.a", { title: "R", sections: [], rerunCommandId });
+        const panel = defaultSurface === "inApp" ? controller.getOpenPanel() : controller.getDetachedPanels()[0];
+        expect(panel?.commandId, rerunCommandId).toBe("cmd.a");
+      }
+    }
+  });
+
   it("treats pending and result reports for the same panel as updates without a false close", () => {
     const { host, notifyPanelClosed } = hostWithPanels();
     const times = ["opened", "should-not-be-used"];

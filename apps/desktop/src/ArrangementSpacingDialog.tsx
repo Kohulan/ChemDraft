@@ -23,7 +23,8 @@ export function frameArrangementSpacingPreviewSvg(svg: string, pageWidth: number
 export function checkedArrangementSpacing(source: ChemDraftDocument, factor: number) {
   const spacing = adjustArrangementSpacing(source, factor);
   const edit = resolveElectronMarksInSelectionTransform(source, spacing.document);
-  return { document: edit.document, ok: spacing.ok && !edit.refused, status: edit.status ?? spacing.status };
+  return { document: edit.document, ok: spacing.ok && !edit.refused, status: edit.status ?? spacing.status,
+    independentlyMovedMarkIds: edit.independentlyMovedMarkIds };
 }
 
 /** Runs only in the document owner; native forms receive previews, never documents. */

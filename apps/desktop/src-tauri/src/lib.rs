@@ -49,6 +49,7 @@ mod problem_reports;
 mod screen_capture;
 mod shortcut_recording_menu;
 mod structure_search;
+mod toolset_fit;
 mod utility_suspension;
 #[cfg(test)]
 mod utility_suspension_tests;
@@ -176,20 +177,31 @@ const CLOSE_WINDOW_FILE_MENU_ID: &str = "app.closeWindow.file";
 #[cfg(target_os = "macos")]
 const CLOSE_WINDOW_WINDOW_MENU_ID: &str = "app.closeWindow.window";
 /// Linux: muda's predefined Minimize, Maximize and Close Window are unsupported in GTK menus, so
-/// Linux builds ordinary items with these ids, acting on the document window. Two Close ids, one
-/// per menu, because muda item ids are meant to be unique.
+/// Linux builds ordinary items backed by these registry commands (`windowCommands.ts`). A click
+/// routes to the webview like any other menu command, and the command asks for the native action
+/// on the document window over `WINDOW_ACTION_EVENT`. macOS and Windows keep the predefined items.
+const WINDOW_MINIMIZE_COMMAND_ID: &str = "window.minimize";
+const WINDOW_TOGGLE_MAXIMIZE_COMMAND_ID: &str = "window.toggleMaximize";
+const WINDOW_CLOSE_COMMAND_ID: &str = "window.close";
+/// Routed only on Linux, the one build whose menu carries them (`is_routed_menu_command`).
+const LINUX_WINDOW_COMMAND_IDS: &[&str] = &[
+    WINDOW_MINIMIZE_COMMAND_ID,
+    WINDOW_TOGGLE_MAXIMIZE_COMMAND_ID,
+    WINDOW_CLOSE_COMMAND_ID,
+];
+/// File ▸ Close Window has its own id because muda item ids are meant to be unique; it routes as
+/// `window.close`, like the Window menu's item (`linux_menu_command_id`).
 #[cfg(any(target_os = "linux", test))]
-const LINUX_MINIMIZE_MENU_ID: &str = "app.window.minimize";
+const LINUX_CLOSE_WINDOW_FILE_MENU_ID: &str = "window.close.fileMenu";
+/// Sent by the window commands with `{ commandId }`. Mirrors `WINDOW_ACTION_EVENT` in
+/// apps/desktop/src/windowCommands.ts.
 #[cfg(any(target_os = "linux", test))]
-const LINUX_TOGGLE_MAXIMIZE_MENU_ID: &str = "app.window.toggleMaximize";
-#[cfg(any(target_os = "linux", test))]
-const LINUX_CLOSE_WINDOW_FILE_MENU_ID: &str = "app.window.close.file";
-#[cfg(any(target_os = "linux", test))]
-const LINUX_CLOSE_WINDOW_WINDOW_MENU_ID: &str = "app.window.close.window";
+const WINDOW_ACTION_EVENT: &str = "chemdraft://window-action";
 const DOM_COMMAND_EVENT: &str = "chemdraft:native-command";
 #[cfg(target_os = "macos")]
 const PALETTE_POINTER_EVENT: &str = "chemdraft://palette-pointer";
-#[cfg(target_os = "macos")]
+/// macOS: the pointer poll's leave. Linux: a GTK leave-notify on the palette
+/// (install_toolset_pointer_leave). Windows never emits it.
 const PALETTE_POINTER_LEAVE_EVENT: &str = "chemdraft://palette-pointer-leave";
 const OPEN_DOCUMENT_EVENT: &str = "chemdraft://open-document";
 const TOOLSET_WINDOW_STATE_EVENT: &str = "chemdraft://toolset-window-state";
@@ -201,7 +213,11 @@ const AGENT_BRIDGE_ENV_VAR: &str = "CHEMDRAFT_AGENT_BRIDGE";
 const AGENT_BRIDGE_CLI_ARG: &str = "--chemdraft-agent-bridge";
 const ENGINE3D_PROTOCOL_VERSION: u32 = 2;
 const ENGINE3D_SIDECAR_BASENAME: &str = "avogadro3d-sidecar";
+const STRUCTURE_INTERACTIVE3D_COMMAND_ID: &str = "structure.openInteractive3d";
 const ENGINE3D_SIDECAR_ENV_VAR: &str = "CHEMDRAFT_ENGINE3D_SIDECAR";
+/// `CHEMDRAFT_ENGINE3D_LOG=1` turns on the Interactive 3D diagnostic on stderr (`engine3d_log`).
+/// Off by default, and the same on every platform.
+const ENGINE3D_LOG_ENV_VAR: &str = "CHEMDRAFT_ENGINE3D_LOG";
 const ENGINE3D_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const ENGINE3D_MAX_BATCH_LINES: usize = 128;
 const ENGINE3D_SESSION_OUTPUT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -1023,7 +1039,7 @@ const MENU_COMMAND_IDS: &[&str] = &[
     "text.convertToAtomLabel",
     "analyze.molecularProperties",
     "chemistry.validateSelection",
-    "structure.openInteractive3d",
+    STRUCTURE_INTERACTIVE3D_COMMAND_ID,
     "plugins.manage",
     "plugins.vibeCodeStarter",
     ABOUT_COMMAND_ID,
@@ -1104,8 +1120,10 @@ struct NativeMenuNeedsRebuild(AtomicBool);
 )]
 #[serde(rename_all = "lowercase")]
 enum KeybindingScheme {
-    #[default]
     ChemDraft,
+    /// The industry-standard scheme, the default for new installs since 1.2.3. The native menu is
+    /// built with it until the document window pushes the stored scheme (`set_keybinding_scheme`).
+    #[default]
     ChemDraw,
 }
 
@@ -1231,6 +1249,8 @@ struct Engine3dManagedSession {
     stdin: Option<ChildStdin>,
     stdout_rx: Receiver<String>,
     stderr_rx: Receiver<String>,
+    /// The diagnostic reports the process's exit once, not on every later poll.
+    exit_logged: bool,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -1278,6 +1298,7 @@ struct Engine3dSidecarStatus {
     resolved_path: Option<String>,
     bundled_binary_name: String,
     target_triple: String,
+    log_enabled: bool,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -1565,10 +1586,7 @@ pub fn run() {
                 return;
             }
             #[cfg(target_os = "linux")]
-            if let Some(action) = linux_window_menu_action(command_id) {
-                run_linux_window_menu_action(app, action);
-                return;
-            }
+            let command_id = linux_menu_command_id(command_id);
             if (is_routed_menu_command(command_id)
                 || (is_clipboard_edit_menu_command(command_id)
                     && custom_menu_shortcut(app, command_id).is_some()))
@@ -1762,6 +1780,13 @@ pub fn run() {
                     {
                         return;
                     }
+                    // A work-area fit is ChemDraft's adjustment, not the user's position (B9).
+                    let decision = toolset_fit::with_memory(|memory| {
+                        memory.moved(window.label(), (position.x, position.y))
+                    });
+                    if decision == toolset_fit::FitEventDecision::Skip {
+                        return;
+                    }
                     if let Err(error) = persist_toolset_position(
                         app,
                         &toolset_id,
@@ -1772,13 +1797,55 @@ pub fn run() {
                             "Could not persist ChemDraft toolset position {toolset_id}: {error}"
                         );
                     }
+                    // Moving a fitted inspector makes its fitted size the user's too.
+                    if decision == toolset_fit::FitEventDecision::PersistFrame
+                        && toolset_is_resizable(&toolset_id)
+                    {
+                        if let Err(error) = persist_toolset_size(window, &toolset_id) {
+                            eprintln!(
+                                "Could not persist ChemDraft toolset size {toolset_id}: {error}"
+                            );
+                        }
+                    }
                 }
                 WindowEvent::Resized(_) if toolset_is_resizable(&toolset_id) => {
+                    // A minimize or hide can arrive as a resize (Windows reports 0 x 0). It is no
+                    // user frame, so it must not end a fit either; the `Moved` arm skips it too.
+                    if visible_toolset_physical_position(window).is_none() {
+                        return;
+                    }
+                    let Ok(size) = window.inner_size() else {
+                        return;
+                    };
+                    let decision = toolset_fit::with_memory(|memory| {
+                        memory.resized(window.label(), (size.width, size.height))
+                    });
+                    if decision == toolset_fit::FitEventDecision::Skip {
+                        return;
+                    }
                     if let Err(error) = persist_toolset_size(window, &toolset_id) {
                         eprintln!("Could not persist ChemDraft toolset size {toolset_id}: {error}");
                     }
+                    // Resizing a fitted inspector makes its fitted position the user's too.
+                    if decision == toolset_fit::FitEventDecision::PersistFrame {
+                        if let Some(position) = visible_toolset_physical_position(window) {
+                            if let Err(error) = persist_toolset_position(
+                                app,
+                                &toolset_id,
+                                position,
+                                window.scale_factor().unwrap_or(1.0),
+                            ) {
+                                eprintln!(
+                                    "Could not persist ChemDraft toolset position {toolset_id}: {error}"
+                                );
+                            }
+                        }
+                    }
                 }
                 WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed => {
+                    if matches!(event, WindowEvent::Destroyed) {
+                        toolset_fit::with_memory(|memory| memory.forget(window.label()));
+                    }
                     // Only a user close reaches the saved layout state; quit teardown must not.
                     if APP_QUITTING.load(Ordering::SeqCst) {
                         return;
@@ -2041,6 +2108,8 @@ fn setup_primary_app(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::E
     if let Err(error) = linux_session_end::install(app) {
         eprintln!("Could not install ChemDraft Linux termination handlers: {error}");
     }
+    #[cfg(target_os = "linux")]
+    listen_for_linux_window_actions(app);
     panel_window::observe_document_pointer_release(app);
     file_warnings_window::observe_document(app)?;
     // Programmatic panel removal hides a reusable window, so it produces neither
@@ -3572,7 +3641,12 @@ fn close_toolset_window(
     // waiting for, building or arming its window does not show it afterwards (a later open does).
     palette_first_paint::closed(&toolset_window_label(&toolset_id));
     let window = app.get_webview_window(&toolset_window_label(&toolset_id));
-    if let Some(window) = window.as_ref() {
+    // A fitted palette's live position is ChemDraft's adjustment to a smaller work area, not the
+    // user's (toolset_fit): saving it would stop a later open from restoring the user's own frame.
+    let fitted = window
+        .as_ref()
+        .is_some_and(|window| toolset_fit::with_memory(|memory| memory.is_fitted(window.label())));
+    if let Some(window) = window.as_ref().filter(|_| !fitted) {
         let webview: &tauri::Webview = window.as_ref();
         if let Some(position) = visible_toolset_physical_position(&webview.window()) {
             // Best-effort, exactly like the `Moved` handler. Remembering where the palette was is
@@ -4824,8 +4898,7 @@ impl PluginPanelShortcut {
             || shortcut.command_id.is_empty()
             || shortcut.command_id.len() > 4096
             || shortcut.command_id.trim() != shortcut.command_id
-            || shortcut.command_id == "document.closeTab"
-            || shortcut.command_id.starts_with("document.closeTab.")
+            || panel_shortcut_reaches_document_window(&shortcut.command_id)
         {
             return Err("Invalid panel shortcut command.".into());
         }
@@ -4841,6 +4914,23 @@ impl PluginPanelShortcut {
             self.command_id.clone()
         }
     }
+}
+
+/// Commands a panel's shortcut bridge must never forward: closing a document tab, and the window
+/// commands, whose native half minimizes, maximizes or closes the whole document window on the
+/// panel's behalf. Compared without any `:` routing suffix (`document_command_id`) or `.` variant.
+fn panel_shortcut_reaches_document_window(command_id: &str) -> bool {
+    let command = command_id
+        .split_once(':')
+        .map_or(command_id, |(command, _)| command);
+    std::iter::once("document.closeTab")
+        .chain(LINUX_WINDOW_COMMAND_IDS.iter().copied())
+        .any(|blocked| {
+            command == blocked
+                || command
+                    .strip_prefix(blocked)
+                    .is_some_and(|variant| variant.starts_with('.'))
+        })
 }
 
 fn validate_plugin_panel_event(
@@ -5342,9 +5432,63 @@ mod plugin_panel_label_tests {
             serde_json::json!({"commandId": " edit.undo"}),
             serde_json::json!({"commandId": "document.closeTab"}),
             serde_json::json!({"commandId": "document.closeTab.other"}),
+            serde_json::json!({"commandId": "document.closeTab:forceDocumentHistory"}),
             serde_json::json!({"commandId": "edit.undo", "sourceLabel": "main"}),
         ] {
             assert!(validate_plugin_panel_event(&label, event, &payload).is_err());
+        }
+        // The window commands act natively on the whole document window, on every platform's
+        // bridge, so a panel can no more minimize, maximize or close it than close its tab.
+        for command in [
+            "window.close",
+            "window.minimize",
+            "window.toggleMaximize",
+            "window.close.fileMenu",
+            "window.close:forceDocumentHistory",
+            "window.minimize:forceDocumentHistory",
+            "window.toggleMaximize.other",
+        ] {
+            let payload = serde_json::json!({"commandId": command});
+            assert!(
+                validate_plugin_panel_event(&label, event, &payload).is_err(),
+                "{command}"
+            );
+            assert!(
+                super::PluginPanelShortcut::parse(&payload).is_err(),
+                "{command}"
+            );
+        }
+        for allowed in [
+            "window.minimizeAll",
+            "document.closeTabs",
+            "view.window.close",
+        ] {
+            let payload = serde_json::json!({"commandId": allowed});
+            assert!(
+                validate_plugin_panel_event(&label, event, &payload).is_ok(),
+                "{allowed}"
+            );
+        }
+        // window-action is a plain event: only the trusted app windows may emit at all. Plugin
+        // panels hold no emit permission, so their only route to it was the shortcut bridge.
+        let panel_capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/plugin-panel.json")).unwrap();
+        for permission in panel_capability["permissions"].as_array().unwrap() {
+            // An entry is an identifier string or an object carrying one.
+            let permission = permission
+                .as_str()
+                .or_else(|| permission["identifier"].as_str())
+                .unwrap_or_default();
+            assert!(
+                !matches!(
+                    permission,
+                    "core:default"
+                        | "core:event:default"
+                        | "core:event:allow-emit"
+                        | "core:event:allow-emit-to"
+                ),
+                "{permission}"
+            );
         }
         let request = "chemdraft://toolset-command-specs-request";
         assert!(validate_plugin_panel_event(&label, request, &serde_json::json!({})).is_ok());
@@ -6615,6 +6759,9 @@ async fn open_toolset_popover(
     focus_mode: Option<ToolsetPopoverFocusMode>,
 ) -> Result<(), String> {
     let label = toolset_popover_window_label(&toolset_id);
+    // Linux: capture the opening press's user time now, before a cold build can let later input
+    // through; the reveal stamps it on the popover before its first map.
+    utility_window::record_opening_user_time(&app, &label)?;
     let focus_mode = effective_toolset_popover_focus_mode(&label, focus_mode.unwrap_or_default());
     let _creation = lock_window_creation()?;
     if utility_windows_suspended() {
@@ -6633,6 +6780,7 @@ async fn open_toolset_popover(
         // both the warm and cold paths.
         panel_window::set_popover_content(&window, &kind)?;
         configure_toolset_popover_window(&window, focus_mode)?;
+        attach_toolset_popover_to_owner(&window, &toolset_id)?;
         window
             .set_title(toolset_popover_title(&label, &kind))
             .map_err(|error| error.to_string())?;
@@ -6758,6 +6906,7 @@ fn build_toolset_popover_window(
     disable_default_context_menus(&window);
     utility_window::prepare(&window, utility_window::Kind::Popover, native_wayland)?;
     configure_toolset_popover_window(&window, focus_mode)?;
+    attach_toolset_popover_to_owner(&window, toolset_id)?;
     install_toolset_input_focus(&window)?;
     panel_window::set_popover_content(&window, kind)?;
     // Re-assert the anchor as the FINAL step, mirroring the warm path: panel configuration
@@ -6829,6 +6978,46 @@ fn close_toolset_popover(app: tauri::AppHandle, toolset_id: String) -> Result<()
 
 fn toolset_popover_window_label(toolset_id: &str) -> String {
     format!("toolset-popover-{}", toolset_id.replace('.', "-"))
+}
+
+/// The window a popover stacks above on Linux: the palette that opened it, since every palette
+/// opens and prewarms popovers under its own toolset id. The canvas's E/Z popover has no palette,
+/// and a palette may be gone; both fall back to the document window, the builder's parent.
+#[cfg(any(target_os = "linux", test))]
+fn toolset_popover_owner_label(toolset_id: &str, window_exists: impl Fn(&str) -> bool) -> String {
+    let palette = toolset_window_label(toolset_id);
+    if window_exists(&palette) {
+        palette
+    } else {
+        MAIN_WINDOW_LABEL.to_string()
+    }
+}
+
+/// Linux: make the popover transient for the palette that owns it, so the window manager keeps
+/// it above that palette (B7: on KDE it opened behind the Main toolbar). Rechecked on every open,
+/// in case the palette's native window was rebuilt; an unchanged parent is not rewritten.
+#[cfg(target_os = "linux")]
+fn attach_toolset_popover_to_owner<R: Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    toolset_id: &str,
+) -> Result<(), String> {
+    let app = window.app_handle();
+    let owner_label =
+        toolset_popover_owner_label(toolset_id, |label| app.get_webview_window(label).is_some());
+    match app.get_webview_window(&owner_label) {
+        Some(owner) => utility_window::set_transient_owner(window, &owner),
+        None => Ok(()),
+    }
+}
+
+/// macOS keeps popovers unparented (see `toolset_popover_window_config`) and Windows orders them
+/// through their owner and `raise_among_owned_windows`.
+#[cfg(not(target_os = "linux"))]
+fn attach_toolset_popover_to_owner<R: Runtime>(
+    _window: &tauri::WebviewWindow<R>,
+    _toolset_id: &str,
+) -> Result<(), String> {
+    Ok(())
 }
 
 /// Palette popovers (colour pickers and flyouts) never take key status when they open: their
@@ -6904,11 +7093,17 @@ fn toolset_tooltip_suppressed<'a>(windows: impl IntoIterator<Item = (&'a str, bo
 /// front. The tooltip webview invokes this after sizing itself: palettes and popovers become visible
 /// through this same NSWindow::orderFront path, whereas Tauri's JS `show()` did not reliably display
 /// the focusable(false) panel.
+///
+/// Linux passes the measured `width`/`height` too: the size is pinned (min = max hints) and applied
+/// here, on the main thread, before the position and the map, so each tooltip gets its own size.
+/// macOS and Windows size the window from the webview first and pass neither.
 #[tauri::command]
 fn show_toolset_tooltip_window(
     app: tauri::AppHandle,
     x: Option<f64>,
     y: Option<f64>,
+    width: Option<f64>,
+    height: Option<f64>,
 ) -> Result<(), String> {
     if utility_windows_suspended() {
         return Ok(());
@@ -6929,6 +7124,18 @@ fn show_toolset_tooltip_window(
     let Some(window) = app.get_webview_window(TOOLSET_TOOLTIP_WINDOW_LABEL) else {
         return Ok(());
     };
+    // Linux: a GtkWindow resize is clamped to the window's current size hints, and GTK's own
+    // non-resizable sizing could keep the previous tooltip's larger frame (a one-line tooltip in a
+    // 220x64 window). Pin this tooltip's size, then resize, before the position and the map.
+    #[cfg(target_os = "linux")]
+    if let Some((width, height)) = tooltip_content_size(width, height) {
+        let webview: &tauri::Webview = window.as_ref();
+        let size = tauri::LogicalSize::new(width, height);
+        utility_window::pin_content_fit_frame(&webview.window(), size.into())?;
+        window.set_size(size).map_err(|error| error.to_string())?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (width, height);
     // Placing and showing in one command halves the tooltip's IPC round trips (it used to be
     // monitor query → set size → set position → show, all strictly sequential).
     if let (Some(x), Some(y)) = (x, y) {
@@ -6951,6 +7158,16 @@ fn show_toolset_tooltip_window(
     // SW_SHOWNOACTIVATE keeps the hidden window's old z-order, which left the tooltip behind the
     // palette it describes.
     raise_among_owned_windows(&window)
+}
+
+/// A tooltip size the show command may apply: both sides given, finite and positive.
+#[cfg(any(target_os = "linux", test))]
+fn tooltip_content_size(width: Option<f64>, height: Option<f64>) -> Option<(f64, f64)> {
+    let (width, height) = (width?, height?);
+    [width, height]
+        .into_iter()
+        .all(|n| n.is_finite() && n > 0.0)
+        .then_some((width, height))
 }
 
 /// Raise a just-shown floating window above its siblings (the palettes and the other utility
@@ -7074,10 +7291,21 @@ fn show_toolset_popover_window(
     } else {
         window.show().map_err(|error| error.to_string())?;
     }
+    // Linux: map it as the answer to the opening press (its user time, recorded by
+    // open_toolset_popover), so KWin neither refuses it nor marks a newly created popover as
+    // demanding attention. Windows shows it with SW_SHOWNOACTIVATE and
+    // macOS orders it front above; neither has a user time to carry.
+    #[cfg(target_os = "linux")]
+    utility_window::stamp_user_time(&window)?;
     #[cfg(not(target_os = "macos"))]
     // `focus: false` at creation makes Tao use SW_SHOWNOACTIVATE on Windows.
     // Keep its visibility state in sync (a raw ShowWindow alone breaks later hide()).
     utility_window::set_visible(&window, true)?;
+    // Linux: a restack request, not gtk_window_present, so the document keeps focus. KWin's
+    // focus-stealing prevention maps the non-activating popover under the active application's
+    // windows; this raise and its palette parent (attach_toolset_popover_to_owner) lift it again.
+    #[cfg(target_os = "linux")]
+    utility_window::raise(&window)?;
     raise_among_owned_windows(&window)?;
     let visibility = window.is_visible();
     #[cfg(windows)]
@@ -7099,6 +7327,10 @@ fn show_toolset_popover_window(
 /// strand the tooltip visible over the palette.
 #[tauri::command]
 fn hide_toolset_tooltip_window(app: tauri::AppHandle) -> Result<(), String> {
+    hide_toolset_tooltip(&app)
+}
+
+fn hide_toolset_tooltip<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
     let Some(window) = app.get_webview_window(TOOLSET_TOOLTIP_WINDOW_LABEL) else {
         return Ok(());
     };
@@ -7271,7 +7503,25 @@ fn resize_toolset_window(
     let window_scale = window.scale_factor().unwrap_or(scale);
     let position = window.outer_position().map_err(|error| error.to_string())?;
     let origin = (position.x, position.y);
-    let mut placement = toolset_content_placement(origin, (width, height), scale, area);
+    let label = window.label();
+    // A palette ChemDraft moved to fit a smaller work area starts from the user's saved position,
+    // so it returns there once the work area can hold it again (B9).
+    let fitted = toolset_fit::with_memory(|memory| memory.is_fitted(label));
+    let source = fitted
+        .then(|| saved_toolset_state(app, label))
+        .flatten()
+        .and_then(|state| {
+            let saved = state.position()?;
+            let saved_scale = state
+                .position_scale
+                .unwrap_or_else(|| window.scale_factor().unwrap_or(scale));
+            Some((
+                (saved.x * saved_scale).round() as i32,
+                (saved.y * saved_scale).round() as i32,
+            ))
+        })
+        .unwrap_or(origin);
+    let mut placement = toolset_content_placement(source, (width, height), scale, area);
     // Linux: a palette wider than its work area is capped to it and moved to the area's left edge,
     // the one place it fits (toolset_content_placement). Keep that move rather than the old origin.
     #[cfg(target_os = "linux")]
@@ -7279,7 +7529,7 @@ fn resize_toolset_window(
     #[cfg(not(target_os = "linux"))]
     let keep_fitted_position = false;
     // The monitor under most of the palette can differ from the one under its title.
-    if placement.position != origin
+    if placement.position != source
         && !keep_fitted_position
         && monitor_query::available_monitors(app)
             .unwrap_or_default()
@@ -7289,8 +7539,8 @@ fn resize_toolset_window(
                 #[cfg(target_os = "macos")]
                 {
                     monitor_logical_work_area(monitor).contains_title_strip(
-                        f64::from(position.x) / scale,
-                        f64::from(position.y) / scale,
+                        f64::from(source.0) / scale,
+                        f64::from(source.1) / scale,
                         width,
                         TOOLSET_TITLE_HEIGHT,
                     )
@@ -7300,7 +7550,7 @@ fn resize_toolset_window(
                 #[cfg(not(target_os = "macos"))]
                 {
                     toolset_title_in_physical_work_area(
-                        origin,
+                        source,
                         width,
                         window_scale,
                         monitor.work_area(),
@@ -7308,8 +7558,29 @@ fn resize_toolset_window(
                 }
             })
     {
-        placement.position = origin;
+        placement.position = source;
     }
+    // A move made only to fit the work area is not saved as the user's position (B9).
+    let plan = toolset_fit::plan_fit(
+        placement.position == origin,
+        placement.position != source,
+        fitted,
+    );
+    let live_size = window.inner_size().map_err(|error| error.to_string())?;
+    toolset_fit::with_memory(|memory| match plan.memory {
+        toolset_fit::FitMemoryChange::Keep => {}
+        toolset_fit::FitMemoryChange::Forget => memory.forget(label),
+        toolset_fit::FitMemoryChange::Record => memory.record(
+            label,
+            toolset_fit::FittedFrame {
+                from: origin,
+                to: placement.position,
+                from_size: (live_size.width, live_size.height),
+                to_size: placement.size,
+                tolerance: toolset_fit::tolerance(scale),
+            },
+        ),
+    });
     // X11/XWayland: pin the GtkWindow to the new size before resizing it. GTK clamps a resize to
     // the window's current hints, which still hold the previous content size.
     #[cfg(target_os = "linux")]
@@ -7406,6 +7677,14 @@ fn build_toolset_tooltip_window(app: &tauri::AppHandle) -> Result<(), String> {
     }
 
     let native_wayland = utility_window::uses_native_wayland(app)?;
+    // Linux keeps the tooltip GtkWindow resizable, like the palettes: GTK sizes a non-resizable
+    // X11 window from its remembered frame, which left a smaller tooltip in the previous one's
+    // frame. Every show pins it with min = max hints instead (show_toolset_tooltip_window).
+    #[cfg(target_os = "linux")]
+    let native_resizable = true;
+    // Only Linux builds use native Wayland, so this stays false on macOS and Windows.
+    #[cfg(not(target_os = "linux"))]
+    let native_resizable = native_wayland;
     let builder = utility_window_builder(
         WebviewWindowBuilder::new(
             app,
@@ -7420,7 +7699,7 @@ fn build_toolset_tooltip_window(app: &tauri::AppHandle) -> Result<(), String> {
     .min_inner_size(16.0, 14.0)
     .accept_first_mouse(false)
     .focusable(false)
-    .resizable(native_wayland)
+    .resizable(native_resizable)
     .decorations(false)
     .skip_taskbar(true)
     .visible(false);
@@ -8625,8 +8904,14 @@ fn agent_bridge_flag_enabled(value: Option<&str>) -> bool {
     )
 }
 
+/// `diagnostic` carries the webview's half of the Interactive 3D log (session phases and how each
+/// press on the 3D view was routed). It rides on this command because the app's command set is fixed
+/// by its ACL; the webview sends it only when the status said the log is on.
 #[tauri::command]
-fn engine3d_sidecar_status() -> Engine3dSidecarStatus {
+fn engine3d_sidecar_status(diagnostic: Option<String>) -> Engine3dSidecarStatus {
+    if let Some(line) = diagnostic {
+        engine3d_log(format_args!("webview: {}", engine3d_log_text(&line)));
+    }
     engine3d_sidecar_status_from(std::env::var(ENGINE3D_SIDECAR_ENV_VAR).ok())
 }
 
@@ -8636,7 +8921,7 @@ fn engine3d_sidecar_start_session(
     sessions: tauri::State<'_, Engine3dSidecarSessions>,
 ) -> Result<Engine3dSidecarSessionOutput, String> {
     let lines = normalize_engine3d_protocol_lines(lines, true)?;
-    let path = resolve_engine3d_sidecar_path(std::env::var(ENGINE3D_SIDECAR_ENV_VAR).ok())
+    let (path, _) = resolve_engine3d_sidecar(std::env::var(ENGINE3D_SIDECAR_ENV_VAR).ok())
         .ok_or_else(|| {
             format!(
                 "Interactive 3D sidecar is not configured. Set {ENGINE3D_SIDECAR_ENV_VAR} to a sidecar executable or bundle {}.",
@@ -8673,15 +8958,31 @@ fn engine3d_sidecar_stop_session(
     stop_engine3d_sidecar_session(&process_session_id, &sessions)
 }
 
+/// Interactive 3D needs the 3D sidecar. A build where neither the override nor the bundled binary
+/// can run (missing, a `binaries/` placeholder, or not executable) cannot gain one while it runs,
+/// so the Structure menu leaves the item out for the session instead of showing it disabled
+/// (AGENTS.md §10). The webview applies the same rule to toolbars and the gallery
+/// (`sessionUnavailableCommandIds`).
+fn interactive3d_menu_item_shown() -> bool {
+    static SHOWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SHOWN.get_or_init(|| engine3d_sidecar_status(None).available)
+}
+
 fn engine3d_sidecar_status_from(env_override: Option<String>) -> Engine3dSidecarStatus {
-    let resolved_path = resolve_engine3d_sidecar_path(env_override.clone());
-    let source = if resolved_path.is_some() && env_override.is_some() {
-        "environment"
-    } else if resolved_path.is_some() {
-        "bundled"
-    } else {
-        "missing"
-    };
+    let executable = std::env::current_exe().ok();
+    engine3d_sidecar_status_in(env_override, executable.as_deref().and_then(Path::parent))
+}
+
+/// The status for a sidecar resolved against `executable_dir`. The source comes from the branch
+/// that chose the path: an override that cannot run falls back to the bundled sidecar, and the
+/// status then says "bundled", not "environment".
+fn engine3d_sidecar_status_in(
+    env_override: Option<String>,
+    executable_dir: Option<&Path>,
+) -> Engine3dSidecarStatus {
+    let resolved = resolve_engine3d_sidecar_in(env_override.clone(), executable_dir);
+    let source = resolved.as_ref().map_or("missing", |(_, source)| *source);
+    let resolved_path = resolved.map(|(path, _)| path);
 
     Engine3dSidecarStatus {
         available: resolved_path.is_some(),
@@ -8692,7 +8993,94 @@ fn engine3d_sidecar_status_from(env_override: Option<String>) -> Engine3dSidecar
         resolved_path: resolved_path.map(|path| path.to_string_lossy().to_string()),
         bundled_binary_name: engine3d_bundled_binary_name(),
         target_triple: engine3d_target_triple().to_string(),
+        log_enabled: engine3d_log_enabled(),
     }
+}
+
+fn engine3d_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        engine3d_log_flag_enabled(std::env::var(ENGINE3D_LOG_ENV_VAR).ok().as_deref())
+    })
+}
+
+fn engine3d_log_flag_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.trim() == "1")
+}
+
+/// One line of the opt-in Interactive 3D diagnostic: every sidecar start, exit and stop, the kind of
+/// every protocol message in each direction (`engine3d_protocol_line_summary`), the sidecar's own
+/// stderr, and the webview's phases and press routing. The tester reads it to tell "no input reached
+/// the 3D view" from "the sidecar never answered" from "the answer never reached the view".
+///
+/// Best effort: `eprintln!` panics when stderr rejects the write, which could interrupt a session
+/// start after the child spawned, or poison the session lock mid-send so stop could not clean up.
+fn engine3d_log(message: std::fmt::Arguments<'_>) {
+    if engine3d_log_enabled() {
+        let _ = writeln!(std::io::stderr(), "[engine3d] {message}");
+    }
+}
+
+fn engine3d_log_lines(process_session_id: &str, direction: &str, lines: &[String]) {
+    if !engine3d_log_enabled() {
+        return;
+    }
+    for line in lines {
+        engine3d_log(format_args!(
+            "{process_session_id} {direction} {}",
+            engine3d_protocol_line_summary(line)
+        ));
+    }
+}
+
+/// A protocol line as its type and the fields that say what happened (event type, ok/error, reason,
+/// error text, request id), never its payload: coordinates and molfiles would bury the sequence.
+/// Every field is untrusted text: a decoded `\n` in any of them must not start a second log line.
+fn engine3d_protocol_line_summary(line: &str) -> String {
+    let Ok(serde_json::Value::Object(message)) = serde_json::from_str::<serde_json::Value>(line)
+    else {
+        return format!("unparsed line ({} bytes)", line.len());
+    };
+    let raw = |key: &str| message.get(key).and_then(serde_json::Value::as_str);
+    let text = |key: &str| raw(key).map(engine3d_log_field);
+    let mut summary = text("type").unwrap_or_else(|| "untyped".to_string());
+    if let Some(event_type) = text("eventType") {
+        summary.push(' ');
+        summary.push_str(&event_type);
+    }
+    match message.get("ok").and_then(serde_json::Value::as_bool) {
+        Some(true) => summary.push_str(" ok"),
+        Some(false) => summary.push_str(" failed"),
+        None => {}
+    }
+    if let Some(reason) = text("reason") {
+        summary.push_str(&format!(" reason={reason}"));
+    }
+    if let Some(error) = raw("error").or_else(|| raw("message")) {
+        summary.push_str(&format!(": {}", engine3d_log_text(error)));
+    }
+    if let Some(request_id) = text("requestId") {
+        summary.push_str(&format!(" ({request_id})"));
+    }
+    summary
+}
+
+/// Untrusted text for one log line: control characters become spaces and it stops at 300 chars.
+fn engine3d_log_text(text: &str) -> String {
+    engine3d_log_bounded(text, 300)
+}
+
+/// A protocol identifier (type, event type, reason, request id) for one log line: control
+/// characters become spaces and it stops at 80 chars, so metadata cannot bury the sequence.
+fn engine3d_log_field(text: &str) -> String {
+    engine3d_log_bounded(text, 80)
+}
+
+fn engine3d_log_bounded(text: &str, limit: usize) -> String {
+    text.chars()
+        .take(limit)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 fn normalize_engine3d_protocol_lines(
@@ -8727,32 +9115,36 @@ fn normalize_engine3d_protocol_lines(
         .collect()
 }
 
-fn resolve_engine3d_sidecar_path(env_override: Option<String>) -> Option<PathBuf> {
+/// The sidecar to start and where it came from (`"environment"` or `"bundled"`).
+fn resolve_engine3d_sidecar(env_override: Option<String>) -> Option<(PathBuf, &'static str)> {
+    let executable = std::env::current_exe().ok();
+    resolve_engine3d_sidecar_in(env_override, executable.as_deref().and_then(Path::parent))
+}
+
+fn resolve_engine3d_sidecar_in(
+    env_override: Option<String>,
+    executable_dir: Option<&Path>,
+) -> Option<(PathBuf, &'static str)> {
     // Development / explicit override: an absolute path to a locally built sidecar wins.
     if let Some(path) = env_override {
         let candidate = PathBuf::from(path.trim());
         #[cfg(target_os = "linux")]
         let candidate = linux_startup::user_path(&candidate).into_owned();
         if is_runnable_sidecar(&candidate) {
-            return Some(candidate);
+            return Some((candidate, "environment"));
         }
     }
     // Packaged app: Tauri bundles the `externalBin` sidecar (target-triple suffix stripped) next to
     // the main executable. Resolve it there so a normally launched bundle finds its sidecar instead
     // of reporting Interactive 3D unavailable when the env override is unset.
-    let executable_dir = std::env::current_exe().ok()?;
-    let executable_dir = executable_dir.parent()?;
+    let executable_dir = executable_dir?;
     let sidecar_name = if cfg!(windows) {
         "avogadro3d-sidecar.exe"
     } else {
         "avogadro3d-sidecar"
     };
     let bundled = executable_dir.join(sidecar_name);
-    if is_runnable_sidecar(&bundled) {
-        Some(bundled)
-    } else {
-        None
-    }
+    is_runnable_sidecar(&bundled).then_some((bundled, "bundled"))
 }
 
 /// Marker text every `binaries/` placeholder carries (see binaries/README.md).
@@ -8762,7 +9154,10 @@ const SIDECAR_PLACEHOLDER_MARKER: &[u8] = b"avogadro3d-sidecar placeholder";
 /// without a real build (Linux) are small `#!/bin/sh … exit 2` scripts: `is_file`
 /// accepted them, so status said "bundled" and every session failed when the script exited. They
 /// are recognised by their marker on every platform; Windows additionally requires a PE image
-/// (a text placeholder there failed to start with OS error 193).
+/// (a text placeholder there failed to start with OS error 193). On macOS and Linux ChemDraft must
+/// be allowed to execute the file (`access(X_OK)`, which applies the owner, group or other bits
+/// that fit this process, and ACLs): a non-executable override used to pass, win over a working
+/// bundled sidecar, and fail every session with "permission denied".
 fn is_runnable_sidecar(path: &Path) -> bool {
     if !path.is_file() || is_sidecar_placeholder(path) {
         return false;
@@ -8773,7 +9168,13 @@ fn is_runnable_sidecar(path: &Path) -> bool {
     }
     #[cfg(not(windows))]
     {
-        true
+        use std::os::unix::ffi::OsStrExt;
+
+        std::ffi::CString::new(path.as_os_str().as_bytes()).is_ok_and(|path| {
+            // SAFETY: `path` is a NUL-terminated string that outlives the call; access only
+            // reads it.
+            unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
+        })
     }
 }
 
@@ -8825,7 +9226,18 @@ fn start_engine3d_sidecar_session_from_path(
         .stderr(Stdio::piped())
         .without_console_window()
         .spawn()
-        .map_err(|error| format!("Could not start interactive 3D sidecar: {error}"))?;
+        .map_err(|error| {
+            engine3d_log(format_args!(
+                "{process_session_id} could not start {}: {error}",
+                path.display()
+            ));
+            format!("Could not start interactive 3D sidecar: {error}")
+        })?;
+    engine3d_log(format_args!(
+        "{process_session_id} started {} (pid {})",
+        path.display(),
+        child.id()
+    ));
 
     let stdout = child
         .stdout
@@ -8840,9 +9252,10 @@ fn start_engine3d_sidecar_session_from_path(
         child,
         stdout_rx: spawn_engine3d_line_reader(stdout),
         stderr_rx: spawn_engine3d_line_reader(stderr),
+        exit_logged: false,
     };
 
-    write_engine3d_protocol_lines(&mut session, lines)?;
+    write_engine3d_protocol_lines(&process_session_id, &mut session, lines)?;
     let mut output = collect_engine3d_session_output(
         &process_session_id,
         &mut session,
@@ -8898,7 +9311,7 @@ fn send_engine3d_sidecar_session_lines(
     let mut session = handle
         .lock()
         .map_err(|_| "Interactive 3D sidecar session state is poisoned.".to_string())?;
-    write_engine3d_protocol_lines(&mut session, lines)?;
+    write_engine3d_protocol_lines(process_session_id, &mut session, lines)?;
     Ok(collect_engine3d_session_output(
         process_session_id,
         &mut session,
@@ -8941,6 +9354,7 @@ fn stop_engine3d_sidecar_session(
     let mut session = handle
         .lock()
         .map_err(|_| "Interactive 3D sidecar session state is poisoned.".to_string())?;
+    engine3d_log(format_args!("{process_session_id} stopping"));
     drop(session.stdin.take());
     let graceful_started = Instant::now();
     loop {
@@ -8963,6 +9377,9 @@ fn stop_engine3d_sidecar_session(
         .map_err(|error| format!("Could not poll interactive 3D sidecar: {error}"))?
         .is_none()
     {
+        engine3d_log(format_args!(
+            "{process_session_id} did not exit after stdin closed; killing it"
+        ));
         let _ = session.child.kill();
     }
     let _ = session.child.wait();
@@ -8975,22 +9392,37 @@ fn stop_engine3d_sidecar_session(
 }
 
 fn write_engine3d_protocol_lines(
+    process_session_id: &str,
     session: &mut Engine3dManagedSession,
     lines: &[String],
 ) -> Result<(), String> {
-    let stdin = session
-        .stdin
-        .as_mut()
-        .ok_or_else(|| "Interactive 3D sidecar stdin is not available.".to_string())?;
+    let Some(stdin) = session.stdin.as_mut() else {
+        engine3d_log(format_args!(
+            "{process_session_id} -> not sent: stdin is not available"
+        ));
+        return Err("Interactive 3D sidecar stdin is not available.".to_string());
+    };
+    // Each line is traced only once its newline is written, so a pipe that closes mid-batch never
+    // shows the unwritten lines as sent.
     for line in lines {
-        stdin
+        if let Err(error) = stdin
             .write_all(line.as_bytes())
             .and_then(|_| stdin.write_all(b"\n"))
-            .map_err(|error| format!("Could not write interactive 3D protocol: {error}"))?;
+        {
+            engine3d_log(format_args!(
+                "{process_session_id} -> write failed: {} ({error})",
+                engine3d_protocol_line_summary(line)
+            ));
+            return Err(format!("Could not write interactive 3D protocol: {error}"));
+        }
+        engine3d_log_lines(process_session_id, "->", std::slice::from_ref(line));
     }
-    stdin
-        .flush()
-        .map_err(|error| format!("Could not flush interactive 3D protocol: {error}"))
+    stdin.flush().map_err(|error| {
+        engine3d_log(format_args!(
+            "{process_session_id} -> flush failed ({error})"
+        ));
+        format!("Could not flush interactive 3D protocol: {error}")
+    })
 }
 
 fn collect_engine3d_session_output(
@@ -9031,6 +9463,17 @@ fn collect_engine3d_session_output(
     let status = session.child.try_wait().ok().flatten();
     let exited = status.is_some();
     let exit_code = status.and_then(|status| status.code());
+    engine3d_log_lines(process_session_id, "<-", &stdout_lines);
+    for line in &stderr_lines {
+        engine3d_log(format_args!(
+            "{process_session_id} stderr: {}",
+            engine3d_log_text(line)
+        ));
+    }
+    if let Some(status) = status.filter(|_| !session.exit_logged) {
+        session.exit_logged = true;
+        engine3d_log(format_args!("{process_session_id} exited ({status})"));
+    }
 
     Engine3dSidecarSessionOutput {
         process_session_id: process_session_id.to_string(),
@@ -10255,16 +10698,20 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                 true,
                 None::<&str>,
             )?,
+        ],
+    )?;
+    if interactive3d_menu_item_shown() {
+        structure_menu.append_items(&[
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(
                 app,
-                "structure.openInteractive3d",
+                STRUCTURE_INTERACTIVE3D_COMMAND_ID,
                 "Interactive 3D Workspace...",
                 true,
                 None::<&str>,
             )?,
-        ],
-    )?;
+        ])?;
+    }
     let structure_plugin_items = plugin_menu_items_in(plugin_items, "structure");
     if !structure_plugin_items.is_empty() {
         structure_menu.append(&PredefinedMenuItem::separator(app)?)?;
@@ -10546,9 +10993,9 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                     #[cfg(not(target_os = "linux"))]
                     &PredefinedMenuItem::maximize(app, None)?,
                     #[cfg(target_os = "linux")]
-                    &linux_window_menu_item(app, LINUX_MINIMIZE_MENU_ID)?,
+                    &linux_window_menu_item(app, WINDOW_MINIMIZE_COMMAND_ID)?,
                     #[cfg(target_os = "linux")]
-                    &linux_window_menu_item(app, LINUX_TOGGLE_MAXIMIZE_MENU_ID)?,
+                    &linux_window_menu_item(app, WINDOW_TOGGLE_MAXIMIZE_COMMAND_ID)?,
                     &PredefinedMenuItem::separator(app)?,
                     #[cfg(target_os = "macos")]
                     &close_window_menu_item(
@@ -10559,7 +11006,7 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                     #[cfg(windows)]
                     &PredefinedMenuItem::close_window(app, None)?,
                     #[cfg(target_os = "linux")]
-                    &linux_window_menu_item(app, LINUX_CLOSE_WINDOW_WINDOW_MENU_ID)?,
+                    &linux_window_menu_item(app, WINDOW_CLOSE_COMMAND_ID)?,
                 ],
             )?,
             // macOS keeps About in the application menu; elsewhere Help is its home.
@@ -10616,21 +11063,42 @@ enum LinuxWindowMenuAction {
     Close,
 }
 
+/// The registry command a Linux menu item routes as. File ▸ Close Window's own menu id becomes
+/// `window.close`; every other menu id already is its command id.
 #[cfg(any(target_os = "linux", test))]
-fn linux_window_menu_action(command_id: &str) -> Option<LinuxWindowMenuAction> {
-    match command_id {
-        LINUX_MINIMIZE_MENU_ID => Some(LinuxWindowMenuAction::Minimize),
-        LINUX_TOGGLE_MAXIMIZE_MENU_ID => Some(LinuxWindowMenuAction::ToggleMaximize),
-        LINUX_CLOSE_WINDOW_FILE_MENU_ID | LINUX_CLOSE_WINDOW_WINDOW_MENU_ID => {
-            Some(LinuxWindowMenuAction::Close)
-        }
-        _ => None,
+fn linux_menu_command_id(menu_id: &str) -> &str {
+    if menu_id == LINUX_CLOSE_WINDOW_FILE_MENU_ID {
+        WINDOW_CLOSE_COMMAND_ID
+    } else {
+        menu_id
     }
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn linux_window_menu_title(command_id: &str) -> &'static str {
-    match linux_window_menu_action(command_id) {
+fn linux_window_command_action(command_id: &str) -> Option<LinuxWindowMenuAction> {
+    match command_id {
+        WINDOW_MINIMIZE_COMMAND_ID => Some(LinuxWindowMenuAction::Minimize),
+        WINDOW_TOGGLE_MAXIMIZE_COMMAND_ID => Some(LinuxWindowMenuAction::ToggleMaximize),
+        WINDOW_CLOSE_COMMAND_ID => Some(LinuxWindowMenuAction::Close),
+        _ => None,
+    }
+}
+
+/// The action a `WINDOW_ACTION_EVENT` payload (`{ "commandId": "window.minimize" }`) asks for.
+#[cfg(any(target_os = "linux", test))]
+fn linux_window_action_request(payload: &str) -> Option<LinuxWindowMenuAction> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Request {
+        command_id: String,
+    }
+    let request = serde_json::from_str::<Request>(payload).ok()?;
+    linux_window_command_action(&request.command_id)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_window_menu_title(menu_id: &str) -> &'static str {
+    match linux_window_command_action(linux_menu_command_id(menu_id)) {
         Some(LinuxWindowMenuAction::Minimize) => "Minimize",
         Some(LinuxWindowMenuAction::ToggleMaximize) => "Maximize / Restore",
         Some(LinuxWindowMenuAction::Close) | None => "Close Window",
@@ -10645,6 +11113,25 @@ fn linux_window_menu_item<R: Runtime>(
     id: &str,
 ) -> tauri::Result<MenuItem<R>> {
     MenuItem::with_id(app, id, linux_window_menu_title(id), true, None::<&str>)
+}
+
+/// The window commands' native half. It acts only on the document window. Only the trusted app
+/// windows in the default capability may emit events; plugin panels may only listen, and their
+/// shortcut bridge refuses these commands (`panel_shortcut_reaches_document_window`). The webview
+/// half sends only from the document window (`requestWindowAction` in windowCommands.ts).
+#[cfg(target_os = "linux")]
+fn listen_for_linux_window_actions(app: &tauri::AppHandle) {
+    let target = app.clone();
+    app.listen(
+        WINDOW_ACTION_EVENT,
+        move |event| match linux_window_action_request(event.payload()) {
+            Some(action) => run_linux_window_menu_action(&target, action),
+            None => eprintln!(
+                "Ignored an unknown ChemDraft window action: {}",
+                event.payload()
+            ),
+        },
+    );
 }
 
 /// The GTK menu bar belongs to the document window, so these act on it. Close goes through
@@ -11087,18 +11574,59 @@ fn ensure_toolset_window<R: Runtime>(
     // A persisted position wins (the user moved it before); otherwise the JS-supplied default.
     // Either way it's clamped onto an attached monitor — a position saved on a display that's since
     // been unplugged would otherwise open the palette offscreen with no way to get it back.
-    let position = saved
-        .and_then(PersistedToolsetState::position)
-        .unwrap_or(default_position);
+    let saved_position = saved.and_then(PersistedToolsetState::position);
+    // Linux and Windows carry the menu bar inside the document window: a first-ever placement
+    // stays clear of it, so the Main toolbar never covers the menus. Saved positions are the user's.
+    let position = saved_position.unwrap_or_else(|| {
+        toolset_fit::position_clear_of_document_chrome(
+            default_position,
+            (width, height),
+            document_chrome_frame(app),
+            TOOLSET_DOCUMENT_CHROME_GAP,
+        )
+    });
+    // A saved frame squeezed onto a smaller work area at creation is a fit, not a new user frame:
+    // its creation events must not overwrite the saved one (B9).
+    let record_creation_fit = |to: (i32, i32), to_size: (u32, u32), scale: f64| {
+        toolset_fit::with_memory(|memory| {
+            memory.record(
+                &label,
+                toolset_fit::FittedFrame {
+                    from: to,
+                    to,
+                    from_size: to_size,
+                    to_size,
+                    tolerance: toolset_fit::tolerance(scale),
+                },
+            )
+        });
+    };
     #[cfg(not(windows))]
-    let (position, width, height) = clamp_toolset_frame(app, position, (width, height), resizable);
+    let (position, width, height) = {
+        let (position, width, height, adjusted) =
+            clamp_toolset_frame(app, &label, position, (width, height), resizable);
+        if adjusted && saved_position.is_some() {
+            let scale = scale_at_logical_point(app, position.x, position.y);
+            let to = tauri::LogicalPosition::new(position.x, position.y).to_physical::<i32>(scale);
+            let to_size = tauri::LogicalSize::new(width, height).to_physical::<u32>(scale);
+            record_creation_fit((to.x, to.y), (to_size.width, to_size.height), scale);
+        }
+        (position, width, height)
+    };
     #[cfg(windows)]
     let placement = clamp_windows_toolset_frame(
         app,
+        &label,
         ToolsetFrameOrigin::Logical(position, saved.and_then(|state| state.position_scale)),
         (width, height),
         resizable,
-    );
+    )
+    .map(|(placement, adjusted)| {
+        if adjusted && saved_position.is_some() {
+            record_creation_fit(placement.position, placement.size, placement.scale);
+        }
+        placement
+    });
 
     // Keep every palette GtkWindow resizable on Linux. On native Wayland, a non-resizable
     // GtkWindow's fixed size hints can conflict with the compositor's configure (Weston's kiosk
@@ -11110,7 +11638,11 @@ fn ensure_toolset_window<R: Runtime>(
     let native_resizable = true;
     #[cfg(not(target_os = "linux"))]
     let native_resizable = resizable;
-    let native_wayland = utility_window::uses_native_wayland(app)?;
+    // A creation that fails from here on leaves no window, so no Destroyed event clears a fit
+    // recorded above; a stale one would swallow the next window's first matching Moved or Resized.
+    let forget_creation_fit = || toolset_fit::with_memory(|memory| memory.forget(&label));
+    let native_wayland =
+        utility_window::uses_native_wayland(app).inspect_err(|_| forget_creation_fit())?;
 
     windows_activation_log::frame_set(&label, "toolbar creation", "logical", || {
         ((position.x, position.y), (width, height))
@@ -11124,7 +11656,8 @@ fn ensure_toolset_window<R: Runtime>(
             ),
         ),
         app,
-    )?
+    )
+    .inspect_err(|_| forget_creation_fit())?
     .title(title)
     .inner_size(width, height)
     .accept_first_mouse(true)
@@ -11155,7 +11688,7 @@ fn ensure_toolset_window<R: Runtime>(
     // Only scrolling inspectors need a floor for manual resize. A toolbar's frame is fixed
     // at the DOM's measured size until the next fit. A floor here would leave narrow grids padded.
     let builder = if resizable {
-        builder.min_inner_size(96.0, 56.0)
+        builder.min_inner_size(TOOLSET_INSPECTOR_MIN_SIZE.0, TOOLSET_INSPECTOR_MIN_SIZE.1)
     } else {
         builder
     };
@@ -11173,6 +11706,7 @@ fn ensure_toolset_window<R: Runtime>(
             if let Ok(mut labels) = app.state::<ToolsetWindowDirectory>().labels.lock() {
                 labels.remove(&label);
             }
+            forget_creation_fit();
             return Err(error.to_string());
         }
     };
@@ -11194,6 +11728,7 @@ fn ensure_toolset_window<R: Runtime>(
     utility_window::prepare(&window, utility_window::Kind::Toolbar, native_wayland)?;
     configure_toolset_utility_window(&window, true)?;
     install_toolset_input_focus(&window)?;
+    install_toolset_pointer_leave(&window, toolset_id)?;
     #[cfg(target_os = "linux")]
     utility_window::set_visible(&window, true)?;
     #[cfg(windows)]
@@ -11223,6 +11758,33 @@ fn install_toolset_input_focus<R: Runtime>(window: &tauri::WebviewWindow<R>) -> 
     let installed =
         run_on_main_thread_blocking(window, move || panel_window::install_input_focus(&target))
             .and_then(|result| result);
+    panel_window::finish_installation(installed, || {
+        window.destroy().map_err(|error| error.to_string())
+    })
+}
+
+/// Linux (B5): when the pointer leaves a palette, or another window covers it, hide the shared
+/// tooltip at once and tell the palette, which clears its tooltip state (PaletteWindow). WebKitGTK
+/// did not always deliver the DOM pointerleave, and the tooltip stayed up until the next hover.
+/// A no-op on macOS and Windows (utility_window::on_pointer_leave).
+fn install_toolset_pointer_leave<R: Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    toolset_id: &str,
+) -> Result<(), String> {
+    let app = window.app_handle().clone();
+    let label = window.label().to_owned();
+    let toolset_id = toolset_id.to_owned();
+    let installed = utility_window::on_pointer_leave(window, move || {
+        // Best-effort: the palette's own hide below still runs if the native hide fails.
+        let _ = hide_toolset_tooltip(&app);
+        let _ = app.emit_to(
+            label.as_str(),
+            PALETTE_POINTER_LEAVE_EVENT,
+            PalettePointerLeavePayload {
+                toolset_id: toolset_id.clone(),
+            },
+        );
+    });
     panel_window::finish_installation(installed, || {
         window.destroy().map_err(|error| error.to_string())
     })
@@ -11314,7 +11876,7 @@ struct PalettePointerPayload {
     y: f64,
 }
 
-#[cfg(target_os = "macos")]
+/// The PALETTE_POINTER_LEAVE_EVENT payload, on every platform that emits it (see that constant).
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PalettePointerLeavePayload {
@@ -11594,12 +12156,55 @@ fn toolset_toggle_command_id(toolset_id: &str) -> String {
 
 fn is_routed_menu_command(command_id: &str) -> bool {
     MENU_COMMAND_IDS.contains(&command_id)
+        || (cfg!(target_os = "linux") && LINUX_WINDOW_COMMAND_IDS.contains(&command_id))
         || native_clipboard_edit_command(command_id).is_some()
         || command_id.starts_with(TOOLSET_TOGGLE_PREFIX)
         || command_id.starts_with(PLUGIN_COMMAND_PREFIX)
 }
 
 const TOOLSET_TITLE_HEIGHT: f64 = 22.0;
+/// The Main toolbar, which stacks above the other palettes (`DEFAULT_TOOLSET_ID` in TypeScript).
+const MAIN_TOOLSET_ID: &str = "core.main";
+/// The smallest a scrolling inspector may be resized to (its builder's `min_inner_size`).
+const TOOLSET_INSPECTOR_MIN_SIZE: (f64, f64) = (96.0, 56.0);
+/// Space between the document window's menu bar and a palette placed below it.
+const TOOLSET_DOCUMENT_CHROME_GAP: f64 = 8.0;
+/// Height of the menu bar GTK draws inside the document window's client area (Breeze and Adwaita
+/// draw about 26-30 px at scale 1; this errs on the side of clearing it).
+#[cfg(target_os = "linux")]
+const DOCUMENT_IN_CLIENT_MENU_BAR_HEIGHT: f64 = 32.0;
+/// Windows draws the menu bar in the non-client area, above the client origin.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const DOCUMENT_IN_CLIENT_MENU_BAR_HEIGHT: f64 = 0.0;
+
+/// The document window's title and menu bars in global logical points, where a palette's first
+/// placement must not go. `None` while it is hidden or minimized.
+#[cfg(not(target_os = "macos"))]
+fn document_chrome_frame<R: Runtime>(app: &tauri::AppHandle<R>) -> Option<ScreenRect> {
+    let document = app.get_webview_window(MAIN_WINDOW_LABEL)?;
+    if !document.is_visible().unwrap_or(false) || document.is_minimized().unwrap_or(true) {
+        return None;
+    }
+    let scale = document
+        .scale_factor()
+        .ok()
+        .filter(|scale| scale.is_finite() && *scale > 0.0)?;
+    let outer = document.outer_position().ok()?;
+    let inner = document.inner_position().ok()?;
+    let width = document.outer_size().ok()?.width;
+    Some(toolset_fit::document_chrome(
+        (f64::from(outer.x) / scale, f64::from(outer.y) / scale),
+        f64::from(inner.y) / scale,
+        f64::from(width) / scale,
+        DOCUMENT_IN_CLIENT_MENU_BAR_HEIGHT,
+    ))
+}
+
+/// macOS uses the global menu bar, so a palette cannot cover the document's menus (unchanged).
+#[cfg(target_os = "macos")]
+fn document_chrome_frame<R: Runtime>(_app: &tauri::AppHandle<R>) -> Option<ScreenRect> {
+    None
+}
 
 /// A monitor's full bounds in global logical points.
 #[cfg(not(windows))]
@@ -11613,6 +12218,24 @@ fn monitor_logical_bounds(monitor: &tauri::Monitor) -> (f64, f64, f64, f64) {
         origin.x + size.width,
         origin.y + size.height,
     )
+}
+
+/// The scale of the monitor holding a global logical point (1.0 when none does).
+#[cfg(not(windows))]
+fn scale_at_logical_point<R: Runtime>(app: &tauri::AppHandle<R>, x: f64, y: f64) -> f64 {
+    monitor_query::available_monitors(app)
+        .ok()
+        .and_then(|monitors| {
+            monitors
+                .iter()
+                .find(|monitor| {
+                    let (left, top, right, bottom) = monitor_logical_bounds(monitor);
+                    (left..right).contains(&x) && (top..bottom).contains(&y)
+                })
+                .map(tauri::Monitor::scale_factor)
+        })
+        .filter(|scale| scale.is_finite() && *scale > 0.0)
+        .unwrap_or(1.0)
 }
 
 /// A monitor's work area (minus menu bar and Dock) in the same logical points.
@@ -11662,19 +12285,23 @@ fn inspector_frame_in_work_area(
 /// created successfully and painted into nowhere — which reads to the user as "the toolbar won't
 /// open" even though View ▸ Toolbars shows it checked, with no UI path to recover it. Clamp onto the
 /// primary monitor (the one that's certainly present) whenever the saved spot is unreachable.
+///
+/// Returns the frame and whether it differs from the one given. A frame this moves also keeps its
+/// title strip out from under the Main toolbar (`label` is the palette being placed).
 #[cfg(not(windows))]
 fn clamp_toolset_frame<R: Runtime>(
     app: &tauri::AppHandle<R>,
+    label: &str,
     position: ToolsetWindowPosition,
     size: (f64, f64),
     resizable: bool,
-) -> (ToolsetWindowPosition, f64, f64) {
+) -> (ToolsetWindowPosition, f64, f64, bool) {
     let (width, height) = size;
     let monitors = match monitor_query::available_monitors(app) {
         Ok(monitors) if !monitors.is_empty() => monitors,
         // No monitor info (headless, or the platform refused): trust the saved position rather than
         // moving a window the user may have deliberately placed.
-        _ => return (position, width, height),
+        _ => return (position, width, height, false),
     };
 
     let areas = monitors
@@ -11691,7 +12318,89 @@ fn clamp_toolset_frame<R: Runtime>(
         let primary = monitor_query::primary_monitor(app).ok().flatten();
         monitor_logical_work_area(primary.as_ref().unwrap_or(&monitors[0]))
     });
-    toolset_frame_in_work_area(position, size, resizable, area)
+    let (clamped, width, height) = toolset_frame_in_work_area(position, size, resizable, area);
+    if !toolset_frame_differs(position, size, clamped, (width, height)) {
+        return (clamped, width, height, false);
+    }
+    let Some((toolbar, scale)) = main_toolbar_frame(app, label) else {
+        return (clamped, width, height, true);
+    };
+    let toolbar = ScreenRect::new(
+        toolbar.x / scale,
+        toolbar.y / scale,
+        toolbar.width / scale,
+        toolbar.height / scale,
+    );
+    let (clamped, width, height, _) = toolset_fit::frame_clear_of_toolbar(
+        clamped,
+        (width, height),
+        resizable,
+        area,
+        toolbar,
+        TOOLSET_TITLE_HEIGHT,
+        TOOLSET_INSPECTOR_MIN_SIZE.1,
+    );
+    (clamped, width, height, true)
+}
+
+/// Whether two logical palette frames differ by half a point or more on any edge.
+fn toolset_frame_differs(
+    position: ToolsetWindowPosition,
+    size: (f64, f64),
+    other_position: ToolsetWindowPosition,
+    other_size: (f64, f64),
+) -> bool {
+    [
+        position.x - other_position.x,
+        position.y - other_position.y,
+        size.0 - other_size.0,
+        size.1 - other_size.1,
+    ]
+    .into_iter()
+    .any(|difference| difference.abs() >= 0.5)
+}
+
+/// The Main toolbar's live outer frame in physical pixels, and its scale, unless it is the palette
+/// being placed or is hidden or minimized.
+fn main_toolbar_frame<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    placing_label: &str,
+) -> Option<(ScreenRect, f64)> {
+    let label = toolset_window_label(MAIN_TOOLSET_ID);
+    if label == placing_label {
+        return None;
+    }
+    let window = app.get_webview_window(&label)?;
+    if !window.is_visible().unwrap_or(false) || window.is_minimized().unwrap_or(true) {
+        return None;
+    }
+    let scale = window.scale_factor().ok()?;
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let position = window.outer_position().ok()?;
+    let size = window.outer_size().ok()?;
+    Some((
+        ScreenRect::new(
+            f64::from(position.x),
+            f64::from(position.y),
+            f64::from(size.width),
+            f64::from(size.height),
+        ),
+        scale,
+    ))
+}
+
+/// A palette's saved layout entry, read through its window label.
+fn saved_toolset_state<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    label: &str,
+) -> Option<PersistedToolsetState> {
+    let toolset_id = toolset_id_for_window_label(app, label)?;
+    load_toolset_layout_state(app)
+        .toolsets
+        .get(&toolset_id)
+        .cloned()
 }
 
 #[cfg(any(not(windows), test))]
@@ -11759,9 +12468,7 @@ fn monitor_containing_physical_point(
         .find(|monitor| toolset_monitor_contains(monitor, point))
 }
 
-/// Select a Windows monitor in virtual-desktop pixels. Only after selecting it do we use its
-/// scale to clamp the frame in monitor-local points and convert it back to pixels.
-#[cfg(any(windows, test))]
+#[cfg(test)]
 fn clamp_toolset_frame_in_physical_space(
     origin: ToolsetFrameOrigin,
     size: (f64, f64),
@@ -11769,6 +12476,23 @@ fn clamp_toolset_frame_in_physical_space(
     monitors: &[ToolsetMonitor],
     primary: &ToolsetMonitor,
 ) -> panel_window_frame::Placement {
+    clamp_toolset_frame_in_physical_space_clear_of(origin, size, resizable, monitors, primary, None)
+        .0
+}
+
+/// Select a Windows monitor in virtual-desktop pixels. Only after selecting it do we use its
+/// scale to clamp the frame in monitor-local points and convert it back to pixels. A frame this
+/// moves keeps its title strip out from under `toolbar` (the Main toolbar's frame in virtual-desktop
+/// pixels). Also returns whether the frame differs from the one given.
+#[cfg(any(windows, test))]
+fn clamp_toolset_frame_in_physical_space_clear_of(
+    origin: ToolsetFrameOrigin,
+    size: (f64, f64),
+    resizable: bool,
+    monitors: &[ToolsetMonitor],
+    primary: &ToolsetMonitor,
+    toolbar: Option<ScreenRect>,
+) -> (panel_window_frame::Placement, bool) {
     let (physical, source_scale) = match origin {
         ToolsetFrameOrigin::Physical((x, y), scale) => ((f64::from(x), f64::from(y)), scale),
         ToolsetFrameOrigin::Logical(position, saved_scale) => {
@@ -11828,26 +12552,54 @@ fn clamp_toolset_frame_in_physical_space(
         x: (physical.0 - f64::from(x)) / scale,
         y: (physical.1 - f64::from(y)) / scale,
     };
-    let (position, width, height) =
+    let (clamped, width, height) =
         toolset_frame_in_work_area(position, size, resizable, monitor.work_area);
+    let adjusted = toolset_frame_differs(position, size, clamped, (width, height));
+    let (position, width, height) = match toolbar.filter(|_| adjusted) {
+        Some(toolbar) => {
+            let toolbar = ScreenRect::new(
+                (toolbar.x - f64::from(x)) / scale,
+                (toolbar.y - f64::from(y)) / scale,
+                toolbar.width / scale,
+                toolbar.height / scale,
+            );
+            let (position, width, height, _) = toolset_fit::frame_clear_of_toolbar(
+                clamped,
+                (width, height),
+                resizable,
+                monitor.work_area,
+                toolbar,
+                TOOLSET_TITLE_HEIGHT,
+                TOOLSET_INSPECTOR_MIN_SIZE.1,
+            );
+            (position, width, height)
+        }
+        None => (clamped, width, height),
+    };
     let size = tauri::LogicalSize::new(width, height).to_physical::<u32>(scale);
-    panel_window_frame::Placement {
-        position: (
-            (f64::from(x) + position.x * scale).round() as i32,
-            (f64::from(y) + position.y * scale).round() as i32,
-        ),
-        size: (size.width, size.height),
-        scale,
-    }
+    (
+        panel_window_frame::Placement {
+            position: (
+                (f64::from(x) + position.x * scale).round() as i32,
+                (f64::from(y) + position.y * scale).round() as i32,
+            ),
+            size: (size.width, size.height),
+            scale,
+        },
+        adjusted,
+    )
 }
 
+/// Also returns whether the frame differs from the one given (see
+/// [`clamp_toolset_frame_in_physical_space_clear_of`]); `label` is the palette being placed.
 #[cfg(windows)]
 fn clamp_windows_toolset_frame<R: Runtime>(
     app: &tauri::AppHandle<R>,
+    label: &str,
     origin: ToolsetFrameOrigin,
     size: (f64, f64),
     resizable: bool,
-) -> Option<panel_window_frame::Placement> {
+) -> Option<(panel_window_frame::Placement, bool)> {
     let monitors: Vec<_> = monitor_query::available_monitors(app)
         .ok()?
         .iter()
@@ -11859,8 +12611,13 @@ fn clamp_windows_toolset_frame<R: Runtime>(
         .as_ref()
         .map(ToolsetMonitor::from_native);
     let primary = primary.as_ref().or_else(|| monitors.first())?;
-    Some(clamp_toolset_frame_in_physical_space(
-        origin, size, resizable, &monitors, primary,
+    Some(clamp_toolset_frame_in_physical_space_clear_of(
+        origin,
+        size,
+        resizable,
+        &monitors,
+        primary,
+        main_toolbar_frame(app, label).map(|(toolbar, _)| toolbar),
     ))
 }
 
@@ -11881,16 +12638,59 @@ fn recover_offscreen_toolset_window<R: Runtime>(
     let Ok(scale) = window.scale_factor() else {
         return;
     };
-    let Ok(size) = window.outer_size() else {
+    let (Ok(size), Ok(inner)) = (window.outer_size(), window.inner_size()) else {
         return;
     };
     let size = size.to_logical::<f64>(scale);
-    let (clamped, width, height) =
-        clamp_toolset_frame(app, position, (size.width, size.height), resizable);
-    if (width - size.width).abs() >= 0.5 || (height - size.height).abs() >= 0.5 {
+    let live_size = (size.width, size.height);
+    let label = window.label();
+    // A palette ChemDraft fitted to a smaller work area is re-placed from the user's saved frame,
+    // so it returns there once the work area can hold it again (B9).
+    let fitted = toolset_fit::with_memory(|memory| memory.is_fitted(label));
+    let (source, source_size) = fitted
+        .then(|| saved_toolset_state(app, label))
+        .flatten()
+        .and_then(|state| {
+            let position = state.position()?;
+            Some((position, state.window_size(resizable).unwrap_or(live_size)))
+        })
+        .unwrap_or((position, live_size));
+    let (clamped, width, height, adjusted) =
+        clamp_toolset_frame(app, label, source, source_size, resizable);
+    let resize = (width - size.width).abs() >= 0.5 || (height - size.height).abs() >= 0.5;
+    let reposition = (clamped.x - position.x).abs() >= 0.5 || (clamped.y - position.y).abs() >= 0.5;
+    let plan = toolset_fit::plan_fit(!resize && !reposition, adjusted, fitted);
+    toolset_fit::with_memory(|memory| match plan.memory {
+        toolset_fit::FitMemoryChange::Keep => {}
+        toolset_fit::FitMemoryChange::Forget => memory.forget(label),
+        toolset_fit::FitMemoryChange::Record => {
+            let from =
+                tauri::LogicalPosition::new(position.x, position.y).to_physical::<i32>(scale);
+            let to = tauri::LogicalPosition::new(clamped.x, clamped.y).to_physical::<i32>(scale);
+            let to_size = if resize {
+                tauri::LogicalSize::new(width, height).to_physical::<u32>(scale)
+            } else {
+                inner
+            };
+            memory.record(
+                label,
+                toolset_fit::FittedFrame {
+                    from: (from.x, from.y),
+                    to: (to.x, to.y),
+                    from_size: (inner.width, inner.height),
+                    to_size: (to_size.width, to_size.height),
+                    tolerance: toolset_fit::tolerance(scale),
+                },
+            );
+        }
+    });
+    if !plan.apply {
+        return;
+    }
+    if resize {
         let _ = window.set_size(tauri::LogicalSize::new(width, height));
     }
-    if (clamped.x - position.x).abs() < 0.5 && (clamped.y - position.y).abs() < 0.5 {
+    if !reposition {
         return;
     }
 
@@ -11927,14 +12727,50 @@ fn recover_offscreen_toolset_window<R: Runtime>(
         };
         let physical = (position.x, position.y);
         let logical_size = size.to_logical::<f64>(scale);
-        let Some(placement) = clamp_windows_toolset_frame(
-            &app,
-            ToolsetFrameOrigin::Physical(physical, scale),
-            (logical_size.width, logical_size.height),
-            resizable,
-        ) else {
+        let live_size = (logical_size.width, logical_size.height);
+        let label = window.label();
+        // A palette ChemDraft fitted to a smaller work area is re-placed from the user's saved
+        // frame, so it returns there once the work area can hold it again (B9).
+        let fitted = toolset_fit::with_memory(|memory| memory.is_fitted(label));
+        let (origin, source_size) = fitted
+            .then(|| saved_toolset_state(&app, label))
+            .flatten()
+            .and_then(|state| {
+                let position = state.position()?;
+                Some((
+                    ToolsetFrameOrigin::Logical(position, state.position_scale),
+                    state.window_size(resizable).unwrap_or(live_size),
+                ))
+            })
+            .unwrap_or((ToolsetFrameOrigin::Physical(physical, scale), live_size));
+        let Some((placement, adjusted)) =
+            clamp_windows_toolset_frame(&app, label, origin, source_size, resizable)
+        else {
             return;
         };
+        let live_size = (size.width, size.height);
+        let plan = toolset_fit::plan_fit(
+            placement.position == physical && placement.size == live_size,
+            adjusted,
+            fitted,
+        );
+        toolset_fit::with_memory(|memory| match plan.memory {
+            toolset_fit::FitMemoryChange::Keep => {}
+            toolset_fit::FitMemoryChange::Forget => memory.forget(label),
+            toolset_fit::FitMemoryChange::Record => memory.record(
+                label,
+                toolset_fit::FittedFrame {
+                    from: physical,
+                    to: placement.position,
+                    from_size: live_size,
+                    to_size: placement.size,
+                    tolerance: toolset_fit::tolerance(scale),
+                },
+            ),
+        });
+        if !plan.apply {
+            return;
+        }
         if placement.position == physical {
             if placement.size != (size.width, size.height) {
                 let _ =
@@ -12584,6 +13420,20 @@ fn find_menu_item_by_id<R: Runtime>(
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn keybinding_scheme_defaults_to_the_industry_standard_scheme() {
+        assert_eq!(KeybindingScheme::default(), KeybindingScheme::ChemDraw);
+        let state = KeybindingSchemeState::default();
+        assert_eq!(*state.0.lock().unwrap(), KeybindingScheme::ChemDraw);
+        assert_eq!(KeybindingScheme::default().rulers(), "CmdOrCtrl+;");
+        // An explicit scheme in the preferences file still wins, and none stored stays None.
+        let stored: DesktopPreferences =
+            serde_json::from_value(serde_json::json!({ "shortcutScheme": "chemdraft" })).unwrap();
+        assert_eq!(stored.shortcut_scheme, Some(KeybindingScheme::ChemDraft));
+        let empty: DesktopPreferences = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(empty.shortcut_scheme, None);
+    }
 
     #[test]
     fn desktop_preferences_persist_shortcut_schemes_independently() {
@@ -13257,12 +14107,23 @@ mod tests {
 
     #[test]
     fn committed_sidecar_placeholders_are_never_runnable() {
-        let binaries = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("binaries");
-        for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
-            let placeholder = binaries.join(format!("avogadro3d-sidecar-{triple}"));
-            assert!(is_sidecar_placeholder(&placeholder), "{triple}");
-            assert!(!is_runnable_sidecar(&placeholder), "{triple}");
-        }
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let binaries = manifest.join("binaries");
+        let placeholder = binaries.join("avogadro3d-sidecar-aarch64-unknown-linux-gnu");
+        assert!(is_sidecar_placeholder(&placeholder));
+        assert!(!is_runnable_sidecar(&placeholder));
+        // The x86_64 Linux sidecar is a placeholder exactly until a maintainer commits the build
+        // pinned in scripts/engine3d-sidecar-linux.json.
+        let pin: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(manifest.join("../../../scripts/engine3d-sidecar-linux.json"))
+                .expect("Linux sidecar pin"),
+        )
+        .expect("Linux sidecar pin JSON");
+        let pending = pin["sha256"] == "PENDING-MAINTAINER-COMMIT";
+        let linux = binaries.join("avogadro3d-sidecar-x86_64-unknown-linux-gnu");
+        assert_eq!(is_sidecar_placeholder(&linux), pending);
+        // Windows also requires a PE image, which an ELF is not.
+        assert_eq!(is_runnable_sidecar(&linux), !pending && !cfg!(windows));
         for real in [
             "avogadro3d-sidecar-aarch64-apple-darwin",
             "avogadro3d-sidecar-x86_64-apple-darwin",
@@ -13421,6 +14282,55 @@ mod tests {
         );
         assert_eq!(centered.position, (1920, 0));
         assert_eq!(centered.size, expected.size);
+    }
+
+    #[test]
+    fn a_squeezed_inspector_title_lands_below_the_main_toolbar_and_a_user_frame_is_kept() {
+        // B9: 1024x768 with a 44 px panel, Main 1024x85 at 0,135.
+        let monitor = ToolsetMonitor {
+            identity: panel_window_frame::MonitorIdentity {
+                name: None,
+                position: (0, 0),
+                size: (1024, 768),
+            },
+            scale: 1.0,
+            work_area: ScreenRect::new(0.0, 0.0, 1024.0, 724.0),
+        };
+        let monitors = [monitor];
+        let main = Some(ScreenRect::new(0.0, 135.0, 1024.0, 85.0));
+        let clamp = |origin: (i32, i32), size: (f64, f64), toolbar: Option<ScreenRect>| {
+            clamp_toolset_frame_in_physical_space_clear_of(
+                ToolsetFrameOrigin::Physical(origin, 1.0),
+                size,
+                true,
+                &monitors,
+                &monitors[0],
+                toolbar,
+            )
+        };
+
+        // The 1680 frame squeezed onto 1024: its clamped title (y 124) would sit inside Main, so
+        // it goes below Main and gives up height to stay inside the work area.
+        let (placement, adjusted) = clamp((900, 160), (520.0, 600.0), main);
+        assert!(adjusted);
+        assert_eq!(
+            (placement.position, placement.size),
+            ((504, 220), (520, 504))
+        );
+        // Without a Main toolbar the clamp is unchanged.
+        let (placement, adjusted) = clamp((900, 160), (520.0, 600.0), None);
+        assert!(adjusted);
+        assert_eq!(
+            (placement.position, placement.size),
+            ((504, 124), (520, 600))
+        );
+        // A frame that fits is the user's and is never moved, wherever it sits.
+        let (placement, adjusted) = clamp((100, 150), (300.0, 300.0), main);
+        assert!(!adjusted);
+        assert_eq!(
+            (placement.position, placement.size),
+            ((100, 150), (300, 300))
+        );
     }
 
     #[test]
@@ -15311,6 +16221,30 @@ mod tests {
     }
 
     #[test]
+    fn toolset_popovers_stack_above_the_palette_that_opened_them() {
+        let open = ["main", "toolset-core-main", "toolset-plugin-my-tools"];
+        let exists = |label: &str| open.contains(&label);
+        expect_eq(
+            "toolset-core-main",
+            &toolset_popover_owner_label("core.main", exists),
+        );
+        // The palette label's sanitizing, not the popover label's dot-only replacement.
+        expect_eq(
+            "toolset-plugin-my-tools",
+            &toolset_popover_owner_label("plugin.my_tools", exists),
+        );
+        // The canvas's E/Z popover has no palette; a closed palette's popover falls back too.
+        expect_eq(
+            MAIN_WINDOW_LABEL,
+            &toolset_popover_owner_label("core.bondStereo", exists),
+        );
+        expect_eq(
+            MAIN_WINDOW_LABEL,
+            &toolset_popover_owner_label("core.arrows", exists),
+        );
+    }
+
+    #[test]
     fn only_scrolling_toolsets_allow_user_resize() {
         for id in ["core.molecularInspector", "core.drawnStructureSettings"] {
             assert!(toolset_is_resizable(id), "{id}");
@@ -15387,24 +16321,32 @@ mod tests {
     }
 
     #[test]
-    fn linux_window_menu_items_act_on_the_document_window() {
-        let ids = [
-            LINUX_MINIMIZE_MENU_ID,
-            LINUX_TOGGLE_MAXIMIZE_MENU_ID,
+    fn linux_window_menu_items_route_as_registry_commands() {
+        let menu_ids = [
+            WINDOW_MINIMIZE_COMMAND_ID,
+            WINDOW_TOGGLE_MAXIMIZE_COMMAND_ID,
             LINUX_CLOSE_WINDOW_FILE_MENU_ID,
-            LINUX_CLOSE_WINDOW_WINDOW_MENU_ID,
+            WINDOW_CLOSE_COMMAND_ID,
         ];
         assert_eq!(
-            ids.map(linux_window_menu_action),
+            menu_ids
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            menu_ids.len(),
+            "muda menu ids must be unique"
+        );
+        assert_eq!(
+            menu_ids.map(linux_menu_command_id),
             [
-                Some(LinuxWindowMenuAction::Minimize),
-                Some(LinuxWindowMenuAction::ToggleMaximize),
-                Some(LinuxWindowMenuAction::Close),
-                Some(LinuxWindowMenuAction::Close),
+                WINDOW_MINIMIZE_COMMAND_ID,
+                WINDOW_TOGGLE_MAXIMIZE_COMMAND_ID,
+                WINDOW_CLOSE_COMMAND_ID,
+                WINDOW_CLOSE_COMMAND_ID,
             ]
         );
         assert_eq!(
-            ids.map(linux_window_menu_title),
+            menu_ids.map(linux_window_menu_title),
             [
                 "Minimize",
                 "Maximize / Restore",
@@ -15413,14 +16355,44 @@ mod tests {
             ]
         );
         assert_eq!(
-            ids.iter().collect::<std::collections::HashSet<_>>().len(),
-            ids.len()
+            linux_menu_command_id("document.closeTab"),
+            "document.closeTab"
         );
-        for id in ids {
-            // Handled natively, never sent to the webview's command dispatcher.
-            assert!(!is_routed_menu_command(id));
+        for command_id in LINUX_WINDOW_COMMAND_IDS {
+            // Routed to the webview's command registry on Linux only; macOS and Windows show the
+            // predefined OS items, which never reach the dispatcher.
+            assert_eq!(
+                is_routed_menu_command(command_id),
+                cfg!(target_os = "linux"),
+                "{command_id}"
+            );
+            assert!(!MENU_COMMAND_IDS.contains(command_id));
         }
-        assert_eq!(linux_window_menu_action("document.closeTab"), None);
+        assert!(!is_routed_menu_command(LINUX_CLOSE_WINDOW_FILE_MENU_ID));
+
+        // The command's native half: its event payload names the command it runs.
+        assert_eq!(
+            [
+                r#"{"commandId":"window.minimize"}"#,
+                r#"{"commandId":"window.toggleMaximize"}"#,
+                r#"{"commandId":"window.close"}"#,
+            ]
+            .map(linux_window_action_request),
+            [
+                Some(LinuxWindowMenuAction::Minimize),
+                Some(LinuxWindowMenuAction::ToggleMaximize),
+                Some(LinuxWindowMenuAction::Close),
+            ]
+        );
+        for payload in [
+            r#"{"commandId":"window.close.fileMenu"}"#,
+            r#"{"commandId":"document.closeTab"}"#,
+            r#"{"action":"minimize"}"#,
+            "not json",
+        ] {
+            assert_eq!(linux_window_action_request(payload), None, "{payload}");
+        }
+        assert_eq!(WINDOW_ACTION_EVENT, "chemdraft://window-action");
 
         // muda drops the predefined items from GTK menus, so Linux must build its own.
         let source = include_str!("lib.rs");
@@ -15435,9 +16407,9 @@ mod tests {
             "#[cfg(not(target_os = \"linux\"))]\n                    &PredefinedMenuItem::minimize",
             "#[cfg(not(target_os = \"linux\"))]\n                    &PredefinedMenuItem::maximize",
             "#[cfg(windows)]\n                    &PredefinedMenuItem::close_window",
-            "&linux_window_menu_item(app, LINUX_MINIMIZE_MENU_ID)?",
-            "&linux_window_menu_item(app, LINUX_TOGGLE_MAXIMIZE_MENU_ID)?",
-            "&linux_window_menu_item(app, LINUX_CLOSE_WINDOW_WINDOW_MENU_ID)?",
+            "&linux_window_menu_item(app, WINDOW_MINIMIZE_COMMAND_ID)?",
+            "&linux_window_menu_item(app, WINDOW_TOGGLE_MAXIMIZE_COMMAND_ID)?",
+            "&linux_window_menu_item(app, WINDOW_CLOSE_COMMAND_ID)?",
         ] {
             assert!(menu.contains(item), "Window menu lacks {item}");
         }
@@ -15449,10 +16421,13 @@ mod tests {
             .split(".on_window_event(")
             .next()
             .unwrap();
+        // No native shortcut: the Linux items take the same routed path as every other menu item.
         assert!(dispatch.contains(
-            "if let Some(action) = linux_window_menu_action(command_id) {\n                \
-             run_linux_window_menu_action(app, action);\n                return;"
+            "#[cfg(target_os = \"linux\")]\n            let command_id = linux_menu_command_id(command_id);"
         ));
+        assert!(!dispatch.contains("run_linux_window_menu_action"));
+        assert!(source
+            .contains("#[cfg(target_os = \"linux\")]\n    listen_for_linux_window_actions(app);"));
     }
 
     #[test]
@@ -15582,6 +16557,22 @@ mod tests {
     #[test]
     fn toolset_windows_do_not_take_focus_from_document_window() {
         expect_false(toolset_window_focusable());
+    }
+
+    #[test]
+    fn tooltip_show_applies_only_a_complete_positive_size() {
+        assert_eq!(
+            tooltip_content_size(Some(105.0), Some(22.0)),
+            Some((105.0, 22.0))
+        );
+        // macOS and Windows pass no size; the webview already sized the window.
+        assert_eq!(tooltip_content_size(None, None), None);
+        assert_eq!(tooltip_content_size(Some(105.0), None), None);
+        assert_eq!(tooltip_content_size(None, Some(22.0)), None);
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(tooltip_content_size(Some(bad), Some(22.0)), None);
+            assert_eq!(tooltip_content_size(Some(105.0), Some(bad)), None);
+        }
     }
 
     #[test]
@@ -16338,6 +17329,33 @@ mod tests {
     }
 
     #[test]
+    fn interactive3d_menu_item_is_omitted_without_a_runnable_sidecar() {
+        // Built only when the sidecar can run: never a permanently disabled item (AGENTS.md §10).
+        let source = include_str!("lib.rs");
+        let structure = source
+            .split("let structure_menu = Submenu::with_id_and_items(")
+            .nth(1)
+            .unwrap()
+            .split("let structure_plugin_items")
+            .next()
+            .unwrap();
+        let gated = structure
+            .split("if interactive3d_menu_item_shown() {")
+            .nth(1)
+            .expect("the Interactive 3D item is gated on the sidecar");
+        assert!(gated.contains("STRUCTURE_INTERACTIVE3D_COMMAND_ID,"));
+        assert_eq!(
+            structure
+                .matches("STRUCTURE_INTERACTIVE3D_COMMAND_ID")
+                .count(),
+            1
+        );
+        assert!(!structure.contains("\"structure.openInteractive3d\""));
+        let status = engine3d_sidecar_status_from(Some("/definitely/not/a/sidecar".to_owned()));
+        assert_eq!(status.available, status.source != "missing");
+    }
+
+    #[test]
     fn layout_menu_commands_are_routed() {
         expect_true(is_routed_menu_command("layout.group"));
         expect_true(is_routed_menu_command("layout.ungroup"));
@@ -16389,9 +17407,27 @@ mod tests {
         let (path, owned) = (std::env::current_exe().expect("test executable"), false);
         #[cfg(not(windows))]
         let (path, owned) = {
+            use std::os::unix::fs::PermissionsExt;
+
             let path = std::env::temp_dir()
                 .join(format!("chemdraft-engine3d-status-{}", std::process::id()));
             fs::write(&path, "").expect("fixture should write");
+            // A file its owner cannot execute is never the sidecar: the override is skipped (the
+            // bundled sidecar or "missing" decides) rather than winning and failing every session.
+            // Root may execute a file with any execute bit set (access(2)), so 0o055 only below it.
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            let root = unsafe { libc::geteuid() } == 0;
+            for mode in [0o644, 0o600, 0o055] {
+                if mode == 0o055 && root {
+                    continue;
+                }
+                fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("chmod");
+                expect_true(!is_runnable_sidecar(&path));
+                let status = engine3d_sidecar_status_from(Some(path.to_string_lossy().to_string()));
+                expect_true(status.source != "environment");
+                expect_true(status.resolved_path != Some(path.to_string_lossy().to_string()));
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
             (path, true)
         };
 
@@ -16408,6 +17444,106 @@ mod tests {
         if owned {
             let _ = fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn engine3d_sidecar_status_names_the_source_it_resolved() {
+        let dir =
+            std::env::temp_dir().join(format!("chemdraft-engine3d-source-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("fixture dir");
+        let missing_override = Some(dir.join("no-such-sidecar").to_string_lossy().to_string());
+
+        // An override that cannot run, and nothing bundled: missing.
+        let status = engine3d_sidecar_status_in(missing_override.clone(), Some(&dir));
+        expect_eq("missing", status.source.as_str());
+        expect_true(!status.available);
+        expect_eq(None, status.resolved_path);
+
+        // The same override beside a runnable bundled sidecar: the bundle is chosen, and the
+        // status says so rather than "environment".
+        #[cfg(windows)]
+        let bundled = {
+            // The smallest file is_pe_image accepts: MZ, e_lfanew = 0x40, then PE\0\0.
+            let mut image = vec![0u8; 0x44];
+            image[..2].copy_from_slice(b"MZ");
+            image[0x3c] = 0x40;
+            image[0x40..].copy_from_slice(b"PE\0\0");
+            let path = dir.join("avogadro3d-sidecar.exe");
+            fs::write(&path, image).expect("fixture should write");
+            path
+        };
+        #[cfg(not(windows))]
+        let bundled = {
+            use std::os::unix::fs::PermissionsExt;
+
+            let path = dir.join("avogadro3d-sidecar");
+            fs::write(&path, "#!/bin/sh\n").expect("fixture should write");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+            path
+        };
+        let status = engine3d_sidecar_status_in(missing_override, Some(&dir));
+        expect_eq("bundled", status.source.as_str());
+        expect_true(status.available);
+        expect_eq(
+            Some(bundled.to_string_lossy().to_string()),
+            status.resolved_path,
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn engine3d_log_is_opt_in_with_exactly_one() {
+        expect_true(engine3d_log_flag_enabled(Some("1")));
+        expect_true(engine3d_log_flag_enabled(Some(" 1\n")));
+        expect_true(!engine3d_log_flag_enabled(None));
+        expect_true(!engine3d_log_flag_enabled(Some("")));
+        expect_true(!engine3d_log_flag_enabled(Some("0")));
+        expect_true(!engine3d_log_flag_enabled(Some("true")));
+    }
+
+    #[test]
+    fn engine3d_log_summarizes_protocol_lines_without_payloads() {
+        expect_eq(
+            "beginDrag (engine3d-4)".to_string(),
+            engine3d_protocol_line_summary(
+                "{\"protocolVersion\":2,\"requestId\":\"engine3d-4\",\"type\":\"beginDrag\",\"sessionId\":\"s1\",\"atomId\":\"a1\"}",
+            ),
+        );
+        expect_eq(
+            "response ok (engine3d-4)".to_string(),
+            engine3d_protocol_line_summary(
+                "{\"protocolVersion\":2,\"requestId\":\"engine3d-4\",\"sessionId\":\"s1\",\"type\":\"response\",\"ok\":true}",
+            ),
+        );
+        expect_eq(
+            "response failed: Unknown dragged atom id. (engine3d-5)".to_string(),
+            engine3d_protocol_line_summary(
+                "{\"protocolVersion\":2,\"requestId\":\"engine3d-5\",\"sessionId\":\"s1\",\"type\":\"response\",\"ok\":false,\"error\":\"Unknown dragged atom id.\"}",
+            ),
+        );
+        let coordinates = engine3d_protocol_line_summary(
+            "{\"protocolVersion\":2,\"requestId\":\"engine3d-6.event\",\"sessionId\":\"s1\",\"type\":\"event\",\"eventType\":\"coordinatesChanged\",\"coordinateRevision\":7,\"reason\":\"settle\",\"coords3dByAtomId\":{\"a1\":{\"x\":1.25,\"y\":0,\"z\":0}}}",
+        );
+        expect_eq(
+            "event coordinatesChanged reason=settle (engine3d-6.event)".to_string(),
+            coordinates.clone(),
+        );
+        expect_true(!coordinates.contains("1.25"));
+        expect_eq(
+            "unparsed line (8 bytes)".to_string(),
+            engine3d_protocol_line_summary("not json"),
+        );
+        expect_eq("a b".to_string(), engine3d_log_text("a\nb"));
+        expect_eq(300, engine3d_log_text(&"x".repeat(400)).chars().count());
+        // Decoded newlines in metadata stay on one line, and long metadata is bounded.
+        let hostile = engine3d_protocol_line_summary(&format!(
+            "{{\"type\":\"event\\nforged\",\"eventType\":\"a\\rb\",\"reason\":\"r\\nq\",\"requestId\":\"{}\"}}",
+            "i".repeat(200)
+        ));
+        expect_true(!hostile.contains('\n') && !hostile.contains('\r'));
+        expect_true(hostile.starts_with("event forged a b reason=r q ("));
+        expect_eq(80, hostile.matches('i').count());
     }
 
     #[test]

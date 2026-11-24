@@ -54,13 +54,13 @@ const KEYBINDING_SCHEMES: RadioOption<KeybindingScheme>[] = [
   {
     value: "chemdraft",
     title: KEYBINDING_SCHEME_LABELS.chemdraft,
-    description: "The native ChemDraft shortcuts. Recommended for new users."
+    description: "The native ChemDraft shortcuts."
   },
   {
     value: "chemdraw",
     title: KEYBINDING_SCHEME_LABELS.chemdraw,
     description:
-      "Classic desktop shortcuts and hover hotkeys (Space for select, X for the bond tool, hover an atom and press 2 for a carbonyl, \"l\" for Cl, \"b\" for Br…). Case matters for element keys: B = boron, b = Br."
+      "The default for new installs. Classic desktop shortcuts and hover hotkeys (Space for select, X for the bond tool, hover an atom and press 2 for a carbonyl, \"l\" for Cl, \"b\" for Br…). Case matters for element keys: B = boron, b = Br."
   }
 ];
 

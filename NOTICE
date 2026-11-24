@@ -271,34 +271,37 @@ better-enums (compiled into the Intel Mac naming engine's RDKit wheel)
   The wheel carries the better-enums license text. Not bundled with ChemDraft.
 
 Avogadro libraries (avogadrolibs Core + Calc, statically linked into the
-avogadro3d-sidecar executable shipped beside the app on macOS and Windows)
+avogadro3d-sidecar executable shipped beside the app on macOS, Windows and
+x86_64 Linux)
   BSD-3-Clause. Copyright (c) 2011-2020, Kitware, Inc.
   Source: https://github.com/OpenChemistry/avogadrolibs, commit
   416651ddaef33a4e20392392e7c0b505d446491b. Built without Open Babel, GPL plugins,
   or Python (guarded by pnpm audit:engine3d-sidecar).
   Full licence text: native/avogadro3d-sidecar/licenses/avogadrolibs-LICENSE.txt
-  Installed license (macOS and Windows): licenses/avogadrolibs-LICENSE.txt
+  Installed licence (macOS, Windows and Linux): licenses/avogadrolibs-LICENSE.txt
 
 CppNumericalSolvers (cppoptlib)
   Header-only L-BFGS minimizer and More-Thuente line search, compiled through
   Avogadro Calc into the avogadro3d-sidecar executable shipped beside the app on
-  macOS and Windows.
+  macOS, Windows and x86_64 Linux.
   MIT. Copyright (c) 2014-2015 Patrick Wieschollek;
   Copyright (c) 2015- Patrick Wieschollek+Contributors.
   Source: https://github.com/PatWie/CppNumericalSolvers, as vendored by avogadrolibs
-  commit 416651ddaef33a4e20392392e7c0b505d446491b in thirdparty/cppoptlib/ (license:
+  commit 416651ddaef33a4e20392392e7c0b505d446491b in thirdparty/cppoptlib/ (licence:
   thirdparty/cppoptlib/LICENSE) and compiled as vendored there.
-  Full license text: native/avogadro3d-sidecar/licenses/cppoptlib-LICENSE.txt
-  Installed license (macOS and Windows): licenses/cppoptlib-LICENSE.txt
+  Full licence text: native/avogadro3d-sidecar/licenses/cppoptlib-LICENSE.txt
+  Installed licence (macOS, Windows and Linux): licenses/cppoptlib-LICENSE.txt
 
 Eigen 3.4.0 (header-only, compiled into the avogadro3d-sidecar executable)
   MPL-2.0. Source: https://gitlab.com/libeigen/eigen, tag 3.4.0. Unmodified.
   Source for the MPL-2.0 files is available at the URL above. Eigen also carries a
   few LGPL-licensed modules. The sidecar is built with EIGEN_MPL2_ONLY, which makes
   including any of them a compile error, so the shipped Windows and macOS arm64
-  binaries, both built with the flag, contain none.
+  binaries and the x86_64 Linux binary (built once from source by the
+  linux-sidecar-build.yml workflow and committed, as the others are), all built
+  with the flag, contain none.
   Full licence text: native/avogadro3d-sidecar/licenses/Eigen-COPYING.MPL2.txt
-  Installed license (macOS and Windows): licenses/Eigen-COPYING.MPL2.txt
+  Installed licence (macOS, Windows and Linux): licenses/Eigen-COPYING.MPL2.txt
 
 --------------------------------------------------------------------------------
 Optional components downloaded only at the user's request
