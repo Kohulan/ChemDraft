@@ -23,10 +23,11 @@ export interface AssistantToolContext {
   /** Undefined means the pinned tab closed: every tool fails closed. */
   getDocument(): ChemDraftDocument | undefined;
   getSelectionAtSend(): readonly string[];
-  /** The Send-time selection's ids bound to the page they were selected on. Every object lookup in a
-   * tool resolves through it (resolveScopedObject), so an id never resolves to a same-id object on
-   * another page. A pinned object missing from its page (deleted, or moved to another page) resolves
-   * to nothing: reads and writes to it are refused with a reselect message.
+  /** The Send-time selection's pins: each id pins the selected object by its host-owned identity. Every
+   * object lookup in a tool resolves through it (resolveScopedObject), so an id resolves only to that
+   * object, on whatever page it now is, and never to a same-id object (another page, or a paste, undo,
+   * or insert reusing the id). A pinned object that is gone resolves to nothing: reads and writes to it
+   * are refused with a reselect message.
    * Absent: ids resolve only when they are unique in the document. */
   getSelectionPagesAtSend?(): PluginWriteScopePages | undefined;
   /** Transaction-owned ids, including writes through another session for this run. */

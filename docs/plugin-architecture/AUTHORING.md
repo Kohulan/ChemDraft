@@ -1024,6 +1024,78 @@ try {
 Only plugin and assistant writes are refused this way. A document that already stores such a count
 (an older file, a restored session, a paste) opens and edits as stored, and the app flags the atom.
 
+### Embedding hosts: object identity (1.2.3)
+
+The host binds each object selected when a command or request started, and each object it inserts,
+to that object's in-memory identity, never to its id alone: an id freed by a deletion and reused by a
+paste, an undo or another insert names a different object, and writes to it are refused. The identity
+lives in chem-core beside the document, never in it. It is not serialized or structured-cloned, a
+plugin never receives one, and everything a plugin writes is parsed into a new value. chem-core's own
+edits (`applyPatch`, `adoptDerivedDocument`) carry it to the edited value.
+
+`@chemdraft/plugin-host` bundles its own chem-core runtime. Compatible copies that successfully adopt the published runtime share it; copies finding another
+version, an untrusted runtime, or an unpublishable global keep private runtimes. The identity runtime is published on `globalThis` under
+`Symbol.for("chemdraft.chem-core.objectIdentity")` and versioned, so an embedder that commits plugin
+writes through its own `@chemdraft/chem-core` keeps the identities the SDK pinned, and a command's
+second write to the same object still resolves. For that, the embedder:
+
+- commits in the same realm as its `PluginHost` (not in another Worker or iframe);
+- uses a chem-core with the same identity-runtime version, currently 2 (a copy that finds another
+  version keeps its identities private, so pins stop resolving and writes are refused: fail closed,
+  never a wrong match);
+- loads every chem-core copy it will use (its own, the host's, the `@chemdraft/plugin-host` SDK
+  bundle's) before any script it does not trust runs in that realm, not only the first copy: each
+  copy captures the built-ins it relies on (`Object.isFrozen`, the `WeakMap.prototype` methods and
+  so on) when it loads, so a copy that loads after untrusted code replaced one rejects the genuine
+  runtime, makes a private one and calls the replaced methods;
+- calls `retainObjectIdentity(before, after)` from `@chemdraft/chem-core` for each object value it
+  edits itself instead of through chem-core's patches (only a same-id, same-type value continues an
+  object);
+- reports the document each write committed through the request's `onCommitted`, so the write's
+  insertions are granted by the identity of the objects actually inserted.
+
+The first copy publishes only if the global property can be defined: it publishes the runtime as a
+fixed, hidden property that cannot be replaced. It exposes only what chem-core already exports: read an object's identity, test one, and
+continue an object onto its edited copy. Nothing in it can replace an identity an object already
+holds. The engine gives every object of every document it adopts (a patch result, `toEngineDocument`,
+`admitParsedDocument`, an adopted derived document) an identity, so once a document is adopted,
+nothing can move another object's identity onto any of its objects. This applies to documents the
+engine adopts. Two early returns hand back their input unchanged: `applyPatches` with no patches, and
+`adoptDerivedDocument` when `next` is `base`, is already an engine document, or comes with a `base`
+that is not an engine document. These returns perform no cloning, adoption, or identity minting. A
+non-engine input is returned unadopted and is not newly pre-identified; an already-engine input
+remains adopted and pre-identified. The runtime calls
+only built-ins captured when each chem-core copy loads, so replacing `WeakMap.prototype` methods,
+`Function.prototype.call` or `Symbol` later changes nothing. A later copy adopts a published runtime
+only if it has exactly the runtime's shape and behaves as chem-core's on fresh probe objects. A
+runtime that answers every identity check with "yes" is not adopted. A copy that finds anything else
+under that key keeps its identities private: silently for a runtime of another version, otherwise
+with one console warning.
+
+Run untrusted plugins in a Worker, as the app does: code in the host's own realm can always reach
+the host's globals. The accepted trust boundary is this: code that runs in the page before
+ChemDraft's chem-core copies load is outside what the page can defend, and a fake runtime that
+behaves correctly except for a targeted object cannot be detected from inside the realm. Two limits
+follow. First, a script that runs in the realm before a chem-core copy loads can publish a forgery
+that passes the adoption check: it behaves exactly like chem-core until it is asked about an object it
+targets. No check made from inside the realm can tell the two apart, and a script that runs first
+controls the realm anyway. Such scripts are out of scope. Second, carrying only fills a missing identity, so an object in an engine-adopted document cannot be
+handed another object's identity; an unidentified value, including one already in a non-engine
+document, still can, through the runtime's `retain` (chem-core's
+`retainObjectIdentity`), as an edited copy does. A patch parses anything it inserts into a new value,
+so ordinary patch insertion is not a bypass. Such a value reaches a document only if a trusted caller
+gives the engine a document that contains it. Each of these paths takes such a document, and each
+needs a trusted caller to submit it:
+
+- `adoptDerivedDocument`, when it adopts (a `next` whose objects were pre-retained);
+- `admitParsedDocument`, which admits the document as it is and keeps any identity an object holds;
+- `toEngineDocument` and `cloneDocument`, which copy each object's identity onto its copy;
+- `applyPatches` on an input that is not an engine document, which starts with `cloneDocument` only
+  when `patches.length > 0`. With no patches it returns the supplied document unchanged, without
+  cloning, adopting or pre-identifying it, so an identity retained beforehand survives.
+
+Code the host trusts that far can change the document without any pin.
+
 ### Native tables (0.1.18)
 
 Plugins may read the optional `tableStyle.autoColumnMinEm` minimum auto column width in em.

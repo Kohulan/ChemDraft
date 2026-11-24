@@ -676,6 +676,25 @@ describe("desktop direct plugin patch application", () => {
     expect(document.pages[0].objects.map((object) => object.id)).toEqual(["edit", "move", "remove", "unchanged"]);
   });
 
+  it("CR422 item 1: selects the surviving insertion on page B when objects reordered then removed on page A", () => {
+    let document = createEmptyDocument();
+    document = { ...document, pages: [...document.pages, { ...document.pages[0], id: "second", objects: [] }] };
+    const pageA = document.pages[0].id;
+    for (const id of ["x", "y"]) {
+      document = applyPatch(document, { op: "addObject", pageId: pageA, object: { ...moleculeObject(), id } });
+    }
+    const result = applyPluginDocumentPatch(document, ProposedDocumentPatchSchema.parse({ reason: "reorder, remove, insert", patch: {
+      op: "batch", patches: [
+        { op: "setObjectOrder", pageId: pageA, objectIds: ["y", "x"] },
+        { op: "removeObject", objectId: "x" },
+        { op: "removeObject", objectId: "y" },
+        { op: "addObject", pageId: "second", object: { ...moleculeObject(), id: "table_on_b" } }
+      ]
+    } }));
+    expect(result.receipt.objectIds).toEqual(["table_on_b"]);
+    expect(result.document.selection).toMatchObject({ pageId: "second", objectIds: ["table_on_b"] });
+  });
+
   it("clears selection for a deletion-only patch", () => {
     let document = createEmptyDocument();
     const pageId = document.pages[0].id;

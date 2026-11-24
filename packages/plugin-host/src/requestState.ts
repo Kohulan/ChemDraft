@@ -6,6 +6,7 @@ import {
   RequestRevisions, RequestWriteError, type RequestDocument, type RequestHistory, type RequestObjectRef, type RequestPageChoice,
   type RequestViewport
 } from "./requestWrites";
+import type { PagePin, PluginWriteScopePages } from "./pageObjects";
 
 export interface RequestPageAnswer {
   requestId: string;
@@ -21,7 +22,11 @@ export interface RequestState {
   label: string;
   document: RequestDocument;
   selection: RequestObjectRef[];
+  /** Host-only pins of `selection`, captured at Send with it (see BoundRequestWrite.selectionPins). */
+  selectionPins?: PluginWriteScopePages;
   inserted: Map<string, RequestObjectRef>;
+  /** Host-only pins of `inserted`: each insertion's committed object, by its host identity. */
+  insertionPins: Map<string, PagePin>;
   touched: Map<string, RequestObjectRef>;
   revisions: RequestRevisions;
   stop: AbortController;
@@ -56,7 +61,7 @@ export function createRequestState(pluginId: string, owner: symbol, document: Re
   if (selection.length > PluginRequestLimits.objects || snapshot.pages.length > PluginRequestLimits.pages) {
     throw new RequestWriteError("limit", "The document exceeds the request page or selection limit.");
   }
-  return { id, pluginId, owner, label, document, selection, inserted: new Map(), touched: new Map(),
+  return { id, pluginId, owner, label, document, selection, inserted: new Map(), insertionPins: new Map(), touched: new Map(),
     revisions: new RequestRevisions(), stop: new AbortController(), writing: false,
     pageAnswers, pageDecisions: new Map(), cursors: new Map() };
 }

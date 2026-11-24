@@ -5,6 +5,7 @@ export { bracketPairs, sameBracketIdentity, retainBracketIdentity, withoutBracke
   bracketChemistryWarnings, withBracketChemistryWarnings, moleculeBracketWarningMessages } from "./brackets";
 export { isRepeatUnitBoundaryBond, remapImportedRepeatUnitAfterMoleculeMerge, resolveRepeatUnitAtomMembership, type RepeatUnitAtomMembership, type RepeatUnitMembershipOptions } from "./repeatUnitMembership";
 export { rotatePointAboutCenter } from "./pointRotation";
+export { hasObjectIdentity, objectIdentity, retainObjectIdentity, type ObjectIdentity } from "./objectIdentity";
 export { MAX_IMAGE_OBJECT_BYTES } from "./imageBytes";
 export { MAX_IMAGE_SIDE, MAX_IMAGE_DECODED_BYTES, imagePixelLimitError, validatePngImage, validateSvgImage, isSvgImageSource, createImageGraphicObject, readPngInfo, readSvgInfo, type CreateImageGraphicObjectOptions, type ImagePixelInfo } from "./image";
 
@@ -198,6 +199,7 @@ export {
   type NativeDocumentWarningCode
 } from "./documentRead";
 export { compareNativeVersions, type NativeDocumentWriteWarning } from "./nativeCompatibilityState";
+export { nextObjectId, renumberDuplicatePageObjectIds, type ObjectIdSource, type RenumberedObjectId } from "./objectIds";
 export { copyNativeObjectExtensions, preservedNativeChemistryValues } from "./nativeObjectExtensions";
 
 export {
@@ -211,6 +213,7 @@ export {
   applyPatches,
   pruneReactionObjectReferences,
   type ApplyPatchOptions,
+  type PatchObjectTarget,
   type OrphanedRepeatUnit,
   planOrphanedRepeatUnitCleanup,
   removeOrphanedRepeatUnitBrackets,

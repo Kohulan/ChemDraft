@@ -14,9 +14,8 @@ import {
   type AppliedPatchReceipt,
   type NormalizedProposedDocumentPatch
 } from "@chemdraft/plugin-api";
-import { assertPluginDocumentWriteScope, bareIdTargetPage, objectInWriteScope, rebasePluginPatch,
-  retainedCtabCompatibility, storedCtabReference, writePatchOps, type PageObjectRef, type PluginHost,
-  type PluginWriteScopePages } from "@chemdraft/plugin-host";
+import { assertPluginDocumentWriteScope, bareIdTargetPage, rebasePluginPatch,
+  retainedCtabCompatibility, storedCtabReference, writePatchOps, type PluginHost, type PluginWriteScopePages } from "@chemdraft/plugin-host";
 import { selectionBounds, translateInsertedDocumentObjects, withImpliedRadicalChemistryRederived } from "../documentWorkflow";
 import { choosePlacement, objectRect, overlaps as boundsOverlap, pageContentRect, RELATIVE_GAP, unionRects } from "../assistant/placement";
 import type { ViewportRect } from "@chemdraft/viewport-engine";
@@ -48,11 +47,10 @@ const STORED_CHEMISTRY_FIELDS = ["structure", "structureFormat", "chemistry", "c
  * insertions are verified exactly like a scoped plugin's. */
 export function refreshPluginPatchChemistry(before: ChemDraftDocument, draft: ChemDraftDocument,
   rebased: NormalizedProposedDocumentPatch, writeScopeObjectIds?: readonly string[], signal?: AbortSignal,
-  /** Legacy writes: a selected id is in scope only on the page its selection named. */
+  /** Legacy writes: a selected id is in scope only for its pinned object, wherever that object is. */
   scopePages?: PluginWriteScopePages
 ): Promise<ChemDraftDocument> | undefined {
   const scope = writeScopeObjectIds && new Set(writeScopeObjectIds);
-  // Send-time pins resolve only on their own page; never a same-id object elsewhere.
   const inserted = new Set<string>();
   const atomUpdates = new Set<string>();
   const storedUpdates = new Set<string>();
@@ -80,14 +78,19 @@ export function refreshPluginPatchChemistry(before: ChemDraftDocument, draft: Ch
       if (object.type !== "molecule") continue;
       const previous = prior[moleculeIndex++];
       const isInsertion = inserted.has(object.id);
-      if (previous?.id !== object.id || (scope && !isInsertion && !objectInWriteScope(scope, scopePages, page.id, object.id))) continue;
+      // Skip only ids the write was never granted. Which same-id object a pin grants is the scope check's
+      // to decide (it runs before the first inspection below and refuses the rest); this gate only ever
+      // errs toward verifying, so a granted molecule's chemistry is never left unchecked.
+      if (previous?.id !== object.id || (scope && !isInsertion && !scope.has(object.id))) continue;
       // Every insertion is verified, whether a scoped command wrote it or the user accepted it.
       const verifyInsertion = isInsertion;
       // An authored atom move can change 2D stereo, but only where geometry defines stereo, and
       // never when every atom moved together keeping every stereo side. Host placement
       // translates an insertion as a unit.
+      // An exact translation keeps every relative position, including degenerate ones such as two
+      // opposite neighbours of a wedged centre, which the side check cannot read as kept.
       const graphChanged = object !== previous && (graphSignature(previous) !== graphSignature(object) ||
-        atomUpdates.has(object.id) && hasGeometryStereo(object) &&
+        atomUpdates.has(object.id) && hasGeometryStereo(object) && !translatedExactly(previous, object) &&
         !(movedAsUnit(previous, object) && keptStereoSides(previous, object)));
       // A write to the stored records must agree with the graph the canvas draws, changed or not.
       const storedChanged = object !== previous && storedUpdates.has(object.id) && storedRecord(previous) !== storedRecord(object);
@@ -212,6 +215,41 @@ function movedAsUnit(before: MoleculeObject, after: MoleculeObject): boolean {
   const zx = real / spread, zy = imaginary / spread;
   if (!(Math.hypot(zx, zy) > 1e-9)) return false;
   return offsets.every(({ ux, uy, vx, vy }) => Math.hypot(vx - (zx * ux - zy * uy), vy - (zx * uy + zy * ux)) <= tolerance);
+}
+
+/** The largest rounding allowance `translatedExactly` accepts, as a fraction of the molecule's
+ * shortest bond. Far below anything that can move a substituent to another side of a bond. */
+const TRANSLATION_ROUNDING_PER_BOND_LENGTH = 1e-9;
+
+/** True when the same atoms all moved by one vector, within floating-point rounding of the
+ * coordinates. Every relative position is then unchanged, so no 2D stereo can have changed.
+ * Rotation, reflection, scale or any per-atom difference beyond rounding does not count.
+ *
+ * Rounding grows with the coordinates' magnitude, not with the molecule: far enough from the
+ * origin it reaches a small molecule's own bond lengths, and a reflection, rotation or reshaping
+ * would fit inside it. So the allowance must also be negligible against the shortest bond; when it
+ * is not, the move is not treated as a translation and goes through the stereo checks. */
+function translatedExactly(before: MoleculeObject, after: MoleculeObject): boolean {
+  const start = new Map(before.atoms.map(atom => [atom.id, atom]));
+  if (after.atoms.length !== start.size) return false;
+  const pairs = after.atoms.map(atom => [start.get(atom.id), atom] as const);
+  const [first] = pairs;
+  if (!first?.[0] || pairs.some(([from]) => !from)) return false;
+  const dx = first[1].x - first[0].x, dy = first[1].y - first[0].y;
+  // A few units in the last place of the largest coordinate: x + d - x can differ from d by rounding.
+  let magnitude = 1;
+  for (const [from, to] of pairs) magnitude = Math.max(magnitude, Math.abs(from!.x), Math.abs(from!.y), Math.abs(to.x), Math.abs(to.y));
+  const tolerance = 8 * Number.EPSILON * magnitude;
+  let shortestBond = Infinity;
+  for (const bond of before.bonds) {
+    const from = start.get(bond.fromAtomId), to = start.get(bond.toAtomId);
+    if (!from || !to) return false;
+    shortestBond = Math.min(shortestBond, Math.hypot(to.x - from.x, to.y - from.y));
+  }
+  // No bond, a zero-length bond, or rounding comparable to the geometry: not provably a translation.
+  if (!Number.isFinite(shortestBond) || !(tolerance <= TRANSLATION_ROUNDING_PER_BOND_LENGTH * shortestBond)) return false;
+  return pairs.every(([from, to]) => Number.isFinite(to.x) && Number.isFinite(to.y) &&
+    Math.abs(to.x - from!.x - dx) <= tolerance && Math.abs(to.y - from!.y - dy) <= tolerance);
 }
 
 /** Smallest |sin| of the angle between a stereo bond and its reference that still reads as a side.
@@ -363,11 +401,8 @@ export function applyPluginDocumentPatch(
   // Record each touched object by page and id: the page an insertion names, and the page chem-core's
   // bare-id op acted on (its first occurrence). A same-id object on another page is never "touched".
   const touched = new Set<string>();
-  const touchedRefs: PageObjectRef[] = [];
   const touch = (pageId: string | undefined, objectId: string) => {
-    if (pageId === undefined || touched.has(`${pageId}\u0000${objectId}`)) return;
-    touched.add(`${pageId}\u0000${objectId}`);
-    touchedRefs.push({ pageId, objectId });
+    if (pageId !== undefined) touched.add(`${pageId}\u0000${objectId}`);
   };
   for (const op of writePatchOps(proposed.patch)) {
     switch (op.op) {
@@ -379,13 +414,18 @@ export function applyPluginDocumentPatch(
       case "setObjectOrder": op.objectIds.forEach((id) => touch(op.pageId, id)); break;
     }
   }
+  const survivingPages = new Set<string>();
   const objectIds = patched.pages.flatMap((page) =>
-    page.objects.filter((object) => touched.has(`${page.id}\u0000${object.id}`)).map((object) => object.id)
+    page.objects.filter((object) => touched.has(`${page.id}\u0000${object.id}`)).map((object) => {
+      survivingPages.add(page.id);
+      return object.id;
+    })
   );
 
   let selected = patched;
   if (objectIds.length > 0) {
-    const page = patched.pages.find((candidate) => touchedRefs.every((ref) => ref.pageId === candidate.id));
+    // Select what survived: a touched object the batch later removed no longer pins a page.
+    const page = survivingPages.size === 1 ? patched.pages.find((candidate) => survivingPages.has(candidate.id)) : undefined;
     if (page) {
       selected = applyPatch(
         patched,

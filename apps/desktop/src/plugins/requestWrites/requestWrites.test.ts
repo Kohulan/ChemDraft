@@ -7,12 +7,12 @@ import { repeatUnitMolfileGroups, repeatUnits } from "@chemdraft/export-engine";
 import type { ExportWarning } from "@chemdraft/export-engine";
 import { exportDocumentToCdxml, openChemDraftPayload } from "@chemdraft/cdx-compat";
 import { parseMolfileGraph } from "@chemdraft/clipboard-adapter";
-import { applyPatch, BracketObjectSchema, createEmptyDocument, moleculeToMolfileV2000, resolveRepeatUnitAtomMembership,
+import { admitParsedDocument, applyPatch, BracketObjectSchema, createEmptyDocument, hasObjectIdentity, moleculeToMolfileV2000, objectIdentity, parseDocument, serializeDocument, resolveRepeatUnitAtomMembership,
   toEngineDocument, type ChemDraftDocument, type DocumentObject, type MoleculeObject, type ReactionObject } from "@chemdraft/chem-core";
 import { PluginApiVersion, type PluginCommandContext, type PluginPermission, type PluginToolHandler } from "@chemdraft/plugin-api";
 import { PluginHost, type RequestDocument, type PluginPatchApplicationRequest } from "@chemdraft/plugin-host";
 import { describe, expect, it, vi } from "vitest";
-import { createNativeArtLineGraphicObject, createNativeMolfileMolecule, normalizeCommittedDocument, selectionBounds } from "../../documentWorkflow";
+import { createNativeArtLineGraphicObject, createNativeMolfileMolecule, normalizeCommittedDocument, openNativeDocument, selectionBounds } from "../../documentWorkflow";
 import { createPluginWriteGate } from "../applyPluginDocumentPatch";
 import { buildPluginTablePatch } from "../buildPluginTablePatch";
 import { createFigurePlanProviders } from "../figurePlans";
@@ -39,10 +39,12 @@ const plugin = "org.test.requests";
 
 function setup(initialIds: string[] = [], onToolCall?: PluginToolHandler,
   options: { writeSelection?: string[]; duplicate?: boolean; deferOrdinary?: boolean; objects?: DocumentObject[];
-    confirm?: (signal: AbortSignal, documentKey: string) => Promise<"enlarge" | "keep"> } = {}) {
+    confirm?: (signal: AbortSignal, documentKey: string) => Promise<"enlarge" | "keep">;
+    /** Start from this document (for example, one opened from a file) instead of the built-in one. */
+    document?: ChemDraftDocument } = {}) {
   const first = toEngineDocument(createEmptyDocument());
-  const pageId = first.pages[0]!.id;
-  let pinned: ChemDraftDocument | undefined = normalizeCommittedDocument(applyPatch(first, { op: "batch", patches: [
+  const pageId = options.document?.pages[0]!.id ?? first.pages[0]!.id;
+  let pinned: ChemDraftDocument | undefined = options.document ?? normalizeCommittedDocument(applyPatch(first, { op: "batch", patches: [
     { op: "addObject", pageId, object: note("anchor") },
     { op: "addObject", pageId, object: { ...ethane, chemistry: nativeSingleBondGraphMetadata(ethane.atoms, ethane.bonds),
       compatibility: { sourceFormat: "smiles", unknown: { smiles: "CC" }, warnings: [] } } },
@@ -1779,6 +1781,212 @@ describe("verified request writes", () => {
       f.gate.flush();
       expect(await pending).toMatchObject({ ok: false, error: { code: "cancelled" } });
       expect(f.history).toHaveLength(0);
+    } finally { await f.finish(); }
+  });
+});
+
+describe("1.2.3: a request's Send-time selection pins its object by host-owned identity", () => {
+  /** After Send, the user deletes the selected note and pastes an exact copy back under its id. */
+  const deleteAndPasteAnchor = (pageId: string) => (document: ChemDraftDocument) => {
+    const copy = structuredClone(document.pages[0]!.objects.find(object => object.id === "anchor")!);
+    return applyPatch(applyPatch(document, { op: "removeObject", objectId: "anchor" }), { op: "addObject", pageId, object: copy });
+  };
+
+  it("refuses a write to a same-page object that reuses a selected id after Send", async () => {
+    const f = setup(["anchor"]);
+    try {
+      const requestId = await f.begin();
+      f.edit(deleteAndPasteAnchor(f.pageId));
+      const pasted = f.pinned();
+      expect(await f.context.documents.applyRequestPatch!({ requestId, patch: {
+        op: "updateObject", objectId: "anchor", changes: { text: "Edited" }
+      } })).toMatchObject({ ok: false, error: { code: "scope" } });
+      expect(f.pinned()).toBe(pasted);
+      expect(f.history).toHaveLength(0);
+    } finally { await f.finish(); }
+  });
+
+  it("an object the request inserts under its deleted selection's id stays writable as its insertion", async () => {
+    const f = setup(["anchor"]);
+    try {
+      const requestId = await f.begin();
+      const apply = f.context.documents.applyRequestPatch!;
+      expect(await apply({ requestId, patch: { op: "removeObject", objectId: "anchor" } })).toMatchObject({ ok: true });
+      expect(await apply({ requestId, patch: { op: "addObject", pageId: f.pageId, object: note("anchor", "Replacement") } }))
+        .toMatchObject({ ok: true });
+      expect(await apply({ requestId, patch: { op: "updateObject", objectId: "anchor", changes: { text: "Edited replacement" } } }))
+        .toMatchObject({ ok: true });
+      expect(f.pinned().pages[0]!.objects.find(object => object.id === "anchor")).toMatchObject({ text: "Edited replacement" });
+    } finally { await f.finish(); }
+  });
+
+  it("still writes the selected object after the user edits it, and again after the request's own write", async () => {
+    const f = setup(["anchor"]);
+    try {
+      const requestId = await f.begin();
+      f.edit(document => applyPatch(document, { op: "updateObject", objectId: "anchor", changes: { x: 160 } }));
+      const apply = f.context.documents.applyRequestPatch!;
+      expect(await apply({ requestId, patch: { op: "updateObject", objectId: "anchor", changes: { text: "First" } } }))
+        .toMatchObject({ ok: true });
+      expect(await apply({ requestId, patch: { op: "updateObject", objectId: "anchor", changes: { text: "Second" } } }))
+        .toMatchObject({ ok: true });
+      expect(f.pinned().pages[0]!.objects.find(object => object.id === "anchor")).toMatchObject({ x: 160, text: "Second" });
+    } finally { await f.finish(); }
+  });
+});
+
+describe("Kimi 1.2.3 finding 3: a request's insertions are granted by identity, never by bare id", () => {
+  // The desktop history refuses any write after a user edit that follows the request's own write
+  // ("interrupted"). These edits are made without telling the history, so the scope check itself
+  // must refuse: it may never stand on that unrelated guard.
+  /** The user deletes `id` and pastes an exact copy back under it, on the first page. */
+  const deleteAndPaste = (id: string, pageId: string) => (document: ChemDraftDocument) => {
+    const copy = structuredClone(document.pages[0]!.objects.find(object => object.id === id)!);
+    return applyPatch(applyPatch(document, { op: "removeObject", objectId: id }), { op: "addObject", pageId, object: copy });
+  };
+
+  it("refuses a write to a pasted replacement of the request's own insertion", async () => {
+    const f = setup();
+    try {
+      const requestId = await f.begin();
+      const apply = f.context.documents.applyRequestPatch!;
+      expect(await apply({ requestId, patch: { op: "addObject", pageId: f.pageId, object: note("inserted") } })).toMatchObject({ ok: true });
+      f.edit(deleteAndPaste("inserted", f.pageId), false);
+      const pasted = f.pinned();
+      expect(await apply({ requestId, patch: { op: "updateObject", objectId: "inserted", changes: { text: "Edited" } } }))
+        .toMatchObject({ ok: false, error: { code: "scope" } });
+      expect(f.pinned()).toBe(pasted);
+    } finally { await f.finish(); }
+  });
+
+  it("refuses it when the insertion reused the id of the request's deleted selection", async () => {
+    const f = setup(["anchor"]);
+    try {
+      const requestId = await f.begin();
+      const apply = f.context.documents.applyRequestPatch!;
+      expect(await apply({ requestId, patch: { op: "removeObject", objectId: "anchor" } })).toMatchObject({ ok: true });
+      expect(await apply({ requestId, patch: { op: "addObject", pageId: f.pageId, object: note("anchor", "Replacement") } }))
+        .toMatchObject({ ok: true });
+      f.edit(deleteAndPaste("anchor", f.pageId), false);
+      const pasted = f.pinned();
+      expect(await apply({ requestId, patch: { op: "updateObject", objectId: "anchor", changes: { text: "Edited" } } }))
+        .toMatchObject({ ok: false, error: { code: "scope" } });
+      expect(f.pinned()).toBe(pasted);
+    } finally { await f.finish(); }
+  });
+
+  it("still writes its own insertion after the user edits it", async () => {
+    const f = setup();
+    try {
+      const requestId = await f.begin();
+      const apply = f.context.documents.applyRequestPatch!;
+      expect(await apply({ requestId, patch: { op: "addObject", pageId: f.pageId, object: note("inserted") } })).toMatchObject({ ok: true });
+      f.edit(document => applyPatch(document, { op: "updateObject", objectId: "inserted", changes: { y: 160 } }), false);
+      expect(await apply({ requestId, patch: { op: "updateObject", objectId: "inserted", changes: { text: "Edited" } } }))
+        .toMatchObject({ ok: true });
+      expect(f.pinned().pages[0]!.objects.find(object => object.id === "inserted")).toMatchObject({ y: 160, text: "Edited" });
+    } finally { await f.finish(); }
+  });
+});
+
+/**
+ * Probe run-20261122-074045-5fa6da (1.2.2): a native .chemdraft file holding two same-page objects with
+ * the id "X" opens unchanged, and with X selected, "removeObject X; updateObject X", "reorderObject X;
+ * updateObject X" and two separate writes under the same pin all reached the SECOND, unselected X. Here
+ * the document goes through the app's real open path (openNativeDocument, then admitParsedDocument and
+ * normalizeCommittedDocument as resetDocumentHistory installs it), Send pins the selection as the app
+ * does (the command invocation), and the writes go through the request-bound path.
+ */
+describe("1.2.2 probe: a request on a native file with two same-page objects sharing an id", () => {
+  function duplicateFile(): string {
+    const empty = createEmptyDocument();
+    const page = { ...empty.pages[0]!, id: "page-1", objects: [note("X", "Selected"), { ...note("X", "Not selected"), x: 300 }] };
+    return serializeDocument({ ...empty, pages: [page], selection: { pageId: "page-1", objectIds: ["X"] } });
+  }
+  /**
+   * The probe's document, installed as resetDocumentHistory installs an opened file. Since 1.2.3 the native
+   * reader renumbers the second X on open (see the last case), so these defense-in-depth cases build the
+   * document with the strict in-memory validator, which still accepts a duplicate id: the request path must
+   * stay safe for a duplicate that reaches the engine some other way.
+   */
+  function openedDuplicates(): ChemDraftDocument {
+    const installed = normalizeCommittedDocument(admitParsedDocument(parseDocument(JSON.parse(duplicateFile()))), { preserveElectronMarks: true });
+    expect(installed.pages[0]!.objects.map(object => [object.id, object.x])).toEqual([["X", 120], ["X", 300]]);
+    expect(installed.selection).toMatchObject({ pageId: "page-1", objectIds: ["X"] });
+    return installed;
+  }
+  const secondX = (document: ChemDraftDocument) => document.pages[0]!.objects.filter(object => object.id === "X")[1];
+  const moveX = { op: "updateObject" as const, objectId: "X", changes: { x: 500 } };
+  /** Nothing changed: the same document, and the unselected X keeps its value and host-owned identity. */
+  function expectUnchanged(f: ReturnType<typeof setup>, opened: ChemDraftDocument, unselected: DocumentObject) {
+    expect(f.pinned()).toBe(opened);
+    expect(secondX(f.pinned())).toEqual(unselected);
+    expect(hasObjectIdentity(secondX(f.pinned())!, objectIdentity(unselected))).toBe(true);
+    expect(f.history).toHaveLength(0);
+  }
+
+  type Patch = Parameters<NonNullable<PluginCommandContext["documents"]["applyRequestPatch"]>>[0]["patch"];
+  const shapes: [string, Patch[]][] = [
+    ["batch removeObject X; updateObject X", [{ op: "batch", patches: [{ op: "removeObject", objectId: "X" }, moveX] }]],
+    // Request writes do not accept reorderObject at all ("unavailable to request writes"); kept so the shape
+    // stays refused should that change.
+    ["batch reorderObject X; updateObject X", [{ op: "batch", patches: [{ op: "reorderObject", objectId: "X", placement: "front" }, moveX] } as never]],
+    ["two separate writes: removeObject X, then updateObject X", [{ op: "removeObject", objectId: "X" }, moveX]]
+  ];
+
+  it("a Send whose selection names both copies cannot begin a request, so no write shape can run", async () => {
+    // Send pins the selection by page and id; with two X on the Send page the selection refs name both, and
+    // the request is refused at begin with the existing scope wording. Identity cannot tell which copy the
+    // user meant (the selection is a list of ids), so this is the documented answer for a single update too.
+    const opened = openedDuplicates();
+    const unselected = secondX(opened)!;
+    const f = setup(["X"], undefined, { document: opened });
+    try {
+      expect(await f.context.requests!.begin({ label: "Edit the selection" }))
+        .toMatchObject({ ok: false, error: { code: "scope", message: "The initiating selection contains an ambiguous object ID." } });
+      for (const [, writes] of shapes) {
+        for (const patch of writes) {
+          expect(await f.context.documents.applyRequestPatch!({ requestId: "request-never-begun", patch })).toMatchObject({ ok: false });
+        }
+      }
+      expect(await f.context.documents.applyRequestPatch!({ requestId: "request-never-begun", patch: moveX })).toMatchObject({ ok: false });
+      expectUnchanged(f, opened, unselected);
+    } finally { await f.finish(); }
+  });
+
+  it.each(shapes)("a request begun on the opened file cannot reach either X with the %s", async (name, writes) => {
+    // The same document, with the request's Send selection overridden to nothing: neither X is granted.
+    // The request write refuses any op naming an id that is ambiguous on its page, before scope.
+    const refusal = name.includes("reorderObject") ? "Invalid documents.applyRequestPatch arguments." : 'Ambiguous object ID "X".';
+    const opened = openedDuplicates();
+    const unselected = secondX(opened)!;
+    const f = setup(["X"], undefined, { document: opened, writeSelection: [] });
+    try {
+      const requestId = await f.begin();
+      for (const patch of writes) {
+        const result = await f.context.documents.applyRequestPatch!({ requestId, patch });
+        expect(result, JSON.stringify(result)).toMatchObject({ ok: false, error: { code: "invalid", message: refusal } });
+      }
+      expectUnchanged(f, opened, unselected);
+    } finally { await f.finish(); }
+  });
+
+  it("1.2.3: File > Open renumbers the second X, so a request can begin and a single update of the selected X now lands", async () => {
+    // Previously refused at begin ("ambiguous object ID"): the opened file now holds one X and one X_002.
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const opened = openNativeDocument(duplicateFile());
+    vi.restoreAllMocks();
+    expect(opened.warnings.map(warning => warning.code)).toContain("NATIVE_DUPLICATE_OBJECT_IDS_RENUMBERED");
+    const installed = normalizeCommittedDocument(admitParsedDocument(opened.document!), { preserveElectronMarks: true });
+    expect(installed.pages[0]!.objects.map(object => [object.id, object.x])).toEqual([["X", 120], ["X_002", 300]]);
+    const other = installed.pages[0]!.objects[1]!;
+    const f = setup(["X"], undefined, { document: installed });
+    try {
+      const requestId = await f.begin();
+      expect(await f.context.documents.applyRequestPatch!({ requestId, patch: moveX })).toMatchObject({ ok: true });
+      expect(f.pinned().pages[0]!.objects.map(object => [object.id, object.x])).toEqual([["X", 500], ["X_002", 300]]);
+      expect(f.pinned().pages[0]!.objects[1]).toEqual(other);
+      expect(hasObjectIdentity(f.pinned().pages[0]!.objects[1]!, objectIdentity(other))).toBe(true);
     } finally { await f.finish(); }
   });
 });

@@ -26,4 +26,7 @@ export * from "./inspectorModel";
 export * from "./results";
 export * from "./scheduler";
 export * from "./session";
+// The stereochemistry labels RDKit analysis writes into a molecule's chemistry record, and the
+// predicate that tells an assigned descriptor from the unassigned-centre note.
+export * from "./stereochemistryLabels";
 export * from "./units";

@@ -34,7 +34,11 @@ IDs remain unchanged. `setDrawingDefaults` is the typed patch for document drawi
 Native files use feature-based minimum app versions. `readSerializedDocument(contents)` and
 `readDocument(candidate)` return `{ document, warnings, formatVersion, minAppVersion }`; use these
 when the host needs to present compatibility warnings. `deserializeDocument` remains the
-document-only convenience API. Legacy visual classifiers degrade with named warnings in every file,
+document-only convenience API. Object ids are page-scoped: when a file holds two objects with one
+id on the same page, the reader keeps the first and gives each later copy a fresh id from
+`nextObjectId`, with one `NATIVE_DUPLICATE_OBJECT_IDS_RENUMBERED` warning and a log line. Only ids
+change; references that cannot be attributed to one copy keep pointing at the first.
+`parseDocument` (the strict in-memory validator) does not renumber. Legacy visual classifiers degrade with named warnings in every file,
 including unversioned files, and preserve their original values for re-save. Main's legacy chemistry
 classifiers (bond order, structure/expansion encoding, reaction mapping, mechanism-arrow kind and
 electron-mark kind) likewise open as `unknown`, with `NATIVE_CHEMISTRY_ENUM_FALLBACK` naming the
