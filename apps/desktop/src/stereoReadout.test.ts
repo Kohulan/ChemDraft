@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createEmptyDocument, type MoleculeObject } from "@chemdraft/chem-core";
-import { createSmilesMolecule } from "@chemdraft/document-workflow-core";
+import { createSmilesMolecule, stereoPerceptionMolfile } from "@chemdraft/document-workflow-core";
 import * as ocl from "@chemdraft/ocl-adapter";
 import { buildObjectCanvasMenu } from "./canvasContextMenuModel";
 import { popupNativeCanvasMenu } from "./nativeCanvasContextMenu";
 import {
-  loadStereoEngine, resetStereoEngineForTests, resolveStereoReadout, stereoReadoutLabel, stereoReadoutRequest,
-  stereoReadoutTargetFromPart, type StereoEngine
+  loadStereoEngine, resetStereoEngineForTests, resolveStereoReadout, stereoReadoutLabel, stereoReadoutMolfile,
+  stereoReadoutRequest, stereoReadoutTargetFromPart, type StereoEngine
 } from "./stereoReadout";
 
 const tauriInvoke = vi.hoisted(() => vi.fn());
@@ -74,6 +74,92 @@ describe("stereo readout from the existing OCL perceiver", () => {
     // Whatever the engine says is what the row says: the label is the engine's descriptor.
     expect(stereoReadoutLabel({ molecule: s, atomId: s.atoms[STEREOCENTRE_INDEX]!.id }, fixed)).toBe("Stereocentre: R");
     expect(fixed.perceiveStereoCentersFromMolfile).toHaveBeenCalledOnce();
+  });
+});
+
+/** Collapses the atoms after `keepIndex` in `removeFrom..` into one labelled atom at `keepIndex`,
+ * the way a drawn abbreviation stands in for a group. */
+function abbreviate(source: MoleculeObject, keepIndex: number, removeFrom: number, label: string): MoleculeObject {
+  const kept = source.atoms[keepIndex]!.id;
+  const removed = new Set(source.atoms.slice(removeFrom).map(atom => atom.id));
+  return {
+    ...source,
+    atoms: source.atoms.filter(atom => !removed.has(atom.id)).map(atom => atom.id === kept ? { ...atom, element: label } : atom),
+    bonds: source.bonds.filter(bond => !removed.has(bond.fromAtomId) && !removed.has(bond.toAtomId))
+  };
+}
+const relabel = (source: MoleculeObject, index: number, label: string): MoleculeObject =>
+  ({ ...source, atoms: source.atoms.map((atom, i) => i === index ? { ...atom, element: label } : atom) });
+
+// (S)-1-phenylethylamine: atom 1 is the centre (N > Ph > CH3 > H); atom 3 is the ipso carbon.
+const S_PHENYLETHYLAMINE = "N[C@@H](C)c1ccccc1";
+
+describe("molecules with placeholder atoms show no row (AGENTS.md §8)", () => {
+  it("declines a centre next to Ph, where the engine's placeholder reading is wrong", () => {
+    const expanded = molecule(S_PHENYLETHYLAMINE);
+    const centreId = expanded.atoms[1]!.id;
+    expect(stereoReadoutLabel({ molecule: expanded, atomId: centreId }, engine)).toBe("Stereocentre: S");
+    const ph = abbreviate(expanded, 3, 4, "Ph");
+    expect(ph.atoms.map(atom => atom.element)).toEqual(["N", "C", "C", "Ph"]);
+    // The perceiver alone would answer R here: the "Ph" placeholder does not rank as phenyl.
+    expect(engine.perceiveStereoCentersFromMolfile(stereoPerceptionMolfile(ph))[1]).toEqual({ isStereoCenter: true, descriptor: "R" });
+    expect(stereoReadoutMolfile(ph)).toBeUndefined();
+    expect(stereoReadoutLabel({ molecule: ph, atomId: centreId }, engine)).toBeUndefined();
+  });
+
+  it.each(["Ph", "CH3", "OMe", "R1", "R", "*", "Et"])("declines every atom and bond in a molecule holding a %s label", label => {
+    // The label sits on a methyl far from the centre, and still nothing is shown for the molecule.
+    const s = relabel(molecule(S_IBUPROFEN), 0, label);
+    expect(stereoReadoutMolfile(s)).toBeUndefined();
+    expect(stereoReadoutLabel({ molecule: s, atomId: s.atoms[STEREOCENTRE_INDEX]!.id }, engine)).toBeUndefined();
+    const e = relabel(molecule("C/C=C/CC"), 4, label);
+    expect(stereoReadoutLabel({ molecule: e, bondId: doubleBond(e).id }, engine)).toBeUndefined();
+  });
+
+  it("still reads R/S and E/Z in plain molecules, including D and T isotope symbols", () => {
+    const s = molecule(S_IBUPROFEN);
+    expect(stereoReadoutMolfile(s)).toBe(stereoPerceptionMolfile(s));
+    expect(stereoReadoutLabel({ molecule: s, atomId: s.atoms[STEREOCENTRE_INDEX]!.id }, engine)).toBe("Stereocentre: S");
+    // A drawn "D" or "T" atom is written as that symbol, which is hydrogen, not a placeholder.
+    for (const isotope of ["D", "T"]) {
+      const labelled = relabel(molecule("C/C=C/CC"), 4, isotope);
+      expect(stereoReadoutMolfile(labelled)?.split("\n")[8]?.slice(31, 34).trim()).toBe(isotope);
+      expect(stereoReadoutLabel({ molecule: labelled, bondId: doubleBond(labelled).id }, engine)).toBe("Double bond: E");
+    }
+  });
+
+  it("keeps the index mapping across a disconnected second component", () => {
+    // Two ibuprofen components in one molecule object, S then R; the second centre is atom 15 + 10.
+    const two = molecule(`${S_IBUPROFEN}.${R_IBUPROFEN}`);
+    expect(two.atoms).toHaveLength(30);
+    expect(stereoReadoutLabel({ molecule: two, atomId: two.atoms[STEREOCENTRE_INDEX]!.id }, engine)).toBe("Stereocentre: S");
+    expect(stereoReadoutLabel({ molecule: two, atomId: two.atoms[15 + STEREOCENTRE_INDEX]!.id }, engine)).toBe("Stereocentre: R");
+    expect(stereoReadoutLabel({ molecule: two, atomId: two.atoms[15]!.id }, engine)).toBeUndefined();
+    // A labelled atom in either component declines the whole molecule object.
+    const labelled = relabel(two, 15, "Ph");
+    expect(stereoReadoutLabel({ molecule: labelled, atomId: labelled.atoms[STEREOCENTRE_INDEX]!.id }, engine)).toBeUndefined();
+    // A Ph in a different molecule object leaves this one alone.
+    const other = abbreviate(molecule(S_PHENYLETHYLAMINE), 3, 4, "Ph");
+    expect(stereoReadoutLabel({ molecule: other, atomId: other.atoms[1]!.id }, engine)).toBeUndefined();
+    expect(stereoReadoutLabel({ molecule: two, atomId: two.atoms[15 + STEREOCENTRE_INDEX]!.id }, engine)).toBe("Stereocentre: R");
+  });
+
+  it("reports ring E/Z exactly as the engine does, and nothing where it reports none", () => {
+    // Expected values checked against perceiveDoubleBondStereoFromMolfile (2026-11-24).
+    for (const [smiles, expected] of [
+      ["C1=C\\CCCCCC/1", "Double bond: Z"], // cis-cyclooctene
+      ["C1=C/CCCCCC/1", "Double bond: E"], // trans-cyclooctene
+      ["C1=CCCCC1", undefined] // cyclohexene: the engine assigns no E/Z
+    ] as const) {
+      const ring = molecule(smiles);
+      const bond = doubleBond(ring);
+      const index = (id: string) => ring.atoms.findIndex(atom => atom.id === id);
+      const reported = engine.perceiveDoubleBondStereoFromMolfile(stereoPerceptionMolfile(ring)).find(entry =>
+        [entry.from, entry.to].sort().join() === [index(bond.fromAtomId), index(bond.toAtomId)].sort().join());
+      const engineLabel = reported?.descriptor === "E" || reported?.descriptor === "Z" ? `Double bond: ${reported.descriptor}` : undefined;
+      expect(stereoReadoutLabel({ molecule: ring, bondId: bond.id }, engine), smiles).toBe(engineLabel);
+      expect(engineLabel, smiles).toBe(expected);
+    }
   });
 });
 

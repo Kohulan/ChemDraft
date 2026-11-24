@@ -1,4 +1,4 @@
-import type { MoleculeObject } from "@chemdraft/chem-core";
+import { elementSymbols, type MoleculeObject } from "@chemdraft/chem-core";
 import { stereoPerceptionMolfile } from "@chemdraft/document-workflow-core";
 import type {
   perceiveDoubleBondStereoFromMolfile,
@@ -14,6 +14,12 @@ import type {
  * produced only when the engine reports a defined R/S or E/Z; anything else (not stereogenic,
  * unspecified, an "either" double bond, a drawing the molfile writer refuses, an engine
  * failure) yields no label, so the menu never shows a guess.
+ *
+ * A molecule with any atom the writer cannot spell as an element (a label or abbreviation such as
+ * "Ph", "CH3" or "OMe", a collapsed superatom, an R-group, a "*") gets no row at all. The writer
+ * stands an R-group placeholder in for each such atom; a placeholder ranks apart from every element
+ * but not by the group's true CIP priority, so a centre or double bond anywhere in that molecule
+ * could read the wrong R/S or E/Z (AGENTS.md §8: decline rather than guess).
  */
 export interface StereoEngine {
   perceiveStereoCentersFromMolfile: typeof perceiveStereoCentersFromMolfile;
@@ -39,6 +45,27 @@ export function stereoReadoutTargetFromPart(
   return undefined;
 }
 
+// What the V2000 writer emits for a real atom; "D" and "T" are hydrogen isotopes.
+const ELEMENT_SYMBOLS: ReadonlySet<string> = new Set([...elementSymbols, "D", "T"]);
+
+/**
+ * The molfile the perceiver reads, or undefined when the writer replaced any drawn atom with a
+ * placeholder. Decided from the molfile actually written, not by re-deciding which labels spell:
+ * every atom line must carry an element symbol, and no `M  RGP` placeholder line may appear.
+ * Throws whatever `stereoPerceptionMolfile` throws (query bonds, over 999 atoms).
+ */
+export function stereoReadoutMolfile(molecule: MoleculeObject): string | undefined {
+  const molfile = stereoPerceptionMolfile(molecule);
+  const lines = molfile.split("\n");
+  const atomCount = Number.parseInt(lines[3]?.slice(0, 3) ?? "", 10);
+  if (atomCount !== molecule.atoms.length) return undefined;
+  for (let index = 0; index < atomCount; index++) {
+    // V2000 atom line: x, y, z (10 columns each), a space, then the 3-column symbol.
+    if (!ELEMENT_SYMBOLS.has(lines[4 + index]?.slice(31, 34).trim() ?? "")) return undefined;
+  }
+  return lines.some(line => line.startsWith("M  RGP")) ? undefined : molfile;
+}
+
 /** Synchronous readout against an already loaded engine. Never throws. */
 export function stereoReadoutLabel(target: StereoReadoutTarget, engine: StereoEngine): string | undefined {
   const { molecule } = target;
@@ -46,8 +73,11 @@ export function stereoReadoutLabel(target: StereoReadoutTarget, engine: StereoEn
     if ("atomId" in target) {
       const index = molecule.atoms.findIndex(atom => atom.id === target.atomId);
       if (index < 0) return undefined;
-      // Index-aligned to molecule.atoms: stereoPerceptionMolfile writes atoms in document order.
-      const center = engine.perceiveStereoCentersFromMolfile(stereoPerceptionMolfile(molecule))[index];
+      const molfile = stereoReadoutMolfile(molecule);
+      if (!molfile) return undefined;
+      // Index-aligned to molecule.atoms: stereoPerceptionMolfile writes atoms in document order,
+      // and the perceiver reports in that input order (disconnected components included).
+      const center = engine.perceiveStereoCentersFromMolfile(molfile)[index];
       if (!center?.isStereoCenter) return undefined;
       return center.descriptor === "R" || center.descriptor === "S" ? `Stereocentre: ${center.descriptor}` : undefined;
     }
@@ -58,7 +88,9 @@ export function stereoReadoutLabel(target: StereoReadoutTarget, engine: StereoEn
     const from = molecule.atoms.findIndex(atom => atom.id === bond.fromAtomId);
     const to = molecule.atoms.findIndex(atom => atom.id === bond.toAtomId);
     if (from < 0 || to < 0) return undefined;
-    const perceived = engine.perceiveDoubleBondStereoFromMolfile(stereoPerceptionMolfile(molecule))
+    const molfile = stereoReadoutMolfile(molecule);
+    if (!molfile) return undefined;
+    const perceived = engine.perceiveDoubleBondStereoFromMolfile(molfile)
       .find(entry => (entry.from === from && entry.to === to) || (entry.from === to && entry.to === from));
     return perceived?.descriptor === "E" || perceived?.descriptor === "Z" ? `Double bond: ${perceived.descriptor}` : undefined;
   } catch {
