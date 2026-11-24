@@ -112,7 +112,9 @@ handshake check that needs only Node, no binutils) finds a real x86-64 ELF whose
 protocol message for the check's session, and the commit result must report
 Avogadro-backed UFF and the pinned commit. A sidecar that hangs is killed (SIGTERM,
 then SIGKILL) and fails the check. It then runs `pnpm audit:engine3d-sidecar`
-and all three smokes below, and uploads the artifact `engine3d-sidecar-linux-x86_64`
+and all three smokes below with `CHEMDRAFT_ENGINE3D_SIDECAR` set to
+`native/avogadro3d-sidecar/build/linux-x86_64/avogadro3d-sidecar` (the examples below name the
+`protocol-scout` build), and uploads the artifact `engine3d-sidecar-linux-x86_64`
 (the binary and its `.sha256`), printing the SHA-256 and the run id in the job summary.
 
 A maintainer commits that binary (mode 0755) and puts the run id and SHA-256 into

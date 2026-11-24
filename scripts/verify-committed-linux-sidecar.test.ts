@@ -39,8 +39,11 @@ describe("the committed x86_64 Linux 3D sidecar pin", () => {
     expect(sha256Hex(committed)).toBe(pin.sha256);
     expect(committedSidecarProblem(committed, pin)).toBeUndefined();
     const inventory = read("docs/architecture/dependency-inventory.md").toString("utf8");
-    expect(inventory).toContain(pin.sha256);
-    expect(inventory).toContain(`run id: ${pin.buildRunId}`);
+    // Both values in the Linux entry itself, not anywhere in the inventory.
+    const linuxEntry = /\*\*x86_64 Linux build — [^*]*\*\*/.exec(inventory)?.[0];
+    expect(linuxEntry).toBeDefined();
+    expect(linuxEntry).toContain(`run id: ${pin.buildRunId} `);
+    expect(linuxEntry).toContain(`SHA-256: \`${pin.sha256}\``);
   });
 });
 
@@ -112,6 +115,11 @@ describe("verifyPackagedLinuxSidecar", () => {
         path: LINUX_SIDECAR_PATH, buildWorkflow: ".github/workflows/linux-sidecar-build.yml", buildRunId: "42", sha256: sha256Hex(pinned)
       }));
     }
+  });
+
+  it("refuses a payload that is not a regular file before reading it", async () => {
+    // Read first, a directory was reported missing and a FIFO with no writer blocked the read.
+    await expect(verify(root)).rejects.toThrow(`${root} is not a regular file in the package.`);
   });
 
   it("refuses a missing payload sidecar and the placeholder", async () => {

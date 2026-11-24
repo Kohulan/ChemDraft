@@ -1809,6 +1809,11 @@ pub fn run() {
                     }
                 }
                 WindowEvent::Resized(_) if toolset_is_resizable(&toolset_id) => {
+                    // A minimize or hide can arrive as a resize (Windows reports 0 x 0). It is no
+                    // user frame, so it must not end a fit either; the `Moved` arm skips it too.
+                    if visible_toolset_physical_position(window).is_none() {
+                        return;
+                    }
                     let Ok(size) = window.inner_size() else {
                         return;
                     };
@@ -3636,7 +3641,12 @@ fn close_toolset_window(
     // waiting for, building or arming its window does not show it afterwards (a later open does).
     palette_first_paint::closed(&toolset_window_label(&toolset_id));
     let window = app.get_webview_window(&toolset_window_label(&toolset_id));
-    if let Some(window) = window.as_ref() {
+    // A fitted palette's live position is ChemDraft's adjustment to a smaller work area, not the
+    // user's (toolset_fit): saving it would stop a later open from restoring the user's own frame.
+    let fitted = window
+        .as_ref()
+        .is_some_and(|window| toolset_fit::with_memory(|memory| memory.is_fitted(window.label())));
+    if let Some(window) = window.as_ref().filter(|_| !fitted) {
         let webview: &tauri::Webview = window.as_ref();
         if let Some(position) = visible_toolset_physical_position(&webview.window()) {
             // Best-effort, exactly like the `Moved` handler. Remembering where the palette was is
@@ -5464,7 +5474,11 @@ mod plugin_panel_label_tests {
         let panel_capability: serde_json::Value =
             serde_json::from_str(include_str!("../capabilities/plugin-panel.json")).unwrap();
         for permission in panel_capability["permissions"].as_array().unwrap() {
-            let permission = permission.as_str().unwrap_or_default();
+            // An entry is an identifier string or an object carrying one.
+            let permission = permission
+                .as_str()
+                .or_else(|| permission["identifier"].as_str())
+                .unwrap_or_default();
             assert!(
                 !matches!(
                     permission,
@@ -17400,7 +17414,13 @@ mod tests {
             fs::write(&path, "").expect("fixture should write");
             // A file its owner cannot execute is never the sidecar: the override is skipped (the
             // bundled sidecar or "missing" decides) rather than winning and failing every session.
+            // Root may execute a file with any execute bit set (access(2)), so 0o055 only below it.
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            let root = unsafe { libc::geteuid() } == 0;
             for mode in [0o644, 0o600, 0o055] {
+                if mode == 0o055 && root {
+                    continue;
+                }
                 fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("chmod");
                 expect_true(!is_runnable_sidecar(&path));
                 let status = engine3d_sidecar_status_from(Some(path.to_string_lossy().to_string()));

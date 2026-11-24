@@ -24,6 +24,8 @@ const KILL_GRACE_MS = 5_000;
 const TIMEOUT_STATUS = 124;
 /** The session the handshake creates; every message the sidecar writes back must carry it. */
 export const HANDSHAKE_SESSION = "sidecar-check";
+/** The app rejects a longer protocol line (DefaultEngine3DMaxMessageBytes in packages/engine3d-api). */
+export const MAX_MESSAGE_BYTES = 4 * 1024 * 1024;
 
 /** Libraries glibc itself provides. libstdc++ and libgcc are linked statically (linux-build.yml). */
 export const GLIBC_LIBRARIES = new Set([
@@ -227,6 +229,7 @@ export function parseHandshakeMessages(stdout, session = HANDSHAKE_SESSION) {
   const messages = [];
   for (const [index, line] of stdout.slice(0, -1).split("\n").entries()) {
     const bad = (why) => ({ problem: `wrote a non-protocol line to stdout (line ${index + 1} ${why})` });
+    if (Buffer.byteLength(line, "utf8") > MAX_MESSAGE_BYTES) return bad(`is longer than the app's ${MAX_MESSAGE_BYTES}-byte limit`);
     let message;
     try { message = JSON.parse(line); } catch { return bad("is not JSON"); }
     if (!isRecord(message)) return bad("is not a JSON object");
@@ -247,6 +250,12 @@ export function parseHandshakeMessages(stdout, session = HANDSHAKE_SESSION) {
 export function handshakeProblem(stdout, commit, session = HANDSHAKE_SESSION) {
   const { messages, problem } = parseHandshakeMessages(stdout, session);
   if (problem) return problem;
+  // The app records an error event on the session even when the expected messages follow it.
+  const error = messages.find((message) => message.type === "event" && message.eventType === "error");
+  if (error) {
+    const detail = typeof error.message === "string" && error.message !== "" ? `: ${error.message}` : "";
+    return `handshake reported an error event for ${error.requestId}${detail}`;
+  }
   const response = (requestId) => messages.filter((message) => message.type === "response" && message.requestId === requestId);
   const event = (requestId, eventType) => messages.filter((message) =>
     message.type === "event" && message.requestId === `${requestId}.event` && message.eventType === eventType);
@@ -376,7 +385,8 @@ export async function checkEngine3dSidecar(sidecar, { rootDir = ROOT_DIR, log = 
   const commit = pinnedAvogadroCommit(readFileSync(join(rootDir, "native", "avogadro3d-sidecar", "CMakeLists.txt"), "utf8"));
   if (!commit) fail("CMakeLists.txt must pin exactly one avogadrolibs commit");
 
-  const { status, stdout, stderr, timedOut } = await runSidecarHandshake(sidecar, handshakeRequests());
+  // The file checked above, relative to the working directory: spawn would look a bare name up in PATH.
+  const { status, stdout, stderr, timedOut } = await runSidecarHandshake(resolve(sidecar), handshakeRequests());
   const show = () => {
     log("--- sidecar stdout"); process.stdout.write(stdout);
     log("--- sidecar stderr"); process.stdout.write(stderr);

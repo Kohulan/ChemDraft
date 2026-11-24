@@ -115,34 +115,54 @@ def keys(*shortcuts):
     run("xdotool", "key", "--clearmodifiers", "--delay", "100", *shortcuts)
 
 
+# Runs in a child process (input_focus_window): prints the focus window's number, or exits 1.
+INPUT_FOCUS_QUERY = r"""
+import ctypes
+import ctypes.util
+import os
+import sys
+library = ctypes.util.find_library("X11")
+if not library:
+    sys.exit("libX11 not found")
+xlib = ctypes.CDLL(library)
+xlib.XOpenDisplay.restype = ctypes.c_void_p
+xlib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+xlib.XGetInputFocus.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong),
+                                ctypes.POINTER(ctypes.c_int)]
+xlib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+display = xlib.XOpenDisplay(os.environ.get("DISPLAY", "").encode() or None)
+if not display:
+    sys.exit(f"cannot open X display {os.environ.get('DISPLAY')!r}")
+window = ctypes.c_ulong()
+revert = ctypes.c_int()
+xlib.XGetInputFocus(display, ctypes.byref(window), ctypes.byref(revert))
+xlib.XCloseDisplay(display)
+print(window.value)
+"""
+
+
 def input_focus_window():
     """The X window that has input focus, or None when no window does.
 
     XGetInputFocus answers None (0) or PointerRoot (1) when no window is focused. Querying
     either as a window is a BadWindow error (xdotool getwindowfocus does exactly that), so
     those answers are mapped to "no window focused" here. Returns the window number as a
-    string, or None; raises OSError if libX11 or the display cannot be opened."""
-    import ctypes
-    import ctypes.util
-    library = ctypes.util.find_library("X11")
-    if not library:
-        raise OSError("libX11 not found")
-    xlib = ctypes.CDLL(library)
-    xlib.XOpenDisplay.restype = ctypes.c_void_p
-    xlib.XOpenDisplay.argtypes = [ctypes.c_char_p]
-    xlib.XGetInputFocus.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong),
-                                    ctypes.POINTER(ctypes.c_int)]
-    xlib.XCloseDisplay.argtypes = [ctypes.c_void_p]
-    display = xlib.XOpenDisplay(os.environ.get("DISPLAY", "").encode() or None)
-    if not display:
-        raise OSError(f"cannot open X display {os.environ.get('DISPLAY')!r}")
+    string, or None; raises OSError if libX11 or the display cannot be opened, or the query
+    does not answer.
+
+    The query runs in a child process: if the X server goes away during it, Xlib's default
+    I/O error handler exits the process, which here would skip explain_failure and the
+    Session cleanup."""
     try:
-        window = ctypes.c_ulong()
-        revert = ctypes.c_int()
-        xlib.XGetInputFocus(display, ctypes.byref(window), ctypes.byref(revert))
-    finally:
-        xlib.XCloseDisplay(display)
-    return None if window.value in (0, 1) else str(window.value)
+        result = subprocess.run([sys.executable, "-c", INPUT_FOCUS_QUERY],
+                                capture_output=True, timeout=10)
+    except subprocess.TimeoutExpired as error:
+        raise OSError(f"the X focus query did not answer within {error.timeout} s") from error
+    answer = result.stdout.decode(errors="replace").strip()
+    if result.returncode or not answer.isdigit():
+        message = result.stderr.decode(errors="replace").strip()
+        raise OSError(message or f"the X focus query exited with status {result.returncode}")
+    return None if int(answer) in (0, 1) else answer
 
 
 def xclip(target):
@@ -999,11 +1019,16 @@ def type_into_field(session, Atspi, settings):
 
 
 def x_server_reachable():
-    """(reachable, detail): whether an X connection to $DISPLAY works (xdpyinfo, as action.yml)."""
+    """(reachable, detail): whether an X connection to $DISPLAY works (xdpyinfo, as action.yml).
+
+    reachable is None when xdpyinfo itself could not be started (not every install list has
+    it), which says nothing about the X server."""
     try:
         result = subprocess.run(["xdpyinfo"], capture_output=True, timeout=10)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        return False, f"xdpyinfo could not run: {error}"
+    except subprocess.TimeoutExpired as error:
+        return False, f"xdpyinfo did not answer: {error}"
+    except OSError as error:
+        return None, f"xdpyinfo could not run: {error}"
     if result.returncode:
         return False, result.stderr.decode(errors="replace").strip() or f"exit {result.returncode}"
     return True, ""
@@ -1027,7 +1052,10 @@ def explain_failure(session):
             print(f"Cannot read display.log: {error}", flush=True)
         dropped = ("failed to read Wayland events" in log or "unmapped surface or view" in log)
         compositor_gone = session.server is not None and session.server.poll() is not None
-        if not reachable:
+        if reachable is None:
+            print("Cannot tell whether XWayland is still alive on "
+                  f"DISPLAY={os.environ.get('DISPLAY')}: {detail}.", flush=True)
+        elif not reachable:
             who = "Weston" if session.compositor == "weston" else "KWin"
             if session.compositor == "weston" and not compositor_gone:
                 print("Weston dropped XWayland: the X server on "

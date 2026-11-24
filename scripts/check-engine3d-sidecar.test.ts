@@ -13,6 +13,7 @@ import {
   handshakeProblem,
   handshakeRequests,
   MAX_GLIBC,
+  MAX_MESSAGE_BYTES,
   newestVersion,
   packagedModeProblem,
   pinnedAvogadroCommit,
@@ -228,6 +229,26 @@ describe("handshake", () => {
       .toBe('wrote a non-protocol line to stdout (line 1 has type "request", not response or event)');
     expect(handshakeProblem(`${envelope("check-ping.event", "event")},"eventType":"bogus"}\n${goodStdout}`, commit))
       .toBe('wrote a non-protocol line to stdout (line 1 has eventType "bogus")');
+  });
+
+  it("refuses a line longer than the app accepts, and accepts one at the limit", () => {
+    const padded = (bytes: number) => {
+      const line = `${envelope("check-ping.event", "event")},"eventType":"heartbeat","pad":""}`;
+      return line.replace('"pad":""', `"pad":"${"x".repeat(bytes - line.length)}"`);
+    };
+    expect(Buffer.byteLength(padded(MAX_MESSAGE_BYTES))).toBe(MAX_MESSAGE_BYTES);
+    expect(handshakeProblem(`${padded(MAX_MESSAGE_BYTES)}\n${goodStdout}`, commit)).toBeUndefined();
+    expect(handshakeProblem(`${padded(MAX_MESSAGE_BYTES + 1)}\n${goodStdout}`, commit))
+      .toBe(`wrote a non-protocol line to stdout (line 1 is longer than the app's ${MAX_MESSAGE_BYTES}-byte limit)`);
+  });
+
+  it("refuses an error event even when every expected message follows it", () => {
+    const error = `${envelope("check-create.event", "event")},"eventType":"error","message":"UFF setup failed"}`;
+    expect(handshakeProblem(`${error}\n${goodStdout}`, commit))
+      .toBe("handshake reported an error event for check-create.event: UFF setup failed");
+    // A warning is not fatal in the app, so it does not fail the check.
+    const warning = `${envelope("check-create.event", "event")},"eventType":"warning","message":"slow"}`;
+    expect(handshakeProblem(`${warning}\n${goodStdout}`, commit)).toBeUndefined();
   });
 
   it("refuses commit metadata outside the result object, as the app reads it", () => {

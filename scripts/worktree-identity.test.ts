@@ -202,11 +202,12 @@ describe.skipIf(process.platform === "win32")("run-app shared dev lock guard", (
           process.exit(0);
         });
         console.log('ready');
-        setTimeout(() => process.exit(1), 60000);
+        setTimeout(() => process.exit(1), 150000);
       \`], { stdio: ['ignore', 'pipe', 'inherit'] });
       child.stdout.once('data', () => console.log('ready'));
       setInterval(() => { if (existsSync(join(directory, 'finish'))) process.exit(0); }, 20);
-      setTimeout(() => process.exit(1), 60000);
+      // Fallbacks only, past the test's own 120 s budget, so a slow host cannot release the lock early.
+      setTimeout(() => process.exit(1), 150000);
     `);
     const devPath = source.slice(source.indexOf('\nif [ "$RUN_MODE" = "--dev" ]; then\n'),
       source.indexOf('\nstop_existing_dev_server "$DEV_PORT" ignore-unrelated\n'));

@@ -7,7 +7,7 @@
 // checks the sidecar inside a built .deb or AppImage payload the same way, against the same pin.
 // Node built-ins only. Usage: node scripts/verify-committed-linux-sidecar.mjs [--packaged <payload sidecar>]
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { checkEngine3dSidecar, SidecarCheckFailure } from "./check-engine3d-sidecar.mjs";
@@ -84,6 +84,11 @@ export async function verifyCommittedLinuxSidecar({ rootDir = ROOT_DIR, log = co
  */
 export async function verifyPackagedLinuxSidecar(payloadPath, { rootDir = ROOT_DIR, log = console.log } = {}) {
   const pin = readLinuxSidecarPin(rootDir);
+  // The file type before reading: reading a FIFO or a device could block before any timeout applies.
+  // The 0755 mode is checked with the handshake (checkEngine3dSidecar, packaged).
+  let stats;
+  try { stats = lstatSync(payloadPath); } catch { throw new SidecarCheckFailure(`${payloadPath} is missing.`, { perFile: false }); }
+  if (!stats.isFile()) throw new SidecarCheckFailure(`${payloadPath} is not a regular file in the package.`, { perFile: false });
   let bytes;
   try { bytes = readFileSync(payloadPath); } catch { throw new SidecarCheckFailure(`${payloadPath} is missing.`, { perFile: false }); }
   const problem = committedSidecarProblem(bytes, pin, payloadPath);
