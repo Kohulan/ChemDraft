@@ -415,7 +415,7 @@ it("saves an unchanged caption whose font was left out as plain styled text, nam
   expect(named).toEqual(["3"]);
   expect(saved.warnings.filter(w => w.code === "cdxml.font_entry_too_long").map(w => w.message)).toEqual([
     `CDXML export: the source font of text ${omitted.id} has a name longer than 256 characters, or more than 512 characters of font attributes, far beyond any real font; ` +
-    "it was not written, and text set in it was written without its caption frame and run fonts, or in the default font."
+    "it was not written, and text whose source runs name it was written from its current text and styles instead of being copied from its source."
   ]);
   // The text itself is kept, and the other caption keeps its unchanged source form.
   expect(saved.warnings.map(w => w.code)).not.toContain("cdxml.text_source_formatting_not_kept");
@@ -437,8 +437,40 @@ it("does not copy an unchanged source text naming a stored font that is too long
   const saved = exportDocumentToCdxml(opened.document!, plain);
   const { listed, named } = fontIdsOf(saved.contents);
   expect(named.every(id => listed.has(id))).toBe(true);
-  expect(saved.warnings.filter(w => w.code === "cdxml.font_entry_too_long")).toHaveLength(1);
-  expect(textsOf(openChemDraftPayload(saved.contents)).map(text => text.text)).toEqual(["x", "x"]);
+  // The caption naming font 7 is written from its current state, which keeps its frame and its font
+  // (Times, now under a new id): the warning must not say it lost them.
+  expect(saved.warnings.filter(w => w.code === "cdxml.font_entry_too_long").map(w => w.message)).toEqual([
+    "CDXML export: font 7 has a name longer than 256 characters, or more than 512 characters of font attributes, far beyond any real font; " +
+    "it was not written, and text whose source runs name it was written from its current text and styles instead of being copied from its source."
+  ]);
+  expect(saved.contents).toContain('<font id="1" charset="iso-8859-1" name="Times"/>');
+  expect(saved.contents).toContain('<t id="9" p="30 72" BoundingBox="30 60 54 72" Justification="Left"><s font="1" size="10" face="0">x</s></t>');
+  const again = textsOf(openChemDraftPayload(saved.contents));
+  expect(again.map(text => text.text)).toEqual(["x", "x"]);
+  expect(again.map(text => text.style.fontFamily)).toEqual(["Times", "Arial"]);
+});
+
+it("says what happened to each kind of text set in fonts it does not write", () => {
+  const longName = "N".repeat(1_000);
+  const document = createEmptyDocument();
+  // A stored entry over the caps, and a caption set in an over-long name. (A table's font name is
+  // capped at 200 characters by the document schema, under the 256 that would leave it unwritten.)
+  const holder: TextObject = { type: "text", id: "holder", x: 10, y: 10, width: 40, height: 22, rotation: 0, text: "h", spans: [],
+    style: {}, compatibility: { warnings: [], unknown: { cdxmlTextFontTable: [{ id: "7", charset: "iso-8859-1", name: longName }] } } };
+  const captionText: TextObject = { type: "text", id: "caption", x: 36, y: 80, width: 40, height: 22, rotation: 0, text: "x",
+    style: { fontFamily: longName, fontSizePx: 16 }, spans: [{ text: "x", script: "normal", style: {} }],
+    compatibility: { warnings: [], unknown: { sourceCdxmlAttributes: { p: "30 72", Justification: "Left" } } } };
+  document.pages[0].objects = [holder, captionText];
+  const saved = exportDocumentToCdxml(document, plain);
+  expect(saved.warnings.filter(w => w.code === "cdxml.font_entry_too_long").map(w => w.message)).toEqual([
+    "CDXML export: font 7, the font of text caption have a name longer than 256 characters, or more than 512 characters of font attributes, far beyond any real font; " +
+    "they were not written: text whose source runs name one of them was written from its current text and styles instead of being copied from its source; " +
+    "a caption set in one of them was written as plain styled text, without its caption frame and run fonts."
+  ]);
+  expect(saved.contents).not.toContain(longName.slice(0, 257));
+  // The caption is written as plain styled text: no caption frame (its Justification) and no run font.
+  expect(saved.contents).not.toContain("Justification=");
+  expect(saved.contents).not.toMatch(/<s [^>]*font=/);
 });
 
 // CodeRabbit (#442): opening a native document dropped a stored over-long font entry but left an
@@ -466,7 +498,7 @@ it("does not copy an unchanged source text whose stored font was dropped on open
     expect(saved.contents).not.toContain("N".repeat(257));
     expect(saved.warnings.filter(w => w.code === "cdxml.font_entry_too_long").map(w => w.message)).toEqual([
       `CDXML export: the source font of text ${dropped.id} has a name longer than 256 characters, or more than 512 characters of font attributes, far beyond any real font; ` +
-      "it was not written, and text set in it was written without its caption frame and run fonts, or in the default font."
+      "it was not written, and text whose source runs name it was written from its current text and styles instead of being copied from its source."
     ]);
     // Copied unchanged, the first source text's run would name id 7, which is now Helvetica.
     const again = textsOf(openChemDraftPayload(saved.contents));

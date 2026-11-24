@@ -52,6 +52,7 @@ import { sha256Hex, utf8Bytes, utf8String } from "./sha256";
 import { PROPS } from "./cdxTags";
 import { cdxmlLimits } from "./cdxmlLimits";
 import { addImportedRadicalMarks } from "./importedRadicalMarks";
+import { isStandardAtomRadicalMark, standardRadicalMarkPageIndex, type StandardRadicalMarkPageIndex } from "./standardRadicalMarks";
 import { equalPrintMargins, fitPageSetup, importPageSetup, pagePrintMargins, type VisiblePageSetup } from "./pageSetup";
 import {
   CDX_NATIVE_ENVELOPE_ATTRIBUTE,
@@ -67,7 +68,6 @@ import {
 import { abbreviationExpansionIssue, cdxmlAtomChemistry, cdxmlAtomNativeState, elementFromCdxmlAtom, restoreCdxmlAbbreviations } from "./abbreviations";
 import { cdxmlToCssPx, cssPxToCdxml, formatNumber, formatPoint } from "./coordinates";
 import { countCdxmlFontEntries, indexCdxmlFonts, lookupCdxmlFont, trackCdxmlFontTable, type CdxmlFont } from "./cdxmlFontIndex";
-import { nativeChargePlacementPointForAtom, nativeRadicalPlacementPointForAtom, nativeChargeMarkSizePx } from "@chemdraft/layout-engine";
 
 export interface CompatibilityConversionWarning {
   code: string;
@@ -340,6 +340,8 @@ interface VisibleExportContext {
   sourceIds: Map<string, string>;
   crossingPartnerKeysByRefKey: Map<string, Set<string>>;
   crossingFrontKeysByRefKey: Map<string, { front: number; back: number }>;
+  /** Built on the page's first radical-dot check (isStandardAtomRadicalMark), then reused. */
+  radicalMarks?: StandardRadicalMarkPageIndex;
 }
 
 interface UnknownObjectExportDiagnostics {
@@ -467,6 +469,30 @@ function cdxmlFontEntryTooLongWarning(prefix: string, noun: string, labels: read
     `${one ? "has" : "have"} a name longer than ${CDXML_FONT_NAME_LIMIT} characters, or more than ` +
     `${CDXML_FONT_ENTRY_LIMIT} characters of font attributes, far beyond any real font; ` +
     `${one ? "it was" : "they were"} ${outcome.split("{it}").join(one ? "it" : "them")}`);
+}
+
+/**
+ * What export did with text set in a font it did not write. `source`: a stored font-table entry
+ * over the caps, or a source font import or open left out; text whose source runs name it is not
+ * copied from its source but written from its current text and styles (a marked caption keeps its
+ * frame and run fonts when those fonts can be written; exportTextObject). `caption`/`table`: the
+ * name of a font a caption or table is set in is too long; the caption is written as plain styled
+ * text, the table in the default font.
+ */
+type CdxmlFontNotWrittenKind = "source" | "caption" | "table";
+
+/** Export's one cdxml.font_entry_too_long warning, saying for each kind present what happened to its text. */
+function exportFontEntryTooLongWarning(entries: readonly { label: string; kind: CdxmlFontNotWrittenKind }[]): CompatibilityConversionWarning {
+  const kinds = new Set(entries.map(entry => entry.kind));
+  // One kind: "it"/"them" are the fonts named; several: each clause is about some of them.
+  const font = kinds.size > 1 ? "one of them" : "{it}";
+  const clauses = ([
+    ["source", `text whose source runs name ${font} was written from its current text and styles instead of being copied from its source`],
+    ["caption", `a caption set in ${font} was written as plain styled text, without its caption frame and run fonts`],
+    ["table", `a table set in ${font} was written in the default font`]
+  ] as const).filter(([kind]) => kinds.has(kind)).map(([, clause]) => clause);
+  return cdxmlFontEntryTooLongWarning("CDXML export", "", entries.map(entry => entry.label),
+    `not written${clauses.length > 1 ? ": " + clauses.join("; ") : ", and " + clauses[0]}.`);
 }
 
 function importCdxmlFonts(tree: OrderedXmlTree, sourceFormat: string, warnings: CompatibilityConversionWarning[]): CdxmlImportFonts {
@@ -1091,9 +1117,10 @@ function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityCo
   const fonts = new Map<string, CdxmlFont>();
   // A stored font over the per-font caps (a native payload's table is not checked by import) is not
   // written, and its id stays reserved so that no new font takes it. An unchanged source text that
-  // names it is written as plain styled text (exportTextObject), never copied back out naming a font
-  // the file does not list. One warning names every font not written.
-  const tooLong: string[] = [];
+  // names it is written from its current text and styles (exportTextObject), never copied back out
+  // naming a font the file does not list. One warning names every font not written, and what happened to the
+  // text set in each kind (exportFontEntryTooLongWarning).
+  const tooLong: { label: string; kind: CdxmlFontNotWrittenKind }[] = [];
   const tooLongIds = new Set<string>();
   const unwritableIds = new Set<string>();
   for (const page of document.pages) for (const object of page.objects) {
@@ -1107,7 +1134,7 @@ function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityCo
         continue;
       }
       if (cdxmlFontEntryTooLong(font)) {
-        if (!tooLongIds.has(font.id)) { tooLongIds.add(font.id); tooLong.push(`font ${font.id}`); }
+        if (!tooLongIds.has(font.id)) { tooLongIds.add(font.id); tooLong.push({ label: `font ${font.id}`, kind: "source" }); }
         continue;
       }
       const previous = fonts.get(font.id);
@@ -1119,9 +1146,11 @@ function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityCo
     }
   }
   // A text whose source runs named a font import left out (over the caps) has no font to write for
-  // them; it is written as plain styled text, reported in the one warning below.
+  // them; it is written from its current text and styles, reported in the one warning below.
   for (const page of document.pages) for (const object of page.objects) {
-    if (object.type === "text" && object.compatibility?.unknown.cdxmlTextFontOmitted === true) tooLong.push(`the source font of text ${object.id}`);
+    if (object.type === "text" && object.compatibility?.unknown.cdxmlTextFontOmitted === true) {
+      tooLong.push({ label: `the source font of text ${object.id}`, kind: "source" });
+    }
   }
   const byName = indexCdxmlFonts<string | undefined>(fonts.values(), font => font.name);
   const plainCaptionIds = new Set<string>();
@@ -1148,7 +1177,10 @@ function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityCo
       if (typeof name !== "string" || !name || lookupCdxmlFont(byName, name)) continue;
       // Not registered: a caption set in it is written as plain styled text, a table in the default font.
       if (name.length > CDXML_FONT_NAME_LIMIT) {
-        if (!nameTooLong) { nameTooLong = true; tooLong.push(`the font of ${object.type} ${object.id}`); }
+        if (!nameTooLong) {
+          nameTooLong = true;
+          tooLong.push({ label: `the font of ${object.type} ${object.id}`, kind: object.type === "table" ? "table" : "caption" });
+        }
         continue;
       }
       while (nextId < cdxmlLimits.fontId && (fonts.has(String(nextId)) || tooLongIds.has(String(nextId)))) nextId++;
@@ -1170,10 +1202,7 @@ function exportCdxmlFonts(document: ChemDraftDocument, warnings: CompatibilityCo
       byName.set(name, font);
     }
   }
-  if (tooLong.length) {
-    warnings.push(cdxmlFontEntryTooLongWarning("CDXML export", "", tooLong,
-      "not written, and text set in {it} was written without its caption frame and run fonts, or in the default font."));
-  }
+  if (tooLong.length) warnings.push(exportFontEntryTooLongWarning(tooLong));
   return { table: trackCdxmlFontTable([...fonts.values()]), byName, plainCaptionIds, captionRunLimitWarned: false, notWrittenIds: tooLongIds,
     unwritableIds, unwritableIdWarned: false };
 }
@@ -1598,55 +1627,6 @@ function exportReactionSchemes(
   });
 }
 
-/** Default atom-tool dots carry the Radical attribute written on the atom, not separate
- * authored appearance. A moved or styled dot still needs the ordinary loss diagnostics. */
-function isStandardAtomRadicalMark(
-  mark: ElectronMarkObject,
-  page: DocumentPage,
-  objectsById: ReadonlyMap<string, DocumentObject>
-): boolean {
-  if (mark.markKind !== "radical-dot" || mark.anchor.kind !== "atom"
-      || mark.style.source !== "chemdraft-native-charge"
-      || Object.entries(mark.style).some(([key, value]) => key !== "source" && value !== undefined)
-      || mark.width !== nativeChargeMarkSizePx || mark.height !== nativeChargeMarkSizePx || mark.rotation !== 0) return false;
-  const { objectId, atomId } = mark.anchor;
-  const molecule = objectId && objectsById.get(objectId);
-  if (!molecule || molecule.type !== "molecule") return false;
-  const atom = molecule.atoms.find(atom => atom.id === atomId);
-  if (!atom) return false;
-  // Source handles follow direct edits to the atom's radical state, including its removal.
-  // Compare the current atom-relative frame: a stationary dot must not stay exempt when
-  // its atom moves away, while translating both together preserves the imported appearance.
-  const imported = mark.compatibility?.unknown.cdxmlRadicalMarkPlacement;
-  if (isRecord(imported)) {
-    if (imported.objectId !== objectId || imported.atomId !== atomId) return false;
-    if (typeof imported.offsetX === "number" && typeof imported.offsetY === "number") {
-      const atomPoint = transformPointForObject(molecule, atom);
-      return Math.abs(mark.x - atomPoint.x - imported.offsetX) < 1e-8
-        && Math.abs(mark.y - atomPoint.y - imported.offsetY) < 1e-8;
-    }
-    // Older native payloads lack relative coordinates: require the current default below.
-  }
-  if (!isRecord(imported) && atom.markRadicals !== 1 && atom.markRadicals !== 2) return false;
-  const carried = page.objects.filter(object => object.type === "electron-mark"
-    && object.anchor.kind === "atom" && object.anchor.objectId === molecule.id && object.anchor.atomId === atom.id
-    && (object.markKind === "radical-dot" || object.markKind === "charge" && object.radical)).length;
-  if (!isRecord(imported) && carried !== atom.markRadicals) return false;
-  // Legacy imports placed both triplet dots in the charge-tool slot. Keep those untouched
-  // payloads warning-free too, but only while that slot still matches the atom's position.
-  const point = isRecord(imported)
-    ? nativeChargePlacementPointForAtom(molecule, atom.id,
-      // Reconstruct the legacy slot before mixed-mark collision avoidance existed.
-      page.objects.filter(object => object.type !== "electron-mark" || object.markKind === "charge"), page.width, page.height)
-    : nativeRadicalPlacementPointForAtom(molecule, atom.id,
-      page.objects.slice(0, page.objects.indexOf(mark)), page.width, page.height);
-  if (!point) return false;
-  const size = nativeChargeMarkSizePx;
-  const x = Math.max(0, Math.min(point.x - size / 2, page.width - size));
-  const y = Math.max(0, Math.min(point.y - size / 2, page.height - size));
-  return Math.abs(mark.x - x) < 1e-8 && Math.abs(mark.y - y) < 1e-8;
-}
-
 function exportLonePair(
   mark: ElectronMarkObject, context: VisibleExportContext, allocator: IdAllocator,
   objects: ReadonlyMap<string, DocumentObject>
@@ -1733,7 +1713,7 @@ function exportVisibleObject(
     return "";
   }
   if (object.type === "electron-mark") {
-    if (isStandardAtomRadicalMark(object, context.page, objectsById)) return "";
+    if (isStandardAtomRadicalMark(object, context.page, objectsById, () => context.radicalMarks ??= standardRadicalMarkPageIndex(context.page))) return "";
     const lonePair = exportLonePair(object, context, allocator, objectsById);
     if (lonePair) return lonePair;
     warnings.push({
