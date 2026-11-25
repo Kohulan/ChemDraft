@@ -25,8 +25,8 @@ const CdxmlHydrogenCountNotCountedCode = "cdxml.atom_hydrogen_count_not_counted"
 /**
  * One warning per molecule holding an atom that stores a hydrogen count nothing counts (chem-core
  * `atomIgnoresStatedHydrogenCount`: an H, D or T atom, a label naming no element — an unknown
- * atom "*", a generic label such as A or R1 — or an abbreviation such as OMe or Ph, stating a count
- * other than 0). The document opens with the count as stored (it round-trips unchanged); the atom
+ * atom "*", a generic label such as A or R1 — or an abbreviation such as OMe or Ph, or a typed Ac,
+ * Pr or Ts on a bond (acetyl, n-propyl, tosyl), stating a count other than 0). The document opens with the count as stored (it round-trips unchanged); the atom
  * validator flags the atom, and this names it in the open report, as the CDXML importer names a
  * count it did not keep or does not count. `source` heads the message; `objectIds`, when given,
  * limits the report to those molecules.
@@ -36,8 +36,9 @@ export function nativeHydrogenCountNotCountedWarnings(
 ): NativeDocumentOpenWarning[] {
   return document.pages.flatMap((page) => page.objects.flatMap((object) => {
     if (object.type !== "molecule" || (objectIds && !objectIds.has(object.id))) return [];
-    const notCounted = object.atoms.filter(atomIgnoresStatedHydrogenCount);
-    return notCounted.length ? [{ code: NativeHydrogenCountNotCountedCode, message: `${source}: ${hydrogenCountNotCountedText(notCounted)}`,
+    // The molecule's bonds decide whether a typed "Ac", "Pr" or "Ts" is acetyl, n-propyl or tosyl.
+    const notCounted = object.atoms.filter((atom) => atomIgnoresStatedHydrogenCount(atom, object.bonds));
+    return notCounted.length ? [{ code: NativeHydrogenCountNotCountedCode, message: `${source}: ${hydrogenCountNotCountedText(notCounted, object.bonds)}`,
       sourceObjectId: object.id, atomIds: notCounted.map((atom) => atom.id) }] : [];
   }));
 }

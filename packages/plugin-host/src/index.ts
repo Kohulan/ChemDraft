@@ -3,12 +3,13 @@ import { sameDocumentValue } from "./documentValue";
 // into this package's dist so no `@chemdraft/chem-core` dependency ships (ADR-0031). `ChemDraftDocument`,
 // however, is taken from `@chemdraft/plugin-api` so a consumer using both SDK packages sees ONE canonical
 // document type — not a second, structurally-identical copy inlined here.
-import type { ApplyPatchOptions, DocumentObject, DocumentPatch, DocumentPage, ObjectIdentity, OrphanedRepeatUnit } from "@chemdraft/chem-core";
+import type { ApplyPatchOptions, DocumentObject, DocumentPatch, DocumentPage, MoleculeAtom, MoleculeBond, ObjectIdentity,
+  OrphanedRepeatUnit } from "@chemdraft/chem-core";
 import { duplicateIdRefusalMessage, insertionPins, objectInWriteScope, objectIsInWriteScope, objectLocations, pinnedObjectMissingMessage,
   pinObject, pinSelectionPages, resolvePinnedObject, resolvePinnedObjects, resolvePinnedPages, scopedObjectRefs, withoutPins, withPins,
   type PageObjectRef, type PagePin, type PinnedObjectPages, type PluginWriteScopePages } from "./pageObjects";
-import { applyPatch, atomWithIgnoredHydrogenCount, hasObjectIdentity, ignoredHydrogenCountAtomKind, objectIdentity, planOrphanedRepeatUnitCleanup,
-  pruneReactionObjectReferences, removeOrphanedRepeatUnitBrackets, sameBracketIdentity } from "@chemdraft/chem-core";
+import { applyPatch, atomIgnoresStatedHydrogenCount, atomWithIgnoredHydrogenCount, hasObjectIdentity, ignoredHydrogenCountAtomKind,
+  objectIdentity, planOrphanedRepeatUnitCleanup, pruneReactionObjectReferences, removeOrphanedRepeatUnitBrackets, sameBracketIdentity } from "@chemdraft/chem-core";
 import {
   commitRequestPatch, containsBounds, pageContainsBounds, RequestWriteError, type BoundRequestWrite, type RequestDocument, type RequestHistory,
   type RequestWriteCommit, type RequestObjectRef, type RequestViewport, type RequestPageSpaceProvider
@@ -243,9 +244,10 @@ export function assertPluginPatchWriteScope(
   const sequential = scopePages && sequentialTargetHooks(document, scopePages, scope, beforeObjectWrite);
   const draftInScope = (pageId: string, object: DocumentObject) =>
     sequential ? sequential.inScope(object) : objectInWriteScope(scope, pinned, pageId, object.id);
+  const requested = requestedHydrogenCountRecorder(sequential?.beforeObjectWrite ?? beforeObjectWrite, sequential?.beforeObjectTargets);
   // Inspect one atomic draft, without normalizing partial pairs or forward references between ops.
   const validated = applyPatch(document, preflight.patch, { preserveRepeatUnitBrackets: true, deferGroupCleanup: true,
-    beforeObjectWrite: sequential?.beforeObjectWrite ?? beforeObjectWrite, beforeObjectTargets: sequential?.beforeObjectTargets,
+    beforeObjectWrite: requested.beforeObjectWrite, beforeObjectTargets: requested.beforeObjectTargets,
     beforeRemoveObjects: (draft, objectIds) => {
       const removed = new Set(objectIds);
       for (const page of draft.pages) {
@@ -307,54 +309,149 @@ export function assertPluginPatchWriteScope(
     throw new PluginHostError(`Patch would change object "${object.id}", which is not selected`);
   }
   assertPluginPageWriteScope(document, validated, scope, pinned, inserted);
-  assertRepresentableHydrogenCounts(document, validated);
+  assertRepresentableHydrogenCounts(document, validated, requested.counts);
   return validated;
 }
 
 /** The refusal reason (API 0.1.27 `PluginRefusalFields.reason`) for a write that would store a
  * hydrogen count other than 0 on an H, D or T atom, on a label naming no element (the unknown atom
- * "*" or a generic label such as A, Q, M, X or R1), or on an abbreviation such as OMe or Ph
- * (`details.element` gives the label). */
+ * "*" or a generic label such as A, Q, M, X or R1), or on an abbreviation such as OMe or Ph, or a
+ * typed Ac, Pr or Ts on a bond, which the label grammar reads as acetyl, n-propyl or tosyl
+ * (`details.element` gives the label), or a nonzero count the write states that the written atom
+ * would not carry (the patch engine drops the count of an atom whose bonds or statement the write
+ * changes). */
 export const HydrogenCountUnrepresentableReason = "hydrogen_count_unrepresentable";
 
 /**
  * Refuse a plugin or assistant write that would store a hydrogen count other than 0 on an H, D or T
  * atom, on a label naming no element (the unknown atom "*", a generic label such as A or R1), or on
- * an abbreviation such as OMe or Ph (its hydrogens come from what it stands for; chem-core reads the
+ * an abbreviation such as OMe or Ph, or a typed Ac, Pr or Ts on a bond (acetyl, n-propyl, tosyl)
+ * (its hydrogens come from what it stands for; chem-core reads the
  * abbreviation table itself, so the published SDK refuses it too): no label, formula or export reads it (chem-core
  * `atomIgnoresStatedHydrogenCount`), so storing it would silently lose what the writer said
  * (AGENTS.md §7). This is the only place such a count is
  * refused. chem-core's patches keep it, because they also replay opening, restoring, pasting,
  * duplicating and undoing a user's own document, which must never be refused; the atom validator
- * flags it there instead. A count the molecule already held unchanged is let be, so an edit
- * elsewhere in an older document's molecule is not blocked.
+ * flags it there instead.
+ *
+ * Two rules, in order:
+ *
+ * 1. Every nonzero count the patch stated (`requested`, keyed by the identity of the object each op
+ *    reached) must be exactly what the committed atom carries, the same atom of the same object
+ *    followed by identity. The patch engine drops the count of an atom whose bonds or statement
+ *    change (`clearChangedAtomHydrogenHints`), so an updateObject that bonds an unbonded typed Ac
+ *    (actinium, which may carry a count) and states hydrogenCount 2 on it would otherwise commit
+ *    acetyl with the stated 2 silently discarded. Nothing exempts a stated count that did not land:
+ *    not what the molecule held before, and not a same-id object elsewhere. An object or atom that
+ *    cannot be followed to the committed result is refused (fail closed).
+ * 2. The committed molecules may not carry an uncounted count this write introduced. A count an
+ *    edited molecule already held unchanged, on the same atom, with the same label and already
+ *    uncounted, is let be, so an edit elsewhere in an older document's molecule is not blocked. The
+ *    molecule it is compared with is the one the edited value continues, by host identity only;
+ *    one with no such predecessor (an insertion) has nothing to keep.
  */
-function assertRepresentableHydrogenCounts(before: ChemDraftDocument, after: ChemDraftDocument): void {
-  for (const page of after.pages) {
-    const previousPage = before.pages.find(candidate => candidate.id === page.id);
-    for (const object of page.objects) {
-      if (object.type !== "molecule") continue;
-      const previous = previousPage?.objects.find(candidate => candidate.id === object.id);
-      if (previous === object) continue;
-      const atom = atomWithIgnoredHydrogenCount(object.atoms, previous?.type === "molecule" ? previous.atoms : undefined);
-      if (!atom) continue;
-      const kind = ignoredHydrogenCountAtomKind(atom);
-      const allowed = kind === "an unknown atom" ? "an unknown atom (*), as a typed * label means"
-        : kind === "a hydrogen atom" ? "an H, D or T atom, as a typed H, D or T label means"
-        : kind === "an abbreviation" ? `an abbreviation (${atom.element})`
-        : `a label naming no element (${atom.element}), as a typed ${atom.element} label means`;
-      const why = kind === "an abbreviation"
-        ? "which nothing would count: an abbreviation's hydrogens come from what it stands for"
-        : `which ${kind} cannot carry`;
+function assertRepresentableHydrogenCounts(before: ChemDraftDocument, after: ChemDraftDocument,
+  requested: RequestedHydrogenCounts = new Map()): void {
+  const committed = after.pages.flatMap(page => page.objects);
+  for (const [identity, { moleculeId, atoms }] of requested) {
+    const object = committed.find(candidate => hasObjectIdentity(candidate, identity));
+    const molecule = object?.type === "molecule" ? object : undefined;
+    for (const [atomId, asked] of atoms) {
+      if (!asked.hydrogenCount) continue;
+      const atom = molecule?.atoms.find(candidate => candidate.id === atomId);
+      if (atom?.hydrogenCount === asked.hydrogenCount) continue;
+      const stated = { ...(atom ?? asked), hydrogenCount: asked.hydrogenCount };
+      if (molecule && atom && atomIgnoresStatedHydrogenCount(stated, molecule.bonds)) {
+        throw ignoredHydrogenCountRefusal(molecule.id, stated, molecule.bonds);
+      }
       throw new PluginHostError(
-        `Plugin write refused: atom "${atom.id}" of molecule "${object.id}" is ${atom.element} with hydrogenCount ` +
-        `${atom.hydrogenCount}, ${why}. Only 0 is allowed on ${allowed}; ` +
-        "omit hydrogenCount or set it to 0. Nothing was changed.",
+        `Plugin write refused: atom "${atomId}" of molecule "${molecule?.id ?? moleculeId}" is ${stated.element} with hydrogenCount ` +
+        `${stated.hydrogenCount}, which the written molecule would not keep: a change to an atom's bonds, or to what the ` +
+        "atom is, drops its stated count. State the count in a later update, once that change is made, or omit " +
+        "hydrogenCount. Nothing was changed.",
         { reason: HydrogenCountUnrepresentableReason,
-          details: { moleculeId: object.id, atomId: atom.id, element: atom.element, hydrogenCount: atom.hydrogenCount! } }
+          details: { moleculeId: molecule?.id ?? moleculeId, atomId, element: stated.element, hydrogenCount: stated.hydrogenCount } }
       );
     }
   }
+  const originals = before.pages.flatMap(page => page.objects);
+  const untouched = new Set(originals);
+  for (const object of committed) {
+    // An untouched object is the same value. An edited one is compared only with the object it
+    // continues, by host identity: ids may repeat, so an id never stands in for it.
+    if (object.type !== "molecule" || untouched.has(object)) continue;
+    const previous = originals.find(candidate => hasObjectIdentity(object, objectIdentity(candidate)));
+    // The bonds decide whether a typed "Ac", "Pr" or "Ts" is acetyl, n-propyl or tosyl (bonded) or the element.
+    const previousMolecule = previous?.type === "molecule" ? previous : undefined;
+    const atom = atomWithIgnoredHydrogenCount(object.atoms, previousMolecule?.atoms, object.bonds, previousMolecule?.bonds);
+    if (atom) throw ignoredHydrogenCountRefusal(object.id, atom, object.bonds);
+  }
+}
+
+/** The hydrogen_count_unrepresentable refusal for `atom` of molecule `moleculeId`, whose stated
+ * count nothing reads (`atomIgnoresStatedHydrogenCount` with `bonds`). */
+function ignoredHydrogenCountRefusal(moleculeId: string, atom: MoleculeAtom, bonds: readonly MoleculeBond[]): PluginHostError {
+  const kind = ignoredHydrogenCountAtomKind(atom, bonds);
+  const allowed = kind === "an unknown atom" ? "an unknown atom (*), as a typed * label means"
+    : kind === "a hydrogen atom" ? "an H, D or T atom, as a typed H, D or T label means"
+    : kind === "an abbreviation" ? `an abbreviation (${atom.element})`
+    : `a label naming no element (${atom.element}), as a typed ${atom.element} label means`;
+  const why = kind === "an abbreviation"
+    ? "which nothing would count: an abbreviation's hydrogens come from what it stands for"
+    : `which ${kind} cannot carry`;
+  return new PluginHostError(
+    `Plugin write refused: atom "${atom.id}" of molecule "${moleculeId}" is ${atom.element} with hydrogenCount ` +
+    `${atom.hydrogenCount}, ${why}. Only 0 is allowed on ${allowed}; ` +
+    "omit hydrogenCount or set it to 0. Nothing was changed.",
+    { reason: HydrogenCountUnrepresentableReason,
+      details: { moleculeId, atomId: atom.id, element: atom.element, hydrogenCount: atom.hydrogenCount! } }
+  );
+}
+
+/** Per molecule, by host identity (chem-core objectIdentity.ts), the atoms given a hydrogen count by
+ * the last op in the patch that wrote that molecule's atoms (an addObject of it, or an updateObject
+ * supplying `atoms`), as that op wrote them, and the molecule's id for a refusal. Not by id: a
+ * document may repeat an id, and a request must only ever apply to the object the op actually
+ * reached. A later removeObject that reaches the molecule forgets it. */
+type RequestedHydrogenCounts = Map<ObjectIdentity, { moleculeId: string; atoms: Map<string, MoleculeAtom> }>;
+
+/**
+ * Patch hooks recording the hydrogen counts each write asked for, against the object the patch engine
+ * actually applies the op to: chem-core resolves an updateObject to its id's first occurrence in the
+ * draft as it stands at that op, and calls `beforeObjectWrite` with that object as `previous`; the
+ * updated value carries its identity (`retainObjectIdentity`), as does the validated result. An
+ * insertion is a new value with a fresh identity. `beforeObjectTargets` runs before every operation,
+ * so it names the op a write belongs to, and a removal's targets are the objects it removes. The
+ * given hooks still run, after the recording.
+ */
+function requestedHydrogenCountRecorder(beforeObjectWrite?: ApplyPatchOptions["beforeObjectWrite"],
+  beforeObjectTargets?: ApplyPatchOptions["beforeObjectTargets"]) {
+  const counts: RequestedHydrogenCounts = new Map();
+  let current: DocumentPatch | undefined;
+  return {
+    counts,
+    beforeObjectTargets: (draft: ChemDraftDocument, patch: DocumentPatch, targets: readonly { pageId: string; object: DocumentObject }[]) => {
+      current = patch;
+      if (patch.op === "removeObject") {
+        // The write removes what it stated a count on: nothing of it is committed to keep the count.
+        for (const { object } of targets) {
+          for (const identity of counts.keys()) if (hasObjectIdentity(object, identity)) counts.delete(identity);
+        }
+      }
+      beforeObjectTargets?.(draft, patch, targets);
+    },
+    beforeObjectWrite: (pageId: string, previous: DocumentObject | undefined, next: DocumentObject) => {
+      // Read before chem-core replaces an update's atoms (clearChangedAtomHydrogenHints), after this hook.
+      const writesAtoms = previous ? current?.op === "updateObject" && "atoms" in current.changes : current?.op === "addObject";
+      if (writesAtoms && next.type === "molecule") {
+        const atoms = new Map<string, MoleculeAtom>();
+        for (const atom of next.atoms) if (typeof atom.hydrogenCount === "number") atoms.set(atom.id, atom);
+        // Never mint an identity on `next` of an update: it must inherit `previous`'s.
+        counts.set(objectIdentity(previous ?? next), { moleculeId: next.id, atoms });
+      }
+      beforeObjectWrite?.(pageId, previous, next);
+    }
+  };
 }
 
 export interface ScopedRepeatUnitCleanup {
