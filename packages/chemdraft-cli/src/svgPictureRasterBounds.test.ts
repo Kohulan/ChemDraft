@@ -125,4 +125,12 @@ describe("flattenSvgPictures bounds every pixmap on both sides", { timeout: 30_0
     expect(pngSizes(flattened)).toEqual([[1, 8192]]);
     expect(withinBounds()).toBe(true);
   });
+
+  it("fits a frame whose short side is held at one pixel to what the budget has left, not removes it", async () => {
+    const warnings: ExportWarning[] = [];
+    const flattened = await flattenSvgPictures(page(image("thin", "1", "8192", picture('width="40" height="20"'))), 1, warnings, 4096);
+    expect(warnings).toEqual([]);
+    expect(pngSizes(flattened)).toEqual([[1, 4096]]);
+    expect(withinBounds()).toBe(true);
+  });
 });
