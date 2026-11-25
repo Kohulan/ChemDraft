@@ -10325,9 +10325,12 @@ export function carriedElectronMarkSvgTransform(
 ): string {
   const center = objectRotationCenter(mark);
   const turn = ((placement.rotation - mark.rotation) % 360 + 540) % 360 - 180;
-  const move = `translate(${formatNumber(placement.x - mark.x)} ${formatNumber(placement.y - mark.y)})`;
+  // Unrounded, like every other transform the Spin 3D overlay paints (its atom labels, and this
+  // mark's own translate before marks could turn): flatten commits the unrounded placement, so a
+  // rounded transform would paint the mark up to 0.0005 px from where it lands (AGENTS.md §9).
+  const move = `translate(${placement.x - mark.x} ${placement.y - mark.y})`;
   return Math.abs(turn) > 1e-9
-    ? `${move} rotate(${formatNumber(turn)} ${formatNumber(center.x)} ${formatNumber(center.y)})`
+    ? `${move} rotate(${turn} ${center.x} ${center.y})`
     : move;
 }
 
