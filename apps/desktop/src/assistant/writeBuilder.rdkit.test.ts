@@ -98,6 +98,28 @@ describe("RDKit assistant write identity", () => {
     expect(context.write).not.toHaveBeenCalled();
   });
 
+  // A mapped SMILES is drawn as atoms with no map field, so the legacy assistant route's identity check
+  // refuses it; the refusal names atom maps rather than a generic identity change (1.2.3 re-review).
+  it.each(["[CH3:1]/[CH:2]=[CH:3]/[CH3:4]", "[CH3:1][C:2](=[O:3])[OH:4]"])("refuses a mapped SMILES insert, naming atom maps: %s", async smiles => {
+    const context = realContext(false);
+    context.getDocument()!.pages[0]!.objects = [];
+    context.chemistry.structureFromSmiles = async ({ smiles }) => {
+      const parsed = (await depictSmilesForPaste(smiles))!;
+      return { available: true, built: true, object: createSmilesMolecule(
+        context.getDocument()!, { x: 200, y: 200 }, parsed.depiction, smiles) };
+    };
+    const write = context.write;
+    context.write = async (patch, signal, check, expected) => {
+      const before = context.getDocument()!;
+      await verifyNormalizedAssistantWrite(context, before, applyPatch(before, patch), new Set(expected?.keys()), expected);
+      return write(patch, signal, check, expected);
+    };
+    const result = await callAssistantTool(context, "insert_structures", { items: [{ kind: "molecule", smiles }] });
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result.content)).toContain("(atom-map numbers, which ChemDraft does not keep yet)");
+    expect(context.getDocument()!.pages[0]!.objects.filter(object => object.type === "molecule")).toEqual([]);
+  });
+
   it.each(["C[C@H](C)C", "[C@H](F)(F)F", "C[C@H](O)CC"])(
     "allows harmless chirality marks and ordinary stereocentres: %s", async smiles => {
       const result = await callAssistantTool(realContext(false), "insert_structures", {

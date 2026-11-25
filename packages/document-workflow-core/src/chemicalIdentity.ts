@@ -3,6 +3,7 @@ import { nativeBondOrderResolution } from "@chemdraft/layout-engine";
 import { expandNativeMoleculeLabelGroups, nativeSingleHeavyElementLabelValence } from "./atoms";
 import type { RdkitJsMol, RdkitJson, RdkitMinimalModule } from "@chemdraft/rdkit-adapter";
 import { markV2000UnspecifiedDoubleBonds, sourceBondSemantics } from "./sourceBondSemantics";
+import { smilesAtomMapNumbers } from "./atomMaps";
 
 /** With stereoReference, compare on that input's specified stereo; ignore additional output stereo. */
 export type InspectChemicalIdentity = (
@@ -227,7 +228,9 @@ export class ChemicalIdentityMismatchError extends Error {
       sourceFacts && outputFacts && sourceFacts.chargedAtoms !== outputFacts.chargedAtoms
         ? "charges" : undefined
     ].filter(Boolean);
-    const difference = differences.join(", ") || "chemical identity";
+    // A drawing has no atom-map field, so a mapped source never matches it: say so by name.
+    const unmapped = smilesAtomMapNumbers(source).length > 0 && smilesAtomMapNumbers(output).length === 0;
+    const difference = differences.join(", ") || (unmapped ? "atom-map numbers, which ChemDraft does not keep yet" : "chemical identity");
     super(`Canonical SMILES mismatch for ${moleculeId}; refusing a change to chemical identity ` +
       `(${difference}): ${source} -> ${output}.`);
     this.name = "ChemicalIdentityMismatchError";

@@ -5,14 +5,17 @@
  */
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { applyPatches, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
+import { applyPatch, applyPatches, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
 import { ProposedDocumentPatchSchema } from "@chemdraft/plugin-api";
 import { inspectClipboardPayload } from "@chemdraft/clipboard-adapter";
+import { ATOM_MAPS_WRITE_REFUSAL_REASON } from "@chemdraft/document-workflow-core";
+import { rebasePluginPatch } from "@chemdraft/plugin-host";
 import {
-  applyClipboardPastePayload, createPhase4Document, createSelectionClipboardPayload, openNativeDocument,
+  applyClipboardPastePayload, createPhase4Document, createSelectionClipboardPayload, normalizeCommittedDocument, openNativeDocument,
   pasteSelectionClipboardPayload
 } from "./documentWorkflow";
-import { applyPluginDocumentPatch } from "./plugins/applyPluginDocumentPatch";
+import { applyAcceptedPluginProposal, applyPluginDocumentPatch, rebaseProposedInsertion, refreshPluginPatchChemistry } from "./plugins/applyPluginDocumentPatch";
+import { verifyDesktopRequestWrite } from "./plugins/requestWrites/normalizedWrite";
 
 const notice = "atom-map numbers are not kept yet; they will be dropped on export or when the structure is edited";
 
@@ -90,4 +93,38 @@ describe("RXN paste", () => {
   it("leaves an unmapped RXN paste's status unchanged", () => {
     expect(paste(rxn([0, 0, 0, 0])).status).toBe("Pasted 2 editable RXN molecule blocks");
   });
+});
+
+// The committed paths run real chemistry verification (RDKit) before anything is written. Drawn atoms
+// have no map field, so a stored source with maps never verifies: each route refuses the write and
+// says that atom maps are why, instead of a generic mismatch (1.2.3 re-review, finding 4).
+describe("verified plugin and assistant writes of a mapped stored source", () => {
+  const mapped = () => ({ ...firstMolecule(mappedDocument()), id: "mol_plugin_mapped" });
+  const insertPatch = (document: ChemDraftDocument, object: MoleculeObject) => ProposedDocumentPatchSchema.parse({
+    reason: "Insert structure", patch: { op: "addObject", pageId: document.pages[0]!.id, object } });
+
+  it.each([false, true])("refuses a plugin insert, naming atom maps (accepted proposal: %s)", async accepted => {
+    const before = createPhase4Document();
+    const patch = insertPatch(before, mapped());
+    const applied = (accepted ? applyAcceptedPluginProposal : applyPluginDocumentPatch)(before, patch);
+    const authored = accepted ? rebaseProposedInsertion(before, patch) : rebasePluginPatch(before, patch);
+    const commit = refreshPluginPatchChemistry(before, normalizeCommittedDocument(applied.document), authored);
+    await expect(commit).rejects.toThrow(`Plugin write refused: ${ATOM_MAPS_WRITE_REFUSAL_REASON}`);
+  }, 60_000);
+
+  it("refuses an assistant request insert whose stored source has maps, naming atom maps", async () => {
+    const before = createPhase4Document();
+    const object = mapped();
+    const draft = applyPatch(before, { op: "addObject", pageId: before.pages[0]!.id, object });
+    await expect(verifyDesktopRequestWrite(before, draft, new Set([object.id]), new Map([[object.id, "CC=CC"]]), new AbortController().signal))
+      .rejects.toThrow(`Plugin write refused: ${ATOM_MAPS_WRITE_REFUSAL_REASON}`);
+  }, 60_000);
+
+  it("refuses an assistant request insert declared by a mapped SMILES, naming atom maps", async () => {
+    const before = createPhase4Document();
+    const object = { ...mapped(), structureFormat: "smiles" as const, structure: "[CH3:1][CH:2]=[CH:3][CH3:4]", compatibility: undefined };
+    const draft = applyPatch(before, { op: "addObject", pageId: before.pages[0]!.id, object });
+    await expect(verifyDesktopRequestWrite(before, draft, new Set([object.id]), new Map([[object.id, object.structure]]), new AbortController().signal))
+      .rejects.toThrow(`Plugin write refused: ${ATOM_MAPS_WRITE_REFUSAL_REASON}`);
+  }, 60_000);
 });

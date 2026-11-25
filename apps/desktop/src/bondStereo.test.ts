@@ -164,7 +164,11 @@ describe("bond stereo commands", () => {
     ["V3000 map split over a continuation line", true],
     ["source SMILES kept beside a molfile", true],
     ["SMILES class 0", false],
-    ["SMILES R-group label ChemDraft spells [*:1]", false]
+    ["SMILES R-group label ChemDraft spells [*:1]", false],
+    ["V3000 AAMAP = 7 with spaces", true],
+    ["V3000 AAMAP=0 beside a positional map", true],
+    ["V3000 short counts line and a blank line before the block", true],
+    ["SMILES [*:1] on another atom than the drawn R1", true]
   ] as const)("locks E/Z exactly when the open report warns of atom maps: %s", (format, locked) => {
     const { document, molecule, target } = drawing("C/C=C/C");
     let changes: Partial<typeof molecule>;
@@ -180,6 +184,22 @@ describe("bond stereo commands", () => {
       expect(lines[atomLine]).toMatch(/ 0$/);
       lines.splice(atomLine, 1, lines[atomLine]!.replace(/ 0$/, " -"), "M  V30 1");
       changes = { structureFormat: "molfile-v3000", structure: lines.join("\n") };
+    } else if (format.startsWith("V3000 ")) {
+      const lines = moleculeToMolfileV3000(molecule, { fromDocFrame: true, kekuleBondOrders: new Map() }).contents.split("\n");
+      const atomLine = lines.indexOf("M  V30 BEGIN ATOM") + 1;
+      expect(lines[atomLine]).toMatch(/ 0$/);
+      if (format === "V3000 AAMAP = 7 with spaces") lines[atomLine] = `${lines[atomLine]} AAMAP = 7`;
+      else if (format === "V3000 AAMAP=0 beside a positional map") lines[atomLine] = `${lines[atomLine]!.replace(/ 0$/, " 5")} AAMAP=0`;
+      else {
+        lines[atomLine] = lines[atomLine]!.replace(/ 0$/, " 3");
+        const counts = lines.findIndex(line => line.includes("V3000"));
+        lines.splice(counts, 1, "0 0 V3000", "");
+      }
+      changes = { structureFormat: "molfile-v3000", structure: lines.join("\n") };
+    } else if (format === "SMILES [*:1] on another atom than the drawn R1") {
+      // The drawn R1 replaces a terminal carbon (bonded to C); the [*:1] is bonded to nothing drawn as R1's neighbours.
+      changes = { structureFormat: "smiles", structure: "C/C=C/C.[*:1]",
+        atoms: molecule.atoms.map((atom, index) => index === 0 ? { ...atom, element: "R1" } : atom) };
     } else if (format === "source SMILES kept beside a molfile") {
       changes = { compatibility: { sourceFormat: "smiles", warnings: [], unknown: { smiles: "[CH3:1]/C=C/C" } } };
     } else if (format === "SMILES class 0") {

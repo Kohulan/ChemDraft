@@ -1,6 +1,8 @@
 import { clearStoredCtabReference, storedCtabReference } from "@chemdraft/plugin-host";
 import type { Anchor, MoleculeObject } from "@chemdraft/chem-core";
-import { chemicalIdentitySource, moleculeSmiles, nativeSingleBondGraphMetadata } from "@chemdraft/document-workflow-core";
+import {
+  ATOM_MAPS_WRITE_REFUSAL_REASON, chemicalIdentitySource, moleculeSmiles, moleculeSourceHasAtomMaps, nativeSingleBondGraphMetadata
+} from "@chemdraft/document-workflow-core";
 import type { ExportWarning } from "@chemdraft/export-engine";
 import { nativeElementFromAtomLabel, nativeEnhancedStereoAtomIndicators } from "@chemdraft/layout-engine";
 import { refreshNativeSingleBondGraph } from "../../documentWorkflow";
@@ -80,6 +82,10 @@ export async function verifyStoredSources(context: StructureInspectionContext, m
     const result = await context.chemistry.inspectStructure(format === "smiles" ? "smiles" : "molfile", value);
     if (!result.valid || !result.orderedIdentity ||
         replacementIdentity !== undefined && (result.hasStoredGroups !== false || result.identitySmiles !== replacementIdentity)) {
+      // Drawn atoms have no map field, so a mapped stored source never matches them: name the cause.
+      if (result.valid && moleculeSourceHasAtomMaps({ ...molecule, structureFormat: format, structure: value, compatibility: undefined })) {
+        throw new ChemistryRefusal(ATOM_MAPS_WRITE_REFUSAL_REASON, `The stored ${format} of "${molecule.id}" carries atom-map numbers the editable graph cannot keep.`);
+      }
       throw new ChemistryRefusal("the stored structure doesn't match the drawn atoms", `The stored ${format} of "${molecule.id}" has chemistry the editable graph cannot verify.`);
     }
     if (format !== "smiles" && graph) {
