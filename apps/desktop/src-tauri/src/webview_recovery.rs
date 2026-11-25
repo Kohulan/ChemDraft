@@ -36,7 +36,11 @@ impl RecoveryPolicy {
         } else {
             "Quit and restart ChemDraft to reopen it."
         };
-        let appimage = concat!("./ChemDraft_", env!("CARGO_PKG_VERSION"), "-beta_amd64.AppImage");
+        let appimage = concat!(
+            "./ChemDraft_",
+            env!("CARGO_PKG_VERSION"),
+            "-beta_amd64.AppImage"
+        );
         Recovery {
             reload,
             message: format!(
