@@ -347,7 +347,7 @@ import { analysisClient } from "./analysisClient";
 import { clipboardChemistrySizeRefusal, guardClipboardPayload, inspectClipboardPayload, isVectorArtworkType, looksLikeSmiles, smilesListCandidates, type ClipboardDetectedPayload } from "@chemdraft/clipboard-adapter";
 import { atomMapStereoLossStatus, verifySmilesPaste, verifySmilesPasteInput, verifySmilesGridEntries } from "./smilesPasteIdentity";
 import {
-  SmilesListPasteError, depictSmilesForPaste, depictSmilesListForPaste, smilesListFailureStatus
+  SmilesListPasteError, depictSmilesForPaste, depictSmilesListForPaste, smilesListAtomMapNotes, smilesListFailureStatus
 } from "./smilesListPaste";
 import type { Generate3DConformerResult, StructureAnalysisResult } from "@chemdraft/chemistry-adapter";
 import {
@@ -8055,7 +8055,9 @@ export function MainWindow({
       await verifySmilesPaste(depiction, pasteSmiles);
       terminal = terminalResult();
       if (terminal) return terminal;
-      const atomMapNotes = removedAtomMaps ? [ATOM_MAPS_REMOVED_STATUS,
+      // Compare stereo whenever the text changed: a class 0 is not a map (no "removed" note), but
+      // removing it can still leave a centre or an alkene without stereo.
+      const atomMapNotes = pasteSmiles !== smilesText ? [...(removedAtomMaps ? [ATOM_MAPS_REMOVED_STATUS] : []),
         ...[await atomMapStereoLossStatus(smilesText, pasteSmiles, undefined, signal)].filter((note): note is string => note !== undefined)] : [];
       terminal = terminalResult();
       if (terminal) return terminal;
@@ -8186,7 +8188,9 @@ export function MainWindow({
       const failures = smilesListFailureStatus(displayedFailures);
       const failureCount = displayedFailures.length;
       const makeStatus = (placementStatus: string) => {
-        const baseStatus = [placementStatus, ...new Set(entries.flatMap(entry => entry.molecule ? [structureTemplateLayoutMessage(entry.molecule)!] : [])), ...(parsed.warnings ?? [])].join("; ");
+        const baseStatus = [placementStatus, ...new Set(entries.flatMap(entry => entry.molecule ? [structureTemplateLayoutMessage(entry.molecule)!] : [])), ...(parsed.warnings ?? []),
+          // Only the entries that passed identity verification were pasted; only they add a note.
+          ...smilesListAtomMapNotes(entries)].join("; ");
         return failures ? `${baseStatus}; ${failureCount} item${failureCount === 1 ? "" : "s"} failed: ${failures}` +
           (engineUnavailable ? "; pasted as text" : "") : baseStatus;
       };

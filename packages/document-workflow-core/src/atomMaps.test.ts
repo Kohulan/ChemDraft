@@ -68,7 +68,9 @@ describe("molfileAtomMapNumbers", () => {
   });
 
   it("ignores class 0 and ChemDraft's own R-group numbers", () => {
-    const rgroup = v2000("", [2, 0]).replace("C   0  0  0  0  0  0  0  0  0  2", "R#  0  0  0  0  0  0  0  0  0  2");
+    // ChemDraft's writer (chem-core molfile.ts) always pairs an R# atom with its M  RGP entry.
+    const rgroup = v2000("", [2, 0]).replace("C   0  0  0  0  0  0  0  0  0  2", "R#  0  0  0  0  0  0  0  0  0  2")
+      .replace("M  END", "M  RGP  1   1   2\nM  END");
     expect(molfileAtomMapNumbers(rgroup)).toEqual([]);
   });
 
@@ -128,5 +130,108 @@ describe("stereo lost with the maps", () => {
       "Without atom-map numbers, 1 double-bond E/Z assignment in the pasted SMILES is no longer stereogenic and was drawn without stereo");
     expect(atomMapStereoLossMessage("[CH3:1]/[CH:2]=[CH:3]/[CH3:4]", "C/C=C/C")).toBeUndefined();
     expect(atomMapStereoLossMessage("O[C@@H:2](F)[13CH3:1]", "[13CH3][C@H](O)F")).toBeUndefined();
+  });
+});
+
+describe("review findings (1.2.3)", () => {
+  const atomLine = (xyz: string, symbol: string, map: number) =>
+    `${xyz} ${symbol.padEnd(3)} 0  0  0  0  0  0  0  0  0${String(map).padStart(3)}  0  0`;
+  const coordinates = (x: number) => `${x.toFixed(4).padStart(10)}    0.0000    0.0000`;
+  const molfile = (header: readonly string[], counts: string, atoms: readonly string[], rest: readonly string[] = []) =>
+    [...header, counts, ...atoms, ...rest, "M  END"].join("\n");
+
+  it("removes a class 0 so callers can see the text changed, without counting it", () => {
+    for (const input of ["[CH3:0][C@](C)(F)Cl", "[CH3:0]/C(C)=C/F"]) {
+      const result = stripSmilesAtomMaps(input);
+      expect(result.removed).toBe(0);
+      expect(result.smiles).not.toBe(input);
+      expect(result.smiles).toBe(input.replace(":0", ""));
+    }
+  });
+
+  it("reads V2000 atom lines by column when the coordinate fields touch", () => {
+    const touching = molfile(["title", "  Other", ""], "  2  1  0  0  0  0  0  0  0  0999 V2000", [
+      atomLine("12345.6789-1234.5678-9999.9999", "C", 3),
+      atomLine("-1234.5678    0.0000    0.0000", "O", 0)
+    ], ["  1  2  1  0"]);
+    expect(touching.split("\n")[4]!.slice(0, 30)).toBe("12345.6789-1234.5678-9999.9999");
+    expect(touching.split("\n")[4]!.slice(60, 63)).toBe("  3");
+    expect(molfileAtomMapNumbers(touching)).toEqual([3]);
+  });
+
+  it.each([
+    ["unpadded, separate fields", "2 1 0 0 0 0 0 0 0 0999"],
+    ["unpadded, no tag, six fields", "2 1 0 0 0 0"],
+    ["fixed width, no tag", "  2  1  0  0  0  0  0  0  0  0999"]
+  ])("accepts the clipboard reader's versionless counts form: %s", (_name, counts) => {
+    const text = molfile(["title", "  Other", ""], counts, [atomLine(coordinates(0), "C", 4), atomLine(coordinates(1.5), "O", 0)],
+      ["  1  2  1  0  0  0  0"]);
+    expect(molfileAtomMapNumbers(text)).toEqual([4]);
+  });
+
+  it("never lets a counts-shaped header comment win over the real counts line", () => {
+    for (const comment of ["  0  0  0  0  0  0  0  0  0  0999 V2000", "  0  0  0  0  0  0", "  1  0  0  0  0  0  0  0  0  0999 V2000"]) {
+      const text = molfile(["", "title", "  Other", comment], "  2  0  0  0  0  0  0  0  0  0999 V2000",
+        [atomLine(coordinates(0), "C", 1), atomLine(coordinates(1.5), "C", 2)]);
+      expect(molfileAtomMapNumbers(text)).toEqual([1, 2]);
+    }
+  });
+
+  it("reads a one-line RXN block header, as the clipboard reader does", () => {
+    const block = ["  ChemDraw06022615382D", "  2  1  0  0  0  0            999 V2000",
+      atomLine(coordinates(0), "C", 1), atomLine(coordinates(1.56), "O", 2), "  1  2  1  0        0", "M  END"].join("\n");
+    expect(molfileAtomMapNumbers(block)).toEqual([1, 2]);
+  });
+
+  it("counts a map on an external R-group pseudo-atom", () => {
+    // RDKit reads this as [2*:7]: R-group 2, atom map 7.
+    const external = molfile(["", "  Other", ""], "  2  0  0  0  0  0  0  0  0  0999 V2000",
+      [atomLine(coordinates(0), "R#", 7), atomLine(coordinates(1.5), "C", 0)], ["M  RGP  1   1   2"]);
+    expect(molfileAtomMapNumbers(external)).toEqual([7]);
+    // ChemDraft's own program line does not excuse a map that differs from the R-group number.
+    expect(molfileAtomMapNumbers(external.replace("  Other", "  ChemDraft"))).toEqual([7]);
+    // Another writer's R# whose map equals its R-group number is still a map.
+    expect(molfileAtomMapNumbers(external.replace("M  RGP  1   1   2", "M  RGP  1   1   7"))).toEqual([7]);
+    // ChemDraft's own encoding: R# with its own number, or a dummy * with no R-group entry.
+    const own = external.replace("  Other", "  ChemDraft").replace("M  RGP  1   1   2", "M  RGP  1   1   7");
+    expect(molfileAtomMapNumbers(own)).toEqual([]);
+    expect(molfileAtomMapNumbers(own.replace("R# ", "*  ").replace("M  RGP  1   1   7\n", ""))).toEqual([]);
+    expect(molfileAtomMapNumbers(external.replace("R# ", "*  ").replace("M  RGP  1   1   2\n", ""))).toEqual([7]);
+  });
+
+  it("counts AAMAP= and other writers' maps on a V3000 R-group atom, and AAMAP= split over a continuation line", () => {
+    const v3000 = (program: string, atoms: string[]) => ["", program, "", "  0  0  0     0  0            999 V3000",
+      "M  V30 BEGIN CTAB", `M  V30 COUNTS ${atoms.length} 0 0 0 0`, "M  V30 BEGIN ATOM", ...atoms,
+      "M  V30 END ATOM", "M  V30 END CTAB", "M  END"].join("\n");
+    expect(molfileAtomMapNumbers(v3000("  ChemDraft", ["M  V30 1 R# 0 0 0 0 RGROUPS=(1 2) AAMAP=5"]))).toEqual([5]);
+    expect(molfileAtomMapNumbers(v3000("  ChemDraft", ["M  V30 1 R# 0 0 0 5 RGROUPS=(1 2)"]))).toEqual([5]);
+    expect(molfileAtomMapNumbers(v3000("  Other", ["M  V30 1 R# 0 0 0 2 RGROUPS=(1 2)"]))).toEqual([2]);
+    expect(molfileAtomMapNumbers(v3000("  ChemDraft", ["M  V30 1 R# 0 0 0 2 RGROUPS=(1 2)"]))).toEqual([]);
+    expect(molfileAtomMapNumbers(v3000("  Other", ["M  V30 1 C 0 0 0 0 CHG=1 -", "M  V30 AAMAP=8"]))).toEqual([8]);
+    expect(molfileAtomMapNumbers(v3000("  Other", ["M  V30 1 C 0 0 0 0 AA-", "M  V30 MAP=9"]))).toEqual([9]);
+  });
+
+  it("reads mapped SMILES kept only as the source SMILES of a molfile structure", () => {
+    const molecule = { structureFormat: "molfile-v2000" as const, structure: v2000("", [0, 0]) };
+    expect(moleculeSourceHasAtomMaps(molecule)).toBe(false);
+    expect(moleculeSourceHasAtomMaps({ ...molecule, compatibility: { sourceFormat: "smiles", warnings: [], unknown: { smiles: "[CH3:1]O" } } })).toBe(true);
+    expect(moleculeSourceHasAtomMaps({ ...molecule, compatibility: { sourceFormat: "smiles", warnings: [], unknown: { smiles: "[CH3:0]O" } } })).toBe(false);
+    expect(moleculeSourceHasAtomMaps({ ...molecule, compatibility: { sourceFormat: "smiles", warnings: [], unknown: { smiles: "CO" } } })).toBe(false);
+  });
+
+  it("reads ChemDraft's own [*:n] spelling of a drawn Rn label as that label, not a map", () => {
+    const atom = (element: string) => ({ id: element, element, x: 0, y: 0, formalCharge: 0 });
+    expect(moleculeSourceHasAtomMaps({ structureFormat: "smiles", structure: "[*:2]CC", atoms: [atom("R2"), atom("C"), atom("C")] })).toBe(false);
+    expect(moleculeSourceHasAtomMaps({ structureFormat: "smiles", structure: "[*+:2]CC", atoms: [atom("R2")] })).toBe(false);
+    expect(moleculeSourceHasAtomMaps({ structureFormat: "smiles", structure: "[*:2]CC", atoms: [atom("R3")] })).toBe(true);
+    expect(moleculeSourceHasAtomMaps({ structureFormat: "smiles", structure: "[*:2]C[*:2]", atoms: [atom("R2")] })).toBe(true);
+    expect(moleculeSourceHasAtomMaps({ structureFormat: "smiles", structure: "[CH3:2]C", atoms: [atom("R2")] })).toBe(true);
+    expect(moleculeSourceHasAtomMaps({ structureFormat: "smiles", structure: "[*:2]CC" })).toBe(true);
+  });
+
+  it("writes the V2000 map column the detector reads (CTAB column 61-63)", () => {
+    const text = v2000("t", [1, 0, 12]);
+    expect(text.split("\n").slice(4, 7).map(line => line.slice(60, 63))).toEqual(["  1", "  0", " 12"]);
+    expect(molfileAtomMapNumbers(text)).toEqual([1, 12]);
   });
 });

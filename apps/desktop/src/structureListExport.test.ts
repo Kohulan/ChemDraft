@@ -908,6 +908,8 @@ describe("atom maps in a stored source structure", () => {
     const molfile = await copyAsMolfileForExport(document!, "v2000", molWarnings);
     expect(molfile).toBeDefined();
     expect(parseMolfileGraph(molfile!).atoms).toHaveLength(4);
+    // The CTAB itself: every atom's map column (61-63) is written as 0.
+    expect(ctabMapColumns(molfile!)).toEqual(["  0", "  0", "  0", "  0"]);
     expect(molWarnings.filter(message => message.includes("Atom-map numbers"))).toEqual([
       "Atom-map numbers stored with this structure were dropped from the MOL export; ChemDraft does not keep them yet."
     ]);
@@ -918,10 +920,71 @@ describe("atom maps in a stored source structure", () => {
     ]);
     const sdf = await exportStructureListSdf(document!);
     expect(sdf.contents).toContain("> <SMILES>\nCC=CC\n");
+    expect(ctabMapColumns(sdf.contents)).toEqual(["  0", "  0", "  0", "  0"]);
     // One warning covers the record: its connection table and its SMILES field.
     expect(sdf.warnings.filter(warning => warning.code === mapCode)).toEqual([
       expect.objectContaining({ objectId: molecule.id, severity: "warning", message: expect.stringContaining("SDF export") })
     ]);
+  });
+
+  /** The map columns (61-63) of the first CTAB's atom lines, read by the counts line. */
+  function ctabMapColumns(text: string): string[] {
+    const lines = text.split("\n");
+    const counts = lines.findIndex(line => /V2000\s*$/.test(line));
+    return lines.slice(counts + 1, counts + 1 + Number(lines[counts]!.slice(0, 3))).map(line => line.slice(60, 63));
+  }
+
+  it("pins the full bytes of every export of an unmapped structure", async () => {
+    const { document } = opened("open.json");
+    const smilesWarnings: string[] = [];
+    const molWarnings: string[] = [];
+    const exports = {
+      smiles: await copyAsSmiles(document!, smilesWarnings),
+      mol: await copyAsMolfileForExport(document!, "v2000", molWarnings),
+      smi: (await exportStructureListSmi(document!)).contents,
+      sdf: (await exportStructureListSdf(document!)).contents
+    };
+    expect(exports).toMatchInlineSnapshot(`
+      {
+        "mol": "
+        ChemDraft
+
+        4  3  0  0  0  0  0  0  0  0999 V2000
+          6.0873   -8.4109    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+          7.3863   -7.6609    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+          8.6854   -8.4109    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+          9.9845   -7.6609    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+        1  2  1  0  0  0  0
+        2  3  2  3  0  0  0
+        3  4  1  0  0  0  0
+      M  END
+      ",
+        "sdf": "ChemDraft molecule 1
+        ChemDraft
+
+        4  3  0  0  0  0  0  0  0  0999 V2000
+          6.0873   -8.4109    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+          7.3863   -7.6609    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+          8.6854   -8.4109    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+          9.9845   -7.6609    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+        1  2  1  0  0  0  0
+        2  3  2  3  0  0  0
+        3  4  1  0  0  0  0
+      M  END
+      > <SMILES>
+      CC=CC
+
+      > <Index>
+      1
+
+      $$$$
+      ",
+        "smi": "CC=CC	1
+      ",
+        "smiles": "CC=CC",
+      }
+    `);
+    expect(ctabMapColumns(exports.mol!).every(column => column === "  0")).toBe(true);
   });
 
   it("adds nothing for an unmapped structure", async () => {

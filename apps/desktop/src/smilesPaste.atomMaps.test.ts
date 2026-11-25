@@ -11,6 +11,7 @@ import { ensureRdkit, generateSmiles2DMolfile, resetRdkitForTesting } from "@che
 import { installRealRdkitModuleLoader } from "@chemdraft/rdkit-adapter/testing";
 import { pastedStructureDepictionFromMolfile, SMILES_PASTE_OPTIONS } from "./documentWorkflow";
 import { atomMapStereoLossStatus, checkedSmilesPaste, SmilesPasteIdentityError } from "./smilesPasteIdentity";
+import { smilesListAtomMapNotes } from "./smilesListPaste";
 
 beforeAll(() => installRealRdkitModuleLoader());
 afterAll(() => resetRdkitForTesting());
@@ -72,6 +73,26 @@ describe("mapped SMILES paste", () => {
     expect(await atomMapStereoLossStatus(mapped, smiles, inspect)).toBe(
       "Without atom-map numbers, 1 stereocenter in the pasted SMILES is no longer stereogenic and was drawn without stereo");
     expect(await atomMapStereoLossStatus("[CH3:1][C@H:2](O)F", "[CH3][C@H](O)F", inspect)).toBeUndefined();
+  });
+
+  it.each([
+    ["[CH3:0][C@](C)(F)Cl", "1 stereocenter"],
+    ["[CH3:0]/C(C)=C/F", "1 double-bond E/Z assignment"]
+  ])("says so when a class 0, which is not a map, was what made %s stereogenic", async (input, lost) => {
+    const { smiles, removed } = stripSmilesAtomMaps(input);
+    expect(removed).toBe(0);
+    expect(smiles).not.toBe(input);
+    expect(await atomMapStereoLossStatus(input, smiles, inspect)).toBe(
+      `Without atom-map numbers, ${lost} in the pasted SMILES is no longer stereogenic and was drawn without stereo`);
+  });
+
+  it("builds list-paste notes from the entries given, which are the accepted ones", () => {
+    const mapped = { atomMaps: { input: "[CH3:1]O", mapsRemoved: true } };
+    const lost = { atomMaps: { input: "[CH3:0][C@](C)(F)Cl", mapsRemoved: false, stereoLoss: "lost" } };
+    expect(smilesListAtomMapNotes([{}, {}])).toEqual([]);
+    expect(smilesListAtomMapNotes([mapped, {}])).toEqual([ATOM_MAPS_REMOVED_STATUS]);
+    expect(smilesListAtomMapNotes([lost])).toEqual(["[CH3:0][C@](C)(F)Cl: lost"]);
+    expect(smilesListAtomMapNotes([lost, mapped])).toEqual(["[CH3:0][C@](C)(F)Cl: lost", ATOM_MAPS_REMOVED_STATUS]);
   });
 
   it("reports a failed stereo check instead of staying silent", async () => {

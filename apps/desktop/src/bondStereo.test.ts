@@ -13,6 +13,7 @@ import {
 } from "./documentWorkflow";
 import { createBondStereoActions, moleculeBondStereoCommandId, moleculeBondStereoForCommand } from "./commands";
 import { createMoleculeInspectorModel } from "./moleculeInspectorModel";
+import { atomMapsNotKeptOpenWarnings } from "@chemdraft/document-workflow-core";
 
 function drawing(smiles: string) {
   const document = insertNativeMolfileMolecule(createPhase4Document(), { x: 220, y: 220 }, depictSmiles2D(smiles).molfile, "molfile-v2000");
@@ -155,6 +156,52 @@ describe("bond stereo commands", () => {
         expect(applyMoleculeBondStereo(mapped, [target], value, perceiveDoubleBondStereoFromMolfile)).toBe(mapped);
       }
       expect(mapped).toEqual(before);
+    }
+  });
+
+  it.each([
+    ["versionless V2000", true],
+    ["V3000 map split over a continuation line", true],
+    ["source SMILES kept beside a molfile", true],
+    ["SMILES class 0", false],
+    ["SMILES R-group label ChemDraft spells [*:1]", false]
+  ] as const)("locks E/Z exactly when the open report warns of atom maps: %s", (format, locked) => {
+    const { document, molecule, target } = drawing("C/C=C/C");
+    let changes: Partial<typeof molecule>;
+    if (format === "versionless V2000") {
+      const lines = molecule.structure.split("\n");
+      const counts = lines.findIndex(line => line.includes("V2000"));
+      lines[counts] = lines[counts]!.replace(/\s*V2000\s*$/, "");
+      lines[counts + 1] = lines[counts + 1]!.slice(0, 60) + "  1" + lines[counts + 1]!.slice(63);
+      changes = { structure: lines.join("\n") };
+    } else if (format === "V3000 map split over a continuation line") {
+      const lines = moleculeToMolfileV3000(molecule, { fromDocFrame: true, kekuleBondOrders: new Map() }).contents.split("\n");
+      const atomLine = lines.indexOf("M  V30 BEGIN ATOM") + 1;
+      expect(lines[atomLine]).toMatch(/ 0$/);
+      lines.splice(atomLine, 1, lines[atomLine]!.replace(/ 0$/, " -"), "M  V30 1");
+      changes = { structureFormat: "molfile-v3000", structure: lines.join("\n") };
+    } else if (format === "source SMILES kept beside a molfile") {
+      changes = { compatibility: { sourceFormat: "smiles", warnings: [], unknown: { smiles: "[CH3:1]/C=C/C" } } };
+    } else if (format === "SMILES class 0") {
+      changes = { structureFormat: "smiles", structure: "[CH3:0]/C=C/C" };
+    } else {
+      changes = { structureFormat: "smiles", structure: "[*:1]/C=C/C",
+        atoms: molecule.atoms.map((atom, index) => index === 0 ? { ...atom, element: "R1" } : atom) };
+    }
+    const mapped = applyPatches(document, [{ op: "updateObject", objectId: molecule.id, changes }]);
+    const reason = "Atom mapping must be removed before changing E/Z";
+    const state = nativeBondStereoAvailability(mapped, [target], perceiveDoubleBondStereoFromMolfile);
+    expect(atomMapsNotKeptOpenWarnings(mapped)).toHaveLength(locked ? 1 : 0);
+    if (locked) {
+      expect(state).toEqual({ eitherDisabledReason: reason, geometryDisabledReason: reason });
+      expect(nativeBondStereoFlipDisabledReason(mapped, [target], perceiveDoubleBondStereoFromMolfile)).toBe(reason);
+      for (const value of ["either", "geometry", "flipped"] as const) {
+        expect(applyMoleculeBondStereo(mapped, [target], value, perceiveDoubleBondStereoFromMolfile)).toBe(mapped);
+      }
+    } else {
+      expect(state.eitherDisabledReason).not.toBe(reason);
+      expect(state.geometryDisabledReason).not.toBe(reason);
+      expect(nativeBondStereoFlipDisabledReason(mapped, [target], perceiveDoubleBondStereoFromMolfile)).not.toBe(reason);
     }
   });
 

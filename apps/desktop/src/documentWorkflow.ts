@@ -40,7 +40,7 @@ import type { storedCoordinatesMatchStereo } from "@chemdraft/ocl-adapter";
 import type { DoubleBondStereoReader } from "./interaction/doubleBondStereo";
 import { nativeDocumentExportWarnings, nativeMoleculeExportWarnings } from "@chemdraft/document-workflow-core";
 import {
-  ATOM_MAPS_NOT_KEPT_OPEN_CODE, atomMapsDroppedMessage, atomMapsNotKeptOpenWarnings, molfileAtomMapNumbers,
+  ATOM_MAPS_NOT_KEPT_NOTICE, ATOM_MAPS_NOT_KEPT_OPEN_CODE, atomMapsDroppedMessage, atomMapsNotKeptOpenWarnings, molfileAtomMapNumbers,
   moleculeSourceHasAtomMaps, pushAtomMapsDroppedWarning
 } from "@chemdraft/document-workflow-core";
 import {
@@ -5203,8 +5203,7 @@ export function insertNativeMolfileMolecule(
 }
 
 /** A pasted MOL/RXN keeps its mapped source text, but no native atom carries the maps. */
-const pastedAtomMapsNotKeptStatus =
-  "atom-map numbers are not kept yet; they will be dropped on export or when the structure is edited";
+const pastedAtomMapsNotKeptStatus = ATOM_MAPS_NOT_KEPT_NOTICE;
 
 export function applyClipboardPastePayload(
   document: ChemDraftDocument,
@@ -9775,22 +9774,12 @@ function withoutDoubleBondStereo(bond: MoleculeBond): MoleculeBond {
 
 const atomMappedBondStereoDisabledReason = "Atom mapping must be removed before changing E/Z";
 
-/** Atom maps exist only in the source structure, not in the native atom model. */
+/**
+ * Atom maps exist only in the source structure, not in the native atom model. The same reading as
+ * the open and export warnings (`moleculeSourceHasAtomMaps`), so the lock and the warnings agree.
+ */
 function bondStereoSourceHasAtomMapping(molecule: MoleculeObject): boolean {
-  if (molecule.structureFormat === "smiles") return /\[[^\]]*:\d+\]/.test(molecule.structure);
-  if (molecule.structureFormat === "molfile-v3000") {
-    if (/\bAAMAP\s*=\s*[1-9]\d*\b/.test(molecule.structure)) return true;
-    // Standard V3000 also has a positional atom-map field after x/y/z.
-    const atomBlock = molecule.structure.split("M  V30 BEGIN ATOM")[1]?.split("M  V30 END ATOM")[0];
-    return atomBlock?.split(/\r?\n/).some(line => {
-      const fields = line.trim().split(/\s+/);
-      return fields[0] === "M" && fields[1] === "V30" && Number(fields[7]) > 0;
-    }) ?? false;
-  }
-  const source = molecule.structure.split(/\r?\n/);
-  const counts = source.findIndex(line => line.includes("V2000"));
-  return counts >= 0 && source.slice(counts + 1, counts + 1 + Number(source[counts].slice(0, 3)))
-    .some(line => Number(line.slice(60, 63)) > 0);
+  return moleculeSourceHasAtomMaps(molecule);
 }
 
 function withStoredBondStereoMolfile(molecule: MoleculeObject): MoleculeObject {
@@ -16401,6 +16390,10 @@ export function pasteSelectionClipboardPayload(
   }
 
   warningsOut?.push(...(payload.warnings ?? []));
+  // A copied structure keeps its mapped source on paste, but no native atom carries the maps.
+  if (sourceChildren.some(object => object.type === "molecule" && moleculeSourceHasAtomMaps(object))) {
+    warningsOut?.push(ATOM_MAPS_NOT_KEPT_NOTICE);
+  }
   remapCopiedBracketPairs([...pastedById.values()], idBySourceId, warningsOut);
 
   const selectedIds = payload.selectionIds

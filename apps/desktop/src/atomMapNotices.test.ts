@@ -1,0 +1,93 @@
+/**
+ * Atom maps have no native field yet. Every write that puts a structure with a mapped stored source
+ * into an open document says so once: a MOL/RXN paste, a paste of copied ChemDraft objects, and a
+ * plugin insert. An unmapped write's status is unchanged.
+ */
+import { readFileSync } from "node:fs";
+import { describe, expect, it } from "vitest";
+import { applyPatches, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
+import { ProposedDocumentPatchSchema } from "@chemdraft/plugin-api";
+import { inspectClipboardPayload } from "@chemdraft/clipboard-adapter";
+import {
+  applyClipboardPastePayload, createPhase4Document, createSelectionClipboardPayload, openNativeDocument,
+  pasteSelectionClipboardPayload
+} from "./documentWorkflow";
+import { applyPluginDocumentPatch } from "./plugins/applyPluginDocumentPatch";
+
+const notice = "atom-map numbers are not kept yet; they will be dropped on export or when the structure is edited";
+
+function mappedDocument(): ChemDraftDocument {
+  const opened = openNativeDocument(readFileSync(new URL(
+    "../../../packages/fixtures/open-double-bonds/atom-mapped.chemdraft", import.meta.url), "utf8"));
+  return opened.document!;
+}
+const firstMolecule = (document: ChemDraftDocument) =>
+  document.pages[0]!.objects.find((object): object is MoleculeObject => object.type === "molecule")!;
+const unmappedCopy = (molecule: MoleculeObject): MoleculeObject => ({ ...molecule,
+  structure: molecule.structure.split("\n").map(line =>
+    /^\s+-?\d+\.\d{4}\s/.test(line) ? `${line.slice(0, 60)}  0${line.slice(63)}` : line).join("\n") });
+
+describe("pasting copied ChemDraft objects", () => {
+  function pasteSelectionOf(source: ChemDraftDocument) {
+    const selected = applyPatches(source, [{ op: "setSelection", pageId: source.pages[0]!.id, objectIds: [firstMolecule(source).id] }]);
+    const payload = createSelectionClipboardPayload(selected)!;
+    expect(payload).toBeDefined();
+    const warnings: string[] = [];
+    const pasted = pasteSelectionClipboardPayload(createPhase4Document(), payload, { x: 300, y: 300 }, warnings);
+    return { pasted, warnings };
+  }
+
+  it("says once that a mapped source's atom maps are not kept", () => {
+    const { pasted, warnings } = pasteSelectionOf(mappedDocument());
+    expect(warnings.filter(warning => warning === notice)).toHaveLength(1);
+    // The clone keeps its stored source as it was.
+    expect(firstMolecule(pasted).structure).toBe(firstMolecule(mappedDocument()).structure);
+  });
+
+  it("adds nothing for an unmapped structure", () => {
+    const source = mappedDocument();
+    const unmapped = applyPatches(source, [{ op: "updateObject", objectId: firstMolecule(source).id,
+      changes: { structure: unmappedCopy(firstMolecule(source)).structure } }]);
+    expect(pasteSelectionOf(unmapped).warnings.some(warning => warning.includes("atom-map"))).toBe(false);
+  });
+});
+
+describe("plugin inserts", () => {
+  function insert(object: MoleculeObject) {
+    const document = createPhase4Document();
+    return applyPluginDocumentPatch(document, ProposedDocumentPatchSchema.parse({ reason: "Insert structure",
+      patch: { op: "addObject", pageId: document.pages[0]!.id, object: { ...object, id: "mol_plugin_mapped" } } }));
+  }
+
+  it("says once that an inserted structure's atom maps are not kept", () => {
+    const result = insert(firstMolecule(mappedDocument()));
+    expect(result.warnings).toEqual(["Atom-map numbers are not kept yet; they will be dropped on export or when the structure is edited."]);
+  });
+
+  it("adds nothing for an unmapped structure", () => {
+    expect(insert(unmappedCopy(firstMolecule(mappedDocument()))).warnings).toEqual([]);
+  });
+});
+
+describe("RXN paste", () => {
+  const atom = (x: string, symbol: string, map: number) =>
+    `${x.padStart(10)}    0.0000    0.0000 ${symbol.padEnd(3)} 0  0  0  0  0  0  0  0  0${String(map).padStart(3)}  0  0`;
+  const rxn = (maps: readonly [number, number, number, number]) => [
+    "$RXN", "", "  ChemDraw", "", "  1  1",
+    "$MOL", "", "  ChemDraw", "", "  2  1  0  0  0  0            999 V2000",
+    atom("0.0000", "C", maps[0]), atom("1.5600", "O", maps[1]), "  1  2  1  0        0", "M  END",
+    "$MOL", "", "  ChemDraw", "", "  2  1  0  0  0  0            999 V2000",
+    atom("0.0000", "C", maps[2]), atom("1.5600", "O", maps[3]), "  1  2  1  0        0", "M  END"
+  ].join("\n");
+  const paste = (text: string) => applyClipboardPastePayload(createPhase4Document(),
+    inspectClipboardPayload({ types: ["text/plain"], textItems: [{ type: "text/plain", text }] }), { x: 260, y: 260 });
+
+  it("names a mapped RXN paste in its status", () => {
+    const result = paste(rxn([1, 2, 1, 2]));
+    expect(result.status).toBe(`Pasted 2 editable RXN molecule blocks; ${notice}`);
+  });
+
+  it("leaves an unmapped RXN paste's status unchanged", () => {
+    expect(paste(rxn([0, 0, 0, 0])).status).toBe("Pasted 2 editable RXN molecule blocks");
+  });
+});

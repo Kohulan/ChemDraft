@@ -19,7 +19,9 @@ import { assertPluginDocumentWriteScope, bareIdTargetPage, rebasePluginPatch,
 import { rederiveImpliedRadicalChemistryOf, selectionBounds, translateInsertedDocumentObjects } from "../documentWorkflow";
 import { choosePlacement, objectRect, overlaps as boundsOverlap, pageContentRect, RELATIVE_GAP, unionRects } from "../assistant/placement";
 import type { ViewportRect } from "@chemdraft/viewport-engine";
-import { nativeSingleBondGraphMetadata, tryNativeSingleBondGraphSmiles } from "@chemdraft/document-workflow-core";
+import {
+  ATOM_MAPS_NOT_KEPT_NOTICE, moleculeSourceHasAtomMaps, nativeSingleBondGraphMetadata, tryNativeSingleBondGraphSmiles
+} from "@chemdraft/document-workflow-core";
 import { nativeElementFromAtomLabel } from "@chemdraft/layout-engine";
 import {
   assertChemistryClaims, assertRetainedAnnotationsKept, refreshVerifiedMoleculeChemistry, stableRecord, verifiedChemicalRecord,
@@ -40,8 +42,9 @@ export interface AppliedPluginDocumentPatch {
   /**
    * What the user must be told about this write although it applied: one sentence per inserted
    * molecule whose lone-H (H•) cache was kept as stored because it is not ChemDraft's own earlier
-   * output for the drawing (`rederiveImpliedRadicalChemistryOf` declined it), naming the molecule, for
-   * the caller to show
+   * output for the drawing (`rederiveImpliedRadicalChemistryOf` declined it), naming the molecule, and
+   * one sentence when the write put a structure with a mapped stored source into the document (atom
+   * maps are not kept yet), for the caller to show
    * with the write's status, as paste does with its `warningsOut` (AGENTS.md section 7).
    */
   warnings: string[];
@@ -433,6 +436,11 @@ export function applyPluginDocumentPatch(
       return object.id;
     })
   );
+  // A structure this write inserted (or gave a new source) whose stored source carries atom maps:
+  // the source keeps them, no native atom does. Said once per write, as a mapped MOL paste says it.
+  if (writeAddsAtomMappedSource(document, patched, touched)) {
+    warnings.push(`${ATOM_MAPS_NOT_KEPT_NOTICE[0]!.toUpperCase()}${ATOM_MAPS_NOT_KEPT_NOTICE.slice(1)}.`);
+  }
 
   let selected = patched;
   if (objectIds.length > 0) {
@@ -454,6 +462,18 @@ export function applyPluginDocumentPatch(
     receipt: AppliedPatchReceiptSchema.parse({ applied: true, objectIds }),
     warnings
   };
+}
+
+/** Whether a touched molecule (`page\u0000id` keys) has a mapped stored source it did not have before. */
+function writeAddsAtomMappedSource(before: ChemDraftDocument, after: ChemDraftDocument, touched: ReadonlySet<string>): boolean {
+  const mapped = (document: ChemDraftDocument, pageId: string, objectId: string) => {
+    const object = document.pages.find(page => page.id === pageId)?.objects.find(candidate => candidate.id === objectId);
+    return object?.type === "molecule" && moleculeSourceHasAtomMaps(object);
+  };
+  return [...touched].some(key => {
+    const [pageId, objectId] = key.split("\u0000") as [string, string];
+    return mapped(after, pageId, objectId) && !mapped(before, pageId, objectId);
+  });
 }
 
 /** Move an overlapping inserted group together, only when free space fits on this page. */

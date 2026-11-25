@@ -65,12 +65,34 @@ function isSmilesChemistryRefusal(error: unknown): error is Error {
 }
 
 export interface SmilesListPasteResult {
-  entries: { smiles: string; depiction: PastedStructureDepiction; molecule?: MoleculeObject }[];
+  entries: {
+    smiles: string; depiction: PastedStructureDepiction; molecule?: MoleculeObject;
+    /** The token as pasted, when removing its atom-map classes changed it (`smilesListAtomMapNotes`). */
+    atomMaps?: SmilesListEntryAtomMaps;
+  }[];
   skipped: number;
   skippedItems: { line: number; token: string; reason: string }[];
   /** Per-item chemistry or empty-depiction failures, including the input and specific reason. */
   failures: SmilesListPasteFailure[];
   warnings?: string[];
+}
+
+export interface SmilesListEntryAtomMaps {
+  /** The token as pasted, maps included. */
+  input: string;
+  /** Whether a nonzero map was removed (a class 0 is unmapped, but still removed). */
+  mapsRemoved: boolean;
+  /** Stereo the maps alone made specifiable (`atomMapStereoLossStatus`). */
+  stereoLoss?: string;
+}
+
+/**
+ * The status notes for the atom maps removed from the entries actually pasted: give it only the
+ * entries that passed identity verification, so a refused token adds nothing.
+ */
+export function smilesListAtomMapNotes(entries: readonly { atomMaps?: SmilesListEntryAtomMaps }[]): string[] {
+  const notes = entries.flatMap(({ atomMaps }) => atomMaps?.stereoLoss ? [`${atomMaps.input}: ${atomMaps.stereoLoss}`] : []);
+  return entries.some(({ atomMaps }) => atomMaps?.mapsRemoved) ? [...notes, ATOM_MAPS_REMOVED_STATUS] : notes;
 }
 
 export interface SmilesListPasteFailure {
@@ -125,13 +147,13 @@ async function depictSmilesListCandidates(
   let parsedFirstTokenLines = 0;
   let openDoubleBonds = 0;
   let identityRefusals = 0;
-  let atomMapsRemoved = false;
   for (const [index, candidate] of candidates.entries()) {
     signal?.throwIfAborted();
     let parsed: Awaited<ReturnType<typeof depictSmilesForPaste>> = undefined;
     let identityRefused = false;
     // Atom maps have no native field yet: each token is drawn, verified and stored without them.
     const { smiles: token, removed: removedAtomMaps } = stripSmilesAtomMaps(candidate.token);
+    const stripped = token !== candidate.token;
     try {
       await inspectInput?.(token, signal);
       signal?.throwIfAborted();
@@ -154,17 +176,21 @@ async function depictSmilesListCandidates(
     }
     if (parsed) {
       handledTokens.add(`${candidate.line}:${candidate.column}`);
-      entries.push({ smiles: token, depiction: parsed.depiction, ...(parsed.molecule ? { molecule: parsed.molecule } : {}) });
+      // Compared whenever the text changed: a class 0 is not a map, but removing it can still
+      // leave a centre or an alkene without stereo. The notes are built from the accepted entries
+      // only (`smilesListAtomMapNotes`), after the caller's identity verification.
+      let atomMaps: SmilesListEntryAtomMaps | undefined;
+      if (stripped) {
+        const stereoLoss = await inspectAtomMapStereo?.(candidate.token, token, signal);
+        signal?.throwIfAborted();
+        atomMaps = { input: candidate.token, mapsRemoved: removedAtomMaps > 0, ...(stereoLoss ? { stereoLoss } : {}) };
+      }
+      entries.push({ smiles: token, depiction: parsed.depiction, ...(parsed.molecule ? { molecule: parsed.molecule } : {}),
+        ...(atomMaps ? { atomMaps } : {}) });
       const count = parsed.depiction.bonds.filter(bond => bond.stereo === "either").length;
       openDoubleBonds += count;
       warnings.push(...(parsed.warnings ?? []).filter(warning => warning !== unspecifiedDoubleBondNotice(count))
         .map((warning) => `${candidate.token}: ${warning}`));
-      if (removedAtomMaps) {
-        atomMapsRemoved = true;
-        const stereoLoss = await inspectAtomMapStereo?.(candidate.token, token, signal);
-        signal?.throwIfAborted();
-        if (stereoLoss) warnings.push(`${candidate.token}: ${stereoLoss}`);
-      }
     }
     if ((parsed || identityRefused) && candidate.column === firstTokenColumns.get(candidate.line)) {
       parsedFirstTokenLines += 1;
@@ -181,7 +207,6 @@ async function depictSmilesListCandidates(
     candidates: tokens.length, parsed: entries.length + identityRefusals, lineCount, parsedFirstTokenLines
   })) {
     if (openDoubleBonds) warnings.push(unspecifiedDoubleBondNotice(openDoubleBonds));
-    if (atomMapsRemoved) warnings.push(ATOM_MAPS_REMOVED_STATUS);
     const skippedItems = tokens.filter(token => !handledTokens.has(`${token.line}:${token.column}`)
       || identityRefusalReasons.has(`${token.line}:${token.column}`))
       .map(({ line, column, token }) => ({ line, token,
