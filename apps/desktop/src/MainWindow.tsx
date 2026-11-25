@@ -2547,10 +2547,11 @@ export function MainWindow({
   // The start document of the outermost `commitDocumentHistoryFrom` in progress: a drag's own commit
   // records from its `startDocument` and must not disarm that drag.
   const historyCommitStartRef = useRef<ChemDraftDocument | undefined>(undefined);
-  // The pointer of a drag that a foreign write disarmed (`installDocumentHistory`). Its button is
-  // still held, so hover stays off and is not re-hit until that pointer is released, exactly as it
-  // would be while the drag was armed.
-  const disarmedGesturePointerIdRef = useRef<number | undefined>(undefined);
+  // The pointers of drags that a foreign write disarmed (`installDocumentHistory`). Their buttons
+  // are still held, so hover stays off and is not re-hit until each pointer is released, exactly as
+  // it would be while its drag was armed. Held per pointer: another contact neither ends a hold
+  // nor starts one.
+  const disarmedGesturePointerIdsRef = useRef(new Set<number>());
   const artStylePreviewRef = useRef<{ startDocument: ChemDraftDocument; undoLabel: string; commandKey: string; commandId: string } | null>(null);
   const moleculeInspectorPreviewRef = useRef<{ startDocument: ChemDraftDocument; undoLabel: string; commandKey: string; commandId: string } | null>(null);
   const settlePalettePreviewRef = useRef<(reason: string) => void>(() => undefined);
@@ -3984,7 +3985,7 @@ export function MainWindow({
         if (!active) continue;
         ref.current = null;
         disarmed = true;
-        disarmedGesturePointerIdRef.current = active.pointerId;
+        disarmedGesturePointerIdsRef.current.add(active.pointerId);
         clearObjectTransformPreview(active.pointerId);
         releaseGesturePointer(active.pointerId);
         for (const target of [pageRef.current, canvasRegionRef.current]) {
@@ -15365,19 +15366,24 @@ export function MainWindow({
     if (activeToolState.activeKind !== "selection") keepNumericInputPreviewsRef.current();
   }, [activeToolState.activeKind]);
 
-  // A disarmed drag's pointer is held until it is released. A release outside the window may never
-  // arrive, so the next press, or a move with no button down, also ends the hold.
+  // A disarmed drag's pointer is held until that same pointer is released. A release outside the
+  // window may never arrive, so that pointer's next press, or a move from it with no button down,
+  // also ends its hold; leaving the window ends every hold. Other pointers never touch a hold.
   useEffect(() => {
+    const held = disarmedGesturePointerIdsRef.current;
     const endHold = (event: globalThis.PointerEvent) => {
-      const held = disarmedGesturePointerIdRef.current;
-      if (held === undefined) return;
-      const released = event.type === "pointerdown" ||
-        (event.type === "pointermove" ? (event.buttons & 1) === 0 : event.pointerId === held);
-      if (released) disarmedGesturePointerIdRef.current = undefined;
+      if (!held.has(event.pointerId)) return;
+      if (event.type !== "pointermove" || (event.buttons & 1) === 0) held.delete(event.pointerId);
     };
+    const endAllHolds = () => held.clear();
     const types = ["pointerup", "pointercancel", "pointerdown", "pointermove"] as const;
     for (const type of types) window.addEventListener(type, endHold, { capture: true });
-    return () => { for (const type of types) window.removeEventListener(type, endHold, { capture: true }); };
+    window.addEventListener("blur", endAllHolds);
+    return () => {
+      for (const type of types) window.removeEventListener(type, endHold, { capture: true });
+      window.removeEventListener("blur", endAllHolds);
+      held.clear();
+    };
   }, []);
 
   // Publish which build this WINDOW is running, so it can be asked from outside instead of read off
@@ -16076,7 +16082,7 @@ export function MainWindow({
       const before = documentRef.current;
       // Check before dispatch too: a command may itself end an editor or cancel a gesture.
       const canRehit = () => !activeAtomLabelEditRef.current && !activeTextEditObjectIdRef.current &&
-        !isSnapshotSessionActive() && disarmedGesturePointerIdRef.current === undefined &&
+        !isSnapshotSessionActive() && disarmedGesturePointerIdsRef.current.size === 0 &&
         !selectionMarqueeRef.current && !selectionLassoRef.current &&
         !tapeMeasureDragRef.current && !spin3dTugDragRef.current;
       const rehit = rehitAfterEdit && canRehit();
@@ -17612,7 +17618,7 @@ export function MainWindow({
   const rederiveNativeCanvasHoverFromLastPointer = useCallback((sourceDocument: ChemDraftDocument) => {
     // Menu history navigation shares the keyboard path's editor and gesture guards.
     if (activeAtomLabelEditRef.current || activeTextEditObjectIdRef.current ||
-        isSnapshotSessionActive() || disarmedGesturePointerIdRef.current !== undefined ||
+        isSnapshotSessionActive() || disarmedGesturePointerIdsRef.current.size > 0 ||
         selectionMarqueeRef.current || selectionLassoRef.current ||
         tapeMeasureDragRef.current || spin3dTugDragRef.current) return;
     let clientPoint = pointerInsideCanvasRef.current ? lastCanvasPointerClientPointRef.current : undefined;
@@ -20183,7 +20189,9 @@ export function MainWindow({
       return;
     }
 
-    updateNativeCanvasHover(document, pagePointFromPointerEvent(event), event.target);
+    // The button of a drag an undo stopped is still down: no hover until it is released.
+    updateNativeCanvasHover(document, disarmedGesturePointerIdsRef.current.has(event.pointerId)
+      ? undefined : pagePointFromPointerEvent(event), event.target);
   }, [
     assignHoveredNativeDeleteTarget,
     document,
@@ -23175,7 +23183,9 @@ export function MainWindow({
       return;
     }
 
-    updateNativeCanvasHover(document, pagePointFromPointerEvent(event), event.target);
+    // The button of a drag an undo stopped is still down: no hover until it is released.
+    updateNativeCanvasHover(document, disarmedGesturePointerIdsRef.current.has(event.pointerId)
+      ? undefined : pagePointFromPointerEvent(event), event.target);
   }, [
     continueNativePlacementDrag,
     assignHoveredNativeDeleteTarget,
