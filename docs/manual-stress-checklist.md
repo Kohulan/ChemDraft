@@ -4,6 +4,9 @@ Molecule angle entry: select one whole native molecule, right-click, choose Rota
 enter positive/negative/fractional angles and a full 360 degrees. Accept/cancel and Undo/Redo must
 preserve charge, isotopes, stereochemistry, bond lengths and internal angles. Partial selections
 must not offer whole-molecule rotation. Check native menus and input focus on Windows and both macOS builds.
+Then, with the Bond tool active, right-click the selected molecule and choose Rotate molecule: the Selection tool comes up with the angle box showing; type an angle (say 30) and check the molecule turns, then pick the Bond tool, draw a bond onto that molecule, return to Selection and press Escape: the bond stays and Undo removes it, then the rotation. Type a stretch, then choose Rotate molecule and press Escape: the stretch stays and Undo returns to before it. Type 30 in the angle box, then clear it (or change it to `1.` or letters): the molecule returns to where it started, and Enter adds no undo step. While dragging a stretch or rotate handle (button still held), choose Rotate molecule from the menu or shortcut: no angle box opens, and on release the drag is one undo step.
+Open the angle box (and, separately, the stretch box) and leave it empty, or type only `-`, `1.` or letters, then hover a palette color and move off it, pick the Bond tool, or press Enter: the drawing is unchanged and Undo has nothing new to undo. A palette color hover while a typed angle is showing keeps the rotation as one step, and moving off the color removes the color again.
+Paste `C[C@H]([NH3+])C(=O)[O-]`, hover the CH3 and press `-`, then right-click the molecule: Rotate molecule is offered (also after Ctrl+A on Windows, Cmd+A on macOS); enter 90 and keep: the charge, radical and lone-pair marks turn with their atoms, the charges stay, and one Undo restores the molecule and every mark. Select that molecule with a second molecule, a text or an arrow: Rotate molecule is not offered.
 
 Document zoom controls: use Main's Zoom Out/In and each preset, check 100→125→150→200 and reverse,
 then smooth wheel/pinch and tab switching. The displayed percentage must follow the active view.
@@ -360,6 +363,34 @@ Main toolbar while the overlay is still up. Click outside the molecule: the stat
 drawing changed, the 3D overlay closes, and the cleaned-up drawing stays. Do it again, but this time
 click Spin 3D a second time instead of clicking outside: Spin 3D starts over on the cleaned-up
 molecule (no "already active" message), and a click outside flattens it.
+
+Marks follow their own atom (1.2.3 blocker). Paste aspirin `CC(=O)Oc1ccccc1C(=O)O`, hover the
+carboxylic acid OH oxygen and press `-`; repeat on fresh copies with a radical dot, a lone pair and
+a radical anion (RDKit cannot verify a singly bonded O•−, so Spin 3D and the 3D rotations may refuse
+that one with a message: a refusal is fine, a misplaced mark is not). For each, run Spin 3D twice:
+once with the molecule and its mark selected, once with only the molecule selected (click the
+molecule, not the mark). The moment the overlay opens, before any drag, the mark sits beside the
+carboxylate O, never beside the ester O or on a bond, and stays beside it, with its selection box
+when it is selected, through a long drag in several directions; no box is left behind at the old
+spot. Click outside: it is committed where the overlay drew it. Then check it is still beside that O
+after typed X, Y and Z rotations of the stored model, after Interactive 3D (tug the O, click
+outside), after 3D Clean Up, in a transparent PNG/TIFF and an SVG export, and after Save As, close
+and reopen. Throughout, Copy As SMILES stays `...C(=O)[O-]` (formula unchanged), dragging the
+carboxylate O still pulls the mark, and one Undo after any of these restores the drawing and the
+mark exactly as before.
+
+Marks keep off other molecules and off labels. Draw a second molecule (ethane, and separately
+methylamine `CN`) right where the aspirin's `-` will land after a Spin 3D of the first: during the
+drag and after the click outside, the `-` never sits on the other molecule's atoms, bonds or its
+`NH2`/`H2N` letters; it turns to a free side of its own O at the same distance, and the other
+molecule does not move. Draw methylammonium (`CN`, `+` on the N, drawn `H3N` with the `+` at its
+lower right) and Spin 3D it half a turn about the vertical: it is committed as `NH3`, and the `+`
+is not left on the `H3`. A `2+` (or `3-`) mark, drawn larger, is carried clear of bonds by its larger
+circle. A molecule turned on the page (rotation not 0, for example from a turned import or group)
+with a `-` on it: during Spin 3D the `-` is painted where the click outside stores it, turned with
+the molecule (the overlay itself still draws the projection unturned, so mid-spin the mark may sit
+apart from the drawn atom; after release the mark is beside its atom and the molecule is still
+turned). Copy As SMILES never changes.
 
 ## Automatic plugin update notices (macOS and Windows)
 
