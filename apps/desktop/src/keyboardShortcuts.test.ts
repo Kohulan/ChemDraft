@@ -10,7 +10,7 @@ import { DEFAULT_KEYBINDING_SETTINGS, LEGACY_DEFAULT_KEYBINDING_SCHEME } from ".
 import {
   createDesktopShortcutRegistry,
   createMainWindowShortcutCommands,
-  enableWindowsLastDocumentCloseAction,
+  enableLastDocumentCloseAction,
   isBrowserReloadChord
 } from "./keyboardShortcuts";
 import { desktopToolsetRegistry, getToolsetCommandSpecs } from "./toolsets";
@@ -130,16 +130,18 @@ describe("isBrowserReloadChord", () => {
 });
 
 describe("last document close command", () => {
-  it("enables Close Document Tab only on Windows", () => {
+  it("enables Close Document Tab on Windows and Linux, not on macOS", () => {
     const document = createPhase4Document();
     const actions = createQuickActions(document, undefined, { hasMultipleTabs: false });
     const closeKey = { key: "w", ctrlKey: true };
 
-    const windows = enableWindowsLastDocumentCloseAction(actions, "windows");
-    expect(createDesktopShortcutRegistry(windows, "windows").resolve(closeKey)).toBe("document.closeTab");
-    expect(windows.find((action) => action.id === "document.closeTab")).toMatchObject({ enabled: true });
+    for (const platform of ["windows", "linux"] as const) {
+      const enabled = enableLastDocumentCloseAction(actions, platform);
+      expect(createDesktopShortcutRegistry(enabled, platform).resolve(closeKey)).toBe("document.closeTab");
+      expect(enabled.find((action) => action.id === "document.closeTab")).toMatchObject({ enabled: true });
+    }
 
-    const macos = enableWindowsLastDocumentCloseAction(actions, "macos");
+    const macos = enableLastDocumentCloseAction(actions, "macos");
     expect(createDesktopShortcutRegistry(macos, "macos").resolve({ key: "w", metaKey: true })).toBeUndefined();
     expect(macos.find((action) => action.id === "document.closeTab")).toMatchObject({ enabled: false });
   });

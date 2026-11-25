@@ -64,15 +64,17 @@ export interface DesktopShortcutRegistryOptions {
 }
 
 /**
- * Windows keeps a document window open after closing its final drawing, replacing that drawing
- * through the ordinary close-tab path. macOS leaves its final Cmd+W to the native Close Window
- * action instead. Keep the platform explicit so tests can cover both policies from one host.
+ * Windows and Linux keep a document window open after closing its final drawing, replacing that
+ * drawing through the ordinary close-tab path (a dirty one asks "Save changes?" first). macOS leaves
+ * its final Cmd+W to the native Close Window action instead. Linux has no Ctrl+W menu accelerator
+ * (the webview owns the shortcut), so leaving the command disabled there made Ctrl+W on the only
+ * drawing do nothing. Keep the platform explicit so tests can cover every policy from one host.
  */
-export function enableWindowsLastDocumentCloseAction(
+export function enableLastDocumentCloseAction(
   commands: readonly CommandSpec[],
   platform: ShortcutPlatform = detectDesktopShortcutPlatform()
 ): CommandSpec[] {
-  if (platform !== "windows") return [...commands];
+  if (platform === "macos") return [...commands];
   return commands.map((command) => command.id === "document.closeTab"
     ? { ...command, enabled: true, disabledReason: undefined }
     : command);

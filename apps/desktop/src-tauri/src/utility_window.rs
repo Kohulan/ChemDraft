@@ -211,12 +211,172 @@ pub(super) fn raise<R: Runtime>(window: &WebviewWindow<R>) -> Result<(), String>
     })?
 }
 
+/// Whether the window manager places a palette again each time it is mapped, so ChemDraft must
+/// hold it where it was (palette_map_pin). X11 and XWayland only: a native Wayland client has no
+/// global position, and macOS and Windows show a window where it was.
+#[cfg(target_os = "linux")]
+pub(super) fn map_replaces_position<R: Runtime>(app: &AppHandle<R>) -> bool {
+    !uses_native_wayland(app).unwrap_or(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn map_replaces_position<R: Runtime>(_app: &AppHandle<R>) -> bool {
+    false
+}
+
+/// Move a mapped X11 palette to `position` (physical pixels, its outer top-left), as a pager would.
+///
+/// A plain move (gtk_window_move, XMoveWindow) is a client configure request, and KWin pulls a
+/// window that lies inside the work area back into it after one (`keepInArea` in
+/// `X11Window::configureRequest`), which is exactly the clamp being undone. `_NET_MOVERESIZE_WINDOW`
+/// is handled as a request from a tool, which KWin applies as given; other EWMH window managers
+/// treat it as an ordinary move. North-west gravity makes the position the frame's top-left, the
+/// same point Tao reports as the outer position. Returns what it did, for the diagnostic.
+#[cfg(target_os = "linux")]
+pub(super) fn move_mapped<R: Runtime>(
+    window: &tauri::Window<R>,
+    position: (i32, i32),
+) -> Result<String, String> {
+    let target = window.clone();
+    super::run_on_main_thread_blocking(window, move || {
+        use gtk::{gdk::prelude::DisplayExtManual, glib::translate::ToGlibPtr, prelude::WidgetExt};
+
+        let native = target.gtk_window().map_err(|error| error.to_string())?;
+        let Some(surface) = native.window() else {
+            return Ok("skipped:unrealized".to_string());
+        };
+        let display = surface.display();
+        if !display.backend().is_x11() {
+            return Ok("skipped:not-x11".to_string());
+        }
+        let window_ptr: *mut gtk::gdk::ffi::GdkWindow = surface.to_glib_none().0;
+        let display_ptr: *mut gtk::gdk::ffi::GdkDisplay = display.to_glib_none().0;
+        // SAFETY: GTK's main thread, an X11 display (checked above) and a realized toplevel that
+        // outlives the call.
+        let error = unsafe { send_net_moveresize(display_ptr, window_ptr, position) };
+        display.flush();
+        Ok(format!("sent:_NET_MOVERESIZE_WINDOW,x-error={error}"))
+    })?
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn move_mapped<R: Runtime>(
+    _window: &tauri::Window<R>,
+    _position: (i32, i32),
+) -> Result<String, String> {
+    Ok("skipped:not-linux".to_string())
+}
+
+/// Xlib's XClientMessageEvent with 32-bit data, which Xlib passes as C longs.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // Read by Xlib, never by Rust.
+struct XClientMessageEvent {
+    kind: std::os::raw::c_int,
+    serial: std::os::raw::c_ulong,
+    send_event: std::os::raw::c_int,
+    display: *mut std::os::raw::c_void,
+    window: std::os::raw::c_ulong,
+    message_type: std::os::raw::c_ulong,
+    format: std::os::raw::c_int,
+    data: [std::os::raw::c_long; 5],
+}
+
+/// Xlib's XEvent: every event travels in a buffer of 24 longs.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[allow(dead_code)] // Read by Xlib, never by Rust.
+union XEvent {
+    client: XClientMessageEvent,
+    pad: [std::os::raw::c_long; 24],
+}
+
+/// Send `_NET_MOVERESIZE_WINDOW` for `window` to the root window, and return the X error code the
+/// GDK trap caught (0 for none).
+///
+/// SAFETY: GTK's main thread, an X11 `display`, and a realized `window` on it.
+#[cfg(target_os = "linux")]
+unsafe fn send_net_moveresize(
+    display: *mut gtk::gdk::ffi::GdkDisplay,
+    window: *mut gtk::gdk::ffi::GdkWindow,
+    (x, y): (i32, i32),
+) -> std::os::raw::c_int {
+    use std::os::raw::c_long;
+
+    const CLIENT_MESSAGE: std::os::raw::c_int = 33;
+    const SUBSTRUCTURE_NOTIFY_MASK: c_long = 1 << 19;
+    const SUBSTRUCTURE_REDIRECT_MASK: c_long = 1 << 20;
+    const NORTH_WEST_GRAVITY: c_long = 1;
+    const SET_X: c_long = 1 << 8;
+    const SET_Y: c_long = 1 << 9;
+    // EWMH source indication 2: a pager or other direct user action.
+    const FROM_PAGER: c_long = 2 << 12;
+
+    let xdisplay = gdk_x11_display_get_xdisplay(display);
+    let xid = gdk_x11_window_get_xid(window);
+    gdk_x11_display_error_trap_push(display);
+    let message_type = XInternAtom(xdisplay, c"_NET_MOVERESIZE_WINDOW".as_ptr(), 0);
+    let mut event = XEvent { pad: [0; 24] };
+    event.client = XClientMessageEvent {
+        kind: CLIENT_MESSAGE,
+        serial: 0,
+        send_event: 1,
+        display: xdisplay,
+        window: xid,
+        message_type,
+        format: 32,
+        data: [
+            NORTH_WEST_GRAVITY | SET_X | SET_Y | FROM_PAGER,
+            c_long::from(x),
+            c_long::from(y),
+            0,
+            0,
+        ],
+    };
+    XSendEvent(
+        xdisplay,
+        XDefaultRootWindow(xdisplay),
+        0,
+        SUBSTRUCTURE_NOTIFY_MASK | SUBSTRUCTURE_REDIRECT_MASK,
+        &mut event,
+    );
+    gdk_x11_display_error_trap_pop(display)
+}
+
 // From libgdk-3 (gdk/x11/gdkx11display.h, gdkx11window.h), which gdk-sys already links. The
 // signatures are gdkx11-sys 0.18's; a GdkX11Display/GdkX11Window is its GdkDisplay/GdkWindow.
 #[cfg(target_os = "linux")]
 unsafe extern "C" {
     fn gdk_x11_display_get_user_time(display: *mut gtk::gdk::ffi::GdkDisplay) -> u32;
     fn gdk_x11_window_set_user_time(window: *mut gtk::gdk::ffi::GdkWindow, timestamp: u32);
+    fn gdk_x11_window_get_xid(window: *mut gtk::gdk::ffi::GdkWindow) -> std::os::raw::c_ulong;
+    fn gdk_x11_display_get_xdisplay(
+        display: *mut gtk::gdk::ffi::GdkDisplay,
+    ) -> *mut std::os::raw::c_void;
+    fn gdk_x11_display_error_trap_push(display: *mut gtk::gdk::ffi::GdkDisplay);
+    fn gdk_x11_display_error_trap_pop(
+        display: *mut gtk::gdk::ffi::GdkDisplay,
+    ) -> std::os::raw::c_int;
+}
+
+// libX11 (Xlib.h); the same declarations as palette_focus_linux.rs, plus XSendEvent.
+#[cfg(target_os = "linux")]
+#[link(name = "X11")]
+unsafe extern "C" {
+    fn XInternAtom(
+        display: *mut std::os::raw::c_void,
+        name: *const std::os::raw::c_char,
+        only_if_exists: std::os::raw::c_int,
+    ) -> std::os::raw::c_ulong;
+    fn XDefaultRootWindow(display: *mut std::os::raw::c_void) -> std::os::raw::c_ulong;
+    fn XSendEvent(
+        display: *mut std::os::raw::c_void,
+        window: std::os::raw::c_ulong,
+        propagate: std::os::raw::c_int,
+        event_mask: std::os::raw::c_long,
+        event: *mut XEvent,
+    ) -> std::os::raw::c_int;
 }
 
 /// The X11 user time of the input that opened each popover, by window label. Recorded when the

@@ -22,6 +22,9 @@ pub(crate) struct UtilitySuspension {
     /// Bottom to top, retained for the whole cycle, including already-restored siblings.
     restore_order: Vec<String>,
     recovery_positions: HashMap<String, HashSet<(i32, i32)>>,
+    /// Each utility's outer position when this suspension hid it, so the restore never measures a
+    /// hidden window's frame (which an X11 window manager no longer manages).
+    hidden_positions: HashMap<String, (i32, i32)>,
     deferred_panels: HashMap<String, super::OpenPluginPanelRequest>,
 }
 
@@ -131,6 +134,7 @@ impl UtilitySuspension {
         self.restore.remove(label);
         self.restore_order.retain(|entry| entry != label);
         self.visibility.remove(label);
+        self.hidden_positions.remove(label);
         self.deferred_panels.remove(label);
     }
 
@@ -145,6 +149,7 @@ impl UtilitySuspension {
             self.restore.clear();
             self.restore_order.clear();
             self.recovery_positions.clear();
+            self.hidden_positions.clear();
             self.deferred_panels.clear();
             return None;
         }
@@ -195,6 +200,17 @@ impl UtilitySuspension {
 
     pub(crate) fn restored(&mut self, label: &str) {
         self.restore.remove(label);
+        self.hidden_positions.remove(label);
+    }
+
+    /// Record where `label` was just before this suspension hid it.
+    pub(crate) fn hiding_at(&mut self, label: &str, position: (i32, i32)) {
+        self.hidden_positions.insert(label.to_string(), position);
+    }
+
+    /// Where `label` was when this suspension hid it, until it is restored or closed.
+    pub(crate) fn hidden_position(&self, label: &str) -> Option<(i32, i32)> {
+        self.hidden_positions.get(label).copied()
     }
 
     pub(crate) fn recovery_move(&mut self, label: &str, position: (i32, i32)) {
@@ -228,6 +244,7 @@ impl UtilitySuspension {
             self.visibility.clear();
             self.document_children.clear();
             self.restore_order.clear();
+            self.hidden_positions.clear();
         }
     }
 }
@@ -276,6 +293,47 @@ mod tests {
         state.restored("toolset-core-main");
         state.finish_restore();
         assert!(!state.active());
+    }
+
+    #[test]
+    fn the_position_before_the_hide_is_kept_until_the_palette_is_restored_or_closed() {
+        let mut state = UtilitySuspension::default();
+        state.begin(
+            [
+                ("toolset-core-main".into(), true, false, false),
+                ("toolset-core-rings".into(), true, false, false),
+                ("toolset-core-art".into(), true, false, false),
+            ],
+            None,
+        );
+        state.hiding_at("toolset-core-main", (450, 315));
+        state.hiding_at("toolset-core-rings", (-40, 900));
+        state.hiding_at("toolset-core-art", (10, 10));
+        assert_eq!(state.hidden_position("toolset-core-main"), Some((450, 315)));
+        assert_eq!(state.hidden_position("toolset-core-other"), None);
+        state.closed("toolset-core-art");
+        assert_eq!(state.hidden_position("toolset-core-art"), None);
+        state.release(false).unwrap();
+        state.start_restore();
+        // Main restores; Rings waits for a retry and keeps its frame through it.
+        assert_eq!(state.hidden_position("toolset-core-main"), Some((450, 315)));
+        state.restored("toolset-core-main");
+        assert_eq!(state.hidden_position("toolset-core-main"), None);
+        state.finish_restore();
+        assert_eq!(
+            state.hidden_position("toolset-core-rings"),
+            Some((-40, 900))
+        );
+        state.start_restore();
+        state.restored("toolset-core-rings");
+        state.finish_restore();
+        assert!(!state.active());
+        assert_eq!(state.hidden_position("toolset-core-rings"), None);
+        // Quitting forgets every frame.
+        state.begin([("toolset-core-main".into(), true, false, false)], None);
+        state.hiding_at("toolset-core-main", (1, 2));
+        state.release(true);
+        assert_eq!(state.hidden_position("toolset-core-main"), None);
     }
 
     #[test]
