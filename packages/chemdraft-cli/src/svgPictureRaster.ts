@@ -1,6 +1,8 @@
 import { Resvg } from "@resvg/resvg-js";
-import type { ChemDraftDocument } from "@chemdraft/chem-core";
-import { sanitizeSvgPicture, type ExportWarning, type SanitizedSvg } from "@chemdraft/export-engine";
+import { readSvgInfo, type ChemDraftDocument } from "@chemdraft/chem-core";
+import {
+  parseSvgLength, pictureSizeLimitError, sanitizeSvgPicture, type ExportWarning, type SanitizedSvg
+} from "@chemdraft/export-engine";
 import type { SvgPictureRasterRequest } from "@chemdraft/export-engine/pdf";
 
 /**
@@ -12,9 +14,12 @@ import type { SvgPictureRasterRequest } from "@chemdraft/export-engine/pdf";
  * (`@chemdraft/export-engine`, the one the desktop drop uses) has read it: under its refusing policy a
  * picture that refers to anything outside itself is not drawn at all, bitmaps are checked by their
  * bytes and sizes before any Resvg is built, and what resvg draws is the serialisation of what was
- * checked.
+ * checked. Every pixmap resvg is asked for is bounded on both sides and in total, whatever the picture's
+ * own size or aspect: the picture's size is read and checked before any Resvg is built, and its root is
+ * given the exact pixel size to render at.
  */
 
+/** Every pixmap resvg draws here, the intermediate render and the stretch to the frame, stays within this a side. */
 const MAX_RENDER_SIDE = 8192;
 /** PNG flattening: the longest side of one flattened picture. */
 export const FLATTEN_MAX_SIDE = 8192;
@@ -45,20 +50,64 @@ export async function sanitizeSvgForResvg(source: string): Promise<SanitizedSvg>
 }
 
 export async function rasterizeSvgPictureWithResvg(request: SvgPictureRasterRequest): Promise<Uint8Array> {
-  const { svg } = await sanitizeSvgForResvg(request.svg);
   const { pixelWidth, pixelHeight } = request;
+  if (pixmapSizeError(pixelWidth, pixelHeight)) throw new Error(`the requested raster size ${pixelWidth} x ${pixelHeight} is not usable`);
+  const { svg } = await sanitizeSvgForResvg(request.svg);
   // resvg-js does not draw an image nested inside an SVG that is itself nested as an image, so render the
   // picture directly, at its own aspect and large enough to cover the frame on both axes...
-  const intrinsic = new Resvg(svg);
-  const scale = Math.min(Math.max(pixelWidth / intrinsic.width, pixelHeight / intrinsic.height),
-    MAX_RENDER_SIDE / Math.max(intrinsic.width, intrinsic.height));
-  const rendered = new Resvg(svg, { fitTo: { mode: "width", value: Math.max(1, Math.round(intrinsic.width * scale)) } })
-    .render().asPng();
+  const rendered = renderBounded(await sizedSvg(svg, pixelWidth, pixelHeight));
   // ...then stretch that to the frame (preserveAspectRatio="none"), as the canvas does.
   const href = `data:image/png;base64,${Buffer.from(rendered).toString("base64")}`;
   const wrapper = `<svg xmlns="http://www.w3.org/2000/svg" width="${pixelWidth}" height="${pixelHeight}" viewBox="0 0 ${pixelWidth} ${pixelHeight}">` +
     `<image x="0" y="0" width="${pixelWidth}" height="${pixelHeight}" preserveAspectRatio="none" href="${href}"/></svg>`;
-  return new Uint8Array(new Resvg(wrapper).render().asPng());
+  return new Uint8Array(renderBounded(wrapper));
+}
+
+/** Why a pixmap of this size is not drawn, or undefined: at most `MAX_RENDER_SIDE` a side and within the shared decoded limit. */
+function pixmapSizeError(width: number, height: number): string | undefined {
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) return `it is ${width} × ${height} pixels`;
+  if (width > MAX_RENDER_SIDE || height > MAX_RENDER_SIDE) return `it is ${width} × ${height} pixels; the limit is ${MAX_RENDER_SIDE} pixels on a side`;
+  return pictureSizeLimitError(width, height)?.replace(/\.$/, "");
+}
+
+/** Render an SVG whose root size is the pixmap wanted, refusing before the pixmap exists if that size is out of bounds. */
+function renderBounded(svg: string): Buffer {
+  const resvg = new Resvg(svg);
+  const width = Math.ceil(resvg.width), height = Math.ceil(resvg.height);
+  const error = pixmapSizeError(width, height);
+  if (error) throw new Error(`the picture would render too large: ${error}`);
+  return resvg.render().asPng();
+}
+
+/**
+ * The sanitised picture with its root sized to the exact pixmap to draw: its intrinsic aspect, covering
+ * `pixelWidth` x `pixelHeight` where the side limit allows, at most `MAX_RENDER_SIDE` on either side (a side
+ * the aspect makes thinner than a pixel is drawn one pixel wide). The intrinsic size is the one the drop and
+ * the desktop rasteriser read; a root width or height that is zero, negative or not finite, or an intrinsic
+ * size the paste caps refuse, is refused. The root's viewBox is kept; one with no viewBox gets one from its
+ * intrinsic size, so resizing it scales rather than crops.
+ */
+async function sizedSvg(svg: string, pixelWidth: number, pixelHeight: number): Promise<string> {
+  const { parser, serializer } = await xml();
+  const parsed = parser.parseFromString(svg, "image/svg+xml");
+  const root = parsed.documentElement;
+  if (!root || root.localName !== "svg" || parsed.getElementsByTagName("parsererror").length) throw new Error("the SVG could not be read");
+  for (const name of ["width", "height"]) {
+    const value = root.getAttribute(name);
+    const length = value === null ? undefined : parseSvgLength(value);
+    if (length && !(Number.isFinite(length.value) && length.value > 0)) throw new Error(`the SVG's ${name} "${value}" is not a usable size`);
+  }
+  const info = readSvgInfo(svg);
+  const width = info?.physicalSize?.width ?? NaN, height = info?.physicalSize?.height ?? NaN;
+  if (!(Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0)) throw new Error("the SVG's size can't be read");
+  const limit = pictureSizeLimitError(info!.pixelWidth, info!.pixelHeight);
+  if (limit) throw new Error(limit.replace(/\.$/, ""));
+  const scale = Math.min(Math.max(pixelWidth / width, pixelHeight / height), MAX_RENDER_SIDE / Math.max(width, height));
+  const renderSide = (side: number) => Math.min(MAX_RENDER_SIDE, Math.max(1, Math.round(side * scale)));
+  if (!root.hasAttribute("viewBox")) root.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  root.setAttribute("width", String(renderSide(width)));
+  root.setAttribute("height", String(renderSide(height)));
+  return serializer.serializeToString(parsed);
 }
 
 /**
@@ -121,15 +170,19 @@ export async function flattenSvgPictures(svg: string, pixelsPerUnit: number, war
     try {
       const base64 = hrefs.length === 1 ? /^data:image\/svg\+xml;base64,([A-Za-z0-9+/=]*)$/i.exec(hrefs[0]!.value)?.[1] : undefined;
       const width = Number(image.getAttribute("width")), height = Number(image.getAttribute("height"));
-      if (base64 === undefined || !(width > 0) || !(height > 0)) throw new Error("the picture's data or frame can't be read");
       let pixelWidth = width * pixelsPerUnit, pixelHeight = height * pixelsPerUnit;
+      // A frame of 1e309 reads as Infinity, and one Infinity or NaN here would poison the budget of every later picture.
+      if (base64 === undefined || !(width > 0) || !(height > 0) || !(Number.isFinite(pixelWidth) && pixelWidth > 0)
+        || !(Number.isFinite(pixelHeight) && pixelHeight > 0)) throw new Error("the picture's data or frame can't be read");
       const fitSide = Math.min(1, FLATTEN_MAX_SIDE / Math.max(pixelWidth, pixelHeight));
-      const fitBudget = Math.min(1, Math.sqrt(Math.max(remainingPixels, 0) / (pixelWidth * pixelHeight * fitSide * fitSide)));
-      if (fitBudget < 1 && Math.max(pixelWidth, pixelHeight) * fitSide * fitBudget < FLATTEN_MIN_SIDE) {
+      pixelWidth *= fitSide;
+      pixelHeight *= fitSide;
+      const fitBudget = Math.min(1, Math.sqrt(Math.max(remainingPixels, 0) / (pixelWidth * pixelHeight)));
+      if (fitBudget < 1 && Math.max(pixelWidth, pixelHeight) * fitBudget < FLATTEN_MIN_SIDE) {
         throw new Error("the document has too many SVG pictures to draw within the memory limit");
       }
-      pixelWidth = Math.max(1, Math.floor(pixelWidth * fitSide * fitBudget));
-      pixelHeight = Math.max(1, Math.floor(pixelHeight * fitSide * fitBudget));
+      pixelWidth = Math.min(FLATTEN_MAX_SIDE, Math.max(1, Math.floor(pixelWidth * fitBudget)));
+      pixelHeight = Math.min(FLATTEN_MAX_SIDE, Math.max(1, Math.floor(pixelHeight * fitBudget)));
       if (pixelWidth * pixelHeight > remainingPixels) throw new Error("the document has too many SVG pictures to draw within the memory limit");
       // The final PNG decodes every picture on its own, so each one is charged, shared raster or not.
       charged = pixelWidth * pixelHeight;
