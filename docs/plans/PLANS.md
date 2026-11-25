@@ -58,6 +58,18 @@ the hidden-scrollbar floating tool palette background still drag. Preserve nativ
 disabled-control exclusion, click compensation and the mouse fallback. Test both platform routes; actual Windows/macOS
 scrollbar dragging and mixed-DPI native checks remain pending.
 
+## Image drag and drop (`feat/1.2.3-image-drop`)
+
+Drop PNG, JPEG, GIF, WebP and SVG files on the canvas (owner request for 1.2.3), as native picture
+objects through `createImageGraphicObject`, the same model Paste Picture uses. One shared handler in
+`apps/desktop/src/imageDrop/` serves the Tauri path drop and the browser `File` drop: pictures are
+recognised by their bytes, documents keep the open path unchanged, BMP/TIFF/HEIC/AVIF/SVGZ/PDF and
+files over 20 MB are refused by name before reading. JPEG/GIF/WebP are decoded by the webview after a
+header pixel-cap check and stored as PNG; SVG is sanitised into an inert, allow-listed copy. All
+pictures of a drop are one "Insert Image" entry, placed at the drop point (per-platform position
+conversion), in the tab under the drop only. No drop navigates any window. Pictures keep their aspect
+ratio under every resize. Hands-on pass on native Windows and both macOS builds remains pending.
+
 # ChemDraft Assistant plugin (active, branches claude/assistant-*)
 
 ## Objective

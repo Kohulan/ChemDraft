@@ -17,7 +17,8 @@ import { Resvg } from "@resvg/resvg-js";
 import { jsPDF } from "jspdf";
 import { exportDocumentToCdxml } from "@chemdraft/cdx-compat";
 import { describe, expect, it } from "vitest";
-import { exportDocumentToPdf, exportSvgToPdf } from "./pdf";
+import { crc32 } from "node:zlib";
+import { exportDocumentToPdf, exportSvgToPdf, svgPictureRasterSize, SVG_PICTURE_MAX_RASTER_PIXELS, type SvgPictureRasterRequest } from "./pdf";
 import { exportDocumentToSvg } from "./svg";
 import { extractPdfPositionedTextRuns, extractPdfTextRuns, largePicturePng, pdfFontStreams, sfntName, sfntTable, standardFontTextWidth } from "./pdf.testUtils";
 import { multilineScriptedTextDocument, scriptedTextDocument } from "./scriptedText.fixture";
@@ -120,7 +121,7 @@ describe("exportDocumentToPdf", () => {
     expect(pdf.warnings).toEqual([{ code: "export.pdf.picture_missing_data", severity: "warning", objectId: "missing-picture",
       message: "PDF export: picture missing-picture has no picture data and was not drawn" }]);
     expect(exportDocumentToCdxml(document).warnings).toEqual([{ code: "cdxml.picture_not_saved", sourceObjectId: "missing-picture",
-      message: "CDXML export: picture missing-picture is not saved in CDXML" }]);
+      message: "CDXML export: picture missing-picture has no picture data, so nothing of it is saved in CDXML" }]);
   });
 
   it("exports picture frames in SVG and embeds PNGs in PDF, warning for SVG pictures", async () => {
@@ -145,7 +146,7 @@ describe("exportDocumentToPdf", () => {
     expect(content).toMatch(/\/I\d+ Do/);
     expect(content).toContain("80. 0 0 40. 10.12345");
     expect(pdf.warnings).toEqual([{ code: "export.pdf.svg_picture_not_drawn", severity: "warning", objectId: "g13",
-      message: "PDF export: SVG picture g13 was not drawn; paste it as PNG or export SVG" }]);
+      message: "PDF export: SVG picture g13 was not drawn: no SVG rasteriser is available in this export; export SVG or PNG to keep the picture" }]);
   });
 
   it.each([1, 0.5, 2])("keeps PNGs at physical size with output page scale %s, moving their centres with the layout", async outputScale => {
@@ -889,6 +890,209 @@ function documentWithText(text: string, style: TextObject["style"] = {}) {
     }
   }, { now: timestamp });
 }
+
+describe("SVG pictures in PDF export", () => {
+  const redPng = () => new Uint8Array(new Resvg('<svg xmlns="http://www.w3.org/2000/svg" width="4" height="2"><rect width="4" height="2" fill="red"/></svg>').render().asPng());
+  const svgSource = (tag = "") => `<svg xmlns="http://www.w3.org/2000/svg" width="96" height="48"><rect width="96" height="48" fill="blue"/>${tag}</svg>`;
+  const pictureOf = (id: string, mimeType: "image/png" | "image/svg+xml", frame: Partial<{ x: number; y: number; width: number; height: number; rotation: number }>, opacity?: number, source = svgSource()) => {
+    const dataBase64 = mimeType === "image/png" ? Buffer.from(redPng()).toString("base64") : btoa(source);
+    const picture = { ...createImageGraphicObject({ id, mimeType, dataBase64, center: { x: 0, y: 0 } }),
+      x: 100, y: 120, width: 96, height: 48, rotation: 30, ...frame };
+    if (opacity !== undefined) picture.style = { ...picture.style, opacity };
+    return picture;
+  };
+  const documentOf = (...objects: ReturnType<typeof pictureOf>[]) => {
+    const document = createEmptyDocument({ now: timestamp });
+    document.pages[0]!.objects = objects;
+    return document;
+  };
+  const pictureAlphas = (pdf: string) => {
+    const states = new Map([...pdf.matchAll(/(\d+) 0 obj\s*<<\s*\/ca ([\d.]+)\s*>>/g)].map(match => [match[1]!, Number(match[2])]));
+    const resources = new Map([...pdf.matchAll(/\/(GS\d+) (\d+) 0 R/g)].map(match => [match[1]!, states.get(match[2]!)]));
+    const stack: number[] = [];
+    let alpha = 1;
+    const painted: number[] = [];
+    for (const token of pdf.match(/stream\n([\s\S]*?)\nendstream/)![1]!.matchAll(/\b(q|Q)\b|\/(GS\d+) gs|\/I\d+ Do/g)) {
+      if (token[1] === "q") stack.push(alpha);
+      else if (token[1] === "Q") alpha = stack.pop() ?? 1;
+      else if (token[2]) alpha = resources.get(token[2]) ?? alpha;
+      else painted.push(alpha);
+    }
+    return painted;
+  };
+  const pdfOf = (document: ReturnType<typeof documentOf>, rasterizeSvgPicture?: (request: SvgPictureRasterRequest) => Promise<Uint8Array>) =>
+    withPdfDom(domParser => exportDocumentToPdf(document, { domParser, compress: false, rasterizeSvgPicture }));
+  const notDrawn = (id: string, reason: string) => ({ code: "export.pdf.svg_picture_not_drawn", severity: "warning", objectId: id,
+    message: `PDF export: SVG picture ${id} was not drawn: ${reason}` });
+
+  it("places a PNG and an SVG picture of the same frame identically in SVG and PDF export", async () => {
+    const document = documentOf(pictureOf("png-picture", "image/png", {}, 0.4), pictureOf("svg-picture", "image/svg+xml", {}, 0.4));
+    const requests: SvgPictureRasterRequest[] = [];
+    const result = await pdfOf(document, async request => { requests.push(request); return redPng(); });
+    expect(result.warnings).toEqual([]);
+
+    const dom = new JSDOM(exportDocumentToSvg(document).contents, { contentType: "image/svg+xml" });
+    const groups = [...dom.window.document.querySelectorAll("g[data-object-id]")];
+    expect(groups.map(group => group.getAttribute("data-object-id"))).toEqual(["png-picture", "svg-picture"]);
+    const attributes = (group: Element) => ["x", "y", "width", "height", "preserveAspectRatio"].map(name => group.querySelector("image")!.getAttribute(name))
+      .concat(group.getAttribute("transform")!, group.getAttribute("opacity")!);
+    expect(attributes(groups[1]!)).toEqual(attributes(groups[0]!));
+    dom.window.close();
+
+    const pdf = Buffer.from(result.bytes).toString("latin1");
+    const [first, second] = pdfPictureFrames(pdf);
+    expect(second!.width).toBeCloseTo(first!.width, 6);
+    expect(second!.height).toBeCloseTo(first!.height, 6);
+    expect(second!.cx).toBeCloseTo(first!.cx, 6);
+    expect(second!.cy).toBeCloseTo(first!.cy, 6);
+    expect(first!.width).toBeCloseTo(72, 1);
+    expect(pictureAlphas(pdf)).toEqual([0.4, 0.4]);
+    // 96 x 48 page units drawn at 300 dpi; the hook sees the frame and the PNG size it must produce.
+    expect(requests).toEqual([{ svg: svgSource(), width: 96, height: 48, pixelWidth: 300, pixelHeight: 150 }]);
+  });
+
+  it("keeps SVG pictures in z-order between vector objects and PNG pictures", async () => {
+    const document = createEmptyDocument({ now: timestamp });
+    const text = (id: string, content: string, y: number): TextObject => ({ id, type: "text", x: 20, y, width: 80, height: 20, rotation: 0,
+      text: content, spans: [], style: {} });
+    document.pages[0]!.objects = [text("t1", "Before", 40), pictureOf("svg-picture", "image/svg+xml", { rotation: 0 }),
+      text("t2", "Between", 60), pictureOf("png-picture", "image/png", { rotation: 0, y: 300 }), text("t3", "After", 80)];
+    const result = await pdfOf(document, async () => redPng());
+    const pdf = Buffer.from(result.bytes).toString("latin1");
+    const draws = [...pdf.matchAll(/\/I\d+ Do/g)].map(match => match.index!);
+    expect(draws).toHaveLength(2);
+    expect(draws[0]).toBeGreaterThan(pdf.indexOf("(Before)"));
+    expect(pdf.indexOf("(Between)")).toBeGreaterThan(draws[0]!);
+    expect(draws[1]).toBeGreaterThan(pdf.indexOf("(Between)"));
+    expect(pdf.indexOf("(After)")).toBeGreaterThan(draws[1]!);
+  });
+
+  it("sizes rasters at 300 dpi, no smaller than the picture's own pixels, no larger than 4096 on a side", () => {
+    expect(svgPictureRasterSize({ width: 96, height: 48 }, { pixelWidth: 96, pixelHeight: 48 })).toEqual({ pixelWidth: 300, pixelHeight: 150 });
+    expect(svgPictureRasterSize({ width: 96, height: 48 }, { pixelWidth: 1000, pixelHeight: 500 })).toEqual({ pixelWidth: 1000, pixelHeight: 500 });
+    expect(svgPictureRasterSize({ width: 2000, height: 1000 }, { pixelWidth: 2000, pixelHeight: 1000 })).toEqual({ pixelWidth: 4096, pixelHeight: 2048 });
+    expect(svgPictureRasterSize({ width: 1, height: 1 }, { pixelWidth: 1, pixelHeight: 1 })).toEqual({ pixelWidth: 3, pixelHeight: 3 });
+  });
+
+  it("rasterises identical pictures once", async () => {
+    const document = documentOf(pictureOf("one", "image/svg+xml", { x: 50 }), pictureOf("two", "image/svg+xml", { x: 300, rotation: 0 }),
+      pictureOf("larger", "image/svg+xml", { x: 500, width: 192, height: 96 }));
+    const requests: SvgPictureRasterRequest[] = [];
+    const result = await pdfOf(document, async request => { requests.push(request); return redPng(); });
+    expect(result.warnings).toEqual([]);
+    expect(requests.map(request => [request.width, request.pixelWidth])).toEqual([[96, 300], [192, 600]]);
+    expect(pdfPictureFrames(Buffer.from(result.bytes).toString("latin1"))).toHaveLength(3);
+  });
+
+  it("warns by picture and still exports the rest when the rasteriser fails", async () => {
+    const document = documentOf(pictureOf("png-picture", "image/png", { x: 10 }), pictureOf("svg-picture", "image/svg+xml", { x: 300 }));
+    const result = await pdfOf(document, async () => { throw new Error("the SVG has content that can't be drawn"); });
+    expect(result.warnings).toEqual([notDrawn("svg-picture", "the SVG has content that can't be drawn")]);
+    expect(pdfPictureFrames(Buffer.from(result.bytes).toString("latin1"))).toHaveLength(1);
+    // Non-Error throws still name the reason.
+    const thrown = await pdfOf(documentOf(pictureOf("svg-picture", "image/svg+xml", {})), () => Promise.reject("boom"));
+    expect(thrown.warnings).toEqual([notDrawn("svg-picture", "boom")]);
+  });
+
+  it("warns when the rasteriser returns something that is not a usable PNG", async () => {
+    const document = documentOf(pictureOf("svg-picture", "image/svg+xml", {}));
+    const garbage = await pdfOf(document, async () => new Uint8Array([1, 2, 3, 4]));
+    expect(garbage.warnings).toEqual([notDrawn("svg-picture", "the rasteriser returned an invalid PNG (the PNG has invalid structure.)")]);
+    const notBytes = await pdfOf(document, async () => "iVBORw0KGgo=" as unknown as Uint8Array);
+    expect(notBytes.warnings).toEqual([notDrawn("svg-picture", "the rasteriser did not return PNG bytes")]);
+    // Well-framed PNG whose pixels cannot decode: jsPDF refuses it, and only this picture is lost.
+    const png = Buffer.from(redPng());
+    const idat = png.indexOf("IDAT");
+    const corrupt = Buffer.from(png);
+    corrupt.fill(0x55, idat + 4, idat + 12);
+    const corrupted = await pdfOf(document, async () => new Uint8Array(corrupt));
+    expect(corrupted.bytes.length).toBeGreaterThan(0);
+    expect(corrupted.warnings).toEqual([notDrawn("svg-picture", "the rasterised PNG could not be embedded (Error while decompressing the data: -3)")]);
+  });
+
+  it("warns by picture, and exports the rest, when a native PNG picture cannot be embedded", async () => {
+    // Well-framed PNG whose pixels cannot decode: the structure check passes it, jsPDF refuses it.
+    const png = Buffer.from(redPng());
+    png.fill(0x55, png.indexOf("IDAT") + 4, png.indexOf("IDAT") + 12);
+    const broken = { ...createImageGraphicObject({ id: "broken", mimeType: "image/png", dataBase64: png.toString("base64"), center: { x: 0, y: 0 } }),
+      x: 300, y: 120, width: 96, height: 48, rotation: 0 };
+    const result = await pdfOf(documentOf(pictureOf("fine", "image/png", { x: 10 }), broken));
+    expect(result.warnings).toEqual([{ code: "export.pdf.picture_not_drawn", severity: "warning", objectId: "broken",
+      message: "PDF export: picture broken was not drawn: the PNG could not be embedded (Error while decompressing the data: -3)" }]);
+    expect(pdfPictureFrames(Buffer.from(result.bytes).toString("latin1"))).toHaveLength(1);
+  });
+
+  it("rejects a rasteriser result larger than the size cap", async () => {
+    const chunk = (type: string, data: Buffer) => {
+      const bytes = Buffer.alloc(data.length + 12);
+      bytes.writeUInt32BE(data.length, 0);
+      bytes.write(type, 4, "ascii");
+      data.copy(bytes, 8);
+      bytes.writeUInt32BE(crc32(bytes.subarray(4, -4)), bytes.length - 4);
+      return bytes;
+    };
+    const header = Buffer.alloc(13);
+    header.writeUInt32BE(5000, 0);
+    header.writeUInt32BE(10, 4);
+    header[8] = 8;
+    header[9] = 6;
+    const huge = Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk("IHDR", header), chunk("IDAT", Buffer.from([0])), chunk("IEND", Buffer.alloc(0))]);
+    const result = await pdfOf(documentOf(pictureOf("svg-picture", "image/svg+xml", {})), async () => new Uint8Array(huge));
+    expect(result.warnings).toEqual([notDrawn("svg-picture", "the rasteriser returned a 5000 x 10 PNG; the limit is 4096 pixels on a side")]);
+  });
+
+  it("warns by picture when no rasteriser is given, in the document and SVG callers", async () => {
+    const document = documentOf(pictureOf("svg-picture", "image/svg+xml", {}));
+    const reason = "no SVG rasteriser is available in this export; export SVG or PNG to keep the picture";
+    expect((await pdfOf(document)).warnings).toEqual([notDrawn("svg-picture", reason)]);
+    const page = document.pages[0]!;
+    const picture = page.objects[0] as ReturnType<typeof pictureOf>;
+    // The same document through the SVG caller, now with a rasteriser.
+    const viaSvg = await withPdfDom(domParser => exportSvgToPdf(exportDocumentToSvg(document).contents, { domParser, compress: false,
+      outputWidth: page.width, outputHeight: page.height, pictures: new Map([[picture.id, picture]]), pageSize: page,
+      rasterizeSvgPicture: async () => redPng() }));
+    expect(viaSvg.warnings).toEqual([]);
+    expect(pdfPictureFrames(Buffer.from(viaSvg.bytes).toString("latin1"))).toHaveLength(1);
+  });
+
+  it("shares one pixel budget across a document of many large pictures", async () => {
+    const pictures = Array.from({ length: 14 }, (_, index) => pictureOf(`big-${index}`, "image/svg+xml",
+      { width: 1500, height: 1500, rotation: 0 }, undefined,
+      `<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="1500"><desc>${index}</desc></svg>`));
+    const requests: SvgPictureRasterRequest[] = [];
+    const result = await pdfOf(documentOf(...pictures), async request => { requests.push(request); return redPng(); });
+    expect(requests[0]).toMatchObject({ pixelWidth: 4096, pixelHeight: 4096 });
+    expect(requests.reduce((total, request) => total + request.pixelWidth * request.pixelHeight, 0)).toBeLessThanOrEqual(SVG_PICTURE_MAX_RASTER_PIXELS);
+    expect(requests.length).toBeLessThan(pictures.length);
+    expect(result.warnings).toHaveLength(pictures.length - requests.length);
+    for (const warning of result.warnings) expect(warning.message).toContain("too many SVG pictures");
+  }, 30_000);
+
+  it("gives a failed raster's pixels back to the budget, once, for the pictures after it", async () => {
+    const svgOf = (label: string) => `<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="1500"><desc>${label}</desc></svg>`;
+    const big = (id: string, label: string) => pictureOf(id, "image/svg+xml", { width: 1500, height: 1500, rotation: 0 }, undefined, svgOf(label));
+    // Six failures that would reserve the whole budget, a duplicate of the first (one cached
+    // failure, no second refund), then seven good pictures: six fill the budget exactly.
+    const pictures = [
+      ...Array.from({ length: 6 }, (_, index) => big(`bad-${index}`, `bad ${index}`)),
+      big("bad-again", "bad 0"),
+      ...Array.from({ length: 7 }, (_, index) => big(`good-${index}`, `good ${index}`))
+    ];
+    const good: SvgPictureRasterRequest[] = [];
+    const result = await pdfOf(documentOf(...pictures), async request => {
+      if (request.svg.includes("bad")) throw new Error("renderer crashed");
+      good.push(request);
+      return redPng();
+    });
+    expect(result.warnings.map(warning => warning.message.includes("renderer crashed"))).toEqual([...Array(7).fill(true), false]);
+    expect(result.warnings[7]!.message).toContain("too many SVG pictures");
+    // Six good pictures draw whole; the seventh has no budget left. A second refund for the
+    // duplicate would have let it through.
+    expect(good).toHaveLength(6);
+    expect(good.every(request => request.pixelWidth === 4096 && request.pixelHeight === 4096)).toBe(true);
+    expect(good.reduce((total, request) => total + request.pixelWidth * request.pixelHeight, 0)).toBeLessThanOrEqual(SVG_PICTURE_MAX_RASTER_PIXELS);
+  }, 30_000);
+});
 
 async function withPdfDom<T>(callback: (domParser: DOMParser) => Promise<T>, useStandardTextMetrics = false): Promise<T> {
   const dom = new JSDOM("<!doctype html><html><body></body></html>", {

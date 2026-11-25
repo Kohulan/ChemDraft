@@ -4,6 +4,7 @@ import { exportDocumentToCdxml } from "@chemdraft/cdx-compat";
 import { NativeDocumentBaselineAppVersion, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
 import { assertMolfileHasKnownBondOrders, nativeMoleculeExportWarnings, stereoPerceptionMolfile } from "@chemdraft/document-workflow-core";
 import { ensureSvgFontsLoaded, exportDocumentToSvg, type ExportWarning } from "@chemdraft/export-engine";
+import { DocumentStyleScale } from "@chemdraft/layout-engine";
 import { perceiveStereoCentersFromMolfile } from "@chemdraft/ocl-adapter";
 import { numericOption, parseOptions, stringOption } from "../args";
 import { figureStyleHelp, figureStyleOptions, figureStyleResult, parseFigureStyle, validateFigureDpi } from "../figureStyle";
@@ -14,6 +15,7 @@ import { installNodeEngines } from "../engine";
 import { installNodeRendering } from "../nodeRendering";
 import { CliUsageError, cliExitCode, defaultCliIo, handleCliError, writeJsonLine,
   writeProgress, type CliIo } from "../output";
+import { flattenSvgPictures, headlessSvgPictureWarnings, rasterizeSvgPictureWithResvg } from "../svgPictureRaster";
 import { withPdfDom } from "./export";
 import { perceiveDoubleBondStereo } from "./stereo";
 
@@ -142,8 +144,8 @@ export async function runRenderDocumentCommand(argv: readonly string[], io: CliI
         await save(extension === format ? out : `${out}.${format}`, saved.contents);
       } else if (format === "pdf") {
         const { exportDocumentToPdf } = await import("@chemdraft/export-engine/pdf");
-        const pdf = await withPdfDom((domParser) => exportDocumentToPdf(document, { domParser }));
-        warnings.push(...pdf.warnings);
+        const pdf = await withPdfDom((domParser) => exportDocumentToPdf(document, { domParser, rasterizeSvgPicture: rasterizeSvgPictureWithResvg }));
+        warnings.push(...pdf.warnings, ...await headlessSvgPictureWarnings(document, "pdf", pdf.warnings));
         await save(extension === format ? out : `${out}.${format}`, pdf.bytes);
       } else {
         await ensureSvgFontsLoaded(document);
@@ -155,7 +157,15 @@ export async function runRenderDocumentCommand(argv: readonly string[], io: CliI
         physicalSize = cropped?.viewBox;
         const base = ["svg", "png"].includes(extension) ? out.slice(0, -extname(out).length) : out;
         if (format === "svg" || format === "both") await save(format === "both" ? `${base}.svg` : extension === format ? out : `${out}.svg`, svg);
-        if (format === "png" || format === "both") await save(format === "both" ? `${base}.png` : extension === format ? out : `${out}.png`, svgToPng(svg, width, figure.style, figure.dpi));
+        if (format === "png" || format === "both") {
+          // resvg draws no bitmap inside a nested SVG picture, so each one is flattened to a PNG first.
+          const viewBoxWidth = Number(/<svg\b[^>]*\sviewBox="[^"]*?\s([\d.eE+-]+)\s+[\d.eE+-]+"/.exec(svg)?.[1]);
+          const pixelsPerUnit = figure.style === "document" ? DocumentStyleScale.pointsPerUnit * (figure.dpi ?? DocumentStyleScale.defaultDpi) / 72
+            : viewBoxWidth > 0 ? width / viewBoxWidth : 1;
+          const flattened = await flattenSvgPictures(svg, pixelsPerUnit, warnings);
+          warnings.push(...await headlessSvgPictureWarnings(document, "png", warnings));
+          await save(format === "both" ? `${base}.png` : extension === format ? out : `${out}.png`, svgToPng(flattened, width, figure.style, figure.dpi));
+        }
       }
       if (format !== "chemdraft" && document.pages.length > 1) warnings.push({
         code: "export.first_page_only", severity: "warning", message: "Only the first page was rendered; other pages remain in the source document."

@@ -10,6 +10,10 @@
  * copy made through `<use>` or `<feImage>`, but parses each copy's href afresh, so the copy still
  * names its picture and Rust can report exactly which pictures have copies it could not draw.
  *
+ * SVG pictures that embed a bitmap become PNGs here: `svgPicture/rasterEmbeddedBitmaps.ts` rasterises
+ * each one as this pass reaches it (`beforeDecode`), so they take the same path and the same budget.
+ * Pure-vector SVG pictures draw natively.
+ *
  * Limits, enforced before decoding and re-checked in Rust: 16384 px a side, 256 MiB of decoded
  * pixels (width × height × 4) across one export call, and 1024 pictures per call. A picture over a
  * limit, or one that fails to decode, is not drawn; Rust reports it with a warning naming the reason.
@@ -52,11 +56,21 @@ export interface DecodedPicturePixels {
 
 export type PicturePixelDecoder = (png: Uint8Array<ArrayBuffer>) => Promise<DecodedPicturePixels>;
 
+/**
+ * Runs on each `<image>` this call may still take, in drawing order, before it is read, with the
+ * decoded bytes still unspent; it may replace the href with a PNG of at most that many decoded
+ * bytes (`svgPicture/rasterEmbeddedBitmaps.ts` does, for SVG pictures that embed a bitmap). It
+ * resolves `true` when it took the picture on for rasterising, whether or not that succeeded: such a
+ * picture holds one of the `RasterPictureMaxCount` slots either way, so failures cannot run unbounded.
+ */
+export type RasterPicturePreStep = (image: Element, remainingBytes: number) => Promise<boolean | void>;
+
 export interface PrepareRasterPicturesOptions {
   /** Defaults to the webview's own decoder, `decodePngPixels`. */
   decode?: PicturePixelDecoder;
   /** Decoded bytes allowed across this call; defaults to `RasterPictureDecodedBudgetBytes`. */
   budgetBytes?: number;
+  beforeDecode?: RasterPicturePreStep;
 }
 
 export interface PreparedRasterPictures {
@@ -87,24 +101,37 @@ export function readPngSize(bytes: Uint8Array): { width: number; height: number 
  * Decodes the SVG's top-level PNG pictures for one native raster export. Pictures nested inside SVG
  * pictures, other bitmap types, and `<image>` elements that already carry an id or more than one
  * href are left untouched, so Rust keeps its general omitted-picture warning for them.
+ *
+ * One ledger: a picture is charged its decoded bytes only once it has decoded, and `beforeDecode`
+ * sizes each SVG picture against what is truly left at that point in drawing order.
  */
 export async function prepareRasterPictures(
   svg: string,
-  { decode = decodePngPixels, budgetBytes = RasterPictureDecodedBudgetBytes }: PrepareRasterPicturesOptions = {}
+  { decode = decodePngPixels, budgetBytes = RasterPictureDecodedBudgetBytes, beforeDecode }: PrepareRasterPicturesOptions = {}
 ): Promise<PreparedRasterPictures> {
-  if (!/data:image\/png;base64,/i.test(svg)) return { svg, pictures: [] };
+  if (!/data:image\/png;base64,/i.test(svg) && !(beforeDecode && /data:image\/svg\+xml/i.test(svg))) return { svg, pictures: [] };
   const parsed = new DOMParser().parseFromString(svg, "image/svg+xml");
   if (parsed.getElementsByTagName("parsererror").length > 0) return { svg, pictures: [] };
 
   const prefix = unusedIdPrefix(svg);
   const pictures: NativeRasterPicture[] = [];
   let remainingBytes = budgetBytes;
+  // Slots held by SVG pictures the pre-step took on but that did not become a PNG (rasterising failed).
+  let failedSlots = 0;
+  // Whether any href was rewritten: an over-count stand-in can come before any picture is sent.
+  let rewritten = false;
   for (const image of Array.from(parsed.getElementsByTagNameNS(SvgNamespace, "image"))) {
+    const admitted = beforeDecode && pictures.length + failedSlots < RasterPictureMaxCount
+      ? (await beforeDecode(image, remainingBytes)) === true : false;
     const href = pngHref(image);
-    if (!href) continue;
-    if (pictures.length >= RasterPictureMaxCount) {
+    if (!href) {
+      if (admitted) failedSlots += 1;
+      continue;
+    }
+    if (pictures.length + failedSlots >= RasterPictureMaxCount) {
       // Counted before decoding: past the limit nothing is decoded or sent.
       href.attribute.value = RasterPictureOverCountHref;
+      rewritten = true;
       continue;
     }
     const id = `${prefix}${pictures.length}`;
@@ -119,9 +146,15 @@ export async function prepareRasterPictures(
       href.attribute.value = rasterPicturePlaceholderHref(outcome.width, outcome.height, id);
     }
     image.setAttribute("id", id);
+    rewritten = true;
   }
-  if (pictures.length === 0) return { svg, pictures };
+  if (!rewritten) return { svg, pictures };
   return { svg: new XMLSerializer().serializeToString(parsed), pictures };
+}
+
+/** Read the size from the first base64 characters, before decoding anything else. */
+function pngSizeOfBase64(base64: string): { width: number; height: number } | undefined {
+  return base64.length % 4 === 0 ? readPngSize(base64ToBytes(base64.slice(0, PngSizeHeaderBase64Length))) : undefined;
 }
 
 /** Decodes one picture within the limits and returns its pixels as base64, or why it was refused. */
@@ -131,8 +164,7 @@ async function encodeWithinLimits(
   decode: PicturePixelDecoder
 ): Promise<{ width: number; height: number; rgbaBase64: string } | { refused: RasterPictureRefusal }> {
   try {
-    // Read the size from the first base64 characters, before decoding anything else.
-    const size = base64.length % 4 === 0 ? readPngSize(base64ToBytes(base64.slice(0, PngSizeHeaderBase64Length))) : undefined;
+    const size = pngSizeOfBase64(base64);
     if (!size) return { refused: "decodeFailed" };
     if (size.width > RasterPictureMaxSidePx || size.height > RasterPictureMaxSidePx) return { refused: "tooLarge" };
     if (size.width * size.height * 4 > remainingBytes) return { refused: "overBudget" };

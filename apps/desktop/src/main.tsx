@@ -4,10 +4,16 @@ import { App } from "./App";
 import { perfProbeRequestedFromWindow } from "./perf/gate";
 import { perfHook } from "./perf/runtime";
 import { installContextMenuGuard } from "./contextMenuGuard";
+import { installDropNavigationGuard } from "./imageDrop/dropNavigationGuard";
+import { isBlockedByModalDialog } from "@chemdraft/shortcut-engine";
 import "./App.css";
 
+const utilityWindow = new URLSearchParams(window.location.search).has("window");
 // The document window owns its canvas context menu; all other app windows share this guard.
-if (new URLSearchParams(window.location.search).has("window")) installContextMenuGuard();
+if (utilityWindow) installContextMenuGuard();
+// No drop navigates any window. Only the document window takes files (outside modal dialogs); a
+// file dropped on a palette, popover or dialog is refused there.
+installDropNavigationGuard(window, utilityWindow ? {} : { acceptsFiles: target => !isBlockedByModalDialog(target) });
 
 function mount() {
   createRoot(document.getElementById("root") as HTMLElement).render(

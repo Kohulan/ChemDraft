@@ -242,6 +242,7 @@ import {
   placeInsertedObjectsInFreeSpace,
   createPluginWriteGate,
   describePatchFailure,
+  PluginWriteGateTimeoutError,
   type PluginWriteGate
 } from "./plugins/applyPluginDocumentPatch";
 import { AnalyzerNoticeBanner, type AnalyzerNotice } from "./plugins/AnalyzerNotice";
@@ -949,6 +950,13 @@ import {
 } from "./keyboardShortcuts";
 import { installBrowserReloadGuard, wasBrowserReloadPrevented } from "./browserReloadGuard";
 import { assertDocumentSize, decodeNativeDocumentContents, documentContentsKey, readBrowserDocumentFile, readNativeDocumentFile, type DocumentContents } from "./documentText";
+import { handleDroppedFiles, type DroppedImageInsertion, type DroppedImageSource } from "./imageDrop/dropHandler";
+import { browserDropClientPoint, drawableCanvasRect, dropPagePoint, tauriDropClientPoint, type DropClientPoint } from "./imageDrop/dropPosition";
+import { insertDroppedImages, type PagePointLike } from "./imageDrop/insertDroppedImages";
+import type { PreparedDroppedImage } from "./imageDrop/prepareDroppedImage";
+import { savedDocumentBytes } from "./imageDrop/dropDocumentBudget";
+import { browserImageDecoders } from "./imageDrop/rasterDecode";
+import { browserDroppedImageSource, nativeDroppedImageSource } from "./imageDrop/readDroppedFile";
 import { createDocumentFileSave, exportDocumentCdx } from "./documentFileFormats";
 import { getDesktopExportFormatDescriptor as getExportFormatDescriptor } from "./desktopExportFormats";
 import { exportDefaultPath, stripExportFileExtension } from "./exportFilename";
@@ -1416,6 +1424,11 @@ type ObjectResizeInputState = {
   draftYPercent: string;
   homeXPercent: string;
   homeYPercent: string;
+  /**
+   * A picture keeps its aspect ratio (it scales by the mean of a stretch), so its X and Y entries are
+   * one value: typing either sets both, and the readout shows the scale actually applied.
+   */
+  linkedAxes?: boolean;
 };
 type ObjectResizeCorner = "top-left" | "top-right" | "bottom-left" | "bottom-right";
 type ObjectResizeDragState = {
@@ -1886,7 +1899,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.24.21.40-opus";
+const CURRENT_BUILD_STAMP = "11.24.22.41-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -10841,7 +10854,8 @@ export function MainWindow({
     return run;
   }, []);
 
-  const openDocumentBatch = useCallback((requests: readonly DocumentOpenRequest[]): Promise<void> => {
+  // Resolves to the batch's summary status (also shown here), so a drop can add its pictures to it.
+  const openDocumentBatch = useCallback((requests: readonly DocumentOpenRequest[]): Promise<string | undefined> => {
     const results = requests.map(({ contents, displayName, path, receipt }) => {
       // Confirm at tab installation, before optional page-fit and compatibility dialogs.
       // A rejected parse or an early return (e.g. unfinished table edit) fails the receipt.
@@ -10870,6 +10884,7 @@ export function MainWindow({
         setStatus(summary);
         if (!documentSessionHydratedRef.current) shellOpenFailureRef.current = summary;
       }
+      return summary || undefined;
     });
     documentOpenQueueRef.current = finished.catch(() => undefined);
     return finished;
@@ -11208,23 +11223,159 @@ export function MainWindow({
   }, []);
 
   const openDroppedDocumentPaths = useCallback(async (paths: readonly string[]) => {
-    await openDocumentBatch(paths.map(path => ({
+    return openDocumentBatch(paths.map(path => ({
       contents: () => readNativeDocumentFile(path), displayName: nativePathBasename(path), path
     })));
   }, [openDocumentBatch]);
+
+  // Dropped pictures: prepared one drop at a time, so two drops never interleave their commits.
+  const imageDropQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+  // Why the open document cannot take a dropped picture now; the same guards as Paste Picture.
+  const imageDropRefusal = useCallback((): string | undefined => {
+    if (quitInteractionRef.current) return "ChemDraft is quitting.";
+    if (closeTabPromptRef.current) return "answer the close-tab question first.";
+    if (!documentSessionHydratedRef.current) return "the restored documents are still loading; drop them again in a moment.";
+    if (isBlockedByModalDialog(null)) return "close the open dialog first.";
+    if (pageFitPendingRef.current) return "answer the page size question first.";
+    if (tableCellEditorRef.current) return "finish editing the table cell first.";
+    if (activeAtomLabelEditRef.current) return "finish editing the atom label first.";
+    if (activeTextEditObjectIdRef.current) return "finish editing the text first.";
+    return undefined;
+  }, []);
+  /**
+   * The drop point in page units, read when the drop happens. A drop outside the drawable canvas
+   * (toolbar, tab strip, rulers, scrollbars) lands at the nearest point of the visible page; a drop without a
+   * position (a synthetic event) at the visible centre, as Paste Picture does.
+   */
+  const droppedImagePagePoint = useCallback((client: DropClientPoint | undefined): PagePointLike => {
+    const canvas = canvasRegionRef.current;
+    const page = pageRef.current;
+    if (!client || !canvas || !page) return viewportCentrePagePoint();
+    // The drawable area, as `isCanvasDrawingPress` reads it: no rulers, no scrollbars.
+    const drawable = drawableCanvasRect(canvas, canvas.classList.contains("rulers-visible") ? RULER_THICKNESS : 0);
+    return dropPagePoint(client, drawable, page.getBoundingClientRect(), viewportRef.current.scale, documentRef.current.pages[0]!);
+  }, [viewportCentrePagePoint]);
+  /**
+   * One drop, either route. The target tab, its document and the point are fixed at drop time; the
+   * pictures are committed only into that same document, as one "Insert Image" undo entry, after the
+   * asynchronous read and decode. A document that changed tab (or was replaced in its tab) is never
+   * written to: the status says so instead. The edit guards are checked at drop time, so a refusal is
+   * reported at once, and again at commit. The commit waits, as a plugin's write does, for any live
+   * canvas gesture to end (a resize, move or drawing commits from its own starting snapshot and would
+   * wipe the pictures), and is refused if the canvas stays busy.
+   */
+  const runFileDrop = useCallback(<T,>(files: readonly T[], client: DropClientPoint | undefined, route: {
+    nameOf(file: T): string;
+    imageSource(file: T): DroppedImageSource;
+    openDocuments(files: T[]): Promise<string | undefined>;
+  }) => {
+    const tabId = activeDocumentTabIdRef.current;
+    // Bumped whenever the active document is replaced or another tab is installed (as for plugin
+    // writes): a picture is only ever inserted into the document it was dropped on.
+    const documentIdentity = documentIdentityRef.current;
+    const point = droppedImagePagePoint(client);
+    const insertImages = (images: PreparedDroppedImage[]): DroppedImageInsertion => {
+      if (!mountedRef.current || activeDocumentTabIdRef.current !== tabId || documentIdentityRef.current !== documentIdentity) {
+        return { ok: false, reason: "the document they were dropped on is no longer the active tab; drop them again." };
+      }
+      const refusal = imageDropRefusal();
+      if (refusal) return { ok: false, reason: refusal };
+      let scaledToPage: readonly string[] = [];
+      let failure: string | undefined;
+      const committed = commitDocumentChangeWithPageFit(document => {
+        try {
+          const inserted = insertDroppedImages(document, images, point);
+          scaledToPage = inserted.scaledToPage;
+          return inserted.document;
+        } catch (error) {
+          failure = error instanceof Error ? error.message : String(error);
+          return document;
+        }
+      }, "Insert Image", undefined, undefined, preserveChemistry("paste"));
+      if (!committed) return { ok: false, reason: failure ?? "the document did not accept them." };
+      // Like Paste Picture: the pictures stay selected and the canvas has focus, so the first Undo
+      // undoes the drop rather than a field's text history.
+      resetPasteUiState();
+      canvasRegionRef.current?.focus({ preventScroll: true });
+      return { ok: true, scaledToPage };
+    };
+    return handleDroppedFiles(files, {
+      ...route, insertImages, decoders: browserImageDecoders, setStatus,
+      insertRefusal: imageDropRefusal,
+      documentBytes: () => {
+        // The session's cached payload when autosave has built one for this very document.
+        const current = documentRef.current;
+        let payload = sessionPayloadCacheRef.current.get(current);
+        if (!payload) {
+          payload = createNativeSavePayload(current);
+          sessionPayloadCacheRef.current.set(current, payload);
+        }
+        return savedDocumentBytes(payload.contents);
+      },
+      whenIdle: <R,>(commit: () => R): Promise<R> => {
+        const gate = pluginWriteGateRef.current;
+        if (!gate) return Promise.resolve().then(commit);
+        return gate.run(commit).catch((error: unknown) => {
+          throw new Error(error instanceof PluginWriteGateTimeoutError
+            ? "the canvas stayed busy with another edit; drop them again."
+            : error instanceof Error ? error.message : String(error));
+        });
+      },
+      serialize: task => {
+        const run = imageDropQueueRef.current.then(task);
+        imageDropQueueRef.current = run.catch(() => undefined);
+        return run;
+      }
+    }).catch((error: unknown) => setStatus(`Couldn't finish the drop: ${error instanceof Error ? error.message : String(error)}`));
+  }, [commitDocumentChangeWithPageFit, droppedImagePagePoint, imageDropRefusal, resetPasteUiState]);
+
+  const dropNativePaths = useCallback((paths: readonly string[], client: DropClientPoint | undefined) =>
+    runFileDrop(paths, client, { nameOf: nativePathBasename, imageSource: nativeDroppedImageSource,
+      openDocuments: openDroppedDocumentPaths }), [openDroppedDocumentPaths, runFileDrop]);
+
+  const dropBrowserFiles = useCallback((files: readonly File[], client: DropClientPoint | undefined) =>
+    runFileDrop(files, client, { nameOf: file => file.name, imageSource: browserDroppedImageSource,
+      // The document path exactly as before the picture drop existed.
+      openDocuments: entries => openDocumentBatch(entries.map(file => ({ contents: () => readBrowserDocumentFile(file), displayName: file.name }))) }),
+  [openDocumentBatch, runFileDrop]);
 
   useEffect(() => {
     if (!isDesktopRuntime()) return undefined;
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    void listenCurrentWindowEvent<{ paths: string[] }>("tauri://drag-drop", (event) => {
-      if (!disposed && !closeTabPromptRef.current && !quitInteractionRef.current) void openDroppedDocumentPaths(event.payload.paths);
+    const platform = shortcutPlatform ?? detectDesktopShortcutPlatform();
+    void listenCurrentWindowEvent<{ paths: string[]; position?: { x: number; y: number } }>("tauri://drag-drop", (event) => {
+      if (disposed || closeTabPromptRef.current || quitInteractionRef.current) return;
+      // Pixels per CSS pixel right now, including any webview zoom, for Windows' physical position.
+      const client = tauriDropClientPoint(event.payload.position, platform, window.devicePixelRatio);
+      void dropNativePaths(event.payload.paths, client);
     }).then((stop) => {
       if (disposed) stop();
       else unlisten = stop;
     }).catch(() => undefined);
     return () => { disposed = true; unlisten?.(); };
-  }, [openDroppedDocumentPaths]);
+  }, [dropNativePaths, shortcutPlatform]);
+
+  // The web build: a file dropped anywhere in the document window (the canvas, a toolbar, the tab
+  // strip) is taken here. `main.tsx` keeps every other drop from navigating. The desktop webviews
+  // hand file drops to the native event above instead (WebView2 has external drops switched off,
+  // WKWebView and WebKitGTK give them to the native handler), so this stays as the canvas handler
+  // always was: registered in every runtime.
+  useEffect(() => {
+    const onDrop = (event: DragEvent) => {
+      const files = event.dataTransfer?.files;
+      if (!files?.length) return;
+      event.preventDefault();
+      if (closeTabPromptRef.current) return;
+      if (isBlockedByModalDialog(event.target)) {
+        setStatus("Close the open dialog, then drop the files again.");
+        return;
+      }
+      void dropBrowserFiles(Array.from(files), browserDropClientPoint(event));
+    };
+    window.addEventListener("drop", onDrop);
+    return () => window.removeEventListener("drop", onDrop);
+  }, [dropBrowserFiles]);
 
   const openDocumentFromNativePicker = useCallback(async () => {
     if (!isDesktopRuntime()) {
@@ -18620,7 +18771,7 @@ export function MainWindow({
     point: ClientPoint,
     stretching: boolean
   ) => {
-    const scale = objectResizeScaleFromDrag(drag.centerPoint, drag.startPoint, point, stretching);
+    const scale = objectResizeScaleFromDrag(drag.centerPoint, drag.startPoint, point, objectResizeStretches(drag, stretching));
     const object = findDocumentObject(drag.startDocument, drag.objectId);
     const resized = drag.target
       ? resizeNativeMoleculeParts(drag.startDocument, drag.target, scale)
@@ -18632,8 +18783,8 @@ export function MainWindow({
   const previewObjectResize = useCallback((drag: ObjectResizeDragState, point: ClientPoint, stretching: boolean) => {
     markFrame("previewObjectResize", () => {
       drag.latestPoint = point;
-      drag.stretching = stretching;
-      drag.latestScale = objectResizeScaleFromDrag(drag.centerPoint, drag.startPoint, point, stretching);
+      drag.stretching = objectResizeStretches(drag, stretching);
+      drag.latestScale = objectResizeScaleFromDrag(drag.centerPoint, drag.startPoint, point, drag.stretching);
       drag.latestCumulativeScale = cumulativeObjectResizeScale(drag.startCumulativeScale, drag.latestScale);
       showObjectResizeReadout(drag.objectId, drag.latestCumulativeScale);
       clearObjectTransformPreview(drag.pointerId);
@@ -18642,6 +18793,7 @@ export function MainWindow({
   }, [clearObjectTransformPreview, objectResizeDocumentFromDrag, replacePresentDocument, showObjectResizeReadout]);
 
   const commitObjectResize = useCallback((drag: ObjectResizeDragState, point: ClientPoint): boolean => {
+    drag.stretching = objectResizeStretches(drag, drag.stretching);
     drag.latestScale = objectResizeScaleFromDrag(drag.centerPoint, drag.startPoint, point, drag.stretching);
     drag.latestCumulativeScale = cumulativeObjectResizeScale(drag.startCumulativeScale, drag.latestScale);
     const { document: resized, independentlyMovedMarkIds } = objectResizeDocumentFromDrag(drag, point, drag.stretching);
@@ -21862,7 +22014,8 @@ export function MainWindow({
       draftXPercent: homeXPercent,
       draftYPercent: homeYPercent,
       homeXPercent,
-      homeYPercent
+      homeYPercent,
+      ...(object.type === "graphic" && object.graphicKind === "image" ? { linkedAxes: true } : {})
     });
     setStatus("Stretch entry");
     return true;
@@ -24055,13 +24208,10 @@ export function MainWindow({
             }
           }}
           onDragOver={(event) => {
-            if (event.dataTransfer.types.includes("Files")) event.preventDefault();
-          }}
-          onDrop={(event) => {
+            // The drop itself is handled at window level (any point of the window takes files).
+            if (!event.dataTransfer.types.includes("Files")) return;
             event.preventDefault();
-            if (closeTabPromptRef.current) return;
-            const files = Array.from(event.dataTransfer.files);
-            void openDocumentBatch(files.map(file => ({ contents: () => readBrowserDocumentFile(file), displayName: file.name })));
+            event.dataTransfer.dropEffect = "copy";
           }}
           data-zoom-surface="document"
           // Gates the ring interior hit surface (see .native-molecule-ring-hit-target): ring
@@ -26018,6 +26168,13 @@ export function rotationReadoutDegrees(angleDegrees: number): number {
 
 export function cumulativeRotationReadoutDegrees(startDegrees: number, deltaDegrees: number): number {
   return rotationReadoutDegrees(startDegrees + deltaDegrees);
+}
+
+/** Pictures keep their aspect ratio: Shift (stretch) resizes a picture uniformly, from any corner. */
+export function objectResizeStretches(drag: Pick<ObjectResizeDragState, "startDocument" | "objectId" | "target">, stretching: boolean): boolean {
+  if (!stretching || drag.target) return stretching;
+  const object = findDocumentObject(drag.startDocument, drag.objectId);
+  return !(object?.type === "graphic" && object.graphicKind === "image");
 }
 
 export function objectResizeScaleFromDrag(
@@ -34235,6 +34392,12 @@ function RotationInputPopover({
   );
 }
 
+/** One typed stretch value; for a picture (`linkedAxes`) it sets both axes. */
+function linkedObjectResizeDraft(input: ObjectResizeInputState, axis: "x" | "y", value: string): ObjectResizeInputState {
+  if (input.linkedAxes) return { ...input, draftXPercent: value, draftYPercent: value };
+  return axis === "x" ? { ...input, draftXPercent: value } : { ...input, draftYPercent: value };
+}
+
 function ObjectResizeInputPopover({
   input,
   onKeep,
@@ -34284,7 +34447,7 @@ function ObjectResizeInputPopover({
           inputMode="decimal"
           type="text"
           value={input.draftXPercent}
-          onChange={(event) => onChange({ ...input, draftXPercent: event.currentTarget.value })}
+          onChange={(event) => onChange(linkedObjectResizeDraft(input, "x", event.currentTarget.value))}
         />
       </label>
       <label className="object-scale-input-field">
@@ -34294,7 +34457,7 @@ function ObjectResizeInputPopover({
           inputMode="decimal"
           type="text"
           value={input.draftYPercent}
-          onChange={(event) => onChange({ ...input, draftYPercent: event.currentTarget.value })}
+          onChange={(event) => onChange(linkedObjectResizeDraft(input, "y", event.currentTarget.value))}
         />
       </label>
       <span aria-hidden="true" className="object-scale-input-unit">%</span>

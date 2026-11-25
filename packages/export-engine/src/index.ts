@@ -37,3 +37,4 @@ export {
 } from "./tableClipboard";
 
 export type ExportFormat = ExportFormatId;
+export * from "./svgSafety";

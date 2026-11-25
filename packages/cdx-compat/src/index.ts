@@ -2728,12 +2728,19 @@ function exportReactionArrowObject(
 
 function exportGraphicObject(
   graphic: GraphicObject,
-  { ids, colors, pageBackgroundColor, format }: VisibleExportContext,
+  { ids, colors, pageBackgroundColor, format, embedNativePayload }: VisibleExportContext,
   allocator: IdAllocator,
   warnings: CompatibilityConversionWarning[]
 ): string {
   if (graphic.graphicKind === "image") {
-    warnings.push({ code: "cdxml.picture_not_saved", message: `CDXML export: picture ${graphic.id} is not saved in CDXML`, sourceObjectId: graphic.id });
+    // CDXML/CDX have no picture element here. The native document carries it, so ChemDraft reopens it;
+    // the visible layer other programs read does not. Say which of the two this file is.
+    const label = format === "CDX" ? "CDX" : "CDXML";
+    const hasPicture = graphic.data.image !== undefined || graphic.data.imageHref !== undefined;
+    const message = !hasPicture ? `${label} export: picture ${graphic.id} has no picture data, so nothing of it is saved in ${label}`
+      : embedNativePayload ? `${label} export: picture ${graphic.id} is kept for ChemDraft in this file's embedded ChemDraft data; other programs that open this ${label} will not show it`
+        : `${label} export: picture ${graphic.id} is not saved in this ${label} (no ChemDraft data is embedded), so it is lost when the file is reopened`;
+    warnings.push({ code: "cdxml.picture_not_saved", message, sourceObjectId: graphic.id });
     return "";
   }
   const graphicId = idFor(ids, graphic.id, allocator);

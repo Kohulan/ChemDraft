@@ -14,6 +14,7 @@ import {
   unresolvableAromaticRing
 } from "@chemdraft/layout-engine/testing";
 import { longestNativePathWorkForTesting } from "@chemdraft/document-workflow-core/testing";
+import { createEmptyDocument as emptyPictureDocument, createImageGraphicObject } from "@chemdraft/chem-core";
 import { openChemDraftPayload } from "@chemdraft/cdx-compat";
 import * as workflowCore from "@chemdraft/document-workflow-core";
 import { nativeSingleBondGraphMetadata } from "@chemdraft/document-workflow-core";
@@ -18896,5 +18897,40 @@ describe("stored text frame preservation", () => {
     const normalized = normalizeCommittedDocument(loaded);
     expect(widths(normalized)).toEqual(widths(drawing));
     expect(widths(normalizeCommittedDocument(normalized))).toEqual(widths(drawing));
+  });
+});
+
+describe("picture aspect ratio under resize", () => {
+  // A real 1 × 1 PNG, drawn at 120 × 60 page units and rotated.
+  const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+  function pictureDocument() {
+    const document = emptyPictureDocument({ title: "Pictures" });
+    const picture = { ...createImageGraphicObject({ id: "image-1", mimeType: "image/png", dataBase64: png, center: { x: 200, y: 200 } }),
+      x: 140, y: 170, width: 120, height: 60, rotation: 30 };
+    const rect = { ...picture, id: "rect-1", graphicKind: "rect" as const, data: {}, x: 300, y: 300, rotation: 0 };
+    return applyPatches(document, [
+      { op: "addObject", pageId: document.pages[0]!.id, object: picture },
+      { op: "addObject", pageId: document.pages[0]!.id, object: rect }
+    ]);
+  }
+  const frame = (document: ChemDraftDocument, id: string) => {
+    const object = document.pages[0]!.objects.find(candidate => candidate.id === id)!;
+    return { x: object.x, y: object.y, width: object.width, height: object.height, rotation: object.rotation };
+  };
+
+  it("scales a stretched picture uniformly by the mean factor, keeping rotation, while other graphics stretch", () => {
+    const stretched = scaleDocumentObjectsAroundPoint(pictureDocument(), ["image-1", "rect-1"], { x: 0, y: 0 }, 2, 0.5);
+    const picture = frame(stretched, "image-1");
+    expect(picture.width / picture.height).toBeCloseTo(2, 10);
+    expect(picture.width).toBeCloseTo(120, 10);
+    expect(picture.rotation).toBe(30);
+    // The centre still follows the stretch, so a picture keeps its place inside a stretched group.
+    expect({ x: picture.x + picture.width / 2, y: picture.y + picture.height / 2 }).toEqual({ x: 400, y: 100 });
+    expect(frame(stretched, "rect-1")).toMatchObject({ width: 240, height: 30 });
+  });
+
+  it("scales a picture exactly under a uniform resize", () => {
+    const scaled = scaleDocumentObjectsAroundPoint(pictureDocument(), ["image-1"], { x: 200, y: 200 }, 1.5, 1.5);
+    expect(frame(scaled, "image-1")).toEqual({ x: 110, y: 155, width: 180, height: 90, rotation: 30 });
   });
 });
