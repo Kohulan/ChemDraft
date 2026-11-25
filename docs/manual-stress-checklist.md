@@ -2057,9 +2057,14 @@ lossy and a lossless WebP, an SVG with gradients and `<use href="#id">`, a BMP, 
   inserted anywhere and the status names it (`"photo.jpg" was not inserted: the document of the drop
   is no longer the active tab; try the drop again.`). Repeat with two pictures and a `.cdxml`: the
   status names both pictures (`"a.jpg" and "b.jpg" were not inserted: …`) and the document.
-  Drops during a text, label or table-cell edit, with
-  a dialog open or while quitting are refused with a reason, shown at once (before the file is read).
-  Every refused insertion names each dropped picture, quoted, however many.
+  A drop is refused, with a reason shown at once (before the file is read), while an in-page dialog
+  is open (any dialog drawn inside the document page, which in the web build includes Export), while
+  an unanswered close-tab, quit or page-size question is up, or during a text, label or table-cell
+  edit (on the desktop app the native listener ignores a drop entirely while the close-tab or quit
+  prompt is up). On the desktop app a drop while the separate Preferences or Export window is open is
+  accepted (owner-side decision 2026-11-25: those windows are modeless), and Export then exports the
+  drawing as it is when Export is pressed. Every refused insertion names each dropped picture,
+  quoted, however many.
 - Live gestures: drop the large JPEG and, before it appears, start resizing (then, separately,
   moving, rotating and drawing) another object; hold the gesture past the moment the picture would
   appear, then finish it. The picture appears once the gesture ends, the gesture's result is kept,
