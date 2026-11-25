@@ -4,6 +4,7 @@ import * as smilesListPaste from "./smilesListPaste";
 import * as smilesPasteIdentity from "./smilesPasteIdentity";
 import { IdentityVerificationTimeoutError } from "./depiction2d/identityWorkerClient";
 import { inspectStructureOffThread } from "./depiction2d/identityClient";
+import { DOCUMENT_FILE_DROP_EVENT } from "./imageDrop/dropPosition";
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { act, createElement, StrictMode } from "react";
 import { setNativePromptProvider, type NativePromptOptions } from "./nativePrompt";
@@ -1343,7 +1344,7 @@ describe("documents in one window", () => {
           await act(async () => native.events.get("chemdraft://open-document")!(payload));
         } else if (path === "native drop") {
           native.readFile.mockResolvedValueOnce(new TextEncoder().encode(contents));
-          await act(async () => native.events.get("tauri://drag-drop")!({ paths: ["C:\\Drawings\\future.chemdraft"] }));
+          await act(async () => native.events.get(DOCUMENT_FILE_DROP_EVENT)!({ paths: ["C:\\Drawings\\future.chemdraft"] }));
         } else {
           native.desktop = false;
           // Browser opening now reads bounded bytes so CDX and BOM-encoded text share a transport.
@@ -1581,7 +1582,7 @@ describe("documents in one window", () => {
     expect(tabs()).toHaveLength(1);
     await paste("Keep OS edits");
     native.readFile.mockResolvedValueOnce(new TextEncoder().encode(fileContents("Dropped")));
-    await act(async () => native.events.get("tauri://drag-drop")!({ paths: ["C:\\Drawings\\drop.chemdraft"] }));
+    await act(async () => native.events.get(DOCUMENT_FILE_DROP_EVENT)!({ paths: ["C:\\Drawings\\drop.chemdraft"] }));
     expect(tabs()).toHaveLength(2);
     await act(async () => native.events.get("chemdraft://open-document")!({ path: "C:\\Drawings\\open.chemdraft", displayName: "open.chemdraft", contents: `${contents}\n` }));
     expect(tabs()).toHaveLength(2);
@@ -1862,7 +1863,7 @@ describe("documents in one window", () => {
       native.readFile.mockResolvedValueOnce(new TextEncoder().encode(oversized))
         .mockReturnValueOnce(delayedB)
         .mockReturnValueOnce(delayedC);
-      await act(async () => native.events.get("tauri://drag-drop")!({
+      await act(async () => native.events.get(DOCUMENT_FILE_DROP_EVENT)!({
         paths: ["/drawings/A.cdxml", "/drawings/B.cdxml", "/drawings/C.cdxml"]
       }));
       expectPageFit("A.cdxml");
@@ -1931,7 +1932,7 @@ describe("documents in one window", () => {
             .mockResolvedValueOnce(new TextEncoder().encode("invalid document"))
             .mockResolvedValueOnce(new TextEncoder().encode(oversized))
             .mockResolvedValueOnce(new TextEncoder().encode(oversized));
-          await act(async () => native.events.get("tauri://drag-drop")!({
+          await act(async () => native.events.get(DOCUMENT_FILE_DROP_EVENT)!({
             paths: ["/drawings/unreadable.cdxml", "/drawings/invalid.cdxml", "/drawings/A.cdxml", "/drawings/B.cdxml"]
           }));
         } else if (source === "browser drop") {

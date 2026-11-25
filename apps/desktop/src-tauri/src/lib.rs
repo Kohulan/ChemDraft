@@ -13,6 +13,7 @@ mod document_session;
 mod download_diagnosis;
 mod export;
 mod external_tools;
+mod file_drop;
 mod file_warnings_window;
 mod first_paint;
 mod fonts;
@@ -1655,6 +1656,12 @@ pub fn run() {
                         window
                             .state::<naming_engine::NamingEngineState>()
                             .shutdown();
+                    }
+                    // Files dropped from the file manager: sent to the page with the drop point
+                    // corrected for the title bar (file_drop.rs). tauri-plugin-fs has already
+                    // added the paths to its scope, on the RunEvent that precedes this listener.
+                    WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position }) => {
+                        file_drop::emit_document_drop(window, paths, *position);
                     }
                     WindowEvent::Focused(true) => {
                         #[cfg(target_os = "macos")]

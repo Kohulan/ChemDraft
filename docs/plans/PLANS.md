@@ -67,7 +67,8 @@ recognised by their bytes, documents keep the open path unchanged, BMP/TIFF/HEIC
 files over 20 MB are refused by name before reading. JPEG/GIF/WebP are decoded by the webview after a
 header pixel-cap check and stored as PNG; SVG is sanitised into an inert, allow-listed copy. All
 pictures of a drop are one "Insert Image" entry, placed at the drop point (per-platform position
-conversion), in the tab under the drop only. No drop navigates any window. Pictures keep their aspect
+conversion; on macOS Rust removes the live title-bar inset, `file_drop.rs`), in the tab under the drop
+only; the drop's status stays with that tab and is also shown on the tab in front. No drop navigates any window. Pictures keep their aspect
 ratio under every resize. Hands-on pass on native Windows and both macOS builds remains pending.
 
 # ChemDraft Assistant plugin (active, branches claude/assistant-*)

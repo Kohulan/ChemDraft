@@ -143,6 +143,18 @@ export function fileWarningsTooltip(reports: readonly OpenWarningsReport[]): str
     : undefined;
 }
 
+/**
+ * The status line's tooltip: the status as displayed, which the line truncates (several refusals),
+ * then the file warnings on the lines after it. A status line the warnings already state is not
+ * repeated; no text, no tooltip.
+ */
+export function statusMessageTitle(displayed: string | undefined, warningsTooltip: string | undefined): string | undefined {
+  const text = displayed?.trim() ? displayed : undefined;
+  if (!warningsTooltip) return text;
+  if (!text || warningsTooltip.split("\n").includes(text)) return warningsTooltip;
+  return `${text}\n\n${warningsTooltip}`;
+}
+
 export function describeOpenWarningTarget(document: ChemDraftDocument, warning: OpenWarning): OpenWarningTarget {
   if (!warning.sourceObjectId) {
     return { label: "Whole file", missing: false };
