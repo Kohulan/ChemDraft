@@ -83,6 +83,8 @@ export function embeddedBitmapPictureStep(options: RasterizeEmbeddedBitmapsOptio
     }
     const png = await pending;
     if (png !== undefined) href.value = png;
+    // Taken on: this picture holds a count slot whether or not it rasterised.
+    return true;
   };
 }
 

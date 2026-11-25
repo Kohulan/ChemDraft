@@ -8,9 +8,9 @@
  * Kept references: a `#fragment` naming an element of the same document (gradients, clip paths,
  * `<use href="#id">`), never on `<image>` or `<feImage>`, where a renderer could read it as a file
  * name; and, on those two only, base64 PNG, JPEG, GIF or WebP data. Never nested SVG data, never a
- * file, URL or `javascript:`, and never data in CSS, where only `url(#fragment)` is kept. A reference
- * is checked exactly as a URL parser reads it (only ASCII whitespace is trimmed) and the checked
- * value is what is written out.
+ * file, URL or `javascript:`, and never data in CSS, where only `url(#fragment)` is kept (quoted when
+ * the id needs it). A reference is checked exactly as a URL parser reads it (only ASCII whitespace is
+ * trimmed) and the checked value is what is written out. `<a>` stays, for selectors, but inert.
  *
  * An embedded bitmap must be what its label says (its magic bytes), and its header size must be
  * within the picture caps, all of them together within the decoded-size cap. One that is not makes
@@ -50,7 +50,7 @@ export const MAX_SVG_CSS_CHARS = 8 * 1024 * 1024;
 export const MAX_SVG_EMBEDDED_DECODED_BYTES = MAX_IMAGE_DECODED_BYTES;
 
 const ALLOWED_ELEMENTS = new Set([
-  "svg", "g", "defs", "symbol", "use", "switch", "view", "title", "desc", "metadata", "style",
+  "svg", "g", "a", "defs", "symbol", "use", "switch", "view", "title", "desc", "metadata", "style",
   "path", "rect", "circle", "ellipse", "line", "polyline", "polygon", "text", "tspan", "textPath",
   "image", "linearGradient", "radialGradient", "stop", "pattern", "clipPath", "mask", "marker", "filter",
   "feBlend", "feColorMatrix", "feComponentTransfer", "feComposite", "feConvolveMatrix", "feDiffuseLighting",
@@ -164,9 +164,27 @@ function trimUrlSpace(value: string): string {
   while (end > start && isAsciiSpace(value.charCodeAt(end - 1))) end -= 1;
   return start === 0 && end === value.length ? value : value.slice(start, end);
 }
-/** `#` and an id: no space, control, quote, parenthesis, angle bracket or backslash anywhere. */
+/** `#` and an id that can be written in an unquoted `url()`: no space, control, quote, parenthesis, angle bracket or backslash. */
 const FRAGMENT = /^#[^\u0000- \u007f"'()<>\\]+$/;
-const isFragmentReference = (target: string) => FRAGMENT.test(target);
+/**
+ * `#` and an id in a CSS `url()`, which can never load anything: any id without a control character,
+ * written back quoted where an unquoted url could not hold it (`url("#atom(1)")`).
+ */
+const CSS_FRAGMENT = /^#[^\u0000-\u001f\u007f]+$/;
+const isFragmentReference = (target: string) => CSS_FRAGMENT.test(target);
+
+/** A checked CSS fragment as `url()` text: bare when it can be, else a quoted CSS string. */
+const cssFragmentUrl = (target: string) => `url(${FRAGMENT.test(target) ? target : `"${target.replace(/["\\]/g, "\\$&")}"`})`;
+
+/**
+ * The id an XML `href="#…"` names in every renderer, or undefined when they may disagree. A URL parser
+ * strips tabs and newlines anywhere, and browsers percent-decode the fragment before matching an id
+ * while other renderers match it as written, so a fragment with either is ambiguous and is not kept.
+ */
+function xmlFragmentId(value: string): string | undefined {
+  const id = value.slice(1);
+  return id && !/[\t\n\r]|%[0-9a-f]{2}/i.test(id) ? id : undefined;
+}
 
 /** `data:image/<type>;base64,<payload>`, checked in one linear pass (no backtracking regex). */
 function parseRasterDataUri(target: string): { format: RasterHeaderFormat; label: string; base64: string } | undefined {
@@ -234,9 +252,10 @@ function checkedHref(element: string, raw: string, state: SvgSanitizeState): str
   const value = trimUrlSpace(raw);
   const picture = PICTURE_ELEMENTS.has(element);
   if (value.startsWith("#") && !picture) {
-    if (!isFragmentReference(value)) { noteRemoved(state, "load"); return undefined; }
-    // A fragment naming nothing draws nothing either way: dropped without a note.
-    return state.ids?.has(value.slice(1)) ? value : undefined;
+    // A same-document fragment loads nothing. One naming nothing, or not the same id in every
+    // renderer, draws nothing either way: dropped without a note.
+    const id = xmlFragmentId(value);
+    return id !== undefined && state.ids?.has(id) ? value : undefined;
   }
   const data = picture ? parseRasterDataUri(value) : undefined;
   if (!data) {
@@ -314,12 +333,12 @@ function cssSource(text: CssText, from: number, to: number): string {
     space = "";
     comment = false;
     if (token.type === "url") {
-      out += `url(${trimUrlSpace(token.value)})`;
+      out += cssFragmentUrl(trimUrlSpace(token.value));
       previous = token;
     } else if (token.type === "function" && token.value === "url") {
       let inner = index + 1;
       while (isBlank(tokens[inner]!)) inner += 1;
-      out += `url(${trimUrlSpace(tokens[inner]!.value)})`;
+      out += cssFragmentUrl(trimUrlSpace(tokens[inner]!.value));
       index = close[index]!;
       previous = tokens[index]!;
     } else {
@@ -437,6 +456,33 @@ function sanitizeDeclarations(text: CssText, from: number, to: number, state: Sv
   return kept.join(";");
 }
 
+/**
+ * Whether an `@font-face` block (tokens `[from, to)`) names only installed fonts: every `src` is empty
+ * or a list of `local()` faces, and nothing else in the block loads.
+ */
+function fontFaceLoadsNothing(text: CssText, from: number, to: number): boolean {
+  const { tokens, close } = text;
+  if (cssComponentsVerdict(text, from, to) === "loads") return false;
+  for (let start = from; start < to;) {
+    const end = nextOnLevel(text, start, to, SEMICOLON);
+    let name = start;
+    while (name < end && isBlank(tokens[name]!)) name += 1;
+    if (name < end && tokens[name]!.type === "ident" && tokens[name]!.value === "src") {
+      let colon = name + 1;
+      while (colon < end && isBlank(tokens[colon]!)) colon += 1;
+      if (colon >= end || tokens[colon]!.type !== ":") return false;
+      for (let index = colon + 1; index < end; index += 1) {
+        const token = tokens[index]!;
+        if (isBlank(token) || token.type === ",") continue;
+        if (token.type !== "function" || token.value !== "local" || close[index]! < 0 || close[index]! >= end) return false;
+        index = close[index]!;
+      }
+    }
+    start = end + 1;
+  }
+  return true;
+}
+
 /** A rule list (a stylesheet or a kept at-rule's block). */
 function sanitizeRules(text: CssText, from: number, to: number, state: SvgSanitizeState, depth: number): string {
   const out: string[] = [];
@@ -457,6 +503,8 @@ function sanitizeRules(text: CssText, from: number, to: number, state: SvgSaniti
       const prelude = cssComponentsVerdict(text, start + 1, stop);
       if (KEPT_AT_RULE_BLOCKS.has(first.value) && depth < 8 && prelude === "safe") {
         out.push(`${cssSource(text, start, stop)}{${sanitizeRules(text, stop + 1, closer, state, depth + 1)}}`);
+      } else if (first.value === "font-face" && prelude !== "loads" && fontFaceLoadsNothing(text, stop + 1, closer)) {
+        // Installed fonts only: nothing outside the picture is named. Dropped without a note.
       } else {
         // `@font-face` (which loads its `src`), `@page`, `@property` and the rest, or a prelude that loads.
         noteRemoved(state, first.value === "font-face" || prelude === "loads" ? "load" : "other");
@@ -576,6 +624,32 @@ function xmlTools(options: SvgSafetyOptions): XmlTools {
   return { parser, serializer };
 }
 
+/**
+ * The text without its DOCTYPE declaration (one with entities or an internal subset is refused before
+ * this), so no parser is ever handed an external identifier it might fetch. Only the prolog is read:
+ * whitespace, the XML declaration, comments and processing instructions before it.
+ */
+function withoutDoctype(source: string): string {
+  let index = 0;
+  for (;;) {
+    while (index < source.length && (isAsciiSpace(source.charCodeAt(index)) || source.charCodeAt(index) === 0xfeff)) index += 1;
+    const [open, close] = source.startsWith("<?", index) ? ["<?", "?>"] : ["<!--", "-->"];
+    const end = source.startsWith(open, index) ? source.indexOf(close, index + open.length) : -1;
+    if (end < 0) break;
+    index = end + close.length;
+  }
+  if (source.slice(index, index + 9).toUpperCase() !== "<!DOCTYPE") return source;
+  let quote = "";
+  for (let end = index + 9; end < source.length; end += 1) {
+    const character = source[end];
+    if (quote) { if (character === quote) quote = ""; }
+    else if (character === '"' || character === "'") quote = character;
+    else if (character === "[") return source;
+    else if (character === ">") return source.slice(0, index) + source.slice(end + 1);
+  }
+  return source;
+}
+
 function parseSvg(source: string, xml: XmlTools): Document | string {
   const parsed = xml.parser.parseFromString(source, "image/svg+xml");
   if (parsed.getElementsByTagName("parsererror").length) return "the SVG is not well-formed XML.";
@@ -623,16 +697,23 @@ function sanitizeAttributes(element: Element, state: SvgSanitizeState): void {
   }
 }
 
-/** `<a>` becomes `<g>`: its children and transform stay, its link goes. */
-function linksToGroups(document: Document, state: SvgSanitizeState): void {
+/**
+ * What makes an `<a>` a link or focusable (in any namespace, so `xlink:href` too). Event handlers go
+ * with every element's attributes, and namespaced XLink attributes (`xlink:show`) are dropped anyway.
+ */
+const LINK_ATTRIBUTES = new Set(["href", "target", "download", "ping", "rel", "referrerpolicy", "hreflang", "type", "tabindex", "autofocus"]);
+
+/**
+ * `<a>` stays an `<a>`, so style sheet selectors such as `a rect` still match, but inert: with no
+ * href it is a plain group to every renderer. Its children, transform and class stay.
+ */
+function inertLinks(document: Document, state: SvgSanitizeState): void {
   for (const link of Array.from(document.getElementsByTagNameNS(SVG_NS, "a"))) {
-    const group = document.createElementNS(SVG_NS, "g");
     for (const attribute of Array.from(link.attributes)) {
-      if (attribute.localName === "href" || attribute.localName === "target") { noteRemoved(state, "other"); continue; }
-      if (attribute.namespaceURI === null) group.setAttribute(attribute.name, attribute.value);
+      if (!LINK_ATTRIBUTES.has(attribute.localName.toLowerCase())) continue;
+      if (attribute.localName === "href" || attribute.localName === "target") noteRemoved(state, "other");
+      link.removeAttributeNode(attribute);
     }
-    while (link.firstChild) group.append(link.firstChild);
-    link.replaceWith(group);
   }
 }
 
@@ -676,7 +757,7 @@ function sanitizeTree(document: Document, state: SvgSanitizeState): void {
     if (isStylesheetInstruction(node)) noteRemoved(state, "load");
     node.remove();
   }
-  linksToGroups(document, state);
+  inertLinks(document, state);
   const elements = pruneElements(document.documentElement, state);
   // Fragments must name an element that is still there.
   const ids = new Set<string>();
@@ -714,11 +795,12 @@ function sanitizeOnce(source: string, xml: XmlTools, refuseOutside: boolean): Sv
   }
   const bounds = scanBounds(source);
   if (bounds) return { ok: false, error: bounds };
-  let parsed = parseSvg(source, xml);
+  const text = withoutDoctype(source);
+  let parsed = parseSvg(text, xml);
   if (typeof parsed === "string") return { ok: false, error: parsed };
   // Hand-written SVG often omits its namespace; a picture viewer would not draw it at all.
   if (parsed.documentElement.namespaceURI === null && parsed.documentElement.nodeName === "svg") {
-    parsed = parseSvg(source.replace(/<svg(?=[\s/>])/, `<svg xmlns="${SVG_NS}"`), xml);
+    parsed = parseSvg(text.replace(/<svg(?=[\s/>])/, `<svg xmlns="${SVG_NS}"`), xml);
     if (typeof parsed === "string") return { ok: false, error: parsed };
   }
   const root = parsed.documentElement;

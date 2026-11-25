@@ -59,9 +59,11 @@ export type PicturePixelDecoder = (png: Uint8Array<ArrayBuffer>) => Promise<Deco
 /**
  * Runs on each `<image>` this call may still take, in drawing order, before it is read, with the
  * decoded bytes still unspent; it may replace the href with a PNG of at most that many decoded
- * bytes (`svgPicture/rasterEmbeddedBitmaps.ts` does, for SVG pictures that embed a bitmap).
+ * bytes (`svgPicture/rasterEmbeddedBitmaps.ts` does, for SVG pictures that embed a bitmap). It
+ * resolves `true` when it took the picture on for rasterising, whether or not that succeeded: such a
+ * picture holds one of the `RasterPictureMaxCount` slots either way, so failures cannot run unbounded.
  */
-export type RasterPicturePreStep = (image: Element, remainingBytes: number) => Promise<void>;
+export type RasterPicturePreStep = (image: Element, remainingBytes: number) => Promise<boolean | void>;
 
 export interface PrepareRasterPicturesOptions {
   /** Defaults to the webview's own decoder, `decodePngPixels`. */
@@ -114,11 +116,17 @@ export async function prepareRasterPictures(
   const prefix = unusedIdPrefix(svg);
   const pictures: NativeRasterPicture[] = [];
   let remainingBytes = budgetBytes;
+  // Slots held by SVG pictures the pre-step took on but that did not become a PNG (rasterising failed).
+  let failedSlots = 0;
   for (const image of Array.from(parsed.getElementsByTagNameNS(SvgNamespace, "image"))) {
-    if (beforeDecode && pictures.length < RasterPictureMaxCount) await beforeDecode(image, remainingBytes);
+    const admitted = beforeDecode && pictures.length + failedSlots < RasterPictureMaxCount
+      ? (await beforeDecode(image, remainingBytes)) === true : false;
     const href = pngHref(image);
-    if (!href) continue;
-    if (pictures.length >= RasterPictureMaxCount) {
+    if (!href) {
+      if (admitted) failedSlots += 1;
+      continue;
+    }
+    if (pictures.length + failedSlots >= RasterPictureMaxCount) {
       // Counted before decoding: past the limit nothing is decoded or sent.
       href.attribute.value = RasterPictureOverCountHref;
       continue;

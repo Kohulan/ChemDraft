@@ -158,6 +158,17 @@ describe("embeddedBitmapPictureStep", () => {
     expect(rasterize).not.toHaveBeenCalled();
   });
 
+  it("counts an SVG picture it took on against the limit even when rasterising it failed", async () => {
+    const rasterize = vi.fn(async (_request: SvgPictureRasterRequest): Promise<Uint8Array> => { throw new Error("no"); });
+    // Distinct pictures, so the per-export cache cannot absorb the calls.
+    const failing = Array.from({ length: RasterPictureMaxCount + 1 }, (_, index) => picture(dataUri(BITMAP_SVG(`data-n="${index}"`))));
+    const png = `<image width="1" height="1" href="data:image/png;base64,${picturePngBase64}"/>`;
+    const { pictures } = await prepare(page([...failing, png]), { rasterize });
+    expect(rasterize).toHaveBeenCalledTimes(RasterPictureMaxCount);
+    // The slots are spent: the PNG after them is past the limit and is not decoded.
+    expect(pictures).toHaveLength(0);
+  });
+
   describe("one budget in drawing order", () => {
     const MiB = 1024 * 1024;
     const sizing = () => vi.fn(async (request: SvgPictureRasterRequest) => pngOfSize(request.pixelWidth, request.pixelHeight));

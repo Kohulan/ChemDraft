@@ -25,8 +25,12 @@ function expectInert(svg: string): void {
   const document = parsed(svg);
   expect(document.getElementsByTagName("parsererror")).toHaveLength(0);
   for (const element of Array.from(document.getElementsByTagName("*"))) {
-    expect(["script", "foreignObject", "iframe", "object", "embed", "audio", "video", "a", "animate", "set",
+    expect(["script", "foreignObject", "iframe", "object", "embed", "audio", "video", "animate", "set",
       "animateMotion", "animateTransform", "handler"]).not.toContain(element.localName);
+    // An `<a>` may stay, but never as a link.
+    if (element.localName === "a") {
+      expect(Array.from(element.attributes).filter(attribute => ["href", "target", "download", "ping"].includes(attribute.localName))).toEqual([]);
+    }
     for (const attribute of Array.from(element.attributes)) {
       expect(attribute.localName.toLowerCase().startsWith("on")).toBe(false);
       if (attribute.localName === "href") expect(attribute.value).toMatch(/^#|^data:image\/(png|jpeg|gif|webp);base64,/);
@@ -93,12 +97,17 @@ describe("sanitizeSvgPicture attacks", () => {
     expect(parsed(result.svg).getElementById("r")?.getAttribute("fill")).toBe("red");
   });
 
-  it("keeps a link's children and transform as a group", () => {
-    const result = clean(`<svg ${NS}><a href="https://e.test" transform="translate(3 4)"><circle id="c" r="2"/></a></svg>`);
-    const circle = parsed(result.svg).getElementById("c")!;
-    expect(circle.parentElement?.localName).toBe("g");
-    expect(circle.parentElement?.getAttribute("transform")).toBe("translate(3 4)");
-    expect(result.removedExternal).toBe(true);
+  it("keeps a link as an inert <a>: its children, transform and class stay, so selectors such as `a rect` still match", () => {
+    const result = clean(`<svg ${NS} ${XLINK}><style>a rect{fill:red}</style><a href="https://e.test" xlink:href="#c" target="_blank" `
+      + `download="x" ping="https://e.test/p" rel="noopener" tabindex="0" onclick="x()" class="k" transform="translate(3 4)"><rect id="c" width="2" height="2"/></a></svg>`);
+    const document = parsed(result.svg);
+    const link = document.getElementById("c")!.parentElement!;
+    expect(link.localName).toBe("a");
+    expect(Array.from(link.attributes).map(attribute => attribute.name).sort()).toEqual(["class", "transform"]);
+    expect(link.getAttribute("transform")).toBe("translate(3 4)");
+    expect(document.querySelector("a rect")?.id).toBe("c");
+    expect(result).toMatchObject({ removedExternal: true, removedActive: true });
+    expectInert(result.svg);
   });
 
   it("refuses malformed XML, entities and internal DOCTYPE subsets", () => {
@@ -112,6 +121,18 @@ describe("sanitizeSvgPicture attacks", () => {
       `<svg xmlns="http://example.com/not-svg"/>`
     ]) {
       expect(sanitizeSvgPicture(source).ok, source).toBe(false);
+    }
+  });
+
+  it("never hands a parser a DOCTYPE, so no parser sees an external identifier", () => {
+    const parse = vi.fn((source: string, type: DOMParserSupportedType) => new DOMParser().parseFromString(source, type));
+    const doctype = '<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">';
+    for (const source of [`<?xml version="1.0"?>\n<!-- made by hand -->${doctype}<svg ${NS}><rect width="1" height="1"/></svg>`,
+      `\uFEFF${doctype}\n<svg width="1" height="1"><rect width="1" height="1"/></svg>`]) {
+      parse.mockClear();
+      expect(sanitizeSvgPicture(source, { domParser: { parseFromString: parse } }).ok, source).toBe(true);
+      expect(parse).toHaveBeenCalled();
+      for (const [text] of parse.mock.calls) expect(text).not.toMatch(/DOCTYPE|w3\.org\/Graphics/);
     }
   });
 
@@ -366,6 +387,35 @@ describe("fragment references resolve within the picture", () => {
     expect(parsed(padded.svg).querySelector("image")!.getAttribute("href")).toBe(PNG_DATA);
   });
 
+  it("keeps an XML fragment to any surviving id, whatever a CSS url() would need, but not one renderers read differently", () => {
+    const source = `<svg ${NS} ${XLINK}><defs><path id="atom(1)" d="M0 0h1"/><path id="a b" d="M0 0"/><path id="a%20b" d="M0 0"/>`
+      + `<path id="ab" d="M0 0"/></defs><use href="#atom(1)"/><use xlink:href="#atom(1)"/><use href="#a%20b"/><use href="#a&#9;b"/></svg>`;
+    for (const result of [clean(source), refuse(source)]) {
+      if (!result.ok) throw new Error(result.error);
+      const uses = Array.from(parsed(result.svg).getElementsByTagName("use"));
+      // A browser decodes `%20` and strips a tab before matching an id, other renderers do not: neither is kept.
+      expect(uses.map(use => use.getAttribute("href") ?? use.getAttributeNS("http://www.w3.org/1999/xlink", "href")))
+        .toEqual(["#atom(1)", "#atom(1)", null, null]);
+      expect(result.removedExternal).toBe(false);
+    }
+    // Still never on a picture element.
+    expect(refuse(`<svg ${NS}><path id="atom(1)" d="M0 0"/><image href="#atom(1)" width="1" height="1"/></svg>`).ok).toBe(false);
+  });
+
+  it("writes a CSS url() to an id an unquoted url cannot hold as a quoted string", () => {
+    const source = `<svg ${NS}><linearGradient id="g(1)"/><linearGradient id='q"\\'/><style>rect{stroke:url('#g(1)')}</style>`
+      + `<rect width="1" height="1" fill="url(#g\\(1\\))" style="fill:url(&quot;#q\\&quot;\\\\&quot;)"/></svg>`;
+    for (const result of [clean(source), refuse(source)]) {
+      if (!result.ok) throw new Error(result.error);
+      const document = parsed(result.svg);
+      const rect = document.querySelector("rect")!;
+      expect(rect.getAttribute("fill")).toBe('url("#g(1)")');
+      expect(rect.getAttribute("style")).toBe('fill:url("#q\\"\\\\")');
+      expect(document.querySelector("style")!.textContent).toBe('rect{stroke:url("#g(1)")}');
+      expect(result.removedExternal).toBe(false);
+    }
+  });
+
   it("writes a CSS url() as its checked fragment, with only ASCII whitespace trimmed", () => {
     const result = clean(`<svg ${NS}><rect width="1" height="1" fill="url(' #g&#9;')" stroke="url(&quot;#g&#160;&quot;)"/></svg>`);
     const rect = parsed(result.svg).querySelector("rect")!;
@@ -449,6 +499,29 @@ describe("the renderer's policy refuses instead of removing what loads", () => {
   });
 });
 
+describe("an @font-face that names only installed fonts", () => {
+  const refuse = (source: string) => sanitizeSvgPicture(source, { outsideReferences: "refuse" });
+  const svg = (rule: string) => `<svg ${NS}><style>${rule} rect{fill:red}</style><rect width="1" height="1"/></svg>`;
+
+  it("is dropped on its own, without a note or a refusal", () => {
+    for (const rule of ["@font-face{font-family:x;src:local(Arial), local('Helvetica Neue')}", "@font-face{font-family:x}",
+      "@font-face{font-family:x;src:}"]) {
+      const removed = clean(svg(rule));
+      expect(removed.removedExternal, rule).toBe(false);
+      expect(parsed(removed.svg).querySelector("style")!.textContent, rule).toBe("rect{fill:red}");
+      expect(refuse(svg(rule)).ok, rule).toBe(true);
+    }
+  });
+
+  it("keeps today's handling for url() and data sources", () => {
+    for (const src of ["url(a.woff)", "local(x), url(data:font/woff2;base64,AAAA)", "url(#f)", "local(x) format('woff')"]) {
+      const rule = `@font-face{font-family:x;src:${src}}`;
+      expect(clean(svg(rule)).removedExternal, rule).toBe(true);
+      expect(refuse(svg(rule)), rule).toEqual({ ok: false, error: "the SVG refers to a file or address outside the picture." });
+    }
+  });
+});
+
 describe("embedded bitmaps are listed for a decoder", () => {
   it("lists each distinct admitted bitmap once, with its format and header size", () => {
     const webp = btoa(String.fromCharCode(...webpVp8lHeader(3, 2)));
@@ -490,7 +563,7 @@ describe("benign drawings from common producers survive", () => {
   it("a diagram editor's file: the HTML label goes, its SVG text fallback and the shapes stay visible", () => {
     const result = clean(DIAGRAM_SAMPLE);
     expect(result.removedActive).toBe(true);
-    // The footer link: its text stays, as a group.
+    // The footer link: its text stays, inside an inert <a>.
     expect(result.removedExternal).toBe(true);
     expectInert(result.svg);
     const document = parsed(result.svg);

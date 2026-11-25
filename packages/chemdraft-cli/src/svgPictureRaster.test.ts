@@ -3,10 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Resvg } from "@resvg/resvg-js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { ChemDraftDocument } from "@chemdraft/chem-core";
 import type { ExportWarning } from "@chemdraft/export-engine";
 import { DIAGRAM_SAMPLE, EDITOR_SAMPLE, PLOT_SAMPLE, TOOLKIT_SAMPLE } from "../../export-engine/src/svgSafety/benignSamples";
 import { jpegHeader, pngWithSize } from "../../export-engine/src/svgSafety/testFixtures";
-import { flattenSvgPictures, rasterizeSvgPictureWithResvg } from "./svgPictureRaster";
+import { flattenSvgPictures, headlessSvgPictureWarnings, rasterizeSvgPictureWithResvg } from "./svgPictureRaster";
 
 const decode = (png: Uint8Array, width: number, height: number) => {
   const image = new Resvg(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><image width="${width}" height="${height}" href="data:image/png;base64,${Buffer.from(png).toString("base64")}"/></svg>`).render();
@@ -231,5 +232,21 @@ describe("flattenSvgPictures", { timeout: 30_000 }, () => {
     const refused = picture("pic", 40, 20, '<image width="4" height="4" href="/etc/hosts"/>');
     await flattenSvgPictures(page('<g data-object-id="mol1"><path d="M0 0"/></g>', refused), 1, warnings);
     expect(warnings).toEqual([expect.objectContaining({ objectId: "pic", message: expect.stringContaining("SVG picture pic was not drawn") })]);
+  });
+});
+
+describe("headlessSvgPictureWarnings", { timeout: 30_000 }, () => {
+  // A real 4 x 4 lossless WebP, which resvg-js leaves out.
+  const webp = "UklGRhwAAABXRUJQVlA4TA8AAAAvA8AAAAcQ/Y/+ByKi/wEA";
+  const source = `<svg xmlns="${SVG}" width="40" height="20"><image width="10" height="10" href="data:image/webp;base64,${webp}"/></svg>`;
+  const document = (...ids: string[]) => ({ pages: [{ objects: ids.map((id) => ({ id, type: "graphic",
+    data: { image: { mimeType: "image/svg+xml", dataBase64: Buffer.from(source).toString("base64") } } })) }] }) as unknown as ChemDraftDocument;
+
+  it("warns about the WebP only for a picture that was drawn, never beside its own \"not drawn\" warning", async () => {
+    for (const format of ["png", "pdf"] as const) {
+      const notDrawn: ExportWarning = { code: `export.${format}.svg_picture_not_drawn`, severity: "warning", objectId: "lost", message: "not drawn" };
+      const warnings = await headlessSvgPictureWarnings(document("drawn", "lost"), format, [notDrawn]);
+      expect(warnings.map((warning) => [warning.code, warning.objectId])).toEqual([[`export.${format}.svg_picture_bitmap_not_drawn`, "drawn"]]);
+    }
   });
 });

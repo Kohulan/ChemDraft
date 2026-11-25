@@ -63,14 +63,19 @@ export async function rasterizeSvgPictureWithResvg(request: SvgPictureRasterRequ
 
 /**
  * resvg-js draws PNG, JPEG and GIF bitmaps only: a WebP an SVG picture embeds is left out. One warning
- * per such picture on the rendered (first) page, so the loss is never silent. Pictures the check
- * refuses get their own "not drawn" warning from the export, not this one.
+ * per such picture on the rendered (first) page, so the loss is never silent. Only a picture that was
+ * drawn gets it: one the check refused, or that the export could not draw (`exportWarnings`, the
+ * export's own warnings, already say it "was not drawn"), gets that warning alone.
  */
-export async function headlessSvgPictureWarnings(document: ChemDraftDocument, format: "png" | "pdf"): Promise<ExportWarning[]> {
+export async function headlessSvgPictureWarnings(
+  document: ChemDraftDocument, format: "png" | "pdf", exportWarnings: readonly ExportWarning[]
+): Promise<ExportWarning[]> {
+  const notDrawn = `export.${format}.svg_picture_not_drawn`;
+  const undrawn = new Set(exportWarnings.filter((warning) => warning.code === notDrawn).map((warning) => warning.objectId));
   const warnings: ExportWarning[] = [];
   for (const object of document.pages[0]?.objects ?? []) {
     const image = object.type === "graphic" ? object.data.image : undefined;
-    if (!image || image.mimeType !== "image/svg+xml") continue;
+    if (!image || image.mimeType !== "image/svg+xml" || undrawn.has(object.id)) continue;
     let sanitized: SanitizedSvg;
     try {
       sanitized = await sanitizeSvgForResvg(Buffer.from(image.dataBase64, "base64").toString("utf8"));
