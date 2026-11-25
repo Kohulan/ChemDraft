@@ -56,4 +56,20 @@ describe.each([
     await expect(saveInExportDirectory("spectrum.svg", {}, write, deps)).rejects.toThrow("disk full");
     expect(deps.directory.current).toBe(last);
   });
+  it("writes the resolved path for a repeated extension, and cancels when the resolver declines", async () => {
+    const doubled = paths.join(last, "nmr.svg.svg"), collapsed = paths.join(last, "nmr.svg");
+    const resolveSelected = vi.fn(async (path: string) => path === doubled ? collapsed : undefined);
+    const deps = { ...dependencies(), resolveSelected };
+    deps.save.mockResolvedValueOnce(doubled);
+    const write = vi.fn(async () => {});
+    const options = { filters: [{ name: "SVG", extensions: ["svg"] }] };
+    await expect(saveInExportDirectory("nmr.svg", options, write, deps)).resolves.toBe("saved");
+    expect(resolveSelected).toHaveBeenCalledWith(doubled, ["svg"]);
+    expect(write).toHaveBeenCalledWith(collapsed);
+    deps.save.mockResolvedValueOnce(paths.join(documents, "other.svg.svg"));
+    write.mockClear();
+    await expect(saveInExportDirectory("nmr.svg", options, write, deps)).resolves.toBe("cancelled");
+    expect(write).not.toHaveBeenCalled();
+    expect(deps.directory.current).toBe(last);
+  });
 });
