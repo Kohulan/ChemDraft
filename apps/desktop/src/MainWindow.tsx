@@ -1908,7 +1908,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.25.06.31-opus";
+const CURRENT_BUILD_STAMP = "11.25.08.28-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -11284,7 +11284,7 @@ export function MainWindow({
   const imageDropRefusal = useCallback((): string | undefined => {
     if (quitInteractionRef.current) return "ChemDraft is quitting.";
     if (closeTabPromptRef.current) return "answer the close-tab question first.";
-    if (!documentSessionHydratedRef.current) return "the restored documents are still loading; drop them again in a moment.";
+    if (!documentSessionHydratedRef.current) return "the restored documents are still loading; try the drop again in a moment.";
     if (isBlockedByModalDialog(null)) return "close the open dialog first.";
     if (pageFitPendingRef.current) return "answer the page size question first.";
     if (tableCellEditorRef.current) return "finish editing the table cell first.";
@@ -11333,7 +11333,7 @@ export function MainWindow({
     const point = droppedImagePagePoint(client);
     const insertImages = (images: PreparedDroppedImage[]): DroppedImageInsertion => {
       if (!mountedRef.current || activeDocumentTabIdRef.current !== tabId || documentIdentityRef.current !== documentIdentity) {
-        return { ok: false, reason: "the document they were dropped on is no longer the active tab; drop them again." };
+        return { ok: false, reason: "the document of the drop is no longer the active tab; try the drop again." };
       }
       const refusal = imageDropRefusal();
       if (refusal) return { ok: false, reason: refusal };
@@ -11349,7 +11349,7 @@ export function MainWindow({
           return document;
         }
       }, "Insert Image", undefined, undefined, preserveChemistry("paste"));
-      if (!committed) return { ok: false, reason: failure ?? "the document did not accept them." };
+      if (!committed) return { ok: false, reason: failure ?? "the document did not accept the insertion." };
       // Like Paste Picture: the pictures stay selected and the canvas has focus, so the first Undo
       // undoes the drop rather than a field's text history.
       resetPasteUiState();
@@ -11374,7 +11374,7 @@ export function MainWindow({
         if (!gate) return Promise.resolve().then(commit);
         return gate.run(commit).catch((error: unknown) => {
           throw new Error(error instanceof PluginWriteGateTimeoutError
-            ? "the canvas stayed busy with another edit; drop them again."
+            ? "the canvas stayed busy with another edit; try the drop again."
             : error instanceof Error ? error.message : String(error));
         });
       },

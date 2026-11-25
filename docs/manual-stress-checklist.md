@@ -1979,7 +1979,8 @@ Run under KDE Plasma (Wayland session, so the app uses XWayland) and on GNOME.
 Run on macOS (Retina and a 1x external display) and on Windows at 100%, 150% and 200% display
 scaling. Prepare a small and a large PNG, a phone JPEG with an EXIF rotation, an animated GIF, a
 lossy and a lossless WebP, an SVG with gradients and `<use href="#id">`, a BMP, a TIFF, a HEIC, a
-`.svgz`, a picture over 20 MB, and a `.cdxml`.
+`.svgz`, a picture over 20 MB, a `.cdxml`, a web link (`.url` dragged from a browser on Windows,
+`.webloc` on macOS), a Windows shortcut (`.lnk`) and an 8000 × 8000 PNG photo.
 
 - Each format: drag it from Finder / Explorer onto the page. It appears centred under the pointer,
   at its natural size, selected; the status names it. The JPEG stands upright (EXIF honoured); the
@@ -2022,8 +2023,15 @@ lossy and a lossless WebP, an SVG with gradients and `<use href="#id">`, a BMP, 
   is damaged", both kinds: data that cannot be inflated at all (`r8-damaged.png`, which the webview
   would insert as an invisible picture) and data corrupted mid-stream (`r9-midcorrupt.png`, which it
   would insert half black). The same PNGs embedded in an SVG refuse the SVG ("an embedded PNG
-  picture could not be decoded"). Large valid PNGs (interlaced, 16-bit, palette) still insert
-  without a visible pause. A drop of a refused file and a good one inserts the good one.
+  picture could not be decoded"). On macOS 11 both are refused the same way. Large valid PNGs
+  (interlaced, 16-bit, palette) still insert. While the 8000 × 8000 PNG is checked the window stays
+  responsive: the status shows "Reading…", the menus open and a hover shows its tooltip, with no
+  stall longer than a moment. A drop of a refused file and a good one inserts the good one.
+- Links and shortcuts: drop the `.url`, the `.webloc` and the `.lnk`, each alone: the status is only
+  `Couldn't drop "link.url": it is a web link, not a picture or a drawing.` (for the shortcut: `it
+  is a shortcut; drop the file it points to instead.`), never a parser's wording, and the app does
+  not navigate. Drop one with a PNG and a `.cdxml`: the picture is inserted, the document opens and
+  the link is named.
 - Document size: on a document already near 60 MB, drop several large pictures. Those that fit are
   inserted; the rest are refused by name ("it would make the document larger than 64.0 MB, the most
   ChemDraft can open"). Save, close and reopen the document: it opens.
@@ -2046,8 +2054,12 @@ lossy and a lossless WebP, an SVG with gradients and `<use href="#id">`, a BMP, 
 - Stalled disk: drop a picture from a network share, then disconnect it mid-read: after 30 seconds
   the status names the file, and a later drop works.
 - Tabs and guards: start a drop of the large JPEG and switch tabs before it appears: it is not
-  inserted anywhere and the status says so. Drops during a text, label or table-cell edit, with
+  inserted anywhere and the status names it (`"photo.jpg" was not inserted: the document of the drop
+  is no longer the active tab; try the drop again.`). Repeat with two pictures and a `.cdxml`: the
+  status names both pictures (`"a.jpg" and "b.jpg" were not inserted: …`) and the document.
+  Drops during a text, label or table-cell edit, with
   a dialog open or while quitting are refused with a reason, shown at once (before the file is read).
+  Every refused insertion names each dropped picture, quoted, however many.
 - Live gestures: drop the large JPEG and, before it appears, start resizing (then, separately,
   moving, rotating and drawing) another object; hold the gesture past the moment the picture would
   appear, then finish it. The picture appears once the gesture ends, the gesture's result is kept,

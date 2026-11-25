@@ -20,7 +20,9 @@ const native = vi.hoisted(() => ({
   /** Every listen and unlisten, by event name, in order. */
   subscriptions: [] as string[],
   files: new Map<string, Uint8Array>(),
-  stat: vi.fn<(path: string) => Promise<{ size: number }>>()
+  stat: vi.fn<(path: string) => Promise<{ size: number }>>(),
+  /** When set, a native read waits for it: a slow disk. */
+  gate: undefined as Promise<void> | undefined
 }));
 
 vi.mock("./rdkitWasmLoader", () => ({ registerRdkitWasmLoader: vi.fn() }));
@@ -63,6 +65,7 @@ vi.mock("@tauri-apps/plugin-fs", async (original) => ({
     let offset = 0;
     return {
       read: async (buffer: Uint8Array) => {
+        await native.gate;
         const count = Math.min(buffer.length, bytes.length - offset);
         buffer.set(bytes.subarray(offset, offset + count));
         offset += count;
@@ -107,6 +110,7 @@ describe("dropping picture files on the document window", { timeout: 3 * DROP_WA
     native.subscriptions.length = 0;
     native.files.clear();
     native.stat.mockReset();
+    native.gate = undefined;
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
     vi.stubGlobal("localStorage", new MemoryStorage());
     vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
@@ -335,7 +339,7 @@ describe("dropping picture files on the document window", { timeout: 3 * DROP_WA
     return { file, release };
   }
 
-  const leftTab = "The dropped pictures were not inserted: the document they were dropped on is no longer the active tab; drop them again.";
+  const leftTab = "\"slow.png\" was not inserted: the document of the drop is no longer the active tab; try the drop again.";
 
   it("reports a drop refused because the user switched tabs on both tabs, never leaving its own on Reading", async () => {
     await twoTabs();
@@ -375,9 +379,42 @@ describe("dropping picture files on the document window", { timeout: 3 * DROP_WA
     await browserDrop([documentFile("Replacement")]);
     await eventually(() => expect(snapshot().title).toBe("Replacement"));
     release();
-    await eventually(() => expect(status()).toBe("The dropped pictures were not inserted: the document they were dropped on is no longer the active tab; drop them again."));
+    await eventually(() => expect(status()).toBe(leftTab));
     expect(pictures()).toHaveLength(0);
     expect(tabs()).toHaveLength(1);
+  });
+
+  it("names the picture and the document of a mixed drop whose tab changed while the picture was read", async () => {
+    await twoTabs();
+    const slow = slowPicture();
+    await browserDrop([slow.file, documentFile("Arrived")], { x: 100, y: 100 });
+    await act(async () => { tabs()[1]!.click(); });
+    await eventually(() => expect(snapshot().title).not.toBe("First"));
+    slow.release();
+    await eventually(() => expect(status()).toBe(`${leftTab.replace(/\.$/, "")}; Opened Arrived.chemdraft as legacy ChemDraft JSON`));
+    await act(async () => { tabs()[0]!.click(); });
+    await eventually(() => expect(snapshot().title).toBe("First"));
+    expect(status()).toBe(leftTab);
+    expect(pictures()).toHaveLength(0);
+  });
+
+  it("refuses a web link or a shortcut by name, without reading it or navigating", async () => {
+    await mount();
+    const link = dropFile("link.url", new TextEncoder().encode("[InternetShortcut]\nURL=https://example.com/\n"));
+    const event = await browserDrop([link], { x: 100, y: 100 });
+    expect(event.defaultPrevented).toBe(true);
+    await eventually(() => expect(status()).toBe("Couldn't drop \"link.url\": it is a web link, not a picture or a drawing."));
+    expect(link.reads()).toBe(0);
+    expect(tabs()).toHaveLength(1);
+    const shortcut = dropFile("Drawing.lnk", new Uint8Array(76));
+    await browserDrop([dropFile("page.webloc", new Uint8Array(40)), dropFile("ok.png", pngBytes()), shortcut], { x: 100, y: 100 });
+    await eventually(() => expect(status()).toBe([
+      "Inserted picture ok.png",
+      "Couldn't drop \"page.webloc\": it is a web link, not a picture or a drawing",
+      "Couldn't drop \"Drawing.lnk\": it is a shortcut; drop the file it points to instead."
+    ].join("; ")));
+    expect(shortcut.reads()).toBe(0);
+    expect(pictures()).toHaveLength(1);
   });
 
   it("prevents navigation for a file dropped outside the canvas and shows copy over the canvas", async () => {
@@ -536,6 +573,47 @@ describe("dropping picture files on the document window", { timeout: 3 * DROP_WA
       await eventually(() => expect(status()).toBe("No pictures were inserted; Couldn't drop \"big.png\": it is 21.0 MB; a dropped picture can be at most 20.0 MB; "
         + "Opened doc.chemdraft as legacy ChemDraft JSON"));
       expect(snapshot().title).toBe("Native document");
+    });
+
+    it("names the picture and the document of a mixed native drop whose tab changed while the picture was read", async () => {
+      native.desktop = true;
+      let release!: () => void;
+      native.gate = new Promise<void>(resolve => { release = resolve; });
+      native.files.set("/Users/me/Drops/slow.png", pngBytes());
+      native.files.set("/Users/me/Drops/doc.chemdraft", new TextEncoder().encode(serializeDocument(createPhase4Document("Arrived"))));
+      native.stat.mockImplementation(async path => ({ size: native.files.get(path)?.length ?? 0 }));
+      await mount(createPhase4Document("First"), "windows");
+      await eventually(() => expect(native.events.has(DOCUMENT_FILE_DROP_EVENT)).toBe(true));
+      await command("document.new");
+      await act(async () => { tabs()[0]!.click(); });
+      await eventually(() => expect(snapshot().title).toBe("First"));
+      await act(async () => native.events.get(DOCUMENT_FILE_DROP_EVENT)!({ paths: ["/Users/me/Drops/slow.png", "/Users/me/Drops/doc.chemdraft"],
+        position: { x: 10, y: 10 }, units: "physical", topInsetRemoved: 0 }));
+      await eventually(() => expect(status()).toBe("Reading the dropped picture…"));
+      await act(async () => { tabs()[1]!.click(); });
+      await eventually(() => expect(snapshot().title).not.toBe("First"));
+      release();
+      await eventually(() => expect(status()).toBe(`${leftTab.replace(/\.$/, "")}; Opened doc.chemdraft as legacy ChemDraft JSON`));
+      await act(async () => { tabs()[0]!.click(); });
+      await eventually(() => expect(snapshot().title).toBe("First"));
+      expect(pictures()).toHaveLength(0);
+    });
+
+    it("refuses native web links and shortcuts by name without reading them, and still opens a dropped document", async () => {
+      native.desktop = true;
+      native.files.set("C:\\Drawings\\doc.chemdraft", new TextEncoder().encode(serializeDocument(createPhase4Document("Native document"))));
+      native.stat.mockImplementation(async path => ({ size: native.files.get(path)?.length ?? 0 }));
+      await mount(createPhase4Document("Desktop"), "windows");
+      await eventually(() => expect(native.events.has(DOCUMENT_FILE_DROP_EVENT)).toBe(true));
+      await act(async () => native.events.get(DOCUMENT_FILE_DROP_EVENT)!({ paths: ["C:\\Users\\me\\Desktop\\link.url", "C:\\Users\\me\\Desktop\\Drawing.lnk",
+        "C:\\Drawings\\doc.chemdraft"], position: { x: 10, y: 10 }, units: "physical", topInsetRemoved: 0 }));
+      await eventually(() => expect(status()).toBe([
+        "Couldn't drop \"link.url\": it is a web link, not a picture or a drawing",
+        "Couldn't drop \"Drawing.lnk\": it is a shortcut; drop the file it points to instead",
+        "Opened doc.chemdraft as legacy ChemDraft JSON"
+      ].join("; ")));
+      expect(snapshot().title).toBe("Native document");
+      expect(native.stat.mock.calls.map(([path]) => path).filter(path => !path.endsWith(".chemdraft"))).toEqual([]);
     });
 
     it("listens once per mount, so a page-size change leaves no gap, and a later drop uses the current page", async () => {

@@ -1,11 +1,11 @@
 // @vitest-environment jsdom
 
-import { inflateRawSync } from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DAMAGED_PNG_IMAGE_DATA, PNG_SURPLUS_IMAGE_DATA_BYTES, pngImageDataError, type PngInflateStream } from "./pngIntegrity";
+import { DAMAGED_PNG_IMAGE_DATA, PNG_SURPLUS_IMAGE_DATA_BYTES, pngImageDataError } from "./pngIntegrity";
 import { bytesToBase64, prepareDroppedImage } from "./prepareDroppedImage";
 import type { DecodeCheck, DroppedImageDecoders } from "./rasterDecode";
-import { damagedDropFixture, testPng, type TestPngChunk, type TestPngOptions } from "./pngTestImages";
+import { damagedDropFixture, testPng, writeTestPng, type TestPngChunk, type TestPngOptions } from "./pngTestImages";
+import { zlibOfZeros } from "./zlibTestStreams";
 
 const DAMAGED = "the PNG could not be decoded: its image data is damaged.";
 const NS = 'xmlns="http://www.w3.org/2000/svg"';
@@ -36,34 +36,18 @@ const swapLastAdler = (stream: Uint8Array) => {
   return copy;
 };
 
-/** The webview's inflater, with its output counted and, optionally, a hook on each chunk. */
-function countingInflate(onChunk?: (bytes: number) => void): PngInflateStream & { bytes: number } {
-  const factory = Object.assign(() => {
-    const inner = new DecompressionStream("deflate");
-    const count = new TransformStream<Uint8Array, Uint8Array>({
-      transform(chunk, controller) {
-        factory.bytes += chunk.length;
-        onChunk?.(factory.bytes);
-        controller.enqueue(chunk);
-      }
-    });
-    return { writable: inner.writable, readable: inner.readable.pipeThrough(count) };
-  }, { bytes: 0 });
-  return factory;
+/**
+ * An RGBA picture whose image data is all zeros (filter 0, black transparent pixels), with `extra`
+ * zero bytes more: built from a hand-made stream, so a large one costs nothing to make.
+ */
+function zeroPng(width: number, height: number, extra = 0): Uint8Array {
+  const header = new Uint8Array(13);
+  new DataView(header.buffer).setUint32(0, width);
+  new DataView(header.buffer).setUint32(4, height);
+  header.set([8, 6, 0, 0, 0], 8);
+  const stream = zlibOfZeros((1 + width * 4) * height + extra);
+  return writeTestPng([{ type: "IHDR", data: header }, { type: "IDAT", data: stream }, { type: "IEND", data: new Uint8Array() }]);
 }
-
-/** An inflater that ignores the zlib header and Adler-32, as some engines' do. */
-const inflateWithoutAdlerCheck: PngInflateStream = () => {
-  const parts: Uint8Array[] = [];
-  return new TransformStream<BufferSource, Uint8Array>({
-    transform(chunk) { parts.push(Uint8Array.from(chunk as Uint8Array)); },
-    flush(controller) {
-      const all = Buffer.concat(parts);
-      const output = new Uint8Array(inflateRawSync(all.subarray(2, all.length - 4)));
-      for (let offset = 0; offset < output.length; offset += 1000) controller.enqueue(output.slice(offset, offset + 1000));
-    }
-  });
-};
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -129,6 +113,19 @@ describe("pngImageDataError accepts every valid PNG, byte for byte", () => {
     await expectKept("trailing bytes", testPng({ width: 6, height: 6, trailing: new Uint8Array([1, 2, 3, 0, 0, 0, 0]) }));
   });
 
+  it("ignores bytes after the zlib stream, in its last IDAT or in an IDAT of their own", async () => {
+    // libpng and the webviews read no further than the stream's end.
+    for (const padding of [[0], [0, 0, 0, 0], [0xff, 0x13, 0x37, 0, 1, 2, 3, 4, 5]]) {
+      await expectKept(`${padding.length} bytes in the last IDAT`,
+        testPng({ width: 20, height: 9, zlib: stream => concat(stream, Uint8Array.from(padding)) }));
+      await expectKept(`${padding.length} bytes in an IDAT after it`, withChunks({ width: 20, height: 9 }, chunks =>
+        chunks.flatMap(chunk => chunk.type === "IEND" ? [{ type: "IDAT", data: Uint8Array.from(padding) }, chunk] : [chunk])));
+    }
+    // The Adler-32 is where the stream ends, not the last four bytes of the image data.
+    await expectRefused("wrong Adler-32 before padding",
+      testPng({ width: 20, height: 9, zlib: stream => concat(swapLastAdler(stream), Uint8Array.of(0, 0, 0, 0)) }));
+  });
+
   it("tolerates up to 64 KiB of surplus image data and no more", async () => {
     const surplus = (extra: number) => testPng({ width: 10, height: 10, imageData: data => concat(data, new Uint8Array(extra)) });
     await expectKept("1000 bytes", surplus(1000));
@@ -187,33 +184,36 @@ describe("pngImageDataError refuses damaged image data", () => {
       [chunks[0], chunks[1], { type: "tEXt", data: new TextEncoder().encode("a\0b") }, ...chunks.slice(2)]));
   });
 
-  it("refuses the Adler-32 itself when the engine's inflater does not check it", async () => {
-    const png = testPng({ width: 40, height: 40, zlib: swapLastAdler });
-    expect(await pngImageDataError(png, { inflate: inflateWithoutAdlerCheck })).toBe(DAMAGED_PNG_IMAGE_DATA);
-    expect(await pngImageDataError(testPng({ width: 40, height: 40 }), { inflate: inflateWithoutAdlerCheck })).toBeUndefined();
-  });
-
   it("stops inflating far too much image data rather than reading it all", async () => {
-    const extra = 16 * 1024 * 1024;
-    const inflate = countingInflate();
-    const png = testPng({ width: 10, height: 10, imageData: data => concat(data, new Uint8Array(extra)) });
-    expect(await pngImageDataError(png, { inflate })).toBe(DAMAGED_PNG_IMAGE_DATA);
-    expect(inflate.bytes).toBeGreaterThan(0);
-    expect(inflate.bytes).toBeLessThan(extra / 4);
+    // 2 GiB of zeros behind a 10 × 10 picture: inflating it all would take seconds.
+    const png = zeroPng(10, 10, 2 * 1024 * 1024 * 1024);
+    const started = performance.now();
+    expect(await pngImageDataError(png)).toBe(DAMAGED_PNG_IMAGE_DATA);
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(await pngImageDataError(zeroPng(10, 10, PNG_SURPLUS_IMAGE_DATA_BYTES))).toBeUndefined();
   });
 });
 
-describe("pngImageDataError under the file's deadline and without a webview inflater", () => {
-  it("rejects with the abort reason mid-inflate and cancels the inflater", async () => {
+describe("pngImageDataError keeps the window responsive and honours the file's deadline", () => {
+  it("lets a timer run during a large check, and makes a small one wait for none", async () => {
+    const large = zeroPng(3000, 3000);
+    let fired = false;
+    setTimeout(() => { fired = true; }, 0);
+    expect(await pngImageDataError(large)).toBeUndefined();
+    expect(fired).toBe(true);
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    expect(await pngImageDataError(testPng({ width: 64, height: 64, colourType: 6 }))).toBeUndefined();
+    expect(setTimeoutSpy).not.toHaveBeenCalled();
+    setTimeoutSpy.mockRestore();
+  });
+
+  it("rejects with the abort reason when the deadline passes mid-check", async () => {
     const controller = new AbortController();
     const reason = new Error("reading it took longer than 30 seconds.");
-    const inflate = countingInflate(() => controller.abort(reason));
-    const png = testPng({ width: 4000, height: 2000, colourType: 6, imageData: data => data.fill(0) });
-    await expect(pngImageDataError(png, { signal: controller.signal, inflate })).rejects.toBe(reason);
-    // Give a cancelled pipe the chance to misbehave (an unhandled rejection fails the run).
-    await new Promise(resolve => setTimeout(resolve, 20));
-    expect(inflate.bytes).toBeLessThan(4000 * 2000);
-    await expect(pngImageDataError(png, { signal: controller.signal, inflate })).rejects.toBe(reason);
+    const png = zeroPng(8000, 4000);
+    setTimeout(() => controller.abort(reason), 5);
+    await expect(pngImageDataError(png, { signal: controller.signal })).rejects.toBe(reason);
+    await expect(pngImageDataError(png, { signal: controller.signal })).rejects.toBe(reason);
   });
 
   it("refuses through prepareDroppedImage with the deadline wording", async () => {
@@ -223,18 +223,11 @@ describe("pngImageDataError under the file's deadline and without a webview infl
     await expect(prepareDroppedImage("late.png", testPng({ width: 4, height: 4 }), decoders, { signal: controller.signal })).rejects.toBe(reason);
   });
 
-  it("skips only the inflate step when the webview has no DecompressionStream", async () => {
+  it("needs nothing from the webview: the same verdicts where it has no DecompressionStream (macOS 11)", async () => {
     vi.stubGlobal("DecompressionStream", undefined);
-    // Nothing a good picture needs is missing, so it is never refused for that.
     await expectKept("good", testPng({ width: 13, height: 7, colourType: 6, interlace: true }));
-    // Inflating is what finds these, so the decoder has the last word on them.
-    expect(await pngImageDataError(damagedDropFixture("r8-damaged.png"))).toBeUndefined();
-    expect(await pngImageDataError(damagedDropFixture("r9-midcorrupt.png"))).toBeUndefined();
-    // The chunks and header are still checked.
-    await expectRefused("IDAT CRC", withChunks({ width: 4, height: 4 }, chunks =>
-      chunks.map(chunk => chunk.type === "IDAT" ? { ...chunk, crc: 1 } : chunk)));
-    await expectRefused("no PLTE", withChunks({ width: 4, height: 4, colourType: 3 }, chunks => chunks.filter(chunk => chunk.type !== "PLTE")));
-    expect(await pngImageDataError(damagedDropFixture("r8-damaged.png"), { inflate: null })).toBeUndefined();
+    await expectRefused("r8-damaged.png", damagedDropFixture("r8-damaged.png"));
+    await expectRefused("r9-midcorrupt.png", damagedDropFixture("r9-midcorrupt.png"));
   });
 });
 
