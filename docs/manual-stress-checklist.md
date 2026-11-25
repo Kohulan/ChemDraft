@@ -4,6 +4,9 @@ Molecule angle entry: select one whole native molecule, right-click, choose Rota
 enter positive/negative/fractional angles and a full 360 degrees. Accept/cancel and Undo/Redo must
 preserve charge, isotopes, stereochemistry, bond lengths and internal angles. Partial selections
 must not offer whole-molecule rotation. Check native menus and input focus on Windows and both macOS builds.
+Then, with the Bond tool active, right-click the selected molecule and choose Rotate molecule: the Selection tool comes up with the angle box showing; type an angle (say 30) and check the molecule turns, then pick the Bond tool, draw a bond onto that molecule, return to Selection and press Escape: the bond stays and Undo removes it, then the rotation. Type a stretch, then choose Rotate molecule and press Escape: the stretch stays and Undo returns to before it. Type 30 in the angle box, then clear it (or change it to `1.` or letters): the molecule returns to where it started, and Enter adds no undo step. While dragging a stretch or rotate handle (button still held), choose Rotate molecule from the menu or shortcut: no angle box opens, and on release the drag is one undo step.
+Open the angle box (and, separately, the stretch box) and leave it empty, or type only `-`, `1.` or letters, then hover a palette color and move off it, pick the Bond tool, or press Enter: the drawing is unchanged and Undo has nothing new to undo. A palette color hover while a typed angle is showing keeps the rotation as one step, and moving off the color removes the color again.
+Paste `C[C@H]([NH3+])C(=O)[O-]`, hover the CH3 and press `-`, then right-click the molecule: Rotate molecule is offered (also after Ctrl+A on Windows, Cmd+A on macOS); enter 90 and keep: the charge, radical and lone-pair marks turn with their atoms, the charges stay, and one Undo restores the molecule and every mark. Select that molecule with a second molecule, a text or an arrow: Rotate molecule is not offered.
 
 Document zoom controls: use Main's Zoom Out/In and each preset, check 100→125→150→200 and reverse,
 then smooth wheel/pinch and tab switching. The displayed percentage must follow the active view.
@@ -360,6 +363,36 @@ Main toolbar while the overlay is still up. Click outside the molecule: the stat
 drawing changed, the 3D overlay closes, and the cleaned-up drawing stays. Do it again, but this time
 click Spin 3D a second time instead of clicking outside: Spin 3D starts over on the cleaned-up
 molecule (no "already active" message), and a click outside flattens it.
+
+Marks follow their own atom (1.2.3 blocker). Paste aspirin `CC(=O)Oc1ccccc1C(=O)O`, hover the
+carboxylic acid OH oxygen and press `-`; repeat on fresh copies with a radical dot, a lone pair and
+a radical anion (RDKit cannot verify a singly bonded O•−, so Spin 3D and the 3D rotations may refuse
+that one with a message: a refusal is fine, a misplaced mark is not). For each, run Spin 3D twice:
+once with the molecule and its mark selected, once with only the molecule selected (click the
+molecule, not the mark). The moment the overlay opens, before any drag, the mark sits beside the
+carboxylate O, never beside the ester O or on a bond, and stays beside it, with its selection box
+when it is selected, through a long drag in several directions; no box is left behind at the old
+spot. Click outside: it is committed where the overlay drew it. Then check it is still beside that O
+after typed X, Y and Z rotations of the stored model, after Interactive 3D (tug the O, click
+outside), after 3D Clean Up, in a transparent PNG/TIFF and an SVG export, and after Save As, close
+and reopen. Throughout, each variant's chemistry stays its own: Copy As SMILES and the formula stay
+exactly what they were right after its mark was placed (for the `-` charge, `...C(=O)[O-]`; the
+radical dot, lone pair and radical anion each keep whatever their own copy gave then, never another
+variant's), dragging the carboxylate O still pulls the mark, and one Undo after any of these restores the drawing and the
+mark exactly as before.
+
+Marks keep off other molecules and off labels. Draw a second molecule (ethane, and separately
+methylamine `CN`) right where the aspirin's `-` will land after a Spin 3D of the first: during the
+drag and after the click outside, the `-` never sits on the other molecule's atoms, bonds or its
+`NH2`/`H2N` letters; it turns to a free side of its own O at the same distance, and the other
+molecule does not move. Draw methylammonium (`CN`, `+` on the N, drawn `H3N` with the `+` at its
+lower right) and Spin 3D it half a turn about the vertical: it is committed as `NH3`, and the `+`
+is not left on the `H3`. A `2+` (or `3-`) mark, drawn larger, is carried clear of bonds by its larger
+circle. A molecule turned on the page (rotation not 0, for example from a turned import or group)
+with a `-` on it: during Spin 3D the `-` is painted where the click outside stores it, turned with
+the molecule (the overlay itself still draws the projection unturned, so mid-spin the mark may sit
+apart from the drawn atom; after release the mark is beside its atom and the molecule is still
+turned). Copy As SMILES never changes.
 
 ## Automatic plugin update notices (macOS and Windows)
 
@@ -1877,20 +1910,23 @@ Run under KDE Plasma (Wayland session, so the app uses XWayland) and on GNOME.
   Minimize and Zoom/Maximize items with their usual shortcuts (Cmd+M on macOS), and no
   "Maximize / Restore" item or disabled copy of the Linux items appears in any menu, toolbar or
   the Customize gallery.
-- 1280-wide screen: set the display to 1280x800 and relaunch. The Main toolbar is no wider than
-  the screen and starts at its left edge; nothing runs off the right edge of the screen. At
-  1680x1050 the Main toolbar keeps its full width and saved position.
-- 1024-wide screen: set the display to 1024x768 and relaunch. The Main toolbar is as wide as the
-  screen and scrolls sideways: drag its horizontal scrollbar (or Shift+wheel over it) to the right
-  end and every tool, up to the last one, is reachable and clickable. The scrollbar is fully
-  visible below the tool row, not cut off by the palette's bottom edge, and the row above it is
-  not clipped either. Palettes that fit the screen (Arrows, Orbitals, Style) show no scrollbar.
-  Relaunched at 1680x1050, the Main toolbar shows no scrollbar.
+- 1280-wide screen: set the display to 1280x800 and relaunch. The Main toolbar keeps its natural
+  width (two rows of tools, about 1400 px with the zoom widget), stays where it was saved and runs
+  off the right edge of the screen. It is not shrunk, does not wrap and shows no scrollbar. Drag it
+  left by its title until the last tool is on screen: it stays where it was dropped, and is still
+  there after Shift+Ctrl+S then Esc and after quitting and relaunching. At 1680x1050 the Main
+  toolbar also keeps its full width and saved position.
+- 1024-wide screen and 150% scale: set the display to 1024x768, relaunch, and repeat at
+  1920x1080 with 150% scaling (and on a 1366x768 laptop at 100%). Each time the Main toolbar
+  shows both rows at full width with no horizontal or vertical scrollbar and runs off the right
+  edge; dragging it left reaches every tool, up to the last one, and each is clickable. Palettes
+  that fit the screen (Arrows, Orbitals, Style) are unchanged. (Native Wayland only, with
+  `CHEMDRAFT_NATIVE_WAYLAND=1`: the compositor places palettes, so there Main is still capped to
+  the screen and scrolls sideways.)
 - Moving between screens without relaunching (a 1024x768 and a 1680x1050 monitor side by side):
-  drag the scrolling Main toolbar onto the wide monitor. It widens to its full width, the
-  horizontal scrollbar disappears and the palette loses the scrollbar's height. Drag it back to
-  the narrow monitor: it is capped at that screen's width again and scrolls sideways with the bar
-  fully visible. Neither move leaves the palette flickering or resizing on its own.
+  drag the Main toolbar from the wide monitor onto the narrow one and back. It keeps its natural
+  width on both, never gains a scrollbar, and is not resized on its own. Neither move
+  leaves the palette flickering.
 - Palette positions after Save/Open: place Main and Art somewhere distinctive, then press
   Shift+Ctrl+S and Esc, and Ctrl+O and Esc, several times. Every palette comes back exactly where
   it was, and after quitting and relaunching it opens at that same spot (toolbar-state.json is
@@ -1902,8 +1938,10 @@ Run under KDE Plasma (Wayland session, so the app uses XWayland) and on GNOME.
   switch back to 1680x1050: within about a second it returns to the exact spot and size it had
   before (toolbar-state.json still holds that frame throughout). Repeat, but this time drag it a
   little while at 1024x768: back at 1680x1050 it stays where you dropped it. The same holds for
-  the Main toolbar on Linux: at 1024 it starts at the left edge, and back at 1680 it returns to
-  its saved position. Quit at 1024x768 and relaunch at 1680x1050: palettes open at their 1680
+  the Main toolbar on Linux: at 1024 it keeps its natural width and stays at its saved spot while
+  at least 48 px of its title is still on the screen; only a Main saved farther right than that is
+  moved, to the work area's left edge (running off the right edge). Back at 1680 it returns to its
+  saved position. Quit at 1024x768 and relaunch at 1680x1050: palettes open at their 1680
   positions, not the squeezed ones.
 - Document menu bar stays clickable (Linux and Windows; macOS has the global menu bar and is
   unchanged): start from a fresh profile (delete toolbar-state.json) so every palette takes its
@@ -1963,11 +2001,11 @@ Run under KDE Plasma (Wayland session, so the app uses XWayland) and on GNOME.
   text box, and `xprop WM_NORMAL_HINTS` shows min = max = that size. Then hover short, long,
   short again: the window shrinks as well as grows.
 - Work-area change with no window event: with the 1024x768 display from the 1.2.2 section (Main
-  capped and scrolling), remove or auto-hide the bottom panel without touching the palette. Within
-  about a second Main is re-fitted to the new work area; put the panel back and it is capped
-  again. On a wide display, add a vertical panel on the left or right that narrows the work area
-  below Main's width: Main is capped and scrolls without being moved. No palette flickers or keeps
-  resizing afterwards (watch for a few seconds).
+  running off the right edge at its natural width), remove or auto-hide the bottom panel without
+  touching the palette, then put it back. Main keeps its width and position both times. On a wide
+  display, add a vertical panel on the left or right that narrows the work area below Main's
+  width: Main keeps its natural width, shows no scrollbar and is not moved. No palette flickers or
+  keeps resizing afterwards (watch for a few seconds).
 - GTK Save dialog file types: open a `.cdxml` file and press Shift+Ctrl+S. The file-type dropdown
   at the bottom of the dialog is not blank: it reads CDXML, the existing file is selected in the
   list, and the dropdown also offers ChemDraft and CDX. Repeat with a `.chemdraft` and a `.cdx`
