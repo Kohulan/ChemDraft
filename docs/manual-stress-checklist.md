@@ -609,7 +609,7 @@ default scheme, `v` selects the Select tool even over an atom. Check these on bo
 following the selected scheme — `e` over an atom applies the Et nickname in the ChemDraw scheme,
 while ChemDraft's `e` arms the eraser; charge stacking
 by hotkey and by the charge tool up to ±9 and back down to mark removal;
-hover an atom of a selected and an unselected ring and press + (Shift+= and numpad +) and then -, holding the pointer still after Shift raises the rotation handles: each charges that atom, in both schemes; with nothing hovered (including after moving off the canvas) and no atom selected, + and - pick the charge tools in the ChemDraft scheme, while with one atom selected and nothing hovered, + and - charge the selected atom (as a literal + did before);
+hover an atom of a selected and an unselected ring and press + (Shift+= and numpad +) and then -; a PHYSICAL main-keyboard Shift+= must be pressed by a person, because automation tools inject "=" with code NumpadEqual and do not prove the physical path; holding the pointer still after Shift raises the rotation handles: each charges that atom, in both schemes; with nothing hovered (including after moving off the canvas) and no atom selected, + and - pick the charge tools in the ChemDraft scheme, while with one atom selected and nothing hovered, + and - charge the selected atom (as a literal + did before);
 with **Direct electron-mark editing** off (the default), check radical/lone-pair painted-ink-only picking over
 atoms, bonds and filled rings, repeated radical/lone-pair tool placement on existing ink, and
 absence of mark resize/rotation handles.
@@ -2009,6 +2009,7 @@ lossy and a lossless WebP, an SVG with gradients and `<use href="#id">`, a BMP, 
   large picture and switch tabs while it is read: the tab you are on reports the drop's outcome, and
   so does the receiving tab when you return. Hover a long status (several refusals) that ends in an
   ellipsis: the tooltip shows it in full, with any file warnings on the lines after it.
+  Drop 13 files with 6 refused: the status and its tooltip name every refused file (no "more files").
 - Refusals: the BMP, TIFF, HEIC, `.svgz`, `.ai` and 20 MB+ files are refused by name with a specific
   reason, immediately (no read of the large file); the `.ai` reason names the extension only. A
   `.png` renamed from a text file is refused as not a picture. A PNG whose chunks are intact but

@@ -25,7 +25,15 @@ export interface DroppedImageSource {
   read(maxBytes: number, options?: DecodeOptions): Promise<Uint8Array>;
 }
 
-export interface DropRefusalEntry { name: string; reason: string }
+export interface DropRefusalEntry {
+  name: string;
+  reason: string;
+  /**
+   * Set when the reason is about the whole drop rather than this file (the count cap, the total-bytes
+   * cap): every file refused for the same one shares one status part, which still names each file.
+   */
+  wholeDrop?: "count" | "totalBytes";
+}
 
 export interface SplitDrop<T> {
   images: T[];
@@ -100,13 +108,14 @@ export async function prepareDroppedImages(
   options: PrepareDropOptions = {}
 ): Promise<PreparedDrop> {
   const result: PreparedDrop = { images: [], refusals: [] };
-  const refuse = (name: string, reason: string) => result.refusals.push({ name, reason });
+  const refuse = (name: string, reason: string, wholeDrop?: DropRefusalEntry["wholeDrop"]) =>
+    result.refusals.push(wholeDrop ? { name, reason, wholeDrop } : { name, reason });
   const deadlineMs = options.deadlineMs ?? DROPPED_IMAGE_DEADLINE_MS;
   let totalBytes = 0;
   const admitted: DroppedImageSource[] = [];
   for (const [index, source] of sources.entries()) {
     if (index >= MAX_DROPPED_IMAGES) {
-      refuse(source.name, `only ${MAX_DROPPED_IMAGES} pictures can be dropped at once.`);
+      refuse(source.name, `only ${MAX_DROPPED_IMAGES} pictures can be dropped at once.`, "count");
       continue;
     }
     let size: number;
@@ -119,7 +128,7 @@ export async function prepareDroppedImages(
     const sizeError = droppedImageSizeError(size);
     if (sizeError) { refuse(source.name, sizeError); continue; }
     if (totalBytes + size > MAX_DROPPED_IMAGE_TOTAL_BYTES) {
-      refuse(source.name, `the pictures in one drop can total at most ${formatDropBytes(MAX_DROPPED_IMAGE_TOTAL_BYTES)}.`);
+      refuse(source.name, `the pictures in one drop can total at most ${formatDropBytes(MAX_DROPPED_IMAGE_TOTAL_BYTES)}.`, "totalBytes");
       continue;
     }
     totalBytes += size;
@@ -153,6 +162,29 @@ function listNames(names: readonly string[]): string {
   return names.length > LISTED ? `${shown} and ${names.length - LISTED} more` : shown;
 }
 
+/**
+ * One part per refusal, in order. Refusals for the same whole-drop reason share one part, where the
+ * first of them would have been, naming every file: `Couldn't drop "a.png", "b.png" and "c.png": …`.
+ */
+function refusalParts(refusals: readonly DropRefusalEntry[]): string[] {
+  const groups = new Map<string, DropRefusalEntry[]>();
+  const parts: Array<DropRefusalEntry | DropRefusalEntry[]> = [];
+  for (const refusal of refusals) {
+    if (!refusal.wholeDrop) { parts.push(refusal); continue; }
+    const group = groups.get(refusal.wholeDrop);
+    if (group) { group.push(refusal); continue; }
+    const created = [refusal];
+    groups.set(refusal.wholeDrop, created);
+    parts.push(created);
+  }
+  return parts.map(part => {
+    if (!Array.isArray(part)) return dropRefusal(part.name, part.reason);
+    if (part.length === 1) return dropRefusal(part[0]!.name, part[0]!.reason);
+    const names = part.map(refusal => `"${droppedFileBaseName(refusal.name)}"`);
+    return `Couldn't drop ${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}: ${part[0]!.reason}`;
+  });
+}
+
 /** What was inserted, how it was adjusted, and every refusal with its file and reason. */
 export function formatImageDropStatus(outcome: {
   inserted: readonly PreparedDroppedImage[];
@@ -172,8 +204,7 @@ export function formatImageDropStatus(outcome: {
     }
     if (outcome.scaledToPage?.length) parts.push(`scaled to fit the page: ${listNames(outcome.scaledToPage)}`);
   }
-  for (const refusal of outcome.refusals.slice(0, LISTED)) parts.push(dropRefusal(refusal.name, refusal.reason));
-  if (outcome.refusals.length > LISTED) parts.push(`${outcome.refusals.length - LISTED} more files were refused`);
+  for (const part of refusalParts(outcome.refusals)) parts.push(part);
   return joinStatusParts(parts);
 }
 
