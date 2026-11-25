@@ -61,6 +61,7 @@ import { getAssistantTransactions } from "./assistant/assistantTransaction";
 import { documentZoomClientCenter, documentZoomScaleForCommand, documentZoomStepScale, normalizeDocumentZoomRange } from "./documentZoom";
 import { broadcastToolsetZoom, listenForToolsetZoomRequests } from "./window-manager";
 import { acquireNativeUtilitySuspension } from "./nativeUtilitySuspension";
+import { onFileDialogRefused } from "./fileDialogGuard";
 import { loadAskToSaveBeforeQuit } from "./quitSettings";
 import { loadStartWithFreshDocument } from "./startupSettings";
 import { nativePrompt, useNativePrompt } from "./nativePrompt";
@@ -1917,7 +1918,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.25.15.30-opus";
+const CURRENT_BUILD_STAMP = "11.25.15.40-opus";
 
 const NUMERIC_ENTRY_DURING_DRAG_STATUS = "Finish the current drag, then enter a value";
 
@@ -3433,6 +3434,8 @@ export function MainWindow({
   useEffect(() => {
     prewarmNativeDialogModule();
   }, []);
+  // Deferred so the refused caller's own "… canceled" status does not replace it.
+  useEffect(() => onFileDialogRefused((refusal) => { window.setTimeout(() => setStatus(refusal), 0); }), []);
   // "Set as Default Arrow Style" survives restarts: seed the in-session defaults from localStorage
   // once on mount; each set writes the snapshot back (see the context-menu handler).
   useEffect(() => {
