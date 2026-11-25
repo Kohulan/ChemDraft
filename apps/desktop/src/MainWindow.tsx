@@ -67,7 +67,9 @@ import { nativePrompt, useNativePrompt } from "./nativePrompt";
 import { collapseRepeatedFileExtension, DOCUMENT_SAVE_EXTENSIONS, type RepeatedExtensionSaveTarget } from "./repeatedSaveExtension";
 import { resolveNativeSavePanelPath, resolveNativeSavePanelTarget, writeNativeSavePanelGrant } from "./nativeSavePanelPath";
 import { notifyNativeDocumentCompatibility } from "./nativeDocumentNotice";
-import { formatDocumentOpenBatchStatus, formatDocumentOpenFailure, listenAndDrainNativeOpenQueue, type DocumentOpenResult } from "./nativeOpenQueue";
+import {
+  formatDocumentOpenBatchStatus, formatDocumentOpenDropOutcome, formatDocumentOpenFailure, listenAndDrainNativeOpenQueue, type DocumentOpenResult
+} from "./nativeOpenQueue";
 import { useInAppModalUtilitySuspension } from "./useInAppModalUtilitySuspension";
 import { Icon } from "./icons";
 import { snapRotationDegrees } from "./rotationSnap";
@@ -1545,6 +1547,12 @@ type OpenDocumentContentsOptions = {
   dirty?: boolean;
   /** Replaces the "Opened …" status line (e.g. "Restored last session — …"). */
   statusOverride?: string;
+  /**
+   * The open's own status line once its tab is in front, for a drop's outcome: the "Opened …" line
+   * (or `statusOverride`) without the page-size clause, which is stale once the prompt is answered,
+   * or that the file was already open.
+   */
+  onStatus?: (status: string) => void;
 };
 export type NativeMoleculeSelectionPart =
   | { objectId: string; kind: "atom"; atomId: string }
@@ -1905,7 +1913,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.25.12.23-opus";
+const CURRENT_BUILD_STAMP = "11.25.13.00-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -10795,7 +10803,10 @@ export function MainWindow({
         browserFileKeysRef.current.get(tab.id) === browserKey);
     if (existing) {
       activateDocumentTab(existing.id, options?.onRefused);
-      if (activeDocumentTabIdRef.current === existing.id) options?.onOpened?.();
+      if (activeDocumentTabIdRef.current === existing.id) {
+        options?.onStatus?.(`${displayName} was already open`);
+        options?.onOpened?.();
+      }
       perfHook(() => reportOutcome?.("already-open"));
       return;
     }
@@ -10843,6 +10854,7 @@ export function MainWindow({
     setStatus(fitRecommendation
       ? `${openStatus}; imported content exceeds ${pageFitPromptLayoutLabel(fitRecommendation.currentPageTitle, fitRecommendation.currentOrientation)}`
       : openStatus);
+    options?.onStatus?.(openStatus);
     options?.onOpened?.();
     perfHook(() => reportOutcome?.("installed"));
     await pageFitSettled;
@@ -10885,13 +10897,16 @@ export function MainWindow({
     return run;
   }, []);
 
-  // Resolves to the batch's summary status (also shown here), so a drop can add its pictures to it.
+  // Every open shows the batch summary in status. It also resolves to a drop's outcome: each opened
+  // document's own status line, then, if any failed, the count opened and each failure with its own
+  // reason. Only a drop with pictures shows that text; every other open ignores it.
   const openDocumentBatch = useCallback((requests: readonly DocumentOpenRequest[]): Promise<string | undefined> => {
     const results = requests.map(({ contents, displayName, path, receipt }) => {
       // Confirm at tab installation, before optional page-fit and compatibility dialogs.
       // A rejected parse or an early return (e.g. unfinished table edit) fails the receipt.
       let opened = false;
       let refusal: string | undefined;
+      let status: string | undefined;
       const confirm = (installed: boolean) => {
         if (!receipt) return;
         void confirmNativeOpen(receipt, installed).catch(error =>
@@ -10899,10 +10914,11 @@ export function MainWindow({
       };
       const options: OpenDocumentContentsOptions = {
         onOpened: () => { opened = true; confirm(true); },
-        onRefused: message => { refusal = message; }
+        onRefused: message => { refusal = message; },
+        onStatus: message => { status = message; }
       };
       return openDocumentContents(contents, displayName, path, options).then(
-        (): DocumentOpenResult => opened ? { displayName }
+        (): DocumentOpenResult => opened ? { displayName, ...(status ? { status } : {}) }
           : { displayName, error: refusal ?? "Finish or cancel the current edit and try again." },
         (error: unknown): DocumentOpenResult => ({ displayName, error })
       ).finally(() => { if (!opened) confirm(false); });
@@ -10910,12 +10926,13 @@ export function MainWindow({
     // Reserve the summary's place before any later batch. Each open includes its page-fit and
     // compatibility prompts, so keeping an imported page finishes successfully before we count it.
     const finished = documentOpenQueueRef.current.then(async () => {
-      const summary = formatDocumentOpenBatchStatus(await Promise.all(results));
+      const settled = await Promise.all(results);
+      const summary = formatDocumentOpenBatchStatus(settled);
       if (summary) {
         setStatus(summary);
         if (!documentSessionHydratedRef.current) shellOpenFailureRef.current = summary;
       }
-      return summary || undefined;
+      return formatDocumentOpenDropOutcome(settled);
     });
     documentOpenQueueRef.current = finished.catch(() => undefined);
     return finished;
@@ -11283,7 +11300,7 @@ export function MainWindow({
   const imageDropRefusal = useCallback((): string | undefined => {
     if (quitInteractionRef.current) return "ChemDraft is quitting.";
     if (closeTabPromptRef.current) return "answer the close-tab question first.";
-    if (!documentSessionHydratedRef.current) return "the restored documents are still loading; drop them again in a moment.";
+    if (!documentSessionHydratedRef.current) return "the restored documents are still loading; try the drop again in a moment.";
     if (isBlockedByModalDialog(null)) return "close the open dialog first.";
     if (pageFitPendingRef.current) return "answer the page size question first.";
     if (tableCellEditorRef.current) return "finish editing the table cell first.";
@@ -11332,7 +11349,7 @@ export function MainWindow({
     const point = droppedImagePagePoint(client);
     const insertImages = (images: PreparedDroppedImage[]): DroppedImageInsertion => {
       if (!mountedRef.current || activeDocumentTabIdRef.current !== tabId || documentIdentityRef.current !== documentIdentity) {
-        return { ok: false, reason: "the document they were dropped on is no longer the active tab; drop them again." };
+        return { ok: false, reason: "the document of the drop is no longer the active tab; try the drop again." };
       }
       const refusal = imageDropRefusal();
       if (refusal) return { ok: false, reason: refusal };
@@ -11348,7 +11365,7 @@ export function MainWindow({
           return document;
         }
       }, "Insert Image", undefined, undefined, preserveChemistry("paste"));
-      if (!committed) return { ok: false, reason: failure ?? "the document did not accept them." };
+      if (!committed) return { ok: false, reason: failure ?? "the document did not accept the insertion." };
       // Like Paste Picture: the pictures stay selected and the canvas has focus, so the first Undo
       // undoes the drop rather than a field's text history.
       resetPasteUiState();
@@ -11373,7 +11390,7 @@ export function MainWindow({
         if (!gate) return Promise.resolve().then(commit);
         return gate.run(commit).catch((error: unknown) => {
           throw new Error(error instanceof PluginWriteGateTimeoutError
-            ? "the canvas stayed busy with another edit; drop them again."
+            ? "the canvas stayed busy with another edit; try the drop again."
             : error instanceof Error ? error.message : String(error));
         });
       },

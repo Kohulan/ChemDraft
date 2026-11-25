@@ -1979,7 +1979,8 @@ Run under KDE Plasma (Wayland session, so the app uses XWayland) and on GNOME.
 Run on macOS (Retina and a 1x external display) and on Windows at 100%, 150% and 200% display
 scaling. Prepare a small and a large PNG, a phone JPEG with an EXIF rotation, an animated GIF, a
 lossy and a lossless WebP, an SVG with gradients and `<use href="#id">`, a BMP, a TIFF, a HEIC, a
-`.svgz`, a picture over 20 MB, and a `.cdxml`.
+`.svgz`, a picture over 20 MB, a `.cdxml`, a web link (`.url` dragged from a browser on Windows,
+`.webloc` on macOS), a Windows shortcut (`.lnk`) and an 8000 × 8000 PNG photo.
 
 - Each format: drag it from Finder / Explorer onto the page. It appears centred under the pointer,
   at its natural size, selected; the status names it. The JPEG stands upright (EXIF honoured); the
@@ -2002,7 +2003,12 @@ lossy and a lossless WebP, an SVG with gradients and `<use href="#id">`, a BMP, 
   cascade up and to the left, none on top of another. Drop fifty small pictures: every one has its
   own position on the page.
 - Mixed: drop a PNG and a `.cdxml` together. The picture lands in the current tab and the document
-  opens in its own tab; the status reports both. Drop only a `.cdxml`: it opens as before.
+  opens in its own tab; that tab's status names both files, "Inserted picture mixed.png; Opened
+  mixed.cdxml as …", worded as the open itself words it (with its warnings count, if any, and no
+  "imported content exceeds" once the page-size question is answered). Drop a picture and two
+  documents: each document is named. Drop a picture with a document already open in another tab:
+  the status says that document was already open. Drop a picture with a document that cannot be
+  opened: the failure is named. Drop only a `.cdxml`: it opens and its status reads as before.
 - Mixed drop status on both tabs: drop five pictures, a BMP and a `.cdxml` on a tab holding a
   drawing. The new tab's status names the inserted pictures and the BMP refusal. Switch back to the
   receiving tab: its status shows the pictures' result, never "Reading 5 dropped pictures…". Drop a
@@ -2012,9 +2018,22 @@ lossy and a lossless WebP, an SVG with gradients and `<use href="#id">`, a BMP, 
   Drop 13 files with 6 refused: the status and its tooltip name every refused file (no "more files").
 - Refusals: the BMP, TIFF, HEIC, `.svgz`, `.ai` and 20 MB+ files are refused by name with a specific
   reason, immediately (no read of the large file); the `.ai` reason names the extension only. A
-  `.png` renamed from a text file is refused as not a picture. A PNG whose chunks are intact but
-  whose image data is damaged is refused as "could not be decoded". A drop of a refused file and a
-  good one inserts the good one.
+  `.png` renamed from a text file is refused as not a picture. A PNG whose chunks and CRCs are intact
+  but whose image data is damaged is refused by name as "the PNG could not be decoded: its image data
+  is damaged", both kinds: data that cannot be inflated at all (`r8-damaged.png`, which the webview
+  would insert as an invisible picture) and data corrupted mid-stream (`r9-midcorrupt.png`, which it
+  would insert half black). The same PNGs embedded in an SVG refuse the SVG ("an embedded PNG
+  picture could not be decoded"). On macOS 11 both are refused the same way. Large valid PNGs
+  (interlaced, 16-bit, palette) still insert. While the 8000 × 8000 PNG is checked the window stays
+  responsive: the status shows "Reading…", the menus open and a hover shows its tooltip, with no
+  stall longer than a moment. A drop of a refused file and a good one inserts the good one.
+- Hidden window: drop the 8000 × 8000 PNG and at once cover or minimise the window: it is inserted,
+  not refused.
+- Links and shortcuts: drop the `.url`, the `.webloc` and the `.lnk`, each alone: the status is only
+  `Couldn't drop "link.url": it is a web link, not a picture or a drawing.` (for the shortcut: `it
+  is a shortcut; drop the file it points to instead.`), never a parser's wording, and the app does
+  not navigate. Drop one with a PNG and a `.cdxml`: the picture is inserted, the document opens and
+  the link is named.
 - Document size: on a document already near 60 MB, drop several large pictures. Those that fit are
   inserted; the rest are refused by name ("it would make the document larger than 64.0 MB, the most
   ChemDraft can open"). Save, close and reopen the document: it opens.
@@ -2037,8 +2056,17 @@ lossy and a lossless WebP, an SVG with gradients and `<use href="#id">`, a BMP, 
 - Stalled disk: drop a picture from a network share, then disconnect it mid-read: after 30 seconds
   the status names the file, and a later drop works.
 - Tabs and guards: start a drop of the large JPEG and switch tabs before it appears: it is not
-  inserted anywhere and the status says so. Drops during a text, label or table-cell edit, with
-  a dialog open or while quitting are refused with a reason, shown at once (before the file is read).
+  inserted anywhere and the status names it (`"photo.jpg" was not inserted: the document of the drop
+  is no longer the active tab; try the drop again.`). Repeat with two pictures and a `.cdxml`: the
+  status names both pictures (`"a.jpg" and "b.jpg" were not inserted: …`) and the document.
+  A drop is refused, with a reason shown at once (before the file is read), while an in-page dialog
+  is open (any dialog drawn inside the document page, which in the web build includes Export), while
+  an unanswered close-tab, quit or page-size question is up, or during a text, label or table-cell
+  edit (on the desktop app the native listener ignores a drop entirely while the close-tab or quit
+  prompt is up). On the desktop app a drop while the separate Preferences or Export window is open is
+  accepted (owner-side decision 2026-11-25: those windows are modeless), and Export then exports the
+  drawing as it is when Export is pressed. Every refused insertion names each dropped picture,
+  quoted, however many.
 - Live gestures: drop the large JPEG and, before it appears, start resizing (then, separately,
   moving, rotating and drawing) another object; hold the gesture past the moment the picture would
   appear, then finish it. The picture appears once the gesture ends, the gesture's result is kept,
