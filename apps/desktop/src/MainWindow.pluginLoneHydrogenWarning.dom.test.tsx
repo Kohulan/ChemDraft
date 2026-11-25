@@ -201,6 +201,43 @@ describe("a plugin insert whose lone-H cache refresh is declined", () => {
     expect(status().split("Kept the stored chemistry")).toHaveLength(2);
   }, 20_000);
 
+  it("keeps a run's write warning when a queued repeat that writes nothing supersedes it from the menu", async () => {
+    const blank = createEmptyDocument();
+    const port = await mount(blank);
+    const pageId = blank.pages[0]!.id;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let runs = 0;
+    // The first run writes a cache the refresh keeps as stored, then a warning-free lone H, and waits;
+    // the repeat, queued behind it, writes nothing.
+    act(() => captured.runtime!.registerPlugin({ id: "org.chemdraft.loneHydrogenTest", name: "Lone H test", version: "0.1.0",
+      apiVersion: "^0.1.14", entry: "test.js", permissions: ["document.write"], contributes: { commands: [{ id: command, title: "Test" }] }
+    }, { commandHandlers: { [command]: async (context: PluginCommandContext) => {
+      runs += 1;
+      if (runs > 1) return;
+      await context.documents.applyPatch!({ reason: "Insert structure", patch: { op: "addObject", pageId, object: declined() } });
+      await context.documents.applyPatch!({ reason: "Insert structure", patch: { op: "addObject", pageId, object: refreshable("fresh", 200) } });
+      await gate;
+    } } }));
+    await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: command } })); });
+    await vi.waitFor(async () => {
+      await act(async () => {});
+      expect(inserted(port.read("initial")!, "fresh")?.structure).toBe(refreshedStructure);
+    }, { timeout: 15_000 });
+    // The warning-free write's status is the one showing while the first run waits.
+    expect(status()).toBe("Lone H test: inserted structure");
+    await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: command } })); });
+    await act(async () => { release(); });
+    await vi.waitFor(async () => {
+      await act(async () => {});
+      expect(runs).toBe(2);
+      expect(status()).toContain(reason);
+    }, { timeout: 15_000 });
+    expect(inserted(port.read("initial")!, "kept")?.chemistry?.stereochemistry).toEqual(["atom 0 (S)"]);
+    expect(status()).toMatch(/^Lone H test: inserted structure\. Kept the stored chemistry of molecule "kept": /);
+    expect(status().split("Kept the stored chemistry")).toHaveLength(2);
+  }, 30_000);
+
   it.each([
     ["throws", async () => { throw new Error("boom after insert"); }],
     ["returns { ok: false }", async () => ({ ok: false, error: { code: "test.failed", message: "boom after insert" } })]

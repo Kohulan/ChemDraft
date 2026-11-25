@@ -1899,7 +1899,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.24.21.26-opus";
+const CURRENT_BUILD_STAMP = "11.24.22.11-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -13809,6 +13809,10 @@ export function MainWindow({
   // Per menu-invoked plugin command: the status of each write it made that carried a warning (a lone-H
   // cache kept as stored), so the command's final status, which reports its selection warnings, keeps it.
   const pluginWriteWarningStatusesRef = useRef(new Map<string, string[]>());
+  // Per plugin command queue: the write-warning statuses of its newest requested run. A run a newer
+  // one supersedes publishes no status, so it hands its committed writes' warnings to that run, which
+  // settles after it and publishes them: a committed write's warning is never lost.
+  const pluginCommandLatestWriteWarningsRef = useRef(new Map<string, string[]>());
   // A refused analyzer run opens no report window; this notice says why (see AnalyzerNotice).
   const [analyzerNotice, setAnalyzerNotice] = useState<AnalyzerNotice | undefined>(undefined);
   const analyzerNoticeIdRef = useRef(0);
@@ -14784,6 +14788,14 @@ export function MainWindow({
       // Collected per invocation: the status of each write this run commits with a warning. Kept on
       // failure too, since a committed write stays on the canvas whatever the command does next.
       const writeWarningStatuses: string[] = [];
+      pluginCommandLatestWriteWarningsRef.current.set(queueKey, writeWarningStatuses);
+      const superseded = () => {
+        if (!mountedRef.current) return true;
+        if (pluginCommandGenerationsRef.current.get(queueKey) === generation) return false;
+        const latest = pluginCommandLatestWriteWarningsRef.current.get(queueKey);
+        if (latest && latest !== writeWarningStatuses) latest.push(...writeWarningStatuses);
+        return true;
+      };
       const failedStatus = (message: string) => [...writeWarningStatuses, `Plugin command failed: ${message}`].join(" ");
       const run = previous
         .catch(() => undefined)
@@ -14799,9 +14811,7 @@ export function MainWindow({
               pluginWriteWarningStatusesRef.current.delete(commandId);
             }
           }
-          if (!mountedRef.current || pluginCommandGenerationsRef.current.get(queueKey) !== generation) {
-            return;
-          }
+          if (superseded()) return;
           const failure = pluginCommandFailure(result);
           if (failure) {
             setStatus(failedStatus(failure));
@@ -14817,9 +14827,7 @@ export function MainWindow({
           }
         })
         .catch((error: unknown) => {
-          if (!mountedRef.current || pluginCommandGenerationsRef.current.get(queueKey) !== generation) {
-            return;
-          }
+          if (superseded()) return;
           const message = error instanceof Error ? error.message : String(error);
           setStatus(failedStatus(message));
           if (analyzerOwned && owner) showAnalyzerNotice(owner.id, owner.name, message);
@@ -14829,6 +14837,7 @@ export function MainWindow({
         if (pluginCommandQueuesRef.current.get(queueKey) === tracked) {
           pluginCommandQueuesRef.current.delete(queueKey);
           pluginCommandGenerationsRef.current.delete(queueKey);
+          pluginCommandLatestWriteWarningsRef.current.delete(queueKey);
           if (mountedRef.current) {
             setPendingPluginCommands(current => {
               const next = new Set(current); next.delete(queueKey); return next;
