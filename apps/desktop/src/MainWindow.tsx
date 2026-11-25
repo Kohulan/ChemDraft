@@ -10897,9 +10897,9 @@ export function MainWindow({
     return run;
   }, []);
 
-  // Shows the batch's summary (its failures) as before. Resolves to what a drop's outcome says of the
-  // documents: each one opened by its own status line, then that summary. Only a drop with pictures
-  // shows it; every other open ignores it.
+  // Every open shows the batch summary in status. It also resolves to a drop's outcome: each opened
+  // document's own status line, then, if any failed, the count opened and each failure with its own
+  // reason. Only a drop with pictures shows that text; every other open ignores it.
   const openDocumentBatch = useCallback((requests: readonly DocumentOpenRequest[]): Promise<string | undefined> => {
     const results = requests.map(({ contents, displayName, path, receipt }) => {
       // Confirm at tab installation, before optional page-fit and compatibility dialogs.
