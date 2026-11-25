@@ -16,7 +16,7 @@ import {
 } from "@chemdraft/plugin-api";
 import { assertPluginDocumentWriteScope, bareIdTargetPage, rebasePluginPatch,
   retainedCtabCompatibility, storedCtabReference, writePatchOps, type PluginHost, type PluginWriteScopePages } from "@chemdraft/plugin-host";
-import { selectionBounds, translateInsertedDocumentObjects, withImpliedRadicalChemistryRederived } from "../documentWorkflow";
+import { rederiveImpliedRadicalChemistryOf, selectionBounds, translateInsertedDocumentObjects } from "../documentWorkflow";
 import { choosePlacement, objectRect, overlaps as boundsOverlap, pageContentRect, RELATIVE_GAP, unionRects } from "../assistant/placement";
 import type { ViewportRect } from "@chemdraft/viewport-engine";
 import { nativeSingleBondGraphMetadata, tryNativeSingleBondGraphSmiles } from "@chemdraft/document-workflow-core";
@@ -37,6 +37,14 @@ export interface PluginPatchPlacementOptions extends ApplyPatchOptions {
 export interface AppliedPluginDocumentPatch {
   document: ChemDraftDocument;
   receipt: AppliedPatchReceipt;
+  /**
+   * What the user must be told about this write although it applied: one sentence per inserted
+   * molecule whose lone-H (H•) cache was kept as stored because it is not ChemDraft's own earlier
+   * output for the drawing (`rederiveImpliedRadicalChemistryOf` declined it), naming the molecule, for
+   * the caller to show
+   * with the write's status, as paste does with its `warningsOut` (AGENTS.md section 7).
+   */
+  warnings: string[];
 }
 
 /** The fields that carry a molecule's chemistry beside its editable graph, for save and export. */
@@ -117,6 +125,9 @@ export function refreshPluginPatchChemistry(before: ChemDraftDocument, draft: Ch
           if (!object.atoms.length) throw new ChemistryRefusal("the molecule has no drawn atoms to check against", "The molecule has no editable atoms to verify.");
           if (verifyInsertion && !graphChanged && !storedChanged) {
             // Verification only: an insertion that matches its graph keeps its records as authored.
+            // A lone-H cache the insert's refresh kept as stored (`rederiveImpliedRadicalChemistryOf`
+            // declined it) is verified as stored, like any other insertion: stale or conflicting chemistry
+            // is refused, never corrected here.
             const insertion = withoutBracketContext(object);
             await verifiedChemicalRecord(context, insertion, await inspectMolecule(context, insertion));
             return;
@@ -389,15 +400,16 @@ export function applyPluginDocumentPatch(
     patched = translateInsertedDocumentObjects(patched, objects.map(object => object.id), x - bounds.x, y - bounds.y);
   }
   // An inserted molecule copied from a document saved before the H• reading carries a lone H's stale
-  // H2 cache. Re-derive the inserted molecules only (by page and id), before verification and inside
-  // this write's one history entry; atoms, bonds and placement stay as authored.
-  const insertedRefs = new Set(writePatchOps(proposed.patch).flatMap(op =>
-    op.op === "addObject" && op.object.type === "molecule" ? [`${op.pageId}\u0000${op.object.id}`] : []));
-  if (insertedRefs.size) {
-    patched = withImpliedRadicalChemistryRederived(patched, {
-      only: (pageId, objectId) => insertedRefs.has(`${pageId}\u0000${objectId}`), occasion: "on plugin insert"
-    });
-  }
+  // cache. Re-derive the inserted molecules only (by page and id), in one pass over the pages they
+  // are on, before verification and inside this write's one history entry; atoms, bonds and placement
+  // stay as authored. A molecule it keeps as stored (its cache is not ChemDraft's own earlier output
+  // for the drawing) is named to the user, and verified as stored below.
+  const refresh = rederiveImpliedRadicalChemistryOf(patched, writePatchOps(proposed.patch).flatMap(op =>
+    op.op === "addObject" && op.object.type === "molecule" ? [{ pageId: op.pageId, objectId: op.object.id }] : []),
+  // The commit's verification (`refreshPluginPatchChemistry`) checks a kept CTAB against the drawing.
+  { occasion: "on plugin insert", storedCtabVerified: true });
+  patched = refresh.document;
+  const warnings = refresh.declined.map(({ objectId, text }) => `Kept the stored chemistry of molecule "${objectId}": ${text}`);
   // Record each touched object by page and id: the page an insertion names, and the page chem-core's
   // bare-id op acted on (its first occurrence). A same-id object on another page is never "touched".
   const touched = new Set<string>();
@@ -439,7 +451,8 @@ export function applyPluginDocumentPatch(
 
   return {
     document: selected,
-    receipt: AppliedPatchReceiptSchema.parse({ applied: true, objectIds })
+    receipt: AppliedPatchReceiptSchema.parse({ applied: true, objectIds }),
+    warnings
   };
 }
 
@@ -575,13 +588,18 @@ export function applyAcceptedPluginProposal(
  * The document a pending proposal produces when the user accepts it into `document`: the host's own
  * accept application (`previewProposedPatch`, with its orphaned-bracket allowance) through
  * `applyAcceptedPluginProposal`, exactly as the accept begins. Nothing is committed and `document`
- * is not changed, so the review can dry-run it; it throws where the accept would.
+ * is not changed, so the review can dry-run it; it throws where the accept would. The application's
+ * `warnings` (what the user must be told although it applied) are added to `warningsOut` if given.
  */
 export function previewAcceptedPluginProposal(
-  host: Pick<PluginHost, "previewProposedPatch">, proposalId: string, document: ChemDraftDocument
+  host: Pick<PluginHost, "previewProposedPatch">, proposalId: string, document: ChemDraftDocument, warningsOut?: string[]
 ): ChemDraftDocument {
   return host.previewProposedPatch(proposalId, document, {
-    apply: (current, proposed, options) => applyAcceptedPluginProposal(current, proposed, options).document
+    apply: (current, proposed, options) => {
+      const applied = applyAcceptedPluginProposal(current, proposed, options);
+      warningsOut?.push(...applied.warnings);
+      return applied.document;
+    }
   });
 }
 

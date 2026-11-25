@@ -739,6 +739,7 @@ import {
   findForeignNativeMoleculeBondTarget,
   openNativeDocument,
   openedDocumentRenumberedObjectIds,
+  openedDocumentWarnings,
   previewNativeMoleculeBondGrowth,
   nativeBondDragSourceAtomId,
   previewNativeMoleculeFreeformBondGrowth,
@@ -1898,7 +1899,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.24.20.26-opus";
+const CURRENT_BUILD_STAMP = "11.24.20.36-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -10801,11 +10802,13 @@ export function MainWindow({
     const sourceLabel = typeof contents === "string"
       ? openSourceLabel(resolvedOpen.source, resolvedOpen.statusSourceLabel)
       : openSourceLabel(resolvedOpen.source, resolvedOpen.statusSourceLabel).replaceAll("CDXML", "CDX");
-    const warningsReport = { displayName, sourceLabel, warnings: opened.warnings };
+    // A visible-layer conflict reports only the installed candidate's lone-H warnings.
+    const installedWarnings = openedDocumentWarnings(opened, resolvedOpen.document);
+    const warningsReport = { displayName, sourceLabel, warnings: installedWarnings };
     tabWarningsRef.current = warningsReport;
     setOpenWarningsReport(warningsReport);
     const openStatus = options?.statusOverride
-      ?? formatOpenStatus(displayName, sourceLabel, opened.warnings);
+      ?? formatOpenStatus(displayName, sourceLabel, installedWarnings);
     setStatus(fitRecommendation
       ? `${openStatus}; imported content exceeds ${pageFitPromptLayoutLabel(fitRecommendation.currentPageTitle, fitRecommendation.currentOrientation)}`
       : openStatus);
@@ -11497,6 +11500,9 @@ export function MainWindow({
               const opened = openNativeDocument(session.contents);
               const resolved = await resolveOpenResultDocument(opened);
               if (!resolved) throw new Error(formatOpenFailure(opened.warnings));
+              // Read before the headers below replace the installed document: a visible-layer
+              // conflict reports only the installed candidate's lone-H warnings.
+              const installedWarnings = openedDocumentWarnings(opened, resolved.document);
               // Autosave uses the ordinary feature-based writer, which can legitimately drop a
               // format-only header. Restore the source headers so its notice matches File > Open,
               // including on later relaunches, without changing that writer's compatibility rules.
@@ -11508,7 +11514,7 @@ export function MainWindow({
               ));
               const reports = restoreSessionWarningReports(session, {
                 displayName: session.displayName, sourceLabel: openSourceLabel(resolved.source, resolved.statusSourceLabel),
-                warnings: opened.warnings
+                warnings: installedWarnings
               });
               restored.push({ session, opened, resolved, history, reports, candidateIndex, id: crypto.randomUUID() });
             } catch {
@@ -13800,6 +13806,9 @@ export function MainWindow({
   const pluginCommandQueuesRef = useRef(new Map<string, Promise<void>>());
   const [pendingPluginCommands, setPendingPluginCommands] = useState<ReadonlySet<string>>(() => new Set());
   const pluginCommandGenerationsRef = useRef(new Map<string, number>());
+  // Per menu-invoked plugin command: the status of each write it made that carried a warning (a lone-H
+  // cache kept as stored), so the command's final status, which reports its selection warnings, keeps it.
+  const pluginWriteWarningStatusesRef = useRef(new Map<string, string[]>());
   // A refused analyzer run opens no report window; this notice says why (see AnalyzerNotice).
   const [analyzerNotice, setAnalyzerNotice] = useState<AnalyzerNotice | undefined>(undefined);
   const analyzerNoticeIdRef = useRef(0);
@@ -14000,7 +14009,11 @@ export function MainWindow({
           receipt.objectIds.length > 0 && insertedDescription
             ? `${plugin.name}: inserted ${insertedDescription}`
             : `${plugin.name}: applied ${command.title}`;
-        setStatus(sourceStatus ? `${insertionStatus} (${sourceStatus})` : insertionStatus);
+        const writeStatus = sourceStatus ? `${insertionStatus} (${sourceStatus})` : insertionStatus;
+        // A refresh the write declined (a lone-H cache kept as stored) reaches the user (AGENTS.md §7).
+        const finalStatus = applied.warnings.length ? `${writeStatus}. ${applied.warnings.join(" ")}` : writeStatus;
+        setStatus(finalStatus);
+        if (applied.warnings.length) pluginWriteWarningStatusesRef.current.get(command.id)?.push(finalStatus);
         return receipt;
       });
     }
@@ -14328,7 +14341,8 @@ export function MainWindow({
         const before = documentRef.current;
         const documentIdentity = documentIdentityRef.current;
         // The same application the review dry-runs for its warnings (`proposalReviewItem`).
-        let prepared = previewAcceptedPluginProposal(host, proposal.id, before);
+        const applyWarnings: string[] = [];
+        let prepared = previewAcceptedPluginProposal(host, proposal.id, before, applyWarnings);
         if (recognized) {
           const visible = assistantHistoryPort.getViewportRect?.(tab.id);
           const pageRect = pageRef.current?.getBoundingClientRect();
@@ -14365,7 +14379,7 @@ export function MainWindow({
         }
         setSelectedNativeMoleculePart(undefined);
         const message = acceptedProposalMessage(pluginName, proposal,
-          { recognized, screenCapture: Boolean(screenCapture), before, committed });
+          { recognized, screenCapture: Boolean(screenCapture), before, committed, warnings: applyWarnings });
         setStatus(message);
         return { ok: true, message };
       } catch (error) {
@@ -14767,24 +14781,38 @@ export function MainWindow({
       pluginCommandGenerationsRef.current.set(queueKey, generation);
       const previous = pluginCommandQueuesRef.current.get(queueKey) ?? Promise.resolve();
       setPendingPluginCommands(current => new Set(current).add(queueKey));
+      // Collected per invocation: the status of each write this run commits with a warning. Kept on
+      // failure too, since a committed write stays on the canvas whatever the command does next.
+      const writeWarningStatuses: string[] = [];
+      const failedStatus = (message: string) => [...writeWarningStatuses, `Plugin command failed: ${message}`].join(" ");
       const run = previous
         .catch(() => undefined)
         .then(async () => {
           // Collected per invocation: only this command's own selection reads can add to it.
           const selectionWarnings: string[] = [];
-          const result = await invokePluginCommand(commandId, { selectionWarnings, input: options?.input });
+          pluginWriteWarningStatusesRef.current.set(commandId, writeWarningStatuses);
+          let result: unknown;
+          try {
+            result = await invokePluginCommand(commandId, { selectionWarnings, input: options?.input });
+          } finally {
+            if (pluginWriteWarningStatusesRef.current.get(commandId) === writeWarningStatuses) {
+              pluginWriteWarningStatusesRef.current.delete(commandId);
+            }
+          }
           if (!mountedRef.current || pluginCommandGenerationsRef.current.get(queueKey) !== generation) {
             return;
           }
           const failure = pluginCommandFailure(result);
           if (failure) {
-            setStatus(`Plugin command failed: ${failure}`);
+            setStatus(failedStatus(failure));
             if (analyzerOwned && owner) showAnalyzerNotice(owner.id, owner.name, failure);
           } else {
             // A run that went through supersedes whatever this analyzer refused earlier.
             if (analyzerOwned && owner) clearAnalyzerNoticeFor(owner.id);
-            if (selectionWarnings.length) {
-              setStatus([...new Set(selectionWarnings)].join(" "));
+            if (selectionWarnings.length || writeWarningStatuses.length) {
+              // Keep every write's warning (AGENTS.md section 7), even when a later warning-free write
+              // set the status, beside the selection's.
+              setStatus([...writeWarningStatuses, ...new Set(selectionWarnings)].join(" "));
             }
           }
         })
@@ -14793,7 +14821,7 @@ export function MainWindow({
             return;
           }
           const message = error instanceof Error ? error.message : String(error);
-          setStatus(`Plugin command failed: ${message}`);
+          setStatus(failedStatus(message));
           if (analyzerOwned && owner) showAnalyzerNotice(owner.id, owner.name, message);
         });
       let tracked: Promise<void>;
