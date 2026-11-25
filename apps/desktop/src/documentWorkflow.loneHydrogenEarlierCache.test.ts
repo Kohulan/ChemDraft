@@ -1,6 +1,6 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  admitParsedDocument, applyPatch, createEmptyDocument, serializeDocument,
+  admitParsedDocument, applyPatch, createEmptyDocument, serializeDocument, withBracketChemistryWarnings,
   type BracketObject, type ChemDraftDocument, type DocumentObject, type MoleculeAtom, type MoleculeBond, type MoleculeObject
 } from "@chemdraft/chem-core";
 import { nativeSingleBondGraphMetadata } from "@chemdraft/document-workflow-core";
@@ -9,6 +9,13 @@ import { installNodeRdkitModuleLoader } from "@chemdraft/rdkit-adapter/node";
 import { buildDocumentSessionEnvelope, parseDocumentSessionEnvelope } from "./documentSession";
 import * as workflow from "./documentWorkflow";
 import { restoreSessionWarningReports } from "./openWarnings";
+
+// chem-core's page annotation, counted: the refresh computes a page's bracket notes once per pass
+// (the last describe below). Every call still runs chem-core's own function.
+vi.mock("@chemdraft/chem-core", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@chemdraft/chem-core")>();
+  return { ...actual, withBracketChemistryWarnings: vi.fn(actual.withBracketChemistryWarnings) };
+});
 
 // A lone H, D or T is one hydrogen atom, a radical (H•; owner decision 2026-11-23). A document saved
 // before that caches an earlier reading of it. The refresh replaces a stored cache only when it is
@@ -175,6 +182,28 @@ const statedH4WithTodaysDiagnostic = () => ({
   ...nativeSingleBondGraphMetadata([...statedAtoms, atom("p1", "H", 10), atom("p2", "H", 50)], [bond("q1", "h1", "p1"), bond("q2", "h2", "p2")]),
   atomCount: 2, bondCount: 0
 });
+
+// A C bonded to an OMe label stating one hydrogen of its own (hydrogenCount 1), beside a lone H. An
+// abbreviation's hydrogens come from what it stands for, so nothing counts that count, and today's
+// validator writes a diagnostic about it (94e7e2d1e). Native (H•): "COC.[H]", C2H7O, one radical.
+// H2 reading (863c8f229): "COC.[HH]", C2H8O, no radical. No earlier writer wrote a diagnostic about the
+// count: 863c8f229, e7ef3bc68 and release 1.2.2 read "OMe" as its label (an element symbol begins it).
+const methoxyAtoms = [atom("c", "C", 0), { ...atom("ome", "OMe", 14, 8), hydrogenCount: 1 }, atom("h", "H", 50)];
+const methoxyBonds = [bond("co", "c", "ome")];
+const methoxyH2 = record("C2H8O", 48.085, 48.05751, 3, 1);
+const methoxy = (id: string, structure: string, chemistry: MoleculeObject["chemistry"], compatibility?: MoleculeObject["compatibility"]) =>
+  moleculeOf(id, methoxyAtoms, methoxyBonds, "smiles", structure, chemistry, compatibility);
+/** Today's cache for the methoxy drawing, as the native writer derives it (no page note). */
+const methoxyToday = () => refreshedAt123(methoxy("p", "", undefined));
+// The same with a Me label (methyl): "CC.[H]", C2H7 today. No element symbol begins "Me", so the
+// earlier writers that judged stated counts (863c8f229, e7ef3bc68) read it as a label naming no
+// element and wrote that diagnostic in their own words, which today's (an abbreviation's) are not.
+// Release 1.2.2 judged no stated count and wrote none.
+const methylAtoms = [atom("c", "C", 0), { ...atom("me", "Me", 14, 8), hydrogenCount: 1 }, atom("h", "H", 50)];
+const methylBonds = [bond("cm", "c", "me")];
+const methyl = (id: string, structure: string, chemistry: MoleculeObject["chemistry"]) =>
+  moleculeOf(id, methylAtoms, methylBonds, "smiles", structure, chemistry);
+const methylToday = () => refreshedAt123(methyl("p", "", undefined));
 
 /** A V2000 molfile of C, F, Cl, Br and a lone H, as RDKit writes one (the lone H with no valence field: H2). */
 const haloV2000 = [
@@ -435,6 +464,68 @@ describe("a lone H's stale cache that is ChemDraft's own earlier output is refre
     }
     expect(warn).not.toHaveBeenCalled();
   });
+
+  // Release 1.2.2 judged no stated hydrogen count, so its record of that drawing holds no diagnostic.
+  it("refreshes release 1.2.2's record of two lone H atoms, one stating a count: it wrote no diagnostic about the count", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const today = statedToday();
+    const stored = stated("released", "[H].[H]", { ...today, radicalCount: 0, warnings: [] });
+    for (const read of [openRead, restoreRead]) {
+      const result = read([stored]);
+      expect(declinedOf(result.warnings)).toEqual([]);
+      const [kept] = molecules(committed(result));
+      expect(kept!.structure).toBe("[H].[H]");
+      expect(kept!.chemistry).toEqual(today);
+    }
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  // The earlier writers' own records of a C–OMe stating a count beside a lone H, inside a repeat-unit
+  // bracket pair: none of them wrote a diagnostic about the OMe's count, so none is compared with one.
+  it("refreshes each earlier writer's own record of a bracketed C–OMe stating a count beside a lone H, with no warning", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const today = methoxyToday();
+    expect(today.structure).toBe("COC.[H]");
+    expect(today.chemistry).toMatchObject({ formula: "C2H7O", radicalCount: 1 });
+    expect(today.chemistry!.warnings.map((warning) => warning.objectId)).toEqual(["ome"]);
+    expect(today.chemistry!.warnings[0]!.message).toContain("an abbreviation's hydrogens come from what it stands for");
+    const records: [string, MoleculeObject][] = [
+      ["the H2 writer's", methoxy("h2era", "COC.[HH]", methoxyH2, { warnings: [], unknown: { smiles: "COC.[HH]" } })],
+      ["the bare-atom writers'", methoxy("bare", "COC.[H]", { ...today.chemistry!, radicalCount: 0, warnings: [] })]
+    ];
+    for (const [what, stored] of records) {
+      for (const [occasion, read] of [["open", openRead], ["session restore", restoreRead]] as const) {
+        const result = read([stored, ...repeatUnitPair(stored.id)]);
+        expect(declinedOf(result.warnings), `${what} on ${occasion}`).toEqual([]);
+        const [kept] = molecules(committed(result));
+        expect(kept!.structure, `${what} on ${occasion}`).toBe("COC.[H]");
+        expect(withoutBracketNotes(kept!), `${what} on ${occasion}`).toEqual(today.chemistry);
+        expect(bracketNotes(kept!), `${what} on ${occasion}`).toHaveLength(1);
+        expect(kept!.compatibility?.unknown.smiles ?? "COC.[H]").toBe("COC.[H]");
+      }
+      const warningsOut: string[] = [];
+      const [pastedMolecule] = molecules(pasted([stored, ...repeatUnitPair(stored.id)], warningsOut));
+      expect(pastedMolecule!.structure, what).toBe("COC.[H]");
+      expect(withoutBracketNotes(pastedMolecule!), what).toEqual(today.chemistry);
+      expect(warningsOut, what).toEqual([]);
+    }
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("refreshes release 1.2.2's record of a C–Me stating a count beside a lone H, which holds no diagnostic", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const today = methylToday();
+    expect(today.structure).toBe("CC.[H]");
+    expect(today.chemistry!.warnings.map((warning) => warning.objectId)).toEqual(["me"]);
+    const stored = methyl("released", "CC.[H]", { ...today.chemistry!, radicalCount: 0, warnings: [] });
+    for (const read of [openRead, restoreRead]) {
+      const result = read([stored]);
+      expect(declinedOf(result.warnings)).toEqual([]);
+      const [kept] = molecules(committed(result));
+      expect(kept!.chemistry).toEqual(today.chemistry);
+    }
+    expect(warn).not.toHaveBeenCalled();
+  });
 });
 
 describe("a lone H's cache that is not ChemDraft's own earlier output is kept as stored, with one warning", () => {
@@ -535,6 +626,49 @@ describe("a lone H's cache that is not ChemDraft's own earlier output is kept as
       // One console line per refresh that declined: open, restore and paste.
       expect(warn).toHaveBeenCalledTimes(3);
     }, 30_000);
+  }
+
+  // Records that carry a diagnostic only today's validator writes beside an earlier reading's chemistry,
+  // or that no earlier writer wrote in these words, inside a repeat-unit bracket pair: a mix of eras,
+  // so each is kept as stored (the page's note added by the read, as on every record) and named once.
+  const bracketedMixes: [string, () => MoleculeObject][] = [
+    ["the H2 reading's COC.[HH] (both SMILES fields), C2H8O and no radical, with today's diagnostic about the OMe count",
+      () => methoxy("mixedOMe", "COC.[HH]", { ...methoxyH2, warnings: methoxyToday().chemistry!.warnings },
+        { warnings: [], unknown: { smiles: "COC.[HH]" } })],
+    ["the bare atom's COC.[H] and no radical, with today's diagnostic about the OMe count",
+      () => methoxy("bareOMe", "COC.[H]", { ...methoxyToday().chemistry!, radicalCount: 0 })],
+    ["the H2 reading's CC.[HH] and C2H8 of a C–Me stating a count, with no diagnostic (that writer wrote one, in other words)",
+      () => methyl("h2Me", "CC.[HH]", record("C2H8", 32.086, 32.0626, 3, 1))],
+    ["the H2 reading's CC.[HH] and C2H8 of a C–Me stating a count, with today's diagnostic about the Me count",
+      () => methyl("mixedMe", "CC.[HH]", { ...record("C2H8", 32.086, 32.0626, 3, 1), warnings: methylToday().chemistry!.warnings })],
+    ["the bare atom's CC.[H] of a C–Me stating a count, with today's diagnostic about the Me count",
+      () => methyl("bareMe", "CC.[H]", { ...methylToday().chemistry!, radicalCount: 0 })]
+  ];
+
+  for (const [what, make] of bracketedMixes) {
+    it(`keeps a bracketed record byte-identical and warns once, on open, session restore and paste: ${what}`, () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const stored = make();
+      for (const [occasion, read] of [["open", openRead], ["session restore", restoreRead]] as const) {
+        const result = read([stored, ...repeatUnitPair(stored.id)]);
+        const declined = declinedOf(result.warnings);
+        expect(declined, occasion).toHaveLength(1);
+        expect(declined[0]!.sourceObjectId).toBe(stored.id);
+        const [readBack] = molecules(result.document!);
+        expect(bracketNotes(readBack!), occasion).toHaveLength(1);
+        const [kept] = molecules(committed(result));
+        expect(cacheOf(kept!), occasion).toBe(cacheOf(readBack!));
+        expect(kept!.structure, occasion).toBe(stored.structure);
+        expect(withoutBracketNotes(kept!), occasion).toEqual(stored.chemistry);
+      }
+      const warningsOut: string[] = [];
+      const [kept] = molecules(pasted([stored, ...repeatUnitPair(stored.id)], warningsOut));
+      expect(kept!.structure).toBe(stored.structure);
+      expect(kept!.compatibility).toEqual(stored.compatibility);
+      expect(withoutBracketNotes(kept!)).toEqual(stored.chemistry);
+      expect(warningsOut).toHaveLength(1);
+      expect(warn).toHaveBeenCalledTimes(3);
+    });
   }
 
   it("names each molecule a paste keeps as stored once, one line each, in the open report's words", () => {
@@ -720,5 +854,81 @@ describe("rederiveImpliedRadicalChemistryOf refreshes only the named molecules",
     expect(onlyKept.document).toBe(document);
     expect(onlyKept.declined).toHaveLength(1);
     expect(workflow.rederiveImpliedRadicalChemistryOf(document, [{ pageId: "no_such_page", objectId: "fresh" }]).document).toBe(document);
+  });
+});
+
+// Bracket membership is a page's, not a record's: the refresh computes a page's bracket notes once per
+// pass (chem-core's `withBracketChemistryWarnings`, counted here) and reuses them for every molecule and
+// every candidate record on it, so a crowded page reads and commits in linear time.
+describe("a page of 400 lone-H molecules beside one repeat-unit bracket pair reads and commits quickly", () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+  const annotations = vi.mocked(withBracketChemistryWarnings);
+  const COUNT = 400;
+  /** `molecule` moved to its own cell of a 20-column grid, atoms and all. */
+  const placed = (molecule: MoleculeObject, index: number): MoleculeObject => {
+    const dx = (index % 20) * 120;
+    const dy = Math.floor(index / 20) * 60 + 100;
+    return { ...molecule, x: molecule.x + dx, y: molecule.y + dy,
+      atoms: molecule.atoms.map((each) => ({ ...each, x: each.x + dx, y: each.y + dy })) };
+  };
+  /** The page: COUNT molecules made by `make`, the first of them inside a repeat-unit bracket pair. */
+  const crowdedPage = (make: (id: string) => MoleculeObject): DocumentObject[] => [
+    { ...make("m0") },
+    ...Array.from({ length: COUNT - 1 }, (_, index) => placed(make(`m${index + 1}`), index + 1)),
+    ...repeatUnitPair("m0")
+  ];
+  /** Reads and commits `objects`, counting chem-core's page annotations in each pass and timing both. */
+  const readAndCommit = (objects: DocumentObject[]) => {
+    annotations.mockClear();
+    const started = performance.now();
+    const read = openRead(objects);
+    const openAnnotations = annotations.mock.calls.length;
+    annotations.mockClear();
+    const document = committed(read);
+    const elapsed = performance.now() - started;
+    return { read, document, elapsed, openAnnotations, commitAnnotations: annotations.mock.calls.length };
+  };
+
+  it("leaves 400 current records as stored, annotating the page once in the open report's pass and once in the commit's", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const current = refreshedAt123(ethane("current"));
+    const { read, document, elapsed, openAnnotations, commitAnnotations } = readAndCommit(
+      crowdedPage((id) => ({ ...ethane(id), structureFormat: current.structureFormat, structure: current.structure, chemistry: current.chemistry })));
+    expect(openAnnotations).toBe(1);
+    expect(commitAnnotations).toBe(1);
+    expect(elapsed).toBeLessThan(2_000);
+    expect(declinedOf(read.warnings)).toEqual([]);
+    const before = molecules(read.document!);
+    const after = molecules(document);
+    expect(after).toHaveLength(COUNT);
+    after.forEach((molecule, index) => expect(cacheOf(molecule)).toBe(cacheOf(before[index]!)));
+    expect(bracketNotes(after[0]!)).toHaveLength(1);
+    expect(after.slice(1).every((molecule) => bracketNotes(molecule).length === 0)).toBe(true);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("refreshes 400 H2-era records, annotating the page once per pass for every candidate record", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const at123 = refreshedAt123(ethane("stale"));
+    const { read, document, elapsed, openAnnotations, commitAnnotations } = readAndCommit(crowdedPage((id) => ethane(id)));
+    expect(openAnnotations).toBe(1);
+    expect(commitAnnotations).toBe(1);
+    expect(elapsed).toBeLessThan(2_000);
+    expect(declinedOf(read.warnings)).toEqual([]);
+    const after = molecules(document);
+    expect(after).toHaveLength(COUNT);
+    for (const molecule of after) {
+      expect(molecule.structure).toBe("CC.[H]");
+      expect(withoutBracketNotes(molecule)).toEqual(at123.chemistry);
+    }
+    expect(bracketNotes(after[0]!)).toHaveLength(1);
+    // A plugin batch naming every molecule refreshes in one pass too, annotating the page once.
+    annotations.mockClear();
+    const page = read.document!.pages[0]!;
+    const batch = workflow.rederiveImpliedRadicalChemistryOf(read.document!,
+      molecules(read.document!).map((molecule) => ({ pageId: page.id, objectId: molecule.id })));
+    expect(annotations).toHaveBeenCalledTimes(1);
+    expect(batch.declined).toEqual([]);
+    expect(warn).not.toHaveBeenCalled();
   });
 });

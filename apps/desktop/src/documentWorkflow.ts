@@ -107,7 +107,9 @@ import {
   pageLayoutSourceUnit,
   flattenPerspectiveFrom3D,
   atomImpliedRadicalCount,
+  atomicNumberForElementSymbol,
   atomStatedHydrogenCount,
+  ignoredHydrogenCountAtomKind,
   isDativeBond,
   isEngineDocument,
   isMetalSymbol,
@@ -8460,10 +8462,12 @@ function rederiveImpliedRadicalCaches(
     const selected = select(page.id);
     if (!selected) return page;
     let pageChanged = false;
+    // One context per page and pass, so the page's bracket notes are computed once (`annotatedOnPage`).
+    const context: LoneHydrogenPageContext = { document, page };
     const objects = page.objects.map((object) => {
       if (object.type !== "molecule" || !selected(object.id)) return object;
       try {
-        const refresh = impliedRadicalCacheRefresh(object, { document, page }, storedCtabVerified);
+        const refresh = impliedRadicalCacheRefresh(object, context, storedCtabVerified);
         if (refresh.kind === "unchanged") return object;
         if (refresh.kind === "declined") {
           // Kept exactly as stored, and said so: never a partly refreshed, contradictory cache.
@@ -8512,11 +8516,20 @@ export function impliedRadicalCacheDeclinedLine(objectId: string, text = implied
 /** The cached fields the lone-H refresh compares with an earlier reading and writes. */
 type LoneHydrogenCache = Pick<MoleculeObject, "structureFormat" | "structure" | "chemistry">;
 
-/** Where a molecule the lone-H refresh reads sits: its document, and the page of it holding the molecule. */
+/**
+ * Where a molecule the lone-H refresh reads sits: its document, and the page of it holding the
+ * molecule. One context serves every molecule of the page in one pass (`rederiveImpliedRadicalCaches`,
+ * `impliedRadicalCacheNotRefreshedWarnings`), so the page's bracket notes are computed once.
+ */
 interface LoneHydrogenPageContext {
   document: ChemDraftDocument;
   page: DocumentPage;
+  /** Filled on first use (`pageBracketNotes`): chem-core's bracket notes for each molecule of the page. */
+  bracketNotes?: ReadonlyMap<DocumentObject, readonly CompatibilityWarning[]>;
 }
+
+/** The code of chem-core's page note on a molecule inside a repeat-unit or multiple-group bracket pair. */
+const BRACKET_MULTIPLIER_NOTE_CODE = "chemistry.bracket_multiplier";
 
 type ImpliedRadicalCacheRefresh =
   | { kind: "unchanged" }
@@ -8579,15 +8592,46 @@ function impliedRadicalCacheRefresh(
  * the refresh exactly the note this adds; the note follows the page and the drawing, never how a
  * lone H is read. The refresh writes today's record annotated in the same way, as the next commit
  * would leave it. A record with no chemistry is returned as it is (nothing is annotated).
+ *
+ * The notes themselves are chem-core's, computed once per page and pass (`pageBracketNotes`); they
+ * depend on the page's brackets and on the molecule's id and atoms, never on its cached record, so
+ * every molecule and every candidate record of the page reuses them. Each record then takes them as
+ * that function takes them: its own bracket notes dropped, the page's appended, and the record left
+ * as it is when that changes nothing.
  */
 function annotatedOnPage(context: LoneHydrogenPageContext, object: MoleculeObject, cache: LoneHydrogenCache): LoneHydrogenCache {
-  const { document, page } = context;
-  const index = page.objects.indexOf(object);
-  if (!cache.chemistry || index < 0) return cache;
-  const objects = [...page.objects];
-  objects[index] = { ...object, ...cache };
-  const annotated = withBracketChemistryWarnings({ ...document, pages: [{ ...page, objects }] }).pages[0]?.objects[index];
-  return annotated?.type === "molecule" ? { ...cache, chemistry: annotated.chemistry } : cache;
+  if (!cache.chemistry) return cache;
+  context.bracketNotes ??= pageBracketNotes(context.document, context.page);
+  const notes = context.bracketNotes.get(object);
+  if (!notes) return cache;
+  const previous = cache.chemistry.warnings;
+  if (notes.length === 0 && !previous.some((warning) => warning.code === BRACKET_MULTIPLIER_NOTE_CODE)) return cache;
+  const warnings = [...previous.filter((warning) => warning.code !== BRACKET_MULTIPLIER_NOTE_CODE), ...notes];
+  if (JSON.stringify(previous) === JSON.stringify(warnings)) return cache;
+  return { ...cache, chemistry: { ...cache.chemistry, warnings } };
+}
+
+/**
+ * chem-core's bracket notes (`chemistry.bracket_multiplier`) for each molecule of `page`, keyed by the
+ * page's own molecule object: `withBracketChemistryWarnings`, run once on `page` of `document` with
+ * every molecule's record emptied of warnings (a molecule with no record given an empty one, so it is
+ * annotated too), so whatever it leaves on a record is exactly the page's notes for that molecule.
+ * Bracket membership reads the page's brackets and each molecule's id, atoms and bonds (a stored
+ * structure only for a molecule with no atoms, which holds no lone H), never a cached record, so the
+ * notes hold for any record the refresh compares or writes.
+ */
+function pageBracketNotes(document: ChemDraftDocument, page: DocumentPage): Map<DocumentObject, readonly CompatibilityWarning[]> {
+  const emptied = page.objects.map((object): DocumentObject => object.type !== "molecule" ? object : {
+    ...object,
+    chemistry: { isotopeLabels: [], stereochemistry: [], ...object.chemistry, warnings: [] }
+  });
+  const annotated = withBracketChemistryWarnings({ ...document, pages: [{ ...page, objects: emptied }] }).pages[0]?.objects ?? [];
+  const notes = new Map<DocumentObject, readonly CompatibilityWarning[]>();
+  page.objects.forEach((object, index) => {
+    const result = annotated[index];
+    if (object.type === "molecule" && result?.type === "molecule") notes.set(object, result.chemistry?.warnings ?? []);
+  });
+  return notes;
 }
 
 /**
@@ -8633,39 +8677,122 @@ function storedCacheIs(object: MoleculeObject, reading: LoneHydrogenCache): bool
 
 /**
  * The complete caches ChemDraft's native derivation wrote for this drawing under the earlier
- * readings of a hydrogen atom, each the whole record that era's writer wrote (structure, format, and
+ * readings of a hydrogen atom, each the whole record ONE earlier writer wrote (structure, format, and
  * every field of the chemistry record, its diagnostics included; `impliedRadicalCacheRefresh` then
  * adds the page's annotations through chem-core's own function), computed by today's writer from
  * `derived` (`refreshNativeSingleBondGraph`'s result: its atoms are the ones the derivation read, its
  * structure and chemistry today's H• reading). Each reading is applied to EVERY hydrogen atom it read
  * differently from today, all at once, so a stored cache matches a reading only when it is one era's
- * output throughout; a mix of eras matches none. A reading whose record today's writer cannot rebuild
- * exactly, in every field, is not offered at all, so it never matches in part:
+ * output throughout; a mix of eras matches none. Each record holds only the diagnostics that writer
+ * wrote (`eraDiagnostics`), so a record carrying a diagnostic only a later writer wrote matches no
+ * earlier one. A reading whose record today's writer cannot rebuild exactly, in every field, is not
+ * offered at all, so it never matches in part:
  * - H2 (863c8f229 until e7ef3bc68): each H, D or T atom with no covalent bond (a lone one, or one
  *   bonded only datively, a dative bond costing it nothing) carried one hydrogen of its own, as RDKit
  *   read the molfile's H without a valence field (`h2ReadingHydrogenCarrier`): SMILES [HH], [2HH],
- *   [3HH] (a dative Fe–D beside a lone H: [2HH][Fe].[HH], H3DFe); no radical (`h2ReadingCache`,
- *   which also says when a diagnostic of that era cannot be rebuilt);
- * - the bare atom with no radical (release 1.2.2 and earlier, and e7ef3bc68 until 95783e713): today's
- *   structure and record, with the radicals counting no lone hydrogen atom. A datively bonded H, D or
- *   T read then as it does today (the single atom, no radical), so only the lone ones differ, and in
- *   the radical count alone: the writer of e7ef3bc68 derived no hydrogen for a hydrogen atom, as
- *   today's does, so its diagnostics about one (a stated count it does not count: "... SMILES count
- *   0.") are today's, word for word; release 1.2.2 wrote no such diagnostic, so a record of it never
- *   holds one, and one that does is not release 1.2.2's.
- * Every other part of the cache is today's derivation's: neither reading is isomeric, and neither
- * ever wrote stereo.
+ *   [3HH] (a dative Fe–D beside a lone H: [2HH][Fe].[HH], H3DFe); no radical (`h2ReadingCache`);
+ * - the bare atom with no radical: today's structure and record, with the radicals counting no lone
+ *   hydrogen atom. A datively bonded H, D or T read then as it does today (the single atom, no
+ *   radical), so only the lone ones differ, and in the radical count alone. Two writers wrote it, with
+ *   different diagnostics, so each is its own record:
+ *   - e7ef3bc68 until 95783e713 (`"bare"`): it derived no hydrogen for a hydrogen atom, as today's
+ *     does, so its diagnostics about one (a stated count it does not count: "... SMILES count 0.")
+ *     are today's, word for word; it wrote none about an abbreviation's stated count;
+ *   - release 1.2.2 (`"release-1.2.2"`, and an earlier release where its record is the same): it read
+ *     no stated hydrogen count at all, so it wrote no diagnostic about one, and its formula, masses and
+ *     SMILES never counted one. Where today's writer counts a stated count (`atomStatedHydrogenCount`)
+ *     its record is not release 1.2.2's, so that reading is not offered.
+ * Every other part of the cache is today's derivation's: no reading is isomeric, and none ever wrote
+ * stereo.
  */
 function earlierLoneHydrogenReadings(derived: MoleculeObject): LoneHydrogenCache[] {
-  const lone = derived.atoms.filter((atom) => atomImpliedRadicalCount(atom, derived.bonds) > 0);
-  const chemistry = derived.chemistry;
-  const bare: LoneHydrogenCache = {
-    structureFormat: derived.structureFormat, structure: derived.structure,
-    chemistry: chemistry && { ...chemistry, radicalCount: (chemistry.radicalCount ?? 0) - lone.length }
-  };
-  const carriers = derived.atoms.filter((atom) => h2ReadingHydrogenCarrier(atom, derived.bonds));
+  const { atoms, bonds, chemistry } = derived;
+  const readings: LoneHydrogenCache[] = [];
+  const carriers = atoms.filter((atom) => h2ReadingHydrogenCarrier(atom, bonds));
   const h2 = h2ReadingCache(derived, new Set(carriers.map((atom) => atom.id)));
-  return h2 ? [h2, bare] : [bare];
+  if (h2) readings.push(h2);
+  const lone = atoms.filter((atom) => atomImpliedRadicalCount(atom, bonds) > 0);
+  const bare = (era: "bare" | "release-1.2.2"): LoneHydrogenCache | undefined => {
+    const cache = { structureFormat: derived.structureFormat, structure: derived.structure };
+    if (!chemistry) return { ...cache, chemistry };
+    const warnings = eraDiagnostics(era, chemistry.warnings, atoms, bonds);
+    return warnings && { ...cache, chemistry: { ...chemistry, radicalCount: (chemistry.radicalCount ?? 0) - lone.length, warnings } };
+  };
+  const developed = bare("bare");
+  if (developed) readings.push(developed);
+  if (!atoms.some((atom) => atomStatedHydrogenCount(atom, bonds) !== undefined)) {
+    const released = bare("release-1.2.2");
+    if (released && JSON.stringify(released) !== JSON.stringify(developed)) readings.push(released);
+  }
+  return readings;
+}
+
+/**
+ * The diagnostics (`chemistry.warnings`) the earlier writer `era` wrote for a drawing, from the ones
+ * today's validator writes for it read as that era read it (`warnings`, written for `atoms` and
+ * `bonds`), or undefined when that writer wrote one this cannot rebuild word for word (the reading is
+ * then not offered). Each diagnostic is told by the rule that wrote it (document-workflow-core's
+ * `nativeAtomValidationState` for the atom it names), and kept, dropped (that writer had no such
+ * rule, and wrote nothing in its place) or declined (that writer wrote it in other words), from the
+ * history of the validator (document-workflow-core's atoms.ts, chem-core's hydrogenHints.ts,
+ * layout-engine's `atomDerivedHydrogenCount`):
+ * - about no atom (an unknown bond order, an isotope with no mass): unchanged since release 1.2.2, kept;
+ * - an atom's valence, aromaticity or label (not about a stated count): unchanged since release 1.2.2,
+ *   kept, but for e7ef3bc68's judging of an H atom stating 0 as a typed H. "bare" wrote that too;
+ *   release 1.2.2 did not, but a stated 0 on an H atom is a count today's writer counts, so release
+ *   1.2.2's reading is not offered there. 863c8f229 derived one hydrogen for every neutral H, D or T
+ *   atom with no covalent bond and no radical mark, and judged a stated 0 on one as a count to check,
+ *   so for "h2" no diagnostic about an H, D or T atom is rebuilt (nor one about a hydrogen that
+ *   reading added);
+ * - a stated count that disagrees with the derived one (9ffa39a38): written in the same words by
+ *   "h2" and "bare", kept; release 1.2.2 read no stated count, and its reading is not offered where
+ *   today's writer counts one (`earlierLoneHydrogenReadings`), so none reaches it here: declined;
+ * - a stated count nothing counts, on a hydrogen atom, the unknown atom or a label naming no element
+ *   (f5ab763ac, 937c15fed, e866c62a5): written in the same words by "h2" and "bare", kept; release
+ *   1.2.2 wrote none, dropped;
+ * - such a count on an abbreviation (OMe, Ph; a typed Ac, Pr or Ts on a bond: 94e7e2d1e, 043a85dd4),
+ *   after every earlier writer. Release 1.2.2 wrote none, dropped. "h2" and "bare" read an
+ *   abbreviation's label as their label grammar's when an element symbol begins it (OMe, Ph, CF3, a
+ *   typed Ac), writing nothing, dropped; one no element symbol begins (Me, Et) they read as a label
+ *   naming no element, and wrote that diagnostic in those words, declined.
+ * A diagnostic about an atom its validator finds valid is no such writer's, declined.
+ */
+function eraDiagnostics(
+  era: "h2" | "bare" | "release-1.2.2",
+  warnings: readonly CompatibilityWarning[],
+  atoms: readonly MoleculeAtom[],
+  bonds: readonly MoleculeBond[]
+): CompatibilityWarning[] | undefined {
+  if (warnings.length === 0) return [];
+  const atomById = new Map(atoms.map((atom) => [atom.id, atom]));
+  let resolution: ReturnType<typeof nativeBondOrderResolution> | undefined;
+  const kept: CompatibilityWarning[] = [];
+  for (const warning of warnings) {
+    const atom = warning.objectId === undefined ? undefined : atomById.get(warning.objectId);
+    if (!atom) {
+      kept.push(warning);
+      continue;
+    }
+    if (era === "h2" && hydrogenCountElement(atom) === "H") return undefined;
+    resolution ??= nativeBondOrderResolution(atoms, bonds);
+    const state = nativeAtomValidationState(atom, bonds, atom.formalCharge, atoms, resolution);
+    if (state.valid) return undefined;
+    if (state.hydrogenCountNotCounted !== true) {
+      if (state.statedHydrogens !== undefined && era === "release-1.2.2") return undefined;
+      kept.push(warning);
+      continue;
+    }
+    if (era === "release-1.2.2") continue;
+    if (ignoredHydrogenCountAtomKind(atom, bonds) !== "an abbreviation") {
+      kept.push(warning);
+      continue;
+    }
+    const label = atom.element.trim();
+    const elementBegins = atomicNumberForElementSymbol(label.slice(0, 2)) !== undefined ||
+      atomicNumberForElementSymbol(label.slice(0, 1)) !== undefined;
+    if (!elementBegins) return undefined;
+  }
+  return kept;
 }
 
 /**
@@ -8697,11 +8824,12 @@ function h2ReadingHydrogenCarrier(atom: MoleculeAtom, bonds: readonly MoleculeBo
  * - its diagnostics (`warnings`), which that era's validator wrote reading each such atom as holding
  *   one hydrogen (its derived count 1, which a diagnostic about it states: a stated count it does not
  *   count ends "... SMILES count 1."). Today's validator never derives a hydrogen for a hydrogen atom
- *   (layout-engine's `atomDerivedHydrogenCount`), bonded or not, so a diagnostic about such an atom
- *   (or its added hydrogen) cannot be rebuilt as that era wrote it: then there is no H2 reading. Every
- *   other atom's diagnostics must not depend on how such an atom is read: only when the drawing as
- *   read today (`derived`) and as partnered here give the same list is that list taken as that era's;
- *   when they differ there is no H2 reading either;
+ *   (layout-engine's `atomDerivedHydrogenCount`), bonded or not, so a diagnostic about such an atom,
+ *   or any other hydrogen atom, or its added hydrogen, cannot be rebuilt as that era wrote it: then
+ *   there is no H2 reading (`eraDiagnostics`, which also leaves out the diagnostics only later writers
+ *   wrote). Every other atom's diagnostics must not depend on how such an atom is read: only when the
+ *   drawing as read today (`derived`) and as partnered here give the same list is that list taken as
+ *   that era's; when they differ there is no H2 reading either;
  * - the structure from the drawing with each such atom written as a hydrogen atom of an isotope no
  *   atom of the molecule has, a token the writer writes for nothing else, which then becomes the H2
  *   reading's token for that atom. Components and their order follow the bonds, which are the
@@ -8713,25 +8841,22 @@ function h2ReadingCache(derived: MoleculeObject, loneIds: ReadonlySet<string>): 
   const takenIds = new Set([...atoms.map((atom) => atom.id), ...bonds.map((bond) => bond.id)]);
   const partneredAtoms: MoleculeAtom[] = [];
   const partnerBonds: MoleculeBond[] = [];
-  const readDifferently = new Set(loneIds);
   for (const atom of atoms) {
     partneredAtoms.push(atom);
     if (!loneIds.has(atom.id)) continue;
     const id = `${atom.id}\u0000h2`;
     if (takenIds.has(id)) return undefined;
-    readDifferently.add(id);
     partneredAtoms.push({ id, element: "H", x: atom.x, y: atom.y, formalCharge: 0 });
     partnerBonds.push({ id, fromAtomId: atom.id, toAtomId: id, order: "single" });
   }
-  const metadata = nativeSingleBondGraphMetadata(partneredAtoms, [...bonds, ...partnerBonds]);
-  // The H2 writer's diagnostics, where they can be rebuilt (see above): none about an atom that
-  // reading read differently, and the others the same whichever way those atoms are read.
-  const todays = derived.chemistry?.warnings ?? [];
-  const aboutReadDifferently = (warnings: readonly CompatibilityWarning[]) =>
-    warnings.some((warning) => warning.objectId !== undefined && readDifferently.has(warning.objectId));
-  if (aboutReadDifferently(todays) || aboutReadDifferently(metadata.warnings) ||
-      JSON.stringify(metadata.warnings) !== JSON.stringify(todays)) return undefined;
-  const chemistry = { ...metadata, atomCount: atoms.length, bondCount: bonds.length };
+  const partneredBonds = [...bonds, ...partnerBonds];
+  const metadata = nativeSingleBondGraphMetadata(partneredAtoms, partneredBonds);
+  // The H2 writer's diagnostics, where they can be rebuilt (see above): the same whichever way those
+  // atoms are read, none about a hydrogen atom, and only those that era's writer wrote.
+  if (JSON.stringify(metadata.warnings) !== JSON.stringify(derived.chemistry?.warnings ?? [])) return undefined;
+  const warnings = eraDiagnostics("h2", metadata.warnings, partneredAtoms, partneredBonds);
+  if (!warnings) return undefined;
+  const chemistry = { ...metadata, atomCount: atoms.length, bondCount: bonds.length, warnings };
 
   const takenIsotopes = new Set(atoms.map((atom) => atom.isotope));
   let isotope = 900_000;
@@ -8771,19 +8896,23 @@ export function impliedRadicalCacheNotRefreshedWarnings(
   document: ChemDraftDocument,
   source = "ChemDraft document"
 ): { code: string; message: string; sourceObjectId: string }[] {
-  return document.pages.flatMap((page) => page.objects.flatMap((object) => {
-    if (object.type !== "molecule") return [];
-    try {
-      const refresh = impliedRadicalCacheRefresh(object, { document, page });
-      return refresh.kind === "declined" ? [{
-        code: IMPLIED_RADICAL_CACHE_NOT_REFRESHED_CODE,
-        message: `${source}: ${impliedRadicalCacheNotRefreshedText()}`,
-        sourceObjectId: object.id
-      }] : [];
-    } catch {
-      return [];
-    }
-  }));
+  return document.pages.flatMap((page) => {
+    // One context per page, as the refresh keeps one (`annotatedOnPage`).
+    const context: LoneHydrogenPageContext = { document, page };
+    return page.objects.flatMap((object) => {
+      if (object.type !== "molecule") return [];
+      try {
+        const refresh = impliedRadicalCacheRefresh(object, context);
+        return refresh.kind === "declined" ? [{
+          code: IMPLIED_RADICAL_CACHE_NOT_REFRESHED_CODE,
+          message: `${source}: ${impliedRadicalCacheNotRefreshedText()}`,
+          sourceObjectId: object.id
+        }] : [];
+      } catch {
+        return [];
+      }
+    });
+  });
 }
 
 /**
