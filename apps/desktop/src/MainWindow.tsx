@@ -94,6 +94,7 @@ import {
   OPEN_WARNINGS_LIST_ID,
   openWarningsHeading,
   restoreSessionWarningReports,
+  statusMessageTitle,
   TOGGLE_OPEN_WARNINGS_COMMAND_ID,
   warningCountLabel,
   type OpenWarning,
@@ -951,7 +952,7 @@ import {
 import { installBrowserReloadGuard, wasBrowserReloadPrevented } from "./browserReloadGuard";
 import { assertDocumentSize, decodeNativeDocumentContents, documentContentsKey, readBrowserDocumentFile, readNativeDocumentFile, type DocumentContents } from "./documentText";
 import { handleDroppedFiles, type DroppedImageInsertion, type DroppedImageSource } from "./imageDrop/dropHandler";
-import { browserDropClientPoint, drawableCanvasRect, dropPagePoint, tauriDropClientPoint, type DropClientPoint } from "./imageDrop/dropPosition";
+import { DOCUMENT_FILE_DROP_EVENT, browserDropClientPoint, drawableCanvasRect, dropPagePoint, nativeDropClientPoint, type DocumentFileDropPayload, type DropClientPoint } from "./imageDrop/dropPosition";
 import { insertDroppedImages, type PagePointLike } from "./imageDrop/insertDroppedImages";
 import type { PreparedDroppedImage } from "./imageDrop/prepareDroppedImage";
 import { savedDocumentBytes } from "./imageDrop/dropDocumentBudget";
@@ -1899,7 +1900,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.24.22.41-opus";
+const CURRENT_BUILD_STAMP = "11.25.00.26-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -10571,7 +10572,9 @@ export function MainWindow({
     setAnalysisReport(undefined);
     setObjectContextMenu(undefined);
     setArrowEditTargetId(undefined);
-    setStatus(tableDraftStatusRef.current?.announced ?? snapshot.status);
+    // The ref follows at once, so a second switch before React renders snapshots this tab's status.
+    statusRef.current = tableDraftStatusRef.current?.announced ?? snapshot.status;
+    setStatus(statusRef.current);
     pluginRuntimeRef.current?.notifyActiveDocumentChanged(requestDocumentKey(id));
   }, [cancelDocumentTabSessions, clearDocumentInteractionState, installDocumentHistory, requestDocumentKey]);
 
@@ -11222,6 +11225,24 @@ export function MainWindow({
     return () => { dialogCoordinatorRef.current = undefined; void coordinator.dispose(); };
   }, []);
 
+  /**
+   * A status for one tab, whichever is active: the active tab shows it at once, another tab keeps it
+   * in its snapshot for when it is shown again. `statusRef` follows at once, so a tab switch in the
+   * same tick, before React renders, snapshots this status and not the one before it. False when the
+   * tab has closed.
+   */
+  const setTabStatus = useCallback((tabId: string, message: string): boolean => {
+    if (tabId === activeDocumentTabIdRef.current) {
+      statusRef.current = message;
+      setStatus(message);
+      return true;
+    }
+    const snapshot = documentTabSnapshotsRef.current.get(tabId);
+    if (!snapshot || !documentTabsRef.current.some(tab => tab.id === tabId)) return false;
+    documentTabSnapshotsRef.current.set(tabId, { ...snapshot, status: message });
+    return true;
+  }, []);
+
   const openDroppedDocumentPaths = useCallback(async (paths: readonly string[]) => {
     return openDocumentBatch(paths.map(path => ({
       contents: () => readNativeDocumentFile(path), displayName: nativePathBasename(path), path
@@ -11270,6 +11291,13 @@ export function MainWindow({
     openDocuments(files: T[]): Promise<string | undefined>;
   }) => {
     const tabId = activeDocumentTabIdRef.current;
+    // "Reading…", the result and any failure belong to the tab the drop landed on, wherever the user
+    // has gone since (a tab that has closed meanwhile: the active one). The whole outcome is also
+    // shown on the tab active at the end, so a refusal is never only on a tab out of sight.
+    const setDropStatus = (message: string) => {
+      if (!setTabStatus(tabId, message)) setTabStatus(activeDocumentTabIdRef.current, message);
+    };
+    const showOutcome = (message: string) => { setTabStatus(activeDocumentTabIdRef.current, message); };
     // Bumped whenever the active document is replaced or another tab is installed (as for plugin
     // writes): a picture is only ever inserted into the document it was dropped on.
     const documentIdentity = documentIdentityRef.current;
@@ -11300,7 +11328,7 @@ export function MainWindow({
       return { ok: true, scaledToPage };
     };
     return handleDroppedFiles(files, {
-      ...route, insertImages, decoders: browserImageDecoders, setStatus,
+      ...route, insertImages, decoders: browserImageDecoders, setStatus: setDropStatus, showOutcome,
       insertRefusal: imageDropRefusal,
       documentBytes: () => {
         // The session's cached payload when autosave has built one for this very document.
@@ -11326,8 +11354,12 @@ export function MainWindow({
         imageDropQueueRef.current = run.catch(() => undefined);
         return run;
       }
-    }).catch((error: unknown) => setStatus(`Couldn't finish the drop: ${error instanceof Error ? error.message : String(error)}`));
-  }, [commitDocumentChangeWithPageFit, droppedImagePagePoint, imageDropRefusal, resetPasteUiState]);
+    }).catch((error: unknown) => {
+      const message = `Couldn't finish the drop: ${error instanceof Error ? error.message : String(error)}`;
+      setDropStatus(message);
+      showOutcome(message);
+    });
+  }, [commitDocumentChangeWithPageFit, droppedImagePagePoint, imageDropRefusal, resetPasteUiState, setTabStatus]);
 
   const dropNativePaths = useCallback((paths: readonly string[], client: DropClientPoint | undefined) =>
     runFileDrop(paths, client, { nameOf: nativePathBasename, imageSource: nativeDroppedImageSource,
@@ -11343,18 +11375,19 @@ export function MainWindow({
     if (!isDesktopRuntime()) return undefined;
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    const platform = shortcutPlatform ?? detectDesktopShortcutPlatform();
-    void listenCurrentWindowEvent<{ paths: string[]; position?: { x: number; y: number } }>("tauri://drag-drop", (event) => {
+    // Not `tauri://drag-drop`: its macOS position is measured from under the title bar. Rust sends
+    // this one, once per drop, with the position made relative to the page (`file_drop.rs`).
+    void listenCurrentWindowEvent<DocumentFileDropPayload>(DOCUMENT_FILE_DROP_EVENT, (event) => {
       if (disposed || closeTabPromptRef.current || quitInteractionRef.current) return;
       // Pixels per CSS pixel right now, including any webview zoom, for Windows' physical position.
-      const client = tauriDropClientPoint(event.payload.position, platform, window.devicePixelRatio);
+      const client = nativeDropClientPoint(event.payload, window.devicePixelRatio);
       void dropNativePaths(event.payload.paths, client);
     }).then((stop) => {
       if (disposed) stop();
       else unlisten = stop;
     }).catch(() => undefined);
     return () => { disposed = true; unlisten?.(); };
-  }, [dropNativePaths, shortcutPlatform]);
+  }, [dropNativePaths]);
 
   // The web build: a file dropped anywhere in the document window (the canvas, a toolbar, the tab
   // strip) is taken here. `main.tsx` keeps every other drop from navigating. The desktop webviews
@@ -12305,13 +12338,6 @@ export function MainWindow({
     }
   }, closeTabPrompt, true);
 
-  const setExportTabStatus = useCallback((tabId: string, message: string) => {
-    if (tabId === activeDocumentTabIdRef.current) setStatus(message);
-    else {
-      const snapshot = documentTabSnapshotsRef.current.get(tabId);
-      if (snapshot) documentTabSnapshotsRef.current.set(tabId, { ...snapshot, status: message });
-    }
-  }, []);
   const openExportDialog = useCallback(() => {
     const tabId = activeDocumentTabIdRef.current;
     const state = createDefaultExportDialogState(documentRef.current, lastExportDirectoryRef.current, fileStateRef.current.path);
@@ -12362,10 +12388,10 @@ export function MainWindow({
       if (path.length > 1024 || nativePathBasename(path).length > 256 || new TextEncoder().encode(JSON.stringify([path, nativePathBasename(path)])).length > 2400) throw new Error("The chosen export path is too long for the dialog. Choose a shorter path.");
       const filename = nativePathBasename(path);
       exportGrantsRef.current.set(tabId, { path, filename, format: options.format });
-      setExportTabStatus(tabId, `Export location: ${filename}`);
+      setTabStatus(tabId, `Export location: ${filename}`);
       return { status: "picked", destinationPath: path, filename };
     } catch (error) {
-      if (live()) setExportTabStatus(tabId, `Export location failed: ${String(error)}`);
+      if (live()) setTabStatus(tabId, `Export location failed: ${String(error)}`);
       throw error;
     }
   };
@@ -12407,12 +12433,12 @@ export function MainWindow({
         lastExportDirectoryRef.current = nativePathDirname(path) ?? lastExportDirectoryRef.current;
       }
       const notice = formatExportStatus(descriptor.menuLabel, result.format, result.warnings);
-      if (live()) setExportTabStatus(tabId, notice);
+      if (live()) setTabStatus(tabId, notice);
       const details = [notice, ...result.warnings.map(warning => warning.message)].join("\n");
       // Successful receipts carry a notice only when there are warnings to review.
       return { status: "exported", ...(result.warnings.length ? { notice: boundExportNotice(details) } : {}) };
     } catch (error) {
-      if (live()) setExportTabStatus(tabId, `Export failed: ${String(error)}`);
+      if (live()) setTabStatus(tabId, `Export failed: ${String(error)}`);
       throw error;
     }
   };
@@ -24731,7 +24757,7 @@ export function MainWindow({
               title={spin3dErrorMessage ?? (interactive3dWorkspace ? interactive3dWorkspaceStatusText({
                 status: interactive3dWorkspace.status, energyLabel: interactive3dWorkspace.energyLabel,
                 warnings: interactive3dWorkspace.session?.warnings ?? []
-              }) : fileWarningsTooltip(warningReports))}>
+              }) : statusMessageTitle(hoveredNativeWarning ?? status, fileWarningsTooltip(warningReports)))}>
               {spin3dErrorMessage ?? (interactive3dWorkspace
                 ? <Interactive3dWorkspaceStatus status={interactive3dWorkspace.status}
                     energyLabel={interactive3dWorkspace.energyLabel} warnings={interactive3dWorkspace.session?.warnings ?? []} />

@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createImageGraphicObject, serializeDocument, type ChemDraftDocument, type GraphicObject } from "@chemdraft/chem-core";
 import { MainWindow, objectResizeStretches } from "./MainWindow";
 import { createPhase4Document } from "./documentWorkflow";
+import { DOCUMENT_FILE_DROP_EVENT } from "./imageDrop/dropPosition";
 import { browserDecodeCheck, browserRasterToPng } from "./imageDrop/rasterDecode";
 import { jpegHeader, pngBytes, svgBytes } from "./imageDrop/testFixtures";
 import { picturePngBase64 } from "./testSupport/imageFixture";
@@ -281,14 +282,65 @@ describe("dropping picture files on the document window", { timeout: 3 * DROP_WA
     await eventually(() => expect(snapshot().title).toBe("Only document"));
     expect(tabs()).toHaveLength(1);
 
-    await browserDrop([dropFile("mixed.png", pngBytes()), documentFile("Mixed document")], { x: 200, y: 200 });
-    // The picture went into the tab under the drop; the document then opened in a tab of its own.
-    await eventually(() => expect(status()).toMatch(/^Inserted picture mixed\.png/));
+    await browserDrop([dropFile("mixed.png", pngBytes()), dropFile("scan.bmp", new Uint8Array(30)), documentFile("Mixed document")], { x: 200, y: 200 });
+    // The picture went into the tab under the drop; the document then opened in a tab of its own,
+    // which shows the whole outcome (one document opened adds no summary of its own).
+    const pictureStatus = "Inserted picture mixed.png; Couldn't drop \"scan.bmp\": BMP and TIFF pictures can't be dropped yet; save it as PNG or JPEG first.";
     await eventually(() => expect(snapshot().title).toBe("Mixed document"));
+    await eventually(() => expect(status()).toBe(pictureStatus));
     expect(tabs()).toHaveLength(2);
+    // The receiving tab keeps the pictures' own result, never "Reading…".
     await act(async () => { tabs()[0]!.click(); });
     await eventually(() => expect(snapshot().title).toBe("Only document"));
+    expect(status()).toBe(pictureStatus);
     expect(pictures()).toHaveLength(1);
+  });
+
+  /** Two tabs, the first holding "First"; the first is active, as the drop's target. */
+  async function twoTabs() {
+    await mount();
+    await browserDrop([documentFile("First")]);
+    await eventually(() => expect(snapshot().title).toBe("First"));
+    await command("document.new");
+    await act(async () => { tabs()[0]!.click(); });
+    await eventually(() => expect(snapshot().title).toBe("First"));
+  }
+
+  function slowPicture() {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const file: DropFile = { name: "slow.png", size: pngBytes().length, arrayBuffer: async () => { await gate; return pngBytes().buffer as ArrayBuffer; } };
+    return { file, release };
+  }
+
+  const leftTab = "The dropped pictures were not inserted: the document they were dropped on is no longer the active tab; drop them again.";
+
+  it("reports a drop refused because the user switched tabs on both tabs, never leaving its own on Reading", async () => {
+    await twoTabs();
+    const slow = slowPicture();
+    await browserDrop([slow.file], { x: 100, y: 100 });
+    expect(status()).toBe("Reading the dropped picture…");
+    await act(async () => { tabs()[1]!.click(); });
+    await eventually(() => expect(snapshot().title).not.toBe("First"));
+    slow.release();
+    // The tab now in front tells the refusal, so it is not missed.
+    await eventually(() => expect(status()).toBe(leftTab));
+    await act(async () => { tabs()[0]!.click(); });
+    await eventually(() => expect(snapshot().title).toBe("First"));
+    expect(status()).toBe(leftTab);
+    expect(pictures()).toHaveLength(0);
+  });
+
+  it("shows the outcome on the active tab when the tab the drop landed on has closed", async () => {
+    await twoTabs();
+    const slow = slowPicture();
+    await browserDrop([slow.file], { x: 100, y: 100 });
+    await act(async () => { tabs()[1]!.click(); });
+    await act(async () => { container.querySelectorAll<HTMLButtonElement>(".document-tab-close")[0]!.click(); });
+    await eventually(() => expect(tabs()).toHaveLength(1));
+    slow.release();
+    await eventually(() => expect(status()).toBe(leftTab));
+    expect(pictures()).toHaveLength(0);
   });
 
   it("never inserts into a document that replaced the drop target while the picture was read", async () => {
@@ -321,21 +373,25 @@ describe("dropping picture files on the document window", { timeout: 3 * DROP_WA
     await eventually(() => expect(snapshot().title).toBe("From the tab strip"));
   });
 
-  describe("desktop drag-drop event", () => {
+  describe("desktop document file drop event", () => {
     it.each([
-      ["macos", 2, { x: 300, y: 200 }],
-      ["linux", 1.5, { x: 300, y: 200 }],
-      ["windows", 1.5, { x: 450, y: 300 }],
-      ["windows", 2, { x: 600, y: 400 }]
-    ] as const)("places the picture at the converted %s position (scale %s)", async (platform, scale, position) => {
+      // macOS: Rust has already taken the 28-point title-bar inset off y; it is not taken off again.
+      ["macos", 2, { x: 300, y: 200 }, "css", 28],
+      ["linux", 1.5, { x: 300, y: 200 }, "css", 0],
+      ["windows", 1.5, { x: 450, y: 300 }, "physical", 0],
+      ["windows", 2, { x: 600, y: 400 }, "physical", 0]
+    ] as const)("places the picture at the converted %s position (scale %s)", async (platform, scale, position, units, topInsetRemoved) => {
       native.desktop = true;
       vi.stubGlobal("devicePixelRatio", scale);
       native.files.set("/Users/me/Pictures/mol.png", pngBytes());
       native.stat.mockImplementation(async path => ({ size: native.files.get(path)?.length ?? 0 }));
       await mount(createPhase4Document("Desktop"), platform);
-      await eventually(() => expect(native.events.has("tauri://drag-drop")).toBe(true));
-      await act(async () => native.events.get("tauri://drag-drop")!({ paths: ["/Users/me/Pictures/mol.png"], position }));
+      await eventually(() => expect(native.events.has(DOCUMENT_FILE_DROP_EVENT)).toBe(true));
+      // Tauri's own event, measured from under the macOS title bar, is not listened to: one insertion per drop.
+      expect(native.events.has("tauri://drag-drop")).toBe(false);
+      await act(async () => native.events.get(DOCUMENT_FILE_DROP_EVENT)!({ paths: ["/Users/me/Pictures/mol.png"], position, units, topInsetRemoved }));
       await eventually(() => expect(status()).toBe("Inserted picture mol.png"));
+      expect(pictures()).toHaveLength(1);
       expect(centre(pictures()[0]!)).toEqual({ x: 300, y: 200 });
     });
 
@@ -344,8 +400,9 @@ describe("dropping picture files on the document window", { timeout: 3 * DROP_WA
       native.files.set("C:\\Drawings\\doc.chemdraft", new TextEncoder().encode(serializeDocument(createPhase4Document("Native document"))));
       native.stat.mockImplementation(async path => ({ size: path.endsWith(".png") ? 21 * 1024 * 1024 : native.files.get(path)!.length }));
       await mount(createPhase4Document("Desktop"), "windows");
-      await eventually(() => expect(native.events.has("tauri://drag-drop")).toBe(true));
-      await act(async () => native.events.get("tauri://drag-drop")!({ paths: ["C:\\Pictures\\big.png", "C:\\Drawings\\doc.chemdraft"], position: { x: 10, y: 10 } }));
+      await eventually(() => expect(native.events.has(DOCUMENT_FILE_DROP_EVENT)).toBe(true));
+      await act(async () => native.events.get(DOCUMENT_FILE_DROP_EVENT)!({ paths: ["C:\\Pictures\\big.png", "C:\\Drawings\\doc.chemdraft"],
+        position: { x: 10, y: 10 }, units: "physical", topInsetRemoved: 0 }));
       await eventually(() => expect(status()).toBe("No pictures were inserted; Couldn't drop \"big.png\": it is 21.0 MB; a dropped picture can be at most 20.0 MB."));
       expect(snapshot().title).toBe("Native document");
     });

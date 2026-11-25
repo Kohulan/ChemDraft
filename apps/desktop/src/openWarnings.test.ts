@@ -13,6 +13,7 @@ import {
   NO_OPEN_WARNINGS_REASON,
   openWarningsHeading,
   restoreSessionWarningReports as restoreParsedSessionWarningReports,
+  statusMessageTitle,
   TOGGLE_OPEN_WARNINGS_COMMAND_ID,
   warningCountLabel,
   type OpenWarning
@@ -151,6 +152,17 @@ describe("open warnings model", () => {
     expect(fileWarningReports(open, { ...save, warnings: [] })).toEqual([open]);
     expect(fileWarningReports(undefined, save)).toEqual([save]);
     expect(fileWarningsTooltip(fileWarningReports(undefined, undefined))).toBeUndefined();
+  });
+
+  it("titles the status line with the whole status, then the file warnings, never twice", () => {
+    const warnings = "Saved table.chemdraft: 1 warning\nTable written as text and lines.";
+    const long = "Inserted picture a.png; Couldn't drop \"b.bmp\": BMP and TIFF pictures can't be dropped yet";
+    expect(statusMessageTitle(long, undefined)).toBe(long);
+    expect(statusMessageTitle(long, warnings)).toBe(`${long}\n\n${warnings}`);
+    expect(statusMessageTitle("Saved table.chemdraft: 1 warning", warnings)).toBe(warnings);
+    expect(statusMessageTitle("", warnings)).toBe(warnings);
+    expect(statusMessageTitle("  ", undefined)).toBeUndefined();
+    expect(statusMessageTitle(undefined, undefined)).toBeUndefined();
   });
 
   it("names the atom an unknown Element became, and selects it", () => {

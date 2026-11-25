@@ -1,25 +1,28 @@
 import { describe, expect, it } from "vitest";
-import { browserDropClientPoint, drawableCanvasRect, dropPagePoint, tauriDropClientPoint } from "./dropPosition";
+import { browserDropClientPoint, drawableCanvasRect, dropPagePoint, nativeDropClientPoint } from "./dropPosition";
 
-describe("tauriDropClientPoint", () => {
-  // The same pointer at CSS point (300, 150) as each platform's webview layer reports it.
-  it.each([1, 1.5, 2])("macOS reports CSS points at scale %s", (scale) => {
-    expect(tauriDropClientPoint({ x: 300, y: 150 }, "macos", scale)).toEqual({ x: 300, y: 150 });
+describe("nativeDropClientPoint", () => {
+  // The same pointer at CSS point (300, 150) as each platform's payload reports it.
+  it.each([1, 1.5, 2])("takes CSS pixels (macOS after the inset, Linux) as they are at scale %s", (scale) => {
+    expect(nativeDropClientPoint({ position: { x: 300, y: 150 }, units: "css" }, scale)).toEqual({ x: 300, y: 150 });
   });
 
-  it.each([1, 1.5, 2])("Linux reports logical pixels at scale %s", (scale) => {
-    expect(tauriDropClientPoint({ x: 300, y: 150 }, "linux", scale)).toEqual({ x: 300, y: 150 });
+  it.each([1, 1.5, 2])("divides Windows' physical client pixels by the scale %s", (scale) => {
+    expect(nativeDropClientPoint({ position: { x: 300 * scale, y: 150 * scale }, units: "physical" }, scale)).toEqual({ x: 300, y: 150 });
   });
 
-  it.each([1, 1.5, 2])("Windows reports physical client pixels at scale %s", (scale) => {
-    expect(tauriDropClientPoint({ x: 300 * scale, y: 150 * scale }, "windows", scale)).toEqual({ x: 300, y: 150 });
+  it("never applies the title-bar inset Rust has already removed", () => {
+    expect(nativeDropClientPoint({ position: { x: 300, y: 150 }, units: "css", topInsetRemoved: 28 }, 2))
+      .toEqual({ x: 300, y: 150 });
   });
 
-  it("has no point for a missing or malformed position, and ignores a bad scale", () => {
-    expect(tauriDropClientPoint(undefined, "windows", 2)).toBeUndefined();
-    expect(tauriDropClientPoint({ x: "1", y: 2 }, "macos", 1)).toBeUndefined();
-    expect(tauriDropClientPoint({ x: Number.NaN, y: 2 }, "linux", 1)).toBeUndefined();
-    expect(tauriDropClientPoint({ x: 10, y: 20 }, "windows", 0)).toEqual({ x: 10, y: 20 });
+  it("has no point for a missing or malformed position or units, and ignores a bad scale", () => {
+    expect(nativeDropClientPoint(undefined, 2)).toBeUndefined();
+    expect(nativeDropClientPoint({ position: { x: "1", y: 2 }, units: "css" }, 1)).toBeUndefined();
+    expect(nativeDropClientPoint({ position: { x: Number.NaN, y: 2 }, units: "css" }, 1)).toBeUndefined();
+    // The old `tauri://drag-drop` shape, without units, is not guessed at.
+    expect(nativeDropClientPoint({ position: { x: 10, y: 20 } }, 1)).toBeUndefined();
+    expect(nativeDropClientPoint({ position: { x: 10, y: 20 }, units: "physical" }, 0)).toEqual({ x: 10, y: 20 });
   });
 });
 

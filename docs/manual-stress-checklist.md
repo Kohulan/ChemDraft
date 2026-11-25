@@ -1983,7 +1983,13 @@ lossy and a lossless WebP, an SVG with gradients and `<use href="#id">`, a BMP, 
 - Each format: drag it from Finder / Explorer onto the page. It appears centred under the pointer,
   at its natural size, selected; the status names it. The JPEG stands upright (EXIF honoured); the
   GIF and WebP show their first frame. A picture larger than the page is shrunk to fit inside it.
-- Drop point: repeat at 50%, 100% and 400% zoom, scrolled, near each page edge (the picture is
+- Drop point: drop a small picture with a sharp centre (a crosshair PNG): the pointer's tip is the
+  picture's centre within 1-2 px, horizontally and vertically, never a title bar's height below it.
+  Check it in a normal window, in full screen (macOS: no title bar shown, then again with the title
+  bar revealed by moving the pointer to the top), after resizing the window, with the window on a
+  second display, and on macOS with a window tab bar showing (View > Show Tab Bar where offered). On
+  Windows check it with the window menu bar shown, at each display scaling. Then repeat at 50%, 100%
+  and 400% zoom, scrolled, near each page edge (the picture is
   shifted fully onto the page) and over the pasteboard beside the page and over the toolbar (it goes
   to the nearest point of the visible page). With rulers shown and the canvas scrolled, drop over a
   ruler and over each scrollbar: the picture lands just inside the drawable area, never under the
@@ -1996,6 +2002,12 @@ lossy and a lossless WebP, an SVG with gradients and `<use href="#id">`, a BMP, 
   own position on the page.
 - Mixed: drop a PNG and a `.cdxml` together. The picture lands in the current tab and the document
   opens in its own tab; the status reports both. Drop only a `.cdxml`: it opens as before.
+- Mixed drop status on both tabs: drop five pictures, a BMP and a `.cdxml` on a tab holding a
+  drawing. The new tab's status names the inserted pictures and the BMP refusal. Switch back to the
+  receiving tab: its status shows the pictures' result, never "Reading 5 dropped pictures…". Drop a
+  large picture and switch tabs while it is read: the tab you are on reports the drop's outcome, and
+  so does the receiving tab when you return. Hover a long status (several refusals) that ends in an
+  ellipsis: the tooltip shows it in full, with any file warnings on the lines after it.
 - Refusals: the BMP, TIFF, HEIC, `.svgz`, `.ai` and 20 MB+ files are refused by name with a specific
   reason, immediately (no read of the large file); the `.ai` reason names the extension only. A
   `.png` renamed from a text file is refused as not a picture. A PNG whose chunks are intact but
