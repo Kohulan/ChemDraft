@@ -1906,7 +1906,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.25.12.22-opus";
+const CURRENT_BUILD_STAMP = "11.25.13.05-opus";
 
 const NUMERIC_ENTRY_DURING_DRAG_STATUS = "Finish the current drag, then enter a value";
 
@@ -2544,6 +2544,10 @@ export function MainWindow({
   // The start document of the outermost `commitDocumentHistoryFrom` in progress: a drag's own commit
   // records from its `startDocument` and must not disarm that drag.
   const historyCommitStartRef = useRef<ChemDraftDocument | undefined>(undefined);
+  // The pointer of a drag that a foreign write disarmed (`installDocumentHistory`). Its button is
+  // still held, so hover stays off and is not re-hit until that pointer is released, exactly as it
+  // would be while the drag was armed.
+  const disarmedGesturePointerIdRef = useRef<number | undefined>(undefined);
   const artStylePreviewRef = useRef<{ startDocument: ChemDraftDocument; undoLabel: string; commandKey: string; commandId: string } | null>(null);
   const moleculeInspectorPreviewRef = useRef<{ startDocument: ChemDraftDocument; undoLabel: string; commandKey: string; commandId: string } | null>(null);
   const settlePalettePreviewRef = useRef<(reason: string) => void>(() => undefined);
@@ -3977,6 +3981,7 @@ export function MainWindow({
         if (!active) continue;
         ref.current = null;
         disarmed = true;
+        disarmedGesturePointerIdRef.current = active.pointerId;
         clearObjectTransformPreview(active.pointerId);
         releaseGesturePointer(active.pointerId);
         for (const target of [pageRef.current, canvasRegionRef.current]) {
@@ -15355,6 +15360,21 @@ export function MainWindow({
     if (activeToolState.activeKind !== "selection") keepNumericInputPreviewsRef.current();
   }, [activeToolState.activeKind]);
 
+  // A disarmed drag's pointer is held until it is released. A release outside the window may never
+  // arrive, so the next press, or a move with no button down, also ends the hold.
+  useEffect(() => {
+    const endHold = (event: globalThis.PointerEvent) => {
+      const held = disarmedGesturePointerIdRef.current;
+      if (held === undefined) return;
+      const released = event.type === "pointerdown" ||
+        (event.type === "pointermove" ? (event.buttons & 1) === 0 : event.pointerId === held);
+      if (released) disarmedGesturePointerIdRef.current = undefined;
+    };
+    const types = ["pointerup", "pointercancel", "pointerdown", "pointermove"] as const;
+    for (const type of types) window.addEventListener(type, endHold, { capture: true });
+    return () => { for (const type of types) window.removeEventListener(type, endHold, { capture: true }); };
+  }, []);
+
   // Publish which build this WINDOW is running, so it can be asked from outside instead of read off
   // the corner of the screen. Written on load, after every hot update, and whenever the window comes
   // back to the front — the three moments at which the answer can have changed.
@@ -16051,7 +16071,8 @@ export function MainWindow({
       const before = documentRef.current;
       // Check before dispatch too: a command may itself end an editor or cancel a gesture.
       const canRehit = () => !activeAtomLabelEditRef.current && !activeTextEditObjectIdRef.current &&
-        !isSnapshotSessionActive() && !selectionMarqueeRef.current && !selectionLassoRef.current &&
+        !isSnapshotSessionActive() && disarmedGesturePointerIdRef.current === undefined &&
+        !selectionMarqueeRef.current && !selectionLassoRef.current &&
         !tapeMeasureDragRef.current && !spin3dTugDragRef.current;
       const rehit = rehitAfterEdit && canRehit();
       invokeCommandRef.current(commandId);
@@ -17586,7 +17607,8 @@ export function MainWindow({
   const rederiveNativeCanvasHoverFromLastPointer = useCallback((sourceDocument: ChemDraftDocument) => {
     // Menu history navigation shares the keyboard path's editor and gesture guards.
     if (activeAtomLabelEditRef.current || activeTextEditObjectIdRef.current ||
-        isSnapshotSessionActive() || selectionMarqueeRef.current || selectionLassoRef.current ||
+        isSnapshotSessionActive() || disarmedGesturePointerIdRef.current !== undefined ||
+        selectionMarqueeRef.current || selectionLassoRef.current ||
         tapeMeasureDragRef.current || spin3dTugDragRef.current) return;
     let clientPoint = pointerInsideCanvasRef.current ? lastCanvasPointerClientPointRef.current : undefined;
     const canvas = canvasRegionRef.current;

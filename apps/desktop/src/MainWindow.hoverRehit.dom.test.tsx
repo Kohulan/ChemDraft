@@ -500,4 +500,18 @@ describe.each(["windows", "macos"] as const)("hover re-hit (%s shortcuts)", plat
     expect(resolve).not.toHaveBeenCalled();
     await pointer("pointercancel", { x: 500, y: 400 });
   });
+
+  it("re-hits again once the pointer of a gesture the undo stopped is released", async () => {
+    await mount();
+    const bond = await hoverBond();
+    await press("2");
+    await pointer("pointerdown", { x: 500, y: 400 });
+    await press("z", true);
+    expect(snapshot().hoveredNativeTarget).toBeUndefined();
+    await pointer("pointerup", { x: 500, y: 400 });
+    // No pointer move: the redo re-hits the last canvas position, over the bond.
+    await press("z", true, true);
+    expect(molecule().bonds.find(candidate => candidate.id === bond.id)!.order).toBe("double");
+    expect(snapshot().hoveredNativeTarget).toMatchObject({ kind: "bond", bondId: bond.id });
+  });
 });
