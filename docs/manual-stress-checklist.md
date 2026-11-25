@@ -609,6 +609,7 @@ default scheme, `v` selects the Select tool even over an atom. Check these on bo
 following the selected scheme — `e` over an atom applies the Et nickname in the ChemDraw scheme,
 while ChemDraft's `e` arms the eraser; charge stacking
 by hotkey and by the charge tool up to ±9 and back down to mark removal;
+hover an atom of a selected and an unselected ring and press + (Shift+= and numpad +) and then -, holding the pointer still after Shift raises the rotation handles: each charges that atom, in both schemes; with nothing hovered (including after moving off the canvas) and no atom selected, + and - pick the charge tools in the ChemDraft scheme, while with one atom selected and nothing hovered, + and - charge the selected atom (as a literal + did before);
 with **Direct electron-mark editing** off (the default), check radical/lone-pair painted-ink-only picking over
 atoms, bonds and filled rings, repeated radical/lone-pair tool placement on existing ink, and
 absence of mark resize/rotation handles.

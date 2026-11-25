@@ -30,6 +30,47 @@ export function hoverKeyFromEvent(event: Pick<KeyboardEventLike, "key" | "code" 
   return letter ? (event.shiftKey ? letter : letter.toLowerCase()) : event.key;
 }
 
+/**
+ * The hover key a Shift+= press stands for when the event reports the unshifted legend. Some macOS
+ * input paths (and automation) deliver Shift+= as key "=" with Shift held; the global chord engine
+ * folds +/= and drops Shift, but hover tables keep literal characters, so that press means "+".
+ * Only the physical Equal key with Shift alone qualifies: bare "=", numpad +, layouts that report
+ * "+" directly, and Cmd/Ctrl+= zoom are untouched.
+ *
+ * Known limitation: a layout whose Shift+Equal genuinely types "=" (for example macOS Sindhi or
+ * Cherokee-QWERTY) is treated as "+" for hover actions. Literal "=" bindings still win because the
+ * literal key is tried first.
+ */
+export function shiftedHoverKeyAlternate(
+  event: Pick<KeyboardEventLike, "key" | "code" | "shiftKey" | "ctrlKey" | "altKey" | "metaKey">
+): string | undefined {
+  return event.key === "=" && event.code === "Equal" && event.shiftKey &&
+    !event.ctrlKey && !event.altKey && !event.metaKey ? "+" : undefined;
+}
+
+/**
+ * Resolve a hover key against a hover lookup: the literal key first, then (only if that misses) the
+ * shifted alternate. Remapped or cleared bindings are respected because both go through `lookup`.
+ */
+export function resolveHoverKey<T>(
+  event: Pick<KeyboardEventLike, "key" | "code" | "shiftKey" | "ctrlKey" | "altKey" | "metaKey">,
+  lookup: (key: string) => T | undefined
+): { key: string; match: T | undefined } {
+  const key = hoverKeyFromEvent(event);
+  const match = lookup(key);
+  if (match !== undefined) return { key, match };
+  const alternate = shiftedHoverKeyAlternate(event);
+  const alternateMatch = alternate === undefined ? undefined : lookup(alternate);
+  return alternate !== undefined && alternateMatch !== undefined ? { key: alternate, match: alternateMatch } : { key, match };
+}
+
+/** The character a hover-shortcut recorder stores for a press: Shift+= is recorded as "+". */
+export function recordedHoverKeyFromEvent(
+  event: Pick<KeyboardEventLike, "key" | "code" | "shiftKey" | "ctrlKey" | "altKey" | "metaKey">
+): string {
+  return shiftedHoverKeyAlternate(event) ?? hoverKeyFromEvent(event);
+}
+
 /** Apply overrides to a hover scope while retaining literal case and punctuation. */
 export function createHoverShortcutRegistry(
   defaults: Readonly<Record<string, string>>,
