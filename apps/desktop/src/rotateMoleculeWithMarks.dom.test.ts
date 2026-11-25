@@ -19,6 +19,8 @@ import * as workflow from "./documentWorkflow";
 import { DOM_COMMAND_EVENT } from "./window-manager";
 import type { NativeElectronMarkSpec } from "./documentWorkflow";
 import { distantAttachedElectronMarkFixture, electronMarkDropFixture } from "./testSupport/electronMarkDropFixture";
+import { PRESERVE_CHEMISTRY, policyChemistryRefusals } from "./commitChemistryGuard";
+import { relayoutMolfile2D } from "@chemdraft/ocl-adapter";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 vi.mock("@scena/react-ruler", () => ({ default: () => null }));
@@ -387,5 +389,111 @@ describe.each(["macos", "windows"] as const)("Rotate molecule with the molecule'
     const alone = container.querySelector<HTMLElement>(".object-transform-input-layer")!;
     expect([alone.style.left, alone.style.top, alone.style.width, alone.style.height])
       .toEqual([layers[0].style.left, layers[0].style.top, layers[0].style.width, layers[0].style.height]);
+  });
+});
+
+// 3D clean-up (and the engine pass of 2D Clean Up) carries the cleaned molecule's marks with its
+// atoms (`carriedElectronMarkPatches`). A mark whose stale non-explicit anchor still names A but which
+// the committed resolver gives to benzene B belongs to B, as it does for Rotate Molecule: cleaning up
+// A must leave it on B. Captured by its stored anchor, it was re-anchored explicitly to A's N, and
+// the commit funnel's chemistry guard refused the clean-up as a charge moved from B to A. Opened
+// files keep stored marks (`preserveElectronMarks`), which is how this state reaches the window.
+describe("clean-up of A with a stale-anchored mark that B owns", () => {
+  it.each(markCases.slice(0, 2))("leaves the %s mark on B and passes the commit chemistry guard", (_name, spec) => {
+    const stale = staleAnchorDrawing(spec, nearBenzeneAtom);
+    expect(stale.owner?.objectId).toBe(stale.benzeneId);
+    // Bend A so the clean-up has something to fix; the stored marks are kept as an opened file keeps them.
+    const glycine = stale.document.pages[0].objects.find(object => object.id === stale.moleculeId) as MoleculeObject;
+    const before = workflow.normalizeCommittedDocument(applyPatch(stale.document, { op: "updateObject", objectId: glycine.id,
+      changes: { atoms: glycine.atoms.map((atom, index) => ({ ...atom, x: atom.x + (index % 3) * 7, y: atom.y - (index % 2) * 9 })) } },
+    { now: phase4Timestamp }), { preserveElectronMarks: true });
+    const markBefore = before.pages[0].objects.find(object => object.id === stale.markId) as ElectronMarkObject;
+    expect(markBefore.anchor).toMatchObject({ kind: "atom", objectId: stale.moleculeId });
+    expect(markBefore.atomAssociation).toBeUndefined();
+
+    const next = workflow.applyNativeMoleculeEngineRelayout(before, stale.moleculeId, relayoutMolfile2D, { warnings: [] });
+    // The commit funnel (`prepareDocumentCommit`): marks follow moved atoms, then commit normalization.
+    const after = workflow.normalizeCommittedDocument(workflow.carryElectronMarksWithMovedAtoms(before, next, PRESERVE_CHEMISTRY));
+    const cleanedA = after.pages[0].objects.find(object => object.id === stale.moleculeId) as MoleculeObject;
+    expect(cleanedA.atoms.map(atom => [atom.x, atom.y])).not.toEqual(
+      (before.pages[0].objects.find(object => object.id === stale.moleculeId) as MoleculeObject).atoms.map(atom => [atom.x, atom.y]));
+    // The commit funnel's check, as `commitChemistryRefusal` runs it for 3D clean-up.
+    expect(policyChemistryRefusals(PRESERVE_CHEMISTRY, { before, next, after,
+      normalize: workflow.committedNormalForm, markAtoms: workflow.committedElectronMarkAtoms })).toEqual([]);
+    // The mark is B's: the clean-up of A neither moves it nor re-anchors it.
+    const markNext = next.pages[0].objects.find(object => object.id === stale.markId) as ElectronMarkObject;
+    expect(markNext).toEqual(markBefore);
+    expect(workflow.committedElectronMarkAssignments(after.pages[0]).anchorByMarkId.get(stale.markId)).toEqual(stale.owner);
+  });
+});
+
+// Review claim (1.2.3): a mark lying outside its stored anchor's association radius is moved onto the
+// stored atom by the carry, a silent charge move. Clean-up carries only owned marks (above), so the
+// floating mark is not touched; the Spin 3D rule (`spin3dCarriedElectronMarks`, flatten and its
+// overlay) still prefers the stored anchor, so this checks what the carry does with it and whether
+// the commit funnel's chemistry guard refuses the edit when it does.
+describe("a floating mark still anchored to A, outside every association radius", () => {
+  it.each(markCases.slice(0, 2))("%s: clean-up leaves it; a Spin 3D carry of it is caught by the chemistry guard", (_name, spec) => {
+    const stale = staleAnchorDrawing(spec, farFromEveryAtom);
+    expect(stale.owner).toBeUndefined();
+    const before = stale.document;
+    const page = before.pages[0];
+    const glycine = page.objects.find(object => object.id === stale.moleculeId) as MoleculeObject;
+    const markBefore = page.objects.find(object => object.id === stale.markId) as ElectronMarkObject;
+    const guard = (next: ChemDraftDocument) => policyChemistryRefusals(PRESERVE_CHEMISTRY, { before, next,
+      after: workflow.normalizeCommittedDocument(workflow.carryElectronMarksWithMovedAtoms(before, next, PRESERVE_CHEMISTRY)),
+      normalize: workflow.committedNormalForm, markAtoms: workflow.committedElectronMarkAtoms });
+
+    // Clean-up (the committed owner rule): the floating mark is not carried, and the edit commits.
+    const cleaned = workflow.applyNativeMoleculeEngineRelayout(before, stale.moleculeId, relayoutMolfile2D, { warnings: [] });
+    expect(cleaned.pages[0].objects.find(object => object.id === stale.markId)).toEqual(markBefore);
+    expect(guard(cleaned)).toEqual([]);
+
+    // The Spin 3D rule carries it by its stored anchor: redraw A shifted and see where it goes.
+    const redrawn = { ...glycine, atoms: glycine.atoms.map(atom => ({ ...atom, x: atom.x + 15, y: atom.y + 10 })) };
+    const patches = workflow.carriedElectronMarkPatches(page, glycine, redrawn);
+    expect(patches.map(patch => patch.op === "updateObject" && patch.objectId)).toEqual([stale.markId]);
+    const next = applyPatches(before, [{ op: "updateObject", objectId: glycine.id, changes: { atoms: redrawn.atoms } }, ...patches],
+      { now: phase4Timestamp });
+    const carried = next.pages[0].objects.find(object => object.id === stale.markId) as ElectronMarkObject;
+    // It is made explicit on A's atom, so it would put its charge or radical there: the guard refuses.
+    expect(carried.atomAssociation).toBe("explicit");
+    expect(guard(next).length).toBeGreaterThan(0);
+  });
+});
+
+// Review claim (1.2.3, reported for 1.2.4): when a redraw leaves a mark's atom where it was but puts
+// a bond over the mark, the carry turns the mark to a clear side, and then the commit funnel's
+// `followElectronMarksWithMovedAtoms` restores every mark of a STATIONARY atom to its stored spot,
+// over the bond. Pinned as observed; 7f2322bb0 had the same restore (and its flatten kept the offset
+// with no clear-side turn at all), so this is not a regression of 1.2.3.
+describe("a stationary atom's carried mark under the commit funnel", () => {
+  it("is put back over the bond that the redraw laid across it (known, 1.2.4)", () => {
+    const { document } = markedDrawing({ kind: "charge", charge: 1 }, "none");
+    const page = document.pages[0];
+    const molecule = page.objects.find(object => object.type === "molecule") as MoleculeObject;
+    const mark = page.objects.find(object => object.type === "electron-mark") as ElectronMarkObject;
+    const atomId = (mark.anchor as { atomId: string }).atomId;
+    const atom = molecule.atoms.find(candidate => candidate.id === atomId)!;
+    const bond = molecule.bonds.find(candidate => candidate.fromAtomId === atomId || candidate.toAtomId === atomId)!;
+    const neighborId = bond.fromAtomId === atomId ? bond.toAtomId : bond.fromAtomId;
+    // Lay the neighbor along the atom -> mark direction, so the bond runs through the mark.
+    const center = workflow.nativeChargeMarkCenter(mark), atomPoint = transformPointForObject(molecule, atom);
+    const dx = center.x - atomPoint.x, dy = center.y - atomPoint.y, length = Math.hypot(dx, dy);
+    const neighbor = molecule.atoms.find(candidate => candidate.id === neighborId)!;
+    const scale = 40 / length;
+    const redrawn = { ...molecule, atoms: molecule.atoms.map(candidate => candidate.id === neighborId
+      ? { ...candidate, x: atom.x + dx * scale, y: atom.y + dy * scale } : candidate) };
+    expect(redrawn.atoms.find(candidate => candidate.id === neighborId)).not.toEqual(neighbor);
+    const patches = workflow.carriedElectronMarkPatches(page, molecule, redrawn);
+    const next = applyPatches(document, [{ op: "updateObject", objectId: molecule.id, changes: { atoms: redrawn.atoms } }, ...patches],
+      { now: phase4Timestamp });
+    const placed = next.pages[0].objects.find(object => object.id === mark.id) as ElectronMarkObject;
+    // The carry turned the mark off the bond...
+    expect([placed.x, placed.y]).not.toEqual([mark.x, mark.y]);
+    // ...and the funnel restores the stationary atom's mark to its old spot, now on the bond.
+    const followed = workflow.carryElectronMarksWithMovedAtoms(document, next, PRESERVE_CHEMISTRY);
+    const committed = followed.pages[0].objects.find(object => object.id === mark.id) as ElectronMarkObject;
+    expect([committed.x, committed.y]).toEqual([mark.x, mark.y]);
   });
 });

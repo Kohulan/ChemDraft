@@ -375,8 +375,10 @@ when it is selected, through a long drag in several directions; no box is left b
 spot. Click outside: it is committed where the overlay drew it. Then check it is still beside that O
 after typed X, Y and Z rotations of the stored model, after Interactive 3D (tug the O, click
 outside), after 3D Clean Up, in a transparent PNG/TIFF and an SVG export, and after Save As, close
-and reopen. Throughout, Copy As SMILES stays `...C(=O)[O-]` (formula unchanged), dragging the
-carboxylate O still pulls the mark, and one Undo after any of these restores the drawing and the
+and reopen. Throughout, each variant's chemistry stays its own: Copy As SMILES and the formula stay
+exactly what they were right after its mark was placed (for the `-` charge, `...C(=O)[O-]`; the
+radical dot, lone pair and radical anion each keep whatever their own copy gave then, never another
+variant's), dragging the carboxylate O still pulls the mark, and one Undo after any of these restores the drawing and the
 mark exactly as before.
 
 Marks keep off other molecules and off labels. Draw a second molecule (ethane, and separately

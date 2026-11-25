@@ -1917,7 +1917,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.25.14.20-opus";
+const CURRENT_BUILD_STAMP = "11.25.14.55-opus";
 
 const NUMERIC_ENTRY_DURING_DRAG_STATUS = "Finish the current drag, then enter a value";
 
@@ -3962,10 +3962,18 @@ export function MainWindow({
     }
     // Retained moves never install preview documents. Any install while one is active
     // replaces its source geometry, so disarm it before React updates the paint/chrome.
+    const historyMoved = !switchingTabs && (history.past !== previous.past || history.future !== previous.future);
+    const drawingChanged = history.present !== previous.present &&
+      !assistantDocumentContentUnchanged(previous.present, history.present);
     const drag = objectDragRef.current;
     if (drag && !graphicObjectIdsForCssDragPreview(drag)) {
       objectDragRef.current = null;
       objectDragMachineRef.current = initialInteractionState();
+      // A foreign history write (an undo) that stops the move holds its pointer's hover off until
+      // release, as it does for every other drag it disarms below.
+      if (historyMoved && drawingChanged && drag.startDocument !== historyCommitStartRef.current) {
+        disarmedGesturePointerIdsRef.current.add(drag.pointerId);
+      }
       clearObjectTransformPreview(drag.pointerId);
       releaseGesturePointer(drag.pointerId);
       setHoveredNativeAtom(undefined);
@@ -3982,17 +3990,25 @@ export function MainWindow({
     // dropped from history by the release, so disarm the drag. Settling a session that predates the
     // drag (a palette preview, a numeric entry, a text checkpoint) records the drawing already showing
     // and leaves the drag armed. A tab switch cleans up on its own.
-    const foreignDrags = !switchingTabs && (history.past !== previous.past || history.future !== previous.future)
+    const foreignDrags = historyMoved
       ? snapshotDragRefs.filter(ref => ref.current && ref.current.startDocument !== historyCommitStartRef.current)
       : [];
-    if (foreignDrags.length > 0 && history.present !== previous.present &&
-      !assistantDocumentContentUnchanged(previous.present, history.present)) {
+    if (foreignDrags.length > 0 && drawingChanged) {
       let disarmed = false;
       for (const ref of foreignDrags) {
         const active = ref.current;
         if (!active) continue;
         ref.current = null;
         disarmed = true;
+        // A stopped drag leaves none of its own preview painted: the freehand stroke's path and its
+        // pending frame, and the corner-radius readout.
+        if (ref === freehandArtDragRef) {
+          if (freehandArtPreviewFrameRef.current !== undefined) window.cancelAnimationFrame(freehandArtPreviewFrameRef.current);
+          freehandArtPreviewFrameRef.current = undefined;
+          resetFreehandArtPreviewPath(freehandArtPreviewPathRef.current);
+        } else if (ref === graphicCornerRadiusDragRef) {
+          setGraphicCornerRadiusReadout(undefined);
+        }
         disarmedGesturePointerIdsRef.current.add(active.pointerId);
         clearObjectTransformPreview(active.pointerId);
         releaseGesturePointer(active.pointerId);

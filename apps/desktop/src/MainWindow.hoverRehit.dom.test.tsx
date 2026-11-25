@@ -586,4 +586,34 @@ describe.each(["windows", "macos"] as const)("hover re-hit (%s shortcuts)", plat
     expect(molecule().bonds.find(candidate => candidate.id === bond.id)!.order).toBe("double");
     expect(snapshot().hoveredNativeTarget).toMatchObject({ kind: "bond", bondId: bond.id });
   });
+
+  // 1.2.3 review: an undo that stops a molecule MOVE drag holds that pointer's hover off until its
+  // release, as for every other drag an undo stops.
+  it("holds hover off for the pointer of a molecule move that an undo stopped", async () => {
+    await mount();
+    const bond = await hoverBond();
+    await press("2");
+    await act(async () => { await window.__CHEMDRAFT_AGENT__?.command("tool.select"); });
+    const from = molecule().atoms.find(atom => atom.id === bond.fromAtomId)!;
+    const to = molecule().atoms.find(atom => atom.id === bond.toAtomId)!;
+    const midpoint = { x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 };
+    const atomsBefore = molecule().atoms;
+    // Press on the molecule's own element: the whole-object move (`objectDragRef`).
+    const moleculeElement = container.querySelector(`[data-object-id="${molecule().id}"]`)!;
+    expect(moleculeElement).not.toBeNull();
+    await pointerAs("pointerdown", midpoint, { pointerId: 7, buttons: 1 }, moleculeElement);
+    await pointerAs("pointermove", { x: midpoint.x + 30, y: midpoint.y + 20 }, { pointerId: 7, buttons: 1 });
+    await pointerAs("pointermove", { x: midpoint.x + 40, y: midpoint.y + 25 }, { pointerId: 7, buttons: 1 });
+    await press("z", true);
+    expect(molecule().bonds.find(candidate => candidate.id === bond.id)!.order).toBe("single");
+    expect(molecule().atoms).toEqual(atomsBefore);
+    expect(snapshot().hoveredNativeTarget).toBeUndefined();
+    // The held button's moves over the bond set no hover until the pointer is released.
+    await pointerAs("pointermove", midpoint, { pointerId: 7, buttons: 1 });
+    expect(snapshot().hoveredNativeTarget).toBeUndefined();
+    await pointerAs("pointerup", midpoint, { pointerId: 7, buttons: 0 });
+    expect(molecule().atoms).toEqual(atomsBefore);
+    await pointerAs("pointermove", midpoint, { pointerId: 7, buttons: 0 });
+    expect(snapshot().hoveredNativeTarget).toMatchObject({ kind: "bond", bondId: bond.id });
+  });
 });

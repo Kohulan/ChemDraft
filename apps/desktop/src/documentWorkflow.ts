@@ -17855,11 +17855,16 @@ function buildNativeMoleculeEngineRelayout(
   }
 
   // The molecule's charge, radical and lone-pair marks follow their atoms to the new layout in the
-  // same patch set (one undo step), each kept at its offset or turned to a free side.
+  // same patch set (one undo step), each kept at its offset or turned to a free side. The marks
+  // carried are the ones the committed owner rule gives this molecule (`atomOwnedMarksForTransform`,
+  // as for Rotate Molecule), never a stale stored anchor: a non-explicit mark still anchored here but
+  // assigned to another molecule's atom stays with that molecule, so its chemistry cannot move.
   const page = document.pages.find(candidate => candidate.objects.includes(molecule));
+  const owned = page ? atomOwnedMarksForTransform(page.objects, molecule.id, new Set(molecule.atoms.map(atom => atom.id)))
+    .map(({ mark, atomId }) => ({ mark, atomId })) : [];
   return applyPatches(document, [
     { op: "updateObject" as const, objectId: molecule.id, changes: cleaned },
-    ...(page ? carriedElectronMarkPatches(page, molecule, cleaned) : [])
+    ...(page ? carriedElectronMarkPatches(page, molecule, cleaned, owned) : [])
   ], {
     now: phase4Timestamp
   });
@@ -20202,9 +20207,9 @@ export interface CarriedElectronMarkPlacement extends ElectronMarkCarryPlacement
 export function carriedElectronMarkPlacements(
   page: DocumentPage,
   before: MoleculeObject,
-  after: MoleculeObject
+  after: MoleculeObject,
+  entries: ReadonlyArray<{ mark: ElectronMarkObject; atomId: string }> = spin3dCarriedElectronMarks(page, before.id)
 ): Map<string, CarriedElectronMarkPlacement> {
-  const entries = spin3dCarriedElectronMarks(page, before.id);
   const placements = new Map<string, CarriedElectronMarkPlacement>();
   if (entries.length === 0) return placements;
   const marks = new Map(entries.map(({ mark }) => [mark.id, mark] as const));
@@ -20245,13 +20250,15 @@ export function spinOverlayCarriedMarkPlacements(
 }
 
 /** Patches that carry `before`'s marks to `after` (see `carriedElectronMarkPlacements`). Legacy atom
- * associations become explicit so the redrawn geometry cannot reassign a mark to a nearer atom. */
+ * associations become explicit so the redrawn geometry cannot reassign a mark to a nearer atom.
+ * `entries` are the marks to carry with their atoms (default: the Spin 3D owner rule). */
 export function carriedElectronMarkPatches(
   page: DocumentPage,
   before: MoleculeObject,
-  after: MoleculeObject
+  after: MoleculeObject,
+  entries?: ReadonlyArray<{ mark: ElectronMarkObject; atomId: string }>
 ): DocumentPatch[] {
-  return [...carriedElectronMarkPlacements(page, before, after).values()].map(({ mark, atomId, x, y, rotation }) => ({
+  return [...carriedElectronMarkPlacements(page, before, after, entries).values()].map(({ mark, atomId, x, y, rotation }) => ({
     op: "updateObject" as const, objectId: mark.id, changes: {
       x, y, ...(rotation !== mark.rotation ? { rotation } : {}), atomAssociation: "explicit" as const,
       anchor: { kind: "atom" as const, objectId: before.id, atomId }
