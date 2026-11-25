@@ -40,6 +40,10 @@ import type { storedCoordinatesMatchStereo } from "@chemdraft/ocl-adapter";
 import type { DoubleBondStereoReader } from "./interaction/doubleBondStereo";
 import { nativeDocumentExportWarnings, nativeMoleculeExportWarnings } from "@chemdraft/document-workflow-core";
 import {
+  ATOM_MAPS_NOT_KEPT_OPEN_CODE, atomMapsDroppedMessage, atomMapsNotKeptOpenWarnings, molfileAtomMapNumbers,
+  moleculeSourceHasAtomMaps, pushAtomMapsDroppedWarning
+} from "@chemdraft/document-workflow-core";
+import {
   GRAPHIC_CORNER_RADIUS_HANDLE_SIZE_PX,
   OBJECT_RESIZE_HANDLE_OFFSET_PX,
   OBJECT_RESIZE_HANDLE_SIZE_PX,
@@ -5198,6 +5202,10 @@ export function insertNativeMolfileMolecule(
   );
 }
 
+/** A pasted MOL/RXN keeps its mapped source text, but no native atom carries the maps. */
+const pastedAtomMapsNotKeptStatus =
+  "atom-map numbers are not kept yet; they will be dropped on export or when the structure is edited";
+
 export function applyClipboardPastePayload(
   document: ChemDraftDocument,
   payload: ClipboardDetectedPayload,
@@ -5257,7 +5265,8 @@ export function applyClipboardPastePayload(
         .map((warning) => ({ code: warning.code, message: warning.message })) ?? [];
       return {
         document: nextDocument,
-        status: `Pasted editable ${payload.format === "molfile-v3000" ? "MOL V3000" : "MOL V2000"} structure`,
+        status: `Pasted editable ${payload.format === "molfile-v3000" ? "MOL V3000" : "MOL V2000"} structure` +
+          (molfileAtomMapNumbers(payload.text).length ? `; ${pastedAtomMapsNotKeptStatus}` : ""),
         kind: payload.kind,
         selectedObjectId: selected?.id,
         warnings: [...payload.warnings, ...parsedWarnings]
@@ -5307,7 +5316,8 @@ export function applyClipboardPastePayload(
       ];
       return {
         document: nextDocument,
-        status: `Pasted ${molfileBlocks.length} editable RXN molecule block${molfileBlocks.length === 1 ? "" : "s"}`,
+        status: `Pasted ${molfileBlocks.length} editable RXN molecule block${molfileBlocks.length === 1 ? "" : "s"}` +
+          (molfileBlocks.some(block => molfileAtomMapNumbers(block.text).length) ? `; ${pastedAtomMapsNotKeptStatus}` : ""),
         kind: payload.kind,
         selectedObjectId: selected?.id,
         warnings: rxnWarnings
@@ -21645,8 +21655,24 @@ export function openNativeDocument(contents: string | Uint8Array): ChemDraftOpen
     : readNativeDocumentContents("", () => importCdx(contents));
   // The lone-H cache refresh runs when the read document is committed; a molecule it will keep
   // as stored (its cache is not ChemDraft's own earlier output for the drawing) is named in the open report.
-  const notRefreshed = openedLoneHydrogenCacheWarnings(result);
+  const notRefreshed = [...openedLoneHydrogenCacheWarnings(result), ...openedAtomMapWarnings(result)];
   return notRefreshed.length ? { ...result, warnings: [...result.warnings, ...notRefreshed] } : result;
+}
+
+/**
+ * Atom maps have no native field yet: a structure whose stored source still carries them (saved by
+ * an earlier build, or pasted as a mapped MOL) loses them on export or edit, so the open report
+ * says so once per candidate document, each message naming which one in a visible-layer conflict.
+ */
+function openedAtomMapWarnings(result: ChemDraftOpenResult): ReturnType<typeof atomMapsNotKeptOpenWarnings> {
+  if (result.document) return atomMapsNotKeptOpenWarnings(result.document);
+  if (!result.conflict) return [];
+  return [
+    ...atomMapsNotKeptOpenWarnings(result.conflict.embeddedDocument, embeddedCandidateSource),
+    ...(result.conflict.visibleDocument
+      ? atomMapsNotKeptOpenWarnings(result.conflict.visibleDocument, visibleCandidateSource)
+      : [])
+  ];
 }
 
 /** What begins the lone-H warnings of each candidate of a visible-layer conflict (`openedLoneHydrogenCacheWarnings`). */
@@ -21687,7 +21713,8 @@ export function openedDocumentWarnings(result: ChemDraftOpenResult, installed: C
       : undefined;
   if (discarded === undefined) return result.warnings;
   const warnings = result.warnings.filter((warning) =>
-    warning.code !== IMPLIED_RADICAL_CACHE_NOT_REFRESHED_CODE || !warning.message.startsWith(`${discarded}: `));
+    (warning.code !== IMPLIED_RADICAL_CACHE_NOT_REFRESHED_CODE && warning.code !== ATOM_MAPS_NOT_KEPT_OPEN_CODE) ||
+    !warning.message.startsWith(`${discarded}: `));
   return warnings.length === result.warnings.length ? result.warnings : warnings;
 }
 
@@ -22120,6 +22147,8 @@ export async function copyAsSmiles(document: ChemDraftDocument, warningsOut?: st
   try {
     for (const [index, molecule] of molecules.entries()) {
       const smiles = await moleculeSmiles(molecule, index, warnings, computeStructureIdentifiers);
+      // The stored-SMILES fallback writes a mapped source as it is; every other route drops the maps.
+      if (smiles !== molecule.structure) pushAtomMapsDroppedWarning(warnings, molecule, "SMILES");
       if (smiles.length > 0) parts.push(smiles);
     }
   } finally {
@@ -22190,7 +22219,9 @@ export function copyAsMolfile(
         message.startsWith(`Atom label "${atom.element}" is not an element symbol;`)
       )).map(atom => atom.element));
       return nativeMoleculeExportWarnings(molecule, { unrecognizedLabels }).map(warning => warning.message);
-    }), ...writerWarnings.filter(message => !cachedBracketMessages.has(message) && !repeatMessages.some(warning => warning.includes(message))));
+    }), ...writerWarnings.filter(message => !cachedBracketMessages.has(message) && !repeatMessages.some(warning => warning.includes(message))),
+    // The writer reads native atoms, which have no map field; say so once for the copy.
+    ...(molecules.some(moleculeSourceHasAtomMaps) ? [atomMapsDroppedMessage("MOL")] : []));
   }
 }
 

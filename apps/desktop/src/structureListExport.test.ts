@@ -8,12 +8,14 @@ import { assertMolfileExportIdentity, moleculeToInteropMolfile } from "@chemdraf
 import { molfileCoordinateScale } from "@chemdraft/layout-engine";
 import { parseMolfileGraph } from "@chemdraft/clipboard-adapter";
 import {
+  applyClipboardPastePayload,
   copyAsMolfile,
   copyAsMolfileForExport as copyAsMolfileFromWorkflow,
   createPhase4Document,
   insertNativeMolfileMolecule,
   copyAsSmiles,
   insertSmilesMoleculeGrid,
+  openNativeDocument,
   type PastedStructureDepiction
 } from "./documentWorkflow";
 import { copyAsMolfileForExport, exportStructureListSdf, exportStructureListSmi, readingOrderMolecules } from "./structureListExport";
@@ -876,4 +878,74 @@ it("normalizes differently sized SDF records independently without mutating the 
     expect(molfileCoordinateScale(graph.atoms, graph.bonds, 1.5, 22).medianBondLength).toBeCloseTo(1.5, 4);
   }
   expect(document).toEqual(before);
+});
+
+describe("atom maps in a stored source structure", () => {
+  const fixture = (name: string) => readFileSync(new URL(`../../../packages/fixtures/open-double-bonds/${name}`, import.meta.url), "utf8");
+  const opened = (name: string) => {
+    const result = openNativeDocument(fixture(name));
+    if (!result.document) throw new Error(`Expected ${name} to open`);
+    return result;
+  };
+  const mapCode = "export.atom_maps_dropped";
+
+  beforeEach(async () => {
+    const { installNodeRdkitModuleLoader } = await import("@chemdraft/rdkit-adapter/node");
+    installNodeRdkitModuleLoader();
+    const real = await vi.importActual<typeof import("@chemdraft/rdkit-adapter/identifiers")>("@chemdraft/rdkit-adapter/identifiers");
+    vi.mocked(computeStructureIdentifiers).mockImplementation(real.computeStructureIdentifiers);
+  });
+
+  it("warns on Copy As SMILES, Copy As MOL, .smi and SDF instead of dropping the maps silently", async () => {
+    const { document } = opened("atom-mapped.chemdraft");
+    const molecule = document!.pages[0]!.objects[0] as MoleculeObject;
+    const smilesWarnings: string[] = [];
+    expect(await copyAsSmiles(document!, smilesWarnings)).toBe("CC=CC");
+    expect(smilesWarnings.filter(message => message.includes("Atom-map numbers"))).toEqual([
+      "Atom-map numbers stored with this structure were dropped from the SMILES export; ChemDraft does not keep them yet."
+    ]);
+    const molWarnings: string[] = [];
+    const molfile = await copyAsMolfileForExport(document!, "v2000", molWarnings);
+    expect(molfile).toBeDefined();
+    expect(parseMolfileGraph(molfile!).atoms).toHaveLength(4);
+    expect(molWarnings.filter(message => message.includes("Atom-map numbers"))).toEqual([
+      "Atom-map numbers stored with this structure were dropped from the MOL export; ChemDraft does not keep them yet."
+    ]);
+    const smi = await exportStructureListSmi(document!);
+    expect(smi.contents).toBe("CC=CC\t1\n");
+    expect(smi.warnings.filter(warning => warning.code === mapCode)).toEqual([
+      expect.objectContaining({ objectId: molecule.id, severity: "warning", message: expect.stringContaining("SMILES export") })
+    ]);
+    const sdf = await exportStructureListSdf(document!);
+    expect(sdf.contents).toContain("> <SMILES>\nCC=CC\n");
+    // One warning covers the record: its connection table and its SMILES field.
+    expect(sdf.warnings.filter(warning => warning.code === mapCode)).toEqual([
+      expect.objectContaining({ objectId: molecule.id, severity: "warning", message: expect.stringContaining("SDF export") })
+    ]);
+  });
+
+  it("adds nothing for an unmapped structure", async () => {
+    const { document, warnings } = opened("open.json");
+    expect(warnings.map(warning => warning.code)).not.toContain("document.atom_maps_not_kept");
+    const smilesWarnings: string[] = [];
+    await copyAsSmiles(document!, smilesWarnings);
+    const molWarnings: string[] = [];
+    await copyAsMolfileForExport(document!, "v2000", molWarnings);
+    expect([...smilesWarnings, ...molWarnings].some(message => message.includes("Atom-map"))).toBe(false);
+    for (const exportList of [exportStructureListSmi, exportStructureListSdf]) {
+      expect((await exportList(document!)).warnings.map(warning => warning.code)).not.toContain(mapCode);
+    }
+  });
+
+  it("names a mapped MOL paste in its status and leaves an unmapped one unchanged", () => {
+    const molecule = opened("atom-mapped.chemdraft").document!.pages[0]!.objects[0] as MoleculeObject;
+    const paste = (text: string) => applyClipboardPastePayload(createPhase4Document(), {
+      kind: "molfile", format: "molfile-v2000", text, sourceType: "text/plain", warnings: []
+    } as Parameters<typeof applyClipboardPastePayload>[1], { x: 200, y: 200 });
+    expect(paste(molecule.structure).status).toBe("Pasted editable MOL V2000 structure; atom-map numbers are not kept yet; " +
+      "they will be dropped on export or when the structure is edited");
+    const unmapped = molecule.structure.split("\n").map(line =>
+      /^\s+-?\d+\.\d{4}\s/.test(line) ? `${line.slice(0, 60)}  0${line.slice(63)}` : line).join("\n");
+    expect(paste(unmapped).status).toBe("Pasted editable MOL V2000 structure");
+  });
 });

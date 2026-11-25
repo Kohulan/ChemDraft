@@ -27,7 +27,12 @@ describe("bond stereo commands", () => {
   it("preserves atom maps on opening a native document and refuses E/Z edits", () => {
     const opened = openNativeDocument(readFileSync(new URL(
       "../../../packages/fixtures/open-double-bonds/atom-mapped.chemdraft", import.meta.url), "utf8"));
-    expect(opened.warnings).toEqual([]);
+    // The maps stay in the stored source, but no native atom keeps them: the open report says so.
+    expect(opened.warnings).toEqual([{
+      code: "document.atom_maps_not_kept",
+      message: "ChemDraft document: 1 structure stores atom-map numbers. ChemDraft does not keep atom maps yet; " +
+        "they will be dropped on export or when the structure is edited."
+    }]);
     expect(opened.document).toBeDefined();
     const document = opened.document!;
     const molecule = document.pages[0].objects[0];

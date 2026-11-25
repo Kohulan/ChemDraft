@@ -4,7 +4,9 @@ import { depictSmilesOffThread } from "./depiction2d/client";
 import type { DepictionRequestOptions } from "@chemdraft/rdkit-adapter";
 import { SmilesIdentityEngineUnavailableError, SmilesPasteIdentityError } from "./smilesPasteIdentity";
 import { createEmptyDocument, type MoleculeObject } from "@chemdraft/chem-core";
-import { pastedStructureDepictionFromMolfile, type StructureTemplateMoleculeOptions } from "@chemdraft/document-workflow-core";
+import {
+  ATOM_MAPS_REMOVED_STATUS, pastedStructureDepictionFromMolfile, stripSmilesAtomMaps, type StructureTemplateMoleculeOptions
+} from "@chemdraft/document-workflow-core";
 import { templateMoleculeForSmiles } from "./structureTemplateInsertion";
 
 type TemplatePastePlacement = Pick<StructureTemplateMoleculeOptions, "document" | "centre" | "reservedObjectIds">;
@@ -12,6 +14,8 @@ type TemplatePastePlacement = Pick<StructureTemplateMoleculeOptions, "document" 
 export interface SmilesListPasteOptions {
   signal?: AbortSignal;
   inspectInput?: (smiles: string, signal?: AbortSignal) => Promise<void>;
+  /** Names stereo lost by removing a token's atom maps (`atomMapStereoLossStatus`). */
+  inspectAtomMapStereo?: (mapped: string, stripped: string, signal?: AbortSignal) => Promise<string | undefined>;
   templatePlacement?: TemplatePastePlacement;
 }
 
@@ -105,7 +109,7 @@ async function depictSmilesListCandidates(
   text: string,
   candidates: readonly SmilesListCandidate[],
   onProgress?: (completed: number, total: number) => void,
-  { signal, inspectInput, templatePlacement = { document: createEmptyDocument(), centre: { x: 0, y: 0 } } }: SmilesListPasteOptions = {}
+  { signal, inspectInput, inspectAtomMapStereo, templatePlacement = { document: createEmptyDocument(), centre: { x: 0, y: 0 } } }: SmilesListPasteOptions = {}
 ): Promise<SmilesListPasteResult | undefined> {
   const entries: SmilesListPasteResult["entries"] = [];
   const failures: SmilesListPasteResult["failures"] = [];
@@ -121,14 +125,17 @@ async function depictSmilesListCandidates(
   let parsedFirstTokenLines = 0;
   let openDoubleBonds = 0;
   let identityRefusals = 0;
+  let atomMapsRemoved = false;
   for (const [index, candidate] of candidates.entries()) {
     signal?.throwIfAborted();
     let parsed: Awaited<ReturnType<typeof depictSmilesForPaste>> = undefined;
     let identityRefused = false;
+    // Atom maps have no native field yet: each token is drawn, verified and stored without them.
+    const { smiles: token, removed: removedAtomMaps } = stripSmilesAtomMaps(candidate.token);
     try {
-      await inspectInput?.(candidate.token, signal);
+      await inspectInput?.(token, signal);
       signal?.throwIfAborted();
-      parsed = await depictSmilesForPaste(candidate.token, { signal, priority: "background" }, placement);
+      parsed = await depictSmilesForPaste(token, { signal, priority: "background" }, placement);
     } catch (error) {
       if (error instanceof SmilesPasteIdentityError ||
         error instanceof SmilesIdentityEngineUnavailableError) {
@@ -136,7 +143,7 @@ async function depictSmilesListCandidates(
         identityRefusals += 1;
         // The status renderer already names the token; retain the refusal's detail without
         // repeating the whole input (which can be a large host molecule).
-        const prefix = `SMILES paste refused: chemical identity could not be verified for "${candidate.token}": `;
+        const prefix = `SMILES paste refused: chemical identity could not be verified for "${token}": `;
         const detail = (error.message.startsWith(prefix) ? error.message.slice(prefix.length)
           : error.message.replace(/^SMILES paste refused:\s*/, "")).replace(/\s+/g, " ").trim();
         identityRefusalReasons.set(`${candidate.line}:${candidate.column}`,
@@ -147,11 +154,17 @@ async function depictSmilesListCandidates(
     }
     if (parsed) {
       handledTokens.add(`${candidate.line}:${candidate.column}`);
-      entries.push({ smiles: candidate.token, depiction: parsed.depiction, ...(parsed.molecule ? { molecule: parsed.molecule } : {}) });
+      entries.push({ smiles: token, depiction: parsed.depiction, ...(parsed.molecule ? { molecule: parsed.molecule } : {}) });
       const count = parsed.depiction.bonds.filter(bond => bond.stereo === "either").length;
       openDoubleBonds += count;
       warnings.push(...(parsed.warnings ?? []).filter(warning => warning !== unspecifiedDoubleBondNotice(count))
         .map((warning) => `${candidate.token}: ${warning}`));
+      if (removedAtomMaps) {
+        atomMapsRemoved = true;
+        const stereoLoss = await inspectAtomMapStereo?.(candidate.token, token, signal);
+        signal?.throwIfAborted();
+        if (stereoLoss) warnings.push(`${candidate.token}: ${stereoLoss}`);
+      }
     }
     if ((parsed || identityRefused) && candidate.column === firstTokenColumns.get(candidate.line)) {
       parsedFirstTokenLines += 1;
@@ -168,6 +181,7 @@ async function depictSmilesListCandidates(
     candidates: tokens.length, parsed: entries.length + identityRefusals, lineCount, parsedFirstTokenLines
   })) {
     if (openDoubleBonds) warnings.push(unspecifiedDoubleBondNotice(openDoubleBonds));
+    if (atomMapsRemoved) warnings.push(ATOM_MAPS_REMOVED_STATUS);
     const skippedItems = tokens.filter(token => !handledTokens.has(`${token.line}:${token.column}`)
       || identityRefusalReasons.has(`${token.line}:${token.column}`))
       .map(({ line, column, token }) => ({ line, token,

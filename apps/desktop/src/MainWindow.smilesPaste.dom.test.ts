@@ -347,6 +347,49 @@ describe("MainWindow SMILES paste", () => {
     expect(container.querySelectorAll(".text-object")).toHaveLength(0);
   }, 20_000);
 
+  function pastedMolecules() {
+    return getAssistantHistoryPort().read("initial")!.pages[0]!.objects.flatMap(object => object.type === "molecule" ? [object] : []);
+  }
+  const mapsRemoved = "Atom-map numbers removed; ChemDraft does not keep them yet.";
+
+  it.each([
+    ["[CH3:1]/[CH:2]=[CH:3]/[CH3:4]", "[CH3]/[CH]=[CH]/[CH3]"],
+    ["[CH3:1][C:2](=[O:3])[OH:4]", "[CH3][C](=[O])[OH]"]
+  ])("pastes the atom-mapped SMILES %s without its maps and says so", async (mapped, stripped) => {
+    const status = await paste(mapped, "text/plain", mapsRemoved);
+    expect(status).toMatch(/^Pasted SMILES structure — 4 atoms/);
+    expect(status!.split(mapsRemoved)).toHaveLength(2);
+    expect(status).not.toContain("refused");
+    const molecules = pastedMolecules();
+    expect(molecules).toHaveLength(1);
+    expect(molecules[0]!.structure).not.toMatch(/:\d+\]/);
+    expect(molecules[0]!.compatibility?.unknown).toEqual({ smiles: stripped });
+    expect(container.querySelectorAll(".text-object")).toHaveLength(0);
+  }, 20_000);
+
+  it("says when removing the maps leaves a centre without stereo", async () => {
+    const status = await paste("[CH3:1][C@:2]([CH3:3])(F)Cl", "text/plain", mapsRemoved);
+    expect(status).toContain("Without atom-map numbers, 1 stereocenter in the pasted SMILES is no longer stereogenic and was drawn without stereo");
+    expect(pastedMolecules()).toHaveLength(1);
+  }, 20_000);
+
+  it("leaves the status of an unmapped paste unchanged", async () => {
+    const status = await paste("CC(=O)O", "text/plain", "Pasted SMILES structure");
+    expect(status).toBe("Pasted SMILES structure — 4 atoms");
+  }, 20_000);
+
+  it("pastes a list of mapped tokens without maps and says so once", async () => {
+    const status = await paste("[CH3:1][OH:2]\n[CH3:1][C:2](=[O:3])[OH:4]\nCCN", "text/plain", mapsRemoved);
+    expect(status).toContain("Pasted 3 SMILES structures");
+    expect(status!.split(mapsRemoved)).toHaveLength(2);
+    expect(status).not.toContain("failed");
+    const molecules = pastedMolecules();
+    expect(molecules).toHaveLength(3);
+    expect(molecules.map(molecule => molecule.compatibility?.unknown?.smiles).sort())
+      .toEqual(["CCN", "[CH3][C](=[O])[OH]", "[CH3][OH]"]);
+    for (const molecule of molecules) expect(molecule.structure).not.toMatch(/:\d+\]/);
+  }, 20_000);
+
   it("names the skipped line for C1CC while placing the other list entries", async () => {
     const status = await paste("CCO\nC1CC\nCCN\nCCC", "text/plain", "skipped line 2: 'C1CC' (not valid SMILES)");
     expect(status).not.toContain("failed");
