@@ -223,6 +223,7 @@ import {
   reconcileRingDoubleBondSides,
   smallestRingAtomIdsByBondId,
   defaultMechanismArrowControls,
+  hydrogenCountElement,
   mechanismArrowGeometry,
   nativeBondOrderResolution,
   nativeGroupLabelDisplay,
@@ -8602,14 +8603,16 @@ function earlierLoneHydrogenReadings(derived: MoleculeObject): LoneHydrogenCache
 }
 
 /**
- * Whether the H2 reading (863c8f229 until e7ef3bc68) gave `atom` a hydrogen of its own: an H, D or T
- * that is not a typed literal, neutral, carries no radical mark and states no count of its own
+ * Whether the H2 reading (863c8f229 until e7ef3bc68) gave `atom` a hydrogen of its own: a hydrogen
+ * atom as that era's writer told one, by layout-engine's `hydrogenCountElement` (H for any label the
+ * writer's element normalization folds to H, a stored "h" included, and for D and T), that is not a
+ * typed literal, neutral, carries no radical mark and states no count of its own
  * (`atomStatedHydrogenCount`), with no covalent bond: its bonds, if any, are all dative, which cost
  * it no valence (layout-engine's `nativeBondValenceContribution`). Its derived count was then
  * hydrogen's valence of 1. Every lone hydrogen atom (`atomImpliedRadicalCount`) is one.
  */
 function h2ReadingHydrogenCarrier(atom: MoleculeAtom, bonds: readonly MoleculeBond[]): boolean {
-  if (atom.element !== "H" && atom.element !== "D" && atom.element !== "T") return false;
+  if (hydrogenCountElement(atom) !== "H") return false;
   if (atom.labelLiteral === true || atom.formalCharge !== 0 || (atom.markRadicals ?? 0) !== 0) return false;
   if (atomStatedHydrogenCount(atom, bonds) !== undefined) return false;
   return bonds.every((bond) => (bond.fromAtomId !== atom.id && bond.toAtomId !== atom.id) || isDativeBond(bond));

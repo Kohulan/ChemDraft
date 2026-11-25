@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createEmptyDocument, moleculeToMolfileV2000, type MoleculeAtom, type MoleculeBond, type MoleculeObject } from "@chemdraft/chem-core";
+import { createEmptyDocument, moleculeToMolfileV2000, moleculeToMolfileV3000, type MoleculeAtom, type MoleculeBond, type MoleculeObject } from "@chemdraft/chem-core";
 import { ProposedDocumentPatchSchema } from "@chemdraft/plugin-api";
 import { rebasePluginPatch } from "@chemdraft/plugin-host";
 import { normalizeCommittedDocument, refreshNativeSingleBondGraph, type ImpliedRadicalRefreshTarget } from "../documentWorkflow";
@@ -300,7 +300,9 @@ describe("verifying a plugin insert of a lone H's cache", () => {
   }, 60_000);
 
   it.each([
-    ["a doublet on a carbon instead of the H", "M  RAD  1   1   2", /stored structure doesn't match the drawn atoms/],
+    // A doublet is accepted only on a lone hydrogen atom of the CTAB, so one on a carbon is refused as
+    // an annotation the graph writer cannot verify, before RDKit's reading is compared.
+    ["a doublet on a carbon instead of the H", "M  RAD  1   1   2", /stored structure carries annotations that can't be checked/],
     ["a triplet on the H (its spin cannot be checked)", "M  RAD  1   3   3", /stored structure carries annotations that can't be checked/]
   ])("refuses an M  RAD molfile with %s", async (_what, radicals, refusal) => {
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
@@ -308,6 +310,41 @@ describe("verifying a plugin insert of a lone H's cache", () => {
     expect(inserted().structure).toContain(radicals);
     expect(verified).toBeDefined();
     await expect(verified!).rejects.toThrow(refusal);
+  }, 60_000);
+
+  // The same molecule as a V3000 molfile (with the writer's own VAL=-1 on the lone H), with `edit`
+  // applied to the writer's text.
+  const radicalCtabV3000 = (edit: (molfile: string) => string) => {
+    const drawn = ethane("CC.[H]");
+    const molfile = edit(moleculeToMolfileV3000(drawn, { kekuleBondOrders: new Map() }).contents);
+    return { ...drawn, ...refreshedAt123(drawn), structureFormat: "molfile-v3000" as const, structure: molfile };
+  };
+
+  it("keeps a V3000 molfile with RAD=2 on the lone H's atom line, with no warning, and the verifier accepts it", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const stored = radicalCtabV3000((molfile) => molfile.replace(/^(M {2}V30 3 H .*)$/m, "$1 RAD=2"));
+    expect(stored.structure).toMatch(/^M {2}V30 3 H .* RAD=2$/m);
+    const { applied, inserted, normalized, verified } = verify(stored, false);
+    expect(applied.warnings).toEqual([]);
+    expect(cacheOf(inserted())).toEqual(cacheOf(stored));
+    const document = (await verified) ?? normalized;
+    const kept = document.pages[0]!.objects.find((candidate): candidate is MoleculeObject => candidate.type === "molecule")!;
+    expect(kept.chemistry?.radicalCount).toBe(1);
+    expect(warn).not.toHaveBeenCalled();
+  }, 60_000);
+
+  it.each([
+    // RDKit reads no radical from a bond line, so the RAD=2 there states nothing it can check.
+    ["RAD=2 on the C-C bond line", (molfile: string) => molfile.replace(/^(M {2}V30 1 1 1 2)$/m, "$1 RAD=2"), /M {2}V30 1 1 1 2 RAD=2$/m],
+    ["RAD=2 on a carbon's atom line", (molfile: string) => molfile.replace(/^(M {2}V30 1 C .*)$/m, "$1 RAD=2"), /M {2}V30 1 C .* RAD=2$/m]
+  ])("refuses a V3000 molfile with %s as an annotation it can't check", async (_what, edit, written) => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const stored = radicalCtabV3000(edit);
+    expect(stored.structure).toMatch(written);
+    const { inserted, verified } = verify(stored, false);
+    expect(inserted().structure).toBe(stored.structure);
+    expect(verified).toBeDefined();
+    await expect(verified!).rejects.toThrow(/stored structure carries annotations that can't be checked/);
   }, 60_000);
 
   // (The commit's verification then refuses any dative bond, which a V2000 molfile cannot carry; only

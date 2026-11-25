@@ -129,6 +129,20 @@ const dativeBonds = [bond("coord", "d", "fe", "single", { bondStyle: "dashed" })
 const dativeH2 = record("H3DFe", 60.883, 60.97251, 3, 1, { isotopeLabels: ["2H"] });
 const dative = (id: string, structure: string, chemistry: MoleculeObject["chemistry"]) =>
   moleculeOf(id, dativeAtoms, dativeBonds, "smiles", structure, chemistry);
+// The same, with a second Fe bearing a dative H stored as lowercase "h", which the native writer folds
+// to H (layout-engine's `hydrogenCountElement`). Native: "[2H][Fe].[Fe][H].[H]", H2DFe2. The H2 reading
+// gave the "h" a hydrogen too: "[2HH][Fe].[Fe][HH].[HH]", H5DFe2.
+const lowercaseAtoms = [...dativeAtoms, atom("fe2", "Fe", 15, 30), atom("hl", "h", 0, 30)];
+const lowercaseBonds = [...dativeBonds, bond("coord2", "hl", "fe2", "single", { bondStyle: "dashed" })];
+const lowercase = (id: string, structure: string, chemistry: MoleculeObject["chemistry"]) =>
+  moleculeOf(id, lowercaseAtoms, lowercaseBonds, "smiles", structure, chemistry);
+/** The record the native writer derives for the lowercase drawing with a hydrogen partnered to each of `partnered`. */
+const lowercasePartneredRecord = (partnered: string[]) => {
+  const derived = workflow.refreshNativeSingleBondGraph(lowercase("p", "", undefined),
+    [...lowercaseAtoms, ...partnered.map((id, index) => atom(`partner${index}`, "H", 70 + index * 10))],
+    [...lowercaseBonds, ...partnered.map((id, index) => bond(`pair${index}`, id, `partner${index}`))]);
+  return { ...derived.chemistry!, atomCount: lowercaseAtoms.length, bondCount: lowercaseBonds.length };
+};
 
 /** A V2000 molfile of C, F, Cl, Br and a lone H, as RDKit writes one (the lone H with no valence field: H2). */
 const haloV2000 = [
@@ -272,6 +286,25 @@ describe("a lone H's stale cache that is ChemDraft's own earlier output is refre
     expect(warn).not.toHaveBeenCalled();
   });
 
+  it("refreshes a dative Fe–h stored as lowercase \"h\" as the H2 reading stored it ([2HH][Fe].[Fe][HH].[HH], H5DFe2)", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const h2 = lowercasePartneredRecord(["d", "lone", "hl"]);
+    expect(h2.formula).toBe("H5DFe2");
+    const stored = lowercase("lowercase", "[2HH][Fe].[Fe][HH].[HH]", h2);
+    const expected = refreshedAt123(stored);
+    expect(expected.structure).toBe("[2H][Fe].[Fe][H].[H]");
+    expect(expected.chemistry?.formula).toBe("H2DFe2");
+    for (const [occasion, read] of [["open", openRead], ["session restore", restoreRead]] as const) {
+      const result = read([stored]);
+      expect(declinedOf(result.warnings), occasion).toEqual([]);
+      expect(cacheOf(molecules(committed(result))[0]!), occasion).toBe(cacheOf(expected));
+    }
+    const warningsOut: string[] = [];
+    expect(cacheOf(molecules(pasted([stored], warningsOut))[0]!)).toBe(cacheOf(expected));
+    expect(warningsOut).toEqual([]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
   it("refreshes the same dative drawing under the bare-atom reading ([2H][Fe].[H], no radical): the dative D read then as now", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const today = refreshedAt123(dative("bare", "", undefined));
@@ -327,6 +360,13 @@ describe("a lone H's cache that is not ChemDraft's own earlier output is kept as
         [...dativeBonds, bond("pair", "lone", "partner")]);
       expect(partnered.chemistry?.formula).toBe("H2DFe");
       return dative("mixed", "[2H][Fe].[HH]", { ...partnered.chemistry!, atomCount: 3, bondCount: 1 });
+    }],
+    // The lowercase "h" read as today while the D and the lone H read as H2 (H4DFe2): the H2-era writer
+    // folded "h" to H and gave it a hydrogen too, so no writer ever emitted this.
+    ["a mixed-era cache whose dative \"h\" reads as today ([2HH][Fe].[Fe][H].[HH], H4DFe2)", () => {
+      const mixed = lowercasePartneredRecord(["d", "lone"]);
+      expect(mixed.formula).toBe("H4DFe2");
+      return lowercase("mixedh", "[2HH][Fe].[Fe][H].[HH]", mixed);
     }],
     // Today's structure and record, but a cached copy of other chemistry: not a no-op, and no era's output.
     ["a cached copy of other chemistry (COC.[HH]) beside today's structure and record",
