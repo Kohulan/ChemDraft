@@ -72,8 +72,9 @@ const idOf = (record: unknown): string | undefined => {
  * 1. Objects. Every later same-page duplicate of an object id gets a fresh id; the first object with
  *    an id keeps it. Object ids are page-scoped (plugin-host pageObjects.ts): the same id on two
  *    different pages is two legitimate objects and is left alone. New ids follow the
- *    {@link nextObjectId} scheme, prefixed with the duplicated id, so they are unique across the
- *    whole document.
+ *    {@link nextObjectId} scheme, prefixed with the duplicated id, counting from the distinct object-id
+ *    count and skipping every string anywhere in the file, so they are unique across the whole
+ *    document and never capture a dangling reference (one naming an object that does not exist).
  * 2. Atoms and bonds. Inside one molecule, every later atom repeating an atom id, and every later
  *    bond repeating a bond id, gets `<id>_<n>` from a per-id counter starting at 2, skipping every
  *    string anywhere in the file (so it can neither collide with an id nor capture a dangling
@@ -101,14 +102,14 @@ export function renumberDuplicatePageObjectIds(root: unknown): RenumberedId[] {
   const pages = ownNativeValue(root, "pages");
   if (!Array.isArray(pages)) return [];
   const renumbered: RenumberedId[] = [];
-  renumberPageObjects(pages, renumbered);
+  renumberPageObjects(root, pages, renumbered);
   renumberMoleculeItems(root, pages, renumbered);
   return renumbered;
 }
 
-function renumberPageObjects(pages: readonly unknown[], renumbered: RenumberedId[]): void {
-  // Every object id on every page, which is what nextObjectId counts and skips.
-  const taken = new Set<string>();
+function renumberPageObjects(root: unknown, pages: readonly unknown[], renumbered: RenumberedId[]): void {
+  // Every object id on every page, which is what nextObjectId counts (to pick its starting index).
+  const objectIds = new Set<string>();
   let repeated = false;
   for (const page of pages) {
     const seen = new Set<string>();
@@ -117,12 +118,16 @@ function renumberPageObjects(pages: readonly unknown[], renumbered: RenumberedId
       if (id === undefined) continue;
       if (seen.has(id)) repeated = true;
       else seen.add(id);
-      taken.add(id);
+      objectIds.add(id);
     }
   }
   if (!repeated) return;
 
-  const allocate = objectIdAllocator(taken);
+  // Skip every string in the file, not just object ids: a new id equal to a dangling reference (a
+  // reaction component, group child, anchor, bracket member, selection entry... naming an object that
+  // does not exist) would silently make the renamed copy that reference's target. Object ids are
+  // strings in the file, so this also covers what nextObjectId skips. Counting is unchanged.
+  const allocate = objectIdAllocator(objectIds.size, fileStrings(root));
   pages.forEach((page, pageIndex) => {
     const seen = new Set<string>();
     objectsOf(page).forEach((object, objectIndex) => {
@@ -205,17 +210,19 @@ function objectIdWithIndex(prefix: string, index: number): string {
 
 /**
  * {@link nextObjectId} for a run of renumberings over one document, without rebuilding its id set per
- * call. `taken` is every object id in the document and is extended with each id issued.
+ * call. `distinct` is the number of distinct object ids in the document; `taken` holds every object id
+ * plus every other string to avoid (passed to nextObjectId as `reserved`) and is extended with each id
+ * issued.
  *
- * Same results as calling nextObjectId on the live document each time: the k-th call (1-based) starts
- * at `taken0 + k` (the distinct count has grown by one per issued id) and skips taken ids. When this
- * prefix was last issued at index `r` by call k' < k, every index in [taken0 + k', r] was taken then and
- * still is, and taken0 + k > taken0 + k', so starting at max(taken0 + k, r + 1) skips only taken ids.
+ * Same results as calling nextObjectId(live document, prefix, reserved) each time: the k-th call
+ * (1-based) starts at `distinct + k` (the distinct count has grown by one per issued id) and skips
+ * taken ids. When this prefix was last issued at index `r` by call k' < k, every index in
+ * [distinct + k', r] was taken then and still is, and distinct + k > distinct + k', so starting at
+ * max(distinct + k, r + 1) skips only taken ids.
  * Each probe that fails moves the prefix's counter past an id that is taken, and a string is
  * `<prefix>_<padded index>` for at most one (prefix, index), so failed probes total at most |taken|.
  */
-function objectIdAllocator(taken: Set<string>): (prefix: string) => string {
-  const distinct = taken.size;
+function objectIdAllocator(distinct: number, taken: Set<string>): (prefix: string) => string {
   let issued = 0;
   const lastIndex = new Map<string, number>();
   return (prefix) => {
