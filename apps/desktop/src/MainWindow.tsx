@@ -65,7 +65,7 @@ import { loadAskToSaveBeforeQuit } from "./quitSettings";
 import { loadStartWithFreshDocument } from "./startupSettings";
 import { nativePrompt, useNativePrompt } from "./nativePrompt";
 import { collapseRepeatedFileExtension, DOCUMENT_SAVE_EXTENSIONS, type RepeatedExtensionSaveTarget } from "./repeatedSaveExtension";
-import { resolveNativeSavePanelPath, resolveNativeSavePanelTarget, writeNativeSavePanelGrant } from "./nativeSavePanelPath";
+import { resolveNativeAppendedExtensionPath, resolveNativeSavePanelPath, resolveNativeSavePanelTarget, writeNativeSavePanelGrant } from "./nativeSavePanelPath";
 import { notifyNativeDocumentCompatibility } from "./nativeDocumentNotice";
 import {
   formatDocumentOpenBatchStatus, formatDocumentOpenDropOutcome, formatDocumentOpenFailure, listenAndDrainNativeOpenQueue, type DocumentOpenResult
@@ -1917,7 +1917,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.25.15.20-opus";
+const CURRENT_BUILD_STAMP = "11.25.15.30-opus";
 
 const NUMERIC_ENTRY_DURING_DRAG_STATUS = "Finish the current drag, then enter a value";
 
@@ -12324,9 +12324,14 @@ export function MainWindow({
       const restoreNotice = restoredSavePathNotice(savingFileState);
       if (restoreNotice) setStatus(restoreNotice);
       let path = forceSaveAs || restoreNotice ? undefined : savingFileState.path;
-      if (!path) path = await pickNativeSavePath(savingFileState.path ?? payload.filename,
-        restoreNotice ? { title: "Save As — restored file unavailable", extension: "chemdraft" } : undefined,
-        savingFileState.path, shortcutPlatform);
+      if (!path) {
+        const picked = await pickNativeSavePath(savingFileState.path ?? payload.filename,
+          restoreNotice ? { title: "Save As — restored file unavailable", extension: "chemdraft" } : undefined,
+          savingFileState.path, shortcutPlatform);
+        // The panel asked only about the name as typed; confirm replacing `name.chemdraft`.
+        path = picked && await resolveNativeAppendedExtensionPath(picked, ensureChemDraftFileExtension(picked),
+          { ownPath: savingFileState.path, platform: shortcutPlatform });
+      }
       if (!path) {
         const canceled = `${restoreNotice ? `${restoreNotice} ` : ""}Save canceled. The tab is still open.`;
         if (savingTabId === activeDocumentTabIdRef.current) setStatus(restoreNotice ? canceled : "Save canceled");
@@ -35609,7 +35614,7 @@ async function pickNativeMoleculeTemplateSavePath(defaultPath: string): Promise<
     filters: [{ name: "Drawn Structure Settings Template", extensions: ["template"] }]
   });
   const resolved = selected ? await resolveNativeSavePanelPath(selected, ["template"]) : undefined;
-  return resolved ? ensureExportFileExtension(resolved, ["template"]) : undefined;
+  return resolved ? resolveNativeAppendedExtensionPath(resolved, ensureExportFileExtension(resolved, ["template"])) : undefined;
 }
 
 type TauriDialogModule = typeof import("./nativeFileDialog");
