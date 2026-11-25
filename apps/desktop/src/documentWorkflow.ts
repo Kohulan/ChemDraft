@@ -20255,6 +20255,32 @@ export function singleMoleculeSelection(
   document: ChemDraftDocument,
   nativePartHostObjectIds: readonly string[] = []
 ): SingleMoleculeSelection {
+  return foldCarriedMarksIntoMolecule(document, nativePartHostObjectIds,
+    (page, moleculeId) => spin3dCarriedElectronMarks(page, moleculeId).map(({ mark }) => mark.id));
+}
+
+/**
+ * The selection as a 2D molecule transform (Rotate Molecule, its angle box) reads it: one molecule
+ * plus only marks the transform cascade carries rigidly with it. The carried marks are exactly the
+ * ones `atomOwnedMarksForTransform` gives the molecule, the rule the rotation itself moves marks by:
+ * a non-explicit charge or radical mark by its committed assignment (never a stale stored anchor),
+ * and an explicit anchor only when it names one of the molecule's live atoms. So a selection is
+ * folded into the molecule exactly when every selected mark will turn with it.
+ */
+export function singleMoleculeTransformSelection(document: ChemDraftDocument): SingleMoleculeSelection {
+  return foldCarriedMarksIntoMolecule(document, [], (page, moleculeId) => {
+    const molecule = page.objects.find(object => object.id === moleculeId);
+    if (molecule?.type !== "molecule") return [];
+    const atomIds = new Set(molecule.atoms.map(atom => atom.id));
+    return atomOwnedMarksForTransform(page.objects, moleculeId, atomIds).map(({ mark }) => mark.id);
+  });
+}
+
+function foldCarriedMarksIntoMolecule(
+  document: ChemDraftDocument,
+  nativePartHostObjectIds: readonly string[],
+  carriedMarkIds: (page: DocumentPage, moleculeId: string) => readonly string[]
+): SingleMoleculeSelection {
   const objectIds = [...new Set([...document.selection.objectIds, ...nativePartHostObjectIds])];
   const page = document.pages.find(candidate => candidate.id === document.selection.pageId) ?? document.pages[0];
   const unchanged = { objectIds, uncarriedMarkIds: [] };
@@ -20264,7 +20290,7 @@ export function singleMoleculeSelection(
   const others = objectIds.filter(id => !markIds.includes(id));
   if (markIds.length === 0 || others.length !== 1 || objectById.get(others[0]!)?.type !== "molecule") return unchanged;
   const moleculeId = others[0]!;
-  const carried = new Set(spin3dCarriedElectronMarks(page, moleculeId).map(({ mark }) => mark.id));
+  const carried = new Set(carriedMarkIds(page, moleculeId));
   const uncarriedMarkIds = markIds.filter(id => !carried.has(id));
   return uncarriedMarkIds.length > 0 ? { objectIds, uncarriedMarkIds } : { objectIds: [moleculeId], uncarriedMarkIds: [] };
 }

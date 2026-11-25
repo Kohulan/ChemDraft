@@ -739,6 +739,7 @@ import {
   moveNativeMoleculeParts,
   moleculeFrameDelta,
   singleMoleculeSelection,
+  singleMoleculeTransformSelection,
   spin3dCarriedElectronMarks,
   carriedElectronMarkPlacements,
   type CarriedElectronMarkPlacement,
@@ -1908,7 +1909,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.25.13.15-opus";
+const CURRENT_BUILD_STAMP = "11.25.13.45-opus";
 
 const NUMERIC_ENTRY_DURING_DRAG_STATUS = "Finish the current drag, then enter a value";
 
@@ -13445,9 +13446,11 @@ export function MainWindow({
 
         if (action.id === "layout.rotateMolecule") {
           const current = documentRef.current;
-          const objectId = current.selection.objectIds[0];
+          // The molecule's own marks may be selected with it, when the rotation carries every one of them.
+          const rotationIds = singleMoleculeTransformSelection(current).objectIds;
+          const objectId = rotationIds[0];
           const object = objectId ? findDocumentObject(current, objectId) : undefined;
-          if (current.selection.objectIds.length !== 1 || object?.type !== "molecule" ||
+          if (rotationIds.length !== 1 || object?.type !== "molecule" ||
             !isNativeMoleculeGraph(object) || selectedNativeMoleculePart) {
             setStatus("Select one whole molecule to rotate");
             return;
@@ -31047,6 +31050,16 @@ function DocumentObjectViewContent({
         width: `calc(${transformFrame.width}px * var(--page-scale))`,
         height: `calc(${transformFrame.height}px * var(--page-scale))`
       } as CSSProperties : undefined;
+      // A molecule selected with its own marks shows the group frame, yet Rotate Molecule turns it as
+      // one molecule (`singleMoleculeTransformSelection`): its angle entry still opens on the molecule's frame.
+      const entryFrame = transformFrame ?? (rotationInput && selected && inGroupSelection && transformHandlesEnabled &&
+        hasVisibleSelectionTargets ? moleculeTransformFrameForSelection(object, undefined, selectedAtomIds) : undefined);
+      const entryFrameStyle = entryFrame === transformFrame ? transformFrameStyle : entryFrame ? {
+        left: `calc(${entryFrame.x}px * var(--page-scale))`,
+        top: `calc(${entryFrame.y}px * var(--page-scale))`,
+        width: `calc(${entryFrame.width}px * var(--page-scale))`,
+        height: `calc(${entryFrame.height}px * var(--page-scale))`
+      } as CSSProperties : undefined;
       const selectionBlob = selectedBondIds.size > 0 || selectedAtomIds.size > 0 ? (
         <g
           className={[
@@ -31348,11 +31361,11 @@ function DocumentObjectViewContent({
               ) : null}
             </div>
           ) : null}
-          {transformFrame && (rotationInput || resizeInput) ? (
+          {entryFrame && (rotationInput || resizeInput) ? (
             <div
               className="object-transform-input-layer"
               data-has-tilt3d={canProjectedPlaneTilt ? "true" : undefined}
-              style={transformFrameStyle}
+              style={entryFrameStyle}
             >
               {rotationInput ? (
                 <RotationInputPopover
