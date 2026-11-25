@@ -1,5 +1,10 @@
 # ChemDraft Desktop
 
+The Main toolbar has a customizable Document Zoom widget: Zoom Out/In plus 25%, 50%, 75%, 100%,
+200% and 400% presets. Buttons use predictable intermediate stops including 125% and 150%; wheel
+and pinch remain smooth. Toolbar zoom preserves the visible workspace center and changes only
+the view. Older custom layouts can add Document Zoom from the customization gallery.
+
 Preferences includes “Ask to save unsaved changes before quitting”, off by default.
 When enabled, quitting with dirty tabs offers Save / Don't Save / Cancel in a native message
 box, with an accessible in-window fallback if the native box cannot open. Save writes every
