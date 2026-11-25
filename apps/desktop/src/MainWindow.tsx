@@ -741,7 +741,7 @@ import {
   singleMoleculeSelection,
   singleMoleculeTransformSelection,
   spin3dCarriedElectronMarks,
-  carriedElectronMarkPlacements,
+  spinOverlayCarriedMarkPlacements,
   type CarriedElectronMarkPlacement,
   uncarriedMarksRefusal,
   findForeignNativeMoleculeBondTarget,
@@ -1909,7 +1909,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.25.13.45-opus";
+const CURRENT_BUILD_STAMP = "11.25.14.10-opus";
 
 const NUMERIC_ENTRY_DURING_DRAG_STATUS = "Finish the current drag, then enter a value";
 
@@ -23755,12 +23755,12 @@ export function MainWindow({
   const spinCarriedMarkIds = useMemo(() => spinCarriedMarks.length > 0
     ? new Set(spinCarriedMarks.map(mark => mark.markId)) : undefined, [spinCarriedMarks]);
   // The same placement flatten commits (offset kept, or turned to a free side; layout-engine's
-  // carryElectronMarksToRedrawnMolecule), read for the projected atoms of each frame. The overlay
-  // draws the molecule unrotated, so the marks are placed in that frame too.
+  // carryElectronMarksToRedrawnMolecule), read for the projected atoms of each frame in the frame
+  // flatten commits them in, the molecule's own rotation included: each mark is painted at the page
+  // position release stores it at (spinOverlayCarriedMarkPlacements).
   const spinSourceMolecule = activeSpin3dState?.sourceMolecule;
   const placeSpinCarriedMarks = useMemo(() => spinSourceMolecule && spinCarriedMarks.length > 0
-    ? (atoms: readonly MoleculeAtom[]) =>
-        carriedElectronMarkPlacements(activePage, spinSourceMolecule, { ...spinSourceMolecule, atoms, rotation: 0 })
+    ? (atoms: MoleculeAtom[]) => spinOverlayCarriedMarkPlacements(activePage, spinSourceMolecule, atoms)
     : undefined, [activePage, spinSourceMolecule, spinCarriedMarks.length]);
 
   // The browser build has no native OS menu, so it renders the shared app-menu model in-viewport.
@@ -27636,8 +27636,8 @@ function SpinOverlay({
   state: Spin3dState;
   /** Charge/radical marks that follow their atoms through the spin. */
   carriedMarks?: readonly SpinCarriedMark[];
-  /** Where the carried marks go for the projected atoms: `carriedElectronMarkPlacements`, as flatten commits them. */
-  placeCarriedMarks?: (atoms: readonly MoleculeAtom[]) => ReadonlyMap<string, CarriedElectronMarkPlacement>;
+  /** Where the carried marks go for the projected atoms: `spinOverlayCarriedMarkPlacements`, as flatten commits them. */
+  placeCarriedMarks?: (atoms: MoleculeAtom[]) => ReadonlyMap<string, CarriedElectronMarkPlacement>;
   pageWidth: number;
   pageHeight: number;
   /** The molecule's own 2D drawing style — the overlay renders with the SAME colors,
@@ -27782,7 +27782,9 @@ function SpinOverlay({
       ))}
       {/* Each mark goes where flatten commits it (the ScreenPlacement contract): its offset from
           its projected atom kept, or turned about the atom to a free side when that spot lands on
-          another atom or a bond. A lone pair turns with it. */}
+          another atom, a bond or a label (its own molecule's or another's). A lone pair turns with
+          it. A molecule turned on the page has its marks painted where release stores them, turned
+          with it, though this overlay draws the projection itself unturned. */}
       {carriedMarks.map(({ markId, fragments, selected }) => {
         const placement = carriedMarkPlacements?.get(markId);
         if (!placement) return null;

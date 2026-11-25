@@ -379,6 +379,19 @@ and reopen. Throughout, Copy As SMILES stays `...C(=O)[O-]` (formula unchanged),
 carboxylate O still pulls the mark, and one Undo after any of these restores the drawing and the
 mark exactly as before.
 
+Marks keep off other molecules and off labels. Draw a second molecule (ethane, and separately
+methylamine `CN`) right where the aspirin's `-` will land after a Spin 3D of the first: during the
+drag and after the click outside, the `-` never sits on the other molecule's atoms, bonds or its
+`NH2`/`H2N` letters; it turns to a free side of its own O at the same distance, and the other
+molecule does not move. Draw methylammonium (`CN`, `+` on the N, drawn `H3N` with the `+` at its
+lower right) and Spin 3D it half a turn about the vertical: it is committed as `NH3`, and the `+`
+is not left on the `H3`. A `2+` (or `3-`) mark, drawn larger, is carried clear of bonds by its larger
+circle. A molecule turned on the page (rotation not 0, for example from a turned import or group)
+with a `-` on it: during Spin 3D the `-` is painted where the click outside stores it, turned with
+the molecule (the overlay itself still draws the projection unturned, so mid-spin the mark may sit
+apart from the drawn atom; after release the mark is beside its atom and the molecule is still
+turned). Copy As SMILES never changes.
+
 ## Automatic plugin update notices (macOS and Windows)
 
 On both platforms, launch with an installed official plugin and a check due (no successful plugin

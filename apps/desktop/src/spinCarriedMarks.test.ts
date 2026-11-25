@@ -19,9 +19,12 @@
 // of a ring carbon, seed 28 beside the carbonyl O.
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { applyPatch, type ChemDraftDocument, type ElectronMarkObject, type MoleculeObject } from "@chemdraft/chem-core";
-import { nativeElectronMarkAssignments, stereoPerceptionMolfile } from "@chemdraft/document-workflow-core";
+import { moleculeGeometryFromAtoms, nativeElectronMarkAssignments, stereoPerceptionMolfile } from "@chemdraft/document-workflow-core";
 import { exportDocumentToSvg } from "@chemdraft/export-engine";
-import { planPageSvgRender } from "@chemdraft/layout-engine";
+import {
+  carriedMarkLabelDepth, electronMarkInkRadius, moleculeLayoutLabelBoxes, planMoleculeAtomLabels, planPageSvgRender,
+  transformPointForObject
+} from "@chemdraft/layout-engine";
 import { depictSmiles2D, ensureOclResources, relayoutMolfile2D } from "@chemdraft/ocl-adapter";
 import { ensureRdkit, rdkitConformerGenerator } from "@chemdraft/rdkit-adapter";
 import { installRealRdkitModuleLoader } from "@chemdraft/rdkit-adapter/testing";
@@ -229,14 +232,14 @@ function flattenAt(session: Session, quat: Quaternion, coords3d: ArrayLike<numbe
   }));
 }
 
-/** What SpinOverlay paints each frame: the projected atoms, and the shared placement of the mark for them. */
-function liveOverlay(session: Session, quat: Quaternion, coords3d: ArrayLike<number> = session.coords3d) {
+/** What SpinOverlay paints each frame: the projected atoms, and the placement of the mark for them that
+ * MainWindow's overlay asks for (`spinOverlayCarriedMarkPlacements`, the frame flatten commits in). */
+function liveOverlay(session: Pick<Session, "document" | "molecule" | "mark" | "bondPairs" | "placement" | "coords3d">,
+  quat: Quaternion, coords3d: ArrayLike<number> = session.coords3d) {
   const projection = projectSpin(coords3d, session.bondPairs, quat, session.placement);
   const atoms = session.molecule.atoms.map((atom, index) => ({ ...atom, x: projection.atoms[index]!.sx, y: projection.atoms[index]!.sy }));
-  expect(typeof workflow.carriedElectronMarkPlacements, "the overlay's shared mark placement").toBe("function");
-  const placed = workflow.carriedElectronMarkPlacements(session.document.pages[0], session.molecule, {
-    ...session.molecule, rotation: 0, atoms
-  }).get(session.mark.id)!;
+  expect(typeof workflow.spinOverlayCarriedMarkPlacements, "the overlay's shared mark placement").toBe("function");
+  const placed = workflow.spinOverlayCarriedMarkPlacements(session.document.pages[0], session.molecule, atoms).get(session.mark.id)!;
   expect(placed, "the overlay carries the mark").toBeDefined();
   return { atoms, placement: { ...placed, width: session.mark.width, height: session.mark.height } };
 }
@@ -538,5 +541,166 @@ describe("a drawing saved with a stale offset", () => {
     const respun = flattenAt({ ...session, molecule }, model.orientation, coords3d, reopened, placement);
     expectMarkOnItsAtom(session, respun, "re-spun");
     expectChemistryKept(session, respun, "re-spun");
+  });
+});
+
+/**
+ * `session` with its molecule turned `degrees` on the page (its object rotation, a supported state: a
+ * drawing imported or grouped with a turn), the mark turned with it so it sits beside its atom where
+ * the page draws it. Atoms, bonds and chemistry are unchanged. The mark's binding to its atom is made
+ * explicit (as any spin, rotation or direct drop leaves it): a legacy distance association is read
+ * against the molecule's unturned atoms (document-workflow-core nativeElectronMarkAssignments), which
+ * at 90° would hand this '-' to the carboxyl C.
+ */
+function turnedOnPage(session: Session, degrees: number): Session {
+  const turned = { ...session.molecule, rotation: degrees };
+  const center = transformPointForObject(turned, centerOf(session.mark));
+  let document = applyPatch(session.document, { op: "updateObject", objectId: turned.id, changes: { rotation: degrees } });
+  document = normalizeCommittedDocument(applyPatch(document, { op: "updateObject", objectId: session.mark.id, changes: {
+    x: center.x - session.mark.width / 2, y: center.y - session.mark.height / 2, atomAssociation: "explicit",
+    anchor: { kind: "atom", objectId: turned.id, atomId: session.acidOxygen.id },
+    ...(session.mark.markKind === "lone-pair" ? { rotation: ((session.mark.rotation + degrees) % 360 + 360) % 360 } : {})
+  } }));
+  const molecule = moleculeOf(document);
+  const atom = transformPointForObject(molecule, molecule.atoms.find(candidate => candidate.id === session.acidOxygen.id)!);
+  const mark = markOf(document);
+  expect(Math.hypot(centerOf(mark).x - atom.x, centerOf(mark).y - atom.y), "the turned mark is as far from its atom").toBeCloseTo(session.drawnDistance, 6);
+  const chemistry = chemistryOf(document);
+  expect(chemistry.owner, "still the carboxylate O's").toEqual(session.chemistry.owner);
+  return { ...session, document, molecule, mark, chemistry };
+}
+
+/** The committed molecule's atoms where the page draws them (its rotation applied). */
+function pageAtoms(molecule: MoleculeObject) {
+  return molecule.atoms.map(atom => ({ ...atom, ...transformPointForObject(molecule, atom) }));
+}
+
+describe("a molecule turned on the page: the overlay paints each mark exactly where release stores it", () => {
+  it.each(markKinds)("a %s on a molecule turned 37° and 90°: same page position in the overlay and after flatten", async (_kind, spec) => {
+    const crowdedBefore = crowdedViews.length;
+    for (const conformer of [esterRepro, dragRepro]) {
+      for (const degrees of [37, 90]) {
+        const session = turnedOnPage(await aspirinWithMark(spec, conformer), degrees);
+        for (const [view, quat] of [["opening", session.open], ["drag -90,-40", dragged(session, -90, -40)]] as const) {
+          const name = `${label(conformer)} turned ${degrees}° ${view}`;
+          const live = liveOverlay(session, quat);
+          const committed = flattenAt(session, quat);
+          const mark = markOf(committed);
+          // Absolute page coordinates, not just the offset from the atom.
+          expect(mark.x, `${name}: x`).toBeCloseTo(live.placement.x, 6);
+          expect(mark.y, `${name}: y`).toBeCloseTo(live.placement.y, 6);
+          expect(mark.rotation, `${name}: rotation`).toBeCloseTo(live.placement.rotation, 6);
+          // The commit keeps the molecule's turn, and the mark beside its atom where the page draws it.
+          const molecule = moleculeOf(committed);
+          expect(molecule.rotation).toBe(degrees);
+          expect(mark.anchor).toMatchObject({ kind: "atom", objectId: molecule.id, atomId: session.acidOxygen.id });
+          expectBeside(pageAtoms(molecule), molecule.bonds, mark, session.acidOxygen.id, session.drawnDistance, name);
+          expectChemistryKept(session, committed, name);
+        }
+      }
+    }
+    expect(crowdedViews.slice(crowdedBefore)).toEqual([]);
+  });
+});
+
+/** `document` with `smiles` added as a second molecule whose atoms are moved so its atom `index` sits at `at`. */
+function withSecondMolecule(document: ChemDraftDocument, smiles: string, index: number, at: { x: number; y: number }) {
+  const added = insertNativeMolfileMolecule(document, { x: 80, y: 80 }, depictSmiles2D(smiles).molfile, "molfile-v2000");
+  const second = added.pages[0].objects.find((object): object is MoleculeObject =>
+    object.type === "molecule" && !document.pages[0].objects.some(existing => existing.id === object.id))!;
+  const anchor = second.atoms[index]!;
+  const atoms = second.atoms.map(atom => ({ ...atom, x: atom.x + at.x - anchor.x, y: atom.y + at.y - anchor.y }));
+  const placed = normalizeCommittedDocument(applyPatch(added, {
+    op: "updateObject", objectId: second.id, changes: { atoms, ...moleculeGeometryFromAtoms(atoms) }
+  }));
+  return { document: placed, second: placed.pages[0].objects.find((object): object is MoleculeObject => object.id === second.id)! };
+}
+
+describe("another molecule on the page is an obstacle: a mark is never carried onto its atom, bond or label", () => {
+  it.each([["ethane's carbon", "CC", 0], ["methylamine's NH2 label", "CN", 1]] as const)(
+    "the '-' whose kept spot lands on %s turns to a free side, in the overlay and on release", async (_what, smiles, index) => {
+      const crowdedBefore = crowdedViews.length;
+      for (const conformer of [esterRepro, dragRepro]) {
+        const session = await aspirinWithMark({ kind: "charge", charge: -1 }, conformer);
+        for (const quat of [session.open, dragged(session, -90, -40)]) {
+          // Where release puts the '-' with nothing else on the page.
+          const spot = centerOf(markOf(flattenAt(session, quat)));
+          const { document, second } = withSecondMolecule(session.document, smiles, index, spot);
+          const crowded: Session = { ...session, document };
+          // Adding the molecule changes nothing about the aspirin or its mark.
+          expect(chemistryOf(document), "the mark still belongs to the carboxylate O").toEqual(session.chemistry);
+          const name = `${label(conformer)} ${smiles} at the kept spot`;
+          const live = liveOverlay(crowded, quat);
+          const committed = flattenAt(crowded, quat);
+          const mark = markOf(committed);
+          expect(mark.x, `${name}: x`).toBeCloseTo(live.placement.x, 6);
+          expect(mark.y, `${name}: y`).toBeCloseTo(live.placement.y, 6);
+          const center = centerOf(mark);
+          expect(Math.hypot(center.x - spot.x, center.y - spot.y), `${name}: the mark left the spot`).toBeGreaterThan(5);
+          // Beside its own atom: nearer it than any atom of either molecule, off every bond of both.
+          const prefixed = second.atoms.map(atom => ({ ...atom, id: `second:${atom.id}` }));
+          const bonds = [...moleculeOf(committed).bonds, ...second.bonds.map(bond => ({
+            fromAtomId: `second:${bond.fromAtomId}`, toAtomId: `second:${bond.toAtomId}`
+          }))];
+          expectBeside([...moleculeOf(committed).atoms, ...prefixed], bonds, mark, session.acidOxygen.id, session.drawnDistance, name);
+          // Off the other molecule's label letters by the mark's drawn ink.
+          const ink = electronMarkInkRadius(mark);
+          for (const box of moleculeLayoutLabelBoxes(second)) {
+            expect(carriedMarkLabelDepth(center, ink, box), `${name}: on the label`).toBeLessThanOrEqual(1e-6);
+          }
+          // Neither molecule's chemistry changed; the other molecule did not move.
+          expectChemistryKept(session, committed, name);
+          expect(committed.pages[0].objects.find(object => object.id === second.id)).toEqual(second);
+        }
+      }
+      expect(crowdedViews.slice(crowdedBefore)).toEqual([]);
+    });
+});
+
+describe("a mark keeps off the letters of the label its molecule is committed with", () => {
+  it("methylammonium spun end over end: H3N is committed as NH3, and the '+' turns off the H3 it would land on", async () => {
+    const plain = insertNativeMolfileMolecule(createPhase4Document("Ammonium"), { x: 300, y: 300 }, depictSmiles2D("CN").molfile, "molfile-v2000");
+    const drawn = moleculeOf(plain);
+    const nitrogen = drawn.atoms.find(atom => atom.element === "N")!;
+    const charged = normalizeCommittedDocument(applyChargeToolAtNativeAtom(plain, { kind: "charge", charge: 1 },
+      { kind: "atom", objectId: drawn.id, atomId: nitrogen.id, distanceToPointer: 0 }));
+    // The '+' to the lower right of N: clear of "H3N" (its hydrogens are drawn on the left, away from the C).
+    const molecule = moleculeOf(charged);
+    expect(planMoleculeAtomLabels(molecule).map(plan => plan.label)).toEqual(["H3N"]);
+    const placedMark = markOf(charged);
+    const document = normalizeCommittedDocument(applyPatch(charged, { op: "updateObject", objectId: placedMark.id, changes: {
+      x: nitrogen.x + 14 - placedMark.width / 2, y: nitrogen.y + 9 - placedMark.height / 2
+    } }));
+    const mark = markOf(document);
+    const chemistry = chemistryOf(document);
+    const drawnLabel = moleculeLayoutLabelBoxes(molecule)[0]!;
+    expect(carriedMarkLabelDepth(centerOf(mark), electronMarkInkRadius(mark), drawnLabel), "drawn clear of H3N").toBeLessThan(0);
+    // A 2D conformer turned half a turn about the vertical: the C goes over to N's other side.
+    const coords3d = Float64Array.from(molecule.atoms.flatMap(atom => [atom.x, -atom.y, 0]));
+    const bondPairs: [number, number][] = [[0, 1]];
+    const placement: ScreenPlacement = {
+      centerX: (molecule.atoms[0]!.x + molecule.atoms[1]!.x) / 2, centerY: (molecule.atoms[0]!.y + molecule.atoms[1]!.y) / 2, scale: 1
+    };
+    const quat = quatFromAxisAngle([0, 1, 0], Math.PI);
+    const live = liveOverlay({ document, molecule, mark, bondPairs, placement, coords3d }, quat);
+    const outcome = flattenSpunMolecule(document, molecule.id, coords3d, quatToViewMatrix(quat), { placement });
+    expect(outcome.status, outcome.refusalReasons.join("; ")).toBe("committed");
+    const committed = normalizeCommittedDocument(outcome.document);
+    const committedMolecule = moleculeOf(committed);
+    expect(planMoleculeAtomLabels(committedMolecule).map(plan => plan.label), "the label is committed the other way round").toEqual(["NH3"]);
+    const committedLabel = moleculeLayoutLabelBoxes(committedMolecule)[0]!;
+    const committedN = committedMolecule.atoms.find(atom => atom.id === nitrogen.id)!;
+    const ink = electronMarkInkRadius(mark);
+    // Kept at its offset, the '+' would sit on the H3 of NH3.
+    const kept = { x: committedN.x + centerOf(mark).x - nitrogen.x, y: committedN.y + centerOf(mark).y - nitrogen.y };
+    expect(carriedMarkLabelDepth(kept, ink, committedLabel), "the kept spot is on the letters").toBeGreaterThan(3);
+    // It turns off them, at the same distance from its N, and the overlay paints it there.
+    const committedMark = markOf(committed);
+    const center = centerOf(committedMark);
+    expect(carriedMarkLabelDepth(center, ink, committedLabel)).toBeLessThanOrEqual(1e-6);
+    expect(Math.hypot(center.x - committedN.x, center.y - committedN.y)).toBeCloseTo(Math.hypot(14, 9), 6);
+    expect(committedMark.x).toBeCloseTo(live.placement.x, 6);
+    expect(committedMark.y).toBeCloseTo(live.placement.y, 6);
+    expect(chemistryOf(committed)).toEqual(chemistry);
   });
 });

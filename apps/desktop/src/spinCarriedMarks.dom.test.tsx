@@ -241,6 +241,51 @@ describe.each(["macos", "windows"] as const)("Spin 3D keeps the acid O's charge 
   it("a drag with only the molecule selected carries the unselected mark",
     () => spinRepro({ seed: esterReproSeed, drag: true, moleculeOnly: true }));
 
+  it.each([37, 90])("a molecule turned %d° on the page: release stores the '-' at the page position the overlay painted it", async degrees => {
+    conformerSeed = esterReproSeed;
+    // Aspirin with its '-', the molecule turned on the page (its object rotation) and the mark turned
+    // with it, bound to the carboxylate O. Only the molecule is selected.
+    const plain = aspirinDrawing();
+    const molecule = moleculeOf(plain);
+    const acidOxygen = acidOxygenOf(molecule);
+    const charged = normalizeCommittedDocument(applyChargeToolAtNativeAtom(plain, { kind: "charge", charge: -1 },
+      { kind: "atom", objectId: molecule.id, atomId: acidOxygen.id, distanceToPointer: 0 }));
+    const [drawnMark] = marksOf(charged);
+    const turned = { ...moleculeOf(charged), rotation: degrees };
+    const center = transformPointForObject(turned, centerOf(drawnMark!));
+    let document = applyPatch(charged, { op: "updateObject", objectId: molecule.id, changes: { rotation: degrees } });
+    document = normalizeCommittedDocument(applyPatch(document, { op: "updateObject", objectId: drawnMark!.id, changes: {
+      x: center.x - drawnMark!.width / 2, y: center.y - drawnMark!.height / 2, atomAssociation: "explicit",
+      anchor: { kind: "atom", objectId: molecule.id, atomId: acidOxygen.id }
+    } }));
+    const rect = await mount(selectDocumentObjects(document, document.pages[0].id, [molecule.id]));
+    const mark = marksOf(snapshot())[0]!;
+    const smiles = await copySmiles();
+    await command("structure.spin3d");
+    await act(async () => vi.waitFor(() => expect(overlay(), status()).not.toBeNull()));
+    overlay()!.getBoundingClientRect = () => rect;
+    const painted = overlay()!.querySelector(`[data-spin3d-electron-mark="${mark.id}"]`)!;
+    const [dx, dy] = painted.getAttribute("data-spin3d-mark-offset")!.split(" ").map(Number);
+    await act(async () => pointer(overlay()!, "pointerdown", 20, 20));
+    await act(async () => vi.waitFor(() => expect(overlay(), status()).toBeNull()));
+    expect(status()).toMatch(/^Flattened /);
+    const flattened = snapshot();
+    const committed = marksOf(flattened)[0]!;
+    // The page position the overlay painted is the one stored.
+    expect(committed.x).toBeCloseTo(mark.x + dx!, 6);
+    expect(committed.y).toBeCloseTo(mark.y + dy!, 6);
+    // Still turned, the mark beside its O where the page draws it, chemistry unchanged.
+    const flatMolecule = moleculeOf(flattened);
+    expect(flatMolecule.rotation).toBe(degrees);
+    const oxygen = transformPointForObject(flatMolecule, flatMolecule.atoms.find(atom => atom.id === acidOxygen.id)!);
+    const drawnOxygen = transformPointForObject(turned, acidOxygen);
+    expect(Math.hypot(centerOf(committed).x - oxygen.x, centerOf(committed).y - oxygen.y))
+      .toBeCloseTo(Math.hypot(centerOf(mark).x - drawnOxygen.x, centerOf(mark).y - drawnOxygen.y), 6);
+    expect(committed.anchor).toEqual(mark.anchor);
+    expect(committed.charge).toBe(mark.charge);
+    expect(await copySmiles()).toBe(smiles);
+  });
+
   it("3D clean-up carries the charge with its O and undoes in one step", async () => {
     const plain = aspirinDrawing();
     const molecule = moleculeOf(plain);
