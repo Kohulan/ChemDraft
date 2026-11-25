@@ -219,13 +219,13 @@ describe("size and count caps", () => {
     const result = await prepareDroppedImages(many, decoders());
     expect(result.images).toHaveLength(MAX_DROPPED_IMAGES);
     expect(result.refusals).toEqual([
-      { name: "p50.png", reason: "only 50 pictures can be dropped at once." },
-      { name: "p51.png", reason: "only 50 pictures can be dropped at once." }
+      { name: "p50.png", reason: "only 50 pictures can be dropped at once.", wholeDrop: "count" },
+      { name: "p51.png", reason: "only 50 pictures can be dropped at once.", wholeDrop: "count" }
     ]);
     const big = Array.from({ length: 11 }, (_, index) => memorySource(`b${index}.png`, pngBytes(), MAX_DROPPED_IMAGE_BYTES));
     const total = await prepareDroppedImages(big, decoders());
     expect(total.images).toHaveLength(MAX_DROPPED_IMAGE_TOTAL_BYTES / MAX_DROPPED_IMAGE_BYTES);
-    expect(total.refusals).toEqual([{ name: "b10.png", reason: "the pictures in one drop can total at most 200.0 MB." }]);
+    expect(total.refusals).toEqual([{ name: "b10.png", reason: "the pictures in one drop can total at most 200.0 MB.", wholeDrop: "totalBytes" }]);
     expect(big[10]!.reads).toBe(0);
   });
 
@@ -503,6 +503,12 @@ describe("handleDroppedFiles", () => {
 });
 
 describe("formatImageDropStatus", () => {
+  it("does not throw for a very large refusal list", () => {
+    const refusals = Array.from({ length: 150_000 }, (_, index) => ({ name: `f${index}.png`, reason: `r${index}.` }));
+    const status = formatImageDropStatus({ inserted: [], refusals });
+    expect(status).toContain("f0.png");
+    expect(status).toContain("f149999.png");
+  });
   it("lists a few names, then counts the rest", () => {
     const images = Array.from({ length: 7 }, (_, index) => ({ name: `p${index}.png`, mimeType: "image/png" as const, dataBase64: "", notes: [] }));
     expect(formatImageDropStatus({ inserted: images, refusals: [], scaledToPage: ["p1.png"] }))
@@ -514,6 +520,40 @@ describe("formatImageDropStatus", () => {
   it("drops a reason's own period before the separator, keeping only the last one", () => {
     expect(formatImageDropStatus({ inserted: [], refusals: [{ name: "a.png", reason: "first." }, { name: "b.png", reason: "second." }] }))
       .toBe("No pictures were inserted; Couldn't drop \"a.png\": first; Couldn't drop \"b.png\": second.");
+  });
+
+  it("names every refused file, however many", () => {
+    const refusals = ["a.bmp", "b.bmp", "c.bmp", "d.bmp", "e.bmp", "fake.png"].map(name => ({ name, reason: "its reason." }));
+    const status = formatImageDropStatus({ inserted: [], refusals });
+    expect(status).toBe(["No pictures were inserted",
+      ...refusals.map(refusal => `Couldn't drop "${refusal.name}": its reason`)].join("; ") + ".");
+    expect(status).not.toMatch(/more files/);
+  });
+
+  it("gives whole-drop refusals one part naming each of their files", () => {
+    const count = (name: string) => ({ name, reason: "only 50 pictures can be dropped at once.", wholeDrop: "count" as const });
+    const format = (refusals: { name: string; reason: string; wholeDrop?: "count" | "totalBytes" }[]) =>
+      formatImageDropStatus({ inserted: [], refusals });
+    expect(format([count("a.png")])).toBe("No pictures were inserted; Couldn't drop \"a.png\": only 50 pictures can be dropped at once.");
+    expect(format([count("a.png"), count("/x/b.png")]))
+      .toBe("No pictures were inserted; Couldn't drop \"a.png\" and \"b.png\": only 50 pictures can be dropped at once.");
+    expect(format([count("a.png"), count("b.png"), count("c.png")]))
+      .toBe("No pictures were inserted; Couldn't drop \"a.png\", \"b.png\" and \"c.png\": only 50 pictures can be dropped at once.");
+  });
+
+  it("keeps per-file and whole-drop refusals in order, each group where its first file was", () => {
+    const total = (name: string) => ({ name, reason: "the pictures in one drop can total at most 200.0 MB.", wholeDrop: "totalBytes" as const });
+    const count = (name: string) => ({ name, reason: "only 50 pictures can be dropped at once.", wholeDrop: "count" as const });
+    const own = (name: string) => ({ name, reason: "its contents are not a picture." });
+    expect(formatImageDropStatus({ inserted: [], refusals: [own("x.bmp"), total("t1.png"), own("y.png"), count("c1.png"), total("t2.png"), count("c2.png"), own("z.png")] }))
+      .toBe([
+        "No pictures were inserted",
+        "Couldn't drop \"x.bmp\": its contents are not a picture",
+        "Couldn't drop \"t1.png\" and \"t2.png\": the pictures in one drop can total at most 200.0 MB",
+        "Couldn't drop \"y.png\": its contents are not a picture",
+        "Couldn't drop \"c1.png\" and \"c2.png\": only 50 pictures can be dropped at once",
+        "Couldn't drop \"z.png\": its contents are not a picture."
+      ].join("; "));
   });
 });
 
