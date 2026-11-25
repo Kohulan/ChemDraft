@@ -32,6 +32,7 @@ import { MAX_IMAGE_DECODED_BYTES } from "@chemdraft/chem-core";
 import { CssTokenBudgetError, matchCssBlocks, tokenizeCss, type CssToken } from "./cssTokens";
 import { readRasterHeaderSize, sniffBinaryImageFormat, type RasterHeaderFormat } from "./imageSniff";
 import { pictureSizeLimitError } from "./pixelLimits";
+import { parseSvgLength } from "./svgLength";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 const XLINK_NS = "http://www.w3.org/1999/xlink";
@@ -669,7 +670,9 @@ const isDoctypeAt = (source: string, index: number) => source.slice(index, index
  * start tag begins in that text; or the reason to refuse: an internal subset (which could declare
  * entities) or a second DOCTYPE (not well-formed). Nothing after the root start is read, so a
  * DOCTYPE in a comment, CDATA section or text of the body is only text, and every character is
- * visited once.
+ * visited once. It fails closed: anything else, such as a character this does not read as white
+ * space, is refused here rather than left for a parser to read differently. XML 1.1 (which reads
+ * U+0085 and U+2028 as line ends) is refused outright.
  */
 function readProlog(source: string): { text: string; root: number } | string {
   let index = 0;
@@ -680,6 +683,11 @@ function readProlog(source: string): { text: string; root: number } | string {
     if (close) {
       const end = source.indexOf(close, index + (close === "?>" ? 2 : 4));
       if (end < 0) return NOT_WELL_FORMED;
+      if (close === "?>") {
+        const version = xmlDeclarationVersion(source.slice(index + 2, end));
+        if (version === "") return NOT_WELL_FORMED;
+        if (version !== undefined && version !== "1.0") return `the SVG is XML ${version}, which is not supported; save it as XML 1.0.`;
+      }
       index = end + close.length;
       continue;
     }
@@ -698,8 +706,48 @@ function readProlog(source: string): { text: string; root: number } | string {
     doctype = { start: index, end: end + 1 };
     index = end + 1;
   }
-  if (!doctype) return { text: source, root: index };
-  return { text: source.slice(0, doctype.start) + source.slice(doctype.end), root: index - (doctype.end - doctype.start) };
+  if (source[index] !== "<" || !isNameStartAt(source, index + 1)) return NOT_WELL_FORMED;
+  const read = doctype
+    ? { text: source.slice(0, doctype.start) + source.slice(doctype.end), root: index - (doctype.end - doctype.start) }
+    : { text: source, root: index };
+  return hasMarkupDeclarationBefore(read.text, read.root) ? NOT_WELL_FORMED : read;
+}
+
+/**
+ * The version an `<?xml ...?>` declaration (given without its `<?` and `?>`) names, empty when it
+ * names none; undefined for any other processing instruction.
+ */
+function xmlDeclarationVersion(body: string): string | undefined {
+  if (!/^xml(?:[\t\n\r ]|$)/i.test(body)) return undefined;
+  return /\bversion[\t\n\r ]*=[\t\n\r ]*(["'])([^"']*)\1/.exec(body)?.[2] ?? "";
+}
+
+/** An XML NameStartChar at `index` (a supplementary-plane one is a high surrogate here). */
+function isNameStartAt(text: string, index: number): boolean {
+  const code = text.charCodeAt(index);
+  const within = (low: number, high: number) => code >= low && code <= high;
+  return code === 0x3a || code === 0x5f || within(0x41, 0x5a) || within(0x61, 0x7a) || within(0xc0, 0xd6)
+    || within(0xd8, 0xf6) || within(0xf8, 0x2ff) || within(0x370, 0x37d) || within(0x37f, 0x1fff) || within(0x200c, 0x200d)
+    || within(0x2070, 0x218f) || within(0x2c00, 0x2fef) || within(0x3001, 0xd7ff) || within(0xd800, 0xdb7f)
+    || within(0xf900, 0xfdcf) || within(0xfdf0, 0xfffd);
+}
+
+/**
+ * Belt and braces for `readProlog`: in the text a parser is handed, anything before the root other
+ * than white space, comments and processing instructions (a DOCTYPE, an entity or a CDATA section)
+ * means the prolog was misread, so the picture is refused.
+ */
+function hasMarkupDeclarationBefore(text: string, root: number): boolean {
+  let index = 0;
+  while (index < root) {
+    const code = text.charCodeAt(index);
+    if (isAsciiSpace(code) || code === 0xfeff) { index += 1; continue; }
+    const close = text.startsWith("<!--", index) ? "-->" : text.startsWith("<?", index) ? "?>" : undefined;
+    const end = close ? text.indexOf(close, index + (close === "?>" ? 2 : 4)) : -1;
+    if (end < 0 || end >= root) return true;
+    index = end + close!.length;
+  }
+  return index !== root;
 }
 
 /**
@@ -741,13 +789,10 @@ function parseSvg(source: string, xml: XmlTools): Document | string {
 }
 
 function absoluteLengthPx(value: string | null): number | undefined {
-  const text = value?.trim();
-  // No length needs more; a long run of digits would make the pattern below backtrack quadratically.
-  if (!text || text.length > 64) return undefined;
-  const match = text.match(/^([+]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)\s*(px|pt|pc|in|mm|cm)?$/i);
-  if (!match) return undefined;
-  const scale: Record<string, number> = { px: 1, pt: 96 / 72, pc: 16, in: 96, mm: 96 / 25.4, cm: 96 / 2.54 };
-  const result = Number(match[1]) * scale[(match[2] ?? "px").toLowerCase()]!;
+  const length = parseSvgLength(value ?? "");
+  if (!length) return undefined;
+  const scale: Record<string, number> = { "": 1, px: 1, pt: 96 / 72, pc: 16, in: 96, mm: 96 / 25.4, cm: 96 / 2.54 };
+  const result = length.value * (scale[length.unit.toLowerCase()] ?? NaN);
   return Number.isFinite(result) && result > 0 ? result : undefined;
 }
 
