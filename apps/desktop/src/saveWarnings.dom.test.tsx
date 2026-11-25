@@ -149,6 +149,15 @@ describe("save warnings in the existing file warnings list", () => {
 
   const bridge = () => window.__CHEMDRAFT_AGENT__!;
   const status = () => container.querySelector<HTMLElement>("[data-status-message]")!;
+  /**
+   * The file-warnings part of the status title, which begins with the status as displayed (a long
+   * status truncates); "" when the title is the status alone.
+   */
+  const warningsTitle = () => {
+    const { title, textContent } = status();
+    if (title === textContent) return "";
+    return title.startsWith(`${textContent}\n\n`) ? title.slice(`${textContent}\n\n`.length) : title;
+  };
   const button = () => container.querySelector<HTMLButtonElement>("[data-open-warnings-button]");
   const list = () => container.querySelector<HTMLElement>("[data-open-warnings-list]");
 
@@ -194,7 +203,7 @@ describe("save warnings in the existing file warnings list", () => {
     });
     expect(button()).not.toBeNull();
     expect(status().title).toContain("Opened import.cdxml");
-    return status().title;
+    return warningsTitle();
   }
 
   function saveTooltip(filename: string, warnings: readonly { message: string }[]) {
@@ -238,7 +247,8 @@ describe("save warnings in the existing file warnings list", () => {
 
     await command("document.save");
     expect(status().textContent).toBe(`Saved ${payload.filename} with ${payload.warnings.length} compatibility warning(s)`);
-    expect(status().title).toBe(saveTooltip(payload.filename, payload.warnings));
+    // The status as displayed, then the warnings on the lines after it.
+    expect(status().title).toBe(`${status().textContent}\n\n${saveTooltip(payload.filename, payload.warnings)}`);
     expect(button()?.textContent).toBe(`${payload.warnings.length} warnings`);
     expect(button()?.title).toBe("Show the warnings from saving this document");
     expect(list()).toBeNull();
@@ -271,7 +281,8 @@ describe("save warnings in the existing file warnings list", () => {
     await mount(createPhase4Document("Clean"));
     await command("document.save");
     expect(status().textContent).toBe("Saved Clean.chemdraft");
-    expect(status().getAttribute("title")).toBeNull();
+    // No warnings: the title is the status alone.
+    expect(status().title).toBe("Saved Clean.chemdraft");
     expect(button()).toBeNull();
     expect(list()).toBeNull();
   });
@@ -288,7 +299,7 @@ describe("save warnings in the existing file warnings list", () => {
     await command("document.save");
     expect(button()).toBeNull();
     expect(list()).toBeNull();
-    expect(status().getAttribute("title")).toBeNull();
+    expect(warningsTitle()).toBe("");
   });
 
   it("keeps the open report, button, list and tooltip after an unchanged clean save", async () => {
@@ -304,7 +315,7 @@ describe("save warnings in the existing file warnings list", () => {
 
     await command("document.save");
     expect(status().textContent).toMatch(/^Saved .*\.chemdraft$/);
-    expect(status().title).toBe(openTooltip);
+    expect(warningsTitle()).toBe(openTooltip);
     expect(button()?.textContent).toBe(count);
     expect(button()?.title).toBe("Show the warnings from opening this document");
     await click(button()!);
@@ -320,7 +331,7 @@ describe("save warnings in the existing file warnings list", () => {
     const payload = createNativeSavePayload(bridge().snapshot().document);
     expect(payload.warnings.length).toBeGreaterThan(0);
     await command("document.save");
-    expect(status().title).toBe(`${openTooltip}\n\n${saveTooltip(payload.filename, payload.warnings)}`);
+    expect(warningsTitle()).toBe(`${openTooltip}\n\n${saveTooltip(payload.filename, payload.warnings)}`);
     expect(button()?.textContent).toBe(`${openCount + payload.warnings.length} warnings`);
     expect(button()?.title).toBe("Show the warnings from opening and saving this document");
     await click(button()!);
@@ -337,7 +348,7 @@ describe("save warnings in the existing file warnings list", () => {
 
     // Repeating the save replaces its report, without duplicating findings or changing the open report.
     await command("document.save");
-    expect(status().title).toBe(`${openTooltip}\n\n${saveTooltip(payload.filename, payload.warnings)}`);
+    expect(warningsTitle()).toBe(`${openTooltip}\n\n${saveTooltip(payload.filename, payload.warnings)}`);
     await click(button()!);
     await act(async () => { window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); });
     expect(list()).toBeNull();
@@ -347,7 +358,7 @@ describe("save warnings in the existing file warnings list", () => {
     await command("edit.undo");
     expect(createNativeSavePayload(bridge().snapshot().document).warnings).toHaveLength(0);
     await command("document.save");
-    expect(status().title).toBe(openTooltip);
+    expect(warningsTitle()).toBe(openTooltip);
     await click(button()!);
     expect(list()?.getAttribute("aria-label")).toMatch(/^Opened import.cdxml/);
     expect(list()?.textContent).not.toContain("Saved ");
@@ -359,7 +370,7 @@ describe("save warnings in the existing file warnings list", () => {
     const openTooltip = await openWithWarnings();
     await command(tableInsertCommandId(2, 2, 1));
     await command("document.save");
-    const combinedTooltip = status().title;
+    const combinedTooltip = warningsTitle();
     expect(combinedTooltip).toContain(openTooltip);
     expect(combinedTooltip).toContain("Saved table.chemdraft");
     await click(button()!);
@@ -375,7 +386,7 @@ describe("save warnings in the existing file warnings list", () => {
     await remount();
     expect(button()).toBeNull();
     await activate(0);
-    expect(status().title).toBe(combinedTooltip);
+    expect(warningsTitle()).toBe(combinedTooltip);
     await click(button()!);
     expect([...list()!.querySelectorAll("section")].map(section => section.getAttribute("aria-label"))).toEqual(headings);
   });
@@ -384,7 +395,7 @@ describe("save warnings in the existing file warnings list", () => {
     native.desktop = true;
     await mount();
     await command("document.save");
-    const tooltip = status().title;
+    const tooltip = warningsTitle();
     const count = button()!.textContent;
     await act(async () => { await native.flush!("committed", 42); });
     expect(native.quit).toHaveBeenCalledExactlyOnceWith(42);
@@ -393,7 +404,7 @@ describe("save warnings in the existing file warnings list", () => {
     expect(saved.tabs[0]!.saveWarnings).toMatchObject({ operation: "save" });
 
     await remount();
-    expect(status().title).toBe(tooltip);
+    expect(warningsTitle()).toBe(tooltip);
     expect(button()?.textContent).toBe(count);
     expect(button()?.title).toBe("Show the warnings from saving this document");
     await click(button()!);
@@ -455,7 +466,7 @@ describe("save warnings in the existing file warnings list", () => {
     const openTooltip = await openWithWarnings();
     await command(tableInsertCommandId(2, 2, 1));
     await command("document.save");
-    const combinedTooltip = status().title;
+    const combinedTooltip = warningsTitle();
     expect(combinedTooltip).toContain(openTooltip);
     await click(button()!);
 
@@ -463,9 +474,9 @@ describe("save warnings in the existing file warnings list", () => {
     expect(button()).toBeNull();
     expect(list()).toBeNull();
     await command("document.save");
-    expect(status().getAttribute("title")).toBeNull();
+    expect(warningsTitle()).toBe("");
     await activate(0);
-    expect(status().title).toBe(combinedTooltip);
+    expect(warningsTitle()).toBe(combinedTooltip);
     expect(list()).toBeNull();
     await click(button()!);
     expect(list()!.querySelectorAll("section")).toHaveLength(2);
@@ -480,29 +491,29 @@ describe("save warnings in the existing file warnings list", () => {
     expect(list()?.textContent).not.toContain("Opened import.cdxml");
 
     await activate(0);
-    expect(status().title).toBe(combinedTooltip);
+    expect(warningsTitle()).toBe(combinedTooltip);
     await command("document.closeTab");
     expect(status().title).not.toContain(openTooltip);
     await command("document.new");
     expect(button()).toBeNull();
     expect(list()).toBeNull();
-    expect(status().getAttribute("title")).toBeNull();
+    expect(warningsTitle()).toBe("");
   });
 
   it("keeps save warnings with their tab and clears the visible list on tab changes", async () => {
     await mount();
     await command("document.save");
-    const warningText = status().title;
+    const warningText = warningsTitle();
     await click(button()!);
     await command("document.new");
     expect(button()).toBeNull();
     expect(list()).toBeNull();
-    expect(status().getAttribute("title")).toBeNull();
+    expect(warningsTitle()).toBe("");
     await command("document.save");
 
     await activate(0);
     expect(button()?.textContent).toBe("1 warning");
-    expect(status().title).toBe(warningText);
+    expect(warningsTitle()).toBe(warningText);
     expect(list()).toBeNull();
     await click(button()!);
     expect(list()?.textContent).toContain(warningFor(tableDocument()).message);
@@ -511,7 +522,7 @@ describe("save warnings in the existing file warnings list", () => {
     expect(button()).toBeNull();
     expect(list()).toBeNull();
     expect(status().textContent).toBe("Saved Untitled.chemdraft");
-    expect(status().getAttribute("title")).toBeNull();
+    expect(warningsTitle()).toBe("");
   });
 
   it("preserves open warnings on the saved tab when a native write completes after switching tabs", async () => {
@@ -534,7 +545,7 @@ describe("save warnings in the existing file warnings list", () => {
     await command("document.new");
     await act(async () => { finishWrite(); await saving; });
     expect(button()).toBeNull();
-    expect(status().getAttribute("title")).toBeNull();
+    expect(warningsTitle()).toBe("");
 
     await activate(0);
     expect(status().textContent).toBe("Saved table.chemdraft with 1 compatibility warning(s)");
@@ -544,6 +555,6 @@ describe("save warnings in the existing file warnings list", () => {
     expect(list()?.getAttribute("aria-label")).toContain("Opened import.cdxml");
     expect(list()!.querySelectorAll("section")).toHaveLength(2);
     expect(list()?.textContent).toContain(payload.warnings[0]!.message);
-    expect(status().title).toBe(`${openTooltip}\n\n${saveTooltip("table.chemdraft", payload.warnings)}`);
+    expect(warningsTitle()).toBe(`${openTooltip}\n\n${saveTooltip("table.chemdraft", payload.warnings)}`);
   });
 });

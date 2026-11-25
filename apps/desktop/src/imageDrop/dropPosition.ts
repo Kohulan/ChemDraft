@@ -1,29 +1,43 @@
-import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
-
 export interface DropClientPoint { x: number; y: number }
 
+/** The document window's native drop event, sent by `file_drop.rs` in place of `tauri://drag-drop`. */
+export const DOCUMENT_FILE_DROP_EVENT = "chemdraft://document-file-drop";
+
+/** Its payload; see `DocumentFileDropPayload` in `file_drop.rs`. */
+export interface DocumentFileDropPayload {
+  paths: string[];
+  position?: { x?: unknown; y?: unknown } | null;
+  /** `css`: CSS pixels relative to the page (macOS, Linux). `physical`: device pixels (Windows). */
+  units?: unknown;
+  /**
+   * The macOS title-bar inset already taken off `y` in Rust, read from the window at drop time (0
+   * elsewhere). Never applied again here.
+   */
+  topInsetRemoved?: unknown;
+}
+
 /**
- * The `tauri://drag-drop` position in the webview's CSS pixels. The payload is typed as a physical
- * position, but the webview layer (wry 0.55) fills it differently per platform:
+ * The native drop position in the page's CSS pixels. Rust has already made it relative to the page:
  *
- * - macOS: `draggingLocation` in the WKWebView's own frame, flipped to a top-left origin. That is
- *   in points, which are CSS pixels.
- * - Linux: GTK's drag motion coordinates, logical pixels relative to the webview widget.
+ * - macOS: wry measures `y` from the top of the WKWebView's frame, which extends under the title bar
+ *   (a full-size content view), while the page starts below WebKit's inset. Rust removes the inset
+ *   it reads from the window at drop time and sends points, which are CSS pixels.
+ * - Linux: GTK's drag coordinates, logical pixels relative to the webview widget.
  * - Windows: `ScreenToClient` on the webview's own container window, so physical pixels relative to
- *   the webview. The container sits below a window menu bar (which is in the frame's non-client
- *   area), so no menu offset applies; dividing by the device pixel ratio gives CSS pixels.
+ *   the page. The container sits below a window menu bar (which is in the frame's non-client area),
+ *   so no menu offset applies; dividing by the device pixel ratio gives CSS pixels.
  *
  * `scaleFactor` should be the webview's `devicePixelRatio`, which also folds in any webview zoom.
  */
-export function tauriDropClientPoint(
-  position: { x?: unknown; y?: unknown } | null | undefined,
-  platform: ShortcutPlatform,
+export function nativeDropClientPoint(
+  payload: Omit<DocumentFileDropPayload, "paths"> | null | undefined,
   scaleFactor: number
 ): DropClientPoint | undefined {
-  const x = position?.x;
-  const y = position?.y;
+  const x = payload?.position?.x;
+  const y = payload?.position?.y;
   if (typeof x !== "number" || typeof y !== "number" || !Number.isFinite(x) || !Number.isFinite(y)) return undefined;
-  const scale = platform === "windows" && Number.isFinite(scaleFactor) && scaleFactor > 0 ? scaleFactor : 1;
+  if (payload?.units !== "css" && payload?.units !== "physical") return undefined;
+  const scale = payload.units === "physical" && Number.isFinite(scaleFactor) && scaleFactor > 0 ? scaleFactor : 1;
   return { x: x / scale, y: y / scale };
 }
 

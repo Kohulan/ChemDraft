@@ -409,6 +409,40 @@ describe("handleDroppedFiles", () => {
     ].join("; "));
   });
 
+  it("sets the pictures' result on their tab before the documents open, then the whole outcome on the active tab", async () => {
+    const events: string[] = [];
+    const { handler } = harness();
+    await handleDroppedFiles([file("a.cdxml"), file("one.png"), file("bad.bmp")], { ...handler,
+      setStatus: status => events.push(`drop tab: ${status}`),
+      showOutcome: status => events.push(`active tab: ${status}`),
+      openDocuments: async () => { events.push("open documents"); return "Opened 1 document"; } });
+    const pictures = "Inserted picture one.png; Couldn't drop \"bad.bmp\": BMP and TIFF pictures can't be dropped yet; save it as PNG or JPEG first.";
+    expect(events).toEqual([
+      "drop tab: Reading the dropped picture…",
+      `drop tab: ${pictures}`,
+      "open documents",
+      `active tab: ${pictures.replace(/\.$/, "")}; Opened 1 document`
+    ]);
+  });
+
+  it("never leaves the drop tab on Reading, for a refusal at commit, a refusal at drop time or pictures only", async () => {
+    for (const [insert, refusedNow, files] of [
+      ["refuse", undefined, ["one.png", "a.mol"]],
+      ["ok", "finish editing the text first.", ["one.png", "a.mol"]],
+      ["ok", undefined, ["one.png", "two.png"]]
+    ] as const) {
+      const dropTab: string[] = [];
+      const active: string[] = [];
+      const { handler } = harness(insert);
+      await handleDroppedFiles(files.map(name => file(name)), { ...handler, insertRefusal: () => refusedNow,
+        setStatus: status => dropTab.push(status), showOutcome: status => active.push(status) });
+      expect(dropTab.at(-1)).not.toMatch(/^Reading/);
+      expect(dropTab.at(-1)).toMatch(insert === "refuse" || refusedNow ? /^The dropped pictures were not inserted/ : /^Inserted 2 pictures/);
+      expect(active).toHaveLength(1);
+      expect(active[0]).toContain(dropTab.at(-1)!.replace(/\.$/, ""));
+    }
+  });
+
   it("reports a refused insertion and still opens the documents", async () => {
     const { calls, handler } = harness("refuse");
     await handleDroppedFiles([file("one.png"), file("a.mol")], handler);
