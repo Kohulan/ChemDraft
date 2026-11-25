@@ -1185,10 +1185,8 @@ mod tests {
     #[test]
     fn previews_are_bounded_utf8() {
         let long = "é".repeat(10_000);
-        let preview = text_preview(
-            &utf16le(&long, true),
-            TextEncoding::Utf16 { big_endian: false },
-        );
+        let bytes = utf16le(&long, true);
+        let preview = text_preview(&bytes, TextEncoding::Utf16 { big_endian: false });
         assert!(preview.len() <= 8192);
         assert!(std::str::from_utf8(&preview).is_ok());
         assert_eq!(text_preview(&[b'C'; 9000], TextEncoding::Utf8).len(), 8192);
