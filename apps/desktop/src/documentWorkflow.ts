@@ -30,6 +30,7 @@ import { nativeTemplateForToolCommand as sharedTemplateForToolCommand } from "./
 import { projectedDoubleBondSides } from "./interaction/projectedDoubleBondSides";
 import { buildTableObject, pageConstrainedShift } from "@chemdraft/document-workflow-core";
 import { planTableLayout, planTextObjectPlacement, tableVisualBoundsForArrangement, textAutoSizePageLimits, transformPointForObject, rotatedGraphicLocalBounds } from "@chemdraft/layout-engine";
+import { carryElectronMarksToRedrawnMolecule, type ElectronMarkCarryMolecule, type ElectronMarkCarryPlacement } from "@chemdraft/layout-engine";
 import { validTableDimensions, type TableInsertDimensions } from "./dialogs/insertTableOptions";
 import { doubleBondStereoState, perceivedSpecifiedDoubleBondIds } from "./interaction/doubleBondStereo";
 import { separateProjectedStereoLigands, serializeSpin3dMolfile, type Spin3dStereoIssue, type Spin3dStereoReference } from "./interaction/spin3dStereo";
@@ -17853,7 +17854,13 @@ function buildNativeMoleculeEngineRelayout(
     return document;
   }
 
-  return applyPatches(document, [{ op: "updateObject" as const, objectId: molecule.id, changes: cleaned }], {
+  // The molecule's charge, radical and lone-pair marks follow their atoms to the new layout in the
+  // same patch set (one undo step), each kept at its offset or turned to a free side.
+  const page = document.pages.find(candidate => candidate.objects.includes(molecule));
+  return applyPatches(document, [
+    { op: "updateObject" as const, objectId: molecule.id, changes: cleaned },
+    ...(page ? carriedElectronMarkPatches(page, molecule, cleaned) : [])
+  ], {
     now: phase4Timestamp
   });
 }
@@ -20106,19 +20113,12 @@ export function flattenSpunMolecule(
       structureFormat: flattened.structureFormat
     }
   }];
-  // Carry the mark's existing offset with its atom. Make legacy atom
-  // associations explicit so a crowded projection cannot reassign them.
-  const oldAtoms = new Map(molecule.atoms.map(atom => [atom.id, atom]));
-  const newAtoms = new Map(flattened.atoms.map(atom => [atom.id, atom]));
-  for (const { mark, atomId } of spin3dCarriedElectronMarks(page, objectId)) {
-    const before = oldAtoms.get(atomId);
-    const after = newAtoms.get(atomId);
-    if (!before || !after) continue;
-    patches.push({ op: "updateObject", objectId: mark.id, changes: {
-      x: mark.x + after.x - before.x, y: mark.y + after.y - before.y, atomAssociation: "explicit",
-      anchor: { kind: "atom", objectId, atomId }
-    } });
-  }
+  // Carry each mark with its atom (its offset kept, or turned to a free side when the projection
+  // puts that spot on another atom or a bond), in the same patch set so one undo restores it.
+  patches.push(...carriedElectronMarkPatches(page, molecule, {
+    ...molecule, atoms: flattened.atoms, bonds: flattened.bonds, x: flattened.x, y: flattened.y,
+    width: flattened.width, height: flattened.height
+  }));
   const pageId = page.id;
   for (const crossing of page.crossings) {
     if (crossing.bonds.every(ref => ref.objectId === objectId)) {
@@ -20171,9 +20171,10 @@ function isSpin3dStereoMarker(bond: MoleculeBond): boolean {
 }
 
 /**
- * The charge/radical marks a Spin 3D session carries with molecule `objectId`, each with the atom it
- * follows. Flatten moves each by its atom's (flattened − drawn) offset, and the live overlay paints
- * each at the same offset from the projected atom, so the mark never lags the spin.
+ * The charge/radical/lone-pair marks a Spin 3D session carries with molecule `objectId`, each with the
+ * atom it follows, whether or not the mark itself is selected. Flatten and the live overlay place
+ * them with the same rule (`carriedElectronMarkPlacements`), so the mark never lags the spin and is
+ * committed where it was painted.
  */
 export function spin3dCarriedElectronMarks(
   page: DocumentPage, objectId: string
@@ -20184,6 +20185,47 @@ export function spin3dCarriedElectronMarks(
     const owner = spin3dElectronMarkOwner(mark, assignments);
     return owner?.objectId === objectId ? [{ mark, atomId: owner.atomId }] : [];
   });
+}
+
+/** Where one carried mark goes when its molecule is redrawn (layout-engine's placement, with its mark). */
+export interface CarriedElectronMarkPlacement extends ElectronMarkCarryPlacement {
+  mark: ElectronMarkObject;
+}
+
+/**
+ * Where the marks molecule `before` owns on `page` go when it is redrawn as `after` (same atom ids,
+ * new positions): Spin 3D flatten and its live overlay, X/Y rotation of a stored 3D model, and 3D
+ * clean-up all use this, so the overlay paints each mark where the commit puts it. Which marks
+ * travel is decided here (`spin3dCarriedElectronMarks`); where they go is layout-engine's
+ * `carryElectronMarksToRedrawnMolecule`, the one copy of that math. Positions only: no chemistry.
+ */
+export function carriedElectronMarkPlacements(
+  page: DocumentPage,
+  before: MoleculeObject,
+  after: ElectronMarkCarryMolecule
+): Map<string, CarriedElectronMarkPlacement> {
+  const entries = spin3dCarriedElectronMarks(page, before.id);
+  const marks = new Map(entries.map(({ mark }) => [mark.id, mark] as const));
+  const placements = new Map<string, CarriedElectronMarkPlacement>();
+  for (const [markId, placement] of carryElectronMarksToRedrawnMolecule(before, after, entries)) {
+    placements.set(markId, { ...placement, mark: marks.get(markId)! });
+  }
+  return placements;
+}
+
+/** Patches that carry `before`'s marks to `after` (see `carriedElectronMarkPlacements`). Legacy atom
+ * associations become explicit so the redrawn geometry cannot reassign a mark to a nearer atom. */
+export function carriedElectronMarkPatches(
+  page: DocumentPage,
+  before: MoleculeObject,
+  after: ElectronMarkCarryMolecule
+): DocumentPatch[] {
+  return [...carriedElectronMarkPlacements(page, before, after).values()].map(({ mark, atomId, x, y, rotation }) => ({
+    op: "updateObject" as const, objectId: mark.id, changes: {
+      x, y, ...(rotation !== mark.rotation ? { rotation } : {}), atomAssociation: "explicit" as const,
+      anchor: { kind: "atom" as const, objectId: before.id, atomId }
+    }
+  }));
 }
 
 /** The selection as single-molecule commands (Spin 3D, 3D cleanup, Interactive 3D) read it. */
@@ -20357,6 +20399,7 @@ export function assertSpin3dDocumentIdentity(
     const originalAssignments = nativeElectronMarkAssignments(page).anchorByMarkId;
     const nextAssignments = nativeElectronMarkAssignments(nextPage).anchorByMarkId;
     const nextObjects = new Map(nextPage.objects.map(object => [object.id, object]));
+    let carried: Map<string, CarriedElectronMarkPlacement> | undefined;
     for (const mark of page.objects) {
       if (mark.type !== "electron-mark") continue;
       const next = nextObjects.get(mark.id);
@@ -20367,11 +20410,13 @@ export function assertSpin3dDocumentIdentity(
         throw new Error(`the atom association of the ${mark.markKind} mark ${mark.id} would change`);
       }
       if (page !== sourcePage || owner?.objectId !== stereo.source.id) continue;
-      const atom = stereo.source.atoms.find(candidate => candidate.id === owner.atomId);
-      const moved = target?.atoms.find(candidate => candidate.id === owner.atomId);
-      const from = nativeChargeMarkCenter(mark);
-      const to = nativeChargeMarkCenter(next);
-      if (!atom || !moved || Math.hypot(to.x - moved.x - (from.x - atom.x), to.y - moved.y - (from.y - atom.y)) > 1e-6) {
+      // The mark must sit where the shared carry rule puts it for the committed atoms: its offset
+      // kept, or turned to a free side (the same placement the live overlay painted).
+      carried ??= target ? carriedElectronMarkPlacements(page, stereo.source, target) : new Map();
+      const expected = carried.get(mark.id);
+      if (!expected || Math.hypot(next.x - expected.x, next.y - expected.y) > 1e-6 ||
+          Math.abs(next.width - mark.width) > 1e-9 || Math.abs(next.height - mark.height) > 1e-9 ||
+          Math.abs(((next.rotation - expected.rotation) % 360 + 540) % 360 - 180) > 1e-6) {
         throw new Error(`the ${mark.markKind} mark ${mark.id} would move away from its atom`);
       }
     }

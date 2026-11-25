@@ -10,7 +10,7 @@ import { electronMarkInteractionFrames } from "./electronMarkInteraction";
 import { installPopoverEscapeRouting } from "./window-manager/popoverEscape";
 import { BracketLabelEditor, type BracketLabelEditorHandle } from "./BracketLabelEditor";
 import { createBracketCommands, selectedBracketPair, toggleBracketRepeatUnit, setBracketRepeatLabel, bracketRepeatUnitStatus, prepareCleanupRepeatUnits } from "./bracketCommands";
-import { bracketLabelPlan, bracketLabelContainsPoint, lonePairDragDirection, transformPointForObject } from "@chemdraft/layout-engine";
+import { bracketLabelPlan, bracketLabelContainsPoint, carriedElectronMarkSvgTransform, lonePairDragDirection, transformPointForObject } from "@chemdraft/layout-engine";
 import { useCanvasHandwritingFont } from "./canvasHandwritingFont";
 import { nativeTemplateForToolCommand } from "./ringTemplates";
 import { ATOM_MAPS_REMOVED_STATUS, documentDrawingDefaults, stripSmilesAtomMaps } from "@chemdraft/document-workflow-core";
@@ -740,6 +740,8 @@ import {
   moleculeFrameDelta,
   singleMoleculeSelection,
   spin3dCarriedElectronMarks,
+  carriedElectronMarkPlacements,
+  type CarriedElectronMarkPlacement,
   uncarriedMarksRefusal,
   findForeignNativeMoleculeBondTarget,
   openNativeDocument,
@@ -1906,7 +1908,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.25.13.05-opus";
+const CURRENT_BUILD_STAMP = "11.25.13.15-opus";
 
 const NUMERIC_ENTRY_DURING_DRAG_STATUS = "Finish the current drag, then enter a value";
 
@@ -23736,17 +23738,27 @@ export function MainWindow({
   // overlay paints each at its atom's projected position, offset exactly as flatten will commit it,
   // and the page hides the stationary copy until the spin ends.
   const spinObjectId = activeSpin3dState?.objectId;
+  const spinSelectedObjectIds = document.selection.objectIds;
   const spinCarriedMarks = useMemo((): readonly SpinCarriedMark[] => {
     if (!spinObjectId) return [];
     const spinAtoms = activeSpin3dState?.atoms ?? [];
+    const selected = new Set(spinSelectedObjectIds);
     return spin3dCarriedElectronMarks(activePage, spinObjectId).flatMap(({ mark, atomId }) => {
-      const atomIndex = spinAtoms.findIndex(atom => atom.id === atomId);
       const fragments = objectOverlayFragments.get(mark.id);
-      return atomIndex >= 0 && fragments?.length ? [{ markId: mark.id, atomIndex, fragments }] : [];
+      return spinAtoms.some(atom => atom.id === atomId) && fragments?.length
+        ? [{ markId: mark.id, fragments, selected: selected.has(mark.id) }] : [];
     });
-  }, [activePage, objectOverlayFragments, spinObjectId, activeSpin3dState?.atoms]);
+  }, [activePage, objectOverlayFragments, spinObjectId, activeSpin3dState?.atoms, spinSelectedObjectIds]);
   const spinCarriedMarkIds = useMemo(() => spinCarriedMarks.length > 0
     ? new Set(spinCarriedMarks.map(mark => mark.markId)) : undefined, [spinCarriedMarks]);
+  // The same placement flatten commits (offset kept, or turned to a free side; layout-engine's
+  // carryElectronMarksToRedrawnMolecule), read for the projected atoms of each frame. The overlay
+  // draws the molecule unrotated, so the marks are placed in that frame too.
+  const spinSourceMolecule = activeSpin3dState?.sourceMolecule;
+  const placeSpinCarriedMarks = useMemo(() => spinSourceMolecule && spinCarriedMarks.length > 0
+    ? (atoms: readonly MoleculeAtom[]) =>
+        carriedElectronMarkPlacements(activePage, spinSourceMolecule, { ...spinSourceMolecule, atoms, rotation: 0 })
+    : undefined, [activePage, spinSourceMolecule, spinCarriedMarks.length]);
 
   // The browser build has no native OS menu, so it renders the shared app-menu model in-viewport.
   // On the Tauri desktop build the native menu owns this, so the in-window bar stays hidden.
@@ -24643,6 +24655,10 @@ export function MainWindow({
                   return (
                   <>
                 {labelDisplayPage.objects.map((object, layerIndex) => {
+                  // A mark the Spin 3D overlay carries is painted (with its selection box) where its
+                  // atom has turned to; its view here would leave the box at the old spot. The overlay
+                  // takes every pointer event during the spin, so nothing is lost by dropping it.
+                  if (spinCarriedMarkIds?.has(object.id)) return null;
                   // An Eraser sweep shows its own preview; leftover selection chrome (a whole chain
                   // highlighted by the chain tool) would read as "all of this will be erased".
                   const selectionChromeActive = activeToolState.activeKind === "selection" && eraserSweepPreview === undefined;
@@ -24771,6 +24787,7 @@ export function MainWindow({
                     <SpinOverlay
                       state={activeSpin3dState}
                       carriedMarks={spinCarriedMarks}
+                      placeCarriedMarks={placeSpinCarriedMarks}
                       pageWidth={activePage.width}
                       pageHeight={activePage.height}
                       drawingStyle={spinStyle}
@@ -27595,15 +27612,16 @@ function Spin3dGeneratingCue({ box, atomCount, pageWidth, pageHeight }: {
  */
 interface SpinCarriedMark {
   markId: string;
-  /** Index of the mark's atom in `Spin3dState.atoms` (and so in the projection). */
-  atomIndex: number;
-  /** The mark's page paint, drawn where it stands now; the overlay translates it with its atom. */
+  /** The mark's page paint, drawn where it stands now; the overlay moves it to its placement. */
   fragments: readonly PageSvgElementFragment[];
+  /** The mark is selected: the overlay draws its selection box around it where it is painted. */
+  selected: boolean;
 }
 
 function SpinOverlay({
   state,
   carriedMarks = [],
+  placeCarriedMarks,
   pageWidth,
   pageHeight,
   drawingStyle,
@@ -27615,6 +27633,8 @@ function SpinOverlay({
   state: Spin3dState;
   /** Charge/radical marks that follow their atoms through the spin. */
   carriedMarks?: readonly SpinCarriedMark[];
+  /** Where the carried marks go for the projected atoms: `carriedElectronMarkPlacements`, as flatten commits them. */
+  placeCarriedMarks?: (atoms: readonly MoleculeAtom[]) => ReadonlyMap<string, CarriedElectronMarkPlacement>;
   pageWidth: number;
   pageHeight: number;
   /** The molecule's own 2D drawing style — the overlay renders with the SAME colors,
@@ -27654,6 +27674,10 @@ function SpinOverlay({
   // atom, as the flat drawing does (layout-engine's nonElementAtomLabelPlacement). Its bonds turn as
   // the molecule spins, so it is placed from the projected heavy neighbours each frame.
   const projectedByIndex = new Map(projection.atoms.map((atom) => [atom.index, atom]));
+  const carriedMarkPlacements = carriedMarks.length > 0 ? placeCarriedMarks?.(state.atoms.map((atom, index) => {
+    const projected = projectedByIndex.get(index);
+    return projected ? { ...atom, x: projected.sx, y: projected.sy } : atom;
+  })) : undefined;
   const heavyNeighbourIndices: number[][] = state.atoms.map(() => []);
   state.bondPairs.forEach(([from, to]) => {
     if (nativeElementFromAtomLabel(state.atoms[to]?.element ?? "") !== "H") heavyNeighbourIndices[from]?.push(to);
@@ -27753,18 +27777,27 @@ function SpinOverlay({
           ))}
         </g>
       ))}
-      {/* Each mark keeps the offset from its atom that flatten commits (the ScreenPlacement
-          contract): translated by its atom's projected minus drawn position. */}
-      {carriedMarks.map(({ markId, atomIndex, fragments }) => {
-        const projected = projectedByIndex.get(atomIndex);
-        const source = state.atoms[atomIndex];
-        if (!projected || !source) return null;
+      {/* Each mark goes where flatten commits it (the ScreenPlacement contract): its offset from
+          its projected atom kept, or turned about the atom to a free side when that spot lands on
+          another atom or a bond. A lone pair turns with it. */}
+      {carriedMarks.map(({ markId, fragments, selected }) => {
+        const placement = carriedMarkPlacements?.get(markId);
+        if (!placement) return null;
+        const { mark } = placement;
         return (
           <g key={`mark-${markId}`} data-spin3d-electron-mark={markId}
-            data-spin3d-mark-offset={`${projected.sx - source.x} ${projected.sy - source.y}`}
-            transform={`translate(${projected.sx - source.x} ${projected.sy - source.y})`}
+            data-spin3d-mark-offset={`${placement.x - mark.x} ${placement.y - mark.y}`}
+            data-spin3d-mark-turn={placement.turnDegrees}
+            transform={carriedElectronMarkSvgTransform(mark, placement)}
             style={{ pointerEvents: "none" }}>
             {fragments.map(renderStaticPageSvgFragment)}
+            {/* The page hides the mark's own selection box during the spin (it would stay at the
+                old spot); this one travels with the mark. */}
+            {selected ? (
+              <rect data-spin3d-mark-selection={markId} x={mark.x - 3} y={mark.y - 3}
+                width={mark.width + 6} height={mark.height + 6} fill="none"
+                stroke="var(--cd-accent)" strokeWidth={2} vectorEffect="non-scaling-stroke" />
+            ) : null}
           </g>
         );
       })}

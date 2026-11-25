@@ -363,6 +363,21 @@ drawing changed, the 3D overlay closes, and the cleaned-up drawing stays. Do it 
 click Spin 3D a second time instead of clicking outside: Spin 3D starts over on the cleaned-up
 molecule (no "already active" message), and a click outside flattens it.
 
+Marks follow their own atom (1.2.3 blocker). Paste aspirin `CC(=O)Oc1ccccc1C(=O)O`, hover the
+carboxylic acid OH oxygen and press `-`; repeat on fresh copies with a radical dot, a lone pair and
+a radical anion (RDKit cannot verify a singly bonded O•−, so Spin 3D and the 3D rotations may refuse
+that one with a message: a refusal is fine, a misplaced mark is not). For each, run Spin 3D twice:
+once with the molecule and its mark selected, once with only the molecule selected (click the
+molecule, not the mark). The moment the overlay opens, before any drag, the mark sits beside the
+carboxylate O, never beside the ester O or on a bond, and stays beside it, with its selection box
+when it is selected, through a long drag in several directions; no box is left behind at the old
+spot. Click outside: it is committed where the overlay drew it. Then check it is still beside that O
+after typed X, Y and Z rotations of the stored model, after Interactive 3D (tug the O, click
+outside), after 3D Clean Up, in a transparent PNG/TIFF and an SVG export, and after Save As, close
+and reopen. Throughout, Copy As SMILES stays `...C(=O)[O-]` (formula unchanged), dragging the
+carboxylate O still pulls the mark, and one Undo after any of these restores the drawing and the
+mark exactly as before.
+
 ## Automatic plugin update notices (macOS and Windows)
 
 On both platforms, launch with an installed official plugin and a check due (no successful plugin

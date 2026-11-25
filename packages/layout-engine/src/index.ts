@@ -1,9 +1,11 @@
 export * from "./layoutQuality";
 export * from "./electronMarkPlacement";
+export * from "./electronMarkCarry";
 export { BoldBondStyle } from "./boldBonds";
 import { boldBondWidth, boldBondPolygonPoints, boldBondEdgeOffsets,
   type BoldBondNeighbor, type BoldBondJoin, type BoldBondJointCache } from "./boldBonds";
 import { nativeChargeMarkSizePx, nativeAtomHitRadiusPx } from "./electronMarkPlacement";
+import { carryElectronMarksWithAtoms } from "./electronMarkCarry";
 export { rotatedGraphicLocalBounds } from "./graphicBounds";
 import type { LayoutLabelBox } from "./layoutQuality";
 import { bondsOverlap } from "./layoutQuality";
@@ -10102,8 +10104,11 @@ export function rotationTransform(object: DocumentObject): string | undefined {
   return `rotate(${formatNumber(object.rotation)} ${formatNumber(object.x + object.width / 2)} ${formatNumber(object.y + object.height / 2)})`;
 }
 
+/** The stored frame an object is drawn in: where it sits and how far it is turned about its centre. */
+export type ObjectRotationFrame = Pick<DocumentObject, "x" | "y" | "width" | "height" | "rotation">;
+
 /** @internal Bounds must use the same pivot as SVG rendering. */
-export function transformPointForObject(object: DocumentObject, point: LayoutPoint): LayoutPoint {
+export function transformPointForObject(object: ObjectRotationFrame, point: LayoutPoint): LayoutPoint {
   if (object.rotation === 0) {
     return point;
   }
@@ -10112,7 +10117,7 @@ export function transformPointForObject(object: DocumentObject, point: LayoutPoi
 }
 
 /** @internal Convert a page point into the object's unrotated coordinate frame. */
-export function inverseTransformPointForObject(object: DocumentObject, point: LayoutPoint): LayoutPoint {
+export function inverseTransformPointForObject(object: ObjectRotationFrame, point: LayoutPoint): LayoutPoint {
   if (object.rotation === 0) {
     return point;
   }
@@ -10121,11 +10126,102 @@ export function inverseTransformPointForObject(object: DocumentObject, point: La
 }
 
 /** @internal Preserve the renderer's pivot when an operation replaces the stored frame. */
-export function objectRotationCenter(object: DocumentObject): LayoutPoint {
+export function objectRotationCenter(object: ObjectRotationFrame): LayoutPoint {
   return {
     x: object.x + object.width / 2,
     y: object.y + object.height / 2
   };
+}
+
+/** The parts of a molecule the electron-mark carry reads: atoms, bonds and the object frame they are drawn in. */
+export type ElectronMarkCarryMolecule = {
+  atoms: readonly Pick<MoleculeAtom, "id" | "x" | "y">[];
+  bonds: readonly Pick<CoreMoleculeBond, "fromAtomId" | "toAtomId">[];
+} & ObjectRotationFrame;
+
+/** One mark a redrawn molecule carries: the stored mark (page frame) and the atom it follows. */
+export interface ElectronMarkCarryEntry {
+  mark: Pick<ElectronMarkObject, "id" | "markKind" | "x" | "y" | "width" | "height" | "rotation">;
+  atomId: string;
+}
+
+/** Where one carried mark goes, in the page frame the mark is stored in. Its size never changes. */
+export interface ElectronMarkCarryPlacement {
+  markId: string;
+  atomId: string;
+  /** The mark's new top-left corner. */
+  x: number;
+  y: number;
+  /** The mark's new rotation in degrees: a lone pair that turned turns with it; every other mark keeps its own. */
+  rotation: number;
+  /** Degrees the mark turned about its atom to reach a free side (0 when it kept its offset). */
+  turnDegrees: number;
+}
+
+/**
+ * The ONE placement rule for the marks a molecule carries when it is redrawn with new atom positions
+ * (same atom ids): the Spin 3D live overlay and its flatten (and so a reopened model, a typed or
+ * dragged X/Y rotation, and an Interactive 3D tug), and 3D clean-up. The overlay paints each mark
+ * exactly where the commit stores it because both call this with the atoms they draw.
+ *
+ * Each mark keeps the page offset from its atom it had in `before`, read in `after`'s frame, unless
+ * that spot lands on another atom or a bond; then it turns about its atom, at the same distance, to
+ * the nearest free side (`carryElectronMarksWithAtoms`). Positions only: the caller keeps every
+ * chemical fact (anchor atom, association, charge) as it was.
+ */
+export function carryElectronMarksToRedrawnMolecule(
+  before: ElectronMarkCarryMolecule,
+  after: ElectronMarkCarryMolecule,
+  entries: readonly ElectronMarkCarryEntry[]
+): Map<string, ElectronMarkCarryPlacement> {
+  const beforeAtoms = new Map(before.atoms.map(atom => [atom.id, atom] as const));
+  const afterAtoms = new Map(after.atoms.map(atom => [atom.id, atom] as const));
+  const carried = entries.flatMap(entry => {
+    const from = beforeAtoms.get(entry.atomId);
+    const to = afterAtoms.get(entry.atomId);
+    if (!from || !to) return [];
+    // The offset the reader sees is on the page; hold it there, read in the redrawn molecule's frame.
+    const fromPage = transformPointForObject(before, from);
+    const toPage = transformPointForObject(after, to);
+    const center = objectRotationCenter(entry.mark);
+    const local = inverseTransformPointForObject(after, { x: toPage.x + center.x - fromPage.x, y: toPage.y + center.y - fromPage.y });
+    return [{ ...entry, offset: { x: local.x - to.x, y: local.y - to.y } }];
+  });
+  const placed = carryElectronMarksWithAtoms(after.atoms, after.bonds, carried.map(({ mark, atomId, offset }) => ({
+    atomId, offset, width: mark.width, height: mark.height
+  })));
+  const placements = new Map<string, ElectronMarkCarryPlacement>();
+  carried.forEach(({ mark, atomId }, index) => {
+    const placement = placed[index];
+    if (!placement) return;
+    const center = transformPointForObject(after, placement.center);
+    const turnDegrees = placement.turn * 180 / Math.PI;
+    // A lone pair's two dots sit across the direction to its atom, so they turn with the mark.
+    const rotation = mark.markKind === "lone-pair" && turnDegrees !== 0
+      ? ((mark.rotation + turnDegrees) % 360 + 360) % 360
+      : mark.rotation;
+    placements.set(mark.id, {
+      markId: mark.id, atomId, x: center.x - mark.width / 2, y: center.y - mark.height / 2, rotation, turnDegrees
+    });
+  });
+  return placements;
+}
+
+/**
+ * The SVG transform that paints a mark's stored drawing (its page fragments, already turned by its
+ * own rotation) at `placement`: moved by the placement's offset and turned about its centre by the
+ * rotation it gained. The Spin 3D overlay draws carried marks with this.
+ */
+export function carriedElectronMarkSvgTransform(
+  mark: ElectronMarkCarryEntry["mark"],
+  placement: Pick<ElectronMarkCarryPlacement, "x" | "y" | "rotation">
+): string {
+  const center = objectRotationCenter(mark);
+  const turn = ((placement.rotation - mark.rotation) % 360 + 540) % 360 - 180;
+  const move = `translate(${formatNumber(placement.x - mark.x)} ${formatNumber(placement.y - mark.y)})`;
+  return Math.abs(turn) > 1e-9
+    ? `${move} rotate(${formatNumber(turn)} ${formatNumber(center.x)} ${formatNumber(center.y)})`
+    : move;
 }
 
 function moleculeDrawingPrimitive(object: MoleculeObject): "single-bond" | undefined {
